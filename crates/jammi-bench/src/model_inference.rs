@@ -86,11 +86,11 @@ use crate::report::{DeterminismGate, Measurement, ModelInferenceTier, RateVerdic
 
 /// The source id the synthetic corpus registers under. Generic — names no
 /// consumer; the corpus is a neutral family of short factual sentences.
-const SOURCE_ID: &str = "corpus";
+pub(crate) const SOURCE_ID: &str = "corpus";
 /// The text column the verbs read.
-const TEXT_COLUMN: &str = "text";
+pub(crate) const TEXT_COLUMN: &str = "text";
 /// The key column carrying each row's stable id into the result table.
-const KEY_COLUMN: &str = "_row_id";
+pub(crate) const KEY_COLUMN: &str = "_row_id";
 
 /// The deterministic synthetic corpus: a fixed family of short sentences across
 /// two topics. Fixed (not random) text because the real model tokenizes and
@@ -184,7 +184,7 @@ impl ModelInferenceSpec {
 /// A `local:`-prefixed model id for a committed bundle directory — the resolver's
 /// no-network branch (`ModelSource::Local`), so the serve loads off the committed
 /// safetensors and never reaches HuggingFace.
-fn local_model_id(dir: &std::path::Path) -> Result<String, Box<dyn std::error::Error>> {
+pub(crate) fn local_model_id(dir: &std::path::Path) -> Result<String, Box<dyn std::error::Error>> {
     Ok(format!(
         "local:{}",
         dir.to_str()
@@ -193,15 +193,15 @@ fn local_model_id(dir: &std::path::Path) -> Result<String, Box<dyn std::error::E
 }
 
 /// One synthetic row: its stable key and its text.
-struct Row {
-    id: String,
-    text: &'static str,
+pub(crate) struct Row {
+    pub(crate) id: String,
+    pub(crate) text: &'static str,
 }
 
 /// Build the deterministic synthetic corpus: `row_count` rows, each drawing a
 /// fixed sentence by a seed-rotated index so the corpus is byte-stable from the
 /// committed seed.
-fn build_corpus(spec: &ModelInferenceSpec) -> Vec<Row> {
+pub(crate) fn build_corpus(spec: &ModelInferenceSpec) -> Vec<Row> {
     (0..spec.row_count)
         .map(|i| {
             let idx = (spec.corpus_seed as usize).wrapping_add(i) % SENTENCES.len();
@@ -223,11 +223,22 @@ fn build_corpus(spec: &ModelInferenceSpec) -> Vec<Row> {
 async fn corpus_session(
     rows: &[Row],
 ) -> Result<(Arc<InferenceSession>, tempfile::TempDir), Box<dyn std::error::Error>> {
+    corpus_session_on_device(rows, -1).await
+}
+
+/// The device-parameterized corpus session the CPU tier ([`corpus_session`],
+/// `gpu_device = -1`) and the GPU perf-baseline tier (`gpu_device = 0`) share.
+/// `gpu_device` flows straight to the engine's `select_device`, so the same
+/// serving path measures on whichever device the caller names.
+pub(crate) async fn corpus_session_on_device(
+    rows: &[Row],
+    gpu_device: i32,
+) -> Result<(Arc<InferenceSession>, tempfile::TempDir), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let config = JammiConfig {
         artifact_dir: dir.path().to_path_buf(),
         gpu: GpuConfig {
-            device: -1,
+            device: gpu_device,
             ..Default::default()
         },
         ..Default::default()
@@ -320,7 +331,7 @@ impl Fnv {
 ///
 /// `model_id` selects the bundle the serve resolves — the committed embed bundle
 /// for the gate, a different bundle for the teeth test.
-async fn serve_embed(
+pub(crate) async fn serve_embed(
     session: &Arc<InferenceSession>,
     model_id: &str,
 ) -> Result<(String, f64, usize), Box<dyn std::error::Error>> {
@@ -357,7 +368,7 @@ async fn serve_embed(
 /// forward, the pooling, or the softmax moves a score even when the argmax label
 /// is unchanged, so this is the regression-sensitive quantity. Returns `(digest,
 /// serve_wall_ms, rows_served)`.
-async fn serve_infer(
+pub(crate) async fn serve_infer(
     session: &Arc<InferenceSession>,
     model_id: &str,
     target_keys: &[String],
@@ -412,7 +423,7 @@ async fn serve_infer(
 
 /// A rows/s rate, or `0.0` when the serve was instantaneous (a degenerate
 /// measurement the rate gate fails closed on rather than dividing by zero).
-fn rows_per_s(rows: usize, wall_ms: f64) -> f64 {
+pub(crate) fn rows_per_s(rows: usize, wall_ms: f64) -> f64 {
     if wall_ms > 0.0 {
         rows as f64 / (wall_ms / 1_000.0)
     } else {

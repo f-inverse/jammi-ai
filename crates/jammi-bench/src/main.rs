@@ -60,6 +60,7 @@ mod context_predictor;
 mod corpus;
 mod eval;
 mod fixture;
+mod gpu_inference;
 mod graph_train;
 mod model_inference;
 mod operator_mirror;
@@ -347,6 +348,20 @@ enum Command {
     /// re-serves. Not a CI step — the provenance-recording rebuilder.
     #[command(hide = true)]
     RebuildModelInferenceSpec,
+    /// The on-GPU throughput/latency baseline: serves `generate_text_embeddings`
+    /// and `infer` on `gpu.device = 0` over the committed tiny bundles, measures
+    /// sustained rows/s and p50/p99 serve latency, and gates each against
+    /// `baselines/gpu_inference.json` (a throughput floor + a p99 ceiling). The GPU
+    /// peer of `model-inference-scale`; requires the `cuda` feature and a GPU (fails
+    /// loud on a CPU fallback). Emits the JSON report with the `gpu_inference` tier
+    /// set and exits non-zero on a regression or a non-deterministic serve.
+    GpuInferenceScale,
+    /// Internal: rebuild the committed GPU-inference baseline
+    /// (`baselines/gpu_inference.json`) from a fresh serve on this device. Run
+    /// off-box on the target device class (the prove-lane A100) when the baseline
+    /// is established or the serving contract changes; CI only loads and re-serves.
+    #[command(hide = true)]
+    RebuildGpuInferenceSpec,
     /// The CPU-hermetic cache-hit SLO tier: drives the engine's opt-in producer
     /// memoization (`CachePolicy::Use`) on a cacheable producer (the
     /// neighbour-graph, anchored on the immutable source-table `ResultDigest`).
@@ -411,6 +426,8 @@ async fn main() -> std::process::ExitCode {
         Command::RebuildContextPredictorSpec => run_rebuild_context_predictor_spec().await,
         Command::ModelInferenceScale => run_model_inference_scale().await,
         Command::RebuildModelInferenceSpec => run_rebuild_model_inference_spec().await,
+        Command::GpuInferenceScale => run_gpu_inference_scale().await,
+        Command::RebuildGpuInferenceSpec => run_rebuild_gpu_inference_spec().await,
         Command::CacheSloScale => run_cache_slo_scale().await,
         Command::RecomputeScale => run_recompute_scale().await,
     }
@@ -451,6 +468,7 @@ async fn run_cache_slo_scale() -> std::process::ExitCode {
             graph_train: None,
             context_predictor: None,
             model_inference: None,
+            gpu_inference: None,
             cache_slo: Some(tier),
             recompute: None,
         },
@@ -502,6 +520,7 @@ async fn run_recompute_scale() -> std::process::ExitCode {
             graph_train: None,
             context_predictor: None,
             model_inference: None,
+            gpu_inference: None,
             cache_slo: None,
             recompute: Some(tier),
         },
@@ -604,6 +623,7 @@ async fn run_train_scale() -> std::process::ExitCode {
             graph_train: None,
             context_predictor: None,
             model_inference: None,
+            gpu_inference: None,
             cache_slo: None,
             recompute: None,
         },
@@ -665,6 +685,7 @@ fn run_conformal_scale() -> std::process::ExitCode {
             graph_train: None,
             context_predictor: None,
             model_inference: None,
+            gpu_inference: None,
             cache_slo: None,
             recompute: None,
         },
@@ -716,6 +737,7 @@ fn run_eval_scale() -> std::process::ExitCode {
             graph_train: None,
             context_predictor: None,
             model_inference: None,
+            gpu_inference: None,
             cache_slo: None,
             recompute: None,
         },
@@ -768,6 +790,7 @@ async fn run_propagate_scale() -> std::process::ExitCode {
             graph_train: None,
             context_predictor: None,
             model_inference: None,
+            gpu_inference: None,
             cache_slo: None,
             recompute: None,
         },
@@ -976,6 +999,7 @@ fn run_graph_train_scale() -> std::process::ExitCode {
             graph_train: Some(tier),
             context_predictor: None,
             model_inference: None,
+            gpu_inference: None,
             cache_slo: None,
             recompute: None,
         },
@@ -1075,6 +1099,7 @@ async fn run_context_predictor_scale() -> std::process::ExitCode {
             graph_train: None,
             context_predictor: Some(tier),
             model_inference: None,
+            gpu_inference: None,
             cache_slo: None,
             recompute: None,
         },
@@ -1181,6 +1206,7 @@ async fn run_model_inference_scale() -> std::process::ExitCode {
             graph_train: None,
             context_predictor: None,
             model_inference: Some(tier),
+            gpu_inference: None,
             cache_slo: None,
             recompute: None,
         },
@@ -1232,6 +1258,83 @@ async fn run_rebuild_model_inference_spec() -> std::process::ExitCode {
         }
         Err(e) => {
             eprintln!("failed to serialize model-inference spec: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// The GPU-inference corpus/measurement shape. A larger corpus than the CPU tier
+/// so the GPU serve is non-trivial, and enough iters for a meaningful p99 without
+/// making the prove-lane run long.
+const GPU_INFERENCE_PARAMS: gpu_inference::GpuInferenceParams = gpu_inference::GpuInferenceParams {
+    row_count: 256,
+    corpus_seed: 0,
+    iters: 20,
+    target_count: 8,
+};
+
+/// Run the GPU-inference tier against the committed baseline, emit the report,
+/// and exit non-zero on any regression / non-deterministic serve.
+async fn run_gpu_inference_scale() -> std::process::ExitCode {
+    let spec = match gpu_inference::GpuInferenceSpec::load() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("gpu-inference-scale could not load the committed baseline: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let tier = match gpu_inference::run(&spec).await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("gpu-inference-scale run failed: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let passed = gpu_inference::gates_passed(&tier);
+    let report = Report {
+        engine_version: ENGINE_VERSION,
+        host: Host::detect(),
+        subcommand: "gpu-inference-scale",
+        tiers: Tiers {
+            gpu_inference: Some(tier),
+            ..Default::default()
+        },
+    };
+    emit(&report);
+    if passed {
+        std::process::ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "gpu-inference gate FAILED — a served throughput dropped below its floor, a p99 \
+             latency rose above its ceiling, or a serve was non-deterministic (see the report)."
+        );
+        std::process::ExitCode::FAILURE
+    }
+}
+
+/// Rebuild and write the committed GPU-inference baseline from a fresh serve on
+/// this device. The off-box one-shot; prints the baseline it wrote.
+async fn run_rebuild_gpu_inference_spec() -> std::process::ExitCode {
+    let spec = match gpu_inference::rebuild_spec(GPU_INFERENCE_PARAMS).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("rebuild-gpu-inference-spec failed: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    match serde_json::to_string_pretty(&spec) {
+        Ok(json) => {
+            if let Err(e) =
+                std::fs::write(gpu_inference::GpuInferenceSpec::path(), format!("{json}\n"))
+            {
+                eprintln!("rebuild-gpu-inference-spec could not write the baseline: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+            println!("{json}");
+            std::process::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("failed to serialize gpu-inference baseline: {e}");
             std::process::ExitCode::FAILURE
         }
     }
@@ -1294,6 +1397,7 @@ async fn run_search_rss() -> std::process::ExitCode {
             graph_train: None,
             context_predictor: None,
             model_inference: None,
+            gpu_inference: None,
             cache_slo: None,
             recompute: None,
         },
@@ -1347,6 +1451,7 @@ async fn run_arxiv() -> std::process::ExitCode {
             graph_train: None,
             context_predictor: None,
             model_inference: None,
+            gpu_inference: None,
             cache_slo: None,
             recompute: None,
         },
@@ -1406,6 +1511,7 @@ async fn run_recall_sweep(
             graph_train: None,
             context_predictor: None,
             model_inference: None,
+            gpu_inference: None,
             cache_slo: None,
             recompute: None,
         },

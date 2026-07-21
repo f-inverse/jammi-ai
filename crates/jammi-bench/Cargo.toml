@@ -34,3 +34,9 @@ serde_json.workspace = true
 futures.workspace = true
 libc.workspace = true
 tempfile = "3"
+
+[features]
+# Enables the on-GPU perf-baseline tier (`gpu-inference-scale`): pulls the
+# engine's CUDA backend so the tier serves on a real device. Off by default so
+# the rest of the harness stays CPU-hermetic; the GPU prove-lane builds with it.
+cuda = ["jammi-ai/cuda"]

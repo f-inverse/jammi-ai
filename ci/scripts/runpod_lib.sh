@@ -13,6 +13,12 @@
 
 : "${RUNPOD_API_KEY:?RUNPOD_API_KEY must be set (GitHub secret)}"
 RP_IMAGE="${RP_IMAGE:-ghcr.io/f-inverse/jammi-ai-ci-cuda:latest}"
+# Minimum NVIDIA driver major the CUDA build needs: the image ships CUDA 12.6 PTX
+# that the deployment driver JIT-compiles at model load, so a pod below r560
+# (< CUDA 12.6) cannot run it — the engine's own startup floor (#304) rejects it
+# and every model load fails. RunPod's fleet is mixed, so pod selection fails
+# over past an under-floor pod rather than deploying onto one that cannot run.
+RP_MIN_DRIVER_MAJOR="${RP_MIN_DRIVER_MAJOR:-560}"
 RP_WORK="$(mktemp -d)"
 RP_SSH_KEY="$RP_WORK/id_ed25519"
 RP_POD_ID=""; RP_HOST=""; RP_PORT=""; RP_PUBKEY=""; RP_SSHO=()
@@ -76,13 +82,27 @@ print("" if "errors" in d else (d.get("data",{}).get("podFindAndDeployOnDemand")
 p=(json.load(sys.stdin).get("data",{}).get("pod") or {}).get("runtime") or {}
 [print(x["ip"], x["publicPort"]) for x in (p.get("ports") or []) if x.get("privatePort")==22 and x.get("isIpPublic")]' | head -1)
       if [ -n "${RP_HOST:-}" ] && ssh "${RP_SSHO[@]}" -p "$RP_PORT" "root@${RP_HOST}" true 2>/dev/null; then
-        echo "  SSH up on ${RP_HOST}:${RP_PORT}"; return 0
+        # Reachable — now gate on the driver floor. A pod below r560 cannot JIT
+        # the image's CUDA 12.6 PTX, so it is unusable for this build; fail over
+        # to the next candidate rather than run every test into the #304 floor.
+        local drv drv_major
+        drv="$(ssh "${RP_SSHO[@]}" -p "$RP_PORT" "root@${RP_HOST}" \
+          "nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1" 2>/dev/null)"
+        drv_major="${drv%%.*}"
+        if [ -n "$drv_major" ] && [ "$drv_major" -ge "$RP_MIN_DRIVER_MAJOR" ] 2>/dev/null; then
+          echo "  SSH up on ${RP_HOST}:${RP_PORT} (driver ${drv})"; return 0
+        fi
+        echo "  pod ${RP_POD_ID} driver '${drv:-unknown}' is below the r${RP_MIN_DRIVER_MAJOR} floor; terminating and trying next candidate"
+        rp_gql "{\"query\":\"mutation{ podTerminate(input:{podId:\\\"${RP_POD_ID}\\\"}) }\"}" >/dev/null 2>&1
+        RP_POD_ID=""; break
       fi
       RP_HOST=""; sleep 10
     done
-    echo "  pod ${RP_POD_ID} never became reachable; terminating and trying next candidate"
-    rp_gql "{\"query\":\"mutation{ podTerminate(input:{podId:\\\"${RP_POD_ID}\\\"}) }\"}" >/dev/null 2>&1
-    RP_POD_ID=""
+    if [ -n "$RP_POD_ID" ]; then
+      echo "  pod ${RP_POD_ID} never became reachable; terminating and trying next candidate"
+      rp_gql "{\"query\":\"mutation{ podTerminate(input:{podId:\\\"${RP_POD_ID}\\\"}) }\"}" >/dev/null 2>&1
+      RP_POD_ID=""
+    fi
   done
   if [ "$supply_seen" = "0" ]; then echo "::error::no GPU capacity on RunPod for the requested candidates (SUPPLY_CONSTRAINT); retry later"
   else echo "::error::GPU pod(s) deployed but none became reachable over SSH; retry later"; fi

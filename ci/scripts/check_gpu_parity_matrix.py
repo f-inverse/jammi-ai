@@ -175,7 +175,7 @@ STRUCTURALLY_EXCLUDED: dict[Cell, str] = {
     Cell("DistilBert", "AudioEmbedding"): "DistilBert is text-only; `forward_audio_embedding` requires a loaded `audio` tower, which a text load never populates.",
     Cell("ModernBert", "ImageEmbedding"): "ModernBert is text-only; `forward_image_embedding` requires a loaded `vision` tower, which a text load never populates.",
     Cell("ModernBert", "AudioEmbedding"): "ModernBert is text-only; `forward_audio_embedding` requires a loaded `audio` tower, which a text load never populates.",
-    Cell("ClipText", "ImageEmbedding"): "ClipText is the OpenCLIP TEXT tower only; `forward_image_embedding` requires a loaded `vision` tower, which a text-only load never populates.",
+    Cell("ClipText", "ImageEmbedding"): "ClipText is the OpenCLIP TEXT tower; on an OpenCLIP model (`is_open_clip` co-loads BOTH towers, candle.rs:1520-1522) image embedding is served by the co-loaded vision tower and is accounted under `OpenClipVision × ImageEmbedding` — the ClipText row covers only text-tower verbs.",
     Cell("ClipText", "AudioEmbedding"): "ClipText is the OpenCLIP TEXT tower only; `forward_audio_embedding` requires a loaded `audio` tower, which a text-only load never populates.",
     # ClipText's `OpenClipTextForward::forward_hidden` is a hard-coded `Err`
     # ("OpenCLIP text encoder does not support forward_hidden (classification
@@ -186,11 +186,11 @@ STRUCTURALLY_EXCLUDED: dict[Cell, str] = {
     # OpenClipVision is vision-only: `CandleModel::text` is never populated,
     # so `text_forward()` — which every text verb routes through — errors
     # "Cannot run text task on a vision-only model".
-    Cell("OpenClipVision", "TextEmbedding"): "OpenClipVision is vision-only; forward_embedding (TextEmbedding) calls text_forward(), which errors \"Cannot run text task on a vision-only model\".",
+    Cell("OpenClipVision", "TextEmbedding"): "An OpenCLIP model's text embedding is served by its co-loaded ClipText text tower (`is_open_clip` co-loads both towers, candle.rs:1520-1522) and is accounted under `ClipText × TextEmbedding`; the OpenClipVision (vision-tower) row covers only `ImageEmbedding`.",
     Cell("OpenClipVision", "AudioEmbedding"): "OpenClipVision is vision-only; forward_audio_embedding requires a loaded `audio` tower, which a vision-only load never populates.",
-    Cell("OpenClipVision", "Classification"): "OpenClipVision is vision-only; forward_classification calls text_forward(), which errors \"Cannot run text task on a vision-only model\".",
-    Cell("OpenClipVision", "Ner"): "OpenClipVision is vision-only; forward_ner calls text_forward(), which errors \"Cannot run text task on a vision-only model\".",
-    Cell("OpenClipVision", "Regression"): "OpenClipVision is vision-only; forward_regression calls text_forward(), which errors \"Cannot run text task on a vision-only model\".",
+    Cell("OpenClipVision", "Classification"): "Classification on an OpenCLIP model routes through the text tower, whose `OpenClipTextForward::forward_hidden` is a hard Err (open_clip_text.rs) — non-serveable, accounted under `ClipText × Classification`; the vision-tower row covers only `ImageEmbedding`.",
+    Cell("OpenClipVision", "Ner"): "NER on an OpenCLIP model routes through the text tower, whose `OpenClipTextForward::forward_hidden` is a hard Err (open_clip_text.rs) — non-serveable, accounted under `ClipText × Ner`; the vision-tower row covers only `ImageEmbedding`.",
+    Cell("OpenClipVision", "Regression"): "Regression on an OpenCLIP model is served by the co-loaded ClipText text tower's `forward_pooled` and is accounted under `ClipText × Regression`; the OpenClipVision (vision-tower) row covers only `ImageEmbedding`.",
     # HtsatAudio is audio-only: `CandleModel::text` is never populated either,
     # so the same `text_forward()` guard rejects every text verb; it has no
     # `vision` tower for ImageEmbedding.

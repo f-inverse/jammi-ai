@@ -1270,7 +1270,6 @@ const GPU_INFERENCE_PARAMS: gpu_inference::GpuInferenceParams = gpu_inference::G
     row_count: 256,
     corpus_seed: 0,
     iters: 20,
-    target_count: 8,
 };
 
 /// Run the GPU-inference tier against the committed baseline, emit the report,

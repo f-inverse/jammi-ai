@@ -1,38 +1,45 @@
-//! On-GPU throughput/latency baseline — the perf-regression net the rest of the
-//! GPU-inference tiers (fp8, cuDNN/flash-attn, the memory scheduler, batch
-//! coalescing) move a number against.
+//! On-GPU embedding throughput/latency baseline — the perf-regression net the
+//! GPU-inference optimizations (fp8, cuDNN/flash-attn, the memory scheduler,
+//! batch coalescing) move a number against.
 //!
 //! ## Why this exists next to the CPU-hermetic `model_inference` tier
 //!
 //! `model_inference` deliberately serves on `Device::Cpu` so it runs inside the
-//! hermetic `cargo test` net; it can prove byte-determinism and a coarse CPU
-//! code-path rate, but it says nothing about the real device. This tier is its
-//! GPU peer: it serves the same real verbs (`generate_text_embeddings`,
-//! `infer`) over the same tiny committed bundles on `gpu.device = 0`, and
-//! measures the two quantities a GPU optimization actually moves — sustained
-//! throughput (rows/s) and per-serve tail latency (p50/p99). It is gated (behind
-//! the `cuda` feature and the `live-gpu-tests` lane) so default `cargo test`
-//! stays hermetic.
+//! hermetic `cargo test` net; it proves byte-determinism and a coarse CPU
+//! code-path rate, but says nothing about the real device. This tier is its GPU
+//! peer for the embedding path: it serves the real `generate_text_embeddings`
+//! verb over the same tiny committed bundle on `gpu.device = 0`, and measures the
+//! two quantities a GPU optimization actually moves — sustained throughput
+//! (rows/s) and per-serve tail latency (p50/p99). It is gated (behind the `cuda`
+//! feature and the `live-gpu-tests` lane) so default `cargo test` stays hermetic.
+//!
+//! ## Scope: embedding only
+//!
+//! The embedding forward is the primary GPU workload and the one the open
+//! optimizations target (the encoder forward, its precision, its attention
+//! kernel). The classification (`infer`) path is intentionally out of scope here
+//! — it is not yet a validated GPU path (the gated `gpu_capability` suite covers
+//! embeddings, fine-tune, and bf16, not classification), so a perf baseline is
+//! premature until its correctness on-device is established.
 //!
 //! ## What it measures and gates
 //!
-//! For each verb: after a warmup serve that pays the one-time model-load + PTX
-//! JIT cost, `iters` measured serves are timed. From the per-serve wall-times
-//! come p50 / p99 (nearest-rank) and a rows/s throughput taken at the median.
-//! Two gates hold, both against a committed same-device baseline
-//! (`baselines/gpu_inference.json`, captured on the A100 the prove-lane runs):
+//! After a warmup serve that pays the one-time model-load + PTX JIT cost, `iters`
+//! measured serves are timed; from the per-serve wall-times come p50 / p99
+//! (nearest-rank) and a rows/s throughput at the median. Two gates hold against a
+//! committed same-device baseline (`baselines/gpu_inference.json`, captured on the
+//! A100 the prove-lane runs):
 //!
-//! - **throughput floor** — rows/s must clear `baseline · (1 − threshold)`
-//!   (the same relative-drop [`crate::rate_gate`] the CPU tier uses), catching a
-//!   throughput regression.
-//! - **tail-latency ceiling** — p99 must stay under `baseline · (1 + threshold)`,
-//!   catching a latency regression that leaves mean throughput unmoved.
+//! - **throughput floor** — rows/s must clear `baseline · (1 − threshold)` (the
+//!   same relative-drop [`crate::rate_gate`] the CPU tier uses).
+//! - **tail-latency ceiling** — p99 must stay under `baseline · (1 + threshold)`.
 //!
-//! A determinism check rides along: every measured serve's digest must equal the
-//! first, proving the GPU kernel path is deterministic across repeats on the box.
+//! Cross-repeat determinism is *recorded* (every measured serve's digest vs the
+//! first) but not gated — GPU float bit-equality is not a property this codebase
+//! asserts (the device correctness contract is the parity suite's tolerance).
 //!
 //! The threshold is generous by design (GPU wall-times vary with the pod, its
-//! neighbours, and thermals); this is a coarse 2×-regression net, not a
+//! neighbours, and thermals); this is a coarse regression net, not a
 //! micro-benchmark.
 
 use std::error::Error;
@@ -41,7 +48,7 @@ use jammi_db::store::manifest::ComputeDevice;
 use serde::{Deserialize, Serialize};
 
 use crate::model_inference::{
-    build_corpus, corpus_session_on_device, local_model_id, rows_per_s, serve_embed, serve_infer,
+    build_corpus, corpus_session_on_device, local_model_id, rows_per_s, serve_embed,
     ModelInferenceSpec, Row,
 };
 use crate::rate_gate::{RateGate, DEFAULT_REGRESSION_THRESHOLD};
@@ -50,29 +57,22 @@ use crate::report::{GpuInferenceTier, GpuLane, LatencyVerdict, Measurement, Rate
 /// The CUDA device ordinal the tier serves on. Device 0 is the prove-lane A100.
 const GPU_DEVICE: i32 = 0;
 
-/// The committed on-GPU baseline: the corpus shape, the per-verb throughput and
-/// tail-latency baselines, and the fold width. On-disk at
-/// `baselines/gpu_inference.json`; captured off-box by `rebuild-gpu-inference-spec`
-/// on the same device class the gate runs on (A100).
+/// The committed on-GPU embedding baseline: the corpus shape and the embed
+/// throughput + tail-latency baselines. On-disk at `baselines/gpu_inference.json`;
+/// captured off-box by `rebuild-gpu-inference-spec` on the same device class the
+/// gate runs on (A100).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GpuInferenceSpec {
-    /// Synthetic corpus row count — how many rows each serve embeds/infers.
+    /// Synthetic corpus row count — how many rows each serve embeds.
     pub row_count: usize,
     /// Corpus generation seed.
     pub corpus_seed: u64,
-    /// Measured serves per verb (after warmup) the percentiles fold over.
+    /// Measured serves (after warmup) the percentiles fold over.
     pub iters: usize,
-    /// Infer digest fold width — how many corpus rows the infer determinism
-    /// digest walks, in committed order.
-    pub target_keys: Vec<String>,
     /// Committed same-device embed throughput baseline, rows/s.
     pub baseline_embed_rows_per_s: f64,
     /// Committed same-device embed p99 serve latency baseline, ms.
     pub baseline_embed_p99_ms: f64,
-    /// Committed same-device infer throughput baseline, rows/s.
-    pub baseline_infer_rows_per_s: f64,
-    /// Committed same-device infer p99 serve latency baseline, ms.
-    pub baseline_infer_p99_ms: f64,
 }
 
 impl GpuInferenceSpec {
@@ -97,10 +97,8 @@ pub struct GpuInferenceParams {
     pub row_count: usize,
     /// The corpus generation seed.
     pub corpus_seed: u64,
-    /// Measured serves per verb (after warmup).
+    /// Measured serves (after warmup).
     pub iters: usize,
-    /// How many corpus rows the infer digest folds over.
-    pub target_count: usize,
 }
 
 /// The p50 and p99 of a set of per-serve latencies (ms), by nearest-rank on the
@@ -116,34 +114,31 @@ fn percentiles_ms(mut latencies_ms: Vec<f64>) -> (f64, f64) {
     (latencies_ms[rank(0.50)], latencies_ms[rank(0.99)])
 }
 
-/// Serve one verb `warmup + iters` times on the GPU session, returning the
+/// Serve the embed verb `warmup + iters` times on the GPU session, returning the
 /// measured lane (throughput + p50/p99 + both gate verdicts + the determinism
-/// verdict). `serve` runs one serve and yields `(digest, serve_ms, rows)`.
-async fn measure_lane<F, Fut>(
+/// verdict).
+async fn measure_embed_lane(
+    session: &std::sync::Arc<jammi_ai::session::InferenceSession>,
+    model_id: &str,
     iters: usize,
     baseline_rows_per_s: f64,
     baseline_p99_ms: f64,
-    mut serve: F,
-) -> Result<GpuLane, Box<dyn Error>>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<(String, f64, usize), Box<dyn Error>>>,
-{
+) -> Result<GpuLane, Box<dyn Error>> {
     // Warmup: pays the one-time model-load + PTX-JIT cost so it does not land in
     // the measured tail.
-    let (first_digest, _warm_ms, rows) = serve().await?;
+    let (first_digest, _warm_ms, rows) = serve_embed(session, model_id).await?;
 
     let mut latencies_ms = Vec::with_capacity(iters);
     let mut deterministic = true;
     for _ in 0..iters {
-        let (digest, serve_ms, _rows) = serve().await?;
+        let (digest, serve_ms, _rows) = serve_embed(session, model_id).await?;
         if digest != first_digest {
             deterministic = false;
         }
         latencies_ms.push(serve_ms);
     }
 
-    let (p50_ms, p99_ms) = percentiles_ms(latencies_ms.clone());
+    let (p50_ms, p99_ms) = percentiles_ms(latencies_ms);
     // Throughput at the median serve — the representative steady-state rate.
     let rate = rows_per_s(rows, p50_ms);
 
@@ -181,33 +176,20 @@ fn require_cuda(device: ComputeDevice) -> Result<String, Box<dyn Error>> {
     }
 }
 
-/// Run the GPU-inference tier against the committed baseline: serve both verbs on
-/// `gpu.device = 0`, measure throughput + p50/p99, and assemble the tier with the
-/// throughput-floor and tail-latency-ceiling gates.
+/// Run the GPU-inference tier against the committed baseline: serve the embed
+/// verb on `gpu.device = 0`, measure throughput + p50/p99, and assemble the tier
+/// with the throughput-floor and tail-latency-ceiling gates.
 pub async fn run(spec: &GpuInferenceSpec) -> Result<GpuInferenceTier, Box<dyn Error>> {
     let rows = build_corpus_from(spec.row_count, spec.corpus_seed);
-
-    // Embed lane.
     let (session, _dir) = corpus_session_on_device(&rows, GPU_DEVICE).await?;
     let device = require_cuda(session.compute_device())?;
     let embed_id = local_model_id(&ModelInferenceSpec::embed_model_dir())?;
-    let embed = measure_lane(
+    let embed = measure_embed_lane(
+        &session,
+        &embed_id,
         spec.iters,
         spec.baseline_embed_rows_per_s,
         spec.baseline_embed_p99_ms,
-        || serve_embed(&session, &embed_id),
-    )
-    .await?;
-
-    // Infer lane — a fresh session so the embed serves do not warm its cache.
-    let (session, _dir) = corpus_session_on_device(&rows, GPU_DEVICE).await?;
-    require_cuda(session.compute_device())?;
-    let infer_id = local_model_id(&ModelInferenceSpec::classifier_model_dir())?;
-    let infer = measure_lane(
-        spec.iters,
-        spec.baseline_infer_rows_per_s,
-        spec.baseline_infer_p99_ms,
-        || serve_infer(&session, &infer_id, &spec.target_keys),
     )
     .await?;
 
@@ -215,50 +197,35 @@ pub async fn run(spec: &GpuInferenceSpec) -> Result<GpuInferenceTier, Box<dyn Er
         device,
         iters: spec.iters,
         embed,
-        infer,
     })
 }
 
-/// Whether every gate held: both verbs deterministic across repeats, both
-/// throughputs cleared their floors, and both p99 latencies stayed under ceiling.
+/// Whether every gate held: throughput cleared its floor and p99 stayed under
+/// ceiling. (Cross-repeat determinism is recorded on the lane but not gated — see
+/// the module docs.)
 pub fn gates_passed(tier: &GpuInferenceTier) -> bool {
-    [&tier.embed, &tier.infer].iter().all(|lane| {
-        lane.deterministic
-            && lane.rate_gate.as_ref().is_none_or(|v| v.passed)
-            && lane.latency_gate.as_ref().is_none_or(|v| v.passed)
-    })
+    tier.embed.rate_gate.as_ref().is_none_or(|v| v.passed)
+        && tier.embed.latency_gate.as_ref().is_none_or(|v| v.passed)
 }
 
 /// Re-derive the committed baseline from a fresh serve on this device: measure
-/// both verbs and record their throughput + p99 baselines. The off-box one-shot
+/// the embed verb and record its throughput + p99 baselines. The off-box one-shot
 /// that writes `baselines/gpu_inference.json`, run on the target device class
 /// (A100); the gate only ever loads and re-serves.
 pub async fn rebuild_spec(params: GpuInferenceParams) -> Result<GpuInferenceSpec, Box<dyn Error>> {
-    let rows = build_corpus_from(params.row_count, params.corpus_seed);
-    let target_keys: Vec<String> = rows
-        .iter()
-        .take(params.target_count)
-        .map(|r| r.id.clone())
-        .collect();
-
-    // Zeroed baselines so the first measurement's rate gate is vacuously wide;
-    // we overwrite them with the measured values below.
+    // Zeroed floor / infinite ceiling so the capture serve's gates are vacuously
+    // wide; overwrite with the measured values below.
     let mut spec = GpuInferenceSpec {
         row_count: params.row_count,
         corpus_seed: params.corpus_seed,
         iters: params.iters,
-        target_keys: target_keys.clone(),
         baseline_embed_rows_per_s: 0.0,
         baseline_embed_p99_ms: f64::INFINITY,
-        baseline_infer_rows_per_s: 0.0,
-        baseline_infer_p99_ms: f64::INFINITY,
     };
 
     let tier = run(&spec).await?;
     spec.baseline_embed_rows_per_s = tier.embed.rows_per_s.value.unwrap_or(0.0);
     spec.baseline_embed_p99_ms = tier.embed.p99_ms.value.unwrap_or(0.0);
-    spec.baseline_infer_rows_per_s = tier.infer.rows_per_s.value.unwrap_or(0.0);
-    spec.baseline_infer_p99_ms = tier.infer.p99_ms.value.unwrap_or(0.0);
     Ok(spec)
 }
 

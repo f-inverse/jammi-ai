@@ -1109,23 +1109,22 @@ pub struct GpuLane {
     pub deterministic: bool,
 }
 
-/// The on-GPU throughput/latency baseline tier: the two real serving verbs
-/// (`generate_text_embeddings`, `infer`) measured on `gpu.device = 0` over the
-/// tiny committed bundles, each gated on a throughput floor and a p99 ceiling
-/// against `baselines/gpu_inference.json`. The GPU peer of [`ModelInferenceTier`]
-/// — where that tier is CPU-hermetic and gates determinism, this one runs on the
-/// real device and gates the perf a GPU optimization moves.
+/// The on-GPU embedding throughput/latency baseline tier: the real
+/// `generate_text_embeddings` verb measured on `gpu.device = 0` over the tiny
+/// committed bundle, gated on a throughput floor and a p99 ceiling against
+/// `baselines/gpu_inference.json`. The GPU peer of [`ModelInferenceTier`] — where
+/// that tier is CPU-hermetic and gates determinism, this one runs on the real
+/// device and gates the perf a GPU optimization moves. Scoped to embedding: the
+/// classification (`infer`) path is not yet a validated GPU path.
 #[derive(Debug, Serialize)]
 pub struct GpuInferenceTier {
     /// The device the serve resolved to (e.g. `cuda:0`) — proof it was not a CPU
     /// fallback.
     pub device: String,
-    /// Measured serves per verb (after warmup) the percentiles folded over.
+    /// Measured serves (after warmup) the percentiles folded over.
     pub iters: usize,
     /// The embed verb's lane.
     pub embed: GpuLane,
-    /// The infer verb's lane.
-    pub infer: GpuLane,
 }
 
 /// The CPU-hermetic cache-hit SLO tier: the engine's opt-in producer memoization

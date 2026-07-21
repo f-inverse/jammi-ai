@@ -1,13 +1,14 @@
 //! CPU↔GPU parity for `infer` (`Classification`) over a **ModernBERT** classifier.
 //!
-//! The embedding parity lane runs a plain-BERT encoder; this lane is the only
-//! one exercising the ModernBERT backbone (rotary attention, GeGLU) on a real
-//! device. That path silently failed on GPU — the score-matmul relied on RoPE
-//! leaving Q/K contiguous, which holds on CPU but not CUDA, so every row errored
-//! and `infer` returned empty scores (annotate semantics swallow the per-row
-//! error). This test is the regression guard: it asserts the GPU actually
-//! produced a score distribution for every row AND that it matches the CPU
-//! distribution up to reduction noise.
+//! This is the only lane exercising the ModernBERT backbone through the
+//! classification head on a real device — the path that silently produced no
+//! output on GPU. The genuine failure is the classifier's CLS row: `SeqClassifier`
+//! pulls it with `narrow(seq=0).squeeze(1)`, leaving a 2-D tensor whose row stride
+//! is `seq·hidden` (≠ `hidden`), a layout candle's CUDA matmul rejects while its
+//! CPU matmul tolerates it. Every row errored, and `infer`'s per-row annotate
+//! semantics swallowed the error into empty scores. This test is the regression
+//! guard: it asserts the GPU produced a score distribution for every row AND that
+//! it matches the CPU distribution up to reduction noise.
 
 use std::collections::HashMap;
 use std::sync::Arc;

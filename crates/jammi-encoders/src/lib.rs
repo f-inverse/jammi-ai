@@ -54,22 +54,25 @@ use candle_core::Tensor;
 
 /// Contiguity-safe matmul — the single matmul primitive every encoder uses.
 ///
-/// candle's **CUDA** matmul rejects an arbitrary-strided operand (a view left by
-/// `narrow` / `transpose` / a RoPE op chain) with "matmul is only supported for
-/// contiguous tensors"; its **CPU** matmul silently tolerates the same tensor.
-/// That asymmetry is a whole class of CPU-passes / GPU-fails bug: an attention
-/// score or context matmul fed a non-contiguous Q/K/V is correct on CPU yet
-/// errors at model load on GPU — and because inference annotates per-row errors,
-/// the failure is swallowed into empty output rather than surfaced.
+/// candle's **CUDA** matmul rejects two operand layouts its **CPU** matmul
+/// silently tolerates: a batched operand with **irregular batch strides** (a
+/// batch dim scrambled by `permute` / `index` / `narrow`, e.g. the OpenCLIP
+/// `qkv` split), and a **2-D operand whose row stride ≠ its column count** (a
+/// `narrow`+`squeeze` slice, e.g. the ModernBERT classifier's CLS row). It does
+/// *accept* a plain transpose (`.t()`) and regular batched transposes, so not
+/// every view is a problem — but which ones are is candle-internal and
+/// version-dependent. An operand of a rejected layout fails at model load on GPU,
+/// and because inference annotates per-row errors, the failure is swallowed into
+/// empty output rather than surfaced — a silent CPU-passes / GPU-fails class.
 ///
-/// Materialising both operands here, once, removes the class: no encoder call
-/// site has to know which view ops leave which layout, and no future
-/// architecture can reintroduce the bug by feeding a matmul a fresh
-/// non-contiguous tensor. It is deliberately unconditional rather than
-/// "`contiguous()` only when candle would reject it" — guessing candle's accepted
-/// layouts would re-encode a dependency on its internal behaviour, the exact
-/// fragility this replaces. `contiguous()` is a no-op on an already-contiguous
-/// tensor, so a copy happens only where one was genuinely needed.
+/// This primitive makes **both** operands contiguous unconditionally rather than
+/// reasoning per-site about which view ops leave which layout. That per-site
+/// reasoning is the error-prone analysis that let the bug exist — and that even a
+/// careful reader gets wrong (a RoPE'd score matmul *looks* non-contiguous but
+/// RoPE materialises its operands, so candle accepts it). Encoding the guard once,
+/// depending on no candle internal, is worth a bounded cost: `contiguous()` is a
+/// no-op on an already-contiguous operand and a single copy on a transposed one
+/// candle would otherwise have accepted natively.
 pub fn contiguous_matmul(a: &Tensor, b: &Tensor) -> candle_core::Result<Tensor> {
     a.contiguous()?.matmul(&b.contiguous()?)
 }

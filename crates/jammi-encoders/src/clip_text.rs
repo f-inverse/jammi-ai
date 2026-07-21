@@ -144,10 +144,11 @@ impl MultiHeadAttention {
         let v = qkv.i(2)?.contiguous()?;
 
         let scale = (self.head_dim as f64).sqrt();
-        let attn_scores = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?)? / scale)?;
+        let attn_scores =
+            (crate::contiguous_matmul(&q, &k.transpose(D::Minus2, D::Minus1)?)? / scale)?;
         let attn_scores = attn_scores.broadcast_add(causal_mask)?;
         let attn_weights = candle_nn::ops::softmax_last_dim(&attn_scores)?;
-        let attn_output = attn_weights.matmul(&v)?;
+        let attn_output = crate::contiguous_matmul(&attn_weights, &v)?;
 
         let attn_output = attn_output.permute((0, 2, 1, 3))?.reshape((
             batch,
@@ -324,7 +325,7 @@ impl ClipText {
         let pooled = gather_at_indices(&x, &eot_indices)?;
 
         // Project into the shared CLIP latent space and L2-normalize.
-        let projected = pooled.matmul(&self.text_projection)?;
+        let projected = crate::contiguous_matmul(&pooled, &self.text_projection)?;
         l2_normalize(&projected)
     }
 

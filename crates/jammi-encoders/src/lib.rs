@@ -49,3 +49,30 @@ pub use htsat_audio::{HtsatAudio, HtsatAudioConfig};
 pub use modernbert::{ModernBert, ModernBertConfig};
 pub use pooling::{pool_and_normalize, Pooling};
 pub use precision::compute_precision_to_dtype;
+
+use candle_core::Tensor;
+
+/// Contiguity-safe matmul — the single matmul primitive every encoder uses.
+///
+/// candle's **CUDA** matmul rejects two operand layouts its **CPU** matmul
+/// silently tolerates: a batched operand with **irregular batch strides** (a
+/// batch dim scrambled by `permute` / `index` / `narrow`, e.g. the OpenCLIP
+/// `qkv` split), and a **2-D operand whose row stride ≠ its column count** (a
+/// `narrow`+`squeeze` slice, e.g. the ModernBERT classifier's CLS row). It does
+/// *accept* a plain transpose (`.t()`) and regular batched transposes, so not
+/// every view is a problem — but which ones are is candle-internal and
+/// version-dependent. An operand of a rejected layout fails at model load on GPU,
+/// and because inference annotates per-row errors, the failure is swallowed into
+/// empty output rather than surfaced — a silent CPU-passes / GPU-fails class.
+///
+/// This primitive makes **both** operands contiguous unconditionally rather than
+/// reasoning per-site about which view ops leave which layout. That per-site
+/// reasoning is the error-prone analysis that let the bug exist — and that even a
+/// careful reader gets wrong (a RoPE'd score matmul *looks* non-contiguous but
+/// RoPE materialises its operands, so candle accepts it). Encoding the guard once,
+/// depending on no candle internal, is worth a bounded cost: `contiguous()` is a
+/// no-op on an already-contiguous operand and a single copy on a transposed one
+/// candle would otherwise have accepted natively.
+pub fn contiguous_matmul(a: &Tensor, b: &Tensor) -> candle_core::Result<Tensor> {
+    a.contiguous()?.matmul(&b.contiguous()?)
+}

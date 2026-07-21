@@ -27,7 +27,10 @@ impl SeqClassifier {
             .backbone
             .forward_hidden(input_ids, mask)
             .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
-        let cls = hidden.narrow(1, 0, 1)?.squeeze(1)?;
+        // `narrow(seq=0)` leaves a row-strided view; candle's CUDA matmul (the
+        // head's linear) rejects a non-contiguous input, so materialise the CLS
+        // row before projecting. A no-op on CPU where it is already contiguous.
+        let cls = hidden.narrow(1, 0, 1)?.squeeze(1)?.contiguous()?;
         self.head.forward(&cls)
     }
 

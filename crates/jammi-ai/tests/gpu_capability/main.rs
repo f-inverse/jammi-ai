@@ -55,6 +55,7 @@
 mod harness;
 
 mod bf16_gpu_gate;
+mod classification_parity;
 mod embeddings_parity;
 mod fine_tune_learns;
 mod graph_finetune_learns;

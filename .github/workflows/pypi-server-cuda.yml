@@ -57,6 +57,13 @@ jobs:
       - name: Strip the binary
         run: strip target/release/jammi-server
 
+      # Fail here — not on a user's machine at execve — if the binary links a
+      # CUDA library the `nvidia-*-cu12` dependency wheels + shim do not deliver.
+      # DT_NEEDED survives stripping (it lives in .dynamic), so this checks the
+      # exact bytes shipped.
+      - name: Verify the CUDA link set is covered by the wheel dependencies
+        run: python3 packaging/server-cu12/verify_link_set.py target/release/jammi-server
+
       - uses: actions/upload-artifact@v4
         with:
           name: server-cu12-binary

@@ -798,8 +798,15 @@ impl InferenceSession {
 
     /// Run inference on a registered source using a model.
     ///
-    /// Scans the source, feeds `content_columns` through the model,
-    /// and returns RecordBatches with prefix + task-specific columns.
+    /// Scans the source, feeds `content_columns` through the model, and
+    /// returns RecordBatches with prefix + task-specific columns. The
+    /// per-row `_status`/`_error` prefix columns are reserved for **pre-forward
+    /// input validation** (an empty/null content row is annotated
+    /// `_status = "error"` before the model ever sees it) — a `model.forward`
+    /// failure itself is always systemic (a broken kernel, a
+    /// contiguity/PTX/dtype mismatch, or a model incapable of the requested
+    /// task), so it fails this call loudly as an `Err` rather than being
+    /// annotated as an all-`_status = "error"` relation.
     pub async fn infer(
         &self,
         source_id: &str,

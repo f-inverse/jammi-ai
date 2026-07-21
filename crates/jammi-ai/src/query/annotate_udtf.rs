@@ -32,6 +32,13 @@
 //! The output schema is the inference prefix (`_row_id`, `_source`, `_model`,
 //! `_status`, `_error`, `_latency_ms`) followed by the task's columns. The
 //! caller joins back to the source on `_row_id = <key column>`.
+//!
+//! `_status = "error"` is reserved for **pre-forward per-row input
+//! validation** (an empty/null content column) — it is annotated before the
+//! model ever runs. A `model.forward` failure itself is always systemic (a
+//! broken kernel, a contiguity/PTX/dtype mismatch, or a model incapable of
+//! the requested task), never a per-row event, so it fails the whole query
+//! loudly rather than being served as an all-`_status = "error"` relation.
 
 use std::any::Any;
 use std::fmt;

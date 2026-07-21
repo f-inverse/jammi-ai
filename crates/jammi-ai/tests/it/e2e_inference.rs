@@ -323,6 +323,93 @@ async fn e2e_error_rows_have_null_vector_and_error_message() {
     }
 }
 
+// ─── Systemic forward failure propagates loudly (esc-028 / #319 / #326) ────
+//
+// A `model.forward` failure is always systemic (a broken kernel, a
+// contiguity/PTX/dtype mismatch, or — as exercised here — a model that
+// cannot serve the requested task at all), never a per-row event. It must
+// fail the operation as an `Err`, not be served as an all-`_status = "error"`
+// relation or silently persist an empty "ready" embedding table.
+
+#[tokio::test]
+async fn e2e_systemic_forward_failure_propagates_from_infer() {
+    // `ModelTask::Regression` on a base (never fine-tuned) checkpoint fails
+    // identically for every row — the model carries no distributional head —
+    // which is a systemic, non-OOM `model.forward` error, not a per-row input
+    // problem. It must propagate out of `infer` as an `Err`.
+    let (session, _dir) = session_with_patents().await;
+    let model_source = tiny_bert_source();
+
+    let err = session
+        .infer(
+            "patents",
+            &model_source,
+            ModelTask::Regression,
+            &["abstract".to_string()],
+            "id",
+            jammi_db::store::CachePolicy::Bypass,
+        )
+        .await
+        .expect_err(
+            "a systemic (non-OOM) forward failure must propagate as an Err out of `infer`, \
+             not be served as an all-`_status=error` relation",
+        );
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("distributional head"),
+        "error should name the systemic forward failure (no fine-tuned head), got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn e2e_systemic_forward_failure_propagates_from_embedding_pipeline() {
+    // `ModelTask::ImageEmbedding` on a text-only checkpoint (no vision tower)
+    // fails identically for every row — a systemic, non-OOM `model.forward`
+    // error. It must propagate out of `generate_image_embeddings` as an `Err`
+    // rather than silently persisting an empty "ready" embedding table (the
+    // #319 hole this fix closes) or an all-error relation.
+    let (session, _dir) = session_with_patents().await;
+    let model_id = "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap();
+
+    let err = session
+        .generate_image_embeddings(
+            "patents",
+            &model_id,
+            "abstract",
+            "id",
+            jammi_db::store::CachePolicy::Bypass,
+        )
+        .await
+        .expect_err(
+            "a systemic (non-OOM) forward failure must propagate as an Err out of \
+             `generate_image_embeddings`, not persist an empty ready embedding table",
+        );
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("vision"),
+        "error should name the systemic forward failure (no vision tower), got: {msg}"
+    );
+
+    // Non-vacuity: no `ready` embedding table was left behind for this failed
+    // run — the failure genuinely prevented materialization rather than the
+    // assertion above passing on an unrelated error.
+    let tables = session
+        .catalog()
+        .find_result_tables("patents", Some(ModelTask::ImageEmbedding), None)
+        .await
+        .unwrap();
+    assert!(
+        tables.iter().all(|t| t.status != "ready"),
+        "a systemic forward failure must not leave a ready embedding table behind, found: {:?}",
+        tables
+            .iter()
+            .map(|t| (&t.table_name, &t.status))
+            .collect::<Vec<_>>()
+    );
+}
+
 // ─── Observer integration ───────────────────────────────────────────────────
 
 #[tokio::test]

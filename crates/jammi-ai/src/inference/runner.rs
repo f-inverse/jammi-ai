@@ -15,8 +15,17 @@ use super::{extract_column, extract_columns, slice_columns};
 use crate::model::cache::ModelCache;
 use crate::model::{BackendType, LoadedModel, ModelSource, ModelTask};
 
-/// Processes input RecordBatches through a model, handling batching,
-/// error recovery, and dynamic batch sizing.
+/// Processes input RecordBatches through a model, handling batching and
+/// dynamic batch sizing.
+///
+/// A model-forward failure is always systemic (a broken kernel, a
+/// contiguity/PTX/dtype mismatch, or a model incapable of the requested
+/// task) — it is never a per-row event, so it is never annotated as a
+/// per-row `_status = error`. `run` propagates it as an `Err` sent through
+/// the output stream, failing the operation loudly. The only recovery this
+/// runner performs is OOM batch-halving (see [`Self::handle_oom`]), which
+/// retries the SAME chunk at a smaller size; every other forward failure,
+/// and a persistent OOM at the minimum batch size, propagates.
 pub struct InferenceRunner {
     model_cache: Arc<ModelCache>,
     source: ModelSource,
@@ -175,11 +184,18 @@ impl InferenceRunner {
                 )
                 .await
             }
-            Err(e) => {
-                tracing::warn!(rows = row_count, "Batch inference failed: {e}");
-                *current_batch_size = (*current_batch_size / 2).max(1);
-                self.build_error_batch(keys, adapter, &e.to_string(), row_count, output_schema)
-            }
+            // A non-OOM forward failure is always systemic — a broken kernel,
+            // a contiguity/PTX/dtype mismatch, or a model that cannot serve
+            // the requested task at all — never a per-row event (per-row
+            // input validation happens PRE-forward and sets
+            // `row_status[i] = false` without an `Err`; over-long text is
+            // truncated, not errored). Halving the batch size cannot isolate
+            // a bad row here — it only shrinks FUTURE chunks, the current
+            // chunk is never retried — so it is pointless for a systemic
+            // failure. Propagate instead of annotating an
+            // all-`_status = error` batch: `_status = error` means "this
+            // row's input was bad", never "the model is broken".
+            Err(e) => Err(e),
         }
     }
 
@@ -234,24 +250,18 @@ impl InferenceRunner {
                     );
                 }
                 Err(e) if Self::is_oom_error(&e) && *current_batch_size > 1 => continue,
-                Err(e) => {
-                    return self.build_error_batch(
-                        keys,
-                        adapter,
-                        &e.to_string(),
-                        row_count,
-                        output_schema,
-                    );
-                }
+                // A non-OOM failure discovered mid-retry is systemic (see the
+                // matching arm in `process_chunk`) — propagate rather than
+                // annotate.
+                Err(e) => return Err(e),
             }
         }
-        self.build_error_batch(
-            keys,
-            adapter,
-            "GPU OOM persists at minimum batch size",
-            row_count,
-            output_schema,
-        )
+        // Persistent OOM at the minimum batch size is an unservable resource
+        // failure — it must surface to the caller, not be annotated as a
+        // per-row `_status = error` batch.
+        Err(JammiError::Inference(
+            "GPU OOM persists at minimum batch size".into(),
+        ))
     }
 
     /// Build an output RecordBatch from a successful model forward pass.
@@ -280,48 +290,6 @@ impl InferenceRunner {
 
         RecordBatch::try_new(Arc::clone(output_schema), all_columns)
             .map_err(|e| JammiError::Inference(format!("Failed to build output batch: {e}")))
-    }
-
-    /// Build an all-error RecordBatch when the entire chunk fails.
-    ///
-    /// Uses the live `adapter` (built from the loaded model) so the error batch
-    /// matches the served schema even for a form-dependent head — a quantile
-    /// regression head's error columns are its level count, not the Gaussian
-    /// default of 2.
-    fn build_error_batch(
-        &self,
-        keys: &ArrayRef,
-        adapter: &dyn OutputAdapter,
-        error_message: &str,
-        row_count: usize,
-        output_schema: &SchemaRef,
-    ) -> Result<RecordBatch> {
-        let row_status = vec![false; row_count];
-        let row_errors = vec![error_message.to_string(); row_count];
-
-        // All-error backend output sized by the adapter, then re-stamped with
-        // this error's per-row message.
-        let mut dummy_output = adapter.error_output(row_count);
-        dummy_output.row_status = row_status.clone();
-        dummy_output.row_errors = row_errors.clone();
-
-        let task_columns = adapter.adapt(&dummy_output, row_count)?;
-
-        let prefix = build_prefix_columns(
-            keys,
-            &self.source_id,
-            &self.source.to_string(),
-            &row_status,
-            &row_errors,
-            0.0,
-            row_count,
-        );
-
-        let mut all_columns = prefix;
-        all_columns.extend(task_columns);
-
-        RecordBatch::try_new(Arc::clone(output_schema), all_columns)
-            .map_err(|e| JammiError::Inference(format!("Failed to build error batch: {e}")))
     }
 }
 

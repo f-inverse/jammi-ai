@@ -265,7 +265,8 @@ Each `RecordBatch` has prefix columns (`_row_id`, `_source`, `_model`, `_status`
 
 ## Error handling
 
-Inference never panics on bad input. Errors are tracked per-row:
+Inference never panics on bad input. `_status`/`_error` track **per-row input
+validation**, applied before the model ever runs:
 
 | Condition | `_status` | `_error` | `vector` |
 |-----------|-----------|----------|----------|
@@ -273,7 +274,12 @@ Inference never panics on bad input. Errors are tracked per-row:
 | Null text | `"error"` | `"Empty or null text input"` | null |
 | Empty text | `"error"` | `"Empty or null text input"` | null |
 
-The batch continues processing even when individual rows fail.
+The batch continues processing even when individual rows fail this
+validation. A model-forward failure itself — a broken kernel, a
+contiguity/PTX/dtype mismatch, or a model incapable of the requested task —
+is always systemic (every row fails identically), never a per-row event, so
+it fails the whole `infer`/embedding call with an error rather than being
+served as an all-`"error"` relation or an empty "ready" embedding table.
 
 ## Dynamic batch sizing
 
@@ -281,7 +287,7 @@ The runner starts with the configured `inference.batch_size` (default: 32). If a
 
 1. Halve the batch size
 2. Retry (up to 3 times)
-3. If OOM persists at batch size 1, mark the row as error and continue
+3. If OOM persists at batch size 1, the call fails with an error
 
 The reduced batch size is sticky for the remainder of the stream.
 

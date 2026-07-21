@@ -37,6 +37,14 @@ pub struct CandleBackend;
 /// L2-normalize over `forward_hidden`) is the base for any future wrapper
 /// that doesn't need model-declared pooling.
 pub(crate) trait CandleTextForward: Send + Sync {
+    /// The longest token sequence this encoder accepts (`max_position_embeddings`
+    /// for BERT-family towers, `context_length` for the OpenCLIP text tower).
+    /// The text path truncates tokenization to this bound so an over-long input
+    /// yields a truncated embedding rather than a hard forward failure — the
+    /// limit is the model's own, never a fixed constant that silently drops a
+    /// CLIP row (context 77) at a BERT-shaped 512.
+    fn max_sequence_length(&self) -> usize;
+
     fn forward_hidden(
         &self,
         input_ids: &Tensor,
@@ -129,6 +137,10 @@ struct BertForward {
 }
 
 impl CandleTextForward for BertForward {
+    fn max_sequence_length(&self) -> usize {
+        self.model.max_seq_length()
+    }
+
     fn forward_hidden(
         &self,
         input_ids: &Tensor,
@@ -162,6 +174,10 @@ struct ModernBertForward {
 }
 
 impl CandleTextForward for ModernBertForward {
+    fn max_sequence_length(&self) -> usize {
+        self.model.max_seq_length()
+    }
+
     fn forward_hidden(
         &self,
         input_ids: &Tensor,
@@ -196,6 +212,10 @@ struct DistilBertForward {
 }
 
 impl CandleTextForward for DistilBertForward {
+    fn max_sequence_length(&self) -> usize {
+        self.model.max_seq_length()
+    }
+
     fn forward_hidden(
         &self,
         input_ids: &Tensor,
@@ -228,6 +248,10 @@ struct DistilBertClassificationForward {
 }
 
 impl CandleTextForward for DistilBertClassificationForward {
+    fn max_sequence_length(&self) -> usize {
+        self.distilbert.max_seq_length()
+    }
+
     fn forward_hidden(
         &self,
         input_ids: &Tensor,
@@ -264,6 +288,10 @@ impl CandleTextForward for DistilBertClassificationForward {
 struct ModernBertClassificationForward(SeqClassifier);
 
 impl CandleTextForward for ModernBertClassificationForward {
+    fn max_sequence_length(&self) -> usize {
+        self.0.max_seq_length()
+    }
+
     fn forward_hidden(
         &self,
         input_ids: &Tensor,
@@ -287,6 +315,10 @@ struct BertClassificationForward {
 }
 
 impl CandleTextForward for BertClassificationForward {
+    fn max_sequence_length(&self) -> usize {
+        self.bert.max_seq_length()
+    }
+
     fn forward_hidden(
         &self,
         input_ids: &Tensor,
@@ -649,7 +681,10 @@ impl CandleModel {
         let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
             JammiError::Inference("No tokenizer loaded for regression model".into())
         })?;
-        let encoding = tokenizer.encode_batch(&valid_texts, Some(512))?;
+        let encoding = tokenizer.encode_batch(
+            &valid_texts,
+            Some(self.text_forward()?.max_sequence_length()),
+        )?;
         let input_ids = self.tokens_to_tensor(&encoding.input_ids)?;
         let attention_mask = self.tokens_to_tensor(&encoding.attention_masks)?;
 
@@ -764,7 +799,10 @@ impl CandleModel {
             let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
                 JammiError::Inference("No tokenizer loaded for embedding model".into())
             })?;
-            let encoding = tokenizer.encode_batch(&valid_texts, Some(512))?;
+            let encoding = tokenizer.encode_batch(
+                &valid_texts,
+                Some(self.text_forward()?.max_sequence_length()),
+            )?;
 
             let input_ids = self.tokens_to_tensor(&encoding.input_ids)?;
             let attention_mask = self.tokens_to_tensor(&encoding.attention_masks)?;
@@ -1042,7 +1080,10 @@ impl CandleModel {
             let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
                 JammiError::Inference("No tokenizer loaded for classification model".into())
             })?;
-            let encoding = tokenizer.encode_batch(&valid_texts, Some(512))?;
+            let encoding = tokenizer.encode_batch(
+                &valid_texts,
+                Some(self.text_forward()?.max_sequence_length()),
+            )?;
 
             let input_ids = self.tokens_to_tensor(&encoding.input_ids)?;
             let attention_mask = self.tokens_to_tensor(&encoding.attention_masks)?;
@@ -1149,7 +1190,10 @@ impl CandleModel {
                 .tokenizer
                 .as_ref()
                 .ok_or_else(|| JammiError::Inference("No tokenizer loaded for NER model".into()))?;
-            let encoding = tokenizer.encode_batch(&valid_texts, Some(512))?;
+            let encoding = tokenizer.encode_batch(
+                &valid_texts,
+                Some(self.text_forward()?.max_sequence_length()),
+            )?;
 
             let input_ids = self.tokens_to_tensor(&encoding.input_ids)?;
             let attention_mask = self.tokens_to_tensor(&encoding.attention_masks)?;

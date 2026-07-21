@@ -1,0 +1,7 @@
+{
+  "row_count": 256,
+  "corpus_seed": 0,
+  "iters": 20,
+  "baseline_embed_rows_per_s": 10043.872104157464,
+  "baseline_embed_p99_ms": 37.49413800000001
+}

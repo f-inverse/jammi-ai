@@ -466,6 +466,21 @@ jobs:
       - name: Assert the guide's documented enum enumerations match the code
         run: python3 ci/scripts/check_doc_parity.py
 
+  # GPU-parity coverage-completeness guard — the device-axis analog of the
+  # required Postgres/SQLite backend it-matrix. A trivial hermetic pure-Python
+  # check (no toolchain, no GPU): it enumerates every SHIPPED (encoder
+  # architecture × GPU-dispatching ModelTask verb) cell and requires each to
+  # be COVERED, STRUCTURALLY_EXCLUDED, or PENDING, so an untested cell cannot
+  # silently hide a divergence (closes esc-028). No path filter (runs on
+  # every PR) so the context stays safe to require.
+  gpu-parity-matrix:
+    name: Guard (GPU parity matrix)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assert every shipped (architecture x verb) cell is accounted for
+        run: python3 ci/scripts/check_gpu_parity_matrix.py
+
   # ── Single rolled-up gate ──────────────────────────────────────────────────
   # The ONE check a branch-protection ruleset should require, instead of listing
   # every job as a separate context. It fails if any job above failed/cancelled;
@@ -490,6 +505,7 @@ jobs:
       - test-python
       - test-pg
       - doc-parity
+      - gpu-parity-matrix
     if: always()
     uses: ./.github/workflows/_summary.yml
     with:

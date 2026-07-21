@@ -1,5 +1,7 @@
 //! CPU↔GPU parity for `infer` (`Classification`) over a **ModernBERT** classifier.
 //!
+//! gpu-parity-cell: ModernBert × Classification
+//!
 //! This is the only lane exercising the ModernBERT backbone through the
 //! classification head on a real device — the path that silently produced no
 //! output on GPU. The genuine failure is the classifier's CLS row: `SeqClassifier`

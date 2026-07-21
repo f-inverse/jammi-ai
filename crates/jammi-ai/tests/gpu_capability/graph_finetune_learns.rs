@@ -1,5 +1,10 @@
 //! P3 — `fine_tune_graph` learns on GPU, end to end.
 //!
+//! Not a `ci/scripts/check_gpu_parity_matrix.py` cell: this runs ONLY on GPU
+//! (no CPU baseline) and asserts a training-loop property (the adapter
+//! changes embeddings), not CPU↔GPU forward parity for an (architecture ×
+//! verb) cell.
+//!
 //! The declared-graph fine-tune (node CSV + edge CSV → biased-walk positives →
 //! MNRL over the LoRA trainer) runs on a GPU-pinned session over the synthetic
 //! two-community graph the CPU suite uses, and must:

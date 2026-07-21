@@ -1,5 +1,7 @@
 //! P1 — CPU↔GPU parity for `generate_text_embeddings` and `encode_text_query`.
 //!
+//! gpu-parity-cell: Bert × TextEmbedding
+//!
 //! The same `tiny_bert` encoder runs over the same `patents.parquet` subset on a
 //! GPU-pinned and a CPU-pinned session; the resulting per-row embedding vectors
 //! (keyed by `_row_id`, so the comparison is row-exact regardless of scan order)

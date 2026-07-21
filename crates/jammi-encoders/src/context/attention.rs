@@ -94,7 +94,7 @@ pub fn attention_weights(
     key_mask: Option<&Tensor>,
 ) -> Result<Tensor, EncoderError> {
     let (_b, _q_len, hidden) = query.dims3()?;
-    let scores = crate::contiguous_matmul(&query, &keys.t()?)?; // [B, q_len, kv_len]
+    let scores = crate::contiguous_matmul(query, &keys.t()?)?; // [B, q_len, kv_len]
     let scores = (scores / (hidden as f64).sqrt())?;
     let scores = match key_mask {
         // The additive mask is [B, 1, 1, kv_len]; squeeze the two singleton

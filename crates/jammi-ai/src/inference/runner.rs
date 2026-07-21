@@ -184,8 +184,18 @@ impl InferenceRunner {
     }
 
     fn is_oom_error(e: &JammiError) -> bool {
+        // Only a genuine out-of-memory error gets the batch-halving retry. A bare
+        // "cuda" substring is NOT OOM — it also matches kernel / loader failures
+        // such as `CUDA_ERROR_INVALID_PTX`, which halving the batch cannot fix
+        // and which must not be misrouted through the OOM path (#319). Match the
+        // OOM spellings across backends: `out of memory` (spaces), the CUDA
+        // `CUDA_ERROR_OUT_OF_MEMORY` (underscores), candle's `OutOfMemory`, and
+        // the bare `oom` token.
         let msg = e.to_string().to_lowercase();
-        msg.contains("out of memory") || msg.contains("oom") || msg.contains("cuda")
+        msg.contains("out of memory")
+            || msg.contains("out_of_memory")
+            || msg.contains("outofmemory")
+            || msg.contains("oom")
     }
 
     async fn handle_oom(
@@ -312,5 +322,27 @@ impl InferenceRunner {
 
         RecordBatch::try_new(Arc::clone(output_schema), all_columns)
             .map_err(|e| JammiError::Inference(format!("Failed to build error batch: {e}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `is_oom_error` must classify ONLY genuine out-of-memory errors. A CUDA
+    /// kernel/loader failure (e.g. `INVALID_PTX`) is not OOM — misrouting it to
+    /// the batch-halving retry (and never surfacing it) is #319.
+    #[test]
+    fn is_oom_error_matches_only_real_oom() {
+        let oom = |m: &str| InferenceRunner::is_oom_error(&JammiError::Inference(m.into()));
+        // Genuine OOM — including the CUDA OOM spelling — is caught.
+        assert!(oom("CUDA_ERROR_OUT_OF_MEMORY"));
+        assert!(oom("out of memory"));
+        assert!(oom("GPU OOM at batch 4"));
+        // Non-OOM CUDA failures must NOT be treated as OOM.
+        assert!(!oom("CUDA_ERROR_INVALID_PTX"));
+        assert!(!oom("a cuda kernel launch failed"));
+        assert!(!oom("cuDNN not available"));
+        assert!(!oom("shape mismatch"));
     }
 }

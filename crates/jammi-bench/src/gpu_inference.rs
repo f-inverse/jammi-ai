@@ -57,6 +57,14 @@ use crate::report::{GpuInferenceTier, GpuLane, LatencyVerdict, Measurement, Rate
 /// The CUDA device ordinal the tier serves on. Device 0 is the prove-lane A100.
 const GPU_DEVICE: i32 = 0;
 
+/// Relative-rise threshold for the p99 tail-latency ceiling — deliberately wider
+/// than the throughput floor's [`DEFAULT_REGRESSION_THRESHOLD`]. p99 over a short
+/// warmed sample is the single slowest serve, which is spiky on rented ephemeral
+/// GPUs (a neighbour, a scheduler hiccup, thermals); the throughput floor already
+/// gates the *median*, so this ceiling exists only to catch a gross tail
+/// regression (a p99 that more than doubles), not normal tail jitter.
+const LATENCY_CEILING_THRESHOLD: f64 = 1.0;
+
 /// The committed on-GPU embedding baseline: the corpus shape and the embed
 /// throughput + tail-latency baselines. On-disk at `baselines/gpu_inference.json`;
 /// captured off-box by `rebuild-gpu-inference-spec` on the same device class the
@@ -143,7 +151,7 @@ async fn measure_embed_lane(
     let rate = rows_per_s(rows, p50_ms);
 
     let rate_gate = RateGate::evaluate(rate, baseline_rows_per_s, DEFAULT_REGRESSION_THRESHOLD);
-    let latency = LatencyVerdict::evaluate(p99_ms, baseline_p99_ms, DEFAULT_REGRESSION_THRESHOLD);
+    let latency = LatencyVerdict::evaluate(p99_ms, baseline_p99_ms, LATENCY_CEILING_THRESHOLD);
 
     Ok(GpuLane {
         rows_per_s: Measurement::measured(rate, "rows_per_s"),

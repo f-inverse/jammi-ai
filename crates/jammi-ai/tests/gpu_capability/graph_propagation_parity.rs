@@ -1,5 +1,9 @@
 //! P1 — `propagate_embeddings` is device-independent (SGC and APPNP).
 //!
+//! Not a `ci/scripts/check_gpu_parity_matrix.py` cell: `propagate_embeddings`
+//! is not dispatched via `ModelTask`/`AnyEncoder` at all (see below) — it is
+//! the CPU-only fold the matrix's own docstring calls out as out of scope.
+//!
 //! Unlike the embedding / encode / predict verbs, graph propagation has **no
 //! GPU kernel**: it is a fixed-order `f64` fold in Rust with a single final
 //! `f32` cast (see `pipeline::graph_propagation`), deterministic and identical

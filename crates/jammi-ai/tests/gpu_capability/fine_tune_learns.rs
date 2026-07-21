@@ -1,5 +1,10 @@
 //! P2 — `fine_tune` learns on GPU.
 //!
+//! Not a `ci/scripts/check_gpu_parity_matrix.py` cell: this runs ONLY on GPU
+//! (no CPU baseline) and asserts a training-loop property (loss decreases,
+//! the adapter changes embeddings), not CPU↔GPU forward parity for an
+//! (architecture × verb) cell.
+//!
 //! A tiny real LoRA run over the `training_pairs.csv` fixture, on a GPU-pinned
 //! session (`gpu.device = 0`, `require_gpu = true`), must:
 //!   (a) complete without error on the GPU,

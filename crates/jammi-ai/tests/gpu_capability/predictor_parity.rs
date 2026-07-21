@@ -1,5 +1,11 @@
 //! P1 — CPU↔GPU parity for the context-predictor `predict` forward pass.
 //!
+//! Not a `ci/scripts/check_gpu_parity_matrix.py` cell: the context predictor
+//! is a `ContextArchitecture` (e.g. `AttnCnp`), a served-model family
+//! distinct from `AnyEncoder`/the OpenCLIP and HTSAT towers the matrix
+//! enumerates, so it sits outside that gate's (architecture × verb) scope
+//! even though it genuinely proves a CPU↔GPU parity property.
+//!
 //! One predictor is trained over a synthetic linear-function meta-dataset (CPU
 //! is fine for *producing* the predictor — the parity check is on the served
 //! forward, not on training), and its weights are persisted to the artifact

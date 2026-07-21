@@ -32,6 +32,9 @@ echo "::endgroup::"
 echo "::group::engine-core GPU correctness (jammi-ai gpu_capability)"
 cargo test -p jammi-ai --features cuda,live-gpu-tests --test gpu_capability -- --nocapture --test-threads=1 || rc=\$?
 echo "::endgroup::"
+echo "::group::GPU embedding perf baseline (jammi-bench gpu-inference-scale)"
+cargo run -p jammi-bench --release --features cuda -- gpu-inference-scale || rc=\$?
+echo "::endgroup::"
 echo "PROVE_EXIT=\${rc}"; exit \$rc
 REMOTE
 rc=$?

@@ -226,7 +226,7 @@ impl TimeInterp {
         // [B, C, T, F] -> [B, C, F, T] -> [B*C*F, T]
         let xt = x.transpose(2, 3)?.contiguous()?.reshape((b * c * f, t))?;
         // [B*C*F, T] @ [T, out_len] = [B*C*F, out_len]
-        let out = xt.matmul(&weights.t()?)?;
+        let out = crate::contiguous_matmul(&xt, &weights.t()?)?;
         // [B*C*F, out_len] -> [B, C, F, out_len] -> [B, C, out_len, F]
         let out = out
             .reshape((b, c, f, self.out_len))?
@@ -412,7 +412,7 @@ impl HtsatPatchEmbed {
 
         // Weight [out_c, 1, kh, kw] -> [kh*kw, out_c]; project and add bias.
         let w = self.mel_conv2d_weight.reshape((out_c, kh * kw))?.t()?;
-        let out = patches.matmul(&w.contiguous()?)?;
+        let out = crate::contiguous_matmul(&patches, &w)?;
         let out = out.broadcast_add(&self.mel_conv2d_bias)?;
 
         // [N*OH*OW, out_c] -> [N, OH, OW, out_c] -> [N, out_c, OH, OW].
@@ -605,7 +605,7 @@ impl SwinSelfAttention {
         let v = self.heads(&self.value.forward(hidden)?)?;
 
         let scale = 1.0 / (self.head_size as f64).sqrt();
-        let scores = (q.matmul(&k.transpose(D::Minus1, D::Minus2)?.contiguous()?)? * scale)?;
+        let scores = (crate::contiguous_matmul(&q, &k.transpose(D::Minus1, D::Minus2)?)? * scale)?;
 
         // bias = rel_bias_table[rel_index][L,L,heads].permute(2,0,1) -> [heads,L,L].
         let bias = self
@@ -630,7 +630,7 @@ impl SwinSelfAttention {
         };
 
         let probs = candle_nn::ops::softmax_last_dim(&scores)?;
-        let ctx = probs.matmul(&v)?; // [BnW, heads, L, head]
+        let ctx = crate::contiguous_matmul(&probs, &v)?; // [BnW, heads, L, head]
         let ctx = ctx.transpose(1, 2)?.contiguous()?.reshape((bnw, l, c))?;
         Ok(ctx)
     }

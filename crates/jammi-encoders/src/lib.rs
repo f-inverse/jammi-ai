@@ -49,3 +49,27 @@ pub use htsat_audio::{HtsatAudio, HtsatAudioConfig};
 pub use modernbert::{ModernBert, ModernBertConfig};
 pub use pooling::{pool_and_normalize, Pooling};
 pub use precision::compute_precision_to_dtype;
+
+use candle_core::Tensor;
+
+/// Contiguity-safe matmul — the single matmul primitive every encoder uses.
+///
+/// candle's **CUDA** matmul rejects an arbitrary-strided operand (a view left by
+/// `narrow` / `transpose` / a RoPE op chain) with "matmul is only supported for
+/// contiguous tensors"; its **CPU** matmul silently tolerates the same tensor.
+/// That asymmetry is a whole class of CPU-passes / GPU-fails bug: an attention
+/// score or context matmul fed a non-contiguous Q/K/V is correct on CPU yet
+/// errors at model load on GPU — and because inference annotates per-row errors,
+/// the failure is swallowed into empty output rather than surfaced.
+///
+/// Materialising both operands here, once, removes the class: no encoder call
+/// site has to know which view ops leave which layout, and no future
+/// architecture can reintroduce the bug by feeding a matmul a fresh
+/// non-contiguous tensor. It is deliberately unconditional rather than
+/// "`contiguous()` only when candle would reject it" — guessing candle's accepted
+/// layouts would re-encode a dependency on its internal behaviour, the exact
+/// fragility this replaces. `contiguous()` is a no-op on an already-contiguous
+/// tensor, so a copy happens only where one was genuinely needed.
+pub fn contiguous_matmul(a: &Tensor, b: &Tensor) -> candle_core::Result<Tensor> {
+    a.contiguous()?.matmul(&b.contiguous()?)
+}

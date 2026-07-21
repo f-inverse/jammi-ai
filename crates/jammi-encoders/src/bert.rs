@@ -140,7 +140,7 @@ impl BertSelfAttention {
         let k = self.transpose_for_scores(&k)?;
         let v = self.transpose_for_scores(&v)?;
 
-        let scores = q.matmul(&k.t()?)?;
+        let scores = crate::contiguous_matmul(&q, &k.t()?)?;
         let scores = (scores / (self.attention_head_size as f64).sqrt())?;
         // The additive mask is always built in F32 (see `extended_attention_mask`);
         // cast to the scores' dtype so a F16/BF16 backbone can add it (a no-op
@@ -149,7 +149,7 @@ impl BertSelfAttention {
         let scores = scores.broadcast_add(&extended_mask)?;
         let probs = candle_nn::ops::softmax(&scores, D::Minus1)?;
 
-        let context = probs.matmul(&v)?;
+        let context = crate::contiguous_matmul(&probs, &v)?;
         let context = context.transpose(1, 2)?.contiguous()?;
         Ok(context.flatten_from(D::Minus2)?)
     }

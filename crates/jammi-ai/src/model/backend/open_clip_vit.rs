@@ -156,15 +156,18 @@ impl MultiHeadAttention {
         let qkv = qkv.reshape((batch, seq_len, 3, self.num_heads, self.head_dim))?;
         let qkv = qkv.permute((2, 0, 3, 1, 4))?; // (3, batch, heads, seq, head_dim)
 
-        let q = qkv.i(0)?.contiguous()?;
-        let k = qkv.i(1)?.contiguous()?;
-        let v = qkv.i(2)?.contiguous()?;
+        let q = qkv.i(0)?;
+        let k = qkv.i(1)?;
+        let v = qkv.i(2)?;
 
-        // Scaled dot-product attention
+        // Scaled dot-product attention. `contiguous_matmul` guarantees both
+        // operands are contiguous — candle's CUDA matmul rejects the strided
+        // views left by the qkv split/transpose that its CPU matmul tolerates.
         let scale = (self.head_dim as f64).sqrt();
-        let attn_weights = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?)? / scale)?;
+        let attn_weights =
+            (jammi_encoders::contiguous_matmul(&q, &k.transpose(D::Minus2, D::Minus1)?)? / scale)?;
         let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-        let attn_output = attn_weights.matmul(&v)?;
+        let attn_output = jammi_encoders::contiguous_matmul(&attn_weights, &v)?;
 
         // Reshape back: (batch, heads, seq, head_dim) -> (batch, seq, width)
         let attn_output = attn_output.permute((0, 2, 1, 3))?.reshape((
@@ -346,7 +349,7 @@ impl OpenClipVisionTransformer {
         let pooled = self.ln_post.forward(&pooled)?;
 
         // Linear projection: (batch, width) -> (batch, embed_dim)
-        pooled.matmul(&self.proj)
+        jammi_encoders::contiguous_matmul(&pooled, &self.proj)
     }
 
     /// Return the output embedding dimension.

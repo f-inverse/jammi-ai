@@ -110,7 +110,8 @@ impl DistilBertSelfAttention {
         let k = self.transpose_for_scores(&k)?;
         let v = self.transpose_for_scores(&v)?;
 
-        let scores = (q.matmul(&k.t()?)? / (self.attention_head_size as f64).sqrt())?;
+        let scores =
+            (crate::contiguous_matmul(&q, &k.t()?)? / (self.attention_head_size as f64).sqrt())?;
         // The additive mask is always built in F32 (see `extended_attention_mask`);
         // cast to the scores' dtype so a F16/BF16 backbone can add it (a no-op
         // when scores are already F32).
@@ -118,7 +119,7 @@ impl DistilBertSelfAttention {
         let scores = scores.broadcast_add(&extended_mask)?;
         let probs = candle_nn::ops::softmax(&scores, D::Minus1)?;
 
-        let context = probs.matmul(&v)?;
+        let context = crate::contiguous_matmul(&probs, &v)?;
         // Re-materialise contiguously after the transpose, then collapse the
         // head/dim trailing axes back into hidden.
         let context = context.transpose(1, 2)?.contiguous()?;

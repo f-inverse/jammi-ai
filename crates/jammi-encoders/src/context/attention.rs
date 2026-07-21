@@ -68,7 +68,7 @@ pub fn multi_head_attention(
     let k = split_heads(keys, num_heads)?; // [B, heads, kv_len, head_dim]
     let v = split_heads(values, num_heads)?; // [B, heads, kv_len, head_dim]
 
-    let scores = q.matmul(&k.t()?)?; // [B, heads, q_len, kv_len]
+    let scores = crate::contiguous_matmul(&q, &k.t()?)?; // [B, heads, q_len, kv_len]
     let scores = (scores / (head_dim as f64).sqrt())?;
     let scores = match key_mask {
         Some(mask) => scores.broadcast_add(mask)?,
@@ -76,7 +76,7 @@ pub fn multi_head_attention(
     };
     let probs = candle_nn::ops::softmax(&scores, D::Minus1)?;
 
-    let context = probs.matmul(&v)?; // [B, heads, q_len, head_dim]
+    let context = crate::contiguous_matmul(&probs, &v)?; // [B, heads, q_len, head_dim]
     let context = context.transpose(1, 2)?.contiguous()?; // [B, q_len, heads, head_dim]
     Ok(context.reshape((b, q_len, hidden))?)
 }
@@ -94,7 +94,7 @@ pub fn attention_weights(
     key_mask: Option<&Tensor>,
 ) -> Result<Tensor, EncoderError> {
     let (_b, _q_len, hidden) = query.dims3()?;
-    let scores = query.matmul(&keys.t()?)?; // [B, q_len, kv_len]
+    let scores = crate::contiguous_matmul(&query, &keys.t()?)?; // [B, q_len, kv_len]
     let scores = (scores / (hidden as f64).sqrt())?;
     let scores = match key_mask {
         // The additive mask is [B, 1, 1, kv_len]; squeeze the two singleton

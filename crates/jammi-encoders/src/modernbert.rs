@@ -194,20 +194,21 @@ impl ModernBertAttention {
             .narrow(D::Minus1, h * d, h * d)?
             .reshape((batch, seq, h, d))?
             .transpose(1, 2)?;
-        // candle's matmul rejects non-contiguous batch layouts; Q and K become
-        // contiguous as a side effect of the RoPE op chain, but V skips RoPE,
-        // so make the transposed-V contiguity explicit here.
         let v = qkv
             .narrow(D::Minus1, 2 * h * d, h * d)?
             .reshape((batch, seq, h, d))?
             .transpose(1, 2)?
             .contiguous()?;
 
-        let q = self.rope.apply(&q)?;
-        let k = self.rope.apply(&k)?;
+        // candle's matmul rejects non-contiguous batch layouts. RoPE's output
+        // contiguity is device-dependent (contiguous on CPU, not guaranteed on
+        // CUDA), so make Q and K contiguous explicitly rather than relying on the
+        // op chain — otherwise the score matmul fails on GPU and every row errors.
+        let q = self.rope.apply(&q)?.contiguous()?;
+        let k = self.rope.apply(&k)?.contiguous()?;
 
         let scale = (d as f64).sqrt();
-        let scores = q.matmul(&k.transpose(D::Minus1, D::Minus2)?)?;
+        let scores = q.matmul(&k.transpose(D::Minus1, D::Minus2)?.contiguous()?)?;
         let scores = (scores / scale)?;
         // The additive mask is always built in F32 (see `extended_attention_mask`);
         // cast to the scores' dtype so a F16/BF16 backbone can add it (a no-op

@@ -23,7 +23,7 @@ use crate::model::{BackendType, LoadedModel, ModelSource, ModelTask};
 /// task) — it is never a per-row event, so it is never annotated as a
 /// per-row `_status = error`. `run` propagates it as an `Err` sent through
 /// the output stream, failing the operation loudly. The only recovery this
-/// runner performs is OOM batch-halving (see [`Self::handle_oom`]), which
+/// runner performs is OOM batch-halving (`handle_oom`), which
 /// retries the SAME chunk at a smaller size; every other forward failure,
 /// and a persistent OOM at the minimum batch size, propagates.
 pub struct InferenceRunner {

@@ -231,8 +231,7 @@ impl<'a> EmbeddingPipeline<'a> {
                 }
             }
             if total > 0 && ok == 0 {
-                let detail =
-                    first_err.unwrap_or_else(|| "every row failed inference".to_string());
+                let detail = first_err.unwrap_or_else(|| "every row failed inference".to_string());
                 return Err(JammiError::Inference(format!(
                     "embedding generation produced no embeddings — every input row failed \
                      inference (likely a GPU/model failure, e.g. a compute-capability / PTX \

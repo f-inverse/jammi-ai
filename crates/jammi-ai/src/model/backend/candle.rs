@@ -2029,6 +2029,10 @@ pub(crate) fn select_device(config: &DeviceConfig) -> Result<Device> {
     #[cfg(feature = "cuda")]
     {
         if let Ok(dev) = Device::new_cuda(config.gpu_device as usize) {
+            // Fail fast on a driver too old to JIT this build's PTX, rather than
+            // letting the first model load surface a raw
+            // `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` from deep in candle.
+            check_driver_floor(cuda_driver_cuda_version()?)?;
             return Ok(dev);
         }
     }
@@ -2039,6 +2043,67 @@ pub(crate) fn select_device(config: &DeviceConfig) -> Result<Device> {
         }
     }
     gpu_unavailable(config.gpu_device, config.require_gpu)
+}
+
+/// Minimum CUDA version the deployment driver must support, in
+/// `cuDriverGetVersion` integer form (`major * 1000 + minor * 10`).
+///
+/// This build's CUDA kernels ship as **PTX only** (candle emits `build_ptx()`,
+/// no native SASS), so the deployment driver JIT-compiles them at model load.
+/// The PTX is produced by the pinned **CUDA 12.6** toolkit (PTX ISA 8.5), and a
+/// driver can only JIT PTX whose ISA is ≤ its own CUDA version — so the driver
+/// must itself support CUDA 12.6 (`12060`) or newer. On Linux that is NVIDIA
+/// driver **r560+** (≥ 560.28.03). An older driver rejects the PTX at load with
+/// `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` / `CUDA_ERROR_INVALID_PTX` — a cause
+/// independent of an arch mismatch. Keep this in lockstep with the toolkit
+/// version in `.docker/ci-cuda.Dockerfile` and the driver floor documented in
+/// `docs/guide/src/deploy-server.md`.
+#[cfg(any(feature = "cuda", test))]
+const MIN_DRIVER_CUDA_VERSION: i32 = 12_060;
+
+/// Reject a driver whose supported CUDA version is below [`MIN_DRIVER_CUDA_VERSION`].
+///
+/// `reported` is `cuDriverGetVersion`'s integer form. Pure so the boundary is
+/// unit-tested without a GPU; the CUDA-only [`cuda_driver_cuda_version`] feeds it
+/// the live value.
+#[cfg(any(feature = "cuda", test))]
+fn check_driver_floor(reported: i32) -> Result<()> {
+    if reported < MIN_DRIVER_CUDA_VERSION {
+        return Err(JammiError::Gpu(format!(
+            "NVIDIA driver too old to run this GPU build: the driver supports up to CUDA \
+             {rep_major}.{rep_minor}, but the build ships CUDA {min_major}.{min_minor} PTX that \
+             the driver must JIT-compile at model load. Upgrade to driver r560 or later \
+             (≥ 560.28.03 on Linux); otherwise model load fails with \
+             CUDA_ERROR_UNSUPPORTED_PTX_VERSION. (cuDriverGetVersion reported {reported}.)",
+            rep_major = reported / 1000,
+            rep_minor = (reported % 1000) / 10,
+            min_major = MIN_DRIVER_CUDA_VERSION / 1000,
+            min_minor = (MIN_DRIVER_CUDA_VERSION % 1000) / 10,
+        )));
+    }
+    Ok(())
+}
+
+/// The CUDA version the installed driver supports (`cuDriverGetVersion`), in
+/// `major * 1000 + minor * 10` form. Callable once a CUDA device has
+/// initialized — the driver is loaded by then.
+#[cfg(feature = "cuda")]
+fn cuda_driver_cuda_version() -> Result<i32> {
+    use candle_core::cuda::cudarc::driver::sys;
+    let mut version: core::ffi::c_int = 0;
+    // SAFETY: `cuDriverGetVersion` writes a single `int` through the pointer and
+    // reads nothing else; the driver is present because `Device::new_cuda` just
+    // succeeded. cudarc is linked (`dynamic-linking`), so the symbol resolves.
+    let status = unsafe { sys::cuDriverGetVersion(&mut version) };
+    if status != sys::CUresult::CUDA_SUCCESS {
+        return Err(JammiError::Gpu(format!(
+            "cuDriverGetVersion failed ({status:?}); cannot verify the NVIDIA driver meets the \
+             CUDA {}.{} PTX floor this build requires",
+            MIN_DRIVER_CUDA_VERSION / 1000,
+            (MIN_DRIVER_CUDA_VERSION % 1000) / 10,
+        )));
+    }
+    Ok(version)
 }
 
 /// The [`ComputeDevice`] the engine *effectively* runs on for `config` — the
@@ -2196,6 +2261,27 @@ mod device_tests {
             flag.load(Ordering::SeqCst),
             "expected a loud warn-level CPU-fallback log"
         );
+    }
+
+    /// The PTX-ISA driver floor (#304): a driver below the CUDA 12.6 line the
+    /// build's PTX requires is rejected with a typed, actionable error; the
+    /// 12.6 line and anything newer pass.
+    #[test]
+    fn driver_floor_rejects_below_and_accepts_at_or_above() {
+        // 12.4 (r550) — the reporter's driver in #277: below the floor, rejected.
+        match check_driver_floor(12_040) {
+            Err(JammiError::Gpu(msg)) => {
+                assert!(msg.contains("r560"), "message must name the fix: {msg}");
+                assert!(
+                    msg.contains("12.4"),
+                    "message must report the driver's CUDA version: {msg}"
+                );
+            }
+            other => panic!("expected JammiError::Gpu for an old driver, got {other:?}"),
+        }
+        // Exactly at the floor (12.6) and newer (12.8) both pass.
+        assert!(check_driver_floor(MIN_DRIVER_CUDA_VERSION).is_ok());
+        assert!(check_driver_floor(12_080).is_ok());
     }
 }
 

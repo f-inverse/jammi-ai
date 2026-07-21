@@ -50,6 +50,12 @@ dependencies = [
     "pyarrow>=15",
     "requests>=2.31",
     "usearch==2.25.1",
+    # usearch's SIMD backend, an unpinned transitive dep. Pinned EXACTLY to the
+    # last release with a cp312 manylinux wheel: 7.7.1 shipped sdist-only (no
+    # wheel yet), and the book-gate CI image has no Python headers, so an
+    # unpinned float builds 7.7.1 from source and fails (`Python.h: not found`).
+    # Pinning to the wheel-having version keeps the gate reproducible.
+    "numkong==7.7.0",
 ]
 
 [project.optional-dependencies]

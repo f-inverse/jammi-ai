@@ -34,4 +34,9 @@ impl SeqClassifier {
     pub fn num_classes(&self) -> usize {
         self.num_classes
     }
+
+    /// Longest token sequence the classifier's backbone accepts.
+    pub fn max_seq_length(&self) -> usize {
+        self.backbone.max_seq_length()
+    }
 }

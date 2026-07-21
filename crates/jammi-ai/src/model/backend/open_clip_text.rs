@@ -20,6 +20,10 @@ use super::candle::CandleTextForward;
 pub struct OpenClipTextForward(pub ClipText);
 
 impl CandleTextForward for OpenClipTextForward {
+    fn max_sequence_length(&self) -> usize {
+        self.0.context_length()
+    }
+
     fn forward_hidden(
         &self,
         _input_ids: &Tensor,

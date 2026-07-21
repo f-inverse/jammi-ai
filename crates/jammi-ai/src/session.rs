@@ -113,7 +113,10 @@ impl InferenceSession {
         let artifact_store = Arc::new(build_artifact_store(&inner)?);
         let resolver = ModelResolver::new(catalog.clone(), Arc::clone(&artifact_store))?;
         let device_config = DeviceConfig::from_config(inner.config());
-        let scheduler = Arc::new(GpuScheduler::new_unlimited());
+        let scheduler = Arc::new(GpuScheduler::for_device(
+            device_config.gpu_device,
+            device_config.memory_fraction,
+        ));
         let model_cache = Arc::new(ModelCache::new(resolver, device_config.clone(), scheduler));
         let result_store = Arc::new(build_result_store(&inner, Arc::clone(&catalog))?);
         // Install the tenant-gating result-table schema as the context's

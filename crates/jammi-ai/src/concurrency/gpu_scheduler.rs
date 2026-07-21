@@ -76,15 +76,72 @@ impl GpuScheduler {
         }
     }
 
-    /// Query available GPU memory via CUDA.
-    /// Returns `(free_bytes, total_bytes)`. Returns `Err` on CPU-only machines.
+    /// Query the device's memory via CUDA, returning `(free_bytes, total_bytes)`.
+    ///
+    /// Retains the device's primary context (shared, refcounted — candle later
+    /// retains the same one) and reads `cuMemGetInfo`. `Err` on a CPU-only build
+    /// or when the device cannot be reached, which the caller
+    /// ([`Self::for_device`]) treats as "no budget, run unlimited".
+    #[cfg(feature = "cuda")]
+    pub fn detect_gpu_memory(device_id: usize) -> Result<(usize, usize)> {
+        use candle_core::cuda::cudarc::driver::CudaContext;
+        let ctx = CudaContext::new(device_id)
+            .map_err(|e| JammiError::Gpu(format!("CUDA device {device_id} init failed: {e}")))?;
+        ctx.mem_get_info().map_err(|e| {
+            JammiError::Gpu(format!(
+                "cuMemGetInfo failed on CUDA device {device_id}: {e}"
+            ))
+        })
+    }
+
+    /// CPU-only build: there is no CUDA runtime to probe.
+    #[cfg(not(feature = "cuda"))]
     pub fn detect_gpu_memory(_device_id: usize) -> Result<(usize, usize)> {
-        // Real CUDA detection requires the cudarc crate, which is only useful
-        // on GPU machines. Return Err on CPU-only builds. When CUDA support is
-        // needed, gate behind a `cuda` feature and use cudarc::driver.
         Err(JammiError::Gpu(
-            "GPU memory detection not available (no CUDA runtime)".into(),
+            "GPU memory detection not available (CPU-only build)".into(),
         ))
+    }
+
+    /// The scheduler appropriate for the configured device.
+    ///
+    /// On a CUDA device whose memory can be probed, this is a real memory-budget
+    /// scheduler sized to the card: `memory_fraction` of total VRAM is usable and
+    /// the remainder is headroom for activations / workspace the coarse
+    /// per-model estimate does not count. Otherwise — a negative ordinal (CPU),
+    /// a CPU-only build, or a device that could not be probed — it is an
+    /// unlimited pass-through, since admission control without a real budget
+    /// would gate nothing meaningfully.
+    pub fn for_device(gpu_device: i32, memory_fraction: f64) -> Self {
+        if gpu_device < 0 {
+            return Self::new_unlimited();
+        }
+        match Self::detect_gpu_memory(gpu_device as usize) {
+            Ok((_free, total)) => {
+                let headroom_fraction = (1.0 - memory_fraction).clamp(0.0, 1.0);
+                tracing::info!(
+                    gpu_device,
+                    total_bytes = total,
+                    memory_fraction,
+                    "GPU memory admission enabled"
+                );
+                Self::new(total, headroom_fraction)
+            }
+            Err(e) => {
+                // On a CUDA build a probe failure is a real anomaly worth a warn.
+                // On a CPU-only build it is the normal case (the default ordinal
+                // is 0 even with no GPU); the model-load path already reports the
+                // CPU fallback, so staying quiet here avoids a redundant warn on
+                // every session construction.
+                #[cfg(feature = "cuda")]
+                tracing::warn!(
+                    gpu_device,
+                    "GPU memory probe failed ({e}); GPU memory admission disabled (unlimited)"
+                );
+                #[cfg(not(feature = "cuda"))]
+                let _ = &e;
+                Self::new_unlimited()
+            }
+        }
     }
 
     /// Usable GPU memory after headroom reservation.
@@ -158,5 +215,53 @@ impl GpuScheduler {
 
             notified.await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A negative ordinal is CPU: no budget, admit everything.
+    #[test]
+    fn for_device_cpu_is_unlimited() {
+        let sched = GpuScheduler::for_device(-1, 0.9);
+        assert!(sched.unlimited);
+        assert_eq!(sched.available(), usize::MAX);
+    }
+
+    /// When the device cannot be probed — which is always true in the hermetic
+    /// CPU test build, where `detect_gpu_memory` reports no CUDA runtime —
+    /// `for_device` degrades to unlimited rather than fabricating a budget.
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn for_device_falls_back_to_unlimited_when_probe_fails() {
+        let sched = GpuScheduler::for_device(0, 0.9);
+        assert!(sched.unlimited);
+    }
+
+    /// `memory_fraction` maps to usable budget: with a 1 GiB card and 0.9,
+    /// 900 MiB is admittable and the rest is headroom.
+    #[test]
+    fn budget_reflects_memory_fraction() {
+        let total = 1024 * 1024 * 1024;
+        let sched = Arc::new(GpuScheduler::new(total, 1.0 - 0.9));
+        let usable = sched.available();
+        // 90% of the card, within rounding.
+        assert!(
+            (usable as f64 - total as f64 * 0.9).abs() < 2.0,
+            "usable {usable} should be ~90% of {total}"
+        );
+        // A request under budget is admitted and reserves; over-budget is refused.
+        let permit = sched.try_acquire(usable / 2).expect("half-budget admits");
+        assert!(
+            sched.try_acquire(usable).is_none(),
+            "over remaining refused"
+        );
+        drop(permit);
+        assert!(
+            sched.try_acquire(usable).is_some(),
+            "release frees the budget"
+        );
     }
 }

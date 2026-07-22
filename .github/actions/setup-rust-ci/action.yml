@@ -1,0 +1,46 @@
+name: setup-rust-ci
+description: >
+  Shared per-job Rust CI setup: runs the sccache GHA-cache action and exports
+  SCCACHE_GHA_ENABLED + RUSTFLAGS via $GITHUB_ENV, so a job's cache backend and
+  its linker/warnings posture live in ONE definition instead of being repeated
+  in every workflow. Must run AFTER `actions/checkout@v4` — this is a
+  local-path composite (`./.github/actions/setup-rust-ci`), so the checkout
+  step has to have already materialized it. Bump the sccache-action pin HERE,
+  not in each consuming workflow.
+
+inputs:
+  rustflags:
+    description: >
+      RUSTFLAGS to export for the rest of the job. Defaults to the shared
+      "-D warnings -C link-arg=-fuse-ld=mold" posture the hermetic Rust lanes
+      use. Pass an explicit override for a job whose real config genuinely
+      differs — e.g. "-C link-arg=-fuse-ld=mold" with no `-D warnings` for a
+      lane that must not fail on a warning outside its own crates, or ""
+      to leave RUSTFLAGS unset entirely (falling back to .cargo/config.toml's
+      per-target mold default). Never silently force a job onto a flag set it
+      didn't have.
+    required: false
+    default: "-D warnings -C link-arg=-fuse-ld=mold"
+  no-sccache:
+    description: >
+      Set to "true" to skip the sccache-action step and the SCCACHE_GHA_ENABLED
+      export — for a lane that explicitly disables the compiler wrapper
+      (RUSTC_WRAPPER="") and never talks to an sccache server, e.g. a
+      metadata-only `cargo install`/`cargo deny` lane.
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - if: inputs.no-sccache != 'true'
+      uses: mozilla-actions/sccache-action@v0.0.9
+
+    - shell: bash
+      run: |
+        if [ "${{ inputs.no-sccache }}" != "true" ]; then
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+        fi
+        if [ -n "${{ inputs.rustflags }}" ]; then
+          echo "RUSTFLAGS=${{ inputs.rustflags }}" >> "$GITHUB_ENV"
+        fi

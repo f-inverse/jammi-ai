@@ -18,7 +18,6 @@ use std::sync::Arc;
 use arrow::array::{Array, StringArray};
 use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::session::InferenceSession;
-use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::store::CachePolicy;
 use tempfile::TempDir;
 
@@ -27,22 +26,6 @@ use crate::skip_without_gpu;
 
 /// The committed tiny ModernBERT classifier fixture (`local:` — no network).
 const CLASSIFIER: &str = "tiny_modernbert_classifier";
-
-/// Register the patents fixture as a source on `session`.
-async fn add_patents(session: &Arc<InferenceSession>) {
-    session
-        .add_source(
-            "patents",
-            SourceType::File,
-            SourceConnection {
-                url: Some(harness::fixture_url("patents.parquet")),
-                format: Some(FileFormat::Parquet),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-}
 
 /// Serve `infer` (Classification) over the patents `abstract` column and read
 /// back each row's full score distribution, keyed by `_row_id` so a CPU and GPU
@@ -94,12 +77,12 @@ async fn classification_parity_cpu_vs_gpu_over_modernbert() {
 
     let cpu_dir = TempDir::new().unwrap();
     let cpu = harness::cpu_session(cpu_dir.path()).await;
-    add_patents(&cpu).await;
+    harness::add_patents(&cpu).await;
     let cpu_scores = keyed_scores(&cpu).await;
 
     let gpu_dir = TempDir::new().unwrap();
     let gpu = harness::gpu_session(gpu_dir.path()).await;
-    add_patents(&gpu).await;
+    harness::add_patents(&gpu).await;
     let gpu_scores = keyed_scores(&gpu).await;
 
     // The decisive assertion the RoPE-contiguity fix restores: the GPU produced a

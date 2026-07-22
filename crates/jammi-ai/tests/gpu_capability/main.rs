@@ -12,9 +12,12 @@
 //!   input runs through a `gpu.device=0` session and a `gpu.device=-1` (CPU)
 //!   session against the *same* fixtures, and the outputs must agree within an
 //!   explicit tolerance. Parity is the decisive proof: a wrong GPU kernel or a
-//!   dtype bug breaks it. Verbs: `generate_text_embeddings`, `encode_text_query`,
-//!   and the context-predictor `predict` forward pass (over one trained
-//!   predictor, served on each device).
+//!   dtype bug breaks it. Verbs: `generate_text_embeddings` / `encode_text_query`
+//!   over BERT, ModernBERT, and the OpenCLIP text tower; `generate_image_embeddings`
+//!   / `encode_image_query` over the OpenCLIP vision tower;
+//!   `generate_audio_embeddings` / `encode_audio_query` over HTSAT-CLAP;
+//!   `infer` (`Classification`, `Ner`) over ModernBERT; and the context-predictor
+//!   `predict` forward pass (over one trained predictor, served on each device).
 //!   `propagate_embeddings` (SGC / APPNP) is also exercised on both devices, but
 //!   propagation has **no GPU kernel** — it is a deterministic CPU `f64` fold —
 //!   so its test asserts *device-independence* (bit-identical output regardless
@@ -63,8 +66,13 @@ mod harness;
 
 mod bf16_gpu_gate;
 mod classification_parity;
+mod clip_text_embeddings_parity;
 mod embeddings_parity;
 mod fine_tune_learns;
 mod graph_finetune_learns;
 mod graph_propagation_parity;
+mod htsat_audio_embeddings_parity;
+mod modernbert_embeddings_parity;
+mod ner_parity;
+mod open_clip_vision_parity;
 mod predictor_parity;

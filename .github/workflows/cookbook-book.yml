@@ -27,8 +27,6 @@ env:
   OPENBLAS_NUM_THREADS: "1"
   MKL_NUM_THREADS: "1"
   TOKENIZERS_PARALLELISM: "false"
-  SCCACHE_GHA_ENABLED: "true"
-  RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
 jobs:
   gate:
@@ -42,7 +40,9 @@ jobs:
           # The scale-tier vector cache (cookbook/book/artifacts/scale/) lives in
           # Git LFS; pull it so the gate reads the real cache, not LFS pointers.
           lfs: true
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          rustflags: "-C link-arg=-fuse-ld=mold"
 
       - name: Build + install the HEAD wheels
         # The CI base image ships maturin + a system python3; venv-isolate so

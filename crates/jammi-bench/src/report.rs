@@ -136,11 +136,13 @@ pub struct Tiers {
     /// cookbook (the A/B split). Populated by `model-inference-scale`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_inference: Option<ModelInferenceTier>,
-    /// The on-GPU throughput/latency baseline: the same two serving verbs measured
-    /// on `gpu.device = 0`, each gated on a throughput floor and a p99 tail-latency
-    /// ceiling against a committed same-device baseline. The GPU peer of
-    /// `model_inference`; the perf-regression net for GPU-inference work. Populated
-    /// by `gpu-inference-scale` (behind the `cuda` feature / `live-gpu-tests` lane).
+    /// The on-GPU embedding throughput/latency observability tier: the embed
+    /// serving verb measured on `gpu.device = 0`, tagged with the concrete device
+    /// that served it. Records rows/s, p50/p99 tail latency, and cross-repeat
+    /// determinism as measurements, not gates — an absolute rate on the ephemeral
+    /// heterogeneous prove fleet is not a property of the code alone. The GPU
+    /// peer of `model_inference`. Populated by `gpu-inference-scale` (behind the
+    /// `cuda` feature / `live-gpu-tests` lane).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gpu_inference: Option<GpuInferenceTier>,
     /// The CPU-hermetic cache-hit SLO tier: the engine's opt-in producer
@@ -496,49 +498,6 @@ pub struct RateVerdict {
     pub passed: bool,
     /// Human-readable summary of the verdict with the full arithmetic.
     pub detail: String,
-}
-
-/// A tail-latency regression verdict — the ceiling counterpart of [`RateVerdict`].
-/// Where a rate gate is a floor (throughput must not drop), a latency gate is a
-/// ceiling: the measured p99 must stay under `baseline · (1 + threshold)`.
-#[derive(Debug, Serialize)]
-pub struct LatencyVerdict {
-    /// The measured latency the gate evaluated, ms.
-    pub measured_ms: f64,
-    /// The committed same-device baseline latency, ms.
-    pub baseline_ms: f64,
-    /// The relative-rise threshold applied.
-    pub threshold: f64,
-    /// The ceiling `baseline · (1 + threshold)` the measured latency had to stay under.
-    pub ceiling_ms: f64,
-    /// Whether the measured latency stayed under the ceiling.
-    pub passed: bool,
-    /// Human-readable summary of the verdict with the full arithmetic.
-    pub detail: String,
-}
-
-impl LatencyVerdict {
-    /// Evaluate a p99 latency against its committed baseline. A non-finite or
-    /// non-positive baseline (an un-captured spec) makes the ceiling vacuously
-    /// wide so the first rebuild serve passes; a real baseline bites.
-    pub fn evaluate(measured_ms: f64, baseline_ms: f64, threshold: f64) -> Self {
-        let ceiling_ms = baseline_ms * (1.0 + threshold);
-        let passed = !baseline_ms.is_finite() || baseline_ms <= 0.0 || measured_ms <= ceiling_ms;
-        let detail = format!(
-            "p99 {measured_ms:.3}ms vs baseline {baseline_ms:.3}ms \
-             (ceiling {ceiling_ms:.3}ms @ +{:.0}%): {}",
-            threshold * 100.0,
-            if passed { "PASS" } else { "REGRESSION" },
-        );
-        Self {
-            measured_ms,
-            baseline_ms,
-            threshold,
-            ceiling_ms,
-            passed,
-            detail,
-        }
-    }
 }
 
 /// The activation-memory negative control: the GradCache (bounded) and
@@ -1087,40 +1046,47 @@ pub struct ModelInferenceTier {
     pub infer_digest: DeterminismGate,
 }
 
-/// One verb's measured GPU lane: sustained throughput, tail latency, and the two
-/// same-device gate verdicts, plus whether the serve was deterministic across the
-/// measured repeats.
+/// One verb's measured GPU lane: sustained throughput, tail latency, and whether
+/// the serve was deterministic across the measured repeats. Recorded
+/// observability, not a gate — see [`GpuInferenceTier`] for why an absolute rate
+/// on this fleet cannot be a committed baseline.
 #[derive(Debug, Serialize)]
 pub struct GpuLane {
     /// Sustained serving throughput at the median serve, rows/s.
     pub rows_per_s: Measurement,
     /// Median per-serve wall latency, ms.
     pub p50_ms: Measurement,
-    /// 99th-percentile per-serve wall latency, ms — the tail the ceiling gate bites.
+    /// 99th-percentile per-serve wall latency, ms.
     pub p99_ms: Measurement,
-    /// Throughput rate-regression verdict against the committed same-device baseline.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rate_gate: Option<RateVerdict>,
-    /// Tail-latency regression verdict against the committed same-device baseline.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub latency_gate: Option<LatencyVerdict>,
     /// Whether every measured serve's digest matched the first — the on-device
     /// determinism contract across repeats.
     pub deterministic: bool,
 }
 
-/// The on-GPU embedding throughput/latency baseline tier: the real
+/// The on-GPU embedding throughput/latency tier: the real
 /// `generate_text_embeddings` verb measured on `gpu.device = 0` over the tiny
-/// committed bundle, gated on a throughput floor and a p99 ceiling against
-/// `baselines/gpu_inference.json`. The GPU peer of [`ModelInferenceTier`] — where
-/// that tier is CPU-hermetic and gates determinism, this one runs on the real
-/// device and gates the perf a GPU optimization moves. Scoped to embedding: the
-/// classification (`infer`) path is not yet a validated GPU path.
+/// committed bundle. The GPU peer of [`ModelInferenceTier`] — where that tier is
+/// CPU-hermetic and gates determinism, this one runs on the real device and
+/// *records* the perf a GPU optimization would move, tagged with the device that
+/// produced it. Scoped to embedding: the classification (`infer`) path is not yet
+/// a validated GPU path.
+///
+/// Throughput and tail latency ride as measurements, not gates: the prove lane
+/// runs on an ephemeral heterogeneous rented fleet (SXM4 / PCIe A100s, no
+/// pinning), so an absolute rate is a property of `code × device ×
+/// pod-conditions`, not of the code alone — a committed absolute floor would
+/// gate pod variance, not a regression. The device-independent correctness
+/// contract (cross-repeat determinism, CPU↔GPU parity) is hard-gated separately
+/// in the `gpu_capability` suite.
 #[derive(Debug, Serialize)]
 pub struct GpuInferenceTier {
     /// The device the serve resolved to (e.g. `cuda:0`) — proof it was not a CPU
     /// fallback.
     pub device: String,
+    /// The concrete device sub-class the ordinal resolved to (e.g.
+    /// `NVIDIA A100-SXM4-80GB`) — the provenance tag that makes the recorded
+    /// throughput/latency interpretable across the heterogeneous fleet.
+    pub device_name: String,
     /// Measured serves (after warmup) the percentiles folded over.
     pub iters: usize,
     /// The embed verb's lane.

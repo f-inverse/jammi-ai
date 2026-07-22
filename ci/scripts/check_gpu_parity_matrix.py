@@ -218,8 +218,6 @@ PENDING: dict[Cell, str] = {
     # (embeddings_parity.rs); DistilBert and ModernBert share the same
     # generic `forward_embedding` path and are equally serveable.
     Cell("DistilBert", "TextEmbedding"): _PENDING_REASON,
-    Cell("ModernBert", "TextEmbedding"): _PENDING_REASON,
-    Cell("ClipText", "TextEmbedding"): _PENDING_REASON + " (cookbook/fixtures/tiny_open_clip exists.)",
     # Classification: only ModernBert×Classification is proven today
     # (classification_parity.rs, the esc-028 regression guard); Bert and
     # DistilBert have their own `*ClassificationForward` wrapper and are
@@ -232,7 +230,6 @@ PENDING: dict[Cell, str] = {
     # none is proven on GPU yet. cookbook/fixtures/tiny_modernbert_ner exists.
     Cell("Bert", "Ner"): _PENDING_REASON,
     Cell("DistilBert", "Ner"): _PENDING_REASON,
-    Cell("ModernBert", "Ner"): _PENDING_REASON + " (cookbook/fixtures/tiny_modernbert_ner exists.)",
     # Regression: generic over `forward_pooled` for every text architecture,
     # including ClipText (whose `forward_pooled` override succeeds — only
     # `forward_hidden` is rejected); none is proven on GPU yet.
@@ -242,8 +239,6 @@ PENDING: dict[Cell, str] = {
     Cell("ClipText", "Regression"): _PENDING_REASON + " (frozen-backbone ProjectionHead-style fine-tune is structurally supported by the trainer; forward_pooled succeeds for ClipText.)",
     # The two non-BERT served architectures: each has exactly one servable
     # verb, and neither is proven on GPU yet.
-    Cell("OpenClipVision", "ImageEmbedding"): _PENDING_REASON + " (cookbook/fixtures/tiny_open_clip exists.)",
-    Cell("HtsatAudio", "AudioEmbedding"): _PENDING_REASON + " (cookbook/fixtures/htsat_clap_tiny and htsat_clap_real exist.)",
 }
 
 

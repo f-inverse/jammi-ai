@@ -1,0 +1,172 @@
+name: _pypi-server
+
+# Reusable jammi-server PyPI-publish pipeline: build the binary (in the CI base
+# image, at the given container/feature set) -> package + relabel the wheel to
+# its real manylinux platform tag (NO auditwheel — the CUDA leg's CUDA `.so`s
+# are deliberately left unvendored, arriving instead via the `nvidia-*-cu12`
+# dependency wheels at install time; the CPU leg has nothing to vendor either)
+# -> publish via PyPI Trusted Publishing (OIDC, no API token). When
+# `run_gpu_prove` is set, publish is gated behind the shared A100 prove-gate
+# (build -> prove -> promote); the ungated (CPU) leg publishes straight off the
+# built wheel. One reusable, two thin callers (pypi-server.yml /
+# pypi-server-cuda.yml) instead of two near-identical workflows.
+
+on:
+  workflow_call:
+    inputs:
+      container_image:
+        description: "CI base image the binary is built in (manylinux_2_28 floor)."
+        type: string
+        required: true
+      cargo_features:
+        description: "Comma-separated cargo features for the jammi-server binary build."
+        type: string
+        required: true
+      rustflags:
+        description: >
+          RUSTFLAGS for the binary build, passed through to setup-rust-ci.
+          Both legs currently leave RUSTFLAGS unset upstream (falling back to
+          .cargo/config.toml's per-target mold default), hence the default.
+        type: string
+        required: false
+        default: "-C link-arg=-fuse-ld=mold"
+      package_dir:
+        description: "The wheel package directory (e.g. packaging/server-cpu, packaging/server-cu12)."
+        type: string
+        required: true
+      platform_tag:
+        description: "The manylinux platform tag the built binary actually requires."
+        type: string
+        required: false
+        default: "manylinux_2_28_x86_64"
+      artifact_prefix:
+        description: "Prefix for the uploaded workflow artifacts (e.g. server-cpu, server-cu12)."
+        type: string
+        required: true
+      verify_link_set:
+        description: >
+          Run `${package_dir}/verify_link_set.py` against the stripped binary —
+          the CUDA leg's DT_NEEDED-coverage check (the CPU leg carries no such
+          script and leaves this false).
+        type: boolean
+        required: false
+        default: false
+      run_gpu_prove:
+        description: "Gate publish behind the shared A100 prove-gate (build -> prove -> promote)."
+        type: boolean
+        required: false
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-binary:
+    name: Build jammi-server binary
+    runs-on: ubuntu-latest
+    container: ${{ inputs.container_image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          rustflags: ${{ inputs.rustflags }}
+
+      - name: Build jammi-server (release)
+        run: cargo build --release -p jammi-server --bin jammi-server --features ${{ inputs.cargo_features }}
+
+      - name: Strip the binary
+        run: strip target/release/jammi-server
+
+      # Fail here — not on a user's machine at execve — if the binary links a
+      # library the wheel's runtime dependencies do not deliver. DT_NEEDED
+      # survives stripping (it lives in .dynamic), so this checks the exact
+      # bytes shipped.
+      - name: Verify the runtime link set is covered by the wheel dependencies
+        if: inputs.verify_link_set
+        run: python3 ${{ inputs.package_dir }}/verify_link_set.py target/release/jammi-server
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_prefix }}-binary
+          path: target/release/jammi-server
+
+  build-wheel:
+    name: Package wheel (${{ inputs.platform_tag }})
+    needs: build-binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_prefix }}-binary
+          path: artifact
+
+      # Stage the prebuilt binary into the wheel package tree. GitHub artifacts
+      # do not preserve the exec bit, so re-apply it.
+      - name: Stage the binary into the wheel package
+        run: |
+          set -euo pipefail
+          cp artifact/jammi-server ${{ inputs.package_dir }}/jammi_server/bin/jammi-server
+          chmod +x ${{ inputs.package_dir }}/jammi_server/bin/jammi-server
+
+      - name: Build the wheel
+        working-directory: ${{ inputs.package_dir }}
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install build wheel
+          python -m build --wheel --outdir dist
+          # A bin-bearing wheel is NOT py3-none-any (hatchling only sees the
+          # Python sources); relabel to the platform tag the binary actually
+          # requires so pip installs it only on a compatible host.
+          python -m wheel tags --platform-tag ${{ inputs.platform_tag }} --remove dist/*.whl
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_prefix }}-dist
+          path: ${{ inputs.package_dir }}/dist/
+
+  gpu-prove:
+    name: GPU prove-gate (A100)
+    # Tag push only — prove the release commit on a real A100 before promotion.
+    # A no-op (skipped) leg when the caller doesn't request the gate (CPU).
+    if: inputs.run_gpu_prove && github.event_name == 'push'
+    needs: build-wheel
+    uses: ./.github/workflows/_gpu-prove-gate.yml
+    with:
+      git_ref: ${{ github.ref_name }}
+    secrets: inherit
+
+  publish:
+    name: Publish to PyPI
+    # Tag push only — a workflow_dispatch or PR is an artifact-only dry run.
+    # `always()` opts out of the implicit success()-wrap so an intentionally
+    # skipped gpu-prove (the ungated CPU leg) doesn't itself skip publish; the
+    # explicit checks below reproduce build -> prove -> promote exactly: an
+    # ungated leg needs only build-wheel to have succeeded, a gated leg also
+    # needs the prove-gate to have actually passed (not merely run).
+    if: >-
+      always() &&
+      needs.build-wheel.result == 'success' &&
+      github.event_name == 'push' &&
+      (inputs.run_gpu_prove == false || needs.gpu-prove.result == 'success')
+    needs: [build-wheel, gpu-prove]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_prefix }}-dist
+          path: dist
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

@@ -40,6 +40,21 @@ jobs:
         id: meta
         with:
           images: ghcr.io/${{ github.repository }}-${{ inputs.image_suffix }}
+          # `latest` is the tag every `container:` job field in this repo
+          # pulls. `type=sha,format=long` already gives an exact, reproducible
+          # per-commit tag, kept for provenance/debugging — it is deliberately
+          # NOT threaded into any consumer's `container.image`. GitHub Actions
+          # resolves `container.image` at job setup, before any step (incl.
+          # checkout) runs, and restricts that field to the `github`, `needs`,
+          # `strategy`, `matrix`, `vars`, `inputs` contexts — no `hashFiles()`,
+          # no `env`. The only legal way to feed a computed tag into
+          # `container.image` is a per-workflow resolver job whose output the
+          # consumer job reads via `needs.<job>.outputs.<x>` — which would
+          # touch the job graph of every consumer job in every workflow that
+          # runs against this image, AND introduce a push-ordering race
+          # `latest` doesn't have (the resolved tag can be computed before
+          # this workflow has finished pushing the matching manifest,
+          # 404-ing the pull). `latest` stays the consumer-facing tag.
           tags: |
             type=raw,value=latest
             type=sha,format=long

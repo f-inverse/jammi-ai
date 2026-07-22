@@ -17,8 +17,6 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  RUSTFLAGS: "-D warnings -C link-arg=-fuse-ld=mold"
-  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
   smoke:
@@ -29,7 +27,7 @@ jobs:
     if: github.event_name != 'schedule'
     steps:
       - uses: actions/checkout@v4
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: ./.github/actions/setup-rust-ci
 
       - name: Build wheel + venv
         # The CI base image ships maturin + a system python3; venv-isolate to
@@ -63,7 +61,7 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: ./.github/actions/setup-rust-ci
 
       - name: Build wheel + jammi-server binary
         # `flight_sql` shells out to `target/release/jammi-server`; build it

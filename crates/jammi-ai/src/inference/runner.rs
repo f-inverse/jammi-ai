@@ -13,7 +13,7 @@ use super::observer::InferenceObserver;
 use super::schema::build_prefix_columns;
 use super::{extract_column, extract_columns, slice_columns};
 use crate::model::cache::ModelCache;
-use crate::model::{BackendType, LoadedModel, ModelSource, ModelTask};
+use crate::model::{BackendType, ModelSource, ModelTask};
 
 /// Processes input RecordBatches through a model, handling batching and
 /// dynamic batch sizing.
@@ -23,9 +23,10 @@ use crate::model::{BackendType, LoadedModel, ModelSource, ModelTask};
 /// task) — it is never a per-row event, so it is never annotated as a
 /// per-row `_status = error`. `run` propagates it as an `Err` sent through
 /// the output stream, failing the operation loudly. The only recovery this
-/// runner performs is OOM batch-halving (`handle_oom`), which
-/// retries the SAME chunk at a smaller size; every other forward failure,
-/// and a persistent OOM at the minimum batch size, propagates.
+/// runner performs is OOM batch-halving, folded into the cursor loop in
+/// `run_chunks`: it retries the SAME unsent slice at a
+/// smaller size; every other forward failure, and a persistent OOM at the
+/// minimum batch size (1), propagates.
 pub struct InferenceRunner {
     model_cache: Arc<ModelCache>,
     source: ModelSource,
@@ -36,6 +37,19 @@ pub struct InferenceRunner {
     backend: Option<BackendType>,
     batch_size: usize,
     observer: Option<Arc<dyn InferenceObserver>>,
+}
+
+/// Everything needed to shape a successful forward's raw output into a
+/// labeled `RecordBatch` and observe it — bundled because these are all
+/// per-runner-invocation constants, distinct from the per-chunk batching
+/// mechanics (`content`, `keys`, `current_batch_size`) that vary every
+/// iteration of [`InferenceRunner::run_chunks`].
+struct OutputContext<'a> {
+    output_schema: &'a SchemaRef,
+    adapter: &'a dyn OutputAdapter,
+    source_id: &'a str,
+    model_label: &'a str,
+    observer: Option<&'a dyn InferenceObserver>,
 }
 
 impl InferenceRunner {
@@ -102,8 +116,16 @@ impl InferenceRunner {
         // Create output adapter for this task
         let adapter = create_adapter(self.task, &guard.model)?;
 
-        // Track dynamic batch size
-        let mut current_batch_size = self.batch_size;
+        // Track dynamic batch size. A shrink from OOM recovery persists
+        // across input batches (never grows back), so this is threaded
+        // through every call to `run_chunks` below. Floored at 1: a misconfigured
+        // batch size of 0 would make the cursor advance by 0 and spin forever
+        // (the cursor loop replaced the old `step_by`, which panicked on 0) — a
+        // silent hang is worse than a loud error, so treat 0 as 1.
+        let mut current_batch_size = self.batch_size.max(1);
+        let model_label = self.source.to_string();
+        let task = self.task;
+        let model = &guard.model;
 
         // Process input stream
         while let Some(input_batch) = input.next().await {
@@ -111,92 +133,111 @@ impl InferenceRunner {
 
             let content = extract_columns(&input_batch, &self.content_columns)?;
             let keys = extract_column(&input_batch, &self.key_column)?;
-            let row_count = input_batch.num_rows();
 
-            // Process in sub-batches
-            for chunk_start in (0..row_count).step_by(current_batch_size) {
-                let chunk_end = (chunk_start + current_batch_size).min(row_count);
-                let chunk_len = chunk_end - chunk_start;
-                let chunk_content = slice_columns(&content, chunk_start, chunk_len);
-                let chunk_keys = keys.slice(chunk_start, chunk_len);
+            let ctx = OutputContext {
+                output_schema,
+                adapter: adapter.as_ref(),
+                source_id: &self.source_id,
+                model_label: &model_label,
+                observer: self.observer.as_deref(),
+            };
 
-                let start = Instant::now();
-                let output_batch = self
-                    .process_chunk(
-                        &guard.model,
-                        adapter.as_ref(),
-                        &chunk_content,
-                        &chunk_keys,
-                        &mut current_batch_size,
-                        output_schema,
-                    )
-                    .await?;
-                let elapsed = start.elapsed();
-
-                // Notify observer
-                if let Some(obs) = &self.observer {
-                    obs.on_batch(&output_batch, &self.source.to_string(), elapsed);
-                }
-
-                if tx.send(Ok(output_batch)).await.is_err() {
-                    // Receiver dropped (query cancelled)
-                    return Ok(());
-                }
-            }
+            Self::run_chunks(
+                &content,
+                &keys,
+                &mut current_batch_size,
+                &ctx,
+                tx,
+                |chunk_content| model.forward(chunk_content, task),
+            )
+            .await?;
         }
 
         Ok(())
     }
 
-    /// Process one chunk through the model with error handling.
-    async fn process_chunk(
-        &self,
-        model: &LoadedModel,
-        adapter: &dyn OutputAdapter,
+    /// Drive one input batch's rows through `forward` in dynamically-sized
+    /// sub-batches.
+    ///
+    /// `current_batch_size` is read fresh for both the slice length AND the
+    /// cursor advance on every iteration, so a shrink from OOM recovery is
+    /// never stale for one side and fresh for the other (the old
+    /// `step_by(current_batch_size)` + mutable-halving split let the two
+    /// diverge and silently dropped rows). On a successful forward the
+    /// cursor advances by exactly the slice that was just sent — no
+    /// concatenation, no batching-of-batches: each successful sub-batch is
+    /// sent as its own `RecordBatch` immediately. On OOM,
+    /// `current_batch_size` halves (floored at 1) and the SAME unsent slice
+    /// is retried, so no row is ever skipped or duplicated. A non-OOM error,
+    /// or a persistent OOM at batch size 1, propagates rather than being
+    /// annotated as a per-row `_status = error` batch (see the module doc
+    /// comment). `forward` is injected so this control flow is unit-testable
+    /// without a real model.
+    async fn run_chunks<F>(
         content: &[ArrayRef],
         keys: &ArrayRef,
         current_batch_size: &mut usize,
-        output_schema: &SchemaRef,
-    ) -> Result<RecordBatch> {
+        ctx: &OutputContext<'_>,
+        tx: &Sender<datafusion::error::Result<RecordBatch>>,
+        mut forward: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[ArrayRef]) -> Result<BackendOutput>,
+    {
         let row_count = keys.len();
-        let start = Instant::now();
+        let mut chunk_start = 0;
 
-        match model.forward(content, self.task) {
-            Ok(raw_output) => {
-                let latency_ms = start.elapsed().as_secs_f32() * 1000.0;
-                self.build_output_batch(
-                    keys,
-                    &raw_output,
-                    adapter,
-                    row_count,
-                    latency_ms,
-                    output_schema,
-                )
+        while chunk_start < row_count {
+            let chunk_len = (*current_batch_size).min(row_count - chunk_start);
+            let chunk_content = slice_columns(content, chunk_start, chunk_len);
+            let chunk_keys = keys.slice(chunk_start, chunk_len);
+
+            let start = Instant::now();
+            match forward(&chunk_content) {
+                Ok(raw_output) => {
+                    let latency_ms = start.elapsed().as_secs_f32() * 1000.0;
+                    let output_batch = Self::build_output_batch(
+                        ctx,
+                        &chunk_keys,
+                        &raw_output,
+                        chunk_len,
+                        latency_ms,
+                    )?;
+
+                    if let Some(obs) = ctx.observer {
+                        obs.on_batch(&output_batch, ctx.model_label, start.elapsed());
+                    }
+
+                    if tx.send(Ok(output_batch)).await.is_err() {
+                        // Receiver dropped (query cancelled).
+                        return Ok(());
+                    }
+                    chunk_start += chunk_len;
+                }
+                Err(e) if Self::is_oom_error(&e) && *current_batch_size > 1 => {
+                    *current_batch_size = (*current_batch_size / 2).max(1);
+                    tracing::warn!(
+                        new_batch_size = *current_batch_size,
+                        "GPU OOM, halving batch size"
+                    );
+                    // Do NOT advance chunk_start — retry the same slice at
+                    // the smaller size.
+                }
+                // A non-OOM forward failure is always systemic — a broken
+                // kernel, a contiguity/PTX/dtype mismatch, or a model that
+                // cannot serve the requested task at all — never a per-row
+                // event (per-row input validation happens PRE-forward and
+                // sets `row_status[i] = false` without an `Err`; over-long
+                // text is truncated, not errored). And a persistent OOM at
+                // batch size 1 is an unservable resource failure. Propagate
+                // instead of annotating an all-`_status = error` batch:
+                // `_status = error` means "this row's input was bad", never
+                // "the model is broken" or "the GPU has no memory left".
+                Err(e) => return Err(e),
             }
-            Err(e) if Self::is_oom_error(&e) => {
-                self.handle_oom(
-                    model,
-                    adapter,
-                    content,
-                    keys,
-                    current_batch_size,
-                    output_schema,
-                )
-                .await
-            }
-            // A non-OOM forward failure is always systemic — a broken kernel,
-            // a contiguity/PTX/dtype mismatch, or a model that cannot serve
-            // the requested task at all — never a per-row event (per-row
-            // input validation happens PRE-forward and sets
-            // `row_status[i] = false` without an `Err`; over-long text is
-            // truncated, not errored). Halving the batch size cannot isolate
-            // a bad row here — it only shrinks FUTURE chunks, the current
-            // chunk is never retried — so it is pointless for a systemic
-            // failure. Propagate instead of annotating an
-            // all-`_status = error` batch: `_status = error` means "this
-            // row's input was bad", never "the model is broken".
-            Err(e) => Err(e),
         }
+
+        Ok(())
     }
 
     fn is_oom_error(e: &JammiError) -> bool {
@@ -214,88 +255,41 @@ impl InferenceRunner {
             || msg.contains("oom")
     }
 
-    async fn handle_oom(
-        &self,
-        model: &LoadedModel,
-        adapter: &dyn OutputAdapter,
-        content: &[ArrayRef],
-        keys: &ArrayRef,
-        current_batch_size: &mut usize,
-        output_schema: &SchemaRef,
-    ) -> Result<RecordBatch> {
-        let row_count = keys.len();
-
-        // Halve batch size up to 3 times
-        for attempt in 0..3 {
-            *current_batch_size = (*current_batch_size / 2).max(1);
-            tracing::warn!(
-                attempt,
-                new_batch_size = *current_batch_size,
-                "GPU OOM, halving batch size"
-            );
-
-            let smaller_len = (*current_batch_size).min(row_count);
-            let smaller_content = slice_columns(content, 0, smaller_len);
-            let smaller_keys = keys.slice(0, smaller_len);
-
-            match model.forward(&smaller_content, self.task) {
-                Ok(raw_output) => {
-                    return self.build_output_batch(
-                        &smaller_keys,
-                        &raw_output,
-                        adapter,
-                        smaller_len,
-                        0.0,
-                        output_schema,
-                    );
-                }
-                Err(e) if Self::is_oom_error(&e) && *current_batch_size > 1 => continue,
-                // A non-OOM failure discovered mid-retry is systemic (see the
-                // matching arm in `process_chunk`) — propagate rather than
-                // annotate.
-                Err(e) => return Err(e),
-            }
-        }
-        // Persistent OOM at the minimum batch size is an unservable resource
-        // failure — it must surface to the caller, not be annotated as a
-        // per-row `_status = error` batch.
-        Err(JammiError::Inference(
-            "GPU OOM persists at minimum batch size".into(),
-        ))
-    }
-
     /// Build an output RecordBatch from a successful model forward pass.
     fn build_output_batch(
-        &self,
+        ctx: &OutputContext<'_>,
         keys: &ArrayRef,
         raw_output: &BackendOutput,
-        adapter: &dyn OutputAdapter,
         row_count: usize,
         latency_ms: f32,
-        output_schema: &SchemaRef,
     ) -> Result<RecordBatch> {
         let prefix = build_prefix_columns(
             keys,
-            &self.source_id,
-            &self.source.to_string(),
+            ctx.source_id,
+            ctx.model_label,
             &raw_output.row_status,
             &raw_output.row_errors,
             latency_ms,
             row_count,
         );
-        let task_columns = adapter.adapt(raw_output, row_count)?;
+        let task_columns = ctx.adapter.adapt(raw_output, row_count)?;
 
         let mut all_columns = prefix;
         all_columns.extend(task_columns);
 
-        RecordBatch::try_new(Arc::clone(output_schema), all_columns)
+        RecordBatch::try_new(Arc::clone(ctx.output_schema), all_columns)
             .map_err(|e| JammiError::Inference(format!("Failed to build output batch: {e}")))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use arrow::array::{Array, StringArray};
+    use arrow::datatypes::Schema;
+
     use super::*;
+    use crate::inference::adapter::EmbeddingAdapter;
+    use crate::inference::schema::build_output_schema;
 
     /// `is_oom_error` must classify ONLY genuine out-of-memory errors. A CUDA
     /// kernel/loader failure (e.g. `INVALID_PTX`) is not OOM — misrouting it to
@@ -312,5 +306,198 @@ mod tests {
         assert!(!oom("a cuda kernel launch failed"));
         assert!(!oom("cuDNN not available"));
         assert!(!oom("shape mismatch"));
+    }
+
+    fn fake_backend_output(len: usize) -> BackendOutput {
+        BackendOutput {
+            float_outputs: vec![vec![1.0; len]],
+            string_outputs: vec![],
+            row_status: vec![true; len],
+            row_errors: vec![String::new(); len],
+            shapes: vec![(len, 1)],
+        }
+    }
+
+    fn test_keys(n: usize) -> ArrayRef {
+        Arc::new(StringArray::from(
+            (0..n).map(|i| format!("row_{i}")).collect::<Vec<_>>(),
+        ))
+    }
+
+    fn test_content(n: usize) -> Vec<ArrayRef> {
+        vec![Arc::new(StringArray::from(vec!["x"; n])) as ArrayRef]
+    }
+
+    fn test_output_schema() -> SchemaRef {
+        build_output_schema(
+            &ModelTask::TextEmbedding,
+            &Arc::new(Schema::empty()),
+            "id",
+            Some(1),
+            None,
+        )
+        .expect("schema builds")
+    }
+
+    /// Drains every batch off `rx` (failing loudly on a stream-level `Err`)
+    /// and returns the `_row_id` values in the order they were sent.
+    async fn drain_row_ids(
+        mut rx: tokio::sync::mpsc::Receiver<datafusion::error::Result<RecordBatch>>,
+    ) -> Vec<String> {
+        let mut ids = Vec::new();
+        while let Some(batch) = rx.recv().await {
+            let batch = batch.expect("no error batches expected on the success path");
+            let row_id_col = batch
+                .column_by_name("_row_id")
+                .expect("_row_id column")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("_row_id is Utf8")
+                .clone();
+            ids.extend(
+                row_id_col
+                    .iter()
+                    .map(|v| v.expect("non-null row id").to_string()),
+            );
+        }
+        ids
+    }
+
+    /// #330: a successful OOM-halving retry must resend the FULL slice at the
+    /// smaller size, and the cursor loop must read `current_batch_size`
+    /// fresh on both the slice length and the advance — so a shrink never
+    /// diverges from the outer cursor (the old `step_by` + mutable-halving
+    /// split let the two drift apart and silently dropped rows, empirically
+    /// 100 of 300). Every one of 300 input rows must appear in the output
+    /// stream exactly once.
+    #[tokio::test]
+    async fn run_chunks_conserves_every_row_across_oom_halving() {
+        let row_count = 300;
+        let keys = test_keys(row_count);
+        let content = test_content(row_count);
+        let adapter = EmbeddingAdapter::new(1);
+        let output_schema = test_output_schema();
+        let ctx = OutputContext {
+            output_schema: &output_schema,
+            adapter: &adapter,
+            source_id: "test-source",
+            model_label: "test-model",
+            observer: None,
+        };
+        let mut current_batch_size = 100;
+        let oom_threshold = 64;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(row_count);
+        InferenceRunner::run_chunks(
+            &content,
+            &keys,
+            &mut current_batch_size,
+            &ctx,
+            &tx,
+            |chunk| {
+                let len = chunk[0].len();
+                if len > oom_threshold {
+                    Err(JammiError::Inference("out of memory".into()))
+                } else {
+                    Ok(fake_backend_output(len))
+                }
+            },
+        )
+        .await
+        .expect("run_chunks succeeds once the batch size shrinks under the OOM threshold");
+        drop(tx);
+
+        let mut ids = drain_row_ids(rx).await;
+        ids.sort();
+        let mut expected: Vec<String> = (0..row_count).map(|i| format!("row_{i}")).collect();
+        expected.sort();
+        assert_eq!(
+            ids, expected,
+            "every input row must appear exactly once — no drops (#330), no duplicates"
+        );
+    }
+
+    /// A persistent OOM that survives even at batch size 1 is an unservable
+    /// resource failure — it must propagate rather than loop forever or
+    /// silently drop the unservable slice, and the size must floor at 1
+    /// (never reach 0, which would divide the input into an infinite number
+    /// of empty chunks).
+    #[tokio::test]
+    async fn run_chunks_propagates_persistent_oom_at_minimum_batch_size() {
+        let row_count = 10;
+        let keys = test_keys(row_count);
+        let content = test_content(row_count);
+        let adapter = EmbeddingAdapter::new(1);
+        let output_schema = test_output_schema();
+        let ctx = OutputContext {
+            output_schema: &output_schema,
+            adapter: &adapter,
+            source_id: "test-source",
+            model_label: "test-model",
+            observer: None,
+        };
+        let mut current_batch_size = 4;
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(row_count);
+        let result = InferenceRunner::run_chunks(
+            &content,
+            &keys,
+            &mut current_batch_size,
+            &ctx,
+            &tx,
+            |_chunk| Err(JammiError::Inference("out of memory".into())),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "persistent OOM at batch size 1 must propagate"
+        );
+        assert_eq!(
+            current_batch_size, 1,
+            "batch size halves down to a floor of 1, never below"
+        );
+    }
+
+    /// #331: a non-OOM forward failure is always systemic — it must
+    /// propagate immediately, never be misrouted through the OOM-halving
+    /// retry, and never emit any output batch.
+    #[tokio::test]
+    async fn run_chunks_propagates_non_oom_error_immediately() {
+        let row_count = 10;
+        let keys = test_keys(row_count);
+        let content = test_content(row_count);
+        let adapter = EmbeddingAdapter::new(1);
+        let output_schema = test_output_schema();
+        let ctx = OutputContext {
+            output_schema: &output_schema,
+            adapter: &adapter,
+            source_id: "test-source",
+            model_label: "test-model",
+            observer: None,
+        };
+        let mut current_batch_size = 4;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(row_count);
+        let result = InferenceRunner::run_chunks(
+            &content,
+            &keys,
+            &mut current_batch_size,
+            &ctx,
+            &tx,
+            |_chunk| Err(JammiError::Inference("shape mismatch".into())),
+        )
+        .await;
+
+        assert!(result.is_err(), "a non-OOM forward failure must propagate");
+        assert_eq!(
+            current_batch_size, 4,
+            "a non-OOM error must not trigger OOM halving"
+        );
+        drop(tx);
+        assert!(
+            rx.recv().await.is_none(),
+            "a systemic failure must not emit any output batch"
+        );
     }
 }

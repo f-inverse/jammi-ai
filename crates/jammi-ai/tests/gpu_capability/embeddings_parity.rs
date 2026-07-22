@@ -7,69 +7,11 @@
 //! (keyed by `_row_id`, so the comparison is row-exact regardless of scan order)
 //! and the same encoded query vector must match within the parity tolerance.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-
-use arrow::array::{Array, FixedSizeListArray, Float32Array, StringArray};
-use arrow::datatypes::DataType;
-use jammi_ai::session::InferenceSession;
-use jammi_db::catalog::result_repo::ResultTableRecord;
-use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::store::CachePolicy;
 use tempfile::TempDir;
 
 use crate::harness;
 use crate::skip_without_gpu;
-
-/// Register the patents fixture as a source on `session`.
-async fn add_patents(session: &Arc<InferenceSession>) {
-    session
-        .add_source(
-            "patents",
-            SourceType::File,
-            SourceConnection {
-                url: Some(harness::fixture_url("patents.parquet")),
-                format: Some(FileFormat::Parquet),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-}
-
-/// Read an embedding result table's `(_row_id, vector)` rows into a map, so a
-/// CPU and a GPU table compare row-exact even if their scan order differs.
-async fn keyed_vectors(
-    session: &Arc<InferenceSession>,
-    table: &ResultTableRecord,
-) -> HashMap<String, Vec<f32>> {
-    let batches = session
-        .sql(&format!(
-            "SELECT _row_id, vector FROM \"jammi.{}\"",
-            table.table_name
-        ))
-        .await
-        .unwrap();
-    let mut out = HashMap::new();
-    for batch in &batches {
-        let ids = arrow::compute::cast(batch.column(0), &DataType::Utf8).unwrap();
-        let ids = ids.as_any().downcast_ref::<StringArray>().unwrap();
-        let list = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<FixedSizeListArray>()
-            .unwrap();
-        for i in 0..batch.num_rows() {
-            let cell = list.value(i);
-            let floats = cell.as_any().downcast_ref::<Float32Array>().unwrap();
-            out.insert(
-                ids.value(i).to_string(),
-                (0..floats.len()).map(|j| floats.value(j)).collect(),
-            );
-        }
-    }
-    out
-}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn generate_embeddings_cpu_gpu_parity() {
@@ -79,7 +21,7 @@ async fn generate_embeddings_cpu_gpu_parity() {
 
     let cpu_dir = TempDir::new().unwrap();
     let cpu = harness::cpu_session(cpu_dir.path()).await;
-    add_patents(&cpu).await;
+    harness::add_patents(&cpu).await;
     let (cpu_table, _) = cpu
         .generate_text_embeddings(
             "patents",
@@ -90,11 +32,11 @@ async fn generate_embeddings_cpu_gpu_parity() {
         )
         .await
         .unwrap();
-    let cpu_vecs = keyed_vectors(&cpu, &cpu_table).await;
+    let cpu_vecs = harness::keyed_result_vectors(&cpu, &cpu_table).await;
 
     let gpu_dir = TempDir::new().unwrap();
     let gpu = harness::gpu_session(gpu_dir.path()).await;
-    add_patents(&gpu).await;
+    harness::add_patents(&gpu).await;
     let (gpu_table, _) = gpu
         .generate_text_embeddings(
             "patents",
@@ -105,7 +47,7 @@ async fn generate_embeddings_cpu_gpu_parity() {
         )
         .await
         .unwrap();
-    let gpu_vecs = keyed_vectors(&gpu, &gpu_table).await;
+    let gpu_vecs = harness::keyed_result_vectors(&gpu, &gpu_table).await;
 
     assert_eq!(
         cpu_table.dimensions, gpu_table.dimensions,

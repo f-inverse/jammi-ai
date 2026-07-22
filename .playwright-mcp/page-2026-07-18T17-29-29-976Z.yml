@@ -1,0 +1,593 @@
+- generic [ref=f3e2]:
+  - generic [ref=f3e4]:
+    - generic [ref=f3e9]:
+      - paragraph [ref=f3e10]: AltStreet
+      - paragraph [ref=f3e11]: "Weekly: new deals, platform research, and the signals that move alt markets."
+    - generic [ref=f3e13]:
+      - textbox "you@email.com" [ref=f3e14]
+      - button "Get Free Access" [ref=f3e15] [cursor=pointer]
+  - banner [ref=f3e16]:
+    - generic [ref=f3e17]:
+      - link [ref=f3e18] [cursor=pointer]:
+        - /url: /
+        - img "AltStreet" [ref=f3e19]
+      - generic [ref=f3e20]:
+        - link "Investing" [ref=f3e22] [cursor=pointer]:
+          - /url: /investing
+        - link "Alternative Assets" [ref=f3e26] [cursor=pointer]:
+          - /url: /categories
+        - link "Guides" [ref=f3e30] [cursor=pointer]:
+          - /url: /guides
+        - link "Reference" [ref=f3e32] [cursor=pointer]:
+          - /url: /reference
+        - link "Due Diligence" [ref=f3e36] [cursor=pointer]:
+          - /url: /due-diligence
+        - link "Taxes & Structures" [ref=f3e40] [cursor=pointer]:
+          - /url: /taxes
+        - link "Platforms & Funds" [ref=f3e44] [cursor=pointer]:
+          - /url: /platforms
+        - link "Tools & Data" [ref=f3e48] [cursor=pointer]:
+          - /url: /data
+        - link "Insights" [ref=f3e52] [cursor=pointer]:
+          - /url: /blog
+      - link "Subscribe" [ref=f3e56] [cursor=pointer]:
+        - /url: /subscribe
+  - main [ref=f3e57]:
+    - generic [ref=f3e59]:
+      - generic [ref=f3e60]:
+        - heading "GPU Cloud Pricing Comparison 2026" [level=1] [ref=f3e61]
+        - paragraph [ref=f3e62]: Compare live cloud GPU pricing across Lambda Labs, RunPod, Vast.ai, AWS, GCP, Azure, and other providers. Find Lambda Labs A100 80GB, RunPod H100, Vast.ai RTX 4090, L40S, and hyperscale hourly rates with yield score analysis and cost calculations.
+        - paragraph [ref=f3e63]: Ranges on this page verified 2026-07-11 against provider APIs and public pricing pages across 7 daily-verified sources; AWS/GCP figures are dated manual reference rates.
+        - generic [ref=f3e64]:
+          - link "View Live Pricing Dashboard" [ref=f3e65] [cursor=pointer]:
+            - /url: /tools/gpu/dashboard
+          - link "Compare Providers" [ref=f3e68] [cursor=pointer]:
+            - /url: "#provider-comparison"
+        - generic [ref=f3e71]: Pricing refreshed regularly • Live dashboard shows current rates
+      - generic [ref=f3e74]:
+        - generic [ref=f3e75]:
+          - heading "Real-Time GPU Pricing" [level=3] [ref=f3e79]
+          - paragraph [ref=f3e81]: Hourly rates for H100, A100, L40S, RTX 4090, and other GPUs across decentralized marketplaces and hyperscale clouds. Dashboard refreshes from provider APIs automatically.
+        - generic [ref=f3e82]:
+          - heading "Infrastructure Cost Calculator" [level=3] [ref=f3e86]
+          - paragraph [ref=f3e88]: Estimate cost per 1M tokens, per training epoch, or per month based on your workload. Calculate total cost of ownership including egress, storage, and compute time.
+        - generic [ref=f3e89]:
+          - heading "Performance-Per-Dollar Analysis" [level=3] [ref=f3e94]
+          - paragraph [ref=f3e96]: Yield score methodology ranks GPUs by computational efficiency per dollar. Compare normalized performance indices across different GPU architectures and price points.
+      - generic [ref=f3e98]:
+        - heading "How to Use This Tool" [level=2] [ref=f3e99]
+        - generic [ref=f3e103]:
+          - generic [ref=f3e104]:
+            - generic [ref=f3e105]:
+              - generic [ref=f3e106]: "1"
+              - heading "Review Provider Types" [level=3] [ref=f3e107]
+            - paragraph [ref=f3e108]: Compare hyperscale, specialized, and decentralized providers below to understand availability vs. cost trade-offs
+          - generic [ref=f3e109]:
+            - generic [ref=f3e110]:
+              - generic [ref=f3e111]: "2"
+              - heading "Select Your GPU Model" [level=3] [ref=f3e112]
+            - paragraph [ref=f3e113]: Use our workload framework to match GPU specs (VRAM, throughput) to your model size and inference requirements
+          - generic [ref=f3e114]:
+            - generic [ref=f3e115]:
+              - generic [ref=f3e116]: "3"
+              - heading "Check Live Dashboard" [level=3] [ref=f3e117]
+            - paragraph [ref=f3e118]: Click "View Live Pricing Dashboard" above to filter by region, compare yield scores, and calculate total costs
+      - generic [ref=f3e120]:
+        - heading "GPU Pricing Market Snapshot (Recent Market Range)" [level=2] [ref=f3e121]
+        - generic [ref=f3e122]:
+          - generic [ref=f3e123]:
+            - heading "Key Price Observations" [level=3] [ref=f3e124]
+            - list [ref=f3e125]:
+              - listitem [ref=f3e126]:
+                - generic [ref=f3e127]: •
+                - generic [ref=f3e128]: H100 pricing verified from $2.46/hr (specialized spot) to $12.29/hr (hyperscale on-demand), a 5x spread
+              - listitem [ref=f3e129]:
+                - generic [ref=f3e130]: •
+                - generic [ref=f3e131]: A100 80GB rates verified from $0.68/hr (hyperscale spot) to $4.10/hr on-demand, depending on provider and tier
+              - listitem [ref=f3e132]:
+                - generic [ref=f3e133]: •
+                - generic [ref=f3e134]: Consumer-grade RTX 4090 instances remain the most cost-efficient for smaller models, verified from $0.14/hr spot
+          - generic [ref=f3e135]:
+            - heading "Market Dynamics" [level=3] [ref=f3e136]
+            - list [ref=f3e137]:
+              - listitem [ref=f3e138]:
+                - generic [ref=f3e139]: •
+                - generic [ref=f3e140]: Decentralized networks (Vast.ai, RunPod) expanded supply by aggregating consumer and enterprise hardware
+              - listitem [ref=f3e141]:
+                - generic [ref=f3e142]: •
+                - generic [ref=f3e143]: Specialized providers (Lambda Labs, CoreWeave) offer middle-ground pricing with better availability than decentralized
+              - listitem [ref=f3e144]:
+                - generic [ref=f3e145]: •
+                - generic [ref=f3e146]: Hyperscale clouds maintain premium pricing but provide enterprise SLAs and global availability
+      - generic [ref=f3e147]:
+        - heading "GPU Provider Price Comparison" [level=2] [ref=f3e148]
+        - paragraph [ref=f3e149]: "Note: The ranges below are directional and may drift based on region, availability, host quality, and instance configuration."
+        - paragraph [ref=f3e150]: Use the live dashboard for exact, current pricing before making infrastructure decisions.
+        - paragraph [ref=f3e151]: Ranges are not quotes; verify pricing with the provider before purchase.
+        - generic [ref=f3e152]:
+          - link "View Live Pricing Dashboard" [ref=f3e153] [cursor=pointer]:
+            - /url: /tools/gpu/dashboard
+          - link "Compare Provider Types" [ref=f3e156] [cursor=pointer]:
+            - /url: "#provider-models"
+        - table [ref=f3e158]:
+          - rowgroup [ref=f3e159]:
+            - row [ref=f3e160]:
+              - columnheader "GPU Model" [ref=f3e161]
+              - columnheader "Decentralized (Vast.ai, RunPod)" [ref=f3e162]: Decentralized(Vast.ai, RunPod)
+              - columnheader "Specialized (Lambda, CoreWeave)" [ref=f3e163]: Specialized(Lambda, CoreWeave)
+              - columnheader "Hyperscale (AWS, GCP, Azure)" [ref=f3e164]: Hyperscale(AWS, GCP, Azure)
+              - columnheader "Typical Use Case" [ref=f3e165]
+          - rowgroup [ref=f3e166]:
+            - row [ref=f3e167]:
+              - cell "H100 80GB" [ref=f3e168]
+              - cell "See live dashboard" [ref=f3e169]
+              - cell "$2.46-6.16/hr" [ref=f3e170]
+              - cell "$10.35-12.29/hr" [ref=f3e171]
+              - cell "Large-scale training (70B+ models), high-throughput production inference" [ref=f3e172]
+            - row [ref=f3e173]:
+              - cell "A100 80GB" [ref=f3e174]
+              - cell "See live dashboard" [ref=f3e175]
+              - cell "$1.21-2.79/hr" [ref=f3e176]
+              - cell "$0.68-4.10/hr" [ref=f3e177]
+              - cell "Fine-tuning mid-size models (13B-70B), batch inference, research" [ref=f3e178]
+            - row [ref=f3e179]:
+              - cell "A100 40GB" [ref=f3e180]
+              - cell "See live dashboard" [ref=f3e181]
+              - cell "$1.99/hr" [ref=f3e182]
+              - cell "$3.40-4.10/hr" [ref=f3e183]
+              - cell "Development, smaller fine-tuning tasks (7B-30B models)" [ref=f3e184]
+            - row [ref=f3e185]:
+              - cell "L40S 48GB" [ref=f3e186]
+              - cell "See live dashboard" [ref=f3e187]
+              - cell "$0.39-2.25/hr" [ref=f3e188]
+              - cell "Limited" [ref=f3e189]
+              - cell "Cost-sensitive inference, multi-modal workloads" [ref=f3e190]
+            - row [ref=f3e191]:
+              - cell "RTX 4090 24GB" [ref=f3e192]
+              - cell "$0.14-0.34/hr" [ref=f3e193]
+              - cell "Limited" [ref=f3e194]
+              - cell "N/A" [ref=f3e195]
+              - cell "Development, small model inference (7B-13B), testing" [ref=f3e196]
+        - generic [ref=f3e197]:
+          - heading "Understanding the Price-Performance Trade-off" [level=3] [ref=f3e198]
+          - generic [ref=f3e201]:
+            - paragraph [ref=f3e202]: Decentralized providers aggregate compute from consumer hardware and smaller data centers, enabling significantly lower hourly rates. Trade-offs include variable availability (commonly observed at 70-85%), potential instance interruptions, and limited enterprise support.
+            - paragraph [ref=f3e203]: Specialized providers operate dedicated GPU infrastructure with institutional-grade availability (95-98%) and better networking, priced between decentralized and hyperscale options.
+            - paragraph [ref=f3e204]: Hyperscale clouds provide enterprise SLAs (99.9%+ uptime), global availability, and comprehensive support at premium pricing. Optimal for production services requiring reliability guarantees.
+        - generic [ref=f3e205]:
+          - paragraph [ref=f3e206]: "Most users do this next: Estimate your complete AI infrastructure costs including training, inference, data labeling, and hidden operational expenses."
+          - link "Calculate Your AI TCO" [ref=f3e207] [cursor=pointer]:
+            - /url: /tools/ai-infrastructure-calculator
+      - generic [ref=f3e212]:
+        - heading "GPU Provider Infrastructure Models" [level=2] [ref=f3e213]
+        - generic [ref=f3e214]:
+          - generic [ref=f3e215]:
+            - heading "Hyperscale Cloud Providers (AWS, GCP, Azure)" [level=3] [ref=f3e221]
+            - generic [ref=f3e223]:
+              - generic [ref=f3e224]:
+                - heading "Infrastructure Characteristics" [level=4] [ref=f3e225]
+                - list [ref=f3e226]:
+                  - listitem [ref=f3e227]:
+                    - generic [ref=f3e230]: Enterprise SLAs with 99.9%+ uptime commitments and financial penalties for breaches
+                  - listitem [ref=f3e231]:
+                    - generic [ref=f3e235]: Global availability across 20+ regions with consistent performance characteristics
+                  - listitem [ref=f3e236]:
+                    - generic [ref=f3e240]: Purpose-built data centers optimized for GPU workloads with liquid cooling and high-bandwidth networking
+              - generic [ref=f3e241]:
+                - heading "Pricing and Economics" [level=4] [ref=f3e242]
+                - list [ref=f3e243]:
+                  - listitem [ref=f3e244]: "• H100 instances: $10.35-12.29/hr per GPU on-demand (verified); reserved commitments discount 20-45%"
+                  - listitem [ref=f3e245]: "• A100 instances: $3.40-4.10/hr on-demand (verified); spot verified as low as $0.68/hr"
+                  - listitem [ref=f3e246]: • Spot instances offer 50-70% discounts but with potential interruption
+                  - listitem [ref=f3e247]: "• Additional costs: data egress ($0.08-0.12/GB), storage, load balancers"
+                - paragraph [ref=f3e248]: "Optimal for: Production services requiring high reliability, compliance requirements, multi-region deployment"
+          - generic [ref=f3e249]:
+            - heading "Specialized GPU Providers (Lambda Labs, CoreWeave, Paperspace)" [level=3] [ref=f3e254]
+            - generic [ref=f3e256]:
+              - generic [ref=f3e257]:
+                - heading "Infrastructure Characteristics" [level=4] [ref=f3e258]
+                - list [ref=f3e259]:
+                  - listitem [ref=f3e260]:
+                    - generic [ref=f3e263]: Focused GPU infrastructure with 95-98% availability but limited formal SLA guarantees
+                  - listitem [ref=f3e264]:
+                    - generic [ref=f3e268]: Regional availability typically concentrated in 3-5 major data center hubs
+                  - listitem [ref=f3e269]:
+                    - generic [ref=f3e273]: Purpose-built for ML workloads with optimized networking and storage configurations
+              - generic [ref=f3e274]:
+                - heading "Pricing and Economics" [level=4] [ref=f3e275]
+                - list [ref=f3e276]:
+                  - listitem [ref=f3e277]: "• H100 instances: $2.49-6.16/hr verified (PCIe on-demand to HGX nodes); spot from $2.46/hr"
+                  - listitem [ref=f3e278]: "• A100 instances: $1.21-2.79/hr verified, often with volume discounts for 10+ GPUs"
+                  - listitem [ref=f3e279]: • Flat-rate pricing with fewer hidden costs than hyperscale clouds
+                  - listitem [ref=f3e280]: • Some providers offer reserved capacity at 15-25% discount
+                - paragraph [ref=f3e281]: "Optimal for: ML teams requiring better economics than hyperscale with more reliability than decentralized"
+          - generic [ref=f3e282]:
+            - heading "Decentralized GPU Marketplaces (Vast.ai, RunPod)" [level=3] [ref=f3e288]
+            - generic [ref=f3e290]:
+              - generic [ref=f3e291]:
+                - heading "Infrastructure Characteristics" [level=4] [ref=f3e292]
+                - list [ref=f3e293]:
+                  - listitem [ref=f3e294]:
+                    - generic [ref=f3e297]: Aggregate supply from consumer hardware, small data centers, and individual operators
+                  - listitem [ref=f3e298]:
+                    - generic [ref=f3e302]: Variable availability commonly observed at 70-85%, with potential for instance interruption or maintenance
+                  - listitem [ref=f3e303]:
+                    - generic [ref=f3e307]: Heterogeneous infrastructure quality, networking speeds, and storage configurations
+              - generic [ref=f3e308]:
+                - heading "Pricing and Economics" [level=4] [ref=f3e309]
+                - list [ref=f3e310]:
+                  - listitem [ref=f3e311]: "• H100 instances: Often available at 50-80% lower rates vs hyperscale (commonly See live dashboard)"
+                  - listitem [ref=f3e312]: "• A100 instances: See live dashboard with variation by host quality"
+                  - listitem [ref=f3e313]: "• RTX consumer GPUs: $0.14-0.34/hr for 4090, 3090, etc."
+                  - listitem [ref=f3e314]: • Transparent base pricing with often lower ancillary fees compared to hyperscale clouds
+                - paragraph [ref=f3e315]: "Optimal for: Development, experimentation, batch workloads, cost-sensitive applications with fault tolerance"
+      - generic [ref=f3e316]:
+        - heading "GPU Selection Framework by Workload" [level=2] [ref=f3e317]
+        - generic [ref=f3e318]:
+          - generic [ref=f3e319]:
+            - heading "Training Large Language Models (30B-70B+ Parameters)" [level=3] [ref=f3e321]
+            - generic [ref=f3e322]:
+              - generic [ref=f3e323]:
+                - generic [ref=f3e324]:
+                  - paragraph [ref=f3e325]: Recommended GPU
+                  - paragraph [ref=f3e326]: H100 80GB or A100 80GB (multi-GPU setup for 70B+)
+                - generic [ref=f3e327]:
+                  - paragraph [ref=f3e328]: Estimated Cost
+                  - paragraph [ref=f3e329]: $2.50-12/hr per GPU × training duration (typically 100-500 GPU-hours for fine-tuning)
+                - generic [ref=f3e330]:
+                  - paragraph [ref=f3e331]: Provider Recommendation
+                  - paragraph [ref=f3e332]: Specialized (Lambda, CoreWeave) for reliability; Decentralized (Vast.ai) for cost savings if checkpointing frequently
+              - paragraph [ref=f3e333]: 80GB VRAM required for models above 30B parameters without advanced quantization. Multi-GPU setups with NVLink or InfiniBand needed for 70B+ models. Consider checkpoint frequency and fault tolerance when using lower-cost providers.
+          - generic [ref=f3e334]:
+            - heading "Production Inference for Customer-Facing Applications" [level=3] [ref=f3e336]
+            - generic [ref=f3e337]:
+              - generic [ref=f3e338]:
+                - generic [ref=f3e339]:
+                  - paragraph [ref=f3e340]: Recommended GPU
+                  - paragraph [ref=f3e341]: H100 for high-throughput; A100 or L40S for cost-balanced inference
+                - generic [ref=f3e342]:
+                  - paragraph [ref=f3e343]: Estimated Cost
+                  - paragraph [ref=f3e344]: $0.50-2.00 per 1M tokens depending on model size and GPU choice
+                - generic [ref=f3e345]:
+                  - paragraph [ref=f3e346]: Provider Recommendation
+                  - paragraph [ref=f3e347]: Hyperscale (AWS, GCP) or Specialized (Lambda, CoreWeave) for SLA requirements
+              - paragraph [ref=f3e348]: Production inference requires high availability (99.9%+), consistent latency, and autoscaling capabilities. Avoid decentralized providers unless implementing multi-provider failover. Factor in egress costs for high-volume applications.
+          - generic [ref=f3e349]:
+            - heading "Fine-Tuning Small to Medium Models (7B-13B Parameters)" [level=3] [ref=f3e351]
+            - generic [ref=f3e352]:
+              - generic [ref=f3e353]:
+                - generic [ref=f3e354]:
+                  - paragraph [ref=f3e355]: Recommended GPU
+                  - paragraph [ref=f3e356]: RTX 4090, L40S, or A100 40GB
+                - generic [ref=f3e357]:
+                  - paragraph [ref=f3e358]: Estimated Cost
+                  - paragraph [ref=f3e359]: $10-100 per fine-tuning run (5-50 GPU-hours typical)
+                - generic [ref=f3e360]:
+                  - paragraph [ref=f3e361]: Provider Recommendation
+                  - paragraph [ref=f3e362]: Decentralized (Vast.ai, RunPod) optimal for cost efficiency
+              - paragraph [ref=f3e363]: 24-48GB VRAM sufficient for most 7B-13B model fine-tuning with LoRA or QLoRA. Decentralized providers offer substantial savings with acceptable interruption risk for non-production workloads. Implement checkpointing every 10-20% of training.
+          - generic [ref=f3e364]:
+            - heading "Development, Experimentation, and Testing" [level=3] [ref=f3e366]
+            - generic [ref=f3e367]:
+              - generic [ref=f3e368]:
+                - generic [ref=f3e369]:
+                  - paragraph [ref=f3e370]: Recommended GPU
+                  - paragraph [ref=f3e371]: RTX 4090, RTX 3090, or L40S
+                - generic [ref=f3e372]:
+                  - paragraph [ref=f3e373]: Estimated Cost
+                  - paragraph [ref=f3e374]: $0.20-0.60/hr for iterative development
+                - generic [ref=f3e375]:
+                  - paragraph [ref=f3e376]: Provider Recommendation
+                  - paragraph [ref=f3e377]: Decentralized providers (Vast.ai) for maximum cost efficiency
+              - paragraph [ref=f3e378]: Consumer-grade GPUs provide excellent performance for development workflows, prompt engineering, and model evaluation. Lower hourly rates enable longer experimentation cycles. Interruption risk is acceptable for non-critical development work.
+          - generic [ref=f3e379]:
+            - heading "Batch Processing and Offline Inference" [level=3] [ref=f3e381]
+            - generic [ref=f3e382]:
+              - generic [ref=f3e383]:
+                - generic [ref=f3e384]:
+                  - paragraph [ref=f3e385]: Recommended GPU
+                  - paragraph [ref=f3e386]: A100 40/80GB for throughput; RTX 4090 for cost efficiency
+                - generic [ref=f3e387]:
+                  - paragraph [ref=f3e388]: Estimated Cost
+                  - paragraph [ref=f3e389]: $0.50-3.00 per 1M tokens processed depending on model and GPU
+                - generic [ref=f3e390]:
+                  - paragraph [ref=f3e391]: Provider Recommendation
+                  - paragraph [ref=f3e392]: Decentralized or spot instances for lowest cost; can tolerate interruption
+              - paragraph [ref=f3e393]: Batch workloads with flexible deadlines can leverage spot pricing or decentralized providers for 60-80% cost savings. Implement job queuing and automatic retry logic to handle potential interruptions. Consider multi-provider strategies to maximize GPU availability.
+      - generic [ref=f3e394]:
+        - heading "Understanding GPU Yield Score Methodology" [level=2] [ref=f3e395]
+        - generic [ref=f3e396]:
+          - heading "Calculation Framework" [level=3] [ref=f3e397]
+          - generic [ref=f3e398]:
+            - paragraph [ref=f3e399]: Yield Score = Performance Index / Hourly Price
+            - paragraph [ref=f3e400]: Higher scores indicate more computational output per dollar spent
+          - generic [ref=f3e401]:
+            - generic [ref=f3e402]:
+              - heading "Performance Index Components" [level=4] [ref=f3e403]
+              - list [ref=f3e404]:
+                - listitem [ref=f3e405]:
+                  - generic [ref=f3e406]: •
+                  - generic [ref=f3e407]:
+                    - strong [ref=f3e408]: "Compute throughput:"
+                    - text: TFLOPS for FP16/BF16 operations (primary metric for transformer models)
+                - listitem [ref=f3e409]:
+                  - generic [ref=f3e410]: •
+                  - generic [ref=f3e411]:
+                    - strong [ref=f3e412]: "Memory bandwidth:"
+                    - text: GB/s for memory-bound inference workloads
+                - listitem [ref=f3e413]:
+                  - generic [ref=f3e414]: •
+                  - generic [ref=f3e415]:
+                    - strong [ref=f3e416]: "Memory capacity:"
+                    - text: Total VRAM available for model weights and KV cache
+                - listitem [ref=f3e417]:
+                  - generic [ref=f3e418]: •
+                  - generic [ref=f3e419]:
+                    - strong [ref=f3e420]: "Tensor Core generation:"
+                    - text: Architectural efficiency for matrix operations
+            - generic [ref=f3e421]:
+              - heading "Normalized Benchmarking" [level=4] [ref=f3e422]
+              - list [ref=f3e423]:
+                - listitem [ref=f3e424]:
+                  - generic [ref=f3e425]: •
+                  - generic [ref=f3e426]: Performance indices normalized to H100 baseline (100)
+                - listitem [ref=f3e427]:
+                  - generic [ref=f3e428]: •
+                  - generic [ref=f3e429]: Based on MLPerf inference benchmarks and manufacturer specifications
+                - listitem [ref=f3e430]:
+                  - generic [ref=f3e431]: •
+                  - generic [ref=f3e432]: Actual performance varies by model architecture, batch size, and optimization
+                - listitem [ref=f3e433]:
+                  - generic [ref=f3e434]: •
+                  - generic [ref=f3e435]: Indices reviewed periodically to reflect driver, framework, and benchmarking updates
+        - generic [ref=f3e436]:
+          - generic [ref=f3e437]:
+            - paragraph [ref=f3e438]: Example 1
+            - paragraph [ref=f3e439]: H100 at $2.46/hr (verified specialized spot)
+            - paragraph [ref=f3e440]: "Score: 40.7"
+            - paragraph [ref=f3e441]: 100 performance index ÷ $2.46 = 40.7
+          - generic [ref=f3e442]:
+            - paragraph [ref=f3e443]: Example 2
+            - paragraph [ref=f3e444]: A100 at $1.50/hr
+            - paragraph [ref=f3e445]: "Score: 38.0"
+            - paragraph [ref=f3e446]: 57 performance index ÷ $1.50 = 38
+          - generic [ref=f3e447]:
+            - paragraph [ref=f3e448]: Example 3
+            - paragraph [ref=f3e449]: RTX 4090 at $0.14/hr
+            - paragraph [ref=f3e450]: "Score: 115.0"
+            - paragraph [ref=f3e451]: 23 performance index ÷ $0.14 = 115
+        - generic [ref=f3e452]:
+          - heading "When Yield Score Matters (and When It Doesn't)" [level=4] [ref=f3e453]
+          - generic [ref=f3e457]:
+            - paragraph [ref=f3e458]:
+              - strong [ref=f3e459]: "Yield score is most valuable when:"
+              - text: You're running 8B-13B inference workloads where multiple GPU options (RTX 4090, L40S, A100 40GB) all meet VRAM requirements. In these cases, yield score helps identify the most cost-efficient choice—often favoring 4090/L40S.
+            - paragraph [ref=f3e460]:
+              - strong [ref=f3e461]: "Yield score becomes secondary when:"
+              - text: Your model requires 80GB VRAM (narrowing options to A100 80GB or H100), you need guaranteed 99.9% uptime for production, or latency requirements demand the fastest possible GPU regardless of cost.
+            - paragraph [ref=f3e462]:
+              - strong [ref=f3e463]: "Practical example:"
+              - text: "For running LLaMA 70B, an H100 at $2.50/hr (yield score: 40) may actually be more cost-effective than an A100 at $1.20/hr (yield score: 47) due to H100's 2-3x higher throughput reducing total job completion time."
+        - paragraph [ref=f3e465]:
+          - strong [ref=f3e466]: "Important context:"
+          - text: Yield score optimizes for cost efficiency, not absolute performance. A high yield score indicates excellent value but may not be appropriate for latency-sensitive or high-throughput production workloads. Use yield score in combination with workload requirements, SLA needs, and availability constraints.
+      - generic [ref=f3e467]:
+        - heading "Frequently Asked Questions" [level=2] [ref=f3e468]
+        - generic [ref=f3e469]:
+          - generic [ref=f3e470]:
+            - heading "What is the cheapest GPU for AI inference?" [level=3] [ref=f3e472]
+            - paragraph [ref=f3e474]: As of our July 2026 verification pass, RTX 4090 spot instances start around $0.14/hour on decentralized marketplaces (batch-priority distributed capacity around $0.20/hour), and L40S starts near $0.39/hour on-demand at specialized providers. For larger models requiring 80GB VRAM, A100 80GB spot pricing was verified as low as $0.68/hour (hyperscale spot) with on-demand rates of roughly $1.21-4.10/hour depending on provider type. Actual rates vary by provider, region, availability, and interruption tolerance.
+          - generic [ref=f3e475]:
+            - heading "How much does an H100 GPU cost per hour?" [level=3] [ref=f3e477]
+            - paragraph [ref=f3e479]: As of our July 2026 verification pass, H100 hourly rates at specialized providers ranged from about $2.46/hour (spot) to $6.16/hour (on-demand 8-GPU HGX nodes), with hyperscale on-demand rates of roughly $10.35-12.29/hour per GPU. Decentralized marketplace rates change continuously; see the live dashboard for current listings. Price differences reflect availability guarantees, support levels, and SLA commitments.
+          - generic [ref=f3e480]:
+            - heading "What is GPU yield score?" [level=3] [ref=f3e482]
+            - paragraph [ref=f3e484]: GPU yield score is a performance-per-dollar metric calculated as Performance Index / Hourly Price. Higher scores indicate more computational output per dollar. This metric helps identify cost-efficient options but should be considered alongside workload requirements, availability needs, and performance constraints.
+          - generic [ref=f3e485]:
+            - heading "How do decentralized providers compare to AWS, GCP, or Azure?" [level=3] [ref=f3e487]
+            - paragraph [ref=f3e489]: Decentralized GPU marketplaces often offer meaningfully lower hourly rates (sometimes 50%+ savings) than hyperscale clouds by aggregating supply from diverse sources. Trade-offs commonly include lower availability guarantees (often cited as 70-85% vs 99.9%), no enterprise SLAs, and variable network performance. Decentralized providers work well for development, batch workloads, and cost-sensitive applications, while production services requiring high reliability generally favor hyperscale or specialized providers.
+          - generic [ref=f3e490]:
+            - heading "What is the cost per 1M tokens for different GPUs?" [level=3] [ref=f3e492]
+            - paragraph [ref=f3e494]: Cost per 1M tokens depends on GPU throughput, hourly price, model architecture, and optimization. As an example, RTX 4090 instances running smaller models may achieve costs in the $0.50-1.00 per 1M tokens range, while H100 instances can be more efficient for larger models despite higher hourly rates due to superior throughput. Use our calculator with your specific model parameters for accurate estimates.
+          - generic [ref=f3e495]:
+            - heading "Is it cheaper to rent or buy GPUs for AI?" [level=3] [ref=f3e497]
+            - paragraph [ref=f3e499]: For workloads with consistent 24/7 utilization at 80%+ capacity, purchasing hardware may break even in approximately 8-12 months compared to cloud rental. However, ownership requires significant upfront capital, ongoing power and cooling costs, maintenance, and lacks flexibility for scaling or GPU type changes. Cloud rental generally proves more cost-effective for variable workloads, short-term projects, or when testing different GPU configurations.
+      - generic [ref=f3e500]:
+        - heading "Related AI Infrastructure Research" [level=2] [ref=f3e501]
+        - generic [ref=f3e502]:
+          - link [ref=f3e503] [cursor=pointer]:
+            - /url: /blog/ai-infrastructure-investment-guide-compute-tokens-data-centers
+            - generic [ref=f3e504]:
+              - heading "AI Infrastructure Investment Guide →" [level=3] [ref=f3e506]
+              - paragraph [ref=f3e508]: Comprehensive analysis of compute infrastructure economics, tokenized compute markets, and data center investment opportunities in the AI buildout.
+          - link [ref=f3e509] [cursor=pointer]:
+            - /url: /blog/gpu-investment-evaluation-h100-h200-mi300x-roi-analysis
+            - generic [ref=f3e510]:
+              - heading "GPU Hardware ROI Analysis (H100 vs H200 vs MI300X) →" [level=3] [ref=f3e512]
+              - paragraph [ref=f3e514]: "Financial modeling for GPU capital expenditure decisions: comparing NVIDIA H100, H200, and AMD MI300X for compute infrastructure investment."
+          - link [ref=f3e515] [cursor=pointer]:
+            - /url: /blog/ai-infrastructure-investing-portfolio-allocation-framework
+            - generic [ref=f3e516]:
+              - heading "AI Infrastructure Portfolio Allocation Framework →" [level=3] [ref=f3e518]
+              - paragraph [ref=f3e520]: Strategic framework for institutional investors building exposure to AI compute infrastructure across public equities, private funds, and direct investments.
+          - link [ref=f3e521] [cursor=pointer]:
+            - /url: /blog/ai-data-center-investment-analysis-framework
+            - generic [ref=f3e522]:
+              - heading "Data Center Investment Analysis Framework →" [level=3] [ref=f3e524]
+              - paragraph [ref=f3e526]: "Evaluation methodology for GPU-focused data center operators: analyzing infrastructure quality, power economics, and compute density metrics."
+          - link [ref=f3e527] [cursor=pointer]:
+            - /url: /categories/ai-infrastructure-compute
+            - generic [ref=f3e528]:
+              - heading "AI Infrastructure & Compute Category →" [level=3] [ref=f3e530]
+              - paragraph [ref=f3e532]: "Complete research coverage of AI compute infrastructure as an alternative asset class: market analysis, provider reviews, and investment frameworks."
+          - link [ref=f3e533] [cursor=pointer]:
+            - /url: /categories/ai-infrastructure-compute/decentralised-gpu-marketplaces
+            - generic [ref=f3e534]:
+              - heading "Decentralized GPU Marketplace Analysis →" [level=3] [ref=f3e536]
+              - paragraph [ref=f3e538]: "Deep-dive research on decentralized compute networks: market structure, pricing dynamics, and investment opportunities in distributed GPU infrastructure."
+          - link [ref=f3e539] [cursor=pointer]:
+            - /url: /blog/ai-infrastructure-risk-management-hedging-power-compute
+            - generic [ref=f3e540]:
+              - heading "AI Infrastructure Risk Management & Hedging →" [level=3] [ref=f3e542]
+              - paragraph [ref=f3e544]: "Risk analysis for compute infrastructure investments: power cost hedging, capacity planning, and portfolio construction strategies for institutional allocators."
+          - link [ref=f3e545] [cursor=pointer]:
+            - /url: /blog/cme-derivatives-outage-data-center-cooling-failure-case-study
+            - generic [ref=f3e546]:
+              - heading "Data Center Infrastructure Failure Case Study (CME) →" [level=3] [ref=f3e548]
+              - paragraph [ref=f3e550]: "Analysis of the 2024 CME data center cooling failure: lessons for GPU infrastructure reliability, redundancy requirements, and operational risk in compute investments."
+      - generic [ref=f3e552]:
+        - heading "Compare Live GPU Pricing" [level=2] [ref=f3e553]
+        - paragraph [ref=f3e554]: Access GPU pricing verified daily across 7 live sources, calculate workload costs with our scenario builder, and identify optimal performance-per-dollar GPUs for your infrastructure.
+        - link "Launch GPU Pricing Dashboard" [ref=f3e555] [cursor=pointer]:
+          - /url: /tools/gpu/dashboard
+      - generic [ref=f3e560]:
+        - paragraph [ref=f3e561]: GPU Cloud Pricing Comparison 2026 for H100, A100, L40S, RTX 4090 pricing across cloud providers. Compare GPU rental costs, calculate inference expenses, and evaluate performance-per-dollar for AI infrastructure.
+        - paragraph [ref=f3e562]: "Provider coverage: Vast.ai GPU pricing, RunPod pricing comparison, Lambda Labs rates, AWS P5 instances, GCP A3 instances, Azure ND series. Workload analysis: LLaMA inference costs, fine-tuning expenses, batch processing economics."
+  - contentinfo [ref=f3e563]:
+    - generic [ref=f3e564]:
+      - generic [ref=f3e565]:
+        - generic [ref=f3e566]:
+          - link [ref=f3e567] [cursor=pointer]:
+            - /url: /
+            - img "AltStreet" [ref=f3e569]
+          - paragraph [ref=f3e570]: AltStreet provides independent research across emerging alternative asset classes—from carbon and AI infrastructure to real assets, collectibles, and private credit.
+          - paragraph [ref=f3e571]: For informational purposes only. Not investment, legal, or tax advice.
+        - generic [ref=f3e572]:
+          - heading "Investing" [level=3] [ref=f3e573]
+          - list [ref=f3e574]:
+            - listitem [ref=f3e575]:
+              - link "How to Invest" [ref=f3e576] [cursor=pointer]:
+                - /url: /investing/how-to-invest
+            - listitem [ref=f3e577]:
+              - link "Net Worth Guides" [ref=f3e578] [cursor=pointer]:
+                - /url: /investing/net-worth-guides
+            - listitem [ref=f3e579]:
+              - link "Portfolio Strategies" [ref=f3e580] [cursor=pointer]:
+                - /url: /investing/portfolio-strategies
+            - listitem [ref=f3e581]:
+              - link "Passive Income" [ref=f3e582] [cursor=pointer]:
+                - /url: /investing/passive-income
+        - generic [ref=f3e583]:
+          - heading "Alternative Assets" [level=3] [ref=f3e584]
+          - list [ref=f3e585]:
+            - listitem [ref=f3e586]:
+              - link "Asset Class Overview" [ref=f3e587] [cursor=pointer]:
+                - /url: /categories
+            - listitem [ref=f3e588]:
+              - link "Private Credit" [ref=f3e589] [cursor=pointer]:
+                - /url: /categories/private-credit-rbf
+            - listitem [ref=f3e590]:
+              - link "Real Assets & Farmland" [ref=f3e591] [cursor=pointer]:
+                - /url: /categories/fractional-real-assets
+            - listitem [ref=f3e592]:
+              - link "Litigation Finance" [ref=f3e593] [cursor=pointer]:
+                - /url: /categories/litigation-finance
+            - listitem [ref=f3e594]:
+              - link "AI Infrastructure" [ref=f3e595] [cursor=pointer]:
+                - /url: /categories/ai-infrastructure-compute
+        - generic [ref=f3e596]:
+          - heading "Reference" [level=3] [ref=f3e597]
+          - list [ref=f3e598]:
+            - listitem [ref=f3e599]:
+              - link "Reference Hub" [ref=f3e600] [cursor=pointer]:
+                - /url: /reference
+            - listitem [ref=f3e601]:
+              - link "Glossary" [ref=f3e602] [cursor=pointer]:
+                - /url: /glossary
+            - listitem [ref=f3e603]:
+              - link "Core Mechanics" [ref=f3e604] [cursor=pointer]:
+                - /url: /reference#mechanics
+            - listitem [ref=f3e605]:
+              - link "Risk Frameworks" [ref=f3e606] [cursor=pointer]:
+                - /url: /reference#risk
+          - heading "Due Diligence" [level=3] [ref=f3e607]
+          - list [ref=f3e608]:
+            - listitem [ref=f3e609]:
+              - link "DD Framework" [ref=f3e610] [cursor=pointer]:
+                - /url: /due-diligence
+            - listitem [ref=f3e611]:
+              - link "PPM Reading Guide" [ref=f3e612] [cursor=pointer]:
+                - /url: /due-diligence/ppm-guide
+            - listitem [ref=f3e613]:
+              - link "Risk Models" [ref=f3e614] [cursor=pointer]:
+                - /url: /due-diligence/risk
+        - generic [ref=f3e615]:
+          - generic [ref=f3e616]:
+            - heading "Platforms" [level=3] [ref=f3e617]
+            - list [ref=f3e618]:
+              - listitem [ref=f3e619]:
+                - link "Review Methodology" [ref=f3e620] [cursor=pointer]:
+                  - /url: /platforms
+              - listitem [ref=f3e621]:
+                - link "Platform Reviews" [ref=f3e622] [cursor=pointer]:
+                  - /url: /platforms/reviews
+          - generic [ref=f3e623]:
+            - heading "Funds & EDGAR" [level=3] [ref=f3e624]
+            - list [ref=f3e625]:
+              - listitem [ref=f3e626]:
+                - link "Fund Directory" [ref=f3e627] [cursor=pointer]:
+                  - /url: /funds
+              - listitem [ref=f3e628]:
+                - link "EDGAR Database" [ref=f3e629] [cursor=pointer]:
+                  - /url: /edgar
+              - listitem [ref=f3e630]:
+                - link "Entity Search" [ref=f3e631] [cursor=pointer]:
+                  - /url: /edgar/search
+          - generic [ref=f3e632]:
+            - heading "Guides" [level=3] [ref=f3e633]
+            - list [ref=f3e634]:
+              - listitem [ref=f3e635]:
+                - link "Guides" [ref=f3e636] [cursor=pointer]:
+                  - /url: /guides
+          - generic [ref=f3e637]:
+            - heading "Taxes & Structures" [level=3] [ref=f3e638]
+            - list [ref=f3e639]:
+              - listitem [ref=f3e640]:
+                - link "Capital Gains" [ref=f3e641] [cursor=pointer]:
+                  - /url: /taxes
+              - listitem [ref=f3e642]:
+                - link "1031 Exchanges" [ref=f3e643] [cursor=pointer]:
+                  - /url: /taxes/structures
+              - listitem [ref=f3e644]:
+                - link "QSBS" [ref=f3e645] [cursor=pointer]:
+                  - /url: /taxes/structures
+              - listitem [ref=f3e646]:
+                - link "Self-Directed IRAs" [ref=f3e647] [cursor=pointer]:
+                  - /url: /taxes/structures
+          - generic [ref=f3e648]:
+            - heading "Resources" [level=3] [ref=f3e649]
+            - list [ref=f3e650]:
+              - listitem [ref=f3e651]:
+                - link "Tools & Data" [ref=f3e652] [cursor=pointer]:
+                  - /url: /data
+              - listitem [ref=f3e653]:
+                - link "Research & Insights" [ref=f3e654] [cursor=pointer]:
+                  - /url: /blog
+              - listitem [ref=f3e655]:
+                - link "News" [ref=f3e656] [cursor=pointer]:
+                  - /url: /news
+              - listitem [ref=f3e657]:
+                - link "Newsletter" [ref=f3e658] [cursor=pointer]:
+                  - /url: /subscribe
+          - generic [ref=f3e659]:
+            - heading "Company" [level=3] [ref=f3e660]
+            - list [ref=f3e661]:
+              - listitem [ref=f3e662]:
+                - link "About" [ref=f3e663] [cursor=pointer]:
+                  - /url: /about
+              - listitem [ref=f3e664]:
+                - link "Contact" [ref=f3e665] [cursor=pointer]:
+                  - /url: /contact
+      - generic [ref=f3e666]:
+        - generic [ref=f3e667]: © 2026 AltStreet. All rights reserved.
+        - generic [ref=f3e669]:
+          - link "Privacy" [ref=f3e670] [cursor=pointer]:
+            - /url: /privacy
+          - link "Terms" [ref=f3e672] [cursor=pointer]:
+            - /url: /terms
+          - link "info@altstreet.investments" [ref=f3e674] [cursor=pointer]:
+            - /url: mailto:info@altstreet.investments
+          - link "AltStreet on X" [ref=f3e678] [cursor=pointer]:
+            - /url: https://x.com/alt_street_
+          - link "AltStreet on YouTube" [ref=f3e681] [cursor=pointer]:
+            - /url: https://www.youtube.com/@altstreet-investments

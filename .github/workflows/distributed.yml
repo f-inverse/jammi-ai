@@ -37,8 +37,6 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  RUSTFLAGS: "-D warnings -C link-arg=-fuse-ld=mold"
-  SCCACHE_GHA_ENABLED: "true"
   # Pinned MinIO + mc versions. A versioned `archive/` release URL is immutable,
   # so the lane is reproducible and a `dl.min.io` "latest" reshuffle can never
   # silently change the binary under us; the `actions/cache` step below means a
@@ -82,7 +80,7 @@ jobs:
       AWS_REGION: us-east-1
     steps:
       - uses: actions/checkout@v4
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: ./.github/actions/setup-rust-ci
 
       - name: Cache the pinned MinIO + mc binaries
         id: minio-cache
@@ -211,7 +209,7 @@ jobs:
       AWS_REGION: us-east-1
     steps:
       - uses: actions/checkout@v4
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: ./.github/actions/setup-rust-ci
 
       - name: Cache the pinned MinIO + mc binaries
         id: minio-cache

@@ -38,7 +38,6 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
   build:
@@ -54,7 +53,12 @@ jobs:
       image: ghcr.io/f-inverse/jammi-ai-ci:latest
     steps:
       - uses: actions/checkout@v4
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          # This lane never set RUSTFLAGS explicitly — it falls back to
+          # .cargo/config.toml's per-target mold default, with no -D warnings.
+          # Preserve that (do not silently add -D warnings here).
+          rustflags: ""
 
       - name: Build guide
         run: mdbook build docs/guide

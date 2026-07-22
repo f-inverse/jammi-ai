@@ -25,12 +25,11 @@ jobs:
     defaults:
       run:
         working-directory: packaging/native
-    env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v4
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          rustflags: "-C link-arg=-fuse-ld=mold"
 
       - name: Build native wheel
         run: maturin build --release --out dist

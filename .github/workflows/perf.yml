@@ -37,8 +37,6 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  RUSTFLAGS: "-D warnings -C link-arg=-fuse-ld=mold"
-  SCCACHE_GHA_ENABLED: "true"
   # Pin Rayon to a single thread so the measured rate reflects the engine's
   # per-core code path, not the runner's variable core count — the same posture
   # the committed baselines were emitted under and the on-box emitters document.
@@ -52,7 +50,7 @@ jobs:
       image: ghcr.io/f-inverse/jammi-ai-ci:latest
     steps:
       - uses: actions/checkout@v4
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: ./.github/actions/setup-rust-ci
 
       - name: Build the bench harness (release)
         # The committed baselines were emitted in the release profile; the rate

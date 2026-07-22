@@ -49,7 +49,6 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
   build:
@@ -61,13 +60,18 @@ jobs:
           # manylinux_2_28 glibc floor for portability — built inside the CI
           # base image (the same toolchain layer the crates.io publish uses),
           # so the binary links against glibc 2.28 and runs on any newer host.
+          # Never set RUSTFLAGS explicitly on this leg — it falls back to
+          # .cargo/config.toml's per-target mold default.
           - target: x86_64-unknown-linux-gnu
             runs-on: ubuntu-latest
             container: ghcr.io/f-inverse/jammi-ai-ci:latest
-          # Apple-silicon native build. mold is Linux-only and auto-skips here.
+            rustflags: "-C link-arg=-fuse-ld=mold"
+          # Apple-silicon native build. mold is Linux-only (config.toml scopes
+          # it to the linux targets), so this leg leaves RUSTFLAGS unset.
           - target: aarch64-apple-darwin
             runs-on: macos-14
             container: ""
+            rustflags: ""
           # linux-aarch64 is deferred: there is no arm Linux runner and no
           # multi-arch CI base image to build it portably. Add a target row
           # here once an arm runner / arm CI base is available.
@@ -78,7 +82,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          rustflags: ${{ matrix.rustflags }}
 
       # The Linux build runs in the CI container, which already carries the
       # Rust toolchain, protoc, and mold. The macOS runner needs protoc and a
@@ -169,7 +175,11 @@ jobs:
     container: ghcr.io/f-inverse/jammi-ai-ci:latest
     steps:
       - uses: actions/checkout@v4
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          # This lane never set RUSTFLAGS explicitly — it falls back to
+          # .cargo/config.toml's per-target mold default, with no -D warnings.
+          rustflags: "-C link-arg=-fuse-ld=mold"
 
       - name: Build jammi-server (CPU, release)
         run: cargo build --release -p jammi-server --bin jammi-server --features jetstream-broker,storage-cloud
@@ -258,7 +268,11 @@ jobs:
     container: ghcr.io/f-inverse/jammi-ai-ci-cuda:latest
     steps:
       - uses: actions/checkout@v4
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          # This lane never set RUSTFLAGS explicitly — it falls back to
+          # .cargo/config.toml's per-target mold default, with no -D warnings.
+          rustflags: "-C link-arg=-fuse-ld=mold"
 
       - name: Build jammi-server (CUDA, release)
         run: cargo build --release -p jammi-server --bin jammi-server --features cuda,jetstream-broker,storage-cloud

@@ -26,8 +26,6 @@ env:
   OPENBLAS_NUM_THREADS: "1"
   MKL_NUM_THREADS: "1"
   TOKENIZERS_PARALLELISM: "false"
-  SCCACHE_GHA_ENABLED: "true"
-  RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
 jobs:
   render:
@@ -39,7 +37,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           lfs: true
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          rustflags: "-C link-arg=-fuse-ld=mold"
 
       - name: Build the HEAD wheels + jammi-server binary
         # The grpc:// / live-server chapters shell out to jammi-server; build it

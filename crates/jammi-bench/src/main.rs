@@ -348,20 +348,19 @@ enum Command {
     /// re-serves. Not a CI step — the provenance-recording rebuilder.
     #[command(hide = true)]
     RebuildModelInferenceSpec,
-    /// The on-GPU throughput/latency baseline: serves `generate_text_embeddings`
-    /// and `infer` on `gpu.device = 0` over the committed tiny bundles, measures
-    /// sustained rows/s and p50/p99 serve latency, and gates each against
-    /// `baselines/gpu_inference.json` (a throughput floor + a p99 ceiling). The GPU
-    /// peer of `model-inference-scale`; requires the `cuda` feature and a GPU (fails
-    /// loud on a CPU fallback). Emits the JSON report with the `gpu_inference` tier
-    /// set and exits non-zero on a regression or a non-deterministic serve.
+    /// The on-GPU embedding throughput/latency observability tier: serves
+    /// `generate_text_embeddings` on `gpu.device = 0` over the committed tiny
+    /// bundle and records sustained rows/s, p50/p99 serve latency, and
+    /// cross-repeat determinism, tagged with the concrete device that served
+    /// them. The GPU peer of `model-inference-scale`; requires the `cuda` feature
+    /// and a GPU (fails loud on a CPU fallback). An absolute rate on the
+    /// ephemeral heterogeneous prove fleet is not a property of the code, so
+    /// there is no perf gate here — the device-independent correctness contract
+    /// (determinism, CPU↔GPU parity) is hard-gated separately in the
+    /// `gpu_capability` suite. Emits the JSON report with the `gpu_inference`
+    /// tier set and exits non-zero only on a missing CUDA device or a serve
+    /// error.
     GpuInferenceScale,
-    /// Internal: rebuild the committed GPU-inference baseline
-    /// (`baselines/gpu_inference.json`) from a fresh serve on this device. Run
-    /// off-box on the target device class (the prove-lane A100) when the baseline
-    /// is established or the serving contract changes; CI only loads and re-serves.
-    #[command(hide = true)]
-    RebuildGpuInferenceSpec,
     /// The CPU-hermetic cache-hit SLO tier: drives the engine's opt-in producer
     /// memoization (`CachePolicy::Use`) on a cacheable producer (the
     /// neighbour-graph, anchored on the immutable source-table `ResultDigest`).
@@ -427,7 +426,6 @@ async fn main() -> std::process::ExitCode {
         Command::ModelInferenceScale => run_model_inference_scale().await,
         Command::RebuildModelInferenceSpec => run_rebuild_model_inference_spec().await,
         Command::GpuInferenceScale => run_gpu_inference_scale().await,
-        Command::RebuildGpuInferenceSpec => run_rebuild_gpu_inference_spec().await,
         Command::CacheSloScale => run_cache_slo_scale().await,
         Command::RecomputeScale => run_recompute_scale().await,
     }
@@ -1272,24 +1270,17 @@ const GPU_INFERENCE_PARAMS: gpu_inference::GpuInferenceParams = gpu_inference::G
     iters: 20,
 };
 
-/// Run the GPU-inference tier against the committed baseline, emit the report,
-/// and exit non-zero on any regression / non-deterministic serve.
+/// Run the GPU-inference tier, emit the report, and exit non-zero only when the
+/// session did not resolve to a CUDA device or a serve itself failed — there is
+/// no perf pass/fail (see the `gpu_inference` module docs).
 async fn run_gpu_inference_scale() -> std::process::ExitCode {
-    let spec = match gpu_inference::GpuInferenceSpec::load() {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("gpu-inference-scale could not load the committed baseline: {e}");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-    let tier = match gpu_inference::run(&spec).await {
+    let tier = match gpu_inference::run(GPU_INFERENCE_PARAMS).await {
         Ok(t) => t,
         Err(e) => {
             eprintln!("gpu-inference-scale run failed: {e}");
             return std::process::ExitCode::FAILURE;
         }
     };
-    let passed = gpu_inference::gates_passed(&tier);
     let report = Report {
         engine_version: ENGINE_VERSION,
         host: Host::detect(),
@@ -1300,43 +1291,7 @@ async fn run_gpu_inference_scale() -> std::process::ExitCode {
         },
     };
     emit(&report);
-    if passed {
-        std::process::ExitCode::SUCCESS
-    } else {
-        eprintln!(
-            "gpu-inference gate FAILED — a served throughput dropped below its floor, a p99 \
-             latency rose above its ceiling, or a serve was non-deterministic (see the report)."
-        );
-        std::process::ExitCode::FAILURE
-    }
-}
-
-/// Rebuild and write the committed GPU-inference baseline from a fresh serve on
-/// this device. The off-box one-shot; prints the baseline it wrote.
-async fn run_rebuild_gpu_inference_spec() -> std::process::ExitCode {
-    let spec = match gpu_inference::rebuild_spec(GPU_INFERENCE_PARAMS).await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("rebuild-gpu-inference-spec failed: {e}");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-    match serde_json::to_string_pretty(&spec) {
-        Ok(json) => {
-            if let Err(e) =
-                std::fs::write(gpu_inference::GpuInferenceSpec::path(), format!("{json}\n"))
-            {
-                eprintln!("rebuild-gpu-inference-spec could not write the baseline: {e}");
-                return std::process::ExitCode::FAILURE;
-            }
-            println!("{json}");
-            std::process::ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("failed to serialize gpu-inference baseline: {e}");
-            std::process::ExitCode::FAILURE
-        }
-    }
+    std::process::ExitCode::SUCCESS
 }
 
 /// The `measure-once` child: run one variant over the pre-materialized corpus,

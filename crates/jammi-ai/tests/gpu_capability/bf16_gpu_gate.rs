@@ -1,5 +1,11 @@
 //! P4 — bf16 inference is ADMITTED and correct on an Ampere+ (sm_80+) GPU.
 //!
+//! Not a `ci/scripts/check_gpu_parity_matrix.py` cell: it compares two GPU
+//! sessions at different precisions (bf16 vs f32), never a CPU baseline, so
+//! it proves precision-admission, not CPU↔GPU forward parity for an
+//! (architecture × verb) cell. `embeddings_parity` already covers Bert ×
+//! TextEmbedding's CPU↔GPU parity.
+//!
 //! This closes the coverage gap the pure-fn unit test cannot reach: the runtime
 //! compute-capability gate's *admit wiring*. On a CUDA build the gate acquires
 //! the resolved device's real capability

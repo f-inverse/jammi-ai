@@ -36,6 +36,13 @@
 //! Conformal / RRF are pure-CPU numerics and are out of scope — there is no GPU
 //! kernel to validate for them.
 //!
+//! `ci/scripts/check_gpu_parity_matrix.py` is the coverage-COMPLETENESS gate
+//! over this suite: it enumerates every SHIPPED (encoder architecture × GPU-
+//! dispatching `ModelTask` verb) cell and requires each to be COVERED (a
+//! `//! gpu-parity-cell: <Arch> × <Verb>` marker in one of these modules),
+//! STRUCTURALLY_EXCLUDED, or PENDING — so an untested cell cannot silently
+//! hide a divergence the way ModernBert×Classification once did (esc-028).
+//!
 //! ## Gating
 //!
 //! The suite is **off by default**: it compiles and runs only under the

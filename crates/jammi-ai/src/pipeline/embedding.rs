@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use arrow::array::Array;
 use datafusion::physical_plan::ExecutionPlan;
 
 use jammi_db::catalog::result_repo::ResultTableRecord;
@@ -191,17 +190,20 @@ impl<'a> EmbeddingPipeline<'a> {
             .await
             .map_err(|e| JammiError::Inference(format!("Failed to collect results: {e}")))?;
 
-        // Fail loud on a systemic inference failure. The shared runner records a
-        // per-row `_status` ("ok"/"error"); the sink drops the error rows. That
-        // per-row annotation is correct for `annotate`, but embeddings are not a
-        // per-row-status relation: if the model failed for EVERY row (a broken
-        // GPU kernel, an arch/dtype mismatch — #277/#319), persisting an empty
-        // "ready" table is silent data loss. Detect all-failed and error out.
-        // (A partial failure still drops only the failed rows.)
+        // Fail loud when there is nothing to embed. A systemic model failure (a
+        // broken kernel / arch / dtype — #277/#319/#326, any non-OOM
+        // `model.forward` error) now propagates from the runner as an `Err` out
+        // of `collect` above, so it never reaches here. What CAN reach here with
+        // zero successful rows is a source whose entire content column is
+        // empty/null: those rows fail PRE-forward input validation and return
+        // `Ok(all-`_status = error`)`, not an `Err`, so they cannot propagate.
+        // The sink drops error rows and `finalize` would then flip the catalog
+        // row to `ready` with `row_count = 0` — a silently-empty table that
+        // searches to nothing, with no signal. Detect all-input-invalid and
+        // error out. (A partial failure still drops only the invalid rows.)
         {
             let mut total = 0usize;
             let mut ok = 0usize;
-            let mut first_err: Option<String> = None;
             for batch in &batches {
                 let s_idx = batch.schema().index_of("_status").map_err(|e| {
                     JammiError::Inference(format!("inference output missing _status: {e}"))
@@ -211,32 +213,19 @@ impl<'a> EmbeddingPipeline<'a> {
                     .as_any()
                     .downcast_ref::<arrow::array::StringArray>()
                     .ok_or_else(|| JammiError::Inference("_status is not Utf8".into()))?;
-                let e_col = batch.schema().index_of("_error").ok().and_then(|i| {
-                    batch
-                        .column(i)
-                        .as_any()
-                        .downcast_ref::<arrow::array::StringArray>()
-                });
                 for i in 0..batch.num_rows() {
                     total += 1;
                     if status.value(i) == "ok" {
                         ok += 1;
-                    } else if first_err.is_none() {
-                        if let Some(errs) = e_col {
-                            if !errs.is_null(i) {
-                                first_err = Some(errs.value(i).to_string());
-                            }
-                        }
                     }
                 }
             }
             if total > 0 && ok == 0 {
-                let detail = first_err.unwrap_or_else(|| "every row failed inference".to_string());
-                return Err(JammiError::Inference(format!(
-                    "embedding generation produced no embeddings — every input row failed \
-                     inference (likely a GPU/model failure, e.g. a compute-capability / PTX \
-                     mismatch): {detail}"
-                )));
+                return Err(JammiError::Inference(
+                    "embedding generation produced no embeddings — every input row was empty \
+                     or invalid (no valid content to embed); check the content column mapping"
+                        .into(),
+                ));
             }
         }
 

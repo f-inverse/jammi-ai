@@ -323,6 +323,188 @@ async fn e2e_error_rows_have_null_vector_and_error_message() {
     }
 }
 
+// ─── Systemic forward failure propagates loudly (esc-028 / #319 / #326) ────
+//
+// A `model.forward` failure is always systemic (a broken kernel, a
+// contiguity/PTX/dtype mismatch, or — as exercised here — a model that
+// cannot serve the requested task at all), never a per-row event. It must
+// fail the operation as an `Err`, not be served as an all-`_status = "error"`
+// relation or silently persist an empty "ready" embedding table.
+
+#[tokio::test]
+async fn e2e_systemic_forward_failure_propagates_from_infer() {
+    // `ModelTask::Regression` on a base (never fine-tuned) checkpoint fails
+    // identically for every row — the model carries no distributional head —
+    // which is a systemic, non-OOM `model.forward` error, not a per-row input
+    // problem. It must propagate out of `infer` as an `Err`.
+    let (session, _dir) = session_with_patents().await;
+    let model_source = tiny_bert_source();
+
+    let err = session
+        .infer(
+            "patents",
+            &model_source,
+            ModelTask::Regression,
+            &["abstract".to_string()],
+            "id",
+            jammi_db::store::CachePolicy::Bypass,
+        )
+        .await
+        .expect_err(
+            "a systemic (non-OOM) forward failure must propagate as an Err out of `infer`, \
+             not be served as an all-`_status=error` relation",
+        );
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("distributional head"),
+        "error should name the systemic forward failure (no fine-tuned head), got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn e2e_systemic_forward_failure_propagates_from_embedding_pipeline() {
+    // `ModelTask::ImageEmbedding` on a text-only checkpoint (no vision tower)
+    // fails identically for every row — a systemic, non-OOM `model.forward`
+    // error. It must propagate out of `generate_image_embeddings` as an `Err`
+    // rather than silently persisting an empty "ready" embedding table (the
+    // #319 hole this fix closes) or an all-error relation.
+    let (session, _dir) = session_with_patents().await;
+    let model_id = "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap();
+
+    let err = session
+        .generate_image_embeddings(
+            "patents",
+            &model_id,
+            "abstract",
+            "id",
+            jammi_db::store::CachePolicy::Bypass,
+        )
+        .await
+        .expect_err(
+            "a systemic (non-OOM) forward failure must propagate as an Err out of \
+             `generate_image_embeddings`, not persist an empty ready embedding table",
+        );
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("vision"),
+        "error should name the systemic forward failure (no vision tower), got: {msg}"
+    );
+
+    // Non-vacuity: no `ready` embedding table was left behind for this failed
+    // run — the failure genuinely prevented materialization rather than the
+    // assertion above passing on an unrelated error.
+    let tables = session
+        .catalog()
+        .find_result_tables("patents", Some(ModelTask::ImageEmbedding), None)
+        .await
+        .unwrap();
+    assert!(
+        tables.iter().all(|t| t.status != "ready"),
+        "a systemic forward failure must not leave a ready embedding table behind, found: {:?}",
+        tables
+            .iter()
+            .map(|t| (&t.table_name, &t.status))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn e2e_all_input_invalid_fails_loud_not_empty_ready_table() {
+    // A source whose ENTIRE content column is empty/null is not a systemic
+    // forward failure — every row fails PRE-forward input validation and the
+    // backend returns `Ok(all-`_status = error`)`, never an `Err`, so it cannot
+    // propagate from the runner. The embedding pipeline must still fail loud
+    // rather than drop every row and flip the catalog row to `ready` with
+    // `row_count = 0` — a silently-empty table that searches to nothing. This is
+    // the case the repurposed #319 guard covers (distinct from the systemic
+    // forward failures the runner now propagates).
+    use arrow::datatypes::{Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use jammi_db::storage::{JammiObjectStore, ObjectParquetWriter, StorageRegistry, StorageUrl};
+
+    let dir = TempDir::new().unwrap();
+    let config = common::test_config(dir.path());
+    let session = InferenceSession::new(config).await.unwrap();
+
+    // Every `abstract` is empty; ids are valid so rows are keyed, not
+    // key-filtered — the invalidity is purely the empty content.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("abstract", DataType::Utf8, false),
+    ]));
+    let ids: Vec<String> = (0..8).map(|i| format!("id_{i}")).collect();
+    let abstracts: Vec<&str> = (0..8).map(|_| "").collect();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from(
+                ids.iter().map(String::as_str).collect::<Vec<_>>(),
+            )) as arrow::array::ArrayRef,
+            Arc::new(StringArray::from(abstracts)),
+        ],
+    )
+    .unwrap();
+
+    let path = dir.path().join("all_empty.parquet");
+    let url = StorageUrl::parse(path.to_str().unwrap()).unwrap();
+    let registry = StorageRegistry::new();
+    let handle = JammiObjectStore::new(registry.driver_for(&url, None).unwrap(), url.clone());
+    let mut writer = ObjectParquetWriter::open(&handle, Arc::clone(&schema))
+        .await
+        .unwrap();
+    writer.write_batch(&batch).await.unwrap();
+    writer.close().await.unwrap();
+
+    session
+        .add_source(
+            "all_empty",
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", path.to_str().unwrap())),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let err = session
+        .generate_text_embeddings(
+            "all_empty",
+            &tiny_bert_source().to_string(),
+            &["abstract".to_string()],
+            "id",
+            jammi_db::store::CachePolicy::Bypass,
+        )
+        .await
+        .expect_err(
+            "an all-empty content column must fail loud (no valid content to embed), \
+             not silently persist an empty ready table",
+        );
+    assert!(
+        err.to_string()
+            .contains("every input row was empty or invalid"),
+        "error should name the all-invalid-input cause, got: {err}"
+    );
+
+    // Non-vacuity: no `ready` embedding table was left behind.
+    let tables = session
+        .catalog()
+        .find_result_tables("all_empty", Some(ModelTask::TextEmbedding), None)
+        .await
+        .unwrap();
+    assert!(
+        tables.iter().all(|t| t.status != "ready"),
+        "an all-invalid-input embedding run must not leave a ready table behind, found: {:?}",
+        tables
+            .iter()
+            .map(|t| (&t.table_name, &t.status))
+            .collect::<Vec<_>>()
+    );
+}
+
 // ─── Observer integration ───────────────────────────────────────────────────
 
 #[tokio::test]

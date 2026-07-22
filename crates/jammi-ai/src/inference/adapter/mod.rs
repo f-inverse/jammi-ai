@@ -34,13 +34,6 @@ pub trait OutputAdapter: Send + Sync {
 
     /// Convert raw backend output into Arrow arrays for one batch.
     fn adapt(&self, output: &BackendOutput, row_count: usize) -> Result<Vec<ArrayRef>>;
-
-    /// A well-formed all-error [`BackendOutput`] for `row_count` rows, shaped so
-    /// `self.adapt(&output, row_count)` yields this adapter's exact columns (all
-    /// null). The error read path uses this so the failure batch matches the
-    /// served schema — critical for a quantile head, whose width is the level
-    /// count, not the Gaussian default of 2.
-    fn error_output(&self, row_count: usize) -> BackendOutput;
 }
 
 /// Create an adapter for a given task with model-derived dimensions.

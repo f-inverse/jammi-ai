@@ -1,23 +1,31 @@
-//! P1 — CPU↔GPU parity for `generate_text_embeddings` and `encode_text_query`.
+//! P1 — CPU↔GPU parity for `generate_text_embeddings` and `encode_text_query`
+//! over a **ModernBERT** encoder.
 //!
-//! gpu-parity-cell: Bert × TextEmbedding
+//! gpu-parity-cell: ModernBert × TextEmbedding
 //!
-//! The same `tiny_bert` encoder runs over the same `patents.parquet` subset on a
-//! GPU-pinned and a CPU-pinned session; the resulting per-row embedding vectors
-//! (keyed by `_row_id`, so the comparison is row-exact regardless of scan order)
-//! and the same encoded query vector must match within the parity tolerance.
+//! ModernBERT shares the generic `forward_embedding` path with BERT /
+//! DistilBERT but runs its own RoPE + local/global attention pattern (see
+//! `classification_parity`'s doc comment for the RoPE-contiguity bug that
+//! pattern once hid on GPU), so this is a distinct kernel path from
+//! `embeddings_parity`'s `Bert × TextEmbedding` cell, not a copy of it. The
+//! same `tiny_modernbert` encoder runs over the same `patents.parquet`
+//! subset on a GPU-pinned and a CPU-pinned session; the resulting per-row
+//! embedding vectors (keyed by `_row_id`, so the comparison is row-exact
+//! regardless of scan order) and the same encoded query vector must match
+//! within the parity tolerance.
+
+use tempfile::TempDir;
 
 use jammi_db::store::CachePolicy;
-use tempfile::TempDir;
 
 use crate::harness;
 use crate::skip_without_gpu;
 
 #[tokio::test(flavor = "multi_thread")]
-async fn generate_embeddings_cpu_gpu_parity() {
+async fn modernbert_generate_embeddings_cpu_gpu_parity() {
     skip_without_gpu!();
     harness::loss_capture::install();
-    let model = harness::local_model_id("tiny_bert");
+    let model = harness::local_fixture_model_id("tiny_modernbert");
 
     let cpu_dir = TempDir::new().unwrap();
     let cpu = harness::cpu_session(cpu_dir.path()).await;
@@ -64,8 +72,11 @@ async fn generate_embeddings_cpu_gpu_parity() {
     let mut worst_abs = 0.0f64;
     for (id, cpu_v) in &cpu_vecs {
         let gpu_v = gpu_vecs.get(id).expect("matching _row_id on GPU");
-        let (cos, abs) =
-            harness::assert_parity(&format!("generate_embeddings[{id}]"), cpu_v, gpu_v);
+        let (cos, abs) = harness::assert_parity(
+            &format!("modernbert_generate_embeddings[{id}]"),
+            cpu_v,
+            gpu_v,
+        );
         worst_cos = worst_cos.min(cos);
         worst_abs = worst_abs.max(abs);
     }
@@ -73,15 +84,15 @@ async fn generate_embeddings_cpu_gpu_parity() {
         rows = cpu_vecs.len(),
         worst_cos,
         worst_abs,
-        "generate_embeddings parity over patents subset"
+        "ModernBERT generate_embeddings parity over patents subset"
     );
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn encode_query_cpu_gpu_parity() {
+async fn modernbert_encode_query_cpu_gpu_parity() {
     skip_without_gpu!();
     harness::loss_capture::install();
-    let model = harness::local_model_id("tiny_bert");
+    let model = harness::local_fixture_model_id("tiny_modernbert");
     let query = "a method for quantum error correction in superconducting qubits";
 
     let cpu_dir = TempDir::new().unwrap();
@@ -96,5 +107,5 @@ async fn encode_query_cpu_gpu_parity() {
         cpu_vec.iter().any(|&v| v != 0.0),
         "query vector must not be all-zero"
     );
-    harness::assert_parity("encode_query", &cpu_vec, &gpu_vec);
+    harness::assert_parity("modernbert_encode_query", &cpu_vec, &gpu_vec);
 }

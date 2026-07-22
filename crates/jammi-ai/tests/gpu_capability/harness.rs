@@ -2,11 +2,16 @@
 //! guard, the paired CPU / GPU session builders, the fixture paths, and the
 //! parity tolerances + comparison helpers every property reuses.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use arrow::array::{Array, FixedSizeListArray, Float32Array, StringArray};
+use arrow::datatypes::DataType;
 use jammi_ai::session::InferenceSession;
+use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::config::{GpuConfig, InferenceConfig, JammiConfig, LoggingConfig};
+use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_numerics::ComputePrecision;
 
 // ─── Parity tolerances ───────────────────────────────────────────────────────
@@ -104,6 +109,19 @@ pub fn local_model_id(fixture_name: &str) -> String {
     format!("local:{}", cookbook_fixture(fixture_name).to_str().unwrap())
 }
 
+/// `file://` URL for a `cookbook/fixtures/` fixture, suitable for source
+/// registration (e.g. the `tiny_ner_corpus.parquet` corpus).
+pub fn cookbook_fixture_url(name: &str) -> String {
+    format!("file://{}", cookbook_fixture(name).display())
+}
+
+/// `local:` model id for a `tests/fixtures/` encoder fixture — the same id
+/// the CPU `it` suite uses for `tiny_modernbert` / `tiny_open_clip`, which are
+/// committed under `tests/fixtures/` rather than `cookbook/fixtures/`.
+pub fn local_fixture_model_id(fixture_name: &str) -> String {
+    format!("local:{}", fixture(fixture_name).to_str().unwrap())
+}
+
 // ─── Session builders ─────────────────────────────────────────────────────────
 
 /// A JammiConfig rooted at `artifact_dir`, pinned to `device`
@@ -164,6 +182,63 @@ pub async fn gpu_session_with_precision(
             .await
             .expect("gpu-pinned session (require_gpu=true)"),
     )
+}
+
+// ─── Shared source / result-table fixtures ─────────────────────────────────
+
+/// Register the `patents.parquet` fixture as a source named `"patents"` on
+/// `session` — the shared text corpus every text-embedding / classification /
+/// NER parity cell runs over.
+pub async fn add_patents(session: &Arc<InferenceSession>) {
+    session
+        .add_source(
+            "patents",
+            SourceType::File,
+            SourceConnection {
+                url: Some(fixture_url("patents.parquet")),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+}
+
+/// Read an embedding result table's `(_row_id, vector)` rows into a map, so a
+/// CPU and a GPU table compare row-exact even if their scan order differs.
+/// Every embedding-generation verb (`generate_text_embeddings`,
+/// `generate_image_embeddings`, `generate_audio_embeddings`) writes this same
+/// `_row_id` + `vector` (`FixedSizeList<Float32>`) result-table shape.
+pub async fn keyed_result_vectors(
+    session: &Arc<InferenceSession>,
+    table: &ResultTableRecord,
+) -> HashMap<String, Vec<f32>> {
+    let batches = session
+        .sql(&format!(
+            "SELECT _row_id, vector FROM \"jammi.{}\"",
+            table.table_name
+        ))
+        .await
+        .unwrap();
+    let mut out = HashMap::new();
+    for batch in &batches {
+        let ids = arrow::compute::cast(batch.column(0), &DataType::Utf8).unwrap();
+        let ids = ids.as_any().downcast_ref::<StringArray>().unwrap();
+        let list = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            let cell = list.value(i);
+            let floats = cell.as_any().downcast_ref::<Float32Array>().unwrap();
+            out.insert(
+                ids.value(i).to_string(),
+                (0..floats.len()).map(|j| floats.value(j)).collect(),
+            );
+        }
+    }
+    out
 }
 
 // ─── Parity comparison helpers ─────────────────────────────────────────────

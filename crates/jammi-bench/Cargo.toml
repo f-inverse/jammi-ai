@@ -36,7 +36,8 @@ libc.workspace = true
 tempfile = "3"
 
 [features]
-# Enables the on-GPU embedding observability tier (`gpu-inference-scale`): pulls the
-# engine's CUDA backend so the tier serves on a real device. Off by default so
-# the rest of the harness stays CPU-hermetic; the GPU prove-lane builds with it.
+# Enables the on-GPU observability tier (`gpu-inference-scale`, embedding +
+# classification lanes): pulls the engine's CUDA backend so the tier serves on
+# a real device. Off by default so the rest of the harness stays CPU-hermetic;
+# the GPU prove-lane builds with it.
 cuda = ["jammi-ai/cuda"]

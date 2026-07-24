@@ -4,13 +4,21 @@
 //!
 //! This is the only lane exercising the ModernBERT backbone through the
 //! classification head on a real device — the path that silently produced no
-//! output on GPU. The genuine failure is the classifier's CLS row: `SeqClassifier`
-//! pulls it with `narrow(seq=0).squeeze(1)`, leaving a 2-D tensor whose row stride
-//! is `seq·hidden` (≠ `hidden`), a layout candle's CUDA matmul rejects while its
-//! CPU matmul tolerates it. Every row errored, and `infer`'s per-row annotate
-//! semantics swallowed the error into empty scores. This test is the regression
-//! guard: it asserts the GPU produced a score distribution for every row AND that
-//! it matches the CPU distribution up to reduction noise.
+//! output on GPU, behind two independent non-contiguity sites fixed in
+//! sequence. First, rotary attention: `q.matmul(k^T)` relied on RoPE leaving
+//! Q/K contiguous, which holds on CPU but not CUDA, so candle's CUDA matmul
+//! rejected the operand and every row errored before the head ever ran
+//! (fixed by routing the attention matmuls through
+//! `jammi_encoders::contiguous_matmul`). That fix let the forward progress
+//! far enough to surface a second, independent site: `SeqClassifier` pulls
+//! the CLS row with `narrow(seq=0).squeeze(1)`, leaving a 2-D tensor whose
+//! row stride is `seq·hidden` (≠ `hidden`) — a layout candle's CUDA matmul
+//! also rejects while its CPU matmul tolerates (fixed with a `.contiguous()`
+//! before the head's linear). Both failures were silent: `infer`'s per-row
+//! annotate semantics swallowed each one into empty scores. This test is the
+//! regression guard for both: it asserts the GPU produced a score
+//! distribution for every row AND that it matches the CPU distribution up to
+//! reduction noise.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -85,10 +93,11 @@ async fn classification_parity_cpu_vs_gpu_over_modernbert() {
     harness::add_patents(&gpu).await;
     let gpu_scores = keyed_scores(&gpu).await;
 
-    // The decisive assertion the RoPE-contiguity fix restores: the GPU produced a
-    // score distribution for *every* row the CPU did. Before the fix the GPU
-    // ModernBERT attention matmul errored on non-contiguous Q/K, so `infer`
-    // returned zero scored rows here.
+    // The decisive assertion both non-contiguity fixes restore together: the
+    // GPU produced a score distribution for *every* row the CPU did. Before
+    // either fix, the GPU ModernBERT forward errored — first on the RoPE'd
+    // attention Q/K matmul, then (once that was fixed) on the classifier's
+    // non-contiguous CLS row — so `infer` returned zero scored rows here.
     assert!(
         !cpu_scores.is_empty(),
         "CPU produced no scores — fixture broken"

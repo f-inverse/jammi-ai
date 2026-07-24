@@ -591,11 +591,12 @@ impl CandleModel {
         }
     }
 
-    /// Access the text forward pass, returning an error if this is a vision-only model.
+    /// Access the text forward pass, returning an error if this model has no
+    /// text tower loaded — e.g. a CLAP checkpoint loaded audio-only.
     fn text_forward(&self) -> Result<&dyn CandleTextForward> {
-        self.text.as_deref().ok_or_else(|| {
-            JammiError::Inference("Cannot run text task on a vision-only model".into())
-        })
+        self.text
+            .as_deref()
+            .ok_or_else(|| JammiError::Inference("No text model loaded for this task".into()))
     }
 
     /// Run forward pass dispatching by task.
@@ -1276,41 +1277,17 @@ impl ModelBackend for CandleBackend {
             }
             jammi_numerics::ComputePrecision::BF16 => {
                 // bf16 is a GPU-tier precision: its tensor-core kernels are an
-                // Ampere (sm_80) innovation, so it is admitted only on a CUDA
-                // device whose compute capability clears the floor declared by
-                // `ComputePrecision::min_cuda_capability`. The capability query
-                // lives on real candle/cudarc CUDA types, so the whole
-                // acquisition is cuda-gated; the allow/reject *decision* is the
-                // pure `is_supported_on_cuda` predicate, unit-tested on CPU.
+                // Ampere (sm_80) innovation. Device admission (`select_device`,
+                // via `check_compute_cap_floor`) already rejects any CUDA
+                // device below that architecture floor before this ever runs,
+                // so a `Device::Cuda(_)` reaching this match is unconditionally
+                // bf16-capable — this arm's only remaining job is CUDA vs
+                // non-CUDA, which is precision-vs-backend, not architecture.
                 #[cfg(feature = "cuda")]
                 {
                     match &device {
                         Device::Cuda(_) => {
-                            let cuda = device.as_cuda_device().map_err(|e| JammiError::Model {
-                                model_id: resolved.model_id.0.clone(),
-                                message: format!("bf16 gate: expected a CUDA device: {e}"),
-                            })?;
-                            let (major, minor) = cuda
-                                .cuda_stream()
-                                .context()
-                                .compute_capability()
-                                .map_err(|e| JammiError::Model {
-                                    model_id: resolved.model_id.0.clone(),
-                                    message: format!(
-                                        "bf16 gate: could not query CUDA compute capability: {e}"
-                                    ),
-                                })?;
-                            if compute_precision.is_supported_on_cuda(major, minor) {
-                                jammi_encoders::compute_precision_to_dtype(compute_precision)
-                            } else {
-                                return Err(JammiError::Model {
-                                    model_id: resolved.model_id.0.clone(),
-                                    message: format!(
-                                        "bf16 inference requires CUDA compute capability >= 8.0 \
-                                         (Ampere+); device is sm_{major}{minor}. Use f16 or f32."
-                                    ),
-                                });
-                            }
+                            jammi_encoders::compute_precision_to_dtype(compute_precision)
                         }
                         _ => {
                             return Err(JammiError::Model {
@@ -2014,6 +1991,10 @@ fn normalize_distilbert_config(config: &serde_json::Value) -> serde_json::Value 
 /// - A negative `gpu_device` selects CPU unconditionally.
 /// - When a GPU is requested and present (the build's accelerator feature is
 ///   compiled in and the device initializes), the accelerator device is used.
+///   A CUDA device additionally clears two floors before admission — the
+///   driver ([`check_driver_floor`]) and the architecture
+///   ([`check_compute_cap_floor`]) — so every precision this build supports
+///   on CUDA is admissible on any device this function returns.
 /// - When a GPU is requested but unavailable — no accelerator feature in this
 ///   build, or the device fails to initialize — the outcome depends on
 ///   `require_gpu`: by default it degrades to CPU with a loud warning; if
@@ -2033,6 +2014,12 @@ pub(crate) fn select_device(config: &DeviceConfig) -> Result<Device> {
             // letting the first model load surface a raw
             // `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` from deep in candle.
             check_driver_floor(cuda_driver_cuda_version()?)?;
+            // Fail fast on an architecture this build's PTX cannot run on at
+            // all — independent of the driver-JIT floor above. Device
+            // admission owns this: once a device clears it, every precision
+            // this build supports on CUDA is admissible on that device.
+            let (major, minor) = cuda_compute_capability(&dev)?;
+            check_compute_cap_floor(major, minor)?;
             return Ok(dev);
         }
     }
@@ -2104,6 +2091,53 @@ fn cuda_driver_cuda_version() -> Result<i32> {
         )));
     }
     Ok(version)
+}
+
+/// Minimum CUDA compute capability (architecture) this build's PTX targets,
+/// as `(major, minor)`.
+///
+/// candle compiles its CUDA kernels to single-architecture PTX at
+/// `compute_80` (`CUDA_COMPUTE_CAP` in `.docker/ci-cuda.Dockerfile`): sm_80
+/// (Ampere) is the floor because that PTX JIT-forward-runs on every
+/// supported datacenter GPU — A100 (8.0), A10/A6000 (8.6), L40S (8.9), H100
+/// (9.0) — while Turing (sm_75, e.g. T4) and older cannot load this build's
+/// PTX at all. This is an architecture floor, independent of
+/// [`MIN_DRIVER_CUDA_VERSION`] above (a stale-driver failure): a device below
+/// this floor cannot run the build's kernels no matter how new its driver
+/// is. Keep this in lockstep with `CUDA_COMPUTE_CAP` in
+/// `.docker/ci-cuda.Dockerfile`.
+#[cfg(any(feature = "cuda", test))]
+const MIN_CUDA_COMPUTE_CAP: (i32, i32) = (8, 0);
+
+/// Reject a device whose compute capability is below [`MIN_CUDA_COMPUTE_CAP`].
+///
+/// Pure so the boundary is unit-tested without a GPU; the CUDA-only
+/// [`cuda_compute_capability`] feeds it the live value.
+#[cfg(any(feature = "cuda", test))]
+fn check_compute_cap_floor(major: i32, minor: i32) -> Result<()> {
+    if (major, minor) < MIN_CUDA_COMPUTE_CAP {
+        return Err(JammiError::Gpu(format!(
+            "GPU architecture too old to run this GPU build: device is sm_{major}{minor}, but \
+             this build's CUDA kernels are compiled for sm_80+ (Ampere or newer — e.g. A100, \
+             A10/A6000, L40S, H100). Turing (sm_75, e.g. T4) and older GPUs are unsupported; no \
+             driver upgrade can fix an architecture mismatch."
+        )));
+    }
+    Ok(())
+}
+
+/// The compute capability (`major`, `minor`) of an initialized CUDA device.
+#[cfg(feature = "cuda")]
+fn cuda_compute_capability(dev: &Device) -> Result<(i32, i32)> {
+    let cuda = dev.as_cuda_device().map_err(|e| {
+        JammiError::Gpu(format!(
+            "expected a CUDA device to query compute capability: {e}"
+        ))
+    })?;
+    cuda.cuda_stream()
+        .context()
+        .compute_capability()
+        .map_err(|e| JammiError::Gpu(format!("could not query CUDA compute capability: {e}")))
 }
 
 /// The [`ComputeDevice`] the engine *effectively* runs on for `config` — the
@@ -2282,6 +2316,70 @@ mod device_tests {
         // Exactly at the floor (12.6) and newer (12.8) both pass.
         assert!(check_driver_floor(MIN_DRIVER_CUDA_VERSION).is_ok());
         assert!(check_driver_floor(12_080).is_ok());
+    }
+
+    /// The architecture floor (#306): a device below sm_80 is rejected with a
+    /// typed, actionable error naming its real architecture and the Ampere+
+    /// requirement; sm_80 and anything newer pass.
+    #[test]
+    fn compute_cap_floor_rejects_below_and_accepts_at_or_above() {
+        // Turing (sm_75, e.g. T4): below the floor, rejected.
+        match check_compute_cap_floor(7, 5) {
+            Err(JammiError::Gpu(msg)) => {
+                assert!(msg.contains("sm_75"), "message must name the device: {msg}");
+                assert!(
+                    msg.contains("sm_80") && msg.contains("Ampere"),
+                    "message must state the Ampere/sm_80+ requirement: {msg}"
+                );
+                assert!(
+                    msg.contains("Turing"),
+                    "message must name Turing as unsupported: {msg}"
+                );
+            }
+            other => panic!("expected JammiError::Gpu for a sub-Ampere device, got {other:?}"),
+        }
+        // Even older (Maxwell, sm_50) is also rejected.
+        assert!(check_compute_cap_floor(5, 0).is_err());
+        // Exactly at the floor (8.0) and newer (8.6, 9.0) all pass.
+        assert!(check_compute_cap_floor(8, 0).is_ok());
+        assert!(check_compute_cap_floor(8, 6).is_ok());
+        assert!(check_compute_cap_floor(9, 0).is_ok());
+    }
+
+    /// Ties the build's CUDA architecture floor to every `ComputePrecision`'s
+    /// hardware requirement (#306 follow-up). Device admission
+    /// (`check_compute_cap_floor` above) is what lets the bf16 gate in
+    /// `CandleBackend::load` admit a `Device::Cuda(_)` unconditionally rather
+    /// than re-querying its capability — that shortcut is only sound while
+    /// `MIN_CUDA_COMPUTE_CAP` is at least as strict as every precision's
+    /// declared floor. If the build floor were ever lowered below a
+    /// precision's requirement (e.g. an sm_75 build variant), that precision
+    /// would silently admit on hardware that cannot run it. The inner match
+    /// has no wildcard arm, so a newly added `ComputePrecision` variant fails
+    /// to compile here until its requirement (if any) is checked.
+    #[test]
+    fn build_floor_covers_every_cuda_precision_requirement() {
+        for precision in [
+            jammi_numerics::ComputePrecision::F32,
+            jammi_numerics::ComputePrecision::F16,
+            jammi_numerics::ComputePrecision::BF16,
+        ] {
+            let precision = match precision {
+                jammi_numerics::ComputePrecision::F32 => precision,
+                jammi_numerics::ComputePrecision::F16 => precision,
+                jammi_numerics::ComputePrecision::BF16 => precision,
+            };
+            if let Some(req) = precision.min_cuda_capability() {
+                assert!(
+                    MIN_CUDA_COMPUTE_CAP >= req,
+                    "{precision:?} requires CUDA compute capability {req:?}, but this build's \
+                     device-admission floor (MIN_CUDA_COMPUTE_CAP) is only \
+                     {MIN_CUDA_COMPUTE_CAP:?} — a device admitted by `check_compute_cap_floor` \
+                     would not actually support {precision:?}, and the bf16 gate in \
+                     `CandleBackend::load` no longer re-checks capability per device"
+                );
+            }
+        }
     }
 }
 

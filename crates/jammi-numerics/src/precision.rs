@@ -26,11 +26,13 @@ use crate::error::NumericsError;
 /// `F32` is the default: maximally compatible, and the byte-parity oracle's
 /// baseline. `F16` halves memory and roughly doubles throughput on hardware
 /// that supports it. `BF16` carries `F32`'s 8-bit exponent range in half the
-/// bytes; it is a GPU-tier precision — the candle load boundary admits it on a
-/// CUDA device of compute capability >= 8.0 (Ampere+) and fails loud below,
-/// keyed off [`ComputePrecision::min_cuda_capability`]. Which precisions a
-/// given device admits is a runtime property, decided at the candle boundary;
-/// this vocabulary only names them and states each one's CUDA floor.
+/// bytes; it is a GPU-tier precision — its tensor-core kernels are an Ampere
+/// (sm_80+) innovation, named here by [`ComputePrecision::min_cuda_capability`].
+/// The candle boundary's device admission (`select_device`'s
+/// `check_compute_cap_floor`) enforces a build-wide CUDA architecture floor
+/// before any model loads; an invariant test there ties that build floor to
+/// every precision's `min_cuda_capability` here, so a precision's hardware
+/// requirement can never silently exceed what the build admits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ComputePrecision {

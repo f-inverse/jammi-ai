@@ -23,7 +23,7 @@ jobs:
     name: Smoke (fast)
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/f-inverse/jammi-ai-ci:latest
+      image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
     if: github.event_name != 'schedule'
     steps:
       - uses: actions/checkout@v4
@@ -57,7 +57,7 @@ jobs:
     name: Smoke (slow + integration)
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/f-inverse/jammi-ai-ci:latest
+      image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4

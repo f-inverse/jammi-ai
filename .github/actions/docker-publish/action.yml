@@ -1,0 +1,115 @@
+name: docker-publish
+description: >
+  Shared build[-and-push] pipeline for a jammi-ai-server container image:
+  Buildx setup, conditional GHCR login (only when `push` is `true` — a
+  build-only verification lane never touches GHCR credentials), conditional
+  tag/label extraction (skipped when `tags-spec` is empty — a build-only lane
+  needs no tags), and the `docker/build-push-action` invocation itself. This
+  collapses server-image.yml's four jobs (generic CPU, self-contained CPU,
+  CUDA push, CUDA build-only PR-verification) — which differ only in image
+  name, tag scheme, build-args, and whether they push at all — into one
+  parameterized action instead of four repeated step sequences. Must run
+  AFTER `actions/checkout@v4` (local-path composite; the checkout step has to
+  have already materialized it, same constraint as `setup-rust-ci`).
+
+inputs:
+  images:
+    description: >
+      Fully-qualified image ref(s) for docker/metadata-action (e.g.
+      ghcr.io/f-inverse/jammi-ai-server). Only consulted when tags-spec is
+      non-empty.
+    required: false
+    default: ""
+  tags-spec:
+    description: >
+      The multi-line `tags:` block passed straight through to
+      docker/metadata-action. Empty (the default) skips tag/label extraction
+      entirely — the build-only PR lane pushes nothing, so it needs no tags.
+    required: false
+    default: ""
+  build-args:
+    description: >
+      Multi-line build-args block passed to docker/build-push-action, e.g.
+      "RUNTIME_VARIANT=runtime-cuda".
+    required: false
+    default: ""
+  push:
+    description: >
+      "true" to log into GHCR and push; "false" for a build-only verification
+      (no GHCR credentials touched, no manifest pushed).
+    required: true
+  registry:
+    description: "Container registry to log into when push is \"true\"."
+    required: false
+    default: "ghcr.io"
+  cache-scope:
+    description: >
+      gha cache scope suffix (e.g. "cu12") so parallel image builds don't
+      clobber each other's cache. Empty (the default) uses the unscoped gha
+      cache.
+    required: false
+    default: ""
+  context:
+    description: "Build context passed to docker/build-push-action."
+    required: false
+    default: "."
+  file:
+    description: "Dockerfile path passed to docker/build-push-action."
+    required: false
+    default: "Dockerfile"
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to GHCR
+      if: inputs.push == 'true'
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ inputs.registry }}
+        username: ${{ github.actor }}
+        # Composite actions cannot read the `secrets` context; `github.token`
+        # is the same value as `secrets.GITHUB_TOKEN`, exposed via the
+        # `github` context instead.
+        password: ${{ github.token }}
+
+    - name: Extract metadata
+      if: inputs.tags-spec != ''
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ inputs.images }}
+        tags: ${{ inputs.tags-spec }}
+
+    # Resolves the gha cache-from/cache-to strings once so the build-push step
+    # below doesn't need conditional expression logic — a scoped cache when
+    # cache-scope is given, the unscoped default cache otherwise.
+    - name: Resolve cache scope
+      id: cache
+      shell: bash
+      run: |
+        if [ -n "${{ inputs.cache-scope }}" ]; then
+          echo "from=type=gha,scope=${{ inputs.cache-scope }}" >> "$GITHUB_OUTPUT"
+          echo "to=type=gha,mode=max,scope=${{ inputs.cache-scope }}" >> "$GITHUB_OUTPUT"
+        else
+          echo "from=type=gha" >> "$GITHUB_OUTPUT"
+          echo "to=type=gha,mode=max" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Build and push
+      uses: docker/build-push-action@v6
+      with:
+        context: ${{ inputs.context }}
+        file: ${{ inputs.file }}
+        platforms: linux/amd64
+        push: ${{ inputs.push }}
+        build-args: ${{ inputs.build-args }}
+        # Empty when the "Extract metadata" step above was skipped (no
+        # tags-spec) — equivalent to omitting `tags`/`labels` entirely, which
+        # is what the build-only PR lane needs (untagged verification build).
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: ${{ steps.cache.outputs.from }}
+        cache-to: ${{ steps.cache.outputs.to }}

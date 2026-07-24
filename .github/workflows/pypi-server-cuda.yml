@@ -25,7 +25,7 @@ jobs:
     name: jammi-server-cu12 (CUDA)
     uses: ./.github/workflows/_pypi-server.yml
     with:
-      container_image: ghcr.io/f-inverse/jammi-ai-ci-cuda:latest
+      container_image: ${{ vars.JAMMI_CI_IMAGE_CUDA || 'ghcr.io/f-inverse/jammi-ai-ci-cuda:latest' }}
       cargo_features: cuda,jetstream-broker,storage-cloud
       package_dir: packaging/server-cu12
       artifact_prefix: server-cu12

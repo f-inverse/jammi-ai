@@ -64,38 +64,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
+      - uses: ./.github/actions/docker-publish
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
+          tags-spec: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha,format=long
-
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
-          platforms: linux/amd64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          push: "true"
 
   # Self-contained variant: opt-in, dispatch-only. Builds the
   # `runtime-selfcontained` stage (baked config + encoder) from the
@@ -111,38 +88,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
+      - uses: ./.github/actions/docker-publish
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
+          tags-spec: |
             type=raw,value=selfcontained
             type=sha,prefix=selfcontained-,format=long
-
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
           build-args: |
             RUNTIME_VARIANT=runtime-selfcontained
-          platforms: linux/amd64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          push: "true"
 
   # CUDA image `jammi-ai-server-cu12`: tag- and dispatch-triggered push.
   # Builds the `runtime-cuda` stage (candle CUDA backend + NVIDIA runtime base)
@@ -172,40 +126,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
+      - uses: ./.github/actions/docker-publish
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_CU12 }}
-          tags: |
+          tags-spec: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha,format=long
-
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
           build-args: |
             RUNTIME_VARIANT=runtime-cuda
-          platforms: linux/amd64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=cu12
-          cache-to: type=gha,mode=max,scope=cu12
+          push: "true"
+          cache-scope: cu12
 
   # Build-only verification for the CUDA image on pull requests that touch the
   # Dockerfile or this workflow. GPU runtime can't be exercised in CI (no GPU on
@@ -222,17 +154,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build CUDA image (no push)
-        uses: docker/build-push-action@v6
+      - uses: ./.github/actions/docker-publish
         with:
-          context: .
-          file: Dockerfile
           build-args: |
             RUNTIME_VARIANT=runtime-cuda
-          platforms: linux/amd64
-          push: false
-          cache-from: type=gha,scope=cu12
-          cache-to: type=gha,mode=max,scope=cu12
+          push: "false"
+          cache-scope: cu12

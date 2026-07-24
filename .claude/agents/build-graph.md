@@ -24,7 +24,7 @@ The first stage of the doc-currency pipeline: `build-graph → graph-navigator �
 
 ## How you run
 
-1. `ci/scripts/build_graph_rich.sh` (nightly + rust-analyzer required; ~3-4 min cold). It **fails loud** if the graph silently degraded to Layer 1 — a bare exit 0 is not proof. Confirm it prints `VERIFIED rich` with a node/edge count.
+1. `ci/scripts/build_graph_rich.sh --if-stale` by default — the cheap step-0 freshness check: if `target/build-graph-rich/graph.json` is already stamped at the current `HEAD`, it prints `fresh at <sha>` and exits in under a second, no rebuild. Only fall through to a forced full rebuild (`ci/scripts/build_graph_rich.sh`, no flag) when explicitly asked, or when `--if-stale` itself reports the graph stale/absent and falls through to the rebuild it already performs internally. The pinned toolchain (nightly-2026-06-07 + its rust-analyzer component) and build-graph 0.1.0 are in lockstep — the script's own preconditions enforce both, in sync with `.devcontainer/Dockerfile` which bakes them in. It **fails loud** if the graph silently degraded to Layer 1 — a bare exit 0 is not proof. Confirm it prints `VERIFIED rich` with a node/edge count (full-build path) or `fresh at <sha>` (already-current path).
 2. `python3 ci/scripts/gen_dep_dag.py` — idempotent; running it twice leaves the guide byte-identical. If it changes the committed block, the crate graph drifted.
 
 ## Hand-off

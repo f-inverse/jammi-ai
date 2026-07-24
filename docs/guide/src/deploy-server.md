@@ -273,7 +273,7 @@ docker compose -f oss-server.yml up
 
 ### Persistence
 
-`/var/lib/jammi` holds the catalog DB, model weights, and indices. Zero-config `jammi-server` writes its SQLite catalog there (the image sets `JAMMI_ARTIFACT_DIR=/var/lib/jammi`). The Dockerfile declares it as a `VOLUME` owned by uid `65532` — a named Docker volume or no mount at all just works; a bind mount must have the host directory writable by uid `65532`:
+`/var/lib/jammi` holds the catalog DB, model weights, and indices. Zero-config `jammi-server` writes its SQLite catalog there (the image sets `JAMMI_ARTIFACT_DIR=/var/lib/jammi`). On the `jammi-ai-server-cu12` image the same volume also holds the CUDA PTX-JIT compute cache at `/var/lib/jammi/.nv-cache` (see [GPU serving](#gpu-serving)) — mounting the volume is what makes that cache durable across container restarts. The Dockerfile declares `/var/lib/jammi` as a `VOLUME` owned by uid `65532` — a named Docker volume or no mount at all just works; a bind mount must have the host directory writable by uid `65532`:
 
 ```bash
 # Bind mount on the host.
@@ -342,6 +342,8 @@ docker run --rm --gpus all \
 Set `gpu.device = 0` in `jammi.toml` (or `JAMMI_GPU__DEVICE=0`) to select the CUDA device; see [GPU configuration](#gpu-configuration). The image is compiled for compute capability `8.0` (Ampere) and runs on `8.0` and every newer datacenter GPU — A10/A6000 (`8.6`), L40S (`8.9`), H100 (`9.0`) — via PTX forward-compatibility. Turing GPUs (e.g. Tesla T4, `7.5`) are not supported.
 
 **Minimum NVIDIA driver:** the image is built against the CUDA 12.6 toolkit and ships single-architecture PTX, so on any GPU newer than `8.0` the driver **JIT-compiles** that PTX at first model load. This requires a driver new enough for the CUDA 12.6 runtime — **Linux: `r560` or later** (`≥ 560.28.03`). An older driver (for example `550.x`, which tops out at the CUDA 12.4 PTX ISA) can reject the image's newer PTX at load with `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` / `CUDA_ERROR_INVALID_PTX`, even on a supported architecture. `nvidia-smi` reports the installed driver and its max CUDA version.
+
+**JIT cache persistence:** the image sets `CUDA_CACHE_PATH=/var/lib/jammi/.nv-cache`, so the driver's compiled PTX→SASS cache lands on the `/var/lib/jammi` volume rather than the container's ephemeral filesystem. With the volume mounted, the JIT cost above is paid once — a subsequent cold start on the same host reuses the cached SASS instead of re-JIT-ing every model load. Without the volume mounted, each container restart starts with an empty cache and re-pays the JIT. `CUDA_CACHE_MAXSIZE` (bytes) caps the cache size if the default cap is too small for the set of models you serve.
 
 The CPU image ignores GPU config and runs inference on the CPU.
 

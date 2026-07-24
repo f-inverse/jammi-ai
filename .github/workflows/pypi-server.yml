@@ -26,7 +26,7 @@ jobs:
     name: jammi-server (CPU)
     uses: ./.github/workflows/_pypi-server.yml
     with:
-      container_image: ghcr.io/f-inverse/jammi-ai-ci:latest
+      container_image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
       cargo_features: jetstream-broker,storage-cloud
       package_dir: packaging/server-cpu
       artifact_prefix: server-cpu

@@ -64,7 +64,7 @@ jobs:
           # .cargo/config.toml's per-target mold default.
           - target: x86_64-unknown-linux-gnu
             runs-on: ubuntu-latest
-            container: ghcr.io/f-inverse/jammi-ai-ci:latest
+            container: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
             rustflags: "-C link-arg=-fuse-ld=mold"
           # Apple-silicon native build. mold is Linux-only (config.toml scopes
           # it to the linux targets), so this leg leaves RUSTFLAGS unset.
@@ -172,7 +172,7 @@ jobs:
   server-cpu:
     name: Build jammi-server (CPU)
     runs-on: ubuntu-latest
-    container: ghcr.io/f-inverse/jammi-ai-ci:latest
+    container: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust-ci
@@ -265,7 +265,7 @@ jobs:
     needs: [gpu-prove-cu12]
     if: always() && (github.event_name != 'push' || needs.gpu-prove-cu12.result == 'success')
     runs-on: ubuntu-latest
-    container: ghcr.io/f-inverse/jammi-ai-ci-cuda:latest
+    container: ${{ vars.JAMMI_CI_IMAGE_CUDA || 'ghcr.io/f-inverse/jammi-ai-ci-cuda:latest' }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust-ci

@@ -21,7 +21,7 @@ jobs:
     name: Build native wheel (Linux)
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/f-inverse/jammi-ai-ci:latest
+      image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
     defaults:
       run:
         working-directory: packaging/native

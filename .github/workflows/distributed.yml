@@ -51,7 +51,7 @@ jobs:
     # No `continue-on-error`: these tests are decided by Postgres locking, not a
     # timing window, so a red is a real regression the nightly watcher acts on.
     container:
-      image: ghcr.io/f-inverse/jammi-ai-ci:latest
+      image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
     services:
       postgres:
         image: postgres:16
@@ -180,7 +180,7 @@ jobs:
     # flake-free streak.
     continue-on-error: true
     container:
-      image: ghcr.io/f-inverse/jammi-ai-ci:latest
+      image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
     services:
       postgres:
         image: postgres:16

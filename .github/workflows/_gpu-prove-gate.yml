@@ -6,10 +6,22 @@ name: _gpu-prove-gate
 # not three copies. Runs the from-source prove-lane (grpc_embedding_gpu +
 # gpu_capability) — the real #277 kernel gate — against the release ref.
 #
-# A100 capacity is intermittent; a capacity/liveness skip (exit 75) is treated as
-# a WARN-and-pass so a third-party outage cannot block a release indefinitely,
-# while a real suite failure HARD-blocks promotion. Needs the RUNPOD_API_KEY
-# secret (pass `secrets: inherit` from the caller).
+# A100 capacity is intermittent (exit 75, SUPPLY_CONSTRAINT). This gate is
+# fail-closed with bounded retry: on 75 it retries the prove script up to 3
+# total attempts, sleeping 300s between attempts (capacity outages are usually
+# transient on that timescale). If every attempt still returns 75, the job
+# FAILS — a capacity outage blocks promotion the same as a real suite failure;
+# it never silently promotes an unproven CUDA artifact (the class of failure
+# esc-028 eliminated on the inference path applies equally to the release
+# path). Every caller gates promotion on this job's `result == 'success'`, so
+# a failed gate here already blocks build-and-push-cu12 / publish / server-cu12
+# with no further wiring needed. Operator recovery: re-run this workflow's
+# failed jobs once A100 capacity returns; promotion stays blocked until the
+# gate is green.
+#
+# Any other non-zero rc (a real suite failure, not a capacity skip) fails
+# immediately with no retry. Needs the RUNPOD_API_KEY secret (pass
+# `secrets: inherit` from the caller).
 
 on:
   workflow_call:
@@ -25,16 +37,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Prove the release commit on A100
+      - name: Prove the release commit on A100 (retry on capacity, fail closed)
         env:
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
           GIT_REF: ${{ inputs.git_ref }}
         run: |
           set +e
-          bash ci/scripts/runpod_gpu_prove.sh
-          rc=$?
-          if [ "$rc" -eq 75 ]; then
-            echo "::warning::A100 capacity unavailable (SUPPLY_CONSTRAINT) — this release is NOT GPU-proven this run; re-run the gate when capacity returns."
-            exit 0
-          fi
-          exit "$rc"
+          max_attempts=3
+          attempt=1
+          while :; do
+            bash ci/scripts/runpod_gpu_prove.sh
+            rc=$?
+            if [ "$rc" -ne 75 ]; then
+              exit "$rc"
+            fi
+            if [ "$attempt" -ge "$max_attempts" ]; then
+              echo "::error::A100 capacity unavailable (SUPPLY_CONSTRAINT) after ${attempt} attempts — this release is NOT GPU-proven. Promotion stays blocked. Operator action: re-run this workflow's failed jobs once A100 capacity returns."
+              exit "$rc"
+            fi
+            echo "::warning::A100 capacity unavailable (SUPPLY_CONSTRAINT), attempt ${attempt}/${max_attempts} — retrying in 300s."
+            sleep 300
+            attempt=$((attempt + 1))
+          done

@@ -136,13 +136,16 @@ pub struct Tiers {
     /// cookbook (the A/B split). Populated by `model-inference-scale`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_inference: Option<ModelInferenceTier>,
-    /// The on-GPU embedding throughput/latency observability tier: the embed
-    /// serving verb measured on `gpu.device = 0`, tagged with the concrete device
-    /// that served it. Records rows/s, p50/p99 tail latency, and cross-repeat
+    /// The on-GPU throughput/latency observability tier: the embed
+    /// (`generate_text_embeddings`) and classification (`infer`) serving verbs
+    /// each measured on `gpu.device = 0`, tagged with the concrete device that
+    /// served them. Records rows/s, p50/p99 tail latency, and cross-repeat
     /// determinism as measurements, not gates — an absolute rate on the ephemeral
-    /// heterogeneous prove fleet is not a property of the code alone. The GPU
-    /// peer of `model_inference`. Populated by `gpu-inference-scale` (behind the
-    /// `cuda` feature / `live-gpu-tests` lane).
+    /// heterogeneous prove fleet is not a property of the code alone. The
+    /// classification lane additionally hard-gates row conservation (a
+    /// correctness property, not a perf one). The GPU peer of `model_inference`.
+    /// Populated by `gpu-inference-scale` (behind the `cuda` feature /
+    /// `live-gpu-tests` lane).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gpu_inference: Option<GpuInferenceTier>,
     /// The CPU-hermetic cache-hit SLO tier: the engine's opt-in producer
@@ -1046,12 +1049,21 @@ pub struct ModelInferenceTier {
     pub infer_digest: DeterminismGate,
 }
 
-/// One verb's measured GPU lane: sustained throughput, tail latency, and whether
-/// the serve was deterministic across the measured repeats. Recorded
-/// observability, not a gate — see [`GpuInferenceTier`] for why an absolute rate
-/// on this fleet cannot be a committed baseline.
+/// One verb's measured GPU lane: sustained throughput, tail latency, the
+/// per-serve scored row count, and whether the serve was deterministic across
+/// the measured repeats. Recorded observability, not a perf gate — see
+/// [`GpuInferenceTier`] for why an absolute rate on this fleet cannot be a
+/// committed baseline. `rows` is load-bearing for the one thing this lane
+/// hard-gates: the classification lane asserts `rows` equals the corpus row
+/// count on every serve (row conservation is correctness, not perf — a
+/// per-row forward failure that `infer`'s annotate semantics silently drops
+/// must not pass as a smaller-but-fine result).
 #[derive(Debug, Serialize)]
 pub struct GpuLane {
+    /// Rows the serve scored — the same count every measured repeat produced
+    /// (the embed lane's persisted-vector count; the infer lane's scored-row
+    /// count, checked for conservation against the corpus size).
+    pub rows: usize,
     /// Sustained serving throughput at the median serve, rows/s.
     pub rows_per_s: Measurement,
     /// Median per-serve wall latency, ms.
@@ -1063,21 +1075,34 @@ pub struct GpuLane {
     pub deterministic: bool,
 }
 
-/// The on-GPU embedding throughput/latency tier: the real
-/// `generate_text_embeddings` verb measured on `gpu.device = 0` over the tiny
-/// committed bundle. The GPU peer of [`ModelInferenceTier`] — where that tier is
-/// CPU-hermetic and gates determinism, this one runs on the real device and
-/// *records* the perf a GPU optimization would move, tagged with the device that
-/// produced it. Scoped to embedding: the classification (`infer`) path is not yet
-/// a validated GPU path.
+/// The on-GPU throughput/latency tier: the engine's two GPU-model serving
+/// verbs — [`generate_text_embeddings`](jammi_ai::session::InferenceSession::generate_text_embeddings)
+/// (embed) and [`infer`](jammi_ai::session::InferenceSession::infer)
+/// (classification) — measured on `gpu.device = 0` over their own tiny
+/// committed bundles. The GPU peer of [`ModelInferenceTier`] — where that tier
+/// is CPU-hermetic and gates determinism, this one runs on the real device and
+/// *records* the perf a GPU optimization would move, tagged with the device
+/// that produced it.
 ///
 /// Throughput and tail latency ride as measurements, not gates: the prove lane
 /// runs on an ephemeral heterogeneous rented fleet (SXM4 / PCIe A100s, no
 /// pinning), so an absolute rate is a property of `code × device ×
 /// pod-conditions`, not of the code alone — a committed absolute floor would
 /// gate pod variance, not a regression. The device-independent correctness
-/// contract (cross-repeat determinism, CPU↔GPU parity) is hard-gated separately
-/// in the `gpu_capability` suite.
+/// contracts this tier DOES hard-gate: (1) the session resolved to a real CUDA
+/// device, never a silent CPU fallback (a serve error exits the tier
+/// non-zero); (2) the classification lane's scored row count matches the
+/// corpus row count on every serve (row conservation — [`GpuLane::rows`]).
+/// Cross-repeat determinism and CPU↔GPU parity are hard-gated separately, in
+/// the `gpu_capability` suite.
+///
+/// The report is emitted as one stable JSON document (`Report` →
+/// `tiers.gpu_inference`, printed by `emit()`): `device`, `device_name`,
+/// `iters`, and one [`GpuLane`] per verb (`embed`, `infer`), each carrying
+/// `rows`, `rows_per_s`, `p50_ms`, `p99_ms`. Every key is present on every run
+/// (no field is conditionally omitted and no record carries a timestamp), so
+/// two runs' JSON diffs cleanly — the groundwork a future within-run A/B
+/// perf-comparison mechanism would read, though no such comparator exists yet.
 #[derive(Debug, Serialize)]
 pub struct GpuInferenceTier {
     /// The device the serve resolved to (e.g. `cuda:0`) — proof it was not a CPU
@@ -1091,6 +1116,8 @@ pub struct GpuInferenceTier {
     pub iters: usize,
     /// The embed verb's lane.
     pub embed: GpuLane,
+    /// The classification (`infer`) verb's lane.
+    pub infer: GpuLane,
 }
 
 /// The CPU-hermetic cache-hit SLO tier: the engine's opt-in producer memoization

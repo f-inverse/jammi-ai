@@ -324,6 +324,19 @@ pub fn emit_child_result(rss_mib: f64, digest: &str) {
     println!("{}", format_child_line(rss_mib, digest));
 }
 
+/// Widen a `libc::statvfs` block-count field to `u64` regardless of its
+/// native width on the compiling platform. `f_bavail`/`f_frsize` are not the
+/// same width on every `libc::statvfs` binding (e.g. `f_bavail` is `u32` on
+/// Darwin but `u64` on glibc Linux, and the reverse is possible on other
+/// targets); going through a generic `impl Into<u64>` parameter — rather than
+/// a bare `x as u64` or `u64::from(x)` at the call site — widens whichever
+/// native width the field actually has without tripping `unnecessary_cast` /
+/// `useless_conversion` on the platform where that particular field is
+/// already `u64` (the lint sees a generic call, not a same-type conversion).
+fn widen(n: impl Into<u64>) -> u64 {
+    n.into()
+}
+
 /// Free disk space in MiB on the filesystem backing `path`, via `statvfs`.
 fn free_disk_mib(path: &Path) -> Result<u64, Box<dyn std::error::Error>> {
     use std::os::unix::ffi::OsStrExt;
@@ -335,7 +348,7 @@ fn free_disk_mib(path: &Path) -> Result<u64, Box<dyn std::error::Error>> {
     if rc != 0 {
         return Err(format!("statvfs failed for {}", path.display()).into());
     }
-    let bytes = stat.f_bavail * stat.f_frsize;
+    let bytes = widen(stat.f_bavail) * widen(stat.f_frsize);
     Ok(bytes / (1024 * 1024))
 }
 

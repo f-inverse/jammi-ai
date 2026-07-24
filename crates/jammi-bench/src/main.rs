@@ -348,18 +348,19 @@ enum Command {
     /// re-serves. Not a CI step — the provenance-recording rebuilder.
     #[command(hide = true)]
     RebuildModelInferenceSpec,
-    /// The on-GPU embedding throughput/latency observability tier: serves
-    /// `generate_text_embeddings` on `gpu.device = 0` over the committed tiny
-    /// bundle and records sustained rows/s, p50/p99 serve latency, and
-    /// cross-repeat determinism, tagged with the concrete device that served
-    /// them. The GPU peer of `model-inference-scale`; requires the `cuda` feature
-    /// and a GPU (fails loud on a CPU fallback). An absolute rate on the
-    /// ephemeral heterogeneous prove fleet is not a property of the code, so
-    /// there is no perf gate here — the device-independent correctness contract
-    /// (determinism, CPU↔GPU parity) is hard-gated separately in the
-    /// `gpu_capability` suite. Emits the JSON report with the `gpu_inference`
-    /// tier set and exits non-zero only on a missing CUDA device or a serve
-    /// error.
+    /// The on-GPU throughput/latency observability tier: serves both
+    /// `generate_text_embeddings` (embed) and `infer` (classification) on
+    /// `gpu.device = 0` over their own committed tiny bundles and records each
+    /// lane's sustained rows/s, p50/p99 serve latency, and cross-repeat
+    /// determinism, tagged with the concrete device that served them. The GPU
+    /// peer of `model-inference-scale`; requires the `cuda` feature and a GPU
+    /// (fails loud on a CPU fallback). An absolute rate on the ephemeral
+    /// heterogeneous prove fleet is not a property of the code, so there is no
+    /// perf gate here — the device-independent correctness contracts
+    /// (determinism, CPU↔GPU parity, and this tier's own classification
+    /// row-conservation check) are hard-gated. Emits the JSON report with the
+    /// `gpu_inference` tier set and exits non-zero on a missing CUDA device, a
+    /// serve error, or a classification lane that dropped a row.
     GpuInferenceScale,
     /// The CPU-hermetic cache-hit SLO tier: drives the engine's opt-in producer
     /// memoization (`CachePolicy::Use`) on a cacheable producer (the
@@ -1271,8 +1272,9 @@ const GPU_INFERENCE_PARAMS: gpu_inference::GpuInferenceParams = gpu_inference::G
 };
 
 /// Run the GPU-inference tier, emit the report, and exit non-zero only when the
-/// session did not resolve to a CUDA device or a serve itself failed — there is
-/// no perf pass/fail (see the `gpu_inference` module docs).
+/// session did not resolve to a CUDA device, a serve itself failed, or the
+/// classification lane's row-conservation check failed — there is no perf
+/// pass/fail (see the `gpu_inference` module docs).
 async fn run_gpu_inference_scale() -> std::process::ExitCode {
     let tier = match gpu_inference::run(GPU_INFERENCE_PARAMS).await {
         Ok(t) => t,

@@ -358,21 +358,17 @@ pub(crate) async fn serve_embed(
     Ok((fnv.finish(), serve_ms, vectors.len()))
 }
 
-/// Serve the infer verb over the corpus through the engine's real `infer`
-/// (`Classification`), then fold the full per-row score distribution
-/// (`all_scores_json`) of each committed target, in committed-target order, into
-/// an FNV digest.
-///
-/// The digest is over `all_scores_json` rather than the bare `label`, because the
-/// score distribution is the classifier head's full output — a regression in the
-/// forward, the pooling, or the softmax moves a score even when the argmax label
-/// is unchanged, so this is the regression-sensitive quantity. Returns `(digest,
-/// serve_wall_ms, rows_served)`.
-pub(crate) async fn serve_infer(
+/// Serve the infer verb (`Classification`) over the corpus through the
+/// engine's real `infer`, and index the served `(_row_id, all_scores_json)`
+/// rows into a map — the shared raw serve both [`serve_infer`] (folds a
+/// committed target subset) and [`serve_infer_all`] (folds every scored row)
+/// build their digest on top of. Returns `(by_key, serve_wall_ms)`; the wall
+/// time is over the whole `infer` call, matching [`serve_embed`]'s timing
+/// convention.
+async fn infer_scores_by_key(
     session: &Arc<InferenceSession>,
     model_id: &str,
-    target_keys: &[String],
-) -> Result<(String, f64, usize), Box<dyn std::error::Error>> {
+) -> Result<(std::collections::HashMap<String, String>, f64), Box<dyn std::error::Error>> {
     let source = ModelSource::parse(model_id);
     let start = Instant::now();
     let (batches, _) = session
@@ -387,8 +383,9 @@ pub(crate) async fn serve_infer(
         .await?;
     let serve_ms = start.elapsed().as_secs_f64() * 1_000.0;
 
-    // Index `_row_id -> all_scores_json` across the served batches so the fold
-    // walks the committed targets in committed order, independent of batch shape.
+    // Index `_row_id -> all_scores_json` across the served batches so a caller
+    // can fold in whatever order (committed targets, or every scored key
+    // sorted) independent of the served batch shape.
     let mut by_key: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for batch in &batches {
         let ids = batch
@@ -409,6 +406,25 @@ pub(crate) async fn serve_infer(
             }
         }
     }
+    Ok((by_key, serve_ms))
+}
+
+/// Serve the infer verb over the corpus through the engine's real `infer`
+/// (`Classification`), then fold the full per-row score distribution
+/// (`all_scores_json`) of each committed target, in committed-target order, into
+/// an FNV digest.
+///
+/// The digest is over `all_scores_json` rather than the bare `label`, because the
+/// score distribution is the classifier head's full output — a regression in the
+/// forward, the pooling, or the softmax moves a score even when the argmax label
+/// is unchanged, so this is the regression-sensitive quantity. Returns `(digest,
+/// serve_wall_ms, rows_served)`.
+pub(crate) async fn serve_infer(
+    session: &Arc<InferenceSession>,
+    model_id: &str,
+    target_keys: &[String],
+) -> Result<(String, f64, usize), Box<dyn std::error::Error>> {
+    let (by_key, serve_ms) = infer_scores_by_key(session, model_id).await?;
 
     let mut fnv = Fnv::new();
     for key in target_keys {
@@ -419,6 +435,32 @@ pub(crate) async fn serve_infer(
         fnv.mix(0x00); // key boundary
     }
     Ok((fnv.finish(), serve_ms, target_keys.len()))
+}
+
+/// Serve the infer verb over EVERY corpus row (rather than a fixed committed
+/// target subset) and fold every scored row's `all_scores_json`, in sorted
+/// `_row_id` order (so the fold is reproducible independent of served batch
+/// order), into an FNV digest. Returns `(digest, serve_wall_ms, scored_row_count)`.
+///
+/// The scored-row count is the row-conservation signal a caller needs: `infer`'s
+/// per-row annotate semantics can silently drop a row whose forward errored (the
+/// regression `gpu_capability`'s `classification_parity` guards on CPU↔GPU
+/// output), so a caller comparing this count against the input row count catches
+/// that same class of silent data loss on whichever device it served.
+pub(crate) async fn serve_infer_all(
+    session: &Arc<InferenceSession>,
+    model_id: &str,
+) -> Result<(String, f64, usize), Box<dyn std::error::Error>> {
+    let (by_key, serve_ms) = infer_scores_by_key(session, model_id).await?;
+
+    let mut keys: Vec<&String> = by_key.keys().collect();
+    keys.sort();
+    let mut fnv = Fnv::new();
+    for key in &keys {
+        fnv.mix_str(&by_key[*key]);
+        fnv.mix(0x00); // key boundary
+    }
+    Ok((fnv.finish(), serve_ms, keys.len()))
 }
 
 /// A rows/s rate, or `0.0` when the serve was instantaneous (a degenerate

@@ -1,26 +1,28 @@
-//! On-GPU embedding throughput/latency observability — the GPU peer of the
-//! CPU-hermetic `model_inference` tier, serving the real
-//! `generate_text_embeddings` verb on a real CUDA device.
+//! On-GPU throughput/latency observability — the GPU peer of the CPU-hermetic
+//! `model_inference` tier, serving the engine's two real GPU-model verbs,
+//! embedding (`generate_text_embeddings`) and classification (`infer`), on a
+//! real CUDA device.
 //!
 //! ## Why this exists next to the CPU-hermetic `model_inference` tier
 //!
 //! `model_inference` deliberately serves on `Device::Cpu` so it runs inside the
 //! hermetic `cargo test` net; it proves byte-determinism and a coarse CPU
 //! code-path rate, but says nothing about the real device. This tier is its GPU
-//! peer for the embedding path: it serves the real `generate_text_embeddings`
-//! verb over the same tiny committed bundle on `gpu.device = 0`, and measures the
-//! two quantities a GPU optimization actually moves — sustained throughput
-//! (rows/s) and per-serve tail latency (p50/p99). It is gated behind the `cuda`
-//! feature and the `live-gpu-tests` lane so default `cargo test` stays hermetic.
+//! peer: it serves the same two verbs over the same tiny committed bundles on
+//! `gpu.device = 0`, and measures the two quantities a GPU optimization
+//! actually moves — sustained throughput (rows/s) and per-serve tail latency
+//! (p50/p99). It is gated behind the `cuda` feature and the `live-gpu-tests`
+//! lane so default `cargo test` stays hermetic.
 //!
-//! ## Scope: embedding only
+//! ## Scope: embedding and classification
 //!
-//! The embedding forward is the primary GPU workload and the one open
-//! optimizations target (the encoder forward, its precision, its attention
-//! kernel). The classification (`infer`) path is intentionally out of scope here
-//! — it is not yet a validated GPU path (the gated `gpu_capability` suite covers
-//! embeddings, fine-tune, and bf16, not classification), so measuring it here is
-//! premature until its correctness on-device is established.
+//! Both verbs are measured. The embedding forward is the primary GPU workload
+//! open optimizations target (the encoder forward, its precision, its
+//! attention kernel); the classification (`infer`) lane serves the same
+//! `tiny_modernbert_classifier` bundle the `gpu_capability` suite's
+//! `classification_parity` cell already establishes as a validated GPU path
+//! (CPU↔GPU parity hard-gated there), so measuring its throughput/latency here
+//! is no longer premature.
 //!
 //! ## What is device-independent (hard-gated) vs device-dependent (recorded)
 //!
@@ -41,11 +43,26 @@
 //! tagged with the concrete device that produced them, never asserted against a
 //! remembered constant.
 //!
+//! Row conservation IS hard-gated on the classification lane, and it is a
+//! correctness property, not a perf one: `infer`'s per-row annotate semantics
+//! can silently drop a row whose forward errored, so the lane asserts the
+//! scored row count equals the corpus row count on every serve — the same
+//! invariant `classification_parity` checks CPU↔GPU, checked here run-to-run
+//! on the GPU alone.
+//!
 //! The designated perf-regression gate for when a GPU-specific optimization
 //! lands (fp8, cuDNN / flash-attention, a memory scheduler, batch coalescing) is
 //! a **within-run A/B ratio** — parent-HEAD vs the PR change, measured back to
 //! back on the *same* pod in the *same* run, so the device and its conditions
 //! cancel by construction — not a resurrected absolute baseline.
+//!
+//! ## Emitted shape
+//!
+//! `run()` assembles a [`crate::report::GpuInferenceTier`], and the
+//! `gpu-inference-scale` subcommand prints it as the `tiers.gpu_inference` field
+//! of the one stable JSON [`crate::report::Report`] document on stdout (no other
+//! output format). See [`crate::report::GpuInferenceTier`] for the exact field
+//! shape and the diffability contract (stable keys, no per-lane timestamps).
 
 use std::error::Error;
 
@@ -53,7 +70,7 @@ use jammi_db::store::manifest::ComputeDevice;
 
 use crate::model_inference::{
     build_corpus, corpus_session_on_device, local_model_id, rows_per_s, serve_embed,
-    ModelInferenceSpec, Row,
+    serve_infer_all, ModelInferenceSpec, Row,
 };
 use crate::report::{GpuInferenceTier, GpuLane, Measurement};
 
@@ -111,6 +128,66 @@ async fn measure_embed_lane(
     let rate = rows_per_s(rows, p50_ms);
 
     Ok(GpuLane {
+        rows,
+        rows_per_s: Measurement::measured(rate, "rows_per_s"),
+        p50_ms: Measurement::measured(p50_ms, "ms"),
+        p99_ms: Measurement::measured(p99_ms, "ms"),
+        deterministic,
+    })
+}
+
+/// Assert a classification serve scored every corpus row — row conservation is
+/// a correctness property, not a perf one. `infer`'s per-row annotate semantics
+/// silently drop a row whose forward errored (the RoPE-contiguity bug
+/// `gpu_capability`'s `classification_parity` regression-guards CPU↔GPU), so a
+/// scored count short of the corpus size is real data loss and must fail the
+/// tier loudly rather than ride as a smaller-but-quietly-accepted rate.
+fn assert_row_conservation(scored_rows: usize, expected_rows: usize) -> Result<(), Box<dyn Error>> {
+    if scored_rows != expected_rows {
+        return Err(format!(
+            "gpu-inference classification lane scored {scored_rows} rows but the corpus has \
+             {expected_rows} — a per-row forward failure silently dropped a row on GPU"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Serve the classification (`infer`) verb `warmup + iters` times on the GPU
+/// session, returning the measured lane. Mirrors [`measure_embed_lane`]'s
+/// throughput/latency/determinism measurement, plus one hard gate
+/// [`measure_embed_lane`] has no need for: every serve, including warmup, must
+/// score exactly `expected_rows` ([`assert_row_conservation`]) — the same
+/// row-conservation invariant `classification_parity` checks CPU↔GPU, checked
+/// here run-to-run on the GPU alone.
+async fn measure_infer_lane(
+    session: &std::sync::Arc<jammi_ai::session::InferenceSession>,
+    model_id: &str,
+    expected_rows: usize,
+    iters: usize,
+) -> Result<GpuLane, Box<dyn Error>> {
+    // Warmup: pays the one-time model-load + PTX-JIT cost so it does not land in
+    // the measured tail.
+    let (first_digest, _warm_ms, warm_rows) = serve_infer_all(session, model_id).await?;
+    assert_row_conservation(warm_rows, expected_rows)?;
+
+    let mut latencies_ms = Vec::with_capacity(iters);
+    let mut deterministic = true;
+    for _ in 0..iters {
+        let (digest, serve_ms, scored_rows) = serve_infer_all(session, model_id).await?;
+        assert_row_conservation(scored_rows, expected_rows)?;
+        if digest != first_digest {
+            deterministic = false;
+        }
+        latencies_ms.push(serve_ms);
+    }
+
+    let (p50_ms, p99_ms) = percentiles_ms(latencies_ms);
+    // Throughput at the median serve — the representative steady-state rate.
+    let rate = rows_per_s(warm_rows, p50_ms);
+
+    Ok(GpuLane {
+        rows: warm_rows,
         rows_per_s: Measurement::measured(rate, "rows_per_s"),
         p50_ms: Measurement::measured(p50_ms, "ms"),
         p99_ms: Measurement::measured(p99_ms, "ms"),
@@ -158,22 +235,29 @@ fn cuda_device_name(_ordinal: u32) -> Result<String, Box<dyn Error>> {
     Err("gpu-inference built without the cuda feature; no device to name".into())
 }
 
-/// Run the GPU-inference tier: serve the embed verb on `gpu.device = 0` and
-/// record throughput, p50/p99 tail latency, and cross-repeat determinism,
-/// tagged with the concrete device that served them.
+/// Run the GPU-inference tier: serve the embed and classification verbs on
+/// `gpu.device = 0` and record throughput, p50/p99 tail latency, and
+/// cross-repeat determinism for each, tagged with the concrete device that
+/// served them. The classification lane additionally hard-gates row
+/// conservation (see [`measure_infer_lane`]).
 pub async fn run(params: GpuInferenceParams) -> Result<GpuInferenceTier, Box<dyn Error>> {
     let rows = build_corpus_from(params.row_count, params.corpus_seed);
     let (session, _dir) = corpus_session_on_device(&rows, GPU_DEVICE).await?;
     let ordinal = require_cuda(session.compute_device())?;
     let device_name = cuda_device_name(ordinal)?;
+
     let embed_id = local_model_id(&ModelInferenceSpec::embed_model_dir())?;
     let embed = measure_embed_lane(&session, &embed_id, params.iters).await?;
+
+    let infer_id = local_model_id(&ModelInferenceSpec::classifier_model_dir())?;
+    let infer = measure_infer_lane(&session, &infer_id, params.row_count, params.iters).await?;
 
     Ok(GpuInferenceTier {
         device: format!("cuda:{ordinal}"),
         device_name,
         iters: params.iters,
         embed,
+        infer,
     })
 }
 

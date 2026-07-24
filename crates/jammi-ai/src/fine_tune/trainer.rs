@@ -2112,9 +2112,10 @@ fn mnrl_loss(
     let p_t = p_norm
         .t()
         .map_err(|e| JammiError::FineTune(format!("mnrl transpose: {e}")))?;
-    // (n, n) anchor↔positive similarity, scaled.
-    let sim = (a_norm
-        .matmul(&p_t)
+    // (n, n) anchor↔positive similarity, scaled. `p_t` is a transpose view, so
+    // this routes through the contiguity-safe primitive rather than a raw
+    // `matmul` on a transposed RHS.
+    let sim = (jammi_encoders::contiguous_matmul(&a_norm, &p_t)
         .map_err(|e| JammiError::FineTune(format!("mnrl matmul: {e}")))?
         * scale)
         .map_err(|e| JammiError::FineTune(format!("mnrl scale: {e}")))?;
@@ -2133,8 +2134,7 @@ fn mnrl_loss(
             let neg_t = neg_norm
                 .t()
                 .map_err(|e| JammiError::FineTune(format!("mnrl neg transpose: {e}")))?;
-            let neg_sim = (a_norm
-                .matmul(&neg_t)
+            let neg_sim = (jammi_encoders::contiguous_matmul(&a_norm, &neg_t)
                 .map_err(|e| JammiError::FineTune(format!("mnrl neg matmul: {e}")))?
                 * scale)
                 .map_err(|e| JammiError::FineTune(format!("mnrl neg scale: {e}")))?;

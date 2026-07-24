@@ -6,14 +6,16 @@
 //! (architecture × verb) cell. `embeddings_parity` already covers Bert ×
 //! TextEmbedding's CPU↔GPU parity.
 //!
-//! This closes the coverage gap the pure-fn unit test cannot reach: the runtime
-//! compute-capability gate's *admit wiring*. On a CUDA build the gate acquires
-//! the resolved device's real capability
-//! (`as_cuda_device().cuda_stream().context().compute_capability()`), feeds it
-//! to `ComputePrecision::is_supported_on_cuda`, and — on sm_80+ — admits bf16
-//! as `DType::BF16`. The CPU suite can only exercise the `cfg(not(cuda))` reject
-//! arm and the decision predicate in isolation; only a real Ampere+ device
-//! (here the A10G, sm_86) drives acquire → decide → admit end-to-end.
+//! This closes the coverage gap the pure-fn unit test cannot reach: the
+//! runtime architecture-floor's *admit wiring*. Device admission
+//! (`select_device`) acquires the resolved device's real compute capability
+//! (`as_cuda_device().cuda_stream().context().compute_capability()`) and
+//! rejects anything below sm_80 (Ampere) before a model ever loads, so a
+//! `Device::Cuda(_)` reaching the bf16 gate is unconditionally bf16-capable —
+//! the gate itself only distinguishes CUDA from non-CUDA. The CPU suite can
+//! only exercise the `cfg(not(cuda))` reject arm and the pure
+//! `check_compute_cap_floor` predicate in isolation; only a real Ampere+
+//! device (here the A10G, sm_86) drives acquire → admit → encode end-to-end.
 //!
 //! The proof that bf16 was genuinely admitted-as-bf16 (not silently down-graded
 //! to f32) is structural: the gate's `BF16` arm either maps to `DType::BF16` or

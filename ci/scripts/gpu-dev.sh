@@ -44,7 +44,8 @@ gpu-dev.sh — GPU development on RunPod
   pull    [session] <path>    rsync <path> back FROM the pod
   down    [session]           terminate the pod, forget the session
   ls                          list sessions
-  reap    [hours]             terminate ANY orphaned jammi pod past its deadline
+  reap    [hours]             terminate orphaned pods past their own deadline
+                              ([hours] force-reaps everything older than that)
   prewarm [arch]              publish the cargo-registry prewarm object
 
 arch: a100 (default) | l40s | h100 | a40 | l4
@@ -70,7 +71,9 @@ case "$CMD" in
   reap)
     # shellcheck source=ci/scripts/runpod_lib.sh
     source "$DIR/runpod_lib.sh"
-    rp_sweep "${1:-$RP_TTL_HOURS}"
+    # No argument => judge each pod against the deadline in its own name.
+    # Passing RP_TTL_HOURS here would impose THIS shell's limit on every pod.
+    rp_sweep "${1:-}"
     exit $?
     ;;
 esac

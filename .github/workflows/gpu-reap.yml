@@ -1,0 +1,48 @@
+name: GPU reap (RunPod orphans)
+
+# Terminates RunPod pods this repo rented that have outlived their own deadline.
+#
+# Every pod carries a deadline in its entrypoint, armed before anything else the
+# container does. This sweep is the independent backstop for the case that
+# deadline never got armed — a pod whose container died early, or a host that
+# stopped reporting.
+#
+# It is a SEPARATE workflow on purpose. The sweep also runs at the top of
+# `runpod_gpu_prove.sh`, but that only helps when the prove lane runs; the prove
+# lane spent four consecutive nights failing at deploy without cleaning anything.
+# A backstop that only works when the thing it backs up is healthy is not a
+# backstop.
+#
+# It fails the run when it cannot enumerate pods. "Could not check" must never be
+# reported as "nothing to clean up" — that is how a guard silently stops guarding.
+
+on:
+  schedule:
+    # Every 6h, offset off the hour to avoid the other crons.
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      force_hours:
+        description: "Force-reap every jammi pod older than this many hours (leave empty to honour each pod's own deadline)."
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  reap:
+    name: Terminate orphaned RunPod pods
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Never overlap: two sweeps racing would both try to terminate the same pod.
+    concurrency:
+      group: gpu-reap
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reap
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+        run: bash ci/scripts/gpu-dev.sh reap ${{ inputs.force_hours }}

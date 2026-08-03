@@ -7,10 +7,16 @@
 #                A surviving pod is what lets a fine-tune / eval / bench outlive
 #                the SSH session.
 #
-# EVERY pod — CI, throwaway, or surviving — carries a hard RP_TTL_HOURS deadline
-# baked into its entrypoint at deploy time. The EXIT trap is best-effort only: a
+# EVERY pod — CI, throwaway, or surviving — carries an RP_TTL_HOURS deadline
+# baked into its entrypoint at deploy time, and the deadline is repeated in the
+# pod's name so any sweeper can honour it. The EXIT trap is best-effort only: a
 # SIGKILLed process (a cancelled GitHub run, a dropped laptop) never runs it, and
 # a pod with no other deadline then bills until the account empties.
+#
+# The in-pod deadline ends in `kill -9 1`, and whether that stops RunPod BILLING
+# or merely exits the container is UNVERIFIED — rp_sweep still explicitly
+# terminates a non-RUNNING pod for exactly that reason. Treat the sweep as
+# load-bearing, not as belt-and-braces.
 #   * state    — the pod is always disposable (volumeInGb 0). Durable state lives
 #                in an S3-compatible object store that rp_bootstrap rehydrates.
 #                A RunPod network volume is deliberately NEVER attached: an
@@ -46,6 +52,17 @@ RP_MIN_DRIVER_MAJOR="${RP_MIN_DRIVER_MAJOR:-560}"
 RP_SESSION="${RP_SESSION:-}"
 RP_KEEP="${RP_KEEP:-0}"
 RP_TTL_HOURS="${RP_TTL_HOURS:-8}"
+# Every pod this tooling rents is named "<prefix>-ttl<H>". The deadline travels
+# with the pod so a sweeper can honour each pod's OWN limit instead of imposing
+# its own — otherwise a CI sweep (3h) reaps a developer's 8h session.
+RP_POD_PREFIX="jammi-gpu"
+# Validated here, not at use: RP_TTL_HOURS goes into arithmetic expansion AND the
+# pod name. A non-integer would yield a malformed payload plus an unparseable
+# name, and no script here sets -e, so it would fail silently in both places.
+case "$RP_TTL_HOURS" in
+  ''|*[!0-9]*) echo "::error::RP_TTL_HOURS must be a positive integer (got '${RP_TTL_HOURS}')" >&2; exit 2 ;;
+esac
+[ "$RP_TTL_HOURS" -gt 0 ] || { echo "::error::RP_TTL_HOURS must be > 0" >&2; exit 2; }
 RP_SESSION_ROOT="${RP_SESSION_ROOT:-${HOME}/.config/runpod/sessions}"
 RP_S3_CONF="${RP_S3_CONF:-${HOME}/.config/runpod/s3}"
 RP_REPO_URL="${RP_REPO_URL:-https://github.com/f-inverse/jammi-ai}"
@@ -161,23 +178,37 @@ rp_s3_load() {
 }
 
 _rp_deploy_payload() { # $1=cloudType $2=gpuTypeId
-  python3 - "$1" "$2" "$RP_IMAGE" "$RP_PUBKEY" "$(( RP_TTL_HOURS * 3600 ))" <<'PY'
+  python3 - "$1" "$2" "$RP_IMAGE" "$RP_PUBKEY" "$RP_TTL_HOURS" "$RP_POD_PREFIX" <<'PY'
 import json, sys
-cloud, gpu, image, pub, ttl = sys.argv[1:6]
+cloud, gpu, image, pub, ttl_h, prefix = sys.argv[1:7]
+ttl = int(ttl_h) * 3600
 # The deadline is part of the pod's own entrypoint, so it exists from the moment
 # the container starts. It CANNOT be installed over SSH after the fact: the
 # window between "pod rented" and "SSH reachable" is minutes long, and a runner
-# killed inside it (GitHub cancels in-progress runs — gpu-prove.yml sets
-# cancel-in-progress) never runs its EXIT trap. That is exactly how an A100 was
-# orphaned for seven days. runpodctl uses the pod-scoped credential RunPod
-# injects; `kill 1` stops the container if it cannot be installed.
-watchdog = ("( curl -fsSL cli.runpod.net 2>/dev/null | bash >/dev/null 2>&1; "
-            "sleep %s; runpodctl remove pod \"$RUNPOD_POD_ID\" 2>/dev/null || kill 1 ) & " % ttl)
-setup = ("yum install -y openssh-server openssh-clients >/dev/null 2>&1; ssh-keygen -A; "
+# SIGKILLed inside it never runs its EXIT trap. That is exactly how an A100 was
+# orphaned for seven days on 2026-07-24.
+#
+# `sleep` comes FIRST so the deadline is reached no matter what the network does;
+# an install ahead of it can hang and leave the pod with no deadline at all.
+# Every step after the sleep is `timeout`-bounded and separated by `;` rather than
+# `||`, so a command that hangs or never returns cannot swallow the kill.
+watchdog = ("( sleep %d; "
+            "timeout 120 sh -c 'command -v runpodctl >/dev/null 2>&1 || "
+            "curl -fsSL cli.runpod.net | bash' >/dev/null 2>&1; "
+            "timeout 60 runpodctl remove pod \"$RUNPOD_POD_ID\" >/dev/null 2>&1; "
+            "kill -9 1 ) & " % ttl)
+# The watchdog is armed BEFORE anything else in the entrypoint. Any command
+# placed ahead of it — `yum install` reaching the network, for instance — can
+# hang and leave the pod running with no deadline, which is the failure this
+# whole mechanism exists to prevent.
+setup = (watchdog
+         + "yum install -y openssh-server openssh-clients >/dev/null 2>&1; ssh-keygen -A; "
          "mkdir -p /root/.ssh; printf '%s\\n' \"$PUBLIC_KEY\" > /root/.ssh/authorized_keys; "
          "chmod 700 /root/.ssh; chmod 600 /root/.ssh/authorized_keys; "
-         + watchdog + "/usr/sbin/sshd -D")
-inp = {"cloudType": cloud, "gpuCount": 1, "gpuTypeId": gpu, "name": "jammi-gpu",
+         "/usr/sbin/sshd -D")
+inp = {"cloudType": cloud, "gpuCount": 1, "gpuTypeId": gpu,
+       # The deadline travels in the name so any sweeper honours THIS pod's limit.
+       "name": "%s-ttl%s" % (prefix, ttl_h),
        "imageName": image, "containerDiskInGb": 60, "volumeInGb": 0, "ports": "22/tcp",
        "dockerArgs": "bash -c '%s'" % setup, "env": [{"key": "PUBLIC_KEY", "value": pub}]}
 print(json.dumps({"query": "mutation D($i: PodFindAndDeployOnDemandInput!){ podFindAndDeployOnDemand(input:$i){ id } }",
@@ -287,42 +318,78 @@ rp_run_remote() {
     | ssh "${RP_SSHO[@]}" -p "$RP_PORT" "root@${RP_HOST}" "timeout ${RP_TIMEOUT:-3000} bash -s"
 }
 
-# Install the pod-side deadline. The pod self-terminates with the pod-scoped
-# credential RunPod injects, so the account API key never lands on rented
-# hardware. `kill 1` is the fallback for an image where runpodctl cannot install:
-# stopping the container is strictly better than billing until someone notices.
-# This is a wall-clock ceiling, not idle detection — an idle pod bills until TTL.
-# Terminate orphaned pods. The deploy-time watchdog is the primary deadline;
-# this is the backstop for a pod whose container never got far enough to arm it,
-# and the only thing that can clean up after a runner killed during the
-# minutes-long gap between "pod rented" and "pod reachable".
+# Terminate orphaned pods. The in-pod deadline is the primary guard; this is the
+# backstop for a pod whose container never got far enough to arm it, and the only
+# thing that can clean up after a runner killed during the minutes-long gap
+# between "pod rented" and "pod reachable".
 #
-# Only ever touches pods this tooling created (name "jammi-gpu"): anything else
+# Only touches pods this tooling created (the RP_POD_PREFIX name): anything else
 # in the account is somebody's deliberate work and is never in scope. A stopped
 # jammi pod is always garbage — the tooling terminates, it never stops.
-rp_sweep() { # $1=max age hours (default RP_TTL_HOURS)
-  local max_h="${1:-$RP_TTL_HOURS}" victims id age n=0
-  victims="$(rp_gql '{"query":"query{ myself{ pods{ id name desiredStatus runtime{ uptimeInSeconds } } } }"}' \
+#
+# With no argument each pod is judged against the deadline carried in its own
+# name, so a sweeper never imposes its own limit on someone else's pod. An
+# explicit hours argument is a force-reap override for the emergency case.
+#
+# Every ambiguity resolves toward terminating. A pod this tooling rented that we
+# cannot reason about is far more likely to be a leak than healthy work, and the
+# cost of a wrong sweep is one re-run; the cost of a wrong spare is $187.
+rp_sweep() { # $1=optional override age in hours
+  local override="${1:-}" out rc id age why n=0
+  if [ -n "$override" ]; then
+    case "$override" in
+      ''|*[!0-9]*) echo "::error::reap: hours must be a positive integer (got '${override}')"; return 2 ;;
+    esac
+  fi
+  out="$(rp_gql '{"query":"query{ myself{ pods{ id name desiredStatus runtime{ uptimeInSeconds } } } }"}' \
     | python3 -c "
 import sys, json
-max_s = $max_h * 3600
-d = json.load(sys.stdin)
-pods = ((d.get('data') or {}).get('myself') or {}).get('pods') or []
-for p in pods:
-    if p.get('name') != 'jammi-gpu':
+override = '''$override'''.strip()
+prefix = '$RP_POD_PREFIX'
+try:
+    d = json.load(sys.stdin)
+except Exception as e:
+    print('could not parse RunPod response: %s' % e); sys.exit(3)
+if d.get('errors'):
+    print(json.dumps(d['errors'])[:200]); sys.exit(3)
+me = (d.get('data') or {}).get('myself')
+if me is None or me.get('pods') is None:
+    print('response contained no pod list'); sys.exit(3)
+for p in me['pods']:
+    name = p.get('name') or ''
+    if not name.startswith(prefix):
         continue
-    rt = p.get('runtime') or {}
-    up = rt.get('uptimeInSeconds') or 0
-    if p.get('desiredStatus') != 'RUNNING' or up > max_s:
-        print(p['id'], up)
+    up = (p.get('runtime') or {}).get('uptimeInSeconds')
+    if p.get('desiredStatus') != 'RUNNING':
+        print(p['id'], up if up is not None else -1, 'not-running'); continue
+    if up is None:
+        # A pod we rented that reports no telemetry is unreachable, not young.
+        print(p['id'], -1, 'no-telemetry'); continue
+    if override:
+        limit = int(override) * 3600
+    else:
+        tail = name[len(prefix):]
+        if tail.startswith('-ttl') and tail[4:].isdigit():
+            limit = int(tail[4:]) * 3600
+        else:
+            print(p['id'], up, 'unparseable-deadline'); continue
+    if up > limit:
+        print(p['id'], up, 'past-deadline-%ds' % limit)
 ")"
-  [ -n "$victims" ] || { echo "sweep: no orphaned jammi pods older than ${max_h}h"; return 0; }
-  while read -r id age; do
+  rc=$?
+  # A failed query must never read as "nothing to clean up" — this is the
+  # independent backstop, and a silent green here is how a guard stops guarding.
+  if [ "$rc" -ne 0 ]; then
+    echo "::error::sweep could NOT enumerate pods; orphans may exist unseen: ${out}"
+    return 1
+  fi
+  [ -n "$out" ] || { echo "sweep: queried OK — no orphaned ${RP_POD_PREFIX} pods"; return 0; }
+  while read -r id age why; do
     [ -n "$id" ] || continue
     rp_terminate "$id"
-    echo "::warning::swept orphaned pod ${id} (up ${age}s, limit $(( max_h * 3600 ))s)"
+    echo "::warning::swept pod ${id} (${why}, up ${age}s)"
     n=$(( n + 1 ))
-  done <<< "$victims"
+  done <<< "$out"
   echo "sweep: terminated ${n} orphaned pod(s)"
 }
 

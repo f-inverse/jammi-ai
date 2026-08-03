@@ -20,21 +20,39 @@ on:
     # Nightly at 03:47 UTC — off-peak, offset from the other crons.
     - cron: "47 3 * * *"
 
-concurrency:
-  group: gpu-prove-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   gpu-prove:
     name: GPU prove on RunPod A100 (sm_80)
     # Label event only runs for the `run-gpu` label; dispatch/schedule always run.
     if: github.event_name != 'pull_request' || github.event.label.name == 'run-gpu'
     runs-on: ubuntu-latest
+    # Concurrency is on the JOB, not the workflow, and never cancels.
+    #
+    # `on: pull_request: types: [labeled]` fires for EVERY label, so a
+    # workflow-level group would admit runs whose job the `if:` above skips —
+    # and those runs would still cancel an in-flight proof, or evict a pending
+    # one (GitHub replaces the older pending run in a group by default). At job
+    # level a skipped job never enters the group at all.
+    #
+    # cancel-in-progress is false because this job rents hardware and cleans up
+    # in an EXIT trap. Cancelling SIGKILLs the runner, the trap never runs, and
+    # the pod it already rented is orphaned — that is exactly how a toggled
+    # `run-gpu` label leaked an A100 for seven days on 2026-07-24. Letting a
+    # superseded run finish costs ~$0.50; cancelling one cost $187.
+    concurrency:
+      group: gpu-prove-${{ github.ref }}
+      cancel-in-progress: false
+    # A job-timeout kill is another trap bypass. The remote job is capped by
+    # RP_TIMEOUT (50m) plus deploy; this bounds the rest well under the 360m default.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
 
       # The orchestrator rents an A100, runs the gated GPU suites on it, streams
-      # the output, and ALWAYS terminates the pod on exit. A `75` exit means no
+      # the output, and terminates the pod on exit — best-effort, via an EXIT
+      # trap a SIGKILLed runner never reaches. The real guarantee is the deadline
+      # armed inside the pod's own entrypoint, plus the gpu-reap sweep. A `75`
+      # exit means no
       # A100 capacity (SUPPLY_CONSTRAINT) — surfaced as a neutral skip, not a
       # red, since it is a provider-capacity condition, not a code failure.
       - name: Prove GPU suites on a real A100

@@ -102,33 +102,53 @@ architecture and would poison the pod's.
 ## Cost guard
 
 **The EXIT trap is best-effort and must never be the only thing stopping the
-meter.** A SIGKILLed process never runs it — a cancelled GitHub run (this
-workflow sets `cancel-in-progress`), a dropped laptop, a force-quit terminal. On
-2026-07-24 a superseded `gpu-prove` run was cancelled 92 seconds in, while it was
-still waiting for its pod's SSH to come up. The trap never fired, and the A100 it
-had just rented ran for seven days.
+meter.** A SIGKILLed process never runs it — a cancelled GitHub run, a job
+timeout, a dropped laptop. On 2026-07-24 someone toggled the `run-gpu` label off
+and on to re-run the gate, 71 seconds after the first run started. The
+concurrency group cancelled that run while it was still waiting for its pod's SSH
+to come up. The trap never fired, and the A100 it had just rented ran for seven
+days, consuming ~$187.
 
-Two guards, because neither alone is sufficient:
+Three guards, in order of when they act:
 
-1. **A deadline baked into the pod's entrypoint at deploy.** Every pod — CI,
-   throwaway, or surviving — self-terminates after `RP_TTL_HOURS` (default 8; the
-   CI prove lane uses 3). It is part of the container's own command, so it is
-   running from the moment the pod exists. It deliberately is *not* installed
-   over SSH: the gap between "pod rented" and "pod reachable" is minutes long,
-   and that gap is exactly where the orphan above was created. The pod uses the
-   pod-scoped credential RunPod injects, so your account API key never lands on
-   rented hardware.
+1. **The workflows never cancel a run that rents hardware.** Concurrency on both
+   `gpu-prove.yml` and `_gpu-prove-gate.yml` sits on the *job* (so a run whose
+   job is skipped by the label gate never enters the group) and sets
+   `cancel-in-progress: false`. Superseded runs queue instead of dying mid-rent.
 
-2. **A sweep**, for a pod whose container never got far enough to arm itself:
+2. **A deadline armed inside the pod's own entrypoint**, before the container
+   does anything else — including its package install, which reaches the network
+   and could hang. Every pod self-terminates after `RP_TTL_HOURS` (default 8; the
+   CI prove lane uses 3). It deliberately is *not* installed over SSH: the gap
+   between "pod rented" and "pod reachable" is minutes long, and that gap is
+   where the orphan above was created.
+
+3. **A sweep**, for a pod whose container never got far enough to arm itself:
 
    ```bash
-   ci/scripts/gpu-dev.sh reap        # terminate any jammi pod past its deadline
-   ci/scripts/gpu-dev.sh reap 2      # ...past 2 hours
+   ci/scripts/gpu-dev.sh reap        # honour each pod's own deadline
+   ci/scripts/gpu-dev.sh reap 2      # force-reap everything older than 2h
    ```
 
-   The prove lane runs this before renting anything, so an orphan is bounded by
-   the gap to the next prove run. It only ever touches pods named `jammi-gpu`;
-   anything else in the account is left alone.
+   Each pod's deadline travels in its name (`jammi-gpu-ttl<H>`), so a sweep
+   honours *that pod's* limit rather than imposing its own — without this, a CI
+   prove run's 3 h sweep would reap your 8 h dev session. Only pods named
+   `jammi-gpu*` are ever touched. `.github/workflows/gpu-reap.yml` runs it every
+   6 h independently of the prove lane, because a backstop that only works when
+   the thing it backs up is healthy is not a backstop.
+
+   Every ambiguity resolves toward terminating: unreadable telemetry, an
+   unparseable deadline, or a stopped pod is swept. And a sweep that cannot
+   *reach* RunPod fails loudly rather than reporting "nothing to clean up".
+
+Guards 2 and 3 are **not** fully independent. The in-pod deadline ends in
+`kill -9 1`, and whether that stops RunPod billing or merely exits the container
+is unverified — which is why the sweep still explicitly terminates a non-running
+pod. Verifying it costs about $0.15: rent an L4 with `RP_TTL_HOURS=1`, let it
+fire, and check whether billing stops.
+
+All three are **wall-clock ceilings, not idle detection** — a pod you stop using
+bills until its deadline. Run `down` when you're finished.
 
 Both are **wall-clock ceilings, not idle detection** — a pod you stop using bills
 until its deadline. Run `down` when you're finished; the guards are for the times

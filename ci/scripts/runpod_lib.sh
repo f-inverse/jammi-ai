@@ -372,9 +372,9 @@ rp_sweep() { # $1=optional override age in hours
       ''|*[!0-9]*) echo "::error::reap: hours must be a positive integer (got '${override}')"; return 2 ;;
     esac
   fi
-  out="$(rp_gql '{"query":"query{ myself{ pods{ id name desiredStatus runtime{ uptimeInSeconds } } } }"}' \
+  out="$(rp_gql '{"query":"query{ myself{ pods{ id name desiredStatus createdAt runtime{ uptimeInSeconds } } } }"}' \
     | python3 -c "
-import sys, json
+import sys, json, datetime
 override = '''$override'''.strip()
 prefix = '$RP_POD_PREFIX'
 try:
@@ -386,16 +386,29 @@ if d.get('errors'):
 me = (d.get('data') or {}).get('myself')
 if me is None or me.get('pods') is None:
     print('response contained no pod list'); sys.exit(3)
+now = datetime.datetime.now(datetime.timezone.utc)
 for p in me['pods']:
     name = p.get('name') or ''
     if not name.startswith(prefix):
         continue
-    up = (p.get('runtime') or {}).get('uptimeInSeconds')
+    # Age comes from createdAt, never from runtime.uptimeInSeconds. Measured on
+    # live pods: uptime is null for the first minutes of a perfectly healthy pod,
+    # so treating null as 'unreachable' terminates in-flight CI runs. createdAt is
+    # also a true since-RENTAL clock, so a container restart cannot reset it —
+    # which uptime can, letting a pod live forever in deadline-length increments.
+    age = None
+    ca = p.get('createdAt')
+    if ca:
+        try:
+            age = int((now - datetime.datetime.fromisoformat(ca.replace('Z', '+00:00'))).total_seconds())
+        except Exception:
+            age = None
     if p.get('desiredStatus') != 'RUNNING':
-        print(p['id'], up if up is not None else -1, 'not-running'); continue
-    if up is None:
-        # A pod we rented that reports no telemetry is unreachable, not young.
-        print(p['id'], -1, 'no-telemetry'); continue
+        print(p['id'], age if age is not None else -1, 'not-running'); continue
+    if age is None:
+        # Cannot establish age. Killing on this basis is how healthy pods die, so
+        # surface it instead and let an operator force-reap.
+        print('UNAGEABLE', p['id'], name); continue
     if override:
         limit = int(override) * 3600
     else:
@@ -403,9 +416,9 @@ for p in me['pods']:
         if tail.startswith('-ttl') and tail[4:].isdigit():
             limit = int(tail[4:]) * 3600
         else:
-            print(p['id'], up, 'unparseable-deadline'); continue
-    if up > limit:
-        print(p['id'], up, 'past-deadline-%ds' % limit)
+            print(p['id'], age, 'unparseable-deadline'); continue
+    if age > limit:
+        print(p['id'], age, 'past-deadline-%ds' % limit)
 ")"
   rc=$?
   # A failed query must never read as "nothing to clean up" — this is the
@@ -417,8 +430,12 @@ for p in me['pods']:
   [ -n "$out" ] || { echo "sweep: queried OK — no orphaned ${RP_POD_PREFIX} pods"; return 0; }
   while read -r id age why; do
     [ -n "$id" ] || continue
+    if [ "$id" = "UNAGEABLE" ]; then
+      echo "::error::pod ${age} (${why}) has no usable createdAt — cannot judge its age; reap explicitly if it is an orphan"
+      continue
+    fi
     rp_terminate "$id"
-    echo "::warning::swept pod ${id} (${why}, up ${age}s)"
+    echo "::warning::swept pod ${id} (${why}, age ${age}s)"
     n=$(( n + 1 ))
   done <<< "$out"
   echo "sweep: terminated ${n} orphaned pod(s)"

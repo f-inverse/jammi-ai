@@ -65,10 +65,6 @@ esac
 RP_SESSION_ROOT="${RP_SESSION_ROOT:-${HOME}/.config/runpod/sessions}"
 RP_S3_CONF="${RP_S3_CONF:-${HOME}/.config/runpod/s3}"
 RP_REPO_URL="${RP_REPO_URL:-https://github.com/f-inverse/jammi-ai}"
-# s5cmd: the S3 client the pod uses to move the prewarm tarball. Pinned to a
-# release binary for the same reason mold/protoc/sccache are in the CI image —
-# an unpinned fetch makes an otherwise reproducible pod drift under you.
-RP_S5CMD_VERSION="${RP_S5CMD_VERSION:-2.3.0}"
 
 # A named session must outlive the process; an anonymous one must not leak. The
 # session dir is created lazily by the first writer, so read-only commands
@@ -442,14 +438,15 @@ for p in me['pods']:
 }
 
 # Make the pod ready to build jammi: import the container ENV (already done by
-# rp_run_remote), rehydrate the cargo registry from the prewarm object, point
-# sccache at the object store, and place the repo at $1 (default: main).
+# rp_run_remote), point sccache at the object store, and place the repo at $1
+# (default: main).
 #
-# The cargo registry is the expensive cold cost — the CI image deliberately wipes
-# /usr/local/cargo/registry, so a fresh pod otherwise re-resolves the whole
-# arrow/datafusion/candle tree before it compiles a line. It is restored as ONE
-# tarball rather than synced: RunPod's S3 surface degrades badly past ~10k
-# objects, and a cargo registry is far past that.
+# The cargo REGISTRY is deliberately not cached. It looks expensive — the CI image
+# wipes /usr/local/cargo/registry, so every pod re-fetches the whole
+# arrow/datafusion/candle tree — but measured on a RunPod host that fetch is 9s
+# for 868 crates, because datacenter bandwidth makes it free. Restoring a 285MB
+# tarball was slower than just fetching. The real cold cost is COMPILATION, which
+# is what sccache addresses.
 rp_bootstrap() { # $1=git ref (optional)
   local ref="${1:-main}" s3=0
   rp_s3_load && s3=1
@@ -458,9 +455,9 @@ set -uo pipefail
 export CARGO_HOME="\${CARGO_HOME:-/usr/local/cargo}"
 
 # Pod-side tools the dev loop needs and the CI image has no reason to carry:
-# zstd backs the prewarm tarball, rsync the working-tree sync, tmux the detached
-# jobs that outlive the SSH session.
-yum install -y zstd rsync tmux >/dev/null 2>&1 || echo "warn: pod tool install failed"
+# rsync for the working-tree sync, tmux for detached jobs that outlive the SSH
+# session.
+yum install -y rsync tmux >/dev/null 2>&1 || echo "warn: pod tool install failed"
 
 # One re-sourceable file that makes any later shell correct. The container's
 # Dockerfile ENV is captured here rather than re-derived from /proc/1/environ at
@@ -474,11 +471,6 @@ if [ "${s3}" = "1" ]; then
   export AWS_SECRET_ACCESS_KEY='${RP_S3_SECRET_ACCESS_KEY:-}'
   export S3_ENDPOINT='${RP_S3_ENDPOINT:-}'
   export S3_BUCKET='${RP_S3_BUCKET:-}'
-
-  if ! command -v s5cmd >/dev/null 2>&1; then
-    curl -fsSL "https://github.com/peak/s5cmd/releases/download/v${RP_S5CMD_VERSION}/s5cmd_${RP_S5CMD_VERSION}_Linux-64bit.tar.gz" \
-      | tar -xz -C /usr/local/bin s5cmd 2>/dev/null || echo "warn: s5cmd install failed — running cold"
-  fi
 
   # sccache reads the compile cache straight from the object store, so a pod in
   # any datacenter warms up. Wrapper is already set repo-wide in .cargo/config.toml.
@@ -516,56 +508,6 @@ if [ ! -d /root/jammi-ai/.git ]; then
 fi
 cd /root/jammi-ai && git fetch --all --quiet && git checkout --quiet "${ref}" && git pull --quiet --ff-only 2>/dev/null
 
-# Restore the registry only when this exact Cargo.lock has a prewarm object.
-if [ "${s3}" = "1" ] && command -v s5cmd >/dev/null 2>&1; then
-  KEY="registry/\$(sha256sum Cargo.lock | cut -c1-16).tar.zst"
-  # ABSENT and UNREADABLE are different and must not both read as "cold". RunPod's
-  # S3 surface returns intermittent 403s for a few minutes after a multipart
-  # upload, so a single failed read is not evidence the prewarm does not exist —
-  # reporting it as one silently costs every later pod a full cold fetch, with a
-  # message saying everything is normal.
-  if s5cmd --endpoint-url "\$S3_ENDPOINT" ls "s3://\$S3_BUCKET/\$KEY" >/dev/null 2>&1; then
-    restored=0
-    for attempt in 1 2 3; do
-      # pipefail: without it the pipeline's status is tar's, so a failed download
-      # feeding an empty stream could still look like a successful restore.
-      if { set -o pipefail
-           s5cmd --endpoint-url "\$S3_ENDPOINT" cat "s3://\$S3_BUCKET/\$KEY" \
-             | zstd -d -c | tar -x -C "\$CARGO_HOME"; } >/dev/null 2>&1; then
-        restored=1; break
-      fi
-      sleep 10
-    done
-    if [ "\$restored" = "1" ]; then
-      echo "registry prewarm restored (\$KEY, \$(du -sh "\$CARGO_HOME/registry" 2>/dev/null | cut -f1))"
-    else
-      echo "::warning::prewarm \$KEY EXISTS but could not be read after 3 attempts — running cold"
-    fi
-  else
-    echo "no registry prewarm for this Cargo.lock yet — cold fetch (publish one with 'gpu-dev.sh prewarm')"
-  fi
-fi
 echo "bootstrap complete: \$(cd /root/jammi-ai && git rev-parse --short HEAD)"
-EOF
-}
-
-# Build and publish the registry prewarm object for the pod's current Cargo.lock.
-# Idempotent: overwrites the key for that lock hash.
-rp_prewarm_publish() {
-  rp_s3_load || { echo "::error::no object store configured (${RP_S3_CONF}); nothing to publish"; return 1; }
-  rp_run_remote <<EOF
-set -uo pipefail
-[ -f /root/.jammi_env ] && . /root/.jammi_env
-export CARGO_HOME="\${CARGO_HOME:-/usr/local/cargo}"
-cd /root/jammi-ai || exit 1
-cargo fetch --locked || exit 1
-KEY="registry/\$(sha256sum Cargo.lock | cut -c1-16).tar.zst"
-# Compress through the zstd binary rather than tar's --zstd: the CI image is
-# AlmaLinux 8, whose GNU tar is 1.30, and --zstd only exists from 1.31.
-command -v zstd >/dev/null 2>&1 || { echo "::error::zstd missing on the pod"; exit 1; }
-set -o pipefail
-tar -c -C "\$CARGO_HOME" registry | zstd -T0 -3 -c \
-  | s5cmd --endpoint-url '${RP_S3_ENDPOINT}' pipe "s3://${RP_S3_BUCKET}/\$KEY" || exit 1
-echo "published \$KEY (\$(s5cmd --endpoint-url '${RP_S3_ENDPOINT}' ls "s3://${RP_S3_BUCKET}/\$KEY" | awk '{print \$3}') bytes)"
 EOF
 }

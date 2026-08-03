@@ -36,13 +36,13 @@ mkdir -p ~/.config/runpod && printf '%s' 'YOUR_KEY' > ~/.config/runpod/key && ch
 
 (CI reads the same key from the `RUNPOD_API_KEY` GitHub Actions secret.)
 
-The build-substrate cache is **optional** — without it everything still works,
-just cold. To enable it, create a network volume plus an S3 API key (RunPod →
-Settings → S3 API Keys) and write:
+The shared **sccache** compile cache is optional — without it everything still
+works, just cold. To enable it, create a network volume plus an S3 API key
+(RunPod → Settings → S3 API Keys) and write:
 
 ```bash
 cat > ~/.config/runpod/s3 <<'EOF'
-RP_S3_ENDPOINT=https://s3api-us-ks-2.runpod.io
+RP_S3_ENDPOINT=https://s3api-us-ne-1.runpod.io
 RP_S3_BUCKET=<network-volume-id>
 RP_S3_ACCESS_KEY_ID=user_...
 RP_S3_SECRET_ACCESS_KEY=rps_...
@@ -50,11 +50,26 @@ EOF
 chmod 600 ~/.config/runpod/s3
 ```
 
-Then publish the cargo-registry prewarm once per `Cargo.lock` change:
+The volume is never attached to a pod, so its datacenter only has to serve the
+S3 API — and **RunPod's documented list of S3 datacenters is not accurate**.
+Probe before choosing one; a live endpoint answers `401`, a dead one `530` or
+nothing:
 
 ```bash
-ci/scripts/gpu-dev.sh prewarm a100
+curl -s -o /dev/null -w '%{http_code}\n' https://s3api-us-ne-1.runpod.io/
 ```
+
+`RP_S3_REGION` is derived from the endpoint. RunPod signs SigV4 against the
+datacenter and rejects `auto` outright, which — because `rustc-wrapper` is
+sccache repo-wide — would otherwise stop every cargo command on the pod dead.
+Bootstrap proves the sccache server starts against the bucket and falls back to
+a local disk cache if it cannot.
+
+The cargo **registry** is deliberately not cached. It looks like the expensive
+part, since the CI image wipes `/usr/local/cargo/registry`, but a cold
+`cargo fetch --locked` measures **9s for 868 crates** on a RunPod host —
+datacenter bandwidth makes it free. Compilation is the real cost, and that is
+what sccache holds.
 
 `gpu-dev.sh` generates its own SSH key — nothing to register.
 

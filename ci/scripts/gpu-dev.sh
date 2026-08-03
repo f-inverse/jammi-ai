@@ -4,11 +4,15 @@
 # Two lifetimes, one substrate:
 #   * `shell` is a throwaway debug pod — it dies when you exit (the CI default).
 #   * `up` starts a named session whose pod SURVIVES disconnect, so a fine-tune,
-#     eval or bench keeps running after you close the terminal. Such a pod is
-#     always armed with a TTL reaper; nothing else would ever stop the meter.
+#     eval or bench keeps running after you close the terminal.
 #
-# The pod itself is disposable in both cases (volumeInGb 0). What persists lives
-# in an S3-compatible object store — see `docs/maintainer/dev-gpu.md`.
+# Every pod carries an RP_TTL_HOURS deadline in its own entrypoint regardless of
+# lifetime, and `reap` sweeps anything that outlives it.
+#
+# The pod itself is disposable (volumeInGb 0). The only thing that persists is
+# the sccache compile cache in an S3-compatible object store — the cargo registry
+# is deliberately NOT cached; fetching it measures 9s on a RunPod host.
+# See `docs/maintainer/dev-gpu.md`.
 #
 # Usage:
 #   gpu-dev.sh shell   [arch]              throwaway shell; pod dies on exit
@@ -20,7 +24,6 @@
 #   gpu-dev.sh pull    [session] <path>    rsync <path> back FROM the pod
 #   gpu-dev.sh down    [session]           terminate the pod, forget the session
 #   gpu-dev.sh ls                          list sessions
-#   gpu-dev.sh prewarm [arch]              publish the cargo-registry prewarm
 #
 # arch: a100 (default) | l40s | h100 | a40 | l4
 # Env: RUNPOD_API_KEY (or ~/.config/runpod/key), RP_IMAGE, RP_TTL_HOURS (8).
@@ -46,7 +49,6 @@ gpu-dev.sh — GPU development on RunPod
   ls                          list sessions
   reap    [hours]             terminate orphaned pods past their own deadline
                               ([hours] force-reaps everything older than that)
-  prewarm [arch]              publish the cargo-registry prewarm object
 
 arch: a100 (default) | l40s | h100 | a40 | l4
 Sessions are named after the arch; RP_SESSION overrides.
@@ -84,14 +86,14 @@ ARG="${1:-}"; [ $# -gt 0 ] && shift
 # `up a100` … `attach a100` … `down a100`. RP_SESSION overrides for a second pod
 # of the same arch.
 case "$CMD" in
-  shell|up|prewarm) ARCH="${ARG:-a100}"; SESSION="${RP_SESSION:-$ARCH}" ;;
-  *)                SESSION="${RP_SESSION:-${ARG:-a100}}"; ARCH="" ;;
+  shell|up) ARCH="${ARG:-a100}"; SESSION="${RP_SESSION:-$ARCH}" ;;
+  *)        SESSION="${RP_SESSION:-${ARG:-a100}}"; ARCH="" ;;
 esac
 
-# `shell` and `prewarm` are throwaway: no named session, so the EXIT trap wipes
+# `shell` is throwaway: no named session, so the EXIT trap wipes
 # the temp dir and terminates the pod.
 case "$CMD" in
-  shell|prewarm) : ;;
+  shell) : ;;
   *) export RP_SESSION="$SESSION" ;;
 esac
 
@@ -144,7 +146,7 @@ case "$CMD" in
     echo "=== session '${SESSION}' up on ${RP_HOST}:${RP_PORT} (pod ${RP_POD_ID}) ==="
     echo "    attach:  $(basename "$0") attach ${SESSION}"
     echo "    run job: $(basename "$0") run ${SESSION} cargo test -p jammi-ai --features cuda,live-gpu-tests"
-    echo "    STOP:    $(basename "$0") down ${SESSION}      # else the reaper does it in ${RP_TTL_HOURS}h"
+    echo "    STOP:    $(basename "$0") down ${SESSION}      # else it self-terminates in ${RP_TTL_HOURS}h"
     ;;
 
   attach)
@@ -205,18 +207,6 @@ EOF
     fi
     RP_POD_ID=""   # already gone; keep the EXIT trap from double-terminating
     rp_session_forget
-    ;;
-
-  prewarm)
-    rp_s3_load || { echo "::error::no object store configured at ${RP_S3_CONF} — see docs/maintainer/dev-gpu.md"; exit 1; }
-    rp_init
-    echo "=== provisioning ${ARCH} to build the prewarm ==="
-    rp_deploy_arch "$ARCH" || exit $?
-    rp_bootstrap || { echo "::error::bootstrap failed — no prewarm published"; exit 1; }
-    # Propagate the failure. Reporting success on a prewarm that never uploaded
-    # leaves every later pod silently cold with nothing to show why.
-    rp_prewarm_publish || { echo "::error::prewarm FAILED — nothing was published"; exit 1; }
-    echo "=== done — terminating pod (trap) ==="
     ;;
 
   *) echo "unknown command: $CMD"; usage 2 ;;

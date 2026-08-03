@@ -69,7 +69,17 @@ The cargo **registry** is deliberately not cached. It looks like the expensive
 part, since the CI image wipes `/usr/local/cargo/registry`, but a cold
 `cargo fetch --locked` measures **9s for 868 crates** on a RunPod host —
 datacenter bandwidth makes it free. Compilation is the real cost, and that is
-what sccache holds.
+what sccache holds. Measured on two separate A40 pods, `cargo build -p jammi-db`:
+
+| pod | wall | cache hits | misses |
+|-----|------|-----------|--------|
+| 1 — cold, populating | 188s | 0 | 504 |
+| 2 — reading pod 1's cache | 47s | 504 | 0 |
+
+A 4× cut with a 100% hit rate across two pods that never met, which is the
+property the whole ephemeral-pod design rests on. Expect a smaller ratio on a
+full CUDA build — nvcc output is not rustc output — but the mechanism is what
+matters: the cache survives the machine.
 
 `gpu-dev.sh` generates its own SSH key — nothing to register.
 

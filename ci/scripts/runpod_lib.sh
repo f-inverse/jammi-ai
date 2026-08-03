@@ -519,14 +519,30 @@ cd /root/jammi-ai && git fetch --all --quiet && git checkout --quiet "${ref}" &&
 # Restore the registry only when this exact Cargo.lock has a prewarm object.
 if [ "${s3}" = "1" ] && command -v s5cmd >/dev/null 2>&1; then
   KEY="registry/\$(sha256sum Cargo.lock | cut -c1-16).tar.zst"
-  # Whole pipeline quiet: on a cache MISS zstd prints "unexpected end of file",
-  # which reads as a fault when it is the ordinary first-run path. A spurious
-  # error in a working path is how people learn to ignore real ones.
-  if { s5cmd --endpoint-url "\$S3_ENDPOINT" cat "s3://\$S3_BUCKET/\$KEY" \
-       | zstd -d -c | tar -x -C "\$CARGO_HOME"; } >/dev/null 2>&1; then
-    echo "registry prewarm restored (\$KEY)"
+  # ABSENT and UNREADABLE are different and must not both read as "cold". RunPod's
+  # S3 surface returns intermittent 403s for a few minutes after a multipart
+  # upload, so a single failed read is not evidence the prewarm does not exist —
+  # reporting it as one silently costs every later pod a full cold fetch, with a
+  # message saying everything is normal.
+  if s5cmd --endpoint-url "\$S3_ENDPOINT" ls "s3://\$S3_BUCKET/\$KEY" >/dev/null 2>&1; then
+    restored=0
+    for attempt in 1 2 3; do
+      # pipefail: without it the pipeline's status is tar's, so a failed download
+      # feeding an empty stream could still look like a successful restore.
+      if { set -o pipefail
+           s5cmd --endpoint-url "\$S3_ENDPOINT" cat "s3://\$S3_BUCKET/\$KEY" \
+             | zstd -d -c | tar -x -C "\$CARGO_HOME"; } >/dev/null 2>&1; then
+        restored=1; break
+      fi
+      sleep 10
+    done
+    if [ "\$restored" = "1" ]; then
+      echo "registry prewarm restored (\$KEY, \$(du -sh "\$CARGO_HOME/registry" 2>/dev/null | cut -f1))"
+    else
+      echo "::warning::prewarm \$KEY EXISTS but could not be read after 3 attempts — running cold"
+    fi
   else
-    echo "no registry prewarm for this Cargo.lock — cold fetch (run 'gpu-dev.sh prewarm' to publish one)"
+    echo "no registry prewarm for this Cargo.lock yet — cold fetch (publish one with 'gpu-dev.sh prewarm')"
   fi
 fi
 echo "bootstrap complete: \$(cd /root/jammi-ai && git rev-parse --short HEAD)"

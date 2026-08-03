@@ -5,9 +5,12 @@
 #
 #   * lifetime — terminate-on-exit (the default) or survive-exit (RP_KEEP=1).
 #                A surviving pod is what lets a fine-tune / eval / bench outlive
-#                the SSH session. It is always paired with a pod-side TTL reaper,
-#                because once the EXIT trap is disarmed nothing else stops the
-#                meter.
+#                the SSH session.
+#
+# EVERY pod — CI, throwaway, or surviving — carries a hard RP_TTL_HOURS deadline
+# baked into its entrypoint at deploy time. The EXIT trap is best-effort only: a
+# SIGKILLed process (a cancelled GitHub run, a dropped laptop) never runs it, and
+# a pod with no other deadline then bills until the account empties.
 #   * state    — the pod is always disposable (volumeInGb 0). Durable state lives
 #                in an S3-compatible object store that rp_bootstrap rehydrates.
 #                A RunPod network volume is deliberately NEVER attached: an
@@ -29,7 +32,7 @@
 #                 RP_SESSION_ROOT so a *different* terminal can reattach. Unset =
 #                 throwaway temp dir, wiped on exit.
 #   RP_KEEP       1 = leave the pod running when this process exits.
-#   RP_TTL_HOURS  reaper deadline for RP_KEEP pods (default 8).
+#   RP_TTL_HOURS  hard deadline baked into every pod at deploy (default 8).
 # Sets globals: RP_POD_ID, RP_HOST, RP_PORT. Installs an EXIT trap for teardown.
 
 : "${RUNPOD_API_KEY:?RUNPOD_API_KEY must be set (GitHub secret)}"
@@ -78,7 +81,7 @@ rp_terminate() { # $1=podId
 rp_cleanup() {
   if [ -n "$RP_POD_ID" ]; then
     if [ "$RP_KEEP" = "1" ]; then
-      echo "::notice::pod ${RP_POD_ID} left running (reaper terminates it in ≤${RP_TTL_HOURS}h)"
+      echo "::notice::pod ${RP_POD_ID} left running (self-terminates in ≤${RP_TTL_HOURS}h)"
     else
       rp_terminate "$RP_POD_ID"
       echo "::notice::terminated RunPod pod ${RP_POD_ID}"
@@ -158,12 +161,22 @@ rp_s3_load() {
 }
 
 _rp_deploy_payload() { # $1=cloudType $2=gpuTypeId
-  python3 - "$1" "$2" "$RP_IMAGE" "$RP_PUBKEY" <<'PY'
+  python3 - "$1" "$2" "$RP_IMAGE" "$RP_PUBKEY" "$(( RP_TTL_HOURS * 3600 ))" <<'PY'
 import json, sys
-cloud, gpu, image, pub = sys.argv[1:5]
+cloud, gpu, image, pub, ttl = sys.argv[1:6]
+# The deadline is part of the pod's own entrypoint, so it exists from the moment
+# the container starts. It CANNOT be installed over SSH after the fact: the
+# window between "pod rented" and "SSH reachable" is minutes long, and a runner
+# killed inside it (GitHub cancels in-progress runs — gpu-prove.yml sets
+# cancel-in-progress) never runs its EXIT trap. That is exactly how an A100 was
+# orphaned for seven days. runpodctl uses the pod-scoped credential RunPod
+# injects; `kill 1` stops the container if it cannot be installed.
+watchdog = ("( curl -fsSL cli.runpod.net 2>/dev/null | bash >/dev/null 2>&1; "
+            "sleep %s; runpodctl remove pod \"$RUNPOD_POD_ID\" 2>/dev/null || kill 1 ) & " % ttl)
 setup = ("yum install -y openssh-server openssh-clients >/dev/null 2>&1; ssh-keygen -A; "
          "mkdir -p /root/.ssh; printf '%s\\n' \"$PUBLIC_KEY\" > /root/.ssh/authorized_keys; "
-         "chmod 700 /root/.ssh; chmod 600 /root/.ssh/authorized_keys; /usr/sbin/sshd -D")
+         "chmod 700 /root/.ssh; chmod 600 /root/.ssh/authorized_keys; "
+         + watchdog + "/usr/sbin/sshd -D")
 inp = {"cloudType": cloud, "gpuCount": 1, "gpuTypeId": gpu, "name": "jammi-gpu",
        "imageName": image, "containerDiskInGb": 60, "volumeInGb": 0, "ports": "22/tcp",
        "dockerArgs": "bash -c '%s'" % setup, "env": [{"key": "PUBLIC_KEY", "value": pub}]}
@@ -279,21 +292,38 @@ rp_run_remote() {
 # hardware. `kill 1` is the fallback for an image where runpodctl cannot install:
 # stopping the container is strictly better than billing until someone notices.
 # This is a wall-clock ceiling, not idle detection — an idle pod bills until TTL.
-# The teardown verb differs across runpodctl generations (`remove pod` vs
-# `pod delete`), so both are attempted before the fallback. Guessing one and
-# being wrong is silent and expensive: the pod simply bills until someone looks.
-rp_reap() {
-  local secs=$(( RP_TTL_HOURS * 3600 ))
-  rp_run_remote <<EOF
-set -uo pipefail
-command -v runpodctl >/dev/null 2>&1 || curl -fsSL cli.runpod.net 2>/dev/null | bash >/dev/null 2>&1 || true
-command -v runpodctl >/dev/null 2>&1 || echo "warn: runpodctl unavailable — reaper will fall back to stopping the container"
-nohup setsid bash -c 'sleep ${secs}
-  runpodctl remove pod "\$RUNPOD_POD_ID" 2>/dev/null \
-    || runpodctl pod delete "\$RUNPOD_POD_ID" 2>/dev/null \
-    || kill 1' >/dev/null 2>&1 &
-echo "reaper armed: pod self-terminates in ${RP_TTL_HOURS}h"
-EOF
+# Terminate orphaned pods. The deploy-time watchdog is the primary deadline;
+# this is the backstop for a pod whose container never got far enough to arm it,
+# and the only thing that can clean up after a runner killed during the
+# minutes-long gap between "pod rented" and "pod reachable".
+#
+# Only ever touches pods this tooling created (name "jammi-gpu"): anything else
+# in the account is somebody's deliberate work and is never in scope. A stopped
+# jammi pod is always garbage — the tooling terminates, it never stops.
+rp_sweep() { # $1=max age hours (default RP_TTL_HOURS)
+  local max_h="${1:-$RP_TTL_HOURS}" victims id age n=0
+  victims="$(rp_gql '{"query":"query{ myself{ pods{ id name desiredStatus runtime{ uptimeInSeconds } } } }"}' \
+    | python3 -c "
+import sys, json
+max_s = $max_h * 3600
+d = json.load(sys.stdin)
+pods = ((d.get('data') or {}).get('myself') or {}).get('pods') or []
+for p in pods:
+    if p.get('name') != 'jammi-gpu':
+        continue
+    rt = p.get('runtime') or {}
+    up = rt.get('uptimeInSeconds') or 0
+    if p.get('desiredStatus') != 'RUNNING' or up > max_s:
+        print(p['id'], up)
+")"
+  [ -n "$victims" ] || { echo "sweep: no orphaned jammi pods older than ${max_h}h"; return 0; }
+  while read -r id age; do
+    [ -n "$id" ] || continue
+    rp_terminate "$id"
+    echo "::warning::swept orphaned pod ${id} (up ${age}s, limit $(( max_h * 3600 ))s)"
+    n=$(( n + 1 ))
+  done <<< "$victims"
+  echo "sweep: terminated ${n} orphaned pod(s)"
 }
 
 # Make the pod ready to build jammi: import the container ENV (already done by

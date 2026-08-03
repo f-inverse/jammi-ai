@@ -89,6 +89,7 @@ ci/scripts/gpu-dev.sh attach a100                 # shell in, from any terminal
 ci/scripts/gpu-dev.sh pull a100 target/nextest    # bring artifacts back
 ci/scripts/gpu-dev.sh down a100                   # terminate
 ci/scripts/gpu-dev.sh ls                          # what's still running
+ci/scripts/gpu-dev.sh reap                        # kill anything orphaned
 ```
 
 `run` launches under tmux and returns immediately, so the job outlives both the
@@ -100,14 +101,38 @@ architecture and would poison the pod's.
 
 ## Cost guard
 
-A surviving pod has no EXIT trap, so nothing would otherwise stop the meter.
-Every `up` pod is therefore armed with a reaper that self-terminates it after
-`RP_TTL_HOURS` (default 8) using the pod-scoped credential RunPod injects — your
-account API key never lands on rented hardware.
+**The EXIT trap is best-effort and must never be the only thing stopping the
+meter.** A SIGKILLed process never runs it — a cancelled GitHub run (this
+workflow sets `cancel-in-progress`), a dropped laptop, a force-quit terminal. On
+2026-07-24 a superseded `gpu-prove` run was cancelled 92 seconds in, while it was
+still waiting for its pod's SSH to come up. The trap never fired, and the A100 it
+had just rented ran for seven days.
 
-This is a **wall-clock ceiling, not idle detection**: a pod you stop using still
-bills until its TTL expires. Run `down` when you're finished; the reaper is a
-backstop for the times you forget, not a substitute for it.
+Two guards, because neither alone is sufficient:
+
+1. **A deadline baked into the pod's entrypoint at deploy.** Every pod — CI,
+   throwaway, or surviving — self-terminates after `RP_TTL_HOURS` (default 8; the
+   CI prove lane uses 3). It is part of the container's own command, so it is
+   running from the moment the pod exists. It deliberately is *not* installed
+   over SSH: the gap between "pod rented" and "pod reachable" is minutes long,
+   and that gap is exactly where the orphan above was created. The pod uses the
+   pod-scoped credential RunPod injects, so your account API key never lands on
+   rented hardware.
+
+2. **A sweep**, for a pod whose container never got far enough to arm itself:
+
+   ```bash
+   ci/scripts/gpu-dev.sh reap        # terminate any jammi pod past its deadline
+   ci/scripts/gpu-dev.sh reap 2      # ...past 2 hours
+   ```
+
+   The prove lane runs this before renting anything, so an orphan is bounded by
+   the gap to the next prove run. It only ever touches pods named `jammi-gpu`;
+   anything else in the account is left alone.
+
+Both are **wall-clock ceilings, not idle detection** — a pod you stop using bills
+until its deadline. Run `down` when you're finished; the guards are for the times
+something kills the process before you can.
 
 ```bash
 RP_TTL_HOURS=2 ci/scripts/gpu-dev.sh up a100
@@ -127,5 +152,6 @@ are always throwaway and always terminate.
   cloud tiers and PCIe/SXM variants; if all are exhausted it exits `75`. Retry.
 - Pods below NVIDIA driver r560 are rejected and skipped: they cannot JIT the
   image's CUDA 12.6 PTX, so every model load would fail the #304 startup floor.
-- If a run is killed uncleanly, `gpu-dev.sh ls` and the RunPod console will show
-  any straggler.
+- If a run is killed uncleanly, `gpu-dev.sh reap` terminates the straggler;
+  `gpu-dev.sh ls` shows only sessions this machine started, so it will not see a
+  pod orphaned by a CI run or another checkout.

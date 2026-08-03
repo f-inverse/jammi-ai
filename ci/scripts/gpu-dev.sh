@@ -44,6 +44,7 @@ gpu-dev.sh — GPU development on RunPod
   pull    [session] <path>    rsync <path> back FROM the pod
   down    [session]           terminate the pod, forget the session
   ls                          list sessions
+  reap    [hours]             terminate ANY orphaned jammi pod past its deadline
   prewarm [arch]              publish the cargo-registry prewarm object
 
 arch: a100 (default) | l40s | h100 | a40 | l4
@@ -56,16 +57,23 @@ USAGE
 CMD="${1:-}"; [ $# -gt 0 ] && shift
 case "$CMD" in ""|-h|--help|help) usage 0 ;; esac
 
-# `ls` needs the session root but no pod, and sourcing the lib installs an EXIT
-# trap — harmless, but resolve the trivial command first.
-if [ "$CMD" = "ls" ]; then
-  RP_SESSION_ROOT="${RP_SESSION_ROOT:-${HOME}/.config/runpod/sessions}"
-  # shellcheck source=ci/scripts/runpod_lib.sh
-  source "$DIR/runpod_lib.sh"
-  printf '%-16s %-20s %s\n' SESSION POD ARCH@HOST
-  rp_session_list
-  exit 0
-fi
+# `ls` and `reap` are account-level: no session, no arch, no pod. Resolve them
+# before the session/arch argument parsing below, which does not apply to them.
+case "$CMD" in
+  ls)
+    # shellcheck source=ci/scripts/runpod_lib.sh
+    source "$DIR/runpod_lib.sh"
+    printf '%-16s %-20s %s\n' SESSION POD ARCH@HOST
+    rp_session_list
+    exit 0
+    ;;
+  reap)
+    # shellcheck source=ci/scripts/runpod_lib.sh
+    source "$DIR/runpod_lib.sh"
+    rp_sweep "${1:-$RP_TTL_HOURS}"
+    exit $?
+    ;;
+esac
 
 ARG="${1:-}"; [ $# -gt 0 ] && shift
 
@@ -124,10 +132,8 @@ case "$CMD" in
     rp_init
     echo "=== provisioning ${ARCH} (image: ${RP_IMAGE}) ==="
     rp_deploy_arch "$ARCH" || exit $?
-    # Arm the reaper BEFORE disarming teardown: between those two points is the
-    # only window in which a pod could be orphaned with no deadline.
-    echo "=== arming ${RP_TTL_HOURS}h reaper ==="
-    rp_reap
+    # No separate arming step: the ${RP_TTL_HOURS}h deadline is baked into the
+    # pod's entrypoint at deploy, so it is already running.
     echo "=== bootstrapping ==="
     rp_bootstrap || { echo "::error::bootstrap failed — terminating pod"; exit 1; }
     rp_keep

@@ -2,44 +2,115 @@
 
 jammi's default `cargo test` is CPU-hermetic; the GPU path is exercised only by
 the gated `live-gpu-tests` lane. You don't need a local GPU — rent one per task
-on RunPod, and let it auto-terminate.
+on RunPod through `ci/scripts/gpu-dev.sh`.
+
+A pod has two independent axes:
+
+- **lifetime** — `shell` gives a throwaway pod that dies when you exit. `up`
+  starts a named session whose pod *survives* disconnect, so a fine-tune, eval or
+  bench keeps running after you close the terminal.
+- **state** — the pod itself is always disposable. Anything worth keeping lives
+  either in git (your working tree) or in an S3-compatible object store (the
+  build substrate). Nothing durable is ever stored on the pod.
+
+## Why no network volume is attached
+
+RunPod network volumes are Secure-Cloud-only and locked to a single datacenter,
+and can only be attached at deploy time. Attaching one would delete both failover
+dimensions in `runpod_lib.sh` — cloud tier and PCIe/SXM variant — and those exist
+precisely because A100 supply is intermittent. Pinning the pod to one datacenter
+trades away availability for persistence we can get more cheaply.
+
+So the pod stays free to land anywhere, and durable state is made
+location-independent instead. A network volume is still the natural *backing
+store* for that object storage, reached over its S3 endpoint — it is simply never
+mounted on a pod.
 
 ## One-time setup
 
-- A RunPod API key (RunPod → Settings → API Keys). Store it locally:
-  ```bash
-  mkdir -p ~/.config/runpod && printf '%s' 'YOUR_KEY' > ~/.config/runpod/key && chmod 600 ~/.config/runpod/key
-  ```
-  (CI reads the same key from the `RUNPOD_API_KEY` GitHub Actions secret.)
-- `ci/scripts/gpu-shell.sh` generates its own ephemeral SSH key per run — nothing
-  to register.
-
-## Interactive debugging — `gpu-shell`
-
-Drop into a shell on a real GPU of the arch a ticket needs; the pod is
-**terminated when you exit**:
+A RunPod API key (RunPod → Settings → API Keys):
 
 ```bash
-ci/scripts/gpu-shell.sh a100     # sm_80 — the #277 floor (default)
-ci/scripts/gpu-shell.sh l40s     # sm_89 (Ada) — fp8 work (#308)
-ci/scripts/gpu-shell.sh h100     # sm_90 (Hopper)
-ci/scripts/gpu-shell.sh a40      # sm_86 (Ampere workstation)
+mkdir -p ~/.config/runpod && printf '%s' 'YOUR_KEY' > ~/.config/runpod/key && chmod 600 ~/.config/runpod/key
 ```
 
-The pod boots the CUDA CI image (full toolchain). Inside, load the container's
-build env (an SSH shell doesn't inherit Dockerfile `ENV`), then build/run:
+(CI reads the same key from the `RUNPOD_API_KEY` GitHub Actions secret.)
+
+The build-substrate cache is **optional** — without it everything still works,
+just cold. To enable it, create a network volume plus an S3 API key (RunPod →
+Settings → S3 API Keys) and write:
 
 ```bash
-while IFS= read -r -d '' e; do export "$e"; done < /proc/1/environ
-git clone --depth 1 https://github.com/f-inverse/jammi-ai && cd jammi-ai
-cargo test -p jammi-ai --features cuda,live-gpu-tests --test gpu_capability -- --nocapture --test-threads=1
+cat > ~/.config/runpod/s3 <<'EOF'
+RP_S3_ENDPOINT=https://s3api-us-ks-2.runpod.io
+RP_S3_BUCKET=<network-volume-id>
+RP_S3_ACCESS_KEY_ID=user_...
+RP_S3_SECRET_ACCESS_KEY=rps_...
+EOF
+chmod 600 ~/.config/runpod/s3
 ```
+
+Then publish the cargo-registry prewarm once per `Cargo.lock` change:
+
+```bash
+ci/scripts/gpu-dev.sh prewarm a100
+```
+
+`gpu-dev.sh` generates its own SSH key — nothing to register.
+
+## Interactive debugging
+
+```bash
+ci/scripts/gpu-dev.sh shell a100     # sm_80 — the #277 floor (default)
+ci/scripts/gpu-dev.sh shell l40s     # sm_89 (Ada) — fp8 work (#308)
+ci/scripts/gpu-dev.sh shell h100     # sm_90 (Hopper)
+ci/scripts/gpu-dev.sh shell a40      # sm_86 (Ampere workstation)
+```
+
+The pod boots the CUDA CI image, clones the repo, restores the cache, and drops
+you into a shell in the checkout with the container's build environment already
+loaded. It is terminated when you exit.
 
 To reproduce the **shipped runtime image** (e.g. the uid-65532 JIT-cache case in
 #305) instead of the toolchain image:
 
 ```bash
-RP_IMAGE=nvidia/cuda:12.6.3-runtime-ubi8 ci/scripts/gpu-shell.sh a100
+RP_IMAGE=nvidia/cuda:12.6.3-runtime-ubi8 ci/scripts/gpu-dev.sh shell a100
+```
+
+## Long-running work
+
+```bash
+ci/scripts/gpu-dev.sh up a100                     # session survives disconnect
+ci/scripts/gpu-dev.sh push a100                   # send uncommitted work
+ci/scripts/gpu-dev.sh run a100 cargo test -p jammi-ai --features cuda,live-gpu-tests
+ci/scripts/gpu-dev.sh logs a100                   # follow it (Ctrl-C is safe)
+ci/scripts/gpu-dev.sh attach a100                 # shell in, from any terminal
+ci/scripts/gpu-dev.sh pull a100 target/nextest    # bring artifacts back
+ci/scripts/gpu-dev.sh down a100                   # terminate
+ci/scripts/gpu-dev.sh ls                          # what's still running
+```
+
+`run` launches under tmux and returns immediately, so the job outlives both the
+command and your SSH connection. Sessions are named after the arch; set
+`RP_SESSION` for a second pod of the same one.
+
+`push` deliberately excludes `target/` — your host build output is the wrong
+architecture and would poison the pod's.
+
+## Cost guard
+
+A surviving pod has no EXIT trap, so nothing would otherwise stop the meter.
+Every `up` pod is therefore armed with a reaper that self-terminates it after
+`RP_TTL_HOURS` (default 8) using the pod-scoped credential RunPod injects — your
+account API key never lands on rented hardware.
+
+This is a **wall-clock ceiling, not idle detection**: a pod you stop using still
+bills until its TTL expires. Run `down` when you're finished; the reaper is a
+backstop for the times you forget, not a substitute for it.
+
+```bash
+RP_TTL_HOURS=2 ci/scripts/gpu-dev.sh up a100
 ```
 
 ## Automated proof — CI
@@ -47,11 +118,14 @@ RP_IMAGE=nvidia/cuda:12.6.3-runtime-ubi8 ci/scripts/gpu-shell.sh a100
 The `gpu-prove` workflow (`_gpu-prove-gate.yml`) runs `grpc_embedding_gpu` +
 `gpu_capability` on a real A100 via the same shared primitive
 (`ci/scripts/runpod_lib.sh`), gating every CUDA release (build → prove →
-promote). Trigger it per-PR with the `run-gpu` label, or it runs nightly.
+promote). Trigger it per-PR with the `run-gpu` label, or it runs nightly. CI pods
+are always throwaway and always terminate.
 
 ## Notes
 
-- **A100 capacity on RunPod is intermittent** — `gpu-shell` fails over across
+- **A100 capacity on RunPod is intermittent** — deployment fails over across
   cloud tiers and PCIe/SXM variants; if all are exhausted it exits `75`. Retry.
-- Every pod is terminated on exit (an `EXIT` trap in `runpod_lib.sh`). If a run
-  is killed uncleanly, check for stragglers in the RunPod console.
+- Pods below NVIDIA driver r560 are rejected and skipped: they cannot JIT the
+  image's CUDA 12.6 PTX, so every model load would fail the #304 startup floor.
+- If a run is killed uncleanly, `gpu-dev.sh ls` and the RunPod console will show
+  any straggler.

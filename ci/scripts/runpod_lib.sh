@@ -1,14 +1,35 @@
 #!/usr/bin/env bash
 # Shared RunPod GPU primitive — one seam for every caller.
 #
-# Deploys a live A100 (sm_80) with two failover dimensions (capacity +
-# liveness), runs a remote job on it importing the container's real ENV, and
-# ALWAYS terminates the pod on exit. Sourced by:
-#   * runpod_gpu_prove.sh          — build-from-source + run the gated GPU suites
-#   * runpod_gpu_smoke_artifact.sh — run a prebuilt CUDA artifact on the device
+# A pod is described by two independent axes:
+#
+#   * lifetime — terminate-on-exit (the default) or survive-exit (RP_KEEP=1).
+#                A surviving pod is what lets a fine-tune / eval / bench outlive
+#                the SSH session. It is always paired with a pod-side TTL reaper,
+#                because once the EXIT trap is disarmed nothing else stops the
+#                meter.
+#   * state    — the pod is always disposable (volumeInGb 0). Durable state lives
+#                in an S3-compatible object store that rp_bootstrap rehydrates.
+#                A RunPod network volume is deliberately NEVER attached: an
+#                attached volume is Secure-Cloud-only and pinned to a single
+#                datacenter, which would delete both failover dimensions below —
+#                and intermittent A100 supply is precisely why they exist.
+#
+# Deploys a live GPU pod with two failover dimensions (capacity + liveness), runs
+# a remote job on it importing the container's real ENV, and terminates the pod
+# on exit unless asked to keep it. Sourced by:
+#   * runpod_gpu_prove.sh — build-from-source + run the gated GPU suites (CI)
+#   * gpu-dev.sh          — the interactive / long-running dev CLI
 #
 # Requires env: RUNPOD_API_KEY.
-# Optional env: RP_IMAGE (pod image), RP_TIMEOUT (remote timeout s, default 3000).
+# Optional env:
+#   RP_IMAGE      pod image.
+#   RP_TIMEOUT    remote job timeout in seconds (default 3000).
+#   RP_SESSION    named session. Persists pod coordinates AND the SSH key under
+#                 RP_SESSION_ROOT so a *different* terminal can reattach. Unset =
+#                 throwaway temp dir, wiped on exit.
+#   RP_KEEP       1 = leave the pod running when this process exits.
+#   RP_TTL_HOURS  reaper deadline for RP_KEEP pods (default 8).
 # Sets globals: RP_POD_ID, RP_HOST, RP_PORT. Installs an EXIT trap for teardown.
 
 : "${RUNPOD_API_KEY:?RUNPOD_API_KEY must be set (GitHub secret)}"
@@ -19,9 +40,30 @@ RP_IMAGE="${RP_IMAGE:-ghcr.io/f-inverse/jammi-ai-ci-cuda:latest}"
 # and every model load fails. RunPod's fleet is mixed, so pod selection fails
 # over past an under-floor pod rather than deploying onto one that cannot run.
 RP_MIN_DRIVER_MAJOR="${RP_MIN_DRIVER_MAJOR:-560}"
-RP_WORK="$(mktemp -d)"
+RP_SESSION="${RP_SESSION:-}"
+RP_KEEP="${RP_KEEP:-0}"
+RP_TTL_HOURS="${RP_TTL_HOURS:-8}"
+RP_SESSION_ROOT="${RP_SESSION_ROOT:-${HOME}/.config/runpod/sessions}"
+RP_S3_CONF="${RP_S3_CONF:-${HOME}/.config/runpod/s3}"
+RP_REPO_URL="${RP_REPO_URL:-https://github.com/f-inverse/jammi-ai}"
+# s5cmd: the S3 client the pod uses to move the prewarm tarball. Pinned to a
+# release binary for the same reason mold/protoc/sccache are in the CI image —
+# an unpinned fetch makes an otherwise reproducible pod drift under you.
+RP_S5CMD_VERSION="${RP_S5CMD_VERSION:-2.3.0}"
+
+# A named session must outlive the process; an anonymous one must not leak. The
+# session dir is created lazily by the first writer, so read-only commands
+# against a session that does not exist leave nothing behind.
+if [ -n "$RP_SESSION" ]; then
+  RP_WORK="${RP_SESSION_ROOT}/${RP_SESSION}"
+  RP_WORK_IS_TEMP=0
+else
+  RP_WORK="$(mktemp -d)"
+  RP_WORK_IS_TEMP=1
+fi
 RP_SSH_KEY="$RP_WORK/id_ed25519"
-RP_POD_ID=""; RP_HOST=""; RP_PORT=""; RP_PUBKEY=""; RP_SSHO=()
+RP_META="$RP_WORK/meta"
+RP_POD_ID=""; RP_HOST=""; RP_PORT=""; RP_PUBKEY=""; RP_ARCH=""; RP_SSHO=()
 
 # An SSH login shell does NOT inherit the container's Dockerfile ENV (CC=gcc-13,
 # PATH with cuda+mold+rust). Every remote job imports PID 1's real environment.
@@ -29,20 +71,90 @@ RP_ENV_PREAMBLE='while IFS= read -r -d "" __e; do export "$__e"; done < /proc/1/
 
 rp_gql() { curl -s "https://api.runpod.io/graphql?api_key=${RUNPOD_API_KEY}" -H 'Content-Type: application/json' --data-binary "$1"; }
 
+rp_terminate() { # $1=podId
+  rp_gql "{\"query\":\"mutation{ podTerminate(input:{podId:\\\"${1}\\\"}) }\"}" >/dev/null 2>&1
+}
+
 rp_cleanup() {
   if [ -n "$RP_POD_ID" ]; then
-    rp_gql "{\"query\":\"mutation{ podTerminate(input:{podId:\\\"${RP_POD_ID}\\\"}) }\"}" >/dev/null 2>&1
-    echo "::notice::terminated RunPod pod ${RP_POD_ID}"
+    if [ "$RP_KEEP" = "1" ]; then
+      echo "::notice::pod ${RP_POD_ID} left running (reaper terminates it in ≤${RP_TTL_HOURS}h)"
+    else
+      rp_terminate "$RP_POD_ID"
+      echo "::notice::terminated RunPod pod ${RP_POD_ID}"
+    fi
   fi
-  rm -rf "$RP_WORK"
+  [ "$RP_WORK_IS_TEMP" = "1" ] && rm -rf "$RP_WORK"
 }
 trap rp_cleanup EXIT
 
-# Generate the ephemeral SSH keypair used to reach the pod.
+# Disarm teardown for this process. The pod survives; the reaper is the only
+# thing that will stop it, so rp_reap must already be installed.
+rp_keep() { RP_KEEP=1; }
+
+# Generate (or reuse) the SSH keypair used to reach the pod. Reuse matters for a
+# named session: regenerating would lock us out of a pod that is still running.
 rp_init() {
-  ssh-keygen -t ed25519 -N '' -f "$RP_SSH_KEY" -q
+  _rp_work_mkdir
+  [ -f "$RP_SSH_KEY" ] || ssh-keygen -t ed25519 -N '' -f "$RP_SSH_KEY" -q
   RP_PUBKEY="$(cat "${RP_SSH_KEY}.pub")"
   RP_SSHO=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -i "$RP_SSH_KEY")
+}
+
+# Create the work dir on first write. Split out so read-only commands against a
+# nonexistent session do not litter RP_SESSION_ROOT with empty directories.
+_rp_work_mkdir() { [ -d "$RP_WORK" ] || { mkdir -p "$RP_WORK" && chmod 700 "$RP_WORK"; }; }
+
+rp_session_save() {
+  [ -n "$RP_SESSION" ] || return 0
+  _rp_work_mkdir
+  { echo "RP_POD_ID=$RP_POD_ID"; echo "RP_HOST=$RP_HOST"; echo "RP_PORT=$RP_PORT"
+    echo "RP_ARCH=$RP_ARCH"; echo "RP_IMAGE=$RP_IMAGE"; } > "$RP_META"
+  chmod 600 "$RP_META"
+}
+
+# Restore pod coordinates for a session started by another process. Returns 1
+# when the session has no recorded pod.
+rp_session_load() {
+  [ -f "$RP_META" ] || return 1
+  # shellcheck disable=SC1090  # path is a runtime-selected session dir
+  . "$RP_META"
+  [ -n "${RP_POD_ID:-}" ] || return 1
+  rp_init
+}
+
+# A recorded pod is not a live pod — the reaper may have collected it, or the
+# host may have died. Callers must confirm before treating a session as usable.
+rp_session_alive() {
+  [ -n "$RP_POD_ID" ] && [ -n "$RP_HOST" ] && [ -n "$RP_PORT" ] || return 1
+  ssh "${RP_SSHO[@]}" -p "$RP_PORT" "root@${RP_HOST}" true 2>/dev/null
+}
+
+rp_session_list() {
+  [ -d "$RP_SESSION_ROOT" ] || return 0
+  local d name
+  for d in "$RP_SESSION_ROOT"/*/; do
+    [ -f "${d}meta" ] || continue
+    name="$(basename "$d")"
+    # shellcheck disable=SC1090
+    ( . "${d}meta"; printf '%-16s %-20s %s@%s\n' "$name" "${RP_POD_ID}" "${RP_ARCH}" "${RP_HOST}:${RP_PORT}" )
+  done
+}
+
+# Forget a session's local state. The caller terminates the pod first.
+rp_session_forget() {
+  [ -n "$RP_SESSION" ] && [ -d "$RP_WORK" ] && rm -rf "$RP_WORK"
+}
+
+# Load the object-store config used for the build-substrate cache. Returns 1 when
+# unconfigured — every caller treats that as "run cold", never as an error: the
+# cache is an optimisation and correctness must not depend on it.
+rp_s3_load() {
+  [ -f "$RP_S3_CONF" ] || return 1
+  # shellcheck disable=SC1090  # user-provided config outside the repo
+  . "$RP_S3_CONF"
+  [ -n "${RP_S3_ENDPOINT:-}" ] && [ -n "${RP_S3_BUCKET:-}" ] \
+    && [ -n "${RP_S3_ACCESS_KEY_ID:-}" ] && [ -n "${RP_S3_SECRET_ACCESS_KEY:-}" ]
 }
 
 _rp_deploy_payload() { # $1=cloudType $2=gpuTypeId
@@ -66,13 +178,38 @@ PY
 # (neutral skip) when no candidate yields a reachable pod — a provider condition,
 # not a code failure.
 rp_deploy_live() {
-  local supply_seen=0 combo cloud gpu R
+  local supply_seen=0 combo cloud gpu R parsed code msg
   for combo in "$@"; do
     cloud="${combo%%|*}"; gpu="${combo##*|}"
-    RP_POD_ID="$(rp_gql "$(_rp_deploy_payload "$cloud" "$gpu")" | python3 -c 'import sys,json
+    # Only SUPPLY_CONSTRAINT is a capacity condition worth failing over. Every
+    # other refusal — INSUFFICIENT_BALANCE, a bad key, an unpullable image — is a
+    # real fault, and reporting it as "no capacity" would return the neutral-skip
+    # 75 and let the GPU gate pass while proving nothing.
+    # Emitted as three LINES, not delimited fields: every plausible single-char
+    # delimiter is either IFS whitespace (which collapses the empty id field on
+    # an error, silently turning the error code into the pod id) or can occur in
+    # the message text.
+    parsed="$(rp_gql "$(_rp_deploy_payload "$cloud" "$gpu")" | python3 -c 'import sys,json
 d=json.load(sys.stdin)
-print("" if "errors" in d else (d.get("data",{}).get("podFindAndDeployOnDemand") or {}).get("id",""), end="")')"
-    if [ -z "$RP_POD_ID" ]; then echo "  no capacity: ${cloud} / ${gpu}"; continue; fi
+e=(d.get("errors") or [])
+if e:
+    x=e[0]
+    print("")
+    print((x.get("extensions") or {}).get("code") or "UNKNOWN")
+    print(" ".join((x.get("message") or "").split()))
+else:
+    print((d.get("data",{}).get("podFindAndDeployOnDemand") or {}).get("id","") or "")
+    print("NO_ID")
+    print("")')"
+    { read -r RP_POD_ID; read -r code; read -r msg; } <<< "$parsed"
+    if [ -z "$RP_POD_ID" ]; then
+      case "$code" in
+        SUPPLY_CONSTRAINT|NO_ID) echo "  no capacity: ${cloud} / ${gpu}"; continue ;;
+        *) echo "::error::RunPod refused the deploy (${code}): ${msg}"
+           echo "::error::this is not a capacity condition — failing loudly rather than skipping"
+           return 1 ;;
+      esac
+    fi
     supply_seen=1
     echo "  deployed ${RP_POD_ID} on ${cloud} / ${gpu}; waiting for SSH (≤4m)..."
     RP_HOST=""; RP_PORT=""
@@ -90,17 +227,17 @@ p=(json.load(sys.stdin).get("data",{}).get("pod") or {}).get("runtime") or {}
           "nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1" 2>/dev/null)"
         drv_major="${drv%%.*}"
         if [ -n "$drv_major" ] && [ "$drv_major" -ge "$RP_MIN_DRIVER_MAJOR" ] 2>/dev/null; then
-          echo "  SSH up on ${RP_HOST}:${RP_PORT} (driver ${drv})"; return 0
+          echo "  SSH up on ${RP_HOST}:${RP_PORT} (driver ${drv})"; rp_session_save; return 0
         fi
         echo "  pod ${RP_POD_ID} driver '${drv:-unknown}' is below the r${RP_MIN_DRIVER_MAJOR} floor; terminating and trying next candidate"
-        rp_gql "{\"query\":\"mutation{ podTerminate(input:{podId:\\\"${RP_POD_ID}\\\"}) }\"}" >/dev/null 2>&1
+        rp_terminate "$RP_POD_ID"
         RP_POD_ID=""; break
       fi
       RP_HOST=""; sleep 10
     done
     if [ -n "$RP_POD_ID" ]; then
       echo "  pod ${RP_POD_ID} never became reachable; terminating and trying next candidate"
-      rp_gql "{\"query\":\"mutation{ podTerminate(input:{podId:\\\"${RP_POD_ID}\\\"}) }\"}" >/dev/null 2>&1
+      rp_terminate "$RP_POD_ID"
       RP_POD_ID=""
     fi
   done
@@ -109,17 +246,143 @@ p=(json.load(sys.stdin).get("data",{}).get("pod") or {}).get("runtime") or {}
   return 75
 }
 
-# A100 (sm_80) — the arch that proves the compute_80 floor / #277. Wrapper over
-# rp_deploy_live with the A100 candidate list (PCIe + SXM, both cloud tiers).
-rp_deploy_live_a100() {
-  rp_deploy_live \
-    "SECURE|NVIDIA A100 80GB PCIe" "COMMUNITY|NVIDIA A100 80GB PCIe" \
-    "SECURE|NVIDIA A100-SXM4-80GB" "COMMUNITY|NVIDIA A100-SXM4-80GB"
+# arch → RunPod GPU-type candidates (SECURE then COMMUNITY), the one place the
+# mapping lives. A100 is the #277 floor (sm_80); l40s/l4 are Ada (sm_89, fp8
+# #308); h100 is Hopper (sm_90); a40 is Ampere-workstation (sm_86). (RunPod has
+# no Tesla T4 — #306 is Ampere+.) Returns 2 on an unknown arch.
+rp_deploy_arch() { # $1=arch
+  local cand
+  case "$1" in
+    a100) cand=("SECURE|NVIDIA A100 80GB PCIe" "COMMUNITY|NVIDIA A100 80GB PCIe" "SECURE|NVIDIA A100-SXM4-80GB" "COMMUNITY|NVIDIA A100-SXM4-80GB") ;;
+    l40s) cand=("SECURE|NVIDIA L40S" "COMMUNITY|NVIDIA L40S") ;;
+    h100) cand=("SECURE|NVIDIA H100 80GB HBM3" "SECURE|NVIDIA H100 PCIe" "COMMUNITY|NVIDIA H100 80GB HBM3" "COMMUNITY|NVIDIA H100 PCIe") ;;
+    a40)  cand=("SECURE|NVIDIA A40" "COMMUNITY|NVIDIA A40") ;;
+    l4)   cand=("SECURE|NVIDIA L4" "COMMUNITY|NVIDIA L4") ;;
+    *) echo "::error::unknown arch '$1' (want: a100|l40s|h100|a40|l4)"; return 2 ;;
+  esac
+  RP_ARCH="$1"
+  rp_deploy_live "${cand[@]}"
 }
+
+# A100 (sm_80) — the arch that proves the compute_80 floor / #277.
+rp_deploy_live_a100() { rp_deploy_arch a100; }
 
 # Run a bash script (read from stdin) on the pod, with the container ENV imported
 # first and a hard timeout. Returns the remote script's exit code.
 rp_run_remote() {
   { printf '%s\n' "$RP_ENV_PREAMBLE"; cat; } \
     | ssh "${RP_SSHO[@]}" -p "$RP_PORT" "root@${RP_HOST}" "timeout ${RP_TIMEOUT:-3000} bash -s"
+}
+
+# Install the pod-side deadline. The pod self-terminates with the pod-scoped
+# credential RunPod injects, so the account API key never lands on rented
+# hardware. `kill 1` is the fallback for an image where runpodctl cannot install:
+# stopping the container is strictly better than billing until someone notices.
+# This is a wall-clock ceiling, not idle detection — an idle pod bills until TTL.
+# The teardown verb differs across runpodctl generations (`remove pod` vs
+# `pod delete`), so both are attempted before the fallback. Guessing one and
+# being wrong is silent and expensive: the pod simply bills until someone looks.
+rp_reap() {
+  local secs=$(( RP_TTL_HOURS * 3600 ))
+  rp_run_remote <<EOF
+set -uo pipefail
+command -v runpodctl >/dev/null 2>&1 || curl -fsSL cli.runpod.net 2>/dev/null | bash >/dev/null 2>&1 || true
+command -v runpodctl >/dev/null 2>&1 || echo "warn: runpodctl unavailable — reaper will fall back to stopping the container"
+nohup setsid bash -c 'sleep ${secs}
+  runpodctl remove pod "\$RUNPOD_POD_ID" 2>/dev/null \
+    || runpodctl pod delete "\$RUNPOD_POD_ID" 2>/dev/null \
+    || kill 1' >/dev/null 2>&1 &
+echo "reaper armed: pod self-terminates in ${RP_TTL_HOURS}h"
+EOF
+}
+
+# Make the pod ready to build jammi: import the container ENV (already done by
+# rp_run_remote), rehydrate the cargo registry from the prewarm object, point
+# sccache at the object store, and place the repo at $1 (default: main).
+#
+# The cargo registry is the expensive cold cost — the CI image deliberately wipes
+# /usr/local/cargo/registry, so a fresh pod otherwise re-resolves the whole
+# arrow/datafusion/candle tree before it compiles a line. It is restored as ONE
+# tarball rather than synced: RunPod's S3 surface degrades badly past ~10k
+# objects, and a cargo registry is far past that.
+rp_bootstrap() { # $1=git ref (optional)
+  local ref="${1:-main}" s3=0
+  rp_s3_load && s3=1
+  rp_run_remote <<EOF
+set -uo pipefail
+export CARGO_HOME="\${CARGO_HOME:-/usr/local/cargo}"
+
+# Pod-side tools the dev loop needs and the CI image has no reason to carry:
+# zstd backs the prewarm tarball, rsync the working-tree sync, tmux the detached
+# jobs that outlive the SSH session.
+yum install -y zstd rsync tmux >/dev/null 2>&1 || echo "warn: pod tool install failed"
+
+# One re-sourceable file that makes any later shell correct. The container's
+# Dockerfile ENV is captured here rather than re-derived from /proc/1/environ at
+# each use site, so \`attach\` and detached \`run\` jobs cannot drift from it.
+{ while IFS= read -r -d '' __e; do
+    printf 'export %s=%q\n' "\${__e%%=*}" "\${__e#*=}"
+  done < /proc/1/environ; } > /root/.jammi_env
+
+if [ "${s3}" = "1" ]; then
+  export AWS_ACCESS_KEY_ID='${RP_S3_ACCESS_KEY_ID:-}'
+  export AWS_SECRET_ACCESS_KEY='${RP_S3_SECRET_ACCESS_KEY:-}'
+  export S3_ENDPOINT='${RP_S3_ENDPOINT:-}'
+  export S3_BUCKET='${RP_S3_BUCKET:-}'
+
+  if ! command -v s5cmd >/dev/null 2>&1; then
+    curl -fsSL "https://github.com/peak/s5cmd/releases/download/v${RP_S5CMD_VERSION}/s5cmd_${RP_S5CMD_VERSION}_Linux-64bit.tar.gz" \
+      | tar -xz -C /usr/local/bin s5cmd 2>/dev/null || echo "warn: s5cmd install failed — running cold"
+  fi
+
+  # sccache reads the compile cache straight from the object store, so a pod in
+  # any datacenter warms up. Wrapper is already set repo-wide in .cargo/config.toml.
+  export SCCACHE_BUCKET="\$S3_BUCKET"
+  export SCCACHE_ENDPOINT="\$S3_ENDPOINT"
+  export SCCACHE_REGION=auto
+  export SCCACHE_S3_USE_SSL=true
+  export SCCACHE_S3_KEY_PREFIX=sccache
+  { echo "export AWS_ACCESS_KEY_ID=\$(printf %q "\$AWS_ACCESS_KEY_ID")"
+    echo "export AWS_SECRET_ACCESS_KEY=\$(printf %q "\$AWS_SECRET_ACCESS_KEY")"
+    echo "export SCCACHE_BUCKET=\$(printf %q "\$SCCACHE_BUCKET")"
+    echo "export SCCACHE_ENDPOINT=\$(printf %q "\$SCCACHE_ENDPOINT")"
+    echo "export SCCACHE_REGION=auto"
+    echo "export SCCACHE_S3_USE_SSL=true"
+    echo "export SCCACHE_S3_KEY_PREFIX=sccache"; } >> /root/.jammi_env
+fi
+
+if [ ! -d /root/jammi-ai/.git ]; then
+  git clone --filter=blob:none "${RP_REPO_URL}" /root/jammi-ai || exit 1
+fi
+cd /root/jammi-ai && git fetch --all --quiet && git checkout --quiet "${ref}" && git pull --quiet --ff-only 2>/dev/null
+
+# Restore the registry only when this exact Cargo.lock has a prewarm object.
+if [ "${s3}" = "1" ] && command -v s5cmd >/dev/null 2>&1; then
+  KEY="registry/\$(sha256sum Cargo.lock | cut -c1-16).tar.zst"
+  if s5cmd --endpoint-url "\$S3_ENDPOINT" cat "s3://\$S3_BUCKET/\$KEY" 2>/dev/null \
+       | tar -x --zstd -C "\$CARGO_HOME" 2>/dev/null; then
+    echo "registry prewarm restored (\$KEY)"
+  else
+    echo "no registry prewarm for this Cargo.lock — cold fetch (run 'gpu-dev.sh prewarm' to publish one)"
+  fi
+fi
+echo "bootstrap complete: \$(cd /root/jammi-ai && git rev-parse --short HEAD)"
+EOF
+}
+
+# Build and publish the registry prewarm object for the pod's current Cargo.lock.
+# Idempotent: overwrites the key for that lock hash.
+rp_prewarm_publish() {
+  rp_s3_load || { echo "::error::no object store configured (${RP_S3_CONF}); nothing to publish"; return 1; }
+  rp_run_remote <<EOF
+set -uo pipefail
+[ -f /root/.jammi_env ] && . /root/.jammi_env
+export CARGO_HOME="\${CARGO_HOME:-/usr/local/cargo}"
+cd /root/jammi-ai || exit 1
+cargo fetch --locked || exit 1
+KEY="registry/\$(sha256sum Cargo.lock | cut -c1-16).tar.zst"
+tar -c --zstd -C "\$CARGO_HOME" registry \
+  | s5cmd --endpoint-url '${RP_S3_ENDPOINT}' pipe "s3://${RP_S3_BUCKET}/\$KEY" || exit 1
+echo "published \$KEY"
+EOF
 }

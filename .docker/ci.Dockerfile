@@ -13,13 +13,22 @@ ARG MOLD_VERSION=2.35.1
 RUN curl -fsSL "https://github.com/rui314/mold/releases/download/v${MOLD_VERSION}/mold-${MOLD_VERSION}-x86_64-linux.tar.gz" \
     | tar -xz --strip-components=1 -C /usr/local
 
-# Rust toolchain (manylinux ships no Rust)
+# Rust toolchain (manylinux ships no Rust).
+#
+# RUST_VERSION has no default ON PURPOSE. The build context is `.docker/`, so
+# rust-toolchain.toml cannot be COPYed in; the workflow reads the pin from that
+# file and passes it here. A default would let the image build succeed at a
+# stale version while the repo pin moved — silently producing an image whose
+# rustc disagrees with every checkout that uses it. Failing closed is the point.
+ARG RUST_VERSION
+RUN test -n "${RUST_VERSION}" || { echo "RUST_VERSION build-arg is required (from rust-toolchain.toml)"; exit 1; }
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH="/usr/local/cargo/bin:${PATH}"
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --default-toolchain 1.94.0 --profile minimal \
-    && rustup component add rustfmt clippy
+    | sh -s -- -y --default-toolchain "${RUST_VERSION}" --profile minimal \
+    && rustup component add rustfmt clippy \
+    && rustc --version | grep -qF "${RUST_VERSION}"
 
 # sccache — pre-built static binary (avoids openssl-devel in the image,
 # which could cause manylinux-incompatible linkage in wheel builds)

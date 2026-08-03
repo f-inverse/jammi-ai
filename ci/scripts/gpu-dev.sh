@@ -212,8 +212,10 @@ EOF
     rp_init
     echo "=== provisioning ${ARCH} to build the prewarm ==="
     rp_deploy_arch "$ARCH" || exit $?
-    rp_bootstrap
-    rp_prewarm_publish
+    rp_bootstrap || { echo "::error::bootstrap failed — no prewarm published"; exit 1; }
+    # Propagate the failure. Reporting success on a prewarm that never uploaded
+    # leaves every later pod silently cold with nothing to show why.
+    rp_prewarm_publish || { echo "::error::prewarm FAILED — nothing was published"; exit 1; }
     echo "=== done — terminating pod (trap) ==="
     ;;
 

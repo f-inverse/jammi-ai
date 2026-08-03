@@ -173,7 +173,20 @@ rp_s3_load() {
   # shellcheck disable=SC1090  # user-provided config outside the repo
   . "$RP_S3_CONF"
   [ -n "${RP_S3_ENDPOINT:-}" ] && [ -n "${RP_S3_BUCKET:-}" ] \
-    && [ -n "${RP_S3_ACCESS_KEY_ID:-}" ] && [ -n "${RP_S3_SECRET_ACCESS_KEY:-}" ]
+    && [ -n "${RP_S3_ACCESS_KEY_ID:-}" ] && [ -n "${RP_S3_SECRET_ACCESS_KEY:-}" ] || return 1
+  # RunPod signs SigV4 against the datacenter as the region and rejects "auto"
+  # outright ("the region 'auto' is wrong; expecting 'us-ne-1'"), which bricks
+  # every cargo command on the pod since sccache wraps rustc globally. Derive it
+  # from the endpoint so there is one source of truth; a non-RunPod endpoint
+  # (R2 and friends) keeps "auto" unless the config states otherwise.
+  if [ -z "${RP_S3_REGION:-}" ]; then
+    case "$RP_S3_ENDPOINT" in
+      *s3api-*.runpod.io*)
+        RP_S3_REGION="${RP_S3_ENDPOINT#*s3api-}"
+        RP_S3_REGION="${RP_S3_REGION%%.runpod.io*}" ;;
+      *) RP_S3_REGION=auto ;;
+    esac
+  fi
 }
 
 _rp_deploy_payload() { # $1=cloudType $2=gpuTypeId
@@ -454,16 +467,31 @@ if [ "${s3}" = "1" ]; then
   # any datacenter warms up. Wrapper is already set repo-wide in .cargo/config.toml.
   export SCCACHE_BUCKET="\$S3_BUCKET"
   export SCCACHE_ENDPOINT="\$S3_ENDPOINT"
-  export SCCACHE_REGION=auto
+  export SCCACHE_REGION='${RP_S3_REGION:-auto}'
   export SCCACHE_S3_USE_SSL=true
   export SCCACHE_S3_KEY_PREFIX=sccache
-  { echo "export AWS_ACCESS_KEY_ID=\$(printf %q "\$AWS_ACCESS_KEY_ID")"
-    echo "export AWS_SECRET_ACCESS_KEY=\$(printf %q "\$AWS_SECRET_ACCESS_KEY")"
-    echo "export SCCACHE_BUCKET=\$(printf %q "\$SCCACHE_BUCKET")"
-    echo "export SCCACHE_ENDPOINT=\$(printf %q "\$SCCACHE_ENDPOINT")"
-    echo "export SCCACHE_REGION=auto"
-    echo "export SCCACHE_S3_USE_SSL=true"
-    echo "export SCCACHE_S3_KEY_PREFIX=sccache"; } >> /root/.jammi_env
+
+  # sccache wraps rustc for EVERY cargo invocation, so an object store it cannot
+  # reach does not degrade the build — it stops the build dead, and the pod is
+  # useless for anything. Prove the server starts against this bucket; if it does
+  # not, drop the S3 backend and let sccache fall back to its local disk cache.
+  # A cold pod that works beats a warm one that cannot compile.
+  sccache --stop-server >/dev/null 2>&1
+  if sccache --start-server >/dev/null 2>&1 && sccache --show-stats >/dev/null 2>&1; then
+    { echo "export AWS_ACCESS_KEY_ID=\$(printf %q "\$AWS_ACCESS_KEY_ID")"
+      echo "export AWS_SECRET_ACCESS_KEY=\$(printf %q "\$AWS_SECRET_ACCESS_KEY")"
+      echo "export SCCACHE_BUCKET=\$(printf %q "\$SCCACHE_BUCKET")"
+      echo "export SCCACHE_ENDPOINT=\$(printf %q "\$SCCACHE_ENDPOINT")"
+      echo "export SCCACHE_REGION=\$(printf %q "\$SCCACHE_REGION")"
+      echo "export SCCACHE_S3_USE_SSL=true"
+      echo "export SCCACHE_S3_KEY_PREFIX=sccache"; } >> /root/.jammi_env
+    echo "sccache: S3 backend live (region \$SCCACHE_REGION)"
+  else
+    echo "::warning::sccache could not use the S3 backend; falling back to local disk cache"
+    sccache --stop-server >/dev/null 2>&1
+    unset SCCACHE_BUCKET SCCACHE_ENDPOINT SCCACHE_REGION SCCACHE_S3_USE_SSL SCCACHE_S3_KEY_PREFIX
+    sccache --start-server >/dev/null 2>&1
+  fi
 fi
 
 if [ ! -d /root/jammi-ai/.git ]; then

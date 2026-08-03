@@ -502,8 +502,11 @@ cd /root/jammi-ai && git fetch --all --quiet && git checkout --quiet "${ref}" &&
 # Restore the registry only when this exact Cargo.lock has a prewarm object.
 if [ "${s3}" = "1" ] && command -v s5cmd >/dev/null 2>&1; then
   KEY="registry/\$(sha256sum Cargo.lock | cut -c1-16).tar.zst"
-  if s5cmd --endpoint-url "\$S3_ENDPOINT" cat "s3://\$S3_BUCKET/\$KEY" 2>/dev/null \
-       | tar -x --zstd -C "\$CARGO_HOME" 2>/dev/null; then
+  # Whole pipeline quiet: on a cache MISS zstd prints "unexpected end of file",
+  # which reads as a fault when it is the ordinary first-run path. A spurious
+  # error in a working path is how people learn to ignore real ones.
+  if { s5cmd --endpoint-url "\$S3_ENDPOINT" cat "s3://\$S3_BUCKET/\$KEY" \
+       | zstd -d -c | tar -x -C "\$CARGO_HOME"; } >/dev/null 2>&1; then
     echo "registry prewarm restored (\$KEY)"
   else
     echo "no registry prewarm for this Cargo.lock — cold fetch (run 'gpu-dev.sh prewarm' to publish one)"
@@ -524,8 +527,12 @@ export CARGO_HOME="\${CARGO_HOME:-/usr/local/cargo}"
 cd /root/jammi-ai || exit 1
 cargo fetch --locked || exit 1
 KEY="registry/\$(sha256sum Cargo.lock | cut -c1-16).tar.zst"
-tar -c --zstd -C "\$CARGO_HOME" registry \
+# Compress through the zstd binary rather than tar's --zstd: the CI image is
+# AlmaLinux 8, whose GNU tar is 1.30, and --zstd only exists from 1.31.
+command -v zstd >/dev/null 2>&1 || { echo "::error::zstd missing on the pod"; exit 1; }
+set -o pipefail
+tar -c -C "\$CARGO_HOME" registry | zstd -T0 -3 -c \
   | s5cmd --endpoint-url '${RP_S3_ENDPOINT}' pipe "s3://${RP_S3_BUCKET}/\$KEY" || exit 1
-echo "published \$KEY"
+echo "published \$KEY (\$(s5cmd --endpoint-url '${RP_S3_ENDPOINT}' ls "s3://${RP_S3_BUCKET}/\$KEY" | awk '{print \$3}') bytes)"
 EOF
 }

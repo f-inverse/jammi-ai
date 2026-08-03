@@ -13,10 +13,9 @@
 # SIGKILLed process (a cancelled GitHub run, a dropped laptop) never runs it, and
 # a pod with no other deadline then bills until the account empties.
 #
-# The in-pod deadline ends in `kill -9 1`, and whether that stops RunPod BILLING
-# or merely exits the container is UNVERIFIED — rp_sweep still explicitly
-# terminates a non-RUNNING pod for exactly that reason. Treat the sweep as
-# load-bearing, not as belt-and-braces.
+# The in-pod deadline self-terminates with `runpodctl remove pod` and is verified
+# on hardware. It still needs the network at deadline time, so rp_sweep is
+# load-bearing rather than belt-and-braces.
 #   * state    — the pod is always disposable (volumeInGb 0). Durable state lives
 #                in an S3-compatible object store that rp_bootstrap rehydrates.
 #                A RunPod network volume is deliberately NEVER attached: an
@@ -189,23 +188,42 @@ ttl = int(ttl_h) * 3600
 # orphaned for seven days on 2026-07-24.
 #
 # `sleep` comes FIRST so the deadline is reached no matter what the network does;
-# an install ahead of it can hang and leave the pod with no deadline at all.
-# Every step after the sleep is `timeout`-bounded and separated by `;` rather than
-# `||`, so a command that hangs or never returns cannot swallow the kill.
+# an install ahead of it can hang and leave the pod with no deadline at all. Every
+# step after it is `timeout`-bounded so nothing can wedge the sequence.
+#
+# `runpodctl remove pod $RUNPOD_POD_ID` is the ONLY in-pod termination that works,
+# and it is verified on real hardware: RunPod special-cases self-removal, so it
+# succeeds in this custom image with no config file and no key of ours — even
+# though `runpodctl config` fails and `runpodctl get pod` returns Unauthorized.
+#
+# There is deliberately no `kill 1` fallback. It was measured to be a no-op:
+# PID 1 in a PID namespace ignores signals it has no handler for, including
+# SIGKILL, so the pod kept RUNNING and kept billing at full rate. A fallback that
+# cannot work is worse than none — it invites trusting a guard that does nothing.
+# The retry loop replaces it: the only real failure mode left is no network at
+# deadline time, and retrying costs nothing. rp_sweep remains the true backstop.
 watchdog = ("( sleep %d; "
-            "timeout 120 sh -c 'command -v runpodctl >/dev/null 2>&1 || "
-            "curl -fsSL cli.runpod.net | bash' >/dev/null 2>&1; "
-            "timeout 60 runpodctl remove pod \"$RUNPOD_POD_ID\" >/dev/null 2>&1; "
-            "kill -9 1 ) & " % ttl)
+            "while :; do "
+            "timeout 120 sh -c \"command -v runpodctl >/dev/null 2>&1 || "
+            "curl -fsSL cli.runpod.net | bash\" >/dev/null 2>&1; "
+            "timeout 60 runpodctl remove pod \"$RUNPOD_POD_ID\" >/dev/null 2>&1 && break; "
+            "sleep 60; done ) & " % ttl)
 # The watchdog is armed BEFORE anything else in the entrypoint. Any command
 # placed ahead of it — `yum install` reaching the network, for instance — can
 # hang and leave the pod running with no deadline, which is the failure this
 # whole mechanism exists to prevent.
 setup = (watchdog
          + "yum install -y openssh-server openssh-clients >/dev/null 2>&1; ssh-keygen -A; "
-         "mkdir -p /root/.ssh; printf '%s\\n' \"$PUBLIC_KEY\" > /root/.ssh/authorized_keys; "
+         "mkdir -p /root/.ssh; printf \"%s\\n\" \"$PUBLIC_KEY\" > /root/.ssh/authorized_keys; "
          "chmod 700 /root/.ssh; chmod 600 /root/.ssh/authorized_keys; "
          "/usr/sbin/sshd -D")
+
+# `setup` is wrapped in bash -c '...' below. A single quote anywhere inside it
+# closes that wrapper early and hands the remainder — pipes, redirects,
+# semicolons — to the OUTER shell. The entrypoint then dies on a syntax error and
+# the pod boots, bills, and never becomes reachable: a silent, paid failure that
+# looks exactly like a capacity problem. Quote with double quotes only.
+assert "'" not in setup, "pod entrypoint must contain no single quotes (breaks bash -c wrapping)"
 inp = {"cloudType": cloud, "gpuCount": 1, "gpuTypeId": gpu,
        # The deadline travels in the name so any sweeper honours THIS pod's limit.
        "name": "%s-ttl%s" % (prefix, ttl_h),

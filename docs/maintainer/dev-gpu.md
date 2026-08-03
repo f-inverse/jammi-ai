@@ -123,6 +123,19 @@ Three guards, in order of when they act:
    between "pod rented" and "pod reachable" is minutes long, and that gap is
    where the orphan above was created.
 
+   It terminates via `runpodctl remove pod $RUNPOD_POD_ID`. RunPod special-cases
+   self-removal, so this succeeds in our custom image with no config file and
+   without us placing any key on the pod — verified on an A40, along with the
+   deadline firing and the pod staying gone. Note RunPod injects its own
+   `RUNPOD_API_KEY` into every pod's environment; it does not grant account-wide
+   access (`runpodctl get pod` returns `Unauthorized`).
+
+   There is **no `kill 1` fallback**, because it was measured to do nothing:
+   PID 1 in a PID namespace ignores signals it has no handler for, including
+   SIGKILL, and the pod carried on RUNNING and billing at full rate. Instead the
+   watchdog retries the removal, since the only remaining failure is no network
+   at deadline time.
+
 3. **A sweep**, for a pod whose container never got far enough to arm itself:
 
    ```bash
@@ -141,11 +154,8 @@ Three guards, in order of when they act:
    unparseable deadline, or a stopped pod is swept. And a sweep that cannot
    *reach* RunPod fails loudly rather than reporting "nothing to clean up".
 
-Guards 2 and 3 are **not** fully independent. The in-pod deadline ends in
-`kill -9 1`, and whether that stops RunPod billing or merely exits the container
-is unverified — which is why the sweep still explicitly terminates a non-running
-pod. Verifying it costs about $0.15: rent an L4 with `RP_TTL_HOURS=1`, let it
-fire, and check whether billing stops.
+Guard 2 needs the network at deadline time; guard 3 needs this repo's CI to be
+running. They fail for unrelated reasons, which is the point of having both.
 
 All three are **wall-clock ceilings, not idle detection** — a pod you stop using
 bills until its deadline. Run `down` when you're finished.

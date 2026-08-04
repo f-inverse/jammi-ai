@@ -8,19 +8,19 @@ name: _ci-base-image
 # Every consumer's `container:` field (and workflow-call `container_image`
 # input) resolves the image via a repo variable with a literal `:latest`
 # fallback: `${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}`
-# (resp. `JAMMI_CI_IMAGE_CUDA` for the CUDA base). `container.image` is
-# restricted to the `github`, `needs`, `strategy`, `matrix`, `vars`, `inputs`
-# contexts — no `hashFiles()`, no `env` — but `vars` IS legal there, so a
-# content-addressed (sha-tagged) image ref can reach `container.image`
-# directly with no resolver-job indirection. This job is what keeps that
-# variable current: after the manifest push completes, it PATCHes (falling
-# back to POSTs, on a 404, to create) the repo variable to the exact
-# `sha-<commit>` tag it just pushed. Updating the variable strictly AFTER the
-# push (not before, not racing it) means a consumer job that reads the
-# variable can never observe a tag whose manifest hasn't landed in the
-# registry yet — there is no pull-before-push race by construction, and no
-# separate resolver job's output has to be threaded through every consuming
-# workflow's job graph.
+# (resp. `JAMMI_CI_IMAGE_CUDA` for the CUDA base).
+#
+# Consumers track `:latest`, deliberately. This workflow does NOT rewrite those
+# variables to the sha tag it just pushed, and a step that tried to was removed:
+# GITHUB_TOKEN cannot write repo variables at all (403 "Resource not accessible
+# by integration" on both create and update), and no `permissions:` block can
+# grant it — repo variables need `administration: write`, which is not available
+# to GITHUB_TOKEN. Re-adding sha-pinning therefore means introducing a PAT, not
+# adjusting permissions. Do not "fix" the failure by making such a step
+# non-fatal; that converts a broken pin into a silent one.
+#
+# The `sha-<commit>` tag is still published, so a specific build can be pinned by
+# hand (set the repo variable to it) when a bisect or a reproduction needs it.
 
 on:
   workflow_call:
@@ -37,7 +37,6 @@ on:
 permissions:
   contents: read
   packages: write
-  actions: write
 
 jobs:
   build-and-push:
@@ -45,7 +44,6 @@ jobs:
     permissions:
       contents: read
       packages: write
-      actions: write
     steps:
       - uses: actions/checkout@v4
 
@@ -59,11 +57,10 @@ jobs:
         id: meta
         with:
           images: ghcr.io/${{ github.repository }}-${{ inputs.image_suffix }}
-          # `latest` is the fallback every consumer's `vars.JAMMI_CI_IMAGE[_CUDA]
-          # || 'ghcr.io/...:latest'` expression resolves to before the variable
-          # below is ever seeded (a fresh fork, or before this workflow has run
-          # once). `type=sha,format=long` is the content-addressed tag this job
-          # publishes to the repo variable once the push below completes.
+          # `latest` is what every consumer's `vars.JAMMI_CI_IMAGE[_CUDA] ||
+          # 'ghcr.io/...:latest'` expression resolves to, and what the repo
+          # variables are set to. `type=sha,format=long` is published alongside
+          # it as an immutable handle for pinning a build by hand.
           tags: |
             type=raw,value=latest
             type=sha,format=long
@@ -93,28 +90,3 @@ jobs:
             RUST_VERSION=${{ steps.rust-pin.outputs.channel }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-
-      # Only runs once the manifest push above has completed, so the variable
-      # a consumer job reads never points at a tag that hasn't landed in the
-      # registry yet. Picks the sha-tagged ref out of the metadata action's
-      # output (the same tag list just pushed) rather than reconstructing it,
-      # so the variable is always byte-identical to what was actually pushed.
-      - name: Update the repo variable to the pushed sha-tagged image
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VAR_NAME: ${{ inputs.image_suffix == 'ci-cuda' && 'JAMMI_CI_IMAGE_CUDA' || 'JAMMI_CI_IMAGE' }}
-        run: |
-          set -euo pipefail
-          image_ref=$(echo '${{ steps.meta.outputs.tags }}' | grep -m1 ':sha-')
-          api="repos/${{ github.repository }}/actions/variables"
-          if gh api "$api/$VAR_NAME" \
-              -X PATCH -H "Accept: application/vnd.github+json" \
-              -f name="$VAR_NAME" -f value="$image_ref"; then
-            echo "updated $VAR_NAME=$image_ref"
-          else
-            echo "$VAR_NAME not found — creating it"
-            gh api "$api" \
-              -X POST -H "Accept: application/vnd.github+json" \
-              -f name="$VAR_NAME" -f value="$image_ref"
-            echo "created $VAR_NAME=$image_ref"
-          fi

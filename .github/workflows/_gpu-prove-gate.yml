@@ -35,6 +35,19 @@ jobs:
   prove:
     name: Prove on a real A100 (sm_80)
     runs-on: ubuntu-latest
+    # Serialize per release ref. A `v*` tag fires several callers (release-binaries,
+    # server-image, pypi-server-cuda) that each prove the SAME commit, so without
+    # this they rent an A100 apiece — concurrent rentals, each able to orphan its
+    # pod if the release run is cancelled. Never cancels: this job rents hardware
+    # and cleans up in an EXIT trap, and a SIGKILLed runner leaks the pod.
+    # An evicted pending gate leaves `result != 'success'`, which blocks promotion —
+    # fail-closed, which is the correct direction for a release gate.
+    concurrency:
+      group: gpu-prove-gate-${{ inputs.git_ref }}
+      cancel-in-progress: false
+    # Bounded retry is up to 3 prove attempts with 300s between; this caps the
+    # job well under the 360m default, since a job-timeout kill bypasses the trap.
+    timeout-minutes: 200
     steps:
       - uses: actions/checkout@v4
       - name: Prove the release commit on A100 (retry on capacity, fail closed)

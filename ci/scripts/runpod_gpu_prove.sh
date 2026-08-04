@@ -8,11 +8,21 @@
 # Exit 0 = suites passed; 75 = no A100 capacity (neutral skip).
 set -uo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# This lane's own pods never need 8h — the remote job is capped by RP_TIMEOUT
+# (50m by default), so a tighter deadline bounds the damage of an orphan.
+RP_TTL_HOURS="${RP_TTL_HOURS:-3}"
 # shellcheck source=ci/scripts/runpod_lib.sh
 source "$DIR/runpod_lib.sh"
 
 GIT_REPO="${GIT_REPO:-https://github.com/${GITHUB_REPOSITORY:-f-inverse/jammi-ai}.git}"
 GIT_REF="${GIT_REF:-${GITHUB_SHA:-main}}"
+
+# Sweep before renting anything. This workflow sets cancel-in-progress, so a
+# superseded run is SIGKILLed and never runs its EXIT trap; the pod it had just
+# rented is orphaned. Running the sweep here bounds any such orphan to the gap
+# until the next prove run rather than "until the account empties" — which is
+# what happened on 2026-07-24.
+rp_sweep
 
 rp_init
 echo "=== provisioning a live A100 (sm_80) ==="

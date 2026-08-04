@@ -160,6 +160,11 @@ RP_TTL_HOURS=24 ci/scripts/gpu-dev.sh up a100
 Only one job at a time per session — `run` replaces any existing one (it kills
 the `jammi` tmux session first).
 
+**Stopping one.** There is no `stop` verb. `run` something else to displace the
+job, `attach` and Ctrl-C to end it from its own terminal, or `down` the pod.
+Only `down` stops the meter: a pod with no job running bills exactly the same as
+one at full tilt. [dev-gpu.md](dev-gpu.md) records why the verb does not exist.
+
 ---
 
 ## Recipe 4 — Get back on a session you left
@@ -175,8 +180,25 @@ detaches; Ctrl-C kills the job** — the tool says so before handing over the
 keyboard. Use `--shell` when you want to poke around *while* a job runs, and
 `logs` when you only want to watch.
 
-Sessions are named after the arch. `RP_SESSION=second ci/scripts/gpu-dev.sh up a100`
-gives you a second A100 session.
+### A second pod of the same arch
+
+A session is named after its arch, so a second A100 needs a name of its own:
+
+```bash
+RP_SESSION=bench ci/scripts/gpu-dev.sh up a100     # `up` takes an ARCH — name it here
+ci/scripts/gpu-dev.sh run bench cargo run -p jammi-bench --release --features cuda -- gpu-inference-scale
+ci/scripts/gpu-dev.sh logs bench
+ci/scripts/gpu-dev.sh down bench
+```
+
+`RP_SESSION` is only needed on `up` and `shell`, which take an *arch* where every
+other verb takes a *session*. Each session is its own pod with its own SSH key,
+its own `jammi-<session>` block in the generated ssh config, and its own bill;
+`ls` shows them all regardless of which one you are pointed at.
+
+Set it inline on the one command that needs it, never in your shell profile: an
+exported `RP_SESSION` **overrides the positional session argument** everywhere,
+so `RP_SESSION=bench … down a100` terminates `bench` and says so.
 
 ---
 
@@ -331,6 +353,82 @@ keeps your tree on your own disk and is much harder to lose work with.
 
 ---
 
+## Recipe 11 — Serve from the pod, query from your laptop
+
+*The client/server shape: `jammi-server` holds the GPU and the models, your
+laptop runs the client and never loads the ML stack. It is the topology a client
+offloads training and inference to a GPU host in — and it is reachable on a
+rented pod, over an SSH tunnel rather than an exposed port.*
+
+Boot a session and put your code on it as usual, then start the server as the
+pod's job:
+
+```bash
+ci/scripts/gpu-dev.sh up a100
+ci/scripts/gpu-dev.sh push a100
+ci/scripts/gpu-dev.sh run a100 JAMMI_SERVER__FLIGHT_LISTEN=127.0.0.1:8081 JAMMI_SERVER__HEALTH_LISTEN=127.0.0.1:8080 JAMMI_GPU__REQUIRE_GPU=true cargo run -p jammi-server --release --features cuda
+```
+
+**Bind loopback, not `0.0.0.0`.** Those two overrides are the whole reason this
+is safe. The defaults are `0.0.0.0:8081` (Flight SQL + gRPC) and `0.0.0.0:8080`
+(health), and the pod is a rented multi-tenant host: binding the wildcard offers
+those ports to whatever else can reach it. It *looks* harmless only because the
+pod declares `22/tcp` and nothing else, so the provider routes nothing else in —
+that is somebody else's routing table, not a boundary we chose, and not one to
+build on. On loopback, the session's SSH key is the only way in.
+
+`JAMMI_GPU__REQUIRE_GPU=true` makes an unusable device fatal. Without it a GPU
+build degrades to CPU with a warning, and you would be serving CPU inference off
+an A100 without noticing. (The full config surface is
+`docs/guide/src/deploy-server.md`.)
+
+`run` returns as soon as the job is launched, and this job compiles first, so
+wait for the server to announce itself:
+
+```bash
+ci/scripts/gpu-dev.sh logs a100
+# jammi-server listening flight=127.0.0.1:8081 health=127.0.0.1:8080
+```
+
+Ctrl-C only detaches you. Then, from a second terminal, forward both ports over
+the ssh config `up` already wrote:
+
+```bash
+ssh -F ~/.config/runpod/ssh_config -N -o ExitOnForwardFailure=yes \
+  -L 8081:127.0.0.1:8081 -L 8080:127.0.0.1:8080 jammi-a100
+```
+
+**`-o ExitOnForwardFailure=yes` is not decoration.** Without it, a local 8081
+that is already busy — a local server, a tunnel to another pod — leaves `ssh`
+*connected with no forward at all*. Every query below then goes to whatever else
+holds that port and comes back confident and wrong. With it, `ssh` refuses to
+come up and you find out immediately.
+
+Now drive it from your laptop, against `localhost`:
+
+```bash
+cargo run -p jammi-cli -- status     # --target already defaults to grpc://127.0.0.1:8081
+curl -s localhost:8080/healthz
+```
+
+### One job per pod
+
+`run` kills the tmux session named `jammi` and starts a new one, so a pod runs
+exactly one job — and a server started with `run` **is** that job:
+
+- **A second `run` on this session kills the server.** To pick up new code:
+  `push`, then `run` the same server command again.
+- For a shell beside the running server use `attach a100 --shell`, or a second
+  `ssh -F ~/.config/runpod/ssh_config jammi-a100`. Plain `attach` joins the
+  server's own terminal, where Ctrl-C stops it.
+- Work that needs a job slot of its own needs a pod of its own —
+  `RP_SESSION=bench ci/scripts/gpu-dev.sh up a100`, per Recipe 4. That is a
+  second pod and a second bill.
+
+`down a100` stops the server, the pod and the meter together.
+
+---
+
 ## What things cost, and what stops them
 
 Every pod carries a deadline in its own entrypoint from the moment it starts —
@@ -341,6 +439,10 @@ limit rather than imposing its own.
 The guards are wall-clock ceilings, **not idle detection**. A pod you stopped
 using an hour ago is still billing. `down` when you are done; the guards are for
 when something kills your process before you can.
+
+`RP_TIMEOUT` is **not** one of the guards, whatever its name suggests: it caps
+the SSH invocation that *launches* a job, not the job, which is detached and
+outlives it. [dev-gpu.md](dev-gpu.md) has what it actually bounds.
 
 Your prepaid balance is the real ceiling, provided auto-recharge stays off.
 
@@ -370,7 +472,8 @@ verified never gets a pod.
 **`--ref <ref> was IGNORED`** — the session is already up on a different ref, and
 `up` does not move a live pod. `down` it and `up` again; `ls` shows which ref
 each session booted on. Passing the ref the pod is *already* on is a no-op, not
-an error.
+an error. There is no verb that moves a live checkout either, and that is
+deliberate — [dev-gpu.md](dev-gpu.md) says why one cannot be trusted.
 
 **`--ref <ref> cannot be honoured: <image> ships no git`** — you combined `--ref`
 with an image that cannot hold a checkout, which in practice means Recipe 6.

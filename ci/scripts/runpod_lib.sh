@@ -32,7 +32,12 @@
 # Requires env: RUNPOD_API_KEY.
 # Optional env:
 #   RP_IMAGE      pod image.
-#   RP_TIMEOUT    remote job timeout in seconds (default 3000).
+#   RP_TIMEOUT    seconds allowed for ONE rp_run_remote invocation (default
+#                 3000). It bounds the SSH invocation, not whatever that
+#                 invocation leaves behind: gpu-dev.sh's `run` uses it only to
+#                 launch a detached tmux session, which daemonizes and outlives
+#                 the timeout entirely. It is NOT a cost guard — RP_TTL_HOURS and
+#                 rp_sweep are.
 #   RP_SESSION    named session. Persists pod coordinates AND the SSH key under
 #                 RP_SESSION_ROOT so a *different* terminal can reattach. Unset =
 #                 throwaway temp dir, wiped on exit.
@@ -421,6 +426,11 @@ rp_deploy_live_a100() { rp_deploy_arch a100; }
 
 # Run a bash script (read from stdin) on the pod, with the container ENV imported
 # first and a hard timeout. Returns the remote script's exit code.
+#
+# The timeout binds THIS invocation only. A script that daemonizes something —
+# gpu-dev.sh's `run` starts a detached tmux session — returns immediately and
+# leaves the real work running past any RP_TIMEOUT. The pod's own deadline is the
+# thing that bounds that, which is why the deadline is armed in the entrypoint.
 rp_run_remote() {
   { printf '%s\n' "$RP_ENV_PREAMBLE"; cat; } \
     | ssh "${RP_SSHO[@]}" -p "$RP_PORT" "root@${RP_HOST}" "timeout ${RP_TIMEOUT:-3000} bash -s"

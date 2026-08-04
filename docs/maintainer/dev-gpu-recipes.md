@@ -10,9 +10,12 @@ outlives it. Nothing you care about should exist only on a pod.
 
 ---
 
-## Before anything else
+## Before anything else — your RunPod key
 
-Write your RunPod API key once:
+Get a key from the RunPod console: **Settings → API Keys → + Create API Key**.
+Copy it at creation; the console will not show it again.
+
+Then either write it to the file `gpu-dev.sh` reads:
 
 ```bash
 mkdir -p ~/.config/runpod
@@ -20,11 +23,38 @@ printf '%s' 'YOUR_KEY' > ~/.config/runpod/key
 chmod 600 ~/.config/runpod/key
 ```
 
+…or export `RUNPOD_API_KEY`, which takes precedence over the file if both exist.
+
+Confirm it works without renting anything — this only reads your balance:
+
+```bash
+curl -s "https://api.runpod.io/graphql?api_key=$(cat ~/.config/runpod/key)" \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"query{ myself{ clientBalance } }"}'
+```
+
+A number back means you are set. `{"errors":…}` means the key is wrong.
+
+### Handle it like a payment method, because it is
+
+- **The key spends real money.** Anything holding it can rent GPUs on the
+  account until the balance is gone.
+- **Use your own key**, not a shared one. Revoking one person's access should not
+  mean rotating everyone's.
+- **Never commit it.** It belongs in `~/.config/runpod/`, outside any repo. The
+  repo contains no key and no account identifiers — keep it that way.
+- CI does **not** use your key. It reads the `RUNPOD_API_KEY` GitHub Actions
+  secret, which is separate and only reachable by workflows in this repo.
+- The account balance is the real spend ceiling, so leave auto-recharge **off**.
+  If several developers share one account, you also share that ceiling.
+
 That is the whole required setup. `gpu-dev.sh` generates its own SSH key per
 session — nothing to register with RunPod.
 
 The shared compile cache is optional and worth it (a build measured 188s cold vs
-47s warm); see the setup block in [dev-gpu.md](dev-gpu.md).
+47s warm); see the setup block in [dev-gpu.md](dev-gpu.md). Note it needs a
+*second* credential — an S3 API key, which is not the same thing as the API key
+above.
 
 ### Picking an arch
 

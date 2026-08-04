@@ -4,6 +4,9 @@ jammi's default `cargo test` is CPU-hermetic; the GPU path is exercised only by
 the gated `live-gpu-tests` lane. You don't need a local GPU — rent one per task
 on RunPod through `ci/scripts/gpu-dev.sh`.
 
+**Looking for how to do a specific thing?** [dev-gpu-recipes.md](dev-gpu-recipes.md)
+is the task-oriented walkthrough. This page is the design and setup reference.
+
 A pod has two independent axes:
 
 - **lifetime** — `shell` gives a throwaway pod that dies when you exit. `up`

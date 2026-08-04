@@ -466,6 +466,16 @@ yum install -y rsync tmux >/dev/null 2>&1 || echo "warn: pod tool install failed
     printf 'export %s=%q\n' "\${__e%%=*}" "\${__e#*=}"
   done < /proc/1/environ; } > /root/.jammi_env
 
+# Make shells we do NOT launch correct too — plain ssh, an editor's remote server,
+# a language server. An SSH session inherits none of the container's Dockerfile
+# ENV, so without this cargo, nvcc and mold are absent from any session that did
+# not come through gpu-dev.sh. Both files are needed: /etc/profile.d is read by
+# LOGIN shells (which is how an editor server and its language server are
+# started), .bashrc by interactive non-login ones.
+echo '[ -f /root/.jammi_env ] && . /root/.jammi_env' > /etc/profile.d/jammi-env.sh
+grep -q jammi_env /root/.bashrc 2>/dev/null \
+  || echo '[ -f /root/.jammi_env ] && . /root/.jammi_env' >> /root/.bashrc
+
 if [ "${s3}" = "1" ]; then
   export AWS_ACCESS_KEY_ID='${RP_S3_ACCESS_KEY_ID:-}'
   export AWS_SECRET_ACCESS_KEY='${RP_S3_SECRET_ACCESS_KEY:-}'

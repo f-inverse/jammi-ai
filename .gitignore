@@ -81,3 +81,5 @@ docs/plans/*
 docs/superpowers/
 docs/IMPLEMENTATION.md
 docs/specs/
+# Artifacts pulled off a GPU pod by `ci/scripts/gpu-dev.sh pull`.
+.gpu-pull/

@@ -40,7 +40,8 @@ gpu-dev.sh — GPU development on RunPod
 
   shell   [arch]              throwaway shell; the pod dies when you exit
   up      [arch]              start a session whose pod SURVIVES disconnect
-  attach  [session]           shell into a surviving session
+  attach  [session]           join a surviving session's running job
+                              (--shell for a plain prompt instead)
   run     [session] <cmd...>  run <cmd> detached under tmux
   logs    [session]           tail the detached job's output
   push    [session]           rsync your working tree TO the pod
@@ -100,9 +101,19 @@ esac
 # shellcheck source=ci/scripts/runpod_lib.sh
 source "$DIR/runpod_lib.sh"
 
-# Interactive remote command: correct env, then a shell in the checkout.
-rp_login_cmd() {
-  echo '[ -f /root/.jammi_env ] && . /root/.jammi_env; cd /root/jammi-ai 2>/dev/null; exec bash -i'
+# Interactive remote command: correct env, then either the running job's terminal
+# or a plain shell in the checkout. Pass "job" to prefer the job when one exists.
+rp_login_cmd() { # $1 = "job" to join a live tmux job
+  local pre='[ -f /root/.jammi_env ] && . /root/.jammi_env; cd /root/jammi-ai 2>/dev/null;'
+  if [ "${1:-}" = "job" ]; then
+    # Ctrl-C inside the job's pane signals the job itself, so say so before
+    # handing over the keyboard — this is a terminal that can destroy work.
+    printf '%s %s' "$pre" 'if tmux has-session -t jammi 2>/dev/null; then
+      echo "=== joining the running job. Ctrl-B then D detaches. Ctrl-C KILLS the job. ===";
+      exec tmux attach -t jammi; fi; exec bash -i'
+  else
+    printf '%s %s' "$pre" 'exec bash -i'
+  fi
 }
 
 require_pod() {
@@ -151,7 +162,11 @@ case "$CMD" in
 
   attach)
     require_pod; rp_keep
-    ssh "${RP_SSHO[@]}" -t -p "$RP_PORT" "root@${RP_HOST}" "$(rp_login_cmd)" || true
+    # Joins the running job's terminal when there is one — that is what the word
+    # means everywhere else. `--shell` forces a plain prompt, for when you want to
+    # poke around WHILE a job runs rather than take its keyboard.
+    MODE=job; [ "${1:-}" = "--shell" ] && MODE=shell
+    ssh "${RP_SSHO[@]}" -t -p "$RP_PORT" "root@${RP_HOST}" "$(rp_login_cmd "$MODE")" || true
     echo "=== detached; pod ${RP_POD_ID} still running (down with: $(basename "$0") down ${SESSION}) ==="
     ;;
 

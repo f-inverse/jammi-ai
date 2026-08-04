@@ -247,30 +247,58 @@ A cron (`.github/workflows/gpu-reap.yml`) runs the same sweep every 6 hours.
 
 ## Recipe 10 — Editor / IDE remote session
 
-Possible, with caveats worth reading first.
+*You are living inside the cuda-gated code and want completion, go-to-definition
+and inline errors over it. A local editor cannot give you that: it cannot resolve
+`--features cuda` without a CUDA toolchain, so everything behind
+`#[cfg(feature = "cuda")]` stays dim.*
 
-A login shell on the pod has the full toolchain (cargo, rustc, nvcc, `CC`), so a
-remote server and language server work. Connect with the session's own key:
+`up` writes an ssh config for every live session:
 
 ```bash
-cat ~/.config/runpod/sessions/a100/meta      # RP_HOST, RP_PORT
-# key: ~/.config/runpod/sessions/a100/id_ed25519
+ci/scripts/gpu-dev.sh up a100
+ssh -F ~/.config/runpod/ssh_config jammi-a100     # confirm it works
 ```
 
-Add that host/port/key to `~/.ssh/config` and connect to `/root/jammi-ai`.
+It lives at `~/.config/runpod/ssh_config` and holds one `Host jammi-<session>`
+block per session, regenerated on every `up` and `down`. **`~/.ssh/config` is
+never touched** — a bug rewriting that file would break every other host you
+have. To make the hosts visible to tools that read the default config, opt in
+once, either way:
 
-Three things to know:
+```bash
+# in ~/.ssh/config, at the top:
+Include ~/.config/runpod/ssh_config
+```
 
-1. **Host and port change with every pod.** Nothing maintains your ssh config;
-   you re-edit it each session.
-2. **Your work then lives on a disposable pod.** It self-terminates at
+or point your editor's remote-SSH `configFile` setting at
+`~/.config/runpod/ssh_config`.
+
+Then connect to `jammi-a100` and open `/root/jammi-ai`. A login shell there has
+cargo, rustc, nvcc and the right `CC`, which is what a remote server and language
+server need.
+
+### What this does not solve
+
+1. **Your work now lives on a disposable pod.** It self-terminates at
    `RP_TTL_HOURS` and the sweep collects it. Work on a branch and `git push`
-   often — a reaped pod takes uncommitted work with it.
-3. **Never run `push` in this mode.** It is `rsync --delete` from your machine
-   and will destroy your pod-side edits without asking.
+   often; a reaped pod takes uncommitted work with it. Consider a longer
+   deadline for an editor session — an 8-hour default expiring mid-afternoon
+   lands on unsaved work.
+2. **Never run `push` in this mode.** It is `rsync --delete` from your machine
+   and destroys pod-side edits without asking. The push loop and editing on the
+   pod are mutually exclusive.
+3. **The pod starts on `main`.** Check out your branch on the pod once you are
+   connected.
+4. **Host and port change with every new pod.** The config file regenerates, but
+   an editor that has cached the old connection may need its window reloaded.
+5. **The remote server is re-downloaded per pod** (~100 MB). It lives on the
+   pod's disk, so a new pod means a new download.
+6. **Untested: the editor server's glibc floor.** VS Code Server requires glibc
+   ≥ 2.28 and the CI image is `manylinux_2_28` — exactly 2.28. It should work; no
+   one has confirmed it. The plain `ssh` path above is verified.
 
-If you mostly want an IDE, Recipe 2 keeps your tree on your own disk and is
-harder to lose work with.
+If you are mostly in shared CPU code and touch GPU paths occasionally, Recipe 2
+keeps your tree on your own disk and is much harder to lose work with.
 
 ---
 

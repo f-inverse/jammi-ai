@@ -153,8 +153,10 @@ case "$CMD" in
     echo "=== bootstrapping ==="
     rp_bootstrap || { echo "::error::bootstrap failed — terminating pod"; exit 1; }
     rp_keep
+    rp_ssh_config_sync
     echo
     echo "=== session '${SESSION}' up on ${RP_HOST}:${RP_PORT} (pod ${RP_POD_ID}) ==="
+    echo "    ssh:     ssh -F ${RP_SSH_CONFIG} jammi-${SESSION}"
     echo "    attach:  $(basename "$0") attach ${SESSION}"
     echo "    run job: $(basename "$0") run ${SESSION} cargo test -p jammi-ai --features cuda,live-gpu-tests"
     echo "    STOP:    $(basename "$0") down ${SESSION}      # else it self-terminates in ${RP_TTL_HOURS}h"
@@ -222,6 +224,8 @@ EOF
     fi
     RP_POD_ID=""   # already gone; keep the EXIT trap from double-terminating
     rp_session_forget
+    # After the session file is gone, so the dead host stops being offered.
+    rp_ssh_config_sync
     ;;
 
   *) echo "unknown command: $CMD"; usage 2 ;;

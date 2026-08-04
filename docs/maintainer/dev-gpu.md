@@ -99,6 +99,26 @@ The pod boots the CUDA CI image, clones the repo, restores the cache, and drops
 you into a shell in the checkout with the container's build environment already
 loaded. It is terminated when you exit.
 
+The checkout is placed on `main` unless you name a ref:
+
+```bash
+ci/scripts/gpu-dev.sh shell a40 --ref my-branch
+ci/scripts/gpu-dev.sh up a100 --ref v0.3.1
+```
+
+`--ref` takes a branch, a tag or a commit. A branch or tag is proved to exist
+with `git ls-remote` *before* a pod is rented, so a typo costs a second rather
+than a GPU-hour plus the minutes-long wait for SSH; a commit id is the one form
+no remote query can resolve, and is checked on the pod. The ref is recorded in
+the session and shown by `ls`, because otherwise nothing says which code a pod is
+running. Bootstrap fails loudly — and the pod is terminated — if the fetch, the
+checkout, or the fast-forward fails, since a pod quietly sitting on an older
+commit produces real results for code nobody is reading.
+
+`up` never moves a live pod onto a different ref: `down` the session and start it
+again. Passing `--ref` to a session that is already up is an error, not a
+silently ignored flag.
+
 To reproduce the **shipped runtime image** (e.g. the uid-65532 JIT-cache case in
 #305) instead of the toolchain image:
 
@@ -126,6 +146,15 @@ command and your SSH connection. Sessions are named after the arch; set
 
 `push` deliberately excludes `target/` — your host build output is the wrong
 architecture and would poison the pod's.
+
+**`--ref` and `push` are alternatives, not partners.** `push` is
+`rsync --delete` excluding `.git`, so it overwrites the working tree while
+leaving the pod's git metadata pointing at whatever was checked out: the pod then
+reports HEAD on one ref while holding the contents of another, and every git
+command on the pod answers about the wrong thing. Use `--ref` for the modes that
+do not push — a shell on a branch, an editor session, a job run straight from a
+pushed branch — and leave the pod on `main` when the push loop is what moves your
+code.
 
 ## Cost guard
 
@@ -185,12 +214,11 @@ Three guards, in order of when they act:
 Guard 2 needs the network at deadline time; guard 3 needs this repo's CI to be
 running. They fail for unrelated reasons, which is the point of having both.
 
-All three are **wall-clock ceilings, not idle detection** — a pod you stop using
-bills until its deadline. Run `down` when you're finished.
+Guards 2 and 3 are **wall-clock ceilings, not idle detection** — a pod you stop
+using bills until its deadline. Run `down` when you're finished; the guards are
+for the times something kills the process before you can.
 
-Both are **wall-clock ceilings, not idle detection** — a pod you stop using bills
-until its deadline. Run `down` when you're finished; the guards are for the times
-something kills the process before you can.
+Lower the ceiling when you know the work is short:
 
 ```bash
 RP_TTL_HOURS=2 ci/scripts/gpu-dev.sh up a100

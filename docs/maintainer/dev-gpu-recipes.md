@@ -82,10 +82,17 @@ behave differently.*
 
 ```bash
 ci/scripts/gpu-dev.sh shell a40
+ci/scripts/gpu-dev.sh shell a40 --ref my-branch   # look at a branch, not main
 ```
 
 Lands you in `/root/jammi-ai` with cargo, nvcc and mold on `PATH`. **The pod is
 terminated when you exit.** Nothing survives — this is for looking, not working.
+
+`--ref` takes a branch, a tag or a commit, and defaults to `main`. A branch or
+tag that does not exist is caught by `git ls-remote` *before* anything is rented;
+a commit id cannot be resolved that way, so it is the one form whose failure you
+pay a pod for. Either way the boot fails loudly rather than leaving you on `main`
+looking at the wrong code.
 
 ---
 
@@ -106,11 +113,21 @@ You edit locally in your normal environment. The pod only executes.
 
 Two things that surprise people:
 
-- **The pod starts on `main`.** Bootstrap clones and checks out `main`, not your
-  branch. Your branch and your uncommitted work arrive with `push`.
+- **The pod starts on `main` unless you say otherwise.** Bootstrap checks out
+  `main`; `--ref` names a different branch, tag or commit. In *this* loop leave
+  it on `main` — `push` is what carries your code, and see the note below on why
+  the two do not mix.
 - **`push` is `rsync --delete`**, excluding `.git`, `target/` and `.venv`. It
   makes the pod's tree match yours exactly, so anything you edited *on the pod*
   is destroyed. Never mix `push` with editing on the pod.
+
+**Do not combine `--ref` with the push loop.** Because `push` excludes `.git`, a
+pod booted with `--ref X` and then pushed to from branch `Y` reports HEAD on `X`
+while holding `Y`'s files. Nothing is lost — the code that runs is the code you
+pushed — but every git command on the pod, and anything reading HEAD to label a
+result, now answers about a commit that is not there. `--ref` is for the modes
+that never push: a shell on a branch (Recipe 1), an editor session (Recipe 10),
+or a job run straight from a pushed branch.
 
 ---
 
@@ -255,7 +272,7 @@ and inline errors over it. A local editor cannot give you that: it cannot resolv
 `up` writes an ssh config for every live session:
 
 ```bash
-ci/scripts/gpu-dev.sh up a100
+ci/scripts/gpu-dev.sh up a100 --ref my-branch     # boot straight onto your branch
 ssh -F ~/.config/runpod/ssh_config jammi-a100     # confirm it works
 ```
 
@@ -287,8 +304,9 @@ server need.
 2. **Never run `push` in this mode.** It is `rsync --delete` from your machine
    and destroys pod-side edits without asking. The push loop and editing on the
    pod are mutually exclusive.
-3. **The pod starts on `main`.** Check out your branch on the pod once you are
-   connected.
+3. **Boot on the branch you intend to edit** — `up a100 --ref my-branch`. This is
+   the mode `--ref` exists for: you are editing on the pod, so `push` is off the
+   table and the checkout is the only thing that can put your code there.
 4. **Host and port change with every new pod.** The config file regenerates, but
    an editor that has cached the old connection may need its window reloaded.
 5. **The remote server is re-downloaded per pod** (~100 MB). It lives on the
@@ -332,6 +350,19 @@ so.
 
 **`no live session '<name>'`** — the pod was reaped or the host died. Start a new
 one with `up`.
+
+**`'<ref>' is not a branch or tag`** — the ref does not exist on the remote.
+Nothing was rented; fix the spelling, or `git push` the branch first. The same
+refusal covers a remote that cannot be reached at all: a ref that cannot be
+verified never gets a pod.
+
+**`--ref <ref> was IGNORED`** — the session is already up on a different ref, and
+`up` does not move a live pod. `down` it and `up` again; `ls` shows which ref
+each session booted on.
+
+**`'<ref>' cannot fast-forward`** — the branch was force-pushed, so the pod's
+copy is on a commit that no longer exists upstream. Bootstrap stops rather than
+build it. `down` and `up` again for a clean clone.
 
 **`::warning::sccache could not use the S3 backend`** — the cache is unreachable
 and the pod fell back to a local disk cache. Builds still work, just cold. Check

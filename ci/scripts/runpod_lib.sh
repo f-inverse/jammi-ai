@@ -38,7 +38,8 @@
 #                 throwaway temp dir, wiped on exit.
 #   RP_KEEP       1 = leave the pod running when this process exits.
 #   RP_TTL_HOURS  hard deadline baked into every pod at deploy (default 8).
-# Sets globals: RP_POD_ID, RP_HOST, RP_PORT. Installs an EXIT trap for teardown.
+# Sets globals: RP_POD_ID, RP_HOST, RP_PORT, RP_REF. Installs an EXIT trap for
+# teardown.
 
 : "${RUNPOD_API_KEY:?RUNPOD_API_KEY must be set (GitHub secret)}"
 RP_IMAGE="${RP_IMAGE:-ghcr.io/f-inverse/jammi-ai-ci-cuda:latest}"
@@ -81,6 +82,9 @@ fi
 RP_SSH_KEY="$RP_WORK/id_ed25519"
 RP_META="$RP_WORK/meta"
 RP_POD_ID=""; RP_HOST=""; RP_PORT=""; RP_PUBKEY=""; RP_ARCH=""; RP_SSHO=()
+# The git ref the pod's checkout sits on. Set by rp_bootstrap only after the
+# checkout succeeded, so recorded state never claims a ref the pod is not on.
+RP_REF=""
 
 # An SSH login shell does NOT inherit the container's Dockerfile ENV (CC=gcc-13,
 # PATH with cuda+mold+rust). Every remote job imports PID 1's real environment.
@@ -126,7 +130,7 @@ rp_session_save() {
   [ -n "$RP_SESSION" ] || return 0
   _rp_work_mkdir
   { echo "RP_POD_ID=$RP_POD_ID"; echo "RP_HOST=$RP_HOST"; echo "RP_PORT=$RP_PORT"
-    echo "RP_ARCH=$RP_ARCH"; echo "RP_IMAGE=$RP_IMAGE"; } > "$RP_META"
+    echo "RP_ARCH=$RP_ARCH"; echo "RP_IMAGE=$RP_IMAGE"; echo "RP_REF=$RP_REF"; } > "$RP_META"
   chmod 600 "$RP_META"
 }
 
@@ -153,8 +157,11 @@ rp_session_list() {
   for d in "$RP_SESSION_ROOT"/*/; do
     [ -f "${d}meta" ] || continue
     name="$(basename "$d")"
+    # A session with no recorded ref never completed a bootstrap; say so rather
+    # than imply main, which is the guess this whole path exists to remove.
     # shellcheck disable=SC1090
-    ( . "${d}meta"; printf '%-16s %-20s %s@%s\n' "$name" "${RP_POD_ID}" "${RP_ARCH}" "${RP_HOST}:${RP_PORT}" )
+    ( . "${d}meta"; printf '%-16s %-20s %-18s %s@%s\n' \
+        "$name" "${RP_POD_ID}" "${RP_REF:-<none>}" "${RP_ARCH}" "${RP_HOST}:${RP_PORT}" )
   done
 }
 
@@ -481,6 +488,59 @@ for p in me['pods']:
   echo "sweep: terminated ${n} orphaned pod(s)"
 }
 
+# A ref travels to the pod inside a remote command line, so it is constrained to
+# git's own refname charset before it can get there. Anything outside that charset
+# — a quote, a semicolon, a backtick — closes the interpolation and hands the
+# remainder to the pod's shell as commands.
+#
+# The empty string is rejected rather than defaulted: a caller that computed an
+# empty ref asked for a specific thing and got nothing, and silently substituting
+# `main` builds the wrong commit while reporting success. A leading `-` reads as
+# an option to git, and `..` is a range, never a single ref.
+rp_ref_check() { # $1=ref
+  case "${1:-}" in
+    '')   echo "::error::git ref is empty" >&2; return 2 ;;
+    -*)   echo "::error::git ref must not start with '-' (got '${1}')" >&2; return 2 ;;
+    *..*) echo "::error::git ref must not contain '..' (got '${1}')" >&2; return 2 ;;
+    *[!A-Za-z0-9._/-]*)
+          echo "::error::git ref may contain only [A-Za-z0-9._/-] (got '${1}')" >&2; return 2 ;;
+  esac
+}
+
+# An abbreviated or full commit id: all hex, at least 7 characters. Such a ref is
+# spelled exactly like a branch of the same name and a remote resolves names, not
+# object ids, so it can never be pre-checked.
+_rp_ref_is_objectish() { # $1=ref
+  [ "${#1}" -ge 7 ] && [ "${#1}" -le 40 ] || return 1
+  case "$1" in *[!0-9a-f]*) return 1 ;; esac
+}
+
+# Prove a ref exists BEFORE a pod is rented. `git ls-remote` costs about a second
+# and no money; learning the same fact from the pod costs a GPU plus the
+# minutes-long wait for SSH. An unverifiable ref refuses to rent, in both
+# directions: a ref that is absent and a remote that cannot be reached are
+# different messages but the same answer, because renting on a guess is the
+# expensive mistake.
+#
+# A commit id is the one ref that cannot be answered here and is therefore
+# verified on the pod — the single case where the failure is paid for.
+rp_ref_precheck() { # $1=ref
+  local rc
+  if _rp_ref_is_objectish "$1"; then
+    echo "note: '${1}' looks like a commit id — it can only be verified on the pod"
+    return 0
+  fi
+  git ls-remote --exit-code --heads --tags "$RP_REPO_URL" "$1" >/dev/null 2>&1
+  rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    2) echo "::error::'${1}' is not a branch or tag in ${RP_REPO_URL} — nothing was rented" >&2 ;;
+    *) echo "::error::could not reach ${RP_REPO_URL} to verify '${1}' (git ls-remote exit ${rc})" >&2
+       echo "::error::refusing to rent a pod for a ref that cannot be verified" >&2 ;;
+  esac
+  return 1
+}
+
 # Make the pod ready to build jammi: import the container ENV (already done by
 # rp_run_remote), point sccache at the object store, and place the repo at $1
 # (default: main).
@@ -491,8 +551,13 @@ for p in me['pods']:
 # for 868 crates, because datacenter bandwidth makes it free. Restoring a 285MB
 # tarball was slower than just fetching. The real cold cost is COMPILATION, which
 # is what sccache addresses.
-rp_bootstrap() { # $1=git ref (optional)
-  local ref="${1:-main}" s3=0
+# An omitted ref means main; an empty one is a caller bug, not a default. The
+# distinction is made on argument COUNT, because `${1:-main}` collapses the two
+# and turns "the ref I computed is empty" into a silent, successful boot on main.
+rp_bootstrap() { # $1=git ref (optional; default main)
+  local ref=main s3=0 rc
+  [ $# -gt 0 ] && ref="$1"
+  rp_ref_check "$ref" || return 2
   rp_s3_load && s3=1
   rp_run_remote <<EOF
 set -uo pipefail
@@ -561,16 +626,32 @@ if [ ! -d /root/jammi-ai/.git ]; then
   git clone --filter=blob:none "${RP_REPO_URL}" /root/jammi-ai || exit 1
 fi
 cd /root/jammi-ai || exit 1
-git fetch --all --quiet
-# Fail loudly on a ref that does not exist. Chained with && this short-circuited
-# and still printed "bootstrap complete", leaving you silently on main and
-# wondering why your change was not there.
+
+# Every step below is checked. A pod that reports "bootstrap complete" while
+# sitting on an older commit is worse than one that failed: the build, the test
+# result and the benchmark are all real, and all answer a question about code
+# nobody is looking at.
+git fetch --all --tags --prune --quiet \
+  || { echo "::error::git fetch failed — the pod cannot see the current refs"; exit 1; }
 git checkout --quiet "${ref}" \
   || { echo "::error::ref '${ref}' not found in ${RP_REPO_URL}"; exit 1; }
-# Fast-forward only when on a branch; a tag or sha is a detached HEAD and pull
-# would fail noisily for no reason.
-git symbolic-ref -q HEAD >/dev/null 2>&1 && git pull --quiet --ff-only 2>/dev/null
+# Only a branch tracks anything; a tag or a commit id is a detached HEAD where
+# there is nothing to fast-forward to. A branch that will NOT fast-forward has
+# been force-pushed, so the checkout is on a commit that no longer exists
+# upstream — the one case this whole sequence exists to catch.
+if git symbolic-ref -q HEAD >/dev/null; then
+  git pull --quiet --ff-only \
+    || { echo "::error::'${ref}' cannot fast-forward — force-pushed? the pod is on a stale commit"; exit 1; }
+fi
 
 echo "bootstrap complete: ${ref} @ \$(git rev-parse --short HEAD)"
 EOF
+  rc=$?
+  [ "$rc" -eq 0 ] || return "$rc"
+  # The ref is an identity axis of a session: nothing else records which code a
+  # pod is running, so `ls` and a second terminal cannot otherwise tell. Written
+  # only once the checkout has actually happened, and its failure is the caller's
+  # failure — a session that cannot be recorded is a pod nobody can find again.
+  RP_REF="$ref"
+  rp_session_save
 }

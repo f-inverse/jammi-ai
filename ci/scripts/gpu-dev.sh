@@ -15,8 +15,8 @@
 # See `docs/maintainer/dev-gpu.md`.
 #
 # Usage:
-#   gpu-dev.sh shell   [arch]              throwaway shell; pod dies on exit
-#   gpu-dev.sh up      [arch]              start a surviving session (name = arch)
+#   gpu-dev.sh shell   [arch] [--ref R]    throwaway shell; pod dies on exit
+#   gpu-dev.sh up      [arch] [--ref R]    start a surviving session (name = arch)
 #   gpu-dev.sh attach  [session]           shell into a surviving session
 #   gpu-dev.sh run     [session] <cmd...>  run <cmd> detached under tmux
 #   gpu-dev.sh logs    [session]           tail the detached job's output
@@ -26,6 +26,8 @@
 #   gpu-dev.sh ls                          list sessions
 #
 # arch: a100 (default) | l40s | h100 | a40 | l4
+# --ref: branch, tag or commit the pod's checkout is placed on (default main).
+#        Verified against the remote BEFORE a pod is rented.
 # Env: RUNPOD_API_KEY (or ~/.config/runpod/key), RP_IMAGE, RP_TTL_HOURS (8).
 set -uo pipefail
 
@@ -38,8 +40,8 @@ usage() {
   cat <<'USAGE'
 gpu-dev.sh — GPU development on RunPod
 
-  shell   [arch]              throwaway shell; the pod dies when you exit
-  up      [arch]              start a session whose pod SURVIVES disconnect
+  shell   [arch] [--ref R]    throwaway shell; the pod dies when you exit
+  up      [arch] [--ref R]    start a session whose pod SURVIVES disconnect
   attach  [session]           join a surviving session's running job
                               (--shell for a plain prompt instead)
   run     [session] <cmd...>  run <cmd> detached under tmux
@@ -52,6 +54,9 @@ gpu-dev.sh — GPU development on RunPod
                               ([hours] force-reaps everything older than that)
 
 arch: a100 (default) | l40s | h100 | a40 | l4
+--ref R: branch, tag or commit for the pod's checkout (default main), checked
+         against the remote before anything is rented. `up` does not move a live
+         pod: `down` it first.
 Sessions are named after the arch; RP_SESSION overrides.
 Env: RUNPOD_API_KEY (or ~/.config/runpod/key), RP_IMAGE, RP_TTL_HOURS (default 8).
 USAGE
@@ -67,7 +72,7 @@ case "$CMD" in
   ls)
     # shellcheck source=ci/scripts/runpod_lib.sh
     source "$DIR/runpod_lib.sh"
-    printf '%-16s %-20s %s\n' SESSION POD ARCH@HOST
+    printf '%-16s %-20s %-18s %s\n' SESSION POD REF ARCH@HOST
     rp_session_list
     exit 0
     ;;
@@ -81,14 +86,42 @@ case "$CMD" in
     ;;
 esac
 
-ARG="${1:-}"; [ $# -gt 0 ] && shift
-
 # Sessions are named after the arch, so the common case needs no bookkeeping:
 # `up a100` … `attach a100` … `down a100`. RP_SESSION overrides for a second pod
 # of the same arch.
+#
+# Only the two commands that BOOT a pod take options, and only they get a flag
+# loop. `run` hands its whole tail to the pod as a command line, so parsing flags
+# there would eat `cargo test -- --nocapture` alive.
+REF=main
+REF_EXPLICIT=0
 case "$CMD" in
-  shell|up) ARCH="${ARG:-a100}"; SESSION="${RP_SESSION:-$ARCH}" ;;
-  *)        SESSION="${RP_SESSION:-${ARG:-a100}}"; ARCH="" ;;
+  shell|up)
+    ARCH=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --ref)
+          # A flag whose value is missing must not silently become a default:
+          # `up --ref` would otherwise boot main and look like it honoured you.
+          [ $# -ge 2 ] || { echo "::error::--ref needs a value (a branch, tag or commit)"; exit 2; }
+          REF="$2"; REF_EXPLICIT=1; shift 2 ;;
+        --ref=*)
+          REF="${1#--ref=}"; REF_EXPLICIT=1; shift ;;
+        # An unrecognised option is a hard error, never a positional argument.
+        # Absorbing one makes `up --ref x` die on "unknown arch '--ref'" — a
+        # message naming a problem the user does not have.
+        -*) echo "::error::unknown option '$1' for ${CMD}"; usage 2 ;;
+        *)
+          [ -z "$ARCH" ] || { echo "::error::${CMD}: unexpected argument '$1'"; usage 2; }
+          ARCH="$1"; shift ;;
+      esac
+    done
+    ARCH="${ARCH:-a100}"; SESSION="${RP_SESSION:-$ARCH}"
+    ;;
+  *)
+    ARG="${1:-}"; [ $# -gt 0 ] && shift
+    SESSION="${RP_SESSION:-${ARG:-a100}}"; ARCH=""
+    ;;
 esac
 
 # `shell` is throwaway: no named session, so the EXIT trap wipes
@@ -100,6 +133,12 @@ esac
 
 # shellcheck source=ci/scripts/runpod_lib.sh
 source "$DIR/runpod_lib.sh"
+
+# The ref rules live with the code that sends the ref to the pod, so they are
+# applied here as soon as that code is available — before anything is rented.
+case "$CMD" in
+  shell|up) rp_ref_check "$REF" || exit 2 ;;
+esac
 
 # Interactive remote command: correct env, then either the running job's terminal
 # or a plain shell in the checkout. Pass "job" to prefer the job when one exists.
@@ -126,36 +165,53 @@ require_pod() {
 case "$CMD" in
 
   shell)
+    # Before rp_init, before anything is rented: a bad ref costs a second here
+    # and a GPU-hour plus a four-minute SSH wait on the far side of the deploy.
+    rp_ref_precheck "$REF" || exit 2
     rp_init
-    echo "=== provisioning ${ARCH} (image: ${RP_IMAGE}) ==="
+    echo "=== provisioning ${ARCH} on ${REF} (image: ${RP_IMAGE}) ==="
     rp_deploy_arch "$ARCH" || exit $?
     echo "=== bootstrapping ==="
-    rp_bootstrap
-    echo "=== pod ${RP_POD_ID} on ${RP_HOST}:${RP_PORT} — it TERMINATES when you exit ==="
+    # A pod on the wrong code answers the wrong question convincingly, so a failed
+    # bootstrap ends the session rather than dropping you into a shell on it.
+    rp_bootstrap "$REF" || { echo "::error::bootstrap failed — terminating pod (trap)"; exit 1; }
+    echo "=== pod ${RP_POD_ID} on ${RP_HOST}:${RP_PORT} @ ${RP_REF} — it TERMINATES when you exit ==="
     ssh "${RP_SSHO[@]}" -t -p "$RP_PORT" "root@${RP_HOST}" "$(rp_login_cmd)" || true
     echo "=== shell closed — terminating pod (trap) ==="
     ;;
 
   up)
     if rp_session_load && rp_session_alive; then
-      echo "session '${SESSION}' already live on ${RP_HOST}:${RP_PORT} (pod ${RP_POD_ID})"
+      # rp_keep FIRST: this pod belongs to a session that is already running, and
+      # every exit below must leave it alone.
+      rp_keep
+      echo "session '${SESSION}' already live on ${RP_HOST}:${RP_PORT} (pod ${RP_POD_ID}, ref ${RP_REF:-<none>})"
+      # `up` never moves a live pod. Reporting success on an ignored --ref would
+      # leave you reading results from one ref while believing they came from
+      # another — the exact failure this flag exists to remove.
+      if [ "$REF_EXPLICIT" = 1 ] && [ "$REF" != "${RP_REF:-}" ]; then
+        echo "::error::--ref ${REF} was IGNORED: the live pod is on '${RP_REF:-<none>}'"
+        echo "::error::to boot on ${REF}: $(basename "$0") down ${SESSION} && $(basename "$0") ${CMD} ${ARCH} --ref ${REF}"
+        exit 1
+      fi
       echo "attach with: $(basename "$0") attach ${SESSION}"
-      rp_keep; exit 0
+      exit 0
     fi
+    rp_ref_precheck "$REF" || exit 2
     # A recorded-but-dead pod (reaped, or a host that died) must not be carried
     # into the deploy — the EXIT trap would act on a stale id.
     RP_POD_ID=""
     rp_init
-    echo "=== provisioning ${ARCH} (image: ${RP_IMAGE}) ==="
+    echo "=== provisioning ${ARCH} on ${REF} (image: ${RP_IMAGE}) ==="
     rp_deploy_arch "$ARCH" || exit $?
     # No separate arming step: the ${RP_TTL_HOURS}h deadline is baked into the
     # pod's entrypoint at deploy, so it is already running.
     echo "=== bootstrapping ==="
-    rp_bootstrap || { echo "::error::bootstrap failed — terminating pod"; exit 1; }
+    rp_bootstrap "$REF" || { echo "::error::bootstrap failed — terminating pod"; exit 1; }
     rp_keep
     rp_ssh_config_sync
     echo
-    echo "=== session '${SESSION}' up on ${RP_HOST}:${RP_PORT} (pod ${RP_POD_ID}) ==="
+    echo "=== session '${SESSION}' up on ${RP_HOST}:${RP_PORT} @ ${RP_REF} (pod ${RP_POD_ID}) ==="
     echo "    ssh:     ssh -F ${RP_SSH_CONFIG} jammi-${SESSION}"
     echo "    attach:  $(basename "$0") attach ${SESSION}"
     echo "    run job: $(basename "$0") run ${SESSION} cargo test -p jammi-ai --features cuda,live-gpu-tests"

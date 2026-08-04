@@ -103,28 +103,41 @@ The checkout is placed on `main` unless you name a ref:
 
 ```bash
 ci/scripts/gpu-dev.sh shell a40 --ref my-branch
-ci/scripts/gpu-dev.sh up a100 --ref v0.3.1
+ci/scripts/gpu-dev.sh up a100 --ref v0.47.0
 ```
 
 `--ref` takes a branch, a tag or a commit. A branch or tag is proved to exist
 with `git ls-remote` *before* a pod is rented, so a typo costs a second rather
 than a GPU-hour plus the minutes-long wait for SSH; a commit id is the one form
-no remote query can resolve, and is checked on the pod. The ref is recorded in
-the session and shown by `ls`, because otherwise nothing says which code a pod is
-running. Bootstrap fails loudly — and the pod is terminated — if the fetch, the
-checkout, or the fast-forward fails, since a pod quietly sitting on an older
-commit produces real results for code nobody is reading.
+no remote query can resolve, and is checked on the pod. That precheck never
+prompts for anything and is bounded in time, so an unreachable or private
+`RP_REPO_URL` fails fast instead of stalling every `up` on a credential prompt.
+The ref is recorded in the session and shown by `ls`, because otherwise nothing
+says which code a pod is running. Bootstrap fails loudly — and the pod is
+terminated — if the fetch, the checkout, or the fast-forward fails, since a pod
+quietly sitting on an older commit produces real results for code nobody is
+reading.
 
 `up` never moves a live pod onto a different ref: `down` the session and start it
-again. Passing `--ref` to a session that is already up is an error, not a
-silently ignored flag.
+again. A `--ref` that names a ref the live pod is **not** on is an error rather
+than a silently ignored flag; naming the ref it is already on is a no-op.
 
-To reproduce the **shipped runtime image** (e.g. the uid-65532 JIT-cache case in
-#305) instead of the toolchain image:
+## Reproducing the shipped runtime image
+
+The **runtime** image (e.g. for the uid-65532 JIT-cache case in #305) is not the
+toolchain image and carries none of its tools:
 
 ```bash
 RP_IMAGE=nvidia/cuda:12.6.3-runtime-ubi8 ci/scripts/gpu-dev.sh shell a100
 ```
+
+That image ships no toolchain and **no git**, so the pod gets no checkout at all
+and you land in `/root`. This is the one case where a pod is deliberately on no
+ref, and it is reported as such: the banner reads `<none>` rather than naming a
+ref that is not there, and so does `ls` for a session started with `up`. Naming
+a `--ref` with such an image is an error — the request cannot be honoured, and a
+pod that quietly ignored it would be exactly the failure `--ref` exists to
+remove. Every other bootstrap failure stays fatal and takes the pod with it.
 
 ## Long-running work
 

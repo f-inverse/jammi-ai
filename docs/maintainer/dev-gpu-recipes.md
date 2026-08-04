@@ -206,6 +206,17 @@ RP_IMAGE=nvidia/cuda:12.6.3-runtime-ubi8 ci/scripts/gpu-dev.sh shell a100
 That image has no toolchain, so you cannot build in it. It is for reproducing
 runtime behaviour against an artifact you already have.
 
+**It also ships no git, so this pod gets no checkout** — you land in `/root`,
+not in `/root/jammi-ai`. The tool says so before handing you the shell and
+reports the pod as being on no ref rather than naming one that is not there
+(`<none>`, and that is what `ls` shows if you use `up` for this instead of the
+throwaway `shell`). This is the only image where an absent checkout is expected;
+anywhere else a failed bootstrap terminates the pod.
+
+Do **not** add `--ref` here. There is nothing on the pod that can act on it, so
+it is refused *before* the shell rather than ignored — `--ref` is for images that
+can hold a checkout.
+
 ---
 
 ## Recipe 7 — Run what CI runs
@@ -358,7 +369,16 @@ verified never gets a pod.
 
 **`--ref <ref> was IGNORED`** — the session is already up on a different ref, and
 `up` does not move a live pod. `down` it and `up` again; `ls` shows which ref
-each session booted on.
+each session booted on. Passing the ref the pod is *already* on is a no-op, not
+an error.
+
+**`--ref <ref> cannot be honoured: <image> ships no git`** — you combined `--ref`
+with an image that cannot hold a checkout, which in practice means Recipe 6.
+Drop the flag, or use the toolchain image.
+
+**`no checkout: this image ships no git`** — expected on the runtime image
+(Recipe 6) and nowhere else. The pod is fine; it is simply on no ref, and `ls`
+says `<none>`.
 
 **`'<ref>' cannot fast-forward`** — the branch was force-pushed, so the pod's
 copy is on a commit that no longer exists upstream. Bootstrap stops rather than

@@ -72,7 +72,6 @@ case "$CMD" in
   ls)
     # shellcheck source=ci/scripts/runpod_lib.sh
     source "$DIR/runpod_lib.sh"
-    printf '%-16s %-20s %-18s %s\n' SESSION POD REF ARCH@HOST
     rp_session_list
     exit 0
     ;;
@@ -107,9 +106,12 @@ case "$CMD" in
           REF="$2"; REF_EXPLICIT=1; shift 2 ;;
         --ref=*)
           REF="${1#--ref=}"; REF_EXPLICIT=1; shift ;;
-        # An unrecognised option is a hard error, never a positional argument.
-        # Absorbing one makes `up --ref x` die on "unknown arch '--ref'" — a
-        # message naming a problem the user does not have.
+        # Asking for help is not an error, and `up -h` is where someone reaches
+        # when they have forgotten the flag they came to look up.
+        -h|--help) usage 0 ;;
+        # Any OTHER unrecognised option is a hard error, never a positional
+        # argument. Absorbing one makes `up --ref x` die on "unknown arch
+        # '--ref'" — a message naming a problem the user does not have.
         -*) echo "::error::unknown option '$1' for ${CMD}"; usage 2 ;;
         *)
           [ -z "$ARCH" ] || { echo "::error::${CMD}: unexpected argument '$1'"; usage 2; }
@@ -162,6 +164,31 @@ require_pod() {
   exit 1
 }
 
+# Bootstrap the pod, and decide what each outcome means. A pod on the wrong code
+# answers the wrong question convincingly, so a failed bootstrap ends the
+# session rather than handing you a shell on it.
+#
+# The one exception is an image that ships no git (rp_bootstrap's exit 3):
+# reproducing the shipped RUNTIME image is a real use of a pod and that image has
+# no toolchain, so there is no checkout to be had and nothing is being hidden —
+# RP_REF stays empty and every report says `<none>`. It is still fatal when the
+# caller NAMED a ref: that request cannot be honoured here, and a pod that
+# quietly ignores it is the exact failure `--ref` exists to remove.
+bootstrap_or_die() {
+  rp_bootstrap "$REF"
+  case "$?" in
+    0) return 0 ;;
+    3) [ "$REF_EXPLICIT" = 0 ] || {
+         echo "::error::--ref ${REF} cannot be honoured: ${RP_IMAGE} ships no git"
+         echo "::error::terminating pod (trap)"
+         exit 1
+       }
+       echo "=== no checkout: this image ships no git, so the pod is on no ref ==="
+       return 0 ;;
+    *) echo "::error::bootstrap failed — terminating pod (trap)"; exit 1 ;;
+  esac
+}
+
 case "$CMD" in
 
   shell)
@@ -172,10 +199,8 @@ case "$CMD" in
     echo "=== provisioning ${ARCH} on ${REF} (image: ${RP_IMAGE}) ==="
     rp_deploy_arch "$ARCH" || exit $?
     echo "=== bootstrapping ==="
-    # A pod on the wrong code answers the wrong question convincingly, so a failed
-    # bootstrap ends the session rather than dropping you into a shell on it.
-    rp_bootstrap "$REF" || { echo "::error::bootstrap failed — terminating pod (trap)"; exit 1; }
-    echo "=== pod ${RP_POD_ID} on ${RP_HOST}:${RP_PORT} @ ${RP_REF} — it TERMINATES when you exit ==="
+    bootstrap_or_die
+    echo "=== pod ${RP_POD_ID} on ${RP_HOST}:${RP_PORT} @ ${RP_REF:-<none>} — it TERMINATES when you exit ==="
     ssh "${RP_SSHO[@]}" -t -p "$RP_PORT" "root@${RP_HOST}" "$(rp_login_cmd)" || true
     echo "=== shell closed — terminating pod (trap) ==="
     ;;
@@ -190,8 +215,14 @@ case "$CMD" in
       # leave you reading results from one ref while believing they came from
       # another — the exact failure this flag exists to remove.
       if [ "$REF_EXPLICIT" = 1 ] && [ "$REF" != "${RP_REF:-}" ]; then
+        # `up` takes an ARCH, never a session name — they are only the same
+        # string until RP_SESSION overrides it. Suggesting a bare `up ${ARCH}`
+        # would then boot a DIFFERENT session than the `down` beside it, so the
+        # override is carried explicitly whenever there is one.
+        SESSION_ENV=""
+        [ "$SESSION" = "$ARCH" ] || SESSION_ENV="RP_SESSION=${SESSION} "
         echo "::error::--ref ${REF} was IGNORED: the live pod is on '${RP_REF:-<none>}'"
-        echo "::error::to boot on ${REF}: $(basename "$0") down ${SESSION} && $(basename "$0") ${CMD} ${ARCH} --ref ${REF}"
+        echo "::error::to boot on ${REF}: $(basename "$0") down ${SESSION} && ${SESSION_ENV}$(basename "$0") ${CMD} ${ARCH} --ref ${REF}"
         exit 1
       fi
       echo "attach with: $(basename "$0") attach ${SESSION}"
@@ -207,11 +238,11 @@ case "$CMD" in
     # No separate arming step: the ${RP_TTL_HOURS}h deadline is baked into the
     # pod's entrypoint at deploy, so it is already running.
     echo "=== bootstrapping ==="
-    rp_bootstrap "$REF" || { echo "::error::bootstrap failed — terminating pod"; exit 1; }
+    bootstrap_or_die
     rp_keep
     rp_ssh_config_sync
     echo
-    echo "=== session '${SESSION}' up on ${RP_HOST}:${RP_PORT} @ ${RP_REF} (pod ${RP_POD_ID}) ==="
+    echo "=== session '${SESSION}' up on ${RP_HOST}:${RP_PORT} @ ${RP_REF:-<none>} (pod ${RP_POD_ID}) ==="
     echo "    ssh:     ssh -F ${RP_SSH_CONFIG} jammi-${SESSION}"
     echo "    attach:  $(basename "$0") attach ${SESSION}"
     echo "    run job: $(basename "$0") run ${SESSION} cargo test -p jammi-ai --features cuda,live-gpu-tests"

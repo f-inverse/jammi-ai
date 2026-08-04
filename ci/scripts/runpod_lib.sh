@@ -82,8 +82,10 @@ fi
 RP_SSH_KEY="$RP_WORK/id_ed25519"
 RP_META="$RP_WORK/meta"
 RP_POD_ID=""; RP_HOST=""; RP_PORT=""; RP_PUBKEY=""; RP_ARCH=""; RP_SSHO=()
-# The git ref the pod's checkout sits on. Set by rp_bootstrap only after the
-# checkout succeeded, so recorded state never claims a ref the pod is not on.
+# The git ref the pod's checkout sits on. Two sites keep it honest, so recorded
+# state never claims a ref the pod is not on: rp_bootstrap sets it only after the
+# checkout succeeded, and rp_deploy_live clears it the moment pod identity
+# changes — otherwise a dead session's ref survives into the new pod's record.
 RP_REF=""
 
 # An SSH login shell does NOT inherit the container's Dockerfile ENV (CC=gcc-13,
@@ -151,18 +153,38 @@ rp_session_alive() {
   ssh "${RP_SSHO[@]}" -p "$RP_PORT" "root@${RP_HOST}" true 2>/dev/null
 }
 
+# The whole session table — header included, so the row format exists once. The
+# column widths are derived from the rows rather than fixed: a ref is a branch
+# name or a 40-character commit id, so every fixed width is eventually too narrow
+# and a single over-long cell shifts every column after it out of alignment.
 rp_session_list() {
-  [ -d "$RP_SESSION_ROOT" ] || return 0
-  local d name
-  for d in "$RP_SESSION_ROOT"/*/; do
-    [ -f "${d}meta" ] || continue
-    name="$(basename "$d")"
-    # A session with no recorded ref never completed a bootstrap; say so rather
-    # than imply main, which is the guess this whole path exists to remove.
-    # shellcheck disable=SC1090
-    ( . "${d}meta"; printf '%-16s %-20s %-18s %s@%s\n' \
-        "$name" "${RP_POD_ID}" "${RP_REF:-<none>}" "${RP_ARCH}" "${RP_HOST}:${RP_PORT}" )
-  done
+  local rows="" d name w_s=7 w_p=3 w_r=3 f_s f_p f_r f_rest
+  if [ -d "$RP_SESSION_ROOT" ]; then
+    for d in "$RP_SESSION_ROOT"/*/; do
+      [ -f "${d}meta" ] || continue
+      name="$(basename "$d")"
+      # Subshell: every meta file sets the same variable names. A session with no
+      # recorded ref never completed a bootstrap; say so rather than imply main,
+      # which is the guess this whole path exists to remove.
+      # shellcheck disable=SC1090
+      rows="${rows}$( . "${d}meta"
+        printf '%s\t%s\t%s\t%s@%s:%s' "$name" "${RP_POD_ID:-?}" "${RP_REF:-<none>}" \
+          "${RP_ARCH:-?}" "${RP_HOST:-?}" "${RP_PORT:-?}" )"$'\n'
+    done
+  fi
+  while IFS=$'\t' read -r f_s f_p f_r f_rest; do
+    [ -n "$f_s" ] || continue
+    [ "${#f_s}" -gt "$w_s" ] && w_s="${#f_s}"
+    [ "${#f_p}" -gt "$w_p" ] && w_p="${#f_p}"
+    [ "${#f_r}" -gt "$w_r" ] && w_r="${#f_r}"
+  done <<< "$rows"
+  # `%-*s` takes each width as an argument, so the format string stays a literal
+  # and the header cannot drift from the rows it labels.
+  printf '%-*s  %-*s  %-*s  %s\n' "$w_s" SESSION "$w_p" POD "$w_r" REF ARCH@HOST
+  while IFS=$'\t' read -r f_s f_p f_r f_rest; do
+    [ -n "$f_s" ] || continue
+    printf '%-*s  %-*s  %-*s  %s\n' "$w_s" "$f_s" "$w_p" "$f_p" "$w_r" "$f_r" "$f_rest"
+  done <<< "$rows"
 }
 
 # Regenerate the ssh config THIS TOOLING OWNS, one `Host jammi-<session>` block
@@ -300,6 +322,14 @@ PY
 # (neutral skip) when no candidate yields a reachable pod — a provider condition,
 # not a code failure.
 rp_deploy_live() {
+  # A new pod voids everything recorded about the PREVIOUS pod's contents, and
+  # the ref is the only such axis. rp_session_save runs the moment SSH comes up —
+  # minutes ahead of the checkout, and never at all if the bootstrap fails — so a
+  # ref inherited from a dead session would be written against the new pod id and
+  # `ls` would report a live pod as being on code it was never on. Cleared here,
+  # at the one place pod identity changes, so no caller has to remember; the
+  # `<none>` sentinel then means what it says: this pod has no checkout yet.
+  RP_REF=""
   local supply_seen=0 combo cloud gpu R parsed code msg
   for combo in "$@"; do
     cloud="${combo%%|*}"; gpu="${combo##*|}"
@@ -515,6 +545,20 @@ _rp_ref_is_objectish() { # $1=ref
   case "$1" in *[!0-9a-f]*) return 1 ;; esac
 }
 
+# Ask the remote whether a ref exists, in bounded time and without ever asking a
+# human anything. This runs on every `up` and `shell`, and RP_REPO_URL is
+# overridable, so a private URL has three ways to turn a one-second gate into an
+# indefinite stall: HTTPS credentials prompted on the terminal, an ssh remote
+# asking to trust a host key, and a server that accepts the connection and then
+# sends nothing. The first two are refused outright; the third is bounded by
+# git's own low-speed knobs rather than `timeout`, which is coreutils and absent
+# on a BSD host — the gate must behave identically wherever a maintainer runs it.
+_rp_ls_remote() { # $1=ref
+  GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND='ssh -oBatchMode=yes -oConnectTimeout=10' \
+  git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 \
+      ls-remote --exit-code --heads --tags "$RP_REPO_URL" "$1" >/dev/null 2>&1
+}
+
 # Prove a ref exists BEFORE a pod is rented. `git ls-remote` costs about a second
 # and no money; learning the same fact from the pod costs a GPU plus the
 # minutes-long wait for SSH. An unverifiable ref refuses to rent, in both
@@ -530,7 +574,7 @@ rp_ref_precheck() { # $1=ref
     echo "note: '${1}' looks like a commit id — it can only be verified on the pod"
     return 0
   fi
-  git ls-remote --exit-code --heads --tags "$RP_REPO_URL" "$1" >/dev/null 2>&1
+  _rp_ls_remote "$1"
   rc=$?
   case "$rc" in
     0) return 0 ;;
@@ -554,6 +598,10 @@ rp_ref_precheck() { # $1=ref
 # An omitted ref means main; an empty one is a caller bug, not a default. The
 # distinction is made on argument COUNT, because `${1:-main}` collapses the two
 # and turns "the ref I computed is empty" into a silent, successful boot on main.
+#
+# Returns 0 (pod is on $1), 2 (the ref itself is malformed), 3 (the image ships
+# no git, so the pod is on NO ref and RP_REF stays empty), or the remote script's
+# code for a real failure.
 rp_bootstrap() { # $1=git ref (optional; default main)
   local ref=main s3=0 rc
   [ $# -gt 0 ] && ref="$1"
@@ -620,6 +668,17 @@ if [ "${s3}" = "1" ]; then
     unset SCCACHE_BUCKET SCCACHE_ENDPOINT SCCACHE_REGION SCCACHE_S3_USE_SSL SCCACHE_S3_KEY_PREFIX
     sccache --start-server >/dev/null 2>&1
   fi
+fi
+
+# "This image CANNOT hold a checkout" and "the checkout failed" are different
+# facts and only the second is a broken pod. Reproducing the shipped RUNTIME
+# image is a real use of a GPU pod, and that image ships no toolchain and no git
+# — there is nothing to fix and nothing to retry. Exit 3 reports a pod that is on
+# NO ref; RP_REF stays empty so nothing ever claims otherwise, and the caller
+# decides whether a refless pod is what was asked for.
+if ! command -v git >/dev/null 2>&1; then
+  echo "::notice::no git in ${RP_IMAGE} — this pod gets no checkout"
+  exit 3
 fi
 
 if [ ! -d /root/jammi-ai/.git ]; then

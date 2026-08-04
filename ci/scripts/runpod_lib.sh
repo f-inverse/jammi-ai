@@ -560,8 +560,17 @@ fi
 if [ ! -d /root/jammi-ai/.git ]; then
   git clone --filter=blob:none "${RP_REPO_URL}" /root/jammi-ai || exit 1
 fi
-cd /root/jammi-ai && git fetch --all --quiet && git checkout --quiet "${ref}" && git pull --quiet --ff-only 2>/dev/null
+cd /root/jammi-ai || exit 1
+git fetch --all --quiet
+# Fail loudly on a ref that does not exist. Chained with && this short-circuited
+# and still printed "bootstrap complete", leaving you silently on main and
+# wondering why your change was not there.
+git checkout --quiet "${ref}" \
+  || { echo "::error::ref '${ref}' not found in ${RP_REPO_URL}"; exit 1; }
+# Fast-forward only when on a branch; a tag or sha is a detached HEAD and pull
+# would fail noisily for no reason.
+git symbolic-ref -q HEAD >/dev/null 2>&1 && git pull --quiet --ff-only 2>/dev/null
 
-echo "bootstrap complete: \$(cd /root/jammi-ai && git rev-parse --short HEAD)"
+echo "bootstrap complete: ${ref} @ \$(git rev-parse --short HEAD)"
 EOF
 }

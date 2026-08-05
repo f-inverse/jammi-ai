@@ -99,12 +99,45 @@ The pod boots the CUDA CI image, clones the repo, restores the cache, and drops
 you into a shell in the checkout with the container's build environment already
 loaded. It is terminated when you exit.
 
-To reproduce the **shipped runtime image** (e.g. the uid-65532 JIT-cache case in
-#305) instead of the toolchain image:
+The checkout is placed on `main` unless you name a ref:
+
+```bash
+ci/scripts/gpu-dev.sh shell a40 --ref my-branch
+ci/scripts/gpu-dev.sh up a100 --ref v0.47.0
+```
+
+`--ref` takes a branch, a tag or a commit. A branch or tag is proved to exist
+with `git ls-remote` *before* a pod is rented, so a typo costs a second rather
+than a GPU-hour plus the minutes-long wait for SSH; a commit id is the one form
+no remote query can resolve, and is checked on the pod. That precheck never
+prompts for anything and is bounded in time, so an unreachable or private
+`RP_REPO_URL` fails fast instead of stalling every `up` on a credential prompt.
+The ref is recorded in the session and shown by `ls`, because otherwise nothing
+says which code a pod is running. Bootstrap fails loudly — and the pod is
+terminated — if the fetch, the checkout, or the fast-forward fails, since a pod
+quietly sitting on an older commit produces real results for code nobody is
+reading.
+
+`up` never moves a live pod onto a different ref: `down` the session and start it
+again. A `--ref` that names a ref the live pod is **not** on is an error rather
+than a silently ignored flag; naming the ref it is already on is a no-op.
+
+## Reproducing the shipped runtime image
+
+The **runtime** image (e.g. for the uid-65532 JIT-cache case in #305) is not the
+toolchain image and carries none of its tools:
 
 ```bash
 RP_IMAGE=nvidia/cuda:12.6.3-runtime-ubi8 ci/scripts/gpu-dev.sh shell a100
 ```
+
+That image ships no toolchain and **no git**, so the pod gets no checkout at all
+and you land in `/root`. This is the one case where a pod is deliberately on no
+ref, and it is reported as such: the banner reads `<none>` rather than naming a
+ref that is not there, and so does `ls` for a session started with `up`. Naming
+a `--ref` with such an image is an error — the request cannot be honoured, and a
+pod that quietly ignored it would be exactly the failure `--ref` exists to
+remove. Every other bootstrap failure stays fatal and takes the pod with it.
 
 ## Long-running work
 
@@ -121,11 +154,27 @@ ci/scripts/gpu-dev.sh reap                        # kill anything orphaned
 ```
 
 `run` launches under tmux and returns immediately, so the job outlives both the
-command and your SSH connection. Sessions are named after the arch; set
-`RP_SESSION` for a second pod of the same one.
+command and your SSH connection. There is exactly one job per pod: `run` kills
+the `jammi` tmux session before starting the next one, so a long-lived job — a
+server, say — occupies the pod's only slot until something displaces it.
+
+Sessions are named after the arch. `RP_SESSION` names one explicitly, and is
+needed only on `up` and `shell`, the two verbs that take an *arch* where the rest
+take a *session*; it overrides the positional argument for the rest, which is a
+sharp edge worth knowing before you export it. The worked form is in
+[dev-gpu-recipes.md](dev-gpu-recipes.md).
 
 `push` deliberately excludes `target/` — your host build output is the wrong
 architecture and would poison the pod's.
+
+**`--ref` and `push` are alternatives, not partners.** `push` is
+`rsync --delete` excluding `.git`, so it overwrites the working tree while
+leaving the pod's git metadata pointing at whatever was checked out: the pod then
+reports HEAD on one ref while holding the contents of another, and every git
+command on the pod answers about the wrong thing. Use `--ref` for the modes that
+do not push — a shell on a branch, an editor session, a job run straight from a
+pushed branch — and leave the pod on `main` when the push loop is what moves your
+code.
 
 ## Cost guard
 
@@ -185,16 +234,64 @@ Three guards, in order of when they act:
 Guard 2 needs the network at deadline time; guard 3 needs this repo's CI to be
 running. They fail for unrelated reasons, which is the point of having both.
 
-All three are **wall-clock ceilings, not idle detection** — a pod you stop using
-bills until its deadline. Run `down` when you're finished.
+Guards 2 and 3 are **wall-clock ceilings, not idle detection** — a pod you stop
+using bills until its deadline. Run `down` when you're finished; the guards are
+for the times something kills the process before you can.
 
-Both are **wall-clock ceilings, not idle detection** — a pod you stop using bills
-until its deadline. Run `down` when you're finished; the guards are for the times
-something kills the process before you can.
+Lower the ceiling when you know the work is short:
 
 ```bash
 RP_TTL_HOURS=2 ci/scripts/gpu-dev.sh up a100
 ```
+
+### `RP_TIMEOUT` is not a fourth guard
+
+`RP_TIMEOUT` (default 3000s) wraps the `timeout … bash -s` that `rp_run_remote`
+sends over SSH, so it bounds *that SSH invocation*: bootstrap, and the CI prove
+lane's build-and-test script — which is what lets `gpu-prove.yml` reason about
+its own job timeout.
+
+It does **not** bound a running job. `run` uses `rp_run_remote` only to launch a
+detached tmux session; tmux daemonizes, the invocation returns in under a second,
+and the job it started is already outside the timeout's reach. It then runs — and
+bills — until it finishes or the pod's deadline fires. Lowering `RP_TIMEOUT`
+protects nothing about a `run` job; `RP_TTL_HOURS` and the sweep are what stop
+one.
+
+## Verbs that deliberately do not exist
+
+Two are absent that a reader will look for. Both were considered and refused;
+neither is a gap waiting to be filled.
+
+### No `stop` — halt the job, keep the pod
+
+`tmux kill-session` is not a process-tree kill. It destroys the pane and SIGHUPs
+its foreground process group, so anything that `setsid`'d away from that group,
+or is wedged in a CUDA ioctl, survives — still holding the GPU, on a pod that now
+looks idle. A verb cannot honestly be called `stop` when its failure mode is a
+live process nobody is watching.
+
+It would also **save nothing**. The pod bills at its full rate whether a job runs
+or not; the guards above are wall-clock ceilings, not idle detection. A `stop`
+sitting next to `down` in the help output is exactly what someone watching spend
+reaches for — and it would take their money while looking like it saved it.
+
+What exists instead: `run` the next thing (it replaces the job), `attach` and
+Ctrl-C to end it from its own terminal, or `down` — the only one that stops the
+meter.
+
+### No `refresh` — move a live pod's checkout to another ref
+
+Moving a live checkout means `git checkout <ref>` against a working tree that may
+be dirty, and **a dirty `git checkout` does not reliably fail**. It refuses only
+when a modified file differs between the two refs; when it does not, the checkout
+succeeds and carries the modification across. The pod is then on a tree matching
+*neither* ref, while the session record reports the new one with full confidence
+and `ls` repeats it. That is precisely the silent-wrong-checkout failure `--ref`
+exists to remove, so a verb that reintroduces it is not a convenience.
+
+`up` therefore refuses a `--ref` against a live pod rather than acting on it. The
+answer is `down` then `up <arch> --ref <ref>`: a boot, for a tree you can trust.
 
 ## Automated proof — CI
 

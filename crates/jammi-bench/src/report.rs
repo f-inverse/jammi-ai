@@ -89,6 +89,10 @@ pub struct Tiers {
     /// Populated by `train-scale`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub training: Option<TrainingTier>,
+    /// The encoder fine-tune step tier: real LoRA step cost on the resolved
+    /// device. Recorded, never gated. Populated by `finetune-step`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finetune_step: Option<FinetuneStepTier>,
     /// The CPU-hermetic conformal-coverage tier: the engine's split-conformal
     /// calibration drives a marginal coverage that is gated against a committed
     /// floor (`coverage_floor = measured − MARGIN`, the recall-floor idiom), one
@@ -1073,6 +1077,48 @@ pub struct GpuLane {
     /// Whether every measured serve's digest matched the first — the on-device
     /// determinism contract across repeats.
     pub deterministic: bool,
+}
+
+/// The encoder fine-tune step tier: the cost of one real LoRA training step —
+/// three encoder forwards on the tape at once, a triplet loss, one backward into
+/// the adapter tensors, and one optimizer step.
+///
+/// Every field is **recorded**, never gated. A step time is a property of
+/// `code x device x box`; the comparable quantity on a heterogeneous fleet is
+/// the ratio between two runs on the *same* box, which is why the device and its
+/// concrete sub-class are carried alongside every number.
+#[derive(Debug, Serialize)]
+pub struct FinetuneStepTier {
+    /// The device the step ran on (`cpu` or `cuda:N`).
+    pub device: String,
+    /// The concrete device sub-class (e.g. `NVIDIA A100-SXM4-80GB`), so a
+    /// recorded rate stays interpretable across a fleet that is not pinned.
+    pub device_name: String,
+    /// The precision the frozen backbone ran at.
+    pub backbone_dtype: String,
+    pub batch: usize,
+    pub seq: usize,
+    pub lora_rank: usize,
+    pub lora_dropout: f64,
+    /// The LoRA target-module selectors, which decide how many linears carry an
+    /// adapter — and therefore how much of the step is adapter work.
+    pub target_modules: Vec<String>,
+    /// Trainable tensor count. Zero would mean the selectors matched nothing and
+    /// the measurement is of a frozen forward, so it is reported, not assumed.
+    pub trainable_tensors: usize,
+    /// Measured steps after warmup.
+    pub steps_measured: usize,
+    pub s_per_step_p50: Measurement,
+    pub s_per_step_mean: Measurement,
+    pub steps_per_s: Measurement,
+    pub triplets_per_s: Measurement,
+    /// Peak resident set. Absent off Linux rather than faked.
+    pub peak_rss_bytes: Measurement,
+    /// Peak device memory growth over the run's own baseline, sampled while the
+    /// measured steps ran. Device-total minus the pre-load reading, not a
+    /// per-process figure — exact on a dedicated pod, an over-report on a shared
+    /// GPU. Absent when `nvidia-smi` is not present.
+    pub peak_vram_bytes: Measurement,
 }
 
 /// The on-GPU throughput/latency tier: the engine's two GPU-model serving

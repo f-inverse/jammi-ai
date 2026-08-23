@@ -1,0 +1,73 @@
+{
+  "source": "huggingface transformers ModernBertModel, eager attention",
+  "torch": "2.13.0",
+  "transformers": "5.15.1",
+  "seed": 20260823,
+  "layer_types": [
+    "full_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "full_attention"
+  ],
+  "sliding_window": 8,
+  "tensors": {
+    "padded.attention_mask": {
+      "shape": [
+        1,
+        64
+      ],
+      "dtype": "int64"
+    },
+    "padded.input_ids": {
+      "shape": [
+        1,
+        64
+      ],
+      "dtype": "int64"
+    },
+    "padded.last_hidden_state": {
+      "shape": [
+        1,
+        64,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "padded.pooled": {
+      "shape": [
+        1,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "unpadded.attention_mask": {
+      "shape": [
+        1,
+        64
+      ],
+      "dtype": "int64"
+    },
+    "unpadded.input_ids": {
+      "shape": [
+        1,
+        64
+      ],
+      "dtype": "int64"
+    },
+    "unpadded.last_hidden_state": {
+      "shape": [
+        1,
+        64,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "unpadded.pooled": {
+      "shape": [
+        1,
+        32
+      ],
+      "dtype": "float32"
+    }
+  }
+}

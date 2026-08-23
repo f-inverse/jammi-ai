@@ -6,4 +6,5 @@ mod bert;
 mod clip_text;
 mod distilbert;
 mod modernbert;
+mod modernbert_sliding_window;
 mod pooling;

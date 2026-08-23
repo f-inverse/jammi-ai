@@ -1562,6 +1562,40 @@ fn discover_resume(
     crate::fine_tune::resume::load_bundle(local.dir(), device).map(Some)
 }
 
+/// Refuse a backbone precision the resolved device cannot compute at.
+///
+/// BF16 is a GPU-tier precision. candle's CPU matmul accepts `F16 | F32 | F64`
+/// only and returns "unsupported dtype BF16 for op matmul" otherwise, so a BF16
+/// backbone on CPU fails at the first frozen linear of the first forward —
+/// after the job has been claimed, the backbone downloaded, and the adapter
+/// built.
+///
+/// This became reachable when the LoRA arm stopped re-materialising the frozen
+/// weight in F32 on every forward. That upcast was masking the limitation:
+/// with every ModernBERT linear LoRA-targeted, no `Frozen` arm survived to hit
+/// the unsupported matmul, so a CPU BF16 fine-tune "worked" only by silently
+/// discarding the precision it was asked for. Honouring `backbone_dtype` means
+/// the unsupported combination has to be refused rather than quietly ignored.
+///
+/// The inference path makes the same refusal at
+/// `crate::model::backend::candle` when it resolves a device; this is its
+/// training-side peer. It cannot move up into `FineTuneConfig::validate`,
+/// which sees the config but not the device the claiming worker will resolve.
+fn validate_backbone_precision(
+    precision: jammi_numerics::ComputePrecision,
+    device: &candle_core::Device,
+) -> Result<()> {
+    if precision == jammi_numerics::ComputePrecision::BF16 && !device.is_cuda() {
+        return Err(JammiError::FineTune(
+            "backbone_dtype=bf16 requires a CUDA device; this worker resolved a non-CUDA \
+             device, whose matmul does not implement bf16. Use f16 for a reduced-precision \
+             backbone on CPU, or f32."
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Construct an encoder-adapters target: load the frozen backbone weights from
 /// the catalog artifact path, wrap the configured target modules with LoRA, and
 /// return both the resulting encoder and the persisted adapter metadata that
@@ -1684,6 +1718,7 @@ fn build_encoder_adapters(
         seed: config.seed,
     };
 
+    validate_backbone_precision(config.backbone_dtype, device)?;
     let backbone_dtype: candle_core::DType =
         jammi_encoders::compute_precision_to_dtype(config.backbone_dtype);
     let adapter_cfg =
@@ -1740,6 +1775,59 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    /// The premise the bf16-on-CPU refusal rests on, pinned rather than
+    /// remembered: candle's CPU matmul does not implement BF16.
+    ///
+    /// If candle ever gains it, this test fails and says so — which is the
+    /// signal to delete [`validate_backbone_precision`]'s CPU arm rather than
+    /// leave a refusal in place for a limitation that no longer exists. A guard
+    /// whose justification is only a comment outlives its reason.
+    #[test]
+    fn cpu_matmul_still_cannot_do_bf16() {
+        use candle_core::{DType, Device, Tensor};
+        let d = Device::Cpu;
+        let a = Tensor::zeros((4, 4), DType::BF16, &d).unwrap();
+        assert!(
+            a.matmul(&a).is_err(),
+            "candle CPU matmul now supports BF16 — remove the CPU arm of \
+             validate_backbone_precision instead of keeping a stale refusal"
+        );
+        let f16 = Tensor::zeros((4, 4), DType::F16, &d).unwrap();
+        assert!(
+            f16.matmul(&f16).is_ok(),
+            "F16 is the reduced precision the refusal steers callers to; it must work on CPU"
+        );
+    }
+
+    #[test]
+    fn bf16_backbone_is_refused_on_cpu_with_a_faithful_error() {
+        use jammi_numerics::ComputePrecision;
+        let err = validate_backbone_precision(ComputePrecision::BF16, &candle_core::Device::Cpu)
+            .expect_err("bf16 on CPU must be refused, not silently downgraded");
+        let msg = err.to_string();
+        assert!(msg.contains("bf16"), "error must name the precision: {msg}");
+        assert!(
+            msg.contains("f16") || msg.contains("f32"),
+            "error must name a usable alternative: {msg}"
+        );
+        assert!(
+            matches!(err, JammiError::FineTune(_)),
+            "typed error, got {err:?}"
+        );
+    }
+
+    /// Positive control: the guard must refuse only the combination it targets.
+    #[test]
+    fn other_precisions_are_accepted_on_cpu() {
+        use jammi_numerics::ComputePrecision;
+        for p in [ComputePrecision::F32, ComputePrecision::F16] {
+            assert!(
+                validate_backbone_precision(p, &candle_core::Device::Cpu).is_ok(),
+                "{p:?} must be accepted on CPU"
+            );
+        }
+    }
 
     /// A panicking blocking trainer drives the job to a terminal `failed` status
     /// with the panic message recorded — never an uncaught unwind that wedges the

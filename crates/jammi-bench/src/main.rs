@@ -402,6 +402,11 @@ enum Command {
         cuda: Option<usize>,
         #[arg(long, default_value_t = 42)]
         seed: u64,
+        /// Encode the three triplet groups in one forward (the trainer's
+        /// behaviour). `--batched-forward false` measures the three-forward
+        /// shape for an A/B on the same box.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        batched_forward: bool,
     },
     /// The CPU-hermetic cache-hit SLO tier: drives the engine's opt-in producer
     /// memoization (`CachePolicy::Use`) on a cacheable producer (the
@@ -481,6 +486,7 @@ async fn main() -> std::process::ExitCode {
             backbone_dtype,
             cuda,
             seed,
+            batched_forward,
         } => run_finetune_step(finetune_step::FinetuneStepParams {
             model_dir,
             batch,
@@ -507,6 +513,7 @@ async fn main() -> std::process::ExitCode {
             },
             cuda_device: cuda,
             seed,
+            batched_forward,
         }),
         Command::CacheSloScale => run_cache_slo_scale().await,
         Command::RecomputeScale => run_recompute_scale().await,

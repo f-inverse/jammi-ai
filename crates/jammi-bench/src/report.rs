@@ -1103,6 +1103,10 @@ pub struct FinetuneStepTier {
     /// The LoRA target-module selectors, which decide how many linears carry an
     /// adapter — and therefore how much of the step is adapter work.
     pub target_modules: Vec<String>,
+    /// Whether the three triplet groups were encoded in one forward (the
+    /// trainer's behaviour) or three. On a dispatch-bound device this is the
+    /// largest single term in the step, so it is recorded alongside every rate.
+    pub batched_forward: bool,
     /// Trainable tensor count. Zero would mean the selectors matched nothing and
     /// the measurement is of a frozen forward, so it is reported, not assumed.
     pub trainable_tensors: usize,
@@ -1114,10 +1118,15 @@ pub struct FinetuneStepTier {
     pub triplets_per_s: Measurement,
     /// Peak resident set. Absent off Linux rather than faked.
     pub peak_rss_bytes: Measurement,
-    /// Peak device memory growth over the run's own baseline, sampled while the
-    /// measured steps ran. Device-total minus the pre-load reading, not a
-    /// per-process figure — exact on a dedicated pod, an over-report on a shared
-    /// GPU. Absent when `nvidia-smi` is not present.
+    /// Peak device memory growth during the measured steps, over a baseline read
+    /// AFTER the model and optimizer are resident.
+    ///
+    /// So this is activation and workspace growth: it deliberately excludes the
+    /// backbone weights and the optimizer moments, because those are constant
+    /// for a configuration and would mask the term that actually moves. It is
+    /// device-total minus that baseline rather than a per-process figure — exact
+    /// on a dedicated pod, an over-report on a shared GPU. Absent when
+    /// `nvidia-smi` is not present.
     pub peak_vram_bytes: Measurement,
 }
 

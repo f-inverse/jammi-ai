@@ -1562,7 +1562,6 @@ fn discover_resume(
     crate::fine_tune::resume::load_bundle(local.dir(), device).map(Some)
 }
 
-/// Construct an encoder-adapters target: load the frozen backbone weights from
 /// Refuse a backbone precision the resolved device cannot compute at.
 ///
 /// BF16 is a GPU-tier precision. candle's CPU matmul accepts `F16 | F32 | F64`
@@ -1597,6 +1596,7 @@ fn validate_backbone_precision(
     Ok(())
 }
 
+/// Construct an encoder-adapters target: load the frozen backbone weights from
 /// the catalog artifact path, wrap the configured target modules with LoRA, and
 /// return both the resulting encoder and the persisted adapter metadata that
 /// pairs with the trained tensors on disk.

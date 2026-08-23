@@ -54,8 +54,8 @@ use crate::report::{FinetuneStepTier, Measurement};
 /// Poll total device memory in use, in bytes, via `nvidia-smi`.
 ///
 /// Whole-device, not per-process: on a dedicated pod this session is the only
-/// consumer, and the tier subtracts the pre-load baseline so the reported figure
-/// is this run's own growth. On a shared GPU it would over-report, so the field
+/// consumer, and the tier subtracts a baseline read after the model is resident,
+/// so the reported figure is activation and workspace growth. On a shared GPU it would over-report, so the field
 /// is documented as device-total-minus-baseline rather than as a process
 /// measurement.
 fn device_memory_used_bytes() -> Option<u64> {
@@ -142,6 +142,12 @@ pub struct FinetuneStepParams {
     /// CUDA ordinal, or `None` for CPU.
     pub cuda_device: Option<usize>,
     pub seed: u64,
+    /// Encode anchor/positive/negative in ONE forward (what the trainer does)
+    /// rather than three. Kept switchable because the difference between the two
+    /// is the single largest term in this step on a dispatch-bound device, so
+    /// the tier has to be able to measure it as a within-run A/B on one box
+    /// rather than across binaries.
+    pub batched_forward: bool,
 }
 
 /// Deterministic synthetic token ids, uniform over `[1, vocab)` so no id is the
@@ -230,9 +236,25 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     let mut times = Vec::with_capacity(params.steps);
     for step in 0..(params.warmup + params.steps) {
         let t0 = Instant::now();
-        let a = encoder.forward(&blocks[0], &mask)?;
-        let p = encoder.forward(&blocks[1], &mask)?;
-        let n = encoder.forward(&blocks[2], &mask)?;
+        let (a, p, n) = if params.batched_forward {
+            // One forward over the concatenated groups, split after pooling —
+            // the trainer's `encode_groups` shape.
+            let joined = Tensor::cat(&[&blocks[0], &blocks[1], &blocks[2]], 0)?;
+            let joined_mask = Tensor::cat(&[&mask, &mask, &mask], 0)?;
+            let all = encoder.forward(&joined, &joined_mask)?;
+            let b = params.batch;
+            (
+                all.narrow(0, 0, b)?,
+                all.narrow(0, b, b)?,
+                all.narrow(0, 2 * b, b)?,
+            )
+        } else {
+            (
+                encoder.forward(&blocks[0], &mask)?,
+                encoder.forward(&blocks[1], &mask)?,
+                encoder.forward(&blocks[2], &mask)?,
+            )
+        };
         let loss = triplet_loss(&a, &p, &n, 0.3)?;
         let grads = loss.backward()?;
         opt.step(&grads)?;
@@ -261,6 +283,7 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
         lora_rank: params.lora_rank,
         lora_dropout: params.lora_dropout as f64,
         target_modules: params.target_modules.clone(),
+        batched_forward: params.batched_forward,
         trainable_tensors: trainable.len(),
         steps_measured: times.len(),
         s_per_step_p50: Measurement::measured(p50, "s"),

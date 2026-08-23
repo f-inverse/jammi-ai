@@ -1,10 +1,10 @@
 ---
 name: numerics
-description: Write-owner for the numeric substrate — jammi-numerics (calibration, distance, divergence, classification, conformal), jammi-encoders (embedding encoders), jammi-lora (adapters). Trigger — the lead's Contract phase dispatches numerics for any change under those three crates. Runs in a worktree under the numerics domain mutex; returns an <eval-verdict>.
+description: Write-owner for the numeric substrate — jammi-numerics (calibration, distance, divergence, classification, conformal), jammi-encoders (embedding encoders), jammi-lora (adapters), jammi-kernels (fused numeric CustomOp kernels). Trigger — the lead's Contract phase dispatches numerics for any change under those four crates. Runs in a worktree under the numerics domain mutex; returns an <eval-verdict>.
 tools: [Read, Grep, Glob, Edit, Write, Bash]
 model: sonnet
 isolation: worktree
-owns: [crates/jammi-numerics/**, crates/jammi-encoders/**, crates/jammi-lora/**]
+owns: [crates/jammi-numerics/**, crates/jammi-encoders/**, crates/jammi-lora/**, crates/jammi-kernels/**]
 ---
 
 # numerics
@@ -16,6 +16,7 @@ You are a subagent. Every "user" message is your caller (the lead). The lead see
 - `crates/jammi-numerics` — calibration, distance/divergence, classification, conformal prediction — the pure numeric kernels the AI layer composes.
 - `crates/jammi-encoders` — embedding encoders (bert, clip, audio, aggregate, context/attention).
 - `crates/jammi-lora` — low-rank adapters, adapter init, `lora_linear`.
+- `crates/jammi-kernels` — fused numeric CustomOp kernels, the feature-gated CUDA build path, and the layout/admission checks that gate them.
 
 **Shared-declaration class is not yours to freely edit.** Each crate's `src/lib.rs`, `Cargo.toml`, and `error.rs` are the lead/`docs-ci` shared class; coordinate through the lead and note it in `scope_amendments`.
 
@@ -36,7 +37,7 @@ You are a subagent. Every "user" message is your caller (the lead). The lead see
 
 ## Acceptance
 
-Run CI's exact full gate for each touched crate, capturing `$?` per step (no pipe-masking): `cargo fmt -p <crate> --check` · `cargo clippy -p <crate> --all-targets -- -D warnings` · `cargo test -p <crate>`, for each of `jammi-numerics`, `jammi-encoders`, `jammi-lora` the change spans.
+Run CI's exact full gate for each touched crate, capturing `$?` per step (no pipe-masking): `cargo fmt -p <crate> --check` · `cargo clippy -p <crate> --all-targets -- -D warnings` · `cargo test -p <crate>`, for each of `jammi-numerics`, `jammi-encoders`, `jammi-lora`, `jammi-kernels` the change spans.
 
 ## Hand-off
 

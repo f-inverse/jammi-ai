@@ -1,14 +1,12 @@
 //! Single LoRA-augmented linear layer: frozen base + trainable A and B matrices.
 
-use std::sync::Mutex;
-
 use candle_core::Tensor;
 use candle_nn::{Init, Linear, Module, VarBuilder, VarMap};
 
 use crate::error::LoraError;
 use crate::init::LoraInitMode;
 use crate::seeded::{
-    gaussian_fill, kaiming_uniform_fill, seed_for_param, DropoutStream, SplitMix64,
+    gaussian_fill, kaiming_uniform_fill, seed_for_param, DropoutMasks, SplitMix64,
 };
 
 /// Overwrite the storage of the `Var` already registered at `name` in `varmap`
@@ -40,14 +38,13 @@ pub struct LoraLinear {
     scaling: f64,
     /// Optional dropout probability applied to the LoRA path while training.
     dropout: Option<f32>,
-    /// Run-owned, seeded dropout stream. `Some` exactly when `dropout > 0`.
-    /// Interior-mutable because the `Module`-style `forward(&self, …)` advances
-    /// the mask stream; a `Mutex` (not `RefCell`) keeps `LoraLinear: Sync`, which
-    /// the model holds across threads. The trainer drives forwards
-    /// single-threaded and in a deterministic order, so the lock is uncontended
-    /// and the k-th training forward through this layer always consumes the k-th
-    /// mask.
-    dropout_stream: Option<Mutex<DropoutStream>>,
+    /// Run-owned, counter-keyed dropout masks. `Some` exactly when
+    /// `dropout > 0`. Interior-mutable because the `Module`-style
+    /// `forward(&self, …)` advances the forward counter; the counter is an
+    /// atomic rather than a `Mutex` because the mask is a pure function of it,
+    /// so there is no stream state to guard — which also drops the per-forward
+    /// lock the old advancing stream needed to stay `Sync`.
+    dropout_masks: Option<DropoutMasks>,
     /// Whether the layer is currently in training mode.
     training: bool,
 }
@@ -159,9 +156,9 @@ impl LoraLinear {
             alpha / rank as f64
         };
 
-        let dropout_stream = dropout
+        let dropout_masks = dropout
             .filter(|p| *p > 0.0)
-            .map(|_| Mutex::new(DropoutStream::new(seed, &vb.prefix())));
+            .map(|_| DropoutMasks::new(seed, &vb.prefix()));
 
         Ok(Self {
             base,
@@ -169,7 +166,7 @@ impl LoraLinear {
             lora_b,
             scaling,
             dropout,
-            dropout_stream,
+            dropout_masks,
             training: true,
         })
     }
@@ -212,7 +209,7 @@ impl LoraLinear {
             lora_b,
             scaling,
             dropout: None,
-            dropout_stream: None,
+            dropout_masks: None,
             training: false,
         }
     }
@@ -253,20 +250,12 @@ impl LoraLinear {
         };
 
         let lora_in = if self.training {
-            match (self.dropout, &self.dropout_stream) {
-                (Some(p), Some(stream)) if p > 0.0 => {
-                    // Seeded inverted-dropout: draw a Bernoulli mask from the
-                    // run-owned stream (NOT candle's unseedable `ops::dropout`)
-                    // and apply it. The stream advances one block of draws per
-                    // training forward, so the mask is a pure function of the
-                    // seed and the forward's position in the deterministic
-                    // training order.
-                    let mask_vals = stream
-                        .lock()
-                        .map_err(|_| LoraError::Config("dropout stream mutex poisoned".into()))?
-                        .draw_mask(x_lora.elem_count(), p);
-                    let mask = Tensor::from_vec(mask_vals, x_lora.shape(), x_lora.device())?
-                        .to_dtype(x_lora.dtype())?;
+            match (self.dropout, &self.dropout_masks) {
+                (Some(p), Some(masks)) if p > 0.0 => {
+                    // Seeded inverted-dropout: build the mask on the activation's
+                    // own device (NOT candle's unseedable `ops::dropout`), keyed
+                    // by this layer and its forward counter.
+                    let mask = masks.next_mask(&x_lora, p)?;
                     (&x_lora * &mask)?
                 }
                 _ => x_lora,
@@ -302,24 +291,15 @@ impl LoraLinear {
     /// masks byte-match the uninterrupted run. A poisoned stream mutex surfaces
     /// as a typed error rather than a panic.
     pub fn dropout_position(&self) -> Result<Option<u64>, LoraError> {
-        match &self.dropout_stream {
-            None => Ok(None),
-            Some(stream) => stream
-                .lock()
-                .map(|s| Some(s.position()))
-                .map_err(|_| LoraError::Config("dropout stream mutex poisoned".into())),
-        }
+        Ok(self.dropout_masks.as_ref().map(DropoutMasks::position))
     }
 
     /// Restore this layer's dropout stream to `position` (replaying from the
     /// origin) so the next training forwards draw the same masks the uninterrupted
     /// run drew. A no-op when the layer has no dropout stream.
     pub fn restore_dropout_position(&self, position: u64) -> Result<(), LoraError> {
-        if let Some(stream) = &self.dropout_stream {
-            stream
-                .lock()
-                .map_err(|_| LoraError::Config("dropout stream mutex poisoned".into()))?
-                .restore_position(position);
+        if let Some(masks) = &self.dropout_masks {
+            masks.restore_position(position);
         }
         Ok(())
     }

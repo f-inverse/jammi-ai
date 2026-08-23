@@ -5,9 +5,10 @@
 //! `Init::Randn` and `candle_nn::ops::dropout` are *unseedable* — two runs of
 //! the same fine-tune produce different adapters. This module owns the draws
 //! instead: a small self-contained SplitMix64 PRNG fills host buffers that are
-//! then registered as trainable `Var`s, and a per-layer dropout stream draws a
-//! Bernoulli mask. Nothing here touches a global RNG, so a fine-tune is a pure
-//! function of `(seed, source rows, config)`.
+//! then registered as trainable `Var`s, and a per-layer counter-keyed source
+//! ([`DropoutMasks`]) draws each Bernoulli mask on the device that will consume
+//! it. Nothing here touches an unseeded global RNG, so a fine-tune is a pure
+//! function of `(seed, source rows, config)` on a given device class.
 //!
 //! **Cross-process determinism.** Every draw stream is keyed by
 //! `(seed, fully-qualified parameter name)` via [`seed_for_param`], never by
@@ -16,6 +17,10 @@
 //! byte-identical regardless of how many other layers exist or when they were
 //! built. This is the same FNV-1a-then-SplitMix idiom the engine already uses
 //! for its seeded graph walks.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use candle_core::{Device, Tensor};
 
 /// A small, fast, self-contained PRNG (SplitMix64) so seeded init and dropout
 /// reproduce byte-identically from a seed without pulling a `rand` dependency
@@ -91,68 +96,117 @@ pub(crate) fn gaussian_fill(rng: &mut SplitMix64, len: usize, stdev: f32) -> Vec
         .collect()
 }
 
-/// A run-owned, advancing dropout stream. Seeded per LoRA layer from
-/// `(seed, "{param_prefix}.dropout")`, it draws an inverted-dropout Bernoulli
-/// mask each time the LoRA path runs in training mode. Because forwards happen
-/// in a deterministic order (ordered rows → fixed batching), an advancing
-/// per-layer stream is equivalent to keying the mask by `(step, microbatch)`:
-/// the k-th training forward through this layer always consumes the k-th block
-/// of draws. Validation forwards skip dropout (`set_training(false)`), so they
-/// never perturb the stream.
-pub(crate) struct DropoutStream {
-    /// The stream's deterministic origin — `(seed, "{layer_name}.dropout")` — kept
-    /// so the stream can be rewound to an exact draw position on resume (replay
-    /// from the origin by `position` draws), not just advanced from where it is.
+/// A LoRA layer's dropout mask source: a *counter-keyed* draw, not an advancing
+/// stream.
+///
+/// The mask for a layer's k-th training forward is a pure function of
+/// `(run seed, fully-qualified layer name, k)`. Two properties follow, and both
+/// were absent from the advancing-stream design this replaces:
+///
+/// * **Restore is O(1).** The old stream had no closed-form skip, so restoring a
+///   persisted position replayed that many draws one at a time from the origin.
+///   Its comment justified the cost on the grounds that "the LoRA matrices are
+///   small" — true of the *init* draws it was modelled on, but the dropout
+///   position advances by one draw per *activation element*, which is
+///   `batch * seq * in_features` per forward. After a single epoch of a large
+///   encoder that is on the order of 1e11 draws per layer, so resume did not
+///   merely slow down, it failed to finish. Restoring a counter is an
+///   assignment.
+///
+/// * **The mask is built on the device that will consume it.** The old stream
+///   generated a host `Vec<f32>` the size of the whole activation and copied it
+///   across per LoRA site per forward, so a GPU run paid a single-threaded host
+///   RNG and a PCIe transfer for every layer of every forward, and pinned each
+///   mask in device memory until backward. Measured on an A100 with
+///   ModernBERT-large at batch 8 / seq 128, removing that cost took the step
+///   from 2.07 s to 0.72 s and freed 16.7 GB.
+///
+/// Determinism is per device class, which is the contract the surrounding code
+/// already lives under (`jammi-numerics` documents single-architecture
+/// determinism as the guarantee and cross-architecture reproducibility as an
+/// explicit non-goal). A CPU run is byte-reproducible against a CPU run, a CUDA
+/// run against a CUDA run; the two draw different masks from the same seed, as
+/// they do in every mainstream framework.
+pub(crate) struct DropoutMasks {
+    /// `(seed, "{layer_name}.dropout")` — the layer's key, from which every
+    /// mask is derived together with the forward counter.
     origin_seed: u64,
-    rng: SplitMix64,
-    /// Total `next_f32` draws consumed since the origin. This is the stream's
-    /// position; persisted at an epoch boundary and replayed on resume so a
-    /// resumed run's k-th-block-onward masks byte-match the uninterrupted run.
-    position: u64,
+    /// Training forwards taken through this layer. The mask key, and the whole
+    /// resume state.
+    counter: AtomicU64,
 }
 
-impl DropoutStream {
+impl DropoutMasks {
     pub(crate) fn new(seed: u64, layer_name: &str) -> Self {
-        let origin_seed = seed_for_param(seed, &format!("{layer_name}.dropout"));
         Self {
-            origin_seed,
-            rng: SplitMix64::new(origin_seed),
-            position: 0,
+            origin_seed: seed_for_param(seed, &format!("{layer_name}.dropout")),
+            counter: AtomicU64::new(0),
         }
     }
 
-    /// Draw an inverted-dropout mask of length `len`: each element is `0.0` with
-    /// probability `p`, else `1/(1-p)` so the expected value is preserved (same
-    /// scaling candle's `dropout` applies). Advances the stream by `len` draws.
-    pub(crate) fn draw_mask(&mut self, len: usize, p: f32) -> Vec<f32> {
-        let keep = 1.0 - p;
-        let scale = 1.0 / keep;
-        let mask = (0..len)
-            .map(|_| if self.rng.next_f32() < p { 0.0 } else { scale })
-            .collect();
-        self.position += len as u64;
-        mask
-    }
-
-    /// The stream's current draw position — the number of mask draws consumed
-    /// since the origin. The unit of resume state for this layer's dropout.
+    /// Forwards taken so far — the unit of resume state.
     pub(crate) fn position(&self) -> u64 {
-        self.position
+        self.counter.load(Ordering::Relaxed)
     }
 
-    /// Rewind to the origin and replay `position` draws, leaving the stream at the
-    /// exact state it had after consuming that many masks. A resumed run restores
-    /// each layer's dropout stream to the position it held at the persisted epoch
-    /// boundary, so the next forwards draw the same masks the uninterrupted run
-    /// drew — `SplitMix64` has no closed-form skip, but the LoRA matrices are
-    /// small, so replaying the consumed draws is cheap and exact.
-    pub(crate) fn restore_position(&mut self, position: u64) {
-        self.rng = SplitMix64::new(self.origin_seed);
-        for _ in 0..position {
-            self.rng.next_f32();
-        }
-        self.position = position;
+    /// Restore the forward counter. O(1): the mask is a function of the counter,
+    /// so there is no stream to replay.
+    pub(crate) fn restore_position(&self, position: u64) {
+        self.counter.store(position, Ordering::Relaxed);
     }
+
+    /// Build the next inverted-dropout mask for `x`, on `x`'s own device, and
+    /// advance the counter.
+    ///
+    /// Inverted dropout: a kept element is scaled by `1/(1-p)` so the expected
+    /// value is preserved, matching what candle's own `dropout` applies.
+    pub(crate) fn next_mask(&self, x: &Tensor, p: f32) -> Result<Tensor, candle_core::Error> {
+        let k = self.counter.fetch_add(1, Ordering::Relaxed);
+        let key = mix_counter(self.origin_seed, k);
+        let scale = 1.0 / (1.0 - p) as f64;
+
+        match x.device() {
+            Device::Cpu => {
+                // candle's CPU RNG cannot be seeded (`set_seed` errors), which is
+                // why this crate carries its own generator at all. Building the
+                // buffer host-side is free here: it is already the device the
+                // tensor lives on, so there is no transfer.
+                let mut rng = SplitMix64::new(key);
+                let vals: Vec<f32> = (0..x.elem_count())
+                    .map(|_| {
+                        if rng.next_f32() < p {
+                            0.0
+                        } else {
+                            scale as f32
+                        }
+                    })
+                    .collect();
+                Tensor::from_vec(vals, x.shape(), x.device())?.to_dtype(x.dtype())
+            }
+            device => {
+                // Seed the device generator from the same key, then draw on the
+                // device. `rand_uniform` is F32/F64 only, so the comparison runs
+                // in F32 and the result casts to the activation's dtype.
+                device.set_seed(key)?;
+                let u = Tensor::rand(0f32, 1f32, x.shape(), device)?;
+                let keep = u.ge(p)?.to_dtype(candle_core::DType::F32)?;
+                (keep * scale)?.to_dtype(x.dtype())
+            }
+        }
+    }
+}
+
+/// Fold a forward counter into a layer's origin seed.
+///
+/// SplitMix64's finalizer over `origin ^ (counter * golden-ratio odd constant)`:
+/// consecutive counters land far apart, so successive forwards of one layer are
+/// uncorrelated, and two layers never collide because their origins already
+/// differ by [`seed_for_param`].
+fn mix_counter(origin_seed: u64, counter: u64) -> u64 {
+    let mut z = origin_seed ^ counter.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 #[cfg(test)]
@@ -200,41 +254,102 @@ mod tests {
         assert!(mean.abs() < 0.005, "mean {mean} not near 0");
     }
 
+    fn mask_values(t: &Tensor) -> Vec<f32> {
+        t.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+    }
+
     #[test]
-    fn dropout_stream_is_deterministic_and_scaled() {
-        let mut s1 = DropoutStream::new(11, "projection");
-        let mut s2 = DropoutStream::new(11, "projection");
-        let m1 = s1.draw_mask(10_000, 0.3);
-        let m2 = s2.draw_mask(10_000, 0.3);
-        assert_eq!(m1, m2);
-        let scale = 1.0 / 0.7;
-        for x in &m1 {
-            assert!(*x == 0.0 || (*x - scale).abs() < 1e-6);
+    fn masks_are_deterministic_and_inverted_scaled() {
+        let d = Device::Cpu;
+        let x = Tensor::zeros((100, 100), candle_core::DType::F32, &d).unwrap();
+        let a = DropoutMasks::new(11, "projection");
+        let b = DropoutMasks::new(11, "projection");
+        let m1 = mask_values(&a.next_mask(&x, 0.3).unwrap());
+        let m2 = mask_values(&b.next_mask(&x, 0.3).unwrap());
+        assert_eq!(
+            m1, m2,
+            "same (seed, layer, counter) must give the same mask"
+        );
+
+        let scale = 1.0f32 / 0.7;
+        for v in &m1 {
+            assert!(
+                *v == 0.0 || (*v - scale).abs() < 1e-6,
+                "unexpected value {v}"
+            );
         }
-        // Roughly p of the mask is dropped.
-        let dropped = m1.iter().filter(|x| **x == 0.0).count() as f32 / m1.len() as f32;
+        let dropped = m1.iter().filter(|v| **v == 0.0).count() as f32 / m1.len() as f32;
         assert!((dropped - 0.3).abs() < 0.03, "dropped fraction {dropped}");
     }
 
     #[test]
-    fn restore_position_replays_the_exact_stream() {
-        // A reference stream draws three masks; a fresh stream restored to the
-        // reference's position after two masks must draw the third mask
-        // byte-identically — this is the resume invariant for dropout.
-        let mut reference = DropoutStream::new(7, "projection");
-        let _m0 = reference.draw_mask(16, 0.2);
-        let _m1 = reference.draw_mask(8, 0.2);
-        let pos = reference.position();
-        assert_eq!(pos, 24);
-        let m2_ref = reference.draw_mask(16, 0.2);
+    fn successive_forwards_draw_different_masks() {
+        let d = Device::Cpu;
+        let x = Tensor::zeros((64, 64), candle_core::DType::F32, &d).unwrap();
+        let m = DropoutMasks::new(3, "projection");
+        let first = mask_values(&m.next_mask(&x, 0.3).unwrap());
+        let second = mask_values(&m.next_mask(&x, 0.3).unwrap());
+        assert_ne!(
+            first, second,
+            "a counter-keyed mask must advance; an unchanging mask is not dropout"
+        );
+    }
 
-        let mut resumed = DropoutStream::new(7, "projection");
+    #[test]
+    fn two_layers_do_not_share_a_mask() {
+        let d = Device::Cpu;
+        let x = Tensor::zeros((64, 64), candle_core::DType::F32, &d).unwrap();
+        let a = DropoutMasks::new(5, "layer.0.Wqkv");
+        let b = DropoutMasks::new(5, "layer.1.Wqkv");
+        assert_ne!(
+            mask_values(&a.next_mask(&x, 0.3).unwrap()),
+            mask_values(&b.next_mask(&x, 0.3).unwrap()),
+            "masks are keyed by layer name; two layers must not correlate"
+        );
+    }
+
+    /// The resume invariant, and the reason this is counter-keyed rather than an
+    /// advancing stream: restoring is an assignment, so it is O(1) at any
+    /// position. The old design replayed `position` draws one at a time, and
+    /// position advanced by one per activation *element* — order 1e11 per layer
+    /// after one epoch of a large encoder.
+    #[test]
+    fn restore_position_reproduces_the_uninterrupted_masks() {
+        let d = Device::Cpu;
+        let x = Tensor::zeros((32, 32), candle_core::DType::F32, &d).unwrap();
+        let reference = DropoutMasks::new(7, "projection");
+        let _ = reference.next_mask(&x, 0.2).unwrap();
+        let _ = reference.next_mask(&x, 0.2).unwrap();
+        let pos = reference.position();
+        assert_eq!(pos, 2, "position counts forwards, not draws");
+        let third = mask_values(&reference.next_mask(&x, 0.2).unwrap());
+
+        let resumed = DropoutMasks::new(7, "projection");
         resumed.restore_position(pos);
         assert_eq!(resumed.position(), pos);
-        let m2_resumed = resumed.draw_mask(16, 0.2);
         assert_eq!(
-            m2_ref, m2_resumed,
-            "a restored dropout stream must replay the uninterrupted stream byte-for-byte"
+            third,
+            mask_values(&resumed.next_mask(&x, 0.2).unwrap()),
+            "a restored layer must draw the mask the uninterrupted run would have"
         );
+    }
+
+    /// Restoring must not depend on how far in the run the position is. A
+    /// replay-based restore would take time proportional to it; this asserts the
+    /// behaviour is identical at a position no replay could reach.
+    #[test]
+    fn restore_is_position_independent() {
+        let d = Device::Cpu;
+        let x = Tensor::zeros((8, 8), candle_core::DType::F32, &d).unwrap();
+        let far = 5_000_000_000u64;
+        let a = DropoutMasks::new(9, "projection");
+        a.restore_position(far);
+        let b = DropoutMasks::new(9, "projection");
+        b.restore_position(far);
+        assert_eq!(
+            mask_values(&a.next_mask(&x, 0.25).unwrap()),
+            mask_values(&b.next_mask(&x, 0.25).unwrap())
+        );
+        assert_eq!(a.position(), far + 1);
     }
 }

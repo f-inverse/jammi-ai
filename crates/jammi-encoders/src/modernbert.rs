@@ -28,6 +28,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
 use candle_nn::{embedding, linear_no_bias, Embedding, VarBuilder, VarMap};
@@ -35,7 +36,7 @@ use jammi_lora::{effective_rank, should_apply_lora, LoraBuildConfig, LoraLinear,
 
 use crate::error::EncoderError;
 use crate::layer_norm::LayerNorm;
-use crate::mask::extended_attention_mask;
+use crate::mask::{extended_attention_mask, sliding_window_mask};
 use crate::pooling::{pool_and_normalize, Pooling};
 
 const DEFAULT_LAYER_NORM_EPS: f64 = 1e-5;
@@ -62,12 +63,11 @@ fn default_global_attn_every_n_layers() -> usize {
 
 /// ModernBERT architecture configuration parsed from `config.json`.
 ///
-/// Fields mirror the HuggingFace ModernBERT config schema. The
-/// sliding-window-local-attention fields are accepted for round-trip
-/// compatibility with stock checkpoints but are not exercised by the
-/// forward pass — this port uses a single global RoPE for every layer,
-/// which is exact for any checkpoint whose `global_attn_every_n_layers` is
-/// `1` (i.e., every layer is a global-attention layer).
+/// Fields mirror the HuggingFace ModernBERT config schema, including the
+/// sliding-window-local-attention set, which the forward pass honours:
+/// `global_attn_every_n_layers` selects which layers are global, and a local
+/// layer attends within `local_attention / 2` positions either side using
+/// `local_rope_theta` as its RoPE base. See [`ModernBertConfig::is_local_layer`].
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ModernBertConfig {
     pub hidden_size: usize,
@@ -86,6 +86,28 @@ pub struct ModernBertConfig {
     pub local_attention: usize,
     #[serde(default = "default_global_attn_every_n_layers")]
     pub global_attn_every_n_layers: usize,
+}
+
+impl ModernBertConfig {
+    /// Whether layer `idx` uses sliding-window local attention.
+    ///
+    /// ModernBERT's rule, matching upstream
+    /// (`layer_types[i] = "sliding_attention" if i % global_attn_every_n_layers
+    /// else "full_attention"`): layer 0 and every `global_attn_every_n_layers`-th
+    /// layer thereafter are global, and the rest are local. A checkpoint with
+    /// `global_attn_every_n_layers == 1` is therefore all-global — which is why
+    /// a single-layer fixture cannot distinguish an implementation that honours
+    /// the window from one that ignores it.
+    pub fn is_local_layer(&self, idx: usize) -> bool {
+        self.global_attn_every_n_layers != 0 && !idx.is_multiple_of(self.global_attn_every_n_layers)
+    }
+
+    /// Half-width of the sliding window: a local layer's query at position `i`
+    /// attends to keys `j` with `|i - j| <= half_window`. Upstream stores the
+    /// full width and halves it (`sliding_window = local_attention // 2`).
+    pub fn half_window(&self) -> usize {
+        self.local_attention / 2
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -169,13 +191,26 @@ struct ModernBertAttention {
     /// `None` for layer 0 — the embedding `norm` already pre-normalises the
     /// input there, so the layer holds an identity pre-norm.
     attn_norm: Option<LayerNorm>,
-    rope: RotaryEmbedding,
+    /// The RoPE table for this layer's attention type. Shared, because a model
+    /// has exactly two tables (global and local) however many layers it has.
+    rope: Arc<RotaryEmbedding>,
+    /// `true` when this layer attends within a sliding window rather than over
+    /// the whole sequence. The band itself is built once per forward and passed
+    /// in, since it depends only on the sequence length.
+    is_local: bool,
     num_heads: usize,
     head_dim: usize,
 }
 
 impl ModernBertAttention {
-    fn forward(&self, hidden: &Tensor, extended_mask: &Tensor) -> Result<Tensor, EncoderError> {
+    /// `local_band` is the `[1, 1, seq, seq]` sliding-window mask, supplied
+    /// whenever the model has any local layer. A global layer ignores it.
+    fn forward(
+        &self,
+        hidden: &Tensor,
+        extended_mask: &Tensor,
+        local_band: Option<&Tensor>,
+    ) -> Result<Tensor, EncoderError> {
         let normed = match &self.attn_norm {
             Some(ln) => ln.forward(hidden)?,
             None => hidden.clone(),
@@ -210,6 +245,20 @@ impl ModernBertAttention {
         // when scores are already F32).
         let extended_mask = extended_mask.to_dtype(scores.dtype())?;
         let scores = scores.broadcast_add(&extended_mask)?;
+
+        // A local layer additionally masks everything outside its band. Added
+        // straight onto the scores rather than pre-combined with the padding
+        // mask, so the two never materialise a joint `[batch, heads, seq, seq]`
+        // tensor: each broadcasts from its own smaller shape.
+        let scores = match (self.is_local, local_band) {
+            (true, Some(band)) => scores.broadcast_add(&band.to_dtype(scores.dtype())?)?,
+            (true, None) => {
+                return Err(EncoderError::Config(
+                    "local-attention layer reached without a sliding-window band".into(),
+                ))
+            }
+            (false, _) => scores,
+        };
 
         let attn = candle_nn::ops::softmax(&scores, D::Minus1)?;
 
@@ -260,8 +309,15 @@ struct ModernBertLayer {
 }
 
 impl ModernBertLayer {
-    fn forward(&self, hidden: &Tensor, extended_mask: &Tensor) -> Result<Tensor, EncoderError> {
-        let after_attn = self.attention.forward(hidden, extended_mask)?;
+    /// Passes `local_band` through to attention; whether it is consulted is the
+    /// attention's own per-layer property.
+    fn forward(
+        &self,
+        hidden: &Tensor,
+        extended_mask: &Tensor,
+        local_band: Option<&Tensor>,
+    ) -> Result<Tensor, EncoderError> {
+        let after_attn = self.attention.forward(hidden, extended_mask, local_band)?;
         self.mlp.forward(&after_attn)
     }
 }
@@ -283,6 +339,10 @@ pub struct ModernBert {
     pooling: Pooling,
     hidden_size: usize,
     max_position_embeddings: usize,
+    /// Half-width of the sliding window, `Some` only when the model actually
+    /// has a local layer. `None` means every layer is global and no band is
+    /// built.
+    local_half_window: Option<usize>,
 }
 
 impl ModernBert {
@@ -332,8 +392,14 @@ impl ModernBert {
         let mut hidden = self.emb_norm.forward(&word_emb)?;
 
         let extended = extended_attention_mask(mask)?;
+        // Built once per forward, not per layer: the band depends only on the
+        // sequence length and the window, so every local layer shares it.
+        let local_band = self
+            .local_half_window
+            .map(|half| sliding_window_mask(seq, half, input_ids.device()))
+            .transpose()?;
         for layer in &self.layers {
-            hidden = layer.forward(&hidden, &extended)?;
+            hidden = layer.forward(&hidden, &extended, local_band.as_ref())?;
         }
 
         self.final_norm.forward(&hidden)
@@ -521,6 +587,22 @@ impl<'a> ModernBertBuilder<'a> {
 
         let head_dim = config.hidden_size / config.num_attention_heads;
 
+        // Exactly two RoPE tables per model, shared by every layer of the
+        // matching attention type. Building one per layer would allocate
+        // `num_hidden_layers` identical tables.
+        let global_rope = Arc::new(RotaryEmbedding::new(
+            head_dim,
+            config.max_position_embeddings,
+            config.global_rope_theta,
+            device,
+        )?);
+        let local_rope = Arc::new(RotaryEmbedding::new(
+            head_dim,
+            config.max_position_embeddings,
+            config.local_rope_theta,
+            device,
+        )?);
+
         let word_embeddings = embedding(
             config.vocab_size,
             config.hidden_size,
@@ -564,12 +646,12 @@ impl<'a> ModernBertBuilder<'a> {
                 )?)
             };
 
-            let rope = RotaryEmbedding::new(
-                head_dim,
-                config.max_position_embeddings,
-                config.global_rope_theta,
-                device,
-            )?;
+            let is_local = config.is_local_layer(n);
+            let rope = if is_local {
+                Arc::clone(&local_rope)
+            } else {
+                Arc::clone(&global_rope)
+            };
 
             let wi = site.build(
                 "Wi",
@@ -596,6 +678,7 @@ impl<'a> ModernBertBuilder<'a> {
                     wo,
                     attn_norm,
                     rope,
+                    is_local,
                     num_heads: config.num_attention_heads,
                     head_dim,
                 },
@@ -622,6 +705,9 @@ impl<'a> ModernBertBuilder<'a> {
             pooling: self.pooling,
             hidden_size: config.hidden_size,
             max_position_embeddings: config.max_position_embeddings,
+            local_half_window: (0..config.num_hidden_layers)
+                .any(|n| config.is_local_layer(n))
+                .then(|| config.half_window()),
         })
     }
 }

@@ -4146,6 +4146,7 @@ dependencies = [
  "futures",
  "jammi-ai",
  "jammi-db",
+ "jammi-encoders",
  "jammi-lora",
  "jammi-numerics",
  "libc",

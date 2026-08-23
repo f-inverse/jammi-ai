@@ -28,7 +28,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
 use candle_nn::{embedding, linear_no_bias, Embedding, VarBuilder, VarMap};
@@ -91,6 +91,10 @@ pub struct ModernBertConfig {
 impl ModernBertConfig {
     /// Whether layer `idx` uses sliding-window local attention.
     ///
+    /// Panics if `global_attn_every_n_layers` is 0; [`ModernBertBuilder::build`]
+    /// refuses such a config before any layer is constructed, so this is
+    /// unreachable from a loaded model.
+    ///
     /// ModernBERT's rule, matching upstream
     /// (`layer_types[i] = "sliding_attention" if i % global_attn_every_n_layers
     /// else "full_attention"`): layer 0 and every `global_attn_every_n_layers`-th
@@ -99,7 +103,7 @@ impl ModernBertConfig {
     /// a single-layer fixture cannot distinguish an implementation that honours
     /// the window from one that ignores it.
     pub fn is_local_layer(&self, idx: usize) -> bool {
-        self.global_attn_every_n_layers != 0 && !idx.is_multiple_of(self.global_attn_every_n_layers)
+        !idx.is_multiple_of(self.global_attn_every_n_layers)
     }
 
     /// Half-width of the sliding window: a local layer's query at position `i`
@@ -343,6 +347,18 @@ pub struct ModernBert {
     /// has a local layer. `None` means every layer is global and no band is
     /// built.
     local_half_window: Option<usize>,
+    /// Sliding-window bands, keyed by sequence length.
+    ///
+    /// The band is a pure function of `(seq, half_window, device)` and constant
+    /// for the life of the model, but the sequence length varies per batch
+    /// (padding is batch-longest), so it is memoised per length rather than
+    /// built once. Without this, every forward allocated and uploaded a
+    /// `seq * seq` host buffer — 268 MB per forward at this family's
+    /// `max_position_embeddings` of 8192 — which is the same host-generated
+    /// per-forward mask cost recorded as esc-032 for LoRA dropout.
+    ///
+    /// A `Mutex` rather than a `RefCell`: the model is held across threads.
+    band_cache: Mutex<HashMap<usize, Tensor>>,
 }
 
 impl ModernBert {
@@ -394,15 +410,34 @@ impl ModernBert {
         let extended = extended_attention_mask(mask)?;
         // Built once per forward, not per layer: the band depends only on the
         // sequence length and the window, so every local layer shares it.
-        let local_band = self
-            .local_half_window
-            .map(|half| sliding_window_mask(seq, half, input_ids.device()))
-            .transpose()?;
+        let local_band = match self.local_half_window {
+            None => None,
+            Some(half) => Some(self.sliding_band(seq, half, input_ids.device())?),
+        };
         for layer in &self.layers {
             hidden = layer.forward(&hidden, &extended, local_band.as_ref())?;
         }
 
         self.final_norm.forward(&hidden)
+    }
+
+    /// The sliding-window band for `seq`, built once per length and reused.
+    fn sliding_band(
+        &self,
+        seq: usize,
+        half: usize,
+        device: &Device,
+    ) -> Result<Tensor, EncoderError> {
+        let mut cache = self
+            .band_cache
+            .lock()
+            .map_err(|_| EncoderError::Config("sliding-window band cache poisoned".into()))?;
+        if let Some(band) = cache.get(&seq) {
+            return Ok(band.clone());
+        }
+        let band = sliding_window_mask(seq, half, device)?;
+        cache.insert(seq, band.clone());
+        Ok(band)
     }
 
     /// Borrowed references to every trainable LoRA tensor in the encoder.
@@ -565,6 +600,15 @@ impl<'a> ModernBertBuilder<'a> {
         device: &Device,
         varmap: &VarMap,
     ) -> Result<ModernBert, EncoderError> {
+        // Refuse a config this port cannot honour rather than reinterpreting it.
+        // Upstream raises on `i % 0`; silently treating it as all-global would
+        // be the same silent-wrong-function class this sliding-window support
+        // exists to remove.
+        if config.global_attn_every_n_layers == 0 {
+            return Err(EncoderError::Config(
+                "global_attn_every_n_layers must be > 0 (1 = every layer global)".into(),
+            ));
+        }
         if config.num_attention_heads == 0
             || !config
                 .hidden_size
@@ -708,6 +752,7 @@ impl<'a> ModernBertBuilder<'a> {
             local_half_window: (0..config.num_hidden_layers)
                 .any(|n| config.is_local_layer(n))
                 .then(|| config.half_window()),
+            band_cache: Mutex::new(HashMap::new()),
         })
     }
 }

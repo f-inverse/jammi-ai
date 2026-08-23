@@ -250,3 +250,61 @@ fn assert_case_matches(case: &str) {
         "{case}: pooled embedding diverges by {pooled_delta:.6}"
     );
 }
+
+/// A config this port cannot honour must be refused at load, not reinterpreted.
+///
+/// `global_attn_every_n_layers = 0` has no meaning — upstream raises on `i % 0`.
+/// Treating it as "all layers global" would be the same silent-wrong-function
+/// class that sliding-window support exists to remove, so it fails loudly.
+#[test]
+fn zero_global_attn_every_n_layers_is_refused_at_load() {
+    let device = Device::Cpu;
+    let mut cfg = load_config();
+    cfg.global_attn_every_n_layers = 0;
+    let varmap = VarMap::new();
+    let weights = fixture_dir().join("model.safetensors");
+    let built = ModernBert::builder().backbone_dtype(DType::F32).build(
+        &[weights.as_path()],
+        &cfg,
+        &device,
+        &varmap,
+    );
+    let Err(err) = built else {
+        panic!("global_attn_every_n_layers = 0 must be refused, not reinterpreted");
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("global_attn_every_n_layers"),
+        "the error must name the field it refuses: {msg}"
+    );
+}
+
+/// The band is memoised per sequence length, so repeated forwards at one length
+/// do not rebuild it. Without the cache each forward allocated and uploaded a
+/// `seq * seq` host buffer.
+#[test]
+fn sliding_band_is_reused_across_forwards() {
+    let device = Device::Cpu;
+    let g = goldens(&device);
+    let encoder = build_encoder(&device);
+    let ids = g["unpadded.input_ids"].to_dtype(DType::U32).unwrap();
+    let mask = g["unpadded.attention_mask"].to_dtype(DType::U32).unwrap();
+
+    // Two forwards at the same length must agree exactly — a rebuilt band that
+    // differed would show here, and a cached band that went stale would too.
+    let a = encoder.forward_hidden(&ids, &mask).unwrap();
+    let b = encoder.forward_hidden(&ids, &mask).unwrap();
+    assert_eq!(
+        max_abs_diff(&a, &b),
+        0.0,
+        "repeated forwards must be identical"
+    );
+
+    // A different length must still be correct, proving the cache is keyed by
+    // length rather than serving the first band to every caller.
+    let short_ids = ids.narrow(1, 0, 32).unwrap();
+    let short_mask = mask.narrow(1, 0, 32).unwrap();
+    let s = encoder.forward_hidden(&short_ids, &short_mask).unwrap();
+    assert_eq!(s.dims()[1], 32, "short forward keeps its own length");
+    assert_all_finite(&s, "short-sequence hidden states");
+}

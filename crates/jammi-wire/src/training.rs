@@ -440,6 +440,54 @@ mod tests {
         assert_eq!(decoded.batch_size, 8);
     }
 
+    /// NON-BUG GOLDEN for #347.
+    ///
+    /// #347's first stated root cause is that a serde default overrides an
+    /// explicit `validation_fraction = 0`, so a user who asks for no validation
+    /// split silently gets 10%. That is false, and this pins why so nobody
+    /// "fixes" it later: the proto field carries explicit presence, so a set-to
+    /// -zero and an unset field are distinguishable on the wire, and the
+    /// converter honours both.
+    ///
+    /// The existing all-unset test covers only the omitted half — which is
+    /// exactly why the misconception was plausible. Both halves are asserted
+    /// here. A future change that made the field non-optional, or that coerced
+    /// `0.0` to the default, would fail this.
+    #[test]
+    fn explicit_zero_validation_fraction_survives_the_wire_round_trip() {
+        let cfg = FineTuneConfig {
+            validation_fraction: 0.0,
+            // The zero split is only legal alongside a metric that needs no
+            // validation pass; see FineTuneConfig::validate.
+            early_stopping_metric: EarlyStoppingMetric::TrainLoss,
+            ..Default::default()
+        };
+        cfg.validate()
+            .expect("0.0 + train_loss is a legal combination");
+
+        let proto = config_to_proto(&cfg);
+        assert_eq!(
+            proto.validation_fraction,
+            Some(0.0),
+            "an explicit zero must be SENT as present, not omitted"
+        );
+        let decoded = FineTuneConfig::try_from(proto).expect("decodes");
+        assert_eq!(
+            decoded.validation_fraction, 0.0,
+            "an explicit zero must survive the round trip as zero, not become the default"
+        );
+
+        // The other half: an omitted field still resolves to the engine default,
+        // so presence is genuinely carrying the distinction.
+        let omitted = pb::FineTuneConfig::default();
+        assert_eq!(
+            FineTuneConfig::try_from(omitted)
+                .unwrap()
+                .validation_fraction,
+            0.1
+        );
+    }
+
     /// A partially-set wire config overrides exactly the present fields and
     /// leaves every other field at the engine default — including a legal `0`
     /// override (`warmup_steps = 0` to disable warmup), which is now

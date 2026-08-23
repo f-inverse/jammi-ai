@@ -448,6 +448,22 @@ impl FineTuneConfig {
                 "early_stopping_patience must be > 0".into(),
             ));
         }
+        // Monitoring a metric that will never be measured. Refused rather than
+        // coerced to TrainLoss: the caller asked for two things that cannot both
+        // hold, and silently picking one for them means the run they get is not
+        // the run they configured. This catches the explicit zero; a fraction
+        // that rounds to zero rows depends on the dataset size, which this
+        // config cannot see, and is refused at the split instead.
+        if self.validation_fraction == 0.0
+            && self.early_stopping_metric == EarlyStoppingMetric::ValLoss
+        {
+            return Err(JammiError::FineTune(
+                "early_stopping_metric=val_loss requires validation_fraction > 0; \
+                 set early_stopping_metric=train_loss to train on the whole \
+                 dataset, or raise validation_fraction to hold out a split"
+                    .into(),
+            ));
+        }
         if self.hard_negatives.mine {
             if self.hard_negatives.k == 0 {
                 return Err(JammiError::FineTune(
@@ -494,5 +510,72 @@ impl FineTuneConfig {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+
+    /// RED for #347: a run cannot monitor a metric it will never measure.
+    ///
+    /// `validation_fraction = 0.0` holds out nothing, so under the DEFAULT
+    /// `early_stopping_metric = ValLoss` the trainer monitored a validation loss
+    /// that was never computed. `evaluate` returned a `0.0` sentinel for the
+    /// empty split, so epoch 0 won `0.0 < f64::MAX` and wrote `checkpoint_best`,
+    /// every later epoch failed `0.0 < 0.0` and burned patience, the loop broke
+    /// at `patience + 1` epochs, and the epoch-0 adapter was published as the
+    /// run's result with a reported `final_loss` of 0.0. A silently untrained
+    /// model reported as perfect.
+    ///
+    /// Refused, not coerced. The issue proposes auto-switching the metric to
+    /// `TrainLoss`; that silently gives the caller a different run than the one
+    /// they configured, and the two settings are equally plausible as the
+    /// intended one.
+    #[test]
+    fn zero_validation_fraction_with_val_loss_is_refused() {
+        let cfg = FineTuneConfig {
+            validation_fraction: 0.0,
+            early_stopping_metric: EarlyStoppingMetric::ValLoss,
+            ..Default::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("val_loss over an empty split must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("validation_fraction"),
+            "the error must name the field: {msg}"
+        );
+        assert!(
+            msg.contains("train_loss"),
+            "the error must name the usable alternative: {msg}"
+        );
+    }
+
+    /// Positive control: the refusal is narrow. Each setting is legal on its own
+    /// and only the combination is refused, so this cannot pass by rejecting
+    /// everything.
+    #[test]
+    fn the_zero_split_refusal_is_narrow() {
+        FineTuneConfig {
+            validation_fraction: 0.0,
+            early_stopping_metric: EarlyStoppingMetric::TrainLoss,
+            ..Default::default()
+        }
+        .validate()
+        .expect("no split + train_loss is the documented way to train on everything");
+
+        FineTuneConfig {
+            validation_fraction: 0.2,
+            early_stopping_metric: EarlyStoppingMetric::ValLoss,
+            ..Default::default()
+        }
+        .validate()
+        .expect("a real split + val_loss is the default shape");
+
+        FineTuneConfig::default()
+            .validate()
+            .expect("the shipped default must remain valid");
     }
 }

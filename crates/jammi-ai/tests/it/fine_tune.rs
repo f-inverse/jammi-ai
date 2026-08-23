@@ -965,6 +965,7 @@ async fn training_divergence_detection() {
             epochs: 5,
             batch_size: 1,
             validation_fraction: 0.0,
+            early_stopping_metric: jammi_ai::fine_tune::EarlyStoppingMetric::TrainLoss,
             warmup_steps: 0,
             ..Default::default()
         },
@@ -2190,6 +2191,7 @@ async fn training_bails_when_lease_lost_mid_run() {
             epochs: 5,
             batch_size: 2,
             validation_fraction: 0.0,
+            early_stopping_metric: jammi_ai::fine_tune::EarlyStoppingMetric::TrainLoss,
             warmup_steps: 0,
             ..Default::default()
         },

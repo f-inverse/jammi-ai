@@ -145,14 +145,9 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::{EnvSigningKeyStore, MASTER_KEY_ENV};
-    use std::sync::Mutex;
+    use crate::audit::key_store::test_env::{lock, TEST_KEY};
+    use crate::audit::EnvSigningKeyStore;
     use uuid::Uuid;
-
-    // The master-key env var is process-global; serialize the tests that touch
-    // it against each other.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-    const TEST_KEY: &str = "0000000000000000000000000000000000000000000000000000000000000001";
 
     fn scoped() -> PerQueryAudit {
         let mut r = PerQueryAudit::new(
@@ -170,8 +165,8 @@ mod tests {
 
     #[test]
     fn sign_then_verify_roundtrips() {
-        let _g = ENV_LOCK.lock().unwrap();
-        std::env::set_var(MASTER_KEY_ENV, TEST_KEY);
+        let env = lock();
+        env.set(TEST_KEY);
         let store = EnvSigningKeyStore;
         let mut r = scoped();
         sign_record(&mut r, &store).unwrap();
@@ -181,8 +176,8 @@ mod tests {
 
     #[test]
     fn tampering_breaks_signature() {
-        let _g = ENV_LOCK.lock().unwrap();
-        std::env::set_var(MASTER_KEY_ENV, TEST_KEY);
+        let env = lock();
+        env.set(TEST_KEY);
         let store = EnvSigningKeyStore;
         let mut r = scoped();
         sign_record(&mut r, &store).unwrap();
@@ -195,8 +190,8 @@ mod tests {
 
     #[test]
     fn signing_is_deterministic_across_calls() {
-        let _g = ENV_LOCK.lock().unwrap();
-        std::env::set_var(MASTER_KEY_ENV, TEST_KEY);
+        let env = lock();
+        env.set(TEST_KEY);
         let master = EnvSigningKeyStore.master_key().unwrap();
         let secret = derive_tenant_secret(&master, "tenant-a").unwrap();
         let r = scoped();
@@ -209,8 +204,8 @@ mod tests {
 
     #[test]
     fn different_tenants_get_different_secrets() {
-        let _g = ENV_LOCK.lock().unwrap();
-        std::env::set_var(MASTER_KEY_ENV, TEST_KEY);
+        let env = lock();
+        env.set(TEST_KEY);
         let master = EnvSigningKeyStore.master_key().unwrap();
         assert_ne!(
             derive_tenant_secret(&master, "tenant-a").unwrap(),
@@ -220,8 +215,8 @@ mod tests {
 
     #[test]
     fn verify_with_tenant_is_true_under_the_signing_tenant() {
-        let _g = ENV_LOCK.lock().unwrap();
-        std::env::set_var(MASTER_KEY_ENV, TEST_KEY);
+        let env = lock();
+        env.set(TEST_KEY);
         let store = EnvSigningKeyStore;
         let mut r = scoped(); // signed under "tenant-a"
         sign_record(&mut r, &store).unwrap();
@@ -230,8 +225,8 @@ mod tests {
 
     #[test]
     fn verify_with_tenant_is_false_under_a_peer_tenant() {
-        let _g = ENV_LOCK.lock().unwrap();
-        std::env::set_var(MASTER_KEY_ENV, TEST_KEY);
+        let env = lock();
+        env.set(TEST_KEY);
         let store = EnvSigningKeyStore;
         let mut r = scoped(); // signed under "tenant-a"
         sign_record(&mut r, &store).unwrap();
@@ -246,8 +241,8 @@ mod tests {
     fn session_scope_closes_the_record_tenant_verify_leak() {
         // The RED→GREEN contrast, pinned as a regression test. A record signed
         // by tenant A is presented to tenant B's session.
-        let _g = ENV_LOCK.lock().unwrap();
-        std::env::set_var(MASTER_KEY_ENV, TEST_KEY);
+        let env = lock();
+        env.set(TEST_KEY);
         let store = EnvSigningKeyStore;
         let mut a_record = scoped(); // tenant_id = "tenant-a"
         sign_record(&mut a_record, &store).unwrap();
@@ -273,8 +268,8 @@ mod tests {
 
     #[test]
     fn verify_with_tenant_reports_tamper_as_false() {
-        let _g = ENV_LOCK.lock().unwrap();
-        std::env::set_var(MASTER_KEY_ENV, TEST_KEY);
+        let env = lock();
+        env.set(TEST_KEY);
         let store = EnvSigningKeyStore;
         let mut r = scoped();
         sign_record(&mut r, &store).unwrap();
@@ -284,12 +279,12 @@ mod tests {
 
     #[test]
     fn verify_with_tenant_surfaces_a_missing_master_key_as_error() {
-        let _g = ENV_LOCK.lock().unwrap();
-        std::env::set_var(MASTER_KEY_ENV, TEST_KEY);
+        let env = lock();
+        env.set(TEST_KEY);
         let mut r = scoped();
         sign_record(&mut r, &EnvSigningKeyStore).unwrap();
         // A genuine fault (no usable key) is an Err, not a silent `false`.
-        std::env::remove_var(MASTER_KEY_ENV);
+        env.clear();
         assert!(matches!(
             verify_with_tenant(&r, "tenant-a", &EnvSigningKeyStore),
             Err(AuditError::MasterKey(_))
@@ -298,8 +293,8 @@ mod tests {
 
     #[test]
     fn missing_master_key_makes_present_check_fail() {
-        let _g = ENV_LOCK.lock().unwrap();
-        std::env::remove_var(MASTER_KEY_ENV);
+        let env = lock();
+        env.clear();
         assert!(matches!(
             ensure_master_key_present(&EnvSigningKeyStore),
             Err(AuditError::MasterKey(_))

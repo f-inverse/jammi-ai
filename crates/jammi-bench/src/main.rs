@@ -59,6 +59,7 @@ mod conformal;
 mod context_predictor;
 mod corpus;
 mod eval;
+mod finetune_step;
 mod fixture;
 mod gpu_inference;
 mod graph_train;
@@ -362,6 +363,51 @@ enum Command {
     /// `gpu_inference` tier set and exits non-zero on a missing CUDA device, a
     /// serve error, or a classification lane that dropped a row.
     GpuInferenceScale,
+    /// The encoder fine-tune step tier: time one real LoRA training step —
+    /// three encoder forwards live on the tape at once, a cosine-margin triplet
+    /// loss, one backward into the adapter tensors, and one AdamW step — over a
+    /// ModernBERT checkpoint on disk. Runs on CPU by default and on a CUDA
+    /// ordinal with `--cuda`.
+    ///
+    /// Every number is RECORDED, never gated: a step time is a property of
+    /// `code x device x box`, so the only comparison a heterogeneous rented
+    /// fleet supports is a ratio between two runs on the same box. Emits the
+    /// JSON report with the `finetune_step` tier set.
+    FinetuneStep {
+        /// Directory holding `config.json` + `model.safetensors`.
+        #[arg(long)]
+        model_dir: PathBuf,
+        #[arg(long, default_value_t = 8)]
+        batch: usize,
+        #[arg(long, default_value_t = 128)]
+        seq: usize,
+        #[arg(long, default_value_t = 20)]
+        steps: usize,
+        #[arg(long, default_value_t = 5)]
+        warmup: usize,
+        #[arg(long, default_value_t = 8)]
+        lora_rank: usize,
+        #[arg(long, default_value_t = 16.0)]
+        lora_alpha: f64,
+        #[arg(long, default_value_t = 0.05)]
+        lora_dropout: f32,
+        /// Comma-separated LoRA target selectors.
+        #[arg(long, default_value = "Wqkv,Wo,Wi")]
+        target_modules: String,
+        /// Backbone precision: f32, f16, or bf16.
+        #[arg(long, default_value = "f32")]
+        backbone_dtype: String,
+        /// CUDA ordinal; omit for CPU.
+        #[arg(long)]
+        cuda: Option<usize>,
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// Encode the three triplet groups in one forward (the trainer's
+        /// behaviour). `--batched-forward false` measures the three-forward
+        /// shape for an A/B on the same box.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        batched_forward: bool,
+    },
     /// The CPU-hermetic cache-hit SLO tier: drives the engine's opt-in producer
     /// memoization (`CachePolicy::Use`) on a cacheable producer (the
     /// neighbour-graph, anchored on the immutable source-table `ResultDigest`).
@@ -427,9 +473,79 @@ async fn main() -> std::process::ExitCode {
         Command::ModelInferenceScale => run_model_inference_scale().await,
         Command::RebuildModelInferenceSpec => run_rebuild_model_inference_spec().await,
         Command::GpuInferenceScale => run_gpu_inference_scale().await,
+        Command::FinetuneStep {
+            model_dir,
+            batch,
+            seq,
+            steps,
+            warmup,
+            lora_rank,
+            lora_alpha,
+            lora_dropout,
+            target_modules,
+            backbone_dtype,
+            cuda,
+            seed,
+            batched_forward,
+        } => run_finetune_step(finetune_step::FinetuneStepParams {
+            model_dir,
+            batch,
+            seq,
+            steps,
+            warmup,
+            lora_rank,
+            lora_alpha,
+            lora_dropout,
+            target_modules: target_modules
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+            backbone_dtype: match backbone_dtype.as_str() {
+                "f32" => jammi_numerics::ComputePrecision::F32,
+                "f16" => jammi_numerics::ComputePrecision::F16,
+                "bf16" => jammi_numerics::ComputePrecision::BF16,
+                other => {
+                    eprintln!("unknown backbone_dtype {other:?}; expected f32, f16, or bf16");
+                    return std::process::ExitCode::FAILURE;
+                }
+            },
+            cuda_device: cuda,
+            seed,
+            batched_forward,
+        }),
         Command::CacheSloScale => run_cache_slo_scale().await,
         Command::RecomputeScale => run_recompute_scale().await,
     }
+}
+
+/// The `finetune-step` subcommand: run the tier and emit the report. Records;
+/// does not gate. Exits non-zero only when the step could not be measured at
+/// all — a missing checkpoint, a target-module set that matched no linear, or a
+/// device that could not be resolved.
+fn run_finetune_step(params: finetune_step::FinetuneStepParams) -> std::process::ExitCode {
+    let tier = match finetune_step::run(&params) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("finetune-step failed: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let report = Report {
+        engine_version: ENGINE_VERSION,
+        host: Host::detect(),
+        subcommand: "finetune-step",
+        tiers: Tiers {
+            finetune_step: Some(tier),
+            ..Default::default()
+        },
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).expect("serialize report")
+    );
+    std::process::ExitCode::SUCCESS
 }
 
 /// The `cache-slo-scale` subcommand: load the committed spec, run the tier (cold
@@ -461,6 +577,7 @@ async fn run_cache_slo_scale() -> std::process::ExitCode {
             binding: None,
             recall_sweep: None,
             training: None,
+            finetune_step: None,
             conformal: None,
             eval: None,
             propagate: None,
@@ -513,6 +630,7 @@ async fn run_recompute_scale() -> std::process::ExitCode {
             binding: None,
             recall_sweep: None,
             training: None,
+            finetune_step: None,
             conformal: None,
             eval: None,
             propagate: None,
@@ -616,6 +734,7 @@ async fn run_train_scale() -> std::process::ExitCode {
             binding: None,
             recall_sweep: None,
             training: Some(tier),
+            finetune_step: None,
             conformal: None,
             eval: None,
             propagate: None,
@@ -678,6 +797,7 @@ fn run_conformal_scale() -> std::process::ExitCode {
             binding: None,
             recall_sweep: None,
             training: None,
+            finetune_step: None,
             conformal: Some(tier),
             eval: None,
             propagate: None,
@@ -730,6 +850,7 @@ fn run_eval_scale() -> std::process::ExitCode {
             binding: None,
             recall_sweep: None,
             training: None,
+            finetune_step: None,
             conformal: None,
             eval: Some(tier),
             propagate: None,
@@ -783,6 +904,7 @@ async fn run_propagate_scale() -> std::process::ExitCode {
             binding: None,
             recall_sweep: None,
             training: None,
+            finetune_step: None,
             conformal: None,
             eval: None,
             propagate: Some(tier),
@@ -992,6 +1114,7 @@ fn run_graph_train_scale() -> std::process::ExitCode {
             binding: None,
             recall_sweep: None,
             training: None,
+            finetune_step: None,
             conformal: None,
             eval: None,
             propagate: None,
@@ -1092,6 +1215,7 @@ async fn run_context_predictor_scale() -> std::process::ExitCode {
             binding: None,
             recall_sweep: None,
             training: None,
+            finetune_step: None,
             conformal: None,
             eval: None,
             propagate: None,
@@ -1199,6 +1323,7 @@ async fn run_model_inference_scale() -> std::process::ExitCode {
             binding: None,
             recall_sweep: None,
             training: None,
+            finetune_step: None,
             conformal: None,
             eval: None,
             propagate: None,
@@ -1347,6 +1472,7 @@ async fn run_search_rss() -> std::process::ExitCode {
             binding: Some(tier),
             recall_sweep: None,
             training: None,
+            finetune_step: None,
             conformal: None,
             eval: None,
             propagate: None,
@@ -1401,6 +1527,7 @@ async fn run_arxiv() -> std::process::ExitCode {
             binding: None,
             recall_sweep: None,
             training: None,
+            finetune_step: None,
             conformal: None,
             eval: None,
             propagate: None,
@@ -1461,6 +1588,7 @@ async fn run_recall_sweep(
             binding: None,
             recall_sweep: Some(tier),
             training: None,
+            finetune_step: None,
             conformal: None,
             eval: None,
             propagate: None,

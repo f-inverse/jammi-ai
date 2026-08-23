@@ -365,3 +365,179 @@ fn lora_build_config_frozen_is_no_op() {
         cfg.layers_to_transform
     ));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Backbone-precision parity between the Frozen and LoRA arms
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A reduced backbone dtype must mean the same thing at every linear, whether
+/// or not that linear happens to be a LoRA target.
+///
+/// With `lora_b` initialised to zeros the LoRA contribution is exactly
+/// `B @ A @ x = 0`, so `Lora(W)` and `Frozen(W)` are the same function and must
+/// agree bit-for-bit. They did not: the `Frozen` arm cast the input down to the
+/// weight dtype and ran the matmul at the backbone precision, while the LoRA arm
+/// materialised a fresh F32 copy of the frozen weight on every forward and ran
+/// the base matmul in F32. A LoRA run therefore silently ignored
+/// `backbone_dtype` on precisely the linears it targeted.
+///
+/// F16 rather than BF16 because candle's CPU matmul accepts `F16 | F32 | F64`
+/// only; BF16 on CPU is rejected by the fine-tune config gate instead, and is
+/// covered by `bf16_backbone_is_refused_on_cpu`.
+mod backbone_precision_parity {
+    use candle_core::{DType, Device, Tensor};
+    use candle_nn::{Linear, VarMap};
+    use jammi_lora::{LoraInitMode, LoraLinear, MaybeLoraLinear};
+
+    const IN: usize = 24;
+    const OUT: usize = 16;
+    const BATCH: usize = 4;
+
+    fn weight(device: &Device) -> Tensor {
+        // Deterministic, non-degenerate, and large enough in magnitude that an
+        // F32-vs-F16 matmul difference is representable rather than rounding to
+        // the same value.
+        let data: Vec<f32> = (0..OUT * IN)
+            .map(|i| ((i % 17) as f32 - 8.0) / 6.0)
+            .collect();
+        Tensor::from_vec(data, (OUT, IN), device)
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap()
+    }
+
+    fn input(device: &Device) -> Tensor {
+        let data: Vec<f32> = (0..BATCH * IN)
+            .map(|i| ((i % 13) as f32 - 6.0) / 5.0)
+            .collect();
+        Tensor::from_vec(data, (BATCH, IN), device).unwrap()
+    }
+
+    fn finite_count(t: &Tensor) -> usize {
+        t.flatten_all()
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .filter(|v| v.is_finite())
+            .count()
+    }
+
+    fn spread(t: &Tensor) -> f32 {
+        let v = t
+            .flatten_all()
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        v.iter().fold(f32::MIN, |a, b| a.max(*b)) - v.iter().fold(f32::MAX, |a, b| a.min(*b))
+    }
+
+    fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
+        let a = a
+            .flatten_all()
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let b = b
+            .flatten_all()
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        a.iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    /// Build both arms over the *same* weight tensor at `dtype`.
+    fn arms(device: &Device, dtype: DType) -> (MaybeLoraLinear, MaybeLoraLinear, VarMap) {
+        let w = weight(device).to_dtype(dtype).unwrap();
+        let frozen = MaybeLoraLinear::Frozen(Linear::new(w.clone(), None));
+        let varmap = VarMap::new();
+        let vb = candle_nn::VarBuilder::from_varmap(&varmap, DType::F32, device);
+        let lora = LoraLinear::new(
+            Linear::new(w, None),
+            4,
+            8.0,
+            false,
+            LoraInitMode::ZerosB,
+            None,
+            42,
+            &varmap,
+            &vb.pp("site"),
+        )
+        .unwrap();
+        (frozen, MaybeLoraLinear::Lora(lora), varmap)
+    }
+
+    #[test]
+    fn lora_arm_honours_the_backbone_dtype_like_the_frozen_arm() {
+        let device = Device::Cpu;
+        let x = input(&device);
+        let (frozen, lora, _vm) = arms(&device, DType::F16);
+
+        // The zero-delta premise: without this the comparison below would be
+        // measuring a real LoRA contribution, not a precision difference.
+        let MaybeLoraLinear::Lora(inner) = &lora else {
+            unreachable!("constructed as Lora")
+        };
+        let b_sum = inner
+            .lora_b
+            .abs()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert_eq!(b_sum, 0.0, "ZerosB must leave lora_b exactly zero");
+
+        let fo = frozen.forward(&x).unwrap();
+        let lo = lora.forward(&x).unwrap();
+
+        // Non-vacuity: NaN fails every comparison bound in both directions, and
+        // a zeroed matmul would make any two outputs agree.
+        assert_eq!(
+            finite_count(&fo),
+            fo.elem_count(),
+            "frozen output non-finite"
+        );
+        assert_eq!(finite_count(&lo), lo.elem_count(), "lora output non-finite");
+        assert!(spread(&fo) > 0.0, "frozen output is constant");
+        assert!(spread(&lo) > 0.0, "lora output is constant");
+
+        assert_eq!(
+            fo.dtype(),
+            lo.dtype(),
+            "the two arms must agree on the output dtype"
+        );
+        let delta = max_abs_diff(&fo, &lo);
+        assert_eq!(
+            delta, 0.0,
+            "with lora_b == 0 the LoRA arm is the frozen arm, but they differ by {delta} \
+             at F16 — the LoRA arm is not running the base matmul at the backbone dtype"
+        );
+    }
+
+    /// Positive control: the harness must discriminate dtype rather than report
+    /// agreement everywhere. At F32 both arms have always agreed, and must
+    /// continue to.
+    #[test]
+    fn the_two_arms_agree_at_f32_too() {
+        let device = Device::Cpu;
+        let x = input(&device);
+        let (frozen, lora, _vm) = arms(&device, DType::F32);
+        let fo = frozen.forward(&x).unwrap();
+        let lo = lora.forward(&x).unwrap();
+        assert_eq!(finite_count(&fo), fo.elem_count());
+        assert!(spread(&fo) > 0.0);
+        assert_eq!(max_abs_diff(&fo, &lo), 0.0);
+    }
+}

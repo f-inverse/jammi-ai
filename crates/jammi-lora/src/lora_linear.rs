@@ -2,7 +2,7 @@
 
 use std::sync::Mutex;
 
-use candle_core::{DType, Tensor};
+use candle_core::Tensor;
 use candle_nn::{Init, Linear, Module, VarBuilder, VarMap};
 
 use crate::error::LoraError;
@@ -229,35 +229,21 @@ impl LoraLinear {
     /// the result is cast back to the backbone dtype before the LoRA delta is
     /// added so downstream layers stay in their expected precision.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor, LoraError> {
+        // The frozen base runs at the backbone dtype, exactly as
+        // `MaybeLoraLinear::Frozen` does: cast the input down to the weight and
+        // matmul there. Re-materialising the weight in F32 on every forward
+        // would make `backbone_dtype` inert on precisely the linears a LoRA run
+        // targets — the reduced dtype would cost an extra full-size allocation
+        // per forward and buy neither memory nor tensor-core throughput — and
+        // would leave a targeted linear computing a different function from an
+        // untargeted one over the same weights.
         let base_dtype = self.base.weight().dtype();
-
-        let x_f32 = if x.dtype() == DType::F32 {
+        let x_base = if x.dtype() == base_dtype {
             x.clone()
         } else {
-            x.to_dtype(DType::F32)?
+            x.to_dtype(base_dtype)?
         };
-        let w_f32 = if base_dtype == DType::F32 {
-            self.base.weight().clone()
-        } else {
-            self.base.weight().to_dtype(DType::F32)?
-        };
-        let bias_f32 = self
-            .base
-            .bias()
-            .map(|b| {
-                if b.dtype() == DType::F32 {
-                    Ok::<_, candle_core::Error>(b.clone())
-                } else {
-                    b.to_dtype(DType::F32)
-                }
-            })
-            .transpose()?;
-        let base_out_f32 = Linear::new(w_f32, bias_f32).forward(&x_f32)?;
-        let base_out = if base_dtype == DType::F32 {
-            base_out_f32
-        } else {
-            base_out_f32.to_dtype(base_dtype)?
-        };
+        let base_out = self.base.forward(&x_base)?;
 
         let lora_dtype = self.lora_a.dtype();
         let x_lora = if x.dtype() != lora_dtype {

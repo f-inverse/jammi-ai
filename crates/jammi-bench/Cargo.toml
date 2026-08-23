@@ -22,6 +22,7 @@ jammi-numerics.workspace = true
 # `fine_tune` integration suite exercises on `Device::Cpu`.
 jammi-ai = { workspace = true, features = ["local"] }
 jammi-lora = { workspace = true, features = ["candle"] }
+jammi-encoders.workspace = true
 candle-core.workspace = true
 candle-nn.workspace = true
 

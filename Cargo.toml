@@ -11,6 +11,7 @@ members = [
     "crates/jammi-python",
     "crates/jammi-cli",
     "crates/jammi-lora",
+    "crates/jammi-kernels",
     "crates/jammi-encoders",
     "crates/jammi-test-utils",
     "crates/jammi-bench",
@@ -26,6 +27,7 @@ default-members = [
     "crates/jammi-server",
     "crates/jammi-cli",
     "crates/jammi-lora",
+    "crates/jammi-kernels",
     "crates/jammi-encoders",
     "crates/jammi-bench",
 ]
@@ -56,6 +58,12 @@ jammi-server = { version = "0.47.0", path = "crates/jammi-server" }
 # `features = ["candle"]` (jammi-encoders) or via a feature that does (jammi-ai's
 # `local`).
 jammi-lora = { version = "0.47.0", path = "crates/jammi-lora", default-features = false }
+# Leaf: CustomOp scaffolding + the feature-gated CUDA build path for fused
+# training kernels (candle-core/candle-nn only, no jammi-* deps — dep
+# direction preserved). Not yet a dependency of any other workspace crate in
+# this commit; jammi-encoders takes it in a later commit at the first real
+# fused-op call site.
+jammi-kernels = { version = "0.47.0", path = "crates/jammi-kernels" }
 jammi-encoders = { version = "0.47.0", path = "crates/jammi-encoders" }
 jammi-test-utils = { path = "crates/jammi-test-utils" }
 
@@ -101,6 +109,9 @@ candle-nn = "0.11"
 # candle-transformers is consumed only by jammi-encoders dev-dependencies
 # (parity-test feature) — it is no longer in any production dep tree.
 candle-transformers = "0.11"
+# bf16/f16 storage type — the same crate candle-core itself depends on
+# (jammi-kernels' CustomOp CPU arms read/write `CpuStorage::BF16` directly).
+half = "2.5"
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["download-binaries"] }
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 usearch = "2.25"

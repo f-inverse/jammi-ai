@@ -314,7 +314,10 @@ jobs:
           #   - jammi-numerics is leaf (no internal deps)
           #   - jammi-db depends on jammi-numerics
           #   - jammi-lora is leaf
-          #   - jammi-encoders depends on jammi-lora
+          #   - jammi-kernels is leaf (candle-core/candle-nn only)
+          #   - jammi-encoders depends on jammi-lora (jammi-kernels lands before it
+          #     here even though no crate depends on it yet, so the ordering
+          #     already holds for the commit that adds the dependency edge)
           #   - jammi-wire depends on jammi-db, jammi-numerics, jammi-lora
           #   - jammi-admin depends on jammi-wire, jammi-db
           #   - jammi-client depends on jammi-wire, jammi-admin, jammi-db
@@ -323,7 +326,7 @@ jobs:
           #   - jammi-cli depends on jammi-db, jammi-admin
           # The presence guard skips crates that don't exist at this tag's
           # checkout — pre-S2 tags don't have jammi-numerics.
-          for crate in jammi-numerics jammi-db jammi-lora jammi-encoders jammi-wire jammi-admin jammi-client jammi-ai jammi-server jammi-cli; do
+          for crate in jammi-numerics jammi-db jammi-lora jammi-kernels jammi-encoders jammi-wire jammi-admin jammi-client jammi-ai jammi-server jammi-cli; do
             if [ ! -f "crates/${crate}/Cargo.toml" ]; then
               echo "${crate} not present at this tag — skipping"
               continue

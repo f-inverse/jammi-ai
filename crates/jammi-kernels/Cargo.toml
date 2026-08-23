@@ -1,0 +1,49 @@
+[package]
+name = "jammi-kernels"
+description = "Candle CustomOp scaffolding and a feature-gated CUDA build path for fused training kernels (elementwise/normalization/attention). Leaf crate: no jammi-* dependencies."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["candle", "cuda", "custom-op", "fused-kernel", "autodiff"]
+categories = ["science"]
+readme = "README.md"
+build = "build.rs"
+
+[dependencies]
+candle-core.workspace = true
+candle-nn.workspace = true
+# CustomOp2::cpu_fwd receives raw `CpuStorage`; the BF16 CPU arm reads/writes
+# `half::bf16` directly. Same crate (compatible version range) candle-core
+# itself depends on — not a new numeric type into the graph, just the public
+# name for one already resolved.
+half.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[build-dependencies]
+# Only pulled into the build-dependency graph when the `cuda` feature is
+# active (`optional = true` + `dep:bindgen_cuda` below) — the default
+# (laptop/CI) build never resolves or builds this crate, so it adds no
+# system requirement (nvcc, a CUDA toolkit) to the non-cuda lane.
+bindgen_cuda = { version = "0.1.6", optional = true }
+
+[dev-dependencies]
+approx.workspace = true
+
+[features]
+default = []
+# Forwards to candle's own `cuda` feature chain and pulls in the PTX build
+# step (`build.rs`). THE feature chain jammi-encoders/jammi-ai hang off of in
+# a later commit; not wired to any consumer yet in this one.
+cuda = ["dep:bindgen_cuda", "candle-core/cuda", "candle-nn/cuda"]
+
+# CPU↔CUDA parity — the landing proof the lead's pod session runs.
+# `required-features` means this test target is not even built by a plain
+# `cargo test -p jammi-kernels`; it exists (and can compile) only when the
+# `cuda` feature is active.
+[[test]]
+name = "cuda_parity"
+path = "tests/cuda_parity.rs"
+required-features = ["cuda"]

@@ -650,11 +650,18 @@ fn softmax_scale_bf16_bit_exact_vs_affine_then_unscaled_production_width_1_16_51
 }
 
 /// `head_dim = 128` leg, BF16, at PRODUCTION tensor widths (unlike the
-/// small toy `head_dim = 48` fixture below): `1/sqrt(128)` is irrational,
-/// so this DOES exercise the `f64 -> f32 -> bf16` double-rounding vs.
-/// `f64 -> bf16` single-rounding gap the module doc discloses. MEASURED,
-/// not assumed — bounded by the theoretical 1-ULP worst case for a single
-/// extra rounding step, not asserted bit-exact.
+/// small toy `head_dim = 48` fixture below). `1/sqrt(128)`'s F32 bit
+/// pattern is `0x3db5_04f3` — nowhere near a BF16 rounding tie (low 16
+/// bits `0x04f3`, far from the `0x8000` halfway point), so this leg does
+/// NOT exercise the `f64 -> f32 -> bf16` double-rounding vs. `f64 ->
+/// bf16` gap the module doc discloses (`128` is not one of the 4 known
+/// mismatch values — see the module doc's `scale_constant_bf16_max_1_ulp_across_head_dim_1_to_20000`
+/// sweep, and its separate exact-tie sibling test, for that). What this leg DOES
+/// measure: this op's BF16 kernel is bit-exact vs. affine-then-unscaled
+/// at this specific `head_dim`, at production tensor width — MEASURED,
+/// not assumed, still bounded `<= 1` ULP by the assertion (not `== 0`)
+/// so a genuine divergence at some other `head_dim` is not silently
+/// masked.
 #[test]
 fn softmax_scale_bf16_head_dim_128_bounded_vs_affine_then_unscaled_production_width_2_16_128_128() {
     let max_ulp = bf16_scale_max_ulp_diff_vs_affine_then_unscaled(2, 16, 128, head_dim_128_scale());
@@ -676,13 +683,16 @@ fn softmax_scale_bf16_head_dim_128_bounded_vs_affine_then_unscaled_production_wi
 }
 
 /// A NON-power-of-two scale, disclosed honestly rather than swept under
-/// the ModernBERT-only fixture above: `head_dim = 48` (`scale =
-/// 1/sqrt(48)`, irrational, genuinely rounded at every precision) DOES
-/// exercise the `f64 -> f32 -> bf16` double-rounding vs. `f64 -> bf16`
-/// single-rounding gap the module doc names. MEASURED, not assumed — this
-/// op is NOT claimed bit-exact here; the point is proving the divergence
-/// class is real (or absent) for at least one non-degenerate case, not
-/// just the lucky power-of-two production value.
+/// the ModernBERT-only fixture above: `head_dim = 48`, `scale =
+/// 1/sqrt(48)`, F32 bit pattern `0x3e13_cd3a` — like `head_dim = 128`
+/// above, NOT near a BF16 rounding tie (low 16 bits `0xcd3a`), so this
+/// leg does NOT exercise the double-rounding gap the module doc names
+/// either (see that doc's sweep test and its two genuine-tie legs for
+/// what does). MEASURED, not assumed — this op is NOT claimed bit-exact
+/// here; the point is pinning this op's kernel against the
+/// affine-then-unscaled composition for at least one non-power-of-two,
+/// non-ModernBERT-production value, not just the power-of-two production
+/// one.
 #[test]
 fn softmax_scale_bf16_non_power_of_two_head_dim_is_measured_not_assumed() {
     let device = Device::Cpu;

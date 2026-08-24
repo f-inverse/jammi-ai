@@ -141,51 +141,88 @@
 //! The BF16 kernel path additionally rounds that F32 `scale` value to
 //! BF16 once per call (`bf16::from_f32(self.scale)`), which takes the
 //! `f64 -> f32 -> bf16` (double-rounding) path for the scale CONSTANT
-//! itself, vs. `T::from_f64`'s own BF16 branch, which takes `f64 -> bf16`
-//! (single-rounding) directly. In principle a double-rounding path can
-//! disagree with a single-rounding path for SOME input — that is the
-//! textbook double-rounding failure mode — so this was checked directly
-//! rather than assumed away.
+//! itself, vs. `T::from_f64`'s own BF16 branch, which for `T = bf16` is
+//! `half::bf16::from_f64`. That function is NOT a round-to-nearest-even
+//! of the true infinite-precision `f64` value, despite reading as a
+//! "single rounding" from its signature: `half-2.7.1`'s own
+//! `f64_to_bf16` (`bfloat/convert.rs`) TRUNCATES the `f64` to its top 32
+//! raw bits FIRST (discarding the low 32 mantissa bits outright — a
+//! round-TOWARD-ZERO step on that intermediate, not round-to-nearest),
+//! THEN rounds THAT truncated value to BF16 — genuinely different from
+//! `f64 -> f32` (`as f32`, always a correctly-rounded IEEE cast, the path
+//! this op's own `scale: f32` field takes) followed by `f32 -> bf16`.
 //!
-//! The TRUE, stronger property (corrected from an earlier version of this
-//! doc, which understated it): for `scale = 1/sqrt(head_dim)` specifically,
-//! the two rounding paths agree BIT-FOR-BIT for every `head_dim` in `1
-//! ..= 20_000` — checked exhaustively, not sampled, with the closest case
-//! still landing roughly `1.5e5x` away from a rounding tie (nowhere near
-//! straddling a BF16 boundary). This is not a lucky property of a handful
-//! of fixture values; it is a structural fact about how `1/sqrt(d)`
-//! rounds, true for every `head_dim` any ModernBERT-class config could
-//! plausibly use. Once the scale constant itself is bit-identical on both
-//! paths, the REST of each arm's arithmetic (`round_bf16(s_i *
-//! round_bf16(scale))` then the existing mask-add rounding) is the same
-//! sequence of ordinary BF16 ops applied to the same inputs, so the two
-//! arms are bit-identical STRUCTURALLY, not merely on whichever fixture
-//! happened to be measured:
+//! For `scale = 1/sqrt(head_dim)`, MEASURED by
+//! `tests::scale_constant_bf16_max_1_ulp_across_head_dim_1_to_20000` in
+//! this module's own `mod tests` (the actual artifact) over `head_dim` in
+//! `1..=20_000`: the two paths do NOT agree bit-for-bit everywhere — an
+//! earlier version of this doc, and an earlier version of this same test,
+//! both wrongly claimed exact agreement (checked with a hand-rolled
+//! reference conversion that assumed true round-to-nearest-of-the-exact-
+//! value semantics for `bf16::from_f64`, which is not what `half` v2.7.1
+//! actually implements). The two paths disagree at EXACTLY 4 values in
+//! this range — `head_dim` `685`, `2740` (`= 4 * 685`), `10960` (`= 16 *
+//! 685`), and `15290` — each by exactly 1 ULP, the theoretical worst case
+//! for one extra rounding step; the test bounds every value in the sweep
+//! at `<= 1` ULP and additionally pins this exact 4-element mismatch set,
+//! so a future `half` version or rustc change that moves either count is
+//! caught, not silently absorbed. NONE of these four is an exact BF16
+//! rounding tie in the F32 intermediate (`685`'s low 16 F32 bits are
+//! `0x8008`, `15290`'s are `0x8006` — both near, not AT, the `0x8000`
+//! halfway point) — this is a DIFFERENT hazard from an exact tie: the
+//! disagreement comes from `bf16::from_f64`'s truncation step discarding
+//! information the correctly-rounded F32 intermediate retains, not from
+//! a genuine ambiguity in which BF16 neighbour is closer.
+//!
+//! `head_dim = 1811` (`1/sqrt(1811)`, F32 bit pattern `0x3cc0_8000`) and
+//! `head_dim = 7244` (`1/sqrt(7244)`, F32 bit pattern `0x3c40_8000`) ARE
+//! exact BF16 rounding ties in the F32 intermediate (low 16 bits exactly
+//! `0x8000`) — the textbook double-rounding hazard, checked SEPARATELY by
+//! `tests::scale_constant_ties_at_head_dim_1811_and_7244_agree_by_round_to_even_not_by_construction`,
+//! which pins both cases explicitly (bit patterns and outcome). Unlike
+//! the four mismatches above, the two paths DO agree at both of these
+//! ties — but only because round-half-to-even's tie-break happens to pick
+//! the SAME neighbour the true value of `1/sqrt(d)` is nearer to, for
+//! these two specific values, not because ties are safe in general.
+//! `head_dim` outside `1..=20_000` is UNPROVEN by either sweep.
+//!
+//! This does not threaten correctness for a `head_dim` where the two
+//! paths disagree: the op never computes or compares against
+//! `bf16::from_f64`'s path at runtime — it only ever receives and rounds
+//! the F32 `scale` its caller already computed (see [`Self::with_scale`]).
+//! That path exists ONLY inside the test oracles below, as the specific
+//! eager reference (`Tensor::affine` on a BF16 tensor, via `WithDType`'s
+//! `bf16::from_f64` binding in `candle-core`'s `dtype.rs`) those oracles
+//! compare against; a disagreement there means this op is not bit-exact
+//! vs. THAT ONE eager composition for that `head_dim` — a measured
+//! tolerance gap in the oracle's comparison, not an internal
+//! inconsistency or wrong number from the op itself, which remains
+//! self-consistent (multiplies by whatever BF16-rounded scale it was
+//! actually given) regardless.
+//!
 //! - `head_dim = 64` (`scale = 0.125`, an exact power of two — see
-//!   `PRODUCTION_SCALE` in `tests/oracles.rs`): BIT-EXACT (0 ULP), doubly
-//!   guaranteed (both by `0.125` being exactly representable at every
-//!   precision AND by the general `1/sqrt(d)` property above) — see
+//!   `PRODUCTION_SCALE` in `tests/oracles.rs`): BIT-EXACT (0 ULP),
+//!   guaranteed by `0.125` being exactly representable at every precision
+//!   (no rounding occurs on either path, tie or not) — see
 //!   `softmax_scale_bf16_bit_exact_vs_affine_then_unscaled_production_width_2_16_128_128`/
 //!   `..._1_16_512_512`.
-//! - `head_dim = 48` (`scale = 1/sqrt(48)`, irrational — a small,
-//!   non-production toy fixture) and `head_dim = 128` (`scale =
-//!   1/sqrt(128)`, irrational, the OTHER ModernBERT-class value this
-//!   crate's admission predicate must accept, at PRODUCTION tensor widths
-//!   `seq` 128 and 512): MEASURED 0 ULP, matching the general property
-//!   above rather than a coincidence — see
+//! - `head_dim = 48` (`scale = 1/sqrt(48)`, F32 bit pattern
+//!   `0x3e13_cd3a`) and `head_dim = 128` (`scale = 1/sqrt(128)`, F32 bit
+//!   pattern `0x3db5_04f3`, the OTHER ModernBERT-class value this crate's
+//!   admission predicate must accept, at PRODUCTION tensor widths `seq`
+//!   128 and 512): MEASURED 0 ULP — see
 //!   `softmax_scale_bf16_non_power_of_two_head_dim_is_measured_not_assumed`
 //!   and
 //!   `softmax_scale_bf16_head_dim_128_bounded_vs_affine_then_unscaled_production_width_2_16_128_128`/
-//!   `..._1_16_512_512`. These legs do NOT "exercise a double-rounding gap"
-//!   in the sense of demonstrating one CAN occur for a non-power-of-two
-//!   `head_dim` — no such gap exists for any realistic `head_dim`, per the
-//!   sweep above — their honest purpose is disclosing that this crate did
-//!   not simply assume the power-of-two case generalizes, and measuring at
-//!   least one non-power-of-two value directly rather than taking the
-//!   general property purely on the auditor's word. The tests still assert
-//!   only `<= 1` ULP (the theoretical worst case for one extra rounding
-//!   step), not `== 0`, so a future scale value falling outside the swept
-//!   `head_dim` range is not silently assumed identical.
+//!   `..._1_16_512_512`. NEITHER `48` nor `128` is one of the 4 known
+//!   mismatch values above, so these two legs pin this op's CPU kernel
+//!   against the affine-then-unscaled composition at these two specific
+//!   `head_dim` values (genuinely bit-exact there), nothing more — they
+//!   do not, by themselves, establish or exercise the double-rounding
+//!   class the `1..=20_000` sweep above measures directly. The tests
+//!   still assert only `<= 1` ULP (the theoretical worst case for one
+//!   extra rounding step), not `== 0`, so a future scale value is not
+//!   silently assumed identical by the assertion itself.
 //!
 //! Every leg above multiplies-and-rounds each element (`round_bf16(s_i *
 //! round_bf16(scale))`) before the existing mask-add rounding runs,
@@ -422,8 +459,9 @@
 //! `d(y)/d(pre_softmax)` UNCHANGED — the TWO output slots of `bwd`
 //! therefore diverge once `scale != 1.0`: the slot flowing
 //! back to this op's `scores` ARGUMENT is `SoftmaxBwdDScores`'s raw output
-//! multiplied by `self.scale` (a plain `Tensor::affine(scale, 0.0)` call).
-//! This is NOT untracked. `d_pre_softmax`
+//! multiplied by `self.scale` (a plain `Tensor::affine(scale, 0.0)` call),
+//! and that `.affine` call's own `Op::Affine` node IS tracked, not an
+//! untracked side computation. `d_pre_softmax`
 //! comes from `super::apply2` (`CustomOp2::apply_op2`), which attaches an
 //! `Op::CustomOp2` graph node whenever either of ITS inputs (`res`,
 //! `grad_res`) is itself tracked — the ordinary case whenever the original
@@ -469,9 +507,8 @@
 //!
 //! ## esc-037 disposition
 //!
-//! This names only what is true regardless of which branch this file is
-//! read from (a call path and file layout named here previously existed
-//! only on a different, unmerged branch). esc-037 (`.jammi/escapes.jsonl`) names TWO
+//! This describes only call paths and file layout that hold on this
+//! branch. esc-037 (`.jammi/escapes.jsonl`) names TWO
 //! backward-truncating APIs: `candle_nn::ops::softmax_last_dim`
 //! (`apply_op1_no_bwd`) and `QMatMul`, the natural entry point for
 //! quantized fine-tuning. esc-037's `softmax_last_dim` call sites live in
@@ -1084,15 +1121,12 @@ fn softmax_row_f32(
     }
 }
 
-// No other function in this crate carries this allow, so it is not "the
-// same call this crate's other internal `*_fwd_*` helpers make" — `scale`
-// (the fold-in-scale change) pushed THIS function specifically over
-// clippy's default 7-argument ceiling; every argument here is already
-// load-bearing (no grab-bag "options" struct would clarify anything a
-// positional list of row/shape/policy/scale scalars does not already say
-// directly), so the allow is kept, with its real justification stated
-// directly rather than by false analogy to a precedent that does not
-// exist.
+// `scale` (the fold-in-scale change) pushed this function, and its BF16
+// counterpart `softmax_fwd_bf16` below, over clippy's default 7-argument
+// ceiling. Every argument here is already load-bearing (no grab-bag
+// "options" struct would clarify anything a positional list of
+// row/shape/policy/scale scalars does not already say directly), so the
+// allow is kept on both.
 #[allow(clippy::too_many_arguments)]
 fn softmax_fwd_f32(
     scores: &[f32],
@@ -1321,6 +1355,112 @@ mod tests {
             .with_scale(0.125)
             .expect("0.125 must be accepted");
         assert_eq!(op.scale(), 0.125);
+    }
+
+    // -------------------------------------------------------------------
+    // The scale-constant rounding sweep the module doc's "scale
+    // semantics" section cites — this IS the artifact, not a description
+    // of one (family F).
+    // -------------------------------------------------------------------
+
+    /// The exact set of `head_dim` values in `1..=20_000` where
+    /// `bf16::from_f32(f32(1/sqrt(d)))` (double-rounding) and
+    /// `bf16::from_f64(1/sqrt(d))` (`half-2.7.1`'s truncate-then-round
+    /// path) disagree — see
+    /// `scale_constant_bf16_max_1_ulp_across_head_dim_1_to_20000`'s own
+    /// doc for why, and the module doc's "scale semantics" section for
+    /// the full disclosure.
+    const KNOWN_SCALE_MISMATCHES: [u32; 4] = [685, 2740, 10960, 15290];
+
+    /// For every `head_dim` in `1..=20_000`, does the `f64 -> f32 -> bf16`
+    /// double-rounding path this op's `scale` field takes
+    /// (`bf16::from_f32(f32(1/sqrt(d)))`, i.e. what `with_scale` receives
+    /// after the caller's own `f64 -> f32` cast, then this op's own
+    /// BF16-kernel rounding) agree bit-for-bit with `bf16::from_f64`, the
+    /// path candle's own `Tensor::affine` takes on a BF16 tensor (via
+    /// `WithDType`'s `bf16::from_f64` binding in `candle-core`'s
+    /// `dtype.rs`)? MEASURED over the swept range, not assumed -- and NOT
+    /// what an earlier version of this test claimed (exact agreement
+    /// everywhere): `half-2.7.1`'s `bf16::from_f64` (`f64_to_bf16`,
+    /// `bfloat/convert.rs`) TRUNCATES the f64 to its top 32 raw bits
+    /// FIRST, then rounds THAT truncated intermediate to BF16 -- not a
+    /// round-to-nearest-even of the true `f64` value despite the
+    /// "single-rounding" framing that name suggests, and genuinely
+    /// different from this op's own `f64 -> f32` (`as f32`, a correctly-
+    /// rounded IEEE cast) `-> bf16` path. The two paths disagree at
+    /// EXACTLY 4 values in this range -- `KNOWN_SCALE_MISMATCHES` -- each
+    /// by 1 ULP, so this bounds every value at `<= 1` ULP (the
+    /// theoretical worst case for one extra rounding step, matching this
+    /// crate's non-power-of-two BF16 legs in `tests/oracles.rs`) AND pins
+    /// the exact mismatch set, so a `half` version bump or rustc change
+    /// that moves either is caught here rather than silently absorbed.
+    /// See the module doc's "scale semantics" section for the full
+    /// disclosure, including the SEPARATE exact-tie case (a different
+    /// hazard) checked by
+    /// `scale_constant_ties_at_head_dim_1811_and_7244_agree_by_round_to_even_not_by_construction`.
+    #[test]
+    fn scale_constant_bf16_max_1_ulp_across_head_dim_1_to_20000() {
+        let mut mismatches = Vec::new();
+        for d in 1u32..=20_000 {
+            let val = 1.0f64 / f64::from(d).sqrt();
+            let double_rounded = bf16::from_f32(val as f32);
+            let single_rounded = bf16::from_f64(val);
+            let diff =
+                (i32::from(double_rounded.to_bits()) - i32::from(single_rounded.to_bits())).abs();
+            assert!(
+                diff <= 1,
+                "head_dim={d}: f64->f32->bf16 ({:#06x}) vs f64->bf16 ({:#06x}) differ by \
+                 {diff} ULP -- larger than the theoretical 1-ULP worst case",
+                double_rounded.to_bits(),
+                single_rounded.to_bits(),
+            );
+            if diff != 0 {
+                mismatches.push(d);
+            }
+        }
+        assert_eq!(
+            mismatches, KNOWN_SCALE_MISMATCHES,
+            "the set of head_dim values where the two paths disagree changed -- update this \
+             pinned list AND the module doc's 'scale semantics' section after confirming why"
+        );
+    }
+
+    /// Pins the two exact-tie cases the sweep above passes through, found
+    /// by checking every `head_dim` in `1..=20_000` for an F32 intermediate
+    /// whose low 16 bits are exactly `0x8000` (equidistant between the two
+    /// candidate BF16 values -- the textbook double-rounding hazard,
+    /// where a genuine disagreement between the two paths is possible in
+    /// general). Both cases here agree — NOT because ties are safe, but
+    /// because round-half-to-even's tie-break (the parity of the retained
+    /// mantissa bit) happens to pick the SAME neighbour the true
+    /// infinite-precision value of `1/sqrt(d)` is nearer to, for these two
+    /// specific values. See the module doc's "scale semantics" section for
+    /// why this does not threaten correctness even if some other
+    /// `head_dim` disagreed.
+    #[test]
+    fn scale_constant_ties_at_head_dim_1811_and_7244_agree_by_round_to_even_not_by_construction() {
+        for (d, expected_f32_bits) in [(1811u32, 0x3cc0_8000u32), (7244u32, 0x3c40_8000u32)] {
+            let val = 1.0f64 / f64::from(d).sqrt();
+            let f32_bits = (val as f32).to_bits();
+            assert_eq!(
+                f32_bits, expected_f32_bits,
+                "head_dim={d}: expected F32 bit pattern {expected_f32_bits:#010x}, got {f32_bits:#010x}"
+            );
+            assert_eq!(
+                f32_bits & 0xFFFF,
+                0x8000,
+                "head_dim={d}: expected an EXACT BF16 rounding tie (low 16 bits == 0x8000), \
+                 got {:#06x}",
+                f32_bits & 0xFFFF
+            );
+            let double_rounded = bf16::from_f32(val as f32);
+            let single_rounded = bf16::from_f64(val);
+            assert_eq!(
+                double_rounded.to_bits(),
+                single_rounded.to_bits(),
+                "head_dim={d}: the two paths disagree at this exact tie"
+            );
+        }
     }
 
     // -------------------------------------------------------------------

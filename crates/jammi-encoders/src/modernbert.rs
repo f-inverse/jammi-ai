@@ -181,21 +181,29 @@ pub(crate) static SOFTMAX_DISPATCH_COUNTERS: LazyLock<&'static DispatchCounters>
 /// check is unchanged and still the correct defense for any direct
 /// `apply2` caller that bypasses this predicate entirely.
 ///
-/// `scale` is `softmax_apply_training`'s OWN `scale` argument (the
-/// divisor, `sqrt(head_dim)` in production — see that function's doc): the
-/// fused branch folds `1.0 / scale` into `SoftmaxLastDimFused::scale`, and
+/// `scores_divisor` is `softmax_apply_training`'s OWN `scores_divisor`
+/// argument (`sqrt(head_dim)` in production — see that function's doc), a
+/// DIVISOR — named to say so explicitly, since `SoftmaxLastDimFused::scale`
+/// (a field on a DIFFERENT type, in `jammi-kernels`) is a MULTIPLIER and
+/// the two are easy to conflate by name alone. The fused branch folds `1.0
+/// / scores_divisor` into `SoftmaxLastDimFused::scale`, and
 /// `SoftmaxLastDimFused::with_scale` has a real domain of its own (family
 /// D — finite and strictly positive, see its doc). The `scale_finite_positive`
-/// clause below checks THAT quantity (`1.0 / scale` cast to `f32`, the
-/// EXACT value the fused branch would pass to `with_scale`), not `scale`
-/// itself directly, so a `scale` that is finite and positive but produces
-/// a non-finite or non-positive reciprocal (e.g. `scale` so large `1.0 /
-/// scale` underflows to `0.0`, or `scale == 0.0` itself) is caught here —
-/// a counted eager fallback (the SAME `scores / scale` division the eager
-/// branch already performs, so this is never a numeric domain the eager
-/// branch could not also handle) rather than `with_scale` refusing deeper
-/// in the call stack.
-fn softmax_admission_predicate(scores: &Tensor, mask: &Tensor, scale: f64) -> (bool, &'static str) {
+/// clause below checks THAT quantity (`1.0 / scores_divisor` cast to
+/// `f32`, the EXACT value the fused branch would pass to `with_scale`),
+/// not `scores_divisor` itself directly, so a `scores_divisor` that is
+/// finite and positive but produces a non-finite or non-positive
+/// reciprocal (e.g. `scores_divisor` so large `1.0 / scores_divisor`
+/// underflows to `0.0`, or `scores_divisor == 0.0` itself) is caught here
+/// — a counted eager fallback (the SAME `scores / scores_divisor`
+/// division the eager branch already performs, so this is never a numeric
+/// domain the eager branch could not also handle) rather than
+/// `with_scale` refusing deeper in the call stack.
+fn softmax_admission_predicate(
+    scores: &Tensor,
+    mask: &Tensor,
+    scores_divisor: f64,
+) -> (bool, &'static str) {
     if !device_is_supported(scores.device()) {
         return (false, "device_is_cpu_or_cuda");
     }
@@ -219,7 +227,7 @@ fn softmax_admission_predicate(scores: &Tensor, mask: &Tensor, scale: f64) -> (b
     if !jammi_kernels::ops::mask_broadcast_class_holds(scores, mask) {
         return (false, "mask_broadcast_class");
     }
-    let scale_mul = (1.0 / scale) as f32;
+    let scale_mul = (1.0 / scores_divisor) as f32;
     if !(scale_mul.is_finite() && scale_mul > 0.0) {
         return (false, "scale_finite_positive");
     }
@@ -696,31 +704,34 @@ impl ModernBertAttention {
 /// `ops::softmax::tests::fully_masked_row_backward_is_zero_under_both_policies_given_pooling_style_zero_dy`
 /// for the verified claim this restates).
 ///
-/// ## `scores` is UNSCALED here — `scale` folds `1/sqrt(head_dim)` in
+/// ## `scores` is UNSCALED here — `scores_divisor` folds `sqrt(head_dim)` in
 ///
 /// `scores` is `forward`'s `raw_scores` — the RAW `q @ k^T` matmul output,
-/// never divided by `scale` (`sqrt(head_dim)`) before reaching this
-/// function, unlike eval's own `scores` (see `forward`'s doc comment at
-/// its call site). This removes the `Op::Affine` node
-/// (`scores / scale`) the training arm used to retain at
-/// `[batch, heads, seq, seq]` — the single largest per-layer tape tensor
-/// this fused softmax op's own memory win already targets (see
+/// never divided by `scores_divisor` (`sqrt(head_dim)`) before reaching
+/// this function, unlike eval's own `scores` (see `forward`'s doc comment
+/// at its call site). This removes the `Op::Affine` node (`scores /
+/// scores_divisor`) the training arm used to retain at `[batch, heads,
+/// seq, seq]` — the single largest per-layer tape tensor this fused
+/// softmax op's own memory win already targets (see
 /// `jammi_kernels::ops::softmax`'s module doc). The FUSED branch folds
-/// `1/scale` into `SoftmaxLastDimFused::scale` (`with_scale`) so the op
-/// itself computes `softmax(scale_mul * scores + mask)` in one pass — see
-/// that op's module doc's "scale semantics" section for the exact
-/// per-dtype rounding this reproduces. The EAGER FALLBACK branch restores
-/// the `scores / scale` division EXPLICITLY, right here, so a domain miss
-/// (wrong dtype, non-contiguous, broadcast-class violation, …) is
-/// numerically IDENTICAL to what this function computed before `scale`
-/// existed — the fallback is never a fourth numeric path, only the
-/// pre-existing training-eager composition.
+/// `1 / scores_divisor` into `SoftmaxLastDimFused::scale` (`with_scale`)
+/// — a MULTIPLIER, the opposite convention from this function's own
+/// `scores_divisor` parameter, named explicitly to keep the two apart —
+/// so the op itself computes `softmax(scale_mul * scores + mask)` in one
+/// pass — see that op's module doc's "scale semantics" section for the
+/// exact per-dtype rounding this reproduces. The EAGER FALLBACK branch
+/// restores the `scores / scores_divisor` division EXPLICITLY, right
+/// here, so a domain miss (wrong dtype, non-contiguous, broadcast-class
+/// violation, …) is numerically IDENTICAL to what this function computed
+/// before `scores_divisor` existed as a named parameter — the fallback
+/// is never a fourth numeric path, only the pre-existing training-eager
+/// composition.
 fn softmax_apply_training(
     scores: &Tensor,
     mask: &Tensor,
-    scale: f64,
+    scores_divisor: f64,
 ) -> Result<Tensor, EncoderError> {
-    let (holds, predicate) = softmax_admission_predicate(scores, mask, scale);
+    let (holds, predicate) = softmax_admission_predicate(scores, mask, scores_divisor);
     let outcome = admit(
         admission_mode(),
         "softmax_last_dim_fused",
@@ -733,10 +744,10 @@ fn softmax_apply_training(
             scores,
             mask,
             SoftmaxLastDimFused::new(jammi_kernels::ops::FullyMaskedPolicy::Zeros)
-                .with_scale((1.0 / scale) as f32)?,
+                .with_scale((1.0 / scores_divisor) as f32)?,
         )?),
         DispatchOutcome::Eager => Ok(candle_nn::ops::softmax(
-            &(scores / scale)?.broadcast_add(mask)?,
+            &(scores / scores_divisor)?.broadcast_add(mask)?,
             D::Minus1,
         )?),
     }
@@ -1919,9 +1930,19 @@ mod tests {
     /// win in proportion to its own size, but this test does not, and
     /// cannot, measure bytes. The actual byte measurement is the committed
     /// pod A/B record,
-    /// `crates/jammi-bench/baselines/p1_softmax_scale_fold_ab.json`
-    /// (`seq = 512`: `77.46 GB -> 71.76 GB` peak training VRAM), recorded
-    /// separately from this CPU-hermetic test.
+    /// `crates/jammi-bench/baselines/p1_softmax_scale_fold_ab.json`, which
+    /// discloses ALL THREE measured rows, not just the favorable one:
+    /// `seq = 512` (`b8`) shows the predicted-size win (`77.46 GB -> 71.76
+    /// GB`, within one allocator pool block of the retained-tensor-size
+    /// arithmetic the JSON's `_comment` derives); `seq = 128` (`b16`)
+    /// shows the SAME win at smaller absolute magnitude (`33.24 GB ->
+    /// 32.57 GB`, also one pool block from predicted); `seq = 128` (`b8`)
+    /// is the CONTRARY row — the arithmetic predicts a save, but the tip
+    /// arm measures ONE allocator pool block (32 MiB) MORE than the base
+    /// arm at that row, not less. See the JSON's `_comment` for the full
+    /// arithmetic and the honest disclosure of why the smallest row does
+    /// not follow the trend (allocator pool granularity dominates at that
+    /// size, not the Affine-node removal itself).
     ///
     /// BEFORE: reconstructs the composition an equivalent call site
     /// WITHOUT `scale` folded in would run (the `Op::Affine` division,

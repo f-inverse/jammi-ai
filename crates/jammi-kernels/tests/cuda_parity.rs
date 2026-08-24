@@ -1694,6 +1694,109 @@ fn softmax_scale_parity_narrowed_with_nonzero_offset() {
 }
 
 // =======================================================================
+// SoftmaxLastDimFused: CUDA-only, SAME-DEVICE BF16 bit-exactness for the
+// pre-mask-add rounding point (`bf16_mul_rounded`, `softmax.cu:83`, used
+// at `:272`/`:280`/`:287`). This is NOT a CPU<->CUDA parity check (every
+// leg above is) -- it compares fused-with-scale against
+// affine-then-fused-no-scale ENTIRELY ON CUDA, mirroring
+// `tests/oracles.rs`'s CPU-hermetic
+// `softmax_scale_bf16_small_additive_mask_bit_exact_vs_affine_then_unscaled`.
+// It exists because NEITHER of this crate's other CUDA-BF16 checks can
+// catch a regression in that rounding point: `assert_softmax_scale_parity_bf16`
+// above is a CPU<->CUDA comparison at a 2-BF16-ULP bound wide enough to
+// swallow exactly the single-extra-rounding-step this test defends
+// against, and every mask fixture used by the suites above is the real
+// ModernBERT alphabet `{0.0, -10_000.0, -20_000.0}`, which cannot observe
+// the rounding point at all (round-identity at `0.0`, annihilation near
+// `MASKED_LOGIT` -- see `small_bias_mask_fixture`'s own doc, identical
+// reasoning to its CPU-oracle sibling). Concretely, this catches removing
+// the pre-mask-add rounding from `softmax.cu` -- i.e. computing
+// `scores[i] * scale + mask[i]` as one un-rounded step instead of
+// `bf16_mul_rounded(scores[i], scale)` FIRST, rounding to BF16, THEN
+// adding `mask[i]` and rounding again.
+//
+// Gated by `JAMMI_REQUIRE_CUDA` like every other test in this file (via
+// `cuda_device()`'s early return) -- cannot be run in this environment;
+// the lead runs it on the pod.
+// =======================================================================
+
+/// A REL-POS-BIAS-shaped mask: small, continuous, NEVER `0.0` and NEVER
+/// near `MASKED_LOGIT` magnitude — see this section's own doc and
+/// `tests/oracles.rs`'s identical `small_bias_mask_fixture` for why the
+/// real ModernBERT alphabet cannot exercise the rounding point this test
+/// defends.
+fn small_bias_mask_fixture(batch: usize, seq: usize) -> Vec<f32> {
+    (0..batch * seq * seq)
+        .map(|i| (i as f32 * 0.037 - 3.0).sin() * 0.5)
+        .collect()
+}
+
+fn assert_softmax_scale_bf16_bit_exact_same_device_cuda(
+    cuda: &Device,
+    batch: usize,
+    heads: usize,
+    seq: usize,
+    scale: f64,
+) {
+    let sv = fixture(batch * heads * seq * seq, 5.0);
+    let mv = small_bias_mask_fixture(batch, seq);
+    let sb: Vec<bf16> = sv.iter().map(|&v| bf16::from_f32(v)).collect();
+    let mb: Vec<bf16> = mv.iter().map(|&v| bf16::from_f32(v)).collect();
+    let scores = Tensor::from_slice(&sb, (batch, heads, seq, seq), cuda).unwrap();
+    let mask = Tensor::from_slice(&mb, (batch, 1, seq, seq), cuda).unwrap();
+
+    // `FullyMaskedPolicy::Propagate` (`softmax_scale`'s default via
+    // `SoftmaxLastDimFused::default()`), NOT `Zeros`: the small, signed
+    // `[-0.5, 0.5]` mask fixture is not the real masking alphabet, so a
+    // row that happens to land all-negative is not "fully masked" in the
+    // production sense -- `Zeros`'s short-circuit would misfire on it,
+    // exactly as `tests/oracles.rs`'s CPU sibling documents.
+    let fused_scaled = softmax_scale(&scores, &mask, scale as f32).unwrap();
+    let affined = scores.affine(scale, 0.0).unwrap();
+    let affine_then_unscaled = softmax_scale(&affined, &mask, 1.0).unwrap();
+
+    let a: Vec<bf16> = fused_scaled.flatten_all().unwrap().to_vec1().unwrap();
+    let b: Vec<bf16> = affine_then_unscaled
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert!(
+        a.iter().any(|v| v.to_f32().abs() > 1e-3),
+        "fixture must be non-degenerate"
+    );
+    assert_eq!(
+        a, b,
+        "CUDA BF16 small-additive-mask leg (head_dim scale={scale}): fused-with-scale \
+         must be BIT-EXACT vs affine-then-fused-no-scale, entirely on CUDA -- a \
+         mismatch here means softmax.cu's pre-mask-add rounding point moved"
+    );
+}
+
+#[test]
+fn softmax_scale_bf16_small_additive_mask_bit_exact_same_device_head_dim_64() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    assert_softmax_scale_bf16_bit_exact_same_device_cuda(
+        &cuda,
+        2,
+        16,
+        128,
+        HEAD_DIM_64_SCALE as f64,
+    );
+}
+
+#[test]
+fn softmax_scale_bf16_small_additive_mask_bit_exact_same_device_head_dim_128() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let scale = 1.0 / 128.0f64.sqrt();
+    assert_softmax_scale_bf16_bit_exact_same_device_cuda(&cuda, 2, 16, 128, scale);
+}
+
+// =======================================================================
 // GegluFused CPU<->CUDA parity: fwd + bwd (dwi_out). Covers the same
 // divergence-prone classes as the suites above (contiguous, narrowed-with-
 // nonzero-offset, empty, a block-size boundary, a non-power-of-two width)

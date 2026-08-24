@@ -139,13 +139,26 @@ fn quick_gelu(xs: &Tensor) -> CandleResult<Tensor> {
 /// unrouted this stops backward at the very first `LayerNorm` node
 /// (`ln_pre`, ahead of every block) and no gradient is ever reachable at
 /// `MultiHeadAttention`'s softmax, regardless of that flag.
+///
+/// No `LayerNorm` this tower loads is bias-free (`layer_norm()`'s config
+/// conversion from `f64` always sets `affine: true`, so `ln.bias()` is
+/// always `Some` in practice — see `load`'s call sites), but a bias-free
+/// `ln.bias() == None` must not fall back to `ln.forward(x)` under
+/// training: that would silently reintroduce the exact truncation this
+/// function exists to remove for a norm layer that happens to have no
+/// bias. Instead synthesize a zero bias and take the same differentiable
+/// composition; adding a zero is IEEE-754-exact, so this changes neither
+/// the forward value nor which weight gradient is computed.
 fn apply_layer_norm(ln: &LayerNorm, x: &Tensor, training: bool) -> CandleResult<Tensor> {
     if !training {
         return ln.forward(x);
     }
     match ln.bias() {
         Some(bias) => candle_nn::ops::layer_norm_slow(x, ln.weight(), bias, ln.eps() as f32),
-        None => ln.forward(x),
+        None => {
+            let zero_bias = ln.weight().zeros_like()?;
+            candle_nn::ops::layer_norm_slow(x, ln.weight(), &zero_bias, ln.eps() as f32)
+        }
     }
 }
 
@@ -849,5 +862,51 @@ mod tests {
             bits_of(&b_bf16),
             "bf16 (compared via lossless f32 upcast): softmax_last_dim vs composed softmax must match bit-for-bit on CPU"
         );
+    }
+
+    /// No `LayerNorm` this tower actually loads is bias-free, but
+    /// `apply_layer_norm`'s `None` (no-bias) arm must not silently fall back
+    /// to the truncated eval kernel under `training = true` — that would
+    /// reintroduce the exact defect this unit removes for a norm layer that
+    /// happens to have no bias. Builds a bias-free `candle_nn::LayerNorm`
+    /// directly (`candle_nn::layer_norm_no_bias`) and asserts its weight
+    /// receives a nonzero gradient under `training = true`.
+    #[test]
+    fn apply_layer_norm_training_true_bias_free_still_gets_weight_gradient() {
+        let device = Device::Cpu;
+        let width = 8usize;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let ln = candle_nn::layer_norm_no_bias(width, 1e-5, vb.pp("ln")).unwrap();
+        break_zero_init_symmetry(&varmap, &device);
+        assert!(
+            ln.bias().is_none(),
+            "fixture must actually be bias-free to exercise the `None` arm"
+        );
+
+        let rows = 3;
+        let n = rows * width;
+        let xv: Vec<f32> = (0..n)
+            .map(|i| ((i as f32) * 0.031 - 1.1).sin() * 0.6)
+            .collect();
+        let x = Tensor::from_slice(&xv, (rows, width), &device).unwrap();
+
+        let out = apply_layer_norm(&ln, &x, true).unwrap();
+        let weights = fixed_nonuniform_weights(out.dims(), &device);
+        let loss = (out * weights).unwrap().sum_all().unwrap();
+        let grads = loss.backward().unwrap();
+
+        let grad = grads.get(ln.weight()).expect(
+            "bias-free LayerNorm's weight must still receive a gradient under training=true, \
+             not silently fall back to the truncated eval kernel",
+        );
+        let norm: f32 = grad
+            .sqr()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(norm > 0.0, "weight grad norm must be nonzero, got {norm}");
     }
 }

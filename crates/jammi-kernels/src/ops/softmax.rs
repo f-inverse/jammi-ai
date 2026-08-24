@@ -25,9 +25,9 @@
 //! V-matmul needs it too) and `grad_res` — no `[B,H,S,S]`-shaped intermediate
 //! survives the forward pass at all. `tests::fused_softmax_retains_fewer_tape_nodes_than_eager`
 //! measures this directly via `Tensor::sorted_nodes()` (candle's own public
-//! topological-sort-for-backward API): the real VRAM number is the lead's
-//! pod A/B, but the NODE-COUNT reduction this claim rests on is measured
-//! here, live, on CPU.
+//! topological-sort-for-backward API): the real VRAM number comes from a
+//! GPU A/B benchmark, but the NODE-COUNT reduction this claim rests on is
+//! measured here, live, on CPU.
 //!
 //! ## The supported mask broadcast class (family D)
 //!
@@ -103,9 +103,7 @@
 //!
 //! ## Fully-masked row: safe-softmax zeros, an INTENTIONAL divergence from `candle_nn::ops::softmax`
 //!
-//! CORRECTED (an audit finding — the previous wording here, inherited from
-//! a since-corrected claim in `jammi_encoders::mask`, was FALSE):
-//! `jammi-encoders`' actual call site DOES construct a fully-masked row in
+//! `jammi-encoders`' call site DOES construct a fully-masked row in
 //! production once padding is present. `sliding_window_mask`'s band ALONE
 //! always keeps a query's own diagonal in-window, but a query that is
 //! ITSELF a pad token has that diagonal KEY also masked by the padding
@@ -1111,12 +1109,11 @@ mod tests {
         }
     }
 
-    /// Audit BLOCK finding, resolved via `FullyMaskedPolicy::Zeros`: a
-    /// fully-masked row (synthetic `-inf` convention here) outputs ZEROS
-    /// (safe-softmax — see the module doc's "fully-masked row" section),
-    /// an INTENTIONAL divergence from `candle_nn::ops::softmax`'s own
-    /// `NaN` there. Eager's `NaN` is recorded as the known-divergent
-    /// baseline, not matched.
+    /// Under `FullyMaskedPolicy::Zeros`, a fully-masked row (synthetic
+    /// `-inf` convention here) outputs ZEROS (safe-softmax — see the
+    /// module doc's "fully-masked row" section), an INTENTIONAL divergence
+    /// from `candle_nn::ops::softmax`'s own `NaN` there. Eager's `NaN` is
+    /// recorded as the known-divergent baseline, not matched.
     #[test]
     fn an_all_masked_row_under_zeros_policy_outputs_zeros_diverging_from_eagers_nan_intentionally()
     {
@@ -1517,13 +1514,13 @@ mod tests {
         }
     }
 
-    /// Audit BLOCK finding, RESOLVED via `FullyMaskedPolicy::Zeros`: a
-    /// FULLY masked row at the REAL convention (`MASKED_LOGIT = -10_000.0`,
-    /// finite — not the synthetic `-inf` shape the tests above cover),
-    /// mirroring the padding-query construction that reaches this in
-    /// production (see `jammi_encoders::mask::sliding_window_mask`'s
-    /// corrected doc: a pad query whose entire window lies in the pad
-    /// region has every key masked this way). `candle_nn::ops::softmax` on
+    /// Under `FullyMaskedPolicy::Zeros`, a FULLY masked row at the REAL
+    /// convention (`MASKED_LOGIT = -10_000.0`, finite — not the synthetic
+    /// `-inf` shape the tests above cover), mirroring the padding-query
+    /// construction that reaches this in production (see
+    /// `jammi_encoders::mask::sliding_window_mask`'s doc: a pad query whose
+    /// entire window lies in the pad region has every key masked this
+    /// way). `candle_nn::ops::softmax` on
     /// a BF16 tensor computes NATIVELY in BF16 (no internal F32 upcast), so
     /// BF16's coarse ULP near magnitude `10_000` (~64) ANNIHILATES any real
     /// score there, and eager's reference output on this row is UNIFORM

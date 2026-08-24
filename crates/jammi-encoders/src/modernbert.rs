@@ -145,30 +145,25 @@ pub(crate) static SOFTMAX_DISPATCH_COUNTERS: DispatchCounters = DispatchCounters
 /// The fused masked-softmax kernel's domain, checked at the call site
 /// (family D / K2): `scores`'s device is one
 /// [`crate::layer_norm::device_is_supported`] accepts, `scores`/`mask`
-/// share a dtype the kernel implements (F32 or BF16), BOTH `scores` and
+/// share a dtype the kernel implements (F32 or BF16), both `scores` and
 /// `mask` are contiguous (`SoftmaxLastDimFused` refuses a strided view for
-/// EITHER argument — see its module doc; an earlier version of this
-/// predicate checked only `mask`, asymmetrically, an audit finding
-/// corrected here), `scores`'s rank is within [`MAX_RANK`] (the CUDA arm's
-/// fixed-arity kernel signature) and last dimension within
-/// [`MAX_LAST_DIM`] (a conservative validated ceiling, not a hardware
-/// limit — see that constant's own doc), and `mask` is within `scores`'s
-/// supported broadcast class
-/// ([`jammi_kernels::ops::mask_broadcast_class_holds`] — the SAME check
+/// either argument — see its module doc), `scores`'s rank is within
+/// [`MAX_RANK`] (the CUDA arm's fixed-arity kernel signature) and last
+/// dimension within [`MAX_LAST_DIM`] (a conservative validated ceiling, not
+/// a hardware limit — see that constant's own doc), and `mask` is within
+/// `scores`'s supported broadcast class
+/// ([`jammi_kernels::ops::mask_broadcast_class_holds`] — the same check
 /// the op applies internally, called directly rather than re-derived here
 /// to avoid a second, independently-maintained copy of that logic).
 ///
-/// CORRECTED (an audit finding): an earlier version of this predicate
-/// deliberately did NOT check the broadcast class, reasoning that a
-/// mismatched mask shape reaching this call site would be "a bug in the
-/// caller, not an admission question" — that reasoning does not hold: this
-/// function's whole job (K2's "validate, don't silently degrade" doctrine)
-/// is to make EVERY domain failure a counted, observable eager fallback
-/// rather than an error surfacing from inside the op. Checking the
-/// broadcast class here means a mismatched mask shape on the training arm
-/// now falls back to eager (counted in [`SOFTMAX_DISPATCH_COUNTERS`]) —
-/// the SAME outcome device/dtype/rank/last-dim failures already got —
-/// instead of propagating `SoftmaxLastDimFused`'s own internal
+/// The broadcast-class check matters because this function's whole job
+/// (K2's "validate, don't silently degrade" doctrine) is to make every
+/// domain failure a counted, observable eager fallback rather than an
+/// error surfacing from inside the op: checking the broadcast class here
+/// means a mismatched mask shape on the training arm falls back to eager
+/// (counted in [`SOFTMAX_DISPATCH_COUNTERS`]) — the same outcome
+/// device/dtype/rank/last-dim failures already get — instead of
+/// propagating `SoftmaxLastDimFused`'s own internal
 /// `candle_core::Error::ShapeMismatchBinaryOp`. The op's own internal
 /// check is unchanged and still the correct defense for any direct
 /// `apply2` caller that bypasses this predicate entirely.

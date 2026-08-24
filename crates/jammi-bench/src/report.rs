@@ -1096,13 +1096,28 @@ pub struct FinetuneStepTier {
     pub device_name: String,
     /// The precision the frozen backbone ran at.
     pub backbone_dtype: String,
-    /// Which of the three trainer-supported text encoders this run drove —
-    /// `"modernbert"`, `"bert"`, or `"distilbert"` — detected from
-    /// `config.json`'s `model_type` field (or `--model-type` when that field
-    /// is absent). Recorded, never gated: this tier compares ratios on the
-    /// same box, and the per-model comparison it exists for (issue #356,
-    /// rule 12) needs to know which model produced each row.
+    /// The encoder family this tier BUILT (`"modernbert"`, `"bert"`, or
+    /// `"distilbert"`) — detected from `config.json`'s `model_type` field,
+    /// or resolved by `--model-type` when the field is absent or names a
+    /// BERT-family sibling this tier does not build directly (see
+    /// `config_model_type` below). Recorded, never gated: this tier
+    /// compares ratios on the same box, and the per-model comparison it
+    /// exists for (issue #356, rule 12) needs to know which builder
+    /// produced each row.
     pub model_type: String,
+    /// The checkpoint's OWN `model_type` string from `config.json`, when it
+    /// differs from `model_type` above — i.e. when `--model-type` accepted
+    /// a BERT-family sibling (`roberta`/`camembert`/`xlm-roberta`) or any
+    /// other value `config.json` names that this tier does not itself
+    /// build, and drove it through the named builder instead. `None` when
+    /// the file's own declaration already equals `model_type` (no override
+    /// was needed to relabel anything).
+    ///
+    /// A non-`None` value here is not a parity claim: the row was built
+    /// through `model_type`'s builder (e.g. `Bert`), and that builder's
+    /// tensor-key layout and position-id semantics are its own, not the
+    /// sibling's — see [`crate::finetune_step::ModelType::detect`]'s doc.
+    pub config_model_type: Option<String>,
     pub batch: usize,
     pub seq: usize,
     pub lora_rank: usize,

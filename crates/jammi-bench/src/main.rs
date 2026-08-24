@@ -370,8 +370,14 @@ enum Command {
     /// `modernbert`, `bert`, or `distilbert`. That is not the trainer's full
     /// family list: the trainer's own dispatch has a `_ => Bert` catch-all,
     /// and RoBERTa/CamemBERT/XLM-RoBERTa checkpoints all load through the same
-    /// `Bert` builder — pass `--model-type bert` for one of those. Runs on CPU
-    /// by default and on a CUDA ordinal with `--cuda`.
+    /// `Bert` builder — pass `--model-type bert` for one of those; the report's
+    /// `config_model_type` field then carries the checkpoint's own declared
+    /// name (`"roberta"`, etc.) so the row stays attributable. This loads
+    /// through the Bert builder (tensor-key prefix `bert.`, or an unprefixed
+    /// root layout); RoBERTa-family position-id semantics (the HF
+    /// `padding_idx`-offset convention) are not reproduced — this is not a
+    /// parity claim, only a way to measure the step cost of those weights.
+    /// Runs on CPU by default and on a CUDA ordinal with `--cuda`.
     ///
     /// Every number is RECORDED, never gated: a step time is a property of
     /// `code x device x box`, so the only comparison a heterogeneous rented
@@ -399,15 +405,27 @@ enum Command {
         /// per-model default policy: ModernBERT defaults to `Wqkv,Wo,Wi`;
         /// BERT and DistilBERT have no universal default (their linears are
         /// named differently) and refuse with the model's own selector
-        /// vocabulary if this is omitted for them.
+        /// vocabulary if this is omitted for them. If PASSED, it must name at
+        /// least one selector: `""` or an all-commas value (every
+        /// comma-separated token empty) is a typed refusal at parse time,
+        /// before any checkpoint loads — omitting the flag entirely is the
+        /// way to defer to the per-model default policy.
         #[arg(long)]
         target_modules: Option<String>,
         /// Explicit model-family override (`modernbert`, `bert`, or
-        /// `distilbert`), for a checkpoint whose `config.json` has no
-        /// `model_type` field. Omit to detect it from the file. A value that
-        /// CONTRADICTS a `model_type` the file already declares is a typed
-        /// error, not a silent relabel — this flag only fills an absent
-        /// field.
+        /// `distilbert`). Required for a checkpoint whose `config.json` has
+        /// no `model_type` field, and also the way to drive a BERT-family
+        /// sibling (`roberta`/`camembert`/`xlm-roberta`) this tier does not
+        /// autodetect: pass `--model-type bert` for one of those, and its
+        /// own declared name survives in the report's `config_model_type`
+        /// field. A value that CONTRADICTS a `model_type` the file already
+        /// declares AS ONE OF THIS TIER'S OWN THREE (`modernbert`/`bert`/
+        /// `distilbert`) is a typed error, not a silent relabel — that is a
+        /// genuine mislabel, not a gap the override exists to fill. Loading
+        /// a sibling through `--model-type bert` is loading, not parity: the
+        /// `Bert` builder's tensor-key layout and position-id handling are
+        /// its own, not the sibling's (e.g. RoBERTa's `padding_idx`-offset
+        /// position ids are not reproduced).
         #[arg(long)]
         model_type: Option<String>,
         /// Backbone precision: f32, f16, or bf16.
@@ -513,13 +531,20 @@ async fn main() -> std::process::ExitCode {
             lora_rank,
             lora_alpha,
             lora_dropout,
-            target_modules: target_modules.map(|raw| {
-                raw.split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            }),
+            // A typed refusal here (a passed-but-empty `--target-modules`) is
+            // caught before any checkpoint loads — distinct from an OMITTED
+            // flag (`None`, left alone below), which defers to the tier's
+            // per-model default policy.
+            target_modules: match target_modules {
+                Some(raw) => match finetune_step::parse_target_modules_flag(&raw) {
+                    Ok(modules) => Some(modules),
+                    Err(e) => {
+                        eprintln!("finetune-step failed: {e}");
+                        return std::process::ExitCode::FAILURE;
+                    }
+                },
+                None => None,
+            },
             model_type_override: model_type,
             backbone_dtype: match backbone_dtype.as_str() {
                 "f32" => jammi_numerics::ComputePrecision::F32,
@@ -542,7 +567,9 @@ async fn main() -> std::process::ExitCode {
 /// The `finetune-step` subcommand: run the tier and emit the report. Records;
 /// does not gate. Exits non-zero only when the step could not be measured at
 /// all — a missing checkpoint, a target-module set that matched no linear, or a
-/// device that could not be resolved.
+/// device that could not be resolved. (A `--target-modules` flag present but
+/// naming zero selectors is caught earlier, before this function is even
+/// called — see [`finetune_step::parse_target_modules_flag`].)
 fn run_finetune_step(params: finetune_step::FinetuneStepParams) -> std::process::ExitCode {
     let tier = match finetune_step::run(&params) {
         Ok(t) => t,

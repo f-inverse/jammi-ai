@@ -132,9 +132,21 @@ fn triplet_loss(a: &Tensor, p: &Tensor, n: &Tensor, margin: f64) -> candle_core:
 /// (`jammi_ai::fine_tune::worker::build_encoder_adapters`) has a `_ =>
 /// Bert` catch-all, and `model/backend/candle.rs` enumerates `bert`,
 /// `roberta`, `camembert`, and `xlm-roberta` as BERT-family — every one of
-/// those siblings loads through the same `Bert` builder this tier drives.
-/// A checkpoint whose `config.json` names one of those siblings should pass
-/// `--model-type bert` explicitly.
+/// those siblings loads through the same `Bert` builder this tier drives
+/// (see [`Self::BERT_FAMILY_SIBLINGS`]). A checkpoint whose `config.json`
+/// names one of those siblings is driven by passing `--model-type bert`
+/// explicitly ([`Self::detect`] accepts this — a sibling's own `model_type`
+/// is not one of this tier's three, so it is not a "genuine mislabel" the
+/// way naming `distilbert` while `--model-type bert` is passed would be);
+/// the file's own string survives in the report as `config_model_type` so
+/// the row stays attributable to what the checkpoint actually claims to be.
+///
+/// This is loading, not parity: the `Bert` builder probes only the `bert.`
+/// tensor-key prefix (or an unprefixed root layout) and knows nothing of
+/// RoBERTa's `padding_idx`-offset position ids — driving a RoBERTa
+/// checkpoint through `--model-type bert` measures the step cost of the
+/// weights it loaded, not a claim that HF's RoBERTa forward and this one
+/// agree.
 ///
 /// Detected from `config.json`'s `model_type` field the same way the trainer
 /// reads it (`crates/jammi-ai/src/fine_tune/worker.rs`,
@@ -151,8 +163,31 @@ pub enum ModelType {
     DistilBert,
 }
 
+/// What [`ModelType::detect`] resolved, plus the checkpoint's own
+/// `model_type` string when that string is not what `model_type` above
+/// reads out as — i.e. when `--model-type` accepted a BERT-family sibling
+/// (or any other value `config.json` names that is not one of this tier's
+/// own three). `None` when the file's own declaration already equals the
+/// resolved model, so the row is not carrying a redundant copy of the same
+/// string under two names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetectedModel {
+    pub model_type: ModelType,
+    pub config_model_type: Option<String>,
+}
+
 impl ModelType {
     pub const ALL: [&'static str; 3] = ["modernbert", "bert", "distilbert"];
+
+    /// BERT-family siblings this tier does not autodetect (their
+    /// `model_type` is not literally one of [`Self::ALL`]) but accepts via
+    /// an explicit `--model-type bert` override, because they load through
+    /// the same `Bert` builder as `"bert"` itself. Sourced from
+    /// `crates/jammi-ai/src/model/backend/candle.rs`'s
+    /// `"bert" | "roberta" | "camembert" | "xlm-roberta"` match arm and
+    /// `crates/jammi-ai/src/fine_tune/worker.rs`'s `_ => Bert` catch-all —
+    /// the tier's own trainer/inference dispatch, not a list invented here.
+    pub const BERT_FAMILY_SIBLINGS: [&'static str; 3] = ["roberta", "camembert", "xlm-roberta"];
 
     fn parse(raw: &str) -> Result<Self, ModelTypeError> {
         match raw {
@@ -172,33 +207,52 @@ impl ModelType {
     }
 
     /// Detect from a parsed `config.json`. An explicit `--model-type`
-    /// override wins over the file's own `model_type` field only for the
-    /// case the override exists for: `model_type` CAN be absent from a real
-    /// checkpoint (`jammi_encoders::BertConfig`'s own `model_type` field is
-    /// `#[serde(default)]` `Option<String>` — a raw `BertModel` checkpoint
-    /// need not carry it — and the trainer's own dispatch treats an absent
-    /// field as `"bert"` rather than refusing to build). When `config.json`
-    /// DOES carry a `model_type` and the override names a *different* one,
-    /// that is not an absence to fill — silently trusting the override there
-    /// would let the tier profile the wrong builder while reporting the
-    /// override's label, corrupting the per-model classification this tier
-    /// exists for; refuse with a typed error naming both instead.
+    /// override wins whenever the file's own `model_type` is not one of
+    /// this tier's own three ([`Self::ALL`]): `model_type` CAN be absent
+    /// from a real checkpoint (`jammi_encoders::BertConfig`'s own
+    /// `model_type` field is `#[serde(default)]` `Option<String>` — a raw
+    /// `BertModel` checkpoint need not carry it — and the trainer's own
+    /// dispatch treats an absent field as `"bert"` rather than refusing to
+    /// build), and it can also be a BERT-family sibling
+    /// ([`Self::BERT_FAMILY_SIBLINGS`]) or any other value this tier does
+    /// not itself build — in every one of those cases the override is the
+    /// only way to say which builder to use, so it is accepted, and the
+    /// file's own string is preserved in the returned
+    /// [`DetectedModel::config_model_type`] rather than silently dropped.
+    ///
+    /// Only when `config.json` DOES declare one of this tier's own three
+    /// types and the override names a *different* one is that a genuine
+    /// mislabel, not a gap the override exists to fill: silently trusting
+    /// the override there would let the tier profile the wrong builder
+    /// while reporting the override's label, corrupting the per-model
+    /// classification this tier exists for — refuse with a typed error
+    /// naming both instead.
     pub fn detect(
         config_json: &serde_json::Value,
         override_type: Option<&str>,
-    ) -> Result<Self, ModelTypeError> {
+    ) -> Result<DetectedModel, ModelTypeError> {
         let file_type = config_json.get("model_type").and_then(|v| v.as_str());
-        match (override_type, file_type) {
-            (Some(explicit), Some(file_raw)) if explicit != file_raw => {
-                Err(ModelTypeError::OverrideContradicts {
+        let model_type = match (override_type, file_type) {
+            (Some(explicit), Some(file_raw))
+                if Self::ALL.contains(&file_raw) && file_raw != explicit =>
+            {
+                return Err(ModelTypeError::OverrideContradicts {
                     file_type: file_raw.to_string(),
                     override_type: explicit.to_string(),
-                })
+                });
             }
-            (Some(explicit), _) => Self::parse(explicit),
-            (None, Some(raw)) => Self::parse(raw),
-            (None, None) => Err(ModelTypeError::Absent),
-        }
+            (Some(explicit), _) => Self::parse(explicit)?,
+            (None, Some(raw)) => Self::parse(raw)?,
+            (None, None) => return Err(ModelTypeError::Absent),
+        };
+        let config_model_type = match file_type {
+            Some(raw) if raw != model_type.as_str() => Some(raw.to_string()),
+            _ => None,
+        };
+        Ok(DetectedModel {
+            model_type,
+            config_model_type,
+        })
     }
 
     /// The LoRA target-module selector vocabulary this model's encoder
@@ -257,16 +311,23 @@ impl std::fmt::Display for ModelType {
 /// string-match a message.
 #[derive(Debug)]
 pub enum ModelTypeError {
-    /// `model_type` was present but not one of [`ModelType::ALL`].
+    /// `model_type` was present but not one of [`ModelType::ALL`], and no
+    /// `--model-type` override was supplied to resolve it (a known
+    /// BERT-family sibling falls in here too, absent an override — it is
+    /// not one of [`ModelType::ALL`] either).
     Unknown(String),
     /// `config.json` has no `model_type` field and no `--model-type`
     /// override was supplied.
     Absent,
-    /// `config.json` names one `model_type` and `--model-type` names a
-    /// different one. The override exists for the case `model_type` is
-    /// ABSENT from the file; it is not a licence to relabel a checkpoint
-    /// that already declares its own family, since that would drive the
-    /// wrong builder while the report still carries the override's label.
+    /// `config.json` names one of this tier's own three types
+    /// ([`ModelType::ALL`]) and `--model-type` names a *different* one — a
+    /// genuine mislabel, not a gap. The override exists to resolve a
+    /// checkpoint whose own declaration is absent, a BERT-family sibling
+    /// ([`ModelType::BERT_FAMILY_SIBLINGS`]), or anything else this tier
+    /// does not itself build; it is not a licence to relabel a checkpoint
+    /// that already declares itself one of the three, since that would
+    /// drive the wrong builder while the report still carries the
+    /// override's label.
     OverrideContradicts {
         file_type: String,
         override_type: String,
@@ -279,8 +340,12 @@ impl std::fmt::Display for ModelTypeError {
             Self::Unknown(raw) => write!(
                 f,
                 "unknown model_type {raw:?} in config.json; expected one of {:?}, or pass \
-                 --model-type explicitly",
-                ModelType::ALL
+                 --model-type explicitly. Known BERT-family siblings {:?} are accepted this way \
+                 (e.g. --model-type bert for a roberta checkpoint) — they load through the Bert \
+                 builder (prefix `bert.` or root layout); RoBERTa-family position-id semantics \
+                 are not reproduced, so this is not a parity claim",
+                ModelType::ALL,
+                ModelType::BERT_FAMILY_SIBLINGS
             ),
             Self::Absent => write!(
                 f,
@@ -292,10 +357,15 @@ impl std::fmt::Display for ModelTypeError {
                 override_type,
             } => write!(
                 f,
-                "config.json declares model_type {file_type:?} but --model-type was passed as \
-                 {override_type:?}; --model-type only fills in an ABSENT model_type field, it \
-                 does not override a present one — pass a config.json-consistent value, or omit \
-                 --model-type to detect {file_type:?} from the file"
+                "config.json declares model_type {file_type:?}, one of this tier's own {:?}, \
+                 but --model-type was passed as {override_type:?}; --model-type may only \
+                 resolve a model_type this tier does not already recognize as one of its own \
+                 three — an absent field, a BERT-family sibling such as {:?}, or another value \
+                 entirely — it cannot relabel a checkpoint that already declares itself \
+                 {file_type:?}. Pass a config.json-consistent value, or omit --model-type to \
+                 detect {file_type:?} from the file",
+                ModelType::ALL,
+                ModelType::BERT_FAMILY_SIBLINGS
             ),
         }
     }
@@ -329,6 +399,52 @@ fn resolve_target_modules(
     }
 }
 
+/// The `--target-modules` flag was passed but names no selector at all —
+/// every comma-separated token was empty (`""`, `","`, `" , "`, ...).
+/// Typed so this is caught at flag-parse time, before a model even loads:
+/// an OMITTED flag defers to [`resolve_target_modules`]'s per-model default
+/// policy (a legitimate, different outcome), but a flag that IS present and
+/// resolves to zero selectors would otherwise sail through as `Some(vec![])`
+/// — `resolve_target_modules` treats any `Some` as "the caller's explicit
+/// choice" and returns it verbatim, so an empty explicit list would only
+/// surface later as `run`'s "no trainable LoRA tensors — target_modules
+/// matched nothing", after the checkpoint and its weights were already
+/// loaded. That is the wrong failure to see for a typo in a comma list.
+#[derive(Debug)]
+pub struct NoTargetModulesGivenError;
+
+impl std::fmt::Display for NoTargetModulesGivenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "--target-modules was passed but names no selector (every comma-separated token \
+             was empty); omit the flag entirely to use the model's default policy, or pass at \
+             least one selector"
+        )
+    }
+}
+
+impl std::error::Error for NoTargetModulesGivenError {}
+
+/// Parse the CLI's comma-separated `--target-modules` value into a selector
+/// list. Call only when the flag was actually passed (an omitted flag stays
+/// `None` at the call site and is never routed through here) — `raw` being
+/// present-but-empty or all-commas is [`NoTargetModulesGivenError`], not an
+/// empty `Vec`, so the refusal fires before the checkpoint loads rather than
+/// after (see [`NoTargetModulesGivenError`]'s doc).
+pub fn parse_target_modules_flag(raw: &str) -> Result<Vec<String>, NoTargetModulesGivenError> {
+    let modules: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if modules.is_empty() {
+        return Err(NoTargetModulesGivenError);
+    }
+    Ok(modules)
+}
+
 /// Parameters the tier drives its step off of.
 #[derive(Debug, Clone)]
 pub struct FinetuneStepParams {
@@ -346,9 +462,12 @@ pub struct FinetuneStepParams {
     /// defaults to `Wqkv,Wo,Wi`; BERT and DistilBERT have no universal
     /// default and this tier refuses rather than silently matching nothing.
     pub target_modules: Option<Vec<String>>,
-    /// Explicit override for the model family, for a checkpoint whose
-    /// `config.json` has no `model_type` field. `None` detects it from the
-    /// file (see [`ModelType::detect`]).
+    /// Explicit override for the model family — required for a checkpoint
+    /// whose `config.json` has no `model_type` field, and also the way to
+    /// drive a BERT-family sibling (`roberta`/`camembert`/`xlm-roberta`)
+    /// this tier does not autodetect (its own declared name then survives
+    /// in the report's `config_model_type`). `None` detects the family from
+    /// the file (see [`ModelType::detect`]).
     pub model_type_override: Option<String>,
     pub backbone_dtype: jammi_numerics::ComputePrecision,
     /// CUDA ordinal, or `None` for CPU.
@@ -421,7 +540,9 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
 
     let config_raw = std::fs::read_to_string(params.model_dir.join("config.json"))?;
     let config_json: serde_json::Value = serde_json::from_str(&config_raw)?;
-    let model_type = ModelType::detect(&config_json, params.model_type_override.as_deref())?;
+    let detected = ModelType::detect(&config_json, params.model_type_override.as_deref())?;
+    let model_type = detected.model_type;
+    let config_model_type = detected.config_model_type;
     let target_modules = resolve_target_modules(model_type, params.target_modules.as_deref())?;
     let weights = params.model_dir.join("model.safetensors");
 
@@ -573,6 +694,7 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
         device_name: device_name(params.cuda_device),
         backbone_dtype: format!("{:?}", params.backbone_dtype).to_lowercase(),
         model_type: model_type.as_str().to_string(),
+        config_model_type,
         batch: params.batch,
         seq: params.seq,
         lora_rank: params.lora_rank,
@@ -888,18 +1010,28 @@ mod tests {
             ("distilbert", ModelType::DistilBert),
         ] {
             let json = serde_json::json!({ "model_type": raw });
-            assert_eq!(ModelType::detect(&json, None).unwrap(), expected);
+            let detected = ModelType::detect(&json, None).unwrap();
+            assert_eq!(detected.model_type, expected);
+            // The file's own declaration already equals the resolved model
+            // — no redundant copy under a second name.
+            assert_eq!(detected.config_model_type, None);
         }
     }
 
     #[test]
-    fn unknown_model_type_is_a_typed_error_naming_all_three() {
+    fn unknown_model_type_is_a_typed_error_naming_all_three_and_the_accepted_siblings() {
         let json = serde_json::json!({ "model_type": "gpt2" });
         let err = ModelType::detect(&json, None).unwrap_err();
         assert!(matches!(&err, ModelTypeError::Unknown(s) if s == "gpt2"));
         let msg = err.to_string();
         for name in ModelType::ALL {
             assert!(msg.contains(name), "error {msg:?} must name {name}");
+        }
+        for sibling in ModelType::BERT_FAMILY_SIBLINGS {
+            assert!(
+                msg.contains(sibling),
+                "error {msg:?} must name accepted sibling {sibling}"
+            );
         }
     }
 
@@ -910,10 +1042,28 @@ mod tests {
             ModelType::detect(&json, None).unwrap_err(),
             ModelTypeError::Absent
         ));
-        assert_eq!(
-            ModelType::detect(&json, Some("bert")).unwrap(),
-            ModelType::Bert
-        );
+        let detected = ModelType::detect(&json, Some("bert")).unwrap();
+        assert_eq!(detected.model_type, ModelType::Bert);
+        // model_type absent + `--model-type bert` → Bert with
+        // config_model_type None (there is no file declaration to diverge
+        // from).
+        assert_eq!(detected.config_model_type, None);
+    }
+
+    /// A real RoBERTa `config.json` carries `model_type = "roberta"`. This
+    /// tier does not autodetect it (it is not one of [`ModelType::ALL`]),
+    /// but `--model-type bert` is ACCEPTED — `"roberta"` is not one of this
+    /// tier's own three types, so this is not the genuine-mislabel case
+    /// [`ModelTypeError::OverrideContradicts`] exists for — and the
+    /// resolved row is `Bert` with `config_model_type` carrying the file's
+    /// own `"roberta"` string, so the row stays attributable to what the
+    /// checkpoint actually declares itself to be.
+    #[test]
+    fn bert_family_sibling_config_accepts_bert_override_and_records_its_own_declaration() {
+        let json = serde_json::json!({ "model_type": "roberta" });
+        let detected = ModelType::detect(&json, Some("bert")).unwrap();
+        assert_eq!(detected.model_type, ModelType::Bert);
+        assert_eq!(detected.config_model_type.as_deref(), Some("roberta"));
     }
 
     #[test]
@@ -1024,6 +1174,9 @@ mod tests {
 
     #[test]
     fn override_contradicting_config_model_type_is_a_typed_error() {
+        // `"distilbert"` is one of this tier's own three (`ModelType::ALL`)
+        // — a genuine mislabel against a different override, unlike the
+        // BERT-family-sibling case above.
         let json = serde_json::json!({ "model_type": "distilbert" });
         let err = ModelType::detect(&json, Some("bert")).unwrap_err();
         assert!(matches!(
@@ -1041,9 +1194,24 @@ mod tests {
         // A matching override is a no-op, not a contradiction — this is the
         // ABSENT-field case the override actually exists for, extended to
         // "present and identical" rather than "present and different".
+        let detected = ModelType::detect(&json, Some("distilbert")).unwrap();
+        assert_eq!(detected.model_type, ModelType::DistilBert);
+        assert_eq!(detected.config_model_type, None);
+    }
+
+    #[test]
+    fn target_modules_flag_empty_or_all_commas_is_a_typed_parse_time_error() {
+        for raw in ["", ",", " , ", ",,,"] {
+            let err = parse_target_modules_flag(raw).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("--target-modules"),
+                "refusal {msg:?} must name the flag"
+            );
+        }
         assert_eq!(
-            ModelType::detect(&json, Some("distilbert")).unwrap(),
-            ModelType::DistilBert
+            parse_target_modules_flag("query, value").unwrap(),
+            vec!["query".to_string(), "value".to_string()]
         );
     }
 

@@ -894,8 +894,20 @@ fn lora_backward_step_changes_weights() {
 // ─── Divergence detection: NaN loss triggers job failure ────────────────────
 //
 // UAT 5. The training loop should fail with "diverged" after 3 consecutive
-// batches with NaN or >100 loss. Tests with precomputed NaN-score batches.
-
+// batches with NaN or >100 loss. Tests with precomputed NaN-embedding
+// batches.
+//
+// esc-040 de-pin: the real CoSENT objective (pairwise ordering — see
+// `cosent_loss` in `trainer.rs`) is NaN-in-*scores*-safe by construction: a
+// score only ever participates in a `<` comparison building the valid-pair
+// mask, and any comparison touching NaN is IEEE-754 `false`, so a NaN score
+// is masked out (never a valid pair) rather than propagating — for *any*
+// batch size, not just this test's single-row batch. The previous fixture
+// put NaN in `scores` and relied on the OLD (buggy, plain-MSE) `cosent_loss`
+// computing `(cos - NaN)²` directly on every row with no pairwise masking;
+// that premise no longer holds. NaN in the *embeddings* still propagates
+// (it corrupts the cosine similarity itself, upstream of the pairwise mask),
+// so that is what now exercises the divergence path.
 #[tokio::test(flavor = "multi_thread")]
 async fn training_divergence_detection() {
     use candle_nn::VarMap;
@@ -911,11 +923,12 @@ async fn training_divergence_detection() {
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
     let model = build_projection_head(32, &FineTuneConfig::default(), &varmap, &vb).unwrap();
 
-    // Create batches where scores are NaN → cosent_loss produces NaN
+    // Create batches where the embeddings are NaN → cosine similarity, and
+    // hence cosent_loss, is NaN regardless of pairing.
     let nan_batch = TrainingBatch::Contrastive {
-        embeddings_a: Tensor::ones((1, 32), DType::F32, &device).unwrap(),
+        embeddings_a: Tensor::full(f32::NAN, (1, 32), &device).unwrap(),
         embeddings_b: Tensor::ones((1, 32), DType::F32, &device).unwrap(),
-        scores: Tensor::new(&[f32::NAN], &device).unwrap(),
+        scores: Tensor::new(&[1.0f32], &device).unwrap(),
     };
     // Need at least 3 batches to trigger divergence (3 consecutive NaN)
     let loader =

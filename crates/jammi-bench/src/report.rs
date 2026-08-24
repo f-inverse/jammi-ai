@@ -1185,6 +1185,29 @@ pub struct FinetuneStepTier {
     /// see the doc above), or because the admission predicate failed for
     /// any other stated reason.
     pub lora_epilogue_eager_dispatches: u64,
+    /// How many times the P2 fused LoRA SITE
+    /// (`jammi_kernels::ops::LoraLinearFused` — one `CustomOp3` covering
+    /// the base matmul, dropout, both LoRA GEMMs, AND the epilogue, not
+    /// just `ScaledCastAdd`'s standalone epilogue) actually dispatched
+    /// during this run — the same positive-proof channel as
+    /// `ln_fused_dispatches` / … / `lora_epilogue_fused_dispatches`. Read
+    /// via `jammi_lora::lora_linear_fused_dispatch_snapshot`.
+    /// `lora_epilogue_fused_dispatches`/`lora_epilogue_eager_dispatches`
+    /// (above) are PERMANENTLY ZERO on a run where this field is nonzero:
+    /// `LoraLinearFused` reuses `ScaledCastAdd`'s `cpu_fwd`/`cuda_fwd`
+    /// directly as an internal step, never through the standalone
+    /// epilogue's own `admit` call (see `jammi_lora::lora_epilogue_counters`'s
+    /// doc) — that pairing going to `0` is the expected P2 baseline, not a
+    /// missing-dispatch regression.
+    pub lora_linear_fused_dispatches: u64,
+    /// How many times that same call site fell back to the eager
+    /// composition (`[base matmul, dropout, A-matmul, B-matmul, mul,
+    /// cast, add]`) instead — outside the fused kernel's domain
+    /// (bias-carrying base, unsupported dtype/device, non-contiguous
+    /// view, unsupported rank), because `training == false` (eval/serving
+    /// never dispatches the fused kernel at all), or because the
+    /// admission predicate failed for any other stated reason.
+    pub lora_linear_eager_dispatches: u64,
     pub s_per_step_p50: Measurement,
     pub s_per_step_mean: Measurement,
     pub steps_per_s: Measurement,

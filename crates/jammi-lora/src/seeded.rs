@@ -26,7 +26,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use candle_core::Tensor;
-use jammi_kernels::ops::DropoutFused;
+use jammi_kernels::ops::{DropoutFused, DropoutKey};
 
 /// A small, fast, self-contained PRNG (SplitMix64) so seeded init and dropout
 /// reproduce byte-identically from a seed without pulling a `rand` dependency
@@ -175,14 +175,23 @@ impl DropoutMasks {
         self.counter.store(position, Ordering::Relaxed);
     }
 
-    /// Apply this layer's dropout to `x` for the NEXT training forward
-    /// (advancing the counter by one) and return the result directly —
-    /// the mask is never materialized as a separate tensor at any point.
-    /// `p` must already be validated to `[0.0, 1.0)` by the caller
-    /// (`LoraLinear::new`); [`jammi_kernels::ops::DropoutFused::new`]
-    /// re-validates independently regardless (family D: an op trusts no
-    /// caller for its own domain).
-    pub(crate) fn apply(&self, x: &Tensor, p: f32) -> Result<Tensor, candle_core::Error> {
+    /// Reserve the NEXT training forward's Philox key WITHOUT drawing
+    /// anything: advances the forward counter by exactly ONE (the same
+    /// atomic `fetch_add` [`Self::apply`] itself performs) and returns the
+    /// `(seed, layer_id, forward_idx, p)` tuple as a
+    /// [`jammi_kernels::ops::DropoutKey`].
+    ///
+    /// This exists so a call site can decide FUSED-vs-EAGER-FALLBACK
+    /// *after* reserving the key and have BOTH arms consume the identical
+    /// key — critically, the fallback arm must NOT call [`Self::apply`]
+    /// (which would reserve a SECOND, different `forward_idx` for the same
+    /// logical forward, breaking esc-033's O(1) resume invariant: two
+    /// arms of the SAME forward must advance the counter by exactly one
+    /// between them, not one each). `p` must already be validated to
+    /// `[0.0, 1.0)` by the caller (`LoraLinear::new`); the eventual
+    /// `DropoutFused::new` construction re-validates independently
+    /// regardless (family D).
+    pub(crate) fn next_key(&self, p: f32) -> Result<DropoutKey, candle_core::Error> {
         let k = self.counter.fetch_add(1, Ordering::Relaxed);
         let forward_idx: u32 = k.try_into().map_err(|_| {
             candle_core::Error::Msg(format!(
@@ -192,7 +201,39 @@ impl DropoutMasks {
                 self.layer_id
             ))
         })?;
-        let op = DropoutFused::new(self.run_seed, self.layer_id, forward_idx, p)?;
+        Ok(DropoutKey {
+            seed: self.run_seed,
+            layer_id: self.layer_id,
+            forward_idx,
+            p,
+        })
+    }
+
+    /// Apply this layer's dropout to `x` for the NEXT training forward
+    /// (advancing the counter by one, via [`Self::next_key`]) and return
+    /// the result directly — the mask is never materialized as a separate
+    /// tensor at any point.
+    ///
+    /// As of the P2 fused-LoRA-site commit, `LoraLinear::forward` no
+    /// longer calls this directly (it calls [`Self::next_key`] itself, so
+    /// both the fused and eager-fallback arms can consume the SAME
+    /// reserved key — see `lora_linear::LoraLinear::forward`'s doc). Kept
+    /// (not deleted) as the `#[cfg(test)]` module's own oracle surface
+    /// below: `apply`'s determinism/resume tests (`masks_are_deterministic
+    /// _and_inverted_scaled`, `restore_position_reproduces_the
+    /// _uninterrupted_masks`, the esc-033 anti-relaxation clause, …) are
+    /// this type's actual correctness proof and are simplest to state
+    /// against the one-call `apply` shape rather than every test
+    /// re-inlining `next_key` + `DropoutFused::new` + `apply1`.
+    #[allow(
+        dead_code,
+        reason = "exercised extensively by this module's own #[cfg(test)] oracles; \
+                  no longer reachable from the plain (non-test) library build now that \
+                  LoraLinear::forward calls next_key directly"
+    )]
+    pub(crate) fn apply(&self, x: &Tensor, p: f32) -> Result<Tensor, candle_core::Error> {
+        let key = self.next_key(p)?;
+        let op = DropoutFused::new(key.seed, key.layer_id, key.forward_idx, key.p)?;
         jammi_kernels::ops::apply1(x, op)
     }
 }

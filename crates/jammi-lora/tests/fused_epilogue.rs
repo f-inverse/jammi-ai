@@ -26,10 +26,23 @@
 //!    re-run here with an explicit assertion that the FUSED kernel (not a
 //!    fallback) is what produced the agreement, so the golden is not
 //!    accidentally green only because the fused path never engaged.
+//!
+//! **Migrated (P2 fused-LoRA-site commit):** items 3 and 4 originally
+//! asserted on `lora_epilogue_dispatch_snapshot` (the single-op epilogue
+//! counter). `LoraLinear::forward`'s training arm now routes through
+//! `jammi_kernels::ops::LoraLinearFused` — the WHOLE site, not just the
+//! epilogue — so these three tests now assert on
+//! `lora_linear_fused_dispatch_snapshot` instead, and
+//! `training_mode_on_a_supported_dtype_dispatches_fused_and_is_counted`
+//! additionally pins that `lora_epilogue`'s own counter stays untouched by
+//! a fused-site dispatch (documented, not silently left stale).
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Linear, Module, VarBuilder, VarMap};
-use jammi_lora::{lora_epilogue_dispatch_snapshot, LoraInitMode, LoraLinear, MaybeLoraLinear};
+use jammi_lora::{
+    lora_epilogue_dispatch_snapshot, lora_linear_fused_dispatch_snapshot, LoraInitMode, LoraLinear,
+    MaybeLoraLinear,
+};
 
 fn cpu() -> Device {
     Device::Cpu
@@ -195,13 +208,25 @@ fn training_mode_on_a_supported_dtype_dispatches_fused_and_is_counted() {
     // with every other test in this binary running concurrently — see
     // `eval_mode_never_dispatches_the_fused_kernel`'s doc for why an exact
     // delta would be racy.
-    let before = lora_epilogue_dispatch_snapshot();
+    let before = lora_linear_fused_dispatch_snapshot();
+    // `lora_epilogue`'s OWN counter, unchanged by this forward: the P2
+    // fused LoRA site never calls `ScaledCastAdd` through `admit` (it
+    // reuses `ScaledCastAdd::cpu_fwd` directly, internally — see
+    // `jammi_lora::lora_epilogue_counters`'s doc). A fused-dispatch
+    // forward must NOT move `lora_epilogue`'s snapshot at all.
+    let epilogue_before = lora_epilogue_dispatch_snapshot();
     let _ = lora.forward(&x).unwrap();
-    let after = lora_epilogue_dispatch_snapshot();
+    let after = lora_linear_fused_dispatch_snapshot();
+    let epilogue_after = lora_epilogue_dispatch_snapshot();
     assert!(
         after.fused > before.fused,
         "an F32-backbone training forward must dispatch the fused kernel \
          (before={before:?}, after={after:?})"
+    );
+    assert_eq!(
+        epilogue_after, epilogue_before,
+        "lora_epilogue's own counter must be untouched by a fused LoRA-site \
+         dispatch (before={epilogue_before:?}, after={epilogue_after:?})"
     );
 }
 
@@ -229,9 +254,9 @@ fn training_mode_on_an_unsupported_dtype_falls_back_and_is_counted() {
     )
     .unwrap();
 
-    let before = lora_epilogue_dispatch_snapshot();
+    let before = lora_linear_fused_dispatch_snapshot();
     let _ = lora.forward(&x).unwrap();
-    let after = lora_epilogue_dispatch_snapshot();
+    let after = lora_linear_fused_dispatch_snapshot();
     assert!(
         after.eager > before.eager,
         "an F16-backbone training forward must fall back to eager \
@@ -267,9 +292,9 @@ fn esc_031_golden_holds_through_the_fused_path_with_dispatch_proof() {
     .unwrap();
     let frozen = MaybeLoraLinear::Frozen(w_for_frozen);
 
-    let before = lora_epilogue_dispatch_snapshot();
+    let before = lora_linear_fused_dispatch_snapshot();
     let lora_out = lora.forward(&x).unwrap();
-    let after = lora_epilogue_dispatch_snapshot();
+    let after = lora_linear_fused_dispatch_snapshot();
     assert!(
         after.fused > before.fused,
         "the golden must be exercised THROUGH the fused kernel, not a fallback \

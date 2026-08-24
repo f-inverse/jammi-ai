@@ -31,8 +31,9 @@
 use candle_core::{DType, Device, Tensor, Var, D};
 use half::bf16;
 use jammi_kernels::ops::{
-    apply1, apply2, apply3, Axpy, DropoutFused, FullyMaskedPolicy, GegluFused, GeluVariant,
-    LayerNormFused, PhiloxKatProbe, RopeFused, ScaledCastAdd, SoftmaxLastDimFused,
+    apply1, apply2, apply3, Axpy, DropoutFused, DropoutKey, FullyMaskedPolicy, GegluFused,
+    GeluVariant, LayerNormFused, LoraLinearFused, PhiloxKatProbe, RopeFused, ScaledCastAdd,
+    SoftmaxLastDimFused,
 };
 
 fn axpy(alpha: f64, x: &Tensor, y: &Tensor) -> candle_core::Result<Tensor> {
@@ -2633,4 +2634,360 @@ fn dropout_parity_multi_block_not_a_multiple_of_block_size() {
     // 2000 spans multiple 256-thread blocks with a partial last block.
     let x = fixture(2000, 9.0);
     assert_dropout_parity_f32(&cuda, 7, 1, 12, 0.4, &x);
+}
+
+// =======================================================================
+// LoraLinearFused CPU<->CUDA parity: forward + all three backward outputs
+// (dx, dw, dab), at the two dtype combinations `jammi-lora`'s admission
+// predicate reaches ((F32,F32,F32) and (BF16,BF16,F32)), plus a dropout
+// leg and a narrowed-with-nonzero-offset `x`. `BF16` here is the ONLY
+// place this op's base-matmul dtype is actually exercised end to end —
+// candle-core 0.11.0's CPU backend has no `BF16` matmul (see
+// `ops::lora_linear`'s module doc), so the "CPU" side of this comparison
+// runs the base GEMM at `F32` (a bit-exact cast-up of the same `BF16`
+// input) while the CUDA side runs the REAL `BF16` cuBLAS path — this is a
+// weaker parity claim than the other bf16 legs above (comparing two
+// DIFFERENT dtype executions, not the same dtype on two devices), stated
+// explicitly rather than silently reused from the `f32_f32` helper's
+// shape.
+// =======================================================================
+
+fn pack_ab(a: &Tensor, b: &Tensor) -> candle_core::Result<Tensor> {
+    let bt = b.t()?.contiguous()?;
+    Tensor::cat(&[a, &bt], 1)
+}
+
+fn lora_linear(
+    x: &Tensor,
+    w: &Tensor,
+    ab: &Tensor,
+    scale: f32,
+    inf: usize,
+    outf: usize,
+    r: usize,
+    dropout: Option<DropoutKey>,
+    dweight_needed: bool,
+) -> candle_core::Result<Tensor> {
+    let op = LoraLinearFused::new(scale, inf, outf, r, dropout, dweight_needed)?;
+    x.apply_op3(w, ab, op)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assert_lora_linear_parity_f32(
+    cuda: &Device,
+    rows: usize,
+    inf: usize,
+    outf: usize,
+    r: usize,
+    scale: f32,
+    xv: &[f32],
+    wv: &[f32],
+    av: &[f32],
+    bv: &[f32],
+) {
+    let cpu = Device::Cpu;
+
+    let x_cpu = Var::from_tensor(&Tensor::from_slice(xv, (rows, inf), &cpu).unwrap()).unwrap();
+    let w_cpu = Var::from_tensor(&Tensor::from_slice(wv, (outf, inf), &cpu).unwrap()).unwrap();
+    let a_cpu = Var::from_tensor(&Tensor::from_slice(av, (r, inf), &cpu).unwrap()).unwrap();
+    let b_cpu = Var::from_tensor(&Tensor::from_slice(bv, (outf, r), &cpu).unwrap()).unwrap();
+    let ab_cpu = pack_ab(a_cpu.as_tensor(), b_cpu.as_tensor()).unwrap();
+    let out_cpu = lora_linear(
+        x_cpu.as_tensor(),
+        w_cpu.as_tensor(),
+        &ab_cpu,
+        scale,
+        inf,
+        outf,
+        r,
+        None,
+        true,
+    )
+    .unwrap();
+    let grads_cpu = out_cpu.sum_all().unwrap().backward().unwrap();
+
+    let x_gpu = Var::from_tensor(&Tensor::from_slice(xv, (rows, inf), cuda).unwrap()).unwrap();
+    let w_gpu = Var::from_tensor(&Tensor::from_slice(wv, (outf, inf), cuda).unwrap()).unwrap();
+    let a_gpu = Var::from_tensor(&Tensor::from_slice(av, (r, inf), cuda).unwrap()).unwrap();
+    let b_gpu = Var::from_tensor(&Tensor::from_slice(bv, (outf, r), cuda).unwrap()).unwrap();
+    let ab_gpu = pack_ab(a_gpu.as_tensor(), b_gpu.as_tensor()).unwrap();
+    let out_gpu = lora_linear(
+        x_gpu.as_tensor(),
+        w_gpu.as_tensor(),
+        &ab_gpu,
+        scale,
+        inf,
+        outf,
+        r,
+        None,
+        true,
+    )
+    .unwrap();
+    let grads_gpu = out_gpu.sum_all().unwrap().backward().unwrap();
+
+    let out_cpu_v: Vec<f32> = out_cpu.flatten_all().unwrap().to_vec1().unwrap();
+    let out_gpu_v: Vec<f32> = out_gpu
+        .flatten_all()
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(out_cpu_v.len(), rows * outf);
+    assert_eq!(out_gpu_v.len(), rows * outf, "GPU forward length mismatch");
+    for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
+        assert!(
+            ((*c - *g).abs() as f64) <= F32_TOL,
+            "fwd[{i}]: cpu {c} vs cuda {g}"
+        );
+    }
+
+    let check = |name: &str, cpu_t: &Tensor, gpu_t: &Tensor| {
+        let c: Vec<f32> = cpu_t.flatten_all().unwrap().to_vec1().unwrap();
+        let g: Vec<f32> = gpu_t
+            .flatten_all()
+            .unwrap()
+            .to_device(&cpu)
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(c.len(), g.len(), "{name}: length mismatch");
+        for (i, (cv, gv)) in c.iter().zip(g.iter()).enumerate() {
+            assert!(
+                ((*cv - *gv).abs() as f64) <= F32_TOL,
+                "{name}[{i}]: cpu {cv} vs cuda {gv}"
+            );
+        }
+    };
+    check(
+        "dx",
+        grads_cpu.get(&x_cpu).unwrap(),
+        grads_gpu.get(&x_gpu).unwrap(),
+    );
+    check(
+        "dw",
+        grads_cpu.get(&w_cpu).unwrap(),
+        grads_gpu.get(&w_gpu).unwrap(),
+    );
+    check(
+        "da",
+        grads_cpu.get(&a_cpu).unwrap(),
+        grads_gpu.get(&a_gpu).unwrap(),
+    );
+    check(
+        "db",
+        grads_cpu.get(&b_cpu).unwrap(),
+        grads_gpu.get(&b_gpu).unwrap(),
+    );
+}
+
+#[test]
+fn lora_linear_parity_f32_contiguous_small() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let (rows, inf, outf, r) = (6usize, 5usize, 7usize, 3usize);
+    let x = fixture(rows * inf, 1.0);
+    let w = fixture(outf * inf, 2.0);
+    let a = fixture(r * inf, 3.0);
+    let b = fixture(outf * r, 4.0);
+    assert_lora_linear_parity_f32(&cuda, rows, inf, outf, r, 1.6, &x, &w, &a, &b);
+}
+
+#[test]
+fn lora_linear_parity_f32_production_width_wqkv() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let (rows, inf, outf, r) = (24 * 128, 1024usize, 3072usize, 16usize);
+    let x = fixture(rows * inf, 0.1);
+    let w = fixture(outf * inf, 0.2);
+    let a = fixture(r * inf, 0.3);
+    let b = fixture(outf * r, 0.4);
+    assert_lora_linear_parity_f32(&cuda, rows, inf, outf, r, 0.5, &x, &w, &a, &b);
+}
+
+#[test]
+fn lora_linear_parity_f32_narrowed_with_nonzero_offset() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let cpu = Device::Cpu;
+    let (rows, inf, outf, r) = (4usize, 6usize, 5usize, 2usize);
+    // Build a [3*rows, inf] tensor and narrow to the middle `rows` block —
+    // the missing-offset class this crate's own review found in `Axpy`'s
+    // CUDA arm, exercised on this op's `x` argument.
+    let x_all = fixture(3 * rows * inf, 5.0);
+    let w = fixture(outf * inf, 6.0);
+    let a = fixture(r * inf, 7.0);
+    let b = fixture(outf * r, 8.0);
+    let ab_cpu = pack_ab(
+        &Tensor::from_slice(&a, (r, inf), &cpu).unwrap(),
+        &Tensor::from_slice(&b, (outf, r), &cpu).unwrap(),
+    )
+    .unwrap();
+    let ab_gpu = pack_ab(
+        &Tensor::from_slice(&a, (r, inf), &cuda).unwrap(),
+        &Tensor::from_slice(&b, (outf, r), &cuda).unwrap(),
+    )
+    .unwrap();
+    let w_cpu = Tensor::from_slice(&w, (outf, inf), &cpu).unwrap();
+    let w_gpu = Tensor::from_slice(&w, (outf, inf), &cuda).unwrap();
+
+    let x_cpu_full = Tensor::from_slice(&x_all, (3 * rows, inf), &cpu).unwrap();
+    let x_cpu = x_cpu_full.narrow(0, rows, rows).unwrap();
+    assert!(!x_cpu.is_contiguous() || x_cpu.layout().start_offset() != 0);
+    let x_gpu_full = Tensor::from_slice(&x_all, (3 * rows, inf), &cuda).unwrap();
+    let x_gpu = x_gpu_full.narrow(0, rows, rows).unwrap();
+
+    let out_cpu = lora_linear(&x_cpu, &w_cpu, &ab_cpu, 1.2, inf, outf, r, None, false).unwrap();
+    let out_gpu = lora_linear(&x_gpu, &w_gpu, &ab_gpu, 1.2, inf, outf, r, None, false).unwrap();
+
+    let out_cpu_v: Vec<f32> = out_cpu.flatten_all().unwrap().to_vec1().unwrap();
+    let out_gpu_v: Vec<f32> = out_gpu
+        .flatten_all()
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(out_gpu_v.len(), rows * outf, "GPU forward length mismatch");
+    for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
+        assert!(
+            ((*c - *g).abs() as f64) <= F32_TOL,
+            "narrowed fwd[{i}]: cpu {c} vs cuda {g}"
+        );
+    }
+}
+
+#[test]
+fn lora_linear_parity_f32_dropout_matches_across_devices() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let cpu = Device::Cpu;
+    let (rows, inf, outf, r) = (8usize, 6usize, 5usize, 2usize);
+    let key = DropoutKey {
+        seed: 123,
+        layer_id: 4,
+        forward_idx: 2,
+        p: 0.3,
+    };
+    let x = fixture(rows * inf, 9.0);
+    let w = fixture(outf * inf, 10.0);
+    let a = fixture(r * inf, 11.0);
+    let b = fixture(outf * r, 12.0);
+
+    let x_cpu = Tensor::from_slice(&x, (rows, inf), &cpu).unwrap();
+    let w_cpu = Tensor::from_slice(&w, (outf, inf), &cpu).unwrap();
+    let ab_cpu = pack_ab(
+        &Tensor::from_slice(&a, (r, inf), &cpu).unwrap(),
+        &Tensor::from_slice(&b, (outf, r), &cpu).unwrap(),
+    )
+    .unwrap();
+    let out_cpu =
+        lora_linear(&x_cpu, &w_cpu, &ab_cpu, 0.7, inf, outf, r, Some(key), false).unwrap();
+
+    let x_gpu = Tensor::from_slice(&x, (rows, inf), &cuda).unwrap();
+    let w_gpu = Tensor::from_slice(&w, (outf, inf), &cuda).unwrap();
+    let ab_gpu = pack_ab(
+        &Tensor::from_slice(&a, (r, inf), &cuda).unwrap(),
+        &Tensor::from_slice(&b, (outf, r), &cuda).unwrap(),
+    )
+    .unwrap();
+    let out_gpu =
+        lora_linear(&x_gpu, &w_gpu, &ab_gpu, 0.7, inf, outf, r, Some(key), false).unwrap();
+
+    let out_cpu_v: Vec<f32> = out_cpu.flatten_all().unwrap().to_vec1().unwrap();
+    let out_gpu_v: Vec<f32> = out_gpu
+        .flatten_all()
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(out_gpu_v.len(), rows * outf, "GPU forward length mismatch");
+    for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
+        assert!(
+            ((*c - *g).abs() as f64) <= F32_TOL,
+            "dropout fwd[{i}]: cpu {c} vs cuda {g} — the SAME (seed, layer_id, \
+             forward_idx) key must draw the identical mask on both devices \
+             (Philox is a pure function of the counter, not device RNG state)"
+        );
+    }
+}
+
+/// `BF16` base on CUDA (the real production dtype pair) — the CPU side
+/// runs the base matmul at `F32` (candle-core 0.11.0 has no CPU `BF16`
+/// matmul; see this file's own leading comment on this section and
+/// `ops::lora_linear`'s module doc), so this compares CUDA's REAL `BF16`
+/// path against an `F32`-CPU reference built from the SAME bit-pattern
+/// values (each `BF16` input is round-tripped through `bf16::from_f32`
+/// before either device runs, so both sides start from IDENTICAL
+/// bf16-quantized numbers) — a wider tolerance than the pure-`F32` legs
+/// above, since the CPU reference never re-quantizes intermediate values
+/// to `BF16` the way the CUDA `base` GEMM's tensor cores do.
+#[test]
+fn lora_linear_parity_bf16_base_production_width() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let cpu = Device::Cpu;
+    let (rows, inf, outf, r) = (256usize, 1024usize, 3072usize, 16usize);
+    let scale = 0.5f32;
+
+    let xv = fixture(rows * inf, 1.0);
+    let wv = fixture(outf * inf, 2.0);
+    let av = fixture(r * inf, 3.0);
+    let bv = fixture(outf * r, 4.0);
+    let x_bf16: Vec<bf16> = xv.iter().map(|&v| bf16::from_f32(v)).collect();
+    let w_bf16: Vec<bf16> = wv.iter().map(|&v| bf16::from_f32(v)).collect();
+    // Reconstruct the exact f32 values BF16 quantization produced, so the
+    // CPU F32 reference and the CUDA BF16 run start from identical numbers.
+    let x_requantized: Vec<f32> = x_bf16.iter().map(|v| v.to_f32()).collect();
+    let w_requantized: Vec<f32> = w_bf16.iter().map(|v| v.to_f32()).collect();
+
+    let x_cpu = Tensor::from_slice(&x_requantized, (rows, inf), &cpu).unwrap();
+    let w_cpu = Tensor::from_slice(&w_requantized, (outf, inf), &cpu).unwrap();
+    let ab_cpu = pack_ab(
+        &Tensor::from_slice(&av, (r, inf), &cpu).unwrap(),
+        &Tensor::from_slice(&bv, (outf, r), &cpu).unwrap(),
+    )
+    .unwrap();
+    let out_cpu = lora_linear(&x_cpu, &w_cpu, &ab_cpu, scale, inf, outf, r, None, false).unwrap();
+
+    let x_gpu = Tensor::from_slice(&x_bf16, (rows, inf), &cuda).unwrap();
+    let w_gpu = Tensor::from_slice(&w_bf16, (outf, inf), &cuda).unwrap();
+    let ab_gpu = pack_ab(
+        &Tensor::from_slice(&av, (r, inf), &cuda).unwrap(),
+        &Tensor::from_slice(&bv, (outf, r), &cuda).unwrap(),
+    )
+    .unwrap();
+    let out_gpu = lora_linear(&x_gpu, &w_gpu, &ab_gpu, scale, inf, outf, r, None, false).unwrap();
+
+    let out_cpu_v: Vec<f32> = out_cpu.flatten_all().unwrap().to_vec1().unwrap();
+    let out_gpu_v: Vec<f32> = out_gpu
+        .to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(out_gpu_v.len(), rows * outf, "GPU forward length mismatch");
+    // Relative-with-floor (this crate's usual bf16 metric — see
+    // MAINTAINER-GUIDE §2.6a's "relative-with-floor bf16 metric" section),
+    // not bit-exact: the CUDA base GEMM runs on bf16 tensor cores
+    // (f32-accumulate, bf16-store), a different rounding schedule than the
+    // CPU f32 reference's own arithmetic.
+    let rel_tol = 5e-2f32;
+    let abs_floor = 1e-2f32;
+    for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
+        let bound = rel_tol * c.abs().max(g.abs()) + abs_floor;
+        assert!(
+            (c - g).abs() <= bound,
+            "bf16-base fwd[{i}]: cpu(f32 ref) {c} vs cuda(bf16) {g} (bound {bound})"
+        );
+    }
 }

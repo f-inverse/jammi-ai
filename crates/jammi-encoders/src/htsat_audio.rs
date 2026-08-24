@@ -324,6 +324,43 @@ impl AffBlock {
     }
 }
 
+/// Tile `x` (`[N, C, H, W]`) into non-overlapping `kh × kw` blocks:
+/// `[N, C, OH, OW, kh, kw]`, via `narrow` (to the largest divisible prefix
+/// of each tiled dim) followed by `unfold`.
+///
+/// Any tail narrower than `kh`/`kw` is dropped, exactly as a strided conv
+/// with `stride == kernel` would drop it — narrowing to `floor(dim/size) *
+/// size` BEFORE unfolding makes that drop explicit instead of leaving it
+/// implicit in `unfold`'s own window-count arithmetic, and matters for
+/// BACKWARD, not forward: candle registers `unfold`'s backward as a plain
+/// `Op::Reshape` (candle-core-0.11.0 `tensor.rs:2931-2969` constructs the
+/// unfolded view with `op: BackpropOp::new1(self, Op::Reshape)`; its
+/// backward, `backprop.rs:602-606`, does `let arg_grad = grad.reshape(arg.dims())?`).
+/// `Tensor::reshape` requires equal element counts on both sides
+/// (`tensor.rs:2523-2531`, `Error::ShapeMismatchBinaryOp`) — true only when
+/// `unfold`'s `size` evenly divides the dim it unfolds. On a non-dividing
+/// dim, `unfold` drops a tail (its output holds FEWER elements than its
+/// input), and `grad.reshape(arg.dims())` errors rather than padding the
+/// missing tail with zero gradient (see
+/// [`tests::unfold_backward_is_a_plain_reshape_in_candle`], the premise-pin
+/// for this exact candle behavior). Narrowing first makes forward drop
+/// nothing `unfold` wasn't already going to drop (`unfold` only ever reads
+/// the same `floor(dim/size) * size` prefix regardless — see
+/// [`tests::tile_nonoverlapping_is_forward_bit_identical_to_unfold_without_narrow_first`]),
+/// while making the narrowed dim's own element count match what `unfold`
+/// reads exactly, so `unfold`'s `Op::Reshape` backward is well-defined:
+/// `narrow`'s own backward correctly zero-pads the dropped tail's gradient
+/// (a true zero, since that tail never contributed to the output), where
+/// `unfold`'s naive `Op::Reshape` backward on the un-narrowed tensor would
+/// have simply errored instead.
+fn tile_nonoverlapping(x: &Tensor, kh: usize, kw: usize) -> Result<Tensor, EncoderError> {
+    let (_n, _c, h, w) = x.dims4()?;
+    let h_used = (h / kh) * kh;
+    let w_used = (w / kw) * kw;
+    let x = x.narrow(2, 0, h_used)?.narrow(3, 0, w_used)?;
+    Ok(x.unfold(2, kh, kh)?.unfold(3, kw, kw)?)
+}
+
 /// HTSAT patch embedding under fusion.
 ///
 /// The fused 4-channel image is split into a single global channel and three
@@ -400,7 +437,9 @@ impl HtsatPatchEmbed {
     /// Input `[N, 1, H, W]`, kernel `(kh, kw) = (4, 12)`, stride `(4, 12)`,
     /// padding 0. With stride == kernel the conv tiles the plane into disjoint
     /// `kh × kw` blocks (a tail narrower than `kw` is dropped, exactly as a
-    /// strided conv would). Each block is flattened and projected by the
+    /// strided conv would — see [`tile_nonoverlapping`]'s doc for why that
+    /// drop is narrowed explicitly rather than left implicit in `unfold`'s
+    /// own window count). Each block is flattened and projected by the
     /// reshaped weight `[out_c, kh*kw]`.
     fn mel_conv2d(&self, x: &Tensor) -> Result<Tensor, EncoderError> {
         let (n, _in_c, _h, _w) = x.dims4()?;
@@ -408,7 +447,7 @@ impl HtsatPatchEmbed {
 
         // Tile H then W into non-overlapping blocks: append size-kh / size-kw
         // trailing axes. [N, 1, H, W] -> [N, 1, OH, OW, kh, kw].
-        let tiled = x.unfold(2, kh, kh)?.unfold(3, kw, kw)?;
+        let tiled = tile_nonoverlapping(x, kh, kw)?;
         let tiled_dims = tiled.dims().to_vec();
         let (oh, ow) = (tiled_dims[2], tiled_dims[3]);
 
@@ -1582,85 +1621,59 @@ mod tests {
             .sqrt()
     }
 
-    /// Run the front half through the GLOBAL patch-conv only (bypassing
-    /// `HtsatPatchEmbed::forward`'s `mel_conv2d`/AFF-fusion local branch),
+    /// Run the REAL front half (`HtsatAudioEncoder::forward_front`, public —
+    /// batch-norm → bicubic time-resample → `reshape_mel2img` → the fused
+    /// `patch_embed`, exercising BOTH the global-conv and the
+    /// `mel_conv2d`/AFF-fusion local branch when `is_longer[i]` is `true`),
     /// then the full Swin spine (`forward_spine`, public), returning the
     /// pooled descriptor.
     ///
-    /// `HtsatPatchEmbed::forward` computes BOTH the global-conv AND the
-    /// fused-local (`mel_conv2d`) paths for every sample regardless of
-    /// `is_longer` (the mask only SELECTS between them afterward — see its
-    /// own doc), so `mel_conv2d` is unconditionally reachable from
-    /// `HtsatAudio::forward`. `mel_conv2d` tiles its input via
-    /// `Tensor::unfold(dim, kw=12, step=12)` over a width of 128, which does
-    /// NOT divide evenly (`128 / 12 = 10` windows, an 8-wide tail dropped —
-    /// documented, intentional for FORWARD). candle-core registers
-    /// `unfold`'s backward as a plain `Op::Reshape` (candle-core-0.11.0
-    /// `tensor.rs:2962`), which assumes the forward is a lossless,
-    /// element-count-preserving view — true only when `size` evenly divides
-    /// the dim. With a dropped tail it is NOT: `unfold`'s backward tries to
-    /// `.reshape()` the incoming gradient back to an input shape with MORE
-    /// elements than the gradient actually has, and candle errors (a loud,
-    /// safe failure — "shape mismatch in reshape" — not a silently wrong
-    /// gradient).
-    ///
-    /// Before the LayerNorm fix, `patch_embed.norm`'s own no-bwd truncation
-    /// made this path COMPLETELY unreachable from backward, so this bug was
-    /// dormant — nothing ever exercised `unfold`'s backward formula in
-    /// practice. Fixing `patch_embed.norm` correctly makes it reachable,
-    /// which is what EXPOSES this separate, pre-existing, upstream
-    /// candle-core limitation (not something this crate patches — see the
-    /// "no hard candle dependency" project convention: compose over
-    /// candle's public API, premise-pin the limitation, don't vendor/patch
-    /// candle itself). It means `HtsatAudio::forward`'s FUSED local branch
-    /// is not trainable end-to-end today; that is flagged as a follow-up,
-    /// out of THIS unit's scope (attention-softmax + LayerNorm no-bwd
-    /// truncation only). This helper isolates the claim actually under
-    /// test — the softmax/LayerNorm fix reaches every parameter it should —
-    /// from that separate, orthogonal `unfold` limitation, by using only
-    /// the global-conv patch-embed path (`patch_embed.proj`), which has no
-    /// `unfold` anywhere in it.
-    fn run_front_global_conv_only_and_spine(tower: &HtsatAudio, input: &Tensor) -> Spine {
+    /// This replaces an earlier detour (`run_front_global_conv_only_and_spine`)
+    /// that bypassed `mel_conv2d` entirely: before [`tile_nonoverlapping`]'s
+    /// narrow-before-unfold fix, `mel_conv2d`'s width unfold
+    /// (`spec_size=128`, `kw=patch_size*3=12`, non-dividing — see
+    /// [`tests::tile_nonoverlapping_is_forward_bit_identical_to_unfold_without_narrow_first`])
+    /// made backward through the fused branch error out
+    /// (`tests::mel_conv2d_backward_reaches_conv_weight_through_the_fused_patch_embed_path`'s
+    /// doc has the exact pre-fix failure signature), so the global-conv-only
+    /// detour was the only way to exercise this unit's softmax/LayerNorm
+    /// claim without ALSO tripping that separate, orthogonal limitation.
+    /// With `mel_conv2d`'s tiling fixed, the real front half is now strictly
+    /// more coverage (it still exercises the global-conv path — `proj` runs
+    /// unconditionally inside `HtsatPatchEmbed::forward` regardless of
+    /// `is_longer` — plus the fused local branch this detour excluded), so
+    /// the detour added no further coverage and was removed rather than
+    /// kept alongside this.
+    fn run_front_and_spine(tower: &HtsatAudio, input: &Tensor, is_longer: &[bool]) -> Spine {
         let encoder = tower.encoder();
-        let x = input.transpose(1, 3).unwrap().contiguous().unwrap();
-        let post_bn = encoder.batch_norm.forward_t(&x, false).unwrap();
-        let normalized = post_bn.transpose(1, 3).unwrap().contiguous().unwrap();
-        let post_interp = encoder.time_interp.forward(&normalized).unwrap();
-        let post_reshape = encoder.reshape_mel2img(&post_interp).unwrap();
-
-        let global = post_reshape.narrow(1, 0, 1).unwrap();
-        let global = encoder.patch_embed.proj.forward(&global).unwrap();
-        let flat = global
-            .flatten_from(2)
+        let front = encoder.forward_front(input, is_longer).unwrap();
+        let frames_num = front.post_reshape_mel2img.dim(2).unwrap();
+        encoder
+            .forward_spine(&front.patch_embed_out, frames_num)
             .unwrap()
-            .transpose(1, 2)
-            .unwrap()
-            .contiguous()
-            .unwrap();
-        let patch_embed_out = encoder.patch_embed.norm.forward(&flat).unwrap();
-
-        let frames_num = post_reshape.dim(2).unwrap();
-        encoder.forward_spine(&patch_embed_out, frames_num).unwrap()
     }
 
-    /// End-to-end RED oracle through the full Swin spine, front half run via
-    /// the global-conv-only path (see
-    /// [`run_front_global_conv_only_and_spine`]'s doc for why the fused
-    /// local branch is excluded — a SEPARATE, orthogonal candle-core
-    /// limitation, not this unit's softmax/LayerNorm claim). With BOTH the
+    /// End-to-end RED oracle through the REAL front half (`is_longer=[true]`,
+    /// exercising the fused `mel_conv2d`/AFF path — see
+    /// [`run_front_and_spine`]'s doc for why this no longer needs a
+    /// global-conv-only detour) and the full Swin spine. With BOTH the
     /// attention-softmax arm and every `LayerNorm` (patch-embed norm,
     /// `layernorm_before`/`after` and `PatchMerging::norm` per stage, the
-    /// encoder's final norm) gated on `training`, backward through the
-    /// pooled descriptor reaches the patch-embed conv, layer-0 Q/K, and
-    /// EVERY stage/block's `rel_bias_table` — all 4 stages, all
-    /// `sum(depths)=8` blocks. Fails if EITHER gate regresses: reverting
-    /// only the softmax arm leaves every `rel_bias_table` severed the same
-    /// way the eval companion below shows; reverting only the final norm's
-    /// gate severs backward before it reaches ANY stage (the patch-embed
-    /// conv assertion fails first, since the final norm sits strictly
-    /// downstream of everything). This is the shape a real training loop
-    /// would have hit: no error, just gradients that silently never update
-    /// anything.
+    /// encoder's final norm) gated on `training`, AND `mel_conv2d`'s tiling
+    /// made backward-sound, backward through the pooled descriptor reaches
+    /// the patch-embed conv, `mel_conv2d`'s own conv weight, layer-0 Q/K,
+    /// and EVERY stage/block's `rel_bias_table` — all 4 stages, all
+    /// `sum(depths)=8` blocks. Fails if any of the THREE independent fixes
+    /// regresses: reverting the softmax arm leaves every `rel_bias_table`
+    /// severed the same way the eval companion below shows; reverting the
+    /// final norm's gate severs backward before it reaches ANY stage (the
+    /// patch-embed conv assertion fails first); reverting
+    /// [`tile_nonoverlapping`]'s narrow-before-unfold makes `loss.backward()`
+    /// itself return `Err` before any assertion runs at all (a louder
+    /// failure than the other two, but still this same test). This is the
+    /// shape a real training loop would have hit: no error, just gradients
+    /// that silently never update anything (or, pre-`tile_nonoverlapping`,
+    /// backward outright refusing to run at all on the fused path).
     #[test]
     fn training_true_full_forward_reaches_every_parameter() {
         let device = Device::Cpu;
@@ -1668,7 +1681,7 @@ mod tests {
         let (mut tower, cfg, input) = build_full_tower_and_input(&varmap, &device, 101);
         tower.set_training(true);
 
-        let spine = run_front_global_conv_only_and_spine(&tower, &input);
+        let spine = run_front_and_spine(&tower, &input, &[true]);
         let loss = nonuniform_loss(&spine.pooler_out, cfg.hidden_size, &device);
         let grads = loss.backward().unwrap();
 
@@ -1676,6 +1689,23 @@ mod tests {
         assert!(
             grads.get(patch_conv.as_tensor()).is_some(),
             "patch-embed conv weight grad must be Some under training=true through the full forward"
+        );
+
+        let mel_conv_weight = find_var(&varmap, "mel_conv2d.weight");
+        let mel_conv_grad = grads.get(mel_conv_weight.as_tensor()).expect(
+            "mel_conv2d.weight grad must be Some under training=true through the full forward \
+             (the fused/AFF local branch, is_longer=true) — this is the assertion that FAILS \
+             (loss.backward() itself returns Err before reaching it) without \
+             tile_nonoverlapping's narrow-before-unfold fix",
+        );
+        let mel_conv_norm = grad_norm(mel_conv_grad);
+        assert!(
+            mel_conv_norm.is_finite(),
+            "mel_conv2d.weight grad norm must be finite, got {mel_conv_norm}"
+        );
+        assert!(
+            mel_conv_norm > 0.0,
+            "mel_conv2d.weight grad norm must be nonzero, got {mel_conv_norm}"
         );
 
         let q0 = find_var(&varmap, "layers.0.blocks.0.attention.self.query.weight");
@@ -1730,17 +1760,20 @@ mod tests {
     }
 
     /// The eval-mode observable a user of this tower would actually hit
-    /// before either gate existed: the full spine's backward (same
-    /// global-conv-only front half as the companion test above, for a
-    /// like-for-like comparison — see
-    /// [`run_front_global_conv_only_and_spine`]'s doc) yields NO gradient
-    /// entry AT ALL for the patch-embed conv, layer-0 Q/K, or any
-    /// `rel_bias_table`, because the encoder's final `norm`
-    /// (`candle_nn::LayerNorm`'s `BackpropOp::none()` truncation) severs
-    /// backward before it reaches ANY stage — independent of the softmax
-    /// arm, which is a SEPARATE, strictly-worse truncation one hop earlier
-    /// inside each block (see `training_false_rel_bias_table_grad_is_none_for_every_block`,
-    /// which isolates that one).
+    /// before either gate existed: the full spine's backward (same REAL
+    /// front half as the companion test above, `is_longer=[true]`, for a
+    /// like-for-like comparison — see [`run_front_and_spine`]'s doc) yields
+    /// NO gradient entry AT ALL for the patch-embed conv, `mel_conv2d`'s
+    /// conv weight, layer-0 Q/K, or any `rel_bias_table`, because the
+    /// encoder's final `norm` (`candle_nn::LayerNorm`'s `BackpropOp::none()`
+    /// truncation) severs backward before it reaches ANY stage — independent
+    /// of the softmax arm, which is a SEPARATE, strictly-worse truncation
+    /// one hop earlier inside each block (see
+    /// `training_false_rel_bias_table_grad_is_none_for_every_block`, which
+    /// isolates that one), and independent of `mel_conv2d`'s tiling fix
+    /// (eval never runs `loss.backward()` past `norm`, so it never reaches
+    /// far enough upstream to observe whether `mel_conv2d`'s own backward
+    /// would have succeeded).
     #[test]
     fn training_false_full_forward_grads_are_none_before_final_norm() {
         let device = Device::Cpu;
@@ -1748,7 +1781,7 @@ mod tests {
         let (tower, cfg, input) = build_full_tower_and_input(&varmap, &device, 101);
         // training defaults to false; forward without calling set_training.
 
-        let spine = run_front_global_conv_only_and_spine(&tower, &input);
+        let spine = run_front_and_spine(&tower, &input, &[true]);
         let loss = nonuniform_loss(&spine.pooler_out, cfg.hidden_size, &device);
         let grads = loss.backward().unwrap();
 
@@ -1757,6 +1790,12 @@ mod tests {
             grads.get(patch_conv.as_tensor()).is_none(),
             "patch-embed conv weight grad must be None under eval through the full forward \
              (the encoder's final norm truncates backward before it reaches any stage)"
+        );
+
+        let mel_conv_weight = find_var(&varmap, "mel_conv2d.weight");
+        assert!(
+            grads.get(mel_conv_weight.as_tensor()).is_none(),
+            "mel_conv2d.weight grad must be None under eval through the full forward"
         );
 
         let q0 = find_var(&varmap, "layers.0.blocks.0.attention.self.query.weight");
@@ -1781,6 +1820,166 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Direct, isolated backward test for [`HtsatPatchEmbed::forward`]'s
+    /// fused (`is_longer=true`) branch reaching `mel_conv2d`'s own conv
+    /// weight — narrower than the full-tower oracle above (stops at
+    /// `patch_embed`, not the whole Swin spine), and the exact test that
+    /// FAILED before [`tile_nonoverlapping`]'s narrow-before-unfold fix.
+    ///
+    /// Pre-fix failure signature (reproduced in isolation by
+    /// [`unfold_backward_is_a_plain_reshape_in_candle`] on a minimal
+    /// fixture; MEASURED here by temporarily reverting `mel_conv2d`'s tiling
+    /// to plain `x.unfold(2, kh, kh)?.unfold(3, kw, kw)?` with no `narrow`
+    /// first): on the real `htsat_clap_tiny` geometry (`spec_size=128`,
+    /// `kw=patch_size*3=12`, `128 / 12 = 10` windows with an 8-wide tail
+    /// dropped, `patch_embed_input_channels=3` local channels, batch=1),
+    /// `loss.backward()` itself returned
+    /// `Err("shape mismatch in reshape, lhs: [3, 1, 32, 10, 4, 12], rhs:
+    /// [3, 1, 32, 128, 4]")` — `unfold`'s `Op::Reshape` backward trying to
+    /// reshape the width-unfold's gradient (`[..., 10, 4, 12]`, sized by the
+    /// DROPPED-tail 120-of-128 output) back to the pre-width-unfold input
+    /// shape (`[..., 128, 4]`, the full un-narrowed 128) — a loud `Err`, not
+    /// a panic, but this test's `.expect(...)` on that `Result` is what
+    /// turns it into a failing assertion — before any `grads.get(...)` call
+    /// was even reached.
+    #[test]
+    fn mel_conv2d_backward_reaches_conv_weight_through_the_fused_patch_embed_path() {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let (mut tower, cfg, input) = build_full_tower_and_input(&varmap, &device, 202);
+        tower.set_training(true);
+        let encoder = tower.encoder();
+
+        // Front half up to patch_embed's own input, matching
+        // HtsatAudioEncoder::forward_front's composition exactly (see that
+        // method), stopping one step short of it so this test can reach
+        // into HtsatPatchEmbed::forward's own boundary outputs directly.
+        let x = input.transpose(1, 3).unwrap().contiguous().unwrap();
+        let post_bn = encoder.batch_norm.forward_t(&x, false).unwrap();
+        let normalized = post_bn.transpose(1, 3).unwrap().contiguous().unwrap();
+        let post_interp = encoder.time_interp.forward(&normalized).unwrap();
+        let post_reshape = encoder.reshape_mel2img(&post_interp).unwrap();
+
+        let mut mel_conv2d_out = None;
+        let mut fusion_out = None;
+        let patch_embed_out = encoder
+            .patch_embed
+            .forward(&post_reshape, &[true], &mut mel_conv2d_out, &mut fusion_out)
+            .unwrap();
+
+        let loss = nonuniform_loss(&patch_embed_out, cfg.patch_embeds_hidden_size, &device);
+        let grads = loss.backward().expect(
+            "backward through the fused (is_longer=true) patch-embed path must succeed now \
+             that mel_conv2d's tiling narrows before unfolding — see this test's doc for the \
+             exact pre-fix Err this .expect(...) turns into a failing assertion for",
+        );
+
+        let mel_conv_weight = find_var(&varmap, "mel_conv2d.weight");
+        let grad = grads
+            .get(mel_conv_weight.as_tensor())
+            .expect("mel_conv2d.weight grad must be Some through the fused patch-embed path");
+        let norm = grad_norm(grad);
+        assert!(
+            norm.is_finite(),
+            "mel_conv2d.weight grad norm must be finite, got {norm}"
+        );
+        assert!(
+            norm > 0.0,
+            "mel_conv2d.weight grad norm must be nonzero, got {norm}"
+        );
+    }
+
+    /// Pre-fix tiling: `unfold` applied directly, with no `narrow` first —
+    /// reproduces exactly what `mel_conv2d` did before [`tile_nonoverlapping`]
+    /// existed. Used only to prove the fix's forward stays bit-identical.
+    fn unfold_only_tiling(x: &Tensor, kh: usize, kw: usize) -> Tensor {
+        x.unfold(2, kh, kh).unwrap().unfold(3, kw, kw).unwrap()
+    }
+
+    /// Forward bit-identity oracle: [`tile_nonoverlapping`]'s
+    /// narrow-then-unfold must read the IDENTICAL elements as unfolding
+    /// directly with no narrow, on the exact non-dividing shape
+    /// `mel_conv2d` hits in production (`spec_size=128`,
+    /// `kw=patch_size*3=12`; see `config_parity_with_fixture` for where
+    /// these numbers come from — `128 / 12 = 10` windows, an 8-wide tail
+    /// dropped either way). This is the oracle behind
+    /// `golden_parity`'s 6/6 staying green across this fix: `unfold`
+    /// already only ever reads the same `floor(dim/size) * size` prefix
+    /// regardless of whether that prefix is narrowed first, so narrowing
+    /// changes nothing about which elements FORWARD reads — only whether
+    /// BACKWARD is well-defined.
+    #[test]
+    fn tile_nonoverlapping_is_forward_bit_identical_to_unfold_without_narrow_first() {
+        let device = Device::Cpu;
+        let (n, c, h, w) = (2usize, 1usize, 128usize, 128usize);
+        let (kh, kw) = (4usize, 12usize);
+        let x = deterministic_tensor(n * c * h, w, 55, &device)
+            .reshape((n, c, h, w))
+            .unwrap();
+
+        let narrowed = tile_nonoverlapping(&x, kh, kw).unwrap();
+        let direct = unfold_only_tiling(&x, kh, kw);
+
+        assert_eq!(
+            narrowed.dims(),
+            direct.dims(),
+            "narrow-then-unfold and unfold-only must tile to the identical shape"
+        );
+        let a: Vec<f32> = narrowed
+            .contiguous()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let b: Vec<f32> = direct
+            .contiguous()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(
+            a, b,
+            "narrow-then-unfold must read the identical elements as unfold alone (the \
+             dropped-tail, non-dividing case)"
+        );
+    }
+
+    /// Premise-pin (the repo idiom for a documented upstream limitation,
+    /// e.g. `jammi-kernels`' `cpu_matmul_still_cannot_do_bf16`): pins the
+    /// exact candle-core behavior [`tile_nonoverlapping`]'s
+    /// narrow-before-unfold works around, so a future candle upgrade that
+    /// fixes `unfold`'s backward on a non-dividing dim flips THIS test red
+    /// — a loud signal that the workaround may now be removable — instead
+    /// of silently leaving it unexplained and untested. See
+    /// `tile_nonoverlapping`'s own doc for the exact candle-core source
+    /// citations this pins (`tensor.rs:2931-2969`, `backprop.rs:602-606`,
+    /// `tensor.rs:2523-2531`).
+    #[test]
+    fn unfold_backward_is_a_plain_reshape_in_candle() {
+        let device = Device::Cpu;
+        // dim length 5, size=2, step=2: 2 windows read 4 of the 5 elements
+        // (an element dropped) — the minimal non-dividing case.
+        let x =
+            Var::from_tensor(&Tensor::from_vec(vec![1f32, 2., 3., 4., 5.], 5, &device).unwrap())
+                .unwrap();
+        let tiled = x.as_tensor().unfold(0, 2, 2).unwrap(); // [2, 2]
+        let loss = tiled.sum_all().unwrap();
+        let err = loss.backward().expect_err(
+            "unfold's backward on a non-dividing dim must still error today (the candle \
+             premise tile_nonoverlapping's narrow-before-unfold depends on) — if this now \
+             succeeds, candle may have fixed unfold's backward and the workaround may be \
+             removable",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("shape mismatch") && msg.contains("reshape"),
+            "expected candle's reshape-shape-mismatch error from unfold's Op::Reshape backward; \
+             got: {msg}"
+        );
     }
 
     /// Eval output is unaffected by ever having toggled training on and back

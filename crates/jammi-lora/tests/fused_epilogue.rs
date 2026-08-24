@@ -27,7 +27,7 @@
 //!    fallback) is what produced the agreement, so the golden is not
 //!    accidentally green only because the fused path never engaged.
 //!
-//! **Migrated (P2 fused-LoRA-site commit):** items 3 and 4 originally
+//! **Migrated (whole-site fusion commit):** items 3 and 4 originally
 //! asserted on `lora_epilogue_dispatch_snapshot` (the single-op epilogue
 //! counter). `LoraLinear::forward`'s training arm now routes through
 //! `jammi_kernels::ops::LoraLinearFused` — the WHOLE site, not just the
@@ -307,5 +307,190 @@ fn esc_031_golden_holds_through_the_fused_path_with_dispatch_proof() {
         frozen_out.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
         "with lora_b == 0 the fused epilogue adds cast(0*scaling) == 0: Lora(W) must \
          be bit-identical to Frozen(W)"
+    );
+}
+
+/// esc-033's determinism/resume oracles, restated against the PRODUCTION
+/// `LoraLinear::forward` path (an adversarial mutation audit finding: the
+/// prior oracle suite only exercised `DropoutMasks::apply` directly, never
+/// `forward` itself — a corrupted `forward_idx` reservation at the actual
+/// call site, or a divergence between the fused-site key and the
+/// eager-fallback key, could have slipped through). `dispatch_fused`
+/// selects which arm dispatches (`true`: F32 backbone, no bias -> fused;
+/// `false`: a bias-carrying base -> eager fallback), so this proves the
+/// SAME resume invariant on BOTH arms independently.
+fn resume_reproduces_the_uninterrupted_dropout_stream(dispatch_fused: bool) {
+    let device = cpu();
+    const N: usize = 6;
+    const K: u64 = 2;
+
+    let build = |seed: u64, varmap: &VarMap, vb: &VarBuilder| -> LoraLinear {
+        let (in_features, out_features) = (8, 16);
+        let mut row = Vec::with_capacity(in_features * out_features);
+        for i in 0..out_features {
+            for j in 0..in_features {
+                row.push(((i * 7 + j * 3) as f32).sin());
+            }
+        }
+        let w = Tensor::from_vec(row, (out_features, in_features), &device).unwrap();
+        let base = if dispatch_fused {
+            Linear::new(w, None)
+        } else {
+            let bias = Tensor::zeros((out_features,), DType::F32, &device).unwrap();
+            Linear::new(w, Some(bias))
+        };
+        LoraLinear::new(
+            base,
+            4,
+            8.0,
+            false,
+            LoraInitMode::Gaussian,
+            Some(0.3),
+            seed,
+            varmap,
+            vb,
+        )
+        .unwrap()
+    };
+    let x = Tensor::ones((2, 5, 8), DType::F32, &device).unwrap();
+
+    // Uninterrupted reference: N forwards, every output recorded.
+    let ref_varmap = VarMap::new();
+    let ref_vb = VarBuilder::from_varmap(&ref_varmap, DType::F32, &device);
+    let reference = build(321, &ref_varmap, &ref_vb);
+    let before = lora_linear_fused_dispatch_snapshot();
+    let mut ref_outputs = Vec::with_capacity(N);
+    for _ in 0..N {
+        ref_outputs.push(
+            reference
+                .forward(&x)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+        );
+    }
+    let after = lora_linear_fused_dispatch_snapshot();
+    if dispatch_fused {
+        assert!(
+            after.fused > before.fused,
+            "expected the fused arm to dispatch"
+        );
+    } else {
+        assert!(
+            after.eager > before.eager,
+            "expected the eager arm to dispatch"
+        );
+    }
+
+    // The "crashed" run: a separate instance, only the first K forwards.
+    let interrupted_varmap = VarMap::new();
+    let interrupted_vb = VarBuilder::from_varmap(&interrupted_varmap, DType::F32, &device);
+    let interrupted = build(321, &interrupted_varmap, &interrupted_vb);
+    for _ in 0..K {
+        interrupted.forward(&x).unwrap();
+    }
+    let pos = interrupted.dropout_position().unwrap().unwrap();
+    assert_eq!(pos, K, "dropout_position must count PRODUCTION forwards");
+
+    // The resumed run: a FRESH instance restored to that position,
+    // continuing for every remaining forward.
+    let resumed_varmap = VarMap::new();
+    let resumed_vb = VarBuilder::from_varmap(&resumed_varmap, DType::F32, &device);
+    let resumed = build(321, &resumed_varmap, &resumed_vb);
+    resumed.restore_dropout_position(pos).unwrap();
+    let mut resumed_outputs = Vec::with_capacity(N - K as usize);
+    for _ in 0..(N - K as usize) {
+        resumed_outputs.push(
+            resumed
+                .forward(&x)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+        );
+    }
+
+    for i in 0..(N - K as usize) {
+        assert_eq!(
+            resumed_outputs[i],
+            ref_outputs[K as usize + i],
+            "post-restore production forward {i} diverged from the uninterrupted run \
+             (dispatch_fused={dispatch_fused})"
+        );
+    }
+}
+
+#[test]
+fn fused_arm_production_path_resume_reproduces_the_uninterrupted_dropout_stream() {
+    resume_reproduces_the_uninterrupted_dropout_stream(true);
+}
+
+#[test]
+fn eager_arm_production_path_resume_reproduces_the_uninterrupted_dropout_stream() {
+    resume_reproduces_the_uninterrupted_dropout_stream(false);
+}
+
+/// The negative control proving the oracle above has teeth (esc-033's
+/// anti-relaxation clause, restated at the production `LoraLinear::forward`
+/// level): restoring to `K + 1` instead of `K` must NOT reproduce the
+/// uninterrupted run's continuation.
+#[test]
+fn fused_arm_production_path_would_catch_an_off_by_one_resume_position() {
+    let device = cpu();
+    const N: usize = 5;
+    const K: u64 = 2;
+
+    let build = |seed: u64, varmap: &VarMap, vb: &VarBuilder| -> LoraLinear {
+        let base = build_base(8, 16, &device, DType::F32);
+        LoraLinear::new(
+            base,
+            4,
+            8.0,
+            false,
+            LoraInitMode::Gaussian,
+            Some(0.3),
+            seed,
+            varmap,
+            vb,
+        )
+        .unwrap()
+    };
+    let x = Tensor::ones((2, 5, 8), DType::F32, &device).unwrap();
+
+    let ref_varmap = VarMap::new();
+    let ref_vb = VarBuilder::from_varmap(&ref_varmap, DType::F32, &device);
+    let reference = build(654, &ref_varmap, &ref_vb);
+    let mut ref_outputs = Vec::with_capacity(N);
+    for _ in 0..N {
+        ref_outputs.push(
+            reference
+                .forward(&x)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+        );
+    }
+
+    let off_by_one_varmap = VarMap::new();
+    let off_by_one_vb = VarBuilder::from_varmap(&off_by_one_varmap, DType::F32, &device);
+    let off_by_one = build(654, &off_by_one_varmap, &off_by_one_vb);
+    off_by_one.restore_dropout_position(K + 1).unwrap(); // the injected bug: should be K.
+    let wrong_output = off_by_one
+        .forward(&x)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+
+    assert_ne!(
+        wrong_output, ref_outputs[K as usize],
+        "an off-by-one resume position must NOT reproduce the correct continuation — \
+         if it did, the positive oracle above would be vacuous"
     );
 }

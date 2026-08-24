@@ -214,8 +214,8 @@ impl DropoutMasks {
     /// the result directly — the mask is never materialized as a separate
     /// tensor at any point.
     ///
-    /// As of the P2 fused-LoRA-site commit, `LoraLinear::forward` no
-    /// longer calls this directly (it calls [`Self::next_key`] itself, so
+    /// `LoraLinear::forward` no longer calls this directly (it calls
+    /// [`Self::next_key`] itself, so
     /// both the fused and eager-fallback arms can consume the SAME
     /// reserved key — see `lora_linear::LoraLinear::forward`'s doc). Kept
     /// (not deleted) as the `#[cfg(test)]` module's own oracle surface

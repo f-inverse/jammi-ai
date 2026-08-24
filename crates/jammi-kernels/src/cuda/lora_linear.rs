@@ -3,18 +3,26 @@
 //! doc for the full rounding enumeration), issued at the storage level
 //! with NO new `.cu` kernel: `BackendStorage::matmul`/`to_dtype` (cuBLAS
 //! and candle's own `cast_*` kernels, already compiled into every candle
-//! build) for the three GEMMs and the two casts, and
+//! build) for the three GEMMs and the casts, and
 //! [`crate::ops::DropoutFused`]/[`crate::ops::ScaledCastAdd`]'s OWN
 //! `cuda_fwd` methods called directly for dropout and the epilogue —
 //! exactly the same launchers `crate::cuda::dropout`/
 //! `crate::cuda::scaled_cast_add` already ship, reused rather than
-//! duplicated.
+//! duplicated. `ab`'s row-packed `[in + out, rank]` layout (see
+//! `ops::lora_linear`'s module doc) means the `A^T`/`B` slices below are
+//! zero-copy `Layout::narrow(0, ..)` views, not materialized buffers —
+//! this file no longer issues its own `to_dtype` gather-copy for them (an
+//! EARLIER, column-packed layout required one; it failed cuBLAS's
+//! `gemm_config` admissibility check on-device — `MatMulNonContiguous` —
+//! which is exactly why the pack layout changed, not merely a style
+//! preference).
 
 use candle_core::backend::BackendStorage;
 use candle_core::{
     CudaStorage, CustomOp1, CustomOp2, CustomOp3, DType, Error, Layout, Result, Shape,
 };
 
+use crate::ops::lora_linear::materialize_contiguous_if_needed;
 use crate::ops::{DropoutFused, LoraLinearFused, ScaledCastAdd};
 
 #[allow(clippy::too_many_arguments)]
@@ -39,17 +47,27 @@ pub(crate) fn cuda_fwd(
     if !matches!(s1.dtype(), DType::F32 | DType::BF16) {
         return Err(Error::UnsupportedDTypeForOp(s1.dtype(), op.name()));
     }
-    for (l, what) in [(l1, "x"), (l2, "w"), (l3, "ab")] {
+    for (l, what) in [(l2, "w"), (l3, "ab")] {
         if l.contiguous_offsets().is_none() {
             return Err(Error::RequiresContiguous {
                 op: match what {
-                    "x" => "lora_linear_fused(x)",
                     "w" => "lora_linear_fused(w)",
                     _ => "lora_linear_fused(ab)",
                 },
             });
         }
     }
+
+    // `x` may be a non-contiguous (e.g. transposed/narrowed) view;
+    // materialize it at THIS op's storage level rather than refusing —
+    // see `ops::lora_linear::materialize_contiguous_if_needed`'s doc for
+    // why only `x` (never `w`/`ab`) gets this treatment.
+    let x_owned = materialize_contiguous_if_needed(s1, l1)?;
+    let (s1, l1): (&CudaStorage, Layout) = match &x_owned {
+        Some((owned, contig_l)) => (owned, contig_l.clone()),
+        None => (s1, l1.clone()),
+    };
+    let l1 = &l1;
 
     let inf = op.in_features;
     let outf = op.out_features;
@@ -77,27 +95,22 @@ pub(crate) fn cuda_fwd(
         None => (x32_storage, x32_l),
     };
 
-    // A/B^T materialized into their own dense buffers before either GEMM
-    // touches them — see `ops::lora_linear`'s module doc: a column-slice
-    // of the wider packed `ab` buffer fails cuBLAS's `gemm_config`
-    // eligibility check (neither its row- nor column-contiguous branch
-    // matches a padded row stride), so this cast-to-the-same-dtype gather
-    // copy (bit-exact — no numeric operation, just a layout-aware read)
-    // is required, not merely convenient.
-    let a_view = l3.narrow(1, 0, inf)?;
-    let bt_view = l3.narrow(1, inf, outf)?;
-    let a_storage = s3.to_dtype(&a_view, DType::F32)?;
-    let bt_storage = s3.to_dtype(&bt_view, DType::F32)?;
-    let a_l = Layout::contiguous((r, inf));
-    let bt_l = Layout::contiguous((r, outf));
+    // `ab`'s row-packed layout: the first `inf` rows ARE `A^T` (`[in,
+    // rank]`) and the remaining `outf` rows ARE `B` (`[out, rank]`) — both
+    // dim-0 narrows of a contiguous matrix, hence themselves contiguous
+    // with NO copy (see `ops::lora_linear`'s module doc's "packed-`ab`
+    // GEMM eligibility problem" section for the `gemm_config`
+    // admissibility argument this relies on).
+    let a_t_l = l3.narrow(0, 0, inf)?;
+    let b_l = l3.narrow(0, inf, outf)?;
+    let b_t_l = b_l.transpose(0, 1)?;
 
-    // Step 4: h = xd @ A^T.
-    let a_t_l = a_l.transpose(0, 1)?;
-    let h_storage = xd_storage.matmul(&a_storage, (1, m, r, inf), &xd_l, &a_t_l)?;
+    // Step 4: h = xd @ A^T — `a_t_l` used directly, zero-copy.
+    let h_storage = xd_storage.matmul(s3, (1, m, r, inf), &xd_l, &a_t_l)?;
     let h_l = Layout::contiguous((m, r));
 
-    // Step 5: delta = h @ B^T.
-    let delta_storage = h_storage.matmul(&bt_storage, (1, m, outf, r), &h_l, &bt_l)?;
+    // Step 5: delta = h @ B^T — `b_t_l` used directly, zero-copy.
+    let delta_storage = h_storage.matmul(s3, (1, m, outf, r), &h_l, &b_t_l)?;
     let delta_l = Layout::contiguous((m, outf));
 
     // Step 6: out = base + cast(delta * scale), via ScaledCastAdd's OWN

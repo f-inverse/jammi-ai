@@ -18,24 +18,27 @@ use crate::seeded::{
 /// (`jammi_kernels::ops::DropoutFused`), read from the same op-keyed
 /// registry `lora_epilogue_counters` (below) uses.
 ///
-/// **Permanently `{fused: 0, eager: 0}` as of the P2 fused-LoRA-site
-/// commit.** `forward`'s training arm no longer calls `DropoutMasks::apply`
-/// (which recorded here via `admit`) — dropout is now reserved via
-/// `DropoutMasks::next_key` and consumed DIRECTLY by
-/// [`LoraLinearFused`]/[`DropoutFused::new`] on EITHER arm (fused-site or
-/// eager-fallback), bypassing this counter's own `admit` call entirely
-/// (see `forward`'s doc). The function is kept, unchanged, for source and
-/// snapshot-schema compatibility with any existing durable-job-record
-/// reader of this name; a NEW consumer wanting dropout's fused/eager split
-/// should read [`lora_linear_fused_dispatch_snapshot`] instead — dropout
-/// is now folded into that ONE counter, the same way `lora_epilogue`'s is.
+/// **Permanently `{fused: 0, eager: 0}` today.** `forward`'s training arm
+/// no longer calls `DropoutMasks::apply` (which recorded here via
+/// `admit`) — dropout is now reserved via `DropoutMasks::next_key` and
+/// consumed DIRECTLY by [`LoraLinearFused`]/[`DropoutFused::new`] on
+/// EITHER arm (fused-site or eager-fallback), bypassing this counter's
+/// own `admit` call entirely (see `forward`'s doc). The eager-fallback
+/// arm's own dropout call (`apply1`) is a PLAIN function call too, not
+/// routed through `admit`, so this counter stays zero on that arm as
+/// well — not just the fused one. The function is kept, unchanged, for
+/// source and snapshot-schema compatibility with any existing
+/// durable-job-record reader of this name; a NEW consumer wanting
+/// dropout's fused/eager split should read
+/// [`lora_linear_fused_dispatch_snapshot`] instead — dropout is now
+/// folded into that ONE counter, the same way `lora_epilogue`'s is.
 fn lora_dropout_counters() -> &'static DispatchCounters {
     counters_for("lora_dropout")
 }
 
 /// A snapshot of the fused/eager dispatch counts for the LoRA dropout op —
-/// mirrors [`lora_epilogue_dispatch_snapshot`]. See [`lora_dropout_counters`]'s
-/// doc: permanently zero as of the P2 fused-LoRA-site commit.
+/// mirrors [`lora_epilogue_dispatch_snapshot`]. See `lora_dropout_counters`'s
+/// doc: permanently zero today, on both arms.
 pub fn lora_dropout_dispatch_snapshot() -> DispatchSnapshot {
     lora_dropout_counters().snapshot()
 }
@@ -48,9 +51,9 @@ pub fn lora_dropout_dispatch_snapshot() -> DispatchSnapshot {
 /// C2-C5's four ops in `jammi-encoders` keep their own pre-existing
 /// statics unchanged.
 ///
-/// **Permanently `{fused: 0, eager: 0}` as of the P2 fused-LoRA-site
-/// commit**, for the same reason [`lora_dropout_counters`] is: the
-/// standalone epilogue call `forward` used to make
+/// **Permanently `{fused: 0, eager: 0}` today**, for the same reason
+/// [`lora_dropout_counters`] is: the standalone epilogue call `forward`
+/// used to make
 /// (`apply2(base_out, lora_out, ScaledCastAdd::new(..))`) is superseded by
 /// [`LoraLinearFused`], which reuses `ScaledCastAdd`'s `cpu_fwd`/`cuda_fwd`
 /// DIRECTLY (a plain function call, not through `admit`) as its own
@@ -67,8 +70,7 @@ fn lora_epilogue_counters() -> &'static DispatchCounters {
 /// `rope_dispatch_snapshot` / `softmax_dispatch_snapshot` /
 /// `geglu_dispatch_snapshot` — the read API a durable job record or a
 /// bench report uses to state which kernel path actually ran. See
-/// [`lora_epilogue_counters`]'s doc: permanently zero as of the P2
-/// fused-LoRA-site commit.
+/// `lora_epilogue_counters`'s doc: permanently zero today.
 pub fn lora_epilogue_dispatch_snapshot() -> DispatchSnapshot {
     lora_epilogue_counters().snapshot()
 }
@@ -89,10 +91,10 @@ fn eager_epilogue(base_out: &Tensor, lora_out: &Tensor, scaling: f64) -> Result<
 }
 
 /// Per-op fused/eager dispatch counts for the fused LoRA SITE
-/// (`jammi_kernels::ops::LoraLinearFused`, the P2 whole-site fusion — one
+/// (`jammi_kernels::ops::LoraLinearFused`, the whole-site fusion — one
 /// tape node in place of the ~11-node eager composition
-/// [`eager_epilogue`] and its own `A`/`B`/dropout sub-linears build), read
-/// from the same op-keyed registry [`lora_epilogue_counters`] uses.
+/// `eager_epilogue` and its own `A`/`B`/dropout sub-linears build), read
+/// from the same op-keyed registry `lora_epilogue_counters` uses.
 ///
 /// **`lora_epilogue`/`lora_dropout` legitimately read `0` for every
 /// forward that dispatches through this counter instead.** Once the
@@ -127,10 +129,29 @@ pub fn lora_linear_fused_dispatch_snapshot() -> DispatchSnapshot {
 /// refuses `rank == 0`, and a real `Linear`'s weight always has
 /// `out_features >= 1`) — not re-checked here, but re-validated
 /// independently by [`LoraLinearFused::new`] regardless (family D: an op
-/// trusts no caller for its own domain).
-fn lora_linear_admission_predicate(x: &Tensor, w: &Tensor, has_bias: bool) -> (bool, &'static str) {
+/// trusts no caller for its own domain). `lora_a`/`lora_b` (packed into
+/// `ab`) must be `F32` — the op's own domain requires it — checked here
+/// too as a COUNTED domain miss, not only as the op's own hard refusal.
+fn lora_linear_admission_predicate(
+    x: &Tensor,
+    w: &Tensor,
+    lora_dtype: DType,
+    has_bias: bool,
+) -> (bool, &'static str) {
     if has_bias {
         return (false, "base_has_no_bias");
+    }
+    // [`jammi_kernels::ops::LoraLinearFused`]'s own domain requires `ab`
+    // to be `F32` (checked again by the op itself, family D — this is a
+    // COUNTED domain miss at the call site, not a substitute for that
+    // check). Today's workspace fact is that `lora_a`/`lora_b` are always
+    // built `F32` (this predicate's own doc), so this branch is not
+    // expected to ever fire in this workspace — it exists so a FUTURE
+    // non-`F32` adapter falls back loudly-counted rather than reaching the
+    // op's own hard `UnsupportedDTypeForOp` refusal via a code path that
+    // looks like ordinary fused dispatch.
+    if lora_dtype != DType::F32 {
+        return (false, "lora_ab_dtype_f32");
     }
     if !device_is_supported(x.device()) {
         return (false, "device_is_cpu_or_cuda");
@@ -171,8 +192,12 @@ fn lora_linear_admission_predicate(x: &Tensor, w: &Tensor, has_bias: bool) -> (b
 /// error: `w.is_variable()` alone would silently miss this case (a
 /// tracked non-`Var` intermediate is neither "definitely frozen" nor
 /// "definitely trainable"), and `!w.track_op()` alone would OVER-refuse a
-/// legitimate trainable `Var` (a `Var`'s own `track_op()` is `false` — it
-/// IS the leaf — so the `is_variable()` check must be tried FIRST). See
+/// legitimate trainable `Var` — candle-core 0.11's `Tensor::track_op` is
+/// `is_variable() || op.is_some()` (`tensor.rs:592-594`), so a `Var`
+/// itself DOES report `track_op() == true` (unlike a true frozen leaf).
+/// The `is_variable()` branch must therefore be tried FIRST: it is the
+/// only test that can tell a trainable `Var` apart from a tracked
+/// non-`Var` intermediate, both of which have `track_op() == true`. See
 /// `jammi_kernels::ops::lora_linear`'s module doc for what `dweight_needed`
 /// controls in the fused kernel's own `bwd`.
 fn frozen_weight_gate(w: &Tensor) -> Result<bool, LoraError> {
@@ -447,7 +472,7 @@ impl LoraLinear {
 
     /// Reconstruct a `LoraLinear` from tensors already loaded from disk.
     ///
-    /// `rank` is inferred from `lora_a.dims()[0]`; scaling is [`lora_scaling`]
+    /// `rank` is inferred from `lora_a.dims()[0]`; scaling is `lora_scaling`
     /// of `(alpha, rank, use_rslora)` — the SAME pure function `new` calls,
     /// so a reload can never silently disagree with the run that trained the
     /// adapter. The invariant is that scaling is entirely determined by the
@@ -457,7 +482,7 @@ impl LoraLinear {
     /// not assume vanilla scaling.
     ///
     /// Refuses (typed, [`LoraError::Config`]) when `lora_a.dims()[0] == 0` —
-    /// see [`lora_scaling`]'s domain doc.
+    /// see `lora_scaling`'s domain doc.
     pub fn from_loaded(
         base: Linear,
         lora_a: Tensor,
@@ -486,7 +511,7 @@ impl LoraLinear {
     }
 
     /// The effective LoRA scaling factor this layer applies — see
-    /// [`lora_scaling`]'s doc for what determines it. A pure read of the
+    /// `lora_scaling`'s doc for what determines it. A pure read of the
     /// value computed at construction (`new` or `from_loaded`), useful for
     /// tests and diagnostics that need to confirm the two constructors agree
     /// bit-for-bit without re-deriving it from a forward pass.
@@ -520,14 +545,14 @@ impl LoraLinear {
     /// The training arm routes the ENTIRE site — `base = x @ w^T`, the
     /// dropout draw, both LoRA GEMMs, and the epilogue — through ONE
     /// `CustomOp3` call ([`LoraLinearFused`]) when the kernel's own domain
-    /// holds ([`lora_linear_admission_predicate`]): this collapses the
+    /// holds (`lora_linear_admission_predicate`): this collapses the
     /// ~11-node eager composition (each node its own `zeros_like`+`add` in
     /// candle's backward) into one node (plus the tiny `ab`-packing
     /// `Tensor::cat`). Outside the fused kernel's domain (a bias-carrying
     /// base, an unsupported dtype/device, a non-contiguous view, an
     /// unsupported rank), the training arm falls back to the SAME `[base
     /// matmul, dropout, A-matmul, B-matmul, epilogue]` eager composition
-    /// eval uses — see [`eager_epilogue`] — so a domain miss reproduces
+    /// eval uses — see `eager_epilogue` — so a domain miss reproduces
     /// eval's own math exactly, just still gated to `training == true`
     /// (dropout still applies on this fallback, which eval's own path
     /// never runs).
@@ -550,7 +575,7 @@ impl LoraLinear {
     /// (`ModernBertBuilder::build`'s `lora_vb` construction,
     /// `crates/jammi-encoders/src/modernbert.rs`), not a
     /// `candle_nn::VarBuilder::from_varmap` API guarantee — see
-    /// [`lora_linear_admission_predicate`]'s doc for what this bounds.
+    /// `lora_linear_admission_predicate`'s doc for what this bounds.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor, LoraError> {
         if !self.training {
             // Eval/serving: always the eager composition, unconditionally
@@ -584,7 +609,8 @@ impl LoraLinear {
         };
 
         let has_bias = self.base.bias().is_some();
-        let (holds, predicate) = lora_linear_admission_predicate(x, self.base.weight(), has_bias);
+        let (holds, predicate) =
+            lora_linear_admission_predicate(x, self.base.weight(), self.lora_a.dtype(), has_bias);
         let outcome = admit(
             admission_mode(),
             "lora_linear_fused",
@@ -595,8 +621,17 @@ impl LoraLinear {
 
         match outcome {
             DispatchOutcome::Fused => {
-                let b_t = self.lora_b.t()?.contiguous()?;
-                let ab = Tensor::cat(&[&self.lora_a, &b_t], 1)?;
+                // Row-packed layout (`jammi_kernels::ops::lora_linear`'s
+                // module doc, "the packed-`ab` GEMM eligibility problem"):
+                // `A^T` (`self.lora_a.t()`) stacked over `B`
+                // (`self.lora_b`, no pre-transpose needed) along dim 0 —
+                // `[in + out, rank]`. `self.lora_a.t()` is a non-contiguous
+                // VIEW; `Tensor::cat`'s dim-0 path (`cat0`) copies via each
+                // arg's own `Layout` regardless (`copy_strided_src`), so no
+                // `.contiguous()` call is needed before packing (unlike the
+                // column-packed layout this replaced, which needed one for
+                // `B^T`).
+                let ab = Tensor::cat(&[&self.lora_a.t()?, &self.lora_b], 0)?;
                 let op = LoraLinearFused::new(
                     self.scaling as f32,
                     self.in_features,
@@ -665,6 +700,63 @@ impl LoraLinear {
             masks.restore_position(position);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod frozen_weight_gate_tests {
+    use super::frozen_weight_gate;
+    use candle_core::{Device, Tensor, Var};
+
+    /// The ordinary case: a weight loaded straight from a `VarBuilder`
+    /// (a true untracked leaf) — `dweight_needed` must be `false`.
+    #[test]
+    fn untracked_leaf_is_false() {
+        let device = Device::Cpu;
+        let w = Tensor::randn(0f32, 1.0, (3, 4), &device).unwrap();
+        assert!(!w.is_variable() && !w.track_op());
+        assert!(!frozen_weight_gate(&w).unwrap());
+    }
+
+    /// The "also fine-tune the base" case: `w` is itself a trainable
+    /// `Var` — `dweight_needed` must be `true`. Per candle-core 0.11's
+    /// `Tensor::track_op` (`is_variable() || op.is_some()`), a `Var`
+    /// DOES report `track_op() == true` — this is exactly why
+    /// `is_variable()` must be checked FIRST (see `frozen_weight_gate`'s
+    /// own doc).
+    #[test]
+    fn trainable_var_is_true() {
+        let device = Device::Cpu;
+        let w = Var::from_tensor(&Tensor::randn(0f32, 1.0, (3, 4), &device).unwrap()).unwrap();
+        assert!(w.as_tensor().is_variable());
+        assert!(w.as_tensor().track_op());
+        assert!(frozen_weight_gate(w.as_tensor()).unwrap());
+    }
+
+    /// The refused, ambiguous case: `w` carries an `Op` (e.g. a
+    /// `Tensor::to_dtype` cast applied after loading) but is NOT a `Var`
+    /// — neither "definitely frozen" nor "definitely trainable"; a typed
+    /// refusal, not a silent guess.
+    #[test]
+    fn tracked_non_var_is_a_typed_refusal() {
+        let device = Device::Cpu;
+        // `BackpropOp::new1` (candle-core 0.11's `op.rs:1100-1107`) only
+        // attaches an `Op` when its OWN argument already `track_op()`s —
+        // a plain leaf `Tensor::randn(..)` does not, so casting IT would
+        // produce another untracked leaf, not the ambiguous state this
+        // test targets. Starting from a `Var` (which DOES `track_op()`)
+        // and casting to a DIFFERENT dtype (a same-dtype cast
+        // short-circuits to `self.clone()`, `tensor.rs:2453-2461`, and
+        // would just return the `Var` itself) produces a tensor that is
+        // TRACKED (inherits `track_op()` from its `Var` input) but is
+        // itself NOT a `Var` — exactly the case `frozen_weight_gate`
+        // must refuse.
+        let w = Var::from_tensor(&Tensor::randn(0f32, 1.0, (3, 4), &device).unwrap()).unwrap();
+        let tracked = w.as_tensor().to_dtype(candle_core::DType::F64).unwrap();
+        assert!(!tracked.is_variable());
+        assert!(tracked.track_op(), "fixture must actually be tracked");
+        let err = frozen_weight_gate(&tracked).unwrap_err();
+        assert!(matches!(err, crate::error::LoraError::Config(_)));
     }
 }
 

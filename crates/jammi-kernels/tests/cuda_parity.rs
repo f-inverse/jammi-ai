@@ -2652,23 +2652,36 @@ fn dropout_parity_multi_block_not_a_multiple_of_block_size() {
 // shape.
 // =======================================================================
 
+/// Packs `a`/`b` into `ab`'s row-packed `[in + out, rank]` layout — see
+/// `jammi_kernels::ops::lora_linear`'s module doc, "the packed-`ab` GEMM
+/// eligibility problem". No `.contiguous()` call needed before packing
+/// (`Tensor::cat`'s dim-0 path handles `a.t()`'s non-contiguous view via
+/// each arg's own `Layout`) — unlike the column-packed layout this
+/// replaced, which needed one for `B^T`.
 fn pack_ab(a: &Tensor, b: &Tensor) -> candle_core::Result<Tensor> {
-    let bt = b.t()?.contiguous()?;
-    Tensor::cat(&[a, &bt], 1)
+    Tensor::cat(&[&a.t()?, b], 0)
 }
 
-fn lora_linear(
-    x: &Tensor,
-    w: &Tensor,
-    ab: &Tensor,
+/// Bundles [`lora_linear`]'s construction data into one value — the
+/// small-params-struct fix for `clippy::too_many_arguments` (no `#[allow]`
+/// per the fix contract) rather than a 9-positional-argument function.
+#[derive(Clone, Copy)]
+struct LoraLinearParams {
     scale: f32,
     inf: usize,
     outf: usize,
     r: usize,
     dropout: Option<DropoutKey>,
     dweight_needed: bool,
+}
+
+fn lora_linear(
+    x: &Tensor,
+    w: &Tensor,
+    ab: &Tensor,
+    p: LoraLinearParams,
 ) -> candle_core::Result<Tensor> {
-    let op = LoraLinearFused::new(scale, inf, outf, r, dropout, dweight_needed)?;
+    let op = LoraLinearFused::new(p.scale, p.inf, p.outf, p.r, p.dropout, p.dweight_needed)?;
     x.apply_op3(w, ab, op)
 }
 
@@ -2696,12 +2709,14 @@ fn assert_lora_linear_parity_f32(
         x_cpu.as_tensor(),
         w_cpu.as_tensor(),
         &ab_cpu,
-        scale,
-        inf,
-        outf,
-        r,
-        None,
-        true,
+        LoraLinearParams {
+            scale,
+            inf,
+            outf,
+            r,
+            dropout: None,
+            dweight_needed: true,
+        },
     )
     .unwrap();
     let grads_cpu = out_cpu.sum_all().unwrap().backward().unwrap();
@@ -2715,12 +2730,14 @@ fn assert_lora_linear_parity_f32(
         x_gpu.as_tensor(),
         w_gpu.as_tensor(),
         &ab_gpu,
-        scale,
-        inf,
-        outf,
-        r,
-        None,
-        true,
+        LoraLinearParams {
+            scale,
+            inf,
+            outf,
+            r,
+            dropout: None,
+            dweight_needed: true,
+        },
     )
     .unwrap();
     let grads_gpu = out_gpu.sum_all().unwrap().backward().unwrap();
@@ -2840,8 +2857,16 @@ fn lora_linear_parity_f32_narrowed_with_nonzero_offset() {
     let x_gpu_full = Tensor::from_slice(&x_all, (3 * rows, inf), &cuda).unwrap();
     let x_gpu = x_gpu_full.narrow(0, rows, rows).unwrap();
 
-    let out_cpu = lora_linear(&x_cpu, &w_cpu, &ab_cpu, 1.2, inf, outf, r, None, false).unwrap();
-    let out_gpu = lora_linear(&x_gpu, &w_gpu, &ab_gpu, 1.2, inf, outf, r, None, false).unwrap();
+    let params = |scale: f32| LoraLinearParams {
+        scale,
+        inf,
+        outf,
+        r,
+        dropout: None,
+        dweight_needed: false,
+    };
+    let out_cpu = lora_linear(&x_cpu, &w_cpu, &ab_cpu, params(1.2)).unwrap();
+    let out_gpu = lora_linear(&x_gpu, &w_gpu, &ab_gpu, params(1.2)).unwrap();
 
     let out_cpu_v: Vec<f32> = out_cpu.flatten_all().unwrap().to_vec1().unwrap();
     let out_gpu_v: Vec<f32> = out_gpu
@@ -2856,6 +2881,79 @@ fn lora_linear_parity_f32_narrowed_with_nonzero_offset() {
         assert!(
             ((*c - *g).abs() as f64) <= F32_TOL,
             "narrowed fwd[{i}]: cpu {c} vs cuda {g}"
+        );
+    }
+}
+
+/// A GENUINELY non-contiguous `x` (a transposed VIEW, not merely a
+/// nonzero-offset contiguous narrow — see
+/// `lora_linear_parity_f32_narrowed_with_nonzero_offset` for that class):
+/// `ops::lora_linear::materialize_contiguous_if_needed` must produce the
+/// SAME CUDA result as it does on CPU, at the SAME (transposed) input —
+/// the CUDA-only leg the fix contract calls for, since a strided
+/// materialize-copy's `to_dtype`-based gather is a DIFFERENT code path per
+/// device (`CudaStorage::to_dtype`'s own cast kernel vs the CPU backend's).
+#[test]
+fn lora_linear_parity_f32_transposed_x_is_materialized_identically_on_both_devices() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let cpu = Device::Cpu;
+    let (inf, outf, r) = (6usize, 5usize, 2usize);
+    let rows = 4usize;
+    let x_t_v = fixture(inf * rows, 13.0); // stored as [inf, rows], then transposed to [rows, inf].
+    let w = fixture(outf * inf, 14.0);
+    let a = fixture(r * inf, 15.0);
+    let b = fixture(outf * r, 16.0);
+
+    let ab_cpu = pack_ab(
+        &Tensor::from_slice(&a, (r, inf), &cpu).unwrap(),
+        &Tensor::from_slice(&b, (outf, r), &cpu).unwrap(),
+    )
+    .unwrap();
+    let ab_gpu = pack_ab(
+        &Tensor::from_slice(&a, (r, inf), &cuda).unwrap(),
+        &Tensor::from_slice(&b, (outf, r), &cuda).unwrap(),
+    )
+    .unwrap();
+    let w_cpu = Tensor::from_slice(&w, (outf, inf), &cpu).unwrap();
+    let w_gpu = Tensor::from_slice(&w, (outf, inf), &cuda).unwrap();
+
+    let x_cpu = Tensor::from_slice(&x_t_v, (inf, rows), &cpu)
+        .unwrap()
+        .t()
+        .unwrap();
+    assert!(!x_cpu.is_contiguous());
+    let x_gpu = Tensor::from_slice(&x_t_v, (inf, rows), &cuda)
+        .unwrap()
+        .t()
+        .unwrap();
+    assert!(!x_gpu.is_contiguous());
+
+    let params = LoraLinearParams {
+        scale: 0.9,
+        inf,
+        outf,
+        r,
+        dropout: None,
+        dweight_needed: false,
+    };
+    let out_cpu = lora_linear(&x_cpu, &w_cpu, &ab_cpu, params).unwrap();
+    let out_gpu = lora_linear(&x_gpu, &w_gpu, &ab_gpu, params).unwrap();
+
+    let out_cpu_v: Vec<f32> = out_cpu.flatten_all().unwrap().to_vec1().unwrap();
+    let out_gpu_v: Vec<f32> = out_gpu
+        .flatten_all()
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(out_gpu_v.len(), rows * outf, "GPU forward length mismatch");
+    for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
+        assert!(
+            ((*c - *g).abs() as f64) <= F32_TOL,
+            "transposed-x fwd[{i}]: cpu {c} vs cuda {g}"
         );
     }
 }
@@ -2885,8 +2983,15 @@ fn lora_linear_parity_f32_dropout_matches_across_devices() {
         &Tensor::from_slice(&b, (outf, r), &cpu).unwrap(),
     )
     .unwrap();
-    let out_cpu =
-        lora_linear(&x_cpu, &w_cpu, &ab_cpu, 0.7, inf, outf, r, Some(key), false).unwrap();
+    let params = LoraLinearParams {
+        scale: 0.7,
+        inf,
+        outf,
+        r,
+        dropout: Some(key),
+        dweight_needed: false,
+    };
+    let out_cpu = lora_linear(&x_cpu, &w_cpu, &ab_cpu, params).unwrap();
 
     let x_gpu = Tensor::from_slice(&x, (rows, inf), &cuda).unwrap();
     let w_gpu = Tensor::from_slice(&w, (outf, inf), &cuda).unwrap();
@@ -2895,8 +3000,7 @@ fn lora_linear_parity_f32_dropout_matches_across_devices() {
         &Tensor::from_slice(&b, (outf, r), &cuda).unwrap(),
     )
     .unwrap();
-    let out_gpu =
-        lora_linear(&x_gpu, &w_gpu, &ab_gpu, 0.7, inf, outf, r, Some(key), false).unwrap();
+    let out_gpu = lora_linear(&x_gpu, &w_gpu, &ab_gpu, params).unwrap();
 
     let out_cpu_v: Vec<f32> = out_cpu.flatten_all().unwrap().to_vec1().unwrap();
     let out_gpu_v: Vec<f32> = out_gpu
@@ -2954,7 +3058,15 @@ fn lora_linear_parity_bf16_base_production_width() {
         &Tensor::from_slice(&bv, (outf, r), &cpu).unwrap(),
     )
     .unwrap();
-    let out_cpu = lora_linear(&x_cpu, &w_cpu, &ab_cpu, scale, inf, outf, r, None, false).unwrap();
+    let params = LoraLinearParams {
+        scale,
+        inf,
+        outf,
+        r,
+        dropout: None,
+        dweight_needed: false,
+    };
+    let out_cpu = lora_linear(&x_cpu, &w_cpu, &ab_cpu, params).unwrap();
 
     let x_gpu = Tensor::from_slice(&x_bf16, (rows, inf), &cuda).unwrap();
     let w_gpu = Tensor::from_slice(&w_bf16, (outf, inf), &cuda).unwrap();
@@ -2963,7 +3075,7 @@ fn lora_linear_parity_bf16_base_production_width() {
         &Tensor::from_slice(&bv, (outf, r), &cuda).unwrap(),
     )
     .unwrap();
-    let out_gpu = lora_linear(&x_gpu, &w_gpu, &ab_gpu, scale, inf, outf, r, None, false).unwrap();
+    let out_gpu = lora_linear(&x_gpu, &w_gpu, &ab_gpu, params).unwrap();
 
     let out_cpu_v: Vec<f32> = out_cpu.flatten_all().unwrap().to_vec1().unwrap();
     let out_gpu_v: Vec<f32> = out_gpu

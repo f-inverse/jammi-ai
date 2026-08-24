@@ -480,8 +480,24 @@ jobs:
           # can't be authored and left silently unwired into CI.
           - name: CI guard wiring
             cmd: python3 ci/scripts/check_ci_guard_wiring.py
+          # A backtick-quoted citation in a comment (e.g. "see `foo_bar` below")
+          # must resolve to a real fn/const/struct/.../field/method/crate name
+          # somewhere in the repo — closes the fabricated-proof defect class
+          # (an agent citing a TEST that does not exist). `--changed-only`:
+          # the full-repo scan found a pre-existing backlog too large to fix
+          # in the PR that introduced the gate; this ratchets against the diff
+          # base so new fabricated citations are caught without blocking
+          # unrelated PRs on the backlog (see docs/maintainer/MAINTAINER-GUIDE.md
+          # §6 CI guard contracts and ci/cited_identifiers_allow.txt).
+          - name: cited-identifier resolution
+            cmd: python3 ci/scripts/check_cited_identifiers.py --changed-only
     steps:
+      # fetch-depth: 0 so `origin/<base>` history is present for the
+      # `--changed-only` diff-scoped leg (cited-identifier resolution) — the
+      # same reason `.github/workflows/swarm.yml`'s job unshallows.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Run guard
         run: ${{ matrix.cmd }}
 

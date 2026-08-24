@@ -1,0 +1,14 @@
+# Explicit escape hatch for `ci/scripts/check_cited_identifiers.py`.
+#
+# One identifier per line, with a `#` reason comment. An identifier here
+# resolves regardless of what the working tree or local cargo registry cache
+# can find — this is the mechanism that keeps a deliberate reference to a
+# vendored/upstream internal (which the CI guard job, no toolchain/cargo,
+# cannot see) from permanently blocking the gate.
+#
+# This file is EMPTY today: the gate ships in `--changed-only` (ratchet) mode
+# in CI (see `.github/workflows/ci.yml`) because the full-repo scan found a
+# pre-existing backlog (~123 distinct unresolved citations across ~50 files —
+# see the PR that added this gate for the full list) too large to triage in
+# one PR. As the backfill retires each pre-existing citation (fix the name, or
+# allowlist it here with a reason), add its line below.

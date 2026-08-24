@@ -3045,6 +3045,13 @@ graphs don't exhaust runner disk) → `test-clients` (clients + the **two candle
   backend-specific SQL tokens (SQLite-only `rowid`/`AUTOINCREMENT`/`PRAGMA`/`strftime(`/`glob(`;
   Postgres-only `ctid`). A syntactic first-pass tripwire only — it stops the obvious cheap
   regression; `test-pg` above is what actually enforces backend-behavioral parity.
+- **`ci/scripts/check_cited_identifiers.py`** requires every backtick-quoted, snake_case-shaped
+  citation in a `crates/**/*.rs` comment (e.g. "see `foo_bar` below") to resolve to a real
+  fn/const/static/struct/enum/mod/type/trait/macro/field/method/crate name in the repo (or an
+  explicit reason in `ci/cited_identifiers_allow.txt` for a deliberate vendored/upstream
+  reference) — closes the fabricated-proof defect class (a comment citing a test that does not
+  exist). Runs `--changed-only` (ratchet against the diff base) in CI: the full-repo scan found a
+  pre-existing backlog too large to fix in the PR that introduced the gate.
 
 **Postgres coverage note (heuristic, not a certified gap list).** A name-based grep of
 `crates/jammi-db/tests/it/` for the following `jammi-db` catalog/store functions found zero direct

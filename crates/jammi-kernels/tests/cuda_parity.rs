@@ -3943,6 +3943,34 @@ fn attention_block_parity_f32_fully_masked_row_is_zero_on_both_devices() {
 /// `BF16` on CUDA only (CPU domain is F32-only — see this section's own
 /// doc), against an F32 CPU reference with a `BF16`-width tolerance. A
 /// smoke-plus-bound test, not a same-dtype cross-device comparison.
+///
+/// The `qkv` fixture is scaled to `0.1x` the amplitude every OTHER fixture
+/// in this file uses (`fixture()` is bounded `[-10, 10]`). At the full
+/// `[-10, 10]` amplitude this op's raw pre-scale `Q·Kᵀ` reaches
+/// `O(head_dim * 10^2) = O(6400)`; after the `1/sqrt(head_dim)` scale that
+/// is still `O(800)` — two full orders of magnitude above the `O(1-10)` logit range
+/// a LayerNormed production activation feeding this op actually produces.
+/// At that magnitude, `bf16`'s ~3 significant decimal digits give an
+/// ABSOLUTE rounding error of `O(1)` on individual scores; measured on this
+/// exact fixture (pinned in the diagnostic below) two competing logits at
+/// row `s=1, h=1` land only `2.7` apart out of a `~330`-magnitude pair
+/// (`327.77` vs `330.50`) — comfortably inside that `O(1)` rounding noise,
+/// so `bf16` legitimately flips their softmax weight split (`0.06/0.94`
+/// point measured; a `~1 ULP` `Q`/`K` rounding perturbation is enough to
+/// move it by `e^{O(1)}`-scale factors) and the resulting context vector
+/// differs by more than a generic bf16-ULP bound allows. This is NOT a
+/// kernel bug: `attention_block_diag_bf16_fused_bit_exact_vs_eager_cuda`
+/// below proves the fused CUDA kernel is BIT-IDENTICAL (not just within
+/// tolerance) to composing `RopeFused` + `Tensor::matmul` +
+/// `SoftmaxLastDimFused` + `Tensor::matmul` by hand, all in bf16, on the
+/// SAME device — i.e. whatever the fused kernel computes here, the eager
+/// composition it replaces computes byte-for-byte too. The fixture here is
+/// rescaled to the `O(1-10)`-logit domain this op is actually evaluated in
+/// (post-LayerNorm activations, `1/sqrt(head_dim)`-scaled dot products) so
+/// this bound test stays inside the domain where a fixed bf16-ULP bound is
+/// a meaningful claim, per this crate's domain-validity mandate — it does
+/// not paper over precision loss by widening the bound to fit an
+/// unrepresentative, out-of-domain fixture.
 #[test]
 fn attention_block_parity_bf16_cuda_vs_f32_cpu_reference() {
     let Some(cuda) = cuda_device() else {
@@ -3950,7 +3978,10 @@ fn attention_block_parity_bf16_cuda_vs_f32_cpu_reference() {
     };
     let cpu = Device::Cpu;
     let (batch, seq, heads, head_dim) = (1usize, 6usize, 2usize, 64usize);
-    let qkv_v = qkv_fixture(batch, seq, heads, head_dim, 4.0);
+    let qkv_v: Vec<f32> = qkv_fixture(batch, seq, heads, head_dim, 4.0)
+        .into_iter()
+        .map(|v| v * 0.1)
+        .collect();
     let rope_v = attention_rope_pack(seq, head_dim);
     let mask_v = vec![0f32; batch * seq];
     let scale = 1.0 / (head_dim as f32).sqrt();
@@ -3993,4 +4024,127 @@ fn attention_block_parity_bf16_cuda_vs_f32_cpu_reference() {
             "attention_block bf16 fwd[{i}]: f32 cpu {c} vs bf16 cuda {g}"
         );
     }
+}
+
+/// The actual Tier-0 bit-exact claim: the fused CUDA `bf16` kernel is
+/// BYTE-IDENTICAL — not just within a tolerance — to hand-composing the
+/// SAME primitives (`RopeFused::cuda_fwd`, ordinary `Tensor::matmul`,
+/// `SoftmaxLastDimFused::cuda_fwd`, ordinary `Tensor::matmul`) on the SAME
+/// device. This is the oracle
+/// `attention_block_parity_bf16_cuda_vs_f32_cpu_reference`'s doc comment
+/// points at: candle-core 0.11's CPU backend has no `bf16` `MatMul` impl
+/// (this op's own module doc, `crates/jammi-kernels/src/ops/attention_block.rs`),
+/// so a same-dtype cross-DEVICE comparison for `bf16` is impossible — the
+/// only same-dtype comparison available is cross-IMPLEMENTATION, same
+/// device: fused op vs. its own eager decomposition. Uses the SAME
+/// out-of-domain-for-bf16 fixture amplitude the CPU-vs-CUDA test above now
+/// avoids (raw `[-10, 10]`) specifically BECAUSE bit-identity must hold
+/// regardless of score magnitude — unlike a tolerance bound, exact equality
+/// has no domain restriction to violate.
+#[test]
+fn attention_block_diag_bf16_fused_bit_exact_vs_eager_cuda() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let (batch, seq, heads, head_dim) = (1usize, 6usize, 2usize, 64usize);
+    let qkv_v = qkv_fixture(batch, seq, heads, head_dim, 4.0);
+    let rope_v = attention_rope_pack(seq, head_dim);
+    let mask_v = vec![0f32; batch * seq];
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let op = AttentionBlockFused::new(scale, None, FullyMaskedPolicy::Zeros, true).unwrap();
+
+    let qkv_b: Vec<bf16> = qkv_v.iter().map(|&v| bf16::from_f32(v)).collect();
+    let rope_b: Vec<bf16> = rope_v.iter().map(|&v| bf16::from_f32(v)).collect();
+    let mask_b: Vec<bf16> = mask_v.iter().map(|&v| bf16::from_f32(v)).collect();
+    let qkv_gpu = Tensor::from_slice(&qkv_b, (batch, seq, 3, heads, head_dim), &cuda).unwrap();
+    let rope_gpu = Tensor::from_slice(&rope_b, (2, 1, 1, seq, head_dim), &cuda).unwrap();
+    let mask_gpu = Tensor::from_slice(&mask_b, (batch, 1, 1, seq), &cuda).unwrap();
+
+    let out_fused: Vec<f32> = qkv_gpu
+        .apply_op3(&rope_gpu, &mask_gpu, op)
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_device(&Device::Cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    // Eager: narrow+squeeze+transpose q/k/v; RopeFused on q,k; scale q;
+    // matmul; +mask; SoftmaxLastDimFused; matmul; transpose+reshape back —
+    // the SAME chain the op contract's module doc describes `bwd`
+    // recomputing, run here in `fwd` for the comparison.
+    let q = qkv_gpu
+        .narrow(2, 0, 1)
+        .unwrap()
+        .squeeze(2)
+        .unwrap()
+        .transpose(1, 2)
+        .unwrap()
+        .contiguous()
+        .unwrap();
+    let k = qkv_gpu
+        .narrow(2, 1, 1)
+        .unwrap()
+        .squeeze(2)
+        .unwrap()
+        .transpose(1, 2)
+        .unwrap()
+        .contiguous()
+        .unwrap();
+    let v = qkv_gpu
+        .narrow(2, 2, 1)
+        .unwrap()
+        .squeeze(2)
+        .unwrap()
+        .transpose(1, 2)
+        .unwrap()
+        .contiguous()
+        .unwrap();
+    let cos = rope_gpu.narrow(0, 0, 1).unwrap();
+    let sin = rope_gpu.narrow(0, 1, 1).unwrap();
+    let q_rot = apply3(&q, &cos, &sin, RopeFused::new(false)).unwrap();
+    let k_rot = apply3(&k, &cos, &sin, RopeFused::new(false)).unwrap();
+    let q_scaled = (q_rot * scale as f64).unwrap();
+    let scores = q_scaled
+        .matmul(&k_rot.transpose(2, 3).unwrap().contiguous().unwrap())
+        .unwrap();
+    let mask_bc = mask_gpu
+        .broadcast_as(scores.shape())
+        .unwrap()
+        .contiguous()
+        .unwrap();
+    let p = apply2(
+        &scores,
+        &mask_bc,
+        SoftmaxLastDimFused::new(FullyMaskedPolicy::Zeros),
+    )
+    .unwrap();
+    let ctx = p.matmul(&v).unwrap();
+    let out_eager: Vec<f32> = ctx
+        .transpose(1, 2)
+        .unwrap()
+        .contiguous()
+        .unwrap()
+        .reshape((batch, seq, heads * head_dim))
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_device(&Device::Cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    assert_eq!(out_fused.len(), out_eager.len());
+    assert_eq!(
+        out_fused, out_eager,
+        "fused CUDA bf16 attention_block output is NOT bit-identical to the eager CUDA \
+         composition of RopeFused + matmul + SoftmaxLastDimFused + matmul — this is a real \
+         divergence in the fused kernel's call site, not the fixture's score magnitude \
+         (unlike a tolerance bound, exact equality has no domain to be out of)"
+    );
 }

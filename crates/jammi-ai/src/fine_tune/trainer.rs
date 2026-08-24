@@ -16,7 +16,7 @@ use crate::fine_tune::adamw::{AdamW, ParamsAdamW};
 use jammi_db::error::{JammiError, Result};
 
 use super::data::{TextChunk, TrainingDataLoader};
-use super::optimizer::clip_and_step;
+use super::optimizer::{accumulate_grads, clip_and_step};
 use super::regression_loss::{crps_gaussian_loss, gaussian_nll_loss, pinball_loss, TargetScaler};
 use super::resume::{
     capture_bundle, NamedMoments, RestoredCheckpoint, ResumeState, RESUME_STATE_SCHEMA_VERSION,
@@ -83,12 +83,24 @@ pub fn compute_lr(config: &FineTuneConfig, step: usize, total_steps: usize) -> f
 
 /// Mutable per-epoch state passed into [`TrainingLoop::process_batch_loss`].
 ///
-/// All four fields are borrowed mutably so the function can update batch
+/// All five fields are borrowed mutably so the function can update batch
 /// counts, loss accumulators, and the gradient store in place.
 struct EpochState<'a> {
     batch_count: &'a mut usize,
     epoch_loss: &'a mut f64,
-    accumulated_grads: &'a mut Option<GradStore>,
+    accumulated_grads: &'a mut GradStore,
+    /// Whether a micro-batch has been merged into `accumulated_grads` since
+    /// the last optimizer step (i.e. whether the epoch-end flush has
+    /// anything pending). Deliberately independent of whether
+    /// `accumulated_grads` actually contains any entries: a batch whose
+    /// backward produces no gradient for any trainable var (e.g. a loss with
+    /// no valid contribution on that batch) still occupies a
+    /// gradient-accumulation "slot" and must still trigger its window's
+    /// optimizer step, exactly as a batch that did produce gradients would —
+    /// `GradStore` emptiness is not a proxy for "no micro-batch happened
+    /// here". A plain `bool` says exactly that, without introspecting the
+    /// store.
+    grads_pending: &'a mut bool,
     global_step: &'a mut usize,
 }
 
@@ -448,9 +460,14 @@ impl TrainingLoop {
             }
             let mut epoch_loss = 0.0;
             let mut batch_count = 0;
-            // Accumulated gradients across micro-batches. Seeded from the first
-            // backward call (avoids needing a private GradStore::new()).
-            let mut accumulated_grads: Option<GradStore> = None;
+            // Accumulated gradients across micro-batches, merged in
+            // `accumulate_grads`. Starts (and is reset, at every accumulation
+            // window boundary) to `GradStore::default()` rather than `None`
+            // — see `EpochState::grads_pending`'s doc for why "is there
+            // anything to flush" is tracked by that flag, not by querying
+            // this store's contents.
+            let mut accumulated_grads = GradStore::default();
+            let mut grads_pending = false;
             let mut epoch_pos_sim = 0.0f64;
             let mut epoch_neg_sim = 0.0f64;
             let mut triplet_batch_count = 0usize;
@@ -488,6 +505,7 @@ impl TrainingLoop {
                             batch_count: &mut batch_count,
                             epoch_loss: &mut epoch_loss,
                             accumulated_grads: &mut accumulated_grads,
+                            grads_pending: &mut grads_pending,
                             global_step: &mut global_step,
                         },
                         StepContext {
@@ -537,6 +555,7 @@ impl TrainingLoop {
                             batch_count: &mut batch_count,
                             epoch_loss: &mut epoch_loss,
                             accumulated_grads: &mut accumulated_grads,
+                            grads_pending: &mut grads_pending,
                             global_step: &mut global_step,
                         },
                         StepContext {
@@ -553,13 +572,18 @@ impl TrainingLoop {
 
             // Flush any remaining micro-batch gradients that didn't fill a full
             // accumulation window (last partial window of the epoch).
-            if let Some(mut acc) = accumulated_grads.take() {
+            // `grads_pending` is false here whenever the last window was
+            // already flushed at its own boundary (or `process_batch_loss`
+            // was never called this epoch, e.g. the GradCache branch above)
+            // — see `EpochState::grads_pending`'s doc for why this is a
+            // dedicated flag rather than a `GradStore` emptiness check.
+            if grads_pending {
                 let lr = compute_lr(&self.config, global_step, total_steps);
                 optimizer.set_learning_rate(lr);
                 clip_and_step(
                     &mut optimizer,
                     &trainable_vars,
-                    &mut acc,
+                    &mut accumulated_grads,
                     self.config.max_grad_norm,
                 )?;
                 global_step += 1;
@@ -1419,42 +1443,30 @@ impl TrainingLoop {
             .backward()
             .map_err(|e| JammiError::FineTune(format!("Backward: {e}")))?;
 
-        // Merge new_grads into the running accumulator.
-        // The accumulator is seeded from the first backward call to avoid
-        // needing the private GradStore::new().
-        match epoch.accumulated_grads {
-            None => {
-                *epoch.accumulated_grads = Some(new_grads);
-            }
-            Some(ref mut acc) => {
-                for var in ctx.trainable_vars.iter() {
-                    let t: &Tensor = var;
-                    if let Some(g_new) = new_grads.get(t) {
-                        if let Some(g_acc) = acc.remove(t) {
-                            let summed = (&g_acc + g_new)
-                                .map_err(|e| JammiError::FineTune(format!("Grad acc: {e}")))?;
-                            acc.insert(t, summed);
-                        } else {
-                            acc.insert(t, g_new.clone());
-                        }
-                    }
-                }
-            }
-        }
+        // Merge new_grads into the running accumulator. This micro-batch has
+        // now occupied its accumulation slot regardless of whether it
+        // contributed any actual gradient entries — see
+        // `EpochState::grads_pending`'s doc.
+        accumulate_grads(epoch.accumulated_grads, new_grads, ctx.trainable_vars)?;
+        *epoch.grads_pending = true;
 
         // Optimizer step every N micro-batches.
         if (*epoch.batch_count).is_multiple_of(self.config.gradient_accumulation_steps) {
             let lr = compute_lr(&self.config, *epoch.global_step, ctx.total_steps);
             ctx.optimizer.set_learning_rate(lr);
 
-            if let Some(mut acc) = epoch.accumulated_grads.take() {
-                clip_and_step(
-                    ctx.optimizer,
-                    ctx.trainable_vars,
-                    &mut acc,
-                    self.config.max_grad_norm,
-                )?;
-            }
+            clip_and_step(
+                ctx.optimizer,
+                ctx.trainable_vars,
+                epoch.accumulated_grads,
+                self.config.max_grad_norm,
+            )?;
+            // Reset to a fresh, empty accumulator for the next window —
+            // `mem::take` swaps in `GradStore::default()` and discards the
+            // just-consumed values, the same "no Option needed" seed the
+            // epoch starts with.
+            std::mem::take(epoch.accumulated_grads);
+            *epoch.grads_pending = false;
 
             *epoch.global_step += 1;
 

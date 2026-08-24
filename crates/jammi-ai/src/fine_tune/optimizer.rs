@@ -80,6 +80,42 @@ pub fn clip_and_step(
         .map_err(|e| JammiError::FineTune(format!("Optimizer step: {e}")))
 }
 
+/// Merge a freshly-computed [`GradStore`] into a running accumulator,
+/// summing per-var over `vars`. The shared gradient-accumulation merge: both
+/// the text trainer's micro-batch loop and GradCache's per-chunk
+/// accumulation pass reduce to this one place, sitting next to the
+/// clip→step seam it feeds.
+///
+/// `acc` starts as `GradStore::default()` (a public, `#[derive(Default)]`
+/// constructor — `GradStore::new()` itself is private, but `Default` is not)
+/// and is never re-seeded from a fresh store: for the first call, every var
+/// present in `fresh` takes the `else` branch below (`acc.remove(t)` finds
+/// nothing in the still-empty accumulator) and is inserted directly, with no
+/// addition performed — numerically identical to the wholesale
+/// `acc = fresh` a first-call special case would have done, but expressed as
+/// the same per-var loop every subsequent call takes. `fresh` is consumed
+/// (not borrowed): its values are moved into `acc` via `remove` rather than
+/// cloned, since nothing else needs `fresh` after this call.
+pub(crate) fn accumulate_grads(
+    acc: &mut GradStore,
+    mut fresh: GradStore,
+    vars: &[Var],
+) -> Result<()> {
+    for var in vars {
+        let t: &Tensor = var;
+        if let Some(g_new) = fresh.remove(t) {
+            if let Some(g_acc) = acc.remove(t) {
+                let summed = (&g_acc + &g_new)
+                    .map_err(|e| JammiError::FineTune(format!("Grad acc: {e}")))?;
+                acc.insert(t, summed);
+            } else {
+                acc.insert(t, g_new);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Backward `loss`, clip the resulting gradients, and take one AdamW step — the
 /// whole batch→update sequence for a loop without gradient accumulation.
 ///

@@ -29,6 +29,8 @@ use candle_core::backprop::GradStore;
 use candle_core::{DType, Tensor, Var};
 use jammi_db::error::{JammiError, Result};
 
+use super::optimizer::accumulate_grads;
+
 /// One group of rows to embed — the anchors, the positives, or (for a triplet
 /// batch) the hard negatives. Each group encodes independently into an
 /// `[n_rows, d]` representation; the loss closure consumes all groups together.
@@ -113,7 +115,8 @@ pub fn gradcache_backward(
     // For each chunk, the surrogate `Σ rep · cached_grad` has parameter
     // gradient equal to the chunk's contribution to `∂loss/∂θ` (chain rule),
     // and only this chunk's encoder graph is alive while it is computed.
-    let mut accumulated: Option<GradStore> = None;
+    let mut accumulated = GradStore::default();
+    let mut any_grads = false;
     for (group, cached) in groups.iter().zip(cached_grads.iter()) {
         let Some(cached_grad) = cached else {
             continue;
@@ -138,44 +141,18 @@ pub fn gradcache_backward(
             let grads = surrogate
                 .backward()
                 .map_err(|e| JammiError::FineTune(format!("gradcache chunk backward: {e}")))?;
-            accumulated = Some(merge_grads(accumulated.take(), grads, trainable_vars)?);
+            accumulate_grads(&mut accumulated, grads, trainable_vars)?;
+            any_grads = true;
             start += len;
         }
     }
 
-    accumulated.ok_or_else(|| {
-        JammiError::FineTune(
+    if !any_grads {
+        return Err(JammiError::FineTune(
             "gradcache produced no gradients — no representation reached the loss".into(),
-        )
-    })
-}
-
-/// Merge a fresh [`GradStore`] into a running accumulator, summing per-var.
-/// Seeds the accumulator from the first store (candle's `GradStore::new` is
-/// private), matching the trainer's gradient-accumulation merge.
-fn merge_grads(
-    accumulated: Option<GradStore>,
-    fresh: GradStore,
-    trainable_vars: &[Var],
-) -> Result<GradStore> {
-    match accumulated {
-        None => Ok(fresh),
-        Some(mut acc) => {
-            for var in trainable_vars {
-                let t: &Tensor = var;
-                if let Some(g_new) = fresh.get(t) {
-                    if let Some(g_acc) = acc.remove(t) {
-                        let summed = (&g_acc + g_new)
-                            .map_err(|e| JammiError::FineTune(format!("gradcache merge: {e}")))?;
-                        acc.insert(t, summed);
-                    } else {
-                        acc.insert(t, g_new.clone());
-                    }
-                }
-            }
-            Ok(acc)
-        }
+        ));
     }
+    Ok(accumulated)
 }
 
 #[cfg(test)]

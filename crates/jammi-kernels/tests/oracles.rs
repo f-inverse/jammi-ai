@@ -872,11 +872,11 @@ fn softmax_scale_bwd_multiplies_raw_dscores_by_scale() {
 /// (a naive "same `scores`, different `scale`, dmask must match" claim
 /// would be mathematically wrong) -- the CORRECT claim, verified here, is
 /// that `dmask` from the scaled run matches `dmask` from an INDEPENDENT
-/// unscaled reference run evaluated AT THE SAME `pre_softmax` point
+/// unscaled reference run evaluated AT THE SAME pre-softmax point
 /// (pre-multiplied scores, `scale = 1.0`) -- i.e. `dmask` is exactly
 /// `mask_grad(d_pre_softmax)`, never further multiplied by `scale`, using
 /// the SAME "compare against an independent graph at the identical
-/// `pre_softmax` point" construction `softmax_scale_bwd_multiplies_raw_dscores_by_scale`
+/// pre-softmax point" construction `softmax_scale_bwd_multiplies_raw_dscores_by_scale`
 /// uses for `dscores`.
 #[test]
 fn softmax_scale_dmask_uses_unscaled_gradient_not_scaled() {
@@ -916,10 +916,10 @@ fn softmax_scale_dmask_uses_unscaled_gradient_not_scaled() {
     // The reference: an INDEPENDENT graph rooted at the ALREADY-scaled
     // scores (matching `pre_softmax = scale*scores` exactly), run through
     // the UNSCALED op (`scale = 1.0`) -- computes the IDENTICAL
-    // `pre_softmax` (hence the IDENTICAL `y`) the scaled run above
+    // pre-softmax value (hence the IDENTICAL `y`) the scaled run above
     // internally reaches, so `dmask` from this reference is directly
     // comparable, unlike a reference at the RAW (un-multiplied) `scores`
-    // (a different `pre_softmax` point entirely).
+    // (a different pre-softmax point entirely).
     let sv_scaled: Vec<f32> = sv.iter().map(|&v| v * scale as f32).collect();
     let scores_pre = Tensor::from_slice(&sv_scaled, (2, 4), &device).unwrap();
     let mask_ref = Var::from_tensor(&Tensor::from_slice(&mv, (1, 4), &device).unwrap()).unwrap();

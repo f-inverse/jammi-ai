@@ -143,7 +143,7 @@ pub(crate) static ROPE_DISPATCH_COUNTERS: LazyLock<&'static DispatchCounters> =
 /// Fused/eager dispatch counters for the ModernBERT attention softmax,
 /// read from the registry — mirroring `ROPE_DISPATCH_COUNTERS` /
 /// `crate::layer_norm::LN_DISPATCH_COUNTERS` — see
-/// `ModernBertAttention::softmax_apply`'s doc for the training-only gate
+/// [`softmax_apply_training`]'s doc for the training-only gate
 /// this counts. `pub(crate)` (not `pub`) — read via
 /// [`crate::softmax_dispatch_snapshot`], the same shape
 /// [`crate::rope_dispatch_snapshot`] / [`crate::ln_dispatch_snapshot`] use.
@@ -725,7 +725,12 @@ impl ModernBertAttention {
 /// violation, …) is numerically IDENTICAL to what this function computed
 /// before `scores_divisor` existed as a named parameter — the fallback
 /// is never a fourth numeric path, only the pre-existing training-eager
-/// composition.
+/// composition. This is a MEASURED claim, not an assertion: EVERY other
+/// test exercising this function is fused-eligible (none reaches this
+/// branch), so `tests::eager_fallback_softmax_matches_inline_reference_fwd_and_bwd`
+/// is the ONLY oracle that forces this arm and checks it fwd+bwd
+/// bit-for-bit against the inline composition this doc describes —
+/// mutation-verified (see that test's own doc).
 fn softmax_apply_training(
     scores: &Tensor,
     mask: &Tensor,
@@ -1913,6 +1918,165 @@ mod tests {
         for (i, (f, e)) in dxf.iter().zip(dxe.iter()).enumerate() {
             assert!((f - e).abs() < 1e-3, "dscores[{i}]: fused {f} vs eager {e}");
         }
+    }
+
+    /// Deletion-catching oracle for `softmax_apply_training`'s EAGER
+    /// FALLBACK arm -- the branch every OTHER test in this file skips
+    /// over, because every other fixture here is fused-eligible (three of
+    /// them assert the fused counter incremented: the two tests above and
+    /// `fused_training_softmax_call_site_drops_the_affine_node` below).
+    /// MUTATION-VERIFIED: replacing the eager arm's `scores /
+    /// scores_divisor` with `scores * scores_divisor` leaves every one of
+    /// those fused-path tests, and every other encoder test, green --
+    /// none of them ever reaches this branch -- while this test reddens
+    /// (see the commit message that introduced this test for the actual
+    /// mutate/run/revert record). This is what makes "the
+    /// fallback is never a fourth numeric path, only the pre-existing
+    /// training-eager composition" (`softmax_apply_training`'s own doc
+    /// comment above) a MEASURED claim rather than an assertion no test
+    /// actually exercises.
+    ///
+    /// Forces the eager arm via an admissible-by-construction domain miss
+    /// -- `scores` non-contiguous (`.t()` on a `Var`, transposing the
+    /// last two axes) -- rather than an env-var flip
+    /// (`JAMMI_KERNELS_STRICT`), which would mutate shared process state
+    /// a parallel test run could race on. `mask_broadcast_class`, dtype,
+    /// rank, and scale all still hold for this fixture, so
+    /// `scores_contiguous` is the ONLY predicate clause it fails --
+    /// confirmed below, not assumed.
+    ///
+    /// Production width, not the tiny `seq = 4` toy fixtures the tests
+    /// above use: `heads = 16`, `seq = 128` (one of `jammi-kernels`'s own
+    /// two production `seq` classes -- see `tests/cuda_parity.rs`'s
+    /// `SoftmaxLastDimFused CPU<->CUDA parity` section doc), `scale =
+    /// 8.0` (`sqrt(64)`, ModernBERT-large's real `head_dim`), and the
+    /// REAL `MASKED_LOGIT` mask convention
+    /// ([`crate::mask::MASKED_LOGIT`], not a synthetic `-10_000.0`
+    /// restated by hand) at a realistic padding density. F32, not BF16:
+    /// this oracle is about a gross divide-vs-multiply operator swap (any
+    /// finite `scale != 1.0` separates the two arithmetically at every
+    /// dtype), not the BF16 boundary-rounding hazard `ops/softmax.rs`'s
+    /// module doc discloses -- that hazard is a property of the FUSED
+    /// kernel's own rounding point, which this arm never reaches.
+    ///
+    /// Compares fwd AND bwd bit-for-bit (`assert_eq!`, not an epsilon
+    /// tolerance) against an INDEPENDENTLY-rooted inline
+    /// `candle_nn::ops::softmax((scores / scale) + mask)` composition --
+    /// on the same device, dtype, and deterministic CPU F32 ops, two runs
+    /// of the identical composition must reproduce identical bits, so
+    /// this is a measured claim ("numerically IDENTICAL to before"), not
+    /// an assertion.
+    #[test]
+    fn eager_fallback_softmax_matches_inline_reference_fwd_and_bwd() {
+        let device = Device::Cpu;
+        let batch = 2;
+        let heads = 16;
+        let seq = 128;
+        let scale = 8.0f64; // sqrt(64) -- ModernBERT-large's real head_dim.
+        let sv: Vec<f32> = (0..batch * heads * seq * seq)
+            .map(|i| (i as f32 * 0.017 - 5.0).sin() * 3.0)
+            .collect();
+        let mv: Vec<f32> = (0..batch * seq)
+            .map(|i| {
+                if i % 37 == 0 {
+                    crate::mask::MASKED_LOGIT
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+
+        let base_fn =
+            Var::from_tensor(&Tensor::from_slice(&sv, (batch, heads, seq, seq), &device).unwrap())
+                .unwrap();
+        let scores_fn = base_fn.as_tensor().t().unwrap();
+        assert!(
+            !scores_fn.is_contiguous(),
+            "fixture construction bug: `.t()` must produce a non-contiguous view"
+        );
+        let mask_fn = Tensor::from_slice(&mv, (batch, 1, 1, seq), &device).unwrap();
+
+        // Non-vacuity: this fixture must fail admission for EXACTLY the
+        // contiguity clause -- not some other domain check silently
+        // masking the one this test targets.
+        let (holds, predicate) = softmax_admission_predicate(&scores_fn, &mask_fn, scale);
+        assert!(!holds, "fixture must be refused admission");
+        assert_eq!(
+            predicate, "scores_contiguous",
+            "fixture must fail admission for non-contiguity specifically, not another clause"
+        );
+
+        let base_ref =
+            Var::from_tensor(&Tensor::from_slice(&sv, (batch, heads, seq, seq), &device).unwrap())
+                .unwrap();
+        let scores_ref = base_ref.as_tensor().t().unwrap();
+        let mask_ref = Tensor::from_slice(&mv, (batch, 1, 1, seq), &device).unwrap();
+
+        let before = SOFTMAX_DISPATCH_COUNTERS.snapshot();
+        let out_fn = softmax_apply_training(&scores_fn, &mask_fn, scale).unwrap();
+        let after = SOFTMAX_DISPATCH_COUNTERS.snapshot();
+        assert!(
+            after.eager > before.eager,
+            "this fixture must actually dispatch the EAGER fallback, or this oracle \
+             exercises nothing (before={before:?}, after={after:?})"
+        );
+
+        let out_ref = candle_nn::ops::softmax(
+            &(&scores_ref / scale)
+                .unwrap()
+                .broadcast_add(&mask_ref)
+                .unwrap(),
+            D::Minus1,
+        )
+        .unwrap();
+
+        let vf: Vec<f32> = out_fn.flatten_all().unwrap().to_vec1().unwrap();
+        let vr: Vec<f32> = out_ref.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(
+            vf.iter().any(|v| v.abs() > 1e-6),
+            "fixture must be non-degenerate"
+        );
+        assert_eq!(
+            vf, vr,
+            "eager-fallback forward must be BIT-IDENTICAL to the inline eager reference \
+             composition -- a mismatch here means the fallback arm no longer computes \
+             `(scores / scores_divisor) + mask` exactly"
+        );
+
+        // A NON-UNIFORM seed -- see `fused_training_softmax_matches_eager_fwd_and_bwd`
+        // above for why a uniform `dy` would make this comparison vacuous.
+        let dy_seed_v: Vec<f32> = (0..batch * heads * seq * seq)
+            .map(|i| (i as f32 * 0.023 - 1.0).cos())
+            .collect();
+        let dy_fn = Tensor::from_slice(&dy_seed_v, (batch, heads, seq, seq), &device).unwrap();
+        let dy_ref = Tensor::from_slice(&dy_seed_v, (batch, heads, seq, seq), &device).unwrap();
+        let loss_fn = (&out_fn * &dy_fn).unwrap().sum_all().unwrap();
+        let loss_ref = (&out_ref * &dy_ref).unwrap().sum_all().unwrap();
+        let grads_fn = loss_fn.backward().unwrap();
+        let grads_ref = loss_ref.backward().unwrap();
+        let dxf: Vec<f32> = grads_fn
+            .get(&base_fn)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let dxr: Vec<f32> = grads_ref
+            .get(&base_ref)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert!(
+            dxf.iter().any(|v| v.abs() > 1e-6),
+            "gradient must be measured-nonzero"
+        );
+        assert_eq!(
+            dxf, dxr,
+            "eager-fallback backward must be BIT-IDENTICAL to the inline eager \
+             reference's gradient"
+        );
     }
 
     /// NODE-COUNT PROXY for the training arm's memory win: the call site,

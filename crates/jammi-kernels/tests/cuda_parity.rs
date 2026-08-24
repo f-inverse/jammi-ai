@@ -1361,8 +1361,9 @@ fn softmax_parity_empty_batch() {
 // confounded by the `scale` field's own rounding (already proven exact
 // at this value in `tests/oracles.rs`'s CPU-hermetic legs); these legs
 // are specifically about the CUDA kernel's OWN `scale * scores[i] +
-// mask[i]` (F32) / `bf16_mul_rounded` + `bf16_add_rounded` (BF16)
-// arithmetic matching the CPU arm's — contiguous, narrowed-with-nonzero-
+// mask[i]` (F32) / softmax.cu's bf16_mul_rounded (softmax.cu:83) plus
+// bf16_add_rounded (softmax.cu:101) (BF16) arithmetic matching the CPU
+// arm's — contiguous, narrowed-with-nonzero-
 // offset, and BOTH production `seq` classes (128, 512).
 // =======================================================================
 
@@ -1695,8 +1696,8 @@ fn softmax_scale_parity_narrowed_with_nonzero_offset() {
 
 // =======================================================================
 // SoftmaxLastDimFused: CUDA-only, SAME-DEVICE BF16 bit-exactness for the
-// pre-mask-add rounding point (`bf16_mul_rounded`, `softmax.cu:83`, used
-// at `:272`/`:280`/`:287`). This is NOT a CPU<->CUDA parity check (every
+// pre-mask-add rounding point (softmax.cu's bf16_mul_rounded, softmax.cu:83,
+// used at softmax.cu:272/280/287). This is NOT a CPU<->CUDA parity check (every
 // leg above is) -- it compares fused-with-scale against
 // affine-then-fused-no-scale ENTIRELY ON CUDA, mirroring
 // `tests/oracles.rs`'s CPU-hermetic
@@ -1715,9 +1716,18 @@ fn softmax_scale_parity_narrowed_with_nonzero_offset() {
 // `bf16_mul_rounded(scores[i], scale)` FIRST, rounding to BF16, THEN
 // adding `mask[i]` and rounding again.
 //
-// Gated by `JAMMI_REQUIRE_CUDA` like every other test in this file (via
-// `cuda_device()`'s early return) -- cannot be run in this environment;
-// the lead runs it on the pod.
+// Only the head_dim=128 leg below (`scale = 1/sqrt(128)`, not exactly
+// representable in BF16 or F32) actually discriminates that mutation:
+// multiplying a BF16 value by an exact power of two (the head_dim=64
+// leg's `scale = 0.125 = 1/sqrt(64)`, ModernBERT-large's real production
+// value) only shifts the exponent, so `bf16_mul_rounded(s, 0.125)` is
+// exact and produces the IDENTICAL bit pattern whether or not the
+// intermediate round-after-multiply step runs -- the head_dim=64 leg
+// still proves CUDA/CPU-independent same-device bit-exactness at the real
+// production scale, but a mutant that drops the intermediate rounding
+// entirely passes it unchanged. Both legs are gated by
+// `JAMMI_REQUIRE_CUDA` like every other test in this file (via
+// `cuda_device()`'s early return).
 // =======================================================================
 
 /// A REL-POS-BIAS-shaped mask: small, continuous, NEVER `0.0` and NEVER

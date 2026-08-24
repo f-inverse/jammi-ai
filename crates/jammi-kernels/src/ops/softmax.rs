@@ -144,8 +144,8 @@
 //! itself, vs. `T::from_f64`'s own BF16 branch, which for `T = bf16` is
 //! `half::bf16::from_f64`. That function is NOT a round-to-nearest-even
 //! of the true infinite-precision `f64` value, despite reading as a
-//! "single rounding" from its signature: `half-2.7.1`'s own
-//! `f64_to_bf16` (`bfloat/convert.rs`) TRUNCATES the `f64` to its top 32
+//! "single rounding" from its signature: `half-2.7.1`'s own f64→bf16
+//! conversion (bfloat/convert.rs:26-40) TRUNCATES the `f64` to its top 32
 //! raw bits FIRST (discarding the low 32 mantissa bits outright — a
 //! round-TOWARD-ZERO step on that intermediate, not round-to-nearest),
 //! THEN rounds THAT truncated value to BF16 — genuinely different from
@@ -155,14 +155,13 @@
 //! For `scale = 1/sqrt(head_dim)`, MEASURED by
 //! `tests::scale_constant_bf16_max_1_ulp_across_head_dim_1_to_20000` in
 //! this module's own `mod tests` (the actual artifact) over `head_dim` in
-//! `1..=20_000`: the two paths do NOT agree bit-for-bit everywhere — an
-//! earlier version of this doc, and an earlier version of this same test,
-//! both wrongly claimed exact agreement (checked with a hand-rolled
-//! reference conversion that assumed true round-to-nearest-of-the-exact-
-//! value semantics for `bf16::from_f64`, which is not what `half` v2.7.1
-//! actually implements). The two paths disagree at EXACTLY 4 values in
-//! this range — `head_dim` `685`, `2740` (`= 4 * 685`), `10960` (`= 16 *
-//! 685`), and `15290` — each by exactly 1 ULP, the theoretical worst case
+//! `1..=20_000`: the two paths do NOT agree bit-for-bit everywhere —
+//! `half` v2.7.1's f64→bf16 conversion (bfloat/convert.rs:26-40)
+//! TRUNCATES the `f64` to its top 32 raw bits before rounding to BF16,
+//! which is not a round-to-nearest-even of the true infinite-precision
+//! value, so the two paths disagree at EXACTLY 4 values in this range —
+//! `head_dim` `685`, `2740` (`= 4 * 685`), `10960` (`= 16 * 685`), and
+//! `15290` — each by exactly 1 ULP, the theoretical worst case
 //! for one extra rounding step; the test bounds every value in the sweep
 //! at `<= 1` ULP and additionally pins this exact 4-element mismatch set,
 //! so a future `half` version or rustc change that moves either count is
@@ -557,8 +556,8 @@
 //! [`SoftmaxLastDimFused::with_scale`] is the ONLY constructor for a
 //! non-default `scale` and validates this, returning
 //! [`crate::error::KernelError::InvalidScale`] rather than accepting `0.0`
-//! (which would silently zero out `scores`'s own contribution to
-//! `pre_softmax`, making the op confidently compute a uniform-over-
+//! (which would silently zero out `scores`'s own contribution to the
+//! pre-softmax sum, making the op confidently compute a uniform-over-
 //! unmasked-positions distribution instead of erroring), a negative value
 //! (no meaning as an attention scale), or `NaN`/`±inf` (poisons every
 //! downstream reduction). This is NOT re-checked inside `cpu_fwd`/
@@ -1379,12 +1378,12 @@ mod tests {
     /// BF16-kernel rounding) agree bit-for-bit with `bf16::from_f64`, the
     /// path candle's own `Tensor::affine` takes on a BF16 tensor (via
     /// `WithDType`'s `bf16::from_f64` binding in `candle-core`'s
-    /// `dtype.rs`)? MEASURED over the swept range, not assumed -- and NOT
-    /// what an earlier version of this test claimed (exact agreement
-    /// everywhere): `half-2.7.1`'s `bf16::from_f64` (`f64_to_bf16`,
-    /// `bfloat/convert.rs`) TRUNCATES the f64 to its top 32 raw bits
-    /// FIRST, then rounds THAT truncated intermediate to BF16 -- not a
-    /// round-to-nearest-even of the true `f64` value despite the
+    /// `dtype.rs`)? MEASURED over the swept range, not assumed -- the two
+    /// paths do NOT agree bit-for-bit everywhere: `half-2.7.1`'s
+    /// `bf16::from_f64` (its f64→bf16 conversion, bfloat/convert.rs:26-40)
+    /// TRUNCATES the f64 to its top 32 raw bits FIRST, then rounds THAT
+    /// truncated intermediate to BF16 -- not a round-to-nearest-even of
+    /// the true `f64` value despite the
     /// "single-rounding" framing that name suggests, and genuinely
     /// different from this op's own `f64 -> f32` (`as f32`, a correctly-
     /// rounded IEEE cast) `-> bf16` path. The two paths disagree at

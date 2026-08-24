@@ -108,7 +108,12 @@ impl AnyEncoder {
             Self::Bert(e) => e.set_training(training),
             Self::DistilBert(e) => e.set_training(training),
             Self::ModernBert(e) => e.set_training(training),
-            Self::ClipText(_) => {}
+            // ClipText has no LoRA-wrapped params to gate, but its attention
+            // softmax still has a training-only differentiable arm (see
+            // `ClipText::set_training`'s doc) — forward the flag so backward
+            // through a frozen tower's activations stays correct even though
+            // no callers install trainable weights on it today.
+            Self::ClipText(e) => e.set_training(training),
         }
     }
 

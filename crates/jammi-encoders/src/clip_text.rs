@@ -113,6 +113,10 @@ struct MultiHeadAttention {
     out_proj: Linear,
     num_heads: usize,
     head_dim: usize,
+    /// Selects the softmax arm — see [`Self::forward`]'s doc for why the
+    /// two arms exist. Defaults to `false` (eval); flipped by
+    /// [`ClipText::set_training`].
+    training: bool,
 }
 
 impl MultiHeadAttention {
@@ -127,12 +131,39 @@ impl MultiHeadAttention {
             out_proj,
             num_heads,
             head_dim,
+            training: false,
         })
     }
 
     /// Causal self-attention. `causal_mask` is an additive `[seq, seq]` tensor
     /// with `0.0` at allowed positions and `-inf` (or large negative) at
     /// masked positions; it is broadcast over `[batch, heads]`.
+    ///
+    /// `candle_nn::ops::softmax_last_dim` is a `CustomOp1` registered with
+    /// `apply_op1_no_bwd` (candle-nn `ops.rs`), whose result carries
+    /// `BackpropOp::none()` — backward does not error on it, it just stops
+    /// traversing there. Through the `probs @ V` matmul the V-slice of this
+    /// block's fused `in_proj_weight` still receives a gradient (V sits
+    /// downstream of the softmax, not upstream), so the observable is not a
+    /// crash but a silently WRONG gradient: the Q and K slices of
+    /// `in_proj_weight` come back exactly zero. `training=true` therefore
+    /// routes through `candle_nn::ops::softmax`, the ordinary differentiable
+    /// max/sub/exp/sum/div composition — same arm ModernBERT's attention
+    /// uses for the same reason.
+    ///
+    /// This flag is load-bearing on CUDA: candle's fused softmax kernel and
+    /// the composed primitive-op reduction can differ in fold order there.
+    /// On CPU the two arms are bit-identical (measured 0/N differing mantissa
+    /// bits at f32 and bf16 on representative window shapes — see
+    /// `tests::softmax_last_dim_and_composed_softmax_are_cpu_bit_identical`),
+    /// so `training=false` costs nothing to keep byte-identical to today's
+    /// eval path.
+    ///
+    /// No caller in this codebase can set `training=true` on a `ClipText`
+    /// tower today (`CandleVisionForward`/`CandleAudioForward` towers are
+    /// reached through `&self` trait objects behind `Arc<LoadedModel>`, and
+    /// the `AnyEncoder::ClipText` arm reports zero trainable params). The
+    /// flag exists so the tower is trainable-CORRECT for when a caller does.
     fn forward(&self, x: &Tensor, causal_mask: &Tensor) -> Result<Tensor, EncoderError> {
         let (batch, seq_len, _) = x.dims3()?;
         let qkv = self.in_proj.forward(x)?;
@@ -147,7 +178,11 @@ impl MultiHeadAttention {
         let attn_scores =
             (crate::contiguous_matmul(&q, &k.transpose(D::Minus2, D::Minus1)?)? / scale)?;
         let attn_scores = attn_scores.broadcast_add(causal_mask)?;
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_scores)?;
+        let attn_weights = if self.training {
+            candle_nn::ops::softmax(&attn_scores, D::Minus1)?
+        } else {
+            candle_nn::ops::softmax_last_dim(&attn_scores)?
+        };
         let attn_output = crate::contiguous_matmul(&attn_weights, &v)?;
 
         let attn_output = attn_output.permute((0, 2, 1, 3))?.reshape((
@@ -157,6 +192,10 @@ impl MultiHeadAttention {
         ))?;
 
         Ok(self.out_proj.forward(&attn_output)?)
+    }
+
+    fn set_training(&mut self, training: bool) {
+        self.training = training;
     }
 }
 
@@ -214,6 +253,10 @@ impl ResidualAttentionBlock {
         let x = self.ln_2.forward(&x)?;
         let x = self.mlp.forward(&x)?;
         Ok((residual + x)?)
+    }
+
+    fn set_training(&mut self, training: bool) {
+        self.attn.set_training(training);
     }
 }
 
@@ -345,6 +388,17 @@ impl ClipText {
     pub fn context_length(&self) -> usize {
         self.config.context_length
     }
+
+    /// Switch every block's attention softmax between the eval (no-backward)
+    /// arm and the differentiable composed arm — see
+    /// [`MultiHeadAttention::forward`]'s doc for why the two arms exist. Eval
+    /// output is unaffected either way; only backward through this tower's
+    /// gradient is correct in training mode.
+    pub fn set_training(&mut self, training: bool) {
+        for block in &mut self.blocks {
+            block.set_training(training);
+        }
+    }
 }
 
 /// Build the `[size, size]` additive causal mask: `0.0` on and below the
@@ -388,7 +442,7 @@ fn l2_normalize(t: &Tensor) -> Result<Tensor, EncoderError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::{DType, Device};
+    use candle_core::{DType, Device, Var};
     use candle_nn::VarMap;
 
     /// Replace every variable in `varmap` with a random tensor of the same
@@ -400,6 +454,67 @@ mod tests {
             let random = Tensor::randn(0f32, 0.1, shape, device).unwrap();
             var.set(&random).unwrap();
         }
+    }
+
+    /// Deterministic (non-RNG) fill: every variable gets values from a fixed
+    /// LCG walk over a stably-ordered (sorted-by-key) variable list, so two
+    /// independent test functions that each build a fresh `VarMap` land on
+    /// bit-identical weights — required for the training/eval defect-shape
+    /// pair below, which must observe the SAME fixture from two separate
+    /// `#[test]` functions.
+    fn deterministic_fill_varmap(varmap: &VarMap, device: &Device) {
+        let mut state: u32 = 1;
+        let data = varmap.data().lock().unwrap();
+        let mut entries: Vec<_> = data.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (_, var) in entries {
+            let shape = var.shape().clone();
+            let n = shape.elem_count();
+            let values: Vec<f32> = (0..n)
+                .map(|_| {
+                    // glibc-style LCG; deterministic, no external RNG/seed state.
+                    state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                    let unit = (state >> 8) as f32 / (1u32 << 24) as f32; // [0, 1)
+                    (unit - 0.5) * 0.2 // [-0.1, 0.1)
+                })
+                .collect();
+            var.set(&Tensor::from_vec(values, shape, device).unwrap())
+                .unwrap();
+        }
+    }
+
+    /// Locate the [`Var`] whose VarMap key ends with `suffix` (VarBuilder
+    /// keys are dot-joined paths, e.g. `transformer.resblocks.0.attn.in_proj_weight`).
+    fn find_var(varmap: &VarMap, suffix: &str) -> Var {
+        let data = varmap.data().lock().unwrap();
+        data.iter()
+            .find(|(k, _)| k.ends_with(suffix))
+            .unwrap_or_else(|| {
+                let keys: Vec<_> = data.keys().collect();
+                panic!("no var with suffix '{suffix}' in varmap; keys: {keys:?}")
+            })
+            .1
+            .clone()
+    }
+
+    /// Fixed (non-random) 2-sequence batch, EOT (highest ID) trailing padding
+    /// on the second row, for the training/eval backward tests.
+    fn fixed_batch(cfg: &ClipTextConfig, device: &Device) -> (Tensor, Tensor) {
+        let ids: Vec<u32> = vec![
+            1,
+            2,
+            3,
+            4,
+            (cfg.vocab_size - 1) as u32, // EOT at index 4
+            5,
+            6,
+            (cfg.vocab_size - 1) as u32,
+            0,
+            0, // EOT at index 2, padded
+        ];
+        let input_ids = Tensor::from_vec(ids, (2, 5), device).unwrap();
+        let mask = Tensor::ones((2, 5), DType::U32, device).unwrap();
+        (input_ids, mask)
     }
 
     fn tiny_config() -> ClipTextConfig {
@@ -506,6 +621,243 @@ mod tests {
                 assert_eq!(max, cfg.context_length);
             }
             other => panic!("expected SequenceTooLong, got {other:?}"),
+        }
+    }
+
+    /// L2 norm of a `[rows, width]` sub-block of a `[3*width, width]`
+    /// `in_proj_weight` gradient, addressing the Q/K/V slice by row range.
+    fn slice_grad_norm(grad: &Tensor, row_start: usize, width: usize) -> f32 {
+        let rows = grad.to_vec2::<f32>().unwrap();
+        rows[row_start..row_start + width]
+            .iter()
+            .flatten()
+            .map(|v| v * v)
+            .sum::<f32>()
+            .sqrt()
+    }
+
+    /// Non-uniform per-`embed_dim` weights so `loss = (out * weights).sum()`
+    /// cannot accidentally cancel a broken (e.g. sign-flipped or transposed)
+    /// gradient reduction the way a uniform-weight sum could.
+    fn nonuniform_loss(out: &Tensor, embed_dim: usize, device: &Device) -> Tensor {
+        let weights: Vec<f32> = (0..embed_dim).map(|i| 1.0 + i as f32 * 0.37).collect();
+        let weights = Tensor::from_vec(weights, embed_dim, device).unwrap();
+        out.broadcast_mul(&weights).unwrap().sum_all().unwrap()
+    }
+
+    /// Run token embedding + positional embedding + ONLY block 0 (not the
+    /// whole tower) and return `(in_proj_weight grad, token_embedding grad)`.
+    ///
+    /// This deliberately stops short of `ClipText::forward`'s `ln_final` /
+    /// EOT-gather / `text_projection` tail. `candle_nn::LayerNorm`'s own
+    /// fused kernel (`candle_nn::ops::layer_norm`, `apply_op3_no_bwd`) is a
+    /// SEPARATE `BackpropOp::none()` truncation — the same family of defect
+    /// as `softmax_last_dim` but affecting normalization, not attention, and
+    /// out of scope for this fix. Because it sits AFTER every block, routing
+    /// the loss through it (i.e. through `ClipText::forward`'s public output)
+    /// severs backward before it reaches ANY block parameter, independent of
+    /// the softmax arm under test here — it would make both the training and
+    /// eval oracles below vacuously pass (no gradient at all, in either
+    /// mode). Stopping at block 0's own output keeps the softmax defect
+    /// isolated and observable: block-internal residual connections
+    /// (`shortcut + attn`, `hidden + mlp_out`) keep the gradient path to
+    /// `token_embedding` and to the V-slice of `in_proj_weight` alive
+    /// regardless of `ln_1`/`ln_2`'s OWN truncation, exactly as the
+    /// `probs @ V` matmul keeps V alive despite `softmax_last_dim`'s.
+    fn block0_backward(
+        model: &ClipText,
+        varmap: &VarMap,
+        input_ids: &Tensor,
+        device: &Device,
+    ) -> (Option<Tensor>, Option<Tensor>) {
+        let seq = input_ids.dim(1).unwrap();
+        let token_emb = model.token_embedding.forward(input_ids).unwrap();
+        let pos_emb = model.positional_embedding.i((..seq, ..)).unwrap();
+        let x = token_emb.broadcast_add(&pos_emb).unwrap();
+        let causal = model.causal_mask.i((..seq, ..seq)).unwrap();
+        let block0_out = model.blocks[0].forward(&x, &causal).unwrap();
+
+        let loss = nonuniform_loss(&block0_out, model.hidden_size(), device);
+        let grads = loss.backward().unwrap();
+
+        let in_proj_weight = find_var(varmap, "resblocks.0.attn.in_proj_weight");
+        let token_embedding = find_var(varmap, "token_embedding.weight");
+        (
+            grads.get(in_proj_weight.as_tensor()).cloned(),
+            grads.get(token_embedding.as_tensor()).cloned(),
+        )
+    }
+
+    /// RED oracle: fails if `MultiHeadAttention::forward`'s training arm is
+    /// reverted to `softmax_last_dim` (or if `ClipText::set_training` stops
+    /// propagating down to the attention module) — under either regression
+    /// the Q/K slices of `in_proj_weight` come back exactly zero here, same
+    /// as the companion eval-mode test below. Measured on this fixture: Q/K
+    /// slice norms are small but strictly positive (softmax's Jacobian damps
+    /// them relative to V's direct linear pass-through) — e.g. ~5e-4 / ~1.6e-3
+    /// against V's ~7.5, never exactly `0.0` the way eval's are.
+    #[test]
+    fn training_true_backward_gives_nonzero_grad_to_q_k_and_v_slices() {
+        let cfg = tiny_config();
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let mut model = ClipText::load(vb, &cfg).unwrap();
+        deterministic_fill_varmap(&varmap, &device);
+        model.set_training(true);
+
+        let (input_ids, _mask) = fixed_batch(&cfg, &device);
+        let (in_proj_grad, token_embedding_grad) =
+            block0_backward(&model, &varmap, &input_ids, &device);
+
+        let grad = in_proj_grad.expect("in_proj_weight must have a gradient under training=true");
+        let width = cfg.width;
+        let q_norm = slice_grad_norm(&grad, 0, width);
+        let k_norm = slice_grad_norm(&grad, width, width);
+        let v_norm = slice_grad_norm(&grad, 2 * width, width);
+
+        assert!(
+            q_norm > 0.0,
+            "Q slice grad norm must be nonzero, got {q_norm}"
+        );
+        assert!(
+            k_norm > 0.0,
+            "K slice grad norm must be nonzero, got {k_norm}"
+        );
+        assert!(
+            v_norm > 0.0,
+            "V slice grad norm (positive control) must be nonzero, got {v_norm}"
+        );
+        assert!(
+            token_embedding_grad.is_some(),
+            "token embedding grad must be Some under training=true"
+        );
+    }
+
+    /// Documents the defect shape on the SAME fixture as
+    /// [`training_true_backward_gives_nonzero_grad_to_q_k_and_v_slices`]:
+    /// eval's `softmax_last_dim` (`BackpropOp::none()`) truncates backward
+    /// before it ever reaches Q/K, but V still receives a gradient through
+    /// the untouched `probs @ V` matmul — a silently WRONG (partially zero),
+    /// not erroring, gradient. This test is independent of the training-arm
+    /// fix (eval always uses `softmax_last_dim`), so it stays green even
+    /// under the fix-verifier's revert; paired with the test above it also
+    /// catches a dropped `set_training` propagation line (that regression
+    /// would flip the OTHER test red instead, since eval's own arm never
+    /// changes). Measured on this fixture: Q/K slice norms are exactly
+    /// `0.0`; V's is ~7.5 (unchanged from the training=true measurement,
+    /// since V's path never crosses the truncation either way).
+    #[test]
+    fn training_false_q_and_k_grad_are_exactly_zero_v_nonzero() {
+        let cfg = tiny_config();
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let model = ClipText::load(vb, &cfg).unwrap();
+        deterministic_fill_varmap(&varmap, &device);
+        // training defaults to false; forward without calling set_training.
+
+        let (input_ids, _mask) = fixed_batch(&cfg, &device);
+        let (in_proj_grad, token_embedding_grad) =
+            block0_backward(&model, &varmap, &input_ids, &device);
+
+        let grad = in_proj_grad.expect("in_proj_weight still gets a (partial) gradient under eval");
+        let width = cfg.width;
+        let q_norm = slice_grad_norm(&grad, 0, width);
+        let k_norm = slice_grad_norm(&grad, width, width);
+        let v_norm = slice_grad_norm(&grad, 2 * width, width);
+
+        assert_eq!(q_norm, 0.0, "Q slice grad must be exactly zero under eval");
+        assert_eq!(k_norm, 0.0, "K slice grad must be exactly zero under eval");
+        assert!(
+            v_norm > 0.0,
+            "V slice grad (positive control) must be nonzero under eval, got {v_norm}"
+        );
+        assert!(
+            token_embedding_grad.is_some(),
+            "token embedding grad is still reachable via the block's residual stream under eval \
+             (only Q/K are severed by softmax_last_dim, not the whole graph)"
+        );
+    }
+
+    /// Eval output is unaffected by ever having toggled training on and back
+    /// off: the two arms are only wired into the *backward* path, so the
+    /// eval-mode forward is byte-identical before any `set_training` call and
+    /// after `set_training(true); set_training(false)`. Masks in this tower
+    /// are hardcoded F32 (`build_causal_mask`), so this oracle stays f32-only
+    /// — no bf16 variant is meaningful here.
+    #[test]
+    fn eval_output_is_bit_identical_across_a_training_toggle_round_trip() {
+        let cfg = tiny_config();
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let mut model = ClipText::load(vb, &cfg).unwrap();
+        deterministic_fill_varmap(&varmap, &device);
+
+        let (input_ids, mask) = fixed_batch(&cfg, &device);
+
+        let before = model.forward(&input_ids, &mask).unwrap();
+        model.set_training(true);
+        model.set_training(false);
+        let after = model.forward(&input_ids, &mask).unwrap();
+
+        assert_eq!(
+            before.to_vec2::<f32>().unwrap(),
+            after.to_vec2::<f32>().unwrap(),
+            "eval output must be bit-identical across a training toggle round trip"
+        );
+    }
+
+    /// `softmax_last_dim`'s fused CUSTOM-OP kernel and the composed
+    /// max/sub/exp/sum/div `softmax` are bit-identical on CPU — the reason
+    /// `training=false` is free to keep byte-identical to today's eval path.
+    /// Only CUDA's fused softmax kernel may fold in a different reduction
+    /// order (the training flag is load-bearing there, not here).
+    #[test]
+    fn softmax_last_dim_and_composed_softmax_are_cpu_bit_identical() {
+        let device = Device::Cpu;
+        for (rows, cols) in [(8usize, 512usize), (64, 64)] {
+            let mut state: u32 = 7;
+            let n = rows * cols;
+            let values: Vec<f32> = (0..n)
+                .map(|_| {
+                    state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                    let unit = (state >> 8) as f32 / (1u32 << 24) as f32;
+                    (unit - 0.5) * 20.0 // wide range to exercise the max-shift
+                })
+                .collect();
+            let x = Tensor::from_vec(values, (rows, cols), &device).unwrap();
+
+            let fused = candle_nn::ops::softmax_last_dim(&x).unwrap();
+            let composed = candle_nn::ops::softmax(&x, D::Minus1).unwrap();
+            assert_eq!(
+                fused.to_vec2::<f32>().unwrap(),
+                composed.to_vec2::<f32>().unwrap(),
+                "f32 [{rows},{cols}]: fused vs composed softmax must be bit-identical on CPU"
+            );
+
+            let x_bf16 = x.to_dtype(DType::BF16).unwrap();
+            let fused_bf16 = candle_nn::ops::softmax_last_dim(&x_bf16).unwrap();
+            let composed_bf16 = candle_nn::ops::softmax(&x_bf16, D::Minus1).unwrap();
+            let fused_bits: Vec<u16> = fused_bf16
+                .to_vec2::<half::bf16>()
+                .unwrap()
+                .into_iter()
+                .flatten()
+                .map(|v| v.to_bits())
+                .collect();
+            let composed_bits: Vec<u16> = composed_bf16
+                .to_vec2::<half::bf16>()
+                .unwrap()
+                .into_iter()
+                .flatten()
+                .map(|v| v.to_bits())
+                .collect();
+            assert_eq!(
+                fused_bits, composed_bits,
+                "bf16 [{rows},{cols}]: fused vs composed softmax must be bit-identical on CPU"
+            );
         }
     }
 }

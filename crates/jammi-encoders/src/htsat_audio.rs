@@ -531,6 +531,10 @@ struct SwinSelfAttention {
     rel_index: Tensor,
     num_heads: usize,
     head_size: usize,
+    /// Selects the softmax arm — see [`Self::forward`]'s doc for why the two
+    /// arms exist. Defaults to `false` (eval); flipped by
+    /// [`HtsatAudio::set_training`].
+    training: bool,
 }
 
 impl SwinSelfAttention {
@@ -556,6 +560,7 @@ impl SwinSelfAttention {
             rel_index,
             num_heads,
             head_size: dim / num_heads,
+            training: false,
         })
     }
 
@@ -593,6 +598,35 @@ impl SwinSelfAttention {
     /// `hidden`: `[B*nW, L, C]` (`L = ws·ws` tokens per window); `mask`: optional
     /// `[nW, L, L]`; `num_windows` is nW (needed to fold the mask over the batch
     /// axis).
+    ///
+    /// `candle_nn::ops::softmax_last_dim` is a `CustomOp1` registered with
+    /// `apply_op1_no_bwd`, whose result carries `BackpropOp::none()` —
+    /// backward does not error on it, it just stops traversing there.
+    /// `query`/`key` (and, most starkly, `rel_bias_table`) sit EXCLUSIVELY
+    /// upstream of this softmax: `rel_bias_table` is read only at the
+    /// index-select/reshape/permute above that feeds `scores`, with no other
+    /// use anywhere in the tower. With no other path ever contributing to its
+    /// gradient accumulator, `grads.get(&rel_bias_table_var)` comes back
+    /// `None` under eval, not merely zero — a strictly worse failure mode
+    /// than CLIP's fused-QKV case (there, V's surviving path at least forces
+    /// the shared `in_proj_weight` accumulator to exist, so Q/K only read
+    /// back as zero rows of it). `training=true` routes through
+    /// `candle_nn::ops::softmax`, the ordinary differentiable max/sub/exp/
+    /// sum/div composition — same arm ModernBERT's attention uses.
+    ///
+    /// This flag is load-bearing on CUDA: candle's fused softmax kernel and
+    /// the composed primitive-op reduction can differ in fold order there.
+    /// On CPU the two arms are bit-identical (measured 0/N differing
+    /// mantissa bits — see
+    /// `tests::softmax_last_dim_and_composed_softmax_are_cpu_bit_identical`
+    /// in `clip_text.rs`, which covers both towers' shared claim), so
+    /// `training=false` costs nothing to keep byte-identical to today's eval
+    /// path.
+    ///
+    /// No caller in this codebase can set `training=true` on an `HtsatAudio`
+    /// tower today (`CandleAudioForward` towers are reached through `&self`
+    /// trait objects behind `Arc<LoadedModel>`). The flag exists so the
+    /// tower is trainable-CORRECT for when a caller does.
     fn forward(
         &self,
         hidden: &Tensor,
@@ -629,10 +663,18 @@ impl SwinSelfAttention {
             None => scores,
         };
 
-        let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+        let probs = if self.training {
+            candle_nn::ops::softmax(&scores, D::Minus1)?
+        } else {
+            candle_nn::ops::softmax_last_dim(&scores)?
+        };
         let ctx = crate::contiguous_matmul(&probs, &v)?; // [BnW, heads, L, head]
         let ctx = ctx.transpose(1, 2)?.contiguous()?.reshape((bnw, l, c))?;
         Ok(ctx)
+    }
+
+    fn set_training(&mut self, training: bool) {
+        self.training = training;
     }
 }
 
@@ -805,6 +847,10 @@ impl SwinBlock {
         let y = self.output.forward(&y)?;
         Ok((&hidden + y)?)
     }
+
+    fn set_training(&mut self, training: bool) {
+        self.attention.set_training(training);
+    }
 }
 
 /// Swin patch-merging downsample: `2×` spatial reduction with a `4C → 2C`
@@ -893,6 +939,12 @@ impl SwinStage {
             None
         };
         Ok(Self { blocks, downsample })
+    }
+
+    fn set_training(&mut self, training: bool) {
+        for block in &mut self.blocks {
+            block.set_training(training);
+        }
     }
 }
 
@@ -1122,6 +1174,14 @@ impl HtsatAudioEncoder {
     pub fn grid(&self) -> (usize, usize) {
         self.grid
     }
+
+    /// Propagate the training flag to every stage's blocks — see
+    /// [`SwinSelfAttention::forward`]'s doc for why the flag exists.
+    fn set_training(&mut self, training: bool) {
+        for stage in &mut self.stages {
+            stage.set_training(training);
+        }
+    }
 }
 
 /// The per-boundary activations produced while running the Swin spine, captured
@@ -1240,6 +1300,16 @@ impl HtsatAudio {
         &self.projection
     }
 
+    /// Switch every Swin block's attention softmax between the eval
+    /// (no-backward) arm and the differentiable composed arm — see
+    /// [`SwinSelfAttention::forward`]'s doc for why the two arms exist. Eval
+    /// output is unaffected either way; only backward through this tower's
+    /// gradient (most visibly `rel_bias_table`, which otherwise gets no
+    /// gradient at all) is correct in training mode.
+    pub fn set_training(&mut self, training: bool) {
+        self.encoder.set_training(training);
+    }
+
     /// Full forward on `input_features` `[B, 4, T, num_mel_bins]` (any T), with
     /// the per-sample `is_longer` fusion gate, returning the L2-normalized audio
     /// embedding `[B, projection_dim]`.
@@ -1261,7 +1331,250 @@ impl HtsatAudio {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::Device;
+    use candle_core::{DType, Device, Var};
+    use candle_nn::VarMap;
+
+    /// Deterministic (non-RNG) fill, identical LCG scheme to
+    /// `clip_text::tests::deterministic_fill_varmap` — see that doc for why
+    /// this must be reproducible rather than seeded-RNG.
+    fn deterministic_fill_varmap(varmap: &VarMap, device: &Device) {
+        let mut state: u32 = 1;
+        let data = varmap.data().lock().unwrap();
+        let mut entries: Vec<_> = data.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (_, var) in entries {
+            let shape = var.shape().clone();
+            let n = shape.elem_count();
+            let values: Vec<f32> = (0..n)
+                .map(|_| {
+                    state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                    let unit = (state >> 8) as f32 / (1u32 << 24) as f32;
+                    (unit - 0.5) * 0.2
+                })
+                .collect();
+            var.set(&Tensor::from_vec(values, shape, device).unwrap())
+                .unwrap();
+        }
+    }
+
+    /// Locate the [`Var`] whose VarMap key ends with `suffix`.
+    fn find_var(varmap: &VarMap, suffix: &str) -> Var {
+        let data = varmap.data().lock().unwrap();
+        data.iter()
+            .find(|(k, _)| k.ends_with(suffix))
+            .unwrap_or_else(|| {
+                let keys: Vec<_> = data.keys().collect();
+                panic!("no var with suffix '{suffix}' in varmap; keys: {keys:?}")
+            })
+            .1
+            .clone()
+    }
+
+    /// Deterministic `[rows, cols]` tensor via the same LCG, wide enough
+    /// (`[-10, 10)`) to exercise the softmax max-shift and window-mask paths.
+    fn deterministic_tensor(rows: usize, cols: usize, seed: u32, device: &Device) -> Tensor {
+        let mut state = seed;
+        let n = rows * cols;
+        let values: Vec<f32> = (0..n)
+            .map(|_| {
+                state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                let unit = (state >> 8) as f32 / (1u32 << 24) as f32;
+                (unit - 0.5) * 20.0
+            })
+            .collect();
+        Tensor::from_vec(values, (rows, cols), device).unwrap()
+    }
+
+    /// Non-uniform per-channel weights so `loss = (out * weights).sum()`
+    /// cannot accidentally cancel a broken gradient reduction the way a
+    /// uniform-weight sum could.
+    fn nonuniform_loss(out: &Tensor, channels: usize, device: &Device) -> Tensor {
+        let weights: Vec<f32> = (0..channels).map(|i| 1.0 + i as f32 * 0.37).collect();
+        let weights = Tensor::from_vec(weights, channels, device).unwrap();
+        out.broadcast_mul(&weights).unwrap().sum_all().unwrap()
+    }
+
+    /// A minimal config exercising a `SwinStage` directly: `window_size=2`
+    /// against a `4×4` grid (`min(4,4) > window_size`) forces `shift_size=0`
+    /// on block 0 (W-MSA) and `shift_size=window/2=1` on block 1 (SW-MSA,
+    /// masked) — both attention arms in one 2-block stage.
+    fn tiny_stage_config() -> HtsatAudioConfig {
+        HtsatAudioConfig {
+            depths: vec![2],
+            num_attention_heads: vec![2],
+            window_size: 2,
+            spec_size: 8,
+            patch_size: 4,
+            patch_stride: [4, 4],
+            num_mel_bins: 8,
+            patch_embeds_hidden_size: 8,
+            hidden_size: 8,
+            mlp_ratio: 2.0,
+            projection_dim: 8,
+            projection_hidden_act: "relu".to_string(),
+            hidden_act: "gelu".to_string(),
+            layer_norm_eps: 1e-5,
+            enable_fusion: false,
+            patch_embed_input_channels: 1,
+            aff_block_r: 4,
+            enable_patch_layer_norm: true,
+            flatten_patch_embeds: true,
+            qkv_bias: true,
+        }
+    }
+
+    /// Build a 2-block `SwinStage` (`[4,4]` grid, `dim=8`, `heads=2`): block 0
+    /// is W-MSA (`shift_size=0`, unmasked), block 1 is SW-MSA
+    /// (`shift_size=1`, masked) — both attention arms in one stage.
+    fn build_tiny_stage(varmap: &VarMap, device: &Device) -> SwinStage {
+        let cfg = tiny_stage_config();
+        let vb = VarBuilder::from_varmap(varmap, DType::F32, device);
+        SwinStage::load(vb, &cfg, 8, 2, 2, (4, 4), false, device).unwrap()
+    }
+
+    /// Run `stage`'s blocks sequentially on a FIXED (non-`Var`) input tensor
+    /// and return each block's `rel_bias_table` gradient plus the final
+    /// output.
+    ///
+    /// `hidden` is deliberately a plain tensor with no computation history
+    /// (not derived from any VarMap leaf): `SwinBlock::forward`'s residual
+    /// connections make each block's OWN in-block leaf weights (query, key,
+    /// value, `rel_bias_table`, `attention_output`) independently reachable
+    /// from a downstream loss regardless of whether `hidden` itself is
+    /// tracked — see [`SwinSelfAttention::forward`]'s doc: `rel_bias_table`'s
+    /// reachability is a purely LOCAL property of the softmax arm, not of
+    /// what feeds the block. This sidesteps HTSAT's SEPARATE, out-of-scope
+    /// `candle_nn::LayerNorm` `BackpropOp::none()` truncation (its own
+    /// `norm`/`layernorm_before`/`layernorm_after`/`PatchMerging::norm`),
+    /// which would otherwise sever backward the moment the loss is routed
+    /// through the tower's FINAL norm or a cross-stage `PatchMerging`
+    /// downsample — this test stays scoped to a single stage's own blocks
+    /// rather than the full `HtsatAudio::forward` for exactly that reason.
+    fn run_stage_backward(
+        stage: &SwinStage,
+        varmap: &VarMap,
+        device: &Device,
+    ) -> (Vec<Option<Tensor>>, Tensor) {
+        let hidden = deterministic_tensor(16, 8, 11, device)
+            .reshape((1, 16, 8))
+            .unwrap();
+        let mut x = hidden;
+        for block in &stage.blocks {
+            x = block.forward(&x).unwrap();
+        }
+        let loss = nonuniform_loss(&x, 8, device);
+        let grads = loss.backward().unwrap();
+
+        let rel_bias_grads = (0..stage.blocks.len())
+            .map(|i| {
+                let var = find_var(
+                    varmap,
+                    &format!("blocks.{i}.attention.self.relative_position_bias_table"),
+                );
+                grads.get(var.as_tensor()).cloned()
+            })
+            .collect();
+        (rel_bias_grads, x)
+    }
+
+    /// RED oracle: fails if `SwinSelfAttention::forward`'s training arm is
+    /// reverted to `softmax_last_dim` (or if `HtsatAudio::set_training`'s
+    /// propagation down to `SwinStage`/`SwinBlock` is dropped) — under
+    /// either regression `rel_bias_table`'s gradient comes back `None` for
+    /// every block, same as the companion eval-mode test below. Exercises
+    /// BOTH attention arms: block 0 is W-MSA (`shift_size=0`, unmasked),
+    /// block 1 is SW-MSA (`shift_size=1`, masked).
+    #[test]
+    fn training_true_rel_bias_table_grad_is_some_for_every_block() {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let mut stage = build_tiny_stage(&varmap, &device);
+        deterministic_fill_varmap(&varmap, &device);
+        stage.set_training(true);
+
+        let (rel_bias_grads, _) = run_stage_backward(&stage, &varmap, &device);
+        for (i, grad) in rel_bias_grads.iter().enumerate() {
+            let g = grad.as_ref().unwrap_or_else(|| {
+                panic!("block {i}: rel_bias_table grad must be Some under training=true")
+            });
+            let norm: f32 = g
+                .sqr()
+                .unwrap()
+                .sum_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap()
+                .sqrt();
+            assert!(
+                norm > 0.0,
+                "block {i}: rel_bias_table grad norm must be nonzero, got {norm}"
+            );
+        }
+    }
+
+    /// Documents the defect shape on the SAME fixture as
+    /// [`training_true_rel_bias_table_grad_is_some_for_every_block`]: eval's
+    /// `softmax_last_dim` never records a link back to `rel_bias_table` (its
+    /// ONLY use anywhere in the tower — see `SwinSelfAttention::forward`'s
+    /// doc), so `grads.get` comes back `None`, not zero — a step worse than
+    /// CLIP's shared-weight case, where V's surviving path at least forces
+    /// the accumulator to exist. Independent of the training-arm fix (eval
+    /// always uses `softmax_last_dim`), so this stays green under the
+    /// fix-verifier's revert; paired with the test above it also catches a
+    /// dropped `set_training` propagation line.
+    #[test]
+    fn training_false_rel_bias_table_grad_is_none_for_every_block() {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let stage = build_tiny_stage(&varmap, &device);
+        deterministic_fill_varmap(&varmap, &device);
+        // training defaults to false; forward without calling set_training.
+
+        let (rel_bias_grads, _) = run_stage_backward(&stage, &varmap, &device);
+        for (i, grad) in rel_bias_grads.iter().enumerate() {
+            assert!(
+                grad.is_none(),
+                "block {i}: rel_bias_table grad must be None under eval (its only use is upstream \
+                 of softmax_last_dim, which records no backward link at all)"
+            );
+        }
+    }
+
+    /// Eval output is unaffected by ever having toggled training on and back
+    /// off: the two softmax arms are only wired into the *backward* path, so
+    /// the eval-mode forward is byte-identical before any `set_training`
+    /// call and after `set_training(true); set_training(false)`. Uses a
+    /// VarMap-backed tower sized by the real `htsat_clap_tiny` config (not
+    /// the minimal `tiny_stage_config` above) so this exercises the full
+    /// front-half + all four Swin stages + patch-merging + pooling +
+    /// projection, not just one stage. Masks in this tower are hardcoded F32
+    /// (`build_attn_mask`), so this oracle stays f32-only.
+    #[test]
+    fn eval_output_is_bit_identical_across_a_training_toggle_round_trip() {
+        let device = Device::Cpu;
+        let cfg = HtsatAudioConfig::from_hf_clap_config(&fixture_config()).unwrap();
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let mut tower = HtsatAudio::load(vb, &cfg, &device).unwrap();
+        deterministic_fill_varmap(&varmap, &device);
+
+        let t = 40;
+        let input = deterministic_tensor(4 * t, cfg.num_mel_bins, 99, &device)
+            .reshape((1, 4, t, cfg.num_mel_bins))
+            .unwrap();
+        let is_longer = [true];
+
+        let before = tower.forward(&input, &is_longer).unwrap();
+        tower.set_training(true);
+        tower.set_training(false);
+        let after = tower.forward(&input, &is_longer).unwrap();
+
+        assert_eq!(
+            before.to_vec2::<f32>().unwrap(),
+            after.to_vec2::<f32>().unwrap(),
+            "eval output must be bit-identical across a training toggle round trip"
+        );
+    }
 
     fn fixture_config() -> serde_json::Value {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))

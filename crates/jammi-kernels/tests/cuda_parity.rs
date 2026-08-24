@@ -31,9 +31,9 @@
 use candle_core::{DType, Device, Tensor, Var, D};
 use half::bf16;
 use jammi_kernels::ops::{
-    apply1, apply2, apply3, Axpy, DropoutFused, DropoutKey, FullyMaskedPolicy, GegluFused,
-    GeluVariant, LayerNormFused, LowRankResidualLinear, PhiloxKatProbe, RopeFused, ScaledCastAdd,
-    SoftmaxLastDimFused,
+    apply1, apply2, apply3, AttentionBlockFused, Axpy, DropoutFused, DropoutKey,
+    FullyMaskedPolicy, GegluFused, GeluVariant, LayerNormFused, LowRankResidualLinear,
+    PhiloxKatProbe, RopeFused, ScaledCastAdd, SoftmaxLastDimFused,
 };
 
 fn axpy(alpha: f64, x: &Tensor, y: &Tensor) -> candle_core::Result<Tensor> {
@@ -3762,4 +3762,235 @@ fn lora_linear_parity_bf16_exact_integer_fixture_is_bit_exact() {
         "exact-integer bf16 fixture must be bit-exact against a reference built from the \
          SAME single rounding point the op's own epilogue documents"
     );
+// -----------------------------------------------------------------------
+// AttentionBlockFused (P3, Tier 0) — CPU<->CUDA parity, forward AND
+// backward. AWAITING THE POD: these legs were authored and pass `cargo
+// check --features cuda`'s type-checking surface as far as this
+// development environment can verify (no `nvcc`, so `cudarc`'s own build
+// script cannot run here at all — see `cuda_device`'s module doc for the
+// `JAMMI_REQUIRE_CUDA` skip-vs-fail distinction this file's every leg
+// already honours), but have never themselves executed against a GPU.
+// `crates/jammi-kernels/src/cuda/attention_block.rs`'s own module doc
+// carries the same disclosure.
+//
+// CPU domain is F32-only for this op (candle-core 0.11's CPU backend has
+// no `BF16` `MatMul` — see that op's own module doc); `BF16` is therefore
+// exercised CUDA-only, against an F32 CPU reference with a `BF16`-width
+// tolerance (mirroring `assert_rope_parity_bf16`'s `bf16_bound`), not a
+// same-dtype cross-device comparison the way every other op's `_bf16` leg
+// here is.
+
+/// `[period, hidden]` cos/sin tables, redundant-half convention (this
+/// file's own `rope_table`/`rope_sin_table`), packed into
+/// `AttentionBlockFused`'s `rope_pack` argument
+/// (`[2, 1, 1, period, hidden]` — `cos` then `sin`, a plain concatenation
+/// since both blocks are already contiguous and adjacent by construction).
+fn attention_rope_pack(period: usize, hidden: usize) -> Vec<f32> {
+    let mut v = rope_table(period, hidden, 10_000.0);
+    v.extend(rope_sin_table(period, hidden, 10_000.0));
+    v
+}
+
+/// `qkv` fixture: `[batch, seq, 3, heads, head_dim]`, a smooth deterministic
+/// function of the flat index (same shape every other fixture in this file
+/// uses — `sin`-based, bounded, reproducible).
+fn qkv_fixture(batch: usize, seq: usize, heads: usize, head_dim: usize, seed: f32) -> Vec<f32> {
+    fixture(batch * seq * 3 * heads * head_dim, seed)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assert_attention_block_parity_f32(
+    cuda: &Device,
+    batch: usize,
+    seq: usize,
+    heads: usize,
+    head_dim: usize,
+    window: Option<u32>,
+    qkv_v: &[f32],
+) {
+    let cpu = Device::Cpu;
+    let n = qkv_v.len();
+    let rope_v = attention_rope_pack(seq, head_dim);
+    let mask_v = vec![0f32; batch * seq];
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let op = AttentionBlockFused::new(scale, window, FullyMaskedPolicy::Zeros, true).unwrap();
+
+    let qkv_cpu = Var::from_tensor(
+        &Tensor::from_slice(qkv_v, (batch, seq, 3, heads, head_dim), &cpu).unwrap(),
+    )
+    .unwrap();
+    let rope_cpu = Tensor::from_slice(&rope_v, (2, 1, 1, seq, head_dim), &cpu).unwrap();
+    let mask_cpu = Tensor::from_slice(&mask_v, (batch, 1, 1, seq), &cpu).unwrap();
+    let out_cpu = qkv_cpu
+        .as_tensor()
+        .apply_op3(&rope_cpu, &mask_cpu, op)
+        .unwrap();
+    let grads_cpu = out_cpu.sum_all().unwrap().backward().unwrap();
+
+    let qkv_gpu = Var::from_tensor(
+        &Tensor::from_slice(qkv_v, (batch, seq, 3, heads, head_dim), cuda).unwrap(),
+    )
+    .unwrap();
+    let rope_gpu = Tensor::from_slice(&rope_v, (2, 1, 1, seq, head_dim), cuda).unwrap();
+    let mask_gpu = Tensor::from_slice(&mask_v, (batch, 1, 1, seq), cuda).unwrap();
+    let out_gpu = qkv_gpu
+        .as_tensor()
+        .apply_op3(&rope_gpu, &mask_gpu, op)
+        .unwrap();
+    let grads_gpu = out_gpu.sum_all().unwrap().backward().unwrap();
+
+    let out_cpu_v: Vec<f32> = out_cpu.flatten_all().unwrap().to_vec1().unwrap();
+    let out_gpu_v: Vec<f32> = out_gpu
+        .to_device(&cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(out_cpu_v.len(), batch * seq * heads * head_dim);
+    assert_eq!(
+        out_gpu_v.len(),
+        out_cpu_v.len(),
+        "attention_block GPU fwd length mismatch"
+    );
+    for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
+        assert!(
+            ((*c - *g).abs() as f64) <= F32_TOL,
+            "attention_block fwd[{i}]: cpu {c} vs cuda {g} (batch={batch}, seq={seq}, \
+             heads={heads}, head_dim={head_dim}, window={window:?})"
+        );
+    }
+
+    let dqkv_cpu: Vec<f32> = grads_cpu
+        .get(&qkv_cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let dqkv_gpu: Vec<f32> = grads_gpu
+        .get(&qkv_gpu)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(dqkv_cpu.len(), n);
+    assert_eq!(
+        dqkv_gpu.len(),
+        n,
+        "attention_block GPU dqkv length mismatch"
+    );
+    for (i, (c, g)) in dqkv_cpu.iter().zip(dqkv_gpu.iter()).enumerate() {
+        assert!(
+            ((*c - *g).abs() as f64) <= F32_TOL,
+            "attention_block dqkv[{i}]: cpu {c} vs cuda {g}"
+        );
+    }
+}
+
+#[test]
+fn attention_block_parity_f32_global_head_dim_64() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let (batch, seq, heads, head_dim) = (2usize, 6usize, 2usize, 64usize);
+    let qkv_v = qkv_fixture(batch, seq, heads, head_dim, 1.0);
+    assert_attention_block_parity_f32(&cuda, batch, seq, heads, head_dim, None, &qkv_v);
+}
+
+#[test]
+fn attention_block_parity_f32_local_window_head_dim_64() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let (batch, seq, heads, head_dim) = (1usize, 9usize, 3usize, 64usize);
+    let qkv_v = qkv_fixture(batch, seq, heads, head_dim, 2.0);
+    assert_attention_block_parity_f32(&cuda, batch, seq, heads, head_dim, Some(2), &qkv_v);
+}
+
+#[test]
+fn attention_block_parity_f32_fully_masked_row_is_zero_on_both_devices() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let cpu = Device::Cpu;
+    let (batch, seq, heads, head_dim) = (1usize, 3usize, 1usize, 64usize);
+    let qkv_v = qkv_fixture(batch, seq, heads, head_dim, 3.0);
+    let rope_v = attention_rope_pack(seq, head_dim);
+    // Every key masked (padding) -> every row is fully masked (no window).
+    let mask_v = vec![-10_000.0f32; batch * seq];
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let op = AttentionBlockFused::new(scale, None, FullyMaskedPolicy::Zeros, true).unwrap();
+
+    let qkv_gpu = Tensor::from_slice(&qkv_v, (batch, seq, 3, heads, head_dim), &cuda).unwrap();
+    let rope_gpu = Tensor::from_slice(&rope_v, (2, 1, 1, seq, head_dim), &cuda).unwrap();
+    let mask_gpu = Tensor::from_slice(&mask_v, (batch, 1, 1, seq), &cuda).unwrap();
+    let out_gpu: Vec<f32> = qkv_gpu
+        .apply_op3(&rope_gpu, &mask_gpu, op)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert!(out_gpu.iter().all(|&x| x == 0.0), "{out_gpu:?}");
+}
+
+/// `BF16` on CUDA only (CPU domain is F32-only — see this section's own
+/// doc), against an F32 CPU reference with a `BF16`-width tolerance. A
+/// smoke-plus-bound test, not a same-dtype cross-device comparison.
+#[test]
+fn attention_block_parity_bf16_cuda_vs_f32_cpu_reference() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let cpu = Device::Cpu;
+    let (batch, seq, heads, head_dim) = (1usize, 6usize, 2usize, 64usize);
+    let qkv_v = qkv_fixture(batch, seq, heads, head_dim, 4.0);
+    let rope_v = attention_rope_pack(seq, head_dim);
+    let mask_v = vec![0f32; batch * seq];
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let op = AttentionBlockFused::new(scale, None, FullyMaskedPolicy::Zeros, true).unwrap();
+
+    let qkv_cpu = Tensor::from_slice(&qkv_v, (batch, seq, 3, heads, head_dim), &cpu).unwrap();
+    let rope_cpu = Tensor::from_slice(&rope_v, (2, 1, 1, seq, head_dim), &cpu).unwrap();
+    let mask_cpu = Tensor::from_slice(&mask_v, (batch, 1, 1, seq), &cpu).unwrap();
+    let out_cpu: Vec<f32> = qkv_cpu
+        .apply_op3(&rope_cpu, &mask_cpu, op)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    let qkv_b: Vec<bf16> = qkv_v.iter().map(|&v| bf16::from_f32(v)).collect();
+    let rope_b: Vec<bf16> = rope_v.iter().map(|&v| bf16::from_f32(v)).collect();
+    let mask_b: Vec<bf16> = mask_v.iter().map(|&v| bf16::from_f32(v)).collect();
+    let qkv_gpu = Tensor::from_slice(&qkv_b, (batch, seq, 3, heads, head_dim), &cuda).unwrap();
+    let rope_gpu = Tensor::from_slice(&rope_b, (2, 1, 1, seq, head_dim), &cuda).unwrap();
+    let mask_gpu = Tensor::from_slice(&mask_b, (batch, 1, 1, seq), &cuda).unwrap();
+    let out_gpu: Vec<f32> = qkv_gpu
+        .apply_op3(&rope_gpu, &mask_gpu, op)
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    let bf16_bound = |c: f32, g: f32| 4.0 * 2.0f32.powi(-7) * c.abs().max(g.abs()).max(1.0);
+    assert_eq!(out_cpu.len(), out_gpu.len());
+    for (i, (c, g)) in out_cpu.iter().zip(out_gpu.iter()).enumerate() {
+        assert!(
+            (c - g).abs() <= bf16_bound(*c, *g),
+            "attention_block bf16 fwd[{i}]: f32 cpu {c} vs bf16 cuda {g}"
+        );
+    }
 }

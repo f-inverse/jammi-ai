@@ -2306,6 +2306,383 @@ mod projection_head_rslora_tests {
     }
 }
 
+/// esc-041, honest end-to-end oracle (B2). [`projection_head_rslora_tests`]
+/// above pins `load_projection_head`'s scaling formula against a
+/// hand-derived `alpha/sqrt(rank)` — but that fixture never trains, never
+/// persists through the real writer, and compares against itself: hardcoding
+/// `use_rslora = false` at either the write site
+/// ([`crate::fine_tune::target::TrainingTarget::saved_adapter`]) or a read
+/// site ([`load_projection_head`], [`load_distribution_head`]) would leave it
+/// green. This module drives the WHOLE round trip through the production
+/// call chain instead: `build_projection_head`/`build_distribution_head`
+/// (the real training builder, threading `config.use_rslora` into
+/// `LoraLinear::new`) → real AdamW optimizer steps on a fixed batch →
+/// `TrainingTarget::saved_adapter` + `jammi_lora::save_adapter` (the exact
+/// calls `TrainingLoop::run` makes at trainer.rs) → `load_projection_head` /
+/// `load_distribution_head` (the exact calls this backend's `load` makes) →
+/// compare the reloaded head's forward pass against the trained head's,
+/// bit-for-bit. Same weights, same scaling, same ops — nothing between
+/// training and serving that could silently disagree.
+#[cfg(test)]
+mod projection_head_end_to_end_persistence_tests {
+    use super::*;
+    use crate::fine_tune::adamw::{AdamW, ParamsAdamW};
+    use crate::fine_tune::lora::{build_distribution_head, build_projection_head};
+    use crate::fine_tune::target::TrainingTarget;
+    use crate::fine_tune::FineTuneConfig;
+
+    const HIDDEN: usize = 4;
+
+    fn dims() -> crate::model::ModelDimensions {
+        crate::model::ModelDimensions {
+            hidden_size: HIDDEN,
+            num_layers: 1,
+            num_attention_heads: 1,
+            intermediate_size: HIDDEN,
+        }
+    }
+
+    /// Real AdamW steps of `layer.forward(x)` toward `target_out`, mutating the
+    /// layer's own trainable A/B `Var`s in place (no synthetic weight-poking).
+    ///
+    /// Finishes by calling `layer.set_training(false)`, so every subsequent
+    /// `forward` — including the "trained" readout this test compares against
+    /// the served one — takes the SAME unconditionally-eager path
+    /// `from_loaded` (serving) always uses (see `LoraLinear::forward`'s doc).
+    /// This isolates the `use_rslora` read/write question this test pins from
+    /// the fused-training-epilogue kernel's admission, a separate and
+    /// orthogonal numerics concern (a training-mode fused epilogue is not
+    /// guaranteed bit-identical to the eager composition it fuses).
+    fn train_layer(
+        layer: &mut jammi_lora::LoraLinear,
+        varmap: &VarMap,
+        x: &Tensor,
+        target_out: &Tensor,
+    ) {
+        let mut opt = AdamW::new(
+            varmap.all_vars(),
+            ParamsAdamW {
+                lr: 0.05,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for _ in 0..80 {
+            let out = layer.forward(x).unwrap();
+            let diff = (&out - target_out).unwrap();
+            let loss = diff.sqr().unwrap().mean_all().unwrap();
+            let grads = loss.backward().unwrap();
+            opt.step(&grads).unwrap();
+        }
+        layer.set_training(false);
+    }
+
+    /// Build a real projection head (`use_rslora`, `rank` from `config`),
+    /// train its single `projection` layer away from its zero-init identity,
+    /// persist through the REAL writer, and reload through the REAL reader.
+    /// Returns `(trained_out, served_out, adapter_config_json)`.
+    fn train_persist_serve_projection(
+        config: &FineTuneConfig,
+        x: &Tensor,
+        target_out: &Tensor,
+    ) -> (Vec<f32>, Vec<f32>, String) {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let mut head = build_projection_head(HIDDEN, config, &varmap, &vb).unwrap();
+        train_layer(&mut head.layers[0].1, &varmap, x, target_out);
+        let trained_out = head.layers[0]
+            .1
+            .forward(x)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap()[0]
+            .clone();
+
+        let target = TrainingTarget::ProjectionHead { head };
+        let final_weights = target.named_trainable_weights().unwrap();
+        let saved = target.saved_adapter(config, None, None);
+
+        let dir = tempfile::tempdir().unwrap();
+        jammi_lora::save_adapter(dir.path(), &final_weights, &saved).unwrap();
+        let json = std::fs::read_to_string(dir.path().join("adapter_config.json")).unwrap();
+
+        // Re-read `use_rslora`/`lora_alpha` from the PERSISTED file — never
+        // from `config` again — the same `SavedAdapter` deserialize this
+        // backend's real `load` does before calling `load_projection_head`.
+        // Feeding `config.use_rslora` straight back in here would make the
+        // write site (target.rs) load-bearing but leave the read call site
+        // (this file's `load_projection_head` call, "candle.rs:1687")
+        // untested: a value that never left the training-side `config`
+        // cannot expose a defect in the reload plumbing that's supposed to
+        // carry it.
+        let cfg =
+            match serde_json::from_str::<crate::fine_tune::target::SavedAdapter>(&json).unwrap() {
+                crate::fine_tune::target::SavedAdapter::ProjectionHead(cfg) => cfg,
+                crate::fine_tune::target::SavedAdapter::EncoderAdapters(_) => {
+                    panic!("projection head must persist as SavedAdapter::ProjectionHead")
+                }
+            };
+
+        let lora = load_projection_head(
+            &dir.path().join("adapter.safetensors"),
+            cfg.lora_alpha,
+            cfg.use_rslora,
+            &device,
+            &dims(),
+            "e2e-projection-test",
+        )
+        .unwrap()
+        .expect("adapter carries a projection layer");
+        let served_out = lora.forward(x).unwrap().to_vec2::<f32>().unwrap()[0].clone();
+
+        (trained_out, served_out, json)
+    }
+
+    /// B2 / esc-041 oracle: at both r = 16 and r = 4, a `use_rslora = true`
+    /// projection head that has genuinely trained away from its zero-init
+    /// identity (`‖trained(x) − x‖₂ > 1e-3`, and finite) serves — after a real
+    /// round trip through `saved_adapter` + `save_adapter` +
+    /// `load_projection_head` — the IDENTICAL forward pass, bit-for-bit. The
+    /// persisted config also carries the `use_rslora` key explicitly
+    /// (control (d)): a freshly written adapter is never silently legacy.
+    ///
+    /// Mutation checks performed by hand and recorded in the hand-off (not
+    /// committed — they assert the CURRENT code is right, not a permanent
+    /// regression probe for a defect that no longer exists):
+    /// - Hardcoding `use_rslora: false` at
+    ///   `TrainingTarget::saved_adapter`'s `ProjectionHeadConfig` literal
+    ///   (target.rs) → this test FAILS (served ≠ trained; the JSON also
+    ///   stops reflecting the configured choice).
+    /// - Hardcoding `false` as `load_projection_head`'s `use_rslora` argument
+    ///   at its candle.rs call site → this test FAILS (served ≠ trained at
+    ///   r = 16 and r = 4, since a `false` read serves only `1/sqrt(rank)`
+    ///   of the trained magnitude).
+    #[test]
+    fn projection_head_trains_persists_and_serves_identically_with_rslora() {
+        let device = Device::Cpu;
+        let x = Tensor::new(&[[1.0f32, 0.5, -0.3, 0.2]], &device).unwrap();
+        let target_out = Tensor::new(&[[0.0f32, 1.0, 1.0, -1.0]], &device).unwrap();
+
+        for rank in [16usize, 4usize] {
+            let config = FineTuneConfig {
+                lora_rank: rank,
+                lora_alpha: 8.0,
+                use_rslora: true,
+                // Dropout is orthogonal to what this test pins; disabling it
+                // removes a source of stochastic noise from the training loop
+                // (the default config carries lora_dropout = 0.05).
+                lora_dropout: 0.0,
+                ..Default::default()
+            };
+            let (trained, served, json) = train_persist_serve_projection(&config, &x, &target_out);
+
+            let base: Vec<f32> = x.to_vec2::<f32>().unwrap()[0].clone();
+            let delta: f32 = trained
+                .iter()
+                .zip(base.iter())
+                .map(|(t, b)| (t - b).powi(2))
+                .sum::<f32>()
+                .sqrt();
+            assert!(
+                delta.is_finite() && delta > 1e-3,
+                "rank={rank}: training must move the head measurably away from its \
+                 zero-init identity, got delta={delta}"
+            );
+
+            assert!(
+                json.contains("\"use_rslora\""),
+                "rank={rank}: a freshly written adapter config must carry the use_rslora \
+                 key explicitly, got: {json}"
+            );
+            assert!(
+                json.contains("\"use_rslora\": true"),
+                "rank={rank}: the persisted config must reflect the configured choice, got: \
+                 {json}"
+            );
+
+            assert_eq!(
+                trained, served,
+                "rank={rank}: serving the reloaded adapter must reproduce the trained \
+                 forward pass bit-for-bit — same weights, same persisted use_rslora, same \
+                 scaling"
+            );
+        }
+    }
+
+    /// Companion oracle for the OTHER unpinned read site: `load_distribution_head`
+    /// (the regression head's serve-time reloader) must also read the
+    /// persisted `use_rslora`, not a fixed default. Same round trip as above,
+    /// but through `build_distribution_head`'s `distribution` layer
+    /// (`head.layers[1]`, zeros base) and `load_distribution_head`.
+    #[test]
+    fn distribution_head_trains_persists_and_serves_identically_with_rslora() {
+        let device = Device::Cpu;
+        let x = Tensor::new(&[[1.0f32, 0.5, -0.3, 0.2]], &device).unwrap();
+        // Distribution head output width 2 (mean, raw_std) — the parametric
+        // Gaussian head shape.
+        let target_out = Tensor::new(&[[0.7f32, -0.4]], &device).unwrap();
+
+        let config = FineTuneConfig {
+            lora_rank: 16,
+            lora_alpha: 8.0,
+            use_rslora: true,
+            lora_dropout: 0.0,
+            ..Default::default()
+        };
+
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let mut head = build_distribution_head(HIDDEN, 2, &config, &varmap, &vb).unwrap();
+        train_layer(&mut head.layers[1].1, &varmap, &x, &target_out);
+        let trained = head.layers[1]
+            .1
+            .forward(&x)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap()[0]
+            .clone();
+
+        let target = TrainingTarget::ProjectionHead { head };
+        let final_weights = target.named_trainable_weights().unwrap();
+        let saved = target.saved_adapter(&config, None, None);
+        let dir = tempfile::tempdir().unwrap();
+        jammi_lora::save_adapter(dir.path(), &final_weights, &saved).unwrap();
+        let json = std::fs::read_to_string(dir.path().join("adapter_config.json")).unwrap();
+
+        // Re-read from the PERSISTED file, not `config` — see the projection
+        // head test's identical note on why this is load-bearing for the
+        // read call site, not just the write site.
+        let cfg =
+            match serde_json::from_str::<crate::fine_tune::target::SavedAdapter>(&json).unwrap() {
+                crate::fine_tune::target::SavedAdapter::ProjectionHead(cfg) => cfg,
+                crate::fine_tune::target::SavedAdapter::EncoderAdapters(_) => {
+                    panic!("distribution head must persist as SavedAdapter::ProjectionHead")
+                }
+            };
+        assert!(
+            json.contains("\"use_rslora\": true"),
+            "the persisted config must reflect the configured choice, got: {json}"
+        );
+
+        let lora = load_distribution_head(
+            &dir.path().join("adapter.safetensors"),
+            cfg.lora_alpha,
+            cfg.use_rslora,
+            &device,
+            &dims(),
+            "e2e-distribution-test",
+        )
+        .unwrap()
+        .expect("adapter carries a distribution layer");
+        let served = lora.forward(&x).unwrap().to_vec2::<f32>().unwrap()[0].clone();
+
+        let delta: f32 = trained.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!(
+            delta.is_finite() && delta > 1e-3,
+            "training must move the distribution head measurably away from its zero-init \
+             output, got delta={delta}"
+        );
+        assert_eq!(
+            trained, served,
+            "serving the reloaded distribution head must reproduce the trained forward \
+             pass bit-for-bit"
+        );
+    }
+
+    /// The TRUE oracle for the candle.rs read call site (not just the
+    /// `load_projection_head`/`load_distribution_head` FUNCTIONS the two
+    /// tests above pin): `load_projection_head` is `fn`-private with exactly
+    /// ONE caller in the whole crate — `CandleBackend::load`, at the
+    /// `cfg.use_rslora` argument the audit named. The two tests above call
+    /// `load_projection_head` directly, so — like the pre-fix
+    /// `served_scaling_ratio_matches_persisted_rslora_flag` — they cannot see
+    /// a defect confined to THAT call site (feeding it something other than
+    /// `cfg.use_rslora`). This test drives the real `CandleBackend::load`
+    /// over the `tiny_bert` fixture with an `adapter_path` pointing at a real
+    /// `use_rslora = true`-trained adapter, and reads the served
+    /// `projection_head` straight off the returned `LoadedModel::Candle` —
+    /// the exact field `CandleBackend::load` populates from
+    /// `load_projection_head`'s return at that call site. No text/tokenizer
+    /// path is exercised (`tokenizer: None`, `pooling_config: None` — the
+    /// mean-pool fallback, unused since only the LoRA layer's own forward is
+    /// read, not a full embed pass).
+    #[test]
+    fn candle_backend_load_honors_persisted_rslora_for_projection_head() {
+        let device = Device::Cpu;
+        let tiny_bert_dir = jammi_test_utils::cookbook_fixture("tiny_bert");
+        let hidden = 32usize; // tiny_bert's config.json `hidden_size`.
+        let x_vals: Vec<f32> = (0..hidden).map(|i| (i as f32 * 0.037).sin()).collect();
+        let x = Tensor::from_vec(x_vals, (1, hidden), &device).unwrap();
+        let target_vals: Vec<f32> = (0..hidden).map(|i| (i as f32 * 0.091).cos()).collect();
+        let target_out = Tensor::from_vec(target_vals, (1, hidden), &device).unwrap();
+
+        let config = FineTuneConfig {
+            lora_rank: 16,
+            lora_alpha: 8.0,
+            use_rslora: true,
+            lora_dropout: 0.0,
+            ..Default::default()
+        };
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let mut head = build_projection_head(hidden, &config, &varmap, &vb).unwrap();
+        train_layer(&mut head.layers[0].1, &varmap, &x, &target_out);
+        let trained = head.layers[0]
+            .1
+            .forward(&x)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap()[0]
+            .clone();
+
+        let target = TrainingTarget::ProjectionHead { head };
+        let final_weights = target.named_trainable_weights().unwrap();
+        let saved = target.saved_adapter(&config, None, None);
+        let adapter_dir = tempfile::tempdir().unwrap();
+        jammi_lora::save_adapter(adapter_dir.path(), &final_weights, &saved).unwrap();
+
+        let config_path = tiny_bert_dir.join("config.json");
+        let model_config: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(&config_path).unwrap()).unwrap();
+        let resolved = crate::model::ResolvedModel {
+            model_id: crate::model::ModelId("local:tiny_bert-b2-e2e-test".into()),
+            backend: crate::model::BackendType::Candle,
+            task: ModelTask::TextEmbedding,
+            config_path,
+            weights_paths: vec![tiny_bert_dir.join("model.safetensors")],
+            tokenizer: None,
+            model_config,
+            preprocessor_config: None,
+            pooling_config: None,
+            base_model_id: None,
+            adapter_path: Some(adapter_dir.path().to_path_buf()),
+            estimated_memory: 0,
+        };
+        let device_config = DeviceConfig {
+            gpu_device: -1,
+            memory_fraction: 0.9,
+            require_gpu: false,
+            compute_precision: jammi_numerics::ComputePrecision::F32,
+        };
+        let loaded = CandleBackend.load(&resolved, &device_config).unwrap();
+        let served_lora = match loaded {
+            LoadedModel::Candle(model) => model.projection_head.expect(
+                "the real CandleBackend::load must build a projection head from the saved \
+                 adapter",
+            ),
+            LoadedModel::Ort(_) => panic!("expected a Candle-backend model, got Ort"),
+        };
+        let served = served_lora.forward(&x).unwrap().to_vec2::<f32>().unwrap()[0].clone();
+
+        assert_eq!(
+            trained, served,
+            "CandleBackend::load's served projection head (built at its `cfg.use_rslora` call \
+             site) must reproduce the trained forward pass bit-for-bit"
+        );
+    }
+}
+
 #[cfg(test)]
 mod device_tests {
     use std::sync::atomic::{AtomicBool, Ordering};

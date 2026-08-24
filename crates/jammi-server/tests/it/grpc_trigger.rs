@@ -74,7 +74,7 @@ fn make_event_batch(ids: &[i64], kinds: &[&str]) -> RecordBatch {
 
 /// Encode a batch as Arrow IPC and pack it into the wire shape the server
 /// emits — `data_header` empty, full `StreamWriter` payload in `data_body`.
-/// `decode_arrow_batch` on the server concatenates the two anyway, so this
+/// `decode_publish_batch` on the server concatenates the two anyway, so this
 /// is the symmetric shape.
 fn encode_batch_to_ipc(batch: &RecordBatch) -> ArrowBatch {
     let mut buf: Vec<u8> = Vec::new();
@@ -354,7 +354,7 @@ async fn grpc_publish_round_trips_batch_to_backing_table() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn grpc_publish_rejects_schema_mismatch_with_invalid_argument() {
     // Encode a batch whose schema does not match the topic; the server
-    // must reject with `InvalidArgument` (per `decode_arrow_batch`).
+    // must reject with `InvalidArgument` (per `decode_publish_batch`).
     let fixture = start_grpc_test_server(&[TopicSeed::new("events")]).await;
     let ch = channel(fixture.addr).await;
     let mut client = TriggerServiceClient::with_interceptor(ch, with_session("session-mismatch"));

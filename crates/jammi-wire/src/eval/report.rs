@@ -240,8 +240,9 @@ pub struct CalibrationAggregate {
 ///
 /// Marginal coverage can hide conditional miscoverage — a predictor can hit its
 /// nominal level globally while systematically under-covering a subgroup — so
-/// the harness slices coverage and CRPS by cohort. `n` and `crps_ci` are
-/// reported so a small cohort is not over-read.
+/// the harness slices coverage and CRPS by cohort. `n` and
+/// `crps_ci_lower`/`crps_ci_upper` are reported so a small cohort is not
+/// over-read.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CohortCalibration {
     /// The cohort tag key this slice groups on.

@@ -2327,7 +2327,7 @@ fn covered_on_wire(cases: &[IsolationCase]) -> BTreeSet<String> {
     let mut covered: BTreeSet<String> = cases
         .iter()
         .filter(|c| c.kind != CaseKind::FlightSql)
-        // Synthetic case names (e.g. the `_global_pk_collision` companion) are
+        // Synthetic case names (e.g. `AddSource_global_pk_collision`) are
         // not wire rpcs; they share the real rpc's `service`/`rpc-without-suffix`
         // identity, so strip a trailing `_...` synthetic tag for the bind.
         .map(|c| format!("{}/{}", c.service, base_rpc(c.rpc)))
@@ -2338,9 +2338,10 @@ fn covered_on_wire(cases: &[IsolationCase]) -> BTreeSet<String> {
     covered
 }
 
-/// Strip a synthetic companion suffix (`Rpc_some_tag` → `Rpc`) so multiple
-/// cases over one rpc still bind to that single wire method. A real rpc name
-/// never contains `_`, so the first `_` marks a synthetic tag.
+/// Strip a synthetic companion suffix (`AddSource_global_pk_collision` →
+/// `AddSource`) so multiple cases over one rpc still bind to that single
+/// wire method. A real rpc name never contains `_`, so the first `_` marks
+/// a synthetic tag.
 fn base_rpc(rpc: &str) -> &str {
     match rpc.split_once('_') {
         Some((base, _)) => base,

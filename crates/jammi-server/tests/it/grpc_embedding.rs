@@ -604,8 +604,9 @@ fn write_docs_source_parquet(dir: &TempDir) -> std::path::PathBuf {
 
 /// Write a `(_row_id: Utf8, vector: FixedSizeList<Float32>[IMPORT_DIMS])` parquet
 /// of precomputed vectors keyed by [`IMPORT_DOC_IDS`]. Each doc gets a distinct
-/// unit basis direction (`doc-i` → `e_i`), so a nearest-neighbor query by one
-/// doc's direction resolves that doc unambiguously. The vectors are non-zero, so
+/// unit basis direction (doc-i gets the i-th standard basis vector), so a
+/// nearest-neighbor query by one doc's direction resolves that doc
+/// unambiguously. The vectors are non-zero, so
 /// import L2-normalizes them without rejecting any.
 fn write_import_vectors_parquet(dir: &TempDir) -> std::path::PathBuf {
     let path = dir.path().join("precomputed.parquet");
@@ -695,8 +696,9 @@ async fn import_embeddings_registers_a_ready_searchable_table_over_the_wire() {
         "the imported table records its embedding width"
     );
 
-    // Search by doc-1's direction (`e_1`): the imported doc-1 row is its own
-    // nearest neighbor under cosine, so it ranks first. `select` projects the
+    // Search by doc-1's direction (its standard basis vector): the imported
+    // doc-1 row is its own nearest neighbor under cosine, so it ranks
+    // first. `select` projects the
     // hydrated `body` column, proving the imported table joins back to its
     // source exactly like a generated one.
     let mut query = vec![0.0_f32; IMPORT_DIMS];

@@ -53,3 +53,7 @@ cfg_attr # Rust language builtin attribute, not a repo symbol.
 pragma_table_info # SQLite's `pragma_table_info` table-valued function.
 sqlite_master # SQLite's builtin schema catalog table.
 code_version # Dagster's asset `code_version` concept, cited for analogy in a doc comment; not a repo symbol.
+RUST_LOG  # env var read by tracing_subscriber::EnvFilter::try_from_default_env() (jammi-server/src/telemetry.rs) — upstream tracing-subscriber convention, never a string literal in this repo's .rs sources
+tonic_web  # the external `tonic-web` crate, referenced by its Rust module path in jammi-server/src/grpc_web_trailers.rs doc comments
+make_trailers_frame  # tonic-web's own (private) trailers-frame builder (tonic-web-0.14.5/src/call.rs), cited in jammi-server/src/grpc_web_trailers.rs as the upstream shape this layer mirrors
+with_interceptor  # the `Type::with_interceptor` associated fn tonic-build's client codegen template emits for every generated service client (tonic-build-0.14.6/src/client.rs); jammi-wire/src/transport.rs and every generated client call site name it as a path-qualified call (`Client::with_interceptor(..)`), which this gate's method-call scan (`.name(`) does not match

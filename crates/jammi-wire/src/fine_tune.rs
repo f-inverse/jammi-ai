@@ -82,9 +82,9 @@ pub enum EmbeddingLoss {
 ///
 /// Three of the four arms train the **parametric Gaussian** head — the head
 /// emits `(mean, raw_std)` per row and the loss reads a positive `σ` from
-/// `raw_std` via `floor + softplus(raw_std)` (a *learnable* floor, the
-/// `RegressionHead::Gaussian` `std_floor`). The fourth trains the **quantile**
-/// head (one output per level) with the pinball loss.
+/// `raw_std` via `floor + softplus(raw_std)`, where `floor` is the fixed
+/// numerical guard `STD_FLOOR` against exact-zero variance. The fourth trains
+/// the **quantile** head (one output per level) with the pinball loss.
 ///
 /// Every arm is a **proper score**: minimising it rewards a calibrated
 /// *distribution*, not merely an accurate mean. (Plain MSE on the mean is *not*
@@ -522,7 +522,8 @@ mod validation_tests {
     /// `validation_fraction = 0.0` holds out nothing, so under the DEFAULT
     /// `early_stopping_metric = ValLoss` the trainer monitored a validation loss
     /// that was never computed. `evaluate` returned a `0.0` sentinel for the
-    /// empty split, so epoch 0 won `0.0 < f64::MAX` and wrote `checkpoint_best`,
+    /// empty split, so epoch 0 won `0.0 < f64::MAX` and wrote
+    /// `checkpoint_best.safetensors`,
     /// every later epoch failed `0.0 < 0.0` and burned patience, the loop broke
     /// at `patience + 1` epochs, and the epoch-0 adapter was published as the
     /// run's result with a reported `final_loss` of 0.0. A silently untrained

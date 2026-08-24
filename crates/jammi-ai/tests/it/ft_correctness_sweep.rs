@@ -61,14 +61,29 @@ async fn claimed_loop_env(tag: &str) -> (Arc<jammi_db::catalog::Catalog>, tempfi
 }
 
 /// A precomputed contrastive batch with a learnable (non-degenerate) signal:
-/// orthogonal a/b but score=1.0, so cosent loss is non-zero and gradients flow.
+/// TWO rows with an ordering VIOLATION (row 0's orthogonal embeddings are
+/// graded HIGH, row 1's identical embeddings are graded LOW — the targets say
+/// row 0 should be MORE similar, the embeddings say the opposite), so CoSENT's
+/// real pairwise-ordering loss is non-zero and gradients flow.
+///
+/// This replaces a single-row (`score = 1.0`) fixture whose docstring made the
+/// same "non-zero cosent loss, gradients flow" claim, which was false: a lone
+/// row can never form a `scores[i] < scores[j]` pair, so CoSENT's real
+/// pairwise-ordering loss sits at its `log(1) = 0` floor with zero gradient on
+/// any single-row batch, under CoSENT/AnglE, regardless of the row's score
+/// (see `jammi_ai::fine_tune::trainer`'s `is_degenerate_ordering_batch`, B3).
+/// This file's oracles pin optimizer STEP COUNTS, not loss/gradient values, so
+/// no assertion here changed — this is a premise repair (the fixture's own
+/// claim about itself), not a threshold relaxation. Every threshold in this
+/// file is a deterministic step-count equality, so no seed-dependent
+/// tolerance moved either.
 fn learnable_batch(device: &Device) -> TrainingBatch {
-    let a = Tensor::new(&[[1.0f32, 0.0, 0.0, 0.0]], device).unwrap();
-    let b = Tensor::new(&[[0.0f32, 1.0, 0.0, 0.0]], device).unwrap();
+    let a = Tensor::new(&[[1.0f32, 0.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]], device).unwrap();
+    let b = Tensor::new(&[[0.0f32, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]], device).unwrap();
     TrainingBatch::Contrastive {
         embeddings_a: a,
         embeddings_b: b,
-        scores: Tensor::new(&[1.0f32], device).unwrap(),
+        scores: Tensor::new(&[1.0f32, 0.0f32], device).unwrap(),
     }
 }
 

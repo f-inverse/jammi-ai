@@ -16,7 +16,7 @@ use crate::fine_tune::adamw::{AdamW, ParamsAdamW};
 use jammi_db::error::{JammiError, Result};
 
 use super::data::{TextChunk, TrainingDataLoader};
-use super::optimizer::clip_and_step;
+use super::optimizer::{clip_and_step, DEFAULT_NORM_CHECK_INTERVAL};
 use super::regression_loss::{crps_gaussian_loss, gaussian_nll_loss, pinball_loss, TargetScaler};
 use super::resume::{
     capture_bundle, NamedMoments, RestoredCheckpoint, ResumeState, RESUME_STATE_SCHEMA_VERSION,
@@ -437,6 +437,28 @@ impl TrainingLoop {
         // reuses the last mining (the staleness/cost trade).
         let mut mined_loader: Option<TrainingDataLoader> = None;
 
+        // Hold candle's HtoD constant-upload CACHE for the whole run, CUDA
+        // only. This is NOT graph capture — it is a content-keyed cache
+        // (`(DeviceId, TypeId, bytes) -> uploaded slice`, capped at 4096
+        // bytes/entry) that candle's own tensor-metadata uploads (dims/
+        // strides, and the tiny constants ops like `clip_gradients`'s
+        // `.minimum(1.0)` allocate) already consult when enabled; without the
+        // guard those same small, repeated H2D copies happen fresh every
+        // step. The guard is depth-counted (`CudaGraphHtodCacheGuard::drop`
+        // decrements), so holding it for the run's whole duration is safe to
+        // nest inside anything else that also enables it. `None` on CPU/Metal
+        // — the cache only exists on the CUDA backend, and
+        // `enable_cuda_graph_htod_cache` itself only exists on `CudaDevice`
+        // when candle-core is built with its `cuda` feature (this crate's own
+        // `cuda` feature forwards to it), so the call is gated the same way.
+        #[cfg(feature = "cuda")]
+        let _htod_cache_guard = match &self.device {
+            Device::Cuda(cuda_device) => Some(cuda_device.enable_cuda_graph_htod_cache()),
+            Device::Cpu | Device::Metal(_) => None,
+        };
+        #[cfg(not(feature = "cuda"))]
+        let _htod_cache_guard: Option<()> = None;
+
         for epoch in start_epoch..self.config.epochs {
             // Cooperative cancellation: the worker's heartbeat sets this when the
             // lease is lost. Bail at the epoch boundary, leaving the job for
@@ -561,6 +583,8 @@ impl TrainingLoop {
                     &trainable_vars,
                     &mut acc,
                     self.config.max_grad_norm,
+                    DEFAULT_NORM_CHECK_INTERVAL,
+                    global_step + 1,
                 )?;
                 global_step += 1;
             }
@@ -866,7 +890,7 @@ impl TrainingLoop {
         trainable_vars: &[Var],
         optimizer: &mut AdamW,
         _total_steps: usize,
-        _global_step: usize,
+        global_step: usize,
     ) -> Result<f64> {
         use super::gradcache::{gradcache_backward, EncodeGroup};
 
@@ -956,6 +980,8 @@ impl TrainingLoop {
             trainable_vars,
             &mut grads,
             self.config.max_grad_norm,
+            DEFAULT_NORM_CHECK_INTERVAL,
+            global_step + 1,
         )?;
 
         Ok(loss_val)
@@ -1362,6 +1388,51 @@ impl TrainingLoop {
             loss.to_dtype(DType::F32)
                 .map_err(|e| JammiError::FineTune(format!("Loss dtype cast: {e}")))?
         };
+
+        // Gradient-accumulation window bookkeeping, computed from the
+        // PROSPECTIVE batch index (this micro-batch counts unless it turns
+        // out diverged below) so the loss scale is known before `backward` —
+        // without reading the loss off the device first. `epoch.batch_count`
+        // itself is only committed once divergence is known (below): a
+        // diverged micro-batch must not advance the window, matching the
+        // pre-existing skip semantics exactly.
+        //
+        // A full accumulation window averages over `grad_accum` micro-batches, so
+        // each one's loss is divided by `grad_accum`. The epoch's trailing window
+        // — when `batches_per_epoch` is not a multiple of `grad_accum` — contains
+        // only `batches_per_epoch % grad_accum` micro-batches, so those divide by
+        // that smaller count to keep the window's gradient a true average rather
+        // than under-scaling it by the full `grad_accum`. `candidate_batch_count`
+        // is the 1-based index this micro-batch WOULD occupy within the epoch.
+        let grad_accum = self.config.gradient_accumulation_steps.max(1);
+        let candidate_batch_count = *epoch.batch_count + 1;
+        let partial_window = ctx.batches_per_epoch % grad_accum;
+        let in_trailing_partial =
+            partial_window != 0 && candidate_batch_count > ctx.batches_per_epoch - partial_window;
+        let scale = if in_trailing_partial {
+            partial_window as f64
+        } else {
+            grad_accum as f64
+        };
+        let scaled_loss =
+            (&loss / scale).map_err(|e| JammiError::FineTune(format!("Loss scale: {e}")))?;
+
+        // `backward` is issued BEFORE the loss is read off the device: the
+        // old order (`to_scalar` first, for divergence detection) forced the
+        // host to wait for the forward pass before even starting backward's
+        // kernel launches, stalling the pipeline mid-step on every single
+        // batch. Backward's launches (async on CUDA) now go out first; the
+        // D2H read below only has to wait for whatever of the forward pass
+        // isn't already done by the time backward finishes issuing — and
+        // this is the ONE remaining sync in this loop's per-batch path (the
+        // grad-clip sync is gone; see `optimizer::clip_gradients`). Releasing
+        // the activation graph here (not later) is still what keeps
+        // `gradient_accumulation_steps > 1` from growing memory proportional
+        // to the micro-batch count.
+        let new_grads = scaled_loss
+            .backward()
+            .map_err(|e| JammiError::FineTune(format!("Backward: {e}")))?;
+
         let loss_val = loss_f32
             .to_scalar::<f32>()
             .map_err(|e| JammiError::FineTune(format!("Loss scalar: {e}")))?
@@ -1378,6 +1449,11 @@ impl TrainingLoop {
         // load-bearing backstop for the regression arms (an overconfidence collapse
         // or a NaN gradient). The threshold still guards the non-regression arms
         // (CoSENT/MNRL/triplet/CE), whose magnitudes are unchanged.
+        //
+        // A diverged micro-batch's `new_grads` are dropped here without being
+        // merged into `epoch.accumulated_grads` — the extra `backward` this
+        // batch cost (versus the old skip-before-backward order) is spent
+        // only on the rare diverged batch, never on the healthy common case.
         if loss_val.is_nan() || loss_val > 100.0 {
             self.divergence_count += 1;
             if self.divergence_count >= 3 {
@@ -1390,34 +1466,7 @@ impl TrainingLoop {
         self.divergence_count = 0;
 
         *epoch.epoch_loss += loss_val;
-        *epoch.batch_count += 1;
-
-        // Scale the loss and immediately run backward, releasing the activation
-        // graph so that `gradient_accumulation_steps > 1` doesn't grow memory
-        // proportionally to the number of micro-batches.
-        //
-        // A full accumulation window averages over `grad_accum` micro-batches, so
-        // each one's loss is divided by `grad_accum`. The epoch's trailing window
-        // — when `batches_per_epoch` is not a multiple of `grad_accum` — contains
-        // only `batches_per_epoch % grad_accum` micro-batches, so those divide by
-        // that smaller count to keep the window's gradient a true average rather
-        // than under-scaling it by the full `grad_accum`. `epoch.batch_count` has
-        // already been incremented for this micro-batch, so it is the 1-based
-        // index of the current micro-batch within the epoch.
-        let grad_accum = self.config.gradient_accumulation_steps.max(1);
-        let partial_window = ctx.batches_per_epoch % grad_accum;
-        let in_trailing_partial =
-            partial_window != 0 && *epoch.batch_count > ctx.batches_per_epoch - partial_window;
-        let scale = if in_trailing_partial {
-            partial_window as f64
-        } else {
-            grad_accum as f64
-        };
-        let scaled_loss =
-            (&loss / scale).map_err(|e| JammiError::FineTune(format!("Loss scale: {e}")))?;
-        let new_grads = scaled_loss
-            .backward()
-            .map_err(|e| JammiError::FineTune(format!("Backward: {e}")))?;
+        *epoch.batch_count = candidate_batch_count;
 
         // Merge new_grads into the running accumulator.
         // The accumulator is seeded from the first backward call to avoid
@@ -1453,6 +1502,8 @@ impl TrainingLoop {
                     ctx.trainable_vars,
                     &mut acc,
                     self.config.max_grad_norm,
+                    DEFAULT_NORM_CHECK_INTERVAL,
+                    *epoch.global_step + 1,
                 )?;
             }
 

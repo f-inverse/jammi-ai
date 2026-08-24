@@ -4,19 +4,15 @@
 //! remapping. Supports global average pooling (used by PatentCLIP) instead
 //! of CLS token pooling.
 //!
-//! Moved here from `jammi-ai`'s `model::backend::open_clip_vit` (esc-037
-//! part 2/3): the attention softmax now goes through
-//! [`crate::attention::attention_softmax`], the fused-QKV `MultiHeadAttention`
-//! is the SAME struct [`crate::clip_text`]'s text tower shares
-//! (parameterised by an optional causal mask —
-//! [`crate::attention::MultiHeadAttention::forward`]'s doc), every
-//! `candle_nn::LayerNorm` + the old file's own `apply_layer_norm` helper is
-//! [`crate::layer_norm::LayerNorm`] (which already has an equivalent
-//! bias-free/training gradient oracle —
-//! `crate::layer_norm::tests::fused_training_path_matches_slow_within_tolerance_fwd_and_bwd`
-//! — so that helper and its own bias-free test were not re-added here), and
-//! `quick_gelu` is [`crate::activations::quick_gelu`] (previously
-//! duplicated verbatim against `crate::clip_text`'s copy).
+//! The attention softmax goes through
+//! [`crate::attention::attention_softmax`]; the fused-QKV `MultiHeadAttention`
+//! is the SAME struct [`crate::clip_text`]'s text tower shares (parameterised
+//! by an optional causal mask —
+//! [`crate::attention::MultiHeadAttention::forward`]'s doc); every
+//! `candle_nn::LayerNorm` is [`crate::layer_norm::LayerNorm`] (which has its
+//! own bias-free/training gradient oracle —
+//! `crate::layer_norm::tests::fused_training_path_matches_slow_within_tolerance_fwd_and_bwd`);
+//! and `quick_gelu` is the single shared [`crate::activations::quick_gelu`].
 
 use candle_core::{IndexOp, Module, Tensor};
 use candle_nn::{conv2d_no_bias, Conv2d, Conv2dConfig, VarBuilder};
@@ -657,6 +653,94 @@ mod tests {
             "K slice grad must be exactly zero under the truncated eval kernel"
         );
         assert!(v_norm > 0.0, "V slice grad must stay nonzero, got {v_norm}");
+    }
+
+    /// Deletion-catching oracle for [`ResidualAttentionBlock`]'s
+    /// residual-stream LayerNorms themselves (`ln_1`/`ln_2`, block 0):
+    /// every gradient assertion above reaches its target parameter through
+    /// the block's residual bypass (`x + attn`, `x + mlp_out` in
+    /// [`ResidualAttentionBlock::forward`]), so a dropped
+    /// `self.ln_1.set_training(training)` / `self.ln_2.set_training(training)`
+    /// line — leaving that ONE LayerNorm stuck on its fused,
+    /// `BackpropOp::none()`-truncated eval arm even with the rest of the
+    /// tower `training=true` — would NOT be caught by any test above: the
+    /// residual path still carries a gradient to `in_proj_weight`/
+    /// `conv1.weight` regardless of `ln_1`/`ln_2`'s own truncation. This
+    /// test asserts `ln_1`/`ln_2`'s OWN `weight` — not anything upstream —
+    /// through the full public `forward`: `Some`/finite/nonzero under
+    /// `training=true`, `None` under `training=false` (`ln_pre` already
+    /// truncates backward ahead of every block under eval — see
+    /// `training_false_backward_has_no_in_proj_gradient_at_all`'s doc — so
+    /// the eval half of this assertion holds independent of `ln_1`/`ln_2`'s
+    /// own gate; the training=true half is what a dropped propagation line
+    /// actually flips). RED-verified: deleting
+    /// `self.ln_1.set_training(training)` from
+    /// `ResidualAttentionBlock::set_training` flips the training=true half
+    /// of this test (`ln_1.weight` comes back `None` instead of `Some`)
+    /// while every other test in this file stays green.
+    #[test]
+    fn ln_1_and_ln_2_own_weight_gradient_present_under_training_absent_under_eval() {
+        let config = tiny_config();
+        let device = Device::Cpu;
+
+        for suffix in [
+            "transformer.resblocks.0.ln_1.weight",
+            "transformer.resblocks.0.ln_2.weight",
+        ] {
+            let training_grad = {
+                let varmap = VarMap::new();
+                let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+                let mut model = OpenClipVisionTransformer::load(vb.pp("visual"), &config).unwrap();
+                break_zero_init_symmetry(&varmap, &device);
+                model.set_training(true);
+
+                let input = fixed_pixel_values(&device);
+                let output = model.forward(&input).unwrap();
+                let weights = fixed_nonuniform_weights(output.dims(), &device);
+                let loss = (output * weights).unwrap().sum_all().unwrap();
+                let grads = loss.backward().unwrap();
+                let var = crate::test_support::find_var(&varmap, suffix);
+                grads.get(var.as_tensor()).cloned()
+            };
+            let grad = training_grad
+                .unwrap_or_else(|| panic!("{suffix} grad must be Some under training=true"));
+            let norm = grad
+                .sqr()
+                .unwrap()
+                .sum_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap()
+                .sqrt();
+            assert!(
+                norm.is_finite(),
+                "{suffix} grad norm must be finite under training=true, got {norm}"
+            );
+            assert!(
+                norm > 0.0,
+                "{suffix} grad norm must be nonzero under training=true, got {norm}"
+            );
+
+            let eval_grad = {
+                let varmap = VarMap::new();
+                let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+                let model = OpenClipVisionTransformer::load(vb.pp("visual"), &config).unwrap();
+                break_zero_init_symmetry(&varmap, &device);
+                // training defaults to false; forward without calling set_training.
+
+                let input = fixed_pixel_values(&device);
+                let output = model.forward(&input).unwrap();
+                let weights = fixed_nonuniform_weights(output.dims(), &device);
+                let loss = (output * weights).unwrap().sum_all().unwrap();
+                let grads = loss.backward().unwrap();
+                let var = crate::test_support::find_var(&varmap, suffix);
+                grads.get(var.as_tensor()).cloned()
+            };
+            assert!(
+                eval_grad.is_none(),
+                "{suffix} grad must be None under training=false"
+            );
+        }
     }
 
     /// Eval output must be byte-identical whether or not `set_training` was

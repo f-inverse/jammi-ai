@@ -367,8 +367,8 @@ fn l2_normalize(t: &Tensor) -> Result<Tensor, EncoderError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::deterministic_fill_varmap;
-    use candle_core::{DType, Device, Var};
+    use crate::test_support::{deterministic_fill_varmap, find_var, nonuniform_loss};
+    use candle_core::{DType, Device};
     use candle_nn::VarMap;
 
     /// Replace every variable in `varmap` with a random tensor of the same
@@ -380,20 +380,6 @@ mod tests {
             let random = Tensor::randn(0f32, 0.1, shape, device).unwrap();
             var.set(&random).unwrap();
         }
-    }
-
-    /// Locate the [`Var`] whose VarMap key ends with `suffix` (VarBuilder
-    /// keys are dot-joined paths, e.g. `transformer.resblocks.0.attn.in_proj_weight`).
-    fn find_var(varmap: &VarMap, suffix: &str) -> Var {
-        let data = varmap.data().lock().unwrap();
-        data.iter()
-            .find(|(k, _)| k.ends_with(suffix))
-            .unwrap_or_else(|| {
-                let keys: Vec<_> = data.keys().collect();
-                panic!("no var with suffix '{suffix}' in varmap; keys: {keys:?}")
-            })
-            .1
-            .clone()
     }
 
     /// Fixed (non-random) 2-sequence batch, EOT (highest ID) trailing padding
@@ -533,15 +519,6 @@ mod tests {
             .map(|v| v * v)
             .sum::<f32>()
             .sqrt()
-    }
-
-    /// Non-uniform per-`embed_dim` weights so `loss = (out * weights).sum()`
-    /// cannot accidentally cancel a broken (e.g. sign-flipped or transposed)
-    /// gradient reduction the way a uniform-weight sum could.
-    fn nonuniform_loss(out: &Tensor, embed_dim: usize, device: &Device) -> Tensor {
-        let weights: Vec<f32> = (0..embed_dim).map(|i| 1.0 + i as f32 * 0.37).collect();
-        let weights = Tensor::from_vec(weights, embed_dim, device).unwrap();
-        out.broadcast_mul(&weights).unwrap().sum_all().unwrap()
     }
 
     /// Run token embedding + positional embedding + ONLY block 0 (not the
@@ -772,6 +749,88 @@ mod tests {
             "in_proj_weight grad must be None under eval through the full forward, not merely \
              zero in its Q/K rows — ln_final severs the V-slice's surviving path too"
         );
+    }
+
+    /// Deletion-catching oracle for the residual-stream LayerNorms
+    /// themselves (`ln_1`/`ln_2`, block 0): every OTHER gradient assertion
+    /// in this file reaches its target parameter THROUGH the block's
+    /// residual bypass (`shortcut + attn`, `hidden + mlp_out` —
+    /// [`block0_backward`]'s doc), so a dropped `self.ln_1.set_training(training)`
+    /// / `self.ln_2.set_training(training)` line (leaving that ONE
+    /// LayerNorm stuck on its fused, `BackpropOp::none()`-truncated eval
+    /// arm even when the rest of the tower is `training=true`) would NOT
+    /// be caught by any test above: the residual path still carries a
+    /// gradient to `in_proj_weight`/`token_embedding` regardless of `ln_1`/
+    /// `ln_2`'s own truncation. This test asserts `ln_1`/`ln_2`'s OWN
+    /// `weight` — not anything upstream of it — through the full public
+    /// `forward`: `Some`/finite/nonzero under `training=true`, `None` under
+    /// `training=false` (`(Some(bias), false)`'s fused arm is
+    /// `BackpropOp::none()` on ALL three of its operands, including
+    /// `weight` itself — see `crate::layer_norm::LayerNorm::forward`).
+    /// RED-verified: deleting `self.ln_1.set_training(training)` from
+    /// `ResidualAttentionBlock::set_training` flips the training=true half
+    /// of this test (ln_1.weight comes back `None` instead of `Some`)
+    /// while every other test in this file stays green.
+    #[test]
+    fn ln_1_and_ln_2_own_weight_gradient_present_under_training_absent_under_eval() {
+        let cfg = tiny_config();
+        let device = Device::Cpu;
+
+        let training_grad = |name: &str| -> Option<Tensor> {
+            let varmap = VarMap::new();
+            let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+            let mut model = ClipText::load(vb, &cfg).unwrap();
+            deterministic_fill_varmap(&varmap, &device);
+            model.set_training(true);
+
+            let (input_ids, mask) = fixed_batch(&cfg, &device);
+            let out = model.forward(&input_ids, &mask).unwrap();
+            let loss = nonuniform_loss(&out, cfg.embed_dim, &device);
+            let grads = loss.backward().unwrap();
+            let var = find_var(&varmap, name);
+            grads.get(var.as_tensor()).cloned()
+        };
+        let eval_grad = |name: &str| -> Option<Tensor> {
+            let varmap = VarMap::new();
+            let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+            let model = ClipText::load(vb, &cfg).unwrap();
+            deterministic_fill_varmap(&varmap, &device);
+            // training defaults to false; forward without calling set_training.
+
+            let (input_ids, mask) = fixed_batch(&cfg, &device);
+            let out = model.forward(&input_ids, &mask).unwrap();
+            let loss = nonuniform_loss(&out, cfg.embed_dim, &device);
+            let grads = loss.backward().unwrap();
+            let var = find_var(&varmap, name);
+            grads.get(var.as_tensor()).cloned()
+        };
+
+        for name in ["resblocks.0.ln_1.weight", "resblocks.0.ln_2.weight"] {
+            let grad = training_grad(name)
+                .unwrap_or_else(|| panic!("{name} grad must be Some under training=true"));
+            let norm = grad
+                .sqr()
+                .unwrap()
+                .sum_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap()
+                .sqrt();
+            assert!(
+                norm.is_finite(),
+                "{name} grad norm must be finite under training=true, got {norm}"
+            );
+            assert!(
+                norm > 0.0,
+                "{name} grad norm must be nonzero under training=true, got {norm}"
+            );
+
+            assert!(
+                eval_grad(name).is_none(),
+                "{name} grad must be None under training=false (eval's fused LayerNorm arm is \
+                 BackpropOp::none() on every operand, including its own weight)"
+            );
+        }
     }
 
     /// Eval output is unaffected by ever having toggled training on and back

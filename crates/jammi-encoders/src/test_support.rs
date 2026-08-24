@@ -4,7 +4,7 @@
 //! way to avoid duplicating a test helper verbatim in every tower's own
 //! `tests` mod.
 
-use candle_core::{Device, Tensor};
+use candle_core::{Device, Tensor, Var};
 use candle_nn::VarMap;
 
 /// Deterministic (non-RNG) fill: every variable gets values from a fixed LCG
@@ -12,8 +12,7 @@ use candle_nn::VarMap;
 /// independent test functions that each build a fresh `VarMap` land on
 /// bit-identical weights — required for a training/eval defect-shape pair
 /// that must observe the SAME fixture from two separate `#[test]`
-/// functions. (Was duplicated verbatim between `clip_text.rs`'s and
-/// `htsat_audio.rs`'s `tests` mods; this is the one copy both now call.)
+/// functions. The one copy `clip_text.rs` and `htsat_audio.rs` both call.
 ///
 /// Domain-validity edge case this fill must honor for towers that load a
 /// `BatchNorm` (HTSAT): `running_var` is a VARIANCE, not an unconstrained
@@ -52,4 +51,29 @@ pub(crate) fn deterministic_fill_varmap(varmap: &VarMap, device: &Device) {
         var.set(&Tensor::from_vec(values, shape, device).unwrap())
             .unwrap();
     }
+}
+
+/// Locate the [`Var`] whose VarMap key ends with `suffix` (VarBuilder keys
+/// are dot-joined paths, e.g. `transformer.resblocks.0.attn.in_proj_weight`).
+/// The one copy `clip_text.rs` and `htsat_audio.rs` both call.
+pub(crate) fn find_var(varmap: &VarMap, suffix: &str) -> Var {
+    let data = varmap.data().lock().unwrap();
+    data.iter()
+        .find(|(k, _)| k.ends_with(suffix))
+        .unwrap_or_else(|| {
+            let keys: Vec<_> = data.keys().collect();
+            panic!("no var with suffix '{suffix}' in varmap; keys: {keys:?}")
+        })
+        .1
+        .clone()
+}
+
+/// Non-uniform per-channel weights so `loss = (out * weights).sum()` cannot
+/// accidentally cancel a broken (e.g. sign-flipped or transposed) gradient
+/// reduction the way a uniform-weight sum could. The one copy `clip_text.rs`
+/// and `htsat_audio.rs` both call.
+pub(crate) fn nonuniform_loss(out: &Tensor, channels: usize, device: &Device) -> Tensor {
+    let weights: Vec<f32> = (0..channels).map(|i| 1.0 + i as f32 * 0.37).collect();
+    let weights = Tensor::from_vec(weights, channels, device).unwrap();
+    out.broadcast_mul(&weights).unwrap().sum_all().unwrap()
 }

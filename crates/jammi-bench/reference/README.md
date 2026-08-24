@@ -180,9 +180,11 @@ flag; build a distribution/trajectory-equivalence test instead.
 
 `finetune_step.rs`'s `VramSampler` polls whole-device memory via `nvidia-smi`
 on a background thread every 25ms over the ENTIRE step loop (warmup +
-measured), then subtracts a baseline snapshot read once, right after the
-model+optimizer are built (before the loop starts) — see
-`finetune_step.rs:112,:233`.
+measured), then subtracts a baseline snapshot (`vram_baseline`, read via
+`device_memory_used_bytes`) taken once, right after the model+optimizer are
+built (before the loop starts) — see `VramSampler` and the `vram_baseline`
+read inside `finetune_step::run` (a line number would drift the next time
+`run` grows; the names do not).
 
 **An earlier draft of this script got the sampling point wrong.** It polled
 `torch.cuda.memory_allocated()` once per step, at the same point the clock

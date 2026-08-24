@@ -247,7 +247,25 @@ impl ModelType {
         config_json: &serde_json::Value,
         override_type: Option<&str>,
     ) -> Result<DetectedModel, ModelTypeError> {
-        let file_type = config_json.get("model_type").and_then(|v| v.as_str());
+        // A3: type the field strictly. A bare `.and_then(|v| v.as_str())`
+        // collapses "the key is missing" and "the key is present but holds
+        // a non-string JSON value" (`{"model_type": 42}`) into the same
+        // `None` — under-detecting a malformed checkpoint AND falsifying
+        // `DetectedModel::config_model_type`'s documented invariant
+        // ("`None` ONLY when the field is literally absent"): a present,
+        // malformed field would otherwise report `config_model_type: null`
+        // exactly as if nothing were declared. `null` is still treated as
+        // "no declaration" (JSON's own idiom for absence); every other
+        // non-string value present is a typed refusal.
+        let file_type: Option<&str> = match config_json.get("model_type") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(s)) => Some(s.as_str()),
+            Some(other) => {
+                return Err(ModelTypeError::NonStringModelType {
+                    value: other.clone(),
+                });
+            }
+        };
         // Parse the override to a `ModelType` FIRST, before it is compared
         // against anything `config.json` declares. An invalid `--model-type`
         // value (not one of `Self::ALL`) must be refused as an invalid FLAG
@@ -265,6 +283,24 @@ impl ModelType {
         let model_type = match (parsed_override, file_type) {
             (Some(explicit), Some(file_raw))
                 if Self::ALL.contains(&file_raw) && file_raw != explicit.as_str() =>
+            {
+                return Err(ModelTypeError::OverrideContradicts {
+                    file_type: file_raw.to_string(),
+                    override_type: explicit.as_str().to_string(),
+                });
+            }
+            // A2: `config.json` names a BERT-family sibling — not one of
+            // `Self::ALL`, so the guard above never fires for it — but an
+            // override that is anything other than `Bert` is still a
+            // genuine mislabel, not the "resolve a sibling declaration"
+            // case the override exists for (see this fn's doc and
+            // `ModelTypeError::OverrideContradicts`'s doc). Before this
+            // arm, `(Some(explicit), _) => explicit` silently accepted
+            // e.g. a `roberta`-declared file with `--model-type
+            // distilbert`, which then died untyped deep inside the
+            // DistilBERT loader instead of refusing here.
+            (Some(explicit), Some(file_raw))
+                if Self::BERT_FAMILY_SIBLINGS.contains(&file_raw) && explicit != Self::Bert =>
             {
                 return Err(ModelTypeError::OverrideContradicts {
                     file_type: file_raw.to_string(),
@@ -368,17 +404,32 @@ pub enum ModelTypeError {
     /// `config.json` has no `model_type` field and no `--model-type`
     /// override was supplied.
     Absent,
-    /// `config.json` names one of this tier's own three types
-    /// ([`ModelType::ALL`]) and `--model-type` names a *different*, itself
-    /// VALID one — a genuine mislabel, not a gap. The override exists to
-    /// resolve a checkpoint whose own declaration is absent, a BERT-family
-    /// sibling ([`ModelType::BERT_FAMILY_SIBLINGS`]), or anything else this
-    /// tier does not itself build; it is not a licence to relabel a
-    /// checkpoint that already declares itself one of the three, since that
-    /// would drive the wrong builder while the report still carries the
-    /// override's label. An INVALID override never reaches this variant —
-    /// [`ModelType::detect`] parses (and can therefore refuse) the override
-    /// before it is ever compared against `config.json`.
+    /// Either of two genuine mislabels, both refused the same way because
+    /// both mean "the override does not resolve what this checkpoint
+    /// actually is":
+    ///
+    /// - `config.json` names one of this tier's own three types
+    ///   ([`ModelType::ALL`]) and `--model-type` names a *different*, itself
+    ///   VALID one. The override exists to resolve a checkpoint whose own
+    ///   declaration is absent, a BERT-family sibling
+    ///   ([`ModelType::BERT_FAMILY_SIBLINGS`]), or anything else this tier
+    ///   does not itself build; it is not a licence to relabel a checkpoint
+    ///   that already declares itself one of the three, since that would
+    ///   drive the wrong builder while the report still carries the
+    ///   override's label.
+    /// - `config.json` names a BERT-family sibling
+    ///   ([`ModelType::BERT_FAMILY_SIBLINGS`]) and `--model-type` names
+    ///   anything other than [`ModelType::Bert`]. A sibling is driven ONLY
+    ///   through the `Bert` builder (siblings load through the same tensor
+    ///   layout `"bert"` does); any other override is not "resolving an
+    ///   ambiguous file", it is asking this tier to force a `roberta.`-keyed
+    ///   checkpoint through, say, the DistilBERT loader, which dies deep
+    ///   inside that loader with an untyped error naming neither the real
+    ///   mismatch nor the fix.
+    ///
+    /// An INVALID override never reaches this variant — [`ModelType::detect`]
+    /// parses (and can therefore refuse) the override before it is ever
+    /// compared against `config.json`.
     OverrideContradicts {
         file_type: String,
         override_type: String,
@@ -393,6 +444,19 @@ pub enum ModelTypeError {
     /// probe to accept sibling prefixes is a known follow-up, not something
     /// this tier can work around.
     UnsupportedTensorPrefix { prefix: String },
+    /// `config.json`'s `model_type` field is PRESENT but is not a JSON
+    /// string (e.g. `{"model_type": 42}`) — refused rather than silently
+    /// folded into "absent". A bare `.and_then(|v| v.as_str())` read
+    /// collapses "the field is missing" and "the field is present but the
+    /// wrong JSON type" into the same `None`, which both under-detects a
+    /// genuinely malformed checkpoint AND falsifies
+    /// [`DetectedModel::config_model_type`]'s documented invariant
+    /// ("`None` ONLY when the field is literally absent") — a present,
+    /// malformed field would report `config_model_type: null` exactly as if
+    /// nothing were declared at all. `null` (JSON's own "no value") is
+    /// still treated as absent; every other non-string type is this
+    /// variant.
+    NonStringModelType { value: serde_json::Value },
 }
 
 impl std::fmt::Display for ModelTypeError {
@@ -431,6 +495,19 @@ impl std::fmt::Display for ModelTypeError {
             Self::OverrideContradicts {
                 file_type,
                 override_type,
+            } if ModelType::BERT_FAMILY_SIBLINGS.contains(&file_type.as_str()) => write!(
+                f,
+                "config.json declares model_type {file_type:?}, a BERT-family sibling \
+                 ({:?}), which this tier only drives through the Bert builder — pass \
+                 --model-type bert to load it, not --model-type {override_type:?}. A \
+                 sibling's tensor layout (bert.-prefixed or root) is what the Bert builder \
+                 knows; forcing it through a different builder fails deep inside that \
+                 builder's own loader instead of here",
+                ModelType::BERT_FAMILY_SIBLINGS
+            ),
+            Self::OverrideContradicts {
+                file_type,
+                override_type,
             } => write!(
                 f,
                 "config.json declares model_type {file_type:?}, one of this tier's own {:?}, \
@@ -452,6 +529,12 @@ impl std::fmt::Display for ModelTypeError {
                  under its own class name, a third layout this tier cannot drive through \
                  --model-type bert; widening jammi-encoders' bert.rs prefix probe to accept \
                  sibling prefixes is a known follow-up, not something this tier can work around."
+            ),
+            Self::NonStringModelType { value } => write!(
+                f,
+                "config.json's model_type field is present but is not a string ({value}); \
+                 expected one of {:?}, or omit the field entirely and pass --model-type",
+                ModelType::ALL
             ),
         }
     }
@@ -622,25 +705,46 @@ impl std::error::Error for VocabTooSmallError {}
 /// this module's top-level doc); it can only refuse typed, before the
 /// misleading error, naming the prefix it actually found.
 ///
-/// `None` (no tensor ending in the embeddings-weight suffix at all) is
-/// deliberately let through unblocked: that is not the sibling-prefix case
-/// this check exists for, and the encoder's own build will surface
+/// No candidate at all (no tensor ending in the embeddings-weight suffix)
+/// is deliberately let through unblocked: that is not the sibling-prefix
+/// case this check exists for, and the encoder's own build will surface
 /// whatever is actually wrong with a checkpoint that lacks the tensor
 /// entirely.
+///
+/// B1: collects EVERY candidate prefix rather than taking the first hit
+/// off an unordered iterator. `MmapedSafetensors::tensors()` flattens an
+/// internal `HashMap`, so a checkpoint carrying more than one tensor
+/// ending in the embeddings-weight suffix (e.g. a `"bert."`-prefixed
+/// embedding table alongside a second, sibling-prefixed one in the same
+/// file) previously produced a NONDETERMINISTIC verdict — an audit
+/// measured 5 runs over identical bytes split 3 refused / 2 loaded,
+/// because `find_map` returned whichever candidate the `HashMap`'s
+/// iteration happened to yield first that run, and the refusal (when it
+/// fired) named that arbitrary candidate rather than the layout that was
+/// actually unsupported. Sorting the full candidate set makes the verdict
+/// a pure function of the SET of prefixes present, not of iteration
+/// order: accept whenever a `Bert`-loadable prefix (`""` or `"bert."`) is
+/// among the candidates — mirroring the `Bert` builder's own probe
+/// (`bert.rs:508`), which looks for that prefix and, finding it, loads
+/// through it regardless of what else the file also contains — and
+/// otherwise refuse deterministically, naming every candidate found.
 fn probe_bert_tensor_prefix(weights: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     const EMBEDDING_SUFFIX: &str = "embeddings.word_embeddings.weight";
     let mapped = unsafe { candle_core::safetensors::MmapedSafetensors::new(weights) }?;
-    let found_prefix = mapped
+    let mut candidates: Vec<String> = mapped
         .tensors()
         .into_iter()
-        .find_map(|(name, _)| name.strip_suffix(EMBEDDING_SUFFIX).map(str::to_string));
-    match found_prefix.as_deref() {
-        None | Some("") | Some("bert.") => Ok(()),
-        Some(other) => Err(ModelTypeError::UnsupportedTensorPrefix {
-            prefix: other.to_string(),
-        }
-        .into()),
+        .filter_map(|(name, _)| name.strip_suffix(EMBEDDING_SUFFIX).map(str::to_string))
+        .collect();
+    candidates.sort();
+    candidates.dedup();
+    if candidates.is_empty() || candidates.iter().any(|p| p.is_empty() || p == "bert.") {
+        return Ok(());
     }
+    Err(ModelTypeError::UnsupportedTensorPrefix {
+        prefix: candidates.join(", "),
+    }
+    .into())
 }
 
 /// Deterministic synthetic token ids, uniform over `[1, vocab)` so no id is the
@@ -1178,6 +1282,35 @@ mod tests {
         write_tiny_bert_checkpoint(device, layers, "roberta.", "roberta")
     }
 
+    /// A checkpoint whose safetensors carries tensors under TWO different
+    /// prefixes that both end in `probe_bert_tensor_prefix`'s
+    /// embeddings-weight suffix — the exact shape that exposed B1's
+    /// `find_map`-over-a-`HashMap` nondeterminism (an audit's 5 runs on
+    /// identical bytes split 3 refused / 2 loaded). `primary_prefix` is
+    /// layered first via a full BERT-shaped tensor set
+    /// ([`write_tiny_bert_checkpoint`]); `extra_prefix` contributes ONE
+    /// extra tensor ending in that same suffix — enough to give the probe a
+    /// second candidate, since it only inspects tensor NAMES, never shapes
+    /// or values.
+    fn write_tiny_bert_checkpoint_with_extra_embedding_prefix(
+        device: &Device,
+        layers: usize,
+        primary_prefix: &str,
+        primary_model_type: &str,
+        extra_prefix: &str,
+    ) -> tempfile::TempDir {
+        let dir = write_tiny_bert_checkpoint(device, layers, primary_prefix, primary_model_type);
+        let path = dir.path().join("model.safetensors");
+        let mut tensors: HashMap<String, Tensor> =
+            candle_core::safetensors::load(&path, device).expect("reload safetensors");
+        tensors.insert(
+            format!("{extra_prefix}embeddings.word_embeddings.weight"),
+            Tensor::randn(0f32, 0.02, (4usize, 4usize), device).expect("randn extra embedding"),
+        );
+        candle_core::safetensors::save(&tensors, &path).expect("overwrite with extra prefix");
+        dir
+    }
+
     /// Write a tiny synthetic ModernBERT checkpoint (config.json +
     /// model.safetensors) under the HuggingFace `"model."`-prefixed
     /// tensor-key convention `jammi_encoders::ModernBert::builder().build`
@@ -1416,22 +1549,36 @@ mod tests {
     /// catch a per-layer selector mutation).
     const SMOKE_LAYERS: usize = 3;
 
-    /// B1: the exact trainable-tensor count `target_modules` must produce
-    /// on a `layers`-layer encoder, derived from the SAME
-    /// `jammi_lora::should_apply_lora` vocabulary table the
-    /// `*_selector_vocabulary_matches_real_module_names` tests below use —
-    /// so this multiplication is pinned against the production matcher,
-    /// not a hand-derived constant that could silently drift from it. Each
-    /// matched site carries exactly 2 trainable tensors (LoRA A and B).
+    /// A1: the exact trainable-tensor count `target_modules` must produce
+    /// on a `layers`-layer encoder, derived by calling the SAME
+    /// site-enumeration function production uses
+    /// (`jammi_lora::should_apply_lora`) with the WHOLE selector list at
+    /// once, per module — matching production's UNION semantics: a module
+    /// gets at most one adapter no matter how many selectors in
+    /// `target_modules` match it, because `should_apply_lora` itself takes
+    /// the full target list and returns one bool per module, never one bool
+    /// per (module, selector) pair.
+    ///
+    /// An earlier draft summed [`sites_matched`] (a PER-SELECTOR match
+    /// count) across `target_modules`, which double-counts a module matched
+    /// by more than one selector — e.g. BERT's `["output.dense",
+    /// "attention.output.dense"]`: `"output.dense"` matches 2 sites
+    /// (`attention.output.dense` ends with it too) and
+    /// `"attention.output.dense"` matches 1 (itself), summing to 3 distinct
+    /// "matches" over only 2 distinct MODULES — inflating the oracle to 18
+    /// trainable tensors at `SMOKE_LAYERS` where production (and this
+    /// union-based rewrite) produces 12. Each matched module carries
+    /// exactly 2 trainable tensors (LoRA A and B).
     fn expected_trainable_tensors(
         target_modules: &[&str],
         module_names: &[&str],
         layers: usize,
     ) -> usize {
-        let matched_per_layer: usize = target_modules
+        let targets: Vec<String> = target_modules.iter().map(|s| s.to_string()).collect();
+        let matched_per_layer = module_names
             .iter()
-            .map(|selector| sites_matched(selector, module_names))
-            .sum();
+            .filter(|name| jammi_lora::should_apply_lora(name, &targets, 0, &None))
+            .count();
         matched_per_layer * layers * 2
     }
 
@@ -1453,6 +1600,31 @@ mod tests {
             tier.trainable_tensors,
             expected_trainable_tensors(&targets, &bert_module_names(), SMOKE_LAYERS)
         );
+    }
+
+    /// A1: overlapping selectors apply LoRA to each matched MODULE at most
+    /// once (production's union semantics via `should_apply_lora` taking
+    /// the whole target list per module), not once per (module, selector)
+    /// pair. `"output.dense"` and `"attention.output.dense"` both match
+    /// BERT's `attention.output.dense` site (`should_apply_lora`'s
+    /// suffix-match rule), so a per-selector SUM would double-count it —
+    /// 18 trainable tensors at `SMOKE_LAYERS` under the old oracle, 12
+    /// under production and the fixed oracle.
+    #[test]
+    fn finetune_step_end_to_end_cpu_smoke_bert_overlapping_selectors_apply_lora_once_per_module() {
+        let device = Device::Cpu;
+        let dir = write_tiny_bert_unprefixed(&device, SMOKE_LAYERS);
+        let mut params = base_params(dir.path().to_path_buf());
+        let targets = ["output.dense", "attention.output.dense"];
+        params.target_modules = Some(targets.iter().map(|s| s.to_string()).collect());
+        let tier = run(&params).expect("bert finetune step runs end-to-end on CPU");
+        let expected = expected_trainable_tensors(&targets, &bert_module_names(), SMOKE_LAYERS);
+        assert_eq!(
+            expected, 12,
+            "sanity: the fixed union-based oracle itself must be 12 (2 distinct \
+             matched modules x SMOKE_LAYERS x 2), not the old sum-based 18"
+        );
+        assert_eq!(tier.trainable_tensors, expected);
     }
 
     #[test]
@@ -1591,6 +1763,70 @@ mod tests {
         );
     }
 
+    /// B1: a checkpoint carrying BOTH a `"bert."`-prefixed embeddings
+    /// tensor AND a second, sibling-prefixed one (`"roberta."`) accepts
+    /// DETERMINISTICALLY on every one of many repeated calls against the
+    /// IDENTICAL bytes — `"bert."` is among the candidates, mirroring the
+    /// `Bert` builder's own preference. Before the fix this call's outcome
+    /// depended on `MmapedSafetensors::tensors()`'s `HashMap` iteration
+    /// order; a single call cannot distinguish "fixed" from "got lucky
+    /// this run", so this loops.
+    #[test]
+    fn probe_bert_tensor_prefix_accepts_deterministically_when_bert_prefix_is_one_of_several_candidates(
+    ) {
+        let device = Device::Cpu;
+        let dir = write_tiny_bert_checkpoint_with_extra_embedding_prefix(
+            &device,
+            SMOKE_LAYERS,
+            "bert.",
+            "bert",
+            "roberta.",
+        );
+        let weights = dir.path().join("model.safetensors");
+        for i in 0..20 {
+            probe_bert_tensor_prefix(&weights).unwrap_or_else(|e| {
+                panic!("run {i}: bert. among the candidates must accept every time, got {e}")
+            });
+        }
+    }
+
+    /// B1's refusal side: a checkpoint whose ONLY candidates are two
+    /// non-`Bert` sibling prefixes refuses DETERMINISTICALLY on every
+    /// repeated call, and the error names EVERY candidate (sorted) rather
+    /// than whichever one a `HashMap` iteration happened to surface first.
+    #[test]
+    fn probe_bert_tensor_prefix_refuses_deterministically_naming_every_candidate() {
+        let device = Device::Cpu;
+        let dir = write_tiny_bert_checkpoint_with_extra_embedding_prefix(
+            &device,
+            SMOKE_LAYERS,
+            "roberta.",
+            "roberta",
+            "camembert.",
+        );
+        let weights = dir.path().join("model.safetensors");
+        for i in 0..20 {
+            let err = probe_bert_tensor_prefix(&weights)
+                .expect_err("neither candidate is bert-loadable; must refuse every run");
+            let typed = err
+                .downcast_ref::<ModelTypeError>()
+                .unwrap_or_else(|| panic!("run {i}: refusal must be ModelTypeError, got {err}"));
+            match typed {
+                ModelTypeError::UnsupportedTensorPrefix { prefix } => {
+                    assert!(
+                        prefix.contains("camembert."),
+                        "run {i}: error must name camembert., got {prefix:?}"
+                    );
+                    assert!(
+                        prefix.contains("roberta."),
+                        "run {i}: error must name roberta., got {prefix:?}"
+                    );
+                }
+                other => panic!("run {i}: expected UnsupportedTensorPrefix, got {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn override_contradicting_config_model_type_is_a_typed_error() {
         // `"distilbert"` is one of this tier's own three (`ModelType::ALL`)
@@ -1620,6 +1856,89 @@ mod tests {
         assert_eq!(detected.model_type, ModelType::DistilBert);
         assert_eq!(detected.config_model_type.as_deref(), Some("distilbert"));
         assert_eq!(detected.model_type_override.as_deref(), Some("distilbert"));
+    }
+
+    /// A2: a BERT-family sibling declaration (not in [`ModelType::ALL`], so
+    /// the ALL-based guard never fires) with a non-`Bert` override is still
+    /// a genuine mislabel, refused the same way as the `ALL`-vs-`ALL` case
+    /// above. Before the fix `(Some(explicit), _) => explicit` accepted
+    /// this silently, driving a `roberta.`-keyed checkpoint through the
+    /// DistilBERT builder, which then died with an untyped "missing field
+    /// dim" instead of refusing here.
+    #[test]
+    fn sibling_declared_config_with_non_bert_override_is_a_typed_error() {
+        for sibling in ModelType::BERT_FAMILY_SIBLINGS {
+            let json = serde_json::json!({ "model_type": sibling });
+            let err = ModelType::detect(&json, Some("distilbert")).unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    ModelTypeError::OverrideContradicts { file_type, override_type }
+                        if file_type == sibling && override_type == "distilbert"
+                ),
+                "sibling {sibling:?}: expected OverrideContradicts, got {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains(sibling),
+                "error {msg:?} must name the sibling {sibling:?}"
+            );
+            assert!(
+                msg.contains("bert"),
+                "error {msg:?} must say --model-type bert is the way to drive a sibling"
+            );
+        }
+        // The complement: the SAME sibling declarations accept `--model-type
+        // bert` (this is the sibling-loading path the override exists
+        // for) — proving the new guard refuses ONLY a non-Bert override,
+        // not every override of a sibling-declared file.
+        for sibling in ModelType::BERT_FAMILY_SIBLINGS {
+            let json = serde_json::json!({ "model_type": sibling });
+            let detected = ModelType::detect(&json, Some("bert")).unwrap();
+            assert_eq!(detected.model_type, ModelType::Bert);
+            assert_eq!(detected.config_model_type.as_deref(), Some(sibling));
+        }
+    }
+
+    /// A3: `config.json`'s `model_type` field PRESENT but not a JSON string
+    /// (`{"model_type": 42}`) is a typed refusal, not silently folded into
+    /// "absent" the way a bare `.and_then(|v| v.as_str())` read would. Also
+    /// covers the field being a bool/array/object — every non-string,
+    /// non-null JSON type.
+    #[test]
+    fn present_non_string_model_type_is_a_typed_error_not_silently_absent() {
+        for bad in [
+            serde_json::json!(42),
+            serde_json::json!(true),
+            serde_json::json!(["bert"]),
+            serde_json::json!({ "nested": "bert" }),
+        ] {
+            let json = serde_json::json!({ "model_type": bad });
+            let err = ModelType::detect(&json, None).unwrap_err();
+            assert!(
+                matches!(&err, ModelTypeError::NonStringModelType { .. }),
+                "value {bad:?}: expected NonStringModelType, got {err:?}"
+            );
+        }
+        // `null` is still "no declaration" (JSON's own no-value idiom), not
+        // a NonStringModelType refusal — it takes the same `Absent` path as
+        // a genuinely missing key.
+        let json = serde_json::json!({ "model_type": serde_json::Value::Null });
+        assert!(matches!(
+            ModelType::detect(&json, None).unwrap_err(),
+            ModelTypeError::Absent
+        ));
+        // A present-but-malformed field refuses even when a VALID override
+        // is also supplied — the malformed `config.json` is worth
+        // surfacing on its own; a caller that wants to drive this
+        // checkpoint through `--model-type bert` regardless must fix the
+        // file, not rely on the override to paper over it silently
+        // (which is exactly how the old code produced a `config_model_type:
+        // null` that falsified B2's "None ONLY when literally absent"
+        // invariant — the field WAS present, just not a string).
+        let json = serde_json::json!({ "model_type": 42 });
+        let err = ModelType::detect(&json, Some("bert")).unwrap_err();
+        assert!(matches!(err, ModelTypeError::NonStringModelType { .. }));
     }
 
     #[test]

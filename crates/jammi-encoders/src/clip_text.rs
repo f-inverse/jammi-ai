@@ -16,9 +16,10 @@
 //! enabling cross-modal cosine similarity.
 
 use candle_core::{IndexOp, Module, Tensor, D};
-use candle_nn::{embedding, layer_norm, linear, Embedding, LayerNorm, Linear, VarBuilder};
+use candle_nn::{embedding, linear, Embedding, Linear, VarBuilder};
 
 use crate::error::EncoderError;
+use crate::layer_norm::LayerNorm;
 
 /// Architecture configuration for the OpenCLIP text transformer.
 ///
@@ -231,9 +232,16 @@ impl ResidualAttentionBlock {
     fn load(vb: VarBuilder, width: usize, heads: usize) -> Result<Self, EncoderError> {
         // OpenCLIP text transformer uses a fixed 4x MLP ratio.
         let intermediate_size = width * 4;
-        let ln_1 = layer_norm(width, 1e-5, vb.pp("ln_1"))?;
+        // `with_bias=true`: OpenCLIP's `ln_1`/`ln_2` are affine (weight AND
+        // bias), matching `candle_nn::layer_norm`'s `remove_mean=true,
+        // affine=true` default this call replaced — same "weight"/"bias"
+        // safetensors key names (`crate::layer_norm::LayerNorm::new`'s doc).
+        // No `remove_mean=false` (RMSNorm-style) variant exists anywhere in
+        // this tower's config, so the house class's fixed mean-removal is
+        // exactly the behavior being replaced, not a silent narrowing.
+        let ln_1 = LayerNorm::new(width, 1e-5, true, vb.pp("ln_1"))?;
         let attn = MultiHeadAttention::load(vb.pp("attn"), width, heads)?;
-        let ln_2 = layer_norm(width, 1e-5, vb.pp("ln_2"))?;
+        let ln_2 = LayerNorm::new(width, 1e-5, true, vb.pp("ln_2"))?;
         let mlp = Mlp::load(vb.pp("mlp"), width, intermediate_size)?;
         Ok(Self {
             ln_1,
@@ -257,6 +265,8 @@ impl ResidualAttentionBlock {
 
     fn set_training(&mut self, training: bool) {
         self.attn.set_training(training);
+        self.ln_1.set_training(training);
+        self.ln_2.set_training(training);
     }
 }
 
@@ -308,7 +318,7 @@ impl ClipText {
             blocks.push(block);
         }
 
-        let ln_final = layer_norm(config.width, 1e-5, vb.pp("ln_final"))?;
+        let ln_final = LayerNorm::new(config.width, 1e-5, true, vb.pp("ln_final"))?;
         let text_projection = vb.get((config.width, config.embed_dim), "text_projection")?;
 
         let causal_mask = build_causal_mask(config.context_length, vb.device())?;
@@ -389,15 +399,24 @@ impl ClipText {
         self.config.context_length
     }
 
-    /// Switch every block's attention softmax between the eval (no-backward)
-    /// arm and the differentiable composed arm — see
-    /// [`MultiHeadAttention::forward`]'s doc for why the two arms exist. Eval
-    /// output is unaffected either way; only backward through this tower's
-    /// gradient is correct in training mode.
+    /// Switch every block's attention softmax AND every LayerNorm (`ln_1`,
+    /// `ln_2` per block, plus `ln_final`) between the eval (no-backward) arm
+    /// and the differentiable composed arm — see
+    /// [`MultiHeadAttention::forward`]'s doc for the softmax truncation and
+    /// [`crate::layer_norm::LayerNorm`]'s module doc for the identical
+    /// `BackpropOp::none()` truncation in `candle_nn::LayerNorm`'s own fast
+    /// path. Both are load-bearing together: before `ln_final` was gated,
+    /// backward through the tower's public `forward` truncated at `ln_final`
+    /// regardless of the attention fix, giving NO gradient at all (not even
+    /// a partial one) to every parameter used earlier — see
+    /// `tests::training_true_full_forward_reaches_every_parameter` for the
+    /// full end-to-end oracle. Eval output is unaffected either way; only
+    /// backward through this tower's gradient is correct in training mode.
     pub fn set_training(&mut self, training: bool) {
         for block in &mut self.blocks {
             block.set_training(training);
         }
+        self.ln_final.set_training(training);
     }
 }
 
@@ -777,6 +796,101 @@ mod tests {
             token_embedding_grad.is_some(),
             "token embedding grad is still reachable via the block's residual stream under eval \
              (only Q/K are severed by softmax_last_dim, not the whole graph)"
+        );
+    }
+
+    /// End-to-end RED oracle through the FULL public `forward` (not the
+    /// block-level bypass above): with BOTH the attention-softmax arm and
+    /// every `LayerNorm` (`ln_1`/`ln_2` per block, `ln_final`) gated on
+    /// `training`, backward through `model.forward(...)`'s pooled,
+    /// L2-normalized output reaches every parameter used anywhere in the
+    /// tower. Fails if EITHER gate regresses: reverting only the softmax arm
+    /// leaves Q/K severed (same failure this test would show even with
+    /// `ln_final` fixed); reverting only `ln_final`'s gate severs backward
+    /// entirely before it reaches ANY block (the token embedding assertion
+    /// would fail first, since `ln_final` sits strictly downstream of every
+    /// block). This is the shape a real training loop would have hit: no
+    /// error, just gradients that silently never update Q/K or the earlier
+    /// layers.
+    #[test]
+    fn training_true_full_forward_reaches_every_parameter() {
+        let cfg = tiny_config();
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let mut model = ClipText::load(vb, &cfg).unwrap();
+        deterministic_fill_varmap(&varmap, &device);
+        model.set_training(true);
+
+        let (input_ids, mask) = fixed_batch(&cfg, &device);
+        let out = model.forward(&input_ids, &mask).unwrap();
+        let loss = nonuniform_loss(&out, cfg.embed_dim, &device);
+        let grads = loss.backward().unwrap();
+
+        let token_embedding = find_var(&varmap, "token_embedding.weight");
+        assert!(
+            grads.get(token_embedding.as_tensor()).is_some(),
+            "token embedding grad must be Some under training=true through the full forward"
+        );
+
+        let in_proj_weight = find_var(&varmap, "resblocks.0.attn.in_proj_weight");
+        let grad = grads
+            .get(in_proj_weight.as_tensor())
+            .expect("layer-0 in_proj_weight must have a gradient under training=true");
+        let width = cfg.width;
+        let q_norm = slice_grad_norm(grad, 0, width);
+        let k_norm = slice_grad_norm(grad, width, width);
+        let v_norm = slice_grad_norm(grad, 2 * width, width);
+        assert!(
+            q_norm > 0.0,
+            "Q slice grad norm must be nonzero, got {q_norm}"
+        );
+        assert!(
+            k_norm > 0.0,
+            "K slice grad norm must be nonzero, got {k_norm}"
+        );
+        assert!(
+            v_norm > 0.0,
+            "V slice grad norm must be nonzero, got {v_norm}"
+        );
+    }
+
+    /// The eval-mode observable a user of this tower would actually hit
+    /// before either gate existed: `model.forward(...)`'s backward yields NO
+    /// gradient entry AT ALL (`grads.get(...).is_none()`, not a partial or
+    /// zero one) for the token embedding or `in_proj_weight`, because
+    /// `ln_final`'s own `BackpropOp::none()` truncates backward before it
+    /// reaches ANY block, independent of the softmax arm (which is a
+    /// SEPARATE, strictly-worse truncation one hop earlier). This documents
+    /// the pre-fix full-tower failure mode: not "Q/K come back zero" (that's
+    /// only visible below `ln_final`, per the block-level tests above) but
+    /// "nothing upstream of `ln_final` gets a gradient at all."
+    #[test]
+    fn training_false_full_forward_grads_are_none_before_ln_final() {
+        let cfg = tiny_config();
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let model = ClipText::load(vb, &cfg).unwrap();
+        deterministic_fill_varmap(&varmap, &device);
+        // training defaults to false; forward without calling set_training.
+
+        let (input_ids, mask) = fixed_batch(&cfg, &device);
+        let out = model.forward(&input_ids, &mask).unwrap();
+        let loss = nonuniform_loss(&out, cfg.embed_dim, &device);
+        let grads = loss.backward().unwrap();
+
+        let token_embedding = find_var(&varmap, "token_embedding.weight");
+        assert!(
+            grads.get(token_embedding.as_tensor()).is_none(),
+            "token embedding grad must be None under eval through the full forward \
+             (ln_final truncates backward before it reaches any block)"
+        );
+        let in_proj_weight = find_var(&varmap, "resblocks.0.attn.in_proj_weight");
+        assert!(
+            grads.get(in_proj_weight.as_tensor()).is_none(),
+            "in_proj_weight grad must be None under eval through the full forward, not merely \
+             zero in its Q/K rows — ln_final severs the V-slice's surviving path too"
         );
     }
 

@@ -26,11 +26,12 @@
 
 use candle_core::{IndexOp, Module, ModuleT, Tensor, D};
 use candle_nn::{
-    batch_norm, conv2d, layer_norm, linear, linear_no_bias, BatchNorm, BatchNormConfig, Conv2d,
-    Conv2dConfig, LayerNorm, Linear, VarBuilder,
+    batch_norm, conv2d, linear, linear_no_bias, BatchNorm, BatchNormConfig, Conv2d, Conv2dConfig,
+    Linear, VarBuilder,
 };
 
 use crate::error::EncoderError;
+use crate::layer_norm::LayerNorm;
 
 /// Architecture configuration for the HTSAT-Swin CLAP audio tower, deserialized
 /// from a HuggingFace `ClapAudioConfig` (`config.json` or the `audio_config`
@@ -372,9 +373,14 @@ impl HtsatPatchEmbed {
         let mel_conv2d_bias = mel.get(config.patch_embeds_hidden_size, "bias")?;
 
         let fusion_model = AffBlock::load(vb.pp("fusion_model"), config)?;
-        let norm = layer_norm(
+        // `with_bias=true`: this config never sets a `remove_mean=false`
+        // (RMSNorm-style) variant anywhere — see
+        // `crate::layer_norm::LayerNorm::new`'s doc for the "weight"/"bias"
+        // safetensors names this reads, unchanged from `candle_nn::layer_norm`.
+        let norm = LayerNorm::new(
             config.patch_embeds_hidden_size,
             config.layer_norm_eps,
+            true,
             vb.pp("norm"),
         )?;
 
@@ -495,7 +501,11 @@ impl HtsatPatchEmbed {
 
         // Flatten the patch grid and LayerNorm: [B, C, gh, gw] -> [B, gh*gw, C].
         let flat = patch_map.flatten_from(2)?.transpose(1, 2)?.contiguous()?;
-        Ok(self.norm.forward(&flat)?)
+        self.norm.forward(&flat)
+    }
+
+    fn set_training(&mut self, training: bool) {
+        self.norm.set_training(training);
     }
 }
 
@@ -708,7 +718,9 @@ impl SwinBlock {
         device: &candle_core::Device,
     ) -> Result<Self, EncoderError> {
         let eps = config.layer_norm_eps;
-        let layernorm_before = layer_norm(dim, eps, vb.pp("layernorm_before"))?;
+        // `with_bias=true`: no `remove_mean=false` variant exists in this
+        // config — see `HtsatPatchEmbed::load`'s note on the same class.
+        let layernorm_before = LayerNorm::new(dim, eps, true, vb.pp("layernorm_before"))?;
         let attention = SwinSelfAttention::load(
             vb.pp("attention").pp("self"),
             dim,
@@ -716,7 +728,7 @@ impl SwinBlock {
             config.window_size,
         )?;
         let attention_output = linear(dim, dim, vb.pp("attention").pp("output").pp("dense"))?;
-        let layernorm_after = layer_norm(dim, eps, vb.pp("layernorm_after"))?;
+        let layernorm_after = LayerNorm::new(dim, eps, true, vb.pp("layernorm_after"))?;
         let inter = (config.mlp_ratio * dim as f64) as usize;
         let intermediate = linear(dim, inter, vb.pp("intermediate").pp("dense"))?;
         let output = linear(inter, dim, vb.pp("output").pp("dense"))?;
@@ -850,6 +862,8 @@ impl SwinBlock {
 
     fn set_training(&mut self, training: bool) {
         self.attention.set_training(training);
+        self.layernorm_before.set_training(training);
+        self.layernorm_after.set_training(training);
     }
 }
 
@@ -868,13 +882,19 @@ impl PatchMerging {
         dim: usize,
         input_resolution: (usize, usize),
     ) -> Result<Self, EncoderError> {
-        let norm = layer_norm(4 * dim, config.layer_norm_eps, vb.pp("norm"))?;
+        // `with_bias=true`: no `remove_mean=false` variant exists in this
+        // config — see `HtsatPatchEmbed::load`'s note on the same class.
+        let norm = LayerNorm::new(4 * dim, config.layer_norm_eps, true, vb.pp("norm"))?;
         let reduction = linear_no_bias(4 * dim, 2 * dim, vb.pp("reduction"))?;
         Ok(Self {
             norm,
             reduction,
             input_resolution,
         })
+    }
+
+    fn set_training(&mut self, training: bool) {
+        self.norm.set_training(training);
     }
 
     fn forward(&self, hidden: &Tensor) -> Result<Tensor, EncoderError> {
@@ -944,6 +964,9 @@ impl SwinStage {
     fn set_training(&mut self, training: bool) {
         for block in &mut self.blocks {
             block.set_training(training);
+        }
+        if let Some(downsample) = &mut self.downsample {
+            downsample.set_training(training);
         }
     }
 }
@@ -1027,7 +1050,14 @@ impl HtsatAudioEncoder {
                 device,
             )?);
         }
-        let norm = layer_norm(config.hidden_size, config.layer_norm_eps, vb.pp("norm"))?;
+        // `with_bias=true`: no `remove_mean=false` variant exists in this
+        // config — see `HtsatPatchEmbed::load`'s note on the same class.
+        let norm = LayerNorm::new(
+            config.hidden_size,
+            config.layer_norm_eps,
+            true,
+            vb.pp("norm"),
+        )?;
 
         Ok(Self {
             batch_norm,
@@ -1175,12 +1205,23 @@ impl HtsatAudioEncoder {
         self.grid
     }
 
-    /// Propagate the training flag to every stage's blocks — see
-    /// [`SwinSelfAttention::forward`]'s doc for why the flag exists.
+    /// Propagate the training flag to every stage's blocks (attention
+    /// softmax AND `layernorm_before`/`layernorm_after`/`PatchMerging::norm`
+    /// — see [`SwinSelfAttention::forward`]'s doc for the softmax truncation
+    /// and [`crate::layer_norm::LayerNorm`]'s module doc for the identical
+    /// `BackpropOp::none()` truncation candle_nn's own LayerNorm fast path
+    /// has), plus the patch-embed norm and this encoder's own final norm —
+    /// every LayerNorm the front-half + spine + pooling boundary touches.
+    /// Before the final norm was gated, backward through
+    /// `HtsatAudio::forward`'s public output truncated there regardless of
+    /// the attention fix, giving NO gradient at all to anything upstream —
+    /// see `tests::training_true_full_forward_reaches_every_parameter`.
     fn set_training(&mut self, training: bool) {
+        self.patch_embed.set_training(training);
         for stage in &mut self.stages {
             stage.set_training(training);
         }
+        self.norm.set_training(training);
     }
 }
 
@@ -1337,19 +1378,36 @@ mod tests {
     /// Deterministic (non-RNG) fill, identical LCG scheme to
     /// `clip_text::tests::deterministic_fill_varmap` — see that doc for why
     /// this must be reproducible rather than seeded-RNG.
+    ///
+    /// Domain-validity edge case unique to this tower: `BatchNorm`'s
+    /// `running_var` is a VARIANCE, not an unconstrained parameter — it must
+    /// stay non-negative (`forward` computes `1/sqrt(running_var + eps)`),
+    /// unlike every other weight/bias this fixture fills. A naive symmetric
+    /// `[-0.1, 0.1)` fill can and does land `running_var` on a negative
+    /// value, producing `sqrt(negative) = NaN` that silently propagates
+    /// through the entire forward pass (and then backward, since NaN
+    /// arithmetic is closed under every op here) — the fixture would
+    /// otherwise manufacture a domain violation, not exercise one. Keys
+    /// ending in `running_var` are instead filled from a strictly-positive
+    /// `[0.5, 0.7)` range.
     fn deterministic_fill_varmap(varmap: &VarMap, device: &Device) {
         let mut state: u32 = 1;
         let data = varmap.data().lock().unwrap();
         let mut entries: Vec<_> = data.iter().collect();
         entries.sort_by(|a, b| a.0.cmp(b.0));
-        for (_, var) in entries {
+        for (key, var) in entries {
             let shape = var.shape().clone();
             let n = shape.elem_count();
+            let is_variance = key.ends_with("running_var");
             let values: Vec<f32> = (0..n)
                 .map(|_| {
                     state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-                    let unit = (state >> 8) as f32 / (1u32 << 24) as f32;
-                    (unit - 0.5) * 0.2
+                    let unit = (state >> 8) as f32 / (1u32 << 24) as f32; // [0, 1)
+                    if is_variance {
+                        0.5 + unit * 0.2 // [0.5, 0.7) — strictly positive
+                    } else {
+                        (unit - 0.5) * 0.2 // [-0.1, 0.1)
+                    }
                 })
                 .collect();
             var.set(&Tensor::from_vec(values, shape, device).unwrap())
@@ -1537,6 +1595,237 @@ mod tests {
                 "block {i}: rel_bias_table grad must be None under eval (its only use is upstream \
                  of softmax_last_dim, which records no backward link at all)"
             );
+        }
+    }
+
+    /// Build a VarMap-backed full `HtsatAudio` tower sized by the real
+    /// `htsat_clap_tiny` config, and a fixed `[1, 4, t, num_mel_bins]` input.
+    fn build_full_tower_and_input(
+        varmap: &VarMap,
+        device: &Device,
+        seed: u32,
+    ) -> (HtsatAudio, HtsatAudioConfig, Tensor) {
+        let cfg = HtsatAudioConfig::from_hf_clap_config(&fixture_config()).unwrap();
+        let vb = VarBuilder::from_varmap(varmap, DType::F32, device);
+        let tower = HtsatAudio::load(vb, &cfg, device).unwrap();
+        deterministic_fill_varmap(varmap, device);
+
+        let t = 40;
+        let input = deterministic_tensor(4 * t, cfg.num_mel_bins, seed, device)
+            .reshape((1, 4, t, cfg.num_mel_bins))
+            .unwrap();
+        (tower, cfg, input)
+    }
+
+    /// L2 norm of a gradient tensor, via `grads.get(...)`.
+    fn grad_norm(g: &Tensor) -> f32 {
+        g.sqr()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
+            .sqrt()
+    }
+
+    /// Run the front half through the GLOBAL patch-conv only (bypassing
+    /// `HtsatPatchEmbed::forward`'s `mel_conv2d`/AFF-fusion local branch),
+    /// then the full Swin spine (`forward_spine`, public), returning the
+    /// pooled descriptor.
+    ///
+    /// `HtsatPatchEmbed::forward` computes BOTH the global-conv AND the
+    /// fused-local (`mel_conv2d`) paths for every sample regardless of
+    /// `is_longer` (the mask only SELECTS between them afterward — see its
+    /// own doc), so `mel_conv2d` is unconditionally reachable from
+    /// `HtsatAudio::forward`. `mel_conv2d` tiles its input via
+    /// `Tensor::unfold(dim, kw=12, step=12)` over a width of 128, which does
+    /// NOT divide evenly (`128 / 12 = 10` windows, an 8-wide tail dropped —
+    /// documented, intentional for FORWARD). candle-core registers
+    /// `unfold`'s backward as a plain `Op::Reshape` (candle-core-0.11.0
+    /// `tensor.rs:2962`), which assumes the forward is a lossless,
+    /// element-count-preserving view — true only when `size` evenly divides
+    /// the dim. With a dropped tail it is NOT: `unfold`'s backward tries to
+    /// `.reshape()` the incoming gradient back to an input shape with MORE
+    /// elements than the gradient actually has, and candle errors (a loud,
+    /// safe failure — "shape mismatch in reshape" — not a silently wrong
+    /// gradient).
+    ///
+    /// Before the LayerNorm fix, `patch_embed.norm`'s own no-bwd truncation
+    /// made this path COMPLETELY unreachable from backward, so this bug was
+    /// dormant — nothing ever exercised `unfold`'s backward formula in
+    /// practice. Fixing `patch_embed.norm` correctly makes it reachable,
+    /// which is what EXPOSES this separate, pre-existing, upstream
+    /// candle-core limitation (not something this crate patches — see the
+    /// "no hard candle dependency" project convention: compose over
+    /// candle's public API, premise-pin the limitation, don't vendor/patch
+    /// candle itself). It means `HtsatAudio::forward`'s FUSED local branch
+    /// is not trainable end-to-end today; that is flagged as a follow-up,
+    /// out of THIS unit's scope (attention-softmax + LayerNorm no-bwd
+    /// truncation only). This helper isolates the claim actually under
+    /// test — the softmax/LayerNorm fix reaches every parameter it should —
+    /// from that separate, orthogonal `unfold` limitation, by using only
+    /// the global-conv patch-embed path (`patch_embed.proj`), which has no
+    /// `unfold` anywhere in it.
+    fn run_front_global_conv_only_and_spine(tower: &HtsatAudio, input: &Tensor) -> Spine {
+        let encoder = tower.encoder();
+        let x = input.transpose(1, 3).unwrap().contiguous().unwrap();
+        let post_bn = encoder.batch_norm.forward_t(&x, false).unwrap();
+        let normalized = post_bn.transpose(1, 3).unwrap().contiguous().unwrap();
+        let post_interp = encoder.time_interp.forward(&normalized).unwrap();
+        let post_reshape = encoder.reshape_mel2img(&post_interp).unwrap();
+
+        let global = post_reshape.narrow(1, 0, 1).unwrap();
+        let global = encoder.patch_embed.proj.forward(&global).unwrap();
+        let flat = global
+            .flatten_from(2)
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let patch_embed_out = encoder.patch_embed.norm.forward(&flat).unwrap();
+
+        let frames_num = post_reshape.dim(2).unwrap();
+        encoder.forward_spine(&patch_embed_out, frames_num).unwrap()
+    }
+
+    /// End-to-end RED oracle through the full Swin spine, front half run via
+    /// the global-conv-only path (see
+    /// [`run_front_global_conv_only_and_spine`]'s doc for why the fused
+    /// local branch is excluded — a SEPARATE, orthogonal candle-core
+    /// limitation, not this unit's softmax/LayerNorm claim). With BOTH the
+    /// attention-softmax arm and every `LayerNorm` (patch-embed norm,
+    /// `layernorm_before`/`after` and `PatchMerging::norm` per stage, the
+    /// encoder's final norm) gated on `training`, backward through the
+    /// pooled descriptor reaches the patch-embed conv, layer-0 Q/K, and
+    /// EVERY stage/block's `rel_bias_table` — all 4 stages, all
+    /// `sum(depths)=8` blocks. Fails if EITHER gate regresses: reverting
+    /// only the softmax arm leaves every `rel_bias_table` severed the same
+    /// way the eval companion below shows; reverting only the final norm's
+    /// gate severs backward before it reaches ANY stage (the patch-embed
+    /// conv assertion fails first, since the final norm sits strictly
+    /// downstream of everything). This is the shape a real training loop
+    /// would have hit: no error, just gradients that silently never update
+    /// anything.
+    #[test]
+    fn training_true_full_forward_reaches_every_parameter() {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let (mut tower, cfg, input) = build_full_tower_and_input(&varmap, &device, 101);
+        tower.set_training(true);
+
+        let spine = run_front_global_conv_only_and_spine(&tower, &input);
+        let loss = nonuniform_loss(&spine.pooler_out, cfg.hidden_size, &device);
+        let grads = loss.backward().unwrap();
+
+        let patch_conv = find_var(&varmap, "patch_embed.proj.weight");
+        assert!(
+            grads.get(patch_conv.as_tensor()).is_some(),
+            "patch-embed conv weight grad must be Some under training=true through the full forward"
+        );
+
+        let q0 = find_var(&varmap, "layers.0.blocks.0.attention.self.query.weight");
+        let k0 = find_var(&varmap, "layers.0.blocks.0.attention.self.key.weight");
+        let q_grad = grads
+            .get(q0.as_tensor())
+            .expect("layer-0 query.weight grad must be Some under training=true");
+        let k_grad = grads
+            .get(k0.as_tensor())
+            .expect("layer-0 key.weight grad must be Some under training=true");
+        // `> 0.0` alone would silently pass through a NaN-poisoned gradient
+        // (`NaN > 0.0` is `false`, not a panic) — assert finiteness
+        // explicitly so a future domain violation fails loudly here instead
+        // of masquerading as "grad norm not nonzero".
+        let q_norm = grad_norm(q_grad);
+        let k_norm = grad_norm(k_grad);
+        assert!(
+            q_norm.is_finite(),
+            "layer-0 query.weight grad norm must be finite, got {q_norm}"
+        );
+        assert!(
+            k_norm.is_finite(),
+            "layer-0 key.weight grad norm must be finite, got {k_norm}"
+        );
+        assert!(
+            q_norm > 0.0,
+            "layer-0 query.weight grad norm must be nonzero"
+        );
+        assert!(k_norm > 0.0, "layer-0 key.weight grad norm must be nonzero");
+
+        for s in 0..cfg.num_stages() {
+            for b in 0..cfg.depths[s] {
+                let suffix =
+                    format!("layers.{s}.blocks.{b}.attention.self.relative_position_bias_table");
+                let var = find_var(&varmap, &suffix);
+                let g = grads.get(var.as_tensor()).unwrap_or_else(|| {
+                    panic!(
+                        "stage {s} block {b}: rel_bias_table grad must be Some under training=true"
+                    )
+                });
+                let norm = grad_norm(g);
+                assert!(
+                    norm.is_finite(),
+                    "stage {s} block {b}: rel_bias_table grad norm must be finite, got {norm}"
+                );
+                assert!(
+                    norm > 0.0,
+                    "stage {s} block {b}: rel_bias_table grad norm must be nonzero, got {norm}"
+                );
+            }
+        }
+    }
+
+    /// The eval-mode observable a user of this tower would actually hit
+    /// before either gate existed: the full spine's backward (same
+    /// global-conv-only front half as the companion test above, for a
+    /// like-for-like comparison — see
+    /// [`run_front_global_conv_only_and_spine`]'s doc) yields NO gradient
+    /// entry AT ALL for the patch-embed conv, layer-0 Q/K, or any
+    /// `rel_bias_table`, because the encoder's final `norm`
+    /// (`candle_nn::LayerNorm`'s `BackpropOp::none()` truncation) severs
+    /// backward before it reaches ANY stage — independent of the softmax
+    /// arm, which is a SEPARATE, strictly-worse truncation one hop earlier
+    /// inside each block (see `training_false_rel_bias_table_grad_is_none_for_every_block`,
+    /// which isolates that one).
+    #[test]
+    fn training_false_full_forward_grads_are_none_before_final_norm() {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let (tower, cfg, input) = build_full_tower_and_input(&varmap, &device, 101);
+        // training defaults to false; forward without calling set_training.
+
+        let spine = run_front_global_conv_only_and_spine(&tower, &input);
+        let loss = nonuniform_loss(&spine.pooler_out, cfg.hidden_size, &device);
+        let grads = loss.backward().unwrap();
+
+        let patch_conv = find_var(&varmap, "patch_embed.proj.weight");
+        assert!(
+            grads.get(patch_conv.as_tensor()).is_none(),
+            "patch-embed conv weight grad must be None under eval through the full forward \
+             (the encoder's final norm truncates backward before it reaches any stage)"
+        );
+
+        let q0 = find_var(&varmap, "layers.0.blocks.0.attention.self.query.weight");
+        let k0 = find_var(&varmap, "layers.0.blocks.0.attention.self.key.weight");
+        assert!(
+            grads.get(q0.as_tensor()).is_none(),
+            "layer-0 query.weight grad must be None under eval"
+        );
+        assert!(
+            grads.get(k0.as_tensor()).is_none(),
+            "layer-0 key.weight grad must be None under eval"
+        );
+
+        for s in 0..cfg.num_stages() {
+            for b in 0..cfg.depths[s] {
+                let suffix =
+                    format!("layers.{s}.blocks.{b}.attention.self.relative_position_bias_table");
+                let var = find_var(&varmap, &suffix);
+                assert!(
+                    grads.get(var.as_tensor()).is_none(),
+                    "stage {s} block {b}: rel_bias_table grad must be None under eval"
+                );
+            }
         }
     }
 

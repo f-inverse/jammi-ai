@@ -114,22 +114,21 @@ fn bootstrap_ci_refuses_nan_sample() {
 }
 
 #[test]
-fn bootstrap_ci_refuses_nan_sample_before_any_resample_is_drawn() {
+fn bootstrap_ci_refuses_nan_sample_without_invoking_statistic_fn() {
     // The edge guard must fire on the *presence* of a NaN sample, before any
     // resample is drawn — not rely on a downstream, output-edge check that
     // only catches a NaN that happens to land in a particular resample. A
-    // prior version of this test hard-coded a seed (`StdRng::seed_from_u64(2)`
-    // with `n = 2, iterations = 1`) empirically known to draw only the
-    // non-NaN position, arguing "even this lucky seed is still refused". But
-    // rand's `StdRng` stream is explicitly NOT value-stable across `rand`
-    // versions, so that "known-lucky seed" claim can silently go false on a
-    // dependency bump and the test would still pass (vacuously, for the
-    // wrong reason) or fail for an unrelated reason. This version proves the
-    // same property without depending on any seed's draw sequence: a
-    // `Cell<bool>` records whether `statistic_fn` was EVER invoked. If the
-    // input-edge guard is what causes the error, `statistic_fn` is never
-    // called at all — no resample, lucky or not, gets the chance to be the
-    // one that "missed" the NaN.
+    // seed-keyed assertion (e.g. picking a seed empirically known to draw
+    // only the non-NaN position and arguing "even this lucky seed is still
+    // refused") would be unsound: rand's `StdRng` stream is explicitly NOT
+    // value-stable across `rand` versions, so any "known-lucky seed" claim
+    // can silently go false on a dependency bump, and the test would then
+    // pass vacuously (for the wrong reason) or fail for an unrelated one.
+    // This test instead proves the guard-placement claim directly and
+    // seed-independently: a `Cell<bool>` records whether `statistic_fn` was
+    // EVER invoked. If the input-edge guard is what causes the error,
+    // `statistic_fn` is never called at all — no resample, lucky or not,
+    // gets the chance to be the one that "missed" the NaN.
     use std::cell::Cell;
     let invoked = Cell::new(false);
     let mean = |xs: &[f64]| {

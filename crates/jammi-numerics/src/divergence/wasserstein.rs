@@ -30,21 +30,43 @@ use crate::histogram::interpolate::interpolate_to;
 /// `total_cmp` is a genuine total order even over a `NaN`- or
 /// `±inf`-containing slice (see [`bootstrap_ci`](crate::stats::bootstrap_ci)
 /// for the same point made explicitly) — so a `NaN` or `±inf` element would
-/// sort into a well-defined position and NOT corrupt the sort itself. The
-/// real reason is downstream: this score exists to be compared against a
-/// fixed drift-monitor threshold, and neither a `NaN` nor an unbounded
-/// `±inf` distance is meaningful there. A `NaN` comparison against any
-/// threshold is always `false` (`NaN > c` never fires, silently defeating
-/// the monitor), and an unbounded `±inf` distance carries no *magnitude*
-/// information past "already over any finite threshold" — it cannot
+/// sort into a well-defined position and NOT corrupt the sort itself. What
+/// actually happens without the guard, measured downstream of the sort:
+///
+/// - A `NaN` element always yields a `NaN` score: it propagates through the
+///   `(a - b).abs()` sum (any arithmetic touching `NaN` is `NaN`) into
+///   `mean`, and `mean / scale` stays `NaN` regardless of `scale`.
+/// - A `±inf` element yields either `NaN` or an unbounded `±inf` score,
+///   depending on how the two populations pair up once interpolated onto
+///   the common grid — not one fixed outcome. Equal-length populations skip
+///   [`interpolate_to`] entirely (see its doc), so `±inf` lands at the same
+///   sorted index in both and an aligned `inf - inf` (or `-inf - -inf`)
+///   produces `NaN`; e.g. `wasserstein_1d(&[1.0, f32::INFINITY], &[2.0,
+///   f32::INFINITY])` is `NaN`. An `inf` in only one population instead
+///   produces an unbounded, but non-`NaN`, `±inf` numerator. Separately,
+///   [`padded_range`] falls back to a fixed `(0.0, 1.0)` — silently pinning
+///   `scale = 1.0` regardless of `current`'s magnitude, the same fallback
+///   the empty-`reference` case above defeats — whenever `reference`'s own
+///   min/max range is non-finite, which happens whenever `reference`
+///   contains `±inf` (see [`padded_range`]'s doc for exactly when the
+///   fallback fires).
+///
+/// In every one of those outcomes the number is meaningless to this
+/// function's one consumer: this score exists to be compared against a
+/// fixed drift-monitor threshold. A `NaN` comparison against any threshold
+/// is always `false` (`NaN > c` never fires, silently defeating the
+/// monitor); an unbounded `±inf` distance carries no *magnitude*
+/// information past "already over any finite threshold", so it cannot
 /// distinguish a mild distributional shift from a catastrophic one, which is
-/// exactly what a drift score exists to do. Both are refused for this one,
-/// consistent, "meaningless to the consumer" reason, not two different ones.
-/// This is stricter than scipy's `wasserstein_distance`, which propagates
-/// both a `NaN` element and a `±inf` element straight through into its
-/// return value (`scipy/stats/_stats_py.py` has no finiteness guard) rather
-/// than refusing either; the empty-input edge above is the only case where
-/// jammi matches scipy's behavior exactly.
+/// exactly what a drift score exists to do; and a scale silently pinned to
+/// `1.0` breaks this function's own documented scale-invariance the same
+/// way the empty-`reference` case does. All three are refused for this one,
+/// consistent, "meaningless to the consumer" reason, not distinct ones. This
+/// is stricter than scipy's `wasserstein_distance`, which propagates both a
+/// `NaN` element and a `±inf` element straight through into its return value
+/// (`scipy/stats/_stats_py.py` has no finiteness guard) rather than refusing
+/// either; the empty-input edge above is the only case where jammi matches
+/// scipy's behavior exactly.
 ///
 /// # Errors
 ///

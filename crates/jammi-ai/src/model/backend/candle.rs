@@ -2589,18 +2589,22 @@ mod ner_nonfinite_logit_tests {
         vec![Arc::new(StringArray::from(vec!["fine row", "diverged row"])) as ArrayRef]
     }
 
-    /// RED-first (the class-sweep audit finding): a diverged model's row (row
-    /// 1's hidden states are NaN, so its token logits are non-finite) must
-    /// refuse the WHOLE call with a typed `JammiError::Inference` naming the
-    /// offending row, through the public `CandleModel::forward` NER entry —
-    /// never route a non-finite MODEL output onto the per-row `_status`
-    /// channel, whose contract (`InferenceRunner::run_chunks` in runner.rs)
-    /// reserves `_status = error` for a bad row INPUT, never "the model is
-    /// broken". Reverting the candle.rs fix (keeping this test) shows this
-    /// assertion fails: the old code silently reports row 1 as an ordinary
-    /// per-row NER decode failure (`_status = error`, `entities = "[]"`)
-    /// instead of refusing the batch — an operator reading that row would be
-    /// told to look at their input text, not their model.
+    /// A diverged model's row (row 1's hidden states are NaN, so its token
+    /// logits are non-finite) must refuse the WHOLE call with a typed
+    /// `JammiError::Inference` naming the offending row, through the public
+    /// `CandleModel::forward` NER entry — never route a non-finite MODEL
+    /// output onto the per-row `_status` channel, whose contract
+    /// (`InferenceRunner::run_chunks` in runner.rs) reserves `_status =
+    /// error` for a bad row INPUT, never "the model is broken". The prior
+    /// `Err` arm here set `row_status[orig_idx] = false` and left that row's
+    /// `all_entities_json` entry as an empty string (never `entities =
+    /// "[]"` — only the `Ok` arm writes that), which `NerAdapter` (via
+    /// `nullify_strings`) turns into a SQL NULL for the row regardless of
+    /// the string's contents — the same per-row-input-fault treatment a
+    /// genuinely malformed row's text gets, not a signal that the model
+    /// itself is broken. The invariant this test pins: a model-side
+    /// non-finite row is a batch-level typed failure, never a per-row input
+    /// error.
     #[test]
     fn nan_hidden_state_row_is_refused_with_a_typed_error_naming_the_row() {
         let model = model_with_hidden_states(1);

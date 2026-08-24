@@ -375,7 +375,7 @@ enum Command {
     /// name (`"roberta"`, etc.) so the row stays attributable. This loads
     /// through the Bert builder (tensor-key prefix `bert.`, or an unprefixed
     /// root layout); RoBERTa-family position-id semantics (the HF
-    /// `padding_idx`-offset convention) are not reproduced — this is not a
+    /// padding_idx-offset convention) are not reproduced — this is not a
     /// parity claim, only a way to measure the step cost of those weights.
     /// Runs on CPU by default and on a CUDA ordinal with `--cuda`.
     ///
@@ -424,8 +424,19 @@ enum Command {
         /// genuine mislabel, not a gap the override exists to fill. Loading
         /// a sibling through `--model-type bert` is loading, not parity: the
         /// `Bert` builder's tensor-key layout and position-id handling are
-        /// its own, not the sibling's (e.g. RoBERTa's `padding_idx`-offset
-        /// position ids are not reproduced).
+        /// its own, not the sibling's (e.g. RoBERTa's padding_idx-offset
+        /// position ids are not reproduced). An invalid value (not one of
+        /// `modernbert`/`bert`/`distilbert`) is refused as an invalid FLAG,
+        /// naming `--model-type`, even when `config.json` declares a valid
+        /// type of its own. Known limitation: a checkpoint's tensor keys
+        /// prefixed with the sibling's OWN class name (e.g. `"roberta."`,
+        /// what that sibling's own save_pretrained emits) are refused —
+        /// "the Bert builder's own two-layout probe does not know how to
+        /// load" them; it loads only a `"bert."`-wrapped `BertForX`
+        /// checkpoint or an unprefixed root `BertModel` checkpoint.
+        /// Widening `jammi-encoders`' `bert.rs` prefix probe to accept
+        /// sibling prefixes is a known follow-up, not something this tier
+        /// can work around.
         #[arg(long)]
         model_type: Option<String>,
         /// Backbone precision: f32, f16, or bf16.

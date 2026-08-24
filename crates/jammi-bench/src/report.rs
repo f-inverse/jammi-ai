@@ -1105,19 +1105,42 @@ pub struct FinetuneStepTier {
     /// exists for (issue #356, rule 12) needs to know which builder
     /// produced each row.
     pub model_type: String,
-    /// The checkpoint's OWN `model_type` string from `config.json`, when it
-    /// differs from `model_type` above — i.e. when `--model-type` accepted
-    /// a BERT-family sibling (`roberta`/`camembert`/`xlm-roberta`) or any
-    /// other value `config.json` names that this tier does not itself
-    /// build, and drove it through the named builder instead. `None` when
-    /// the file's own declaration already equals `model_type` (no override
-    /// was needed to relabel anything).
+    /// `config.json`'s own `model_type` string, EXACTLY as read from the
+    /// file — present whenever the field exists, even when it already
+    /// equals `model_type` above (agreement is preserved, not collapsed to
+    /// `null`). `null` ONLY when the field is literally absent from the
+    /// checkpoint's `config.json`.
     ///
-    /// A non-`None` value here is not a parity claim: the row was built
-    /// through `model_type`'s builder (e.g. `Bert`), and that builder's
-    /// tensor-key layout and position-id semantics are its own, not the
-    /// sibling's — see [`crate::finetune_step::ModelType::detect`]'s doc.
+    /// Serialized explicitly as `null` rather than omitted when absent
+    /// (no `#[serde(skip_serializing_if)]`) — deliberately, unlike most
+    /// `Option` fields elsewhere in this report: a durable JSON record
+    /// needs to distinguish "this field's value is empty" from "this
+    /// report predates the field existing at all", the same reason
+    /// [`Measurement::not_yet_measured`] emits an explicit marker instead
+    /// of a bare zero. See this module's own
+    /// `finetune_step_tier_serializes_null_not_omitted_for_absent_model_type_fields`
+    /// test, which pins this policy on the wire, not just in prose.
+    ///
+    /// Together with [`Self::model_type_override`] this reconstructs every
+    /// provenance state a single collapsed field could not: `(Some(_),
+    /// None)` is "declared and agreed, no override needed"; `(None,
+    /// Some(_))` is "declared nothing, the operator asserted `--model-type`
+    /// from nothing"; `(Some(_), Some(_))` is "declared a sibling or other
+    /// value, the operator resolved it via override" (or a redundant,
+    /// agreeing override). A non-agreeing pair is not a parity claim: the
+    /// row was built through `model_type`'s builder (e.g. `Bert`), and that
+    /// builder's tensor-key layout and position-id semantics are its own,
+    /// not the sibling's — see
+    /// [`crate::finetune_step::ModelType::detect`]'s doc.
     pub config_model_type: Option<String>,
+    /// The `--model-type` override EXACTLY as passed on the command line.
+    /// `null` ONLY when the flag was never supplied — including when a
+    /// supplied override agreed with `config.json`'s own declaration (a
+    /// no-op override is still a fact about how this row was produced, so
+    /// it is recorded rather than folded away). See
+    /// [`Self::config_model_type`]'s doc for how the two fields together
+    /// avoid collapsing distinct provenance states into the same value.
+    pub model_type_override: Option<String>,
     pub batch: usize,
     pub seq: usize,
     pub lora_rank: usize,
@@ -1411,4 +1434,141 @@ pub struct RecomputeScaleTier {
     /// The whole Downstream sweep's wall-time, milliseconds. Machine-dependent
     /// reference only — never gated.
     pub sweep_ms: Measurement,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal, fully-populated [`FinetuneStepTier`] for the serialization
+    /// tests below. Field VALUES are arbitrary except where the test itself
+    /// varies them; what is pinned is the emitted key SET and the
+    /// present-vs-omitted / null-vs-value policy for the two `Option`
+    /// fields, not any particular number.
+    fn sample_finetune_step_tier(
+        config_model_type: Option<&str>,
+        model_type_override: Option<&str>,
+    ) -> FinetuneStepTier {
+        FinetuneStepTier {
+            device: "cpu".to_string(),
+            device_name: "cpu".to_string(),
+            backbone_dtype: "f32".to_string(),
+            model_type: "bert".to_string(),
+            config_model_type: config_model_type.map(str::to_string),
+            model_type_override: model_type_override.map(str::to_string),
+            batch: 2,
+            seq: 6,
+            lora_rank: 2,
+            lora_dropout: 0.0,
+            target_modules: vec!["query".to_string()],
+            batched_forward: true,
+            trainable_tensors: 2,
+            steps_measured: 1,
+            ln_fused_dispatches: 0,
+            ln_eager_dispatches: 0,
+            rope_fused_dispatches: 0,
+            rope_eager_dispatches: 0,
+            softmax_fused_dispatches: 0,
+            softmax_eager_dispatches: 0,
+            geglu_fused_dispatches: 0,
+            geglu_eager_dispatches: 0,
+            lora_epilogue_fused_dispatches: 0,
+            lora_epilogue_eager_dispatches: 0,
+            s_per_step_p50: Measurement::measured(0.01, "s"),
+            s_per_step_mean: Measurement::measured(0.01, "s"),
+            steps_per_s: Measurement::measured(100.0, "steps/s"),
+            triplets_per_s: Measurement::measured(200.0, "triplets/s"),
+            peak_rss_bytes: Measurement::not_yet_measured("bytes"),
+            peak_vram_bytes: Measurement::not_yet_measured("bytes"),
+        }
+    }
+
+    /// B5's deliberate policy: `config_model_type` and `model_type_override`
+    /// are the ONLY two `Option` fields on `FinetuneStepTier` that do NOT
+    /// carry `#[serde(skip_serializing_if = "Option::is_none")]` — they
+    /// serialize an EXPLICIT `null` when absent, the same "present, marked
+    /// absent" shape [`Measurement::not_yet_measured`] uses, rather than
+    /// disappearing from the object the way every other absent `Option`
+    /// field in this report does. Pinned on the actual wire output
+    /// (`serde_json::to_value`), not just asserted in a doc comment, so a
+    /// future `#[serde(skip_serializing_if)]` added by habit (matching the
+    /// rest of the file's convention) reddens this test instead of silently
+    /// changing what "absent" means on an already-emitted schema.
+    #[test]
+    fn finetune_step_tier_serializes_null_not_omitted_for_absent_model_type_fields() {
+        let tier = sample_finetune_step_tier(None, None);
+        let value = serde_json::to_value(&tier).expect("serialize FinetuneStepTier");
+        let obj = value.as_object().expect("object");
+        assert!(
+            obj.contains_key("config_model_type"),
+            "config_model_type must be present (as null), not omitted, when absent: {obj:?}"
+        );
+        assert_eq!(obj["config_model_type"], serde_json::Value::Null);
+        assert!(
+            obj.contains_key("model_type_override"),
+            "model_type_override must be present (as null), not omitted, when absent: {obj:?}"
+        );
+        assert_eq!(obj["model_type_override"], serde_json::Value::Null);
+    }
+
+    /// The complement of the null case: when both fields carry a value, the
+    /// SAME two keys serialize as strings, not e.g. nested under a
+    /// differently-shaped variant — a durable-record reader's schema for
+    /// this pair does not change shape between the absent and present
+    /// states.
+    #[test]
+    fn finetune_step_tier_serializes_string_values_for_present_model_type_fields() {
+        let tier = sample_finetune_step_tier(Some("roberta"), Some("bert"));
+        let value = serde_json::to_value(&tier).expect("serialize FinetuneStepTier");
+        let obj = value.as_object().expect("object");
+        assert_eq!(obj["config_model_type"], serde_json::json!("roberta"));
+        assert_eq!(obj["model_type_override"], serde_json::json!("bert"));
+    }
+
+    /// The full emitted key set, pinned so a field added or renamed on
+    /// `FinetuneStepTier` is a visible, reviewed diff here rather than a
+    /// silent addition/removal a downstream JSON-diffing perf gate would
+    /// only notice indirectly.
+    #[test]
+    fn finetune_step_tier_emits_the_full_pinned_key_set() {
+        let tier = sample_finetune_step_tier(Some("roberta"), Some("bert"));
+        let value = serde_json::to_value(&tier).expect("serialize FinetuneStepTier");
+        let obj = value.as_object().expect("object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let mut expected = vec![
+            "batch",
+            "batched_forward",
+            "backbone_dtype",
+            "config_model_type",
+            "device",
+            "device_name",
+            "geglu_eager_dispatches",
+            "geglu_fused_dispatches",
+            "ln_eager_dispatches",
+            "ln_fused_dispatches",
+            "lora_dropout",
+            "lora_epilogue_eager_dispatches",
+            "lora_epilogue_fused_dispatches",
+            "lora_rank",
+            "model_type",
+            "model_type_override",
+            "peak_rss_bytes",
+            "peak_vram_bytes",
+            "rope_eager_dispatches",
+            "rope_fused_dispatches",
+            "s_per_step_mean",
+            "s_per_step_p50",
+            "seq",
+            "softmax_eager_dispatches",
+            "softmax_fused_dispatches",
+            "steps_measured",
+            "steps_per_s",
+            "target_modules",
+            "trainable_tensors",
+            "triplets_per_s",
+        ];
+        expected.sort_unstable();
+        assert_eq!(keys, expected);
+    }
 }

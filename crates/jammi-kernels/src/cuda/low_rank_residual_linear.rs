@@ -1,5 +1,5 @@
-//! CUDA forward for [`crate::ops::LoraLinearFused`] — the SAME six-step
-//! sequence `ops::lora_linear`'s CPU `cpu_fwd` runs (see that module's
+//! CUDA forward for [`crate::ops::LowRankResidualLinear`] — the SAME six-step
+//! sequence `ops::low_rank_residual_linear`'s CPU `cpu_fwd` runs (see that module's
 //! doc for the full rounding enumeration), issued at the storage level
 //! with NO new `.cu` kernel: `BackendStorage::matmul`/`to_dtype` (cuBLAS
 //! and candle's own `cast_*` kernels, already compiled into every candle
@@ -9,7 +9,7 @@
 //! exactly the same launchers `crate::cuda::dropout`/
 //! `crate::cuda::scaled_cast_add` already ship, reused rather than
 //! duplicated. `ab`'s row-packed `[in + out, rank]` layout (see
-//! `ops::lora_linear`'s module doc) means the `A^T`/`B` slices below are
+//! `ops::low_rank_residual_linear`'s module doc) means the `A^T`/`B` slices below are
 //! zero-copy `Layout::narrow(0, ..)` views, not materialized buffers —
 //! this file no longer issues its own `to_dtype` gather-copy for them (an
 //! EARLIER, column-packed layout required one; it failed cuBLAS's
@@ -22,12 +22,12 @@ use candle_core::{
     CudaStorage, CustomOp1, CustomOp2, CustomOp3, DType, Error, Layout, Result, Shape,
 };
 
-use crate::ops::lora_linear::materialize_contiguous_if_needed;
-use crate::ops::{DropoutFused, LoraLinearFused, ScaledCastAdd};
+use crate::ops::low_rank_residual_linear::materialize_contiguous_if_needed;
+use crate::ops::{DropoutFused, LowRankResidualLinear, ScaledCastAdd};
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn cuda_fwd(
-    op: &LoraLinearFused,
+    op: &LowRankResidualLinear,
     s1: &CudaStorage,
     l1: &Layout,
     s2: &CudaStorage,
@@ -51,8 +51,8 @@ pub(crate) fn cuda_fwd(
         if l.contiguous_offsets().is_none() {
             return Err(Error::RequiresContiguous {
                 op: match what {
-                    "w" => "lora_linear_fused(w)",
-                    _ => "lora_linear_fused(ab)",
+                    "w" => "low_rank_residual_linear(w)",
+                    _ => "low_rank_residual_linear(ab)",
                 },
             });
         }
@@ -60,7 +60,7 @@ pub(crate) fn cuda_fwd(
 
     // `x` may be a non-contiguous (e.g. transposed/narrowed) view;
     // materialize it at THIS op's storage level rather than refusing —
-    // see `ops::lora_linear::materialize_contiguous_if_needed`'s doc for
+    // see `ops::low_rank_residual_linear::materialize_contiguous_if_needed`'s doc for
     // why only `x` (never `w`/`ab`) gets this treatment.
     let x_owned = materialize_contiguous_if_needed(s1, l1)?;
     let (s1, l1): (&CudaStorage, Layout) = match &x_owned {
@@ -98,7 +98,7 @@ pub(crate) fn cuda_fwd(
     // `ab`'s row-packed layout: the first `inf` rows ARE `A^T` (`[in,
     // rank]`) and the remaining `outf` rows ARE `B` (`[out, rank]`) — both
     // dim-0 narrows of a contiguous matrix, hence themselves contiguous
-    // with NO copy (see `ops::lora_linear`'s module doc's "packed-`ab`
+    // with NO copy (see `ops::low_rank_residual_linear`'s module doc's "packed-`ab`
     // GEMM eligibility problem" section for the `gemm_config`
     // admissibility argument this relies on).
     let a_t_l = l3.narrow(0, 0, inf)?;

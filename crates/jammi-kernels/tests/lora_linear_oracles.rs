@@ -1,6 +1,6 @@
-//! `LoraLinearFused` production-width oracles: CPU-hermetic, `F32`
+//! `LowRankResidualLinear` production-width oracles: CPU-hermetic, `F32`
 //! (candle-core 0.11.0's CPU backend has no `BF16` matmul without
-//! `mkl`/`accelerate` — see `ops::lora_linear`'s module doc; the `BF16`
+//! `mkl`/`accelerate` — see `ops::low_rank_residual_linear`'s module doc; the `BF16`
 //! leg lives in `cuda_parity.rs`, pod-run).
 //!
 //! `crates/jammi-kernels/src/ops/lora_linear.rs`'s own `#[cfg(test)]`
@@ -68,7 +68,7 @@
 //!   already a `1e-3` tolerance, never a `tol == 0.0` claim.
 
 use candle_core::{DType, Device, Result, Tensor, Var};
-use jammi_kernels::ops::{DropoutKey, LoraLinearFused};
+use jammi_kernels::ops::{DropoutKey, LowRankResidualLinear};
 
 /// The eager composition `LoraLinear::forward`'s training arm builds
 /// today, reproduced directly over plain tensors (no dropout): `base_out
@@ -82,7 +82,7 @@ fn eager_forward(x: &Tensor, w: &Tensor, a: &Tensor, b: &Tensor, scale: f64) -> 
 }
 
 /// Packs `a`/`b` into `ab`'s row-packed `[in + out, rank]` layout — see
-/// `jammi_kernels::ops::lora_linear`'s module doc, "the packed-`ab` GEMM
+/// `jammi_kernels::ops::low_rank_residual_linear`'s module doc, "the packed-`ab` GEMM
 /// eligibility problem". `a.t()` is a non-contiguous VIEW; `Tensor::cat`'s
 /// dim-0 path handles that via each arg's own `Layout` (no `.contiguous()`
 /// call needed first — unlike the column-packed layout this replaced,
@@ -91,7 +91,7 @@ fn pack_ab(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     Tensor::cat(&[&a.t()?, b], 0)
 }
 
-fn fused_forward(x: &Tensor, w: &Tensor, ab: &Tensor, op: LoraLinearFused) -> Result<Tensor> {
+fn fused_forward(x: &Tensor, w: &Tensor, ab: &Tensor, op: LowRankResidualLinear) -> Result<Tensor> {
     x.apply_op3(w, ab, op)
 }
 
@@ -161,7 +161,7 @@ fn production_width_wqkv_forward_matches_the_eager_composition() {
     let b = Tensor::from_slice(&exact_fixture(outf * r, 4), (outf, r), &device).unwrap();
     let ab = pack_ab(&a, &b).unwrap();
 
-    let op = LoraLinearFused::new(scale as f32, inf, outf, r, None, false).unwrap();
+    let op = LowRankResidualLinear::new(scale as f32, inf, outf, r, None, false).unwrap();
     let fused = fused_forward(&x, &w, &ab, op).unwrap();
     let eager = eager_forward(&x, &w, &a, &b, scale).unwrap();
 
@@ -188,7 +188,7 @@ fn production_width_wqkv_forward_matches_the_eager_composition_within_a_derived_
     let b = Tensor::from_slice(&fixture(outf * r, 0.45), (outf, r), &device).unwrap();
     let ab = pack_ab(&a, &b).unwrap();
 
-    let op = LoraLinearFused::new(scale as f32, inf, outf, r, None, false).unwrap();
+    let op = LowRankResidualLinear::new(scale as f32, inf, outf, r, None, false).unwrap();
     let fused = fused_forward(&x, &w, &ab, op).unwrap();
     let eager = eager_forward(&x, &w, &a, &b, scale).unwrap();
 
@@ -218,7 +218,7 @@ fn production_width_wi_forward_matches_the_eager_composition() {
     let b = Tensor::from_slice(&exact_fixture(outf * r, 8), (outf, r), &device).unwrap();
     let ab = pack_ab(&a, &b).unwrap();
 
-    let op = LoraLinearFused::new(scale as f32, inf, outf, r, None, false).unwrap();
+    let op = LowRankResidualLinear::new(scale as f32, inf, outf, r, None, false).unwrap();
     let fused = fused_forward(&x, &w, &ab, op).unwrap();
     let eager = eager_forward(&x, &w, &a, &b, scale).unwrap();
 
@@ -231,7 +231,7 @@ fn production_width_wi_forward_matches_the_eager_composition() {
 /// shape — `LoraLinear::forward` never sees a pre-flattened `[B*S, in]`
 /// tensor) with production-width `in`/`out`, at a smaller `B*S` so the
 /// test stays fast; the flattening logic is dimension-count-generic (see
-/// `LoraLinearFused::flatten_x`), so this is the shape-handling oracle,
+/// `LowRankResidualLinear::flatten_x`), so this is the shape-handling oracle,
 /// not a second numeric one.
 #[test]
 fn production_width_rank3_forward_matches_the_eager_composition() {
@@ -247,7 +247,7 @@ fn production_width_rank3_forward_matches_the_eager_composition() {
     let b = Tensor::from_slice(&exact_fixture(outf * r, 14), (outf, r), &device).unwrap();
     let ab = pack_ab(&a, &b).unwrap();
 
-    let op = LoraLinearFused::new(scale as f32, inf, outf, r, None, false).unwrap();
+    let op = LowRankResidualLinear::new(scale as f32, inf, outf, r, None, false).unwrap();
     let fused = fused_forward(&x, &w, &ab, op).unwrap();
     assert_eq!(fused.dims(), &[b_dim, s_dim, outf]);
 
@@ -288,7 +288,7 @@ fn production_width_backward_matches_candle_autograd_of_the_current_composition(
     let ab_fused = pack_ab(a_fused.as_tensor(), b_fused.as_tensor()).unwrap();
     let dy = Tensor::from_slice(&dy_v, (rows, outf), &device).unwrap();
 
-    let op = LoraLinearFused::new(scale as f32, inf, outf, r, None, true).unwrap();
+    let op = LowRankResidualLinear::new(scale as f32, inf, outf, r, None, true).unwrap();
     let out_fused = x_fused
         .as_tensor()
         .apply_op3(w_fused.as_tensor(), &ab_fused, op)
@@ -429,7 +429,7 @@ fn production_width_backward_matches_candle_autograd_of_the_current_composition_
     let ab_fused = pack_ab(a_fused.as_tensor(), b_fused.as_tensor()).unwrap();
     let dy = Tensor::from_slice(&dy_v, (rows, outf), &device).unwrap();
 
-    let op = LoraLinearFused::new(scale as f32, inf, outf, r, Some(key), true).unwrap();
+    let op = LowRankResidualLinear::new(scale as f32, inf, outf, r, Some(key), true).unwrap();
     let out_fused = x_fused
         .as_tensor()
         .apply_op3(w_fused.as_tensor(), &ab_fused, op)
@@ -548,7 +548,7 @@ fn rank2_pooled_classification_head_matches_the_eager_composition() {
     let b = Tensor::from_slice(&exact_fixture(outf * r, 15), (outf, r), &device).unwrap();
     let ab = pack_ab(&a, &b).unwrap();
 
-    let op = LoraLinearFused::new(scale as f32, inf, outf, r, None, false).unwrap();
+    let op = LowRankResidualLinear::new(scale as f32, inf, outf, r, None, false).unwrap();
     let fused = fused_forward(&x, &w, &ab, op).unwrap();
     assert_eq!(fused.dims(), &[rows, outf]);
     let eager = eager_forward(&x, &w, &a, &b, scale).unwrap();
@@ -576,7 +576,7 @@ fn single_row_boundary_matches_the_eager_composition() {
     let b = Tensor::from_slice(&exact_fixture(outf * r, 24), (outf, r), &device).unwrap();
     let ab = pack_ab(&a, &b).unwrap();
 
-    let op = LoraLinearFused::new(scale as f32, inf, outf, r, None, false).unwrap();
+    let op = LowRankResidualLinear::new(scale as f32, inf, outf, r, None, false).unwrap();
     let fused = fused_forward(&x, &w, &ab, op).unwrap();
     let eager = eager_forward(&x, &w, &a, &b, scale).unwrap();
 
@@ -601,14 +601,14 @@ fn empty_rows_boundary_produces_an_empty_output_not_a_panic() {
     let b = Tensor::from_slice(&fixture(outf * r, 3.2), (outf, r), &device).unwrap();
     let ab = pack_ab(&a, &b).unwrap();
 
-    let op = LoraLinearFused::new(1.0, inf, outf, r, None, false).unwrap();
+    let op = LowRankResidualLinear::new(1.0, inf, outf, r, None, false).unwrap();
     let fused = fused_forward(&x, &w, &ab, op).unwrap();
     assert_eq!(fused.dims(), &[0, outf]);
 }
 
 /// Dropout at production width: the fused kernel's internal draw must
 /// match `DropoutFused` applied directly with the SAME key — the same
-/// determinism proof `ops::lora_linear`'s own unit test makes at small
+/// determinism proof `ops::low_rank_residual_linear`'s own unit test makes at small
 /// scale, repeated here at the width the #352 profile measured so a
 /// scale-dependent indexing bug (e.g. an `i as u32` truncation somewhere
 /// in the flatten path) cannot hide in a small fixture. `p = 0.5` (so the
@@ -633,7 +633,7 @@ fn production_width_dropout_matches_dropout_fused_applied_directly() {
     let b = Tensor::from_slice(&exact_fixture(outf * r, 34), (outf, r), &device).unwrap();
     let ab = pack_ab(&a, &b).unwrap();
 
-    let op = LoraLinearFused::new(scale as f32, inf, outf, r, Some(key), false).unwrap();
+    let op = LowRankResidualLinear::new(scale as f32, inf, outf, r, Some(key), false).unwrap();
     let fused = fused_forward(&x, &w, &ab, op).unwrap();
 
     // `base` must use `x` UNDROPPED (only the LoRA branch is dropped),
@@ -676,6 +676,6 @@ fn f16_base_is_a_typed_domain_refusal() {
     let b = Tensor::from_slice(&fixture(outf * r, 6.3), (outf, r), &device).unwrap();
     let ab = pack_ab(&a, &b).unwrap();
 
-    let op = LoraLinearFused::new(1.0, inf, outf, r, None, false).unwrap();
+    let op = LowRankResidualLinear::new(1.0, inf, outf, r, None, false).unwrap();
     assert!(fused_forward(&x, &w, &ab, op).is_err());
 }

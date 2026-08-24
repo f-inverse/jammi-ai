@@ -6,7 +6,7 @@ use jammi_kernels::admission::{
     admission_mode, admit, counters_for, device_is_supported, DispatchCounters, DispatchOutcome,
     DispatchSnapshot,
 };
-use jammi_kernels::ops::{apply1, apply3, DropoutFused, DropoutKey, LoraLinearFused};
+use jammi_kernels::ops::{apply1, apply3, DropoutFused, DropoutKey, LowRankResidualLinear};
 
 use crate::error::LoraError;
 use crate::init::LoraInitMode;
@@ -21,7 +21,7 @@ use crate::seeded::{
 /// **Permanently `{fused: 0, eager: 0}` today.** `forward`'s training arm
 /// no longer calls `DropoutMasks::apply` (which recorded here via
 /// `admit`) — dropout is now reserved via `DropoutMasks::next_key` and
-/// consumed DIRECTLY by [`LoraLinearFused`]/[`DropoutFused::new`] on
+/// consumed DIRECTLY by [`LowRankResidualLinear`]/[`DropoutFused::new`] on
 /// EITHER arm (fused-site or eager-fallback), bypassing this counter's
 /// own `admit` call entirely (see `forward`'s doc). The eager-fallback
 /// arm's own dropout call (`apply1`) is a PLAIN function call too, not
@@ -55,9 +55,9 @@ pub fn lora_dropout_dispatch_snapshot() -> DispatchSnapshot {
 /// [`lora_dropout_counters`] is: the standalone epilogue call `forward`
 /// used to make
 /// (`apply2(base_out, lora_out, ScaledCastAdd::new(..))`) is superseded by
-/// [`LoraLinearFused`], which reuses `ScaledCastAdd`'s `cpu_fwd`/`cuda_fwd`
+/// [`LowRankResidualLinear`], which reuses `ScaledCastAdd`'s `cpu_fwd`/`cuda_fwd`
 /// DIRECTLY (a plain function call, not through `admit`) as its own
-/// internal epilogue step — see `jammi_kernels::ops::lora_linear`'s module
+/// internal epilogue step — see `jammi_kernels::ops::low_rank_residual_linear`'s module
 /// doc. Kept, unchanged, for source/snapshot-schema compatibility; see
 /// [`lora_linear_fused_dispatch_snapshot`] for the counter that now
 /// reflects this call site's real dispatch split.
@@ -91,17 +91,30 @@ fn eager_epilogue(base_out: &Tensor, lora_out: &Tensor, scaling: f64) -> Result<
 }
 
 /// Per-op fused/eager dispatch counts for the fused LoRA SITE
-/// (`jammi_kernels::ops::LoraLinearFused`, the whole-site fusion — one
-/// tape node in place of the ~11-node eager composition
-/// `eager_epilogue` and its own `A`/`B`/dropout sub-linears build), read
-/// from the same op-keyed registry `lora_epilogue_counters` uses.
+/// (`jammi_kernels::ops::LowRankResidualLinear`, the whole-site fusion),
+/// read from the same op-keyed registry `lora_epilogue_counters` uses.
+/// MEASURED (not estimated) at the production `LoraLinear::forward` path
+/// (`rank`-3 `x`, `F32`, `dropout = 0.3`, a frozen `w`) via
+/// `Tensor::sorted_nodes().len()`: the fused arm retains 5 tape nodes end
+/// to end (3 OP-CARRYING — `A.t()`, the `ab` pack `Op::Cat`, and this
+/// op's own `CustomOp3` call — plus the 2 `Var` leaves, `A`/`B`) versus
+/// 9 op-carrying nodes (11 total) for the eager composition
+/// `eager_epilogue` and its own `A`/`B`/dropout sub-linears build —
+/// see `crates/jammi-lora/tests/fused_epilogue.rs`'s
+/// `production_path_retains_fewer_tape_nodes_fused_vs_eager_fallback` for
+/// the harness these numbers come from. Every op-carrying node is one
+/// `GradStore::or_insert` (`backprop.rs`) full-size `zeros_like` + `add`
+/// at backward time — `A.t()`/the `ab` pack are the two this op's own
+/// `CustomOp3` collapse does NOT eliminate (they still cost their own
+/// node each), disclosed here rather than folded silently into "one
+/// node".
 ///
 /// **`lora_epilogue`/`lora_dropout` legitimately read `0` for every
 /// forward that dispatches through this counter instead.** Once the
-/// training arm routes through [`LoraLinearFused`], neither
+/// training arm routes through [`LowRankResidualLinear`], neither
 /// [`ScaledCastAdd`] nor a standalone [`DropoutFused`] call is EVER made
 /// for that forward — both are reused INSIDE the fused kernel's own
-/// `cpu_fwd`/`cuda_fwd` (see `jammi_kernels::ops::lora_linear`'s module
+/// `cpu_fwd`/`cuda_fwd` (see `jammi_kernels::ops::low_rank_residual_linear`'s module
 /// doc), called directly as plain functions, never through
 /// `jammi_kernels::ops::apply1`/`apply2`'s own dispatch-counted path. This
 /// is not a regression in observability: the fused/eager split IS
@@ -118,17 +131,19 @@ pub fn lora_linear_fused_dispatch_snapshot() -> DispatchSnapshot {
 }
 
 /// The fused LoRA-SITE kernel's domain, checked at the call site (family D
-/// / K2): [`device_is_supported`]; `x` rank 2 (a pooled head,
-/// `fine_tune/lora.rs`) or 3 (`[batch, seq, in]`); `x`/`w` share a dtype
+/// / K2): [`device_is_supported`]; `x` rank 2 (a pooled head) or 3
+/// (`[batch, seq, in]`); `x`/`w` share a dtype
 /// that is EITHER both `F32` or both `BF16` (the two combinations
-/// [`jammi_kernels::ops::LoraLinearFused`] actually implements); both
-/// contiguous; the base weight carries no bias (see
-/// [`jammi_kernels::ops::lora_linear`]'s module doc for why a bias is a
+/// [`jammi_kernels::ops::LowRankResidualLinear`] actually implements); `w`
+/// contiguous (`x` is NOT required to be — the op materializes a
+/// non-contiguous `x` internally; see the op's own domain doc); the base
+/// weight carries no bias (see
+/// [`jammi_kernels::ops::low_rank_residual_linear`]'s module doc for why a bias is a
 /// domain refusal here rather than packed into `ab`). `out_features >= 1`
 /// and `rank >= 1` are guaranteed by construction (`LoraLinear::new`
 /// refuses `rank == 0`, and a real `Linear`'s weight always has
 /// `out_features >= 1`) — not re-checked here, but re-validated
-/// independently by [`LoraLinearFused::new`] regardless (family D: an op
+/// independently by [`LowRankResidualLinear::new`] regardless (family D: an op
 /// trusts no caller for its own domain). `lora_a`/`lora_b` (packed into
 /// `ab`) must be `F32` — the op's own domain requires it — checked here
 /// too as a COUNTED domain miss, not only as the op's own hard refusal.
@@ -141,7 +156,7 @@ fn lora_linear_admission_predicate(
     if has_bias {
         return (false, "base_has_no_bias");
     }
-    // [`jammi_kernels::ops::LoraLinearFused`]'s own domain requires `ab`
+    // [`jammi_kernels::ops::LowRankResidualLinear`]'s own domain requires `ab`
     // to be `F32` (checked again by the op itself, family D — this is a
     // COUNTED domain miss at the call site, not a substitute for that
     // check). Today's workspace fact is that `lora_a`/`lora_b` are always
@@ -160,9 +175,16 @@ fn lora_linear_admission_predicate(
     if x_rank != 2 && x_rank != 3 {
         return (false, "x_rank_2_or_3");
     }
-    if !x.is_contiguous() {
-        return (false, "x_contiguous");
-    }
+    // `x` is deliberately NOT required to be contiguous here (round-2
+    // audit finding A2): `jammi_kernels::ops::LowRankResidualLinear`
+    // materializes a non-contiguous `x` internally, at the storage level,
+    // rather than refusing it (see its own
+    // `materialize_contiguous_if_needed` doc) — the ONE argument a real
+    // call site does not fully control the layout of (an upstream
+    // reshape/transpose can hand this a strided view). Refusing it here
+    // too would leave that op-level handling permanently unreachable from
+    // production and push a numerically harmless shape to the eager
+    // fallback for no reason.
     if !w.is_contiguous() {
         return (false, "w_contiguous");
     }
@@ -198,7 +220,7 @@ fn lora_linear_admission_predicate(
 /// The `is_variable()` branch must therefore be tried FIRST: it is the
 /// only test that can tell a trainable `Var` apart from a tracked
 /// non-`Var` intermediate, both of which have `track_op() == true`. See
-/// `jammi_kernels::ops::lora_linear`'s module doc for what `dweight_needed`
+/// `jammi_kernels::ops::low_rank_residual_linear`'s module doc for what `dweight_needed`
 /// controls in the fused kernel's own `bwd`.
 fn frozen_weight_gate(w: &Tensor) -> Result<bool, LoraError> {
     if w.is_variable() {
@@ -540,15 +562,21 @@ impl LoraLinear {
     /// replaced): eval never even evaluates the fused kernel's domain
     /// predicate.
     ///
-    /// ## Training: `jammi_kernels::ops::LoraLinearFused`, one tape node
+    /// ## Training: `jammi_kernels::ops::LowRankResidualLinear`, 9→3 op-nodes
     ///
     /// The training arm routes the ENTIRE site — `base = x @ w^T`, the
     /// dropout draw, both LoRA GEMMs, and the epilogue — through ONE
-    /// `CustomOp3` call ([`LoraLinearFused`]) when the kernel's own domain
+    /// `CustomOp3` call ([`LowRankResidualLinear`]) when the kernel's own domain
     /// holds (`lora_linear_admission_predicate`): this collapses the
-    /// ~11-node eager composition (each node its own `zeros_like`+`add` in
-    /// candle's backward) into one node (plus the tiny `ab`-packing
-    /// `Tensor::cat`). Outside the fused kernel's domain (a bias-carrying
+    /// eager composition's 9 op-carrying tape nodes (11 total with the 2
+    /// `A`/`B` `Var` leaves; each op-carrying node its own `zeros_like`+
+    /// `add` in candle's backward, `GradStore::or_insert`) down to 3
+    /// op-carrying nodes (5 total) — this op's own single `CustomOp3`
+    /// call, PLUS the `A.t()` view and the `ab`-packing `Tensor::cat`
+    /// this collapse does NOT eliminate (both still cost their own node;
+    /// disclosed, not folded silently into "one node"). MEASURED (not
+    /// estimated) — see [`lora_linear_fused_dispatch_snapshot`]'s own doc
+    /// for the exact harness. Outside the fused kernel's domain (a bias-carrying
     /// base, an unsupported dtype/device, a non-contiguous view, an
     /// unsupported rank), the training arm falls back to the SAME `[base
     /// matmul, dropout, A-matmul, B-matmul, epilogue]` eager composition
@@ -559,7 +587,7 @@ impl LoraLinear {
     ///
     /// **Dropout key reservation.** `DropoutMasks::next_key` is called
     /// EXACTLY ONCE per training forward, BEFORE the admission decision —
-    /// both the fused arm (passed into [`LoraLinearFused`]'s construction
+    /// both the fused arm (passed into [`LowRankResidualLinear`]'s construction
     /// data) and the eager-fallback arm (passed directly to
     /// `DropoutFused::new`) consume the SAME reserved key. Neither arm
     /// calls `DropoutMasks::apply` (which would reserve a SECOND,
@@ -621,7 +649,7 @@ impl LoraLinear {
 
         match outcome {
             DispatchOutcome::Fused => {
-                // Row-packed layout (`jammi_kernels::ops::lora_linear`'s
+                // Row-packed layout (`jammi_kernels::ops::low_rank_residual_linear`'s
                 // module doc, "the packed-`ab` GEMM eligibility problem"):
                 // `A^T` (`self.lora_a.t()`) stacked over `B`
                 // (`self.lora_b`, no pre-transpose needed) along dim 0 —
@@ -632,7 +660,7 @@ impl LoraLinear {
                 // column-packed layout this replaced, which needed one for
                 // `B^T`).
                 let ab = Tensor::cat(&[&self.lora_a.t()?, &self.lora_b], 0)?;
-                let op = LoraLinearFused::new(
+                let op = LowRankResidualLinear::new(
                     self.scaling as f32,
                     self.in_features,
                     self.out_features,

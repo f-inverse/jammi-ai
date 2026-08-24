@@ -11,7 +11,7 @@ pub(crate) mod axpy;
 pub(crate) mod dropout;
 pub(crate) mod geglu;
 pub(crate) mod layer_norm;
-pub(crate) mod lora_linear;
+pub(crate) mod low_rank_residual_linear;
 pub(crate) mod rope;
 pub(crate) mod scaled_cast_add;
 pub(crate) mod softmax;

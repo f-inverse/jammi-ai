@@ -32,7 +32,7 @@ use candle_core::{DType, Device, Tensor, Var, D};
 use half::bf16;
 use jammi_kernels::ops::{
     apply1, apply2, apply3, Axpy, DropoutFused, DropoutKey, FullyMaskedPolicy, GegluFused,
-    GeluVariant, LayerNormFused, LoraLinearFused, PhiloxKatProbe, RopeFused, ScaledCastAdd,
+    GeluVariant, LayerNormFused, LowRankResidualLinear, PhiloxKatProbe, RopeFused, ScaledCastAdd,
     SoftmaxLastDimFused,
 };
 
@@ -2637,13 +2637,13 @@ fn dropout_parity_multi_block_not_a_multiple_of_block_size() {
 }
 
 // =======================================================================
-// LoraLinearFused CPU<->CUDA parity: forward + all three backward outputs
+// LowRankResidualLinear CPU<->CUDA parity: forward + all three backward outputs
 // (dx, dw, dab), at the two dtype combinations `jammi-lora`'s admission
 // predicate reaches ((F32,F32,F32) and (BF16,BF16,F32)), plus a dropout
 // leg and a narrowed-with-nonzero-offset `x`. `BF16` here is the ONLY
 // place this op's base-matmul dtype is actually exercised end to end —
 // candle-core 0.11.0's CPU backend has no `BF16` matmul (see
-// `ops::lora_linear`'s module doc), so the "CPU" side of this comparison
+// `ops::low_rank_residual_linear`'s module doc), so the "CPU" side of this comparison
 // runs the base GEMM at `F32` (a bit-exact cast-up of the same `BF16`
 // input) while the CUDA side runs the REAL `BF16` cuBLAS path — this is a
 // weaker parity claim than the other bf16 legs above (comparing two
@@ -2653,7 +2653,7 @@ fn dropout_parity_multi_block_not_a_multiple_of_block_size() {
 // =======================================================================
 
 /// Packs `a`/`b` into `ab`'s row-packed `[in + out, rank]` layout — see
-/// `jammi_kernels::ops::lora_linear`'s module doc, "the packed-`ab` GEMM
+/// `jammi_kernels::ops::low_rank_residual_linear`'s module doc, "the packed-`ab` GEMM
 /// eligibility problem". No `.contiguous()` call needed before packing
 /// (`Tensor::cat`'s dim-0 path handles `a.t()`'s non-contiguous view via
 /// each arg's own `Layout`) — unlike the column-packed layout this
@@ -2681,7 +2681,7 @@ fn lora_linear(
     ab: &Tensor,
     p: LoraLinearParams,
 ) -> candle_core::Result<Tensor> {
-    let op = LoraLinearFused::new(p.scale, p.inf, p.outf, p.r, p.dropout, p.dweight_needed)?;
+    let op = LowRankResidualLinear::new(p.scale, p.inf, p.outf, p.r, p.dropout, p.dweight_needed)?;
     x.apply_op3(w, ab, op)
 }
 
@@ -2888,7 +2888,7 @@ fn lora_linear_parity_f32_narrowed_with_nonzero_offset() {
 /// A GENUINELY non-contiguous `x` (a transposed VIEW, not merely a
 /// nonzero-offset contiguous narrow — see
 /// `lora_linear_parity_f32_narrowed_with_nonzero_offset` for that class):
-/// `ops::lora_linear::materialize_contiguous_if_needed` must produce the
+/// `ops::low_rank_residual_linear::materialize_contiguous_if_needed` must produce the
 /// SAME CUDA result as it does on CPU, at the SAME (transposed) input —
 /// the CUDA-only leg the fix contract calls for, since a strided
 /// materialize-copy's `to_dtype`-based gather is a DIFFERENT code path per
@@ -3024,7 +3024,7 @@ fn lora_linear_parity_f32_dropout_matches_across_devices() {
 /// `BF16` base on CUDA (the real production dtype pair) — the CPU side
 /// runs the base matmul at `F32` (candle-core 0.11.0 has no CPU `BF16`
 /// matmul; see this file's own leading comment on this section and
-/// `ops::lora_linear`'s module doc), so this compares CUDA's REAL `BF16`
+/// `ops::low_rank_residual_linear`'s module doc), so this compares CUDA's REAL `BF16`
 /// path against an `F32`-CPU reference built from the SAME bit-pattern
 /// values (each `BF16` input is round-tripped through `bf16::from_f32`
 /// before either device runs, so both sides start from IDENTICAL

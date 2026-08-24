@@ -30,7 +30,7 @@
 //! **Migrated (whole-site fusion commit):** items 3 and 4 originally
 //! asserted on `lora_epilogue_dispatch_snapshot` (the single-op epilogue
 //! counter). `LoraLinear::forward`'s training arm now routes through
-//! `jammi_kernels::ops::LoraLinearFused` — the WHOLE site, not just the
+//! `jammi_kernels::ops::LowRankResidualLinear` — the WHOLE site, not just the
 //! epilogue — so these three tests now assert on
 //! `lora_linear_fused_dispatch_snapshot` instead, and
 //! `training_mode_on_a_supported_dtype_dispatches_fused_and_is_counted`
@@ -67,6 +67,26 @@ fn build_base(in_features: usize, out_features: usize, device: &Device, dtype: D
 
 fn rand_input(device: &Device) -> Tensor {
     Tensor::randn(0f32, 1.0, (2, 5, 8), device).unwrap()
+}
+
+/// Same weight VALUES as [`build_base`], but with an EXACTLY-ZERO bias —
+/// `bias.is_some()` alone is enough to force `LoraLinear::forward`'s
+/// eager-fallback arm (see `lora_linear_admission_predicate`'s
+/// `base_has_no_bias` check), while a zero bias adds NOTHING numerically
+/// to the base output — so this is the "same math, forced-eager" fixture
+/// the fused-vs-eager cross-arm oracles below need: any output difference
+/// between a fused-arm and an eager-arm instance built with this vs
+/// [`build_base`] is attributable ONLY to which arm dispatched, never to
+/// the bias term itself.
+fn build_base_with_zero_bias(
+    in_features: usize,
+    out_features: usize,
+    device: &Device,
+    dtype: DType,
+) -> Linear {
+    let base = build_base(in_features, out_features, device, dtype);
+    let bias = Tensor::zeros((out_features,), dtype, device).unwrap();
+    Linear::new(base.weight().clone(), Some(bias))
 }
 
 #[test]
@@ -493,4 +513,322 @@ fn fused_arm_production_path_would_catch_an_off_by_one_resume_position() {
         "an off-by-one resume position must NOT reproduce the correct continuation — \
          if it did, the positive oracle above would be vacuous"
     );
+}
+
+/// Production-level companion to `jammi_lora::seeded::tests::
+/// restore_is_position_independent`: restoring is an ASSIGNMENT (not a
+/// replay), so it must be exactly as fast and exactly as correct at a
+/// position no replay loop could reach in test time. Two independently
+/// restored `LoraLinear`s at the SAME huge position must produce
+/// bit-identical `forward` output.
+#[test]
+fn resume_at_a_huge_position_is_correct_at_the_production_path() {
+    let device = cpu();
+    let base_a = build_base(8, 16, &device, DType::F32);
+    let base_b = build_base(8, 16, &device, DType::F32);
+    let x = Tensor::ones((2, 5, 8), DType::F32, &device).unwrap();
+    // Within u32::MAX (the Philox counter's forward-index ceiling) but far
+    // beyond anything a replay loop could reach in test time.
+    let far = 2_000_000_000u64;
+
+    let varmap_a = VarMap::new();
+    let vb_a = VarBuilder::from_varmap(&varmap_a, DType::F32, &device);
+    let lora_a = LoraLinear::new(
+        base_a,
+        4,
+        8.0,
+        false,
+        LoraInitMode::Gaussian,
+        Some(0.3),
+        9,
+        &varmap_a,
+        &vb_a,
+    )
+    .unwrap();
+    lora_a.restore_dropout_position(far).unwrap();
+
+    let varmap_b = VarMap::new();
+    let vb_b = VarBuilder::from_varmap(&varmap_b, DType::F32, &device);
+    let lora_b = LoraLinear::new(
+        base_b,
+        4,
+        8.0,
+        false,
+        LoraInitMode::Gaussian,
+        Some(0.3),
+        9,
+        &varmap_b,
+        &vb_b,
+    )
+    .unwrap();
+    lora_b.restore_dropout_position(far).unwrap();
+
+    let out_a = lora_a.forward(&x).unwrap();
+    let out_b = lora_b.forward(&x).unwrap();
+    assert_eq!(
+        out_a.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        out_b.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        "two independently-restored LoraLinears at the same huge position must \
+         draw the identical dropout mask and produce bit-identical output"
+    );
+    assert_eq!(lora_a.dropout_position().unwrap().unwrap(), far + 1);
+}
+
+/// Production-level companion to `jammi_lora::seeded::tests::
+/// forward_counter_overflow_is_a_typed_refusal_not_a_silent_wrap`: a
+/// forward counter that would overflow the Philox counter's 32-bit slot
+/// must surface as a typed `Err` from `LoraLinear::forward` itself (the
+/// actual call site), not silently wrap into a REUSED (and therefore
+/// wrongly correlated) counter value.
+#[test]
+fn resume_past_the_forward_counter_ceiling_is_a_typed_refusal_at_the_production_path() {
+    let device = cpu();
+    let base = build_base(8, 16, &device, DType::F32);
+    let x = Tensor::ones((2, 5, 8), DType::F32, &device).unwrap();
+
+    let varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+    let lora = LoraLinear::new(
+        base,
+        4,
+        8.0,
+        false,
+        LoraInitMode::Gaussian,
+        Some(0.3),
+        1,
+        &varmap,
+        &vb,
+    )
+    .unwrap();
+    lora.restore_dropout_position(u32::MAX as u64 + 1).unwrap();
+
+    assert!(
+        lora.forward(&x).is_err(),
+        "a forward index beyond u32::MAX must be refused by LoraLinear::forward itself, \
+         not silently wrapped"
+    );
+}
+
+/// (Round-2 audit finding B1): every prior resume oracle in this file
+/// compares an arm against ITSELF (fused-vs-fused, or eager-vs-eager) —
+/// none of them ever cross-compares the FUSED arm's actual dropout draw
+/// against the EAGER arm's, so a divergence introduced ONLY on one arm's
+/// key (e.g. a `forward_idx` off-by-one applied to just the fused
+/// construction call) would survive the whole suite. This test closes
+/// that gap directly: SAME `ResumeState` (both fresh, position 0), SAME
+/// seed/prefix/config (hence identical seeded `A`/`B` AND identical
+/// `layer_id`), SAME input — one instance forced fused (bias-free base),
+/// one forced eager (a `build_base_with_zero_bias` base, which changes
+/// NOTHING numerically) — their outputs must be BIT-IDENTICAL. This is
+/// the strongest form of "the same key produces the same result" this
+/// crate can state: not merely that resuming reproduces a FIXED arm's own
+/// earlier run, but that the two DIFFERENT arms of the SAME logical
+/// forward never diverge.
+#[test]
+fn fused_and_eager_arms_draw_the_bit_identical_dropout_stream_at_the_same_resume_state() {
+    let device = cpu();
+    let (in_features, out_features, rank) = (8usize, 16usize, 4usize);
+    let seed = 999u64;
+    let x_v: Vec<f32> = (0..2 * 5 * in_features)
+        .map(|i| ((i as f32) * 0.23).sin())
+        .collect();
+    let x = Tensor::from_slice(&x_v, (2, 5, in_features), &device).unwrap();
+
+    let varmap_f = VarMap::new();
+    let vb_f = VarBuilder::from_varmap(&varmap_f, DType::F32, &device);
+    let base_f = build_base(in_features, out_features, &device, DType::F32);
+    let lora_f = LoraLinear::new(
+        base_f,
+        rank,
+        8.0,
+        false,
+        LoraInitMode::Gaussian,
+        Some(0.3),
+        seed,
+        &varmap_f,
+        &vb_f,
+    )
+    .unwrap();
+
+    let varmap_e = VarMap::new();
+    let vb_e = VarBuilder::from_varmap(&varmap_e, DType::F32, &device);
+    let base_e = build_base_with_zero_bias(in_features, out_features, &device, DType::F32);
+    let lora_e = LoraLinear::new(
+        base_e,
+        rank,
+        8.0,
+        false,
+        LoraInitMode::Gaussian,
+        Some(0.3),
+        seed,
+        &varmap_e,
+        &vb_e,
+    )
+    .unwrap();
+
+    let before_f = lora_linear_fused_dispatch_snapshot();
+    let y_f = lora_f.forward(&x).unwrap();
+    let after_f = lora_linear_fused_dispatch_snapshot();
+    assert!(
+        after_f.fused > before_f.fused,
+        "the bias-free fixture must actually dispatch the fused arm"
+    );
+
+    let before_e = lora_linear_fused_dispatch_snapshot();
+    let y_e = lora_e.forward(&x).unwrap();
+    let after_e = lora_linear_fused_dispatch_snapshot();
+    assert!(
+        after_e.eager > before_e.eager,
+        "the zero-bias fixture must actually dispatch the eager-fallback arm"
+    );
+
+    assert_eq!(
+        y_f.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        y_e.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        "same ResumeState, same seed/prefix/config, same input: the fused and \
+         eager-fallback arms must draw the BIT-IDENTICAL dropout stream and \
+         produce bit-identical output"
+    );
+}
+
+/// The negative control proving the cross-arm oracle above has teeth: two
+/// instances with DIFFERENT seeds (hence different `run_seed`, so a
+/// different Philox key on both the seeded-init AND the dropout draw)
+/// must NOT produce the same output. If they did, the positive oracle
+/// above would be vacuously insensitive to a divergent key — exactly the
+/// class of bug (one arm's key silently diverging from the other's) B1
+/// exists to catch.
+#[test]
+fn fused_and_eager_arms_with_different_seeds_do_not_coincidentally_match() {
+    let device = cpu();
+    let (in_features, out_features, rank) = (8usize, 16usize, 4usize);
+    let x_v: Vec<f32> = (0..2 * 5 * in_features)
+        .map(|i| ((i as f32) * 0.23).sin())
+        .collect();
+    let x = Tensor::from_slice(&x_v, (2, 5, in_features), &device).unwrap();
+
+    let varmap_f = VarMap::new();
+    let vb_f = VarBuilder::from_varmap(&varmap_f, DType::F32, &device);
+    let base_f = build_base(in_features, out_features, &device, DType::F32);
+    let lora_f = LoraLinear::new(
+        base_f,
+        rank,
+        8.0,
+        false,
+        LoraInitMode::Gaussian,
+        Some(0.3),
+        999,
+        &varmap_f,
+        &vb_f,
+    )
+    .unwrap();
+
+    let varmap_e = VarMap::new();
+    let vb_e = VarBuilder::from_varmap(&varmap_e, DType::F32, &device);
+    let base_e = build_base_with_zero_bias(in_features, out_features, &device, DType::F32);
+    let lora_e = LoraLinear::new(
+        base_e,
+        rank,
+        8.0,
+        false,
+        LoraInitMode::Gaussian,
+        Some(0.3),
+        1000, // DIFFERENT seed — the injected divergence.
+        &varmap_e,
+        &vb_e,
+    )
+    .unwrap();
+
+    let y_f = lora_f.forward(&x).unwrap();
+    let y_e = lora_e.forward(&x).unwrap();
+    assert_ne!(
+        y_f.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        y_e.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        "a divergent key between the two arms must NOT coincidentally produce the \
+         same output — if it did, the positive cross-arm oracle above would be vacuous"
+    );
+}
+
+/// (Round-2 audit finding B2): the module doc's tape-node-reduction claim
+/// was never MEASURED against the actual PRODUCTION `LoraLinear::forward`
+/// path (only against a from-scratch reconstruction in
+/// `jammi_kernels::ops::low_rank_residual_linear`'s own test suite). This
+/// measures it directly, at the shape/config the doc's headline
+/// describes: rank-3 `x`, `F32`, `dropout = 0.3` (a `Var`-tracked
+/// intermediate — the dropout DOES add tracked nodes, unlike the
+/// dropout-less measurement in `jammi_kernels::ops`), a frozen (plain,
+/// non-`Var`) `w`. `Tensor::sorted_nodes()` is candle's own PUBLIC
+/// topological-sort-for-backward API — the exact list `Tensor::backward`
+/// walks and `GradStore::or_insert` allocates a full-size `zeros_like` +
+/// `add` for.
+#[test]
+fn production_path_retains_fewer_tape_nodes_fused_vs_eager_fallback() {
+    let device = cpu();
+    let (in_features, out_features, rank) = (8usize, 16usize, 4usize);
+
+    // FUSED arm: bias-free base.
+    let varmap_f = VarMap::new();
+    let vb_f = VarBuilder::from_varmap(&varmap_f, DType::F32, &device);
+    let base_f = build_base(in_features, out_features, &device, DType::F32);
+    let lora_f = LoraLinear::new(
+        base_f,
+        rank,
+        8.0,
+        false,
+        LoraInitMode::Gaussian,
+        Some(0.3),
+        7,
+        &varmap_f,
+        &vb_f,
+    )
+    .unwrap();
+    // `x` itself is a PLAIN (untracked) tensor here, matching the site's
+    // own domain (a real call site's incoming activation is typically NOT
+    // itself a bare leaf `Var`) — this isolates the LoRA SITE's own node
+    // contribution (`A`/`B` and the site's own op(s)) from whatever `x`'s
+    // upstream graph would separately contribute.
+    let x_f = rand_input(&device);
+    let before_f = lora_linear_fused_dispatch_snapshot();
+    let y_f = lora_f.forward(&x_f).unwrap();
+    let after_f = lora_linear_fused_dispatch_snapshot();
+    assert!(
+        after_f.fused > before_f.fused,
+        "must actually dispatch fused"
+    );
+    let nodes_fused = y_f.sorted_nodes().len();
+
+    // EAGER-FALLBACK arm: zero-bias base forces fallback, same shapes/config.
+    let varmap_e = VarMap::new();
+    let vb_e = VarBuilder::from_varmap(&varmap_e, DType::F32, &device);
+    let base_e = build_base_with_zero_bias(in_features, out_features, &device, DType::F32);
+    let lora_e = LoraLinear::new(
+        base_e,
+        rank,
+        8.0,
+        false,
+        LoraInitMode::Gaussian,
+        Some(0.3),
+        7,
+        &varmap_e,
+        &vb_e,
+    )
+    .unwrap();
+    let x_e = rand_input(&device);
+    let before_e = lora_linear_fused_dispatch_snapshot();
+    let y_e = lora_e.forward(&x_e).unwrap();
+    let after_e = lora_linear_fused_dispatch_snapshot();
+    assert!(
+        after_e.eager > before_e.eager,
+        "must actually dispatch eager"
+    );
+    let nodes_eager = y_e.sorted_nodes().len();
+
+    assert!(
+        nodes_fused < nodes_eager,
+        "the fused arm must retain FEWER tape nodes than the eager-fallback arm: \
+         fused={nodes_fused} eager={nodes_eager}"
+    );
+    // Pin the MEASURED constants directly (not just "fewer than").
+    assert_eq!(nodes_fused, 5, "measured production-path FUSED node count");
+    assert_eq!(nodes_eager, 11, "measured production-path EAGER node count");
 }

@@ -1,10 +1,13 @@
-//! One tape node per LoRA site: `out = (x @ w^T) + cast(scale * (dropout(x) @ A^T @ B^T))`.
+//! One tape node per low-rank residual site: a frozen linear map `x @
+//! w^T` plus a trainable low-rank correction, `out = (x @ w^T) +
+//! cast(scale * (dropout(x) @ A^T @ B^T))` — `w` is `[out, in]` and
+//! FROZEN, `A` is `[rank, in]` and `B` is `[out, rank]`, both trainable,
+//! `rank << min(in, out)`.
 //!
-//! This is the fused replacement for the eager composition
-//! `jammi-lora`'s `LoraLinear::forward` (training arm) builds today from
-//! ~11 candle ops (`Linear::forward`'s reshape/matmul/reshape for `base`,
-//! the same for the `A` and `B` sub-linears, a `to_dtype`, an optional
-//! `DropoutFused` node, and [`super::ScaledCastAdd`]'s own `[mul, cast,
+//! This is the fused replacement for the eager composition this math
+//! builds from ~11 candle ops (a `Linear`-style reshape/matmul/reshape for
+//! `base`, the same for the `A` and `B` sub-linears, a `to_dtype`, an
+//! optional dropout node, and [`super::ScaledCastAdd`]'s own `[mul, cast,
 //! add]`): each of those is its own node on candle's backward tape, and
 //! candle's `GradStore::or_insert` (`backprop.rs`) allocates a FULL-SIZE
 //! `zeros_like` + `add` for every one of them, PLUS an unconditional `dW`
@@ -12,12 +15,20 @@
 //! operands' gradients regardless of whether either side is trainable —
 //! `backprop.rs:457-468`). Collapsing the whole site into one
 //! `CustomOp3` removes all of that: one node, one (or two, if the base
-//! weight is itself a trainable `Var`) gradient contribution.
+//! weight is itself a trainable `Var`) gradient contribution. MEASURED
+//! (not estimated) via `Tensor::sorted_nodes().len()` — the exact list
+//! `Tensor::backward` walks — at `x`/`A`/`B` as `Var`s and `w` a plain
+//! (frozen, untracked) leaf, `F32`, no dropout: the eager composition
+//! this op replaces retains 10 tape nodes end to end (3 `Var` leaves + 7
+//! tracked intermediates/output); this op's own site retains 6 (the same
+//! 3 leaves + `A.t()` + the `ab` pack + this op's own single node) — see
+//! `fused_site_retains_fewer_tape_nodes_than_the_eager_composition`'s own
+//! doc for the full per-node accounting.
 //!
 //! ## The three tensor arguments
 //!
-//! - `x`: `[.., in]` (rank 2 — a pooled head, e.g. `fine_tune/lora.rs` — or
-//!   rank 3 — `[batch, seq, in]`), the backbone dtype (`F32` or `BF16`).
+//! - `x`: `[.., in]` (rank 2 — a pooled/flattened activation — or rank 3
+//!   — `[batch, seq, in]`), the backbone dtype (`F32` or `BF16`).
 //! - `w`: `[out, in]`, the FROZEN base weight, same dtype as `x`.
 //! - `ab`: `F32` `[in + out, rank]`, THE pack layout — row 0 through
 //!   `in - 1` holds `A^T` (`[in, rank]`), row `in` through `in + out - 1`
@@ -133,7 +144,7 @@
 //! narrower-than-its-storage-row slice satisfies NEITHER (`rhs_m2` is the
 //! padded `in + out`, matching neither `n` nor `1`), so cuBLAS refused it
 //! with `MatMulNonContiguous`. This was confirmed on-device (an A100 pod
-//! run against production ModernBERT-large widths): EVERY
+//! run against production transformer-encoder widths): EVERY
 //! `lora_linear_parity_*` CUDA leg failed with exactly this error at the
 //! `h = xd @ A^T` GEMM.
 //!
@@ -180,14 +191,15 @@
 //! fails the same way with or without this op (a typed, loud error, never
 //! a silent wrong number — family D holds either way). This is a
 //! pre-existing, disclosed gap in candle's CPU backend, not something this
-//! op's domain check tries to route around: `BF16` production forwards run
-//! on CUDA only (see `jammi-lora`'s call-site admission doc), and the CPU
+//! op's domain check tries to route around: `BF16` production forwards are
+//! expected to run on CUDA only (a call site's own admission predicate is
+//! what decides this — see the domain section below), and the CPU
 //! oracle suite here covers the `(F32, F32, F32)` combination end-to-end
 //! plus the typed-error boundary for `(BF16, BF16, F32)` on CPU.
 //!
 //! ## Bias: a domain refusal, not packed into `ab`
 //!
-//! BERT/DistilBERT's LoRA bases carry a bias (`candle_nn::linear`'s
+//! A frozen linear base MAY carry a bias (`candle_nn::linear`'s
 //! `bias.is_some()`); this op has no bias slot. Packing a bias
 //! contribution into a single augmented matmul was evaluated and
 //! rejected: turning `y = x @ w^T + b` into a single matmul over an
@@ -209,8 +221,9 @@
 //! (see "the packed-`ab` GEMM eligibility problem" above for why THIS
 //! orientation, not `[rank, in+out]`); dtype pairs `(F32, F32, F32)` and
 //! `(BF16, BF16, F32)` (base dtype must match between `x`/`w`; `ab` is
-//! always `F32` — the workspace fact `jammi-lora`'s LoRA adapters are
-//! always built `F32`, cited in [`super::ScaledCastAdd`]'s own doc);
+//! always `F32` by this op's own domain requirement, regardless of the
+//! base dtype — see [`super::ScaledCastAdd`]'s own doc for the analogous
+//! epilogue requirement);
 //! `w`/`ab` contiguous (`Layout::is_contiguous`) — a hard refusal, since
 //! the call site is expected to control their layout by construction
 //! (a `VarBuilder`-loaded weight, a freshly `Tensor::cat`-ed `ab`); `x` MAY
@@ -219,7 +232,7 @@
 //! [`materialize_contiguous_if_needed`]'s doc), since `x` is the one
 //! argument a caller does not fully control the layout of. `out >= 1`,
 //! `rank >= 1` (validated once, at construction, in
-//! [`LoraLinearFused::new`]); the call site is
+//! [`LowRankResidualLinear::new`]); the call site is
 //! responsible for `n <= u32::MAX` and `device_is_supported` (this op has
 //! no CUDA-launch-grid ceiling of its own beyond what
 //! `crate::cuda::{dropout, scaled_cast_add}`'s own launchers already
@@ -237,7 +250,7 @@ use candle_core::{
 use super::{DropoutFused, ScaledCastAdd};
 
 /// The Philox draw's `(seed, layer_id, forward_idx, p)` key, reserved ONCE
-/// per site per forward by `jammi-lora`'s `DropoutMasks::next_key()`
+/// per site per forward by the CALL SITE's own key-reservation function
 /// BEFORE either arm (fused or eager fallback) runs — see this crate's
 /// `dropout` module doc for the counter mapping this key feeds into
 /// [`DropoutFused::new`]. `Copy` (unlike [`DropoutFused`] itself, whose
@@ -253,36 +266,40 @@ pub struct DropoutKey {
     pub p: f32,
 }
 
-/// One fused LoRA site: `(x @ w^T) + cast(scale * (dropout(x) @ A^T @
-/// B^T))`. See the module doc for the full forward/backward rounding
-/// enumeration. `Copy` (this crate's usual stateless-op requirement — see
-/// `ops`'s module doc): every field is construction data fixed by the
-/// CALL SITE before `apply3` runs, never mutated or cached from a
-/// forward's own inputs.
+/// One fused low-rank residual site: `(x @ w^T) + cast(scale *
+/// (dropout(x) @ A^T @ B^T))`. See the module doc for the full
+/// forward/backward rounding enumeration. `Copy` (this crate's usual
+/// stateless-op requirement — see `ops`'s module doc): every field is
+/// construction data fixed by the CALL SITE before `apply3` runs, never
+/// mutated or cached from a forward's own inputs.
 #[derive(Debug, Clone, Copy)]
-pub struct LoraLinearFused {
-    /// The LoRA scaling factor `gamma_r` (`alpha/rank` or
-    /// `alpha/sqrt(rank)` — see `jammi_lora::lora_scaling`), applied to
-    /// the `B^T`-side delta before the epilogue's cast.
+pub struct LowRankResidualLinear {
+    /// The scaling factor `gamma_r` applied to the `B^T`-side delta
+    /// before the epilogue's cast — a caller-supplied constant (typically
+    /// `alpha/rank` or `alpha/sqrt(rank)` in a LoRA-style
+    /// parameterization; this op has no opinion on which formula produced
+    /// it).
     pub scale: f32,
     pub in_features: usize,
     pub out_features: usize,
     pub rank: usize,
-    /// `Some` when the call site's `LoraLinear` has dropout configured
-    /// AND is training; `None` skips step 3/step-4-of-backward entirely
-    /// (`xd == x32`, `d_xd` unchanged) rather than running dropout at
-    /// `p == 0.0` through the kernel.
+    /// `Some` when the call site has dropout configured AND is training;
+    /// `None` skips step 3/step-4-of-backward entirely (`xd == x32`,
+    /// `d_xd` unchanged) rather than running dropout at `p == 0.0`
+    /// through the kernel.
     pub dropout: Option<DropoutKey>,
     /// Whether `bwd` computes and returns `Some(dW)` for the `w` slot —
     /// frozen into this `Copy` instance by the call site from its OWN
     /// frozen-weight gate (`!w.track_op()` => `false`, a tracked `Var`
-    /// base => `true`; see `jammi-lora`'s `LoraLinear::new` doc for why
-    /// `is_variable()` alone is not a safe signal here). This op never
-    /// inspects `w`'s tracked-op state itself.
+    /// base => `true`; `is_variable()` alone is not a safe signal here,
+    /// since a tracked-but-non-`Var` intermediate is neither definitely
+    /// frozen nor definitely trainable — see the call site's own gate
+    /// for the full three-way classification). This op never inspects
+    /// `w`'s tracked-op state itself.
     pub dweight_needed: bool,
 }
 
-impl LoraLinearFused {
+impl LowRankResidualLinear {
     /// `scale` must be finite (a non-finite scaling would poison every
     /// output silently otherwise — family F); `in_features`/`out_features`/
     /// `rank` must each be `>= 1` (a zero-sized GEMM dimension is a
@@ -301,12 +318,12 @@ impl LoraLinearFused {
     ) -> Result<Self> {
         if !scale.is_finite() {
             return Err(Error::Msg(format!(
-                "lora_linear_fused: scale must be finite, got {scale}"
+                "low_rank_residual_linear: scale must be finite, got {scale}"
             )));
         }
         if in_features == 0 || out_features == 0 || rank == 0 {
             return Err(Error::Msg(format!(
-                "lora_linear_fused: in_features/out_features/rank must all be >= 1, got \
+                "low_rank_residual_linear: in_features/out_features/rank must all be >= 1, got \
                  in_features={in_features} out_features={out_features} rank={rank}"
             )));
         }
@@ -319,7 +336,7 @@ impl LoraLinearFused {
         if let Some(key) = dropout {
             if !key.p.is_finite() || !(0.0..1.0).contains(&key.p) {
                 return Err(Error::Msg(format!(
-                    "lora_linear_fused: dropout.p must be finite and in [0.0, 1.0), got {}",
+                    "low_rank_residual_linear: dropout.p must be finite and in [0.0, 1.0), got {}",
                     key.p
                 )));
             }
@@ -340,20 +357,20 @@ impl LoraLinearFused {
     /// never needs to happen — the GEMM only ever sees a flat row count).
     /// Refuses any rank other than 2 or 3 (this op's stated domain) and
     /// any last-dim mismatch with `self.in_features`. `pub(crate)`: also
-    /// called from `crate::cuda::lora_linear::cuda_fwd`, so the domain
+    /// called from `crate::cuda::low_rank_residual_linear::cuda_fwd`, so the domain
     /// check has exactly one definition, not one per device.
     pub(crate) fn flatten_x(&self, l1: &Layout) -> Result<usize> {
         let dims = l1.dims();
         if dims.len() != 2 && dims.len() != 3 {
             return Err(Error::Msg(format!(
-                "lora_linear_fused: x must be rank 2 or 3, got rank {}",
+                "low_rank_residual_linear: x must be rank 2 or 3, got rank {}",
                 dims.len()
             )));
         }
         let last = dims[dims.len() - 1];
         if last != self.in_features {
             return Err(Error::Msg(format!(
-                "lora_linear_fused: x's last dim {last} != in_features {}",
+                "low_rank_residual_linear: x's last dim {last} != in_features {}",
                 self.in_features
             )));
         }
@@ -361,11 +378,13 @@ impl LoraLinearFused {
     }
 
     /// `w` must be exactly `[out_features, in_features]`; `ab` must be
-    /// exactly `[rank, in_features + out_features]` and `F32`. Both
+    /// exactly `[in_features + out_features, rank]` (the row-packed
+    /// layout — see the module doc's "packed-`ab` GEMM eligibility
+    /// problem" section) and `F32`. Both
     /// checked structurally regardless of what the call site's own
     /// admission predicate already verified (family D: an op trusts no
     /// caller for its own domain — the same doctrine `DropoutFused::new`
-    /// documents). `pub(crate)`: shared with `crate::cuda::lora_linear`
+    /// documents). `pub(crate)`: shared with `crate::cuda::low_rank_residual_linear`
     /// (dims/dtype are device-erased, so this needs no `CpuStorage`/
     /// `CudaStorage`-specific variant).
     pub(crate) fn check_w_and_ab(
@@ -376,7 +395,7 @@ impl LoraLinearFused {
     ) -> Result<()> {
         if l2.dims() != [self.out_features, self.in_features] {
             return Err(Error::Msg(format!(
-                "lora_linear_fused: w must be [{}, {}], got {:?}",
+                "low_rank_residual_linear: w must be [{}, {}], got {:?}",
                 self.out_features,
                 self.in_features,
                 l2.dims()
@@ -384,14 +403,17 @@ impl LoraLinearFused {
         }
         if ab_dims != [self.in_features + self.out_features, self.rank] {
             return Err(Error::Msg(format!(
-                "lora_linear_fused: ab must be [{}, {}], got {:?}",
+                "low_rank_residual_linear: ab must be [{}, {}], got {:?}",
                 self.in_features + self.out_features,
                 self.rank,
                 ab_dims
             )));
         }
         if ab_dtype != DType::F32 {
-            return Err(Error::UnsupportedDTypeForOp(ab_dtype, "lora_linear_fused"));
+            return Err(Error::UnsupportedDTypeForOp(
+                ab_dtype,
+                "low_rank_residual_linear",
+            ));
         }
         Ok(())
     }
@@ -400,7 +422,7 @@ impl LoraLinearFused {
     /// `out_features` — the final tensor shape this op returns,
     /// independent of the flat `(rows, out_features)` shape every
     /// internal GEMM actually operates over. `pub(crate)`: shared with
-    /// `crate::cuda::lora_linear::cuda_fwd`.
+    /// `crate::cuda::low_rank_residual_linear::cuda_fwd`.
     pub(crate) fn output_shape(&self, l1: &Layout) -> Shape {
         let mut dims = l1.dims().to_vec();
         *dims
@@ -443,11 +465,11 @@ pub(crate) fn materialize_contiguous_if_needed<S: BackendStorage>(
     Ok(Some((owned, Layout::contiguous(l.shape().clone()))))
 }
 
-impl super::sealed::Sealed for LoraLinearFused {}
+impl super::sealed::Sealed for LowRankResidualLinear {}
 
-impl CustomOp3 for LoraLinearFused {
+impl CustomOp3 for LowRankResidualLinear {
     fn name(&self) -> &'static str {
-        "lora_linear_fused"
+        "low_rank_residual_linear"
     }
 
     fn cpu_fwd(
@@ -475,8 +497,8 @@ impl CustomOp3 for LoraLinearFused {
             if l.contiguous_offsets().is_none() {
                 return Err(Error::RequiresContiguous {
                     op: match what {
-                        "w" => "lora_linear_fused(w)",
-                        _ => "lora_linear_fused(ab)",
+                        "w" => "low_rank_residual_linear(w)",
+                        _ => "low_rank_residual_linear(ab)",
                     },
                 });
             }
@@ -558,7 +580,7 @@ impl CustomOp3 for LoraLinearFused {
         s3: &candle_core::CudaStorage,
         l3: &Layout,
     ) -> Result<(candle_core::CudaStorage, Shape)> {
-        crate::cuda::lora_linear::cuda_fwd(self, s1, l1, s2, l2, s3, l3)
+        crate::cuda::low_rank_residual_linear::cuda_fwd(self, s1, l1, s2, l2, s3, l3)
     }
 
     /// Tensor-level (see the module doc's backward enumeration): every
@@ -587,7 +609,7 @@ impl CustomOp3 for LoraLinearFused {
         // checked and refused rather than trusted.
         if !self.dweight_needed && w.is_variable() {
             return Err(Error::Msg(
-                "lora_linear_fused: bwd called with dweight_needed=false but w is a \
+                "low_rank_residual_linear: bwd called with dweight_needed=false but w is a \
                  trainable Var — the call site's frozen_weight_gate disagrees with the \
                  tensor it actually passed; refusing rather than silently dropping w's \
                  gradient"
@@ -666,7 +688,20 @@ impl CustomOp3 for LoraLinearFused {
         let dx_base = dy_base_2d.matmul(w)?.reshape(x.shape())?;
         let dx = (&dx_base + &d_x_lora)?;
 
-        let dw = if self.dweight_needed {
+        // The MIRROR gate (family D — the same doctrine as the
+        // `!dweight_needed && w.is_variable()` refusal above, but this
+        // combination is wasteful rather than dangerous): `dweight_needed
+        // == true` while `w` is not actually `track_op()`'d means the
+        // call site's `frozen_weight_gate` disagrees with the tensor it
+        // passed in the OTHER direction — `w` carries no `Op` and is not
+        // a `Var`, so NOTHING downstream (`backprop.rs`'s `sorted_nodes`
+        // walk never visits an untracked leaf, and there is no `Var` to
+        // `grads.get`) will ever read a `dW` computed for it. Computing
+        // the full `dy^T @ x` GEMM and allocating its output anyway would
+        // be silently wasted work every backward pass — skipped here
+        // rather than trusted, matching this op's usual "an op trusts no
+        // caller for its own domain" doctrine.
+        let dw = if self.dweight_needed && w.track_op() {
             let x_base_2d = x.reshape((m, inf))?;
             Some(dy_base_2d.t()?.matmul(&x_base_2d)?)
         } else {
@@ -784,7 +819,12 @@ mod tests {
         Tensor::cat(&[&a_t_tensor, &b_tensor], 0).unwrap()
     }
 
-    fn fused_forward(x: &Tensor, w: &Tensor, ab: &Tensor, op: LoraLinearFused) -> Result<Tensor> {
+    fn fused_forward(
+        x: &Tensor,
+        w: &Tensor,
+        ab: &Tensor,
+        op: LowRankResidualLinear,
+    ) -> Result<Tensor> {
         x.apply_op3(w, ab, op)
     }
 
@@ -810,7 +850,7 @@ mod tests {
         let w = Tensor::from_slice(&w_v, (outf, inf), &device).unwrap();
         let ab = pack_ab(&a_v, inf, &b_v, outf, r, &device);
 
-        let op = LoraLinearFused::new(scale, inf, outf, r, None, false).unwrap();
+        let op = LowRankResidualLinear::new(scale, inf, outf, r, None, false).unwrap();
         let got = fused_forward(&x, &w, &ab, op)
             .unwrap()
             .to_vec2::<f32>()
@@ -845,7 +885,7 @@ mod tests {
         let w = Tensor::from_slice(&w_v, (outf, inf), &device).unwrap();
         let ab = pack_ab(&a_v, inf, &b_v, outf, r, &device);
 
-        let op = LoraLinearFused::new(scale, inf, outf, r, None, false).unwrap();
+        let op = LowRankResidualLinear::new(scale, inf, outf, r, None, false).unwrap();
         let got = fused_forward(&x, &w, &ab, op).unwrap();
         assert_eq!(got.dims(), &[b, s, outf]);
         let got_flat: Vec<f32> = got.flatten_all().unwrap().to_vec1().unwrap();
@@ -878,7 +918,7 @@ mod tests {
         let b = Tensor::from_slice(&b_v, (outf, r), &device).unwrap();
         let ab = pack_ab(&a_v, inf, &b_v, outf, r, &device);
 
-        let op = LoraLinearFused::new(scale, inf, outf, r, None, false).unwrap();
+        let op = LowRankResidualLinear::new(scale, inf, outf, r, None, false).unwrap();
         let fused = fused_forward(&x, &w, &ab, op).unwrap();
 
         // Manual eager reconstruction: identical to `LoraLinear::forward`'s
@@ -927,7 +967,7 @@ mod tests {
         let b = Tensor::from_slice(&b_v, (outf, r), &device).unwrap();
         let ab = pack_ab(&a_v, inf, &b_v, outf, r, &device);
 
-        let op = LoraLinearFused::new(scale, inf, outf, r, Some(key), false).unwrap();
+        let op = LowRankResidualLinear::new(scale, inf, outf, r, Some(key), false).unwrap();
         let fused = fused_forward(&x, &w, &ab, op).unwrap();
 
         // Manual reconstruction using the SAME DropoutFused key directly.
@@ -989,7 +1029,7 @@ mod tests {
         let a_t = a_var.as_tensor().t().unwrap();
         let ab = Tensor::cat(&[&a_t, b_var.as_tensor()], 0).unwrap();
 
-        let op = LoraLinearFused::new(scale, inf, outf, r, None, false).unwrap();
+        let op = LowRankResidualLinear::new(scale, inf, outf, r, None, false).unwrap();
         let out = x.as_tensor().apply_op3(&w, &ab, op).unwrap();
         let dy = Tensor::from_slice(&dy_v, (rows, outf), &device).unwrap();
         let total = (&out * &dy).unwrap().sum_all().unwrap();
@@ -1130,7 +1170,7 @@ mod tests {
         let a_t = a_var.as_tensor().t().unwrap();
         let ab = Tensor::cat(&[&a_t, b_var.as_tensor()], 0).unwrap();
 
-        let op = LoraLinearFused::new(scale, inf, outf, r, Some(key), false).unwrap();
+        let op = LowRankResidualLinear::new(scale, inf, outf, r, Some(key), false).unwrap();
         let out = x.as_tensor().apply_op3(&w, &ab, op).unwrap();
         let dy = Tensor::from_slice(&dy_v, (rows, outf), &device).unwrap();
         let total = (&out * &dy).unwrap().sum_all().unwrap();
@@ -1215,7 +1255,7 @@ mod tests {
         // dweight_needed = true: w is a trainable Var, dW must be Some.
         let w_trainable =
             Var::from_tensor(&Tensor::randn(0f32, 1.0, (outf, inf), &device).unwrap()).unwrap();
-        let op_true = LoraLinearFused::new(1.0, inf, outf, r, None, true).unwrap();
+        let op_true = LowRankResidualLinear::new(1.0, inf, outf, r, None, true).unwrap();
         let out_true = x.apply_op3(w_trainable.as_tensor(), &ab, op_true).unwrap();
         let grads_true = out_true.sum_all().unwrap().backward().unwrap();
         assert!(
@@ -1228,7 +1268,7 @@ mod tests {
         // fetch).
         let w_frozen = Tensor::randn(0f32, 1.0, (outf, inf), &device).unwrap();
         assert!(!w_frozen.is_variable() && !w_frozen.track_op());
-        let op_false = LoraLinearFused::new(1.0, inf, outf, r, None, false).unwrap();
+        let op_false = LowRankResidualLinear::new(1.0, inf, outf, r, None, false).unwrap();
         let out_false = x.apply_op3(&w_frozen, &ab, op_false).unwrap();
         // A frozen leaf carries no gradient entry to inspect via `grads`
         // (it is never a `Var`); the real assertion is that this forward
@@ -1243,9 +1283,9 @@ mod tests {
     /// trusts no caller for its own domain, cited in `check_w_and_ab`'s
     /// own doc): `dweight_needed=false` combined with an ACTUALLY
     /// trainable `w` (a `Var`) is refused with a typed error rather than
-    /// silently dropping `w`'s gradient forever — the call site
-    /// (`jammi-lora`'s `frozen_weight_gate`) is expected to keep this flag
-    /// truthful, but this op does not simply trust it.
+    /// silently dropping `w`'s gradient forever — the call site's own
+    /// frozen-weight gate is expected to keep this flag truthful, but
+    /// this op does not simply trust it.
     #[test]
     fn dweight_needed_false_with_a_trainable_w_is_a_typed_refusal() {
         let device = Device::Cpu;
@@ -1256,7 +1296,7 @@ mod tests {
         let b = Tensor::randn(0f32, 1.0, (outf, r), &device).unwrap();
         let ab = Tensor::cat(&[&a.t().unwrap(), &b], 0).unwrap();
 
-        let op = LoraLinearFused::new(1.0, inf, outf, r, None, false).unwrap();
+        let op = LowRankResidualLinear::new(1.0, inf, outf, r, None, false).unwrap();
         let out = x.apply_op3(w.as_tensor(), &ab, op).unwrap();
         let err = out.sum_all().unwrap().backward().expect_err(
             "dweight_needed=false with a trainable w must be refused, not silently \
@@ -1265,10 +1305,46 @@ mod tests {
         assert!(matches!(err, Error::Msg(_)));
     }
 
+    /// The MIRROR gate (round-2 audit finding A1): `dweight_needed=true`
+    /// combined with a `w` that is NOT actually `track_op()`'d (a true
+    /// frozen leaf) must skip computing `dW` entirely — no `dW` slot is
+    /// ever returned for a `w` nothing downstream could read one for —
+    /// rather than silently wasting a full `dy^T @ x` GEMM and its output
+    /// allocation every backward pass. Calls `CustomOp3::bwd` DIRECTLY
+    /// (bypassing `Tensor::backward`'s whole machinery) so this asserts
+    /// the WORK ITSELF was skipped (`dw` is `None` INSIDE `bwd`'s own
+    /// return), not merely that candle's `GradStore` later discards an
+    /// entry nothing reads — a black-box `grads.get(&w).is_none()` check
+    /// would pass identically whether or not the wasted GEMM ran.
+    #[test]
+    fn dweight_needed_true_with_an_untracked_w_skips_dw_without_wasted_work() {
+        let device = Device::Cpu;
+        let (rows, inf, outf, r) = (3usize, 3usize, 4usize, 2usize);
+        let x = Tensor::randn(0f32, 1.0, (rows, inf), &device).unwrap();
+        let w = Tensor::randn(0f32, 1.0, (outf, inf), &device).unwrap();
+        assert!(
+            !w.is_variable() && !w.track_op(),
+            "w must be a true frozen leaf"
+        );
+        let a = Tensor::randn(0f32, 1.0, (r, inf), &device).unwrap();
+        let b = Tensor::randn(0f32, 1.0, (outf, r), &device).unwrap();
+        let ab = Tensor::cat(&[&a.t().unwrap(), &b], 0).unwrap();
+
+        let op = LowRankResidualLinear::new(1.0, inf, outf, r, None, true).unwrap();
+        let res = x.apply_op3(&w, &ab, op).unwrap();
+        let grad_res = Tensor::ones_like(&res).unwrap();
+        let (_dx, dw, _dab) = op.bwd(&x, &w, &ab, &res, &grad_res).unwrap();
+        assert!(
+            dw.is_none(),
+            "dweight_needed=true with an untracked w must skip the dW GEMM \
+             entirely, not merely compute-then-discard it"
+        );
+    }
+
     #[test]
     fn rank2_pooled_head_shape_is_accepted() {
-        // fine_tune/lora.rs's classification/distribution/ner heads: rank-2
-        // x, F32 base, small out_features.
+        // A rank-2 pooled classification-head-shaped call: rank-2 x, F32
+        // base, small out_features.
         let device = Device::Cpu;
         let (rows, inf, outf, r) = (4usize, 6usize, 2usize, 2usize);
         let x = Tensor::randn(0f32, 1.0, (rows, inf), &device).unwrap();
@@ -1277,7 +1353,7 @@ mod tests {
         let b = Tensor::randn(0f32, 1.0, (outf, r), &device).unwrap();
         let ab = Tensor::cat(&[&a.t().unwrap(), &b], 0).unwrap();
 
-        let op = LoraLinearFused::new(1.0, inf, outf, r, None, false).unwrap();
+        let op = LowRankResidualLinear::new(1.0, inf, outf, r, None, false).unwrap();
         let out = x.apply_op3(&w, &ab, op).unwrap();
         assert_eq!(out.dims(), &[rows, outf]);
     }
@@ -1290,7 +1366,7 @@ mod tests {
         let a = Tensor::randn(0f32, 1.0, (2, 5), &device).unwrap();
         let b = Tensor::randn(0f32, 1.0, (3, 2), &device).unwrap();
         let ab = Tensor::cat(&[&a.t().unwrap(), &b], 0).unwrap();
-        let op = LoraLinearFused::new(1.0, 5, 3, 2, None, false).unwrap();
+        let op = LowRankResidualLinear::new(1.0, 5, 3, 2, None, false).unwrap();
         assert!(x.apply_op3(&w, &ab, op).is_err());
     }
 
@@ -1302,14 +1378,14 @@ mod tests {
         // Wrong shape (should be [in+out, r]) — the ab packing itself must
         // be [in+out, r], the row-packed layout (see the module doc).
         let bad_ab = Tensor::randn(0f32, 1.0, (2, 5), &device).unwrap();
-        let op = LoraLinearFused::new(1.0, 5, 3, 2, None, false).unwrap();
+        let op = LowRankResidualLinear::new(1.0, 5, 3, 2, None, false).unwrap();
         assert!(x.apply_op3(&w, &bad_ab, op).is_err());
     }
 
     #[test]
     fn non_finite_scale_is_a_typed_refusal() {
-        assert!(LoraLinearFused::new(f32::NAN, 4, 4, 2, None, false).is_err());
-        assert!(LoraLinearFused::new(f32::INFINITY, 4, 4, 2, None, false).is_err());
+        assert!(LowRankResidualLinear::new(f32::NAN, 4, 4, 2, None, false).is_err());
+        assert!(LowRankResidualLinear::new(f32::INFINITY, 4, 4, 2, None, false).is_err());
     }
 
     /// `dropout.p` is validated at CONSTRUCTION, the same way `scale` is
@@ -1325,17 +1401,17 @@ mod tests {
                 p,
             })
         };
-        assert!(LoraLinearFused::new(1.0, 4, 4, 2, key(f32::NAN), false).is_err());
-        assert!(LoraLinearFused::new(1.0, 4, 4, 2, key(1.0), false).is_err());
-        assert!(LoraLinearFused::new(1.0, 4, 4, 2, key(-0.1), false).is_err());
-        assert!(LoraLinearFused::new(1.0, 4, 4, 2, key(0.5), false).is_ok());
+        assert!(LowRankResidualLinear::new(1.0, 4, 4, 2, key(f32::NAN), false).is_err());
+        assert!(LowRankResidualLinear::new(1.0, 4, 4, 2, key(1.0), false).is_err());
+        assert!(LowRankResidualLinear::new(1.0, 4, 4, 2, key(-0.1), false).is_err());
+        assert!(LowRankResidualLinear::new(1.0, 4, 4, 2, key(0.5), false).is_ok());
     }
 
     #[test]
     fn zero_sized_dims_are_a_typed_refusal() {
-        assert!(LoraLinearFused::new(1.0, 0, 4, 2, None, false).is_err());
-        assert!(LoraLinearFused::new(1.0, 4, 0, 2, None, false).is_err());
-        assert!(LoraLinearFused::new(1.0, 4, 4, 0, None, false).is_err());
+        assert!(LowRankResidualLinear::new(1.0, 0, 4, 2, None, false).is_err());
+        assert!(LowRankResidualLinear::new(1.0, 4, 0, 2, None, false).is_err());
+        assert!(LowRankResidualLinear::new(1.0, 4, 4, 0, None, false).is_err());
     }
 
     /// Family D, revised: a non-contiguous `x` (e.g. a transposed view) is
@@ -1357,10 +1433,10 @@ mod tests {
         let b = Tensor::randn(0f32, 1.0, (3, 2), &device).unwrap();
         let ab = Tensor::cat(&[&a.t().unwrap(), &b], 0).unwrap();
 
-        let op = LoraLinearFused::new(1.0, 5, 3, 2, None, false).unwrap();
+        let op = LowRankResidualLinear::new(1.0, 5, 3, 2, None, false).unwrap();
         let fused_noncontig = x.apply_op3(&w, &ab, op).unwrap();
 
-        let op_ref = LoraLinearFused::new(1.0, 5, 3, 2, None, false).unwrap();
+        let op_ref = LowRankResidualLinear::new(1.0, 5, 3, 2, None, false).unwrap();
         let x_contig = x.contiguous().unwrap();
         let fused_contig = x_contig.apply_op3(&w, &ab, op_ref).unwrap();
 
@@ -1399,7 +1475,7 @@ mod tests {
         let a = Tensor::randn(0f32, 1.0, (r, inf), &device).unwrap();
         let b = Tensor::randn(0f32, 1.0, (outf, r), &device).unwrap();
         let ab = Tensor::cat(&[&a.t().unwrap(), &b], 0).unwrap();
-        let op = LoraLinearFused::new(1.0, inf, outf, r, None, false).unwrap();
+        let op = LowRankResidualLinear::new(1.0, inf, outf, r, None, false).unwrap();
         let err = x.apply_op3(&w, &ab, op).expect_err(
             "BF16 CPU matmul is unsupported by candle-core 0.11.0 without mkl/accelerate",
         );
@@ -1416,7 +1492,7 @@ mod tests {
     #[test]
     fn empty_dropout_key_and_present_dropout_key_draw_the_same_mask_as_dropout_fused_directly() {
         // Not a new determinism property (DropoutFused already proves
-        // this) — pins that LoraLinearFused's OWN reconstruction of
+        // this) — pins that LowRankResidualLinear's OWN reconstruction of
         // DropoutFused from a DropoutKey uses the fields in the right
         // order (a transposed/swapped constructor call would silently
         // draw a DIFFERENT stream and this test would catch it via the
@@ -1465,7 +1541,7 @@ mod tests {
     /// slices were already proven admissible by construction (module
     /// doc); this test proves EVERY BACKWARD product is too, at `rank`
     /// 1/2/3 (this op's own domain boundary — `rank >= 1`) and at
-    /// production width (ModernBERT-large's `in=1024`). Reconstructs
+    /// production width (a transformer-encoder-scale `in=1024`). Reconstructs
     /// `bwd`'s exact slicing sequence (`a_t = ab.narrow(0, 0, inf)`,
     /// `b = ab.narrow(0, inf, outf)`, and their single-transpose views)
     /// rather than calling the private `bwd` method directly, since the
@@ -1549,5 +1625,96 @@ mod tests {
             );
             let _d_xd = g.matmul(&a_t_t).unwrap();
         }
+    }
+
+    /// MEMORY ORACLE (mirrors `jammi_encoders::modernbert`'s own
+    /// `fused_training_softmax_call_site_drops_the_affine_node`):
+    /// `Tensor::sorted_nodes()` is candle's own PUBLIC topological-sort-
+    /// for-backward API (the exact list `Tensor::backward` walks, and the
+    /// list `GradStore::or_insert` allocates a full-size `zeros_like` +
+    /// `add` for) — a direct, honest count of what backward keeps
+    /// resident, not a proxy. `x`/`A`/`B` are `Var`s (so they, and every
+    /// TRACKED intermediate derived from them, appear in the walk); `w`
+    /// is a PLAIN (non-`Var`, untracked) leaf, so it and any
+    /// exclusively-`w`-derived intermediate (`w.t()`) contribute NOTHING
+    /// to either count — matching this op's actual frozen-base contract.
+    /// `F32`, no dropout.
+    ///
+    /// EAGER: the composition this op replaces, reproduced directly
+    /// (`base = x@w^T`, `after_a = x@A^T`, `lora_out = after_a@B^T`,
+    /// `scaled = lora_out*scale`, `out = base+scaled`) — every `.t()` on
+    /// a TRACKED operand (`A`, `B`) is itself a distinct tracked node
+    /// (`Op::Transpose`), not free.
+    ///
+    /// FUSED: `ab = cat([A.t(), B], 0)` then ONE `apply_op3` call.
+    #[test]
+    fn fused_site_retains_fewer_tape_nodes_than_the_eager_composition() {
+        let device = Device::Cpu;
+        let (rows, inf, outf, r) = (4usize, 5usize, 3usize, 2usize);
+        let scale = 1.3f32;
+
+        let x_v: Vec<f32> = (0..rows * inf).map(|i| ((i as f32) * 0.29).sin()).collect();
+        let w_v: Vec<f32> = (0..outf * inf).map(|i| ((i as f32) * 0.19).cos()).collect();
+        let a_v: Vec<f32> = (0..r * inf).map(|i| ((i as f32) * 0.37).sin()).collect();
+        let b_v: Vec<f32> = (0..outf * r).map(|i| ((i as f32) * 0.41).cos()).collect();
+
+        // EAGER.
+        let x_eager =
+            Var::from_tensor(&Tensor::from_slice(&x_v, (rows, inf), &device).unwrap()).unwrap();
+        let w_plain = Tensor::from_slice(&w_v, (outf, inf), &device).unwrap();
+        let a_eager =
+            Var::from_tensor(&Tensor::from_slice(&a_v, (r, inf), &device).unwrap()).unwrap();
+        let b_eager =
+            Var::from_tensor(&Tensor::from_slice(&b_v, (outf, r), &device).unwrap()).unwrap();
+        assert!(
+            !w_plain.is_variable() && !w_plain.track_op(),
+            "w must be a plain leaf"
+        );
+
+        let base_out = x_eager.as_tensor().matmul(&w_plain.t().unwrap()).unwrap();
+        let after_a = x_eager
+            .as_tensor()
+            .matmul(&a_eager.as_tensor().t().unwrap())
+            .unwrap();
+        let lora_out = after_a.matmul(&b_eager.as_tensor().t().unwrap()).unwrap();
+        let scaled = (&lora_out * f64::from(scale)).unwrap();
+        let y_eager = (&base_out + &scaled).unwrap();
+        let nodes_eager = y_eager.sorted_nodes().len();
+
+        // FUSED.
+        let x_fused =
+            Var::from_tensor(&Tensor::from_slice(&x_v, (rows, inf), &device).unwrap()).unwrap();
+        let a_fused =
+            Var::from_tensor(&Tensor::from_slice(&a_v, (r, inf), &device).unwrap()).unwrap();
+        let b_fused =
+            Var::from_tensor(&Tensor::from_slice(&b_v, (outf, r), &device).unwrap()).unwrap();
+        let ab_fused =
+            Tensor::cat(&[&a_fused.as_tensor().t().unwrap(), b_fused.as_tensor()], 0).unwrap();
+        let op = LowRankResidualLinear::new(scale, inf, outf, r, None, false).unwrap();
+        let y_fused = x_fused
+            .as_tensor()
+            .apply_op3(&w_plain, &ab_fused, op)
+            .unwrap();
+        let nodes_fused = y_fused.sorted_nodes().len();
+
+        assert!(
+            nodes_fused < nodes_eager,
+            "the fused site must retain FEWER tape nodes than the eager composition: \
+             eager={nodes_eager} fused={nodes_fused}"
+        );
+        // Pin the MEASURED constants directly, not just "fewer than" (see
+        // this test's own doc for the leaf-vs-tracked-intermediate
+        // accounting these numbers follow from).
+        assert_eq!(
+            nodes_eager, 10,
+            "measured EAGER node count: x, A, B (3 leaves) + A.t(), base_out, \
+             after_a, B.t(), lora_out, scaled, out (7 tracked intermediates/output) \
+             — w and w.t() contribute 0 (w is a plain, untracked leaf)"
+        );
+        assert_eq!(
+            nodes_fused, 6,
+            "measured FUSED node count: x, A, B (3 leaves) + A.t(), ab (Op::Cat), \
+             out (CustomOp3) (3 tracked intermediates/output) — w contributes 0"
+        );
     }
 }

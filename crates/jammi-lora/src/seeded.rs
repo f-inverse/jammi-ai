@@ -25,8 +25,11 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(test)]
 use candle_core::Tensor;
-use jammi_kernels::ops::{DropoutFused, DropoutKey};
+#[cfg(test)]
+use jammi_kernels::ops::DropoutFused;
+use jammi_kernels::ops::DropoutKey;
 
 /// A small, fast, self-contained PRNG (SplitMix64) so seeded init and dropout
 /// reproduce byte-identically from a seed without pulling a `rand` dependency
@@ -176,18 +179,17 @@ impl DropoutMasks {
     }
 
     /// Reserve the NEXT training forward's Philox key WITHOUT drawing
-    /// anything: advances the forward counter by exactly ONE (the same
-    /// atomic `fetch_add` [`Self::apply`] itself performs) and returns the
-    /// `(seed, layer_id, forward_idx, p)` tuple as a
-    /// [`jammi_kernels::ops::DropoutKey`].
+    /// anything: advances the forward counter by exactly ONE (a single
+    /// atomic `fetch_add`) and returns the `(seed, layer_id, forward_idx,
+    /// p)` tuple as a [`jammi_kernels::ops::DropoutKey`].
     ///
     /// This exists so a call site can decide FUSED-vs-EAGER-FALLBACK
     /// *after* reserving the key and have BOTH arms consume the identical
-    /// key — critically, the fallback arm must NOT call [`Self::apply`]
-    /// (which would reserve a SECOND, different `forward_idx` for the same
-    /// logical forward, breaking esc-033's O(1) resume invariant: two
-    /// arms of the SAME forward must advance the counter by exactly one
-    /// between them, not one each). `p` must already be validated to
+    /// key — critically, the fallback arm must NOT reserve a SECOND,
+    /// different `forward_idx` for the same logical forward (that would
+    /// break esc-033's O(1) resume invariant: two arms of the SAME
+    /// forward must advance the counter by exactly one between them, not
+    /// one each). `p` must already be validated to
     /// `[0.0, 1.0)` by the caller (`LoraLinear::new`); the eventual
     /// `DropoutFused::new` construction re-validates independently
     /// regardless (family D).
@@ -207,34 +209,6 @@ impl DropoutMasks {
             forward_idx,
             p,
         })
-    }
-
-    /// Apply this layer's dropout to `x` for the NEXT training forward
-    /// (advancing the counter by one, via [`Self::next_key`]) and return
-    /// the result directly — the mask is never materialized as a separate
-    /// tensor at any point.
-    ///
-    /// `LoraLinear::forward` no longer calls this directly (it calls
-    /// [`Self::next_key`] itself, so
-    /// both the fused and eager-fallback arms can consume the SAME
-    /// reserved key — see `lora_linear::LoraLinear::forward`'s doc). Kept
-    /// (not deleted) as the `#[cfg(test)]` module's own oracle surface
-    /// below: `apply`'s determinism/resume tests (`masks_are_deterministic
-    /// _and_inverted_scaled`, `restore_position_reproduces_the
-    /// _uninterrupted_masks`, the esc-033 anti-relaxation clause, …) are
-    /// this type's actual correctness proof and are simplest to state
-    /// against the one-call `apply` shape rather than every test
-    /// re-inlining `next_key` + `DropoutFused::new` + `apply1`.
-    #[allow(
-        dead_code,
-        reason = "exercised extensively by this module's own #[cfg(test)] oracles; \
-                  no longer reachable from the plain (non-test) library build now that \
-                  LoraLinear::forward calls next_key directly"
-    )]
-    pub(crate) fn apply(&self, x: &Tensor, p: f32) -> Result<Tensor, candle_core::Error> {
-        let key = self.next_key(p)?;
-        let op = DropoutFused::new(key.seed, key.layer_id, key.forward_idx, key.p)?;
-        jammi_kernels::ops::apply1(x, op)
     }
 }
 
@@ -357,6 +331,25 @@ mod tests {
         t.flatten_all().unwrap().to_vec1::<f32>().unwrap()
     }
 
+    /// Test-only replacement for the deleted `DropoutMasks::apply`
+    /// convenience method: reserves this layer's NEXT key
+    /// (`DropoutMasks::next_key`) and applies it directly, exactly as
+    /// `apply` used to. Lives ONLY under `#[cfg(test)]` — the production
+    /// call site (`LoraLinear::forward`) has its OWN reason to call
+    /// `next_key` directly (so both the fused and eager-fallback arms can
+    /// share one reserved key), so a shipped `apply` convenience method
+    /// was genuinely dead code in the non-test build; this helper is not
+    /// (every test below exercises it).
+    fn apply_via_next_key(
+        masks: &DropoutMasks,
+        x: &Tensor,
+        p: f32,
+    ) -> Result<Tensor, candle_core::Error> {
+        let key = masks.next_key(p)?;
+        let op = DropoutFused::new(key.seed, key.layer_id, key.forward_idx, key.p)?;
+        jammi_kernels::ops::apply1(x, op)
+    }
+
     #[test]
     fn layer_id_for_name_is_a_pure_function_of_the_name_alone() {
         assert_eq!(
@@ -450,8 +443,8 @@ mod tests {
         let x = Tensor::ones((100, 100), candle_core::DType::F32, &d).unwrap();
         let a = DropoutMasks::new(11, "projection");
         let b = DropoutMasks::new(11, "projection");
-        let m1 = mask_values(&a.apply(&x, 0.3).unwrap());
-        let m2 = mask_values(&b.apply(&x, 0.3).unwrap());
+        let m1 = mask_values(&apply_via_next_key(&a, &x, 0.3).unwrap());
+        let m2 = mask_values(&apply_via_next_key(&b, &x, 0.3).unwrap());
         assert_eq!(
             m1, m2,
             "same (seed, layer, counter) must draw the same mask"
@@ -473,8 +466,8 @@ mod tests {
         let d = candle_core::Device::Cpu;
         let x = Tensor::ones((64, 64), candle_core::DType::F32, &d).unwrap();
         let m = DropoutMasks::new(3, "projection");
-        let first = mask_values(&m.apply(&x, 0.3).unwrap());
-        let second = mask_values(&m.apply(&x, 0.3).unwrap());
+        let first = mask_values(&apply_via_next_key(&m, &x, 0.3).unwrap());
+        let second = mask_values(&apply_via_next_key(&m, &x, 0.3).unwrap());
         assert_ne!(
             first, second,
             "a counter-keyed mask must advance; an unchanging mask is not dropout"
@@ -488,124 +481,33 @@ mod tests {
         let a = DropoutMasks::new(5, "layer.0.Wqkv");
         let b = DropoutMasks::new(5, "layer.1.Wqkv");
         assert_ne!(
-            mask_values(&a.apply(&x, 0.3).unwrap()),
-            mask_values(&b.apply(&x, 0.3).unwrap()),
+            mask_values(&apply_via_next_key(&a, &x, 0.3).unwrap()),
+            mask_values(&apply_via_next_key(&b, &x, 0.3).unwrap()),
             "masks are keyed by layer_id; two layers must not correlate"
         );
     }
 
-    /// The resume invariant, and the reason this is counter-keyed rather
-    /// than an advancing stream: restoring is an assignment, so it is O(1)
-    /// at any position. The old design replayed `position` draws one at a
-    /// time, and position advanced by one per activation ELEMENT — order
-    /// 1e11 per layer after one epoch of a large encoder (esc-033).
-    #[test]
-    fn restore_position_reproduces_the_uninterrupted_masks() {
-        let d = candle_core::Device::Cpu;
-        let x = Tensor::ones((32, 32), candle_core::DType::F32, &d).unwrap();
-        let reference = DropoutMasks::new(7, "projection");
-        let _ = reference.apply(&x, 0.2).unwrap();
-        let _ = reference.apply(&x, 0.2).unwrap();
-        let pos = reference.position();
-        assert_eq!(pos, 2, "position counts forwards, not draws");
-        let third = mask_values(&reference.apply(&x, 0.2).unwrap());
-
-        let resumed = DropoutMasks::new(7, "projection");
-        resumed.restore_position(pos);
-        assert_eq!(resumed.position(), pos);
-        assert_eq!(
-            third,
-            mask_values(&resumed.apply(&x, 0.2).unwrap()),
-            "a restored layer must draw the mask the uninterrupted run would have"
-        );
-    }
-
-    /// esc-033's ANTI-RELAXATION CLAUSE (the promotion-gating oracle): O(1)
-    /// restore must not be "bought" by resuming onto a DIFFERENT stream —
-    /// the failure a counter-based redesign can still have is an off-by-
-    /// one in `forward_idx`. The check above (one draw after restore)
-    /// cannot see that class of bug if the off-by-one happens to
-    /// self-correct after one step; this asserts the WHOLE post-restore
-    /// stream — every forward from the restored position through the end
-    /// of the run — is byte-identical to the uninterrupted run's, not just
-    /// the immediate next one.
-    #[test]
-    fn post_restore_stream_is_byte_identical_to_the_uninterrupted_run_across_many_forwards() {
-        let d = candle_core::Device::Cpu;
-        let x = Tensor::ones((16, 16), candle_core::DType::F32, &d).unwrap();
-        const N: u64 = 12;
-        const K: u64 = 5;
-
-        // Uninterrupted reference: N forwards, every output recorded.
-        let reference = DropoutMasks::new(123, "projection");
-        let mut ref_outputs = Vec::with_capacity(N as usize);
-        for _ in 0..N {
-            ref_outputs.push(mask_values(&reference.apply(&x, 0.3).unwrap()));
-        }
-
-        // The "crashed" run: a SEPARATE instance that only ran the first K
-        // forwards before the persisted checkpoint.
-        let interrupted = DropoutMasks::new(123, "projection");
-        for _ in 0..K {
-            interrupted.apply(&x, 0.3).unwrap();
-        }
-        let pos = interrupted.position();
-        assert_eq!(pos, K);
-
-        // The resumed run: a FRESH instance restored to that position,
-        // continuing for every remaining forward.
-        let resumed = DropoutMasks::new(123, "projection");
-        resumed.restore_position(pos);
-        let mut resumed_outputs = Vec::with_capacity((N - K) as usize);
-        for _ in 0..(N - K) {
-            resumed_outputs.push(mask_values(&resumed.apply(&x, 0.3).unwrap()));
-        }
-
-        for i in 0..(N - K) {
-            assert_eq!(
-                resumed_outputs[i as usize],
-                ref_outputs[(K + i) as usize],
-                "post-restore forward {i} (uninterrupted-run forward {}) diverged — \
-                 O(1) restore must reproduce the identical stream, not merely a \
-                 plausible-looking one",
-                K + i
-            );
-        }
-    }
-
-    /// The negative control proving the oracle above has teeth: restoring
-    /// to `K + 1` instead of `K` (the EXACT off-by-one esc-033's anti-
-    /// relaxation clause names) must NOT reproduce the uninterrupted run's
-    /// continuation. If it did, the positive test above would be
-    /// vacuously insensitive to this failure mode.
-    #[test]
-    fn post_restore_stream_would_catch_an_off_by_one_forward_idx() {
-        let d = candle_core::Device::Cpu;
-        let x = Tensor::ones((16, 16), candle_core::DType::F32, &d).unwrap();
-        const N: u64 = 8;
-        const K: u64 = 3;
-
-        let reference = DropoutMasks::new(77, "projection");
-        let mut ref_outputs = Vec::with_capacity(N as usize);
-        for _ in 0..N {
-            ref_outputs.push(mask_values(&reference.apply(&x, 0.3).unwrap()));
-        }
-
-        let off_by_one = DropoutMasks::new(77, "projection");
-        off_by_one.restore_position(K + 1); // the injected bug: should be K
-        let wrong_output = mask_values(&off_by_one.apply(&x, 0.3).unwrap());
-
-        assert_ne!(
-            wrong_output, ref_outputs[K as usize],
-            "an off-by-one restore position must NOT reproduce the correct \
-             continuation — if it did, the positive oracle above would be vacuous"
-        );
-    }
+    // The remaining esc-033 resume oracles this module used to state
+    // directly against `DropoutMasks::apply` — the basic
+    // "restore-then-one-forward" check, the full-stream byte-identity
+    // check, and the off-by-one negative control — are now stated at the
+    // PRODUCTION `LoraLinear::forward` call site instead (both the fused
+    // and eager-fallback arms):
+    // `crates/jammi-lora/tests/fused_epilogue.rs`'s
+    // `{fused,eager}_arm_production_path_resume_reproduces_the_
+    // uninterrupted_dropout_stream` and
+    // `fused_arm_production_path_would_catch_an_off_by_one_resume_position`.
+    // No assertion is lost — the claims are IDENTICAL, just exercised
+    // through the actual call site's own `next_key` reservation (the code
+    // path esc-033 was really about) rather than through this module's
+    // own `#[cfg(test)]`-only helper.
 
     /// Restoring must not depend on how far into the run the position is —
     /// a replay-based restore would take time proportional to it; this
     /// asserts the behaviour is identical at a position no replay could
-    /// reach in any reasonable time.
+    /// reach in any reasonable time. (A production-level companion —
+    /// `LoraLinear::restore_dropout_position` at the same huge position —
+    /// lives in `fused_epilogue.rs`.)
     #[test]
     fn restore_is_position_independent() {
         let d = candle_core::Device::Cpu;
@@ -620,15 +522,16 @@ mod tests {
         let b = DropoutMasks::new(9, "projection");
         b.restore_position(far);
         assert_eq!(
-            mask_values(&a.apply(&x, 0.25).unwrap()),
-            mask_values(&b.apply(&x, 0.25).unwrap())
+            mask_values(&apply_via_next_key(&a, &x, 0.25).unwrap()),
+            mask_values(&apply_via_next_key(&b, &x, 0.25).unwrap())
         );
         assert_eq!(a.position(), far + 1);
     }
 
     /// A forward counter that would overflow the Philox counter's 32-bit
     /// slot is a typed refusal, not a silent wraparound into a REUSED
-    /// (and therefore wrongly correlated) counter value.
+    /// (and therefore wrongly correlated) counter value. (A production-
+    /// level companion lives in `fused_epilogue.rs`.)
     #[test]
     fn forward_counter_overflow_is_a_typed_refusal_not_a_silent_wrap() {
         let d = candle_core::Device::Cpu;
@@ -636,7 +539,7 @@ mod tests {
         let m = DropoutMasks::new(1, "projection");
         m.restore_position(u32::MAX as u64 + 1);
         assert!(
-            m.apply(&x, 0.2).is_err(),
+            apply_via_next_key(&m, &x, 0.2).is_err(),
             "a forward index beyond u32::MAX must be refused, not silently wrapped"
         );
     }

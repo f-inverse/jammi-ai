@@ -59,7 +59,7 @@ mod dropout;
 // op's domain check, not two that could silently drift apart.
 pub(crate) mod geglu;
 pub(crate) mod layer_norm;
-pub(crate) mod lora_linear;
+pub(crate) mod low_rank_residual_linear;
 pub(crate) mod rope;
 mod scaled_cast_add;
 pub(crate) mod softmax;
@@ -68,7 +68,7 @@ pub use axpy::Axpy;
 pub use dropout::{DropoutFused, PhiloxKatProbe};
 pub use geglu::{GegluFused, GeluVariant};
 pub use layer_norm::{LayerNormFused, MAX_HIDDEN};
-pub use lora_linear::{DropoutKey, LoraLinearFused};
+pub use low_rank_residual_linear::{DropoutKey, LowRankResidualLinear};
 pub use rope::{RopeFused, MAX_HEAD_DIM};
 pub use scaled_cast_add::ScaledCastAdd;
 pub use softmax::{

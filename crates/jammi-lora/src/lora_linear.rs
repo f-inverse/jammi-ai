@@ -151,9 +151,28 @@ fn eager_epilogue(base_out: &Tensor, lora_out: &Tensor, scaling: f64) -> Result<
 /// a `DivisionByZero` panic) — a confident wrong number, not a loud failure
 /// — so this is refused with a typed [`LoraError::Config`] rather than
 /// silently returned.
+///
+/// `alpha` must be finite and `> 0.0`. PEFT's own reference implementation
+/// (`src/peft/tuners/lora/layer.py`, `LoraLayer.update_layer`:
+/// `self.scaling[adapter_name] = lora_alpha / r`) performs no such check —
+/// PEFT accepts any float there. But an unchecked non-positive or non-finite
+/// `alpha` is a K2 edge specific to jammi's own read path, not PEFT's: `rank`
+/// and `alpha` are both read from the same persisted `adapter_config.json`
+/// with no read-path validation, so a corrupted/hand-edited `lora_alpha`
+/// (`0.0`, negative, `NaN`, `inf`) silently zeroes or negates the adapter's
+/// entire contribution, or propagates a non-finite scaling that only
+/// surfaces much later as NaN activations deep in a forward pass — a
+/// confident-wrong-number failure at a distant call site, not a loud one at
+/// the point the bad value was actually read. Refused here, at the input
+/// edge, with a typed [`LoraError::Config`] instead.
 pub fn lora_scaling(alpha: f64, rank: usize, use_rslora: bool) -> Result<f64, LoraError> {
     if rank == 0 {
         return Err(LoraError::Config("LoRA rank must be > 0".into()));
+    }
+    if !alpha.is_finite() || alpha <= 0.0 {
+        return Err(LoraError::Config(format!(
+            "LoRA alpha must be finite and > 0.0, got {alpha}"
+        )));
     }
     Ok(if use_rslora {
         alpha / (rank as f64).sqrt()
@@ -597,8 +616,6 @@ mod lora_scaling_tests {
             (1.0, 1, true),
             (32.0, 16, false),
             (32.0, 16, true),
-            (0.0, 4, false), // alpha == 0 is a valid, if inert, scaling.
-            (0.0, 4, true),
         ];
         for &(alpha, rank, use_rslora) in cases {
             let expected = if use_rslora {
@@ -630,15 +647,34 @@ mod lora_scaling_tests {
         }
     }
 
-    /// Non-finite `alpha` (family F non-vacuity: a naive `> c` bound is
-    /// `false` for `NaN`, so this asserts on the actual bit pattern instead
-    /// of a comparison a `NaN` could vacuously dodge) propagates as a
-    /// `NaN`/`inf` scaling rather than being silently coerced — `rank`, not
-    /// `alpha`, is this function's validated domain edge; a caller passing a
-    /// non-finite `alpha` gets a non-finite scaling back, visibly.
+    /// Domain boundary (family D / K2): a non-finite or non-positive `alpha`
+    /// must be a typed refusal, not a `NaN`/`inf`/zeroed/negated scaling
+    /// silently propagating to a distant "NaN activations" failure. Every
+    /// bad value below is refused in BOTH the vanilla and rsLoRA arm (family
+    /// F non-vacuity: a naive `alpha > 0.0` comparison is `false` for `NaN`
+    /// too, so a control that only checked `!(got > 0.0)` on the OUTPUT
+    /// would vacuously "pass" on a `NaN` input that never actually hit the
+    /// refusal branch — this asserts the typed `Err` directly instead).
     #[test]
-    fn non_finite_alpha_propagates_visibly_not_silently() {
-        let got = lora_scaling(f64::NAN, 4, false).unwrap();
-        assert!(got.is_nan(), "NaN alpha must yield a visible NaN scaling");
+    fn non_positive_or_non_finite_alpha_is_a_typed_refusal_both_arms() {
+        let bad: &[f64] = &[f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -1.0];
+        for &alpha in bad {
+            for use_rslora in [false, true] {
+                let err = lora_scaling(alpha, 4, use_rslora).unwrap_err();
+                assert!(
+                    matches!(err, crate::error::LoraError::Config(_)),
+                    "alpha={alpha} use_rslora={use_rslora}: expected a Config refusal, got {err:?}"
+                );
+            }
+        }
+    }
+
+    /// Non-vacuity's positive counterpart: a valid `alpha` (`16.0`) must
+    /// still be ACCEPTED by both arms — the refusal above is not so broad it
+    /// rejects everything.
+    #[test]
+    fn valid_alpha_is_accepted_both_arms() {
+        assert_eq!(lora_scaling(16.0, 4, false).unwrap(), 4.0);
+        assert_eq!(lora_scaling(16.0, 4, true).unwrap(), 8.0);
     }
 }

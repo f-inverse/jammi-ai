@@ -11,25 +11,24 @@
 //! ## The op-keyed dispatch-counter registry
 //!
 //! [`device_is_supported`] and [`admission_mode`] are the CANONICAL home for
-//! two predicates every fused op's call site needs (moved here from
-//! `jammi-encoders::layer_norm` by the C6 commit, which found them
-//! duplicated/reached-through-`crate::layer_norm::` by every one of C2-C5's
-//! four ops): `jammi-encoders` re-exports both names from `crate::layer_norm`
-//! so its existing call sites (`crate::layer_norm::admission_mode()`, etc.)
-//! keep compiling unchanged.
+//! two predicates every fused op's call site needs. `jammi-encoders`'
+//! call sites (`layer_norm`, `modernbert`'s RoPE/softmax/GeGLU) reach them
+//! directly as `jammi_kernels::admission::{device_is_supported,
+//! admission_mode}` — there is no `crate::layer_norm::` compat re-export of
+//! either name; every caller across the workspace, including `jammi-lora`
+//! (which has no dependency on `jammi-encoders` at all), imports from this
+//! module.
 //!
-//! [`counters_for`] generalizes the OTHER half of the duplication: C2-C5
-//! each hand-declared their own `pub(crate) static X_DISPATCH_COUNTERS:
-//! DispatchCounters = DispatchCounters::new();` in their own module, one per
-//! op. A NEW fused op (this crate's or a downstream crate's) does not need
-//! to repeat that — it calls `counters_for("its_op_name")` and gets back a
-//! `&'static DispatchCounters` looked up (or, on first use, lazily created
-//! and leaked) from ONE process-wide, op-keyed table. This is additive: the
-//! four existing per-op statics are left as they are (a live, working,
-//! independently-tested mechanism — migrating them is a separate, higher-
-//! blast-radius change this commit does not make), but every op added after
-//! this one — starting with the LoRA epilogue's `"lora_epilogue"` counters —
-//! uses the registry instead of adding a fifth hand-declared static.
+//! [`counters_for`] generalizes the OTHER half: every op's dispatch
+//! counters — `jammi-encoders::layer_norm::LN_DISPATCH_COUNTERS`,
+//! `modernbert::{ROPE,SOFTMAX,GEGLU}_DISPATCH_COUNTERS`, and every op added
+//! since — are a `LazyLock<&'static DispatchCounters>` initialized from
+//! `counters_for("its_op_name")`, not a hand-declared
+//! `static X: DispatchCounters = DispatchCounters::new()`. A NEW fused op
+//! (this crate's or a downstream crate's) calls `counters_for("its_op_name")`
+//! and gets back a `&'static DispatchCounters` looked up (or, on first use,
+//! lazily created and leaked) from the ONE process-wide, op-keyed table
+//! [`snapshot_all`] reads in full.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -256,13 +255,12 @@ pub fn admission_mode() -> AdmissionMode {
 /// impossible rather than merely unreached, at zero runtime cost (the whole
 /// expression folds to a compile-time constant).
 ///
-/// Moved here from `jammi-encoders::layer_norm::device_is_supported` (the
-/// C6 commit): that crate now re-exports this function under its old path
-/// so `crate::layer_norm::device_is_supported(..)` call sites in
-/// `jammi-encoders` (including `crate::modernbert`'s RoPE/softmax/GeGLU
-/// admission predicates) keep compiling unchanged, and `jammi-lora` — which
-/// has no dependency on `jammi-encoders` at all — reaches the identical,
-/// once-audited clause directly.
+/// The canonical home for this predicate: `jammi-encoders`' call sites
+/// (`layer_norm`, and `modernbert`'s RoPE/softmax/GeGLU admission
+/// predicates) import `jammi_kernels::admission::device_is_supported`
+/// directly — there is no `crate::layer_norm::device_is_supported` compat
+/// path — and `jammi-lora`, which has no dependency on `jammi-encoders` at
+/// all, reaches the identical, once-audited clause the same way.
 pub fn device_is_supported(d: &Device) -> bool {
     d.is_cpu() || (cfg!(feature = "cuda") && d.is_cuda())
 }

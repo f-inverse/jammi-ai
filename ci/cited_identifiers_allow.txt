@@ -6,9 +6,14 @@
 # vendored/upstream internal (which the CI guard job, no toolchain/cargo,
 # cannot see) from permanently blocking the gate.
 #
-# This file is EMPTY today: the gate ships in `--changed-only` (ratchet) mode
-# in CI (see `.github/workflows/ci.yml`) because the full-repo scan found a
-# pre-existing backlog (~123 distinct unresolved citations across ~50 files —
-# see the PR that added this gate for the full list) too large to triage in
-# one PR. As the backfill retires each pre-existing citation (fix the name, or
-# allowlist it here with a reason), add its line below.
+# The gate ships in `--changed-only` (ratchet) mode in CI (see
+# `.github/workflows/ci.yml`) because the full-repo scan found a pre-existing
+# backlog (~123 distinct unresolved citations across ~50 files — see the PR
+# that added this gate for the full list) too large to triage in one PR. As
+# the backfill retires each pre-existing citation (fix the name, or allowlist
+# it here with a reason), add its line below.
+
+RUST_LOG  # env var read by tracing_subscriber::EnvFilter::try_from_default_env() (jammi-server/src/telemetry.rs) — upstream tracing-subscriber convention, never a string literal in this repo's .rs sources
+tonic_web  # the external `tonic-web` crate, referenced by its Rust module path in jammi-server/src/grpc_web_trailers.rs doc comments
+make_trailers_frame  # tonic-web's own (private) trailers-frame builder (tonic-web-0.14.5/src/call.rs), cited in jammi-server/src/grpc_web_trailers.rs as the upstream shape this layer mirrors
+with_interceptor  # the `Type::with_interceptor` associated fn tonic-build's client codegen template emits for every generated service client (tonic-build-0.14.6/src/client.rs); jammi-wire/src/transport.rs and every generated client call site name it as a path-qualified call (`Client::with_interceptor(..)`), which this gate's method-call scan (`.name(`) does not match

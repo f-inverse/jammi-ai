@@ -362,7 +362,7 @@ impl From<&BackendError> for pb::BackendErrorDetail {
 }
 
 /// Reconstruct the [`BackendError`] from its wire detail — the inverse of the
-/// encode above. The `tenant_mismatch` arm re-parses the UUID strings (empty ==
+/// encode above. The `TenantMismatch` arm re-parses the UUID strings (empty ==
 /// `None`); a non-empty string that fails to parse reconstructs as `None`, the
 /// only total option for a forged payload, since the variant's faithful path
 /// always carries a valid UUID. `Sqlx` reconstructs as `Execution` carrying the
@@ -803,8 +803,10 @@ mod tests {
     /// the id-carrying `NotFound`/`AlreadyExists`, the payload-free
     /// `NoOrderColumn`, and the nested engine-owned `Backend`) round-trips to
     /// the identical variant and `Display` after the full Status round-trip. The
-    /// lone genuinely-foreign leaf, `BackendError::Sqlx`, is exercised in
-    /// `backend_sqlx_leaf_folds_to_faithful_string`.
+    /// cases below deliberately omit `BackendError::Sqlx`: it is the lone
+    /// genuinely-foreign leaf and folds to `Execution` carrying its inner
+    /// `Display` string (see the `Sqlx` arm in the encode/decode above), not a
+    /// round-trip this test's "reconstructs as itself" assertion covers.
     #[test]
     fn mutable_table_variant_round_trips_faithfully() {
         use jammi_db::catalog::backend::BackendError;

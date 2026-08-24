@@ -97,7 +97,7 @@ impl TryFrom<pb::SourceConnection> for SourceConnection {
 /// overrides, and driver options are server-side and have no wire field, so the
 /// send side does not carry them. A `None` URL encodes as the empty string the
 /// decode reads back as `None`; an unset format encodes as
-/// `FILE_FORMAT_UNSPECIFIED`, which the decode maps to "let the engine infer".
+/// FILE_FORMAT_UNSPECIFIED, which the decode maps to "let the engine infer".
 impl From<SourceConnection> for pb::SourceConnection {
     fn from(conn: SourceConnection) -> Self {
         pb::SourceConnection {
@@ -109,7 +109,7 @@ impl From<SourceConnection> for pb::SourceConnection {
 
 /// Map the engine's [`FileFormat`] onto the proto enum — the inverse of
 /// [`file_format_from_proto`]. An absent format encodes as
-/// `FILE_FORMAT_UNSPECIFIED` (the decode reads that back as "let the engine
+/// FILE_FORMAT_UNSPECIFIED (the decode reads that back as "let the engine
 /// infer").
 fn file_format_to_proto(format: Option<FileFormat>) -> pb::FileFormat {
     match format {

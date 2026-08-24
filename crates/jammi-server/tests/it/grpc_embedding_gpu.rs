@@ -3,8 +3,9 @@
 //!
 //! Jammi's recommended shape is client/server + GPU: a CUDA `jammi-server`
 //! served over gRPC / Flight SQL, driven by a remote client. That shape is
-//! otherwise never exercised on a GPU anywhere — the `jammi-ai`
-//! `gpu_capability` suite proves the engine core *in-process*, and every other
+//! otherwise never exercised on a GPU anywhere — the `jammi-ai` crate's
+//! `tests/gpu_capability` integration suite proves the engine core
+//! *in-process*, and every other
 //! lane is CPU. Here an in-process Tonic chain hosts a GPU-pinned
 //! `InferenceSession` (`gpu.device = 0`, `require_gpu = true`) and a client
 //! registers a source, runs the unified `GenerateEmbeddings` / `EncodeQuery`

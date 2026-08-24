@@ -44,9 +44,14 @@
 //!   is a REVIEW concern this bound cannot catch at compile time — stated
 //!   here explicitly rather than left as an overclaim.
 
-use candle_core::{CustomOp2, CustomOp3, Result, Tensor};
+use candle_core::{CustomOp1, CustomOp2, CustomOp3, Result, Tensor};
 
 mod axpy;
+// `pub(crate)`, not private like `axpy`/`layer_norm`/`rope`: `crate::cuda::geglu`
+// imports `geglu_dims`/`output_shape`/`check_variant` directly from here
+// rather than duplicating them — the same "shared, not duplicated" choice
+// `ops::softmax` makes for its own (more complex) broadcast-domain logic.
+pub(crate) mod geglu;
 mod layer_norm;
 mod rope;
 // `pub(crate)`, not private like the three above: `crate::cuda::softmax`
@@ -59,6 +64,7 @@ mod rope;
 pub(crate) mod softmax;
 
 pub use axpy::Axpy;
+pub use geglu::{GegluFused, GeluVariant};
 pub use layer_norm::{LayerNormFused, MAX_HIDDEN};
 pub use rope::{RopeFused, MAX_HEAD_DIM};
 pub use softmax::{
@@ -90,6 +96,14 @@ mod sealed {
 pub trait KernelOp: Copy + Send + Sync + 'static + sealed::Sealed {}
 
 impl<T> KernelOp for T where T: Copy + Send + Sync + 'static + sealed::Sealed {}
+
+/// The sanctioned way to run a unary (`CustomOp1`) fused op — the same
+/// enforcement point as [`apply2`]/[`apply3`], for an op that takes
+/// exactly one tensor argument (e.g. [`GegluFused`], whose split happens
+/// INSIDE the kernel rather than at the call site).
+pub fn apply1<T: KernelOp + CustomOp1>(x: &Tensor, op: T) -> Result<Tensor> {
+    x.apply_op1(op)
+}
 
 /// The sanctioned way to run a binary (`CustomOp2`) fused op: requires
 /// `T: KernelOp + CustomOp2`, so this is the compile-time enforcement

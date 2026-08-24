@@ -21,6 +21,23 @@ candle-nn.workspace = true
 half.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# `f32`/`f64` erf — GeGLU's forward/backward need the same error function
+# candle-core's own `gelu_erf` uses. candle-core's `crate::cpu::erf::erf_f32`
+# (`src/cpu/erf.rs`) is a private wrapper around `libm::erff`/`libm::erf`, not
+# re-exported publicly, so this crate depends on `libm` directly rather than
+# re-deriving a different-precision erf. `libm` was ALREADY resolved in this
+# workspace's Cargo.lock (a transitive dependency of candle-core, itself
+# `[dependencies.libm] version = "0.2.15"`), so this adds no new package to
+# the dependency graph — only a direct (named) one this crate can call.
+# `.workspace = true` (not a per-crate literal version): a single hoisted
+# entry means fused-vs-eager parity can't drift between crates in this
+# workspace (one lock entry moves both this crate's erf and candle-core's),
+# and — since a `^`-range literal can still pick up a later `libm` PATCH
+# release across `cargo update` without any commit here changing — a single
+# workspace-level bump is what would visibly move this crate's own quoted
+# oracle numbers (`geglu_oracles.rs`'s measured tolerances/residuals), not a
+# silent per-crate drift.
+libm.workspace = true
 
 [build-dependencies]
 # Only pulled into the build-dependency graph when the `cuda` feature is

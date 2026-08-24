@@ -4275,6 +4275,7 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "half",
+ "libm",
  "thiserror 2.0.18",
  "tracing",
 ]

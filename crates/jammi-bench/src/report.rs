@@ -1153,6 +1153,19 @@ pub struct FinetuneStepTier {
     /// last-dim), or because the admission predicate failed for any other
     /// stated reason.
     pub softmax_eager_dispatches: u64,
+    /// How many times ModernBERT's training-mode fused GeGLU kernel
+    /// (`jammi_kernels::ops::GegluFused`) actually dispatched during this
+    /// run — the same positive-proof channel as `ln_fused_dispatches` /
+    /// `rope_fused_dispatches` / `softmax_fused_dispatches`, for the C5
+    /// fused-kernels commit (see `jammi_encoders::modernbert`'s
+    /// `geglu_apply_training` doc).
+    pub geglu_fused_dispatches: u64,
+    /// How many times that same call site fell back to the eager
+    /// (`narrow`+`narrow`+`gelu_erf`+`mul`) composition instead — outside
+    /// the fused kernel's domain (dtype/contiguity/device/even-last-dim),
+    /// or because the admission predicate failed for any other stated
+    /// reason.
+    pub geglu_eager_dispatches: u64,
     pub s_per_step_p50: Measurement,
     pub s_per_step_mean: Measurement,
     pub steps_per_s: Measurement,

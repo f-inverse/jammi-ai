@@ -85,6 +85,17 @@ pub fn softmax_dispatch_snapshot() -> jammi_kernels::admission::DispatchSnapshot
     modernbert::SOFTMAX_DISPATCH_COUNTERS.snapshot()
 }
 
+/// A snapshot of ModernBERT's training-mode fused GeGLU
+/// (`jammi_kernels::ops::GegluFused`) dispatch counts (see
+/// `crate::modernbert`'s `geglu_apply_training` for the call site this
+/// counts). `modernbert::GEGLU_DISPATCH_COUNTERS` is `pub(crate)` — this
+/// is the read API a durable job record or a bench report uses, mirroring
+/// [`ln_dispatch_snapshot`] / [`rope_dispatch_snapshot`] /
+/// [`softmax_dispatch_snapshot`] exactly.
+pub fn geglu_dispatch_snapshot() -> jammi_kernels::admission::DispatchSnapshot {
+    modernbert::GEGLU_DISPATCH_COUNTERS.snapshot()
+}
+
 /// Contiguity-safe matmul — the single matmul primitive every encoder uses.
 ///
 /// candle's **CUDA** matmul rejects two operand layouts its **CPU** matmul

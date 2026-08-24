@@ -31,7 +31,8 @@
 use candle_core::{DType, Device, Tensor, Var, D};
 use half::bf16;
 use jammi_kernels::ops::{
-    apply2, apply3, Axpy, FullyMaskedPolicy, LayerNormFused, RopeFused, SoftmaxLastDimFused,
+    apply1, apply2, apply3, Axpy, FullyMaskedPolicy, GegluFused, GeluVariant, LayerNormFused,
+    RopeFused, SoftmaxLastDimFused,
 };
 
 fn axpy(alpha: f64, x: &Tensor, y: &Tensor) -> candle_core::Result<Tensor> {
@@ -1293,6 +1294,313 @@ fn softmax_parity_empty_batch() {
         .unwrap();
     // Must not attempt an illegal zero-block launch.
     let out_gpu: Vec<f32> = softmax(&s_gpu, &m_gpu)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert!(out_cpu.is_empty());
+    assert!(out_gpu.is_empty());
+}
+
+// =======================================================================
+// GegluFused CPU<->CUDA parity: fwd + bwd (dwi_out). Covers the same
+// divergence-prone classes as the suites above (contiguous, narrowed-with-
+// nonzero-offset, empty, a block-size boundary, a non-power-of-two width)
+// PLUS ModernBERT-large's actual production width (intermediate=2624),
+// since this op's CUDA kernel is purely elementwise (grid-stride over
+// n_out = rows*intermediate) rather than a per-row block reduction.
+// =======================================================================
+
+fn geglu(wi_out: &Tensor) -> candle_core::Result<Tensor> {
+    apply1(wi_out, GegluFused::new(GeluVariant::Erf))
+}
+
+fn assert_geglu_parity_f32(cuda: &Device, rows: usize, intermediate: usize, wv: &[f32]) {
+    let cpu = Device::Cpu;
+    let n_out = rows * intermediate;
+
+    let wi_cpu =
+        Var::from_tensor(&Tensor::from_slice(wv, (rows, 2 * intermediate), &cpu).unwrap()).unwrap();
+    let out_cpu = geglu(&wi_cpu).unwrap();
+    let grads_cpu = out_cpu.backward().unwrap();
+
+    let wi_gpu =
+        Var::from_tensor(&Tensor::from_slice(wv, (rows, 2 * intermediate), cuda).unwrap()).unwrap();
+    let out_gpu = geglu(&wi_gpu).unwrap();
+    let grads_gpu = out_gpu.backward().unwrap();
+
+    let out_cpu_v: Vec<f32> = out_cpu.flatten_all().unwrap().to_vec1().unwrap();
+    let out_gpu_v: Vec<f32> = out_gpu
+        .to_device(&cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(out_cpu_v.len(), n_out);
+    assert_eq!(out_gpu_v.len(), n_out, "geglu GPU fwd length mismatch");
+    for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
+        assert!(
+            ((*c - *g).abs() as f64) <= F32_TOL,
+            "geglu fwd[{i}]: cpu {c} vs cuda {g} (rows={rows}, intermediate={intermediate})"
+        );
+    }
+
+    let dwi_cpu: Vec<f32> = grads_cpu
+        .get(&wi_cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let dwi_gpu: Vec<f32> = grads_gpu
+        .get(&wi_gpu)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(dwi_cpu.len(), rows * 2 * intermediate);
+    assert_eq!(
+        dwi_gpu.len(),
+        rows * 2 * intermediate,
+        "geglu GPU dwi_out length mismatch"
+    );
+    for (i, (c, g)) in dwi_cpu.iter().zip(dwi_gpu.iter()).enumerate() {
+        assert!(
+            ((*c - *g).abs() as f64) <= F32_TOL,
+            "geglu dwi_out[{i}]: cpu {c} vs cuda {g}"
+        );
+    }
+}
+
+fn assert_geglu_parity_bf16(cuda: &Device, rows: usize, intermediate: usize, wv: &[f32]) {
+    let cpu = Device::Cpu;
+    let n_out = rows * intermediate;
+    let wb: Vec<bf16> = wv.iter().map(|&v| bf16::from_f32(v)).collect();
+
+    let wi_cpu =
+        Var::from_tensor(&Tensor::from_slice(&wb, (rows, 2 * intermediate), &cpu).unwrap())
+            .unwrap();
+    let out_cpu = geglu(&wi_cpu).unwrap();
+    let grads_cpu = out_cpu.backward().unwrap();
+
+    let wi_gpu =
+        Var::from_tensor(&Tensor::from_slice(&wb, (rows, 2 * intermediate), cuda).unwrap())
+            .unwrap();
+    let out_gpu = geglu(&wi_gpu).unwrap();
+    let grads_gpu = out_gpu.backward().unwrap();
+
+    let to_f32 = |t: &Tensor| -> Vec<f32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap()
+    };
+    // The SAME relative-with-floor-at-1.0 bound `assert_softmax_parity_bf16`
+    // / the LayerNorm/RoPE parity helpers use (`REL = 2*2^-7 = 2^-6`,
+    // floored at magnitude `1.0`) — NOT the wider relative-with-large-
+    // absolute-floor bound `geglu_oracles.rs`'s CPU-only fused-vs-EAGER
+    // oracle needs (`BF16_ABS_FLOOR = 2^-5`, sized for eager's rounding
+    // CASCADE occasionally underflowing an intermediate to exact bf16
+    // zero — a mechanism that cannot arise HERE, since both sides of THIS
+    // comparison run the IDENTICAL fused single-rounding kernel, just on
+    // different hardware/compilers). CPU<->CUDA divergence is bounded by
+    // ordinary rounding-order/`--fmad=true` contraction (`build.rs`'s
+    // documented tolerance doctrine), the same class every other op's
+    // parity leg in this file already bounds with this exact formula.
+    let bf16_bound = |c: f32, g: f32| 2.0 * 2.0f32.powi(-7) * c.abs().max(g).max(1.0);
+
+    let out_cpu_v = to_f32(&out_cpu);
+    let out_gpu_v = to_f32(&out_gpu.to_device(&cpu).unwrap());
+    assert_eq!(out_cpu_v.len(), n_out);
+    assert_eq!(out_gpu_v.len(), n_out, "geglu bf16 GPU fwd length mismatch");
+    for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
+        assert!(
+            (c - g).abs() <= bf16_bound(*c, *g),
+            "geglu bf16 fwd[{i}]: cpu {c} vs cuda {g}"
+        );
+    }
+
+    let dwi_cpu_v = to_f32(&grads_cpu.get(&wi_cpu).unwrap().clone());
+    let dwi_gpu_v = to_f32(&grads_gpu.get(&wi_gpu).unwrap().to_device(&cpu).unwrap());
+    assert_eq!(dwi_cpu_v.len(), rows * 2 * intermediate);
+    assert_eq!(
+        dwi_gpu_v.len(),
+        rows * 2 * intermediate,
+        "geglu bf16 GPU dwi_out length mismatch"
+    );
+    for (i, (c, g)) in dwi_cpu_v.iter().zip(dwi_gpu_v.iter()).enumerate() {
+        assert!(
+            (c - g).abs() <= bf16_bound(*c, *g),
+            "geglu bf16 dwi_out[{i}]: cpu {c} vs cuda {g}"
+        );
+    }
+}
+
+#[test]
+fn geglu_parity_contiguous_small() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let rows = 4;
+    let intermediate = 8;
+    let wv = fixture(rows * 2 * intermediate, 1.0);
+    assert_geglu_parity_f32(&cuda, rows, intermediate, &wv);
+    assert_geglu_parity_bf16(&cuda, rows, intermediate, &wv);
+}
+
+#[test]
+fn geglu_parity_production_width_modernbert_large() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    // ModernBERT-large's real `intermediate_size` (HuggingFace's published
+    // `answerdotai/ModernBERT-large` `config.json`) — also comfortably
+    // multi-block for the 256-wide grid-stride kernel.
+    let rows = 2;
+    let intermediate = 2624;
+    let wv = fixture(rows * 2 * intermediate, 2.0);
+    assert_geglu_parity_f32(&cuda, rows, intermediate, &wv);
+    assert_geglu_parity_bf16(&cuda, rows, intermediate, &wv);
+}
+
+#[test]
+fn geglu_parity_non_power_of_two_intermediate() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    // 300 is not a power of two and not a multiple of GEGLU_BLOCK (256) --
+    // exercises the grid-stride tail.
+    let rows = 3;
+    let intermediate = 300;
+    let wv = fixture(rows * 2 * intermediate, 3.0);
+    assert_geglu_parity_f32(&cuda, rows, intermediate, &wv);
+    assert_geglu_parity_bf16(&cuda, rows, intermediate, &wv);
+}
+
+#[test]
+fn geglu_parity_multi_block_exact_multiple_of_block_size() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    // n_out = rows*intermediate = 2*512 = 1024 = exactly 4 * GEGLU_BLOCK
+    // (256).
+    let rows = 2;
+    let intermediate = 512;
+    let wv = fixture(rows * 2 * intermediate, 4.0);
+    assert_geglu_parity_f32(&cuda, rows, intermediate, &wv);
+}
+
+#[test]
+fn geglu_parity_narrowed_with_nonzero_offset() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    // A [3, rows, 2*intermediate] tensor narrowed to its middle "batch"
+    // slab: the resulting view is contiguous but has a nonzero
+    // `start_offset` -- the same class of bug this crate's other CUDA arms
+    // had (reading the base buffer's first elements instead of the
+    // tensor's real range).
+    let rows = 2;
+    let intermediate = 16;
+    let base = fixture(3 * rows * 2 * intermediate, 4.0);
+    let cpu = Device::Cpu;
+
+    let wi_cpu = Tensor::from_slice(&base, (3, rows, 2 * intermediate), &cpu)
+        .unwrap()
+        .narrow(0, 1, 1)
+        .unwrap()
+        .flatten(0, 1)
+        .unwrap();
+    assert!(wi_cpu.is_contiguous());
+    assert_ne!(wi_cpu.layout().start_offset(), 0);
+
+    let wi_gpu = Tensor::from_slice(&base, (3, rows, 2 * intermediate), cuda)
+        .unwrap()
+        .narrow(0, 1, 1)
+        .unwrap()
+        .flatten(0, 1)
+        .unwrap();
+
+    let out_cpu: Vec<f32> = geglu(&wi_cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let out_gpu: Vec<f32> = geglu(&wi_gpu)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(out_cpu.len(), rows * intermediate);
+    assert_eq!(
+        out_gpu.len(),
+        rows * intermediate,
+        "narrowed geglu GPU fwd length mismatch"
+    );
+    for (i, (c, g)) in out_cpu.iter().zip(out_gpu.iter()).enumerate() {
+        assert!(
+            ((*c - *g).abs() as f64) <= F32_TOL,
+            "narrowed geglu fwd[{i}]: cpu {c} vs cuda {g}"
+        );
+    }
+    // And matches the eager (narrow+narrow+gelu_erf+mul) composition on
+    // the middle slab's own data, not the base buffer's first
+    // `rows*2*intermediate` elements.
+    let expected_slab = Tensor::from_slice(
+        &base[rows * 2 * intermediate..2 * rows * 2 * intermediate],
+        (rows, 2 * intermediate),
+        &cpu,
+    )
+    .unwrap();
+    let gate = expected_slab.narrow(D::Minus1, 0, intermediate).unwrap();
+    let up = expected_slab
+        .narrow(D::Minus1, intermediate, intermediate)
+        .unwrap();
+    let expected = (gate.gelu_erf().unwrap() * up)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    for (i, (g, e)) in out_gpu.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            ((*g - *e).abs() as f64) <= F32_TOL,
+            "narrowed geglu fwd[{i}] vs eager: cuda {g} vs {e}"
+        );
+    }
+}
+
+#[test]
+fn geglu_parity_empty_last_dim() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let cpu = Device::Cpu;
+    let rows = 3;
+    let wi_cpu = Tensor::from_slice(&[] as &[f32], (rows, 0), &cpu).unwrap();
+    let wi_gpu = Tensor::from_slice(&[] as &[f32], (rows, 0), cuda).unwrap();
+
+    let out_cpu: Vec<f32> = geglu(&wi_cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    // Must not attempt an illegal zero-block launch.
+    let out_gpu: Vec<f32> = geglu(&wi_gpu)
         .unwrap()
         .to_device(&cpu)
         .unwrap()

@@ -34,7 +34,7 @@ use candle_core::{DType, Device, Module, Tensor, D};
 use candle_nn::{embedding, linear_no_bias, Embedding, VarBuilder, VarMap};
 use jammi_kernels::admission::{admit, DispatchCounters, DispatchOutcome};
 use jammi_kernels::ops::{
-    apply2, apply3, RopeFused, SoftmaxLastDimFused, MAX_HEAD_DIM, MAX_LAST_DIM, MAX_RANK,
+    apply1, apply2, apply3, RopeFused, SoftmaxLastDimFused, MAX_HEAD_DIM, MAX_LAST_DIM, MAX_RANK,
 };
 use jammi_lora::{effective_rank, should_apply_lora, LoraBuildConfig, LoraLinear, MaybeLoraLinear};
 
@@ -681,8 +681,74 @@ fn softmax_apply_training(scores: &Tensor, mask: &Tensor) -> Result<Tensor, Enco
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GeGLU FFN
+// Fused GeGLU (C5)
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Fused/eager dispatch counters for the ModernBERT MLP's GeGLU
+/// activation, mirroring `ROPE_DISPATCH_COUNTERS` /
+/// `SOFTMAX_DISPATCH_COUNTERS` / `crate::layer_norm::LN_DISPATCH_COUNTERS`
+/// — see `ModernBertMlp::forward`'s doc for the training-only gate this
+/// counts. `pub(crate)` (not `pub`) — read via
+/// [`crate::geglu_dispatch_snapshot`], the same shape the other three
+/// snapshot functions use.
+pub(crate) static GEGLU_DISPATCH_COUNTERS: DispatchCounters = DispatchCounters::new();
+
+/// The fused GeGLU kernel's domain, checked at the call site (family D /
+/// K2): `wi_out`'s device is one [`crate::layer_norm::device_is_supported`]
+/// accepts, its dtype is one the kernel implements (F32 or BF16),
+/// `wi_out` is contiguous ([`jammi_kernels::ops::GegluFused`] refuses a
+/// strided view — see its module doc), and its last dimension is nonzero
+/// and even (the op splits it into two equal `gate`/`up` halves; an odd
+/// width is a structural domain violation the op itself also refuses, but
+/// checking it here means it becomes a counted eager fallback instead of
+/// a `candle_core::Error` surfacing from inside the op).
+fn geglu_admission_predicate(wi_out: &Tensor) -> (bool, &'static str) {
+    if !crate::layer_norm::device_is_supported(wi_out.device()) {
+        return (false, "device_is_cpu_or_cuda");
+    }
+    if !matches!(wi_out.dtype(), DType::F32 | DType::BF16) {
+        return (false, "dtype_f32_or_bf16");
+    }
+    if !wi_out.is_contiguous() {
+        return (false, "wi_out_contiguous");
+    }
+    let last = *wi_out.dims().last().unwrap_or(&0);
+    if last == 0 || !last.is_multiple_of(2) {
+        return (false, "last_dim_nonzero_and_even");
+    }
+    (true, "domain_ok")
+}
+
+/// Only ever called from `ModernBertMlp::forward`'s `self.training` arm —
+/// dispatches to [`jammi_kernels::ops::GegluFused`] (erf variant — the
+/// ONLY variant ModernBERT's MLP call site uses, see that op's own
+/// `GeluVariant` doc) when its domain holds, else falls back to the
+/// eager `narrow`+`narrow`+`gelu_erf`+`mul` composition (recording which
+/// happened either way, mirroring `softmax_apply_training`'s / RoPE's
+/// identical admission mechanism). Eval never calls this function at all
+/// (see `forward`'s `match`), so it has no bearing on eval's bit-identity.
+fn geglu_apply_training(wi_out: &Tensor) -> Result<Tensor, EncoderError> {
+    let (holds, predicate) = geglu_admission_predicate(wi_out);
+    let outcome = admit(
+        crate::layer_norm::admission_mode(),
+        "geglu_fused",
+        predicate,
+        holds,
+        &GEGLU_DISPATCH_COUNTERS,
+    )?;
+    match outcome {
+        DispatchOutcome::Fused => Ok(apply1(
+            wi_out,
+            jammi_kernels::ops::GegluFused::new(jammi_kernels::ops::GeluVariant::Erf),
+        )?),
+        DispatchOutcome::Eager => {
+            let intermediate = wi_out.dim(D::Minus1)? / 2;
+            let gate = wi_out.narrow(D::Minus1, 0, intermediate)?;
+            let up = wi_out.narrow(D::Minus1, intermediate, intermediate)?;
+            Ok((gate.gelu_erf()? * up)?)
+        }
+    }
+}
 
 struct ModernBertMlp {
     /// Packed gate+up projection. LoRA target name: `"Wi"`.
@@ -692,19 +758,38 @@ struct ModernBertMlp {
     /// output projection when callers want both).
     wo: MaybeLoraLinear,
     mlp_norm: LayerNorm,
+    /// Whether the fused GeGLU kernel may be attempted (still gated by
+    /// its own domain check — see [`geglu_apply_training`]). `false`
+    /// (eval/serving) always runs the eager `narrow`+`narrow`+`gelu_erf`+
+    /// `mul` composition below, unconditionally — the SAME code this file
+    /// had before the fused kernel existed, so eval's output values are
+    /// bit-identical before/after this change (see
+    /// `tests::eval_mode_mlp_is_bit_identical_regardless_of_fused_eligibility`).
+    /// `true` (training) is the ONLY state that ever reaches
+    /// [`geglu_apply_training`]. Propagated by [`ModernBert::set_training`].
+    training: bool,
 }
 
 impl ModernBertMlp {
+    fn set_training(&mut self, training: bool) {
+        self.training = training;
+    }
+
     fn forward(&self, x: &Tensor) -> Result<Tensor, EncoderError> {
         let normed = self.mlp_norm.forward(x)?;
 
         let up_gate = self.wi.forward(&normed)?;
-        let intermediate = up_gate.dim(D::Minus1)? / 2;
 
-        let gate = up_gate.narrow(D::Minus1, 0, intermediate)?;
-        let up = up_gate.narrow(D::Minus1, intermediate, intermediate)?;
-
-        let act = (gate.gelu_erf()? * up)?;
+        let act = if self.training {
+            geglu_apply_training(&up_gate)?
+        } else {
+            // Eval's UNCHANGED code path, bit-identical to before this
+            // commit.
+            let intermediate = up_gate.dim(D::Minus1)? / 2;
+            let gate = up_gate.narrow(D::Minus1, 0, intermediate)?;
+            let up = up_gate.narrow(D::Minus1, intermediate, intermediate)?;
+            (gate.gelu_erf()? * up)?
+        };
         let out = self.wo.forward(&act)?;
 
         Ok((out + x)?)
@@ -903,6 +988,7 @@ impl ModernBert {
             layer.mlp.wi.set_training(training);
             layer.mlp.wo.set_training(training);
             layer.mlp.mlp_norm.set_training(training);
+            layer.mlp.set_training(training);
         }
         self.final_norm.set_training(training);
     }
@@ -1149,6 +1235,7 @@ impl<'a> ModernBertBuilder<'a> {
                     wi,
                     wo: mlp_wo,
                     mlp_norm,
+                    training: false,
                 },
             });
         }
@@ -1675,6 +1762,160 @@ mod tests {
             .unwrap();
         for (i, (f, e)) in dxf.iter().zip(dxe.iter()).enumerate() {
             assert!((f - e).abs() < 1e-3, "dscores[{i}]: fused {f} vs eager {e}");
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Fused GeGLU (C5)
+    // -------------------------------------------------------------------
+
+    fn eager_geglu(wi_out: &Tensor) -> Tensor {
+        let intermediate = wi_out.dim(D::Minus1).unwrap() / 2;
+        let gate = wi_out.narrow(D::Minus1, 0, intermediate).unwrap();
+        let up = wi_out
+            .narrow(D::Minus1, intermediate, intermediate)
+            .unwrap();
+        (gate.gelu_erf().unwrap() * up).unwrap()
+    }
+
+    #[test]
+    fn geglu_admission_predicate_accepts_a_typical_modernbert_shape() {
+        let device = Device::Cpu;
+        let wi_out = Tensor::from_slice(&[0.0f32; 2 * 8], (1, 2, 8), &device).unwrap();
+        let (holds, predicate) = geglu_admission_predicate(&wi_out);
+        assert!(
+            holds,
+            "typical [batch, seq, 2*intermediate] must be admitted: {predicate}"
+        );
+    }
+
+    /// Advisory fix mirroring `softmax_admission_predicate_rejects_
+    /// broadcast_class_violation`: an odd last dimension (cannot split
+    /// into equal gate/up halves) must be caught HERE — a counted eager
+    /// fallback — rather than only inside the op, where it would surface
+    /// as a raw `candle_core::Error` on the training arm.
+    #[test]
+    fn geglu_admission_predicate_rejects_odd_last_dim() {
+        let device = Device::Cpu;
+        let wi_out = Tensor::from_slice(&[0.0f32; 3], (1, 3), &device).unwrap();
+        let (holds, predicate) = geglu_admission_predicate(&wi_out);
+        assert!(!holds, "an odd last dim must be refused");
+        assert_eq!(predicate, "last_dim_nonzero_and_even");
+    }
+
+    /// The eval-path bit-identity requirement, mirroring
+    /// `eval_mode_attention_softmax_is_bit_identical_regardless_of_fused_
+    /// eligibility`: `ModernBertMlp::forward`'s `training == false` arm
+    /// always runs the eager `narrow`+`narrow`+`gelu_erf`+`mul`
+    /// composition (see that method's `match`), structurally never
+    /// reaching `geglu_apply_training` — this test proves that
+    /// composition's OWN output is unaffected by `geglu_apply_training`
+    /// existing and dispatching the fused kernel elsewhere, on a fixture
+    /// that WOULD be fused-eligible.
+    #[test]
+    fn eval_mode_mlp_geglu_is_bit_identical_regardless_of_fused_eligibility() {
+        let device = Device::Cpu;
+        let intermediate = 8;
+        let rows = 2;
+        let wv: Vec<f32> = (0..rows * 2 * intermediate)
+            .map(|i| (i as f32 * 0.23 - 1.0).sin() * 2.0)
+            .collect();
+        let wi_out = Tensor::from_slice(&wv, (rows, 2 * intermediate), &device).unwrap();
+
+        // Non-vacuity: this fixture WOULD be admitted into the fused
+        // kernel if training were true.
+        let (holds, predicate) = geglu_admission_predicate(&wi_out);
+        assert!(
+            holds,
+            "fixture must satisfy the fused GeGLU domain — the test proves eval \
+             skips it anyway, not that the fixture happens to be ineligible: {predicate}"
+        );
+
+        let before: Vec<f32> = eager_geglu(&wi_out)
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        // Exercise the REAL fused-or-fallback dispatch function (proven
+        // eligible above) without changing eval's own composed call above.
+        let training_before = GEGLU_DISPATCH_COUNTERS.snapshot();
+        let _ = geglu_apply_training(&wi_out).unwrap();
+        let training_after = GEGLU_DISPATCH_COUNTERS.snapshot();
+        assert!(
+            training_after.fused > training_before.fused,
+            "the eligibility check above must be load-bearing: this exercise call \
+             must actually dispatch the fused kernel, not silently fall back \
+             (before={training_before:?}, after={training_after:?})"
+        );
+
+        let after: Vec<f32> = eager_geglu(&wi_out)
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "eval-mode MLP GeGLU must be byte-identical before and after the \
+             fused kernel exists"
+        );
+    }
+
+    /// Fused-vs-eager MLP-level oracle: `geglu_apply_training`'s actual
+    /// dispatch path (fused kernel, since this fixture is fused-eligible
+    /// on CPU) vs. the eager `narrow`+`narrow`+`gelu_erf`+`mul`
+    /// composition, fwd AND bwd — mirroring
+    /// `fused_training_softmax_matches_eager_fwd_and_bwd` exactly.
+    #[test]
+    fn fused_training_geglu_matches_eager_fwd_and_bwd() {
+        let device = Device::Cpu;
+        let intermediate = 8;
+        let rows = 2;
+        let wv: Vec<f32> = (0..rows * 2 * intermediate)
+            .map(|i| (i as f32 * 0.19 - 2.0).cos() * 2.0)
+            .collect();
+
+        let wi_fused =
+            Var::from_tensor(&Tensor::from_slice(&wv, (rows, 2 * intermediate), &device).unwrap())
+                .unwrap();
+        let before = GEGLU_DISPATCH_COUNTERS.snapshot();
+        let out_fused = geglu_apply_training(&wi_fused).unwrap();
+        let after = GEGLU_DISPATCH_COUNTERS.snapshot();
+        assert!(
+            after.fused > before.fused,
+            "this fixture must actually dispatch the fused kernel, not fall back \
+             (before={before:?}, after={after:?})"
+        );
+
+        let wi_eager =
+            Var::from_tensor(&Tensor::from_slice(&wv, (rows, 2 * intermediate), &device).unwrap())
+                .unwrap();
+        let out_eager = eager_geglu(&wi_eager);
+
+        let vf: Vec<f32> = out_fused.flatten_all().unwrap().to_vec1().unwrap();
+        let ve: Vec<f32> = out_eager.flatten_all().unwrap().to_vec1().unwrap();
+        for (i, (f, e)) in vf.iter().zip(ve.iter()).enumerate() {
+            assert!((f - e).abs() < 1e-4, "fwd[{i}]: fused {f} vs eager {e}");
+        }
+
+        let grads_fused = out_fused.backward().unwrap();
+        let grads_eager = out_eager.backward().unwrap();
+        let dwf: Vec<f32> = grads_fused
+            .get(&wi_fused)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let dwe: Vec<f32> = grads_eager
+            .get(&wi_eager)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        for (i, (f, e)) in dwf.iter().zip(dwe.iter()).enumerate() {
+            assert!((f - e).abs() < 1e-3, "dwi_out[{i}]: fused {f} vs eager {e}");
         }
     }
 }

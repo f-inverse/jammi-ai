@@ -112,6 +112,20 @@ candle-transformers = "0.11"
 # bf16/f16 storage type — the same crate candle-core itself depends on
 # (jammi-kernels' CustomOp CPU arms read/write `CpuStorage::BF16` directly).
 half = "2.5"
+# f32/f64 erf — the same crate candle-core's own (non-public)
+# `crate::cpu::erf` wraps internally for its `Erf`/`GeluErf` unary ops.
+# jammi-kernels' fused GeGLU kernel needs the identical function for its
+# CPU forward/backward (candle-core does not re-export `erf_f32`/`erf_f64`
+# publicly), so this is a direct dependency, not a re-derived, possibly-
+# different-precision erf implementation. Hoisted here (rather than a
+# per-crate literal version) so every consumer resolves the SAME `libm`
+# version by construction — a `^`-range literal in one crate's own
+# Cargo.toml can still pick up a later patch release across a `cargo
+# update`, which would not break anything functionally but WOULD be able
+# to shift the fused-vs-eager oracle's own measured numbers (this crate's
+# tests quote specific measured tolerances/residuals) without any commit
+# in this repository visibly changing them.
+libm = "0.2"
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["download-binaries"] }
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 usearch = "2.25"

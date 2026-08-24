@@ -30,8 +30,10 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
+use candle_core::{DType, Device, Module, Tensor, D};
 use candle_nn::{embedding, linear_no_bias, Embedding, VarBuilder, VarMap};
+use jammi_kernels::admission::{admit, DispatchCounters, DispatchOutcome};
+use jammi_kernels::ops::{apply3, RopeFused, MAX_HEAD_DIM};
 use jammi_lora::{effective_rank, should_apply_lora, LoraBuildConfig, LoraLinear, MaybeLoraLinear};
 
 use crate::error::EncoderError;
@@ -118,14 +120,69 @@ impl ModernBertConfig {
 // RoPE
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Fused/eager dispatch counters for the ModernBERT RoPE application,
+/// mirroring `crate::layer_norm::LN_DISPATCH_COUNTERS` — see this
+/// module's "RoPE: table hoisting + fused rotate-half" doc section for
+/// the training-only gate this counts. `pub(crate)` (not `pub`) — read via
+/// [`crate::rope_dispatch_snapshot`], the same shape
+/// [`crate::ln_dispatch_snapshot`] uses.
+pub(crate) static ROPE_DISPATCH_COUNTERS: DispatchCounters = DispatchCounters::new();
+
+/// Cached, dtype-cast AND pre-broadcast-shaped (`[1, 1, max_seq_len,
+/// head_dim]`) RoPE tables — see [`RotaryEmbedding::cached_tables`].
+struct CastCache {
+    dtype: DType,
+    cos: Tensor,
+    sin: Tensor,
+}
+
 /// Precomputed RoPE cos/sin tables of shape `[max_seq_len, head_dim]`.
 ///
 /// We duplicate the `half_dim` frequencies so the tables are usable with the
 /// `rotate_half(x) = cat(-x[..,half:], x[..,:half])` formulation, which is
 /// the variant the upstream ModernBERT implementation uses.
+///
+/// ## Table hoisting: VALUES bit-neutral in eval and training-eager
+/// alike — disclosed honestly, not "eval untouched"
+///
+/// The model has exactly TWO `RotaryEmbedding`s (global/local theta)
+/// however many layers it has, but before this change every SINGLE Q/K
+/// application re-cast the `f32` source table to the backbone dtype and
+/// re-`unsqueeze`d it to broadcast shape — the same two ops, recomputed
+/// identically on every one of `2 * num_layers` calls per forward.
+/// [`Self::cached_tables`] computes that cast+unsqueeze ONCE per dtype
+/// (memoised in `cast_cache`, a `Mutex` for the same reason
+/// `ModernBert::band_cache` is one — the model is held across threads)
+/// and every call — [`Self::apply`] (used in eval and as the training
+/// fallback) AND [`Self::apply_training`] (the fused path) alike —
+/// reuses it. The OUTPUT VALUES are BIT-NEUTRAL: the cached tensor holds
+/// the exact same bytes a fresh `to_dtype`/`unsqueeze` pair would have
+/// produced from the same source table (no rounding is introduced by
+/// caching, only redundant recomputation is removed) — asserted by
+/// `tests::table_hoisting_is_bit_neutral_with_the_uncached_computation`.
+/// This is NOT the same claim as "eval's call sequence is unchanged":
+/// `apply` now acquires `cast_cache`'s lock once per call (`2 *
+/// num_layers` times per forward, uncontended in the single-model-per-
+/// thread shape every caller in this repository uses today — a `Mutex`
+/// lock/unlock pair on an uncontended lock is on the order of tens of
+/// nanoseconds, negligible next to a single matmul, but a real,
+/// previously-absent synchronization point this doc does not hide).
+///
+/// ## The fused rotate-half kernel: training-only
+///
+/// [`Self::apply_training`] is the ONLY call site that may dispatch to
+/// [`jammi_kernels::ops::RopeFused`]; [`Self::apply`] never does, so
+/// eval's OUTPUT VALUES (which always come from `apply`, see
+/// `ModernBertAttention::forward`) are bit-identical before and after
+/// this commit — table hoisting's lock is the only thing eval's call
+/// shape gains. `apply_training` itself still falls back to `apply`
+/// whenever the fused kernel's domain check fails (K2 admission) — the
+/// training path is therefore "fused when possible, otherwise identical
+/// to eval's own path", never a third distinct numeric path.
 struct RotaryEmbedding {
     cos: Tensor,
     sin: Tensor,
+    cast_cache: Mutex<Option<CastCache>>,
 }
 
 impl RotaryEmbedding {
@@ -152,27 +209,60 @@ impl RotaryEmbedding {
         let cos = Tensor::from_vec(cos_vec, (max_seq_len, head_dim), device)?;
         let sin = Tensor::from_vec(sin_vec, (max_seq_len, head_dim), device)?;
 
-        Ok(Self { cos, sin })
+        Ok(Self {
+            cos,
+            sin,
+            cast_cache: Mutex::new(None),
+        })
     }
 
-    /// Apply RoPE to a `[batch, num_heads, seq, head_dim]` tensor.
+    /// Returns the `[1, 1, max_seq_len, head_dim]` cos/sin tables cast to
+    /// `dtype`, computing and memoising them on the first call for that
+    /// dtype (see the struct doc's "table hoisting" section). A model
+    /// instance uses exactly one backbone dtype for its lifetime, so this
+    /// is a single-entry cache in practice; a later call with a DIFFERENT
+    /// dtype still computes the right answer (it just recomputes and
+    /// overwrites the single cached entry rather than growing a map — a
+    /// case that never arises for one model instance).
+    fn cached_tables(&self, dtype: DType) -> Result<(Tensor, Tensor), EncoderError> {
+        {
+            let cache = self
+                .cast_cache
+                .lock()
+                .map_err(|_| EncoderError::Config("RoPE table cache poisoned".into()))?;
+            if let Some(c) = cache.as_ref() {
+                if c.dtype == dtype {
+                    return Ok((c.cos.clone(), c.sin.clone()));
+                }
+            }
+        }
+        let cos = self.cos.to_dtype(dtype)?.unsqueeze(0)?.unsqueeze(0)?;
+        let sin = self.sin.to_dtype(dtype)?.unsqueeze(0)?.unsqueeze(0)?;
+        let mut cache = self
+            .cast_cache
+            .lock()
+            .map_err(|_| EncoderError::Config("RoPE table cache poisoned".into()))?;
+        *cache = Some(CastCache {
+            dtype,
+            cos: cos.clone(),
+            sin: sin.clone(),
+        });
+        Ok((cos, sin))
+    }
+
+    /// Apply RoPE to a `[batch, num_heads, seq, head_dim]` tensor — the
+    /// eager composition, whose OUTPUT VALUES are unchanged from before
+    /// table hoisting existed (see the struct doc's disclosure: this call
+    /// now also takes `cast_cache`'s lock once, which is new). Used
+    /// directly in eval and as [`Self::apply_training`]'s fallback.
     fn apply(&self, x: &Tensor) -> Result<Tensor, EncoderError> {
         let (_batch, _heads, seq, head_dim) = x.dims4()?;
         let half = head_dim / 2;
         let x_dtype = x.dtype();
 
-        let cos = self
-            .cos
-            .i(..seq)?
-            .to_dtype(x_dtype)?
-            .unsqueeze(0)?
-            .unsqueeze(0)?;
-        let sin = self
-            .sin
-            .i(..seq)?
-            .to_dtype(x_dtype)?
-            .unsqueeze(0)?
-            .unsqueeze(0)?;
+        let (cos_full, sin_full) = self.cached_tables(x_dtype)?;
+        let cos = cos_full.narrow(2, 0, seq)?;
+        let sin = sin_full.narrow(2, 0, seq)?;
 
         let x1 = x.narrow(D::Minus1, 0, half)?;
         let x2 = x.narrow(D::Minus1, half, half)?;
@@ -183,6 +273,103 @@ impl RotaryEmbedding {
         let sin_part = rot_half.broadcast_mul(&sin)?;
         Ok((cos_part + sin_part)?)
     }
+
+    /// The training-mode arm: dispatches to
+    /// [`jammi_kernels::ops::RopeFused`] when its domain holds, else
+    /// falls back to [`Self::apply`] (recording which happened either
+    /// way, mirroring `crate::layer_norm`'s LN admission mechanism). Only
+    /// ever called when the caller's `training` flag is `true` — see
+    /// `ModernBertAttention::forward`.
+    fn apply_training(&self, x: &Tensor) -> Result<Tensor, EncoderError> {
+        let (_batch, _heads, seq, head_dim) = x.dims4()?;
+        let x_dtype = x.dtype();
+        let (cos_full, sin_full) = self.cached_tables(x_dtype)?;
+        let cos = cos_full.narrow(2, 0, seq)?;
+        let sin = sin_full.narrow(2, 0, seq)?;
+
+        let (holds, predicate) =
+            rope_admission_predicate(x_dtype, x.device(), &cos, &sin, head_dim);
+        let outcome = admit(
+            crate::layer_norm::admission_mode(),
+            "rope_fused",
+            predicate,
+            holds,
+            &ROPE_DISPATCH_COUNTERS,
+        )?;
+        match outcome {
+            DispatchOutcome::Fused => {
+                // Paid ONLY on the admitted-fused branch: `x` is a
+                // `transpose(1, 2)` view (see `ModernBertAttention::forward`)
+                // and therefore not contiguous, which the fused kernel's
+                // domain requires (see `RopeFused`'s module doc).
+                //
+                // Honest accounting (do not overclaim this is free): in the
+                // EAGER path, `x` is never separately materialised before
+                // RoPE — `Tensor::cat` (building `rotate_half(x)`) already
+                // produces a contiguous OUTPUT as an intrinsic side effect
+                // of computing the rotation itself, not via a distinct copy
+                // step, so `crate::contiguous_matmul`'s own `.contiguous()`
+                // call right after was ALREADY a no-op before this commit
+                // (its argument was already contiguous). The fused path's
+                // `x.contiguous()` here is therefore a GENUINE additional
+                // memory copy the eager path never isolated as a separate
+                // cost — one bandwidth-bound elementwise pass, materially
+                // cheaper than the ~12-op chain (2 narrows, a `neg`, the
+                // `cat`, 2 broadcast-muls, an add, plus the per-call
+                // `to_dtype`/`unsqueeze` table hoisting already removes) it
+                // replaces, but a real cost, not a wash. Downstream
+                // `contiguous_matmul` sees an already-contiguous fused
+                // output either way (every `CustomOp` allocates a fresh
+                // contiguous buffer), so it stays a no-op there in both
+                // paths.
+                let x_c = x.contiguous()?;
+                Ok(apply3(&x_c, &cos, &sin, RopeFused::new(false))?)
+            }
+            DispatchOutcome::Eager => self.apply(x),
+        }
+    }
+}
+
+/// The fused RoPE kernel's domain, checked at the call site (family D /
+/// K2): `x`'s device is one [`crate::layer_norm::device_is_supported`]
+/// accepts (CPU, or CUDA when this build compiled `jammi-kernels`' `cuda`
+/// arm), `x`/`cos`/`sin` share a dtype the kernel implements (F32 or
+/// BF16), `cos`/`sin` are contiguous (guaranteed by construction —
+/// [`RotaryEmbedding::cached_tables`] always produces a genuinely
+/// contiguous tensor and `narrow` on its leading dim preserves that — this
+/// check is a defensive re-verification, not a load-bearing "maybe fails"
+/// branch: family D's "validate at every numeric edge", not an assumption
+/// left silently trusted), `head_dim` is nonzero and even (rotate-half's
+/// domain), and within [`MAX_HEAD_DIM`] (a conservative validated ceiling,
+/// not a hardware limit — see that constant's own doc). Returns the
+/// aggregate predicate and the name of whichever check is the reason (or
+/// a fixed "domain_ok" name when everything holds).
+fn rope_admission_predicate(
+    x_dtype: DType,
+    x_device: &Device,
+    cos: &Tensor,
+    sin: &Tensor,
+    head_dim: usize,
+) -> (bool, &'static str) {
+    if !crate::layer_norm::device_is_supported(x_device) {
+        return (false, "device_is_cpu_or_cuda");
+    }
+    if x_dtype != cos.dtype()
+        || x_dtype != sin.dtype()
+        || !matches!(x_dtype, DType::F32 | DType::BF16)
+    {
+        return (false, "dtype_f32_or_bf16_matching_between_x_cos_sin");
+    }
+    if !cos.is_contiguous() || !sin.is_contiguous() {
+        return (false, "cos_sin_contiguous");
+    }
+    if head_dim == 0 || !head_dim.is_multiple_of(2) {
+        return (false, "head_dim_even_and_nonzero");
+    }
+    if head_dim > MAX_HEAD_DIM {
+        return (false, "head_dim_within_kernel_max_head_dim");
+    }
+    (true, "domain_ok")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -204,9 +391,23 @@ struct ModernBertAttention {
     is_local: bool,
     num_heads: usize,
     head_dim: usize,
+    /// Whether the fused RoPE kernel may be attempted on Q/K (still gated
+    /// by its own domain check — see [`RotaryEmbedding::apply_training`]).
+    /// `false` (eval/serving) always calls [`RotaryEmbedding::apply`]
+    /// directly, with output VALUES bit-identical to before this field
+    /// existed (see `RotaryEmbedding`'s struct doc for the one disclosed,
+    /// non-numeric change — a table-cache lock — `apply` itself gained);
+    /// `true` (training) is the ONLY state that ever reaches
+    /// `apply_training`. Propagated by [`ModernBert::set_training`], the
+    /// same mechanism `LayerNorm::set_training` uses.
+    training: bool,
 }
 
 impl ModernBertAttention {
+    fn set_training(&mut self, training: bool) {
+        self.training = training;
+    }
+
     /// `local_band` is the `[1, 1, seq, seq]` sliding-window mask, supplied
     /// whenever the model has any local layer. A global layer ignores it.
     fn forward(
@@ -238,8 +439,8 @@ impl ModernBertAttention {
             .reshape((batch, seq, h, d))?
             .transpose(1, 2)?;
 
-        let q = self.rope.apply(&q)?;
-        let k = self.rope.apply(&k)?;
+        let q = self.rope_apply(&q)?;
+        let k = self.rope_apply(&k)?;
 
         let scale = (d as f64).sqrt();
         let scores = crate::contiguous_matmul(&q, &k.transpose(D::Minus1, D::Minus2)?)?;
@@ -273,6 +474,22 @@ impl ModernBertAttention {
 
         let out = self.wo.forward(&ctx)?;
         Ok((out + hidden)?)
+    }
+
+    /// Dispatches to [`RotaryEmbedding::apply_training`] (fused-when-
+    /// possible) in training mode, else [`RotaryEmbedding::apply`]
+    /// directly — eval never even calls the training-mode method, so
+    /// its OUTPUT VALUES are bit-identical to before the fused kernel
+    /// existed regardless of that method's own admission logic (`apply`
+    /// itself gained a table-cache lock from table hoisting — see
+    /// `RotaryEmbedding`'s struct doc — which is a real, disclosed
+    /// change to what eval does, not a numeric one).
+    fn rope_apply(&self, x: &Tensor) -> Result<Tensor, EncoderError> {
+        if self.training {
+            self.rope.apply_training(x)
+        } else {
+            self.rope.apply(x)
+        }
     }
 }
 
@@ -470,20 +687,29 @@ impl ModernBert {
         Ok(out)
     }
 
-    /// Toggle training mode on every LoRA-augmented linear and every LayerNorm.
-    /// ModernBERT's LayerNorms use the bias-free variant: in EVAL mode
-    /// (`training = false`) the forward stays on the slow primitive-op
-    /// path exactly as before, unconditionally; in TRAINING mode
-    /// (`training = true`) it dispatches to the fused CUDA/CPU LayerNorm
-    /// kernel when that kernel's own domain holds (dtype, contiguity,
-    /// device, hidden size), falling back to the slow path otherwise —
-    /// see `crate::layer_norm`'s module doc. Propagating the flag keeps
-    /// the surface consistent with [`crate::Bert`] and [`crate::DistilBert`].
+    /// Toggle training mode on every LoRA-augmented linear, every
+    /// LayerNorm, AND every attention layer's RoPE application. ModernBERT's
+    /// LayerNorms use the bias-free variant: in EVAL mode (`training =
+    /// false`) the forward stays on the slow primitive-op path exactly as
+    /// before, unconditionally; in TRAINING mode (`training = true`) it
+    /// dispatches to the fused CUDA/CPU LayerNorm kernel when that
+    /// kernel's own domain holds (dtype, contiguity, device, hidden
+    /// size), falling back to the slow path otherwise — see
+    /// `crate::layer_norm`'s module doc. RoPE follows the SAME doctrine:
+    /// eval always calls `RotaryEmbedding::apply` directly (OUTPUT VALUES
+    /// bit-identical before/after the fused kernel; `apply` itself now
+    /// also takes a table-cache lock from table hoisting, an uncontended,
+    /// non-numeric change disclosed on `RotaryEmbedding`'s own doc),
+    /// training calls `RotaryEmbedding::apply_training` (fused kernel
+    /// when its own domain holds, else the identical eager `apply`) — see
+    /// `ModernBertAttention::rope_apply`. Propagating the flag keeps the
+    /// surface consistent with [`crate::Bert`] and [`crate::DistilBert`].
     pub fn set_training(&mut self, training: bool) {
         self.emb_norm.set_training(training);
         for layer in &mut self.layers {
             layer.attention.wqkv.set_training(training);
             layer.attention.wo.set_training(training);
+            layer.attention.set_training(training);
             if let Some(attn_norm) = layer.attention.attn_norm.as_mut() {
                 attn_norm.set_training(training);
             }
@@ -730,6 +956,7 @@ impl<'a> ModernBertBuilder<'a> {
                     is_local,
                     num_heads: config.num_attention_heads,
                     head_dim,
+                    training: false,
                 },
                 mlp: ModernBertMlp {
                     wi,
@@ -805,6 +1032,243 @@ impl<'a, 'b> LoraSite<'a, 'b> {
             Ok(MaybeLoraLinear::Lora(lora_linear))
         } else {
             Ok(MaybeLoraLinear::Frozen(frozen))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::Var;
+    use half::bf16;
+
+    fn rope(head_dim: usize, max_seq: usize, theta: f64, device: &Device) -> RotaryEmbedding {
+        RotaryEmbedding::new(head_dim, max_seq, theta, device).unwrap()
+    }
+
+    /// Table hoisting (this module's doc) must be BIT-NEUTRAL: the cached,
+    /// pre-cast/pre-unsqueezed table produces the exact same output
+    /// `apply` would have produced computing `to_dtype`/`unsqueeze` fresh
+    /// every call. Compares the CACHED path's output (first call, which
+    /// populates the cache) against a SECOND call (which reads the
+    /// cache) — both must be byte-identical to each other AND to a
+    /// from-scratch recomputation done by hand outside the cache.
+    #[test]
+    fn table_hoisting_is_bit_neutral_with_the_uncached_computation() {
+        let device = Device::Cpu;
+        let head_dim = 8;
+        let max_seq = 16;
+        let r = rope(head_dim, max_seq, 10_000.0, &device);
+        let xv: Vec<bf16> = (0..2 * 4 * head_dim)
+            .map(|i| bf16::from_f32(i as f32 * 0.13 - 3.0))
+            .collect();
+        let x = Tensor::from_slice(&xv, (2, 1, 4, head_dim), &device).unwrap();
+
+        // First call: populates the cache.
+        let out_first: Vec<bf16> = r
+            .apply(&x)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        // Second call: reads the cache.
+        let out_second: Vec<bf16> = r
+            .apply(&x)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(
+            out_first, out_second,
+            "cached and re-cached calls must be byte-identical"
+        );
+
+        // Hand-computed "no cache at all" reference: cast/unsqueeze fresh,
+        // then the exact same rotate-half composition `apply` runs.
+        let seq = 4usize;
+        let half = head_dim / 2;
+        let cos = r
+            .cos
+            .narrow(0, 0, seq)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap();
+        let sin = r
+            .sin
+            .narrow(0, 0, seq)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap();
+        let x1 = x.narrow(D::Minus1, 0, half).unwrap();
+        let x2 = x.narrow(D::Minus1, half, half).unwrap();
+        let neg_x2 = (x2 * -1.0f64).unwrap();
+        let rot_half = Tensor::cat(&[&neg_x2, &x1], D::Minus1).unwrap();
+        let uncached: Vec<bf16> = (x.broadcast_mul(&cos).unwrap()
+            + rot_half.broadcast_mul(&sin).unwrap())
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+        assert_eq!(
+            out_first, uncached,
+            "the cached path must match a from-scratch to_dtype/unsqueeze computation"
+        );
+    }
+
+    /// The positive half of the RoPE device clause: CPU must satisfy it.
+    #[test]
+    fn rope_admission_predicate_accepts_cpu_device() {
+        let device = Device::Cpu;
+        let cos = Tensor::from_slice(&[1.0f32; 8], (1, 1, 1, 8), &device).unwrap();
+        let sin = Tensor::from_slice(&[0.0f32; 8], (1, 1, 1, 8), &device).unwrap();
+        let (holds, predicate) = rope_admission_predicate(DType::F32, &device, &cos, &sin, 8);
+        assert!(holds, "CPU must satisfy the device clause: {predicate}");
+    }
+
+    /// The negative half: an odd `head_dim` is refused, not silently
+    /// truncated.
+    #[test]
+    fn rope_admission_predicate_rejects_odd_head_dim() {
+        let device = Device::Cpu;
+        let cos = Tensor::from_slice(&[1.0f32; 7], (1, 1, 1, 7), &device).unwrap();
+        let sin = Tensor::from_slice(&[0.0f32; 7], (1, 1, 1, 7), &device).unwrap();
+        let (holds, predicate) = rope_admission_predicate(DType::F32, &device, &cos, &sin, 7);
+        assert!(!holds, "odd head_dim must be refused");
+        assert_eq!(predicate, "head_dim_even_and_nonzero");
+    }
+
+    /// The eval-path bit-identity requirement, mirroring
+    /// `crate::layer_norm`'s identical test: a `training == false` RoPE
+    /// application must be UNCHANGED by `apply_training`'s existence, on
+    /// a fixture that WOULD be fused-eligible if training were true —
+    /// proving eval structurally never reaches `apply_training`, not
+    /// merely that this fixture happens to fail admission.
+    #[test]
+    fn eval_mode_rope_is_bit_identical_regardless_of_fused_eligibility() {
+        let device = Device::Cpu;
+        let head_dim = 8;
+        let seq = 4;
+        let r = rope(head_dim, 16, 10_000.0, &device);
+        let xv: Vec<f32> = (0..2 * seq * head_dim)
+            .map(|i| (i as f32 * 0.29 - 1.1).sin())
+            .collect();
+        let x = Tensor::from_slice(&xv, (1, 2, seq, head_dim), &device).unwrap();
+
+        // Non-vacuity (mirrors `crate::layer_norm`'s identical assertion):
+        // prove this fixture WOULD be admitted into the fused kernel if
+        // `training` were `true`, so the test below proves eval
+        // structurally never reaches `apply_training` — not merely that
+        // this particular fixture happens to fail admission regardless.
+        let (cos_full, sin_full) = r.cached_tables(x.dtype()).unwrap();
+        let cos = cos_full.narrow(2, 0, seq).unwrap();
+        let sin = sin_full.narrow(2, 0, seq).unwrap();
+        let (holds, predicate) =
+            rope_admission_predicate(x.dtype(), x.device(), &cos, &sin, head_dim);
+        assert!(
+            holds,
+            "fixture must satisfy the fused RoPE domain — the test proves eval \
+             skips it anyway, not that the fixture happens to be ineligible: {predicate}"
+        );
+
+        let before: Vec<f32> = r
+            .apply(&x)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        // Exercise the fused arm (available in this binary, and PROVEN
+        // eligible above) without changing the eval call itself.
+        let training_before = ROPE_DISPATCH_COUNTERS.snapshot();
+        let _ = r.apply_training(&x).unwrap();
+        let training_after = ROPE_DISPATCH_COUNTERS.snapshot();
+        assert!(
+            training_after.fused > training_before.fused,
+            "the eligibility check above must be load-bearing: this exercise call \
+             must actually dispatch the fused kernel, not silently fall back \
+             (before={training_before:?}, after={training_after:?})"
+        );
+
+        let after: Vec<f32> = r
+            .apply(&x)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "eval-mode RoPE forward must be byte-identical before and after \
+             the fused kernel exists"
+        );
+    }
+
+    /// Encoder-level oracle: `apply_training`'s actual dispatch path (fused
+    /// kernel, since this fixture is fused-eligible on CPU) vs. `apply`
+    /// (the eager composition), fwd AND bwd.
+    #[test]
+    fn fused_training_rope_matches_eager_fwd_and_bwd() {
+        let device = Device::Cpu;
+        let head_dim = 8;
+        let seq = 4;
+        let r = rope(head_dim, 16, 10_000.0, &device);
+        let xv: Vec<f32> = (0..2 * seq * head_dim)
+            .map(|i| (i as f32 * 0.17 - 2.0).cos() * 2.0)
+            .collect();
+
+        let x_fused =
+            Var::from_tensor(&Tensor::from_slice(&xv, (1, 2, seq, head_dim), &device).unwrap())
+                .unwrap();
+        let before = ROPE_DISPATCH_COUNTERS.snapshot();
+        let out_fused = r.apply_training(x_fused.as_tensor()).unwrap();
+        let after = ROPE_DISPATCH_COUNTERS.snapshot();
+        assert!(
+            after.fused > before.fused,
+            "this fixture must actually dispatch the fused kernel, not fall back \
+             (before={before:?}, after={after:?})"
+        );
+
+        let x_eager =
+            Var::from_tensor(&Tensor::from_slice(&xv, (1, 2, seq, head_dim), &device).unwrap())
+                .unwrap();
+        let out_eager = r.apply(x_eager.as_tensor()).unwrap();
+
+        let vf: Vec<f32> = out_fused.flatten_all().unwrap().to_vec1().unwrap();
+        let ve: Vec<f32> = out_eager.flatten_all().unwrap().to_vec1().unwrap();
+        for (i, (f, e)) in vf.iter().zip(ve.iter()).enumerate() {
+            assert!((f - e).abs() < 1e-4, "fwd[{i}]: fused {f} vs eager {e}");
+        }
+
+        let grads_fused = out_fused.backward().unwrap();
+        let grads_eager = out_eager.backward().unwrap();
+        let dxf: Vec<f32> = grads_fused
+            .get(&x_fused)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let dxe: Vec<f32> = grads_eager
+            .get(&x_eager)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        for (i, (f, e)) in dxf.iter().zip(dxe.iter()).enumerate() {
+            assert!((f - e).abs() < 1e-3, "dx[{i}]: fused {f} vs eager {e}");
         }
     }
 }

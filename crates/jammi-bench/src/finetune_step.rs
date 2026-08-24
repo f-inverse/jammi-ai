@@ -238,6 +238,8 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     // around the step loop, so this run's dispatch count is isolated
     // from anything an earlier tier in the same process invocation did.
     let ln_dispatch_before = jammi_encoders::ln_dispatch_snapshot();
+    // Same mechanism, for the C3 fused RoPE kernel.
+    let rope_dispatch_before = jammi_encoders::rope_dispatch_snapshot();
 
     let mut times = Vec::with_capacity(params.steps);
     for step in 0..(params.warmup + params.steps) {
@@ -277,6 +279,7 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     }
 
     let ln_dispatch_after = jammi_encoders::ln_dispatch_snapshot();
+    let rope_dispatch_after = jammi_encoders::rope_dispatch_snapshot();
 
     times.sort_by(f64::total_cmp);
     let p50 = times[times.len() / 2];
@@ -300,6 +303,12 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
         ln_eager_dispatches: ln_dispatch_after
             .eager
             .saturating_sub(ln_dispatch_before.eager),
+        rope_fused_dispatches: rope_dispatch_after
+            .fused
+            .saturating_sub(rope_dispatch_before.fused),
+        rope_eager_dispatches: rope_dispatch_after
+            .eager
+            .saturating_sub(rope_dispatch_before.eager),
         s_per_step_p50: Measurement::measured(p50, "s"),
         s_per_step_mean: Measurement::measured(mean, "s"),
         steps_per_s: Measurement::measured(1.0 / p50, "steps/s"),

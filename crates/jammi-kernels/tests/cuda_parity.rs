@@ -30,7 +30,7 @@
 
 use candle_core::{DType, Device, Tensor, Var};
 use half::bf16;
-use jammi_kernels::ops::{apply2, Axpy, LayerNormFused};
+use jammi_kernels::ops::{apply2, apply3, Axpy, LayerNormFused, RopeFused};
 
 fn axpy(alpha: f64, x: &Tensor, y: &Tensor) -> candle_core::Result<Tensor> {
     apply2(x, y, Axpy::new(alpha))
@@ -639,6 +639,299 @@ fn ln_parity_empty_batch() {
         .unwrap();
     // Must not attempt an illegal zero-block launch.
     let out_gpu: Vec<f32> = ln_forward(1e-5, false, &x_gpu, &g_gpu)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert!(out_cpu.is_empty());
+    assert!(out_gpu.is_empty());
+}
+
+// =======================================================================
+// RopeFused CPU<->CUDA parity: fwd + bwd (dx). Covers the same
+// divergence-prone classes as Axpy's/LayerNormFused's suites above
+// (contiguous, narrowed-with-nonzero-offset, empty, a block-size
+// boundary) PLUS the RoPE-specific dimension this op varies over:
+// head_dim 64 (ModernBERT-large's) and a non-power-of-two EVEN head_dim
+// (exercises the grid-stride tail and the `col < half` branch's bounds).
+// =======================================================================
+
+fn rope(negate_sin: bool, x: &Tensor, cos: &Tensor, sin: &Tensor) -> candle_core::Result<Tensor> {
+    apply3(x, cos, sin, RopeFused::new(negate_sin))
+}
+
+/// A deterministic `[period, hidden]` RoPE table with the SAME
+/// column-duplication `RotaryEmbedding::new` bakes in (`jammi-encoders`) —
+/// this op's domain premise.
+fn rope_table(period: usize, hidden: usize, theta_base: f64) -> Vec<f32> {
+    let half = hidden / 2;
+    let mut out = vec![0f32; period * hidden];
+    for pos in 0..period {
+        for half_pass in 0..2 {
+            for i in 0..half {
+                let theta = (pos as f64) * theta_base.powf(-2.0 * i as f64 / hidden as f64);
+                out[pos * hidden + half_pass * half + i] = theta.cos() as f32;
+            }
+        }
+    }
+    out
+}
+
+fn rope_sin_table(period: usize, hidden: usize, theta_base: f64) -> Vec<f32> {
+    let half = hidden / 2;
+    let mut out = vec![0f32; period * hidden];
+    for pos in 0..period {
+        for half_pass in 0..2 {
+            for i in 0..half {
+                let theta = (pos as f64) * theta_base.powf(-2.0 * i as f64 / hidden as f64);
+                out[pos * hidden + half_pass * half + i] = theta.sin() as f32;
+            }
+        }
+    }
+    out
+}
+
+fn assert_rope_parity_f32(cuda: &Device, batch: usize, seq: usize, hidden: usize, xv: &[f32]) {
+    let cpu = Device::Cpu;
+    let n = xv.len();
+    let cos_v = rope_table(seq, hidden, 10_000.0);
+    let sin_v = rope_sin_table(seq, hidden, 10_000.0);
+
+    let x_cpu =
+        Var::from_tensor(&Tensor::from_slice(xv, (batch, 1, seq, hidden), &cpu).unwrap()).unwrap();
+    let cos_cpu = Tensor::from_slice(&cos_v, (1, 1, seq, hidden), &cpu).unwrap();
+    let sin_cpu = Tensor::from_slice(&sin_v, (1, 1, seq, hidden), &cpu).unwrap();
+    let out_cpu = rope(false, &x_cpu, &cos_cpu, &sin_cpu).unwrap();
+    let grads_cpu = out_cpu.backward().unwrap();
+
+    let x_gpu =
+        Var::from_tensor(&Tensor::from_slice(xv, (batch, 1, seq, hidden), cuda).unwrap()).unwrap();
+    let cos_gpu = Tensor::from_slice(&cos_v, (1, 1, seq, hidden), cuda).unwrap();
+    let sin_gpu = Tensor::from_slice(&sin_v, (1, 1, seq, hidden), cuda).unwrap();
+    let out_gpu = rope(false, &x_gpu, &cos_gpu, &sin_gpu).unwrap();
+    let grads_gpu = out_gpu.backward().unwrap();
+
+    let out_cpu_v: Vec<f32> = out_cpu.flatten_all().unwrap().to_vec1().unwrap();
+    let out_gpu_v: Vec<f32> = out_gpu
+        .to_device(&cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(out_cpu_v.len(), n);
+    assert_eq!(out_gpu_v.len(), n, "rope GPU fwd length mismatch");
+    for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
+        assert!(
+            ((*c - *g).abs() as f64) <= F32_TOL,
+            "rope fwd[{i}]: cpu {c} vs cuda {g} (batch={batch}, seq={seq}, hidden={hidden})"
+        );
+    }
+
+    let dx_cpu: Vec<f32> = grads_cpu
+        .get(&x_cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let dx_gpu: Vec<f32> = grads_gpu
+        .get(&x_gpu)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(dx_cpu.len(), n);
+    assert_eq!(dx_gpu.len(), n, "rope GPU dx length mismatch");
+    for (i, (c, g)) in dx_cpu.iter().zip(dx_gpu.iter()).enumerate() {
+        assert!(
+            ((*c - *g).abs() as f64) <= F32_TOL,
+            "rope dx[{i}]: cpu {c} vs cuda {g}"
+        );
+    }
+}
+
+fn assert_rope_parity_bf16(cuda: &Device, batch: usize, seq: usize, hidden: usize, xv: &[f32]) {
+    let cpu = Device::Cpu;
+    let n = xv.len();
+    let cos_v = rope_table(seq, hidden, 10_000.0);
+    let sin_v = rope_sin_table(seq, hidden, 10_000.0);
+    let xb: Vec<bf16> = xv.iter().map(|&v| bf16::from_f32(v)).collect();
+    let cb: Vec<bf16> = cos_v.iter().map(|&v| bf16::from_f32(v)).collect();
+    let sb: Vec<bf16> = sin_v.iter().map(|&v| bf16::from_f32(v)).collect();
+
+    let x_cpu =
+        Var::from_tensor(&Tensor::from_slice(&xb, (batch, 1, seq, hidden), &cpu).unwrap()).unwrap();
+    let cos_cpu = Tensor::from_slice(&cb, (1, 1, seq, hidden), &cpu).unwrap();
+    let sin_cpu = Tensor::from_slice(&sb, (1, 1, seq, hidden), &cpu).unwrap();
+    let out_cpu = rope(false, &x_cpu, &cos_cpu, &sin_cpu).unwrap();
+    let grads_cpu = out_cpu.backward().unwrap();
+
+    let x_gpu =
+        Var::from_tensor(&Tensor::from_slice(&xb, (batch, 1, seq, hidden), cuda).unwrap()).unwrap();
+    let cos_gpu = Tensor::from_slice(&cb, (1, 1, seq, hidden), cuda).unwrap();
+    let sin_gpu = Tensor::from_slice(&sb, (1, 1, seq, hidden), cuda).unwrap();
+    let out_gpu = rope(false, &x_gpu, &cos_gpu, &sin_gpu).unwrap();
+    let grads_gpu = out_gpu.backward().unwrap();
+
+    let to_f32 = |t: &Tensor| -> Vec<f32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap()
+    };
+    let bf16_bound = |c: f32, g: f32| 2.0 * 2.0f32.powi(-7) * c.abs().max(g).max(1.0);
+
+    let out_cpu_v = to_f32(&out_cpu);
+    let out_gpu_v = to_f32(&out_gpu.to_device(&cpu).unwrap());
+    assert_eq!(out_cpu_v.len(), n);
+    assert_eq!(out_gpu_v.len(), n, "rope bf16 GPU fwd length mismatch");
+    for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
+        assert!(
+            (c - g).abs() <= bf16_bound(*c, *g),
+            "rope bf16 fwd[{i}]: cpu {c} vs cuda {g}"
+        );
+    }
+
+    let dx_cpu_v = to_f32(&grads_cpu.get(&x_cpu).unwrap().clone());
+    let dx_gpu_v = to_f32(&grads_gpu.get(&x_gpu).unwrap().to_device(&cpu).unwrap());
+    assert_eq!(dx_cpu_v.len(), n);
+    assert_eq!(dx_gpu_v.len(), n, "rope bf16 GPU dx length mismatch");
+    for (i, (c, g)) in dx_cpu_v.iter().zip(dx_gpu_v.iter()).enumerate() {
+        assert!(
+            (c - g).abs() <= bf16_bound(*c, *g),
+            "rope bf16 dx[{i}]: cpu {c} vs cuda {g}"
+        );
+    }
+}
+
+#[test]
+fn rope_parity_contiguous_head_dim_64_modernbert_large_shape() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let batch = 2;
+    let seq = 6;
+    let hidden = 64;
+    let x = fixture(batch * seq * hidden, 1.0);
+    assert_rope_parity_f32(&cuda, batch, seq, hidden, &x);
+    assert_rope_parity_bf16(&cuda, batch, seq, hidden, &x);
+}
+
+#[test]
+fn rope_parity_non_power_of_two_even_head_dim() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    // 20 is even (a valid rotate-half split) but not a power of two and
+    // not a multiple of any convenient block size — exercises the
+    // grid-stride tail and the `col < half` boundary.
+    let batch = 3;
+    let seq = 5;
+    let hidden = 20;
+    let x = fixture(batch * seq * hidden, 2.0);
+    assert_rope_parity_f32(&cuda, batch, seq, hidden, &x);
+    assert_rope_parity_bf16(&cuda, batch, seq, hidden, &x);
+}
+
+#[test]
+fn rope_parity_narrowed_with_nonzero_offset() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    // A [3, batch, seq, hidden] tensor narrowed to its middle "batch"
+    // slab: contiguous but nonzero `start_offset` — the same class of bug
+    // `Axpy`'s/`LayerNormFused`'s CUDA arms had (reading the base buffer's
+    // first elements instead of the tensor's real range).
+    let batch = 2;
+    let seq = 4;
+    let hidden = 16;
+    let base_x = fixture(3 * batch * seq * hidden, 3.0);
+    let cos_v = rope_table(seq, hidden, 10_000.0);
+    let sin_v = rope_sin_table(seq, hidden, 10_000.0);
+    let cpu = Device::Cpu;
+
+    let x_cpu = Tensor::from_slice(&base_x, (3, batch, seq, hidden), &cpu)
+        .unwrap()
+        .narrow(0, 1, 1)
+        .unwrap()
+        .flatten(0, 1)
+        .unwrap();
+    assert!(x_cpu.is_contiguous());
+    assert_ne!(x_cpu.layout().start_offset(), 0);
+
+    let x_gpu = Tensor::from_slice(&base_x, (3, batch, seq, hidden), &cuda)
+        .unwrap()
+        .narrow(0, 1, 1)
+        .unwrap()
+        .flatten(0, 1)
+        .unwrap();
+    let cos_cpu = Tensor::from_slice(&cos_v, (1, 1, seq, hidden), &cpu).unwrap();
+    let sin_cpu = Tensor::from_slice(&sin_v, (1, 1, seq, hidden), &cpu).unwrap();
+    let cos_gpu = Tensor::from_slice(&cos_v, (1, 1, seq, hidden), &cuda).unwrap();
+    let sin_gpu = Tensor::from_slice(&sin_v, (1, 1, seq, hidden), &cuda).unwrap();
+
+    let out_cpu: Vec<f32> = rope(false, &x_cpu, &cos_cpu, &sin_cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let out_gpu: Vec<f32> = rope(false, &x_gpu, &cos_gpu, &sin_gpu)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(out_cpu.len(), batch * seq * hidden);
+    assert_eq!(
+        out_gpu.len(),
+        batch * seq * hidden,
+        "narrowed rope GPU fwd length mismatch"
+    );
+    for (i, (c, g)) in out_cpu.iter().zip(out_gpu.iter()).enumerate() {
+        assert!(
+            ((*c - *g).abs() as f64) <= F32_TOL,
+            "narrowed rope fwd[{i}]: cpu {c} vs cuda {g}"
+        );
+    }
+}
+
+#[test]
+fn rope_parity_empty_batch() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let cpu = Device::Cpu;
+    let hidden = 8;
+    let seq = 4;
+    let x_cpu = Tensor::from_slice(&[] as &[f32], (0, 1, seq, hidden), &cpu).unwrap();
+    let x_gpu = Tensor::from_slice(&[] as &[f32], (0, 1, seq, hidden), &cuda).unwrap();
+    let cos_v = rope_table(seq, hidden, 10_000.0);
+    let sin_v = rope_sin_table(seq, hidden, 10_000.0);
+    let cos_cpu = Tensor::from_slice(&cos_v, (1, 1, seq, hidden), &cpu).unwrap();
+    let sin_cpu = Tensor::from_slice(&sin_v, (1, 1, seq, hidden), &cpu).unwrap();
+    let cos_gpu = Tensor::from_slice(&cos_v, (1, 1, seq, hidden), &cuda).unwrap();
+    let sin_gpu = Tensor::from_slice(&sin_v, (1, 1, seq, hidden), &cuda).unwrap();
+
+    let out_cpu: Vec<f32> = rope(false, &x_cpu, &cos_cpu, &sin_cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    // Must not attempt an illegal zero-block launch.
+    let out_gpu: Vec<f32> = rope(false, &x_gpu, &cos_gpu, &sin_gpu)
         .unwrap()
         .to_device(&cpu)
         .unwrap()

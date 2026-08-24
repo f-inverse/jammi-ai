@@ -48,9 +48,11 @@ use candle_core::{CustomOp2, CustomOp3, Result, Tensor};
 
 mod axpy;
 mod layer_norm;
+mod rope;
 
 pub use axpy::Axpy;
 pub use layer_norm::{LayerNormFused, MAX_HIDDEN};
+pub use rope::{RopeFused, MAX_HEAD_DIM};
 
 mod sealed {
     //! Not `pub` at the `ops` level, so `Sealed` is unreachable outside

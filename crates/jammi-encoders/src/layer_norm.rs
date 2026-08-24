@@ -87,7 +87,12 @@ pub static LN_DISPATCH_COUNTERS: DispatchCounters = DispatchCounters::new();
 /// / `ln_eager_dispatches`), which needs no env var at all. Wiring an
 /// actual `JAMMI_KERNELS_STRICT=1` setter into the bench tier / a
 /// `gpu_capability`-style lane is future work (C8), not shipped here.
-fn admission_mode() -> AdmissionMode {
+///
+/// `pub(crate)`: `crate::modernbert`'s RoPE admission also reads this —
+/// ONE `JAMMI_KERNELS_STRICT` env var governs strictness uniformly across
+/// every fused kernel this crate dispatches, rather than one env var per
+/// op.
+pub(crate) fn admission_mode() -> AdmissionMode {
     static MODE: OnceLock<AdmissionMode> = OnceLock::new();
     *MODE.get_or_init(|| {
         if std::env::var_os("JAMMI_KERNELS_STRICT").is_some() {
@@ -122,7 +127,11 @@ fn admission_mode() -> AdmissionMode {
 /// Extracted from [`fused_admission_predicate`] so it is unit-testable
 /// directly against a `Device::Metal` value with no `metal` feature on
 /// this crate at all — see `tests::device_is_supported_rejects_metal`.
-fn device_is_supported(d: &Device) -> bool {
+/// `pub(crate)` (not private) so `crate::modernbert`'s RoPE admission
+/// predicate reuses the exact same audited clause (including the
+/// `cfg!(feature = "cuda")` half) rather than duplicating it — the C3
+/// fused-kernels contract's explicit instruction ("reuse C2's fn").
+pub(crate) fn device_is_supported(d: &Device) -> bool {
     d.is_cpu() || (cfg!(feature = "cuda") && d.is_cuda())
 }
 

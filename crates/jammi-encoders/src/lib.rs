@@ -64,6 +64,16 @@ pub fn ln_dispatch_snapshot() -> jammi_kernels::admission::DispatchSnapshot {
     layer_norm::LN_DISPATCH_COUNTERS.snapshot()
 }
 
+/// A snapshot of ModernBERT's training-mode fused RoPE (rotate-half)
+/// dispatch counts (see `crate::modernbert`'s `RotaryEmbedding` doc for
+/// the admission mechanism this counts, and its `apply_training` for the
+/// call site). `modernbert::ROPE_DISPATCH_COUNTERS` is `pub(crate)` —
+/// this is the read API a durable job record or a bench report uses,
+/// mirroring [`ln_dispatch_snapshot`] exactly.
+pub fn rope_dispatch_snapshot() -> jammi_kernels::admission::DispatchSnapshot {
+    modernbert::ROPE_DISPATCH_COUNTERS.snapshot()
+}
+
 /// Contiguity-safe matmul — the single matmul primitive every encoder uses.
 ///
 /// candle's **CUDA** matmul rejects two operand layouts its **CPU** matmul

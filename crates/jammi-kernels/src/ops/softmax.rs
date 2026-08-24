@@ -375,6 +375,8 @@ use candle_core::backend::BackendStorage;
 use candle_core::{CpuStorage, CustomOp2, Error, Layout, Result, Shape, Tensor};
 use half::bf16;
 
+use super::empty_like;
+
 /// The largest `last` (reduction-axis) size the CUDA kernel accepts.
 ///
 /// A conservative, VALIDATED ceiling — NOT a hardware constraint, the same
@@ -502,28 +504,6 @@ fn mask_row_offset(row: usize, s_lead: &[usize], m_lead: &[usize]) -> usize {
         flat = flat * m_lead[axis].max(1) + i;
     }
     flat
-}
-
-fn empty_like(
-    s1: &CpuStorage,
-    s2: &CpuStorage,
-    l1: &Layout,
-    op: &'static str,
-) -> Result<(CpuStorage, Shape)> {
-    match (s1, s2) {
-        (CpuStorage::F32(_), CpuStorage::F32(_)) => {
-            Ok((CpuStorage::F32(Vec::new()), l1.shape().clone()))
-        }
-        (CpuStorage::BF16(_), CpuStorage::BF16(_)) => {
-            Ok((CpuStorage::BF16(Vec::new()), l1.shape().clone()))
-        }
-        (s1, s2) if s1.dtype() != s2.dtype() => Err(Error::DTypeMismatchBinaryOp {
-            lhs: s1.dtype(),
-            rhs: s2.dtype(),
-            op,
-        }),
-        (s1, _) => Err(Error::UnsupportedDTypeForOp(s1.dtype(), op)),
-    }
 }
 
 /// Policy for [`SoftmaxLastDimFused`]'s behavior on a row where EVERY

@@ -367,7 +367,9 @@ fn l2_normalize(t: &Tensor) -> Result<Tensor, EncoderError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{deterministic_fill_varmap, find_var, nonuniform_loss};
+    use crate::test_support::{
+        assert_finite_nonzero, deterministic_fill_varmap, find_var, nonuniform_loss,
+    };
     use candle_core::{DType, Device};
     use candle_nn::VarMap;
 
@@ -529,7 +531,8 @@ mod tests {
     /// fused kernel (`candle_nn::ops::layer_norm`, `apply_op3_no_bwd`) is a
     /// SEPARATE `BackpropOp::none()` truncation — the same family of defect
     /// as `softmax_last_dim` but affecting normalization, not attention, and
-    /// out of scope for this fix. Because it sits AFTER every block, routing
+    /// independent of the softmax arm this helper isolates. Because it sits
+    /// AFTER every block, routing
     /// the loss through it (i.e. through `ClipText::forward`'s public output)
     /// severs backward before it reaches ANY block parameter, independent of
     /// the softmax arm under test here — it would make both the training and
@@ -592,18 +595,9 @@ mod tests {
         let k_norm = slice_grad_norm(&grad, width, width);
         let v_norm = slice_grad_norm(&grad, 2 * width, width);
 
-        assert!(
-            q_norm > 0.0,
-            "Q slice grad norm must be nonzero, got {q_norm}"
-        );
-        assert!(
-            k_norm > 0.0,
-            "K slice grad norm must be nonzero, got {k_norm}"
-        );
-        assert!(
-            v_norm > 0.0,
-            "V slice grad norm (positive control) must be nonzero, got {v_norm}"
-        );
+        assert_finite_nonzero(q_norm, "Q slice");
+        assert_finite_nonzero(k_norm, "K slice");
+        assert_finite_nonzero(v_norm, "V slice (positive control)");
         assert!(
             token_embedding_grad.is_some(),
             "token embedding grad must be Some under training=true"
@@ -645,10 +639,7 @@ mod tests {
 
         assert_eq!(q_norm, 0.0, "Q slice grad must be exactly zero under eval");
         assert_eq!(k_norm, 0.0, "K slice grad must be exactly zero under eval");
-        assert!(
-            v_norm > 0.0,
-            "V slice grad (positive control) must be nonzero under eval, got {v_norm}"
-        );
+        assert_finite_nonzero(v_norm, "V slice (positive control, eval)");
         assert!(
             token_embedding_grad.is_some(),
             "token embedding grad is still reachable via the block's residual stream under eval \
@@ -684,12 +675,6 @@ mod tests {
         let loss = nonuniform_loss(&out, cfg.embed_dim, &device);
         let grads = loss.backward().unwrap();
 
-        let token_embedding = find_var(&varmap, "token_embedding.weight");
-        assert!(
-            grads.get(token_embedding.as_tensor()).is_some(),
-            "token embedding grad must be Some under training=true through the full forward"
-        );
-
         let in_proj_weight = find_var(&varmap, "resblocks.0.attn.in_proj_weight");
         let grad = grads
             .get(in_proj_weight.as_tensor())
@@ -698,18 +683,15 @@ mod tests {
         let q_norm = slice_grad_norm(grad, 0, width);
         let k_norm = slice_grad_norm(grad, width, width);
         let v_norm = slice_grad_norm(grad, 2 * width, width);
-        assert!(
-            q_norm > 0.0,
-            "Q slice grad norm must be nonzero, got {q_norm}"
-        );
-        assert!(
-            k_norm > 0.0,
-            "K slice grad norm must be nonzero, got {k_norm}"
-        );
-        assert!(
-            v_norm > 0.0,
-            "V slice grad norm must be nonzero, got {v_norm}"
-        );
+        assert_finite_nonzero(q_norm, "Q slice");
+        assert_finite_nonzero(k_norm, "K slice");
+        assert_finite_nonzero(v_norm, "V slice");
+
+        // BLANKET oracle: every Var in the VarMap — not just the
+        // hand-picked token_embedding/in_proj_weight pair above — must
+        // receive a Some/finite/nonzero gradient. Measured 29/29 on this
+        // fixture: ClipText has no non-differentiable buffer to exclude.
+        crate::test_support::assert_every_var_has_gradient(&varmap, &grads, &[]);
     }
 
     /// The eval-mode observable a user of this tower would actually hit
@@ -749,6 +731,17 @@ mod tests {
             "in_proj_weight grad must be None under eval through the full forward, not merely \
              zero in its Q/K rows — ln_final severs the V-slice's surviving path too"
         );
+
+        // BLANKET oracle: every trainable Var in the VarMap is severed, not
+        // just the two spot-checked above. EXCLUDED: `text_projection`
+        // (`crate::contiguous_matmul(&pooled, &self.text_projection)` in
+        // `ClipText::forward` — see that method) — it sits DOWNSTREAM of
+        // `ln_final`'s truncation, applied by a plain differentiable matmul
+        // directly to `ln_final`'s output, so it still receives its own
+        // gradient (matmul backward for one operand only needs the OTHER
+        // operand's forward value, not a walk back through it) even though
+        // everything upstream of `ln_final` is severed.
+        crate::test_support::assert_every_var_grad_is_none(&varmap, &grads, &["text_projection"]);
     }
 
     /// Deletion-catching oracle for the residual-stream LayerNorms
@@ -816,14 +809,7 @@ mod tests {
                 .to_scalar::<f32>()
                 .unwrap()
                 .sqrt();
-            assert!(
-                norm.is_finite(),
-                "{name} grad norm must be finite under training=true, got {norm}"
-            );
-            assert!(
-                norm > 0.0,
-                "{name} grad norm must be nonzero under training=true, got {norm}"
-            );
+            assert_finite_nonzero(norm, &format!("{name} (training=true)"));
 
             assert!(
                 eval_grad(name).is_none(),

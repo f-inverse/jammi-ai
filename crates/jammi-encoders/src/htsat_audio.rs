@@ -363,6 +363,17 @@ impl AffBlock {
 fn tile_nonoverlapping(x: &Tensor, kh: usize, kw: usize) -> Result<Tensor, EncoderError> {
     let (n, c, h, w) = x.dims4()?;
     let (oh, ow) = (h / kh, w / kw);
+    // Domain guard: h < kh or w < kw makes oh or ow zero, which would
+    // silently narrow to a zero-length tile axis and return an empty
+    // tensor with no error — a confident-wrong shape rather than a
+    // refusal. Reject before narrowing.
+    if oh == 0 || ow == 0 {
+        return Err(EncoderError::Config(format!(
+            "tile_nonoverlapping: input spatial dims ({h}, {w}) are smaller than the tile \
+             kernel ({kh}, {kw}); at least one output tile dimension would be zero (oh={oh}, \
+             ow={ow})"
+        )));
+    }
     let x = x.narrow(2, 0, oh * kh)?.narrow(3, 0, ow * kw)?;
     Ok(x.contiguous()?
         .reshape((n, c, oh, kh, ow, kw))?
@@ -1412,7 +1423,9 @@ impl HtsatAudio {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{deterministic_fill_varmap, find_var, nonuniform_loss};
+    use crate::test_support::{
+        assert_finite_nonzero, deterministic_fill_varmap, find_var, nonuniform_loss,
+    };
     use candle_core::{DType, Device, Var};
     use candle_nn::VarMap;
 
@@ -1542,10 +1555,7 @@ mod tests {
                 .to_scalar::<f32>()
                 .unwrap()
                 .sqrt();
-            assert!(
-                norm > 0.0,
-                "block {i}: rel_bias_table grad norm must be nonzero, got {norm}"
-            );
+            assert_finite_nonzero(norm, &format!("block {i}: rel_bias_table"));
         }
     }
 
@@ -1674,14 +1684,7 @@ mod tests {
              tile_nonoverlapping's backward-sound reshape/permute tiling",
         );
         let mel_conv_norm = grad_norm(mel_conv_grad);
-        assert!(
-            mel_conv_norm.is_finite(),
-            "mel_conv2d.weight grad norm must be finite, got {mel_conv_norm}"
-        );
-        assert!(
-            mel_conv_norm > 0.0,
-            "mel_conv2d.weight grad norm must be nonzero, got {mel_conv_norm}"
-        );
+        assert_finite_nonzero(mel_conv_norm, "mel_conv2d.weight");
 
         let q0 = find_var(&varmap, "layers.0.blocks.0.attention.self.query.weight");
         let k0 = find_var(&varmap, "layers.0.blocks.0.attention.self.key.weight");
@@ -1691,25 +1694,16 @@ mod tests {
         let k_grad = grads
             .get(k0.as_tensor())
             .expect("layer-0 key.weight grad must be Some under training=true");
-        // `> 0.0` alone would silently pass through a NaN-poisoned gradient
-        // (`NaN > 0.0` is `false`, not a panic) — assert finiteness
-        // explicitly so a future domain violation fails loudly here instead
-        // of masquerading as "grad norm not nonzero".
+        // A bare `norm > 0.0` positive control leaves a hole open at `+inf`,
+        // not at `NaN`: `NaN > 0.0` is `false`, so `assert!(norm > 0.0)`
+        // already panics (correctly fails) on a NaN-poisoned gradient, but
+        // `+inf > 0.0` is `true`, so an exploded gradient would silently
+        // satisfy a bare `> 0.0` check. `assert_finite_nonzero` checks
+        // `is_finite()` first, closing that hole with its own message.
         let q_norm = grad_norm(q_grad);
         let k_norm = grad_norm(k_grad);
-        assert!(
-            q_norm.is_finite(),
-            "layer-0 query.weight grad norm must be finite, got {q_norm}"
-        );
-        assert!(
-            k_norm.is_finite(),
-            "layer-0 key.weight grad norm must be finite, got {k_norm}"
-        );
-        assert!(
-            q_norm > 0.0,
-            "layer-0 query.weight grad norm must be nonzero"
-        );
-        assert!(k_norm > 0.0, "layer-0 key.weight grad norm must be nonzero");
+        assert_finite_nonzero(q_norm, "layer-0 query.weight");
+        assert_finite_nonzero(k_norm, "layer-0 key.weight");
 
         for s in 0..cfg.num_stages() {
             for b in 0..cfg.depths[s] {
@@ -1722,16 +1716,42 @@ mod tests {
                     )
                 });
                 let norm = grad_norm(g);
-                assert!(
-                    norm.is_finite(),
-                    "stage {s} block {b}: rel_bias_table grad norm must be finite, got {norm}"
-                );
-                assert!(
-                    norm > 0.0,
-                    "stage {s} block {b}: rel_bias_table grad norm must be nonzero, got {norm}"
-                );
+                assert_finite_nonzero(norm, &format!("stage {s} block {b}: rel_bias_table"));
             }
         }
+
+        // BLANKET oracle: every Var in the VarMap — not just the
+        // hand-picked patch-embed/mel_conv2d/layer-0-Q-K/rel_bias_table
+        // subset above — must receive a Some/finite/nonzero gradient.
+        // EXCLUDED, two disjoint reasons:
+        //  - `running_mean`/`running_var`: the five `BatchNorm` instances'
+        //    buffers (the top-level `batch_norm` plus the fused AFF
+        //    block's `local_bn1`/`local_bn4`/`global_bn2`/`global_bn5`).
+        //    Non-differentiable BY CONSTRUCTION: candle's
+        //    `BatchNorm::forward_t(_, train=false)` (this tower always
+        //    runs eval-mode batch-norm statistics, regardless of the
+        //    tower's own `training` flag — see
+        //    `HtsatAudioEncoder::forward_front`'s `forward_t(&x, false)`
+        //    call) reads `running_mean`/`running_var` as plain tensors,
+        //    never through an autodiff op, so no `Op` node ever links a
+        //    loss back to them.
+        //  - `audio_projection.*` (the `ClapAudioProjection` head's two
+        //    linears): OUT OF SCOPE for this test's own composition, not a
+        //    tower defect. [`run_front_and_spine`] stops at
+        //    `spine.pooler_out`, one step short of `HtsatAudio::forward`'s
+        //    own `self.projection.forward_unnormalized(...)` call (see
+        //    that method's doc) — `audio_projection`'s weights are simply
+        //    never read by the graph this test builds, so `grads.get`
+        //    correctly returns `None` for them independent of anything
+        //    this test is actually measuring.
+        // Measured on this fixture: 171 of 185 Vars present, exactly the
+        // union of the 10 BatchNorm buffers and the 4 audio_projection
+        // weights excluded above.
+        crate::test_support::assert_every_var_has_gradient(
+            &varmap,
+            &grads,
+            &["running_mean", "running_var", "audio_projection"],
+        );
     }
 
     /// The eval-mode observable a user of this tower would actually hit
@@ -1795,6 +1815,16 @@ mod tests {
                 );
             }
         }
+
+        // BLANKET oracle: every trainable Var in the VarMap is severed
+        // (same `running_mean`/`running_var` exclusion as the training=true
+        // companion oracle — those buffers are non-differentiable by
+        // construction either way, see that test's doc).
+        crate::test_support::assert_every_var_grad_is_none(
+            &varmap,
+            &grads,
+            &["running_mean", "running_var"],
+        );
     }
 
     /// Deletion-catching oracle for [`SwinBlock`]'s residual-stream
@@ -1812,9 +1842,16 @@ mod tests {
     /// (this is the SAME shape as `training_false_full_forward_grads_are_none_before_final_norm`'s
     /// note that the encoder's final norm is a SEPARATE truncation from
     /// this one). This test asserts `layernorm_before`/`layernorm_after`'s
-    /// OWN `weight` — not anything upstream — through the full public
-    /// forward: `Some`/finite/nonzero under `training=true`, `None` under
-    /// `training=false`. RED-verified: deleting
+    /// OWN `weight` — not anything upstream — through
+    /// [`run_front_and_spine`] (`forward_front` composed with
+    /// `forward_spine`, stopping at `spine.pooler_out`), NOT the full
+    /// public [`HtsatAudio::forward`]: the skipped tail is
+    /// `ClapAudioProjection::forward_unnormalized` (linear, activation,
+    /// linear) plus `l2_normalize`, none of which touch `layernorm_before`/
+    /// `layernorm_after` either way, so composing up to `pooler_out` is
+    /// sufficient for this assertion without pulling in the projection
+    /// head's own weights as noise. `Some`/finite/nonzero under
+    /// `training=true`, `None` under `training=false`. RED-verified: deleting
     /// `self.layernorm_before.set_training(training)` from
     /// `SwinBlock::set_training` flips the training=true half of this test
     /// (`layernorm_before.weight` comes back `None` instead of `Some`)
@@ -1840,14 +1877,7 @@ mod tests {
             let grad = training_grad
                 .unwrap_or_else(|| panic!("{name} grad must be Some under training=true"));
             let norm = grad_norm(&grad);
-            assert!(
-                norm.is_finite(),
-                "{name} grad norm must be finite under training=true, got {norm}"
-            );
-            assert!(
-                norm > 0.0,
-                "{name} grad norm must be nonzero under training=true, got {norm}"
-            );
+            assert_finite_nonzero(norm, &format!("{name} (training=true)"));
 
             let eval_grad = {
                 let varmap = VarMap::new();
@@ -1925,14 +1955,7 @@ mod tests {
             .get(mel_conv_weight.as_tensor())
             .expect("mel_conv2d.weight grad must be Some through the fused patch-embed path");
         let norm = grad_norm(grad);
-        assert!(
-            norm.is_finite(),
-            "mel_conv2d.weight grad norm must be finite, got {norm}"
-        );
-        assert!(
-            norm > 0.0,
-            "mel_conv2d.weight grad norm must be nonzero, got {norm}"
-        );
+        assert_finite_nonzero(norm, "mel_conv2d.weight");
     }
 
     /// Gradient-VALUE oracle (a): central finite differences on a small
@@ -1944,15 +1967,19 @@ mod tests {
     /// non-uniform `w` is exactly linear in `x`: central differences have
     /// ZERO truncation error here (unlike a general nonlinear function),
     /// so a tight tolerance is legitimate — any residual gap is purely
-    /// f32 rounding. `[1, 1, 8, 9]`, `kh=2, kw=3`: both `8 / 2` and `9 / 3`
-    /// divide exactly (no dropped tail); the dropped-tail case is covered
-    /// separately by the production-geometry scatter oracle below, which
+    /// f32 rounding. `[1, 1, 9, 10]`, `kh=2, kw=3`: neither `9 / 2` (row
+    /// 8 dropped) nor `10 / 3` (column 9 dropped) divides exactly, so
+    /// this fixture is genuinely non-dividing on BOTH axes — the FD loop
+    /// below runs over every element including the dropped row/column, so
+    /// it also proves the dropped-tail elements get exactly zero gradient.
+    /// The production-geometry scatter oracle below covers a
+    /// dropped-tail-on-one-axis-only case at full production scale, which
     /// does not check EVERY element (72x more elements) the way this one
     /// does.
     #[test]
     fn tile_nonoverlapping_gradient_matches_central_finite_differences() {
         let device = Device::Cpu;
-        let (n, c, h, w) = (1usize, 1usize, 8usize, 9usize);
+        let (n, c, h, w) = (1usize, 1usize, 9usize, 10usize);
         let (kh, kw) = (2usize, 3usize);
         let numel = n * c * h * w;
 
@@ -2013,26 +2040,26 @@ mod tests {
         }
     }
 
-    /// Gradient-VALUE oracle (b): at the exact production geometry
-    /// (`[3, 1, 128, 128]`, `kh=4, kw=12` — `mel_conv2d`'s real shape, see
-    /// `config_parity_with_fixture`), [`tile_nonoverlapping`]'s analytic
-    /// gradient must equal a hand-built scatter: `dx[n, c, oh*kh+i, ow*kw+j]
-    /// = w[n, c, oh, ow, i, j]` for every retained element, and exactly
-    /// `0.0` for the dropped 8-column tail (`w=128`, `kw=12`,
-    /// `128 / 12 = 10` windows, columns `120..128` never read; `h=128`,
-    /// `kh=4` divides exactly, so height has no dropped tail). This is a
+    /// Shared body for the gradient-VALUE scatter oracle (b): builds a
+    /// deterministic `x` and non-uniform weight tensor at the given
+    /// geometry, runs `tile_nonoverlapping` forward+backward, and asserts
+    /// the analytic gradient exactly equals a hand-built scatter:
+    /// `dx[n, c, oh*kh+i, ow*kw+j] = w[n, c, oh, ow, i, j]` for every
+    /// retained element and exactly `0.0` for any dropped tail. This is a
     /// pure scatter — every retained `x` element contributes to EXACTLY
     /// one tile slot, so there is no floating-point accumulation to give
     /// tolerance to: `assert_eq!` on the f32 values is the correct
     /// comparison here, not an approximation.
-    #[test]
-    fn mel_conv2d_gradient_matches_the_hand_built_scatter_at_production_geometry() {
+    fn assert_tile_nonoverlapping_gradient_matches_scatter(
+        (n, c, h, w): (usize, usize, usize, usize),
+        (kh, kw): (usize, usize),
+        seed: u32,
+        label: &str,
+    ) {
         let device = Device::Cpu;
-        let (n, c, h, w) = (3usize, 1usize, 128usize, 128usize);
-        let (kh, kw) = (4usize, 12usize);
         let (oh, ow) = (h / kh, w / kw);
 
-        let x_vals = deterministic_tensor(n * c * h, w, 71, &device)
+        let x_vals = deterministic_tensor(n * c * h, w, seed, &device)
             .flatten_all()
             .unwrap()
             .to_vec1::<f32>()
@@ -2081,29 +2108,99 @@ mod tests {
 
         assert_eq!(
             analytic, expected,
-            "tile_nonoverlapping's gradient at the production geometry must exactly equal the \
+            "tile_nonoverlapping's gradient at the {label} geometry must exactly equal the \
              hand-built scatter (element-for-element — this is a pure copy, no arithmetic \
              accumulation, so bit-exact equality is the correct comparison)"
         );
     }
 
-    /// Pre-fix tiling: `unfold` applied directly, with no `narrow` first —
+    /// Gradient-VALUE oracle (b): at the exact production geometry
+    /// (`[3, 1, 128, 128]`, `kh=4, kw=12` — `mel_conv2d`'s real shape, see
+    /// `config_parity_with_fixture`), [`tile_nonoverlapping`]'s analytic
+    /// gradient matches the hand-built scatter, including exactly `0.0`
+    /// for the dropped 8-column tail (`w=128`, `kw=12`, `128 / 12 = 10`
+    /// windows, columns `120..128` never read; `h=128`, `kh=4` divides
+    /// exactly, so height has no dropped tail here — the complementary
+    /// dropped-ROW case is covered by
+    /// [`mel_conv2d_gradient_matches_the_hand_built_scatter_with_dropped_row_tail`]
+    /// below, since narrowing on dim 2 (height) exercises a different
+    /// stride/permute path than narrowing on dim 3 (width) alone).
+    #[test]
+    fn mel_conv2d_gradient_matches_the_hand_built_scatter_at_production_geometry() {
+        assert_tile_nonoverlapping_gradient_matches_scatter(
+            (3, 1, 128, 128),
+            (4, 12),
+            71,
+            "production (W-tail dropped, H exact)",
+        );
+    }
+
+    /// Gradient-VALUE oracle (b'): the complementary dropped-ROW-tail case
+    /// — `[2, 1, 9, 8]`, `kh=2, kw=2`: `h=9, kh=2` drops row `8` (narrow on
+    /// dim 2, the H axis), while `w=8, kw=2` divides exactly (no dropped
+    /// column). Case (b) above only ever exercises a dropped-tail on the W
+    /// axis (dim 3); `tile_nonoverlapping`'s narrow-then-reshape-then-permute
+    /// composition treats dim 2 and dim 3 asymmetrically (the permute order
+    /// is fixed), so a narrow-on-dim-2 backward is a materially different
+    /// code path from narrow-on-dim-3 and must be measured on its own
+    /// fixture, not assumed to work because (b) passed.
+    #[test]
+    fn mel_conv2d_gradient_matches_the_hand_built_scatter_with_dropped_row_tail() {
+        assert_tile_nonoverlapping_gradient_matches_scatter(
+            (2, 1, 9, 8),
+            (2, 2),
+            97,
+            "dropped-row-tail (H narrowed, W exact)",
+        );
+    }
+
+    /// Domain-validity oracle: when the input spatial dims are smaller than
+    /// the tile kernel (`h < kh` or `w < kw`), `oh` or `ow` floors to zero
+    /// and a narrow-then-reshape without a guard would silently produce an
+    /// empty tensor instead of surfacing the caller's mistake. Both the
+    /// height-starved and the width-starved case must return a typed
+    /// [`EncoderError`], not an empty `Ok`.
+    #[test]
+    fn tile_nonoverlapping_rejects_input_smaller_than_the_kernel() {
+        let device = Device::Cpu;
+
+        // h=1 < kh=2: oh would floor to 0.
+        let x = Tensor::zeros((1usize, 1usize, 1usize, 10usize), DType::F32, &device).unwrap();
+        let err = tile_nonoverlapping(&x, 2, 3)
+            .expect_err("h < kh must be rejected, not silently return an empty tensor");
+        assert!(
+            matches!(err, EncoderError::Config(_)),
+            "h < kh must fail with EncoderError::Config, got {err:?}"
+        );
+
+        // w=1 < kw=3: ow would floor to 0.
+        let x = Tensor::zeros((1usize, 1usize, 10usize, 1usize), DType::F32, &device).unwrap();
+        let err = tile_nonoverlapping(&x, 2, 3)
+            .expect_err("w < kw must be rejected, not silently return an empty tensor");
+        assert!(
+            matches!(err, EncoderError::Config(_)),
+            "w < kw must fail with EncoderError::Config, got {err:?}"
+        );
+    }
+
+    /// Reference tiling: `unfold` applied directly, with no `narrow` first —
     /// reproduces exactly what `mel_conv2d` did before [`tile_nonoverlapping`]
-    /// existed. Used only to prove the fix's forward stays bit-identical.
+    /// existed. Used only to prove `tile_nonoverlapping`'s forward stays
+    /// bit-identical to this reference.
     fn unfold_only_tiling(x: &Tensor, kh: usize, kw: usize) -> Tensor {
         x.unfold(2, kh, kh).unwrap().unfold(3, kw, kw).unwrap()
     }
 
     /// Forward bit-identity oracle: [`tile_nonoverlapping`]'s
     /// narrow-then-reshape-then-permute tiling must read the IDENTICAL
-    /// elements as `unfold` did (the pre-fix tiling), on the exact
-    /// non-dividing shape `mel_conv2d` hits in production (`spec_size=128`,
-    /// `kw=patch_size*3=12`; see `config_parity_with_fixture` for where
-    /// these numbers come from — `128 / 12 = 10` windows, an 8-wide tail
-    /// dropped either way; `n=3` matches the fused patch-embed's local
-    /// branch, `patch_embed_input_channels=3` local channels folded into
-    /// the batch axis). This is the oracle behind `golden_parity`'s 6/6
-    /// staying green across this fix: both tilings only ever read the same
+    /// elements as `unfold` did (the plain-`unfold` reference tiling above),
+    /// on the exact non-dividing shape `mel_conv2d` hits in production
+    /// (`spec_size=128`, `kw=patch_size*3=12`; see `config_parity_with_fixture`
+    /// for where these numbers come from — `128 / 12 = 10` windows, an
+    /// 8-wide tail dropped either way; `n=3` matches the fused patch-embed's
+    /// local branch, `patch_embed_input_channels=3` local channels folded
+    /// into the batch axis). This is the oracle behind `golden_parity`'s
+    /// 6/6 staying green: both tilings only ever read the same
     /// `floor(dim/size) * size` prefix, so changing HOW that prefix is
     /// reshaped into tiles changes nothing about which elements FORWARD
     /// reads — only whether BACKWARD is exact.
@@ -2192,11 +2289,12 @@ mod tests {
     /// `x` gradient does NOT match the hand-derived correct gradient
     /// `dx[row, col] = w[row / 2, col, row % 2]` (derived from unfold's own
     /// FORWARD index arithmetic, `tensor.rs:2931-2969`) at 4 of its 8
-    /// positions — this is the exact silent-wrong-gradient failure mode
-    /// [`tile_nonoverlapping`]'s width/height unfold chain was exposed to
-    /// before it moved to `reshape`/`permute` (whose backward passes are
-    /// exact scatters, not a flat reshape). If this test ever starts
-    /// PASSING (the two grads agreeing), candle has fixed unfold's backward
+    /// positions — this is the exact silent-wrong-gradient failure mode a
+    /// width/height `unfold` chain is exposed to, the reason
+    /// [`tile_nonoverlapping`] instead uses `reshape`/`permute` (whose
+    /// backward passes are exact scatters, not a flat reshape). If this
+    /// test ever starts PASSING (the two grads agreeing), candle has fixed
+    /// unfold's backward
     /// to account for which dim was unfolded, and the day this happens is
     /// the day `tile_nonoverlapping` could safely go back to `unfold`.
     #[test]

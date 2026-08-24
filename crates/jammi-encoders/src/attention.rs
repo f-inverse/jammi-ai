@@ -164,14 +164,14 @@ impl MultiHeadAttention {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::{DType, Device};
+    use candle_core::{DType, Device, Var};
     use candle_nn::VarMap;
 
-    /// `MultiHeadAttention::forward`'s op sequence with the three
-    /// `qkv.i(_)?.contiguous()?` calls this fix removed put back in
-    /// (`contiguous_matmul` already contiguous-izes both its operands, so
-    /// those calls were redundant copies, not a correctness dependency) —
-    /// used only by
+    /// `MultiHeadAttention::forward`'s op sequence with three redundant
+    /// `qkv.i(_)?.contiguous()?` calls put back in that the primary forward
+    /// path omits (`contiguous_matmul` already contiguous-izes both its
+    /// operands, so those calls are redundant copies, not a correctness
+    /// dependency) — used only by
     /// [`tests::dropping_the_redundant_contiguous_calls_does_not_change_eval_output`]
     /// to prove the removal is a pure no-op on values.
     fn forward_with_redundant_contiguous(
@@ -413,5 +413,59 @@ mod tests {
                  unmasked case only"
             );
         }
+    }
+
+    /// Premise-pin (the repo idiom for a documented upstream limitation,
+    /// e.g. `jammi-kernels`' `cpu_matmul_still_cannot_do_bf16`, or
+    /// `htsat_audio::tests::unfold_backward_is_a_plain_reshape_in_candle`):
+    /// pins the exact candle-nn/candle-core behavior every eval→`None`
+    /// gradient-deletion oracle in this crate rests on — that both
+    /// `candle_nn::ops::layer_norm` and `candle_nn::ops::softmax_last_dim`
+    /// wrap their result in `BackpropOp::none()` (see this module's own doc
+    /// for `softmax_last_dim`'s exact candle-nn/candle-core source
+    /// citations), so a `Var` strictly upstream of either gets NO gradient
+    /// entry at all under eval — not zero, not an error, just absent. If a
+    /// future candle upgrade gives either primitive a real backward pass,
+    /// every "grad must be `None` under `training=false`" assertion in this
+    /// crate (`clip_text.rs`, `open_clip_vision.rs`, `htsat_audio.rs`) would
+    /// start failing for the RIGHT reason (eval now backprops), and this
+    /// test is the one place that failure is diagnosed instead of chased
+    /// through every tower's tests independently.
+    #[test]
+    fn layer_norm_and_softmax_last_dim_are_backward_free_in_candle() {
+        let device = Device::Cpu;
+
+        // softmax_last_dim: a Var upstream of it gets no gradient entry.
+        let xv =
+            Var::from_tensor(&Tensor::from_vec(vec![1f32, 2., 3., 4.], (2, 2), &device).unwrap())
+                .unwrap();
+        let out = candle_nn::ops::softmax_last_dim(xv.as_tensor()).unwrap();
+        let loss = out.sum_all().unwrap();
+        let grads = loss.backward().unwrap();
+        assert!(
+            grads.get(xv.as_tensor()).is_none(),
+            "softmax_last_dim's BackpropOp::none() must leave its operand with NO gradient \
+             entry — if this now returns Some, candle has given softmax_last_dim a real \
+             backward pass and every eval-mode deletion oracle in this crate needs revisiting"
+        );
+
+        // layer_norm: a Var upstream of it (the input `x`) gets no
+        // gradient entry either.
+        let xv = Var::from_tensor(
+            &Tensor::from_vec(vec![1f32, 2., 3., 4., 5., 6.], (2, 3), &device).unwrap(),
+        )
+        .unwrap();
+        let weight = Tensor::ones(3, DType::F32, &device).unwrap();
+        let bias = Tensor::zeros(3, DType::F32, &device).unwrap();
+        let out = candle_nn::ops::layer_norm(xv.as_tensor(), &weight, &bias, 1e-5).unwrap();
+        let loss = out.sum_all().unwrap();
+        let grads = loss.backward().unwrap();
+        assert!(
+            grads.get(xv.as_tensor()).is_none(),
+            "candle_nn::ops::layer_norm's BackpropOp::none() must leave its input operand with \
+             NO gradient entry — if this now returns Some, candle has given the fused \
+             layer_norm kernel a real backward pass and every eval-mode deletion oracle in this \
+             crate needs revisiting"
+        );
     }
 }

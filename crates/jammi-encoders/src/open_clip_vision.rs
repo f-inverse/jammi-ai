@@ -1,8 +1,8 @@
 //! OpenCLIP-compatible Vision Transformer (ViT).
 //!
 //! Loads weights from OpenCLIP safetensors files directly, without key
-//! remapping. Supports global average pooling (used by PatentCLIP) instead
-//! of CLS token pooling.
+//! remapping. Supports global average pooling over patch tokens or
+//! CLS-token pooling, selected by `global_average_pool`.
 //!
 //! The attention softmax goes through
 //! [`crate::attention::attention_softmax`]; the fused-QKV `MultiHeadAttention`
@@ -522,7 +522,12 @@ mod tests {
     /// slices of `in_proj_weight`. Reverting that arm to `softmax_last_dim`
     /// makes this fail: `BackpropOp::none()` stops the walk at the softmax
     /// node before it reaches Q/K (see
-    /// [`crate::attention::attention_softmax`]'s module doc).
+    /// [`crate::attention::attention_softmax`]'s module doc). Beyond the
+    /// Q/K/V slice check, a BLANKET loop over every `Var` in the `VarMap`
+    /// asserts the whole tower — not a hand-picked subset — receives a
+    /// `Some`/finite/nonzero gradient (measured 32/32 on this fixture, no
+    /// exclusions: this tower has no non-differentiable buffer like
+    /// HTSAT's `BatchNorm` running stats).
     #[test]
     fn training_true_backward_reaches_qk_through_softmax() {
         let config = tiny_config();
@@ -549,23 +554,11 @@ mod tests {
         let k_norm = row_slice_norm(grad, width, width);
         let v_norm = row_slice_norm(grad, 2 * width, width);
 
-        assert!(
-            q_norm > 0.0,
-            "Q slice grad norm must be nonzero, got {q_norm}"
-        );
-        assert!(
-            k_norm > 0.0,
-            "K slice grad norm must be nonzero, got {k_norm}"
-        );
-        assert!(
-            v_norm > 0.0,
-            "V slice grad norm must be nonzero (positive control), got {v_norm}"
-        );
+        crate::test_support::assert_finite_nonzero(q_norm, "Q slice");
+        crate::test_support::assert_finite_nonzero(k_norm, "K slice");
+        crate::test_support::assert_finite_nonzero(v_norm, "V slice (positive control)");
 
-        assert!(
-            grads.get(model.conv1.weight()).is_some(),
-            "patch-conv weight must receive a gradient — the whole graph stays connected"
-        );
+        crate::test_support::assert_every_var_has_gradient(&varmap, &grads, &[]);
     }
 
     /// Documents the measured full-model shape at `training = false` (the
@@ -580,7 +573,9 @@ mod tests {
     /// propagation call (e.g. `set_training` failing to reach a block would
     /// not change this assertion, since eval is `training = false` either
     /// way, but a regression that accidentally made eval reach the softmax
-    /// site would still show up as a change here).
+    /// site would still show up as a change here). A BLANKET loop over
+    /// every `Var` in the `VarMap` proves this is the whole tower's
+    /// behavior, not just `in_proj_weight`'s.
     #[test]
     fn training_false_backward_has_no_in_proj_gradient_at_all() {
         let config = tiny_config();
@@ -602,6 +597,16 @@ mod tests {
             "eval's own LayerNorm kernel must still truncate backward before block 0's \
              attention runs, matching pre-fix behavior for this tower's eval path"
         );
+
+        // EXCLUDED: `visual.proj` (`crate::contiguous_matmul(&pooled,
+        // &self.proj)` in `OpenClipVisionTransformer::forward`) — it sits
+        // DOWNSTREAM of `ln_pre`'s truncation, applied by a plain
+        // differentiable matmul directly to `ln_post`'s output, so it
+        // still receives its own gradient (matmul backward for one
+        // operand only needs the OTHER operand's forward value, not a
+        // walk back through it) even though everything upstream of
+        // `ln_pre` is severed.
+        crate::test_support::assert_every_var_grad_is_none(&varmap, &grads, &["visual.proj"]);
     }
 
     /// Isolated reproduction of the softmax site's own defect shape,
@@ -652,7 +657,7 @@ mod tests {
             k_norm, 0.0,
             "K slice grad must be exactly zero under the truncated eval kernel"
         );
-        assert!(v_norm > 0.0, "V slice grad must stay nonzero, got {v_norm}");
+        crate::test_support::assert_finite_nonzero(v_norm, "V slice");
     }
 
     /// Deletion-catching oracle for [`ResidualAttentionBlock`]'s
@@ -712,14 +717,7 @@ mod tests {
                 .to_scalar::<f32>()
                 .unwrap()
                 .sqrt();
-            assert!(
-                norm.is_finite(),
-                "{suffix} grad norm must be finite under training=true, got {norm}"
-            );
-            assert!(
-                norm > 0.0,
-                "{suffix} grad norm must be nonzero under training=true, got {norm}"
-            );
+            crate::test_support::assert_finite_nonzero(norm, &format!("{suffix} (training=true)"));
 
             let eval_grad = {
                 let varmap = VarMap::new();

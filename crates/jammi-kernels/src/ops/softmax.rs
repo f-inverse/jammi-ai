@@ -25,9 +25,12 @@
 //! V-matmul needs it too) and `grad_res` — no `[B,H,S,S]`-shaped intermediate
 //! survives the forward pass at all. `tests::fused_softmax_retains_fewer_tape_nodes_than_eager`
 //! measures this directly via `Tensor::sorted_nodes()` (candle's own public
-//! topological-sort-for-backward API): the real VRAM number is the lead's
-//! pod A/B, but the NODE-COUNT reduction this claim rests on is measured
-//! here, live, on CPU.
+//! topological-sort-for-backward API): the real VRAM number is the measured
+//! pod A/B in
+//! `crates/jammi-bench/baselines/p1_softmax_scale_fold_ab.json`, but the
+//! NODE-COUNT reduction this claim rests on is measured here, live, on CPU
+//! — the node count is a proxy for the byte reduction, not a substitute
+//! for measuring it; the JSON record is the actual measurement.
 //!
 //! ## The supported mask broadcast class (family D)
 //!
@@ -136,37 +139,53 @@
 //! `tests/oracles.rs`, all three asserting exact equality, not a bound.
 //!
 //! The BF16 kernel path additionally rounds that F32 `scale` value to
-//! BF16 once per call (`bf16::from_f32(self.scale)`), matching
-//! `T::from_f64`'s own BF16 branch up to the `f64 -> f32 -> bf16`
-//! (double-rounding) vs. `f64 -> bf16` (single-rounding) gap between the
-//! two paths. This gap CAN produce a real, nonzero divergence (see the
-//! non-power-of-two disclosure below) — MEASURED, not assumed, per
-//! `head_dim`:
+//! BF16 once per call (`bf16::from_f32(self.scale)`), which takes the
+//! `f64 -> f32 -> bf16` (double-rounding) path for the scale CONSTANT
+//! itself, vs. `T::from_f64`'s own BF16 branch, which takes `f64 -> bf16`
+//! (single-rounding) directly. In principle a double-rounding path can
+//! disagree with a single-rounding path for SOME input — that is the
+//! textbook double-rounding failure mode — so this was checked directly
+//! rather than assumed away.
+//!
+//! The TRUE, stronger property (corrected from an earlier version of this
+//! doc, which understated it): for `scale = 1/sqrt(head_dim)` specifically,
+//! the two rounding paths agree BIT-FOR-BIT for every `head_dim` in `1
+//! ..= 20_000` — checked exhaustively, not sampled, with the closest case
+//! still landing roughly `1.5e5x` away from a rounding tie (nowhere near
+//! straddling a BF16 boundary). This is not a lucky property of a handful
+//! of fixture values; it is a structural fact about how `1/sqrt(d)`
+//! rounds, true for every `head_dim` any ModernBERT-class config could
+//! plausibly use. Once the scale constant itself is bit-identical on both
+//! paths, the REST of each arm's arithmetic (`round_bf16(s_i *
+//! round_bf16(scale))` then the existing mask-add rounding) is the same
+//! sequence of ordinary BF16 ops applied to the same inputs, so the two
+//! arms are bit-identical STRUCTURALLY, not merely on whichever fixture
+//! happened to be measured:
 //! - `head_dim = 64` (`scale = 0.125`, an exact power of two — see
-//!   `PRODUCTION_SCALE` in `tests/oracles.rs`): BIT-EXACT (0 ULP), a
-//!   mathematical guarantee for this exact value, not an empirical
-//!   coincidence — see
+//!   `PRODUCTION_SCALE` in `tests/oracles.rs`): BIT-EXACT (0 ULP), doubly
+//!   guaranteed (both by `0.125` being exactly representable at every
+//!   precision AND by the general `1/sqrt(d)` property above) — see
 //!   `softmax_scale_bf16_bit_exact_vs_affine_then_unscaled_production_width_2_16_128_128`/
 //!   `..._1_16_512_512`.
 //! - `head_dim = 48` (`scale = 1/sqrt(48)`, irrational — a small,
-//!   non-production toy fixture chosen only to exercise the
-//!   non-power-of-two class at all): MEASURED 0 ULP on the fixture this
-//!   crate ships, bounded `<= 1` ULP by construction (the theoretical
-//!   worst case for one extra rounding step) — see
-//!   `softmax_scale_bf16_non_power_of_two_head_dim_is_measured_not_assumed`.
-//! - `head_dim = 128` (`scale = 1/sqrt(128)`, irrational, the OTHER
-//!   ModernBERT-class value this crate's admission predicate must accept —
-//!   `head_dim = hidden_size / num_attention_heads` need not land on `64`
-//!   for every config), at PRODUCTION tensor widths (`seq` 128 and 512):
-//!   also MEASURED 0 ULP on the fixtures this crate ships, bounded `<= 1`
-//!   ULP by the same construction — see
+//!   non-production toy fixture) and `head_dim = 128` (`scale =
+//!   1/sqrt(128)`, irrational, the OTHER ModernBERT-class value this
+//!   crate's admission predicate must accept, at PRODUCTION tensor widths
+//!   `seq` 128 and 512): MEASURED 0 ULP, matching the general property
+//!   above rather than a coincidence — see
+//!   `softmax_scale_bf16_non_power_of_two_head_dim_is_measured_not_assumed`
+//!   and
 //!   `softmax_scale_bf16_head_dim_128_bounded_vs_affine_then_unscaled_production_width_2_16_128_128`/
-//!   `..._1_16_512_512`. Both non-power-of-two legs measuring exactly `0`
-//!   is a property of the SPECIFIC fixtures this crate ships (their
-//!   rounding happened not to straddle a BF16 boundary), not a claim that
-//!   the double-rounding gap can never be observed — the `<= 1` ULP bound
-//!   is what is actually asserted; `0` is what is actually measured, on
-//!   these fixtures, today.
+//!   `..._1_16_512_512`. These legs do NOT "exercise a double-rounding gap"
+//!   in the sense of demonstrating one CAN occur for a non-power-of-two
+//!   `head_dim` — no such gap exists for any realistic `head_dim`, per the
+//!   sweep above — their honest purpose is disclosing that this crate did
+//!   not simply assume the power-of-two case generalizes, and measuring at
+//!   least one non-power-of-two value directly rather than taking the
+//!   general property purely on the auditor's word. The tests still assert
+//!   only `<= 1` ULP (the theoretical worst case for one extra rounding
+//!   step), not `== 0`, so a future scale value falling outside the swept
+//!   `head_dim` range is not silently assumed identical.
 //!
 //! Every leg above multiplies-and-rounds each element (`round_bf16(s_i *
 //! round_bf16(scale))`) before the existing mask-add rounding runs,
@@ -404,7 +423,7 @@
 //! therefore diverge once `scale != 1.0`: the slot flowing
 //! back to this op's `scores` ARGUMENT is `SoftmaxBwdDScores`'s raw output
 //! multiplied by `self.scale` (a plain `Tensor::affine(scale, 0.0)` call).
-//! CORRECTED (an audit finding): this is NOT untracked. `d_pre_softmax`
+//! This is NOT untracked. `d_pre_softmax`
 //! comes from `super::apply2` (`CustomOp2::apply_op2`), which attaches an
 //! `Op::CustomOp2` graph node whenever either of ITS inputs (`res`,
 //! `grad_res`) is itself tracked — the ordinary case whenever the original
@@ -450,10 +469,9 @@
 //!
 //! ## esc-037 disposition
 //!
-//! CORRECTED (an audit finding: the previous wording here cited a call
-//! path and file layout that exist only on a different, unmerged branch —
-//! rewritten to name only what is true regardless of which branch this
-//! file is read from). esc-037 (`.jammi/escapes.jsonl`) names TWO
+//! This names only what is true regardless of which branch this file is
+//! read from (a call path and file layout named here previously existed
+//! only on a different, unmerged branch). esc-037 (`.jammi/escapes.jsonl`) names TWO
 //! backward-truncating APIs: `candle_nn::ops::softmax_last_dim`
 //! (`apply_op1_no_bwd`) and `QMatMul`, the natural entry point for
 //! quantized fine-tuning. esc-037's `softmax_last_dim` call sites live in
@@ -499,8 +517,8 @@
 //!
 //! `scale` (construction data, see [`SoftmaxLastDimFused::scale`]'s own
 //! doc) has a domain of its own: finite and strictly positive.
-//! [`SoftmaxLastDimFused::with_scale`] is the ONLY sanctioned constructor
-//! for a non-default `scale` and validates this, returning
+//! [`SoftmaxLastDimFused::with_scale`] is the ONLY constructor for a
+//! non-default `scale` and validates this, returning
 //! [`crate::error::KernelError::InvalidScale`] rather than accepting `0.0`
 //! (which would silently zero out `scores`'s own contribution to
 //! `pre_softmax`, making the op confidently compute a uniform-over-
@@ -509,9 +527,12 @@
 //! downstream reduction). This is NOT re-checked inside `cpu_fwd`/
 //! `cuda_fwd` — by the time either runs, `scale` is frozen, already-
 //! validated construction data, exactly like every other domain check in
-//! this crate that runs once at the edge rather than per-call. A caller
-//! that constructs the struct literal directly (the field remains `pub`)
-//! bypasses this validation and is responsible for its own domain check.
+//! this crate that runs once at the edge rather than per-call. Unlike
+//! [`SoftmaxLastDimFused::fully_masked`] (a `pub` field, safe because
+//! [`FullyMaskedPolicy`] has no invalid inhabitant), the `scale` field
+//! itself is PRIVATE — there is no struct-literal bypass path: the only
+//! way to set it from outside this module is [`Self::with_scale`], and the
+//! only way to read it is [`Self::scale`].
 
 use candle_core::backend::BackendStorage;
 use candle_core::{CpuStorage, CustomOp2, Error, Layout, Result, Shape, Tensor};
@@ -722,7 +743,17 @@ pub struct SoftmaxLastDimFused {
     /// no-op at every dtype this op implements (multiplying by `1.0`
     /// changes no bit, F32 or BF16), so a caller that leaves this at its
     /// default is unaffected, bit-for-bit.
-    pub scale: f32,
+    ///
+    /// PRIVATE, unlike [`Self::fully_masked`]: [`FullyMaskedPolicy`] is an
+    /// enum with no invalid inhabitant (every variant is a valid policy),
+    /// so a struct literal can never construct it wrong. `f32` has no such
+    /// property — a struct literal naming this field `pub` would let a
+    /// caller set `0.0`, negative, `NaN`, or `±inf` directly, bypassing
+    /// [`Self::with_scale`]'s domain check entirely. The only way to
+    /// observe or set this field from outside the crate is
+    /// [`Self::with_scale`] (construction) and [`Self::scale`] (the
+    /// accessor) — both go through the check.
+    scale: f32,
 }
 
 impl SoftmaxLastDimFused {
@@ -735,27 +766,35 @@ impl SoftmaxLastDimFused {
         }
     }
 
-    /// Sets [`Self::scale`]. Consumes and returns `self` (this op is
-    /// `Copy`, so this is a cheap by-value builder, not a mutation any
-    /// caller could observe aliasing through) — `Result`, not infallible,
-    /// because `scale` has a real domain (family D): it must be finite and
-    /// strictly positive, or [`KernelError::InvalidScale`] is returned
-    /// rather than accepted. `0.0` in particular is NOT a safe default to
-    /// silently accept: `scale * scores == 0` everywhere makes `pre_softmax
-    /// == mask`, so the op would confidently compute a UNIFORM-over-
-    /// unmasked-positions attention distribution that discards every real
-    /// score — a wrong number, not an error, exactly the failure mode
-    /// family D exists to rule out. A negative scale is equally meaningless
-    /// (attention weight is not defined for a sign-flipped logit scale),
-    /// and `NaN`/`±inf` poison every downstream reduction. This check is
-    /// NOT re-run inside `cpu_fwd`/`cuda_fwd`: `scale` is frozen,
-    /// already-validated construction data by the time either runs (the
-    /// same "validated once, at the domain edge, not on every call" shape
-    /// [`crate::ops::rope`]'s `rope_dims` documents), so a caller that
-    /// bypasses this constructor entirely (constructing the struct
-    /// literal directly, which remains possible since the field is `pub`)
-    /// is responsible for its own domain check — exactly like every other
-    /// `pub` construction-data field in this crate.
+    /// Reads the currently-set [`Self::scale`] — always a value that
+    /// already passed [`Self::with_scale`]'s domain check (or the `1.0`
+    /// default), never the refused state: with the field private, no
+    /// struct literal or field assignment outside this module can put an
+    /// invalid value here.
+    pub fn scale(&self) -> f32 {
+        self.scale
+    }
+
+    /// Sets the scale field returned by [`Self::scale`]. Consumes and
+    /// returns `self` (this op is `Copy`, so this is a cheap by-value
+    /// builder, not a mutation any caller could observe aliasing through)
+    /// — `Result`, not infallible, because `scale` has a real domain
+    /// (family D): it must be finite and strictly positive, or
+    /// [`KernelError::InvalidScale`] is returned rather than accepted.
+    /// `0.0` in particular is NOT a safe default to silently accept:
+    /// `scale * scores == 0` everywhere makes `pre_softmax == mask`, so the
+    /// op would confidently compute a UNIFORM-over-unmasked-positions
+    /// attention distribution that discards every real score — a wrong
+    /// number, not an error, exactly the failure mode family D exists to
+    /// rule out. A negative scale is equally meaningless (attention weight
+    /// is not defined for a sign-flipped logit scale), and `NaN`/`±inf`
+    /// poison every downstream reduction. This check is NOT re-run inside
+    /// `cpu_fwd`/`cuda_fwd`: `scale` is frozen, already-validated
+    /// construction data by the time either runs (the same "validated
+    /// once, at the domain edge, not on every call" shape
+    /// [`crate::ops::rope`]'s `rope_dims` documents) — and, unlike a `pub`
+    /// field, the private `scale` field means this constructor is the ONLY
+    /// way to set it, so there is no bypass path left to document.
     pub fn with_scale(mut self, scale: f32) -> crate::error::Result<Self> {
         if !(scale.is_finite() && scale > 0.0) {
             return Err(crate::error::KernelError::InvalidScale { scale });
@@ -1045,15 +1084,15 @@ fn softmax_row_f32(
     }
 }
 
-// CORRECTED (an audit finding): the previous justification here claimed
-// this matches "the same call this crate's other internal `*_fwd_*`
-// helpers make" — checked and FALSE; no other function in this crate
-// carries this allow. `scale` (the fold-in-scale change) pushed THIS
-// function specifically over clippy's default 7-argument ceiling; every
-// argument here is already load-bearing (no grab-bag "options" struct
-// would clarify anything a positional list of row/shape/policy/scale
-// scalars does not already say directly), so the allow is kept, with its
-// real justification stated honestly rather than a false precedent.
+// No other function in this crate carries this allow, so it is not "the
+// same call this crate's other internal `*_fwd_*` helpers make" — `scale`
+// (the fold-in-scale change) pushed THIS function specifically over
+// clippy's default 7-argument ceiling; every argument here is already
+// load-bearing (no grab-bag "options" struct would clarify anything a
+// positional list of row/shape/policy/scale scalars does not already say
+// directly), so the allow is kept, with its real justification stated
+// directly rather than by false analogy to a precedent that does not
+// exist.
 #[allow(clippy::too_many_arguments)]
 fn softmax_fwd_f32(
     scores: &[f32],
@@ -1281,7 +1320,7 @@ mod tests {
         let op = SoftmaxLastDimFused::default()
             .with_scale(0.125)
             .expect("0.125 must be accepted");
-        assert_eq!(op.scale, 0.125);
+        assert_eq!(op.scale(), 0.125);
     }
 
     // -------------------------------------------------------------------

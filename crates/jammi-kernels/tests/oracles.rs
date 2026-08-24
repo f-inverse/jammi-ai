@@ -387,11 +387,10 @@ fn bwd_is_never_called_when_neither_input_leads_to_a_variable() {
 }
 
 // ---------------------------------------------------------------------
-// SoftmaxLastDimFused: `scale` semantics (P1 of the fused-kernels
-// program — folding `1/sqrt(head_dim)` into this op, replacing the
-// `Op::Affine` node `ModernBertAttention::forward`'s training arm used to
-// retain — see `jammi_kernels::ops::softmax`'s module doc's "scale
-// semantics" section).
+// SoftmaxLastDimFused: `scale` semantics — folding `1/sqrt(head_dim)`
+// into this op, replacing the `Op::Affine` node
+// `ModernBertAttention::forward`'s training arm used to retain — see
+// `jammi_kernels::ops::softmax`'s module doc's "scale semantics" section.
 //
 // The comparison target throughout is `fused-with-scale` vs. `(candle's
 // own Tensor::affine) THEN fused-no-scale` — the EXACT two-op composition
@@ -412,7 +411,9 @@ fn softmax_scaled(
     // fixture in this file passes a genuine finite positive scale, so
     // `.expect` here is a test-fixture assumption, not a silent unwrap of a
     // real fallible path. The domain refusal itself is exercised directly
-    // by `softmax_scale_with_scale_refuses_the_invalid_domain` below.
+    // by `ops::softmax::tests::with_scale_refuses_zero_negative_nan_and_infinite`
+    // (in `crates/jammi-kernels/src/ops/softmax.rs`'s own `mod tests`, not
+    // in this file).
     apply2(
         scores,
         mask,
@@ -468,6 +469,30 @@ fn scale_mask_fixture(batch: usize, seq: usize) -> Vec<f32> {
         }
     }
     mask
+}
+
+/// A REL-POS-BIAS-shaped mask: small, continuous, NEVER `0.0` and NEVER
+/// near `MASKED_LOGIT` magnitude, unlike [`scale_mask_fixture`]'s real
+/// ModernBERT alphabet `{0.0, -10_000.0, -20_000.0}`. This exists to close
+/// a specific gap that alphabet cannot: at `mask = 0.0`, adding it is a
+/// round-identity regardless of how precisely the scaled score was rounded
+/// beforehand (`x + 0.0 == x` at every precision); at `mask ≈
+/// MASKED_LOGIT`, the add ANNIHILATES the scaled score (BF16's ULP near
+/// `10_000` dwarfs any real score), which also erases any precision
+/// difference in how the score itself was rounded. Neither case can
+/// observe WHERE the BF16 kernel's intermediate rounding happens
+/// (`softmax_row_bf16`'s `scaled = bf16::from_f32(scores[i] * scale_bf)`,
+/// rounded to BF16 BEFORE the mask add — see the module doc's "scale
+/// semantics" section) — an oracle built only from that alphabet would
+/// pass identically whether or not that intermediate rounding step were
+/// silently dropped (i.e. the product kept in F32 until AFTER the mask
+/// add). Values in `[-0.5, 0.5]` are the same order of magnitude as the
+/// scaled scores themselves, so the mask-add's OWN rounding is where a
+/// dropped intermediate-rounding regression would actually show up.
+fn small_bias_mask_fixture(batch: usize, seq: usize) -> Vec<f32> {
+    (0..batch * seq * seq)
+        .map(|i| (i as f32 * 0.037 - 3.0).sin() * 0.5)
+        .collect()
 }
 
 /// `1.0 / sqrt(64)` — ModernBERT-large's REAL `head_dim` (`num_heads =
@@ -695,6 +720,75 @@ fn softmax_scale_bf16_non_power_of_two_head_dim_is_measured_not_assumed() {
     assert!(
         max_ulp <= 1,
         "double-rounding gap larger than the theoretical 1-ULP worst case: {max_ulp}"
+    );
+}
+
+/// Closes a real gap in every OTHER BF16 leg above: every one of them uses
+/// [`scale_mask_fixture`]'s real ModernBERT alphabet (`{0.0, -10_000.0,
+/// -20_000.0}`), and at BOTH ends of that alphabet the mask add cannot
+/// observe WHERE the intermediate rounding happens (`0.0` is a
+/// round-identity; `MASKED_LOGIT` magnitude annihilates the scaled score
+/// regardless of how precisely it was rounded beforehand) — see
+/// [`small_bias_mask_fixture`]'s doc. If `softmax_row_bf16`'s
+/// load-bearing intermediate rounding (`scaled =
+/// bf16::from_f32(scores[i].to_f32() * scale_bf.to_f32())`, rounded to
+/// BF16 BEFORE the mask add, not kept in F32 until after it) were
+/// silently dropped, every OTHER BF16 oracle in this file would still
+/// pass — this is the one that would not.
+///
+/// Uses `FullyMaskedPolicy::Propagate` (not `Zeros`): the small, signed
+/// `[-0.5, 0.5]` mask fixture is not the real masking alphabet, so a row
+/// that happens to land all-negative is not "fully masked" in the
+/// production sense — `Zeros`'s short-circuit would misfire on it and
+/// mask the very rounding behavior this test exists to observe. Uses
+/// [`head_dim_128_scale`] (irrational), not [`PRODUCTION_SCALE`]: `0.125`
+/// is an exact power of two, so `scores[i] * 0.125` is an EXACT BF16
+/// operation (a power-of-two multiply only shifts the exponent) with no
+/// rounding to relocate in the first place — this test needs a `scale`
+/// whose multiply genuinely rounds.
+///
+/// RED-verified: temporarily changing `softmax_row_bf16` to compute
+/// `bf16::from_f32(scores[i].to_f32() * scale_bf.to_f32() + mask[i].to_f32())`
+/// directly (keeping the product in F32 across the mask add, i.e.
+/// dropping the intermediate rounding this test defends) makes this
+/// assertion fail on this fixture, while every other test in this file
+/// (including the other BF16 legs above) still passes.
+#[test]
+fn softmax_scale_bf16_small_additive_mask_bit_exact_vs_affine_then_unscaled() {
+    let device = Device::Cpu;
+    let batch = 2;
+    let heads = 16;
+    let seq = 128;
+    let scale = head_dim_128_scale();
+    let sv = scale_scores_fixture(batch * heads * seq * seq);
+    let mv = small_bias_mask_fixture(batch, seq);
+    let sb: Vec<bf16> = sv.iter().map(|&v| bf16::from_f32(v)).collect();
+    let mb: Vec<bf16> = mv.iter().map(|&v| bf16::from_f32(v)).collect();
+    let scores = Tensor::from_slice(&sb, (batch, heads, seq, seq), &device).unwrap();
+    let mask = Tensor::from_slice(&mb, (batch, 1, seq, seq), &device).unwrap();
+
+    let fused_scaled =
+        softmax_scaled(&scores, &mask, FullyMaskedPolicy::Propagate, scale as f32).unwrap();
+    let affined = scores.affine(scale, 0.0).unwrap();
+    let affine_then_unscaled =
+        softmax_unscaled(&affined, &mask, FullyMaskedPolicy::Propagate).unwrap();
+
+    let a: Vec<bf16> = fused_scaled.flatten_all().unwrap().to_vec1().unwrap();
+    let b: Vec<bf16> = affine_then_unscaled
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert!(
+        a.iter().any(|v| v.to_f32().abs() > 1e-3),
+        "fixture must be non-degenerate"
+    );
+    assert_eq!(
+        a, b,
+        "BF16 small-additive-mask leg: fused-with-scale must be BIT-EXACT vs \
+         affine-then-fused-no-scale — a mismatch here means the intermediate \
+         rounding point (`scaled = bf16::from_f32(scores[i] * scale_bf)`, rounded \
+         BEFORE the mask add) moved"
     );
 }
 

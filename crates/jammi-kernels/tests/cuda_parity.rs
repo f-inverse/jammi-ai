@@ -1353,9 +1353,9 @@ fn softmax_parity_empty_batch() {
 }
 
 // =======================================================================
-// SoftmaxLastDimFused CPU<->CUDA parity: `scale` semantics (P1 of the
-// fused-kernels program — folding `1/sqrt(head_dim)` into this op; see
-// `ops/softmax.rs`'s module doc's "scale semantics" section). `scale =
+// SoftmaxLastDimFused CPU<->CUDA parity: `scale` semantics — folding
+// `1/sqrt(head_dim)` into this op; see `ops/softmax.rs`'s module doc's
+// "scale semantics" section. `scale =
 // 0.125` (`1/sqrt(64)`, ModernBERT-large's REAL `head_dim`) throughout —
 // an exact power of two, so the CPU<->CUDA comparison below is not
 // confounded by the `scale` field's own rounding (already proven exact
@@ -1420,11 +1420,21 @@ fn assert_softmax_scale_parity_f32(
 
     // Non-uniform dy (family F): `Tensor::backward()`'s implicit all-ones
     // seed makes `dscores = (dy - sum(dy*y)) * y` IDENTICALLY zero for
-    // every softmax row (`sum(y) == 1`) -- with a uniform seed, THIS
-    // parity check would still pass with `* scale` deleted from `bwd`
-    // entirely (both sides would compute the same all-zero `dscores`,
-    // proving nothing about the CUDA kernel's own `scale` arithmetic).
-    // Seed with a fixed non-uniform `dy` instead.
+    // every softmax row (`sum(y) == 1`) -- with a uniform seed, `dscores`
+    // would be an uninformative all-zero on BOTH devices, exercising
+    // nothing about `SoftmaxBwdDScores`'s CPU/CUDA numeric coupling.
+    // Note what this parity check can and cannot catch: `bwd`'s `* scale`
+    // multiply (`d_pre_softmax.affine(self.scale as f64, 0.0)`) is ONE
+    // Rust code path shared by both devices -- deleting it would move the
+    // CPU and CUDA arms of THIS check identically, so this comparison
+    // cannot detect that regression regardless of the `dy` seed. That
+    // check instead lives in `tests/oracles.rs`'s
+    // `softmax_scale_bwd_multiplies_raw_dscores_by_scale`, which compares
+    // against an INDEPENDENT reference graph rather than CPU-vs-CUDA. What
+    // a non-uniform seed on THIS check buys is a measurably-nonzero
+    // `dscores` that exercises `SoftmaxBwdDScores`'s own forward-y-coupled
+    // arithmetic (`(dy - sum(dy*y)) * y`) matching between the CPU and
+    // CUDA kernel implementations -- seed with a fixed non-uniform `dy`.
     let dy_seed = fixture(n, 6.0);
     let dy_cpu = Tensor::from_slice(&dy_seed, (rows, last), &cpu).unwrap();
     let dy_gpu = Tensor::from_slice(&dy_seed, (rows, last), cuda).unwrap();
@@ -1519,8 +1529,11 @@ fn assert_softmax_scale_parity_bf16(
     }
 
     // Non-uniform dy (family F): see `assert_softmax_scale_parity_f32`'s
-    // identical note -- an implicit all-ones seed would make this check
-    // pass vacuously even with `* scale` deleted from `bwd`.
+    // identical note -- this exercises `SoftmaxBwdDScores`'s forward-y
+    // coupling on a measurably-nonzero `dscores`, not the shared `* scale`
+    // multiply (which a CPU<->CUDA comparison cannot catch either way;
+    // that check lives in `tests/oracles.rs`'s
+    // `softmax_scale_bwd_multiplies_raw_dscores_by_scale`).
     let dy_seed_f = fixture(n, 6.0);
     let dy_seed_b: Vec<bf16> = dy_seed_f.iter().map(|&v| bf16::from_f32(v)).collect();
     let dy_cpu = Tensor::from_slice(&dy_seed_b, (rows, last), &cpu).unwrap();

@@ -1,0 +1,72 @@
+{
+  "_comment": "Same-box A/B record for the P1 softmax-scale-fold change (jammi_kernels::ops::softmax's SoftmaxLastDimFused::with_scale folding 1/sqrt(head_dim) into the fused softmax op). The two arms differ by EXACTLY ONE thing: `base` is the training arm BEFORE this change -- ModernBertAttention::forward built a `scores / sqrt(head_dim)` Op::Affine node (a full [batch, heads, seq, seq] retained tape tensor per layer) and then called the fused softmax with scale=1.0; `tip` is the training arm AFTER -- the same 1/sqrt(head_dim) folded directly into SoftmaxLastDimFused via with_scale, so that Op::Affine node is never constructed at all. Nothing else moved: same model config, same LoRA config, same dtype, same step/warmup/seed. peak_vram_bytes is the tier's device-total-minus-baseline (nvidia-smi/pool high-water mark across the whole run), NOT a live/allocator-delta reading -- the same convention documented in finetune_step_reference.json's own _comment. softmax_fused_dispatches/lora_epilogue_fused_dispatches are identical on both legs (700 and 2800 respectively, 0 eager fallbacks on either arm) because this change alters WHEN scale is applied, not WHETHER the fused softmax or LoRA epilogue kernels are admitted -- confirming the two arms really do differ only by the Affine-node removal, not by a change in kernel admission. Arithmetic check for the b8-s512-d0 delta (the row where the removed [B_eff, H, S, S] bf16 tensor is largest): B_eff = 24 is the batched-triplet effective leading dimension this LoRA config's batched-forward (r=16, alpha=32, targets Wqkv/Wo/Wi bf16, batched across the three targets) presents to the attention module, H = 16 heads, S = 512, 2 bytes/element (bf16), 28 layers (ModernBERT-large): 24 * 16 * 512 * 512 * 2 * 28 = 5,637,144,576 bytes = 5.64 GB, matching the measured peak_vram_bytes delta at that row (77,462,503,424 - 71,758,249,984 = 5,704,253,440 bytes = 5.70 GB) to within the same order of overhead (allocator fragmentation/other transient tensors) any single-node removal from a real training step carries -- this is a sanity check on the SIZE of the effect, not a claim of exact equality. RECORD, never gate (heterogeneous-fleet doctrine, same as finetune_step_reference.json).",
+  "provenance": {
+    "gpu": "NVIDIA A100-SXM4-80GB",
+    "session": "pod",
+    "date": "2026-08-24",
+    "rebuild": "clean",
+    "jammi_kernels_strict": true,
+    "base_ref": "0148973",
+    "base_disposition": "P1 absent (branch base: training arm builds an Op::Affine scores/sqrt(head_dim) node before calling the fused softmax with scale=1.0)",
+    "tip_ref": "bf8e807",
+    "tip_disposition": "P1 present (1/sqrt(head_dim) folded into SoftmaxLastDimFused via with_scale; no Op::Affine node built)",
+    "steps": 20,
+    "warmup": 5,
+    "seed": 42,
+    "lora_rank": 16,
+    "lora_alpha": 32,
+    "lora_targets": ["Wqkv", "Wo", "Wi"],
+    "dtype": "bf16",
+    "forward_mode": "batched-forward"
+  },
+  "rows": {
+    "b8-s128-d0": {
+      "base": {
+        "outcome": "ok",
+        "s_per_step_p50": 0.269567794,
+        "peak_vram_bytes": 23741857792.0,
+        "dispatch_counters": {
+          "softmax_fused_dispatches": 700,
+          "softmax_eager_dispatches": 0,
+          "lora_epilogue_fused_dispatches": 2800,
+          "lora_epilogue_eager_dispatches": 0
+        }
+      },
+      "tip": {
+        "outcome": "ok",
+        "s_per_step_p50": 0.267156648,
+        "peak_vram_bytes": 23775412224.0,
+        "dispatch_counters": {
+          "softmax_fused_dispatches": 700,
+          "softmax_eager_dispatches": 0,
+          "lora_epilogue_fused_dispatches": 2800,
+          "lora_epilogue_eager_dispatches": 0
+        }
+      }
+    },
+    "b8-s512-d0": {
+      "base": {
+        "outcome": "ok",
+        "s_per_step_p50": 1.078004373,
+        "peak_vram_bytes": 77462503424.0
+      },
+      "tip": {
+        "outcome": "ok",
+        "s_per_step_p50": 1.037705405,
+        "peak_vram_bytes": 71758249984.0
+      }
+    },
+    "b16-s128-d0": {
+      "base": {
+        "outcome": "ok",
+        "s_per_step_p50": 0.509359359,
+        "peak_vram_bytes": 33237762048.0
+      },
+      "tip": {
+        "outcome": "ok",
+        "s_per_step_p50": 0.504041552,
+        "peak_vram_bytes": 32566673408.0
+      }
+    }
+  }
+}

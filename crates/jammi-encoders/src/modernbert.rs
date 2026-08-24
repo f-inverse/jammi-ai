@@ -1697,17 +1697,23 @@ mod tests {
         assert_eq!(predicate, "mask_broadcast_class");
     }
 
-    /// Audit BLOCK finding, fixed: `scale` (the divisor `softmax_apply_training`
-    /// passes through, `1.0 / scale` being the value handed to
-    /// `SoftmaxLastDimFused::with_scale`) has a real domain (family D) --
-    /// `0.0`, negative, `NaN`, and `+inf` all produce a `1.0 / scale` this
-    /// op's own `with_scale` would refuse, and this predicate must catch
-    /// EVERY one of them here, at the call site, before ever reaching
-    /// `with_scale` -- a bad scale must become a counted eager fallback
-    /// (K2's doctrine), not a `KernelError` propagating out of the training
-    /// arm. `0.125` (`1/sqrt(64)`, ModernBERT-large's real head_dim) is the
-    /// positive control: it must be ACCEPTED, proving this clause does not
-    /// also reject the real production value.
+    /// `scale` (the divisor `softmax_apply_training` passes through, `1.0 /
+    /// scale` being the value handed to `SoftmaxLastDimFused::with_scale`)
+    /// has a real domain (family D) -- `0.0`, negative, `NaN`, and `+inf`
+    /// all produce a `1.0 / scale` this op's own `with_scale` would refuse,
+    /// and this predicate must catch EVERY one of them here, at the call
+    /// site, before ever reaching `with_scale`. In `AdmissionMode::Fallback`
+    /// (the default), a bad scale becomes a counted eager fallback (K2's
+    /// doctrine), not a `KernelError` propagating out of the training arm
+    /// -- this is scoped to `Fallback` deliberately: in
+    /// `AdmissionMode::Strict`, `admit` turns the SAME failed predicate
+    /// into `KernelError::StrictModeFallback`, which DOES propagate (see
+    /// `jammi_kernels::admission`'s own doc and tests), by design -- Strict
+    /// mode exists precisely so a failed predicate is observable as an
+    /// error rather than silently degrading. `0.125` (`1/sqrt(64)`,
+    /// ModernBERT-large's real head_dim) is the positive control: it must
+    /// be ACCEPTED, proving this clause does not also reject the real
+    /// production value.
     #[test]
     fn softmax_admission_predicate_scale_domain() {
         let device = Device::Cpu;
@@ -1911,9 +1917,11 @@ mod tests {
     /// still a NODE-COUNT PROXY for VRAM, not a byte measurement: one
     /// `[batch, heads, seq, seq]` node dropped from the tape is a real
     /// win in proportion to its own size, but this test does not, and
-    /// cannot, measure bytes. The actual byte measurement is the lead's
-    /// pod A/B (`seq = 512`: `77.46 GB -> 71.76 GB` peak training VRAM),
-    /// recorded separately from this CPU-hermetic test.
+    /// cannot, measure bytes. The actual byte measurement is the committed
+    /// pod A/B record,
+    /// `crates/jammi-bench/baselines/p1_softmax_scale_fold_ab.json`
+    /// (`seq = 512`: `77.46 GB -> 71.76 GB` peak training VRAM), recorded
+    /// separately from this CPU-hermetic test.
     ///
     /// BEFORE: reconstructs the composition an equivalent call site
     /// WITHOUT `scale` folded in would run (the `Op::Affine` division,

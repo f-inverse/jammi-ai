@@ -326,39 +326,47 @@ impl AffBlock {
 
 /// Tile `x` (`[N, C, H, W]`) into non-overlapping `kh × kw` blocks:
 /// `[N, C, OH, OW, kh, kw]`, via `narrow` (to the largest divisible prefix
-/// of each tiled dim) followed by `unfold`.
+/// of each tiled dim) followed by a `reshape` + `permute`.
 ///
 /// Any tail narrower than `kh`/`kw` is dropped, exactly as a strided conv
 /// with `stride == kernel` would drop it — narrowing to `floor(dim/size) *
-/// size` BEFORE unfolding makes that drop explicit instead of leaving it
-/// implicit in `unfold`'s own window-count arithmetic, and matters for
-/// BACKWARD, not forward: candle registers `unfold`'s backward as a plain
-/// `Op::Reshape` (candle-core-0.11.0 `tensor.rs:2931-2969` constructs the
-/// unfolded view with `op: BackpropOp::new1(self, Op::Reshape)`; its
-/// backward, `backprop.rs:602-606`, does `let arg_grad = grad.reshape(arg.dims())?`).
-/// `Tensor::reshape` requires equal element counts on both sides
-/// (`tensor.rs:2523-2531`, `Error::ShapeMismatchBinaryOp`) — true only when
-/// `unfold`'s `size` evenly divides the dim it unfolds. On a non-dividing
-/// dim, `unfold` drops a tail (its output holds FEWER elements than its
-/// input), and `grad.reshape(arg.dims())` errors rather than padding the
-/// missing tail with zero gradient (see
-/// [`tests::unfold_backward_is_a_plain_reshape_in_candle`], the premise-pin
-/// for this exact candle behavior). Narrowing first makes forward drop
-/// nothing `unfold` wasn't already going to drop (`unfold` only ever reads
-/// the same `floor(dim/size) * size` prefix regardless — see
-/// [`tests::tile_nonoverlapping_is_forward_bit_identical_to_unfold_without_narrow_first`]),
-/// while making the narrowed dim's own element count match what `unfold`
-/// reads exactly, so `unfold`'s `Op::Reshape` backward is well-defined:
-/// `narrow`'s own backward correctly zero-pads the dropped tail's gradient
-/// (a true zero, since that tail never contributed to the output), where
-/// `unfold`'s naive `Op::Reshape` backward on the un-narrowed tensor would
-/// have simply errored instead.
+/// size` first makes both the forward tiling AND its gradient exact: the
+/// narrowed tensor reshapes losslessly to `[N, C, OH, kh, OW, kw]` (its
+/// element count already matches, since every axis is now an exact
+/// multiple of its tile size), and `permute((0, 1, 2, 4, 3, 5))` reorders
+/// the `kw` axis ahead of `OW` to land on `[N, C, OH, OW, kh, kw]`. Both
+/// `reshape` and `permute` have exact, structural backward passes in
+/// candle (a reshape's backward is the inverse reshape; a permute's
+/// backward is the inverse permute), so gradient flows back through every
+/// element at the position it actually came from — unlike `Tensor::unfold`,
+/// whose backward is registered as a single flat `Op::Reshape`
+/// (candle-core-0.11.0 `tensor.rs:2931-2969` builds the unfolded view with
+/// `op: BackpropOp::new1(self, Op::Reshape)`; its backward,
+/// `backprop.rs:602-606`, does `let arg_grad = grad.reshape(arg.dims())?`)
+/// regardless of which dim is unfolded. That flat reshape is only a valid
+/// gradient when the unfolded dim is the tensor's LAST dim (unfolding dim 2
+/// of a 4-D tensor into a NEW trailing dim, as `mel_conv2d` does twice in a
+/// row, permutes elements between the reshape's input and output layout —
+/// `grad.reshape(arg.dims())` silently reinterprets the flat buffer under
+/// the wrong strides instead of scattering each gradient element back to
+/// its source position). PyTorch's own `Tensor.unfold` backward
+/// (`aten/src/ATen/native/UnfoldBackward.cpp`, `unfold_backward`) is a true
+/// scatter for exactly this reason — the semantics this tiling reproduces
+/// with `reshape`/`permute`, whose backward passes are correct scatters by
+/// construction, avoids depending on candle's unfold backward at all. See
+/// [`tests::unfold_backward_is_a_plain_reshape_in_candle`] for the
+/// premise-pin on candle's flat-reshape behavior, and
+/// [`tests::unfold_backward_on_a_non_last_dim_is_wrong_but_finite`] for the
+/// pin on the permutation failure this function avoids. Forward stays
+/// bit-identical to the old unfold-based tiling — see
+/// [`tests::tile_nonoverlapping_is_forward_bit_identical_to_unfold_without_narrow_first`].
 fn tile_nonoverlapping(x: &Tensor, kh: usize, kw: usize) -> Result<Tensor, EncoderError> {
-    let (_n, _c, h, w) = x.dims4()?;
-    let h_used = (h / kh) * kh;
-    let w_used = (w / kw) * kw;
-    let x = x.narrow(2, 0, h_used)?.narrow(3, 0, w_used)?;
-    Ok(x.unfold(2, kh, kh)?.unfold(3, kw, kw)?)
+    let (n, c, h, w) = x.dims4()?;
+    let (oh, ow) = (h / kh, w / kw);
+    let x = x.narrow(2, 0, oh * kh)?.narrow(3, 0, ow * kw)?;
+    Ok(x.contiguous()?
+        .reshape((n, c, oh, kh, ow, kw))?
+        .permute((0, 1, 2, 4, 3, 5))?)
 }
 
 /// HTSAT patch embedding under fusion.
@@ -1404,22 +1412,9 @@ impl HtsatAudio {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::deterministic_fill_varmap;
+    use crate::test_support::{deterministic_fill_varmap, find_var, nonuniform_loss};
     use candle_core::{DType, Device, Var};
     use candle_nn::VarMap;
-
-    /// Locate the [`Var`] whose VarMap key ends with `suffix`.
-    fn find_var(varmap: &VarMap, suffix: &str) -> Var {
-        let data = varmap.data().lock().unwrap();
-        data.iter()
-            .find(|(k, _)| k.ends_with(suffix))
-            .unwrap_or_else(|| {
-                let keys: Vec<_> = data.keys().collect();
-                panic!("no var with suffix '{suffix}' in varmap; keys: {keys:?}")
-            })
-            .1
-            .clone()
-    }
 
     /// Deterministic `[rows, cols]` tensor via the same LCG, wide enough
     /// (`[-10, 10)`) to exercise the softmax max-shift and window-mask paths.
@@ -1434,15 +1429,6 @@ mod tests {
             })
             .collect();
         Tensor::from_vec(values, (rows, cols), device).unwrap()
-    }
-
-    /// Non-uniform per-channel weights so `loss = (out * weights).sum()`
-    /// cannot accidentally cancel a broken gradient reduction the way a
-    /// uniform-weight sum could.
-    fn nonuniform_loss(out: &Tensor, channels: usize, device: &Device) -> Tensor {
-        let weights: Vec<f32> = (0..channels).map(|i| 1.0 + i as f32 * 0.37).collect();
-        let weights = Tensor::from_vec(weights, channels, device).unwrap();
-        out.broadcast_mul(&weights).unwrap().sum_all().unwrap()
     }
 
     /// A minimal config exercising a `SwinStage` directly: `window_size=2`
@@ -1623,27 +1609,14 @@ mod tests {
 
     /// Run the REAL front half (`HtsatAudioEncoder::forward_front`, public —
     /// batch-norm → bicubic time-resample → `reshape_mel2img` → the fused
-    /// `patch_embed`, exercising BOTH the global-conv and the
-    /// `mel_conv2d`/AFF-fusion local branch when `is_longer[i]` is `true`),
-    /// then the full Swin spine (`forward_spine`, public), returning the
-    /// pooled descriptor.
-    ///
-    /// This replaces an earlier detour (`run_front_global_conv_only_and_spine`)
-    /// that bypassed `mel_conv2d` entirely: before [`tile_nonoverlapping`]'s
-    /// narrow-before-unfold fix, `mel_conv2d`'s width unfold
-    /// (`spec_size=128`, `kw=patch_size*3=12`, non-dividing — see
-    /// [`tests::tile_nonoverlapping_is_forward_bit_identical_to_unfold_without_narrow_first`])
-    /// made backward through the fused branch error out
-    /// (`tests::mel_conv2d_backward_reaches_conv_weight_through_the_fused_patch_embed_path`'s
-    /// doc has the exact pre-fix failure signature), so the global-conv-only
-    /// detour was the only way to exercise this unit's softmax/LayerNorm
-    /// claim without ALSO tripping that separate, orthogonal limitation.
-    /// With `mel_conv2d`'s tiling fixed, the real front half is now strictly
-    /// more coverage (it still exercises the global-conv path — `proj` runs
+    /// `patch_embed`, exercising BOTH the global-conv path (`proj` runs
     /// unconditionally inside `HtsatPatchEmbed::forward` regardless of
-    /// `is_longer` — plus the fused local branch this detour excluded), so
-    /// the detour added no further coverage and was removed rather than
-    /// kept alongside this.
+    /// `is_longer`) and the `mel_conv2d`/AFF-fusion local branch when
+    /// `is_longer[i]` is `true`), then the full Swin spine (`forward_spine`,
+    /// public), returning the pooled descriptor. With `mel_conv2d`'s tiling
+    /// backward-sound (see [`tile_nonoverlapping`]), this is the full
+    /// production composition — no caller of this helper needs to route
+    /// around the fused local branch.
     fn run_front_and_spine(tower: &HtsatAudio, input: &Tensor, is_longer: &[bool]) -> Spine {
         let encoder = tower.encoder();
         let front = encoder.forward_front(input, is_longer).unwrap();
@@ -1655,25 +1628,27 @@ mod tests {
 
     /// End-to-end RED oracle through the REAL front half (`is_longer=[true]`,
     /// exercising the fused `mel_conv2d`/AFF path — see
-    /// [`run_front_and_spine`]'s doc for why this no longer needs a
-    /// global-conv-only detour) and the full Swin spine. With BOTH the
+    /// [`run_front_and_spine`]'s doc) and the full Swin spine. With BOTH the
     /// attention-softmax arm and every `LayerNorm` (patch-embed norm,
     /// `layernorm_before`/`after` and `PatchMerging::norm` per stage, the
     /// encoder's final norm) gated on `training`, AND `mel_conv2d`'s tiling
-    /// made backward-sound, backward through the pooled descriptor reaches
-    /// the patch-embed conv, `mel_conv2d`'s own conv weight, layer-0 Q/K,
-    /// and EVERY stage/block's `rel_bias_table` — all 4 stages, all
-    /// `sum(depths)=8` blocks. Fails if any of the THREE independent fixes
-    /// regresses: reverting the softmax arm leaves every `rel_bias_table`
-    /// severed the same way the eval companion below shows; reverting the
-    /// final norm's gate severs backward before it reaches ANY stage (the
-    /// patch-embed conv assertion fails first); reverting
-    /// [`tile_nonoverlapping`]'s narrow-before-unfold makes `loss.backward()`
-    /// itself return `Err` before any assertion runs at all (a louder
-    /// failure than the other two, but still this same test). This is the
-    /// shape a real training loop would have hit: no error, just gradients
-    /// that silently never update anything (or, pre-`tile_nonoverlapping`,
-    /// backward outright refusing to run at all on the fused path).
+    /// backward-sound (its own reshape/permute have exact scatter
+    /// backward passes — see [`tile_nonoverlapping`]), backward through the
+    /// pooled descriptor reaches the patch-embed conv, `mel_conv2d`'s own
+    /// conv weight, layer-0 Q/K, and EVERY stage/block's `rel_bias_table` —
+    /// all 4 stages, all `sum(depths)=8` blocks. Fails if any of the THREE
+    /// independent invariants regresses: reverting the softmax arm leaves
+    /// every `rel_bias_table` severed the same way the eval companion below
+    /// shows; reverting the final norm's gate severs backward before it
+    /// reaches ANY stage (the patch-embed conv assertion fails first);
+    /// reverting [`tile_nonoverlapping`] to a plain `unfold` either errors
+    /// `loss.backward()` outright (the non-dividing case) or SUCCEEDS with a
+    /// silently-permuted gradient (a dividing case, or any case where
+    /// candle's flat-reshape backward happens not to error) — this test
+    /// alone cannot distinguish "wrong but finite" from "correct"; see
+    /// [`tests::mel_conv2d_gradient_matches_the_hand_built_scatter_at_production_geometry`]
+    /// for the oracle that catches the wrong-gradient failure mode this one
+    /// cannot.
     #[test]
     fn training_true_full_forward_reaches_every_parameter() {
         let device = Device::Cpu;
@@ -1696,7 +1671,7 @@ mod tests {
             "mel_conv2d.weight grad must be Some under training=true through the full forward \
              (the fused/AFF local branch, is_longer=true) — this is the assertion that FAILS \
              (loss.backward() itself returns Err before reaching it) without \
-             tile_nonoverlapping's narrow-before-unfold fix",
+             tile_nonoverlapping's backward-sound reshape/permute tiling",
         );
         let mel_conv_norm = grad_norm(mel_conv_grad);
         assert!(
@@ -1822,6 +1797,75 @@ mod tests {
         }
     }
 
+    /// Deletion-catching oracle for [`SwinBlock`]'s residual-stream
+    /// LayerNorms themselves (`layernorm_before`/`layernorm_after`, layer-0
+    /// block-0): every OTHER gradient assertion above reaches its target
+    /// parameter through the block's residual bypass (`shortcut + attn` /
+    /// `hidden + mlp_out` in [`SwinBlock::forward`]), so a dropped
+    /// `self.layernorm_before.set_training(training)` /
+    /// `self.layernorm_after.set_training(training)` line — leaving that
+    /// ONE LayerNorm stuck on its fused, `BackpropOp::none()`-truncated
+    /// eval arm even with the rest of the tower `training=true` — would
+    /// NOT be caught by any test above: the residual path still carries a
+    /// gradient to `mel_conv2d.weight`/`query.weight`/`rel_bias_table`
+    /// regardless of `layernorm_before`/`layernorm_after`'s own truncation
+    /// (this is the SAME shape as `training_false_full_forward_grads_are_none_before_final_norm`'s
+    /// note that the encoder's final norm is a SEPARATE truncation from
+    /// this one). This test asserts `layernorm_before`/`layernorm_after`'s
+    /// OWN `weight` — not anything upstream — through the full public
+    /// forward: `Some`/finite/nonzero under `training=true`, `None` under
+    /// `training=false`. RED-verified: deleting
+    /// `self.layernorm_before.set_training(training)` from
+    /// `SwinBlock::set_training` flips the training=true half of this test
+    /// (`layernorm_before.weight` comes back `None` instead of `Some`)
+    /// while every other test in this file stays green.
+    #[test]
+    fn layernorm_before_and_after_own_weight_gradient_present_under_training_absent_under_eval() {
+        let device = Device::Cpu;
+
+        for name in [
+            "layers.0.blocks.0.layernorm_before.weight",
+            "layers.0.blocks.0.layernorm_after.weight",
+        ] {
+            let training_grad = {
+                let varmap = VarMap::new();
+                let (mut tower, cfg, input) = build_full_tower_and_input(&varmap, &device, 303);
+                tower.set_training(true);
+                let spine = run_front_and_spine(&tower, &input, &[true]);
+                let loss = nonuniform_loss(&spine.pooler_out, cfg.hidden_size, &device);
+                let grads = loss.backward().unwrap();
+                let var = find_var(&varmap, name);
+                grads.get(var.as_tensor()).cloned()
+            };
+            let grad = training_grad
+                .unwrap_or_else(|| panic!("{name} grad must be Some under training=true"));
+            let norm = grad_norm(&grad);
+            assert!(
+                norm.is_finite(),
+                "{name} grad norm must be finite under training=true, got {norm}"
+            );
+            assert!(
+                norm > 0.0,
+                "{name} grad norm must be nonzero under training=true, got {norm}"
+            );
+
+            let eval_grad = {
+                let varmap = VarMap::new();
+                let (tower, cfg, input) = build_full_tower_and_input(&varmap, &device, 303);
+                // training defaults to false; forward without calling set_training.
+                let spine = run_front_and_spine(&tower, &input, &[true]);
+                let loss = nonuniform_loss(&spine.pooler_out, cfg.hidden_size, &device);
+                let grads = loss.backward().unwrap();
+                let var = find_var(&varmap, name);
+                grads.get(var.as_tensor()).cloned()
+            };
+            assert!(
+                eval_grad.is_none(),
+                "{name} grad must be None under training=false"
+            );
+        }
+    }
+
     /// Direct, isolated backward test for [`HtsatPatchEmbed::forward`]'s
     /// fused (`is_longer=true`) branch reaching `mel_conv2d`'s own conv
     /// weight — narrower than the full-tower oracle above (stops at
@@ -1891,6 +1935,158 @@ mod tests {
         );
     }
 
+    /// Gradient-VALUE oracle (a): central finite differences on a small
+    /// non-dividing fixture prove [`tile_nonoverlapping`]'s analytic
+    /// gradient is not just finite and nonzero but numerically CORRECT —
+    /// the oracle the old unfold-based tiling never had. `tile_nonoverlapping`
+    /// is a pure linear map of `x` (narrow, reshape, permute — no
+    /// nonlinearity anywhere), so `loss = sum(w * tile(x))` for a
+    /// non-uniform `w` is exactly linear in `x`: central differences have
+    /// ZERO truncation error here (unlike a general nonlinear function),
+    /// so a tight tolerance is legitimate — any residual gap is purely
+    /// f32 rounding. `[1, 1, 8, 9]`, `kh=2, kw=3`: both `8 / 2` and `9 / 3`
+    /// divide exactly (no dropped tail); the dropped-tail case is covered
+    /// separately by the production-geometry scatter oracle below, which
+    /// does not check EVERY element (72x more elements) the way this one
+    /// does.
+    #[test]
+    fn tile_nonoverlapping_gradient_matches_central_finite_differences() {
+        let device = Device::Cpu;
+        let (n, c, h, w) = (1usize, 1usize, 8usize, 9usize);
+        let (kh, kw) = (2usize, 3usize);
+        let numel = n * c * h * w;
+
+        let mut state: u32 = 3;
+        let mut next = || {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            ((state >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 4.0 // [-2, 2)
+        };
+        let x_vals: Vec<f32> = (0..numel).map(|_| next()).collect();
+
+        let (oh, ow) = (h / kh, w / kw);
+        let tile_numel = n * c * oh * ow * kh * kw;
+        let w_vals: Vec<f32> = (0..tile_numel).map(|_| next()).collect();
+
+        let loss_value = |xs: &[f32]| -> f32 {
+            let x = Tensor::from_vec(xs.to_vec(), (n, c, h, w), &device).unwrap();
+            let tiled = tile_nonoverlapping(&x, kh, kw).unwrap();
+            let weights = Tensor::from_vec(w_vals.clone(), tiled.dims().to_vec(), &device).unwrap();
+            (&tiled * &weights)
+                .unwrap()
+                .sum_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap()
+        };
+
+        let xv =
+            Var::from_tensor(&Tensor::from_vec(x_vals.clone(), (n, c, h, w), &device).unwrap())
+                .unwrap();
+        let tiled = tile_nonoverlapping(xv.as_tensor(), kh, kw).unwrap();
+        let weights = Tensor::from_vec(w_vals.clone(), tiled.dims().to_vec(), &device).unwrap();
+        let loss = (&tiled * &weights).unwrap().sum_all().unwrap();
+        let grads = loss.backward().unwrap();
+        let analytic: Vec<f32> = grads
+            .get(xv.as_tensor())
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        let eps = 1e-2f32;
+        for i in 0..numel {
+            let mut plus = x_vals.clone();
+            plus[i] += eps;
+            let mut minus = x_vals.clone();
+            minus[i] -= eps;
+            let fd = (loss_value(&plus) - loss_value(&minus)) / (2.0 * eps);
+
+            let diff = (analytic[i] - fd).abs();
+            let tol = 1e-4 * fd.abs().max(1.0); // relative-with-floor.
+            assert!(
+                diff <= tol,
+                "element {i}: analytic grad {} vs central-difference {fd} differ by {diff} \
+                 (tol {tol})",
+                analytic[i]
+            );
+        }
+    }
+
+    /// Gradient-VALUE oracle (b): at the exact production geometry
+    /// (`[3, 1, 128, 128]`, `kh=4, kw=12` — `mel_conv2d`'s real shape, see
+    /// `config_parity_with_fixture`), [`tile_nonoverlapping`]'s analytic
+    /// gradient must equal a hand-built scatter: `dx[n, c, oh*kh+i, ow*kw+j]
+    /// = w[n, c, oh, ow, i, j]` for every retained element, and exactly
+    /// `0.0` for the dropped 8-column tail (`w=128`, `kw=12`,
+    /// `128 / 12 = 10` windows, columns `120..128` never read; `h=128`,
+    /// `kh=4` divides exactly, so height has no dropped tail). This is a
+    /// pure scatter — every retained `x` element contributes to EXACTLY
+    /// one tile slot, so there is no floating-point accumulation to give
+    /// tolerance to: `assert_eq!` on the f32 values is the correct
+    /// comparison here, not an approximation.
+    #[test]
+    fn mel_conv2d_gradient_matches_the_hand_built_scatter_at_production_geometry() {
+        let device = Device::Cpu;
+        let (n, c, h, w) = (3usize, 1usize, 128usize, 128usize);
+        let (kh, kw) = (4usize, 12usize);
+        let (oh, ow) = (h / kh, w / kw);
+
+        let x_vals = deterministic_tensor(n * c * h, w, 71, &device)
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let tile_numel = n * c * oh * ow * kh * kw;
+        // Bounded, non-uniform weights (not the unbounded `1.0 + i*0.37`
+        // idiom used elsewhere — at this element count that would reach
+        // into the tens of thousands and lose f32 precision).
+        let w_vals: Vec<f32> = (0..tile_numel)
+            .map(|i| 1.0 + (i % 97) as f32 * 0.013)
+            .collect();
+
+        let xv =
+            Var::from_tensor(&Tensor::from_vec(x_vals, (n, c, h, w), &device).unwrap()).unwrap();
+        let tiled = tile_nonoverlapping(xv.as_tensor(), kh, kw).unwrap();
+        let weights = Tensor::from_vec(w_vals.clone(), (n, c, oh, ow, kh, kw), &device).unwrap();
+        let loss = (&tiled * &weights).unwrap().sum_all().unwrap();
+        let grads = loss.backward().unwrap();
+        let analytic: Vec<f32> = grads
+            .get(xv.as_tensor())
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        let mut expected = vec![0f32; n * c * h * w];
+        for ni in 0..n {
+            for ci in 0..c {
+                for ohi in 0..oh {
+                    for owi in 0..ow {
+                        for i in 0..kh {
+                            for j in 0..kw {
+                                let src_h = ohi * kh + i;
+                                let src_w = owi * kw + j;
+                                let x_idx = ((ni * c + ci) * h + src_h) * w + src_w;
+                                let wt_idx =
+                                    ((((ni * c + ci) * oh + ohi) * ow + owi) * kh + i) * kw + j;
+                                expected[x_idx] = w_vals[wt_idx];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        assert_eq!(
+            analytic, expected,
+            "tile_nonoverlapping's gradient at the production geometry must exactly equal the \
+             hand-built scatter (element-for-element — this is a pure copy, no arithmetic \
+             accumulation, so bit-exact equality is the correct comparison)"
+        );
+    }
+
     /// Pre-fix tiling: `unfold` applied directly, with no `narrow` first —
     /// reproduces exactly what `mel_conv2d` did before [`tile_nonoverlapping`]
     /// existed. Used only to prove the fix's forward stays bit-identical.
@@ -1899,21 +2095,22 @@ mod tests {
     }
 
     /// Forward bit-identity oracle: [`tile_nonoverlapping`]'s
-    /// narrow-then-unfold must read the IDENTICAL elements as unfolding
-    /// directly with no narrow, on the exact non-dividing shape
-    /// `mel_conv2d` hits in production (`spec_size=128`,
+    /// narrow-then-reshape-then-permute tiling must read the IDENTICAL
+    /// elements as `unfold` did (the pre-fix tiling), on the exact
+    /// non-dividing shape `mel_conv2d` hits in production (`spec_size=128`,
     /// `kw=patch_size*3=12`; see `config_parity_with_fixture` for where
     /// these numbers come from — `128 / 12 = 10` windows, an 8-wide tail
-    /// dropped either way). This is the oracle behind
-    /// `golden_parity`'s 6/6 staying green across this fix: `unfold`
-    /// already only ever reads the same `floor(dim/size) * size` prefix
-    /// regardless of whether that prefix is narrowed first, so narrowing
-    /// changes nothing about which elements FORWARD reads — only whether
-    /// BACKWARD is well-defined.
+    /// dropped either way; `n=3` matches the fused patch-embed's local
+    /// branch, `patch_embed_input_channels=3` local channels folded into
+    /// the batch axis). This is the oracle behind `golden_parity`'s 6/6
+    /// staying green across this fix: both tilings only ever read the same
+    /// `floor(dim/size) * size` prefix, so changing HOW that prefix is
+    /// reshaped into tiles changes nothing about which elements FORWARD
+    /// reads — only whether BACKWARD is exact.
     #[test]
     fn tile_nonoverlapping_is_forward_bit_identical_to_unfold_without_narrow_first() {
         let device = Device::Cpu;
-        let (n, c, h, w) = (2usize, 1usize, 128usize, 128usize);
+        let (n, c, h, w) = (3usize, 1usize, 128usize, 128usize);
         let (kh, kw) = (4usize, 12usize);
         let x = deterministic_tensor(n * c * h, w, 55, &device)
             .reshape((n, c, h, w))
@@ -1925,7 +2122,7 @@ mod tests {
         assert_eq!(
             narrowed.dims(),
             direct.dims(),
-            "narrow-then-unfold and unfold-only must tile to the identical shape"
+            "reshape/permute tiling and unfold-only must tile to the identical shape"
         );
         let a: Vec<f32> = narrowed
             .contiguous()
@@ -1943,21 +2140,22 @@ mod tests {
             .unwrap();
         assert_eq!(
             a, b,
-            "narrow-then-unfold must read the identical elements as unfold alone (the \
+            "reshape/permute tiling must read the identical elements as unfold alone (the \
              dropped-tail, non-dividing case)"
         );
     }
 
     /// Premise-pin (the repo idiom for a documented upstream limitation,
     /// e.g. `jammi-kernels`' `cpu_matmul_still_cannot_do_bf16`): pins the
-    /// exact candle-core behavior [`tile_nonoverlapping`]'s
-    /// narrow-before-unfold works around, so a future candle upgrade that
-    /// fixes `unfold`'s backward on a non-dividing dim flips THIS test red
-    /// — a loud signal that the workaround may now be removable — instead
-    /// of silently leaving it unexplained and untested. See
-    /// `tile_nonoverlapping`'s own doc for the exact candle-core source
-    /// citations this pins (`tensor.rs:2931-2969`, `backprop.rs:602-606`,
-    /// `tensor.rs:2523-2531`).
+    /// exact candle-core behavior that makes `Tensor::unfold`'s backward
+    /// unsafe to depend on directly — a flat `Op::Reshape` regardless of
+    /// which dim was unfolded (see [`tile_nonoverlapping`]'s own doc for
+    /// the exact candle-core source citations this pins,
+    /// `tensor.rs:2931-2969`, `backprop.rs:602-606`, `tensor.rs:2523-2531`)
+    /// — so a future candle upgrade that fixes `unfold`'s backward flips
+    /// THIS test red, a loud signal that `tile_nonoverlapping` could go
+    /// back to `unfold` directly, instead of silently leaving the
+    /// workaround unexplained and untested.
     #[test]
     fn unfold_backward_is_a_plain_reshape_in_candle() {
         let device = Device::Cpu;
@@ -1970,15 +2168,80 @@ mod tests {
         let loss = tiled.sum_all().unwrap();
         let err = loss.backward().expect_err(
             "unfold's backward on a non-dividing dim must still error today (the candle \
-             premise tile_nonoverlapping's narrow-before-unfold depends on) — if this now \
-             succeeds, candle may have fixed unfold's backward and the workaround may be \
-             removable",
+             premise this crate avoids depending on) — if this now succeeds, candle may have \
+             fixed unfold's backward",
         );
         let msg = err.to_string();
         assert!(
             msg.contains("shape mismatch") && msg.contains("reshape"),
             "expected candle's reshape-shape-mismatch error from unfold's Op::Reshape backward; \
              got: {msg}"
+        );
+    }
+
+    /// Premise-pin, companion to [`unfold_backward_is_a_plain_reshape_in_candle`]:
+    /// on a NON-last-dim unfold whose size evenly divides the unfolded dim
+    /// (so `grad.reshape(arg.dims())` does NOT error — the element counts
+    /// match), candle's backward still returns a WRONG gradient, silently.
+    /// `x` is `[4, 2]`; `x.unfold(0, 2, 2)` unfolds dim 0 (NOT `x`'s last
+    /// dim, which is dim 1) into a new trailing dim, giving `[2, 2, 2]`
+    /// (`windows, orig_dim1, in_window`) — structurally the same shape as
+    /// `tile_nonoverlapping`'s width-then-height unfold chain, just 2-D
+    /// instead of 4-D. `loss = sum(w * unfold(x))` for a distinct-valued
+    /// `w` backward-succeeds (8 elements both sides), but the resulting
+    /// `x` gradient does NOT match the hand-derived correct gradient
+    /// `dx[row, col] = w[row / 2, col, row % 2]` (derived from unfold's own
+    /// FORWARD index arithmetic, `tensor.rs:2931-2969`) at 4 of its 8
+    /// positions — this is the exact silent-wrong-gradient failure mode
+    /// [`tile_nonoverlapping`]'s width/height unfold chain was exposed to
+    /// before it moved to `reshape`/`permute` (whose backward passes are
+    /// exact scatters, not a flat reshape). If this test ever starts
+    /// PASSING (the two grads agreeing), candle has fixed unfold's backward
+    /// to account for which dim was unfolded, and the day this happens is
+    /// the day `tile_nonoverlapping` could safely go back to `unfold`.
+    #[test]
+    fn unfold_backward_on_a_non_last_dim_is_wrong_but_finite() {
+        let device = Device::Cpu;
+        let x_vals: Vec<f32> = (0..8).map(|i| i as f32).collect();
+        let xv = Var::from_tensor(&Tensor::from_vec(x_vals, (4, 2), &device).unwrap()).unwrap();
+        let tiled = xv.as_tensor().unfold(0, 2, 2).unwrap(); // [2, 2, 2]; dim 0, not the last dim.
+
+        let w_vals: Vec<f32> = (1..=8).map(|i| i as f32).collect();
+        let w = Tensor::from_vec(w_vals.clone(), (2, 2, 2), &device).unwrap();
+        let loss = (&tiled * &w).unwrap().sum_all().unwrap();
+        let grads = loss.backward().expect(
+            "this dividing case must NOT error (element counts match: 8 both sides) — the \
+             point of this pin is that candle's naive reshape backward succeeds here, silently, \
+             with the wrong answer, unlike the non-dividing case above which errors loudly",
+        );
+        let got: Vec<f32> = grads
+            .get(xv.as_tensor())
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        let w_at = |window: usize, col: usize, in_window: usize| {
+            w_vals[(window * 2 + col) * 2 + in_window]
+        };
+        let mut correct = vec![0f32; 8];
+        for row in 0..4 {
+            for col in 0..2 {
+                correct[row * 2 + col] = w_at(row / 2, col, row % 2);
+            }
+        }
+
+        assert_ne!(
+            got, correct,
+            "candle's unfold backward on a non-last dim is expected to be WRONG (see this \
+             test's doc) — if it now matches the hand-derived correct gradient, candle has \
+             fixed this and the premise this test pins no longer holds"
+        );
+        assert!(
+            got.iter().all(|v| v.is_finite()),
+            "candle's wrong gradient here must still be FINITE (not NaN/Inf) — the whole point \
+             is that it is a SILENT wrong answer, not a loud failure: got {got:?}"
         );
     }
 

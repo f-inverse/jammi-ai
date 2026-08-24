@@ -308,8 +308,8 @@ impl ClipText {
     /// Switch every block's attention softmax AND every LayerNorm (`ln_1`,
     /// `ln_2` per block, plus `ln_final`) between the eval (no-backward) arm
     /// and the differentiable composed arm — see
-    /// [`MultiHeadAttention::forward`]'s doc for the softmax truncation and
-    /// [`crate::layer_norm::LayerNorm`]'s module doc for the identical
+    /// `MultiHeadAttention::forward`'s doc for the softmax truncation and
+    /// `crate::layer_norm::LayerNorm`'s module doc for the identical
     /// `BackpropOp::none()` truncation in `candle_nn::LayerNorm`'s own fast
     /// path. Both are load-bearing together: before `ln_final` was gated,
     /// backward through the tower's public `forward` truncated at `ln_final`

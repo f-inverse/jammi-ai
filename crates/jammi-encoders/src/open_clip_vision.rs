@@ -5,14 +5,14 @@
 //! CLS-token pooling, selected by `global_average_pool`.
 //!
 //! The attention softmax goes through
-//! [`crate::attention::attention_softmax`]; the fused-QKV `MultiHeadAttention`
+//! `crate::attention::attention_softmax`; the fused-QKV `MultiHeadAttention`
 //! is the SAME struct [`crate::clip_text`]'s text tower shares (parameterised
 //! by an optional causal mask —
-//! [`crate::attention::MultiHeadAttention::forward`]'s doc); every
-//! `candle_nn::LayerNorm` is [`crate::layer_norm::LayerNorm`] (which has its
+//! `crate::attention::MultiHeadAttention::forward`'s doc); every
+//! `candle_nn::LayerNorm` is `crate::layer_norm::LayerNorm` (which has its
 //! own bias-free/training gradient oracle —
 //! `crate::layer_norm::tests::fused_training_path_matches_slow_within_tolerance_fwd_and_bwd`);
-//! and `quick_gelu` is the single shared [`crate::activations::quick_gelu`].
+//! and `quick_gelu` is the single shared `crate::activations::quick_gelu`.
 
 use candle_core::{IndexOp, Module, Tensor};
 use candle_nn::{conv2d_no_bias, Conv2d, Conv2dConfig, VarBuilder};
@@ -319,11 +319,11 @@ impl OpenClipVisionTransformer {
     /// Sets whether attention backward walks through the differentiable
     /// softmax composition (`true`) or the fast fused kernel that truncates
     /// backward (`false`, the default from `load`) — see
-    /// [`crate::attention::attention_softmax`]'s module doc for why the two
+    /// `crate::attention::attention_softmax`'s module doc for why the two
     /// arms exist and produce bit-identical eval output on CPU. Also
     /// switches every `LayerNorm` (`ln_pre`, `ln_1`/`ln_2` per block,
     /// `ln_post`) between the eval (no-backward) arm and the differentiable
-    /// composed arm — see [`crate::layer_norm::LayerNorm`]'s module doc for
+    /// composed arm — see `crate::layer_norm::LayerNorm`'s module doc for
     /// the identical `BackpropOp::none()` truncation `candle_nn::LayerNorm`'s
     /// own fast path has. Propagates to every block's attention sublayer and
     /// both norms this method doesn't own directly.

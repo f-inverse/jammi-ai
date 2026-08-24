@@ -1394,7 +1394,7 @@ impl HtsatAudio {
 
     /// Switch every Swin block's attention softmax between the eval
     /// (no-backward) arm and the differentiable composed arm — see
-    /// [`SwinSelfAttention::forward`]'s doc for why the two arms exist. Eval
+    /// `SwinSelfAttention::forward`'s doc for why the two arms exist. Eval
     /// output is unaffected either way; only backward through this tower's
     /// gradient (most visibly `rel_bias_table`, which otherwise gets no
     /// gradient at all) is correct in training mode.

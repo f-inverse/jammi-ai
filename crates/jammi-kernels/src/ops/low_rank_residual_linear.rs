@@ -215,6 +215,36 @@
 //! refusal (counted eager fallback at the call site), matching the
 //! contract's explicit escape hatch for this evaluation.
 //!
+//! ## The `w` x `dweight_needed` lattice (family D, rule 3: full state
+//! ## enumeration for every guard on `w`'s tracked state)
+//!
+//! `bwd` gates on TWO independent predicates: `w.is_variable()` (true only
+//! for a genuine trainable `Var`) and `w.track_op()` (`is_variable() ||
+//! op.is_some()`, candle-core-0.11.0 `tensor.rs:592-594` — a strict
+//! superset of `is_variable()`, true also for a tracked-but-not-`Var`
+//! intermediate such as `w_var.as_tensor() * 1.0`). Crossed against
+//! `dweight_needed` in `{true, false}`, `w` sorts into three DISTINCT
+//! states (not two — `is_variable()` alone collapses two of them
+//! together), giving 3 x 2 = 6 cells:
+//!
+//! | `w` state                                   | `dweight_needed` | Behaviour                                                             | Covering test |
+//! |----------------------------------------------|-------------------|------------------------------------------------------------------------|---------------|
+//! | untracked leaf (`!track_op()`)                | `false`           | normal frozen-base backward; `dw = None`                               | `dweight_needed_returns_some_dw_otherwise_none` (the `dweight_needed=false` half) |
+//! | untracked leaf (`!track_op()`)                | `true`            | mirror gate (`dweight_needed && w.track_op()`) is false; `dw = None`, NO wasted `dy^T @ x` GEMM | `dweight_needed_true_with_an_untracked_w_skips_dw_without_wasted_work` |
+//! | `Var` (`is_variable() && track_op()`)         | `false`           | self-contradiction refusal (`!dweight_needed && w.track_op()`); typed `Error::Msg`, never a panic | `dweight_needed_false_with_a_trainable_w_is_a_typed_refusal` |
+//! | `Var` (`is_variable() && track_op()`)         | `true`            | normal trainable-base backward; `dw = Some(dy^T @ x)`                  | `dweight_needed_returns_some_dw_otherwise_none` (the `dweight_needed=true` half) |
+//! | tracked, non-`Var` (`!is_variable() && track_op()`) | `false`     | self-contradiction refusal (SAME gate as the `Var`/`false` cell — `track_op()`, not `is_variable()`, is what the gate tests); typed `Error::Msg`. THE CELL THE PRE-FIX PANIC LIVED IN: an `is_variable()`-only gate let this state through, `dw` came back `None` from the mirror gate, and candle's `sorted_nodes()` walk (which recurses into any TRACKED node, not only `Var`s) later panicked at `backprop.rs:175` finding no `GradStore` entry for `w`'s own tracked node | `tracked_non_var_w_with_dweight_needed_false_is_a_typed_refusal_not_a_panic` |
+//! | tracked, non-`Var` (`!is_variable() && track_op()`) | `true`      | mirror gate is true (`track_op()` alone, no `is_variable()` requirement); `dw = Some(dy^T @ x)` computed against `w`'s CURRENT values (algebraically identical to the `Var` case — `dy^T @ x` does not care whether `w` is itself a leaf) | `bwd_every_gemm_operand_is_admissible_at_boundary_and_production_ranks` exercises the same GEMM shape; no dedicated tracked-non-`Var`-true test exists because this cell is not a domain boundary (no refusal, no skipped work) — the `Var`-true cell above already proves the GEMM's correctness end to end via `Tensor::backward` |
+//!
+//! Both `bwd` gates key off `w.track_op()`, never `w.is_variable()` alone
+//! — that is the fix: an `is_variable()`-only self-contradiction check
+//! (as this file had before) leaves the two `!is_variable() && track_op()`
+//! rows unguarded on the refusal side while the mirror gate (already
+//! `track_op()`-keyed) correctly returns `None` for `dw`, so the ONLY
+//! observable symptom was the downstream `backprop.rs` panic, not a
+//! silently wrong gradient — still a defect (family D wants a typed
+//! refusal, not a panic reachable from any consumer of a `pub use`d op).
+//!
 //! ## Domain (family D / K2)
 //!
 //! `x` rank 2 or 3, `w` rank 2 `[out, in]`, `ab` rank 2 `[in+out, rank]`
@@ -294,8 +324,16 @@ pub struct LowRankResidualLinear {
     /// base => `true`; `is_variable()` alone is not a safe signal here,
     /// since a tracked-but-non-`Var` intermediate is neither definitely
     /// frozen nor definitely trainable — see the call site's own gate
-    /// for the full three-way classification). This op never inspects
-    /// `w`'s tracked-op state itself.
+    /// for the full three-way classification). CORRECTION (this field's
+    /// doc previously claimed the opposite of what `bwd` actually does):
+    /// `bwd` DOES inspect `w.track_op()` itself, TWICE — once as the
+    /// self-contradiction refusal (`!dweight_needed && w.track_op()`) and
+    /// once as the mirror gate deciding whether to compute `dW` at all
+    /// (`dweight_needed && w.track_op()`) — precisely because this flag
+    /// alone is call-site data this op does not fully trust (family D: an
+    /// op trusts no caller for its own domain). See "The `w` ×
+    /// `dweight_needed` lattice" in the module doc for the full state
+    /// table both gates jointly cover.
     pub dweight_needed: bool,
 }
 
@@ -602,17 +640,38 @@ impl CustomOp3 for LowRankResidualLinear {
         // This op trusts no caller for its own domain (the same doctrine
         // `check_w_and_ab`'s doc states): `dweight_needed` is CALL-SITE
         // data, frozen into this `Copy` instance at construction, not
-        // re-derived here — but `w.is_variable() && !self.dweight_needed`
-        // is a self-contradictory combination (a trainable base weight
-        // whose gradient this op was told to DROP) that would silently
-        // starve `w` of its own gradient contribution forever, so it is
-        // checked and refused rather than trusted.
-        if !self.dweight_needed && w.is_variable() {
+        // re-derived here — but `w.track_op() && !self.dweight_needed` is a
+        // self-contradictory combination (a TRACKED base weight — either a
+        // true `Var` or a tracked-but-not-`Var` intermediate, e.g. `w_var
+        // .as_tensor() * 1.0` — whose gradient this op was told to DROP)
+        // that would silently starve `w` of its own gradient contribution
+        // forever, so it is checked and refused rather than trusted.
+        //
+        // `w.track_op()` (NOT `w.is_variable()`) is the correct predicate
+        // here: `track_op() == is_variable() || op.is_some()`
+        // (candle-core-0.11.0 `tensor.rs:592-594`), a strict superset. A
+        // `w.is_variable()`-only check misses the tracked-but-non-`Var`
+        // cell of the lattice below entirely — that cell is exactly what
+        // used to reach `Tensor::backward`'s `sorted_nodes()` walk (which
+        // recurses into ANY tracked node, `backprop.rs`'s `walk`, not only
+        // `Var`s) with no `GradStore` entry for `w`'s node (this op's own
+        // mirror gate below, keyed the same way, correctly returned `None`
+        // for the `dw` slot), and PANIC at `backprop.rs:175`'s
+        // `grads.remove(node).expect("grad not populated")` the moment the
+        // walk reached `w`'s own tracked node — see
+        // `tracked_non_var_w_with_dweight_needed_false_is_a_typed_refusal_not_a_panic`
+        // for the reproduction (panics before this `track_op()` fix,
+        // returns a typed `Error::Msg` after it) and the module doc's
+        // "The `w` × `dweight_needed` lattice" section for the full state
+        // table this gate (together with the mirror gate below) covers.
+        if !self.dweight_needed && w.track_op() {
             return Err(Error::Msg(
-                "low_rank_residual_linear: bwd called with dweight_needed=false but w is a \
-                 trainable Var — the call site's frozen_weight_gate disagrees with the \
-                 tensor it actually passed; refusing rather than silently dropping w's \
-                 gradient"
+                "low_rank_residual_linear: bwd called with dweight_needed=false but w is \
+                 tracked (a trainable Var, or a tracked-but-not-Var intermediate) — the call \
+                 site's frozen_weight_gate disagrees with the tensor it actually passed; \
+                 refusing rather than silently dropping w's gradient (or panicking when \
+                 candle's own backward walk later visits w's tracked node with no gradient \
+                 entry for it)"
                     .into(),
             ));
         }
@@ -1305,8 +1364,8 @@ mod tests {
         assert!(matches!(err, Error::Msg(_)));
     }
 
-    /// The MIRROR gate (round-2 audit finding A1): `dweight_needed=true`
-    /// combined with a `w` that is NOT actually `track_op()`'d (a true
+    /// The MIRROR gate: `dweight_needed=true` combined with a `w` that is
+    /// NOT actually `track_op()`'d (a true
     /// frozen leaf) must skip computing `dW` entirely — no `dW` slot is
     /// ever returned for a `w` nothing downstream could read one for —
     /// rather than silently wasting a full `dy^T @ x` GEMM and its output
@@ -1339,6 +1398,53 @@ mod tests {
             "dweight_needed=true with an untracked w must skip the dW GEMM \
              entirely, not merely compute-then-discard it"
         );
+    }
+
+    /// REPRO-FIRST probe for the panic bug this test's fix addresses: `w`
+    /// is TRACKED but NOT a `Var` (`w_var.as_tensor() * 1.0` — a tracked
+    /// `Op::Affine` intermediate) with `dweight_needed=false`. The
+    /// call-site gate at `crates/jammi-lora/src/lib.rs` never reaches this
+    /// state (it only ever passes a genuine leaf-or-Var `w`), but this op
+    /// is `pub use`d (`ops/mod.rs`) and reachable directly by any consumer
+    /// — `bwd`'s own domain check must not trust the call site here either
+    /// (family D: this op trusts no caller for its own domain, the same
+    /// doctrine `check_w_and_ab`'s doc states). BEFORE the fix, `bwd`'s
+    /// self-contradiction gate tested `w.is_variable()` (false for a
+    /// tracked-non-`Var`), so it let this state through; `bwd` then
+    /// returned `dw = None` for the w slot at the MIRROR gate
+    /// (`self.dweight_needed && w.track_op()` is false since
+    /// `dweight_needed` is false) while candle's `sorted_nodes()` still
+    /// visits `w` (its `Op::Affine` node is TRACKED, so `sorted_nodes`'s
+    /// own `walk` recurses into it via `node.op()`), and
+    /// `Tensor::backward`'s `grads.remove(node).expect("... grad not
+    /// populated")` (`backprop.rs:175`) PANICS the moment the walk reaches
+    /// `w`'s node — see this test for the reproduction and the module
+    /// doc's state-table below for the full lattice this covers.
+    #[test]
+    fn tracked_non_var_w_with_dweight_needed_false_is_a_typed_refusal_not_a_panic() {
+        let device = Device::Cpu;
+        let (rows, inf, outf, r) = (3usize, 3usize, 4usize, 2usize);
+        let x = Tensor::randn(0f32, 1.0, (rows, inf), &device).unwrap();
+        let w_var =
+            Var::from_tensor(&Tensor::randn(0f32, 1.0, (outf, inf), &device).unwrap()).unwrap();
+        // Tracked (has an Op::Affine) but NOT itself a Var — the third,
+        // previously-unmodelled state.
+        let w = (w_var.as_tensor() * 1.0).unwrap();
+        assert!(
+            !w.is_variable() && w.track_op(),
+            "w must be tracked-but-not-a-Var: the exact cell the panic lived in"
+        );
+        let a = Tensor::randn(0f32, 1.0, (r, inf), &device).unwrap();
+        let b = Tensor::randn(0f32, 1.0, (outf, r), &device).unwrap();
+        let ab = Tensor::cat(&[&a.t().unwrap(), &b], 0).unwrap();
+
+        let op = LowRankResidualLinear::new(1.0, inf, outf, r, None, false).unwrap();
+        let out = x.apply_op3(&w, &ab, op).unwrap();
+        let err = out.sum_all().unwrap().backward().expect_err(
+            "dweight_needed=false with a tracked-non-Var w must be a typed refusal, \
+             never a panic and never a silently dropped gradient",
+        );
+        assert!(matches!(err, Error::Msg(_)));
     }
 
     #[test]
@@ -1543,7 +1649,7 @@ mod tests {
     /// x` — see the module doc's backward enumeration), not merely the
     /// five reducing over `inf`/`rank` — the base branch's `dx_base`/`dw`
     /// reduce over `outf`/`rows` instead, a DIFFERENT `(b, m, n, k)` shape
-    /// this test was previously silent on (round-2 audit A8). Forward's
+    /// this test was previously silent on. Forward's
     /// own slices were already proven admissible by construction (module
     /// doc); this test proves EVERY BACKWARD product is too, at `rank`
     /// 1/2/3 (this op's own domain boundary — `rank >= 1`) and at
@@ -1568,7 +1674,7 @@ mod tests {
             let ab = Tensor::cat(&[&a.t().unwrap(), &b], 0).unwrap();
             let xd_2d = Tensor::randn(0f32, 1.0, (rows, inf), &device).unwrap();
             let d_lora_2d = Tensor::randn(0f32, 1.0, (rows, outf), &device).unwrap();
-            // (A8, round-2 audit): the base branch's own two GEMMs
+            // The base branch's own two GEMMs
             // (`dx_base = dy @ w`, `dw = dy^T @ x`) were the two missing
             // from this test — every OTHER GEMM `bwd` issues was already
             // covered above, but these two are a DIFFERENT (b, m, n, k)

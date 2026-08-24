@@ -194,15 +194,39 @@ impl DropoutMasks {
     /// `DropoutFused::new` construction re-validates independently
     /// regardless (family D).
     pub(crate) fn next_key(&self, p: f32) -> Result<DropoutKey, candle_core::Error> {
-        let k = self.counter.fetch_add(1, Ordering::Relaxed);
-        let forward_idx: u32 = k.try_into().map_err(|_| {
-            candle_core::Error::Msg(format!(
-                "dropout: forward counter {k} for layer_id {} exceeds u32::MAX — the Philox \
-                 counter mapping reserves exactly 32 bits for the forward index \
-                 (jammi_kernels::philox)",
-                self.layer_id
-            ))
-        })?;
+        // The overflow check happens BEFORE the counter advances — a
+        // refused draw must leave `self.counter` untouched, or a caller
+        // that retries after catching the error (or simply calls
+        // `position()` afterward for diagnostics) would observe the
+        // counter having silently advanced past `u32::MAX` on a draw that
+        // never actually happened. `AtomicU64::fetch_update` makes the
+        // "check current value, then conditionally advance" sequence one
+        // atomic operation rather than a separate load-then-fetch_add
+        // (which would race under concurrent callers): the closure
+        // returns `None` (no store) when the CURRENT value already
+        // exceeds `u32::MAX`, so the counter is left exactly where it was
+        // for the caller to inspect via `position()`.
+        let k = self
+            .counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |k| {
+                if k > u32::MAX as u64 {
+                    None
+                } else {
+                    Some(k + 1)
+                }
+            })
+            .map_err(|k| {
+                candle_core::Error::Msg(format!(
+                    "dropout: forward counter {k} for layer_id {} exceeds u32::MAX — the \
+                     Philox counter mapping reserves exactly 32 bits for the forward index \
+                     (jammi_kernels::philox)",
+                    self.layer_id
+                ))
+            })?;
+        let forward_idx: u32 = k.try_into().expect(
+            "fetch_update's closure already refused any k > u32::MAX; a value that passed \
+             the closure must fit",
+        );
         Ok(DropoutKey {
             seed: self.run_seed,
             layer_id: self.layer_id,
@@ -235,9 +259,9 @@ pub(crate) fn layer_id_for_name(name: &str) -> u32 {
     ((z >> 32) as u32) ^ (z as u32)
 }
 
-/// Audit advisory (post-4aa1303 round): `layer_id` is the ONLY Philox
-/// counter slot derived from a hash rather than carried verbatim — the
-/// one place two DISTINCT sites CAN collide, and a collision means two
+/// `layer_id` is the ONLY Philox counter slot derived from a hash rather
+/// than carried verbatim — the one place two DISTINCT sites CAN collide,
+/// and a collision means two
 /// sites share every mask silently (no error, correlated dropout, forever
 /// — the same `layer_id` at the same `forward_idx` draws the identical
 /// Philox stream). All 112 ModernBERT-large site names were confirmed
@@ -365,8 +389,8 @@ mod tests {
     /// The real 112-site ModernBERT-large naming scheme (28 layers x
     /// `{attn.Wqkv, attn.Wo, mlp.Wi, mlp.Wo}`, `"layer.{n}.{site}"` —
     /// matching `jammi_encoders::modernbert`'s own `collect_dropout_
-    /// position` call sites) — the audit's config-dependent claim, pinned
-    /// as a real regression oracle rather than left as prose.
+    /// position` call sites) — a config-dependent collision-freedom claim,
+    /// pinned as a real regression oracle rather than left as prose.
     #[test]
     fn real_modernbert_large_names_are_collision_free() {
         let mut names = Vec::new();
@@ -387,8 +411,8 @@ mod tests {
         );
     }
 
-    /// The audit advisory itself: `layer_id` is a 32-bit hash, so a
-    /// collision IS structurally possible — engineer one by brute force
+    /// `layer_id` is a 32-bit hash, so a collision IS structurally
+    /// possible — engineer one by brute force
     /// (a fixed base name + an increasing suffix counter; the birthday
     /// bound over a 32-bit output puts the expected first collision
     /// around sqrt(2^32) ~= 65536 tries, so a 500k cap is generous) and
@@ -542,5 +566,28 @@ mod tests {
             apply_via_next_key(&m, &x, 0.2).is_err(),
             "a forward index beyond u32::MAX must be refused, not silently wrapped"
         );
+    }
+
+    /// A refused draw must not advance the counter — `next_key`'s overflow
+    /// check happens BEFORE `fetch_update` commits any new value (an
+    /// atomic check-then-maybe-store, not the old check-AFTER-`fetch_add`
+    /// ordering), so `position()` reads back exactly the pre-refusal value
+    /// no matter how many times a caller retries a refused draw.
+    #[test]
+    fn a_refused_draw_leaves_the_counter_unadvanced() {
+        let d = candle_core::Device::Cpu;
+        let x = Tensor::ones((4, 4), candle_core::DType::F32, &d).unwrap();
+        let m = DropoutMasks::new(1, "projection");
+        let overflowed = u32::MAX as u64 + 1;
+        m.restore_position(overflowed);
+        assert_eq!(m.position(), overflowed);
+        for _ in 0..3 {
+            assert!(apply_via_next_key(&m, &x, 0.2).is_err());
+            assert_eq!(
+                m.position(),
+                overflowed,
+                "a refused draw must not advance the counter, even on repeated retries"
+            );
+        }
     }
 }

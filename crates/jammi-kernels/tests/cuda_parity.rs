@@ -2671,7 +2671,7 @@ fn dropout_parity_multi_block_not_a_multiple_of_block_size() {
 // input) while the CUDA side runs the REAL `BF16` cuBLAS path — this is a
 // weaker parity claim than the other bf16 legs above (comparing two
 // DIFFERENT dtype executions, not the same dtype on two devices), stated
-// explicitly rather than silently reused from the `f32_f32` helper's
+// explicitly rather than silently reused from `assert_lora_linear_parity_f32`'s
 // shape.
 // =======================================================================
 
@@ -2758,6 +2758,36 @@ fn lora_linear_parity_tolerance(rows: usize, inf: usize, outf: usize, values: &[
     let max_term_magnitude = amplitude * amplitude;
     let chain_factor = 3.0;
     chain_factor * higham_bound(n, max_term_magnitude, F32_U)
+}
+
+/// A tolerance for a SINGLE two-operand GEMM reduction whose two operands
+/// do NOT share the fixture's own amplitude — unlike `fwd`/`dx`/`dw` (where
+/// both GEMM operands genuinely are amplitude-10 fixture slices, so
+/// [`lora_linear_parity_tolerance`]'s `amplitude * amplitude` term is
+/// correct), `da`'s and `db`'s own DOMINANT reduction multiplies two
+/// DIFFERENTLY-SCALED operands: `da`'s is `d(after_a)` (an already-reduced
+/// intermediate, amplitude ~27 at this test's production width) against
+/// `x` (amplitude ~10); `db`'s is `d(lora_out)` (== `dy * scale`, amplitude
+/// == `scale` exactly, since `dy` is `sum_all().backward()`'s all-ones
+/// seed) against `after_a` (amplitude ~51000). Squaring ONE shared
+/// amplitude — what the vacuous predecessor of this function's call site
+/// did by reusing [`lora_linear_parity_tolerance`] with the raw `x`/`w`/`a`/
+/// `b` fixture slices — assumes both operands sit at the fixture's own
+/// amplitude, which is false for exactly this GEMM: the resulting bound
+/// (337.5) landed at `8.1x` `da`'s OWN maximum magnitude (41.7), so ANY
+/// `da_gpu` (including `0.0`) would have passed. `lhs_amp * rhs_amp` (the
+/// ACTUAL, measured amplitudes of the two real operands) fixes that. `n`
+/// is `rows` — the actual contraction depth of BOTH `da`'s and `db`'s own
+/// final GEMM (`d(after_a)^T @ x` and `d(lora_out)^T @ after_a`
+/// respectively both contract over `rows`, not `inf`/`outf` — see this
+/// function's call site for the derivation), not the conservative
+/// `max(rows, inf, outf)` [`lora_linear_parity_tolerance`] uses for its
+/// looser, multi-output catch-all bound. Same `chain_factor = 3.0` safety
+/// margin for the upstream (`g`/`after_a`) reduction's own summation-order
+/// noise, matching this file's established convention.
+fn lora_linear_parity_tolerance_asymmetric(n: usize, lhs_amp: f64, rhs_amp: f64) -> f64 {
+    let chain_factor = 3.0;
+    chain_factor * higham_bound(n, lhs_amp * rhs_amp, F32_U)
 }
 
 /// Packs `a`/`b` into `ab`'s row-packed `[in + out, rank]` layout — see
@@ -3276,8 +3306,8 @@ fn lora_linear_parity_bf16_base_production_width() {
     }
 }
 
-/// The BACKWARD counterpart to `lora_linear_parity_bf16_base_production_width`
-/// (audit item B3): `x`/`w` are the SAME bf16-rounded values (`x_bf16`,
+/// The BACKWARD counterpart to `lora_linear_parity_bf16_base_production_width`:
+/// `x`/`w` are the SAME bf16-rounded values (`x_bf16`,
 /// `w_bf16`/their `f32` requantizations), but the CPU reference here is
 /// NOT this op's own CPU forward+`backward()` — it is candle's ORDINARY
 /// autograd walking the EAGER composition this op replaces (`base = x @
@@ -3374,7 +3404,7 @@ fn lora_linear_parity_bf16_base_backward_production_width() {
         .unwrap();
 
     // The `dx_base`/`d_x_lora` pieces `dx_cpu` sums, kept SEPARATE
-    // (mirroring the forward test's `base_only`/`delta_scaled` split) so
+    // (mirroring the forward test's `base_only_cpu`/`delta_scaled_cpu` split) so
     // the bound below can be sized to EACH bf16 rounding point's own
     // magnitude. `dy` is `sum_all().backward()`'s upstream seed: ones.
     let dy_cpu = Tensor::ones((rows, outf), DType::F32, &cpu).unwrap();
@@ -3395,6 +3425,30 @@ fn lora_linear_parity_bf16_base_backward_production_width() {
         .unwrap()
         .to_vec1()
         .unwrap();
+
+    // `da`/`db`'s own two REAL operands, measured directly (not assumed
+    // equal to the raw fixture amplitude — see
+    // `lora_linear_parity_tolerance_asymmetric`'s doc): `d(after_a) ==
+    // d(lora_out) @ B == (dy * scale) @ B` (`g_cpu` already computed
+    // above, scaled here) feeds `da`'s own final GEMM (`d(after_a)^T @
+    // x`); `after_a == x @ A^T` feeds `db`'s own final GEMM
+    // (`d(lora_out)^T @ after_a`).
+    let d_after_a_cpu: Vec<f32> = g_cpu
+        .affine(f64::from(scale), 0.0)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let after_a_cpu: Vec<f32> = x_cpu
+        .as_tensor()
+        .matmul(&a_cpu.as_tensor().t().unwrap())
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let max_abs = |v: &[f32]| v.iter().fold(0.0f64, |acc, &x| acc.max(f64::from(x.abs())));
 
     // CUDA side: the REAL fused op, `x`/`w` true `bf16` tensors.
     let x_gpu =
@@ -3466,18 +3520,36 @@ fn lora_linear_parity_bf16_base_backward_production_width() {
         );
     }
 
-    let da_db_tol =
-        lora_linear_parity_tolerance(rows, inf, outf, &[&x_requantized, &w_requantized, &av, &bv]);
+    // RULE-2 DISCRIMINATION PROOF (was vacuous before this fix): the
+    // predecessor of this pair of bounds reused `lora_linear_parity_tolerance`
+    // with the RAW fixture slices, giving `tol == 337.5` against `da`'s own
+    // measured max magnitude of `41.7` — a `bound / max|signal|` ratio of
+    // `8.1`, so `da_gpu == 0.0` (a mutation that drops the entire `da`
+    // gradient) would have PASSED (`|41.7 - 0.0| == 41.7 < 337.5`). The
+    // asymmetric bound below is keyed to the ACTUAL operand magnitudes
+    // feeding `da`'s/`db`'s own dominant reduction (see
+    // `lora_linear_parity_tolerance_asymmetric`'s doc) — measured here at
+    // `da_tol ~= 6.3` against `da`'s own max `~41.7` (ratio `~0.15`) and
+    // `db_tol ~= 601.3` against `db`'s own max `~3962.0` (ratio `~0.15`),
+    // both `< 1`: a zeroed or otherwise wrong-order-of-magnitude gradient on
+    // EITHER slot is now caught, not just a fine-grained rounding bug.
+    let da_tol = lora_linear_parity_tolerance_asymmetric(
+        rows,
+        max_abs(&d_after_a_cpu),
+        max_abs(&x_requantized),
+    );
     for (i, (c, g)) in da_cpu.iter().zip(da_gpu.iter()).enumerate() {
         assert!(
-            f64::from(*c - *g).abs() <= da_db_tol,
-            "bf16-base bwd da[{i}]: cpu {c} vs cuda {g} (tol {da_db_tol})"
+            f64::from(*c - *g).abs() <= da_tol,
+            "bf16-base bwd da[{i}]: cpu {c} vs cuda {g} (tol {da_tol})"
         );
     }
+    let db_tol =
+        lora_linear_parity_tolerance_asymmetric(rows, f64::from(scale), max_abs(&after_a_cpu));
     for (i, (c, g)) in db_cpu.iter().zip(db_gpu.iter()).enumerate() {
         assert!(
-            f64::from(*c - *g).abs() <= da_db_tol,
-            "bf16-base bwd db[{i}]: cpu {c} vs cuda {g} (tol {da_db_tol})"
+            f64::from(*c - *g).abs() <= db_tol,
+            "bf16-base bwd db[{i}]: cpu {c} vs cuda {g} (tol {db_tol})"
         );
     }
 }

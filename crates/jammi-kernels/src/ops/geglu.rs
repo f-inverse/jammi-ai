@@ -305,7 +305,7 @@ pub enum GeluVariant {
     /// ModernBERT's MLP call site actually uses. Implemented.
     Erf,
     /// The tanh approximation (`candle_core::Tensor::gelu`). NOT
-    /// implemented by this op: a typed refusal ([`check_variant`]), not a
+    /// implemented by this op: a typed refusal (`check_variant`), not a
     /// silently-computed (and silently wrong, for a caller that actually
     /// wanted the tanh formula) alternative activation.
     Tanh,

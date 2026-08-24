@@ -369,7 +369,7 @@ impl LoraLinear {
     /// The final `[mul, cast, add]` — `base_out + cast(lora_out * scaling)`
     /// — is replaced by one fused `CustomOp2` call when `self.training` is
     /// `true` AND the kernel's own domain holds
-    /// ([`epilogue_admission_predicate`]): this collapses three tape nodes
+    /// (`epilogue_admission_predicate`): this collapses three tape nodes
     /// (each with its own `zeros_like`+`add` in backward) into one.
     /// `self.training` gates it because a `LoraLinear` also SERVES
     /// inference (`from_loaded`, `training: false`) — eval/serving keeps
@@ -378,7 +378,7 @@ impl LoraLinear {
     /// `jammi_encoders::layer_norm`'s module doc for the same argument).
     /// Outside the fused kernel's domain (an unsupported dtype/device, a
     /// non-contiguous view), the training-mode arm falls back to
-    /// [`eager_epilogue`] too — the SAME function eval always uses — so a
+    /// `eager_epilogue` too — the SAME function eval always uses — so a
     /// domain miss and eval-mode are byte-identical code paths, not two
     /// independently-maintained ones.
     ///

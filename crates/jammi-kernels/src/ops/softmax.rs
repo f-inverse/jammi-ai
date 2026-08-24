@@ -399,7 +399,7 @@ pub const MAX_LAST_DIM: usize = 4096;
 /// leading axes plus the reduction axis) has nowhere to go in that fixed
 /// signature. `4` is exactly ModernBERT attention's own shape (`[batch,
 /// heads, seq, seq]`, three leading axes) — zero headroom is needed for
-/// this crate's actual workload. The CPU arm's [`mask_row_offset`] is a
+/// this crate's actual workload. The CPU arm's `mask_row_offset` is a
 /// general `Vec`-based unravel/ravel with no such ceiling, so — mirroring
 /// `MAX_LAST_DIM` — this is enforced only on the CUDA arm; a call site
 /// applies it uniformly across devices anyway (see the module doc).
@@ -457,7 +457,7 @@ pub(crate) fn softmax_dims(
 /// Whether `mask` is within `scores`'s supported broadcast class (the
 /// module doc's "supported mask broadcast class" section) — the EXACT
 /// same check `cpu_fwd`/`cuda_fwd` apply internally (this calls
-/// [`softmax_dims`] directly, not a re-derived copy of its logic).
+/// `softmax_dims` directly, not a re-derived copy of its logic).
 ///
 /// `pub`, unlike `softmax_dims` itself: a call site's own admission
 /// predicate (e.g. `jammi_encoders::modernbert::softmax_admission_predicate`)
@@ -533,7 +533,7 @@ fn empty_like(
 /// doc): the op itself never inspects any tensor's runtime state to make
 /// this choice, the CALLER decides at construction time, explicitly.
 ///
-/// This exists because [`row_is_fully_masked`]'s detection rule (`max
+/// This exists because `row_is_fully_masked`'s detection rule (`max
 /// mask < 0.0` means "no attendable key") is a REAL, documented domain
 /// restriction, not a universal truth about additive masking: a caller
 /// using a uniformly-negative additive bias that is NOT a masking
@@ -555,7 +555,7 @@ pub enum FullyMaskedPolicy {
     /// `NaN` for an `-inf` sentinel, a dtype-and-magnitude-dependent
     /// uniform-or-near-normal result for a finite one (see the module
     /// doc). Correct for ANY additive-bias convention, including ones
-    /// [`row_is_fully_masked`]'s rule cannot safely classify. THE DEFAULT
+    /// `row_is_fully_masked`'s rule cannot safely classify. THE DEFAULT
     /// — see [`FullyMaskedPolicy::default`]'s doc for why.
     Propagate,
     /// The production-attention-kernel convention (PyTorch SDPA's

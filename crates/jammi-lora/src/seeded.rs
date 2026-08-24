@@ -230,14 +230,14 @@ pub(crate) fn layer_id_for_name(name: &str) -> u32 {
 /// `tests::real_modernbert_large_names_are_collision_free`), but that is
 /// a property of a CONFIG-DEPENDENT input, not a proof — this function is
 /// the structural guard: given every name that will construct a
-/// [`DropoutMasks`] for one run (the run's "DropoutMasks set"), it
+/// `DropoutMasks` for one run (the run's "DropoutMasks set"), it
 /// verifies the induced `layer_id` set has the SAME cardinality as the
 /// name set — i.e. the hash is injective over this particular input — and
 /// refuses with a typed error NAMING both colliding sites otherwise,
 /// rather than silently proceeding into correlated dropout.
 ///
 /// Intended call site: once, at training-loop construction, over every
-/// name that will end up with a live [`DropoutMasks`] (the same names
+/// name that will end up with a live `DropoutMasks` (the same names
 /// [`crate::LoraLinear::dropout_position`]'s callers already collect via
 /// `dropout_positions()`'s keys, stripped of their `.dropout` suffix —
 /// exactly what was passed to `DropoutMasks::new` for that layer). NOT

@@ -35,8 +35,8 @@
 //!
 //! Random123 publishes known-answer test (KAT) vectors for `philox4x32-10`
 //! in `tests/kat_vectors` (fetched 2026-08-24 from the `main` branch of
-//! the repository above). [`tests::kat_vector_all_zero`],
-//! [`tests::kat_vector_all_ones`], and [`tests::kat_vector_mixed`] below
+//! the repository above). `tests::kat_vector_all_zero`,
+//! `tests::kat_vector_all_ones`, and `tests::kat_vector_mixed` below
 //! assert this Rust implementation reproduces all three published vectors
 //! EXACTLY. The CUDA device function in `cuda/dropout.cu` re-implements
 //! this SAME algorithm in CUDA C (necessarily a second, textually

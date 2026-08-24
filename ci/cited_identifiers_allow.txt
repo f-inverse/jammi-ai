@@ -28,3 +28,15 @@ hf_hub  # Workspace direct dependency (`hf-hub` in Cargo.toml; `hf_hub` is its R
 seed_from_u64  # rand::rngs::StdRng::seed_from_u64, a direct dependency's (rand) real API, cited in lib.rs's determinism contract doc.
 thread_rng  # rand::thread_rng, a direct dependency's (rand) real API, cited in lib.rs's determinism contract doc as the implicit-randomness source this crate never uses.
 rand_distr  # Direct workspace dependency crate name, cited in lib.rs's boundaries doc listing this crate's dependency set.
+# This file is EMPTY today: the gate ships in `--changed-only` (ratchet) mode
+# in CI (see `.github/workflows/ci.yml`) because the full-repo scan found a
+# pre-existing backlog (~123 distinct unresolved citations across ~50 files —
+# see the PR that added this gate for the full list) too large to triage in
+# one PR. As the backfill retires each pre-existing citation (fix the name, or
+# allowlist it here with a reason), add its line below.
+
+schema_force_view_types  # datafusion (direct dep) ParquetOptions field — jammi-bench/src/corpus.rs cites the real upstream schema-inference knob.
+float_roundtrip          # serde_json cargo feature name — jammi-bench/src/fixture.rs cites it to explain why floats are spliced as raw JSON, not reparsed.
+to_string_pretty         # serde_json::to_string_pretty, a free-function (not `.method()`-shaped) call — jammi-bench/src/fixture.rs.
+unnecessary_cast         # clippy lint name — jammi-bench/src/search_rss.rs explains why `widen()` avoids tripping it.
+useless_conversion       # clippy lint name — jammi-bench/src/search_rss.rs explains why `widen()` avoids tripping it.

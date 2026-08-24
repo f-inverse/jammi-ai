@@ -6,9 +6,24 @@
 # vendored/upstream internal (which the CI guard job, no toolchain/cargo,
 # cannot see) from permanently blocking the gate.
 #
-# This file is EMPTY today: the gate ships in `--changed-only` (ratchet) mode
-# in CI (see `.github/workflows/ci.yml`) because the full-repo scan found a
-# pre-existing backlog (~123 distinct unresolved citations across ~50 files —
-# see the PR that added this gate for the full list) too large to triage in
-# one PR. As the backfill retires each pre-existing citation (fix the name, or
-# allowlist it here with a reason), add its line below.
+# The gate ships in `--changed-only` (ratchet) mode in CI (see
+# `.github/workflows/ci.yml`) because the full-repo scan found a pre-existing
+# backlog (~123 distinct unresolved citations across ~50 files — see the PR
+# that added this gate for the full list) too large to triage in one PR. As
+# the backfill retires each pre-existing citation (fix the name, or allowlist
+# it here with a reason), add its line below.
+
+# --- crates/jammi-encoders ---
+bpe_simple_vocab_16e6  # OpenAI CLIP's canonical BPE vocab asset name (bpe_simple_vocab_16e6.txt.gz), cited in clip_text.rs as the source of vocab_size=49408 — not a repo identifier.
+unfold_backward  # PyTorch ATen op (aten/src/ATen/native/UnfoldBackward.cpp), cited in htsat_audio.rs as the reference scatter-backward semantics tile_nonoverlapping avoids depending on.
+unexpected_cfgs  # rustc built-in lint name, cited in layer_norm.rs explaining why an empty `metal` feature isn't declared just to cfg-gate on it.
+NEG_INFINITY  # std f32::NEG_INFINITY, cited in mask.rs contrasting MASKED_LOGIT's finite value against IEEE -inf's NaN-propagation risk.
+is_longer_idx  # HuggingFace transformers' ClapAudioPatchEmbed internal variable name, cited in golden_parity.rs describing the upstream is_longer=false skip condition this test mirrors.
+last_hidden_state  # HF/PyTorch model output attribute name, cited in modernbert_sliding_window.rs describing the oracle fixture's saved tensors.
+get_audio_features  # HF ClapModel.get_audio_features Python method, cited in live_real_clap.rs as the upstream reference embedding this test reproduces.
+hf_hub  # Workspace direct dependency (`hf-hub` in Cargo.toml; `hf_hub` is its Rust path), cited in live_real_clap.rs describing the fetch pattern it mirrors.
+
+# --- crates/jammi-numerics ---
+seed_from_u64  # rand::rngs::StdRng::seed_from_u64, a direct dependency's (rand) real API, cited in lib.rs's determinism contract doc.
+thread_rng  # rand::thread_rng, a direct dependency's (rand) real API, cited in lib.rs's determinism contract doc as the implicit-randomness source this crate never uses.
+rand_distr  # Direct workspace dependency crate name, cited in lib.rs's boundaries doc listing this crate's dependency set.

@@ -136,7 +136,7 @@ pub(crate) static ROPE_DISPATCH_COUNTERS: DispatchCounters = DispatchCounters::n
 
 /// Fused/eager dispatch counters for the ModernBERT attention softmax,
 /// mirroring `ROPE_DISPATCH_COUNTERS` / `crate::layer_norm::LN_DISPATCH_COUNTERS`
-/// — see `ModernBertAttention::softmax_apply`'s doc for the training-only
+/// — see `softmax_apply_training`'s doc for the training-only
 /// gate this counts. `pub(crate)` (not `pub`) — read via
 /// [`crate::softmax_dispatch_snapshot`], the same shape
 /// [`crate::rope_dispatch_snapshot`] / [`crate::ln_dispatch_snapshot`] use.
@@ -209,7 +209,7 @@ struct CastCache {
 
 /// Precomputed RoPE cos/sin tables of shape `[max_seq_len, head_dim]`.
 ///
-/// We duplicate the `half_dim` frequencies so the tables are usable with the
+/// We duplicate the `half` (`head_dim / 2`) frequencies so the tables are usable with the
 /// `rotate_half(x) = cat(-x[..,half:], x[..,:half])` formulation, which is
 /// the variant the upstream ModernBERT implementation uses.
 ///
@@ -764,7 +764,7 @@ struct ModernBertMlp {
     /// `mul` composition below, unconditionally — the SAME code this file
     /// had before the fused kernel existed, so eval's output values are
     /// bit-identical before/after this change (see
-    /// `tests::eval_mode_mlp_is_bit_identical_regardless_of_fused_eligibility`).
+    /// `tests::eval_mode_mlp_geglu_is_bit_identical_regardless_of_fused_eligibility`).
     /// `true` (training) is the ONLY state that ever reaches
     /// [`geglu_apply_training`]. Propagated by [`ModernBert::set_training`].
     training: bool,

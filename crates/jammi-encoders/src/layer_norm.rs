@@ -13,7 +13,7 @@
 //!
 //! A THIRD path exists, gated on `bias.is_none() && training`: every
 //! ModernBERT LayerNorm (`ModernBertConfig` cannot even express a biased
-//! LayerNorm — no `norm_bias` field exists) dispatches to the fused
+//! LayerNorm — it has no norm-bias field at all) dispatches to the fused
 //! CUDA/CPU kernel instead of the `~12`-op eager composition below, when
 //! the fused kernel's own domain holds (`x`'s device is CPU or CUDA —
 //! `LayerNormFused` has no `metal_fwd`, and candle's default `metal_fwd`

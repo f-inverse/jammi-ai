@@ -2199,8 +2199,8 @@ mod tests {
     /// for where these numbers come from — `128 / 12 = 10` windows, an
     /// 8-wide tail dropped either way; `n=3` matches the fused patch-embed's
     /// local branch, `patch_embed_input_channels=3` local channels folded
-    /// into the batch axis). This is the oracle behind `golden_parity`'s
-    /// 6/6 staying green: both tilings only ever read the same
+    /// into the batch axis). This is the oracle behind the `tests/golden_parity.rs`
+    /// suite's 6/6 staying green: both tilings only ever read the same
     /// `floor(dim/size) * size` prefix, so changing HOW that prefix is
     /// reshaped into tiles changes nothing about which elements FORWARD
     /// reads — only whether BACKWARD is exact.

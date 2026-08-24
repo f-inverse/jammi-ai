@@ -1574,17 +1574,9 @@ impl TrainingLoop {
 
     /// The graded-pair embedding objective for a `Contrastive` batch, dispatched
     /// on the configured [`EmbeddingLoss`]. Thin wrapper over the free
-    /// [`dispatch_contrastive_loss`] — the CoSENT default is the free
-    /// [`cosent_loss`]; none of the graded objectives need `self`, they close
-    /// purely over the similarity/score tensors.
+    /// [`dispatch_contrastive_loss`].
     fn contrastive_loss(&self, emb_a: &Tensor, emb_b: &Tensor, scores: &Tensor) -> Result<Tensor> {
-        dispatch_contrastive_loss(
-            self.config.embedding_loss,
-            emb_a,
-            emb_b,
-            scores,
-            &cosent_loss,
-        )
+        dispatch_contrastive_loss(self.config.embedding_loss, emb_a, emb_b, scores)
     }
 
     /// The MNRL similarity scale (`temperature`). `20.0` is the standard
@@ -2270,14 +2262,20 @@ fn mnrl_loss(
 /// [`EmbeddingLoss`]. CoSENT (the default), AnglE, and cosine-MSE consume
 /// graded pairs. The in-batch-negative and triplet objectives are not
 /// graded-pair shaped, so naming one here is a typed error rather than a silent
-/// fall-through to a different loss. `cosent` supplies the CoSENT path (the
-/// only graded objective that reads trainer state).
+/// fall-through to a different loss.
+///
+/// Calls [`cosent_loss`] directly for the CoSENT/default arm — no `&dyn Fn`
+/// indirection. None of the graded objectives (including CoSENT) reads
+/// trainer state, so there was never a reason to inject the CoSENT path as a
+/// closure; the indirection's only effect (esc-040's audit finding) was to
+/// let a test substitute a stand-in for the production default without
+/// exercising `dispatch_contrastive_loss` — the actual production seam
+/// (`TrainingLoop::compute_loss` → `contrastive_loss` → here) — at all.
 fn dispatch_contrastive_loss(
     loss: Option<super::EmbeddingLoss>,
     emb_a: &Tensor,
     emb_b: &Tensor,
     scores: &Tensor,
-    cosent: &dyn Fn(&Tensor, &Tensor, &Tensor) -> Result<Tensor>,
 ) -> Result<Tensor> {
     match loss {
         Some(super::EmbeddingLoss::AnglE) => angle_loss(emb_a, emb_b, scores),
@@ -2293,7 +2291,7 @@ fn dispatch_contrastive_loss(
              (text_a, text_b, score) batch. Choose CoSENT/AnglE/cosine-MSE for graded pairs."
                 .into(),
         )),
-        Some(super::EmbeddingLoss::CoSent) | None => cosent(emb_a, emb_b, scores),
+        Some(super::EmbeddingLoss::CoSent) | None => cosent_loss(emb_a, emb_b, scores),
     }
 }
 
@@ -2529,10 +2527,15 @@ mod tests {
             cosent.is_finite() && mse.is_finite(),
             "both arms must be finite: cosent={cosent}, mse={mse}"
         );
-        // Two-sided margin: far below the MSE arm's O(1) value...
+        // Two-sided margin, tightened to the closed form itself (advisory:
+        // `< 1e-4` was 100× looser than the control) — `log(1 +
+        // exp(scale·(cos_lo − cos_hi)))`, computed independently of the
+        // function under test.
+        let closed_form = closed_form_cosent_residual();
         assert!(
-            cosent < 1e-4,
-            "CoSENT should be ~1.19e-7 on an already-well-ordered pair, got {cosent}"
+            (cosent as f64 - closed_form).abs() < 1e-6,
+            "CoSENT should equal the closed form ≈ {closed_form:.3e} on an already-well-ordered \
+             pair, got {cosent}"
         );
         // ...but strictly positive — not a vacuous always-zero stub.
         assert!(
@@ -2554,6 +2557,146 @@ mod tests {
             cosent, cosent_half,
             "CoSENT must be invariant to a positive rescale of the graded scores"
         );
+    }
+
+    /// The closed-form CoSENT residual on [`cosent_fixture`]'s
+    /// `cos = [0.9, 0.1]`, `scores = [0.2, 0.0]`: the only ordered pair is
+    /// `(i=1, j=0)` (`scores[1]=0.0 < scores[0]=0.2`), whose scaled-similarity
+    /// gap is `sim[1] − sim[0] = 20·(0.1 − 0.9) = −16`, so the pairwise
+    /// log-sum-exp residual is `log(1 + exp(−16)) ≈ 1.13e-7`. Computed
+    /// independently in f64 from the fixture's exact literals — never by
+    /// calling [`cosent_loss`] or [`pairwise_ordering_loss`] — so it is a real
+    /// oracle, not a self-comparison.
+    fn closed_form_cosent_residual() -> f64 {
+        (1.0 + (PAIRWISE_SCALE * (0.1 - 0.9)).exp()).ln()
+    }
+
+    /// esc-040's RED oracle must exercise the PRODUCTION default path, not
+    /// just the free [`cosent_loss`] fn called directly (every other test in
+    /// this module does that). The production seam is
+    /// `TrainingLoop::compute_loss` — called by `TrainingLoop::run` on every
+    /// `Contrastive` batch — → `contrastive_loss` → `dispatch_contrastive_loss`'s
+    /// `Some(CoSent) | None` arm. A defect confined to that arm (e.g.
+    /// rebinding it to [`cosine_mse_loss`]) left the pre-fix suite green
+    /// because nothing called through `compute_loss` on a real
+    /// `TrainingLoop`; the one dispatch-level test that did exist injected a
+    /// panicking closure instead of asserting a value, so it could not catch
+    /// a wrong-but-non-panicking substitution either.
+    ///
+    /// Builds a real `TrainingLoop` over a `ProjectionHead` target through
+    /// the production `TrainingLoopBuilder`, then calls `compute_loss` on a
+    /// real `TrainingBatch::Contrastive` for BOTH `embedding_loss: None`
+    /// (the production default) and `Some(CoSent)` (the explicit choice) —
+    /// both must resolve to the closed-form residual
+    /// ([`closed_form_cosent_residual`], `|Δ| ≤ 1e-6`) and NOT the old
+    /// buggy cancelled-scale value `0.25`.
+    ///
+    /// Mutation check performed by hand and recorded in the hand-off (not
+    /// committed as a permanent probe): temporarily rebinding
+    /// `dispatch_contrastive_loss`'s `Some(CoSent) | None` arm to
+    /// `cosine_mse_loss(emb_a, emb_b, scores)` makes this test FAIL (the
+    /// measured loss reads ≈ 100, `cosine_mse_loss`'s value on this fixture —
+    /// see that fn's doc — not the closed-form ≈ 1.13e-7).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compute_loss_production_default_is_real_cosent_not_mse() {
+        let device = Device::Cpu;
+        let (a, b) = cosent_fixture(&device);
+        let scores = Tensor::new(&[0.2f32, 0.0f32], &device).unwrap();
+        let closed_form = closed_form_cosent_residual();
+
+        for embedding_loss in [None, Some(crate::fine_tune::EmbeddingLoss::CoSent)] {
+            let loop_ = contrastive_production_loop(embedding_loss, &device).await;
+            let batch = super::super::data::TrainingBatch::Contrastive {
+                embeddings_a: a.clone(),
+                embeddings_b: b.clone(),
+                scores: scores.clone(),
+            };
+            let loss = loop_
+                .compute_loss(&batch)
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(
+                loss.is_finite(),
+                "production compute_loss must be finite for embedding_loss={embedding_loss:?}, \
+                 got {loss}"
+            );
+            assert!(
+                (loss as f64 - closed_form).abs() <= 1e-6,
+                "production compute_loss (embedding_loss={embedding_loss:?}) must equal the \
+                 real CoSENT closed form ≈ {closed_form:.3e}, got {loss}"
+            );
+            assert!(
+                (loss - 0.25).abs() > 1e-3,
+                "production compute_loss (embedding_loss={embedding_loss:?}) must NOT be the \
+                 old cancelled-scale cosine-MSE-shaped value 0.25, got {loss}"
+            );
+        }
+    }
+
+    /// Build a real production [`TrainingLoop`] over a
+    /// [`TrainingTarget::ProjectionHead`] embedding target (single
+    /// `projection` layer, `hidden = 2` to match [`cosent_fixture`]), with the
+    /// given `embedding_loss`. The infra (catalog/job/worker/artifact_dir) is
+    /// the production builder's required plumbing — `compute_loss` on a
+    /// `Contrastive` batch never touches it (the batch already carries final
+    /// embeddings) — but going through the real `TrainingLoopBuilder` keeps
+    /// this identical to every other part of the loop `TrainingLoop::run`
+    /// drives.
+    async fn contrastive_production_loop(
+        embedding_loss: Option<crate::fine_tune::EmbeddingLoss>,
+        device: &Device,
+    ) -> TrainingLoop {
+        let config = FineTuneConfig {
+            embedding_loss,
+            ..Default::default()
+        };
+        let varmap = VarMap::new();
+        let vb = candle_nn::VarBuilder::from_varmap(&varmap, DType::F32, device);
+        let head = super::super::lora::build_projection_head(2, &config, &varmap, &vb).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.keep();
+        let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir_path).await.unwrap());
+        catalog
+            .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
+                model_id: "esc-040-model",
+                version: 1,
+                model_type: "embedding",
+                backend: "candle",
+                task: ModelTask::TextEmbedding,
+                base_model_id: None,
+                artifact_path: None,
+                config_json: None,
+            })
+            .await
+            .unwrap();
+        catalog
+            .create_training_job(jammi_db::catalog::training_repo::CreateTrainingJobParams {
+                job_id: "esc-040-job",
+                base_model_id: "esc-040-model::1",
+                training_source: "src",
+                loss_type: "contrastive",
+                hyperparams: "{}",
+                kind: "fine_tune",
+                training_spec: "{}",
+            })
+            .await
+            .unwrap();
+        catalog
+            .claim_next_training_job("esc-040-worker", std::time::Duration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("queued job is claimable");
+
+        TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+            .device(device.clone())
+            .job_id("esc-040-job".into())
+            .worker_id("esc-040-worker".into())
+            .catalog(catalog)
+            .artifact_dir(dir_path)
+            .build()
+            .unwrap()
     }
 
     /// esc-040 gradient arm: CoSENT must produce a finite, non-vanishing
@@ -2848,17 +2991,11 @@ mod tests {
         let a = Tensor::new(&[[1.0f32, 0.0], [0.0, 1.0]], &device).unwrap();
         let b = Tensor::new(&[[0.9f32, 0.1], [0.1, 0.9]], &device).unwrap();
         let scores = Tensor::new(&[1.0f32, 0.5], &device).unwrap();
-        // The CoSENT fallback must never be reached for an MNRL config — assert
-        // the dispatch errors before invoking it.
-        let never = |_: &Tensor, _: &Tensor, _: &Tensor| -> Result<Tensor> {
-            panic!("CoSENT fallback must not run for an MNRL config — silent fall-through")
-        };
         let err = dispatch_contrastive_loss(
             Some(crate::fine_tune::EmbeddingLoss::MultipleNegativesRanking { temperature: 20.0 }),
             &a,
             &b,
             &scores,
-            &never,
         )
         .unwrap_err();
         assert!(
@@ -2872,7 +3009,6 @@ mod tests {
             &a,
             &b,
             &scores,
-            &never,
         )
         .unwrap_err();
         assert!(

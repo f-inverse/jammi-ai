@@ -61,7 +61,9 @@ use std::sync::LazyLock;
 
 use candle_core::{DType, Tensor, D};
 use candle_nn::{Init, VarBuilder};
-use jammi_kernels::admission::{admit, counters_for, DispatchCounters, DispatchOutcome};
+use jammi_kernels::admission::{
+    admission_mode, admit, counters_for, device_is_supported, DispatchCounters, DispatchOutcome,
+};
 use jammi_kernels::ops::{apply2, LayerNormFused, MAX_HIDDEN};
 
 use crate::error::EncoderError;
@@ -88,28 +90,6 @@ use crate::error::EncoderError;
 /// durable job record or a bench report uses.
 pub static LN_DISPATCH_COUNTERS: LazyLock<&'static DispatchCounters> =
     LazyLock::new(|| counters_for("layer_norm_fused"));
-
-/// `Strict` mode (an explicit fused-path request errors instead of
-/// falling back), and whether a device is one every fused CPU/CUDA op in
-/// this crate can run on — MOVED (the C6 commit) to
-/// `jammi_kernels::admission` as the canonical home: `jammi-lora`, which
-/// has no dependency on this crate, needed the exact same two audited
-/// predicates for its own fused LoRA-site epilogue, and duplicating them a
-/// second time was the wrong fix (see `jammi_kernels::admission`'s module
-/// doc for the full "op-keyed dispatch-counter registry" rationale).
-///
-/// Re-exported here under their ORIGINAL names/paths
-/// (`crate::layer_norm::admission_mode`, `crate::layer_norm::
-/// device_is_supported`) so every existing call site in this crate —
-/// this file's own [`LayerNorm::forward_fused_or_fallback`] and
-/// `crate::modernbert`'s RoPE/softmax/GeGLU admission predicates, all of
-/// which reach these through `crate::layer_norm::` — keeps compiling
-/// unchanged. See `jammi_kernels::admission::admission_mode` /
-/// `jammi_kernels::admission::device_is_supported` for the full
-/// documentation (Metal-rejection rationale, the `JAMMI_KERNELS_STRICT`
-/// env var, etc.), which now lives at the canonical definition rather
-/// than here.
-pub(crate) use jammi_kernels::admission::{admission_mode, device_is_supported};
 
 /// The fused kernel's domain, checked at the call site (family D / K2):
 /// `x` and `weight` live on a device [`device_is_supported`] accepts,

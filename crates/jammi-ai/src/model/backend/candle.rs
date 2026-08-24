@@ -2745,6 +2745,123 @@ mod projection_head_end_to_end_persistence_tests {
             );
         }
     }
+
+    /// B1 (PR-C round 4): the DISTRIBUTION-head sibling of
+    /// `candle_backend_load_honors_persisted_rslora_for_projection_head` above —
+    /// the TRUE oracle for `load_distribution_head`'s candle.rs call site
+    /// (`:1698`), which had zero coverage before this test: every existing
+    /// caller either called `load_distribution_head` (the FUNCTION) directly
+    /// — `distribution_head_trains_persists_and_serves_identically_with_rslora`
+    /// above, which by construction cannot see a defect confined to the
+    /// `:1698` call site's own argument — or drove `CandleBackend::load` with
+    /// a PROJECTION-head-only adapter (the sibling test above), whose saved
+    /// weights carry no `distribution.lora_a`/`distribution.lora_b` keys, so
+    /// `load_distribution_head` at `:1698` returns `Ok(None)` regardless of
+    /// what `use_rslora` value it was fed — the call happens (line coverage),
+    /// but the SCALING it applies is never exercised (behavior coverage). A
+    /// hardcoded `true` (or `false`) at that argument therefore left every
+    /// prior test green.
+    ///
+    /// This test persists a real DISTRIBUTION-head adapter (via
+    /// `build_distribution_head`, training `layers[1]`, the `distribution`
+    /// layer — mean/raw_std, the parametric Gaussian shape) through the same
+    /// `saved_adapter` + `save_adapter` round trip, then drives the REAL
+    /// `CandleBackend::load` over the `tiny_bert` fixture and reads the served
+    /// `distribution_head` straight off the returned `LoadedModel::Candle` —
+    /// the exact field `CandleBackend::load` populates from
+    /// `load_distribution_head`'s return at `:1698`. Loops over both
+    /// `use_rslora` values, not `true` only: with a single fixed boolean, a
+    /// hardcoded `true` at `:1698` is indistinguishable from a correct read
+    /// whenever the test itself only ever configures `true` — the mutation is
+    /// only observable at `use_rslora = false`, the shipped default.
+    ///
+    /// Mutation check performed by hand and recorded in the hand-off (not
+    /// committed — it asserts the CURRENT code is right, not a permanent
+    /// regression probe for a defect that no longer exists): hardcoding
+    /// `true` as `load_distribution_head`'s `use_rslora` argument at its
+    /// `candle.rs:1698` call site → this test FAILS at the `use_rslora =
+    /// false` loop iteration (served != trained: a hardcoded `true` read
+    /// against a `false`-trained head serves `alpha/sqrt(rank)` against an
+    /// `alpha/rank`-trained head — a 4x error at rank=16, alpha=8). This is
+    /// the ONLY test in this module sensitive to that call site.
+    #[test]
+    fn candle_backend_load_honors_persisted_rslora_for_distribution_head() {
+        let device = Device::Cpu;
+        let tiny_bert_dir = jammi_test_utils::cookbook_fixture("tiny_bert");
+        let hidden = 32usize; // tiny_bert's config.json `hidden_size`.
+        let x_vals: Vec<f32> = (0..hidden).map(|i| (i as f32 * 0.037).sin()).collect();
+        let x = Tensor::from_vec(x_vals, (1, hidden), &device).unwrap();
+        // Distribution head output width 2 (mean, raw_std) — the parametric
+        // Gaussian head shape.
+        let target_out = Tensor::new(&[[0.7f32, -0.4]], &device).unwrap();
+
+        for use_rslora in [true, false] {
+            let config = FineTuneConfig {
+                lora_rank: 16,
+                lora_alpha: 8.0,
+                use_rslora,
+                lora_dropout: 0.0,
+                ..Default::default()
+            };
+            let varmap = VarMap::new();
+            let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+            let mut head = build_distribution_head(hidden, 2, &config, &varmap, &vb).unwrap();
+            train_layer(&mut head.layers[1].1, &varmap, &x, &target_out);
+            let trained = head.layers[1]
+                .1
+                .forward(&x)
+                .unwrap()
+                .to_vec2::<f32>()
+                .unwrap()[0]
+                .clone();
+
+            let target = TrainingTarget::ProjectionHead { head };
+            let final_weights = target.named_trainable_weights().unwrap();
+            let saved = target.saved_adapter(&config, None, None);
+            let adapter_dir = tempfile::tempdir().unwrap();
+            jammi_lora::save_adapter(adapter_dir.path(), &final_weights, &saved).unwrap();
+
+            let config_path = tiny_bert_dir.join("config.json");
+            let model_config: serde_json::Value =
+                serde_json::from_reader(std::fs::File::open(&config_path).unwrap()).unwrap();
+            let resolved = crate::model::ResolvedModel {
+                model_id: crate::model::ModelId("local:tiny_bert-b1-distribution-e2e-test".into()),
+                backend: crate::model::BackendType::Candle,
+                task: ModelTask::Regression,
+                config_path,
+                weights_paths: vec![tiny_bert_dir.join("model.safetensors")],
+                tokenizer: None,
+                model_config,
+                preprocessor_config: None,
+                pooling_config: None,
+                base_model_id: None,
+                adapter_path: Some(adapter_dir.path().to_path_buf()),
+                estimated_memory: 0,
+            };
+            let device_config = DeviceConfig {
+                gpu_device: -1,
+                memory_fraction: 0.9,
+                require_gpu: false,
+                compute_precision: jammi_numerics::ComputePrecision::F32,
+            };
+            let loaded = CandleBackend.load(&resolved, &device_config).unwrap();
+            let served_lora = match loaded {
+                LoadedModel::Candle(model) => model.distribution_head.expect(
+                    "the real CandleBackend::load must build a distribution head from the \
+                     saved adapter",
+                ),
+                LoadedModel::Ort(_) => panic!("expected a Candle-backend model, got Ort"),
+            };
+            let served = served_lora.forward(&x).unwrap().to_vec2::<f32>().unwrap()[0].clone();
+
+            assert_eq!(
+                trained, served,
+                "use_rslora={use_rslora}: CandleBackend::load's served distribution head \
+                 (built at its `cfg.use_rslora` call site, candle.rs:1698) must reproduce the \
+                 trained forward pass bit-for-bit"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

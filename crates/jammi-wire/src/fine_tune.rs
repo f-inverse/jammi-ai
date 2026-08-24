@@ -447,6 +447,41 @@ impl EmbeddingLoss {
         }
     }
 
+    /// Whether this objective's training rows carry a graded `score` column
+    /// at all — the `(text_a, text_b, score)` Contrastive shape, as opposed
+    /// to an explicit negative (`Triplet`) or a negative drawn from other
+    /// rows in the batch (`MultipleNegativesRanking`).
+    ///
+    /// **A1 (PR-C round 4):** this is a DIFFERENT fact from
+    /// [`Self::min_batch_size`], and the two must never be conflated by
+    /// deriving one from the other. `min_batch_size() >= 2` is true for both
+    /// `{CoSent, AnglE}` (because a graded-score ORDERING pair needs a
+    /// second row to compare against) and `MultipleNegativesRanking`
+    /// (because an in-batch NEGATIVE needs a second row to draw from) — two
+    /// unrelated mechanisms that happen to share the same minimum row count.
+    /// A caller that reads "`min_batch_size() >= 2`" as "this objective
+    /// reads graded scores" gets the right answer for `{CoSent, AnglE}` but
+    /// the WRONG one for `MultipleNegativesRanking`, which never sees a
+    /// `score` column at all. (In the shipped engine this particular wrong
+    /// answer is currently unreachable — `compute_loss` never routes an
+    /// `(anchor, positive)` `Pairs` batch through the graded-score path
+    /// regardless of the configured `embedding_loss`, see
+    /// `TrainingDataLoader::from_pairs`'s doc — but the conflation is a
+    /// landmine for the next caller who reads `min_batch_size() >= 2` as a
+    /// proxy for "reads scores" rather than deriving it, explicitly, from
+    /// this predicate.)
+    ///
+    /// `CosineMse` DOES read a graded score (as its direct MSE regression
+    /// target) despite `min_batch_size() == 1` — the third case
+    /// `min_batch_size() >= 2` alone could never distinguish, in the other
+    /// direction.
+    pub fn reads_graded_scores(&self) -> bool {
+        match self {
+            Self::CoSent | Self::AnglE | Self::CosineMse => true,
+            Self::Triplet { .. } | Self::MultipleNegativesRanking { .. } => false,
+        }
+    }
+
     /// The display name used to name this objective in a refusal message.
     /// Exhaustive alongside [`Self::min_batch_size`] — the compiler, not a
     /// test, is what keeps both in sync with the variant list.
@@ -458,6 +493,44 @@ impl EmbeddingLoss {
             Self::AnglE => "AnglE",
             Self::CosineMse => "CosineMse",
         }
+    }
+}
+
+#[cfg(test)]
+mod embedding_loss_tests {
+    use super::*;
+
+    /// A1 (PR-C round 4): `reads_graded_scores()` and `min_batch_size() >= 2`
+    /// are INDEPENDENT facts, and this pins the one case they disagree on —
+    /// `MultipleNegativesRanking` reports `min_batch_size() == 2` (it needs
+    /// a second row to draw an in-batch NEGATIVE from) but must read
+    /// `reads_graded_scores() == false` (it never sees a `score` column at
+    /// all). A caller deriving "reads scores" from `min_batch_size() >= 2`
+    /// alone would get this variant wrong.
+    #[test]
+    fn reads_graded_scores_disagrees_with_min_batch_size_exactly_for_mnrl() {
+        let mnrl = EmbeddingLoss::MultipleNegativesRanking { temperature: 20.0 };
+        assert_eq!(mnrl.min_batch_size(), 2);
+        assert!(
+            !mnrl.reads_graded_scores(),
+            "MultipleNegativesRanking must not be reported as reading graded scores, despite \
+             sharing min_batch_size()'s value with CoSENT/AnglE"
+        );
+    }
+
+    /// Exhaustive per-variant pin, so a new `EmbeddingLoss` arm must state
+    /// its answer here too (the match in `reads_graded_scores` itself is
+    /// already exhaustive at compile time; this locks the VALUE, not merely
+    /// the coverage).
+    #[test]
+    fn reads_graded_scores_is_pinned_per_variant() {
+        assert!(EmbeddingLoss::CoSent.reads_graded_scores());
+        assert!(EmbeddingLoss::AnglE.reads_graded_scores());
+        assert!(EmbeddingLoss::CosineMse.reads_graded_scores());
+        assert!(!EmbeddingLoss::Triplet { margin: 0.2 }.reads_graded_scores());
+        assert!(
+            !EmbeddingLoss::MultipleNegativesRanking { temperature: 20.0 }.reads_graded_scores()
+        );
     }
 }
 

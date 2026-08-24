@@ -247,17 +247,25 @@ enum TrainingRow {
 /// ordering requirement); `MultipleNegativesRanking`/`Triplet` are not
 /// graded-pair objectives at all.
 ///
-/// Delegates to [`super::EmbeddingLoss::min_batch_size`] rather than
-/// re-deriving its own CoSENT/AnglE/`None` arm list: an ordering objective
-/// needs >= 2 *rows* for exactly the same reason it needs >= 2 distinct
-/// score *levels* — either way, there is no `scores[i] < scores[j]` pair to
-/// read — so the two ">= 2" conditions are one fact, not two independently
-/// maintained copies of it. (`MultipleNegativesRanking` also reports
-/// `min_batch_size() == 2`, but it never reaches a `Contrastive` batch in
-/// practice — see `dispatch_contrastive_loss`'s typed refusal — so this
-/// fn's answer for it is moot.)
+/// **A1 (PR-C round 4):** this is the conjunction of two INDEPENDENT facts —
+/// [`super::EmbeddingLoss::reads_graded_scores`] ("does this objective's
+/// batch carry a `score` column to order at all") and
+/// [`super::EmbeddingLoss::min_batch_size`] `>= 2` ("does this objective
+/// need a second row for ITS OWN reason") — composed explicitly, never one
+/// derived from the other. The previous implementation used
+/// `min_batch_size() >= 2` alone as a proxy for "reads graded scores", which
+/// happens to answer correctly for `{CoSent, AnglE}` (an ordering pair does
+/// need a second row) but WRONGLY calls `MultipleNegativesRanking` an
+/// ordering objective too — MNRL's `min_batch_size() == 2` comes from
+/// needing a second row to draw an in-batch NEGATIVE from, an unrelated
+/// mechanism that reads no `score` column whatsoever. `reads_graded_scores`
+/// closes that gap: MNRL now reads `false` for the right reason (no scores),
+/// not merely because it happens to be moot in the current call path (see
+/// `TrainingDataLoader::from_pairs`'s doc for why an MNRL-dispatched `Pairs`
+/// batch never reaches here in practice).
 fn is_ordering_embedding_objective(loss: Option<super::EmbeddingLoss>) -> bool {
-    loss.unwrap_or_default().min_batch_size() >= 2
+    let loss = loss.unwrap_or_default();
+    loss.reads_graded_scores() && loss.min_batch_size() >= 2
 }
 
 impl TrainingDataLoader {
@@ -409,9 +417,38 @@ impl TrainingDataLoader {
     /// `log(1) = 0` floor with zero gradient. `batch_size` is therefore
     /// refused HERE, at the data edge, naming the objective the source will
     /// actually train, not the one the caller configured.
+    ///
+    /// **`rows.len() < 2` is ALSO refused here (B3), independently of
+    /// `batch_size`.** `batch_size` guards the config knob, not the data: a
+    /// 0- or 1-row dataset passes any `batch_size >= min_batch` check, since
+    /// chunking too few rows still just produces one too-small batch. This
+    /// refusal is the data-volume half of the same fact `batch_size <
+    /// min_batch` is the config-volume half of; see `TrainingLoop::run`'s
+    /// post-split re-check for why this construction-time refusal alone is
+    /// not sufficient (the train/validation split can shrink the train side
+    /// below this floor even when the pre-split dataset cleared it).
     pub fn from_pairs(rows: Vec<(String, String)>, batch_size: usize) -> Result<Self> {
         let min_batch =
             super::EmbeddingLoss::MultipleNegativesRanking { temperature: 0.0 }.min_batch_size();
+        // B3: `batch_size` guards the CONFIG knob, not the DATA. A 0- or
+        // 1-row dataset sails past the `batch_size < min_batch` check below
+        // regardless of how large `batch_size` is configured — chunking 1
+        // row at any batch size still produces exactly one 1-row batch, with
+        // no OTHER row's positive to draw an in-batch negative from, so
+        // every batch of the run trains at MNRL's `log(1) = 0` floor with
+        // zero gradient. Refused here, at the data edge, naming the row
+        // count the caller can actually act on (add rows), distinct from
+        // the `batch_size` remedy the check below names.
+        if rows.len() < min_batch {
+            return Err(JammiError::FineTune(format!(
+                "an (anchor, positive) Pairs source needs at least {min_batch} rows total: with \
+                 fewer than {min_batch} rows there is no OTHER row's positive to draw an \
+                 in-batch negative from under MultipleNegativesRanking, so every batch trains at \
+                 its log(1) = 0 floor with zero gradient regardless of batch_size. Got \
+                 {} row(s). Add more rows.",
+                rows.len()
+            )));
+        }
         if batch_size < min_batch {
             return Err(JammiError::FineTune(format!(
                 "an (anchor, positive) Pairs source is always trained with \
@@ -1070,5 +1107,101 @@ mod tests {
             TrainingDataLoader::from_pairs(rows.clone(), batch_size)
                 .unwrap_or_else(|e| panic!("batch_size={batch_size} must be accepted: {e}"));
         }
+    }
+
+    /// B3 (PR-C round 4): a 0-row `Pairs` source is refused regardless of how
+    /// large `batch_size` is configured — `batch_size` alone guards the
+    /// config knob, never the data. Before this refusal, `from_pairs(vec![],
+    /// 8)` returned `Ok`, and the run would only discover the problem when
+    /// every batch (there are none) trained at MNRL's zero-gradient floor —
+    /// silently, since an empty epoch never even logs a degenerate-batch
+    /// warning.
+    #[test]
+    fn from_pairs_refuses_zero_rows_regardless_of_batch_size() {
+        let err = match TrainingDataLoader::from_pairs(Vec::new(), 8) {
+            Err(e) => e,
+            Ok(_) => panic!("a 0-row Pairs source must be refused even at batch_size=8"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("at least 2 rows") && msg.contains("Got 0 row"),
+            "the refusal must name the row-count floor and the actual count: {msg}"
+        );
+    }
+
+    /// B3 (PR-C round 4): the 1-row sibling of the test above — the
+    /// narrowest case where `batch_size` alone could never catch the defect
+    /// (a single row chunks into exactly one 1-row batch at ANY
+    /// `batch_size >= 1`, so `batch_size < min_batch` never fires).
+    #[test]
+    fn from_pairs_refuses_one_row_regardless_of_batch_size() {
+        let rows = vec![("a1".to_string(), "p1".to_string())];
+        let err = match TrainingDataLoader::from_pairs(rows, 32) {
+            Err(e) => e,
+            Ok(_) => panic!("a 1-row Pairs source must be refused even at batch_size=32"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("at least 2 rows") && msg.contains("Got 1 row"),
+            "the refusal must name the row-count floor and the actual count: {msg}"
+        );
+    }
+
+    // ── A4: GradCache's whole-dataset-as-one-batch degeneracy primitive ──────
+
+    /// The primitive `TrainingLoop::run`'s GradCache arm reads to detect a
+    /// degenerate whole-dataset "batch" (A4, PR-C round 4): a 1-row `Pairs`
+    /// loader's `in_batch_negative_texts()` returns exactly 1 anchor and NO
+    /// explicit negative column — the same `(rows < min_rows,
+    /// negatives.is_none())` pair the GradCache arm gates its diagnostic
+    /// counter on.
+    ///
+    /// Bypasses `from_pairs`'s own construction-time refusal by building the
+    /// private struct literal directly (same module) — that refusal (B3) is
+    /// exactly why the trainer's GradCache diagnostic is unreachable through
+    /// any PUBLIC construction path today (see the `A4` comment at the
+    /// GradCache call site in `trainer.rs`). This test pins the underlying
+    /// primitive's behavior directly, independent of whichever guards
+    /// happen to keep the wired-in trainer.rs check from firing.
+    #[test]
+    fn in_batch_negative_texts_flags_a_single_row_pairs_loader_as_negative_free() {
+        let loader = TrainingDataLoader {
+            format: TrainingFormat::Pairs,
+            data: LoaderData::TextRows(vec![TrainingRow::Pairs {
+                anchor: "a1".to_string(),
+                positive: "p1".to_string(),
+            }]),
+        };
+        let (anchors, positives, negatives) = loader.in_batch_negative_texts().unwrap();
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(positives.len(), 1);
+        assert!(
+            negatives.is_none(),
+            "a Pairs loader draws its negatives in-batch, so in_batch_negative_texts must \
+             report NO explicit negative column — the fact the GradCache diagnostic gates on"
+        );
+    }
+
+    /// The `Triplet` sibling: a 1-row `Triplet` loader carries an EXPLICIT
+    /// negative per row, so it must never be flagged degenerate by the same
+    /// rule — the GradCache arm's `gc_negatives.is_none()` gate exists
+    /// precisely to exclude this case.
+    #[test]
+    fn in_batch_negative_texts_never_flags_a_triplet_loader_as_negative_free() {
+        let loader = TrainingDataLoader {
+            format: TrainingFormat::Triplet,
+            data: LoaderData::TextRows(vec![TrainingRow::Triplet {
+                anchor: "a1".to_string(),
+                positive: "p1".to_string(),
+                negative: "n1".to_string(),
+            }]),
+        };
+        let (anchors, _positives, negatives) = loader.in_batch_negative_texts().unwrap();
+        assert_eq!(anchors.len(), 1);
+        assert!(
+            negatives.is_some(),
+            "a Triplet loader carries an explicit negative per row and must never be reported \
+             as negative-free, even at 1 row"
+        );
     }
 }

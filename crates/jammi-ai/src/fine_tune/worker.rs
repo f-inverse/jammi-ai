@@ -998,9 +998,13 @@ enum NumericColumnError {
     /// A null target at the cited row index. Rejected rather than coerced to
     /// `0.0`, which would silently corrupt the scaler's μ/σ.
     Null(usize),
-    /// A `NaN` target at the cited row index (float columns only). Rejected for
-    /// the same reason as a null.
-    Nan(usize),
+    /// A non-finite (`NaN` or `±infinity`) target at the cited row index
+    /// (float columns only). Rejected for the same reason as a null: an
+    /// infinite target would blow the scaler's mean to `±inf` and its std to
+    /// `NaN` (family D — a mean is unstandardized-computable garbage past a
+    /// non-finite input), exactly as a `NaN` target already corrupted it
+    /// before this check covered `±infinity` too.
+    NonFinite(usize),
 }
 
 /// Extract a numeric column into `Vec<f32>`, accepting the Arrow numeric
@@ -1010,10 +1014,15 @@ enum NumericColumnError {
 /// remaining numeric types (`UInt*`, `Int16`, `Decimal`, …) so a target's exact
 /// Arrow width never decides whether the fine-tune is reachable.
 ///
-/// **Null/NaN rejection is load-bearing.** `Array::value(i)` on a null slot
-/// returns a zero default rather than erroring, which would silently corrupt
-/// the scaler's μ/σ. A null or `NaN` target therefore returns a typed error
-/// citing the row, never a coerced `0.0`.
+/// **Null/non-finite rejection is load-bearing.** `Array::value(i)` on a null
+/// slot returns a zero default rather than erroring, which would silently
+/// corrupt the scaler's μ/σ. A null, `NaN`, or `±infinity` target therefore
+/// returns a typed error citing the row, never a coerced `0.0`. Checking only
+/// `is_nan()` would admit `±infinity` — a `{1.0, +inf, 3.0}` target column
+/// would sail through and reach `TargetScaler::from_targets`, where the mean
+/// itself becomes `inf` and the std (an `inf - inf` subtraction inside the
+/// variance sum) becomes `NaN`, corrupting every de-standardised prediction
+/// this scaler ever produces. `!is_finite()` catches both.
 fn extract_numeric_column(
     col: &dyn arrow::array::Array,
 ) -> std::result::Result<Vec<f32>, NumericColumnError> {
@@ -1068,10 +1077,13 @@ fn extract_numeric_column(
         (0..a.len()).map(|i| a.value(i) as f32).collect()
     };
 
-    // A NaN target (float columns only) would corrupt the scaler; reject it
-    // citing the row, mirroring the null contract.
-    if let Some(i) = floats.iter().position(|v| v.is_nan()) {
-        return Err(NumericColumnError::Nan(i));
+    // A non-finite target (NaN or ±infinity, float columns only) would
+    // corrupt the scaler; reject it citing the row, mirroring the null
+    // contract. `!is_finite()` (not `is_nan()`) is load-bearing: `is_nan()`
+    // alone admits `+inf`/`-inf`, which reaches `TargetScaler::from_targets`
+    // and produces a mean of `inf` and a std of `NaN`.
+    if let Some(i) = floats.iter().position(|v| !v.is_finite()) {
+        return Err(NumericColumnError::NonFinite(i));
     }
     Ok(floats)
 }
@@ -1170,10 +1182,10 @@ fn build_training_data_loader(
                         "'score' has a null at row {i}; a null score cannot be coerced (it \
                          would corrupt the pairwise ordering) — remove or fill the row"
                     ),
-                    NumericColumnError::Nan(i) => format!(
-                        "'score' has a NaN at row {i}; a NaN score cannot be used (it would \
-                         defeat the pairwise-ordering degenerate guards) — remove or fix the \
-                         row"
+                    NumericColumnError::NonFinite(i) => format!(
+                        "'score' has a non-finite value (NaN or \u{00b1}infinity) at row {i}; a \
+                         non-finite score cannot be used (it would defeat the \
+                         pairwise-ordering degenerate guards) — remove or fix the row"
                     ),
                 })
             })?;
@@ -1300,9 +1312,10 @@ fn build_training_data_loader(
                         "regression 'target' has a null at row {i}; a null target cannot be \
                          coerced (it would corrupt the scaler) — remove or fill the row"
                     ),
-                    NumericColumnError::Nan(i) => format!(
-                        "regression 'target' has a NaN at row {i}; a NaN target cannot be used \
-                         (it would corrupt the scaler) — remove or fix the row"
+                    NumericColumnError::NonFinite(i) => format!(
+                        "regression 'target' has a non-finite value (NaN or \u{00b1}infinity) \
+                         at row {i}; a non-finite target cannot be used (it would corrupt the \
+                         scaler) — remove or fix the row"
                     ),
                 })
             })?;
@@ -2190,6 +2203,52 @@ mod tests {
         );
     }
 
+    /// B2: `+infinity`/`-infinity` targets are likewise rejected — `is_nan()`
+    /// alone would admit them, and an unbounded target reaches
+    /// `TargetScaler::from_targets` where the mean becomes `inf` and the std
+    /// becomes `NaN` (an `inf - inf` inside the variance sum), corrupting
+    /// every de-standardised prediction the scaler ever produces.
+    #[test]
+    fn infinite_target_is_rejected_with_typed_error() {
+        let target = Arc::new(Float64Array::from(vec![1.0f64, f64::INFINITY, 3.0])) as ArrayRef;
+        let batch = text_target_batch(&["a", "b", "c"], target);
+        let err = build_training_data_loader(
+            &[batch],
+            &regression_cols(),
+            ModelTask::Regression,
+            None,
+            8,
+        )
+        .err()
+        .unwrap();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("infinity") && msg.contains("row 1"),
+            "+infinity target must be rejected citing the row, got: {msg}"
+        );
+    }
+
+    /// The `-infinity` mirror of the test above.
+    #[test]
+    fn negative_infinite_target_is_rejected_with_typed_error() {
+        let target = Arc::new(Float64Array::from(vec![1.0f64, f64::NEG_INFINITY, 3.0])) as ArrayRef;
+        let batch = text_target_batch(&["a", "b", "c"], target);
+        let err = build_training_data_loader(
+            &[batch],
+            &regression_cols(),
+            ModelTask::Regression,
+            None,
+            8,
+        )
+        .err()
+        .unwrap();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("infinity") && msg.contains("row 1"),
+            "-infinity target must be rejected citing the row, got: {msg}"
+        );
+    }
+
     /// A non-numeric `target` column (strings that don't parse) is a typed
     /// "not a numeric column" error, not a panic.
     #[test]
@@ -2301,6 +2360,52 @@ mod tests {
         assert!(
             msg.contains("NaN") && msg.contains("row 2"),
             "a NaN score amid real levels must be refused citing its row, got: {msg}"
+        );
+    }
+
+    /// B2: `{0.2, 0.9, +infinity}` — `is_nan()` alone would admit this
+    /// column (`+inf` is not NaN), letting it reach
+    /// `from_contrastive`'s dedup-based level count as a spuriously "real"
+    /// third level. `!is_finite()` refuses it at the Arrow-column edge
+    /// instead.
+    #[test]
+    fn infinite_score_column_is_refused() {
+        let score = Arc::new(Float64Array::from(vec![0.2f64, 0.9, f64::INFINITY])) as ArrayRef;
+        let batch = contrastive_batch(&["a1", "a2", "a3"], &["b1", "b2", "b3"], score);
+        let err = build_training_data_loader(
+            &[batch],
+            &contrastive_cols(),
+            ModelTask::TextEmbedding,
+            None,
+            8,
+        )
+        .err()
+        .unwrap();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("infinity") && msg.contains("row 2"),
+            "a +infinity score must be refused citing its row, got: {msg}"
+        );
+    }
+
+    /// The `-infinity` mirror of the test above.
+    #[test]
+    fn negative_infinite_score_column_is_refused() {
+        let score = Arc::new(Float64Array::from(vec![0.2f64, 0.9, f64::NEG_INFINITY])) as ArrayRef;
+        let batch = contrastive_batch(&["a1", "a2", "a3"], &["b1", "b2", "b3"], score);
+        let err = build_training_data_loader(
+            &[batch],
+            &contrastive_cols(),
+            ModelTask::TextEmbedding,
+            None,
+            8,
+        )
+        .err()
+        .unwrap();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("infinity") && msg.contains("row 2"),
+            "a -infinity score must be refused citing its row, got: {msg}"
         );
     }
 

@@ -145,6 +145,32 @@ const QUANTILE_SEP_AGG_MIN: f32 = 3.0;
 /// the weakest measured level.
 const QUANTILE_SEP_POSITIVE_BAR: usize = 9;
 
+/// CEILING arm: the `trim_frac=0.15` trimmed mean of EVERY quantile level's
+/// separation over [`QUANTILE_SEP_SEEDS`] must also stay UNDER this bar. This
+/// is a two-sided control: a floor alone (`QUANTILE_SEP_AGG_MIN`) cannot see
+/// a uniform serve-time scaling defect at the `distribution` head's LoRA read
+/// call site (`load_distribution_head`'s `use_rslora` argument,
+/// `candle.rs:1698`) — that class of defect multiplies every raw head output
+/// (both groups' alike) by the same wrong scaling factor, so `b - a` scales
+/// by that same factor too, which makes the run MORE likely to clear a
+/// floor-only bar, not less. A floor-only oracle cannot see a scale-UP
+/// defect at all; this ceiling closes that gap.
+///
+/// MEASURED trimmed means (this commit, `lora_dropout=0.05`, the shipped
+/// default): level 0.1 -> 4.75, level 0.5 -> 5.89, level 0.9 -> 6.16
+/// (single-seed separations range from about -6.7 to 21.8 across the sweep;
+/// the largest single legitimate separation observed is seed 5's level-0.9
+/// draw, 21.8). Reading `use_rslora` wrong at that call site (a fixed
+/// boolean instead of the persisted `cfg.use_rslora`) applies a
+/// multiplicative scaling error of roughly 2x-4x depending on rank/alpha —
+/// every one of those trimmed means would land at roughly 9.5-12.3 (2x) or
+/// 19-25 (4x). `16.0` sits with real headroom above the measured ceiling
+/// (~6.16, more than 2.5x) while remaining clearly below the 4x-error band
+/// (~19-25), so it survives ordinary seed-to-seed / stream-to-stream scatter
+/// for the correct implementation while still reddening under a scaling
+/// defect of that size.
+const QUANTILE_SEP_AGG_MAX: f32 = 16.0;
+
 /// The `trim_frac`-trimmed mean of `values` (mirrors
 /// `fine_tune::trainer::trimmed_mean`): sorts a copy, drops the top/bottom
 /// `round(trim_frac·n)` entries, averages the rest.
@@ -509,6 +535,18 @@ async fn quantile_regression_serves_and_separates_groups() {
              SEPARATE the groups (learning, not μ-regurgitation): trimmed mean \
              {tm:.2} < required {QUANTILE_SEP_AGG_MIN}. Per-seed separations: \
              {seps:?}. An untrained head gives ≈0 for every seed.",
+            QUANTILE_SEP_SEEDS.len()
+        );
+        // Ceiling arm (see `QUANTILE_SEP_AGG_MAX`'s doc): a floor alone cannot
+        // see a uniform serve-time scaling defect, which only ever inflates
+        // this number.
+        assert!(
+            tm <= QUANTILE_SEP_AGG_MAX,
+            "quantile_{q}: trimmed-mean separation over the {}-seed sweep must \
+             NOT exceed a plausible scale (a uniform serve-time scaling defect \
+             at the distribution head's LoRA read call site inflates every \
+             separation by the same factor): trimmed mean {tm:.2} > \
+             {QUANTILE_SEP_AGG_MAX}. Per-seed separations: {seps:?}.",
             QUANTILE_SEP_SEEDS.len()
         );
         let positive_count = seps.iter().filter(|&&s| s > 0.0).count();

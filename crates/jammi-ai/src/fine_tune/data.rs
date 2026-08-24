@@ -246,11 +246,18 @@ enum TrainingRow {
 /// distinct score levels. `CosineMse` regresses onto the score directly (no
 /// ordering requirement); `MultipleNegativesRanking`/`Triplet` are not
 /// graded-pair objectives at all.
+///
+/// Delegates to [`super::EmbeddingLoss::min_batch_size`] rather than
+/// re-deriving its own CoSENT/AnglE/`None` arm list: an ordering objective
+/// needs >= 2 *rows* for exactly the same reason it needs >= 2 distinct
+/// score *levels* — either way, there is no `scores[i] < scores[j]` pair to
+/// read — so the two ">= 2" conditions are one fact, not two independently
+/// maintained copies of it. (`MultipleNegativesRanking` also reports
+/// `min_batch_size() == 2`, but it never reaches a `Contrastive` batch in
+/// practice — see `dispatch_contrastive_loss`'s typed refusal — so this
+/// fn's answer for it is moot.)
 fn is_ordering_embedding_objective(loss: Option<super::EmbeddingLoss>) -> bool {
-    matches!(
-        loss,
-        None | Some(super::EmbeddingLoss::CoSent) | Some(super::EmbeddingLoss::AnglE)
-    )
+    loss.unwrap_or_default().min_batch_size() >= 2
 }
 
 impl TrainingDataLoader {
@@ -258,8 +265,8 @@ impl TrainingDataLoader {
     ///
     /// Under an ORDERING embedding objective (CoSENT, AnglE — and the `None`
     /// default, which resolves to CoSENT), a dataset whose graded `score`
-    /// column carries fewer than 2 distinct values is refused: the pairwise
-    /// ordering loss reads only `scores[i] < scores[j]` pairs, so a
+    /// column carries fewer than 2 distinct FINITE values is refused: the
+    /// pairwise ordering loss reads only `scores[i] < scores[j]` pairs, so a
     /// single-level dataset has none — every batch would train at the
     /// objective's `log(1) = 0` floor with zero gradient, "converging"
     /// instantly and silently. A non-ordering objective (`CosineMse`
@@ -268,6 +275,24 @@ impl TrainingDataLoader {
     /// data-shape refusal, not a batch_size one (see
     /// `FineTuneConfig::validate`'s companion `batch_size < 2` refusal for
     /// the complementary edge).
+    ///
+    /// Non-finite (NaN/±inf) scores are filtered out before the
+    /// distinct-level count is taken: a NaN forms no valid
+    /// `scores[i] < scores[j]` pair with anything (IEEE-754 comparison
+    /// against NaN is always `false`), so it supplies no ordering signal and
+    /// must not be allowed to inflate the apparent level count. In the
+    /// production path `build_training_data_loader` already refuses a null
+    /// or non-finite `score` cell at the Arrow-column edge (see
+    /// `extract_numeric_column` in `worker.rs`), so a NaN never reaches
+    /// here; this filter is defense in depth for a caller that constructs a
+    /// loader directly.
+    ///
+    /// This refusal is a deliberate jammi divergence from
+    /// `sentence_transformers`'s `CoSENTLoss`
+    /// (`sentence_transformers/losses/CoSENTLoss.py`), which accepts a
+    /// single-level dataset and trains it silently at the same `log(1) = 0`
+    /// floor; jammi refuses at construction instead of shipping a run that
+    /// "converges" on zero gradient.
     pub fn from_contrastive(
         rows: Vec<(String, String, f32)>,
         embedding_loss: Option<super::EmbeddingLoss>,
@@ -275,13 +300,20 @@ impl TrainingDataLoader {
         if is_ordering_embedding_objective(embedding_loss) {
             // `dedup_by` only merges ADJACENT equal runs, so sort first: equal
             // scores collapse to one entry regardless of input row order.
-            let mut sorted: Vec<f32> = rows.iter().map(|(_, _, s)| *s).collect();
-            sorted.sort_by(|a, b| a.total_cmp(b));
+            // Non-finite scores are dropped first (see this fn's doc) so a
+            // NaN can never masquerade as a distinct ordering level.
+            let mut sorted: Vec<f32> = rows
+                .iter()
+                .map(|(_, _, s)| *s)
+                .filter(|s| s.is_finite())
+                .collect();
+            sorted.sort_by(f32::total_cmp);
             sorted.dedup_by(|a, b| a == b);
             if sorted.len() < 2 {
                 return Err(JammiError::FineTune(format!(
-                    "CoSENT/AnglE need \u{2265} 2 distinct score levels; use CosineMse for a \
-                     single-level dataset (got {} distinct level(s) across {} row(s))",
+                    "CoSENT/AnglE need \u{2265} 2 distinct finite score levels; use CosineMse \
+                     for a single-level dataset (got {} distinct finite level(s) across {} \
+                     row(s))",
                     sorted.len(),
                     rows.len()
                 )));
@@ -361,9 +393,38 @@ impl TrainingDataLoader {
 
     /// Create a loader from contrastive pair rows `(anchor, positive)`. The
     /// `MultipleNegativesRanking` objective draws negatives from the rest of
-    /// each batch, so no explicit negative column is needed.
-    pub fn from_pairs(rows: Vec<(String, String)>) -> Self {
-        Self {
+    /// each batch, so no explicit negative column is needed — and, unlike
+    /// [`Self::from_contrastive`]'s `embedding_loss`-gated check, this is
+    /// UNCONDITIONAL: a `Pairs` source is always trained by
+    /// `MultipleNegativesRanking`'s in-batch-negative objective regardless of
+    /// which `embedding_loss` the caller's config names (`compute_loss`
+    /// dispatches every `TrainingBatch::Pairs` to `mnrl_loss`, never to
+    /// `dispatch_contrastive_loss`). `FineTuneConfig::validate`'s own
+    /// `batch_size` refusal cannot see this — it only sees the *configured*
+    /// objective (e.g. `CosineMse`), never that the underlying source is
+    /// `Pairs`-shaped — so a `CosineMse` config with `batch_size = 1` sails
+    /// past that check and would otherwise land here and train MNRL at a
+    /// single row: no other row's positive to draw an in-batch negative
+    /// from, so the softmax is over one class and the loss sits at its
+    /// `log(1) = 0` floor with zero gradient. `batch_size` is therefore
+    /// refused HERE, at the data edge, naming the objective the source will
+    /// actually train, not the one the caller configured.
+    pub fn from_pairs(rows: Vec<(String, String)>, batch_size: usize) -> Result<Self> {
+        let min_batch =
+            super::EmbeddingLoss::MultipleNegativesRanking { temperature: 0.0 }.min_batch_size();
+        if batch_size < min_batch {
+            return Err(JammiError::FineTune(format!(
+                "an (anchor, positive) Pairs source is always trained with \
+                 MultipleNegativesRanking's in-batch-negative objective, regardless of the \
+                 configured embedding_loss: it needs at least {min_batch} rows per batch to \
+                 draw an in-batch negative from another row's positive \
+                 (sentence_transformers/losses/MultipleNegativesRankingLoss.py) — with fewer \
+                 than {min_batch} rows the softmax is over a single class and the loss sits at \
+                 its log(1) = 0 floor with zero gradient. Got batch_size={batch_size}. Raise \
+                 batch_size to at least {min_batch}."
+            )));
+        }
+        Ok(Self {
             format: TrainingFormat::Pairs,
             data: LoaderData::TextRows(
                 rows.into_iter()
@@ -373,7 +434,7 @@ impl TrainingDataLoader {
                     })
                     .collect(),
             ),
-        }
+        })
     }
 
     /// Create a loader from a graph (S11): sample the node-text + edge-table
@@ -923,6 +984,91 @@ mod tests {
             TrainingDataLoader::from_contrastive(multi_level.clone(), loss).unwrap_or_else(|e| {
                 panic!("a 2-level dataset must satisfy every ordering objective ({loss:?}): {e}")
             });
+        }
+    }
+
+    // ── defense in depth: NaN never inflates the distinct-level count ────────
+    //
+    // The production path (`build_training_data_loader` in `worker.rs`)
+    // already refuses a null/non-finite `score` cell before it ever reaches
+    // `from_contrastive`. These pin `from_contrastive` itself, for a caller
+    // that constructs a loader directly, bypassing that Arrow-column edge.
+
+    /// An all-NaN score column must be refused exactly like an all-single-value
+    /// one: a plain `dedup_by(|a, b| a == b)` would never collapse NaN
+    /// (`NaN == NaN` is `false`), so each NaN would count as its own
+    /// "distinct" level and let 3 all-NaN rows sail past the `>= 2` check.
+    /// Filtering non-finite scores first (this fn's doc) collapses them to
+    /// zero finite levels instead.
+    #[test]
+    fn all_nan_scores_are_refused_not_treated_as_distinct_levels() {
+        let rows = vec![
+            ("a1".to_string(), "b1".to_string(), f32::NAN),
+            ("a2".to_string(), "b2".to_string(), f32::NAN),
+            ("a3".to_string(), "b3".to_string(), f32::NAN),
+        ];
+        let err = match TrainingDataLoader::from_contrastive(rows, None) {
+            Err(e) => e,
+            Ok(_) => panic!("an all-NaN score column must be refused, not admitted as diverse"),
+        };
+        assert!(
+            err.to_string().contains("finite"),
+            "the refusal must name the finite-level requirement: {err}"
+        );
+    }
+
+    /// `{0.5, 0.5, NaN}`: only ONE finite level (`0.5`, appearing twice) once
+    /// the NaN is filtered out — still refused, not "2 distinct values"
+    /// (`0.5` and `NaN`) as a NaN-naive dedup would have counted it.
+    #[test]
+    fn mixed_real_and_nan_scores_count_only_finite_levels() {
+        let rows = vec![
+            ("a1".to_string(), "b1".to_string(), 0.5f32),
+            ("a2".to_string(), "b2".to_string(), 0.5f32),
+            ("a3".to_string(), "b3".to_string(), f32::NAN),
+        ];
+        let err = match TrainingDataLoader::from_contrastive(rows, None) {
+            Err(e) => e,
+            Ok(_) => {
+                panic!("one finite level plus a NaN must still be refused (only 1 finite level)")
+            }
+        };
+        assert!(err.to_string().contains("finite"));
+    }
+
+    // ── F1: a `Pairs` source is unconditionally MNRL-trained ─────────────────
+
+    /// `from_pairs` refuses `batch_size < 2` regardless of the caller's
+    /// configured `embedding_loss` — an (anchor, positive) source is always
+    /// trained by `MultipleNegativesRanking`'s in-batch-negative objective,
+    /// which needs another row's positive to draw a negative from.
+    #[test]
+    fn from_pairs_refuses_batch_size_below_mnrl_minimum() {
+        let rows = vec![
+            ("a1".to_string(), "p1".to_string()),
+            ("a2".to_string(), "p2".to_string()),
+        ];
+        let err = match TrainingDataLoader::from_pairs(rows, 1) {
+            Err(e) => e,
+            Ok(_) => panic!("batch_size=1 must be refused for a Pairs source"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("MultipleNegativesRanking") && msg.contains("2"),
+            "the error must name the actual objective the source trains and the minimum: {msg}"
+        );
+    }
+
+    /// Positive control: `batch_size >= 2` is accepted.
+    #[test]
+    fn from_pairs_accepts_batch_size_at_or_above_minimum() {
+        let rows = vec![
+            ("a1".to_string(), "p1".to_string()),
+            ("a2".to_string(), "p2".to_string()),
+        ];
+        for batch_size in [2usize, 8, 32] {
+            TrainingDataLoader::from_pairs(rows.clone(), batch_size)
+                .unwrap_or_else(|e| panic!("batch_size={batch_size} must be accepted: {e}"));
         }
     }
 }

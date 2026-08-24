@@ -471,9 +471,12 @@ impl TrainingLoop {
             let mut epoch_pos_sim = 0.0f64;
             let mut epoch_neg_sim = 0.0f64;
             let mut triplet_batch_count = 0usize;
-            // Count of degenerate (no-ordered-pair) batches under an ordering
-            // embedding objective — see `is_degenerate_ordering_batch`'s doc
-            // (B3). Diagnostic only: the loss value itself is unchanged.
+            // Count of degenerate (no-usable-signal) batches: either a
+            // `Contrastive` batch with no ordered score pair under an
+            // ordering embedding objective (`is_degenerate_ordering_batch`,
+            // B3), or a single-row `Pairs` batch with no in-batch negative
+            // (`is_degenerate_pairs_batch`). Diagnostic only: the loss value
+            // itself is unchanged.
             let mut degenerate_batch_count = 0usize;
 
             // Re-mine hard negatives at refresh boundaries. Mining replaces the
@@ -502,7 +505,9 @@ impl TrainingLoop {
                         &mut epoch_neg_sim,
                         &mut triplet_batch_count,
                     );
-                    if is_degenerate_ordering_batch(&batch, self.config.embedding_loss) {
+                    if is_degenerate_ordering_batch(&batch, self.config.embedding_loss)
+                        || is_degenerate_pairs_batch(&batch)
+                    {
                         degenerate_batch_count += 1;
                     }
                     let loss = self.compute_loss(&batch)?;
@@ -549,7 +554,9 @@ impl TrainingLoop {
                 let text_chunks = epoch_loader.text_chunks(self.config.batch_size);
                 for chunk in &text_chunks {
                     let batch = self.encode_chunk(chunk)?;
-                    if is_degenerate_ordering_batch(&batch, self.config.embedding_loss) {
+                    if is_degenerate_ordering_batch(&batch, self.config.embedding_loss)
+                        || is_degenerate_pairs_batch(&batch)
+                    {
                         degenerate_batch_count += 1;
                     }
                     let loss = self.compute_loss(&batch)?;
@@ -650,21 +657,23 @@ impl TrainingLoop {
                 "Epoch complete"
             );
             // B3: warn (once per epoch, not per batch) when a MAJORITY of this
-            // epoch's batches had no ordered pair to train on — the run is not
+            // epoch's batches had no usable training signal — the run is not
             // failed (a minority-degenerate dataset still trains on its other
             // batches), but a silent >50% floor is worth surfacing rather than
             // discovering only from a loss curve that never moves. The loss
             // value itself is unchanged — see `is_degenerate_ordering_batch`'s
-            // doc.
+            // and `is_degenerate_pairs_batch`'s docs.
             if batch_count > 0 && degenerate_batch_count * 2 > batch_count {
                 tracing::warn!(
                     epoch,
                     degenerate_batch_count,
                     batch_count,
                     "over half of this epoch's batches had no ordered score pair under the \
-                     configured ordering embedding objective (CoSENT/AnglE) — these batches \
-                     trained at the objective's zero-gradient floor. Check the dataset's \
-                     score-level diversity or the batch_size."
+                     configured ordering embedding objective (CoSENT/AnglE), or were a \
+                     single-row Pairs batch with no in-batch negative under \
+                     MultipleNegativesRanking — these batches trained at the objective's \
+                     zero-gradient floor. Check the dataset's score-level diversity or the \
+                     batch_size."
                 );
             }
 
@@ -862,15 +871,19 @@ impl TrainingLoop {
                 job_id = %self.job_id,
                 "hard-negative mining produced no rows; training on original data this epoch"
             );
-            return Ok(self.clone_text_loader(loader));
+            return self.clone_text_loader(loader);
         }
         Ok(TrainingDataLoader::from_triplets(rows))
     }
 
     /// Re-materialise a text loader's in-batch-negative rows as a fresh loader,
     /// used as the mining fall-back. Pairs become a `Pairs` loader; triplets
-    /// keep their explicit negatives.
-    fn clone_text_loader(&self, loader: &TrainingDataLoader) -> TrainingDataLoader {
+    /// keep their explicit negatives. The `Pairs` arm re-validates
+    /// `self.config.batch_size` through the same
+    /// [`super::data::TrainingDataLoader::from_pairs`] refusal the original
+    /// loader's construction already passed (same rows, same config) — this
+    /// is expected to always succeed in practice, never a new failure mode.
+    fn clone_text_loader(&self, loader: &TrainingDataLoader) -> Result<TrainingDataLoader> {
         match loader.in_batch_negative_texts() {
             Ok((anchors, positives, Some(negatives))) => {
                 let rows = anchors
@@ -879,12 +892,13 @@ impl TrainingLoop {
                     .zip(negatives)
                     .map(|((a, p), n)| (a, p, n))
                     .collect();
-                TrainingDataLoader::from_triplets(rows)
+                Ok(TrainingDataLoader::from_triplets(rows))
             }
-            Ok((anchors, positives, None)) => {
-                TrainingDataLoader::from_pairs(anchors.into_iter().zip(positives).collect())
-            }
-            Err(_) => TrainingDataLoader::from_triplets(Vec::new()),
+            Ok((anchors, positives, None)) => TrainingDataLoader::from_pairs(
+                anchors.into_iter().zip(positives).collect(),
+                self.config.batch_size,
+            ),
+            Err(_) => Ok(TrainingDataLoader::from_triplets(Vec::new())),
         }
     }
 
@@ -2337,6 +2351,20 @@ fn dispatch_contrastive_loss(
 /// occasionally strands a batch without any ordered pair — worth counting,
 /// not worth failing the run over.
 ///
+/// Delegates the "is this an ordering objective" question to
+/// [`super::EmbeddingLoss::min_batch_size`] rather than re-deriving the
+/// CoSENT/AnglE/`None` arm list a second time — see `data.rs`'s
+/// `is_ordering_embedding_objective` sibling doc for why the two ">= 2"
+/// conditions are one fact.
+///
+/// Non-finite (NaN) scores are filtered out before the "all collapsed to one
+/// value" check: a NaN forms no valid `scores[i] < scores[j]` pair with
+/// anything, so a plain `==` comparison against NaN (`NaN == NaN` is
+/// `false`) would wrongly call a batch of all-NaN scores non-degenerate. The
+/// production path already refuses a NaN `score` cell at the Arrow-column
+/// edge (`extract_numeric_column` in `worker.rs`) before it ever reaches a
+/// batch, so this filter is defense in depth, not the primary guard.
+///
 /// Every other batch shape / objective is never degenerate by this test — it
 /// is not scored by `pairwise_ordering_loss` at all, so this returns `false`
 /// without inspecting anything.
@@ -2344,22 +2372,43 @@ fn is_degenerate_ordering_batch(
     batch: &super::data::TrainingBatch,
     embedding_loss: Option<super::EmbeddingLoss>,
 ) -> bool {
-    let is_ordering_objective = matches!(
-        embedding_loss,
-        None | Some(super::EmbeddingLoss::CoSent) | Some(super::EmbeddingLoss::AnglE)
-    );
-    if !is_ordering_objective {
+    if embedding_loss.unwrap_or_default().min_batch_size() < 2 {
         return false;
     }
     let super::data::TrainingBatch::Contrastive { scores, .. } = batch else {
         return false;
     };
     match scores.to_vec1::<f32>() {
-        Ok(vals) => vals.len() < 2 || vals.windows(2).all(|w| w[0] == w[1]),
+        Ok(vals) => {
+            let finite: Vec<f32> = vals.into_iter().filter(|v| v.is_finite()).collect();
+            finite.len() < 2 || finite.windows(2).all(|w| w[0] == w[1])
+        }
         // A malformed scores tensor is not this fn's contract to enforce —
         // `compute_loss` surfaces that as its own typed error downstream.
         Err(_) => false,
     }
+}
+
+/// Whether `batch` is a degenerate (single-row) `Pairs` batch: with fewer
+/// than [`super::EmbeddingLoss::MultipleNegativesRanking`]'s own
+/// [`super::EmbeddingLoss::min_batch_size`] rows, there is no OTHER row's
+/// positive to draw an in-batch negative from, so `mnrl_loss` (which every
+/// `Pairs` batch is unconditionally scored by — see `compute_loss`) reduces
+/// to a softmax over a single class and trains at the same `log(1) = 0`
+/// floor with zero gradient as [`is_degenerate_ordering_batch`]'s Contrastive
+/// case. This is the same per-batch DIAGNOSTIC, not a refusal:
+/// `build_training_data_loader` already refuses a `batch_size` below this
+/// bound for a whole `Pairs` dataset, but the LAST, PARTIAL batch of an
+/// epoch can still land at exactly 1 row even when `batch_size >= 2`
+/// (whenever `rows.len() % batch_size == 1`) — this catches that narrower
+/// per-batch case, worth counting, not worth failing the run over.
+fn is_degenerate_pairs_batch(batch: &super::data::TrainingBatch) -> bool {
+    let super::data::TrainingBatch::Pairs { anchors, .. } = batch else {
+        return false;
+    };
+    let min_rows =
+        super::EmbeddingLoss::MultipleNegativesRanking { temperature: 0.0 }.min_batch_size();
+    anchors.dim(0).map(|n| n < min_rows).unwrap_or(false)
 }
 
 /// Evaluate `objective` at each Matryoshka prefix dimension in `dims` and sum
@@ -2655,15 +2704,38 @@ mod tests {
     /// real `TrainingBatch::Contrastive` for BOTH `embedding_loss: None`
     /// (the production default) and `Some(CoSent)` (the explicit choice) —
     /// both must resolve to the closed-form residual
-    /// ([`closed_form_cosent_residual`], `|Δ| ≤ 1e-6`) and NOT the old
-    /// buggy cancelled-scale value `0.25`.
+    /// ([`closed_form_cosent_residual`], `≈ 1.13e-7`), strictly positive, and
+    /// NOT the old buggy cancelled-scale value `0.25`.
     ///
-    /// Mutation check performed by hand and recorded in the hand-off (not
-    /// committed as a permanent probe): temporarily rebinding
-    /// `dispatch_contrastive_loss`'s `Some(CoSent) | None` arm to
-    /// `cosine_mse_loss(emb_a, emb_b, scores)` makes this test FAIL (the
-    /// measured loss reads ≈ 100, `cosine_mse_loss`'s value on this fixture —
-    /// see that fn's doc — not the closed-form ≈ 1.13e-7).
+    /// The closed form is tiny (`≈ 1.13e-7`), so the tolerance is RELATIVE
+    /// (`|loss − closed_form| ≤ 0.1 · closed_form`), not the fixed absolute
+    /// `1e-6` this test used before: an absolute `1e-6` band is wider than
+    /// the closed form itself, so it cannot distinguish the real residual
+    /// from an identically-zero loss (`|0 − 1.13e-7| ≈ 1.13e-7 ≤ 1e-6`
+    /// passes vacuously). `0.1` (10%), not a tighter `1e-3`, because the f32
+    /// forward pass genuinely differs from the f64 closed form by ≈ 6.7% at
+    /// this magnitude: `1 + exp(−16)` sits inside a single f32 ULP of `1.0`
+    /// (`exp(−16) ≈ 1.125e-7`, one ULP at `1.0` is `2⁻²³ ≈ 1.192e-7`), so
+    /// IEEE-754 round-to-nearest rounds the sum UP to `1.0 + 2⁻²³` before
+    /// `log` ever runs — a deterministic quantization of the computation
+    /// itself, not test flakiness, and 10% is still two orders of magnitude
+    /// tighter than the ~100% relative error a `×0` (or wrong-formula)
+    /// mutant produces. `loss > 0.0` is the same anti-vacuity control stated
+    /// directly: a `×0` mutant of the production path is caught by EITHER
+    /// check.
+    ///
+    /// Mutation checks performed by hand and recorded in the hand-off (not
+    /// committed as a permanent probe):
+    /// - Temporarily rebinding `dispatch_contrastive_loss`'s
+    ///   `Some(CoSent) | None` arm to `cosine_mse_loss(emb_a, emb_b, scores)`
+    ///   makes this test FAIL (the measured loss reads ≈ 100,
+    ///   `cosine_mse_loss`'s value on this fixture — see that fn's doc — not
+    ///   the closed-form ≈ 1.13e-7).
+    /// - Temporarily multiplying `cosent_loss`'s return by `0.0` (the ×0
+    ///   mutant) makes this test FAIL: the OLD absolute-`1e-6` tolerance
+    ///   passed vacuously on this mutant (`|0 − 1.13e-7| ≤ 1e-6`); the NEW
+    ///   relative tolerance (100% error vs. the 10% band) and the
+    ///   `loss > 0.0` check both catch it.
     #[tokio::test(flavor = "multi_thread")]
     async fn compute_loss_production_default_is_real_cosent_not_mse() {
         let device = Device::Cpu;
@@ -2689,12 +2761,24 @@ mod tests {
                  got {loss}"
             );
             assert!(
-                (loss as f64 - closed_form).abs() <= 1e-6,
-                "production compute_loss (embedding_loss={embedding_loss:?}) must equal the \
-                 real CoSENT closed form ≈ {closed_form:.3e}, got {loss}"
+                loss > 0.0,
+                "production compute_loss (embedding_loss={embedding_loss:?}) must be strictly \
+                 positive — a ×0 mutant (or any collapse to an identically-zero loss) must not \
+                 pass, got {loss}"
             );
             assert!(
-                (loss - 0.25).abs() > 1e-3,
+                (loss as f64 - closed_form).abs() <= 0.1 * closed_form,
+                "production compute_loss (embedding_loss={embedding_loss:?}) must equal the \
+                 real CoSENT closed form ≈ {closed_form:.3e} within a RELATIVE 10% tolerance \
+                 (an absolute band this wide cannot distinguish the real residual from an \
+                 identically-zero loss; 10%, not tighter, accommodates the f32 quantization at \
+                 this magnitude — see this fn's doc), got {loss}"
+            );
+            // esc-040 control, per the ledger: the old buggy cancelled-scale
+            // cosine-MSE-shaped value sat at 0.25; the real CoSENT residual
+            // must be far from it, not merely outside a narrow band around it.
+            assert!(
+                (loss - 0.25).abs() >= 0.2,
                 "production compute_loss (embedding_loss={embedding_loss:?}) must NOT be the \
                  old cancelled-scale cosine-MSE-shaped value 0.25, got {loss}"
             );
@@ -2768,11 +2852,17 @@ mod tests {
 
     /// Minimal `tracing::Subscriber` that records whether a warn-level event
     /// mentioning "no ordered score pair" was emitted — the B3(c) per-epoch
-    /// degenerate-batch diagnostic. Mirrors
-    /// `crate::model::backend::candle::device_tests::WarnCapture`'s shape.
+    /// degenerate-batch diagnostic — and also records the `(epoch,
+    /// degenerate_batch_count)` pair of every such warning, so a multi-epoch
+    /// test can assert the counter RESETS per epoch rather than accumulating.
+    /// Mirrors `crate::model::backend::candle::device_tests::WarnCapture`'s
+    /// shape.
     #[derive(Clone, Default)]
     struct DegenerateWarnCapture {
         saw_warning: Arc<AtomicBool>,
+        /// `(epoch, degenerate_batch_count)` for every degenerate-majority
+        /// warning observed, in emission order.
+        per_epoch: Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
     }
 
     impl tracing::Subscriber for DegenerateWarnCapture {
@@ -2785,8 +2875,11 @@ mod tests {
         fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
         fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
         fn event(&self, event: &tracing::Event<'_>) {
+            #[derive(Default)]
             struct MsgVisitor {
                 hit: bool,
+                epoch: Option<u64>,
+                degenerate_batch_count: Option<u64>,
             }
             impl tracing::field::Visit for MsgVisitor {
                 fn record_debug(
@@ -2794,17 +2887,27 @@ mod tests {
                     field: &tracing::field::Field,
                     value: &dyn std::fmt::Debug,
                 ) {
-                    if field.name() == "message"
-                        && format!("{value:?}").contains("no ordered score pair")
-                    {
-                        self.hit = true;
+                    let rendered = format!("{value:?}");
+                    match field.name() {
+                        "message" if rendered.contains("no ordered score pair") => {
+                            self.hit = true;
+                        }
+                        "epoch" => self.epoch = rendered.parse().ok(),
+                        "degenerate_batch_count" => {
+                            self.degenerate_batch_count = rendered.parse().ok()
+                        }
+                        _ => {}
                     }
                 }
             }
-            let mut visitor = MsgVisitor { hit: false };
+            let mut visitor = MsgVisitor::default();
             event.record(&mut visitor);
             if visitor.hit {
                 self.saw_warning.store(true, Ordering::SeqCst);
+                if let (Some(epoch), Some(count)) = (visitor.epoch, visitor.degenerate_batch_count)
+                {
+                    self.per_epoch.lock().unwrap().push((epoch, count));
+                }
             }
         }
         fn enter(&self, _: &tracing::span::Id) {}
@@ -2814,19 +2917,30 @@ mod tests {
     /// B3(c): the epoch loop counts degenerate (no-ordered-pair) batches
     /// under an ordering objective and warns ONCE PER EPOCH when a MAJORITY
     /// of the epoch's batches were degenerate — WITHOUT changing the loss
-    /// value itself. Drives the real `TrainingLoop::run` over 3 precomputed
-    /// single-row `Contrastive` batches under the production default
-    /// (`embedding_loss: None` → CoSENT): a lone row can never form a
-    /// `scores[i] < scores[j]` pair, so every batch is degenerate (3/3 >
-    /// 50%). Captures `tracing` output ([`DegenerateWarnCapture`]) to assert
-    /// the warn actually fires, not merely that the counter compiles.
+    /// value itself, and the counter RESETS every epoch rather than
+    /// accumulating.
+    ///
+    /// The fixture is built on a REACHABLE state:
+    /// `batch_size: 2` (the config `FineTuneConfig::validate` would actually
+    /// accept for the production default CoSENT objective — `batch_size: 1`
+    /// is refused by that check and could never reach a real
+    /// `TrainingLoop::run`). Each precomputed 2-row `Contrastive` batch
+    /// carries ONE score level (both rows scored identically), so every
+    /// batch is still degenerate — a 2-row batch with no ordering signal is
+    /// exactly the narrower per-batch case
+    /// `TrainingDataLoader::from_contrastive`'s whole-dataset check cannot
+    /// see (see `is_degenerate_ordering_batch`'s doc). Drives the real
+    /// `TrainingLoop::run` over 2 epochs of 3 such batches (3/3 > 50% each
+    /// epoch) and asserts the captured `(epoch, degenerate_batch_count)`
+    /// pairs are `[(0, 3), (1, 3)]` — epoch 1's count is NOT `6`, proving the
+    /// counter is per-epoch, not cumulative.
     #[tokio::test(flavor = "multi_thread")]
     async fn epoch_warns_on_majority_degenerate_batches_without_changing_loss() {
         let device = Device::Cpu;
         let config = FineTuneConfig {
             embedding_loss: None,
-            epochs: 1,
-            batch_size: 1,
+            epochs: 2,
+            batch_size: 2,
             validation_fraction: 0.0,
             warmup_steps: 0,
             gradient_accumulation_steps: 1,
@@ -2841,9 +2955,19 @@ mod tests {
 
         let batches: Vec<_> = (0..3)
             .map(|_| super::super::data::TrainingBatch::Contrastive {
-                embeddings_a: Tensor::new(&[[1.0f32, 0.0, 0.0, 0.0]], &device).unwrap(),
-                embeddings_b: Tensor::new(&[[0.0f32, 1.0, 0.0, 0.0]], &device).unwrap(),
-                scores: Tensor::new(&[1.0f32], &device).unwrap(),
+                embeddings_a: Tensor::new(
+                    &[[1.0f32, 0.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]],
+                    &device,
+                )
+                .unwrap(),
+                embeddings_b: Tensor::new(
+                    &[[0.0f32, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]],
+                    &device,
+                )
+                .unwrap(),
+                // Both rows in the batch share one score level — no
+                // `scores[i] < scores[j]` pair, so the batch is degenerate.
+                scores: Tensor::new(&[1.0f32, 1.0], &device).unwrap(),
             })
             .collect();
         let loader = super::super::data::TrainingDataLoader::from_precomputed(batches);
@@ -2894,6 +3018,7 @@ mod tests {
 
         let capture = DegenerateWarnCapture::default();
         let flag = Arc::clone(&capture.saw_warning);
+        let per_epoch = Arc::clone(&capture.per_epoch);
         let result = tokio::task::spawn_blocking(move || {
             tracing::subscriber::with_default(capture, || tl.run(&loader))
         })
@@ -2905,6 +3030,12 @@ mod tests {
             flag.load(Ordering::SeqCst),
             "expected a warn-level log when a majority of the epoch's batches were degenerate"
         );
+        assert_eq!(
+            *per_epoch.lock().unwrap(),
+            vec![(0, 3), (1, 3)],
+            "the degenerate-batch count must reset every epoch, not accumulate across epochs \
+             (epoch 1 must read 3, not 6)"
+        );
         // The diagnostic must not change the loss value itself: every batch
         // trains at CoSENT's real `log(1) = 0` floor (no valid pair), so the
         // reported final loss is (near-)zero.
@@ -2912,6 +3043,114 @@ mod tests {
             result.final_loss.abs() < 1e-3,
             "the degenerate-batch diagnostic must not change the loss value itself, got \
              final_loss={}",
+            result.final_loss
+        );
+    }
+
+    /// The `Pairs` sibling of the diagnostic above (F1): the LAST, PARTIAL
+    /// batch of an epoch can land at exactly 1 row even when `batch_size >=
+    /// 2` (`rows.len() % batch_size == 1`), and a 1-row `Pairs` batch has no
+    /// other row's positive to draw an in-batch negative from — degenerate
+    /// under `MultipleNegativesRanking`, the objective every `Pairs` batch
+    /// is unconditionally scored by. This is a per-batch DIAGNOSTIC like the
+    /// Contrastive case, not a refusal: `is_degenerate_pairs_batch` counts
+    /// it into the SAME `degenerate_batch_count` / majority-warn mechanism,
+    /// never failing the run. Drives `TrainingLoop::run` over 3 precomputed
+    /// 1-row `Pairs` batches (3/3 > 50%) and asserts the run completes with
+    /// a near-zero loss (MNRL's single-class softmax floor) and the warn
+    /// fires.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn epoch_warns_on_majority_degenerate_single_row_pairs_batches() {
+        let device = Device::Cpu;
+        let config = FineTuneConfig {
+            embedding_loss: None,
+            epochs: 1,
+            batch_size: 2,
+            validation_fraction: 0.0,
+            warmup_steps: 0,
+            gradient_accumulation_steps: 1,
+            early_stopping_metric: EarlyStoppingMetric::TrainLoss,
+            early_stopping_patience: 10_000,
+            learning_rate: 1e-3,
+            ..Default::default()
+        };
+        let varmap = VarMap::new();
+        let vb = candle_nn::VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let head = super::super::lora::build_projection_head(4, &config, &varmap, &vb).unwrap();
+
+        let batches: Vec<_> = (0..3)
+            .map(|_| super::super::data::TrainingBatch::Pairs {
+                anchors: Tensor::new(&[[1.0f32, 0.0, 0.0, 0.0]], &device).unwrap(),
+                positives: Tensor::new(&[[0.0f32, 1.0, 0.0, 0.0]], &device).unwrap(),
+            })
+            .collect();
+        let loader = super::super::data::TrainingDataLoader::from_precomputed(batches);
+
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.keep();
+        let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir_path).await.unwrap());
+        catalog
+            .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
+                model_id: "f1-pairs-model",
+                version: 1,
+                model_type: "embedding",
+                backend: "candle",
+                task: ModelTask::TextEmbedding,
+                base_model_id: None,
+                artifact_path: None,
+                config_json: None,
+            })
+            .await
+            .unwrap();
+        catalog
+            .create_training_job(jammi_db::catalog::training_repo::CreateTrainingJobParams {
+                job_id: "f1-pairs-job",
+                base_model_id: "f1-pairs-model::1",
+                training_source: "src",
+                loss_type: "pairs",
+                hyperparams: "{}",
+                kind: "fine_tune",
+                training_spec: "{}",
+            })
+            .await
+            .unwrap();
+        catalog
+            .claim_next_training_job("f1-pairs-worker", std::time::Duration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("queued job is claimable");
+
+        let mut tl =
+            TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+                .device(device.clone())
+                .job_id("f1-pairs-job".into())
+                .worker_id("f1-pairs-worker".into())
+                .catalog(catalog)
+                .artifact_dir(dir_path)
+                .build()
+                .unwrap();
+
+        let capture = DegenerateWarnCapture::default();
+        let per_epoch = Arc::clone(&capture.per_epoch);
+        let result = tokio::task::spawn_blocking(move || {
+            tracing::subscriber::with_default(capture, || tl.run(&loader))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            *per_epoch.lock().unwrap(),
+            vec![(0, 3)],
+            "all 3 single-row Pairs batches must be counted degenerate in epoch 0"
+        );
+        // MNRL's cross-entropy over a single class (`log_softmax` of one
+        // logit against itself) is exactly `0` — the same zero-gradient
+        // floor the Contrastive case trains at.
+        assert!(
+            result.final_loss.abs() < 1e-3,
+            "a single-row Pairs batch must train at MNRL's single-class zero-gradient floor, \
+             got final_loss={}",
             result.final_loss
         );
     }

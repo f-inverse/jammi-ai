@@ -385,7 +385,7 @@ impl LoraLinear {
 
     /// Reconstruct a `LoraLinear` from tensors already loaded from disk.
     ///
-    /// `rank` is inferred from `lora_a.dims()[0]`; scaling is [`lora_scaling`]
+    /// `rank` is inferred from `lora_a.dims()[0]`; scaling is `lora_scaling`
     /// of `(alpha, rank, use_rslora)` — the SAME pure function `new` calls,
     /// so a reload can never silently disagree with the run that trained the
     /// adapter. The invariant is that scaling is entirely determined by the
@@ -395,7 +395,7 @@ impl LoraLinear {
     /// not assume vanilla scaling.
     ///
     /// Refuses (typed, [`LoraError::Config`]) when `lora_a.dims()[0] == 0` —
-    /// see [`lora_scaling`]'s domain doc.
+    /// see `lora_scaling`'s domain doc.
     pub fn from_loaded(
         base: Linear,
         lora_a: Tensor,
@@ -417,7 +417,7 @@ impl LoraLinear {
     }
 
     /// The effective LoRA scaling factor this layer applies — see
-    /// [`lora_scaling`]'s doc for what determines it. A pure read of the
+    /// `lora_scaling`'s doc for what determines it. A pure read of the
     /// value computed at construction (`new` or `from_loaded`), useful for
     /// tests and diagnostics that need to confirm the two constructors agree
     /// bit-for-bit without re-deriving it from a forward pass.

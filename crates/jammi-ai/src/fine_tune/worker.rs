@@ -498,6 +498,7 @@ impl TrainingWorker {
                     &columns,
                     task,
                     common.config.embedding_loss,
+                    common.config.batch_size,
                 )
                 .map_err(WorkerJobError::from)?;
                 let run = FineTuneRun {
@@ -1089,11 +1090,22 @@ fn extract_numeric_column(
 /// default) over a dataset whose graded scores carry fewer than 2 distinct
 /// levels is refused here — see `TrainingDataLoader::from_contrastive`'s doc.
 /// Every other format ignores it.
+///
+/// `batch_size` is the fine-tune config's configured micro-batch size, needed
+/// ONLY to validate a `Pairs` (`anchor, positive`) source at construction: a
+/// `Pairs` source always trains `MultipleNegativesRanking`'s in-batch-negative
+/// objective regardless of `embedding_loss` (`FineTuneConfig::validate`'s
+/// `batch_size` refusal cannot see this — it only sees the configured
+/// objective, never the data's shape), so `batch_size <
+/// MultipleNegativesRanking's min_batch_size()` is refused here, naming the
+/// objective the source will actually train — see
+/// [`super::data::TrainingDataLoader::from_pairs`]'s doc.
 fn build_training_data_loader(
     batches: &[RecordBatch],
     columns: &[String],
     task: ModelTask,
     embedding_loss: Option<crate::fine_tune::EmbeddingLoss>,
+    batch_size: usize,
 ) -> Result<TrainingDataLoader> {
     let col_names: Vec<&str> = columns.iter().map(|s| s.as_str()).collect();
 
@@ -1142,21 +1154,29 @@ fn build_training_data_loader(
                 .ok_or_else(|| JammiError::FineTune("'text_a' is not a string column".into()))?;
             let b_vals = extract_string_column(b_col.as_ref())
                 .ok_or_else(|| JammiError::FineTune("'text_b' is not a string column".into()))?;
-            let s_arr = s_col
-                .as_any()
-                .downcast_ref::<arrow::array::Float64Array>()
-                .map(|arr| {
-                    (0..arr.len())
-                        .map(|i| arr.value(i) as f32)
-                        .collect::<Vec<_>>()
+            // Reuse the regression path's own `extract_numeric_column` /
+            // `NumericColumnError` — the same typed-error class, so a null or
+            // non-finite `score` is refused here (citing the row) instead of
+            // admitted into `sorted`/`is_degenerate_ordering_batch`'s
+            // degenerate-ordering guards, which — per family F — must never
+            // see a NaN they could silently pass through as a "real" level.
+            let s_arr = extract_numeric_column(s_col.as_ref()).map_err(|e| {
+                JammiError::FineTune(match e {
+                    NumericColumnError::NotNumeric => format!(
+                        "'score' is not a numeric column (its Arrow type is {})",
+                        s_col.data_type()
+                    ),
+                    NumericColumnError::Null(i) => format!(
+                        "'score' has a null at row {i}; a null score cannot be coerced (it \
+                         would corrupt the pairwise ordering) — remove or fill the row"
+                    ),
+                    NumericColumnError::Nan(i) => format!(
+                        "'score' has a NaN at row {i}; a NaN score cannot be used (it would \
+                         defeat the pairwise-ordering degenerate guards) — remove or fix the \
+                         row"
+                    ),
                 })
-                .or_else(|| {
-                    s_col
-                        .as_any()
-                        .downcast_ref::<arrow::array::Float32Array>()
-                        .map(|arr| (0..arr.len()).map(|i| arr.value(i)).collect())
-                })
-                .ok_or_else(|| JammiError::FineTune("'score' is not a float column".into()))?;
+            })?;
 
             for (i, &score) in s_arr.iter().enumerate().take(batch.num_rows()) {
                 rows.push((a_vals[i].clone(), b_vals[i].clone(), score));
@@ -1246,7 +1266,7 @@ fn build_training_data_loader(
                 rows.push((anchor_vals[i].clone(), pos_vals[i].clone()));
             }
         }
-        Ok(TrainingDataLoader::from_pairs(rows))
+        TrainingDataLoader::from_pairs(rows, batch_size)
     } else if task == ModelTask::Regression {
         // Regression: a string `text` column and a numeric `target` column. The
         // target is read into `f32` (handling int64/float64/float32/… via
@@ -2020,9 +2040,14 @@ mod tests {
     fn detector_builds_regression_loader_from_int64_target() {
         let target = Arc::new(Int64Array::from(vec![2017i64, 2018, 2016])) as ArrayRef;
         let batch = text_target_batch(&["a", "b", "c"], target);
-        let loader =
-            build_training_data_loader(&[batch], &regression_cols(), ModelTask::Regression, None)
-                .unwrap();
+        let loader = build_training_data_loader(
+            &[batch],
+            &regression_cols(),
+            ModelTask::Regression,
+            None,
+            8,
+        )
+        .unwrap();
         assert!(matches!(loader.format(), TrainingFormat::Regression));
         assert_eq!(loader.len(), 3);
         assert_eq!(
@@ -2049,6 +2074,7 @@ mod tests {
                 &regression_cols(),
                 ModelTask::Regression,
                 None,
+                8,
             )
             .unwrap();
             assert_eq!(loader.regression_targets().unwrap(), vec![1.5, 2.5]);
@@ -2060,9 +2086,14 @@ mod tests {
     fn detector_reads_int32_target() {
         let target = Arc::new(Int32Array::from(vec![10i32, 20])) as ArrayRef;
         let batch = text_target_batch(&["a", "b"], target);
-        let loader =
-            build_training_data_loader(&[batch], &regression_cols(), ModelTask::Regression, None)
-                .unwrap();
+        let loader = build_training_data_loader(
+            &[batch],
+            &regression_cols(),
+            ModelTask::Regression,
+            None,
+            8,
+        )
+        .unwrap();
         assert_eq!(loader.regression_targets().unwrap(), vec![10.0, 20.0]);
     }
 
@@ -2081,7 +2112,7 @@ mod tests {
         let label = Arc::new(StringArray::from(vec!["2017", "2018"])) as ArrayRef;
         let batch = ArrowBatch::try_new(schema, vec![text, label]).unwrap();
         let cols = vec!["text".to_string(), "label".to_string()];
-        let err = build_training_data_loader(&[batch], &cols, ModelTask::Regression, None)
+        let err = build_training_data_loader(&[batch], &cols, ModelTask::Regression, None, 8)
             .err()
             .unwrap();
         let msg = err.to_string();
@@ -2109,7 +2140,7 @@ mod tests {
         let batch = ArrowBatch::try_new(schema, vec![text, label]).unwrap();
         let cols = vec!["text".to_string(), "label".to_string()];
         let loader =
-            build_training_data_loader(&[batch], &cols, ModelTask::TextEmbedding, None).unwrap();
+            build_training_data_loader(&[batch], &cols, ModelTask::TextEmbedding, None, 8).unwrap();
         assert!(matches!(
             loader.format(),
             TrainingFormat::Classification { num_classes: 2 }
@@ -2122,10 +2153,15 @@ mod tests {
     fn null_target_is_rejected_with_typed_error() {
         let target = Arc::new(Int64Array::from(vec![Some(2017i64), None, Some(2018)])) as ArrayRef;
         let batch = text_target_batch(&["a", "b", "c"], target);
-        let err =
-            build_training_data_loader(&[batch], &regression_cols(), ModelTask::Regression, None)
-                .err()
-                .unwrap();
+        let err = build_training_data_loader(
+            &[batch],
+            &regression_cols(),
+            ModelTask::Regression,
+            None,
+            8,
+        )
+        .err()
+        .unwrap();
         let msg = err.to_string();
         assert!(
             msg.contains("null") && msg.contains("row 1"),
@@ -2138,10 +2174,15 @@ mod tests {
     fn nan_target_is_rejected_with_typed_error() {
         let target = Arc::new(Float64Array::from(vec![1.0f64, f64::NAN, 3.0])) as ArrayRef;
         let batch = text_target_batch(&["a", "b", "c"], target);
-        let err =
-            build_training_data_loader(&[batch], &regression_cols(), ModelTask::Regression, None)
-                .err()
-                .unwrap();
+        let err = build_training_data_loader(
+            &[batch],
+            &regression_cols(),
+            ModelTask::Regression,
+            None,
+            8,
+        )
+        .err()
+        .unwrap();
         let msg = err.to_string();
         assert!(
             msg.contains("NaN") && msg.contains("row 1"),
@@ -2155,10 +2196,15 @@ mod tests {
     fn non_numeric_target_is_typed_error() {
         let target = Arc::new(StringArray::from(vec!["alpha", "beta"])) as ArrayRef;
         let batch = text_target_batch(&["a", "b"], target);
-        let err =
-            build_training_data_loader(&[batch], &regression_cols(), ModelTask::Regression, None)
-                .err()
-                .unwrap();
+        let err = build_training_data_loader(
+            &[batch],
+            &regression_cols(),
+            ModelTask::Regression,
+            None,
+            8,
+        )
+        .err()
+        .unwrap();
         assert!(
             err.to_string().contains("not a numeric"),
             "non-numeric target must be a typed error, got: {err}"
@@ -2171,12 +2217,131 @@ mod tests {
     fn constant_target_builds_loader() {
         let target = Arc::new(Int64Array::from(vec![2017i64, 2017, 2017])) as ArrayRef;
         let batch = text_target_batch(&["a", "b", "c"], target);
-        let loader =
-            build_training_data_loader(&[batch], &regression_cols(), ModelTask::Regression, None)
-                .unwrap();
+        let loader = build_training_data_loader(
+            &[batch],
+            &regression_cols(),
+            ModelTask::Regression,
+            None,
+            8,
+        )
+        .unwrap();
         assert_eq!(
             loader.regression_targets().unwrap(),
             vec![2017.0, 2017.0, 2017.0]
         );
+    }
+
+    // ─── Contrastive `score` column: null/NaN refused at extraction ─────────
+    //
+    // `build_training_data_loader`'s `has_contrastive` arm reads `score`
+    // through `extract_numeric_column` — the same typed-error class the
+    // regression `target` extractor above uses — so a null or non-finite
+    // score is refused HERE, before it ever reaches
+    // `TrainingDataLoader::from_contrastive`'s degenerate-ordering-levels
+    // guard (which a NaN would otherwise defeat: `NaN == NaN` is `false`,
+    // so a plain `dedup_by(|a, b| a == b)` never collapses NaN and can let
+    // an all-NaN column masquerade as diverse).
+
+    fn contrastive_batch(text_a: &[&str], text_b: &[&str], score: ArrayRef) -> ArrowBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("text_a", DataType::Utf8, true),
+            Field::new("text_b", DataType::Utf8, true),
+            Field::new("score", score.data_type().clone(), true),
+        ]));
+        let a = Arc::new(StringArray::from(text_a.to_vec())) as ArrayRef;
+        let b = Arc::new(StringArray::from(text_b.to_vec())) as ArrayRef;
+        ArrowBatch::try_new(schema, vec![a, b, score]).unwrap()
+    }
+
+    fn contrastive_cols() -> Vec<String> {
+        vec!["text_a".into(), "text_b".into(), "score".into()]
+    }
+
+    /// An all-NaN `score` column is refused at extraction — the NaN never
+    /// reaches `from_contrastive`'s dedup-based level count, where it would
+    /// otherwise (falsely) look like `3` distinct, never-equal levels.
+    #[test]
+    fn all_nan_score_column_is_refused() {
+        let score = Arc::new(Float64Array::from(vec![f64::NAN, f64::NAN, f64::NAN])) as ArrayRef;
+        let batch = contrastive_batch(&["a1", "a2", "a3"], &["b1", "b2", "b3"], score);
+        let err = build_training_data_loader(
+            &[batch],
+            &contrastive_cols(),
+            ModelTask::TextEmbedding,
+            None,
+            8,
+        )
+        .err()
+        .unwrap();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("NaN") && msg.contains("score"),
+            "an all-NaN score column must be refused citing the row, got: {msg}"
+        );
+    }
+
+    /// `{0.5, 0.5, NaN}`: two rows share a real level and the third is NaN.
+    /// The naive `windows(2).all(|w| w[0] == w[1])` per-batch guard
+    /// (trainer.rs) would call this non-degenerate (`0.5 != NaN`), but this
+    /// column must never even reach that guard — it is refused right here.
+    #[test]
+    fn mixed_real_and_nan_score_column_is_refused() {
+        let score = Arc::new(Float64Array::from(vec![0.5f64, 0.5, f64::NAN])) as ArrayRef;
+        let batch = contrastive_batch(&["a1", "a2", "a3"], &["b1", "b2", "b3"], score);
+        let err = build_training_data_loader(
+            &[batch],
+            &contrastive_cols(),
+            ModelTask::TextEmbedding,
+            None,
+            8,
+        )
+        .err()
+        .unwrap();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("NaN") && msg.contains("row 2"),
+            "a NaN score amid real levels must be refused citing its row, got: {msg}"
+        );
+    }
+
+    /// A null `score` is refused the same way a null regression `target` is —
+    /// never coerced to `0.0`, which would silently corrupt the ordering.
+    #[test]
+    fn null_score_column_is_refused() {
+        let score = Arc::new(Float64Array::from(vec![Some(0.2f64), None, Some(0.9)])) as ArrayRef;
+        let batch = contrastive_batch(&["a1", "a2", "a3"], &["b1", "b2", "b3"], score);
+        let err = build_training_data_loader(
+            &[batch],
+            &contrastive_cols(),
+            ModelTask::TextEmbedding,
+            None,
+            8,
+        )
+        .err()
+        .unwrap();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("null") && msg.contains("row 1"),
+            "a null score must be refused citing the row, got: {msg}"
+        );
+    }
+
+    /// Positive control: a fully finite, non-null, multi-level `score`
+    /// column is accepted and builds a real `Contrastive` loader — the
+    /// refusal above is narrow to null/non-finite, not every score column.
+    #[test]
+    fn finite_score_column_is_accepted() {
+        let score = Arc::new(Float64Array::from(vec![0.2f64, 0.9, 0.5])) as ArrayRef;
+        let batch = contrastive_batch(&["a1", "a2", "a3"], &["b1", "b2", "b3"], score);
+        let loader = build_training_data_loader(
+            &[batch],
+            &contrastive_cols(),
+            ModelTask::TextEmbedding,
+            None,
+            8,
+        )
+        .unwrap();
+        assert!(matches!(loader.format(), TrainingFormat::Contrastive));
+        assert_eq!(loader.len(), 3);
     }
 }

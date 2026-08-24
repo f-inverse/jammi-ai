@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 
+use jammi_db::ModelTask;
 use serde::{Deserialize, Serialize};
 
 // The LoRA init knob and the compute-precision vocabulary are part of
@@ -434,6 +435,11 @@ impl EmbeddingLoss {
     /// `Triplet` and `CosineMse` score each row independently — no cross-row
     /// comparison is ever formed — so a batch of 1 row is well-formed for
     /// either.
+    ///
+    /// This bound only ever fires for an embedding-training [`ModelTask`]:
+    /// `embedding_loss` is meaningless for a Regression/Classification/NER
+    /// head, so [`FineTuneConfig::validate`] gates this check on `task`
+    /// rather than applying it to every job.
     pub fn min_batch_size(&self) -> usize {
         match self {
             Self::CoSent | Self::AnglE | Self::MultipleNegativesRanking { .. } => 2,
@@ -456,8 +462,21 @@ impl EmbeddingLoss {
 }
 
 impl FineTuneConfig {
-    /// Validate all fields. Returns an error describing the first invalid field.
-    pub fn validate(&self) -> jammi_db::error::Result<()> {
+    /// Validate all fields against the job's [`ModelTask`]. Returns an error
+    /// describing the first invalid field.
+    ///
+    /// `task` is required (not inferred from `self`) because one field's
+    /// validity depends on which head is being trained: the
+    /// [`Self::embedding_loss`] minimum-batch-size rule below applies only
+    /// when `task` trains an embedding objective (in-batch-negative /
+    /// pairwise-ordering pairs). A Regression/Classification/NER head has no
+    /// `embedding_loss` in play — `embedding_loss.unwrap_or_default()`
+    /// resolving to CoSENT's `min_batch_size() == 2` must not refuse a
+    /// batch_size=1 regression run that never touches that objective. The
+    /// match on `task` is exhaustive (no wildcard) so a new [`ModelTask`]
+    /// variant forces this call site to state, at compile time, whether it
+    /// carries the embedding batch-size rule.
+    pub fn validate(&self, task: ModelTask) -> jammi_db::error::Result<()> {
         use jammi_db::error::JammiError;
 
         if self.lora_rank == 0 {
@@ -497,25 +516,40 @@ impl FineTuneConfig {
         // no visibility into the data's shape. Refused at the input edge,
         // naming the resolved objective and the minimum, rather than left to
         // surface as an unexplained zero loss mid-run.
-        let resolved_loss = self.embedding_loss.unwrap_or_default();
-        let min_batch = resolved_loss.min_batch_size();
-        if self.batch_size < min_batch {
-            let name = resolved_loss.name();
-            return Err(JammiError::FineTune(format!(
-                "{name} needs at least {min_batch} rows per batch to compute a \
-                 non-degenerate gradient: CoSENT/AnglE score ordered pairs within the batch, \
-                 and MultipleNegativesRanking scores each row's positive against every other \
-                 row's positive as an in-batch negative \
-                 (sentence_transformers/losses/MultipleNegativesRankingLoss.py) — with fewer \
-                 than {min_batch} rows neither comparison can be formed, and the loss sits at \
-                 its log(1) = 0 floor with zero gradient. Got batch_size={}. Raise batch_size \
-                 to at least {min_batch}. Switching embedding_loss to CosineMse only helps for \
-                 a graded (text_a, text_b, score) pair source, where CosineMse regresses each \
-                 row independently; an (anchor, positive) pairs source is always trained with \
-                 MultipleNegativesRanking's in-batch-negative ranking regardless of \
-                 embedding_loss, so batch_size >= 2 is required there too.",
-                self.batch_size
-            )));
+        //
+        // This rule is scoped to embedding tasks (`task` trains an embedding
+        // objective — in-batch-negative / pairwise-ordering pairs).
+        // Regression/Classification/NER heads never see `embedding_loss`;
+        // `unwrap_or_default()` resolving to CoSENT must not refuse those
+        // jobs at batch_size=1. Exhaustive match — a new `ModelTask` variant
+        // must state here whether it carries this rule.
+        let is_embedding_task = match task {
+            ModelTask::TextEmbedding | ModelTask::ImageEmbedding | ModelTask::AudioEmbedding => {
+                true
+            }
+            ModelTask::Classification | ModelTask::Ner | ModelTask::Regression => false,
+        };
+        if is_embedding_task {
+            let resolved_loss = self.embedding_loss.unwrap_or_default();
+            let min_batch = resolved_loss.min_batch_size();
+            if self.batch_size < min_batch {
+                let name = resolved_loss.name();
+                return Err(JammiError::FineTune(format!(
+                    "{name} needs at least {min_batch} rows per batch to compute a \
+                     non-degenerate gradient: CoSENT/AnglE score ordered pairs within the batch, \
+                     and MultipleNegativesRanking scores each row's positive against every other \
+                     row's positive as an in-batch negative \
+                     (sentence_transformers/losses/MultipleNegativesRankingLoss.py) — with fewer \
+                     than {min_batch} rows neither comparison can be formed, and the loss sits at \
+                     its log(1) = 0 floor with zero gradient. Got batch_size={}. Raise batch_size \
+                     to at least {min_batch}. Switching embedding_loss to CosineMse only helps for \
+                     a graded (text_a, text_b, score) pair source, where CosineMse regresses each \
+                     row independently; an (anchor, positive) pairs source is always trained with \
+                     MultipleNegativesRanking's in-batch-negative ranking regardless of \
+                     embedding_loss, so batch_size >= 2 is required there too.",
+                    self.batch_size
+                )));
+            }
         }
         if self.gradient_accumulation_steps == 0 {
             return Err(JammiError::FineTune(
@@ -611,7 +645,9 @@ mod validation_tests {
             lora_alpha: f64::NAN,
             ..Default::default()
         };
-        let err = cfg.validate().expect_err("NaN lora_alpha must be refused");
+        let err = cfg
+            .validate(ModelTask::TextEmbedding)
+            .expect_err("NaN lora_alpha must be refused");
         assert!(
             err.to_string().contains("lora_alpha"),
             "the error must name the field: {err}"
@@ -626,7 +662,7 @@ mod validation_tests {
                 lora_alpha: alpha,
                 ..Default::default()
             };
-            cfg.validate()
+            cfg.validate(ModelTask::TextEmbedding)
                 .expect_err(&format!("{alpha} lora_alpha must be refused"));
         }
     }
@@ -636,7 +672,7 @@ mod validation_tests {
     #[test]
     fn finite_positive_lora_alpha_is_accepted() {
         FineTuneConfig::default()
-            .validate()
+            .validate(ModelTask::TextEmbedding)
             .expect("the shipped default lora_alpha must remain valid");
     }
 
@@ -663,7 +699,7 @@ mod validation_tests {
             ..Default::default()
         };
         let err = cfg
-            .validate()
+            .validate(ModelTask::TextEmbedding)
             .expect_err("val_loss over an empty split must be refused");
         let msg = err.to_string();
         assert!(
@@ -686,7 +722,7 @@ mod validation_tests {
             early_stopping_metric: EarlyStoppingMetric::TrainLoss,
             ..Default::default()
         }
-        .validate()
+        .validate(ModelTask::TextEmbedding)
         .expect("no split + train_loss is the documented way to train on everything");
 
         FineTuneConfig {
@@ -694,11 +730,11 @@ mod validation_tests {
             early_stopping_metric: EarlyStoppingMetric::ValLoss,
             ..Default::default()
         }
-        .validate()
+        .validate(ModelTask::TextEmbedding)
         .expect("a real split + val_loss is the default shape");
 
         FineTuneConfig::default()
-            .validate()
+            .validate(ModelTask::TextEmbedding)
             .expect("the shipped default must remain valid");
     }
 
@@ -718,7 +754,7 @@ mod validation_tests {
             ..Default::default()
         };
         let err = cfg
-            .validate()
+            .validate(ModelTask::TextEmbedding)
             .expect_err("batch_size=1 under the ordering default must be refused");
         let msg = err.to_string();
         assert!(
@@ -740,7 +776,7 @@ mod validation_tests {
             ..Default::default()
         };
         let err = cfg
-            .validate()
+            .validate(ModelTask::TextEmbedding)
             .expect_err("batch_size=1 under AnglE must be refused");
         let msg = err.to_string();
         assert!(
@@ -762,7 +798,7 @@ mod validation_tests {
             ..Default::default()
         };
         let err = cfg
-            .validate()
+            .validate(ModelTask::TextEmbedding)
             .expect_err("batch_size=1 under MultipleNegativesRanking must be refused");
         let msg = err.to_string();
         assert!(
@@ -796,7 +832,7 @@ mod validation_tests {
             embedding_loss: Some(EmbeddingLoss::CosineMse),
             ..Default::default()
         }
-        .validate()
+        .validate(ModelTask::TextEmbedding)
         .expect("batch_size=1 is legal for CosineMse (per-row objective)");
 
         FineTuneConfig {
@@ -804,7 +840,7 @@ mod validation_tests {
             embedding_loss: Some(EmbeddingLoss::Triplet { margin: 0.2 }),
             ..Default::default()
         }
-        .validate()
+        .validate(ModelTask::TextEmbedding)
         .expect("batch_size=1 is legal for Triplet (per-row objective)");
 
         for loss in [
@@ -818,9 +854,124 @@ mod validation_tests {
                 embedding_loss: loss,
                 ..Default::default()
             }
-            .validate()
+            .validate(ModelTask::TextEmbedding)
             .unwrap_or_else(|e| {
                 panic!("batch_size=2 must satisfy every objective that needs it ({loss:?}): {e}")
+            });
+        }
+    }
+
+    // ── PR-C round 4: the embedding min-batch-size rule is task-scoped ────
+    //
+    // `embedding_loss` is meaningless for a Regression/Classification/NER
+    // head, so `FineTuneConfig::validate` must not apply the CoSENT/AnglE/MNRL
+    // min-batch-size rule to those tasks. Only an embedding-training
+    // `ModelTask` (TextEmbedding/ImageEmbedding/AudioEmbedding) carries it.
+
+    /// Regression, Classification, and NER heads at `batch_size = 1` are
+    /// accepted under the (irrelevant) DEFAULT `embedding_loss` resolution
+    /// (`None` -> CoSENT, `min_batch_size() == 2`) — the rule must not apply
+    /// outside an embedding task.
+    #[test]
+    fn non_embedding_tasks_accept_batch_size_one_under_default_embedding_loss() {
+        for task in [
+            ModelTask::Regression,
+            ModelTask::Classification,
+            ModelTask::Ner,
+        ] {
+            FineTuneConfig {
+                batch_size: 1,
+                embedding_loss: None,
+                ..Default::default()
+            }
+            .validate(task)
+            .unwrap_or_else(|e| {
+                panic!("batch_size=1 must be legal for a non-embedding task ({task:?}): {e}")
+            });
+        }
+    }
+
+    /// Same positive control with `embedding_loss` explicitly set to an
+    /// ordering objective (CoSENT/AnglE/MNRL) that *would* be refused under
+    /// an embedding task — a Regression/Classification/NER job never reads
+    /// `embedding_loss` at all, so the field's value must not matter.
+    #[test]
+    fn non_embedding_tasks_accept_batch_size_one_even_with_ordering_embedding_loss_set() {
+        for task in [
+            ModelTask::Regression,
+            ModelTask::Classification,
+            ModelTask::Ner,
+        ] {
+            for loss in [
+                Some(EmbeddingLoss::CoSent),
+                Some(EmbeddingLoss::AnglE),
+                Some(EmbeddingLoss::MultipleNegativesRanking { temperature: 20.0 }),
+            ] {
+                FineTuneConfig {
+                    batch_size: 1,
+                    embedding_loss: loss,
+                    ..Default::default()
+                }
+                .validate(task)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "batch_size=1 must be legal for a non-embedding task \
+                         regardless of embedding_loss ({task:?}, {loss:?}): {e}"
+                    )
+                });
+            }
+        }
+    }
+
+    /// Embedding tasks at `batch_size = 1` under every ordering objective
+    /// (CoSENT/AnglE/MNRL, including the `None` default which resolves to
+    /// CoSENT) remain refused — the fix narrows the rule to embedding tasks,
+    /// it does not remove it. Covers all three embedding `ModelTask` variants
+    /// (TextEmbedding/ImageEmbedding/AudioEmbedding), not just the text case.
+    #[test]
+    fn embedding_tasks_still_refuse_batch_size_one_under_ordering_objectives() {
+        for task in [
+            ModelTask::TextEmbedding,
+            ModelTask::ImageEmbedding,
+            ModelTask::AudioEmbedding,
+        ] {
+            for loss in [
+                None,
+                Some(EmbeddingLoss::CoSent),
+                Some(EmbeddingLoss::AnglE),
+                Some(EmbeddingLoss::MultipleNegativesRanking { temperature: 20.0 }),
+            ] {
+                FineTuneConfig {
+                    batch_size: 1,
+                    embedding_loss: loss,
+                    ..Default::default()
+                }
+                .validate(task)
+                .expect_err(&format!(
+                    "batch_size=1 must remain refused for an embedding task ({task:?}, {loss:?})"
+                ));
+            }
+        }
+    }
+
+    /// Positive control (embedding side): `CosineMse` at `batch_size = 1`
+    /// remains accepted for an embedding task — it is a per-row objective
+    /// with no cross-row comparison, unaffected by the task-scoping fix.
+    #[test]
+    fn embedding_task_cosine_mse_accepts_batch_size_one() {
+        for task in [
+            ModelTask::TextEmbedding,
+            ModelTask::ImageEmbedding,
+            ModelTask::AudioEmbedding,
+        ] {
+            FineTuneConfig {
+                batch_size: 1,
+                embedding_loss: Some(EmbeddingLoss::CosineMse),
+                ..Default::default()
+            }
+            .validate(task)
+            .unwrap_or_else(|e| {
+                panic!("batch_size=1 must remain legal for CosineMse ({task:?}): {e}")
             });
         }
     }

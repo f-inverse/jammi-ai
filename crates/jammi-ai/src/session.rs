@@ -1105,7 +1105,7 @@ impl InferenceSession {
         config: Option<FineTuneConfig>,
     ) -> Result<TrainingJob> {
         let config = config.unwrap_or_default();
-        config.validate()?;
+        config.validate(task)?;
 
         let loss_type = fine_tune_loss_type(&config, task);
         let spec = TrainingSpec::FineTune {
@@ -1228,7 +1228,11 @@ impl InferenceSession {
         config: Option<FineTuneConfig>,
     ) -> Result<TrainingJob> {
         let config = config.unwrap_or_default();
-        config.validate()?;
+        // Graph fine-tuning always trains an embedding metric (S11): the
+        // sampler drives the in-batch-negative / triplet objective over the
+        // node text, never a Regression/Classification/NER head — so the
+        // embedding min-batch-size rule applies here unconditionally.
+        config.validate(ModelTask::TextEmbedding)?;
         sample_config.validate()?;
 
         // The job record's `source` field records the node source — the model is

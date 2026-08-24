@@ -1354,7 +1354,7 @@ fn config_validation_rejects_invalid_values() {
     ];
 
     for (config, field) in &cases {
-        let result = config.validate();
+        let result = config.validate(ModelTask::TextEmbedding);
         assert!(result.is_err(), "Should reject invalid {field}: {config:?}");
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -1364,7 +1364,9 @@ fn config_validation_rejects_invalid_values() {
     }
 
     // Default config should be valid
-    assert!(FineTuneConfig::default().validate().is_ok());
+    assert!(FineTuneConfig::default()
+        .validate(ModelTask::TextEmbedding)
+        .is_ok());
 }
 
 // ─── Durability: a job submitted by one session runs on a worker started later ─

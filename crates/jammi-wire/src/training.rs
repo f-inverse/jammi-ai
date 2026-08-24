@@ -412,6 +412,7 @@ fn backbone_dtype_to_proto(dtype: ComputePrecision) -> pb::BackboneDtype {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jammi_db::ModelTask;
 
     /// An all-unset wire config — the shape a remote client builds when the
     /// caller omits every hyperparameter. With explicit presence on every
@@ -462,7 +463,7 @@ mod tests {
             early_stopping_metric: EarlyStoppingMetric::TrainLoss,
             ..Default::default()
         };
-        cfg.validate()
+        cfg.validate(ModelTask::TextEmbedding)
             .expect("0.0 + train_loss is a legal combination");
 
         let proto = config_to_proto(&cfg);
@@ -558,7 +559,7 @@ mod tests {
             hard_negatives: decoded,
             ..FineTuneConfig::default()
         };
-        cfg.validate()
+        cfg.validate(ModelTask::TextEmbedding)
             .expect("mine-only hard-negative config validates");
     }
 

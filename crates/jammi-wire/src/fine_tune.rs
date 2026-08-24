@@ -408,23 +408,50 @@ impl Default for FineTuneConfig {
     }
 }
 
-/// The display name of `loss` if it is a pairwise-ordering embedding
-/// objective — CoSENT, AnglE, or the `None` default (which resolves to
-/// CoSENT) — or `None` for every non-ordering arm (`CosineMse` regresses
-/// onto the score directly and has no per-batch pair requirement;
-/// `MultipleNegativesRanking`/`Triplet` are not graded-pair objectives at
-/// all). Used by [`FineTuneConfig::validate`]'s batch-size check. The engine
-/// crate's data-loader validation and per-batch degenerate-batch diagnostic
-/// answer the same "is this an ordering objective" question independently (a
-/// duplicated ~3-line match, not a cross-crate call) — this type has no
-/// downstream dependents to share it with.
-fn ordering_objective_name(loss: Option<EmbeddingLoss>) -> Option<&'static str> {
-    match loss {
-        None | Some(EmbeddingLoss::CoSent) => Some("CoSENT"),
-        Some(EmbeddingLoss::AnglE) => Some("AnglE"),
-        Some(EmbeddingLoss::CosineMse)
-        | Some(EmbeddingLoss::MultipleNegativesRanking { .. })
-        | Some(EmbeddingLoss::Triplet { .. }) => None,
+impl EmbeddingLoss {
+    /// The minimum number of rows a batch must carry for this objective to
+    /// compute a non-degenerate gradient. [`FineTuneConfig::validate`] refuses
+    /// `batch_size < self.min_batch_size()`.
+    ///
+    /// `CoSent` and `AnglE` score `scores[i] < scores[j]` pairs *within* the
+    /// batch: with fewer than 2 rows no such pair exists, so every batch
+    /// trains at the loss's `log(1) = 0` floor with zero gradient.
+    ///
+    /// `MultipleNegativesRanking` scores each row's positive against every
+    /// *other* row's positive as an in-batch negative
+    /// (`sentence_transformers/losses/MultipleNegativesRankingLoss.py`): with
+    /// one row there is no other row to draw a negative from, so the softmax
+    /// is over a single class and the cross-entropy loss is exactly the same
+    /// `log(1) = 0` degenerate floor. This bound is not merely the "if you
+    /// pick MNRL" case: the engine's batch dispatch always trains an
+    /// `(anchor, positive)` pairs-format data source with MNRL, regardless of
+    /// which `embedding_loss` the config names, and [`FineTuneConfig::validate`]
+    /// has no visibility into the data's shape (only the config), so it must
+    /// apply this bound whenever the *resolved* objective (the configured one,
+    /// or the `None` default) is one of these three — it cannot rule out a
+    /// pairs-format source underneath a different configured objective.
+    ///
+    /// `Triplet` and `CosineMse` score each row independently — no cross-row
+    /// comparison is ever formed — so a batch of 1 row is well-formed for
+    /// either.
+    pub fn min_batch_size(&self) -> usize {
+        match self {
+            Self::CoSent | Self::AnglE | Self::MultipleNegativesRanking { .. } => 2,
+            Self::Triplet { .. } | Self::CosineMse => 1,
+        }
+    }
+
+    /// The display name used to name this objective in a refusal message.
+    /// Exhaustive alongside [`Self::min_batch_size`] — the compiler, not a
+    /// test, is what keeps both in sync with the variant list.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::CoSent => "CoSENT",
+            Self::Triplet { .. } => "Triplet",
+            Self::MultipleNegativesRanking { .. } => "MultipleNegativesRanking",
+            Self::AnglE => "AnglE",
+            Self::CosineMse => "CosineMse",
+        }
     }
 }
 
@@ -436,8 +463,15 @@ impl FineTuneConfig {
         if self.lora_rank == 0 {
             return Err(JammiError::FineTune("lora_rank must be > 0".into()));
         }
-        if self.lora_alpha <= 0.0 {
-            return Err(JammiError::FineTune("lora_alpha must be > 0".into()));
+        // `lora_alpha <= 0.0` alone does not catch NaN (`NaN <= 0.0` is
+        // `false`), so a non-finite alpha would sail through this check.
+        // `jammi_lora::lora_scaling` deliberately propagates a non-finite
+        // alpha on the assumption this edge is validated upstream — this is
+        // that upstream validation.
+        if !self.lora_alpha.is_finite() || self.lora_alpha <= 0.0 {
+            return Err(JammiError::FineTune(
+                "lora_alpha must be finite and > 0".into(),
+            ));
         }
         if !(0.0..1.0).contains(&self.lora_dropout) {
             return Err(JammiError::FineTune(
@@ -453,23 +487,35 @@ impl FineTuneConfig {
         if self.batch_size == 0 {
             return Err(JammiError::FineTune("batch_size must be > 0".into()));
         }
-        // An ORDERING objective (CoSENT, AnglE — and the `None` default, which
-        // resolves to CoSENT) scores `scores[i] < scores[j]` pairs *within* a
-        // batch: with `batch_size < 2` no such pair can ever exist, so every
-        // batch trains at the loss's `log(1) = 0` floor with zero gradient —
-        // the run "converges" instantly and silently, with nothing learned.
-        // Refused at the input edge, naming the objective and the minimum,
-        // rather than left to surface as an unexplained zero loss mid-run.
-        if let Some(name) = ordering_objective_name(self.embedding_loss) {
-            if self.batch_size < 2 {
-                return Err(JammiError::FineTune(format!(
-                    "{name} is a pairwise-ordering objective: it needs at least 2 rows per \
-                     batch to form a score-ordered pair, got batch_size={}. Raise batch_size \
-                     to at least 2, or choose a non-ordering embedding_loss \
-                     (e.g. CosineMse) for batch_size=1.",
-                    self.batch_size
-                )));
-            }
+        // CoSENT/AnglE need >= 2 rows to form a score-ordered pair, and
+        // MultipleNegativesRanking needs >= 2 rows to draw an in-batch
+        // negative — see [`EmbeddingLoss::min_batch_size`] for why, and for
+        // why this check cannot be narrowed to "only when embedding_loss
+        // names an ordering objective": an `(anchor, positive)` pairs-format
+        // data source is always trained with MultipleNegativesRanking
+        // regardless of the configured `embedding_loss`, and this config has
+        // no visibility into the data's shape. Refused at the input edge,
+        // naming the resolved objective and the minimum, rather than left to
+        // surface as an unexplained zero loss mid-run.
+        let resolved_loss = self.embedding_loss.unwrap_or_default();
+        let min_batch = resolved_loss.min_batch_size();
+        if self.batch_size < min_batch {
+            let name = resolved_loss.name();
+            return Err(JammiError::FineTune(format!(
+                "{name} needs at least {min_batch} rows per batch to compute a \
+                 non-degenerate gradient: CoSENT/AnglE score ordered pairs within the batch, \
+                 and MultipleNegativesRanking scores each row's positive against every other \
+                 row's positive as an in-batch negative \
+                 (sentence_transformers/losses/MultipleNegativesRankingLoss.py) — with fewer \
+                 than {min_batch} rows neither comparison can be formed, and the loss sits at \
+                 its log(1) = 0 floor with zero gradient. Got batch_size={}. Raise batch_size \
+                 to at least {min_batch}. Switching embedding_loss to CosineMse only helps for \
+                 a graded (text_a, text_b, score) pair source, where CosineMse regresses each \
+                 row independently; an (anchor, positive) pairs source is always trained with \
+                 MultipleNegativesRanking's in-batch-negative ranking regardless of \
+                 embedding_loss, so batch_size >= 2 is required there too.",
+                self.batch_size
+            )));
         }
         if self.gradient_accumulation_steps == 0 {
             return Err(JammiError::FineTune(
@@ -554,6 +600,45 @@ impl FineTuneConfig {
 #[cfg(test)]
 mod validation_tests {
     use super::*;
+
+    /// A non-finite `lora_alpha` must be refused: `lora_alpha <= 0.0` alone
+    /// does not catch NaN (`NaN <= 0.0` is `false`), and `jammi_lora`'s
+    /// `lora_scaling` propagates whatever alpha it is given on the
+    /// assumption that this upstream check has already run.
+    #[test]
+    fn nan_lora_alpha_is_refused() {
+        let cfg = FineTuneConfig {
+            lora_alpha: f64::NAN,
+            ..Default::default()
+        };
+        let err = cfg.validate().expect_err("NaN lora_alpha must be refused");
+        assert!(
+            err.to_string().contains("lora_alpha"),
+            "the error must name the field: {err}"
+        );
+    }
+
+    /// Same refusal for positive and negative infinity.
+    #[test]
+    fn infinite_lora_alpha_is_refused() {
+        for alpha in [f64::INFINITY, f64::NEG_INFINITY] {
+            let cfg = FineTuneConfig {
+                lora_alpha: alpha,
+                ..Default::default()
+            };
+            cfg.validate()
+                .expect_err(&format!("{alpha} lora_alpha must be refused"));
+        }
+    }
+
+    /// Positive control: a finite, positive alpha remains legal (the shipped
+    /// default), so the finiteness check does not reject everything.
+    #[test]
+    fn finite_positive_lora_alpha_is_accepted() {
+        FineTuneConfig::default()
+            .validate()
+            .expect("the shipped default lora_alpha must remain valid");
+    }
 
     /// RED for #347: a run cannot monitor a metric it will never measure.
     ///
@@ -664,25 +749,69 @@ mod validation_tests {
         );
     }
 
-    /// Positive control: the ordering-objective refusal is narrow. `batch_size
-    /// = 1` is legal under a non-ordering objective (`CosineMse` has no
-    /// per-batch pair requirement — it regresses onto the score directly),
-    /// and `batch_size = 2` is legal under every ordering objective — only
-    /// the `(ordering objective, batch_size < 2)` combination is refused.
+    /// F1 (round 2): `MultipleNegativesRanking` is degenerate at
+    /// `batch_size = 1` exactly like CoSENT/AnglE — with one row there is no
+    /// other row's positive to draw an in-batch negative from, so the
+    /// softmax is over a single class and the loss is exactly `log(1) = 0`
+    /// with zero gradient. Named explicitly, not folded into "ordering".
     #[test]
-    fn ordering_batch_size_refusal_is_narrow() {
+    fn batch_size_one_with_mnrl_objective_is_refused() {
+        let cfg = FineTuneConfig {
+            batch_size: 1,
+            embedding_loss: Some(EmbeddingLoss::MultipleNegativesRanking { temperature: 20.0 }),
+            ..Default::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("batch_size=1 under MultipleNegativesRanking must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("MultipleNegativesRanking"),
+            "the error must name the objective: {msg}"
+        );
+        assert!(
+            msg.contains('2'),
+            "the error must name the minimum batch size: {msg}"
+        );
+        // F1 (round 2): a pairs source always trains MNRL regardless of
+        // `embedding_loss`, so the remedy text must not steer the caller into
+        // MNRL at batch_size=1 by suggesting a swap that does not apply to a
+        // pairs source.
+        assert!(
+            msg.contains("pairs source is always trained with"),
+            "the remedy must not falsely imply CosineMse fixes a pairs source: {msg}"
+        );
+    }
+
+    /// Positive control: the batch-size refusal is narrow. `batch_size = 1`
+    /// is legal under `CosineMse` (no per-batch pair requirement — it
+    /// regresses onto the score directly) and `Triplet` (a per-row margin
+    /// loss, no cross-row comparison), and `batch_size = 2` is legal under
+    /// every objective that needs it — only the `(needs >= 2, batch_size <
+    /// 2)` combination is refused.
+    #[test]
+    fn batch_size_refusal_is_narrow() {
         FineTuneConfig {
             batch_size: 1,
             embedding_loss: Some(EmbeddingLoss::CosineMse),
             ..Default::default()
         }
         .validate()
-        .expect("batch_size=1 is legal for a non-ordering objective");
+        .expect("batch_size=1 is legal for CosineMse (per-row objective)");
+
+        FineTuneConfig {
+            batch_size: 1,
+            embedding_loss: Some(EmbeddingLoss::Triplet { margin: 0.2 }),
+            ..Default::default()
+        }
+        .validate()
+        .expect("batch_size=1 is legal for Triplet (per-row objective)");
 
         for loss in [
             None,
             Some(EmbeddingLoss::CoSent),
             Some(EmbeddingLoss::AnglE),
+            Some(EmbeddingLoss::MultipleNegativesRanking { temperature: 20.0 }),
         ] {
             FineTuneConfig {
                 batch_size: 2,
@@ -691,7 +820,7 @@ mod validation_tests {
             }
             .validate()
             .unwrap_or_else(|e| {
-                panic!("batch_size=2 must satisfy every ordering objective ({loss:?}): {e}")
+                panic!("batch_size=2 must satisfy every objective that needs it ({loss:?}): {e}")
             });
         }
     }

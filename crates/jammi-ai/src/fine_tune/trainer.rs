@@ -4750,15 +4750,61 @@ mod standardization_contract {
     }
 
     /// PERMANENT REGRESSION (esc-035, second audit round, block 1): the
-    /// σ-axis analogue of the μ scatter above — a genuine ×2/÷2
-    /// per-trajectory scale error applied directly to the REAL served
-    /// z-sigma scalar (via [`measure_crps_seed_raw`], no back-solving a raw
-    /// value out of a ratio) on 2 of the 13 seeds (seeds 5 and 11, chosen
-    /// away from the already-trimmed outlier seeds 2/8), landing so the
-    /// trimmed-mean ratio stays INSIDE `[CRPS_SIGMA_RATIO_LO,
-    /// CRPS_SIGMA_RATIO_HI]` (measured: 1.128). Must be rejected via
-    /// `PerSeedCeilingViolated` alone — `SigmaRatioOutOfRange` must NOT
-    /// fire, or this construction no longer isolates the per-seed arm.
+    /// σ-axis analogue of the μ scatter above — a per-trajectory σ scale
+    /// error injected on 2 of the 13 seeds, landing so the trimmed-mean
+    /// ratio stays INSIDE `[CRPS_SIGMA_RATIO_LO, CRPS_SIGMA_RATIO_HI]`. Must
+    /// be rejected via `PerSeedCeilingViolated` alone — `SigmaRatioOutOfRange`
+    /// must NOT fire, or this construction no longer isolates the per-seed
+    /// arm.
+    ///
+    /// De-pinned from a single dropout-stream trajectory (test-robustness
+    /// fix, see this commit's message): the ORIGINAL construction hard-coded
+    /// which 2 seeds to scatter (5, 11, "chosen away from the already-
+    /// trimmed outlier seeds 2/8") and a fixed ×2/÷2 MULTIPLIER of whatever
+    /// `served_z_sigma0` that trajectory happened to produce. Both choices
+    /// ride the specific per-seed baseline the OLD host SplitMix64 dropout
+    /// stream produced; a stream change (e.g. C7's device-side Philox
+    /// dropout) redistributes which seeds are outliers and what their
+    /// baseline σ actually is, so a hard-coded seed ID or a multiplier of a
+    /// moving baseline can land outside the construction's intended zone.
+    ///
+    /// The fix derives EVERYTHING from THIS run's MEASURED per-seed baseline
+    /// instead of hard-coded constants:
+    /// 1. Measure the real (unmutated) per-seed ceiling pass/fail for every
+    ///    seed in the sweep.
+    /// 2. Pick exactly enough CURRENTLY-PASSING seeds to guarantee the
+    ///    passing count drops below `CRPS_PER_SEED_BAR`
+    ///    (`max(2, passing_count - (CRPS_PER_SEED_BAR - 1))`), so the
+    ///    construction still isolates the per-seed arm even if the measured
+    ///    baseline passing count shifts under a different stream — not just
+    ///    at today's measured 10/13.
+    /// 3. Among the passing candidates, prefer the ones whose sigma_ratio
+    ///    sits CLOSEST to the aggregate band's midpoint (generalizes "away
+    ///    from the outliers" to whichever seeds are the least-extreme under
+    ///    THIS trajectory, not a hard-coded seed ID).
+    /// 4. Inject each touched seed's σ RELATIVE TO ITS OWN measured raw
+    ///    reference (`served_r_sigma0`), by a FIXED absolute margin
+    ///    (`1.5 × sigma_ceiling`, itself derived only from `sigma_y` — a
+    ///    property of the fixed `WIDE` targets, not the dropout stream) —
+    ///    alternating the sign (+ / −) across touched seeds. This
+    ///    guarantees `sigma_abs_diff = 1.5·sigma_ceiling > sigma_ceiling` for
+    ///    EVERY touched seed regardless of trajectory (breaches the
+    ///    per-seed ceiling by construction), while the AGGREGATE arm stays
+    ///    safe by a "breach-one/dilute-many" argument: `check_crps_aggregate`
+    ///    averages the (now sign-alternated) touched ratios into the
+    ///    trimmed mean over 9 kept seeds, diluting each touched seed's
+    ///    individual excess by ~9x — arithmetic that holds for ANY
+    ///    trajectory, not a number calibrated to one.
+    ///
+    /// MEASURED (base, this commit): passing count 10/13 (seeds 2, 8 fail σ;
+    /// seed 10 fails μ), so `touched_count = max(2, 10-8) = 2`; the 2 closest
+    /// to the band midpoint (1.15) are seeds 11 (`sigma_ratio` 1.1145) and 6
+    /// (1.0725). Injecting ±1.5·sigma_ceiling (±14.38 raw units) against
+    /// each seed's own `served_r_sigma0` moves the trimmed-mean ratio from
+    /// 1.108 (unmutated baseline) to 1.125 — comfortably inside
+    /// `[1.0, 1.3]` — while dropping the per-seed-passing count to 8 < 9,
+    /// tripping `PerSeedCeilingViolated`. Full pre-change table (including
+    /// the superseded seed 5/11 ×2/÷2 numbers) is in this commit's message.
     #[tokio::test(flavor = "multi_thread")]
     async fn mutant_scale_balanced_sigma_scatter_rejected_by_per_seed_ceiling() {
         let device = Device::Cpu;
@@ -4766,17 +4812,88 @@ mod standardization_contract {
         let targets = Tensor::from_vec(WIDE.to_vec(), (n,), &device).unwrap();
         let feats = features(n, &device);
         let sigma_y = wide_sigma_y();
+        let mean_ceiling = CRPS_PER_SEED_MEAN_CEILING_FRAC * sigma_y;
+        let sigma_ceiling = CRPS_PER_SEED_SIGMA_CEILING_FRAC * sigma_y;
 
-        let mut stats = Vec::with_capacity(CRPS_SEEDS.len());
+        // Measure the REAL, unmutated per-seed baseline for every swept seed
+        // first — the scatter below is derived from THIS run's numbers, not
+        // a constant calibrated to one historical trajectory.
+        let mut baseline = Vec::with_capacity(CRPS_SEEDS.len());
         for seed in CRPS_SEEDS {
             let (served_z_mean, served_z_sigma0, served_r_mean, served_r_sigma0) =
                 measure_crps_seed_raw(seed, &targets, &feats, &device).await;
-            // MUTANT: a genuine ×2 (seed 5) / ÷2 (seed 11) scale error on
-            // the REAL served z-sigma scalar; every other seed untouched.
-            let scattered_z_sigma0 = match seed {
-                5 => served_z_sigma0 * 2.0,
-                11 => served_z_sigma0 / 2.0,
-                _ => served_z_sigma0,
+            let stats = crps_seed_stats_from_served(
+                seed,
+                n,
+                &served_z_mean,
+                served_z_sigma0,
+                &served_r_mean,
+                served_r_sigma0,
+            );
+            baseline.push((
+                seed,
+                served_z_mean,
+                served_z_sigma0,
+                served_r_mean,
+                served_r_sigma0,
+                stats,
+            ));
+        }
+
+        // Candidates: seeds that CURRENTLY pass both per-seed ceilings —
+        // perturbing an already-failing seed wouldn't demonstrate anything
+        // new about the aggregate/per-seed gap.
+        let mut passing: Vec<usize> = (0..baseline.len())
+            .filter(|&i| {
+                let s = &baseline[i].5;
+                s.mean_abs_diff <= mean_ceiling && s.sigma_abs_diff <= sigma_ceiling
+            })
+            .collect();
+        let passing_count = passing.len();
+        // Enough touched seeds to guarantee the passing count drops below
+        // CRPS_PER_SEED_BAR, whatever the measured baseline passing count is
+        // (not just today's measured 10/13).
+        let touched_count = passing_count.saturating_sub(CRPS_PER_SEED_BAR - 1).max(2);
+        assert!(
+            passing.len() >= touched_count,
+            "need >= {touched_count} currently-passing seeds to construct an \
+             isolating scatter; measured passing count {passing_count} is too \
+             low — the baseline itself may be regressing. baseline: {baseline:?}",
+        );
+
+        // Prefer candidates whose sigma_ratio sits closest to the aggregate
+        // band's midpoint — generalizes "away from the outlier seeds" to
+        // whichever seeds are least extreme under THIS trajectory.
+        let band_mid = (CRPS_SIGMA_RATIO_LO + CRPS_SIGMA_RATIO_HI) / 2.0;
+        passing.sort_by(|&a, &b| {
+            let ra = baseline[a].5.sigma_ratio;
+            let rb = baseline[b].5.sigma_ratio;
+            (ra - band_mid)
+                .abs()
+                .partial_cmp(&(rb - band_mid).abs())
+                .unwrap()
+        });
+        let touched: Vec<usize> = passing[..touched_count].to_vec();
+
+        // Inject each touched seed's σ RELATIVE TO ITS OWN measured raw
+        // reference, by a fixed absolute margin derived only from sigma_y —
+        // guarantees a per-seed ceiling breach regardless of trajectory (see
+        // this fn's doc for the "breach-one/dilute-many" aggregate-safety
+        // argument). Alternate sign across touched seeds to keep the
+        // aggregate contribution balanced.
+        let margin = 1.5 * sigma_ceiling;
+        let mut stats = Vec::with_capacity(CRPS_SEEDS.len());
+        for (i, (seed, served_z_mean, served_z_sigma0, served_r_mean, served_r_sigma0, _)) in
+            baseline.into_iter().enumerate()
+        {
+            let scattered_z_sigma0 = if let Some(pos) = touched.iter().position(|&t| t == i) {
+                if pos % 2 == 0 {
+                    served_r_sigma0 + margin
+                } else {
+                    (served_r_sigma0 - margin).max(1e-3)
+                }
+            } else {
+                served_z_sigma0
             };
             stats.push(crps_seed_stats_from_served(
                 seed,
@@ -4790,18 +4907,22 @@ mod standardization_contract {
         let violations = check_crps_aggregate(&stats, sigma_y);
         assert!(
             violations.contains(&CrpsViolation::PerSeedCeilingViolated),
-            "a ×2/÷2 per-trajectory σ scale error on 2 seeds must be \
-             REJECTED via PerSeedCeilingViolated — the trimmed-mean ratio \
-             arm alone cannot see a minimal-footprint scatter constructed to \
-             stay inside its band. violations: {violations:?}"
+            "a per-trajectory σ scale error on {touched_count} measured-baseline \
+             seeds must be REJECTED via PerSeedCeilingViolated — the \
+             trimmed-mean ratio arm alone cannot see a minimal-footprint \
+             scatter constructed to stay inside its band. touched (indices): \
+             {touched:?}; violations: {violations:?}; stats: {stats:?}"
         );
         assert!(
             !violations.contains(&CrpsViolation::SigmaRatioOutOfRange),
-            "this construction is deliberately INSIDE the aggregate σ-ratio \
-             band (trimmed mean measured ~1.13 against \
-             [{CRPS_SIGMA_RATIO_LO}, {CRPS_SIGMA_RATIO_HI}]) so it isolates \
-             the per-seed ceiling arm — if SigmaRatioOutOfRange now fires \
-             too, re-derive the scatter. violations: {violations:?}"
+            "this construction is derived to be deliberately INSIDE the \
+             aggregate σ-ratio band [{CRPS_SIGMA_RATIO_LO}, \
+             {CRPS_SIGMA_RATIO_HI}] (a fixed ceiling-relative margin diluted \
+             over the trimmed-mean's 9 kept seeds) so it isolates the \
+             per-seed ceiling arm — if SigmaRatioOutOfRange now fires too, \
+             the dilution argument in this fn's doc no longer holds and the \
+             scatter must be re-derived. violations: {violations:?}; stats: \
+             {stats:?}"
         );
     }
 

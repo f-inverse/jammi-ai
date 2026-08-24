@@ -8,10 +8,12 @@ use jammi_encoders::{
     Bert, BertConfig, DistilBert, DistilBertConfig, ModernBert, ModernBertConfig, Pooling,
 };
 
-use jammi_encoders::{ClipText, ClipTextConfig, HtsatAudio, HtsatAudioConfig};
+use jammi_encoders::{
+    ClipText, ClipTextConfig, HtsatAudio, HtsatAudioConfig, OpenClipVisionConfig,
+    OpenClipVisionTransformer,
+};
 
 use super::open_clip_text::OpenClipTextForward;
-use super::open_clip_vit::{OpenClipVisionConfig, OpenClipVisionTransformer};
 use super::{DeviceConfig, ModelBackend};
 use crate::fine_tune::classifier::SeqClassifier;
 use crate::inference::adapter::BackendOutput;

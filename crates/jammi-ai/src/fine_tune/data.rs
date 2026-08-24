@@ -238,10 +238,56 @@ enum TrainingRow {
     },
 }
 
+/// Whether `loss` is a pairwise-ordering embedding objective — CoSENT,
+/// AnglE, or the `None` default (which resolves to CoSENT) — the arms whose
+/// loss reads only the *strict order* of the graded `score` column and is
+/// therefore degenerate on a dataset (or a batch — see
+/// [`super::trainer`]'s per-batch diagnostic) that carries fewer than 2
+/// distinct score levels. `CosineMse` regresses onto the score directly (no
+/// ordering requirement); `MultipleNegativesRanking`/`Triplet` are not
+/// graded-pair objectives at all.
+fn is_ordering_embedding_objective(loss: Option<super::EmbeddingLoss>) -> bool {
+    matches!(
+        loss,
+        None | Some(super::EmbeddingLoss::CoSent) | Some(super::EmbeddingLoss::AnglE)
+    )
+}
+
 impl TrainingDataLoader {
     /// Create a loader from contrastive pair rows.
-    pub fn from_contrastive(rows: Vec<(String, String, f32)>) -> Self {
-        Self {
+    ///
+    /// Under an ORDERING embedding objective (CoSENT, AnglE — and the `None`
+    /// default, which resolves to CoSENT), a dataset whose graded `score`
+    /// column carries fewer than 2 distinct values is refused: the pairwise
+    /// ordering loss reads only `scores[i] < scores[j]` pairs, so a
+    /// single-level dataset has none — every batch would train at the
+    /// objective's `log(1) = 0` floor with zero gradient, "converging"
+    /// instantly and silently. A non-ordering objective (`CosineMse`
+    /// regresses onto the score directly) has no such requirement, so
+    /// `embedding_loss` gates whether this check applies at all — this is a
+    /// data-shape refusal, not a batch_size one (see
+    /// `FineTuneConfig::validate`'s companion `batch_size < 2` refusal for
+    /// the complementary edge).
+    pub fn from_contrastive(
+        rows: Vec<(String, String, f32)>,
+        embedding_loss: Option<super::EmbeddingLoss>,
+    ) -> Result<Self> {
+        if is_ordering_embedding_objective(embedding_loss) {
+            // `dedup_by` only merges ADJACENT equal runs, so sort first: equal
+            // scores collapse to one entry regardless of input row order.
+            let mut sorted: Vec<f32> = rows.iter().map(|(_, _, s)| *s).collect();
+            sorted.sort_by(|a, b| a.total_cmp(b));
+            sorted.dedup_by(|a, b| a == b);
+            if sorted.len() < 2 {
+                return Err(JammiError::FineTune(format!(
+                    "CoSENT/AnglE need \u{2265} 2 distinct score levels; use CosineMse for a \
+                     single-level dataset (got {} distinct level(s) across {} row(s))",
+                    sorted.len(),
+                    rows.len()
+                )));
+            }
+        }
+        Ok(Self {
             format: TrainingFormat::Contrastive,
             data: LoaderData::TextRows(
                 rows.into_iter()
@@ -252,7 +298,7 @@ impl TrainingDataLoader {
                     })
                     .collect(),
             ),
-        }
+        })
     }
 
     /// Create a loader from classification rows (text + integer label).
@@ -797,5 +843,86 @@ mod tests {
         assert!(matches!(val.format(), TrainingFormat::Regression));
         assert_eq!(train.len(), 8);
         assert_eq!(val.len(), 2);
+    }
+
+    // ── B3(b): an ordering objective needs ≥ 2 distinct score levels ─────────
+
+    /// A single-level contrastive dataset (every row scored identically) under
+    /// the DEFAULT (`None`, which resolves to CoSENT) objective is refused:
+    /// CoSENT's pairwise ordering loss reads only `scores[i] < scores[j]`
+    /// pairs, and a single-level dataset has none.
+    #[test]
+    fn single_level_scores_under_default_ordering_objective_is_refused() {
+        let rows = vec![
+            ("a1".to_string(), "b1".to_string(), 0.5f32),
+            ("a2".to_string(), "b2".to_string(), 0.5f32),
+            ("a3".to_string(), "b3".to_string(), 0.5f32),
+        ];
+        // `TrainingDataLoader` does not derive `Debug` (it can hold a
+        // `Tensor`-bearing `TrainingBatch`), so `expect_err`/`unwrap_err`
+        // (which require `T: Debug`) do not apply — match instead.
+        let err = match TrainingDataLoader::from_contrastive(rows, None) {
+            Err(e) => e,
+            Ok(_) => panic!("a single-level dataset under the ordering default must be refused"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("CoSENT") && msg.contains("2"),
+            "the error must name the objective and the minimum distinct level count: {msg}"
+        );
+    }
+
+    /// Same refusal under explicit `Some(AnglE)`.
+    #[test]
+    fn single_level_scores_under_angle_is_refused() {
+        let rows = vec![
+            ("a1".to_string(), "b1".to_string(), 1.0f32),
+            ("a2".to_string(), "b2".to_string(), 1.0f32),
+        ];
+        let err = match TrainingDataLoader::from_contrastive(
+            rows,
+            Some(super::super::EmbeddingLoss::AnglE),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("a single-level dataset under AnglE must be refused"),
+        };
+        assert!(err.to_string().contains("AnglE") || err.to_string().contains("CoSENT"));
+    }
+
+    /// Positive control: the refusal is narrow. A single-level dataset is
+    /// legal under a non-ordering objective (`CosineMse`), and a
+    /// multi-level dataset is legal under every ordering objective — only the
+    /// `(ordering objective, < 2 distinct levels)` combination is refused.
+    /// Row order is irrelevant (the distinct-level count, not adjacency,
+    /// gates the refusal).
+    #[test]
+    fn ordering_objective_score_diversity_refusal_is_narrow() {
+        let single_level = vec![
+            ("a1".to_string(), "b1".to_string(), 0.5f32),
+            ("a2".to_string(), "b2".to_string(), 0.5f32),
+        ];
+        TrainingDataLoader::from_contrastive(
+            single_level,
+            Some(super::super::EmbeddingLoss::CosineMse),
+        )
+        .expect("a single-level dataset is legal for a non-ordering objective");
+
+        // Two distinct levels, interleaved with duplicates, in NON-adjacent
+        // order — the sort-then-dedup check must still find 2 distinct levels.
+        let multi_level = vec![
+            ("a1".to_string(), "b1".to_string(), 0.9f32),
+            ("a2".to_string(), "b2".to_string(), 0.1f32),
+            ("a3".to_string(), "b3".to_string(), 0.9f32),
+            ("a4".to_string(), "b4".to_string(), 0.1f32),
+        ];
+        for loss in [
+            None,
+            Some(super::super::EmbeddingLoss::CoSent),
+            Some(super::super::EmbeddingLoss::AnglE),
+        ] {
+            TrainingDataLoader::from_contrastive(multi_level.clone(), loss).unwrap_or_else(|e| {
+                panic!("a 2-level dataset must satisfy every ordering objective ({loss:?}): {e}")
+            });
+        }
     }
 }

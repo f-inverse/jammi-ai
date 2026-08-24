@@ -408,6 +408,26 @@ impl Default for FineTuneConfig {
     }
 }
 
+/// The display name of `loss` if it is a pairwise-ordering embedding
+/// objective — CoSENT, AnglE, or the `None` default (which resolves to
+/// CoSENT) — or `None` for every non-ordering arm (`CosineMse` regresses
+/// onto the score directly and has no per-batch pair requirement;
+/// `MultipleNegativesRanking`/`Triplet` are not graded-pair objectives at
+/// all). Used by [`FineTuneConfig::validate`]'s batch-size check. The engine
+/// crate's data-loader validation and per-batch degenerate-batch diagnostic
+/// answer the same "is this an ordering objective" question independently (a
+/// duplicated ~3-line match, not a cross-crate call) — this type has no
+/// downstream dependents to share it with.
+fn ordering_objective_name(loss: Option<EmbeddingLoss>) -> Option<&'static str> {
+    match loss {
+        None | Some(EmbeddingLoss::CoSent) => Some("CoSENT"),
+        Some(EmbeddingLoss::AnglE) => Some("AnglE"),
+        Some(EmbeddingLoss::CosineMse)
+        | Some(EmbeddingLoss::MultipleNegativesRanking { .. })
+        | Some(EmbeddingLoss::Triplet { .. }) => None,
+    }
+}
+
 impl FineTuneConfig {
     /// Validate all fields. Returns an error describing the first invalid field.
     pub fn validate(&self) -> jammi_db::error::Result<()> {
@@ -432,6 +452,24 @@ impl FineTuneConfig {
         }
         if self.batch_size == 0 {
             return Err(JammiError::FineTune("batch_size must be > 0".into()));
+        }
+        // An ORDERING objective (CoSENT, AnglE — and the `None` default, which
+        // resolves to CoSENT) scores `scores[i] < scores[j]` pairs *within* a
+        // batch: with `batch_size < 2` no such pair can ever exist, so every
+        // batch trains at the loss's `log(1) = 0` floor with zero gradient —
+        // the run "converges" instantly and silently, with nothing learned.
+        // Refused at the input edge, naming the objective and the minimum,
+        // rather than left to surface as an unexplained zero loss mid-run.
+        if let Some(name) = ordering_objective_name(self.embedding_loss) {
+            if self.batch_size < 2 {
+                return Err(JammiError::FineTune(format!(
+                    "{name} is a pairwise-ordering objective: it needs at least 2 rows per \
+                     batch to form a score-ordered pair, got batch_size={}. Raise batch_size \
+                     to at least 2, or choose a non-ordering embedding_loss \
+                     (e.g. CosineMse) for batch_size=1.",
+                    self.batch_size
+                )));
+            }
         }
         if self.gradient_accumulation_steps == 0 {
             return Err(JammiError::FineTune(
@@ -577,5 +615,84 @@ mod validation_tests {
         FineTuneConfig::default()
             .validate()
             .expect("the shipped default must remain valid");
+    }
+
+    // ── B3(a): an ordering objective needs batch_size ≥ 2 ─────────────────
+
+    /// `batch_size = 1` under the DEFAULT (`embedding_loss: None`, which
+    /// resolves to CoSENT) objective is refused: with one row per batch there
+    /// is never a `scores[i] < scores[j]` pair to form, so every batch trains
+    /// at CoSENT's `log(1) = 0` floor with zero gradient — the run
+    /// "converges" instantly and silently. The error must name the objective
+    /// and the minimum batch size.
+    #[test]
+    fn batch_size_one_with_default_ordering_objective_is_refused() {
+        let cfg = FineTuneConfig {
+            batch_size: 1,
+            embedding_loss: None,
+            ..Default::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("batch_size=1 under the ordering default must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("CoSENT"),
+            "the error must name the objective: {msg}"
+        );
+        assert!(
+            msg.contains('2'),
+            "the error must name the minimum batch size: {msg}"
+        );
+    }
+
+    /// Same refusal, explicit `Some(AnglE)` — named as AnglE, not CoSENT.
+    #[test]
+    fn batch_size_one_with_angle_objective_is_refused() {
+        let cfg = FineTuneConfig {
+            batch_size: 1,
+            embedding_loss: Some(EmbeddingLoss::AnglE),
+            ..Default::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("batch_size=1 under AnglE must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("AnglE"),
+            "the error must name the objective: {msg}"
+        );
+    }
+
+    /// Positive control: the ordering-objective refusal is narrow. `batch_size
+    /// = 1` is legal under a non-ordering objective (`CosineMse` has no
+    /// per-batch pair requirement — it regresses onto the score directly),
+    /// and `batch_size = 2` is legal under every ordering objective — only
+    /// the `(ordering objective, batch_size < 2)` combination is refused.
+    #[test]
+    fn ordering_batch_size_refusal_is_narrow() {
+        FineTuneConfig {
+            batch_size: 1,
+            embedding_loss: Some(EmbeddingLoss::CosineMse),
+            ..Default::default()
+        }
+        .validate()
+        .expect("batch_size=1 is legal for a non-ordering objective");
+
+        for loss in [
+            None,
+            Some(EmbeddingLoss::CoSent),
+            Some(EmbeddingLoss::AnglE),
+        ] {
+            FineTuneConfig {
+                batch_size: 2,
+                embedding_loss: loss,
+                ..Default::default()
+            }
+            .validate()
+            .unwrap_or_else(|e| {
+                panic!("batch_size=2 must satisfy every ordering objective ({loss:?}): {e}")
+            });
+        }
     }
 }

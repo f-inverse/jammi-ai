@@ -471,6 +471,10 @@ impl TrainingLoop {
             let mut epoch_pos_sim = 0.0f64;
             let mut epoch_neg_sim = 0.0f64;
             let mut triplet_batch_count = 0usize;
+            // Count of degenerate (no-ordered-pair) batches under an ordering
+            // embedding objective — see `is_degenerate_ordering_batch`'s doc
+            // (B3). Diagnostic only: the loss value itself is unchanged.
+            let mut degenerate_batch_count = 0usize;
 
             // Re-mine hard negatives at refresh boundaries. Mining replaces the
             // epoch's data with (anchor, positive, mined-negative) triplets fed
@@ -498,6 +502,9 @@ impl TrainingLoop {
                         &mut epoch_neg_sim,
                         &mut triplet_batch_count,
                     );
+                    if is_degenerate_ordering_batch(&batch, self.config.embedding_loss) {
+                        degenerate_batch_count += 1;
+                    }
                     let loss = self.compute_loss(&batch)?;
                     self.process_batch_loss(
                         loss,
@@ -542,6 +549,9 @@ impl TrainingLoop {
                 let text_chunks = epoch_loader.text_chunks(self.config.batch_size);
                 for chunk in &text_chunks {
                     let batch = self.encode_chunk(chunk)?;
+                    if is_degenerate_ordering_batch(&batch, self.config.embedding_loss) {
+                        degenerate_batch_count += 1;
+                    }
                     let loss = self.compute_loss(&batch)?;
                     self.accumulate_sim_stats(
                         &batch,
@@ -636,8 +646,27 @@ impl TrainingLoop {
                 monitor_label,
                 global_step,
                 lr,
+                degenerate_batch_count,
                 "Epoch complete"
             );
+            // B3: warn (once per epoch, not per batch) when a MAJORITY of this
+            // epoch's batches had no ordered pair to train on — the run is not
+            // failed (a minority-degenerate dataset still trains on its other
+            // batches), but a silent >50% floor is worth surfacing rather than
+            // discovering only from a loss curve that never moves. The loss
+            // value itself is unchanged — see `is_degenerate_ordering_batch`'s
+            // doc.
+            if batch_count > 0 && degenerate_batch_count * 2 > batch_count {
+                tracing::warn!(
+                    epoch,
+                    degenerate_batch_count,
+                    batch_count,
+                    "over half of this epoch's batches had no ordered score pair under the \
+                     configured ordering embedding objective (CoSENT/AnglE) — these batches \
+                     trained at the objective's zero-gradient floor. Check the dataset's \
+                     score-level diversity or the batch_size."
+                );
+            }
 
             // Early stopping on the chosen metric.
             if monitor_loss < best_val_loss {
@@ -2295,6 +2324,44 @@ fn dispatch_contrastive_loss(
     }
 }
 
+/// Whether `batch` is a degenerate (no-ordered-pair) batch under an ORDERING
+/// embedding objective (CoSENT/AnglE, or the `None` default that resolves to
+/// CoSENT): a `Contrastive` batch of fewer than 2 rows, or one whose graded
+/// scores all collapse to the same value, has no `scores[i] < scores[j]` pair
+/// for [`pairwise_ordering_loss`] to read — its mask is empty and the batch
+/// trains at the `log(1) = 0` floor with zero gradient (B3). This is a
+/// per-batch DIAGNOSTIC, not a refusal: `TrainingDataLoader::from_contrastive`
+/// already refuses a dataset that is degenerate EVERYWHERE (< 2 distinct
+/// score levels across the whole set); this catches the narrower case of a
+/// dataset that has ordering signal overall but whose per-batch shuffling
+/// occasionally strands a batch without any ordered pair — worth counting,
+/// not worth failing the run over.
+///
+/// Every other batch shape / objective is never degenerate by this test — it
+/// is not scored by `pairwise_ordering_loss` at all, so this returns `false`
+/// without inspecting anything.
+fn is_degenerate_ordering_batch(
+    batch: &super::data::TrainingBatch,
+    embedding_loss: Option<super::EmbeddingLoss>,
+) -> bool {
+    let is_ordering_objective = matches!(
+        embedding_loss,
+        None | Some(super::EmbeddingLoss::CoSent) | Some(super::EmbeddingLoss::AnglE)
+    );
+    if !is_ordering_objective {
+        return false;
+    }
+    let super::data::TrainingBatch::Contrastive { scores, .. } = batch else {
+        return false;
+    };
+    match scores.to_vec1::<f32>() {
+        Ok(vals) => vals.len() < 2 || vals.windows(2).all(|w| w[0] == w[1]),
+        // A malformed scores tensor is not this fn's contract to enforce —
+        // `compute_loss` surfaces that as its own typed error downstream.
+        Err(_) => false,
+    }
+}
+
 /// Evaluate `objective` at each Matryoshka prefix dimension in `dims` and sum
 /// the losses, or evaluate it once on the full embeddings when `dims` is empty.
 ///
@@ -2697,6 +2764,156 @@ mod tests {
             .artifact_dir(dir_path)
             .build()
             .unwrap()
+    }
+
+    /// Minimal `tracing::Subscriber` that records whether a warn-level event
+    /// mentioning "no ordered score pair" was emitted — the B3(c) per-epoch
+    /// degenerate-batch diagnostic. Mirrors
+    /// `crate::model::backend::candle::device_tests::WarnCapture`'s shape.
+    #[derive(Clone, Default)]
+    struct DegenerateWarnCapture {
+        saw_warning: Arc<AtomicBool>,
+    }
+
+    impl tracing::Subscriber for DegenerateWarnCapture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() == tracing::Level::WARN
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct MsgVisitor {
+                hit: bool,
+            }
+            impl tracing::field::Visit for MsgVisitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message"
+                        && format!("{value:?}").contains("no ordered score pair")
+                    {
+                        self.hit = true;
+                    }
+                }
+            }
+            let mut visitor = MsgVisitor { hit: false };
+            event.record(&mut visitor);
+            if visitor.hit {
+                self.saw_warning.store(true, Ordering::SeqCst);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// B3(c): the epoch loop counts degenerate (no-ordered-pair) batches
+    /// under an ordering objective and warns ONCE PER EPOCH when a MAJORITY
+    /// of the epoch's batches were degenerate — WITHOUT changing the loss
+    /// value itself. Drives the real `TrainingLoop::run` over 3 precomputed
+    /// single-row `Contrastive` batches under the production default
+    /// (`embedding_loss: None` → CoSENT): a lone row can never form a
+    /// `scores[i] < scores[j]` pair, so every batch is degenerate (3/3 >
+    /// 50%). Captures `tracing` output ([`DegenerateWarnCapture`]) to assert
+    /// the warn actually fires, not merely that the counter compiles.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn epoch_warns_on_majority_degenerate_batches_without_changing_loss() {
+        let device = Device::Cpu;
+        let config = FineTuneConfig {
+            embedding_loss: None,
+            epochs: 1,
+            batch_size: 1,
+            validation_fraction: 0.0,
+            warmup_steps: 0,
+            gradient_accumulation_steps: 1,
+            early_stopping_metric: EarlyStoppingMetric::TrainLoss,
+            early_stopping_patience: 10_000,
+            learning_rate: 1e-3,
+            ..Default::default()
+        };
+        let varmap = VarMap::new();
+        let vb = candle_nn::VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let head = super::super::lora::build_projection_head(4, &config, &varmap, &vb).unwrap();
+
+        let batches: Vec<_> = (0..3)
+            .map(|_| super::super::data::TrainingBatch::Contrastive {
+                embeddings_a: Tensor::new(&[[1.0f32, 0.0, 0.0, 0.0]], &device).unwrap(),
+                embeddings_b: Tensor::new(&[[0.0f32, 1.0, 0.0, 0.0]], &device).unwrap(),
+                scores: Tensor::new(&[1.0f32], &device).unwrap(),
+            })
+            .collect();
+        let loader = super::super::data::TrainingDataLoader::from_precomputed(batches);
+
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.keep();
+        let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir_path).await.unwrap());
+        catalog
+            .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
+                model_id: "b3c-model",
+                version: 1,
+                model_type: "embedding",
+                backend: "candle",
+                task: ModelTask::TextEmbedding,
+                base_model_id: None,
+                artifact_path: None,
+                config_json: None,
+            })
+            .await
+            .unwrap();
+        catalog
+            .create_training_job(jammi_db::catalog::training_repo::CreateTrainingJobParams {
+                job_id: "b3c-job",
+                base_model_id: "b3c-model::1",
+                training_source: "src",
+                loss_type: "contrastive",
+                hyperparams: "{}",
+                kind: "fine_tune",
+                training_spec: "{}",
+            })
+            .await
+            .unwrap();
+        catalog
+            .claim_next_training_job("b3c-worker", std::time::Duration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("queued job is claimable");
+
+        let mut tl =
+            TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+                .device(device.clone())
+                .job_id("b3c-job".into())
+                .worker_id("b3c-worker".into())
+                .catalog(catalog)
+                .artifact_dir(dir_path)
+                .build()
+                .unwrap();
+
+        let capture = DegenerateWarnCapture::default();
+        let flag = Arc::clone(&capture.saw_warning);
+        let result = tokio::task::spawn_blocking(move || {
+            tracing::subscriber::with_default(capture, || tl.run(&loader))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "expected a warn-level log when a majority of the epoch's batches were degenerate"
+        );
+        // The diagnostic must not change the loss value itself: every batch
+        // trains at CoSENT's real `log(1) = 0` floor (no valid pair), so the
+        // reported final loss is (near-)zero.
+        assert!(
+            result.final_loss.abs() < 1e-3,
+            "the degenerate-batch diagnostic must not change the loss value itself, got \
+             final_loss={}",
+            result.final_loss
+        );
     }
 
     /// esc-040 gradient arm: CoSENT must produce a finite, non-vanishing

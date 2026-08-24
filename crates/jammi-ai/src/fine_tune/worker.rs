@@ -493,8 +493,13 @@ impl TrainingWorker {
                     .read_source_columns(session, &source, &columns)
                     .await
                     .map_err(WorkerJobError::from)?;
-                let loader = build_training_data_loader(&batches, &columns, task)
-                    .map_err(WorkerJobError::from)?;
+                let loader = build_training_data_loader(
+                    &batches,
+                    &columns,
+                    task,
+                    common.config.embedding_loss,
+                )
+                .map_err(WorkerJobError::from)?;
                 let run = FineTuneRun {
                     task,
                     common,
@@ -1077,10 +1082,18 @@ fn extract_numeric_column(
 /// reads them as text. The column names are identical across modalities (the
 /// triplet shape is the same) — only the cell decoding differs, so the caller's
 /// chosen task is the discriminator, not a parallel set of column names.
+///
+/// `embedding_loss` is the fine-tune config's configured objective, needed
+/// ONLY to validate a contrastive (`text_a, text_b, score`) source at
+/// construction: an ordering objective (CoSENT/AnglE, including the `None`
+/// default) over a dataset whose graded scores carry fewer than 2 distinct
+/// levels is refused here — see `TrainingDataLoader::from_contrastive`'s doc.
+/// Every other format ignores it.
 fn build_training_data_loader(
     batches: &[RecordBatch],
     columns: &[String],
     task: ModelTask,
+    embedding_loss: Option<crate::fine_tune::EmbeddingLoss>,
 ) -> Result<TrainingDataLoader> {
     let col_names: Vec<&str> = columns.iter().map(|s| s.as_str()).collect();
 
@@ -1149,7 +1162,7 @@ fn build_training_data_loader(
                 rows.push((a_vals[i].clone(), b_vals[i].clone(), score));
             }
         }
-        Ok(TrainingDataLoader::from_contrastive(rows))
+        TrainingDataLoader::from_contrastive(rows, embedding_loss)
     } else if has_triplet {
         let mut rows = Vec::new();
         for batch in batches {
@@ -2008,7 +2021,7 @@ mod tests {
         let target = Arc::new(Int64Array::from(vec![2017i64, 2018, 2016])) as ArrayRef;
         let batch = text_target_batch(&["a", "b", "c"], target);
         let loader =
-            build_training_data_loader(&[batch], &regression_cols(), ModelTask::Regression)
+            build_training_data_loader(&[batch], &regression_cols(), ModelTask::Regression, None)
                 .unwrap();
         assert!(matches!(loader.format(), TrainingFormat::Regression));
         assert_eq!(loader.len(), 3);
@@ -2031,9 +2044,13 @@ mod tests {
             Arc::new(Float32Array::from(vec![1.5f32, 2.5])) as ArrayRef,
         );
         for batch in [f64_batch, f32_batch] {
-            let loader =
-                build_training_data_loader(&[batch], &regression_cols(), ModelTask::Regression)
-                    .unwrap();
+            let loader = build_training_data_loader(
+                &[batch],
+                &regression_cols(),
+                ModelTask::Regression,
+                None,
+            )
+            .unwrap();
             assert_eq!(loader.regression_targets().unwrap(), vec![1.5, 2.5]);
         }
     }
@@ -2044,7 +2061,7 @@ mod tests {
         let target = Arc::new(Int32Array::from(vec![10i32, 20])) as ArrayRef;
         let batch = text_target_batch(&["a", "b"], target);
         let loader =
-            build_training_data_loader(&[batch], &regression_cols(), ModelTask::Regression)
+            build_training_data_loader(&[batch], &regression_cols(), ModelTask::Regression, None)
                 .unwrap();
         assert_eq!(loader.regression_targets().unwrap(), vec![10.0, 20.0]);
     }
@@ -2064,7 +2081,7 @@ mod tests {
         let label = Arc::new(StringArray::from(vec!["2017", "2018"])) as ArrayRef;
         let batch = ArrowBatch::try_new(schema, vec![text, label]).unwrap();
         let cols = vec!["text".to_string(), "label".to_string()];
-        let err = build_training_data_loader(&[batch], &cols, ModelTask::Regression)
+        let err = build_training_data_loader(&[batch], &cols, ModelTask::Regression, None)
             .err()
             .unwrap();
         let msg = err.to_string();
@@ -2091,7 +2108,8 @@ mod tests {
         let label = Arc::new(StringArray::from(vec!["x", "y"])) as ArrayRef;
         let batch = ArrowBatch::try_new(schema, vec![text, label]).unwrap();
         let cols = vec!["text".to_string(), "label".to_string()];
-        let loader = build_training_data_loader(&[batch], &cols, ModelTask::TextEmbedding).unwrap();
+        let loader =
+            build_training_data_loader(&[batch], &cols, ModelTask::TextEmbedding, None).unwrap();
         assert!(matches!(
             loader.format(),
             TrainingFormat::Classification { num_classes: 2 }
@@ -2104,9 +2122,10 @@ mod tests {
     fn null_target_is_rejected_with_typed_error() {
         let target = Arc::new(Int64Array::from(vec![Some(2017i64), None, Some(2018)])) as ArrayRef;
         let batch = text_target_batch(&["a", "b", "c"], target);
-        let err = build_training_data_loader(&[batch], &regression_cols(), ModelTask::Regression)
-            .err()
-            .unwrap();
+        let err =
+            build_training_data_loader(&[batch], &regression_cols(), ModelTask::Regression, None)
+                .err()
+                .unwrap();
         let msg = err.to_string();
         assert!(
             msg.contains("null") && msg.contains("row 1"),
@@ -2119,9 +2138,10 @@ mod tests {
     fn nan_target_is_rejected_with_typed_error() {
         let target = Arc::new(Float64Array::from(vec![1.0f64, f64::NAN, 3.0])) as ArrayRef;
         let batch = text_target_batch(&["a", "b", "c"], target);
-        let err = build_training_data_loader(&[batch], &regression_cols(), ModelTask::Regression)
-            .err()
-            .unwrap();
+        let err =
+            build_training_data_loader(&[batch], &regression_cols(), ModelTask::Regression, None)
+                .err()
+                .unwrap();
         let msg = err.to_string();
         assert!(
             msg.contains("NaN") && msg.contains("row 1"),
@@ -2135,9 +2155,10 @@ mod tests {
     fn non_numeric_target_is_typed_error() {
         let target = Arc::new(StringArray::from(vec!["alpha", "beta"])) as ArrayRef;
         let batch = text_target_batch(&["a", "b"], target);
-        let err = build_training_data_loader(&[batch], &regression_cols(), ModelTask::Regression)
-            .err()
-            .unwrap();
+        let err =
+            build_training_data_loader(&[batch], &regression_cols(), ModelTask::Regression, None)
+                .err()
+                .unwrap();
         assert!(
             err.to_string().contains("not a numeric"),
             "non-numeric target must be a typed error, got: {err}"
@@ -2151,7 +2172,7 @@ mod tests {
         let target = Arc::new(Int64Array::from(vec![2017i64, 2017, 2017])) as ArrayRef;
         let batch = text_target_batch(&["a", "b", "c"], target);
         let loader =
-            build_training_data_loader(&[batch], &regression_cols(), ModelTask::Regression)
+            build_training_data_loader(&[batch], &regression_cols(), ModelTask::Regression, None)
                 .unwrap();
         assert_eq!(
             loader.regression_targets().unwrap(),

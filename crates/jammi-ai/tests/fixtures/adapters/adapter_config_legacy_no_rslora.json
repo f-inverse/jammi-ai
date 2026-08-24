@@ -1,0 +1,6 @@
+{
+  "adapter_type": "projection_head",
+  "lora_rank": 16,
+  "lora_alpha": 32.0,
+  "head_layers": ["projection"]
+}

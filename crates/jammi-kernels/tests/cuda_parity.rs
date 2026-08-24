@@ -3304,12 +3304,13 @@ fn lora_linear_parity_bf16_base_production_width() {
 ///   BF16` narrowing cast,
 /// - point 7, `dx = dx_base + d_x_lora`, `BF16`'s promote-compute-
 ///   round-once add —
-/// each bounded by its OWN [`bf16_round_bound`] (mirroring the forward
-/// test's "bound each term by its own magnitude, not the combined
-/// result's" reasoning: `dx_base` and `d_x_lora` are two independently-
-/// signed contributions that need not be anywhere near each other's
-/// magnitude), plus a small `F32` floor for the two branches' own GEMM
-/// summation-order noise.
+///
+///   each bounded by its OWN [`bf16_round_bound`] (mirroring the forward
+///   test's "bound each term by its own magnitude, not the combined
+///   result's" reasoning: `dx_base` and `d_x_lora` are two independently-
+///   signed contributions that need not be anywhere near each other's
+///   magnitude), plus a small `F32` floor for the two branches' own GEMM
+///   summation-order noise.
 #[test]
 fn lora_linear_parity_bf16_base_backward_production_width() {
     let Some(cuda) = cuda_device() else {

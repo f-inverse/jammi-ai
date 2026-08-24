@@ -31,8 +31,8 @@
 use candle_core::{DType, Device, Tensor, Var, D};
 use half::bf16;
 use jammi_kernels::ops::{
-    apply1, apply2, apply3, Axpy, FullyMaskedPolicy, GegluFused, GeluVariant, LayerNormFused,
-    RopeFused, ScaledCastAdd, SoftmaxLastDimFused,
+    apply1, apply2, apply3, Axpy, DropoutFused, FullyMaskedPolicy, GegluFused, GeluVariant,
+    LayerNormFused, PhiloxKatProbe, RopeFused, ScaledCastAdd, SoftmaxLastDimFused,
 };
 
 fn axpy(alpha: f64, x: &Tensor, y: &Tensor) -> candle_core::Result<Tensor> {
@@ -1523,7 +1523,7 @@ fn geglu_parity_narrowed_with_nonzero_offset() {
     assert!(wi_cpu.is_contiguous());
     assert_ne!(wi_cpu.layout().start_offset(), 0);
 
-    let wi_gpu = Tensor::from_slice(&base, (3, rows, 2 * intermediate), cuda)
+    let wi_gpu = Tensor::from_slice(&base, (3, rows, 2 * intermediate), &cuda)
         .unwrap()
         .narrow(0, 1, 1)
         .unwrap()
@@ -1591,7 +1591,7 @@ fn geglu_parity_empty_last_dim() {
     let cpu = Device::Cpu;
     let rows = 3;
     let wi_cpu = Tensor::from_slice(&[] as &[f32], (rows, 0), &cpu).unwrap();
-    let wi_gpu = Tensor::from_slice(&[] as &[f32], (rows, 0), cuda).unwrap();
+    let wi_gpu = Tensor::from_slice(&[] as &[f32], (rows, 0), &cuda).unwrap();
 
     let out_cpu: Vec<f32> = geglu(&wi_cpu)
         .unwrap()
@@ -1877,4 +1877,259 @@ fn scaled_cast_add_parity_multi_block_not_a_multiple_of_block_size() {
     let lora = fixture(2000, 8.0);
     assert_scaled_cast_add_parity_f32_f32(&cuda, -2.25, &base, &lora);
     assert_scaled_cast_add_parity_bf16_base(&cuda, -2.25, &base, &lora);
+}
+
+// =======================================================================
+// Philox4x32-10 KAT-on-CUDA: Random123's published known-answer test
+// vectors run through `PhiloxKatProbe`'s CUDA arm (`dropout.cu`'s
+// `philox_kat` device function) and asserted bit-identical to the exact
+// same vectors `jammi_kernels::philox`'s own CPU tests assert. THIS is
+// the proof the C7 contract requires: the Rust CPU port and the CUDA
+// device function compute the identical `u32` stream, not merely "both
+// happen to compile" — see `crate::philox`'s module doc (embedded via
+// `jammi_kernels::philox`, re-exercised here) and `ops::PhiloxKatProbe`'s
+// doc for why this goes through the ordinary `apply1` dispatch path
+// rather than a bespoke raw-buffer-download API.
+// =======================================================================
+
+#[test]
+fn philox_kat_vectors_match_on_cuda() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let cpu = Device::Cpu;
+    let dummy = Tensor::from_slice(&[0.0f32], (1,), &cuda).unwrap();
+    // The three vectors are `jammi_kernels::philox::tests`'s own —
+    // Random123 `tests/kat_vectors`, `philox4x32 10` (fetched 2026-08-24
+    // from `DEShawResearch/random123@main`).
+    let vectors: [([u32; 4], [u32; 2], [u32; 4]); 3] = [
+        (
+            [0, 0, 0, 0],
+            [0, 0],
+            [0x6627e8d5, 0xe169c58d, 0xbc57ac4c, 0x9b00dbd8],
+        ),
+        (
+            [0xffffffff; 4],
+            [0xffffffff, 0xffffffff],
+            [0x408f276d, 0x41c83b0e, 0xa20bc7c6, 0x6d5451fd],
+        ),
+        (
+            [0x243f6a88, 0x85a308d3, 0x13198a2e, 0x03707344],
+            [0xa4093822, 0x299f31d0],
+            [0xd16cfe09, 0x94fdcceb, 0x5001e420, 0x24126ea1],
+        ),
+    ];
+    for (ctr, key, expected) in vectors {
+        let op = PhiloxKatProbe::new(ctr, key);
+        let out: Vec<u32> = apply1(&dummy, op)
+            .unwrap()
+            .to_device(&cpu)
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(
+            out,
+            expected.to_vec(),
+            "philox4x32-10 KAT mismatch on CUDA for ctr={ctr:?} key={key:?}"
+        );
+    }
+}
+
+// =======================================================================
+// DropoutFused CPU<->CUDA parity: the KEEP/DROP decision (an INTEGER
+// comparison over the identical Philox stream, just proven bit-identical
+// above) must match exactly, and the applied scale (`__fmul_rn` on CUDA,
+// a lone `f32 * f32` on CPU — the SAME single IEEE-754 round-to-nearest
+// operation) must match within this file's ordinary `F32_TOL`/bf16-ULP
+// bounds (an fmad-contraction-class gap CANNOT occur here: there is no
+// neighboring add for either side's multiply to fuse with). Covers the
+// same divergence-prone classes as every other op's suite in this file
+// (contiguous, narrowed-with-nonzero-offset, empty) PLUS this op's own
+// domain edge: p == 0.0 must be a bit-exact no-op on BOTH devices.
+// =======================================================================
+
+fn dropout(
+    seed: u64,
+    layer_id: u32,
+    forward_idx: u32,
+    p: f32,
+    x: &Tensor,
+) -> candle_core::Result<Tensor> {
+    let op = DropoutFused::new(seed, layer_id, forward_idx, p)?;
+    apply1(x, op)
+}
+
+/// Decision + applied-value parity, fwd AND bwd, for a fixed
+/// `(seed, layer_id, forward_idx, p)` over a large tensor — oracle 2 (CPU
+/// mask == CUDA mask bit-for-bit at the DECISION level) plus the applied
+/// scale's own tolerance.
+fn assert_dropout_parity_f32(
+    cuda: &Device,
+    seed: u64,
+    layer_id: u32,
+    forward_idx: u32,
+    p: f32,
+    xv: &[f32],
+) {
+    let cpu = Device::Cpu;
+    let n = xv.len();
+
+    let x_cpu = Var::from_tensor(&Tensor::from_slice(xv, (n,), &cpu).unwrap()).unwrap();
+    let out_cpu = dropout(seed, layer_id, forward_idx, p, &x_cpu).unwrap();
+    let grads_cpu = out_cpu.backward().unwrap();
+
+    let x_gpu = Var::from_tensor(&Tensor::from_slice(xv, (n,), cuda).unwrap()).unwrap();
+    let out_gpu = dropout(seed, layer_id, forward_idx, p, &x_gpu).unwrap();
+    let grads_gpu = out_gpu.backward().unwrap();
+
+    let out_cpu_v: Vec<f32> = out_cpu.to_vec1().unwrap();
+    let out_gpu_v: Vec<f32> = out_gpu.to_device(&cpu).unwrap().to_vec1().unwrap();
+    assert_eq!(out_cpu_v.len(), n);
+    assert_eq!(out_gpu_v.len(), n, "dropout GPU fwd length mismatch");
+    for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
+        // The DECISION must match exactly: a kept-on-one-device,
+        // dropped-on-the-other element is a hard failure, not a tolerance
+        // question (the whole point of the shared Philox stream + integer
+        // threshold, proven above).
+        assert_eq!(
+            *c == 0.0,
+            *g == 0.0,
+            "dropout fwd[{i}]: KEEP/DROP decision disagrees, cpu {c} vs cuda {g}"
+        );
+        assert!(
+            ((*c - *g).abs() as f64) <= F32_TOL,
+            "dropout fwd[{i}]: cpu {c} vs cuda {g}"
+        );
+    }
+
+    let dx_cpu: Vec<f32> = grads_cpu.get(&x_cpu).unwrap().to_vec1().unwrap();
+    let dx_gpu: Vec<f32> = grads_gpu
+        .get(&x_gpu)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(dx_cpu.len(), n);
+    assert_eq!(dx_gpu.len(), n, "dropout GPU dx length mismatch");
+    for (i, (c, g)) in dx_cpu.iter().zip(dx_gpu.iter()).enumerate() {
+        assert_eq!(
+            *c == 0.0,
+            *g == 0.0,
+            "dropout dx[{i}]: KEEP/DROP decision disagrees on the regenerated backward, \
+             cpu {c} vs cuda {g}"
+        );
+        assert!(
+            ((*c - *g).abs() as f64) <= F32_TOL,
+            "dropout dx[{i}]: cpu {c} vs cuda {g}"
+        );
+    }
+}
+
+#[test]
+fn dropout_parity_contiguous_small() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let x = fixture(2048, 1.0);
+    assert_dropout_parity_f32(&cuda, 4242, 7, 3, 0.05, &x);
+}
+
+#[test]
+fn dropout_parity_p_zero_is_bit_exact_no_op_on_both_devices() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let cpu = Device::Cpu;
+    let x = fixture(512, 2.0);
+    let x_cpu = Tensor::from_slice(&x, (512,), &cpu).unwrap();
+    let x_gpu = Tensor::from_slice(&x, (512,), &cuda).unwrap();
+    let out_cpu: Vec<f32> = dropout(1, 0, 0, 0.0, &x_cpu).unwrap().to_vec1().unwrap();
+    let out_gpu: Vec<f32> = dropout(1, 0, 0, 0.0, &x_gpu)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(out_cpu, x, "p=0.0 must be a bit-exact no-op on CPU");
+    assert_eq!(out_gpu, x, "p=0.0 must be a bit-exact no-op on CUDA");
+}
+
+#[test]
+fn dropout_parity_narrowed_with_nonzero_offset() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let cpu = Device::Cpu;
+    let base = fixture(3 * 256, 3.0);
+
+    let x_cpu = Tensor::from_slice(&base, (3, 256), &cpu)
+        .unwrap()
+        .narrow(0, 1, 1)
+        .unwrap()
+        .flatten_all()
+        .unwrap();
+    assert!(x_cpu.is_contiguous());
+    assert_ne!(x_cpu.layout().start_offset(), 0);
+    let x_gpu = Tensor::from_slice(&base, (3, 256), &cuda)
+        .unwrap()
+        .narrow(0, 1, 1)
+        .unwrap()
+        .flatten_all()
+        .unwrap();
+
+    let out_cpu: Vec<f32> = dropout(99, 2, 1, 0.3, &x_cpu).unwrap().to_vec1().unwrap();
+    let out_gpu: Vec<f32> = dropout(99, 2, 1, 0.3, &x_gpu)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(out_cpu.len(), 256);
+    assert_eq!(
+        out_gpu.len(),
+        256,
+        "narrowed dropout GPU fwd length mismatch"
+    );
+    for (i, (c, g)) in out_cpu.iter().zip(out_gpu.iter()).enumerate() {
+        assert_eq!(
+            *c == 0.0,
+            *g == 0.0,
+            "narrowed dropout fwd[{i}]: KEEP/DROP decision disagrees"
+        );
+        assert!(
+            ((*c - *g).abs() as f64) <= F32_TOL,
+            "narrowed dropout fwd[{i}]: cpu {c} vs cuda {g}"
+        );
+    }
+}
+
+#[test]
+fn dropout_parity_empty() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let cpu = Device::Cpu;
+    let x_cpu = Tensor::from_slice(&[] as &[f32], (0,), &cpu).unwrap();
+    let x_gpu = Tensor::from_slice(&[] as &[f32], (0,), &cuda).unwrap();
+    let out_cpu: Vec<f32> = dropout(1, 0, 0, 0.3, &x_cpu).unwrap().to_vec1().unwrap();
+    // Must not attempt an illegal zero-block launch.
+    let out_gpu: Vec<f32> = dropout(1, 0, 0, 0.3, &x_gpu)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert!(out_cpu.is_empty());
+    assert!(out_gpu.is_empty());
+}
+
+#[test]
+fn dropout_parity_multi_block_not_a_multiple_of_block_size() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    // 2000 spans multiple 256-thread blocks with a partial last block.
+    let x = fixture(2000, 9.0);
+    assert_dropout_parity_f32(&cuda, 7, 1, 12, 0.4, &x);
 }

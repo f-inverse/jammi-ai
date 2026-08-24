@@ -151,6 +151,34 @@ impl TrainingTarget {
         }
     }
 
+    /// Audit advisory (post-4aa1303 round): `layer_id` — the Philox
+    /// counter slot carrying a layer's identity — is a 32-bit HASH of its
+    /// fully-qualified name, the only place two distinct sites in this
+    /// target CAN collide; a collision means the two sites would share
+    /// every dropout mask silently (no error, correlated dropout,
+    /// forever). This asserts the induced `layer_id` set has the same
+    /// cardinality as this target's own dropout-mask-bearing layer names
+    /// — i.e. the hash is injective over THIS run's actual name set — via
+    /// [`jammi_lora::assert_no_layer_id_collisions`], refusing with a
+    /// typed error naming both colliding sites otherwise.
+    ///
+    /// Reuses [`Self::dropout_positions`]'s own key set (stripped of its
+    /// `.dropout` suffix) rather than re-deriving the name list: those
+    /// keys are already exactly the fully-qualified names each layer's
+    /// `DropoutMasks` was constructed with (the same string
+    /// `restore_dropout_positions` matches back against), so this is the
+    /// SAME "run's DropoutMasks set" resume already depends on being
+    /// named consistently, not a new assumption.
+    pub fn assert_dropout_layer_ids_are_collision_free(&self) -> Result<()> {
+        let positions = self.dropout_positions()?;
+        let names: Vec<&str> = positions
+            .keys()
+            .map(|k| k.strip_suffix(".dropout").unwrap_or(k.as_str()))
+            .collect();
+        jammi_lora::assert_no_layer_id_collisions(names)
+            .map_err(|e| JammiError::FineTune(format!("layer_id collision guard: {e}")))
+    }
+
     /// Restore each layer's dropout-stream position from a
     /// [`Self::dropout_positions`]-shaped map. A missing key leaves that layer's
     /// stream at the origin (the from-scratch position), which is correct for a

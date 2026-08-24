@@ -18,7 +18,9 @@ use jammi_db::error::{JammiError, Result};
 use super::data::{TextChunk, TrainingDataLoader};
 use super::optimizer::clip_and_step;
 use super::regression_loss::{crps_gaussian_loss, gaussian_nll_loss, pinball_loss, TargetScaler};
-use super::resume::{capture_bundle, NamedMoments, RestoredCheckpoint, ResumeState};
+use super::resume::{
+    capture_bundle, NamedMoments, RestoredCheckpoint, ResumeState, RESUME_STATE_SCHEMA_VERSION,
+};
 use super::target::TrainingTarget;
 use super::{EarlyStoppingMetric, FineTuneConfig, LrSchedule};
 use crate::model::{LoadedModel, ModelTask};
@@ -273,6 +275,13 @@ impl TrainingLoopBuilder {
         let artifact_dir = self.artifact_dir.ok_or_else(|| {
             JammiError::FineTune("TrainingLoopBuilder: artifact_dir required".into())
         })?;
+        // Audit advisory (post-4aa1303 round): a whole-run, one-time check
+        // — not a hot-path cost — that no two of this target's dropout
+        // layers hash to the same `layer_id` (see the method's own doc).
+        // Runs before the loop is handed back to the caller, so a
+        // collision is a hard, typed refusal at construction time, never
+        // a silent correlated-dropout defect discovered later.
+        self.target.assert_dropout_layer_ids_are_collision_free()?;
         Ok(TrainingLoop {
             target: self.target,
             base_model: self.base_model,
@@ -868,7 +877,11 @@ impl TrainingLoop {
         // Dropout off for the whole GradCache region so the two encode passes
         // (and the logging re-encode) agree. Toggled while no encode closure
         // borrows `self`, so it does not collide with the immutable borrows
-        // below.
+        // below. Concretely, this means a WHOLE GradCache epoch trains with
+        // LoRA dropout OFF — an undocumented (until now) behavior difference
+        // from the standard per-batch training path, flagged by #352; left
+        // as-is here (out of this commit's scope — a follow-up question,
+        // not a defect this commit fixes).
         self.target.set_training(false);
 
         // Immutable-borrow region: the encode closures borrow `self`, so no
@@ -1842,6 +1855,7 @@ impl TrainingLoop {
         let weights = self.target.named_trainable_weights()?;
         let (moments, step_t) = Self::capture_moments_by_name(optimizer, optim_param_names)?;
         let state = ResumeState {
+            schema_version: RESUME_STATE_SCHEMA_VERSION,
             last_completed_epoch,
             global_step,
             step_t,
@@ -5913,6 +5927,7 @@ mod resume_invariant {
         // Winner B persists an epoch-5 resume bundle directly through the store
         // (the durable state a healthy attempt would have written).
         let winner_state = super::super::resume::ResumeState {
+            schema_version: super::super::resume::RESUME_STATE_SCHEMA_VERSION,
             last_completed_epoch: 5,
             global_step: 60,
             step_t: 60,

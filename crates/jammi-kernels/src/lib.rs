@@ -17,6 +17,13 @@ pub mod admission;
 pub mod error;
 mod layout_walk;
 pub mod ops;
+/// Philox4x32-10 (ported from Random123, BSD-3-Clause — see the module's
+/// own doc for the full provenance/citation) and the `(seed, layer,
+/// forward#, index) -> u32` counter mapping [`ops::DropoutFused`] builds
+/// on. Public so the crate's own test suite (`tests/*.rs`, a separate
+/// compilation unit) and the CUDA parity suite can both exercise the
+/// published known-answer test vectors directly.
+pub mod philox;
 
 #[cfg(feature = "cuda")]
 mod cuda;

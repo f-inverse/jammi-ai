@@ -47,6 +47,7 @@
 use candle_core::{CustomOp1, CustomOp2, CustomOp3, Result, Tensor};
 
 mod axpy;
+mod dropout;
 // `pub(crate)`, not private like `axpy`/`layer_norm`/`rope`: `crate::cuda::geglu`
 // imports `geglu_dims`/`output_shape`/`check_variant` directly from here
 // rather than duplicating them — the same "shared, not duplicated" choice
@@ -65,6 +66,7 @@ mod scaled_cast_add;
 pub(crate) mod softmax;
 
 pub use axpy::Axpy;
+pub use dropout::{DropoutFused, PhiloxKatProbe};
 pub use geglu::{GegluFused, GeluVariant};
 pub use layer_norm::{LayerNormFused, MAX_HIDDEN};
 pub use rope::{RopeFused, MAX_HEAD_DIM};

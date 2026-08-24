@@ -46,8 +46,17 @@ pub use init::LoraInitMode;
 // without its own direct `jammi-numerics` import.
 pub use jammi_numerics::ComputePrecision;
 #[cfg(feature = "candle")]
-pub use lora_linear::{lora_epilogue_dispatch_snapshot, LoraLinear};
+pub use lora_linear::{
+    lora_dropout_dispatch_snapshot, lora_epilogue_dispatch_snapshot, LoraLinear,
+};
 #[cfg(feature = "candle")]
 pub use save_load::{load_adapter, save_adapter};
+// The layer_id collision guard (audit advisory, post-4aa1303 round): a
+// standalone, whole-run structural check over every name that will
+// construct a `DropoutMasks` — see `seeded::assert_no_layer_id_collisions`'s
+// own doc for the call-site contract and why this lives here rather than
+// being threaded through `LoraLinear::new`'s per-layer construction.
+#[cfg(feature = "candle")]
+pub use seeded::assert_no_layer_id_collisions;
 #[cfg(feature = "candle")]
 pub use wrapper::MaybeLoraLinear;

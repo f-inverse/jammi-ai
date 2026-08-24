@@ -43,12 +43,34 @@ const MOMENTS_FILE: &str = "optimizer.safetensors";
 /// The run-state JSON inside a resume bundle.
 const STATE_FILE: &str = "resume_state.json";
 
+/// The current [`ResumeState`] schema version. Bumped whenever a field's
+/// UNIT or MEANING changes in a way that would silently mis-restore an
+/// older checkpoint if read as the new schema — the C7 commit that
+/// introduces this constant is itself such a bump: `dropout_positions`
+/// changes unit from per-ELEMENT draw counts to per-FORWARD Philox
+/// counters (closing esc-032/esc-033; see that field's own doc). See
+/// [`load_bundle`]'s version check for how a mismatch (including a
+/// checkpoint with NO `schema_version` field at all, from before this
+/// commit) is refused rather than silently misinterpreted.
+pub const RESUME_STATE_SCHEMA_VERSION: u32 = 1;
+
 /// The non-tensor run state persisted alongside the weights and moments. Every
 /// field is authoritative on resume — in particular `scaler` is *loaded*, never
 /// recomputed, so a source mutated between crash and resume cannot perturb the
 /// de-standardisation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResumeState {
+    /// The schema version this bundle was written under — see
+    /// [`RESUME_STATE_SCHEMA_VERSION`]. Deliberately carries NO
+    /// `#[serde(default)]`: a checkpoint captured before this field
+    /// existed has no `schema_version` key in its JSON at all, so
+    /// deserializing it FAILS with a typed error naming the missing
+    /// field, rather than silently defaulting to today's schema and
+    /// misinterpreting `dropout_positions`'s unit. [`load_bundle`] adds an
+    /// explicit post-parse check for a PRESENT-but-different version on
+    /// top of that (the case a missing-field serde error alone would not
+    /// catch: a checkpoint from a future/other schema version).
+    pub schema_version: u32,
     /// The last epoch whose optimizer steps all completed — the boundary this
     /// checkpoint was taken at. The resumed run starts at `epoch + 1`.
     pub last_completed_epoch: usize,
@@ -65,8 +87,23 @@ pub struct ResumeState {
     /// The `TargetScaler`'s `(μ, σ)` for a regression run, or `None`. Persisted so
     /// resume loads the authoritative standardiser rather than recomputing it.
     pub scaler: Option<(f64, f64)>,
-    /// Each dropout stream's draw position at the boundary, keyed `{layer}.dropout`.
-    /// A resumed run replays each stream to its position so its next masks match.
+    /// Each layer's dropout FORWARD COUNTER at the boundary, keyed
+    /// `{layer}.dropout`. A resumed run SETS each layer's counter to this
+    /// value (O(1), an assignment — closing esc-033) so its next training
+    /// forwards draw the same masks the uninterrupted run drew.
+    ///
+    /// **Unit change (schema version 1, this commit):** before device-side
+    /// Philox dropout, this counted per-ELEMENT draws from an advancing
+    /// host RNG stream (`draw_mask`'s `position += len`); it now counts
+    /// per-FORWARD Philox counter values (`jammi_kernels::ops::
+    /// DropoutFused`'s `forward_idx`) — one increment per training
+    /// forward through the layer, regardless of the activation's element
+    /// count. A checkpoint written under the OLD unit would silently
+    /// restore a draw count into a forward counter if read under the new
+    /// schema (an off-by-many-orders-of-magnitude misinterpretation, not
+    /// a merely-stale one) — this is exactly why [`RESUME_STATE_SCHEMA_
+    /// VERSION`] exists and why an unversioned checkpoint is refused
+    /// rather than silently accepted (esc-032).
     pub dropout_positions: HashMap<String, u64>,
 }
 
@@ -153,8 +190,31 @@ pub fn load_bundle(dir: &Path, device: &Device) -> Result<RestoredCheckpoint> {
     let moments = pair_moments(moment_tensors)?;
 
     let state_bytes = std::fs::read(dir.join(STATE_FILE))?;
-    let state: ResumeState = serde_json::from_slice(&state_bytes)
-        .map_err(|e| JammiError::FineTune(format!("resume: parse state: {e}")))?;
+    // `ResumeState::schema_version` has no `#[serde(default)]`, so a
+    // checkpoint written before this field existed (no `schema_version` key
+    // in its JSON at all) fails RIGHT HERE with a typed error naming the
+    // missing field — refused, not silently misinterpreted (esc-032).
+    let state: ResumeState = serde_json::from_slice(&state_bytes).map_err(|e| {
+        JammiError::FineTune(format!(
+            "resume: parse state: {e} — a checkpoint written before the schema_version field \
+             existed (pre-C7) has no such field and is refused rather than silently restored: \
+             its 'dropout_positions' counted per-ELEMENT draws, not the per-forward Philox \
+             counters this schema now expects, so misreading one as the other would silently \
+             desynchronize every training forward's dropout mask from the run it resumes"
+        ))
+    })?;
+    // A PRESENT but DIFFERENT version — the case the missing-field parse
+    // error above cannot catch (e.g. a checkpoint from a future schema
+    // version this binary predates). Refused with the same "typed error
+    // naming the field" contract, not guessed at.
+    if state.schema_version != RESUME_STATE_SCHEMA_VERSION {
+        return Err(JammiError::FineTune(format!(
+            "resume: resume_state.json has schema_version {}, this binary expects {} — \
+             refusing rather than guessing how to interpret an unrecognized schema's \
+             'dropout_positions' units",
+            state.schema_version, RESUME_STATE_SCHEMA_VERSION
+        )));
+    }
 
     Ok(RestoredCheckpoint {
         weights,
@@ -228,6 +288,7 @@ mod tests {
         let mut dropout_positions = HashMap::new();
         dropout_positions.insert("projection.dropout".to_string(), 96);
         let state = ResumeState {
+            schema_version: RESUME_STATE_SCHEMA_VERSION,
             last_completed_epoch: 2,
             global_step: 7,
             step_t: 7,
@@ -273,5 +334,109 @@ mod tests {
         flat.insert("p.m".to_string(), tiny(&device, 1.0));
         let err = pair_moments(flat).unwrap_err().to_string();
         assert!(err.contains("torn optimizer state") || err.contains("no second moment"));
+    }
+
+    /// A minimal, valid (weights + moments) bundle, real safetensors files
+    /// but written through `capture_bundle` so both non-state files are
+    /// trivially valid — only `resume_state.json` gets doctored by the two
+    /// schema-version tests below.
+    fn minimal_versioned_bundle(scratch: &std::path::Path) -> Vec<(String, Bytes)> {
+        let device = Device::Cpu;
+        let mut weights = HashMap::new();
+        weights.insert("w.lora_a".to_string(), tiny(&device, 1.0));
+        weights.insert("w.lora_b".to_string(), tiny(&device, 2.0));
+        let mut moments = HashMap::new();
+        moments.insert(
+            "w.lora_a".to_string(),
+            (tiny(&device, 3.0), tiny(&device, 4.0)),
+        );
+        moments.insert(
+            "w.lora_b".to_string(),
+            (tiny(&device, 5.0), tiny(&device, 6.0)),
+        );
+        let state = ResumeState {
+            schema_version: RESUME_STATE_SCHEMA_VERSION,
+            last_completed_epoch: 0,
+            global_step: 0,
+            step_t: 0,
+            seed: 1,
+            scaler: None,
+            dropout_positions: HashMap::new(),
+        };
+        capture_bundle(scratch, &weights, &moments, &state).unwrap()
+    }
+
+    /// esc-032, the exact oracle the C7 contract asks for: an UNVERSIONED
+    /// checkpoint fixture (a `resume_state.json` from before the
+    /// `schema_version` field existed — the field is ABSENT, not merely
+    /// `0`/`null`, matching what a real pre-C7 checkpoint literally wrote)
+    /// must be REFUSED, never silently restored under today's
+    /// (incompatible) `dropout_positions` unit.
+    #[test]
+    fn unversioned_checkpoint_is_refused_not_silently_restored() {
+        let device = Device::Cpu;
+        let scratch = tempfile::tempdir().unwrap();
+        let bundle = minimal_versioned_bundle(scratch.path());
+        let out = tempfile::tempdir().unwrap();
+        for (name, bytes) in &bundle {
+            if name == STATE_FILE {
+                let mut value: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+                value
+                    .as_object_mut()
+                    .expect("resume_state.json must serialize as a JSON object")
+                    .remove("schema_version");
+                std::fs::write(out.path().join(name), serde_json::to_vec(&value).unwrap()).unwrap();
+            } else {
+                std::fs::write(out.path().join(name), bytes).unwrap();
+            }
+        }
+        // `.expect_err`/`.unwrap_err` require `T: Debug`, which
+        // `RestoredCheckpoint` (holding raw `Tensor`s) does not implement —
+        // match explicitly instead of adding a `Debug` derive purely for
+        // this test's sake.
+        let err = match load_bundle(out.path(), &device) {
+            Err(e) => e,
+            Ok(_) => panic!("an unversioned checkpoint must be refused, not silently restored"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("schema_version"),
+            "the typed error must name the missing field: {msg}"
+        );
+    }
+
+    /// The complementary case a missing-field parse error alone cannot
+    /// catch: a checkpoint whose `schema_version` is PRESENT but does not
+    /// match this binary's expectation. Also refused, not guessed at.
+    #[test]
+    fn mismatched_schema_version_is_refused() {
+        let device = Device::Cpu;
+        let scratch = tempfile::tempdir().unwrap();
+        let bundle = minimal_versioned_bundle(scratch.path());
+        let out = tempfile::tempdir().unwrap();
+        for (name, bytes) in &bundle {
+            if name == STATE_FILE {
+                let mut value: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+                value["schema_version"] = serde_json::Value::from(RESUME_STATE_SCHEMA_VERSION + 1);
+                std::fs::write(out.path().join(name), serde_json::to_vec(&value).unwrap()).unwrap();
+            } else {
+                std::fs::write(out.path().join(name), bytes).unwrap();
+            }
+        }
+        let err = match load_bundle(out.path(), &device) {
+            Err(e) => e,
+            Ok(_) => panic!("a mismatched schema_version must be refused"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("schema_version"),
+            "error must name the field: {msg}"
+        );
+        assert!(
+            msg.contains(&(RESUME_STATE_SCHEMA_VERSION + 1).to_string())
+                && msg.contains(&RESUME_STATE_SCHEMA_VERSION.to_string()),
+            "error must state both the checkpoint's version and this binary's expected \
+             version: {msg}"
+        );
     }
 }

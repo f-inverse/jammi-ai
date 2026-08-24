@@ -310,23 +310,36 @@ jobs:
 
           # Publish in topological dependency order. Each entry must come
           # after every crate it depends on, since `cargo publish` resolves
-          # workspace deps against crates.io once the path = is stripped:
-          #   - jammi-numerics is leaf (no internal deps)
-          #   - jammi-db depends on jammi-numerics
-          #   - jammi-lora is leaf
-          #   - jammi-kernels is leaf (candle-core/candle-nn only)
-          #   - jammi-encoders depends on jammi-lora (jammi-kernels lands before it
-          #     here even though no crate depends on it yet, so the ordering
-          #     already holds for the commit that adds the dependency edge)
-          #   - jammi-wire depends on jammi-db, jammi-numerics, jammi-lora
-          #   - jammi-admin depends on jammi-wire, jammi-db
-          #   - jammi-client depends on jammi-wire, jammi-admin, jammi-db
-          #   - jammi-ai depends on jammi-db, jammi-numerics, jammi-lora, jammi-encoders, jammi-wire
-          #   - jammi-server depends on jammi-db, jammi-wire, jammi-ai
-          #   - jammi-cli depends on jammi-db, jammi-admin
+          # workspace deps against crates.io once the path = is stripped.
+          # `cargo publish -p <crate> --no-verify` carries no explicit
+          # `--no-default-features`/`--features` flag, so it resolves each
+          # crate's OWN default feature set — for `jammi-lora` that is
+          # `default = ["candle"]` (`crates/jammi-lora/Cargo.toml`), which
+          # enables `dep:jammi-kernels`. The edges below are each
+          # publishable crate's normal (non-dev, non-build) dependency set
+          # as reported by `cargo metadata --format-version 1 --locked`
+          # (`packages[].dependencies`, filtered to `kind == null` and to
+          # names in this same list) — read off the resolved graph, not
+          # asserted from the Cargo.toml prose, so this comment cannot
+          # drift the way the previous version of it did (it called
+          # `jammi-lora` a leaf, which stopped being true the moment its
+          # `candle` feature grew an optional `jammi-kernels` dependency,
+          # and nothing re-verified the publish order against that change):
+          #   - jammi-numerics -> (none)
+          #   - jammi-db -> jammi-numerics
+          #   - jammi-kernels -> (none)
+          #   - jammi-lora -> jammi-kernels, jammi-numerics
+          #   - jammi-encoders -> jammi-kernels, jammi-lora, jammi-numerics
+          #   - jammi-wire -> jammi-db, jammi-lora, jammi-numerics
+          #   - jammi-admin -> jammi-db, jammi-wire
+          #   - jammi-client -> jammi-admin, jammi-db, jammi-wire
+          #   - jammi-ai -> jammi-db, jammi-encoders, jammi-lora, jammi-numerics, jammi-wire
+          #   - jammi-server -> jammi-ai, jammi-db, jammi-numerics, jammi-wire
+          #   - jammi-cli -> jammi-admin, jammi-db
           # The presence guard skips crates that don't exist at this tag's
-          # checkout — pre-S2 tags don't have jammi-numerics.
-          for crate in jammi-numerics jammi-db jammi-lora jammi-kernels jammi-encoders jammi-wire jammi-admin jammi-client jammi-ai jammi-server jammi-cli; do
+          # checkout — pre-S2 tags don't have jammi-numerics, and pre-C2
+          # tags don't have jammi-kernels.
+          for crate in jammi-numerics jammi-db jammi-kernels jammi-lora jammi-encoders jammi-wire jammi-admin jammi-client jammi-ai jammi-server jammi-cli; do
             if [ ! -f "crates/${crate}/Cargo.toml" ]; then
               echo "${crate} not present at this tag — skipping"
               continue

@@ -199,7 +199,7 @@ async fn close_drops_tables_and_emits_closed_event(backend: BackendKind) {
 }
 
 /// Criterion 5: a session past its timeout is force-closed by the scanner with
-/// a `timed_out` event, and its tables are deleted.
+/// a `TimedOut` event, and its tables are deleted.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]

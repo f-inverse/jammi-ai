@@ -12,7 +12,7 @@ use crate::error::{JammiError, Result};
 ///
 /// Channel ids are ASCII slugs (`[a-z][a-z0-9_]{0,63}`). They appear in
 /// `retrieved_by` / `annotated_by` list columns and as foreign-key values
-/// in the `evidence_channel_columns` catalog table.
+/// in the evidence_channel_columns catalog table.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct ChannelId(String);

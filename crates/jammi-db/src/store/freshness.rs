@@ -140,8 +140,9 @@ pub enum Staleness {
     MissingManifest,
 }
 
-/// One reason a [`Staleness`] verdict is `Stale` (or a `decided_reason` of an
-/// `Undecidable`): a single determinant that diverged from what was recorded.
+/// One reason a [`Staleness`] verdict is `Stale` (or a `decided_reasons` entry
+/// of an `Undecidable`): a single determinant that diverged from what was
+/// recorded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum StaleReason {

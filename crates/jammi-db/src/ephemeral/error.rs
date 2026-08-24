@@ -35,7 +35,7 @@ pub enum EphemeralError {
     UnknownTable(String),
 
     /// One or more ephemeral tables failed to drop on close. The session has
-    /// emitted a `partial_deletion_failure` lifecycle event recording which
+    /// emitted a `PartialDeletionFailure` lifecycle event recording which
     /// physical tables remain; the caller may retry close.
     #[error(
         "ephemeral session {session_id}: {failed}/{total} table drops failed on close \

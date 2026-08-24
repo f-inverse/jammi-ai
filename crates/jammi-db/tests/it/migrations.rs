@@ -1,4 +1,4 @@
-//! End-to-end migration tests. Asserts via the new `applied_migrations`
+//! End-to-end migration tests. Asserts via the new applied_migrations
 //! ledger and direct sqlx queries against the on-disk catalog.
 
 use jammi_db::catalog::backend::{BackendImpl, TxOptions};
@@ -271,7 +271,7 @@ async fn migration_019_normalizes_available_status_to_registered() {
 }
 
 /// Migration 020 tenant-qualifies the evidence-channel identity. Asserts that
-/// `evidence_channel_columns` gained a `tenant_id` column, that the seed columns
+/// evidence_channel_columns gained a `tenant_id` column, that the seed columns
 /// survived the table rebuild with `tenant_id IS NULL`, that the new per-tenant
 /// `UNIQUE (tenant_id, channel_name)` constraint on `evidence_channels` rejects
 /// a same-tenant duplicate while admitting the same name under a different
@@ -286,7 +286,7 @@ async fn migration_020_tenant_qualifies_channels() {
     let _catalog = Catalog::open(dir.path()).await.unwrap();
     let backend = BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await);
 
-    // `evidence_channel_columns` now carries `tenant_id`.
+    // evidence_channel_columns now carries `tenant_id`.
     let cols = backend
         .transaction(
             TxOptions {

@@ -1,12 +1,12 @@
 //! Migration runner. Applies the SQL constants from [`super::schema`] in
-//! order, tracking which have been applied in an `applied_migrations` ledger.
+//! order, tracking which have been applied in an applied_migrations ledger.
 //! Backend-agnostic: works through [`CatalogBackend`].
 
 use super::backend::{BackendError, CatalogBackend, SqlValue, TxOptions};
 use super::schema;
 
 /// Ordered list of migrations. Each entry's first element is the name
-/// recorded in `applied_migrations`; the second is the SQL DDL.
+/// recorded in applied_migrations; the second is the SQL DDL.
 ///
 /// Entries are append-only: a new migration is appended; names are never
 /// renamed or reordered. The SQL itself may be edited only when the change

@@ -256,7 +256,7 @@ impl EphemeralSession {
     /// and publish a `closed` lifecycle event. This is the recommended path —
     /// the [`Drop`] impl is best-effort.
     ///
-    /// On a partial drop failure, a `partial_deletion_failure` event is emitted
+    /// On a partial drop failure, a `PartialDeletionFailure` event is emitted
     /// listing the surviving physical tables and
     /// [`EphemeralError::PartialDeletionFailure`] is returned; the successfully
     /// dropped tables stay dropped.
@@ -264,7 +264,7 @@ impl EphemeralSession {
         self.delete_all(SessionLifecycleEvent::Closed).await
     }
 
-    /// Force-close the session with a `timed_out` lifecycle event. Used by the
+    /// Force-close the session with a `TimedOut` lifecycle event. Used by the
     /// timeout scanner; semantically identical to [`Self::close`] but tags the
     /// transition as a timeout rather than a deliberate close.
     pub async fn force_close(mut self) -> Result<(), EphemeralError> {

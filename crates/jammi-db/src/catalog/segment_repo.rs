@@ -1,4 +1,4 @@
-//! Catalog access for the ANN index-segment set (`index_segments`).
+//! Catalog access for the ANN index-segment set (the index_segments table).
 //!
 //! A table's ANN index is a *set* of immutable segments (migration 025), one
 //! catalog row per segment. This repo owns the three operations the segment set
@@ -16,7 +16,7 @@ use crate::catalog::Catalog;
 use crate::error::Result;
 use crate::tenant::TenantId;
 
-/// One `index_segments` row: a segment's id within its table, the base URL of
+/// One index_segments row: a segment's id within its table, the base URL of
 /// its sidecar bundle (no extension — the layout helpers append
 /// `.usearch` / `.rowmap` / `.manifest.json` / …), and its own row contribution.
 #[derive(Debug, Clone, PartialEq, Eq)]

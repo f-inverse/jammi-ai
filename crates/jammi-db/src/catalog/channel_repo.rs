@@ -174,7 +174,8 @@ pub struct ChannelSpec {
     pub columns: Vec<ChannelColumn>,
 }
 
-/// Repository over `evidence_channels` and `evidence_channel_columns`.
+/// Repository over `evidence_channels` and its child evidence_channel_columns
+/// table.
 ///
 /// Constructed via [`Catalog::channels`].
 pub struct ChannelRepo<'a> {

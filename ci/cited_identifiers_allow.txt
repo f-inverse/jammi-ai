@@ -40,3 +40,16 @@ float_roundtrip          # serde_json cargo feature name — jammi-bench/src/fix
 to_string_pretty         # serde_json::to_string_pretty, a free-function (not `.method()`-shaped) call — jammi-bench/src/fixture.rs.
 unnecessary_cast         # clippy lint name — jammi-bench/src/search_rss.rs explains why `widen()` avoids tripping it.
 useless_conversion       # clippy lint name — jammi-bench/src/search_rss.rs explains why `widen()` avoids tripping it.
+CURRENT_TIMESTAMP # SQL standard function (SQLite/Postgres builtin), not a repo symbol.
+r2d2_sqlite # External crate cited for historical/behavioral comparison; not a workspace dependency.
+AWS_ENDPOINT_URL # AWS SDK-defined env var consumed by object_store's AmazonS3Builder::from_env.
+GOOGLE_APPLICATION_CREDENTIALS # GCP SDK-defined env var (Application Default Credentials).
+schema_force_view_types # datafusion-common ExecutionOptions field; datafusion-common is a transitive (not direct) dep.
+task_local # tokio's `task_local!` macro.
+from_timestamp_micros # chrono's `DateTime::from_timestamp_micros` associated fn.
+await_holding_lock # clippy's `clippy::await_holding_lock` lint name.
+SQLITE_BUSY_SNAPSHOT # SQLite's own extended result code (SQLite C API / SQL engine internals).
+cfg_attr # Rust language builtin attribute, not a repo symbol.
+pragma_table_info # SQLite's `pragma_table_info` table-valued function.
+sqlite_master # SQLite's builtin schema catalog table.
+code_version # Dagster's asset `code_version` concept, cited for analogy in a doc comment; not a repo symbol.

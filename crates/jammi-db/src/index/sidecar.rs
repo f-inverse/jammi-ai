@@ -115,7 +115,7 @@ fn index_options(
 /// validated baseline (per-dimension arithmetic mean directly cancels the
 /// anisotropic offset); `Median` guarantees an exactly balanced 50/50 bit
 /// split per dimension (maximum per-bit entropy) and is kept as the measured
-/// alternative — see the `mean_vs_median_threshold_on_anisotropic_corpus`
+/// alternative — see the `mean_vs_median_threshold_measured_on_anisotropic_corpus`
 /// test below for which one [`DEFAULT_BINARY_THRESHOLD_KIND`] picks and why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -830,9 +830,9 @@ impl VectorIndex for SidecarIndex {
         let actual_k = k.min(self.row_map.len());
         let matches = match self.storage_precision {
             // Same routing as `build`: a Binary graph's typed search path is
-            // `search_b1x8`, fed the query packed through the identical
-            // `pack_threshold_bits` (against the SAME corpus-fit τ) the
-            // corpus rows were bulk-inserted with.
+            // `.search()` fed a `b1x8`-typed query, packed through the
+            // identical `pack_threshold_bits` (against the SAME corpus-fit τ)
+            // the corpus rows were bulk-inserted with.
             StoragePrecision::Binary => {
                 let threshold = self.binary_threshold.as_deref().ok_or_else(|| {
                     JammiError::Other(
@@ -1296,7 +1296,7 @@ mod tests {
     fn pack_threshold_bits_shifts_the_boundary_per_dimension() {
         // A non-zero, per-dimension threshold moves the bit boundary away
         // from 0 independently per dimension — the asymmetric generalisation
-        // `pack_sign_bits` (the old fixed-0 packer) could not express.
+        // the previous fixed-zero-threshold packer could not express.
         let v = [0.4, 0.6, -0.1, -0.1];
         let threshold = [0.5, 0.5, -0.2, 0.0];
         let packed = pack_threshold_bits(&v, &threshold);

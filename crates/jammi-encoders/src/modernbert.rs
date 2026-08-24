@@ -32,7 +32,9 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use candle_core::{DType, Device, Module, Tensor, D};
 use candle_nn::{embedding, linear_no_bias, Embedding, VarBuilder, VarMap};
-use jammi_kernels::admission::{admit, counters_for, DispatchCounters, DispatchOutcome};
+use jammi_kernels::admission::{
+    admission_mode, admit, counters_for, device_is_supported, DispatchCounters, DispatchOutcome,
+};
 use jammi_kernels::ops::{
     apply1, apply2, apply3, RopeFused, SoftmaxLastDimFused, MAX_HEAD_DIM, MAX_LAST_DIM, MAX_RANK,
 };
@@ -150,7 +152,7 @@ pub(crate) static SOFTMAX_DISPATCH_COUNTERS: LazyLock<&'static DispatchCounters>
 
 /// The fused masked-softmax kernel's domain, checked at the call site
 /// (family D / K2): `scores`'s device is one
-/// [`crate::layer_norm::device_is_supported`] accepts, `scores`/`mask`
+/// [`jammi_kernels::admission::device_is_supported`] accepts, `scores`/`mask`
 /// share a dtype the kernel implements (F32 or BF16), BOTH `scores` and
 /// `mask` are contiguous (`SoftmaxLastDimFused` refuses a strided view for
 /// EITHER argument — see its module doc; an earlier version of this
@@ -179,7 +181,7 @@ pub(crate) static SOFTMAX_DISPATCH_COUNTERS: LazyLock<&'static DispatchCounters>
 /// check is unchanged and still the correct defense for any direct
 /// `apply2` caller that bypasses this predicate entirely.
 fn softmax_admission_predicate(scores: &Tensor, mask: &Tensor) -> (bool, &'static str) {
-    if !crate::layer_norm::device_is_supported(scores.device()) {
+    if !device_is_supported(scores.device()) {
         return (false, "device_is_cpu_or_cuda");
     }
     if scores.dtype() != mask.dtype() || !matches!(scores.dtype(), DType::F32 | DType::BF16) {
@@ -374,7 +376,7 @@ impl RotaryEmbedding {
         let (holds, predicate) =
             rope_admission_predicate(x_dtype, x.device(), &cos, &sin, head_dim);
         let outcome = admit(
-            crate::layer_norm::admission_mode(),
+            admission_mode(),
             "rope_fused",
             predicate,
             holds,
@@ -415,7 +417,7 @@ impl RotaryEmbedding {
 }
 
 /// The fused RoPE kernel's domain, checked at the call site (family D /
-/// K2): `x`'s device is one [`crate::layer_norm::device_is_supported`]
+/// K2): `x`'s device is one [`jammi_kernels::admission::device_is_supported`]
 /// accepts (CPU, or CUDA when this build compiled `jammi-kernels`' `cuda`
 /// arm), `x`/`cos`/`sin` share a dtype the kernel implements (F32 or
 /// BF16), `cos`/`sin` are contiguous (guaranteed by construction —
@@ -435,7 +437,7 @@ fn rope_admission_predicate(
     sin: &Tensor,
     head_dim: usize,
 ) -> (bool, &'static str) {
-    if !crate::layer_norm::device_is_supported(x_device) {
+    if !device_is_supported(x_device) {
         return (false, "device_is_cpu_or_cuda");
     }
     if x_dtype != cos.dtype()
@@ -667,7 +669,7 @@ impl ModernBertAttention {
 fn softmax_apply_training(scores: &Tensor, mask: &Tensor) -> Result<Tensor, EncoderError> {
     let (holds, predicate) = softmax_admission_predicate(scores, mask);
     let outcome = admit(
-        crate::layer_norm::admission_mode(),
+        admission_mode(),
         "softmax_last_dim_fused",
         predicate,
         holds,
@@ -701,7 +703,7 @@ pub(crate) static GEGLU_DISPATCH_COUNTERS: LazyLock<&'static DispatchCounters> =
     LazyLock::new(|| counters_for("geglu_fused"));
 
 /// The fused GeGLU kernel's domain, checked at the call site (family D /
-/// K2): `wi_out`'s device is one [`crate::layer_norm::device_is_supported`]
+/// K2): `wi_out`'s device is one [`jammi_kernels::admission::device_is_supported`]
 /// accepts, its dtype is one the kernel implements (F32 or BF16),
 /// `wi_out` is contiguous ([`jammi_kernels::ops::GegluFused`] refuses a
 /// strided view — see its module doc), and its last dimension is nonzero
@@ -710,7 +712,7 @@ pub(crate) static GEGLU_DISPATCH_COUNTERS: LazyLock<&'static DispatchCounters> =
 /// checking it here means it becomes a counted eager fallback instead of
 /// a `candle_core::Error` surfacing from inside the op).
 fn geglu_admission_predicate(wi_out: &Tensor) -> (bool, &'static str) {
-    if !crate::layer_norm::device_is_supported(wi_out.device()) {
+    if !device_is_supported(wi_out.device()) {
         return (false, "device_is_cpu_or_cuda");
     }
     if !matches!(wi_out.dtype(), DType::F32 | DType::BF16) {
@@ -737,7 +739,7 @@ fn geglu_admission_predicate(wi_out: &Tensor) -> (bool, &'static str) {
 fn geglu_apply_training(wi_out: &Tensor) -> Result<Tensor, EncoderError> {
     let (holds, predicate) = geglu_admission_predicate(wi_out);
     let outcome = admit(
-        crate::layer_norm::admission_mode(),
+        admission_mode(),
         "geglu_fused",
         predicate,
         holds,

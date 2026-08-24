@@ -6,9 +6,11 @@
 # vendored/upstream internal (which the CI guard job, no toolchain/cargo,
 # cannot see) from permanently blocking the gate.
 #
-# This file is EMPTY today: the gate ships in `--changed-only` (ratchet) mode
-# in CI (see `.github/workflows/ci.yml`) because the full-repo scan found a
-# pre-existing backlog (~123 distinct unresolved citations across ~50 files —
-# see the PR that added this gate for the full list) too large to triage in
-# one PR. As the backfill retires each pre-existing citation (fix the name, or
-# allowlist it here with a reason), add its line below.
+# The gate ships in `--changed-only` (ratchet) mode in CI (see
+# `.github/workflows/ci.yml`) because the full-repo scan found a pre-existing
+# backlog (~123 distinct unresolved citations across ~50 files — see the PR
+# that added this gate for the full list) too large to triage in one PR. As
+# the backfill retires each pre-existing citation (fix the name, or allowlist
+# it here with a reason), add its line below.
+
+CARGO_TARGET_DIR  # Cargo's own build-output-directory env var, not a repo-defined identifier; cited in crates/jammi-cli/tests/it/server_harness.rs (and crates/jammi-ai/tests/distributed/harness.rs) to explain the sibling-binary resolution trick.

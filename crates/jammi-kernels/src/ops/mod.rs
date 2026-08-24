@@ -49,10 +49,21 @@ use candle_core::{CustomOp2, CustomOp3, Result, Tensor};
 mod axpy;
 mod layer_norm;
 mod rope;
+// `pub(crate)`, not private like the three above: `crate::cuda::softmax`
+// imports `softmax_dims` directly from here rather than duplicating it (a
+// deliberate, disclosed departure from `layer_norm`'s/`rope`'s per-file
+// duplication precedent — see `ops::softmax`'s module doc for why this
+// op's broadcast-domain logic is complex enough that a second,
+// independently-maintained copy is a real divergence risk, not just
+// boilerplate).
+pub(crate) mod softmax;
 
 pub use axpy::Axpy;
 pub use layer_norm::{LayerNormFused, MAX_HIDDEN};
 pub use rope::{RopeFused, MAX_HEAD_DIM};
+pub use softmax::{
+    mask_broadcast_class_holds, FullyMaskedPolicy, SoftmaxLastDimFused, MAX_LAST_DIM, MAX_RANK,
+};
 
 mod sealed {
     //! Not `pub` at the `ops` level, so `Sealed` is unreachable outside

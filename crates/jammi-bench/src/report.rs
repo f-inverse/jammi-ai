@@ -1140,6 +1140,19 @@ pub struct FinetuneStepTier {
     /// kernel's domain (dtype/contiguity/device/head_dim), or because the
     /// admission predicate failed for any other stated reason.
     pub rope_eager_dispatches: u64,
+    /// How many times ModernBERT's training-mode fused masked-softmax
+    /// kernel (`jammi_kernels::ops::SoftmaxLastDimFused`) actually
+    /// dispatched during this run — the same positive-proof channel as
+    /// `ln_fused_dispatches` / `rope_fused_dispatches`, for the C4
+    /// fused-kernels commit (see `jammi_encoders::modernbert`'s
+    /// `softmax_apply_training` doc).
+    pub softmax_fused_dispatches: u64,
+    /// How many times that same call site fell back to the eager
+    /// (`broadcast_add` + `candle_nn::ops::softmax`) composition instead —
+    /// outside the fused kernel's domain (dtype/contiguity/device/rank/
+    /// last-dim), or because the admission predicate failed for any other
+    /// stated reason.
+    pub softmax_eager_dispatches: u64,
     pub s_per_step_p50: Measurement,
     pub s_per_step_mean: Measurement,
     pub steps_per_s: Measurement,

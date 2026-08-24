@@ -240,6 +240,8 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     let ln_dispatch_before = jammi_encoders::ln_dispatch_snapshot();
     // Same mechanism, for the C3 fused RoPE kernel.
     let rope_dispatch_before = jammi_encoders::rope_dispatch_snapshot();
+    // Same mechanism, for the C4 fused masked-softmax kernel.
+    let softmax_dispatch_before = jammi_encoders::softmax_dispatch_snapshot();
 
     let mut times = Vec::with_capacity(params.steps);
     for step in 0..(params.warmup + params.steps) {
@@ -280,6 +282,7 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
 
     let ln_dispatch_after = jammi_encoders::ln_dispatch_snapshot();
     let rope_dispatch_after = jammi_encoders::rope_dispatch_snapshot();
+    let softmax_dispatch_after = jammi_encoders::softmax_dispatch_snapshot();
 
     times.sort_by(f64::total_cmp);
     let p50 = times[times.len() / 2];
@@ -309,6 +312,12 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
         rope_eager_dispatches: rope_dispatch_after
             .eager
             .saturating_sub(rope_dispatch_before.eager),
+        softmax_fused_dispatches: softmax_dispatch_after
+            .fused
+            .saturating_sub(softmax_dispatch_before.fused),
+        softmax_eager_dispatches: softmax_dispatch_after
+            .eager
+            .saturating_sub(softmax_dispatch_before.eager),
         s_per_step_p50: Measurement::measured(p50, "s"),
         s_per_step_mean: Measurement::measured(mean, "s"),
         steps_per_s: Measurement::measured(1.0 / p50, "steps/s"),

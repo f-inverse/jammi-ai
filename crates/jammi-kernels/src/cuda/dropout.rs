@@ -49,17 +49,7 @@ pub(crate) fn cuda_fwd(
     // matching every other op's CUDA glue in this crate, avoid the launch
     // entirely and return an explicitly empty output instead.
     if n == 0 {
-        return match s1.dtype() {
-            DType::F32 => {
-                let out = unsafe { device.alloc::<f32>(0) }?;
-                Ok((CudaStorage::wrap_cuda_slice(out, device), shape))
-            }
-            DType::BF16 => {
-                let out = unsafe { device.alloc::<bf16>(0) }?;
-                Ok((CudaStorage::wrap_cuda_slice(out, device), shape))
-            }
-            dtype => Err(Error::UnsupportedDTypeForOp(dtype, OP)),
-        };
+        return Ok((super::alloc_empty(&device, s1.dtype(), OP)?, shape));
     }
 
     let (o1, o2) = l1

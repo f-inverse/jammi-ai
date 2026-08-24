@@ -55,6 +55,27 @@ fn wasserstein_is_scale_invariant() {
 }
 
 #[test]
+fn wasserstein_refuses_empty_reference() {
+    // Matches scipy.stats.wasserstein_distance, which raises
+    // ValueError("Distribution can't be empty.") from
+    // _validate_distribution for an empty input (verified against
+    // scipy/stats/_stats_py.py and empirically: `wasserstein_distance([],
+    // [1.0, 2.0, 3.0])` raises). Without this guard, `padded_range(&[])`
+    // falls back to `(0.0, 1.0)`, fixing `scale = 1.0` and silently
+    // breaking scale-invariance.
+    let reference: Vec<f32> = vec![];
+    let current: Vec<f32> = (0..10).map(|i| i as f32).collect();
+    assert!(wasserstein_1d(&reference, &current).is_err());
+}
+
+#[test]
+fn wasserstein_refuses_empty_current() {
+    let reference: Vec<f32> = (0..10).map(|i| i as f32).collect();
+    let current: Vec<f32> = vec![];
+    assert!(wasserstein_1d(&reference, &current).is_err());
+}
+
+#[test]
 fn wasserstein_refuses_nan_reference() {
     // scipy.stats.wasserstein_distance propagates a NaN input straight to a
     // NaN distance; jammi's chosen policy is stricter — refuse at the edge

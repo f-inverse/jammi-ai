@@ -1230,16 +1230,22 @@ impl CandleModel {
                 let offsets = &encoding.offsets[batch_idx];
                 let mask = &encoding.attention_masks[batch_idx];
 
-                let entities = jammi_numerics::ner::decode_bio_spans(
+                match jammi_numerics::ner::decode_bio_spans(
                     token_logits,
                     offsets,
                     mask,
                     id2label,
                     &texts[orig_idx],
-                );
-
-                all_entities_json[orig_idx] =
-                    serde_json::to_string(&entities).unwrap_or_else(|_| "[]".to_string());
+                ) {
+                    Ok(entities) => {
+                        all_entities_json[orig_idx] =
+                            serde_json::to_string(&entities).unwrap_or_else(|_| "[]".to_string());
+                    }
+                    Err(e) => {
+                        row_status[orig_idx] = false;
+                        row_errors[orig_idx] = format!("NER span decode failed: {e}");
+                    }
+                }
             }
         }
 

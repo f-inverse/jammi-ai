@@ -187,9 +187,9 @@ fn bf16_bit_diff(a: bf16, b: bf16) -> i32 {
 /// near-zero tail this op's own value range actually produces.
 ///
 /// Both constants are sized from a FULL scan of the backward oracle's
-/// production-width fixture, not from one cherry-picked element, because
-/// this op's bf16 backward divergence has TWO DIFFERENT mechanisms with
-/// different scales:
+/// production-width fixture (measured 2026-08-24), not from one
+/// cherry-picked element, because this op's bf16 backward divergence has
+/// TWO DIFFERENT mechanisms with different scales:
 ///
 /// 1. Ordinary rounding-order divergence at non-trivial magnitude: the
 ///    worst such element measured is `2` bf16 ULP (`0.125` absolute) at

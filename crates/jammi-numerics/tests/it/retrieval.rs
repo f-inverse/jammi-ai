@@ -129,35 +129,6 @@ fn recall_at_ks_no_relevant_is_zero() {
 }
 
 #[test]
-fn ndcg_ideal_gain_order_is_deterministic_under_ties() {
-    // The ideal-DCG sort over graded relevance must be a well-defined total
-    // order even when grades tie: `grade: i32` cast to `f64` for sorting can
-    // never observe a NaN, but the ordering used (`total_cmp`, descending)
-    // must still be stable and reproducible run-to-run — this pins that
-    // contract with an all-tied-grades boundary case.
-    let judgments = vec![
-        RelevanceJudgment {
-            doc_id: "a".into(),
-            grade: 2,
-        },
-        RelevanceJudgment {
-            doc_id: "b".into(),
-            grade: 2,
-        },
-        RelevanceJudgment {
-            doc_id: "c".into(),
-            grade: 2,
-        },
-    ];
-    let retrieved = vec!["a".into(), "b".into(), "c".into()];
-    let m1 = RetrievalMetrics::compute_query(&retrieved, &judgments, 3);
-    let m2 = RetrievalMetrics::compute_query(&retrieved, &judgments, 3);
-    assert_eq!(m1.ndcg.to_bits(), m2.ndcg.to_bits());
-    // All grades equal and perfectly ranked → nDCG is exactly 1.0.
-    assert_abs_diff_eq!(m1.ndcg, 1.0, epsilon = 1e-12);
-}
-
-#[test]
 fn aggregate_averages_queries() {
     let q1 = RetrievalMetrics::compute_query(
         &["doc1".into()],

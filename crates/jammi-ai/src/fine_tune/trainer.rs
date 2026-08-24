@@ -1562,15 +1562,16 @@ impl TrainingLoop {
 
     /// The graded-pair embedding objective for a `Contrastive` batch, dispatched
     /// on the configured [`EmbeddingLoss`]. Thin wrapper over the free
-    /// [`dispatch_contrastive_loss`] — the CoSENT default is provided by
-    /// [`Self::cosent_loss`], the only graded objective that reads `self`.
+    /// [`dispatch_contrastive_loss`] — the CoSENT default is the free
+    /// [`cosent_loss`]; none of the graded objectives need `self`, they close
+    /// purely over the similarity/score tensors.
     fn contrastive_loss(&self, emb_a: &Tensor, emb_b: &Tensor, scores: &Tensor) -> Result<Tensor> {
         dispatch_contrastive_loss(
             self.config.embedding_loss,
             emb_a,
             emb_b,
             scores,
-            &|a, b, s| self.cosent_loss(a, b, s),
+            &cosent_loss,
         )
     }
 
@@ -1592,26 +1593,6 @@ impl TrainingLoop {
         objective: &dyn Fn(Vec<Tensor>) -> Result<Tensor>,
     ) -> Result<Tensor> {
         matryoshka_sum(&self.config.matryoshka_dims, embeddings, objective)
-    }
-
-    /// CoSENT loss: cross-entropy on cosine similarity ordering.
-    fn cosent_loss(&self, emb_a: &Tensor, emb_b: &Tensor, scores: &Tensor) -> Result<Tensor> {
-        let cos_sim = cosine_similarity(emb_a, emb_b)?;
-        // Scale similarities by temperature (20.0 is typical for CoSENT)
-        let temperature = 20.0;
-        let scaled = (&cos_sim * temperature)
-            .map_err(|e| JammiError::FineTune(format!("CoSENT scale: {e}")))?;
-
-        // MSE between scaled cosine similarity and target scores
-        let diff = (&scaled / temperature - scores)
-            .map_err(|e| JammiError::FineTune(format!("CoSENT diff: {e}")))?;
-        let loss = diff
-            .sqr()
-            .map_err(|e| JammiError::FineTune(format!("CoSENT sqr: {e}")))?
-            .mean_all()
-            .map_err(|e| JammiError::FineTune(format!("CoSENT mean: {e}")))?;
-
-        Ok(loss)
     }
 
     /// Apply the classification head to projected embeddings.
@@ -2042,6 +2023,23 @@ fn pairwise_ordering_loss(sim: &Tensor, scores: &Tensor) -> Result<Tensor> {
         .map_err(|e| JammiError::FineTune(format!("pairwise logsumexp: {e}")))
 }
 
+/// CoSENT loss: the pairwise log-sum-exp ordering ([`pairwise_ordering_loss`])
+/// applied to temperature-scaled cosine similarity.
+///
+/// `pairwise_ordering_loss(scale · cos(a, b), scores)` — cosine similarity is
+/// the per-pair signal AnglE's angle magnitude ([`angle_loss`]) stands in for.
+///
+/// Matches Su et al., 2022, "CoSENT: A more effective sentence embedding
+/// scheme" (<https://kexue.fm/archives/8847>) and sentence-transformers'
+/// `CoSENTLoss`: `loss = log(1 + Σ_{scores[i] > scores[j]} exp(λ·(cos[j] −
+/// cos[i])))` with `λ = 20` (= [`PAIRWISE_SCALE`]).
+fn cosent_loss(emb_a: &Tensor, emb_b: &Tensor, scores: &Tensor) -> Result<Tensor> {
+    let cos = cosine_similarity(emb_a, emb_b)?;
+    let scaled =
+        (&cos * PAIRWISE_SCALE).map_err(|e| JammiError::FineTune(format!("CoSENT scale: {e}")))?;
+    pairwise_ordering_loss(&scaled, scores)
+}
+
 /// AnglE loss: optimise the angle difference between paired embeddings in
 /// complex space, applied through the CoSENT pairwise ordering.
 ///
@@ -2126,10 +2124,17 @@ fn split_complex(emb: &Tensor) -> Result<(Tensor, Tensor)> {
 /// cosine-MSE loss: regress the scaled cosine similarity of each pair onto its
 /// graded target score with mean-squared error.
 ///
-/// `MSE(scale · cos(a, b), score)`. The simplest objective for continuous
-/// similarity labels — distinct from CoSENT (pairwise ordering) and MNRL
-/// (ranking). Reuses [`PAIRWISE_SCALE`] so the predicted value lives on the
-/// same scale as the graded targets the other objectives consume.
+/// `MSE(scale · cos(a, b), scale · score)`. The simplest objective for
+/// continuous similarity labels — distinct from CoSENT (pairwise ordering)
+/// and MNRL (ranking). Reuses [`PAIRWISE_SCALE`] so the predicted value lives
+/// on the same scale as the graded targets the other objectives consume.
+///
+/// This is, up to the ×400 (`scale²`) this function applies and CoSENT's
+/// does not, exactly the value the CoSENT default computed before it was
+/// fixed to the real pairwise-ordering objective: the old code scaled by
+/// `PAIRWISE_SCALE` then immediately divided by it before squaring, so the
+/// scale factors cancelled and it silently ran plain unscaled `MSE(cos(a,
+/// b), score)` — this function's value ÷ 400.
 fn cosine_mse_loss(emb_a: &Tensor, emb_b: &Tensor, scores: &Tensor) -> Result<Tensor> {
     let cos = cosine_similarity(emb_a, emb_b)?;
     let pred = (&cos * PAIRWISE_SCALE)
@@ -2384,15 +2389,6 @@ mod tests {
     use super::*;
     use candle_core::Var;
 
-    /// CoSENT objective expressed through the shared pieces: scaled cosine
-    /// similarity fed to the pairwise ordering. Used only to contrast its
-    /// gradient against AnglE's near cosine saturation.
-    fn cosent_reference(emb_a: &Tensor, emb_b: &Tensor, scores: &Tensor) -> Result<Tensor> {
-        let cos = cosine_similarity(emb_a, emb_b).unwrap();
-        let scaled = (&cos * PAIRWISE_SCALE).unwrap();
-        pairwise_ordering_loss(&scaled, scores)
-    }
-
     /// L2 norm of a gradient tensor as an f64 scalar.
     fn grad_norm(g: &Tensor) -> f64 {
         let sq: f32 = g.sqr().unwrap().sum_all().unwrap().to_scalar().unwrap();
@@ -2428,7 +2424,7 @@ mod tests {
 
         let a_t: &Tensor = &a;
 
-        let cosent = cosent_reference(a_t, &b, &scores).unwrap();
+        let cosent = cosent_loss(a_t, &b, &scores).unwrap();
         let cosent_grad = cosent.backward().unwrap();
         let cosent_norm = grad_norm(cosent_grad.get(a_t).unwrap());
 
@@ -2449,6 +2445,156 @@ mod tests {
         assert!(
             angle_norm > cosent_norm * 100.0,
             "AnglE gradient ({angle_norm}) should dominate CoSENT's ({cosent_norm}) at saturation"
+        );
+    }
+
+    /// Fixed embeddings giving cosine similarity exactly `[0.9, 0.1]`: `a`'s
+    /// rows are the unit vector `[1, 0]`, `b`'s rows are `[c, sqrt(1 - c^2)]`
+    /// for `c` in `{0.9, 0.1}` — a unit vector by construction, so the dot
+    /// product `a · b` is exactly `c` with no normalisation rounding beyond
+    /// `c` itself. Shared by the esc-040 CoSENT tests below.
+    fn cosent_fixture(device: &Device) -> (Tensor, Tensor) {
+        let a = Tensor::new(&[[1.0f32, 0.0], [1.0f32, 0.0]], device).unwrap();
+        let b = Tensor::new(
+            &[
+                [0.9f32, (1.0f32 - 0.81f32).sqrt()],
+                [0.1f32, (1.0f32 - 0.01f32).sqrt()],
+            ],
+            device,
+        )
+        .unwrap();
+        (a, b)
+    }
+
+    /// esc-040 finiteness gate: the production CoSENT objective must not
+    /// produce NaN/Inf on an ordinary graded batch.
+    #[test]
+    fn cosent_loss_is_finite() {
+        let device = Device::Cpu;
+        let (a, b) = cosent_fixture(&device);
+        let scores = Tensor::new(&[0.2f32, 0.0f32], &device).unwrap();
+        let loss = cosent_loss(&a, &b, &scores)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(loss.is_finite(), "CoSENT loss must be finite, got {loss}");
+    }
+
+    /// esc-040: the CoSENT default must be the real pairwise-ordering
+    /// objective ([`pairwise_ordering_loss`] over scaled cosine), not plain
+    /// MSE on the cosine (the defect: `temperature` was multiplied in and
+    /// immediately divided back out, cancelling to `mean((cos - score)^2)`).
+    ///
+    /// On `cos = [0.9, 0.1]`, `scores = [0.2, 0.0]` the two pairs are already
+    /// correctly ordered (the higher-cosine pair also has the higher target
+    /// score), so the real CoSENT residual is the tiny
+    /// `log(1 + exp(sim[1] - sim[0])) ≈ 1.19e-7` — orders of magnitude below
+    /// `cosine_mse_loss`'s `≈ 100` (`= 400 ×` the old buggy value of `0.25`,
+    /// see [`cosine_mse_loss`]'s doc). Two-sided: bounded well below the MSE
+    /// arm's value AND strictly positive (not a vacuous always-zero stub).
+    ///
+    /// Also pins CoSENT's scale-invariance in the score: the pairwise mask
+    /// reads only the *strict order* of `scores`, so scaling every score by a
+    /// positive constant (here: halving) leaves the valid-pair set — and
+    /// hence the loss — bit-identical. MSE has no such invariance.
+    #[test]
+    fn cosent_loss_is_pairwise_ordering_not_mse() {
+        let device = Device::Cpu;
+        let (a, b) = cosent_fixture(&device);
+        let scores = Tensor::new(&[0.2f32, 0.0f32], &device).unwrap();
+        let scores_half = Tensor::new(&[0.1f32, 0.0f32], &device).unwrap();
+
+        let cosent = cosent_loss(&a, &b, &scores)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        let mse = cosine_mse_loss(&a, &b, &scores)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+
+        assert!(
+            cosent.is_finite() && mse.is_finite(),
+            "both arms must be finite: cosent={cosent}, mse={mse}"
+        );
+        // Two-sided margin: far below the MSE arm's O(1) value...
+        assert!(
+            cosent < 1e-4,
+            "CoSENT should be ~1.19e-7 on an already-well-ordered pair, got {cosent}"
+        );
+        // ...but strictly positive — not a vacuous always-zero stub.
+        assert!(
+            cosent > 0.0,
+            "CoSENT must be a real (nonzero) residual, got {cosent}"
+        );
+        assert!(
+            (99.0..101.0).contains(&mse),
+            "sanity: cosine_mse_loss should read ~100 on this fixture (400 × the old buggy \
+             cosent value of 0.25), got {mse}"
+        );
+
+        // Scale-invariance under a positive rescale of the graded scores.
+        let cosent_half = cosent_loss(&a, &b, &scores_half)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert_eq!(
+            cosent, cosent_half,
+            "CoSENT must be invariant to a positive rescale of the graded scores"
+        );
+    }
+
+    /// esc-040 gradient arm: CoSENT must produce a finite, non-vanishing
+    /// gradient on a batch containing an inverted pair — the training signal
+    /// the loss exists to supply. Reuses [`cosent_fixture`]'s
+    /// `cos = [0.9, 0.1]` but swaps the score labels relative to
+    /// [`cosent_loss_is_pairwise_ordering_not_mse`]'s well-ordered case: the
+    /// higher-cosine pair (index 0) is now graded *below* the lower-cosine
+    /// pair (index 1) — a genuine ordering violation, not the near-zero
+    /// residual the margin test pins. Asserts fixture non-degeneracy first (a
+    /// valid pair exists and the loss reads the violation, not the
+    /// no-valid-pairs `log(1) = 0` floor) so a vanishing gradient can only
+    /// mean the objective itself is flat, never an empty mask.
+    #[test]
+    fn cosent_gradient_is_non_vanishing_on_inverted_pair() {
+        let device = Device::Cpu;
+        let a = Var::from_tensor(&Tensor::new(&[[1.0f32, 0.0], [1.0f32, 0.0]], &device).unwrap())
+            .unwrap();
+        let b = Tensor::new(
+            &[
+                [0.9f32, (1.0f32 - 0.81f32).sqrt()],
+                [0.1f32, (1.0f32 - 0.01f32).sqrt()],
+            ],
+            &device,
+        )
+        .unwrap();
+        // Inverted: the more-similar pair (cos 0.9) is graded below the
+        // less-similar pair (cos 0.1) — a genuine ordering violation.
+        let scores = Tensor::new(&[0.0f32, 0.2f32], &device).unwrap();
+        let a_t: &Tensor = &a;
+
+        let loss = cosent_loss(a_t, &b, &scores).unwrap();
+        let loss_v = loss.to_scalar::<f32>().unwrap();
+        assert!(
+            loss_v.is_finite(),
+            "CoSENT loss must be finite on an inverted pair, got {loss_v}"
+        );
+        // Fixture non-degeneracy: a real violation reads as a substantial
+        // loss (≈16 here), not the empty-mask `log(1) = 0` floor.
+        assert!(
+            loss_v > 1.0,
+            "fixture non-degeneracy: an inverted pair must produce a substantial loss, got {loss_v}"
+        );
+
+        let grad = loss.backward().unwrap();
+        let norm = grad_norm(grad.get(a_t).unwrap());
+        assert!(
+            norm.is_finite(),
+            "CoSENT gradient must be finite, got {norm}"
+        );
+        assert!(
+            norm > 1e-6,
+            "CoSENT gradient must be non-vanishing on an inverted pair, got {norm}"
         );
     }
 

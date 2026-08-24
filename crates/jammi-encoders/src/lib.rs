@@ -26,8 +26,10 @@ pub mod context;
 pub mod distilbert;
 pub mod htsat_audio;
 pub mod modernbert;
+pub mod open_clip_vision;
 pub mod precision;
 
+mod activations;
 mod any;
 mod attention;
 mod error;
@@ -50,7 +52,9 @@ pub use context::{
 pub use distilbert::{DistilBert, DistilBertConfig};
 pub use error::EncoderError;
 pub use htsat_audio::{HtsatAudio, HtsatAudioConfig};
+pub use layer_norm::LayerNorm;
 pub use modernbert::{ModernBert, ModernBertConfig};
+pub use open_clip_vision::{OpenClipVisionConfig, OpenClipVisionTransformer};
 pub use pooling::{pool_and_normalize, Pooling};
 pub use precision::compute_precision_to_dtype;
 

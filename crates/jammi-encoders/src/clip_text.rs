@@ -101,99 +101,6 @@ impl ClipTextConfig {
     }
 }
 
-/// QuickGelu activation: `x * sigmoid(1.702 * x)`. OpenCLIP uses this
-/// in the text and vision MLPs (not the standard erf-based GELU).
-fn quick_gelu(xs: &Tensor) -> Result<Tensor, EncoderError> {
-    Ok((xs * candle_nn::ops::sigmoid(&(xs * 1.702f64)?)?)?)
-}
-
-/// Multi-head self-attention with fused QKV projection (OpenCLIP layout:
-/// `in_proj_weight`/`in_proj_bias` plus an `out_proj` sub-module).
-struct MultiHeadAttention {
-    in_proj: Linear,
-    out_proj: Linear,
-    num_heads: usize,
-    head_dim: usize,
-    /// Selects the softmax arm — see [`Self::forward`]'s doc for why the
-    /// two arms exist. Defaults to `false` (eval); flipped by
-    /// [`ClipText::set_training`].
-    training: bool,
-}
-
-impl MultiHeadAttention {
-    fn load(vb: VarBuilder, width: usize, num_heads: usize) -> Result<Self, EncoderError> {
-        let head_dim = width / num_heads;
-        let in_proj_weight = vb.get((width * 3, width), "in_proj_weight")?;
-        let in_proj_bias = vb.get(width * 3, "in_proj_bias")?;
-        let in_proj = Linear::new(in_proj_weight, Some(in_proj_bias));
-        let out_proj = linear(width, width, vb.pp("out_proj"))?;
-        Ok(Self {
-            in_proj,
-            out_proj,
-            num_heads,
-            head_dim,
-            training: false,
-        })
-    }
-
-    /// Causal self-attention. `causal_mask` is an additive `[seq, seq]` tensor
-    /// with `0.0` at allowed positions and `-inf` (or large negative) at
-    /// masked positions; it is broadcast over `[batch, heads]`.
-    ///
-    /// See [`crate::attention::attention_softmax`]'s module doc for the
-    /// `BackpropOp::none()` truncation this dispatch works around: through
-    /// the `probs @ V` matmul the V-slice of this block's fused
-    /// `in_proj_weight` still receives a gradient (V sits downstream of the
-    /// softmax, not upstream), so the observable is not a crash but a
-    /// silently WRONG gradient: the Q and K slices of `in_proj_weight` come
-    /// back exactly zero under the fused eval kernel. `training=true`
-    /// therefore routes through the composed, differentiable arm — same arm
-    /// ModernBERT's attention uses for the same reason.
-    ///
-    /// This flag is load-bearing on CUDA: candle's fused softmax kernel and
-    /// the composed primitive-op reduction can differ in fold order there.
-    /// On CPU the two arms are bit-identical (measured 0/N differing mantissa
-    /// bits at f32 and bf16 on representative window shapes — see
-    /// `crate::attention::tests::softmax_last_dim_and_composed_softmax_are_cpu_bit_identical`),
-    /// so `training=false` costs nothing to keep byte-identical to today's
-    /// eval path.
-    ///
-    /// No caller in this codebase can set `training=true` on a `ClipText`
-    /// tower today (`CandleVisionForward`/`CandleAudioForward` towers are
-    /// reached through `&self` trait objects behind `Arc<LoadedModel>`, and
-    /// the `AnyEncoder::ClipText` arm reports zero trainable params). The
-    /// flag exists so the tower is trainable-CORRECT for when a caller does.
-    fn forward(&self, x: &Tensor, causal_mask: &Tensor) -> Result<Tensor, EncoderError> {
-        let (batch, seq_len, _) = x.dims3()?;
-        let qkv = self.in_proj.forward(x)?;
-        let qkv = qkv.reshape((batch, seq_len, 3, self.num_heads, self.head_dim))?;
-        let qkv = qkv.permute((2, 0, 3, 1, 4))?; // (3, batch, heads, seq, head_dim)
-
-        let q = qkv.i(0)?.contiguous()?;
-        let k = qkv.i(1)?.contiguous()?;
-        let v = qkv.i(2)?.contiguous()?;
-
-        let scale = (self.head_dim as f64).sqrt();
-        let attn_scores =
-            (crate::contiguous_matmul(&q, &k.transpose(D::Minus2, D::Minus1)?)? / scale)?;
-        let attn_scores = attn_scores.broadcast_add(causal_mask)?;
-        let attn_weights = crate::attention::attention_softmax(&attn_scores, self.training)?;
-        let attn_output = crate::contiguous_matmul(&attn_weights, &v)?;
-
-        let attn_output = attn_output.permute((0, 2, 1, 3))?.reshape((
-            batch,
-            seq_len,
-            self.num_heads * self.head_dim,
-        ))?;
-
-        Ok(self.out_proj.forward(&attn_output)?)
-    }
-
-    fn set_training(&mut self, training: bool) {
-        self.training = training;
-    }
-}
-
 /// Feed-forward MLP with QuickGelu activation.
 struct Mlp {
     c_fc: Linear,
@@ -209,7 +116,7 @@ impl Mlp {
 
     fn forward(&self, x: &Tensor) -> Result<Tensor, EncoderError> {
         let x = self.c_fc.forward(x)?;
-        let x = quick_gelu(&x)?;
+        let x = crate::activations::quick_gelu(&x)?;
         Ok(self.c_proj.forward(&x)?)
     }
 }
@@ -217,7 +124,7 @@ impl Mlp {
 /// Residual transformer block: LN → MHSA → residual → LN → MLP → residual.
 struct ResidualAttentionBlock {
     ln_1: LayerNorm,
-    attn: MultiHeadAttention,
+    attn: crate::attention::MultiHeadAttention,
     ln_2: LayerNorm,
     mlp: Mlp,
 }
@@ -234,7 +141,7 @@ impl ResidualAttentionBlock {
         // this tower's config, so the house class's fixed mean-removal is
         // exactly the behavior being replaced, not a silent narrowing.
         let ln_1 = LayerNorm::new(width, 1e-5, true, vb.pp("ln_1"))?;
-        let attn = MultiHeadAttention::load(vb.pp("attn"), width, heads)?;
+        let attn = crate::attention::MultiHeadAttention::load(vb.pp("attn"), width, heads)?;
         let ln_2 = LayerNorm::new(width, 1e-5, true, vb.pp("ln_2"))?;
         let mlp = Mlp::load(vb.pp("mlp"), width, intermediate_size)?;
         Ok(Self {
@@ -245,10 +152,15 @@ impl ResidualAttentionBlock {
         })
     }
 
+    /// `causal_mask`: this tower is always causally masked (see the module
+    /// doc), so this call always passes `Some(causal_mask)` — see
+    /// [`crate::attention::MultiHeadAttention::forward`]'s doc for why the
+    /// mask is `Option<&Tensor>` on the shared struct despite that (the
+    /// OpenCLIP vision tower shares this struct unmasked).
     fn forward(&self, x: &Tensor, causal_mask: &Tensor) -> Result<Tensor, EncoderError> {
         let residual = x;
         let x = self.ln_1.forward(x)?;
-        let x = self.attn.forward(&x, causal_mask)?;
+        let x = self.attn.forward(&x, Some(causal_mask))?;
         let x = (residual + x)?;
 
         let residual = &x;

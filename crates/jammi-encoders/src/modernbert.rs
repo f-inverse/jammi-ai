@@ -529,12 +529,17 @@ impl ModernBertAttention {
         let k = self.rope_apply(&k)?;
 
         let scale = (d as f64).sqrt();
-        let scores = crate::contiguous_matmul(&q, &k.transpose(D::Minus1, D::Minus2)?)?;
-        let scores = (scores / scale)?;
+        // UNSCALED — the training arm folds `1/scale` into
+        // `SoftmaxLastDimFused` itself (see `softmax_apply_training`'s
+        // doc) rather than dividing here, which used to retain a full
+        // `[batch, heads, seq, seq]` `Op::Affine` tape tensor per layer (a
+        // node this commit removes for the training arm ONLY). The eval
+        // arm below still divides explicitly, unchanged.
+        let raw_scores = crate::contiguous_matmul(&q, &k.transpose(D::Minus1, D::Minus2)?)?;
         // The additive mask is always built in F32 (see `extended_attention_mask`);
         // cast to the scores' dtype so a F16/BF16 backbone can add it (a no-op
         // when scores are already F32).
-        let extended_mask = extended_mask.to_dtype(scores.dtype())?;
+        let extended_mask = extended_mask.to_dtype(raw_scores.dtype())?;
 
         let attn = if self.training {
             // Combine the (up to two) additive masks into ONE small tensor
@@ -551,7 +556,7 @@ impl ModernBertAttention {
             // other fused op's training arm in this crate.
             let mask = match (self.is_local, local_band) {
                 (true, Some(band)) => {
-                    extended_mask.broadcast_add(&band.to_dtype(scores.dtype())?)?
+                    extended_mask.broadcast_add(&band.to_dtype(raw_scores.dtype())?)?
                 }
                 (true, None) => {
                     return Err(EncoderError::Config(
@@ -560,16 +565,19 @@ impl ModernBertAttention {
                 }
                 (false, _) => extended_mask,
             };
-            softmax_apply_training(&scores, &mask)?
+            softmax_apply_training(&raw_scores, &mask, scale)?
         } else {
             // Eval's UNCHANGED code path, bit-identical to before this
-            // commit: two SEQUENTIAL broadcast-adds, each from its own
-            // smaller shape, never combined into one tensor (see
+            // commit: divides by `scale` exactly as before (the ONE `Op::Affine`
+            // node eval always retained and still does), then two
+            // SEQUENTIAL broadcast-adds, each from its own smaller shape,
+            // never combined into one tensor (see
             // `crate::mask::sliding_window_mask`'s doc for why — neither
             // mask is ever materialised at `[batch, heads, seq, seq]`
             // either way, but combining them first would round
             // differently than adding them in this order, which eval must
             // never do — see `tests::eval_mode_attention_softmax_is_bit_identical_regardless_of_fused_eligibility`).
+            let scores = (&raw_scores / scale)?;
             let scores = scores.broadcast_add(&extended_mask)?;
             let scores = match (self.is_local, local_band) {
                 (true, Some(band)) => scores.broadcast_add(&band.to_dtype(scores.dtype())?)?,
@@ -666,7 +674,31 @@ impl ModernBertAttention {
 /// `jammi_kernels::ops::softmax`'s module doc and
 /// `ops::softmax::tests::fully_masked_row_backward_is_zero_under_both_policies_given_pooling_style_zero_dy`
 /// for the verified claim this restates).
-fn softmax_apply_training(scores: &Tensor, mask: &Tensor) -> Result<Tensor, EncoderError> {
+///
+/// ## `scores` is UNSCALED here — `scale` folds `1/sqrt(head_dim)` in
+///
+/// `scores` is `forward`'s `raw_scores` — the RAW `q @ k^T` matmul output,
+/// never divided by `scale` (`sqrt(head_dim)`) before reaching this
+/// function, unlike eval's own `scores` (see `forward`'s doc comment at
+/// its call site). This removes the `Op::Affine` node
+/// (`scores / scale`) the training arm used to retain at
+/// `[batch, heads, seq, seq]` — the single largest per-layer tape tensor
+/// this fused softmax op's own memory win already targets (see
+/// `jammi_kernels::ops::softmax`'s module doc). The FUSED branch folds
+/// `1/scale` into `SoftmaxLastDimFused::scale` (`with_scale`) so the op
+/// itself computes `softmax(scale_mul * scores + mask)` in one pass — see
+/// that op's module doc's "scale semantics" section for the exact
+/// per-dtype rounding this reproduces. The EAGER FALLBACK branch restores
+/// the `scores / scale` division EXPLICITLY, right here, so a domain miss
+/// (wrong dtype, non-contiguous, broadcast-class violation, …) is
+/// numerically IDENTICAL to what this function computed before `scale`
+/// existed — the fallback is never a fourth numeric path, only the
+/// pre-existing training-eager composition.
+fn softmax_apply_training(
+    scores: &Tensor,
+    mask: &Tensor,
+    scale: f64,
+) -> Result<Tensor, EncoderError> {
     let (holds, predicate) = softmax_admission_predicate(scores, mask);
     let outcome = admit(
         admission_mode(),
@@ -679,10 +711,11 @@ fn softmax_apply_training(scores: &Tensor, mask: &Tensor) -> Result<Tensor, Enco
         DispatchOutcome::Fused => Ok(apply2(
             scores,
             mask,
-            SoftmaxLastDimFused::new(jammi_kernels::ops::FullyMaskedPolicy::Zeros),
+            SoftmaxLastDimFused::new(jammi_kernels::ops::FullyMaskedPolicy::Zeros)
+                .with_scale((1.0 / scale) as f32),
         )?),
         DispatchOutcome::Eager => Ok(candle_nn::ops::softmax(
-            &scores.broadcast_add(mask)?,
+            &(scores / scale)?.broadcast_add(mask)?,
             D::Minus1,
         )?),
     }
@@ -1685,8 +1718,11 @@ mod tests {
 
         // Exercise the REAL fused-or-fallback dispatch function (proven
         // eligible above) without changing eval's own composed call above.
+        // `scale = 1.0` here is deliberately a no-op: this test is about
+        // EVAL never touching this function's dispatch at all, not about
+        // `scale`'s own numerics (covered separately below).
         let training_before = SOFTMAX_DISPATCH_COUNTERS.snapshot();
-        let _ = softmax_apply_training(&scores, &mask).unwrap();
+        let _ = softmax_apply_training(&scores, &mask, 1.0).unwrap();
         let training_after = SOFTMAX_DISPATCH_COUNTERS.snapshot();
         assert!(
             training_after.fused > training_before.fused,
@@ -1711,14 +1747,20 @@ mod tests {
 
     /// Fused-vs-eager attention-level oracle: `softmax_apply_training`'s
     /// actual dispatch path (fused kernel, since this fixture is
-    /// fused-eligible on CPU) vs. the eager `broadcast_add` +
-    /// `candle_nn::ops::softmax` composition, fwd AND bwd.
+    /// fused-eligible on CPU) vs. the eager `/scale` + `broadcast_add` +
+    /// `candle_nn::ops::softmax` composition (the SAME composition
+    /// `forward`'s training arm used to run before `scale` was folded into
+    /// this function), fwd AND bwd. `scale = 8.0` (`sqrt(64)`, ModernBERT's
+    /// real `head_dim`) is a GENUINE, non-`1.0` scale — this is the
+    /// oracle that actually exercises the folded-scale numerics, not just
+    /// the fused/eager dispatch machinery.
     #[test]
     fn fused_training_softmax_matches_eager_fwd_and_bwd() {
         let device = Device::Cpu;
         let batch = 1;
         let heads = 2;
         let seq = 4;
+        let scale = 8.0f64; // sqrt(64) -- ModernBERT-large's real head_dim.
         let sv: Vec<f32> = (0..batch * heads * seq * seq)
             .map(|i| (i as f32 * 0.19 - 2.0).cos() * 2.0)
             .collect();
@@ -1731,7 +1773,7 @@ mod tests {
                 .unwrap();
         let mask_fused = Tensor::from_slice(&mv, (batch, 1, 1, seq), &device).unwrap();
         let before = SOFTMAX_DISPATCH_COUNTERS.snapshot();
-        let out_fused = softmax_apply_training(&s_fused, &mask_fused).unwrap();
+        let out_fused = softmax_apply_training(&s_fused, &mask_fused, scale).unwrap();
         let after = SOFTMAX_DISPATCH_COUNTERS.snapshot();
         assert!(
             after.fused > before.fused,
@@ -1743,18 +1785,43 @@ mod tests {
             Var::from_tensor(&Tensor::from_slice(&sv, (batch, heads, seq, seq), &device).unwrap())
                 .unwrap();
         let mask_eager = Tensor::from_slice(&mv, (batch, 1, 1, seq), &device).unwrap();
-        let out_eager =
-            candle_nn::ops::softmax(&s_eager.broadcast_add(&mask_eager).unwrap(), D::Minus1)
-                .unwrap();
+        let out_eager = candle_nn::ops::softmax(
+            &(s_eager.as_tensor() / scale)
+                .unwrap()
+                .broadcast_add(&mask_eager)
+                .unwrap(),
+            D::Minus1,
+        )
+        .unwrap();
 
         let vf: Vec<f32> = out_fused.flatten_all().unwrap().to_vec1().unwrap();
         let ve: Vec<f32> = out_eager.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(
+            vf.iter().any(|v| v.abs() > 1e-6),
+            "fixture must be non-degenerate"
+        );
         for (i, (f, e)) in vf.iter().zip(ve.iter()).enumerate() {
             assert!((f - e).abs() < 1e-4, "fwd[{i}]: fused {f} vs eager {e}");
         }
 
-        let grads_fused = out_fused.backward().unwrap();
-        let grads_eager = out_eager.backward().unwrap();
+        // A NON-UNIFORM seed, not `Tensor::backward()`'s implicit
+        // all-ones `dy`: a uniform `dy` makes `dscores = (dy -
+        // sum(dy*y))*y` IDENTICALLY zero for every softmax row (since
+        // `sum(y) == 1`), which would make a bare `.backward()` here a
+        // VACUOUS backward check (family F) — it passed before this
+        // fixture had a non-vacuity assertion, silently proving nothing
+        // about `bwd`'s actual scale-chain-rule multiply.
+        let dy_seed_v: Vec<f32> = (0..batch * heads * seq * seq)
+            .map(|i| (i as f32 * 0.31 - 1.0).sin())
+            .collect();
+        let dy_seed_fused =
+            Tensor::from_slice(&dy_seed_v, (batch, heads, seq, seq), &device).unwrap();
+        let dy_seed_eager =
+            Tensor::from_slice(&dy_seed_v, (batch, heads, seq, seq), &device).unwrap();
+        let loss_fused = (&out_fused * &dy_seed_fused).unwrap().sum_all().unwrap();
+        let loss_eager = (&out_eager * &dy_seed_eager).unwrap().sum_all().unwrap();
+        let grads_fused = loss_fused.backward().unwrap();
+        let grads_eager = loss_eager.backward().unwrap();
         let dxf: Vec<f32> = grads_fused
             .get(&s_fused)
             .unwrap()
@@ -1769,9 +1836,101 @@ mod tests {
             .unwrap()
             .to_vec1()
             .unwrap();
+        assert!(
+            dxf.iter().any(|v| v.abs() > 1e-6),
+            "gradient must be measured-nonzero"
+        );
         for (i, (f, e)) in dxf.iter().zip(dxe.iter()).enumerate() {
             assert!((f - e).abs() < 1e-3, "dscores[{i}]: fused {f} vs eager {e}");
         }
+    }
+
+    /// MEMORY ORACLE (P1 of the fused-kernels program): the training
+    /// arm's call site, not just the op itself (`jammi_kernels::ops::softmax`'s
+    /// own `fused_softmax_retains_fewer_tape_nodes_than_eager` already
+    /// covers the op in isolation), retains FEWER tape nodes now that
+    /// `scale` is folded into `softmax_apply_training` directly, because
+    /// the `scores / scale` `Op::Affine` node this call site used to
+    /// build BEFORE calling it is gone. `Tensor::sorted_nodes()` is
+    /// candle's own PUBLIC topological-sort-for-backward API (the exact
+    /// list `Tensor::backward` walks) — a direct, honest count of what
+    /// backward keeps resident, not a proxy.
+    ///
+    /// BEFORE: reconstructs the EXACT composition this call site used to
+    /// run (the `Op::Affine` division, THEN `softmax_apply_training` with
+    /// `scale = 1.0` — algebraically identical to calling it with the
+    /// real `scale` directly, so this is a fair, apples-to-apples
+    /// comparison, not a strawman). AFTER: `softmax_apply_training` called
+    /// with the real `scale` directly, as `forward` does today. Both
+    /// sides use the IDENTICAL fixture (fused-eligible on CPU, mirroring
+    /// `fused_training_softmax_matches_eager_fwd_and_bwd`'s shape) so the
+    /// ONLY difference between the two graphs is the presence/absence of
+    /// the `Op::Affine` node.
+    #[test]
+    fn fused_training_softmax_call_site_drops_the_affine_node() {
+        let device = Device::Cpu;
+        let batch = 1;
+        let heads = 2;
+        let seq = 4;
+        let scale = 8.0f64; // sqrt(64) -- ModernBERT-large's real head_dim.
+        let sv: Vec<f32> = (0..batch * heads * seq * seq)
+            .map(|i| (i as f32 * 0.19 - 2.0).cos() * 2.0)
+            .collect();
+        let mv: Vec<f32> = (0..batch * seq)
+            .map(|i| if i == 2 { -10_000.0 } else { 0.0 })
+            .collect();
+
+        // BEFORE this commit's call-site change.
+        let s_before =
+            Var::from_tensor(&Tensor::from_slice(&sv, (batch, heads, seq, seq), &device).unwrap())
+                .unwrap();
+        let mask_before = Tensor::from_slice(&mv, (batch, 1, 1, seq), &device).unwrap();
+        let scaled_before = (s_before.as_tensor() / scale).unwrap();
+        let before_counters = SOFTMAX_DISPATCH_COUNTERS.snapshot();
+        let y_before = softmax_apply_training(&scaled_before, &mask_before, 1.0).unwrap();
+        let after_before_counters = SOFTMAX_DISPATCH_COUNTERS.snapshot();
+        assert!(
+            after_before_counters.fused > before_counters.fused,
+            "the BEFORE fixture must actually dispatch the fused kernel too, or this \
+             comparison is not apples-to-apples"
+        );
+        let nodes_before = y_before.sorted_nodes().len();
+
+        // AFTER (the actual call site today): `scale` folded directly
+        // into the fused op, no separate `Op::Affine` node ever built.
+        let s_after =
+            Var::from_tensor(&Tensor::from_slice(&sv, (batch, heads, seq, seq), &device).unwrap())
+                .unwrap();
+        let mask_after = Tensor::from_slice(&mv, (batch, 1, 1, seq), &device).unwrap();
+        let before_counters2 = SOFTMAX_DISPATCH_COUNTERS.snapshot();
+        let y_after = softmax_apply_training(&s_after, &mask_after, scale).unwrap();
+        let after_counters2 = SOFTMAX_DISPATCH_COUNTERS.snapshot();
+        assert!(
+            after_counters2.fused > before_counters2.fused,
+            "the AFTER fixture must actually dispatch the fused kernel too, or this \
+             comparison is not apples-to-apples"
+        );
+        let nodes_after = y_after.sorted_nodes().len();
+
+        assert!(
+            nodes_after < nodes_before,
+            "the AFTER graph must retain FEWER tape nodes than BEFORE -- the \
+             Op::Affine node must be gone: before={nodes_before} after={nodes_after}"
+        );
+        // Pin the MEASURED constants directly, not just "fewer than":
+        // BEFORE = [s_before, scaled_before (Op::Affine), y_before] = 3
+        // (mask is never a `Var` in either graph, so it never enters
+        // `sorted_nodes` at all -- the same reasoning
+        // `jammi_kernels::ops::softmax`'s own node-count oracle documents).
+        assert_eq!(
+            nodes_before, 3,
+            "measured BEFORE node count (this commit's own recorded baseline)"
+        );
+        // AFTER = [s_after, y_after] = 2 -- the Op::Affine node is gone.
+        assert_eq!(
+            nodes_after, 2,
+            "measured AFTER node count -- the Op::Affine node is gone"
+        );
     }
 
     // -------------------------------------------------------------------

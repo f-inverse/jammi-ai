@@ -125,9 +125,16 @@ fn triplet_loss(a: &Tensor, p: &Tensor, n: &Tensor, margin: f64) -> candle_core:
     raw.relu()?.mean_all()
 }
 
-/// Which of the three trainer-supported text encoders
-/// (`jammi_ai::fine_tune::worker::build_encoder_adapters`) a checkpoint
-/// directory holds.
+/// Which of the encoders this tier can build (`modernbert` | `bert` |
+/// `distilbert`) a checkpoint directory holds.
+///
+/// This is NOT the trainer's full family list: the trainer's own dispatch
+/// (`jammi_ai::fine_tune::worker::build_encoder_adapters`) has a `_ =>
+/// Bert` catch-all, and `model/backend/candle.rs` enumerates `bert`,
+/// `roberta`, `camembert`, and `xlm-roberta` as BERT-family — every one of
+/// those siblings loads through the same `Bert` builder this tier drives.
+/// A checkpoint whose `config.json` names one of those siblings should pass
+/// `--model-type bert` explicitly.
 ///
 /// Detected from `config.json`'s `model_type` field the same way the trainer
 /// reads it (`crates/jammi-ai/src/fine_tune/worker.rs`,
@@ -165,31 +172,64 @@ impl ModelType {
     }
 
     /// Detect from a parsed `config.json`. An explicit `--model-type`
-    /// override always wins over the file's own `model_type` field — the
-    /// override exists precisely because `model_type` CAN be absent from a
-    /// real checkpoint: `jammi_encoders::BertConfig`'s own `model_type` field
-    /// is `#[serde(default)]` `Option<String>` (a raw `BertModel` checkpoint
-    /// need not carry it), and the trainer's own dispatch treats an absent
-    /// field as `"bert"` rather than refusing to build.
+    /// override wins over the file's own `model_type` field only for the
+    /// case the override exists for: `model_type` CAN be absent from a real
+    /// checkpoint (`jammi_encoders::BertConfig`'s own `model_type` field is
+    /// `#[serde(default)]` `Option<String>` — a raw `BertModel` checkpoint
+    /// need not carry it — and the trainer's own dispatch treats an absent
+    /// field as `"bert"` rather than refusing to build). When `config.json`
+    /// DOES carry a `model_type` and the override names a *different* one,
+    /// that is not an absence to fill — silently trusting the override there
+    /// would let the tier profile the wrong builder while reporting the
+    /// override's label, corrupting the per-model classification this tier
+    /// exists for; refuse with a typed error naming both instead.
     pub fn detect(
         config_json: &serde_json::Value,
         override_type: Option<&str>,
     ) -> Result<Self, ModelTypeError> {
-        if let Some(explicit) = override_type {
-            return Self::parse(explicit);
-        }
-        match config_json.get("model_type").and_then(|v| v.as_str()) {
-            Some(raw) => Self::parse(raw),
-            None => Err(ModelTypeError::Absent),
+        let file_type = config_json.get("model_type").and_then(|v| v.as_str());
+        match (override_type, file_type) {
+            (Some(explicit), Some(file_raw)) if explicit != file_raw => {
+                Err(ModelTypeError::OverrideContradicts {
+                    file_type: file_raw.to_string(),
+                    override_type: explicit.to_string(),
+                })
+            }
+            (Some(explicit), _) => Self::parse(explicit),
+            (None, Some(raw)) => Self::parse(raw),
+            (None, None) => Err(ModelTypeError::Absent),
         }
     }
 
     /// The LoRA target-module selector vocabulary this model's encoder
-    /// actually wires up — the short names each encoder's `LoraSite::build`
-    /// call passes as `target_name` (`bert.rs`'s six per-layer linears,
-    /// `distilbert.rs`'s six, `modernbert.rs`'s `Wqkv`/`Wo`/`Wi`/`mlp.Wo`).
-    /// `jammi_lora::should_apply_lora` matches a target string against the
-    /// END of the module name, so `"Wo"` also matches ModernBERT's `mlp.Wo`.
+    /// actually wires up — the real per-layer module names each encoder's
+    /// `LoraSite::build`/`LoraSlot::build_in` call passes as its FIRST
+    /// argument, the string `jammi_lora::should_apply_lora` matches against
+    /// (NOT the second argument, the LoRA adapter subpath used only to
+    /// address the trainable A/B tensors — those are a different vocabulary
+    /// and matching against it selects nothing, since `should_apply_lora`
+    /// never sees it).
+    ///
+    /// `bert.rs:536-548`: `attention.self.query`, `attention.self.key`,
+    /// `attention.self.value`, `attention.output.dense`,
+    /// `intermediate.dense`, `output.dense`. `distilbert.rs`'s six call
+    /// sites pass short, mutually-exclusive names directly (`q_lin`,
+    /// `k_lin`, `v_lin`, `out_lin`, `lin1`, `lin2`) so no suffix expansion
+    /// applies there. `modernbert.rs:1178-1215`: `Wqkv`, `Wo`, `Wi`,
+    /// `mlp.Wo`.
+    ///
+    /// `should_apply_lora` matches a target string against the END of the
+    /// module name (`module_name == t || module_name.ends_with(t)`), so two
+    /// selectors here are ambiguous BY THAT SEMANTICS, not by a bug in this
+    /// vocabulary: ModernBERT's `"Wo"` also matches `mlp.Wo` (`"mlp.Wo"`
+    /// ends with `"Wo"`), and BERT's `"output.dense"` also matches
+    /// `attention.output.dense` (`"attention.output.dense"` ends with
+    /// `"output.dense"`) — both are the trainer's own selector semantics,
+    /// not something this tier tries to disambiguate. A caller that wants
+    /// exactly one of an ambiguous pair must pass the longer, unambiguous
+    /// form (`attention.output.dense` selects only the attention-output
+    /// site; there is no suffix-only selector that reaches the FFN
+    /// `output.dense` without also reaching `attention.output.dense`).
     pub fn lora_target_vocabulary(self) -> &'static [&'static str] {
         match self {
             Self::ModernBert => &["Wqkv", "Wo", "Wi"],
@@ -197,9 +237,9 @@ impl ModelType {
                 "query",
                 "key",
                 "value",
-                "dense",
-                "intermediate_dense",
-                "output_dense",
+                "attention.output.dense",
+                "intermediate.dense",
+                "output.dense",
             ],
             Self::DistilBert => &["q_lin", "k_lin", "v_lin", "out_lin", "lin1", "lin2"],
         }
@@ -222,6 +262,15 @@ pub enum ModelTypeError {
     /// `config.json` has no `model_type` field and no `--model-type`
     /// override was supplied.
     Absent,
+    /// `config.json` names one `model_type` and `--model-type` names a
+    /// different one. The override exists for the case `model_type` is
+    /// ABSENT from the file; it is not a licence to relabel a checkpoint
+    /// that already declares its own family, since that would drive the
+    /// wrong builder while the report still carries the override's label.
+    OverrideContradicts {
+        file_type: String,
+        override_type: String,
+    },
 }
 
 impl std::fmt::Display for ModelTypeError {
@@ -237,6 +286,16 @@ impl std::fmt::Display for ModelTypeError {
                 f,
                 "config.json has no model_type field; pass --model-type explicitly, one of {:?}",
                 ModelType::ALL
+            ),
+            Self::OverrideContradicts {
+                file_type,
+                override_type,
+            } => write!(
+                f,
+                "config.json declares model_type {file_type:?} but --model-type was passed as \
+                 {override_type:?}; --model-type only fills in an ABSENT model_type field, it \
+                 does not override a present one — pass a config.json-consistent value, or omit \
+                 --model-type to detect {file_type:?} from the file"
             ),
         }
     }
@@ -303,10 +362,40 @@ pub struct FinetuneStepParams {
     pub batched_forward: bool,
 }
 
+/// A `vocab_size` too small to draw a non-pad synthetic id from. Typed so
+/// the failure is a refusal, not the `% (vocab - 1)` divide-by-zero panic a
+/// `vocab_size` of 0 or 1 would otherwise produce inside [`synthetic_ids`].
+#[derive(Debug)]
+pub struct VocabTooSmallError {
+    pub vocab_size: usize,
+}
+
+impl std::fmt::Display for VocabTooSmallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "config.json vocab_size {} is too small for a synthetic non-pad id: need at least \
+             2 (id 0 is reserved as pad, so a vocab of 1 has no other id to draw)",
+            self.vocab_size
+        )
+    }
+}
+
+impl std::error::Error for VocabTooSmallError {}
+
 /// Deterministic synthetic token ids, uniform over `[1, vocab)` so no id is the
 /// pad id. An LCG rather than a dependency, and identical across runs so two
 /// measurements differ only in the code under test.
-fn synthetic_ids(batch: usize, seq: usize, vocab: usize, seed: u64, device: &Device) -> Tensor {
+fn synthetic_ids(
+    batch: usize,
+    seq: usize,
+    vocab: usize,
+    seed: u64,
+    device: &Device,
+) -> Result<Tensor, VocabTooSmallError> {
+    if vocab < 2 {
+        return Err(VocabTooSmallError { vocab_size: vocab });
+    }
     let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
     let ids: Vec<u32> = (0..batch * seq)
         .map(|_| {
@@ -316,7 +405,7 @@ fn synthetic_ids(batch: usize, seq: usize, vocab: usize, seed: u64, device: &Dev
             1 + ((s >> 33) as usize % (vocab - 1)) as u32
         })
         .collect();
-    Tensor::from_vec(ids, (batch, seq), device).expect("synthetic ids")
+    Ok(Tensor::from_vec(ids, (batch, seq), device).expect("synthetic ids"))
 }
 
 /// Run the tier and return its report block.
@@ -413,7 +502,7 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
                 &device,
             )
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
     let vram_baseline = device_memory_used_bytes().unwrap_or(0);
     let sampler = VramSampler::start();
@@ -666,6 +755,112 @@ mod tests {
         dir
     }
 
+    /// Write a tiny synthetic `BertForX`-layout checkpoint (config.json +
+    /// model.safetensors, every tensor key under a `"bert."` prefix) to a
+    /// fresh temp dir.
+    ///
+    /// The committed `tiny_bert` fixture (`cookbook/fixtures/tiny_bert`) is
+    /// the OTHER layout — a raw `BertModel` checkpoint with unprefixed keys
+    /// (`embeddings.word_embeddings.weight`) — so no test anywhere in this
+    /// workspace previously drove the `"bert."`-prefixed arm
+    /// (`bert.rs:508`'s `contains_tensor` probe) end-to-end; that is the arm
+    /// that failed live. Generating this in-test keeps the fixture
+    /// generic/synthetic rather than shaped to any consumer's checkpoint.
+    fn write_tiny_prefixed_bert(device: &Device) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hidden = 16usize;
+        let inter = 32usize;
+        let vocab = 64usize;
+        let max_pos = 32usize;
+        let heads = 2usize;
+        let type_vocab_size = 2usize;
+        let layers = 1usize;
+
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::json!({
+                "model_type": "bert",
+                "hidden_size": hidden,
+                "num_hidden_layers": layers,
+                "num_attention_heads": heads,
+                "intermediate_size": inter,
+                "vocab_size": vocab,
+                "max_position_embeddings": max_pos,
+                "type_vocab_size": type_vocab_size,
+            })
+            .to_string(),
+        )
+        .expect("write config.json");
+
+        let mut tensors: HashMap<String, Tensor> = HashMap::new();
+        let randn =
+            |shape: (usize, usize)| Tensor::randn(0f32, 0.02, shape, device).expect("randn 2-D");
+        let randn_1d = |n: usize| Tensor::randn(0f32, 0.02, (n,), device).expect("randn 1-D");
+        let ones_1d = |n: usize| Tensor::ones((n,), DType::F32, device).expect("ones 1-D");
+        let zeros_1d = |n: usize| Tensor::zeros((n,), DType::F32, device).expect("zeros 1-D");
+
+        tensors.insert(
+            "bert.embeddings.word_embeddings.weight".into(),
+            randn((vocab, hidden)),
+        );
+        tensors.insert(
+            "bert.embeddings.position_embeddings.weight".into(),
+            randn((max_pos, hidden)),
+        );
+        tensors.insert(
+            "bert.embeddings.token_type_embeddings.weight".into(),
+            randn((type_vocab_size, hidden)),
+        );
+        tensors.insert("bert.embeddings.LayerNorm.weight".into(), ones_1d(hidden));
+        tensors.insert("bert.embeddings.LayerNorm.bias".into(), zeros_1d(hidden));
+
+        for n in 0..layers {
+            let prefix = format!("bert.encoder.layer.{n}");
+            for lin in [
+                "attention.self.query",
+                "attention.self.key",
+                "attention.self.value",
+            ] {
+                tensors.insert(format!("{prefix}.{lin}.weight"), randn((hidden, hidden)));
+                tensors.insert(format!("{prefix}.{lin}.bias"), randn_1d(hidden));
+            }
+            tensors.insert(
+                format!("{prefix}.attention.output.dense.weight"),
+                randn((hidden, hidden)),
+            );
+            tensors.insert(
+                format!("{prefix}.attention.output.dense.bias"),
+                randn_1d(hidden),
+            );
+            tensors.insert(
+                format!("{prefix}.attention.output.LayerNorm.weight"),
+                ones_1d(hidden),
+            );
+            tensors.insert(
+                format!("{prefix}.attention.output.LayerNorm.bias"),
+                zeros_1d(hidden),
+            );
+
+            tensors.insert(
+                format!("{prefix}.intermediate.dense.weight"),
+                randn((inter, hidden)),
+            );
+            tensors.insert(format!("{prefix}.intermediate.dense.bias"), randn_1d(inter));
+
+            tensors.insert(
+                format!("{prefix}.output.dense.weight"),
+                randn((hidden, inter)),
+            );
+            tensors.insert(format!("{prefix}.output.dense.bias"), randn_1d(hidden));
+            tensors.insert(format!("{prefix}.output.LayerNorm.weight"), ones_1d(hidden));
+            tensors.insert(format!("{prefix}.output.LayerNorm.bias"), zeros_1d(hidden));
+        }
+
+        candle_core::safetensors::save(&tensors, dir.path().join("model.safetensors"))
+            .expect("save safetensors");
+        dir
+    }
+
     fn base_params(model_dir: std::path::PathBuf) -> FinetuneStepParams {
         FinetuneStepParams {
             model_dir,
@@ -746,10 +941,11 @@ mod tests {
     #[test]
     fn finetune_step_end_to_end_cpu_smoke_bert() {
         let dir = tiny_bert_dir();
-        if !dir.join("config.json").exists() {
-            eprintln!("skipping: tiny_bert fixture not present at {dir:?}");
-            return;
-        }
+        assert!(
+            dir.join("config.json").exists(),
+            "tiny_bert fixture must exist at {dir:?} — a missing fixture is a test failure, \
+             not a silent skip"
+        );
         let mut params = base_params(dir);
         params.target_modules = Some(vec!["query".to_string(), "value".to_string()]);
         let tier = run(&params).expect("bert finetune step runs end-to-end on CPU");
@@ -761,10 +957,11 @@ mod tests {
     #[test]
     fn finetune_step_end_to_end_cpu_smoke_modernbert() {
         let dir = tiny_modernbert_dir();
-        if !dir.join("config.json").exists() {
-            eprintln!("skipping: tiny_modernbert fixture not present at {dir:?}");
-            return;
-        }
+        assert!(
+            dir.join("config.json").exists(),
+            "tiny_modernbert fixture must exist at {dir:?} — a missing fixture is a test \
+             failure, not a silent skip"
+        );
         let params = base_params(dir);
         let tier = run(&params).expect("modernbert finetune step runs end-to-end on CPU");
         assert_eq!(tier.model_type, "modernbert");
@@ -785,13 +982,187 @@ mod tests {
     #[test]
     fn target_modules_refusal_fires_through_run_for_bert() {
         let dir = tiny_bert_dir();
-        if !dir.join("config.json").exists() {
-            eprintln!("skipping: tiny_bert fixture not present at {dir:?}");
-            return;
-        }
+        assert!(
+            dir.join("config.json").exists(),
+            "tiny_bert fixture must exist at {dir:?} — a missing fixture is a test failure, \
+             not a silent skip"
+        );
         let params = base_params(dir); // target_modules: None
         let err = run(&params).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("--target-modules"));
+    }
+
+    /// The arm that failed live: a `"bert."`-prefixed `BertForX` checkpoint
+    /// (`bert.rs:508`'s wrapped-layout probe), never previously exercised by
+    /// any test in this workspace — `finetune_step_end_to_end_cpu_smoke_bert`
+    /// only covers the unprefixed raw-`BertModel` layout.
+    #[test]
+    fn finetune_step_end_to_end_cpu_smoke_bert_prefixed_layout() {
+        let device = Device::Cpu;
+        let dir = write_tiny_prefixed_bert(&device);
+        let mut params = base_params(dir.path().to_path_buf());
+        params.target_modules = Some(vec!["query".to_string(), "value".to_string()]);
+        let tier = run(&params)
+            .expect("bert (BertForX-prefixed layout) finetune step runs end-to-end on CPU");
+        assert_eq!(tier.model_type, "bert");
+        assert!(tier.trainable_tensors > 0);
+        assert_eq!(tier.steps_measured, 1);
+        // Acceptance evidence for the prefixed-layout arm — printed (run
+        // with `--nocapture`) so the run that exercises `bert.rs:508`'s
+        // `contains_tensor("bert.embeddings...")` probe leaves a record of
+        // what it actually built, not just a pass/fail bit.
+        println!(
+            "prefixed-BERT smoke: model_type={} trainable_tensors={} \
+             lora_epilogue_fused_dispatches={} lora_epilogue_eager_dispatches={}",
+            tier.model_type,
+            tier.trainable_tensors,
+            tier.lora_epilogue_fused_dispatches,
+            tier.lora_epilogue_eager_dispatches,
+        );
+    }
+
+    #[test]
+    fn override_contradicting_config_model_type_is_a_typed_error() {
+        let json = serde_json::json!({ "model_type": "distilbert" });
+        let err = ModelType::detect(&json, Some("bert")).unwrap_err();
+        assert!(matches!(
+            &err,
+            ModelTypeError::OverrideContradicts { file_type, override_type }
+                if file_type == "distilbert" && override_type == "bert"
+        ));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("distilbert"),
+            "error {msg:?} must name the file's model_type"
+        );
+        assert!(msg.contains("bert"), "error {msg:?} must name the override");
+
+        // A matching override is a no-op, not a contradiction — this is the
+        // ABSENT-field case the override actually exists for, extended to
+        // "present and identical" rather than "present and different".
+        assert_eq!(
+            ModelType::detect(&json, Some("distilbert")).unwrap(),
+            ModelType::DistilBert
+        );
+    }
+
+    #[test]
+    fn synthetic_ids_refuses_vocab_size_below_two() {
+        let device = Device::Cpu;
+        for vocab in [0usize, 1usize] {
+            let err = synthetic_ids(2, 4, vocab, 1, &device).unwrap_err();
+            assert_eq!(err.vocab_size, vocab);
+        }
+        assert!(synthetic_ids(2, 4, 2, 1, &device).is_ok());
+    }
+
+    /// BERT's real per-layer module names — the FIRST argument to
+    /// `LoraSite::build` (`bert.rs:536-548`), the string
+    /// `jammi_lora::should_apply_lora` actually matches a selector against.
+    /// Embedded here rather than read from `bert.rs`'s own (private)
+    /// `lora_sites` helper: that helper returns the SECOND argument (the
+    /// LoRA adapter subpath, used only for dropout-position bookkeeping) —
+    /// reusing it for module-name matching would silently reintroduce this
+    /// block's bug.
+    fn bert_module_names() -> [&'static str; 6] {
+        [
+            "attention.self.query",
+            "attention.self.key",
+            "attention.self.value",
+            "attention.output.dense",
+            "intermediate.dense",
+            "output.dense",
+        ]
+    }
+
+    /// DistilBERT's real per-layer module names (`distilbert.rs:477-533`).
+    fn distilbert_module_names() -> [&'static str; 6] {
+        ["q_lin", "k_lin", "v_lin", "out_lin", "lin1", "lin2"]
+    }
+
+    /// ModernBERT's real per-layer module names (`modernbert.rs:1178-1215`).
+    fn modernbert_module_names() -> [&'static str; 4] {
+        ["Wqkv", "Wo", "Wi", "mlp.Wo"]
+    }
+
+    /// How many of `module_names` one advertised `selector` matches, via
+    /// the SAME function the encoders call at build time
+    /// (`jammi_lora::should_apply_lora`) rather than a re-implementation of
+    /// its suffix-match rule — so this table cannot drift from the real
+    /// matching semantics.
+    fn sites_matched(selector: &str, module_names: &[&str]) -> usize {
+        let targets = [selector.to_string()];
+        module_names
+            .iter()
+            .filter(|name| jammi_lora::should_apply_lora(name, &targets, 0, &None))
+            .count()
+    }
+
+    #[test]
+    fn bert_selector_vocabulary_matches_real_module_names() {
+        let names = bert_module_names();
+        // (selector, sites it matches per layer under `should_apply_lora`).
+        // "output.dense" is 2, not 1: `should_apply_lora`'s own suffix-match
+        // rule (`module_name.ends_with(t)`) means "attention.output.dense"
+        // also matches, since it ends with "output.dense" too. There is no
+        // suffix-only selector that reaches the FFN `output.dense` without
+        // also reaching `attention.output.dense` — that is the trainer's own
+        // matching semantics, not a bug this tier disambiguates.
+        let expected: &[(&str, usize)] = &[
+            ("query", 1),
+            ("key", 1),
+            ("value", 1),
+            ("attention.output.dense", 1),
+            ("intermediate.dense", 1),
+            ("output.dense", 2),
+        ];
+        let advertised: Vec<&str> = expected.iter().map(|(s, _)| *s).collect();
+        assert_eq!(
+            ModelType::Bert.lora_target_vocabulary(),
+            advertised.as_slice()
+        );
+        for (selector, want) in expected {
+            assert_eq!(
+                sites_matched(selector, &names),
+                *want,
+                "selector {selector:?} must match {want} site(s) of {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn distilbert_selector_vocabulary_matches_real_module_names_one_to_one() {
+        let names = distilbert_module_names();
+        for selector in ModelType::DistilBert.lora_target_vocabulary() {
+            assert_eq!(
+                sites_matched(selector, &names),
+                1,
+                "selector {selector:?} must match exactly one of {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn modernbert_selector_vocabulary_matches_real_module_names() {
+        let names = modernbert_module_names();
+        // "Wo" is 2, not 1: "mlp.Wo" ends with "Wo" too, so the tier's
+        // historical ModernBERT default reaches both `Wo` sites per layer —
+        // documented (not "fixed") the same way as BERT's `output.dense`
+        // ambiguity above, since it is the same `should_apply_lora`
+        // suffix-match rule at work, and this IS the trainer's semantics.
+        let expected: &[(&str, usize)] = &[("Wqkv", 1), ("Wo", 2), ("Wi", 1)];
+        let advertised: Vec<&str> = expected.iter().map(|(s, _)| *s).collect();
+        assert_eq!(
+            ModelType::ModernBert.lora_target_vocabulary(),
+            advertised.as_slice()
+        );
+        for (selector, want) in expected {
+            assert_eq!(
+                sites_matched(selector, &names),
+                *want,
+                "selector {selector:?} must match {want} site(s) of {names:?}"
+            );
+        }
     }
 }

@@ -365,10 +365,13 @@ enum Command {
     GpuInferenceScale,
     /// The encoder fine-tune step tier: time one real LoRA training step —
     /// three encoder forwards live on the tape at once, a cosine-margin triplet
-    /// loss, one backward into the adapter tensors, and one AdamW step — over a
-    /// ModernBERT, BERT or DistilBERT checkpoint (detected from config.json
-    /// model_type) on disk. Runs on CPU by default and on a CUDA ordinal with
-    /// `--cuda`.
+    /// loss, one backward into the adapter tensors, and one AdamW step — over
+    /// a checkpoint whose config.json `model_type` this tier can build:
+    /// `modernbert`, `bert`, or `distilbert`. That is not the trainer's full
+    /// family list: the trainer's own dispatch has a `_ => Bert` catch-all,
+    /// and RoBERTa/CamemBERT/XLM-RoBERTa checkpoints all load through the same
+    /// `Bert` builder — pass `--model-type bert` for one of those. Runs on CPU
+    /// by default and on a CUDA ordinal with `--cuda`.
     ///
     /// Every number is RECORDED, never gated: a step time is a property of
     /// `code x device x box`, so the only comparison a heterogeneous rented
@@ -401,7 +404,10 @@ enum Command {
         target_modules: Option<String>,
         /// Explicit model-family override (`modernbert`, `bert`, or
         /// `distilbert`), for a checkpoint whose `config.json` has no
-        /// `model_type` field. Omit to detect it from the file.
+        /// `model_type` field. Omit to detect it from the file. A value that
+        /// CONTRADICTS a `model_type` the file already declares is a typed
+        /// error, not a silent relabel — this flag only fills an absent
+        /// field.
         #[arg(long)]
         model_type: Option<String>,
         /// Backbone precision: f32, f16, or bf16.

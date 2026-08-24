@@ -1051,12 +1051,10 @@ fn assert_softmax_parity_f32(cuda: &Device, rows: usize, last: usize, sv: &[f32]
     let s_cpu = Var::from_tensor(&Tensor::from_slice(sv, (rows, last), &cpu).unwrap()).unwrap();
     let m_cpu = Tensor::from_slice(&mv, (1, last), &cpu).unwrap();
     let out_cpu = softmax(&s_cpu, &m_cpu).unwrap();
-    let grads_cpu = out_cpu.backward().unwrap();
 
     let s_gpu = Var::from_tensor(&Tensor::from_slice(sv, (rows, last), cuda).unwrap()).unwrap();
     let m_gpu = Tensor::from_slice(&mv, (1, last), cuda).unwrap();
     let out_gpu = softmax(&s_gpu, &m_gpu).unwrap();
-    let grads_gpu = out_gpu.backward().unwrap();
 
     let out_cpu_v: Vec<f32> = out_cpu.flatten_all().unwrap().to_vec1().unwrap();
     let out_gpu_v: Vec<f32> = out_gpu
@@ -1074,6 +1072,20 @@ fn assert_softmax_parity_f32(cuda: &Device, rows: usize, last: usize, sv: &[f32]
             "softmax fwd[{i}]: cpu {c} vs cuda {g} (rows={rows}, last={last})"
         );
     }
+
+    // Non-uniform dy (family F): `Tensor::backward()`'s implicit all-ones
+    // seed makes `dscores = (dy - sum(dy*y)) * y` IDENTICALLY zero for
+    // every softmax row (`sum(y) == 1`), so a parity check seeded that way
+    // would pass VACUOUSLY even with `bwd` badly broken (e.g. `* scale`
+    // deleted). Seed with a fixed non-uniform `dy` instead, matching
+    // `softmax_parity_fully_masked_row_is_zero_on_both_devices`'s own idiom.
+    let dy_seed = fixture(n, 5.0);
+    let dy_cpu = Tensor::from_slice(&dy_seed, (rows, last), &cpu).unwrap();
+    let dy_gpu = Tensor::from_slice(&dy_seed, (rows, last), cuda).unwrap();
+    let loss_cpu = (&out_cpu * &dy_cpu).unwrap().sum_all().unwrap();
+    let loss_gpu = (&out_gpu * &dy_gpu).unwrap().sum_all().unwrap();
+    let grads_cpu = loss_cpu.backward().unwrap();
+    let grads_gpu = loss_gpu.backward().unwrap();
 
     let dx_cpu: Vec<f32> = grads_cpu
         .get(&s_cpu)
@@ -1093,6 +1105,19 @@ fn assert_softmax_parity_f32(cuda: &Device, rows: usize, last: usize, sv: &[f32]
         .unwrap();
     assert_eq!(dx_cpu.len(), n);
     assert_eq!(dx_gpu.len(), n, "softmax GPU dscores length mismatch");
+    // Non-vacuity (family F): pin that the CPU reference itself is
+    // measurably nonzero -- otherwise the parity loop below would pass
+    // trivially without proving `bwd` ran the real formula.
+    let dx_cpu_norm: f64 = dx_cpu
+        .iter()
+        .map(|&v| (v as f64) * (v as f64))
+        .sum::<f64>()
+        .sqrt();
+    assert!(
+        dx_cpu_norm > 1e-3,
+        "CPU dscores must be measured-nonzero (norm {dx_cpu_norm}) -- a vacuous \
+         all-zero reference would make the parity check below prove nothing"
+    );
     for (i, (c, g)) in dx_cpu.iter().zip(dx_gpu.iter()).enumerate() {
         assert!(
             ((*c - *g).abs() as f64) <= F32_TOL,
@@ -1111,12 +1136,10 @@ fn assert_softmax_parity_bf16(cuda: &Device, rows: usize, last: usize, sv: &[f32
     let s_cpu = Var::from_tensor(&Tensor::from_slice(&sb, (rows, last), &cpu).unwrap()).unwrap();
     let m_cpu = Tensor::from_slice(&mb, (1, last), &cpu).unwrap();
     let out_cpu = softmax(&s_cpu, &m_cpu).unwrap();
-    let grads_cpu = out_cpu.backward().unwrap();
 
     let s_gpu = Var::from_tensor(&Tensor::from_slice(&sb, (rows, last), cuda).unwrap()).unwrap();
     let m_gpu = Tensor::from_slice(&mb, (1, last), cuda).unwrap();
     let out_gpu = softmax(&s_gpu, &m_gpu).unwrap();
-    let grads_gpu = out_gpu.backward().unwrap();
 
     let to_f32 = |t: &Tensor| -> Vec<f32> {
         t.to_dtype(DType::F32)
@@ -1139,6 +1162,18 @@ fn assert_softmax_parity_bf16(cuda: &Device, rows: usize, last: usize, sv: &[f32
         );
     }
 
+    // Non-uniform dy (family F): see `assert_softmax_parity_f32`'s
+    // identical note -- an implicit all-ones seed makes `dscores`
+    // identically zero for a softmax row, which would pass vacuously.
+    let dy_seed_f = fixture(n, 5.0);
+    let dy_seed_b: Vec<bf16> = dy_seed_f.iter().map(|&v| bf16::from_f32(v)).collect();
+    let dy_cpu = Tensor::from_slice(&dy_seed_b, (rows, last), &cpu).unwrap();
+    let dy_gpu = Tensor::from_slice(&dy_seed_b, (rows, last), cuda).unwrap();
+    let loss_cpu = (&out_cpu * &dy_cpu).unwrap().sum_all().unwrap();
+    let loss_gpu = (&out_gpu * &dy_gpu).unwrap().sum_all().unwrap();
+    let grads_cpu = loss_cpu.backward().unwrap();
+    let grads_gpu = loss_gpu.backward().unwrap();
+
     let dx_cpu_v = to_f32(&grads_cpu.get(&s_cpu).unwrap().clone());
     let dx_gpu_v = to_f32(&grads_gpu.get(&s_gpu).unwrap().to_device(&cpu).unwrap());
     assert_eq!(dx_cpu_v.len(), n);
@@ -1146,6 +1181,18 @@ fn assert_softmax_parity_bf16(cuda: &Device, rows: usize, last: usize, sv: &[f32
         dx_gpu_v.len(),
         n,
         "softmax bf16 GPU dscores length mismatch"
+    );
+    // Non-vacuity (family F): pin that the CPU reference itself is
+    // measurably nonzero before trusting the parity loop below.
+    let dx_cpu_norm: f64 = dx_cpu_v
+        .iter()
+        .map(|&v| (v as f64) * (v as f64))
+        .sum::<f64>()
+        .sqrt();
+    assert!(
+        dx_cpu_norm > 1e-3,
+        "CPU dscores must be measured-nonzero (norm {dx_cpu_norm}) -- a vacuous \
+         all-zero reference would make the parity check below prove nothing"
     );
     for (i, (c, g)) in dx_cpu_v.iter().zip(dx_gpu_v.iter()).enumerate() {
         assert!(
@@ -1322,10 +1369,16 @@ fn softmax_parity_empty_batch() {
 const HEAD_DIM_64_SCALE: f32 = 0.125;
 
 fn softmax_scale(scores: &Tensor, mask: &Tensor, scale: f32) -> candle_core::Result<Tensor> {
+    // `.with_scale` validates `scale` (family D — see its own doc) and
+    // returns `KernelError`; every fixture in this file passes a genuine
+    // finite positive scale, so `.expect` here is a test-fixture
+    // assumption, not a silent unwrap of a real fallible path.
     apply2(
         scores,
         mask,
-        SoftmaxLastDimFused::default().with_scale(scale),
+        SoftmaxLastDimFused::default()
+            .with_scale(scale)
+            .expect("test fixture scale must be finite and > 0.0"),
     )
 }
 
@@ -1343,12 +1396,10 @@ fn assert_softmax_scale_parity_f32(
     let s_cpu = Var::from_tensor(&Tensor::from_slice(sv, (rows, last), &cpu).unwrap()).unwrap();
     let m_cpu = Tensor::from_slice(&mv, (1, last), &cpu).unwrap();
     let out_cpu = softmax_scale(&s_cpu, &m_cpu, scale).unwrap();
-    let grads_cpu = out_cpu.backward().unwrap();
 
     let s_gpu = Var::from_tensor(&Tensor::from_slice(sv, (rows, last), cuda).unwrap()).unwrap();
     let m_gpu = Tensor::from_slice(&mv, (1, last), cuda).unwrap();
     let out_gpu = softmax_scale(&s_gpu, &m_gpu, scale).unwrap();
-    let grads_gpu = out_gpu.backward().unwrap();
 
     let out_cpu_v: Vec<f32> = out_cpu.flatten_all().unwrap().to_vec1().unwrap();
     let out_gpu_v: Vec<f32> = out_gpu
@@ -1366,6 +1417,21 @@ fn assert_softmax_scale_parity_f32(
             "softmax scale fwd[{i}]: cpu {c} vs cuda {g} (rows={rows}, last={last}, scale={scale})"
         );
     }
+
+    // Non-uniform dy (family F): `Tensor::backward()`'s implicit all-ones
+    // seed makes `dscores = (dy - sum(dy*y)) * y` IDENTICALLY zero for
+    // every softmax row (`sum(y) == 1`) -- with a uniform seed, THIS
+    // parity check would still pass with `* scale` deleted from `bwd`
+    // entirely (both sides would compute the same all-zero `dscores`,
+    // proving nothing about the CUDA kernel's own `scale` arithmetic).
+    // Seed with a fixed non-uniform `dy` instead.
+    let dy_seed = fixture(n, 6.0);
+    let dy_cpu = Tensor::from_slice(&dy_seed, (rows, last), &cpu).unwrap();
+    let dy_gpu = Tensor::from_slice(&dy_seed, (rows, last), cuda).unwrap();
+    let loss_cpu = (&out_cpu * &dy_cpu).unwrap().sum_all().unwrap();
+    let loss_gpu = (&out_gpu * &dy_gpu).unwrap().sum_all().unwrap();
+    let grads_cpu = loss_cpu.backward().unwrap();
+    let grads_gpu = loss_gpu.backward().unwrap();
 
     let dx_cpu: Vec<f32> = grads_cpu
         .get(&s_cpu)
@@ -1385,6 +1451,19 @@ fn assert_softmax_scale_parity_f32(
         .unwrap();
     assert_eq!(dx_cpu.len(), n);
     assert_eq!(dx_gpu.len(), n, "softmax scale GPU dscores length mismatch");
+    // Non-vacuity (family F): pin that the CPU reference itself is
+    // measurably nonzero -- otherwise the parity loop below proves
+    // nothing about the CUDA kernel's own `scale` multiply.
+    let dx_cpu_norm: f64 = dx_cpu
+        .iter()
+        .map(|&v| (v as f64) * (v as f64))
+        .sum::<f64>()
+        .sqrt();
+    assert!(
+        dx_cpu_norm > 1e-3,
+        "CPU dscores must be measured-nonzero (norm {dx_cpu_norm}) -- a vacuous \
+         all-zero reference would make the parity check below prove nothing"
+    );
     for (i, (c, g)) in dx_cpu.iter().zip(dx_gpu.iter()).enumerate() {
         assert!(
             ((*c - *g).abs() as f64) <= F32_TOL,
@@ -1409,12 +1488,10 @@ fn assert_softmax_scale_parity_bf16(
     let s_cpu = Var::from_tensor(&Tensor::from_slice(&sb, (rows, last), &cpu).unwrap()).unwrap();
     let m_cpu = Tensor::from_slice(&mb, (1, last), &cpu).unwrap();
     let out_cpu = softmax_scale(&s_cpu, &m_cpu, scale).unwrap();
-    let grads_cpu = out_cpu.backward().unwrap();
 
     let s_gpu = Var::from_tensor(&Tensor::from_slice(&sb, (rows, last), cuda).unwrap()).unwrap();
     let m_gpu = Tensor::from_slice(&mb, (1, last), cuda).unwrap();
     let out_gpu = softmax_scale(&s_gpu, &m_gpu, scale).unwrap();
-    let grads_gpu = out_gpu.backward().unwrap();
 
     let to_f32 = |t: &Tensor| -> Vec<f32> {
         t.to_dtype(DType::F32)
@@ -1441,6 +1518,18 @@ fn assert_softmax_scale_parity_bf16(
         );
     }
 
+    // Non-uniform dy (family F): see `assert_softmax_scale_parity_f32`'s
+    // identical note -- an implicit all-ones seed would make this check
+    // pass vacuously even with `* scale` deleted from `bwd`.
+    let dy_seed_f = fixture(n, 6.0);
+    let dy_seed_b: Vec<bf16> = dy_seed_f.iter().map(|&v| bf16::from_f32(v)).collect();
+    let dy_cpu = Tensor::from_slice(&dy_seed_b, (rows, last), &cpu).unwrap();
+    let dy_gpu = Tensor::from_slice(&dy_seed_b, (rows, last), cuda).unwrap();
+    let loss_cpu = (&out_cpu * &dy_cpu).unwrap().sum_all().unwrap();
+    let loss_gpu = (&out_gpu * &dy_gpu).unwrap().sum_all().unwrap();
+    let grads_cpu = loss_cpu.backward().unwrap();
+    let grads_gpu = loss_gpu.backward().unwrap();
+
     let dx_cpu_v = to_f32(&grads_cpu.get(&s_cpu).unwrap().clone());
     let dx_gpu_v = to_f32(&grads_gpu.get(&s_gpu).unwrap().to_device(&cpu).unwrap());
     assert_eq!(dx_cpu_v.len(), n);
@@ -1448,6 +1537,18 @@ fn assert_softmax_scale_parity_bf16(
         dx_gpu_v.len(),
         n,
         "softmax scale bf16 GPU dscores length mismatch"
+    );
+    // Non-vacuity (family F): pin that the CPU reference itself is
+    // measurably nonzero before trusting the parity loop below.
+    let dx_cpu_norm: f64 = dx_cpu_v
+        .iter()
+        .map(|&v| (v as f64) * (v as f64))
+        .sum::<f64>()
+        .sqrt();
+    assert!(
+        dx_cpu_norm > 1e-3,
+        "CPU dscores must be measured-nonzero (norm {dx_cpu_norm}) -- a vacuous \
+         all-zero reference would make the parity check below prove nothing"
     );
     for (i, (c, g)) in dx_cpu_v.iter().zip(dx_gpu_v.iter()).enumerate() {
         assert!(

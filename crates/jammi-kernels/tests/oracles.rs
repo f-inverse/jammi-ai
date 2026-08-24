@@ -408,10 +408,17 @@ fn softmax_scaled(
     policy: FullyMaskedPolicy,
     scale: f32,
 ) -> candle_core::Result<Tensor> {
+    // `.with_scale` validates `scale` (family D — see its own doc); every
+    // fixture in this file passes a genuine finite positive scale, so
+    // `.expect` here is a test-fixture assumption, not a silent unwrap of a
+    // real fallible path. The domain refusal itself is exercised directly
+    // by `softmax_scale_with_scale_refuses_the_invalid_domain` below.
     apply2(
         scores,
         mask,
-        SoftmaxLastDimFused::new(policy).with_scale(scale),
+        SoftmaxLastDimFused::new(policy)
+            .with_scale(scale)
+            .expect("test fixture scale must be finite and > 0.0"),
     )
 }
 
@@ -473,25 +480,33 @@ fn scale_mask_fixture(batch: usize, seq: usize) -> Vec<f32> {
 /// exact value to the SAME bits.
 const PRODUCTION_SCALE: f64 = 0.125;
 
-fn f32_scale_bit_exact_vs_affine_then_unscaled(batch: usize, heads: usize, seq: usize) {
+/// `1.0 / sqrt(128)` — the OTHER ModernBERT-class `head_dim` value
+/// (`head_dim = hidden_size / num_attention_heads`, which need not land on
+/// `64` for every config this crate's admission predicate must still
+/// accept). UNLIKE [`PRODUCTION_SCALE`], `128` is a power of two but
+/// `sqrt(128)` and therefore `1/sqrt(128)` is IRRATIONAL — genuinely
+/// rounded at every precision, not a lucky exact-representation coincidence
+/// — so this exercises the bounded-double-rounding class
+/// [`PRODUCTION_SCALE`]'s bit-exactness does not, at REAL production
+/// tensor widths (unlike the small `head_dim = 48` toy fixture below).
+fn head_dim_128_scale() -> f64 {
+    1.0 / 128.0f64.sqrt()
+}
+
+fn f32_scale_bit_exact_vs_affine_then_unscaled(batch: usize, heads: usize, seq: usize, scale: f64) {
     let device = Device::Cpu;
     let sv = scale_scores_fixture(batch * heads * seq * seq);
     let mv = scale_mask_fixture(batch, seq);
     let scores = Tensor::from_slice(&sv, (batch, heads, seq, seq), &device).unwrap();
     let mask = Tensor::from_slice(&mv, (batch, 1, seq, seq), &device).unwrap();
 
-    let fused_scaled = softmax_scaled(
-        &scores,
-        &mask,
-        FullyMaskedPolicy::Zeros,
-        PRODUCTION_SCALE as f32,
-    )
-    .unwrap();
+    let fused_scaled =
+        softmax_scaled(&scores, &mask, FullyMaskedPolicy::Zeros, scale as f32).unwrap();
     // The two-op composition `scale` replaces: candle's own
     // `Tensor::affine` (the SAME op `ModernBertAttention::forward` used
     // to call via `scores / sqrt(head_dim)`) THEN this op with `scale =
     // 1.0` (its default).
-    let affined = scores.affine(PRODUCTION_SCALE, 0.0).unwrap();
+    let affined = scores.affine(scale, 0.0).unwrap();
     let affine_then_unscaled = softmax_unscaled(&affined, &mask, FullyMaskedPolicy::Zeros).unwrap();
 
     let a: Vec<f32> = fused_scaled.flatten_all().unwrap().to_vec1().unwrap();
@@ -504,6 +519,12 @@ fn f32_scale_bit_exact_vs_affine_then_unscaled(batch: usize, heads: usize, seq: 
         a.iter().any(|v| v.is_finite() && *v != 0.0),
         "fixture must be non-degenerate"
     );
+    // F32 bit-exactness (unlike the BF16 leg below) does NOT depend on
+    // `scale` being an exact power of two: `SoftmaxLastDimFused::scale` is
+    // populated by the SAME `f64 -> f32` cast `Tensor::affine`'s own F32
+    // branch performs (see `ops::softmax`'s module doc), so this holds for
+    // ANY finite `scale` -- exercised here at BOTH `PRODUCTION_SCALE`
+    // (power-of-two) and `head_dim_128_scale()` (irrational) call sites.
     assert_eq!(
         a, b,
         "F32: fused-with-scale must be BIT-EXACT vs affine-then-fused-no-scale \
@@ -514,15 +535,28 @@ fn f32_scale_bit_exact_vs_affine_then_unscaled(batch: usize, heads: usize, seq: 
 
 #[test]
 fn softmax_scale_f32_bit_exact_vs_affine_then_unscaled_production_width_2_16_128_128() {
-    f32_scale_bit_exact_vs_affine_then_unscaled(2, 16, 128);
+    f32_scale_bit_exact_vs_affine_then_unscaled(2, 16, 128, PRODUCTION_SCALE);
 }
 
 #[test]
 fn softmax_scale_f32_bit_exact_vs_affine_then_unscaled_production_width_1_16_512_512() {
-    f32_scale_bit_exact_vs_affine_then_unscaled(1, 16, 512);
+    f32_scale_bit_exact_vs_affine_then_unscaled(1, 16, 512, PRODUCTION_SCALE);
 }
 
-fn bf16_scale_max_ulp_diff_vs_affine_then_unscaled(batch: usize, heads: usize, seq: usize) -> i32 {
+/// `head_dim = 128` leg, F32: still BIT-EXACT (see the helper's own doc for
+/// why F32 exactness does not depend on `scale` being a power of two).
+#[test]
+fn softmax_scale_f32_bit_exact_vs_affine_then_unscaled_head_dim_128_production_width_2_16_128_128()
+{
+    f32_scale_bit_exact_vs_affine_then_unscaled(2, 16, 128, head_dim_128_scale());
+}
+
+fn bf16_scale_max_ulp_diff_vs_affine_then_unscaled(
+    batch: usize,
+    heads: usize,
+    seq: usize,
+    scale: f64,
+) -> i32 {
     let device = Device::Cpu;
     let sv = scale_scores_fixture(batch * heads * seq * seq);
     let mv = scale_mask_fixture(batch, seq);
@@ -531,18 +565,13 @@ fn bf16_scale_max_ulp_diff_vs_affine_then_unscaled(batch: usize, heads: usize, s
     let scores = Tensor::from_slice(&sb, (batch, heads, seq, seq), &device).unwrap();
     let mask = Tensor::from_slice(&mb, (batch, 1, seq, seq), &device).unwrap();
 
-    let fused_scaled = softmax_scaled(
-        &scores,
-        &mask,
-        FullyMaskedPolicy::Zeros,
-        PRODUCTION_SCALE as f32,
-    )
-    .unwrap();
+    let fused_scaled =
+        softmax_scaled(&scores, &mask, FullyMaskedPolicy::Zeros, scale as f32).unwrap();
     // `scores.affine(scale, 0.0)` on a BF16 tensor calls candle's OWN
     // `Affine<bf16>` branch (`mul = bf16::from_f64(scale)`, direct
     // f64->bf16, single rounding) -- the TRUE eager rounding path this
     // op's own `scale` field must reproduce (see the module doc).
-    let affined = scores.affine(PRODUCTION_SCALE, 0.0).unwrap();
+    let affined = scores.affine(scale, 0.0).unwrap();
     let affine_then_unscaled = softmax_unscaled(&affined, &mask, FullyMaskedPolicy::Zeros).unwrap();
 
     let a: Vec<bf16> = fused_scaled.flatten_all().unwrap().to_vec1().unwrap();
@@ -570,12 +599,12 @@ fn bf16_scale_max_ulp_diff_vs_affine_then_unscaled(batch: usize, heads: usize, s
 /// path for an exact power of two), so this op is BIT-EXACT vs. the
 /// two-op composition at BF16 too, at production width. This is a
 /// MATHEMATICAL guarantee for THIS scale value, not a general BF16
-/// claim — see `ops::softmax`'s module doc for the double-rounding class
-/// this op discloses for a non-exact scale (not exercised by ModernBERT's
-/// actual configuration, so not asserted here).
+/// claim — see the `head_dim = 128` legs below (and `ops::softmax`'s
+/// module doc) for the double-rounding class this op discloses for a
+/// non-exact scale.
 #[test]
 fn softmax_scale_bf16_bit_exact_vs_affine_then_unscaled_production_width_2_16_128_128() {
-    let max_ulp = bf16_scale_max_ulp_diff_vs_affine_then_unscaled(2, 16, 128);
+    let max_ulp = bf16_scale_max_ulp_diff_vs_affine_then_unscaled(2, 16, 128, PRODUCTION_SCALE);
     eprintln!("MEASURED max bf16 ULP diff (scale rounding vs affine), seq=128: {max_ulp}");
     assert_eq!(
         max_ulp, 0,
@@ -586,12 +615,38 @@ fn softmax_scale_bf16_bit_exact_vs_affine_then_unscaled_production_width_2_16_12
 
 #[test]
 fn softmax_scale_bf16_bit_exact_vs_affine_then_unscaled_production_width_1_16_512_512() {
-    let max_ulp = bf16_scale_max_ulp_diff_vs_affine_then_unscaled(1, 16, 512);
+    let max_ulp = bf16_scale_max_ulp_diff_vs_affine_then_unscaled(1, 16, 512, PRODUCTION_SCALE);
     eprintln!("MEASURED max bf16 ULP diff (scale rounding vs affine), seq=512: {max_ulp}");
     assert_eq!(
         max_ulp, 0,
         "expected BIT-EXACT at head_dim=64 (scale=0.125 is an exact power of two, \
          representable exactly in F32/F64/BF16 alike) -- measured max ULP diff {max_ulp}"
+    );
+}
+
+/// `head_dim = 128` leg, BF16, at PRODUCTION tensor widths (unlike the
+/// small toy `head_dim = 48` fixture below): `1/sqrt(128)` is irrational,
+/// so this DOES exercise the `f64 -> f32 -> bf16` double-rounding vs.
+/// `f64 -> bf16` single-rounding gap the module doc discloses. MEASURED,
+/// not assumed — bounded by the theoretical 1-ULP worst case for a single
+/// extra rounding step, not asserted bit-exact.
+#[test]
+fn softmax_scale_bf16_head_dim_128_bounded_vs_affine_then_unscaled_production_width_2_16_128_128() {
+    let max_ulp = bf16_scale_max_ulp_diff_vs_affine_then_unscaled(2, 16, 128, head_dim_128_scale());
+    eprintln!("MEASURED max bf16 ULP diff (head_dim=128, non-power-of-two), seq=128: {max_ulp}");
+    assert!(
+        max_ulp <= 1,
+        "double-rounding gap larger than the theoretical 1-ULP worst case: {max_ulp}"
+    );
+}
+
+#[test]
+fn softmax_scale_bf16_head_dim_128_bounded_vs_affine_then_unscaled_production_width_1_16_512_512() {
+    let max_ulp = bf16_scale_max_ulp_diff_vs_affine_then_unscaled(1, 16, 512, head_dim_128_scale());
+    eprintln!("MEASURED max bf16 ULP diff (head_dim=128, non-power-of-two), seq=512: {max_ulp}");
+    assert!(
+        max_ulp <= 1,
+        "double-rounding gap larger than the theoretical 1-ULP worst case: {max_ulp}"
     );
 }
 

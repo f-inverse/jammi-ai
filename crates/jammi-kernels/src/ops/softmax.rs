@@ -41,8 +41,8 @@
 //! but the last) may be either `1` (broadcasts: `mask`'s single value along
 //! that axis applies to every position `scores` has there) or exactly equal
 //! to `scores`'s corresponding axis. This covers BOTH shapes ModernBERT's
-//! attention call site actually produces after this commit's call-site
-//! restructuring (see `modernbert.rs`'s `ModernBertAttention::forward`):
+//! attention call site produces (see `modernbert.rs`'s
+//! `ModernBertAttention::forward`):
 //! the padding mask alone, `[batch, 1, 1, seq]` (broadcasts over `heads`
 //! AND the query-row axis), and the padding-mask-plus-sliding-band SUM
 //! precomputed by the call site BEFORE reaching this op, `[batch, 1, seq,
@@ -87,9 +87,9 @@
 //! ## Scale semantics: `scale` is applied to `scores` BEFORE the mask add
 //!
 //! [`SoftmaxLastDimFused::scale`] (construction data, `Copy`, default
-//! `1.0` — every caller/test that predates this field is UNCHANGED,
-//! bit-for-bit, since multiplying by `1.0` is an exact no-op at both F32
-//! and BF16) folds ModernBERT's `1/sqrt(head_dim)` attention scale into
+//! `1.0` — a caller that never sets `scale` observes it as an exact no-op,
+//! bit-for-bit, since multiplying by `1.0` changes no bit at either F32 or
+//! BF16) folds ModernBERT's `1/sqrt(head_dim)` attention scale into
 //! this op, replacing the `scores / sqrt(head_dim)` `Op::Affine` node
 //! `ModernBertAttention::forward`'s training arm used to retain — a full
 //! `[batch, heads, seq, seq]` tape tensor per layer, gone. The op computes
@@ -100,9 +100,10 @@
 //!
 //! ### Reproducing candle's own affine rounding point, exactly
 //!
-//! Before this field existed, the training-arm composition was
-//! `scores.affine(1.0 / sqrt(d), 0.0)` (candle's `Tensor::div(f64)`
-//! bottoms out in `candle-core`'s `cpu_backend::Affine`) followed by the
+//! The eager-fallback branch this op's `scale` field replaces on the
+//! training arm is `scores.affine(1.0 / sqrt(d), 0.0)` (candle's
+//! `Tensor::div(f64)` bottoms out in `candle-core`'s `cpu_backend::Affine`)
+//! followed by the
 //! mask add this op already folds in. `Affine<T>::f` (`cpu_backend/mod.rs`)
 //! computes `mul = T::from_f64(self.0)` ONCE — the scale constant rounded
 //! to the tensor's OWN dtype `T`, never kept at a higher precision — and
@@ -118,17 +119,56 @@
 //! mask_i)`, exactly `softmax_row_bf16`'s pre-existing behavior, unchanged
 //! by this field). This op's `scale: f32` construction data is populated
 //! by the SAME `f64 -> f32` cast `T::from_f64`'s F32 branch performs, so
-//! the F32 kernel path (`softmax_row_f32`/`softmax_fwd_f32`) is bit-exact
-//! by construction (`scale * scores[i]` then `+ mask[i]`, two ordinary F32
-//! ops, no FMA contraction — Rust does not auto-fuse mul+add without an
-//! explicit `mul_add` call, and this op never issues one). The BF16 kernel
-//! path additionally rounds that F32 `scale` value to BF16 once per call
-//! (`bf16::from_f32(self.scale)`), matching `T::from_f64`'s own BF16
-//! branch up to the `f64 -> f32 -> bf16` (double-rounding) vs. `f64 ->
-//! bf16` (single-rounding) gap between the two paths — MEASURED, not
-//! assumed, to be exact at every production `head_dim` this crate ships
-//! (see `tests::bf16_scale_matches_affine_then_mask_add_bit_exact_at_production_head_dims`),
-//! then multiplies-and-rounds each element (`round_bf16(s_i *
+//! the CPU F32 kernel path (`softmax_row_f32`/`softmax_fwd_f32` — this
+//! file's CPU implementation; `softmax_fwd_f32` also names an unrelated
+//! CUDA-arm symbol in `crate::cuda::softmax`, argued separately there) is
+//! bit-exact by construction (`scale * scores[i]` then `+ mask[i]`, two
+//! ordinary F32 ops, no FMA contraction — Rust does not auto-fuse mul+add
+//! without an explicit `mul_add` call, and this op never issues one),
+//! REGARDLESS of whether `scale` happens to be a power of two: this claim
+//! is about matching `T::from_f64`'s OWN rounding point, not about `scale`
+//! being exactly representable, so it holds for ANY finite `scale` — see
+//! `softmax_scale_f32_bit_exact_vs_affine_then_unscaled_production_width_2_16_128_128`/
+//! `..._1_16_512_512` (ModernBERT-large's real `head_dim = 64`, `scale =
+//! 0.125`) AND
+//! `softmax_scale_f32_bit_exact_vs_affine_then_unscaled_head_dim_128_production_width_2_16_128_128`
+//! (`head_dim = 128`, `scale = 1/sqrt(128)`, irrational) in
+//! `tests/oracles.rs`, all three asserting exact equality, not a bound.
+//!
+//! The BF16 kernel path additionally rounds that F32 `scale` value to
+//! BF16 once per call (`bf16::from_f32(self.scale)`), matching
+//! `T::from_f64`'s own BF16 branch up to the `f64 -> f32 -> bf16`
+//! (double-rounding) vs. `f64 -> bf16` (single-rounding) gap between the
+//! two paths. This gap CAN produce a real, nonzero divergence (see the
+//! non-power-of-two disclosure below) — MEASURED, not assumed, per
+//! `head_dim`:
+//! - `head_dim = 64` (`scale = 0.125`, an exact power of two — see
+//!   `PRODUCTION_SCALE` in `tests/oracles.rs`): BIT-EXACT (0 ULP), a
+//!   mathematical guarantee for this exact value, not an empirical
+//!   coincidence — see
+//!   `softmax_scale_bf16_bit_exact_vs_affine_then_unscaled_production_width_2_16_128_128`/
+//!   `..._1_16_512_512`.
+//! - `head_dim = 48` (`scale = 1/sqrt(48)`, irrational — a small,
+//!   non-production toy fixture chosen only to exercise the
+//!   non-power-of-two class at all): MEASURED 0 ULP on the fixture this
+//!   crate ships, bounded `<= 1` ULP by construction (the theoretical
+//!   worst case for one extra rounding step) — see
+//!   `softmax_scale_bf16_non_power_of_two_head_dim_is_measured_not_assumed`.
+//! - `head_dim = 128` (`scale = 1/sqrt(128)`, irrational, the OTHER
+//!   ModernBERT-class value this crate's admission predicate must accept —
+//!   `head_dim = hidden_size / num_attention_heads` need not land on `64`
+//!   for every config), at PRODUCTION tensor widths (`seq` 128 and 512):
+//!   also MEASURED 0 ULP on the fixtures this crate ships, bounded `<= 1`
+//!   ULP by the same construction — see
+//!   `softmax_scale_bf16_head_dim_128_bounded_vs_affine_then_unscaled_production_width_2_16_128_128`/
+//!   `..._1_16_512_512`. Both non-power-of-two legs measuring exactly `0`
+//!   is a property of the SPECIFIC fixtures this crate ships (their
+//!   rounding happened not to straddle a BF16 boundary), not a claim that
+//!   the double-rounding gap can never be observed — the `<= 1` ULP bound
+//!   is what is actually asserted; `0` is what is actually measured, on
+//!   these fixtures, today.
+//!
+//! Every leg above multiplies-and-rounds each element (`round_bf16(s_i *
 //! round_bf16(scale))`) before the existing mask-add rounding runs,
 //! unchanged.
 //!
@@ -199,8 +239,8 @@
 //! `candle_nn::ops::softmax`'s — but only when its caller EXPLICITLY asks
 //! for it via [`FullyMaskedPolicy::Zeros`] (see that type's own doc for
 //! why this is CONSTRUCTION DATA, not an unconditional behavior this op
-//! imposes on every caller): `SoftmaxLastDimFused { fully_masked:
-//! FullyMaskedPolicy::Zeros }` outputs ALL ZEROS on a fully-masked row,
+//! imposes on every caller): `SoftmaxLastDimFused::new(FullyMaskedPolicy::Zeros)`
+//! outputs ALL ZEROS on a fully-masked row,
 //! for every dtype and every masking convention (`-inf` or finite);
 //! `SoftmaxLastDimFused::default()` (`FullyMaskedPolicy::Propagate`)
 //! reproduces `candle_nn::ops::softmax` EXACTLY there instead (dtype-and-
@@ -317,7 +357,7 @@
 //! elimination of the `[B,H,S,S]`-shaped eager intermediates, not the
 //! forward pass's own instruction count — an extra grid-stride pass over
 //! one row (bandwidth-bound, `O(last)`, not `O(last^2)`) is cheap next to
-//! the `S^2`-class memory problem this commit actually targets, so trading
+//! the `S^2`-class memory problem this op actually targets, so trading
 //! a more complex single-pass recurrence for a simpler, already-audited
 //! multi-pass shape is the right tradeoff here. F32 accumulation
 //! throughout (row max and row sum both accumulate in `f32`, matching
@@ -363,19 +403,34 @@
 //! `d(y)/d(pre_softmax)` UNCHANGED — the TWO output slots of `bwd`
 //! therefore diverge once `scale != 1.0`: the slot flowing
 //! back to this op's `scores` ARGUMENT is `SoftmaxBwdDScores`'s raw output
-//! multiplied by `self.scale` (a plain `Tensor::affine(scale, 0.0)` call —
-//! this executes ONCE, eagerly, as part of computing a concrete gradient
-//! `Tensor`; it is not itself tracked on any tape, since `CustomOp2::bwd`'s
-//! own second-order gradient is unsupported here — see
-//! `SoftmaxBwdDScores`'s trailing note), while `dmask` (when `mask.is_variable()`)
+//! multiplied by `self.scale` (a plain `Tensor::affine(scale, 0.0)` call).
+//! CORRECTED (an audit finding): this is NOT untracked. `d_pre_softmax`
+//! comes from `super::apply2` (`CustomOp2::apply_op2`), which attaches an
+//! `Op::CustomOp2` graph node whenever either of ITS inputs (`res`,
+//! `grad_res`) is itself tracked — the ordinary case whenever the original
+//! `scores`/`mask` were `Var`s — so `.affine` on top of it attaches its OWN
+//! `Op::Affine` node the same way any other `Tensor::affine` call would.
+//! What makes this harmless rather than a leak is candle's OWN backward
+//! machinery, not an untracked computation: `Tensor::backward`'s node walk
+//! (`backprop.rs`) processes `bwd`'s RETURNED gradient tensors as terminal
+//! values for that walk — nothing in this crate (or any call site it
+//! ships) ever calls `.backward()` on a gradient tensor a PRIOR `.backward()`
+//! call already produced, so the `Op::Affine` node this `.affine` call
+//! creates is built, read once by the OUTER `backward()` call that is
+//! already in progress, and then dropped along with the rest of that
+//! call's intermediate graph — never differentiated a second time. This
+//! crate does not implement `CustomOp2::bwd` for `SoftmaxBwdDScores`
+//! itself (see its trailing note) precisely because a genuine second-order
+//! gradient THROUGH this tracked node is unsupported; the node's mere
+//! EXISTENCE on the tape, however, is real, not absent, while `bwd` is
+//! executing. `dmask` (when `mask.is_variable()`)
 //! is computed from the RAW, UNSCALED `d(y)/d(pre_softmax)` via
-//! [`mask_grad`], exactly as before this field existed. When `scale` EQUALS
-//! the identity value (every pre-existing caller, and the CPU/CUDA-arm-
-//! agnostic default) the multiply is skipped entirely — an exact `f32`
-//! equality check, not an approximate one, since the identity value has a
-//! single, exact bit pattern — so `dscores` is IDENTICAL to
-//! `SoftmaxBwdDScores`'s raw output, bit-for-bit, on every call site that
-//! predates this field.
+//! [`mask_grad`], unaffected by `scale`. When `scale` EQUALS the identity
+//! value (`1.0`, the CPU/CUDA-arm-agnostic default) the multiply is
+//! skipped entirely — an exact `f32` equality check, not an approximate
+//! one, since the identity value has a single, exact bit pattern — so
+//! `dscores` is IDENTICAL to `SoftmaxBwdDScores`'s raw output, bit-for-bit,
+//! on every caller that leaves `scale` at its default.
 //!
 //! `dscores`'s slot is ALWAYS `Some` (the same "may be an intermediate on a
 //! path to a `Var`" rule `LayerNormFused`'s `dx` and `RopeFused`'s `dx`
@@ -395,23 +450,21 @@
 //!
 //! ## esc-037 disposition
 //!
-//! esc-037 (`.jammi/escapes.jsonl`) names TWO backward-truncating APIs:
-//! `candle_nn::ops::softmax_last_dim` (`apply_op1_no_bwd`), reached by
-//! every call site through `jammi_encoders::attention::attention_softmax`
-//! (`crates/jammi-encoders/src/open_clip_vision.rs`, `clip_text.rs`, and
-//! `htsat_audio.rs` all route through it); and `QMatMul` (`candle-core`'s
-//! `quantized/mod.rs:1023`), the natural entry point for quantized
-//! fine-tuning. [`SoftmaxLastDimFused`] is a DIFFERENT operator entirely —
-//! a `CustomOp2` with a REAL `bwd` (this module), dispatched via
-//! `super::apply2` (never `apply_op2_no_bwd`) — and it is wired at a
-//! DIFFERENT call site (ModernBERT's attention softmax, which today uses
-//! `candle_nn::ops::softmax`, an ordinary composed-and-differentiable
-//! function, not `softmax_last_dim` or `attention_softmax`). This commit
-//! therefore does not make esc-037's named observable impossible on ANY of
-//! the paths it names — `attention_softmax`'s call sites are untouched,
-//! `QMatMul` is untouched entirely, and neither reaches this op.
-//! `closes_escape` is NOT claimed; esc-037 remains fully open for BOTH
-//! `attention_softmax`'s call sites AND `QMatMul`. (This op's OWN
+//! CORRECTED (an audit finding: the previous wording here cited a call
+//! path and file layout that exist only on a different, unmerged branch —
+//! rewritten to name only what is true regardless of which branch this
+//! file is read from). esc-037 (`.jammi/escapes.jsonl`) names TWO
+//! backward-truncating APIs: `candle_nn::ops::softmax_last_dim`
+//! (`apply_op1_no_bwd`) and `QMatMul`, the natural entry point for
+//! quantized fine-tuning. esc-037's `softmax_last_dim` call sites live in
+//! `jammi-encoders`' CLIP-text, HTSAT, and OpenCLIP-vision attention
+//! forwards. [`SoftmaxLastDimFused`] is a DIFFERENT operator entirely — a
+//! `CustomOp2` with a REAL `bwd` (this module), dispatched via
+//! `super::apply2` (never `apply_op2_no_bwd`) — wired ONLY at ModernBERT's
+//! training arm, a call site `softmax_last_dim`'s callers above do not
+//! share and this op does not touch. `closes_escape` is NOT claimed here:
+//! esc-037 remains open for both the `softmax_last_dim` call sites above
+//! and `QMatMul`, neither of which this op reaches. (This op's OWN
 //! existence is also not a new instance of esc-037's hazard class: it
 //! never uses `apply_op2_no_bwd`, so nothing upstream of it silently loses
 //! its gradient the way esc-037 describes.)
@@ -443,6 +496,22 @@
 //! both uniformly across devices (the LayerNorm/RoPE admission-predicate
 //! precedent) so a real training run never depends on which device
 //! happens to accept a wider domain.
+//!
+//! `scale` (construction data, see [`SoftmaxLastDimFused::scale`]'s own
+//! doc) has a domain of its own: finite and strictly positive.
+//! [`SoftmaxLastDimFused::with_scale`] is the ONLY sanctioned constructor
+//! for a non-default `scale` and validates this, returning
+//! [`crate::error::KernelError::InvalidScale`] rather than accepting `0.0`
+//! (which would silently zero out `scores`'s own contribution to
+//! `pre_softmax`, making the op confidently compute a uniform-over-
+//! unmasked-positions distribution instead of erroring), a negative value
+//! (no meaning as an attention scale), or `NaN`/`±inf` (poisons every
+//! downstream reduction). This is NOT re-checked inside `cpu_fwd`/
+//! `cuda_fwd` — by the time either runs, `scale` is frozen, already-
+//! validated construction data, exactly like every other domain check in
+//! this crate that runs once at the edge rather than per-call. A caller
+//! that constructs the struct literal directly (the field remains `pub`)
+//! bypasses this validation and is responsible for its own domain check.
 
 use candle_core::backend::BackendStorage;
 use candle_core::{CpuStorage, CustomOp2, Error, Layout, Result, Shape, Tensor};
@@ -647,11 +716,12 @@ pub struct SoftmaxLastDimFused {
     /// at runtime against any tensor's own state.
     pub fully_masked: FullyMaskedPolicy,
     /// Multiplicative scale applied to `scores` BEFORE the mask add — see
-    /// the module doc's "scale semantics" section. Construction data,
-    /// `Copy`, exactly like `fully_masked`. Default `1.0`, an EXACT no-op
-    /// at every dtype this op implements (multiplying by `1.0` changes no
-    /// bit, F32 or BF16), so every caller/test that predates this field is
-    /// unchanged, bit-for-bit.
+    /// the module doc's "scale semantics" section, and its own domain
+    /// (family D) via [`SoftmaxLastDimFused::with_scale`]. Construction
+    /// data, `Copy`, exactly like `fully_masked`. Default `1.0`, an EXACT
+    /// no-op at every dtype this op implements (multiplying by `1.0`
+    /// changes no bit, F32 or BF16), so a caller that leaves this at its
+    /// default is unaffected, bit-for-bit.
     pub scale: f32,
 }
 
@@ -667,10 +737,31 @@ impl SoftmaxLastDimFused {
 
     /// Sets [`Self::scale`]. Consumes and returns `self` (this op is
     /// `Copy`, so this is a cheap by-value builder, not a mutation any
-    /// caller could observe aliasing through).
-    pub fn with_scale(mut self, scale: f32) -> Self {
+    /// caller could observe aliasing through) — `Result`, not infallible,
+    /// because `scale` has a real domain (family D): it must be finite and
+    /// strictly positive, or [`KernelError::InvalidScale`] is returned
+    /// rather than accepted. `0.0` in particular is NOT a safe default to
+    /// silently accept: `scale * scores == 0` everywhere makes `pre_softmax
+    /// == mask`, so the op would confidently compute a UNIFORM-over-
+    /// unmasked-positions attention distribution that discards every real
+    /// score — a wrong number, not an error, exactly the failure mode
+    /// family D exists to rule out. A negative scale is equally meaningless
+    /// (attention weight is not defined for a sign-flipped logit scale),
+    /// and `NaN`/`±inf` poison every downstream reduction. This check is
+    /// NOT re-run inside `cpu_fwd`/`cuda_fwd`: `scale` is frozen,
+    /// already-validated construction data by the time either runs (the
+    /// same "validated once, at the domain edge, not on every call" shape
+    /// [`crate::ops::rope`]'s `rope_dims` documents), so a caller that
+    /// bypasses this constructor entirely (constructing the struct
+    /// literal directly, which remains possible since the field is `pub`)
+    /// is responsible for its own domain check — exactly like every other
+    /// `pub` construction-data field in this crate.
+    pub fn with_scale(mut self, scale: f32) -> crate::error::Result<Self> {
+        if !(scale.is_finite() && scale > 0.0) {
+            return Err(crate::error::KernelError::InvalidScale { scale });
+        }
         self.scale = scale;
-        self
+        Ok(self)
     }
 }
 
@@ -954,11 +1045,15 @@ fn softmax_row_f32(
     }
 }
 
-// `scale` (the fold-in-scale change) pushed this over clippy's default
-// 7-argument ceiling; every argument here is already load-bearing (no
-// grab-bag "options" struct would clarify anything a positional list of
-// row/shape/policy/scale scalars does not already say directly) — the
-// same call this crate's other internal `*_fwd_*` helpers make.
+// CORRECTED (an audit finding): the previous justification here claimed
+// this matches "the same call this crate's other internal `*_fwd_*`
+// helpers make" — checked and FALSE; no other function in this crate
+// carries this allow. `scale` (the fold-in-scale change) pushed THIS
+// function specifically over clippy's default 7-argument ceiling; every
+// argument here is already load-bearing (no grab-bag "options" struct
+// would clarify anything a positional list of row/shape/policy/scale
+// scalars does not already say directly), so the allow is kept, with its
+// real justification stated honestly rather than a false precedent.
 #[allow(clippy::too_many_arguments)]
 fn softmax_fwd_f32(
     scores: &[f32],
@@ -1153,6 +1248,40 @@ mod tests {
 
     fn eager(scores: &Tensor, mask: &Tensor) -> Result<Tensor> {
         candle_nn::ops::softmax(&scores.broadcast_add(mask)?, candle_core::D::Minus1)
+    }
+
+    // -------------------------------------------------------------------
+    // `with_scale`'s own domain (family D): finite and strictly positive.
+    // -------------------------------------------------------------------
+    #[test]
+    fn with_scale_refuses_zero_negative_nan_and_infinite() {
+        for bad in [0.0f32, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let err = SoftmaxLastDimFused::default()
+                .with_scale(bad)
+                .expect_err(&format!("scale={bad} must be refused"));
+            match err {
+                crate::error::KernelError::InvalidScale { scale } => {
+                    // `NaN != NaN`, so compare bit patterns instead of `==`
+                    // for the NaN case; every other case is an exact value.
+                    assert!(
+                        scale.to_bits() == bad.to_bits() || (scale.is_nan() && bad.is_nan()),
+                        "InvalidScale should carry the refused value: {scale} vs {bad}"
+                    );
+                }
+                other => panic!("expected InvalidScale, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn with_scale_accepts_the_real_production_value() {
+        // `0.125 == 1/sqrt(64)`, ModernBERT-large's real head_dim -- the
+        // positive control proving this domain check does not also reject
+        // the value production actually uses.
+        let op = SoftmaxLastDimFused::default()
+            .with_scale(0.125)
+            .expect("0.125 must be accepted");
+        assert_eq!(op.scale, 0.125);
     }
 
     // -------------------------------------------------------------------
@@ -1850,8 +1979,9 @@ mod tests {
         bf16_width_case(128, 3e-3, 2.8e-2);
     }
 
-    /// MEASURED at `last = 512` (the quadratic-regime `seq` the
-    /// fused-kernels plan names as this commit's actual target): max|delta|
+    /// MEASURED at `last = 512` (the quadratic-regime `seq` this op's
+    /// actual memory target — see the module doc's "why fold the mask in
+    /// at all" section): max|delta|
     /// fwd = `3.9673e-4`, bwd = `4.425e-3`. See `..._128`'s doc for why
     /// these bounds are measured-plus-margin, not a scaling formula.
     #[test]

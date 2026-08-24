@@ -1537,8 +1537,14 @@ mod tests {
         (sp == 1 && sq == p)
     }
 
-    /// Every 2D operand `bwd` hands `Tensor::matmul` — forward's own
-    /// slices were already proven admissible by construction (module
+    /// Every 2D operand `bwd` hands `Tensor::matmul` — ALL SEVEN backward
+    /// GEMMs (`h = xd @ A^T`, `dB = d_lora^T @ h`, `g = d_lora @ B`,
+    /// `dA^T = xd^T @ g`, `d_xd = g @ A`, `dx_base = dy @ w`, `dw = dy^T @
+    /// x` — see the module doc's backward enumeration), not merely the
+    /// five reducing over `inf`/`rank` — the base branch's `dx_base`/`dw`
+    /// reduce over `outf`/`rows` instead, a DIFFERENT `(b, m, n, k)` shape
+    /// this test was previously silent on (round-2 audit A8). Forward's
+    /// own slices were already proven admissible by construction (module
     /// doc); this test proves EVERY BACKWARD product is too, at `rank`
     /// 1/2/3 (this op's own domain boundary — `rank >= 1`) and at
     /// production width (a transformer-encoder-scale `in=1024`). Reconstructs
@@ -1562,6 +1568,15 @@ mod tests {
             let ab = Tensor::cat(&[&a.t().unwrap(), &b], 0).unwrap();
             let xd_2d = Tensor::randn(0f32, 1.0, (rows, inf), &device).unwrap();
             let d_lora_2d = Tensor::randn(0f32, 1.0, (rows, outf), &device).unwrap();
+            // (A8, round-2 audit): the base branch's own two GEMMs
+            // (`dx_base = dy @ w`, `dw = dy^T @ x`) were the two missing
+            // from this test — every OTHER GEMM `bwd` issues was already
+            // covered above, but these two are a DIFFERENT (b, m, n, k)
+            // shape (reducing over `outf`/`rows` instead of `inf`/`rank`)
+            // and were never independently proven admissible.
+            let w = Tensor::randn(0f32, 1.0, (outf, inf), &device).unwrap();
+            let dy_base_2d = Tensor::randn(0f32, 1.0, (rows, outf), &device).unwrap();
+            let x_base_2d = Tensor::randn(0f32, 1.0, (rows, inf), &device).unwrap();
 
             // ab's own slices (mirrors bwd's `a_t`/`b`).
             let a_t = ab.narrow(0, 0, inf).unwrap();
@@ -1624,6 +1639,29 @@ mod tests {
                 "d_xd = g @ A: rhs A at rank={r}"
             );
             let _d_xd = g.matmul(&a_t_t).unwrap();
+
+            // dx_base = dy @ w: lhs dy_base_2d, rhs w.
+            assert!(
+                is_gemm_operand_admissible(dy_base_2d.layout()),
+                "dx_base = dy @ w: lhs dy at rank={r}"
+            );
+            assert!(
+                is_gemm_operand_admissible(w.layout()),
+                "dx_base = dy @ w: rhs w at rank={r}"
+            );
+            let _dx_base = dy_base_2d.matmul(&w).unwrap();
+
+            // dw = dy^T @ x: lhs dy_base_2d.t(), rhs x_base_2d.
+            let dy_base_t = dy_base_2d.t().unwrap();
+            assert!(
+                is_gemm_operand_admissible(dy_base_t.layout()),
+                "dw = dy^T @ x: lhs dy^T at rank={r}"
+            );
+            assert!(
+                is_gemm_operand_admissible(x_base_2d.layout()),
+                "dw = dy^T @ x: rhs x at rank={r}"
+            );
+            let _dw = dy_base_t.matmul(&x_base_2d).unwrap();
         }
     }
 

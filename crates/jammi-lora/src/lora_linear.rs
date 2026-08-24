@@ -129,6 +129,39 @@ fn eager_epilogue(base_out: &Tensor, lora_out: &Tensor, scaling: f64) -> Result<
     Ok((base_out + &scaled_cast)?)
 }
 
+/// The effective LoRA scaling factor `γ_r` applied to `B @ A @ x` before it is
+/// added to the frozen base output.
+///
+/// Vanilla LoRA (Hu et al. 2021) uses `γ_r = alpha / rank`. rsLoRA
+/// (Kalajdzievski 2023, arXiv:2312.03732, §3, eq. "γ_r = α/√r") instead uses
+/// `γ_r = alpha / sqrt(rank)` — chosen so the per-update variance stays
+/// bounded as `rank` grows, which vanilla scaling does not. This matches
+/// PEFT's own reference implementation
+/// (`src/peft/tuners/lora/layer.py`, `LoraLayer.update_layer`):
+/// `self.scaling[adapter_name] = lora_alpha / math.sqrt(r) if use_rslora
+/// else lora_alpha / r`.
+///
+/// Scaling is a pure function of `(alpha, rank, use_rslora)` — nothing else
+/// determines it, and every constructor of [`LoraLinear`] (both a fresh
+/// `new` and a `from_loaded` reconstruction from a saved adapter) MUST route
+/// through this one function so the two can never silently disagree.
+///
+/// Domain (family D / K2): `rank` must be `>= 1`. At `rank == 0` both
+/// branches divide by zero (`alpha / 0` is `+inf`/`-inf`/`NaN` in f64, never
+/// a `DivisionByZero` panic) — a confident wrong number, not a loud failure
+/// — so this is refused with a typed [`LoraError::Config`] rather than
+/// silently returned.
+pub fn lora_scaling(alpha: f64, rank: usize, use_rslora: bool) -> Result<f64, LoraError> {
+    if rank == 0 {
+        return Err(LoraError::Config("LoRA rank must be > 0".into()));
+    }
+    Ok(if use_rslora {
+        alpha / (rank as f64).sqrt()
+    } else {
+        alpha / rank as f64
+    })
+}
+
 /// Overwrite the storage of the `Var` already registered at `name` in `varmap`
 /// with `value`, reaching it through the shared `&VarMap` (no `&mut` needed
 /// because `Var::set` is `&self`). Fails if no such `Var` exists — the caller
@@ -288,11 +321,10 @@ impl LoraLinear {
             }
         }
 
-        let scaling = if use_rslora {
-            alpha / (rank as f64).sqrt()
-        } else {
-            alpha / rank as f64
-        };
+        // `rank == 0` was already refused above, but `lora_scaling` is the
+        // single source of truth for the scaling math (`from_loaded` below
+        // routes through the same function) — see its own doc.
+        let scaling = lora_scaling(alpha, rank, use_rslora)?;
 
         let dropout_masks = dropout
             .filter(|p| *p > 0.0)
@@ -334,14 +366,27 @@ impl LoraLinear {
 
     /// Reconstruct a `LoraLinear` from tensors already loaded from disk.
     ///
-    /// Scaling is derived as `alpha / rank` where rank is inferred from
-    /// `lora_a.dims()[0]`. RSLoRA scaling is intentionally not represented
-    /// here because callers reconstructing from disk always know the
-    /// effective scaling implied by the saved adapter.
-    pub fn from_loaded(base: Linear, lora_a: Tensor, lora_b: Tensor, alpha: f64) -> Self {
+    /// `rank` is inferred from `lora_a.dims()[0]`; scaling is [`lora_scaling`]
+    /// of `(alpha, rank, use_rslora)` — the SAME pure function `new` calls,
+    /// so a reload can never silently disagree with the run that trained the
+    /// adapter. The invariant is that scaling is entirely determined by the
+    /// persisted `(alpha, rank, use_rslora)` triple: the caller must pass
+    /// the `use_rslora` the adapter was actually trained with (typically
+    /// read back from the adapter's own [`crate::AdapterConfig::use_rslora`]),
+    /// not assume vanilla scaling.
+    ///
+    /// Refuses (typed, [`LoraError::Config`]) when `lora_a.dims()[0] == 0` —
+    /// see [`lora_scaling`]'s domain doc.
+    pub fn from_loaded(
+        base: Linear,
+        lora_a: Tensor,
+        lora_b: Tensor,
+        alpha: f64,
+        use_rslora: bool,
+    ) -> Result<Self, LoraError> {
         let rank = lora_a.dims()[0];
-        let scaling = alpha / rank as f64;
-        Self {
+        let scaling = lora_scaling(alpha, rank, use_rslora)?;
+        Ok(Self {
             base,
             lora_a,
             lora_b,
@@ -349,7 +394,16 @@ impl LoraLinear {
             dropout: None,
             dropout_masks: None,
             training: false,
-        }
+        })
+    }
+
+    /// The effective LoRA scaling factor this layer applies — see
+    /// [`lora_scaling`]'s doc for what determines it. A pure read of the
+    /// value computed at construction (`new` or `from_loaded`), useful for
+    /// tests and diagnostics that need to confirm the two constructors agree
+    /// bit-for-bit without re-deriving it from a forward pass.
+    pub fn scaling(&self) -> f64 {
+        self.scaling
     }
 
     /// Toggle training mode. When `false`, dropout in the LoRA path is skipped
@@ -521,5 +575,70 @@ impl LoraLinear {
             masks.restore_position(position);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod lora_scaling_tests {
+    use super::lora_scaling;
+
+    /// Table-driven, bit-exact pin of [`lora_scaling`] against its two
+    /// documented formulas (vanilla `alpha/rank`, rsLoRA `alpha/sqrt(rank)`)
+    /// — the numpy-first oracle here is the closed-form arithmetic itself,
+    /// computed independently of the function under test on each row.
+    #[test]
+    fn table_pins_vanilla_and_rslora_formulas_bit_exact() {
+        let cases: &[(f64, usize, bool)] = &[
+            (8.0, 4, false),
+            (8.0, 4, true),
+            (16.0, 8, false),
+            (16.0, 8, true),
+            (1.0, 1, false),
+            (1.0, 1, true),
+            (32.0, 16, false),
+            (32.0, 16, true),
+            (0.0, 4, false), // alpha == 0 is a valid, if inert, scaling.
+            (0.0, 4, true),
+        ];
+        for &(alpha, rank, use_rslora) in cases {
+            let expected = if use_rslora {
+                alpha / (rank as f64).sqrt()
+            } else {
+                alpha / rank as f64
+            };
+            let got = lora_scaling(alpha, rank, use_rslora).unwrap();
+            assert_eq!(
+                got.to_bits(),
+                expected.to_bits(),
+                "alpha={alpha} rank={rank} use_rslora={use_rslora}: got {got}, expected {expected}"
+            );
+        }
+    }
+
+    /// Domain boundary (family D / K2): `rank == 0` must be a typed refusal,
+    /// not `alpha / 0` silently propagating as `inf`/`NaN`. Both `use_rslora`
+    /// arms are checked so neither the vanilla nor the rsLoRA branch is
+    /// reachable with a zero rank.
+    #[test]
+    fn rank_zero_is_a_typed_refusal_both_arms() {
+        for use_rslora in [false, true] {
+            let err = lora_scaling(8.0, 0, use_rslora).unwrap_err();
+            assert!(
+                matches!(err, crate::error::LoraError::Config(_)),
+                "expected a Config refusal for rank=0, got {err:?}"
+            );
+        }
+    }
+
+    /// Non-finite `alpha` (family F non-vacuity: a naive `> c` bound is
+    /// `false` for `NaN`, so this asserts on the actual bit pattern instead
+    /// of a comparison a `NaN` could vacuously dodge) propagates as a
+    /// `NaN`/`inf` scaling rather than being silently coerced — `rank`, not
+    /// `alpha`, is this function's validated domain edge; a caller passing a
+    /// non-finite `alpha` gets a non-finite scaling back, visibly.
+    #[test]
+    fn non_finite_alpha_propagates_visibly_not_silently() {
+        let got = lora_scaling(f64::NAN, 4, false).unwrap();
+        assert!(got.is_nan(), "NaN alpha must yield a visible NaN scaling");
     }
 }

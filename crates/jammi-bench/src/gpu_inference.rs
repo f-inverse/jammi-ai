@@ -19,7 +19,7 @@
 //! Both verbs are measured. The embedding forward is the primary GPU workload
 //! open optimizations target (the encoder forward, its precision, its
 //! attention kernel); the classification (`infer`) lane serves the same
-//! `tiny_modernbert_classifier` bundle the `gpu_capability` suite's
+//! `tiny_modernbert_classifier` bundle the gpu_capability test binary's
 //! `classification_parity` cell already establishes as a validated GPU path
 //! (CPU↔GPU parity hard-gated there), so measuring its throughput/latency here
 //! is no longer premature.
@@ -33,7 +33,7 @@
 //! absolute floor against that fleet gates pod variance, not a code regression.
 //!
 //! CPU↔GPU parity *is* a device-independent property of the code, and is
-//! hard-gated in the separate `gpu_capability` suite, not here: the served
+//! hard-gated in the separate gpu_capability test binary, not here: the served
 //! output must fall within tolerance of the CPU path. Cross-repeat
 //! determinism is not a hard gate anywhere in this codebase — GPU float
 //! bit-equality across repeats is not a property this codebase asserts — so
@@ -138,8 +138,8 @@ async fn measure_embed_lane(
 
 /// Assert a classification serve scored every corpus row — row conservation is
 /// a correctness property, not a perf one. `infer`'s per-row annotate semantics
-/// silently drop a row whose forward errored (the RoPE-contiguity bug
-/// `gpu_capability`'s `classification_parity` regression-guards CPU↔GPU), so a
+/// silently drop a row whose forward errored (the RoPE-contiguity bug the
+/// gpu_capability test binary's `classification_parity` regression-guards CPU↔GPU), so a
 /// scored count short of the corpus size is real data loss and must fail the
 /// tier loudly rather than ride as a smaller-but-quietly-accepted rate.
 fn assert_row_conservation(scored_rows: usize, expected_rows: usize) -> Result<(), Box<dyn Error>> {

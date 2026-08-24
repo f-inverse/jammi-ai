@@ -12,3 +12,9 @@
 # see the PR that added this gate for the full list) too large to triage in
 # one PR. As the backfill retires each pre-existing citation (fix the name, or
 # allowlist it here with a reason), add its line below.
+
+schema_force_view_types  # datafusion (direct dep) ParquetOptions field — jammi-bench/src/corpus.rs cites the real upstream schema-inference knob.
+float_roundtrip          # serde_json cargo feature name — jammi-bench/src/fixture.rs cites it to explain why floats are spliced as raw JSON, not reparsed.
+to_string_pretty         # serde_json::to_string_pretty, a free-function (not `.method()`-shaped) call — jammi-bench/src/fixture.rs.
+unnecessary_cast         # clippy lint name — jammi-bench/src/search_rss.rs explains why `widen()` avoids tripping it.
+useless_conversion       # clippy lint name — jammi-bench/src/search_rss.rs explains why `widen()` avoids tripping it.

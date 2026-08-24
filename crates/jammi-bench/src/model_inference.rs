@@ -444,8 +444,8 @@ pub(crate) async fn serve_infer(
 ///
 /// The scored-row count is the row-conservation signal a caller needs: `infer`'s
 /// per-row annotate semantics can silently drop a row whose forward errored (the
-/// regression `gpu_capability`'s `classification_parity` guards on CPU↔GPU
-/// output), so a caller comparing this count against the input row count catches
+/// regression the gpu_capability test binary's `classification_parity` guards on
+/// CPU↔GPU output), so a caller comparing this count against the input row count catches
 /// that same class of silent data loss on whichever device it served.
 pub(crate) async fn serve_infer_all(
     session: &Arc<InferenceSession>,

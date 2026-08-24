@@ -1222,7 +1222,7 @@ pub struct FinetuneStepTier {
 /// non-zero); (2) the classification lane's scored row count matches the
 /// corpus row count on every serve (row conservation — [`GpuLane::rows`]).
 /// Cross-repeat determinism and CPU↔GPU parity are hard-gated separately, in
-/// the `gpu_capability` suite.
+/// the gpu_capability test binary.
 ///
 /// The report is emitted as one stable JSON document (`Report` →
 /// `tiers.gpu_inference`, printed by `emit()`): `device`, `device_name`,

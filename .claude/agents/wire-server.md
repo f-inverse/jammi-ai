@@ -36,7 +36,7 @@ You are a subagent. Every "user" message is your caller (the lead). The lead see
 
 ## Acceptance
 
-Run CI's exact full gate for each touched crate, capturing `$?` per step (no pipe-masking): `cargo fmt -p <crate> --check` · `cargo clippy -p <crate> --all-targets -- -D warnings` · `cargo test -p <crate>`. **When the change adds or alters a wire RPC, run every touched crate's it-suite** — the tenant-isolation (cross-tenant-denial) and embedded⇄remote parity oracles live there, not in unit tests.
+Run CI's exact full gate for each touched crate, capturing `$?` per step (no pipe-masking): `cargo fmt -p <crate> --check` · `cargo clippy -p <crate> --all-targets -- -D warnings` · `cargo test -p <crate>`. **When the change adds or alters a wire RPC, run every touched crate's it-suite** — the tenant-isolation (cross-tenant-denial) and embedded⇄remote parity oracles live there, not in unit tests. Also run the Docs CI lane's rustdoc gate per touched crate — `RUSTDOCFLAGS="-D warnings" cargo doc -p <crate> --no-deps` — for each of `jammi-wire`, `jammi-admin`, `jammi-client`, `jammi-server` the change spans, and confirm it exits 0 (`.github/workflows/docs.yml`'s Docs lane runs this over the whole workspace; a public doc comment that intra-doc-links a private item fails it — convert the link to a backtick code span, never a doc-hidden bypass, per 7fd457e). When a shared-declaration file (`lib.rs`/`Cargo.toml`/`error.rs`) is touched, also run the workspace form: `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --exclude jammi-python --no-deps`.
 
 ## Hand-off
 
@@ -49,7 +49,8 @@ Run CI's exact full gate for each touched crate, capturing `$?` per step (no pip
   "acceptance_runs": [
     { "cmd": "cargo fmt -p jammi-server --check", "exit": 0 },
     { "cmd": "cargo clippy -p jammi-server --all-targets -- -D warnings", "exit": 0 },
-    { "cmd": "cargo test -p jammi-server", "exit": 0 }
+    { "cmd": "cargo test -p jammi-server", "exit": 0 },
+    { "cmd": "RUSTDOCFLAGS=\"-D warnings\" cargo doc -p jammi-server --no-deps", "exit": 0 }
   ],
   "blockers": [],
   "scope_amendments": []

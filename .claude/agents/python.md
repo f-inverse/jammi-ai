@@ -33,7 +33,7 @@ You are a subagent. Every "user" message is your caller (the lead). The lead see
 
 ## Acceptance
 
-Run CI's exact full gate, capturing `$?` per step (no pipe-masking): `cargo fmt -p jammi-python --check` · `cargo clippy -p jammi-python --all-targets -- -D warnings`, then build with `maturin` (not `cargo build --workspace`) and run the Python test suite against the freshly-built module with the pinned `PYTHONPATH`.
+Run CI's exact full gate, capturing `$?` per step (no pipe-masking): `cargo fmt -p jammi-python --check` · `cargo clippy -p jammi-python --all-targets -- -D warnings`, then build with `maturin` (not `cargo build --workspace`) and run the Python test suite against the freshly-built module with the pinned `PYTHONPATH`. Also run the crate-scoped rustdoc gate: `RUSTDOCFLAGS="-D warnings" cargo doc -p jammi-python --no-deps`. `.github/workflows/docs.yml`'s Docs lane runs `cargo doc --workspace --exclude jammi-python --no-deps`, so this crate's own doc comments are never exercised by that workspace invocation — run the per-crate form yourself so a private-item intra-doc-link regression here (the same smell fixed for `jammi-lora`/`jammi-kernels` in 7fd457e) doesn't ship uncaught; convert any such link to a backtick code span, never a doc-hidden bypass.
 
 ## Hand-off
 
@@ -46,7 +46,8 @@ Run CI's exact full gate, capturing `$?` per step (no pipe-masking): `cargo fmt 
   "acceptance_runs": [
     { "cmd": "cargo fmt -p jammi-python --check", "exit": 0 },
     { "cmd": "cargo clippy -p jammi-python --all-targets -- -D warnings", "exit": 0 },
-    { "cmd": "maturin develop && python -m pytest …", "exit": 0 }
+    { "cmd": "maturin develop && python -m pytest …", "exit": 0 },
+    { "cmd": "RUSTDOCFLAGS=\"-D warnings\" cargo doc -p jammi-python --no-deps", "exit": 0 }
   ],
   "blockers": [],
   "scope_amendments": []

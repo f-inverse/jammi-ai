@@ -29,7 +29,8 @@ use crate::job::PyTrainingJob;
 /// shared tokio runtime. Exposed to Python as `_NativeDatabase`: the thin Python
 /// `EmbeddedBackend` wrapper (in `jammi/_embedded.py`) holds one of these and is the
 /// user-facing surface. Every verb here is the embedded implementation the
-/// wrapper delegates to — directly (via `__getattr__`) for the verbs whose
+/// wrapper delegates to — an explicit, same-named method call (there is no
+/// attribute-forwarding magic method on the wrapper) for the verbs whose
 /// request is still assembled in Rust, and through the shared proto seam
 /// (`_start_training_proto`) for the training verbs whose kwargs→request
 /// assembly has moved into the pure-Python layer shared with the remote client.

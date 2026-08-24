@@ -28,11 +28,11 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use candle_core::{DType, Device, Module, Tensor, D};
 use candle_nn::{embedding, linear_no_bias, Embedding, VarBuilder, VarMap};
-use jammi_kernels::admission::{admit, DispatchCounters, DispatchOutcome};
+use jammi_kernels::admission::{admit, counters_for, DispatchCounters, DispatchOutcome};
 use jammi_kernels::ops::{
     apply1, apply2, apply3, RopeFused, SoftmaxLastDimFused, MAX_HEAD_DIM, MAX_LAST_DIM, MAX_RANK,
 };
@@ -123,24 +123,30 @@ impl ModernBertConfig {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Fused/eager dispatch counters for the ModernBERT RoPE application,
-/// mirroring `crate::layer_norm::LN_DISPATCH_COUNTERS` — see this
-/// module's "RoPE: table hoisting + fused rotate-half" doc section for
-/// the training-only gate this counts. `pub(crate)` (not `pub`) — read via
-/// [`crate::rope_dispatch_snapshot`], the same shape
+/// read from `jammi_kernels::admission`'s op-keyed registry — see
+/// `crate::layer_norm::LN_DISPATCH_COUNTERS`'s doc for why this is a
+/// `LazyLock` over `counters_for`, not a directly-owned
+/// `static DispatchCounters` (this migration's rationale in full), and
+/// this module's "RoPE: table hoisting + fused rotate-half" doc section
+/// for the training-only gate this counts. `pub(crate)` (not `pub`) — read
+/// via [`crate::rope_dispatch_snapshot`], the same shape
 /// [`crate::ln_dispatch_snapshot`] uses.
-pub(crate) static ROPE_DISPATCH_COUNTERS: DispatchCounters = DispatchCounters::new();
+pub(crate) static ROPE_DISPATCH_COUNTERS: LazyLock<&'static DispatchCounters> =
+    LazyLock::new(|| counters_for("rope_fused"));
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Fused masked softmax (C4)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Fused/eager dispatch counters for the ModernBERT attention softmax,
-/// mirroring `ROPE_DISPATCH_COUNTERS` / `crate::layer_norm::LN_DISPATCH_COUNTERS`
-/// — see `ModernBertAttention::softmax_apply`'s doc for the training-only
-/// gate this counts. `pub(crate)` (not `pub`) — read via
+/// read from the registry — mirroring `ROPE_DISPATCH_COUNTERS` /
+/// `crate::layer_norm::LN_DISPATCH_COUNTERS` — see
+/// `ModernBertAttention::softmax_apply`'s doc for the training-only gate
+/// this counts. `pub(crate)` (not `pub`) — read via
 /// [`crate::softmax_dispatch_snapshot`], the same shape
 /// [`crate::rope_dispatch_snapshot`] / [`crate::ln_dispatch_snapshot`] use.
-pub(crate) static SOFTMAX_DISPATCH_COUNTERS: DispatchCounters = DispatchCounters::new();
+pub(crate) static SOFTMAX_DISPATCH_COUNTERS: LazyLock<&'static DispatchCounters> =
+    LazyLock::new(|| counters_for("softmax_last_dim_fused"));
 
 /// The fused masked-softmax kernel's domain, checked at the call site
 /// (family D / K2): `scores`'s device is one
@@ -372,7 +378,7 @@ impl RotaryEmbedding {
             "rope_fused",
             predicate,
             holds,
-            &ROPE_DISPATCH_COUNTERS,
+            *ROPE_DISPATCH_COUNTERS,
         )?;
         match outcome {
             DispatchOutcome::Fused => {
@@ -665,7 +671,7 @@ fn softmax_apply_training(scores: &Tensor, mask: &Tensor) -> Result<Tensor, Enco
         "softmax_last_dim_fused",
         predicate,
         holds,
-        &SOFTMAX_DISPATCH_COUNTERS,
+        *SOFTMAX_DISPATCH_COUNTERS,
     )?;
     match outcome {
         DispatchOutcome::Fused => Ok(apply2(
@@ -685,13 +691,14 @@ fn softmax_apply_training(scores: &Tensor, mask: &Tensor) -> Result<Tensor, Enco
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Fused/eager dispatch counters for the ModernBERT MLP's GeGLU
-/// activation, mirroring `ROPE_DISPATCH_COUNTERS` /
-/// `SOFTMAX_DISPATCH_COUNTERS` / `crate::layer_norm::LN_DISPATCH_COUNTERS`
+/// activation, read from the registry — mirroring `ROPE_DISPATCH_COUNTERS`
+/// / `SOFTMAX_DISPATCH_COUNTERS` / `crate::layer_norm::LN_DISPATCH_COUNTERS`
 /// — see `ModernBertMlp::forward`'s doc for the training-only gate this
 /// counts. `pub(crate)` (not `pub`) — read via
 /// [`crate::geglu_dispatch_snapshot`], the same shape the other three
 /// snapshot functions use.
-pub(crate) static GEGLU_DISPATCH_COUNTERS: DispatchCounters = DispatchCounters::new();
+pub(crate) static GEGLU_DISPATCH_COUNTERS: LazyLock<&'static DispatchCounters> =
+    LazyLock::new(|| counters_for("geglu_fused"));
 
 /// The fused GeGLU kernel's domain, checked at the call site (family D /
 /// K2): `wi_out`'s device is one [`crate::layer_norm::device_is_supported`]
@@ -734,7 +741,7 @@ fn geglu_apply_training(wi_out: &Tensor) -> Result<Tensor, EncoderError> {
         "geglu_fused",
         predicate,
         holds,
-        &GEGLU_DISPATCH_COUNTERS,
+        *GEGLU_DISPATCH_COUNTERS,
     )?;
     match outcome {
         DispatchOutcome::Fused => Ok(apply1(

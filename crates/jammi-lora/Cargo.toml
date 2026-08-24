@@ -26,6 +26,15 @@ jammi-numerics.workspace = true
 # byte-unchanged.
 candle-core = { workspace = true, optional = true }
 candle-nn = { workspace = true, optional = true }
+# The fused LoRA-site epilogue (`ScaledCastAdd`) and the shared admission
+# scaffolding (`device_is_supported`, `admission_mode`, the op-keyed
+# dispatch-counter registry) — a leaf crate with no `jammi-*` dependency of
+# its own, so this adds no new dependency direction. Optional, gated behind
+# the same `candle` feature as `candle-core`/`candle-nn` above: it is a
+# candle-backed crate (its CPU `CustomOp` implementations need
+# `candle-core` unconditionally), so it can never be pulled without candle
+# already being pulled.
+jammi-kernels = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -42,4 +51,10 @@ default = ["candle"]
 # The `ComputePrecision -> candle DType` mapping lives at the candle boundary
 # in `jammi-encoders`, not here — `jammi-numerics` (this crate's dependency for
 # `ComputePrecision`) stays candle-free either way.
-candle = ["dep:candle-core", "dep:candle-nn"]
+candle = ["dep:candle-core", "dep:candle-nn", "dep:jammi-kernels"]
+# Forwards to `jammi-kernels/cuda` (the .cu build + CUDA `CustomOp` arms) —
+# same chain `jammi-encoders/cuda` forwards through, so the fused LoRA
+# epilogue's CUDA kernel builds under the identical top-level `cuda`
+# feature (`jammi-ai`'s `cuda` list gains `jammi-lora/cuda` alongside
+# `jammi-encoders/cuda`). Never required by a plain `cargo build`.
+cuda = ["jammi-kernels/cuda"]

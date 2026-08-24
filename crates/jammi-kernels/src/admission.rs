@@ -7,10 +7,35 @@
 //! *should* fuse) — it is the shared mechanism a call site's own domain
 //! check (dtype, shape, contiguity, device capability) reports its outcome
 //! through, so every op's fallback is observable the same way.
+//!
+//! ## The op-keyed dispatch-counter registry
+//!
+//! [`device_is_supported`] and [`admission_mode`] are the CANONICAL home for
+//! two predicates every fused op's call site needs (moved here from
+//! `jammi-encoders::layer_norm` by the C6 commit, which found them
+//! duplicated/reached-through-`crate::layer_norm::` by every one of C2-C5's
+//! four ops): `jammi-encoders` re-exports both names from `crate::layer_norm`
+//! so its existing call sites (`crate::layer_norm::admission_mode()`, etc.)
+//! keep compiling unchanged.
+//!
+//! [`counters_for`] generalizes the OTHER half of the duplication: C2-C5
+//! each hand-declared their own `pub(crate) static X_DISPATCH_COUNTERS:
+//! DispatchCounters = DispatchCounters::new();` in their own module, one per
+//! op. A NEW fused op (this crate's or a downstream crate's) does not need
+//! to repeat that — it calls `counters_for("its_op_name")` and gets back a
+//! `&'static DispatchCounters` looked up (or, on first use, lazily created
+//! and leaked) from ONE process-wide, op-keyed table. This is additive: the
+//! four existing per-op statics are left as they are (a live, working,
+//! independently-tested mechanism — migrating them is a separate, higher-
+//! blast-radius change this commit does not make), but every op added after
+//! this one — starting with the LoRA epilogue's `"lora_epilogue"` counters —
+//! uses the registry instead of adding a fifth hand-declared static.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
+
+use candle_core::Device;
 
 use crate::error::{KernelError, Result};
 
@@ -186,6 +211,90 @@ pub fn admit(
     }
 }
 
+/// `Strict` mode (an explicit fused-path request errors instead of falling
+/// back) is switched on by the `JAMMI_KERNELS_STRICT` environment variable,
+/// read once per process — the bench tier and a `gpu_capability`-style lane
+/// are the intended callers, set before the process starts so "fell back
+/// everywhere" can never read as a green measurement of the fused path (K2,
+/// scope decision 6 of the fused-kernels plan). `Fallback` (the default) is
+/// what every ordinary training run uses.
+///
+/// ONE env var governs strictness uniformly across every fused kernel every
+/// crate in this workspace dispatches through `admit`, rather than one env
+/// var per op or per crate — moved here (from `jammi-encoders::layer_norm`,
+/// where C2-C5 all reached it via `crate::layer_norm::admission_mode()`) so
+/// a crate with no dependency on `jammi-encoders` at all (`jammi-lora`) can
+/// read the exact same switch.
+pub fn admission_mode() -> AdmissionMode {
+    static MODE: OnceLock<AdmissionMode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        if std::env::var_os("JAMMI_KERNELS_STRICT").is_some() {
+            AdmissionMode::Strict
+        } else {
+            AdmissionMode::Fallback
+        }
+    })
+}
+
+/// Whether `d` is a device every fused CPU/CUDA-backed op in this crate can
+/// actually run on: CPU always, and CUDA only when THIS BUILD compiled
+/// jammi-kernels' `cuda` feature (`cfg!(feature = "cuda")`).
+///
+/// Metal is refused unconditionally — no op in this crate has a `metal_fwd`,
+/// and candle's default `metal_fwd` ERRORS rather than falling back, so a
+/// Metal tensor reaching `apply2`/`apply3` would turn a working eager
+/// forward into a hard error rather than a clean fallback; refusing it here,
+/// before the tensor ever reaches an op, is what keeps the fallback clean.
+///
+/// The `cfg!(feature = "cuda")` half exists for a narrower reason than
+/// Metal's: candle's `CustomOp2::cuda_fwd` ALSO has a default impl (a typed
+/// `Err`, not a panic), so a CUDA tensor reaching `apply2` while this
+/// crate's own `cuda` feature is OFF (e.g. some other crate in the same
+/// workspace build enabled `candle-core/cuda` via feature unification,
+/// without going through this crate's `cuda` feature) would still fail
+/// SAFELY today — but `cfg!(feature = "cuda")` makes that structurally
+/// impossible rather than merely unreached, at zero runtime cost (the whole
+/// expression folds to a compile-time constant).
+///
+/// Moved here from `jammi-encoders::layer_norm::device_is_supported` (the
+/// C6 commit): that crate now re-exports this function under its old path
+/// so `crate::layer_norm::device_is_supported(..)` call sites in
+/// `jammi-encoders` (including `crate::modernbert`'s RoPE/softmax/GeGLU
+/// admission predicates) keep compiling unchanged, and `jammi-lora` — which
+/// has no dependency on `jammi-encoders` at all — reaches the identical,
+/// once-audited clause directly.
+pub fn device_is_supported(d: &Device) -> bool {
+    d.is_cpu() || (cfg!(feature = "cuda") && d.is_cuda())
+}
+
+/// The op-keyed dispatch-counter registry: one process-wide table from an
+/// op's name to its `DispatchCounters`. See the module doc's "op-keyed
+/// dispatch-counter registry" section for why this exists alongside (not
+/// instead of) the four hand-declared per-op statics C2-C5 already shipped.
+///
+/// Looks up `op`'s counters, creating (and leaking — a `'static` handle,
+/// same lifetime class as a hand-declared `static`, is the whole point) a
+/// fresh zeroed `DispatchCounters` the first time a given `op` name is seen.
+/// Every subsequent call with the SAME `op` string returns the SAME
+/// counters — `admit`'s `Relaxed` atomics accumulate across the process's
+/// lifetime exactly as a hand-declared `static DispatchCounters` would.
+///
+/// `op` is `&'static str` (a string literal at every call site in this
+/// codebase — the op's own compile-time name, e.g. `"lora_epilogue"`), so
+/// the registry can hand back a genuine `&'static DispatchCounters` without
+/// any unsafe lifetime extension.
+pub fn counters_for(op: &'static str) -> &'static DispatchCounters {
+    static REGISTRY: OnceLock<Mutex<HashMap<&'static str, &'static DispatchCounters>>> =
+        OnceLock::new();
+    let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .entry(op)
+        .or_insert_with(|| Box::leak(Box::new(DispatchCounters::new())))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,5 +380,54 @@ mod tests {
         // exercised for the side-effect-free contract, not the log output.
         warn_fallback_once("dedup_test_op", "dedup_predicate");
         warn_fallback_once("dedup_test_op", "dedup_predicate");
+    }
+
+    #[test]
+    fn device_is_supported_rejects_metal() {
+        // No `metal` feature exists on this crate at all — the predicate
+        // must reject `Device::Metal` structurally, not via a cfg this
+        // crate doesn't even define. Mirrors
+        // `jammi_encoders::layer_norm::tests::device_is_supported_rejects_metal`.
+        let metal = Device::Metal(candle_core::MetalDevice);
+        assert!(!device_is_supported(&metal));
+        // CPU is unconditionally supported regardless of build features.
+        assert!(device_is_supported(&Device::Cpu));
+    }
+
+    #[test]
+    fn admission_mode_defaults_to_fallback_without_the_env_var() {
+        // `admission_mode` memoizes into a process-wide `OnceLock`, so this
+        // only asserts the DEFAULT value observed by a fresh process (no
+        // other test in this binary sets `JAMMI_KERNELS_STRICT` before this
+        // one runs — `cargo test`'s default per-test-thread model still
+        // shares one process-wide env and one `OnceLock`, so this is a
+        // documentation-level assertion about the default, not a hermetic
+        // unit test of the env-var branch itself).
+        if std::env::var_os("JAMMI_KERNELS_STRICT").is_none() {
+            assert_eq!(admission_mode(), AdmissionMode::Fallback);
+        }
+    }
+
+    #[test]
+    fn counters_for_returns_the_same_static_instance_for_the_same_op_name() {
+        let a = counters_for("registry_test_op_a");
+        let b = counters_for("registry_test_op_a");
+        // Same `op` name -> same underlying `DispatchCounters`: a record
+        // through one handle is visible through the other.
+        a.record(DispatchOutcome::Fused);
+        assert_eq!(b.snapshot(), DispatchSnapshot { fused: 1, eager: 0 });
+        assert!(std::ptr::eq(a, b), "must be the identical instance");
+    }
+
+    #[test]
+    fn counters_for_keys_by_op_name_not_by_call_site() {
+        // Two DIFFERENT op names never share counters, even though both
+        // route through the same registry.
+        let a = counters_for("registry_test_op_b1");
+        let b = counters_for("registry_test_op_b2");
+        a.record(DispatchOutcome::Fused);
+        b.record(DispatchOutcome::Eager);
+        assert_eq!(a.snapshot(), DispatchSnapshot { fused: 1, eager: 0 });
+        assert_eq!(b.snapshot(), DispatchSnapshot { fused: 0, eager: 1 });
     }
 }

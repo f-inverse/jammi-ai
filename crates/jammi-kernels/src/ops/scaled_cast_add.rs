@@ -1,0 +1,377 @@
+use candle_core::backend::BackendStorage;
+use candle_core::{CpuStorage, CustomOp2, DType, Error, Layout, Result, Shape, Tensor};
+use half::bf16;
+
+use crate::layout_walk::StridedOffsets;
+
+/// `out = base + cast_to(base.dtype())(lora * scaling)`, elementwise.
+/// `scaling` is fixed at construction; `base` and `lora` may differ in
+/// dtype (the whole reason this op exists — see below).
+///
+/// A generic Tensor-API primitive (family L: this crate names no consumer),
+/// but the shape it was designed to fuse away is `jammi-lora`'s LoRA-site
+/// epilogue: `base_out + scaling * lora_out`, where `base_out` is the frozen
+/// matmul's output at the backbone dtype and `lora_out` is the small A/B
+/// GEMM's output at the LoRA adapter's own dtype (today, always `F32` in
+/// this workspace — a call-site fact, not a `candle_nn::VarBuilder::
+/// from_varmap` API guarantee: its dtype is caller-supplied, not hardcoded;
+/// see `jammi-lora`'s `LoraLinear::forward` module doc for the exact call
+/// sites that make it `F32` today). The eager composition this replaces is
+/// `[mul, cast, add]` — three tape nodes, one `CustomOp2` here.
+///
+/// STATELESS BY CONSTRUCTION: `Copy`, same argument as [`Axpy`](super::Axpy)
+/// — `scaling` is construction data, not runtime state.
+///
+/// ## Domain (family D)
+///
+/// NOT a broadcasting op: `base` and `lora` must have identical shape (a
+/// mismatch is `Error::ShapeMismatchBinaryOp`, never silently broadcast).
+/// CPU forward supports `base`/`lora` each independently `F32` or `BF16`
+/// (four combinations); any other dtype on either side is a typed
+/// `Error::UnsupportedDTypeForOp`. The CUDA forward (feature-gated)
+/// supports the same four combinations and additionally requires
+/// contiguous storage.
+///
+/// ## The bf16 rounding model: round-before-add, not accumulate-then-round
+///
+/// This is the ONE place this op's rounding model deliberately does NOT
+/// follow [`Axpy`](super::Axpy)'s "f32-accumulate, round once" precedent.
+/// `Axpy` chose single-rounding as a documented DIVERGENCE from candle's
+/// own multi-step bf16 arithmetic. Here the target is different: `PEFT`'s
+/// reference implementation (`peft/tuners/lora/layer.py`, `Linear.forward`)
+/// computes the delta as `lora_B(lora_A(dropout(x)))` times `scaling`, with
+/// `x` cast UP to `lora_A.weight.dtype` and the delta's product cast back
+/// DOWN to the base result's dtype BEFORE the add — i.e. `torch` itself
+/// rounds the scaled delta to the base dtype, then adds two same-dtype
+/// tensors (which `torch`/`candle` both compute by promoting to `f32`,
+/// adding, and rounding back once). That is TWO round points, not one:
+/// first the cast on the scaled delta, then the add's own single rounding.
+/// This op reproduces that model exactly — round the scaled delta to
+/// `base`'s dtype, then add and round once more — which is why, unlike
+/// `Axpy`, the CPU (`F32`,`F32`)/(`BF16`,`F32`) combinations that
+/// `jammi-lora`'s admission predicate actually reaches are BIT-EXACT
+/// against the eager `[mul, cast, add]` composition (see
+/// `tests/scaled_cast_add_oracles.rs`), not merely within a stated ULP
+/// tolerance.
+///
+/// ## The other two combinations are NOT bit-exact — disclosed, not assumed
+///
+/// `(F32, BF16)` (a `BF16`-dtype `lora`) and `(BF16, BF16)` are accepted by
+/// this op's domain (`cpu_fwd` implements all four `{F32,BF16} x {F32,BF16}`
+/// combinations) but are UNREACHABLE today — `jammi-lora`'s admission
+/// predicate never dispatches them, because `lora_a`/`lora_b` are always
+/// `F32` in this workspace (see the "generic Tensor-API primitive" note
+/// above). Should a future caller reach either combination, it will NOT be
+/// bit-exact against eager: candle-core 0.11.0's own CPU `Affine` impl
+/// (`cpu_backend/mod.rs`, `impl Map1 for Affine`: `let mul =
+/// T::from_f64(self.0);` then `v * mul + add` in `T`'s own arithmetic)
+/// rounds the SCALING CONSTANT itself to `lora`'s storage dtype BEFORE
+/// multiplying — an extra bf16 rounding of `scaling` this op never
+/// performs (it always widens `lora` to `f32` and multiplies by `scaling
+/// as f32`, matching what `Affine` does when `lora`'s dtype is `F32`, but
+/// NOT when it is `BF16`). The divergence is therefore keyed on LORA'S
+/// dtype being `BF16`, not on `base`'s — both `(F32, BF16)` and `(BF16,
+/// BF16)` inherit it identically. Measured and bounded (relative-with-
+/// floor, the C4/C5 `bf16_close` pattern) in
+/// `tests/scaled_cast_add_oracles.rs`'s `f32_base_bf16_lora_diverges_…`
+/// and `bf16_base_bf16_lora_diverges_…` — not silently assumed equal just
+/// because the crate is publishable and a future caller could reach this
+/// combination.
+#[derive(Debug, Clone, Copy)]
+pub struct ScaledCastAdd {
+    pub scaling: f64,
+}
+
+impl ScaledCastAdd {
+    pub fn new(scaling: f64) -> Self {
+        Self { scaling }
+    }
+}
+
+impl super::sealed::Sealed for ScaledCastAdd {}
+
+impl CustomOp2 for ScaledCastAdd {
+    fn name(&self) -> &'static str {
+        "scaled_cast_add"
+    }
+
+    fn cpu_fwd(
+        &self,
+        s1: &CpuStorage,
+        l1: &Layout,
+        s2: &CpuStorage,
+        l2: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        if l1.dims() != l2.dims() {
+            return Err(Error::ShapeMismatchBinaryOp {
+                lhs: l1.shape().clone(),
+                rhs: l2.shape().clone(),
+                op: self.name(),
+            });
+        }
+        match (s1, s2) {
+            (CpuStorage::F32(base), CpuStorage::F32(lora)) => {
+                let out = scaled_cast_add_f32_f32(self.scaling, base, l1, lora, l2);
+                Ok((CpuStorage::F32(out), l1.shape().clone()))
+            }
+            (CpuStorage::F32(base), CpuStorage::BF16(lora)) => {
+                let out = scaled_cast_add_f32_bf16(self.scaling, base, l1, lora, l2);
+                Ok((CpuStorage::F32(out), l1.shape().clone()))
+            }
+            (CpuStorage::BF16(base), CpuStorage::F32(lora)) => {
+                let out = scaled_cast_add_bf16_f32(self.scaling, base, l1, lora, l2);
+                Ok((CpuStorage::BF16(out), l1.shape().clone()))
+            }
+            (CpuStorage::BF16(base), CpuStorage::BF16(lora)) => {
+                let out = scaled_cast_add_bf16_bf16(self.scaling, base, l1, lora, l2);
+                Ok((CpuStorage::BF16(out), l1.shape().clone()))
+            }
+            (s1, s2) => {
+                let unsupported = |d: DType| !matches!(d, DType::F32 | DType::BF16);
+                if unsupported(s1.dtype()) {
+                    Err(Error::UnsupportedDTypeForOp(s1.dtype(), self.name()))
+                } else {
+                    Err(Error::UnsupportedDTypeForOp(s2.dtype(), self.name()))
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        s1: &candle_core::CudaStorage,
+        l1: &Layout,
+        s2: &candle_core::CudaStorage,
+        l2: &Layout,
+    ) -> Result<(candle_core::CudaStorage, Shape)> {
+        crate::cuda::scaled_cast_add::cuda_fwd(self.scaling, s1, l1, s2, l2)
+    }
+
+    /// `d_base = dy` (identity: the add is linear in `base` with unit
+    /// coefficient, and the straight-through convention this op's rounding
+    /// model uses treats every `round_to(..)` as the identity function for
+    /// gradient purposes — the same convention a plain `to_dtype` cast's own
+    /// backward uses in this codebase, e.g. `LoraLinear::forward`'s eager
+    /// `.to_dtype(..)` composes through ordinary differentiable candle ops
+    /// whose cast backward is exactly this).
+    ///
+    /// `d_lora = cast_to(lora.dtype())(dy) * scaling` — the chain rule
+    /// through the (straight-through) round and the scalar multiply, in
+    /// THAT order (cast first, then scale), matching the C6 contract's
+    /// stated backward and the eager composition's own gradient (`dy` ->
+    /// `to_dtype(f32)` -> `* scaling`, since `lora_out` before its own cast
+    /// is `F32` in every reachable configuration).
+    ///
+    /// ALWAYS returns `Some` for both slots — `Tensor::is_variable()` is
+    /// NOT a safe gate here (see [`Axpy::bwd`](super::Axpy)'s doc for the
+    /// full argument: it cannot distinguish a true frozen leaf from an
+    /// INTERMEDIATE on a path to a `Var`, and candle's own backward walk
+    /// requires a populated gradient for the latter regardless).
+    fn bwd(
+        &self,
+        _base: &Tensor,
+        lora: &Tensor,
+        _res: &Tensor,
+        grad_res: &Tensor,
+    ) -> Result<(Option<Tensor>, Option<Tensor>)> {
+        let d_base = grad_res.clone();
+        let dy_lora_dtype = if grad_res.dtype() == lora.dtype() {
+            grad_res.clone()
+        } else {
+            grad_res.to_dtype(lora.dtype())?
+        };
+        let d_lora = dy_lora_dtype.affine(self.scaling, 0.0)?;
+        Ok((Some(d_base), Some(d_lora)))
+    }
+}
+
+/// Fixed fold order (family J): `StridedOffsets` walked in the same
+/// sequence for a given pair of layouts every time.
+fn scaled_cast_add_f32_f32(
+    scaling: f64,
+    base: &[f32],
+    lb: &Layout,
+    lora: &[f32],
+    ll: &Layout,
+) -> Vec<f32> {
+    let scaling = scaling as f32;
+    StridedOffsets::from_layout(lb)
+        .zip(StridedOffsets::from_layout(ll))
+        .map(|(ib, il)| base[ib] + lora[il] * scaling)
+        .collect()
+}
+
+fn scaled_cast_add_f32_bf16(
+    scaling: f64,
+    base: &[f32],
+    lb: &Layout,
+    lora: &[bf16],
+    ll: &Layout,
+) -> Vec<f32> {
+    let scaling = scaling as f32;
+    StridedOffsets::from_layout(lb)
+        .zip(StridedOffsets::from_layout(ll))
+        .map(|(ib, il)| base[ib] + lora[il].to_f32() * scaling)
+        .collect()
+}
+
+/// The reachable production combination (`BF16` backbone, `F32` LoRA
+/// adapter): rounds the scaled delta to `bf16` FIRST (matching eager's
+/// explicit `.to_dtype(base_out.dtype())`), then adds via the same
+/// promote-compute-round-once semantics candle's own bf16 arithmetic uses
+/// for a single binary op — two round points total, reproducing eager
+/// bit-for-bit (see this op's own module doc and
+/// `tests/scaled_cast_add_oracles.rs`).
+fn scaled_cast_add_bf16_f32(
+    scaling: f64,
+    base: &[bf16],
+    lb: &Layout,
+    lora: &[f32],
+    ll: &Layout,
+) -> Vec<bf16> {
+    let scaling = scaling as f32;
+    StridedOffsets::from_layout(lb)
+        .zip(StridedOffsets::from_layout(ll))
+        .map(|(ib, il)| {
+            let delta = bf16::from_f32(lora[il] * scaling);
+            bf16::from_f32(base[ib].to_f32() + delta.to_f32())
+        })
+        .collect()
+}
+
+fn scaled_cast_add_bf16_bf16(
+    scaling: f64,
+    base: &[bf16],
+    lb: &Layout,
+    lora: &[bf16],
+    ll: &Layout,
+) -> Vec<bf16> {
+    let scaling = scaling as f32;
+    StridedOffsets::from_layout(lb)
+        .zip(StridedOffsets::from_layout(ll))
+        .map(|(ib, il)| {
+            let delta = bf16::from_f32(lora[il].to_f32() * scaling);
+            bf16::from_f32(base[ib].to_f32() + delta.to_f32())
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::Device;
+
+    fn scaled_cast_add(scaling: f64, base: &Tensor, lora: &Tensor) -> Result<Tensor> {
+        crate::ops::apply2(base, lora, ScaledCastAdd::new(scaling))
+    }
+
+    #[test]
+    fn cpu_fwd_f32_f32_matches_hand_computed_values() {
+        let device = Device::Cpu;
+        let base = Tensor::from_slice(&[10.0f32, 20.0, 30.0], (3,), &device).unwrap();
+        let lora = Tensor::from_slice(&[1.0f32, 2.0, 3.0], (3,), &device).unwrap();
+        let out = scaled_cast_add(2.0, &base, &lora)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(out, vec![12.0, 24.0, 36.0]);
+    }
+
+    #[test]
+    fn cpu_fwd_bf16_f32_matches_hand_computed_values() {
+        let device = Device::Cpu;
+        let base =
+            Tensor::from_slice(&[bf16::from_f32(1.0), bf16::from_f32(2.0)], (2,), &device).unwrap();
+        let lora = Tensor::from_slice(&[4.0f32, -8.0], (2,), &device).unwrap();
+        let out = scaled_cast_add(0.5, &base, &lora)
+            .unwrap()
+            .to_vec1::<bf16>()
+            .unwrap();
+        let expected = [
+            bf16::from_f32(1.0 + bf16::from_f32(0.5 * 4.0).to_f32()),
+            bf16::from_f32(2.0 + bf16::from_f32(0.5 * -8.0).to_f32()),
+        ];
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn zero_scaling_leaves_base_unchanged_at_every_supported_combo() {
+        // The esc-031 golden's premise, exercised directly at the kernel
+        // level: `scaling == 0` (or, equivalently, `lora == 0`) must be a
+        // bit-exact no-op on `base` for every supported dtype pair.
+        let device = Device::Cpu;
+        for (base_bf16, lora_bf16) in [(false, false), (false, true), (true, false), (true, true)] {
+            let base_v = [1.5f32, -2.25, 100.0];
+            let lora_v = [7.0f32, -3.5, 0.25];
+            let base = if base_bf16 {
+                let v: Vec<bf16> = base_v.iter().map(|&x| bf16::from_f32(x)).collect();
+                Tensor::from_slice(&v, (3,), &device).unwrap()
+            } else {
+                Tensor::from_slice(&base_v, (3,), &device).unwrap()
+            };
+            let lora = if lora_bf16 {
+                let v: Vec<bf16> = lora_v.iter().map(|&x| bf16::from_f32(x)).collect();
+                Tensor::from_slice(&v, (3,), &device).unwrap()
+            } else {
+                Tensor::from_slice(&lora_v, (3,), &device).unwrap()
+            };
+            let out = scaled_cast_add(0.0, &base, &lora).unwrap();
+            assert_eq!(out.dtype(), base.dtype());
+            let out_f32 = out.to_dtype(DType::F32).unwrap().to_vec1::<f32>().unwrap();
+            let base_f32 = base.to_dtype(DType::F32).unwrap().to_vec1::<f32>().unwrap();
+            assert_eq!(
+                out_f32, base_f32,
+                "base_bf16={base_bf16} lora_bf16={lora_bf16}: zero scaling must be a bit-exact no-op"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_tensor_is_a_no_op_not_an_error() {
+        let device = Device::Cpu;
+        let base = Tensor::from_slice(&[] as &[f32], (0,), &device).unwrap();
+        let lora = Tensor::from_slice(&[] as &[f32], (0,), &device).unwrap();
+        let out = scaled_cast_add(3.0, &base, &lora)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn shape_mismatch_is_refused_not_broadcast() {
+        let device = Device::Cpu;
+        let base = Tensor::from_slice(&[1.0f32, 2.0], (2,), &device).unwrap();
+        let lora = Tensor::from_slice(&[1.0f32, 2.0, 3.0], (3,), &device).unwrap();
+        let err = scaled_cast_add(1.0, &base, &lora)
+            .expect_err("mismatched shapes must not silently broadcast");
+        assert!(matches!(err, Error::ShapeMismatchBinaryOp { .. }));
+    }
+
+    #[test]
+    fn unsupported_dtype_is_refused_with_a_typed_error() {
+        let device = Device::Cpu;
+        let base = Tensor::from_slice(&[1u8, 2], (2,), &device).unwrap();
+        let lora = Tensor::from_slice(&[1.0f32, 2.0], (2,), &device).unwrap();
+        let err = scaled_cast_add(1.0, &base, &lora)
+            .expect_err("U8 has no scaled_cast_add CPU implementation for `base`");
+        assert!(matches!(err, Error::UnsupportedDTypeForOp(..)));
+    }
+
+    #[test]
+    fn non_contiguous_view_is_still_correct_on_cpu() {
+        let device = Device::Cpu;
+        let base = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], (2, 3), &device)
+            .unwrap()
+            .t()
+            .unwrap();
+        let lora = Tensor::from_slice(&[0.0f32; 6], (3, 2), &device).unwrap();
+        assert!(!base.is_contiguous());
+        let out = scaled_cast_add(1.0, &base, &lora)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        assert_eq!(out, vec![vec![1.0, 4.0], vec![2.0, 5.0], vec![3.0, 6.0]]);
+    }
+}

@@ -32,7 +32,7 @@ use candle_core::{DType, Device, Tensor, Var, D};
 use half::bf16;
 use jammi_kernels::ops::{
     apply1, apply2, apply3, Axpy, FullyMaskedPolicy, GegluFused, GeluVariant, LayerNormFused,
-    RopeFused, SoftmaxLastDimFused,
+    RopeFused, ScaledCastAdd, SoftmaxLastDimFused,
 };
 
 fn axpy(alpha: f64, x: &Tensor, y: &Tensor) -> candle_core::Result<Tensor> {
@@ -1610,4 +1610,271 @@ fn geglu_parity_empty_last_dim() {
         .unwrap();
     assert!(out_cpu.is_empty());
     assert!(out_gpu.is_empty());
+}
+
+// =======================================================================
+// ScaledCastAdd CPU<->CUDA parity: fwd + BOTH backward outputs (d_base,
+// d_lora), at the two dtype combinations `jammi-lora`'s admission
+// predicate actually reaches (`F32`/`F32` and `BF16` base /`F32` lora).
+// Covers the same divergence-prone classes as Axpy's suite above
+// (contiguous, narrowed-with-nonzero-offset, empty, a block-size boundary).
+// =======================================================================
+
+fn scaled_cast_add(scaling: f64, base: &Tensor, lora: &Tensor) -> candle_core::Result<Tensor> {
+    apply2(base, lora, ScaledCastAdd::new(scaling))
+}
+
+fn assert_scaled_cast_add_parity_f32_f32(
+    cuda: &Device,
+    scaling: f64,
+    basev: &[f32],
+    loraev: &[f32],
+) {
+    let cpu = Device::Cpu;
+    let n = basev.len();
+
+    let base_cpu = Var::from_tensor(&Tensor::from_slice(basev, (n,), &cpu).unwrap()).unwrap();
+    let lora_cpu = Var::from_tensor(&Tensor::from_slice(loraev, (n,), &cpu).unwrap()).unwrap();
+    let out_cpu = scaled_cast_add(scaling, &base_cpu, &lora_cpu).unwrap();
+    let grads_cpu = out_cpu.backward().unwrap();
+
+    let base_gpu = Var::from_tensor(&Tensor::from_slice(basev, (n,), cuda).unwrap()).unwrap();
+    let lora_gpu = Var::from_tensor(&Tensor::from_slice(loraev, (n,), cuda).unwrap()).unwrap();
+    let out_gpu = scaled_cast_add(scaling, &base_gpu, &lora_gpu).unwrap();
+    let grads_gpu = out_gpu.backward().unwrap();
+
+    let out_cpu_v: Vec<f32> = out_cpu.to_vec1().unwrap();
+    let out_gpu_v: Vec<f32> = out_gpu.to_device(&cpu).unwrap().to_vec1().unwrap();
+    assert_eq!(out_cpu_v.len(), n);
+    assert_eq!(
+        out_gpu_v.len(),
+        n,
+        "GPU forward output length mismatch (got {}, expected {n})",
+        out_gpu_v.len()
+    );
+    for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
+        assert!(
+            ((*c - *g).abs() as f64) <= F32_TOL,
+            "fwd[{i}]: cpu {c} vs cuda {g} (scaling={scaling}, n={n})"
+        );
+    }
+
+    let d_base_cpu: Vec<f32> = grads_cpu.get(&base_cpu).unwrap().to_vec1().unwrap();
+    let d_base_gpu: Vec<f32> = grads_gpu
+        .get(&base_gpu)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let d_lora_cpu: Vec<f32> = grads_cpu.get(&lora_cpu).unwrap().to_vec1().unwrap();
+    let d_lora_gpu: Vec<f32> = grads_gpu
+        .get(&lora_gpu)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(d_base_cpu.len(), n);
+    assert_eq!(d_base_gpu.len(), n, "d_base GPU length mismatch");
+    assert_eq!(d_lora_cpu.len(), n);
+    assert_eq!(d_lora_gpu.len(), n, "d_lora GPU length mismatch");
+    for (i, (c, g)) in d_base_cpu.iter().zip(d_base_gpu.iter()).enumerate() {
+        assert!(
+            ((*c - *g).abs() as f64) <= F32_TOL,
+            "d_base[{i}]: cpu {c} vs cuda {g}"
+        );
+    }
+    for (i, (c, g)) in d_lora_cpu.iter().zip(d_lora_gpu.iter()).enumerate() {
+        assert!(
+            ((*c - *g).abs() as f64) <= F32_TOL,
+            "d_lora[{i}]: cpu {c} vs cuda {g}"
+        );
+    }
+}
+
+/// The `BF16` base / `F32` lora combination — the one the fine-tune bench
+/// (bf16 backbone) actually dispatches through.
+fn assert_scaled_cast_add_parity_bf16_base(
+    cuda: &Device,
+    scaling: f64,
+    basev: &[f32],
+    loraev: &[f32],
+) {
+    let cpu = Device::Cpu;
+    let n = basev.len();
+    let base_bf16: Vec<bf16> = basev.iter().map(|&v| bf16::from_f32(v)).collect();
+
+    let base_cpu = Tensor::from_slice(&base_bf16, (n,), &cpu).unwrap();
+    let lora_cpu = Tensor::from_slice(loraev, (n,), &cpu).unwrap();
+    let out_cpu: Vec<f32> = scaled_cast_add(scaling, &base_cpu, &lora_cpu)
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    let base_gpu = Tensor::from_slice(&base_bf16, (n,), cuda).unwrap();
+    let lora_gpu = Tensor::from_slice(loraev, (n,), cuda).unwrap();
+    let out_gpu: Vec<f32> = scaled_cast_add(scaling, &base_gpu, &lora_gpu)
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    assert_eq!(out_cpu.len(), n);
+    assert_eq!(
+        out_gpu.len(),
+        n,
+        "bf16-base GPU forward output length mismatch (got {}, expected {n})",
+        out_gpu.len()
+    );
+    // Same accumulation semantics on both devices (round-to-bf16-then-add,
+    // per this op's module doc) — fmad-class ~1-ULP-at-bf16 differences
+    // are the only expected source of divergence between CPU and CUDA.
+    for (i, (c, g)) in out_cpu.iter().zip(out_gpu.iter()).enumerate() {
+        let ulp = 2.0f32.powi(-7) * c.abs().max(*g).max(1.0);
+        assert!(
+            (c - g).abs() <= 2.0 * ulp,
+            "bf16-base fwd[{i}]: cpu {c} vs cuda {g}"
+        );
+    }
+}
+
+#[test]
+fn scaled_cast_add_parity_contiguous_small() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let base = fixture(8, 1.0);
+    let lora = fixture(8, 2.0);
+    assert_scaled_cast_add_parity_f32_f32(&cuda, 1.75, &base, &lora);
+    assert_scaled_cast_add_parity_bf16_base(&cuda, 1.75, &base, &lora);
+}
+
+#[test]
+fn scaled_cast_add_parity_narrowed_with_nonzero_offset() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    // Build a [3, 8] tensor and narrow to the middle row — the missing-
+    // offset class this crate's own review found in `Axpy`'s CUDA arm.
+    let base_all = fixture(24, 3.0);
+    let lora_all = fixture(24, 4.0);
+    let cpu = Device::Cpu;
+
+    let base_cpu = Tensor::from_slice(&base_all, (3, 8), &cpu)
+        .unwrap()
+        .narrow(0, 1, 1)
+        .unwrap()
+        .flatten_all()
+        .unwrap();
+    let lora_cpu = Tensor::from_slice(&lora_all, (3, 8), &cpu)
+        .unwrap()
+        .narrow(0, 1, 1)
+        .unwrap()
+        .flatten_all()
+        .unwrap();
+    assert!(base_cpu.is_contiguous());
+    assert_ne!(base_cpu.layout().start_offset(), 0);
+
+    let base_gpu = Tensor::from_slice(&base_all, (3, 8), &cuda)
+        .unwrap()
+        .narrow(0, 1, 1)
+        .unwrap()
+        .flatten_all()
+        .unwrap();
+    let lora_gpu = Tensor::from_slice(&lora_all, (3, 8), &cuda)
+        .unwrap()
+        .narrow(0, 1, 1)
+        .unwrap()
+        .flatten_all()
+        .unwrap();
+    assert!(base_gpu.is_contiguous());
+    assert_ne!(base_gpu.layout().start_offset(), 0);
+
+    let out_cpu: Vec<f32> = scaled_cast_add(2.0, &base_cpu, &lora_cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let out_gpu: Vec<f32> = scaled_cast_add(2.0, &base_gpu, &lora_gpu)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(out_cpu.len(), 8);
+    assert_eq!(
+        out_gpu.len(),
+        8,
+        "narrowed GPU forward output length mismatch (got {}, expected 8)",
+        out_gpu.len()
+    );
+    for (i, (c, g)) in out_cpu.iter().zip(out_gpu.iter()).enumerate() {
+        assert!(
+            ((*c - *g).abs() as f64) <= F32_TOL,
+            "narrowed fwd[{i}]: cpu {c} vs cuda {g}"
+        );
+    }
+    let expected: Vec<f32> = base_all[8..16]
+        .iter()
+        .zip(lora_all[8..16].iter())
+        .map(|(&b, &l)| b + 2.0 * l)
+        .collect();
+    for (i, (g, e)) in out_gpu.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            ((*g - *e).abs() as f64) <= F32_TOL,
+            "narrowed fwd[{i}] vs hand-computed: cuda {g} vs {e}"
+        );
+    }
+}
+
+#[test]
+fn scaled_cast_add_parity_empty() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let cpu = Device::Cpu;
+    let base_cpu = Tensor::from_slice(&[] as &[f32], (0,), &cpu).unwrap();
+    let lora_cpu = Tensor::from_slice(&[] as &[f32], (0,), &cpu).unwrap();
+    let base_gpu = Tensor::from_slice(&[] as &[f32], (0,), &cuda).unwrap();
+    let lora_gpu = Tensor::from_slice(&[] as &[f32], (0,), &cuda).unwrap();
+
+    let out_cpu: Vec<f32> = scaled_cast_add(1.0, &base_cpu, &lora_cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    // Must not attempt an illegal (0, 1, 1) launch grid.
+    let out_gpu: Vec<f32> = scaled_cast_add(1.0, &base_gpu, &lora_gpu)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert!(out_cpu.is_empty());
+    assert!(out_gpu.is_empty());
+}
+
+#[test]
+fn scaled_cast_add_parity_multi_block_exact_multiple_of_block_size() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let base = fixture(4096, 5.0);
+    let lora = fixture(4096, 6.0);
+    assert_scaled_cast_add_parity_f32_f32(&cuda, 0.5, &base, &lora);
+}
+
+#[test]
+fn scaled_cast_add_parity_multi_block_not_a_multiple_of_block_size() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let base = fixture(2000, 7.0);
+    let lora = fixture(2000, 8.0);
+    assert_scaled_cast_add_parity_f32_f32(&cuda, -2.25, &base, &lora);
+    assert_scaled_cast_add_parity_bf16_base(&cuda, -2.25, &base, &lora);
 }

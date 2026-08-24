@@ -54,6 +54,7 @@ mod axpy;
 pub(crate) mod geglu;
 mod layer_norm;
 mod rope;
+mod scaled_cast_add;
 // `pub(crate)`, not private like the three above: `crate::cuda::softmax`
 // imports `softmax_dims` directly from here rather than duplicating it (a
 // deliberate, disclosed departure from `layer_norm`'s/`rope`'s per-file
@@ -67,6 +68,7 @@ pub use axpy::Axpy;
 pub use geglu::{GegluFused, GeluVariant};
 pub use layer_norm::{LayerNormFused, MAX_HIDDEN};
 pub use rope::{RopeFused, MAX_HEAD_DIM};
+pub use scaled_cast_add::ScaledCastAdd;
 pub use softmax::{
     mask_broadcast_class_holds, FullyMaskedPolicy, SoftmaxLastDimFused, MAX_LAST_DIM, MAX_RANK,
 };

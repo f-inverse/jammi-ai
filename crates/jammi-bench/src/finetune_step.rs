@@ -244,6 +244,8 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     let softmax_dispatch_before = jammi_encoders::softmax_dispatch_snapshot();
     // Same mechanism, for the C5 fused GeGLU kernel.
     let geglu_dispatch_before = jammi_encoders::geglu_dispatch_snapshot();
+    // Same mechanism, for the C6 fused LoRA-site epilogue.
+    let lora_epilogue_dispatch_before = jammi_lora::lora_epilogue_dispatch_snapshot();
 
     let mut times = Vec::with_capacity(params.steps);
     for step in 0..(params.warmup + params.steps) {
@@ -286,6 +288,7 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     let rope_dispatch_after = jammi_encoders::rope_dispatch_snapshot();
     let softmax_dispatch_after = jammi_encoders::softmax_dispatch_snapshot();
     let geglu_dispatch_after = jammi_encoders::geglu_dispatch_snapshot();
+    let lora_epilogue_dispatch_after = jammi_lora::lora_epilogue_dispatch_snapshot();
 
     times.sort_by(f64::total_cmp);
     let p50 = times[times.len() / 2];
@@ -327,6 +330,12 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
         geglu_eager_dispatches: geglu_dispatch_after
             .eager
             .saturating_sub(geglu_dispatch_before.eager),
+        lora_epilogue_fused_dispatches: lora_epilogue_dispatch_after
+            .fused
+            .saturating_sub(lora_epilogue_dispatch_before.fused),
+        lora_epilogue_eager_dispatches: lora_epilogue_dispatch_after
+            .eager
+            .saturating_sub(lora_epilogue_dispatch_before.eager),
         s_per_step_p50: Measurement::measured(p50, "s"),
         s_per_step_mean: Measurement::measured(mean, "s"),
         steps_per_s: Measurement::measured(1.0 / p50, "steps/s"),

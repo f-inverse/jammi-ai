@@ -57,11 +57,9 @@
 //! populated`, `backprop.rs:175`) rather than silently training a
 //! grad-less parameter — a safe failure mode, not a silent-wrong one.
 
-use std::sync::OnceLock;
-
-use candle_core::{DType, Device, Tensor, D};
+use candle_core::{DType, Tensor, D};
 use candle_nn::{Init, VarBuilder};
-use jammi_kernels::admission::{admit, AdmissionMode, DispatchCounters, DispatchOutcome};
+use jammi_kernels::admission::{admit, DispatchCounters, DispatchOutcome};
 use jammi_kernels::ops::{apply2, LayerNormFused, MAX_HIDDEN};
 
 use crate::error::EncoderError;
@@ -74,66 +72,26 @@ use crate::error::EncoderError;
 pub static LN_DISPATCH_COUNTERS: DispatchCounters = DispatchCounters::new();
 
 /// `Strict` mode (an explicit fused-path request errors instead of
-/// falling back) is switched on by the `JAMMI_KERNELS_STRICT` environment
-/// variable, read once per process — the bench tier and the
-/// `gpu_capability` lane are the intended callers, set before the
-/// process starts so "fell back everywhere" can never read as a green
-/// measurement of the fused path (K2, scope decision 6 of the
-/// fused-kernels plan). `Fallback` (the default) is what every ordinary
-/// training run uses. Honestly: no caller in this repository sets
-/// `JAMMI_KERNELS_STRICT` today — the positive-proof channel this
-/// commit ships is [`crate::ln_dispatch_snapshot`] and
-/// `jammi-bench`'s `finetune_step` tier reading it (`ln_fused_dispatches`
-/// / `ln_eager_dispatches`), which needs no env var at all. Wiring an
-/// actual `JAMMI_KERNELS_STRICT=1` setter into the bench tier / a
-/// `gpu_capability`-style lane is future work (C8), not shipped here.
+/// falling back), and whether a device is one every fused CPU/CUDA op in
+/// this crate can run on — MOVED (the C6 commit) to
+/// `jammi_kernels::admission` as the canonical home: `jammi-lora`, which
+/// has no dependency on this crate, needed the exact same two audited
+/// predicates for its own fused LoRA-site epilogue, and duplicating them a
+/// second time was the wrong fix (see `jammi_kernels::admission`'s module
+/// doc for the full "op-keyed dispatch-counter registry" rationale).
 ///
-/// `pub(crate)`: `crate::modernbert`'s RoPE admission also reads this —
-/// ONE `JAMMI_KERNELS_STRICT` env var governs strictness uniformly across
-/// every fused kernel this crate dispatches, rather than one env var per
-/// op.
-pub(crate) fn admission_mode() -> AdmissionMode {
-    static MODE: OnceLock<AdmissionMode> = OnceLock::new();
-    *MODE.get_or_init(|| {
-        if std::env::var_os("JAMMI_KERNELS_STRICT").is_some() {
-            AdmissionMode::Strict
-        } else {
-            AdmissionMode::Fallback
-        }
-    })
-}
-
-/// Whether `d` is a device [`LayerNormFused`] actually implements: CPU
-/// always, and CUDA only when THIS BUILD compiled jammi-kernels' `cuda`
-/// arm (`cfg!(feature = "cuda")`, forwarded from this crate's own `cuda`
-/// feature). Metal is refused unconditionally — this op has no
-/// `metal_fwd`, and candle's default `metal_fwd` ERRORS rather than
-/// falling back, so a Metal tensor reaching `apply2` would turn a working
-/// eager forward into a hard error at the first bias-free training-mode
-/// LN; see `jammi-ai`'s `metal` feature and `select_device`.
-///
-/// The `cfg!(feature = "cuda")` half exists for a narrower reason than
-/// Metal's: candle's `CustomOp2::cuda_fwd` ALSO has a default impl (a
-/// typed `Err`, not a panic — the same shape as `metal_fwd`'s), so a CUDA
-/// tensor reaching `apply2` while jammi-kernels' own `cuda` feature is
-/// OFF (e.g. some other crate in the same workspace build enabled
-/// `candle-core/cuda` via feature unification, without going through
-/// this crate's `cuda` feature) would still fail SAFELY today — no crate
-/// in this workspace currently reaches that combination (traced), but
-/// `cfg!(feature = "cuda")` makes it structurally impossible rather than
-/// merely unreached, at zero runtime cost (the whole expression folds to
-/// a compile-time constant).
-///
-/// Extracted from [`fused_admission_predicate`] so it is unit-testable
-/// directly against a `Device::Metal` value with no `metal` feature on
-/// this crate at all — see `tests::device_is_supported_rejects_metal`.
-/// `pub(crate)` (not private) so `crate::modernbert`'s RoPE admission
-/// predicate reuses the exact same audited clause (including the
-/// `cfg!(feature = "cuda")` half) rather than duplicating it — the C3
-/// fused-kernels contract's explicit instruction ("reuse C2's fn").
-pub(crate) fn device_is_supported(d: &Device) -> bool {
-    d.is_cpu() || (cfg!(feature = "cuda") && d.is_cuda())
-}
+/// Re-exported here under their ORIGINAL names/paths
+/// (`crate::layer_norm::admission_mode`, `crate::layer_norm::
+/// device_is_supported`) so every existing call site in this crate —
+/// this file's own [`LayerNorm::forward_fused_or_fallback`] and
+/// `crate::modernbert`'s RoPE/softmax/GeGLU admission predicates, all of
+/// which reach these through `crate::layer_norm::` — keeps compiling
+/// unchanged. See `jammi_kernels::admission::admission_mode` /
+/// `jammi_kernels::admission::device_is_supported` for the full
+/// documentation (Metal-rejection rationale, the `JAMMI_KERNELS_STRICT`
+/// env var, etc.), which now lives at the canonical definition rather
+/// than here.
+pub(crate) use jammi_kernels::admission::{admission_mode, device_is_supported};
 
 /// The fused kernel's domain, checked at the call site (family D / K2):
 /// `x` and `weight` live on a device [`device_is_supported`] accepts,
@@ -270,7 +228,7 @@ impl LayerNorm {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::Var;
+    use candle_core::{Device, Var};
     use half::bf16;
 
     fn bias_free_ln(weight: Tensor, eps: f64, training: bool) -> LayerNorm {

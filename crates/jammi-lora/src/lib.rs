@@ -46,7 +46,7 @@ pub use init::LoraInitMode;
 // without its own direct `jammi-numerics` import.
 pub use jammi_numerics::ComputePrecision;
 #[cfg(feature = "candle")]
-pub use lora_linear::LoraLinear;
+pub use lora_linear::{lora_epilogue_dispatch_snapshot, LoraLinear};
 #[cfg(feature = "candle")]
 pub use save_load::{load_adapter, save_adapter};
 #[cfg(feature = "candle")]

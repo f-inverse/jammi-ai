@@ -2,14 +2,89 @@
 
 use std::sync::Mutex;
 
-use candle_core::Tensor;
+use candle_core::{DType, Tensor};
 use candle_nn::{Init, Linear, Module, VarBuilder, VarMap};
+use jammi_kernels::admission::{
+    admission_mode, admit, counters_for, device_is_supported, DispatchCounters, DispatchOutcome,
+    DispatchSnapshot,
+};
+use jammi_kernels::ops::{apply2, ScaledCastAdd};
 
 use crate::error::LoraError;
 use crate::init::LoraInitMode;
 use crate::seeded::{
     gaussian_fill, kaiming_uniform_fill, seed_for_param, DropoutStream, SplitMix64,
 };
+
+/// Per-op fused/eager dispatch counts for the LoRA-site epilogue
+/// (`base_out + cast(lora_out * scaling)`), read from `jammi-kernels`' new
+/// op-keyed registry (`counters_for`) rather than a hand-declared
+/// `static DispatchCounters` — this crate is the first to use the
+/// generalized form C6 adds (see `jammi_kernels::admission`'s module doc);
+/// C2-C5's four ops in `jammi-encoders` keep their own pre-existing
+/// statics unchanged.
+fn lora_epilogue_counters() -> &'static DispatchCounters {
+    counters_for("lora_epilogue")
+}
+
+/// A snapshot of the fused/eager dispatch counts for the LoRA-site
+/// epilogue, mirroring `jammi_encoders::ln_dispatch_snapshot` /
+/// `rope_dispatch_snapshot` / `softmax_dispatch_snapshot` /
+/// `geglu_dispatch_snapshot` — the read API a durable job record or a
+/// bench report uses to state which kernel path actually ran.
+pub fn lora_epilogue_dispatch_snapshot() -> DispatchSnapshot {
+    lora_epilogue_counters().snapshot()
+}
+
+/// The fused epilogue kernel's domain, checked at the call site (family D
+/// / K2): `base_out` lives on a device [`device_is_supported`] accepts,
+/// both `base_out` and `lora_out` are dtype `F32` or `BF16` (independently
+/// — `ScaledCastAdd` supports all four combinations, though only
+/// (`F32`,`F32`) and (`BF16`,`F32`) are reachable today: `lora_a`/`lora_b`
+/// are always `F32` in this workspace, since the two call sites that
+/// construct a LoRA adapter's `VarBuilder` both pass `DType::F32` — see
+/// this module's `forward` doc for the exact citation), both are contiguous
+/// (`ScaledCastAdd`'s CUDA arm has no strided-view support — see its own
+/// module doc), and the two tensors' shapes match exactly (the op is not a
+/// broadcasting op). Returns the aggregate predicate and the name of
+/// whichever check is the reason (the first one evaluated, or a fixed
+/// "domain_ok" name when everything holds).
+fn epilogue_admission_predicate(base_out: &Tensor, lora_out: &Tensor) -> (bool, &'static str) {
+    if !device_is_supported(base_out.device()) {
+        return (false, "device_is_cpu_or_cuda");
+    }
+    if !matches!(base_out.dtype(), DType::F32 | DType::BF16) {
+        return (false, "base_dtype_f32_or_bf16");
+    }
+    if !matches!(lora_out.dtype(), DType::F32 | DType::BF16) {
+        return (false, "lora_dtype_f32_or_bf16");
+    }
+    if !base_out.is_contiguous() {
+        return (false, "base_contiguous");
+    }
+    if !lora_out.is_contiguous() {
+        return (false, "lora_contiguous");
+    }
+    if base_out.dims() != lora_out.dims() {
+        return (false, "base_and_lora_shape_equal");
+    }
+    (true, "domain_ok")
+}
+
+/// The eager `[mul, cast, add]` composition the fused epilogue replaces:
+/// `base_out + cast_to(base_out.dtype())(lora_out * scaling)`. Kept as its
+/// own function so both the eval-mode path (which always uses it — see
+/// `forward`'s doc) and the training-mode fallback (when the fused
+/// kernel's domain does not hold) share exactly one implementation.
+fn eager_epilogue(base_out: &Tensor, lora_out: &Tensor, scaling: f64) -> Result<Tensor, LoraError> {
+    let scaled = (lora_out * scaling)?;
+    let scaled_cast = if scaled.dtype() != base_out.dtype() {
+        scaled.to_dtype(base_out.dtype())?
+    } else {
+        scaled
+    };
+    Ok((base_out + &scaled_cast)?)
+}
 
 /// Overwrite the storage of the `Var` already registered at `name` in `varmap`
 /// with `value`, reaching it through the shared `&VarMap` (no `&mut` needed
@@ -228,6 +303,47 @@ impl LoraLinear {
     /// The frozen base path runs in F32 for device-agnostic matmul support;
     /// the result is cast back to the backbone dtype before the LoRA delta is
     /// added so downstream layers stay in their expected precision.
+    ///
+    /// ## The fused epilogue: `jammi_kernels::ops::ScaledCastAdd`
+    ///
+    /// The final `[mul, cast, add]` — `base_out + cast(lora_out * scaling)`
+    /// — is replaced by one fused `CustomOp2` call when `self.training` is
+    /// `true` AND the kernel's own domain holds
+    /// ([`epilogue_admission_predicate`]): this collapses three tape nodes
+    /// (each with its own `zeros_like`+`add` in backward) into one.
+    /// `self.training` gates it because a `LoraLinear` also SERVES
+    /// inference (`from_loaded`, `training: false`) — eval/serving keeps
+    /// today's eager composition bit-for-bit, unconditionally, exactly as
+    /// C2's fused LayerNorm gates on its own crate's `training` flag (see
+    /// `jammi_encoders::layer_norm`'s module doc for the same argument).
+    /// Outside the fused kernel's domain (an unsupported dtype/device, a
+    /// non-contiguous view), the training-mode arm falls back to
+    /// [`eager_epilogue`] too — the SAME function eval always uses — so a
+    /// domain miss and eval-mode are byte-identical code paths, not two
+    /// independently-maintained ones.
+    ///
+    /// The LoRA-arm dtype `lora_a`/`lora_b` run at (`self.lora_a.dtype()`,
+    /// read below) is `F32` in every training-mode call site in this
+    /// workspace TODAY — but this is a WORKSPACE FACT about today's call
+    /// sites, not a `candle_nn::VarBuilder::from_varmap` API guarantee:
+    /// its dtype is an ordinary caller-supplied parameter, not hardcoded
+    /// by the function itself, and nothing stops a future caller from
+    /// passing something else. What actually bounds it today is
+    /// `ModernBertBuilder::build`'s `lora_vb` construction
+    /// (`crates/jammi-encoders/src/modernbert.rs`) — the SINGLE place a
+    /// LoRA adapter's `VarBuilder` is built for every ModernBERT LoRA site
+    /// (Wqkv/Wo/Wi across every layer, the #352 profile's 112 sites) —
+    /// whose both branches pass `DType::F32` explicitly:
+    /// `VarBuilder::from_mmaped_safetensors(&[adapter], DType::F32,
+    /// device)` when reloading a saved adapter, and
+    /// `VarBuilder::from_varmap(varmap, DType::F32, device)` when
+    /// training. The `x.to_dtype(lora_dtype)` up-cast below is therefore a
+    /// REAL cast (not a no-op) whenever `backbone_dtype` is reduced
+    /// (`BF16`/`F16`) — changing which dtype that `VarBuilder` passes is a
+    /// distinct precision decision (raising or lowering the adapter's own
+    /// numeric precision), out of this commit's scope; this comment states
+    /// which case holds today, and WHY it holds (a call-site choice, not
+    /// an API guarantee), rather than leaving it silently assumed.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor, LoraError> {
         // The frozen base runs at the backbone dtype, exactly as
         // `MaybeLoraLinear::Frozen` does: cast the input down to the weight and
@@ -280,14 +396,29 @@ impl LoraLinear {
         let b_lin = Linear::new(self.lora_b.clone(), None);
         let lora_out = b_lin.forward(&after_a)?;
 
-        let scaled = (&lora_out * self.scaling)?;
-        let scaled_cast = if scaled.dtype() != base_out.dtype() {
-            scaled.to_dtype(base_out.dtype())?
-        } else {
-            scaled
-        };
+        if !self.training {
+            // Eval/serving: always the eager composition, unconditionally
+            // — see `forward`'s doc for why this must stay bit-identical
+            // regardless of the fused kernel's existence.
+            return eager_epilogue(&base_out, &lora_out, self.scaling);
+        }
 
-        Ok((&base_out + &scaled_cast)?)
+        let (holds, predicate) = epilogue_admission_predicate(&base_out, &lora_out);
+        let outcome = admit(
+            admission_mode(),
+            "lora_epilogue",
+            predicate,
+            holds,
+            lora_epilogue_counters(),
+        )?;
+        match outcome {
+            DispatchOutcome::Fused => Ok(apply2(
+                &base_out,
+                &lora_out,
+                ScaledCastAdd::new(self.scaling),
+            )?),
+            DispatchOutcome::Eager => eager_epilogue(&base_out, &lora_out, self.scaling),
+        }
     }
 
     /// References to the two trainable LoRA parameter tensors.

@@ -17,4 +17,9 @@ pub enum LoraError {
     /// Caller passed an invalid configuration value.
     #[error("Configuration: {0}")]
     Config(String),
+    /// The fused LoRA epilogue's admission scaffolding refused STRICT-mode
+    /// dispatch (see `jammi_kernels::admission::AdmissionMode::Strict`) —
+    /// an explicit fused-path request whose domain predicate failed.
+    #[error("LoRA epilogue admission: {0}")]
+    Kernel(#[from] jammi_kernels::error::KernelError),
 }

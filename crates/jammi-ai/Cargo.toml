@@ -159,8 +159,18 @@ live-gpu-tests = ["local"]
 # CUDA / Metal acceleration of the embedded engine — only meaningful with `local`.
 # `jammi-encoders/cuda` is the first real fork in this chain (added the
 # fused-kernels commit): jammi-encoders previously had no `cuda` feature at
-# all, so this bypassed it entirely.
-cuda = ["local", "candle-core/cuda", "candle-nn/cuda", "jammi-encoders/cuda"]
+# all, so this bypassed it entirely. `jammi-lora/cuda` (added the C6
+# LoRA-epilogue commit) forwards the same way, through `jammi-lora`'s own
+# `cuda = ["jammi-kernels/cuda"]` feature — `jammi-lora` and `jammi-encoders`
+# both depend on the same leaf `jammi-kernels` crate, not on each other, so
+# each needs its own forwarding entry in this list.
+cuda = [
+    "local",
+    "candle-core/cuda",
+    "candle-nn/cuda",
+    "jammi-encoders/cuda",
+    "jammi-lora/cuda",
+]
 metal = ["local", "candle-core/metal", "candle-nn/metal"]
 
 # The `it` integration suite drives the embedded engine end-to-end (model loading,

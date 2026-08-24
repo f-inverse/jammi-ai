@@ -1166,6 +1166,25 @@ pub struct FinetuneStepTier {
     /// or because the admission predicate failed for any other stated
     /// reason.
     pub geglu_eager_dispatches: u64,
+    /// How many times a LoRA-site fused epilogue
+    /// (`jammi_kernels::ops::ScaledCastAdd`, `base_out + cast(lora_out *
+    /// scaling)`) actually dispatched during this run — the same
+    /// positive-proof channel as `ln_fused_dispatches` /
+    /// `rope_fused_dispatches` / `softmax_fused_dispatches` /
+    /// `geglu_fused_dispatches`, for the C6 fused-kernels commit (see
+    /// `jammi_lora::LoraLinear::forward`'s doc). Read via
+    /// `jammi_lora::lora_epilogue_dispatch_snapshot` rather than a
+    /// `jammi_encoders`-side wrapper — the counters live in
+    /// `jammi-kernels`' op-keyed registry, so any crate that knows the op
+    /// name (`"lora_epilogue"`) reads the same table.
+    pub lora_epilogue_fused_dispatches: u64,
+    /// How many times that same call site fell back to the eager `[mul,
+    /// cast, add]` composition instead — outside the fused kernel's
+    /// domain (dtype/contiguity/device/shape), because `training ==
+    /// false` (eval/serving never dispatches the fused kernel at all —
+    /// see the doc above), or because the admission predicate failed for
+    /// any other stated reason.
+    pub lora_epilogue_eager_dispatches: u64,
     pub s_per_step_p50: Measurement,
     pub s_per_step_mean: Measurement,
     pub steps_per_s: Measurement,

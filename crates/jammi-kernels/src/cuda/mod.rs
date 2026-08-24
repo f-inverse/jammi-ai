@@ -7,10 +7,13 @@ pub(crate) mod axpy;
 pub(crate) mod geglu;
 pub(crate) mod layer_norm;
 pub(crate) mod rope;
+pub(crate) mod scaled_cast_add;
 pub(crate) mod softmax;
 
 pub(crate) const PTX_AXPY: &str = include_str!(concat!(env!("OUT_DIR"), "/axpy.ptx"));
 pub(crate) const PTX_GEGLU: &str = include_str!(concat!(env!("OUT_DIR"), "/geglu.ptx"));
 pub(crate) const PTX_LAYER_NORM: &str = include_str!(concat!(env!("OUT_DIR"), "/layer_norm.ptx"));
 pub(crate) const PTX_ROPE: &str = include_str!(concat!(env!("OUT_DIR"), "/rope.ptx"));
+pub(crate) const PTX_SCALED_CAST_ADD: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/scaled_cast_add.ptx"));
 pub(crate) const PTX_SOFTMAX: &str = include_str!(concat!(env!("OUT_DIR"), "/softmax.ptx"));

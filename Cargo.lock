@@ -4286,6 +4286,7 @@ version = "0.47.0"
 dependencies = [
  "candle-core",
  "candle-nn",
+ "jammi-kernels",
  "jammi-numerics",
  "serde",
  "serde_json",

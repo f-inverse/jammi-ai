@@ -29,13 +29,17 @@ pub mod modernbert;
 pub mod precision;
 
 mod any;
+mod attention;
 mod error;
 mod layer_norm;
 mod mask;
 mod pooling;
+#[cfg(test)]
+mod test_support;
 
 pub use aggregate::{segment_aggregate, SegmentReduce};
 pub use any::AnyEncoder;
+pub use attention::attention_softmax;
 pub use audio::{AnyAudioEncoder, AudioEncoder};
 pub use bert::{Bert, BertConfig};
 pub use clip_text::{ClipText, ClipTextConfig};

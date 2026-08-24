@@ -140,23 +140,21 @@ impl MultiHeadAttention {
     /// with `0.0` at allowed positions and `-inf` (or large negative) at
     /// masked positions; it is broadcast over `[batch, heads]`.
     ///
-    /// `candle_nn::ops::softmax_last_dim` is a `CustomOp1` registered with
-    /// `apply_op1_no_bwd` (candle-nn `ops.rs`), whose result carries
-    /// `BackpropOp::none()` — backward does not error on it, it just stops
-    /// traversing there. Through the `probs @ V` matmul the V-slice of this
-    /// block's fused `in_proj_weight` still receives a gradient (V sits
-    /// downstream of the softmax, not upstream), so the observable is not a
-    /// crash but a silently WRONG gradient: the Q and K slices of
-    /// `in_proj_weight` come back exactly zero. `training=true` therefore
-    /// routes through `candle_nn::ops::softmax`, the ordinary differentiable
-    /// max/sub/exp/sum/div composition — same arm ModernBERT's attention
-    /// uses for the same reason.
+    /// See [`crate::attention::attention_softmax`]'s module doc for the
+    /// `BackpropOp::none()` truncation this dispatch works around: through
+    /// the `probs @ V` matmul the V-slice of this block's fused
+    /// `in_proj_weight` still receives a gradient (V sits downstream of the
+    /// softmax, not upstream), so the observable is not a crash but a
+    /// silently WRONG gradient: the Q and K slices of `in_proj_weight` come
+    /// back exactly zero under the fused eval kernel. `training=true`
+    /// therefore routes through the composed, differentiable arm — same arm
+    /// ModernBERT's attention uses for the same reason.
     ///
     /// This flag is load-bearing on CUDA: candle's fused softmax kernel and
     /// the composed primitive-op reduction can differ in fold order there.
     /// On CPU the two arms are bit-identical (measured 0/N differing mantissa
     /// bits at f32 and bf16 on representative window shapes — see
-    /// `tests::softmax_last_dim_and_composed_softmax_are_cpu_bit_identical`),
+    /// `crate::attention::tests::softmax_last_dim_and_composed_softmax_are_cpu_bit_identical`),
     /// so `training=false` costs nothing to keep byte-identical to today's
     /// eval path.
     ///
@@ -179,11 +177,7 @@ impl MultiHeadAttention {
         let attn_scores =
             (crate::contiguous_matmul(&q, &k.transpose(D::Minus2, D::Minus1)?)? / scale)?;
         let attn_scores = attn_scores.broadcast_add(causal_mask)?;
-        let attn_weights = if self.training {
-            candle_nn::ops::softmax(&attn_scores, D::Minus1)?
-        } else {
-            candle_nn::ops::softmax_last_dim(&attn_scores)?
-        };
+        let attn_weights = crate::attention::attention_softmax(&attn_scores, self.training)?;
         let attn_output = crate::contiguous_matmul(&attn_weights, &v)?;
 
         let attn_output = attn_output.permute((0, 2, 1, 3))?.reshape((
@@ -461,6 +455,7 @@ fn l2_normalize(t: &Tensor) -> Result<Tensor, EncoderError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::deterministic_fill_varmap;
     use candle_core::{DType, Device, Var};
     use candle_nn::VarMap;
 
@@ -472,33 +467,6 @@ mod tests {
             let shape = var.shape().clone();
             let random = Tensor::randn(0f32, 0.1, shape, device).unwrap();
             var.set(&random).unwrap();
-        }
-    }
-
-    /// Deterministic (non-RNG) fill: every variable gets values from a fixed
-    /// LCG walk over a stably-ordered (sorted-by-key) variable list, so two
-    /// independent test functions that each build a fresh `VarMap` land on
-    /// bit-identical weights — required for the training/eval defect-shape
-    /// pair below, which must observe the SAME fixture from two separate
-    /// `#[test]` functions.
-    fn deterministic_fill_varmap(varmap: &VarMap, device: &Device) {
-        let mut state: u32 = 1;
-        let data = varmap.data().lock().unwrap();
-        let mut entries: Vec<_> = data.iter().collect();
-        entries.sort_by(|a, b| a.0.cmp(b.0));
-        for (_, var) in entries {
-            let shape = var.shape().clone();
-            let n = shape.elem_count();
-            let values: Vec<f32> = (0..n)
-                .map(|_| {
-                    // glibc-style LCG; deterministic, no external RNG/seed state.
-                    state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-                    let unit = (state >> 8) as f32 / (1u32 << 24) as f32; // [0, 1)
-                    (unit - 0.5) * 0.2 // [-0.1, 0.1)
-                })
-                .collect();
-            var.set(&Tensor::from_vec(values, shape, device).unwrap())
-                .unwrap();
         }
     }
 
@@ -921,57 +889,5 @@ mod tests {
             after.to_vec2::<f32>().unwrap(),
             "eval output must be bit-identical across a training toggle round trip"
         );
-    }
-
-    /// `softmax_last_dim`'s fused CUSTOM-OP kernel and the composed
-    /// max/sub/exp/sum/div `softmax` are bit-identical on CPU — the reason
-    /// `training=false` is free to keep byte-identical to today's eval path.
-    /// Only CUDA's fused softmax kernel may fold in a different reduction
-    /// order (the training flag is load-bearing there, not here).
-    #[test]
-    fn softmax_last_dim_and_composed_softmax_are_cpu_bit_identical() {
-        let device = Device::Cpu;
-        for (rows, cols) in [(8usize, 512usize), (64, 64)] {
-            let mut state: u32 = 7;
-            let n = rows * cols;
-            let values: Vec<f32> = (0..n)
-                .map(|_| {
-                    state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-                    let unit = (state >> 8) as f32 / (1u32 << 24) as f32;
-                    (unit - 0.5) * 20.0 // wide range to exercise the max-shift
-                })
-                .collect();
-            let x = Tensor::from_vec(values, (rows, cols), &device).unwrap();
-
-            let fused = candle_nn::ops::softmax_last_dim(&x).unwrap();
-            let composed = candle_nn::ops::softmax(&x, D::Minus1).unwrap();
-            assert_eq!(
-                fused.to_vec2::<f32>().unwrap(),
-                composed.to_vec2::<f32>().unwrap(),
-                "f32 [{rows},{cols}]: fused vs composed softmax must be bit-identical on CPU"
-            );
-
-            let x_bf16 = x.to_dtype(DType::BF16).unwrap();
-            let fused_bf16 = candle_nn::ops::softmax_last_dim(&x_bf16).unwrap();
-            let composed_bf16 = candle_nn::ops::softmax(&x_bf16, D::Minus1).unwrap();
-            let fused_bits: Vec<u16> = fused_bf16
-                .to_vec2::<half::bf16>()
-                .unwrap()
-                .into_iter()
-                .flatten()
-                .map(|v| v.to_bits())
-                .collect();
-            let composed_bits: Vec<u16> = composed_bf16
-                .to_vec2::<half::bf16>()
-                .unwrap()
-                .into_iter()
-                .flatten()
-                .map(|v| v.to_bits())
-                .collect();
-            assert_eq!(
-                fused_bits, composed_bits,
-                "bf16 [{rows},{cols}]: fused vs composed softmax must be bit-identical on CPU"
-            );
-        }
     }
 }

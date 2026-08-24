@@ -609,9 +609,8 @@ impl SwinSelfAttention {
     /// `[nW, L, L]`; `num_windows` is nW (needed to fold the mask over the batch
     /// axis).
     ///
-    /// `candle_nn::ops::softmax_last_dim` is a `CustomOp1` registered with
-    /// `apply_op1_no_bwd`, whose result carries `BackpropOp::none()` —
-    /// backward does not error on it, it just stops traversing there.
+    /// See [`crate::attention::attention_softmax`]'s module doc for the
+    /// `BackpropOp::none()` truncation this dispatch works around.
     /// `query`/`key` (and, most starkly, `rel_bias_table`) sit EXCLUSIVELY
     /// upstream of this softmax: `rel_bias_table` is read only at the
     /// index-select/reshape/permute above that feeds `scores`, with no other
@@ -620,18 +619,16 @@ impl SwinSelfAttention {
     /// `None` under eval, not merely zero — a strictly worse failure mode
     /// than CLIP's fused-QKV case (there, V's surviving path at least forces
     /// the shared `in_proj_weight` accumulator to exist, so Q/K only read
-    /// back as zero rows of it). `training=true` routes through
-    /// `candle_nn::ops::softmax`, the ordinary differentiable max/sub/exp/
-    /// sum/div composition — same arm ModernBERT's attention uses.
+    /// back as zero rows of it). `training=true` routes through the
+    /// composed, differentiable arm — same arm ModernBERT's attention uses.
     ///
     /// This flag is load-bearing on CUDA: candle's fused softmax kernel and
     /// the composed primitive-op reduction can differ in fold order there.
     /// On CPU the two arms are bit-identical (measured 0/N differing
     /// mantissa bits — see
-    /// `tests::softmax_last_dim_and_composed_softmax_are_cpu_bit_identical`
-    /// in `clip_text.rs`, which covers both towers' shared claim), so
-    /// `training=false` costs nothing to keep byte-identical to today's eval
-    /// path.
+    /// `crate::attention::tests::softmax_last_dim_and_composed_softmax_are_cpu_bit_identical`,
+    /// which covers every tower's shared claim), so `training=false` costs
+    /// nothing to keep byte-identical to today's eval path.
     ///
     /// No caller in this codebase can set `training=true` on an `HtsatAudio`
     /// tower today (`CandleAudioForward` towers are reached through `&self`
@@ -673,11 +670,7 @@ impl SwinSelfAttention {
             None => scores,
         };
 
-        let probs = if self.training {
-            candle_nn::ops::softmax(&scores, D::Minus1)?
-        } else {
-            candle_nn::ops::softmax_last_dim(&scores)?
-        };
+        let probs = crate::attention::attention_softmax(&scores, self.training)?;
         let ctx = crate::contiguous_matmul(&probs, &v)?; // [BnW, heads, L, head]
         let ctx = ctx.transpose(1, 2)?.contiguous()?.reshape((bnw, l, c))?;
         Ok(ctx)
@@ -1372,48 +1365,9 @@ impl HtsatAudio {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::deterministic_fill_varmap;
     use candle_core::{DType, Device, Var};
     use candle_nn::VarMap;
-
-    /// Deterministic (non-RNG) fill, identical LCG scheme to
-    /// `clip_text::tests::deterministic_fill_varmap` — see that doc for why
-    /// this must be reproducible rather than seeded-RNG.
-    ///
-    /// Domain-validity edge case unique to this tower: `BatchNorm`'s
-    /// `running_var` is a VARIANCE, not an unconstrained parameter — it must
-    /// stay non-negative (`forward` computes `1/sqrt(running_var + eps)`),
-    /// unlike every other weight/bias this fixture fills. A naive symmetric
-    /// `[-0.1, 0.1)` fill can and does land `running_var` on a negative
-    /// value, producing `sqrt(negative) = NaN` that silently propagates
-    /// through the entire forward pass (and then backward, since NaN
-    /// arithmetic is closed under every op here) — the fixture would
-    /// otherwise manufacture a domain violation, not exercise one. Keys
-    /// ending in `running_var` are instead filled from a strictly-positive
-    /// `[0.5, 0.7)` range.
-    fn deterministic_fill_varmap(varmap: &VarMap, device: &Device) {
-        let mut state: u32 = 1;
-        let data = varmap.data().lock().unwrap();
-        let mut entries: Vec<_> = data.iter().collect();
-        entries.sort_by(|a, b| a.0.cmp(b.0));
-        for (key, var) in entries {
-            let shape = var.shape().clone();
-            let n = shape.elem_count();
-            let is_variance = key.ends_with("running_var");
-            let values: Vec<f32> = (0..n)
-                .map(|_| {
-                    state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-                    let unit = (state >> 8) as f32 / (1u32 << 24) as f32; // [0, 1)
-                    if is_variance {
-                        0.5 + unit * 0.2 // [0.5, 0.7) — strictly positive
-                    } else {
-                        (unit - 0.5) * 0.2 // [-0.1, 0.1)
-                    }
-                })
-                .collect();
-            var.set(&Tensor::from_vec(values, shape, device).unwrap())
-                .unwrap();
-        }
-    }
 
     /// Locate the [`Var`] whose VarMap key ends with `suffix`.
     fn find_var(varmap: &VarMap, suffix: &str) -> Var {

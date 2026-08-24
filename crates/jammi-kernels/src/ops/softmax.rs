@@ -780,7 +780,7 @@ impl SoftmaxLastDimFused {
     /// builder, not a mutation any caller could observe aliasing through)
     /// — `Result`, not infallible, because `scale` has a real domain
     /// (family D): it must be finite and strictly positive, or
-    /// [`KernelError::InvalidScale`] is returned rather than accepted.
+    /// [`crate::error::KernelError::InvalidScale`] is returned rather than accepted.
     /// `0.0` in particular is NOT a safe default to silently accept:
     /// `scale * scores == 0` everywhere makes `pre_softmax == mask`, so the
     /// op would confidently compute a UNIFORM-over-unmasked-positions
@@ -792,7 +792,7 @@ impl SoftmaxLastDimFused {
     /// `cpu_fwd`/`cuda_fwd`: `scale` is frozen, already-validated
     /// construction data by the time either runs (the same "validated
     /// once, at the domain edge, not on every call" shape
-    /// [`crate::ops::rope`]'s `rope_dims` documents) — and, unlike a `pub`
+    /// `crate::ops::rope`'s `rope_dims` documents) — and, unlike a `pub`
     /// field, the private `scale` field means this constructor is the ONLY
     /// way to set it, so there is no bypass path left to document.
     pub fn with_scale(mut self, scale: f32) -> crate::error::Result<Self> {

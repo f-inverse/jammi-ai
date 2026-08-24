@@ -233,6 +233,12 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     let vram_baseline = device_memory_used_bytes().unwrap_or(0);
     let sampler = VramSampler::start();
 
+    // Positive-proof channel for the fused-vs-eager LayerNorm A/B: a
+    // delta over the process-wide dispatch counters taken immediately
+    // around the step loop, so this run's dispatch count is isolated
+    // from anything an earlier tier in the same process invocation did.
+    let ln_dispatch_before = jammi_encoders::ln_dispatch_snapshot();
+
     let mut times = Vec::with_capacity(params.steps);
     for step in 0..(params.warmup + params.steps) {
         let t0 = Instant::now();
@@ -270,6 +276,8 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
         }
     }
 
+    let ln_dispatch_after = jammi_encoders::ln_dispatch_snapshot();
+
     times.sort_by(f64::total_cmp);
     let p50 = times[times.len() / 2];
     let mean = times.iter().sum::<f64>() / times.len() as f64;
@@ -286,6 +294,12 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
         batched_forward: params.batched_forward,
         trainable_tensors: trainable.len(),
         steps_measured: times.len(),
+        ln_fused_dispatches: ln_dispatch_after
+            .fused
+            .saturating_sub(ln_dispatch_before.fused),
+        ln_eager_dispatches: ln_dispatch_after
+            .eager
+            .saturating_sub(ln_dispatch_before.eager),
         s_per_step_p50: Measurement::measured(p50, "s"),
         s_per_step_mean: Measurement::measured(mean, "s"),
         steps_per_s: Measurement::measured(1.0 / p50, "steps/s"),

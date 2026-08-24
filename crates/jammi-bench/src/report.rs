@@ -1112,6 +1112,23 @@ pub struct FinetuneStepTier {
     pub trainable_tensors: usize,
     /// Measured steps after warmup.
     pub steps_measured: usize,
+    /// How many times `jammi_encoders`' bias-free training-mode LayerNorm
+    /// actually dispatched the fused kernel (`jammi_kernels::ops::LayerNormFused`)
+    /// during this run (warmup + measured steps) — a delta over the
+    /// process-wide dispatch counters taken immediately before and after
+    /// the step loop. This is the positive-proof channel a fused-vs-eager
+    /// A/B needs: the step time alone cannot distinguish "the fused path
+    /// ran and was fast" from "the fused path silently fell back and
+    /// eager was fast anyway" (K2, scope decision 6 of the fused-kernels
+    /// plan).
+    pub ln_fused_dispatches: u64,
+    /// How many times that same call site fell back to the eager
+    /// (`slow()`) composition instead — outside the fused kernel's domain
+    /// (dtype/contiguity/device/hidden), or because the admission
+    /// predicate failed for any other stated reason. Non-zero here on a
+    /// `ModernBert` bias-free training run is itself a signal worth
+    /// reading, not just a complement of `ln_fused_dispatches`.
+    pub ln_eager_dispatches: u64,
     pub s_per_step_p50: Measurement,
     pub s_per_step_mean: Measurement,
     pub steps_per_s: Measurement,

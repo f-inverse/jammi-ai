@@ -52,6 +52,18 @@ pub use precision::compute_precision_to_dtype;
 
 use candle_core::Tensor;
 
+/// A snapshot of the bias-free training-mode LayerNorm's fused/eager
+/// dispatch counts (see `crate::layer_norm`'s module doc for the
+/// admission mechanism this counts). `layer_norm` is a crate-private
+/// module — its dispatch-counter static is otherwise unnameable from
+/// outside this crate — so this is the read API a durable job record or
+/// a bench report uses to state which kernel path actually ran during a
+/// measured run (`jammi-bench`'s `finetune_step` tier reads this around
+/// its step loop).
+pub fn ln_dispatch_snapshot() -> jammi_kernels::admission::DispatchSnapshot {
+    layer_norm::LN_DISPATCH_COUNTERS.snapshot()
+}
+
 /// Contiguity-safe matmul — the single matmul primitive every encoder uses.
 ///
 /// candle's **CUDA** matmul rejects two operand layouts its **CPU** matmul

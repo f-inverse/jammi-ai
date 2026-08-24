@@ -44,11 +44,13 @@
 //!   is a REVIEW concern this bound cannot catch at compile time — stated
 //!   here explicitly rather than left as an overclaim.
 
-use candle_core::{CustomOp2, Result, Tensor};
+use candle_core::{CustomOp2, CustomOp3, Result, Tensor};
 
 mod axpy;
+mod layer_norm;
 
 pub use axpy::Axpy;
+pub use layer_norm::{LayerNormFused, MAX_HIDDEN};
 
 mod sealed {
     //! Not `pub` at the `ops` level, so `Sealed` is unreachable outside
@@ -59,19 +61,39 @@ mod sealed {
 
 /// Every fused op this crate exports must implement this. See the module
 /// doc for what the `Copy` bound does and does not guarantee, and why the
-/// enforcement is total (via [`apply2`]) rather than a per-op opt-in
-/// assertion. `'static` matches `CustomOp2`'s own bound on `apply_op2`
-/// (an op carries no borrowed data — every field is owned, plain
-/// construction data like `Axpy::alpha`).
-pub trait KernelOp: CustomOp2 + Copy + Send + Sync + 'static + sealed::Sealed {}
+/// enforcement is total (via [`apply2`]/[`apply3`]) rather than a per-op
+/// opt-in assertion. `'static` matches `CustomOp2`/`CustomOp3`'s own bound
+/// on `apply_op2`/`apply_op3` (an op carries no borrowed data — every
+/// field is owned, plain construction data like `Axpy::alpha` or
+/// `LayerNormFused::eps`).
+///
+/// Deliberately NOT bounded by `CustomOp2` (or any specific arity) here:
+/// `LayerNormFused`'s backward recomputes `dx` through an internal
+/// `CustomOp3` helper (`x`, `gamma`, `grad_output` — three tensor
+/// arguments, since candle 0.11 has no save-for-backward channel to stash
+/// the recomputed mean/invvar in), so the arity-agnostic statelessness
+/// guarantee (`Copy + Send + Sync + Sealed`) lives here, and each
+/// arity-specific `applyN` function below adds its own `CustomOpN` bound.
+pub trait KernelOp: Copy + Send + Sync + 'static + sealed::Sealed {}
 
-impl<T> KernelOp for T where T: CustomOp2 + Copy + Send + Sync + 'static + sealed::Sealed {}
+impl<T> KernelOp for T where T: Copy + Send + Sync + 'static + sealed::Sealed {}
 
 /// The sanctioned way to run a binary (`CustomOp2`) fused op: requires
-/// `T: KernelOp`, so this is the compile-time enforcement point every
-/// call site (present and future) goes through. A future op of a
-/// different arity (`CustomOp1`/`CustomOp3`) gets its own `apply1`/
-/// `apply3` following the same pattern.
-pub fn apply2<T: KernelOp>(x: &Tensor, y: &Tensor, op: T) -> Result<Tensor> {
+/// `T: KernelOp + CustomOp2`, so this is the compile-time enforcement
+/// point every call site (present and future) goes through.
+pub fn apply2<T: KernelOp + CustomOp2>(x: &Tensor, y: &Tensor, op: T) -> Result<Tensor> {
     x.apply_op2(y, op)
+}
+
+/// The sanctioned way to run a ternary (`CustomOp3`) fused op — the same
+/// enforcement point as [`apply2`], for ops that take three tensor
+/// arguments (e.g. `LayerNormFused`'s internal backward-dx kernel: `x`,
+/// `gamma`, `grad_output`).
+pub fn apply3<T: KernelOp + CustomOp3>(
+    x: &Tensor,
+    y: &Tensor,
+    z: &Tensor,
+    op: T,
+) -> Result<Tensor> {
+    x.apply_op3(y, z, op)
 }

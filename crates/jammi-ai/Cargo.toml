@@ -157,7 +157,10 @@ live-distributed-tests = ["local", "jammi-db/storage-s3"]
 # the live run is a GPU-host (A10G) gate.
 live-gpu-tests = ["local"]
 # CUDA / Metal acceleration of the embedded engine — only meaningful with `local`.
-cuda = ["local", "candle-core/cuda", "candle-nn/cuda"]
+# `jammi-encoders/cuda` is the first real fork in this chain (added the
+# fused-kernels commit): jammi-encoders previously had no `cuda` feature at
+# all, so this bypassed it entirely.
+cuda = ["local", "candle-core/cuda", "candle-nn/cuda", "jammi-encoders/cuda"]
 metal = ["local", "candle-core/metal", "candle-nn/metal"]
 
 # The `it` integration suite drives the embedded engine end-to-end (model loading,

@@ -30,7 +30,7 @@
 
 use candle_core::{DType, Device, Tensor, Var};
 use half::bf16;
-use jammi_kernels::ops::{apply2, Axpy};
+use jammi_kernels::ops::{apply2, Axpy, LayerNormFused};
 
 fn axpy(alpha: f64, x: &Tensor, y: &Tensor) -> candle_core::Result<Tensor> {
     apply2(x, y, Axpy::new(alpha))
@@ -340,4 +340,312 @@ fn parity_multi_block_not_a_multiple_of_block_size() {
     let y = fixture(2000, 8.0);
     assert_parity_f32(&cuda, -2.25, &x, &y);
     assert_parity_bf16(&cuda, -2.25, &x, &y);
+}
+
+// =======================================================================
+// LayerNormFused CPU<->CUDA parity: fwd + BOTH backward outputs (dx,
+// dgamma). Covers the same divergence-prone classes as Axpy's suite above
+// (contiguous, narrowed-with-nonzero-offset, empty, a block-size boundary)
+// PLUS the LN-specific dimensions this op actually varies over: hidden
+// 1024 (ModernBERT-large) and a non-1024 hidden, and multiple rows per
+// launch (one CUDA thread block per row).
+// =======================================================================
+
+fn ln_forward(
+    eps: f64,
+    dgamma_needed: bool,
+    x: &Tensor,
+    gamma: &Tensor,
+) -> candle_core::Result<Tensor> {
+    apply2(x, gamma, LayerNormFused::new(eps, dgamma_needed))
+}
+
+fn assert_ln_parity_f32(
+    cuda: &Device,
+    eps: f64,
+    rows: usize,
+    hidden: usize,
+    xv: &[f32],
+    gv: &[f32],
+) {
+    let cpu = Device::Cpu;
+    let n = rows * hidden;
+
+    let x_cpu = Var::from_tensor(&Tensor::from_slice(xv, (rows, hidden), &cpu).unwrap()).unwrap();
+    let g_cpu = Var::from_tensor(&Tensor::from_slice(gv, (hidden,), &cpu).unwrap()).unwrap();
+    let out_cpu = ln_forward(eps, true, &x_cpu, &g_cpu).unwrap();
+    let grads_cpu = out_cpu.backward().unwrap();
+
+    let x_gpu = Var::from_tensor(&Tensor::from_slice(xv, (rows, hidden), cuda).unwrap()).unwrap();
+    let g_gpu = Var::from_tensor(&Tensor::from_slice(gv, (hidden,), cuda).unwrap()).unwrap();
+    let out_gpu = ln_forward(eps, true, &x_gpu, &g_gpu).unwrap();
+    let grads_gpu = out_gpu.backward().unwrap();
+
+    let out_cpu_v: Vec<f32> = out_cpu.flatten_all().unwrap().to_vec1().unwrap();
+    let out_gpu_v: Vec<f32> = out_gpu
+        .to_device(&cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(out_cpu_v.len(), n);
+    assert_eq!(out_gpu_v.len(), n, "LN GPU fwd length mismatch");
+    for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
+        assert!(
+            ((*c - *g).abs() as f64) <= F32_TOL,
+            "ln fwd[{i}]: cpu {c} vs cuda {g} (rows={rows}, hidden={hidden})"
+        );
+    }
+
+    let dx_cpu: Vec<f32> = grads_cpu
+        .get(&x_cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let dx_gpu: Vec<f32> = grads_gpu
+        .get(&x_gpu)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(dx_cpu.len(), n);
+    assert_eq!(dx_gpu.len(), n, "LN GPU dx length mismatch");
+    for (i, (c, g)) in dx_cpu.iter().zip(dx_gpu.iter()).enumerate() {
+        assert!(
+            ((*c - *g).abs() as f64) <= F32_TOL,
+            "ln dx[{i}]: cpu {c} vs cuda {g}"
+        );
+    }
+
+    let dg_cpu: Vec<f32> = grads_cpu.get(&g_cpu).unwrap().to_vec1().unwrap();
+    let dg_gpu: Vec<f32> = grads_gpu
+        .get(&g_gpu)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(dg_cpu.len(), hidden);
+    assert_eq!(dg_gpu.len(), hidden, "LN GPU dgamma length mismatch");
+    for (i, (c, g)) in dg_cpu.iter().zip(dg_gpu.iter()).enumerate() {
+        assert!(
+            ((*c - *g).abs() as f64) <= F32_TOL,
+            "ln dgamma[{i}]: cpu {c} vs cuda {g}"
+        );
+    }
+}
+
+fn assert_ln_parity_bf16(
+    cuda: &Device,
+    eps: f64,
+    rows: usize,
+    hidden: usize,
+    xv: &[f32],
+    gv: &[f32],
+) {
+    let cpu = Device::Cpu;
+    let n = rows * hidden;
+    let xb: Vec<bf16> = xv.iter().map(|&v| bf16::from_f32(v)).collect();
+    let gb: Vec<bf16> = gv.iter().map(|&v| bf16::from_f32(v)).collect();
+
+    let x_cpu = Var::from_tensor(&Tensor::from_slice(&xb, (rows, hidden), &cpu).unwrap()).unwrap();
+    let g_cpu = Var::from_tensor(&Tensor::from_slice(&gb, (hidden,), &cpu).unwrap()).unwrap();
+    let out_cpu = ln_forward(eps, true, &x_cpu, &g_cpu).unwrap();
+    let grads_cpu = out_cpu.backward().unwrap();
+
+    let x_gpu = Var::from_tensor(&Tensor::from_slice(&xb, (rows, hidden), cuda).unwrap()).unwrap();
+    let g_gpu = Var::from_tensor(&Tensor::from_slice(&gb, (hidden,), cuda).unwrap()).unwrap();
+    let out_gpu = ln_forward(eps, true, &x_gpu, &g_gpu).unwrap();
+    let grads_gpu = out_gpu.backward().unwrap();
+
+    let to_f32 = |t: &Tensor| -> Vec<f32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap()
+    };
+    // Same accumulation semantics on both devices (f32-accumulate, round
+    // to bf16 once) — an fmad-class ~1-ULP-at-bf16 bound, same rationale
+    // as `assert_parity_bf16` above.
+    let bf16_bound = |c: f32, g: f32| 2.0 * 2.0f32.powi(-7) * c.abs().max(g).max(1.0);
+
+    let out_cpu_v = to_f32(&out_cpu);
+    let out_gpu_v = to_f32(&out_gpu.to_device(&cpu).unwrap());
+    assert_eq!(out_cpu_v.len(), n);
+    assert_eq!(out_gpu_v.len(), n, "LN bf16 GPU fwd length mismatch");
+    for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
+        assert!(
+            (c - g).abs() <= bf16_bound(*c, *g),
+            "ln bf16 fwd[{i}]: cpu {c} vs cuda {g}"
+        );
+    }
+
+    let dx_cpu_v = to_f32(&grads_cpu.get(&x_cpu).unwrap().clone());
+    let dx_gpu_v = to_f32(&grads_gpu.get(&x_gpu).unwrap().to_device(&cpu).unwrap());
+    assert_eq!(dx_cpu_v.len(), n);
+    assert_eq!(dx_gpu_v.len(), n, "LN bf16 GPU dx length mismatch");
+    for (i, (c, g)) in dx_cpu_v.iter().zip(dx_gpu_v.iter()).enumerate() {
+        assert!(
+            (c - g).abs() <= bf16_bound(*c, *g),
+            "ln bf16 dx[{i}]: cpu {c} vs cuda {g}"
+        );
+    }
+
+    let dg_cpu_v = to_f32(&grads_cpu.get(&g_cpu).unwrap().clone());
+    let dg_gpu_v = to_f32(&grads_gpu.get(&g_gpu).unwrap().to_device(&cpu).unwrap());
+    assert_eq!(dg_cpu_v.len(), hidden);
+    assert_eq!(dg_gpu_v.len(), hidden, "LN bf16 GPU dgamma length mismatch");
+    for (i, (c, g)) in dg_cpu_v.iter().zip(dg_gpu_v.iter()).enumerate() {
+        assert!(
+            (c - g).abs() <= bf16_bound(*c, *g),
+            "ln bf16 dgamma[{i}]: cpu {c} vs cuda {g}"
+        );
+    }
+}
+
+#[test]
+fn ln_parity_contiguous_hidden_1024_modernbert_shape() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let rows = 4;
+    let hidden = 1024;
+    let x = fixture(rows * hidden, 1.0);
+    let g = fixture(hidden, 2.0);
+    assert_ln_parity_f32(&cuda, 1e-5, rows, hidden, &x, &g);
+    assert_ln_parity_bf16(&cuda, 1e-5, rows, hidden, &x, &g);
+}
+
+#[test]
+fn ln_parity_contiguous_non_1024_hidden() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    // Not a power of two, not a multiple of the kernel's LN_BLOCK (256) —
+    // exercises the grid-stride tail within a row.
+    let rows = 3;
+    let hidden = 300;
+    let x = fixture(rows * hidden, 3.0);
+    let g = fixture(hidden, 4.0);
+    assert_ln_parity_f32(&cuda, 1e-5, rows, hidden, &x, &g);
+    assert_ln_parity_bf16(&cuda, 1e-5, rows, hidden, &x, &g);
+}
+
+#[test]
+fn ln_parity_narrowed_with_nonzero_offset() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    // A [3, rows, hidden] tensor narrowed to its middle "batch" slab: the
+    // resulting [rows, hidden] view is contiguous but has a nonzero
+    // `start_offset` — the same class of bug `Axpy`'s CUDA arm had
+    // (reading the base buffer's first elements instead of the tensor's
+    // real range) reproduced for LN's own `contiguous_offsets()` slicing.
+    let rows = 2;
+    let hidden = 16;
+    let base_x = fixture(3 * rows * hidden, 5.0);
+    let g = fixture(hidden, 6.0);
+    let cpu = Device::Cpu;
+
+    let x_cpu = Tensor::from_slice(&base_x, (3, rows, hidden), &cpu)
+        .unwrap()
+        .narrow(0, 1, 1)
+        .unwrap()
+        .flatten(0, 1)
+        .unwrap();
+    assert!(x_cpu.is_contiguous());
+    assert_ne!(x_cpu.layout().start_offset(), 0);
+
+    let x_gpu = Tensor::from_slice(&base_x, (3, rows, hidden), &cuda)
+        .unwrap()
+        .narrow(0, 1, 1)
+        .unwrap()
+        .flatten(0, 1)
+        .unwrap();
+    let g_cpu = Tensor::from_slice(&g, (hidden,), &cpu).unwrap();
+    let g_gpu = Tensor::from_slice(&g, (hidden,), &cuda).unwrap();
+
+    let out_cpu: Vec<f32> = ln_forward(1e-5, false, &x_cpu, &g_cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let out_gpu: Vec<f32> = ln_forward(1e-5, false, &x_gpu, &g_gpu)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(out_cpu.len(), rows * hidden);
+    assert_eq!(
+        out_gpu.len(),
+        rows * hidden,
+        "narrowed LN GPU fwd length mismatch"
+    );
+    for (i, (c, g)) in out_cpu.iter().zip(out_gpu.iter()).enumerate() {
+        assert!(
+            ((*c - *g).abs() as f64) <= F32_TOL,
+            "narrowed ln fwd[{i}]: cpu {c} vs cuda {g}"
+        );
+    }
+    // And matches hand-computed LayerNorm over the middle slab's own
+    // data, not the base buffer's first `rows*hidden` elements.
+    let expected_slab = &base_x[rows * hidden..2 * rows * hidden];
+    for r in 0..rows {
+        let row = &expected_slab[r * hidden..(r + 1) * hidden];
+        let mean: f32 = row.iter().sum::<f32>() / hidden as f32;
+        let var: f32 = row.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / hidden as f32;
+        let invvar = 1.0 / (var + 1e-5f32).sqrt();
+        for i in 0..hidden {
+            let expected = (row[i] - mean) * invvar * g[i];
+            let got = out_gpu[r * hidden + i];
+            assert!(
+                (got - expected).abs() <= F32_TOL as f32,
+                "narrowed ln fwd[{r},{i}] vs hand-computed: cuda {got} vs {expected}"
+            );
+        }
+    }
+}
+
+#[test]
+fn ln_parity_empty_batch() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let cpu = Device::Cpu;
+    let hidden = 8;
+    let x_cpu = Tensor::from_slice(&[] as &[f32], (0, hidden), &cpu).unwrap();
+    let x_gpu = Tensor::from_slice(&[] as &[f32], (0, hidden), &cuda).unwrap();
+    let g = fixture(hidden, 9.0);
+    let g_cpu = Tensor::from_slice(&g, (hidden,), &cpu).unwrap();
+    let g_gpu = Tensor::from_slice(&g, (hidden,), &cuda).unwrap();
+
+    let out_cpu: Vec<f32> = ln_forward(1e-5, false, &x_cpu, &g_cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    // Must not attempt an illegal zero-block launch.
+    let out_gpu: Vec<f32> = ln_forward(1e-5, false, &x_gpu, &g_gpu)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert!(out_cpu.is_empty());
+    assert!(out_gpu.is_empty());
 }

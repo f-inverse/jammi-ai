@@ -7,6 +7,7 @@ use candle_core::cuda_backend::cudarc::driver::LaunchConfig;
 use candle_core::{CudaDevice, CudaStorage, DType, Error, Result};
 use half::bf16;
 
+pub(crate) mod attention_block;
 pub(crate) mod axpy;
 pub(crate) mod dropout;
 pub(crate) mod geglu;

@@ -427,7 +427,7 @@ fn rope_grad_table(
 /// performed here (this op is purely elementwise, unlike LayerNorm), so
 /// determinism follows directly from the absence of any accumulation
 /// order to fix.
-fn rope_fwd_row_f32(x: &[f32], cos: &[f32], sin: &[f32], sign: f32, out: &mut [f32]) {
+pub(crate) fn rope_fwd_row_f32(x: &[f32], cos: &[f32], sin: &[f32], sign: f32, out: &mut [f32]) {
     let hidden = x.len();
     let half = hidden / 2;
     for col in 0..hidden {

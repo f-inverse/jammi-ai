@@ -49,6 +49,11 @@ use candle_core::{
     CpuStorage, CustomOp1, CustomOp2, CustomOp3, Error, Layout, Result, Shape, Tensor,
 };
 
+// `pub(crate)`, not private like `axpy`/`layer_norm`/`rope`: `crate::cuda::attention_block`
+// imports `attention_dims`/`check_mask`/`check_rope_pack`/`check_window` directly
+// from here (the SAME domain checks the CPU arm applies), mirroring
+// `ops::softmax`'s identical `pub(crate)` rationale.
+pub(crate) mod attention_block;
 mod axpy;
 mod dropout;
 // `pub(crate)`, not private like `axpy`/`scaled_cast_add`: each op's CUDA
@@ -64,6 +69,15 @@ pub(crate) mod rope;
 mod scaled_cast_add;
 pub(crate) mod softmax;
 
+pub use attention_block::AttentionBlockFused;
+/// Re-exported under this name (rather than `ops::attention_block::HEAD_DIM`
+/// directly) so a call site's admission predicate reads `ATTENTION_BLOCK_HEAD_DIM`
+/// without a `attention_block::` path segment, mirroring `MAX_HEAD_DIM`/`MAX_LAST_DIM`'s
+/// own flat re-export shape.
+pub const ATTENTION_BLOCK_HEAD_DIM: usize = attention_block::HEAD_DIM;
+/// See [`ATTENTION_BLOCK_HEAD_DIM`]'s doc for why this is a real `const`
+/// definition here rather than a `pub use ... as` rename.
+pub const ATTENTION_BLOCK_MAX_SEQ: usize = attention_block::MAX_SEQ;
 pub use axpy::Axpy;
 pub use dropout::{DropoutFused, PhiloxKatProbe};
 pub use geglu::{GegluFused, GeluVariant};

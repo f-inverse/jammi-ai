@@ -89,20 +89,52 @@ fn build_base_with_zero_bias(
     Linear::new(base.weight().clone(), Some(bias))
 }
 
+/// A fixed, deterministic, SMALL-INTEGER `f32` fixture (`{-4, .., 4}`) —
+/// the SAME discipline `jammi_kernels::ops::low_rank_residual_linear`'s own
+/// `exact_fixture` and `lora_linear_oracles.rs`'s copy of it use: every
+/// partial sum this composition's GEMMs form from these values stays a
+/// small exact integer, so a `assert_eq!` (bit-exact) claim across the
+/// fused CustomOp3 path and a manually-reconstructed `[mul, cast, add]`
+/// eager composition is architecture-independent BY CONSTRUCTION — those
+/// two code paths legitimately hand `gemm` DIFFERENT operand stride
+/// patterns for the mathematically identical reduction (the fused path
+/// packs `lora_a`/`lora_b` into one row-packed `ab` buffer; the eager path
+/// calls three independent `Linear::forward`s), and `gemm`'s own
+/// summation-order choice can depend on that — a real, EXPECTED 1-`f32`-
+/// ULP divergence this test used to hit on non-integer (`Tensor::randn`/
+/// `sin`-fixture) values, NOT a wiring bug (see
+/// `ops::low_rank_residual_linear`'s own module doc and
+/// `lora_linear_oracles.rs`'s "oracle contract" section for the same
+/// citation). This test's OWN stated purpose is proving the WIRING (same
+/// `base_out`/`lora_out`, no extra divergence) — exact-integer values let
+/// it keep the bit-exact assertion that purpose calls for.
+fn exact_fixture(n: usize, phase: i64) -> Vec<f32> {
+    (0..n)
+        .map(|i| {
+            let v = (i as i64 * 7 + phase * 13).rem_euclid(9);
+            (v - 4) as f32
+        })
+        .collect()
+}
+
 #[test]
 fn fused_epilogue_matches_manual_eager_reconstruction_bit_exactly() {
     let device = cpu();
     let varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
 
-    let base_for_lora = build_base(8, 16, &device, DType::F32);
-    let base_for_eager = build_base(8, 16, &device, DType::F32);
-    let x = rand_input(&device);
+    let (in_features, out_features, rank) = (8usize, 16usize, 4usize);
+    let w_v = exact_fixture(out_features * in_features, 2);
+    let w_for_lora = Tensor::from_slice(&w_v, (out_features, in_features), &device).unwrap();
+    let w_for_eager = w_for_lora.clone();
+    let base_for_lora = Linear::new(w_for_lora, None);
+    let base_for_eager = Linear::new(w_for_eager, None);
+    let x_v = exact_fixture(2 * 5 * in_features, 1);
+    let x = Tensor::from_slice(&x_v, (2, 5, in_features), &device).unwrap();
     let alpha = 8.0;
-    let rank = 4;
-    let scaling = alpha / rank as f64;
+    let scaling = alpha / rank as f64; // 2.0, exact in binary.
 
-    let lora = LoraLinear::new(
+    let mut lora = LoraLinear::new(
         base_for_lora,
         rank,
         alpha,
@@ -114,6 +146,15 @@ fn fused_epilogue_matches_manual_eager_reconstruction_bit_exactly() {
         &vb,
     )
     .unwrap();
+    // Overwrite the seeded-random draw with the SAME exact-integer
+    // discipline (`forward` reads these public fields directly — see
+    // `LoraLinear::forward`'s `self.lora_a`/`self.lora_b` uses — so both
+    // the fused and the manual-eager reconstruction below see the
+    // identical values).
+    let a_v = exact_fixture(rank * in_features, 3);
+    let b_v = exact_fixture(out_features * rank, 4);
+    lora.lora_a = Tensor::from_slice(&a_v, (rank, in_features), &device).unwrap();
+    lora.lora_b = Tensor::from_slice(&b_v, (out_features, rank), &device).unwrap();
 
     // On CPU with an F32 backbone the fused kernel's admission domain
     // holds (device CPU, both slots F32, both contiguous, shapes equal),
@@ -629,42 +670,64 @@ fn fused_and_eager_arms_draw_the_bit_identical_dropout_stream_at_the_same_resume
     let device = cpu();
     let (in_features, out_features, rank) = (8usize, 16usize, 4usize);
     let seed = 999u64;
-    let x_v: Vec<f32> = (0..2 * 5 * in_features)
-        .map(|i| ((i as f32) * 0.23).sin())
-        .collect();
+    // Exact-integer `x`/base-weight/`lora_a`/`lora_b` (see this file's
+    // `exact_fixture` doc) AND `p = 0.5` (so the inverted-dropout scale
+    // `1/(1-p) == 2.0` is itself exact in binary): this test's OWN claim
+    // is that the FUSED and EAGER arms draw the bit-identical dropout
+    // STREAM, not a re-litigation of GEMM summation-order parity (already
+    // covered by `jammi-kernels`' own oracles) — exact-integer values
+    // through every rounding point (including dropout's own scale)
+    // isolate that claim from a legitimate, expected 1-ULP divergence the
+    // fused (row-packed `ab`) and eager (three independent `Linear`
+    // calls) code paths can otherwise hand `gemm` via different operand
+    // stride patterns.
+    let x_v = exact_fixture(2 * 5 * in_features, 21);
     let x = Tensor::from_slice(&x_v, (2, 5, in_features), &device).unwrap();
+    let w_v = exact_fixture(out_features * in_features, 22);
+    let a_v = exact_fixture(rank * in_features, 23);
+    let b_v = exact_fixture(out_features * rank, 24);
+    let p = 0.5f32;
 
     let varmap_f = VarMap::new();
     let vb_f = VarBuilder::from_varmap(&varmap_f, DType::F32, &device);
-    let base_f = build_base(in_features, out_features, &device, DType::F32);
-    let lora_f = LoraLinear::new(
+    let base_f = Linear::new(
+        Tensor::from_slice(&w_v, (out_features, in_features), &device).unwrap(),
+        None,
+    );
+    let mut lora_f = LoraLinear::new(
         base_f,
         rank,
         8.0,
         false,
         LoraInitMode::Gaussian,
-        Some(0.3),
+        Some(p),
         seed,
         &varmap_f,
         &vb_f,
     )
     .unwrap();
+    lora_f.lora_a = Tensor::from_slice(&a_v, (rank, in_features), &device).unwrap();
+    lora_f.lora_b = Tensor::from_slice(&b_v, (out_features, rank), &device).unwrap();
 
     let varmap_e = VarMap::new();
     let vb_e = VarBuilder::from_varmap(&varmap_e, DType::F32, &device);
-    let base_e = build_base_with_zero_bias(in_features, out_features, &device, DType::F32);
-    let lora_e = LoraLinear::new(
+    let w_for_eager = Tensor::from_slice(&w_v, (out_features, in_features), &device).unwrap();
+    let zero_bias = Tensor::zeros((out_features,), DType::F32, &device).unwrap();
+    let base_e = Linear::new(w_for_eager, Some(zero_bias));
+    let mut lora_e = LoraLinear::new(
         base_e,
         rank,
         8.0,
         false,
         LoraInitMode::Gaussian,
-        Some(0.3),
+        Some(p),
         seed,
         &varmap_e,
         &vb_e,
     )
     .unwrap();
+    lora_e.lora_a = Tensor::from_slice(&a_v, (rank, in_features), &device).unwrap();
+    lora_e.lora_b = Tensor::from_slice(&b_v, (out_features, rank), &device).unwrap();
 
     let before_f = lora_linear_fused_dispatch_snapshot();
     let y_f = lora_f.forward(&x).unwrap();
@@ -831,4 +894,92 @@ fn production_path_retains_fewer_tape_nodes_fused_vs_eager_fallback() {
     // Pin the MEASURED constants directly (not just "fewer than").
     assert_eq!(nodes_fused, 5, "measured production-path FUSED node count");
     assert_eq!(nodes_eager, 11, "measured production-path EAGER node count");
+}
+
+/// (Round-2 audit A3): the fused arm's `self.scaling as f32` (a plain Rust
+/// narrowing cast) vs the eager arm's `lora_out * self.scaling` (an `f64`
+/// scalar multiplied onto an `F32` tensor via candle's `Affine` CPU
+/// kernel) — MEASURED, not assumed equal, at an rsLoRA scaling that is
+/// genuinely irrational in binary: `alpha = 8, rank = 8` ->
+/// `scaling = 8 / sqrt(8) = 2.8284271247461903`, which has no exact `f32`
+/// representation either way.
+///
+/// Reading candle-core 0.11.0's own CPU `Affine` kernel
+/// (`cpu_backend/mod.rs`, `impl Map1 for Affine`: `let mul =
+/// T::from_f64(self.0);` then `v * mul` in `T`'s own arithmetic) shows it
+/// narrows the `f64` scaling constant to `T` (here `f32`) FIRST, via
+/// `f32::from_f64` — the SAME round-to-nearest `f64`->`f32` narrowing
+/// Rust's `as f32` performs. So the fused arm's `self.scaling as f32` and
+/// the eager arm's `T::from_f64(self.scaling)` narrow to the IDENTICAL
+/// `f32` constant, and both then multiply an `f32` tensor by that SAME
+/// constant — no divergence should exist at this ONE rounding point. This
+/// test proves that directly (exact-integer `x`/`w`/`lora_a`/`lora_b` so
+/// the ONLY non-exact value anywhere in the computation is `scaling`
+/// itself), rather than leaving it assumed from reading the source alone.
+#[test]
+fn rslora_irrational_scaling_agrees_between_fused_and_eager_arms_at_f32() {
+    let device = cpu();
+    let (in_features, out_features, rank) = (8usize, 16usize, 8usize);
+    let alpha = 8.0;
+    let use_rslora = true; // scaling = alpha / sqrt(rank) = 2.8284271247461903, irrational in binary.
+
+    let x_v = exact_fixture(2 * 5 * in_features, 41);
+    let x = Tensor::from_slice(&x_v, (2, 5, in_features), &device).unwrap();
+    let w_v = exact_fixture(out_features * in_features, 42);
+    let a_v = exact_fixture(rank * in_features, 43);
+    let b_v = exact_fixture(out_features * rank, 44);
+
+    let varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+    let base_for_lora = Linear::new(
+        Tensor::from_slice(&w_v, (out_features, in_features), &device).unwrap(),
+        None,
+    );
+    let mut lora = LoraLinear::new(
+        base_for_lora,
+        rank,
+        alpha,
+        use_rslora,
+        LoraInitMode::Gaussian,
+        None,
+        13,
+        &varmap,
+        &vb,
+    )
+    .unwrap();
+    lora.lora_a = Tensor::from_slice(&a_v, (rank, in_features), &device).unwrap();
+    lora.lora_b = Tensor::from_slice(&b_v, (out_features, rank), &device).unwrap();
+
+    // Fused arm: bias-free F32 base on CPU, training — dispatches through
+    // `LowRankResidualLinear`'s `self.scaling as f32`.
+    let fused_out = lora.forward(&x).unwrap();
+
+    // Eager arm: the SAME `eager_epilogue` formula `forward` itself uses
+    // in eval mode (`lora_out * self.scaling`, `scaling: f64`), built by
+    // hand here so it runs even though `lora` is in training mode.
+    let base_for_eager = Linear::new(
+        Tensor::from_slice(&w_v, (out_features, in_features), &device).unwrap(),
+        None,
+    );
+    let base_out = base_for_eager.forward(&x).unwrap();
+    let a_lin = Linear::new(lora.lora_a.clone(), None);
+    let after_a = a_lin.forward(&x).unwrap();
+    let b_lin = Linear::new(lora.lora_b.clone(), None);
+    let lora_out = b_lin.forward(&after_a).unwrap();
+    // `lora.scaling` is a private field (this is an external integration
+    // test); recompute it via the SAME documented formula
+    // (`alpha / sqrt(rank)` for rsLoRA) rather than reach for it.
+    let scaling = alpha / (rank as f64).sqrt();
+    let scaled = (&lora_out * scaling).unwrap();
+    let eager_out = (&base_out + &scaled).unwrap();
+
+    let fused_v = fused_out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let eager_v = eager_out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    assert_eq!(
+        fused_v, eager_v,
+        "rsLoRA's irrational scaling must narrow to the IDENTICAL f32 constant \
+         on both arms (self.scaling as f32 == candle Affine's T::from_f64(self.scaling)) \
+         — a real divergence here would mean the fused epilogue silently uses a \
+         DIFFERENT scaling than the documented eager formula"
+    );
 }

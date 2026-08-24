@@ -366,8 +366,9 @@ enum Command {
     /// The encoder fine-tune step tier: time one real LoRA training step —
     /// three encoder forwards live on the tape at once, a cosine-margin triplet
     /// loss, one backward into the adapter tensors, and one AdamW step — over a
-    /// ModernBERT checkpoint on disk. Runs on CPU by default and on a CUDA
-    /// ordinal with `--cuda`.
+    /// ModernBERT, BERT or DistilBERT checkpoint (detected from config.json
+    /// model_type) on disk. Runs on CPU by default and on a CUDA ordinal with
+    /// `--cuda`.
     ///
     /// Every number is RECORDED, never gated: a step time is a property of
     /// `code x device x box`, so the only comparison a heterogeneous rented
@@ -391,9 +392,18 @@ enum Command {
         lora_alpha: f64,
         #[arg(long, default_value_t = 0.05)]
         lora_dropout: f32,
-        /// Comma-separated LoRA target selectors.
-        #[arg(long, default_value = "Wqkv,Wo,Wi")]
-        target_modules: String,
+        /// Comma-separated LoRA target selectors. Omit to apply the
+        /// per-model default policy: ModernBERT defaults to `Wqkv,Wo,Wi`;
+        /// BERT and DistilBERT have no universal default (their linears are
+        /// named differently) and refuse with the model's own selector
+        /// vocabulary if this is omitted for them.
+        #[arg(long)]
+        target_modules: Option<String>,
+        /// Explicit model-family override (`modernbert`, `bert`, or
+        /// `distilbert`), for a checkpoint whose `config.json` has no
+        /// `model_type` field. Omit to detect it from the file.
+        #[arg(long)]
+        model_type: Option<String>,
         /// Backbone precision: f32, f16, or bf16.
         #[arg(long, default_value = "f32")]
         backbone_dtype: String,
@@ -483,6 +493,7 @@ async fn main() -> std::process::ExitCode {
             lora_alpha,
             lora_dropout,
             target_modules,
+            model_type,
             backbone_dtype,
             cuda,
             seed,
@@ -496,12 +507,14 @@ async fn main() -> std::process::ExitCode {
             lora_rank,
             lora_alpha,
             lora_dropout,
-            target_modules: target_modules
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect(),
+            target_modules: target_modules.map(|raw| {
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            }),
+            model_type_override: model_type,
             backbone_dtype: match backbone_dtype.as_str() {
                 "f32" => jammi_numerics::ComputePrecision::F32,
                 "f16" => jammi_numerics::ComputePrecision::F16,

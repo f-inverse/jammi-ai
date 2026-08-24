@@ -125,6 +125,151 @@ fn triplet_loss(a: &Tensor, p: &Tensor, n: &Tensor, margin: f64) -> candle_core:
     raw.relu()?.mean_all()
 }
 
+/// Which of the three trainer-supported text encoders
+/// (`jammi_ai::fine_tune::worker::build_encoder_adapters`) a checkpoint
+/// directory holds.
+///
+/// Detected from `config.json`'s `model_type` field the same way the trainer
+/// reads it (`crates/jammi-ai/src/fine_tune/worker.rs`,
+/// `model_config.get("model_type").and_then(|v| v.as_str())`) — except this
+/// tier refuses an absent or unrecognized value instead of the trainer's
+/// `.unwrap_or("bert")` fallback. A benchmark that silently mis-classified
+/// the model under test would corrupt the per-model profiling this tier
+/// exists for (issue #356, rule 12: profile first, per model), so "which
+/// model did I just measure" must never be a guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelType {
+    ModernBert,
+    Bert,
+    DistilBert,
+}
+
+impl ModelType {
+    pub const ALL: [&'static str; 3] = ["modernbert", "bert", "distilbert"];
+
+    fn parse(raw: &str) -> Result<Self, ModelTypeError> {
+        match raw {
+            "modernbert" => Ok(Self::ModernBert),
+            "bert" => Ok(Self::Bert),
+            "distilbert" => Ok(Self::DistilBert),
+            other => Err(ModelTypeError::Unknown(other.to_string())),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ModernBert => "modernbert",
+            Self::Bert => "bert",
+            Self::DistilBert => "distilbert",
+        }
+    }
+
+    /// Detect from a parsed `config.json`. An explicit `--model-type`
+    /// override always wins over the file's own `model_type` field — the
+    /// override exists precisely because `model_type` CAN be absent from a
+    /// real checkpoint: `jammi_encoders::BertConfig`'s own `model_type` field
+    /// is `#[serde(default)]` `Option<String>` (a raw `BertModel` checkpoint
+    /// need not carry it), and the trainer's own dispatch treats an absent
+    /// field as `"bert"` rather than refusing to build.
+    pub fn detect(
+        config_json: &serde_json::Value,
+        override_type: Option<&str>,
+    ) -> Result<Self, ModelTypeError> {
+        if let Some(explicit) = override_type {
+            return Self::parse(explicit);
+        }
+        match config_json.get("model_type").and_then(|v| v.as_str()) {
+            Some(raw) => Self::parse(raw),
+            None => Err(ModelTypeError::Absent),
+        }
+    }
+
+    /// The LoRA target-module selector vocabulary this model's encoder
+    /// actually wires up — the short names each encoder's `LoraSite::build`
+    /// call passes as `target_name` (`bert.rs`'s six per-layer linears,
+    /// `distilbert.rs`'s six, `modernbert.rs`'s `Wqkv`/`Wo`/`Wi`/`mlp.Wo`).
+    /// `jammi_lora::should_apply_lora` matches a target string against the
+    /// END of the module name, so `"Wo"` also matches ModernBERT's `mlp.Wo`.
+    pub fn lora_target_vocabulary(self) -> &'static [&'static str] {
+        match self {
+            Self::ModernBert => &["Wqkv", "Wo", "Wi"],
+            Self::Bert => &[
+                "query",
+                "key",
+                "value",
+                "dense",
+                "intermediate_dense",
+                "output_dense",
+            ],
+            Self::DistilBert => &["q_lin", "k_lin", "v_lin", "out_lin", "lin1", "lin2"],
+        }
+    }
+}
+
+impl std::fmt::Display for ModelType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Why [`ModelType::detect`] could not resolve a model family. Typed (not a
+/// bare string) so a caller matching on the failure never has to
+/// string-match a message.
+#[derive(Debug)]
+pub enum ModelTypeError {
+    /// `model_type` was present but not one of [`ModelType::ALL`].
+    Unknown(String),
+    /// `config.json` has no `model_type` field and no `--model-type`
+    /// override was supplied.
+    Absent,
+}
+
+impl std::fmt::Display for ModelTypeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unknown(raw) => write!(
+                f,
+                "unknown model_type {raw:?} in config.json; expected one of {:?}, or pass \
+                 --model-type explicitly",
+                ModelType::ALL
+            ),
+            Self::Absent => write!(
+                f,
+                "config.json has no model_type field; pass --model-type explicitly, one of {:?}",
+                ModelType::ALL
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ModelTypeError {}
+
+/// Resolve the LoRA target-module list for `model_type`, applying the
+/// tier's default policy: ModernBERT keeps its historical `Wqkv,Wo,Wi`
+/// default when the caller passes none; BERT and DistilBERT have no
+/// universal default LoRA target set (their linears are named differently,
+/// and a borrowed ModernBERT default would silently match nothing on
+/// either), so an explicit `--target-modules` is required for them and its
+/// absence is a typed error naming the model's own selector vocabulary
+/// rather than a refusal that only shows up later as "matched nothing".
+fn resolve_target_modules(
+    model_type: ModelType,
+    explicit: Option<&[String]>,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    if let Some(modules) = explicit {
+        return Ok(modules.to_vec());
+    }
+    match model_type {
+        ModelType::ModernBert => Ok(vec!["Wqkv".to_string(), "Wo".to_string(), "Wi".to_string()]),
+        other => Err(format!(
+            "--target-modules is required for model_type {other}: it has no universal default \
+             LoRA target set; choose from {:?}",
+            other.lora_target_vocabulary()
+        )
+        .into()),
+    }
+}
+
 /// Parameters the tier drives its step off of.
 #[derive(Debug, Clone)]
 pub struct FinetuneStepParams {
@@ -137,7 +282,15 @@ pub struct FinetuneStepParams {
     pub lora_rank: usize,
     pub lora_alpha: f64,
     pub lora_dropout: f32,
-    pub target_modules: Vec<String>,
+    /// Comma-split LoRA target selectors, or `None` to apply the tier's
+    /// per-model default policy (see [`resolve_target_modules`]): ModernBERT
+    /// defaults to `Wqkv,Wo,Wi`; BERT and DistilBERT have no universal
+    /// default and this tier refuses rather than silently matching nothing.
+    pub target_modules: Option<Vec<String>>,
+    /// Explicit override for the model family, for a checkpoint whose
+    /// `config.json` has no `model_type` field. `None` detects it from the
+    /// file (see [`ModelType::detect`]).
+    pub model_type_override: Option<String>,
     pub backbone_dtype: jammi_numerics::ComputePrecision,
     /// CUDA ordinal, or `None` for CPU.
     pub cuda_device: Option<usize>,
@@ -178,13 +331,15 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     };
 
     let config_raw = std::fs::read_to_string(params.model_dir.join("config.json"))?;
-    let config: jammi_encoders::ModernBertConfig = serde_json::from_str(&config_raw)?;
+    let config_json: serde_json::Value = serde_json::from_str(&config_raw)?;
+    let model_type = ModelType::detect(&config_json, params.model_type_override.as_deref())?;
+    let target_modules = resolve_target_modules(model_type, params.target_modules.as_deref())?;
     let weights = params.model_dir.join("model.safetensors");
 
     let varmap = VarMap::new();
     let empty_ranks = std::collections::HashMap::new();
     let lora = jammi_lora::LoraBuildConfig {
-        target_modules: &params.target_modules,
+        target_modules: &target_modules,
         layers_to_transform: &None,
         lora_rank: params.lora_rank,
         lora_alpha: params.lora_alpha,
@@ -194,14 +349,44 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
         init_mode: jammi_lora::LoraInitMode::ZerosB,
         seed: params.seed,
     };
+    let backbone_dtype = jammi_encoders::compute_precision_to_dtype(params.backbone_dtype);
 
-    let mut encoder = jammi_encoders::ModernBert::builder()
-        .pooling(jammi_encoders::Pooling::Mean)
-        .backbone_dtype(jammi_encoders::compute_precision_to_dtype(
-            params.backbone_dtype,
-        ))
-        .lora(lora)
-        .build(&[weights.as_path()], &config, &device, &varmap)?;
+    // Pooling is Mean for all three, mirroring the trainer's own dispatch
+    // (`build_encoder_adapters` never calls `.pooling(..)`, so it takes each
+    // builder's default — which is Mean; set explicitly here so this stays
+    // true even if that default ever changes).
+    let (mut encoder, vocab_size): (jammi_encoders::AnyEncoder, usize) = match model_type {
+        ModelType::ModernBert => {
+            let config: jammi_encoders::ModernBertConfig = serde_json::from_value(config_json)?;
+            let vocab_size = config.vocab_size;
+            let encoder = jammi_encoders::ModernBert::builder()
+                .pooling(jammi_encoders::Pooling::Mean)
+                .backbone_dtype(backbone_dtype)
+                .lora(lora)
+                .build(&[weights.as_path()], &config, &device, &varmap)?;
+            (jammi_encoders::AnyEncoder::ModernBert(encoder), vocab_size)
+        }
+        ModelType::Bert => {
+            let config: jammi_encoders::BertConfig = serde_json::from_value(config_json)?;
+            let vocab_size = config.vocab_size;
+            let encoder = jammi_encoders::Bert::builder()
+                .pooling(jammi_encoders::Pooling::Mean)
+                .backbone_dtype(backbone_dtype)
+                .lora(lora)
+                .build(&[weights.as_path()], &config, &device, &varmap)?;
+            (jammi_encoders::AnyEncoder::Bert(encoder), vocab_size)
+        }
+        ModelType::DistilBert => {
+            let config: jammi_encoders::DistilBertConfig = serde_json::from_value(config_json)?;
+            let vocab_size = config.vocab_size;
+            let encoder = jammi_encoders::DistilBert::builder()
+                .pooling(jammi_encoders::Pooling::Mean)
+                .backbone_dtype(backbone_dtype)
+                .lora(lora)
+                .build(&[weights.as_path()], &config, &device, &varmap)?;
+            (jammi_encoders::AnyEncoder::DistilBert(encoder), vocab_size)
+        }
+    };
     encoder.set_training(true);
 
     let trainable = varmap.all_vars();
@@ -223,7 +408,7 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
             synthetic_ids(
                 params.batch,
                 params.seq,
-                config.vocab_size,
+                vocab_size,
                 params.seed + i,
                 &device,
             )
@@ -298,11 +483,12 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
         device: device_label,
         device_name: device_name(params.cuda_device),
         backbone_dtype: format!("{:?}", params.backbone_dtype).to_lowercase(),
+        model_type: model_type.as_str().to_string(),
         batch: params.batch,
         seq: params.seq,
         lora_rank: params.lora_rank,
         lora_dropout: params.lora_dropout as f64,
-        target_modules: params.target_modules.clone(),
+        target_modules,
         batched_forward: params.batched_forward,
         trainable_tensors: trainable.len(),
         steps_measured: times.len(),
@@ -381,4 +567,231 @@ fn peak_rss_bytes() -> Measurement {
         }
     }
     Measurement::not_yet_measured("bytes")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn tiny_bert_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../cookbook/fixtures/tiny_bert")
+    }
+
+    fn tiny_modernbert_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny_modernbert")
+    }
+
+    /// Write a tiny synthetic DistilBERT checkpoint (config.json +
+    /// model.safetensors) to a fresh temp dir, mirroring
+    /// `jammi-encoders/tests/it/distilbert.rs`'s `write_synthetic_weights` —
+    /// no committed DistilBERT fixture exists in this workspace, and
+    /// generating one in-test keeps the fixture generic/synthetic rather
+    /// than shaped to any consumer's data.
+    fn write_tiny_distilbert(device: &Device) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hidden = 16usize;
+        let inter = 32usize;
+        let vocab = 64usize;
+        let max_pos = 32usize;
+        let layers = 1usize;
+
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::json!({
+                "model_type": "distilbert",
+                "dim": hidden,
+                "n_layers": layers,
+                "n_heads": 2,
+                "hidden_dim": inter,
+                "vocab_size": vocab,
+                "max_position_embeddings": max_pos,
+            })
+            .to_string(),
+        )
+        .expect("write config.json");
+
+        let mut tensors: HashMap<String, Tensor> = HashMap::new();
+        let randn =
+            |shape: (usize, usize)| Tensor::randn(0f32, 0.02, shape, device).expect("randn 2-D");
+        let randn_1d = |n: usize| Tensor::randn(0f32, 0.02, (n,), device).expect("randn 1-D");
+        let ones_1d = |n: usize| Tensor::ones((n,), DType::F32, device).expect("ones 1-D");
+        let zeros_1d = |n: usize| Tensor::zeros((n,), DType::F32, device).expect("zeros 1-D");
+
+        tensors.insert(
+            "distilbert.embeddings.word_embeddings.weight".into(),
+            randn((vocab, hidden)),
+        );
+        tensors.insert(
+            "distilbert.embeddings.position_embeddings.weight".into(),
+            randn((max_pos, hidden)),
+        );
+        tensors.insert(
+            "distilbert.embeddings.LayerNorm.weight".into(),
+            ones_1d(hidden),
+        );
+        tensors.insert(
+            "distilbert.embeddings.LayerNorm.bias".into(),
+            zeros_1d(hidden),
+        );
+
+        for n in 0..layers {
+            let prefix = format!("distilbert.transformer.layer.{n}");
+            for lin in ["q_lin", "k_lin", "v_lin", "out_lin"] {
+                tensors.insert(
+                    format!("{prefix}.attention.{lin}.weight"),
+                    randn((hidden, hidden)),
+                );
+                tensors.insert(format!("{prefix}.attention.{lin}.bias"), randn_1d(hidden));
+            }
+            tensors.insert(format!("{prefix}.sa_layer_norm.weight"), ones_1d(hidden));
+            tensors.insert(format!("{prefix}.sa_layer_norm.bias"), zeros_1d(hidden));
+
+            tensors.insert(format!("{prefix}.ffn.lin1.weight"), randn((inter, hidden)));
+            tensors.insert(format!("{prefix}.ffn.lin1.bias"), randn_1d(inter));
+            tensors.insert(format!("{prefix}.ffn.lin2.weight"), randn((hidden, inter)));
+            tensors.insert(format!("{prefix}.ffn.lin2.bias"), randn_1d(hidden));
+
+            tensors.insert(
+                format!("{prefix}.output_layer_norm.weight"),
+                ones_1d(hidden),
+            );
+            tensors.insert(format!("{prefix}.output_layer_norm.bias"), zeros_1d(hidden));
+        }
+
+        candle_core::safetensors::save(&tensors, dir.path().join("model.safetensors"))
+            .expect("save safetensors");
+        dir
+    }
+
+    fn base_params(model_dir: std::path::PathBuf) -> FinetuneStepParams {
+        FinetuneStepParams {
+            model_dir,
+            batch: 2,
+            seq: 6,
+            steps: 1,
+            warmup: 0,
+            lora_rank: 2,
+            lora_alpha: 4.0,
+            lora_dropout: 0.0,
+            target_modules: None,
+            model_type_override: None,
+            backbone_dtype: jammi_numerics::ComputePrecision::F32,
+            cuda_device: None,
+            seed: 1,
+            batched_forward: true,
+        }
+    }
+
+    #[test]
+    fn detects_the_three_positive_model_types() {
+        for (raw, expected) in [
+            ("modernbert", ModelType::ModernBert),
+            ("bert", ModelType::Bert),
+            ("distilbert", ModelType::DistilBert),
+        ] {
+            let json = serde_json::json!({ "model_type": raw });
+            assert_eq!(ModelType::detect(&json, None).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn unknown_model_type_is_a_typed_error_naming_all_three() {
+        let json = serde_json::json!({ "model_type": "gpt2" });
+        let err = ModelType::detect(&json, None).unwrap_err();
+        assert!(matches!(&err, ModelTypeError::Unknown(s) if s == "gpt2"));
+        let msg = err.to_string();
+        for name in ModelType::ALL {
+            assert!(msg.contains(name), "error {msg:?} must name {name}");
+        }
+    }
+
+    #[test]
+    fn absent_model_type_requires_explicit_override() {
+        let json = serde_json::json!({});
+        assert!(matches!(
+            ModelType::detect(&json, None).unwrap_err(),
+            ModelTypeError::Absent
+        ));
+        assert_eq!(
+            ModelType::detect(&json, Some("bert")).unwrap(),
+            ModelType::Bert
+        );
+    }
+
+    #[test]
+    fn target_modules_refuses_silently_matching_nothing_for_bert_and_distilbert() {
+        for mt in [ModelType::Bert, ModelType::DistilBert] {
+            let err = resolve_target_modules(mt, None).unwrap_err();
+            let msg = err.to_string();
+            for name in mt.lora_target_vocabulary() {
+                assert!(msg.contains(name), "refusal {msg:?} must name {name}");
+            }
+        }
+        // ModernBERT keeps its historical default.
+        assert_eq!(
+            resolve_target_modules(ModelType::ModernBert, None).unwrap(),
+            vec!["Wqkv".to_string(), "Wo".to_string(), "Wi".to_string()]
+        );
+        // An explicit list always wins, for every model.
+        let explicit = vec!["query".to_string()];
+        assert_eq!(
+            resolve_target_modules(ModelType::Bert, Some(&explicit)).unwrap(),
+            explicit
+        );
+    }
+
+    #[test]
+    fn finetune_step_end_to_end_cpu_smoke_bert() {
+        let dir = tiny_bert_dir();
+        if !dir.join("config.json").exists() {
+            eprintln!("skipping: tiny_bert fixture not present at {dir:?}");
+            return;
+        }
+        let mut params = base_params(dir);
+        params.target_modules = Some(vec!["query".to_string(), "value".to_string()]);
+        let tier = run(&params).expect("bert finetune step runs end-to-end on CPU");
+        assert_eq!(tier.model_type, "bert");
+        assert!(tier.trainable_tensors > 0);
+        assert_eq!(tier.steps_measured, 1);
+    }
+
+    #[test]
+    fn finetune_step_end_to_end_cpu_smoke_modernbert() {
+        let dir = tiny_modernbert_dir();
+        if !dir.join("config.json").exists() {
+            eprintln!("skipping: tiny_modernbert fixture not present at {dir:?}");
+            return;
+        }
+        let params = base_params(dir);
+        let tier = run(&params).expect("modernbert finetune step runs end-to-end on CPU");
+        assert_eq!(tier.model_type, "modernbert");
+        assert!(tier.trainable_tensors > 0);
+    }
+
+    #[test]
+    fn finetune_step_end_to_end_cpu_smoke_distilbert() {
+        let device = Device::Cpu;
+        let dir = write_tiny_distilbert(&device);
+        let mut params = base_params(dir.path().to_path_buf());
+        params.target_modules = Some(vec!["q_lin".to_string(), "v_lin".to_string()]);
+        let tier = run(&params).expect("distilbert finetune step runs end-to-end on CPU");
+        assert_eq!(tier.model_type, "distilbert");
+        assert!(tier.trainable_tensors > 0);
+    }
+
+    #[test]
+    fn target_modules_refusal_fires_through_run_for_bert() {
+        let dir = tiny_bert_dir();
+        if !dir.join("config.json").exists() {
+            eprintln!("skipping: tiny_bert fixture not present at {dir:?}");
+            return;
+        }
+        let params = base_params(dir); // target_modules: None
+        let err = run(&params).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("--target-modules"));
+    }
 }

@@ -1096,6 +1096,13 @@ pub struct FinetuneStepTier {
     pub device_name: String,
     /// The precision the frozen backbone ran at.
     pub backbone_dtype: String,
+    /// Which of the three trainer-supported text encoders this run drove —
+    /// `"modernbert"`, `"bert"`, or `"distilbert"` — detected from
+    /// `config.json`'s `model_type` field (or `--model-type` when that field
+    /// is absent). Recorded, never gated: this tier compares ratios on the
+    /// same box, and the per-model comparison it exists for (issue #356,
+    /// rule 12) needs to know which model produced each row.
+    pub model_type: String,
     pub batch: usize,
     pub seq: usize,
     pub lora_rank: usize,
@@ -1121,6 +1128,15 @@ pub struct FinetuneStepTier {
     /// ran and was fast" from "the fused path silently fell back and
     /// eager was fast anyway" (K2, scope decision 6 of the fused-kernels
     /// plan).
+    ///
+    /// Structurally 0 on a BERT/DistilBERT run: their LayerNorm is always
+    /// biased (`jammi_encoders::layer_norm`'s fused arm is gated on
+    /// `bias.is_none() && training`, and `BertConfig`/`DistilBertConfig`
+    /// have no bias-free LayerNorm mode), so the `(None, true)` match arm
+    /// that increments this counter is never reached at all for those two
+    /// models — 0 here means "this model has no such call site", not "the
+    /// fused kernel fell back". Read `model_type` before comparing this
+    /// field across rows.
     pub ln_fused_dispatches: u64,
     /// How many times that same call site fell back to the eager
     /// (`slow()`) composition instead — outside the fused kernel's domain
@@ -1128,17 +1144,29 @@ pub struct FinetuneStepTier {
     /// predicate failed for any other stated reason. Non-zero here on a
     /// `ModernBert` bias-free training run is itself a signal worth
     /// reading, not just a complement of `ln_fused_dispatches`.
+    ///
+    /// Same structural-0 caveat as `ln_fused_dispatches` applies on
+    /// BERT/DistilBERT: this counter is per-op, and a model with no
+    /// bias-free LayerNorm records 0/0 here, not a fallback.
     pub ln_eager_dispatches: u64,
     /// How many times ModernBERT's training-mode fused RoPE (rotate-half)
     /// kernel (`jammi_kernels::ops::RopeFused`) actually dispatched during
     /// this run — the same positive-proof channel as `ln_fused_dispatches`,
     /// for the C3 fused-kernels commit (see `jammi_encoders::modernbert`'s
     /// `RotaryEmbedding` doc).
+    ///
+    /// This op exists only on ModernBERT (BERT/DistilBERT use learned
+    /// position embeddings, no RoPE at all), so this counter is
+    /// STRUCTURALLY 0 for `model_type` `"bert"`/`"distilbert"` — that
+    /// means the op does not exist on this model, never that the fused
+    /// path fell back to eager.
     pub rope_fused_dispatches: u64,
     /// How many times that same call site fell back to the eager
     /// (`RotaryEmbedding::apply`) composition instead — outside the fused
     /// kernel's domain (dtype/contiguity/device/head_dim), or because the
-    /// admission predicate failed for any other stated reason.
+    /// admission predicate failed for any other stated reason. Same
+    /// per-op, ModernBERT-only caveat as `rope_fused_dispatches`: 0 on
+    /// BERT/DistilBERT because the call site itself does not exist there.
     pub rope_eager_dispatches: u64,
     /// How many times ModernBERT's training-mode fused masked-softmax
     /// kernel (`jammi_kernels::ops::SoftmaxLastDimFused`) actually
@@ -1146,12 +1174,19 @@ pub struct FinetuneStepTier {
     /// `ln_fused_dispatches` / `rope_fused_dispatches`, for the C4
     /// fused-kernels commit (see `jammi_encoders::modernbert`'s
     /// `softmax_apply_training` doc).
+    ///
+    /// BERT/DistilBERT attention calls plain `candle_nn::ops::softmax`
+    /// through a different call site entirely (never admitted against this
+    /// counter), so this is STRUCTURALLY 0 for those two models — the op
+    /// does not exist on their call path, not a fallback.
     pub softmax_fused_dispatches: u64,
     /// How many times that same call site fell back to the eager
     /// (`broadcast_add` + `candle_nn::ops::softmax`) composition instead —
     /// outside the fused kernel's domain (dtype/contiguity/device/rank/
     /// last-dim), or because the admission predicate failed for any other
-    /// stated reason.
+    /// stated reason. Same per-op, ModernBERT-only caveat as
+    /// `softmax_fused_dispatches`: 0 on BERT/DistilBERT because this call
+    /// site does not exist there.
     pub softmax_eager_dispatches: u64,
     /// How many times ModernBERT's training-mode fused GeGLU kernel
     /// (`jammi_kernels::ops::GegluFused`) actually dispatched during this
@@ -1159,12 +1194,19 @@ pub struct FinetuneStepTier {
     /// `rope_fused_dispatches` / `softmax_fused_dispatches`, for the C5
     /// fused-kernels commit (see `jammi_encoders::modernbert`'s
     /// `geglu_apply_training` doc).
+    ///
+    /// GeGLU is ModernBERT's FFN activation only (BERT/DistilBERT use a
+    /// plain GELU MLP, no gate+up packing), so this is STRUCTURALLY 0 for
+    /// those two models — the op does not exist on their FFN, not a
+    /// fallback.
     pub geglu_fused_dispatches: u64,
     /// How many times that same call site fell back to the eager
     /// (`narrow`+`narrow`+`gelu_erf`+`mul`) composition instead — outside
     /// the fused kernel's domain (dtype/contiguity/device/even-last-dim),
     /// or because the admission predicate failed for any other stated
-    /// reason.
+    /// reason. Same per-op, ModernBERT-only caveat as
+    /// `geglu_fused_dispatches`: 0 on BERT/DistilBERT because this call
+    /// site does not exist there.
     pub geglu_eager_dispatches: u64,
     /// How many times a LoRA-site fused epilogue
     /// (`jammi_kernels::ops::ScaledCastAdd`, `base_out + cast(lora_out *
@@ -1177,6 +1219,13 @@ pub struct FinetuneStepTier {
     /// `jammi_encoders`-side wrapper — the counters live in
     /// `jammi-kernels`' op-keyed registry, so any crate that knows the op
     /// name (`"lora_epilogue"`) reads the same table.
+    ///
+    /// Unlike `ln`/`rope`/`softmax`/`geglu` above, this call site is
+    /// `jammi_lora::LoraLinear::forward` itself — common to every
+    /// LoRA-wrapped linear on all three `model_type`s — so it is NOT
+    /// structurally 0 for BERT/DistilBERT; it is 0 only when
+    /// `trainable_tensors` is 0 or the fused kernel's own domain rejected
+    /// every dispatch.
     pub lora_epilogue_fused_dispatches: u64,
     /// How many times that same call site fell back to the eager `[mul,
     /// cast, add]` composition instead — outside the fused kernel's

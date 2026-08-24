@@ -138,7 +138,7 @@ impl SourceConnection {
 /// Derive a DataFusion table name from a URL by extracting the file stem.
 ///
 /// Handles both Unix forward-slash paths and Windows backslash paths so that
-/// `file://C:\Users\...\triplets_train.parquet` correctly yields `triplets_train`
+/// `file://C:\Users\...\triplets_train.parquet` correctly yields triplets_train
 /// rather than the full `C:\...\triplets_train` (which contains a colon that
 /// breaks DataFusion's SQL parser).
 pub(crate) fn table_name_from_url(url: &str) -> String {

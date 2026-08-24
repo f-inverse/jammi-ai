@@ -569,7 +569,7 @@ impl JammiSession {
     pub async fn remove_source(&self, source_id: &str) -> Result<()> {
         // 0. Capture each result table's ANN segment bundle URLs BEFORE the
         //    catalog delete: `delete_result_tables_for_source` cascades to
-        //    `index_segments`, so the per-segment bundle paths must be read
+        //    index_segments, so the per-segment bundle paths must be read
         //    while those rows still exist. The enumeration is a superset of the
         //    delete set (its tenant predicate is wider), so every deleted
         //    table's segments are covered; extra entries are simply unused.

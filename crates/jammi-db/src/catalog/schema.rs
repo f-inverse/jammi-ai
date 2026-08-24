@@ -144,7 +144,7 @@ CREATE INDEX idx_evidence_channels_tenant ON evidence_channels(tenant_id);
 "#;
 
 /// Normalise the JSON-blob `evidence_channels.schema_json` column into a
-/// child `evidence_channel_columns` table. After this migration each
+/// child evidence_channel_columns table. After this migration each
 /// declared column is a row keyed by `(channel_name, column_name)`,
 /// making the append-only invariant a database constraint rather than
 /// a parser check.
@@ -175,7 +175,7 @@ ALTER TABLE evidence_channels DROP COLUMN schema_json;
 ///   * `mutable_tables` — one row per registered table, carrying the Arrow
 ///     schema JSON, primary-key column list, optional tenant scope, free-form
 ///     user metadata, and a backend identifier (`'sqlite'` | `'postgres'`).
-///   * `mutable_table_indexes` — secondary indexes per registered table.
+///   * mutable_table_indexes — secondary indexes per registered table.
 ///
 /// The `tenant_id` column on `mutable_tables` is defined by migration 005;
 /// Phase 2 stores `NULL` for every row it writes. Phase 3 wires the
@@ -334,7 +334,7 @@ CREATE INDEX idx_eval_per_query_tenant ON _jammi_eval_per_query(tenant_id);
 /// globally-registered topics today are user-declared via the CLI/session/
 /// Python surfaces, and the substrate-owned topics (audit, session lifecycle)
 /// are all tenant-pinned, so this matches existing behaviour. The
-/// `idx_topics_tenant` and `idx_topics_name` secondary indexes are recreated.
+/// idx_topics_tenant and idx_topics_name secondary indexes are recreated.
 ///
 /// `PRAGMA foreign_keys` is OFF inside the migration transaction (sqlx opens
 /// SQLite connections without it), so the temporary FK-less window during the
@@ -528,7 +528,7 @@ UPDATE models SET status = 'registered' WHERE status = 'available';
 ///
 /// Migration 005 added a `tenant_id` column to `evidence_channels` but no code
 /// ever wrote or read it, and the channel name stayed a *global* `TEXT PRIMARY
-/// KEY` (migration 001). `evidence_channel_columns` (migration 006) keyed on
+/// KEY` (migration 001). evidence_channel_columns (migration 006) keyed on
 /// `(channel_name, column_name)` and FK-referenced `evidence_channels(channel_name)`
 /// — also tenant-blind. So two tenants registering a channel of the same name
 /// collided on one global PK slot: tenant B's `register("X")` hit tenant A's row
@@ -541,7 +541,7 @@ UPDATE models SET status = 'registered' WHERE status = 'available';
 /// identity of both tables to carry `tenant_id`:
 ///   * `evidence_channels` gains a `UNIQUE (tenant_id, channel_name)` constraint
 ///     in place of the global `channel_name` PK.
-///   * `evidence_channel_columns` carries `tenant_id`, gains a
+///   * evidence_channel_columns carries `tenant_id`, gains a
 ///     `UNIQUE (tenant_id, channel_name, column_name)` constraint in place of
 ///     its old `(channel_name, column_name)` PK, and its FK becomes a composite
 ///     `REFERENCES evidence_channels(tenant_id, channel_name)` so the parent

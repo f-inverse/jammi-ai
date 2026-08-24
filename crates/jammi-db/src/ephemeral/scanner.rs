@@ -5,7 +5,7 @@
 //! table ids it owns — in a process-shared [`ActiveSessions`] map. A background
 //! [`scan`] pass (run on an interval by [`spawn`]) force-closes every session
 //! whose deadline has passed: it drops the session's tables and publishes a
-//! `timed_out` lifecycle event, exactly as an explicit `force_close` would.
+//! `TimedOut` lifecycle event, exactly as an explicit `force_close` would.
 //!
 //! The scanner does not hold the `EphemeralSession` value itself, so a session
 //! that is explicitly closed (or dropped) deregisters its snapshot and the
@@ -117,9 +117,9 @@ impl ActiveSessions {
 
 /// Run one timeout pass: force-close every session expired as of now.
 ///
-/// Each expired session has its tables dropped and a `timed_out` lifecycle
+/// Each expired session has its tables dropped and a `TimedOut` lifecycle
 /// event published. Drop failures are logged and surface as a
-/// `partial_deletion_failure` event for that session; one session's failure
+/// `PartialDeletionFailure` event for that session; one session's failure
 /// does not abort the pass for the others.
 pub async fn scan(parent: &Arc<JammiSession>, active: &ActiveSessions) {
     let now = Utc::now();
@@ -152,7 +152,7 @@ pub(super) struct DeletionOutcome {
 
 /// Drop every table in `tables` under `tenant`, sum the rows removed, and
 /// publish the terminal lifecycle event — `event` on full success, or
-/// `partial_deletion_failure` (listing survivors, tagging the attempted event)
+/// `PartialDeletionFailure` (listing survivors, tagging the attempted event)
 /// if any drop failed. Shared by the timeout scanner, the explicit `close`
 /// path, and the best-effort `Drop` impl so all three agree on semantics.
 ///

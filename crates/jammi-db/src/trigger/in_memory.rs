@@ -55,8 +55,8 @@ pub const DEFAULT_CHANNEL_CAPACITY: usize = 1024;
 /// Holds an optional pending-failure slot — when set, the next `publish` call
 /// consumes it and returns the corresponding [`TriggerError::Driver`] instead
 /// of broadcasting. Used by tests that need to exercise publisher failure
-/// paths (e.g. a downstream consumer's `publish_failure_does_not_fail_check`
-/// invariant) deterministically.
+/// paths deterministically (e.g. the "publish failure does not fail the
+/// check" invariant exercised by `session_with_broker_swallows_fan_out_failure`).
 pub struct InMemoryBroker {
     channels: RwLock<HashMap<TopicId, ChannelState>>,
     capacity: usize,
@@ -235,8 +235,8 @@ impl TriggerBroker for InMemoryBroker {
                     // is implicitly acknowledged the moment the subscriber
                     // observes it. Surfacing the same value for both fields
                     // keeps the round-trip stable through the backup-restore
-                    // path (`last_ack` is the field a restore would use to
-                    // resume).
+                    // path (`last_ack_stream_sequence` is the field a restore
+                    // would use to resume).
                     last_ack_stream_sequence: last_delivered,
                 });
                 true

@@ -290,7 +290,7 @@ async fn search_vectors_over_two_int8_segments_equals_brute_force() {
     }
 }
 
-// Sanity: `Catalog::open` migrates through 025 so the `index_segments` table
+// Sanity: `Catalog::open` migrates through 025 so the index_segments table
 // exists and starts empty.
 #[tokio::test]
 async fn migration_025_creates_an_empty_index_segments_table() {

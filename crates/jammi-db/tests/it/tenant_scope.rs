@@ -651,7 +651,7 @@ async fn source_tenant_column_persists_and_replays_on_reload(backend: BackendKin
     let tenant_b = fresh_tenant();
 
     // Two parquet files: `notes` carries tenancy under `customer_id`
-    // (6 rows tenant A, 4 rows tenant B); `public_docs` carries no tenant
+    // (6 rows tenant A, 4 rows tenant B); public_docs carries no tenant
     // discriminator at all.
     let notes_path = dir.path().join("notes.parquet");
     let docs_path = dir.path().join("public_docs.parquet");
@@ -782,7 +782,7 @@ async fn source_tenant_column_persists_and_replays_on_reload(backend: BackendKin
         "tenant B must see its 4 rows via the replayed customer_id filter"
     );
 
-    // `public_docs` has no discriminator: every tenant sees all 5 rows, so the
+    // public_docs has no discriminator: every tenant sees all 5 rows, so the
     // reload replayed `None` and injected no spurious filter. (A wrongly
     // replayed filter would drop rows or fail to plan against the absent
     // column.)

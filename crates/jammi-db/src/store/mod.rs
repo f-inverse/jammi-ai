@@ -1033,7 +1033,7 @@ impl ResultStore {
     /// **and** the segment catalog rows. 404 is not an error — the caller may be
     /// paving over already-cleaned state. Enumerates the set from the catalog,
     /// so it must run *before* the `result_tables` row is deleted (the
-    /// `ON DELETE CASCADE` on `index_segments` would otherwise reap the rows
+    /// `ON DELETE CASCADE` on index_segments would otherwise reap the rows
     /// first and hide the bundle URLs).
     async fn purge_segments(&self, table_name: &str) -> Result<()> {
         for seg in self.catalog.list_index_segments(table_name).await? {

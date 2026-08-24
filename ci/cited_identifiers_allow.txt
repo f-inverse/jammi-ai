@@ -6,9 +6,23 @@
 # vendored/upstream internal (which the CI guard job, no toolchain/cargo,
 # cannot see) from permanently blocking the gate.
 #
-# This file is EMPTY today: the gate ships in `--changed-only` (ratchet) mode
-# in CI (see `.github/workflows/ci.yml`) because the full-repo scan found a
-# pre-existing backlog (~123 distinct unresolved citations across ~50 files —
-# see the PR that added this gate for the full list) too large to triage in
-# one PR. As the backfill retires each pre-existing citation (fix the name, or
-# allowlist it here with a reason), add its line below.
+# The gate ships in `--changed-only` (ratchet) mode in CI (see
+# `.github/workflows/ci.yml`) because the full-repo scan found a pre-existing
+# backlog (~123 distinct unresolved citations across ~50 files — see the PR
+# that added this gate for the full list) too large to triage in one PR. As
+# the backfill retires each pre-existing citation (fix the name, or allowlist
+# it here with a reason), add its line below.
+
+CURRENT_TIMESTAMP # SQL standard function (SQLite/Postgres builtin), not a repo symbol.
+r2d2_sqlite # External crate cited for historical/behavioral comparison; not a workspace dependency.
+AWS_ENDPOINT_URL # AWS SDK-defined env var consumed by object_store's AmazonS3Builder::from_env.
+GOOGLE_APPLICATION_CREDENTIALS # GCP SDK-defined env var (Application Default Credentials).
+schema_force_view_types # datafusion-common ExecutionOptions field; datafusion-common is a transitive (not direct) dep.
+task_local # tokio's `task_local!` macro.
+from_timestamp_micros # chrono's `DateTime::from_timestamp_micros` associated fn.
+await_holding_lock # clippy's `clippy::await_holding_lock` lint name.
+SQLITE_BUSY_SNAPSHOT # SQLite's own extended result code (SQLite C API / SQL engine internals).
+cfg_attr # Rust language builtin attribute, not a repo symbol.
+pragma_table_info # SQLite's `pragma_table_info` table-valued function.
+sqlite_master # SQLite's builtin schema catalog table.
+code_version # Dagster's asset `code_version` concept, cited for analogy in a doc comment; not a repo symbol.

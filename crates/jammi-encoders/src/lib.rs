@@ -4,8 +4,9 @@
 //! Each of [`Bert`], [`DistilBert`], and [`ModernBert`] is a self-contained
 //! text encoder whose attention/FFN linears can be selectively LoRA-augmented
 //! via [`jammi_lora::LoraBuildConfig`]. [`ClipText`] is the OpenCLIP text
-//! tower that produces shared-latent embeddings compatible with an OpenCLIP
-//! vision tower for cross-modal text↔image search. [`HtsatAudio`] is the
+//! tower and [`OpenClipVisionTransformer`] the OpenCLIP vision tower it is
+//! compatible with, together producing shared-latent embeddings for
+//! cross-modal text↔image search. [`HtsatAudio`] is the
 //! HTSAT-Swin CLAP audio tower that produces shared-latent embeddings from a
 //! 4-channel fusion spectrogram, compatible with the CLAP text tower for
 //! cross-modal text↔audio search. [`AnyEncoder`] / [`AnyAudioEncoder`] are the
@@ -26,13 +27,18 @@ pub mod context;
 pub mod distilbert;
 pub mod htsat_audio;
 pub mod modernbert;
+pub mod open_clip_vision;
 pub mod precision;
 
+mod activations;
 mod any;
+mod attention;
 mod error;
 mod layer_norm;
 mod mask;
 mod pooling;
+#[cfg(test)]
+mod test_support;
 
 pub use aggregate::{segment_aggregate, SegmentReduce};
 pub use any::AnyEncoder;
@@ -47,6 +53,7 @@ pub use distilbert::{DistilBert, DistilBertConfig};
 pub use error::EncoderError;
 pub use htsat_audio::{HtsatAudio, HtsatAudioConfig};
 pub use modernbert::{ModernBert, ModernBertConfig};
+pub use open_clip_vision::{OpenClipVisionConfig, OpenClipVisionTransformer};
 pub use pooling::{pool_and_normalize, Pooling};
 pub use precision::compute_precision_to_dtype;
 

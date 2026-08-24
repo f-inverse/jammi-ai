@@ -365,9 +365,10 @@ enum Command {
     GpuInferenceScale,
     /// The encoder fine-tune step tier: time one real LoRA training step —
     /// three encoder forwards live on the tape at once, a cosine-margin triplet
-    /// loss, one backward into the adapter tensors, and one AdamW step — over a
-    /// ModernBERT checkpoint on disk. Runs on CPU by default and on a CUDA
-    /// ordinal with `--cuda`.
+    /// loss, one backward into the adapter tensors, an optional PRODUCTION
+    /// gradient clip (`--max-grad-norm`, absent by default), and one AdamW
+    /// step — over a ModernBERT checkpoint on disk. Runs on CPU by default and
+    /// on a CUDA ordinal with `--cuda`.
     ///
     /// Every number is RECORDED, never gated: a step time is a property of
     /// `code x device x box`, so the only comparison a heterogeneous rented
@@ -407,6 +408,15 @@ enum Command {
         /// shape for an A/B on the same box.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         batched_forward: bool,
+        /// Run the PRODUCTION gradient-clip (`clip_gradients`) after backward
+        /// and before the optimizer step, at the point the trainer clips —
+        /// the shipped trainer's default (`max_grad_norm = 1.0`) always
+        /// clips, so omitting this flag measures a step the product does not
+        /// run. Absent (the default) skips clipping entirely, bit-identical
+        /// to this tier's behaviour before this flag existed. Must be
+        /// finite and > 0.0 when supplied.
+        #[arg(long)]
+        max_grad_norm: Option<f32>,
     },
     /// The CPU-hermetic cache-hit SLO tier: drives the engine's opt-in producer
     /// memoization (`CachePolicy::Use`) on a cacheable producer (the
@@ -487,6 +497,7 @@ async fn main() -> std::process::ExitCode {
             cuda,
             seed,
             batched_forward,
+            max_grad_norm,
         } => run_finetune_step(finetune_step::FinetuneStepParams {
             model_dir,
             batch,
@@ -514,6 +525,7 @@ async fn main() -> std::process::ExitCode {
             cuda_device: cuda,
             seed,
             batched_forward,
+            max_grad_norm,
         }),
         Command::CacheSloScale => run_cache_slo_scale().await,
         Command::RecomputeScale => run_recompute_scale().await,
@@ -522,8 +534,9 @@ async fn main() -> std::process::ExitCode {
 
 /// The `finetune-step` subcommand: run the tier and emit the report. Records;
 /// does not gate. Exits non-zero only when the step could not be measured at
-/// all — a missing checkpoint, a target-module set that matched no linear, or a
-/// device that could not be resolved.
+/// all — a missing checkpoint, a target-module set that matched no linear, a
+/// device that could not be resolved, or a `--max-grad-norm` that was
+/// supplied but not finite and > 0.0.
 fn run_finetune_step(params: finetune_step::FinetuneStepParams) -> std::process::ExitCode {
     let tier = match finetune_step::run(&params) {
         Ok(t) => t,

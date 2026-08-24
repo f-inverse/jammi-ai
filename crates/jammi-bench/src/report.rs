@@ -1107,6 +1107,24 @@ pub struct FinetuneStepTier {
     /// trainer's behaviour) or three. On a dispatch-bound device this is the
     /// largest single term in the step, so it is recorded alongside every rate.
     pub batched_forward: bool,
+    /// The `--max-grad-norm` this row ran with, or `null` when the flag was
+    /// absent (no clipping — today's behaviour, bit-identical to before this
+    /// field existed). Present so the step this row measured is unambiguous:
+    /// the shipped trainer always calls
+    /// [`jammi_ai::fine_tune::optimizer::clip_gradients`] at the default
+    /// `max_grad_norm = 1.0`
+    /// (`jammi_wire::fine_tune::FineTuneConfig::max_grad_norm`'s default), so
+    /// a step measured with this field `null` is NOT the step the trainer
+    /// runs — it is a distinct, useful reference point (the clip's D2H-sync
+    /// cost isolated out), not an oversight. Deliberately NOT
+    /// `#[serde(skip_serializing_if = "Option::is_none")]`: an omitted key
+    /// reads as "this report predates the field", which is false — every
+    /// `finetune-step` report from this build carries an opinion on
+    /// clipping, so absence is always meaningful and always emitted as an
+    /// explicit `null`, never folded away. See
+    /// `finetune_step_tier_serializes_null_not_omitted_for_absent_max_grad_norm`
+    /// below for the pinned schema shape.
+    pub max_grad_norm: Option<f32>,
     /// Trainable tensor count. Zero would mean the selectors matched nothing and
     /// the measurement is of a frozen forward, so it is reported, not assumed.
     pub trainable_tensors: usize,
@@ -1374,4 +1392,79 @@ pub struct RecomputeScaleTier {
     /// The whole Downstream sweep's wall-time, milliseconds. Machine-dependent
     /// reference only — never gated.
     pub sweep_ms: Measurement,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal, otherwise-arbitrary [`FinetuneStepTier`] for the schema
+    /// tests below. Field VALUES do not matter except where the test itself
+    /// varies them; what is pinned is the emitted key SET and the
+    /// present-vs-omitted / null-vs-value policy for `max_grad_norm`, not any
+    /// particular number.
+    fn sample_finetune_step_tier(max_grad_norm: Option<f32>) -> FinetuneStepTier {
+        FinetuneStepTier {
+            device: "cpu".to_string(),
+            device_name: "cpu".to_string(),
+            backbone_dtype: "f32".to_string(),
+            batch: 2,
+            seq: 6,
+            lora_rank: 2,
+            lora_dropout: 0.0,
+            target_modules: vec!["Wqkv".to_string()],
+            batched_forward: true,
+            max_grad_norm,
+            trainable_tensors: 2,
+            steps_measured: 1,
+            ln_fused_dispatches: 0,
+            ln_eager_dispatches: 0,
+            rope_fused_dispatches: 0,
+            rope_eager_dispatches: 0,
+            softmax_fused_dispatches: 0,
+            softmax_eager_dispatches: 0,
+            geglu_fused_dispatches: 0,
+            geglu_eager_dispatches: 0,
+            lora_epilogue_fused_dispatches: 0,
+            lora_epilogue_eager_dispatches: 0,
+            s_per_step_p50: Measurement::measured(0.1, "s"),
+            s_per_step_mean: Measurement::measured(0.1, "s"),
+            steps_per_s: Measurement::measured(10.0, "steps/s"),
+            triplets_per_s: Measurement::measured(20.0, "triplets/s"),
+            peak_rss_bytes: Measurement::not_yet_measured("bytes"),
+            peak_vram_bytes: Measurement::not_yet_measured("bytes"),
+        }
+    }
+
+    /// Pins the null-when-absent policy: `max_grad_norm` is the field that
+    /// tells a reader whether this row measured the shipped trainer's step
+    /// (clip on) or the idealized no-clip step — an OMITTED key would read as
+    /// "this report predates the field" (a build-provenance question) rather
+    /// than "clipping was off for this row" (a run-provenance fact), so the
+    /// key must be present, explicit `null`, when the flag was not supplied.
+    #[test]
+    fn finetune_step_tier_serializes_null_not_omitted_for_absent_max_grad_norm() {
+        let tier = sample_finetune_step_tier(None);
+        let value = serde_json::to_value(&tier).expect("serialize FinetuneStepTier");
+        let obj = value.as_object().expect("object");
+        assert!(
+            obj.contains_key("max_grad_norm"),
+            "max_grad_norm must be present (as null), not omitted, when absent: {obj:?}"
+        );
+        assert_eq!(obj["max_grad_norm"], serde_json::Value::Null);
+    }
+
+    /// The mirror case: a supplied `--max-grad-norm` serializes as the number,
+    /// not as a string or a re-wrapped option shape.
+    #[test]
+    fn finetune_step_tier_serializes_number_for_present_max_grad_norm() {
+        let tier = sample_finetune_step_tier(Some(1.0f32));
+        let value = serde_json::to_value(&tier).expect("serialize FinetuneStepTier");
+        let obj = value.as_object().expect("object");
+        assert_eq!(
+            obj["max_grad_norm"],
+            serde_json::json!(1.0f32),
+            "present max_grad_norm must serialize as the numeric value: {obj:?}"
+        );
+    }
 }

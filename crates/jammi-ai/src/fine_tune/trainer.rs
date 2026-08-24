@@ -3689,10 +3689,180 @@ mod standardization_contract {
         }
     }
 
-    /// ORACLE (W5-PR5 — quantile (Pinball) scale-robustness): the pinball head
-    /// trains the production dispatch on the WIDE target without diverging, every
-    /// served quantile lands within a spread of μ_y, and the median (level 0.5)
-    /// tracks μ_y. The served columns are non-crossing after de-standardisation.
+    // ─── esc-035: distributional K3 standardization oracles ───────────────────
+    //
+    // `config.seed` reaches ONLY the LoRA-A Kaiming draw (lora.rs:56 ->
+    // lora_linear.rs:131); `features()` above is a fixed LCG. So sweeping the
+    // seed isolates the A-draw and diverges the two oracles below through
+    // gradient dynamics alone — the population these oracles must speak for.
+    // The pinned 12-seed set below is the escape's evidence set; the default
+    // seed (42, `DEFAULT_FINE_TUNE_SEED`) is the ONE trajectory the pre-rewrite
+    // single-seed assertions happened to pass on.
+    const PINNED_SEEDS: [u64; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+
+    /// Per-seed measurement for the Pinball scale-robustness oracle.
+    #[derive(Debug, Clone, Copy)]
+    struct QuantileSeedStats {
+        seed: u64,
+        max_loss: f64,
+        diverged: bool,
+        q10: f32,
+        q50: f32,
+        q90: f32,
+    }
+
+    /// Why a seed's quantile measurement failed the checker — named so a
+    /// rejected seed points at the specific broken bound, not a bare
+    /// `assertion failed`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum QuantileFailure {
+        NonFinite,
+        Diverged,
+        FitOutOfRange,
+        MedianOutOfRange,
+        Crossing,
+    }
+
+    /// THE quantile-oracle judgment, factored out of the training loop into a
+    /// pure function of measured stats. This is what lets the real production
+    /// run and the permanent mutant controls below share one definition of
+    /// "the oracle says no" (required sequence step 2/3). Non-finite counts as
+    /// failing (esc-005 class): every field is checked with `is_finite()`
+    /// before any numeric comparison, so `NaN < bound` (which is `false` and
+    /// would otherwise vacuously read as "not out of range") cannot pass.
+    fn check_quantile_seed(
+        s: &QuantileSeedStats,
+        mu_y: f32,
+        sigma_y: f32,
+    ) -> std::result::Result<(), QuantileFailure> {
+        if !s.max_loss.is_finite() || !s.q10.is_finite() || !s.q50.is_finite() || !s.q90.is_finite()
+        {
+            return Err(QuantileFailure::NonFinite);
+        }
+        if s.diverged || s.max_loss >= 100.0 {
+            return Err(QuantileFailure::Diverged);
+        }
+        for q in [s.q10, s.q50, s.q90] {
+            if (q - mu_y).abs() >= 2.0 * sigma_y {
+                return Err(QuantileFailure::FitOutOfRange);
+            }
+        }
+        if (s.q50 - mu_y).abs() >= sigma_y {
+            return Err(QuantileFailure::MedianOutOfRange);
+        }
+        if !(s.q10 <= s.q50 && s.q50 <= s.q90) {
+            return Err(QuantileFailure::Crossing);
+        }
+        Ok(())
+    }
+
+    /// Train + serve one seed of the Pinball/WIDE scenario through the REAL
+    /// production dispatch: `TrainingLoop::head_forward` -> `compute_loss` ->
+    /// AdamW step, reproducing the production divergence guard
+    /// (`process_batch_loss`'s NaN/`>100` trip) as a non-panicking flag so a
+    /// diverged seed can be COUNTED rather than aborting the sweep (required
+    /// sequence step 2's non-finite/diverged-counts-as-failing rule). This is a
+    /// new test-side helper — `train_tracking_loss` above stays untouched
+    /// (other in-scope-adjacent tests call it and must keep panicking on
+    /// divergence for their own single-run assertions).
+    async fn measure_quantile_seed(
+        seed: u64,
+        targets: &Tensor,
+        feats: &Tensor,
+        levels: &[f64],
+        device: &Device,
+    ) -> QuantileSeedStats {
+        let config = FineTuneConfig {
+            regression_loss: Some(RegressionLoss::Pinball),
+            quantile_levels: levels.to_vec(),
+            seed,
+            ..Default::default()
+        };
+        let (loop_, varmap) = regression_loop(config, levels.len(), targets, device).await;
+        let z_target = z_score_targets(&loop_, targets);
+        let mut opt = AdamW::new(
+            varmap.all_vars(),
+            ParamsAdamW {
+                lr: 0.05,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut max_loss = 0.0_f64;
+        let mut consecutive = 0u32;
+        let mut diverged = false;
+        for _ in 0..1500 {
+            let head_out = loop_.head_forward(feats).unwrap();
+            let batch = TrainingBatch::Regression {
+                input: head_out,
+                target: z_target.clone(),
+            };
+            let loss = loop_.compute_loss(&batch).unwrap();
+            let loss_val = loss
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap() as f64;
+            if loss_val.is_nan() || loss_val > 100.0 {
+                consecutive += 1;
+                if consecutive >= 3 {
+                    diverged = true;
+                }
+            } else {
+                consecutive = 0;
+            }
+            max_loss = max_loss.max(loss_val);
+            let grads = loss.backward().unwrap();
+            opt.step(&grads).unwrap();
+        }
+        let z_head = loop_.head_forward(feats).unwrap();
+        // `serve_through_production` panics (`.unwrap()` on the quantile
+        // adapter's `adapt`, which errors on a non-finite row — trainer.rs
+        // `serve_through_production` -> distribution.rs's non-crossing guard)
+        // if the head itself is non-finite. A diverged seed must be COUNTED,
+        // not crash the sweep (required sequence step 2), so check finiteness
+        // on the raw head BEFORE calling the panicking helper and short-circuit
+        // to a non-finite sentinel the checker's `is_finite()` gate catches.
+        let z_head_vals = z_head.to_vec2::<f32>().unwrap();
+        if z_head_vals.iter().flatten().any(|v| !v.is_finite()) {
+            return QuantileSeedStats {
+                seed,
+                max_loss,
+                diverged: true,
+                q10: f32::NAN,
+                q50: f32::NAN,
+                q90: f32::NAN,
+            };
+        }
+        let cols = serve_through_production(&loop_, &z_head);
+        let row0: Vec<f32> = cols.iter().map(|c| c[0]).collect();
+        QuantileSeedStats {
+            seed,
+            max_loss,
+            diverged,
+            q10: row0[0],
+            q50: row0[1],
+            q90: row0[2],
+        }
+    }
+
+    /// ORACLE (W5-PR5 — quantile (Pinball) scale-robustness), esc-035
+    /// distributional rewrite: the pinball head trains the production dispatch
+    /// on the WIDE target without diverging, every served quantile lands within
+    /// a spread of μ_y, the median tracks μ_y, and the served columns are
+    /// non-crossing after de-standardisation — asserted as a POPULATION claim
+    /// over the pinned 12-seed set (the sole randomness source, the LoRA-A
+    /// Kaiming draw), not one default-seed trajectory.
+    ///
+    /// MEASURED pre-rewrite (esc-035 step 1, unmodified assertions, same
+    /// pinned-seed sweep — table in this commit's message): 10/12 pinned seeds
+    /// pass; seeds 6 and 7 miss (seed 6 on the median bound, seed 7 on both the
+    /// fit and median bounds). The count-based bar below (>=9/12) keeps one
+    /// seed of headroom under that measured 10/12 for platform floating-point
+    /// variance while asserting a strong-majority population claim, not a
+    /// vacuous one; per K3, robustness comes from aggregating over seeds, not
+    /// from widening the per-seed bounds (already the original, un-loosened
+    /// order-of-magnitude bounds: within one/two σ_y of μ_y).
     #[tokio::test(flavor = "multi_thread")]
     async fn ft_quantile_scale_robust_on_high_variance_target() {
         let device = Device::Cpu;
@@ -3701,39 +3871,22 @@ mod standardization_contract {
         let levels = vec![0.1, 0.5, 0.9];
         let sigma_y = wide_sigma_y();
         let mu_y = wide_mean();
-        let config = FineTuneConfig {
-            regression_loss: Some(RegressionLoss::Pinball),
-            quantile_levels: levels.clone(),
-            ..Default::default()
-        };
-        let (loop_, varmap) = regression_loop(config, levels.len(), &targets, &device).await;
         let feats = features(n, &device);
 
-        let (z_head, max_loss) = train_tracking_loss(&loop_, &varmap, &feats, &targets, 1500);
-        assert!(
-            max_loss.is_finite() && max_loss < 100.0,
-            "Pinball: z-space loss must stay below the divergence guard on a σ_y≈{sigma_y} \
-             target (max loss {max_loss})"
-        );
-        let cols = serve_through_production(&loop_, &z_head);
-        let row0: Vec<f32> = cols.iter().map(|c| c[0]).collect();
-        for (i, &q) in row0.iter().enumerate() {
-            assert!(
-                (q - mu_y).abs() < 2.0 * sigma_y,
-                "Pinball: served quantile {i} (level {}) {q} must fit μ_y≈{mu_y} within \
-                 two spreads (σ_y≈{sigma_y})",
-                levels[i]
-            );
+        let mut passed = 0usize;
+        let mut failures: Vec<(u64, QuantileFailure)> = Vec::new();
+        for seed in PINNED_SEEDS {
+            let stats = measure_quantile_seed(seed, &targets, &feats, &levels, &device).await;
+            match check_quantile_seed(&stats, mu_y, sigma_y) {
+                Ok(()) => passed += 1,
+                Err(reason) => failures.push((stats.seed, reason)),
+            }
         }
-        // Median tracks μ_y; columns non-crossing.
         assert!(
-            (row0[1] - mu_y).abs() < sigma_y,
-            "Pinball: served median {} must track μ_y≈{mu_y}",
-            row0[1]
-        );
-        assert!(
-            row0[0] <= row0[1] && row0[1] <= row0[2],
-            "Pinball: served quantiles must be non-crossing: {row0:?}"
+            passed >= 9,
+            "Pinball scale-robustness must hold across a strong majority of the \
+             pinned 12-seed set, not one lucky default-seed trajectory: {passed}/12 \
+             pinned seeds passed the checker (need >=9); failures: {failures:?}"
         );
     }
 
@@ -3880,47 +4033,246 @@ mod standardization_contract {
         );
     }
 
-    /// P10 — the scale-equivariant objectives (Crps, Pinball) share the SAME
-    /// population minimizer in z vs raw space: the z loss is the raw loss / σ_y, so
-    /// the analytic argmin is identical. The served raw output is therefore
-    /// preserved across the two loss spaces — but NOT byte-equal: the production
-    /// AdamW is not scale-free (its `eps = 1e-8` is added to `√v̂`, and the
-    /// decoupled `weight_decay` shrinks θ by `lr·λ` independent of the loss scale),
-    /// so dividing the loss by σ_y ≈ 19 shrinks every gradient by 1/σ_y and the eps
-    /// term's relative weight and the moment trajectory shift. The two runs land on
-    /// the same minimizer up to that optimizer-perturbation, not to machine epsilon.
+    /// The Crps oracle's evaluated seed set (post-audit rework): the pinned
+    /// 12 PLUS `DEFAULT_FINE_TUNE_SEED` (`jammi_wire::fine_tune`, wire's
+    /// fine_tune.rs:362) — the trajectory every caller who does not pass a
+    /// seed actually runs; the escape's whole framing is about that default
+    /// trajectory. The quantile oracle above is UNCHANGED (still the 12-seed
+    /// `PINNED_SEEDS` — an independent audit measured it clean and asked for
+    /// it to be kept as-is: same bounds, same 12 seeds, same >=9 bar).
+    const CRPS_SEEDS: [u64; 13] = [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        jammi_wire::fine_tune::DEFAULT_FINE_TUNE_SEED,
+    ];
+
+    /// Per-seed measurement for the Crps z-vs-raw preservation oracle. Two
+    /// PAIRS of fields, feeding two INDEPENDENT arms of
+    /// [`check_crps_aggregate`]:
+    /// - `(sigma_ratio, mean_signed_diff)` feed the AGGREGATE arms
+    ///   (trimmed-mean, robust to seed-to-seed AdamW noise, sensitive to a
+    ///   uniform/systematic serve-time regression).
+    /// - `(mean_abs_diff, sigma_abs_diff)` feed the PER-SEED CEILING arm —
+    ///   021e48e's original quantities, RE-ADDED (second audit round, block
+    ///   1): an aggregate-only checker is blind to SIGN-BALANCED per-seed
+    ///   scatter (e.g. half the seeds +10 raw units, half −10 raw units of
+    ///   served-mean drift) because a trimmed mean of SIGNED per-seed values
+    ///   cancels across seeds even though every individual seed is badly
+    ///   wrong — measured on this codebase's OWN mutant (i): its per-seed
+    ///   mean diffs are sign-split and the aggregate trims to −0.266 (a PASS)
+    ///   even though `mean_abs_diff` is large on every seed. `check_crps_aggregate`
+    ///   requires evidence from BOTH kinds of arm to accept a sweep.
+    #[derive(Debug, Clone, Copy)]
+    struct CrpsSeedStats {
+        seed: u64,
+        /// σ_z_served / σ_r_served (row 0) — dimensionless; feeds the
+        /// aggregate σ-ratio arm. Scoped claim (advisory, second audit
+        /// round): a trimmed mean of ratios is exact-linear under a uniform
+        /// MULTIPLICATIVE shift of every seed's ratio (the natural failure
+        /// model for a scale parameter) — NOT under a uniform ADDITIVE
+        /// raw-unit shift to `σ_z_served`, which produces a PER-SEED-VARYING
+        /// ratio shift (`delta/σ_r_served`, and `σ_r_served` spans a
+        /// measured ~5x range across seeds).
+        sigma_ratio: f32,
+        /// mean(z_row − r_row) over all rows — SIGNED; feeds the aggregate μ
+        /// arm. A trimmed mean of these is exact-linear under a uniform
+        /// ADDITIVE raw-unit shift (adding `delta` to every row of every
+        /// seed shifts every seed's average, hence the trimmed mean, by
+        /// exactly `delta`).
+        mean_signed_diff: f32,
+        /// max(|z_row − r_row|) over all rows — 021e48e's original per-seed
+        /// μ quantity; feeds the per-seed ceiling arm.
+        mean_abs_diff: f32,
+        /// |σ_z_served − σ_r_served| — 021e48e's original per-seed σ
+        /// quantity; feeds the per-seed ceiling arm.
+        sigma_abs_diff: f32,
+    }
+
+    /// Why `check_crps_aggregate` rejected the sweep. ALL applicable
+    /// violations are collected in one call (see [`check_crps_aggregate`]);
+    /// only [`Self::NonFinite`] short-circuits, because every other
+    /// statistic below is undefined over a non-finite input.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CrpsViolation {
+        NonFinite,
+        SigmaRatioOutOfRange,
+        MeanDrift,
+        /// Fewer than `CRPS_PER_SEED_BAR` of the swept seeds individually
+        /// clear BOTH per-seed ceilings — the arm that makes SIGN-BALANCED
+        /// per-seed scatter visible (see [`CrpsSeedStats`]'s doc).
+        PerSeedCeilingViolated,
+    }
+
+    /// The `trim_frac`-trimmed mean of `values`: sorts a copy, drops the
+    /// top/bottom `round(trim_frac·n)` entries, averages the rest. Exact
+    /// scope of the "exact-linear" property (advisory, second audit round):
+    /// a trimmed mean is exact-linear under a uniform shift APPLIED TO THE
+    /// VALUES BEING AGGREGATED — additive for [`CrpsSeedStats::mean_signed_diff`],
+    /// multiplicative for [`CrpsSeedStats::sigma_ratio`] (see each field's
+    /// doc) — because such a shift preserves rank order, so the trimmed set
+    /// is the SAME before and after. This is what makes a clean
+    /// before/after detection-power comparison possible, and (at
+    /// `trim_frac=0.15`, 2 of the 13 Crps seeds) discards the two measured
+    /// ~15-raw-σ-unit AdamW-noise outlier seeds instead of averaging over
+    /// them unweighted.
+    fn trimmed_mean(values: &[f32], trim_frac: f32) -> f32 {
+        let mut v = values.to_vec();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let trim = ((v.len() as f32) * trim_frac).round() as usize;
+        let keep = &v[trim..v.len() - trim];
+        keep.iter().sum::<f32>() / keep.len() as f32
+    }
+
+    /// σ-axis AGGREGATE arm: `check_crps_aggregate`'s trimmed-mean
+    /// sigma-ratio must land in this dimensionless band. Measured
+    /// trimmed-mean baseline (correct code): 1.108; per-seed ratios range
+    /// 0.66-1.60 (5/13 individual seeds sit below 1.0 — ordinary AdamW
+    /// scatter, not a defect; the bound applies to the TRIMMED MEAN, not
+    /// individual seeds). `LO=1.0` is an EMPIRICAL anchor, not a
+    /// theoretical ideal: the working window is roughly 0.85-1.10 — mutant
+    /// (i)'s trimmed-mean ratio (0.852, measured) bounds `LO` from below,
+    /// the 1.108 baseline (plus jackknife noise, comparable order to the
+    /// μ-axis jackknife below) bounds it from above. MEASURED detection
+    /// crossover (full 3-arm checker, real value-level injection): under-
+    /// dispersion (the sensitive direction, and the direction K3's actual
+    /// bug class moves in) red at -1.8 raw units; over-dispersion (the
+    /// opposite direction) red at +4.0 raw units.
+    const CRPS_SIGMA_RATIO_LO: f32 = 1.0;
+    /// Upper band edge, for the opposite-direction (over-dispersion, e.g. a
+    /// doubled multiply) failure mode; kept for two-sided coverage since the
+    /// trimmed-mean baseline (1.108) leaves headroom either way.
+    const CRPS_SIGMA_RATIO_HI: f32 = 1.3;
+    /// μ-axis AGGREGATE arm: `check_crps_aggregate`'s trimmed-mean SIGNED
+    /// mean-diff must have `abs() < CRPS_MEAN_AGG_TOL`. Measured
+    /// trimmed-mean baseline: 0.765 raw units. MEASURED leave-one-out
+    /// jackknife (removing each of the 13 seeds in turn and recomputing the
+    /// trimmed mean over the other 12): the largest shift from the
+    /// full-sweep value is 0.128 raw units. `0.9` (headroom 0.135 above
+    /// baseline) left the bound within ONE jackknife shift of the
+    /// unregressed baseline — a coin flip against ordinary per-platform
+    /// float/toolchain noise. Widened to a stated margin: baseline + 3×max
+    /// jackknife shift ≈ 0.765 + 3·0.128 ≈ 1.15, rounded to `1.2` (headroom
+    /// 0.435, >3x the measured jackknife noise). This arm no longer has to
+    /// be the sole μ guard: `PerSeedCeilingViolated` below is the arm that
+    /// still catches a per-seed-gross violation the widened aggregate bound
+    /// tolerates — including the whole SIGN-BALANCED-scatter class this
+    /// aggregate structurally cannot see regardless of where the bound
+    /// sits (see [`CrpsSeedStats`]'s doc). MEASURED detection crossover
+    /// (full 3-arm checker, real value-level injection), reported HONESTLY
+    /// after widening for jackknife-robustness (not narrated to look better
+    /// than measured): the sensitive direction (a positive/over-fit shift,
+    /// no sign-cancellation "dip") is red at +0.5 raw units — this is
+    /// arithmetically close to `CRPS_MEAN_AGG_TOL` minus the baseline and
+    /// is NOT reported as a standalone virtue, since it is just the
+    /// headroom; the worst-case direction (negative, the "dip" a
+    /// SIGNED-but-not-scale-invariant statistic centred away from zero
+    /// exhibits) is red at -2.0 raw units.
+    const CRPS_MEAN_AGG_TOL: f32 = 1.2;
+    /// PER-SEED CEILING arm (021e48e's original bound, re-added second audit
+    /// round, block 1): a per-seed μ ceiling as a fraction of σ_y.
+    const CRPS_PER_SEED_MEAN_CEILING_FRAC: f32 = 0.3;
+    /// PER-SEED CEILING arm: a per-seed σ ceiling as a fraction of σ_y.
+    const CRPS_PER_SEED_SIGMA_CEILING_FRAC: f32 = 0.5;
+    /// PER-SEED CEILING arm: how many of the 13 `CRPS_SEEDS` must
+    /// individually clear BOTH ceilings. MEASURED baseline (correct code):
+    /// 10/13 pass both ceilings simultaneously (seeds 2 and 8 miss the σ
+    /// ceiling — the two known ~15-raw-σ-unit AdamW-noise outliers; seed 10
+    /// misses the μ ceiling). `9` keeps one seed of headroom under that
+    /// measured 10/13, mirroring 021e48e's own margin philosophy.
+    const CRPS_PER_SEED_BAR: usize = 9;
+
+    /// THE Crps-oracle judgment (esc-035, second audit round): collects
+    /// EVERY applicable violation from THREE independent arms — no early
+    /// return once non-finiteness is ruled out, so hiding one arm's
+    /// regression behind another firing first is impossible (measured: with
+    /// an earlier single-`Result`, early-return design, setting
+    /// `CRPS_MEAN_AGG_TOL` to a vacuous value left ALL FOUR tests in this
+    /// module green, because the σ arm's early return hid the fact that the
+    /// μ guard had become deletable — the same defect class the first audit
+    /// round blocked on the calibration-ratio term, reappearing on this
+    /// axis).
     ///
-    /// So this is a generous-TOLERANCE fit test, not an equality test: train z vs
-    /// raw to convergence on the SAME data/seed and assert the served raw mean/σ
-    /// agree within a tolerance JUSTIFIED against the eps/decay perturbation
-    /// (measured at σ_y ≈ 19 below). It is the strongest falsifier that z-space
-    /// *materially* alters what a converging objective learns. (β-NLL is NOT
-    /// asserted — it is not scale-equivariant, P12, and the raw path diverges, so
-    /// there is no raw solution to match.)
-    #[tokio::test(flavor = "multi_thread")]
-    async fn crps_served_output_preserved_within_tolerance_z_vs_raw() {
-        let device = Device::Cpu;
-        // The σ_y ≈ 19 WIDE target — the realistic scale. Crps is bounded ≈σ, so
-        // the RAW-space path also converges cleanly here (it never trips the >100
-        // guard), giving a raw solution to compare the z solution against AT the
-        // scale where the optimizer perturbation (eps/decay ÷σ_y) actually bites.
-        let n = WIDE.len();
-        let targets = Tensor::from_vec(WIDE.to_vec(), (n,), &device).unwrap();
-        let feats = features(n, &device);
-        let config = FineTuneConfig {
-            regression_loss: Some(RegressionLoss::Crps),
-            ..Default::default()
-        };
+    /// The three arms:
+    /// 1. AGGREGATE σ-ratio (trimmed mean in `[CRPS_SIGMA_RATIO_LO,
+    ///    CRPS_SIGMA_RATIO_HI]`) — sensitive to a uniform MULTIPLICATIVE σ
+    ///    regression (the K3 bug class here, missing/doubled σ_y multiply,
+    ///    IS multiplicative), scale-invariant across the measured ~5x
+    ///    per-seed σ_r range.
+    /// 2. AGGREGATE μ signed diff (trimmed mean, `abs() < CRPS_MEAN_AGG_TOL`)
+    ///    — sensitive to a uniform ADDITIVE μ regression.
+    /// 3. PER-SEED CEILING count (>= `CRPS_PER_SEED_BAR` of the seeds
+    ///    individually clear BOTH `CRPS_PER_SEED_MEAN_CEILING_FRAC·σ_y` and
+    ///    `CRPS_PER_SEED_SIGMA_CEILING_FRAC·σ_y`) — the arm that catches
+    ///    SIGN-BALANCED per-seed scatter a trimmed mean cancels away (see
+    ///    [`CrpsSeedStats`]'s doc; MEASURED: a ±10-raw-unit alternating μ
+    ///    scatter and a ×2/÷2 alternating σ scatter both read GREEN through
+    ///    arms 1-2 alone, and RED through this arm).
+    ///
+    /// Non-finite counts as failing: ANY non-finite per-seed measurement
+    /// rejects the WHOLE sweep (returns ONLY `NonFinite`) before any other
+    /// arm runs — trimming/counting over a non-finite value is undefined,
+    /// so a diverged seed can never be laundered away by being trimmed out
+    /// or outvoted by finite neighbors.
+    fn check_crps_aggregate(stats: &[CrpsSeedStats], sigma_y: f32) -> Vec<CrpsViolation> {
+        let any_non_finite = stats.iter().any(|s| {
+            !s.sigma_ratio.is_finite()
+                || !s.mean_signed_diff.is_finite()
+                || !s.mean_abs_diff.is_finite()
+                || !s.sigma_abs_diff.is_finite()
+        });
+        if any_non_finite {
+            return vec![CrpsViolation::NonFinite];
+        }
 
-        // Z-space (production) path.
-        let (loop_z, vm_z) = regression_loop(config.clone(), 2, &targets, &device).await;
-        let z_head = train_through_production_dispatch(&loop_z, &vm_z, &feats, &targets, 1500);
-        let served_z = serve_through_production(&loop_z, &z_head);
+        let mut violations = Vec::new();
 
-        // Raw-space reference path: train the SAME head against the RAW target on
-        // the de-standardised head output (the pre-PR5 flow), then read the served
-        // raw distribution. Same scaler, same features, same seed.
-        let (loop_r, vm_r) = regression_loop(config, 2, &targets, &device).await;
+        let sigma_ratios: Vec<f32> = stats.iter().map(|s| s.sigma_ratio).collect();
+        let mean_diffs: Vec<f32> = stats.iter().map(|s| s.mean_signed_diff).collect();
+        let tm_sigma_ratio = trimmed_mean(&sigma_ratios, 0.15);
+        let tm_mean = trimmed_mean(&mean_diffs, 0.15);
+        if !(CRPS_SIGMA_RATIO_LO..=CRPS_SIGMA_RATIO_HI).contains(&tm_sigma_ratio) {
+            violations.push(CrpsViolation::SigmaRatioOutOfRange);
+        }
+        if tm_mean.abs() >= CRPS_MEAN_AGG_TOL {
+            violations.push(CrpsViolation::MeanDrift);
+        }
+
+        let mean_ceiling = CRPS_PER_SEED_MEAN_CEILING_FRAC * sigma_y;
+        let sigma_ceiling = CRPS_PER_SEED_SIGMA_CEILING_FRAC * sigma_y;
+        let per_seed_passed = stats
+            .iter()
+            .filter(|s| s.mean_abs_diff <= mean_ceiling && s.sigma_abs_diff <= sigma_ceiling)
+            .count();
+        if per_seed_passed < CRPS_PER_SEED_BAR {
+            violations.push(CrpsViolation::PerSeedCeilingViolated);
+        }
+
+        violations
+    }
+
+    /// Train the REAL, unmutated raw-space reference path (the pre-PR5 flow:
+    /// head forward -> destandardize -> loss against RAW targets) and return
+    /// `(served_r_mean_rows, served_r_sigma0)`. Shared by the real
+    /// measurement and every mutant control below, so every mutant's z-path
+    /// is compared against the SAME real raw-path training the real oracle
+    /// uses — only the z-path differs per mutant.
+    async fn measure_raw_reference(
+        config: FineTuneConfig,
+        targets: &Tensor,
+        feats: &Tensor,
+        device: &Device,
+    ) -> (Vec<f32>, f32) {
+        let (loop_r, vm_r) = regression_loop(config, 2, targets, device).await;
         let scaler_r = *loop_r.target_scaler.as_ref().unwrap();
         let mut opt = AdamW::new(
             vm_r.all_vars(),
@@ -3931,7 +4283,7 @@ mod standardization_contract {
         )
         .unwrap();
         for _ in 0..1500 {
-            let z_out = loop_r.head_forward(&feats).unwrap();
+            let z_out = loop_r.head_forward(feats).unwrap();
             let raw_head = scaler_r
                 .destandardize(&z_out, &loop_r.regression_form())
                 .unwrap();
@@ -3943,57 +4295,513 @@ mod standardization_contract {
             let grads = loss.backward().unwrap();
             opt.step(&grads).unwrap();
         }
-        // The raw-trained head's de-standardised output IS the pre-PR5 served raw
-        // distribution: column 0 = served mean (μ_y+σ_y·z, already de-standardised),
-        // column 1 = raw σ → the OLD adapter's UNSCALED `softplus(raw)` (no σ_y
-        // multiply, since the σ was learned in raw units). Read it that way.
-        let z_head_r = loop_r.head_forward(&feats).unwrap();
+        let z_head_r = loop_r.head_forward(feats).unwrap();
         let raw_head_r = scaler_r
             .destandardize(&z_head_r, &loop_r.regression_form())
             .unwrap();
         let rows_r = raw_head_r.to_vec2::<f32>().unwrap();
         let served_r_mean: Vec<f32> = rows_r.iter().map(|r| r[0]).collect();
-        let served_r_sigma: Vec<f32> = rows_r
-            .iter()
-            .map(|r| super::super::regression_loss::softplus_std_for_test(r[1] as f64) as f32)
-            .collect();
+        let served_r_sigma0 =
+            super::super::regression_loss::softplus_std_for_test(rows_r[0][1] as f64) as f32;
+        (served_r_mean, served_r_sigma0)
+    }
 
-        // Served raw means and σ are PRESERVED across the two loss spaces within a
-        // tolerance justified by the optimizer perturbation. The two runs share the
-        // population minimizer (scale-equivariant Crps → same argmin); they differ
-        // only by AdamW's non-scale-free eps/decay acting on a ÷σ_y-shrunk gradient.
-        //
-        // MEASURED at σ_y ≈ 19.2 (WIDE, 1500 steps, lr 0.05): the largest served-mean
-        // |z − raw| is ≈ 2.3 raw units (≈ 0.12·σ_y) — most rows agree to < 1 unit,
-        // two end rows differ by ≈ 2.3 — and the served-σ |z − raw| is ≈ 0.8. That
-        // residual is the AdamW eps/decay perturbation on a ÷σ_y-shrunk gradient,
-        // exactly as the doc-comment predicts; it is NOT machine epsilon. The bounds
-        // are 3.0 raw units (≈ 0.16·σ_y) for the mean and 2.0 for the σ — generous
-        // headroom over the measured ≈2.3 / ≈0.8 so the test is robust to the
-        // optimizer wobble, yet ≪ σ_y, so it still fails loudly if z-space
-        // MATERIALLY moved the solution (e.g. the ≈19× error a missing σ_y multiply
-        // or a wrong loss space causes).
-        let mean_tol = 3.0_f32;
-        let sigma_tol = 2.0_f32;
-        let max_mean_diff = served_r_mean
+    /// Build a [`CrpsSeedStats`] from a z-path serve (mean row-vector + σ row
+    /// 0) and a raw-path reference — the one place all four per-seed fields
+    /// are computed, shared by the real measurement and every mutant.
+    fn crps_seed_stats_from_served(
+        seed: u64,
+        n: usize,
+        served_z_mean: &[f32],
+        served_z_sigma0: f32,
+        served_r_mean: &[f32],
+        served_r_sigma0: f32,
+    ) -> CrpsSeedStats {
+        let row_diffs: Vec<f32> = served_z_mean
             .iter()
-            .enumerate()
+            .zip(served_r_mean.iter())
             .take(n)
-            .map(|(row, &r)| (served_z[0][row] - r).abs())
-            .fold(0.0f32, f32::max);
+            .map(|(z, r)| z - r)
+            .collect();
+        let mean_signed_diff = row_diffs.iter().sum::<f32>() / row_diffs.len() as f32;
+        let mean_abs_diff = row_diffs.iter().fold(0.0f32, |m, &d| m.max(d.abs()));
+        let sigma_ratio = served_z_sigma0 / served_r_sigma0;
+        let sigma_abs_diff = (served_z_sigma0 - served_r_sigma0).abs();
+        CrpsSeedStats {
+            seed,
+            sigma_ratio,
+            mean_signed_diff,
+            mean_abs_diff,
+            sigma_abs_diff,
+        }
+    }
+
+    /// Train + serve one seed of the Crps z-vs-raw scenario through the REAL
+    /// production dispatch, returning the RAW served vectors (mean row +
+    /// σ scalar, both z-path and raw-path reference) rather than the
+    /// aggregated [`CrpsSeedStats`]. Shared by [`measure_crps_seed`] and the
+    /// two scatter-class regression tests below, so a scatter/injection can
+    /// be applied to the SAME real served values every other caller sees —
+    /// no post-hoc overwrite of an already-aggregated field, and no
+    /// back-solving a raw value out of a ratio.
+    async fn measure_crps_seed_raw(
+        seed: u64,
+        targets: &Tensor,
+        feats: &Tensor,
+        device: &Device,
+    ) -> (Vec<f32>, f32, Vec<f32>, f32) {
+        let config = FineTuneConfig {
+            regression_loss: Some(RegressionLoss::Crps),
+            seed,
+            ..Default::default()
+        };
+        let (loop_z, vm_z) = regression_loop(config.clone(), 2, targets, device).await;
+        let z_head = train_through_production_dispatch(&loop_z, &vm_z, feats, targets, 1500);
+        let served_z = serve_through_production(&loop_z, &z_head);
+        let (served_r_mean, served_r_sigma0) =
+            measure_raw_reference(config, targets, feats, device).await;
+        (
+            served_z[0].clone(),
+            served_z[1][0],
+            served_r_mean,
+            served_r_sigma0,
+        )
+    }
+
+    /// Train + serve one seed of the Crps z-vs-raw scenario through the REAL
+    /// production dispatch (mirrors the pre-rewrite test body; the only free
+    /// variable is `config.seed`).
+    async fn measure_crps_seed(
+        seed: u64,
+        targets: &Tensor,
+        feats: &Tensor,
+        n: usize,
+        device: &Device,
+    ) -> CrpsSeedStats {
+        let (served_z_mean, served_z_sigma0, served_r_mean, served_r_sigma0) =
+            measure_crps_seed_raw(seed, targets, feats, device).await;
+        crps_seed_stats_from_served(
+            seed,
+            n,
+            &served_z_mean,
+            served_z_sigma0,
+            &served_r_mean,
+            served_r_sigma0,
+        )
+    }
+
+    /// P10 — the scale-equivariant objectives (Crps, Pinball) share the SAME
+    /// population minimizer in z vs raw space: the z loss is the raw loss / σ_y, so
+    /// the analytic argmin is identical. The served raw output is therefore
+    /// preserved across the two loss spaces — but NOT byte-equal: the production
+    /// AdamW is not scale-free (its `eps = 1e-8` is added to `√v̂`, and the
+    /// decoupled `weight_decay` shrinks θ by `lr·λ` independent of the loss scale),
+    /// so dividing the loss by σ_y ≈ 19 shrinks every gradient by 1/σ_y and the eps
+    /// term's relative weight and the moment trajectory shift. The two runs land on
+    /// the same minimizer up to that optimizer-perturbation, not to machine epsilon.
+    /// (β-NLL is NOT asserted — it is not scale-equivariant, P12, and the raw path
+    /// diverges, so there is no raw solution to match.)
+    ///
+    /// esc-035 audit rework (second round): THREE independent arms —
+    /// aggregate trimmed-mean σ-ratio, aggregate trimmed-mean signed μ-diff,
+    /// per-seed ceiling count (see [`check_crps_aggregate`]) — over the
+    /// [`CRPS_SEEDS`] 13-seed sweep (the pinned 12 + the actual default seed),
+    /// not a single-trajectory, per-seed-count-only, or aggregate-only
+    /// judgment. Detection-power table (before/after, both axes, both
+    /// directions) is in this commit's message.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn crps_served_output_preserved_within_tolerance_z_vs_raw() {
+        let device = Device::Cpu;
+        // The σ_y ≈ 19 WIDE target — the realistic scale. Crps is bounded ≈σ, so
+        // the RAW-space path also converges cleanly here (it never trips the >100
+        // guard), giving a raw solution to compare the z solution against AT the
+        // scale where the optimizer perturbation (eps/decay ÷σ_y) actually bites.
+        let n = WIDE.len();
+        let targets = Tensor::from_vec(WIDE.to_vec(), (n,), &device).unwrap();
+        let feats = features(n, &device);
+        let sigma_y = wide_sigma_y();
+
+        let mut stats = Vec::with_capacity(CRPS_SEEDS.len());
+        for seed in CRPS_SEEDS {
+            stats.push(measure_crps_seed(seed, &targets, &feats, n, &device).await);
+        }
+        let violations = check_crps_aggregate(&stats, sigma_y);
+        let evaluated_seeds: Vec<u64> = stats.iter().map(|s| s.seed).collect();
         assert!(
-            max_mean_diff < mean_tol,
-            "Crps served mean: max |z − raw| {max_mean_diff} over {n} rows must be < \
-             {mean_tol} (≈0.16·σ_y) — same population minimizer up to the AdamW \
-             eps/decay perturbation, not a material change in the served output"
+            violations.is_empty(),
+            "Crps served-output preservation (z vs raw), aggregated over the \
+             {}-seed sweep {evaluated_seeds:?}: violations {violations:?}; \
+             stats: {stats:?}",
+            CRPS_SEEDS.len()
+        );
+    }
+
+    // ─── esc-035 required-sequence step 3: permanent negative controls ───────
+    //
+    // The three K3-breaking mutants named by the escape, each asserted to make
+    // `check_crps_aggregate` — the SAME checker fn and SAME named constants the
+    // real oracle above calls, zero inlined tolerance literals — return `Err`
+    // over the SAME `CRPS_SEEDS` sweep.
+
+    /// MUTANT (i): TargetScaler neutralized to identity (μ=0, σ=1) on the
+    /// z-path only, paired against the REAL (unmutated) raw-path reference.
+    /// MEASURED: `MeanDrift` does NOT fire — the per-seed μ diffs are
+    /// SIGN-SPLIT across the sweep (range −5.00…+3.56 raw units), so the
+    /// aggregate μ arm's trimmed mean cancels to ~−0.266, a PASS on that arm
+    /// alone. This mutant is instead caught by the σ-ratio arm (trimmed-mean
+    /// ratio ~0.852, collapsed away from the [1.0, 1.3] band — training
+    /// directly on raw-scale targets without ever being z-scored distorts
+    /// the trained σ column's scale) AND the per-seed ceiling arm (every
+    /// seed's μ diff is individually gross even though sign-balanced in
+    /// aggregate): `[SigmaRatioOutOfRange, PerSeedCeilingViolated]`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mutant_scaler_neutralized_rejected_by_aggregate_checker() {
+        let device = Device::Cpu;
+        let n = WIDE.len();
+        let targets = Tensor::from_vec(WIDE.to_vec(), (n,), &device).unwrap();
+        let feats = features(n, &device);
+        let sigma_y = wide_sigma_y();
+
+        let mut stats = Vec::with_capacity(CRPS_SEEDS.len());
+        for seed in CRPS_SEEDS {
+            let config = FineTuneConfig {
+                regression_loss: Some(RegressionLoss::Crps),
+                seed,
+                ..Default::default()
+            };
+            // MUTANT z-path: neutralize the scaler the production build just
+            // reduced from `targets` — the identity transform, μ=0, σ=1.
+            let (mut loop_z, vm_z) = regression_loop(config.clone(), 2, &targets, &device).await;
+            loop_z.target_scaler = Some(TargetScaler::from_mean_std(0.0, 1.0));
+            let z_head = train_through_production_dispatch(&loop_z, &vm_z, &feats, &targets, 1500);
+            let served_z = serve_through_production(&loop_z, &z_head);
+            let (served_r_mean, served_r_sigma0) =
+                measure_raw_reference(config, &targets, &feats, &device).await;
+            stats.push(crps_seed_stats_from_served(
+                seed,
+                n,
+                &served_z[0],
+                served_z[1][0],
+                &served_r_mean,
+                served_r_sigma0,
+            ));
+        }
+        let violations = check_crps_aggregate(&stats, sigma_y);
+        // MEASURED: the aggregate μ arm's trimmed-mean SIGNED diff cancels
+        // (the per-seed mean diffs are sign-split across the sweep), so this
+        // mutant is caught by the σ-ratio arm and the per-seed ceiling arm,
+        // NOT the aggregate μ arm — asserting the SPECIFIC variants this
+        // mutant fires (not a bare "any violation"), per the second audit
+        // round.
+        assert!(
+            violations.contains(&CrpsViolation::SigmaRatioOutOfRange)
+                && violations.contains(&CrpsViolation::PerSeedCeilingViolated),
+            "mutant (i) [scaler neutralized] must be REJECTED by \
+             check_crps_aggregate over the {}-seed sweep via SigmaRatioOutOfRange \
+             AND PerSeedCeilingViolated — a rewrite under which either goes \
+             missing is a relaxation hiding the regression. \
+             violations: {violations:?}; stats: {stats:?}",
+            CRPS_SEEDS.len()
+        );
+    }
+
+    /// MUTANT (ii): loss-rescaling substitute — train the head directly
+    /// against the RAW target (skip `z_score_targets`) and divide the
+    /// resulting loss by σ_y, the K3-forbidden "fix" that acts on the loss
+    /// instead of the data-space representation (family C: under Adam the
+    /// parameter step is ~lr regardless of loss scale, so a loss-rescale
+    /// cannot substitute for standardizing the target the head conditions
+    /// on). Serving still runs the REAL, unmutated `destandardize`
+    /// (production always treats the head output as z-scale), so the
+    /// raw-trained head's output is destandardized a SECOND time — the
+    /// served mean lands hundreds of raw units from the raw reference.
+    /// Rejected by `check_crps_aggregate`'s own mean predicate (`MeanDrift`),
+    /// no hand-rolled comparison.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mutant_loss_rescale_substitute_rejected_by_aggregate_checker() {
+        let device = Device::Cpu;
+        let n = WIDE.len();
+        let targets = Tensor::from_vec(WIDE.to_vec(), (n,), &device).unwrap();
+        let feats = features(n, &device);
+        let sigma_y = wide_sigma_y();
+
+        let mut stats = Vec::with_capacity(CRPS_SEEDS.len());
+        for seed in CRPS_SEEDS {
+            let config = FineTuneConfig {
+                regression_loss: Some(RegressionLoss::Crps),
+                seed,
+                ..Default::default()
+            };
+            let (loop_z, vm_z) = regression_loop(config.clone(), 2, &targets, &device).await;
+            let scaler = *loop_z.target_scaler.as_ref().unwrap();
+            let mut opt = AdamW::new(
+                vm_z.all_vars(),
+                ParamsAdamW {
+                    lr: 0.05,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            for _ in 0..1500 {
+                // MUTANT: score the RAW head output against the RAW target
+                // (never z-scored), then rescale the LOSS by σ_y — the
+                // forbidden loss-space "fix".
+                let head_out = loop_z.head_forward(&feats).unwrap();
+                let batch = TrainingBatch::Regression {
+                    input: head_out,
+                    target: targets.clone(),
+                };
+                let loss = loop_z.compute_loss(&batch).unwrap();
+                let scaled_loss = (loss / scaler.std()).unwrap();
+                let grads = scaled_loss.backward().unwrap();
+                opt.step(&grads).unwrap();
+            }
+            // Serve through the REAL, unmutated destandardize — production
+            // always treats the head's raw output as z-scale.
+            let z_head = loop_z.head_forward(&feats).unwrap();
+            let served_z = serve_through_production(&loop_z, &z_head);
+            let (served_r_mean, served_r_sigma0) =
+                measure_raw_reference(config, &targets, &feats, &device).await;
+            stats.push(crps_seed_stats_from_served(
+                seed,
+                n,
+                &served_z[0],
+                served_z[1][0],
+                &served_r_mean,
+                served_r_sigma0,
+            ));
+        }
+        let violations = check_crps_aggregate(&stats, sigma_y);
+        // MEASURED: this mutant fires ALL THREE arms — the double-
+        // destandardize offset is so large (tm_mean ~643 raw units) it trips
+        // `MeanDrift`, the mechanism this mutant is meant to demonstrate
+        // (family C: loss-rescale is not data-space standardization); the
+        // destandardized head also lands nowhere near the raw reference's σ
+        // scale (tm_sigma_ratio ~16.3), tripping `SigmaRatioOutOfRange`; and
+        // every individual seed is grossly wrong on both axes, tripping
+        // `PerSeedCeilingViolated`. Assert all three explicitly (the SPECIFIC
+        // variants measured), not a bare "any violation".
+        assert!(
+            violations.contains(&CrpsViolation::MeanDrift)
+                && violations.contains(&CrpsViolation::SigmaRatioOutOfRange)
+                && violations.contains(&CrpsViolation::PerSeedCeilingViolated),
+            "mutant (ii) [loss-rescaling substitute] must be REJECTED by ALL \
+             THREE of check_crps_aggregate's arms over the {}-seed sweep — a \
+             loss-space rescale is not a data-space standardization. \
+             violations: {violations:?}; stats: {stats:?}",
+            CRPS_SEEDS.len()
+        );
+    }
+
+    /// MUTANT (iii): served σ built with `gaussian_scaled(1.0)` instead of
+    /// `gaussian_scaled(scaler.std())` — the literal defect at
+    /// trainer.rs:3214-3217, reproduced here as a hand-built adapter call
+    /// (production code itself is untouched). Training is the REAL,
+    /// unmutated production dispatch; only the serve-time adapter choice is
+    /// corrupted, and only for the z-path (the raw-path reference is real
+    /// and unmutated). Non-tautological: `gaussian_scaled(1.0)` collapses the
+    /// served σ to ~1 raw unit against a raw-path reference that is
+    /// genuinely trajectory-dependent (measured 5.9-29.7 raw units across
+    /// seeds) — the real aggregate checker's `sigma_ratio` field, not a
+    /// self-cancelling ratio of two numbers both derived from the SAME
+    /// forced constant.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mutant_served_sigma_gaussian_scaled_one_rejected_by_aggregate_checker() {
+        use crate::inference::adapter::{BackendOutput, DistributionAdapter, OutputAdapter};
+        use arrow::array::{Array, Float32Array};
+
+        let device = Device::Cpu;
+        let n = WIDE.len();
+        let targets = Tensor::from_vec(WIDE.to_vec(), (n,), &device).unwrap();
+        let feats = features(n, &device);
+        let sigma_y = wide_sigma_y();
+
+        let mut stats = Vec::with_capacity(CRPS_SEEDS.len());
+        for seed in CRPS_SEEDS {
+            let config = FineTuneConfig {
+                regression_loss: Some(RegressionLoss::Crps),
+                seed,
+                ..Default::default()
+            };
+            // REAL, unmutated production training.
+            let (loop_z, vm_z) = regression_loop(config.clone(), 2, &targets, &device).await;
+            let z_head = train_through_production_dispatch(&loop_z, &vm_z, &feats, &targets, 1500);
+            let scaler = loop_z.target_scaler.as_ref().unwrap();
+            let raw = scaler
+                .destandardize(&z_head, &loop_z.regression_form())
+                .unwrap();
+            let served_rows = raw.to_vec2::<f32>().unwrap();
+            let mean_col: Vec<f32> = served_rows.iter().map(|r| r[0]).collect();
+            let width = served_rows.first().map_or(0, Vec::len);
+            let flat: Vec<f32> = served_rows.into_iter().flatten().collect();
+            let output = BackendOutput {
+                float_outputs: vec![flat],
+                string_outputs: vec![],
+                row_status: vec![true; n],
+                row_errors: vec![String::new(); n],
+                shapes: vec![(n, width)],
+            };
+            // MUTANT: gaussian_scaled(1.0) instead of gaussian_scaled(scaler.std()).
+            let cols = DistributionAdapter::gaussian_scaled(1.0_f32)
+                .adapt(&output, n)
+                .unwrap();
+            let served_sigma_mutant = cols[1]
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap()
+                .value(0);
+            let (served_r_mean, served_r_sigma0) =
+                measure_raw_reference(config, &targets, &feats, &device).await;
+            stats.push(crps_seed_stats_from_served(
+                seed,
+                n,
+                &mean_col,
+                served_sigma_mutant,
+                &served_r_mean,
+                served_r_sigma0,
+            ));
+        }
+        let violations = check_crps_aggregate(&stats, sigma_y);
+        // MEASURED: only the serve-time adapter is corrupted, so the μ-axis
+        // AGGREGATE (unaffected) stays clean (`MeanDrift` does NOT fire) —
+        // but the collapsed σ makes EVERY individual seed's `sigma_abs_diff`
+        // grossly wrong too, so this mutant fires BOTH `SigmaRatioOutOfRange`
+        // AND `PerSeedCeilingViolated`. Assert both specifically.
+        assert!(
+            violations.contains(&CrpsViolation::SigmaRatioOutOfRange)
+                && violations.contains(&CrpsViolation::PerSeedCeilingViolated),
+            "mutant (iii) [gaussian_scaled(1.0) instead of gaussian_scaled(σ_y)] \
+             must be REJECTED by check_crps_aggregate's SigmaRatioOutOfRange \
+             AND PerSeedCeilingViolated arms over the {}-seed sweep — a \
+             rewrite under which either goes missing is the ~19x \
+             under-dispersion regression hiding. \
+             violations: {violations:?}; stats: {stats:?}",
+            CRPS_SEEDS.len()
+        );
+    }
+
+    /// PERMANENT REGRESSION (esc-035, second audit round, block 1 — the
+    /// "boundedness term" finding): a SIGN-BALANCED per-seed μ scatter that
+    /// the two aggregate arms CANNOT see. 6 of the 13 sweep seeds get +10 raw
+    /// units, 7 get -10 raw units (the 6/7 split, rather than an even
+    /// alternation, compensates for the REAL baseline's own slight positive
+    /// skew — MEASURED per-seed baseline `mean_signed_diff` is positive for
+    /// 10 of 13 seeds — so the scattered result still lands inside the
+    /// aggregate band rather than being pulled outside it by the pre-existing
+    /// skew), added directly to every REAL served z-row via
+    /// [`measure_crps_seed_raw`] (a real-path serve-time injection, not a
+    /// post-hoc overwrite of an already-aggregated field) — a genuine
+    /// per-trajectory gross violation on EVERY affected seed, landing so the
+    /// trimmed mean of the (now sign-split) per-seed values stays INSIDE
+    /// `CRPS_MEAN_AGG_TOL` (measured trimmed mean: -0.435, bound: 1.2).
+    /// esc-035 requires K3's standardization to keep the served fit
+    /// "BOUNDED across trajectories" — a checker with only two
+    /// central-tendency statistics cannot express that, because
+    /// sign-balanced scatter always has a valid central tendency near zero.
+    /// This is why `PerSeedCeilingViolated` exists: it must fire here, and
+    /// the two aggregate arms must NOT (this construction is deliberately
+    /// inside their bands — if either now also fires, the construction no
+    /// longer isolates the per-seed arm and must be re-derived).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mutant_sign_balanced_mean_scatter_rejected_by_per_seed_ceiling() {
+        let device = Device::Cpu;
+        let n = WIDE.len();
+        let targets = Tensor::from_vec(WIDE.to_vec(), (n,), &device).unwrap();
+        let feats = features(n, &device);
+        let sigma_y = wide_sigma_y();
+
+        let mut stats = Vec::with_capacity(CRPS_SEEDS.len());
+        for (i, seed) in CRPS_SEEDS.into_iter().enumerate() {
+            let (served_z_mean, served_z_sigma0, served_r_mean, served_r_sigma0) =
+                measure_crps_seed_raw(seed, &targets, &feats, &device).await;
+            // MUTANT: +10 raw units on the first 6 seeds, -10 on the
+            // remaining 7 (6/7, not an even alternation — see the doc
+            // comment for why), added directly to every REAL served z-row —
+            // a sign-balanced per-seed scatter; σ untouched.
+            let delta = if i < 6 { 10.0 } else { -10.0 };
+            let scattered_z_mean: Vec<f32> = served_z_mean.iter().map(|v| v + delta).collect();
+            stats.push(crps_seed_stats_from_served(
+                seed,
+                n,
+                &scattered_z_mean,
+                served_z_sigma0,
+                &served_r_mean,
+                served_r_sigma0,
+            ));
+        }
+        let violations = check_crps_aggregate(&stats, sigma_y);
+        assert!(
+            violations.contains(&CrpsViolation::PerSeedCeilingViolated),
+            "a sign-balanced ±10-raw-unit μ scatter must be REJECTED via \
+             PerSeedCeilingViolated — a checker with only aggregate \
+             (median/trimmed-mean) statistics cannot see this class of \
+             per-trajectory violation, which is exactly why this arm \
+             exists. violations: {violations:?}"
         );
         assert!(
-            (served_z[1][0] - served_r_sigma[0]).abs() < sigma_tol,
-            "Crps served σ: z-space (σ_y·σ_z) {} vs raw-space (σ_raw) {} must agree \
-             within {sigma_tol} — scale-equivariance ⇒ same σ minimizer (σ_raw ≈ \
-             σ_y·σ_z) up to the optimizer perturbation",
-            served_z[1][0],
-            served_r_sigma[0]
+            !violations.contains(&CrpsViolation::MeanDrift),
+            "this construction is deliberately INSIDE the aggregate μ band \
+             (trimmed mean measured -0.435 against bound {CRPS_MEAN_AGG_TOL}) \
+             so it isolates the per-seed ceiling arm — if MeanDrift now \
+             fires too, re-derive the scatter split/magnitude so the \
+             aggregate stays green and this test keeps demonstrating the \
+             gap the per-seed arm closes. violations: {violations:?}"
+        );
+    }
+
+    /// PERMANENT REGRESSION (esc-035, second audit round, block 1): the
+    /// σ-axis analogue of the μ scatter above — a genuine ×2/÷2
+    /// per-trajectory scale error applied directly to the REAL served
+    /// z-sigma scalar (via [`measure_crps_seed_raw`], no back-solving a raw
+    /// value out of a ratio) on 2 of the 13 seeds (seeds 5 and 11, chosen
+    /// away from the already-trimmed outlier seeds 2/8), landing so the
+    /// trimmed-mean ratio stays INSIDE `[CRPS_SIGMA_RATIO_LO,
+    /// CRPS_SIGMA_RATIO_HI]` (measured: 1.128). Must be rejected via
+    /// `PerSeedCeilingViolated` alone — `SigmaRatioOutOfRange` must NOT
+    /// fire, or this construction no longer isolates the per-seed arm.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mutant_scale_balanced_sigma_scatter_rejected_by_per_seed_ceiling() {
+        let device = Device::Cpu;
+        let n = WIDE.len();
+        let targets = Tensor::from_vec(WIDE.to_vec(), (n,), &device).unwrap();
+        let feats = features(n, &device);
+        let sigma_y = wide_sigma_y();
+
+        let mut stats = Vec::with_capacity(CRPS_SEEDS.len());
+        for seed in CRPS_SEEDS {
+            let (served_z_mean, served_z_sigma0, served_r_mean, served_r_sigma0) =
+                measure_crps_seed_raw(seed, &targets, &feats, &device).await;
+            // MUTANT: a genuine ×2 (seed 5) / ÷2 (seed 11) scale error on
+            // the REAL served z-sigma scalar; every other seed untouched.
+            let scattered_z_sigma0 = match seed {
+                5 => served_z_sigma0 * 2.0,
+                11 => served_z_sigma0 / 2.0,
+                _ => served_z_sigma0,
+            };
+            stats.push(crps_seed_stats_from_served(
+                seed,
+                n,
+                &served_z_mean,
+                scattered_z_sigma0,
+                &served_r_mean,
+                served_r_sigma0,
+            ));
+        }
+        let violations = check_crps_aggregate(&stats, sigma_y);
+        assert!(
+            violations.contains(&CrpsViolation::PerSeedCeilingViolated),
+            "a ×2/÷2 per-trajectory σ scale error on 2 seeds must be \
+             REJECTED via PerSeedCeilingViolated — the trimmed-mean ratio \
+             arm alone cannot see a minimal-footprint scatter constructed to \
+             stay inside its band. violations: {violations:?}"
+        );
+        assert!(
+            !violations.contains(&CrpsViolation::SigmaRatioOutOfRange),
+            "this construction is deliberately INSIDE the aggregate σ-ratio \
+             band (trimmed mean measured ~1.13 against \
+             [{CRPS_SIGMA_RATIO_LO}, {CRPS_SIGMA_RATIO_HI}]) so it isolates \
+             the per-seed ceiling arm — if SigmaRatioOutOfRange now fires \
+             too, re-derive the scatter. violations: {violations:?}"
         );
     }
 

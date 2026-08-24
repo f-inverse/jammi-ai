@@ -24,7 +24,7 @@
 
 use candle_core::{DType, Device, Tensor, Var};
 use half::bf16;
-use jammi_kernels::ops::{apply2, Axpy};
+use jammi_kernels::ops::{apply2, Axpy, FullyMaskedPolicy, SoftmaxLastDimFused};
 
 fn axpy_fwd(alpha: f64, x: &Tensor, y: &Tensor) -> candle_core::Result<Tensor> {
     // Through `ops::apply2` (requires `T: KernelOp`), not
@@ -384,4 +384,405 @@ fn bwd_is_never_called_when_neither_input_leads_to_a_variable() {
     let grads = out.backward().unwrap();
     assert!(grads.get(&x).is_none());
     assert!(grads.get(&y).is_none());
+}
+
+// ---------------------------------------------------------------------
+// SoftmaxLastDimFused: `scale` semantics (P1 of the fused-kernels
+// program — folding `1/sqrt(head_dim)` into this op, replacing the
+// `Op::Affine` node `ModernBertAttention::forward`'s training arm used to
+// retain — see `jammi_kernels::ops::softmax`'s module doc's "scale
+// semantics" section).
+//
+// The comparison target throughout is `fused-with-scale` vs. `(candle's
+// own Tensor::affine) THEN fused-no-scale` — the EXACT two-op composition
+// `scale` replaces, using THIS crate's own reduction kernel on both
+// sides, not `candle_nn::ops::softmax` (whose own fold order need not
+// match this op's — that comparison already lives in `ops/softmax.rs`'s
+// module tests, at its own stated tolerance, and is orthogonal to
+// whether `scale` itself is applied correctly).
+// ---------------------------------------------------------------------
+
+fn softmax_scaled(
+    scores: &Tensor,
+    mask: &Tensor,
+    policy: FullyMaskedPolicy,
+    scale: f32,
+) -> candle_core::Result<Tensor> {
+    apply2(
+        scores,
+        mask,
+        SoftmaxLastDimFused::new(policy).with_scale(scale),
+    )
+}
+
+fn softmax_unscaled(
+    scores: &Tensor,
+    mask: &Tensor,
+    policy: FullyMaskedPolicy,
+) -> candle_core::Result<Tensor> {
+    apply2(scores, mask, SoftmaxLastDimFused::new(policy))
+}
+
+fn scale_scores_fixture(n: usize) -> Vec<f32> {
+    (0..n)
+        .map(|i| (i as f32 * 0.013 - 5.0).sin() * 2.0)
+        .collect()
+}
+
+/// Mask shape `[batch, 1, seq, seq]` — the local-attention COMBINED-mask
+/// shape `ModernBertAttention::forward`'s training arm actually builds
+/// (padding mask + sliding-window band, pre-summed before reaching this
+/// op). Values are drawn from the REAL ModernBERT mask alphabet: `0.0`
+/// (unmasked), `-10_000.0` (one `MASKED_LOGIT`), `-20_000.0` (two
+/// `MASKED_LOGIT`s summed — the local-layer padding+band combination).
+/// The LAST query row of every batch element is forced FULLY masked
+/// (alternating `-10_000.0`/`-20_000.0`, never `0.0`), exercising
+/// `FullyMaskedPolicy::Zeros`'s short-circuit at production width.
+fn scale_mask_fixture(batch: usize, seq: usize) -> Vec<f32> {
+    let mut mask = vec![0.0f32; batch * seq * seq];
+    for b in 0..batch {
+        for q in 0..seq {
+            for k in 0..seq {
+                let idx = (b * seq + q) * seq + k;
+                mask[idx] = if q == seq - 1 {
+                    if k % 2 == 0 {
+                        -10_000.0
+                    } else {
+                        -20_000.0
+                    }
+                } else {
+                    match (q * 7 + k * 3 + b) % 5 {
+                        0 => -20_000.0,
+                        1 => -10_000.0,
+                        _ => 0.0,
+                    }
+                };
+            }
+        }
+    }
+    mask
+}
+
+/// `1.0 / sqrt(64)` — ModernBERT-large's REAL `head_dim` (`num_heads =
+/// 16`, `hidden = 1024`). `0.125` is an exact power of two: representable
+/// EXACTLY (no rounding at all) in F32, F64, AND BF16 alike, so this
+/// fixture's bit-exactness is a MATHEMATICAL guarantee, not a lucky
+/// empirical coincidence — the `f64 -> f32 -> bf16` double-rounding path
+/// this op's `scale` field takes and the `f64 -> bf16` single-rounding
+/// path `Tensor::affine`'s own `T::from_f64` takes both round the SAME
+/// exact value to the SAME bits.
+const PRODUCTION_SCALE: f64 = 0.125;
+
+fn f32_scale_bit_exact_vs_affine_then_unscaled(batch: usize, heads: usize, seq: usize) {
+    let device = Device::Cpu;
+    let sv = scale_scores_fixture(batch * heads * seq * seq);
+    let mv = scale_mask_fixture(batch, seq);
+    let scores = Tensor::from_slice(&sv, (batch, heads, seq, seq), &device).unwrap();
+    let mask = Tensor::from_slice(&mv, (batch, 1, seq, seq), &device).unwrap();
+
+    let fused_scaled = softmax_scaled(
+        &scores,
+        &mask,
+        FullyMaskedPolicy::Zeros,
+        PRODUCTION_SCALE as f32,
+    )
+    .unwrap();
+    // The two-op composition `scale` replaces: candle's own
+    // `Tensor::affine` (the SAME op `ModernBertAttention::forward` used
+    // to call via `scores / sqrt(head_dim)`) THEN this op with `scale =
+    // 1.0` (its default).
+    let affined = scores.affine(PRODUCTION_SCALE, 0.0).unwrap();
+    let affine_then_unscaled = softmax_unscaled(&affined, &mask, FullyMaskedPolicy::Zeros).unwrap();
+
+    let a: Vec<f32> = fused_scaled.flatten_all().unwrap().to_vec1().unwrap();
+    let b: Vec<f32> = affine_then_unscaled
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert!(
+        a.iter().any(|v| v.is_finite() && *v != 0.0),
+        "fixture must be non-degenerate"
+    );
+    assert_eq!(
+        a, b,
+        "F32: fused-with-scale must be BIT-EXACT vs affine-then-fused-no-scale \
+         (both run the SAME reduction kernel, differing only in when the scale \
+         multiply happens — two ordinary f32 ops, same order, on both sides)"
+    );
+}
+
+#[test]
+fn softmax_scale_f32_bit_exact_vs_affine_then_unscaled_production_width_2_16_128_128() {
+    f32_scale_bit_exact_vs_affine_then_unscaled(2, 16, 128);
+}
+
+#[test]
+fn softmax_scale_f32_bit_exact_vs_affine_then_unscaled_production_width_1_16_512_512() {
+    f32_scale_bit_exact_vs_affine_then_unscaled(1, 16, 512);
+}
+
+fn bf16_scale_max_ulp_diff_vs_affine_then_unscaled(batch: usize, heads: usize, seq: usize) -> i32 {
+    let device = Device::Cpu;
+    let sv = scale_scores_fixture(batch * heads * seq * seq);
+    let mv = scale_mask_fixture(batch, seq);
+    let sb: Vec<bf16> = sv.iter().map(|&v| bf16::from_f32(v)).collect();
+    let mb: Vec<bf16> = mv.iter().map(|&v| bf16::from_f32(v)).collect();
+    let scores = Tensor::from_slice(&sb, (batch, heads, seq, seq), &device).unwrap();
+    let mask = Tensor::from_slice(&mb, (batch, 1, seq, seq), &device).unwrap();
+
+    let fused_scaled = softmax_scaled(
+        &scores,
+        &mask,
+        FullyMaskedPolicy::Zeros,
+        PRODUCTION_SCALE as f32,
+    )
+    .unwrap();
+    // `scores.affine(scale, 0.0)` on a BF16 tensor calls candle's OWN
+    // `Affine<bf16>` branch (`mul = bf16::from_f64(scale)`, direct
+    // f64->bf16, single rounding) -- the TRUE eager rounding path this
+    // op's own `scale` field must reproduce (see the module doc).
+    let affined = scores.affine(PRODUCTION_SCALE, 0.0).unwrap();
+    let affine_then_unscaled = softmax_unscaled(&affined, &mask, FullyMaskedPolicy::Zeros).unwrap();
+
+    let a: Vec<bf16> = fused_scaled.flatten_all().unwrap().to_vec1().unwrap();
+    let b: Vec<bf16> = affine_then_unscaled
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert!(
+        a.iter().any(|v| v.to_f32().abs() > 1e-3),
+        "fixture must be non-degenerate"
+    );
+    a.iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| (x.to_bits() as i32 - y.to_bits() as i32).abs())
+        .max()
+        .unwrap_or(0)
+}
+
+/// MEASURED, not assumed: at ModernBERT-large's REAL `head_dim = 64`
+/// (`scale = 0.125`, an exact power of two — see [`PRODUCTION_SCALE`]'s
+/// doc), the `f64 -> f32 -> bf16` double-rounding path this op's `scale`
+/// field takes and the `f64 -> bf16` single-rounding path `Tensor::affine`
+/// takes land on the IDENTICAL bit pattern (no rounding occurs on either
+/// path for an exact power of two), so this op is BIT-EXACT vs. the
+/// two-op composition at BF16 too, at production width. This is a
+/// MATHEMATICAL guarantee for THIS scale value, not a general BF16
+/// claim — see `ops::softmax`'s module doc for the double-rounding class
+/// this op discloses for a non-exact scale (not exercised by ModernBERT's
+/// actual configuration, so not asserted here).
+#[test]
+fn softmax_scale_bf16_bit_exact_vs_affine_then_unscaled_production_width_2_16_128_128() {
+    let max_ulp = bf16_scale_max_ulp_diff_vs_affine_then_unscaled(2, 16, 128);
+    eprintln!("MEASURED max bf16 ULP diff (scale rounding vs affine), seq=128: {max_ulp}");
+    assert_eq!(
+        max_ulp, 0,
+        "expected BIT-EXACT at head_dim=64 (scale=0.125 is an exact power of two, \
+         representable exactly in F32/F64/BF16 alike) -- measured max ULP diff {max_ulp}"
+    );
+}
+
+#[test]
+fn softmax_scale_bf16_bit_exact_vs_affine_then_unscaled_production_width_1_16_512_512() {
+    let max_ulp = bf16_scale_max_ulp_diff_vs_affine_then_unscaled(1, 16, 512);
+    eprintln!("MEASURED max bf16 ULP diff (scale rounding vs affine), seq=512: {max_ulp}");
+    assert_eq!(
+        max_ulp, 0,
+        "expected BIT-EXACT at head_dim=64 (scale=0.125 is an exact power of two, \
+         representable exactly in F32/F64/BF16 alike) -- measured max ULP diff {max_ulp}"
+    );
+}
+
+/// A NON-power-of-two scale, disclosed honestly rather than swept under
+/// the ModernBERT-only fixture above: `head_dim = 48` (`scale =
+/// 1/sqrt(48)`, irrational, genuinely rounded at every precision) DOES
+/// exercise the `f64 -> f32 -> bf16` double-rounding vs. `f64 -> bf16`
+/// single-rounding gap the module doc names. MEASURED, not assumed — this
+/// op is NOT claimed bit-exact here; the point is proving the divergence
+/// class is real (or absent) for at least one non-degenerate case, not
+/// just the lucky power-of-two production value.
+#[test]
+fn softmax_scale_bf16_non_power_of_two_head_dim_is_measured_not_assumed() {
+    let device = Device::Cpu;
+    let scale = 1.0 / (48.0f64).sqrt();
+    let seq = 8;
+    let sv = scale_scores_fixture(2 * seq * seq);
+    let mv = scale_mask_fixture(1, seq);
+    let sb: Vec<bf16> = sv.iter().map(|&v| bf16::from_f32(v)).collect();
+    let mb: Vec<bf16> = mv.iter().map(|&v| bf16::from_f32(v)).collect();
+    let scores = Tensor::from_slice(&sb, (1, 2, seq, seq), &device).unwrap();
+    let mask = Tensor::from_slice(&mb, (1, 1, seq, seq), &device).unwrap();
+
+    let fused_scaled =
+        softmax_scaled(&scores, &mask, FullyMaskedPolicy::Zeros, scale as f32).unwrap();
+    let affined = scores.affine(scale, 0.0).unwrap();
+    let affine_then_unscaled = softmax_unscaled(&affined, &mask, FullyMaskedPolicy::Zeros).unwrap();
+
+    let a: Vec<bf16> = fused_scaled.flatten_all().unwrap().to_vec1().unwrap();
+    let b: Vec<bf16> = affine_then_unscaled
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let max_ulp = a
+        .iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| (x.to_bits() as i32 - y.to_bits() as i32).abs())
+        .max()
+        .unwrap_or(0);
+    eprintln!("MEASURED max bf16 ULP diff (scale=1/sqrt(48), non-power-of-two): {max_ulp}");
+    // A generous bound: this is a MEASURED double-rounding class, not a
+    // correctness bug -- 1 ULP is the theoretical worst case for a single
+    // extra rounding step, so anything larger would indicate a REAL bug,
+    // not just the disclosed double-rounding gap.
+    assert!(
+        max_ulp <= 1,
+        "double-rounding gap larger than the theoretical 1-ULP worst case: {max_ulp}"
+    );
+}
+
+/// `d(y)/d(scores) = d(y)/d(pre_softmax) * scale` (chain rule through
+/// `pre_softmax = scale * scores + mask`) — verifies `bwd` actually
+/// multiplies by `scale`, with a NON-UNIFORM `dy` seed (a uniform seed
+/// would make this identically zero for every softmax row, since
+/// `sum(y) == 1` — see `jammi-encoders`' `modernbert.rs` test of the same
+/// shape for why that would be a VACUOUS check, family F).
+#[test]
+fn softmax_scale_bwd_multiplies_raw_dscores_by_scale() {
+    let device = Device::Cpu;
+    let scale = PRODUCTION_SCALE;
+    let s0: [f32; 6] = [0.3, -1.2, 2.0, 0.1, -0.5, 1.7];
+    let m0: [f32; 6] = [0.0, -10_000.0, 0.0, -20_000.0, 0.0, 0.0];
+    let dy0: [f32; 6] = [0.5, -1.0, 2.0, 0.25, -0.75, 1.5];
+
+    let scores = Var::from_tensor(&Tensor::from_slice(&s0, (2, 3), &device).unwrap()).unwrap();
+    let mask = Tensor::from_slice(&m0, (1, 3), &device).unwrap();
+    let dy = Tensor::from_slice(&dy0, (2, 3), &device).unwrap();
+
+    let out = softmax_scaled(&scores, &mask, FullyMaskedPolicy::Propagate, scale as f32).unwrap();
+    let loss = (&out * &dy).unwrap().sum_all().unwrap();
+    let dscores: Vec<f32> = loss
+        .backward()
+        .unwrap()
+        .get(&scores)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    // `d(y)/d(pre_softmax)`, from an INDEPENDENT graph rooted at the
+    // already-scaled scores (matching the F32 arm's OWN `scores[i] *
+    // scale` step exactly, so the two sides differ ONLY by the `* scale`
+    // this test is checking for -- not by an unrelated rounding path).
+    let s0_scaled: Vec<f32> = s0.iter().map(|&v| v * scale as f32).collect();
+    let scaled_scores =
+        Var::from_tensor(&Tensor::from_slice(&s0_scaled, (2, 3), &device).unwrap()).unwrap();
+    let out_pre = softmax_unscaled(&scaled_scores, &mask, FullyMaskedPolicy::Propagate).unwrap();
+    let loss_pre = (&out_pre * &dy).unwrap().sum_all().unwrap();
+    let d_pre_softmax: Vec<f32> = loss_pre
+        .backward()
+        .unwrap()
+        .get(&scaled_scores)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    assert!(
+        dscores.iter().any(|v| v.abs() > 1e-4),
+        "gradient must be measured-nonzero"
+    );
+    for (i, (d, dp)) in dscores.iter().zip(d_pre_softmax.iter()).enumerate() {
+        let expected = scale as f32 * dp;
+        assert!(
+            (d - expected).abs() < 1e-5,
+            "dscores[{i}] = {d} vs scale * d_pre_softmax = {expected} (scale={scale})"
+        );
+    }
+}
+
+/// Companion: `dmask` (when `mask` IS a `Var`) uses the RAW, UNSCALED
+/// `d(y)/d(pre_softmax)` -- `d(pre_softmax)/d(mask) == 1`, never `scale`.
+/// `y` itself depends on `scale` (`pre_softmax = scale*scores + mask`
+/// evaluates at a DIFFERENT point for a different `scale`), so `dmask`
+/// evaluated at a DIFFERENT `scale` is NOT expected to match numerically
+/// (a naive "same `scores`, different `scale`, dmask must match" claim
+/// would be mathematically wrong) -- the CORRECT claim, verified here, is
+/// that `dmask` from the scaled run matches `dmask` from an INDEPENDENT
+/// unscaled reference run evaluated AT THE SAME `pre_softmax` point
+/// (pre-multiplied scores, `scale = 1.0`) -- i.e. `dmask` is exactly
+/// `mask_grad(d_pre_softmax)`, never further multiplied by `scale`, using
+/// the SAME "compare against an independent graph at the identical
+/// `pre_softmax` point" construction `softmax_scale_bwd_multiplies_raw_dscores_by_scale`
+/// uses for `dscores`.
+#[test]
+fn softmax_scale_dmask_uses_unscaled_gradient_not_scaled() {
+    let device = Device::Cpu;
+    let sv: [f32; 8] = [1.0, -1.0, 2.0, 0.5, -0.3, 1.7, 0.2, -2.1];
+    let mv: [f32; 4] = [0.1, -0.2, 0.3, -0.1];
+    let dyv: [f32; 8] = [0.4, -0.9, 1.1, 0.6, -1.3, 0.2, -0.5, 0.8];
+    let scale = PRODUCTION_SCALE;
+    let scores = Tensor::from_slice(&sv, (2, 4), &device).unwrap();
+    // A NON-UNIFORM `dy` seed -- `Tensor::backward()`'s implicit all-ones
+    // seed would make `dscores` (and therefore `dmask`) IDENTICALLY zero
+    // regardless of `scale` (`sum(y) == 1` for every softmax row), which
+    // would make this comparison VACUOUS (family F): both sides would be
+    // trivially-equal zeros, proving nothing about `mask_grad`'s actual
+    // scale-independence.
+    let dy = Tensor::from_slice(&dyv, (2, 4), &device).unwrap();
+
+    let mask_scaled = Var::from_tensor(&Tensor::from_slice(&mv, (1, 4), &device).unwrap()).unwrap();
+    let out_scaled = softmax_scaled(
+        &scores,
+        &mask_scaled,
+        FullyMaskedPolicy::Propagate,
+        scale as f32,
+    )
+    .unwrap();
+    let loss_scaled = (&out_scaled * &dy).unwrap().sum_all().unwrap();
+    let dmask_scaled: Vec<f32> = loss_scaled
+        .backward()
+        .unwrap()
+        .get(&mask_scaled)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    // The reference: an INDEPENDENT graph rooted at the ALREADY-scaled
+    // scores (matching `pre_softmax = scale*scores` exactly), run through
+    // the UNSCALED op (`scale = 1.0`) -- computes the IDENTICAL
+    // `pre_softmax` (hence the IDENTICAL `y`) the scaled run above
+    // internally reaches, so `dmask` from this reference is directly
+    // comparable, unlike a reference at the RAW (un-multiplied) `scores`
+    // (a different `pre_softmax` point entirely).
+    let sv_scaled: Vec<f32> = sv.iter().map(|&v| v * scale as f32).collect();
+    let scores_pre = Tensor::from_slice(&sv_scaled, (2, 4), &device).unwrap();
+    let mask_ref = Var::from_tensor(&Tensor::from_slice(&mv, (1, 4), &device).unwrap()).unwrap();
+    let out_ref = softmax_unscaled(&scores_pre, &mask_ref, FullyMaskedPolicy::Propagate).unwrap();
+    let loss_ref = (&out_ref * &dy).unwrap().sum_all().unwrap();
+    let dmask_ref: Vec<f32> = loss_ref
+        .backward()
+        .unwrap()
+        .get(&mask_ref)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    assert!(
+        dmask_scaled.iter().any(|v| v.abs() > 1e-4),
+        "gradient must be measured-nonzero"
+    );
+    assert_eq!(
+        dmask_scaled, dmask_ref,
+        "dmask must be IDENTICAL to the unscaled reference evaluated at the SAME \
+         pre_softmax point -- dmask never gets the scale factor"
+    );
 }

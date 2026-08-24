@@ -71,12 +71,17 @@ fn lead_dims3(lead: &[usize]) -> [u32; 3] {
     out
 }
 
+/// `scale` — `SoftmaxLastDimFused::scale`, threaded straight through as an
+/// extra kernel scalar argument (see `../ops/softmax.rs`'s "scale
+/// semantics" module-doc section and `../cuda/softmax.cu`'s matching
+/// forward kernels for the exact per-dtype rounding this applies).
 pub(crate) fn cuda_fwd(
     s1: &CudaStorage,
     l1: &Layout,
     s2: &CudaStorage,
     l2: &Layout,
     fully_masked: FullyMaskedPolicy,
+    scale: f32,
 ) -> Result<(CudaStorage, Shape)> {
     const OP: &str = "softmax_last_dim_fused";
     let (rows, last) = softmax_dims(l1, l2, OP)?;
@@ -134,6 +139,7 @@ pub(crate) fn cuda_fwd(
             builder.arg(&m_lead[1]);
             builder.arg(&m_lead[2]);
             builder.arg(&policy_u32);
+            builder.arg(&scale);
             unsafe { builder.launch(cfg) }.map_err(|e| Error::Cuda(Box::new(e)))?;
             Ok((CudaStorage::wrap_cuda_slice(out, device), shape))
         }
@@ -155,6 +161,7 @@ pub(crate) fn cuda_fwd(
             builder.arg(&m_lead[1]);
             builder.arg(&m_lead[2]);
             builder.arg(&policy_u32);
+            builder.arg(&scale);
             unsafe { builder.launch(cfg) }.map_err(|e| Error::Cuda(Box::new(e)))?;
             Ok((CudaStorage::wrap_cuda_slice(out, device), shape))
         }

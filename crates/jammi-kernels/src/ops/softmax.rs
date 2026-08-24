@@ -84,6 +84,54 @@
 //! equivalent — exactly the same "different-but-equivalent, own tolerance
 //! oracle" shape this crate's other fused ops take on their training arm).
 //!
+//! ## Scale semantics: `scale` is applied to `scores` BEFORE the mask add
+//!
+//! [`SoftmaxLastDimFused::scale`] (construction data, `Copy`, default
+//! `1.0` — every caller/test that predates this field is UNCHANGED,
+//! bit-for-bit, since multiplying by `1.0` is an exact no-op at both F32
+//! and BF16) folds ModernBERT's `1/sqrt(head_dim)` attention scale into
+//! this op, replacing the `scores / sqrt(head_dim)` `Op::Affine` node
+//! `ModernBertAttention::forward`'s training arm used to retain — a full
+//! `[batch, heads, seq, seq]` tape tensor per layer, gone. The op computes
+//! `y = softmax(scale * scores + mask, last dim)`, NOT `softmax(scores +
+//! mask)` with `scale` applied outside: `scale` is folded in strictly
+//! BEFORE the mask add, at every dtype, and it flows through `bwd`
+//! accordingly — see that method's doc.
+//!
+//! ### Reproducing candle's own affine rounding point, exactly
+//!
+//! Before this field existed, the training-arm composition was
+//! `scores.affine(1.0 / sqrt(d), 0.0)` (candle's `Tensor::div(f64)`
+//! bottoms out in `candle-core`'s `cpu_backend::Affine`) followed by the
+//! mask add this op already folds in. `Affine<T>::f` (`cpu_backend/mod.rs`)
+//! computes `mul = T::from_f64(self.0)` ONCE — the scale constant rounded
+//! to the tensor's OWN dtype `T`, never kept at a higher precision — and
+//! then `v * mul + add` in `T`'s own arithmetic for every element. For F32
+//! (`T = f32`), `T::from_f64` is an ordinary `f64 -> f32` cast and `v *
+//! mul` is a single native F32 multiply: no intermediate rounding beyond
+//! the multiply's own. For BF16 (`T = bf16`), `T::from_f64` ROUNDS the
+//! scale constant to BF16 FIRST (`half::bf16`'s `Mul`/`Add` impls each
+//! round-trip through F32 — `Self::from_f32(Self::to_f32(a) *
+//! Self::to_f32(b))` — see `half-2.7.1/src/bfloat.rs`), so eager's BF16
+//! arm computes `round_bf16(s_i * round_bf16(1/sqrt(d)))` for the scale
+//! step, THEN the existing mask add rounds AGAIN (`round_bf16(scaled_i +
+//! mask_i)`, exactly `softmax_row_bf16`'s pre-existing behavior, unchanged
+//! by this field). This op's `scale: f32` construction data is populated
+//! by the SAME `f64 -> f32` cast `T::from_f64`'s F32 branch performs, so
+//! the F32 kernel path (`softmax_row_f32`/`softmax_fwd_f32`) is bit-exact
+//! by construction (`scale * scores[i]` then `+ mask[i]`, two ordinary F32
+//! ops, no FMA contraction — Rust does not auto-fuse mul+add without an
+//! explicit `mul_add` call, and this op never issues one). The BF16 kernel
+//! path additionally rounds that F32 `scale` value to BF16 once per call
+//! (`bf16::from_f32(self.scale)`), matching `T::from_f64`'s own BF16
+//! branch up to the `f64 -> f32 -> bf16` (double-rounding) vs. `f64 ->
+//! bf16` (single-rounding) gap between the two paths — MEASURED, not
+//! assumed, to be exact at every production `head_dim` this crate ships
+//! (see `tests::bf16_scale_matches_affine_then_mask_add_bit_exact_at_production_head_dims`),
+//! then multiplies-and-rounds each element (`round_bf16(s_i *
+//! round_bf16(scale))`) before the existing mask-add rounding runs,
+//! unchanged.
+//!
 //! ## Extreme-value domain (family D)
 //!
 //! This op's forward is `max`-then-`exp`-then-normalize, the SAME shape
@@ -293,10 +341,11 @@
 //! negligible next to the `S^2`-class memory problem this op targets, but
 //! a real, additional cost this doc does not hide.
 //!
-//! ## `bwd`: needs ONLY the output (`res` = `y`) and `grad_res`
+//! ## `bwd`: needs ONLY the output (`res` = `y`) and `grad_res` — PLUS one
+//! scalar multiply by `scale` on the slot that flows back to `scores`
 //!
-//! `dscores = (dy - sum(dy * y, last)) * y` — the standard softmax
-//! backward identity, and it needs no `scores`, no `mask`, and no
+//! `d(y)/d(pre_softmax) = (dy - sum(dy * y, last)) * y` — the standard
+//! softmax backward identity — and it needs no `scores`, no `mask`, and no
 //! recomputation of the forward at all: just `y` (already resident — the
 //! attention V-matmul reads it right after) and `dy`. Implemented as ONE
 //! internal kernel, [`SoftmaxBwdDScores`] (`CustomOp2`: `y`, `dy`), reused
@@ -304,7 +353,29 @@
 //! internal-helper-`KernelOp` shape `LayerNormFused::bwd` and `RopeFused`'s
 //! reused-with-negated-sin trick both use, rather than composing ordinary
 //! `Tensor` ops for this (which would reintroduce exactly the retained-
-//! intermediate cost this whole op exists to remove).
+//! intermediate cost this whole op exists to remove). `SoftmaxBwdDScores`
+//! itself is UNCHANGED by the `scale` field: it always computes `d(y)/d(pre_softmax)`,
+//! never `d(y)/d(scores)` directly.
+//!
+//! `pre_softmax = scale * scores + mask` (see the module doc's "scale
+//! semantics" section), so by the chain rule `d(y)/d(scores)` equals
+//! `scale` TIMES `d(y)/d(pre_softmax)`, while `d(y)/d(mask)` equals
+//! `d(y)/d(pre_softmax)` UNCHANGED — the TWO output slots of `bwd`
+//! therefore diverge once `scale != 1.0`: the slot flowing
+//! back to this op's `scores` ARGUMENT is `SoftmaxBwdDScores`'s raw output
+//! multiplied by `self.scale` (a plain `Tensor::affine(scale, 0.0)` call —
+//! this executes ONCE, eagerly, as part of computing a concrete gradient
+//! `Tensor`; it is not itself tracked on any tape, since `CustomOp2::bwd`'s
+//! own second-order gradient is unsupported here — see
+//! `SoftmaxBwdDScores`'s trailing note), while `dmask` (when `mask.is_variable()`)
+//! is computed from the RAW, UNSCALED `d(y)/d(pre_softmax)` via
+//! [`mask_grad`], exactly as before this field existed. When `scale` EQUALS
+//! the identity value (every pre-existing caller, and the CPU/CUDA-arm-
+//! agnostic default) the multiply is skipped entirely — an exact `f32`
+//! equality check, not an approximate one, since the identity value has a
+//! single, exact bit pattern — so `dscores` is IDENTICAL to
+//! `SoftmaxBwdDScores`'s raw output, bit-for-bit, on every call site that
+//! predates this field.
 //!
 //! `dscores`'s slot is ALWAYS `Some` (the same "may be an intermediate on a
 //! path to a `Var`" rule `LayerNormFused`'s `dx` and `RopeFused`'s `dx`
@@ -325,23 +396,25 @@
 //! ## esc-037 disposition
 //!
 //! esc-037 (`.jammi/escapes.jsonl`) names TWO backward-truncating APIs:
-//! `candle_nn::ops::softmax_last_dim` (`apply_op1_no_bwd`) at
-//! `htsat_audio.rs:632`, `clip_text.rs:150`, and `open_clip_vit.rs:169`;
-//! and `QMatMul` (`candle-core`'s `quantized/mod.rs:1023`), the natural
-//! entry point for quantized fine-tuning. [`SoftmaxLastDimFused`] is a
-//! DIFFERENT operator entirely — a `CustomOp2` with a REAL `bwd` (this
-//! module), dispatched via `super::apply2` (never `apply_op2_no_bwd`) —
-//! and it is wired at a DIFFERENT call site (ModernBERT's attention
-//! softmax, which today uses `candle_nn::ops::softmax`, an ordinary
-//! composed-and-differentiable function, not `softmax_last_dim`). This
-//! commit therefore does not make esc-037's named observable impossible
-//! on ANY of the paths it names — none of the three `softmax_last_dim`
-//! call sites is touched, `QMatMul` is untouched entirely, and none of
-//! them reaches this op. `closes_escape` is NOT claimed; esc-037 remains
-//! fully open for BOTH the `softmax_last_dim` call sites AND `QMatMul`.
-//! (This op's OWN existence is also not a new instance of esc-037's
-//! hazard class: it never uses `apply_op2_no_bwd`, so nothing upstream of
-//! it silently loses its gradient the way esc-037 describes.)
+//! `candle_nn::ops::softmax_last_dim` (`apply_op1_no_bwd`), reached by
+//! every call site through `jammi_encoders::attention::attention_softmax`
+//! (`crates/jammi-encoders/src/open_clip_vision.rs`, `clip_text.rs`, and
+//! `htsat_audio.rs` all route through it); and `QMatMul` (`candle-core`'s
+//! `quantized/mod.rs:1023`), the natural entry point for quantized
+//! fine-tuning. [`SoftmaxLastDimFused`] is a DIFFERENT operator entirely —
+//! a `CustomOp2` with a REAL `bwd` (this module), dispatched via
+//! `super::apply2` (never `apply_op2_no_bwd`) — and it is wired at a
+//! DIFFERENT call site (ModernBERT's attention softmax, which today uses
+//! `candle_nn::ops::softmax`, an ordinary composed-and-differentiable
+//! function, not `softmax_last_dim` or `attention_softmax`). This commit
+//! therefore does not make esc-037's named observable impossible on ANY of
+//! the paths it names — `attention_softmax`'s call sites are untouched,
+//! `QMatMul` is untouched entirely, and neither reaches this op.
+//! `closes_escape` is NOT claimed; esc-037 remains fully open for BOTH
+//! `attention_softmax`'s call sites AND `QMatMul`. (This op's OWN
+//! existence is also not a new instance of esc-037's hazard class: it
+//! never uses `apply_op2_no_bwd`, so nothing upstream of it silently loses
+//! its gradient the way esc-037 describes.)
 //!
 //! ## Domain, continued: dtype / contiguity / rank
 //!
@@ -568,19 +641,51 @@ impl Default for FullyMaskedPolicy {
 
 /// Fused masked softmax-last-dim forward. See the module doc for the full
 /// design.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct SoftmaxLastDimFused {
     /// See [`FullyMaskedPolicy`]'s doc. Construction data, never inspected
-    /// at runtime against any tensor's own state. `derive(Default)` here
-    /// resolves to `FullyMaskedPolicy::default()` (`Propagate`) via that
-    /// type's own `Default` impl — the SAME conservative default, just
-    /// derived rather than hand-written (clippy's `derivable_impls`).
+    /// at runtime against any tensor's own state.
     pub fully_masked: FullyMaskedPolicy,
+    /// Multiplicative scale applied to `scores` BEFORE the mask add — see
+    /// the module doc's "scale semantics" section. Construction data,
+    /// `Copy`, exactly like `fully_masked`. Default `1.0`, an EXACT no-op
+    /// at every dtype this op implements (multiplying by `1.0` changes no
+    /// bit, F32 or BF16), so every caller/test that predates this field is
+    /// unchanged, bit-for-bit.
+    pub scale: f32,
 }
 
 impl SoftmaxLastDimFused {
+    /// `scale` defaults to `1.0` (see the field's own doc) — use
+    /// [`Self::with_scale`] to fold in a multiplicative scale.
     pub fn new(fully_masked: FullyMaskedPolicy) -> Self {
-        Self { fully_masked }
+        Self {
+            fully_masked,
+            scale: 1.0,
+        }
+    }
+
+    /// Sets [`Self::scale`]. Consumes and returns `self` (this op is
+    /// `Copy`, so this is a cheap by-value builder, not a mutation any
+    /// caller could observe aliasing through).
+    pub fn with_scale(mut self, scale: f32) -> Self {
+        self.scale = scale;
+        self
+    }
+}
+
+impl Default for SoftmaxLastDimFused {
+    /// `fully_masked: FullyMaskedPolicy::default()` (`Propagate`), `scale:
+    /// 1.0` — hand-written (not `derive(Default)`) because `f32`'s own
+    /// `Default` is `0.0`, which would make an un-scaled caller's forward
+    /// output all-zero rather than a no-op; `1.0` is the correct identity
+    /// for a MULTIPLICATIVE scale, exactly the reasoning `Self::new`'s own
+    /// doc states.
+    fn default() -> Self {
+        Self {
+            fully_masked: FullyMaskedPolicy::default(),
+            scale: 1.0,
+        }
     }
 }
 
@@ -621,6 +726,7 @@ impl CustomOp2 for SoftmaxLastDimFused {
                     s_lead,
                     m_lead,
                     self.fully_masked,
+                    self.scale,
                 );
                 Ok((CpuStorage::F32(out), l1.shape().clone()))
             }
@@ -633,6 +739,7 @@ impl CustomOp2 for SoftmaxLastDimFused {
                     s_lead,
                     m_lead,
                     self.fully_masked,
+                    self.scale,
                 );
                 Ok((CpuStorage::BF16(out), l1.shape().clone()))
             }
@@ -653,12 +760,16 @@ impl CustomOp2 for SoftmaxLastDimFused {
         s2: &candle_core::CudaStorage,
         l2: &Layout,
     ) -> Result<(candle_core::CudaStorage, Shape)> {
-        crate::cuda::softmax::cuda_fwd(s1, l1, s2, l2, self.fully_masked)
+        crate::cuda::softmax::cuda_fwd(s1, l1, s2, l2, self.fully_masked, self.scale)
     }
 
-    /// See the module doc's "`bwd`: needs ONLY the output" section.
-    /// `dscores`'s slot is ALWAYS `Some`; `mask`'s slot follows
-    /// `mask.is_variable()`.
+    /// See the module doc's "`bwd`: needs ONLY the output ... PLUS one
+    /// scalar multiply by `scale`" section. `dscores`'s slot is ALWAYS
+    /// `Some`; `mask`'s slot follows `mask.is_variable()`. `dscores` is
+    /// `SoftmaxBwdDScores`'s raw `d(y)/d(pre_softmax)` output scaled by
+    /// `self.scale` (chain rule through `pre_softmax = scale * scores +
+    /// mask`); `dmask` uses the RAW, unscaled value (`d(pre_softmax)/d(mask)
+    /// == 1`, not `scale`).
     fn bwd(
         &self,
         _scores: &Tensor,
@@ -666,11 +777,16 @@ impl CustomOp2 for SoftmaxLastDimFused {
         res: &Tensor,
         grad_res: &Tensor,
     ) -> Result<(Option<Tensor>, Option<Tensor>)> {
-        let dscores = super::apply2(res, grad_res, SoftmaxBwdDScores)?;
+        let d_pre_softmax = super::apply2(res, grad_res, SoftmaxBwdDScores)?;
         let dmask = if mask.is_variable() {
-            Some(mask_grad(&dscores, mask.shape())?)
+            Some(mask_grad(&d_pre_softmax, mask.shape())?)
         } else {
             None
+        };
+        let dscores = if self.scale == 1.0 {
+            d_pre_softmax
+        } else {
+            d_pre_softmax.affine(self.scale as f64, 0.0)?
         };
         Ok((Some(dscores), dmask))
     }
@@ -793,7 +909,13 @@ fn row_is_fully_masked(mask: &[f32]) -> bool {
     mask.iter().cloned().fold(f32::NEG_INFINITY, f32::max) < 0.0
 }
 
-fn softmax_row_f32(scores: &[f32], mask: &[f32], out: &mut [f32], policy: FullyMaskedPolicy) {
+fn softmax_row_f32(
+    scores: &[f32],
+    mask: &[f32],
+    out: &mut [f32],
+    policy: FullyMaskedPolicy,
+    scale: f32,
+) {
     let last = scores.len();
     // Safe softmax (module doc): under `FullyMaskedPolicy::Zeros` ONLY, a
     // fully-masked row outputs ZEROS, matching PyTorch SDPA's
@@ -806,16 +928,23 @@ fn softmax_row_f32(scores: &[f32], mask: &[f32], out: &mut [f32], policy: FullyM
         out.fill(0.0);
         return;
     }
+    // `scale` then the mask add, as TWO separate F32 operations (never a
+    // fused multiply-add — see the module doc's "scale semantics" section
+    // for why this matters bit-for-bit): matches candle's own
+    // `scores.affine(scale, 0.0)` followed by `broadcast_add(mask)`
+    // exactly, for `T = f32`.
     let mut max = f32::NEG_INFINITY;
     for i in 0..last {
-        let v = scores[i] + mask[i];
+        let scaled = scores[i] * scale;
+        let v = scaled + mask[i];
         if v > max {
             max = v;
         }
     }
     let mut sum = 0f32;
     for i in 0..last {
-        let v = scores[i] + mask[i];
+        let scaled = scores[i] * scale;
+        let v = scaled + mask[i];
         let e = (v - max).exp();
         out[i] = e;
         sum += e;
@@ -825,6 +954,12 @@ fn softmax_row_f32(scores: &[f32], mask: &[f32], out: &mut [f32], policy: FullyM
     }
 }
 
+// `scale` (the fold-in-scale change) pushed this over clippy's default
+// 7-argument ceiling; every argument here is already load-bearing (no
+// grab-bag "options" struct would clarify anything a positional list of
+// row/shape/policy/scale scalars does not already say directly) — the
+// same call this crate's other internal `*_fwd_*` helpers make.
+#[allow(clippy::too_many_arguments)]
 fn softmax_fwd_f32(
     scores: &[f32],
     mask: &[f32],
@@ -833,6 +968,7 @@ fn softmax_fwd_f32(
     s_lead: &[usize],
     m_lead: &[usize],
     policy: FullyMaskedPolicy,
+    scale: f32,
 ) -> Vec<f32> {
     let mut out = vec![0f32; rows * last];
     for r in 0..rows {
@@ -840,7 +976,7 @@ fn softmax_fwd_f32(
         let sr = &scores[r * last..(r + 1) * last];
         let mr = &mask[mrow * last..(mrow + 1) * last];
         let outr = &mut out[r * last..(r + 1) * last];
-        softmax_row_f32(sr, mr, outr, policy);
+        softmax_row_f32(sr, mr, outr, policy, scale);
     }
     out
 }
@@ -849,7 +985,13 @@ fn softmax_fwd_f32(
 /// stay in f32 via a temporary `Vec<f32>` — cheap on CPU, no shared-memory
 /// constraint the way the CUDA arm has), rounding to bf16 exactly once on
 /// the way out.
-fn softmax_row_bf16(scores: &[bf16], mask: &[bf16], out: &mut [bf16], policy: FullyMaskedPolicy) {
+fn softmax_row_bf16(
+    scores: &[bf16],
+    mask: &[bf16],
+    out: &mut [bf16],
+    policy: FullyMaskedPolicy,
+    scale_bf: bf16,
+) {
     let last = scores.len();
     // Safe softmax first (module doc), under `FullyMaskedPolicy::Zeros`
     // ONLY: a fully-masked row outputs ZEROS regardless of dtype, so the
@@ -868,24 +1010,33 @@ fn softmax_row_bf16(scores: &[bf16], mask: &[bf16], out: &mut [bf16], policy: Fu
             return;
         }
     }
-    // The ONE deliberate deviation from this crate's "F32-accumulate-
-    // throughout" convention (see the module doc's "bf16 mask-add
-    // rounding" section), for every row that reaches this point (i.e. is
-    // NOT fully masked, but may still have SOME masked positions):
-    // `scores[i] + mask[i]` is rounded to BF16 IMMEDIATELY, matching
-    // `candle_nn::ops::softmax`'s native BF16 `broadcast_add` (which
-    // rounds at that exact step) — NOT computed and kept in F32. At the
-    // real `MASKED_LOGIT` magnitude (`-10_000.0`) this rounding
-    // ANNIHILATES any real `scores[i]` (BF16's ULP there, ≈64, far exceeds
-    // a real score's own magnitude) at a MASKED position, matching
-    // eager's own BF16-native rounding there rather than a strictly-more-
-    // precise (but wrong-relative-to-eager) result. Every step AFTER this
-    // one (max/exp/sum/normalize) still accumulates in F32, matching the
-    // crate's usual convention.
+    // TWO deliberate deviations from this crate's "F32-accumulate-
+    // throughout" convention, matching candle's own `Affine`-then-
+    // `broadcast_add` composition rounding point for point (see the module
+    // doc's "scale semantics" -> "reproducing candle's own affine rounding
+    // point" section), for every row that reaches this point (i.e. is NOT
+    // fully masked, but may still have SOME masked positions):
+    // `scores[i] * scale_bf` is rounded to BF16 IMMEDIATELY (matching
+    // `half::bf16`'s own `Mul` impl: round-trip through F32, round once),
+    // THEN `scaled[i] + mask[i]` is ALSO rounded to BF16 immediately,
+    // matching `candle_nn::ops::softmax`'s native BF16 `broadcast_add`
+    // (which rounds at that exact step) — neither step is computed and
+    // kept in F32. At the real `MASKED_LOGIT` magnitude (`-10_000.0`) the
+    // mask-add rounding ANNIHILATES any real (scaled) score (BF16's ULP
+    // there, ≈64, far exceeds a real score's own magnitude) at a MASKED
+    // position, matching eager's own BF16-native rounding there rather
+    // than a strictly-more-precise (but wrong-relative-to-eager) result.
+    // Every step AFTER the mask add (max/exp/sum/normalize) still
+    // accumulates in F32, matching the crate's usual convention. When
+    // `scale_bf == bf16::ONE` (the `scale == 1.0` default), `scores[i] *
+    // scale_bf` round-trips to `scores[i]` exactly (an already-BF16 value
+    // times BF16 `1.0`, rounded, is a no-op), so this is bit-identical to
+    // the pre-existing behavior for every caller that predates `scale`.
     let mut v = vec![0f32; last];
     let mut max = f32::NEG_INFINITY;
     for i in 0..last {
-        let vi = bf16::from_f32(scores[i].to_f32() + mask[i].to_f32()).to_f32();
+        let scaled = bf16::from_f32(scores[i].to_f32() * scale_bf.to_f32());
+        let vi = bf16::from_f32(scaled.to_f32() + mask[i].to_f32()).to_f32();
         v[i] = vi;
         if vi > max {
             max = vi;
@@ -903,6 +1054,8 @@ fn softmax_row_bf16(scores: &[bf16], mask: &[bf16], out: &mut [bf16], policy: Fu
     }
 }
 
+// See `softmax_fwd_f32`'s identical note.
+#[allow(clippy::too_many_arguments)]
 fn softmax_fwd_bf16(
     scores: &[bf16],
     mask: &[bf16],
@@ -911,14 +1064,21 @@ fn softmax_fwd_bf16(
     s_lead: &[usize],
     m_lead: &[usize],
     policy: FullyMaskedPolicy,
+    scale: f32,
 ) -> Vec<bf16> {
+    // Rounded ONCE per call, matching `Affine<bf16>::f`'s own `mul =
+    // T::from_f64(self.0)` — a single conversion of the scale CONSTANT,
+    // not a per-element re-conversion (see the module doc's "reproducing
+    // candle's own affine rounding point" section for the f64->f32->bf16
+    // vs. f64->bf16 double-rounding disclosure).
+    let scale_bf = bf16::from_f32(scale);
     let mut out = vec![bf16::ZERO; rows * last];
     for r in 0..rows {
         let mrow = mask_row_offset(r, s_lead, m_lead);
         let sr = &scores[r * last..(r + 1) * last];
         let mr = &mask[mrow * last..(mrow + 1) * last];
         let outr = &mut out[r * last..(r + 1) * last];
-        softmax_row_bf16(sr, mr, outr, policy);
+        softmax_row_bf16(sr, mr, outr, policy, scale_bf);
     }
     out
 }

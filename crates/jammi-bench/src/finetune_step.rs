@@ -233,6 +233,20 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     let vram_baseline = device_memory_used_bytes().unwrap_or(0);
     let sampler = VramSampler::start();
 
+    // Positive-proof channel for the fused-vs-eager LayerNorm A/B: a
+    // delta over the process-wide dispatch counters taken immediately
+    // around the step loop, so this run's dispatch count is isolated
+    // from anything an earlier tier in the same process invocation did.
+    let ln_dispatch_before = jammi_encoders::ln_dispatch_snapshot();
+    // Same mechanism, for the C3 fused RoPE kernel.
+    let rope_dispatch_before = jammi_encoders::rope_dispatch_snapshot();
+    // Same mechanism, for the C4 fused masked-softmax kernel.
+    let softmax_dispatch_before = jammi_encoders::softmax_dispatch_snapshot();
+    // Same mechanism, for the C5 fused GeGLU kernel.
+    let geglu_dispatch_before = jammi_encoders::geglu_dispatch_snapshot();
+    // Same mechanism, for the C6 fused LoRA-site epilogue.
+    let lora_epilogue_dispatch_before = jammi_lora::lora_epilogue_dispatch_snapshot();
+
     let mut times = Vec::with_capacity(params.steps);
     for step in 0..(params.warmup + params.steps) {
         let t0 = Instant::now();
@@ -270,6 +284,12 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
         }
     }
 
+    let ln_dispatch_after = jammi_encoders::ln_dispatch_snapshot();
+    let rope_dispatch_after = jammi_encoders::rope_dispatch_snapshot();
+    let softmax_dispatch_after = jammi_encoders::softmax_dispatch_snapshot();
+    let geglu_dispatch_after = jammi_encoders::geglu_dispatch_snapshot();
+    let lora_epilogue_dispatch_after = jammi_lora::lora_epilogue_dispatch_snapshot();
+
     times.sort_by(f64::total_cmp);
     let p50 = times[times.len() / 2];
     let mean = times.iter().sum::<f64>() / times.len() as f64;
@@ -286,6 +306,36 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
         batched_forward: params.batched_forward,
         trainable_tensors: trainable.len(),
         steps_measured: times.len(),
+        ln_fused_dispatches: ln_dispatch_after
+            .fused
+            .saturating_sub(ln_dispatch_before.fused),
+        ln_eager_dispatches: ln_dispatch_after
+            .eager
+            .saturating_sub(ln_dispatch_before.eager),
+        rope_fused_dispatches: rope_dispatch_after
+            .fused
+            .saturating_sub(rope_dispatch_before.fused),
+        rope_eager_dispatches: rope_dispatch_after
+            .eager
+            .saturating_sub(rope_dispatch_before.eager),
+        softmax_fused_dispatches: softmax_dispatch_after
+            .fused
+            .saturating_sub(softmax_dispatch_before.fused),
+        softmax_eager_dispatches: softmax_dispatch_after
+            .eager
+            .saturating_sub(softmax_dispatch_before.eager),
+        geglu_fused_dispatches: geglu_dispatch_after
+            .fused
+            .saturating_sub(geglu_dispatch_before.fused),
+        geglu_eager_dispatches: geglu_dispatch_after
+            .eager
+            .saturating_sub(geglu_dispatch_before.eager),
+        lora_epilogue_fused_dispatches: lora_epilogue_dispatch_after
+            .fused
+            .saturating_sub(lora_epilogue_dispatch_before.fused),
+        lora_epilogue_eager_dispatches: lora_epilogue_dispatch_after
+            .eager
+            .saturating_sub(lora_epilogue_dispatch_before.eager),
         s_per_step_p50: Measurement::measured(p50, "s"),
         s_per_step_mean: Measurement::measured(mean, "s"),
         steps_per_s: Measurement::measured(1.0 / p50, "steps/s"),

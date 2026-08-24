@@ -20,4 +20,11 @@ pub enum EncoderError {
     /// Filesystem operation failed while loading weights or adapter files.
     #[error("I/O: {0}")]
     Io(#[from] std::io::Error),
+    /// A fused-kernel admission decision failed in `Strict` mode (see
+    /// `jammi_kernels::admission::AdmissionMode::Strict` and
+    /// `crate::layer_norm`'s call site): an explicit fused-path request
+    /// was refused instead of silently falling back to the eager
+    /// composition.
+    #[error("Kernel: {0}")]
+    Kernel(#[from] jammi_kernels::error::KernelError),
 }

@@ -52,6 +52,50 @@ pub use precision::compute_precision_to_dtype;
 
 use candle_core::Tensor;
 
+/// A snapshot of the bias-free training-mode LayerNorm's fused/eager
+/// dispatch counts (see `crate::layer_norm`'s module doc for the
+/// admission mechanism this counts). `layer_norm` is a crate-private
+/// module — its dispatch-counter static is otherwise unnameable from
+/// outside this crate — so this is the read API a durable job record or
+/// a bench report uses to state which kernel path actually ran during a
+/// measured run (`jammi-bench`'s `finetune_step` tier reads this around
+/// its step loop).
+pub fn ln_dispatch_snapshot() -> jammi_kernels::admission::DispatchSnapshot {
+    layer_norm::LN_DISPATCH_COUNTERS.snapshot()
+}
+
+/// A snapshot of ModernBERT's training-mode fused RoPE (rotate-half)
+/// dispatch counts (see `crate::modernbert`'s `RotaryEmbedding` doc for
+/// the admission mechanism this counts, and its `apply_training` for the
+/// call site). `modernbert::ROPE_DISPATCH_COUNTERS` is `pub(crate)` —
+/// this is the read API a durable job record or a bench report uses,
+/// mirroring [`ln_dispatch_snapshot`] exactly.
+pub fn rope_dispatch_snapshot() -> jammi_kernels::admission::DispatchSnapshot {
+    modernbert::ROPE_DISPATCH_COUNTERS.snapshot()
+}
+
+/// A snapshot of ModernBERT's training-mode fused masked-softmax
+/// (`jammi_kernels::ops::SoftmaxLastDimFused`) dispatch counts (see
+/// `crate::modernbert`'s `ModernBertAttention::softmax_apply_training` for
+/// the call site this counts). `modernbert::SOFTMAX_DISPATCH_COUNTERS` is
+/// `pub(crate)` — this is the read API a durable job record or a bench
+/// report uses, mirroring [`ln_dispatch_snapshot`] / [`rope_dispatch_snapshot`]
+/// exactly.
+pub fn softmax_dispatch_snapshot() -> jammi_kernels::admission::DispatchSnapshot {
+    modernbert::SOFTMAX_DISPATCH_COUNTERS.snapshot()
+}
+
+/// A snapshot of ModernBERT's training-mode fused GeGLU
+/// (`jammi_kernels::ops::GegluFused`) dispatch counts (see
+/// `crate::modernbert`'s `geglu_apply_training` for the call site this
+/// counts). `modernbert::GEGLU_DISPATCH_COUNTERS` is `pub(crate)` — this
+/// is the read API a durable job record or a bench report uses, mirroring
+/// [`ln_dispatch_snapshot`] / [`rope_dispatch_snapshot`] /
+/// [`softmax_dispatch_snapshot`] exactly.
+pub fn geglu_dispatch_snapshot() -> jammi_kernels::admission::DispatchSnapshot {
+    modernbert::GEGLU_DISPATCH_COUNTERS.snapshot()
+}
+
 /// Contiguity-safe matmul — the single matmul primitive every encoder uses.
 ///
 /// candle's **CUDA** matmul rejects two operand layouts its **CPU** matmul

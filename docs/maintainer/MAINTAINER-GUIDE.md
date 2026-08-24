@@ -69,8 +69,9 @@ jammi-bench -> jammi-ai, jammi-db, jammi-encoders, jammi-lora, jammi-numerics
 jammi-cli -> jammi-admin, jammi-db
 jammi-client -> jammi-admin, jammi-db, jammi-wire
 jammi-db -> jammi-numerics, jammi-test-utils
-jammi-encoders -> jammi-lora, jammi-numerics
-jammi-lora -> jammi-numerics
+jammi-encoders -> jammi-kernels, jammi-lora, jammi-numerics
+jammi-kernels
+jammi-lora -> jammi-kernels, jammi-numerics
 jammi-numerics
 jammi-python -> jammi-ai, jammi-db
 jammi-server -> jammi-admin, jammi-ai, jammi-client, jammi-db, jammi-numerics, jammi-test-utils, jammi-wire
@@ -87,7 +88,9 @@ jammi-numerics   (pure math; no internal deps)
       ▲
 jammi-db ────────────────► jammi-numerics
    ▲   ▲
-jammi-lora   (NO internal deps; candle OPTIONAL, default-features=false at root)
+jammi-kernels   (candle-core/candle-nn only; NO internal jammi-* deps — leaf; CUDA feature-gated)
+      ▲
+jammi-lora ──► jammi-numerics, jammi-kernels(opt, features=["candle"])   [candle OPTIONAL, default-features=false at root]
    ▲
 jammi-wire ──► jammi-db, jammi-numerics, jammi-lora(no candle)   [CANDLE-FREE substrate]
    ▲   ▲
@@ -104,13 +107,18 @@ jammi-server ──► jammi-wire, jammi-ai, jammi-db, jammi-numerics  [serves t
    │
 jammi-python ──► jammi-ai, jammi-db, jammi-lora                  [LOCAL-ONLY PyO3 cdylib]
 
-jammi-encoders ──► candle, jammi-lora(features=["candle"])
+jammi-encoders ──► jammi-numerics, jammi-kernels, jammi-lora(features=["candle"]), candle
 ```
 
 The publish topological order (the canonical DAG statement,
 `.github/workflows/crates.yml`, the publish-order list) is:
-`jammi-numerics → jammi-db → jammi-lora → jammi-encoders → jammi-wire →
-jammi-admin → jammi-client → jammi-ai → jammi-server → jammi-cli`.
+`jammi-numerics → jammi-db → jammi-kernels → jammi-lora → jammi-encoders →
+jammi-wire → jammi-admin → jammi-client → jammi-ai → jammi-server → jammi-cli`.
+`jammi-kernels` sits before `jammi-lora`, not after: `jammi-lora`'s default
+feature set (`default = ["candle"]`, `crates/jammi-lora/Cargo.toml`) enables
+the optional `jammi-kernels` dependency, so `cargo publish -p jammi-lora`
+(no explicit feature flags in the publish step) needs `jammi-kernels` already
+resolvable on crates.io.
 
 Workspace membership (`Cargo.toml`, `[workspace] members`): 13 members;
 `default-members` excludes `jammi-python` (PyO3 cdylib, built by maturin) and
@@ -1826,6 +1834,210 @@ staleness→recompute loop — that is the platform's, not the engine's
   `TrainingWorker` struct), `crates/jammi-ai/src/fine_tune/training_job.rs` (the
   `TrainingJob` struct): the lifecycle owner and the poll/wait handle.
 
+### 2.6a Fused training kernels (`jammi-kernels`)
+
+**The model.** `crates/jammi-kernels` is a leaf crate: `candle-core`/`candle-nn`
+(+ `half`, `libm`, `thiserror`, `tracing`) only, no `jammi-*` dependency, names no
+consumer (family L). Every fused op implements `KernelOp`
+(`crates/jammi-kernels/src/ops/mod.rs`, the `KernelOp` trait) — a SEALED
+supertrait (`Copy + Send + Sync + 'static` + a crate-private `Sealed` marker, so
+no downstream crate can implement it for its own type) enforced structurally at
+the only sanctioned call points, `apply1`/`apply2`/`apply3`
+(`crates/jammi-kernels/src/ops/mod.rs`): a new op that forgets the `Sealed` impl
+fails to *compile* the moment anything tries to run it, rather than shipping
+unconstrained. `Copy` proves no owned interior-mutable/heap field (no per-instance
+cache-in-`fwd`-for-`bwd` state) — it does not, and cannot, prove the absence of a
+module-level `static` (a `&'static` reference is itself `Copy`); that class of
+statefulness is a review concern, stated in the module doc rather than overclaimed.
+
+- **CPU is real, one call path, the gradcheck substrate.** Every op's CPU
+  `fwd`/`bwd` is the actual numeric implementation (not a stub gated out until
+  CUDA lands), so `Tensor::backward()` on a CPU tensor drives the exact kernel
+  code CUDA will also run — each op's `tests/*_oracles.rs` gradchecks `bwd`
+  directly against central finite differences (`gradcheck_*` fns) over this one
+  path, rather than needing a separate numeric-gradient shim.
+- **CUDA is feature-gated and early-returns.** The crate's `cuda` feature forwards
+  to `candle-core/cuda`/`candle-nn/cuda` and pulls in `bindgen_cuda` as an
+  optional build-dependency (`crates/jammi-kernels/Cargo.toml`). `build.rs`
+  checks `CARGO_FEATURE_CUDA` and returns immediately when it is unset — the
+  default (laptop/CI) build never shells out to `nvcc` or requires a CUDA
+  toolkit. When the feature is on, `build.rs` pins `compute_cap(80)` (`sm_80`,
+  Ampere) both via `CUDA_COMPUTE_CAP` (avoiding an `nvidia-smi` probe at
+  construction time — the Docker-build-stage-with-no-driver shape) and via an
+  explicit override, and compiles `src/cuda/*.cu` to one PTX blob per kernel;
+  the driver JIT-forwards that single `sm_80` PTX to 8.6/8.9/9.0 devices at
+  first load (no `-use_fast_math`; `--fmad` contraction is accepted within each
+  oracle's stated tolerance, not pinned away globally).
+- **The five ops** (`crates/jammi-kernels/src/ops/`): `LayerNormFused`
+  (`layer_norm.rs`) — bias-free LayerNorm fwd+bwd, reduced over the last dim;
+  `bwd` recomputes mean/invvar from `x` (candle 0.11 has no save-for-backward
+  channel) via an internal `CustomOp3` helper, `dgamma` skippable via
+  construction data. `RopeFused` (`rope.rs`) — rotate-half RoPE fwd+bwd as one
+  `CustomOp3`, replacing the ~12-op eager chain; `bwd` reuses the same forward
+  kernel with `sin` negated (the flash-attn `conjugate=True` precedent).
+  `SoftmaxLastDimFused` (`softmax.rs`) — masked softmax-last-dim with the
+  additive mask ADD folded in, collapsing the `[broadcast_add, max, sub, exp,
+  sum, div]` chain into one `Op::CustomOp2` graph node (the single largest
+  retained-tape tensor in ModernBERT's attention). `GegluFused` (`geglu.rs`) —
+  gated-GELU as one `CustomOp1` over the whole packed `Wi` output (the split
+  happens inside the kernel), replacing `[narrow, narrow, gelu_erf, mul]`.
+  `ScaledCastAdd` (`scaled_cast_add.rs`) — the LoRA-site epilogue `base +
+  cast(lora * scaling)`, replacing `[mul, cast, add]`; a generic Tensor-API
+  primitive, not LoRA-specific by name (family L), whose one real caller today
+  is `jammi-lora`'s `LoraLinear::forward`.
+
+**Admission (`crates/jammi-kernels/src/admission.rs`): validate-and-fall-back
+with typed refusals.** No op decides fusion *policy* in this module — a call
+site's own domain check (dtype/shape/contiguity/device capability) reports its
+outcome through the shared mechanism:
+
+- **`device_is_supported(d)`** — `true` for CPU always, CUDA only when *this
+  build* compiled the `cuda` feature (`cfg!(feature = "cuda")`, a compile-time
+  fold); Metal is refused unconditionally (no `metal_fwd` exists, and candle's
+  default `metal_fwd` errors rather than falling back — refusing before the
+  tensor reaches `apply2`/`apply3` is what keeps the fallback clean). Also
+  gates on `MIN_CUDA_COMPUTE_CAP = (8, 0)` via `ComputeCapability::meets_minimum`
+  / `probe_cuda_compute_capability` (bf16 tensor cores need Ampere+).
+- **Per-op dispatch counters, two mechanisms, additive.** C2–C5 (LayerNorm,
+  RoPE, softmax, GeGLU) each hand-declared their own `pub(crate) static
+  X_DISPATCH_COUNTERS: DispatchCounters` — left as-is, live and tested. Every
+  op after that (starting with the LoRA epilogue) calls
+  `counters_for("its_op_name")` (`admission.rs`), a process-wide, op-keyed
+  `HashMap<&'static str, &'static DispatchCounters>` that creates-and-leaks a
+  fresh `DispatchCounters` the first time an op name is seen and hands back the
+  same `&'static` on every later call — no new hand-declared static needed.
+  `DispatchCounters::snapshot()` returns a `DispatchSnapshot { fused, eager }`
+  (`Relaxed` atomics).
+- **`warn_fallback_once(op, predicate)`** — a `tracing::warn!` emitted at most
+  once per process per `(op, predicate)` pair, so a fallback-heavy run does not
+  spam.
+- **`admit(mode, op, predicate_name, predicate_holds, counters)`** is the single
+  entry point: it always records the outcome, then on a failed predicate either
+  logs-once-and-falls-back (`AdmissionMode::Fallback`, the default) or returns
+  `KernelError::StrictModeFallback` (`AdmissionMode::Strict`) — never a silent
+  wrong number.
+- **`JAMMI_KERNELS_STRICT`** — `admission_mode()` reads this env var once per
+  process (`OnceLock`); its presence (any value) selects `Strict`. ONE env var
+  governs every fused op in every crate that calls `admit`, rather than one per
+  op/crate — moved here from `jammi-encoders::layer_norm` (which still
+  re-exports `device_is_supported`/`admission_mode` under its old path for
+  source compatibility) specifically so `jammi-lora`, which has no dependency
+  on `jammi-encoders`, can read the identical switch.
+- **The bench report's `*_dispatches` fields are the positive proof.**
+  `crates/jammi-bench/src/report.rs` carries `{ln,rope,softmax,geglu,
+  lora_epilogue}_{fused,eager}_dispatches` — each pair is a snapshot diff
+  (before/after the run) of that op's `DispatchCounters`. A step-time win alone
+  cannot distinguish "the fused kernel ran" from "the fused path silently fell
+  back and eager was just fast"; `fused > 0 && eager == 0` on every row is what
+  "the fused path actually ran" looks like, and is what a `JAMMI_KERNELS_STRICT`
+  bench run is required to show (a fallback there is a hard error, not a quiet
+  eager number wearing a fused label).
+
+**Training-only gate, eval bit-identity.** Every fused op's call site gates on
+`self.training` (or the crate-level `training: bool`), never merely on the
+domain check passing: eval/serving *always* runs the pre-existing eager
+composition, unconditionally — the fused arm is a NEW branch added for
+`(bias.is_none(), training == true)`
+(LayerNorm; `crates/jammi-encoders/src/layer_norm.rs`) or `self.training`
+(RoPE, softmax, GeGLU in
+`crates/jammi-encoders/src/modernbert.rs`; the LoRA epilogue in
+`crates/jammi-lora/src/lora_linear.rs::LoraLinear::forward`), never a
+rewrite of the existing eval path. Each site's own
+`eval_mode_*_is_bit_identical_regardless_of_fused_eligibility`-style test pins
+this: eval's output values are byte-for-byte unchanged by the fused kernel's
+existence. Outside its own domain, the training arm falls back to the *same*
+eager function eval uses, so a domain miss and eval-mode are one code path, not
+two independently-maintained ones.
+
+**The eval doctrine: parity/golden lanes are pod-run, not CI-wired (disclosed
+gap).** `jammi-encoders` carries two feature-gated oracle suites —
+`tests/parity.rs` (`#![cfg(feature = "parity-test")]`) and
+`tests/golden_parity.rs` (`#![cfg(feature = "golden-parity")]`) — and
+`jammi-kernels/tests/cuda_parity.rs` is `required-features = ["cuda"]`
+(`Cargo.toml`), gated on `JAMMI_REQUIRE_CUDA` for hard-fail-vs-skip semantics on
+a device-acquisition failure. **No CI workflow currently passes
+`--features parity-test` or `--features golden-parity`, and no CI runner has a
+GPU to build `--features cuda` against** — these lanes run only from a pod
+session (`ci/scripts/gpu-dev.sh`), by a human or an agent driving one. Wiring a
+parity/golden/cuda lane into a required CI check is a **human gate edit**
+(constitution: an executable gate is human-amend-only, tightening only) — this
+guide states the gap honestly rather than implying a green check exists where
+none runs today.
+
+**Numerics doctrine: reproduce-the-reference rounding decisions, not
+"whatever's convenient."** Each op's bf16 rounding order is a researched,
+disclosed choice against a named upstream reference, not this crate's own
+"accumulate in f32, round once" default:
+
+- **Softmax's bf16 mask-add** (`ops/softmax.rs`) adds the (bf16-typed) mask in
+  bf16 *before* the f32 softmax — matching `candle_nn::ops::softmax`'s own
+  bf16-native `broadcast_add` and, per primary-source research against the
+  upstream HuggingFace ModernBERT reference (`modeling_modernbert.py` +
+  `masking_utils`), that reference's own eager mask path too. The one
+  deliberate divergence is the FULLY-masked row: `FullyMaskedPolicy` (see
+  below) can force all-zero output instead of the `NaN`/uniform-distribution
+  outputs `candle_nn::ops::softmax` produces there — following PyTorch's
+  `_safe_softmax` (`aten/src/ATen/native/transformers/attention.cpp`) and
+  FlashAttention-2's online-softmax convention (`softmax.h`), both of which
+  force zero rather than propagate `NaN`.
+- **GeGLU's round-before-multiply** (`ops/geglu.rs`): on bf16, the activation is
+  rounded to bf16 *before* the multiply (two rounding points), matching HF's
+  `kernels-community` `gelu_and_mul` CUDA kernel (`activation_kernels.cu`,
+  which casts to the storage dtype inside `gelu_kernel` before the separate
+  multiply step) rather than accumulating the whole `gelu(gate) * up` in f32
+  and rounding once. The backward derivation cites ATen's `gelu_backward`
+  (erf-mode `kAlpha`/`kBeta` constants) directly.
+- **The LoRA epilogue's round-before-add** (`ops/scaled_cast_add.rs`): the
+  scaled delta is rounded to `base`'s dtype, then added and rounded once more —
+  matching PEFT's reference (`peft/tuners/lora/layer.py`,
+  `Linear.forward`: the delta casts down to the base result's dtype *before*
+  the add), the opposite rounding-order choice from `Axpy`'s own "f32-
+  accumulate, round once" precedent, made explicitly because here the thing
+  being matched itself rounds twice.
+- **Policy is construction data, never a runtime predicate re-derived from
+  tensor state at call time inside the op.** `FullyMaskedPolicy`
+  (`SoftmaxLastDimFused::fully_masked`), `GeluVariant`
+  (`GegluFused`'s variant field — `Tanh` is a typed refusal via
+  `check_variant`, not an unimplemented path), and `dgamma_needed`
+  (`LayerNormFused`, frozen in at construction from the *call site's*
+  `weight.is_variable()`, re-evaluated per call but never inspected by the op
+  itself) all follow this rule: the op stays exactly as stateless as `Axpy`
+  (see `ops`'s module doc's `Copy` discussion), and a caller whose masking/
+  activation convention does not match a policy's premise simply never
+  requests it, rather than the op silently guessing.
+- **The relative-with-floor bf16 metric.** Every bf16 oracle bounds divergence
+  as `|a - b| <= REL_TOL * max(|a|, |b|) + ABS_FLOOR` (each op's own
+  `bf16_close`/equivalent, e.g. `tests/geglu_oracles.rs`), never bit-exact
+  equality and never a bare absolute or relative bound alone: a pure relative
+  bound cannot describe a divergence where either side rounds to exact bf16
+  zero, and a pure absolute bound is meaningless across bf16's wide dynamic
+  range. Combinations proven bit-exact against eager (documented exception,
+  not the norm) are stated as such per op (e.g. the LoRA epilogue's
+  `(F32,F32)`/`(BF16,F32)` pair — see `ops/scaled_cast_add.rs`'s module doc).
+
+**How to run the A/B.**
+`ci/scripts/gpu-dev.sh run <session> bash ci/scripts/perf/finetune_ab.sh`
+(or directly over ssh once the checkout is on the pod) —
+never a CI job (no GPU on the CI image, and the script switches git refs in
+place). It sweeps `{b8 s128, b8 s512, b16 s128} x {dropout 0, dropout 0.05}`
+across jammi-eager / jammi-fused (`JAMMI_KERNELS_STRICT=1`) / torch-eager /
+torch-sdpa legs, emitting one table (s/step, triplets/s, peak VRAM, the fused
+dispatch counters, the ratio vs torch-sdpa, PASS/FAIL against the throughput
+bar) — see the script's own header for the full env-var surface
+(`MODEL_DIR`, `AB_STEPS`/`AB_WARMUP`, `AB_DRY_RUN`, …). **The stale-build
+guard:** every git-ref switch inside the script is followed by `cargo clean -p
+jammi-kernels --release` *then* a full release rebuild
+(`checkout_and_build()`) — `jammi-kernels`' own build artifacts are the one
+thing that can silently persist across a `git checkout` (a stale `.rlib` built
+from the *previous* ref would make an A/B compare a cached binary against
+itself, not eager against fused), so the clean is unconditional, not an
+optimization to skip on a trusted CI runner. **`JAMMI_REQUIRE_CUDA`** governs
+the separate `cuda_parity` suite (`crates/jammi-kernels/tests/cuda_parity.rs`,
+`required-features = ["cuda"]`): unset, a CUDA-acquisition failure on a
+GPU-less build reads as skip; set (the pod session's actual landing proof), it
+panics instead — so a broken device acquisition on the pod cannot silently
+read as passed-by-skipping.
+
 ### 2.7 Model lifecycle (`jammi-ai/model` + `jammi-db/catalog`)
 
 This section covers two distinct lifecycles that share the word "model" but never touch:
@@ -2489,10 +2701,11 @@ guard the TS client — in `clients/typescript/` run `npm run generate` (= `buf 
 `clients/typescript/test/surface.test.ts` with the new RPC and run `npm run typecheck && npm run
 test`.
 
-**Publish-exclusion clarification.** The workspace has 13 members but the release publishes only 10
-crates in topological order (`.github/workflows/crates.yml`: jammi-numerics → jammi-db → jammi-lora →
-jammi-encoders → jammi-wire → jammi-admin → jammi-client → jammi-ai → jammi-server → jammi-cli). The
-3 unpublished members carry `publish = false` in their manifests: **`jammi-python`**
+**Publish-exclusion clarification.** The workspace has 13 members but the release publishes only 11
+crates in topological order (`.github/workflows/crates.yml`: jammi-numerics → jammi-db →
+jammi-kernels → jammi-lora → jammi-encoders → jammi-wire → jammi-admin → jammi-client →
+jammi-ai → jammi-server → jammi-cli). The 3 unpublished members carry `publish = false`
+in their manifests: **`jammi-python`**
 (`crates/jammi-python/Cargo.toml` — PyO3 cdylib shipped as a maturin wheel via
 `.github/workflows/pypi.yml`, not crates.io), **`jammi-test-utils`**
 (`crates/jammi-test-utils/Cargo.toml`), and **`jammi-bench`** (`crates/jammi-bench/Cargo.toml` — a

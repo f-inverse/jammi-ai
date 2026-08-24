@@ -13,6 +13,11 @@ readme = "README.md"
 [dependencies]
 candle-core.workspace = true
 candle-nn.workspace = true
+# The fused-kernel CustomOp scaffolding (bias-free LayerNorm fwd+bwd, this
+# commit's first real consumer). Non-optional: the CPU implementations are
+# always present (one call path, no cfg forest at call sites) — only the
+# `cuda` feature below adds the CUDA build.
+jammi-kernels.workspace = true
 # Needs the candle-backed LoRA primitives (`LoraLinear` / `MaybeLoraLinear` /
 # `LoraError`), so enable jammi-lora's `candle` feature (off at the workspace root).
 jammi-lora = { workspace = true, features = ["candle"] }
@@ -30,11 +35,18 @@ thiserror.workspace = true
 [dev-dependencies]
 candle-transformers.workspace = true
 hf-hub.workspace = true
+half.workspace = true
 serde_json.workspace = true
 tempfile = "3"
 
 [features]
 default = []
+# Forwards to candle's own `cuda` feature chain via jammi-kernels — THE
+# feature this crate did not have before this commit (jammi-ai's own `cuda`
+# feature bypassed jammi-encoders entirely; this is the first real link in
+# that chain). Adds jammi-kernels' CUDA build (nvcc/PTX) — never required
+# by a plain `cargo build` (see jammi-kernels/build.rs's early-return gate).
+cuda = ["jammi-kernels/cuda"]
 # Enables tests/parity.rs which depends on candle-transformers as a numerical
 # oracle for the Bert frozen forward pass.
 parity-test = []

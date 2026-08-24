@@ -69,6 +69,13 @@ fn frozen_jammi_bert_matches_candle_transformers() {
         .unwrap()
         .to_scalar()
         .unwrap();
+    // Printed unconditionally (not just on failure) so the measured value
+    // is visible in a normal `cargo test -- --nocapture` run and can be
+    // quoted verbatim in a commit message, not just asserted against a
+    // bound — this is the BERT/DistilBERT biased-LayerNorm call sites'
+    // own numeric anchor, which the fused bias-free LayerNorm kernel
+    // must never move (they never reach that code path).
+    println!("frozen_jammi_bert_matches_candle_transformers: measured max |Δ| = {max_diff}");
     assert!(
         max_diff < 1e-5,
         "jammi Bert output differs from candle-transformers by max |Δ| = {max_diff}"

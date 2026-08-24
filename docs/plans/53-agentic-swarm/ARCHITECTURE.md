@@ -186,7 +186,7 @@ coverage is total (an unowned path is a P0). Manifests are exhaustive globs.
 |---|---|
 | `db` | `jammi-db` (all 18 modules; shared `lib.rs`/`Cargo.toml`/`error.rs` = shared-class) |
 | `ai-core` | `jammi-ai` (all 15 modules) |
-| `numerics` | `jammi-numerics`, `jammi-encoders`, `jammi-lora` |
+| `numerics` | `jammi-numerics`, `jammi-encoders`, `jammi-lora`, `jammi-kernels` |
 | `wire-server` | `jammi-wire`, `jammi-admin`, `jammi-client`, `jammi-server` |
 | `cli` | `jammi-cli` |
 | `python` | `jammi-python` |

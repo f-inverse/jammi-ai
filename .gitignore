@@ -83,3 +83,9 @@ docs/IMPLEMENTATION.md
 docs/specs/
 # Artifacts pulled off a GPU pod by `ci/scripts/gpu-dev.sh pull`.
 .gpu-pull/
+
+# The PyTorch/PEFT reference venv `ci/scripts/perf/finetune_ab.sh` provisions
+# on the pod (crates/jammi-bench/reference/README.md's own `.venv-torch-ref`
+# convention) and the A/B sweep's merged report + table it writes.
+.venv-torch-ref/
+.ab-report/

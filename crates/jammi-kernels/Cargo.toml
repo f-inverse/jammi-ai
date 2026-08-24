@@ -1,0 +1,66 @@
+[package]
+name = "jammi-kernels"
+description = "Candle CustomOp scaffolding and a feature-gated CUDA build path for fused training kernels (elementwise/normalization/attention). Leaf crate: no jammi-* dependencies."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["candle", "cuda", "custom-op", "fused-kernel", "autodiff"]
+categories = ["science"]
+readme = "README.md"
+build = "build.rs"
+
+[dependencies]
+candle-core.workspace = true
+candle-nn.workspace = true
+# CustomOp2::cpu_fwd receives raw `CpuStorage`; the BF16 CPU arm reads/writes
+# `half::bf16` directly. Same crate (compatible version range) candle-core
+# itself depends on — not a new numeric type into the graph, just the public
+# name for one already resolved.
+half.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# `f32`/`f64` erf — GeGLU's forward/backward need the same error function
+# candle-core's own `gelu_erf` uses. candle-core's `crate::cpu::erf::erf_f32`
+# (`src/cpu/erf.rs`) is a private wrapper around `libm::erff`/`libm::erf`, not
+# re-exported publicly, so this crate depends on `libm` directly rather than
+# re-deriving a different-precision erf. `libm` was ALREADY resolved in this
+# workspace's Cargo.lock (a transitive dependency of candle-core, itself
+# `[dependencies.libm] version = "0.2.15"`), so this adds no new package to
+# the dependency graph — only a direct (named) one this crate can call.
+# `.workspace = true` (not a per-crate literal version): a single hoisted
+# entry means fused-vs-eager parity can't drift between crates in this
+# workspace (one lock entry moves both this crate's erf and candle-core's),
+# and — since a `^`-range literal can still pick up a later `libm` PATCH
+# release across `cargo update` without any commit here changing — a single
+# workspace-level bump is what would visibly move this crate's own quoted
+# oracle numbers (`geglu_oracles.rs`'s measured tolerances/residuals), not a
+# silent per-crate drift.
+libm.workspace = true
+
+[build-dependencies]
+# Only pulled into the build-dependency graph when the `cuda` feature is
+# active (`optional = true` + `dep:bindgen_cuda` below) — the default
+# (laptop/CI) build never resolves or builds this crate, so it adds no
+# system requirement (nvcc, a CUDA toolkit) to the non-cuda lane.
+bindgen_cuda = { version = "0.1.6", optional = true }
+
+[dev-dependencies]
+approx.workspace = true
+
+[features]
+default = []
+# Forwards to candle's own `cuda` feature chain and pulls in the PTX build
+# step (`build.rs`). THE feature chain jammi-encoders/jammi-ai hang off of in
+# a later commit; not wired to any consumer yet in this one.
+cuda = ["dep:bindgen_cuda", "candle-core/cuda", "candle-nn/cuda"]
+
+# CPU↔CUDA parity — the landing proof the lead's pod session runs.
+# `required-features` means this test target is not even built by a plain
+# `cargo test -p jammi-kernels`; it exists (and can compile) only when the
+# `cuda` feature is active.
+[[test]]
+name = "cuda_parity"
+path = "tests/cuda_parity.rs"
+required-features = ["cuda"]

@@ -1,0 +1,255 @@
+{
+  "_comment": "Same-box A/B reference record for the finetune-step tier (RECORD, never gate; heterogeneous-fleet doctrine). One session, one A100 80GB PCIe (CA-MTL-3), 2026-08-24, jammi tip d361515 vs eager base 8a1b913; torch 2.13.0+cu130 / transformers 5.15.1 / peft 0.20.0, fast-path globals pinned OFF (TF32/cudnn-bench/compile; foreach=False; lora-init peft for throughput rows), sdpa rows ran MEM-EFFICIENT attention (runtime flash probe: no available kernel). jammi peak_vram_delta_bytes is the tier's device-total-minus-baseline; torch's is allocator high-water minus a post-optimizer-warm-step baseline \u2014 the comparable pair per the harness README. VERDICT vs #352's >=0.9x-of-torch bar: NOT MET on this stack (~0.42-0.44x): the 2024-era 0.331 s/step torch baseline #352 recorded does not reproduce on torch 2.13 (~0.118-0.128). vs jammi-eager: 2.17x at d0, 5.7x at d0.05; eager's s512/b16 OOM walls fixed; b8-s512-d0p05 still OOMs on jammi where torch fits.",
+  "provenance": {
+    "gpu": "NVIDIA A100 80GB PCIe",
+    "datacenter": "CA-MTL-3",
+    "date": "2026-08-24",
+    "jammi_ref": "d361515",
+    "eager_base": "8a1b913",
+    "torch": "2.13.0+cu130",
+    "transformers": "5.15.1",
+    "peft": "0.20.0",
+    "steps": 20,
+    "warmup": 5,
+    "seed": 42
+  },
+  "rows": {
+    "b8-s128-d0": {
+      "jammi-eager": {
+        "outcome": "ok",
+        "s_per_step_p50": 0.584995503,
+        "triplets_per_s": 13.675318799843833,
+        "peak_vram_delta_bytes": 40149975040.0,
+        "dispatch_counters": {}
+      },
+      "jammi-fused": {
+        "outcome": "ok",
+        "s_per_step_p50": 0.26938765,
+        "triplets_per_s": 29.696981283291944,
+        "peak_vram_delta_bytes": 23943184384.0,
+        "dispatch_counters": {
+          "ln_fused_dispatches": 1425,
+          "ln_eager_dispatches": 0,
+          "rope_fused_dispatches": 1400,
+          "rope_eager_dispatches": 0,
+          "softmax_fused_dispatches": 700,
+          "softmax_eager_dispatches": 0,
+          "geglu_fused_dispatches": 700,
+          "geglu_eager_dispatches": 0,
+          "lora_epilogue_fused_dispatches": 2800,
+          "lora_epilogue_eager_dispatches": 0
+        }
+      },
+      "torch-eager": {
+        "outcome": "ok",
+        "s_per_step_p50": 0.127771130297333,
+        "triplets_per_s": 62.61195296138807,
+        "peak_vram_delta_bytes": 5350237184.0,
+        "peak_vram_absolute_bytes": 6272021504.0,
+        "attn_implementation": "eager"
+      },
+      "torch-sdpa": {
+        "outcome": "ok",
+        "s_per_step_p50": 0.11844655778259039,
+        "triplets_per_s": 67.54100878713642,
+        "peak_vram_delta_bytes": 4835265536.0,
+        "peak_vram_absolute_bytes": 5757049856.0,
+        "attn_implementation": "sdpa",
+        "sdpa_backend_selected": "efficient (flash runtime-ineligible: no available kernel)"
+      }
+    },
+    "b8-s128-d0p05": {
+      "jammi-eager": {
+        "outcome": "ok",
+        "s_per_step_p50": 1.607990687,
+        "triplets_per_s": 4.975153192538359,
+        "peak_vram_delta_bytes": 58202259456.0,
+        "dispatch_counters": {}
+      },
+      "jammi-fused": {
+        "outcome": "ok",
+        "s_per_step_p50": 0.283026369,
+        "triplets_per_s": 28.2659175124421,
+        "peak_vram_delta_bytes": 19648217088.0,
+        "dispatch_counters": {
+          "ln_fused_dispatches": 1425,
+          "ln_eager_dispatches": 0,
+          "rope_fused_dispatches": 1400,
+          "rope_eager_dispatches": 0,
+          "softmax_fused_dispatches": 700,
+          "softmax_eager_dispatches": 0,
+          "geglu_fused_dispatches": 700,
+          "geglu_eager_dispatches": 0,
+          "lora_epilogue_fused_dispatches": 2800,
+          "lora_epilogue_eager_dispatches": 0
+        }
+      },
+      "torch-eager": {
+        "outcome": "ok",
+        "s_per_step_p50": 0.13290016492828727,
+        "triplets_per_s": 60.1955611139895,
+        "peak_vram_delta_bytes": 5859714048.0,
+        "peak_vram_absolute_bytes": 6781498368.0,
+        "attn_implementation": "eager"
+      },
+      "torch-sdpa": {
+        "outcome": "ok",
+        "s_per_step_p50": 0.12440085411071777,
+        "triplets_per_s": 64.30824014182359,
+        "peak_vram_delta_bytes": 5349133312.0,
+        "peak_vram_absolute_bytes": 6270917632.0,
+        "attn_implementation": "sdpa",
+        "sdpa_backend_selected": "efficient (flash runtime-ineligible: no available kernel)"
+      }
+    },
+    "b8-s512-d0": {
+      "jammi-eager": {
+        "outcome": "oom"
+      },
+      "jammi-fused": {
+        "outcome": "ok",
+        "s_per_step_p50": 1.096180613,
+        "triplets_per_s": 7.298067403423417,
+        "peak_vram_delta_bytes": 77529612288.0,
+        "dispatch_counters": {
+          "ln_fused_dispatches": 1425,
+          "ln_eager_dispatches": 0,
+          "rope_fused_dispatches": 1400,
+          "rope_eager_dispatches": 0,
+          "softmax_fused_dispatches": 700,
+          "softmax_eager_dispatches": 0,
+          "geglu_fused_dispatches": 700,
+          "geglu_eager_dispatches": 0,
+          "lora_epilogue_fused_dispatches": 2800,
+          "lora_epilogue_eager_dispatches": 0
+        }
+      },
+      "torch-eager": {
+        "outcome": "ok",
+        "s_per_step_p50": 0.5745034930296242,
+        "triplets_per_s": 13.925067640254506,
+        "peak_vram_delta_bytes": 34337797120.0,
+        "peak_vram_absolute_bytes": 35259679744.0,
+        "attn_implementation": "eager"
+      },
+      "torch-sdpa": {
+        "outcome": "ok",
+        "s_per_step_p50": 0.44708615401759744,
+        "triplets_per_s": 17.893642932375663,
+        "peak_vram_delta_bytes": 19586250752.0,
+        "peak_vram_absolute_bytes": 20508133376.0,
+        "attn_implementation": "sdpa",
+        "sdpa_backend_selected": "efficient (flash runtime-ineligible: no available kernel)"
+      }
+    },
+    "b8-s512-d0p05": {
+      "jammi-eager": {
+        "outcome": "oom"
+      },
+      "jammi-fused": {
+        "outcome": "oom"
+      },
+      "torch-eager": {
+        "outcome": "ok",
+        "s_per_step_p50": 0.6045017372816801,
+        "triplets_per_s": 13.23403971670016,
+        "peak_vram_delta_bytes": 36227593216.0,
+        "peak_vram_absolute_bytes": 37149606912.0,
+        "attn_implementation": "eager"
+      },
+      "torch-sdpa": {
+        "outcome": "ok",
+        "s_per_step_p50": 0.47887407382950187,
+        "triplets_per_s": 16.705853244517716,
+        "peak_vram_delta_bytes": 21550495744.0,
+        "peak_vram_absolute_bytes": 22472509440.0,
+        "attn_implementation": "sdpa",
+        "sdpa_backend_selected": "efficient (flash runtime-ineligible: no available kernel)"
+      }
+    },
+    "b16-s128-d0": {
+      "jammi-eager": {
+        "outcome": "ok",
+        "s_per_step_p50": 1.133403108,
+        "triplets_per_s": 14.116777946933246,
+        "peak_vram_delta_bytes": 72093794304.0,
+        "dispatch_counters": {}
+      },
+      "jammi-fused": {
+        "outcome": "ok",
+        "s_per_step_p50": 0.516440406,
+        "triplets_per_s": 30.981309390419774,
+        "peak_vram_delta_bytes": 34781265920.0,
+        "dispatch_counters": {
+          "ln_fused_dispatches": 1425,
+          "ln_eager_dispatches": 0,
+          "rope_fused_dispatches": 1400,
+          "rope_eager_dispatches": 0,
+          "softmax_fused_dispatches": 700,
+          "softmax_eager_dispatches": 0,
+          "geglu_fused_dispatches": 700,
+          "geglu_eager_dispatches": 0,
+          "lora_epilogue_fused_dispatches": 2800,
+          "lora_epilogue_eager_dispatches": 0
+        }
+      },
+      "torch-eager": {
+        "outcome": "ok",
+        "s_per_step_p50": 0.24425646616145968,
+        "triplets_per_s": 65.50491887254111,
+        "peak_vram_delta_bytes": 10733519872.0,
+        "peak_vram_absolute_bytes": 11655336960.0,
+        "attn_implementation": "eager"
+      },
+      "torch-sdpa": {
+        "outcome": "ok",
+        "s_per_step_p50": 0.22005114378407598,
+        "triplets_per_s": 72.71036962070924,
+        "peak_vram_delta_bytes": 9704352768.0,
+        "peak_vram_absolute_bytes": 10626169856.0,
+        "attn_implementation": "sdpa",
+        "sdpa_backend_selected": "efficient (flash runtime-ineligible: no available kernel)"
+      }
+    },
+    "b16-s128-d0p05": {
+      "jammi-eager": {
+        "outcome": "oom"
+      },
+      "jammi-fused": {
+        "outcome": "ok",
+        "s_per_step_p50": 0.544754644,
+        "triplets_per_s": 29.37102083704311,
+        "peak_vram_delta_bytes": 40519073792.0,
+        "dispatch_counters": {
+          "ln_fused_dispatches": 1425,
+          "ln_eager_dispatches": 0,
+          "rope_fused_dispatches": 1400,
+          "rope_eager_dispatches": 0,
+          "softmax_fused_dispatches": 700,
+          "softmax_eager_dispatches": 0,
+          "geglu_fused_dispatches": 700,
+          "geglu_eager_dispatches": 0,
+          "lora_epilogue_fused_dispatches": 2800,
+          "lora_epilogue_eager_dispatches": 0
+        }
+      },
+      "torch-eager": {
+        "outcome": "ok",
+        "s_per_step_p50": 0.2555930968374014,
+        "triplets_per_s": 62.599499743839296,
+        "peak_vram_delta_bytes": 11717084160.0,
+        "peak_vram_absolute_bytes": 12639425536.0,
+        "attn_implementation": "eager"
+      },
+      "torch-sdpa": {
+        "outcome": "ok",
+        "s_per_step_p50": 0.23066581785678864,
+        "triplets_per_s": 69.36441709769834,
+        "peak_vram_delta_bytes": 10687654912.0,
+        "peak_vram_absolute_bytes": 11609865216.0,
+        "attn_implementation": "sdpa",
+        "sdpa_backend_selected": "efficient (flash runtime-ineligible: no available kernel)"
+      }
+    }
+  }
+}

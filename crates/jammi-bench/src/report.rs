@@ -1112,6 +1112,79 @@ pub struct FinetuneStepTier {
     pub trainable_tensors: usize,
     /// Measured steps after warmup.
     pub steps_measured: usize,
+    /// How many times `jammi_encoders`' bias-free training-mode LayerNorm
+    /// actually dispatched the fused kernel (`jammi_kernels::ops::LayerNormFused`)
+    /// during this run (warmup + measured steps) — a delta over the
+    /// process-wide dispatch counters taken immediately before and after
+    /// the step loop. This is the positive-proof channel a fused-vs-eager
+    /// A/B needs: the step time alone cannot distinguish "the fused path
+    /// ran and was fast" from "the fused path silently fell back and
+    /// eager was fast anyway" (K2, scope decision 6 of the fused-kernels
+    /// plan).
+    pub ln_fused_dispatches: u64,
+    /// How many times that same call site fell back to the eager
+    /// (`slow()`) composition instead — outside the fused kernel's domain
+    /// (dtype/contiguity/device/hidden), or because the admission
+    /// predicate failed for any other stated reason. Non-zero here on a
+    /// `ModernBert` bias-free training run is itself a signal worth
+    /// reading, not just a complement of `ln_fused_dispatches`.
+    pub ln_eager_dispatches: u64,
+    /// How many times ModernBERT's training-mode fused RoPE (rotate-half)
+    /// kernel (`jammi_kernels::ops::RopeFused`) actually dispatched during
+    /// this run — the same positive-proof channel as `ln_fused_dispatches`,
+    /// for the C3 fused-kernels commit (see `jammi_encoders::modernbert`'s
+    /// `RotaryEmbedding` doc).
+    pub rope_fused_dispatches: u64,
+    /// How many times that same call site fell back to the eager
+    /// (`RotaryEmbedding::apply`) composition instead — outside the fused
+    /// kernel's domain (dtype/contiguity/device/head_dim), or because the
+    /// admission predicate failed for any other stated reason.
+    pub rope_eager_dispatches: u64,
+    /// How many times ModernBERT's training-mode fused masked-softmax
+    /// kernel (`jammi_kernels::ops::SoftmaxLastDimFused`) actually
+    /// dispatched during this run — the same positive-proof channel as
+    /// `ln_fused_dispatches` / `rope_fused_dispatches`, for the C4
+    /// fused-kernels commit (see `jammi_encoders::modernbert`'s
+    /// `softmax_apply_training` doc).
+    pub softmax_fused_dispatches: u64,
+    /// How many times that same call site fell back to the eager
+    /// (`broadcast_add` + `candle_nn::ops::softmax`) composition instead —
+    /// outside the fused kernel's domain (dtype/contiguity/device/rank/
+    /// last-dim), or because the admission predicate failed for any other
+    /// stated reason.
+    pub softmax_eager_dispatches: u64,
+    /// How many times ModernBERT's training-mode fused GeGLU kernel
+    /// (`jammi_kernels::ops::GegluFused`) actually dispatched during this
+    /// run — the same positive-proof channel as `ln_fused_dispatches` /
+    /// `rope_fused_dispatches` / `softmax_fused_dispatches`, for the C5
+    /// fused-kernels commit (see `jammi_encoders::modernbert`'s
+    /// `geglu_apply_training` doc).
+    pub geglu_fused_dispatches: u64,
+    /// How many times that same call site fell back to the eager
+    /// (`narrow`+`narrow`+`gelu_erf`+`mul`) composition instead — outside
+    /// the fused kernel's domain (dtype/contiguity/device/even-last-dim),
+    /// or because the admission predicate failed for any other stated
+    /// reason.
+    pub geglu_eager_dispatches: u64,
+    /// How many times a LoRA-site fused epilogue
+    /// (`jammi_kernels::ops::ScaledCastAdd`, `base_out + cast(lora_out *
+    /// scaling)`) actually dispatched during this run — the same
+    /// positive-proof channel as `ln_fused_dispatches` /
+    /// `rope_fused_dispatches` / `softmax_fused_dispatches` /
+    /// `geglu_fused_dispatches`, for the C6 fused-kernels commit (see
+    /// `jammi_lora::LoraLinear::forward`'s doc). Read via
+    /// `jammi_lora::lora_epilogue_dispatch_snapshot` rather than a
+    /// `jammi_encoders`-side wrapper — the counters live in
+    /// `jammi-kernels`' op-keyed registry, so any crate that knows the op
+    /// name (`"lora_epilogue"`) reads the same table.
+    pub lora_epilogue_fused_dispatches: u64,
+    /// How many times that same call site fell back to the eager `[mul,
+    /// cast, add]` composition instead — outside the fused kernel's
+    /// domain (dtype/contiguity/device/shape), because `training ==
+    /// false` (eval/serving never dispatches the fused kernel at all —
+    /// see the doc above), or because the admission predicate failed for
+    /// any other stated reason.
+    pub lora_epilogue_eager_dispatches: u64,
     pub s_per_step_p50: Measurement,
     pub s_per_step_mean: Measurement,
     pub steps_per_s: Measurement,

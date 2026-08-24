@@ -133,7 +133,42 @@ silently downgraded.
 | `--attn` | *(none in jammi — new)* | `eager`/`sdpa`, the REQUESTED HF attention backend (recorded as `args.attn_requested`). The report's `finetune_step.attn_implementation` is the RESOLVED value read from `model.config._attn_implementation` after loading, falling back to the string `"absent"` (never to `args.attn`) if that attribute somehow does not exist — so a silent HF fallback, or a missing attribute, is visible in the report rather than papered over by echoing back the request. jammi's tier has no such axis (it has its own attention composition); run both, state which is headline. |
 | `--margin` | *(none in jammi — new)* | jammi's tier hardcodes `0.3` in `triplet_loss(&a, &p, &n, 0.3)` and does not expose it on its own CLI. This script defaults to the same `0.3` so the default-vs-default comparison is unaffected; the flag exists so an operator can sweep it without editing the script. |
 | `--lora-init` | *(none in jammi — new; see below)* | `peft` (default) or `jammi`. Controls the LoRA `A` matrix's initial distribution. See "LoRA init" below — this is NOT a cosmetic flag, the two inits differ by a ~1.73x bound factor. |
+| *(none in this script yet)* | `--max-grad-norm` | See "The trainer-shaped step: `--max-grad-norm`" below. This script does not yet call `torch.nn.utils.clip_grad_norm_`, so there is no flag to mirror; a clip-on-vs-clip-off A/B today only exists on jammi's side of the comparison. Adding a matching flag here (and to `torch_finetune_step.py`, which this contract's `files_in_scope` does not cover) is a natural follow-up, not done in this change. |
 | *(n/a)* | `ln_fused_dispatches`/`ln_eager_dispatches`/`rope_fused_dispatches`/`rope_eager_dispatches` | Not reported here — those are jammi's own fused-kernel dispatch counters (`jammi_kernels::ops::LayerNormFused`/`RopeFused`); there is no equivalent concept on the torch side (`--attn` is the closest analogue for attention, and torch's own kernel dispatch inside `sdpa`/`eager` is not independently observable through the public API this script is restricted to). |
+
+## The trainer-shaped step: `--max-grad-norm`
+
+Every `finetune-step` row recorded before this flag existed measured a step
+the product does not run. The shipped trainer's `FineTuneConfig` defaults
+`max_grad_norm` to `1.0`
+(`crates/jammi-wire/src/fine_tune.rs`'s `default_max_grad_norm`), and
+`fine_tune::trainer::TrainingLoop::process_batch_loss` always calls
+`jammi_ai::fine_tune::optimizer::clip_and_step` — `clip_gradients` then the
+optimizer step — at every accumulation boundary. `clip_gradients` computes
+the global L2 norm with one `to_scalar::<f32>()` D2H sync per trainable
+`Var` (224 of them on a ModernBERT-large r16 `Wqkv`/`Wo`/`Wi` LoRA config) —
+a host-sync cost that never appeared in a `finetune-step` row with
+`--max-grad-norm` omitted, because omitting it also skipped the sync.
+
+`--max-grad-norm <f32>` runs that same production `clip_gradients` at the
+same point in the sequence the trainer does — after `backward()`, before the
+optimizer step (`finetune_step.rs`'s step loop, mirroring
+`trainer.rs`'s `process_batch_loss`). Omit the flag (the default) to measure
+the step this tier always measured before — bit-identical to before this
+flag existed, and useful as the isolated no-clip reference point. Supply it
+(`--max-grad-norm 1.0` to match the trainer's own default) to measure the
+step the product actually runs; the delta between an on row and an off row
+on the *same box* is the clip's host-sync cost, measured rather than assumed.
+Report field: `finetune_step.max_grad_norm` — `null` when the flag was
+absent, the numeric value when present (never omitted from the JSON object
+either way, so a report is never ambiguous about which step it measured).
+
+A non-finite or `<= 0.0` `--max-grad-norm` is a typed refusal
+(`InvalidMaxGradNorm`) rather than a silent no-clip run: `clip_gradients`
+itself treats `max_norm <= 0.0` as "disable clipping" (its own documented
+convention, shared with the trainer's config), which is correct for the
+*absent* flag but would be a lie for a row an operator explicitly labeled
+"clip on".
 
 ## LoRA init: NOT a match by default
 

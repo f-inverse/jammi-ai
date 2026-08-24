@@ -67,6 +67,20 @@ fn mann_whitney_does_not_falsely_reject_identical_normals() {
 }
 
 #[test]
+fn mann_whitney_refuses_nan_in_a() {
+    let a = [1.0, f64::NAN, 3.0];
+    let b = sample_normal(0.0, 1.0, 5, 1);
+    assert!(mann_whitney_u(&a, &b).is_err());
+}
+
+#[test]
+fn mann_whitney_refuses_infinite_in_b() {
+    let a = sample_normal(0.0, 1.0, 5, 1);
+    let b = [1.0, f64::INFINITY, 3.0];
+    assert!(mann_whitney_u(&a, &b).is_err());
+}
+
+#[test]
 fn bootstrap_ci_contains_true_mean() {
     let samples: Vec<f64> = (1..=5).map(|x| x as f64).collect();
     let mean = |xs: &[f64]| xs.iter().sum::<f64>() / xs.len() as f64;
@@ -83,6 +97,34 @@ fn bootstrap_ci_contains_true_mean() {
 fn bootstrap_ci_errors_on_empty_samples() {
     let mean = |xs: &[f64]| xs.iter().sum::<f64>() / xs.len() as f64;
     assert!(bootstrap_ci(&[], mean, 100, 0.05, 42).is_err());
+}
+
+#[test]
+fn bootstrap_ci_refuses_nan_sample() {
+    let mean = |xs: &[f64]| xs.iter().sum::<f64>() / xs.len() as f64;
+    let samples = [1.0, f64::NAN, 3.0];
+    assert!(bootstrap_ci(&samples, mean, 100, 0.05, 42).is_err());
+}
+
+#[test]
+fn bootstrap_ci_refuses_infinite_sample() {
+    let mean = |xs: &[f64]| xs.iter().sum::<f64>() / xs.len() as f64;
+    let samples = [1.0, f64::INFINITY, 3.0];
+    assert!(bootstrap_ci(&samples, mean, 100, 0.05, 42).is_err());
+}
+
+#[test]
+fn bootstrap_ci_refuses_non_finite_statistic() {
+    // statistic_fn is caller-supplied and can itself produce a non-finite
+    // value even from finite inputs (e.g. a ratio that divides by zero on a
+    // degenerate resample); the refusal must catch this too, not just the
+    // input edge.
+    let samples: Vec<f64> = vec![1.0, 1.0, 1.0, 1.0];
+    let nan_statistic = |xs: &[f64]| {
+        let denom = xs.iter().map(|x| x - 1.0).sum::<f64>();
+        xs[0] / denom
+    };
+    assert!(bootstrap_ci(&samples, nan_statistic, 100, 0.05, 42).is_err());
 }
 
 #[test]

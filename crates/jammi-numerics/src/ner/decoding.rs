@@ -99,11 +99,57 @@ fn softmax(logits: &[f32]) -> Vec<f32> {
     exps.iter().map(|&e| e / sum).collect()
 }
 
+/// Argmax over per-token class probabilities.
+///
+/// A `NaN` in `values` (e.g. a diverged model producing corrupted logits) is
+/// not provably unreachable here — unlike [`crate::retrieval`]'s
+/// integer-sourced ideal-gain sort — so the comparator cannot rely on
+/// finiteness. `f32::total_cmp` is used instead of `partial_cmp`, which
+/// gives `NaN` the maximal position in its IEEE-754 total order; this
+/// matches `torch.argmax`'s own documented "NaN is propagated" convention
+/// (a `NaN` element compares as the maximum, so `argmax` returns its index)
+/// rather than silently picking an arbitrary non-NaN winner. The returned
+/// confidence is then itself `NaN` — a visibly non-finite value a caller can
+/// detect with `is_finite()`, not a plausible-looking wrong number.
 fn argmax(values: &[f32]) -> (usize, f32) {
     values
         .iter()
         .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .max_by(|(_, a), (_, b)| a.total_cmp(b))
         .map(|(i, &v)| (i, v))
         .unwrap_or((0, 0.0))
+}
+
+#[cfg(test)]
+mod argmax_tests {
+    use super::argmax;
+
+    #[test]
+    fn argmax_picks_finite_max_when_no_nan() {
+        let (idx, val) = argmax(&[0.1, 0.7, 0.2]);
+        assert_eq!(idx, 1);
+        assert_eq!(val, 0.7);
+    }
+
+    #[test]
+    fn argmax_returns_nan_index_when_a_nan_is_present() {
+        // torch.argmax's documented convention: a NaN element is treated as
+        // the maximal value, so its index wins. total_cmp gives the same
+        // outcome here — NaN sorts as the IEEE-754 maximum.
+        let (idx, val) = argmax(&[0.1, f32::NAN, 0.2]);
+        assert_eq!(idx, 1);
+        assert!(val.is_nan());
+    }
+
+    #[test]
+    fn argmax_of_all_nan_is_deterministic() {
+        // `Iterator::max_by` returns the last of several equally-maximal
+        // elements; total_cmp treats every (default, positive) NaN as
+        // bit-identical, so an all-NaN row deterministically resolves to the
+        // last index rather than an arbitrary one.
+        let values = [f32::NAN, f32::NAN, f32::NAN];
+        let (idx, val) = argmax(&values);
+        assert_eq!(idx, values.len() - 1);
+        assert!(val.is_nan());
+    }
 }

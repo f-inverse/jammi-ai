@@ -40,18 +40,42 @@ fn psi_finite_under_smoothing() {
 #[test]
 fn wasserstein_self_is_zero() {
     let v: Vec<f32> = (0..200).map(|i| (i as f32) * 0.01).collect();
-    assert_abs_diff_eq!(wasserstein_1d(&v, &v), 0.0, epsilon = 1e-9);
+    assert_abs_diff_eq!(wasserstein_1d(&v, &v).unwrap(), 0.0, epsilon = 1e-9);
 }
 
 #[test]
 fn wasserstein_is_scale_invariant() {
     let a: Vec<f32> = (0..200).map(|i| (i as f32) * 0.01).collect();
     let b: Vec<f32> = (0..200).map(|i| (i as f32) * 0.01 + 0.5).collect();
-    let unscaled = wasserstein_1d(&a, &b);
+    let unscaled = wasserstein_1d(&a, &b).unwrap();
     let a_scaled: Vec<f32> = a.iter().map(|x| x * 2.0).collect();
     let b_scaled: Vec<f32> = b.iter().map(|x| x * 2.0).collect();
-    let scaled = wasserstein_1d(&a_scaled, &b_scaled);
+    let scaled = wasserstein_1d(&a_scaled, &b_scaled).unwrap();
     assert_abs_diff_eq!(unscaled, scaled, epsilon = 1e-6);
+}
+
+#[test]
+fn wasserstein_refuses_nan_reference() {
+    // scipy.stats.wasserstein_distance propagates a NaN input straight to a
+    // NaN distance; jammi's chosen policy is stricter — refuse at the edge
+    // rather than let the NaN silently corrupt the divergence score.
+    let reference = [1.0_f32, f32::NAN, 3.0];
+    let current: Vec<f32> = (0..10).map(|i| i as f32).collect();
+    assert!(wasserstein_1d(&reference, &current).is_err());
+}
+
+#[test]
+fn wasserstein_refuses_nan_current() {
+    let reference: Vec<f32> = (0..10).map(|i| i as f32).collect();
+    let current = [1.0_f32, 2.0, f32::NAN];
+    assert!(wasserstein_1d(&reference, &current).is_err());
+}
+
+#[test]
+fn wasserstein_refuses_infinite_input() {
+    let reference: Vec<f32> = (0..10).map(|i| i as f32).collect();
+    let current = [1.0_f32, f32::INFINITY, 3.0];
+    assert!(wasserstein_1d(&reference, &current).is_err());
 }
 
 #[test]

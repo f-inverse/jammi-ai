@@ -13,11 +13,24 @@ use crate::stats::types::TestResult;
 /// Mann-Whitney U statistic with tie-corrected variance, returning a
 /// two-tailed p-value via the normal approximation.
 ///
-/// Returns `NumericsError::InvalidInput` if either sample is empty.
+/// Returns `NumericsError::InvalidInput` if either sample is empty or
+/// contains a non-finite (`NaN` or `±inf`) value.
+///
+/// `scipy.stats.mannwhitneyu` defaults to `nan_policy='propagate'`, which
+/// lets a `NaN` ride through to a `NaN` statistic and p-value; jammi refuses
+/// at the edge instead, because the rank-sum computed below sorts the
+/// combined sample and a `NaN` makes `partial_cmp` a non-total comparator —
+/// the resulting rank order (and therefore the U statistic) would be
+/// unspecified rather than the reference's explicit `NaN` propagation.
 pub fn mann_whitney_u(a: &[f64], b: &[f64]) -> Result<TestResult> {
     if a.is_empty() || b.is_empty() {
         return Err(NumericsError::InvalidInput(
             "Mann-Whitney U requires non-empty samples".into(),
+        ));
+    }
+    if a.iter().any(|x| !x.is_finite()) || b.iter().any(|x| !x.is_finite()) {
+        return Err(NumericsError::InvalidInput(
+            "Mann-Whitney U requires finite (non-NaN, non-infinite) samples".into(),
         ));
     }
     let n_a = a.len() as f64;
@@ -29,7 +42,10 @@ pub fn mann_whitney_u(a: &[f64], b: &[f64]) -> Result<TestResult> {
         .map(|&x| (x, 0))
         .chain(b.iter().map(|&x| (x, 1)))
         .collect();
-    combined.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+    // Both samples are validated finite above, so `total_cmp` and
+    // `partial_cmp` agree here; `total_cmp` is used to pin the fold order
+    // rather than lean on that precondition holding forever.
+    combined.sort_by(|x, y| x.0.total_cmp(&y.0));
 
     // Assign average ranks to ties.
     let mut ranks = vec![0.0_f64; combined.len()];

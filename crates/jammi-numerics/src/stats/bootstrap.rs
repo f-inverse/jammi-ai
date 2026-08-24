@@ -61,6 +61,17 @@ where
             "alpha out of range (must be in (0, 1)): {alpha}"
         )));
     }
+    if samples.iter().any(|x| !x.is_finite()) {
+        // A NaN or infinite sample would make the canonicalizing `sort_by`
+        // below a non-total comparator (`f64::partial_cmp` is `None` for
+        // NaN), silently landing in an unspecified order per `[T]::sort_by`'s
+        // docs and corrupting the percentile CI without a visible signal.
+        // Refuse at the edge instead — the same choice `mann_whitney_u` and
+        // `wasserstein_1d` make for the same reason.
+        return Err(NumericsError::InvalidInput(
+            "bootstrap requires finite (non-NaN, non-infinite) samples".into(),
+        ));
+    }
     // Canonicalize the resample basis: the seeded RNG draws positions, so the
     // interval is only a function of the sample multiset once the values those
     // positions hold are in a fixed order.
@@ -76,7 +87,21 @@ where
         }
         stats.push(statistic_fn(&buf));
     }
-    stats.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+    if stats.iter().any(|x| !x.is_finite()) {
+        // `statistic_fn` is caller-supplied and can itself produce a NaN or
+        // infinite value (e.g. a std-dev of a degenerate resample); refuse
+        // here for the same reason the input-edge check above refuses a
+        // non-finite sample — a NaN in the sampling distribution would make
+        // the percentile sort below non-total and the resulting interval a
+        // confident-wrong-number rather than a surfaced failure.
+        return Err(NumericsError::InvalidInput(
+            "bootstrap statistic_fn produced a non-finite (NaN or infinite) value".into(),
+        ));
+    }
+    // Every element is finite at this point, so `total_cmp`'s NaN-aware
+    // total order and `partial_cmp` agree; `total_cmp` is used regardless to
+    // keep the fold order pinned rather than depend on that precondition.
+    stats.sort_by(f64::total_cmp);
     let lower_idx = ((alpha / 2.0) * iterations as f64).floor() as usize;
     let upper_idx = ((1.0 - alpha / 2.0) * iterations as f64).ceil() as usize - 1;
     let lower_idx = lower_idx.min(stats.len() - 1);

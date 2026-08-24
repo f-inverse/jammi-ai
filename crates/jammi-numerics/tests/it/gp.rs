@@ -116,7 +116,7 @@ fn bayes_opt_converges_on_1d_quadratic() {
                 let sigma = var.sqrt();
                 (c, expected_improvement(mu, sigma, f_best))
             })
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .max_by(|a, b| a.1.total_cmp(&b.1))
             .unwrap();
 
         observed_x.push(vec![best_x]);
@@ -126,7 +126,7 @@ fn bayes_opt_converges_on_1d_quadratic() {
     let argmax = observed_x
         .iter()
         .zip(observed_y.iter())
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .max_by(|a, b| a.1.total_cmp(b.1))
         .map(|(x, _)| x[0])
         .unwrap();
 

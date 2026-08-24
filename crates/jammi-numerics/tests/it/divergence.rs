@@ -78,8 +78,11 @@ fn wasserstein_refuses_empty_current() {
 #[test]
 fn wasserstein_refuses_nan_reference() {
     // scipy.stats.wasserstein_distance propagates a NaN input straight to a
-    // NaN distance; jammi's chosen policy is stricter — refuse at the edge
-    // rather than let the NaN silently corrupt the divergence score.
+    // NaN distance; jammi's chosen policy is stricter — refuse at the edge.
+    // The reason is downstream-meaninglessness (a NaN score can never trip a
+    // fixed drift threshold: `NaN > c` is always `false`), not sort-safety —
+    // the implementation sorts with `total_cmp`, a genuine total order over
+    // NaN, so the sort itself would not be corrupted either way.
     let reference = [1.0_f32, f32::NAN, 3.0];
     let current: Vec<f32> = (0..10).map(|i| i as f32).collect();
     assert!(wasserstein_1d(&reference, &current).is_err());
@@ -94,6 +97,12 @@ fn wasserstein_refuses_nan_current() {
 
 #[test]
 fn wasserstein_refuses_infinite_input() {
+    // scipy.stats.wasserstein_distance does NOT refuse this: it has no
+    // finiteness guard, so `wasserstein_distance([1, inf, 3], [1, 2, 3])`
+    // returns `inf`. jammi refuses it anyway, for the same
+    // downstream-meaninglessness reason as the NaN case above (not scipy
+    // parity): an unbounded distance carries no magnitude information past
+    // "already over any finite drift threshold".
     let reference: Vec<f32> = (0..10).map(|i| i as f32).collect();
     let current = [1.0_f32, f32::INFINITY, 3.0];
     assert!(wasserstein_1d(&reference, &current).is_err());

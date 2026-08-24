@@ -114,36 +114,77 @@ fn bootstrap_ci_refuses_nan_sample() {
 }
 
 #[test]
-fn bootstrap_ci_refuses_nan_sample_even_when_a_lucky_seed_would_never_draw_it() {
-    // The edge guard must fire on the *presence* of a NaN sample, not on
-    // whether the seeded resampler happens to draw it. With samples =
-    // [1.0, NaN] (n = 2) and iterations = 1, the resampler draws exactly 2
-    // positions from the sorted basis [1.0, NaN] (index 0 = 1.0, index 1 =
-    // NaN under `total_cmp`'s total order, since positive NaN sorts as the
-    // IEEE-754 maximum); seed 2 draws index 0 both times (empirically
-    // confirmed against `rand::rngs::StdRng` in this crate's `rand`
-    // version), so a resample that never includes the NaN element and a
-    // downstream statistic-finite check alone would silently accept this
-    // input and return a clean-looking Ok(Interval { lower: 1.0, upper: 1.0
-    // }) — this is exactly the corner a downstream-only guard misses.
-    let mean = |xs: &[f64]| xs.iter().sum::<f64>() / xs.len() as f64;
+fn bootstrap_ci_refuses_nan_sample_before_any_resample_is_drawn() {
+    // The edge guard must fire on the *presence* of a NaN sample, before any
+    // resample is drawn — not rely on a downstream, output-edge check that
+    // only catches a NaN that happens to land in a particular resample. A
+    // prior version of this test hard-coded a seed (`StdRng::seed_from_u64(2)`
+    // with `n = 2, iterations = 1`) empirically known to draw only the
+    // non-NaN position, arguing "even this lucky seed is still refused". But
+    // rand's `StdRng` stream is explicitly NOT value-stable across `rand`
+    // versions, so that "known-lucky seed" claim can silently go false on a
+    // dependency bump and the test would still pass (vacuously, for the
+    // wrong reason) or fail for an unrelated reason. This version proves the
+    // same property without depending on any seed's draw sequence: a
+    // `Cell<bool>` records whether `statistic_fn` was EVER invoked. If the
+    // input-edge guard is what causes the error, `statistic_fn` is never
+    // called at all — no resample, lucky or not, gets the chance to be the
+    // one that "missed" the NaN.
+    use std::cell::Cell;
+    let invoked = Cell::new(false);
+    let mean = |xs: &[f64]| {
+        invoked.set(true);
+        xs.iter().sum::<f64>() / xs.len() as f64
+    };
     let samples = [1.0, f64::NAN];
-    let result = bootstrap_ci(&samples, mean, 1, 0.05, 2);
+    let result = bootstrap_ci(&samples, mean, 1_000, 0.05, 2);
     assert!(
         result.is_err(),
-        "a NaN sample must be refused before any draw, independent of whether \
-         this seed's draws would have missed it"
+        "a NaN sample must be refused before any draw"
+    );
+    assert!(
+        !invoked.get(),
+        "statistic_fn must never be invoked once a NaN sample is present — \
+         the input-edge guard must fire before any resample is drawn, so no \
+         seed's draw sequence can be relevant to whether this errors"
     );
 }
 
 #[test]
-fn bootstrap_ci_admits_infinite_sample() {
-    // Unlike NaN, `±inf` has a well-defined position under `total_cmp` and
-    // is a legitimate observed value a heavy-tailed statistic can produce a
-    // finite or infinite result from; it is not refused at the input edge.
+fn bootstrap_ci_refuses_mixed_sign_infinite_samples() {
+    // samples = [+inf, -inf, 1.0]: a resample that draws both infinities
+    // sums to `inf + -inf = NaN` for the mean. Whether any given resample
+    // draws both is a function of `n`, `iterations`, and `seed` — a guard
+    // that only refuses at the OUTPUT edge (on the resulting NaN statistic)
+    // makes `Ok`/`Err` a seed lottery instead of a deterministic property of
+    // the input. Refusing non-finite samples at the INPUT edge removes the
+    // lottery entirely, so every seed must be refused, not just an unlucky
+    // one — swept across many seeds to prove this isn't one seed's accident.
+    let mean = |xs: &[f64]| xs.iter().sum::<f64>() / xs.len() as f64;
+    let samples = [f64::INFINITY, f64::NEG_INFINITY, 1.0];
+    for seed in 0..64u64 {
+        let result = bootstrap_ci(&samples, mean, 3, 0.05, seed);
+        assert!(
+            result.is_err(),
+            "mixed-sign infinite samples must be refused at the input edge \
+             regardless of seed (seed={seed})"
+        );
+    }
+}
+
+#[test]
+fn bootstrap_ci_refuses_infinite_sample() {
+    // A single-sign `±inf` sample is refused too, not just the mixed-sign
+    // case above: the contract is "refuse any non-finite sample", not
+    // "refuse only combinations that happen to produce NaN for `mean`". A
+    // narrower same-sign-only rule would still make the resample statistic's
+    // finiteness depend on `statistic_fn` (e.g. `a - b` on two same-signed
+    // infinities is NaN even though their sum is not) — refusing at the
+    // input edge regardless of sign is the simpler, statistic-fn-agnostic
+    // contract.
     let mean = |xs: &[f64]| xs.iter().sum::<f64>() / xs.len() as f64;
     let samples = [1.0, f64::INFINITY, 3.0];
-    assert!(bootstrap_ci(&samples, mean, 100, 0.05, 42).is_ok());
+    assert!(bootstrap_ci(&samples, mean, 100, 0.05, 42).is_err());
 }
 
 #[test]

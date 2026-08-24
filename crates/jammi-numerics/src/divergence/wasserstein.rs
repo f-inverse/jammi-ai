@@ -25,17 +25,26 @@ use crate::histogram::interpolate::interpolate_to;
 /// with no distributional meaning.
 ///
 /// A non-finite (`NaN` or `±inf`) element in either population is also
-/// refused with [`NumericsError::InvalidInput`] rather than silently sorted: a
-/// `sort_by` comparator built from `partial_cmp` is not a total order once a
-/// `NaN` is present (`NaN.partial_cmp(&x)` is `None` for every `x`), and
-/// collapsing that `None` to `Ordering::Equal` — as the prior implementation
-/// did — makes the sort order "unspecified" per the `[T]::sort_by` docs,
-/// which would silently corrupt the resulting divergence score. This is the
-/// same edge scipy's `wasserstein_distance` does not guard: a `NaN` input
-/// propagates to a `NaN` distance there rather than being rejected. jammi is
-/// stricter than scipy only on this NaN/inf edge, not on the empty-input
-/// edge above — a `NaN` divergence score is a "confident wrong number" for
-/// every downstream drift-monitor threshold that never fires.
+/// refused with [`NumericsError::InvalidInput`]. Sort-safety is NOT the
+/// reason: the sort below uses `total_cmp` (not `partial_cmp`), and
+/// `total_cmp` is a genuine total order even over a `NaN`- or
+/// `±inf`-containing slice (see [`bootstrap_ci`](crate::stats::bootstrap_ci)
+/// for the same point made explicitly) — so a `NaN` or `±inf` element would
+/// sort into a well-defined position and NOT corrupt the sort itself. The
+/// real reason is downstream: this score exists to be compared against a
+/// fixed drift-monitor threshold, and neither a `NaN` nor an unbounded
+/// `±inf` distance is meaningful there. A `NaN` comparison against any
+/// threshold is always `false` (`NaN > c` never fires, silently defeating
+/// the monitor), and an unbounded `±inf` distance carries no *magnitude*
+/// information past "already over any finite threshold" — it cannot
+/// distinguish a mild distributional shift from a catastrophic one, which is
+/// exactly what a drift score exists to do. Both are refused for this one,
+/// consistent, "meaningless to the consumer" reason, not two different ones.
+/// This is stricter than scipy's `wasserstein_distance`, which propagates
+/// both a `NaN` element and a `±inf` element straight through into its
+/// return value (`scipy/stats/_stats_py.py` has no finiteness guard) rather
+/// than refusing either; the empty-input edge above is the only case where
+/// jammi matches scipy's behavior exactly.
 ///
 /// # Errors
 ///

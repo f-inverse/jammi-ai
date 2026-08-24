@@ -41,9 +41,10 @@ use crate::stats::types::Interval;
 ///
 /// Returns [`NumericsError::InvalidInput`] if `samples` is empty, if
 /// `iterations` is `0`, if `alpha` is outside `(0, 1)`, if `samples`
-/// contains a `NaN`, or if `statistic_fn` produces a `NaN` on any resample.
-/// `±inf` is accepted in `samples` and as a `statistic_fn` output — see the
-/// non-finite-handling notes on the two edge checks in the implementation.
+/// contains a non-finite (`NaN` or `±inf`) value, or if `statistic_fn`
+/// produces a `NaN` on any resample. `±inf` IS accepted as a `statistic_fn`
+/// output (but never as a `samples` input) — see the non-finite-handling
+/// notes on the two edge checks in the implementation.
 pub fn bootstrap_ci<F>(
     samples: &[f64],
     statistic_fn: F,
@@ -69,25 +70,32 @@ where
             "alpha out of range (must be in (0, 1)): {alpha}"
         )));
     }
-    if samples.iter().any(|x| x.is_nan()) {
+    if samples.iter().any(|x| !x.is_finite()) {
         // The canonicalizing `sort_by(f64::total_cmp)` below is a genuine
-        // total order even over a NaN-containing slice (that is the whole
-        // point of `total_cmp`), so a NaN sample would NOT corrupt the sort.
-        // The real hazard is downstream and probabilistic: the seeded
-        // resampler draws POSITIONS, so whether any given resample actually
-        // includes the NaN element depends on `n`, `iterations`, and the
-        // seed — at small `n` / few `iterations` a resample can miss it
-        // entirely, in which case the output-edge check below (which does
-        // catch a NaN that DID get drawn) never fires either, and the
-        // returned interval looks like a clean, deterministic answer while
-        // being contingent on RNG luck rather than a property of the input
-        // multiset alone. Refusing here makes that contingency impossible
-        // instead of merely usually-caught. `±inf` is NOT refused here:
-        // total_cmp orders it correctly, and an `±inf` sample resampling
-        // into an `±inf` statistic is a legitimate outcome — see the
-        // output-edge check below.
+        // total order even over a NaN- or ±inf-containing slice (that is the
+        // whole point of `total_cmp`), so a non-finite sample would NOT
+        // corrupt the sort. The real hazard is downstream and probabilistic:
+        // the seeded resampler draws POSITIONS, and `statistic_fn` is
+        // caller-supplied arithmetic over whatever values land at those
+        // positions. Whether a NaN sample's position gets drawn at all — and
+        // whether a drawn combination of samples is even well-defined
+        // arithmetically (e.g. `+inf` and `-inf` both drawn into a `mean`
+        // sum to NaN even though neither individual sample is a NaN) —
+        // depends on `n`, `iterations`, and the seed. At small `n` / few
+        // iterations a resample can dodge the offending combination
+        // entirely, in which case the output-edge NaN check below (which
+        // only catches a NaN that DID get produced) never fires either, and
+        // the returned interval looks like a clean, deterministic answer
+        // while actually being contingent on RNG luck rather than a
+        // property of the input multiset alone. Refusing every non-finite
+        // sample here — not just NaN, and not only mixed-sign infinities —
+        // makes that contingency impossible for ANY `statistic_fn` the
+        // caller might supply, not just `mean`: a same-sign pair of
+        // infinities is fine under `+` but still NaN under `-`, so the
+        // blanket rule is the simplest one that doesn't require reasoning
+        // about which arithmetic `statistic_fn` performs.
         return Err(NumericsError::InvalidInput(
-            "bootstrap requires non-NaN samples".into(),
+            "bootstrap requires finite (non-NaN, non-infinite) samples".into(),
         ));
     }
     // Canonicalize the resample basis: the seeded RNG draws positions, so the
@@ -106,20 +114,25 @@ where
         stats.push(statistic_fn(&buf));
     }
     if stats.iter().any(|x| x.is_nan()) {
-        // `statistic_fn` is caller-supplied and can produce a NaN purely
-        // from its own arithmetic (e.g. a `0.0 / 0.0` on a degenerate
-        // resample) even when every input sample was finite. Refuse for the
-        // same lack-of-numeric-meaning reason the input-edge check above
-        // refuses a NaN sample: a NaN statistic doesn't represent a real
-        // value in the sampling distribution, so a percentile landing on it
-        // would silently hand back a NaN-valued interval bound. `±inf` is
-        // NOT refused: the only operation performed on `stats` past this
-        // point is `total_cmp`-ordered percentile selection (no arithmetic
-        // combination of its elements), which `±inf` participates in
-        // correctly — an interval bound of `±inf` is a legitimate, if
-        // extreme, answer for a heavy-tailed `statistic_fn`.
+        // Every element of `buf` fed into `statistic_fn` above is guaranteed
+        // finite — the input-edge check refused any non-finite `samples`
+        // element before any resample was drawn, so a NaN reaching this
+        // point cannot be attributed to a non-finite input. It can only be
+        // `statistic_fn`'s OWN degenerate arithmetic over finite inputs
+        // (e.g. a `0.0 / 0.0` ratio on a degenerate resample), so this error
+        // message is now accurate rather than a misattribution. Refuse for
+        // the same lack-of-numeric-meaning reason the input-edge check above
+        // refuses a non-finite sample: a NaN statistic doesn't represent a
+        // real value in the sampling distribution, so a percentile landing
+        // on it would silently hand back a NaN-valued interval bound. `±inf`
+        // is NOT refused here: the only operation performed on `stats` past
+        // this point is `total_cmp`-ordered percentile selection (no
+        // arithmetic combination of its elements), which `±inf` participates
+        // in correctly — an interval bound of `±inf` is a legitimate, if
+        // extreme, answer for a heavy-tailed `statistic_fn` (e.g. a ratio
+        // dividing by an exact-zero denominator on every resample).
         return Err(NumericsError::InvalidInput(
-            "bootstrap statistic_fn produced a NaN value".into(),
+            "bootstrap statistic_fn produced a NaN value from finite resampled inputs".into(),
         ));
     }
     // Every element is non-NaN at this point (it may be `±inf`), so

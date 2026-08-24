@@ -81,6 +81,33 @@ backend read back from the loaded model's own config — not an echo of
 config/device, HF falls back to `eager`) shows up in the report rather than
 being hidden behind the flag you passed.
 
+**"torch's best" must be RECORDED, not assumed — flash requires a null
+mask.** PyTorch's flash attention kernel is categorically ineligible with
+ANY non-null `attn_mask` (`aten/src/ATen/native/transformers/sdp_utils_cpp.h`,
+`check_for_attn_mask`: `"Flash Attention does not support non-null
+attn_mask"`); on an A100, a call carrying a padding mask dispatches to
+`EFFICIENT_ATTENTION` instead (cuDNN is only preferred on sm90+). This
+script's synthetic batches are UNPADDED (`mask` is all-ones, no real
+padding), and current `transformers`' `create_bidirectional_mask` — via
+`masking_utils._ignore_bidirectional_mask_sdpa`, which returns `True`
+("skip mask creation, pass `None` to sdpa") whenever the 2D padding mask is
+`None` or `.all()` — drops that all-ones mask to `None` before
+`ModernBertModel`'s own `sdpa_attention_forward` call ever sees it. So the
+`sdpa` row here may genuinely dispatch to FLASH, a result a PADDED
+real-world batch would not reproduce (it would land on `EFFICIENT_ATTENTION`
+or, on sm90+, `CUDNN_ATTENTION`). `finetune_step.sdpa_backend_probe`
+(CUDA + `--attn sdpa` only; `"n/a (cpu)"` elsewhere, `"n/a (attn=eager, ...)"`
+under `--attn eager`) records this empirically, via two independent probes:
+a single real forward wrapped in `torch.nn.attention.sdpa_kernel([<one
+backend>])` per backend (`"ok"` if it completes, `"ineligible: <message>"`
+if torch raises — the raise itself is the signal, never inferred), and a
+`torch.backends.cuda.SDPAParams` built from representative
+`(q, k, v, mask=None, dropout_p, is_causal=False, enable_gqa=False)` tensors
+fed to `can_use_flash_attention`/`can_use_efficient_attention`/
+`can_use_cudnn_attention(params, debug=True)`. Never read a "torch's best"
+headline number without first reading this field to know which kernel
+actually ran.
+
 No GPU, no checkpoint, still exercises the REAL loader:
 
 ```
@@ -332,13 +359,15 @@ UTC date, `git rev-parse HEAD` of this repo), `args` (every resolved CLI
 argument, including `adamw_foreach` read back from the constructed optimizer
 and `moment_warmup_step_executed`), and `finetune_step` (`p50`/`mean`
 s/step, `steps/s`, `triplets/s`, peak RSS, the three peak-VRAM fields above,
-the RESOLVED `attn_implementation` (or `"absent"`), the two
-`reference_compile_*` readbacks, and `lora_a_tensors_reinitialized`) — field
-names chosen to line up with `FinetuneStepTier` in
-`crates/jammi-bench/src/report.rs` wherever the concept is the same. No
-number in this report is asserted or gated inside the script; it is a
-measurement to be read alongside jammi's own JSON report by whatever
-process consumes both (a later contract's A/B table).
+the RESOLVED `attn_implementation` (or `"absent"`), `sdpa_backend_probe`
+(see "torch's best" note above — the empirical flash/efficient/cudnn
+eligibility probe, `"n/a (cpu)"` off CUDA, `"n/a (attn=...)"` off `--attn
+sdpa`), the two `reference_compile_*` readbacks, and
+`lora_a_tensors_reinitialized`) — field names chosen to line up with
+`FinetuneStepTier` in `crates/jammi-bench/src/report.rs` wherever the
+concept is the same. No number in this report is asserted or gated inside
+the script; it is a measurement to be read alongside jammi's own JSON
+report by whatever process consumes both (a later contract's A/B table).
 
 ## Range guards
 

@@ -87,7 +87,19 @@ they are properties of a torch/HF stack, not of jammi's own encoder:
   `args`. Run both: `sdpa` is torch's best-case number (what the throughput
   bar in #352 compares against); `eager` is the semantic twin of jammi's own
   attention composition (no fused SDPA kernel), so state which row a
-  headline ratio uses.
+  headline ratio uses. On `--attn sdpa` and CUDA, `finetune_step.sdpa_backend_probe`
+  RECORDS (never assumes) which torch SDPA kernel a real forward at OUR
+  shapes actually dispatches to — see `sdpa_backend_probe`'s own docstring.
+  This matters because torch's flash kernel is categorically ineligible with
+  ANY non-null `attn_mask` (`sdp_utils_cpp.h::check_for_attn_mask`: "Flash
+  Attention does not support non-null attn_mask"); on an A100, a call
+  carrying a padding mask dispatches to `EFFICIENT_ATTENTION` instead (cuDNN
+  is preferred only on sm90+). But this harness's synthetic batches are
+  UNPADDED (`mask` is all-ones), and current `transformers`'
+  `create_bidirectional_mask` (`masking_utils._ignore_bidirectional_mask_sdpa`)
+  drops such a mask to `None` before it reaches sdpa — so the `sdpa` row here
+  may genuinely dispatch to FLASH, a result a padded real-world batch would
+  not reproduce. Never assume "torch's best" without reading this field.
 * `--dtype {fp32,amp-fp16,bf16}` — NOTE the `amp-fp16` name, deliberately NOT
   called `f16` to flag a real divergence from jammi's `--backbone-dtype f16`
   lane: jammi's F16 casts the whole backbone (weights AND activations) to
@@ -620,6 +632,137 @@ def _step_once(model, optimizer, scaler, blocks, mask, args, use_amp, device):
         torch.cuda.synchronize()
 
 
+def _probe_sdpa_backend_forward(model, backend, input_ids, attention_mask):
+    """Try ONE real forward pass restricted to a single torch SDPA backend,
+    via `torch.nn.attention.sdpa_kernel`. `"ok"` if the forward completes;
+    `"ineligible: <message>"` if torch raises — a `RuntimeError` here IS the
+    signal (e.g. `sdp_utils_cpp.h::check_for_attn_mask`'s categorical "Flash
+    Attention does not support non-null attn_mask" check firing), never
+    inferred from anything else. `torch.no_grad()` because this is a probe,
+    not a training step — its output is discarded, only whether it raised
+    matters.
+    """
+    import torch
+    from torch.nn.attention import sdpa_kernel
+
+    try:
+        with torch.no_grad(), sdpa_kernel([backend]):
+            model(input_ids=input_ids, attention_mask=attention_mask)
+        return "ok"
+    except RuntimeError as exc:
+        return f"ineligible: {exc}"
+
+
+def sdpa_backend_probe(model, model_config, blocks, mask, device, args):
+    """RECORD (never assume) which torch SDPA backend a real forward at OUR
+    shapes actually dispatches to. This exists because PyTorch's flash
+    kernel is categorically ineligible with ANY non-null `attn_mask`
+    (`sdp_utils_cpp.h::check_for_attn_mask`), and on an A100 a call carrying
+    a padding mask dispatches to `EFFICIENT_ATTENTION` instead (`cuDNN` is
+    only preferred on sm90+) — but whether OUR mask actually reaches sdpa as
+    non-null is itself empirical, not assumed: this harness's synthetic
+    batches are unpadded (`mask` is all-ones), and current `transformers`'
+    `create_bidirectional_mask` (via
+    `masking_utils._ignore_bidirectional_mask_sdpa`, verified by reading
+    that function's source: it returns `True` — meaning "skip, pass `None`
+    to sdpa" — whenever `padding_mask is None or padding_mask.all()`) drops
+    an all-ones mask to `None` before `ModernBertModel`'s own
+    `sdpa_attention_forward` call ever sees it. So the `sdpa` row here MAY
+    genuinely dispatch to FLASH, while a padded real-world batch would not.
+    The "torch's best" throughput claim must record the backend, not assume
+    it — hence this probe, run twice, independently:
+
+    1. Per-backend forward under `sdpa_kernel([<one backend>])`,
+       try/except — see `_probe_sdpa_backend_forward`.
+    2. `torch.backends.cuda.SDPAParams` built from representative
+       `(q, k, v, mask, dropout_p, is_causal)` tensors shaped like what
+       ModernBERT's `sdpa_attention_forward` actually passes at OUR
+       `--batch`/`--seq`: `mask=None` (the same empirically-verified reason
+       as above), `is_causal=False` (ModernBERT is bidirectional, never
+       causal), `dropout_p=config.attention_dropout`, `enable_gqa=False`
+       (`ModernBertConfig` has no `num_key_value_heads` field — this
+       backbone has no grouped-query-attention path to enable) — fed to
+       `can_use_flash_attention`/`can_use_efficient_attention`/
+       `can_use_cudnn_attention`. `SDPAParams`'s constructor gained a
+       trailing `enable_gqa` bool in a later torch release than some
+       still-supported versions; the 7-arg (with `enable_gqa`) call is
+       tried first (this is what torch 2.13.0 requires), falling back to
+       the 6-arg (pre-`enable_gqa`) signature on `TypeError`, so this does
+       not hard-fail across the version range.
+
+    Only runs on CUDA with `--attn sdpa` — the combination the module
+    docstring's flash/efficient/cudnn claim is actually about. Returns the
+    plain string `"n/a (cpu)"` on CPU (including `--dry-run`), or an honest
+    `"n/a (attn=...)"` string when `--attn eager` was requested (the probe
+    is about sdpa backend selection specifically; forcing a backend via
+    `sdpa_kernel` on a model that loaded the eager attention path would not
+    measure anything the eager path itself does). Never a guessed value:
+    every string here is either a literal not-applicable marker or the
+    direct result of an empirical try/except or an empirical library call.
+    """
+    if device.type != "cuda":
+        return "n/a (cpu)"
+    if args.attn != "sdpa":
+        return f"n/a (attn={args.attn}, probe only applies to --attn sdpa)"
+
+    import torch
+    from torch.nn.attention import SDPBackend
+
+    probe_ids = blocks[0]
+    result = {
+        "flash": _probe_sdpa_backend_forward(model, SDPBackend.FLASH_ATTENTION, probe_ids, mask),
+        "efficient": _probe_sdpa_backend_forward(
+            model, SDPBackend.EFFICIENT_ATTENTION, probe_ids, mask
+        ),
+        "cudnn": _probe_sdpa_backend_forward(model, SDPBackend.CUDNN_ATTENTION, probe_ids, mask),
+    }
+
+    try:
+        if not hasattr(torch.backends.cuda, "SDPAParams"):
+            raise AttributeError("torch.backends.cuda.SDPAParams does not exist on this build")
+        num_heads = model_config.num_attention_heads
+        head_dim = model_config.hidden_size // num_heads
+        dropout_p = float(getattr(model_config, "attention_dropout", 0.0))
+        param_dtype = next(model.parameters()).dtype
+        q = torch.zeros(
+            args.batch, num_heads, args.seq, head_dim, dtype=param_dtype, device=device
+        )
+        k = torch.zeros_like(q)
+        v = torch.zeros_like(q)
+        attn_mask = None  # verified empirically above: all-ones mask never reaches sdpa
+        is_causal = False  # ModernBERT is bidirectional
+        enable_gqa = False  # ModernBertConfig has no num_key_value_heads field
+        try:
+            params = torch.backends.cuda.SDPAParams(
+                q, k, v, attn_mask, dropout_p, is_causal, enable_gqa
+            )
+        except TypeError:
+            # Older torch: SDPAParams predates the trailing enable_gqa arg.
+            params = torch.backends.cuda.SDPAParams(q, k, v, attn_mask, dropout_p, is_causal)
+        result["sdpa_params_probe"] = {
+            "flash_can_use": bool(torch.backends.cuda.can_use_flash_attention(params, True)),
+            "efficient_can_use": bool(
+                torch.backends.cuda.can_use_efficient_attention(params, True)
+            ),
+            "cudnn_can_use": (
+                bool(torch.backends.cuda.can_use_cudnn_attention(params, True))
+                if hasattr(torch.backends.cuda, "can_use_cudnn_attention")
+                else "probe-unavailable: can_use_cudnn_attention not present on this torch build"
+            ),
+            "note": "debug=True only enables PyTorch's internal C++ LOG(WARNING) (a "
+            "c10/glog-style sink), which writes to the process's native stderr fd "
+            "outside Python's logging/warnings machinery -- not capturable as a string "
+            "in this JSON field. Redirect the pod's own stderr if the specific "
+            "ineligibility message text is needed; the booleans above are the "
+            "reliably observable half of this probe.",
+        }
+    except Exception as exc:  # noqa: BLE001 - a probe must never crash the run; honesty
+        # over a guess: record exactly what went wrong, never a fabricated value.
+        result["sdpa_params_probe"] = f"probe-unavailable: {type(exc).__name__}: {exc}"
+
+    return result
+
+
 def run(args):
     import torch
 
@@ -724,6 +867,16 @@ def run(args):
             model.config, "reference_compile", "absent"
         )
 
+        # RECORD, never assume, which torch SDPA backend a real forward at
+        # OUR shapes actually dispatches to — see `sdpa_backend_probe`'s own
+        # docstring for why an unpadded synthetic batch can genuinely hit
+        # FLASH even though torch's flash kernel is categorically ineligible
+        # with any non-null attn_mask. Run AFTER the untimed warm-up step
+        # (model+adapter+optimizer are fully constructed and resident by
+        # this point) and BEFORE the VRAM baseline reset, so the probe's own
+        # (discarded) forward passes cannot pollute the measured window.
+        sdpa_backend_probe_result = sdpa_backend_probe(model, config, blocks, mask, device, args)
+
         vram_baseline_bytes = None
         if is_cuda:
             vram_baseline_bytes = torch.cuda.memory_allocated(device)
@@ -780,6 +933,7 @@ def run(args):
                 "device": str(device),
                 "backbone_dtype": args.dtype,
                 "attn_implementation": resolved_attn_implementation,
+                "sdpa_backend_probe": sdpa_backend_probe_result,
                 "reference_compile_resolved": reference_compile_resolved,
                 "reference_compile_after_first_forward": reference_compile_after_first_forward,
                 "batch": args.batch,

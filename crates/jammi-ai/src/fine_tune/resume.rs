@@ -94,8 +94,9 @@ pub struct ResumeState {
     ///
     /// **Unit change (schema version 1, this commit):** before device-side
     /// Philox dropout, this counted per-ELEMENT draws from an advancing
-    /// host RNG stream (`draw_mask`'s `position += len`); it now counts
-    /// per-FORWARD Philox counter values (`jammi_kernels::ops::
+    /// host RNG stream (each draw advancing the stream's position by the
+    /// activation's element count); it now counts per-FORWARD Philox counter
+    /// values (`jammi_kernels::ops::
     /// DropoutFused`'s `forward_idx`) — one increment per training
     /// forward through the layer, regardless of the activation's element
     /// count. A checkpoint written under the OLD unit would silently

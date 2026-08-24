@@ -42,7 +42,7 @@
 //! *operator* — propagation reuses `fold_vectors_in_order`, the shared
 //! fixed-order reduction the UDAF accumulator also folds through, so
 //! there is one reduction implementation — with no second normalisation pathway
-//! and no per-element `vector_scale` function. It does **not** route the per-hop
+//! and no separate per-element scaling function. It does **not** route the per-hop
 //! aggregation through the SQL UDAF: the streaming aggregate cannot guarantee a
 //! byte-identical result across partitionings (`f64` `+` is non-associative and a
 //! parallel plan fixes neither the fold nor the merge order), so propagation

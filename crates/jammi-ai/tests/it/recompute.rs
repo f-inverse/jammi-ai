@@ -421,8 +421,9 @@ async fn recompute_context_set_over_default_embedding_table_is_byte_identical() 
 
     // The context-set output is now the newest `kind=model` table for `points` —
     // the exact shadowing condition. `resolve_embedding_table("points", None)`
-    // would now return `context_table`, not `emb`. Only a descriptor that pinned
-    // the resolved `emb` name re-pools correctly on replay.
+    // would now return the freshly materialized context table, not `emb`. Only
+    // a descriptor that pinned the resolved `emb` name re-pools correctly on
+    // replay.
     assert_ne!(
         context_table.table_name, emb.table_name,
         "the context set is a distinct, newer model table for the source"

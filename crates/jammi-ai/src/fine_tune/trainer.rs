@@ -1267,7 +1267,7 @@ impl TrainingLoop {
     /// layer can regress.
     ///
     /// The training loss scores this z-output directly against a z-scored target
-    /// (`embed_chunk` z-scores the target via [`TargetScaler::standardize_value`]),
+    /// (`encode_chunk` z-scores the target via [`TargetScaler::standardize_value`]),
     /// so the optimizer sees O(1) residuals regardless of the target's raw scale.
     /// De-standardisation (`μ_y + σ_y·z` on the mean/quantile columns, `σ_y·σ_z`
     /// on the served σ) happens **only at serve** — the backend's de-standardising
@@ -1544,7 +1544,7 @@ impl TrainingLoop {
     /// head column and scores each against its level.
     ///
     /// Both `input` and `target` are in standardized (z) space — `head_forward`
-    /// returns the raw z-output and `embed_chunk` z-scores the target — so this
+    /// returns the raw z-output and `encode_chunk` z-scores the target — so this
     /// loss scores O(1) residuals regardless of the target's raw scale. The four
     /// objective fns are unchanged: they are pure functions of `(head, target)`,
     /// already proven in z-space by the in-context predictor. De-standardisation
@@ -3260,7 +3260,7 @@ mod standardization_contract {
     }
 
     /// Z-score a raw target tensor with the loop's scaler — the exact transform
-    /// `embed_chunk` applies before the loss in production.
+    /// `encode_chunk` applies before the loss in production.
     fn z_score_targets(loop_: &TrainingLoop, targets: &Tensor) -> Tensor {
         let scaler = loop_.target_scaler.as_ref().unwrap();
         let raw = targets.to_vec1::<f32>().unwrap();
@@ -5157,7 +5157,7 @@ mod determinism_through_forward {
         let feats = features(n, &device);
 
         let (loop_, varmap) = regression_loop(seed, &targets, &device).await;
-        // Z-score the target exactly as `embed_chunk` does — the production loss
+        // Z-score the target exactly as `encode_chunk` does — the production loss
         // scores the raw z-head against the z-target.
         let z_target = {
             let scaler = loop_.target_scaler.as_ref().unwrap();
@@ -5476,7 +5476,7 @@ mod resume_invariant {
         let aux = head.layers[2].1.forward(&proj).unwrap();
         let head_out = loop_.head_forward(&aux).unwrap();
         // Z-score the target with the resumed scaler (persisted across crash/resume),
-        // exactly as `embed_chunk` does in production.
+        // exactly as `encode_chunk` does in production.
         let z_target = {
             let scaler = loop_.target_scaler.as_ref().unwrap();
             let raw = targets.to_vec1::<f32>().unwrap();
@@ -5573,11 +5573,11 @@ mod resume_invariant {
     ///
     /// The "epoch boundary" here is `K` production steps; "the next steps" is `N`
     /// more. Reference: run K steps, persist the durable bundle via the trainer's
-    /// `save_resume_checkpoint` (== `S_ref@K`), then run N more → `W_ref`. Crashed:
+    /// `save_resume_checkpoint` (== `S_ref@K`), then run N more → W_ref. Crashed:
     /// a second loop runs K steps, persists, and is dropped. Resumed: a third loop
     /// `discover`s the durable bundle, restores via `restore_from_checkpoint`, runs
-    /// N steps → `W_resumed`. Then mutate the persisted scaler-source between crash
-    /// and resume (R7) and assert `W_resumed` still matches.
+    /// N steps → W_resumed. Then mutate the persisted scaler-source between crash
+    /// and resume (R7) and assert W_resumed still matches.
     #[tokio::test(flavor = "multi_thread")]
     async fn resume_reproduces_the_exact_trajectory_byte_for_byte() {
         const K: usize = 6;

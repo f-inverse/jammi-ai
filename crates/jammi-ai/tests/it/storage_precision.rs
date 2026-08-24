@@ -363,7 +363,8 @@ async fn per_request_oversample_overrides_table_default() {
 /// oversample resolution read the live deployment config instead of the
 /// table's stamped column, the second session would narrow the candidate
 /// set to the raw quantized top-k, which — for this fixture/query — misses
-/// one of the true top-k neighbours (see `int8_search_with_rescore` sibling
+/// one of the true top-k neighbours (see
+/// `int8_search_with_rescore_matches_exact_f32_baseline` and its sibling
 /// tests establishing quantized-vs-exact divergence on this corpus).
 #[tokio::test]
 async fn table_stamped_oversample_drives_rescore_not_deployment_config() {

@@ -292,8 +292,8 @@ mod tests {
     use crate::inference::schema::build_output_schema;
 
     /// `is_oom_error` must classify ONLY genuine out-of-memory errors. A CUDA
-    /// kernel/loader failure (e.g. `INVALID_PTX`) is not OOM — misrouting it to
-    /// the batch-halving retry (and never surfacing it) is #319.
+    /// kernel/loader failure (e.g. `CUDA_ERROR_INVALID_PTX`) is not OOM —
+    /// misrouting it to the batch-halving retry (and never surfacing it) is #319.
     #[test]
     fn is_oom_error_matches_only_real_oom() {
         let oom = |m: &str| InferenceRunner::is_oom_error(&JammiError::Inference(m.into()));

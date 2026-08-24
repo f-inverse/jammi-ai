@@ -997,7 +997,7 @@ impl InferenceSession {
     }
 
     /// Materialize the k-nearest-neighbour graph of a source's embedding table
-    /// as a queryable edge `result_table`.
+    /// as a queryable edge result table.
     ///
     /// This is for *global-structure* work — clustering, near-duplicate
     /// detection, connected components, graph-aware training-data generation —

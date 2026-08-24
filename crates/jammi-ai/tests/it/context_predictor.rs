@@ -1,10 +1,10 @@
 //! S19 episodic meta-training for the `AnyContextPredictor` family.
 //!
 //! Hermetic, CPU, synthetic meta-datasets. A meta-dataset is a family of linear
-//! functions: each **task** `t` carries a weight vector `w_t`, every row's
+//! functions: each **task** `t` carries a weight vector w_t, every row's
 //! outcome is `y = w_t · x` over a small feature vector `x`, and the embedding
 //! table stores `x` as the row's vector. Same-task neighbours (retrieved by
-//! x-similarity) form a context that *determines* `w_t`, so a predictor that
+//! x-similarity) form a context that *determines* w_t, so a predictor that
 //! meta-learns "infer the task's map from its context, apply it at the target"
 //! generalises to a held-out task in one forward pass — the NP success bar.
 //!

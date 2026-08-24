@@ -9,7 +9,7 @@
 //!
 //! ## Lifecycle
 //! The lexical sidecar's lifecycle equals the ANN sidecar's: it is built (and
-//! rebuilt) with the table. An immutable `result_table` rebuild produces a new
+//! rebuilt) with the table. An immutable result-table rebuild produces a new
 //! sidecar; for a `mutable_table` source, incremental update is the caller's
 //! mode (re-ingest the changed rows into a fresh index).
 //!

@@ -12,7 +12,7 @@
 //! guards). Token classification is argmax over a softmax, so the decisive
 //! parity signal is exact label/span agreement — not a cosine floor over a
 //! continuous vector. The same `tiny_modernbert_ner` model runs over the
-//! same `tiny_ner_corpus` fixture on a GPU-pinned and a CPU-pinned session;
+//! same `tiny_ner_corpus.parquet` fixture on a GPU-pinned and a CPU-pinned session;
 //! every row's decoded entity spans (keyed by `_row_id`, so the comparison
 //! is row-exact regardless of scan order) must carry the same
 //! `(label, start, end)` set, with each entity's mean softmax confidence

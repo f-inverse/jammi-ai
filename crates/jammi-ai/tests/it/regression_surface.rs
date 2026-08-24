@@ -632,7 +632,7 @@ async fn untrained_regression_head_collapses_to_mu_no_separation() {
 /// (test-robustness fix, see this commit's message): the ORIGINAL version of
 /// THIS control made exactly the mistake it was written to guard against —
 /// its own "the TRAINED head clearly separates" sanity leg trained ONE seed
-/// (7) and compared to a hard-coded literal (`QUANTILE_ZERO_CONTROL_MIN` =
+/// (7) and compared to a hard-coded literal (QUANTILE_ZERO_CONTROL_MIN =
 /// 1.5, calibrated to that seed's measured 3.82 under the OLD stream). Under
 /// a stream change that single trajectory's level-0.1 separation flips to
 /// -3.51, so the sanity leg itself fails — the same single-seed fragility
@@ -641,7 +641,7 @@ async fn untrained_regression_head_collapses_to_mu_no_separation() {
 /// Diagnosis (measured under the CURRENT stream in this worktree, all 12
 /// pinned seeds, level-0.1 `served_regression_col0_for_test` column): the
 /// DESTRUCTIVE (zeroed) leg is untouched by the stream change — it reads
-/// EXACTLY 0.0 separation, `max_dev` EXACTLY 0.0, on EVERY one of the 12
+/// EXACTLY 0.0 separation, max deviation EXACTLY 0.0, on EVERY one of the 12
 /// seeds, under BOTH streams. This is structural, not coincidental: the
 /// distribution head's BASE weight is a literal `zeros(output_dim,
 /// hidden_size)` (see `fine_tune::lora::build_distribution_head`), so with

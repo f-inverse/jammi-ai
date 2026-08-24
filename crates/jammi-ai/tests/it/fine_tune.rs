@@ -991,7 +991,8 @@ async fn training_divergence_detection() {
     // `failed` status is the worker's job (a single finalization authority), not
     // the loop's, so this trainer-internals test asserts on the returned error
     // rather than the catalog status. The worker-driven panic→failed path is
-    // covered end-to-end in `panicking_training_job_lands_failed`.
+    // covered end-to-end in
+    // `panicking_training_job_lands_failed_with_recorded_error`.
 }
 
 // ─── Early stopping: patience exhaustion stops training ─────────────────────

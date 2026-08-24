@@ -4,7 +4,7 @@
 //! For every row of an embedding table this finds the row's `k` nearest
 //! neighbours *within the same table* and emits one directed edge per
 //! `(source, neighbour)` pair. The result is a catalogued, tenant-scoped
-//! `result_table` of `kind = neighbor_graph` — adjacency + weight, nothing
+//! result table of `kind = neighbor_graph` — adjacency + weight, nothing
 //! more. It carries no model, no sidecar index, and no evidence channel; the
 //! `similarity` weight is a plain column.
 //!

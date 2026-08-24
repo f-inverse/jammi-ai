@@ -303,9 +303,9 @@ mod tests {
         assert!(should_refresh(1, 1));
     }
 
-    /// The k-hop exclusion re-queries each frontier id's embedding. With the
-    /// redundant `id_to_embedding` copy removed, that embedding now comes from
-    /// the index's own stored vectors via [`SidecarIndex::get`]. A 2-hop
+    /// The k-hop exclusion re-queries each frontier id's embedding: rather than
+    /// keeping a redundant in-memory id-to-embedding copy, that embedding comes
+    /// from the index's own stored vectors via [`SidecarIndex::get`]. A 2-hop
     /// expansion exercises the index lookup on ids that are *not* the original
     /// positive (the second-hop frontier), proving the index-backed lookup
     /// works: with both `dup` (1-hop of `pos`) and `bridge` (1-hop of `dup`,

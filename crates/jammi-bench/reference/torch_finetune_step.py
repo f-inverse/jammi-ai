@@ -169,10 +169,13 @@ high-water mark that cannot miss an intra-step spike the way a discrete poll
 (this script's old per-step read, or jammi's own 25ms `nvidia-smi` interval)
 can.
 
-jammi's `peak_vram_bytes` (`finetune_step.rs:112,:233`) is a whole-device
-`nvidia-smi` poll, sampled every 25ms over the ENTIRE warmup+measured loop,
-minus a baseline snapshot taken once right after the model+optimizer are
-built (before the loop starts) — at which point candle's `AdamW::new` has
+jammi's `peak_vram_bytes` is a whole-device `nvidia-smi` poll
+(`device_memory_used_bytes`, finetune_step.rs:61), sampled every 25ms
+(`std::thread::sleep`, finetune_step.rs:96) over the ENTIRE warmup+measured
+loop, then reduced via `peak.saturating_sub(baseline)`, finetune_step.rs:112
+against a baseline snapshot (`vram_baseline`, finetune_step.rs:358) taken
+once right after the model+optimizer are built (before the loop starts) — at
+which point candle's `AdamW::new` has
 ALREADY allocated the (zero-initialized) first/second moment tensors, since
 candle allocates them eagerly at construction. Torch's `AdamW`, by contrast,
 allocates its `exp_avg`/`exp_avg_sq` state LAZILY on the first `step()` call

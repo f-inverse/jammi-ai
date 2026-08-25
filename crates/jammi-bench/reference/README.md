@@ -177,10 +177,12 @@ flag; build a distribution/trajectory-equivalence test instead.
 ## Peak VRAM: two fields, two different jammi mappings — read before comparing
 
 `finetune_step.rs`'s `VramSampler` polls whole-device memory via `nvidia-smi`
-on a background thread every 25ms over the ENTIRE step loop (warmup +
-measured), then subtracts a baseline snapshot read once, right after the
-model+optimizer are built (before the loop starts) — see
-`finetune_step.rs:112,:233`.
+(`device_memory_used_bytes`, finetune_step.rs:61) on a background thread
+every 25ms (`std::thread::sleep`, finetune_step.rs:96) over the ENTIRE step
+loop (warmup + measured), then subtracts a baseline snapshot
+(`peak.saturating_sub(baseline)`, finetune_step.rs:112) read once, right
+after the model+optimizer are built (before the loop starts) — see
+`vram_baseline`, finetune_step.rs:358.
 
 **An earlier draft of this script got the sampling point wrong.** It polled
 `torch.cuda.memory_allocated()` once per step, at the same point the clock
@@ -440,8 +442,10 @@ match — a mismatch on any of those REFUSES the comparison (never a silent
 `PASS`) regardless of how well the gradients themselves happen to agree.
 On the live A100 run above, this weight-identity check held by actual
 agreement, not by luck of a loose bound: `max|w_jammi - w_torch| =
-1.86e-9` over 224 tensors, five orders of magnitude inside
-`compare_grad_oracle.py`'s `WEIGHT_MATCH_ATOL`.
+1.86e-9` over 224 tensors -- orders of magnitude inside the ULP-relative
+tolerance `compare_grad_oracle.py`'s `WEIGHT_MATCH_ULPS`/`_weight_element_tolerance`
+derive (advisory ii, round-2 audit fix on PR #372: a fixed `1e-4` absolute
+constant, now an f32-ULP-relative bound).
 
 See that script's own module doc for the derived (never fitted) bf16
 ULP-based cosine floor, and its `derive_cosine_floor` doc for why that

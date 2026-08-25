@@ -195,6 +195,12 @@ class FusedProofFixtureTests(unittest.TestCase):
         fallback (1) alongside its fused count -- an admitted call site
         that actually fell back must hard-fail regardless of how many
         OTHER pairs look clean.
+
+        Advisory (iv), round-2 audit fix on PR #372: a `False` proof now
+        turns the verdict `INVALID` (never merely a `[WARN]` suffix on
+        whatever ratio-based verdict would have applied) and the SWEEP's
+        own exit code goes non-zero -- driven at the real `main()` entry
+        point, not `build_report`'s internals in isolation.
         """
         with tempfile.TemporaryDirectory() as raw_dir:
             write_ok_config(
@@ -207,9 +213,11 @@ class FusedProofFixtureTests(unittest.TestCase):
                     "attention_block": (3, 0),
                 },
             )
-            rc, merged, _table = self.run_merge(raw_dir)
-        self.assertEqual(rc, 0)
+            rc, merged, table = self.run_merge(raw_dir)
         self.assertIs(merged["configs"]["b8-s128-d0"]["jammi_fused_dispatch_proof"], False)
+        self.assertTrue(merged["configs"]["b8-s128-d0"]["verdict"].startswith("INVALID"))
+        self.assertIn("INVALID", table)
+        self.assertEqual(rc, 1, "a failed fused_proof must turn the sweep's own exit code non-zero")
 
     def test_all_zero_no(self):
         """Every single pair reads (0, 0) -- a schema regression that
@@ -219,8 +227,9 @@ class FusedProofFixtureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw_dir:
             write_ok_config(raw_dir, "b8-s128-d0", {})
             rc, merged, _table = self.run_merge(raw_dir)
-        self.assertEqual(rc, 0)
         self.assertIs(merged["configs"]["b8-s128-d0"]["jammi_fused_dispatch_proof"], False)
+        self.assertTrue(merged["configs"]["b8-s128-d0"]["verdict"].startswith("INVALID"))
+        self.assertEqual(rc, 1)
 
     def test_mixed_fused_and_eager_no(self):
         """Some pairs show real fused activity (ln, geglu), but ANOTHER
@@ -241,8 +250,9 @@ class FusedProofFixtureTests(unittest.TestCase):
                 },
             )
             rc, merged, _table = self.run_merge(raw_dir)
-        self.assertEqual(rc, 0)
         self.assertIs(merged["configs"]["b8-s128-d0"]["jammi_fused_dispatch_proof"], False)
+        self.assertTrue(merged["configs"]["b8-s128-d0"]["verdict"].startswith("INVALID"))
+        self.assertEqual(rc, 1)
 
     def test_solo_counter_is_a_loud_per_config_failure_not_a_crash(self):
         """B2 + B6: a `_fused_dispatches` key with no `_eager_dispatches`
@@ -268,14 +278,22 @@ class FusedProofFixtureTests(unittest.TestCase):
 
             rc, merged, table = self.run_merge(raw_dir)
 
-        self.assertEqual(rc, 0, "one bad leg must not abort the whole merge (B6)")
         broken_proof = merged["configs"]["b8-s128-solo"]["jammi_fused_dispatch_proof"]
         self.assertIsInstance(broken_proof, str)
         self.assertIn("ERROR", broken_proof)
         self.assertIn("softmax_eager_dispatches", broken_proof)
+        # B6: one bad leg must not abort the merge for the OTHER config --
+        # both configs are still present and correctly classified in the
+        # merged JSON, one bad leg does not silently swallow the other.
+        self.assertTrue(merged["configs"]["b8-s128-solo"]["verdict"].startswith("INVALID"))
         self.assertIs(merged["configs"]["b8-s128-healthy"]["jammi_fused_dispatch_proof"], True)
+        self.assertFalse(merged["configs"]["b8-s128-healthy"]["verdict"].startswith("INVALID"))
         # The error is visible in the printed table too, not just the JSON.
         self.assertIn("ERROR", table)
+        # Advisory (iv): the errored config's own INVALID verdict is what
+        # now gates the SWEEP's exit code non-zero -- the healthy config
+        # passing does not paper over it.
+        self.assertEqual(rc, 1)
 
     def test_vanished_site_case_all_zero_except_attention_block(self):
         """B2's own worst-case example: ln/rope/softmax/geglu/lora_epilogue/
@@ -288,8 +306,9 @@ class FusedProofFixtureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw_dir:
             write_ok_config(raw_dir, "b8-s128-d0", {"attention_block": (10, 0)})
             rc, merged, _table = self.run_merge(raw_dir)
-        self.assertEqual(rc, 0)
         self.assertIs(merged["configs"]["b8-s128-d0"]["jammi_fused_dispatch_proof"], False)
+        self.assertTrue(merged["configs"]["b8-s128-d0"]["verdict"].startswith("INVALID"))
+        self.assertEqual(rc, 1)
 
     def test_vanished_site_case_only_lora_epilogue_positive(self):
         """B2's other named example: only `lora_epilogue` reads (1, 0),
@@ -299,8 +318,9 @@ class FusedProofFixtureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw_dir:
             write_ok_config(raw_dir, "b8-s128-d0", {"lora_epilogue": (1, 0)})
             rc, merged, _table = self.run_merge(raw_dir)
-        self.assertEqual(rc, 0)
         self.assertIs(merged["configs"]["b8-s128-d0"]["jammi_fused_dispatch_proof"], False)
+        self.assertTrue(merged["configs"]["b8-s128-d0"]["verdict"].startswith("INVALID"))
+        self.assertEqual(rc, 1)
 
     def test_no_dispatch_pairs_at_all_reads_false_not_none(self):
         """`jammi_fused_dispatch_proof` is `None` when the jammi-fused leg
@@ -329,9 +349,16 @@ class FusedProofFixtureTests(unittest.TestCase):
 
             rc, merged, _table = self.run_merge(raw_dir)
 
-        self.assertEqual(rc, 0)
         self.assertIsNone(merged["configs"]["b8-s128-missing"]["jammi_fused_dispatch_proof"])
+        # `None` (leg did not run at all) is NOT the same failure class as
+        # `False` (leg ran, proof checked, and failed) -- only the latter
+        # becomes an INVALID verdict; a leg that never ran gets its own
+        # ordinary (non-INVALID) FAIL/N-A verdict from the outcome-based
+        # rules, unaffected by advisory (iv)'s fix.
+        self.assertFalse(merged["configs"]["b8-s128-missing"]["verdict"].startswith("INVALID"))
         self.assertIs(merged["configs"]["b8-s128-empty"]["jammi_fused_dispatch_proof"], False)
+        self.assertTrue(merged["configs"]["b8-s128-empty"]["verdict"].startswith("INVALID"))
+        self.assertEqual(rc, 1, "the b8-s128-empty config's INVALID verdict must gate the sweep exit code")
 
     def test_geglu_zero_zero_now_fails_the_f5_reproduction(self):
         """F5 REPRODUCTION: before this fix, `fused_proof` over pairs
@@ -355,8 +382,9 @@ class FusedProofFixtureTests(unittest.TestCase):
                 },
             )
             rc, merged, _table = self.run_merge(raw_dir)
-        self.assertEqual(rc, 0)
         self.assertIs(merged["configs"]["b8-s128-d0"]["jammi_fused_dispatch_proof"], False)
+        self.assertTrue(merged["configs"]["b8-s128-d0"]["verdict"].startswith("INVALID"))
+        self.assertEqual(rc, 1)
 
     def test_rope_softmax_entirely_absent_from_schema_now_fails_the_f5_reproduction(self):
         """F5 REPRODUCTION: `fused_proof([('ln', 9, 0), ('lora_linear', 3,
@@ -379,8 +407,9 @@ class FusedProofFixtureTests(unittest.TestCase):
             write_leg(raw_dir, "b8-s128-d0", "torch-eager", report=torch_fs(attn_implementation="eager"))
             write_leg(raw_dir, "b8-s128-d0", "torch-sdpa", report=torch_fs())
             rc, merged, _table = self.run_merge(raw_dir)
-        self.assertEqual(rc, 0)
         self.assertIs(merged["configs"]["b8-s128-d0"]["jammi_fused_dispatch_proof"], False)
+        self.assertTrue(merged["configs"]["b8-s128-d0"]["verdict"].startswith("INVALID"))
+        self.assertEqual(rc, 1)
 
     def test_only_ln_present_everything_else_absent_now_fails_the_f5_reproduction(self):
         """F5's most extreme reproduction, quoted directly from the audit:
@@ -398,8 +427,9 @@ class FusedProofFixtureTests(unittest.TestCase):
             write_leg(raw_dir, "b8-s128-d0", "torch-eager", report=torch_fs(attn_implementation="eager"))
             write_leg(raw_dir, "b8-s128-d0", "torch-sdpa", report=torch_fs())
             rc, merged, _table = self.run_merge(raw_dir)
-        self.assertEqual(rc, 0)
         self.assertIs(merged["configs"]["b8-s128-d0"]["jammi_fused_dispatch_proof"], False)
+        self.assertTrue(merged["configs"]["b8-s128-d0"]["verdict"].startswith("INVALID"))
+        self.assertEqual(rc, 1)
 
     def test_unclassified_base_is_a_loud_per_config_error_not_a_silent_pass(self):
         """A NEW fused kernel's dispatch pair landing in `finetune_step.rs`
@@ -417,12 +447,19 @@ class FusedProofFixtureTests(unittest.TestCase):
             write_leg(raw_dir, "b8-s128-d0", "torch-eager", report=torch_fs(attn_implementation="eager"))
             write_leg(raw_dir, "b8-s128-d0", "torch-sdpa", report=torch_fs())
             rc, merged, table = self.run_merge(raw_dir)
-        self.assertEqual(rc, 0, "one bad leg must not abort the whole merge (B6)")
         proof = merged["configs"]["b8-s128-d0"]["jammi_fused_dispatch_proof"]
         self.assertIsInstance(proof, str)
         self.assertIn("ERROR", proof)
         self.assertIn("mystery_kernel", proof)
         self.assertIn("ERROR", table)
+        # Advisory (iv): an errored proof is now INVALID, and INVALID gates
+        # the sweep's exit code -- unlike B6's "one bad leg must not abort
+        # the merge for another config" guarantee (which is about NOT
+        # crashing/dropping the other config's row, still true here since
+        # there is only one config in this fixture), the FINAL exit code is
+        # allowed -- expected -- to reflect this config's own bad leg.
+        self.assertTrue(merged["configs"]["b8-s128-d0"]["verdict"].startswith("INVALID"))
+        self.assertEqual(rc, 1)
 
 
 class LoraInitProvenanceTests(unittest.TestCase):

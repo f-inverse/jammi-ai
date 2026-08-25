@@ -627,6 +627,22 @@ jobs:
           # can't be authored and left silently unwired into CI.
           - name: CI guard wiring
             cmd: python3 ci/scripts/check_ci_guard_wiring.py
+          # check_ci_guard_wiring.py's OWN suite (advisory iii, PR #372
+          # round 2): drives the real python_test_suites()/main() entry
+          # points against throwaway git-init'd fixtures, pinning the
+          # comment-vs-code-line tightening and the root generalization.
+          - name: CI guard wiring suite
+            cmd: python3 ci/scripts/test_check_ci_guard_wiring.py
+          # Re-resolves every finetune_step.rs:<n>/grad_oracle.rs:<n>
+          # PATH:LINE citation under crates/jammi-bench/** and
+          # ci/scripts/perf/** against the file at HEAD (advisory i, PR #372
+          # round 2) -- stdlib-only, hermetic, catches the F7-class
+          # regression (an in-bounds but STALE line number) an eyeballed
+          # diff review missed twice in a row on this same PR.
+          - name: citation resolver
+            cmd: python3 ci/scripts/perf/check_citations.py
+          - name: citation resolver suite
+            cmd: python3 ci/scripts/perf/test_check_citations.py
           # jammi-vs-torch gradient-oracle comparator's own math/refusal
           # suite (F6, PR #372 audit round): stdlib-only (`unittest`), no
           # torch/numpy required — `compare_grad_oracle.py`'s own module

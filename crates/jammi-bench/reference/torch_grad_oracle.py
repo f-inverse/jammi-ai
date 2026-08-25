@@ -31,8 +31,10 @@ every `lora_a` tensor at this fresh `LoraInitMode::ZerosB` init (112 of
 call tests only `dL/dB`" below — and that the weight-identity check F3
 added (`compare_grad_oracle.py`'s `_weight_mismatches`) held on that run
 by actual agreement, not by luck of a loose bound: `max|w_jammi - w_torch|
-= 1.86e-9` over 224 tensors, five orders of magnitude inside
-`WEIGHT_MATCH_ATOL`.
+= 1.86e-9` over 224 tensors -- orders of magnitude inside the ULP-relative
+tolerance `compare_grad_oracle.py`'s `WEIGHT_MATCH_ULPS`/`_weight_element_tolerance`
+derive (advisory ii, round-2 audit fix on PR #372: this was a fixed `1e-4`
+absolute constant, now an f32-ULP-relative bound).
 
 Everything ELSE about this file beyond that one confirmed run (arbitrary
 checkpoints, other `target_modules` sets, other dtypes/ranks/batch/seq
@@ -124,9 +126,11 @@ absent rather than a bare traceback).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import re
 import sys
+import tempfile
 
 # Reuse EVERY piece of machinery torch_finetune_step.py already has working
 # (and, unlike this script, has actually been run): the loader, the LoRA
@@ -135,6 +139,18 @@ import sys
 # the first and silently feed the two stacks different tokens, exactly the
 # class of bug this whole oracle exists to rule out as a variable.
 import torch_finetune_step as tfs
+
+
+class _ModelArgs:
+    """A throwaway attribute-bag `tfs.load_model`/`tfs.wrap_lora` accept in
+    place of a full `argparse.Namespace` — those two functions only ever
+    read specific attributes off whatever object they are handed, never the
+    object's type, so a minimal stand-in is enough. Module-level (not a
+    class nested inside `run()`) so both `run()` (builds the `model_args`
+    passed to `load_model`) and `_run_with_model()` (builds the separate
+    `lora_args` passed to `wrap_lora`) can construct one.
+    """
+
 
 PEFT_NAME_RE = re.compile(
     r"^base_model\.model\.layers\.(?P<layer>\d+)\.(?P<mid>attn|mlp)\.(?P<site>Wqkv|Wo|Wi)"
@@ -204,6 +220,40 @@ def translate_jammi_name_to_peft(name: str) -> str | None:
     bare_site = site.split(".")[-1]
     AB = "A" if ab == "lora_a" else "B"
     return f"base_model.model.layers.{layer}.{mid}.{bare_site}.lora_{AB}.default.weight"
+
+
+# jammi's OWN CLI/interchange dtype vocabulary (`main.rs`'s
+# `--backbone-dtype` choices, `grad_oracle.rs`'s
+# `format!("{:?}", ComputePrecision::F32).to_lowercase()`): `f32`/`f16`/
+# `bf16`. This script's `--dtype` flag keeps torch's OWN spelling (`fp32`,
+# matching `torch_finetune_step.py`'s convention) since it feeds
+# `torch_finetune_step.load_model`'s dtype map, which is shared machinery
+# this script does not own and has its own reasons (the `amp-fp16` case) to
+# keep torch's spelling -- only the WRITTEN REPORT's `backbone_dtype` field
+# is translated to jammi's canonical spelling (B1 audit finding on PR #372;
+# see `run()`'s own comment at that field).
+_DTYPE_FLAG_TO_JAMMI_SPELLING = {
+    "fp32": "f32",
+    "bf16": "bf16",
+}
+
+
+def translate_dtype_flag_to_jammi_spelling(dtype_flag: str) -> str:
+    """`--dtype`'s own spelling -> jammi's canonical `backbone_dtype`
+    spelling. Raises on an unrecognized flag rather than passing an
+    un-translated value through silently -- this script's `--dtype` choices
+    are a closed set (`argparse`'s own `choices=` already enforces that at
+    parse time), so an unrecognized value here means this map itself has
+    drifted out of sync with `parse_args`, not a caller error.
+    """
+    try:
+        return _DTYPE_FLAG_TO_JAMMI_SPELLING[dtype_flag]
+    except KeyError:
+        raise ValueError(
+            f"translate_dtype_flag_to_jammi_spelling: unrecognized --dtype {dtype_flag!r} -- "
+            f"this script's own --dtype choices are {sorted(_DTYPE_FLAG_TO_JAMMI_SPELLING)}, this "
+            "map has drifted out of sync with parse_args' choices=."
+        ) from None
 
 
 def load_lora_weights_into_model(model, path: str) -> int:
@@ -281,19 +331,50 @@ def run(args) -> dict:
     import torch
 
     tfs.pin_fast_path_globals()
+    # Seed BEFORE any model/adapter/checkpoint construction -- including the
+    # --dry-run donor checkpoint below -- mirrors torch_finetune_step.py's
+    # own `run()` ordering (see that function's comment for why: peft's
+    # default LoRA init draws from torch's global generator at
+    # `get_peft_model` time, so the generator must already be seeded when
+    # that call happens).
     torch.manual_seed(args.seed)
-    device = tfs.pick_device(args.cuda)
+    device = tfs.pick_device(None if args.dry_run else args.cuda)
 
-    class ModelArgs:
-        pass
+    dry_run_tmp = tempfile.TemporaryDirectory() if args.dry_run else contextlib.nullcontext()
+    with dry_run_tmp as tmp_dir:
+        if args.dry_run:
+            # Mirrors torch_finetune_step.py's --dry-run: hardcode small,
+            # always-valid batch/seq knobs (the donor checkpoint's own
+            # vocab/hidden size) so the smoke test never depends on a real
+            # checkpoint; --dtype/--attn/--lora-rank/--lora-alpha/
+            # --target-modules/--batched-forward are left as the caller
+            # requested, exercising the SAME load_model/wrap_lora code the
+            # real GPU path uses -- never a separate, untested dry-run-only
+            # code path.
+            args = argparse.Namespace(**vars(args))
+            args.batch = tfs.DRY_RUN_BATCH
+            args.seq = tfs.DRY_RUN_SEQ
+            args.model_dir = tfs.build_dry_run_checkpoint(tmp_dir)
 
-    model_args = ModelArgs()
-    model_args.model_dir = args.model_dir
-    model_args.dtype = args.dtype
-    model_args.attn = args.attn
-    model, config = tfs.load_model(model_args)
+        model_args = _ModelArgs()
+        model_args.model_dir = args.model_dir
+        model_args.dtype = args.dtype
+        model_args.attn = args.attn
+        model, config = tfs.load_model(model_args)
+        return _run_with_model(args, model, config, device)
 
-    lora_args = ModelArgs()
+
+def _run_with_model(args, model, config, device) -> dict:
+    """The part of `run()` that is IDENTICAL whether `model`/`config` came
+    from a real `--model-dir` or a `--dry-run` donor checkpoint — split out
+    so `--dry-run`'s `tempfile.TemporaryDirectory()` context (which must
+    stay open only long enough for `load_model` to read the checkpoint off
+    disk, not for the rest of the forward+backward) does not have to wrap
+    this entire function body.
+    """
+    import torch
+
+    lora_args = _ModelArgs()
     lora_args.lora_rank = args.lora_rank
     lora_args.lora_alpha = args.lora_alpha
     # Forced 0.0, unconditionally -- mirrors grad_oracle.rs's own forced
@@ -366,9 +447,28 @@ def run(args) -> dict:
 
     return {
         "tool": "torch_grad_oracle",
-        "model_dir": str(args.model_dir),
+        # `None` under --dry-run, mirroring torch_finetune_step.py's own
+        # convention: the donor checkpoint lives in a `TemporaryDirectory`
+        # that is deleted the moment `run()` returns, so reporting its path
+        # here would name a directory that no longer exists by the time
+        # anything reads this report.
+        "model_dir": None if args.dry_run else str(args.model_dir),
+        "dry_run": args.dry_run,
         "device": str(device),
-        "backbone_dtype": args.dtype,
+        # B1 audit finding on PR #372: emit jammi's OWN canonical spelling
+        # (`f32`/`bf16`, never `fp32`) here -- `--dtype` itself keeps torch's
+        # bare CLI-flag spelling (`fp32`, matching `torch_finetune_step.py`'s
+        # own `--dtype` convention this script's flags otherwise mirror; see
+        # this module's usage docstring), but the WRITTEN report is what
+        # `compare_grad_oracle.py`'s run-identity check actually reads, and
+        # that check's premise is IDENTICAL configuration on both sides --
+        # jammi's own producer (`grad_oracle.rs`) has emitted `f32`/`f16`/
+        # `bf16` since day one (`main.rs`'s `--backbone-dtype` choices), so
+        # this is the side that was wrong, not the comparator (see
+        # `compare_grad_oracle.py`'s `normalize_backbone_dtype`, kept as a
+        # legacy-spelling fallback for any OLDER dump still carrying `fp32`
+        # here, not as a substitute for fixing the spelling at the source).
+        "backbone_dtype": translate_dtype_flag_to_jammi_spelling(args.dtype),
         "batch": args.batch,
         "seq": args.seq,
         "lora_rank": args.lora_rank,
@@ -388,7 +488,7 @@ def run(args) -> dict:
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--model-dir", type=str, required=True)
+    p.add_argument("--model-dir", type=str, default=None, help="Required unless --dry-run.")
     p.add_argument("--batch", type=int, default=8)
     p.add_argument("--seq", type=int, default=128)
     p.add_argument("--lora-rank", type=int, default=16)
@@ -401,8 +501,22 @@ def parse_args(argv=None):
     p.add_argument("--batched-forward", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--lora-weights-in", type=str, default=None)
     p.add_argument("--lora-weights-out", type=str, default=None)
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help=(
+            "CPU smoke test against a tiny random-init 2-layer ModernBERT built on the fly "
+            "(tfs.build_dry_run_checkpoint) instead of --model-dir -- exercises the REAL "
+            "load_model/wrap_lora/forward/backward/name-translation code path, just at a "
+            "small, always-valid shape. See crates/jammi-bench/reference/README.md."
+        ),
+    )
     p.add_argument("--out", type=str, required=True)
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if not args.dry_run and not args.model_dir:
+        p.error("--model-dir is required unless --dry-run")
+    return args
 
 
 def main(argv=None):

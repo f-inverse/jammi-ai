@@ -230,6 +230,22 @@ def _max_abs(a):
     return max((abs(x) for x in a), default=0.0)
 
 
+def _has_nonfinite(a) -> bool:
+    """`True` iff ANY element of `a` is `NaN`/`+-inf`. Checked EXPLICITLY,
+    never inferred from a downstream comparison happening to reject a NaN
+    "by accident" (family F non-vacuous control: `NaN >= floor` is `False`
+    in IEEE-754 ordering, so a bare `cosine >= floor` check WOULD reject a
+    NaN-poisoned tensor too -- but only as a side effect of float ordering,
+    and only for THAT one comparison; a `max_abs_delta`/`max_abs_delta_over_max_signal`
+    reader has no equivalent accidental protection, e.g. `max(nan, 3.0)` is
+    `nan` in Python -- silently NaN-poisoning that field too without this
+    explicit flag naming the cause).
+    """
+    if HAVE_NUMPY:
+        return bool(np.any(~np.isfinite(np.asarray(a, dtype=np.float64)))) if len(a) else False
+    return any(not math.isfinite(x) for x in a)
+
+
 # NORM_FLOOR mirrors `pooling.rs::norm_floor`'s fp32/bf16 arm (`1e-12`) --
 # same reasoning: a genuinely all-zero gradient vector (e.g. `lora_a`'s
 # gradient at a fresh `LoraInitMode::ZerosB` init, which IS mathematically
@@ -238,6 +254,11 @@ def _max_abs(a):
 # direction, never a `NaN`/`Inf` that a naive `x > floor` control would
 # silently pass through -- family F's non-vacuous-control invariant).
 NORM_FLOOR = 1e-12
+
+# How many of the worst-scoring matched tensors `main()` prints directly to
+# the log (never only into `--out`'s JSON -- see `compare_reports`'s own doc
+# for the B2 finding this closes).
+WORST_TENSORS_TO_PRINT = 5
 
 
 def cosine_similarity(a, b) -> float:
@@ -272,6 +293,67 @@ def is_vacuous_pair(a, b) -> bool:
     return _norm(a) < NORM_FLOOR and _norm(b) < NORM_FLOOR
 
 
+def is_one_sided_zero_pair(a, b) -> bool:
+    """`True` iff EXACTLY ONE of `a`/`b` is (numerically) the zero vector --
+    the critical NEGATIVE case `is_vacuous_pair`'s own doc names but does
+    not itself classify: a real divergence where one stack's gradient
+    collapsed to zero and the other's did not (a dead backward path on one
+    side, a silently-skipped tensor, an all-zero LoRA update that should
+    have been nonzero) is the OPPOSITE conclusion from "neither side has a
+    signal here at all" and must never be swept into the vacuous bucket
+    (which `compare_reports` treats as carrying no evidence either way) --
+    see `tensor_clears_floor`'s own doc for why this is a hard, unconditional
+    FAIL, never gated by `cosine_floor` at all (B2 audit finding on PR #372:
+    a naive `cosine_similarity`-only gate reads a one-sided-zero pair as
+    cosine `0.0`, the SAME number an orthogonal-but-nonzero pair produces,
+    and the SAME number `is_vacuous_pair`'s own both-zero case produces --
+    three structurally different situations collapsing to one indistinguishable
+    float without this explicit classification).
+    """
+    return (_norm(a) < NORM_FLOOR) != (_norm(b) < NORM_FLOOR)
+
+
+def tensor_clears_floor(stats: dict, cosine_floor: float) -> bool:
+    """The PER-TENSOR gate B2 (audit finding on PR #372) requires: applied
+    to EVERY matched tensor individually, never only to the overall
+    concatenated cosine. Lattice (see `test_compare_grad_oracle.py`'s
+    `PerTensorGatingLattice` for one test per cell):
+
+    | grad_a  | grad_b  | classification    | gate result        |
+    |---------|---------|--------------------|---------------------|
+    | zero    | zero    | vacuous            | PASS (no evidence) |
+    | zero    | nonzero | one-sided zero     | FAIL (always)      |
+    | nonzero | zero    | one-sided zero     | FAIL (always)      |
+    | NaN/inf | finite  | has_nonfinite      | FAIL (always)      |
+    | finite  | NaN/inf | has_nonfinite      | FAIL (always)      |
+    | nonzero | nonzero | real signal        | cosine >= floor    |
+
+    Checked in this order deliberately: `has_nonfinite` is checked BEFORE
+    `vacuous`/`one_sided_zero` so a NaN-poisoned tensor that also happens to
+    have a near-zero norm (NaN does not reliably compare `< NORM_FLOOR`
+    either way) cannot be misrouted into the vacuous "carries no evidence,
+    always passes" bucket.
+
+    THE REPRODUCTION this closes: measured on a real run, jammi can zero 55
+    of 112 `lora_b` tensors (real ADAPTER OUTPUT tensors, never expected to
+    be vacuous under this oracle's own "single fresh-init call tests ONLY
+    dL/dB" structural note — see `grad_oracle.rs`'s module doc) and the OLD
+    `overall_cosine_similarity`-only gate still PASSED at floor `0.7`
+    (overall `0.994`, diluted by the other 57 agreeing tensors in one huge
+    concatenated vector) — a real defect on more than a third of the
+    adapter's OWN gradients, invisible to the aggregate statistic. This
+    function's per-tensor application (wired into `compare_reports` below)
+    means even ONE such zeroed tensor now fails the WHOLE comparison.
+    """
+    if stats["has_nonfinite"]:
+        return False
+    if stats["vacuous"]:
+        return True
+    if stats["one_sided_zero"]:
+        return False
+    return stats["cosine_similarity"] >= cosine_floor
+
+
 def compare_tensor(name, grad_a, grad_b):
     if len(grad_a) != len(grad_b):
         raise ValueError(f"{name}: length mismatch ({len(grad_a)} vs {len(grad_b)})")
@@ -282,6 +364,8 @@ def compare_tensor(name, grad_a, grad_b):
         "max_abs_delta_over_max_signal": (max_delta / max_signal) if max_signal > NORM_FLOOR else None,
         "cosine_similarity": cosine_similarity(grad_a, grad_b),
         "vacuous": is_vacuous_pair(grad_a, grad_b),
+        "one_sided_zero": is_one_sided_zero_pair(grad_a, grad_b),
+        "has_nonfinite": _has_nonfinite(grad_a) or _has_nonfinite(grad_b),
         "n": len(grad_a),
     }
 
@@ -306,29 +390,123 @@ RUN_IDENTITY_FIELDS = (
     "backbone_dtype",
 )
 
+# B1 audit finding on PR #372: jammi's OWN CLI/interchange vocabulary
+# (`crates/jammi-bench/src/main.rs`'s `--backbone-dtype` choices,
+# `grad_oracle.rs`'s `format!("{:?}", ComputePrecision::F32).to_lowercase()`)
+# is `f32`/`f16`/`bf16` -- picked as the CANONICAL spelling this comparator
+# normalizes to, since it is already the spelling used across every jammi
+# entry point AND the weight-interchange file's own naming convention (see
+# `grad_oracle.rs`'s module doc's "Weight interchange format" section),
+# never invented fresh for this comparator. `torch_grad_oracle.py`'s `run()`
+# now emits `f32`/`bf16` directly to match (this fix's own change to that
+# script), so this map exists for LEGACY dumps only -- an older
+# `torch_grad_oracle.py` binary, or any external producer, that still
+# carries torch's bare CLI-flag spelling `fp32`. Applied ONLY to
+# `backbone_dtype` (never to any other `RUN_IDENTITY_FIELDS` entry): every
+# jammi-f32-vs-torch-f32 comparison — including this oracle's own
+# near-perfect control (0.9999998, see this module's own doc) — was
+# UNRUNNABLE before this map existed, refused on a spurious SPELLING
+# mismatch (`"f32" != "fp32"`) despite both sides having run at the
+# identical, actual precision.
+_LEGACY_BACKBONE_DTYPE_SPELLINGS = {
+    "fp32": "f32",
+}
+
+
+def normalize_backbone_dtype(value):
+    """Map a legacy `backbone_dtype` spelling to jammi's canonical one;
+    anything not a recognized legacy spelling (including an already-
+    canonical value, or a non-string/`None`) passes through UNCHANGED --
+    this function only ever narrows two spellings of the SAME precision
+    together, never widens what counts as a match.
+    """
+    if not isinstance(value, str):
+        return value
+    return _LEGACY_BACKBONE_DTYPE_SPELLINGS.get(value, value)
+
 # How tightly a `weight` array recorded by the two INDEPENDENT producers
 # (jammi's `grad_oracle.rs`, torch's `torch_grad_oracle.py`) must agree to
-# count as "the identical weight file". Both producers read the SAME
-# safetensors file and re-serialize its values through JSON at f32/f64
-# precision, so a genuine same-file load should agree far tighter than
-# this — this bound is deliberately loose relative to that (not a fitted
-# noise floor) so it never false-trips on JSON round-trip precision, while
-# staying many orders of magnitude below a real content mismatch (the
-# reproduction that motivated this check compared `weight = [0, 0, 0, 0]`
-# against `[9, 9, 9, 9]`).
-WEIGHT_MATCH_ATOL = 1e-4
+# count as "the identical weight file". Advisory (ii), round-2 audit fix on
+# PR #372: this WAS a fixed `1e-4` absolute tolerance -- loose enough to
+# ALSO pass a real content mismatch far smaller than the reproduction that
+# motivated the check in the first place (`weight = [0, 0, 0, 0]` vs
+# `[9, 9, 9, 9]`, a delta of `9.0`, six orders of magnitude above even the
+# OLD bound; the bound was never actually TESTED against a smaller, more
+# realistic corruption). The comparator's own premise here is an EXACT
+# interchange: both producers load the SAME safetensors file (same f32
+# bits) and re-serialize through JSON at f32/f64 precision, so any observed
+# difference is JSON decimal<->binary round-trip noise ONLY, bounded by f32
+# machine epsilon relative to each element's own magnitude -- an ABSOLUTE
+# constant has no principled connection to that mechanism at all. LEAD
+# measured `max|w_jammi - w_torch| = 1.86e-9` over 224 tensors on a real
+# A100 run (`torch_grad_oracle.py`'s own PROVENANCE banner) -- five to six
+# orders of magnitude inside `WEIGHT_MATCH_ULPS` * f32-eps at those
+# elements' magnitudes, so this tighter, mechanism-derived bound does not
+# regress that measurement.
+F32_EPSILON = 2.0**-23  # IEEE-754 binary32 machine epsilon (2^-23)
+# Safety factor widening the single-f32-ULP bound for JSON's OWN
+# decimal<->binary round-trip (both producers serialize through
+# `serde_json`/Python's `json` module, neither of which is obligated to
+# round-trip a float64-parsed-from-decimal value to the EXACT same f32 bits
+# in fewer than a handful of ULPs) -- not a fitted margin against any
+# specific observed number.
+WEIGHT_MATCH_ULPS = 8.0
+
+
+def _weight_element_tolerance(a: float, b: float) -> float:
+    """ULP-relative absolute tolerance for ONE element of a per-tensor
+    `weight` comparison — ties the bound to what an EXACT bit-identical
+    interchange can actually produce (see `WEIGHT_MATCH_ULPS`'s own doc),
+    scaled by the LARGER of the two recorded magnitudes so a small-magnitude
+    element does not inherit a large-magnitude element's tolerance. Floored
+    at `1.0` before scaling (not at `0.0`) so a genuinely zero-valued
+    element still gets a small, non-vacuous absolute tolerance (`WEIGHT_MATCH_ULPS
+    * F32_EPSILON`) rather than a `0.0` tolerance that would reject even a
+    single f32 rounding ULP of JSON round-trip noise on an element that is
+    supposed to be exactly zero.
+    """
+    scale = max(abs(a), abs(b), 1.0)
+    return WEIGHT_MATCH_ULPS * scale * F32_EPSILON
+
+
+def _weight_max_violation(wa, wb):
+    """`(count_of_elements_outside_tolerance, max_abs_delta)` over one
+    tensor's `weight` arrays — numpy-vectorized when available, a plain
+    Python loop otherwise (mirrors this module's numpy-first/pure-Python-
+    fallback convention throughout).
+    """
+    if HAVE_NUMPY:
+        a = np.asarray(wa, dtype=np.float64)
+        b = np.asarray(wb, dtype=np.float64)
+        scale = np.maximum(np.maximum(np.abs(a), np.abs(b)), 1.0)
+        tol = WEIGHT_MATCH_ULPS * scale * F32_EPSILON
+        delta = np.abs(a - b)
+        bad = int(np.count_nonzero(delta > tol))
+        max_delta = float(np.max(delta)) if len(a) else 0.0
+        return bad, max_delta
+    bad = 0
+    max_delta = 0.0
+    for x, y in zip(wa, wb):
+        d = abs(x - y)
+        max_delta = max(max_delta, d)
+        if d > _weight_element_tolerance(x, y):
+            bad += 1
+    return bad, max_delta
 
 
 def _weight_mismatches(report_a, report_b, matched_names):
-    """Per-tensor `weight` agreement over the tensors matched by name.
+    """Per-tensor `weight` agreement over the tensors matched by name, at
+    the ULP-relative tolerance `_weight_element_tolerance`/`_weight_max_violation`
+    derive (never a fixed absolute constant — see `WEIGHT_MATCH_ULPS`'s own
+    doc for why).
 
     This is the check the comparator's own premise (module docstring line
-    6, "IDENTICAL LoRA weights") depends on and, before this fix, never
-    ran: both `grad_oracle.rs` and `torch_grad_oracle.py` dump the exact
-    weight value the forward actually used specifically so a comparator
-    can verify this — reading only `grad` and ignoring `weight` compares
-    gradients that may have been taken at DIFFERENT weights and calls that
-    a pass.
+    6, "IDENTICAL LoRA weights") depends on and, before F3's original fix,
+    never ran at all: both `grad_oracle.rs` and `torch_grad_oracle.py` dump
+    the exact weight value the forward actually used specifically so a
+    comparator can verify this — reading only `grad` and ignoring `weight`
+    compares gradients that may have been taken at DIFFERENT weights and
+    calls that a pass.
     """
     mismatches = []
     for name in matched_names:
@@ -342,11 +520,12 @@ def _weight_mismatches(report_a, report_b, matched_names):
         if len(wa) != len(wb):
             mismatches.append(f"{name}: weight length mismatch ({len(wa)} vs {len(wb)})")
             continue
-        delta = _max_abs_delta(wa, wb)
-        if delta > WEIGHT_MATCH_ATOL:
+        bad_count, max_delta = _weight_max_violation(wa, wb)
+        if bad_count > 0:
             mismatches.append(
-                f"{name}: weight mismatch, max|delta|={delta} (> {WEIGHT_MATCH_ATOL}) -- the two "
-                "dumps were NOT produced from identical LoRA weights"
+                f"{name}: weight mismatch, {bad_count} of {len(wa)} element(s) exceed the "
+                f"{WEIGHT_MATCH_ULPS}-ULP f32-relative tolerance (max|delta|={max_delta}) -- the "
+                "two dumps were NOT produced from identical LoRA weights"
             )
     return mismatches
 
@@ -376,6 +555,13 @@ def _premise_violations(report_a, report_b):
     for field in RUN_IDENTITY_FIELDS:
         va = report_a.get(field)
         vb = report_b.get(field)
+        # B1 fix: `backbone_dtype` is compared through the legacy-spelling
+        # normalizer (see `normalize_backbone_dtype`'s own doc) — every
+        # OTHER run-identity field is compared as-is; a genuine spelling
+        # mismatch on any of those (e.g. `seed` differing) is never a
+        # "just normalize it" situation.
+        if field == "backbone_dtype":
+            va, vb = normalize_backbone_dtype(va), normalize_backbone_dtype(vb)
         if va != vb:
             violations.append(f"run-identity field {field!r} differs: A={va!r} B={vb!r}")
 
@@ -403,12 +589,22 @@ def compare_reports(report_a, report_b, cosine_floor):
     concatenated into one vector) gradient-direction statistics.
 
     `passed` requires ALL of: no name-set mismatch, at least one matched
-    tensor, no premise violation, no weight mismatch, and the overall
-    cosine similarity at or above `cosine_floor`. A premise violation or a
-    weight mismatch forces `passed = False` regardless of how well the
-    gradients happen to agree -- agreement computed at the WRONG premise
-    (different weights, different batch, different config) proves nothing
-    about the two stacks' arithmetic.
+    tensor, no premise violation, no weight mismatch, the overall cosine
+    similarity at or above `cosine_floor`, AND — B2's fix (audit finding on
+    PR #372) — EVERY individually matched tensor clears
+    `tensor_clears_floor` (see that function's own doc for the full
+    lattice). The overall-cosine check alone is NOT sufficient: it is kept
+    (never removed) because it also catches a systematic small-magnitude
+    drift spread evenly across every tensor, which a per-tensor gate at the
+    SAME floor could in principle miss if `cosine_floor` were set loose
+    relative to that drift -- but the overall check on its own is the exact
+    mechanism the audit's reproduction exploited (55 of 112 zeroed `lora_b`
+    tensors, diluted to `overall = 0.994` by the other 57 agreeing ones,
+    passing a `0.7` floor) — the per-tensor gate is what makes THAT specific
+    reproduction fail. A premise violation or a weight mismatch forces
+    `passed = False` regardless of how well the gradients happen to agree
+    -- agreement computed at the WRONG premise (different weights, different
+    batch, different config) proves nothing about the two stacks' arithmetic.
 
     VACUOUS TENSORS (confirmed live on a real A100 run: at a fresh
     `LoraInitMode::ZerosB` init, every `lora_a` tensor's gradient is
@@ -445,6 +641,12 @@ def compare_reports(report_a, report_b, cosine_floor):
         all_b.extend(gb)
 
     vacuous_tensor_names = sorted(name for name in matched if per_tensor[name]["vacuous"])
+    # B2 fix: per-tensor gate, applied to EVERY matched tensor individually
+    # (see `tensor_clears_floor`'s own doc for the lattice) -- never only to
+    # the overall concatenated statistic below.
+    failing_tensor_names = sorted(
+        name for name in matched if not tensor_clears_floor(per_tensor[name], cosine_floor)
+    )
 
     overall_cosine = cosine_similarity(all_a, all_b) if all_a else None
     weight_mismatches = _weight_mismatches(report_a, report_b, matched)
@@ -458,7 +660,30 @@ def compare_reports(report_a, report_b, cosine_floor):
         and overall_cosine >= cosine_floor
         and not weight_mismatches
         and not premise_violations
+        and not failing_tensor_names
     )
+
+    # `main()` prints these (WORST_TENSORS_TO_PRINT of them) directly to the
+    # CI log, not only into `--out`'s JSON -- B2's finding that `--out` was
+    # the ONLY place per-tensor results appeared, so a reader of the log
+    # alone (the common case: nobody opens the JSON artifact unless
+    # something already looked wrong) never saw the per-tensor breakdown at
+    # all. Sort key: non-finite first (worst — an arithmetic-broken tensor),
+    # then one-sided-zero (a real divergence with no salvageable direction),
+    # then real-signal tensors by ascending cosine (worst agreement first);
+    # vacuous tensors sort LAST (category 3) -- they carry no evidence
+    # either way, so they are the least informative entries to show first.
+    def _badness_key(name):
+        s = per_tensor[name]
+        if s["has_nonfinite"]:
+            return (0, 0.0, name)
+        if s["one_sided_zero"]:
+            return (1, 0.0, name)
+        if s["vacuous"]:
+            return (3, 0.0, name)
+        return (2, s["cosine_similarity"], name)
+
+    worst_tensor_names = sorted(matched, key=_badness_key)[:WORST_TENSORS_TO_PRINT]
 
     loss_a = report_a.get("loss")
     loss_b = report_b.get("loss")
@@ -487,6 +712,8 @@ def compare_reports(report_a, report_b, cosine_floor):
         "matched_tensor_count": len(matched),
         "vacuous_tensor_count": len(vacuous_tensor_names),
         "vacuous_tensor_names": vacuous_tensor_names,
+        "failing_tensor_names": failing_tensor_names,
+        "worst_tensor_names": worst_tensor_names,
         "cosine_floor": cosine_floor,
         "overall_cosine_similarity": overall_cosine,
         "per_tensor": per_tensor,
@@ -507,6 +734,114 @@ EXIT_PASS = 0
 EXIT_FAIL = 1
 EXIT_REFUSED = 2
 
+# EMPIRICAL cosine-similarity band this module's own `derive_cosine_floor`
+# doc points an operator at instead of the derived worst-case bound.
+# LEAD-REPORTED, NO COMMITTED ARTIFACT (execution-provenance principle: this
+# module's own local test suite has no GPU and does not reproduce these
+# numbers -- see `torch_grad_oracle.py`'s PROVENANCE banner and
+# `README.md`'s matching disclosure). Two INDEPENDENT lead reports exist for
+# the bf16-vs-f32 row specifically: PR #372's first audit-fix round reported
+# `0.924` (still cited verbatim in `derive_cosine_floor`'s own docstring and
+# in `torch_grad_oracle.py`/`README.md`'s PROVENANCE prose, none of which
+# this fix silently edits -- an unverified number is not something this
+# round can "correct" without a GPU to re-measure it); the round-2 dispatch
+# that added this printed band reported `0.932` for the SAME comparison,
+# same pod, same day (2026-08-25). Both are stated here, neither is asserted
+# to be more correct than the other -- this constant carries the ROUND-2
+# figure (the one this feature's own dispatch specified), and the
+# discrepancy itself is the honest disclosure, not a resolved fact. Treat
+# BOTH figures as "lead-reported, no committed artifact" until a real run
+# lands a committed artifact this repo's own CI can re-derive.
+EMPIRICAL_COSINE_BAND = {
+    "torch_eager_vs_torch_sdpa": 0.825,
+    "torch_bf16_vs_torch_f32": 0.932,
+    "jammi_f32_vs_torch_f32": 0.9999998,
+    "real_defect_low": 0.30,
+    "real_defect_high": 0.53,
+}
+
+
+def format_empirical_band(cosine_floor: float) -> str:
+    """One line naming where `cosine_floor` sits relative to
+    `EMPIRICAL_COSINE_BAND` -- printed by `main()` next to every chosen
+    floor (refused, failed, or passed) so an operator can see at a glance
+    whether the floor they are using sits inside the measured noise band,
+    inside the measured defect band, above the near-perfect f32-vs-f32
+    row, or in the (uninformative, mislabeled-in-between) gap the derived
+    worst-case bound tends to land in. Purely descriptive -- never gates
+    anything itself.
+    """
+    b = EMPIRICAL_COSINE_BAND
+    if cosine_floor > b["jammi_f32_vs_torch_f32"]:
+        where = "ABOVE the measured near-perfect jammi-f32-vs-torch-f32 row -- stricter than any measured same-arithmetic pair has ever cleared"
+    elif cosine_floor >= b["torch_bf16_vs_torch_f32"]:
+        where = "inside the measured bf16-noise-to-near-perfect band -- a real bf16 run should clear this"
+    elif cosine_floor >= b["torch_eager_vs_torch_sdpa"]:
+        where = "inside the measured eager-vs-sdpa-to-bf16-noise band -- typical of real cross-kernel/cross-dtype rounding noise"
+    elif cosine_floor > b["real_defect_high"]:
+        where = "in the GAP between the measured noise band and the measured defect band -- neither anchor directly supports this floor"
+    elif cosine_floor >= b["real_defect_low"]:
+        where = "inside the measured REAL-DEFECT band -- a floor this low would PASS a real arithmetic defect on the anchor run"
+    else:
+        where = "BELOW the measured real-defect band -- even a confirmed defect scored higher than this"
+    return (
+        f"empirical band (LEAD-REPORTED, NO COMMITTED ARTIFACT, A100 2026-08-25): "
+        f"torch-eager-vs-sdpa={b['torch_eager_vs_torch_sdpa']} "
+        f"torch-bf16-vs-f32={b['torch_bf16_vs_torch_f32']} "
+        f"jammi-f32-vs-torch-f32={b['jammi_f32_vs_torch_f32']} "
+        f"real-defect={b['real_defect_low']}-{b['real_defect_high']} "
+        f"-- chosen floor {cosine_floor} is {where}"
+    )
+
+
+def floor_domain_violation(cosine_floor: float) -> str | None:
+    """`None` if `cosine_floor` is inside this comparator's actual VALID
+    domain, `(0.0, 1.0]` -- a reason string otherwise. This is the guard's
+    real operator boundary (family: a guard belongs at the operator's own
+    valid-input boundary, not at whatever single value a reproduction
+    happened to use):
+
+    - Cosine similarity is mathematically defined on `[-1.0, 1.0]`; a floor
+      at or below `0.0` cannot discriminate ordinary bf16 rounding noise
+      from a real, directional arithmetic defect (a 90-degree-or-worse
+      rotation itself scores `<= 0.0` and would clear such a floor) -- this
+      is the F2 boundary the previous round already refused.
+    - A floor ABOVE `1.0` is symmetrically uninformative in the OTHER
+      direction: cosine similarity cannot exceed `1.0` (Cauchy-Schwarz), so
+      NOTHING could ever clear it -- every comparison would silently FAIL
+      regardless of how well the gradients agree, which is exactly as
+      useless as the "always passes" failure mode at the low end, just
+      inverted. `--cosine-floor 1.5` slipped through the OLD `<= 0.0`-only
+      check (B3 audit finding on PR #372).
+    - `NaN`/`+-inf` are refused via `math.isfinite`, never via a bare `<=`/
+      `>` comparison: `nan <= 0.0` and `nan > 1.0` are BOTH `False` in
+      IEEE-754 float ordering (the exact non-vacuous-control trap family F
+      warns about -- a naive `if floor <= 0.0 or floor > 1.0:` check would
+      let `--cosine-floor nan` sail through un-refused, printing a
+      "PASS"/"FAIL" the caller could not trust). `math.isfinite` is checked
+      FIRST, before either ordering comparison, so this never depends on
+      which direction IEEE-754 happens to route a NaN comparison.
+    """
+    if not math.isfinite(cosine_floor):
+        return (
+            f"{cosine_floor} is not finite (NaN/+-inf) -- a non-finite floor cannot be compared "
+            "against a real cosine similarity at all; `nan <= 0.0`/`nan > 1.0` are BOTH False in "
+            "IEEE-754 ordering, so a naive range check would silently let this through"
+        )
+    if cosine_floor <= 0.0:
+        return (
+            f"{cosine_floor} <= 0.0 -- a non-positive floor cannot distinguish ordinary bf16 "
+            "rounding noise from a real arithmetic defect (see derive_cosine_floor's own doc: a "
+            "90-degree-or-worse rotation itself scores <= 0.0 and would clear this floor)"
+        )
+    if cosine_floor > 1.0:
+        return (
+            f"{cosine_floor} > 1.0 -- cosine similarity cannot exceed 1.0 (Cauchy-Schwarz), so "
+            "NOTHING could ever clear this floor; every comparison would silently FAIL regardless "
+            "of how well the gradients actually agree"
+        )
+    return None
+
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -524,33 +859,46 @@ def main(argv=None):
         else derive_cosine_floor(args.num_layers, args.hidden_size)
     )
 
-    # REFUSE before even opening the report files: a floor `<= 0` cannot
-    # discriminate a real arithmetic defect (which can itself read as
-    # cosine `<= 0`, e.g. a 90-degree-or-worse rotation) from noise, so
-    # attempting the comparison at all would be theater regardless of what
-    # the two dumps contain. This enforces `derive_cosine_floor`'s own doc
-    # ("A caller whose derived floor comes out at or below 0.0 should ...
-    # prefer a NAMED, empirically-set floor instead") and closes the
-    # reproduction where ModernBERT-large's OWN default `--num-layers
-    # 28 --hidden-size 1024` derives a floor of ~-0.402 and two EXACTLY
-    # ORTHOGONAL gradient vectors (cosine 0.0) print `PASS`.
+    # Always printed, REGARDLESS of whether the floor below is about to be
+    # refused, so an operator can see where their chosen floor sits relative
+    # to the measured band even on a REFUSED exit (arguably most useful
+    # there: it names what a SANE floor would look like instead of just
+    # saying "no").
+    print(format_empirical_band(cosine_floor))
+
+    # REFUSE before even opening the report files: a floor outside this
+    # comparator's actual valid domain `(0.0, 1.0]` cannot discriminate a
+    # real arithmetic defect from noise in EITHER direction (see
+    # `floor_domain_violation`'s own doc for the full lattice: non-finite,
+    # `<= 0.0`, AND `> 1.0` all refuse now — B3 audit finding on PR #372:
+    # the previous round's `cosine_floor <= 0.0` check alone let
+    # `--cosine-floor nan` and `--cosine-floor 1.5` both slip through
+    # un-refused), so attempting the comparison at all would be theater
+    # regardless of what the two dumps contain. This enforces
+    # `derive_cosine_floor`'s own doc ("A caller whose derived floor comes
+    # out at or below 0.0 should ... prefer a NAMED, empirically-set floor
+    # instead") and closes the reproduction where ModernBERT-large's OWN
+    # default `--num-layers 28 --hidden-size 1024` derives a floor of
+    # ~-0.402 and two EXACTLY ORTHOGONAL gradient vectors (cosine 0.0)
+    # print `PASS`.
     #
-    # This also refuses an EXPLICIT `--cosine-floor` at or below `0.0`:
+    # This also refuses an EXPLICIT `--cosine-floor` outside the domain:
     # such a floor is uninformative regardless of where it came from (see
     # this module's docstring), and silently accepting one would just move
-    # the same vacuous-pass hazard from the derived path to the explicit
-    # one.
-    if cosine_floor <= 0.0:
+    # the same vacuous-pass (or vacuous-always-fail, at the high end)
+    # hazard from the derived path to the explicit one.
+    violation = floor_domain_violation(cosine_floor)
+    if violation is not None:
         source = "an explicit --cosine-floor" if args.cosine_floor is not None else (
             f"the DERIVED floor at --num-layers {args.num_layers} --hidden-size {args.hidden_size}"
         )
         print(
-            f"REFUSED: cosine_floor = {cosine_floor} (<= 0.0), from {source}. A non-positive "
-            "cosine floor cannot distinguish ordinary bf16 rounding noise from a real arithmetic "
-            "defect (a 90-degree-or-worse rotation can itself score <= 0.0) -- this comparator "
-            "will not run a comparison that cannot fail. Pass an explicit --cosine-floor > 0.0 "
-            "(see derive_cosine_floor's docstring), or scope --num-layers/--hidden-size to the "
-            "specific tensor(s) actually being checked rather than the whole-model default.",
+            f"REFUSED: cosine_floor = {cosine_floor}, from {source}, is OUTSIDE the valid domain "
+            f"(0.0, 1.0]: {violation}. This comparator will not run a comparison that cannot "
+            "meaningfully fail. Pass an explicit --cosine-floor inside (0.0, 1.0] (see "
+            "derive_cosine_floor's docstring and the empirical band printed above), or scope "
+            "--num-layers/--hidden-size to the specific tensor(s) actually being checked rather "
+            "than the whole-model default.",
             file=sys.stderr,
         )
         return EXIT_REFUSED
@@ -574,6 +922,13 @@ def main(argv=None):
         "(both sides exactly zero -- e.g. lora_a at a fresh ZerosB init; carries "
         "NO evidence about agreement either way; see is_vacuous_pair's doc)"
     )
+    print(
+        f"failing_tensor_count: {len(result['failing_tensor_names'])} "
+        "(per-tensor gate: has_nonfinite, one_sided_zero, or cosine < floor -- see "
+        "tensor_clears_floor's doc; ANY of these fails the whole comparison, B2 fix)"
+    )
+    if result["failing_tensor_names"]:
+        print(f"failing_tensor_names: {result['failing_tensor_names']}", file=sys.stderr)
     print(f"loss_a: {result['loss_a']}  loss_b: {result['loss_b']}  loss_relative_diff: {result['loss_relative_diff']}")
     if result["only_in_a"]:
         print(f"only_in_a: {result['only_in_a']}", file=sys.stderr)
@@ -583,6 +938,26 @@ def main(argv=None):
         print(f"PREMISE VIOLATION: {msg}", file=sys.stderr)
     for msg in result["weight_mismatches"]:
         print(f"WEIGHT MISMATCH: {msg}", file=sys.stderr)
+    # Worst-N tensors, printed directly to the log -- B2's finding that
+    # `--out`'s JSON was the ONLY place a per-tensor breakdown ever
+    # appeared, so a reader of CI's own log (never opening the JSON
+    # artifact unless something already looked suspicious) had no visibility
+    # into which specific tensor(s) were dragging an aggregate statistic
+    # down, or failing outright under the new per-tensor gate.
+    print(f"worst {len(result['worst_tensor_names'])} tensor(s) (of {result['matched_tensor_count']} matched):")
+    for name in result["worst_tensor_names"]:
+        t = result["per_tensor"][name]
+        tag = (
+            "NONFINITE" if t["has_nonfinite"]
+            else "ONE-SIDED-ZERO" if t["one_sided_zero"]
+            else "vacuous" if t["vacuous"]
+            else "ok" if tensor_clears_floor(t, cosine_floor)
+            else "FAIL"
+        )
+        print(
+            f"  [{tag}] {name}: cosine={t['cosine_similarity']} max_abs_delta={t['max_abs_delta']} "
+            f"n={t['n']}"
+        )
     print("PASS" if result["passed"] else "FAIL")
     return EXIT_PASS if result["passed"] else EXIT_FAIL
 

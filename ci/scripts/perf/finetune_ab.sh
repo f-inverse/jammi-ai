@@ -59,7 +59,14 @@
 # on a config missing the bar; a FAIL row is data for a human to read, not
 # an infrastructure failure (see finetune_step.rs's own module doc). The
 # script's own exit code reflects whether the sweep RAN, not whether every
-# config passed.
+# config passed — WITH ONE CARVE-OUT (advisory iv, round-2 audit fix on
+# PR #372): a config whose `fused_proof` check FAILED or ERRORED reads
+# `INVALID`, not `FAIL`/`PASS`, and `ab_merge.py`'s own exit code DOES go
+# non-zero on an `INVALID` config — a failed proof means the fused kernels
+# may not have actually dispatched at all, so the ratio-based PASS/FAIL
+# classification above it is not trustworthy; that is a correctness-of-
+# measurement question, not a machine-dependent performance number, and is
+# the one thing this doctrine gates on.
 #
 # NOT covered here: loss-TRAJECTORY equivalence between jammi-fused and
 # jammi-eager (the #352 quality constraint) is a REAL-TRAINER check over

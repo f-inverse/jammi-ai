@@ -466,8 +466,40 @@ def build_report(raw_dir, steps, warmup, pass_ratio, torch_lora_init="peft"):
             verdict = f"FAIL (ratio {ratio:.3f} < {pass_ratio})"
         else:
             verdict = f"PASS (ratio {ratio:.3f})"
+
+        # Advisory (iv), round-2 audit fix on PR #372: a failed/errored
+        # `fused_proof` used to only APPEND a cosmetic "[WARN: ...]" suffix
+        # to whatever ratio-based verdict was already computed above -- so a
+        # config whose jammi-fused leg silently fell back to EAGER kernels
+        # (the exact regression `fused_proof` exists to catch) could still
+        # print `PASS (ratio 0.95x) [WARN: ...]`, and nothing downstream
+        # (`main()`'s exit code, a human skimming the table for the string
+        # "FAIL") ever noticed. This is a DIFFERENT class of problem than
+        # the ratio-based PASS/FAIL bar this crate deliberately RECORDS,
+        # never GATES, across a heterogeneous fleet (see
+        # `finetune_ab.sh`'s own "script's own exit code reflects whether
+        # the sweep RAN, not whether every [config] passed" doctrine): a
+        # ratio below bar is a real, machine-dependent PERFORMANCE
+        # observation; a failed fused_proof means the MEASUREMENT ITSELF is
+        # not known to have exercised the code path it claims to -- the
+        # ratio computed above could belong to a DIFFERENT kernel
+        # composition entirely, making the PASS/FAIL classification
+        # meaningless rather than merely unfavorable. INVALID therefore
+        # REPLACES (never just annotates) whatever ratio-based verdict was
+        # computed, and `main()` treats ANY `INVALID` verdict as a hard
+        # sweep failure (non-zero exit) -- the one carve-out from the
+        # record-don't-gate doctrine this crate makes, because this is a
+        # correctness-of-measurement question, not a perf-number question.
         if proof is False or isinstance(proof, str):
-            verdict += " [WARN: fused-dispatch proof missing or errored — see fused_proof column]"
+            reason = (
+                f"errored: {proof}" if isinstance(proof, str)
+                else "checked and FAILED — see fused_proof column for the classification"
+            )
+            verdict = (
+                f"INVALID (fused-dispatch proof {reason} — this leg's PASS/FAIL classification "
+                f"cannot be trusted; the ratio-based verdict this would otherwise have been is "
+                f"discarded, not merely annotated)"
+            )
 
         summary_rows.append((slug, ratio, loss_ratio, verdict))
         merged["configs"][slug] = {
@@ -559,6 +591,25 @@ def main(argv=None):
     print(table)
     with open(os.path.join(out_dir, "finetune_ab_table.txt"), "w") as fh:
         fh.write(table + "\n")
+
+    # Advisory (iv), round-2 audit fix on PR #372: the ONE carve-out from
+    # this crate's own record-don't-gate doctrine (see `finetune_ab.sh`'s
+    # module doc and `build_report`'s own verdict-computation comment) --
+    # an `INVALID` verdict (a failed/errored `fused_proof`) is a
+    # correctness-of-MEASUREMENT problem, not a machine-dependent
+    # performance number, so it is the one thing this sweep's own exit code
+    # DOES gate on. An ordinary ratio-based `FAIL` row remains
+    # record-only, unchanged.
+    invalid_slugs = [
+        slug for slug, cfg in merged["configs"].items() if str(cfg.get("verdict", "")).startswith("INVALID")
+    ]
+    if invalid_slugs:
+        print(
+            f"finetune_ab: FAIL — {len(invalid_slugs)} config(s) have an INVALID verdict "
+            f"(fused-dispatch proof failed or errored, see the table above): {invalid_slugs}",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

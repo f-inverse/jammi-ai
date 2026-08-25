@@ -197,6 +197,23 @@
 //! oracle suite here covers the `(F32, F32, F32)` combination end-to-end
 //! plus the typed-error boundary for `(BF16, BF16, F32)` on CPU.
 //!
+//! A caller (including this file's own tests) matching on that error's
+//! OUTER variant must account for one more environment-dependent wrapper:
+//! candle-core 0.11.0's `Error::bt()` (`src/error.rs:263-273`) boxes
+//! whatever error it is called on into `Error::WithBacktrace { inner,
+//! backtrace }` whenever `std::backtrace::Backtrace::capture()`'s status
+//! is neither `Disabled` nor `Unsupported` — i.e. whenever
+//! `RUST_BACKTRACE` (or `RUST_LIB_BACKTRACE`) is set, which CI sets
+//! workflow-wide. The CPU `MatMul::f` arm that raises this exact
+//! `UnsupportedDTypeForOp(BF16, "matmul")` calls `.bt()` on it
+//! (`cpu_backend/mod.rs:1541`), so a bare `matches!(err,
+//! Error::UnsupportedDTypeForOp(..))` is true with `RUST_BACKTRACE`
+//! unset and false with it set to `1` — an environment property, not a
+//! platform one. This file's own tests `peel_backtrace` before matching
+//! on any candle-RAISED error for exactly this reason (an error THIS
+//! op constructs directly, e.g. `check_w_and_ab`'s refusals, is never
+//! passed through `.bt()` and needs no peeling).
+//!
 //! ## Bias: a domain refusal, not packed into `ab`
 //!
 //! A frozen linear base MAY carry a bias (`candle_nn::linear`'s
@@ -1572,6 +1589,12 @@ mod tests {
     /// decided by the `RUST_BACKTRACE` / `RUST_LIB_BACKTRACE` env vars —
     /// so the OUTER variant of every candle-internal error that goes
     /// through `.bt()` is an environment property, not a platform one.
+    /// See the module doc's "CPU `BF16` matmul" section for the full
+    /// citation. Used below wherever a test matches on an error CANDLE
+    /// raises (a `matmul`/`to_dtype`/tensor-op dtype refusal); an error
+    /// THIS op constructs directly (`check_w_and_ab`, the `cpu_fwd`
+    /// contiguity loop) is never passed through `.bt()` and needs no
+    /// peeling.
     fn peel_backtrace(err: &Error) -> &Error {
         let mut e = err;
         while let Error::WithBacktrace { inner, .. } = e {
@@ -2149,9 +2172,14 @@ mod tests {
         let err = op
             .bwd(&x, &w, &ab, &res_dummy, &grad_res)
             .expect_err("an all-BF16 bwd on this crate's mkl/accelerate-less CPU build must fail");
-        match err {
+        // This is a candle-RAISED error (from `.matmul()`'s own dtype
+        // dispatch), not one this op constructs — peel `.bt()`'s
+        // `WithBacktrace` wrapper first (see `peel_backtrace`'s doc; the
+        // outer variant otherwise depends on `RUST_BACKTRACE`, not the
+        // platform).
+        match peel_backtrace(&err) {
             Error::UnsupportedDTypeForOp(dtype, _) => assert_eq!(
-                dtype,
+                *dtype,
                 DType::BF16,
                 "must fail at the SAME BF16-CPU-matmul limitation forward hits, not an \
                  earlier dtype-mismatch caused by a skipped F32 upcast"
@@ -2206,10 +2234,12 @@ mod tests {
                  (dx_base is F32, d_x_lora is correctly cast back to x's own BF16) — success \
                  here means the final downcast to base_dtype was skipped",
         );
-        match err {
+        // Also a candle-RAISED error (the `+` on two mismatched-dtype
+        // `Tensor`s) — see `peel_backtrace`'s doc.
+        match peel_backtrace(&err) {
             Error::DTypeMismatchBinaryOp { lhs, rhs, .. } => {
-                assert_eq!(lhs, DType::F32);
-                assert_eq!(rhs, DType::BF16);
+                assert_eq!(*lhs, DType::F32);
+                assert_eq!(*rhs, DType::BF16);
             }
             other => panic!("expected DTypeMismatchBinaryOp{{F32, BF16}}, got {other:?}"),
         }

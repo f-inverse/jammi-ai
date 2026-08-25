@@ -211,10 +211,12 @@ pub struct FinetuneStepParams {
     /// This exists because the shipped trainer's default config
     /// (`max_grad_norm = 1.0`) always clips: skipping it, as this tier did
     /// before, measures a step the product never runs — `clip_gradients`
-    /// does one `to_scalar` D2H sync per trainable `Var` (224 on a
-    /// ModernBERT-large r16 `Wqkv`/`Wo`/`Wi` LoRA config), a host-sync cost
-    /// no `None` row can see. Recording both an on and an off row on the
-    /// same box makes that cost a measured delta instead of an assumption.
+    /// runs entirely on device (`4n + 4` device ops for `n` trainable
+    /// `Var`s: the squared-sum fold, the coefficient, and a
+    /// `broadcast_mul` rescale per `Var`; zero `to_scalar`/`to_vec` calls),
+    /// a device-op cost no `None` row can see. Recording both an on and an
+    /// off row on the same box makes that cost a measured delta instead of
+    /// an assumption.
     pub max_grad_norm: Option<f32>,
 }
 
@@ -740,24 +742,33 @@ mod tests {
         );
     }
 
-    /// A huge `max_norm` (1e9) matches the absent path bit-for-bit on the
-    /// HOST implementation: `clip_gradients` computes `total_norm` and,
-    /// finding it far below `max_norm`, takes the early `total_norm <=
-    /// max_norm` return — no gradient is ever touched, not even multiplied
-    /// by a coefficient of 1.0. This identity holds for THIS (host) path
-    /// only; P4b(ii)'s device-side clip may reduce differently (e.g. an
-    /// unconditional `broadcast_mul` per the torch-order convention this
-    /// contract's Facts section cites) and will need its own re-pin when it
-    /// lands.
+    /// A huge `max_norm` (1e9) matches the absent path bit-for-bit under the
+    /// PRODUCTION device-side clip, which has no early return: `clip_coef =
+    /// (max_norm / (total_norm + 1e-6)).min(1.0)` is computed and every
+    /// gradient is multiplied by it unconditionally
+    /// (`jammi_ai::fine_tune::optimizer::clip_gradients`'s exact
+    /// bit-identity predicate). At `max_norm = 1e9` the measured
+    /// `total_norm` from this tier's synthetic step is nowhere near that
+    /// large, so `total_norm <= max_norm - 1e-6` holds by a huge margin,
+    /// `clip_coef` clamps to EXACTLY `1.0`, and `x * 1.0 == x` for every
+    /// finite `x` — the multiply is bit-identical to a no-op, not because it
+    /// was skipped. The boundary this bit-identity predicate does NOT cover
+    /// — `total_norm` within `1e-6` of `max_norm`, where `clip_coef` is
+    /// strictly less than `1.0` and the rescale is NOT bit-identical to
+    /// no-clip — is pinned in `jammi-ai`'s own test,
+    /// `at_max_norm_boundary_coef_is_not_bit_identical_to_no_clip`
+    /// (`crates/jammi-ai/src/fine_tune/optimizer.rs`), which controls the
+    /// closed-form `total_norm`/`max_norm` inputs this tier's end-to-end
+    /// synthetic step cannot.
     #[test]
     fn huge_max_grad_norm_matches_absent_on_host() {
         let absent = train_two_steps_and_flatten_params(None);
         let huge = train_two_steps_and_flatten_params(Some(1e9));
         assert_eq!(
             absent, huge,
-            "clip_gradients's early return (total_norm <= max_norm) must \
-             leave every gradient untouched when max_norm is far above the \
-             actual grad norm"
+            "clip_gradients's unconditional multiply by clip_coef must be \
+             bit-identical to no-op when max_norm is far above the actual \
+             grad norm (clip_coef clamps to exactly 1.0)"
         );
     }
 }

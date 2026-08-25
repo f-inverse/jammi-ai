@@ -145,10 +145,13 @@ the product does not run. The shipped trainer's `FineTuneConfig` defaults
 `fine_tune::trainer::TrainingLoop::process_batch_loss` always calls
 `jammi_ai::fine_tune::optimizer::clip_and_step` — `clip_gradients` then the
 optimizer step — at every accumulation boundary. `clip_gradients` computes
-the global L2 norm with one `to_scalar::<f32>()` D2H sync per trainable
-`Var` (224 of them on a ModernBERT-large r16 `Wqkv`/`Wo`/`Wi` LoRA config) —
-a host-sync cost that never appeared in a `finetune-step` row with
-`--max-grad-norm` omitted, because omitting it also skipped the sync.
+the global L2 norm entirely on device — a fixed left-to-right fold over
+`trainable_vars` (`n` × `sqr` + `sum_all`, `n - 1` adds, then `sqrt` +
+`affine` + `recip` + `affine` + `minimum` for the coefficient, then `n` ×
+`broadcast_mul` to rescale every gradient: `4n + 4` device ops, zero
+`to_scalar`/`to_vec` calls) — a device-op cost that never appeared in a
+`finetune-step` row with `--max-grad-norm` omitted, because omitting it also
+skipped those ops.
 
 `--max-grad-norm <f32>` runs that same production `clip_gradients` at the
 same point in the sequence the trainer does — after `backward()`, before the
@@ -158,7 +161,8 @@ the step this tier always measured before — bit-identical to before this
 flag existed, and useful as the isolated no-clip reference point. Supply it
 (`--max-grad-norm 1.0` to match the trainer's own default) to measure the
 step the product actually runs; the delta between an on row and an off row
-on the *same box* is the clip's host-sync cost, measured rather than assumed.
+on the *same box* is the device-side clip's cost (the `4n + 4` device ops
+above), measured rather than assumed.
 Report field: `finetune_step.max_grad_norm` — `null` when the flag was
 absent, the numeric value when present (never omitted from the JSON object
 either way, so a report is never ambiguous about which step it measured).

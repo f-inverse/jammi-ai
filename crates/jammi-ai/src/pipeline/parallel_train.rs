@@ -118,6 +118,12 @@ where
 
     let mut total_steps = 0usize;
     let mut last_epoch_loss = 0.0f64;
+    // The whole run's optimizer-step horizon, known upfront (one step per
+    // batch per epoch) — passed to `optimizer_step` so its non-finite check
+    // fires on this run's actual last step even when the run is shorter than
+    // `DEFAULT_NORM_CHECK_INTERVAL` steps (see `optimizer::clip_and_step`'s
+    // doc).
+    let total_run_steps = config.epochs.saturating_mul(batches.len());
 
     for _epoch in 0..config.epochs {
         if cancel.load(Ordering::Relaxed) {
@@ -135,7 +141,14 @@ where
             epoch_loss += scalar_loss(&loss)?;
             batch_count += 1;
 
-            optimizer_step(&mut optimizer, &trainable_vars, &loss, config.grad_clip)?;
+            let is_last_step = total_steps + 1 >= total_run_steps;
+            optimizer_step(
+                &mut optimizer,
+                &trainable_vars,
+                &loss,
+                config.grad_clip,
+                is_last_step,
+            )?;
             total_steps += 1;
         }
 

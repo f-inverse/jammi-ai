@@ -1,8 +1,12 @@
 //! Two cast-boundary fusions for [`super::LowRankResidualLinear::bwd`]'s
 //! epilogue and residual-add sites (the "cast-boundary lever", Wave 1
-//! (e)/(f) — `scratchpad/design-cast-boundary-v2.md` §1, §4). Both ops are
-//! generic Tensor-API primitives (family L: this crate names no consumer);
-//! `LowRankResidualLinear::bwd` is their first caller, not a fixed contract.
+//! (e)/(f): B1 is the epilogue's `to_dtype(F32)` + `.affine(scale, 0.0)`
+//! pair fused as [`CastScaleBf16F32`]; B3 is the residual-add's
+//! `to_dtype(bf16)` + `Tensor::add` pair fused as [`CastAddBf16`] — see
+//! each type's own doc below for its exact expression and traffic model).
+//! Both ops are generic Tensor-API primitives (family L: this crate names
+//! no consumer); `LowRankResidualLinear::bwd` is their first caller, not a
+//! fixed contract.
 //!
 //! ## [`CastScaleBf16F32`] — B1's `to_dtype(F32)` + `.affine(scale, 0.0)`
 //!
@@ -468,9 +472,10 @@ mod tests {
     fn bit_identical_to_the_eager_two_kernel_chain_at_production_amplitude() {
         // Production width (>= 4096 elements, guide §3.4) and amplitude
         // spanning the range this op's real caller sees: base-residual-like
-        // magnitudes up to ~6.7e3 (esc-045's layer-18 residual, cited in
-        // scratchpad/design-cast-boundary-v2.md's esc-046 fixture spec),
-        // exact zeros, negative zeros, and subnormals.
+        // magnitudes up to ~6.7e3 (esc-045's own layer-18 residual
+        // magnitude, the real checkpoint measurement this fixture's
+        // amplitude is sized from), exact zeros, negative zeros, and
+        // subnormals.
         let device = Device::Cpu;
         let n = 4096usize;
         let mut xv: Vec<bf16> = (0..n)

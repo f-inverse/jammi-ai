@@ -538,6 +538,31 @@ pub(crate) fn materialize_contiguous_if_needed<S: BackendStorage>(
 /// `BF16`), so there is no runtime domain gap to gate on — `admit` is
 /// called purely for its `JAMMI_KERNELS_DISABLE`/`DispatchCounters`
 /// observability, not to decide fused-vs-eager itself.
+///
+/// This `true` is a DTYPE-applicability claim only — it says nothing about
+/// the CONTIGUITY of `grad_res` (cast-scale site) or `dx_base_2d`/
+/// `d_x_lora_f32_2d` (cast-add site), which `CastScaleBf16F32`/
+/// `CastAddBf16`'s own CUDA arms separately require and enforce with a
+/// TYPED `Error::RequiresContiguous` refusal (never a silent misread of a
+/// strided view). That refusal is believed unreachable in production
+/// today: `ops::cast_scale`'s module doc's "Contiguity at the call site"
+/// section derives, from candle's own `GradStore::or_insert`/`insert`
+/// (`backprop.rs`, `zeros_like` + `add`) and `BackendStorage::matmul`
+/// (`cuda_backend/mod.rs`'s `dev.alloc::<T>(elem_count)`), that all three
+/// tensors are FRESH, contiguous allocations by construction every time
+/// `bwd` is reached through candle's normal `Tensor::backward` walk.
+/// Making `predicate_holds` an `is_contiguous()` check on those tensors
+/// instead of a hardcoded `true` was considered and rejected: it would
+/// only change behaviour on a branch already proven unreachable, it would
+/// tax every real backward pass with three extra `is_contiguous()` calls
+/// on a hot path, and — worse — in `Strict` mode a failed predicate is a
+/// hard `KernelError::StrictModeFallback` (`admission.rs`'s `admit_inner`),
+/// a SECOND error surface for the exact case `RequiresContiguous` already
+/// covers, rather than one typed refusal a reader has to reason about
+/// once. The CUDA kernel's own `RequiresContiguous` stays the single
+/// source of truth for that (impossible-in-practice) case; kept as
+/// defense in depth, not trusted away, per this crate's usual "an op
+/// trusts no caller for its own domain" doctrine.
 fn admit_cast_boundary(
     op: &'static str,
     predicate_name: &'static str,

@@ -1012,6 +1012,65 @@ mod tests {
         }
     }
 
+    /// Round-2 mutants triage (`cargo mutants`: `replace admission_mode ->
+    /// AdmissionMode with Default::default()` MISSED): nothing in this
+    /// crate OR `jammi-bench`'s real-CLI tests previously exercised
+    /// `admission_mode()` actually reading `Strict` from a genuine
+    /// `JAMMI_KERNELS_STRICT` env var — `jammi_encoders::layer_norm`'s
+    /// `strict_mode_errors_instead_of_falling_back_on_a_failed_predicate`
+    /// explicitly bypasses this function (calls `admit` with a literal
+    /// `AdmissionMode::Strict` instead, citing the exact same `OnceLock`
+    /// hazard), and every `jammi-bench` fixture's fused predicates hold
+    /// trivially, so `JAMMI_KERNELS_STRICT=1` there never distinguishes
+    /// Strict from Fallback (disable-wins-over-Strict cells aside). A
+    /// mutant that made `admission_mode()` always return `Fallback` would
+    /// silently turn Strict mode into a no-op everywhere in a real binary
+    /// and nothing would have caught it.
+    ///
+    /// Spawns the ALREADY-COMPILED test binary as a fresh CHILD process
+    /// with the env var set and `--exact` targeting ONLY
+    /// [`admission_mode_child_process_body`] below — a fresh `OnceLock`,
+    /// guaranteed, the same technique
+    /// `crates/jammi-bench/tests/finetune_step_kernel_disable.rs` uses for
+    /// `JAMMI_KERNELS_DISABLE`.
+    #[test]
+    fn admission_mode_reads_strict_from_the_real_env_var_in_a_fresh_process() {
+        let exe = std::env::current_exe().expect("test binary path");
+        let output = std::process::Command::new(exe)
+            .args([
+                "admission::tests::admission_mode_child_process_body",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("JAMMI_KERNELS_STRICT", "1")
+            .env("ADMISSION_MODE_CHILD", "1")
+            .output()
+            .expect("spawn child test binary");
+        assert!(
+            output.status.success(),
+            "child process assertion failed: stdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Only meaningful inside the child process
+    /// [`admission_mode_reads_strict_from_the_real_env_var_in_a_fresh_process`]
+    /// spawns (guarded on `ADMISSION_MODE_CHILD`, the same pattern
+    /// `admission_mode_defaults_to_fallback_without_the_env_var` uses for
+    /// the unset case) — a no-op pass when run directly by the ordinary
+    /// test harness.
+    #[test]
+    fn admission_mode_child_process_body() {
+        if std::env::var_os("ADMISSION_MODE_CHILD").is_some() {
+            assert_eq!(
+                admission_mode(),
+                AdmissionMode::Strict,
+                "JAMMI_KERNELS_STRICT=1 in a fresh process must read as Strict"
+            );
+        }
+    }
+
     #[test]
     fn counters_for_returns_the_same_static_instance_for_the_same_op_name() {
         let a = counters_for("registry_test_op_a");

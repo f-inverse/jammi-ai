@@ -401,8 +401,7 @@ RUN_IDENTITY_FIELDS = (
 # now emits `f32`/`bf16` directly to match (this fix's own change to that
 # script), so this map exists for LEGACY dumps only -- an older
 # `torch_grad_oracle.py` binary, or any external producer, that still
-# carries torch's bare CLI-flag spelling `fp32`. Applied ONLY to
-# `backbone_dtype` (never to any other `RUN_IDENTITY_FIELDS` entry): every
+# carries torch's bare CLI-flag spelling `fp32`. Every
 # jammi-f32-vs-torch-f32 comparison — including this oracle's own
 # near-perfect control (0.9999998, see this module's own doc) — was
 # UNRUNNABLE before this map existed, refused on a spurious SPELLING
@@ -423,6 +422,97 @@ def normalize_backbone_dtype(value):
     if not isinstance(value, str):
         return value
     return _LEGACY_BACKBONE_DTYPE_SPELLINGS.get(value, value)
+
+
+def normalize_target_modules(value):
+    """Canonicalize a `target_modules` run-identity value to an
+    ORDER-INDEPENDENT representation before comparison.
+
+    WHY ORDER IS NOT SEMANTICALLY MEANINGFUL: jammi's OWN consumer of this
+    list, `jammi_lora::config::should_apply_lora`
+    (`crates/jammi-lora/src/config.rs`), tests membership via
+    `target_modules.iter().any(|t| module_name == t ||
+    module_name.ends_with(t))` -- an UNORDERED existence check over the
+    whole slice, never indexed by position. Both producers build this field
+    by literally splitting the operator's `--target-modules` CLI string on
+    commas, preserving whatever order the operator typed (`main.rs`'s
+    `target_modules.split(',')...` collect,
+    `torch_grad_oracle.py`'s `args.target_modules.split(",")` list
+    comprehension) -- so two operators who pass the SAME SET in a different
+    order (a plausible, innocent difference: nobody agrees in advance on a
+    comma-order convention for what is semantically a set) produce
+    representationally different but semantically IDENTICAL
+    `target_modules` values, and the un-normalized comparator refused this
+    exact case (`compare_reports` reported a spurious
+    "run-identity field 'target_modules' differs" premise violation for two
+    dumps configured identically save for CLI argument order).
+
+    Narrows ONLY order, never MEMBERSHIP: returns `tuple(sorted(value))`
+    when `value` is a list -- duplicates are preserved and still compared
+    (`["Wqkv", "Wqkv"]` vs `["Wqkv"]` remain different after sorting, since
+    sorting a 2-element list does not collapse it to a 1-element one), so a
+    caller passing a duplicate on only one side is still caught as a real
+    difference even though `should_apply_lora`'s own predicate would apply
+    LoRA identically either way -- this comparator's job is to detect
+    REPRESENTATIONAL noise (order), not to also decide a duplicate is
+    harmless. Passes anything else (a non-list, `None`) through UNCHANGED,
+    mirroring `normalize_backbone_dtype`'s own narrowing discipline.
+    """
+    if not isinstance(value, list):
+        return value
+    return tuple(sorted(value))
+
+
+# Per-field canonicalizer table: the GENERAL rule the round-2 fix's
+# `backbone_dtype`-only special case (an inline `if field ==
+# "backbone_dtype":` branch in `_premise_violations`) promised in its own
+# comment ("every OTHER run-identity field is compared as-is") but did not
+# actually deliver -- `target_modules`'s order-independence needed the
+# IDENTICAL treatment `backbone_dtype`'s legacy spelling got, not a bespoke
+# second special case one field over. Every `RUN_IDENTITY_FIELDS` entry NOT
+# listed here is compared with NO canonicalization (the JSON-decoded value
+# as-is), because it carries no known cross-producer representational gap:
+#
+# | field            | jammi (`grad_oracle.rs`)         | torch (`torch_grad_oracle.py`)              | canonicalizer            |
+# |------------------|-----------------------------------|----------------------------------------------|---------------------------|
+# | seed             | `u64` field, `#[derive(Serialize)]` -> JSON int | `argparse` `type=int` -> JSON int | none (already like-for-like) |
+# | batch            | `usize` field -> JSON int          | `argparse` `type=int` -> JSON int             | none (already like-for-like) |
+# | seq              | `usize` field -> JSON int          | `argparse` `type=int` -> JSON int             | none (already like-for-like) |
+# | lora_rank        | `usize` field -> JSON int          | `argparse` `type=int` -> JSON int             | none (already like-for-like) |
+# | target_modules   | `Vec<String>` -> JSON array, CLI split ORDER preserved | `list[str]` -> JSON array, CLI split ORDER preserved | `normalize_target_modules` (sorted tuple) |
+# | batched_forward  | `bool` field -> JSON bool           | `argparse.BooleanOptionalAction` -> JSON bool | none (already like-for-like) |
+# | backbone_dtype   | already-canonical `f32`/`f16`/`bf16` string | may carry legacy CLI-flag spelling `fp32`     | `normalize_backbone_dtype` |
+#
+# `seed`/`batch`/`seq`/`lora_rank` are native Python `int`/Rust
+# `u64`/`usize` on BOTH sides -- Python's `json` module serializes an `int`
+# to a bare JSON number, never a string or a float, so `==` on the decoded
+# value already compares like-for-like with no representational gap to
+# close. `batched_forward` is a native `bool` on both sides for the same
+# reason (`json` serializes `bool` to `true`/`false`, never `1`/`0` or a
+# string). See
+# `test_compare_grad_oracle.py::RunIdentityFieldCanonicalizationLattice`
+# for the per-field lattice (representationally-different-but-equal -> OK;
+# genuinely-different -> still a violation) that pins this table, including
+# the negative controls confirming these five fields are NOT silently
+# widened by a canonicalizer they do not need.
+_IDENTITY_FIELD_CANONICALIZERS = {
+    "backbone_dtype": normalize_backbone_dtype,
+    "target_modules": normalize_target_modules,
+}
+
+
+def canonicalize_identity_field(field, value):
+    """Apply `field`'s registered canonicalizer (see
+    `_IDENTITY_FIELD_CANONICALIZERS`'s own table), or return `value`
+    unchanged if none is registered. The SINGLE dispatch point
+    `_premise_violations` calls for EVERY `RUN_IDENTITY_FIELDS` entry --
+    closing a future representational gap for a NEW field means
+    registering one function in the table above, not writing a new
+    `if field == ...` branch inline (the shape the round-2 fix left
+    behind, and the shape this round replaces).
+    """
+    fn = _IDENTITY_FIELD_CANONICALIZERS.get(field)
+    return value if fn is None else fn(value)
 
 # How tightly a `weight` array recorded by the two INDEPENDENT producers
 # (jammi's `grad_oracle.rs`, torch's `torch_grad_oracle.py`) must agree to
@@ -555,13 +645,16 @@ def _premise_violations(report_a, report_b):
     for field in RUN_IDENTITY_FIELDS:
         va = report_a.get(field)
         vb = report_b.get(field)
-        # B1 fix: `backbone_dtype` is compared through the legacy-spelling
-        # normalizer (see `normalize_backbone_dtype`'s own doc) — every
-        # OTHER run-identity field is compared as-is; a genuine spelling
-        # mismatch on any of those (e.g. `seed` differing) is never a
-        # "just normalize it" situation.
-        if field == "backbone_dtype":
-            va, vb = normalize_backbone_dtype(va), normalize_backbone_dtype(vb)
+        # Class-level fix (this round): EVERY field is routed through
+        # `canonicalize_identity_field`'s dispatch table, not just
+        # `backbone_dtype` -- see `_IDENTITY_FIELD_CANONICALIZERS`'s own
+        # table for what each field's canonicalizer narrows (and why the
+        # other five fields need none). A genuine difference (e.g. `seed`
+        # differing, or a real `target_modules` SET difference) still
+        # compares unequal after canonicalization -- these functions only
+        # ever narrow a REPRESENTATIONAL gap, never widen what counts as a
+        # match.
+        va, vb = canonicalize_identity_field(field, va), canonicalize_identity_field(field, vb)
         if va != vb:
             violations.append(f"run-identity field {field!r} differs: A={va!r} B={vb!r}")
 

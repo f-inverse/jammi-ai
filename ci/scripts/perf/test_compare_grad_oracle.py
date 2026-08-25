@@ -425,6 +425,169 @@ class BackboneDtypeSpellingNormalizationTests(unittest.TestCase):
         self.assertTrue(any("backbone_dtype" in v for v in result["premise_violations"]))
 
 
+class RunIdentityFieldCanonicalizationLattice(unittest.TestCase):
+    """CLASS-LEVEL closure of the round-2 `backbone_dtype`-only special case
+    (the old `if field == "backbone_dtype":` branch in `_premise_violations`,
+    whose own inline comment said every OTHER `RUN_IDENTITY_FIELDS` entry
+    "is compared as-is"). This class drives `compare_reports` (never a
+    helper called with bespoke literals) once PER FIELD in
+    `cgo.RUN_IDENTITY_FIELDS`, with two cells per field where a
+    representational gap between the two INDEPENDENT producers
+    (`crates/jammi-bench/src/grad_oracle.rs`,
+    `crates/jammi-bench/reference/torch_grad_oracle.py`) is actually
+    representable:
+
+    - REPRESENTATIONALLY-DIFFERENT-BUT-SEMANTICALLY-EQUAL -> must NOT be a
+      premise violation.
+    - GENUINELY DIFFERENT -> must still be a premise violation (the
+      canonicalization must narrow ONLY the representational gap, never
+      widen into "any value of this field is close enough" -- the same
+      non-widening discipline `BackboneDtypeSpellingNormalizationTests`
+      already pins for `backbone_dtype` alone).
+
+    `target_modules`'s reordered-but-same-set cell
+    (`test_target_modules_reordered_same_set_is_not_a_violation`) is the
+    LIVE INSTANCE this round's dispatch reproduced directly (RED before
+    `normalize_target_modules` is wired into `_premise_violations` via
+    `canonicalize_identity_field`, GREEN after -- see that function's own
+    doc for why a per-field DISPATCH TABLE, not a second inline
+    `if field == ...` special case, is what actually closes the class
+    rather than moving the point fix one field over).
+
+    `seed`/`batch`/`seq`/`lora_rank`/`batched_forward` have NO known
+    representational gap to canonicalize away: `grad_oracle.rs`'s
+    `GradOracleReport` fields (`seed: u64`, `batch: usize`, `seq: usize`,
+    `lora_rank: usize`, `batched_forward: bool`) serialize through
+    `#[derive(Serialize)]`/`serde_json` to a bare JSON number/boolean;
+    `torch_grad_oracle.py`'s `argparse` declarations for the same CLI flags
+    (`type=int` for the four numeric fields, `action=
+    argparse.BooleanOptionalAction` for `--batched-forward`) produce a
+    native Python `int`/`bool` fed straight into `json.dump` -- Python's
+    `json` module serializes an `int` to a bare JSON number and a `bool` to
+    `true`/`false`, never a string or a float. So there is no cross-producer
+    spelling/type gap for these five fields to close (unlike
+    `backbone_dtype`, whose CLI-flag spelling genuinely differs between the
+    two stacks' argument vocabularies, or `target_modules`, whose ORDER is
+    genuinely uncontrolled). This class still tests these five fields two
+    ways: (1) a MATCHING pair passes (the positive control that this
+    round's changes have not accidentally penalized a correctly-configured
+    comparison), and (2) a fabricated cross-TYPE variant (e.g. a
+    stringified `seed`) -- which NEITHER real producer ever emits, but
+    which this comparator must still correctly REJECT as a genuine premise
+    violation rather than silently coerce; registering a canonicalizer for
+    a gap that does not exist in either real producer would only widen what
+    counts as a match with no corresponding representational need.
+    """
+
+    def _result(self, **overrides_b):
+        report_a = make_report(0.3, {"t": [1.0, 2.0, 3.0]})
+        report_b = make_report(0.3, {"t": [1.0, 2.0, 3.0]}, **overrides_b)
+        return cgo.compare_reports(report_a, report_b, cosine_floor=0.9)
+
+    # ---- target_modules ---------------------------------------------------
+
+    def test_target_modules_reordered_same_set_is_not_a_violation(self):
+        """THE REPRODUCTION this round closes: two dumps whose
+        `target_modules` name the identical SET (`{"Wqkv", "Wo", "Wi"}`) in
+        a different order must not be flagged -- order is not a
+        semantically meaningful part of jammi's OWN consumer of this list
+        (`jammi_lora::config::should_apply_lora`'s `.any(|t| module_name ==
+        t || module_name.ends_with(t))` in `crates/jammi-lora/src/config.rs`
+        is an UNORDERED existence check over the whole slice), and both
+        producers build this field by literally splitting the operator's
+        `--target-modules` CLI string on commas in whatever order the
+        operator typed it (`main.rs`'s `target_modules.split(',')...`
+        collect, `torch_grad_oracle.py`'s `args.target_modules.split(",")`
+        list comprehension).
+        """
+        report_a = make_report(0.3, {"t": [1.0, 2.0, 3.0]}, target_modules=["Wqkv", "Wo", "Wi"])
+        report_b = make_report(0.3, {"t": [1.0, 2.0, 3.0]}, target_modules=["Wo", "Wqkv", "Wi"])
+        result = cgo.compare_reports(report_a, report_b, cosine_floor=0.9)
+        self.assertTrue(result["passed"], f"premise_violations={result['premise_violations']!r}")
+        self.assertEqual(result["premise_violations"], [])
+
+    def test_target_modules_different_set_is_still_a_violation(self):
+        """NEGATIVE CONTROL: a genuinely different SET (not just a
+        different order of the same set) must still refuse -- the
+        canonicalizer narrows only ORDER, never MEMBERSHIP.
+        """
+        result = self._result(target_modules=["Wo", "Wi"])
+        self.assertFalse(result["passed"])
+        self.assertTrue(any("target_modules" in v for v in result["premise_violations"]))
+
+    def test_target_modules_duplicate_entry_is_still_a_violation(self):
+        """NEGATIVE CONTROL, narrower than a different set: `["Wqkv",
+        "Wqkv"]` and `["Wqkv"]` name the SAME set but a DIFFERENT multiset
+        (a duplicate present on one side only) -- `normalize_target_modules`
+        sorts without deduplicating specifically so this case is still
+        caught (see that function's own doc for why sortedness, not
+        set-collapsing, is the chosen narrowing).
+        """
+        report_a = make_report(0.3, {"t": [1.0, 2.0, 3.0]}, target_modules=["Wqkv", "Wqkv"])
+        report_b = make_report(0.3, {"t": [1.0, 2.0, 3.0]}, target_modules=["Wqkv"])
+        result = cgo.compare_reports(report_a, report_b, cosine_floor=0.9)
+        self.assertFalse(result["passed"])
+        self.assertTrue(any("target_modules" in v for v in result["premise_violations"]))
+
+    def test_normalize_target_modules_narrows_order_only(self):
+        self.assertEqual(
+            cgo.normalize_target_modules(["Wo", "Wqkv", "Wi"]),
+            cgo.normalize_target_modules(["Wqkv", "Wo", "Wi"]),
+        )
+        self.assertNotEqual(
+            cgo.normalize_target_modules(["Wqkv", "Wqkv"]),
+            cgo.normalize_target_modules(["Wqkv"]),
+        )
+        self.assertIsNone(cgo.normalize_target_modules(None))
+
+    # ---- backbone_dtype (already covered above; pinned here too so this
+    # class is a genuinely complete per-field lattice on its own) ----------
+
+    def test_backbone_dtype_legacy_spelling_is_not_a_violation(self):
+        result = self._result(backbone_dtype="fp32")  # report_a default is "f32"
+        self.assertTrue(result["passed"], f"premise_violations={result['premise_violations']!r}")
+
+    def test_backbone_dtype_genuinely_different_precision_is_still_a_violation(self):
+        result = self._result(backbone_dtype="bf16")
+        self.assertFalse(result["passed"])
+        self.assertTrue(any("backbone_dtype" in v for v in result["premise_violations"]))
+
+    # ---- seed / batch / seq / lora_rank / batched_forward ------------------
+    # No known cross-producer representational gap (see this class's own
+    # doc) -- these five fields still get a matching-pair positive control
+    # and a fabricated cross-type negative control each, so an audit can
+    # verify "safe as-is" by RUNNING the claim, not by reading a comment.
+
+    def test_matching_int_and_bool_identity_fields_are_not_violations(self):
+        result = self._result()  # no overrides -- everything matches by construction
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["premise_violations"], [])
+
+    def test_stringified_numeric_identity_fields_are_still_violations(self):
+        """NEITHER real producer ever emits a stringified `seed`/`batch`/
+        `seq`/`lora_rank` (`grad_oracle.rs`'s fields are native `u64`/
+        `usize`; `torch_grad_oracle.py`'s argparse declarations are all
+        `type=int`) -- this pins that if one somehow did (a schema
+        regression on either side), this comparator still catches it as a
+        genuine mismatch rather than silently coercing `"1" == 1` (which
+        Python's own `==` already returns `False` for, with NO
+        canonicalizer needed -- this test exists to keep it that way on
+        purpose, not to add one).
+        """
+        for field in ("seed", "batch", "seq", "lora_rank"):
+            with self.subTest(field=field):
+                base = make_report(0.3, {"t": [1.0, 2.0, 3.0]})
+                stringified = str(base[field])
+                result = self._result(**{field: stringified})
+                self.assertFalse(result["passed"], f"{field} type mismatch must still refuse")
+                self.assertTrue(any(field in v for v in result["premise_violations"]))
+
+    def test_batched_forward_genuinely_different_value_is_still_a_violation(self):
+        result = self._result(batched_forward=False)
+        self.assertFalse(result["passed"])
+        self.assertTrue(any("batched_forward" in v for v in result["premise_violations"]))
+
+
 class PerTensorGatingLattice(unittest.TestCase):
     """B2 REGRESSION (audit finding on PR #372, round 2): `passed` used to
     consult ONLY the overall concatenated cosine — measured, jammi could

@@ -1230,16 +1230,35 @@ impl CandleModel {
                 let offsets = &encoding.offsets[batch_idx];
                 let mask = &encoding.attention_masks[batch_idx];
 
-                let entities = jammi_numerics::ner::decode_bio_spans(
+                match jammi_numerics::ner::decode_bio_spans(
                     token_logits,
                     offsets,
                     mask,
                     id2label,
                     &texts[orig_idx],
-                );
-
-                all_entities_json[orig_idx] =
-                    serde_json::to_string(&entities).unwrap_or_else(|_| "[]".to_string());
+                ) {
+                    Ok(entities) => {
+                        all_entities_json[orig_idx] =
+                            serde_json::to_string(&entities).unwrap_or_else(|_| "[]".to_string());
+                    }
+                    // `decode_bio_spans`' only error today is a non-finite
+                    // (NaN/±inf) token logit — the model diverged or the
+                    // checkpoint is corrupt, never a per-row INPUT fault (the
+                    // row's text is already known-valid: empty/null text was
+                    // filtered before the forward ran, above). The `_status`
+                    // channel's contract (see `InferenceRunner::run_chunks` in
+                    // runner.rs) reserves per-row `_status = error` for a bad
+                    // INPUT, never "the model is broken" — so this is a
+                    // batch-level typed failure, propagated exactly like any
+                    // other systemic non-OOM forward failure, naming the
+                    // offending row.
+                    Err(e) => {
+                        return Err(JammiError::Inference(format!(
+                            "NER row {orig_idx}: non-finite logits — model diverged or \
+                             checkpoint corrupt ({e})"
+                        )));
+                    }
+                }
             }
         }
 
@@ -2576,5 +2595,168 @@ mod pooling_from_config_tests {
         // `serde_json::Value`s and can never observe a parse failure itself).
         let cfg = serde_json::json!(["not", "an", "object"]);
         assert!(pooling_from_config(Some(&cfg), "test-model").is_err());
+    }
+}
+
+#[cfg(test)]
+mod ner_nonfinite_logit_tests {
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, StringArray};
+    use candle_nn::Linear;
+
+    use super::*;
+
+    /// A `CandleTextForward` stub whose `forward_hidden` returns a hand-set
+    /// `(batch, seq, hidden)` tensor, with `nan_row`'s hidden states forced to
+    /// NaN — bypassing a real encoder to reproduce, deterministically, the
+    /// shape `forward_ner` receives from a genuinely diverged model (a NaN
+    /// hidden state feeds through the token classifier's linear layer to a
+    /// non-finite logit row, since `NaN * weight + bias` is NaN).
+    struct FixedHiddenForward {
+        max_seq_len: usize,
+        hidden_size: usize,
+        nan_row: usize,
+    }
+
+    impl CandleTextForward for FixedHiddenForward {
+        fn max_sequence_length(&self) -> usize {
+            self.max_seq_len
+        }
+
+        fn forward_hidden(
+            &self,
+            input_ids: &Tensor,
+            _attention_mask: &Tensor,
+            _encoding: &BatchEncoding,
+            device: &Device,
+        ) -> Result<Tensor> {
+            let (batch, seq) = input_ids
+                .dims2()
+                .map_err(|e| JammiError::Inference(e.to_string()))?;
+            let mut data = vec![0.1_f32; batch * seq * self.hidden_size];
+            if self.nan_row < batch {
+                let row_start = self.nan_row * seq * self.hidden_size;
+                for v in &mut data[row_start..row_start + seq * self.hidden_size] {
+                    *v = f32::NAN;
+                }
+            }
+            Tensor::from_vec(data, (batch, seq, self.hidden_size), device)
+                .map_err(|e| JammiError::Inference(e.to_string()))
+        }
+    }
+
+    /// A minimal NER-shaped `CandleModel`: a real tiny_bert tokenizer, `text`
+    /// wired to `FixedHiddenForward` so the encoder's hidden states are
+    /// hand-set (`nan_row`'s corrupted), and a tiny real `ner_classifier`
+    /// linear layer — no real weights or forward compute needed beyond that
+    /// to exercise `forward_ner`'s non-finite-logit handling.
+    fn model_with_hidden_states(nan_row: usize) -> CandleModel {
+        const HIDDEN: usize = 4;
+        let tokenizer_path = jammi_test_utils::cookbook_fixture("tiny_bert").join("tokenizer.json");
+        let tokenizer = TokenizerWrapper::from_file(&tokenizer_path).unwrap();
+        let mut id2label = HashMap::new();
+        id2label.insert(0u32, "O".to_string());
+        id2label.insert(1u32, "B-PER".to_string());
+
+        let device = Device::Cpu;
+        let weight = Tensor::zeros((2, HIDDEN), DType::F32, &device).unwrap();
+        let bias = Tensor::zeros((2,), DType::F32, &device).unwrap();
+        let ner_classifier = Linear::new(weight, Some(bias));
+
+        CandleModel {
+            dimensions: ModelDimensions {
+                hidden_size: HIDDEN,
+                num_layers: 1,
+                num_attention_heads: 1,
+                intermediate_size: HIDDEN,
+            },
+            text: Some(Box::new(FixedHiddenForward {
+                max_seq_len: 128,
+                hidden_size: HIDDEN,
+                nan_row,
+            })),
+            vision: None,
+            audio: None,
+            audio_frontend: None,
+            tokenizer: Some(tokenizer),
+            device,
+            projection_head: None,
+            distribution_head: None,
+            regression_scaler: None,
+            regression_form: None,
+            id2label: Some(id2label),
+            ner_classifier: Some(ner_classifier),
+            compute_precision: jammi_numerics::ComputePrecision::F32,
+        }
+    }
+
+    fn two_row_content() -> Vec<ArrayRef> {
+        vec![Arc::new(StringArray::from(vec!["fine row", "diverged row"])) as ArrayRef]
+    }
+
+    /// A diverged model's row (row 1's hidden states are NaN, so its token
+    /// logits are non-finite) must refuse the WHOLE call with a typed
+    /// `JammiError::Inference` naming the offending row, through the public
+    /// `CandleModel::forward` NER entry — never route a non-finite MODEL
+    /// output onto the per-row `_status` channel, whose contract
+    /// (`InferenceRunner::run_chunks` in runner.rs) reserves `_status =
+    /// error` for a bad row INPUT, never "the model is broken". The prior
+    /// `Err` arm here set `row_status[orig_idx] = false` and left that row's
+    /// `all_entities_json` entry as an empty string (never `entities =
+    /// "[]"` — only the `Ok` arm writes that), which `NerAdapter` (via
+    /// `nullify_strings`) turns into a SQL NULL for the row regardless of
+    /// the string's contents — the same per-row-input-fault treatment a
+    /// genuinely malformed row's text gets, not a signal that the model
+    /// itself is broken. The invariant this test pins: a model-side
+    /// non-finite row is a batch-level typed failure, never a per-row input
+    /// error.
+    #[test]
+    fn nan_hidden_state_row_is_refused_with_a_typed_error_naming_the_row() {
+        let model = model_with_hidden_states(1);
+        let content = two_row_content();
+
+        match model.forward(&content, ModelTask::Ner) {
+            Err(JammiError::Inference(msg)) => {
+                assert!(
+                    msg.contains("row 1"),
+                    "error must name the offending row index (1): {msg}"
+                );
+                assert!(
+                    msg.to_lowercase().contains("non-finite")
+                        || msg.to_lowercase().contains("diverg"),
+                    "error must explain the cause is a diverged model, not bad input: {msg}"
+                );
+            }
+            Err(other) => panic!(
+                "expected JammiError::Inference for a non-finite NER logit row, got a \
+                 different JammiError variant: {other:?}"
+            ),
+            Ok(_) => panic!(
+                "expected a typed JammiError::Inference refusal for a non-finite NER logit \
+                 row, but the call succeeded"
+            ),
+        }
+    }
+
+    /// Positive control: the SAME two-row batch shape with all-finite hidden
+    /// states (no NaN row) succeeds — proves the refusal above triggers on
+    /// the non-finite hidden state specifically, not on some incidental
+    /// shape/setup difference in the test harness.
+    #[test]
+    fn all_finite_hidden_states_decode_successfully() {
+        // `nan_row = 2` is out of range for a 2-row batch (valid indices 0
+        // and 1), so `FixedHiddenForward` never corrupts either row.
+        let model = model_with_hidden_states(2);
+        let content = two_row_content();
+
+        let output = model
+            .forward(&content, ModelTask::Ner)
+            .expect("an all-finite batch must decode successfully");
+        assert!(
+            output.row_status.iter().all(|&ok| ok),
+            "expected every row to decode successfully, got row_status {:?}",
+            output.row_status
+        );
     }
 }

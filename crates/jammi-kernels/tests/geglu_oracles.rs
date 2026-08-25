@@ -178,20 +178,18 @@ fn bf16_bit_diff(a: bf16, b: bf16) -> i32 {
 }
 
 /// The PASS/FAIL metric both bf16 oracles below use: RELATIVE tolerance
-/// with an absolute FLOOR, not a flat scale-free absolute bound (a prior
-/// version of this file used `BF16_FWD_ABS_TOL = 1e-3` /
-/// `BF16_BWD_ABS_TOL = 0.3`, both flat absolutes — an audit finding: a
-/// flat absolute bound is scale-free, so at this op's larger magnitudes
-/// (`|dwi_out|` up to ~16 in the production-width backward fixture) `0.3`
-/// permits close to a 2% RELATIVE error there, wide enough that a real
-/// regression (e.g. a dropped `* 0.5` in the CDF) could plausibly still
-/// pass, while ALSO being needlessly loose at the near-zero tail this
-/// op's own value range actually produces).
+/// with an absolute FLOOR, not a flat scale-free absolute bound. A flat
+/// absolute bound is scale-free, so at this op's larger magnitudes
+/// (`|dwi_out|` up to ~16 in the production-width backward fixture) a flat
+/// `0.3` bound permits close to a 2% RELATIVE error there, wide enough
+/// that a real regression (e.g. a dropped `* 0.5` in the CDF) could
+/// plausibly still pass, while ALSO being needlessly loose at the
+/// near-zero tail this op's own value range actually produces.
 ///
 /// Both constants are sized from a FULL scan of the backward oracle's
-/// production-width fixture (2026-08-24 audit + follow-up measurement),
-/// not from one cherry-picked element, because this op's bf16 backward
-/// divergence has TWO DIFFERENT mechanisms with different scales:
+/// production-width fixture (measured 2026-08-24), not from one
+/// cherry-picked element, because this op's bf16 backward divergence has
+/// TWO DIFFERENT mechanisms with different scales:
 ///
 /// 1. Ordinary rounding-order divergence at non-trivial magnitude: the
 ///    worst such element measured is `2` bf16 ULP (`0.125` absolute) at
@@ -420,13 +418,13 @@ fn eager_vs_fused_bf16_bwd_diverges_and_stays_within_the_stated_tolerance_at_pro
         .abs()
         .max(dwe[argmax_i].to_f32().abs());
     let argmax_ulp = bf16_ulp_at(argmax_mag);
-    // MAGNITUDE CONTEXT (an audit finding: a bare "0.125" reads as a large
-    // number out of context — it is 1 bf16 ULP at this fixture's own peak
-    // magnitude, 16, and the fixture's ACTUAL worst element sits at a
-    // smaller magnitude, ~12.2-12.3, where the same 0.125 absolute diff is
-    // exactly 2 bf16 ULP (`BF16_REL_TOL`'s doc derives why `2^-6`, not
-    // `2^-7`, is the bound sized to cover that). Both facts, printed for
-    // the record on every run:
+    // MAGNITUDE CONTEXT: a bare "0.125" reads as a large number out of
+    // context — it is 1 bf16 ULP at this fixture's own peak magnitude, 16,
+    // and the fixture's ACTUAL worst element sits at a smaller magnitude,
+    // ~12.2-12.3, where the same 0.125 absolute diff is exactly 2 bf16 ULP
+    // (`BF16_REL_TOL`'s doc derives why `2^-6`, not `2^-7`, is the bound
+    // sized to cover that). Both facts, printed for the record on every
+    // run:
     println!(
         "eager_vs_fused_bf16_bwd (production width, intermediate={intermediate}): \
          measured max |abs diff| = {max_abs} at element {argmax_i} (fused={}, eager={}, \

@@ -96,8 +96,21 @@ impl RetrievalMetrics {
             })
             .sum();
 
+        // `RelevanceJudgment::grade` is `i32`; an `i32 -> f64` cast is exact
+        // and always finite (`i32`'s full range fits in `f64`'s 53-bit
+        // significand, 52 bits stored plus an implicit leading bit), so
+        // `NaN` is provably unreachable here — unlike a sort over a general
+        // `f32`/`f64` slice, `partial_cmp` on these values is already
+        // total. `total_cmp` is used instead of `partial_cmp` anyway to pin
+        // an explicit, defined descending order rather than rely on the
+        // NaN-unreachability precondition never regressing. Ties (equal
+        // grades) are NOT broken by `total_cmp`'s bit-pattern order in any
+        // way that reorders them: `[T]::sort_by` is a stable sort, and two
+        // equal `i32`-derived `f64` values are bit-identical, so
+        // `total_cmp` returns `Equal` for them — a tied group's relative
+        // order is exactly its order in `judgments`.
         let mut ideal_gains: Vec<f64> = judgments.iter().map(|j| j.grade as f64).collect();
-        ideal_gains.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        ideal_gains.sort_by(|a, b| b.total_cmp(a));
         let ideal_dcg: f64 = ideal_gains
             .iter()
             .take(k)

@@ -13,11 +13,29 @@ use crate::stats::types::TestResult;
 /// Mann-Whitney U statistic with tie-corrected variance, returning a
 /// two-tailed p-value via the normal approximation.
 ///
-/// Returns `NumericsError::InvalidInput` if either sample is empty.
+/// # Errors
+///
+/// Returns `NumericsError::InvalidInput` if either sample is empty or
+/// contains a `NaN` value. `±inf` is accepted, not refused: Mann-Whitney is
+/// rank-based, and `±inf` has a well-defined rank under `f64::total_cmp`
+/// (it is simply the most extreme observation) — verified empirically
+/// against `scipy.stats.mannwhitneyu`, which returns a finite statistic and
+/// p-value for `mannwhitneyu([1.0, inf, 3.0], [2.0, 4.0, 5.0])` rather than
+/// refusing. `NaN` is refused because, unlike `±inf`, it carries no numeric
+/// meaning as an observation: `total_cmp` is a genuine total order even
+/// with `NaN` present, so the rank-sum computed below would still complete
+/// deterministically, but the resulting rank would reflect `NaN`'s
+/// IEEE-754 bit pattern rather than any measured quantity, silently
+/// producing a plausible-looking but meaningless U statistic and p-value.
 pub fn mann_whitney_u(a: &[f64], b: &[f64]) -> Result<TestResult> {
     if a.is_empty() || b.is_empty() {
         return Err(NumericsError::InvalidInput(
             "Mann-Whitney U requires non-empty samples".into(),
+        ));
+    }
+    if a.iter().any(|x| x.is_nan()) || b.iter().any(|x| x.is_nan()) {
+        return Err(NumericsError::InvalidInput(
+            "Mann-Whitney U requires non-NaN samples".into(),
         ));
     }
     let n_a = a.len() as f64;
@@ -29,7 +47,13 @@ pub fn mann_whitney_u(a: &[f64], b: &[f64]) -> Result<TestResult> {
         .map(|&x| (x, 0))
         .chain(b.iter().map(|&x| (x, 1)))
         .collect();
-    combined.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+    // Both samples are validated non-NaN above, but may contain `±inf`;
+    // `total_cmp` orders `±inf` the same way `partial_cmp` would (it is a
+    // total order over the entire IEEE-754 bit space, `NaN` included), so
+    // `total_cmp` is used here to pin the fold order explicitly rather than
+    // depend on `partial_cmp` never seeing a `NaN` this function has already
+    // refused.
+    combined.sort_by(|x, y| x.0.total_cmp(&y.0));
 
     // Assign average ranks to ties.
     let mut ranks = vec![0.0_f64; combined.len()];

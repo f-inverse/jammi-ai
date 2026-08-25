@@ -239,13 +239,13 @@ fn fused_vs_eager_bf16_base_f32_lora_fwd_and_bwd_are_bit_exact_on_a_divergent_fi
     assert_eq!(out_fused.dtype(), DType::BF16);
     assert_eq!(fused_v, eager_v, "fwd must be bit-exact, not merely close");
 
-    // The discrimination proof (closes the audit finding on the previous
-    // version of this fixture, which was vacuous — every element's
-    // rounding error was too small to ever cross a bf16 rounding boundary,
-    // so this assertion would have passed even under a regression to
-    // f32-accumulate). Element 5's fused/eager result must equal the
-    // round-before-add model's hand-computed value (`3.25`) and must
-    // DIFFER from the rejected f32-accumulate model's value (`3.265625`).
+    // The discrimination proof: this fixture is chosen so element 5's
+    // rounding error crosses a bf16 rounding boundary, making the
+    // assertion below non-vacuous — a regression to f32-accumulate would
+    // fail it, not silently pass. Element 5's fused/eager result must
+    // equal the round-before-add model's hand-computed value (`3.25`) and
+    // must DIFFER from the rejected f32-accumulate model's value
+    // (`3.265625`).
     let discriminating_idx = 5;
     let round_before_add = fused_v[discriminating_idx];
     let round_once = f32_accumulate_round_once(

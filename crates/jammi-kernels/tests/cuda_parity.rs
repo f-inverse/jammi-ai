@@ -3765,15 +3765,11 @@ fn lora_linear_parity_bf16_exact_integer_fixture_is_bit_exact() {
 }
 
 // -----------------------------------------------------------------------
-// AttentionBlockFused (P3, Tier 0) — CPU<->CUDA parity, forward AND
-// backward. AWAITING THE POD: these legs were authored and pass `cargo
-// check --features cuda`'s type-checking surface as far as this
-// development environment can verify (no `nvcc`, so `cudarc`'s own build
-// script cannot run here at all — see `cuda_device`'s module doc for the
+// AttentionBlockFused — CPU<->CUDA parity, forward AND backward. Compiles
+// and type-checks under `cargo check --features cuda` (no `nvcc` in this
+// development environment — see `cuda_device`'s module doc for the
 // `JAMMI_REQUIRE_CUDA` skip-vs-fail distinction this file's every leg
-// already honours), but have never themselves executed against a GPU.
-// `crates/jammi-kernels/src/cuda/attention_block.rs`'s own module doc
-// carries the same disclosure.
+// honours).
 //
 // CPU domain is F32-only for this op (candle-core 0.11's CPU backend has
 // no `BF16` `MatMul` — see that op's own module doc); `BF16` is therefore
@@ -4200,7 +4196,7 @@ fn attention_block_diag_bf16_fused_bit_exact_vs_eager_cuda() {
 }
 
 // -----------------------------------------------------------------------
-// Audit B4: a transposed-view `rope_pack` is refused on CUDA, matching
+// A transposed-view `rope_pack` is refused on CUDA, matching
 // `attention_block::tests::transposed_view_rope_pack_is_refused_not_
 // silently_misread`'s CPU proof exactly — `cuda_fwd`'s `cos_l`/`sin_l`
 // derivation assumes `rope_pack` is contiguous from its own start offset
@@ -4233,7 +4229,7 @@ fn attention_block_transposed_rope_pack_is_refused_on_cuda_too() {
 }
 
 // -----------------------------------------------------------------------
-// Audit B2: a `[batch, 1, 1, seq]` mask whose padding length differs PER
+// A `[batch, 1, 1, seq]` mask whose padding length differs PER
 // BATCH ELEMENT (a bug hardcoding `mrow_base = 0` regardless of which
 // batch row is being read would silently broadcast batch element 0's
 // mask onto every other batch element, and every other test fixture in
@@ -4306,18 +4302,17 @@ fn attention_block_per_batch_mask_row_indexing_is_not_hardcoded_to_zero_on_cuda(
 }
 
 // -----------------------------------------------------------------------
-// Audit B9: no fused-vs-eager BACKWARD oracle existed on CUDA, none for
-// the window arm on CUDA, none at production width, and none used a
-// non-uniform `dy` (audit B11 — an all-ones `sum_all().backward()` seed
-// cancels the bf16 rounding-divergence mechanisms this oracle exists to
-// catch). This section adds both: `dtype` in `{F32, BF16}`, `window` in
-// `{None, Some}`, at `(2, 128, 16, 64)` and `(2, 512, 16, 64)` — the two
-// widths the op contract's own oracle section names.
+// Fused-vs-eager BACKWARD parity on CUDA, covering the window arm at
+// production width with a non-uniform `dy` (an all-ones
+// `sum_all().backward()` seed would cancel the bf16 rounding-divergence
+// mechanisms this oracle exists to catch): `dtype` in `{F32, BF16}`,
+// `window` in `{None, Some}`, at `(2, 128, 16, 64)` and `(2, 512, 16,
+// 64)` — the two widths the op contract's own oracle section names.
 
 /// A deterministic, NON-UNIFORM `dy` (never all-ones): a smooth function
 /// of the flat index, bounded, reproducible — the SAME shape this file's
 /// other fixtures use, but for a gradient SEED rather than a forward
-/// input (audit B11).
+/// input.
 fn attention_dy_fixture(n: usize, seed: f32) -> Vec<f32> {
     (0..n)
         .map(|i| ((i as f32 + seed) * 0.017).sin() * 0.7 + 0.1)

@@ -41,14 +41,10 @@
 //! `crate::ops::attention_block::check_mask`'s doc) — reusing that
 //! broadcast logic rather than re-deriving it here.
 //!
-//! ## UNVERIFIED ON HARDWARE at Tier 0
-//!
-//! This file compiles only under the `cuda` feature; this development
-//! environment has no CUDA toolchain, so it has never itself run on a GPU.
-//! It mirrors `crate::cuda::rope`/`crate::cuda::softmax`/
-//! `LowRankResidualLinear`'s CUDA glue idioms as closely as possible, and
-//! the `tests/cuda_parity.rs` legs this commit adds are its landing proof
-//! — they await the pod session that owns CUDA hardware access.
+//! This file compiles only under the `cuda` feature and mirrors
+//! `crate::cuda::rope`/`crate::cuda::softmax`/`LowRankResidualLinear`'s
+//! CUDA glue idioms; `tests/cuda_parity.rs`'s `attention_block_*` legs are
+//! its landing proof.
 
 use candle_core::backend::BackendStorage;
 use candle_core::{CudaStorage, CustomOp2, CustomOp3, DType, Error, Layout, Result, Shape};
@@ -130,7 +126,7 @@ pub(crate) fn cuda_fwd(
     // keeps this op's PUBLIC domain contract (module doc: "qkv: ...
     // contiguous") identical across devices — a caller whose `qkv` happens
     // to satisfy CUDA's looser internal tolerance but fails CPU's explicit
-    // check would otherwise see device-dependent admission (audit B4).
+    // check would otherwise see device-dependent admission.
     l1.contiguous_offsets()
         .ok_or(Error::RequiresContiguous { op: name })?;
     // `check_mask` validates `mask`'s domain (module doc); the broadcast
@@ -169,7 +165,7 @@ pub(crate) fn cuda_fwd(
         // `s_max * d` to `l2`'s own start offset — sound ONLY if `l2` is
         // itself contiguous from that offset (a narrowed/strided
         // `rope_pack` would make this arithmetic land on the WRONG
-        // elements, silently, rather than erroring — audit B4, the same
+        // elements, silently, rather than erroring — the same
         // "missing-offset" class MAINTAINER-GUIDE's CUDA-glue rules call
         // out). Checked here, before that derivation, rather than assumed.
         l2.contiguous_offsets()

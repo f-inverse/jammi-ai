@@ -826,8 +826,8 @@ mod tests {
             let ds = Tensor::randn(0f32, 1.0, (b, h, s, s), &device).unwrap();
 
             // scores = q_scaled.contiguous() @ k_rot.transpose(-1,-2) — NO
-            // `.contiguous()` on the rhs (audit B6 / the module doc's
-            // "fwd/bwd GEMM shape match" section): this must be the SAME
+            // `.contiguous()` on the rhs (see the module doc's "fwd/bwd
+            // GEMM shape match" section): this must be the SAME
             // transpose-VIEW operand `fwd` issues, not a materialized
             // contiguous copy.
             let lhs = q.contiguous().unwrap();
@@ -1110,19 +1110,15 @@ mod tests {
         }
     }
 
-    /// Audit B1: no `bwd` oracle existed under a window arm at all —
-    /// deleting the band combination from a caller's mask entirely stayed
-    /// green, because every existing `bwd`-exercising test used
-    /// `window=None`. This is the fwd+bwd bit-exact proof, at a boundary
-    /// shape `(3, 9, 2, 64)` and a production-scale shape
-    /// `(2, 128, 16, 64)`, with a per-batch-VARYING padding mask (audit B2
-    /// — a `mrow_base` bug would silently broadcast one batch element's
-    /// row onto every other) and a genuinely non-uniform `dy` seed (audit
-    /// B11 — `sum_all().backward()`'s all-ones seed cancels exactly the
-    /// class of bug this oracle exists to catch). `assert_eq!` throughout:
-    /// F32 CPU, the SAME op sequence (`RopeFused` + matmul +
-    /// `SoftmaxLastDimFused` + matmul) either way, so the rounding model
-    /// predicts bit-exact equality, not a tolerance.
+    /// The fwd+bwd bit-exact proof under a WINDOW arm: a boundary shape
+    /// `(3, 9, 2, 64)` and a production-scale shape `(2, 128, 16, 64)`,
+    /// with a per-batch-VARYING padding mask (a `mrow_base` bug would
+    /// silently broadcast one batch element's row onto every other) and a
+    /// genuinely non-uniform `dy` seed (`sum_all().backward()`'s all-ones
+    /// seed would cancel exactly the class of bug this oracle exists to
+    /// catch). `assert_eq!` throughout: F32 CPU, the SAME op sequence
+    /// (`RopeFused` + matmul + `SoftmaxLastDimFused` + matmul) either way,
+    /// so the rounding model predicts bit-exact equality, not a tolerance.
     #[test]
     fn cpu_fwd_and_bwd_bit_exact_vs_eager_with_window_nonuniform_dy_and_per_batch_mask() {
         for &(b, h, s, d) in &[
@@ -1305,9 +1301,9 @@ mod tests {
         assert!(matches!(err, Error::Msg(_)));
     }
 
-    /// Audit B4's other half: `qkv` must be contiguous on BOTH devices
-    /// (`cpu_fwd`'s own `l1.contiguous_offsets()` refusal; `cuda_fwd` gained
-    /// the SAME check even though `gather_bhsd`'s `copy_strided_src` could
+    /// `qkv` must be contiguous on BOTH devices (`cpu_fwd`'s own
+    /// `l1.contiguous_offsets()` refusal; `cuda_fwd` carries the SAME
+    /// check even though `gather_bhsd`'s `copy_strided_src` could
     /// structurally tolerate a strided source — so this op's public domain
     /// contract does not depend on which device runs it).
     #[test]
@@ -1437,12 +1433,12 @@ mod tests {
         let _ = err;
     }
 
-    /// Audit B4: `cuda_fwd`'s `cos_l`/`sin_l` derivation assumes `rope_pack`
+    /// `cuda_fwd`'s `cos_l`/`sin_l` derivation assumes `rope_pack`
     /// is itself contiguous from its own `start_offset` (`sin`'s offset is
     /// computed by ADDING `s_max * d` to that start offset) — a narrowed
     /// or transposed `rope_pack` would silently read the WRONG elements
     /// rather than error, the same "missing-offset" class this crate's
-    /// CUDA glue idioms are audited for elsewhere. `cpu_fwd` shares the
+    /// CUDA glue idioms guard against elsewhere. `cpu_fwd` shares the
     /// SAME `check_rope_pack` shape check plus its own
     /// `l2.contiguous_offsets()` refusal, so both devices refuse a
     /// transposed-view `rope_pack` identically — this is the CPU half of

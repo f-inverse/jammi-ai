@@ -1,0 +1,149 @@
+{
+  "unit": "cast-boundary-wave1-A/B",
+  "git_sha": "80f02fb993806266f05929b6295d7fb9a159696a",
+  "date": "2026-08-25T21:05:13Z",
+  "gpu": "NVIDIA A100-SXM4-80GB, 580.126.16",
+  "nvcc": "Cuda compilation tools, release 12.6, V12.6.85",
+  "features": "cuda",
+  "box": "a100b (exclusive, per the lead)",
+  "env": {
+    "JAMMI_KERNELS_STRICT": "1"
+  },
+  "status": "GREEN",
+  "note": "Same-build forced arm A/B (JAMMI_KERNELS_DISABLE=cast_scale_bf16_f32,cast_add_bf16), run by the lead on the exclusive timing box; pulled from /root/castw1-ab/*.json + /root/castw1-ab.log on a100b and committed verbatim (2 shapes x 2 arms x 2 reps).",
+  "legs": {
+    "b8_s512_fused_r1": {
+      "s_per_step_p50": 0.634850336,
+      "s_per_step_mean": 0.6349387365200001,
+      "lora_linear_fused_dispatches": 3360,
+      "lora_linear_eager_dispatches": 0,
+      "attention_block_fused_dispatches": 840,
+      "kernels_disabled_requested": [],
+      "kernels_disabled_fired": []
+    },
+    "b8_s512_fused_r2": {
+      "s_per_step_p50": 0.635428075,
+      "s_per_step_mean": 0.6446690411199999,
+      "lora_linear_fused_dispatches": 3360,
+      "lora_linear_eager_dispatches": 0,
+      "attention_block_fused_dispatches": 840,
+      "kernels_disabled_requested": [],
+      "kernels_disabled_fired": []
+    },
+    "b8_s512_disabled_r1": {
+      "s_per_step_p50": 0.674415994,
+      "s_per_step_mean": 0.67451149768,
+      "lora_linear_fused_dispatches": 3360,
+      "lora_linear_eager_dispatches": 0,
+      "attention_block_fused_dispatches": 840,
+      "kernels_disabled_requested": [
+        "cast_add_bf16",
+        "cast_scale_bf16_f32"
+      ],
+      "kernels_disabled_fired": [
+        "cast_add_bf16",
+        "cast_scale_bf16_f32"
+      ]
+    },
+    "b8_s512_disabled_r2": {
+      "s_per_step_p50": 0.672819099,
+      "s_per_step_mean": 0.6729609303600002,
+      "lora_linear_fused_dispatches": 3360,
+      "lora_linear_eager_dispatches": 0,
+      "attention_block_fused_dispatches": 840,
+      "kernels_disabled_requested": [
+        "cast_add_bf16",
+        "cast_scale_bf16_f32"
+      ],
+      "kernels_disabled_fired": [
+        "cast_add_bf16",
+        "cast_scale_bf16_f32"
+      ]
+    },
+    "b8_s128_fused_r1": {
+      "s_per_step_p50": 0.18826833,
+      "s_per_step_mean": 0.18832536248,
+      "lora_linear_fused_dispatches": 3360,
+      "lora_linear_eager_dispatches": 0,
+      "attention_block_fused_dispatches": 840,
+      "kernels_disabled_requested": [],
+      "kernels_disabled_fired": []
+    },
+    "b8_s128_fused_r2": {
+      "s_per_step_p50": 0.188276095,
+      "s_per_step_mean": 0.18834605752000005,
+      "lora_linear_fused_dispatches": 3360,
+      "lora_linear_eager_dispatches": 0,
+      "attention_block_fused_dispatches": 840,
+      "kernels_disabled_requested": [],
+      "kernels_disabled_fired": []
+    },
+    "b8_s128_disabled_r1": {
+      "s_per_step_p50": 0.197832099,
+      "s_per_step_mean": 0.19786697296,
+      "lora_linear_fused_dispatches": 3360,
+      "lora_linear_eager_dispatches": 0,
+      "attention_block_fused_dispatches": 840,
+      "kernels_disabled_requested": [
+        "cast_add_bf16",
+        "cast_scale_bf16_f32"
+      ],
+      "kernels_disabled_fired": [
+        "cast_add_bf16",
+        "cast_scale_bf16_f32"
+      ]
+    },
+    "b8_s128_disabled_r2": {
+      "s_per_step_p50": 0.197707723,
+      "s_per_step_mean": 0.19776508287999994,
+      "lora_linear_fused_dispatches": 3360,
+      "lora_linear_eager_dispatches": 0,
+      "attention_block_fused_dispatches": 840,
+      "kernels_disabled_requested": [
+        "cast_add_bf16",
+        "cast_scale_bf16_f32"
+      ],
+      "kernels_disabled_fired": [
+        "cast_add_bf16",
+        "cast_scale_bf16_f32"
+      ]
+    }
+  },
+  "deltas": {
+    "b8_s512_p50_ms": {
+      "fused_r1": 634.850336,
+      "disabled_r1": 674.415994,
+      "delta_ms": 39.565658000000006,
+      "delta_pct": 6.232281178157861
+    },
+    "b8_s128_p50_ms": {
+      "fused_r1": 188.26833000000002,
+      "disabled_r1": 197.832099,
+      "delta_ms": 9.563769
+    }
+  },
+  "dispatch_counter_proof": "requested == fired on both disabled legs (['cast_add_bf16', 'cast_scale_bf16_f32']) \u2014 the forced-eager arm genuinely fell back, not a no-op disable key.",
+  "known_gap": "FinetuneStepTier's JSON does not surface cast_scale_bf16_f32/cast_add_bf16 DispatchCounters as named fields (only lora_linear_fused/eager, attention_block_fused/eager, etc. are wired) \u2014 flagged as a jammi-bench-domain follow-up, not fixed in this crate's scope.",
+  "isolated_kernel_timing_a100d": {
+    "box": "a100d (exclusive at measurement time, verified via nvidia-smi 0% util / 0 MiB before running)",
+    "method": "wall-clock around a Device::synchronize() bracket (nsys unavailable/broken on this pod image: 'nsys --version' errors \"hasn't been installed with CUDA Toolkit 12.6\"), 50 iterations after a 1-launch warm-up, release profile",
+    "cast_scale_bf16_f32": {
+      "shape": "m=12288 outf=3072 (Wqkv-site B1 population)",
+      "ms_per_launch": 0.7459,
+      "achieved_gb_per_s": 303.6,
+      "pct_of_2039_roofline": 14.89,
+      "traffic_model": "read bf16 (2B) + write f32 (4B) per element",
+      "caveat": "this measurement includes the fresh device.alloc::<f32>(n) cost (151 MB output buffer, allocated every call since apply1 has no output-buffer reuse) \u2014 NOT a device-side-only kernel timeline; the true kernel-only GB/s is likely higher than this wall-clock-derived figure. 14.89% is below the guide's \"realistic 25-50%\" band; vectorized 128-bit loads (guide S2 fix #1) were not implemented in this pass \u2014 a Wave 1.1 follow-up, not done here due to inability to compile-test CUDA locally (no nvcc on the authoring machine) this close to the timing run."
+    },
+    "cast_add_bf16": {
+      "shape": "m=12288 inf=1024 (Wqkv-site B3 population)",
+      "ms_per_launch": 0.1027,
+      "achieved_gb_per_s": 980.5,
+      "pct_of_2039_roofline": 48.09,
+      "traffic_model": "read f32 (4B) + read bf16 (2B) + write bf16 (2B) per element",
+      "caveat": "smaller output buffer (25 MB bf16) than cast_scale_bf16_f32's, so less allocation-overhead confound; inside the guide's realistic 25-50% band."
+    }
+  },
+  "cuda_parity_suite": "70/70 passed at 52c6070 (pre-dispatch-counter-test tip of this branch, on a100d — different box from the A/B's a100b, both A100 SXM4 80GB); 71/71 (adds the dispatch-counter test) at 80f02fb; 71 passed + 1 ignored (the isolated-timing test, which needs an explicit --ignored flag) at 32d7917 (this branch's final tip at report time), all on a100d under JAMMI_REQUIRE_CUDA=1 (the landing-proof mode — a device-acquisition failure panics instead of silently skipping).",
+  "cuda_clippy_final_sha": "cargo clippy -p jammi-kernels --all-targets --features cuda -- -D warnings: clean at 32d7917, a100d."
+}

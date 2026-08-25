@@ -20,22 +20,45 @@
 #      number; what the #352 throughput ratio is measured against).
 # Emits one merged JSON report + a printed table: s/step p50, triplets/s,
 # peak VRAM (delta, comparable across stacks, and absolute where torch has
-# it — see "VRAM columns" below), the fused-kernel dispatch counters on
-# every jammi-fused row (the positive-proof channel: fused > 0 AND eager ==
-# 0 is what "the fused path actually ran" looks like — a step-time win
-# alone cannot distinguish that from "fused silently fell back and eager
-# was just fast"), the ratio jammi-fused/torch-sdpa, and a PASS/FAIL against
-# #352's bar (>= 0.9x torch-sdpa throughput at matched batch/seq, no OOM on
-# a config torch itself completed). Like every jammi-bench tier, this
-# RECORDS — it does not gate the process exit code on a config missing the
-# bar; a FAIL row is data for a human to read, not an infrastructure
-# failure (see finetune_step.rs's own module doc). The script's own exit
-# code reflects whether the sweep RAN, not whether every config passed.
+# it — see "VRAM columns" below), EVERY fused-kernel dispatch counter PAIR
+# present in the jammi-fused report (the positive-proof channel: fused > 0
+# AND eager == 0 for EVERY pair — ln, rope, softmax, geglu, lora_epilogue,
+# lora_linear, attention_block, and whatever lands next — is what "the
+# fused path actually ran, end to end" looks like; a step-time win alone
+# cannot distinguish that from "one op silently fell back and the rest were
+# fast anyway"; see `fused_proof`/`dispatch_pairs` in the merge stage for
+# why this reads the pairs off the report's own keys rather than a
+# hardcoded name list), each leg's per-step loss_first->loss_last and a
+# loss_final_ratio jammi-fused/torch-sdpa column (SAME DATA, COST FIXTURE —
+# NOT A QUALITY RESULT, printed only so a large divergence is visible — see
+# "loss_final_ratio" below), the ratio jammi-fused/torch-sdpa, and a
+# PASS/FAIL against #352's bar (>= 0.9x torch-sdpa throughput at matched
+# batch/seq, no OOM on a config torch itself completed). Like every
+# jammi-bench tier, this RECORDS — it does not gate the process exit code
+# on a config missing the bar; a FAIL row is data for a human to read, not
+# an infrastructure failure (see finetune_step.rs's own module doc). The
+# script's own exit code reflects whether the sweep RAN, not whether every
+# config passed.
 #
 # NOT covered here: loss-TRAJECTORY equivalence between jammi-fused and
 # jammi-eager (the #352 quality constraint) is a REAL-TRAINER check over
 # >= 5 seeds reusing C0's distributional oracle machinery — a different,
-# slower harness than this one-step-timing sweep. Run it separately.
+# slower harness than this one-step-timing sweep. Run it separately. The
+# loss_first/loss_last/loss_final_ratio columns THIS script prints are a
+# different, weaker thing: one synthetic-data cost-fixture step count from
+# `finetune-step`/`torch_finetune_step.py` itself, printed for visibility,
+# never a substitute for that real-trainer check.
+#
+# loss_final_ratio (jammi-fused loss_last / torch-sdpa loss_last): SAME
+# DATA (both stacks feed the identical synthetic token ids — the two
+# scripts' `synthetic_ids` are a literal LCG port of each other; see
+# torch_finetune_step.py's module doc), but NOT a quality result: the two
+# stacks run different attention-kernel arithmetic and, at this script's
+# `--lora-init peft` default, different LoRA init distributions, so a ratio
+# far from 1.0 does not indicate either stack regressed — it indicates the
+# comparison's preconditions (matched init, matched attention arithmetic)
+# were not met, which is exactly why this rides as a printed reference, not
+# a gated bar.
 #
 # Leg resolution is BY COMMIT SUBJECT, never by position in history or a
 # hardcoded SHA (the stale-build lesson generalized: a script that names a
@@ -416,6 +439,36 @@ def finetune_block(report, leg):
     return report["tiers"]["finetune_step"] if leg.startswith("jammi") else report["finetune_step"]
 
 
+def dispatch_pairs(fs):
+    """Every `(base, fused_key, eager_key)` positive-proof pair PRESENT in
+    this report's `finetune_step` block, discovered from the JSON keys
+    themselves rather than a hardcoded name list — the P2-oracle advisory:
+    a hardcoded ln/rope/softmax trio silently stops catching a NEW fused op
+    (geglu, lora_epilogue, lora_linear, attention_block, and whatever lands
+    next) the day it is added to `finetune_step.rs`'s `FinetuneStepTier`
+    without this script being updated in lockstep. Every key ending in
+    `_fused_dispatches` names a pair; its sibling is the same base with
+    `_eager_dispatches`, which `finetune_step.rs`'s own struct guarantees
+    always exists alongside the fused counter (every fused/eager counter in
+    that struct is added as a pair, never solo).
+    """
+    pairs = []
+    for key in fs:
+        if not key.endswith("_fused_dispatches"):
+            continue
+        base = key[: -len("_fused_dispatches")]
+        eager_key = f"{base}_eager_dispatches"
+        if eager_key not in fs:
+            raise KeyError(
+                f"'{key}' has no matching '{eager_key}' in the report — "
+                "finetune_step.rs's fused/eager counters are supposed to "
+                "always come in pairs; a solo counter is a schema bug, not "
+                "a config this script should silently skip."
+            )
+        pairs.append((base, fs[key], fs[eager_key]))
+    return pairs
+
+
 def metrics(entry, leg):
     if entry["outcome"] != "OK":
         return None
@@ -423,13 +476,13 @@ def metrics(entry, leg):
     m = {
         "s_per_step_p50": fs["s_per_step_p50"]["value"],
         "triplets_per_s": fs["triplets_per_s"]["value"],
+        "loss_first": fs.get("loss_first"),
+        "loss_last": fs.get("loss_last"),
     }
     if leg.startswith("jammi"):
         m["vram_delta_bytes"] = fs["peak_vram_bytes"]["value"]
         m["vram_absolute_bytes"] = None
-        m["ln_fused"], m["ln_eager"] = fs["ln_fused_dispatches"], fs["ln_eager_dispatches"]
-        m["rope_fused"], m["rope_eager"] = fs["rope_fused_dispatches"], fs["rope_eager_dispatches"]
-        m["softmax_fused"], m["softmax_eager"] = fs["softmax_fused_dispatches"], fs["softmax_eager_dispatches"]
+        m["dispatch_pairs"] = dispatch_pairs(fs)
     else:
         m["vram_delta_bytes"] = fs["peak_vram_delta_bytes"]["value"]
         m["vram_absolute_bytes"] = fs["peak_vram_absolute_bytes"]["value"]
@@ -437,13 +490,39 @@ def metrics(entry, leg):
 
 
 def fused_proof(m):
+    """EVERY `*_fused_dispatches` / `*_eager_dispatches` pair present in the
+    report (see `dispatch_pairs`'s doc — not just the historical ln/rope/
+    softmax trio) must show NO eager fallback, and at least one pair must
+    show a real fused dispatch. This is deliberately NOT "every pair must
+    be fused>0 and eager==0": `FinetuneStepTier`'s own doc documents a real,
+    non-bug exception — `lora_epilogue_*_dispatches` reads a PERMANENT (0,
+    0) on a run where `lora_linear_*_dispatches` is nonzero (one CustomOp3
+    absorbs the standalone epilogue's own `cpu_fwd`/`cuda_fwd` internally,
+    never through its own admission call), and vice versa; asserting
+    fused>0 on BOTH members of that pair would make this check fail on
+    every real run regardless of whether anything actually regressed. So a
+    (0, 0) pair is read as "untouched this run" (a legitimate sibling
+    exclusivity, or an op this config's shapes never exercised) and
+    EXCLUDED from the requirement rather than failed; a pair with
+    `eager > 0` for ANY amount is still a hard fail (an admitted call site
+    that actually fell back), and the overall proof additionally requires
+    at least one pair to show `fused > 0` — a report where every pair
+    reads (0, 0) (e.g. a schema regression that dropped every counter, or
+    zero dispatches for any other reason) is NOT vacuously True.
+    """
     if m is None:
         return None
-    return (
-        m["ln_fused"] > 0 and m["ln_eager"] == 0
-        and m["rope_fused"] > 0 and m["rope_eager"] == 0
-        and m["softmax_fused"] > 0 and m["softmax_eager"] == 0
-    )
+    pairs = m.get("dispatch_pairs")
+    if not pairs:
+        return False
+    any_fused = False
+    for _base, fused, eager in pairs:
+        if fused == 0 and eager == 0:
+            continue
+        if eager > 0:
+            return False
+        any_fused = True
+    return any_fused
 
 
 def fmt(v, nd=4):
@@ -486,6 +565,26 @@ for slug in slugs:
         fused_m and sdpa_m and sdpa_m["triplets_per_s"]
     ) else None
 
+    # loss_final_ratio: jammi-fused's loss_last over torch-sdpa's loss_last.
+    # SAME DATA, COST FIXTURE -- NOT A QUALITY RESULT (per finetune_step.rs's
+    # own module doc's "Honesty about what is measured", and
+    # torch_finetune_step.py's "LOSS TRAJECTORY" section): the two stacks run
+    # different attention-kernel arithmetic and different LoRA init
+    # distributions by default (--lora-init peft here, matching this script's
+    # torch legs, vs jammi's own ZerosB init), so a ratio far from 1.0 does
+    # NOT mean either stack is wrong -- it means the loss values are not
+    # comparable under these settings. Printed anyway so a large divergence
+    # is VISIBLE to a human reader, never asserted against a bar.
+    loss_ratio = None
+    if (
+        fused_m
+        and sdpa_m
+        and fused_m.get("loss_last") is not None
+        and sdpa_m.get("loss_last") is not None
+        and sdpa_m["loss_last"] != 0.0
+    ):
+        loss_ratio = fused_m["loss_last"] / sdpa_m["loss_last"]
+
     any_dry_run = any(entries[leg]["outcome"] == "DRY_RUN" for leg in LEGS)
     torch_fits = entries["torch-sdpa"]["outcome"] == "OK"
     jammi_fused_fits = entries["jammi-fused"]["outcome"] == "OK"
@@ -509,11 +608,18 @@ for slug in slugs:
     if proof is False:
         verdict += " [WARN: fused-dispatch proof missing — fused>0/eager==0 did not hold]"
 
-    summary_rows.append((slug, ratio, verdict))
+    summary_rows.append((slug, ratio, loss_ratio, verdict))
     merged["configs"][slug] = {
         "legs": {leg: {"outcome": entries[leg]["outcome"], "metrics": leg_metrics[leg]} for leg in LEGS},
         "jammi_fused_dispatch_proof": proof,
         "ratio_jammi_fused_over_torch_sdpa": ratio,
+        "loss_final_ratio_jammi_fused_over_torch_sdpa": loss_ratio,
+        "loss_final_ratio_note": "same data, cost fixture -- NOT a quality result "
+        "(see finetune_step.rs's module doc / torch_finetune_step.py's LOSS "
+        "TRAJECTORY section: different attention-kernel arithmetic and "
+        "reduction order between the two stacks makes a loss VALUE comparison "
+        "meaningless even given identical synthetic input ids). Printed so a "
+        "divergence is visible, never gated.",
         "verdict": verdict,
     }
 
@@ -525,8 +631,9 @@ lines = [
     "# finetune A/B -- jammi eager vs jammi fused vs torch eager vs torch sdpa",
     f"# steps={STEPS} warmup={WARMUP} pass_bar={PASS_RATIO}x torch-sdpa triplets/s, no OOM where torch fits",
     "# loss-trajectory equivalence (jammi-fused vs jammi-eager, real trainer, >=5 seeds) is a SEPARATE check -- not measured here.",
+    "# loss_first->loss_last and loss_final_ratio below: SAME DATA, COST FIXTURE -- NOT A QUALITY RESULT. Printed so a divergence is visible, never gated.",
     f"{'config':<16}{'leg':<13}{'outcome':<9}{'s/step_p50':<12}{'triplets/s':<12}"
-    f"{'vram_delta(comparable)':<24}{'vram_absolute(torch only)':<27}{'fused_proof':<12}",
+    f"{'vram_delta(comparable)':<24}{'vram_absolute(torch only)':<27}{'fused_proof':<12}{'loss_first->last':<24}",
 ]
 for slug, leg, outcome, m, proof_val, err_tail in table_rows:
     p50 = fmt(m["s_per_step_p50"]) if m else "n/a"
@@ -534,16 +641,26 @@ for slug, leg, outcome, m, proof_val, err_tail in table_rows:
     vd = fmt_bytes(m["vram_delta_bytes"]) if m else "n/a"
     va = fmt_bytes(m["vram_absolute_bytes"]) if m else "n/a"
     proof_s = "n/a" if proof_val is None else ("YES" if proof_val else "NO")
-    lines.append(f"{slug:<16}{leg:<13}{outcome:<9}{p50:<12}{tps:<12}{vd:<24}{va:<27}{proof_s:<12}")
+    loss_s = (
+        "n/a"
+        if not m or m.get("loss_first") is None or m.get("loss_last") is None
+        else f"{fmt(m['loss_first'])}->{fmt(m['loss_last'])}"
+    )
+    lines.append(
+        f"{slug:<16}{leg:<13}{outcome:<9}{p50:<12}{tps:<12}{vd:<24}{va:<27}{proof_s:<12}{loss_s:<24}"
+    )
     if outcome not in ("OK", "DRY_RUN") and err_tail:
         last = err_tail.splitlines()[-1][:120] if err_tail.splitlines() else ""
         lines.append(f"    -> {last}")
 
 lines.append("")
-lines.append(f"{'config':<16}{'ratio(fused/sdpa)':<20}{'verdict':<60}")
-for slug, ratio, verdict in summary_rows:
+lines.append(
+    f"{'config':<16}{'ratio(fused/sdpa)':<20}{'loss_final_ratio(fused/sdpa,NOT-quality)':<42}{'verdict':<60}"
+)
+for slug, ratio, loss_ratio, verdict in summary_rows:
     ratio_s = "n/a" if ratio is None else f"{ratio:.3f}"
-    lines.append(f"{slug:<16}{ratio_s:<20}{verdict:<60}")
+    loss_ratio_s = "n/a" if loss_ratio is None else f"{loss_ratio:.4f}"
+    lines.append(f"{slug:<16}{ratio_s:<20}{loss_ratio_s:<42}{verdict:<60}")
 
 table = "\n".join(lines)
 print(table)

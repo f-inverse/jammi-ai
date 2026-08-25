@@ -63,6 +63,17 @@ pub(crate) fn sync_read_count() -> u64 {
 /// Computes `total_norm = sqrt(sum ||g||² for all g)` as a device scalar
 /// tensor (a fixed left-to-right fold over `trainable_vars` in order, so the
 /// reduction order — and therefore the bits — is deterministic run to run).
+/// Reduction order versus torch: `clip_grad_norm_` takes a norm of
+/// per-parameter norms (`torch._foreach_norm` per gradient, then
+/// `vector_norm` of the stacked norms — `sqrt(Σ_i (sqrt(Σ g_i²))²)`), while
+/// this folds the raw per-`Var` sums of squares and takes ONE `sqrt`
+/// (`sqrt(Σ_i Σ g_i²)`); the two agree in real arithmetic and differ in
+/// `f32` by the extra `sqrt`-then-square per `Var` torch rounds through —
+/// at most ~1 ulp of each squared term, so `|total_norm_jammi -
+/// total_norm_torch| <= (k + 2) · ε_f32 · total_norm` for `k` `Var`s
+/// (the `+ 2` for the shared final `sqrt` and the sum's own rounding),
+/// well inside the 4-ulp band `tests::multi_var_clip_matches_host_reference_
+/// on_cpu` asserts against a host reference.
 /// Every gradient is then rescaled by `clip_coef = (max_norm / (total_norm +
 /// 1e-6)).min(1.0)` **unconditionally**, matching torch's own avoidance of a
 /// host-syncing `if total_norm > max_norm` branch (`torch/nn/utils/
@@ -522,6 +533,237 @@ mod tests {
                 "expected {e}, got {a} (device/host coefficient diverged beyond 4 ULP)"
             );
         }
+    }
+
+    /// Four trainable `Var`s of UNEQUAL shapes on `device`, each with a
+    /// constant gradient (`d/dw[sum(c * w)] = c`), obtained through a real
+    /// `backward` exactly as every production caller obtains its
+    /// `GradStore`. The per-`Var` sums of squares are exact small integers
+    /// (`2 + 24 + 1 + 45 = 72`), so every partial sum in the device fold is
+    /// exactly representable — the fold's `+` is the ONLY thing that can
+    /// combine them, and `+`→`*` (`2 * 24 * 1 * 45 = 2160`) or `+`→`-`
+    /// (`2 - 24 - 1 - 45 = -68`, `sqrt` → NaN) is visible in the
+    /// coefficient.
+    fn four_vars_with_grads(device: &Device) -> (Vec<Var>, GradStore, Vec<Vec<f32>>) {
+        let specs: [(&[usize], f32); 4] =
+            [(&[2], 1.0), (&[3, 2], 2.0), (&[1, 4], 0.5), (&[5], 3.0)];
+        let mut vars = Vec::new();
+        let mut loss: Option<Tensor> = None;
+        let mut expected_grads = Vec::new();
+        for (dims, c) in specs {
+            let w = Var::from_tensor(&Tensor::zeros(dims, DType::F32, device).unwrap()).unwrap();
+            let coeff = Tensor::full(c, dims, device).unwrap();
+            let term = (w.as_tensor() * &coeff).unwrap().sum_all().unwrap();
+            loss = Some(match loss {
+                None => term,
+                Some(acc) => (&acc + &term).unwrap(),
+            });
+            expected_grads.push(vec![c; dims.iter().product()]);
+            vars.push(w);
+        }
+        let grads = loss.unwrap().backward().unwrap();
+        (vars, grads, expected_grads)
+    }
+
+    /// Bound derivation (f32, exact op sequence `clip_gradients` issues; see
+    /// clause "every doc claim about float behaviour is derived from the op
+    /// sequence in the tensor dtype"):
+    ///  - per-`Var` `sqr` + `sum_all`: exact here (squares of 1, 2, 0.5, 3 and
+    ///    their partial sums are all exactly representable integers or halves
+    ///    below 2^24) — 0 ulp; in general `(n_i - 1) * 0.5` ulp per `Var`;
+    ///  - the fold over 4 `Var`s: exact here (integer partial sums 2, 26, 27,
+    ///    72) — 0 ulp; in general `(k - 1) * 0.5` ulp;
+    ///  - `sqrt(72)`: correctly rounded, 0.5 ulp;
+    ///  - `affine(1.0, 1e-6)` (`x * 1.0 + 1e-6`): `x * 1.0` is exact, one
+    ///    rounding, 0.5 ulp;
+    ///  - `recip`: 0.5 ulp;
+    ///  - `affine(max_norm, 0.0)` with `max_norm == 1.0`: exact, 0 ulp;
+    ///  - `minimum(1.0)`: exact (no rounding), 0 ulp;
+    ///  - `broadcast_mul`: one rounding per element, 0.5 ulp.
+    /// The host reference computes the same chain in f64 (error ≪ 1 f32 ulp)
+    /// and rounds to f32 once (0.5 ulp). Total: ≤ 2.5 ulp device + 0.5 ulp
+    /// host = 3 ulp of the result; asserted at 4 ulp (one ulp of headroom for
+    /// the ulp-of-result vs ulp-of-intermediate mismatch at exponent
+    /// boundaries — not a fitted number).
+    fn assert_multi_var_clip_matches_host(device: &Device) -> Vec<Vec<f32>> {
+        let (vars, mut grads, before) = four_vars_with_grads(device);
+        let max_norm = 1.0f64;
+        let total_norm = clip_gradients(&vars, &mut grads, max_norm)
+            .unwrap()
+            .expect("clipping was enabled");
+        let norm_val: f32 = total_norm.to_scalar().unwrap();
+
+        // Host reference: torch's formula over the SAME per-element grads,
+        // `max_norm / (sqrt(Σ_i Σ g_i²) + 1e-6)`, in f64.
+        let total_sq: f64 = before
+            .iter()
+            .flat_map(|g| g.iter())
+            .map(|&x| (x as f64) * (x as f64))
+            .sum();
+        assert_eq!(
+            total_sq, 72.0,
+            "test setup: the exact-integer sum of squares"
+        );
+        let host_norm = total_sq.sqrt();
+        let host_coef = max_norm / (host_norm + 1e-6);
+        assert!(
+            host_coef < 1.0 - 1e-3,
+            "test setup: the coefficient must be STRICTLY below the 1.0 clamp, got {host_coef}"
+        );
+        let ulps = |e: f32, a: f32| -> f32 {
+            let ulp = f32::EPSILON * e.abs().max(f32::MIN_POSITIVE);
+            (e - a).abs() / ulp
+        };
+        assert!(
+            ulps(host_norm as f32, norm_val) <= 4.0,
+            "total_norm: host {host_norm} vs device {norm_val}"
+        );
+
+        let mut after = Vec::new();
+        for (w, g_before) in vars.iter().zip(&before) {
+            let g_after: Vec<f32> = grads
+                .get(w.as_tensor())
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            for (x, a) in g_before.iter().zip(&g_after) {
+                let e = ((*x as f64) * host_coef) as f32;
+                assert!(a.is_finite(), "clipped gradient must be finite, got {a}");
+                assert!(
+                    ulps(e, *a) <= 4.0,
+                    "expected {e} (host), got {a} (device) — {} ulp apart",
+                    ulps(e, *a)
+                );
+            }
+            after.push(g_after);
+        }
+        after
+    }
+
+    /// The multi-`Var` fold oracle on CPU: `clip_gradients` over FOUR `Var`s
+    /// of unequal shapes at a coefficient strictly below the `1.0` clamp,
+    /// against the host reference `max_norm / (sqrt(Σ_i Σ g_i²) + 1e-6)` and
+    /// every gradient `g_i * coef`, within the bound derived above.
+    ///
+    /// Mutation tried: `+` → `*` in the fold over per-`Var` squared sums
+    /// (`&acc + &sq` → `&acc * &sq`) — RED (`total_sq` becomes `2160`, the
+    /// coefficient a factor `sqrt(30)` too small). A single-`Var` fixture
+    /// cannot see that mutant: the fold is never entered with a `Some(acc)`.
+    #[test]
+    fn multi_var_clip_matches_host_reference_on_cpu() {
+        assert_multi_var_clip_matches_host(&Device::Cpu);
+    }
+
+    /// Acquire CUDA device 0, or skip — unless `JAMMI_REQUIRE_CUDA` is set
+    /// (the pod session that is this leg's landing proof), in which case a
+    /// missing device is a failure, never a silent skip.
+    fn cuda_device_or_skip(test: &str) -> Option<Device> {
+        match Device::new_cuda(0) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
+                    panic!(
+                        "{test}: JAMMI_REQUIRE_CUDA is set but no CUDA device could be \
+                         acquired — a silent skip is not acceptable here: {e}"
+                    );
+                }
+                eprintln!("{test}: skipping — no CUDA device available ({e})");
+                None
+            }
+        }
+    }
+
+    /// The SAME oracle body on CUDA, plus CPU/CUDA BIT-identity of the
+    /// clipped gradients in this finite cell. Why bit-identity is the right
+    /// expectation and not a tolerance: every partial sum in the fixture is
+    /// an exactly-representable integer, so the per-`Var` `sum_all` and the
+    /// fold are exact on both backends regardless of their reduction order;
+    /// `sqrt`/`recip` are correctly rounded on both (nvcc's default
+    /// `-prec-sqrt=true`/`-prec-div=true`; candle-kernels does not build with
+    /// `-use_fast_math`); `affine(1.0, 1e-6)` is `x * 1.0 + 1e-6`, where
+    /// `x * 1.0` is exact, so an FMA contraction on the GPU rounds once to
+    /// the same value the CPU's two ops produce; `affine(max_norm, 0.0)`
+    /// with `max_norm == 1.0` and `minimum(1.0)` are exact; and the final
+    /// `broadcast_mul` is one rounding per element on both.
+    ///
+    /// The NaN cell is a DELIBERATE CPU≠CUDA divergence, not covered by the
+    /// identity assertion: candle-core-0.11.0 `src/op.rs:460` implements
+    /// `Minimum` as `if v1 > v2 { v2 } else { v1 }` — a NaN `v1` fails the
+    /// comparison and is returned, so on CPU a NaN coefficient stays NaN and
+    /// poisons EVERY gradient — while candle-kernels-0.11.0
+    /// `src/cuda_utils.cuh:144` implements it as `fminf`, IEEE `minNum`,
+    /// which returns the non-NaN operand: on CUDA the coefficient clamps to
+    /// `1.0` and only the gradient that was already NaN stays NaN. Neither
+    /// arm changes what `refuse_nonfinite_norm` sees — `total_norm` itself is
+    /// NaN on both, computed before the clamp — so the typed refusal is
+    /// device-independent; only the (never-consumed, since the step is
+    /// refused on cadence) rescaled gradients differ. `nan_gradient_poisons_
+    /// every_gradient_through_the_cpu_minimum` pins the CPU arm; this leg
+    /// pins the CUDA arm when a device is present.
+    #[test]
+    fn multi_var_clip_matches_host_reference_on_cuda_and_is_bit_identical_to_cpu() {
+        let Some(cuda) = cuda_device_or_skip("multi_var_clip_cuda") else {
+            return;
+        };
+        let after_cuda = assert_multi_var_clip_matches_host(&cuda);
+        let after_cpu = assert_multi_var_clip_matches_host(&Device::Cpu);
+        for (i, (c, g)) in after_cuda.iter().zip(&after_cpu).enumerate() {
+            let c_bits: Vec<u32> = c.iter().map(|x| x.to_bits()).collect();
+            let g_bits: Vec<u32> = g.iter().map(|x| x.to_bits()).collect();
+            assert_eq!(
+                c_bits, g_bits,
+                "Var {i}: CUDA-clipped gradient must be bit-identical to the CPU-clipped one \
+                 in the finite cell (cuda {c:?} vs cpu {g:?})"
+            );
+        }
+
+        // The NaN cell's CUDA arm: `fminf(NaN, 1.0) == 1.0`, so the finite
+        // Var's gradient passes through UNCHANGED (bit-identical to before)
+        // while `total_norm` is still NaN for the refusal to see.
+        let (vars, mut grads, before) = one_nan_var_one_finite_var(&cuda);
+        let total_norm = clip_gradients(&vars, &mut grads, 1.0).unwrap().unwrap();
+        assert!(total_norm.to_scalar::<f32>().unwrap().is_nan());
+        let finite_after: Vec<f32> = grads.get(vars[1].as_tensor()).unwrap().to_vec1().unwrap();
+        assert_eq!(
+            finite_after, before,
+            "CUDA's fminf clamps a NaN coefficient to 1.0: the finite gradient is untouched"
+        );
+    }
+
+    /// Two `Var`s: the first with an all-NaN gradient, the second with a
+    /// finite one (`2.0` × 3). Returns the finite gradient's pre-clip values.
+    fn one_nan_var_one_finite_var(device: &Device) -> (Vec<Var>, GradStore, Vec<f32>) {
+        let w_nan = Var::from_tensor(&Tensor::zeros((2,), DType::F32, device).unwrap()).unwrap();
+        let w_fin = Var::from_tensor(&Tensor::zeros((3,), DType::F32, device).unwrap()).unwrap();
+        let nan_coeff = Tensor::full(f32::NAN, (2,), device).unwrap();
+        let fin_coeff = Tensor::full(2.0f32, (3,), device).unwrap();
+        let loss = ((w_nan.as_tensor() * &nan_coeff).unwrap().sum_all().unwrap()
+            + (w_fin.as_tensor() * &fin_coeff).unwrap().sum_all().unwrap())
+        .unwrap();
+        let grads = loss.backward().unwrap();
+        let before: Vec<f32> = grads.get(w_fin.as_tensor()).unwrap().to_vec1().unwrap();
+        assert_eq!(before, vec![2.0; 3], "test setup: the finite gradient");
+        (vec![w_nan, w_fin], grads, before)
+    }
+
+    /// The NaN cell's CPU arm (see the CUDA leg's doc for the pair): a NaN
+    /// in ANY `Var`'s gradient makes `total_norm` NaN, the coefficient NaN,
+    /// and — through candle's CPU `Minimum` (`if v1 > v2 { v2 } else
+    /// { v1 }`, candle-core-0.11.0 `src/op.rs:460`) — the clamp returns the
+    /// NaN, so every OTHER gradient is rescaled to NaN too. The refusal is
+    /// what keeps that from mattering; this pins the arm the doc names.
+    #[test]
+    fn nan_gradient_poisons_every_gradient_through_the_cpu_minimum() {
+        let (vars, mut grads, _before) = one_nan_var_one_finite_var(&Device::Cpu);
+        let total_norm = clip_gradients(&vars, &mut grads, 1.0).unwrap().unwrap();
+        assert!(total_norm.to_scalar::<f32>().unwrap().is_nan());
+        let finite_after: Vec<f32> = grads.get(vars[1].as_tensor()).unwrap().to_vec1().unwrap();
+        assert!(
+            finite_after.iter().all(|x| x.is_nan()),
+            "CPU Minimum returns the NaN coefficient: the finite gradient is poisoned, got {finite_after:?}"
+        );
     }
 
     // The five tests below all read or mutate the process-wide, test-only

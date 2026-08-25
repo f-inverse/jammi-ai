@@ -2,16 +2,24 @@
 //!
 //! See `scratchpad/design-multi-tensor-adamw.md` for the full design study
 //! (launch/memcpy reconciliation against the perf census, the `CustomOp` vs
-//! `InplaceOp` decision, and the CPU-bit-exact/CUDA-tolerance acceptance
-//! split). Summary: `candle_core::CustomOp1/2/3::{cpu_fwd,cuda_fwd}` each
-//! return a BRAND-NEW `(Storage, Shape)` — applying one to a `Var`'s tensor
-//! still needs a `Var::set` afterward (a D2D memcpy) to splice the result
-//! back in. `candle_core::InplaceOp1/2/3` (`Tensor::inplace_op1/2/3`) mutate
-//! an existing tensor's storage directly, through candle's own
-//! `Arc<RwLock<Storage>>` write guard — the ONLY sound, public (no
-//! vendoring/patching candle) path to a writable device buffer, since
-//! `Tensor::storage_mut`/`storage_mut_and_layout` are `pub(crate)` in
-//! candle-core 0.11.0.
+//! `InplaceOp` decision). Summary: `candle_core::CustomOp1/2/3::{cpu_fwd,
+//! cuda_fwd}` each return a BRAND-NEW `(Storage, Shape)` — applying one to a
+//! `Var`'s tensor still needs a `Var::set` afterward (a D2D memcpy) to
+//! splice the result back in. `candle_core::InplaceOp1/2/3`
+//! (`Tensor::inplace_op1/2/3`) mutate an existing tensor's storage directly,
+//! through candle's own `Arc<RwLock<Storage>>` write guard — the ONLY
+//! sound, public (no vendoring/patching candle) path to a writable device
+//! buffer, since `Tensor::storage_mut`/`storage_mut_and_layout` are
+//! `pub(crate)` in candle-core 0.11.0.
+//!
+//! **The unit of fusion is one `Var`'s step, not a multi-tensor batch**:
+//! despite the design study's working name, this crate does NOT batch
+//! multiple `Var`s into one launch (candle has no such primitive without
+//! vendoring). Each `Var` still gets its own three kernel launches
+//! ([`adamw_step_fused_t`], below) — the lever is eliminating the
+//! `Var::set` D2D memcpy `CustomOp` would otherwise force per `Var` per
+//! step (672 `Var`s × steps in the design study's census), not eliminating
+//! per-`Var` launch overhead itself.
 //!
 //! AdamW's update splits into three in-place mutations, each already
 //! matching one `InplaceOpN` arity:
@@ -23,51 +31,105 @@
 //! 3. `theta[i] = theta[i]*(1-lr*wd) - lr*(m[i]*scale_m)/(sqrt(v[i]*scale_v)+eps)`
 //!    — [`AdamThetaUpdate`] via `InplaceOp3` (`theta` mutated, `m`/`v` read
 //!    — called AFTER (1)/(2), so `m`/`v` hold this step's freshly-EMA'd
-//!    values). [`adamw_step_fused`] composes the three, in order, for one
-//!    `Var`.
+//!    values). [`adamw_step_fused_t`] composes the three, in order, for one
+//!    `Var`, deriving `scale_m`/`scale_v` from the step counter `t` itself
+//!    (see that function's doc for why a caller-supplied `scale_m`/`scale_v`
+//!    — [`adamw_step_fused`]'s now-`#[deprecated]` shape — is a
+//!    bias-correction footgun). [`AdamWParams`] bundles the five scalar
+//!    hyperparameters that stay fixed across steps.
 //!
-//! Domain (family D): F32 only (the optimizer is not gated by esc-045's
-//! BF16 boundary — LoRA `theta`/moments are always F32, `adapter.rs`'s
-//! `ComputePrecision::backbone_dtype` only affects the frozen backbone). Not
-//! a broadcasting op: every tensor triple must share one shape (refused,
-//! `Error::ShapeMismatchBinaryOp`, never silently broadcast/truncated). CPU
-//! forward walks arbitrary strides (`StridedOffsets`, matching every other
-//! op in this crate); the CUDA forward (feature-gated) requires contiguous
-//! storage — LoRA's `theta`/`first_moment`/`second_moment` `Var`s are always
-//! freshly allocated and therefore always contiguous
-//! (`jammi-lora/src/lora_linear.rs:374-375`,`422-423`); a non-contiguous
-//! gradient (e.g. a transposed backward output) on CUDA is refused with
-//! `Error::RequiresContiguous` rather than silently misread.
+//! Domain (family D), validated ONCE, up front, before any of the three
+//! `InplaceOpN` calls mutates anything ([`validate_step_domain`]): `theta`/
+//! `first_moment`/`second_moment`/`grad` share one dtype (F32 only — the
+//! optimizer is not gated by esc-045's BF16 boundary; LoRA `theta`/moments
+//! are always F32, `adapter.rs`'s `ComputePrecision::backbone_dtype` only
+//! affects the frozen backbone), one shape (refused,
+//! `Error::ShapeMismatchBinaryOp`, never silently broadcast/truncated), and
+//! one device (`Error::DeviceMismatchBinaryOp`). No two of the four may
+//! ALIAS (share storage) — refused with `Error::CannotSetVar`, mirroring
+//! `Var::set`'s own aliasing guard (candle-core 0.11.0 `variable.rs:130-
+//! 135`), checked via read-lock pointer identity BEFORE any `InplaceOpN`
+//! call so a write-vs-read alias on the SAME `RwLock<Storage>` cannot
+//! deadlock candle's own locking (see [`refuse_aliased`]'s doc). The three
+//! MUTATED tensors (`theta`/`first_moment`/`second_moment`) additionally
+//! need an INJECTIVE layout on both arms: CUDA requires full contiguity
+//! (`Error::RequiresContiguous` — unchanged from before this fix); CPU
+//! forward walks arbitrary strides for **reads** (`StridedOffsets`,
+//! matching every other op in this crate) but a non-injective
+//! **destination** (a stride-0/broadcast dimension mapping multiple logical
+//! indices onto ONE storage slot) is refused the same way a broadcast
+//! `Var::set` target would be — writing through it would silently
+//! overwrite the same slot multiple times per step in an order this op
+//! does not control. `grad` (read-only) has no injectivity requirement on
+//! CPU — a transposed/broadcast gradient view reads correctly through
+//! `StridedOffsets` either way.
 //!
-//! **Bit-identity**: per-element, each of the three update rules above is
-//! evaluated as the SAME sequence of individually-rounded `f32` operations
-//! (`*`, `+`, `-`, `/`, `.sqrt()`) that `candle_nn`-style eager composition
-//! (`m*beta1 + g*(1-beta1)`, etc.) already performs — floating-point
-//! ELEMENTWISE operations have no cross-element interaction, so folding
-//! candle's separate full-array passes (affine, affine, add) into one
+//! **Bit-identity, both arms, not a CUDA tolerance.** Per-element, each of
+//! the three update rules above is evaluated as the SAME SEQUENCE of
+//! individually-rounded `f32` operations that candle's eager composition
+//! (`(m*beta1) + (g*(1-beta1))`, etc. — the literal `adamw.rs:94-100` chain
+//! this module's CPU unit tests reproduce as an independent oracle)
+//! performs — floating-point ELEMENTWISE operations have no cross-element
+//! interaction, so folding candle's separate full-array passes into one
 //! per-element expression changes nothing about that element's own
-//! rounding (`a+b` is exactly commutative in IEEE 754, unlike associativity
-//! across MULTIPLE elements, which this op never reorders). On the CPU arm
-//! this is provably bit-exact (Rust's `f32` arithmetic does not
-//! auto-contract into FMA without an explicit `.mul_add()` call — see the
-//! design study's §3, and every existing op in this module,
-//! e.g. `ops::axpy`, already relies on the same fact for its own
-//! `assert_eq!` oracles). On the CUDA arm this is a documented TOLERANCE
-//! claim, not bit-exact: nvcc's `--fmad=true` default (on regardless of
-//! `--use_fast_math`, which stays off — `build.rs`) may contract an
-//! `a*b+c`-shaped sub-expression into a single-rounding FMA, and — the key
-//! correction versus a naive reading — candle's OWN eager CUDA kernels
-//! (`candle-kernels-0.11.0/src/affine.cu`'s `x*mul+add`) are compiled by a
-//! build script this crate does not control and are exposed to the exact
-//! same contraction, so "bit-identical to the eager CUDA chain" is not an
-//! honestly provable claim either way; this crate's established convention
-//! (every C2-C7 fused op's `tests/cuda_parity.rs`) states a tolerance
-//! instead, and this op follows it.
+//! rounding PROVIDED the expression preserves both candle's OPERATION ORDER
+//! and its ROUNDING COUNT. Two corrections versus the previous version of
+//! this doc, both closed by the adversarial audit at `perf/multi-tensor-
+//! adamw`@0498f8b (`.jammi/ledger/perf-s2-20260825.jsonl`):
+//!
+//! - **Every `Tensor * f64` in the eager chain is `Affine(mul, 0.0)`**
+//!   (`candle-core-0.11.0/src/cpu_backend/mod.rs:311-317`'s CPU map is
+//!   literally `v * mul + add` with `add = T::from_f64(0.0)`; the CUDA
+//!   kernel — `candle-kernels-0.11.0/src/affine.cu`'s `AFFINE_OP(float,
+//!   affine_f32, x * mul + add)` — is the same expression). The trailing
+//!   `+ 0.0` is not a no-op: it LAUNDERS a `-0.0` product (from an
+//!   underflowed or exact-zero multiply) to `+0.0`, per IEEE-754's
+//!   opposite-sign-zero-sum rule. This op's CPU and CUDA arms both now
+//!   reproduce that `+ 0.0` explicitly at every scalar-multiply site
+//!   (`AdamMomentUpdate`/`AdamThetaUpdate`'s bodies below; the `.cu` file's
+//!   matching comment), not just the multiply — skipping it would silently
+//!   diverge on a `-0.0` input the eager chain launders away.
+//! - **On the CUDA arm this is provable, not a tolerance claim.** nvcc's
+//!   `--fmad=true` default (on regardless of `-use_fast_math`, which stays
+//!   off — `build.rs`) may silently contract an `a*b+c`-shaped C-source
+//!   sub-expression into a single-rounding hardware FMA — measured on
+//!   jammi-a100, this previously diverged from candle's own eager CUDA
+//!   chain on 5145/16384 `m` elements at t=3 with nonzero prior moments.
+//!   Per `build.rs`'s pinned-flags comment and `docs/maintainer/cuda-
+//!   kernel-guide.md`, the fix is explicit-rounding PTX intrinsics IN THE
+//!   EXPRESSION (`__fmul_rn`/`__fadd_rn`/`__fsub_rn`/`__fdiv_rn`, `sqrtf` —
+//!   already correctly-rounded without `-use_fast_math`), not a TU-wide
+//!   `--fmad=false` (which would tax every OTHER kernel in this crate for a
+//!   guarantee only this one needs). Each intrinsic is a single, non-fusable
+//!   IEEE round-to-nearest op, so ptxas cannot merge two of them into an
+//!   FMA the way it silently could with bare `*`/`+` — see `cuda/
+//!   adamw_step.cu` for the full per-site mapping against `adamw.rs:94-100`
+//!   and the acceptance harness in `tests/cuda_parity.rs` (fused-CUDA vs
+//!   eager-CUDA `to_bits()` equality, plus fused-CPU vs fused-CUDA) and this
+//!   file's own CPU-side oracle for the CPU arm.
+//!
+//! On the CPU arm, Rust's `f32` arithmetic does not auto-contract into FMA
+//! without an explicit `.mul_add()` call, so no intrinsic-pinning is needed
+//! there — but the `+ 0.0` laundering above is required on CPU too (Rust
+//! does not add it for you either).
 
 use candle_core::backend::BackendStorage;
 use candle_core::{CpuStorage, Error, InplaceOp2, InplaceOp3, Layout, Result, Tensor};
 
 use crate::layout_walk::StridedOffsets;
+
+/// Fixed hyperparameters for one [`adamw_step_fused_t`] call — everything
+/// EXCEPT the step counter `t` (which changes every step and therefore
+/// stays a separate argument rather than a field a caller could forget to
+/// update).
+#[derive(Debug, Clone, Copy)]
+pub struct AdamWParams {
+    pub beta1: f64,
+    pub beta2: f64,
+    pub lr: f64,
+    pub weight_decay: f64,
+    pub eps: f64,
+}
 
 /// In-place `dst[i] = beta*dst[i] + (1-beta)*(g[i] or g[i]^2)` — the Adam
 /// first/second-moment EMA update. `square_grad = false` for the first
@@ -121,9 +183,19 @@ impl InplaceOp2 for AdamMomentUpdate {
                     let gv = g[ig];
                     // `Tensor::sqr` is `v * v` (op.rs:591) — one `f32`
                     // rounding, reproduced here exactly (not `gv.powi(2)`,
-                    // which LLVM may lower differently).
+                    // which LLVM may lower differently). It is its own
+                    // standalone unary kernel in the eager chain, never
+                    // followed by "+ 0.0", so no laundering site here.
                     let gv = if square_grad { gv * gv } else { gv };
-                    m[im] = beta * m[im] + one_minus_beta * gv;
+                    // `Affine(beta, 0.0)` / `Affine(one_minus_beta, 0.0)`:
+                    // two INDEPENDENTLY rounded, INDEPENDENTLY zero-laundered
+                    // terms (candle's own `Tensor * f64` is `v*mul + 0.0`,
+                    // `cpu_backend/mod.rs:311-317` — see this module's doc),
+                    // each its own kernel launch in the eager chain, THEN a
+                    // genuine standalone `Tensor + Tensor` add.
+                    let term_m = beta * m[im] + 0.0f32;
+                    let term_g = one_minus_beta * gv + 0.0f32;
+                    m[im] = term_m + term_g;
                 }
                 Ok(())
             }
@@ -229,11 +301,25 @@ impl InplaceOp3 for AdamThetaUpdate {
                     .zip(m_offsets)
                     .zip(StridedOffsets::from_layout(l3))
                 {
-                    let m_hat = m[im] * scale_m;
-                    let v_hat = v[iv] * scale_v;
+                    // `Affine(next_m, scale_m, 0.0)` / `Affine(next_v,
+                    // scale_v, 0.0)` — see this module's doc.
+                    let m_hat = m[im] * scale_m + 0.0f32;
+                    let v_hat = v[iv] * scale_v + 0.0f32;
+                    // `Affine(sqrt(v_hat), 1.0, eps)` == `sqrt(v_hat) + eps`
+                    // bit-for-bit: `x * 1.0` is exact at any finite `x` (no
+                    // rounding, no sign change), so no separate laundering
+                    // step is needed for THIS site — unlike the `mul=<other>,
+                    // add=0.0` sites, `mul=1.0` cannot itself introduce a new
+                    // `-0.0` `x` did not already carry.
                     let denom = v_hat.sqrt() + eps;
+                    // Standalone binary div — one rounding, no affine site.
                     let adjusted_grad = m_hat / denom;
-                    theta[it] = theta[it] * one_minus_lr_lambda - adjusted_grad * lr;
+                    // `Affine(theta, one_minus_lr_lambda, 0.0)` /
+                    // `Affine(adjusted_grad, lr, 0.0)`, then a genuine
+                    // standalone `Tensor - Tensor` sub.
+                    let theta_scaled = theta[it] * one_minus_lr_lambda + 0.0f32;
+                    let adj_scaled = adjusted_grad * lr + 0.0f32;
+                    theta[it] = theta_scaled - adj_scaled;
                 }
                 Ok(())
             }
@@ -267,15 +353,288 @@ impl InplaceOp3 for AdamThetaUpdate {
     }
 }
 
-/// The whole fused AdamW step for ONE `Var`: two [`AdamMomentUpdate`] calls
-/// (first then second moment — order matters only in that both must finish
-/// before the third call, since [`AdamThetaUpdate`] reads their post-EMA
-/// values) followed by one [`AdamThetaUpdate`] call. Three kernel launches,
-/// zero `Var::set`/memcpy — see this module's doc and the design study for
-/// why. `scale_m`/`scale_v` are the caller's bias-correction terms
-/// (`1/(1-beta1^t)`, `1/(1-beta2^t)` — depend on the step counter `t`, so
-/// the caller computes them fresh each step, exactly as `adamw.rs:87-88`
-/// does).
+/// TEST-ONLY NEGATIVE CONTROL — never wired into [`adamw_step_fused_t`] or
+/// any admission/dispatch path; the ONLY callers are this module's own
+/// `negative_control_...` unit test and `tests/cuda_parity.rs`'s CUDA
+/// bit-identity RED control. It exists solely to prove those harnesses
+/// have the POWER to detect the exact defect class this fix closes:
+/// deliberately forces the single-rounding FMA contraction commit 0498f8b
+/// risked leaving to nvcc's `--fmad=true` discretion (CPU: `f32::mul_add`;
+/// CUDA: `fmaf()`, `cuda/adamw_step.cu`'s `adamw_moment_update_f32_fma_
+/// contracted_red_control`) instead of [`AdamMomentUpdate`]'s real
+/// two-separately-rounded-multiplies-then-add. A normal, always-compiled
+/// (not `#[cfg(test)]`) public type — `#[cfg(test)]` items are invisible to
+/// `tests/*.rs` integration tests, which compile this crate as an ordinary
+/// external dependency (see `PhiloxKatProbe`'s identical precedent,
+/// `ops::dropout`), so this has to be reachable the same way.
+#[derive(Debug, Clone, Copy)]
+pub struct AdamMomentUpdateFmaContractedRedControl {
+    pub beta: f64,
+    pub square_grad: bool,
+}
+
+impl AdamMomentUpdateFmaContractedRedControl {
+    pub fn new(beta: f64, square_grad: bool) -> Self {
+        Self { beta, square_grad }
+    }
+}
+
+impl super::sealed::Sealed for AdamMomentUpdateFmaContractedRedControl {}
+
+impl InplaceOp2 for AdamMomentUpdateFmaContractedRedControl {
+    fn name(&self) -> &'static str {
+        "adamw_moment_update_fma_contracted_red_control"
+    }
+
+    fn cpu_fwd(
+        &self,
+        s1: &mut CpuStorage,
+        l1: &Layout,
+        s2: &CpuStorage,
+        l2: &Layout,
+    ) -> Result<()> {
+        if l1.dims() != l2.dims() {
+            return Err(Error::ShapeMismatchBinaryOp {
+                lhs: l1.shape().clone(),
+                rhs: l2.shape().clone(),
+                op: self.name(),
+            });
+        }
+        match (s1, s2) {
+            (CpuStorage::F32(m), CpuStorage::F32(g)) => {
+                let beta = self.beta as f32;
+                let one_minus_beta = (1.0 - self.beta) as f32;
+                let square_grad = self.square_grad;
+                let m_offsets: Vec<usize> = StridedOffsets::from_layout(l1).collect();
+                for (im, ig) in m_offsets.into_iter().zip(StridedOffsets::from_layout(l2)) {
+                    let gv = g[ig];
+                    let gv = if square_grad { gv * gv } else { gv };
+                    // WRONG on purpose: one rounding for the whole
+                    // expression (`f32::mul_add`), contracting the
+                    // `beta*m[im]` term into the add — exactly the defect
+                    // class the real op must NOT exhibit.
+                    m[im] = beta.mul_add(m[im], one_minus_beta * gv);
+                }
+                Ok(())
+            }
+            (s1, s2) if s1.dtype() != s2.dtype() => Err(Error::DTypeMismatchBinaryOp {
+                lhs: s1.dtype(),
+                rhs: s2.dtype(),
+                op: self.name(),
+            }),
+            (s1, _) => Err(Error::UnsupportedDTypeForOp(s1.dtype(), self.name())),
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        s1: &mut candle_core::CudaStorage,
+        l1: &Layout,
+        s2: &candle_core::CudaStorage,
+        l2: &Layout,
+    ) -> Result<()> {
+        crate::cuda::adamw_step::moment_update_fma_contracted_red_control_cuda_fwd(
+            self.beta,
+            self.square_grad,
+            s1,
+            l1,
+            s2,
+            l2,
+        )
+    }
+}
+
+/// `true` iff `layout` is INJECTIVE as a map from logical multi-index to
+/// storage offset — i.e. no dimension of length > 1 has stride 0. A
+/// stride-0 dimension is exactly what `Tensor::broadcast_as`/`expand`
+/// produce: every logical index along that axis reads (or, if this were a
+/// write target, WRITES) the SAME storage slot. Reading through such a
+/// layout is fine (every read returns the same value regardless of which
+/// logical index asked); writing through one is not (the last write along
+/// the collapsed axis wins, in an order this op does not control) — so
+/// this check gates [`validate_step_domain`]'s three MUTATED destinations
+/// (`theta`/`first_moment`/`second_moment`) only, never `grad`.
+fn layout_is_injective(l: &Layout) -> bool {
+    l.dims()
+        .iter()
+        .zip(l.stride().iter())
+        .all(|(&d, &s)| d <= 1 || s != 0)
+}
+
+/// `true` iff `a` and `b` share the same underlying storage — a public-API
+/// substitute for `Tensor::same_storage` (candle-core 0.11.0 `pub(crate)`,
+/// unreachable from this crate). Acquires a READ lock on `a`, records the
+/// address the guard derefs to, drops it, then does the same for `b` —
+/// SEQUENTIALLY, never holding both simultaneously, so this cannot deadlock
+/// even when `a` and `b` are in fact the same `RwLock` (two read guards on
+/// the same lock, held one at a time, are always sound; it is a
+/// simultaneous read-vs-write pair on the SAME lock — exactly what an
+/// un-checked `InplaceOpN` call with an aliased mutated/read argument would
+/// attempt — that candle's `std::sync::RwLock` cannot resolve). Two
+/// `Tensor`s that merely CONTAIN equal values but own independent storage
+/// (e.g. two separate `Tensor::zeros` calls) get different addresses here,
+/// same as `same_storage` would report.
+fn same_storage(a: &Tensor, b: &Tensor) -> bool {
+    let addr = |t: &Tensor| -> usize {
+        let (storage, _layout) = t.storage_and_layout();
+        &*storage as *const _ as usize
+    };
+    addr(a) == addr(b)
+}
+
+/// Refuses ANY pairwise aliasing among `tensors` — mirrors `Var::set`'s own
+/// aliasing guard (`Error::CannotSetVar`, candle-core 0.11.0 `variable.rs:
+/// 130-135`: "cannot set a variable to a tensor that is derived from its
+/// value"). Called from [`validate_step_domain`] BEFORE any `InplaceOpN`
+/// call, so an aliased write-vs-read pair (e.g. a caller passing the SAME
+/// `Var` as both `first_moment` and `grad`) is refused with a typed error
+/// instead of candle's own write-lock-then-read-lock machinery deadlocking
+/// on the same `RwLock<Storage>` inside `Tensor::inplace_op2/3`.
+fn refuse_aliased(tensors: &[&Tensor]) -> Result<()> {
+    for i in 0..tensors.len() {
+        for j in (i + 1)..tensors.len() {
+            if same_storage(tensors[i], tensors[j]) {
+                let msg = "adamw_step_fused: theta/first_moment/second_moment/grad \
+                           must not alias one another (two arguments share storage)";
+                return Err(Error::CannotSetVar { msg }.bt());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The whole-domain check (family D), run ONCE before any of the three
+/// `InplaceOpN` calls mutates anything — see this module's doc for the full
+/// rationale. Checks, in order: pairwise dtype/shape/device agreement
+/// (against `theta`) for all four tensors; pairwise aliasing across all
+/// four; then, device-conditional, the structural requirement on the THREE
+/// MUTATED tensors only (`theta`/`first_moment`/`second_moment`) — full
+/// contiguity on CUDA (mirroring the CUDA glue's own per-kernel
+/// `require_contiguous_f32`, but checked here across ALL FOUR tensors up
+/// front rather than lazily per launch, so a `grad`/`theta` contiguity
+/// problem that would only have surfaced on the THIRD launch cannot leave
+/// `first_moment`/`second_moment` already mutated by the first two);
+/// injective layout on CPU (see [`layout_is_injective`]'s doc).
+fn validate_step_domain(theta: &Tensor, m: &Tensor, v: &Tensor, g: &Tensor) -> Result<()> {
+    const OP: &str = "adamw_step";
+    for t in [m, v, g] {
+        if t.shape() != theta.shape() {
+            return Err(Error::ShapeMismatchBinaryOp {
+                lhs: theta.shape().clone(),
+                rhs: t.shape().clone(),
+                op: OP,
+            });
+        }
+        if t.dtype() != theta.dtype() {
+            return Err(Error::DTypeMismatchBinaryOp {
+                lhs: theta.dtype(),
+                rhs: t.dtype(),
+                op: OP,
+            });
+        }
+        if t.device().location() != theta.device().location() {
+            return Err(Error::DeviceMismatchBinaryOp {
+                lhs: theta.device().location(),
+                rhs: t.device().location(),
+                op: OP,
+            });
+        }
+    }
+
+    refuse_aliased(&[theta, m, v, g])?;
+
+    if theta.device().is_cuda() {
+        for t in [theta, m, v, g] {
+            if !t.is_contiguous() {
+                return Err(Error::RequiresContiguous { op: OP });
+            }
+        }
+    } else {
+        for t in [theta, m, v] {
+            if !layout_is_injective(t.layout()) {
+                let msg = "adamw_step_fused: theta/first_moment/second_moment must have an \
+                           injective layout (no stride-0/broadcast dimension) — a broadcast \
+                           destination would overwrite the same storage slot multiple times \
+                           per step in an order this op does not control";
+                return Err(Error::CannotSetVar { msg }.bt());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The whole fused AdamW step for ONE `Var`: `validate_step_domain` once,
+/// up front, then two [`AdamMomentUpdate`] calls (first then second moment
+/// — order matters only in that both must finish before the third call,
+/// since [`AdamThetaUpdate`] reads their post-EMA values) followed by one
+/// [`AdamThetaUpdate`] call. Three kernel launches, zero `Var::set`/memcpy
+/// (see this module's doc). `t` is the 1-indexed step counter — matching
+/// `candle_nn::AdamW`'s own convention, `t = 1` for the very first step —
+/// from which `scale_m = 1/(1-beta1^t)`, `scale_v = 1/(1-beta2^t)` are
+/// derived HERE rather than left to the caller: a caller-supplied
+/// `scale_m`/`scale_v` (the deprecated [`adamw_step_fused`]'s shape) is a
+/// bias-correction footgun — nothing stops it from being computed from the
+/// WRONG `t` (stale, off-by-one, or simply never advanced), and the
+/// resulting number is silently "unrepresentable-wrong": every value in
+/// its domain is a plausible bias-correction scalar, so a wrong one carries
+/// no signal that it is wrong. `t == 0` is refused outright (`1/(1-x^0) =
+/// 1/0 = inf`, which would poison every downstream product with `inf`/`NaN`
+/// rather than error).
+pub fn adamw_step_fused_t(
+    theta: &Tensor,
+    first_moment: &Tensor,
+    second_moment: &Tensor,
+    grad: &Tensor,
+    t: usize,
+    params: AdamWParams,
+) -> Result<()> {
+    if t == 0 {
+        candle_core::bail!(
+            "adamw_step_fused_t: t must be >= 1 (candle_nn::AdamW's convention — t=1 for the \
+             first step); t=0 makes scale_m/scale_v = 1/(1-beta^0) = 1/0 = inf"
+        );
+    }
+    validate_step_domain(theta, first_moment, second_moment, grad)?;
+    let t_i32 = i32::try_from(t).map_err(|_| {
+        Error::Msg(format!(
+            "adamw_step_fused_t: t={t} overflows i32::powi's exponent"
+        ))
+    })?;
+    let scale_m = 1f64 / (1f64 - params.beta1.powi(t_i32));
+    let scale_v = 1f64 / (1f64 - params.beta2.powi(t_i32));
+    super::apply_inplace2(
+        first_moment,
+        grad,
+        AdamMomentUpdate::new(params.beta1, false),
+    )?;
+    super::apply_inplace2(
+        second_moment,
+        grad,
+        AdamMomentUpdate::new(params.beta2, true),
+    )?;
+    super::apply_inplace3(
+        theta,
+        first_moment,
+        second_moment,
+        AdamThetaUpdate::new(params.lr, params.weight_decay, scale_m, scale_v, params.eps),
+    )
+}
+
+/// DEPRECATED shape of [`adamw_step_fused_t`]: takes `scale_m`/`scale_v`
+/// (the bias-correction terms) directly from the caller instead of deriving
+/// them from a step counter `t` — see [`adamw_step_fused_t`]'s doc for why
+/// that is a footgun. Kept for one commit because `jammi-ai::fine_tune::
+/// adamw`'s wiring (in flight on this same branch) already calls this exact
+/// signature; behaviour is UNCHANGED (now goes through
+/// `validate_step_domain` too, closing the same-branch audit's upfront-
+/// validation and aliasing findings for this call shape as well) — only the
+/// bias-correction-footgun concern is deprecated away, not the numerics.
+#[deprecated(
+    note = "compute t (the 1-indexed step counter) and call adamw_step_fused_t with AdamWParams \
+            instead — scale_m/scale_v computed by the caller from a stale or wrong t is a \
+            silent, unrepresentable-wrong bias-correction bug"
+)]
 #[allow(clippy::too_many_arguments)]
 pub fn adamw_step_fused(
     theta: &Tensor,
@@ -290,6 +649,7 @@ pub fn adamw_step_fused(
     weight_decay: f64,
     eps: f64,
 ) -> Result<()> {
+    validate_step_domain(theta, first_moment, second_moment, grad)?;
     super::apply_inplace2(first_moment, grad, AdamMomentUpdate::new(beta1, false))?;
     super::apply_inplace2(second_moment, grad, AdamMomentUpdate::new(beta2, true))?;
     super::apply_inplace3(
@@ -350,20 +710,19 @@ mod tests {
         eps: f64,
         t: i32,
     ) {
-        let scale_m = 1f64 / (1f64 - beta1.powi(t));
-        let scale_v = 1f64 / (1f64 - beta2.powi(t));
-        adamw_step_fused(
+        adamw_step_fused_t(
             theta,
             m,
             v,
             g,
-            beta1,
-            beta2,
-            scale_m,
-            scale_v,
-            lr,
-            weight_decay,
-            eps,
+            t as usize,
+            AdamWParams {
+                beta1,
+                beta2,
+                lr,
+                weight_decay,
+                eps,
+            },
         )
         .unwrap();
     }
@@ -452,7 +811,7 @@ mod tests {
         let m = Tensor::zeros((0,), DType::F32, &dev).unwrap();
         let v = Tensor::zeros((0,), DType::F32, &dev).unwrap();
         let g = Tensor::from_slice(&[] as &[f32], (0,), &dev).unwrap();
-        adamw_step_fused(&theta, &m, &v, &g, 0.9, 0.999, 1.0, 1.0, 1e-3, 0.01, 1e-8).unwrap();
+        run_fused(&theta, &m, &v, &g, 0.9, 0.999, 1e-3, 0.01, 1e-8, 1);
         assert!(theta.to_vec1::<f32>().unwrap().is_empty());
     }
 
@@ -651,6 +1010,33 @@ mod tests {
         assert!(delta > 0.0, "theta did not move: {before:?} -> {after:?}");
     }
 
+    /// Peel candle's `Error::WithBacktrace` wrapper (if present) down to the
+    /// error it carries — identical to `low_rank_residual_linear.rs`'s
+    /// helper of the same name/doc. `Error::bt()` (this module's
+    /// `refuse_aliased`/`validate_step_domain` both call it, mirroring
+    /// `Var::set`'s own `CannotSetVar` convention) boxes the original error
+    /// into `WithBacktrace` whenever `RUST_BACKTRACE`/`RUST_LIB_BACKTRACE`
+    /// leaves backtrace capture enabled — an environment property, not a
+    /// platform one — so a bare `matches!(err, Error::CannotSetVar { .. })`
+    /// is only reliable after peeling.
+    fn peel_backtrace(err: &Error) -> &Error {
+        let mut e = err;
+        while let Error::WithBacktrace { inner, .. } = e {
+            e = inner;
+        }
+        e
+    }
+
+    fn default_params() -> AdamWParams {
+        AdamWParams {
+            beta1: 0.9,
+            beta2: 0.999,
+            lr: 1e-3,
+            weight_decay: 0.01,
+            eps: 1e-8,
+        }
+    }
+
     #[test]
     fn shape_mismatch_between_theta_and_grad_is_refused() {
         let dev = Device::Cpu;
@@ -658,7 +1044,7 @@ mod tests {
         let m = Tensor::zeros((2,), DType::F32, &dev).unwrap();
         let v = Tensor::zeros((2,), DType::F32, &dev).unwrap();
         let g = Tensor::from_slice(&[1.0f32, 2.0, 3.0], (3,), &dev).unwrap();
-        let err = adamw_step_fused(&theta, &m, &v, &g, 0.9, 0.999, 1.0, 1.0, 1e-3, 0.01, 1e-8)
+        let err = adamw_step_fused_t(&theta, &m, &v, &g, 1, default_params())
             .expect_err("mismatched theta/grad shapes must not silently broadcast");
         assert!(matches!(err, Error::ShapeMismatchBinaryOp { .. }));
     }
@@ -670,31 +1056,182 @@ mod tests {
         let m = Tensor::zeros((2,), DType::F64, &dev).unwrap();
         let v = Tensor::zeros((2,), DType::F64, &dev).unwrap();
         let g = Tensor::from_slice(&[1.0f64, 2.0], (2,), &dev).unwrap();
-        let err = adamw_step_fused(&theta, &m, &v, &g, 0.9, 0.999, 1.0, 1.0, 1e-3, 0.01, 1e-8)
-            .expect_err("F64 has no adamw_step_fused CPU implementation (F32 only)");
+        let err = adamw_step_fused_t(&theta, &m, &v, &g, 1, default_params())
+            .expect_err("F64 has no adamw_step_fused_t CPU implementation (F32 only)");
+        // theta/m/v/g all AGREE on dtype (F64) — validate_step_domain's
+        // pairwise-vs-theta check passes; the F32-only InplaceOp2's own
+        // catch-all is what actually refuses this, so the caller sees
+        // `UnsupportedDTypeForOp`, not `DTypeMismatchBinaryOp` (that variant
+        // is reserved for an ACTUAL disagreement between two tensors — see
+        // `mismatched_dtype_between_moment_and_grad_is_refused`, below).
         assert!(matches!(err, Error::UnsupportedDTypeForOp(..)));
     }
 
-    /// NEGATIVE CONTROL (family F): a deliberately WRONG reference — the
-    /// exact single-rounding FMA contraction the design study's §3 warns
-    /// CUDA's default `--fmad=true` may apply to an `a*b+c`-shaped
-    /// sub-expression, computed here explicitly via `f32::mul_add` for the
-    /// moment-update step (`beta*m + one_minus_beta*g` becomes a single
-    /// fused-rounding `beta.mul_add(m, one_minus_beta*g)`) instead of the
-    /// kernel's two separately-rounded multiplies + one add. This proves
-    /// the bit-identity oracle has power: if a fused-vs-eager comparison
-    /// could not distinguish an FMA-contracted computation from the
-    /// non-contracted one this op actually performs, the CPU bit-identity
-    /// claim in every other test in this file would be unfalsifiable. Swept
-    /// over several representative `(m, g)` pairs (a single unlucky pair
-    /// CAN coincide bit-for-bit by chance — generic inputs do not) and
-    /// requires at least one mismatch, which is the only way to
-    /// demonstrate a REAL power difference rather than assert a specific
-    /// magic value forever.
+    /// `t == 0` is a domain violation (family D): `1/(1-beta^0) = 1/0 =
+    /// inf`, which would otherwise poison every downstream product with
+    /// `inf`/`NaN` silently rather than error.
     #[test]
-    fn negative_control_an_fma_contracted_reference_is_not_bit_identical() {
-        let beta: f32 = 0.9;
-        let one_minus_beta: f32 = 0.1;
+    fn zero_step_counter_is_refused() {
+        let (theta, m, v, g) = setup(&[1.0], &[0.1], (1,));
+        let err = adamw_step_fused_t(&theta, &m, &v, &g, 0, default_params())
+            .expect_err("t=0 must be refused, not silently produce inf/NaN scale_m/scale_v");
+        assert!(err.to_string().contains("t must be >= 1"), "got: {err}");
+    }
+
+    /// The upfront, single-function domain check (family D / all-or-
+    /// nothing): a shape mismatch that would only have surfaced on the
+    /// THIRD `InplaceOp3` call (`theta` vs `first_moment`/`second_moment`/
+    /// `grad`, which all agree with EACH OTHER) must be caught before the
+    /// first two `InplaceOp2` calls run at all — `first_moment`/
+    /// `second_moment` must be observably UNTOUCHED (still their initial
+    /// nonzero values) after the refused call, not half-advanced.
+    #[test]
+    fn mismatched_shape_on_the_theta_leg_leaves_moments_untouched() {
+        let dev = Device::Cpu;
+        // theta has a DIFFERENT shape from m/v/g, which all agree with each
+        // other — so a lazy, per-call validation would let the two
+        // AdamMomentUpdate calls (m, v) succeed before AdamThetaUpdate's
+        // shape check ever runs.
+        let theta = Tensor::from_slice(&[1.0f32, 2.0, 3.0], (3,), &dev).unwrap();
+        let m = Tensor::from_slice(&[0.5f32, -0.5], (2,), &dev).unwrap();
+        let v = Tensor::from_slice(&[0.25f32, 0.75], (2,), &dev).unwrap();
+        let g = Tensor::from_slice(&[0.1f32, 0.2], (2,), &dev).unwrap();
+        let m_before: Vec<f32> = m.to_vec1().unwrap();
+        let v_before: Vec<f32> = v.to_vec1().unwrap();
+
+        let err = adamw_step_fused_t(&theta, &m, &v, &g, 1, default_params())
+            .expect_err("theta/moment shape mismatch must be refused");
+        assert!(matches!(err, Error::ShapeMismatchBinaryOp { .. }));
+
+        let m_after: Vec<f32> = m.to_vec1().unwrap();
+        let v_after: Vec<f32> = v.to_vec1().unwrap();
+        assert_eq!(
+            m_before, m_after,
+            "first_moment was mutated despite the whole step being refused"
+        );
+        assert_eq!(
+            v_before, v_after,
+            "second_moment was mutated despite the whole step being refused"
+        );
+    }
+
+    /// Aliasing (family D): `first_moment` and `grad` sharing storage (the
+    /// SAME `Var`/`Tensor` passed as both) must be refused with a typed
+    /// error, not deadlock candle's own write-then-read locking inside
+    /// `InplaceOp2::cpu_fwd`'s dispatch. `Tensor::clone()` shares storage
+    /// (candle's `Tensor` is `Arc<Tensor_>`), so `g.clone()` is a genuine
+    /// alias, not merely an equal-valued independent tensor.
+    #[test]
+    fn aliased_first_moment_and_grad_is_refused_not_deadlocked() {
+        let (theta, m, v, _g) = setup(&[1.0, 2.0], &[0.1, 0.2], (2,));
+        let aliased_grad = m.clone();
+        let err = adamw_step_fused_t(&theta, &m, &v, &aliased_grad, 1, default_params())
+            .expect_err("first_moment aliasing grad must be refused");
+        assert!(
+            matches!(peel_backtrace(&err), Error::CannotSetVar { .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// Aliasing: `theta` and `first_moment` sharing storage must also be
+    /// refused (the mutated-vs-read hazard `AdamThetaUpdate` would hit).
+    #[test]
+    fn aliased_theta_and_first_moment_is_refused() {
+        let dev = Device::Cpu;
+        let theta = Tensor::from_slice(&[1.0f32, 2.0], (2,), &dev).unwrap();
+        let m = theta.clone();
+        let v = Tensor::zeros((2,), DType::F32, &dev).unwrap();
+        let g = Tensor::from_slice(&[0.1f32, 0.2], (2,), &dev).unwrap();
+        let err = adamw_step_fused_t(&theta, &m, &v, &g, 1, default_params())
+            .expect_err("theta aliasing first_moment must be refused");
+        assert!(
+            matches!(peel_backtrace(&err), Error::CannotSetVar { .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// CPU non-injective destination (family D): a broadcast `first_moment`
+    /// (stride 0 along the expanded dimension) must be refused, the same
+    /// way the CUDA arm already refuses a non-contiguous one — writing
+    /// through it would silently overwrite the same storage slot multiple
+    /// times per step.
+    #[test]
+    fn non_injective_first_moment_destination_is_refused_on_cpu() {
+        let dev = Device::Cpu;
+        let theta = Tensor::zeros((4,), DType::F32, &dev).unwrap();
+        let m = Tensor::zeros((1,), DType::F32, &dev)
+            .unwrap()
+            .broadcast_as((4,))
+            .unwrap();
+        assert!(!m.is_contiguous());
+        let v = Tensor::zeros((4,), DType::F32, &dev).unwrap();
+        let g = Tensor::from_slice(&[0.1f32, 0.2, 0.3, 0.4], (4,), &dev).unwrap();
+        let err = adamw_step_fused_t(&theta, &m, &v, &g, 1, default_params())
+            .expect_err("a stride-0 broadcast destination must be refused, not silently walked");
+        assert!(
+            matches!(peel_backtrace(&err), Error::CannotSetVar { .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// A broadcast `grad` (read-only) is fine — reading the same storage
+    /// slot repeatedly is not a hazard the way writing through one is.
+    #[test]
+    fn non_injective_grad_is_fine_read_only() {
+        let dev = Device::Cpu;
+        let theta = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0], (4,), &dev).unwrap();
+        let m = Tensor::zeros((4,), DType::F32, &dev).unwrap();
+        let v = Tensor::zeros((4,), DType::F32, &dev).unwrap();
+        let g = Tensor::from_slice(&[0.1f32], (1,), &dev)
+            .unwrap()
+            .broadcast_as((4,))
+            .unwrap();
+        assert!(!g.is_contiguous());
+        adamw_step_fused_t(&theta, &m, &v, &g, 1, default_params())
+            .expect("a broadcast (read-only) grad must be accepted on CPU");
+        let out: Vec<f32> = theta.to_vec1().unwrap();
+        assert!(out.iter().all(|x| x.is_finite()));
+    }
+
+    /// The DEPRECATED `adamw_step_fused` shape still works and still goes
+    /// through the same [`validate_step_domain`]/bit-identity path — kept
+    /// for one commit because the in-flight `jammi-ai::fine_tune::adamw`
+    /// wiring on this branch already calls this exact signature (see this
+    /// function's own doc). `#[allow(deprecated)]`: the whole point of this
+    /// test is to exercise the deprecated item, not to avoid it.
+    #[test]
+    #[allow(deprecated)]
+    fn deprecated_signature_still_matches_the_eager_chain_bit_for_bit() {
+        let (theta, m, v, g) = setup(&[0.5, -1.25, 3.0, 0.0], &[0.1, -0.2, 0.05, 0.0], (4,));
+        let (want_theta, want_m, want_v) =
+            eager_step(&theta, &m, &v, &g, 0.9, 0.999, 1e-3, 0.01, 1e-8, 1);
+        let scale_m = 1f64 / (1f64 - 0.9f64.powi(1));
+        let scale_v = 1f64 / (1f64 - 0.999f64.powi(1));
+        adamw_step_fused(
+            &theta, &m, &v, &g, 0.9, 0.999, scale_m, scale_v, 1e-3, 0.01, 1e-8,
+        )
+        .unwrap();
+        assert_bit_identical(&theta, &want_theta);
+        assert_bit_identical(&m, &want_m);
+        assert_bit_identical(&v, &want_v);
+    }
+
+    /// NEGATIVE CONTROL (family F), CALLING THE REAL OP on both sides —
+    /// the previous version of this test computed two bare `f32`
+    /// expressions locally and never invoked `AdamMomentUpdate`/
+    /// `apply_inplace2` at all, which the adversarial audit correctly
+    /// flagged as tautological (it could never fail regardless of what the
+    /// real kernel did). This version runs [`AdamMomentUpdate`] (the REAL
+    /// kernel) and [`AdamMomentUpdateFmaContractedRedControl`] (the
+    /// deliberately WRONG, FMA-contracted kernel) through the SAME
+    /// `apply_inplace2` dispatch on the SAME nonzero starting `m`/`g`, and
+    /// requires at least one bit mismatch across a representative sweep (a
+    /// single unlucky pair CAN coincide bit-for-bit by chance) — proving
+    /// the bit-identity oracle actually has the power the deprecated
+    /// tautological version only claimed.
+    #[test]
+    fn negative_control_the_fma_contracted_kernel_diverges_from_the_real_one() {
+        let dev = Device::Cpu;
         let pairs: [(f32, f32); 6] = [
             (0.1234567, -0.7654321),
             (std::f32::consts::PI / 4.0, std::f32::consts::E / 3.0),
@@ -704,25 +1241,30 @@ mod tests {
             (1.0000001, -1.0000002),
         ];
         let mut any_mismatch = false;
-        for &(m, g) in &pairs {
-            // The real kernel's sequence (`AdamMomentUpdate::cpu_fwd`):
-            // two separately-rounded multiplies, then one rounded add.
-            let real = beta * m + one_minus_beta * g;
-            // WRONG: a single-rounding FMA contraction of the first
-            // product into the add — exactly what nvcc's `--fmad=true`
-            // default risks doing to an `a*b+c` pattern, and exactly what
-            // this crate's bit-identity claim must NOT silently accept.
-            let fma_contracted = beta.mul_add(m, one_minus_beta * g);
-            if real.to_bits() != fma_contracted.to_bits() {
+        for &(m0, g0) in &pairs {
+            let m_real = Tensor::from_slice(&[m0], (1,), &dev).unwrap();
+            let g = Tensor::from_slice(&[g0], (1,), &dev).unwrap();
+            super::super::apply_inplace2(&m_real, &g, AdamMomentUpdate::new(0.9, false)).unwrap();
+
+            let m_wrong = Tensor::from_slice(&[m0], (1,), &dev).unwrap();
+            super::super::apply_inplace2(
+                &m_wrong,
+                &g,
+                AdamMomentUpdateFmaContractedRedControl::new(0.9, false),
+            )
+            .unwrap();
+
+            let real: f32 = m_real.to_vec1::<f32>().unwrap()[0];
+            let wrong: f32 = m_wrong.to_vec1::<f32>().unwrap()[0];
+            if real.to_bits() != wrong.to_bits() {
                 any_mismatch = true;
             }
         }
         assert!(
             any_mismatch,
-            "an FMA-contracted reference must diverge from the kernel's \
-             two-separate-roundings computation on at least one of these \
-             representative inputs (this is the negative control proving \
-             the bit-identity oracle has power)"
+            "AdamMomentUpdateFmaContractedRedControl must diverge from the real \
+             AdamMomentUpdate kernel on at least one of these representative inputs \
+             — otherwise the bit-identity oracle has no power to catch this defect class"
         );
     }
 
@@ -740,12 +1282,7 @@ mod tests {
         let g_contig = g.contiguous().unwrap();
 
         let want = eager_step(&theta, &m, &v, &g_contig, 0.9, 0.999, 1e-3, 0.01, 1e-8, 1);
-        let scale_m = 1f64 / (1f64 - 0.9f64.powi(1));
-        let scale_v = 1f64 / (1f64 - 0.999f64.powi(1));
-        adamw_step_fused(
-            &theta, &m, &v, &g, 0.9, 0.999, scale_m, scale_v, 1e-3, 0.01, 1e-8,
-        )
-        .unwrap();
+        adamw_step_fused_t(&theta, &m, &v, &g, 1, default_params()).unwrap();
         assert_bit_identical(&theta, &want.0);
     }
 }

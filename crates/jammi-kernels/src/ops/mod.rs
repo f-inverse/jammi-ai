@@ -66,7 +66,16 @@ pub(crate) mod rope;
 mod scaled_cast_add;
 pub(crate) mod softmax;
 
-pub use adamw_step::{adamw_step_fused, AdamMomentUpdate, AdamThetaUpdate};
+// `adamw_step_fused` itself is `#[deprecated]` (see that function's doc) —
+// re-exporting a deprecated item still fires `#[warn(deprecated)]` at the
+// re-export site, so this one line is allowed explicitly rather than
+// silencing the whole module.
+#[allow(deprecated)]
+pub use adamw_step::adamw_step_fused;
+pub use adamw_step::{
+    adamw_step_fused_t, AdamMomentUpdate, AdamMomentUpdateFmaContractedRedControl, AdamThetaUpdate,
+    AdamWParams,
+};
 pub use axpy::Axpy;
 pub use dropout::{DropoutFused, PhiloxKatProbe};
 pub use geglu::{GegluFused, GeluVariant};

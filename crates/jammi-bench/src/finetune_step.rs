@@ -325,6 +325,27 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
         .into());
     }
 
+    // The RESOLVED disable state, for the report artifact (contract K-aux,
+    // round 2 / B3): `requested` is what `JAMMI_KERNELS_DISABLE` named this
+    // process (sorted, empty when unset); `fired` is which of those entries
+    // actually disabled a live dispatch this run (a strict subset once
+    // `unmatched_kernel_disables` is empty, per the check just above).
+    // Recorded even on an ordinary undisabled run (both empty), rather than
+    // only on a forced-eager one: an omitted pair would read as "this
+    // report predates the field", which is false — every report from this
+    // build carries an opinion on which arm it measured. This is what lets
+    // a downstream A/B harness catch the "env var silently dropped" failure
+    // mode `unmatched_disables` does NOT cover: a run whose
+    // `JAMMI_KERNELS_DISABLE` never reached this process at all (a var-NAME
+    // typo, an unforwarded ssh/`docker -e` environment) has NOTHING
+    // requested, so `unmatched_disables()` is trivially empty and the run
+    // succeeds — but `kernels_disabled_requested`/`kernels_disabled_fired`
+    // then both read `[]` here too, distinguishing it from a genuine
+    // forced-eager run (both non-empty and equal) that a caller intended to
+    // compare against.
+    let kernels_disabled_requested = jammi_kernels::admission::disabled_ops_requested();
+    let kernels_disabled_fired = jammi_kernels::admission::disabled_ops_fired();
+
     times.sort_by(f64::total_cmp);
     let p50 = times[times.len() / 2];
     let mean = times.iter().sum::<f64>() / times.len() as f64;
@@ -383,6 +404,8 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
         attention_block_eager_dispatches: attention_block_dispatch_after
             .eager
             .saturating_sub(attention_block_dispatch_before.eager),
+        kernels_disabled_requested,
+        kernels_disabled_fired,
         s_per_step_p50: Measurement::measured(p50, "s"),
         s_per_step_mean: Measurement::measured(mean, "s"),
         steps_per_s: Measurement::measured(1.0 / p50, "steps/s"),

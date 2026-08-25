@@ -30,6 +30,21 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # `--all-targets` above only compiles test binaries whose
+      # `required-features` are satisfied by jammi-ai's default features
+      # ("local"). `gpu_capability` (`required-features = ["live-gpu-tests"]`)
+      # and `distributed` (`required-features = ["live-distributed-tests"]`)
+      # are gated off and so escape plain `--workspace --all-targets` clippy
+      # entirely — a real doc_lazy_continuation lint went unwired for a full
+      # round through exactly this gap (esc-linked: neither feature needs an
+      # actual GPU/CUDA toolchain or a distributed harness to *compile*, only
+      # to run meaningfully, so this step stays hermetic and cheap). Kept as
+      # its own step (not folded into the line above) so a failure here is
+      # legible as "gated-test-surface lint", not conflated with the default
+      # workspace lint pass.
+      - name: Clippy (gated test surfaces — compile-only feature closure)
+        run: cargo clippy -p jammi-ai --tests --features live-gpu-tests,live-distributed-tests -- -D warnings
+
   test:
     name: Test (hermetic)
     runs-on: ubuntu-latest
@@ -186,6 +201,27 @@ jobs:
       # Cargo.toml.
       - name: Assert no proprietary crate in the OSS engine dep tree
         run: cargo metadata --format-version 1 --locked | python3 ci/scripts/check_dep_direction.py
+
+  flash-attn-closure:
+    name: Guard (flash-attn feature closure)
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust-ci
+
+      # `jammi-kernels/flash-attn` vendors CUTLASS + a multi-minute `nvcc`
+      # build; it must depend on `cuda` but never be IMPLIED by it, or the
+      # release lane (`release-binaries.yml`'s `cuda,jetstream-broker,
+      # storage-cloud` build) silently drags CUTLASS into every release
+      # build. This walks the workspace feature graph the way the resolver
+      # does (own `cargo metadata --no-deps` call, so it runs unpiped unlike
+      # the dep-direction guard above) and fails if `flash-attn` is reachable
+      # from `default`, the release lane's feature set, or `--all-features`.
+      - name: Assert no consumer's feature closure reaches jammi-kernels/flash-attn
+        run: python3 ci/scripts/check_flash_attn_closure.py
 
   oss-only-build:
     name: Guard (OSS-only build)
@@ -500,6 +536,7 @@ jobs:
       - test-clients
       - guard
       - dep-direction
+      - flash-attn-closure
       - oss-only-build
       - dep-audit
       - ts-client

@@ -45,6 +45,12 @@ echo "::endgroup::"
 echo "::group::GPU embedding perf — recorded observability, non-gating (jammi-bench gpu-inference-scale)"
 cargo run -p jammi-bench --release --features cuda -- gpu-inference-scale || rc=\$?
 echo "::endgroup::"
+echo "::group::jammi-kernels lib tests, default features (records the x86_64 Linux run this pod is the only artifact for)"
+cargo test -p jammi-kernels -- --nocapture --test-threads=1 || rc=\$?
+echo "::endgroup::"
+echo "::group::jammi-kernels lib tests, --features cuda (this pod's A100 is the GPU the suite needs)"
+cargo test -p jammi-kernels --features cuda -- --nocapture --test-threads=1 || rc=\$?
+echo "::endgroup::"
 echo "PROVE_EXIT=\${rc}"; exit \$rc
 REMOTE
 rc=$?

@@ -599,19 +599,19 @@ impl CustomOp3 for AttentionBlockFused {
                 } else {
                     None
                 };
-                let out = attention_fwd_f32(
-                    &qkv[o1..o2],
-                    rope_slice,
-                    &mask[m1..m2],
-                    mask_b,
-                    mask_q,
+                let out = attention_fwd_f32(&AttentionFwdF32Params {
+                    qkv: &qkv[o1..o2],
+                    rope: rope_slice,
+                    mask: &mask[m1..m2],
+                    mask_batch: mask_b,
+                    mask_query_rows: mask_q,
                     b,
                     s,
                     h,
                     d,
-                    self.scale,
-                    self.fully_masked,
-                )?;
+                    scale: self.scale,
+                    policy: self.fully_masked,
+                })?;
                 Ok((CpuStorage::F32(out), out_shape))
             }
             // A `qkv`/`mask` dtype MISMATCH never reaches this match — it is
@@ -768,6 +768,31 @@ impl CustomOp3 for AttentionBlockFused {
     }
 }
 
+/// [`attention_fwd_f32`]'s inputs, already validated by `cpu_fwd`
+/// (`attention_dims`/`check_mask`/`check_rope_pack` plus the contiguity
+/// and dtype checks): every slice is the exact contiguous range of its
+/// storage, every extent is `qkv`'s own, and `mask_batch`/`mask_query_rows`
+/// are `check_mask`'s two returned axis sizes (`1` or `b`, `1` or `s`).
+#[derive(Clone, Copy)]
+struct AttentionFwdF32Params<'a> {
+    /// `[b, s, 3, h, d]`, contiguous.
+    qkv: &'a [f32],
+    /// `(cos-then-sin table, seq_max)` — the flat `[2, 1, 1, seq_max, d]`
+    /// pack — or `None` when the op was built with `rope == false`.
+    rope: Option<(&'a [f32], usize)>,
+    /// `[mask_batch, 1, mask_query_rows, s]`, contiguous.
+    mask: &'a [f32],
+    mask_batch: usize,
+    mask_query_rows: usize,
+    b: usize,
+    s: usize,
+    h: usize,
+    d: usize,
+    /// Folded into `Q` before `QKᵀ` (module doc's "Fixed domain").
+    scale: f32,
+    policy: FullyMaskedPolicy,
+}
+
 /// The composed CPU forward: gather `Q`/`K`/`V` out of `qkv` into
 /// `[batch*heads, seq, head_dim]` contiguous buffers (fixed ascending
 /// `(batch, seq, heads)` gather order — family J), RoPE-rotate `Q`/`K`
@@ -782,20 +807,25 @@ impl CustomOp3 for AttentionBlockFused {
 /// "window is construction data at the call site" section) — this
 /// function computes no band predicate of its own, unlike earlier
 /// revisions.
-#[allow(clippy::too_many_arguments)]
-fn attention_fwd_f32(
-    qkv: &[f32],
-    rope: Option<(&[f32], usize)>,
-    mask: &[f32],
-    mask_batch: usize,
-    mask_query_rows: usize,
-    b: usize,
-    s: usize,
-    h: usize,
-    d: usize,
-    scale: f32,
-    policy: FullyMaskedPolicy,
-) -> Result<Vec<f32>> {
+///
+/// Inputs arrive as ONE [`AttentionFwdF32Params`] (named fields at the
+/// call site) rather than eleven positional arguments — the shape that
+/// let an earlier revision's `mask_batch`/`mask_query_rows` pair be
+/// silently swappable and needed a `clippy::too_many_arguments` allow.
+fn attention_fwd_f32(params: &AttentionFwdF32Params<'_>) -> Result<Vec<f32>> {
+    let AttentionFwdF32Params {
+        qkv,
+        rope,
+        mask,
+        mask_batch,
+        mask_query_rows,
+        b,
+        s,
+        h,
+        d,
+        scale,
+        policy,
+    } = *params;
     let bh = b * h;
     let sd = s * d;
     let mut q = vec![0f32; bh * sd];
@@ -1786,22 +1816,47 @@ mod tests {
                 .unwrap() as f64
         };
         let eps = 2e-3f32;
-        let tol = 5e-2f64;
-        // Sample a handful of indices rather than every one of `n` (cheap,
-        // still a real finite-difference proof of the scatter/gather
-        // round-trip and the RoPE/scale/softmax chain feeding it).
+        // DERIVED tolerance, not a round number: the central difference
+        // divides the difference of two F32 sums (each rounded to within
+        // one F32 ULP of `|sum|`, `f32::EPSILON * |sum|` as the upper
+        // bound on that ULP) by `2 * eps`, so its own rounding noise is
+        // bounded by `2 * ulp(|sum|) / (2 * eps)`; `8 *` that is the
+        // floor (a few ULPs of accumulation slack in each 384-element
+        // sum), plus `eps^2` for the central difference's truncation term
+        // (order `eps^2` times the third derivative, which is `O(1)`
+        // here). Measured on this fixture: `|sum| = 2.46`, max
+        // `|numeric - analytic| = 4.7e-5` against `tol = 5.9e-4` (ratio
+        // 0.08); the previous flat `5e-2` was ~1000x the observed error.
+        // Discrimination (verified and reverted): dropping the scale from
+        // `dq` (`let dqr = dqs.clone()` in `bwd`) moves `dqkv[0]` from
+        // `0.166` to `1.33`, `|Δ| = 1.16`, ~2000x this tolerance (and only
+        // ~23x the old one).
+        let sum0 = sum_fwd(&qkv0);
+        let tol = 8.0 * (f64::from(f32::EPSILON) * sum0.abs()) / (2.0 * f64::from(eps))
+            + f64::from(eps) * f64::from(eps);
+        // Sample one index per `qkv` slot (Q: 0 and 1, K: n/2, V: n-1)
+        // rather than every one of `n` (cheap, still a real
+        // finite-difference proof of the scatter/gather round-trip and the
+        // RoPE/scale/softmax chain feeding it).
+        let mut max_ratio = 0f64;
         for &i in &[0usize, 1, n / 2, n - 1] {
             let mut vp = qkv0.clone();
             vp[i] += eps;
             let mut vm = qkv0.clone();
             vm[i] -= eps;
-            let numeric = (sum_fwd(&vp) - sum_fwd(&vm)) / (2.0 * eps as f64);
+            let numeric = (sum_fwd(&vp) - sum_fwd(&vm)) / (2.0 * f64::from(eps));
+            let err = (numeric - f64::from(dqkv[i])).abs();
+            max_ratio = max_ratio.max(err / tol);
             assert!(
-                (numeric - dqkv[i] as f64).abs() < tol,
-                "dqkv[{i}]: numeric {numeric} vs analytic {}",
+                err < tol,
+                "dqkv[{i}]: numeric {numeric} vs analytic {} (|Δ| = {err:e} > tol {tol:e})",
                 dqkv[i]
             );
         }
+        assert!(
+            max_ratio > 0.0,
+            "a zero error ratio would mean the finite difference never moved — vacuous"
+        );
     }
 
     #[test]

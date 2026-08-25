@@ -126,6 +126,30 @@ struct StepContext<'a> {
     batches_per_epoch: usize,
 }
 
+/// Running epoch-level cosine-similarity statistics, folded entirely on
+/// device by [`TrainingLoop::accumulate_sim_stats`].
+///
+/// Reshaping what used to be three parallel variables
+/// (`epoch_pos_sim: Option<Tensor>`, `epoch_neg_sim: Option<Tensor>`,
+/// `triplet_batch_count: usize`) into one `Option<SimStats>` makes "a nonzero
+/// count implies both running sums are populated" a STRUCTURAL invariant
+/// instead of a runtime one pinned by an `.expect(...)` at the read site:
+/// there is no way to construct a `SimStats` with `count > 0` and `pos`/`neg`
+/// unset, so the epoch-boundary read can never observe the three variables
+/// having drifted out of sync with each other.
+struct SimStats {
+    /// Running device-side sum of per-micro-batch mean positive-pair cosine
+    /// similarity. Always a graph leaf (`track_op() == false`) — see
+    /// [`TrainingLoop::accumulate_sim_stats`]'s doc.
+    pos: Tensor,
+    /// Running device-side sum of per-micro-batch mean negative-pair cosine
+    /// similarity. Same leaf guarantee as `pos`.
+    neg: Tensor,
+    /// Number of triplet micro-batches folded into `pos`/`neg` so far this
+    /// epoch — the divisor for the epoch-boundary average.
+    count: usize,
+}
+
 /// The training loop: runs LoRA fine-tuning with gradient accumulation,
 /// early stopping, LR scheduling, and checkpointing.
 pub struct TrainingLoop {
@@ -392,6 +416,93 @@ impl TrainingLoop {
             * self.config.epochs;
         let checkpoint_interval = (total_steps as f64 * 0.1).ceil() as usize;
 
+        // `total_steps` above is the ACCUMULATION-WINDOW arm's horizon (one
+        // step per full `grad_accum`-sized window, `div_ceil` also covering a
+        // trailing partial window). GradCache takes exactly ONE optimizer
+        // step per EPOCH (`run_gradcache_epoch`), so its true horizon is
+        // `self.config.epochs`, not `total_steps` — using `total_steps` there
+        // was B2's bug: `global_step + 1 >= total_steps` was false on
+        // GradCache's actual last step whenever `num_batches > 1`, so the
+        // run's real final step never forced `clip_and_step`'s non-finite
+        // check the way a run shorter than `DEFAULT_NORM_CHECK_INTERVAL`
+        // needs it to (see `optimizer::clip_and_step`'s doc). Computed ONCE,
+        // here, and threaded to every `is_last_step` call site below instead
+        // of each site re-deriving it — `gradcache_eligible()` is a fixed
+        // property of `self.config`/`self.base_model` for the run's whole
+        // lifetime (it never toggles per-epoch), so one branch here is
+        // correct for every epoch. The `!train_loader.is_precomputed()` guard
+        // mirrors the epoch loop's own arm precedence below (`is_precomputed()`
+        // is checked BEFORE `gradcache_eligible()` there), so a test run that
+        // happens to set both a `base_model` and a precomputed loader still
+        // gets the accumulation-window horizon, matching the arm it actually
+        // takes.
+        //
+        // LAST-STEP LATTICE — every arm/edge `is_last_step` must be right
+        // for, and this fix's disposition for each:
+        //
+        //  - **accumulation window** (`process_batch_loss`'s flush): one step
+        //    per full `grad_accum`-sized window. `total_steps`'s `div_ceil`
+        //    already counts these correctly; unaffected by this fix.
+        //  - **partial last batch** (trailing window smaller than
+        //    `grad_accum`, `batches_per_epoch % grad_accum != 0`): the same
+        //    `div_ceil` above already accounts for it as one extra step;
+        //    unaffected by this fix.
+        //  - **GradCache**: one step per epoch. THE BUG THIS FIX CLOSES —
+        //    `total_optimizer_steps` uses `self.config.epochs` on this arm
+        //    instead of `total_steps`.
+        //  - **mined loader** (`trainer.rs`'s hard-negative refresh; see
+        //    `mine_hard_negative_loader`'s doc): a row whose mined pool is
+        //    entirely excluded is DROPPED, so a mined epoch's row (and
+        //    therefore batch/window) count can differ from `train_loader`'s —
+        //    what `total_steps` was computed from, once, before the loop.
+        //    This is a PRE-EXISTING desync this fix does NOT resolve: an
+        //    epoch whose mining drops enough rows to change its window count
+        //    can still make `is_last_step` wrong on that epoch, because the
+        //    true per-epoch window count is only known once that epoch's
+        //    `text_chunks()`/mined triplets are built, not upfront. Flagged
+        //    as a known, tracked gap — not silently absorbed into "fixed" by
+        //    this commit.
+        //  - **early stopping** (`break` on patience exhaustion): an
+        //    early-stopped run's actual last step is whatever `global_step`
+        //    reached before the `break`, which `total_optimizer_steps`
+        //    (fixed upfront from `self.config.epochs`) does not know ahead of
+        //    time — `is_last_step` therefore never fires `true` on an
+        //    early-stopped run's TRUE final step. Judged ACCEPTABLE, not a
+        //    residual defect: `run` always restores `checkpoint_best` (saved
+        //    at whichever epoch boundary had the best monitored loss so far)
+        //    before saving the final adapter — on EVERY run, early-stopped or
+        //    not (see the `best_path.exists()` restore below) — so a
+        //    divergence on an early-stopped run's true last step cannot
+        //    silently reach the published artifact: a non-finite
+        //    `monitor_loss` makes `monitor_loss < best_val_loss` `false`
+        //    (family F: `NaN > c` is `false`, and so is `NaN < c`), so that
+        //    epoch is never saved as `checkpoint_best`. The diagnostic gap (a
+        //    divergence not immediately surfaced as a typed `Err` on that
+        //    exact step) remains open — the modulo cadence still catches it
+        //    within `DEFAULT_NORM_CHECK_INTERVAL` steps on a long-enough run,
+        //    and `step == 1` catches an early one — but the PUBLISHED
+        //    adapter's correctness does not depend on it.
+        //  - **cancel** (`self.cancel` checked at the epoch boundary): a
+        //    cancelled run returns `Err` BEFORE the epoch that would have
+        //    followed cancellation ever calls `process_batch_loss` or
+        //    `run_gradcache_epoch` — no `is_last_step` is evaluated for a
+        //    step that never runs, so there is nothing to pin. No adapter is
+        //    published on this path (the worker's lease-guarded finalization
+        //    never runs for an `Err` return).
+        //  - **resume** (`global_step` restored from a checkpoint): `self.config
+        //    .epochs`/`total_steps` are both absolute counts fixed at THIS
+        //    run's start, independent of where `global_step` restarts from —
+        //    resume changes where `global_step` counts FROM, not what it is
+        //    compared against, so a resumed run's `is_last_step` uses exactly
+        //    the same horizon a fresh run would. Already correct; unaffected
+        //    by this fix.
+        let total_optimizer_steps = if !train_loader.is_precomputed() && self.gradcache_eligible()
+        {
+            self.config.epochs
+        } else {
+            total_steps
+        };
+
         // Snapshot the trainable variables ONCE. `VarMap::all_vars()` iterates a
         // HashMap, so a second call could return a different order — and `AdamW`'s
         // optimizer state is positional in the order it was built from. Building
@@ -481,11 +592,12 @@ impl TrainingLoop {
         // launch (`cuda_backend/mod.rs:63-88` in the same release) plus the
         // tiny scalar constants `clip_gradients` materializes (`.minimum
         // (1.0)`; see `optimizer::clip_gradients`'s doc for that op count).
-        // The original P4b census measured this at 633 tiny H2D copies per
-        // training step on the ModernBERT-large r16 LoRA config the bench
-        // exercises (`contract-P4b-sync-removal.md`, fact 4) — cite/re-measure
-        // per pod run rather than re-deriving here; nothing in this file
-        // changes that count.
+        // A per-step tiny-H2D-copy count for a representative LoRA config
+        // (e.g. ModernBERT-large r16) is a real, GPU-measured number, not one
+        // to re-derive from this comment — measure it per pod run against a
+        // committed census artifact when one exists in this tree, rather than
+        // citing a figure or a doc path that is not (currently unresolvable
+        // from this repository). Nothing in this file changes that count.
 
         for epoch in start_epoch..self.config.epochs {
             // Cooperative cancellation: the worker's heartbeat sets this when the
@@ -501,12 +613,10 @@ impl TrainingLoop {
             // Accumulated gradients across micro-batches. Seeded from the first
             // backward call (avoids needing a private GradStore::new()).
             let mut accumulated_grads: Option<GradStore> = None;
-            // Running device-side sums of per-micro-batch mean cosine
-            // similarity — read back to `f64` exactly once, at the epoch
-            // boundary below (see `Self::accumulate_sim_stats`'s doc).
-            let mut epoch_pos_sim: Option<Tensor> = None;
-            let mut epoch_neg_sim: Option<Tensor> = None;
-            let mut triplet_batch_count = 0usize;
+            // Running device-side cosine-similarity stats — read back to
+            // `f64` exactly once, at the epoch boundary below (see
+            // `Self::accumulate_sim_stats`'s and `SimStats`'s docs).
+            let mut sim_stats: Option<SimStats> = None;
 
             // Re-mine hard negatives at refresh boundaries. Mining replaces the
             // epoch's data with (anchor, positive, mined-negative) triplets fed
@@ -528,12 +638,7 @@ impl TrainingLoop {
                 let train_batches = epoch_loader.batches(self.config.batch_size)?;
                 for batch in train_batches {
                     let batch = batch?;
-                    Self::accumulate_sim_stats(
-                        &batch,
-                        &mut epoch_pos_sim,
-                        &mut epoch_neg_sim,
-                        &mut triplet_batch_count,
-                    );
+                    Self::accumulate_sim_stats(&batch, &mut sim_stats);
                     let loss = self.compute_loss(&batch)?;
                     self.process_batch_loss(
                         loss,
@@ -548,7 +653,7 @@ impl TrainingLoop {
                             optimizer: &mut optimizer,
                             checkpoint_dir: &checkpoint_dir,
                             checkpoint_interval,
-                            total_steps,
+                            total_steps: total_optimizer_steps,
                             batches_per_epoch: train_batches_per_epoch,
                         },
                     )?;
@@ -563,7 +668,7 @@ impl TrainingLoop {
                     epoch_loader,
                     &trainable_vars,
                     &mut optimizer,
-                    total_steps,
+                    total_optimizer_steps,
                     global_step,
                 )?;
                 epoch_loss += loss_val;
@@ -578,12 +683,7 @@ impl TrainingLoop {
                 for chunk in &text_chunks {
                     let batch = self.encode_chunk(chunk)?;
                     let loss = self.compute_loss(&batch)?;
-                    Self::accumulate_sim_stats(
-                        &batch,
-                        &mut epoch_pos_sim,
-                        &mut epoch_neg_sim,
-                        &mut triplet_batch_count,
-                    );
+                    Self::accumulate_sim_stats(&batch, &mut sim_stats);
                     self.process_batch_loss(
                         loss,
                         EpochState {
@@ -597,7 +697,7 @@ impl TrainingLoop {
                             optimizer: &mut optimizer,
                             checkpoint_dir: &checkpoint_dir,
                             checkpoint_interval,
-                            total_steps,
+                            total_steps: total_optimizer_steps,
                             batches_per_epoch: train_batches_per_epoch,
                         },
                     )?;
@@ -605,19 +705,25 @@ impl TrainingLoop {
             }
 
             // Flush any remaining micro-batch gradients that didn't fill a full
-            // accumulation window (last partial window of the epoch).
+            // accumulation window (last partial window of the epoch). This
+            // block is only reached via `accumulated_grads` — which only
+            // `process_batch_loss` populates — so it is never reached on the
+            // GradCache arm; `total_optimizer_steps` equals `total_steps`
+            // here (see the lattice doc above `total_optimizer_steps`'s
+            // definition), used for consistency with the other two call
+            // sites rather than because this arm needs the distinction.
             if let Some(mut acc) = accumulated_grads.take() {
                 let lr = compute_lr(&self.config, global_step, total_steps);
                 optimizer.set_learning_rate(lr);
-                // `total_steps` is the whole run's optimizer-step horizon
-                // (computed once, before the epoch loop, from
-                // `train_batches_per_epoch` and `config.epochs`), so
-                // `global_step + 1 >= total_steps` names the run's actual
-                // final optimizer step, not just this epoch's — the
+                // `total_optimizer_steps` is the whole run's ACTUAL
+                // optimizer-step horizon for the arm this run takes (see the
+                // lattice doc above its definition), so
+                // `global_step + 1 >= total_optimizer_steps` names the run's
+                // actual final optimizer step, not just this epoch's — the
                 // non-finite check must not be skippable by a run shorter
                 // than `DEFAULT_NORM_CHECK_INTERVAL` steps (see
                 // `clip_and_step`'s doc).
-                let is_last_step = global_step + 1 >= total_steps;
+                let is_last_step = global_step + 1 >= total_optimizer_steps;
                 clip_and_step(
                     &mut optimizer,
                     &trainable_vars,
@@ -633,30 +739,25 @@ impl TrainingLoop {
             let avg_train_loss = epoch_loss / batch_count.max(1) as f64;
             // The ONE host read for the whole epoch's sim stats — every
             // per-micro-batch contribution above stayed on device (see
-            // `Self::accumulate_sim_stats`'s doc).
-            let avg_pos_sim = if triplet_batch_count > 0 {
-                let sum: f32 = epoch_pos_sim
-                    .as_ref()
-                    .expect(
-                        "triplet_batch_count > 0 implies epoch_pos_sim was folded at least once",
+            // `Self::accumulate_sim_stats`'s doc). `SimStats` makes "a
+            // populated count implies both sums are populated" structural, so
+            // there is no `.expect()` here to fire.
+            let (avg_pos_sim, avg_neg_sim) = match &sim_stats {
+                Some(stats) => {
+                    let pos_sum: f32 = stats
+                        .pos
+                        .to_scalar()
+                        .map_err(|e| JammiError::FineTune(format!("epoch pos sim read: {e}")))?;
+                    let neg_sum: f32 = stats
+                        .neg
+                        .to_scalar()
+                        .map_err(|e| JammiError::FineTune(format!("epoch neg sim read: {e}")))?;
+                    (
+                        pos_sum as f64 / stats.count as f64,
+                        neg_sum as f64 / stats.count as f64,
                     )
-                    .to_scalar()
-                    .map_err(|e| JammiError::FineTune(format!("epoch pos sim read: {e}")))?;
-                sum as f64 / triplet_batch_count as f64
-            } else {
-                0.0
-            };
-            let avg_neg_sim = if triplet_batch_count > 0 {
-                let sum: f32 = epoch_neg_sim
-                    .as_ref()
-                    .expect(
-                        "triplet_batch_count > 0 implies epoch_neg_sim was folded at least once",
-                    )
-                    .to_scalar()
-                    .map_err(|e| JammiError::FineTune(format!("epoch neg sim read: {e}")))?;
-                sum as f64 / triplet_batch_count as f64
-            } else {
-                0.0
+                }
+                None => (0.0, 0.0),
             };
 
             // Validation — skip entirely when monitoring train loss to avoid wasting time.
@@ -947,7 +1048,7 @@ impl TrainingLoop {
         train_loader: &TrainingDataLoader,
         trainable_vars: &[Var],
         optimizer: &mut AdamW,
-        total_steps: usize,
+        total_optimizer_steps: usize,
         global_step: usize,
     ) -> Result<f64> {
         use super::gradcache::{gradcache_backward, EncodeGroup};
@@ -1033,10 +1134,21 @@ impl TrainingLoop {
         self.target.set_training(true);
         let (mut grads, loss_val) = outcome?;
 
-        // GradCache takes exactly one optimizer step per epoch, so
-        // `global_step + 1 >= total_steps` marks its run's last step exactly
-        // like the other two call sites (see the flush-window site's doc).
-        let is_last_step = global_step + 1 >= total_steps;
+        // GradCache takes exactly ONE optimizer step per EPOCH, not one per
+        // accumulation window — the caller passes `total_optimizer_steps` as
+        // `self.config.epochs` on this arm specifically BECAUSE of that (see
+        // the lattice doc at its call site in `run`, above the definition of
+        // `total_optimizer_steps`). Before B2's fix, this call site was
+        // passed the accumulation-window arm's `total_steps`
+        // (`ceil(batches / grad_accum) * epochs`) instead, which
+        // overcounts GradCache's real per-epoch step count whenever a epoch
+        // has more than one micro-batch/accumulation-window worth of data —
+        // making `global_step + 1 >= total_steps` false on GradCache's actual
+        // last step, silently skipping the run's final non-finite check on
+        // any GradCache run shorter than `DEFAULT_NORM_CHECK_INTERVAL` steps
+        // (every multi-epoch GradCache run, since it takes exactly one step
+        // per epoch and `DEFAULT_NORM_CHECK_INTERVAL` is 50).
+        let is_last_step = global_step + 1 >= total_optimizer_steps;
         clip_and_step(
             optimizer,
             trainable_vars,
@@ -1383,28 +1495,66 @@ impl TrainingLoop {
     /// ZERO `to_scalar`/`to_vec*` calls (unlike the old version, which did two
     /// per call, BEFORE `backward` ever ran). Each batch's per-pair cosine
     /// similarity is reduced to a mean (`mean_all`, a device scalar tensor)
-    /// and folded into `epoch_pos_sim`/`epoch_neg_sim` with a device add — a
-    /// fixed left-to-right fold across the epoch's micro-batches (family J:
+    /// and folded into [`SimStats::pos`]/[`SimStats::neg`] with a device add —
+    /// a fixed left-to-right fold across the epoch's micro-batches (family J:
     /// deterministic reduction order), mirroring `optimizer::clip_gradients`'s
     /// fold. The running sums are read back to `f64` exactly ONCE, at the
     /// epoch boundary (see the `avg_pos_sim`/`avg_neg_sim` computation in
-    /// `run`), dividing by `triplet_count` there — so this function moves the
-    /// *number* of per-micro-batch host reads for the sim-stats path from 2
-    /// to 0, not just their timing relative to `backward`.
+    /// `run`), dividing by [`SimStats::count`] there — so this function moves
+    /// the *number* of per-micro-batch host reads for the sim-stats path from
+    /// 2 to 0, not just their timing relative to `backward`.
+    ///
+    /// **Graph retention (B1).** In production `anchor`/`positive`/`negative`
+    /// come from `encode_chunk` over the LoRA `Var`s, so `cosine_similarity`'s
+    /// output is TRACKED (`track_op() == true`): its forward subgraph reaches
+    /// all the way back to the LoRA weights. Folding a tracked scalar into an
+    /// epoch-lifetime accumulator with `(prev + new)` and no `detach()` would
+    /// retain every micro-batch's activation graph until the epoch boundary —
+    /// `sorted_nodes().len()` on the accumulator growing by one micro-batch's
+    /// subgraph size on every call, unbounded over the epoch, even though
+    /// `process_batch_loss` already dropped its own graph via `backward()`
+    /// immediately after computing the loss. `batch_mean_f32` below
+    /// `.detach()`s the per-batch mean BEFORE it ever touches the
+    /// accumulator, and the fold detaches its own output too (belt and
+    /// suspenders: two detached operands under candle's `BackpropOp::new2`
+    /// never re-attach — `op` stays `None` when neither operand tracks — but
+    /// detaching both ends keeps that invariant true even if the fold's
+    /// implementation changes to something that isn't a plain `+`). The
+    /// result: [`SimStats`] is always a graph LEAF (`track_op() == false`) at
+    /// every point in the epoch, regardless of how many micro-batches have
+    /// folded into it — and, being neither `is_variable()` nor carrying an
+    /// `op`, its own `sorted_nodes()` is EMPTY (candle's `sorted_nodes` only
+    /// pushes a node when it is a `Var` or reaches one; a detached non-`Var`
+    /// leaf is neither), not a length of `1`.
+    ///
+    /// **Precision.** The running sum is an on-device `f32` accumulation of
+    /// per-micro-batch means, each already averaged from a cosine similarity
+    /// in `[-1, 1]`; the epoch-boundary read (`to_scalar::<f32>()`) divides
+    /// that `f32` sum by `count` in `f64`. The old code accumulated in host
+    /// `f64` directly. Every candle op this fold issues (`mean_all`, `+`) is a
+    /// single IEEE-754 `f32` rounding per element per op — no compensated
+    /// (Kahan) summation — so after `N` folds the `f32` running sum's error
+    /// versus an exact real-number sum is bounded by `O(N · eps_f32)` on
+    /// values whose magnitude never exceeds `N` (the per-batch means are each
+    /// in `[-1, 1]`, so the partial sum after `k` folds is in `[-k, k]`,
+    /// `eps_f32 ≈ 1.19e-7`) — this is the standard worst-case bound for
+    /// unrationalized floating-point summation (no cancellation-aware claim
+    /// beyond it), and it is a strictly larger error than the old host-`f64`
+    /// path's (`O(N · eps_f64)`, `eps_f64 ≈ 2.22e-16`) for the same `N`. This
+    /// is an epoch-logging metric, not a scored loss or a persisted number a
+    /// contract pins, so the wider `f32` error band is an accepted trade for
+    /// paying zero per-micro-batch host reads.
     ///
     /// Non-triplet batches are silently ignored. Errors in stat computation
     /// (from `cosine_similarity` or the fold) are swallowed so a GPU issue
     /// never aborts training just because of a logging metric — but only
     /// all-or-nothing per batch: if either accumulator's fold would fail, the
-    /// batch contributes to NEITHER accumulator nor `triplet_count`, so the
-    /// two running sums and the count they are later divided by never drift
-    /// out of sync.
-    fn accumulate_sim_stats(
-        batch: &super::data::TrainingBatch,
-        epoch_pos_sim: &mut Option<Tensor>,
-        epoch_neg_sim: &mut Option<Tensor>,
-        triplet_count: &mut usize,
-    ) {
+    /// batch contributes to NEITHER accumulator nor `count`, so the two
+    /// running sums and the count they are later divided by never drift out
+    /// of sync (unchanged from before the [`SimStats`] reshape below — the
+    /// reshape only makes "count > 0 implies both sums are populated"
+    /// structural instead of an `.expect()`-pinned runtime invariant).
+    fn accumulate_sim_stats(batch: &super::data::TrainingBatch, stats: &mut Option<SimStats>) {
         let super::data::TrainingBatch::Triplet {
             anchor,
             positive,
@@ -1419,12 +1569,17 @@ impl TrainingLoop {
             let mean = sim
                 .mean_all()
                 .map_err(|e| JammiError::FineTune(format!("{e}")))?;
-            if mean.dtype() == DType::F32 {
-                Ok(mean)
+            let mean = if mean.dtype() == DType::F32 {
+                mean
             } else {
                 mean.to_dtype(DType::F32)
-                    .map_err(|e| JammiError::FineTune(format!("{e}")))
-            }
+                    .map_err(|e| JammiError::FineTune(format!("{e}")))?
+            };
+            // Detach BEFORE this scalar ever reaches the epoch-lifetime
+            // accumulator (see the doc's "Graph retention (B1)" section) —
+            // this is a logging mean, never a scored loss, so it must never
+            // hold the forward graph open.
+            Ok(mean.detach())
         };
 
         let (Ok(ps), Ok(ns)) = (
@@ -1434,19 +1589,30 @@ impl TrainingLoop {
             return;
         };
 
-        let fold = |acc: &Option<Tensor>, new: &Tensor| -> Result<Tensor> {
-            match acc {
-                None => Ok(new.clone()),
-                Some(prev) => (prev + new).map_err(|e| JammiError::FineTune(format!("{e}"))),
-            }
+        let fold = |acc: &Tensor, new: &Tensor| -> Result<Tensor> {
+            (acc + new)
+                .map(|t| t.detach())
+                .map_err(|e| JammiError::FineTune(format!("{e}")))
         };
-        let (Ok(next_pos), Ok(next_neg)) = (fold(epoch_pos_sim, &ps), fold(epoch_neg_sim, &ns))
-        else {
-            return;
+
+        let next = match stats.as_ref() {
+            None => Ok(SimStats {
+                pos: ps,
+                neg: ns,
+                count: 1,
+            }),
+            Some(prev) => (|| -> Result<SimStats> {
+                Ok(SimStats {
+                    pos: fold(&prev.pos, &ps)?,
+                    neg: fold(&prev.neg, &ns)?,
+                    count: prev.count + 1,
+                })
+            })(),
         };
-        *epoch_pos_sim = Some(next_pos);
-        *epoch_neg_sim = Some(next_neg);
-        *triplet_count += 1;
+
+        if let Ok(next) = next {
+            *stats = Some(next);
+        }
     }
 
     /// Process a single batch loss: divergence detection, gradient accumulation
@@ -3311,7 +3477,7 @@ mod tests {
 mod host_read_discipline {
     use std::sync::Arc;
 
-    use candle_core::{DType, Device, Tensor};
+    use candle_core::{DType, Device, Tensor, Var};
     use candle_nn::{ParamsAdamW, VarBuilder, VarMap};
     use serial_test::serial;
 
@@ -3320,7 +3486,8 @@ mod host_read_discipline {
     use super::super::target::TrainingTarget;
     use super::super::FineTuneConfig;
     use super::{
-        per_micro_batch_host_read_count, EpochState, StepContext, TrainingLoop, TrainingLoopBuilder,
+        per_micro_batch_host_read_count, EpochState, SimStats, StepContext, TrainingLoop,
+        TrainingLoopBuilder,
     };
     use crate::fine_tune::adamw::AdamW;
 
@@ -3369,26 +3536,25 @@ mod host_read_discipline {
             negative,
         };
 
-        let mut pos: Option<Tensor> = None;
-        let mut neg: Option<Tensor> = None;
-        let mut count = 0usize;
+        let mut stats: Option<SimStats> = None;
 
         let before = per_micro_batch_host_read_count();
-        TrainingLoop::accumulate_sim_stats(&batch, &mut pos, &mut neg, &mut count);
+        TrainingLoop::accumulate_sim_stats(&batch, &mut stats);
         assert_eq!(
             per_micro_batch_host_read_count(),
             before,
             "accumulate_sim_stats must not perform any device→host read"
         );
-        assert_eq!(count, 1);
+        let stats = stats.unwrap();
+        assert_eq!(stats.count, 1);
 
         // Numeric correctness of the on-device fold survives the move off
         // host `f64` accumulation: cosine similarity of identical rows is
         // 1.0 (positive pair), of the swapped/orthogonal rows is 0.0
         // (negative pair) — read back ONCE here, in the test, which is not
         // the per-micro-batch path this oracle guards.
-        let pos_val: f32 = pos.unwrap().to_scalar().unwrap();
-        let neg_val: f32 = neg.unwrap().to_scalar().unwrap();
+        let pos_val: f32 = stats.pos.to_scalar().unwrap();
+        let neg_val: f32 = stats.neg.to_scalar().unwrap();
         assert!((pos_val - 1.0).abs() < 1e-5, "got {pos_val}");
         assert!(neg_val.abs() < 1e-5, "got {neg_val}");
     }
@@ -3401,16 +3567,82 @@ mod host_read_discipline {
             input: Tensor::zeros((2, 2), DType::F32, &device).unwrap(),
             target: Tensor::zeros((2,), DType::F32, &device).unwrap(),
         };
-        let mut pos: Option<Tensor> = None;
-        let mut neg: Option<Tensor> = None;
-        let mut count = 0usize;
+        let mut stats: Option<SimStats> = None;
 
         let before = per_micro_batch_host_read_count();
-        TrainingLoop::accumulate_sim_stats(&batch, &mut pos, &mut neg, &mut count);
+        TrainingLoop::accumulate_sim_stats(&batch, &mut stats);
         assert_eq!(per_micro_batch_host_read_count(), before);
-        assert_eq!(count, 0);
-        assert!(pos.is_none());
-        assert!(neg.is_none());
+        assert!(stats.is_none());
+    }
+
+    /// RED-first (B1): before this fix, `accumulate_sim_stats` folded a
+    /// TRACKED per-batch mean (`track_op() == true` whenever
+    /// `anchor`/`positive`/`negative` come from a real forward pass, as they
+    /// do in production via `encode_chunk`'s LoRA `Var`s) into the epoch
+    /// accumulator with no `detach()`, retaining every micro-batch's forward
+    /// subgraph for the whole epoch — the auditor measured the accumulator's
+    /// `sorted_nodes().len()` growing by a fixed per-call increment (23, 46,
+    /// 69, 92, 115) over five calls. This test builds its triplet batch
+    /// THROUGH a `Var` (`w.as_tensor()` has `is_variable() == true`, so every
+    /// `cosine_similarity`/`mean_all` op stacked on top of it is tracked) — a
+    /// leaf `Tensor::new` fixture, as the two tests above use, is untracked
+    /// from the start and CANNOT see this regression (the audit's exact
+    /// point: "the existing tests use leaf tensors and cannot see this").
+    ///
+    /// Mutation tried: delete the `.detach()` calls inside
+    /// `accumulate_sim_stats` (both the per-batch mean's and the fold's) —
+    /// this test goes red on the `track_op()` assertion at fold 1 already
+    /// (`sorted_nodes().len()` nonzero and growing with `n` from there).
+    #[test]
+    fn accumulate_sim_stats_accumulator_is_always_a_graph_leaf() {
+        let device = Device::Cpu;
+        let w = Var::from_tensor(&Tensor::new(&[[1.0f32, 0.0], [0.0, 1.0]], &device).unwrap())
+            .unwrap();
+        let neg_w = Var::from_tensor(&Tensor::new(&[[0.0f32, 1.0], [1.0, 0.0]], &device).unwrap())
+            .unwrap();
+
+        let mut stats: Option<SimStats> = None;
+        for n in 1..=5usize {
+            // Fresh ops on top of the SAME Vars every call — mirrors a fresh
+            // forward pass through the same LoRA weights each micro-batch, so
+            // a real regression (a retained subgraph) grows the
+            // accumulator's node count on every fold, not just the first.
+            let anchor = w.as_tensor().affine(1.0, 0.0).unwrap();
+            let positive = w.as_tensor().affine(1.0, 0.0).unwrap();
+            let negative = neg_w.as_tensor().affine(1.0, 0.0).unwrap();
+            assert!(
+                anchor.track_op(),
+                "test setup: the Var-rooted fixture must itself be tracked"
+            );
+            let batch = TrainingBatch::Triplet {
+                anchor,
+                positive,
+                negative,
+            };
+
+            TrainingLoop::accumulate_sim_stats(&batch, &mut stats);
+
+            let s = stats.as_ref().unwrap();
+            assert_eq!(s.count, n);
+            assert!(
+                !s.pos.track_op(),
+                "pos accumulator must be a detached leaf after fold {n}"
+            );
+            assert!(
+                !s.neg.track_op(),
+                "neg accumulator must be a detached leaf after fold {n}"
+            );
+            assert_eq!(
+                s.pos.sorted_nodes().len(),
+                0,
+                "pos accumulator must not retain a forward graph after fold {n}"
+            );
+            assert_eq!(
+                s.neg.sorted_nodes().len(),
+                0,
+                "neg accumulator must not retain a forward graph after fold {n}"
+            );
+        }
     }
 
     /// RED-first (B3): before this fix, `accumulate_sim_stats` did two
@@ -3423,8 +3655,20 @@ mod host_read_discipline {
     /// `process_batch_loss`'s ONE remaining read is pinned here: mutation
     /// tried — delete the counter increment at its post-backward
     /// `to_scalar` — this test goes red (`before` instead of `before + 1`).
+    ///
+    /// Advisory follow-up: `PER_MICRO_BATCH_HOST_READ_COUNT` (this file) only
+    /// counts the loss-scalar read this function itself issues — it is NOT
+    /// the whole device→host read count for this call. The `StepContext`
+    /// below (`total_steps: 1`, `batches_per_epoch: 1`) makes this micro-batch
+    /// BOTH `step == 1` and the run's last step, so `clip_and_step`'s cadence
+    /// gate (`optimizer.rs`) also fires and reads the grad-norm back through
+    /// `refuse_nonfinite_norm` — a SEPARATE counter
+    /// (`optimizer::sync_read_count`) this file does not own. Both are
+    /// asserted here (against their own before/after deltas, not summed into
+    /// one number) so the two-reads-per-call fact for THIS setup is pinned
+    /// explicitly rather than left implicit in the first assertion's message.
     #[test]
-    #[serial(trainer_host_read_count)]
+    #[serial(trainer_host_read_count, grad_clip_sync_read_count)]
     fn process_batch_loss_reads_the_device_exactly_once_per_micro_batch() {
         let device = Device::Cpu;
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -3456,7 +3700,8 @@ mod host_read_discipline {
         let mut global_step = 0usize;
         let checkpoint_dir = tempfile::tempdir().unwrap();
 
-        let before = per_micro_batch_host_read_count();
+        let loss_before = per_micro_batch_host_read_count();
+        let clip_before = crate::fine_tune::optimizer::sync_read_count();
         loop_
             .process_batch_loss(
                 loss,
@@ -3479,9 +3724,197 @@ mod host_read_discipline {
 
         assert_eq!(
             per_micro_batch_host_read_count(),
-            before + 1,
-            "process_batch_loss must issue exactly one device→host read per micro-batch"
+            loss_before + 1,
+            "process_batch_loss's own post-backward loss read (this file's counter) must be \
+             exactly one device→host read per micro-batch"
         );
+        // A SEPARATE device→host read: `total_steps: 1` + a single micro-batch
+        // makes this call both `step == 1` and the run's last step, so
+        // `clip_and_step`'s cadence gate also fires and reads the grad norm
+        // back via `optimizer::refuse_nonfinite_norm` — pinned here against
+        // its own counter so this call's TRUE read count (two, not one) is
+        // explicit rather than left to the assertion above's message alone.
+        assert_eq!(
+            crate::fine_tune::optimizer::sync_read_count(),
+            clip_before + 1,
+            "clip_and_step's cadence-gated grad-norm read (optimizer::SYNC_READ_COUNT) must \
+             also fire exactly once for this call"
+        );
+    }
+}
+
+/// B2/B3 last-step lattice row: **GradCache**. `run_gradcache_epoch` has no
+/// loss-value divergence check of its own (unlike `process_batch_loss`'s
+/// `loss_val.is_nan() || loss_val > 100.0` guard) — the ONLY thing that can
+/// ever catch a diverged GradCache step is `clip_and_step`'s cadence-gated
+/// `refuse_nonfinite_norm`, so getting `is_last_step` right on this arm is
+/// load-bearing in a way the accumulation-window arm (which has the
+/// loss-value backstop too) is not.
+#[cfg(test)]
+mod gradcache_last_step_oracle {
+    use std::sync::Arc;
+
+    use candle_core::{DType, Device, Tensor};
+    use candle_nn::{ParamsAdamW, VarBuilder, VarMap};
+
+    use super::super::data::TrainingDataLoader;
+    use super::super::lora::build_projection_head;
+    use super::super::target::TrainingTarget;
+    use super::super::{EmbeddingLoss, FineTuneConfig};
+    use super::TrainingLoopBuilder;
+    use crate::fine_tune::adamw::AdamW;
+    use crate::model::{ModelSource, ModelTask};
+
+    const HIDDEN: usize = 32; // tiny_bert's hidden width.
+
+    /// Load the hermetic `tiny_bert` cookbook fixture through a real
+    /// `InferenceSession`'s model cache — the same resolve+backend-load path
+    /// serving uses (see `ModelCache::load_owned_for_test`'s doc on
+    /// `session.rs`'s equivalent seam). Real, but tiny and local: no network,
+    /// sub-second load, matching every other `tiny_bert`-fixture test in
+    /// `tests/it`.
+    async fn tiny_bert() -> Arc<crate::model::LoadedModel> {
+        let dir = tempfile::tempdir().unwrap();
+        let config = jammi_test_utils::test_config(dir.path());
+        let session = crate::session::InferenceSession::new(config).await.unwrap();
+        let source = ModelSource::Local(jammi_test_utils::cookbook_fixture("tiny_bert"));
+        let guard = session
+            .model_cache()
+            .get_or_load(&source, ModelTask::TextEmbedding, None)
+            .await
+            .unwrap();
+        guard.model.clone()
+    }
+
+    /// RED-first (B2/B3): `run_gradcache_epoch`'s `is_last_step` must reflect
+    /// GradCache's TRUE per-epoch horizon (`self.config.epochs`), not the
+    /// accumulation-window arm's `ceil(batches / grad_accum) * epochs` — the
+    /// two differ whenever a GradCache epoch chunks into more than one
+    /// `batch_size`-sized memory-bounded pass (6 rows / `batch_size: 2` = 3
+    /// chunks here, so the WRONG horizon would be `ceil(3/1) * 2 == 6`
+    /// against the correct `2`).
+    ///
+    /// This drives `run_gradcache_epoch` directly (private, same-file access)
+    /// exactly as `run` calls it: epoch 0 first (healthy weights, NOT the
+    /// run's last step), then — DETERMINISTICALLY, not relying on organic
+    /// numeric divergence — corrupts one trainable `Var` to `NaN` before
+    /// calling it a second time for epoch 1 (`epochs: 2`, so this IS the
+    /// run's last step). The correct `total_optimizer_steps` (`2`, matching
+    /// `self.config.epochs`) must make `is_last_step == true` on that second
+    /// call, forcing `clip_and_step`'s non-finite check regardless of the
+    /// `DEFAULT_NORM_CHECK_INTERVAL` modulo cadence (which a 2-step run never
+    /// reaches).
+    ///
+    /// Mutation tried: hardcode `is_last_step = false` inside
+    /// `run_gradcache_epoch` (the bug B2 fixed, reintroduced) — this test
+    /// goes red: the second call returns `Ok` with a NaN weight trained in
+    /// silently, instead of the typed non-finite refusal.
+    #[test]
+    fn run_gradcache_epoch_catches_a_nonfinite_gradient_on_the_runs_last_epoch() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let base_model = tiny_bert().await;
+
+            let device = Device::Cpu;
+            let varmap = VarMap::new();
+            let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+            let config = FineTuneConfig {
+                cached: true,
+                embedding_loss: Some(EmbeddingLoss::MultipleNegativesRanking { temperature: 20.0 }),
+                batch_size: 2,
+                epochs: 2,
+                lora_rank: 2,
+                ..Default::default()
+            };
+            let head = build_projection_head(HIDDEN, &config, &varmap, &vb).unwrap();
+
+            let job_dir = tempfile::tempdir().unwrap();
+            let catalog = Arc::new(
+                jammi_db::catalog::Catalog::open(job_dir.path())
+                    .await
+                    .unwrap(),
+            );
+            let mut loop_ = TrainingLoopBuilder::new(
+                TrainingTarget::ProjectionHead { head },
+                varmap,
+                config,
+            )
+            .device(device.clone())
+            .job_id("gradcache-last-step-job".into())
+            .worker_id("gradcache-last-step-worker".into())
+            .catalog(catalog)
+            .artifact_dir(job_dir.path().to_path_buf())
+            .base_model(base_model)
+            .build()
+            .unwrap();
+
+            // 6 (anchor, positive) pairs — MNRL's in-batch-negative pool —
+            // chunked at `batch_size: 2` into 3 memory-bounded GradCache
+            // passes per epoch, so the pre-fix (WRONG) horizon
+            // (`ceil(3 / 1) * 2 == 6`) visibly differs from the correct one
+            // (`self.config.epochs == 2`).
+            let rows: Vec<(String, String)> = (0..6)
+                .map(|i| (format!("anchor text {i}"), format!("positive text {i}")))
+                .collect();
+            let loader = TrainingDataLoader::from_pairs(rows);
+
+            let trainable_vars = loop_.varmap.all_vars();
+            assert!(
+                !trainable_vars.is_empty(),
+                "test setup: the projection head must have trainable LoRA vars"
+            );
+            let mut optimizer = AdamW::new(
+                trainable_vars.clone(),
+                ParamsAdamW {
+                    lr: 0.01,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            // Epoch 0: healthy weights, global_step 0 → 1. `total_optimizer_steps
+            // == 2` (== `self.config.epochs`) is exactly what `run` computes
+            // for this arm (see `total_optimizer_steps`'s doc in `run`).
+            let global_step_after_epoch0 = 0usize;
+            loop_
+                .run_gradcache_epoch(
+                    &loader,
+                    &trainable_vars,
+                    &mut optimizer,
+                    2,
+                    global_step_after_epoch0,
+                )
+                .expect("epoch 0 must complete on healthy weights");
+
+            // Deterministically corrupt one trainable var to NaN — the
+            // divergence this test pins, not left to organic numeric chance.
+            let w = &trainable_vars[0];
+            let nan = Tensor::full(f32::NAN, w.dims(), &device).unwrap();
+            w.set(&nan).unwrap();
+
+            // Epoch 1 is THIS run's actual last optimizer step
+            // (`global_step + 1 == 2 == total_optimizer_steps`).
+            let global_step_after_epoch1 = 1usize;
+            let err = loop_
+                .run_gradcache_epoch(
+                    &loader,
+                    &trainable_vars,
+                    &mut optimizer,
+                    2,
+                    global_step_after_epoch1,
+                )
+                .expect_err(
+                    "a NaN weight on the run's last GradCache epoch must surface a typed \
+                     non-finite refusal, not train silently",
+                );
+            assert!(
+                err.to_string().contains("non-finite"),
+                "expected a non-finite grad-norm refusal, got: {err}"
+            );
+        });
     }
 }
 

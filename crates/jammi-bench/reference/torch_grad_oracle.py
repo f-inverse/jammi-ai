@@ -127,7 +127,9 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
+import os
 import re
 import sys
 import tempfile
@@ -256,6 +258,29 @@ def translate_dtype_flag_to_jammi_spelling(dtype_flag: str) -> str:
         ) from None
 
 
+def checkpoint_identity(model_dir: str) -> dict:
+    """The base checkpoint's CONTENT identity -- sha256 (hex) of
+    `model_dir/config.json` and `model_dir/model.safetensors`'s raw bytes,
+    plus the weights file's byte length -- computed IDENTICALLY on both
+    stacks (`grad_oracle.rs`'s own `sha256_and_len`, this function's Rust
+    counterpart). Replaces `model_dir` (a path string, not comparable across
+    two boxes/producers) as this comparator's actual IDENTITY determinant
+    for "the two dumps loaded the byte-identical checkpoint" -- see
+    `grad_oracle.rs`'s module doc's determinant table.
+    """
+    config_path = os.path.join(model_dir, "config.json")
+    weights_path = os.path.join(model_dir, "model.safetensors")
+    with open(config_path, "rb") as fh:
+        config_bytes = fh.read()
+    with open(weights_path, "rb") as fh:
+        weights_bytes = fh.read()
+    return {
+        "checkpoint_config_sha256": hashlib.sha256(config_bytes).hexdigest(),
+        "checkpoint_weights_sha256": hashlib.sha256(weights_bytes).hexdigest(),
+        "checkpoint_weights_size_bytes": len(weights_bytes),
+    }
+
+
 def load_lora_weights_into_model(model, path: str) -> int:
     """Load a jammi-produced (or a previous torch-produced, round-trip)
     safetensors file into `model`'s trainable LoRA parameters, translating
@@ -330,7 +355,12 @@ def dump_lora_weights_from_model(model, path: str) -> int:
 def run(args) -> dict:
     import torch
 
-    tfs.pin_fast_path_globals()
+    # Captured (not discarded, unlike an earlier draft of this function):
+    # `tfs.provenance(device, fast_path_globals)` below needs this return
+    # value -- `torch_finetune_step.py`'s own `run()` keeps it for the exact
+    # same reason (that file's own call site, cited in this module's
+    # determinant table).
+    fast_path_globals = tfs.pin_fast_path_globals()
     # Seed BEFORE any model/adapter/checkpoint construction -- including the
     # --dry-run donor checkpoint below -- mirrors torch_finetune_step.py's
     # own `run()` ordering (see that function's comment for why: peft's
@@ -361,10 +391,22 @@ def run(args) -> dict:
         model_args.dtype = args.dtype
         model_args.attn = args.attn
         model, config = tfs.load_model(model_args)
-        return _run_with_model(args, model, config, device)
+        # RESOLVED, not requested -- what HF's `AutoModel.from_pretrained`
+        # actually picked, which can differ from `args.attn` (e.g. falling
+        # back off `flash_attention_2` when the package is not installed).
+        # Captured HERE, before `wrap_lora` (mirrors
+        # `torch_finetune_step.py`'s own `run()`, cited in this module's
+        # determinant table -- PEFT-wrapping can obscure `.config` access on
+        # some versions, so read it off the UNWRAPPED model).
+        resolved_attn_implementation = getattr(model.config, "_attn_implementation", "absent")
+        return _run_with_model(
+            args, model, config, device, fast_path_globals, resolved_attn_implementation
+        )
 
 
-def _run_with_model(args, model, config, device) -> dict:
+def _run_with_model(
+    args, model, config, device, fast_path_globals, resolved_attn_implementation
+) -> dict:
     """The part of `run()` that is IDENTICAL whether `model`/`config` came
     from a real `--model-dir` or a `--dry-run` donor checkpoint — split out
     so `--dry-run`'s `tempfile.TemporaryDirectory()` context (which must
@@ -373,6 +415,13 @@ def _run_with_model(args, model, config, device) -> dict:
     this entire function body.
     """
     import torch
+
+    # Base-checkpoint CONTENT identity, computed BEFORE the forward off the
+    # exact bytes this run loaded -- `args.model_dir` is valid here whether
+    # this call came from a real `--model-dir` or a `--dry-run` donor
+    # checkpoint (`run()`'s `tempfile.TemporaryDirectory()` context is still
+    # open for the whole duration of this call — see `run()`'s own comment).
+    checkpoint_identity_fields = checkpoint_identity(args.model_dir)
 
     lora_args = _ModelArgs()
     lora_args.lora_rank = args.lora_rank
@@ -455,6 +504,28 @@ def _run_with_model(args, model, config, device) -> dict:
         "model_dir": None if args.dry_run else str(args.model_dir),
         "dry_run": args.dry_run,
         "device": str(device),
+        # Base-checkpoint CONTENT identity -- see `checkpoint_identity`'s own
+        # doc and `grad_oracle.rs`'s module doc's determinant table. IDENTITY
+        # (replaces the un-comparable `model_dir` path above, which stays
+        # emitted for human debugging only).
+        **checkpoint_identity_fields,
+        # torch/transformers/peft versions, device NAME (vs. `device` above,
+        # which is the device TYPE/ordinal), git rev, and the fast-path pin
+        # state -- reuses `torch_finetune_step.py`'s own `provenance()`
+        # UNCHANGED (never a second, drifting implementation). PROVENANCE:
+        # recorded, never compared -- two producers legitimately run on
+        # different boxes/software stacks.
+        "provenance": tfs.provenance(device, fast_path_globals),
+        # What `--attn` REQUESTED vs. what HF's `AutoModel.from_pretrained`
+        # actually RESOLVED to (`model.config._attn_implementation`, which
+        # can fall back off the request -- e.g. no `flash_attention_2`
+        # package installed). PROVENANCE: jammi has no equivalent CLI lever
+        # (its own analog, WHICH KERNEL COMPOSITION actually dispatched, is
+        # the `*_fused_dispatches`/`*_eager_dispatches` MEASUREMENT fields on
+        # the jammi side -- see `grad_oracle.rs`'s module doc's determinant
+        # table for why these are not directly comparable to each other).
+        "attn_requested": args.attn,
+        "attn_implementation": resolved_attn_implementation,
         # B1 audit finding on PR #372: emit jammi's OWN canonical spelling
         # (`f32`/`bf16`, never `fp32`) here -- `--dtype` itself keeps torch's
         # bare CLI-flag spelling (`fp32`, matching `torch_finetune_step.py`'s

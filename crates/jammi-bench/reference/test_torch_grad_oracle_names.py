@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Tests for `torch_grad_oracle.py`'s NAME TRANSLATION functions only.
+"""Tests for `torch_grad_oracle.py`'s NAME TRANSLATION functions, plus
+`checkpoint_identity` (pure filesystem + `hashlib`, touches no torch API).
 
-These are the one piece of `torch_grad_oracle.py` this environment CAN
-actually exercise without `torch`/`transformers`/`peft` installed (that
-module's own `import torch_finetune_step as tfs` succeeds even without
-torch present, because `torch_finetune_step.py` imports `torch` lazily
-inside its functions, never at module scope — so importing the NAME
-TRANSLATION functions, which touch no torch API at all, works here).
-Everything else in `torch_grad_oracle.py` (`run`, `load_lora_weights_into_model`,
-`dump_lora_weights_from_model`) is UNTESTED in this environment — see that
-file's own PROVENANCE note.
+These are the pieces of `torch_grad_oracle.py` this environment CAN actually
+exercise without `torch`/`transformers`/`peft` installed (that module's own
+`import torch_finetune_step as tfs` succeeds even without torch present,
+because `torch_finetune_step.py` imports `torch` lazily inside its
+functions, never at module scope — so importing the NAME TRANSLATION
+functions and `checkpoint_identity`, neither of which touches any torch API,
+works here). Everything else in `torch_grad_oracle.py` (`run`,
+`load_lora_weights_into_model`, `dump_lora_weights_from_model`) is UNTESTED
+in this environment — see that file's own PROVENANCE note.
 
 This suite exists because a real bug was caught by exactly this kind of
 check while writing `torch_grad_oracle.py`: an early
@@ -24,12 +25,17 @@ Run directly: `python3 crates/jammi-bench/reference/test_torch_grad_oracle_names
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import torch_grad_oracle as tgo  # noqa: E402
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+TINY_FIXTURE_DIR = os.path.join(REPO_ROOT, "cookbook", "fixtures", "tiny_modernbert_classifier")
 
 
 ALL_SITES = [
@@ -119,6 +125,71 @@ class NameTranslationTests(unittest.TestCase):
     def test_malformed_jammi_name_returns_none_not_a_crash(self):
         self.assertIsNone(tgo.translate_jammi_name_to_peft("not.a.valid.name"))
         self.assertIsNone(tgo.translate_jammi_name_to_peft("layer.3.UnknownSite.lora_a"))
+
+
+@unittest.skipUnless(
+    os.path.isdir(TINY_FIXTURE_DIR),
+    f"committed fixture missing at {TINY_FIXTURE_DIR!r}",
+)
+class CheckpointIdentityTests(unittest.TestCase):
+    """`checkpoint_identity` is the class-level fix for `_premise_violations`
+    comparing an un-comparable `model_dir` PATH string (see
+    `grad_oracle.rs`'s module doc's determinant table): it hashes the base
+    checkpoint's actual BYTES instead. Driven against the SAME committed
+    fixture `grad_oracle.rs`'s own tests use
+    (`cookbook/fixtures/tiny_modernbert_classifier`), never a fabricated
+    tempdir stand-in, so this pins the REAL function against REAL files.
+    """
+
+    def test_matches_an_independently_computed_hashlib_digest(self):
+        """THE ORACLE: recompute both digests directly with `hashlib` in
+        this test (never by calling `checkpoint_identity` twice — that would
+        only prove self-consistency, not correctness) and compare.
+        """
+        result = tgo.checkpoint_identity(TINY_FIXTURE_DIR)
+        with open(os.path.join(TINY_FIXTURE_DIR, "config.json"), "rb") as fh:
+            expected_config_sha256 = hashlib.sha256(fh.read()).hexdigest()
+        with open(os.path.join(TINY_FIXTURE_DIR, "model.safetensors"), "rb") as fh:
+            weights_bytes = fh.read()
+        self.assertEqual(result["checkpoint_config_sha256"], expected_config_sha256)
+        self.assertEqual(result["checkpoint_weights_sha256"], hashlib.sha256(weights_bytes).hexdigest())
+        self.assertEqual(result["checkpoint_weights_size_bytes"], len(weights_bytes))
+
+    def test_is_deterministic_across_repeated_calls(self):
+        first = tgo.checkpoint_identity(TINY_FIXTURE_DIR)
+        second = tgo.checkpoint_identity(TINY_FIXTURE_DIR)
+        self.assertEqual(first, second)
+
+    def test_a_single_byte_content_change_changes_the_digest(self):
+        """NEGATIVE CONTROL (family F non-vacuous): a real content mismatch
+        (not just a different PATH) must actually change the reported
+        identity -- proves this is a content hash, not a directory-name
+        echo. Copies the real fixture into a tempdir and flips one byte of
+        `config.json`, never touches the committed fixture itself.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            import shutil
+
+            shutil.copytree(TINY_FIXTURE_DIR, tmp, dirs_exist_ok=True)
+            baseline = tgo.checkpoint_identity(tmp)
+
+            config_path = os.path.join(tmp, "config.json")
+            with open(config_path, "rb") as fh:
+                data = bytearray(fh.read())
+            data[0] ^= 0xFF  # flip one byte
+            with open(config_path, "wb") as fh:
+                fh.write(bytes(data))
+
+            mutated = tgo.checkpoint_identity(tmp)
+            self.assertNotEqual(
+                baseline["checkpoint_config_sha256"], mutated["checkpoint_config_sha256"]
+            )
+            # The mutation touched ONLY config.json -- the weights digest
+            # must be unaffected (proves the two files hash independently,
+            # not e.g. both digests derived from one combined byte stream).
+            self.assertEqual(
+                baseline["checkpoint_weights_sha256"], mutated["checkpoint_weights_sha256"]
+            )
 
 
 if __name__ == "__main__":

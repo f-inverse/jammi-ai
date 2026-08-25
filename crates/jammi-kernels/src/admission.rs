@@ -216,7 +216,8 @@ pub enum PredicateOutcome {
     /// mathematical domain. Legitimate and expected (e.g. a mixed-prefix
     /// batch on the flash arm) — [`admit_cascade`] NEVER turns this into
     /// an error, in either [`AdmissionMode`]: it declines to the next arm
-    /// and records [`CascadeDispatchCounters::declined`].
+    /// and records `CascadeDispatchCounters`'s `declined` counter (private
+    /// field, incremented internally by [`admit_cascade`]).
     DomainMiss,
     /// The BUILD, DEVICE, or ENVIRONMENT cannot run this arm regardless of
     /// the data (the feature was not compiled, the GPU architecture does
@@ -286,7 +287,8 @@ impl CascadeDispatchCounters {
 }
 
 /// The op-keyed registry for [`CascadeDispatchCounters`] — mirrors
-/// [`counters_for`]/[`registry`] exactly, as a SEPARATE table (a cascade
+/// [`counters_for`]/`registry` (this module's private, plain
+/// `Mutex<HashMap<..>>` table) exactly, as a SEPARATE table (a cascade
 /// op is never looked up through [`counters_for`], and a two-arm op is
 /// never looked up through this function).
 pub fn cascade_counters_for(op: &'static str) -> &'static CascadeDispatchCounters {
@@ -304,8 +306,8 @@ fn cascade_registry() -> &'static Mutex<HashMap<&'static str, &'static CascadeDi
 }
 
 /// Whether `op` is named in `JAMMI_KERNELS_DISABLE` (exact match or the
-/// `"all"` wildcard) — a thin, PUBLIC wrapper over the same
-/// [`disabled_ops`]/[`fired_disables`] plumbing [`admit`] itself uses,
+/// `"all"` wildcard) — a thin, PUBLIC wrapper over the same private
+/// `disabled_ops`/`fired_disables` plumbing [`admit`] itself uses,
 /// exposed so a caller can skip an EXPENSIVE predicate computation (e.g. a
 /// device-side mask reduction + D2H sync, P6 stage B's `flash_d2h_syncs`)
 /// entirely when the op is disabled, rather than computing it and then
@@ -926,6 +928,26 @@ pub fn device_is_supported(d: &Device) -> bool {
     d.is_cpu() || (cfg!(feature = "cuda") && d.is_cuda())
 }
 
+/// Whether THIS crate (`jammi-kernels`) was compiled with the `flash-attn`
+/// feature — a plain `const`, unconditionally compiled (never behind
+/// `#[cfg(feature = "flash-attn")]` itself), so a downstream crate can read
+/// the real answer WITHOUT forwarding the feature through its own
+/// `Cargo.toml`. This matters because `crate::flash` (the module the real
+/// answer would otherwise require referencing) IS `#[cfg(feature =
+/// "flash-attn")]`-gated (`lib.rs`): a call site cannot "stay compiled"
+/// behind a bare `cfg!()` runtime check if reaching the `true` branch would
+/// need to NAME a type from that module — the code would fail to compile
+/// whenever the LOCAL crate's own feature is off, regardless of what this
+/// constant says. `FLASH_COMPILED` is therefore useful ONLY for a predicate
+/// that decides fused-vs-eager without ever naming a `crate::flash` type
+/// directly (P6 Stage B's `attention_block_flash` admission predicate,
+/// `jammi-encoders`, is exactly such a caller today — it holds row
+/// `lengths`, not a constructed `crate::flash::CuSeqlens`, for precisely
+/// this reason). Workspace feature unification makes this SOUND: `cfg!`
+/// resolves to how THIS crate was actually compiled for the whole build
+/// graph, the same value regardless of which downstream crate is asking.
+pub const FLASH_COMPILED: bool = cfg!(feature = "flash-attn");
+
 /// The op-keyed dispatch-counter registry: one process-wide table from an
 /// op's name to its `DispatchCounters`. See the module doc's "op-keyed
 /// dispatch-counter registry" section for why this exists alongside (not
@@ -1148,6 +1170,11 @@ mod tests {
             !captured.contains("fused-kernel domain check failed"),
             "the disabled path must NOT reuse the predicate-failure message; captured={captured}"
         );
+    }
+
+    #[test]
+    fn flash_compiled_matches_the_flash_attn_feature_this_binary_was_built_with() {
+        assert_eq!(FLASH_COMPILED, cfg!(feature = "flash-attn"));
     }
 
     #[test]

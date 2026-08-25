@@ -28,12 +28,15 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use candle_core::{DType, Device, Module, Tensor, D};
 use candle_nn::{embedding, linear_no_bias, Embedding, VarBuilder, VarMap};
 use jammi_kernels::admission::{
-    admission_mode, admit, counters_for, device_is_supported, DispatchCounters, DispatchOutcome,
+    admission_mode, admit, admit_cascade, cascade_counters_for, counters_for, device_is_supported,
+    probe_cuda_compute_capability, CascadeOutcome, ComputeCapability, DispatchCounters,
+    DispatchOutcome, PredicateOutcome,
 };
 use jammi_kernels::ops::{
     apply1, apply2, apply3, AttentionBlockFused, FullyMaskedPolicy, RopeFused, SoftmaxLastDimFused,
@@ -773,6 +776,7 @@ impl ModernBertAttention {
         extended_mask: &Tensor,
         local_band: Option<&Tensor>,
         fused_masks: Option<&FusedAttentionMasks>,
+        flash: Option<&FlashForwardDecision>,
     ) -> Result<Tensor, EncoderError> {
         let normed = match &self.attn_norm {
             Some(ln) => ln.forward(hidden)?,
@@ -793,6 +797,14 @@ impl ModernBertAttention {
                         .into(),
                 ));
             };
+            let Some(flash) = flash else {
+                return Err(EncoderError::Config(
+                    "training-mode attention reached without the per-forward flash-cascade \
+                     decision — ModernBert::forward_hidden decides it once per forward \
+                     (contract v4 §3.2); a direct caller in training mode must supply it too"
+                        .into(),
+                ));
+            };
             self.forward_training_attention(
                 &qkv,
                 batch,
@@ -804,6 +816,7 @@ impl ModernBertAttention {
                     local_band,
                     fused,
                 },
+                flash,
             )?
         } else {
             self.forward_eval_attention(&qkv, batch, seq, h, d, extended_mask, local_band)?
@@ -904,6 +917,7 @@ impl ModernBertAttention {
     /// `BF16`-derived-bound validated range (`|qkv| <= 1`). The op still
     /// computes correctly there; see that section for what IS and is NOT
     /// claimed at this amplitude.
+    #[allow(clippy::too_many_arguments)]
     fn forward_training_attention(
         &self,
         qkv: &Tensor,
@@ -912,12 +926,38 @@ impl ModernBertAttention {
         h: usize,
         d: usize,
         masks: TrainingMaskInputs<'_>,
+        flash: &FlashForwardDecision,
     ) -> Result<Tensor, EncoderError> {
         if self.is_local && masks.local_band.is_none() {
             return Err(EncoderError::Config(
                 "local-attention layer reached without a sliding-window band".into(),
             ));
         }
+
+        // Flash cascade (contract v4 §3.2/§3.3): consulted PER LAYER so the
+        // counters are per-dispatch, not per-forward, even though the
+        // eligibility decision itself was made once, above, in
+        // `ModernBert::forward_hidden`. `attention_block_flash` does not
+        // exist yet (B1), so `flash.outcome` is already pinned to a decline
+        // by `decide_flash_admission` — this call always returns `Declined`
+        // and the block-or-eager dispatch below runs UNCHANGED. `true`:
+        // the block arm (this function's own fallback) always can run, so
+        // Strict mode never errors on the flash arm's decline either.
+        let flash_dispatch = admit_cascade(
+            admission_mode(),
+            "attention_block_flash",
+            flash.reason,
+            flash.outcome,
+            true,
+            cascade_counters_for("attention_block_flash"),
+        )?;
+        debug_assert_eq!(
+            flash_dispatch,
+            CascadeOutcome::Declined,
+            "attention_block_flash cannot dispatch Fused until B1's flash_attention_varlen \
+             lands — decide_flash_admission always downgrades Holds to CapabilityMiss until then"
+        );
+
         let (holds, predicate) = attention_block_admission_predicate(
             qkv,
             seq,
@@ -1323,6 +1363,398 @@ impl ModernBertMlp {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Flash-attention cascade admission seam (P6 Stage B B2)
+//
+// This section builds the SEAM `attention_block_flash` (B1, a sibling
+// branch) will plug into — the op does not exist yet, so every decision
+// below always declines and the training arm's dispatch (and every
+// output byte) is UNCHANGED. See `decide_flash_admission`'s doc for the
+// exact, temporary override that pins this, and
+// `tests::flash_cascade_never_changes_the_block_arm_dispatch_or_output`
+// for the oracle proving it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The head dim the flash cascade admits — mirrors [`ATTENTION_BLOCK_HEAD_DIM`]
+/// (both `64`) and, once B1 lands, `jammi_kernels::flash::HEAD_DIM`.
+/// Duplicated here as a plain constant rather than depending on
+/// `jammi-kernels`'s `flash-attn` feature: this crate does not forward
+/// that feature (no consumer needs the real `jammi_kernels::flash` types
+/// until B1's `flash_attention_varlen` exists — see [`CompactedBatch`]'s
+/// doc for why `lengths`, not a constructed `CuSeqlens`, is what this
+/// commit threads).
+const FLASH_HEAD_DIM: usize = 64;
+
+/// The exact CUDA compute capability the flash cascade admits — sm_80
+/// ONLY (contract v4 §3.4/F6: `>=` would admit sm_86/89/90 and crash at
+/// launch, since the vendored kernel is compiled for sm_80 alone). A stub
+/// this crate OWNS until B1 lands its own build-time `FLASH_COMPUTE_CAP`
+/// constant (`crates/jammi-kernels/build.rs`'s planned
+/// `JAMMI_FLASH_GENCODE_SM`, contract §3.4); this function is the seam
+/// B1's real `check_arch`-equivalent plugs into. Uses the SAME
+/// [`probe_cuda_compute_capability`] every other admission predicate in
+/// this crate/`jammi-kernels` reads (`None` — non-CUDA, or `cuda` feature
+/// off, or a query failure — degrades to `false`, never a panic or a
+/// silently-wrong "yes").
+fn flash_arch_ok(device: &Device) -> bool {
+    probe_cuda_compute_capability(device) == Some(ComputeCapability::new(8, 0))
+}
+
+/// How many times this process has paid the flash cascade's device-side
+/// mask reduction + host sync (contract v4 §3.7, path F, as corrected by
+/// the lead: row LENGTHS alone cannot decide "prefix" — a mask
+/// `[1,0,1,0]` sums to `2`, the same length a genuine prefix `[1,1,0,0]`
+/// reports — so lengths AND the whole-batch prefix predicate are computed
+/// on the device in ONE reduction and read back in ONE sync, not `b`
+/// separate transfers). See [`compute_lengths_and_prefix`]. A durable run
+/// record is expected to read this exactly `steps` (or
+/// `forwards_per_step * steps` — batched vs unbatched vs GradCache-chunked,
+/// contract v4's item-2 correction) on an FA2-ELIGIBLE leg (the sync only
+/// runs once the cheap, sync-free gates below already passed) and `0` on
+/// every block leg, including every CPU / non-`flash-attn`-feature build
+/// this crate's own test suite runs under today.
+static FLASH_D2H_SYNCS: AtomicU64 = AtomicU64::new(0);
+
+/// Read API for [`FLASH_D2H_SYNCS`] — `pub(crate)` today (no external
+/// consumer yet); a durable job record reads it the same way it reads
+/// `crate::attention_block_dispatch_snapshot()`. `#[allow(dead_code)]`:
+/// exercised directly by this module's own tests (`#[cfg(test)]`, a
+/// SEPARATE compilation from the plain lib target `clippy --all-targets`
+/// also checks) but not yet called from non-test production code — no
+/// durable-artifact caller has been wired up to read it yet.
+#[allow(dead_code)]
+pub(crate) fn flash_d2h_syncs() -> u64 {
+    FLASH_D2H_SYNCS.load(Ordering::Relaxed)
+}
+
+/// The once-per-forward flash-cascade decision (contract v4 §3.2), decided
+/// ONCE in [`ModernBert::forward_hidden`] (mirroring [`FusedAttentionMasks`])
+/// and threaded per layer. Owns the compacted batch's row `lengths` and the
+/// `[total]` unpad gather indices — see [`unpad_gather_indices`] — but
+/// deliberately NOT a constructed `jammi_kernels::flash::CuSeqlens`: that
+/// type is feature-gated behind `jammi-kernels`'s `flash-attn` (not
+/// forwarded by this crate's `Cargo.toml` yet), and `CuSeqlens::from_lengths`
+/// is cheap enough to construct on demand, once, at the real flash call
+/// site B1 adds — holding a `CuSeqlens` across a whole forward buys
+/// nothing today and would force a premature feature dependency.
+struct CompactedBatch {
+    /// One length per batch element, `lengths[b] <= seq`.
+    #[allow(dead_code)] // consumed once B1's flash_attention_varlen lands
+    lengths: Vec<usize>,
+    /// `[total]` gather indices into the flattened `[batch * seq]` row
+    /// axis — every REAL (non-pad) row, batch-then-seq order.
+    #[allow(dead_code)] // consumed once B1's flash_attention_varlen lands
+    gather_indices: Tensor,
+    #[allow(dead_code)] // consumed once B1's flash_attention_varlen lands
+    total: usize,
+}
+
+/// The full once-per-forward flash-cascade decision: [`CompactedBatch`]
+/// when eligible, plus the [`PredicateOutcome`] and reason string every
+/// LAYER's own [`admit_cascade`] call reports (contract v4 §3.2: "the
+/// counters are per-dispatch, not per-forward" — this struct is what makes
+/// that per-layer call cheap: no layer re-derives the reason).
+struct FlashForwardDecision {
+    #[allow(dead_code)] // read by this module's tests; consumed by B1's real call site
+    admission: Option<CompactedBatch>,
+    outcome: PredicateOutcome,
+    reason: &'static str,
+}
+
+/// Row indices of every REAL (non-pad) row of a `[batch, seq, ..]` tensor,
+/// flattened to `[total]`, in batch-then-seq order — `padded[b, s]`'s flat
+/// row index `b * seq + s` for every `s < lengths[b]` (RIGHT padding: every
+/// real row precedes every pad row within a batch element — contract v4 §3
+/// D1's "row%period + HF absolute-padded arange" premise, `trainer.rs`'s
+/// `BatchLongest`). `total = gather_indices.dim(0)? = lengths.iter().sum()`.
+fn unpad_gather_indices(
+    lengths: &[usize],
+    seq: usize,
+    device: &Device,
+) -> Result<Tensor, EncoderError> {
+    let total: usize = lengths.iter().map(|&l| l.min(seq)).sum();
+    let mut idx: Vec<u32> = Vec::with_capacity(total);
+    for (b, &len) in lengths.iter().enumerate() {
+        for s in 0..len.min(seq) {
+            idx.push(u32::try_from(b * seq + s).map_err(|_| {
+                EncoderError::Config("unpad_gather_indices: row index overflows u32".into())
+            })?);
+        }
+    }
+    Ok(Tensor::from_vec(idx, (total,), device)?)
+}
+
+/// Unpad: `[batch, seq, hidden] -> [total, hidden]`, gathering every real
+/// row via `gather_indices` (see [`unpad_gather_indices`]). A pure
+/// function — no admission, no counters — the encoder-boundary half of
+/// contract v4 §3.5's "unpad/repad at the ENCODER boundary" (one gather
+/// before layer 0, one scatter after the last layer). `#[allow(dead_code)]`:
+/// exercised by this module's own tests; not yet wired into the real
+/// forward path (B1's flash call site is the eventual production caller).
+#[allow(dead_code)]
+fn unpad_rows(x: &Tensor, gather_indices: &Tensor) -> Result<Tensor, EncoderError> {
+    let (b, s, h) = x.dims3()?;
+    let flat = x.reshape((b * s, h))?;
+    Ok(flat.index_select(gather_indices, 0)?)
+}
+
+/// Repad: `[total, hidden] -> [batch, seq, hidden]`, the inverse of
+/// [`unpad_rows`]. The destination is `Tensor::zeros` (contract v4 §3.5's
+/// `alloc_zeros`, this crate's host-composable equivalent of
+/// `flash/mod.rs`'s CUDA-scratch `alloc_zeros` under `deterministic`) —
+/// NEVER an uninitialised buffer multiplied by a 0/1 indicator, which is
+/// exactly the `0.0 * NaN = NaN` failure `crate::pooling.rs:62`'s own doc
+/// already names: `index_add` on a genuinely zeroed destination can never
+/// read a pad row's stale bytes, because it never reads the destination at
+/// the indices it does not touch. `gather_indices` entries are unique (one
+/// real row maps to exactly one compacted row), so `index_add` — an
+/// accumulate — is exactly a scatter/copy here, never a collision.
+/// `#[allow(dead_code)]`: same status as [`unpad_rows`].
+#[allow(dead_code)]
+fn repad_rows(
+    compacted: &Tensor,
+    gather_indices: &Tensor,
+    batch: usize,
+    seq: usize,
+) -> Result<Tensor, EncoderError> {
+    let hidden = compacted.dim(1)?;
+    let dest = Tensor::zeros((batch * seq, hidden), compacted.dtype(), compacted.device())?;
+    let repadded = dest.index_add(gather_indices, compacted, 0)?;
+    Ok(repadded.reshape((batch, seq, hidden))?)
+}
+
+/// Contract v4 §3.7 (path F), corrected mid-round by the lead: row
+/// LENGTHS alone cannot decide "prefix" (`[1,0,1,0]` sums to `2`, same as
+/// the genuine prefix `[1,1,0,0]`) — this computes BOTH `lengths[b] =
+/// mask.sum(1)` AND the whole-batch prefix predicate `is_prefix = ALL_b,s
+/// (mask[b,s] == (s < lengths[b]))` on the DEVICE in one pass, and reads
+/// them back together in ONE sync (a single `Tensor::cat`ed `to_vec1`
+/// call — `lengths` and the prefix flag share the SAME transfer, not two).
+/// `mask` is `[batch, seq]`, `0.0`/`1.0`-valued padding mask (the same one
+/// [`extended_attention_mask`] consumes).
+fn compute_lengths_and_prefix(mask: &Tensor) -> Result<(Vec<usize>, bool), EncoderError> {
+    let (batch, seq) = mask.dims2()?;
+    let mask_f32 = mask.to_dtype(DType::F32)?;
+    let lengths_col = mask_f32.sum_keepdim(1)?; // [batch, 1]
+
+    // prefix_mask(lengths)[b, s] = 1.0 iff s < lengths[b] — an iota
+    // compared against the broadcast length, still ON THE DEVICE.
+    let iota = Tensor::arange(0u32, seq as u32, mask.device())?
+        .to_dtype(DType::F32)?
+        .reshape((1, seq))?;
+    let reconstructed = iota.broadcast_lt(&lengths_col)?.to_dtype(DType::F32)?;
+    let row_matches = mask_f32.eq(&reconstructed)?.to_dtype(DType::F32)?;
+    // 1.0 iff EVERY (b, s) matches its own prefix reconstruction.
+    let is_prefix_scalar = row_matches.min_all()?.reshape(1)?;
+
+    // ONE sync: `lengths` (b floats) and the prefix flag concatenated into
+    // a single `[batch + 1]` tensor and read back with ONE `to_vec1` call
+    // — the transfer `FLASH_D2H_SYNCS` counts, not `b + 1` separate ones.
+    let combined = Tensor::cat(&[&lengths_col.reshape(batch)?, &is_prefix_scalar], 0)?;
+    let combined_host: Vec<f32> = combined.to_vec1()?;
+    FLASH_D2H_SYNCS.fetch_add(1, Ordering::Relaxed);
+
+    let lengths: Vec<usize> = combined_host[..batch]
+        .iter()
+        .map(|&l| l.round() as usize)
+        .collect();
+    let is_prefix = combined_host[batch] != 0.0;
+    Ok((lengths, is_prefix))
+}
+
+/// The flash cascade's own admission predicate (contract v4 §3.2's
+/// consulted terms): device is CUDA and arch EXACTLY `(8, 0)`
+/// ([`flash_arch_ok`]), backbone dtype `BF16`, `head_dim ==
+/// `[`FLASH_HEAD_DIM`]``, `flash-attn` compiled (`cfg!` TERM — L10, a
+/// [`PredicateOutcome::CapabilityMiss`], never `#[cfg]` on the call site),
+/// and the batch's mask is a prefix mask with every row length `>= 1`
+/// ([`compute_lengths_and_prefix`] — a [`PredicateOutcome::DomainMiss`]
+/// when it is not: a mixed/interior-zero batch legitimately does not fit
+/// this arm's domain, contract v4 §3.3's L3/L4/L5).
+///
+/// Ordered so the EXPENSIVE, D2H-paying check (mask prefix) runs LAST,
+/// after every cheap, sync-free gate — device/arch/dtype/head_dim/feature —
+/// already passed. This is why [`flash_d2h_syncs`] reads `0` on every
+/// block leg this crate's test suite exercises today (no CUDA, or the
+/// `flash-attn` feature off): the cheap gates fail first and the mask
+/// reduction is never reached.
+/// `(outcome, reason, eligible)` — `eligible` is `Some((lengths, seq))`
+/// ONLY on `PredicateOutcome::Holds` (the whole-batch row lengths and the
+/// sequence length [`build_flash_forward_decision`] needs to build
+/// [`CompactedBatch`]). Named to keep [`flash_admission_predicate`]'s and
+/// [`decide_flash_admission`]'s signatures under clippy's `type_complexity`
+/// ceiling.
+type FlashPredicateResult =
+    Result<(PredicateOutcome, &'static str, Option<(Vec<usize>, usize)>), EncoderError>;
+
+fn flash_admission_predicate(
+    device: &Device,
+    dtype: DType,
+    head_dim: usize,
+    mask: &Tensor,
+    trusted_lengths: Option<&[usize]>,
+) -> FlashPredicateResult {
+    // Reads `jammi_kernels::admission::FLASH_COMPILED` (contract v5 item 2)
+    // rather than a LOCAL `cfg!(feature = "flash-attn")`: this crate's own
+    // `flash-attn` feature is not yet forwarded any further up the stack
+    // (`jammi-ai`/`jammi-bench` do not request it), and — because
+    // `jammi_kernels::flash` is itself `#[cfg(feature = "flash-attn")]`-gated
+    // — a call site can never "stay compiled" behind a bare `cfg!()` bool if
+    // reaching the `true` branch would need to NAME a type from that module.
+    // `FLASH_COMPILED` is exactly the escape hatch: a plain, unconditionally-
+    // compiled `bool` reflecting how `jammi-kernels` itself was actually
+    // built, readable regardless of whether THIS crate's own feature flag is
+    // forwarded — see that constant's own doc.
+    if !jammi_kernels::admission::FLASH_COMPILED {
+        return Ok((
+            PredicateOutcome::CapabilityMiss,
+            "flash_attn_feature_compiled",
+            None,
+        ));
+    }
+    if !device.is_cuda() {
+        return Ok((PredicateOutcome::CapabilityMiss, "device_is_cuda", None));
+    }
+    if !flash_arch_ok(device) {
+        return Ok((PredicateOutcome::CapabilityMiss, "arch_is_sm80_exact", None));
+    }
+    if dtype != DType::BF16 {
+        return Ok((PredicateOutcome::DomainMiss, "dtype_is_bf16", None));
+    }
+    if head_dim != FLASH_HEAD_DIM {
+        return Ok((
+            PredicateOutcome::DomainMiss,
+            "head_dim_is_flash_head_dim",
+            None,
+        ));
+    }
+    resolve_lengths_and_prefix(mask, trusted_lengths)
+}
+
+/// The tail of [`flash_admission_predicate`] — everything AFTER the cheap,
+/// device/build capability gates (feature compiled, CUDA, arch) — split out
+/// so path P's `trusted_lengths` branch and path F's device-reduction
+/// branch are BOTH directly unit-testable on `Device::Cpu` without needing
+/// to fake past `flash_admission_predicate`'s own CUDA-only gates (this
+/// crate's test suite has no CUDA device at all).
+fn resolve_lengths_and_prefix(
+    mask: &Tensor,
+    trusted_lengths: Option<&[usize]>,
+) -> FlashPredicateResult {
+    let (lengths, is_prefix) = match trusted_lengths {
+        Some(trusted) => {
+            // Path P (contract v4 §3.7, v5 item 3): the caller ALREADY
+            // knows the row lengths (its own tokenizer's output, e.g.
+            // `encode_texts`) and asserts `mask` was built by a
+            // construction that is a right-padded prefix by CONSTRUCTION
+            // (the same `BatchLongest` premise `trainer.rs` relies on) —
+            // trusted, not re-derived from `mask` on the device, which is
+            // the whole point: this path pays ZERO `flash_d2h_syncs`. Only
+            // a cheap, host-only shape check remains (family D: even a
+            // trusted input gets ITS OWN domain check, not blind faith).
+            let (batch, seq) = mask.dims2()?;
+            if trusted.len() != batch {
+                return Ok((
+                    PredicateOutcome::DomainMiss,
+                    "trusted_lengths_len_matches_batch",
+                    None,
+                ));
+            }
+            if trusted.iter().any(|&l| l > seq) {
+                return Ok((
+                    PredicateOutcome::DomainMiss,
+                    "trusted_lengths_within_seq",
+                    None,
+                ));
+            }
+            (trusted.to_vec(), true)
+        }
+        None => compute_lengths_and_prefix(mask)?,
+    };
+    if !is_prefix {
+        // Mixed batch (some rows non-prefix, contract v4 L3/L5) -> DomainMiss
+        // for the WHOLE forward, at this encoder-level predicate, BEFORE any
+        // `CuSeqlens` construction is attempted.
+        return Ok((
+            PredicateOutcome::DomainMiss,
+            "mask_is_prefix_every_row",
+            None,
+        ));
+    }
+    if lengths.contains(&0) {
+        // Redundant with `is_prefix` today (a length-0 row IS a valid
+        // all-zero prefix and would pass the check above), kept as an
+        // explicit, separately-named domain miss (L4) so a FUTURE relaxation
+        // of the prefix check alone cannot silently admit a zero-length row.
+        return Ok((PredicateOutcome::DomainMiss, "every_row_length_ge_1", None));
+    }
+    let seq = mask.dim(1)?;
+    Ok((PredicateOutcome::Holds, "domain_ok", Some((lengths, seq))))
+}
+
+/// Decides the flash cascade ONCE per forward (contract v4 §3.2), building
+/// [`CompactedBatch`] when eligible.
+///
+/// **Temporary, honest override (remove when B1 lands):** even when
+/// [`flash_admission_predicate`] returns [`PredicateOutcome::Holds`], this
+/// function downgrades the outcome to
+/// `PredicateOutcome::CapabilityMiss("flash_attention_varlen_not_yet_wired")`
+/// and returns `admission: None` — `jammi_kernels::flash::flash_attention_varlen`
+/// (B1, contract §3.1) does not exist on this branch yet, so there is
+/// nothing to dispatch to even on an eligible batch. This is what makes
+/// `tests::flash_cascade_never_changes_the_block_arm_dispatch_or_output`
+/// (and the existing parity/encoder test suite, run bit-for-bit) hold: at
+/// THIS commit every layer's cascade always declines and the block-or-eager
+/// dispatch beneath is BYTE-IDENTICAL to before this seam existed.
+fn decide_flash_admission(
+    device: &Device,
+    dtype: DType,
+    head_dim: usize,
+    mask: &Tensor,
+    trusted_lengths: Option<&[usize]>,
+) -> Result<FlashForwardDecision, EncoderError> {
+    let (outcome, reason, eligible) =
+        flash_admission_predicate(device, dtype, head_dim, mask, trusted_lengths)?;
+    build_flash_forward_decision(outcome, reason, eligible, device)
+}
+
+/// [`decide_flash_admission`]'s device-free second half, split out so the
+/// "downgrade a would-be `Holds` to `CapabilityMiss` until B1 lands" rule —
+/// and [`CompactedBatch`]'s construction from `(lengths, seq)` — are
+/// directly unit-testable with a literal `PredicateOutcome::Holds` input,
+/// without needing an actual CUDA device to reach [`flash_admission_predicate`]'s
+/// `Holds` branch (this crate's own test suite has no CUDA device to run
+/// on at all).
+fn build_flash_forward_decision(
+    outcome: PredicateOutcome,
+    reason: &'static str,
+    eligible: Option<(Vec<usize>, usize)>,
+    device: &Device,
+) -> Result<FlashForwardDecision, EncoderError> {
+    match (outcome, eligible) {
+        (PredicateOutcome::Holds, Some((lengths, seq))) => {
+            let gather_indices = unpad_gather_indices(&lengths, seq, device)?;
+            let total = gather_indices.dim(0)?;
+            Ok(FlashForwardDecision {
+                admission: Some(CompactedBatch {
+                    lengths,
+                    gather_indices,
+                    total,
+                }),
+                // See this function's doc: pinned to CapabilityMiss until
+                // B1's op exists, regardless of the real predicate's Holds.
+                outcome: PredicateOutcome::CapabilityMiss,
+                reason: "flash_attention_varlen_not_yet_wired",
+            })
+        }
+        _ => Ok(FlashForwardDecision {
+            admission: None,
+            outcome,
+            reason,
+        }),
+    }
+}
+
 struct ModernBertLayer {
     attention: ModernBertAttention,
     mlp: ModernBertMlp,
@@ -1337,10 +1769,11 @@ impl ModernBertLayer {
         extended_mask: &Tensor,
         local_band: Option<&Tensor>,
         fused_masks: Option<&FusedAttentionMasks>,
+        flash: Option<&FlashForwardDecision>,
     ) -> Result<Tensor, EncoderError> {
-        let after_attn = self
-            .attention
-            .forward(hidden, extended_mask, local_band, fused_masks)?;
+        let after_attn =
+            self.attention
+                .forward(hidden, extended_mask, local_band, fused_masks, flash)?;
         self.mlp.forward(&after_attn)
     }
 }
@@ -1413,12 +1846,53 @@ impl ModernBert {
         pool_and_normalize(&hidden, mask, self.pooling)
     }
 
+    /// [`Self::forward`] with row lengths ALREADY known host-side (P6 Stage
+    /// B, contract v4 §3.7 "path P", v5 item 3) — see
+    /// [`Self::forward_hidden_with_lengths`]'s doc for the trust contract
+    /// `lengths` carries and why this skips a device sync. The additive
+    /// entry point `AnyEncoder::forward_with_lengths` (`jammi-ai`, NOT this
+    /// crate) is expected to call this; this crate does not depend on
+    /// `jammi-ai` and cannot wire that call site itself.
+    pub fn forward_with_lengths(
+        &self,
+        input_ids: &Tensor,
+        mask: &Tensor,
+        lengths: Option<&[usize]>,
+    ) -> Result<Tensor, EncoderError> {
+        let hidden = self.forward_hidden_with_lengths(input_ids, mask, lengths)?;
+        pool_and_normalize(&hidden, mask, self.pooling)
+    }
+
     /// Run the encoder and return the raw last-layer hidden states
     /// `[batch, seq, hidden]`.
     pub fn forward_hidden(
         &self,
         input_ids: &Tensor,
         mask: &Tensor,
+    ) -> Result<Tensor, EncoderError> {
+        self.forward_hidden_with_lengths(input_ids, mask, None)
+    }
+
+    /// [`Self::forward_hidden`], but with the batch's row `lengths`
+    /// ALREADY known host-side — e.g. from the SAME tokenizer call that
+    /// produced `input_ids`/`mask` (`encode_texts`, `trainer.rs`'s
+    /// `BatchLongest` right-padding). `lengths` is a TRUST boundary
+    /// (family D still applies at the edge, but the edge moves to the
+    /// CALLER): this function does NOT re-derive lengths or re-verify the
+    /// prefix structure from `mask` on the device — that is exactly the
+    /// `flash_d2h_syncs` sync path P exists to avoid paying — it only
+    /// checks the cheap, host-only shape facts `flash_admission_predicate`'s
+    /// `trusted_lengths` branch documents (length count matches batch, each
+    /// length `<= seq`). A caller whose `lengths` do NOT actually match
+    /// `mask`'s real padding structure gets a WRONG flash-eligibility
+    /// decision, not a caught error — this is the documented cost of
+    /// skipping the sync, not a silently-tolerated bug. `lengths: None` is
+    /// [`Self::forward_hidden`]'s exact prior behaviour (path F, unchanged).
+    pub fn forward_hidden_with_lengths(
+        &self,
+        input_ids: &Tensor,
+        mask: &Tensor,
+        lengths: Option<&[usize]>,
     ) -> Result<Tensor, EncoderError> {
         let (_batch, seq) = input_ids.dims2()?;
         if seq > self.max_position_embeddings {
@@ -1470,12 +1944,35 @@ impl ModernBert {
         } else {
             None
         };
+        // The flash-cascade decision (contract v4 §3.2), decided ONCE per
+        // forward exactly like `fused_masks` above — `None` in eval (the
+        // flash arm is training-only, contract v4 §2 scope: "eval/serving
+        // stays eager"). `mask` (not `extended`, which is already additive
+        // `0`/`MASKED_LOGIT`-valued) is the raw `0.0`/`1.0` padding mask
+        // `compute_lengths_and_prefix` needs.
+        let flash_admission = if self.training {
+            let head_dim = self
+                .layers
+                .first()
+                .map(|l| l.attention.head_dim)
+                .unwrap_or(0);
+            Some(decide_flash_admission(
+                input_ids.device(),
+                hidden.dtype(),
+                head_dim,
+                mask,
+                lengths,
+            )?)
+        } else {
+            None
+        };
         for layer in &self.layers {
             hidden = layer.forward(
                 &hidden,
                 &extended,
                 local_band.as_ref(),
                 fused_masks.as_ref(),
+                flash_admission.as_ref(),
             )?;
         }
 
@@ -1914,6 +2411,512 @@ mod tests {
     /// counters through the crate's public `attention_block_dispatch_
     /// snapshot` API — a different binary, so a different `Mutex`).
     static ATTENTION_BLOCK_COUNTER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A flash-cascade decision that always declines — the stub every
+    /// pre-existing (pre-flash) test in this module passes so its call to
+    /// `ModernBertAttention::forward`/`forward_training_attention` keeps
+    /// compiling against the widened signature. Matches EXACTLY what
+    /// `decide_flash_admission` itself produces today (see that function's
+    /// doc): `attention_block_flash` has no real op to dispatch to yet
+    /// (B1), so no test-constructed decision in this module is ever
+    /// `PredicateOutcome::Holds`.
+    fn declined_flash() -> FlashForwardDecision {
+        FlashForwardDecision {
+            admission: None,
+            outcome: PredicateOutcome::CapabilityMiss,
+            reason: "test_stub_flash_declined",
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Flash-cascade admission seam (P6 Stage B B2)
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Serializes every test in this module that reads [`FLASH_D2H_SYNCS`]
+    /// — the SAME process-wide-static hazard [`ATTENTION_BLOCK_COUNTER_TEST_LOCK`]
+    /// already documents for `ATTENTION_BLOCK_DISPATCH_COUNTERS`, for the
+    /// same reason: `cargo test`'s default parallel thread pool would
+    /// otherwise let two tests' "exactly `+1`" assertions race.
+    static FLASH_D2H_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn flash_arch_ok_rejects_cpu() {
+        assert!(!flash_arch_ok(&Device::Cpu));
+    }
+
+    /// L7-equivalent + L10: on this build (no `cuda`/`flash-attn` feature,
+    /// and CPU regardless), the CHEAPEST gate declines first —
+    /// `flash_admission_predicate` never reaches `compute_lengths_and_prefix`,
+    /// so it must pay ZERO device syncs. Also proves the ordering
+    /// (feature/device/arch BEFORE the mask reduction) this module's doc
+    /// claims is why every block leg in this crate's test suite reads
+    /// `flash_d2h_syncs() == 0`.
+    #[test]
+    fn flash_admission_predicate_declines_on_cpu_without_paying_the_d2h_sync() {
+        let _guard = FLASH_D2H_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let device = Device::Cpu;
+        let mask = Tensor::from_slice(&[1f32, 1.0, 1.0, 1.0], (1, 4), &device).unwrap();
+        let before = flash_d2h_syncs();
+        let (outcome, reason, eligible) =
+            flash_admission_predicate(&device, DType::BF16, FLASH_HEAD_DIM, &mask, None).unwrap();
+        let after = flash_d2h_syncs();
+        assert_eq!(outcome, PredicateOutcome::CapabilityMiss);
+        assert!(
+            reason == "flash_attn_feature_compiled" || reason == "device_is_cuda",
+            "unexpected reason: {reason}"
+        );
+        assert!(eligible.is_none());
+        assert_eq!(
+            after, before,
+            "a cheap capability gate must decline BEFORE the mask reduction ever runs"
+        );
+    }
+
+    /// Path P (contract v4 §3.7, v5 item 3): trusted host-side lengths pay
+    /// ZERO `flash_d2h_syncs` — the whole point of skipping the device
+    /// reduction — and still reach `Holds` with the right `CompactedBatch`
+    /// inputs.
+    #[test]
+    fn resolve_lengths_and_prefix_trusted_lengths_pays_zero_d2h_syncs() {
+        let _guard = FLASH_D2H_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let device = Device::Cpu;
+        // The mask's OWN bytes are irrelevant on the trusted-lengths path
+        // (never read for lengths/prefix) — deliberately NOT matching the
+        // trusted lengths here, to prove that.
+        let mask = Tensor::zeros((2, 5), DType::F32, &device).unwrap();
+        let before = flash_d2h_syncs();
+        let (outcome, reason, eligible) =
+            resolve_lengths_and_prefix(&mask, Some(&[3usize, 5usize])).unwrap();
+        let after = flash_d2h_syncs();
+        assert_eq!(after, before, "path P must pay ZERO device syncs");
+        assert_eq!(outcome, PredicateOutcome::Holds, "reason={reason}");
+        let (lengths, seq) = eligible.unwrap();
+        assert_eq!(lengths, vec![3, 5]);
+        assert_eq!(seq, 5);
+    }
+
+    #[test]
+    fn resolve_lengths_and_prefix_trusted_lengths_wrong_batch_count_is_domain_miss() {
+        let device = Device::Cpu;
+        let mask = Tensor::zeros((2, 5), DType::F32, &device).unwrap();
+        let (outcome, reason, eligible) =
+            resolve_lengths_and_prefix(&mask, Some(&[3usize])).unwrap();
+        assert_eq!(outcome, PredicateOutcome::DomainMiss);
+        assert_eq!(reason, "trusted_lengths_len_matches_batch");
+        assert!(eligible.is_none());
+    }
+
+    #[test]
+    fn resolve_lengths_and_prefix_trusted_lengths_exceeding_seq_is_domain_miss() {
+        let device = Device::Cpu;
+        let mask = Tensor::zeros((1, 4), DType::F32, &device).unwrap();
+        let (outcome, reason, eligible) =
+            resolve_lengths_and_prefix(&mask, Some(&[5usize])).unwrap();
+        assert_eq!(outcome, PredicateOutcome::DomainMiss);
+        assert_eq!(reason, "trusted_lengths_within_seq");
+        assert!(eligible.is_none());
+    }
+
+    /// `trusted_lengths = None` reduces `resolve_lengths_and_prefix` to
+    /// EXACTLY path F (`compute_lengths_and_prefix`) — the same
+    /// interior-zero-vs-prefix distinction proven directly against
+    /// `compute_lengths_and_prefix` elsewhere in this module holds through
+    /// this wrapper too.
+    #[test]
+    fn resolve_lengths_and_prefix_none_falls_back_to_path_f() {
+        let _guard = FLASH_D2H_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let device = Device::Cpu;
+        let mask = Tensor::from_slice(&[1f32, 0.0, 1.0, 0.0], (1, 4), &device).unwrap();
+        let before = flash_d2h_syncs();
+        let (outcome, reason, eligible) = resolve_lengths_and_prefix(&mask, None).unwrap();
+        let after = flash_d2h_syncs();
+        assert_eq!(after, before + 1, "path F pays exactly one sync");
+        assert_eq!(outcome, PredicateOutcome::DomainMiss);
+        assert_eq!(reason, "mask_is_prefix_every_row");
+        assert!(eligible.is_none());
+    }
+
+    /// The lead's exact correction: row LENGTHS alone cannot decide
+    /// "prefix" — `[1, 0, 1, 0]` sums to `2`, the SAME length a genuine
+    /// prefix `[1, 1, 0, 0]` reports, but is not one (an interior zero, L3).
+    #[test]
+    fn compute_lengths_and_prefix_distinguishes_interior_zero_from_a_true_prefix_of_equal_length() {
+        let device = Device::Cpu;
+        let genuine_prefix = Tensor::from_slice(&[1f32, 1.0, 0.0, 0.0], (1, 4), &device).unwrap();
+        let interior_zero = Tensor::from_slice(&[1f32, 0.0, 1.0, 0.0], (1, 4), &device).unwrap();
+
+        let (lengths_a, is_prefix_a) = compute_lengths_and_prefix(&genuine_prefix).unwrap();
+        assert_eq!(lengths_a, vec![2]);
+        assert!(is_prefix_a);
+
+        let (lengths_b, is_prefix_b) = compute_lengths_and_prefix(&interior_zero).unwrap();
+        assert_eq!(
+            lengths_b,
+            vec![2],
+            "same SUM as the genuine prefix — this is exactly why lengths alone cannot decide it"
+        );
+        assert!(
+            !is_prefix_b,
+            "an interior zero must NOT read as a prefix mask even though its length matches one"
+        );
+    }
+
+    #[test]
+    fn compute_lengths_and_prefix_all_ones_and_mixed_batch() {
+        let device = Device::Cpu;
+        let all_ones = Tensor::from_slice(&[1f32, 1.0, 1.0, 1.0], (1, 4), &device).unwrap();
+        let (lengths, is_prefix) = compute_lengths_and_prefix(&all_ones).unwrap();
+        assert_eq!(lengths, vec![4]);
+        assert!(
+            is_prefix,
+            "an all-ones row is a trivial (full-length) prefix"
+        );
+
+        // A mixed batch: row 0 a genuine prefix, row 1 all-ones, row 2
+        // interior-zero — the WHOLE-BATCH predicate must be false the
+        // moment ANY row is non-prefix (contract v4 L3/L5: mixed batch ->
+        // DomainMiss for the whole forward).
+        let mixed = Tensor::from_slice(
+            &[
+                1f32, 1.0, 0.0, 0.0, // row 0: prefix, length 2
+                1.0, 1.0, 1.0, 1.0, // row 1: prefix (full), length 4
+                1.0, 0.0, 1.0, 0.0, // row 2: interior zero, NOT a prefix
+            ],
+            (3, 4),
+            &device,
+        )
+        .unwrap();
+        let (lengths_mixed, is_prefix_mixed) = compute_lengths_and_prefix(&mixed).unwrap();
+        assert_eq!(lengths_mixed, vec![2, 4, 2]);
+        assert!(!is_prefix_mixed);
+    }
+
+    /// Exactly ONE sync per call — the transfer `FLASH_D2H_SYNCS` counts,
+    /// not `b` separate ones (this test's own batch has `b = 5` rows).
+    #[test]
+    fn compute_lengths_and_prefix_counts_exactly_one_d2h_sync_per_call_regardless_of_batch_size() {
+        let _guard = FLASH_D2H_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let device = Device::Cpu;
+        let mask = Tensor::ones((5, 4), DType::F32, &device).unwrap();
+        let before = flash_d2h_syncs();
+        let _ = compute_lengths_and_prefix(&mask).unwrap();
+        let after = flash_d2h_syncs();
+        assert_eq!(after, before + 1);
+    }
+
+    #[test]
+    fn unpad_gather_indices_matches_hand_computed_flat_row_offsets() {
+        let device = Device::Cpu;
+        // lengths [3, 0, 2] over seq=4: batch 1 is entirely padding (a
+        // zero-length row — L4's own domain edge), batches 0 and 2 are
+        // real prefixes.
+        let idx = unpad_gather_indices(&[3, 0, 2], 4, &device).unwrap();
+        let got: Vec<u32> = idx.to_vec1().unwrap();
+        // batch 0: rows 0,1,2 (flat 0,1,2); batch 1: none; batch 2: rows
+        // 0,1 at flat offset 2*4=8 -> 8,9.
+        assert_eq!(got, vec![0, 1, 2, 8, 9]);
+    }
+
+    /// Contract v4 §3.5's own failure mode, disclosed directly: repad's
+    /// destination must be freshly zeroed, never a buffer that could carry
+    /// stale/NaN bytes into a pad row via `0.0 * NaN = NaN`
+    /// (`crate::pooling`'s own doc). Round-trips `unpad_rows` then
+    /// `repad_rows` and asserts pad rows are EXACTLY `0.0` (never `NaN`)
+    /// and every real row is bit-identical to the original padded input.
+    #[test]
+    #[allow(clippy::needless_range_loop)] // `b` indexes THREE independent arrays via a computed flat offset, not one
+    fn unpad_repad_round_trip_zeroes_pad_rows_exactly_and_preserves_real_rows_bit_identical() {
+        let device = Device::Cpu;
+        let (batch, seq, hidden) = (2usize, 4usize, 3usize);
+        // batch 0: fully real (length 4); batch 1: real length 2, padded
+        // rows 2,3 — deliberately LARGE, non-round values so a bit-identity
+        // check on the real rows is meaningful.
+        let lengths = vec![4usize, 2usize];
+        let mut data = Vec::with_capacity(batch * seq * hidden);
+        for i in 0..(batch * seq * hidden) {
+            data.push((i as f32) * 0.371 - 5.0);
+        }
+        let padded = Tensor::from_vec(data.clone(), (batch, seq, hidden), &device).unwrap();
+
+        let gather_indices = unpad_gather_indices(&lengths, seq, &device).unwrap();
+        let compacted = unpad_rows(&padded, &gather_indices).unwrap();
+        assert_eq!(compacted.dims(), &[6, hidden]); // total = 4 + 2
+
+        let repadded = repad_rows(&compacted, &gather_indices, batch, seq).unwrap();
+        assert_eq!(repadded.dims(), &[batch, seq, hidden]);
+        let got: Vec<f32> = repadded.flatten_all().unwrap().to_vec1().unwrap();
+
+        for b in 0..batch {
+            for s in 0..seq {
+                let flat = (b * seq + s) * hidden;
+                if s < lengths[b] {
+                    for h in 0..hidden {
+                        assert_eq!(
+                            got[flat + h],
+                            data[flat + h],
+                            "real row (b={b}, s={s}) must be bit-identical"
+                        );
+                    }
+                } else {
+                    for h in 0..hidden {
+                        assert_eq!(
+                            got[flat + h],
+                            0.0,
+                            "pad row (b={b}, s={s}) must be EXACTLY 0.0, never a stale/NaN byte"
+                        );
+                        assert!(!got[flat + h].is_nan());
+                    }
+                }
+            }
+        }
+    }
+
+    /// bf16 leg of the same round trip (CUDA-when-available is deferred —
+    /// this crate's test suite has no CUDA device; the CPU/bf16 leg is the
+    /// dtype this arm actually runs at in production).
+    #[test]
+    #[allow(clippy::needless_range_loop)] // `b` indexes both `lengths` and a computed flat offset into `data`/`got`
+    fn unpad_repad_round_trip_bf16() {
+        let device = Device::Cpu;
+        let (batch, seq, hidden) = (2usize, 3usize, 2usize);
+        let lengths = vec![2usize, 1usize];
+        let data: Vec<bf16> = (0..(batch * seq * hidden))
+            .map(|i| bf16::from_f32((i as f32) * 0.5 - 1.0))
+            .collect();
+        let padded = Tensor::from_vec(data.clone(), (batch, seq, hidden), &device).unwrap();
+        let gather_indices = unpad_gather_indices(&lengths, seq, &device).unwrap();
+        let compacted = unpad_rows(&padded, &gather_indices).unwrap();
+        assert_eq!(compacted.dims(), &[3, hidden]);
+        let repadded = repad_rows(&compacted, &gather_indices, batch, seq).unwrap();
+        let got: Vec<bf16> = repadded.flatten_all().unwrap().to_vec1().unwrap();
+        for b in 0..batch {
+            for s in 0..seq {
+                let flat = (b * seq + s) * hidden;
+                for h in 0..hidden {
+                    let expected = if s < lengths[b] {
+                        data[flat + h]
+                    } else {
+                        bf16::from_f32(0.0)
+                    };
+                    assert_eq!(got[flat + h], expected, "(b={b}, s={s}, h={h})");
+                }
+            }
+        }
+    }
+
+    /// [`build_flash_forward_decision`]'s downgrade rule, tested directly
+    /// (no CUDA device needed to reach `Holds`): a `Holds` outcome still
+    /// gets `CompactedBatch` built CORRECTLY (lengths, gather indices,
+    /// total), but the RETURNED outcome/reason are pinned to
+    /// `CapabilityMiss("flash_attention_varlen_not_yet_wired")` until B1
+    /// lands — see this module's `decide_flash_admission` doc.
+    #[test]
+    fn build_flash_forward_decision_downgrades_holds_but_still_builds_the_compacted_batch() {
+        let device = Device::Cpu;
+        let lengths = vec![3usize, 0usize, 2usize];
+        let decision = build_flash_forward_decision(
+            PredicateOutcome::Holds,
+            "domain_ok",
+            Some((lengths.clone(), 4)),
+            &device,
+        )
+        .unwrap();
+        assert_eq!(decision.outcome, PredicateOutcome::CapabilityMiss);
+        assert_eq!(decision.reason, "flash_attention_varlen_not_yet_wired");
+        let batch = decision
+            .admission
+            .expect("a Holds predicate must still build the compacted batch");
+        assert_eq!(batch.lengths, lengths);
+        assert_eq!(batch.total, 5);
+        let idx: Vec<u32> = batch.gather_indices.to_vec1().unwrap();
+        assert_eq!(
+            idx,
+            unpad_gather_indices(&lengths, 4, &device)
+                .unwrap()
+                .to_vec1::<u32>()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn build_flash_forward_decision_domain_miss_never_builds_a_compacted_batch() {
+        let device = Device::Cpu;
+        let decision = build_flash_forward_decision(
+            PredicateOutcome::DomainMiss,
+            "mask_is_prefix_every_row",
+            None,
+            &device,
+        )
+        .unwrap();
+        assert!(decision.admission.is_none());
+        assert_eq!(decision.outcome, PredicateOutcome::DomainMiss);
+    }
+
+    /// The end-to-end proof: on the SAME `tests/fixtures/tiny_modernbert_head64`
+    /// fixture `forward_hidden_reaches_the_fused_attention_block_on_a_head_dim_64_checkpoint`
+    /// already drives, a training forward's flash-cascade counters read
+    /// EXACTLY `declined == num_hidden_layers`, `fused == 0`, `eager == 0`
+    /// (contract v4's item-2 correction states the general identity as
+    /// `declined == 28 x forwards_per_step x steps`; here ONE forward,
+    /// `num_hidden_layers` layers). AND the block arm's own dispatch/output
+    /// is UNCHANGED — re-asserting the SAME properties that sibling test
+    /// proves — which is the "nothing changes numerically" claim this
+    /// seam's commit message makes.
+    #[test]
+    fn flash_cascade_never_changes_the_block_arm_dispatch_or_output() {
+        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _d2h_guard = FLASH_D2H_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let device = Device::Cpu;
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/tiny_modernbert_head64");
+        let config: ModernBertConfig =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                .unwrap();
+        let weights = dir.join("model.safetensors");
+        let varmap = candle_nn::VarMap::new();
+        let mut model = ModernBert::builder()
+            .build(&[weights.as_path()], &config, &device, &varmap)
+            .unwrap();
+        // Row 1 is right-padded (contract v4's premise) so the flash
+        // predicate's own mask-prefix machinery is exercised end to end —
+        // it must still decline (no CUDA / no flash-attn feature) and the
+        // block arm's dispatch/output stay exactly what they were before
+        // this seam existed.
+        let input_ids =
+            Tensor::new(&[[2u32, 5, 10, 3, 7, 9], [4u32, 8, 1, 6, 0, 0]], &device).unwrap();
+        let mask = Tensor::new(&[[1u32, 1, 1, 1, 1, 1], [1u32, 1, 1, 1, 0, 0]], &device).unwrap();
+
+        model.set_training(true);
+        let block_before = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+        let flash_before = cascade_counters_for("attention_block_flash").snapshot();
+        let d2h_before = flash_d2h_syncs();
+        let out = model.forward_hidden(&input_ids, &mask).unwrap();
+        let block_after = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+        let flash_after = cascade_counters_for("attention_block_flash").snapshot();
+        let d2h_after = flash_d2h_syncs();
+
+        assert_eq!(
+            block_after.fused - block_before.fused,
+            config.num_hidden_layers as u64,
+            "the block arm's OWN dispatch is unchanged by the flash seam"
+        );
+        assert_eq!(block_after.eager, block_before.eager);
+        assert!(
+            out.flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .iter()
+                .all(|x: &f32| x.is_finite()),
+            "training output must be finite"
+        );
+
+        assert_eq!(
+            flash_after.fused, flash_before.fused,
+            "attention_block_flash cannot dispatch Fused — the op does not exist yet (B1)"
+        );
+        assert_eq!(
+            flash_after.eager, flash_before.eager,
+            "always 0 — see CascadeDispatchCounters's doc"
+        );
+        assert_eq!(
+            flash_after.declined - flash_before.declined,
+            config.num_hidden_layers as u64,
+            "one admit_cascade call per layer per forward — contract v4 item 2's identity, \
+             specialised to ONE forward here"
+        );
+        assert_eq!(
+            d2h_after, d2h_before,
+            "no CUDA / no flash-attn feature on this build -> the cheap gate declines before \
+             ANY device sync — 0 on this block leg"
+        );
+
+        // Eval never even builds the flash-cascade decision at all.
+        model.set_training(false);
+        let flash_before_eval = cascade_counters_for("attention_block_flash").snapshot();
+        let _ = model.forward_hidden(&input_ids, &mask).unwrap();
+        let flash_after_eval = cascade_counters_for("attention_block_flash").snapshot();
+        assert_eq!(
+            flash_before_eval, flash_after_eval,
+            "eval never consults the flash cascade"
+        );
+    }
+
+    /// Path P's encoders-side seam (`forward_hidden_with_lengths`, contract
+    /// v5 item 3): `lengths: None` is byte-identical to `forward_hidden`,
+    /// and — on THIS build (no CUDA / no flash-attn feature, so the flash
+    /// cascade always declines at its cheap gates before `lengths` is ever
+    /// consulted) — supplying (even WRONG) `lengths` changes NOTHING about
+    /// the block arm's dispatch or output either, proving the seam is
+    /// dormant exactly like the path-F seam is.
+    #[test]
+    fn forward_hidden_with_lengths_none_is_bit_identical_to_forward_hidden() {
+        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let device = Device::Cpu;
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/tiny_modernbert_head64");
+        let config: ModernBertConfig =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                .unwrap();
+        let weights = dir.join("model.safetensors");
+        let varmap = candle_nn::VarMap::new();
+        let mut model = ModernBert::builder()
+            .build(&[weights.as_path()], &config, &device, &varmap)
+            .unwrap();
+        let input_ids =
+            Tensor::new(&[[2u32, 5, 10, 3, 7, 9], [4u32, 8, 1, 6, 0, 0]], &device).unwrap();
+        let mask = Tensor::new(&[[1u32, 1, 1, 1, 1, 1], [1u32, 1, 1, 1, 0, 0]], &device).unwrap();
+        model.set_training(true);
+
+        let a: Vec<f32> = model
+            .forward_hidden(&input_ids, &mask)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let b: Vec<f32> = model
+            .forward_hidden_with_lengths(&input_ids, &mask, None)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(
+            a, b,
+            "lengths: None must be byte-identical to forward_hidden"
+        );
+
+        // Deliberately WRONG lengths (real lengths are [6, 4]) — on this
+        // CPU/no-flash-attn build the flash cascade declines at its cheap
+        // gates before `lengths` is ever consulted, so the output must
+        // still be unaffected.
+        let c: Vec<f32> = model
+            .forward_hidden_with_lengths(&input_ids, &mask, Some(&[1, 1]))
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(
+            a, c,
+            "wrong lengths must not change the block arm's output on this build"
+        );
+    }
 
     fn rope(head_dim: usize, max_seq: usize, theta: f64, device: &Device) -> RotaryEmbedding {
         RotaryEmbedding::new(head_dim, max_seq, theta, device).unwrap()
@@ -3105,7 +4108,7 @@ mod tests {
         let mut attn = attention_block_fixture(false, h, s, &device);
         attn.set_training(true);
         let err = attn
-            .forward(&hidden, &mask, None, None)
+            .forward(&hidden, &mask, None, None, None)
             .expect_err("training mode without fused masks must be refused");
         assert!(matches!(err, EncoderError::Config(_)), "{err:?}");
     }
@@ -3149,6 +4152,7 @@ mod tests {
                     local_band: None,
                     fused: &fused,
                 },
+                &declined_flash(),
             )
             .unwrap();
         let after = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
@@ -3203,6 +4207,7 @@ mod tests {
                     local_band: Some(&band),
                     fused: &fused,
                 },
+                &declined_flash(),
             )
             .unwrap();
         let after = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
@@ -3279,6 +4284,7 @@ mod tests {
                     local_band: None,
                     fused: &fused,
                 },
+                &declined_flash(),
             )
             .unwrap();
         let after = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
@@ -3432,7 +4438,7 @@ mod tests {
 
         let counters_before = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
         let after: Vec<f32> = attn
-            .forward(&hidden, &mask, None, None)
+            .forward(&hidden, &mask, None, None, None)
             .unwrap()
             .flatten_all()
             .unwrap()
@@ -3442,7 +4448,7 @@ mod tests {
         // supplying it changes nothing, byte for byte.
         let fused = FusedAttentionMasks::build(&mask, None, DType::F32).unwrap();
         let after_with_bundle: Vec<f32> = attn
-            .forward(&hidden, &mask, None, Some(&fused))
+            .forward(&hidden, &mask, None, Some(&fused), None)
             .unwrap()
             .flatten_all()
             .unwrap()
@@ -3503,7 +4509,7 @@ mod tests {
         let fused = FusedAttentionMasks::build(&mask, None, DType::F32).unwrap();
         attn.set_training(false);
         let before_eval = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
-        let _ = attn.forward(&hidden, &mask, None, None).unwrap();
+        let _ = attn.forward(&hidden, &mask, None, None, None).unwrap();
         let after_eval = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
         assert_eq!(
             after_eval.fused, before_eval.fused,
@@ -3512,7 +4518,10 @@ mod tests {
 
         attn.set_training(true);
         let before_train = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
-        let _ = attn.forward(&hidden, &mask, None, Some(&fused)).unwrap();
+        let flash = declined_flash();
+        let _ = attn
+            .forward(&hidden, &mask, None, Some(&fused), Some(&flash))
+            .unwrap();
         let after_train = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
         assert!(
             after_train.fused > before_train.fused,
@@ -3522,7 +4531,7 @@ mod tests {
 
         attn.set_training(false);
         let before_eval2 = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
-        let _ = attn.forward(&hidden, &mask, None, None).unwrap();
+        let _ = attn.forward(&hidden, &mask, None, None, None).unwrap();
         let after_eval2 = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
         assert_eq!(
             after_eval2.fused, before_eval2.fused,
@@ -3684,8 +4693,16 @@ mod tests {
                 )
                 .unwrap()
             } else {
-                attn.forward_training_attention(qkv.as_tensor(), b, s, h, d, masks)
-                    .unwrap()
+                attn.forward_training_attention(
+                    qkv.as_tensor(),
+                    b,
+                    s,
+                    h,
+                    d,
+                    masks,
+                    &declined_flash(),
+                )
+                .unwrap()
             };
             let loss = (&out * &dy).unwrap().sum_all().unwrap();
             let grads = loss.backward().unwrap();
@@ -3860,7 +4877,7 @@ mod tests {
                         local_band: Some(&band),
                         fused: &fused_masks_bf16,
                     };
-                    attn.forward_training_attention(&cur, b, s, h, d, masks)
+                    attn.forward_training_attention(&cur, b, s, h, d, masks, &declined_flash())
                         .unwrap()
                 };
                 // Amplitude control between chained calls (no residual/

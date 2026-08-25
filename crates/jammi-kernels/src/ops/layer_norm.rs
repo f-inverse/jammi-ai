@@ -113,6 +113,8 @@ use candle_core::backend::BackendStorage;
 use candle_core::{CpuStorage, CustomOp2, CustomOp3, Error, Layout, Result, Shape, Tensor};
 use half::bf16;
 
+use super::empty_like;
+
 /// The largest `hidden` (last-dim) size the CUDA kernels accept.
 ///
 /// This is a conservative, VALIDATED ceiling — NOT a hardware constraint.
@@ -158,8 +160,11 @@ impl super::sealed::Sealed for LayerNormFused {}
 /// Checks that `l2` (gamma) is rank-1 with length equal to `l1`'s
 /// (`x`'s) last dimension, returning that length ("hidden"). Shared by
 /// every op in this file — `LayerNormFused`'s forward and both backward
-/// helpers apply the identical `x`-vs-`gamma` shape rule.
-fn hidden_of(l1: &Layout, l2: &Layout, op: &'static str) -> Result<usize> {
+/// helpers apply the identical `x`-vs-`gamma` shape rule. `pub(crate)`:
+/// `crate::cuda::layer_norm` imports this exact check rather than
+/// re-deriving it (the same "shared, not duplicated" choice
+/// `ops::softmax::softmax_dims` and `ops::rope::rope_dims` make).
+pub(crate) fn hidden_of(l1: &Layout, l2: &Layout, op: &'static str) -> Result<usize> {
     let dims = l1.dims();
     let hidden = *dims.last().ok_or_else(|| {
         Error::Msg(format!(
@@ -252,31 +257,6 @@ impl CustomOp2 for LayerNormFused {
             None
         };
         Ok((Some(dx), dgamma))
-    }
-}
-
-/// Shared "hidden == 0, nothing to normalize" fast path for
-/// [`LayerNormFused::cpu_fwd`] and [`LayerNormBwdDx::cpu_fwd`] (same
-/// input dtypes, same output shape as `x`).
-fn empty_like(
-    s1: &CpuStorage,
-    s2: &CpuStorage,
-    l1: &Layout,
-    op: &'static str,
-) -> Result<(CpuStorage, Shape)> {
-    match (s1, s2) {
-        (CpuStorage::F32(_), CpuStorage::F32(_)) => {
-            Ok((CpuStorage::F32(Vec::new()), l1.shape().clone()))
-        }
-        (CpuStorage::BF16(_), CpuStorage::BF16(_)) => {
-            Ok((CpuStorage::BF16(Vec::new()), l1.shape().clone()))
-        }
-        (s1, s2) if s1.dtype() != s2.dtype() => Err(Error::DTypeMismatchBinaryOp {
-            lhs: s1.dtype(),
-            rhs: s2.dtype(),
-            op,
-        }),
-        (s1, _) => Err(Error::UnsupportedDTypeForOp(s1.dtype(), op)),
     }
 }
 
@@ -500,6 +480,27 @@ fn mean_var_f32(row: &[f32], hidden: usize) -> (f32, f32) {
     (mean, sumsq / hidden as f32)
 }
 
+/// BF16 row mean/variance, accumulated in f32 — same two-pass, ascending-
+/// index fold order as [`mean_var_f32`] (family J: one fixed reduction
+/// order, not "whatever the loop happened to do"), so every bf16 call site
+/// below (`ln_fwd_row_bf16`, `ln_bwd_dx_row_bf16`, `ln_bwd_dgamma_bf16`)
+/// computes the identical numeric sequence the CUDA kernel's own
+/// f32-accumulate row-stats pass does — the bf16-CPU-vs-CUDA parity
+/// contract the layer_norm oracle suite checks byte-for-byte.
+fn mean_var_bf16(row: &[bf16], hidden: usize) -> (f32, f32) {
+    let mut sum = 0f32;
+    for v in row {
+        sum += v.to_f32();
+    }
+    let mean = sum / hidden as f32;
+    let mut sumsq = 0f32;
+    for v in row {
+        let d = v.to_f32() - mean;
+        sumsq += d * d;
+    }
+    (mean, sumsq / hidden as f32)
+}
+
 fn ln_fwd_row_f32(x: &[f32], gamma: &[f32], eps: f32, out: &mut [f32]) {
     let hidden = x.len();
     let (mean, var) = mean_var_f32(x, hidden);
@@ -525,17 +526,7 @@ fn ln_fwd_f32(x: &[f32], gamma: &[f32], rows: usize, hidden: usize, eps: f32) ->
 /// `ops::axpy`'s BF16 arm, and what the CUDA kernel does too.
 fn ln_fwd_row_bf16(x: &[bf16], gamma: &[bf16], eps: f32, out: &mut [bf16]) {
     let hidden = x.len();
-    let mut sum = 0f32;
-    for v in x {
-        sum += v.to_f32();
-    }
-    let mean = sum / hidden as f32;
-    let mut sumsq = 0f32;
-    for v in x {
-        let d = v.to_f32() - mean;
-        sumsq += d * d;
-    }
-    let var = sumsq / hidden as f32;
+    let (mean, var) = mean_var_bf16(x, hidden);
     let invvar = 1.0 / (var + eps).sqrt();
     for i in 0..hidden {
         let xhat = (x[i].to_f32() - mean) * invvar;
@@ -598,17 +589,7 @@ fn ln_bwd_dx_f32(
 
 fn ln_bwd_dx_row_bf16(x: &[bf16], gamma: &[bf16], dy: &[bf16], eps: f32, dx: &mut [bf16]) {
     let hidden = x.len();
-    let mut sum = 0f32;
-    for v in x {
-        sum += v.to_f32();
-    }
-    let mean = sum / hidden as f32;
-    let mut sumsq = 0f32;
-    for v in x {
-        let d = v.to_f32() - mean;
-        sumsq += d * d;
-    }
-    let var = sumsq / hidden as f32;
+    let (mean, var) = mean_var_bf16(x, hidden);
     let invvar = 1.0 / (var + eps).sqrt();
 
     let mut sum_t = 0f32;
@@ -673,17 +654,7 @@ fn ln_bwd_dgamma_bf16(x: &[bf16], dy: &[bf16], rows: usize, hidden: usize, eps: 
         let hi = lo + hidden;
         let xr = &x[lo..hi];
         let dyr = &dy[lo..hi];
-        let mut sum = 0f32;
-        for v in xr {
-            sum += v.to_f32();
-        }
-        let mean = sum / hidden as f32;
-        let mut sumsq = 0f32;
-        for v in xr {
-            let d = v.to_f32() - mean;
-            sumsq += d * d;
-        }
-        let var = sumsq / hidden as f32;
+        let (mean, var) = mean_var_bf16(xr, hidden);
         let invvar = 1.0 / (var + eps).sqrt();
         for i in 0..hidden {
             let xhat = (xr[i].to_f32() - mean) * invvar;

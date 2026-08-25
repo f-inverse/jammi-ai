@@ -223,6 +223,7 @@ impl TrainingTarget {
             Self::ProjectionHead { head } => SavedAdapter::ProjectionHead(ProjectionHeadConfig {
                 lora_rank: config.lora_rank,
                 lora_alpha: config.lora_alpha,
+                use_rslora: config.use_rslora,
                 head_layers: head.layers.iter().map(|(name, _)| name.clone()).collect(),
                 target_scaler,
                 regression_form,
@@ -261,6 +262,17 @@ pub struct ProjectionHeadConfig {
     pub lora_rank: usize,
     /// LoRA scaling factor used at training time.
     pub lora_alpha: f64,
+    /// Whether training scaled the adapter with rSLoRA (`alpha / sqrt(rank)`)
+    /// instead of the vanilla `alpha / rank` — see
+    /// [`jammi_lora::lora_scaling`]. No `skip_serializing_if`: absence must
+    /// mean "legacy adapter, predates this field", which is read as `false`
+    /// (vanilla scaling) by `#[serde(default)]`, never conflated with an
+    /// adapter that explicitly opted out. Every adapter this engine writes
+    /// from here on carries the key, present or not. A legacy adapter that
+    /// was actually trained with rSLoRA cannot be repaired retroactively —
+    /// the bit was never recorded — and must be retrained.
+    #[serde(default)]
+    pub use_rslora: bool,
     /// Names of the head layers, in order. Each name keys two safetensors
     /// tensors: `{name}.lora_a` and `{name}.lora_b`. Typical shapes:
     /// - embeddings: `["projection"]`
@@ -507,6 +519,7 @@ mod tests {
         let saved = SavedAdapter::ProjectionHead(ProjectionHeadConfig {
             lora_rank: 4,
             lora_alpha: 8.0,
+            use_rslora: false,
             head_layers: vec!["projection".into(), "distribution".into()],
             target_scaler: Some(scaler),
             regression_form: Some(form),
@@ -663,6 +676,77 @@ mod tests {
             assert!(
                 (q - true_mean).abs() < 1.0,
                 "quantile column {col} must de-standardise to μ_y ≈ {true_mean}, got {q}"
+            );
+        }
+    }
+
+    // ── esc-041: `use_rslora` is a persisted, non-vacuous field ──────────────
+
+    /// esc-041 (d): a legacy `adapter_config.json` — checked in, literally
+    /// lacking the `use_rslora` key, from before this field existed — must
+    /// deserialize with `use_rslora == false` (vanilla `alpha/rank` scaling,
+    /// the only scaling that key's absence can honestly mean) rather than
+    /// failing to parse or defaulting to some other value. This is the
+    /// documented, irreversible consequence of the defect: a legacy adapter
+    /// that was actually trained with rSLoRA cannot be repaired from this
+    /// file alone (the bit was never recorded) and must be retrained.
+    #[test]
+    fn legacy_adapter_config_without_use_rslora_key_defaults_false() {
+        let json =
+            include_str!("../../tests/fixtures/adapters/adapter_config_legacy_no_rslora.json");
+        // The fixture must genuinely lack the key — otherwise this test would
+        // pass vacuously regardless of `#[serde(default)]` wiring.
+        assert!(
+            !json.contains("use_rslora"),
+            "fixture must not carry the key; if it does this test no longer probes the \
+             legacy (absent-key) path"
+        );
+        let saved: SavedAdapter = serde_json::from_str(json)
+            .expect("a legacy config missing use_rslora must still deserialize");
+        match saved {
+            SavedAdapter::ProjectionHead(cfg) => {
+                assert!(
+                    !cfg.use_rslora,
+                    "a legacy config's absent use_rslora key must read as false"
+                );
+                assert_eq!(cfg.lora_rank, 16, "legacy rank must round-trip unchanged");
+                assert_eq!(
+                    cfg.lora_alpha, 32.0,
+                    "legacy alpha must round-trip unchanged"
+                );
+            }
+            SavedAdapter::EncoderAdapters(_) => {
+                panic!("fixture must deserialize as a ProjectionHead adapter")
+            }
+        }
+    }
+
+    /// esc-041 (a, b): `use_rslora` is a real, finite, non-vacuous field —
+    /// every freshly-serialized config carries the key explicitly (no
+    /// `skip_serializing_if`, unlike `target_scaler`/`regression_form`), and
+    /// round-trips both `true` and `false` distinctly through JSON.
+    #[test]
+    fn use_rslora_is_always_serialized_and_round_trips_both_values() {
+        for use_rslora in [true, false] {
+            let cfg = ProjectionHeadConfig {
+                lora_rank: 16,
+                lora_alpha: 32.0,
+                use_rslora,
+                head_layers: vec!["projection".into()],
+                target_scaler: None,
+                regression_form: None,
+            };
+            let json = serde_json::to_string(&cfg).unwrap();
+            assert!(
+                json.contains("\"use_rslora\""),
+                "every serialized config must carry the use_rslora key explicitly \
+                 (no skip_serializing_if), got: {json}"
+            );
+            let reloaded: ProjectionHeadConfig = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                reloaded.use_rslora, use_rslora,
+                "use_rslora must round-trip through JSON unchanged (finite, non-vacuous \
+                 field — true and false are distinguishable after a round trip)"
             );
         }
     }

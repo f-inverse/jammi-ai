@@ -38,13 +38,7 @@ fn check_last_and_n(op: &'static str, n: usize, last: usize) -> Result<()> {
              ops::softmax::MAX_LAST_DIM's doc); the CPU arm has no such ceiling"
         )));
     }
-    if n > u32::MAX as usize {
-        return Err(Error::Msg(format!(
-            "{op}: {n} elements exceeds u32::MAX; the CUDA launch grid and \
-             the kernel's indices are both 32-bit"
-        )));
-    }
-    Ok(())
+    super::check_elem_count_fits_u32(op, n)
 }
 
 /// `rank > MAX_RANK`: refused because the CUDA kernel's mask-broadcast
@@ -77,12 +71,17 @@ fn lead_dims3(lead: &[usize]) -> [u32; 3] {
     out
 }
 
+/// `scale` — `SoftmaxLastDimFused::scale`, threaded straight through as an
+/// extra kernel scalar argument (see `../ops/softmax.rs`'s "scale
+/// semantics" module-doc section and `../cuda/softmax.cu`'s matching
+/// forward kernels for the exact per-dtype rounding this applies).
 pub(crate) fn cuda_fwd(
     s1: &CudaStorage,
     l1: &Layout,
     s2: &CudaStorage,
     l2: &Layout,
     fully_masked: FullyMaskedPolicy,
+    scale: f32,
 ) -> Result<(CudaStorage, Shape)> {
     const OP: &str = "softmax_last_dim_fused";
     let (rows, last) = softmax_dims(l1, l2, OP)?;
@@ -91,18 +90,14 @@ pub(crate) fn cuda_fwd(
     let n = l1.shape().elem_count();
 
     if last == 0 || n == 0 {
-        return match (s1.dtype(), s2.dtype()) {
-            (DType::F32, DType::F32) => {
-                let out = unsafe { device.alloc::<f32>(0) }?;
-                Ok((CudaStorage::wrap_cuda_slice(out, device), shape))
-            }
-            (DType::BF16, DType::BF16) => {
-                let out = unsafe { device.alloc::<bf16>(0) }?;
-                Ok((CudaStorage::wrap_cuda_slice(out, device), shape))
-            }
-            (lhs, rhs) if lhs != rhs => Err(Error::DTypeMismatchBinaryOp { lhs, rhs, op: OP }),
-            (dtype, _) => Err(Error::UnsupportedDTypeForOp(dtype, OP)),
-        };
+        if s1.dtype() != s2.dtype() {
+            return Err(Error::DTypeMismatchBinaryOp {
+                lhs: s1.dtype(),
+                rhs: s2.dtype(),
+                op: OP,
+            });
+        }
+        return Ok((super::alloc_empty(&device, s1.dtype(), OP)?, shape));
     }
     let rank = l1.dims().len();
     check_rank(OP, rank)?;
@@ -144,6 +139,7 @@ pub(crate) fn cuda_fwd(
             builder.arg(&m_lead[1]);
             builder.arg(&m_lead[2]);
             builder.arg(&policy_u32);
+            builder.arg(&scale);
             unsafe { builder.launch(cfg) }.map_err(|e| Error::Cuda(Box::new(e)))?;
             Ok((CudaStorage::wrap_cuda_slice(out, device), shape))
         }
@@ -165,6 +161,7 @@ pub(crate) fn cuda_fwd(
             builder.arg(&m_lead[1]);
             builder.arg(&m_lead[2]);
             builder.arg(&policy_u32);
+            builder.arg(&scale);
             unsafe { builder.launch(cfg) }.map_err(|e| Error::Cuda(Box::new(e)))?;
             Ok((CudaStorage::wrap_cuda_slice(out, device), shape))
         }
@@ -198,18 +195,14 @@ pub(crate) fn cuda_bwd_dscores(
     let n = l1.shape().elem_count();
 
     if last == 0 || n == 0 {
-        return match (s1.dtype(), s2.dtype()) {
-            (DType::F32, DType::F32) => {
-                let out = unsafe { device.alloc::<f32>(0) }?;
-                Ok((CudaStorage::wrap_cuda_slice(out, device), shape))
-            }
-            (DType::BF16, DType::BF16) => {
-                let out = unsafe { device.alloc::<bf16>(0) }?;
-                Ok((CudaStorage::wrap_cuda_slice(out, device), shape))
-            }
-            (lhs, rhs) if lhs != rhs => Err(Error::DTypeMismatchBinaryOp { lhs, rhs, op: OP }),
-            (dtype, _) => Err(Error::UnsupportedDTypeForOp(dtype, OP)),
-        };
+        if s1.dtype() != s2.dtype() {
+            return Err(Error::DTypeMismatchBinaryOp {
+                lhs: s1.dtype(),
+                rhs: s2.dtype(),
+                op: OP,
+            });
+        }
+        return Ok((super::alloc_empty(&device, s1.dtype(), OP)?, shape));
     }
     check_last_and_n(OP, n, last)?;
     let rows = n / last;

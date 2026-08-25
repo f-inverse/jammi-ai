@@ -6,7 +6,7 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::{Linear, Module, VarBuilder, VarMap};
 use jammi_lora::{
     effective_rank, load_adapter, save_adapter, should_apply_lora, AdapterConfig, ComputePrecision,
-    LoraBuildConfig, LoraInitMode, LoraLinear, MaybeLoraLinear,
+    LoraBuildConfig, LoraError, LoraInitMode, LoraLinear, MaybeLoraLinear,
 };
 
 fn cpu() -> Device {
@@ -135,7 +135,9 @@ fn lora_linear_rslora_scaling() {
         lora_a.clone(),
         lora_b.clone(),
         4.0,
-    );
+        false,
+    )
+    .unwrap();
     // For RSLoRA we have to construct via `new` to exercise the use_rslora
     // path; we then overwrite A/B with ones so the delta is observable.
     let mut rslora = LoraLinear::new(
@@ -184,6 +186,121 @@ fn lora_linear_rslora_scaling() {
     assert!(
         (ratio - 2.0).abs() < 1e-4,
         "RSLoRA scaling expected 2x vanilla, got ratio {ratio}"
+    );
+}
+
+/// Table-driven: `new` and `from_loaded` must compute BIT-EQUAL `f64`
+/// scaling for the same `(alpha, rank, use_rslora)` triple — both route
+/// through the crate's single `lora_scaling` primitive (see its doc), so a
+/// disagreement here would mean a reload of a saved adapter silently applies
+/// a different scaling than the run that trained it (esc-041).
+#[test]
+fn new_and_from_loaded_pin_bit_equal_scaling() {
+    let device = cpu();
+    let cases: &[(f64, usize, bool)] = &[
+        (8.0, 4, false),
+        (8.0, 4, true),
+        (16.0, 8, false),
+        (16.0, 8, true),
+        (1.0, 1, false),
+        (1.0, 1, true),
+        (32.0, 16, false),
+        (32.0, 16, true),
+    ];
+    for &(alpha, rank, use_rslora) in cases {
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let base = build_base(8, 16, &device);
+        let new_layer = LoraLinear::new(
+            base,
+            rank,
+            alpha,
+            use_rslora,
+            LoraInitMode::ZerosB,
+            None,
+            0,
+            &varmap,
+            &vb,
+        )
+        .unwrap();
+
+        let lora_a = Tensor::zeros((rank, 8), DType::F32, &device).unwrap();
+        let lora_b = Tensor::zeros((16, rank), DType::F32, &device).unwrap();
+        let loaded_layer = LoraLinear::from_loaded(
+            build_base(8, 16, &device),
+            lora_a,
+            lora_b,
+            alpha,
+            use_rslora,
+        )
+        .unwrap();
+
+        let expected = if use_rslora {
+            alpha / (rank as f64).sqrt()
+        } else {
+            alpha / rank as f64
+        };
+
+        assert_eq!(
+            new_layer.scaling().to_bits(),
+            expected.to_bits(),
+            "new(): alpha={alpha} rank={rank} use_rslora={use_rslora}"
+        );
+        assert_eq!(
+            loaded_layer.scaling().to_bits(),
+            expected.to_bits(),
+            "from_loaded(): alpha={alpha} rank={rank} use_rslora={use_rslora}"
+        );
+        assert_eq!(
+            new_layer.scaling().to_bits(),
+            loaded_layer.scaling().to_bits(),
+            "new() and from_loaded() disagree: alpha={alpha} rank={rank} use_rslora={use_rslora}"
+        );
+    }
+}
+
+/// Domain boundary (family D / K2): both constructors must typed-refuse
+/// `rank == 0` rather than let it reach `alpha / 0`.
+#[test]
+fn rank_zero_is_a_typed_refusal_in_new_and_from_loaded() {
+    let device = cpu();
+    let varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+    let base = build_base(8, 16, &device);
+
+    let new_result = LoraLinear::new(
+        base,
+        0,
+        8.0,
+        false,
+        LoraInitMode::ZerosB,
+        None,
+        0,
+        &varmap,
+        &vb,
+    );
+    // `LoraLinear` intentionally doesn't derive `Debug` (candle's `Linear`
+    // doesn't either) so `unwrap_err()` isn't available; match instead.
+    let new_err = match new_result {
+        Ok(_) => panic!("new(rank=0) must be refused, not constructed"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(new_err, LoraError::Config(_)),
+        "new(rank=0) must be a typed Config refusal, got {new_err:?}"
+    );
+
+    let lora_a = Tensor::zeros((0, 8), DType::F32, &device).unwrap();
+    let lora_b = Tensor::zeros((16, 0), DType::F32, &device).unwrap();
+    let loaded_result =
+        LoraLinear::from_loaded(build_base(8, 16, &device), lora_a, lora_b, 8.0, false);
+    let loaded_err = match loaded_result {
+        Ok(_) => panic!("from_loaded(rank=0) must be refused, not constructed"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(loaded_err, LoraError::Config(_)),
+        "from_loaded(rank=0) must be a typed Config refusal, got {loaded_err:?}"
     );
 }
 

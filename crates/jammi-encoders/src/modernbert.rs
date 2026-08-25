@@ -28,11 +28,13 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use candle_core::{DType, Device, Module, Tensor, D};
 use candle_nn::{embedding, linear_no_bias, Embedding, VarBuilder, VarMap};
-use jammi_kernels::admission::{admit, DispatchCounters, DispatchOutcome};
+use jammi_kernels::admission::{
+    admission_mode, admit, counters_for, device_is_supported, DispatchCounters, DispatchOutcome,
+};
 use jammi_kernels::ops::{
     apply1, apply2, apply3, RopeFused, SoftmaxLastDimFused, MAX_HEAD_DIM, MAX_LAST_DIM, MAX_RANK,
 };
@@ -123,28 +125,34 @@ impl ModernBertConfig {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Fused/eager dispatch counters for the ModernBERT RoPE application,
-/// mirroring `crate::layer_norm::LN_DISPATCH_COUNTERS` — see this
-/// module's "RoPE: table hoisting + fused rotate-half" doc section for
-/// the training-only gate this counts. `pub(crate)` (not `pub`) — read via
-/// [`crate::rope_dispatch_snapshot`], the same shape
+/// read from `jammi_kernels::admission`'s op-keyed registry — see
+/// `crate::layer_norm::LN_DISPATCH_COUNTERS`'s doc for why this is a
+/// `LazyLock` over `counters_for`, not a directly-owned
+/// `static DispatchCounters` (this migration's rationale in full), and
+/// this module's "RoPE: table hoisting + fused rotate-half" doc section
+/// for the training-only gate this counts. `pub(crate)` (not `pub`) — read
+/// via [`crate::rope_dispatch_snapshot`], the same shape
 /// [`crate::ln_dispatch_snapshot`] uses.
-pub(crate) static ROPE_DISPATCH_COUNTERS: DispatchCounters = DispatchCounters::new();
+pub(crate) static ROPE_DISPATCH_COUNTERS: LazyLock<&'static DispatchCounters> =
+    LazyLock::new(|| counters_for("rope_fused"));
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Fused masked softmax (C4)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Fused/eager dispatch counters for the ModernBERT attention softmax,
-/// mirroring `ROPE_DISPATCH_COUNTERS` / `crate::layer_norm::LN_DISPATCH_COUNTERS`
-/// — see `ModernBertAttention::softmax_apply`'s doc for the training-only
-/// gate this counts. `pub(crate)` (not `pub`) — read via
+/// read from the registry — mirroring `ROPE_DISPATCH_COUNTERS` /
+/// `crate::layer_norm::LN_DISPATCH_COUNTERS` — see
+/// [`softmax_apply_training`]'s doc for the training-only gate
+/// this counts. `pub(crate)` (not `pub`) — read via
 /// [`crate::softmax_dispatch_snapshot`], the same shape
 /// [`crate::rope_dispatch_snapshot`] / [`crate::ln_dispatch_snapshot`] use.
-pub(crate) static SOFTMAX_DISPATCH_COUNTERS: DispatchCounters = DispatchCounters::new();
+pub(crate) static SOFTMAX_DISPATCH_COUNTERS: LazyLock<&'static DispatchCounters> =
+    LazyLock::new(|| counters_for("softmax_last_dim_fused"));
 
 /// The fused masked-softmax kernel's domain, checked at the call site
 /// (family D / K2): `scores`'s device is one
-/// [`crate::layer_norm::device_is_supported`] accepts, `scores`/`mask`
+/// [`jammi_kernels::admission::device_is_supported`] accepts, `scores`/`mask`
 /// share a dtype the kernel implements (F32 or BF16), BOTH `scores` and
 /// `mask` are contiguous (`SoftmaxLastDimFused` refuses a strided view for
 /// EITHER argument — see its module doc; an earlier version of this
@@ -172,8 +180,31 @@ pub(crate) static SOFTMAX_DISPATCH_COUNTERS: DispatchCounters = DispatchCounters
 /// `candle_core::Error::ShapeMismatchBinaryOp`. The op's own internal
 /// check is unchanged and still the correct defense for any direct
 /// `apply2` caller that bypasses this predicate entirely.
-fn softmax_admission_predicate(scores: &Tensor, mask: &Tensor) -> (bool, &'static str) {
-    if !crate::layer_norm::device_is_supported(scores.device()) {
+///
+/// `scores_divisor` is `softmax_apply_training`'s OWN `scores_divisor`
+/// argument (`sqrt(head_dim)` in production — see that function's doc), a
+/// DIVISOR — named to say so explicitly, since `SoftmaxLastDimFused::scale`
+/// (a field on a DIFFERENT type, in `jammi-kernels`) is a MULTIPLIER and
+/// the two are easy to conflate by name alone. The fused branch folds `1.0
+/// / scores_divisor` into `SoftmaxLastDimFused::scale`, and
+/// `SoftmaxLastDimFused::with_scale` has a real domain of its own (family
+/// D — finite and strictly positive, see its doc). The `scale_finite_positive`
+/// clause below checks THAT quantity (`1.0 / scores_divisor` cast to
+/// `f32`, the EXACT value the fused branch would pass to `with_scale`),
+/// not `scores_divisor` itself directly, so a `scores_divisor` that is
+/// finite and positive but produces a non-finite or non-positive
+/// reciprocal (e.g. `scores_divisor` so large `1.0 / scores_divisor`
+/// underflows to `0.0`, or `scores_divisor == 0.0` itself) is caught here
+/// — a counted eager fallback (the SAME `scores / scores_divisor`
+/// division the eager branch already performs, so this is never a numeric
+/// domain the eager branch could not also handle) rather than
+/// `with_scale` refusing deeper in the call stack.
+fn softmax_admission_predicate(
+    scores: &Tensor,
+    mask: &Tensor,
+    scores_divisor: f64,
+) -> (bool, &'static str) {
+    if !device_is_supported(scores.device()) {
         return (false, "device_is_cpu_or_cuda");
     }
     if scores.dtype() != mask.dtype() || !matches!(scores.dtype(), DType::F32 | DType::BF16) {
@@ -195,6 +226,10 @@ fn softmax_admission_predicate(scores: &Tensor, mask: &Tensor) -> (bool, &'stati
     }
     if !jammi_kernels::ops::mask_broadcast_class_holds(scores, mask) {
         return (false, "mask_broadcast_class");
+    }
+    let scale_mul = (1.0 / scores_divisor) as f32;
+    if !(scale_mul.is_finite() && scale_mul > 0.0) {
+        return (false, "scale_finite_positive");
     }
     (true, "domain_ok")
 }
@@ -368,11 +403,11 @@ impl RotaryEmbedding {
         let (holds, predicate) =
             rope_admission_predicate(x_dtype, x.device(), &cos, &sin, head_dim);
         let outcome = admit(
-            crate::layer_norm::admission_mode(),
+            admission_mode(),
             "rope_fused",
             predicate,
             holds,
-            &ROPE_DISPATCH_COUNTERS,
+            *ROPE_DISPATCH_COUNTERS,
         )?;
         match outcome {
             DispatchOutcome::Fused => {
@@ -409,7 +444,7 @@ impl RotaryEmbedding {
 }
 
 /// The fused RoPE kernel's domain, checked at the call site (family D /
-/// K2): `x`'s device is one [`crate::layer_norm::device_is_supported`]
+/// K2): `x`'s device is one [`jammi_kernels::admission::device_is_supported`]
 /// accepts (CPU, or CUDA when this build compiled `jammi-kernels`' `cuda`
 /// arm), `x`/`cos`/`sin` share a dtype the kernel implements (F32 or
 /// BF16), `cos`/`sin` are contiguous (guaranteed by construction —
@@ -429,7 +464,7 @@ fn rope_admission_predicate(
     sin: &Tensor,
     head_dim: usize,
 ) -> (bool, &'static str) {
-    if !crate::layer_norm::device_is_supported(x_device) {
+    if !device_is_supported(x_device) {
         return (false, "device_is_cpu_or_cuda");
     }
     if x_dtype != cos.dtype()
@@ -521,12 +556,17 @@ impl ModernBertAttention {
         let k = self.rope_apply(&k)?;
 
         let scale = (d as f64).sqrt();
-        let scores = crate::contiguous_matmul(&q, &k.transpose(D::Minus1, D::Minus2)?)?;
-        let scores = (scores / scale)?;
+        // UNSCALED — the training arm folds `1/scale` into
+        // `SoftmaxLastDimFused` itself (see `softmax_apply_training`'s
+        // doc) rather than dividing here; an eager `scores / scale`
+        // division at this point would retain a full `[batch, heads, seq,
+        // seq]` `Op::Affine` tape tensor per layer, present for the
+        // training arm alone. The eval arm below still divides explicitly.
+        let raw_scores = crate::contiguous_matmul(&q, &k.transpose(D::Minus1, D::Minus2)?)?;
         // The additive mask is always built in F32 (see `extended_attention_mask`);
         // cast to the scores' dtype so a F16/BF16 backbone can add it (a no-op
         // when scores are already F32).
-        let extended_mask = extended_mask.to_dtype(scores.dtype())?;
+        let extended_mask = extended_mask.to_dtype(raw_scores.dtype())?;
 
         let attn = if self.training {
             // Combine the (up to two) additive masks into ONE small tensor
@@ -543,7 +583,7 @@ impl ModernBertAttention {
             // other fused op's training arm in this crate.
             let mask = match (self.is_local, local_band) {
                 (true, Some(band)) => {
-                    extended_mask.broadcast_add(&band.to_dtype(scores.dtype())?)?
+                    extended_mask.broadcast_add(&band.to_dtype(raw_scores.dtype())?)?
                 }
                 (true, None) => {
                     return Err(EncoderError::Config(
@@ -552,16 +592,19 @@ impl ModernBertAttention {
                 }
                 (false, _) => extended_mask,
             };
-            softmax_apply_training(&scores, &mask)?
+            softmax_apply_training(&raw_scores, &mask, scale)?
         } else {
             // Eval's UNCHANGED code path, bit-identical to before this
-            // commit: two SEQUENTIAL broadcast-adds, each from its own
-            // smaller shape, never combined into one tensor (see
+            // commit: divides by `scale` exactly as before (the ONE `Op::Affine`
+            // node eval always retained and still does), then two
+            // SEQUENTIAL broadcast-adds, each from its own smaller shape,
+            // never combined into one tensor (see
             // `crate::mask::sliding_window_mask`'s doc for why — neither
             // mask is ever materialised at `[batch, heads, seq, seq]`
             // either way, but combining them first would round
             // differently than adding them in this order, which eval must
             // never do — see `tests::eval_mode_attention_softmax_is_bit_identical_regardless_of_fused_eligibility`).
+            let scores = (&raw_scores / scale)?;
             let scores = scores.broadcast_add(&extended_mask)?;
             let scores = match (self.is_local, local_band) {
                 (true, Some(band)) => scores.broadcast_add(&band.to_dtype(scores.dtype())?)?,
@@ -604,9 +647,11 @@ impl ModernBertAttention {
 /// Only ever called from `ModernBertAttention::forward`'s `self.training`
 /// arm — dispatches to [`jammi_kernels::ops::SoftmaxLastDimFused`] when its
 /// domain holds, else falls back to the eager
-/// `scores.broadcast_add(mask)` plus `candle_nn::ops::softmax` composition
-/// (recording which happened either way, mirroring `crate::layer_norm`'s
-/// and `RotaryEmbedding`'s identical admission mechanism). Eval never
+/// `(scores / scale).broadcast_add(mask)` plus `candle_nn::ops::softmax`
+/// composition (`scores` here is UNSCALED — see `softmax_apply_training`'s
+/// own doc for why the division is restored explicitly in this branch),
+/// recording which happened either way, mirroring `crate::layer_norm`'s
+/// and `RotaryEmbedding`'s identical admission mechanism. Eval never
 /// calls this function at all (see `forward`'s `match`), so it has no
 /// bearing on eval's bit-identity. A free function (not a method) — it
 /// needs no `ModernBertAttention` field, and keeping it free makes it
@@ -658,23 +703,56 @@ impl ModernBertAttention {
 /// `jammi_kernels::ops::softmax`'s module doc and
 /// `ops::softmax::tests::fully_masked_row_backward_is_zero_under_both_policies_given_pooling_style_zero_dy`
 /// for the verified claim this restates).
-fn softmax_apply_training(scores: &Tensor, mask: &Tensor) -> Result<Tensor, EncoderError> {
-    let (holds, predicate) = softmax_admission_predicate(scores, mask);
+///
+/// ## `scores` is UNSCALED here — `scores_divisor` folds `sqrt(head_dim)` in
+///
+/// `scores` is `forward`'s `raw_scores` — the RAW `q @ k^T` matmul output,
+/// never divided by `scores_divisor` (`sqrt(head_dim)`) before reaching
+/// this function, unlike eval's own `scores` (see `forward`'s doc comment
+/// at its call site). This removes the `Op::Affine` node (`scores /
+/// scores_divisor`) the training arm used to retain at `[batch, heads,
+/// seq, seq]` — the single largest per-layer tape tensor this fused
+/// softmax op's own memory win already targets (see
+/// `jammi_kernels::ops::softmax`'s module doc). The FUSED branch folds
+/// `1 / scores_divisor` into `SoftmaxLastDimFused::scale` (`with_scale`)
+/// — a MULTIPLIER, the opposite convention from this function's own
+/// `scores_divisor` parameter, named explicitly to keep the two apart —
+/// so the op itself computes `softmax(scale_mul * scores + mask)` in one
+/// pass — see that op's module doc's "scale semantics" section for the
+/// exact per-dtype rounding this reproduces. The EAGER FALLBACK branch
+/// restores the `scores / scores_divisor` division EXPLICITLY, right
+/// here, so a domain miss (wrong dtype, non-contiguous, broadcast-class
+/// violation, …) is numerically IDENTICAL to what this function computed
+/// before `scores_divisor` existed as a named parameter — the fallback
+/// is never a fourth numeric path, only the pre-existing training-eager
+/// composition. This is a MEASURED claim, not an assertion: EVERY other
+/// test exercising this function is fused-eligible (none reaches this
+/// branch), so `tests::eager_fallback_softmax_matches_inline_reference_fwd_and_bwd`
+/// is the ONLY oracle that forces this arm and checks it fwd+bwd
+/// bit-for-bit against the inline composition this doc describes —
+/// mutation-verified (see that test's own doc).
+fn softmax_apply_training(
+    scores: &Tensor,
+    mask: &Tensor,
+    scores_divisor: f64,
+) -> Result<Tensor, EncoderError> {
+    let (holds, predicate) = softmax_admission_predicate(scores, mask, scores_divisor);
     let outcome = admit(
-        crate::layer_norm::admission_mode(),
+        admission_mode(),
         "softmax_last_dim_fused",
         predicate,
         holds,
-        &SOFTMAX_DISPATCH_COUNTERS,
+        *SOFTMAX_DISPATCH_COUNTERS,
     )?;
     match outcome {
         DispatchOutcome::Fused => Ok(apply2(
             scores,
             mask,
-            SoftmaxLastDimFused::new(jammi_kernels::ops::FullyMaskedPolicy::Zeros),
+            SoftmaxLastDimFused::new(jammi_kernels::ops::FullyMaskedPolicy::Zeros)
+                .with_scale((1.0 / scores_divisor) as f32)?,
         )?),
         DispatchOutcome::Eager => Ok(candle_nn::ops::softmax(
-            &scores.broadcast_add(mask)?,
+            &(scores / scores_divisor)?.broadcast_add(mask)?,
             D::Minus1,
         )?),
     }
@@ -685,16 +763,17 @@ fn softmax_apply_training(scores: &Tensor, mask: &Tensor) -> Result<Tensor, Enco
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Fused/eager dispatch counters for the ModernBERT MLP's GeGLU
-/// activation, mirroring `ROPE_DISPATCH_COUNTERS` /
-/// `SOFTMAX_DISPATCH_COUNTERS` / `crate::layer_norm::LN_DISPATCH_COUNTERS`
+/// activation, read from the registry — mirroring `ROPE_DISPATCH_COUNTERS`
+/// / `SOFTMAX_DISPATCH_COUNTERS` / `crate::layer_norm::LN_DISPATCH_COUNTERS`
 /// — see `ModernBertMlp::forward`'s doc for the training-only gate this
 /// counts. `pub(crate)` (not `pub`) — read via
 /// [`crate::geglu_dispatch_snapshot`], the same shape the other three
 /// snapshot functions use.
-pub(crate) static GEGLU_DISPATCH_COUNTERS: DispatchCounters = DispatchCounters::new();
+pub(crate) static GEGLU_DISPATCH_COUNTERS: LazyLock<&'static DispatchCounters> =
+    LazyLock::new(|| counters_for("geglu_fused"));
 
 /// The fused GeGLU kernel's domain, checked at the call site (family D /
-/// K2): `wi_out`'s device is one [`crate::layer_norm::device_is_supported`]
+/// K2): `wi_out`'s device is one [`jammi_kernels::admission::device_is_supported`]
 /// accepts, its dtype is one the kernel implements (F32 or BF16),
 /// `wi_out` is contiguous ([`jammi_kernels::ops::GegluFused`] refuses a
 /// strided view — see its module doc), and its last dimension is nonzero
@@ -703,7 +782,7 @@ pub(crate) static GEGLU_DISPATCH_COUNTERS: DispatchCounters = DispatchCounters::
 /// checking it here means it becomes a counted eager fallback instead of
 /// a `candle_core::Error` surfacing from inside the op).
 fn geglu_admission_predicate(wi_out: &Tensor) -> (bool, &'static str) {
-    if !crate::layer_norm::device_is_supported(wi_out.device()) {
+    if !device_is_supported(wi_out.device()) {
         return (false, "device_is_cpu_or_cuda");
     }
     if !matches!(wi_out.dtype(), DType::F32 | DType::BF16) {
@@ -730,11 +809,11 @@ fn geglu_admission_predicate(wi_out: &Tensor) -> (bool, &'static str) {
 fn geglu_apply_training(wi_out: &Tensor) -> Result<Tensor, EncoderError> {
     let (holds, predicate) = geglu_admission_predicate(wi_out);
     let outcome = admit(
-        crate::layer_norm::admission_mode(),
+        admission_mode(),
         "geglu_fused",
         predicate,
         holds,
-        &GEGLU_DISPATCH_COUNTERS,
+        *GEGLU_DISPATCH_COUNTERS,
     )?;
     match outcome {
         DispatchOutcome::Fused => Ok(apply1(
@@ -1556,7 +1635,7 @@ mod tests {
         let device = Device::Cpu;
         let scores = Tensor::from_slice(&[0.0f32; 4], (1, 1, 1, 4), &device).unwrap();
         let mask = Tensor::from_slice(&[0.0f32; 4], (1, 1, 1, 4), &device).unwrap();
-        let (holds, predicate) = softmax_admission_predicate(&scores, &mask);
+        let (holds, predicate) = softmax_admission_predicate(&scores, &mask, 1.0);
         assert!(holds, "CPU must satisfy the device clause: {predicate}");
     }
 
@@ -1567,7 +1646,7 @@ mod tests {
         let device = Device::Cpu;
         let scores = Tensor::from_slice(&[0.0f32; 4], (1, 1, 1, 4), &device).unwrap();
         let mask = Tensor::from_slice(&[bf16::from_f32(0.0); 4], (1, 1, 1, 4), &device).unwrap();
-        let (holds, predicate) = softmax_admission_predicate(&scores, &mask);
+        let (holds, predicate) = softmax_admission_predicate(&scores, &mask, 1.0);
         assert!(!holds, "dtype mismatch must be refused");
         assert_eq!(
             predicate,
@@ -1584,7 +1663,7 @@ mod tests {
         let last = MAX_LAST_DIM + 1;
         let scores = Tensor::from_slice(&vec![0.0f32; last], (1, 1, 1, last), &device).unwrap();
         let mask = Tensor::from_slice(&vec![0.0f32; last], (1, 1, 1, last), &device).unwrap();
-        let (holds, predicate) = softmax_admission_predicate(&scores, &mask);
+        let (holds, predicate) = softmax_admission_predicate(&scores, &mask, 1.0);
         assert!(!holds, "last dim above MAX_LAST_DIM must be refused");
         assert_eq!(predicate, "last_dim_within_kernel_max_last_dim");
     }
@@ -1596,7 +1675,7 @@ mod tests {
         let device = Device::Cpu;
         let scores = Tensor::from_slice(&[0.0f32; 4], (1, 1, 1, 1, 4), &device).unwrap();
         let mask = Tensor::from_slice(&[0.0f32; 4], (1, 1, 1, 1, 4), &device).unwrap();
-        let (holds, predicate) = softmax_admission_predicate(&scores, &mask);
+        let (holds, predicate) = softmax_admission_predicate(&scores, &mask, 1.0);
         assert!(!holds, "rank above MAX_RANK must be refused");
         assert_eq!(predicate, "rank_within_kernel_max_rank");
     }
@@ -1613,7 +1692,7 @@ mod tests {
             .unwrap();
         assert!(!scores.is_contiguous());
         let mask = Tensor::from_slice(&[0.0f32; 2], (1, 2), &device).unwrap();
-        let (holds, predicate) = softmax_admission_predicate(&scores, &mask);
+        let (holds, predicate) = softmax_admission_predicate(&scores, &mask, 1.0);
         assert!(!holds, "non-contiguous scores must be refused");
         assert_eq!(predicate, "scores_contiguous");
     }
@@ -1629,9 +1708,47 @@ mod tests {
         let scores = Tensor::from_slice(&[0.0f32; 3 * 2 * 4], (3, 2, 4), &device).unwrap();
         // Leading axis 0 is `2`, neither `1` nor `scores`'s `3`.
         let mask = Tensor::from_slice(&[0.0f32; 2 * 2 * 4], (2, 2, 4), &device).unwrap();
-        let (holds, predicate) = softmax_admission_predicate(&scores, &mask);
+        let (holds, predicate) = softmax_admission_predicate(&scores, &mask, 1.0);
         assert!(!holds, "a broadcast-class violation must be refused");
         assert_eq!(predicate, "mask_broadcast_class");
+    }
+
+    /// `scale` (the divisor `softmax_apply_training` passes through, `1.0 /
+    /// scale` being the value handed to `SoftmaxLastDimFused::with_scale`)
+    /// has a real domain (family D) -- `0.0`, negative, `NaN`, and `+inf`
+    /// all produce a `1.0 / scale` this op's own `with_scale` would refuse,
+    /// and this predicate must catch EVERY one of them here, at the call
+    /// site, before ever reaching `with_scale`. In `AdmissionMode::Fallback`
+    /// (the default), a bad scale becomes a counted eager fallback (K2's
+    /// doctrine), not a `KernelError` propagating out of the training arm
+    /// -- this is scoped to `Fallback` deliberately: in
+    /// `AdmissionMode::Strict`, `admit` turns the SAME failed predicate
+    /// into `KernelError::StrictModeFallback`, which DOES propagate (see
+    /// `jammi_kernels::admission`'s own doc and tests), by design -- Strict
+    /// mode exists precisely so a failed predicate is observable as an
+    /// error rather than silently degrading. `0.125` (`1/sqrt(64)`,
+    /// ModernBERT-large's real head_dim) is the positive control: it must
+    /// be ACCEPTED, proving this clause does not also reject the real
+    /// production value.
+    #[test]
+    fn softmax_admission_predicate_scale_domain() {
+        let device = Device::Cpu;
+        let scores = Tensor::from_slice(&[0.0f32; 4], (1, 1, 1, 4), &device).unwrap();
+        let mask = Tensor::from_slice(&[0.0f32; 4], (1, 1, 1, 4), &device).unwrap();
+
+        for bad_scale in [0.0f64, -1.0, f64::NAN, f64::INFINITY] {
+            let (holds, predicate) = softmax_admission_predicate(&scores, &mask, bad_scale);
+            assert!(
+                !holds,
+                "scale={bad_scale} must be refused (1.0/scale is not finite-and-positive)"
+            );
+            assert_eq!(predicate, "scale_finite_positive", "scale={bad_scale}");
+        }
+
+        // Positive control: ModernBERT-large's real `sqrt(head_dim)`
+        // divisor (`1.0 / 8.0 == 0.125`) must be ACCEPTED.
+        let (holds, predicate) = softmax_admission_predicate(&scores, &mask, 8.0);
+        assert!(holds, "scale=8.0 (1/8=0.125) must be accepted: {predicate}");
     }
 
     /// The eval-path bit-identity requirement, mirroring
@@ -1659,7 +1776,7 @@ mod tests {
 
         // Non-vacuity: this fixture WOULD be admitted into the fused
         // kernel if training were true.
-        let (holds, predicate) = softmax_admission_predicate(&scores, &mask);
+        let (holds, predicate) = softmax_admission_predicate(&scores, &mask, 1.0);
         assert!(
             holds,
             "fixture must satisfy the fused softmax domain — the test proves eval \
@@ -1676,8 +1793,11 @@ mod tests {
 
         // Exercise the REAL fused-or-fallback dispatch function (proven
         // eligible above) without changing eval's own composed call above.
+        // `scale = 1.0` here is deliberately a no-op: this test is about
+        // EVAL never touching this function's dispatch at all, not about
+        // `scale`'s own numerics (covered separately below).
         let training_before = SOFTMAX_DISPATCH_COUNTERS.snapshot();
-        let _ = softmax_apply_training(&scores, &mask).unwrap();
+        let _ = softmax_apply_training(&scores, &mask, 1.0).unwrap();
         let training_after = SOFTMAX_DISPATCH_COUNTERS.snapshot();
         assert!(
             training_after.fused > training_before.fused,
@@ -1702,14 +1822,20 @@ mod tests {
 
     /// Fused-vs-eager attention-level oracle: `softmax_apply_training`'s
     /// actual dispatch path (fused kernel, since this fixture is
-    /// fused-eligible on CPU) vs. the eager `broadcast_add` +
-    /// `candle_nn::ops::softmax` composition, fwd AND bwd.
+    /// fused-eligible on CPU) vs. the eager `/scale` + `broadcast_add` +
+    /// `candle_nn::ops::softmax` composition (the SAME composition
+    /// `forward`'s training arm used to run before `scale` was folded into
+    /// this function), fwd AND bwd. `scale = 8.0` (`sqrt(64)`, ModernBERT's
+    /// real `head_dim`) is a GENUINE, non-`1.0` scale — this is the
+    /// oracle that actually exercises the folded-scale numerics, not just
+    /// the fused/eager dispatch machinery.
     #[test]
     fn fused_training_softmax_matches_eager_fwd_and_bwd() {
         let device = Device::Cpu;
         let batch = 1;
         let heads = 2;
         let seq = 4;
+        let scale = 8.0f64; // sqrt(64) -- ModernBERT-large's real head_dim.
         let sv: Vec<f32> = (0..batch * heads * seq * seq)
             .map(|i| (i as f32 * 0.19 - 2.0).cos() * 2.0)
             .collect();
@@ -1722,7 +1848,7 @@ mod tests {
                 .unwrap();
         let mask_fused = Tensor::from_slice(&mv, (batch, 1, 1, seq), &device).unwrap();
         let before = SOFTMAX_DISPATCH_COUNTERS.snapshot();
-        let out_fused = softmax_apply_training(&s_fused, &mask_fused).unwrap();
+        let out_fused = softmax_apply_training(&s_fused, &mask_fused, scale).unwrap();
         let after = SOFTMAX_DISPATCH_COUNTERS.snapshot();
         assert!(
             after.fused > before.fused,
@@ -1734,18 +1860,43 @@ mod tests {
             Var::from_tensor(&Tensor::from_slice(&sv, (batch, heads, seq, seq), &device).unwrap())
                 .unwrap();
         let mask_eager = Tensor::from_slice(&mv, (batch, 1, 1, seq), &device).unwrap();
-        let out_eager =
-            candle_nn::ops::softmax(&s_eager.broadcast_add(&mask_eager).unwrap(), D::Minus1)
-                .unwrap();
+        let out_eager = candle_nn::ops::softmax(
+            &(s_eager.as_tensor() / scale)
+                .unwrap()
+                .broadcast_add(&mask_eager)
+                .unwrap(),
+            D::Minus1,
+        )
+        .unwrap();
 
         let vf: Vec<f32> = out_fused.flatten_all().unwrap().to_vec1().unwrap();
         let ve: Vec<f32> = out_eager.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(
+            vf.iter().any(|v| v.abs() > 1e-6),
+            "fixture must be non-degenerate"
+        );
         for (i, (f, e)) in vf.iter().zip(ve.iter()).enumerate() {
             assert!((f - e).abs() < 1e-4, "fwd[{i}]: fused {f} vs eager {e}");
         }
 
-        let grads_fused = out_fused.backward().unwrap();
-        let grads_eager = out_eager.backward().unwrap();
+        // A NON-UNIFORM seed, not `Tensor::backward()`'s implicit
+        // all-ones `dy`: a uniform `dy` makes `dscores = (dy -
+        // sum(dy*y))*y` IDENTICALLY zero for every softmax row (since
+        // `sum(y) == 1`), which would make a bare `.backward()` here a
+        // VACUOUS backward check (family F) — it passed before this
+        // fixture had a non-vacuity assertion, silently proving nothing
+        // about `bwd`'s actual scale-chain-rule multiply.
+        let dy_seed_v: Vec<f32> = (0..batch * heads * seq * seq)
+            .map(|i| (i as f32 * 0.31 - 1.0).sin())
+            .collect();
+        let dy_seed_fused =
+            Tensor::from_slice(&dy_seed_v, (batch, heads, seq, seq), &device).unwrap();
+        let dy_seed_eager =
+            Tensor::from_slice(&dy_seed_v, (batch, heads, seq, seq), &device).unwrap();
+        let loss_fused = (&out_fused * &dy_seed_fused).unwrap().sum_all().unwrap();
+        let loss_eager = (&out_eager * &dy_seed_eager).unwrap().sum_all().unwrap();
+        let grads_fused = loss_fused.backward().unwrap();
+        let grads_eager = loss_eager.backward().unwrap();
         let dxf: Vec<f32> = grads_fused
             .get(&s_fused)
             .unwrap()
@@ -1760,9 +1911,277 @@ mod tests {
             .unwrap()
             .to_vec1()
             .unwrap();
+        assert!(
+            dxf.iter().any(|v| v.abs() > 1e-6),
+            "gradient must be measured-nonzero"
+        );
         for (i, (f, e)) in dxf.iter().zip(dxe.iter()).enumerate() {
             assert!((f - e).abs() < 1e-3, "dscores[{i}]: fused {f} vs eager {e}");
         }
+    }
+
+    /// Deletion-catching oracle for `softmax_apply_training`'s EAGER
+    /// FALLBACK arm -- the branch every OTHER test in this file skips
+    /// over, because every other fixture here is fused-eligible (three of
+    /// them assert the fused counter incremented: the two tests above and
+    /// `fused_training_softmax_call_site_drops_the_affine_node` below).
+    /// MUTATION-VERIFIED: replacing the eager arm's `scores /
+    /// scores_divisor` with `scores * scores_divisor` leaves every one of
+    /// those fused-path tests, and every other encoder test, green --
+    /// none of them ever reaches this branch -- while this test reddens
+    /// (see the commit message that introduced this test for the actual
+    /// mutate/run/revert record). This is what makes "the
+    /// fallback is never a fourth numeric path, only the pre-existing
+    /// training-eager composition" (`softmax_apply_training`'s own doc
+    /// comment above) a MEASURED claim rather than an assertion no test
+    /// actually exercises.
+    ///
+    /// Forces the eager arm via an admissible-by-construction domain miss
+    /// -- `scores` non-contiguous (`.t()` on a `Var`, transposing the
+    /// last two axes) -- rather than an env-var flip
+    /// (`JAMMI_KERNELS_STRICT`), which would mutate shared process state
+    /// a parallel test run could race on. `mask_broadcast_class`, dtype,
+    /// rank, and scale all still hold for this fixture, so
+    /// `scores_contiguous` is the ONLY predicate clause it fails --
+    /// confirmed below, not assumed.
+    ///
+    /// Production width, not the tiny `seq = 4` toy fixtures the tests
+    /// above use: `heads = 16`, `seq = 128` (one of `jammi-kernels`'s own
+    /// two production `seq` classes -- see `tests/cuda_parity.rs`'s
+    /// `SoftmaxLastDimFused CPU<->CUDA parity` section doc), `scale =
+    /// 8.0` (`sqrt(64)`, ModernBERT-large's real `head_dim`), and the
+    /// REAL `MASKED_LOGIT` mask convention
+    /// ([`crate::mask::MASKED_LOGIT`], not a synthetic `-10_000.0`
+    /// restated by hand) at a realistic padding density. F32, not BF16:
+    /// this oracle is about a gross divide-vs-multiply operator swap (any
+    /// finite `scale != 1.0` separates the two arithmetically at every
+    /// dtype), not the BF16 boundary-rounding hazard `ops/softmax.rs`'s
+    /// module doc discloses -- that hazard is a property of the FUSED
+    /// kernel's own rounding point, which this arm never reaches.
+    ///
+    /// Compares fwd AND bwd bit-for-bit (`assert_eq!`, not an epsilon
+    /// tolerance) against an INDEPENDENTLY-rooted inline
+    /// `candle_nn::ops::softmax((scores / scale) + mask)` composition --
+    /// on the same device, dtype, and deterministic CPU F32 ops, two runs
+    /// of the identical composition must reproduce identical bits, so
+    /// this is a measured claim ("numerically IDENTICAL to before"), not
+    /// an assertion.
+    #[test]
+    fn eager_fallback_softmax_matches_inline_reference_fwd_and_bwd() {
+        let device = Device::Cpu;
+        let batch = 2;
+        let heads = 16;
+        let seq = 128;
+        let scale = 8.0f64; // sqrt(64) -- ModernBERT-large's real head_dim.
+        let sv: Vec<f32> = (0..batch * heads * seq * seq)
+            .map(|i| (i as f32 * 0.017 - 5.0).sin() * 3.0)
+            .collect();
+        let mv: Vec<f32> = (0..batch * seq)
+            .map(|i| {
+                if i % 37 == 0 {
+                    crate::mask::MASKED_LOGIT
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+
+        let base_fn =
+            Var::from_tensor(&Tensor::from_slice(&sv, (batch, heads, seq, seq), &device).unwrap())
+                .unwrap();
+        let scores_fn = base_fn.as_tensor().t().unwrap();
+        assert!(
+            !scores_fn.is_contiguous(),
+            "fixture construction bug: `.t()` must produce a non-contiguous view"
+        );
+        let mask_fn = Tensor::from_slice(&mv, (batch, 1, 1, seq), &device).unwrap();
+
+        // Non-vacuity: this fixture must fail admission for EXACTLY the
+        // contiguity clause -- not some other domain check silently
+        // masking the one this test targets.
+        let (holds, predicate) = softmax_admission_predicate(&scores_fn, &mask_fn, scale);
+        assert!(!holds, "fixture must be refused admission");
+        assert_eq!(
+            predicate, "scores_contiguous",
+            "fixture must fail admission for non-contiguity specifically, not another clause"
+        );
+
+        let base_ref =
+            Var::from_tensor(&Tensor::from_slice(&sv, (batch, heads, seq, seq), &device).unwrap())
+                .unwrap();
+        let scores_ref = base_ref.as_tensor().t().unwrap();
+        let mask_ref = Tensor::from_slice(&mv, (batch, 1, 1, seq), &device).unwrap();
+
+        let before = SOFTMAX_DISPATCH_COUNTERS.snapshot();
+        let out_fn = softmax_apply_training(&scores_fn, &mask_fn, scale).unwrap();
+        let after = SOFTMAX_DISPATCH_COUNTERS.snapshot();
+        assert!(
+            after.eager > before.eager,
+            "this fixture must actually dispatch the EAGER fallback, or this oracle \
+             exercises nothing (before={before:?}, after={after:?})"
+        );
+
+        let out_ref = candle_nn::ops::softmax(
+            &(&scores_ref / scale)
+                .unwrap()
+                .broadcast_add(&mask_ref)
+                .unwrap(),
+            D::Minus1,
+        )
+        .unwrap();
+
+        let vf: Vec<f32> = out_fn.flatten_all().unwrap().to_vec1().unwrap();
+        let vr: Vec<f32> = out_ref.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(
+            vf.iter().any(|v| v.abs() > 1e-6),
+            "fixture must be non-degenerate"
+        );
+        assert_eq!(
+            vf, vr,
+            "eager-fallback forward must be BIT-IDENTICAL to the inline eager reference \
+             composition -- a mismatch here means the fallback arm no longer computes \
+             `(scores / scores_divisor) + mask` exactly"
+        );
+
+        // A NON-UNIFORM seed -- see `fused_training_softmax_matches_eager_fwd_and_bwd`
+        // above for why a uniform `dy` would make this comparison vacuous.
+        let dy_seed_v: Vec<f32> = (0..batch * heads * seq * seq)
+            .map(|i| (i as f32 * 0.023 - 1.0).cos())
+            .collect();
+        let dy_fn = Tensor::from_slice(&dy_seed_v, (batch, heads, seq, seq), &device).unwrap();
+        let dy_ref = Tensor::from_slice(&dy_seed_v, (batch, heads, seq, seq), &device).unwrap();
+        let loss_fn = (&out_fn * &dy_fn).unwrap().sum_all().unwrap();
+        let loss_ref = (&out_ref * &dy_ref).unwrap().sum_all().unwrap();
+        let grads_fn = loss_fn.backward().unwrap();
+        let grads_ref = loss_ref.backward().unwrap();
+        let dxf: Vec<f32> = grads_fn
+            .get(&base_fn)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let dxr: Vec<f32> = grads_ref
+            .get(&base_ref)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert!(
+            dxf.iter().any(|v| v.abs() > 1e-6),
+            "gradient must be measured-nonzero"
+        );
+        assert_eq!(
+            dxf, dxr,
+            "eager-fallback backward must be BIT-IDENTICAL to the inline eager \
+             reference's gradient"
+        );
+    }
+
+    /// NODE-COUNT PROXY for the training arm's memory win: the call site,
+    /// not just the op itself (`jammi_kernels::ops::softmax`'s own
+    /// `fused_softmax_retains_fewer_tape_nodes_than_eager` already covers
+    /// the op in isolation), retains FEWER tape nodes when `scale` is
+    /// folded into `softmax_apply_training` directly, because the `scores
+    /// / scale` `Op::Affine` node an equivalent call site without this
+    /// folding would build before calling it is never constructed here.
+    /// `Tensor::sorted_nodes()` is candle's own PUBLIC topological-sort-
+    /// for-backward API (the exact list `Tensor::backward` walks) — a
+    /// direct, honest count of what backward keeps resident, but it is
+    /// still a NODE-COUNT PROXY for VRAM, not a byte measurement: one
+    /// `[batch, heads, seq, seq]` node dropped from the tape is a real
+    /// win in proportion to its own size, but this test does not, and
+    /// cannot, measure bytes. The actual byte measurement is the committed
+    /// pod A/B record,
+    /// `crates/jammi-bench/baselines/p1_softmax_scale_fold_ab.json`, which
+    /// discloses ALL THREE measured rows, not just the favorable one:
+    /// `seq = 512` (`b8`) shows the predicted-size win (`77.46 GB -> 71.76
+    /// GB`, within one allocator pool block of the retained-tensor-size
+    /// arithmetic the JSON's `_comment` derives); `seq = 128` (`b16`)
+    /// shows the SAME win at smaller absolute magnitude (`33.24 GB ->
+    /// 32.57 GB`, also one pool block from predicted); `seq = 128` (`b8`)
+    /// is the CONTRARY row — the arithmetic predicts a save, but the tip
+    /// arm measures ONE allocator pool block (32 MiB) MORE than the base
+    /// arm at that row, not less. See the JSON's `_comment` for the full
+    /// arithmetic and the honest disclosure of why the smallest row does
+    /// not follow the trend (allocator pool granularity dominates at that
+    /// size, not the Affine-node removal itself).
+    ///
+    /// BEFORE: reconstructs the composition an equivalent call site
+    /// WITHOUT `scale` folded in would run (the `Op::Affine` division,
+    /// THEN `softmax_apply_training` with `scale = 1.0` — algebraically
+    /// identical to calling it with the real `scale` directly, so this is
+    /// a fair, apples-to-apples comparison, not a strawman). AFTER:
+    /// `softmax_apply_training` called with the real `scale` directly, the
+    /// call site `ModernBertAttention::forward`'s training arm actually
+    /// uses. Both sides use the IDENTICAL fixture (fused-eligible on CPU,
+    /// mirroring `fused_training_softmax_matches_eager_fwd_and_bwd`'s
+    /// shape) so the ONLY difference between the two graphs is the
+    /// presence/absence of the `Op::Affine` node.
+    #[test]
+    fn fused_training_softmax_call_site_drops_the_affine_node() {
+        let device = Device::Cpu;
+        let batch = 1;
+        let heads = 2;
+        let seq = 4;
+        let scale = 8.0f64; // sqrt(64) -- ModernBERT-large's real head_dim.
+        let sv: Vec<f32> = (0..batch * heads * seq * seq)
+            .map(|i| (i as f32 * 0.19 - 2.0).cos() * 2.0)
+            .collect();
+        let mv: Vec<f32> = (0..batch * seq)
+            .map(|i| if i == 2 { -10_000.0 } else { 0.0 })
+            .collect();
+
+        // BEFORE: the composition an equivalent call site WITHOUT `scale`
+        // folded into `softmax_apply_training` would run.
+        let s_before =
+            Var::from_tensor(&Tensor::from_slice(&sv, (batch, heads, seq, seq), &device).unwrap())
+                .unwrap();
+        let mask_before = Tensor::from_slice(&mv, (batch, 1, 1, seq), &device).unwrap();
+        let scaled_before = (s_before.as_tensor() / scale).unwrap();
+        let before_counters = SOFTMAX_DISPATCH_COUNTERS.snapshot();
+        let y_before = softmax_apply_training(&scaled_before, &mask_before, 1.0).unwrap();
+        let after_before_counters = SOFTMAX_DISPATCH_COUNTERS.snapshot();
+        assert!(
+            after_before_counters.fused > before_counters.fused,
+            "the BEFORE fixture must actually dispatch the fused kernel too, or this \
+             comparison is not apples-to-apples"
+        );
+        let nodes_before = y_before.sorted_nodes().len();
+
+        // AFTER (the actual call site today): `scale` folded directly
+        // into the fused op, no separate `Op::Affine` node ever built.
+        let s_after =
+            Var::from_tensor(&Tensor::from_slice(&sv, (batch, heads, seq, seq), &device).unwrap())
+                .unwrap();
+        let mask_after = Tensor::from_slice(&mv, (batch, 1, 1, seq), &device).unwrap();
+        let before_counters2 = SOFTMAX_DISPATCH_COUNTERS.snapshot();
+        let y_after = softmax_apply_training(&s_after, &mask_after, scale).unwrap();
+        let after_counters2 = SOFTMAX_DISPATCH_COUNTERS.snapshot();
+        assert!(
+            after_counters2.fused > before_counters2.fused,
+            "the AFTER fixture must actually dispatch the fused kernel too, or this \
+             comparison is not apples-to-apples"
+        );
+        let nodes_after = y_after.sorted_nodes().len();
+
+        assert!(
+            nodes_after < nodes_before,
+            "the AFTER graph must retain FEWER tape nodes than BEFORE -- the \
+             Op::Affine node must be gone: before={nodes_before} after={nodes_after}"
+        );
+        // Pin the MEASURED constants directly, not just "fewer than":
+        // BEFORE = [s_before, scaled_before (Op::Affine), y_before] = 3
+        // (mask is never a `Var` in either graph, so it never enters
+        // `sorted_nodes` at all -- the same reasoning
+        // `jammi_kernels::ops::softmax`'s own node-count oracle documents).
+        assert_eq!(nodes_before, 3, "measured BEFORE node count");
+        // AFTER = [s_after, y_after] = 2 -- the Op::Affine node is gone.
+        assert_eq!(
+            nodes_after, 2,
+            "measured AFTER node count -- the Op::Affine node is gone"
+        );
     }
 
     // -------------------------------------------------------------------

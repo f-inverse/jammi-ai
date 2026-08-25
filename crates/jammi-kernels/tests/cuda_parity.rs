@@ -1051,12 +1051,10 @@ fn assert_softmax_parity_f32(cuda: &Device, rows: usize, last: usize, sv: &[f32]
     let s_cpu = Var::from_tensor(&Tensor::from_slice(sv, (rows, last), &cpu).unwrap()).unwrap();
     let m_cpu = Tensor::from_slice(&mv, (1, last), &cpu).unwrap();
     let out_cpu = softmax(&s_cpu, &m_cpu).unwrap();
-    let grads_cpu = out_cpu.backward().unwrap();
 
     let s_gpu = Var::from_tensor(&Tensor::from_slice(sv, (rows, last), cuda).unwrap()).unwrap();
     let m_gpu = Tensor::from_slice(&mv, (1, last), cuda).unwrap();
     let out_gpu = softmax(&s_gpu, &m_gpu).unwrap();
-    let grads_gpu = out_gpu.backward().unwrap();
 
     let out_cpu_v: Vec<f32> = out_cpu.flatten_all().unwrap().to_vec1().unwrap();
     let out_gpu_v: Vec<f32> = out_gpu
@@ -1074,6 +1072,20 @@ fn assert_softmax_parity_f32(cuda: &Device, rows: usize, last: usize, sv: &[f32]
             "softmax fwd[{i}]: cpu {c} vs cuda {g} (rows={rows}, last={last})"
         );
     }
+
+    // Non-uniform dy (family F): `Tensor::backward()`'s implicit all-ones
+    // seed makes `dscores = (dy - sum(dy*y)) * y` IDENTICALLY zero for
+    // every softmax row (`sum(y) == 1`), so a parity check seeded that way
+    // would pass VACUOUSLY even with `bwd` badly broken (e.g. `* scale`
+    // deleted). Seed with a fixed non-uniform `dy` instead, matching
+    // `softmax_parity_fully_masked_row_is_zero_on_both_devices`'s own idiom.
+    let dy_seed = fixture(n, 5.0);
+    let dy_cpu = Tensor::from_slice(&dy_seed, (rows, last), &cpu).unwrap();
+    let dy_gpu = Tensor::from_slice(&dy_seed, (rows, last), cuda).unwrap();
+    let loss_cpu = (&out_cpu * &dy_cpu).unwrap().sum_all().unwrap();
+    let loss_gpu = (&out_gpu * &dy_gpu).unwrap().sum_all().unwrap();
+    let grads_cpu = loss_cpu.backward().unwrap();
+    let grads_gpu = loss_gpu.backward().unwrap();
 
     let dx_cpu: Vec<f32> = grads_cpu
         .get(&s_cpu)
@@ -1093,6 +1105,19 @@ fn assert_softmax_parity_f32(cuda: &Device, rows: usize, last: usize, sv: &[f32]
         .unwrap();
     assert_eq!(dx_cpu.len(), n);
     assert_eq!(dx_gpu.len(), n, "softmax GPU dscores length mismatch");
+    // Non-vacuity (family F): pin that the CPU reference itself is
+    // measurably nonzero -- otherwise the parity loop below would pass
+    // trivially without proving `bwd` ran the real formula.
+    let dx_cpu_norm: f64 = dx_cpu
+        .iter()
+        .map(|&v| (v as f64) * (v as f64))
+        .sum::<f64>()
+        .sqrt();
+    assert!(
+        dx_cpu_norm > 1e-3,
+        "CPU dscores must be measured-nonzero (norm {dx_cpu_norm}) -- a vacuous \
+         all-zero reference would make the parity check below prove nothing"
+    );
     for (i, (c, g)) in dx_cpu.iter().zip(dx_gpu.iter()).enumerate() {
         assert!(
             ((*c - *g).abs() as f64) <= F32_TOL,
@@ -1111,12 +1136,10 @@ fn assert_softmax_parity_bf16(cuda: &Device, rows: usize, last: usize, sv: &[f32
     let s_cpu = Var::from_tensor(&Tensor::from_slice(&sb, (rows, last), &cpu).unwrap()).unwrap();
     let m_cpu = Tensor::from_slice(&mb, (1, last), &cpu).unwrap();
     let out_cpu = softmax(&s_cpu, &m_cpu).unwrap();
-    let grads_cpu = out_cpu.backward().unwrap();
 
     let s_gpu = Var::from_tensor(&Tensor::from_slice(&sb, (rows, last), cuda).unwrap()).unwrap();
     let m_gpu = Tensor::from_slice(&mb, (1, last), cuda).unwrap();
     let out_gpu = softmax(&s_gpu, &m_gpu).unwrap();
-    let grads_gpu = out_gpu.backward().unwrap();
 
     let to_f32 = |t: &Tensor| -> Vec<f32> {
         t.to_dtype(DType::F32)
@@ -1139,6 +1162,18 @@ fn assert_softmax_parity_bf16(cuda: &Device, rows: usize, last: usize, sv: &[f32
         );
     }
 
+    // Non-uniform dy (family F): see `assert_softmax_parity_f32`'s
+    // identical note -- an implicit all-ones seed makes `dscores`
+    // identically zero for a softmax row, which would pass vacuously.
+    let dy_seed_f = fixture(n, 5.0);
+    let dy_seed_b: Vec<bf16> = dy_seed_f.iter().map(|&v| bf16::from_f32(v)).collect();
+    let dy_cpu = Tensor::from_slice(&dy_seed_b, (rows, last), &cpu).unwrap();
+    let dy_gpu = Tensor::from_slice(&dy_seed_b, (rows, last), cuda).unwrap();
+    let loss_cpu = (&out_cpu * &dy_cpu).unwrap().sum_all().unwrap();
+    let loss_gpu = (&out_gpu * &dy_gpu).unwrap().sum_all().unwrap();
+    let grads_cpu = loss_cpu.backward().unwrap();
+    let grads_gpu = loss_gpu.backward().unwrap();
+
     let dx_cpu_v = to_f32(&grads_cpu.get(&s_cpu).unwrap().clone());
     let dx_gpu_v = to_f32(&grads_gpu.get(&s_gpu).unwrap().to_device(&cpu).unwrap());
     assert_eq!(dx_cpu_v.len(), n);
@@ -1146,6 +1181,18 @@ fn assert_softmax_parity_bf16(cuda: &Device, rows: usize, last: usize, sv: &[f32
         dx_gpu_v.len(),
         n,
         "softmax bf16 GPU dscores length mismatch"
+    );
+    // Non-vacuity (family F): pin that the CPU reference itself is
+    // measurably nonzero before trusting the parity loop below.
+    let dx_cpu_norm: f64 = dx_cpu_v
+        .iter()
+        .map(|&v| (v as f64) * (v as f64))
+        .sum::<f64>()
+        .sqrt();
+    assert!(
+        dx_cpu_norm > 1e-3,
+        "CPU dscores must be measured-nonzero (norm {dx_cpu_norm}) -- a vacuous \
+         all-zero reference would make the parity check below prove nothing"
     );
     for (i, (c, g)) in dx_cpu_v.iter().zip(dx_gpu_v.iter()).enumerate() {
         assert!(
@@ -1303,6 +1350,460 @@ fn softmax_parity_empty_batch() {
         .unwrap();
     assert!(out_cpu.is_empty());
     assert!(out_gpu.is_empty());
+}
+
+// =======================================================================
+// SoftmaxLastDimFused CPU<->CUDA parity: `scale` semantics — folding
+// `1/sqrt(head_dim)` into this op; see `ops/softmax.rs`'s module doc's
+// "scale semantics" section. `scale =
+// 0.125` (`1/sqrt(64)`, ModernBERT-large's REAL `head_dim`) throughout —
+// an exact power of two, so the CPU<->CUDA comparison below is not
+// confounded by the `scale` field's own rounding (already proven exact
+// at this value in `tests/oracles.rs`'s CPU-hermetic legs); these legs
+// are specifically about the CUDA kernel's OWN `scale * scores[i] +
+// mask[i]` (F32) / softmax.cu's bf16_mul_rounded (softmax.cu:83) plus
+// bf16_add_rounded (softmax.cu:101) (BF16) arithmetic matching the CPU
+// arm's — contiguous, narrowed-with-nonzero-
+// offset, and BOTH production `seq` classes (128, 512).
+// =======================================================================
+
+const HEAD_DIM_64_SCALE: f32 = 0.125;
+
+fn softmax_scale(scores: &Tensor, mask: &Tensor, scale: f32) -> candle_core::Result<Tensor> {
+    // `.with_scale` validates `scale` (family D — see its own doc) and
+    // returns `KernelError`; every fixture in this file passes a genuine
+    // finite positive scale, so `.expect` here is a test-fixture
+    // assumption, not a silent unwrap of a real fallible path.
+    apply2(
+        scores,
+        mask,
+        SoftmaxLastDimFused::default()
+            .with_scale(scale)
+            .expect("test fixture scale must be finite and > 0.0"),
+    )
+}
+
+fn assert_softmax_scale_parity_f32(
+    cuda: &Device,
+    rows: usize,
+    last: usize,
+    sv: &[f32],
+    scale: f32,
+) {
+    let cpu = Device::Cpu;
+    let n = rows * last;
+    let mv = mask_fixture(last);
+
+    let s_cpu = Var::from_tensor(&Tensor::from_slice(sv, (rows, last), &cpu).unwrap()).unwrap();
+    let m_cpu = Tensor::from_slice(&mv, (1, last), &cpu).unwrap();
+    let out_cpu = softmax_scale(&s_cpu, &m_cpu, scale).unwrap();
+
+    let s_gpu = Var::from_tensor(&Tensor::from_slice(sv, (rows, last), cuda).unwrap()).unwrap();
+    let m_gpu = Tensor::from_slice(&mv, (1, last), cuda).unwrap();
+    let out_gpu = softmax_scale(&s_gpu, &m_gpu, scale).unwrap();
+
+    let out_cpu_v: Vec<f32> = out_cpu.flatten_all().unwrap().to_vec1().unwrap();
+    let out_gpu_v: Vec<f32> = out_gpu
+        .to_device(&cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(out_cpu_v.len(), n);
+    assert_eq!(out_gpu_v.len(), n, "softmax scale GPU fwd length mismatch");
+    for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
+        assert!(
+            ((*c - *g).abs() as f64) <= F32_TOL,
+            "softmax scale fwd[{i}]: cpu {c} vs cuda {g} (rows={rows}, last={last}, scale={scale})"
+        );
+    }
+
+    // Non-uniform dy (family F): `Tensor::backward()`'s implicit all-ones
+    // seed makes `dscores = (dy - sum(dy*y)) * y` IDENTICALLY zero for
+    // every softmax row (`sum(y) == 1`) -- with a uniform seed, `dscores`
+    // would be an uninformative all-zero on BOTH devices, exercising
+    // nothing about `SoftmaxBwdDScores`'s CPU/CUDA numeric coupling.
+    // Note what this parity check can and cannot catch: `bwd`'s `* scale`
+    // multiply (`d_pre_softmax.affine(self.scale as f64, 0.0)`) is ONE
+    // Rust code path shared by both devices -- deleting it would move the
+    // CPU and CUDA arms of THIS check identically, so this comparison
+    // cannot detect that regression regardless of the `dy` seed. That
+    // check instead lives in `tests/oracles.rs`'s
+    // `softmax_scale_bwd_multiplies_raw_dscores_by_scale`, which compares
+    // against an INDEPENDENT reference graph rather than CPU-vs-CUDA. What
+    // a non-uniform seed on THIS check buys is a measurably-nonzero
+    // `dscores` that exercises `SoftmaxBwdDScores`'s own forward-y-coupled
+    // arithmetic (`(dy - sum(dy*y)) * y`) matching between the CPU and
+    // CUDA kernel implementations -- seed with a fixed non-uniform `dy`.
+    let dy_seed = fixture(n, 6.0);
+    let dy_cpu = Tensor::from_slice(&dy_seed, (rows, last), &cpu).unwrap();
+    let dy_gpu = Tensor::from_slice(&dy_seed, (rows, last), cuda).unwrap();
+    let loss_cpu = (&out_cpu * &dy_cpu).unwrap().sum_all().unwrap();
+    let loss_gpu = (&out_gpu * &dy_gpu).unwrap().sum_all().unwrap();
+    let grads_cpu = loss_cpu.backward().unwrap();
+    let grads_gpu = loss_gpu.backward().unwrap();
+
+    let dx_cpu: Vec<f32> = grads_cpu
+        .get(&s_cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let dx_gpu: Vec<f32> = grads_gpu
+        .get(&s_gpu)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(dx_cpu.len(), n);
+    assert_eq!(dx_gpu.len(), n, "softmax scale GPU dscores length mismatch");
+    // Non-vacuity (family F): pin that the CPU reference itself is
+    // measurably nonzero -- otherwise the parity loop below proves
+    // nothing about the CUDA kernel's own `scale` multiply.
+    let dx_cpu_norm: f64 = dx_cpu
+        .iter()
+        .map(|&v| (v as f64) * (v as f64))
+        .sum::<f64>()
+        .sqrt();
+    assert!(
+        dx_cpu_norm > 1e-3,
+        "CPU dscores must be measured-nonzero (norm {dx_cpu_norm}) -- a vacuous \
+         all-zero reference would make the parity check below prove nothing"
+    );
+    for (i, (c, g)) in dx_cpu.iter().zip(dx_gpu.iter()).enumerate() {
+        assert!(
+            ((*c - *g).abs() as f64) <= F32_TOL,
+            "softmax scale dscores[{i}]: cpu {c} vs cuda {g}"
+        );
+    }
+}
+
+fn assert_softmax_scale_parity_bf16(
+    cuda: &Device,
+    rows: usize,
+    last: usize,
+    sv: &[f32],
+    scale: f32,
+) {
+    let cpu = Device::Cpu;
+    let n = rows * last;
+    let mv = mask_fixture(last);
+    let sb: Vec<bf16> = sv.iter().map(|&v| bf16::from_f32(v)).collect();
+    let mb: Vec<bf16> = mv.iter().map(|&v| bf16::from_f32(v)).collect();
+
+    let s_cpu = Var::from_tensor(&Tensor::from_slice(&sb, (rows, last), &cpu).unwrap()).unwrap();
+    let m_cpu = Tensor::from_slice(&mb, (1, last), &cpu).unwrap();
+    let out_cpu = softmax_scale(&s_cpu, &m_cpu, scale).unwrap();
+
+    let s_gpu = Var::from_tensor(&Tensor::from_slice(&sb, (rows, last), cuda).unwrap()).unwrap();
+    let m_gpu = Tensor::from_slice(&mb, (1, last), cuda).unwrap();
+    let out_gpu = softmax_scale(&s_gpu, &m_gpu, scale).unwrap();
+
+    let to_f32 = |t: &Tensor| -> Vec<f32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap()
+    };
+    let bf16_bound = |c: f32, g: f32| 2.0 * 2.0f32.powi(-7) * c.abs().max(g).max(1.0);
+
+    let out_cpu_v = to_f32(&out_cpu);
+    let out_gpu_v = to_f32(&out_gpu.to_device(&cpu).unwrap());
+    assert_eq!(out_cpu_v.len(), n);
+    assert_eq!(
+        out_gpu_v.len(),
+        n,
+        "softmax scale bf16 GPU fwd length mismatch"
+    );
+    for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
+        assert!(
+            (c - g).abs() <= bf16_bound(*c, *g),
+            "softmax scale bf16 fwd[{i}]: cpu {c} vs cuda {g}"
+        );
+    }
+
+    // Non-uniform dy (family F): see `assert_softmax_scale_parity_f32`'s
+    // identical note -- this exercises `SoftmaxBwdDScores`'s forward-y
+    // coupling on a measurably-nonzero `dscores`, not the shared `* scale`
+    // multiply (which a CPU<->CUDA comparison cannot catch either way;
+    // that check lives in `tests/oracles.rs`'s
+    // `softmax_scale_bwd_multiplies_raw_dscores_by_scale`).
+    let dy_seed_f = fixture(n, 6.0);
+    let dy_seed_b: Vec<bf16> = dy_seed_f.iter().map(|&v| bf16::from_f32(v)).collect();
+    let dy_cpu = Tensor::from_slice(&dy_seed_b, (rows, last), &cpu).unwrap();
+    let dy_gpu = Tensor::from_slice(&dy_seed_b, (rows, last), cuda).unwrap();
+    let loss_cpu = (&out_cpu * &dy_cpu).unwrap().sum_all().unwrap();
+    let loss_gpu = (&out_gpu * &dy_gpu).unwrap().sum_all().unwrap();
+    let grads_cpu = loss_cpu.backward().unwrap();
+    let grads_gpu = loss_gpu.backward().unwrap();
+
+    let dx_cpu_v = to_f32(&grads_cpu.get(&s_cpu).unwrap().clone());
+    let dx_gpu_v = to_f32(&grads_gpu.get(&s_gpu).unwrap().to_device(&cpu).unwrap());
+    assert_eq!(dx_cpu_v.len(), n);
+    assert_eq!(
+        dx_gpu_v.len(),
+        n,
+        "softmax scale bf16 GPU dscores length mismatch"
+    );
+    // Non-vacuity (family F): pin that the CPU reference itself is
+    // measurably nonzero before trusting the parity loop below.
+    let dx_cpu_norm: f64 = dx_cpu_v
+        .iter()
+        .map(|&v| (v as f64) * (v as f64))
+        .sum::<f64>()
+        .sqrt();
+    assert!(
+        dx_cpu_norm > 1e-3,
+        "CPU dscores must be measured-nonzero (norm {dx_cpu_norm}) -- a vacuous \
+         all-zero reference would make the parity check below prove nothing"
+    );
+    for (i, (c, g)) in dx_cpu_v.iter().zip(dx_gpu_v.iter()).enumerate() {
+        assert!(
+            (c - g).abs() <= bf16_bound(*c, *g),
+            "softmax scale bf16 dscores[{i}]: cpu {c} vs cuda {g}"
+        );
+    }
+}
+
+#[test]
+fn softmax_scale_parity_contiguous_small() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let rows = 4;
+    let last = 8;
+    let sv = fixture(rows * last, 1.0);
+    assert_softmax_scale_parity_f32(&cuda, rows, last, &sv, HEAD_DIM_64_SCALE);
+    assert_softmax_scale_parity_bf16(&cuda, rows, last, &sv, HEAD_DIM_64_SCALE);
+}
+
+/// `seq = 128` — ModernBERT-large's small-`seq` production class.
+#[test]
+fn softmax_scale_parity_head_dim_64_seq_128_class() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let rows = 4; // e.g. batch*heads collapsed onto the leading axis.
+    let last = 128;
+    let sv = fixture(rows * last, 2.0);
+    assert_softmax_scale_parity_f32(&cuda, rows, last, &sv, HEAD_DIM_64_SCALE);
+    assert_softmax_scale_parity_bf16(&cuda, rows, last, &sv, HEAD_DIM_64_SCALE);
+}
+
+/// `seq = 512` — the quadratic-regime `seq` class the fused-kernels plan
+/// names as this program's actual memory target; exercises the
+/// grid-stride reduction over many more than one block width (256).
+#[test]
+fn softmax_scale_parity_head_dim_64_seq_512_class() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let rows = 2;
+    let last = 512;
+    let sv = fixture(rows * last, 3.0);
+    assert_softmax_scale_parity_f32(&cuda, rows, last, &sv, HEAD_DIM_64_SCALE);
+    assert_softmax_scale_parity_bf16(&cuda, rows, last, &sv, HEAD_DIM_64_SCALE);
+}
+
+#[test]
+fn softmax_scale_parity_narrowed_with_nonzero_offset() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    // A [3, rows, last] tensor narrowed to its middle "batch" slab (the
+    // SAME class of bug this crate's other CUDA arms had — see
+    // `softmax_parity_narrowed_with_nonzero_offset`'s identical
+    // construction — now with `scale` threaded through).
+    let rows = 2;
+    let last = 16;
+    let base = fixture(3 * rows * last, 4.0);
+    let mv = mask_fixture(last);
+    let cpu = Device::Cpu;
+
+    let s_cpu = Tensor::from_slice(&base, (3, rows, last), &cpu)
+        .unwrap()
+        .narrow(0, 1, 1)
+        .unwrap()
+        .flatten(0, 1)
+        .unwrap();
+    assert!(s_cpu.is_contiguous());
+    assert_ne!(s_cpu.layout().start_offset(), 0);
+
+    let s_gpu = Tensor::from_slice(&base, (3, rows, last), &cuda)
+        .unwrap()
+        .narrow(0, 1, 1)
+        .unwrap()
+        .flatten(0, 1)
+        .unwrap();
+    let m_cpu = Tensor::from_slice(&mv, (1, last), &cpu).unwrap();
+    let m_gpu = Tensor::from_slice(&mv, (1, last), &cuda).unwrap();
+
+    let out_cpu: Vec<f32> = softmax_scale(&s_cpu, &m_cpu, HEAD_DIM_64_SCALE)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let out_gpu: Vec<f32> = softmax_scale(&s_gpu, &m_gpu, HEAD_DIM_64_SCALE)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(out_cpu.len(), rows * last);
+    assert_eq!(
+        out_gpu.len(),
+        rows * last,
+        "narrowed softmax scale GPU fwd length mismatch"
+    );
+    for (i, (c, g)) in out_cpu.iter().zip(out_gpu.iter()).enumerate() {
+        assert!(
+            ((*c - *g).abs() as f64) <= F32_TOL,
+            "narrowed softmax scale fwd[{i}]: cpu {c} vs cuda {g}"
+        );
+    }
+    // And matches the eager `affine(scale, 0.0)` + `broadcast_add` +
+    // `softmax` composition on the middle slab's own data (the two-op
+    // composition `scale` replaces), not the base buffer's first
+    // `rows*last` elements.
+    let expected_slab_scores =
+        Tensor::from_slice(&base[rows * last..2 * rows * last], (rows, last), &cpu).unwrap();
+    let expected_pre = expected_slab_scores
+        .affine(HEAD_DIM_64_SCALE as f64, 0.0)
+        .unwrap();
+    let expected = eager_softmax(&expected_pre, &m_cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    for (i, (g, e)) in out_gpu.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            ((*g - *e).abs() as f64) <= F32_TOL,
+            "narrowed softmax scale fwd[{i}] vs eager: cuda {g} vs {e}"
+        );
+    }
+}
+
+// =======================================================================
+// SoftmaxLastDimFused: CUDA-only, SAME-DEVICE BF16 bit-exactness for the
+// pre-mask-add rounding point (softmax.cu's bf16_mul_rounded, softmax.cu:83,
+// used at softmax.cu:272/280/287). This is NOT a CPU<->CUDA parity check (every
+// leg above is) -- it compares fused-with-scale against
+// affine-then-fused-no-scale ENTIRELY ON CUDA, mirroring
+// `tests/oracles.rs`'s CPU-hermetic
+// `softmax_scale_bf16_small_additive_mask_bit_exact_vs_affine_then_unscaled`.
+// It exists because NEITHER of this crate's other CUDA-BF16 checks can
+// catch a regression in that rounding point: `assert_softmax_scale_parity_bf16`
+// above is a CPU<->CUDA comparison at a 2-BF16-ULP bound wide enough to
+// swallow exactly the single-extra-rounding-step this test defends
+// against, and every mask fixture used by the suites above is the real
+// ModernBERT alphabet `{0.0, -10_000.0, -20_000.0}`, which cannot observe
+// the rounding point at all (round-identity at `0.0`, annihilation near
+// `MASKED_LOGIT` -- see `small_bias_mask_fixture`'s own doc, identical
+// reasoning to its CPU-oracle sibling). Concretely, this catches removing
+// the pre-mask-add rounding from `softmax.cu` -- i.e. computing
+// `scores[i] * scale + mask[i]` as one un-rounded step instead of
+// `bf16_mul_rounded(scores[i], scale)` FIRST, rounding to BF16, THEN
+// adding `mask[i]` and rounding again.
+//
+// Only the head_dim=128 leg below (`scale = 1/sqrt(128)`, not exactly
+// representable in BF16 or F32) actually discriminates that mutation:
+// multiplying a BF16 value by an exact power of two (the head_dim=64
+// leg's `scale = 0.125 = 1/sqrt(64)`, ModernBERT-large's real production
+// value) only shifts the exponent, so `bf16_mul_rounded(s, 0.125)` is
+// exact and produces the IDENTICAL bit pattern whether or not the
+// intermediate round-after-multiply step runs -- the head_dim=64 leg
+// still proves CUDA/CPU-independent same-device bit-exactness at the real
+// production scale, but a mutant that drops the intermediate rounding
+// entirely passes it unchanged. Both legs are gated by
+// `JAMMI_REQUIRE_CUDA` like every other test in this file (via
+// `cuda_device()`'s early return).
+// =======================================================================
+
+/// A REL-POS-BIAS-shaped mask: small, continuous, NEVER `0.0` and NEVER
+/// near `MASKED_LOGIT` magnitude — see this section's own doc and
+/// `tests/oracles.rs`'s identical `small_bias_mask_fixture` for why the
+/// real ModernBERT alphabet cannot exercise the rounding point this test
+/// defends.
+fn small_bias_mask_fixture(batch: usize, seq: usize) -> Vec<f32> {
+    (0..batch * seq * seq)
+        .map(|i| (i as f32 * 0.037 - 3.0).sin() * 0.5)
+        .collect()
+}
+
+fn assert_softmax_scale_bf16_bit_exact_same_device_cuda(
+    cuda: &Device,
+    batch: usize,
+    heads: usize,
+    seq: usize,
+    scale: f64,
+) {
+    let sv = fixture(batch * heads * seq * seq, 5.0);
+    let mv = small_bias_mask_fixture(batch, seq);
+    let sb: Vec<bf16> = sv.iter().map(|&v| bf16::from_f32(v)).collect();
+    let mb: Vec<bf16> = mv.iter().map(|&v| bf16::from_f32(v)).collect();
+    let scores = Tensor::from_slice(&sb, (batch, heads, seq, seq), cuda).unwrap();
+    let mask = Tensor::from_slice(&mb, (batch, 1, seq, seq), cuda).unwrap();
+
+    // `FullyMaskedPolicy::Propagate` (`softmax_scale`'s default via
+    // `SoftmaxLastDimFused::default()`), NOT `Zeros`: the small, signed
+    // `[-0.5, 0.5]` mask fixture is not the real masking alphabet, so a
+    // row that happens to land all-negative is not "fully masked" in the
+    // production sense -- `Zeros`'s short-circuit would misfire on it,
+    // exactly as `tests/oracles.rs`'s CPU sibling documents.
+    let fused_scaled = softmax_scale(&scores, &mask, scale as f32).unwrap();
+    let affined = scores.affine(scale, 0.0).unwrap();
+    let affine_then_unscaled = softmax_scale(&affined, &mask, 1.0).unwrap();
+
+    let a: Vec<bf16> = fused_scaled.flatten_all().unwrap().to_vec1().unwrap();
+    let b: Vec<bf16> = affine_then_unscaled
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert!(
+        a.iter().any(|v| v.to_f32().abs() > 1e-3),
+        "fixture must be non-degenerate"
+    );
+    assert_eq!(
+        a, b,
+        "CUDA BF16 small-additive-mask leg (head_dim scale={scale}): fused-with-scale \
+         must be BIT-EXACT vs affine-then-fused-no-scale, entirely on CUDA -- a \
+         mismatch here means softmax.cu's pre-mask-add rounding point moved"
+    );
+}
+
+#[test]
+fn softmax_scale_bf16_small_additive_mask_bit_exact_same_device_head_dim_64() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    assert_softmax_scale_bf16_bit_exact_same_device_cuda(
+        &cuda,
+        2,
+        16,
+        128,
+        HEAD_DIM_64_SCALE as f64,
+    );
+}
+
+#[test]
+fn softmax_scale_bf16_small_additive_mask_bit_exact_same_device_head_dim_128() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let scale = 1.0 / 128.0f64.sqrt();
+    assert_softmax_scale_bf16_bit_exact_same_device_cuda(&cuda, 2, 16, 128, scale);
 }
 
 // =======================================================================

@@ -47,7 +47,7 @@ pub use init::LoraInitMode;
 pub use jammi_numerics::ComputePrecision;
 #[cfg(feature = "candle")]
 pub use lora_linear::{
-    lora_dropout_dispatch_snapshot, lora_epilogue_dispatch_snapshot, LoraLinear,
+    lora_dropout_dispatch_snapshot, lora_epilogue_dispatch_snapshot, lora_scaling, LoraLinear,
 };
 #[cfg(feature = "candle")]
 pub use save_load::{load_adapter, save_adapter};

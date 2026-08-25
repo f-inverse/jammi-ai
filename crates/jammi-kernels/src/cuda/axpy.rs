@@ -1,5 +1,5 @@
 use candle_core::backend::BackendStorage;
-use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+use candle_core::cuda_backend::cudarc::driver::PushKernelArg;
 use candle_core::{CudaStorage, DType, Error, Layout, Result, Shape};
 use half::bf16;
 
@@ -34,22 +34,14 @@ pub(crate) fn cuda_fwd(
     // (`ops::axpy`'s `empty_tensor_is_a_no_op_not_an_error`) instead of
     // ever reaching the launch below.
     if n == 0 {
-        return match (s1.dtype(), s2.dtype()) {
-            (DType::F32, DType::F32) => {
-                let out = unsafe { device.alloc::<f32>(0) }?;
-                Ok((CudaStorage::wrap_cuda_slice(out, device), shape))
-            }
-            (DType::BF16, DType::BF16) => {
-                let out = unsafe { device.alloc::<bf16>(0) }?;
-                Ok((CudaStorage::wrap_cuda_slice(out, device), shape))
-            }
-            (lhs, rhs) if lhs != rhs => Err(Error::DTypeMismatchBinaryOp {
-                lhs,
-                rhs,
+        if s1.dtype() != s2.dtype() {
+            return Err(Error::DTypeMismatchBinaryOp {
+                lhs: s1.dtype(),
+                rhs: s2.dtype(),
                 op: "axpy",
-            }),
-            (dtype, _) => Err(Error::UnsupportedDTypeForOp(dtype, "axpy")),
-        };
+            });
+        }
+        return Ok((super::alloc_empty(&device, s1.dtype(), "axpy")?, shape));
     }
 
     // K2 (refuse, don't compute past the domain): the launch grid below is
@@ -58,12 +50,7 @@ pub(crate) fn cuda_fwd(
     // `u32::MAX` the cast silently wraps, under-launching relative to the
     // real element count and leaving the allocation's tail uninitialized —
     // a confident wrong answer, not a crash. Refuse explicitly instead.
-    if n > u32::MAX as usize {
-        return Err(Error::Msg(format!(
-            "axpy: {n} elements exceeds u32::MAX; the CUDA launch grid and \
-             the kernel's bounds check are both 32-bit"
-        )));
-    }
+    super::check_elem_count_fits_u32("axpy", n)?;
 
     // `is_contiguous()` alone is NOT sufficient: it does not imply
     // `start_offset == 0` (candle's own doc on `Layout::is_contiguous`:
@@ -87,7 +74,7 @@ pub(crate) fn cuda_fwd(
         .contiguous_offsets()
         .ok_or(Error::RequiresContiguous { op: "axpy" })?;
 
-    let cfg = LaunchConfig::for_num_elems(n as u32);
+    let cfg = super::elemwise_launch_config(n as u32);
 
     match (s1.dtype(), s2.dtype()) {
         (DType::F32, DType::F32) => {

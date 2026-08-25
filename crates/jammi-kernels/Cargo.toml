@@ -55,6 +55,17 @@ default = []
 # step (`build.rs`). THE feature chain jammi-encoders/jammi-ai hang off of in
 # a later commit; not wired to any consumer yet in this one.
 cuda = ["dep:bindgen_cuda", "candle-core/cuda", "candle-nn/cuda"]
+# Vendored FlashAttention-2 (hdim64 / bf16 / sm80, forward + backward) behind
+# a torch-free C wrapper — `third_party/flash-attention/`, built by
+# `build.rs::build_flash_attn` with a hand-rolled `nvcc` (needs the CUDA
+# toolkit AND the CUTLASS submodule checked out; see
+# `third_party/flash-attention/VENDORED.md`). DEPENDS on `cuda`; is NOT part
+# of `cuda` and NOT default — the `cuda` lane (the release image builds
+# `--features cuda` through jammi-server) must never compile CUTLASS.
+# `ci/scripts/check_flash_attn_closure.py` asserts that no consumer crate's
+# feature closure reaches it; `tests/feature_table.rs` asserts this crate's
+# own `cuda` / `default` entries do not.
+flash-attn = ["cuda"]
 
 # CPU↔CUDA parity — the landing proof the lead's pod session runs.
 # `required-features` means this test target is not even built by a plain
@@ -64,3 +75,4 @@ cuda = ["dep:bindgen_cuda", "candle-core/cuda", "candle-nn/cuda"]
 name = "cuda_parity"
 path = "tests/cuda_parity.rs"
 required-features = ["cuda"]
+

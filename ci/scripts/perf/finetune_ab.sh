@@ -41,6 +41,31 @@
 #                                       adapted forward, so only their SUM
 #                                       needs fused > 0 — either one alone may
 #                                       legitimately read (0, 0).
+#     * attention_block_flash (P6 Stage B FA2 fold-in — not wired into THIS
+#                                       script's own leg orchestration yet,
+#                                       CASCADE-shaped: its fallback counter
+#                                       is `_declined_dispatches`, not
+#                                       `_eager_dispatches`) — OPTIONAL
+#                                       (may be entirely absent from the
+#                                       report's schema, unlike every base
+#                                       above); when present, `attention_block`
+#                                       may ALSO read (0, 0) if THIS base's
+#                                       own fused count is > 0 this run (the
+#                                       flash arm subsumes the fused
+#                                       attention block, which subsumes
+#                                       rope/softmax — the SAME absorption
+#                                       chain above, extended, never a
+#                                       parallel rule), and a nonzero
+#                                       `declined` count is a hard fail
+#                                       UNLESS `kernels_disabled_requested`
+#                                       AND `kernels_disabled_fired` BOTH
+#                                       name it (a deliberate, self-
+#                                       describing `JAMMI_KERNELS_DISABLE=
+#                                       attention_block_flash` reference
+#                                       leg) — see `ab_merge.py`'s own
+#                                       `CASCADE_BASES`/
+#                                       `ABSORBABLE_BY_ATTENTION_BLOCK_FLASH`
+#                                       doc for the full rule table.
 # Every classified base (present in `ALL_BASES`) must be PRESENT in the
 # report at all — an ABSENT pair (the field renamed, deleted, or
 # feature-gated off) is a hard fail for every one of them, never silently

@@ -43,6 +43,8 @@ jammi-vs-torch comparator this repo carries:
 | `attn_requested` / `attn_implementation` | provenance — jammi has no `--attn` lever; recorded in `leg_provenance`, never compared (see `grad_oracle.rs`'s own table for the fuller rationale) | n/a | `"attn_requested": args.attn,` just above `"attn_implementation": resolved_attn_implementation,` (`torch_finetune_step.py:1051`) |
 | `kernels_disabled_requested` / `kernels_disabled_fired` | provenance (K-aux, landed on `main` at `c0f0e98`) — torch has no equivalent env var; recorded in `leg_provenance`, never compared | `let kernels_disabled_fired = jammi_kernels::admission::disabled_ops_fired();` (`finetune_step.rs:552`) | n/a |
 | `ln`/`rope`/`softmax`/`geglu`/`lora_epilogue`/`lora_linear`/`attention_block` `_fused_dispatches`/`_eager_dispatches` (14 fields) | measurement — this IS the fused-dispatch proof `fused_proof`/`dispatch_pairs` gate on, and `leg_provenance` additionally records the raw counters per config | `finetune_step.rs`'s own `*_fused_dispatches`/`*_eager_dispatches` fields | n/a |
+| `attention_block_flash_fused_dispatches` / `attention_block_flash_declined_dispatches` (P6 Stage B FA2 fold-in — a docs-ci co-sign of `origin/perf/p6-fa2-dense` @ `5886c6b`, NOT on `main` as of this table) | measurement — a CASCADE-shaped pair (`CASCADE_BASES`): no `_eager_dispatches` sibling, its fallback counter is named `_declined_dispatches` instead; absorbs `attention_block` (`ABSORBABLE_BY_ATTENTION_BLOCK_FLASH`), which in turn already absorbs `rope`/`softmax` — one chain, not a second mechanism. A report from `main`'s own binary today carries neither key at all; `dispatch_pairs`/`fused_proof` behave byte-for-byte as before such a report | `report.rs`'s `FinetuneStepTier::attention_block_flash_fused_dispatches`/`::attention_block_flash_declined_dispatches` fields on that branch (not yet in this crate's own `finetune_step.rs`) | n/a |
+| `flash_compiled` | provenance — recorded in `leg_provenance` as `jammi_flash_compiled`, never compared; distinguishes "this build cannot run flash at all" from "flash was compiled in but declined/disabled this run", and backs `fused_proof`'s own flash-disable-consistency check (see that function's doc) | `report.rs`'s `FinetuneStepTier::flash_compiled` field, same branch as above | n/a |
 | `losses` / `loss_first` / `loss_last` | measurement — `loss_final_ratio` is printed for visibility, never gated (see that field's own note in `build_report`) | `finetune_step.rs`'s own fields | `torch_finetune_step.py`'s own fields |
 | `s_per_step_p50` / `triplets_per_s` / VRAM fields | measurement — the actual perf numbers this sweep exists to produce | `finetune_step.rs`'s own fields | `torch_finetune_step.py`'s own fields |
 | `model_dir` | provenance (a path string, not compared — superseded by the checksum fields above) | `FinetuneStepParams::model_dir` (not itself emitted on the tier) | `torch_finetune_step.py`'s own `args["model_dir"]` |
@@ -178,24 +180,51 @@ _TORCH_ARGS_LEVEL_FIELDS = frozenset({"seed", "lora_alpha", "margin"})
 #         `rope`/`softmax`. This closes F4/F5's own reproduction (a
 #         "deleted/feature-gated-off fused MLP" reading `geglu = (0, 0)`
 #         used to still print `fused_proof YES`).
-#       - `attention_block`: the whole-attention fused kernel itself. A
-#         checkpoint whose `head_dim != 64` legitimately falls back to
+#       - `attention_block` used to live in this set too. P6 Stage B FA2
+#         fold-in (below): moved OUT, since a third training-attention arm
+#         now gives it a legitimate absorption path of its own, the same
+#         shape `rope`/`softmax` already had one level down —
+#         see `ABSORBABLE_BY_ATTENTION_BLOCK_FLASH`.
+#   * ABSORBABLE_BY_ATTENTION_BLOCK_FLASH (P6 Stage B FA2 fold-in — a
+#     docs-ci co-sign of `origin/perf/p6-fa2-dense` @ `5886c6b`, NOT on
+#     `main` as of this table) — `attention_block` MUST be PRESENT; may
+#     read `(0, 0)` IFF `attention_block_flash`'s OWN `fused` count is `> 0`
+#     THIS run: when the FlashAttention-2 dense cascade fires for a layer,
+#     that layer's `attention_block` `admit` call is never reached at all
+#     (an early return — see `report.rs`'s
+#     `attention_block_flash_fused_dispatches` field doc on that branch),
+#     the exact same "one call site, mutually exclusive arms" shape
+#     `rope`/`softmax`'s own absorption below already documents one level
+#     down. `by_base.get("attention_block_flash", (0, 0))[0]` defaults to
+#     `0` when the key is entirely ABSENT from the report (every report
+#     `main`'s own binary produces today) — so on such a report this
+#     absorption condition is trivially never satisfied and
+#     `attention_block` falls back to needing its OWN `fused > 0`, i.e.
+#     EXACTLY the `REQUIRED_PAIRS` behaviour it used to get directly,
+#     unchanged.
+#       - A checkpoint whose `head_dim != 64` legitimately falls back to
 #         eager here (`report.rs`'s `attention_block_eager_dispatches`
-#         field doc) — that is ALREADY caught by rule 1 below (`eager >
-#         0` anywhere is a hard fail), so requiring `fused > 0` here for
-#         the cases rule 1 does not already reject adds detection without
-#         changing behaviour on that documented domain-refusal case.
+#         field doc) — that is ALREADY caught by rule 1 below (an
+#         unaccounted-for fallback anywhere is a hard fail), so requiring
+#         `fused > 0` (absent flash absorption) here for the cases rule 1
+#         does not already reject adds detection without changing
+#         behaviour on that documented domain-refusal case.
 #   * ABSORBABLE_BY_ATTENTION_BLOCK — `rope`/`softmax` MUST be PRESENT; may
-#     read `(0, 0)` IFF `attention_block`'s OWN `fused` count is `> 0` this
-#     run: `ModernBertAttention::forward_training_attention`'s FUSED arm is
-#     the whole RoPE+QKᵀ+mask+softmax+PV chain as one op and never calls
-#     `rope_apply`/`softmax_apply_training` at all (see that method's own
-#     doc), so their independent admission call sites are simply never
-#     reached. When `attention_block` itself never goes fused (the eager
-#     attention composition ran instead), that composition DOES call
-#     `rope_apply`/`softmax_apply_training` — each independently
-#     admission-gated — so they must clear the same `fused > 0` bar a
-#     required pair does.
+#     read `(0, 0)` IFF `attention_block`'s OWN `fused` count is `> 0`, OR
+#     (P6 Stage B FA2 fold-in, extending this SAME chain rather than a
+#     parallel mechanism) `attention_block_flash`'s OWN `fused` count is
+#     `> 0`, this run: `ModernBertAttention::forward_training_attention`'s
+#     BLOCK-fused arm is the whole RoPE+QKᵀ+mask+softmax+PV chain as one op
+#     and never calls `rope_apply`/`softmax_apply_training` at all (see
+#     that method's own doc), so their independent admission call sites are
+#     simply never reached — and the FLASH arm is a further whole-attention
+#     alternative to that SAME call site, so it never reaches
+#     `rope_apply`/`softmax_apply_training` either, for the identical
+#     reason one level up the chain. When NEITHER whole-attention arm goes
+#     fused (the eager attention composition ran instead), that
+#     composition DOES call `rope_apply`/`softmax_apply_training` — each
+#     independently admission-gated — so they must clear the same
+#     `fused > 0` bar a required pair does.
 #   * LORA_SITE_EXCLUSIVE_GROUP — `lora_epilogue`/`lora_linear` MUST both be
 #     PRESENT, and are genuinely exclusive with EACH OTHER, not with a
 #     third pair: every training-arm LoRA-adapted forward routes through
@@ -204,13 +233,69 @@ _TORCH_ARGS_LEVEL_FIELDS = frozenset({"seed", "lora_alpha", "margin"})
 #     today `lora_epilogue` is PERMANENTLY `(0, 0)`, superseded by the
 #     fused whole-site kernel `lora_linear` now reports). So only the
 #     GROUP's sum needs a `fused > 0` proof, never each member alone.
-REQUIRED_PAIRS = frozenset({"ln", "geglu", "attention_block"})
+#   * CASCADE_BASES (P6 Stage B FA2 fold-in) — see that set's own doc below.
+#     Its one member today, `attention_block_flash`, is deliberately NOT a
+#     member of any of the three "must be present" sets above: it is a
+#     genuinely OPTIONAL arm (absent entirely on every report `main`'s own
+#     binary produces today, and even on a build that DOES carry the field,
+#     nothing about this crate requires that build to have compiled/used
+#     it) — its ONLY role in `ALL_BASES` is to be a recognized (not
+#     schema-drift) base when `dispatch_pairs` discovers it in a report
+#     that DOES carry it, so its own `fused`/`declined` counts are
+#     available for rule 1 (the declined-count hard-fail-unless-requested
+#     check) and for `ABSORBABLE_BY_ATTENTION_BLOCK_FLASH`/
+#     `ABSORBABLE_BY_ATTENTION_BLOCK`'s absorption conditions above.
+REQUIRED_PAIRS = frozenset({"ln", "geglu"})
 ABSORBABLE_BY_ATTENTION_BLOCK = frozenset({"rope", "softmax"})
+ABSORBABLE_BY_ATTENTION_BLOCK_FLASH = frozenset({"attention_block"})
 LORA_SITE_EXCLUSIVE_GROUP = frozenset({"lora_epilogue", "lora_linear"})
-ALL_BASES = REQUIRED_PAIRS | ABSORBABLE_BY_ATTENTION_BLOCK | LORA_SITE_EXCLUSIVE_GROUP
+
+# CASCADE_BASES — a dispatch pair whose fallback counter is named
+# `<base>_declined_dispatches` instead of `<base>_eager_dispatches` (see
+# `_fallback_key`): there is no eager COMPOSITION this arm falls back to
+# internally the way an ordinary pair's eager composition IS that pair's own
+# fallback — on a domain/capability miss the caller falls through to a
+# WHOLLY SEPARATE arm's own pair instead (`attention_block_flash` declining
+# falls through to `attention_block`, one level up the SAME absorption chain
+# `ABSORBABLE_BY_ATTENTION_BLOCK_FLASH` documents). Reproduction (docs-ci
+# co-sign of `origin/perf/p6-fa2-dense` @ `5886c6b`): running `main`'s own
+# `dispatch_pairs` (before this fix) against that branch's own committed
+# `crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-p6-b3-dense-raw-runs/
+# s128_flash_on_1.json` raises `KeyError` looking for a nonexistent
+# `attention_block_flash_eager_dispatches` sibling, and `build_report`'s
+# per-leg `try`/`except` (see that function's own doc) would then mark
+# EVERY leg of EVERY config `INVALID` — silently voiding the flash-vs-block
+# A/B this tool exists to judge, not merely failing loudly on the one
+# genuinely new pair kind.
+#
+# `attention_block_flash` is NOT on `main` yet (this table's own `main` at
+# the time of writing has zero `flash` references anywhere in
+# `crates/jammi-bench/src/`) — a report from `main`'s own binary carries
+# NEITHER `attention_block_flash_fused_dispatches` NOR
+# `..._declined_dispatches` at all, so `dispatch_pairs` never discovers this
+# base on such a report and every fixture in `test_ab_merge.py` that
+# predates this change stays green, unmodified, byte-for-byte.
+CASCADE_BASES = frozenset({"attention_block_flash"})
+
+ALL_BASES = (
+    REQUIRED_PAIRS
+    | ABSORBABLE_BY_ATTENTION_BLOCK
+    | ABSORBABLE_BY_ATTENTION_BLOCK_FLASH
+    | LORA_SITE_EXCLUSIVE_GROUP
+    | CASCADE_BASES
+)
 assert (
-    len(REQUIRED_PAIRS) + len(ABSORBABLE_BY_ATTENTION_BLOCK) + len(LORA_SITE_EXCLUSIVE_GROUP) == len(ALL_BASES)
-), "REQUIRED_PAIRS / ABSORBABLE_BY_ATTENTION_BLOCK / LORA_SITE_EXCLUSIVE_GROUP must be pairwise disjoint -- every base gets exactly ONE class"
+    len(REQUIRED_PAIRS)
+    + len(ABSORBABLE_BY_ATTENTION_BLOCK)
+    + len(ABSORBABLE_BY_ATTENTION_BLOCK_FLASH)
+    + len(LORA_SITE_EXCLUSIVE_GROUP)
+    + len(CASCADE_BASES)
+    == len(ALL_BASES)
+), (
+    "REQUIRED_PAIRS / ABSORBABLE_BY_ATTENTION_BLOCK / "
+    "ABSORBABLE_BY_ATTENTION_BLOCK_FLASH / LORA_SITE_EXCLUSIVE_GROUP / "
+    "CASCADE_BASES must be pairwise disjoint -- every base gets exactly ONE class"
+)
 
 # B5 — bf16's ULP near a loss value around 0.30: 7 explicit mantissa bits,
 # exponent bucket [0.25, 0.5) => 2^-9. Every real sweep leg runs
@@ -336,14 +421,19 @@ def leg_provenance(report, leg):
     """PROVENANCE (recorded, never compared — see `grad_oracle.rs`'s module
     doc's determinant table for the same identity/provenance/measurement
     split applied to this OTHER cross-producer comparator): torch's
-    `attn_requested`/`attn_implementation` pair, jammi's 14 dispatch
-    counters, and (K-aux, landed on `main` at `c0f0e98`) jammi's resolved
+    `attn_requested`/`attn_implementation` pair, jammi's dispatch counters
+    (including, P6 Stage B FA2 fold-in, a `CASCADE_BASES` member's
+    `_declined_dispatches` counter — `jammi_dispatch_counters` keys off
+    EITHER fallback-counter suffix, not just `_eager_dispatches`, so a
+    cascade pair's raw counts are recorded exactly like every other pair's),
+    (K-aux, landed on `main` at `c0f0e98`) jammi's resolved
     `JAMMI_KERNELS_DISABLE` state (`kernels_disabled_requested`/
-    `kernels_disabled_fired`) — deliberately NOT `FINETUNE_IDENTITY_FIELDS`
-    members (torch has no equivalent env var to compare against), recorded
-    here purely so a human reading the merged JSON can see which arm
-    jammi's OWN leg measured. `None` for the fields the OTHER producer has
-    no equivalent for (never fabricated).
+    `kernels_disabled_fired`), and (P6 Stage B FA2 fold-in) `flash_compiled`
+    — deliberately NOT `FINETUNE_IDENTITY_FIELDS` members (torch has no
+    equivalent env var or build-capability flag to compare against),
+    recorded here purely so a human reading the merged JSON can see which
+    arm jammi's OWN leg measured. `None` for the fields the OTHER producer
+    has no equivalent for (never fabricated).
     """
     fs = finetune_block(report, leg)
     if leg.startswith("jammi"):
@@ -351,10 +441,13 @@ def leg_provenance(report, leg):
             "torch_attn_requested": None,
             "torch_attn_implementation": None,
             "jammi_dispatch_counters": {
-                k: v for k, v in fs.items() if k.endswith("_fused_dispatches") or k.endswith("_eager_dispatches")
+                k: v
+                for k, v in fs.items()
+                if k.endswith("_fused_dispatches") or k.endswith("_eager_dispatches") or k.endswith("_declined_dispatches")
             },
             "jammi_kernels_disabled_requested": fs.get("kernels_disabled_requested"),
             "jammi_kernels_disabled_fired": fs.get("kernels_disabled_fired"),
+            "jammi_flash_compiled": fs.get("flash_compiled"),
         }
     args = report.get("args") if isinstance(report.get("args"), dict) else {}
     return {
@@ -363,29 +456,49 @@ def leg_provenance(report, leg):
         "jammi_dispatch_counters": None,
         "jammi_kernels_disabled_requested": None,
         "jammi_kernels_disabled_fired": None,
+        "jammi_flash_compiled": None,
     }
 
 
+def _fallback_key(base):
+    """The sibling counter key for a `<base>_fused_dispatches` field —
+    `<base>_declined_dispatches` for a `CASCADE_BASES` member (see that
+    set's own doc: a cascade pair has no eager COMPOSITION to fall back to
+    internally, only a domain/capability DECLINE that falls through to a
+    wholly separate arm's own pair), `<base>_eager_dispatches` for every
+    other (ordinary) pair — unchanged from before the cascade-pair fold-in.
+    """
+    return f"{base}_declined_dispatches" if base in CASCADE_BASES else f"{base}_eager_dispatches"
+
+
 def dispatch_pairs(fs):
-    """Every `(base, fused_key, eager_key)` positive-proof pair PRESENT in
-    this report's `finetune_step` block, discovered from the JSON keys
+    """Every `(base, fused_key, fallback_key)` positive-proof pair PRESENT
+    in this report's `finetune_step` block, discovered from the JSON keys
     themselves rather than a hardcoded name list — a hardcoded ln/rope/
     softmax trio would silently stop catching a NEW fused op (geglu,
-    lora_epilogue, lora_linear, attention_block, and whatever lands next)
-    the day it is added to `finetune_step.rs`'s `FinetuneStepTier` without
-    this script being updated in lockstep. Every key ending in
-    `_fused_dispatches` names a pair; its sibling is the same base with
-    `_eager_dispatches`, which `finetune_step.rs`'s own struct guarantees
-    always exists alongside the fused counter (every fused/eager counter in
-    that struct is added as a pair, never solo).
+    lora_epilogue, lora_linear, attention_block, attention_block_flash, and
+    whatever lands next) the day it is added to `finetune_step.rs`'s
+    `FinetuneStepTier` without this script being updated in lockstep. Every
+    key ending in `_fused_dispatches` names a pair; its sibling is the same
+    base's fallback key (`_fallback_key`) — either `_eager_dispatches`
+    (`finetune_step.rs`'s own struct guarantees this always exists
+    alongside an ORDINARY fused counter — every such pair is added as a
+    pair, never solo) or, for a `CASCADE_BASES` member,
+    `_declined_dispatches` (P6 Stage B FA2 fold-in — see that set's own
+    doc). The returned tuple's third element is that fallback count
+    regardless of which key produced it — `fused_proof`'s rule 1 (below)
+    treats BOTH shapes uniformly (a real, non-deliberate fallback anywhere
+    is a hard fail), so `dispatch_pairs` itself does not need to distinguish
+    them past this point.
 
     B6 SCHEMA STRICTNESS: this function stays LOUD (raises `KeyError`) on a
-    solo counter — a fused key with no eager sibling is a genuine schema
+    solo counter — a fused key with no fallback sibling is a genuine schema
     bug (a struct field added without its pair), never a config this script
     should silently skip. F5 extends the SAME loudness to a base
     `fused_proof`'s classification tables (`REQUIRED_PAIRS` /
-    `ABSORBABLE_BY_ATTENTION_BLOCK` / `LORA_SITE_EXCLUSIVE_GROUP`, whose
-    union is `ALL_BASES`) do not know about: a NEW fused kernel landing in
+    `ABSORBABLE_BY_ATTENTION_BLOCK` / `ABSORBABLE_BY_ATTENTION_BLOCK_FLASH` /
+    `LORA_SITE_EXCLUSIVE_GROUP` / `CASCADE_BASES`, whose union is
+    `ALL_BASES`) do not know about: a NEW fused kernel landing in
     `finetune_step.rs` without this module's classification tables being
     updated in lockstep is exactly the same class of schema drift as a
     solo counter — `fused_proof` would otherwise silently never require
@@ -402,30 +515,44 @@ def dispatch_pairs(fs):
     `KeyError` from discarding the merged table for every other config
     (previously this raise propagated all the way to the top-level script
     and aborted the entire merge).
+
+    Reproduction of the bug this fixes (P6 Stage B FA2, docs-ci co-sign of
+    `origin/perf/p6-fa2-dense` @ `5886c6b`): BEFORE `_fallback_key`/
+    `CASCADE_BASES` existed, this function always looked for
+    `<base>_eager_dispatches` — a report carrying
+    `attention_block_flash_fused_dispatches` (that branch's own
+    `report.rs`'s `FinetuneStepTier`, not yet on `main`) has no
+    `attention_block_flash_eager_dispatches` key at all (that arm's
+    fallback counter is named `_declined_dispatches` instead), so this
+    raised `KeyError` on every real leg from that branch's committed
+    `crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-p6-b3-dense-raw-runs/*.json`
+    fixtures.
     """
     pairs = []
     for key in fs:
         if not key.endswith("_fused_dispatches"):
             continue
         base = key[: -len("_fused_dispatches")]
-        eager_key = f"{base}_eager_dispatches"
-        if eager_key not in fs:
+        fallback_key = _fallback_key(base)
+        if fallback_key not in fs:
             raise KeyError(
-                f"'{key}' has no matching '{eager_key}' in the report — "
-                "finetune_step.rs's fused/eager counters are supposed to "
-                "always come in pairs; a solo counter is a schema bug, not "
-                "a config this script should silently skip."
+                f"'{key}' has no matching '{fallback_key}' in the report — "
+                "finetune_step.rs's fused/eager (or, for a CASCADE_BASES "
+                "member, fused/declined) counters are supposed to always "
+                "come in pairs; a solo counter is a schema bug, not a "
+                "config this script should silently skip."
             )
         if base not in ALL_BASES:
             raise KeyError(
                 f"dispatch-pair base {base!r} (from {key!r}) is not classified in ALL_BASES "
                 f"({sorted(ALL_BASES)!r}) — a NEW fused kernel landed in finetune_step.rs "
                 "without fused_proof's REQUIRED_PAIRS / ABSORBABLE_BY_ATTENTION_BLOCK / "
-                "LORA_SITE_EXCLUSIVE_GROUP tables being updated to cover it. This is a "
+                "ABSORBABLE_BY_ATTENTION_BLOCK_FLASH / LORA_SITE_EXCLUSIVE_GROUP / "
+                "CASCADE_BASES tables being updated to cover it. This is a "
                 "schema-drift bug, not a base this script should silently leave unchecked "
                 "(see F5's own fix note on the module-level classification tables)."
             )
-        pairs.append((base, fs[key], fs[eager_key]))
+        pairs.append((base, fs[key], fs[fallback_key]))
     return pairs
 
 
@@ -450,6 +577,15 @@ def metrics(entry, leg):
         m["vram_delta_bytes"] = fs["peak_vram_bytes"]["value"]
         m["vram_absolute_bytes"] = None
         m["dispatch_pairs"] = dispatch_pairs(fs)
+        # P6 Stage B FA2 fold-in: `fused_proof`'s own flash-disable-
+        # consistency check (see that function's doc) reads these off `m`
+        # rather than the raw `fs` a second time, keeping `fused_proof`'s
+        # existing `m`-only signature. `.get()` (never `[...]`): both keys
+        # are entirely ABSENT on every report `main`'s own binary produces
+        # today, and this must not raise for that case.
+        m["flash_compiled"] = fs.get("flash_compiled")
+        m["kernels_disabled_requested"] = fs.get("kernels_disabled_requested")
+        m["kernels_disabled_fired"] = fs.get("kernels_disabled_fired")
     else:
         m["vram_delta_bytes"] = fs["peak_vram_delta_bytes"]["value"]
         m["vram_absolute_bytes"] = fs["peak_vram_absolute_bytes"]["value"]
@@ -458,66 +594,134 @@ def metrics(entry, leg):
 
 def fused_proof(m):
     """See the module-level `REQUIRED_PAIRS`/`ABSORBABLE_BY_ATTENTION_BLOCK`/
-    `LORA_SITE_EXCLUSIVE_GROUP` (union `ALL_BASES`) doc for the
-    classification this checks each pair against. Returns `True`/`False`/
-    `None` (no `dispatch_pairs` at all — not a jammi leg, or the leg itself
-    did not run). Raises (via `dispatch_pairs`, which `metrics()` already
-    calls before this function ever sees `m` — see that function's own doc)
-    if `m["dispatch_pairs"]` would ever contain a base outside `ALL_BASES`;
+    `ABSORBABLE_BY_ATTENTION_BLOCK_FLASH`/`LORA_SITE_EXCLUSIVE_GROUP`/
+    `CASCADE_BASES` (union `ALL_BASES`) doc for the classification this
+    checks each pair against. Returns `True`/`False`/`None` (no
+    `dispatch_pairs` at all — not a jammi leg, or the leg itself did not
+    run) or a `str` (P6 Stage B FA2 fold-in — the flash-disable-consistency
+    check below errored; `build_report` treats a `str` return the same as
+    `False`, see its own `proof is False or isinstance(proof, str)` branch).
+    Raises (via `dispatch_pairs`, which `metrics()` already calls before
+    this function ever sees `m` — see that function's own doc) if
+    `m["dispatch_pairs"]` would ever contain a base outside `ALL_BASES`;
     `fused_proof` itself never receives an unclassified base to begin with.
 
     Rules, in order — EVERY base in `ALL_BASES` (not just `REQUIRED_PAIRS`)
     must be PRESENT in this report's pairs; absence is a hard fail for
     every classified base, never a silently-granted exemption (F5: the
-    pre-fix code granted this exemption to every base except `ln`):
-      1. ANY pair with `eager > 0` is a hard, unconditional fail — an
+    pre-fix code granted this exemption to every base except `ln`), EXCEPT
+    `CASCADE_BASES` members, which are genuinely OPTIONAL (see that set's
+    own doc):
+      0. (P6 Stage B FA2 fold-in) `flash_compiled is False` AND
+         `kernels_disabled_requested` names `attention_block_flash` is a
+         hard, unconditional fail — a disable request naming an op this
+         BUILD never compiled in cannot possibly have exercised anything;
+         the leg's own build configuration already contradicts its own
+         disable request, before a single dispatch pair is even inspected.
+      1. ANY pair with a fallback count (`eager`, or a `CASCADE_BASES`
+         member's `declined`) `> 0` is a hard, unconditional fail — an
          admitted call site that actually fell back, on ANY pair, in ANY
-         group. Never exempted.
+         group — UNLESS that pair is a `CASCADE_BASES` member AND its base
+         appears in BOTH `kernels_disabled_requested` AND
+         `kernels_disabled_fired` on this SAME leg: a DELIBERATE,
+         self-describing disable request (the reference/block-arm leg of a
+         flash-vs-block A/B, `JAMMI_KERNELS_DISABLE=attention_block_flash`)
+         is not a silent fallback — it is the transparently-requested and
+         transparently-recorded way this crate forces the non-flash arm,
+         and the reference leg's OWN `attention_block` pair still has to
+         independently clear rule 2.5 below on its own `fused > 0`, so
+         nothing here grants it a free pass on the thing that actually
+         matters. An UNREQUESTED decline (a genuine domain/capability
+         miss — real padding, wrong arch, `flash-attn` not compiled) stays
+         a hard fail exactly like an ordinary silent eager fallback always
+         has (`report.rs`'s own `attention_block_flash_declined_dispatches`
+         field doc, contract v5 §3.8: "`declined > 0` on any bench leg ->
+         INVALID").
       2. Every `REQUIRED_PAIRS` base must be PRESENT in this report's pairs
          (a required pair vanishing from the JSON entirely — the field
          renamed, deleted, or feature-gated off — is exactly the schema
          regression this proof exists to catch, never silently excluded)
          AND show `fused > 0`.
+      2.5. Every `ABSORBABLE_BY_ATTENTION_BLOCK_FLASH` member (today, only
+         `attention_block`) must be PRESENT (same "absence is a fail" rule
+         as step 2), and may read `(0, 0)` ONLY when
+         `attention_block_flash`'s own `fused` count is `> 0` in this SAME
+         report (defaulting to `0` when that base is entirely absent —
+         i.e. every report `main`'s own binary produces today — so this
+         reduces to "must independently clear `fused > 0`" there, unchanged
+         from before this fold-in); otherwise it must independently clear
+         `fused > 0`.
       3. Every `ABSORBABLE_BY_ATTENTION_BLOCK` member must be PRESENT (same
          "absence is a fail" rule as step 2 — F5's fix), and may read
          `(0, 0)` ONLY when `attention_block`'s own `fused` count is `> 0`
-         in this SAME report; otherwise it must independently clear
-         `fused > 0`.
+         OR (P6 Stage B FA2 fold-in) `attention_block_flash`'s own `fused`
+         count is `> 0`, in this SAME report; otherwise it must
+         independently clear `fused > 0`.
       4. Every `LORA_SITE_EXCLUSIVE_GROUP` member must be PRESENT (same
          rule again), and the GROUP is then checked AS A GROUP: the SUM of
          their `fused` counts must be `> 0` (whichever member actually
          carries this run's dispatch — see the group's own doc).
       5. Overall: at least one pair ANYWHERE in the report must show
          `fused > 0` — a report where every single pair reads `(0, 0)`
-         (e.g. a schema regression that dropped every counter) is NOT
-         vacuously `True`. Steps 2/3/4 already make this true whenever
-         `REQUIRED_PAIRS` is non-empty, but this stays a distinct,
+         (e.g. a schema regression that dropped every counter, or a
+         flash-arm leg where the cascade itself never fired AND the block
+         arm it would otherwise have absorbed into also never fired) is
+         NOT vacuously `True`. Steps 2/2.5/3/4 already make this true
+         whenever `REQUIRED_PAIRS` is non-empty, but this stays a distinct,
          independently-stated check so the property holds even if
          `REQUIRED_PAIRS` were ever emptied.
     """
     if m is None:
         return None
+
+    # Rule 0 — see this function's own doc. Checked BEFORE `dispatch_pairs`
+    # is even inspected: a build/disable-request contradiction invalidates
+    # the leg regardless of what its counters happen to read.
+    if m.get("flash_compiled") is False and "attention_block_flash" in (m.get("kernels_disabled_requested") or []):
+        return (
+            "flash_compiled=False but kernels_disabled_requested names "
+            "'attention_block_flash' — a disable request against an op "
+            "this build never compiled in cannot have exercised anything; "
+            "this leg's own build configuration contradicts its own "
+            "disable request"
+        )
+
     pairs = m.get("dispatch_pairs")
     if not pairs:
         return False
-    by_base = {base: (fused, eager) for base, fused, eager in pairs}
+    by_base = {base: (fused, fallback) for base, fused, fallback in pairs}
 
-    if any(eager > 0 for _fused, eager in by_base.values()):
+    kernels_disabled_requested = set(m.get("kernels_disabled_requested") or [])
+    kernels_disabled_fired = set(m.get("kernels_disabled_fired") or [])
+    for base, (_fused, fallback) in by_base.items():
+        if fallback <= 0:
+            continue
+        if base in CASCADE_BASES and base in kernels_disabled_requested and base in kernels_disabled_fired:
+            continue  # rule 1: deliberate, self-describing disable request — not a silent fallback
         return False
 
     for base in REQUIRED_PAIRS:
         if base not in by_base:
             return False
-        fused, _eager = by_base[base]
+        fused, _fallback = by_base[base]
         if fused == 0:
             return False
 
+    attention_block_flash_fused = by_base.get("attention_block_flash", (0, 0))[0]
+    for base in ABSORBABLE_BY_ATTENTION_BLOCK_FLASH:
+        if base not in by_base:
+            return False  # F5: absence is a schema regression, never silently excluded
+        fused, _fallback = by_base[base]
+        if fused == 0 and attention_block_flash_fused == 0:
+            return False
+
     attention_block_fused = by_base.get("attention_block", (0, 0))[0]
+    attention_ran = attention_block_fused > 0 or attention_block_flash_fused > 0
     for base in ABSORBABLE_BY_ATTENTION_BLOCK:
         if base not in by_base:
             return False  # F5: absence is a schema regression, never silently excluded
-        fused, _eager = by_base[base]
-        if fused == 0 and attention_block_fused == 0:
+        fused, _fallback = by_base[base]
+        if fused == 0 and not attention_ran:
             return False
 
     for base in LORA_SITE_EXCLUSIVE_GROUP:
@@ -527,7 +731,7 @@ def fused_proof(m):
     if lora_group_fused == 0:
         return False
 
-    return any(fused > 0 for fused, _eager in by_base.values())
+    return any(fused > 0 for fused, _fallback in by_base.values())
 
 
 def fmt(v, nd=4):

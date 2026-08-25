@@ -6400,4 +6400,283 @@ mod tests {
             }
         ));
     }
+
+    /// A tiny SplitMix64-derived generator for a synthetic token-id batch,
+    /// self-contained (no cross-crate dependency on `jammi-bench`'s own
+    /// `synthetic_ids` — family L: generic/synthetic fixtures only) —
+    /// used solely by
+    /// `esc045_round4_per_layer_activation_gradient_dump` below.
+    #[cfg(feature = "cuda")]
+    fn round4_synthetic_ids(
+        batch: usize,
+        seq: usize,
+        vocab_size: usize,
+        seed: u64,
+        device: &Device,
+    ) -> Tensor {
+        let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
+        let ids: Vec<u32> = (0..batch * seq)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                ((state >> 33) as u32) % (vocab_size as u32)
+            })
+            .collect();
+        Tensor::from_vec(ids, (batch, seq), device).expect("build synthetic token-id batch")
+    }
+
+    /// esc-045 round 5 (GH #374): seeds ONE shared LoRA weights file (rank
+    /// 16 / alpha 32 / `target_modules=[Wqkv,Wo,Wi]` / `ZerosB` init, seed
+    /// `JAMMI_ROUND4_SEED` or `42`) and saves it via `VarMap::save`, so
+    /// every round-4/round-5 arm invocation below loads the SAME LoRA
+    /// starting point via `JAMMI_ROUND4_LORA_WEIGHTS_IN` (isolating each
+    /// arm's arithmetic as the only variable, exactly like round 4's own
+    /// shared-weights discipline — see that test's doc). A standalone tool
+    /// test, not a check on its own; SKIPS unless
+    /// `JAMMI_ROUND5_SEED_LORA_WEIGHTS_OUT` is set, mirroring
+    /// `esc045_round4_per_layer_activation_gradient_dump`'s own
+    /// no-committed-checkpoint skip convention.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn esc045_round5_seed_shared_lora_weights() {
+        let Ok(model_dir) = std::env::var("JAMMI_ROUND4_MODEL_DIR") else {
+            eprintln!(
+                "esc045_round5_seed_shared_lora_weights: skipping — JAMMI_ROUND4_MODEL_DIR not \
+                 set"
+            );
+            return;
+        };
+        let Ok(out_path) = std::env::var("JAMMI_ROUND5_SEED_LORA_WEIGHTS_OUT") else {
+            eprintln!(
+                "esc045_round5_seed_shared_lora_weights: skipping — \
+                 JAMMI_ROUND5_SEED_LORA_WEIGHTS_OUT not set"
+            );
+            return;
+        };
+        let seed: u64 = std::env::var("JAMMI_ROUND4_SEED")
+            .map(|v| v.parse().expect("JAMMI_ROUND4_SEED must parse as u64"))
+            .unwrap_or(42);
+
+        let device = Device::new_cuda(0).expect("esc-045 round 5 requires a CUDA device");
+        let dir = std::path::PathBuf::from(&model_dir);
+        let config: ModernBertConfig =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                .unwrap();
+        let weights = dir.join("model.safetensors");
+
+        let varmap = VarMap::new();
+        let target_modules = ["Wqkv".to_string(), "Wo".to_string(), "Wi".to_string()];
+        let rank_pattern = HashMap::new();
+        let lora = LoraBuildConfig {
+            target_modules: &target_modules,
+            layers_to_transform: &None,
+            lora_rank: 16,
+            lora_alpha: 32.0,
+            use_rslora: false,
+            lora_dropout: None,
+            rank_pattern: &rank_pattern,
+            init_mode: jammi_lora::LoraInitMode::ZerosB,
+            seed,
+        };
+        let _model = ModernBert::builder()
+            .pooling(Pooling::Mean)
+            .backbone_dtype(DType::BF16)
+            .lora(lora)
+            .build(&[weights.as_path()], &config, &device, &varmap)
+            .expect("build ModernBert-large with LoRA");
+        varmap
+            .save(&out_path)
+            .unwrap_or_else(|e| panic!("save shared LoRA weights to {out_path:?} failed: {e}"));
+        eprintln!("esc045_round5_seed_shared_lora_weights: wrote {out_path} (seed={seed})");
+    }
+
+    /// esc-045 round 4 (GH #374): per-layer ACTIVATION-gradient dump for
+    /// ONE arm, driving the REAL `ModernBert::forward_hidden` on a real
+    /// on-disk checkpoint with the REAL admission machinery
+    /// (`JAMMI_KERNELS_STRICT`/`JAMMI_KERNELS_DISABLE`, read from the
+    /// environment BEFORE this process starts — this test never calls
+    /// `std::env::set_var` on either, per
+    /// `jammi_kernels::admission`'s `OnceLock` contract). Writes a
+    /// `safetensors` file keyed `boundary.1..boundary.N`,
+    /// `qkv.0..qkv.{N-1}`, `mlp_input.0..mlp_input.{N-1}` (`N` =
+    /// `num_hidden_layers`; `boundary.0` is a documented gap — see
+    /// `activation_capture`'s module doc) — each value is `dL/d(that
+    /// activation)`, `F32`, at the exact shape the real forward produced
+    /// it, captured by a `GradTap` hook that fired during `backward()`
+    /// (see that module's doc for why a POST-`backward()` `GradStore`
+    /// read does not work here).
+    ///
+    /// `L = Σ hidden_final²` (a generic, consumer-free scalar — family
+    /// L) is the loss: this test's job is LOCALIZING where a bf16
+    /// fused-vs-eager gradient divergence enters the tape, not
+    /// reproducing the production triplet-hinge objective, and every
+    /// activation between the loss and layer 0 gets a nonzero gradient
+    /// under this loss regardless of hinge sparsity (round 3's own
+    /// finding: `hinge_active` is not actually a live confound, but this
+    /// loss sidesteps the question rather than re-litigating it).
+    ///
+    /// SKIPS (does not fail) unless `JAMMI_ROUND4_MODEL_DIR` is set — no
+    /// ModernBERT-large checkpoint is committed to this repo, so a
+    /// normal `cargo test -p jammi-encoders` run (this crate's
+    /// acceptance gate) stays green; the pod-only invocation sets the
+    /// env var explicitly, mirroring `growth_oracle_cuda_device`'s skip
+    /// convention above.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn esc045_round4_per_layer_activation_gradient_dump() {
+        let Ok(model_dir) = std::env::var("JAMMI_ROUND4_MODEL_DIR") else {
+            eprintln!(
+                "esc045_round4_per_layer_activation_gradient_dump: skipping — \
+                 JAMMI_ROUND4_MODEL_DIR not set"
+            );
+            return;
+        };
+        let out_path = std::env::var("JAMMI_ROUND4_OUT")
+            .expect("JAMMI_ROUND4_OUT must be set alongside JAMMI_ROUND4_MODEL_DIR");
+        let dtype = match std::env::var("JAMMI_ROUND4_DTYPE").as_deref() {
+            Ok("f32") => DType::F32,
+            Ok("bf16") | Err(_) => DType::BF16,
+            Ok(other) => panic!("JAMMI_ROUND4_DTYPE must be f32 or bf16, got {other:?}"),
+        };
+        let lora_weights_in = std::env::var("JAMMI_ROUND4_LORA_WEIGHTS_IN")
+            .expect("JAMMI_ROUND4_LORA_WEIGHTS_IN must be set");
+        let batch: usize = std::env::var("JAMMI_ROUND4_BATCH")
+            .map(|v| v.parse().expect("JAMMI_ROUND4_BATCH must parse as usize"))
+            .unwrap_or(4);
+        let seq: usize = std::env::var("JAMMI_ROUND4_SEQ")
+            .map(|v| v.parse().expect("JAMMI_ROUND4_SEQ must parse as usize"))
+            .unwrap_or(128);
+        let seed: u64 = std::env::var("JAMMI_ROUND4_SEED")
+            .map(|v| v.parse().expect("JAMMI_ROUND4_SEED must parse as u64"))
+            .unwrap_or(42);
+
+        let device = Device::new_cuda(0).expect("esc-045 round 4 requires a CUDA device");
+        let dir = std::path::PathBuf::from(&model_dir);
+        let config: ModernBertConfig =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                .unwrap();
+        let weights = dir.join("model.safetensors");
+
+        let mut varmap = VarMap::new();
+        let target_modules = ["Wqkv".to_string(), "Wo".to_string(), "Wi".to_string()];
+        let rank_pattern = HashMap::new();
+        let lora = LoraBuildConfig {
+            target_modules: &target_modules,
+            layers_to_transform: &None,
+            lora_rank: 16,
+            lora_alpha: 32.0,
+            use_rslora: false,
+            lora_dropout: None,
+            rank_pattern: &rank_pattern,
+            init_mode: jammi_lora::LoraInitMode::ZerosB,
+            seed,
+        };
+        let mut model = ModernBert::builder()
+            .pooling(Pooling::Mean)
+            .backbone_dtype(dtype)
+            .lora(lora)
+            .build(&[weights.as_path()], &config, &device, &varmap)
+            .expect("build ModernBert-large with LoRA");
+        model.set_training(true);
+
+        // The SAME shared LoRA weights file every other round-3/round-4 arm
+        // loads (see this round's hand-off) — overwrites the fresh seeded
+        // draw above so all three arms train from IDENTICAL LoRA A/B
+        // values, isolating the arm's arithmetic as the only variable.
+        varmap.load(&lora_weights_in).unwrap_or_else(|e| {
+            panic!(
+                "load shared LoRA weights {lora_weights_in:?} failed: {e} — names must match \
+                 rank=16/alpha=32/target_modules=[Wqkv,Wo,Wi] exactly"
+            )
+        });
+
+        let input_ids = round4_synthetic_ids(batch, seq, config.vocab_size, seed, &device);
+        let mask = Tensor::ones((batch, seq), DType::U32, &device).unwrap();
+
+        activation_capture::install();
+        let hidden = model.forward_hidden(&input_ids, &mask).unwrap();
+        let loss = hidden
+            .to_dtype(DType::F32)
+            .unwrap()
+            .sqr()
+            .unwrap()
+            .sum_all()
+            .unwrap();
+        let loss_val = loss.to_scalar::<f32>().unwrap();
+        assert!(loss_val.is_finite(), "loss must be finite before backward");
+
+        // The RETURNED `GradStore` is deliberately unused for capture — see
+        // `activation_capture`'s module doc for why reading it after the
+        // fact does not work for these tensors; every gradient below came
+        // from a `GradTap::bwd` side effect that already fired DURING this
+        // call.
+        let _ = loss.backward().unwrap();
+        let sink = activation_capture::take().expect("capture sink was installed above");
+
+        // `boundary.0` (the embedding-norm output, upstream of every LoRA
+        // `Var`) never fires its tap — see `activation_capture`'s module
+        // doc's "one PURELY-frozen exception". `boundary.1..=N`,
+        // `qkv.0..N-1`, `mlp_input.0..N-1` all fire (N =
+        // `num_hidden_layers`): every layer's `Wqkv`/`Wo`/`Wi` is LoRA-
+        // touched by this test's `target_modules`, so every one of those
+        // capture points sits on a path from the loss to a `Var`.
+        let n = config.num_hidden_layers;
+        assert!(
+            !sink.grads.contains_key("boundary.0"),
+            "boundary.0 unexpectedly captured — see activation_capture's module doc; if this \
+             now fires, the module doc's track_grad analysis needs updating, not this assertion \
+             silently relaxed"
+        );
+        for i in 1..=n {
+            assert!(
+                sink.grads.contains_key(&format!("boundary.{i}")),
+                "missing boundary.{i}"
+            );
+        }
+        for i in 0..n {
+            assert!(
+                sink.grads.contains_key(&format!("qkv.{i}")),
+                "missing qkv.{i}"
+            );
+            assert!(
+                sink.grads.contains_key(&format!("mlp_input.{i}")),
+                "missing mlp_input.{i}"
+            );
+        }
+        assert_eq!(
+            sink.grads.len(),
+            3 * n,
+            "expected exactly 3*num_hidden_layers captured gradients (boundary.1..=N, \
+             qkv.0..N-1, mlp_input.0..N-1)"
+        );
+
+        let mut out: HashMap<String, Tensor> = HashMap::new();
+        let mut nonzero_signal = false;
+        for (key, g) in sink.grads {
+            let g = g.to_dtype(DType::F32).unwrap();
+            let v: Vec<f32> = g.flatten_all().unwrap().to_vec1().unwrap();
+            assert!(
+                v.iter().all(|x| x.is_finite()),
+                "{key}: non-finite gradient"
+            );
+            nonzero_signal |= v.iter().any(|&x| x != 0.0);
+            out.insert(key, g);
+        }
+        assert!(
+            nonzero_signal,
+            "every captured gradient is exactly zero — backward() likely never reached the \
+             captured tensors"
+        );
+
+        candle_core::safetensors::save(&out, &out_path).expect("write round-4 dump");
+        eprintln!(
+            "esc045_round4_per_layer_activation_gradient_dump: wrote {} tensors to {out_path} \
+             (loss={loss_val}, dtype={dtype:?}, batch={batch}, seq={seq}, \
+             disabled_requested={:?}, disabled_fired={:?})",
+            out.len(),
+            jammi_kernels::admission::disabled_ops_requested(),
+            jammi_kernels::admission::disabled_ops_fired(),
+        );
+    }
 }

@@ -32,8 +32,9 @@
 use candle_core::{DType, Device, Error, Layout, Tensor, Var, D};
 use half::bf16;
 use jammi_kernels::ops::{
-    apply1, apply2, apply3, bwd_gradient_gemm_layouts, AttentionBlockFused, Axpy,
-    BwdGemmLayoutsParams, DropoutFused, DropoutKey, FullyMaskedPolicy, GegluFused, GeluVariant,
+    apply1, apply2, apply3, bwd_gradient_gemm_layouts, cast_add_bf16_into,
+    cast_scale_bf16_f32_into, AttentionBlockFused, Axpy, BwdGemmLayoutsParams, CastAddBf16,
+    CastScaleBf16F32, DropoutFused, DropoutKey, FullyMaskedPolicy, GegluFused, GeluVariant,
     LayerNormFused, LowRankResidualLinear, PhiloxKatProbe, RopeFused, ScaledCastAdd,
     SoftmaxLastDimFused, ATTENTION_BLOCK_WINDOW_MASKED_VALUE,
 };
@@ -3556,6 +3557,567 @@ fn lora_linear_parity_bf16_base_backward_production_width() {
     }
 }
 
+/// Cast-boundary lever Wave 1 (e)/(f) — `ops::cast_scale`'s
+/// `CastScaleBf16F32`/`CastAddBf16`, folded directly into
+/// `LowRankResidualLinear::bwd`'s B1/B3 sites (see that op's module doc).
+/// Zero dispatch is RED, never green (guide §3.5): this asserts the
+/// `DispatchCounters` for BOTH new op keys actually incremented `fused`
+/// (and recorded no `eager`) across a real CUDA `bf16`-base backward at
+/// PRODUCTION width — the same shape
+/// `lora_linear_parity_bf16_base_backward_production_width` above already
+/// proves numerically correct; this proves the fused kernels are the ones
+/// that ACTUALLY RAN, not merely that the math checks out via some other
+/// path. Snapshots the counters BEFORE and asserts on the DELTA, since
+/// `DispatchCounters` is process-wide (additive across every test in this
+/// binary) and `cargo test`'s default parallel-per-test-thread model means
+/// other tests sharing this process may have already incremented these
+/// same counters before this test's turn.
+#[test]
+fn lora_linear_bf16_base_backward_dispatches_the_fused_cast_boundary_kernels_on_cuda() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let (rows, inf, outf, r) = (256usize, 1024usize, 3072usize, 16usize);
+    let scale = 0.5f32;
+
+    let xv = fixture(rows * inf, 1.0);
+    let wv = fixture(outf * inf, 2.0);
+    let av = fixture(r * inf, 3.0);
+    let bv = fixture(outf * r, 4.0);
+    let x_bf16: Vec<bf16> = xv.iter().map(|&v| bf16::from_f32(v)).collect();
+    let w_bf16: Vec<bf16> = wv.iter().map(|&v| bf16::from_f32(v)).collect();
+
+    let cast_scale_counters = jammi_kernels::admission::counters_for("cast_scale_bf16_f32");
+    let cast_add_counters = jammi_kernels::admission::counters_for("cast_add_bf16");
+    let before_scale = cast_scale_counters.snapshot();
+    let before_add = cast_add_counters.snapshot();
+
+    let x_gpu =
+        Var::from_tensor(&Tensor::from_slice(&x_bf16, (rows, inf), &cuda).unwrap()).unwrap();
+    let w_gpu = Tensor::from_slice(&w_bf16, (outf, inf), &cuda).unwrap();
+    let a_gpu = Var::from_tensor(&Tensor::from_slice(&av, (r, inf), &cuda).unwrap()).unwrap();
+    let b_gpu = Var::from_tensor(&Tensor::from_slice(&bv, (outf, r), &cuda).unwrap()).unwrap();
+    let ab_gpu = pack_ab(a_gpu.as_tensor(), b_gpu.as_tensor()).unwrap();
+    let params = LoraLinearParams {
+        scale,
+        inf,
+        outf,
+        r,
+        dropout: None,
+        dweight_needed: false,
+    };
+    let out_gpu = lora_linear(x_gpu.as_tensor(), &w_gpu, &ab_gpu, params).unwrap();
+    let _grads_gpu = out_gpu.sum_all().unwrap().backward().unwrap();
+
+    let after_scale = cast_scale_counters.snapshot();
+    let after_add = cast_add_counters.snapshot();
+
+    assert!(
+        after_scale.fused > before_scale.fused,
+        "cast_scale_bf16_f32: fused dispatch did not increment (before {before_scale:?}, after \
+         {after_scale:?}) — zero dispatch is RED, never green"
+    );
+    assert_eq!(
+        after_scale.eager, before_scale.eager,
+        "cast_scale_bf16_f32: eager dispatch incremented unexpectedly on an unmodified \
+         JAMMI_KERNELS_DISABLE env (before {before_scale:?}, after {after_scale:?})"
+    );
+    assert!(
+        after_add.fused > before_add.fused,
+        "cast_add_bf16: fused dispatch did not increment (before {before_add:?}, after \
+         {after_add:?}) — zero dispatch is RED, never green"
+    );
+    assert_eq!(
+        after_add.eager, before_add.eager,
+        "cast_add_bf16: eager dispatch incremented unexpectedly on an unmodified \
+         JAMMI_KERNELS_DISABLE env (before {before_add:?}, after {after_add:?})"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Cast-boundary lever Wave 1 — DEVICE-SIDE oracles (phase-4 audit Block
+// 2). Before this, the CUDA arms of `CastScaleBf16F32`/`CastAddBf16`
+// (`src/cuda/cast_scale.rs:31,:57`) were exercised on device only by the
+// dispatch-counter delta test above, which proves the fused kernel RAN
+// but asserts nothing about the VALUE it produced — every genuinely
+// value-level oracle lived only in `ops/cast_scale.rs`'s CPU-only `#[cfg(
+// test)]` module. The five tests below close that gap directly against a
+// real CUDA device.
+
+/// A fixed, deterministic bf16 fixture (family J) carrying the boundary
+/// values the oracles below need alongside bulk sine-wave content: exact
+/// zero, negative zero (at two different indices, to catch an
+/// index-dependent bug), the smallest positive/negative subnormals,
+/// `f32::MIN_POSITIVE`, and the smallest positive/negative NORMAL bf16.
+/// Requires `n >= 8` (every call site below passes `n` in the thousands
+/// or millions).
+fn cast_boundary_fixture_bf16(n: usize) -> Vec<bf16> {
+    assert!(
+        n >= 8,
+        "cast_boundary_fixture_bf16 needs n >= 8 for its boundary slots"
+    );
+    let mut v: Vec<bf16> = (0..n)
+        .map(|i| bf16::from_f32(((i as f32) * 0.017).sin() * 6700.0))
+        .collect();
+    v[0] = bf16::from_f32(0.0);
+    v[1] = bf16::from_f32(-0.0);
+    v[2] = bf16::from_bits(0x0001); // smallest positive subnormal.
+    v[3] = bf16::from_bits(0x8001); // smallest negative subnormal.
+    v[4] = bf16::from_f32(f32::MIN_POSITIVE);
+    v[5] = bf16::from_bits(0x8000); // -0.0 again, a different index.
+    v[6] = bf16::from_bits(0x0080); // smallest positive normal bf16.
+    v[7] = bf16::from_bits(0x8080); // smallest negative normal bf16.
+    v
+}
+
+/// Block 2, leg (e) — `CastScaleBf16F32` vs candle's own two-kernel chain
+/// (`x.to_dtype(F32)` then `.affine(scale, 0.0)`), asserted with a REAL
+/// device-side value oracle, 0 mismatches required. Production width
+/// (guide §3.4): `m=12288, outf=3072`, B1's own census shape
+/// (`ops::cast_scale`'s module doc). Sweeps every scale this op's real
+/// caller passes (`alpha/rank`-shaped, non-power-of-two) plus an extreme
+/// `1e-30` to catch a naive-multiply underflow difference, and asserts
+/// `fused[-0.0]`'s bits are EXACTLY `0x00000000` for a positive scale —
+/// the signed-zero identity the `+ 0.0f` term exists for (`ops::
+/// cast_scale`'s module doc, "the `+0.0f` term is REQUIRED").
+#[test]
+fn cast_scale_bit_identical_to_the_eager_two_kernel_chain_on_cuda_across_scales() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let n = 12_288usize * 256; // B1's own census m·outf population.
+    let xv = cast_boundary_fixture_bf16(n);
+    let x = Tensor::from_slice(&xv, (n,), &cuda).unwrap();
+    for &scale in &[0.11048f64, 0.03125, 2.0, 1e-30, 3.0] {
+        let fused = apply1(&x, CastScaleBf16F32::new(scale))
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let eager = x
+            .to_dtype(DType::F32)
+            .unwrap()
+            .affine(scale, 0.0)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        // Finiteness-affirmative FIRST (guide §3.7): count non-finite
+        // elements in both arms before any bit comparison.
+        assert_eq!(
+            fused.iter().filter(|v| v.is_finite()).count(),
+            n,
+            "fused arm produced a non-finite element at scale={scale}"
+        );
+        assert_eq!(
+            eager.iter().filter(|v| v.is_finite()).count(),
+            n,
+            "eager arm produced a non-finite element at scale={scale}"
+        );
+        let mut mismatches = 0usize;
+        let mut first: Option<(usize, u32, u32)> = None;
+        for i in 0..n {
+            if fused[i].to_bits() != eager[i].to_bits() {
+                mismatches += 1;
+                if first.is_none() {
+                    first = Some((i, fused[i].to_bits(), eager[i].to_bits()));
+                }
+            }
+        }
+        assert_eq!(
+            mismatches, 0,
+            "cast_scale_bf16_f32 NOT bit-identical to the eager two-kernel chain at \
+             scale={scale}: {mismatches}/{n} mismatches, first={first:?}"
+        );
+        if scale > 0.0 {
+            assert_eq!(
+                fused[1].to_bits(),
+                0x0000_0000u32,
+                "the `+0.0f` term was optimised away: fused[-0.0] = {:#010x} at scale={scale}",
+                fused[1].to_bits()
+            );
+        }
+    }
+}
+
+/// Block 2, leg (f) — `CastAddBf16` vs candle's own two-kernel chain
+/// (`f32val.to_dtype(BF16)` then a real `Tensor::add`), with the
+/// accumulate-then-round RED control measured LIVE against this fixture
+/// (guide §3.7/§3.8, family F: a claimed guarantee is computed live and
+/// asserted, not merely printed) — diverges on ~16.5k of this production-
+/// width fixture's 1.57M elements. Production width: `m=12288, inf=1024`,
+/// B3's own census shape.
+#[test]
+fn cast_add_bit_identical_to_the_eager_two_kernel_chain_on_cuda_with_red_control() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let n = 12_288usize * 128; // B3's own census m·inf population.
+    let mut base_v: Vec<bf16> = (0..n)
+        .map(|i| bf16::from_f32(((i as f32) * 0.0131).cos() * 4.0))
+        .collect();
+    let mut f32_v: Vec<f32> = (0..n)
+        .map(|i| ((i as f32) * 0.00029).sin() * 0.03 + ((i % 97) as f32) * 1.0e-4)
+        .collect();
+    base_v[0] = bf16::from_f32(0.0);
+    base_v[1] = bf16::from_f32(-0.0);
+    base_v[2] = bf16::from_bits(0x0001);
+    f32_v[0] = -0.0;
+    f32_v[1] = -0.0;
+    f32_v[2] = f32::from_bits(1);
+    f32_v[3] = -f32::from_bits(1);
+    f32_v[4] = f32::MIN_POSITIVE;
+
+    let base = Tensor::from_slice(&base_v, (n,), &cuda).unwrap();
+    let f32val = Tensor::from_slice(&f32_v, (n,), &cuda).unwrap();
+
+    let fused = apply2(&base, &f32val, CastAddBf16::new())
+        .unwrap()
+        .to_vec1::<bf16>()
+        .unwrap();
+    let eager = (&base + &f32val.to_dtype(DType::BF16).unwrap())
+        .unwrap()
+        .to_vec1::<bf16>()
+        .unwrap();
+
+    // RED control: accumulate in f32 THEN round once (the WRONG order) —
+    // measured live against THIS fixture, not asserted on a hand-picked
+    // scalar alone.
+    let wrong: Vec<bf16> = base_v
+        .iter()
+        .zip(f32_v.iter())
+        .map(|(&b, &f)| bf16::from_f32(b.to_f32() + f))
+        .collect();
+    let wrong_diffs = (0..n)
+        .filter(|&i| wrong[i].to_bits() != eager[i].to_bits())
+        .count();
+    assert!(
+        wrong_diffs > 0,
+        "RED control is vacuous on this fixture: accumulate-then-round agrees with \
+         round-then-add everywhere — the oracle below would prove nothing (non-vacuity, \
+         guide §3.7/§3.8)"
+    );
+
+    let mut mismatches = 0usize;
+    let mut first: Option<(usize, u16, u16)> = None;
+    for i in 0..n {
+        if fused[i].to_bits() != eager[i].to_bits() {
+            mismatches += 1;
+            if first.is_none() {
+                first = Some((i, fused[i].to_bits(), eager[i].to_bits()));
+            }
+        }
+    }
+    assert_eq!(
+        mismatches, 0,
+        "cast_add_bf16 NOT bit-identical to the eager two-kernel chain: {mismatches}/{n} \
+         mismatches, first={first:?}"
+    );
+    let fused_wrong = (0..n)
+        .filter(|&i| fused[i].to_bits() != wrong[i].to_bits())
+        .count();
+    assert_eq!(
+        fused_wrong, wrong_diffs,
+        "fused arm must differ from the accumulate-then-round order at EXACTLY the same \
+         indices the correct (round-then-add) eager chain does"
+    );
+}
+
+/// Block 2 — a NARROWED (contiguous, nonzero `start_offset`) view is read
+/// correctly by both ops' CUDA arms (the `Layout::contiguous_offsets()`
+/// slice, not a hardcoded `0..n`), and a genuinely STRIDED (`.t()`) view
+/// is refused with the TYPED `Error::RequiresContiguous` — never silently
+/// misread, and never confused for a different error variant.
+#[test]
+fn cast_ops_nonzero_start_offset_and_noncontiguous_view_refused_on_cuda() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let n = 4096usize;
+    let xv = cast_boundary_fixture_bf16(n);
+    let x = Tensor::from_slice(&xv, (n,), &cuda).unwrap();
+
+    // Contiguous view with a NONZERO start offset.
+    let narrowed = x.narrow(0, 1000, 2048).unwrap();
+    assert!(narrowed.is_contiguous());
+    let fused = apply1(&narrowed, CastScaleBf16F32::new(0.11048))
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    let eager = narrowed
+        .to_dtype(DType::F32)
+        .unwrap()
+        .affine(0.11048, 0.0)
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    for i in 0..2048 {
+        assert_eq!(
+            fused[i].to_bits(),
+            eager[i].to_bits(),
+            "cast_scale_bf16_f32 narrowed (start_offset=1000) index {i}"
+        );
+    }
+
+    // Genuinely strided view: must REFUSE with the TYPED error, never
+    // silently misread.
+    let x2 = Tensor::from_slice(&xv[..64], (8, 8), &cuda)
+        .unwrap()
+        .t()
+        .unwrap();
+    assert!(!x2.is_contiguous());
+    let err = apply1(&x2, CastScaleBf16F32::new(1.0))
+        .expect_err("a strided (.t()) view must be refused on CUDA, not silently misread");
+    assert!(
+        matches!(err, Error::RequiresContiguous { .. }),
+        "expected Error::RequiresContiguous, got {err:?}"
+    );
+
+    // `cast_add_bf16` with a nonzero start offset on BOTH operands.
+    let base = Tensor::from_slice(&xv, (n,), &cuda)
+        .unwrap()
+        .narrow(0, 7, 1024)
+        .unwrap();
+    let fv: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.0021).sin() * 3.0).collect();
+    let f32val = Tensor::from_slice(&fv, (n,), &cuda)
+        .unwrap()
+        .narrow(0, 33, 1024)
+        .unwrap();
+    let fused = apply2(&base, &f32val, CastAddBf16::new())
+        .unwrap()
+        .to_vec1::<bf16>()
+        .unwrap();
+    let eager = (&base + &f32val.to_dtype(DType::BF16).unwrap())
+        .unwrap()
+        .to_vec1::<bf16>()
+        .unwrap();
+    for i in 0..1024 {
+        assert_eq!(
+            fused[i].to_bits(),
+            eager[i].to_bits(),
+            "cast_add_bf16 nonzero-start-offset index {i}"
+        );
+    }
+
+    // `cast_add_bf16`'s own strided refusal, mirroring `cast_scale`'s
+    // above (its CUDA arm checks `base`'s contiguity first).
+    let base_t = Tensor::from_slice(&xv[..64], (8, 8), &cuda)
+        .unwrap()
+        .t()
+        .unwrap();
+    let fv2 = Tensor::from_slice(&[0.0f32; 64], (8, 8), &cuda).unwrap();
+    let err2 = apply2(&base_t, &fv2, CastAddBf16::new())
+        .expect_err("a strided (.t()) base must be refused on CUDA, not silently misread");
+    assert!(
+        matches!(err2, Error::RequiresContiguous { .. }),
+        "expected Error::RequiresContiguous, got {err2:?}"
+    );
+}
+
+/// Block 2 — the launch-config boundary sweep both ops need alongside the
+/// bulk oracles above: `n=1024` exercises an EXACT multiple of the
+/// elementwise launch's block size, and `n=1023`/`1025`/`4097`/`65537`
+/// exercise a PARTIAL last block on either side of that boundary. `n=0`
+/// (the illegal `(0,1,1)` grid special case both ops' own CUDA glue
+/// avoids via `super::alloc_empty`) is asserted SEPARATELY below, against
+/// `elem_count() == 0` rather than candle's own eager `to_dtype`/`affine`/
+/// `Tensor::add` chain: candle's OWN CUDA cast kernel has no such guard
+/// and itself panics with `DriverError(CUDA_ERROR_INVALID_VALUE, "invalid
+/// argument")` on a 0-element input (confirmed live on device — a candle
+/// limitation on the REFERENCE side, not a defect in either op here), so
+/// it cannot serve as this sweep's eager comparator at `n=0`.
+#[test]
+fn cast_ops_n_sweep_partial_block_and_empty_on_cuda() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+
+    // n=0: candle's own eager `to_dtype`/`Tensor::add` cannot run on an
+    // empty CUDA tensor (see this test's own doc), so this asserts only
+    // that BOTH fused ops accept it and return a genuinely empty output —
+    // the illegal `(0, 1, 1)` launch grid this crate's own CUDA glue
+    // special-cases via `super::alloc_empty`.
+    let empty_bf16 = Tensor::from_slice(&[] as &[bf16], (0,), &cuda).unwrap();
+    let empty_f32 = Tensor::from_slice(&[] as &[f32], (0,), &cuda).unwrap();
+    let o1 = apply1(&empty_bf16, CastScaleBf16F32::new(2.0)).unwrap();
+    assert_eq!(
+        o1.elem_count(),
+        0,
+        "cast_scale_bf16_f32 n=0 must be a no-op, not an error"
+    );
+    let o2 = apply2(&empty_bf16, &empty_f32, CastAddBf16::new()).unwrap();
+    assert_eq!(
+        o2.elem_count(),
+        0,
+        "cast_add_bf16 n=0 must be a no-op, not an error"
+    );
+
+    for &n in &[1usize, 2, 1023, 1024, 1025, 4097, 65_537] {
+        let xv: Vec<bf16> = (0..n)
+            .map(|i| bf16::from_f32(((i as f32) * 0.37).sin() * 6700.0))
+            .collect();
+        let x = Tensor::from_slice(&xv, (n,), &cuda).unwrap();
+        let fused = apply1(&x, CastScaleBf16F32::new(0.11048))
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let eager = x
+            .to_dtype(DType::F32)
+            .unwrap()
+            .affine(0.11048, 0.0)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(
+            fused.len(),
+            n,
+            "cast_scale_bf16_f32 output length mismatch at n={n}"
+        );
+        for i in 0..n {
+            assert_eq!(
+                fused[i].to_bits(),
+                eager[i].to_bits(),
+                "cast_scale_bf16_f32 n={n} i={i}"
+            );
+        }
+
+        let fv: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.11).cos() * 3.0).collect();
+        let f32val = Tensor::from_slice(&fv, (n,), &cuda).unwrap();
+        let fa = apply2(&x, &f32val, CastAddBf16::new())
+            .unwrap()
+            .to_vec1::<bf16>()
+            .unwrap();
+        let ea = (&x + &f32val.to_dtype(DType::BF16).unwrap())
+            .unwrap()
+            .to_vec1::<bf16>()
+            .unwrap();
+        assert_eq!(fa.len(), n, "cast_add_bf16 output length mismatch at n={n}");
+        for i in 0..n {
+            assert_eq!(
+                fa[i].to_bits(),
+                ea[i].to_bits(),
+                "cast_add_bf16 n={n} i={i}"
+            );
+        }
+    }
+}
+
+/// Block 2 — `LowRankResidualLinear::bwd`'s REAL output (`dx`, at
+/// production width `rows=256, inf=1024, outf=3072, r=16`), fused vs the
+/// original two-kernel eager chain, bit-for-bit. `JAMMI_KERNELS_DISABLE`
+/// is read ONCE per process via a `OnceLock` (`admission.rs`'s own module
+/// doc), so proving fused-vs-eager byte-identity needs TWO process
+/// invocations of this SAME test binary (same build, matching this
+/// crate's own precedent for the identical constraint — see this file's
+/// `lora_linear_bf16_base_backward_dispatches_the_fused_cast_boundary_kernels_on_cuda`
+/// above, whose counter assertions this test reuses), not two branches
+/// inside one `#[test]`. Each invocation:
+///
+/// 1. Asserts the `DispatchCounters` delta for BOTH `cast_scale_bf16_f32`
+///    and `cast_add_bf16` matches whichever arm THIS invocation actually
+///    took — disable unset: `fused` increments, `eager` stays flat;
+///    `JAMMI_KERNELS_DISABLE=cast_scale_bf16_f32,cast_add_bf16` set:
+///    `eager` increments — proving the disable genuinely fired rather
+///    than silently matching nothing (guide §3.5, zero dispatch is RED).
+/// 2. Writes `dx`'s raw little-endian bit pattern to the file named by
+///    `JAMMI_CAST_BOUNDARY_DX_DUMP`, when set (skipped, not failed, when
+///    unset — this is not the default CI leg; the CI gate itself only
+///    needs this test's dispatch assertions, which run every time).
+///
+/// The byte-identity claim itself is proven by running this test twice
+/// (env unset, then the `DISABLE` env set) and `cmp -s`-ing the two dump
+/// files — see this unit's own committed CUDA-runs artifact for the
+/// actual command and result.
+#[test]
+fn lrrl_bwd_dx_fused_vs_disabled_cast_boundary_dump_and_dispatch_proof() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let (rows, inf, outf, r) = (256usize, 1024usize, 3072usize, 16usize);
+    let scale = 0.11048f32;
+    let xv = fixture(rows * inf, 1.0);
+    let wv = fixture(outf * inf, 2.0);
+    let av = fixture(r * inf, 3.0);
+    let bv = fixture(outf * r, 4.0);
+    let x_bf16: Vec<bf16> = xv.iter().map(|&v| bf16::from_f32(v)).collect();
+    let w_bf16: Vec<bf16> = wv.iter().map(|&v| bf16::from_f32(v)).collect();
+
+    let cast_scale_counters = jammi_kernels::admission::counters_for("cast_scale_bf16_f32");
+    let cast_add_counters = jammi_kernels::admission::counters_for("cast_add_bf16");
+    let before_scale = cast_scale_counters.snapshot();
+    let before_add = cast_add_counters.snapshot();
+
+    let x_gpu =
+        Var::from_tensor(&Tensor::from_slice(&x_bf16, (rows, inf), &cuda).unwrap()).unwrap();
+    let w_gpu = Tensor::from_slice(&w_bf16, (outf, inf), &cuda).unwrap();
+    let a_gpu = Var::from_tensor(&Tensor::from_slice(&av, (r, inf), &cuda).unwrap()).unwrap();
+    let b_gpu = Var::from_tensor(&Tensor::from_slice(&bv, (outf, r), &cuda).unwrap()).unwrap();
+    let ab_gpu = pack_ab(a_gpu.as_tensor(), b_gpu.as_tensor()).unwrap();
+    let params = LoraLinearParams {
+        scale,
+        inf,
+        outf,
+        r,
+        dropout: None,
+        dweight_needed: false,
+    };
+    let out = lora_linear(x_gpu.as_tensor(), &w_gpu, &ab_gpu, params).unwrap();
+    let grads = out.sum_all().unwrap().backward().unwrap();
+    let dx = grads
+        .get(x_gpu.as_tensor())
+        .expect("dx must be populated")
+        .to_vec2::<bf16>()
+        .unwrap();
+
+    let after_scale = cast_scale_counters.snapshot();
+    let after_add = cast_add_counters.snapshot();
+    let disabled: std::collections::HashSet<String> = std::env::var("JAMMI_KERNELS_DISABLE")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if disabled.contains("cast_scale_bf16_f32") {
+        assert!(
+            after_scale.eager > before_scale.eager,
+            "JAMMI_KERNELS_DISABLE named cast_scale_bf16_f32 but it never dispatched eager — \
+             the disable did not fire (before {before_scale:?}, after {after_scale:?})"
+        );
+    } else {
+        assert!(
+            after_scale.fused > before_scale.fused,
+            "cast_scale_bf16_f32: zero dispatch is RED, never green (before {before_scale:?}, \
+             after {after_scale:?})"
+        );
+    }
+    if disabled.contains("cast_add_bf16") {
+        assert!(
+            after_add.eager > before_add.eager,
+            "JAMMI_KERNELS_DISABLE named cast_add_bf16 but it never dispatched eager — the \
+             disable did not fire (before {before_add:?}, after {after_add:?})"
+        );
+    } else {
+        assert!(
+            after_add.fused > before_add.fused,
+            "cast_add_bf16: zero dispatch is RED, never green (before {before_add:?}, after \
+             {after_add:?})"
+        );
+    }
+
+    let mut bytes = Vec::with_capacity(rows * inf * 2);
+    for row in &dx {
+        for v in row {
+            bytes.extend_from_slice(&v.to_bits().to_le_bytes());
+        }
+    }
+    if let Some(path) = std::env::var_os("JAMMI_CAST_BOUNDARY_DX_DUMP") {
+        std::fs::write(std::path::Path::new(&path), &bytes)
+            .expect("failed to write the dx dump file");
+        println!(
+            "lrrl_bwd_dx_fused_vs_disabled: wrote {} bytes of dx bits to {path:?}",
+            bytes.len()
+        );
+    }
+}
+
 /// The bit-exact counterpart the loose, DERIVED tolerance above cannot
 /// stand in for: [`lora_linear_parity_tolerance`]'s bound is sized to
 /// catch a real bug (an error on the order of a single term's own
@@ -5348,4 +5910,338 @@ fn attention_block_bf16_three_way_vs_f32_reference_b1_and_b8_cuda() {
     // validated-coverage ceiling" section).
     three_way_vs_f32_reference(&cuda, 1, 512, 16, 64, Some(64), 40.0, 12.0);
     three_way_vs_f32_reference(&cuda, 8, 512, 16, 64, Some(64), 40.0, 12.0);
+}
+
+// ---------------------------------------------------------------------
+// Shared isolated-kernel-timing harness (guide §4). EVERY
+// `isolated_kernel_timing_*` test in this file (and every future one —
+// FA2, AdamW, ...) calls [`time_kernel`] rather than hand-rolling its own
+// warm-up/sync/sample loop, so the defect below cannot recur by
+// copy-paste.
+
+/// Timing statistics from [`time_kernel`]. `min_ms`/`median_ms` are
+/// computed with a fixed fold order (family J): sorted with
+/// `f64::total_cmp` (never a NaN-unstable `partial_cmp` sort), median
+/// averaging the two middle samples on an even count rather than picking
+/// one arbitrarily.
+struct TimingStats {
+    min_ms: f64,
+    median_ms: f64,
+    iters: u32,
+    warmups: u32,
+}
+
+/// Isolated-kernel-timing harness every `isolated_kernel_timing_*` test in
+/// this file shares — extracted so the Cast-boundary Wave 1 timing defect
+/// (phase-4 audit Block 1) cannot recur by copy-paste in a future timing
+/// test. THE DEFECT: the original `isolated_kernel_timing_cast_boundary_
+/// wave1` batched 50 launches under ONE trailing `synchronize()`, with a
+/// fresh `device.alloc::<f32>(n)` (a 151 MB output buffer) allocated
+/// INSIDE the timed region on every one of those 50 calls — a re-run on
+/// an otherwise-idle box found a **2.35x spread** across repeats (0.273 /
+/// 0.619 / 0.641 / 0.321 ms), an artifact of that batching/allocator
+/// interaction, not the kernel's own cost.
+///
+/// `prealloc` runs ONCE, before any timing, to build the reusable `State`
+/// (e.g. the input tensor(s)) — nothing the timed region needs to
+/// allocate. `launch` runs once per warm-up AND once per timed iteration,
+/// taking `&mut State` so it can only read/reuse what `prealloc` already
+/// built, never allocate a fresh INPUT, by construction. The kernel
+/// call's own OUTPUT-buffer allocation still happens inside `launch`
+/// every call (`apply1`/`apply2` have no output-buffer-reuse entry point
+/// in this crate's public surface) — that is real device work this
+/// harness intentionally measures, not an artifact to hide. Every
+/// iteration, warm-ups included, is bracketed by its OWN
+/// `Device::synchronize()`: batching N launches under one trailing sync
+/// is exactly what this harness makes structurally impossible to
+/// reintroduce. `nsys` was unavailable/broken on the pod image this first
+/// ran on (`nsys --version` errors "hasn't been installed with CUDA
+/// Toolkit 12.6"), so this is wall-clock, including per-launch CPU-side
+/// dispatch overhead, not a device-side-only `nsys` timeline — every
+/// caller's own `println!` should state that rather than imply
+/// kernel-only cost.
+fn time_kernel<S>(
+    cuda: &Device,
+    warmups: u32,
+    iters: u32,
+    prealloc: impl FnOnce() -> S,
+    mut launch: impl FnMut(&mut S),
+) -> TimingStats {
+    assert!(iters > 0, "time_kernel needs at least one timed iteration");
+    let mut state = prealloc();
+    for _ in 0..warmups {
+        launch(&mut state);
+        cuda.synchronize().unwrap();
+    }
+    let mut samples_ms = Vec::with_capacity(iters as usize);
+    for _ in 0..iters {
+        let start = std::time::Instant::now();
+        launch(&mut state);
+        cuda.synchronize().unwrap();
+        samples_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+    samples_ms.sort_by(f64::total_cmp);
+    let min_ms = samples_ms[0];
+    let mid = samples_ms.len() / 2;
+    let median_ms = if samples_ms.len() % 2 == 0 {
+        (samples_ms[mid - 1] + samples_ms[mid]) / 2.0
+    } else {
+        samples_ms[mid]
+    };
+    TimingStats {
+        min_ms,
+        median_ms,
+        iters,
+        warmups,
+    }
+}
+
+/// Prints one [`TimingStats`] line in the shared format both legs below
+/// use, labelled with which of the two paths it measured — `label` is
+/// `"kernel-only (preallocated output)"` or `"wrapper (apply1/apply2,
+/// includes a fresh output alloc every call)"`, never left implicit,
+/// since the whole point of measuring both is that they are NOT the same
+/// number (see this file's own module doc on the cast-boundary Wave 1
+/// section for the magnitude — cudarc has no caching allocator, so a
+/// 151 MB `cuMemAlloc`/`cuMemFree` pair dominates `cast_scale_bf16_f32`'s
+/// wrapper number).
+fn print_timing_stats(
+    op: &str,
+    shape: &str,
+    elems: usize,
+    bytes_per_elem: f64,
+    label: &str,
+    stats: &TimingStats,
+) {
+    let bytes = elems as f64 * bytes_per_elem;
+    let gb_min = bytes / (stats.min_ms / 1000.0) / 1e9;
+    let gb_median = bytes / (stats.median_ms / 1000.0) / 1e9;
+    println!(
+        "{op} [{label}]: {shape} elems={elems} min {:.4} ms ({gb_min:.1} GB/s, {:.2}% of 2039 \
+         GB/s SXM4 roofline)  median {:.4} ms ({gb_median:.1} GB/s, {:.2}%)  [{} iters after {} \
+         warm-ups, per-iteration synchronize, wall-clock]",
+        stats.min_ms,
+        100.0 * gb_min / 2039.0,
+        stats.median_ms,
+        100.0 * gb_median / 2039.0,
+        stats.iters,
+        stats.warmups
+    );
+}
+
+// ---------------------------------------------------------------------
+// Cast-boundary lever Wave 1 — ISOLATED kernel timing (guide §4), on
+// [`time_kernel`] above. `cargo test --features cuda --test cuda_parity
+// -- --ignored --nocapture isolated_kernel_timing_cast_boundary_wave1` on
+// an EXCLUSIVE box (check `nvidia-smi` first — co-tenancy inflates
+// wall-clock launch time, not just kernel occupancy). Reports BOTH min
+// and median over >= 200 iterations after >= 20 warm-ups (guide's
+// Block-1 fix instruction) — see [`time_kernel`]'s own doc for the
+// batching defect this replaced and the 2.35x-spread number that proved
+// it.
+//
+// SECOND FORM (post-lead-review): the FIRST fix (per-iteration sync,
+// min+median) was necessary but not sufficient — a clean, exclusive-box
+// re-run of that fixed harness (both on a100d and on a100b) still showed
+// `cast_scale_bf16_f32` at ~2.1 ms (5.2% roofline), not the 53% this
+// file's own earlier revision reported. Root cause, found by the lead:
+// `apply1` allocates its 151 MB `f32` OUTPUT storage inside `launch`
+// EVERY iteration (`device.alloc::<f32>(n)`, `src/cuda/cast_scale.rs`),
+// and cudarc has NO caching allocator — a fresh `cuMemAlloc` + the
+// matching `cuMemFree` when the returned `Tensor` drops at the end of
+// each iteration is a genuine ~2 ms of device-driver work, not a
+// measurement artifact. `cast_add_bf16`'s 25 MB output pays far less of
+// this tax, which is why ITS number was already accurate. This test now
+// measures and reports BOTH numbers for both ops, explicitly labelled:
+// the WRAPPER number (`apply1`/`apply2`, what a real caller pays, alloc
+// included) and the KERNEL-ONLY number (`cast_scale_bf16_f32_into`/
+// `cast_add_bf16_into`, `ops/cast_scale.rs`'s `#[doc(hidden)]`
+// preallocated-output entry points — the SAME kernel, writing into a
+// `Tensor` allocated ONCE outside the timed loop).
+#[test]
+#[ignore]
+fn isolated_kernel_timing_cast_boundary_wave1() {
+    let Some(cuda) = cuda_device() else {
+        eprintln!("isolated_kernel_timing: skipping — no CUDA device available");
+        return;
+    };
+
+    const N_WARMUP: u32 = 20;
+    const N_ITERS: u32 = 200;
+
+    // (e) B1's own shape at the census's m/outf: the Wqkv site's
+    // Σout-sized population, m = 12288 (b8-s512 batched-forward), outf =
+    // 3072.
+    let (m_e, outf_e) = (12_288usize, 3_072usize);
+    let scale = 0.03125_f64; // alpha/rank-shaped (e.g. alpha=32/rank=... ).
+    let cast_scale_op = CastScaleBf16F32::new(scale);
+    let shape_e = format!("m={m_e} outf={outf_e}");
+
+    // Correctness FIRST (family F: a claimed number is measured AND
+    // asserted, never assumed) — the preallocated-output path must be
+    // bit-identical to `apply1`'s own output before its timing means
+    // anything.
+    {
+        let grad_res_v: Vec<bf16> = (0..m_e * outf_e)
+            .map(|i| bf16::from_f32(((i as f32) * 0.0001).sin() * 5000.0))
+            .collect();
+        let grad_res = Tensor::from_slice(&grad_res_v, (m_e, outf_e), &cuda).unwrap();
+        let expected = apply1(&grad_res, cast_scale_op)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let out = Tensor::zeros((m_e, outf_e), DType::F32, &cuda).unwrap();
+        cast_scale_bf16_f32_into(&grad_res, scale, &out).unwrap();
+        let got = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for i in 0..m_e * outf_e {
+            assert_eq!(
+                got[i].to_bits(),
+                expected[i].to_bits(),
+                "cast_scale_bf16_f32_into (preallocated-output path) diverged from apply1 at \
+                 index {i} — the kernel-only timing below would be measuring the wrong kernel"
+            );
+        }
+    }
+
+    let stats_e_wrapper = time_kernel(
+        &cuda,
+        N_WARMUP,
+        N_ITERS,
+        || {
+            let grad_res_v: Vec<bf16> = (0..m_e * outf_e)
+                .map(|i| bf16::from_f32(((i as f32) * 0.0001).sin() * 5000.0))
+                .collect();
+            Tensor::from_slice(&grad_res_v, (m_e, outf_e), &cuda).unwrap()
+        },
+        |grad_res: &mut Tensor| {
+            let _ = apply1(grad_res, cast_scale_op).unwrap();
+        },
+    );
+    let stats_e_kernel_only = time_kernel(
+        &cuda,
+        N_WARMUP,
+        N_ITERS,
+        || {
+            let grad_res_v: Vec<bf16> = (0..m_e * outf_e)
+                .map(|i| bf16::from_f32(((i as f32) * 0.0001).sin() * 5000.0))
+                .collect();
+            let grad_res = Tensor::from_slice(&grad_res_v, (m_e, outf_e), &cuda).unwrap();
+            let out = Tensor::zeros((m_e, outf_e), DType::F32, &cuda).unwrap();
+            (grad_res, out)
+        },
+        |(grad_res, out): &mut (Tensor, Tensor)| {
+            cast_scale_bf16_f32_into(grad_res, scale, out).unwrap();
+        },
+    );
+    // Traffic: read bf16 (2B) + write f32 (4B) per element (ops::cast_scale's
+    // own module doc).
+    print_timing_stats(
+        "cast_scale_bf16_f32",
+        &shape_e,
+        m_e * outf_e,
+        6.0,
+        "wrapper (apply1, includes a fresh 151 MB output alloc every call)",
+        &stats_e_wrapper,
+    );
+    print_timing_stats(
+        "cast_scale_bf16_f32",
+        &shape_e,
+        m_e * outf_e,
+        6.0,
+        "kernel-only (preallocated output)",
+        &stats_e_kernel_only,
+    );
+
+    // (f) B3's own shape at the census's m/inf: the Wqkv site's Σin-sized
+    // population, m = 12288, inf = 1024.
+    let (m_f, inf_f) = (12_288usize, 1_024usize);
+    let cast_add_op = CastAddBf16::new();
+    let shape_f = format!("m={m_f} inf={inf_f}");
+
+    {
+        let base_v: Vec<bf16> = (0..m_f * inf_f)
+            .map(|i| bf16::from_f32(((i as f32) * 0.00013).cos() * 4000.0))
+            .collect();
+        let f32val_v: Vec<f32> = (0..m_f * inf_f)
+            .map(|i| ((i as f32) * 0.00029).sin() * 30.0)
+            .collect();
+        let base = Tensor::from_slice(&base_v, (m_f, inf_f), &cuda).unwrap();
+        let f32val = Tensor::from_slice(&f32val_v, (m_f, inf_f), &cuda).unwrap();
+        let expected = apply2(&base, &f32val, cast_add_op)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<bf16>()
+            .unwrap();
+        let out = Tensor::zeros((m_f, inf_f), DType::BF16, &cuda).unwrap();
+        cast_add_bf16_into(&base, &f32val, &out).unwrap();
+        let got = out.flatten_all().unwrap().to_vec1::<bf16>().unwrap();
+        for i in 0..m_f * inf_f {
+            assert_eq!(
+                got[i].to_bits(),
+                expected[i].to_bits(),
+                "cast_add_bf16_into (preallocated-output path) diverged from apply2 at index \
+                 {i} — the kernel-only timing below would be measuring the wrong kernel"
+            );
+        }
+    }
+
+    let stats_f_wrapper = time_kernel(
+        &cuda,
+        N_WARMUP,
+        N_ITERS,
+        || {
+            let base_v: Vec<bf16> = (0..m_f * inf_f)
+                .map(|i| bf16::from_f32(((i as f32) * 0.00013).cos() * 4000.0))
+                .collect();
+            let f32val_v: Vec<f32> = (0..m_f * inf_f)
+                .map(|i| ((i as f32) * 0.00029).sin() * 30.0)
+                .collect();
+            let base = Tensor::from_slice(&base_v, (m_f, inf_f), &cuda).unwrap();
+            let f32val = Tensor::from_slice(&f32val_v, (m_f, inf_f), &cuda).unwrap();
+            (base, f32val)
+        },
+        |(base, f32val): &mut (Tensor, Tensor)| {
+            let _ = apply2(base, f32val, cast_add_op).unwrap();
+        },
+    );
+    let stats_f_kernel_only = time_kernel(
+        &cuda,
+        N_WARMUP,
+        N_ITERS,
+        || {
+            let base_v: Vec<bf16> = (0..m_f * inf_f)
+                .map(|i| bf16::from_f32(((i as f32) * 0.00013).cos() * 4000.0))
+                .collect();
+            let f32val_v: Vec<f32> = (0..m_f * inf_f)
+                .map(|i| ((i as f32) * 0.00029).sin() * 30.0)
+                .collect();
+            let base = Tensor::from_slice(&base_v, (m_f, inf_f), &cuda).unwrap();
+            let f32val = Tensor::from_slice(&f32val_v, (m_f, inf_f), &cuda).unwrap();
+            let out = Tensor::zeros((m_f, inf_f), DType::BF16, &cuda).unwrap();
+            (base, f32val, out)
+        },
+        |(base, f32val, out): &mut (Tensor, Tensor, Tensor)| {
+            cast_add_bf16_into(base, f32val, out).unwrap();
+        },
+    );
+    // Traffic: read f32 (4B) + read bf16 (2B) + write bf16 (2B) per element.
+    print_timing_stats(
+        "cast_add_bf16",
+        &shape_f,
+        m_f * inf_f,
+        8.0,
+        "wrapper (apply2, includes a fresh 25 MB output alloc every call)",
+        &stats_f_wrapper,
+    );
+    print_timing_stats(
+        "cast_add_bf16",
+        &shape_f,
+        m_f * inf_f,
+        8.0,
+        "kernel-only (preallocated output)",
+        &stats_f_kernel_only,
+    );
 }

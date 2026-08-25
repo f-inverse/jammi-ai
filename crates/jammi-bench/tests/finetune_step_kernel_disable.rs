@@ -449,3 +449,128 @@ fn dropped_disable_var_is_distinguishable_from_a_genuine_forced_eager_run() {
         genuine_tier["kernels_disabled_requested"]
     );
 }
+
+/// K-aux round-2 advisory: `--expect-kernels-disabled` turns the SAME
+/// dropped-var failure mode `dropped_disable_var_is_distinguishable_from_a_
+/// genuine_forced_eager_run` above proves is DISTINGUISHABLE (by comparing
+/// two runs' JSON reports after the fact) into something the run ITSELF
+/// hard-errors on, on a single invocation: the binary controls its own
+/// argv, so naming the intended disable set there closes the gap between
+/// "what the caller meant to request" and "what this process's real
+/// environment actually carried" without a human eyeballing the report.
+#[test]
+fn expect_kernels_disabled_hard_errors_when_the_env_var_was_dropped() {
+    let dir = model_dir();
+
+    // Simulates the dropped var exactly like the sibling test above (a
+    // var-NAME typo), but this time the caller ALSO states its intent on
+    // the command line via `--expect-kernels-disabled`.
+    let output = base_command(&dir)
+        .args(["--expect-kernels-disabled", "attention_block_fused"])
+        .env_remove("JAMMI_KERNELS_DISABLE")
+        .env("JAMMI_KERNEL_DISABLE", "attention_block_fused") // NOTE: missing the `S`
+        .output()
+        .expect("spawn jammi-bench finetune-step");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a dropped JAMMI_KERNELS_DISABLE must hard-fail when --expect-kernels-disabled named \
+         the intended set — stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("attention_block_fused") && stderr.contains("--expect-kernels-disabled"),
+        "the failure must name both the expectation and what this process actually saw — \
+         stderr={stderr}"
+    );
+    assert!(
+        !stdout.contains("finetune_step"),
+        "an INVALID run printed a JSON tier on stdout — stdout={stdout}"
+    );
+}
+
+/// The positive control: the SAME `--expect-kernels-disabled` value,
+/// paired with the CORRECTLY-named env var, must succeed exactly like the
+/// ordinary genuine forced-eager run — proving the flag does not reject a
+/// run that actually matches its own stated intent.
+#[test]
+fn expect_kernels_disabled_matches_a_genuine_correctly_forwarded_run() {
+    let dir = model_dir();
+    let output = base_command(&dir)
+        .args(["--expect-kernels-disabled", "attention_block_fused"])
+        .env("JAMMI_KERNELS_DISABLE", "attention_block_fused")
+        .output()
+        .expect("spawn jammi-bench finetune-step");
+
+    assert!(
+        output.status.success(),
+        "a correctly-forwarded env var matching --expect-kernels-disabled must succeed — \
+         stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let report: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("invalid JSON report: {e}\n{stdout}"));
+    let tier = &report["tiers"]["finetune_step"];
+    assert_eq!(
+        tier["kernels_disabled_requested"],
+        serde_json::json!(["attention_block_fused"]),
+        "tier={tier}"
+    );
+}
+
+/// Round-3 audit fix: `--expect-kernels-disabled` used to hand-roll its own
+/// comma-split parser (a `Vec`, no dedup) instead of routing through
+/// `jammi_kernels::admission::parse_disable_list` (a `HashSet`) the way a
+/// genuine `JAMMI_KERNELS_DISABLE` read does — so a VALID leg naming the
+/// same two ops on both sides, with a duplicate entry and a DIFFERENT
+/// comma-order on each side, hard-failed blaming a dropped env var that
+/// was never dropped (`disabled_ops_requested()`'s deduplicated two-entry
+/// list never equalled the duplicate-preserving four-entry list the old
+/// parser produced). Both `JAMMI_KERNELS_DISABLE` (two real ops, WITH a
+/// duplicate, in one order) and `--expect-kernels-disabled` (the SAME two
+/// ops, WITH a duplicate, in the REVERSED order) must now resolve to the
+/// identical two-entry SET regardless: this must succeed, and
+/// `kernels_disabled_requested` must equal `kernels_disabled_fired`
+/// (both ops are real and dispatch on this fixture, so nothing is
+/// unmatched either).
+#[test]
+fn expect_kernels_disabled_tolerates_duplicates_and_reordering_like_the_real_env_var_does() {
+    let dir = model_dir();
+    let output = base_command(&dir)
+        .args([
+            "--expect-kernels-disabled",
+            "attention_block_fused,layer_norm_fused,attention_block_fused",
+        ])
+        .env(
+            "JAMMI_KERNELS_DISABLE",
+            "layer_norm_fused,attention_block_fused,layer_norm_fused",
+        )
+        .output()
+        .expect("spawn jammi-bench finetune-step");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "a duplicate entry and reversed comma-order on either side must not change what SET \
+         of ops was requested — stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("invalid JSON report: {e}\n{stdout}"));
+    let tier = &report["tiers"]["finetune_step"];
+    let expected = serde_json::json!(["attention_block_fused", "layer_norm_fused"]);
+    assert_eq!(tier["kernels_disabled_requested"], expected, "tier={tier}");
+    assert_eq!(
+        tier["kernels_disabled_requested"], tier["kernels_disabled_fired"],
+        "both named ops are real and dispatch on this fixture — nothing should be unmatched; \
+         tier={tier}"
+    );
+    assert_eq!(tier["ln_fused_dispatches"].as_u64(), Some(0), "tier={tier}");
+    assert_eq!(
+        tier["attention_block_fused_dispatches"].as_u64(),
+        Some(0),
+        "tier={tier}"
+    );
+}

@@ -28,7 +28,7 @@
 //! forward AND backward.
 #![cfg(feature = "cuda")]
 
-use candle_core::{DType, Device, Tensor, Var, D};
+use candle_core::{DType, Device, Error, Tensor, Var, D};
 use half::bf16;
 use jammi_kernels::ops::{
     apply1, apply2, apply3, AttentionBlockFused, Axpy, DropoutFused, DropoutKey, FullyMaskedPolicy,
@@ -4197,4 +4197,439 @@ fn attention_block_diag_bf16_fused_bit_exact_vs_eager_cuda() {
          divergence in the fused kernel's call site, not the fixture's score magnitude \
          (unlike a tolerance bound, exact equality has no domain to be out of)"
     );
+}
+
+// -----------------------------------------------------------------------
+// Audit B4: a transposed-view `rope_pack` is refused on CUDA, matching
+// `attention_block::tests::transposed_view_rope_pack_is_refused_not_
+// silently_misread`'s CPU proof exactly — `cuda_fwd`'s `cos_l`/`sin_l`
+// derivation assumes `rope_pack` is contiguous from its own start offset
+// (`sin`'s offset is `l2.start_offset() + s_max * d`), which is unsound
+// for a narrowed/transposed view without the `l2.contiguous_offsets()`
+// check `cuda_fwd` now applies before that derivation.
+#[test]
+fn attention_block_transposed_rope_pack_is_refused_on_cuda_too() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let (batch, seq, heads, head_dim) = (1usize, 3usize, 1usize, 64usize);
+    let qkv_v = qkv_fixture(batch, seq, heads, head_dim, 5.0);
+    let qkv = Tensor::from_slice(&qkv_v, (batch, seq, 3, heads, head_dim), &cuda).unwrap();
+    let mask = Tensor::from_slice(&vec![0f32; batch * seq], (batch, 1, 1, seq), &cuda).unwrap();
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let op = AttentionBlockFused::new(scale, FullyMaskedPolicy::Zeros, true).unwrap();
+
+    // Built `[2, 1, 1, head_dim, seq]` then transposed to the CORRECT
+    // shape `[2, 1, 1, seq, head_dim]` but non-contiguous.
+    let big = Tensor::zeros((2, 1, 1, head_dim, seq), DType::F32, &cuda).unwrap();
+    let rope_pack = big.transpose(3, 4).unwrap();
+    assert!(!rope_pack.is_contiguous());
+    assert_eq!(rope_pack.dims(), &[2, 1, 1, seq, head_dim]);
+
+    let err = qkv
+        .apply_op3(&rope_pack, &mask, op)
+        .expect_err("a transposed-view rope_pack must be refused on CUDA too");
+    assert!(matches!(err, Error::RequiresContiguous { .. }));
+}
+
+// -----------------------------------------------------------------------
+// Audit B2: a `[batch, 1, 1, seq]` mask whose padding length differs PER
+// BATCH ELEMENT (a bug hardcoding `mrow_base = 0` regardless of which
+// batch row is being read would silently broadcast batch element 0's
+// mask onto every other batch element, and every other test fixture in
+// this file uses a UNIFORM mask across batch, which cannot catch that) —
+// on the CUDA arm.
+#[test]
+fn attention_block_per_batch_mask_row_indexing_is_not_hardcoded_to_zero_on_cuda() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let cpu = Device::Cpu;
+    let (batch, seq, heads, head_dim) = (3usize, 6usize, 2usize, 64usize);
+    let qkv_v = qkv_fixture(batch, seq, heads, head_dim, 6.0);
+    let rope_v = attention_rope_pack(seq, head_dim);
+    // A DIFFERENT pad length per batch element: batch 0 pads its last 0
+    // keys (fully real), batch 1 pads its last 2, batch 2 pads its last 4
+    // — a hardcoded `mrow_base = 0` would apply batch 0's (all-zero) row
+    // to every batch element, silently attending to padding everywhere.
+    let mut mask_v = vec![0f32; batch * seq];
+    for (bi, pad_len) in [0usize, 2, 4].into_iter().enumerate() {
+        for ki in (seq - pad_len)..seq {
+            mask_v[bi * seq + ki] = -10_000.0;
+        }
+    }
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let op = AttentionBlockFused::new(scale, FullyMaskedPolicy::Zeros, true).unwrap();
+
+    let qkv_cpu = Tensor::from_slice(&qkv_v, (batch, seq, 3, heads, head_dim), &cpu).unwrap();
+    let rope_cpu = Tensor::from_slice(&rope_v, (2, 1, 1, seq, head_dim), &cpu).unwrap();
+    let mask_cpu = Tensor::from_slice(&mask_v, (batch, 1, 1, seq), &cpu).unwrap();
+    let out_cpu: Vec<f32> = qkv_cpu
+        .apply_op3(&rope_cpu, &mask_cpu, op)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    let qkv_gpu = Tensor::from_slice(&qkv_v, (batch, seq, 3, heads, head_dim), &cuda).unwrap();
+    let rope_gpu = Tensor::from_slice(&rope_v, (2, 1, 1, seq, head_dim), &cuda).unwrap();
+    let mask_gpu = Tensor::from_slice(&mask_v, (batch, 1, 1, seq), &cuda).unwrap();
+    let out_gpu: Vec<f32> = qkv_gpu
+        .apply_op3(&rope_gpu, &mask_gpu, op)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    assert_eq!(out_cpu.len(), out_gpu.len());
+    for (i, (c, g)) in out_cpu.iter().zip(out_gpu.iter()).enumerate() {
+        assert!(
+            ((*c - *g).abs() as f64) <= F32_TOL,
+            "attention_block per-batch-mask fwd[{i}]: cpu {c} vs cuda {g}"
+        );
+    }
+    // Also proves the CPU arm itself does not degenerate to "every batch
+    // sees batch 0's mask": batch 0 (no padding) and batch 2 (4/6 keys
+    // padded) must produce DIFFERENT context vectors for the same qkv.
+    let per_batch = seq * heads * head_dim;
+    let b0 = &out_cpu[0..per_batch];
+    let b2 = &out_cpu[2 * per_batch..3 * per_batch];
+    assert!(
+        b0.iter().zip(b2.iter()).any(|(x, y)| (x - y).abs() > 1e-6),
+        "batch 0 (unpadded) and batch 2 (4/6 keys padded) must diverge — a hardcoded \
+         mrow_base=0 would make every batch element read batch 0's (all-real) mask row"
+    );
+}
+
+// -----------------------------------------------------------------------
+// Audit B9: no fused-vs-eager BACKWARD oracle existed on CUDA, none for
+// the window arm on CUDA, none at production width, and none used a
+// non-uniform `dy` (audit B11 — an all-ones `sum_all().backward()` seed
+// cancels the bf16 rounding-divergence mechanisms this oracle exists to
+// catch). This section adds both: `dtype` in `{F32, BF16}`, `window` in
+// `{None, Some}`, at `(2, 128, 16, 64)` and `(2, 512, 16, 64)` — the two
+// widths the op contract's own oracle section names.
+
+/// A deterministic, NON-UNIFORM `dy` (never all-ones): a smooth function
+/// of the flat index, bounded, reproducible — the SAME shape this file's
+/// other fixtures use, but for a gradient SEED rather than a forward
+/// input (audit B11).
+fn attention_dy_fixture(n: usize, seed: f32) -> Vec<f32> {
+    (0..n)
+        .map(|i| ((i as f32 + seed) * 0.017).sin() * 0.7 + 0.1)
+        .collect()
+}
+
+fn mask_shape_of(mask_v: &[f32], batch: usize, seq: usize) -> (usize, usize, usize, usize) {
+    if mask_v.len() == batch * seq {
+        (batch, 1, 1, seq)
+    } else {
+        (batch, 1, seq, seq)
+    }
+}
+
+/// Hand-composed eager backward reference on `device`: RopeFused + matmul
+/// + SoftmaxLastDimFused + matmul, run under `Var`/`backward()` so
+/// candle's own autograd (not this op's `bwd`) produces `dqkv` — the
+/// independent reference [`AttentionBlockFused`]'s own `dqkv` is compared
+/// against. Returns `(out_values, dqkv_values)`, both cast to `f32`
+/// AFTER the graph runs in `dtype` (any divergence already happened in
+/// `dtype` and survives the upcast exactly).
+#[allow(clippy::too_many_arguments)]
+fn attention_block_bwd_eager_reference(
+    device: &Device,
+    dtype: DType,
+    qkv_v: &[f32],
+    rope_v: &[f32],
+    mask_v: &[f32],
+    dy_v: &[f32],
+    batch: usize,
+    seq: usize,
+    heads: usize,
+    head_dim: usize,
+    scale: f32,
+) -> (Vec<f32>, Vec<f32>) {
+    let cast = |t: Tensor| -> Tensor { t.to_dtype(dtype).unwrap() };
+    let qkv = Var::from_tensor(&cast(
+        Tensor::from_slice(qkv_v, (batch, seq, 3, heads, head_dim), device).unwrap(),
+    ))
+    .unwrap();
+    let rope_pack = cast(Tensor::from_slice(rope_v, (2, 1, 1, seq, head_dim), device).unwrap());
+    let mask = cast(Tensor::from_slice(mask_v, mask_shape_of(mask_v, batch, seq), device).unwrap());
+    let dy = cast(Tensor::from_slice(dy_v, (batch, seq, heads * head_dim), device).unwrap());
+
+    let q = qkv
+        .as_tensor()
+        .narrow(2, 0, 1)
+        .unwrap()
+        .squeeze(2)
+        .unwrap()
+        .transpose(1, 2)
+        .unwrap()
+        .contiguous()
+        .unwrap();
+    let k = qkv
+        .as_tensor()
+        .narrow(2, 1, 1)
+        .unwrap()
+        .squeeze(2)
+        .unwrap()
+        .transpose(1, 2)
+        .unwrap()
+        .contiguous()
+        .unwrap();
+    let v = qkv
+        .as_tensor()
+        .narrow(2, 2, 1)
+        .unwrap()
+        .squeeze(2)
+        .unwrap()
+        .transpose(1, 2)
+        .unwrap()
+        .contiguous()
+        .unwrap();
+    let cos = rope_pack.narrow(0, 0, 1).unwrap();
+    let sin = rope_pack.narrow(0, 1, 1).unwrap();
+    let q_rot = apply3(&q, &cos, &sin, RopeFused::new(false)).unwrap();
+    let k_rot = apply3(&k, &cos, &sin, RopeFused::new(false)).unwrap();
+    let q_scaled = (q_rot * scale as f64).unwrap();
+    let scores = q_scaled
+        .matmul(&k_rot.transpose(2, 3).unwrap().contiguous().unwrap())
+        .unwrap();
+    let mask_bc = mask
+        .broadcast_as(scores.shape())
+        .unwrap()
+        .contiguous()
+        .unwrap();
+    let p = apply2(
+        &scores,
+        &mask_bc,
+        SoftmaxLastDimFused::new(FullyMaskedPolicy::Zeros),
+    )
+    .unwrap();
+    let ctx = p.matmul(&v).unwrap();
+    let out = ctx
+        .transpose(1, 2)
+        .unwrap()
+        .contiguous()
+        .unwrap()
+        .reshape((batch, seq, heads * head_dim))
+        .unwrap();
+
+    let loss = (&out * &dy).unwrap().sum_all().unwrap();
+    let grads = loss.backward().unwrap();
+    let dqkv = grads.get(&qkv).unwrap().to_dtype(DType::F32).unwrap();
+
+    let out_v: Vec<f32> = out
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_device(&Device::Cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let dqkv_v: Vec<f32> = dqkv
+        .to_device(&Device::Cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    (out_v, dqkv_v)
+}
+
+/// Runs [`AttentionBlockFused`] itself (the op under test, via
+/// `apply_op3`/`bwd`) on `device`, with the SAME non-uniform `dy` seed
+/// [`attention_block_bwd_eager_reference`] uses. Returns `(out_values,
+/// dqkv_values)`, both cast to `f32` the same way.
+#[allow(clippy::too_many_arguments)]
+fn attention_block_bwd_fused(
+    device: &Device,
+    dtype: DType,
+    qkv_v: &[f32],
+    rope_v: &[f32],
+    mask_v: &[f32],
+    dy_v: &[f32],
+    batch: usize,
+    seq: usize,
+    heads: usize,
+    head_dim: usize,
+    scale: f32,
+) -> (Vec<f32>, Vec<f32>) {
+    let cast = |t: Tensor| -> Tensor { t.to_dtype(dtype).unwrap() };
+    let qkv = Var::from_tensor(&cast(
+        Tensor::from_slice(qkv_v, (batch, seq, 3, heads, head_dim), device).unwrap(),
+    ))
+    .unwrap();
+    let rope_pack = cast(Tensor::from_slice(rope_v, (2, 1, 1, seq, head_dim), device).unwrap());
+    let mask = cast(Tensor::from_slice(mask_v, mask_shape_of(mask_v, batch, seq), device).unwrap());
+    let dy = cast(Tensor::from_slice(dy_v, (batch, seq, heads * head_dim), device).unwrap());
+
+    let op = AttentionBlockFused::new(scale, FullyMaskedPolicy::Zeros, true).unwrap();
+    let out = qkv.as_tensor().apply_op3(&rope_pack, &mask, op).unwrap();
+    let loss = (&out * &dy).unwrap().sum_all().unwrap();
+    let grads = loss.backward().unwrap();
+    let dqkv = grads.get(&qkv).unwrap().to_dtype(DType::F32).unwrap();
+
+    let out_v: Vec<f32> = out
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_device(&Device::Cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let dqkv_v: Vec<f32> = dqkv
+        .to_device(&Device::Cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    (out_v, dqkv_v)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assert_attention_block_bwd_parity_cuda(
+    cuda: &Device,
+    dtype: DType,
+    batch: usize,
+    seq: usize,
+    heads: usize,
+    head_dim: usize,
+    window: Option<usize>,
+    seed: f32,
+) {
+    let qkv_v = qkv_fixture(batch, seq, heads, head_dim, seed);
+    let rope_v = attention_rope_pack(seq, head_dim);
+    let mask_base = vec![0f32; batch * seq];
+    let mask_v: Vec<f32> = match window {
+        None => mask_base,
+        Some(hw) => {
+            let combined = combined_attention_mask(cuda, batch, seq, &mask_base, Some(hw));
+            combined.flatten_all().unwrap().to_vec1().unwrap()
+        }
+    };
+    let dy_v = attention_dy_fixture(batch * seq * heads * head_dim, seed + 100.0);
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    let (out_fused, dqkv_fused) = attention_block_bwd_fused(
+        cuda, dtype, &qkv_v, &rope_v, &mask_v, &dy_v, batch, seq, heads, head_dim, scale,
+    );
+    let (out_eager, dqkv_eager) = attention_block_bwd_eager_reference(
+        cuda, dtype, &qkv_v, &rope_v, &mask_v, &dy_v, batch, seq, heads, head_dim, scale,
+    );
+
+    assert_eq!(out_fused.len(), out_eager.len());
+    assert_eq!(dqkv_fused.len(), dqkv_eager.len());
+
+    match dtype {
+        DType::F32 => {
+            // Discrimination proof: this op's own module doc claims the
+            // composed-CUDA arm issues the EXACT SAME cuBLAS/RopeFused/
+            // SoftmaxLastDimFused calls, in the SAME order, as this hand
+            // composition — F32 accumulation through the identical op
+            // sequence is therefore bit-exact, not merely close. A half-
+            // term drop, a wrong transpose, or a scale applied twice would
+            // almost certainly miss `assert_eq!` here.
+            assert_eq!(
+                out_fused, out_eager,
+                "attention_block CUDA F32 fwd not bit-exact vs eager (dtype={dtype:?}, \
+                 window={window:?}, shape=({batch},{seq},{heads},{head_dim}))"
+            );
+            assert_eq!(
+                dqkv_fused, dqkv_eager,
+                "attention_block CUDA F32 dqkv not bit-exact vs eager (dtype={dtype:?}, \
+                 window={window:?}, shape=({batch},{seq},{heads},{head_dim}))"
+            );
+        }
+        DType::BF16 => {
+            let bf16_bound = |c: f32, g: f32| 8.0 * 2.0f32.powi(-7) * c.abs().max(g.abs()).max(1.0);
+            for (i, (c, g)) in out_fused.iter().zip(out_eager.iter()).enumerate() {
+                assert!(
+                    (c - g).abs() <= bf16_bound(*c, *g),
+                    "attention_block CUDA bf16 fwd[{i}] vs eager: {c} vs {g} (window={window:?}, \
+                     shape=({batch},{seq},{heads},{head_dim}))"
+                );
+            }
+            for (i, (c, g)) in dqkv_fused.iter().zip(dqkv_eager.iter()).enumerate() {
+                assert!(
+                    (c - g).abs() <= bf16_bound(*c, *g),
+                    "attention_block CUDA bf16 dqkv[{i}] vs eager: {c} vs {g} (window={window:?}, \
+                     shape=({batch},{seq},{heads},{head_dim}))"
+                );
+            }
+        }
+        other => panic!("unexpected dtype {other:?}"),
+    }
+}
+
+#[test]
+fn attention_block_bwd_parity_f32_global_s128_cuda() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    assert_attention_block_bwd_parity_cuda(&cuda, DType::F32, 2, 128, 16, 64, None, 7.0);
+}
+
+#[test]
+fn attention_block_bwd_parity_f32_global_s512_cuda() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    assert_attention_block_bwd_parity_cuda(&cuda, DType::F32, 2, 512, 16, 64, None, 8.0);
+}
+
+#[test]
+fn attention_block_bwd_parity_f32_window_s128_cuda() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    assert_attention_block_bwd_parity_cuda(&cuda, DType::F32, 2, 128, 16, 64, Some(16), 9.0);
+}
+
+#[test]
+fn attention_block_bwd_parity_f32_window_s512_cuda() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    assert_attention_block_bwd_parity_cuda(&cuda, DType::F32, 2, 512, 16, 64, Some(64), 10.0);
+}
+
+#[test]
+fn attention_block_bwd_parity_bf16_global_s128_cuda() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    assert_attention_block_bwd_parity_cuda(&cuda, DType::BF16, 2, 128, 16, 64, None, 11.0);
+}
+
+#[test]
+fn attention_block_bwd_parity_bf16_global_s512_cuda() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    assert_attention_block_bwd_parity_cuda(&cuda, DType::BF16, 2, 512, 16, 64, None, 12.0);
+}
+
+#[test]
+fn attention_block_bwd_parity_bf16_window_s128_cuda() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    assert_attention_block_bwd_parity_cuda(&cuda, DType::BF16, 2, 128, 16, 64, Some(16), 13.0);
+}
+
+#[test]
+fn attention_block_bwd_parity_bf16_window_s512_cuda() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    assert_attention_block_bwd_parity_cuda(&cuda, DType::BF16, 2, 512, 16, 64, Some(64), 14.0);
 }

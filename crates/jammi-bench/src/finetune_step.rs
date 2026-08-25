@@ -148,6 +148,21 @@ pub struct FinetuneStepParams {
     /// the tier has to be able to measure it as a within-run A/B on one box
     /// rather than across binaries.
     pub batched_forward: bool,
+    /// The op key set the CALLER intended `JAMMI_KERNELS_DISABLE` to carry
+    /// into this process, sorted — `None` when the caller makes no claim
+    /// (the ordinary, unchecked case). When `Some`, [`run`] hard-errors if
+    /// [`jammi_kernels::admission::disabled_ops_requested`] does not read
+    /// back EXACTLY this set, turning the "env var silently dropped"
+    /// failure mode (a var-NAME typo, an unforwarded ssh/`docker -e`
+    /// environment — see `kernels_disabled_requested`/`kernels_disabled_fired`'s
+    /// doc just above [`run`]'s dispatch-counter reads) into a machine-
+    /// enforced check on the SAME invocation that intended the disable,
+    /// rather than something a caller has to eyeball in the emitted JSON
+    /// report after the fact. Distinct from `unmatched_disables()` (which
+    /// this function already checks): that catches a REQUESTED entry that
+    /// never fired; this catches the process never having received the
+    /// request it was TOLD to expect at all, at any point.
+    pub expect_kernels_disabled: Option<Vec<String>>,
 }
 
 /// Deterministic synthetic token ids, uniform over `[1, vocab)` so no id is the
@@ -174,7 +189,10 @@ fn synthetic_ids(batch: usize, seq: usize, vocab: usize, seed: u64, device: &Dev
 /// before this function returns, and
 /// `jammi_kernels::admission::unmatched_disables`'s doc): that is a typo
 /// in the disable list, not evidence the forced-eager arm ran, and must
-/// never be reported as a datum (contract K-aux).
+/// never be reported as a datum (contract K-aux). Also returns `Err` when
+/// `params.expect_kernels_disabled` is `Some` and does not match what this
+/// process's `JAMMI_KERNELS_DISABLE` actually resolved to — see
+/// `FinetuneStepParams::expect_kernels_disabled`'s doc.
 pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std::error::Error>> {
     let device = match params.cuda_device {
         Some(ordinal) => Device::new_cuda(ordinal)?,
@@ -345,6 +363,29 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     // compare against.
     let kernels_disabled_requested = jammi_kernels::admission::disabled_ops_requested();
     let kernels_disabled_fired = jammi_kernels::admission::disabled_ops_fired();
+
+    // `--expect-kernels-disabled` (contract K-aux, round 2 advisory): the
+    // binary controls its own argv, so a caller that names its intended
+    // `JAMMI_KERNELS_DISABLE` set on the SAME command line gets a hard
+    // error instead of having to notice, after the fact, that the
+    // process-observed `kernels_disabled_requested` in the emitted JSON
+    // report came back empty (or different) — machine-enforced rather than
+    // eyeballed. Compared as SORTED sets: `kernels_disabled_requested` is
+    // already sorted, and the expectation is sorted here so the caller's
+    // ordering on the command line is not load-bearing.
+    if let Some(expected) = &params.expect_kernels_disabled {
+        let mut expected_sorted = expected.clone();
+        expected_sorted.sort();
+        if kernels_disabled_requested != expected_sorted {
+            return Err(format!(
+                "--expect-kernels-disabled named {expected_sorted:?} but this process's real \
+                 JAMMI_KERNELS_DISABLE resolved to {kernels_disabled_requested:?} — the env var \
+                 was dropped, mistyped, or not forwarded to this process (INVALID run, not a \
+                 datum)"
+            )
+            .into());
+        }
+    }
 
     times.sort_by(f64::total_cmp);
     let p50 = times[times.len() / 2];

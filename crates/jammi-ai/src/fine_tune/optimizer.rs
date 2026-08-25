@@ -168,7 +168,7 @@ pub fn clip_gradients(
             total_sq = Some(match total_sq {
                 None => sq,
                 Some(acc) => {
-                    (&acc * /* ~ changed by cargo-mutants ~ */ &sq).map_err(|e| JammiError::FineTune(format!("GradClip acc: {e}")))?
+                    (&acc + &sq).map_err(|e| JammiError::FineTune(format!("GradClip acc: {e}")))?
                 }
             });
         }

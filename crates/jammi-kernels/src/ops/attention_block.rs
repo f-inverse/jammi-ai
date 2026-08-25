@@ -799,13 +799,13 @@ mod tests {
             let dctx = Tensor::randn(0f32, 1.0, (b, h, s, d), &device).unwrap();
             let ds = Tensor::randn(0f32, 1.0, (b, h, s, s), &device).unwrap();
 
-            // scores = q_scaled.contiguous() @ k.transpose(-1,-2).contiguous()
+            // scores = q_scaled.contiguous() @ k_rot.transpose(-1,-2) — NO
+            // `.contiguous()` on the rhs (audit B6 / the module doc's
+            // "fwd/bwd GEMM shape match" section): this must be the SAME
+            // transpose-VIEW operand `fwd` issues, not a materialized
+            // contiguous copy.
             let lhs = q.contiguous().unwrap();
-            let rhs = k
-                .transpose(D::Minus1, D::Minus2)
-                .unwrap()
-                .contiguous()
-                .unwrap();
+            let rhs = k.transpose(D::Minus1, D::Minus2).unwrap();
             assert!(
                 is_gemm_operand_admissible(lhs.layout()),
                 "scores lhs @ ({b},{s},{h},{d})"
@@ -813,6 +813,22 @@ mod tests {
             assert!(
                 is_gemm_operand_admissible(rhs.layout()),
                 "scores rhs @ ({b},{s},{h},{d})"
+            );
+            // The mutation this guards against: reintroducing
+            // `.contiguous()` on `rhs` (as an earlier revision of `bwd`
+            // did) would make THIS assertion pass too (a materialized
+            // contiguous tensor is still an admissible GEMM operand — the
+            // shape mismatch is invisible to `is_gemm_operand_admissible`
+            // alone) but flip `rhs.is_contiguous()` from `false` to `true`,
+            // which is exactly what this assertion catches: `s > 1` here
+            // (`s=3`/`s=8`) makes a genuine transpose of a contiguous
+            // `[b,h,s,d]` tensor itself non-contiguous whenever `d > 1`
+            // (verified: both fixtures use `d=4`).
+            assert!(
+                !rhs.is_contiguous(),
+                "scores rhs @ ({b},{s},{h},{d}) must be a transpose VIEW (cuBLAS OP_T), not a \
+                 materialized contiguous copy (OP_N) — bwd would then issue a DIFFERENT GEMM \
+                 shape than fwd's own QKᵀ"
             );
             let _ = lhs.matmul(&rhs).unwrap();
 

@@ -204,10 +204,15 @@
 //! backtrace }` whenever `std::backtrace::Backtrace::capture()`'s status
 //! is neither `Disabled` nor `Unsupported` — i.e. whenever
 //! `RUST_BACKTRACE` (or `RUST_LIB_BACKTRACE`) is set, which CI sets
-//! workflow-wide. The CPU `MatMul::f` arm that raises this exact
-//! `UnsupportedDTypeForOp(BF16, "matmul")` calls `.bt()` on it
-//! (`cpu_backend/mod.rs:1541`), so a bare `matches!(err,
-//! Error::UnsupportedDTypeForOp(..))` is true with `RUST_BACKTRACE`
+//! workflow-wide. The CPU `MatMul::f` arm this workspace actually
+//! compiles — the `#[cfg(all(not(feature = "mkl"), not(feature =
+//! "accelerate")))]` `gemm` arm, `cpu_backend/mod.rs:1372-1385` — raises
+//! this exact `UnsupportedDTypeForOp(T::DTYPE, "matmul")` from its
+//! `match T::DTYPE` catch-all at `:1384` and calls `.bt()` on it (the
+//! `accelerate` and `mkl` arms, opened at `:1455` and `:1546`, do the
+//! same at `:1541` and `:1659`, but no crate in this workspace enables
+//! either feature, so neither arm is compiled here), so a bare
+//! `matches!(err, Error::UnsupportedDTypeForOp(..))` is true with `RUST_BACKTRACE`
 //! unset and false with it set to `1` — an environment property, not a
 //! platform one. This file's own tests `peel_backtrace` before matching
 //! on any candle-RAISED error for exactly this reason (an error THIS
@@ -2115,9 +2120,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // `bwd`'s three `==`->`!=` dtype-dispatch-branch survivors (MUT-1:
-    // :686 `grad_res.dtype() == F32`, :696 `base_dtype == F32`, :738
-    // `base_dtype == F32`). `bwd` is called DIRECTLY (bypassing
+    // `bwd`'s three `==`->`!=` dtype-dispatch-branch survivors (MUT-1),
+    // named here by their `let` bindings: the `dy` upcast (`let dy_f32 =
+    // if grad_res.dtype() == DType::F32`), the `x` upcast (`let x32_2d =
+    // if base_dtype == DType::F32`), and the final `d_x_lora` downcast
+    // (`let d_x_lora_2d = if base_dtype == DType::F32`). `bwd` is called
+    // DIRECTLY (bypassing
     // `apply_op3`/`cpu_fwd`'s own dtype gate, which refuses a BF16 base
     // on CPU today — see `bf16_base_on_cpu_is_a_typed_error...` above),
     // white-box, so each branch's effect is observable even though the
@@ -2131,9 +2139,9 @@ mod tests {
     // here — the same pre-existing limitation
     // `bf16_base_on_cpu_is_a_typed_error...` discloses), so the real
     // assertion is WHERE it fails: correct code upcasts `dy`/`x` to F32
-    // for every intermediate GEMM (:686, :696) and only the FINAL
-    // `dy_base_2d.matmul(w)` (unavoidably BF16xBF16) fails, with
-    // `UnsupportedDTypeForOp`. Either :686 or :696 mutated instead skips
+    // for every intermediate GEMM (the `dy` and `x` upcasts) and only the
+    // FINAL `dy_base_2d.matmul(w)` (unavoidably BF16xBF16) fails, with
+    // `UnsupportedDTypeForOp`. Either upcast mutated instead skips
     // an upcast, so an EARLIER GEMM sees mismatched operand dtypes and
     // fails with `DTypeMismatchBinaryOp` instead — a different, earlier,
     // and therefore DISTINGUISHABLE failure.
@@ -2192,19 +2200,20 @@ mod tests {
         }
     }
 
-    // Oracle B (isolates :738 specifically, which Oracle A's fixture
-    // cannot reach — see this test's own module-doc analysis: with
-    // `base_dtype = BF16`, the all-BF16 fixture always fails at the
-    // FINAL `dy_base_2d.matmul(w)` line, one step BEFORE :738's own
-    // effect (`d_x_lora`'s dtype) is ever consumed by the `dx_base +
-    // d_x_lora` addition). Here `w`/`grad_res` are F32 (so that final
-    // matmul-and-add DOES succeed, or fails for a REASON ISOLATED to
-    // :738): `x` alone is BF16, so :696 correctly upcasts it to F32 for
-    // the LoRA-path GEMMs, and :738 is what decides whether `d_x_lora`
-    // is cast back to `x`'s own BF16 (correct — mismatches `dx_base`'s
-    // F32, giving `DTypeMismatchBinaryOp` at the final add) or left at
-    // F32 (:738 mutated — matches `dx_base`, so the call WRONGLY
-    // succeeds).
+    // Oracle B (isolates the final `d_x_lora_2d` downcast specifically,
+    // which Oracle A's fixture cannot reach — see this test's own
+    // module-doc analysis: with `base_dtype = BF16`, the all-BF16 fixture
+    // always fails at the FINAL `dy_base_2d.matmul(w)` line, one step
+    // BEFORE that downcast's own effect (`d_x_lora`'s dtype) is ever
+    // consumed by the `dx_base + d_x_lora` addition). Here `w`/`grad_res`
+    // are F32 (so that final matmul-and-add DOES succeed, or fails for a
+    // REASON ISOLATED to the downcast): `x` alone is BF16, so the `x`
+    // upcast (`let x32_2d = ...`) correctly lifts it to F32 for the
+    // LoRA-path GEMMs, and the `let d_x_lora_2d = if base_dtype ==
+    // DType::F32` branch is what decides whether `d_x_lora` is cast back
+    // to `x`'s own BF16 (correct — mismatches `dx_base`'s F32, giving
+    // `DTypeMismatchBinaryOp` at the final add) or left at F32 (that
+    // branch mutated — matches `dx_base`, so the call WRONGLY succeeds).
     #[test]
     fn bwd_direct_mixed_dtype_oracle_isolates_the_final_downcast_branch() {
         let device = Device::Cpu;
@@ -2245,11 +2254,83 @@ mod tests {
         }
     }
 
-    /// Cosmetic `name()` survivor (this file's one op): the name is part
-    /// of this op's counters/admission keys (see `ops`'s module doc).
+    /// Cosmetic `name()` survivor (this file's one op). What the snapshot
+    /// pins: `name()` is the `op` payload of every typed refusal this op
+    /// raises with `&self` in hand (`cpu_fwd`'s `DTypeMismatchBinaryOp {
+    /// op: self.name(), .. }` / `UnsupportedDTypeForOp(_, self.name())`,
+    /// and the CUDA arm's `op: op.name()`) and of candle's own
+    /// `BackwardNotSupported { op: self.name() }` — the diagnostic name
+    /// a user matches error messages on, so a rename silently changes
+    /// every one of them. It is NOT an admission/counter key: those are
+    /// a consumer's own dispatch-site literals (`admit(.., "<key>", ..)`
+    /// / `counters_for("<key>")` — see `crate::admission::counters_for`'s
+    /// doc), independent of `name()` by construction; this op's consumer
+    /// keys its fused PATH `"lora_linear_fused"` (a composition of
+    /// dropout, this op, and the epilogue), which is why that key
+    /// legitimately differs from this name and is not asserted here.
     #[test]
     fn ops_name_in_this_file_is_pinned() {
         let op = LowRankResidualLinear::new(1.0, 3, 4, 2, None, false).unwrap();
         assert_eq!(op.name(), "low_rank_residual_linear");
+    }
+
+    /// The two refusal sites that CANNOT reach `self.name()` carry their
+    /// own literal copy of the op name instead: `check_w_and_ab`'s
+    /// `UnsupportedDTypeForOp(ab_dtype, "low_rank_residual_linear")` arm
+    /// (a non-F32 `ab`), and `cpu_fwd`'s `(w)`/`(ab)`-suffixed
+    /// `RequiresContiguous { op }` labels (mirrored verbatim on the CUDA
+    /// arm). Both must agree with `name()` so a caller matching on the
+    /// `op` payload sees ONE name for this op regardless of which check
+    /// refused — pinned through the payloads themselves, never a third
+    /// literal.
+    #[test]
+    fn every_literal_copy_of_the_op_name_agrees_with_name() {
+        let device = Device::Cpu;
+        let (rows, inf, outf, r) = (3usize, 3usize, 4usize, 2usize);
+        let op = LowRankResidualLinear::new(1.0, inf, outf, r, None, false).unwrap();
+        let name = op.name();
+
+        // (a) `check_w_and_ab`'s literal: a non-F32 `ab` dtype.
+        let w_layout = Layout::contiguous((outf, inf));
+        let err = op
+            .check_w_and_ab(&w_layout, &[inf + outf, r], DType::BF16)
+            .expect_err("a BF16 ab must be refused");
+        match err {
+            Error::UnsupportedDTypeForOp(dtype, op_label) => {
+                assert_eq!(dtype, DType::BF16);
+                assert_eq!(
+                    op_label, name,
+                    "check_w_and_ab's literal drifted from name()"
+                );
+            }
+            other => panic!("expected UnsupportedDTypeForOp(BF16, _), got {other:?}"),
+        }
+
+        // (b) `cpu_fwd`'s `(w)` label: a non-contiguous `w` (contiguous
+        // `ab`), the same fixture as
+        // `non_contiguous_w_is_refused_with_the_w_op_label` above.
+        let x = Tensor::from_slice(&exact_fixture(rows * inf, 1), (rows, inf), &device).unwrap();
+        let w = Tensor::from_slice(&exact_fixture(inf * outf, 2), (inf, outf), &device)
+            .unwrap()
+            .t()
+            .unwrap();
+        assert!(!w.is_contiguous());
+        let ab = pack_ab(
+            &exact_fixture(r * inf, 3),
+            inf,
+            &exact_fixture(outf * r, 4),
+            outf,
+            r,
+            &device,
+        );
+        let err = fused_forward(&x, &w, &ab, op).expect_err("non-contiguous w must be refused");
+        match err {
+            Error::RequiresContiguous { op: op_label } => assert_eq!(
+                op_label.strip_suffix("(w)"),
+                Some(name),
+                "cpu_fwd's `(w)` RequiresContiguous label drifted from name(): {op_label}"
+            ),
+            other => panic!("expected RequiresContiguous{{op: \"...(w)\"}}, got {other:?}"),
+        }
     }
 }

@@ -525,4 +525,43 @@ mod tests {
             }
         ));
     }
+
+    /// The admission/counter key this crate dispatches a fused path under
+    /// is a call-site literal, independent of the kernel op's `name()` by
+    /// construction (`jammi_kernels::admission::counters_for`'s doc): an
+    /// admission key names a consumer's fused PATH, which may compose
+    /// several ops, so it can legitimately differ from any one
+    /// `CustomOp`'s name (the LoRA consumer keys `"lora_linear_fused"`
+    /// over the op named `"low_rank_residual_linear"`). Where this crate
+    /// keys a path by the op's own name — layer-norm and softmax — that
+    /// coincidence is what lets a counters snapshot be read side by side
+    /// with the op's error payloads, so it is pinned here without a third
+    /// literal: the registry entry each `*_DISPATCH_COUNTERS` resolves to
+    /// must be the very entry `counters_for(op.name())` resolves to
+    /// (`counters_for` hands back the same `&'static` for the same key).
+    /// The `admit(..)` call sites' `op` argument is the same key by
+    /// convention but has no read-back API (it feeds a log-once WARN and
+    /// the `StrictModeFallback` payload), so it stays pinned only by the
+    /// strict-mode tests' literal matches above.
+    #[test]
+    fn dispatch_counter_keys_agree_with_the_kernel_ops_names() {
+        use candle_core::CustomOp2;
+        use jammi_kernels::admission::counters_for;
+        use jammi_kernels::ops::{LayerNormFused, SoftmaxLastDimFused};
+        assert!(
+            std::ptr::eq(
+                counters_for(LayerNormFused::new(1e-5, false).name()),
+                *LN_DISPATCH_COUNTERS
+            ),
+            "LN_DISPATCH_COUNTERS is keyed by a literal that drifted from LayerNormFused::name()"
+        );
+        assert!(
+            std::ptr::eq(
+                counters_for(SoftmaxLastDimFused::default().name()),
+                *crate::modernbert::SOFTMAX_DISPATCH_COUNTERS
+            ),
+            "SOFTMAX_DISPATCH_COUNTERS is keyed by a literal that drifted from \
+             SoftmaxLastDimFused::name()"
+        );
+    }
 }

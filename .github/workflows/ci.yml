@@ -226,6 +226,27 @@ jobs:
       - name: Assert no proprietary crate in the OSS engine dep tree
         run: cargo metadata --format-version 1 --locked | python3 ci/scripts/check_dep_direction.py
 
+  flash-attn-closure:
+    name: Guard (flash-attn feature closure)
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust-ci
+
+      # `jammi-kernels/flash-attn` vendors CUTLASS + a multi-minute `nvcc`
+      # build; it must depend on `cuda` but never be IMPLIED by it, or the
+      # release lane (`release-binaries.yml`'s `cuda,jetstream-broker,
+      # storage-cloud` build) silently drags CUTLASS into every release
+      # build. This walks the workspace feature graph the way the resolver
+      # does (own `cargo metadata --no-deps` call, so it runs unpiped unlike
+      # the dep-direction guard above) and fails if `flash-attn` is reachable
+      # from `default`, the release lane's feature set, or `--all-features`.
+      - name: Assert no consumer's feature closure reaches jammi-kernels/flash-attn
+        run: python3 ci/scripts/check_flash_attn_closure.py
+
   oss-only-build:
     name: Guard (OSS-only build)
     runs-on: ubuntu-latest
@@ -539,6 +560,7 @@ jobs:
       - test-clients
       - guard
       - dep-direction
+      - flash-attn-closure
       - oss-only-build
       - dep-audit
       - ts-client

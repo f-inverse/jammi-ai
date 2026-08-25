@@ -25,6 +25,23 @@ use super::target::TrainingTarget;
 use super::{EarlyStoppingMetric, FineTuneConfig, LrSchedule};
 use crate::model::{LoadedModel, ModelTask};
 
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
+
+/// Test-only counter of device→host reads issued on the per-micro-batch
+/// path this file owns (`process_batch_loss`'s post-backward loss read is the
+/// only production one; `accumulate_sim_stats` must never move it — see its
+/// doc). Mirrors `optimizer::SYNC_READ_COUNT`'s role for the clip: a CPU test
+/// cannot observe a CUDA sync directly, so this is the structural proxy.
+#[cfg(test)]
+static PER_MICRO_BATCH_HOST_READ_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot [`PER_MICRO_BATCH_HOST_READ_COUNT`]. Test-only.
+#[cfg(test)]
+fn per_micro_batch_host_read_count() -> u64 {
+    PER_MICRO_BATCH_HOST_READ_COUNT.load(Ordering::Relaxed)
+}
+
 /// Result of a completed training run.
 ///
 /// The loop trains and persists the adapter into a worker-private local
@@ -449,27 +466,38 @@ impl TrainingLoop {
         // reuses the last mining (the staleness/cost trade).
         let mut mined_loader: Option<TrainingDataLoader> = None;
 
-        // Hold candle's HtoD constant-upload CACHE for the whole run, CUDA
-        // only. This is NOT graph capture — it is a content-keyed cache
-        // (`(DeviceId, TypeId, bytes) -> uploaded slice`, capped at 4096
-        // bytes/entry) that candle's own tensor-metadata uploads (dims/
-        // strides, and the tiny constants ops like `clip_gradients`'s
-        // `.minimum(1.0)` allocate) already consult when enabled; without the
-        // guard those same small, repeated H2D copies happen fresh every
-        // step. The guard is depth-counted (`CudaGraphHtodCacheGuard::drop`
-        // decrements), so holding it for the run's whole duration is safe to
-        // nest inside anything else that also enables it. `None` on CPU/Metal
-        // — the cache only exists on the CUDA backend, and
-        // `enable_cuda_graph_htod_cache` itself only exists on `CudaDevice`
-        // when candle-core is built with its `cuda` feature (this crate's own
-        // `cuda` feature forwards to it), so the call is gated the same way.
-        #[cfg(feature = "cuda")]
-        let _htod_cache_guard = match &self.device {
-            Device::Cuda(cuda_device) => Some(cuda_device.enable_cuda_graph_htod_cache()),
-            Device::Cpu | Device::Metal(_) => None,
-        };
-        #[cfg(not(feature = "cuda"))]
-        let _htod_cache_guard: Option<()> = None;
+        // NOT held: candle's `CUDA_GRAPH_HTOD_CACHE`.
+        //
+        // candle-core 0.11.0's `CudaDevice`-scoped HtoD-cache-enabling method
+        // (`cuda_backend/device.rs:92-95`) turns on a THREAD-LOCAL,
+        // content-keyed `HashMap<(DeviceId, TypeId, bytes), Box<dyn Any>>` of
+        // every H2D upload ≤ `CUDA_GRAPH_HTOD_CACHE_MAX_BYTES` (4096) bytes
+        // (`device.rs:31,209`) — every distinct `input_ids`/mask/score/label
+        // micro-batch the trainer ever uploads becomes a permanent entry.
+        // `CudaGraphHtodCacheGuard::drop` (`device.rs:45-52`) only decrements
+        // a re-entrancy depth counter; nothing in candle's public API clears
+        // or bounds the map's contents, and 0.11.0 is the newest release on
+        // crates.io, so there is no pin bump that adds one. Holding that
+        // guard for a whole run would grow the map by one entry per distinct
+        // micro-batch shape/content for the run's lifetime, unbounded, on a
+        // pooled `spawn_blocking` thread that outlives the training job
+        // (family E: bound the term that grows, not a sum around it — there
+        // is no bound to add here without candle exposing one). The
+        // `cuda_htod_cache_premise_pin::candle_core_is_still_the_audited_0_11_0`
+        // test below fails the moment `candle-core` moves off `0.11.0`, so a
+        // future upgrade is forced to re-read `cuda_backend/device.rs` for an
+        // eviction/bounded-capacity API before that guard is ever reinstated.
+        //
+        // What the trainer pays instead, per micro-batch, uncached: the
+        // dims/strides H2D uploads `params_from_layout` issues per kernel
+        // launch (`cuda_backend/mod.rs:63-88` in the same release) plus the
+        // tiny scalar constants `clip_gradients` materializes (`.minimum
+        // (1.0)`; see `optimizer::clip_gradients`'s doc for that op count).
+        // The original P4b census measured this at 633 tiny H2D copies per
+        // training step on the ModernBERT-large r16 LoRA config the bench
+        // exercises (`contract-P4b-sync-removal.md`, fact 4) — cite/re-measure
+        // per pod run rather than re-deriving here; nothing in this file
+        // changes that count.
 
         for epoch in start_epoch..self.config.epochs {
             // Cooperative cancellation: the worker's heartbeat sets this when the
@@ -490,8 +518,11 @@ impl TrainingLoop {
             // this store's contents.
             let mut accumulated_grads = GradStore::default();
             let mut grads_pending = false;
-            let mut epoch_pos_sim = 0.0f64;
-            let mut epoch_neg_sim = 0.0f64;
+            // Running device-side sums of per-micro-batch mean cosine
+            // similarity — read back to `f64` exactly once, at the epoch
+            // boundary below (see `Self::accumulate_sim_stats`'s doc).
+            let mut epoch_pos_sim: Option<Tensor> = None;
+            let mut epoch_neg_sim: Option<Tensor> = None;
             let mut triplet_batch_count = 0usize;
 
             // Re-mine hard negatives at refresh boundaries. Mining replaces the
@@ -514,7 +545,7 @@ impl TrainingLoop {
                 let train_batches = epoch_loader.batches(self.config.batch_size)?;
                 for batch in train_batches {
                     let batch = batch?;
-                    self.accumulate_sim_stats(
+                    Self::accumulate_sim_stats(
                         &batch,
                         &mut epoch_pos_sim,
                         &mut epoch_neg_sim,
@@ -565,7 +596,7 @@ impl TrainingLoop {
                 for chunk in &text_chunks {
                     let batch = self.encode_chunk(chunk)?;
                     let loss = self.compute_loss(&batch)?;
-                    self.accumulate_sim_stats(
+                    Self::accumulate_sim_stats(
                         &batch,
                         &mut epoch_pos_sim,
                         &mut epoch_neg_sim,
@@ -602,6 +633,15 @@ impl TrainingLoop {
             if grads_pending {
                 let lr = compute_lr(&self.config, global_step, total_steps);
                 optimizer.set_learning_rate(lr);
+                // `total_steps` is the whole run's optimizer-step horizon
+                // (computed once, before the epoch loop, from
+                // `train_batches_per_epoch` and `config.epochs`), so
+                // `global_step + 1 >= total_steps` names the run's actual
+                // final optimizer step, not just this epoch's — the
+                // non-finite check must not be skippable by a run shorter
+                // than `DEFAULT_NORM_CHECK_INTERVAL` steps (see
+                // `clip_and_step`'s doc).
+                let is_last_step = global_step + 1 >= total_steps;
                 clip_and_step(
                     &mut optimizer,
                     &trainable_vars,
@@ -609,18 +649,36 @@ impl TrainingLoop {
                     self.config.max_grad_norm,
                     DEFAULT_NORM_CHECK_INTERVAL,
                     global_step + 1,
+                    is_last_step,
                 )?;
                 global_step += 1;
             }
 
             let avg_train_loss = epoch_loss / batch_count.max(1) as f64;
+            // The ONE host read for the whole epoch's sim stats — every
+            // per-micro-batch contribution above stayed on device (see
+            // `Self::accumulate_sim_stats`'s doc).
             let avg_pos_sim = if triplet_batch_count > 0 {
-                epoch_pos_sim / triplet_batch_count as f64
+                let sum: f32 = epoch_pos_sim
+                    .as_ref()
+                    .expect(
+                        "triplet_batch_count > 0 implies epoch_pos_sim was folded at least once",
+                    )
+                    .to_scalar()
+                    .map_err(|e| JammiError::FineTune(format!("epoch pos sim read: {e}")))?;
+                sum as f64 / triplet_batch_count as f64
             } else {
                 0.0
             };
             let avg_neg_sim = if triplet_batch_count > 0 {
-                epoch_neg_sim / triplet_batch_count as f64
+                let sum: f32 = epoch_neg_sim
+                    .as_ref()
+                    .expect(
+                        "triplet_batch_count > 0 implies epoch_neg_sim was folded at least once",
+                    )
+                    .to_scalar()
+                    .map_err(|e| JammiError::FineTune(format!("epoch neg sim read: {e}")))?;
+                sum as f64 / triplet_batch_count as f64
             } else {
                 0.0
             };
@@ -913,7 +971,7 @@ impl TrainingLoop {
         train_loader: &TrainingDataLoader,
         trainable_vars: &[Var],
         optimizer: &mut AdamW,
-        _total_steps: usize,
+        total_steps: usize,
         global_step: usize,
     ) -> Result<f64> {
         use super::gradcache::{gradcache_backward, EncodeGroup};
@@ -999,6 +1057,10 @@ impl TrainingLoop {
         self.target.set_training(true);
         let (mut grads, loss_val) = outcome?;
 
+        // GradCache takes exactly one optimizer step per epoch, so
+        // `global_step + 1 >= total_steps` marks its run's last step exactly
+        // like the other two call sites (see the flush-window site's doc).
+        let is_last_step = global_step + 1 >= total_steps;
         clip_and_step(
             optimizer,
             trainable_vars,
@@ -1006,6 +1068,7 @@ impl TrainingLoop {
             self.config.max_grad_norm,
             DEFAULT_NORM_CHECK_INTERVAL,
             global_step + 1,
+            is_last_step,
         )?;
 
         Ok(loss_val)
@@ -1338,58 +1401,76 @@ impl TrainingLoop {
         }
     }
 
-    /// Accumulate cosine similarity stats from a triplet batch for epoch-level logging.
-    /// Non-triplet batches are silently ignored. Errors in stat computation are swallowed
-    /// so a GPU issue never aborts training just because of a logging metric.
+    /// Accumulate cosine similarity stats from a triplet batch for epoch-level
+    /// logging, entirely ON DEVICE — this runs once per micro-batch, so it
+    /// sits on the same hot path `process_batch_loss` does, and must issue
+    /// ZERO `to_scalar`/`to_vec*` calls (unlike the old version, which did two
+    /// per call, BEFORE `backward` ever ran). Each batch's per-pair cosine
+    /// similarity is reduced to a mean (`mean_all`, a device scalar tensor)
+    /// and folded into `epoch_pos_sim`/`epoch_neg_sim` with a device add — a
+    /// fixed left-to-right fold across the epoch's micro-batches (family J:
+    /// deterministic reduction order), mirroring `optimizer::clip_gradients`'s
+    /// fold. The running sums are read back to `f64` exactly ONCE, at the
+    /// epoch boundary (see the `avg_pos_sim`/`avg_neg_sim` computation in
+    /// `run`), dividing by `triplet_count` there — so this function moves the
+    /// *number* of per-micro-batch host reads for the sim-stats path from 2
+    /// to 0, not just their timing relative to `backward`.
+    ///
+    /// Non-triplet batches are silently ignored. Errors in stat computation
+    /// (from `cosine_similarity` or the fold) are swallowed so a GPU issue
+    /// never aborts training just because of a logging metric — but only
+    /// all-or-nothing per batch: if either accumulator's fold would fail, the
+    /// batch contributes to NEITHER accumulator nor `triplet_count`, so the
+    /// two running sums and the count they are later divided by never drift
+    /// out of sync.
     fn accumulate_sim_stats(
-        &self,
         batch: &super::data::TrainingBatch,
-        epoch_pos_sim: &mut f64,
-        epoch_neg_sim: &mut f64,
+        epoch_pos_sim: &mut Option<Tensor>,
+        epoch_neg_sim: &mut Option<Tensor>,
         triplet_count: &mut usize,
     ) {
-        if let super::data::TrainingBatch::Triplet {
+        let super::data::TrainingBatch::Triplet {
             anchor,
             positive,
             negative,
         } = batch
-        {
-            let ps = cosine_similarity(anchor, positive)
-                .and_then(|t| {
-                    t.mean_all()
-                        .map_err(|e| JammiError::FineTune(format!("{e}")))
-                })
-                .and_then(|t| {
-                    let t = if t.dtype() == DType::F32 {
-                        t
-                    } else {
-                        t.to_dtype(DType::F32)
-                            .map_err(|e| JammiError::FineTune(format!("{e}")))?
-                    };
-                    t.to_scalar::<f32>()
-                        .map_err(|e| JammiError::FineTune(format!("{e}")))
-                });
-            let ns = cosine_similarity(anchor, negative)
-                .and_then(|t| {
-                    t.mean_all()
-                        .map_err(|e| JammiError::FineTune(format!("{e}")))
-                })
-                .and_then(|t| {
-                    let t = if t.dtype() == DType::F32 {
-                        t
-                    } else {
-                        t.to_dtype(DType::F32)
-                            .map_err(|e| JammiError::FineTune(format!("{e}")))?
-                    };
-                    t.to_scalar::<f32>()
-                        .map_err(|e| JammiError::FineTune(format!("{e}")))
-                });
-            if let (Ok(ps_val), Ok(ns_val)) = (ps, ns) {
-                *epoch_pos_sim += ps_val as f64;
-                *epoch_neg_sim += ns_val as f64;
-                *triplet_count += 1;
+        else {
+            return;
+        };
+
+        let batch_mean_f32 = |a: &Tensor, b: &Tensor| -> Result<Tensor> {
+            let sim = cosine_similarity(a, b)?;
+            let mean = sim
+                .mean_all()
+                .map_err(|e| JammiError::FineTune(format!("{e}")))?;
+            if mean.dtype() == DType::F32 {
+                Ok(mean)
+            } else {
+                mean.to_dtype(DType::F32)
+                    .map_err(|e| JammiError::FineTune(format!("{e}")))
             }
-        }
+        };
+
+        let (Ok(ps), Ok(ns)) = (
+            batch_mean_f32(anchor, positive),
+            batch_mean_f32(anchor, negative),
+        ) else {
+            return;
+        };
+
+        let fold = |acc: &Option<Tensor>, new: &Tensor| -> Result<Tensor> {
+            match acc {
+                None => Ok(new.clone()),
+                Some(prev) => (prev + new).map_err(|e| JammiError::FineTune(format!("{e}"))),
+            }
+        };
+        let (Ok(next_pos), Ok(next_neg)) = (fold(epoch_pos_sim, &ps), fold(epoch_neg_sim, &ns))
+        else {
+            return;
+        };
+        *epoch_pos_sim = Some(next_pos);
+        *epoch_neg_sim = Some(next_neg);
+        *triplet_count += 1;
     }
 
     /// Process a single batch loss: divergence detection, gradient accumulation
@@ -1457,6 +1538,8 @@ impl TrainingLoop {
             .backward()
             .map_err(|e| JammiError::FineTune(format!("Backward: {e}")))?;
 
+        #[cfg(test)]
+        PER_MICRO_BATCH_HOST_READ_COUNT.fetch_add(1, Ordering::Relaxed);
         let loss_val = loss_f32
             .to_scalar::<f32>()
             .map_err(|e| JammiError::FineTune(format!("Loss scalar: {e}")))?
@@ -1504,6 +1587,10 @@ impl TrainingLoop {
             let lr = compute_lr(&self.config, *epoch.global_step, ctx.total_steps);
             ctx.optimizer.set_learning_rate(lr);
 
+            // See the flush-window call site's doc: `ctx.total_steps` is
+            // the whole run's optimizer-step horizon, so this names the
+            // run's actual final optimizer step, not just this epoch's.
+            let is_last_step = *epoch.global_step + 1 >= ctx.total_steps;
             clip_and_step(
                 ctx.optimizer,
                 ctx.trainable_vars,
@@ -1511,6 +1598,7 @@ impl TrainingLoop {
                 self.config.max_grad_norm,
                 DEFAULT_NORM_CHECK_INTERVAL,
                 *epoch.global_step + 1,
+                is_last_step,
             )?;
             // Reset to a fresh, empty accumulator for the next window —
             // `mem::take` swaps in `GradStore::default()` and discards the
@@ -2444,6 +2532,42 @@ fn cosine_similarity(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     (&dot / &denom).map_err(|e| JammiError::FineTune(format!("cos_sim div: {e}")))
 }
 
+/// B2 premise pin: the "no bounded HtoD-cache API exists" reasoning behind
+/// removing the run-held cache guard (see the `NOT held: candle's
+/// CUDA_GRAPH_HTOD_CACHE` doc above the epoch loop in [`TrainingLoop::run`])
+/// is read straight off candle-core 0.11.0's `cuda_backend/device.rs` — a
+/// version-specific fact, not a permanent one. `cuda_backend` is private to
+/// candle-core, so this crate cannot probe its `CudaGraphHtodCacheGuard` type
+/// for a `clear`/`capacity` method directly (and the `cuda` feature cannot
+/// build locally anyway — no nvcc); pinning the dependency's resolved version
+/// in the workspace lockfile is the compile-time-checkable proxy available
+/// everywhere. This fails the moment `candle-core` moves off `0.11.0`,
+/// forcing a human to re-read the new `cuda_backend/device.rs` for an
+/// eviction/bounded-capacity API before a run-held HtoD-cache guard is ever
+/// reinstated.
+#[cfg(test)]
+mod cuda_htod_cache_premise_pin {
+    #[test]
+    fn candle_core_is_still_the_audited_0_11_0() {
+        let lock = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"));
+        let idx = lock
+            .find("name = \"candle-core\"")
+            .expect("candle-core must appear in the workspace Cargo.lock");
+        let version_line = lock[idx..]
+            .lines()
+            .nth(1)
+            .expect("a version line must follow the candle-core package name");
+        assert_eq!(
+            version_line.trim(),
+            "version = \"0.11.0\"",
+            "candle-core moved off the audited 0.11.0 — before reinstating a \
+             run-held HtoD-cache guard, re-read the new cuda_backend/device.rs \
+             for an eviction or bounded-capacity API (see TrainingLoop::run's \
+             doc on why this guard was removed)."
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::regression_loss::{
@@ -3329,6 +3453,194 @@ mod tests {
             l_crossing > l_ordered,
             "a crossing head must cost more than an ordered one \
              (crossing {l_crossing}, ordered {l_ordered})"
+        );
+    }
+}
+
+/// Host-read accounting for the per-micro-batch training path (B3 close):
+/// [`TrainingLoop::accumulate_sim_stats`] must issue ZERO device→host reads
+/// (it used to do two `to_scalar::<f32>()` per triplet micro-batch, BEFORE
+/// `backward` ever ran), and [`TrainingLoop::process_batch_loss`] must issue
+/// exactly ONE (its post-backward loss read) — for every loss arm, since
+/// `process_batch_loss` takes an already-computed loss [`Tensor`] and never
+/// branches on which objective produced it, so exercising it once here
+/// structurally covers CoSENT/MNRL/Triplet/CE/regression alike.
+#[cfg(test)]
+mod host_read_discipline {
+    use std::sync::Arc;
+
+    use candle_core::{DType, Device, Tensor};
+    use candle_nn::{ParamsAdamW, VarBuilder, VarMap};
+    use serial_test::serial;
+
+    use super::super::data::TrainingBatch;
+    use super::super::lora::build_distribution_head;
+    use super::super::target::TrainingTarget;
+    use super::super::FineTuneConfig;
+    use super::{
+        per_micro_batch_host_read_count, EpochState, StepContext, TrainingLoop, TrainingLoopBuilder,
+    };
+    use crate::fine_tune::adamw::AdamW;
+
+    const HIDDEN: usize = 4;
+
+    /// A minimal real [`TrainingLoop`]. `process_batch_loss` and
+    /// `accumulate_sim_stats` never touch the catalog (only `TrainingLoop::run`
+    /// does, via `mark_training_running`), so this skips the register/create/
+    /// claim job plumbing the production-dispatch oracles elsewhere in this
+    /// file use for that reason — an empty, unclaimed catalog is enough here.
+    async fn minimal_loop(device: &Device) -> TrainingLoop {
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
+        let config = FineTuneConfig::default();
+        let head = build_distribution_head(HIDDEN, 2, &config, &varmap, &vb).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.keep();
+        let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir_path).await.unwrap());
+        TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+            .device(device.clone())
+            .job_id("host-read-oracle-job".into())
+            .worker_id("host-read-oracle-worker".into())
+            .catalog(catalog)
+            .artifact_dir(dir_path)
+            .build()
+            .unwrap()
+    }
+
+    // The three tests below all read `PER_MICRO_BATCH_HOST_READ_COUNT`
+    // (directly, or indirectly by calling `accumulate_sim_stats`/
+    // `process_batch_loss`). `cargo test` runs tests in parallel threads
+    // within the SAME process, so an unmarked set racing on that counter
+    // would be flaky; `#[serial(..)]` under a shared key forces them to run
+    // one at a time relative to each other.
+
+    #[test]
+    #[serial(trainer_host_read_count)]
+    fn accumulate_sim_stats_never_reads_the_device_back() {
+        let device = Device::Cpu;
+        let anchor = Tensor::new(&[[1.0f32, 0.0], [0.0, 1.0]], &device).unwrap();
+        let positive = Tensor::new(&[[1.0f32, 0.0], [0.0, 1.0]], &device).unwrap();
+        let negative = Tensor::new(&[[0.0f32, 1.0], [1.0, 0.0]], &device).unwrap();
+        let batch = TrainingBatch::Triplet {
+            anchor,
+            positive,
+            negative,
+        };
+
+        let mut pos: Option<Tensor> = None;
+        let mut neg: Option<Tensor> = None;
+        let mut count = 0usize;
+
+        let before = per_micro_batch_host_read_count();
+        TrainingLoop::accumulate_sim_stats(&batch, &mut pos, &mut neg, &mut count);
+        assert_eq!(
+            per_micro_batch_host_read_count(),
+            before,
+            "accumulate_sim_stats must not perform any device→host read"
+        );
+        assert_eq!(count, 1);
+
+        // Numeric correctness of the on-device fold survives the move off
+        // host `f64` accumulation: cosine similarity of identical rows is
+        // 1.0 (positive pair), of the swapped/orthogonal rows is 0.0
+        // (negative pair) — read back ONCE here, in the test, which is not
+        // the per-micro-batch path this oracle guards.
+        let pos_val: f32 = pos.unwrap().to_scalar().unwrap();
+        let neg_val: f32 = neg.unwrap().to_scalar().unwrap();
+        assert!((pos_val - 1.0).abs() < 1e-5, "got {pos_val}");
+        assert!(neg_val.abs() < 1e-5, "got {neg_val}");
+    }
+
+    #[test]
+    #[serial(trainer_host_read_count)]
+    fn accumulate_sim_stats_ignores_non_triplet_batches_without_reading() {
+        let device = Device::Cpu;
+        let batch = TrainingBatch::Regression {
+            input: Tensor::zeros((2, 2), DType::F32, &device).unwrap(),
+            target: Tensor::zeros((2,), DType::F32, &device).unwrap(),
+        };
+        let mut pos: Option<Tensor> = None;
+        let mut neg: Option<Tensor> = None;
+        let mut count = 0usize;
+
+        let before = per_micro_batch_host_read_count();
+        TrainingLoop::accumulate_sim_stats(&batch, &mut pos, &mut neg, &mut count);
+        assert_eq!(per_micro_batch_host_read_count(), before);
+        assert_eq!(count, 0);
+        assert!(pos.is_none());
+        assert!(neg.is_none());
+    }
+
+    /// RED-first (B3): before this fix, `accumulate_sim_stats` did two
+    /// `to_scalar::<f32>()` calls on every triplet micro-batch, BEFORE
+    /// `backward` ever ran. Mutation tried: reinstate a `to_scalar` inside
+    /// `accumulate_sim_stats` (re-add the old per-call host read that used to
+    /// populate `epoch_pos_sim`/`epoch_neg_sim` as `f64`s directly, instead of
+    /// folding device tensors) — `accumulate_sim_stats_never_reads_the_device_
+    /// back` above goes red because the counter moves. Separately,
+    /// `process_batch_loss`'s ONE remaining read is pinned here: mutation
+    /// tried — delete the counter increment at its post-backward
+    /// `to_scalar` — this test goes red (`before` instead of `before + 1`).
+    #[test]
+    #[serial(trainer_host_read_count)]
+    fn process_batch_loss_reads_the_device_exactly_once_per_micro_batch() {
+        let device = Device::Cpu;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut loop_ = rt.block_on(minimal_loop(&device));
+
+        // A loss tensor built from an arbitrary trainable var. `process_batch_loss`
+        // never branches on which loss function produced its `loss` argument, so
+        // this structurally covers every loss arm — the read this test pins is
+        // the same call regardless of whether the loss came from CoSENT, MNRL,
+        // triplet margin, classification CE, or a regression objective.
+        let trainable_vars = loop_.varmap.all_vars();
+        let w = trainable_vars[0].clone();
+        let loss = w.as_tensor().sqr().unwrap().sum_all().unwrap();
+
+        let mut optimizer = AdamW::new(
+            trainable_vars.clone(),
+            ParamsAdamW {
+                lr: 0.01,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut batch_count = 0usize;
+        let mut epoch_loss = 0.0f64;
+        let mut accumulated_grads = candle_core::backprop::GradStore::default();
+        let mut grads_pending = false;
+        let mut global_step = 0usize;
+        let checkpoint_dir = tempfile::tempdir().unwrap();
+
+        let before = per_micro_batch_host_read_count();
+        loop_
+            .process_batch_loss(
+                loss,
+                EpochState {
+                    batch_count: &mut batch_count,
+                    epoch_loss: &mut epoch_loss,
+                    accumulated_grads: &mut accumulated_grads,
+                    grads_pending: &mut grads_pending,
+                    global_step: &mut global_step,
+                },
+                StepContext {
+                    trainable_vars: &trainable_vars,
+                    optimizer: &mut optimizer,
+                    checkpoint_dir: checkpoint_dir.path(),
+                    checkpoint_interval: 0,
+                    total_steps: 1,
+                    batches_per_epoch: 1,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            per_micro_batch_host_read_count(),
+            before + 1,
+            "process_batch_loss must issue exactly one device→host read per micro-batch"
         );
     }
 }

@@ -20,22 +20,73 @@
 #      number; what the #352 throughput ratio is measured against).
 # Emits one merged JSON report + a printed table: s/step p50, triplets/s,
 # peak VRAM (delta, comparable across stacks, and absolute where torch has
-# it — see "VRAM columns" below), the fused-kernel dispatch counters on
-# every jammi-fused row (the positive-proof channel: fused > 0 AND eager ==
-# 0 is what "the fused path actually ran" looks like — a step-time win
-# alone cannot distinguish that from "fused silently fell back and eager
-# was just fast"), the ratio jammi-fused/torch-sdpa, and a PASS/FAIL against
-# #352's bar (>= 0.9x torch-sdpa throughput at matched batch/seq, no OOM on
-# a config torch itself completed). Like every jammi-bench tier, this
-# RECORDS — it does not gate the process exit code on a config missing the
-# bar; a FAIL row is data for a human to read, not an infrastructure
-# failure (see finetune_step.rs's own module doc). The script's own exit
-# code reflects whether the sweep RAN, not whether every config passed.
+# it — see "VRAM columns" below), EVERY fused-kernel dispatch counter PAIR
+# present in the jammi-fused report (the positive-proof channel `ab_merge.py`'s
+# `fused_proof` computes: `eager == 0` on EVERY pair, ALWAYS, no exceptions —
+# but `fused > 0` is NOT a flat per-pair rule; it is the classification
+# `ab_merge.py`'s `REQUIRED_PAIRS`/`ABSORBABLE_BY_ATTENTION_BLOCK`/
+# `LORA_SITE_EXCLUSIVE_GROUP` (their union, `ALL_BASES`) declares and that
+# module's own doc is the authority on — restated here only for a reader of
+# THIS script, not duplicated logic:
+#     * ln, geglu, attention_block   — each MUST independently show fused > 0.
+#     * rope, softmax                — MUST be present; may read (0, 0) ONLY
+#                                       when attention_block's OWN fused count
+#                                       is > 0 this run (its fused arm folds
+#                                       RoPE+softmax into itself and never
+#                                       calls their independent sites at all);
+#                                       otherwise each independently needs
+#                                       fused > 0.
+#     * lora_epilogue, lora_linear   — MUST both be present; mutually
+#                                       EXCLUSIVE call sites for the same LoRA
+#                                       adapted forward, so only their SUM
+#                                       needs fused > 0 — either one alone may
+#                                       legitimately read (0, 0).
+# Every classified base (present in `ALL_BASES`) must be PRESENT in the
+# report at all — an ABSENT pair (the field renamed, deleted, or
+# feature-gated off) is a hard fail for every one of them, never silently
+# excluded. A pair discovered in the report but NOT in `ALL_BASES` (a NEW
+# fused kernel this script's classification tables were never updated for)
+# is a loud per-config schema-drift ERROR, not a silently-ignored base — see
+# `fused_proof`/`dispatch_pairs` in the merge stage for the full rule table
+# and "whatever lands next" being read off the report's own keys rather than
+# a hardcoded name list), each leg's per-step loss_first->loss_last and a
+# loss_final_ratio jammi-fused/torch-sdpa column (SAME DATA, COST FIXTURE —
+# NOT A QUALITY RESULT, printed only so a large divergence is visible — see
+# "loss_final_ratio" below), the ratio jammi-fused/torch-sdpa, and a
+# PASS/FAIL against #352's bar (>= 0.9x torch-sdpa throughput at matched
+# batch/seq, no OOM on a config torch itself completed). Like every
+# jammi-bench tier, this RECORDS — it does not gate the process exit code
+# on a config missing the bar; a FAIL row is data for a human to read, not
+# an infrastructure failure (see finetune_step.rs's own module doc). The
+# script's own exit code reflects whether the sweep RAN, not whether every
+# config passed — WITH ONE CARVE-OUT (advisory iv, round-2 audit fix on
+# PR #372): a config whose `fused_proof` check FAILED or ERRORED reads
+# `INVALID`, not `FAIL`/`PASS`, and `ab_merge.py`'s own exit code DOES go
+# non-zero on an `INVALID` config — a failed proof means the fused kernels
+# may not have actually dispatched at all, so the ratio-based PASS/FAIL
+# classification above it is not trustworthy; that is a correctness-of-
+# measurement question, not a machine-dependent performance number, and is
+# the one thing this doctrine gates on.
 #
 # NOT covered here: loss-TRAJECTORY equivalence between jammi-fused and
 # jammi-eager (the #352 quality constraint) is a REAL-TRAINER check over
 # >= 5 seeds reusing C0's distributional oracle machinery — a different,
-# slower harness than this one-step-timing sweep. Run it separately.
+# slower harness than this one-step-timing sweep. Run it separately. The
+# loss_first/loss_last/loss_final_ratio columns THIS script prints are a
+# different, weaker thing: one synthetic-data cost-fixture step count from
+# `finetune-step`/`torch_finetune_step.py` itself, printed for visibility,
+# never a substitute for that real-trainer check.
+#
+# loss_final_ratio (jammi-fused loss_last / torch-sdpa loss_last): SAME
+# DATA (both stacks feed the identical synthetic token ids — the two
+# scripts' `synthetic_ids` are a literal LCG port of each other; see
+# torch_finetune_step.py's module doc), but NOT a quality result: the two
+# stacks run different attention-kernel arithmetic and, at this script's
+# `--lora-init peft` default, different LoRA init distributions, so a ratio
+# far from 1.0 does not indicate either stack regressed — it indicates the
+# comparison's preconditions (matched init, matched attention arithmetic)
+# were not met, which is exactly why this rides as a printed reference, not
+# a gated bar.
 #
 # Leg resolution is BY COMMIT SUBJECT, never by position in history or a
 # hardcoded SHA (the stale-build lesson generalized: a script that names a
@@ -81,9 +132,14 @@
 # jammi-bench's own CLI defaults (rank 8 / alpha 16), which differ from the
 # torch reference script's C8-contract defaults (rank 16 / alpha 32) on
 # purpose (see torch_finetune_step.py's --lora-rank/--lora-alpha help text).
-# --lora-init is always `peft` here (these are throughput rows, where the
-# adapter's initial values do not matter — see torch_finetune_step.py's own
-# LoRA-init section for when `--lora-init jammi` is the right call instead).
+# --lora-init defaults to `peft` (AB_TORCH_LORA_INIT, below) — right for
+# throughput rows, where the adapter's initial values do not matter. Set
+# AB_TORCH_LORA_INIT=jammi to sweep the loss-TRAJECTORY-equivalence
+# precondition instead (torch_finetune_step.py re-draws every lora_A matrix
+# from jammi's own bound — see that script's own LoRA-init section). jammi's
+# own leg always uses its LoraInitMode::ZerosB init; it has no CLI knob for
+# this today, so it is not itself switchable — the merged report's
+# top-level "lora_init" block records which value each side actually used.
 #
 # Env vars:
 #   MODEL_DIR            checkpoint dir (config.json + weights) BOTH stacks
@@ -95,6 +151,12 @@
 #                         matching both CLIs' own defaults).
 #   AB_SEED               synthetic-data + init seed (default 42).
 #   AB_PASS_RATIO         the #352 throughput bar (default 0.9).
+#   AB_TORCH_LORA_INIT    torch_finetune_step.py's --lora-init for BOTH
+#                         torch legs (default "peft" — throughput rows;
+#                         "jammi" is required before a loss_final_ratio
+#                         column means anything as a trajectory-equivalence
+#                         signal — see torch_finetune_step.py's own LoRA-init
+#                         section). Must be "peft" or "jammi".
 #   AB_OUT_DIR            where the merged report + table land (default
 #                         "<repo>/.ab-report/<UTC timestamp>").
 #   TORCH_VENV            torch venv path (default "<repo>/.venv-torch-ref").
@@ -126,6 +188,14 @@ AB_STEPS="${AB_STEPS:-20}"
 AB_WARMUP="${AB_WARMUP:-5}"
 AB_SEED="${AB_SEED:-42}"
 AB_PASS_RATIO="${AB_PASS_RATIO:-0.9}"
+AB_TORCH_LORA_INIT="${AB_TORCH_LORA_INIT:-peft}"
+case "$AB_TORCH_LORA_INIT" in
+  peft|jammi) ;;
+  *)
+    echo "::error::AB_TORCH_LORA_INIT must be 'peft' or 'jammi', got '${AB_TORCH_LORA_INIT}'."
+    exit 2
+    ;;
+esac
 TORCH_VENV="${TORCH_VENV:-$REPO_ROOT/.venv-torch-ref}"
 
 MODEL_DIR="${MODEL_DIR:-}"
@@ -243,7 +313,7 @@ run_torch_leg() {
     --steps "$AB_STEPS" --warmup "$AB_WARMUP"
     --lora-rank 16 --lora-alpha 32 --lora-dropout "$dropout"
     --target-modules "Wqkv,Wo,Wi"
-    --dtype bf16 --attn "$attn" --lora-init peft
+    --dtype bf16 --attn "$attn" --lora-init "$AB_TORCH_LORA_INIT"
     --cuda "$AB_CUDA_ORDINAL" --seed "$AB_SEED"
   )
   run_leg "$config_slug" "$leg" "${cmd[@]}"
@@ -371,189 +441,15 @@ checkout_and_build "$ORIGINAL_REF"
 # ---------------------------------------------------------------------- #
 # merge + table
 # ---------------------------------------------------------------------- #
-python3 - "$RAW_DIR" "$OUT_DIR" "$AB_STEPS" "$AB_WARMUP" "$AB_PASS_RATIO" <<'PYEOF'
-import json
-import os
-import sys
-
-RAW_DIR, OUT_DIR, STEPS, WARMUP, PASS_RATIO_S = sys.argv[1:6]
-PASS_RATIO = float(PASS_RATIO_S)
-LEGS = ["jammi-eager", "jammi-fused", "torch-eager", "torch-sdpa"]
-
-
-def load_leg(config_slug, leg):
-    base = os.path.join(RAW_DIR, f"{config_slug}__{leg}")
-    exit_path, out_path, err_path = base + ".exit", base + ".json", base + ".stderr"
-    if not os.path.exists(exit_path):
-        return {"outcome": "MISSING", "err_tail": "", "report": None}
-
-    exit_code = open(exit_path).read().strip()
-    err_tail = ""
-    if os.path.exists(err_path):
-        err_lines = open(err_path, errors="replace").read().splitlines()
-        err_tail = "\n".join(err_lines[-5:])
-
-    report = None
-    try:
-        with open(out_path) as fh:
-            report = json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        report = None
-
-    if report is not None and (report.get("tool") == "dry-run" or report.get("ab_dry_run") is True):
-        return {"outcome": "DRY_RUN", "err_tail": "", "report": None}
-
-    if exit_code != "0" or report is None:
-        low = err_tail.lower()
-        oom_markers = ("out of memory", "cuda_error_out_of_memory", "cublas_status_alloc_failed", "outofmemoryerror")
-        outcome = "OOM" if any(m in low for m in oom_markers) else "FAIL"
-        return {"outcome": outcome, "err_tail": err_tail, "report": None}
-
-    return {"outcome": "OK", "err_tail": "", "report": report}
-
-
-def finetune_block(report, leg):
-    return report["tiers"]["finetune_step"] if leg.startswith("jammi") else report["finetune_step"]
-
-
-def metrics(entry, leg):
-    if entry["outcome"] != "OK":
-        return None
-    fs = finetune_block(entry["report"], leg)
-    m = {
-        "s_per_step_p50": fs["s_per_step_p50"]["value"],
-        "triplets_per_s": fs["triplets_per_s"]["value"],
-    }
-    if leg.startswith("jammi"):
-        m["vram_delta_bytes"] = fs["peak_vram_bytes"]["value"]
-        m["vram_absolute_bytes"] = None
-        m["ln_fused"], m["ln_eager"] = fs["ln_fused_dispatches"], fs["ln_eager_dispatches"]
-        m["rope_fused"], m["rope_eager"] = fs["rope_fused_dispatches"], fs["rope_eager_dispatches"]
-        m["softmax_fused"], m["softmax_eager"] = fs["softmax_fused_dispatches"], fs["softmax_eager_dispatches"]
-    else:
-        m["vram_delta_bytes"] = fs["peak_vram_delta_bytes"]["value"]
-        m["vram_absolute_bytes"] = fs["peak_vram_absolute_bytes"]["value"]
-    return m
-
-
-def fused_proof(m):
-    if m is None:
-        return None
-    return (
-        m["ln_fused"] > 0 and m["ln_eager"] == 0
-        and m["rope_fused"] > 0 and m["rope_eager"] == 0
-        and m["softmax_fused"] > 0 and m["softmax_eager"] == 0
-    )
-
-
-def fmt(v, nd=4):
-    return "n/a" if v is None else f"{v:.{nd}f}"
-
-
-def fmt_bytes(v):
-    return "n/a" if v is None else f"{int(v):,}"
-
-
-def config_slugs():
-    slugs = set()
-    if os.path.isdir(RAW_DIR):
-        for name in os.listdir(RAW_DIR):
-            if name.endswith(".exit") and "__" in name:
-                slugs.add(name.split("__", 1)[0])
-    return sorted(slugs)
-
-
-slugs = config_slugs()
-if not slugs:
-    print(f"finetune_ab: FAIL — no leg output found under {RAW_DIR}", file=sys.stderr)
-    sys.exit(1)
-
-merged = {"steps": STEPS, "warmup": WARMUP, "pass_ratio_bar": PASS_RATIO, "configs": {}}
-table_rows = []
-summary_rows = []
-
-for slug in slugs:
-    entries = {leg: load_leg(slug, leg) for leg in LEGS}
-    leg_metrics = {leg: metrics(entries[leg], leg) for leg in LEGS}
-    proof = fused_proof(leg_metrics["jammi-fused"])
-
-    for leg in LEGS:
-        table_rows.append((slug, leg, entries[leg]["outcome"], leg_metrics[leg],
-                            proof if leg == "jammi-fused" else None, entries[leg]["err_tail"]))
-
-    fused_m, sdpa_m = leg_metrics["jammi-fused"], leg_metrics["torch-sdpa"]
-    ratio = fused_m["triplets_per_s"] / sdpa_m["triplets_per_s"] if (
-        fused_m and sdpa_m and sdpa_m["triplets_per_s"]
-    ) else None
-
-    any_dry_run = any(entries[leg]["outcome"] == "DRY_RUN" for leg in LEGS)
-    torch_fits = entries["torch-sdpa"]["outcome"] == "OK"
-    jammi_fused_fits = entries["jammi-fused"]["outcome"] == "OK"
-
-    # The #352 bar is "no OOM where torch fits" — it binds ONLY when
-    # torch-sdpa itself succeeded. If torch-sdpa didn't fit, there is no
-    # baseline to hold jammi-fused to and the bar does not apply — that is
-    # NOT the same thing as jammi failing, and must not print as FAIL.
-    if any_dry_run:
-        verdict = "N/A (dry-run)"
-    elif not torch_fits:
-        verdict = f"N/A (torch-sdpa itself did not fit: {entries['torch-sdpa']['outcome']} — bar does not apply)"
-    elif not jammi_fused_fits:
-        verdict = f"FAIL (OOM where torch fits: jammi-fused {entries['jammi-fused']['outcome']})"
-    elif ratio is None:
-        verdict = "FAIL (no ratio: triplets_per_s missing on an OK leg — investigate)"
-    elif ratio < PASS_RATIO:
-        verdict = f"FAIL (ratio {ratio:.3f} < {PASS_RATIO})"
-    else:
-        verdict = f"PASS (ratio {ratio:.3f})"
-    if proof is False:
-        verdict += " [WARN: fused-dispatch proof missing — fused>0/eager==0 did not hold]"
-
-    summary_rows.append((slug, ratio, verdict))
-    merged["configs"][slug] = {
-        "legs": {leg: {"outcome": entries[leg]["outcome"], "metrics": leg_metrics[leg]} for leg in LEGS},
-        "jammi_fused_dispatch_proof": proof,
-        "ratio_jammi_fused_over_torch_sdpa": ratio,
-        "verdict": verdict,
-    }
-
-os.makedirs(OUT_DIR, exist_ok=True)
-with open(os.path.join(OUT_DIR, "finetune_ab_report.json"), "w") as fh:
-    json.dump(merged, fh, indent=2)
-
-lines = [
-    "# finetune A/B -- jammi eager vs jammi fused vs torch eager vs torch sdpa",
-    f"# steps={STEPS} warmup={WARMUP} pass_bar={PASS_RATIO}x torch-sdpa triplets/s, no OOM where torch fits",
-    "# loss-trajectory equivalence (jammi-fused vs jammi-eager, real trainer, >=5 seeds) is a SEPARATE check -- not measured here.",
-    f"{'config':<16}{'leg':<13}{'outcome':<9}{'s/step_p50':<12}{'triplets/s':<12}"
-    f"{'vram_delta(comparable)':<24}{'vram_absolute(torch only)':<27}{'fused_proof':<12}",
-]
-for slug, leg, outcome, m, proof_val, err_tail in table_rows:
-    p50 = fmt(m["s_per_step_p50"]) if m else "n/a"
-    tps = fmt(m["triplets_per_s"]) if m else "n/a"
-    vd = fmt_bytes(m["vram_delta_bytes"]) if m else "n/a"
-    va = fmt_bytes(m["vram_absolute_bytes"]) if m else "n/a"
-    proof_s = "n/a" if proof_val is None else ("YES" if proof_val else "NO")
-    lines.append(f"{slug:<16}{leg:<13}{outcome:<9}{p50:<12}{tps:<12}{vd:<24}{va:<27}{proof_s:<12}")
-    if outcome not in ("OK", "DRY_RUN") and err_tail:
-        last = err_tail.splitlines()[-1][:120] if err_tail.splitlines() else ""
-        lines.append(f"    -> {last}")
-
-lines.append("")
-lines.append(f"{'config':<16}{'ratio(fused/sdpa)':<20}{'verdict':<60}")
-for slug, ratio, verdict in summary_rows:
-    ratio_s = "n/a" if ratio is None else f"{ratio:.3f}"
-    lines.append(f"{slug:<16}{ratio_s:<20}{verdict:<60}")
-
-table = "\n".join(lines)
-print(table)
-with open(os.path.join(OUT_DIR, "finetune_ab_table.txt"), "w") as fh:
-    fh.write(table + "\n")
-
-sys.exit(0)
-PYEOF
+# B3: this used to be an inline heredoc with zero automated coverage
+# (AB_DRY_RUN=1 only ever exercised the DRY_RUN arm). It is now
+# ci/scripts/perf/ab_merge.py, an importable module `ci/scripts/perf/
+# test_ab_merge.py` drives directly against fixture leg directories — this
+# call is exactly the "real entry point" that test suite exercises.
+python3 "$DIR/ab_merge.py" "$RAW_DIR" "$OUT_DIR" "$AB_STEPS" "$AB_WARMUP" "$AB_PASS_RATIO" "$AB_TORCH_LORA_INIT"
 PY_RC=$?
 
 echo
 echo "=== merged report + table: ${OUT_DIR} ==="
 exit "$PY_RC"
+

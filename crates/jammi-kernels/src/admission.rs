@@ -519,18 +519,77 @@ impl DispatchCounters {
     }
 }
 
+/// One recorded fallback warning: `(op, predicate_key, message)` — see
+/// [`fallback_warnings_emitted`]'s doc for what `predicate_key`
+/// distinguishes.
+type FallbackWarning = (&'static str, &'static str, String);
+
+/// Process-wide, append-only record of every fallback warning this process
+/// has actually EMITTED (not merely "would have logged"): [`FallbackWarning`]
+/// triples, pushed by [`warn_fallback_once_with_message`] in the SAME
+/// guarded block that fires `tracing::warn!`. This is the deterministic
+/// oracle a test asserts against, in place of capturing the `tracing` log
+/// line itself — `tracing`'s callsite `Interest` cache is PROCESS-GLOBAL, so
+/// a thread-local `tracing::subscriber::set_default` guard around one test
+/// races every OTHER test in this shared binary that can reach the same
+/// `tracing::warn!` callsite concurrently (this crate used exactly that
+/// pattern until it flaked under `cargo test --test-threads=N`: a sibling
+/// test on another thread with no subscriber installed could win the
+/// callsite's first-touch `Interest` decision and starve this test's
+/// capture of every event). A plain, process-wide `Mutex<Vec<_>>` has no
+/// such hazard: every thread that reaches this function pushes into the
+/// SAME vector regardless of scheduling, and [`fallback_warnings_emitted`]
+/// reads it directly — no subscriber, no callsite cache, no thread-local
+/// guard.
+///
+/// Same provenance family as [`disabled_ops_fired`]: an append-only,
+/// process-wide record a test (or a durable run artifact) can assert
+/// against deterministically rather than eyeballing a log stream.
+fn fallback_warnings() -> &'static Mutex<Vec<FallbackWarning>> {
+    static WARNINGS: OnceLock<Mutex<Vec<FallbackWarning>>> = OnceLock::new();
+    WARNINGS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Every fallback warning this process has emitted so far, in emission
+/// order: `(op, predicate_key, message)`. `predicate_key` is either the
+/// call site's own `predicate_name` (a genuine domain-predicate failure —
+/// `warn_predicate_failed_once`'s path) or the literal
+/// `"disabled_by_JAMMI_KERNELS_DISABLE"` (`warn_disabled_once`'s path,
+/// the same fixed key `op_is_disabled`'s callers use elsewhere in this
+/// module) — the two are always distinguishable by this field alone,
+/// without needing to compare `message` text. See `fallback_warnings`'s
+/// doc for why this is the oracle a test asserts against instead of a
+/// captured `tracing` log line.
+pub fn fallback_warnings_emitted() -> Vec<FallbackWarning> {
+    fallback_warnings()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
 /// Emits a `tracing::warn!` at most once per process for a given
 /// `(op, predicate)` pair, with `message` as the log line — split out from
 /// [`warn_fallback_once`] so [`warn_disabled_once`] can share the SAME
 /// log-once-per-process dedup set while emitting a message that does not
 /// misattribute a deliberate `JAMMI_KERNELS_DISABLE` instruction as a
 /// "domain check failed" defect.
+///
+/// Records into [`fallback_warnings`] in the SAME guarded block that fires
+/// `tracing::warn!` — a mutation that replaces this function's body (or
+/// [`warn_fallback_once`]'s) wholesale with `()` removes BOTH the log line
+/// and the record, so [`fallback_warnings_emitted`] coming back without
+/// the expected entry is what a test observes; it does not need to capture
+/// the `tracing` output at all.
 fn warn_fallback_once_with_message(op: &'static str, predicate: &'static str, message: &str) {
     static SEEN: OnceLock<Mutex<HashSet<(&'static str, &'static str)>>> = OnceLock::new();
     let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
     let mut seen = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if seen.insert((op, predicate)) {
         tracing::warn!(op, predicate, "{message}");
+        fallback_warnings()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((op, predicate, message.to_string()));
     }
 }
 
@@ -548,19 +607,36 @@ pub fn warn_fallback_once(op: &'static str, predicate: &'static str) {
     );
 }
 
-/// Parses `JAMMI_KERNELS_DISABLE`'s raw value into the requested op-key
-/// set: comma-separated, each entry trimmed, empty entries dropped (a
-/// trailing comma or stray whitespace must not manufacture a bogus `""`
-/// entry that [`unmatched_disables`] would then report as unmatched
-/// forever). `None` (unset) and `Some("")`/an all-whitespace/all-comma
-/// value collapse to the SAME empty set — [`op_is_disabled`] treats an
-/// empty set as unconditionally inert, so unset and "set but empty" are
-/// byte-identical in their effect on [`admit`].
+/// Parses a `JAMMI_KERNELS_DISABLE`-shaped value into an op-key SET:
+/// comma-separated, each entry trimmed, empty entries dropped (a trailing
+/// comma or stray whitespace must not manufacture a bogus `""` entry that
+/// [`unmatched_disables`] would then report as unmatched forever), and
+/// DUPLICATES COLLAPSED (a `HashSet`, not a `Vec` — the grammar this
+/// parses is a SET of op keys, not an ordered, possibly-repeating list;
+/// `"foo,foo"` and `"foo"` name the same request). `None` (unset) and
+/// `Some("")`/an all-whitespace/all-comma value collapse to the SAME empty
+/// set — `op_is_disabled` treats an empty set as unconditionally inert,
+/// so unset and "set but empty" are byte-identical in their effect on
+/// [`admit`].
 ///
-/// Pure/no I/O — split out from [`disabled_ops`] so the parsing edge
+/// Public and reused verbatim by `jammi-bench`'s `--expect-kernels-disabled`
+/// flag (`crates/jammi-bench/src/main.rs`): that flag's value and
+/// `JAMMI_KERNELS_DISABLE` are the SAME grammar (a caller states the SAME
+/// disable list two ways — one via the env var this process reads, one via
+/// an argv claim about what it expects that env var to carry), so there is
+/// exactly ONE parser for it. A round-3 audit found `--expect-kernels-disabled`
+/// had grown a SECOND, divergent parser that collected into a `Vec` with no
+/// dedup: `JAMMI_KERNELS_DISABLE=op --expect-kernels-disabled op,op` then
+/// compared `disabled_ops_requested()`'s deduplicated `["op"]` against the
+/// duplicate-preserving `["op", "op"]` and hard-failed a VALID leg, blaming
+/// a dropped env var that was never dropped. Both parsers reading through
+/// this one function makes that class of divergence structurally
+/// impossible, not just untested.
+///
+/// Pure/no I/O — split out from `disabled_ops` so the parsing edge
 /// cases are unit-testable with literal inputs, independent of the
 /// process-wide [`OnceLock`] `disabled_ops` memoizes into.
-fn parse_disable_list(raw: Option<&str>) -> HashSet<String> {
+pub fn parse_disable_list(raw: Option<&str>) -> HashSet<String> {
     raw.map(|s| {
         s.split(',')
             .map(str::trim)
@@ -1099,12 +1175,78 @@ mod tests {
 
     #[test]
     fn warn_fallback_once_is_idempotent_per_process() {
-        // Not directly observable from outside (the log line itself isn't
-        // captured here), but calling it twice with the same key must not
-        // panic and the internal set must not grow unbounded per call —
-        // exercised for the side-effect-free contract, not the log output.
+        // Calling it twice with the same key must not panic, and
+        // `fallback_warnings_emitted()` must record exactly ONE entry for
+        // this (op, predicate) pair regardless of how many times it fires
+        // — the `seen.insert` dedup guards the push the same way it guards
+        // the `tracing::warn!` call.
         warn_fallback_once("dedup_test_op", "dedup_predicate");
         warn_fallback_once("dedup_test_op", "dedup_predicate");
+        warn_fallback_once("dedup_test_op", "dedup_predicate");
+        let count = fallback_warnings_emitted()
+            .iter()
+            .filter(|(op, predicate, _)| *op == "dedup_test_op" && *predicate == "dedup_predicate")
+            .count();
+        assert_eq!(
+            count, 1,
+            "a log-once-per-process key must record exactly one entry no matter how many times it fires"
+        );
+    }
+
+    /// Cell 3 and cell 5's messages are not merely non-equal by accident —
+    /// this drives BOTH `admit_inner` arms itself (through a dedicated,
+    /// test-unique op name, so this assertion is independent of whichever
+    /// other test happens to run first/concurrently) and asserts the two
+    /// recorded messages differ. Replaces
+    /// `disabled_path_warn_message_is_distinct_from_a_genuine_predicate_failure`
+    /// (removed): that test proved the same property via a thread-local
+    /// `tracing::subscriber::set_default` guard racing `tracing`'s
+    /// process-global callsite `Interest` cache against every sibling test
+    /// reaching the same callsite concurrently — flaky under
+    /// `cargo test --test-threads=N` (8/200 runs observed failing in the
+    /// phase-4 audit). `fallback_warnings_emitted()` has no such race.
+    #[test]
+    fn fallback_warning_messages_are_distinct_between_the_disabled_and_predicate_failure_paths() {
+        let op = "fallback_warning_distinctness_op";
+        let counters = DispatchCounters::new();
+
+        admit_inner(
+            AdmissionMode::Fallback,
+            op,
+            "distinctness_pred",
+            false,
+            false,
+            &counters,
+        )
+        .expect("Fallback mode never errors");
+        admit_inner(
+            AdmissionMode::Fallback,
+            op,
+            "distinctness_pred",
+            true,
+            true,
+            &counters,
+        )
+        .expect("a disabled op never errors");
+
+        let warnings = fallback_warnings_emitted();
+        let predicate_failure_message = warnings
+            .iter()
+            .find(|(o, p, _)| *o == op && *p == "distinctness_pred")
+            .map(|(_, _, m)| m.clone())
+            .expect("predicate-failure warn must be recorded");
+        let disabled_message = warnings
+            .iter()
+            .find(|(o, p, _)| *o == op && *p == "disabled_by_JAMMI_KERNELS_DISABLE")
+            .map(|(_, _, m)| m.clone())
+            .expect("disabled warn must be recorded");
+
+        assert_ne!(
+            predicate_failure_message, disabled_message,
+            "a JAMMI_KERNELS_DISABLE forced-eager outcome must never read as a predicate defect, or vice versa"
+        );
+        assert!(predicate_failure_message.contains("fused-kernel domain check failed"));
+        assert!(disabled_message.contains("op disabled via JAMMI_KERNELS_DISABLE"));
     }
 
     /// B4 / advisory (a), belt-and-braces: captures the ACTUAL
@@ -1217,6 +1359,77 @@ mod tests {
         // unit test of the env-var branch itself).
         if std::env::var_os("JAMMI_KERNELS_STRICT").is_none() {
             assert_eq!(admission_mode(), AdmissionMode::Fallback);
+        }
+    }
+
+    /// Round-2 mutants triage (`cargo mutants`: `replace admission_mode ->
+    /// AdmissionMode with Default::default()` MISSED): nothing in this
+    /// crate OR `jammi-bench`'s real-CLI tests previously exercised
+    /// `admission_mode()` actually reading `Strict` from a genuine
+    /// `JAMMI_KERNELS_STRICT` env var — `jammi_encoders::layer_norm`'s
+    /// `strict_mode_errors_instead_of_falling_back_on_a_failed_predicate`
+    /// explicitly bypasses this function (calls `admit` with a literal
+    /// `AdmissionMode::Strict` instead, citing the exact same `OnceLock`
+    /// hazard), and every `jammi-bench` fixture's fused predicates hold
+    /// trivially, so `JAMMI_KERNELS_STRICT=1` there never distinguishes
+    /// Strict from Fallback (disable-wins-over-Strict cells aside). A
+    /// mutant that made `admission_mode()` always return `Fallback` would
+    /// silently turn Strict mode into a no-op everywhere in a real binary
+    /// and nothing would have caught it.
+    ///
+    /// Spawns the ALREADY-COMPILED test binary as a fresh CHILD process
+    /// with the env var set and `--exact` targeting ONLY
+    /// [`admission_mode_child_process_body`] below — a fresh `OnceLock`,
+    /// guaranteed, the same technique
+    /// `crates/jammi-bench/tests/finetune_step_kernel_disable.rs` uses for
+    /// `JAMMI_KERNELS_DISABLE`.
+    #[test]
+    fn admission_mode_reads_strict_from_the_real_env_var_in_a_fresh_process() {
+        let exe = std::env::current_exe().expect("test binary path");
+        let output = std::process::Command::new(exe)
+            .args([
+                "admission::tests::admission_mode_child_process_body",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("JAMMI_KERNELS_STRICT", "1")
+            .env("ADMISSION_MODE_CHILD", "1")
+            .output()
+            .expect("spawn child test binary");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "child process assertion failed: stdout={stdout}\nstderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // Non-vacuity: `cargo test`'s libtest harness exits 0 on a filter
+        // that matches ZERO tests (a typo'd `--exact` path, or a module
+        // rename that silently stops matching, would make this test
+        // "pass" having run NOTHING). Asserting the child actually ran and
+        // passed exactly the one test it was told to run is what makes
+        // `output.status.success()` alone mean what this test claims it
+        // means.
+        assert!(
+            stdout.contains("1 passed"),
+            "the child process must have actually run (and passed) exactly one test — \
+             stdout={stdout}"
+        );
+    }
+
+    /// Only meaningful inside the child process
+    /// [`admission_mode_reads_strict_from_the_real_env_var_in_a_fresh_process`]
+    /// spawns (guarded on `ADMISSION_MODE_CHILD`, the same pattern
+    /// `admission_mode_defaults_to_fallback_without_the_env_var` uses for
+    /// the unset case) — a no-op pass when run directly by the ordinary
+    /// test harness.
+    #[test]
+    fn admission_mode_child_process_body() {
+        if std::env::var_os("ADMISSION_MODE_CHILD").is_some() {
+            assert_eq!(
+                admission_mode(),
+                AdmissionMode::Strict,
+                "JAMMI_KERNELS_STRICT=1 in a fresh process must read as Strict"
+            );
         }
     }
 
@@ -1347,6 +1560,63 @@ mod tests {
             "a genuine predicate failure must be distinguishable from a JAMMI_KERNELS_DISABLE forced-eager outcome"
         );
         assert_eq!(counters.snapshot(), DispatchSnapshot { fused: 0, eager: 1 });
+        // The observability half of cell 3: the ONLY signal that this call
+        // took the eager arm because the PREDICATE failed (not because the
+        // op was disabled) is this warning — see `fallback_warnings`'s doc
+        // for why this is asserted via the process-wide record rather than
+        // a captured `tracing` log line. Kills the `replace
+        // warn_fallback_once with ()` mutant: deleting that call stops
+        // this entry from ever being pushed, while `decision.reason` above
+        // (produced by `warn_predicate_failed_once`'s unconditional return
+        // value, not by the warn call's side effect) would still read
+        // correctly — this assertion is what that mutant needs to survive
+        // past.
+        let warnings = fallback_warnings_emitted();
+        assert!(
+            warnings.iter().any(|(op, predicate, message)| {
+                *op == "lattice_op"
+                    && *predicate == "pred_failed"
+                    && message == "fused-kernel domain check failed; falling back to the eager composition"
+            }),
+            "the predicate-failure warn must actually be recorded for (lattice_op, pred_failed); warnings={warnings:?}"
+        );
+    }
+
+    /// Cell 3's shape again, but through the literal public [`admit`] entry
+    /// point rather than [`admit_inner`] — achievable hermetically here
+    /// (unlike cell 5's disabled arm below) because this arm never
+    /// consults `JAMMI_KERNELS_DISABLE` at all: `op_is_disabled` on the
+    /// real, env-var-backed [`disabled_ops`] returns `false` for any op
+    /// name never named in it, and no test in this binary ever calls
+    /// `std::env::set_var("JAMMI_KERNELS_DISABLE", ..)` in-process (see
+    /// `op_is_disabled`'s doc). Guarded the same way
+    /// `admission_mode_defaults_to_fallback_without_the_env_var` and cell
+    /// 9 are, and a fresh, test-unique op name so a concurrently-running
+    /// test can never make this one's `disabled` observation ambiguous.
+    #[test]
+    fn lattice_cell_03_predicate_failure_warn_is_recorded_through_the_real_admit() {
+        if std::env::var_os("JAMMI_KERNELS_DISABLE").is_none() {
+            let op = "lattice_cell_03_real_admit_warn_op";
+            let counters = DispatchCounters::new();
+            let outcome = admit(
+                AdmissionMode::Fallback,
+                op,
+                "warn_observability_pred",
+                false,
+                &counters,
+            )
+            .expect("Fallback mode never errors");
+            assert_eq!(outcome, DispatchOutcome::Eager);
+            let warnings = fallback_warnings_emitted();
+            assert!(
+                warnings.iter().any(|(o, p, m)| {
+                    *o == op
+                        && *p == "warn_observability_pred"
+                        && m == "fused-kernel domain check failed; falling back to the eager composition"
+                }),
+                "the predicate-failure warn must be recorded through the real admit(); warnings={warnings:?}"
+            );
+        }
     }
 
     #[test]
@@ -1394,6 +1664,44 @@ mod tests {
             "disabling an op with a HOLDING predicate must be attributed to the disable, not a predicate failure"
         );
         assert_eq!(counters.snapshot(), DispatchSnapshot { fused: 0, eager: 1 });
+        // The observability half of cell 5: the ONLY signal on this arm
+        // that the fused predicate WOULD have held but the op ran eager
+        // anyway is this warning (with the fixed
+        // `disabled_by_JAMMI_KERNELS_DISABLE` key, not the call site's own
+        // predicate name) — see `fallback_warnings`'s doc. Kills the
+        // `replace warn_fallback_once_with_message with ()` mutant: that
+        // mutation removes both `warn_disabled_once`'s and
+        // `warn_predicate_failed_once`'s log line AND this push (they
+        // share the one function), while `decision.reason` above would
+        // still read `Some(Disabled)` unaffected (it is the unconditional
+        // return value of `warn_disabled_once`, not derived from the warn
+        // call's side effect) — this assertion is what that mutant needs
+        // to survive past.
+        //
+        // Driven through `admit_inner` (not the literal public [`admit`]):
+        // exercising this arm through `admit` would require setting
+        // `JAMMI_KERNELS_DISABLE` in-process, which races every OTHER test
+        // in this shared binary for who populates `disabled_ops`'s
+        // `OnceLock` first (`op_is_disabled`'s doc). `admit_inner` IS
+        // `admit`'s real decision core once `disabled` has been resolved —
+        // the only thing `admit` adds is that env-var read — so this is
+        // the real admission decision function, not a helper reimplementing
+        // it with literals. The real end-to-end proof that `admit()`'s
+        // disabled arm actually fires through a genuine
+        // `JAMMI_KERNELS_DISABLE` env var lives in
+        // `crates/jammi-bench/tests/finetune_step_kernel_disable.rs`
+        // (`strict_mode_disable_forces_layer_norm_eager_and_the_run_still_succeeds`
+        // and its siblings), which spawns the real CLI in a fresh child
+        // process for exactly this reason.
+        let warnings = fallback_warnings_emitted();
+        assert!(
+            warnings.iter().any(|(op, predicate, message)| {
+                *op == "lattice_op"
+                    && *predicate == "disabled_by_JAMMI_KERNELS_DISABLE"
+                    && message == "op disabled via JAMMI_KERNELS_DISABLE"
+            }),
+            "the disabled-path warn must actually be recorded for (lattice_op, disabled_by_JAMMI_KERNELS_DISABLE); warnings={warnings:?}"
+        );
     }
 
     #[test]

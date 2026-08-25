@@ -325,3 +325,103 @@ fn oracle_compute_lr_goes_negative_past_horizon() {
 // LR honoring is already pinned directly by `compute_lr` (see the `lr_schedule_*`
 // tests in fine_tune.rs) and, for the negative-LR defect, by
 // `oracle_compute_lr_goes_negative_past_horizon` above.
+
+// ════════════════════════════════════════════════════════════════════════════
+// ORACLE 2c — the run's optimizer-step horizon AND its checkpoint cadence, as
+// realised by the loop, over the boundary cases the arithmetic in `run` has
+// to get right:
+//
+//   total_steps         = ceil(batches_per_epoch / grad_accum) * epochs
+//   checkpoint_interval = ceil(total_steps * 0.1)
+//   step checkpoints    = { k in 1..=total_steps : k % checkpoint_interval == 0 }
+//                       → total_steps / checkpoint_interval files
+//
+// Cells: batches not divisible by grad_accum with epochs=1 (the trailing
+// partial-window flush is the run's last step); a horizon ≤ 10 (interval 1:
+// every step checkpoints); a horizon > 10 (interval > 1: only multiples);
+// a horizon that is not a multiple of its interval (the floor in the count).
+// The oracle counts the `checkpoint_{step}.safetensors` files the run left in
+// its artifact dir — the realised cadence, not the formula re-derived.
+// ════════════════════════════════════════════════════════════════════════════
+#[tokio::test(flavor = "multi_thread")]
+async fn oracle_total_steps_and_checkpoint_cadence_boundaries() {
+    let device = Device::Cpu;
+    // (batches_per_epoch, grad_accum, epochs)
+    let cells: [(usize, usize, usize); 4] = [
+        (5, 2, 1),  // partial window, epochs=1: 3 steps, interval 1 → 3 files
+        (7, 3, 2),  // partial window, epochs=2: 6 steps, interval 1 → 6 files
+        (4, 1, 3),  // 12 steps, interval 2 → 6 files
+        (11, 1, 1), // 11 steps, interval 2 → 5 files (floor: step 11 is not a multiple)
+    ];
+    for (n, ga, epochs) in cells {
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let head = build_projection_head(4, &FineTuneConfig::default(), &varmap, &vb).unwrap();
+        let batches: Vec<_> = (0..n).map(|_| learnable_batch(&device)).collect();
+        let loader = TrainingDataLoader::from_precomputed(batches);
+
+        let tag = format!("ckpt-cadence-{n}-{ga}-{epochs}");
+        let (catalog, dir) = claimed_loop_env(&tag).await;
+
+        let mut tl = TrainingLoopBuilder::new(
+            TrainingTarget::ProjectionHead { head },
+            varmap,
+            FineTuneConfig {
+                epochs,
+                batch_size: 1,
+                validation_fraction: 0.0,
+                warmup_steps: 0,
+                gradient_accumulation_steps: ga,
+                early_stopping_metric: jammi_ai::fine_tune::EarlyStoppingMetric::TrainLoss,
+                early_stopping_patience: 10_000,
+                learning_rate: 1e-3,
+                ..Default::default()
+            },
+        )
+        .job_id(tag.clone())
+        .worker_id(format!("{tag}-worker"))
+        .catalog(Arc::clone(&catalog))
+        .artifact_dir(dir.path().to_path_buf())
+        .build()
+        .unwrap();
+
+        let result = tokio::task::spawn_blocking(move || tl.run(&loader))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let total_steps = n.div_ceil(ga) * epochs;
+        let interval = (total_steps as f64 * 0.1).ceil() as usize;
+        let expected_files = total_steps / interval;
+        assert_eq!(
+            result.total_steps, total_steps,
+            "cell (n={n}, ga={ga}, epochs={epochs}): realised steps"
+        );
+
+        let mut step_checkpoints: Vec<usize> = std::fs::read_dir(result.artifact_dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter_map(|name| {
+                name.strip_prefix("checkpoint_")?
+                    .strip_suffix(".safetensors")?
+                    .parse::<usize>()
+                    .ok()
+            })
+            .collect();
+        step_checkpoints.sort_unstable();
+        let expected: Vec<usize> = (1..=total_steps).filter(|k| k % interval == 0).collect();
+        assert_eq!(
+            step_checkpoints, expected,
+            "cell (n={n}, ga={ga}, epochs={epochs}): checkpoint steps at interval {interval}"
+        );
+        assert_eq!(step_checkpoints.len(), expected_files);
+        assert!(
+            result
+                .artifact_dir
+                .path()
+                .join("checkpoint_best.safetensors")
+                .exists(),
+            "cell (n={n}, ga={ga}, epochs={epochs}): the epoch-boundary best checkpoint"
+        );
+    }
+}

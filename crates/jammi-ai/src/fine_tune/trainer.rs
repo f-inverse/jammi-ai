@@ -859,6 +859,15 @@ impl TrainingLoop {
                     is_last_step,
                 )?;
                 global_step += 1;
+                // The flush is an optimizer step like any other, so it sits
+                // on the same step-checkpoint cadence as the in-window steps
+                // in `process_batch_loss` and the GradCache arm — the
+                // trailing step of an epoch whose batch count is not a
+                // multiple of `grad_accum` must not be the one step that
+                // skips its checkpoint.
+                if checkpoint_interval > 0 && global_step.is_multiple_of(checkpoint_interval) {
+                    self.save_checkpoint(&checkpoint_dir, global_step)?;
+                }
             }
 
             let avg_train_loss = epoch_loss / batch_count.max(1) as f64;

@@ -290,10 +290,36 @@ pub struct AttentionBlockFused {
 }
 
 impl AttentionBlockFused {
+    /// `scale.is_finite()` alone only rules out `NaN`/`±inf` — it says
+    /// nothing about the bit-exactness argument the module doc's "Fixed
+    /// domain" section actually rests on: that folding `scale` into `Q`
+    /// BEFORE `QKᵀ` is bit-exact to dividing the score matrix by
+    /// `sqrt(head_dim)` AFTER, which holds ONLY when `scale` is an EXACT
+    /// power of two (an exponent-only shift introduces no mantissa
+    /// rounding; any other value would). The DETERMINANT for "is this f32
+    /// value an exact power of two" is its mantissa bits: IEEE 754
+    /// binary32 stores a normal value as `(1 + mantissa/2^23) * 2^exponent`,
+    /// so a value is an exact power of two (or `0.0`/subnormal, both
+    /// refused separately below) iff its 23-bit mantissa field is entirely
+    /// zero — `scale.to_bits() & 0x007f_ffff == 0`. Refuses any `scale`
+    /// that fails this check with a typed error rather than silently
+    /// accepting a value whose bit-exactness claim this op cannot actually
+    /// make (family D): `0.125` (`1/sqrt(64)`, this op's own production
+    /// value) passes; `0.1` (used by earlier, pre-fix-round test fixtures
+    /// as an "arbitrary" scale) is refused.
     pub fn new(scale: f32, fully_masked: FullyMaskedPolicy, rope: bool) -> Result<Self> {
-        if !scale.is_finite() {
+        if !scale.is_finite() || scale <= 0.0 {
             return Err(Error::Msg(format!(
-                "attention_block_fused: scale must be finite, got {scale}"
+                "attention_block_fused: scale must be finite and strictly positive (matching \
+                 SoftmaxLastDimFused::with_scale's identical domain), got {scale}"
+            )));
+        }
+        if scale.to_bits() & 0x007f_ffff != 0 {
+            return Err(Error::Msg(format!(
+                "attention_block_fused: scale must be an EXACT power of two (nonzero mantissa \
+                 bits: {:#x}) — the fold-scale-into-Q bit-exactness argument (module doc's \
+                 \"Fixed domain\" section) depends on it; got {scale}",
+                scale.to_bits() & 0x007f_ffff
             )));
         }
         Ok(Self {
@@ -1112,6 +1138,20 @@ mod tests {
         assert!(g.iter().all(|&x| x == 0.0), "{g:?}");
     }
 
+    /// `0.125` (`1/sqrt(64)`, this op's own production scale) is an exact
+    /// power of two — accepted; `0.1` has a nonzero f32 mantissa (a
+    /// terminating-but-not-power-of-two binary fraction) — refused. See
+    /// `new`'s own doc for the DETERMINANT this guards (mantissa bits, not
+    /// just finiteness).
+    #[test]
+    fn new_accepts_an_exact_power_of_two_scale_and_refuses_a_non_power_of_two_one() {
+        AttentionBlockFused::new(0.125, FullyMaskedPolicy::Propagate, false)
+            .expect("0.125 = 2^-3 is an exact power of two");
+        let err = AttentionBlockFused::new(0.1, FullyMaskedPolicy::Propagate, false)
+            .expect_err("0.1 has a nonzero f32 mantissa — not an exact power of two");
+        assert!(matches!(err, Error::Msg(_)));
+    }
+
     #[test]
     fn head_dim_other_than_64_is_refused() {
         let device = Device::Cpu;
@@ -1123,6 +1163,31 @@ mod tests {
         let op = AttentionBlockFused::new(0.125, FullyMaskedPolicy::Propagate, false).unwrap();
         let err = fused(&qkv, &rope_pack, &mask, op).expect_err("head_dim != 64 must be refused");
         assert!(matches!(err, Error::Msg(_)));
+    }
+
+    /// Audit B4's other half: `qkv` must be contiguous on BOTH devices
+    /// (`cpu_fwd`'s own `l1.contiguous_offsets()` refusal; `cuda_fwd` gained
+    /// the SAME check even though `gather_bhsd`'s `copy_strided_src` could
+    /// structurally tolerate a strided source — so this op's public domain
+    /// contract does not depend on which device runs it).
+    #[test]
+    fn non_contiguous_qkv_is_refused_not_silently_misread() {
+        let device = Device::Cpu;
+        let (b, s, h, d) = (1usize, 3usize, 1usize, HEAD_DIM);
+        let mask = zero_mask(b, s, &device);
+        let (cos, sin) = rope_tables(s, d, &device);
+        let rope_pack = pack_rope(&cos, &sin).unwrap();
+        let scale = 1.0 / (d as f32).sqrt();
+        // `[batch, 3, seq, heads, head_dim]` transposed to the CORRECT
+        // shape `[batch, seq, 3, heads, head_dim]` but non-contiguous.
+        let big = Tensor::zeros((b, 3, s, h, d), DType::F32, &device).unwrap();
+        let qkv = big.transpose(1, 2).unwrap();
+        assert!(!qkv.is_contiguous());
+        assert_eq!(qkv.dims(), &[b, s, 3, h, d]);
+        let op = AttentionBlockFused::new(scale, FullyMaskedPolicy::Propagate, true).unwrap();
+        let err = fused(&qkv, &rope_pack, &mask, op)
+            .expect_err("a non-contiguous qkv must be refused, not silently misread");
+        assert!(matches!(err, Error::RequiresContiguous { .. }));
     }
 
     /// A mask whose query-row axis is neither `1` nor `seq` (the ONE new
@@ -1230,5 +1295,36 @@ mod tests {
             "a tracked rope_pack must make backward fail loudly, not silently drop its gradient",
         );
         let _ = err;
+    }
+
+    /// Audit B4: `cuda_fwd`'s `cos_l`/`sin_l` derivation assumes `rope_pack`
+    /// is itself contiguous from its own `start_offset` (`sin`'s offset is
+    /// computed by ADDING `s_max * d` to that start offset) — a narrowed
+    /// or transposed `rope_pack` would silently read the WRONG elements
+    /// rather than error, the same "missing-offset" class this crate's
+    /// CUDA glue idioms are audited for elsewhere. `cpu_fwd` shares the
+    /// SAME `check_rope_pack` shape check plus its own
+    /// `l2.contiguous_offsets()` refusal, so both devices refuse a
+    /// transposed-view `rope_pack` identically — this is the CPU half of
+    /// that proof; `cuda_parity.rs`'s CUDA leg proves the other.
+    #[test]
+    fn transposed_view_rope_pack_is_refused_not_silently_misread() {
+        let device = Device::Cpu;
+        let (b, h, s, d) = (1usize, 1usize, 3usize, HEAD_DIM);
+        let qkv = Tensor::zeros((b, s, 3, h, d), DType::F32, &device).unwrap();
+        let mask = zero_mask(b, s, &device);
+        let scale = 1.0 / (d as f32).sqrt();
+        // Built as `[2, 1, 1, d, s]` then transposed to the correct SHAPE
+        // (`[2, 1, 1, s, d]`) but now a non-contiguous VIEW, not a fresh
+        // contiguous buffer — `check_rope_pack`'s shape check alone would
+        // accept this; only the contiguity check catches it.
+        let big = Tensor::zeros((2, 1, 1, d, s), DType::F32, &device).unwrap();
+        let rope_pack = big.transpose(3, 4).unwrap();
+        assert!(!rope_pack.is_contiguous());
+        assert_eq!(rope_pack.dims(), &[2, 1, 1, s, d]);
+        let op = AttentionBlockFused::new(scale, FullyMaskedPolicy::Propagate, true).unwrap();
+        let err = fused(&qkv, &rope_pack, &mask, op)
+            .expect_err("a transposed-view rope_pack must be refused, not silently misread");
+        assert!(matches!(err, Error::RequiresContiguous { .. }));
     }
 }

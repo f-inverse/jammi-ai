@@ -123,6 +123,16 @@ pub(crate) fn cuda_fwd(
         let out = alloc_scratch(&device, s1.dtype(), 0)?;
         return Ok((out, out_shape));
     }
+    // `qkv` must be contiguous — the SAME domain the CPU arm's `cpu_fwd`
+    // requires (`l1.contiguous_offsets()`). `slot_view`/`gather_bhsd`
+    // could structurally tolerate an arbitrarily strided `qkv` (they read
+    // through `copy_strided_src`), but requiring contiguity here anyway
+    // keeps this op's PUBLIC domain contract (module doc: "qkv: ...
+    // contiguous") identical across devices — a caller whose `qkv` happens
+    // to satisfy CUDA's looser internal tolerance but fails CPU's explicit
+    // check would otherwise see device-dependent admission (audit B4).
+    l1.contiguous_offsets()
+        .ok_or(Error::RequiresContiguous { op: name })?;
     // `check_mask` validates `mask`'s domain (module doc); the broadcast
     // itself is handled structurally by `SoftmaxLastDimFused::cuda_fwd`
     // below, which is handed `s3`/`l3` directly — no local unravel of
@@ -155,6 +165,15 @@ pub(crate) fn cuda_fwd(
 
     let (q_rot, q_rot_l, k_rot) = if op.rope {
         let s_max = check_rope_pack(l2, s, d, name)?;
+        // `cos_l`/`sin_l` below derive `sin`'s start offset by ADDING
+        // `s_max * d` to `l2`'s own start offset — sound ONLY if `l2` is
+        // itself contiguous from that offset (a narrowed/strided
+        // `rope_pack` would make this arithmetic land on the WRONG
+        // elements, silently, rather than erroring — audit B4, the same
+        // "missing-offset" class MAINTAINER-GUIDE's CUDA-glue rules call
+        // out). Checked here, before that derivation, rather than assumed.
+        l2.contiguous_offsets()
+            .ok_or(Error::RequiresContiguous { op: name })?;
         let cos_l =
             Layout::contiguous_with_offset((1, 1, s_max, d), l2.start_offset()).narrow(2, 0, s)?;
         let sin_l = Layout::contiguous_with_offset((1, 1, s_max, d), l2.start_offset() + s_max * d)

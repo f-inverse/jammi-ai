@@ -59,8 +59,7 @@ fn fused_vs_eager_forced_arm_ab_is_bit_identical_both_pre_and_post_fix_bf16_cuda
     };
 
     let (in_features, out_features, rank) = (64usize, 128usize, 16usize);
-    let alpha = 32.0;
-    let scaling = alpha / rank as f64;
+    let alpha = 32.0; // scaling = alpha/rank = 2.0, computed internally by LoraLinear::new.
 
     let w_v = wide_fixture(out_features * in_features, 2, 300.0);
     let w = Tensor::from_slice(&w_v, (out_features, in_features), &device)

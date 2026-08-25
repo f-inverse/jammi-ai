@@ -17,11 +17,20 @@ section): this is a CI-adjacent script, not a package, and nothing here
 should ever tempt CI into enforcing a Python requirements file against a
 crate that has no Python toolchain.
 
+`CascadePairFixtureTests` (P6 Stage B FA2 fold-in, a docs-ci co-sign of
+`origin/perf/p6-fa2-dense` @ `5886c6b`) additionally drives two REAL,
+committed raw-run reports from that branch
+(`fixtures/p6_fa2_dense_raw_runs/*.json`, provenance in that directory's own
+`PROVENANCE.md`) through this same real entry point — never a hand-rolled
+dict standing in for what that branch's own `finetune-step` binary actually
+emitted.
+
 Run directly: `python3 ci/scripts/perf/test_ab_merge.py`
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import sys
@@ -33,6 +42,7 @@ import ab_merge  # noqa: E402
 
 
 LEGS = ab_merge.LEGS
+FIXTURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "p6_fa2_dense_raw_runs")
 
 # Every fused/eager pair `FinetuneStepTier` actually serializes today (see
 # `crates/jammi-bench/src/report.rs`'s `FinetuneStepTier` and this repo's
@@ -112,6 +122,40 @@ def drop_dispatch_keys(*bases):
         overrides[f"{base}_fused_dispatches"] = None
         overrides[f"{base}_eager_dispatches"] = None
     return overrides
+
+
+def flash_overrides(fused=0, declined=0, compiled=True, disabled_requested=None, disabled_fired=None):
+    """An `overrides` dict for `jammi_fs` that adds the P6 Stage B FA2
+    cascade fields (`attention_block_flash_fused_dispatches`/
+    `..._declined_dispatches`/`flash_compiled`/`kernels_disabled_requested`/
+    `kernels_disabled_fired`) — NONE of these are in `jammi_fs`'s own base
+    dict (they are entirely ABSENT on every report `main`'s own binary
+    produces today; a report that predates this fold-in has no `flash`
+    key at all), so this is additive, never a replacement of an existing
+    key. `disabled_requested`/`disabled_fired` default to `[]` (not
+    `None`) — `fs.get(...)` on a real report never reads `null` for these
+    two list fields (K-aux's own field doc: "Always present, even on an
+    ordinary run with nothing disabled").
+    """
+    return {
+        "attention_block_flash_fused_dispatches": fused,
+        "attention_block_flash_declined_dispatches": declined,
+        "flash_compiled": compiled,
+        "kernels_disabled_requested": list(disabled_requested or []),
+        "kernels_disabled_fired": list(disabled_fired or []),
+    }
+
+
+def load_fixture_finetune_step(name):
+    """Reads `fixtures/p6_fa2_dense_raw_runs/<name>.json` — a REAL,
+    committed `jammi-bench finetune-step` raw-run report copied verbatim
+    from `origin/perf/p6-fa2-dense` (see that directory's own
+    `PROVENANCE.md`) — and returns its FULL top-level dict (the same shape
+    `write_leg` writes straight to a `.json` fixture file), never just the
+    `finetune_step` sub-block in isolation.
+    """
+    with open(os.path.join(FIXTURES_DIR, f"{name}.json")) as fh:
+        return json.load(fh)
 
 
 def torch_fs(seed=42, attn_requested="sdpa", lora_alpha=32.0, margin=0.3, **overrides):
@@ -509,6 +553,252 @@ _CLEAN_YES_DISPATCHES = {
     "lora_linear": (3, 0),
     "attention_block": (3, 0),
 }
+
+
+class CascadePairFixtureTests(unittest.TestCase):
+    """P6 Stage B FA2 fold-in (docs-ci co-sign of `origin/perf/p6-fa2-dense`
+    @ `5886c6b`): `attention_block_flash_fused_dispatches` has no
+    `_eager_dispatches` sibling — its fallback counter is
+    `_declined_dispatches` instead (`CASCADE_BASES`). Running THIS FILE's
+    OWN `test_ab_merge.py` suite (every test above this class) against an
+    UNMODIFIED `ab_merge.py` reproduced the exact bug this class pins:
+    `dispatch_pairs` raised `KeyError` on that branch's own committed
+    fixtures, and `build_report`'s per-leg `try`/`except` turned every leg
+    of every config `INVALID` -- verified directly against the REAL
+    fixtures below before this fix landed, never merely asserted.
+
+    `test_real_flash_on_fixture_is_valid_true` /
+    `test_real_flash_off_fixture_is_valid_reference_leg` drive the two
+    REAL, committed raw-run reports (`fixtures/p6_fa2_dense_raw_runs/`,
+    provenance in that directory's own `PROVENANCE.md`) through
+    `ab_merge.main` unmodified -- never a hand-rolled dict standing in for
+    what that branch's own binary actually emitted. Every other test here
+    is a synthetic construction (there is no real recorded run of "nothing
+    ran" or "flash_compiled=False but disabled" -- those are degenerate/
+    contradictory shapes, not real outcomes), built by taking one of the
+    real fixtures' `finetune_step` dict and overriding only the field(s)
+    each case names (never inventing an unrelated shape), or via
+    `jammi_fs`/`flash_overrides` for the isolated single-rule checks.
+
+    Every test writes ONLY `jammi-eager`/`jammi-fused` legs (`torch-eager`/
+    `torch-sdpa` stay MISSING) -- `jammi_fused_dispatch_proof` only ever
+    reads the `jammi-fused` leg (see `build_report`'s own
+    `proof = fused_proof(leg_metrics["jammi-fused"])`), and the `proof is
+    False or isinstance(proof, str)` verdict override runs unconditionally
+    regardless of whether a torch leg fit at all -- so this is not a
+    fixture-completeness shortcut, it isolates exactly the mechanism this
+    class exists to test.
+    """
+
+    def run_merge(self, raw_dir):
+        out_dir = tempfile.mkdtemp()
+        rc = ab_merge.main([raw_dir, out_dir, "25", "5", "0.9"])
+        with open(os.path.join(out_dir, "finetune_ab_report.json")) as fh:
+            merged = json.load(fh)
+        return rc, merged
+
+    def write_jammi_fused_only(self, raw_dir, slug, report):
+        write_leg(raw_dir, slug, "jammi-eager", report=jammi_fs({}))
+        write_leg(raw_dir, slug, "jammi-fused", report=report)
+
+    def test_real_flash_on_fixture_is_valid_true(self):
+        """THE BUG REPRODUCTION: before this fix, this raised `KeyError`
+        (via `dispatch_pairs`) on this exact fixture, caught per-leg by
+        `build_report` and surfaced as an `"ERROR: ..."` string, never
+        `True`. `s128_flash_on_1.json` reads `attention_block_flash_fused_
+        dispatches: 840`, `..._declined_dispatches: 0`,
+        `attention_block_fused_dispatches: 0` -- the flash-ON leg.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self.write_jammi_fused_only(raw_dir, "b8-s128-flash-on", load_fixture_finetune_step("s128_flash_on_1"))
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-flash-on"]
+        self.assertIs(cfg["jammi_fused_dispatch_proof"], True, cfg["jammi_fused_dispatch_proof"])
+        self.assertFalse(str(cfg["verdict"]).startswith("INVALID"), cfg["verdict"])
+        self.assertEqual(rc, 0)
+
+    def test_real_flash_off_fixture_is_valid_reference_leg(self):
+        """THE BUG REPRODUCTION, the reference-leg side: before this fix,
+        this ALSO raised `KeyError` on the exact same missing-sibling shape
+        (`attention_block_flash_fused_dispatches` present,
+        `..._eager_dispatches` absent -- the fallback key is
+        `..._declined_dispatches` here too, just nonzero: `840`).
+        `s128_flash_off_1.json` reads `attention_block_flash_fused_
+        dispatches: 0`, `..._declined_dispatches: 840`,
+        `attention_block_fused_dispatches: 840`,
+        `kernels_disabled_requested == kernels_disabled_fired ==
+        ["attention_block_flash"]` -- the JAMMI_KERNELS_DISABLE=
+        attention_block_flash reference leg, and its `declined: 840` must
+        NOT be treated as a silent fallback (rule 1's exemption).
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self.write_jammi_fused_only(raw_dir, "b8-s128-flash-off", load_fixture_finetune_step("s128_flash_off_1"))
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-flash-off"]
+        self.assertIs(cfg["jammi_fused_dispatch_proof"], True, cfg["jammi_fused_dispatch_proof"])
+        self.assertFalse(str(cfg["verdict"]).startswith("INVALID"), cfg["verdict"])
+        self.assertEqual(rc, 0)
+
+    def test_nothing_ran_in_attention_arm_is_invalid(self):
+        """Truth-table case 3: `attention_block_flash` reads `(0, 0)` AND
+        `attention_block` ALSO reads `fused == 0` -- the whole attention
+        arm dispatched nothing at all. Built from the real flash-off
+        fixture with only the attention-arm counters and the (no longer
+        applicable) disable-request fields zeroed out.
+        """
+        report = load_fixture_finetune_step("s128_flash_off_1")
+        report = copy.deepcopy(report)
+        fs = report["tiers"]["finetune_step"]
+        fs["attention_block_fused_dispatches"] = 0
+        fs["attention_block_flash_fused_dispatches"] = 0
+        fs["attention_block_flash_declined_dispatches"] = 0
+        fs["kernels_disabled_requested"] = []
+        fs["kernels_disabled_fired"] = []
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self.write_jammi_fused_only(raw_dir, "b8-s128-nothing-ran", report)
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-nothing-ran"]
+        self.assertIs(cfg["jammi_fused_dispatch_proof"], False, cfg["jammi_fused_dispatch_proof"])
+        self.assertTrue(str(cfg["verdict"]).startswith("INVALID"), cfg["verdict"])
+        self.assertEqual(rc, 1)
+
+    def test_flash_compiled_false_but_disable_requested_is_invalid(self):
+        """Truth-table case 4: a build that never compiled flash in
+        (`flash_compiled: false`) cannot possibly have exercised a disable
+        request naming it -- the leg's own build configuration contradicts
+        its own disable request, loud and INVALID regardless of what the
+        dispatch counters themselves read. Built from the real flash-off
+        fixture (which DOES carry a real `attention_block_flash` disable
+        request) with only `flash_compiled` flipped.
+        """
+        report = copy.deepcopy(load_fixture_finetune_step("s128_flash_off_1"))
+        report["tiers"]["finetune_step"]["flash_compiled"] = False
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self.write_jammi_fused_only(raw_dir, "b8-s128-flash-not-compiled", report)
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-flash-not-compiled"]
+        proof = cfg["jammi_fused_dispatch_proof"]
+        self.assertIsInstance(proof, str, proof)
+        self.assertIn("flash_compiled", proof)
+        self.assertIn("attention_block_flash", proof)
+        self.assertTrue(str(cfg["verdict"]).startswith("INVALID"), cfg["verdict"])
+        self.assertEqual(rc, 1)
+
+    def test_unrequested_decline_is_still_a_hard_fail_non_vacuous_control(self):
+        """Negative control (non-vacuous): rule 1's exemption for a
+        `CASCADE_BASES` decline is gated on `kernels_disabled_requested`
+        AND `kernels_disabled_fired` BOTH naming the base -- a decline that
+        happens WITHOUT either (a genuine domain/capability miss: real
+        padding, wrong arch, `flash-attn` not compiled) must still hard-fail
+        exactly like an ordinary silent eager fallback always has. Built
+        from the real flash-on fixture (`kernels_disabled_requested: []`
+        unmodified) with `attention_block_flash_declined_dispatches` alone
+        flipped nonzero -- proves the exemption is NOT "any CASCADE_BASES
+        decline is fine", only a SELF-DESCRIBING one.
+        """
+        report = copy.deepcopy(load_fixture_finetune_step("s128_flash_on_1"))
+        report["tiers"]["finetune_step"]["attention_block_flash_declined_dispatches"] = 5
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self.write_jammi_fused_only(raw_dir, "b8-s128-unrequested-decline", report)
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-unrequested-decline"]
+        self.assertIs(cfg["jammi_fused_dispatch_proof"], False, cfg["jammi_fused_dispatch_proof"])
+        self.assertTrue(str(cfg["verdict"]).startswith("INVALID"), cfg["verdict"])
+        self.assertEqual(rc, 1)
+
+    def test_rope_softmax_absorbed_via_flash_arm_alone_isolated_rule(self):
+        """Isolates `ABSORBABLE_BY_ATTENTION_BLOCK`'s extended OR condition:
+        `rope`/`softmax` may read `(0, 0)` when `attention_block_flash`'s
+        `fused > 0`, even though `attention_block` ITSELF also reads
+        `(0, 0)` -- absorbed transitively through the flash arm, not merely
+        because `attention_block` happened to be positive (that path is
+        already covered by the real flash-off fixture test above; this
+        isolates the flash-only leg of the OR).
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            report = jammi_fs(
+                {
+                    "ln": (9, 0),
+                    "geglu": (3, 0),
+                    "lora_linear": (3, 0),
+                    "attention_block": (0, 0),
+                },
+                **flash_overrides(fused=5, declined=0),
+            )
+            self.write_jammi_fused_only(raw_dir, "b8-s128-flash-absorbs", report)
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-flash-absorbs"]
+        self.assertIs(cfg["jammi_fused_dispatch_proof"], True, cfg["jammi_fused_dispatch_proof"])
+        self.assertEqual(rc, 0)
+
+    def test_flash_absent_from_schema_preserves_old_required_attention_block_behaviour(self):
+        """Backward-compatibility pin: a report with NO `attention_block_
+        flash` key at all (every report `main`'s own binary produces
+        today) must treat `attention_block` EXACTLY as `REQUIRED_PAIRS`
+        used to before this fold-in -- `attention_block` reading `(0, 0)`
+        with no flash key present is still a hard fail, never silently
+        exempted just because the classification table changed shape.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            report = jammi_fs(
+                {
+                    "ln": (9, 0),
+                    "geglu": (3, 0),
+                    "lora_linear": (3, 0),
+                    "attention_block": (0, 0),
+                }
+            )
+            self.write_jammi_fused_only(raw_dir, "b8-s128-no-flash-key", report)
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-no-flash-key"]
+        self.assertIs(cfg["jammi_fused_dispatch_proof"], False, cfg["jammi_fused_dispatch_proof"])
+        self.assertTrue(str(cfg["verdict"]).startswith("INVALID"), cfg["verdict"])
+        self.assertEqual(rc, 1)
+
+    def test_provenance_records_flash_compiled_and_declined_counter(self):
+        """`leg_provenance`'s `jammi_flash_compiled` field, and
+        `jammi_dispatch_counters` picking up a `_declined_dispatches`-
+        suffixed key (not just `_fused_dispatches`/`_eager_dispatches`) --
+        both recorded, never compared, same "provenance" row this fold-in
+        adds to the module docstring's determinant table.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self.write_jammi_fused_only(
+                raw_dir, "b8-s128-flash-on", load_fixture_finetune_step("s128_flash_on_1")
+            )
+            out_dir = tempfile.mkdtemp()
+            rc = ab_merge.main([raw_dir, out_dir, "25", "5", "0.9"])
+            self.assertEqual(rc, 0)
+            with open(os.path.join(out_dir, "finetune_ab_report.json")) as fh:
+                merged = json.load(fh)
+        cfg = merged["configs"]["b8-s128-flash-on"]
+        self.assertIs(cfg["provenance"]["jammi"]["jammi_flash_compiled"], True)
+        counters = cfg["provenance"]["jammi"]["jammi_dispatch_counters"]
+        self.assertIn("attention_block_flash_declined_dispatches", counters)
+        self.assertEqual(counters["attention_block_flash_declined_dispatches"], 0)
+        self.assertEqual(counters["attention_block_flash_fused_dispatches"], 840)
+
+    def test_cascade_shaped_unknown_base_without_declined_sibling_still_raises(self):
+        """Schema-drift-is-loud, extended to the cascade shape: a NEW
+        `_fused_dispatches` key for a base that is NOT in `CASCADE_BASES`
+        (so `_fallback_key` looks for `_eager_dispatches`, not
+        `_declined_dispatches`) and carries ONLY a `_declined_dispatches`
+        sibling -- no `_eager_dispatches` at all -- must still raise a
+        LOUD, per-leg error, never silently pass as if it were an
+        ordinary `(0, 0)` pair.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            report = jammi_fs({"ln": (9, 0), "geglu": (3, 0), "lora_linear": (3, 0), "attention_block": (3, 0)})
+            report["tiers"]["finetune_step"]["mystery_cascade_fused_dispatches"] = 7
+            report["tiers"]["finetune_step"]["mystery_cascade_declined_dispatches"] = 0
+            self.write_jammi_fused_only(raw_dir, "b8-s128-mystery-cascade", report)
+            rc, merged = self.run_merge(raw_dir)
+        proof = merged["configs"]["b8-s128-mystery-cascade"]["jammi_fused_dispatch_proof"]
+        self.assertIsInstance(proof, str)
+        self.assertIn("ERROR", proof)
+        self.assertIn("mystery_cascade_eager_dispatches", proof)
+        self.assertTrue(merged["configs"]["b8-s128-mystery-cascade"]["verdict"].startswith("INVALID"))
+        self.assertEqual(rc, 1)
 
 
 class LegPremiseCheckTests(unittest.TestCase):

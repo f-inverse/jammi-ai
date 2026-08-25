@@ -76,3 +76,10 @@ name = "cuda_parity"
 path = "tests/cuda_parity.rs"
 required-features = ["cuda"]
 
+# FlashAttention-2 FFI smoke — pod-run (`JAMMI_REQUIRE_CUDA=1 cargo test -p
+# jammi-kernels --features flash-attn --test flash_smoke`); built only when
+# `flash-attn` is active.
+[[test]]
+name = "flash_smoke"
+path = "tests/flash_smoke.rs"
+required-features = ["flash-attn"]

@@ -1562,10 +1562,66 @@ mod tests {
         );
     }
 
+    /// Peel candle's `Error::WithBacktrace` wrapper (if present) down to
+    /// the error it carries. `candle_core::Error::bt()` (candle-core
+    /// 0.11.0 `src/error.rs:263-273`) calls `Backtrace::capture()` and,
+    /// whenever its status is neither `Disabled` nor `Unsupported`, boxes
+    /// the original error into `Error::WithBacktrace { inner, backtrace }`
+    /// (`src/error.rs:235-238`). `Backtrace::capture()`'s status is
+    /// decided by the `RUST_BACKTRACE` / `RUST_LIB_BACKTRACE` env vars —
+    /// so the OUTER variant of every candle-internal error that goes
+    /// through `.bt()` is an environment property, not a platform one.
+    fn peel_backtrace(err: &Error) -> &Error {
+        let mut e = err;
+        while let Error::WithBacktrace { inner, .. } = e {
+            e = inner;
+        }
+        e
+    }
+
     /// The disclosed pre-existing candle limitation (see the module doc):
     /// a `BF16` base on CPU must fail with a typed error — the SAME error
     /// class `candle_nn::Linear::forward` already returns for a `BF16`
     /// CPU matmul today, never a panic and never a silently wrong number.
+    ///
+    /// What this asserts is exactly what the module doc promises: (a) the
+    /// op returns `Err` (no panic, no number); (b) that `Err` is
+    /// IDENTICAL — same outer discriminant, same inner discriminant, same
+    /// `(DType, op)` payload — to the one the eager `x.matmul(w^T)` this op
+    /// replaces produces on the same platform in the same environment;
+    /// (c) the inner error is candle's own matmul dispatch refusal, not
+    /// this op's domain check.
+    ///
+    /// Two variants of the SAME error reach the caller, and the
+    /// determinant is `RUST_BACKTRACE`, not the OS/arch:
+    ///
+    /// * `RUST_BACKTRACE` unset or `0` (a plain local `cargo test` on
+    ///   macOS/aarch64 or Linux/x86_64): the bare
+    ///   `Error::UnsupportedDTypeForOp(DType::BF16, "matmul")` — candle-core
+    ///   0.11.0 `src/cpu_backend/mod.rs:1372-1385`, the gemm-backed
+    ///   `impl Map2 for MatMul`'s `f` (`#[cfg(all(not(feature = "mkl"),
+    ///   not(feature = "accelerate")))]`), whose `match T::DTYPE` admits
+    ///   only `F16 | F32 | F64` and returns
+    ///   `Error::UnsupportedDTypeForOp(T::DTYPE, "matmul").bt()` for
+    ///   everything else BEFORE the `gemm` crate is ever called (so
+    ///   `gemm`'s per-target dtype support is moot for `BF16`). `.bt()`
+    ///   returns `self` unchanged when the backtrace status is `Disabled`
+    ///   (`src/error.rs:266-267`).
+    /// * `RUST_BACKTRACE=1` (the repo's `.github/workflows/ci.yml` sets it
+    ///   workflow-wide under `env:`, so EVERY hermetic-lane test binary
+    ///   runs with it — Linux/x86_64 in CI, and reproduced verbatim on
+    ///   macOS/aarch64 with `RUST_BACKTRACE=1 cargo test -p jammi-kernels`):
+    ///   `Error::WithBacktrace { inner: Box(UnsupportedDTypeForOp(BF16,
+    ///   "matmul")), backtrace }` — the same error, boxed by `.bt()`
+    ///   (`src/error.rs:268-271`). A bare
+    ///   `matches!(err, Error::UnsupportedDTypeForOp(..))` is false here,
+    ///   which is why this test must peel the wrapper first.
+    ///
+    /// The `accelerate` (`src/cpu_backend/mod.rs:1541`) and `mkl`
+    /// (`src/cpu_backend/mod.rs:1659`) `MatMul::f` variants also return
+    /// `Error::UnsupportedDTypeForOp(dtype, "matmul").bt()` for `BF16`, but
+    /// neither feature is enabled by any `Cargo.toml` in this workspace, so
+    /// the gemm-backed path above is the one both platforms compile.
     #[test]
     fn bf16_base_on_cpu_is_a_typed_error_not_a_panic_or_wrong_number() {
         let device = Device::Cpu;
@@ -1582,17 +1638,49 @@ mod tests {
         let b = Tensor::randn(0f32, 1.0, (outf, r), &device).unwrap();
         let ab = Tensor::cat(&[&a.t().unwrap(), &b], 0).unwrap();
         let op = LowRankResidualLinear::new(1.0, inf, outf, r, None, false).unwrap();
+
+        // (a) an `Err`, never a panic and never a number.
         let err = x.apply_op3(&w, &ab, op).expect_err(
             "BF16 CPU matmul is unsupported by candle-core 0.11.0 without mkl/accelerate",
         );
-        assert!(matches!(err, Error::UnsupportedDTypeForOp(..)));
 
-        // The SAME error class the eager composition (candle_nn::Linear)
-        // hits today — this op is not introducing a NEW failure mode.
+        // The SAME call the eager composition (candle_nn::Linear::forward
+        // is `x.matmul(&w.t()?)`) issues today — this op is not
+        // introducing a NEW failure mode.
         let eager_err = x
             .matmul(&w.t().unwrap())
             .expect_err("the pre-existing eager composition must fail identically");
-        assert!(matches!(eager_err, Error::UnsupportedDTypeForOp(..)));
+
+        // (b) IDENTICAL to the eager error on this platform, in this
+        // environment: the outer variant (bare vs `WithBacktrace`, decided
+        // by `RUST_BACKTRACE` — see the doc above) must agree, ...
+        assert_eq!(
+            std::mem::discriminant(&err),
+            std::mem::discriminant(&eager_err),
+            "fused and eager BF16-CPU errors differ in their OUTER variant: \
+             fused={err:?} eager={eager_err:?}"
+        );
+        // ... and so must the error underneath it, discriminant AND payload.
+        let (inner, eager_inner) = (peel_backtrace(&err), peel_backtrace(&eager_err));
+        assert_eq!(
+            std::mem::discriminant(inner),
+            std::mem::discriminant(eager_inner),
+            "fused and eager BF16-CPU errors differ in their INNER variant: \
+             fused={inner:?} eager={eager_inner:?}"
+        );
+        // (c) candle's own matmul dispatch refusal
+        // (`cpu_backend/mod.rs:1384`: `UnsupportedDTypeForOp(T::DTYPE,
+        // "matmul")`), carrying the base dtype — NOT this op's domain
+        // check (which would name this op, not "matmul"), on BOTH sides.
+        for (side, e) in [("fused", inner), ("eager", eager_inner)] {
+            match e {
+                Error::UnsupportedDTypeForOp(dtype, op_name) => {
+                    assert_eq!(*dtype, DType::BF16, "{side}: unexpected dtype payload");
+                    assert_eq!(*op_name, "matmul", "{side}: unexpected op payload");
+                }
+                other => panic!("{side}: expected UnsupportedDTypeForOp, got {other:?}"),
+            }
+        }
     }
 
     #[test]

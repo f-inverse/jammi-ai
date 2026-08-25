@@ -335,15 +335,15 @@ impl CustomOp3 for FlashVarlenBwdHelper {
     // honest answer here (out of scope, see the module doc's "Domain").
 }
 
-/// The ONLY public entry point. Constructs a FRESH [`FlashVarlenAttention`]
+/// The ONLY public entry point. Constructs a FRESH `FlashVarlenAttention`
 /// per call (hoisting one across calls is unrepresentable outside this
 /// module — see [`crate::ops::StatefulKernelOp`]'s doc) and runs it through
 /// [`crate::ops::apply_stateful1`].
 ///
 /// `cu_seqlens`/`cfg` are borrowed: this function takes its OWN owned copy
 /// of `cu_seqlens`' (tiny — `batch + 1` `i32`s) device array via
-/// [`CuSeqlens::try_duplicate`] so the op struct — which must be `'static`
-/// — never borrows from the caller.
+/// `CuSeqlens::try_duplicate` (crate-private) so the op struct — which
+/// must be `'static` — never borrows from the caller.
 pub fn flash_attention_varlen(
     qkv: &Tensor,
     cu_seqlens: &CuSeqlens,

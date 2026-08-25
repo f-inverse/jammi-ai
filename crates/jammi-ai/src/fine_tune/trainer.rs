@@ -508,7 +508,10 @@ impl TrainingLoop {
         //    compared against, so a resumed run's `is_last_step` uses exactly
         //    the same horizon a fresh run would. Already correct; unaffected
         //    by this fix.
-        let total_optimizer_steps = if !train_loader.is_precomputed() && self.gradcache_eligible() {
+        let total_optimizer_steps = if Self::wants_gradcache_horizon(
+            train_loader.is_precomputed(),
+            self.gradcache_eligible(),
+        ) {
             self.config.epochs
         } else {
             total_steps
@@ -1051,6 +1054,26 @@ impl TrainingLoop {
                 self.config.embedding_loss,
                 Some(super::EmbeddingLoss::MultipleNegativesRanking { .. })
             )
+    }
+
+    /// Whether `total_optimizer_steps` (in `run`) should use GradCache's
+    /// per-epoch horizon (`self.config.epochs`) rather than the
+    /// accumulation-window arm's `total_steps`. Pulled out of the `if` at its
+    /// one call site into its own pure function so the boolean condition
+    /// itself — not just its downstream effect on `is_last_step`, three
+    /// calls and a real forward pass away — is directly unit-testable
+    /// without needing a full `run()` call. This is exactly the gap a
+    /// mutation sweep found: deleting the `!` on `is_precomputed` at the
+    /// inlined call site was invisible to every test in this file, because
+    /// the only test that reaches GradCache's `total_optimizer_steps`
+    /// (`gradcache_last_step_oracle`) calls `run_gradcache_epoch` directly
+    /// with a literal value, bypassing this computation entirely — `run()`
+    /// itself is never driven end-to-end with a real GradCache-eligible,
+    /// non-precomputed loader anywhere in this crate's test suite. Testing
+    /// the pure boolean function here closes that gap without needing the
+    /// heavier end-to-end harness.
+    fn wants_gradcache_horizon(is_precomputed: bool, gradcache_eligible: bool) -> bool {
+        !is_precomputed && gradcache_eligible
     }
 
     /// Run one GradCache epoch: treat the whole training set as a single
@@ -2743,6 +2766,40 @@ mod tests {
     fn grad_norm(g: &Tensor) -> f64 {
         let sq: f32 = g.sqr().unwrap().sum_all().unwrap().to_scalar().unwrap();
         (sq as f64).sqrt()
+    }
+
+    /// RED-first (mutants sweep finding, P4b R2): `total_optimizer_steps`
+    /// (in `run`) must use GradCache's per-epoch horizon ONLY when the loader
+    /// is NOT precomputed AND the run is GradCache-eligible — all four
+    /// truth-table cells pinned directly, since no test drives `run()`
+    /// end-to-end with a real GradCache-eligible, non-precomputed loader
+    /// (see `wants_gradcache_horizon`'s doc).
+    ///
+    /// Mutation tried: delete the `!` on `is_precomputed` at this function's
+    /// inlined call site in `run` (its pre-extraction form) — invisible to
+    /// every other test in this file. Mutation tried against this function's
+    /// OWN body (`!is_precomputed && gradcache_eligible` → `is_precomputed &&
+    /// gradcache_eligible`): the `(false, true)` case flips from `true` to
+    /// `false` — this test goes red.
+    #[test]
+    fn wants_gradcache_horizon_requires_a_non_precomputed_loader() {
+        assert!(
+            TrainingLoop::wants_gradcache_horizon(false, true),
+            "non-precomputed + eligible must want the GradCache horizon"
+        );
+        assert!(
+            !TrainingLoop::wants_gradcache_horizon(true, true),
+            "a precomputed loader must never want the GradCache horizon, \
+             even when otherwise eligible"
+        );
+        assert!(
+            !TrainingLoop::wants_gradcache_horizon(false, false),
+            "not eligible must never want the GradCache horizon"
+        );
+        assert!(
+            !TrainingLoop::wants_gradcache_horizon(true, false),
+            "precomputed and not eligible must never want the GradCache horizon"
+        );
     }
 
     /// Near cosine saturation — pairs whose embeddings are almost aligned, so

@@ -452,6 +452,29 @@
 //! itself is UNCHANGED by the `scale` field: it always computes `d(y)/d(pre_softmax)`,
 //! never `d(y)/d(scores)` directly.
 //!
+//! ### esc-045 round 3 (GH#374): `BF16` rounds the `dy·y` product TWICE,
+//! matching ATen, not once
+//!
+//! An earlier revision of `dscores_row_bf16`/`softmax_bwd_dscores_bf16`
+//! accumulated `dot = Σ f32(dy_i) * f32(y_i)` directly in a float register —
+//! MORE precise per term than torch, but not what the reference this crate
+//! targets actually does. `aten/src/ATen/native/cuda/SoftMax.cu`'s
+//! `softmax_backward_cuda_out` (v2.13.0) computes `Tensor tmp = grad *
+//! output;` as a SEPARATE elementwise kernel FIRST — `mul_kernel_cuda`
+//! computes in `opmath_t` (`float`) and casts to `BFloat16` ONCE per
+//! element when it stores `tmp` — so the per-element product is genuinely
+//! BF16-quantized BEFORE the row reduction ever runs; the reduction then
+//! sums THAT already-rounded `tmp` (not the raw product), and the epilogue
+//! (`SoftMaxBackwardEpilogue::operator()`) reads `tmp_i` (not `dy_i`,
+//! per the kernel's own "gradOutput that we get here is really gradOutput *
+//! output" comment) to compute the final, second rounding. `dscores_row_bf16`
+//! now reproduces exactly this: a real, materialized `tmp` array, rounded
+//! once, summed in f32, then subtracted-and-rounded again — see that
+//! function's own doc for the full derivation and
+//! `tests/softmax_bwd_dscores_aten_rounding.rs` for the op-level oracle
+//! (RED before this fix on every discriminating row at production width
+//! `last = 512`).
+//!
 //! `pre_softmax = scale * scores + mask` (see the module doc's "scale
 //! semantics" section), so by the chain rule `d(y)/d(scores)` equals
 //! `scale` TIMES `d(y)/d(pre_softmax)`, while `d(y)/d(mask)` equals
@@ -1274,13 +1297,49 @@ fn dscores_f32(y: &[f32], dy: &[f32], rows: usize, last: usize) -> Vec<f32> {
     out
 }
 
+/// esc-045 (GH#374 round 3): matches ATen's own bf16 softmax backward
+/// rounding placement, quoted at source in
+/// `tests/softmax_bwd_dscores_aten_rounding.rs`'s module doc —
+/// `aten/src/ATen/native/transformers/cuda/attention_backward.cu`'s math
+/// path differentiates through `at::softmax`, whose CUDA backward
+/// (`softmax_backward_cuda_out`, `aten/src/ATen/native/cuda/SoftMax.cu`)
+/// computes `Tensor tmp = grad * output;` — a SEPARATE elementwise kernel
+/// that BF16-rounds `dy_i * y_i` ONCE, materializing it, BEFORE the row
+/// reduction ever runs (`mul_kernel_cuda`'s `opmath_t = float`, cast to the
+/// output dtype exactly once per element). `host_softmax_backward` then
+/// sums THAT already-rounded `tmp` in f32 and its epilogue subtracts
+/// `output * sum` from `tmp` (not from the raw, unrounded `dy`), rounding
+/// once more for the final store. So torch's `dS` rounds the per-element
+/// product `dy·y` TWICE overall — once as `tmp`, once as `dS` itself — with
+/// the SUM computed over the first, already-BF16-quantized set of values.
+/// A prior revision of this function accumulated the UNROUNDED product
+/// directly (`dot += dy*y` in f32, no intermediate BF16 width) — MORE
+/// precise per term than torch, but a genuine rounding-PLACEMENT divergence
+/// from the reference this crate targets (family D: matching the
+/// reference's own domain/rounding behavior, not merely "more accurate" —
+/// the same principle esc-045's round-2 GeGLU fix already established at
+/// ATen source, `ops/geglu.rs`'s "esc-045 fix" section). Fixed fold order
+/// (family J) preserved throughout: both passes below walk the row in
+/// ascending index order, exactly as before.
 fn dscores_row_bf16(y: &[bf16], dy: &[bf16], out: &mut [bf16]) {
-    let mut dot = 0f32;
+    // `tmp_i = round_bf16(dy_i * y_i)` — ATen's `Tensor tmp = grad *
+    // output;`, a genuine, separate BF16-width intermediate.
+    let mut tmp = vec![bf16::ZERO; y.len()];
     for i in 0..y.len() {
-        dot += dy[i].to_f32() * y[i].to_f32();
+        tmp[i] = bf16::from_f32(dy[i].to_f32() * y[i].to_f32());
     }
+    // `sum_k = Σ f32(tmp_i)` — f32 accumulation of the ALREADY-rounded
+    // products, matching `cunn_SoftMaxBackward`'s `ilpReduce<AddFloat>`
+    // over `tmp` (not over the raw product).
+    let mut sum_k = 0f32;
+    for &t in &tmp {
+        sum_k += t.to_f32();
+    }
+    // `dS_i = round_bf16(tmp_i - y_i * sum_k)` — the epilogue
+    // (`SoftMaxBackwardEpilogue::operator()`), which reads `tmp_i` (not
+    // `dy_i`) as its `gradOutput` argument per the kernel's own comment.
     for i in 0..y.len() {
-        out[i] = bf16::from_f32((dy[i].to_f32() - dot) * y[i].to_f32());
+        out[i] = bf16::from_f32(tmp[i].to_f32() - y[i].to_f32() * sum_k);
     }
 }
 

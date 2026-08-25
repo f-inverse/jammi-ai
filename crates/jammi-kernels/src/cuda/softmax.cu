@@ -316,6 +316,24 @@ extern "C" __global__ void softmax_bwd_dscores_f32(
     }
 }
 
+// esc-045 round 3 (GH#374): matches ATen's own bf16 softmax backward
+// rounding placement — `aten/src/ATen/native/cuda/SoftMax.cu`'s
+// `softmax_backward_cuda_out` (v2.13.0) computes `Tensor tmp = grad *
+// output;` as a SEPARATE elementwise kernel FIRST (`mul_kernel_cuda`,
+// `opmath_t = float`, cast to `BFloat16` ONCE per element when it stores
+// `tmp`), so the per-element product is genuinely BF16-rounded BEFORE the
+// row reduction runs; `cunn_SoftMaxBackward` then sums THAT already-rounded
+// `tmp` in f32, and its epilogue reads `tmp_i` (not the raw `dy_i` — per
+// the kernel's own "gradOutput that we get here is really gradOutput *
+// output" comment) for the final subtract-and-round. See
+// `../ops/softmax.rs`'s `dscores_row_bf16` doc for the full derivation and
+// `tests/softmax_bwd_dscores_aten_rounding.rs` for the op-level oracle. A
+// prior revision of this kernel accumulated the UNROUNDED product directly
+// — more precise per term, but not what torch does; `bf16_tmp` below is
+// recomputed (not cached) in the second pass, matching this file's
+// existing "read the same input pointers, don't stage an extra buffer"
+// idiom — one extra `__float2bfloat16`/`__bfloat162float` round-trip per
+// element, bandwidth-neutral.
 extern "C" __global__ void softmax_bwd_dscores_bf16(
     const __nv_bfloat16* y, const __nv_bfloat16* dy, __nv_bfloat16* dscores,
     const unsigned int last
@@ -328,13 +346,14 @@ extern "C" __global__ void softmax_bwd_dscores_bf16(
 
     float dot = 0.0f;
     for (unsigned int i = threadIdx.x; i < last; i += blockDim.x) {
-        dot += __bfloat162float(dyr[i]) * __bfloat162float(yr[i]);
+        __nv_bfloat16 tmp = __float2bfloat16(__bfloat162float(dyr[i]) * __bfloat162float(yr[i]));
+        dot += __bfloat162float(tmp);
     }
     dot = block_reduce_sum(dot, scratch);
 
     for (unsigned int i = threadIdx.x; i < last; i += blockDim.x) {
         float yv = __bfloat162float(yr[i]);
-        float dyv = __bfloat162float(dyr[i]);
-        dsr[i] = __float2bfloat16((dyv - dot) * yv);
+        __nv_bfloat16 tmp = __float2bfloat16(__bfloat162float(dyr[i]) * yv);
+        dsr[i] = __float2bfloat16(__bfloat162float(tmp) - yv * dot);
     }
 }

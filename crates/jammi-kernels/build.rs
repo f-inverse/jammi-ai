@@ -221,12 +221,34 @@ fn build_flash_attn() {
         fa_dir.join("VENDORED.md").display()
     );
 
+    // ---- The ONE `-gencode` literal (see the doc comment above): sm_80
+    // cubin only, no PTX. `JAMMI_FLASH_GENCODE_SM` below is derived FROM
+    // this literal (parsed, not independently retyped) so the two can
+    // never drift apart — `crate::flash::check_arch` (`flash/mod.rs`)
+    // reads it via `env!("JAMMI_FLASH_GENCODE_SM")` and refuses any device
+    // whose compute capability major.minor does not EXACTLY match (P6
+    // Stage B contract §3.4: `meets_minimum()` is right for the PTX lane,
+    // wrong for a cubin-only build with no forward-compat JIT path).
+    const GENCODE_ARCH: &str = "arch=compute_80,code=sm_80";
+    let gencode_sm = GENCODE_ARCH
+        .rsplit("sm_")
+        .next()
+        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+        .unwrap_or_else(|| {
+            panic!(
+                "jammi-kernels build.rs: GENCODE_ARCH {GENCODE_ARCH:?} does not end in \
+                 \"sm_<digits>\" — the code=sm_XX suffix `JAMMI_FLASH_GENCODE_SM` derives from \
+                 is missing or malformed"
+            )
+        });
+    println!("cargo:rustc-env=JAMMI_FLASH_GENCODE_SM={gencode_sm}");
+
     // ---- The flag group (see the doc comment above).
     let common_flags: Vec<String> = [
         "-O3",
         "-std=c++17",
         "-gencode",
-        "arch=compute_80,code=sm_80",
+        GENCODE_ARCH,
         "--expt-relaxed-constexpr",
         "--expt-extended-lambda",
         "--use_fast_math",

@@ -3,7 +3,20 @@
 //! real CPU forward+backward and a feature-gated CUDA forward loaded from
 //! build-time PTX.
 //!
-//! ## Every op in this module implements `KernelOp`
+//! **Statelessness is TOTAL for the `applyN` family** ([`apply1`],
+//! [`apply2`], [`apply3`]): every op reachable through them is [`KernelOp`]
+//! (`Copy`-bounded — see below), so NONE of them may carry a `Saved` field.
+//! An op that genuinely needs one (P6 Stage B's FlashAttention-2 varlen op,
+//! `crate::ops::flash_attention`) runs ONLY through [`apply_stateful1`]/
+//! [`apply_stateful3`], which require [`StatefulKernelOp`] instead — a
+//! SEPARATE sealed trait with no `Copy`/`Clone` bound (see its own doc).
+//! The two families are mutually exclusive by construction: `KernelOp`
+//! requires `Copy`, `StatefulKernelOp`'s whole point is that a type holding
+//! interior-mutable state (`Saved<T>`) CANNOT be `Copy`, so no type
+//! satisfies both, and there is exactly one `applyN`/`apply_statefulN`
+//! entry point per arity a real op ever needs.
+//!
+//! ## Every STATELESS op in this module implements `KernelOp`
 //!
 //! `CustomOp2::apply_op2` takes the op BY VALUE, so a fresh instance backs
 //! every call regardless of the type's own properties — that alone does
@@ -56,6 +69,12 @@ use candle_core::{
 pub(crate) mod attention_block;
 mod axpy;
 mod dropout;
+// `flash-attn`-gated: `crate::flash` (the FFI boundary) exists only under
+// that feature, so the op composing it can only exist under it too — see
+// this submodule's own doc for why it is a `StatefulKernelOp`, not a
+// `KernelOp`.
+#[cfg(feature = "flash-attn")]
+pub(crate) mod flash_attention;
 // `pub(crate)`, not private like `axpy`/`scaled_cast_add`: each op's CUDA
 // glue (`crate::cuda::geglu`/`layer_norm`/`rope`/`softmax`) imports its
 // shared dims/domain helper (`geglu_dims`/`output_shape`/`check_variant`,
@@ -66,6 +85,7 @@ pub(crate) mod geglu;
 pub(crate) mod layer_norm;
 pub(crate) mod low_rank_residual_linear;
 pub(crate) mod rope;
+mod saved;
 mod scaled_cast_add;
 pub(crate) mod softmax;
 
@@ -101,10 +121,13 @@ pub const ATTENTION_BLOCK_MAX_SEQ: usize = attention_block::MAX_SEQ;
 pub const ATTENTION_BLOCK_WINDOW_MASKED_VALUE: f32 = attention_block::WINDOW_MASKED_VALUE;
 pub use axpy::Axpy;
 pub use dropout::{DropoutFused, PhiloxKatProbe};
+#[cfg(feature = "flash-attn")]
+pub use flash_attention::flash_attention_varlen;
 pub use geglu::{GegluFused, GeluVariant};
 pub use layer_norm::{LayerNormFused, MAX_HIDDEN};
 pub use low_rank_residual_linear::{DropoutKey, LowRankResidualLinear};
 pub use rope::{RopeFused, MAX_HEAD_DIM};
+pub use saved::{Saved, SavedError};
 pub use scaled_cast_add::ScaledCastAdd;
 pub use softmax::{
     mask_broadcast_class_holds, FullyMaskedPolicy, SoftmaxLastDimFused, MAX_LAST_DIM, MAX_RANK,
@@ -156,6 +179,132 @@ pub fn apply2<T: KernelOp + CustomOp2>(x: &Tensor, y: &Tensor, op: T) -> Result<
 /// arguments (e.g. `LayerNormFused`'s internal backward-dx kernel: `x`,
 /// `gamma`, `grad_output`).
 pub fn apply3<T: KernelOp + CustomOp3>(
+    x: &Tensor,
+    y: &Tensor,
+    z: &Tensor,
+    op: T,
+) -> Result<Tensor> {
+    x.apply_op3(y, z, op)
+}
+
+/// A SECOND, DISJOINT op family from [`KernelOp`]: ops that legitimately
+/// carry per-instance interior-mutable state (a [`Saved`] field) between
+/// their own `fwd` and their own `bwd`. `KernelOp`'s `Copy` bound exists
+/// PRECISELY to forbid that shape (see this module's top doc, "What
+/// `Copy` … proves, and what it does not") — so a stateful op cannot and
+/// must not implement `KernelOp`; it implements this trait instead.
+///
+/// Bound: `Send + Sync + 'static + Sealed`, deliberately WITHOUT `Copy`
+/// **or `Clone`**. This is not merely "we don't need Clone" — Clone is
+/// actively refused:
+///
+/// - Every call site in this crate constructs a fresh instance and passes
+///   it BY VALUE into [`apply_stateful1`] (mirroring [`apply1`]/[`apply2`]/
+///   [`apply3`]'s own by-value shape and every existing op's inline
+///   `::new()`-at-the-call-site convention — e.g. `AttentionBlockFused::new`
+///   at `crates/jammi-encoders/src/modernbert.rs:960`, `DropoutFused::new`
+///   at `crates/jammi-lora/src/lora_linear.rs:690`); nothing in this crate
+///   ever clones an op value, stateful or not.
+/// - If a stateful op were `Clone`, a caller could hold one instance in a
+///   struct field (`struct Layer { op: FlashVarlenAttention }`) and reuse
+///   a CLONE of it across multiple calls — reintroducing exactly the
+///   hazard `Saved`'s per-call freshness argument depends on (see
+///   `saved`'s module doc): a cloned `Saved<T>` shares its `Arc` with the
+///   original, so `set()` on a REUSED clone would fail with
+///   `SavedError::AlreadySet` (harmless — a typed error, not silent
+///   corruption) but only because `Saved` itself refuses to be `Clone`
+///   either; the real defence is one level up, at THIS bound, making the
+///   reuse impossible to WRITE in the first place: without `Copy` or
+///   `Clone`, `op: FlashVarlenAttention` cannot be moved out of `&self` in
+///   a method (`cannot move out of `self.op` which is behind a shared
+///   reference` — a compile error, not a runtime one), so a struct field
+///   holding one can never be handed to [`apply_stateful1`] (which takes
+///   the op BY VALUE) more than once. Hoisting a stateful op into a
+///   long-lived field is therefore unrepresentable at compile time, not
+///   merely discouraged by convention.
+///
+/// `candle_core::Tensor::apply_op1_arc`/`apply_op3_arc` (`custom_op.rs:
+/// 216-234,236-243`) are PUBLIC candle APIs that take an already-
+/// constructed `Arc<Box<dyn CustomOpN + Send + Sync>>` and can back
+/// arbitrarily many forward calls from ONE such `Arc` — nothing in
+/// `CustomOpN`'s own trait bounds stops that. This module's enforcement is
+/// therefore a DISCIPLINE over this crate's own call sites (never call
+/// `apply_opN_arc`/`apply_opN_no_bwd` directly on a `Saved`-bearing op),
+/// not a type-system guarantee candle itself enforces — see
+/// `crates/jammi-kernels/tests/stateful_op_discipline.rs`'s grep-based
+/// regression test for the mechanical check that no call site in this
+/// crate's `src/` does.
+///
+/// The doctest below proves the move-out-of-`&self` closure using
+/// [`Saved`] directly (a PUBLIC type) rather than
+/// `crate::ops::flash_attention::FlashVarlenAttention` itself: that op
+/// type is `pub(crate)` (crate-private by construction, see its own
+/// module doc), and doctests compile as an EXTERNAL crate regardless of
+/// which item's doc comment they are attached to — a `pub(crate)` path is
+/// UNREACHABLE from one (verified: an earlier draft of this doctest tried
+/// `jammi_kernels::ops::flash_attention::FlashVarlenAttention` directly
+/// and failed with `E0603 module is private`, a DIFFERENT and weaker
+/// error than the `E0507 cannot move out of ... behind a shared reference`
+/// this doctest exists to prove). The STRUCTURAL reason
+/// `FlashVarlenAttention` cannot be hoisted is exactly the shape below —
+/// it holds a `Saved<T>` field and derives neither `Copy` nor `Clone` —
+/// so this generic minimal reproduction is a faithful proof of the
+/// mechanism, not a proof about `FlashVarlenAttention` by name specifically:
+///
+/// ```compile_fail,E0507
+/// use jammi_kernels::ops::Saved;
+///
+/// struct HoldsSaved {
+///     lse: Saved<u32>,
+/// }
+///
+/// struct Layer {
+///     op: HoldsSaved,
+/// }
+///
+/// impl Layer {
+///     // The GradCache-detached-pass-1 hazard's shape: a method taking
+///     // `&self` trying to hand the hoisted op to a by-value consumer
+///     // (`apply_stateful1`'s own signature) a SECOND time on a later
+///     // call. `self.op` cannot be moved out of `&self` because
+///     // `HoldsSaved` is neither `Copy` nor `Clone` (it holds a `Saved<T>`,
+///     // and `Saved<T>` itself deliberately implements neither).
+///     fn take_op(&self) -> HoldsSaved {
+///         self.op
+///     }
+/// }
+/// ```
+pub trait StatefulKernelOp: Send + Sync + 'static + sealed::Sealed {}
+
+impl<T> StatefulKernelOp for T where T: Send + Sync + 'static + sealed::Sealed {}
+
+/// The sanctioned way to run a unary (`CustomOp1`) STATEFUL fused op —
+/// same shape as [`apply1`], but for [`StatefulKernelOp`] (no `Copy`
+/// bound). `crate::ops::flash_attention::FlashVarlenAttention`'s FORWARD
+/// takes exactly one differentiable `Tensor` argument (the packed `qkv`)
+/// — mirroring [`crate::ops::AttentionBlockFused`]'s own precedent of
+/// taking `qkv` as ONE `CustomOp3` argument and splitting Q/K/V INTERNALLY
+/// (`crate::cuda::attention_block::slot_view`), not as three top-level
+/// tensor arguments — so `CustomOp1` is its honest arity. Its BACKWARD
+/// needs a different, THREE-tensor seam; see [`apply_stateful3`].
+pub fn apply_stateful1<T: StatefulKernelOp + CustomOp1>(x: &Tensor, op: T) -> Result<Tensor> {
+    x.apply_op1(op)
+}
+
+/// The sanctioned way to run a ternary (`CustomOp3`) STATEFUL fused op.
+/// `crate::ops::flash_attention::FlashVarlenAttention::bwd` uses this: the
+/// vendored backward genuinely needs THREE tensors (`qkv`, `o`, `d_o` —
+/// candle already hands `bwd` exactly these three, `res` being `o`) PLUS
+/// the forward's stashed `lse`, and constructing the returned `d_qkv`
+/// `Tensor` through candle's own `apply_op3` (rather than hand-building a
+/// `Tensor` from raw `Storage`) is the SAME "recompute via composing an
+/// inner op" idiom `LayerNormFused::bwd`'s internal `CustomOp3` dx/dgamma
+/// helpers already use — `lse` moves from the outer op's `Saved` slot to
+/// the inner helper's OWN `Saved` slot at construction (`take()` then
+/// `set()`, both typed, both proven — see `ops::saved`'s module doc): a
+/// `Saved<T>` SPANS two op types here, never a raw field smuggled between
+/// them.
+pub fn apply_stateful3<T: StatefulKernelOp + CustomOp3>(
     x: &Tensor,
     y: &Tensor,
     z: &Tensor,

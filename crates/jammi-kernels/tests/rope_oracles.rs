@@ -470,6 +470,267 @@ fn negated_sin_bwd_matches_a_hand_computed_sign_flip() {
     }
 }
 
+/// esc-045 round 5, E1: `x`/`grad_res` at PRODUCTION amplitude (guide
+/// §3.4) — `hidden = 64` (ModernBERT-large's real `head_dim`), `seq =
+/// 128`, with two coupled "massive activation" channel pairs (`5`/`37`,
+/// `21`/`53` — both `col` and `col+half`, so the rotate-half coupling this
+/// op's math depends on is exercised at the extreme amplitude, not just a
+/// single stray channel) forced to `|x| ~ 6688`, matching round 4's
+/// measured `max|qkv| ~ 6688` at the layer-18 massive-activation onset
+/// (`5d3716a`'s commit message: "one layer past the |x|~6688 massive-
+/// activation onset at layer 18"). Every other channel stays at the
+/// moderate `O(1)`-`O(10)` amplitude this file's other fixtures already
+/// cover. `grad_res` reuses the same massive-channel pattern with an
+/// independent salt (a downstream gradient that has itself passed through
+/// amplified paths is not a moderate one; it is not literally `x` reused).
+fn massive_amplitude_fixture(total_rows: usize, hidden: usize, salt: f32) -> Vec<f32> {
+    let massive_cols = [5usize, 37, 21, 53];
+    (0..total_rows * hidden)
+        .map(|idx| {
+            let row = idx / hidden;
+            let col = idx % hidden;
+            let base = ((row * hidden + col) as f32 * 0.173 + salt).sin() * 8.0;
+            if massive_cols.contains(&col) {
+                let sign = if (row + col).is_multiple_of(2) {
+                    1.0
+                } else {
+                    -1.0
+                };
+                sign * (6688.0 + base)
+            } else {
+                base
+            }
+        })
+        .collect()
+}
+
+/// Independent numpy/f64-first TRUTH (family F) for the forward pass —
+/// the raw per-column rotation algebra derived directly from `out_j =
+/// x_j*cos_j + rotate_half(x)_j*sin_j`, NOT a call through `fused`/`eager`
+/// at any dtype, so this oracle cannot share a bug with either arm under
+/// test. `theta` is recomputed from `(seq_idx, theta_base)` rather than
+/// read back from the f32 `cos`/`sin` tables the arms under test consume,
+/// for the same reason.
+fn truth_fwd_f64(
+    x: &[f32],
+    theta_base: f64,
+    total_rows: usize,
+    period: usize,
+    hidden: usize,
+) -> Vec<f64> {
+    let half = hidden / 2;
+    let mut out = vec![0f64; total_rows * hidden];
+    for r in 0..total_rows {
+        let seq_idx = r % period;
+        for col in 0..hidden {
+            let i = col % half;
+            let theta = (seq_idx as f64) * theta_base.powf(-2.0 * i as f64 / hidden as f64);
+            let (c, s) = (theta.cos(), theta.sin());
+            let xv = x[r * hidden + col] as f64;
+            let rh = if col < half {
+                -(x[r * hidden + col + half] as f64)
+            } else {
+                x[r * hidden + col - half] as f64
+            };
+            out[r * hidden + col] = xv * c + rh * s;
+        }
+    }
+    out
+}
+
+/// Independent numpy/f64-first TRUTH for `dx`, derived by hand from the
+/// module doc's Jacobian-transpose identity (`ops::rope`'s "`bwd`: RoPE
+/// with the sign of `sin` flipped" section): for `col < half`, `dx_col =
+/// dy_col*cos_col + dy_{col+half}*sin_col`; for `col >= half`, `dx_col =
+/// dy_col*cos_col - dy_{col-half}*sin_col` — worked from `out_col`'s own
+/// dependence on `x_col` AND `x_{col +/- half}` (each column of `x`
+/// contributes to exactly two output columns under this op's pairing), not
+/// by calling `fused`'s `bwd` or `eager`'s autograd.
+fn truth_bwd_f64(
+    dy: &[f32],
+    theta_base: f64,
+    total_rows: usize,
+    period: usize,
+    hidden: usize,
+) -> Vec<f64> {
+    let half = hidden / 2;
+    let mut out = vec![0f64; total_rows * hidden];
+    for r in 0..total_rows {
+        let seq_idx = r % period;
+        for col in 0..hidden {
+            let i = col % half;
+            let theta = (seq_idx as f64) * theta_base.powf(-2.0 * i as f64 / hidden as f64);
+            let (c, s) = (theta.cos(), theta.sin());
+            let dyv = dy[r * hidden + col] as f64;
+            let (pair, sign) = if col < half {
+                (col + half, 1.0)
+            } else {
+                (col - half, -1.0)
+            };
+            let dy_pair = dy[r * hidden + pair] as f64;
+            out[r * hidden + col] = dyv * c + sign * dy_pair * s;
+        }
+    }
+    out
+}
+
+/// `(L1 relative error, L2 norm ratio)` of a `bf16` arm against an `f64`
+/// truth vector — ascending-index fold order (family J), the same fixed
+/// order the op's own module doc pins for its kernel math.
+fn relerr_and_norm_ratio(measured: &[bf16], truth: &[f64]) -> (f64, f64) {
+    let mut abs_diff_sum = 0f64;
+    let mut truth_abs_sum = 0f64;
+    let mut measured_sq_sum = 0f64;
+    let mut truth_sq_sum = 0f64;
+    for (&m, &t) in measured.iter().zip(truth.iter()) {
+        let mf = m.to_f32() as f64;
+        abs_diff_sum += (mf - t).abs();
+        truth_abs_sum += t.abs();
+        measured_sq_sum += mf * mf;
+        truth_sq_sum += t * t;
+    }
+    let relerr = abs_diff_sum / truth_abs_sum;
+    let norm_ratio = measured_sq_sum.sqrt() / truth_sq_sum.sqrt();
+    (relerr, norm_ratio)
+}
+
+/// esc-045 round 5, E1 (decides H1 vs H2 — see the round-5 dispatch): at
+/// PRODUCTION amplitude (`massive_amplitude_fixture`), is the FUSED bf16
+/// kernel itself further from an independent f64 truth than the EAGER
+/// candle-op composition is, for fwd AND for `dx` separately? If fused's
+/// relerr is comparable to eager's (both near bf16's own precision floor,
+/// ~0.4%), the isolated op is not the defect (H2: the divergence measured
+/// against jammi's own eager arm in round 4 must be introduced or
+/// amplified downstream of this op, not inside it). If fused's relerr is
+/// ORDERS OF MAGNITUDE larger than eager's, that is H1 — a real kernel
+/// defect at this amplitude, not a rounding-model artifact.
+#[test]
+fn eager_vs_fused_bf16_fwd_and_bwd_at_production_amplitude_vs_independent_f64_truth() {
+    let device = Device::Cpu;
+    let (heads, seq, hidden) = (4usize, 128usize, 64usize);
+    let total_rows = heads * seq;
+    let theta_base = 10_000.0f64;
+
+    let x0 = massive_amplitude_fixture(total_rows, hidden, 0.0);
+    let dy0 = massive_amplitude_fixture(total_rows, hidden, 100.0);
+    assert!(
+        x0.iter().any(|&v| v.abs() > 6000.0),
+        "fixture must actually reach production amplitude"
+    );
+
+    let (cos_v, sin_v) = table(seq, hidden, theta_base);
+    let xb: Vec<bf16> = x0.iter().map(|&v| bf16::from_f32(v)).collect();
+    let cb: Vec<bf16> = cos_v.iter().map(|&v| bf16::from_f32(v)).collect();
+    let sb: Vec<bf16> = sin_v.iter().map(|&v| bf16::from_f32(v)).collect();
+    let dyb: Vec<bf16> = dy0.iter().map(|&v| bf16::from_f32(v)).collect();
+
+    let x_fused =
+        Var::from_tensor(&Tensor::from_slice(&xb, (1, heads, seq, hidden), &device).unwrap())
+            .unwrap();
+    let x_eager =
+        Var::from_tensor(&Tensor::from_slice(&xb, (1, heads, seq, hidden), &device).unwrap())
+            .unwrap();
+    let cos_bf = Tensor::from_slice(&cb, (1, 1, seq, hidden), &device).unwrap();
+    let sin_bf = Tensor::from_slice(&sb, (1, 1, seq, hidden), &device).unwrap();
+
+    let out_fused = fused(false, &x_fused, &cos_bf, &sin_bf).unwrap();
+    let out_eager = eager(&x_eager, &cos_bf, &sin_bf).unwrap();
+    let fwd_fused: Vec<bf16> = out_fused.flatten_all().unwrap().to_vec1().unwrap();
+    let fwd_eager: Vec<bf16> = out_eager.flatten_all().unwrap().to_vec1().unwrap();
+
+    let truth_fwd = truth_fwd_f64(&x0, theta_base, total_rows, seq, hidden);
+    let (fused_relerr_fwd, fused_norm_ratio_fwd) = relerr_and_norm_ratio(&fwd_fused, &truth_fwd);
+    let (eager_relerr_fwd, eager_norm_ratio_fwd) = relerr_and_norm_ratio(&fwd_eager, &truth_fwd);
+    println!(
+        "[E1 fwd] fused: relerr={fused_relerr_fwd:.6e} norm_ratio={fused_norm_ratio_fwd:.6} | \
+         eager: relerr={eager_relerr_fwd:.6e} norm_ratio={eager_norm_ratio_fwd:.6}"
+    );
+
+    let w_fused = Tensor::from_slice(&dyb, (1, heads, seq, hidden), &device).unwrap();
+    let w_eager = Tensor::from_slice(&dyb, (1, heads, seq, hidden), &device).unwrap();
+    let loss_fused = (&out_fused * &w_fused).unwrap().sum_all().unwrap();
+    let loss_eager = (&out_eager * &w_eager).unwrap().sum_all().unwrap();
+    let dx_fused: Vec<bf16> = loss_fused
+        .backward()
+        .unwrap()
+        .get(&x_fused)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let dx_eager: Vec<bf16> = loss_eager
+        .backward()
+        .unwrap()
+        .get(&x_eager)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    let truth_dx = truth_bwd_f64(&dy0, theta_base, total_rows, seq, hidden);
+    let (fused_relerr_bwd, fused_norm_ratio_bwd) = relerr_and_norm_ratio(&dx_fused, &truth_dx);
+    let (eager_relerr_bwd, eager_norm_ratio_bwd) = relerr_and_norm_ratio(&dx_eager, &truth_dx);
+    println!(
+        "[E1 bwd] fused: relerr={fused_relerr_bwd:.6e} norm_ratio={fused_norm_ratio_bwd:.6} | \
+         eager: relerr={eager_relerr_bwd:.6e} norm_ratio={eager_norm_ratio_bwd:.6}"
+    );
+
+    // Non-finite negative control (§3.7): a NaN massive-activation channel
+    // must propagate to a NaN output, never silently compare as passing.
+    let mut x_nan = x0.clone();
+    x_nan[5] = f32::NAN;
+    let xb_nan: Vec<bf16> = x_nan.iter().map(|&v| bf16::from_f32(v)).collect();
+    let x_nan_t = Tensor::from_slice(&xb_nan, (1, heads, seq, hidden), &device).unwrap();
+    let out_nan: Vec<bf16> = fused(false, &x_nan_t, &cos_bf, &sin_bf)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert!(
+        out_nan[5].is_nan(),
+        "NaN in a massive-activation channel must produce a NaN output"
+    );
+
+    // §3.3: agreement is not accuracy — anchor both arms to the
+    // independent f64 truth and require the fused arm to be NO FURTHER
+    // from it than the eager arm, within a small factor covering ordinary
+    // fixture-to-fixture noise. `1e-2` absolute floor covers the case
+    // where eager's relerr measures near-zero (guards a 0/near-0
+    // denominator blowing the ratio up spuriously).
+    let fwd_ratio_ok = fused_relerr_fwd <= (2.0 * eager_relerr_fwd).max(fused_relerr_fwd.min(1e-2));
+    let bwd_ratio_ok = fused_relerr_bwd <= (2.0 * eager_relerr_bwd).max(fused_relerr_bwd.min(1e-2));
+    assert!(
+        fused_relerr_fwd.is_finite() && fwd_ratio_ok,
+        "fwd: fused arm ({fused_relerr_fwd:.6e}) is materially further from f64 truth than the \
+         eager arm ({eager_relerr_fwd:.6e}) at production amplitude — this is H1, a real kernel \
+         defect, not ordinary bf16 rounding"
+    );
+    assert!(
+        fused_relerr_bwd.is_finite() && bwd_ratio_ok,
+        "bwd: fused arm ({fused_relerr_bwd:.6e}) is materially further from f64 truth than the \
+         eager arm ({eager_relerr_bwd:.6e}) at production amplitude — this is H1, a real kernel \
+         defect, not ordinary bf16 rounding"
+    );
+    // Both arms must also be within an ordinary bf16-precision band of
+    // truth in absolute terms (not just relative to each other) — bf16's
+    // machine epsilon is 2^-8 ~ 0.39%; 2% is a deliberate headroom margin
+    // (not tightened to the measured minimum) over that, the same
+    // inherited-conservative-ceiling status `BF16_ULP_TOL` documents.
+    assert!(
+        fused_relerr_fwd < 0.02 && eager_relerr_fwd < 0.02,
+        "fwd relerr exceeds the bf16-precision band even before comparing the two arms: \
+         fused={fused_relerr_fwd:.6e} eager={eager_relerr_fwd:.6e}"
+    );
+    assert!(
+        fused_relerr_bwd < 0.02 && eager_relerr_bwd < 0.02,
+        "bwd relerr exceeds the bf16-precision band even before comparing the two arms: \
+         fused={fused_relerr_bwd:.6e} eager={eager_relerr_bwd:.6e}"
+    );
+}
+
 #[test]
 fn f32_dtype_forward_matches_double_precision_reference() {
     // A numpy/f64-first reference at a hand-verifiable head_dim=2 (a

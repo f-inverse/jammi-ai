@@ -320,6 +320,21 @@ pub fn check_status(code: i32) -> Result<()> {
     })
 }
 
+/// The mismatch message when the C library's `sizeof` for the two args
+/// structs differs from the `#[repr(C)]` mirrors' — `None` when both agree.
+/// Pure, so the cell table (fwd only / bwd only / both / neither) is
+/// unit-tested without a way to inject a wrong C size.
+fn abi_mismatch(c_fwd: usize, c_bwd: usize) -> Option<String> {
+    let rust_fwd = std::mem::size_of::<raw::FwdArgs>();
+    let rust_bwd = std::mem::size_of::<raw::BwdArgs>();
+    if c_fwd == rust_fwd && c_bwd == rust_bwd {
+        return None;
+    }
+    Some(format!(
+        "fwd: C {c_fwd} vs Rust {rust_fwd}; bwd: C {c_bwd} vs Rust {rust_bwd}"
+    ))
+}
+
 /// The `#[repr(C)]` mirrors must be exactly the C structs' size; checked
 /// on every call (one FFI call returning a constant).
 fn check_abi() -> Result<()> {
@@ -330,20 +345,17 @@ fn check_abi() -> Result<()> {
             raw::jammi_flash_sizeof_bwd_args(),
         )
     };
-    if fwd != std::mem::size_of::<raw::FwdArgs>() || bwd != std::mem::size_of::<raw::BwdArgs>() {
-        let code = FlashStatus::Abi as i32;
-        return Err(FlashError::Refused {
-            status: FlashStatus::Abi,
-            code,
-            message: format!(
-                "{} (fwd: C {fwd} vs Rust {}; bwd: C {bwd} vs Rust {})",
-                strerror(code),
-                std::mem::size_of::<raw::FwdArgs>(),
-                std::mem::size_of::<raw::BwdArgs>()
-            ),
-        });
+    match abi_mismatch(fwd, bwd) {
+        None => Ok(()),
+        Some(detail) => {
+            let code = FlashStatus::Abi as i32;
+            Err(FlashError::Refused {
+                status: FlashStatus::Abi,
+                code,
+                message: format!("{} ({detail})", strerror(code)),
+            })
+        }
     }
-    Ok(())
 }
 
 /// The batch's shape, host-side. `total_q` and `max_seqlen` are derived
@@ -849,33 +861,79 @@ mod tests {
 
     #[test]
     fn geometry_refuses_int32_offset_overflow() {
-        // qkv offsets: total_q * 3 * H * 64 > i32::MAX at H = 1 once
-        // total_q > 11_184_810; dq_accum offsets overflow slightly later
-        // (rows_padded * H * 64), so the qkv product is the binding cell.
+        // qkv cell: total_q · 3 · H · 64 > i32::MAX at H = 2 once
+        // total_q > 5_592_405 (5_592_406 · 384 = 2_147_483_904); the
+        // dq_accum product there ((5_592_406 + 128) · 2 · 64 ≈ 716M) stays
+        // under, so this cell isolates the qkv term — and H = 2 (not 1) so
+        // a dropped head factor changes the verdict.
         let g = VarlenGeometry {
-            total_q: 11_184_811,
+            total_q: 5_592_406,
             batch: 1,
-            num_heads: 1,
-            max_seqlen: 11_184_811,
+            num_heads: 2,
+            max_seqlen: 5_592_406,
         };
         assert!(matches!(g.validate(), Err(FlashError::Geometry(_))));
         let g = VarlenGeometry {
-            total_q: 11_184_810,
-            max_seqlen: 11_184_810,
+            total_q: 5_592_405,
+            max_seqlen: 5_592_405,
             ..g
         };
         assert!(g.validate().is_ok(), "{:?}", g.validate().err());
-        // And a dq_accum-bound cell: the 128·B padding rows push it over
-        // while qkv (which has no padding rows) stays under.
-        // rows_padded = 1_000 + 128 · 262_144 = 33_555_432; × 64 =
-        // 2_147_547_648 > i32::MAX, while qkv = 1_000 · 192 stays tiny.
+        // dq_accum cell: rows_padded = 1_000 + 128 · 131_072 = 16_778_216;
+        // · 2 · 64 = 2_147_611_648 > i32::MAX, while qkv = 1_000 · 384 stays
+        // tiny. Again H = 2 so the head factor is load-bearing.
         let g = VarlenGeometry {
             total_q: 1_000,
-            batch: 262_144,
-            num_heads: 1,
+            batch: 131_072,
+            num_heads: 2,
             max_seqlen: 1,
         };
         assert!(matches!(g.validate(), Err(FlashError::Geometry(_))));
+        // Largest legal batch at this total_q / H: rows_padded must be
+        // <= floor(i32::MAX / 128) = 16_777_215, i.e. batch <= 131_064
+        // (1_000 + 128 · 131_064 = 16_777_192; · 128 = 2_147_480_576).
+        let g = VarlenGeometry {
+            batch: 131_064,
+            ..g
+        };
+        assert!(g.validate().is_ok(), "{:?}", g.validate().err());
+        // The comparison is `>`; `>=` would be indistinguishable here
+        // because both products are multiples of 64 and i32::MAX is odd —
+        // equality is unreachable, so that cell has no test by construction.
+    }
+
+    #[test]
+    fn abi_mismatch_cells() {
+        let fwd = std::mem::size_of::<raw::FwdArgs>();
+        let bwd = std::mem::size_of::<raw::BwdArgs>();
+        assert!(abi_mismatch(fwd, bwd).is_none());
+        for (name, cf, cb) in [
+            ("fwd only", fwd + 8, bwd),
+            ("bwd only", fwd, bwd - 4),
+            ("both", fwd + 8, bwd + 8),
+        ] {
+            let m = abi_mismatch(cf, cb).unwrap_or_else(|| panic!("{name}: no mismatch"));
+            assert!(
+                m.contains(&format!("C {cf}")) && m.contains(&format!("C {cb}")),
+                "{m}"
+            );
+        }
+    }
+
+    #[test]
+    fn status_message_is_the_wrapper_static_text() {
+        // Each variant's message is the wrapper's own string (not empty,
+        // not the unknown-code fallback), and the dropout one names the
+        // parameter a caller would search for.
+        for code in 1..=13 {
+            let s = FlashStatus::from_code(code).unwrap();
+            let m = s.message();
+            assert!(!m.is_empty() && !m.contains("unknown"), "{s:?}: {m:?}");
+        }
+        assert!(FlashStatus::DropoutUnsupported
+            .message()
+            .contains("p_dropout must be 0.0"));
+        assert!(FlashStatus::HeadDim.message().contains("64"));
     }
 
     #[test]

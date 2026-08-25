@@ -1134,6 +1134,20 @@ pub struct FinetuneStepTier {
     /// here says nothing about learning quality, only that the forward /
     /// backward / optimizer path executed and produced finite numbers.
     /// Never quote this field as a quality result.
+    ///
+    /// PRECISION: this field is read in the BACKBONE dtype (`finetune_step.rs`'s
+    /// `loss.to_dtype(DType::F32)` widens the STORAGE type for the D2H read,
+    /// it never adds mantissa bits the upstream tensor did not have) —
+    /// every real sweep leg runs `--backbone-dtype bf16`, whose 7 explicit
+    /// mantissa bits give a ULP of `2^-9 ≈ 0.001953125` at a value near
+    /// `0.30` (exponent bucket `[0.25, 0.5)`). Two adjacent recorded steps
+    /// CAN legitimately repeat the exact same `f32` bit pattern even though
+    /// the true (infinite-precision) loss moved, because the move landed
+    /// inside that ULP — this is not a stuck optimizer, it is bf16
+    /// quantization made visible. A caller printing more than ~3 decimal
+    /// digits of a bf16-sourced entry here is displaying precision the
+    /// dtype does not carry; see `ci/scripts/perf/ab_merge.py`'s `fmt_loss`
+    /// for the table formatter that respects this.
     pub losses: Vec<f32>,
     /// `losses[0]`, carried as a scalar for table/summary use so a reader
     /// does not have to index into `losses` for the common case.

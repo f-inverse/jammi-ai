@@ -379,3 +379,32 @@ AFTER argument parsing, inside `run()`; the guards reject a nonsensical raw
 CLI value (e.g. `--dry-run --steps 0`) at parse time regardless of whether
 that value would go on to be overridden, so a typo doesn't silently pass
 just because `--dry-run` happened to make it irrelevant.
+
+## `torch_grad_oracle.py` — the jammi-vs-torch LEARNING oracle's torch side
+
+A SEPARATE script, not a mode of `torch_finetune_step.py` (different
+contract: one forward+backward at IDENTICAL LoRA weights, no optimizer
+step, no timing). See `crates/jammi-bench/src/grad_oracle.rs`'s module doc
+for the full "why gradients, not loss trajectories" argument, and this
+script's own module doc for the exact jammi<->PEFT tensor-name translation
+table it owns (jammi's `grad-oracle` subcommand does zero translation — the
+shared weight-interchange file is a plain `safetensors` file in jammi's OWN
+internal naming; this script translates both directions).
+
+**PROVENANCE — read before trusting this script's output**: it has not
+been run. No `torch`/`transformers`/`peft` install was available in the
+environment it was written in (see `torch_grad_oracle.py`'s own module-doc
+banner for the full disclosure). Its NAME-TRANSLATION functions ARE
+locally tested (`test_torch_grad_oracle_names.py`, stdlib-only, no torch
+needed — that suite caught and pinned a real bug in an early draft: `Wi`,
+an MLP site whose jammi-side name carries no `mlp.` prefix, was misrouted
+to `attn.Wi` by a naive string-prefix heuristic). Everything past the name
+translation (the actual model load / forward / backward / gradient dump)
+is unverified against a live run.
+
+`ci/scripts/perf/compare_grad_oracle.py` reads a jammi `grad-oracle` dump
+and a `torch_grad_oracle.py` dump — SAME JSON schema on both sides — and
+reports gradient-DIRECTION agreement (cosine similarity), never a loss
+comparison; see that script's own module doc for the derived (never
+fitted) bf16 ULP-based cosine floor, and `ci/scripts/perf/test_compare_grad_oracle.py`
+for its (numpy-optional) test suite.

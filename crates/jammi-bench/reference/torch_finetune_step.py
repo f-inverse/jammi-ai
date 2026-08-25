@@ -62,8 +62,24 @@ plus `loss_first`/`loss_last` mirror `finetune_step.rs`'s own `losses` /
 `loss_first` / `loss_last` fields, same placement convention (see
 `_step_once`'s docstring), so the two stacks' per-step loss sequences line up
 index-for-index IF the two runs used the same `--seed`/`--batch`/`--seq`/
-vocab (the synthetic token ids are then bit-identical across the two stacks —
-see `synthetic_ids` below, a literal LCG port of `finetune_step.rs`'s own).
+`--warmup`/vocab (the synthetic token ids are then bit-identical across the
+two stacks — see `synthetic_ids` below, a literal LCG port of
+`finetune_step.rs`'s own). This "line up index-for-index" claim depends on
+BOTH stacks discarding the same number of optimizer updates before recording
+starts: this script always runs one untimed `_step_once` pre-step before its
+`--warmup`/`--steps` loop (documented above), and `finetune_step.rs`'s own
+`run()` now does the identical untimed pre-step immediately before its own
+timed loop — so both stacks' `losses[k]` is the loss after `warmup+k+1` total
+optimizer updates. (An earlier revision of `finetune_step.rs` had no such
+pre-step, so its `losses[k]` was the loss after only `warmup+k` updates —
+one update stale relative to this script, worst-case visible in
+`loss_first`: with `LoraInitMode::ZerosB` the LoRA delta is identically zero
+at construction, so the un-fixed `loss_first` was literally the PRISTINE,
+zero-optimizer-update loss while this script's `loss_first` was already one
+update in. `finetune_step.rs::tests::finetune_step_loss_first_is_the_post_pre_step_update`
+pins the fixed placement.) `--warmup` values that differ between the two
+runs break the index correspondence even with everything else matched,
+since each stack's `losses[0]` is anchored to its OWN `--warmup` value.
 Identical INPUT ids does NOT make the two stacks' loss VALUES a meaningful
 apples-to-apples quality comparison by default: candle and torch run
 different arithmetic (different attention composition, different fused-vs-
@@ -994,7 +1010,12 @@ def run(args):
                 "token ids) — see finetune_step.rs's module doc's 'Honesty about what is "
                 "measured'. Each entry read after optimizer.step() returns; the value "
                 "itself is the PRE-update loss of that step's batch (see _step_once's "
-                "docstring for the placement convention shared with finetune_step.rs).",
+                "docstring for the placement convention shared with finetune_step.rs). "
+                "PRECISION: at --dtype bf16 (every real sweep leg) this value carries only "
+                "bf16's 7 explicit mantissa bits — ULP ~2^-9 ≈ 0.001953125 near 0.30 (the "
+                "[0.25, 0.5) exponent bucket) — so two adjacent steps repeating the exact "
+                "same float is expected quantization, not a stuck optimizer; do not read "
+                "more than ~3 decimal digits of this field as meaningful.",
                 "s_per_step_p50": {"value": p50, "unit": "s"},
                 "s_per_step_mean": {"value": mean, "unit": "s"},
                 "steps_per_s": {"value": 1.0 / p50, "unit": "steps/s"},

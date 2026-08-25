@@ -247,6 +247,93 @@ jobs:
       - name: Assert no consumer's feature closure reaches jammi-kernels/flash-attn
         run: python3 ci/scripts/check_flash_attn_closure.py
 
+  # This is a COMPILE lane, not a correctness lane: it proves the vendored
+  # FlashAttention-2 tree, the torch-free C wrapper, the shim headers, and
+  # `build.rs::build_flash_attn` still produce a valid `nvcc` build (a
+  # source-tree or wrapper edit that FAILS to compile is caught here). It
+  # does NOT prove the kernels are numerically correct — no test in this job
+  # runs on a GPU. `tests/flash_smoke.rs` (16 cases) and the `flash::` unit
+  # tests (17 cases) are the only lane that checks output values, and they
+  # currently run nowhere in CI; they exist only as ad-hoc `JAMMI_REQUIRE_
+  # CUDA=1 cargo test -p jammi-kernels --features flash-attn --test
+  # flash_smoke` pod sessions (see the P6 stage-A artifact commit). Closing
+  # THAT gap needs a self-hosted GPU runner wired the way `_gpu-prove-gate.yml`
+  # already does for the release lane — out of scope here; do not read a green
+  # run of this job as evidence the kernels compute the right numbers.
+  #
+  # `cargo check` (not `cargo build`) is enough: build scripts run in full —
+  # unconditionally compiled AND executed — for `cargo check` exactly as for
+  # `cargo build`, because the primary crate's check needs the build script's
+  # `cargo:rustc-link-lib` / `cargo:rustc-cfg` output regardless of whether the
+  # crate itself is only being metadata-checked. `build.rs::build_flash_attn`
+  # is gated on `CARGO_FEATURE_FLASH_ATTN` in `main()`, not on the downstream
+  # check/build distinction, so `cargo check -p jammi-kernels --features
+  # flash-attn` invokes it — and therefore `nvcc` — the same as a full build.
+  #
+  # Needs the CUDA toolkit (`nvcc`) but NOT a GPU: reuses the established CUDA
+  # CI base image (`JAMMI_CI_IMAGE_CUDA`, the same image `server-cu12` in
+  # release-binaries.yml and the `_pypi-server.yml` CUDA leg already build
+  # in), which ships CUDA 12.6 + gcc-toolset-13 on PATH
+  # (`.docker/ci-cuda.Dockerfile`) and needs no `nvidia-smi`/driver at build
+  # time (`CUDA_COMPUTE_CAP=80` is pinned, matching this crate's own
+  # `build_cuda` precedent).
+  #
+  # The CUTLASS submodule init below is scoped to THIS job's own checkout
+  # step only — GitHub Actions jobs run on independent, ephemeral runners
+  # with independent checkouts, so it cannot leak an initialised CUTLASS tree
+  # into `crates.yml`'s publish checkout. That distinction matters: `cargo
+  # package -p jammi-kernels` (crates.yml, no per-crate `include`/`exclude`)
+  # walks any submodule that IS checked out at package time and would ship
+  # BSD-3-Clause CUTLASS source inside the Apache-2.0-declared tarball
+  # undisclosed (the gap `third_party/flash-attention/VENDORED.md` already
+  # flags, unrelated to and not fixed by this job) — so `submodules:` is never
+  # added to `crates.yml`'s own checkout step.
+  #
+  # Cost, measured on an A100 pod build (the three vendored TUs compile
+  # CONCURRENTLY — `build.rs`'s `tus.iter().map(..).spawn(..)`, so wall time
+  # is bounded by the slowest, not the sum): fwd ~48 s, bwd ~77 s, the
+  # wrapper ~5 s, so the `nvcc` stage alone is ~80 s. Add checkout, a shallow
+  # CUTLASS submodule clone, the CUDA-image pull, and the rest of the crate's
+  # own `cuda`-feature PTX build (`build_cuda`, 7 kernel files, also
+  # nvcc-driven) and the job is realistically a few minutes end to end — real
+  # but bounded, and it runs on every PR here (no `paths:` filter, matching
+  # every other job in this file and the swarm's own no-paths-filter
+  # discipline: a filtered-out required check hangs unrelated PRs). If that
+  # per-PR cost is judged too high, the alternative is scoping it to changes
+  # under `crates/jammi-kernels/build.rs`, `crates/jammi-kernels/src/flash/**`,
+  # `crates/jammi-kernels/third_party/**`, `crates/jammi-kernels/Cargo.toml`,
+  # and `.gitmodules` — EVERY one of those five paths, since missing any is
+  # worse than no filter (it looks like coverage and isn't) — left to the
+  # maintainer to decide, not applied unilaterally here.
+  flash-attn-compile:
+    name: Compile-check (flash-attn / CUTLASS, nvcc — no GPU)
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ vars.JAMMI_CI_IMAGE_CUDA || 'ghcr.io/f-inverse/jammi-ai-ci-cuda:latest' }}
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Deliberately NOT `submodules: recursive` on the checkout itself —
+          # initialise only the one submodule this job needs, explicitly, so
+          # the scope is auditable from this one line rather than implicit in
+          # a blanket flag.
+          submodules: false
+
+      # A bare `git` in a container `run:` step hits "fatal: detected dubious
+      # ownership" (exit 128) — the checkout is owned by a different user than
+      # the container's git, and the safe.directory `actions/checkout` sets is
+      # not visible here (same trap as `dep-dag.yml`'s dep-DAG freshness step).
+      - name: Init the CUTLASS submodule (scoped to this job's checkout only)
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass
+
+      - uses: ./.github/actions/setup-rust-ci
+
+      - name: Compile-check jammi-kernels --features flash-attn (nvcc, no GPU)
+        run: cargo check -p jammi-kernels --features flash-attn
+
   oss-only-build:
     name: Guard (OSS-only build)
     runs-on: ubuntu-latest
@@ -561,6 +648,7 @@ jobs:
       - guard
       - dep-direction
       - flash-attn-closure
+      - flash-attn-compile
       - oss-only-build
       - dep-audit
       - ts-client

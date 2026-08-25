@@ -8,7 +8,7 @@
 
 use candle_core::{CudaDevice, DType, Device, Tensor};
 use jammi_kernels::flash::{CuSeqlens, VarlenConfig};
-use jammi_kernels::ops::flash_attention_varlen;
+use jammi_kernels::ops::{flash_attention_varlen, SavedError};
 
 fn cuda_device() -> Option<CudaDevice> {
     match Device::new_cuda(0) {
@@ -177,6 +177,90 @@ fn gradcache_detached_pass_one_then_a_real_forward_backward_is_green() {
             .iter()
             .all(|x: &f32| x.is_finite()),
         "pass 2 gradient must be finite"
+    );
+}
+
+/// O0(e) (P6 Stage B contract §4): calling `.backward()` TWICE on the SAME
+/// output node re-walks the SAME `FlashVarlenAttention` op instance's `bwd`
+/// closure a second time — `self.lse.take()` hits an ALREADY-EMPTIED
+/// `Saved` slot (the first `.backward()` consumed it). This must surface
+/// the TYPED `SavedError::Empty` (wrapped as a `candle_core::Error::Msg` by
+/// `ops::flash_attention`'s own `saved_err` helper), never panic and never
+/// silently return a wrong/stale gradient. `10b1f3b`'s audit confirmed this
+/// behaviour live (advisory finding: "O0(e) double-backward test missing
+/// (behaviour verified correct)"); this test PINS it as a real oracle.
+#[test]
+fn double_backward_on_the_same_node_surfaces_the_typed_saved_error() {
+    let Some(dev) = cuda_device() else { return };
+    let device = Device::Cuda(dev.clone());
+    let cu = CuSeqlens::from_lengths(&[64usize], &dev).unwrap();
+
+    let qkv_var = candle_core::Var::from_tensor(&random_qkv(&device, 64, 5)).unwrap();
+    let o = flash_attention_varlen(qkv_var.as_tensor(), &cu, &cfg()).unwrap();
+    let loss = o.sum_all().unwrap();
+
+    // First backward: succeeds, consumes the op instance's `Saved<lse>` slot.
+    let grads1 = loss.backward().unwrap();
+    assert!(
+        grads1.get(qkv_var.as_tensor()).is_some(),
+        "the first backward must produce a real gradient"
+    );
+
+    // Second backward on the SAME `loss` tensor: candle's `backward()` does
+    // its own full topological walk each call and re-invokes the SAME
+    // stored op instance's `bwd` — this is exactly the "double backward on
+    // one node" `SavedError::Empty`'s own doc names.
+    let err = loss
+        .backward()
+        .expect_err("a double backward on one node must surface a typed error, never succeed");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("double backward") || msg.contains(&SavedError::Empty.to_string()),
+        "expected SavedError::Empty's own message to surface, got: {msg}"
+    );
+}
+
+/// Pins the (corrected) doc/comment in `ops/flash_attention.rs`'s
+/// `FlashVarlenBwdHelper::cuda_fwd`'s trailing `bwd`-omission note:
+/// differentiating a SECOND time through `d_qkv` (the OUTPUT of
+/// `FlashVarlenAttention::bwd`) does NOT reach candle's
+/// `Error::BackwardNotSupported` — it silently returns an ABSENT gradient
+/// for the original `qkv` `Var`, because `FlashVarlenAttention::bwd`
+/// detaches `arg`/`res`/`grad_res` before constructing `d_qkv`
+/// (`candle_core::op::BackpropOp::new3` only records a backprop edge if at
+/// least one of its three operands is still tracked — none are, once
+/// detached), so `d_qkv` carries no lineage back to `qkv_var` at all.
+/// `10b1f3b`'s audit flagged the OLD comment as false (the auditor
+/// confirmed THIS behaviour, not `BackwardNotSupported`); this test PINS
+/// the corrected claim.
+#[test]
+fn second_order_backward_through_flash_attention_varlen_output_is_a_silent_absent_gradient_not_an_error(
+) {
+    let Some(dev) = cuda_device() else { return };
+    let device = Device::Cuda(dev.clone());
+    let cu = CuSeqlens::from_lengths(&[64usize], &dev).unwrap();
+
+    let qkv_var = candle_core::Var::from_tensor(&random_qkv(&device, 64, 6)).unwrap();
+    let o = flash_attention_varlen(qkv_var.as_tensor(), &cu, &cfg()).unwrap();
+    let loss = o.sum_all().unwrap();
+    let grads = loss.backward().unwrap();
+    let d_qkv = grads
+        .get(qkv_var.as_tensor())
+        .expect("first-order gradient must exist")
+        .clone();
+
+    // A second-order "loss": some scalar function of the FIRST gradient.
+    // If `d_qkv` carried a real backprop edge back to `qkv_var`, this would
+    // put a real entry for `qkv_var` in `grads2`. It structurally cannot.
+    let penalty = d_qkv.sqr().unwrap().sum_all().unwrap();
+    let grads2 = penalty
+        .backward()
+        .expect("backward() itself must not error — there is simply nothing tracked to walk");
+    assert!(
+        grads2.get(qkv_var.as_tensor()).is_none(),
+        "d_qkv is detached from qkv_var's graph by construction (FlashVarlenAttention::bwd \
+         detaches arg/res/grad_res before calling apply_stateful3) — a second-order gradient \
+         must be ABSENT (None), never a (wrong) Some value"
     );
 }
 

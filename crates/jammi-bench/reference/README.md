@@ -177,10 +177,12 @@ flag; build a distribution/trajectory-equivalence test instead.
 ## Peak VRAM: two fields, two different jammi mappings — read before comparing
 
 `finetune_step.rs`'s `VramSampler` polls whole-device memory via `nvidia-smi`
-on a background thread every 25ms over the ENTIRE step loop (warmup +
-measured), then subtracts a baseline snapshot read once, right after the
-model+optimizer are built (before the loop starts) — see
-`finetune_step.rs:112,:233`.
+(`device_memory_used_bytes`, finetune_step.rs:63) on a background thread
+every 25ms (`std::thread::sleep`, finetune_step.rs:98) over the ENTIRE step
+loop (warmup + measured), then subtracts a baseline snapshot
+(`peak.saturating_sub(baseline)`, finetune_step.rs:114) read once, right
+after the model+optimizer are built (before the loop starts) — see
+`vram_baseline`, finetune_step.rs:431.
 
 **An earlier draft of this script got the sampling point wrong.** It polled
 `torch.cuda.memory_allocated()` once per step, at the same point the clock
@@ -379,3 +381,79 @@ AFTER argument parsing, inside `run()`; the guards reject a nonsensical raw
 CLI value (e.g. `--dry-run --steps 0`) at parse time regardless of whether
 that value would go on to be overridden, so a typo doesn't silently pass
 just because `--dry-run` happened to make it irrelevant.
+
+## `torch_grad_oracle.py` — the jammi-vs-torch LEARNING oracle's torch side
+
+A SEPARATE script, not a mode of `torch_finetune_step.py` (different
+contract: one forward+backward at IDENTICAL LoRA weights, no optimizer
+step, no timing). See `crates/jammi-bench/src/grad_oracle.rs`'s module doc
+for the full "why gradients, not loss trajectories" argument, and this
+script's own module doc for the exact jammi<->PEFT tensor-name translation
+table it owns (jammi's `grad-oracle` subcommand does zero translation — the
+shared weight-interchange file is a plain `safetensors` file in jammi's OWN
+internal naming; this script translates both directions).
+
+**PROVENANCE — read before trusting this script's output**: as of the
+F2/F3 audit-fix round on PR #372, it HAS been run once, live, on an A100
+pod (ModernBERT-large, `--batch 8 --seq 128 --seed 42`, jammi tip
+`e62c8a8`) — reported by the lead who dispatched that pod job, not
+verified locally by this fix round (no GPU was available here). See
+`torch_grad_oracle.py`'s own module-doc PROVENANCE banner for the full
+disclosure, including the measured cosine similarities from that run.
+Beyond that one confirmed config, everything else (other checkpoints,
+`target_modules` sets, dtypes/ranks/batch/seq combinations) remains
+UNVERIFIED against a live run — one successful execution is evidence the
+mechanism works, not a proof it is correct everywhere this script accepts
+flags for. Its NAME-TRANSLATION functions are, independently, locally
+tested (`test_torch_grad_oracle_names.py`, stdlib-only, no torch needed —
+that suite caught and pinned a real bug in an early draft: `Wi`, an MLP
+site whose jammi-side name carries no `mlp.` prefix, was misrouted to
+`attn.Wi` by a naive string-prefix heuristic).
+
+**Structural limitation, confirmed on that live run: a single fresh-init
+call tests ONLY `dL/dB`, never `dL/dA`.** Both `grad_oracle.rs` and this
+script run at `LoraInitMode::ZerosB` — `B` starts at the exact zero
+matrix, and the LoRA forward's chain rule routes `dL/dA` through `B^T @
+dL/d(output)`, which is IDENTICALLY zero whenever `B == 0`, for ANY value
+of `A`, on BOTH stacks, REGARDLESS of whether either stack's `dL/dA`
+arithmetic is actually correct. On the live A100 run, every `lora_a`
+tensor's gradient measured EXACTLY `0.0` on both dumps (112 of 224
+matched tensors) — a structural guarantee, not evidence the two stacks
+agree on that path. See `grad_oracle.rs`'s own "Structural limitation"
+doc section and `compare_grad_oracle.py`'s `is_vacuous_pair`/
+`vacuous_tensor_count`, which classify and surface this case explicitly
+rather than let a `0.0` cosine there masquerade as either a pass or a
+fail. Catching a real `dL/dA` defect needs at least one optimizer step
+first (moving `B` away from zero); not implemented this round.
+
+`ci/scripts/perf/compare_grad_oracle.py` reads a jammi `grad-oracle` dump
+and a `torch_grad_oracle.py` dump — SAME JSON schema on both sides,
+INCLUDING `batch_token_id_sums` (both producers emit it; the comparator
+refuses if either side omits it or the two disagree — an earlier draft of
+this script left `batch_token_id_sums` out of this dict entirely, which
+this line used to describe as "same schema" while that gap existed; fixed
+in the F3 audit round on PR #372) — and reports gradient-DIRECTION
+agreement (cosine similarity), never a loss comparison, ONLY after
+verifying its own premise: that both dumps recorded a loaded
+`--lora-weights-in` file, that their per-tensor `weight` arrays actually
+agree, and that their run-identity fields (seed/batch/seq/lora_rank/
+target_modules/batched_forward/backbone_dtype) and `batch_token_id_sums`
+match — a mismatch on any of those REFUSES the comparison (never a silent
+`PASS`) regardless of how well the gradients themselves happen to agree.
+On the live A100 run above, this weight-identity check held by actual
+agreement, not by luck of a loose bound: `max|w_jammi - w_torch| =
+1.86e-9` over 224 tensors -- orders of magnitude inside the ULP-relative
+tolerance `compare_grad_oracle.py`'s `WEIGHT_MATCH_ULPS`/`_weight_element_tolerance`
+derive (advisory ii, round-2 audit fix on PR #372: a fixed `1e-4` absolute
+constant, now an f32-ULP-relative bound).
+
+See that script's own module doc for the derived (never fitted) bf16
+ULP-based cosine floor, and its `derive_cosine_floor` doc for why that
+DERIVED worst-case bound (~-0.40 at ModernBERT-large's own default
+`--num-layers`/`--hidden-size`) is far looser than what real bf16 noise
+actually costs — the live run's measured overall cosines (torch-eager vs
+torch-sdpa 0.825; torch-bf16 vs torch-f32 0.924; jammi-f32 vs torch-f32
+0.9999998; a separately-introduced real defect on the same run scored
+0.30-0.53) are the empirical anchor for picking a real `--cosine-floor`,
+not the derived bound. See `ci/scripts/perf/test_compare_grad_oracle.py`
+for its (numpy-optional) test suite.

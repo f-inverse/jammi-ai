@@ -669,7 +669,7 @@ fn ln_bwd_dgamma_bf16(x: &[bf16], dy: &[bf16], rows: usize, hidden: usize, eps: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::Device;
+    use candle_core::{DType, Device};
 
     fn ln(eps: f64, dgamma_needed: bool, x: &Tensor, gamma: &Tensor) -> Result<Tensor> {
         crate::ops::apply2(x, gamma, LayerNormFused::new(eps, dgamma_needed))
@@ -806,5 +806,309 @@ mod tests {
         for (o, e) in out.iter().zip(expected.iter()) {
             assert!((o.to_f32() - e).abs() < 1e-2, "{o} vs {e}");
         }
+    }
+
+    // -----------------------------------------------------------------
+    // `LayerNormFused::cpu_fwd`'s dtype-mismatch guard (`s1.dtype() !=
+    // s2.dtype()`), the SAME-unsupported-dtype cell (mutation MUT-1:
+    // `layer_norm.rs:216:25 true` survived). The "!=" false-arm (a real
+    // mismatch, e.g. F32 vs BF16) is already `dtype_mismatch_between_
+    // x_and_gamma_is_refused` above; that test alone does not kill the
+    // guard-forced-`true` mutant, because BOTH the real code and the
+    // `true` mutant return `DTypeMismatchBinaryOp` on a real mismatch.
+    // Only a SAME (equal), UNSUPPORTED dtype on both operands (F16 here
+    // — not F32, not BF16) tells them apart: real code falls through to
+    // `UnsupportedDTypeForOp`; the `true` mutant reports
+    // `DTypeMismatchBinaryOp` instead even though the two dtypes agree.
+    // -----------------------------------------------------------------
+    #[test]
+    fn same_unsupported_dtype_is_unsupported_not_a_false_mismatch() {
+        use half::f16;
+        let device = Device::Cpu;
+        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0].map(f16::from_f32), (1, 4), &device)
+            .unwrap();
+        let gamma = Tensor::from_slice(&[1.0f32; 4].map(f16::from_f32), (4,), &device).unwrap();
+        let err = ln(1e-5, false, &x, &gamma)
+            .expect_err("F16/F16 is a real dtype (equal on both sides) this op does not implement");
+        match err {
+            Error::UnsupportedDTypeForOp(dtype, _) => assert_eq!(dtype, DType::F16),
+            other => panic!("expected UnsupportedDTypeForOp(F16, _), got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // `LayerNormBwdDx::cpu_fwd`'s own dtype guard (`s1` = x, `s2` =
+    // gamma; mutations at `layer_norm.rs:340`: guard forced `true`,
+    // forced `false`, and `!=` -> `==`). No existing test calls this
+    // internal helper directly (it is normally reached only through
+    // `LayerNormFused::bwd`, which candle's autograd invokes with
+    // matching dtypes by construction) — both cells below are new.
+    // -----------------------------------------------------------------
+    fn ln_bwd_dx(eps: f64, x: &Tensor, gamma: &Tensor, dy: &Tensor) -> Result<Tensor> {
+        crate::ops::apply3(x, gamma, dy, LayerNormBwdDx { eps })
+    }
+
+    /// Real mismatch cell (x != gamma dtype, dy matches x so the earlier
+    /// `s1.dtype() != s3.dtype()` check at :297 is not what fires here):
+    /// kills the guard-forced-`false` and `!=`->`==` mutants, which would
+    /// otherwise report `UnsupportedDTypeForOp` instead of the correct
+    /// `DTypeMismatchBinaryOp{lhs, rhs}`.
+    #[test]
+    fn bwd_dx_dtype_mismatch_between_x_and_gamma_is_refused() {
+        let device = Device::Cpu;
+        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0], (1, 4), &device).unwrap();
+        let gamma = Tensor::from_slice(&[bf16::from_f32(1.0); 4], (4,), &device).unwrap();
+        let dy = Tensor::from_slice(&[1.0f32, 1.0, 1.0, 1.0], (1, 4), &device).unwrap();
+        let err =
+            ln_bwd_dx(1e-5, &x, &gamma, &dy).expect_err("x/gamma dtype mismatch must be refused");
+        match err {
+            Error::DTypeMismatchBinaryOp { lhs, rhs, .. } => {
+                assert_eq!(lhs, DType::F32);
+                assert_eq!(rhs, DType::BF16);
+            }
+            other => panic!("expected DTypeMismatchBinaryOp{{F32, BF16}}, got {other:?}"),
+        }
+    }
+
+    /// Same-unsupported-dtype cell (x == gamma == dy == F16): kills the
+    /// guard-forced-`true` mutant, which would otherwise report
+    /// `DTypeMismatchBinaryOp` for two operands that actually agree.
+    #[test]
+    fn bwd_dx_same_unsupported_dtype_is_unsupported_not_a_false_mismatch() {
+        use half::f16;
+        let device = Device::Cpu;
+        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0].map(f16::from_f32), (1, 4), &device)
+            .unwrap();
+        let gamma = Tensor::from_slice(&[1.0f32; 4].map(f16::from_f32), (4,), &device).unwrap();
+        let dy = Tensor::from_slice(&[1.0f32; 4].map(f16::from_f32), (1, 4), &device).unwrap();
+        let err = ln_bwd_dx(1e-5, &x, &gamma, &dy)
+            .expect_err("F16/F16/F16 is a real, equal-dtype triple this op does not implement");
+        match err {
+            Error::UnsupportedDTypeForOp(dtype, _) => assert_eq!(dtype, DType::F16),
+            other => panic!("expected UnsupportedDTypeForOp(F16, _), got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // `LayerNormBwdDgamma::cpu_fwd` has TWO copies of this same guard —
+    // one inside the `hidden == 0` fast path (:415) and one in the
+    // general `hidden > 0` path (:439) — each with its own `true`/
+    // `false`/`!=`->`==` survivors. Both cells (mismatch, same-
+    // unsupported) are needed at BOTH hidden==0 and hidden>0, four
+    // tests total.
+    // -----------------------------------------------------------------
+    fn ln_bwd_dgamma(eps: f64, x: &Tensor, dy: &Tensor) -> Result<Tensor> {
+        crate::ops::apply2(x, dy, LayerNormBwdDgamma { eps })
+    }
+
+    #[test]
+    fn bwd_dgamma_hidden_zero_dtype_mismatch_is_refused() {
+        let device = Device::Cpu;
+        let x = Tensor::from_slice(&[] as &[f32], (3, 0), &device).unwrap();
+        let dy = Tensor::from_slice(&[] as &[bf16], (3, 0), &device).unwrap();
+        let err = ln_bwd_dgamma(1e-5, &x, &dy).expect_err("x/dy dtype mismatch must be refused");
+        match err {
+            Error::DTypeMismatchBinaryOp { lhs, rhs, .. } => {
+                assert_eq!(lhs, DType::F32);
+                assert_eq!(rhs, DType::BF16);
+            }
+            other => panic!("expected DTypeMismatchBinaryOp{{F32, BF16}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bwd_dgamma_hidden_zero_same_unsupported_dtype_is_unsupported_not_a_false_mismatch() {
+        use half::f16;
+        let device = Device::Cpu;
+        let x = Tensor::from_slice(&[] as &[f16], (3, 0), &device).unwrap();
+        let dy = Tensor::from_slice(&[] as &[f16], (3, 0), &device).unwrap();
+        let err = ln_bwd_dgamma(1e-5, &x, &dy)
+            .expect_err("F16/F16 (equal, hidden == 0) is not implemented by this op");
+        match err {
+            Error::UnsupportedDTypeForOp(dtype, _) => assert_eq!(dtype, DType::F16),
+            other => panic!("expected UnsupportedDTypeForOp(F16, _), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bwd_dgamma_hidden_nonzero_dtype_mismatch_is_refused() {
+        let device = Device::Cpu;
+        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0], (1, 4), &device).unwrap();
+        let dy = Tensor::from_slice(&[bf16::from_f32(1.0); 4], (1, 4), &device).unwrap();
+        let err = ln_bwd_dgamma(1e-5, &x, &dy).expect_err("x/dy dtype mismatch must be refused");
+        match err {
+            Error::DTypeMismatchBinaryOp { lhs, rhs, .. } => {
+                assert_eq!(lhs, DType::F32);
+                assert_eq!(rhs, DType::BF16);
+            }
+            other => panic!("expected DTypeMismatchBinaryOp{{F32, BF16}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bwd_dgamma_hidden_nonzero_same_unsupported_dtype_is_unsupported_not_a_false_mismatch() {
+        use half::f16;
+        let device = Device::Cpu;
+        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0].map(f16::from_f32), (1, 4), &device)
+            .unwrap();
+        let dy = Tensor::from_slice(&[1.0f32; 4].map(f16::from_f32), (1, 4), &device).unwrap();
+        let err = ln_bwd_dgamma(1e-5, &x, &dy)
+            .expect_err("F16/F16 (equal, hidden > 0) is not implemented by this op");
+        match err {
+            Error::UnsupportedDTypeForOp(dtype, _) => assert_eq!(dtype, DType::F16),
+            other => panic!("expected UnsupportedDTypeForOp(F16, _), got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // The four `+`->`-` eps-sign-flip survivors in the row kernels
+    // (`ln_fwd_row_bf16`:530, `ln_bwd_dx_row_f32`:553,
+    // `ln_bwd_dgamma_f32`:641, `ln_bwd_dgamma_bf16`:658), all of the
+    // shape `invvar = 1.0 / (var + eps).sqrt()`. Rule 2 of the contract
+    // (tolerance failures): derive a bound so tight the flip cannot hide
+    // inside it, rather than shrinking `eps` relative to a fixed abs
+    // tolerance.
+    //
+    // The fixture below makes the bound EXACT (zero slack), not merely
+    // tight: every element of a row is the SAME value, so `var` is
+    // EXACTLY `0.0` in f32 (mean == every element, so `x[i] - mean ==
+    // 0.0` exactly, and `0.0 * invvar == 0.0` for ANY finite `invvar`,
+    // regardless of its magnitude). That makes the correct output
+    // EXACTLY zero — a real, sign-independent guarantee, since `var +
+    // eps = eps > 0` is always a valid domain point for `sqrt`.
+    //
+    // The `+`->`-` mutation instead computes `sqrt(var - eps) =
+    // sqrt(-eps)`, which is NaN for any `eps > 0` in this degenerate-
+    // variance regime — `bound/max|signal| = 0/0`: not "within
+    // tolerance", but a hard finite-vs-non-finite divergence (family F:
+    // every element of a `0.0 * NaN = NaN` product), the strongest
+    // possible measurement of an eps-sign flip. A non-degenerate `eps` (
+    // 1e-2, far from f32's own ULP at this magnitude) rules out this
+    // being a rounding-noise artifact.
+    // -----------------------------------------------------------------
+    #[test]
+    fn constant_row_forward_is_exactly_zero_pinning_the_eps_sign_bf16() {
+        let device = Device::Cpu;
+        let xb = [bf16::from_f32(3.0); 4];
+        let gb = [bf16::from_f32(1.0); 4];
+        let x = Tensor::from_slice(&xb, (1, 4), &device).unwrap();
+        let gamma = Tensor::from_slice(&gb, (4,), &device).unwrap();
+        let out: Vec<bf16> = ln(1e-2, false, &x, &gamma)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        for o in &out {
+            assert_eq!(
+                o.to_f32(),
+                0.0,
+                "a constant row must normalize to EXACTLY zero regardless of eps's \
+                 magnitude — a non-finite value here means `var + eps` was computed as \
+                 `var - eps` (sqrt of a negative number)"
+            );
+        }
+    }
+
+    #[test]
+    fn constant_row_backward_dx_is_exactly_zero_pinning_the_eps_sign_f32() {
+        // `dy`/`gamma` also held CONSTANT across the row: `t = dy*gamma`
+        // is then the same value at every position, so `mean_t == t` and
+        // `dx[i] = (t - mean_t - xhat*mean_t_xhat) * invvar` collapses to
+        // `(0 - 0*mean_t_xhat) * invvar == 0` for ANY finite `invvar` —
+        // exactly the same "value times finite is exact, value times NaN
+        // is not" measurement as the forward case above.
+        let device = Device::Cpu;
+        let x = Tensor::from_slice(&[3.0f32, 3.0, 3.0, 3.0], (1, 4), &device).unwrap();
+        let gamma = Tensor::from_slice(&[1.0f32, 1.0, 1.0, 1.0], (4,), &device).unwrap();
+        let dy = Tensor::from_slice(&[1.0f32, 1.0, 1.0, 1.0], (1, 4), &device).unwrap();
+        let dx: Vec<f32> = ln_bwd_dx(1e-2, &x, &gamma, &dy)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(
+            dx,
+            vec![0.0f32; 4],
+            "a constant x row (with constant dy*gamma) must give an EXACTLY zero dx \
+             regardless of eps's magnitude — a non-finite value here means `var + eps` \
+             was computed as `var - eps`"
+        );
+    }
+
+    #[test]
+    fn constant_row_backward_dgamma_is_exactly_zero_pinning_the_eps_sign_f32() {
+        // `dgamma_i = sum_rows(dy_i * xhat_i)`; a constant x row makes
+        // `xhat_i == 0.0` exactly for every `i`, so `dgamma[i] += dy[i] *
+        // 0.0 == 0.0` for ANY finite `invvar` (`dy` need not be constant
+        // here — only `x`'s row does).
+        let device = Device::Cpu;
+        let x = Tensor::from_slice(
+            &[3.0f32, 3.0, 3.0, 3.0, -2.0, -2.0, -2.0, -2.0],
+            (2, 4),
+            &device,
+        )
+        .unwrap();
+        let dy = Tensor::from_slice(
+            &[1.0f32, 2.0, 3.0, 4.0, -1.0, 0.5, 2.5, -3.0],
+            (2, 4),
+            &device,
+        )
+        .unwrap();
+        let dgamma: Vec<f32> = ln_bwd_dgamma(1e-2, &x, &dy)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(
+            dgamma,
+            vec![0.0f32; 4],
+            "every row constant (independently) must give an EXACTLY zero dgamma \
+             regardless of eps's magnitude — a non-finite value here means `var + eps` \
+             was computed as `var - eps`"
+        );
+    }
+
+    #[test]
+    fn constant_row_backward_dgamma_is_exactly_zero_pinning_the_eps_sign_bf16() {
+        let device = Device::Cpu;
+        let xb = [bf16::from_f32(3.0); 4];
+        let dyb: Vec<bf16> = [1.0f32, 2.0, 3.0, 4.0].map(bf16::from_f32).to_vec();
+        let x = Tensor::from_slice(&xb, (1, 4), &device).unwrap();
+        let dy = Tensor::from_slice(&dyb, (1, 4), &device).unwrap();
+        let dgamma: Vec<bf16> = ln_bwd_dgamma(1e-2, &x, &dy)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        for d in &dgamma {
+            assert_eq!(
+                d.to_f32(),
+                0.0,
+                "a constant x row must give an EXACTLY zero dgamma regardless of eps's \
+                 magnitude — a non-finite value here means `var + eps` was computed as \
+                 `var - eps`"
+            );
+        }
+    }
+
+    /// Cosmetic `name()` survivors (this file's three ops): the name is
+    /// part of this op's counters/admission keys (see `ops`'s module
+    /// doc), so ONE snapshot per op pins the exact string rather than
+    /// leaving `fn name` free to drift to any other non-empty value.
+    #[test]
+    fn every_ops_name_in_this_file_is_pinned() {
+        assert_eq!(LayerNormFused::new(1e-5, false).name(), "layer_norm_fused");
+        assert_eq!(
+            LayerNormBwdDx { eps: 1e-5 }.name(),
+            "layer_norm_fused_bwd_dx"
+        );
+        assert_eq!(
+            LayerNormBwdDgamma { eps: 1e-5 }.name(),
+            "layer_norm_fused_bwd_dgamma"
+        );
     }
 }

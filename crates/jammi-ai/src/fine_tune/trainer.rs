@@ -569,21 +569,22 @@ impl TrainingLoop {
         //    reached before the `break`, which `total_optimizer_steps`
         //    (fixed upfront from `self.config.epochs`) does not know ahead of
         //    time — `is_last_step` therefore never fires `true` on an
-        //    early-stopped run's TRUE final step. Judged ACCEPTABLE, not a
-        //    residual defect: `run` always restores `checkpoint_best` (saved
-        //    at whichever epoch boundary had the best monitored loss so far)
-        //    before saving the final adapter — on EVERY run, early-stopped or
-        //    not (see the `best_path.exists()` restore below) — so a
-        //    divergence on an early-stopped run's true last step cannot
-        //    silently reach the published artifact: a non-finite
-        //    `monitor_loss` makes `monitor_loss < best_val_loss` `false`
-        //    (family F: `NaN > c` is `false`, and so is `NaN < c`), so that
-        //    epoch is never saved as `checkpoint_best`. The diagnostic gap (a
-        //    divergence not immediately surfaced as a typed `Err` on that
-        //    exact step) remains open — the modulo cadence still catches it
-        //    within `DEFAULT_NORM_CHECK_INTERVAL` steps on a long-enough run,
-        //    and `step == 1` catches an early one — but the PUBLISHED
-        //    adapter's correctness does not depend on it.
+        //    early-stopped run's TRUE final step. The monitored loss is NOT
+        //    the backstop for that: `monitor_loss` is measured PRE-step
+        //    (every micro-batch's loss is read before its window's update
+        //    lands), so a NaN/Inf produced by the epoch's final update is
+        //    invisible to that epoch's average — it would only show up in
+        //    the NEXT epoch's forward, as NaN losses tripping
+        //    `process_batch_loss`'s three-strikes divergence guard, and an
+        //    early-stopped (or final) epoch has no next epoch, while
+        //    `checkpoint_best` is written from the CURRENT, post-update
+        //    weights. The backstop is `refuse_nonfinite_params` at the epoch
+        //    boundary (one host read per epoch, never per step): a
+        //    non-finite trainable parameter is a typed refusal before
+        //    `checkpoint_best` — the adapter `run` restores before saving
+        //    the final one — can ever hold it. The diagnostic gap (the
+        //    divergence surfacing at the epoch boundary rather than on the
+        //    exact step) remains, and is bounded by one epoch.
         //  - **cancel** (`self.cancel` checked at the epoch boundary): a
         //    cancelled run returns `Err` BEFORE the epoch that would have
         //    followed cancellation ever calls `process_batch_loss` or
@@ -920,6 +921,12 @@ impl TrainingLoop {
                 lr,
                 "Epoch complete"
             );
+
+            // A non-finite trainable parameter at the epoch boundary is a
+            // typed refusal BEFORE the early-stopping decision can write it
+            // as `checkpoint_best` — see the method's doc for why the
+            // monitored loss cannot stand in for this check.
+            Self::refuse_nonfinite_params(&trainable_vars, epoch)?;
 
             // Early stopping on the chosen metric.
             if monitor_loss < best_val_loss {
@@ -2196,6 +2203,56 @@ impl TrainingLoop {
 
     /// Save a numbered intra-epoch checkpoint. Weights only — the metadata
     /// JSON is written once when the final adapter lands.
+    /// Refuse to write `checkpoint_best` over a non-finite trainable
+    /// parameter — the epoch-boundary backstop for a divergence the
+    /// monitored loss cannot see.
+    ///
+    /// `monitor_loss` is measured PRE-step: each micro-batch's loss is read
+    /// before its window's update lands, so a NaN/Inf produced by an epoch's
+    /// final update is invisible to that epoch's average. It would only
+    /// surface in the NEXT epoch's forward (as NaN losses tripping the
+    /// three-strikes divergence guard in `process_batch_loss`) — and on the
+    /// run's final or early-stopped epoch there is no next epoch, while
+    /// `checkpoint_best` (restored before the final adapter is saved) is
+    /// written from the CURRENT weights, post-update. Without this check a
+    /// divergence on such an epoch's last update — off the grad-norm check's
+    /// cadence — would be published as the run's result.
+    ///
+    /// Cost: one device→host read per epoch boundary (a boundary that
+    /// already syncs for the epoch's loss and sim stats), never per step.
+    /// The sum of every trainable value is folded into one device scalar
+    /// (NaN and ±Inf both propagate through `+`; a sum of sane-magnitude
+    /// finite weights cannot overflow `f32`), then read once.
+    fn refuse_nonfinite_params(trainable_vars: &[Var], epoch: usize) -> Result<()> {
+        let mut total: Option<Tensor> = None;
+        for var in trainable_vars {
+            let t: &Tensor = var;
+            let s = t
+                .to_dtype(DType::F32)
+                .and_then(|t| t.sum_all())
+                .map_err(|e| JammiError::FineTune(format!("checkpoint_best param sum: {e}")))?;
+            total = Some(match total {
+                None => s,
+                Some(acc) => (&acc + &s).map_err(|e| {
+                    JammiError::FineTune(format!("checkpoint_best param fold: {e}"))
+                })?,
+            });
+        }
+        let Some(total) = total else {
+            return Ok(());
+        };
+        let v: f32 = total
+            .to_scalar()
+            .map_err(|e| JammiError::FineTune(format!("checkpoint_best param read: {e}")))?;
+        if !v.is_finite() {
+            return Err(JammiError::FineTune(format!(
+                "checkpoint_best: non-finite trainable parameter after epoch {epoch} \
+                 (parameter sum {v}) — refusing to save or publish it"
+            )));
+        }
+        Ok(())
+    }
+
     fn save_checkpoint(&self, dir: &Path, step: usize) -> Result<()> {
         let path = dir.join(format!("checkpoint_{step}.safetensors"));
         self.save_checkpoint_weights(&path)
@@ -4591,6 +4648,35 @@ mod last_step_run_harness {
         .expect_err("a NaN gradient on the run's last GradCache epoch must be refused");
         assert_grad_norm_refusal(&err, 2);
     }
+
+    /// The epoch-boundary backstop: a NaN gradient on a step that is neither
+    /// step 1, on the modulo cadence, nor the run's last step (step 2 of 3)
+    /// trains in unchecked — `clip_and_step` never reads the norm there, by
+    /// design — and the NEXT micro-batch's NaN loss is skipped by the
+    /// three-strikes divergence guard, so the epoch ends with a non-finite
+    /// adapter that `monitor_loss` (measured pre-step) cannot see.
+    /// `refuse_nonfinite_params` must refuse it before `checkpoint_best` is
+    /// written.
+    ///
+    /// Mutation: delete the `refuse_nonfinite_params` call before
+    /// `save_checkpoint_tagged(.., "best")` — RED (the run returns `Ok` and
+    /// saves a NaN adapter).
+    #[test]
+    fn checkpoint_best_refuses_a_nonfinite_parameter_the_monitored_loss_cannot_see() {
+        let err = run_text_loop(
+            "ckpt-best-nan",
+            text_config(),
+            pairs(6),
+            Some(poison_grad_at(2)),
+            None,
+        )
+        .expect_err("a NaN adapter must not be saved as checkpoint_best");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("checkpoint_best") && msg.contains("non-finite trainable parameter"),
+            "expected the checkpoint_best refusal, got: {msg}"
+        );
+    }
 }
 
 /// Run-level oracles for `LastStepHorizon`'s lattice, driven through the
@@ -4700,10 +4786,10 @@ mod last_step_horizon_run_oracles {
     /// Cell `step > horizon`, disarmed: after the one-shot check, later
     /// overshoot steps are left to the modulo cadence — a NaN on step 102 is
     /// NOT refused by the grad-norm check (that is the per-step sync this
-    /// fix refuses to reinstate): whatever the run ends in, it is not the
-    /// step-102 grad-norm refusal, and the run read the norm exactly once
-    /// (step 101). The epoch-boundary backstop for the adapter such a run
-    /// leaves behind is `refuse_nonfinite_params`.
+    /// fix refuses to reinstate): the run reads the norm exactly once (step
+    /// 101), the NaN trains in, and it is `refuse_nonfinite_params`'s
+    /// epoch-boundary backstop — not the grad-norm check — that refuses the
+    /// adapter such a run leaves behind.
     #[test]
     fn resumed_run_past_a_shrunk_horizon_leaves_later_overshoot_steps_to_the_cadence() {
         let before = thread_sync_read_count();
@@ -4714,12 +4800,13 @@ mod last_step_horizon_run_oracles {
             Some(poison_grad_at(102)),
             Some(100),
         );
-        if let Err(err) = &outcome {
-            assert!(
-                !err.to_string().contains("gradient norm"),
-                "step 102 is past the one-shot check and off the cadence: {err}"
-            );
-        }
+        let err = outcome.expect_err("the NaN adapter is refused at the epoch boundary");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("gradient norm") && msg.contains("checkpoint_best"),
+            "step 102 is past the one-shot check and off the cadence; the epoch-boundary \
+             backstop must be what refuses it: {msg}"
+        );
         assert_eq!(
             thread_sync_read_count() - before,
             1,

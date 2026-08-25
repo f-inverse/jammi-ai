@@ -421,24 +421,64 @@ fn real_rows_loss(hidden: &Tensor, lengths: &[usize]) -> Tensor {
         .expect("at least one non-empty row")
 }
 
+/// Relative-ULP multiplier for the fold-order tolerance below. Measured
+/// (a100c pod, `crates/jammi-kernels/src/admission.rs` gate at `86aa9da`):
+/// row1's worst per-element hidden-state ratio was **220.93** `f32::EPSILON`
+/// units relative to `max(|padded|,|unpadded|)` (2 layers of LN/Wqkv-GEMM/
+/// attention/Wo-GEMM/GeGLU compound a batch-of-2-vs-batch-of-1 GEMM
+/// blocking difference well past a "couple of ULP" bound). `512` gives
+/// roughly 2.3x headroom over that measured worst case while staying a
+/// small multiple of `f32::EPSILON`, not an unbounded fudge.
+const FOLD_ORDER_RTOL_ULP: f32 = 512.0;
+/// Absolute-tolerance multiplier (also in `f32::EPSILON` units), needed
+/// IN ADDITION to the relative term above because LoRA `B` is
+/// zero-initialized: `dL/dA = Bᵀ·upstream = 0` exactly (both legs agree,
+/// ratio 0), but `dL/dB` for a short, near-cancelling batch=1 sequence
+/// can itself be numerical noise clustered around a true value of ~0 —
+/// `max(|padded|,|unpadded|,f32::EPSILON)` then floors the RELATIVE
+/// denominator at `f32::EPSILON` (a unit sized for values near 1.0, not a
+/// sensible floor for a tensor whose own true magnitude is far smaller),
+/// which inflates the ULP-ratio metric without the term being large in
+/// any absolute sense. Measured worst case: `layer.0.Wo.lora_b`'s padded
+/// grad differs from the summed unpadded legs' own (near-zero) value by
+/// **1.91e-6** while every element of both unpadded legs' OWN tensor
+/// stays within `f32::EPSILON` of exactly zero. `64 * f32::EPSILON` ≈
+/// `7.63e-6` gives ~4x headroom over that measured residual — the SAME
+/// `64` this file's original grad tolerance used as its (insufficient
+/// alone) relative multiplier, reused here as the atol term so the two
+/// constants in this file share one convention instead of introducing an
+/// unrelated third number.
+const FOLD_ORDER_ATOL_ULP: f32 = 64.0;
+
+/// Standard `atol + rtol * scale` combined bound (the numpy/torch
+/// `allclose` form), in `f32::EPSILON` units on both terms — a pure
+/// relative bound (as this file originally used) is not sufficient when
+/// the REFERENCE value is itself near-exactly zero (see
+/// `FOLD_ORDER_ATOL_ULP`'s doc); a pure absolute bound would hide real
+/// divergence at large-magnitude elements (the guide's §3.8 "no absolute
+/// ULP floor" clause) — the combined form avoids both failure modes.
+fn fold_order_bound(scale: f32) -> f32 {
+    f32::EPSILON * (FOLD_ORDER_ATOL_ULP + FOLD_ORDER_RTOL_ULP * scale)
+}
+
 /// Elementwise oracle + the shared scale a linear (Higham) summation-error
 /// bound derives from: for every element of `unpadded`'s real row against
 /// the CORRESPONDING row (`batch_idx`) of `padded`'s real positions
-/// (`0..len`), asserts `|padded − unpadded| <= 64 * f32::EPSILON *
-/// max(|padded|, |unpadded|, f32::EPSILON)` — a few-ULP fold-order
-/// tolerance relative to the larger of the two PRE-cancellation values
-/// (see the oracle's own doc above) — and returns `Σ max(|padded|,
-/// |unpadded|, f32::EPSILON)` over the compared elements, the exact
-/// quantity the loss bound below multiplies by the SAME `64 *
-/// f32::EPSILON` constant (a sum of `n` terms each within `k_i` of their
-/// target is within `Σk_i` of the target sum).
+/// (`0..len`), asserts `|padded − unpadded| <= fold_order_bound(scale)`
+/// where `scale = max(|padded|, |unpadded|)` — the larger of the two
+/// PRE-cancellation values (see the oracle's own doc above) — and returns
+/// `(Σ scale, n)` over the compared elements, the exact quantities the
+/// loss bound below is built from (a sum of `n` terms each within
+/// `fold_order_bound(scale_i)` of their target is within
+/// `Σ fold_order_bound(scale_i) = atol_ulp * EPS * n + rtol_ulp * EPS *
+/// Σscale_i` of the target sum, by linearity).
 fn assert_real_row_matches_and_scale(
     padded: &Tensor,
     batch_idx: usize,
     unpadded: &Tensor,
     len: usize,
     label: &str,
-) -> f32 {
+) -> (f32, usize) {
     let p_row: Vec<f32> = padded
         .narrow(0, batch_idx, 1)
         .unwrap()
@@ -468,18 +508,18 @@ fn assert_real_row_matches_and_scale(
             p.is_finite() && u.is_finite(),
             "{label}[{i}]: non-finite hidden state (padded={p}, unpadded={u})"
         );
-        let scale = p.abs().max(u.abs()).max(f32::EPSILON);
-        let bound = 64.0 * f32::EPSILON * scale;
+        let scale = p.abs().max(u.abs());
+        let bound = fold_order_bound(scale);
         let diff = (p - u).abs();
         assert!(
             diff.is_finite() && diff <= bound,
-            "{label}[{i}]: padded hidden state must match the unpadded row's own value within a \
-             few-ULP fold-order tolerance -- batch-size-dependent GEMM blocking/accumulation \
+            "{label}[{i}]: padded hidden state must match the unpadded row's own value within \
+             the derived fold-order tolerance -- batch-size-dependent GEMM blocking/accumulation \
              order, not a batch-mixing leak (padded={p}, unpadded={u}, diff={diff}, bound={bound})"
         );
         scale_sum += scale;
     }
-    scale_sum
+    (scale_sum, p_row.len())
 }
 
 /// THE oracle: a batch with real padding (row 0 fully real, row 1 padded)
@@ -574,24 +614,28 @@ fn padded_training_loss_and_lora_grads_match_unpadded_rows_run_individually_f32_
     let loss_row1_v: f32 = loss_row1.to_scalar().unwrap();
 
     // Elementwise oracle FIRST (proves row-independence at the tensor
-    // level, within a derived few-ULP tolerance) -- its returned scale
-    // sums are what the loss bound below is a linear consequence of, per
-    // this test's own doc comment.
-    let scale_sum_row0 =
+    // level, within a derived fold-order tolerance) -- its returned scale
+    // sums and element counts are what the loss bound below is a linear
+    // consequence of, per this test's own doc comment.
+    let (scale_sum_row0, n_row0) =
         assert_real_row_matches_and_scale(&hidden_padded, 0, &hidden_row0, 6, "row0");
-    let scale_sum_row1 =
+    let (scale_sum_row1, n_row1) =
         assert_real_row_matches_and_scale(&hidden_padded, 1, &hidden_row1, 4, "row1");
 
-    let loss_bound = 64.0 * f32::EPSILON * (scale_sum_row0 + scale_sum_row1);
     let loss_summed = loss_row0_v + loss_row1_v;
     let loss_diff = (loss_padded_v - loss_summed).abs();
+    // Σ fold_order_bound(scale_i) = atol_ulp*EPS*n + rtol_ulp*EPS*Σscale_i,
+    // by linearity of the per-element bound established above.
+    let loss_bound = f32::EPSILON
+        * (FOLD_ORDER_ATOL_ULP * (n_row0 + n_row1) as f32
+            + FOLD_ORDER_RTOL_ULP * (scale_sum_row0 + scale_sum_row1));
     assert!(
         loss_diff.is_finite() && loss_diff <= loss_bound,
         "the padded batch's real-rows loss must match the sum of the two unpadded rows' own \
-         losses within the SAME per-element few-ULP tolerance summed over every compared \
-         element (Higham's summation-error bound), not bit-identical -- batch-size-dependent \
-         GEMM rounding, not a batch-mixing leak (padded={loss_padded_v}, row0={loss_row0_v}, \
-         row1={loss_row1_v}, summed={loss_summed}, diff={loss_diff}, bound={loss_bound})"
+         losses within the SAME derived fold-order tolerance summed over every compared \
+         element, not bit-identical -- batch-size-dependent GEMM rounding, not a batch-mixing \
+         leak (padded={loss_padded_v}, row0={loss_row0_v}, row1={loss_row1_v}, \
+         summed={loss_summed}, diff={loss_diff}, bound={loss_bound})"
     );
 
     // Every LoRA A/B tensor, every layer, every site: the padded run's
@@ -648,21 +692,20 @@ fn padded_training_loss_and_lora_grads_match_unpadded_rows_run_individually_f32_
             // TWO INDEPENDENTLY-COMPUTED (batch=1) reductions externally in
             // f32 — floating-point addition is non-associative (family J),
             // so a DIFFERENT fold order over the mathematically-identical
-            // set of terms is not guaranteed bit-identical, and near-
-            // cancellation (two ~1e-10 terms summing to ~1e-12 here)
-            // amplifies the RELATIVE error at the tiny cancelled magnitude
-            // even though the ABSOLUTE error stays at f32-ULP scale on the
-            // PRE-cancellation operands. The bound below is exactly that:
-            // relative to the larger of the two pre-cancellation terms
-            // (never the cancelled result, which would make an ordinary-
-            // sized rounding error look enormous), a tight, principled
-            // few-ULP tolerance — not a loose fudge factor.
-            let scale = g_row0[i].abs().max(g_row1[i].abs()).max(f32::EPSILON);
-            let bound = 64.0 * f32::EPSILON * scale;
+            // set of terms is not guaranteed bit-identical. `B` is
+            // zero-initialized, so `dL/dA = Bᵀ·upstream = 0` exactly for
+            // both legs (the `scale`-floor case below never fires there),
+            // while `dL/dB` for a short batch=1 sequence can itself be
+            // near-zero numerical noise -- `fold_order_bound` (this file's
+            // module-level doc) is the SAME `atol + rtol*scale` bound
+            // `assert_real_row_matches_and_scale` uses above, not a second
+            // independently-chosen constant.
+            let scale = g_row0[i].abs().max(g_row1[i].abs());
+            let bound = fold_order_bound(scale);
             assert!(
-                diff <= bound,
+                diff.is_finite() && diff <= bound,
                 "{name}[{i}]: padded grad must match the sum of the two unpadded rows' own \
-                 grads within a few-ULP fold-order tolerance (row0={}, row1={}, padded={}, \
+                 grads within the derived fold-order tolerance (row0={}, row1={}, padded={}, \
                  summed={summed}, diff={diff}, bound={bound})",
                 g_row0[i],
                 g_row1[i],

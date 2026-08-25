@@ -1185,6 +1185,33 @@ pub struct FinetuneStepTier {
     /// see the doc above), or because the admission predicate failed for
     /// any other stated reason.
     pub lora_epilogue_eager_dispatches: u64,
+    /// How many times the fused LoRA SITE
+    /// (`jammi_kernels::ops::LowRankResidualLinear` — one `CustomOp3` covering
+    /// the base matmul, dropout, both LoRA GEMMs, AND the epilogue, not
+    /// just `ScaledCastAdd`'s standalone epilogue) actually dispatched
+    /// during this run — the same positive-proof channel as
+    /// `ln_fused_dispatches` / … / `lora_epilogue_fused_dispatches`. Read
+    /// via `jammi_lora::lora_linear_fused_dispatch_snapshot`.
+    /// `lora_epilogue_fused_dispatches`/`lora_epilogue_eager_dispatches`
+    /// (above) are PERMANENTLY ZERO on a run where this field is nonzero:
+    /// `LowRankResidualLinear` reuses `ScaledCastAdd`'s `cpu_fwd`/`cuda_fwd`
+    /// directly as an internal step, never through the standalone
+    /// epilogue's own `admit` call (see `jammi_lora::lora_epilogue_counters`'s
+    /// doc) — that pairing going to `0` is the expected baseline, not a
+    /// missing-dispatch regression.
+    pub lora_linear_fused_dispatches: u64,
+    /// How many times that same call site fell back to the eager
+    /// composition (`[base matmul, dropout, A-matmul, B-matmul, mul,
+    /// cast, add]`) instead — outside the fused kernel's domain
+    /// (bias-carrying base, unsupported dtype/device, non-contiguous
+    /// view, unsupported rank) DURING TRAINING. `training == false`
+    /// (eval/serving) does NOT increment this field: `LoraLinear::forward`
+    /// returns through its own always-eager composition BEFORE ever
+    /// calling `admit` (the thing that increments either counter), so an
+    /// eval-only run leaves BOTH `lora_linear_fused_dispatches` and this
+    /// field at `0` — not evidence the eager arm ran, just evidence
+    /// neither counter was ever touched.
+    pub lora_linear_eager_dispatches: u64,
     pub s_per_step_p50: Measurement,
     pub s_per_step_mean: Measurement,
     pub steps_per_s: Measurement,

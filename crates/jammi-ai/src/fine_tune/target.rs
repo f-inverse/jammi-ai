@@ -264,7 +264,7 @@ pub struct ProjectionHeadConfig {
     pub lora_alpha: f64,
     /// Whether training scaled the adapter with rSLoRA (`alpha / sqrt(rank)`)
     /// instead of the vanilla `alpha / rank` — see
-    /// [`jammi_lora::lora_scaling`]. No `skip_serializing_if`: absence must
+    /// `jammi_lora::lora_scaling`. No `skip_serializing_if`: absence must
     /// mean "legacy adapter, predates this field", which is read as `false`
     /// (vanilla scaling) by `#[serde(default)]`, never conflated with an
     /// adapter that explicitly opted out. Every adapter this engine writes

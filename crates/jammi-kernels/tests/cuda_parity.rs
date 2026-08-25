@@ -31,8 +31,9 @@
 use candle_core::{DType, Device, Tensor, Var, D};
 use half::bf16;
 use jammi_kernels::ops::{
-    apply1, apply2, apply3, Axpy, DropoutFused, FullyMaskedPolicy, GegluFused, GeluVariant,
-    LayerNormFused, PhiloxKatProbe, RopeFused, ScaledCastAdd, SoftmaxLastDimFused,
+    apply1, apply2, apply3, Axpy, DropoutFused, DropoutKey, FullyMaskedPolicy, GegluFused,
+    GeluVariant, LayerNormFused, LowRankResidualLinear, PhiloxKatProbe, RopeFused, ScaledCastAdd,
+    SoftmaxLastDimFused,
 };
 
 fn axpy(alpha: f64, x: &Tensor, y: &Tensor) -> candle_core::Result<Tensor> {
@@ -71,6 +72,29 @@ fn cuda_device() -> Option<Device> {
 fn fixture(n: usize, seed: f32) -> Vec<f32> {
     (0..n)
         .map(|i| (seed + i as f32 * 0.37).sin() * 10.0)
+        .collect()
+}
+
+/// A fixed, deterministic, SMALL-INTEGER `f32` fixture (`{-4, .., 4}`) —
+/// mirrors `ops::low_rank_residual_linear`'s own `exact_fixture` and
+/// `lora_linear_oracles.rs`'s copy of it: every partial sum this op's
+/// GEMMs form from these values stays a SMALL EXACT INTEGER, well under
+/// `f32`'s 24-bit mantissa's exact range even at this file's largest
+/// reduction depth (`inf = 1024`, worst-case term `4*4=16`, worst-case sum
+/// `1024*16 = 16384 << 2^24`). An exact-integer sum is IDENTICAL
+/// regardless of summation order — so a `diff == 0.0` (bit-exact) claim
+/// across CPU and CUDA is architecture/library-independent BY
+/// CONSTRUCTION, not an accident of one `gemm` kernel's blocking choice
+/// (both `gemm_reduced_precision_f32()` and `gemm_reduced_precision_bf16()`
+/// default to `false` in candle-core 0.11.0 — see [`BF16_U`]'s doc for how
+/// that was verified — so neither arm truncates to `tf32`/reduced `bf16`
+/// precision here).
+fn exact_fixture(n: usize, phase: i64) -> Vec<f32> {
+    (0..n)
+        .map(|i| {
+            let v = (i as i64 * 7 + phase * 13).rem_euclid(9);
+            (v - 4) as f32
+        })
         .collect()
 }
 
@@ -2633,4 +2657,1109 @@ fn dropout_parity_multi_block_not_a_multiple_of_block_size() {
     // 2000 spans multiple 256-thread blocks with a partial last block.
     let x = fixture(2000, 9.0);
     assert_dropout_parity_f32(&cuda, 7, 1, 12, 0.4, &x);
+}
+
+// =======================================================================
+// LowRankResidualLinear CPU<->CUDA parity: forward + all three backward outputs
+// (dx, dw, dab), at the two dtype combinations `jammi-lora`'s admission
+// predicate reaches ((F32,F32,F32) and (BF16,BF16,F32)), plus a dropout
+// leg and a narrowed-with-nonzero-offset `x`. `BF16` here is the ONLY
+// place this op's base-matmul dtype is actually exercised end to end —
+// candle-core 0.11.0's CPU backend has no `BF16` matmul (see
+// `ops::low_rank_residual_linear`'s module doc), so the "CPU" side of this comparison
+// runs the base GEMM at `F32` (a bit-exact cast-up of the same `BF16`
+// input) while the CUDA side runs the REAL `BF16` cuBLAS path — this is a
+// weaker parity claim than the other bf16 legs above (comparing two
+// DIFFERENT dtype executions, not the same dtype on two devices), stated
+// explicitly rather than silently reused from `assert_lora_linear_parity_f32`'s
+// shape.
+// =======================================================================
+
+/// `f32` unit roundoff, `2^-24` (Higham, *Accuracy and Stability of
+/// Numerical Algorithms*, 2nd ed., Theorem 4.2 — see
+/// `lora_linear_oracles.rs`'s `derived_dot_product_tolerance` doc for the
+/// full citation this mirrors; generalized here to a `unit_roundoff`
+/// parameter so [`higham_bound`] covers both this constant and
+/// [`BF16_U`]).
+const F32_U: f64 = 1.0 / 16_777_216.0; // 2^-24
+
+/// `bf16` unit roundoff, `2^-8` (7 explicit mantissa bits + the implicit
+/// leading one — `half::bf16`'s own layout). Used ONLY to bound the ONE
+/// place this op's CUDA arm actually rounds a value TO `bf16` (the base
+/// GEMM's own tensor-core output store, and the epilogue's cast of the
+/// scaled LoRA delta) — never as an accumulation-order bound: the base
+/// GEMM's OWN accumulation happens at `f32` precision on tensor cores
+/// regardless of `bf16` storage, per `CUBLAS_COMPUTE_32F` — candle-core
+/// 0.11.0's `cuda_backend::gemm_strided_batched_bf16` (registry source,
+/// `~/.cargo/registry/src/.../candle-core-0.11.0/src/cuda_backend/
+/// mod.rs:2685`) defaults `gemm_reduced_precision_bf16()` to `false`
+/// (`MM_BF16_REDUCED_PRECISION: AtomicBool = AtomicBool::new(false)`,
+/// never set `true` anywhere in this workspace — verified by reading
+/// both), i.e. the FULL-precision `f32`-accumulate compute type, not the
+/// further-reduced `CUBLAS_COMPUTE_32F_FAST_16BF` mode.
+const BF16_U: f64 = 1.0 / 256.0; // 2^-8
+
+/// Higham (2002) Theorem 4.2: a recursively-summed `n`-term sum deviates
+/// from the true sum by at most `(n-1) * u * sum(|x_i|)`; bounding
+/// `sum(|x_i|) <= n * max_term_magnitude` gives the `n^2` shape below. Two
+/// INDEPENDENTLY-chosen valid summation orders (cuBLAS's tensor-core
+/// tiling vs the CPU `gemm` crate's own blocking) can therefore differ
+/// from EACH OTHER by up to twice one order's own worst-case drift from
+/// the infinite-precision sum — the leading `2.0`. Mirrors
+/// `lora_linear_oracles.rs`'s `derived_dot_product_tolerance` exactly
+/// (same citation, same shape).
+fn higham_bound(n: usize, max_term_magnitude: f64, unit_roundoff: f64) -> f64 {
+    2.0 * (n as f64).powi(2) * unit_roundoff * max_term_magnitude
+}
+
+/// A single "round to `bf16`" bound: `bf16` has 8 significant bits
+/// (7 explicit mantissa bits + the implicit leading one), so round-to-
+/// nearest storage of a value `v` introduces at most `0.5 * 2^-7 * |v|`
+/// == `BF16_U * |v|` relative error. Doubled here as an explicit safety
+/// margin over that textbook half-ULP bound: this test does not control
+/// cuBLAS's own internal reduction-tree implementation closely enough to
+/// prove it hits the textbook bound EXACTLY, only that it runs at
+/// `CUBLAS_COMPUTE_32F` (see [`BF16_U`]'s own doc for how that was
+/// verified) rather than a further-reduced mode.
+fn bf16_round_bound(value: f64) -> f64 {
+    2.0 * BF16_U * value.abs()
+}
+
+/// A conservative, DERIVED (not tuned-to-pass) absolute tolerance
+/// covering every CPU<->CUDA `f32` comparison this section's tests make
+/// (`fwd`, `dx`, `dw`, `da`, `db`): each is the output of one or two
+/// chained GEMM reductions over this op's own dimensions (`rows`, `inf`,
+/// `outf`; `rank` is always this op's smallest dimension, so it never
+/// drives the bound) — see this file's leading `LowRankResidualLinear`
+/// section comment for the full forward/backward reduction-depth
+/// enumeration (`dx`'s `d_x_lora` branch alone chains TWO GEMMs: `g =
+/// d_lora @ B` over `outf`, then `d_xd = g @ A` over `rank`; `dw`/`da`/
+/// `db` each reduce over `rows`). Rather than deriving five separate
+/// per-output bounds, this uses the LARGEST reduction depth appearing
+/// ANYWHERE in that graph (`max(rows, inf, outf)`) and a `chain_factor`
+/// of `3.0`: one contribution for the output's own reduction, plus up to
+/// two chained upstream reductions whose own summation-order error
+/// propagates through a further multiply-reduce (no chain in this op's
+/// backward is longer than two GEMMs deep). `amplitude` is derived from
+/// the ACTUAL fixture data passed in (the max absolute value across every
+/// operand slice), not hardcoded, so this stays correct if a caller's
+/// fixture amplitude ever changes. Looser than a per-output derivation
+/// would be, but still tight enough to catch a real bug: a dropped or
+/// mis-indexed term produces an error on the order of a SINGLE term's own
+/// magnitude (`amplitude^2`), orders of magnitude above this bound at any
+/// `n > 1` — the EXACT-integer legs below close the gap this looseness
+/// leaves for a bug small enough to hide under it.
+fn lora_linear_parity_tolerance(rows: usize, inf: usize, outf: usize, values: &[&[f32]]) -> f64 {
+    let amplitude = values
+        .iter()
+        .flat_map(|s| s.iter())
+        .fold(0.0f64, |acc, &v| acc.max(f64::from(v.abs())));
+    let n = rows.max(inf).max(outf);
+    let max_term_magnitude = amplitude * amplitude;
+    let chain_factor = 3.0;
+    chain_factor * higham_bound(n, max_term_magnitude, F32_U)
+}
+
+/// A tolerance for a SINGLE two-operand GEMM reduction whose two operands
+/// do NOT share the fixture's own amplitude — unlike `fwd`/`dx`/`dw` (where
+/// both GEMM operands genuinely are amplitude-10 fixture slices, so
+/// [`lora_linear_parity_tolerance`]'s `amplitude * amplitude` term is
+/// correct), `da`'s and `db`'s own DOMINANT reduction multiplies two
+/// DIFFERENTLY-SCALED operands: `da`'s is `d(after_a)` (an already-reduced
+/// intermediate, amplitude ~27 at this test's production width) against
+/// `x` (amplitude ~10); `db`'s is `d(lora_out)` (== `dy * scale`, amplitude
+/// == `scale` exactly, since `dy` is `sum_all().backward()`'s all-ones
+/// seed) against `after_a` (amplitude ~51000). Squaring ONE shared
+/// amplitude — what the vacuous predecessor of this function's call site
+/// did by reusing [`lora_linear_parity_tolerance`] with the raw `x`/`w`/`a`/
+/// `b` fixture slices — assumes both operands sit at the fixture's own
+/// amplitude, which is false for exactly this GEMM: the resulting bound
+/// (337.5) landed at `8.1x` `da`'s OWN maximum magnitude (41.7), so ANY
+/// `da_gpu` (including `0.0`) would have passed. `lhs_amp * rhs_amp` (the
+/// ACTUAL, measured amplitudes of the two real operands) fixes that. `n`
+/// is `rows` — the actual contraction depth of BOTH `da`'s and `db`'s own
+/// final GEMM (`d(after_a)^T @ x` and `d(lora_out)^T @ after_a`
+/// respectively both contract over `rows`, not `inf`/`outf` — see this
+/// function's call site for the derivation), not the conservative
+/// `max(rows, inf, outf)` [`lora_linear_parity_tolerance`] uses for its
+/// looser, multi-output catch-all bound. Same `chain_factor = 3.0` safety
+/// margin for the upstream (`g`/`after_a`) reduction's own summation-order
+/// noise, matching this file's established convention.
+fn lora_linear_parity_tolerance_asymmetric(n: usize, lhs_amp: f64, rhs_amp: f64) -> f64 {
+    let chain_factor = 3.0;
+    chain_factor * higham_bound(n, lhs_amp * rhs_amp, F32_U)
+}
+
+/// Packs `a`/`b` into `ab`'s row-packed `[in + out, rank]` layout — see
+/// `jammi_kernels::ops::low_rank_residual_linear`'s module doc, "the packed-`ab` GEMM
+/// eligibility problem". No `.contiguous()` call needed before packing
+/// (`Tensor::cat`'s dim-0 path handles `a.t()`'s non-contiguous view via
+/// each arg's own `Layout`) — unlike the column-packed layout this
+/// replaced, which needed one for `B^T`.
+fn pack_ab(a: &Tensor, b: &Tensor) -> candle_core::Result<Tensor> {
+    Tensor::cat(&[&a.t()?, b], 0)
+}
+
+/// Bundles [`lora_linear`]'s construction data into one value — the
+/// small-params-struct fix for `clippy::too_many_arguments` (no `#[allow]`
+/// per the fix contract) rather than a 9-positional-argument function.
+#[derive(Clone, Copy)]
+struct LoraLinearParams {
+    scale: f32,
+    inf: usize,
+    outf: usize,
+    r: usize,
+    dropout: Option<DropoutKey>,
+    dweight_needed: bool,
+}
+
+fn lora_linear(
+    x: &Tensor,
+    w: &Tensor,
+    ab: &Tensor,
+    p: LoraLinearParams,
+) -> candle_core::Result<Tensor> {
+    let op = LowRankResidualLinear::new(p.scale, p.inf, p.outf, p.r, p.dropout, p.dweight_needed)?;
+    x.apply_op3(w, ab, op)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assert_lora_linear_parity_f32(
+    cuda: &Device,
+    rows: usize,
+    inf: usize,
+    outf: usize,
+    r: usize,
+    scale: f32,
+    xv: &[f32],
+    wv: &[f32],
+    av: &[f32],
+    bv: &[f32],
+) {
+    let cpu = Device::Cpu;
+
+    let x_cpu = Var::from_tensor(&Tensor::from_slice(xv, (rows, inf), &cpu).unwrap()).unwrap();
+    let w_cpu = Var::from_tensor(&Tensor::from_slice(wv, (outf, inf), &cpu).unwrap()).unwrap();
+    let a_cpu = Var::from_tensor(&Tensor::from_slice(av, (r, inf), &cpu).unwrap()).unwrap();
+    let b_cpu = Var::from_tensor(&Tensor::from_slice(bv, (outf, r), &cpu).unwrap()).unwrap();
+    let ab_cpu = pack_ab(a_cpu.as_tensor(), b_cpu.as_tensor()).unwrap();
+    let out_cpu = lora_linear(
+        x_cpu.as_tensor(),
+        w_cpu.as_tensor(),
+        &ab_cpu,
+        LoraLinearParams {
+            scale,
+            inf,
+            outf,
+            r,
+            dropout: None,
+            dweight_needed: true,
+        },
+    )
+    .unwrap();
+    let grads_cpu = out_cpu.sum_all().unwrap().backward().unwrap();
+
+    let x_gpu = Var::from_tensor(&Tensor::from_slice(xv, (rows, inf), cuda).unwrap()).unwrap();
+    let w_gpu = Var::from_tensor(&Tensor::from_slice(wv, (outf, inf), cuda).unwrap()).unwrap();
+    let a_gpu = Var::from_tensor(&Tensor::from_slice(av, (r, inf), cuda).unwrap()).unwrap();
+    let b_gpu = Var::from_tensor(&Tensor::from_slice(bv, (outf, r), cuda).unwrap()).unwrap();
+    let ab_gpu = pack_ab(a_gpu.as_tensor(), b_gpu.as_tensor()).unwrap();
+    let out_gpu = lora_linear(
+        x_gpu.as_tensor(),
+        w_gpu.as_tensor(),
+        &ab_gpu,
+        LoraLinearParams {
+            scale,
+            inf,
+            outf,
+            r,
+            dropout: None,
+            dweight_needed: true,
+        },
+    )
+    .unwrap();
+    let grads_gpu = out_gpu.sum_all().unwrap().backward().unwrap();
+
+    // A single DERIVED (Higham Thm 4.2, see `lora_linear_parity_tolerance`'s
+    // own doc) tolerance covers `fwd` and every backward output below: all
+    // five are chained-GEMM outputs over this call's own `(rows, inf,
+    // outf)`, and the fixture's amplitude is read directly off the actual
+    // data (not hardcoded), so this stays correct across every caller of
+    // this function.
+    let tol = lora_linear_parity_tolerance(rows, inf, outf, &[xv, wv, av, bv]);
+
+    let out_cpu_v: Vec<f32> = out_cpu.flatten_all().unwrap().to_vec1().unwrap();
+    let out_gpu_v: Vec<f32> = out_gpu
+        .flatten_all()
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(out_cpu_v.len(), rows * outf);
+    assert_eq!(out_gpu_v.len(), rows * outf, "GPU forward length mismatch");
+    for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
+        assert!(
+            ((*c - *g).abs() as f64) <= tol,
+            "fwd[{i}]: cpu {c} vs cuda {g} (tol {tol})"
+        );
+    }
+
+    let check = |name: &str, cpu_t: &Tensor, gpu_t: &Tensor| {
+        let c: Vec<f32> = cpu_t.flatten_all().unwrap().to_vec1().unwrap();
+        let g: Vec<f32> = gpu_t
+            .flatten_all()
+            .unwrap()
+            .to_device(&cpu)
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(c.len(), g.len(), "{name}: length mismatch");
+        for (i, (cv, gv)) in c.iter().zip(g.iter()).enumerate() {
+            assert!(
+                ((*cv - *gv).abs() as f64) <= tol,
+                "{name}[{i}]: cpu {cv} vs cuda {gv} (tol {tol})"
+            );
+        }
+    };
+    check(
+        "dx",
+        grads_cpu.get(&x_cpu).unwrap(),
+        grads_gpu.get(&x_gpu).unwrap(),
+    );
+    check(
+        "dw",
+        grads_cpu.get(&w_cpu).unwrap(),
+        grads_gpu.get(&w_gpu).unwrap(),
+    );
+    check(
+        "da",
+        grads_cpu.get(&a_cpu).unwrap(),
+        grads_gpu.get(&a_gpu).unwrap(),
+    );
+    check(
+        "db",
+        grads_cpu.get(&b_cpu).unwrap(),
+        grads_gpu.get(&b_gpu).unwrap(),
+    );
+}
+
+#[test]
+fn lora_linear_parity_f32_contiguous_small() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let (rows, inf, outf, r) = (6usize, 5usize, 7usize, 3usize);
+    let x = fixture(rows * inf, 1.0);
+    let w = fixture(outf * inf, 2.0);
+    let a = fixture(r * inf, 3.0);
+    let b = fixture(outf * r, 4.0);
+    assert_lora_linear_parity_f32(&cuda, rows, inf, outf, r, 1.6, &x, &w, &a, &b);
+}
+
+#[test]
+fn lora_linear_parity_f32_production_width_wqkv() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let (rows, inf, outf, r) = (24 * 128, 1024usize, 3072usize, 16usize);
+    let x = fixture(rows * inf, 0.1);
+    let w = fixture(outf * inf, 0.2);
+    let a = fixture(r * inf, 0.3);
+    let b = fixture(outf * r, 0.4);
+    assert_lora_linear_parity_f32(&cuda, rows, inf, outf, r, 0.5, &x, &w, &a, &b);
+}
+
+#[test]
+fn lora_linear_parity_f32_narrowed_with_nonzero_offset() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let cpu = Device::Cpu;
+    let (rows, inf, outf, r) = (4usize, 6usize, 5usize, 2usize);
+    // Build a [3*rows, inf] tensor and narrow to the middle `rows` block —
+    // the missing-offset class this crate's own review found in `Axpy`'s
+    // CUDA arm, exercised on this op's `x` argument.
+    let x_all = fixture(3 * rows * inf, 5.0);
+    let w = fixture(outf * inf, 6.0);
+    let a = fixture(r * inf, 7.0);
+    let b = fixture(outf * r, 8.0);
+    let ab_cpu = pack_ab(
+        &Tensor::from_slice(&a, (r, inf), &cpu).unwrap(),
+        &Tensor::from_slice(&b, (outf, r), &cpu).unwrap(),
+    )
+    .unwrap();
+    let ab_gpu = pack_ab(
+        &Tensor::from_slice(&a, (r, inf), &cuda).unwrap(),
+        &Tensor::from_slice(&b, (outf, r), &cuda).unwrap(),
+    )
+    .unwrap();
+    let w_cpu = Tensor::from_slice(&w, (outf, inf), &cpu).unwrap();
+    let w_gpu = Tensor::from_slice(&w, (outf, inf), &cuda).unwrap();
+
+    let x_cpu_full = Tensor::from_slice(&x_all, (3 * rows, inf), &cpu).unwrap();
+    let x_cpu = x_cpu_full.narrow(0, rows, rows).unwrap();
+    assert!(!x_cpu.is_contiguous() || x_cpu.layout().start_offset() != 0);
+    let x_gpu_full = Tensor::from_slice(&x_all, (3 * rows, inf), &cuda).unwrap();
+    let x_gpu = x_gpu_full.narrow(0, rows, rows).unwrap();
+
+    let params = |scale: f32| LoraLinearParams {
+        scale,
+        inf,
+        outf,
+        r,
+        dropout: None,
+        dweight_needed: false,
+    };
+    let out_cpu = lora_linear(&x_cpu, &w_cpu, &ab_cpu, params(1.2)).unwrap();
+    let out_gpu = lora_linear(&x_gpu, &w_gpu, &ab_gpu, params(1.2)).unwrap();
+
+    let tol = lora_linear_parity_tolerance(rows, inf, outf, &[&x_all, &w, &a, &b]);
+    let out_cpu_v: Vec<f32> = out_cpu.flatten_all().unwrap().to_vec1().unwrap();
+    let out_gpu_v: Vec<f32> = out_gpu
+        .flatten_all()
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(out_gpu_v.len(), rows * outf, "GPU forward length mismatch");
+    for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
+        assert!(
+            ((*c - *g).abs() as f64) <= tol,
+            "narrowed fwd[{i}]: cpu {c} vs cuda {g} (tol {tol})"
+        );
+    }
+}
+
+/// A GENUINELY non-contiguous `x` (a transposed VIEW, not merely a
+/// nonzero-offset contiguous narrow — see
+/// `lora_linear_parity_f32_narrowed_with_nonzero_offset` for that class):
+/// `ops::low_rank_residual_linear::materialize_contiguous_if_needed` must produce the
+/// SAME CUDA result as it does on CPU, at the SAME (transposed) input —
+/// the CUDA-only leg the fix contract calls for, since a strided
+/// materialize-copy's `to_dtype`-based gather is a DIFFERENT code path per
+/// device (`CudaStorage::to_dtype`'s own cast kernel vs the CPU backend's).
+#[test]
+fn lora_linear_parity_f32_transposed_x_is_materialized_identically_on_both_devices() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let cpu = Device::Cpu;
+    let (inf, outf, r) = (6usize, 5usize, 2usize);
+    let rows = 4usize;
+    let x_t_v = fixture(inf * rows, 13.0); // stored as [inf, rows], then transposed to [rows, inf].
+    let w = fixture(outf * inf, 14.0);
+    let a = fixture(r * inf, 15.0);
+    let b = fixture(outf * r, 16.0);
+
+    let ab_cpu = pack_ab(
+        &Tensor::from_slice(&a, (r, inf), &cpu).unwrap(),
+        &Tensor::from_slice(&b, (outf, r), &cpu).unwrap(),
+    )
+    .unwrap();
+    let ab_gpu = pack_ab(
+        &Tensor::from_slice(&a, (r, inf), &cuda).unwrap(),
+        &Tensor::from_slice(&b, (outf, r), &cuda).unwrap(),
+    )
+    .unwrap();
+    let w_cpu = Tensor::from_slice(&w, (outf, inf), &cpu).unwrap();
+    let w_gpu = Tensor::from_slice(&w, (outf, inf), &cuda).unwrap();
+
+    let x_cpu = Tensor::from_slice(&x_t_v, (inf, rows), &cpu)
+        .unwrap()
+        .t()
+        .unwrap();
+    assert!(!x_cpu.is_contiguous());
+    let x_gpu = Tensor::from_slice(&x_t_v, (inf, rows), &cuda)
+        .unwrap()
+        .t()
+        .unwrap();
+    assert!(!x_gpu.is_contiguous());
+
+    let params = LoraLinearParams {
+        scale: 0.9,
+        inf,
+        outf,
+        r,
+        dropout: None,
+        dweight_needed: false,
+    };
+    let out_cpu = lora_linear(&x_cpu, &w_cpu, &ab_cpu, params).unwrap();
+    let out_gpu = lora_linear(&x_gpu, &w_gpu, &ab_gpu, params).unwrap();
+
+    let tol = lora_linear_parity_tolerance(rows, inf, outf, &[&x_t_v, &w, &a, &b]);
+    let out_cpu_v: Vec<f32> = out_cpu.flatten_all().unwrap().to_vec1().unwrap();
+    let out_gpu_v: Vec<f32> = out_gpu
+        .flatten_all()
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(out_gpu_v.len(), rows * outf, "GPU forward length mismatch");
+    for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
+        assert!(
+            ((*c - *g).abs() as f64) <= tol,
+            "transposed-x fwd[{i}]: cpu {c} vs cuda {g} (tol {tol})"
+        );
+    }
+}
+
+#[test]
+fn lora_linear_parity_f32_dropout_matches_across_devices() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let cpu = Device::Cpu;
+    let (rows, inf, outf, r) = (8usize, 6usize, 5usize, 2usize);
+    let key = DropoutKey {
+        seed: 123,
+        layer_id: 4,
+        forward_idx: 2,
+        p: 0.3,
+    };
+    let x = fixture(rows * inf, 9.0);
+    let w = fixture(outf * inf, 10.0);
+    let a = fixture(r * inf, 11.0);
+    let b = fixture(outf * r, 12.0);
+
+    let x_cpu = Tensor::from_slice(&x, (rows, inf), &cpu).unwrap();
+    let w_cpu = Tensor::from_slice(&w, (outf, inf), &cpu).unwrap();
+    let ab_cpu = pack_ab(
+        &Tensor::from_slice(&a, (r, inf), &cpu).unwrap(),
+        &Tensor::from_slice(&b, (outf, r), &cpu).unwrap(),
+    )
+    .unwrap();
+    let params = LoraLinearParams {
+        scale: 0.7,
+        inf,
+        outf,
+        r,
+        dropout: Some(key),
+        dweight_needed: false,
+    };
+    let out_cpu = lora_linear(&x_cpu, &w_cpu, &ab_cpu, params).unwrap();
+
+    let x_gpu = Tensor::from_slice(&x, (rows, inf), &cuda).unwrap();
+    let w_gpu = Tensor::from_slice(&w, (outf, inf), &cuda).unwrap();
+    let ab_gpu = pack_ab(
+        &Tensor::from_slice(&a, (r, inf), &cuda).unwrap(),
+        &Tensor::from_slice(&b, (outf, r), &cuda).unwrap(),
+    )
+    .unwrap();
+    let out_gpu = lora_linear(&x_gpu, &w_gpu, &ab_gpu, params).unwrap();
+
+    // Inverted dropout scales a KEPT element by `1/(1-p)` before it ever
+    // reaches the LoRA branch's own GEMMs — that inflates the effective
+    // per-term magnitude feeding `higham_bound` by the same factor, so the
+    // amplitude this derives from `x`'s RAW (pre-dropout) values is scaled
+    // up here rather than silently under-counting it.
+    let dropout_inv_scale = 1.0 / (1.0 - f64::from(key.p));
+    let x_scaled: Vec<f32> = x.iter().map(|&v| v * dropout_inv_scale as f32).collect();
+    let tol = lora_linear_parity_tolerance(rows, inf, outf, &[&x_scaled, &w, &a, &b]);
+    let out_cpu_v: Vec<f32> = out_cpu.flatten_all().unwrap().to_vec1().unwrap();
+    let out_gpu_v: Vec<f32> = out_gpu
+        .flatten_all()
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(out_gpu_v.len(), rows * outf, "GPU forward length mismatch");
+    for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
+        assert!(
+            ((*c - *g).abs() as f64) <= tol,
+            "dropout fwd[{i}]: cpu {c} vs cuda {g} (tol {tol}) — the SAME (seed, layer_id, \
+             forward_idx) key must draw the identical mask on both devices \
+             (Philox is a pure function of the counter, not device RNG state)"
+        );
+    }
+}
+
+/// `BF16` base on CUDA (the real production dtype pair) — the CPU side
+/// runs the base matmul at `F32` (candle-core 0.11.0 has no CPU `BF16`
+/// matmul; see this file's own leading comment on this section and
+/// `ops::low_rank_residual_linear`'s module doc), so this compares CUDA's REAL `BF16`
+/// path against an `F32`-CPU reference built from the SAME bit-pattern
+/// values (each `BF16` input is round-tripped through `bf16::from_f32`
+/// before either device runs, so both sides start from IDENTICAL
+/// bf16-quantized numbers).
+///
+/// ## Why the bound is keyed to `base`/`delta`'s OWN magnitude, not `out`'s
+///
+/// A standalone on-device probe (a plain `x_bf16.matmul(&w_bf16.t())`,
+/// bypassing this op entirely) against an `f64` "gold" reference built from
+/// the SAME bf16-rounded operands measured the CUDA `base` GEMM's own
+/// error as CORRECTLY-ROUNDED `bf16` storage behaviour: at this test's
+/// `inf = 1024`, `base`'s own magnitude is in the tens of thousands (the
+/// ±10-amplitude fixture, summed over 1024 terms), so `bf16`'s 8
+/// significant bits put a SINGLE round-to-nearest store's worst case at
+/// ~128 absolute (`half_ulp(45000) == 128`) — exactly what the probe
+/// measured (max `|cuda - gold| == 128.2`, `cuda_vs_gold[191] == 107.5`),
+/// confirming `gemm_reduced_precision_bf16() == false` (full `f32`
+/// accumulate, see [`BF16_U`]'s doc) and NOT a functional bug.
+///
+/// This fixture's `base` and `scale * delta` happen to nearly CANCEL
+/// (`base[191] ~= -45163`, `delta_scaled[191] ~= +47549`, `out[191] ~=
+/// 2385`) — family K: a bound proportional to `out`'s own (cancelled, much
+/// smaller) magnitude is the WRONG shape of bound for a computation this
+/// close to catastrophic cancellation; `base`'s ~128 absolute error, which
+/// is tiny relative to `base`'s own ~45000 magnitude, becomes a spurious
+/// ~5% "error" once measured against the cancelled ~2385 output instead.
+/// This bounds each term by ITS OWN magnitude via [`bf16_round_bound`]
+/// instead, computed from `base`/`delta` pieces built SEPARATELY below (not
+/// from `out_cpu` alone).
+#[test]
+fn lora_linear_parity_bf16_base_production_width() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let cpu = Device::Cpu;
+    let (rows, inf, outf, r) = (256usize, 1024usize, 3072usize, 16usize);
+    let scale = 0.5f32;
+
+    let xv = fixture(rows * inf, 1.0);
+    let wv = fixture(outf * inf, 2.0);
+    let av = fixture(r * inf, 3.0);
+    let bv = fixture(outf * r, 4.0);
+    let x_bf16: Vec<bf16> = xv.iter().map(|&v| bf16::from_f32(v)).collect();
+    let w_bf16: Vec<bf16> = wv.iter().map(|&v| bf16::from_f32(v)).collect();
+    // Reconstruct the exact f32 values BF16 quantization produced, so the
+    // CPU F32 reference and the CUDA BF16 run start from identical numbers.
+    let x_requantized: Vec<f32> = x_bf16.iter().map(|v| v.to_f32()).collect();
+    let w_requantized: Vec<f32> = w_bf16.iter().map(|v| v.to_f32()).collect();
+
+    let x_cpu = Tensor::from_slice(&x_requantized, (rows, inf), &cpu).unwrap();
+    let w_cpu = Tensor::from_slice(&w_requantized, (outf, inf), &cpu).unwrap();
+    let a_cpu = Tensor::from_slice(&av, (r, inf), &cpu).unwrap();
+    let b_cpu = Tensor::from_slice(&bv, (outf, r), &cpu).unwrap();
+    let ab_cpu = pack_ab(&a_cpu, &b_cpu).unwrap();
+    let params = LoraLinearParams {
+        scale,
+        inf,
+        outf,
+        r,
+        dropout: None,
+        dweight_needed: false,
+    };
+    let out_cpu = lora_linear(&x_cpu, &w_cpu, &ab_cpu, params).unwrap();
+
+    // The SAME two pieces `out_cpu` sums, kept separate so the bound below
+    // can be sized to EACH term's own magnitude rather than their (possibly
+    // near-cancelling) combined value — see this test's own doc.
+    let base_only_cpu: Vec<f32> = x_cpu
+        .matmul(&w_cpu.t().unwrap())
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let delta_scaled_cpu: Vec<f32> = x_cpu
+        .matmul(&a_cpu.t().unwrap())
+        .unwrap()
+        .matmul(&b_cpu.t().unwrap())
+        .unwrap()
+        .affine(f64::from(scale), 0.0)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    let x_gpu = Tensor::from_slice(&x_bf16, (rows, inf), &cuda).unwrap();
+    let w_gpu = Tensor::from_slice(&w_bf16, (outf, inf), &cuda).unwrap();
+    let ab_gpu = pack_ab(
+        &Tensor::from_slice(&av, (r, inf), &cuda).unwrap(),
+        &Tensor::from_slice(&bv, (outf, r), &cuda).unwrap(),
+    )
+    .unwrap();
+    let out_gpu = lora_linear(&x_gpu, &w_gpu, &ab_gpu, params).unwrap();
+
+    let out_cpu_v: Vec<f32> = out_cpu.flatten_all().unwrap().to_vec1().unwrap();
+    let out_gpu_v: Vec<f32> = out_gpu
+        .to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(out_gpu_v.len(), rows * outf, "GPU forward length mismatch");
+    // A small floor covers the `f32`-only parts of this computation (the
+    // LoRA GEMMs themselves, and the base GEMM's own negligible `f32`
+    // summation-order noise — measured ~0.008 by the same standalone probe
+    // cited in this test's doc).
+    let abs_floor = 1e-1f64;
+    for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
+        let bound = bf16_round_bound(f64::from(base_only_cpu[i]))
+            + bf16_round_bound(f64::from(delta_scaled_cpu[i]))
+            + abs_floor;
+        assert!(
+            f64::from(*c - *g).abs() <= bound,
+            "bf16-base fwd[{i}]: cpu(f32 ref) {c} vs cuda(bf16) {g} (bound {bound}, \
+             base_only {} delta_scaled {})",
+            base_only_cpu[i],
+            delta_scaled_cpu[i]
+        );
+    }
+}
+
+/// The BACKWARD counterpart to `lora_linear_parity_bf16_base_production_width`:
+/// `x`/`w` are the SAME bf16-rounded values (`x_bf16`,
+/// `w_bf16`/their `f32` requantizations), but the CPU reference here is
+/// NOT this op's own CPU forward+`backward()` — it is candle's ORDINARY
+/// autograd walking the EAGER composition this op replaces (`base = x @
+/// w^T`, `delta = scale * (x @ A^T) @ B^T`, `out = base + delta`, plain
+/// `matmul`/`affine`/`add` nodes), an INDEPENDENT code path from this
+/// op's own hand-derived `CustomOp3::bwd` (family F). `w` stays a frozen
+/// (non-`Var`) leaf and `dweight_needed: false` on the CUDA side — the
+/// same LoRA use case every other test in this file assumes — so only
+/// `dx`/`da`/`db` are compared; `dw` is out of scope.
+///
+/// ## Where each bound comes from
+///
+/// `da`/`db` never see a bf16 rounding point: `ab` is always `F32`
+/// (module doc's forward point 2 and backward point 1 are both lossless
+/// widening casts from bf16), so `dB = d_lora^T @ h`/`dA^T = xd^T @ g`
+/// reduce to a pure-`F32` chained-GEMM comparison — the SAME
+/// [`lora_linear_parity_tolerance`] the `f32`-base backward leg uses.
+///
+/// `dx` is different: the module doc's backward enumeration names THREE
+/// bf16 rounding points feeding it —
+/// - point 6, `dx_base = dy @ w`, a real `BF16` GEMM (the same
+///   store-rounding as forward's own `base` GEMM),
+/// - point 5, `d_x_lora = cast_to(x.dtype())(d_xd)`, the lossy `F32 ->
+///   BF16` narrowing cast,
+/// - point 7, `dx = dx_base + d_x_lora`, `BF16`'s promote-compute-
+///   round-once add —
+///
+///   each bounded by its OWN [`bf16_round_bound`] (mirroring the forward
+///   test's "bound each term by its own magnitude, not the combined
+///   result's" reasoning: `dx_base` and `d_x_lora` are two independently-
+///   signed contributions that need not be anywhere near each other's
+///   magnitude), plus a small `F32` floor for the two branches' own GEMM
+///   summation-order noise.
+#[test]
+fn lora_linear_parity_bf16_base_backward_production_width() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let cpu = Device::Cpu;
+    let (rows, inf, outf, r) = (256usize, 1024usize, 3072usize, 16usize);
+    let scale = 0.5f32;
+
+    let xv = fixture(rows * inf, 1.0);
+    let wv = fixture(outf * inf, 2.0);
+    let av = fixture(r * inf, 3.0);
+    let bv = fixture(outf * r, 4.0);
+    let x_bf16: Vec<bf16> = xv.iter().map(|&v| bf16::from_f32(v)).collect();
+    let w_bf16: Vec<bf16> = wv.iter().map(|&v| bf16::from_f32(v)).collect();
+    // Reconstruct the exact f32 values BF16 quantization produced, so the
+    // CPU reference and the CUDA BF16 run start from identical numbers.
+    let x_requantized: Vec<f32> = x_bf16.iter().map(|v| v.to_f32()).collect();
+    let w_requantized: Vec<f32> = w_bf16.iter().map(|v| v.to_f32()).collect();
+
+    // CPU reference: candle's OWN autograd over the plain eager
+    // composition (see this test's own doc) — no CustomOp involved.
+    let x_cpu =
+        Var::from_tensor(&Tensor::from_slice(&x_requantized, (rows, inf), &cpu).unwrap()).unwrap();
+    let w_cpu = Tensor::from_slice(&w_requantized, (outf, inf), &cpu).unwrap();
+    let a_cpu = Var::from_tensor(&Tensor::from_slice(&av, (r, inf), &cpu).unwrap()).unwrap();
+    let b_cpu = Var::from_tensor(&Tensor::from_slice(&bv, (outf, r), &cpu).unwrap()).unwrap();
+
+    let base_cpu = x_cpu.as_tensor().matmul(&w_cpu.t().unwrap()).unwrap();
+    let delta_cpu = x_cpu
+        .as_tensor()
+        .matmul(&a_cpu.as_tensor().t().unwrap())
+        .unwrap()
+        .matmul(&b_cpu.as_tensor().t().unwrap())
+        .unwrap()
+        .affine(f64::from(scale), 0.0)
+        .unwrap();
+    let out_cpu = (base_cpu + delta_cpu).unwrap();
+    let grads_cpu = out_cpu.sum_all().unwrap().backward().unwrap();
+
+    let dx_cpu: Vec<f32> = grads_cpu
+        .get(&x_cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let da_cpu: Vec<f32> = grads_cpu
+        .get(&a_cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let db_cpu: Vec<f32> = grads_cpu
+        .get(&b_cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    // The `dx_base`/`d_x_lora` pieces `dx_cpu` sums, kept SEPARATE
+    // (mirroring the forward test's `base_only_cpu`/`delta_scaled_cpu` split) so
+    // the bound below can be sized to EACH bf16 rounding point's own
+    // magnitude. `dy` is `sum_all().backward()`'s upstream seed: ones.
+    let dy_cpu = Tensor::ones((rows, outf), DType::F32, &cpu).unwrap();
+    let dx_base_cpu: Vec<f32> = dy_cpu
+        .matmul(&w_cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let g_cpu = dy_cpu.matmul(b_cpu.as_tensor()).unwrap();
+    let d_x_lora_cpu: Vec<f32> = g_cpu
+        .matmul(a_cpu.as_tensor())
+        .unwrap()
+        .affine(f64::from(scale), 0.0)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    // `da`/`db`'s own two REAL operands, measured directly (not assumed
+    // equal to the raw fixture amplitude — see
+    // `lora_linear_parity_tolerance_asymmetric`'s doc): `d(after_a) ==
+    // d(lora_out) @ B == (dy * scale) @ B` (`g_cpu` already computed
+    // above, scaled here) feeds `da`'s own final GEMM (`d(after_a)^T @
+    // x`); `after_a == x @ A^T` feeds `db`'s own final GEMM
+    // (`d(lora_out)^T @ after_a`).
+    let d_after_a_cpu: Vec<f32> = g_cpu
+        .affine(f64::from(scale), 0.0)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let after_a_cpu: Vec<f32> = x_cpu
+        .as_tensor()
+        .matmul(&a_cpu.as_tensor().t().unwrap())
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let max_abs = |v: &[f32]| v.iter().fold(0.0f64, |acc, &x| acc.max(f64::from(x.abs())));
+
+    // CUDA side: the REAL fused op, `x`/`w` true `bf16` tensors.
+    let x_gpu =
+        Var::from_tensor(&Tensor::from_slice(&x_bf16, (rows, inf), &cuda).unwrap()).unwrap();
+    let w_gpu = Tensor::from_slice(&w_bf16, (outf, inf), &cuda).unwrap();
+    let a_gpu = Var::from_tensor(&Tensor::from_slice(&av, (r, inf), &cuda).unwrap()).unwrap();
+    let b_gpu = Var::from_tensor(&Tensor::from_slice(&bv, (outf, r), &cuda).unwrap()).unwrap();
+    let ab_gpu = pack_ab(a_gpu.as_tensor(), b_gpu.as_tensor()).unwrap();
+    let params = LoraLinearParams {
+        scale,
+        inf,
+        outf,
+        r,
+        dropout: None,
+        dweight_needed: false,
+    };
+    let out_gpu = lora_linear(x_gpu.as_tensor(), &w_gpu, &ab_gpu, params).unwrap();
+    let grads_gpu = out_gpu.sum_all().unwrap().backward().unwrap();
+
+    let dx_gpu: Vec<f32> = grads_gpu
+        .get(&x_gpu)
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let da_gpu: Vec<f32> = grads_gpu
+        .get(&a_gpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let db_gpu: Vec<f32> = grads_gpu
+        .get(&b_gpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    assert_eq!(dx_gpu.len(), rows * inf, "GPU dx length mismatch");
+    assert_eq!(da_gpu.len(), r * inf, "GPU da length mismatch");
+    assert_eq!(db_gpu.len(), outf * r, "GPU db length mismatch");
+
+    // A small floor covers the `f32`-only summation-order noise both
+    // branches carry regardless of dtype (measured negligible by the
+    // forward test's own standalone probe, cited in its doc).
+    let abs_floor = 1e-1f64;
+    for (i, (c, g)) in dx_cpu.iter().zip(dx_gpu.iter()).enumerate() {
+        let bound = bf16_round_bound(f64::from(dx_base_cpu[i]))
+            + bf16_round_bound(f64::from(d_x_lora_cpu[i]))
+            + bf16_round_bound(f64::from(*c))
+            + abs_floor;
+        assert!(
+            f64::from(*c - *g).abs() <= bound,
+            "bf16-base bwd dx[{i}]: cpu(eager f32) {c} vs cuda(bf16) {g} (bound {bound}, \
+             dx_base {} d_x_lora {})",
+            dx_base_cpu[i],
+            d_x_lora_cpu[i]
+        );
+    }
+
+    // RULE-2 DISCRIMINATION PROOF (was vacuous before this fix): the
+    // predecessor of this pair of bounds reused `lora_linear_parity_tolerance`
+    // with the RAW fixture slices, giving `tol == 337.5` against `da`'s own
+    // measured max magnitude of `41.7` — a `bound / max|signal|` ratio of
+    // `8.1`, so `da_gpu == 0.0` (a mutation that drops the entire `da`
+    // gradient) would have PASSED (`|41.7 - 0.0| == 41.7 < 337.5`). The
+    // asymmetric bound below is keyed to the ACTUAL operand magnitudes
+    // feeding `da`'s/`db`'s own dominant reduction (see
+    // `lora_linear_parity_tolerance_asymmetric`'s doc) — measured here at
+    // `da_tol ~= 6.3` against `da`'s own max `~41.7` (ratio `~0.15`) and
+    // `db_tol ~= 601.3` against `db`'s own max `~3962.0` (ratio `~0.15`),
+    // both `< 1`: a zeroed or otherwise wrong-order-of-magnitude gradient on
+    // EITHER slot is now caught, not just a fine-grained rounding bug.
+    let da_tol = lora_linear_parity_tolerance_asymmetric(
+        rows,
+        max_abs(&d_after_a_cpu),
+        max_abs(&x_requantized),
+    );
+    for (i, (c, g)) in da_cpu.iter().zip(da_gpu.iter()).enumerate() {
+        assert!(
+            f64::from(*c - *g).abs() <= da_tol,
+            "bf16-base bwd da[{i}]: cpu {c} vs cuda {g} (tol {da_tol})"
+        );
+    }
+    let db_tol =
+        lora_linear_parity_tolerance_asymmetric(rows, f64::from(scale), max_abs(&after_a_cpu));
+    for (i, (c, g)) in db_cpu.iter().zip(db_gpu.iter()).enumerate() {
+        assert!(
+            f64::from(*c - *g).abs() <= db_tol,
+            "bf16-base bwd db[{i}]: cpu {c} vs cuda {g} (tol {db_tol})"
+        );
+    }
+}
+
+/// The bit-exact counterpart the loose, DERIVED tolerance above cannot
+/// stand in for: [`lora_linear_parity_tolerance`]'s bound is sized to
+/// catch a real bug (an error on the order of a single term's own
+/// magnitude), but a bug small enough to hide under it — a half-term drop,
+/// a single row read from the wrong offset — needs an assertion with NO
+/// slack at all. [`exact_fixture`]'s small-integer values make that
+/// possible at PRODUCTION width: every intermediate sum here stays a
+/// small exact integer, so CPU and CUDA MUST agree bit-for-bit (`tol ==
+/// 0.0`) regardless of which valid summation order either `gemm`
+/// implementation picks — see `exact_fixture`'s own doc.
+#[test]
+fn lora_linear_parity_f32_exact_integer_fixture_is_bit_exact() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let (rows, inf, outf, r) = (24usize, 1024usize, 3072usize, 16usize);
+    let x = exact_fixture(rows * inf, 1);
+    let w = exact_fixture(outf * inf, 2);
+    let a = exact_fixture(r * inf, 3);
+    let b = exact_fixture(outf * r, 4);
+    // scale = 2.0: exact in binary, so the epilogue's own multiply
+    // introduces no rounding of its own either.
+    assert_lora_linear_parity_f32_bit_exact(&cuda, rows, inf, outf, r, 2.0, &x, &w, &a, &b);
+}
+
+/// Bit-exact (`tol == 0.0`) sibling of [`assert_lora_linear_parity_f32`],
+/// for [`exact_fixture`]-only callers — kept as a SEPARATE function (not a
+/// `tol` parameter on the loose one) so which legs claim bit-exactness is
+/// visible at every call site, not buried in an argument.
+#[allow(clippy::too_many_arguments)]
+fn assert_lora_linear_parity_f32_bit_exact(
+    cuda: &Device,
+    rows: usize,
+    inf: usize,
+    outf: usize,
+    r: usize,
+    scale: f32,
+    xv: &[f32],
+    wv: &[f32],
+    av: &[f32],
+    bv: &[f32],
+) {
+    let cpu = Device::Cpu;
+
+    let x_cpu = Var::from_tensor(&Tensor::from_slice(xv, (rows, inf), &cpu).unwrap()).unwrap();
+    let w_cpu = Var::from_tensor(&Tensor::from_slice(wv, (outf, inf), &cpu).unwrap()).unwrap();
+    let a_cpu = Var::from_tensor(&Tensor::from_slice(av, (r, inf), &cpu).unwrap()).unwrap();
+    let b_cpu = Var::from_tensor(&Tensor::from_slice(bv, (outf, r), &cpu).unwrap()).unwrap();
+    let ab_cpu = pack_ab(a_cpu.as_tensor(), b_cpu.as_tensor()).unwrap();
+    let params = LoraLinearParams {
+        scale,
+        inf,
+        outf,
+        r,
+        dropout: None,
+        dweight_needed: true,
+    };
+    let out_cpu = lora_linear(x_cpu.as_tensor(), w_cpu.as_tensor(), &ab_cpu, params).unwrap();
+    let grads_cpu = out_cpu.sum_all().unwrap().backward().unwrap();
+
+    let x_gpu = Var::from_tensor(&Tensor::from_slice(xv, (rows, inf), cuda).unwrap()).unwrap();
+    let w_gpu = Var::from_tensor(&Tensor::from_slice(wv, (outf, inf), cuda).unwrap()).unwrap();
+    let a_gpu = Var::from_tensor(&Tensor::from_slice(av, (r, inf), cuda).unwrap()).unwrap();
+    let b_gpu = Var::from_tensor(&Tensor::from_slice(bv, (outf, r), cuda).unwrap()).unwrap();
+    let ab_gpu = pack_ab(a_gpu.as_tensor(), b_gpu.as_tensor()).unwrap();
+    let out_gpu = lora_linear(x_gpu.as_tensor(), w_gpu.as_tensor(), &ab_gpu, params).unwrap();
+    let grads_gpu = out_gpu.sum_all().unwrap().backward().unwrap();
+
+    let check = |name: &str, cpu_t: &Tensor, gpu_t: &Tensor| {
+        let c: Vec<f32> = cpu_t.flatten_all().unwrap().to_vec1().unwrap();
+        let g: Vec<f32> = gpu_t
+            .flatten_all()
+            .unwrap()
+            .to_device(&cpu)
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(
+            c, g,
+            "{name}: exact-integer fixture must be bit-exact CPU vs CUDA"
+        );
+    };
+    check(
+        "fwd",
+        &out_cpu.flatten_all().unwrap(),
+        &out_gpu.flatten_all().unwrap(),
+    );
+    check(
+        "dx",
+        grads_cpu.get(&x_cpu).unwrap(),
+        grads_gpu.get(&x_gpu).unwrap(),
+    );
+    check(
+        "dw",
+        grads_cpu.get(&w_cpu).unwrap(),
+        grads_gpu.get(&w_gpu).unwrap(),
+    );
+    check(
+        "da",
+        grads_cpu.get(&a_cpu).unwrap(),
+        grads_gpu.get(&a_gpu).unwrap(),
+    );
+    check(
+        "db",
+        grads_cpu.get(&b_cpu).unwrap(),
+        grads_gpu.get(&b_gpu).unwrap(),
+    );
+}
+
+/// The `bf16` counterpart to
+/// `lora_linear_parity_f32_exact_integer_fixture_is_bit_exact`: small
+/// integer `x`/`w` (exactly representable in `bf16`, since `bf16` exactly
+/// represents every integer in `[-256, 256]`) at production `inf`, so the
+/// true (infinite-precision) base sum is EXACTLY representable in `f32`
+/// (`1024 * 4*4 = 16384 << 2^24`) and the CUDA base GEMM's tensor-core
+/// `f32` accumulation is therefore EXACT up to the ONE unavoidable
+/// rounding point this leg cannot eliminate: the final store of that exact
+/// sum down to `bf16`. The expected reference is built with that SAME
+/// single rounding (`bf16::from_f32(exact_sum)`), and the epilogue's own
+/// two rounding points (`ScaledCastAdd`'s "round delta to `bf16` first,
+/// then add-and-round-once" — see `ops::scaled_cast_add`'s module doc) are
+/// reproduced by hand with the exact same formula
+/// `scaled_cast_add_bf16_f32` uses. This is BIT-EXACT (not a tolerance
+/// leg): a half-term drop, a wrong row, or a transposed operand would
+/// almost certainly miss this exact reference, unlike the loose
+/// term-magnitude bound `lora_linear_parity_bf16_base_production_width`
+/// uses for its realistic (non-integer) fixture.
+#[test]
+fn lora_linear_parity_bf16_exact_integer_fixture_is_bit_exact() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let cpu = Device::Cpu;
+    let (rows, inf, outf, r) = (8usize, 1024usize, 12usize, 4usize);
+    let scale = 2.0f32; // exact in binary.
+
+    let xv = exact_fixture(rows * inf, 1);
+    let wv = exact_fixture(outf * inf, 2);
+    let av = exact_fixture(r * inf, 3);
+    let bv = exact_fixture(outf * r, 4);
+    let x_bf16: Vec<bf16> = xv.iter().map(|&v| bf16::from_f32(v)).collect();
+    let w_bf16: Vec<bf16> = wv.iter().map(|&v| bf16::from_f32(v)).collect();
+
+    // The exact (f64, then losslessly narrowed to f32 — every partial sum
+    // stays a small exact integer) base and delta pieces, computed
+    // independently of candle's own GEMM so this reference shares no code
+    // path with the op under test (family F).
+    let mut base_bf16_expected = vec![bf16::from_f32(0.0); rows * outf];
+    let mut delta_f32_exact = vec![0.0f32; rows * outf];
+    for i in 0..rows {
+        for o in 0..outf {
+            let mut base_acc = 0i64;
+            for k in 0..inf {
+                base_acc += (xv[i * inf + k] as i64) * (wv[o * inf + k] as i64);
+            }
+            base_bf16_expected[i * outf + o] = bf16::from_f32(base_acc as f32);
+
+            let mut delta_acc = 0i64;
+            for j in 0..r {
+                let mut h_acc = 0i64;
+                for k in 0..inf {
+                    h_acc += (xv[i * inf + k] as i64) * (av[j * inf + k] as i64);
+                }
+                delta_acc += h_acc * (bv[o * r + j] as i64);
+            }
+            delta_f32_exact[i * outf + o] = delta_acc as f32;
+        }
+    }
+    let expected: Vec<bf16> = base_bf16_expected
+        .iter()
+        .zip(delta_f32_exact.iter())
+        .map(|(&base, &delta)| {
+            // Mirrors `scaled_cast_add_bf16_f32` exactly (round delta to
+            // bf16 first, then add-and-round-once).
+            let delta_bf16 = bf16::from_f32(delta * scale);
+            bf16::from_f32(base.to_f32() + delta_bf16.to_f32())
+        })
+        .collect();
+
+    let x_gpu = Tensor::from_slice(&x_bf16, (rows, inf), &cuda).unwrap();
+    let w_gpu = Tensor::from_slice(&w_bf16, (outf, inf), &cuda).unwrap();
+    let ab_gpu = pack_ab(
+        &Tensor::from_slice(&av, (r, inf), &cuda).unwrap(),
+        &Tensor::from_slice(&bv, (outf, r), &cuda).unwrap(),
+    )
+    .unwrap();
+    let params = LoraLinearParams {
+        scale,
+        inf,
+        outf,
+        r,
+        dropout: None,
+        dweight_needed: false,
+    };
+    let out_gpu = lora_linear(&x_gpu, &w_gpu, &ab_gpu, params).unwrap();
+    let got: Vec<bf16> = out_gpu
+        .flatten_all()
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    assert_eq!(
+        got, expected,
+        "exact-integer bf16 fixture must be bit-exact against a reference built from the \
+         SAME single rounding point the op's own epilogue documents"
+    );
 }

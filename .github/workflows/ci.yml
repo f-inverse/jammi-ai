@@ -627,6 +627,48 @@ jobs:
           # can't be authored and left silently unwired into CI.
           - name: CI guard wiring
             cmd: python3 ci/scripts/check_ci_guard_wiring.py
+          # check_ci_guard_wiring.py's OWN suite (advisory iii, PR #372
+          # round 2): drives the real python_test_suites()/main() entry
+          # points against throwaway git-init'd fixtures, pinning the
+          # comment-vs-code-line tightening and the root generalization.
+          - name: CI guard wiring suite
+            cmd: python3 ci/scripts/test_check_ci_guard_wiring.py
+          # Re-resolves every finetune_step.rs:<n>/grad_oracle.rs:<n>
+          # PATH:LINE citation under crates/jammi-bench/** and
+          # ci/scripts/perf/** against the file at HEAD (advisory i, PR #372
+          # round 2) -- stdlib-only, hermetic, catches the F7-class
+          # regression (an in-bounds but STALE line number) an eyeballed
+          # diff review missed twice in a row on this same PR.
+          - name: citation resolver
+            cmd: python3 ci/scripts/perf/check_citations.py
+          - name: citation resolver suite
+            cmd: python3 ci/scripts/perf/test_check_citations.py
+          # jammi-vs-torch gradient-oracle comparator's own math/refusal
+          # suite (F6, PR #372 audit round): stdlib-only (`unittest`), no
+          # torch/numpy required — `compare_grad_oracle.py`'s own module
+          # doc's "numpy-first oracle, pure-Python fallback" convention —
+          # so this is exactly the hermetic script-guard shape, never a
+          # torch-dependent lane. Was previously invoked from ZERO
+          # workflows (49 assertions enforced by nothing); execution
+          # provenance principle: zero-execution is RED, not a skip.
+          - name: perf compare_grad_oracle suite
+            cmd: python3 ci/scripts/perf/test_compare_grad_oracle.py
+          # `finetune_ab.sh`'s merge/table stage suite (F6): stdlib-only,
+          # drives `ab_merge.main` (the real entry point that script's own
+          # heredoc-turned-module extraction was built to make testable —
+          # see `ab_merge.py`'s own module doc's B3 note). Same
+          # zero-execution gap as `compare_grad_oracle`'s suite above.
+          - name: perf ab_merge suite
+            cmd: python3 ci/scripts/perf/test_ab_merge.py
+          # `torch_grad_oracle.py`'s NAME-TRANSLATION suite (F6): stdlib-
+          # only, importable without torch installed (that module's own
+          # `import torch_finetune_step as tfs` succeeds torch-free because
+          # `torch_finetune_step.py` imports torch lazily inside its
+          # functions, never at module scope — see this suite's own module
+          # doc). Caught and pinned a real bug (the `Wi`/`mlp.Wi` name
+          # misroute) before this fix; was wired into no workflow at all.
+          - name: reference torch_grad_oracle name-translation suite
+            cmd: python3 crates/jammi-bench/reference/test_torch_grad_oracle_names.py
     steps:
       - uses: actions/checkout@v4
       - name: Run guard

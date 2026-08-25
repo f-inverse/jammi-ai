@@ -62,6 +62,7 @@ mod eval;
 mod finetune_step;
 mod fixture;
 mod gpu_inference;
+mod grad_oracle;
 mod graph_train;
 mod model_inference;
 mod operator_mirror;
@@ -421,6 +422,55 @@ enum Command {
         #[arg(long)]
         expect_kernels_disabled: Option<String>,
     },
+    /// The jammi-vs-torch LEARNING oracle: one forward+backward at
+    /// IDENTICAL LoRA weights (never an optimizer step), dumped per
+    /// trainable tensor by name (loss + f32 gradient) for
+    /// `ci/scripts/perf/compare_grad_oracle.py` to compare against a
+    /// torch-side dump by GRADIENT DIRECTION (cosine similarity), not by
+    /// loss trajectory — see `grad_oracle.rs`'s module doc for why a loss-
+    /// trajectory comparison cannot certify learning parity even after the
+    /// B1 placement fix. `--lora-weights-out` writes the LoRA `A`/`B`
+    /// values this call actually used (jammi's own internal safetensors
+    /// naming); a LATER call's `--lora-weights-in` loads them back,
+    /// overwriting the fresh seeded draw before the forward runs.
+    GradOracle {
+        /// Directory holding `config.json` + `model.safetensors`.
+        #[arg(long)]
+        model_dir: PathBuf,
+        #[arg(long, default_value_t = 8)]
+        batch: usize,
+        #[arg(long, default_value_t = 128)]
+        seq: usize,
+        #[arg(long, default_value_t = 16)]
+        lora_rank: usize,
+        #[arg(long, default_value_t = 32.0)]
+        lora_alpha: f64,
+        /// Comma-separated LoRA target selectors.
+        #[arg(long, default_value = "Wqkv,Wo,Wi")]
+        target_modules: String,
+        /// Backbone precision: f32, f16, or bf16.
+        #[arg(long, default_value = "f32")]
+        backbone_dtype: String,
+        /// CUDA ordinal; omit for CPU.
+        #[arg(long)]
+        cuda: Option<usize>,
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        batched_forward: bool,
+        /// Load LoRA A/B from this safetensors file before the forward
+        /// (jammi's own internal tensor naming — see `grad_oracle.rs`'s
+        /// module doc). Omit to use a fresh seeded draw instead.
+        #[arg(long)]
+        lora_weights_in: Option<PathBuf>,
+        /// Write the LoRA A/B values actually used (post-load, if any) to
+        /// this safetensors file.
+        #[arg(long)]
+        lora_weights_out: Option<PathBuf>,
+        /// Write the gradient/loss dump (JSON) here.
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// The CPU-hermetic cache-hit SLO tier: drives the engine's opt-in producer
     /// memoization (`CachePolicy::Use`) on a cacheable producer (the
     /// neighbour-graph, anchored on the immutable source-table `ResultDigest`).
@@ -546,9 +596,85 @@ async fn main() -> std::process::ExitCode {
                 v
             }),
         }),
+        Command::GradOracle {
+            model_dir,
+            batch,
+            seq,
+            lora_rank,
+            lora_alpha,
+            target_modules,
+            backbone_dtype,
+            cuda,
+            seed,
+            batched_forward,
+            lora_weights_in,
+            lora_weights_out,
+            out,
+        } => run_grad_oracle(
+            grad_oracle::GradOracleParams {
+                model_dir,
+                batch,
+                seq,
+                lora_rank,
+                lora_alpha,
+                target_modules: target_modules
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                backbone_dtype: match backbone_dtype.as_str() {
+                    "f32" => jammi_numerics::ComputePrecision::F32,
+                    "f16" => jammi_numerics::ComputePrecision::F16,
+                    "bf16" => jammi_numerics::ComputePrecision::BF16,
+                    other => {
+                        eprintln!("unknown backbone_dtype {other:?}; expected f32, f16, or bf16");
+                        return std::process::ExitCode::FAILURE;
+                    }
+                },
+                cuda_device: cuda,
+                seed,
+                batched_forward,
+                lora_weights_in,
+                lora_weights_out,
+            },
+            &out,
+        ),
         Command::CacheSloScale => run_cache_slo_scale().await,
         Command::RecomputeScale => run_recompute_scale().await,
     }
+}
+
+/// The `grad-oracle` subcommand: run one forward+backward (no optimizer
+/// step) and write the JSON gradient/loss dump to `out`. Records; does not
+/// gate (the same recorded-not-gated posture `finetune-step` takes — the
+/// comparison this dump feeds, `ci/scripts/perf/compare_grad_oracle.py`, is
+/// the piece that asserts a bound, kept out-of-process so a Python-side
+/// numpy oracle is never coupled to this binary's own exit code). Exits
+/// non-zero only when the step could not be measured at all.
+fn run_grad_oracle(
+    params: grad_oracle::GradOracleParams,
+    out: &std::path::Path,
+) -> std::process::ExitCode {
+    let report = match grad_oracle::run(&params) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("grad-oracle failed: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let json = match serde_json::to_string_pretty(&report) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("grad-oracle: failed to serialize report: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = std::fs::write(out, json) {
+        eprintln!("grad-oracle: failed to write {out:?}: {e}");
+        return std::process::ExitCode::FAILURE;
+    }
+    std::process::ExitCode::SUCCESS
 }
 
 /// The `finetune-step` subcommand: run the tier and emit the report. Records;

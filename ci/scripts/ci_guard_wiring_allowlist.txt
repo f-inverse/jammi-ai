@@ -1,0 +1,25 @@
+# Committed exceptions for ci/scripts/check_ci_guard_wiring.py.
+#
+# One relative-path-from-repo-root per line (only the basename is actually
+# matched — see check_ci_guard_wiring.py's `_allowlisted_names`). A line here
+# means the named gate script / test suite is DELIBERATELY not wired into any
+# `.github/workflows/*.yml` step body right now — add a short reason as a `#`
+# comment on the line above so a reviewer can tell "deliberate" from
+# "forgotten".
+#
+# Every check_*.py/check_*.sh gate script and every test_*.py suite under
+# ci/, crates/*/reference/, tests/ this repo owns IS wired into a workflow,
+# EXCEPT the one entry below. Do not add a line here to silence a FAIL
+# without also writing the reason.
+
+# B1 audit fix on PR #372 (round 2): drives a REAL `cargo build`/`cargo run`
+# AND a REAL torch subprocess (torch/transformers/peft/safetensors, via a
+# provisioned TORCH_VENV) against two real emitters -- neither dependency is
+# available in the hermetic `Guard` job's runner, the same reason
+# `ci/scripts/perf/finetune_ab.sh` itself (the real torch-vs-jammi A/B
+# pipeline this suite is a smaller peer of) is not wired into any
+# `.github/workflows/*.yml` step either; it is a pod-dispatched/manually-run
+# verification script. See that file's own module doc's "Torch env" section
+# and this suite's own module doc for how to provision TORCH_VENV to run it
+# by hand.
+ci/scripts/perf/test_grad_oracle_cross_producer_parity.py

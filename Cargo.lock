@@ -4155,6 +4155,7 @@ dependencies = [
  "clap",
  "datafusion",
  "futures",
+ "hex",
  "jammi-ai",
  "jammi-db",
  "jammi-encoders",
@@ -4164,6 +4165,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
 ]

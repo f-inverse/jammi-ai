@@ -121,8 +121,68 @@ struct EpochState<'a> {
     global_step: &'a mut usize,
 }
 
-/// Immutable per-step context (except for the optimizer, which mutates on
-/// every step). Constructed fresh for each call to
+/// The run's last-optimizer-step horizon plus the one-shot overshoot arm
+/// that keeps a resumed run from re-syncing on every step.
+///
+/// [`Self::is_last_step`] takes the 1-based index of the optimizer step
+/// about to run (`global_step + 1`) and is `true` on exactly one step of a
+/// well-formed run: `step == horizon`. A resumed run whose horizon shrank
+/// below its restored `global_step` (fewer configured epochs, a larger
+/// accumulation window, or fewer rows than the run that wrote the
+/// checkpoint) never reaches `step == horizon` — every step it takes is past
+/// the horizon. Deciding with `>=` would call every one of those steps "the
+/// last step" and force [`refuse_nonfinite_norm`]'s device→host read on all
+/// of them: the per-step sync [`clip_gradients`] exists to remove, back on
+/// every step of the resumed run. So an overshoot is checked ONCE — the
+/// first step past the horizon fires the check and disarms — and the modulo
+/// cadence covers the rest, exactly as it does for a fresh run.
+///
+/// Lattice (`step` against `horizon`, with the arm state):
+///
+/// | cell                          | result                          |
+/// |-------------------------------|---------------------------------|
+/// | `step < horizon`              | `false` (cadence decides)       |
+/// | `step == horizon`             | `true` (the exact last step)    |
+/// | `step > horizon`, armed       | `true`, then disarm (one-shot)  |
+/// | `step > horizon`, disarmed    | `false` (cadence decides)       |
+///
+/// Each cell has a run-level oracle in `last_step_horizon_run_oracles`
+/// (driven through [`TrainingLoop::run`], counting the reads).
+///
+/// [`refuse_nonfinite_norm`]: super::optimizer::refuse_nonfinite_norm
+/// [`clip_gradients`]: super::optimizer::clip_gradients
+struct LastStepHorizon {
+    /// The run's actual optimizer-step count for the arm it takes (see the
+    /// lattice doc above `total_optimizer_steps` in [`TrainingLoop::run`]).
+    horizon: usize,
+    /// Whether the one-shot overshoot check is still armed.
+    overshoot_armed: bool,
+}
+
+impl LastStepHorizon {
+    fn new(horizon: usize) -> Self {
+        Self {
+            horizon,
+            overshoot_armed: true,
+        }
+    }
+
+    /// Whether optimizer step `step` (1-based) must force the non-finite
+    /// check as the run's last step — see the type's lattice.
+    fn is_last_step(&mut self, step: usize) -> bool {
+        if step == self.horizon {
+            return true;
+        }
+        if step > self.horizon && self.overshoot_armed {
+            self.overshoot_armed = false;
+            return true;
+        }
+        false
+    }
+}
+
+/// Immutable per-step context (except for the optimizer and the last-step
+/// horizon's one-shot arm, which mutate on a step). Constructed fresh for each call to
 /// [`TrainingLoop::process_batch_loss`] and dropped at function return so the
 /// caller can keep using `optimizer` directly between iterations.
 struct StepContext<'a> {
@@ -130,7 +190,19 @@ struct StepContext<'a> {
     optimizer: &'a mut AdamW,
     checkpoint_dir: &'a Path,
     checkpoint_interval: usize,
-    total_steps: usize,
+    /// The LR schedule's horizon — `compute_lr`'s `total_steps`, the
+    /// accumulation-window step count `run` computes before the loop. One
+    /// meaning only: where the schedule's decay ends.
+    lr_horizon: usize,
+    /// The run's last-step horizon (`total_optimizer_steps` in `run`) with
+    /// its one-shot overshoot arm. One meaning only: which optimizer step
+    /// forces the non-finite check as the run's last. On this arm the two
+    /// horizons are one number (`process_batch_loss` asserts it), but they
+    /// are named apart because they are NOT one number on the GradCache
+    /// arm (`epochs` vs `ceil(batches / grad_accum) * epochs`), and a single
+    /// field carrying both meanings is how the GradCache horizon was wrong
+    /// once already.
+    last_step_horizon: &'a mut LastStepHorizon,
     /// Micro-batches this epoch's loader yields. Needed so the trailing partial
     /// accumulation window divides its loss by its actual micro-batch count
     /// (`batches_per_epoch % grad_accum`) rather than the full `grad_accum` — the
@@ -523,9 +595,16 @@ impl TrainingLoop {
         //    .epochs`/`total_steps` are both absolute counts fixed at THIS
         //    run's start, independent of where `global_step` restarts from —
         //    resume changes where `global_step` counts FROM, not what it is
-        //    compared against, so a resumed run's `is_last_step` uses exactly
-        //    the same horizon a fresh run would. Already correct; unaffected
-        //    by this fix.
+        //    compared against, so a resumed run's last step is the same
+        //    horizon a fresh run's would be. A resumed run whose horizon
+        //    SHRANK below its restored `global_step` (fewer configured
+        //    epochs, a larger accumulation window, or fewer rows than the
+        //    run that wrote the checkpoint) never reaches the horizon at
+        //    all: every step it takes is past it. `LastStepHorizon` decides
+        //    the exact last step with `==` and checks an overshoot ONCE
+        //    (the first step past the horizon), so such a run pays one
+        //    extra sync, not one per step — see `LastStepHorizon`'s lattice
+        //    and the run-level oracles in `last_step_horizon_run_oracles`.
         let total_optimizer_steps = if Self::wants_gradcache_horizon(
             train_loader.is_precomputed(),
             self.gradcache_eligible(),
@@ -534,6 +613,7 @@ impl TrainingLoop {
         } else {
             total_steps
         };
+        let mut last_step_horizon = LastStepHorizon::new(total_optimizer_steps);
 
         // Snapshot the trainable variables ONCE. `VarMap::all_vars()` iterates a
         // HashMap, so a second call could return a different order — and `AdamW`'s
@@ -691,7 +771,8 @@ impl TrainingLoop {
                             optimizer: &mut optimizer,
                             checkpoint_dir: &checkpoint_dir,
                             checkpoint_interval,
-                            total_steps: total_optimizer_steps,
+                            lr_horizon: total_steps,
+                            last_step_horizon: &mut last_step_horizon,
                             batches_per_epoch: train_batches_per_epoch,
                         },
                     )?;
@@ -706,7 +787,7 @@ impl TrainingLoop {
                     epoch_loader,
                     &trainable_vars,
                     &mut optimizer,
-                    total_optimizer_steps,
+                    &mut last_step_horizon,
                     global_step,
                 )?;
                 epoch_loss += loss_val;
@@ -736,7 +817,8 @@ impl TrainingLoop {
                             optimizer: &mut optimizer,
                             checkpoint_dir: &checkpoint_dir,
                             checkpoint_interval,
-                            total_steps: total_optimizer_steps,
+                            lr_horizon: total_steps,
+                            last_step_horizon: &mut last_step_horizon,
                             batches_per_epoch: train_batches_per_epoch,
                         },
                     )?;
@@ -758,15 +840,14 @@ impl TrainingLoop {
             if grads_pending {
                 let lr = compute_lr(&self.config, global_step, total_steps);
                 optimizer.set_learning_rate(lr);
-                // `total_optimizer_steps` is the whole run's ACTUAL
+                // `last_step_horizon` carries the whole run's ACTUAL
                 // optimizer-step horizon for the arm this run takes (see the
-                // lattice doc above its definition), so
-                // `global_step + 1 >= total_optimizer_steps` names the run's
-                // actual final optimizer step, not just this epoch's — the
-                // non-finite check must not be skippable by a run shorter
-                // than `DEFAULT_NORM_CHECK_INTERVAL` steps (see
+                // lattice doc above `total_optimizer_steps`), so this names
+                // the run's actual final optimizer step, not just this
+                // epoch's — the non-finite check must not be skippable by a
+                // run shorter than `DEFAULT_NORM_CHECK_INTERVAL` steps (see
                 // `clip_and_step`'s doc).
-                let is_last_step = global_step + 1 >= total_optimizer_steps;
+                let is_last_step = last_step_horizon.is_last_step(global_step + 1);
                 clip_and_step(
                     &mut optimizer,
                     &trainable_vars,
@@ -1110,7 +1191,7 @@ impl TrainingLoop {
         train_loader: &TrainingDataLoader,
         trainable_vars: &[Var],
         optimizer: &mut AdamW,
-        total_optimizer_steps: usize,
+        last_step_horizon: &mut LastStepHorizon,
         global_step: usize,
     ) -> Result<f64> {
         use super::gradcache::{gradcache_backward, EncodeGroup};
@@ -1200,20 +1281,17 @@ impl TrainingLoop {
         let mut grads = grads;
 
         // GradCache takes exactly ONE optimizer step per EPOCH, not one per
-        // accumulation window — the caller passes `total_optimizer_steps` as
+        // accumulation window — the caller builds `last_step_horizon` from
         // `self.config.epochs` on this arm specifically BECAUSE of that (see
         // the lattice doc at its call site in `run`, above the definition of
-        // `total_optimizer_steps`). Before B2's fix, this call site was
-        // passed the accumulation-window arm's `total_steps`
-        // (`ceil(batches / grad_accum) * epochs`) instead, which
-        // overcounts GradCache's real per-epoch step count whenever a epoch
-        // has more than one micro-batch/accumulation-window worth of data —
-        // making `global_step + 1 >= total_steps` false on GradCache's actual
-        // last step, silently skipping the run's final non-finite check on
-        // any GradCache run shorter than `DEFAULT_NORM_CHECK_INTERVAL` steps
-        // (every multi-epoch GradCache run, since it takes exactly one step
-        // per epoch and `DEFAULT_NORM_CHECK_INTERVAL` is 50).
-        let is_last_step = global_step + 1 >= total_optimizer_steps;
+        // `total_optimizer_steps`). The accumulation-window arm's horizon
+        // (`ceil(batches / grad_accum) * epochs`) overcounts GradCache's
+        // per-epoch step count whenever an epoch holds more than one
+        // memory-bounded chunk, which would make the run's actual last step
+        // look like an ordinary one and silently skip its non-finite check
+        // on any GradCache run shorter than `DEFAULT_NORM_CHECK_INTERVAL`
+        // steps — every multi-epoch GradCache run, at one step per epoch.
+        let is_last_step = last_step_horizon.is_last_step(global_step + 1);
         clip_and_step(
             optimizer,
             trainable_vars,
@@ -1809,13 +1887,21 @@ impl TrainingLoop {
 
         // Optimizer step every N micro-batches.
         if (*epoch.batch_count).is_multiple_of(self.config.gradient_accumulation_steps) {
-            let lr = compute_lr(&self.config, *epoch.global_step, ctx.total_steps);
+            let lr = compute_lr(&self.config, *epoch.global_step, ctx.lr_horizon);
             ctx.optimizer.set_learning_rate(lr);
 
-            // See the flush-window call site's doc: `ctx.total_steps` is
-            // the whole run's optimizer-step horizon, so this names the
-            // run's actual final optimizer step, not just this epoch's.
-            let is_last_step = *epoch.global_step + 1 >= ctx.total_steps;
+            // Only the accumulation-window arm reaches this function (the
+            // GradCache arm steps in `run_gradcache_epoch`), and on that arm
+            // the LR horizon and the last-step horizon are the same count —
+            // see `StepContext`'s field docs for why they are still two
+            // fields.
+            debug_assert_eq!(
+                ctx.lr_horizon, ctx.last_step_horizon.horizon,
+                "accumulation-window arm: the LR and last-step horizons must agree"
+            );
+            // See the flush-window call site's doc: this names the run's
+            // actual final optimizer step, not just this epoch's.
+            let is_last_step = ctx.last_step_horizon.is_last_step(*epoch.global_step + 1);
             clip_and_step(
                 ctx.optimizer,
                 ctx.trainable_vars,
@@ -3737,8 +3823,8 @@ mod host_read_discipline {
     use super::super::target::TrainingTarget;
     use super::super::FineTuneConfig;
     use super::{
-        per_micro_batch_host_read_count, EpochState, SimStats, StepContext, TrainingLoop,
-        TrainingLoopBuilder,
+        per_micro_batch_host_read_count, EpochState, LastStepHorizon, SimStats, StepContext,
+        TrainingLoop, TrainingLoopBuilder,
     };
     use crate::fine_tune::adamw::AdamW;
 
@@ -3969,7 +4055,8 @@ mod host_read_discipline {
                     optimizer: &mut optimizer,
                     checkpoint_dir: checkpoint_dir.path(),
                     checkpoint_interval: 0,
-                    total_steps: 1,
+                    lr_horizon: 1,
+                    last_step_horizon: &mut LastStepHorizon::new(1),
                     batches_per_epoch: 1,
                 },
             )
@@ -4087,7 +4174,7 @@ mod gradcache_last_step_oracle {
     use super::super::target::TrainingTarget;
     use super::super::{EmbeddingLoss, FineTuneConfig};
     use super::test_fixtures::tiny_bert;
-    use super::TrainingLoopBuilder;
+    use super::{LastStepHorizon, TrainingLoopBuilder};
     use crate::fine_tune::adamw::AdamW;
 
     const HIDDEN: usize = 32; // tiny_bert's hidden width.
@@ -4178,16 +4265,17 @@ mod gradcache_last_step_oracle {
             )
             .unwrap();
 
-            // Epoch 0: healthy weights, global_step 0 → 1. `total_optimizer_steps
-            // == 2` (== `self.config.epochs`) is exactly what `run` computes
-            // for this arm (see `total_optimizer_steps`'s doc in `run`).
+            // Epoch 0: healthy weights, global_step 0 → 1. A horizon of `2`
+            // (== `self.config.epochs`) is exactly what `run` builds for
+            // this arm (see `total_optimizer_steps`'s doc in `run`).
+            let mut horizon = LastStepHorizon::new(2);
             let global_step_after_epoch0 = 0usize;
             loop_
                 .run_gradcache_epoch(
                     &loader,
                     &trainable_vars,
                     &mut optimizer,
-                    2,
+                    &mut horizon,
                     global_step_after_epoch0,
                 )
                 .expect("epoch 0 must complete on healthy weights");
@@ -4206,7 +4294,7 @@ mod gradcache_last_step_oracle {
                     &loader,
                     &trainable_vars,
                     &mut optimizer,
-                    2,
+                    &mut horizon,
                     global_step_after_epoch1,
                 )
                 .expect_err(
@@ -4248,11 +4336,14 @@ mod gradcache_last_step_oracle {
 /// the arm and that the poisoned step IS the run's last.
 #[cfg(test)]
 mod last_step_run_harness {
+    use std::collections::HashMap;
+
     use candle_core::{DType, Device, Tensor};
     use candle_nn::{VarBuilder, VarMap};
 
     use super::super::data::TrainingDataLoader;
     use super::super::lora::build_projection_head;
+    use super::super::resume::{RestoredCheckpoint, ResumeState, RESUME_STATE_SCHEMA_VERSION};
     use super::super::target::TrainingTarget;
     use super::super::{EarlyStoppingMetric, EmbeddingLoss, FineTuneConfig};
     use super::{AfterBackwardHook, TrainingLoopBuilder, TrainingResult};
@@ -4260,7 +4351,7 @@ mod last_step_run_harness {
 
     const HIDDEN: usize = 32; // tiny_bert's hidden width.
 
-    fn text_config() -> FineTuneConfig {
+    pub(super) fn text_config() -> FineTuneConfig {
         FineTuneConfig {
             epochs: 1,
             batch_size: 2,
@@ -4275,7 +4366,7 @@ mod last_step_run_harness {
         }
     }
 
-    fn pairs(n: usize) -> TrainingDataLoader {
+    pub(super) fn pairs(n: usize) -> TrainingDataLoader {
         TrainingDataLoader::from_pairs(
             (0..n)
                 .map(|i| (format!("anchor text {i}"), format!("positive text {i}")))
@@ -4285,7 +4376,7 @@ mod last_step_run_harness {
 
     /// A hook that replaces the first trainable var's gradient with NaN on
     /// optimizer step `step` (1-based) and leaves every other step untouched.
-    fn poison_grad_at(step: usize) -> AfterBackwardHook {
+    pub(super) fn poison_grad_at(step: usize) -> AfterBackwardHook {
         Box::new(move |s, grads, vars| {
             if s == step {
                 let t: &Tensor = &vars[0];
@@ -4298,18 +4389,23 @@ mod last_step_run_harness {
     }
 
     /// Build a real text-path loop over `tiny_bert` (registered model +
-    /// claimed job, as `run` requires) and run it to completion on `loader`,
-    /// with an optional after-backward hook installed.
-    fn run_text_loop(
+    /// claimed job, as `run` requires) and run it to completion on `loader`
+    /// — on the CALLING thread, so a caller can read the thread-local
+    /// `optimizer::thread_sync_read_count` for exactly this run — with an
+    /// optional after-backward hook installed and, when `resume_at` is
+    /// given, resuming from a hand-built bundle whose `global_step` is that
+    /// value (the current weights, zero moments, epoch 0 completed).
+    pub(super) fn run_text_loop(
         tag: &str,
         config: FineTuneConfig,
         loader: TrainingDataLoader,
         hook: Option<AfterBackwardHook>,
+        resume_at: Option<usize>,
     ) -> jammi_db::error::Result<TrainingResult> {
         // A multi-thread runtime: `run` blocks on the catalog through
         // `Handle::current()`, which on a current-thread runtime cannot
-        // drive the IO driver from outside `Runtime::block_on`. Driving it
-        // from `spawn_blocking` is exactly the worker's production shape.
+        // drive the IO driver from outside `Runtime::block_on`; with worker
+        // threads driving IO, entering the runtime on this thread is enough.
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
@@ -4322,21 +4418,54 @@ mod last_step_run_harness {
             let varmap = VarMap::new();
             let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
             let head = build_projection_head(HIDDEN, &config, &varmap, &vb).unwrap();
-            let loop_ =
-                TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
-                    .device(device)
-                    .job_id(tag.into())
-                    .worker_id(format!("{tag}-worker"))
-                    .catalog(catalog)
-                    .artifact_dir(dir.path().to_path_buf())
-                    .base_model(base_model)
-                    .build()
-                    .unwrap();
-            (loop_, dir)
+            let mut builder = TrainingLoopBuilder::new(
+                TrainingTarget::ProjectionHead { head },
+                varmap.clone(),
+                config.clone(),
+            )
+            .device(device)
+            .job_id(tag.into())
+            .worker_id(format!("{tag}-worker"))
+            .catalog(catalog)
+            .artifact_dir(dir.path().to_path_buf())
+            .base_model(base_model);
+            if let Some(global_step) = resume_at {
+                // A bundle "written by a longer run": copies of the current
+                // weights (a `Var` refuses to be set from its own storage),
+                // zero moments for every registered Var keyed by name (as
+                // `restore_from_checkpoint` looks them up), and a step
+                // counter the caller chooses.
+                let data = varmap.data().lock().unwrap();
+                let mut weights = HashMap::new();
+                let mut moments = HashMap::new();
+                for (name, var) in data.iter() {
+                    let t = var.as_tensor();
+                    weights.insert(name.clone(), t.copy().unwrap());
+                    moments.insert(
+                        name.clone(),
+                        (t.zeros_like().unwrap(), t.zeros_like().unwrap()),
+                    );
+                }
+                drop(data);
+                builder = builder.resume(RestoredCheckpoint {
+                    weights,
+                    moments,
+                    state: ResumeState {
+                        schema_version: RESUME_STATE_SCHEMA_VERSION,
+                        last_completed_epoch: 0,
+                        global_step,
+                        step_t: global_step,
+                        seed: config.seed,
+                        scaler: None,
+                        dropout_positions: HashMap::new(),
+                    },
+                });
+            }
+            (builder.build().unwrap(), dir)
         });
         loop_.after_backward = hook;
-        rt.block_on(async move { tokio::task::spawn_blocking(move || loop_.run(&loader)).await })
-            .unwrap()
+        let _enter = rt.enter();
+        loop_.run(&loader)
     }
     /// The typed grad-norm refusal, discriminated from every other error the
     /// run could end in: it must name the poisoned step.
@@ -4362,12 +4491,19 @@ mod last_step_run_harness {
             gradient_accumulation_steps: 2,
             ..text_config()
         };
-        let healthy = run_text_loop("last-step-accum-ok", config.clone(), pairs(8), None).unwrap();
+        let healthy =
+            run_text_loop("last-step-accum-ok", config.clone(), pairs(8), None, None).unwrap();
         assert_eq!(healthy.total_steps, 2, "control: the arm's horizon");
         assert!(2 < DEFAULT_NORM_CHECK_INTERVAL);
 
-        let err = run_text_loop("last-step-accum", config, pairs(8), Some(poison_grad_at(2)))
-            .expect_err("a NaN gradient on the run's last window must be refused");
+        let err = run_text_loop(
+            "last-step-accum",
+            config,
+            pairs(8),
+            Some(poison_grad_at(2)),
+            None,
+        )
+        .expect_err("a NaN gradient on the run's last window must be refused");
         assert_grad_norm_refusal(&err, 2);
     }
 
@@ -4384,11 +4520,18 @@ mod last_step_run_harness {
             gradient_accumulation_steps: 2,
             ..text_config()
         };
-        let healthy = run_text_loop("last-step-flush-ok", config.clone(), pairs(6), None).unwrap();
+        let healthy =
+            run_text_loop("last-step-flush-ok", config.clone(), pairs(6), None, None).unwrap();
         assert_eq!(healthy.total_steps, 2, "control: the arm's horizon");
 
-        let err = run_text_loop("last-step-flush", config, pairs(6), Some(poison_grad_at(2)))
-            .expect_err("a NaN gradient on the run's trailing flush must be refused");
+        let err = run_text_loop(
+            "last-step-flush",
+            config,
+            pairs(6),
+            Some(poison_grad_at(2)),
+            None,
+        )
+        .expect_err("a NaN gradient on the run's trailing flush must be refused");
         assert_grad_norm_refusal(&err, 2);
     }
 
@@ -4402,11 +4545,18 @@ mod last_step_run_harness {
     #[test]
     fn per_batch_arm_refuses_a_nonfinite_gradient_on_the_runs_last_step() {
         let config = text_config();
-        let healthy = run_text_loop("last-step-plain-ok", config.clone(), pairs(6), None).unwrap();
+        let healthy =
+            run_text_loop("last-step-plain-ok", config.clone(), pairs(6), None, None).unwrap();
         assert_eq!(healthy.total_steps, 3, "control: the arm's horizon");
 
-        let err = run_text_loop("last-step-plain", config, pairs(6), Some(poison_grad_at(3)))
-            .expect_err("a NaN gradient on the run's last per-batch step must be refused");
+        let err = run_text_loop(
+            "last-step-plain",
+            config,
+            pairs(6),
+            Some(poison_grad_at(3)),
+            None,
+        )
+        .expect_err("a NaN gradient on the run's last per-batch step must be refused");
         assert_grad_norm_refusal(&err, 3);
     }
 
@@ -4427,12 +4577,154 @@ mod last_step_run_harness {
             epochs: 2,
             ..text_config()
         };
-        let healthy = run_text_loop("last-step-gc-ok", config.clone(), pairs(6), None).unwrap();
+        let healthy =
+            run_text_loop("last-step-gc-ok", config.clone(), pairs(6), None, None).unwrap();
         assert_eq!(healthy.total_steps, 2, "control: one step per epoch");
 
-        let err = run_text_loop("last-step-gc", config, pairs(6), Some(poison_grad_at(2)))
-            .expect_err("a NaN gradient on the run's last GradCache epoch must be refused");
+        let err = run_text_loop(
+            "last-step-gc",
+            config,
+            pairs(6),
+            Some(poison_grad_at(2)),
+            None,
+        )
+        .expect_err("a NaN gradient on the run's last GradCache epoch must be refused");
         assert_grad_norm_refusal(&err, 2);
+    }
+}
+
+/// Run-level oracles for `LastStepHorizon`'s lattice, driven through the
+/// REAL `TrainingLoop::run` over the `tiny_bert` text path (the precomputed
+/// arm computes its loss straight from the given embeddings, touching no
+/// LoRA `Var`, so it never has a gradient to clip and never reads a norm —
+/// it cannot see any of this). `refuse_nonfinite_norm` invocations are
+/// counted through `optimizer::thread_sync_read_count` on the thread the run
+/// executes on — the headline "no per-step sync" property measured at run
+/// level, not inferred from one call, and immune to every other test's
+/// training in the same process.
+#[cfg(test)]
+mod last_step_horizon_run_oracles {
+    use super::super::optimizer::{thread_sync_read_count, DEFAULT_NORM_CHECK_INTERVAL};
+    use super::super::FineTuneConfig;
+    use super::last_step_run_harness::{pairs, poison_grad_at, run_text_loop, text_config};
+
+    /// Cells `step < horizon` and `step == horizon` on a fresh run: 6 pairs
+    /// at `batch_size: 2`, `grad_accum: 1`, one epoch → 3 steps, under the
+    /// 50-step cadence. The run reads the norm back EXACTLY twice: step 1
+    /// (always) and step 3 (the exact last step); step 2 is neither.
+    #[test]
+    fn fresh_short_run_reads_the_norm_on_step_one_and_the_last_step_only() {
+        let before = thread_sync_read_count();
+        let result = run_text_loop("horizon-fresh", text_config(), pairs(6), None, None).unwrap();
+        assert_eq!(result.total_steps, 3, "control: the run's horizon");
+        assert!(3 < DEFAULT_NORM_CHECK_INTERVAL);
+        assert_eq!(
+            thread_sync_read_count() - before,
+            2,
+            "a fresh 3-step run must read the norm on step 1 and step 3 only"
+        );
+    }
+
+    /// The shrunk-horizon resume fixture: 8 pairs at `batch_size: 2`
+    /// (4 steps per epoch), `epochs: 3` → horizon `ceil(4 / 1) * 3 == 12`,
+    /// resumed from a checkpoint claiming `global_step == 100` at the end
+    /// of epoch 0 — a run whose epoch budget shrank after the crash. The
+    /// resumed run takes epochs 1 and 2: 8 steps (101..=108), EVERY one past
+    /// the horizon.
+    fn shrunk_horizon_config() -> FineTuneConfig {
+        FineTuneConfig {
+            epochs: 3,
+            ..text_config()
+        }
+    }
+
+    /// Cells `step > horizon` armed → disarmed, over the whole resumed run:
+    /// it must read the norm back exactly once (the first overshoot step,
+    /// 101, then disarm) — never on all 8.
+    ///
+    /// Mutation tried: decide `is_last_step` with `step >= horizon` (the
+    /// pre-fix form) — RED (8 reads, one per step: the sync amplification
+    /// this fix closes). The contract's run-level bound is
+    /// `≤ ceil(N / interval) + 2` reads over `N` steps; the exact count for
+    /// this fixture is pinned alongside it.
+    #[test]
+    fn resumed_run_past_a_shrunk_horizon_checks_the_overshoot_once() {
+        let before = thread_sync_read_count();
+        let result = run_text_loop(
+            "horizon-overshoot",
+            shrunk_horizon_config(),
+            pairs(8),
+            None,
+            Some(100),
+        )
+        .unwrap();
+        let n = result.total_steps - 100;
+        assert_eq!(n, 8, "control: epochs 1 and 2 of 3, 4 steps each");
+        let reads = thread_sync_read_count() - before;
+        let bound = (n.div_ceil(DEFAULT_NORM_CHECK_INTERVAL) + 2) as u64;
+        assert!(
+            reads <= bound,
+            "a resumed run past its horizon must not re-sync on every step: {reads} reads over \
+             {n} steps, bound {bound}"
+        );
+        assert_eq!(
+            reads, 1,
+            "exactly one overshoot check (step 101), then the cadence decides"
+        );
+    }
+
+    /// Cell `step > horizon`, armed: the one-shot overshoot check is a REAL
+    /// check — a NaN gradient on the first step past the horizon (101) is
+    /// refused, naming that step.
+    ///
+    /// Mutation tried: delete the `step > self.horizon && self.overshoot_armed`
+    /// arm of `LastStepHorizon::is_last_step` — RED (step 101 is unchecked;
+    /// the NaN trains in).
+    #[test]
+    fn resumed_run_past_a_shrunk_horizon_refuses_a_nan_on_its_first_overshoot_step() {
+        let err = run_text_loop(
+            "horizon-overshoot-nan",
+            shrunk_horizon_config(),
+            pairs(8),
+            Some(poison_grad_at(101)),
+            Some(100),
+        )
+        .expect_err("the one-shot overshoot check must refuse a NaN on step 101");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("non-finite total gradient norm") && msg.contains("step 101"),
+            "expected the grad-norm refusal naming step 101, got: {msg}"
+        );
+    }
+
+    /// Cell `step > horizon`, disarmed: after the one-shot check, later
+    /// overshoot steps are left to the modulo cadence — a NaN on step 102 is
+    /// NOT refused by the grad-norm check (that is the per-step sync this
+    /// fix refuses to reinstate): whatever the run ends in, it is not the
+    /// step-102 grad-norm refusal, and the run read the norm exactly once
+    /// (step 101). The epoch-boundary backstop for the adapter such a run
+    /// leaves behind is `refuse_nonfinite_params`.
+    #[test]
+    fn resumed_run_past_a_shrunk_horizon_leaves_later_overshoot_steps_to_the_cadence() {
+        let before = thread_sync_read_count();
+        let outcome = run_text_loop(
+            "horizon-overshoot-later",
+            shrunk_horizon_config(),
+            pairs(8),
+            Some(poison_grad_at(102)),
+            Some(100),
+        );
+        if let Err(err) = &outcome {
+            assert!(
+                !err.to_string().contains("gradient norm"),
+                "step 102 is past the one-shot check and off the cadence: {err}"
+            );
+        }
+        assert_eq!(
+            thread_sync_read_count() - before,
+            1,
+            "the disarmed overshoot must not read the norm again"
+        );
     }
 }
 

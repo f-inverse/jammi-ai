@@ -57,6 +57,22 @@ pub(crate) fn sync_read_count() -> u64 {
     SYNC_READ_COUNT.load(Ordering::Relaxed)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The per-THREAD twin of [`SYNC_READ_COUNT`]: a run-level test drives
+    /// `TrainingLoop::run` on its own thread and reads this, so the count it
+    /// asserts on is exactly that run's reads — unperturbed by every other
+    /// test's training in the same process, which the global counter cannot
+    /// separate.
+    static THREAD_SYNC_READ_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Snapshot [`THREAD_SYNC_READ_COUNT`] for the calling thread. Test-only.
+#[cfg(test)]
+pub(crate) fn thread_sync_read_count() -> u64 {
+    THREAD_SYNC_READ_COUNT.with(|c| c.get())
+}
+
 /// Clip gradients by global L2 norm in-place, matching
 /// `torch.nn.utils.clip_grad_norm_(params, max_norm)`, entirely on-device.
 ///
@@ -248,6 +264,8 @@ pub fn clip_gradients(
 pub fn refuse_nonfinite_norm(total_norm: &Tensor, step: usize) -> Result<()> {
     #[cfg(test)]
     SYNC_READ_COUNT.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    THREAD_SYNC_READ_COUNT.with(|c| c.set(c.get() + 1));
 
     let norm: f32 = total_norm
         .to_scalar::<f32>()

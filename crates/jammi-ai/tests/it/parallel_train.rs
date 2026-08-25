@@ -345,6 +345,78 @@ fn train_loop_signature_is_text_free() {
     assert!(report.final_loss < 0.1, "final loss {}", report.final_loss);
 }
 
+/// B2/B3 last-step lattice row: **`parallel_train.rs`'s `train_loop`**.
+/// `is_last_step` here is `total_steps + 1 >= total_run_steps`, computed
+/// against `total_run_steps = epochs.saturating_mul(batches.len())` — already
+/// this arm's TRUE horizon (one optimizer step per batch per epoch, known
+/// upfront), so this call site was never the wrong-horizon bug B2 fixed
+/// elsewhere. This test is the RED-first coverage oracle B3 asked for at this
+/// specific call site (`parallel_train.rs:144`): a 3-batch, 1-epoch run is
+/// far short of `DEFAULT_NORM_CHECK_INTERVAL` (50), so only `step == 1`
+/// (unconditional) and `is_last_step` (this run's actual final step, batch
+/// index 2) can ever surface a non-finite gradient — a divergence confined to
+/// the LAST batch is invisible to the modulo cadence alone.
+///
+/// Mutation tried: hardcode `is_last_step = false` at the
+/// `parallel_train.rs:144` call site — this test goes red: the call returns
+/// `Ok` and the NaN weight trains in silently instead of surfacing the typed
+/// non-finite refusal.
+#[test]
+fn train_loop_surfaces_a_nonfinite_gradient_on_the_runs_last_batch() {
+    let dev = Device::Cpu;
+    let varmap = VarMap::new();
+    let w = Var::from_vec(vec![1.0f32], (1,), &dev).unwrap();
+    varmap
+        .data()
+        .lock()
+        .unwrap()
+        .insert("w".to_string(), w.clone());
+
+    // Three batches; only the LAST one's features are NaN, so only its
+    // gradient is non-finite — a divergence exactly on the run's final step,
+    // not its first (which the unconditional `step == 1` check would catch
+    // regardless of `is_last_step`, so would not distinguish this bug).
+    let good_batch = |v: f32| TensorBatch {
+        features: Tensor::from_vec(vec![v], (1, 1), &dev).unwrap(),
+        targets: Tensor::from_vec(vec![v + 1.0], (1, 1), &dev).unwrap(),
+    };
+    let bad_batch = TensorBatch {
+        features: Tensor::from_vec(vec![f32::NAN], (1, 1), &dev).unwrap(),
+        targets: Tensor::from_vec(vec![0.0f32], (1, 1), &dev).unwrap(),
+    };
+    let batches = vec![good_batch(1.0), good_batch(2.0), bad_batch];
+
+    let w_for_model = w.clone();
+    let err = train_loop(
+        &varmap,
+        &batches,
+        &ParallelTrainConfig {
+            epochs: 1,
+            learning_rate: 0.01,
+            weight_decay: 0.0,
+            grad_clip: 1.0,
+        },
+        &std::sync::atomic::AtomicBool::new(false),
+        move |batch: &TensorBatch| {
+            let wt: &Tensor = &w_for_model;
+            batch.features.broadcast_add(wt).map_err(into_err)
+        },
+        |preds, batch: &TensorBatch| {
+            let diff = (preds - &batch.targets).map_err(into_err)?;
+            diff.sqr().map_err(into_err)?.mean_all().map_err(into_err)
+        },
+    )
+    .expect_err(
+        "a NaN gradient on the run's last batch must surface a typed non-finite refusal, \
+         not train silently",
+    );
+
+    assert!(
+        err.to_string().contains("non-finite"),
+        "expected a non-finite grad-norm refusal, got: {err}"
+    );
+}
+
 fn into_err(e: candle_core::Error) -> jammi_db::error::JammiError {
     jammi_db::error::JammiError::FineTune(format!("{e}"))
 }

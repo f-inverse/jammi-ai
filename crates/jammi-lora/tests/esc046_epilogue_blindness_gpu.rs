@@ -74,7 +74,11 @@ fn fused_vs_eager_forced_arm_ab_is_bit_identical_both_pre_and_post_fix_bf16_cuda
 
     let build = |bias: bool| -> LoraLinear {
         let varmap = VarMap::new();
-        let vb = VarBuilder::from_varmap(&varmap, DType::BF16, &device);
+        // `lora_a`/`lora_b` must be `F32` (this op's own domain — see
+        // `lora_linear_admission_predicate`'s `lora_ab_dtype_f32` check);
+        // only the BASE weight (passed in directly as an already-built
+        // `Linear` below, never allocated through `vb`) is `BF16`.
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
         let base_bias = bias.then(|| Tensor::zeros((out_features,), DType::BF16, &device).unwrap());
         let base = Linear::new(w.clone(), base_bias);
         let mut lora = LoraLinear::new(

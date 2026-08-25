@@ -68,12 +68,16 @@
 //! ## The window is construction data at the CALL SITE, not this op (family D)
 //!
 //! This op has no `window`/`half_window` field and computes no band
-//! predicate of its own. A local-attention layer's sliding-window band is
-//! `jammi_encoders::mask::sliding_window_mask`'s job, built ONCE per
-//! `(seq, half_window, dtype, device)` by the call site's own cache
-//! (`ModernBert::band_cache`/`sliding_band`) and summed into the padding
-//! mask BEFORE this op ever runs — the caller passes this op ONE already-
-//! combined additive mask, exactly the shape
+//! predicate of its own. Whatever band a local-attention caller wants is
+//! the caller's construction data: the VALUE contract this op relies on
+//! is only that `mask[b, q, k]` is `0.0` for an attendable key and a
+//! value `< 0.0` at the [`WINDOW_MASKED_VALUE`] magnitude for a masked
+//! one — how the caller builds, caches, or combines the padding and band
+//! terms into that value is outside this op's knowledge (family L: this
+//! crate names no consumer, so no consumer's cache is a premise here; the
+//! sentinel-equality pin lives on the consumer side, in its own mask
+//! module). The caller passes this op ONE already-combined additive
+//! mask, exactly the shape
 //! [`super::SoftmaxLastDimFused`] already accepts (`[batch|1, 1, seq|1,
 //! seq]` — see that op's module doc's "supported mask broadcast class").
 //! Earlier revisions of this op re-derived the SAME band predicate three

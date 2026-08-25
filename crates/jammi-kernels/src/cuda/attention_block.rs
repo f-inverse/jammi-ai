@@ -28,10 +28,10 @@
 //!
 //! [`crate::ops::attention_block`]'s module doc states this op has no
 //! `window`/`half_window` construction data at all: the caller pre-combines
-//! its padding mask with any sliding-window band (`jammi_encoders::mask
-//! ::sliding_window_mask`, built once per `(seq, half_window, dtype,
-//! device)` by the call site's own cache) BEFORE this op ever runs, so
-//! `s3`/`l3` here are already the final additive mask —
+//! its padding mask with any sliding-window band into ONE additive value
+//! per `(batch, query, key)` BEFORE this op ever runs (how it builds or
+//! caches that combination is the caller's business, not a premise of
+//! this file), so `s3`/`l3` here are already the final additive mask —
 //! [`crate::ops::SoftmaxLastDimFused`]'s `cuda_fwd` is handed `s3`/`l3`
 //! DIRECTLY, with no scratch-mask build, no host-to-device band upload,
 //! and no `broadcast_as`/`binary_impl::<Add>` combination step in this

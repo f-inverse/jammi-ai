@@ -2653,10 +2653,14 @@ mod tests {
     /// A minimal `ModernBertAttention` at `head_dim ==
     /// ATTENTION_BLOCK_HEAD_DIM`, for exercising
     /// `forward_training_attention`/`forward_eager_training_attention_composition`
-    /// directly without loading a real checkpoint. `wqkv`/`wo` are never
-    /// invoked by either of those two methods (both operate on an
-    /// already-projected `qkv` tensor supplied by the CALLER), so their
-    /// weights are placeholder zeros.
+    /// directly (both operate on an already-projected `qkv` supplied by
+    /// the CALLER) AND `ModernBertAttention::forward` itself (which DOES
+    /// run `wqkv`/`wo`) without loading a real checkpoint. `wqkv`/`wo`
+    /// carry NON-DEGENERATE, deterministic seeded weights: an earlier
+    /// revision used zeros, under which `qkv ≡ 0`, every score was `0`,
+    /// `wo(ctx) + hidden == hidden` for ANY `ctx`, and the eval
+    /// bit-identity test below passed with the mask add deleted — a
+    /// vacuous oracle (audit B2).
     fn attention_block_fixture(
         is_local: bool,
         h: usize,
@@ -2665,17 +2669,23 @@ mod tests {
     ) -> ModernBertAttention {
         use candle_nn::Linear;
         let d = ATTENTION_BLOCK_HEAD_DIM;
-        let placeholder_wqkv = Linear::new(
-            Tensor::zeros((3 * h * d, h * d), DType::F32, device).unwrap(),
+        let wqkv_v: Vec<f32> = (0..3 * h * d * h * d)
+            .map(|i| ((i as f32) * 0.0137).sin() * 0.2)
+            .collect();
+        let wo_v: Vec<f32> = (0..h * d * h * d)
+            .map(|i| ((i as f32) * 0.0091).cos() * 0.2)
+            .collect();
+        let seeded_wqkv = Linear::new(
+            Tensor::from_vec(wqkv_v, (3 * h * d, h * d), device).unwrap(),
             None,
         );
-        let placeholder_wo = Linear::new(
-            Tensor::zeros((h * d, h * d), DType::F32, device).unwrap(),
+        let seeded_wo = Linear::new(
+            Tensor::from_vec(wo_v, (h * d, h * d), device).unwrap(),
             None,
         );
         ModernBertAttention {
-            wqkv: MaybeLoraLinear::Frozen(placeholder_wqkv),
-            wo: MaybeLoraLinear::Frozen(placeholder_wo),
+            wqkv: MaybeLoraLinear::Frozen(seeded_wqkv),
+            wo: MaybeLoraLinear::Frozen(seeded_wo),
             attn_norm: None,
             rope: Arc::new(rope(d, seq_for_table, 10_000.0, device)),
             is_local,
@@ -2914,6 +2924,15 @@ mod tests {
     /// reaches `AttentionBlockFused`, not merely that this fixture happens
     /// to fail admission) — plus that `ATTENTION_BLOCK_DISPATCH_COUNTERS`
     /// does not move at all during the eval call.
+    ///
+    /// The mask carries REAL padding (batch 0 pads its last key, batch 1
+    /// its last two) and the fixture's weights are non-degenerate, so
+    /// the mask add is load-bearing: the test asserts the padded
+    /// reference differs from an unpadded one (non-vacuity), and reddens
+    /// under BOTH audit-B2 mutations (verified, reverted): deleting
+    /// `scores.broadcast_add(&extended_mask)` in `forward_eval_attention`
+    /// (outputs differ from the hand composition), and inverting the
+    /// fused-eligibility assertion's predicate (`assert!(!holds)`).
     #[test]
     fn attention_block_eval_output_is_bit_identical_regardless_of_fused_eligibility() {
         let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
@@ -2924,7 +2943,14 @@ mod tests {
         let n = b * s * h * d;
         let hidden_v: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.037).sin() * 0.5).collect();
         let hidden = Tensor::from_slice(&hidden_v, (b, s, h * d), &device).unwrap();
-        let mask = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
+        // Per-batch-VARYING padding, in the exact additive form
+        // `extended_attention_mask` produces (`0.0` real, `MASKED_LOGIT`
+        // pad): batch 0 pads key 4, batch 1 pads keys 3 and 4.
+        let mut mask_v = vec![0f32; b * s];
+        mask_v[s - 1] = crate::mask::MASKED_LOGIT;
+        mask_v[s + (s - 2)] = crate::mask::MASKED_LOGIT;
+        mask_v[s + (s - 1)] = crate::mask::MASKED_LOGIT;
+        let mask = Tensor::from_slice(&mask_v, (b, 1, 1, s), &device).unwrap();
 
         let mut attn = attention_block_fixture(false, h, s, &device);
         attn.set_training(false);
@@ -2972,22 +2998,34 @@ mod tests {
         let scores =
             crate::contiguous_matmul(&q, &k.transpose(D::Minus1, D::Minus2).unwrap()).unwrap();
         let scores = (scores / scale).unwrap();
-        let scores = scores.broadcast_add(&mask).unwrap();
-        let p = candle_nn::ops::softmax(&scores, D::Minus1).unwrap();
-        let ctx = crate::contiguous_matmul(&p, &v)
-            .unwrap()
-            .transpose(1, 2)
-            .unwrap()
-            .contiguous()
-            .unwrap()
-            .reshape((b, s, h * d))
-            .unwrap();
-        let before_ref: Vec<f32> = (attn.wo.forward(&ctx).unwrap() + &hidden)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1()
-            .unwrap();
+        let compose = |scores: &Tensor| -> Vec<f32> {
+            let p = candle_nn::ops::softmax(scores, D::Minus1).unwrap();
+            let ctx = crate::contiguous_matmul(&p, &v)
+                .unwrap()
+                .transpose(1, 2)
+                .unwrap()
+                .contiguous()
+                .unwrap()
+                .reshape((b, s, h * d))
+                .unwrap();
+            (attn.wo.forward(&ctx).unwrap() + &hidden)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap()
+        };
+        let before_ref = compose(&scores.broadcast_add(&mask).unwrap());
+        // Non-vacuity: with real weights and real padding, the mask add
+        // changes the output — otherwise the assertion below could not
+        // tell a `forward_eval_attention` that dropped its mask add from
+        // one that kept it.
+        let unmasked_ref = compose(&scores);
+        assert_ne!(
+            before_ref, unmasked_ref,
+            "the padded mask must change the output on this fixture, or the mask add is \
+             not under test"
+        );
 
         let counters_before = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
         let after: Vec<f32> = attn

@@ -3860,6 +3860,10 @@ fn assert_attention_block_parity_f32(
     let mask_v = vec![0f32; batch * seq];
     let scale = 1.0 / (head_dim as f32).sqrt();
     let op = AttentionBlockFused::new(scale, FullyMaskedPolicy::Zeros, true).unwrap();
+    // A NON-UNIFORM gradient seed (audit B11): `sum_all().backward()`'s
+    // all-ones `dy` cancels exactly the class of scatter/transpose bug
+    // this cross-device oracle exists to catch.
+    let dy_v = attention_dy_fixture(batch * seq * heads * head_dim, 3.0);
 
     let qkv_cpu = Var::from_tensor(
         &Tensor::from_slice(qkv_v, (batch, seq, 3, heads, head_dim), &cpu).unwrap(),
@@ -3867,11 +3871,17 @@ fn assert_attention_block_parity_f32(
     .unwrap();
     let rope_cpu = Tensor::from_slice(&rope_v, (2, 1, 1, seq, head_dim), &cpu).unwrap();
     let mask_cpu = combined_attention_mask(&cpu, batch, seq, &mask_v, window);
+    let dy_cpu = Tensor::from_slice(&dy_v, (batch, seq, heads * head_dim), &cpu).unwrap();
     let out_cpu = qkv_cpu
         .as_tensor()
         .apply_op3(&rope_cpu, &mask_cpu, op)
         .unwrap();
-    let grads_cpu = out_cpu.sum_all().unwrap().backward().unwrap();
+    let grads_cpu = (&out_cpu * &dy_cpu)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .backward()
+        .unwrap();
 
     let qkv_gpu = Var::from_tensor(
         &Tensor::from_slice(qkv_v, (batch, seq, 3, heads, head_dim), cuda).unwrap(),
@@ -3879,11 +3889,17 @@ fn assert_attention_block_parity_f32(
     .unwrap();
     let rope_gpu = Tensor::from_slice(&rope_v, (2, 1, 1, seq, head_dim), cuda).unwrap();
     let mask_gpu = combined_attention_mask(cuda, batch, seq, &mask_v, window);
+    let dy_gpu = Tensor::from_slice(&dy_v, (batch, seq, heads * head_dim), cuda).unwrap();
     let out_gpu = qkv_gpu
         .as_tensor()
         .apply_op3(&rope_gpu, &mask_gpu, op)
         .unwrap();
-    let grads_gpu = out_gpu.sum_all().unwrap().backward().unwrap();
+    let grads_gpu = (&out_gpu * &dy_gpu)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .backward()
+        .unwrap();
 
     let out_cpu_v: Vec<f32> = out_cpu.flatten_all().unwrap().to_vec1().unwrap();
     let out_gpu_v: Vec<f32> = out_gpu

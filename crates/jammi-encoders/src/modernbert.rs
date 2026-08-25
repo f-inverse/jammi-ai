@@ -3102,6 +3102,104 @@ mod tests {
         );
     }
 
+    /// THE end-to-end proof for P6 Stage B B3-dense: on the SAME
+    /// `tests/fixtures/tiny_modernbert_head64` checkpoint, a DENSE
+    /// (all-ones, no padding) mask, CUDA, bf16 — `attention_block_flash`
+    /// actually dispatches `Fused` (count == `num_hidden_layers`), the
+    /// BLOCK arm's own counter does NOT move for those layers (flash took
+    /// over, not a second arm racing it), `attention_block_flash.declined
+    /// == 0`, and the output is finite. On a build WITHOUT the
+    /// `flash-attn` feature (`cuda` alone), `FLASH_COMPILED` is `false`,
+    /// so the SAME assertions invert: the cascade declines and the block
+    /// arm fires instead — this test is meaningful (and green) under
+    /// EITHER feature combination, not just the real one.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn forward_hidden_dispatches_attention_block_flash_fused_on_a_dense_cuda_bf16_checkpoint() {
+        let Some(device) = growth_oracle_cuda_device() else {
+            return;
+        };
+        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _d2h_guard = FLASH_D2H_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/tiny_modernbert_head64");
+        let config: ModernBertConfig =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                .unwrap();
+        let weights = dir.join("model.safetensors");
+        let varmap = candle_nn::VarMap::new();
+        let mut model = ModernBert::builder()
+            .backbone_dtype(DType::BF16)
+            .build(&[weights.as_path()], &config, &device, &varmap)
+            .unwrap();
+        // Dense: every row real, no padding -- `decide_flash_admission`'s
+        // dense split (`build_flash_forward_decision`) keeps the real
+        // `Holds`.
+        let input_ids =
+            Tensor::new(&[[2u32, 5, 10, 3, 7, 9], [4u32, 8, 1, 6, 9, 2]], &device).unwrap();
+        let mask = Tensor::new(&[[1u32, 1, 1, 1, 1, 1], [1u32, 1, 1, 1, 1, 1]], &device).unwrap();
+
+        model.set_training(true);
+        let block_before = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+        let flash_before = cascade_counters_for("attention_block_flash").snapshot();
+        let out = model.forward_hidden(&input_ids, &mask).unwrap();
+        let block_after = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+        let flash_after = cascade_counters_for("attention_block_flash").snapshot();
+
+        let out_f32: Vec<f32> = out
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert!(
+            out_f32.iter().all(|x| x.is_finite()),
+            "training output must be finite"
+        );
+
+        if jammi_kernels::admission::FLASH_COMPILED {
+            assert_eq!(
+                flash_after.fused - flash_before.fused,
+                config.num_hidden_layers as u64,
+                "attention_block_flash must dispatch Fused on every layer of a dense bf16 \
+                 batch on this build: {flash_before:?} -> {flash_after:?}"
+            );
+            assert_eq!(
+                flash_after.declined, flash_before.declined,
+                "a dense batch must never decline on this build"
+            );
+            assert_eq!(
+                flash_after.eager, flash_before.eager,
+                "always 0 -- see CascadeDispatchCounters's doc"
+            );
+            assert_eq!(
+                block_after.fused, block_before.fused,
+                "the block arm must NOT ALSO fire for layers the flash arm already handled"
+            );
+        } else {
+            assert_eq!(
+                flash_after.declined - flash_before.declined,
+                config.num_hidden_layers as u64,
+                "without the flash-attn feature, FLASH_COMPILED is false and every layer \
+                 declines at the cheap capability gate"
+            );
+            assert_eq!(
+                flash_after.fused, flash_before.fused,
+                "attention_block_flash cannot dispatch Fused without the flash-attn feature"
+            );
+            assert_eq!(
+                block_after.fused - block_before.fused,
+                config.num_hidden_layers as u64,
+                "the block arm must fire for every layer instead"
+            );
+        }
+    }
+
     /// Path P's encoders-side seam (`forward_hidden_with_lengths`, contract
     /// v5 item 3): `lengths: None` is byte-identical to `forward_hidden`,
     /// and — on THIS build (no CUDA / no flash-attn feature, so the flash

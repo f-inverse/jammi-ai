@@ -5350,3 +5350,261 @@ fn attention_block_bf16_three_way_vs_f32_reference_b1_and_b8_cuda() {
     three_way_vs_f32_reference(&cuda, 1, 512, 16, 64, Some(64), 40.0, 12.0);
     three_way_vs_f32_reference(&cuda, 8, 512, 16, 64, Some(64), 40.0, 12.0);
 }
+
+// =======================================================================
+// RopePositionsFused CPU<->CUDA parity + THE B3-dense identity oracle
+// (P6 Stage B B3-dense, contract v5 §3.6): `rope_positions_fused` on the
+// packed `[total, 3, h, d]` buffer is bit-identical to `RopeFused` on the
+// SAME data in `[b, h, s, d]` form (the block arm's own operand shape,
+// `gather_bhsd`'s target) -- run here on CUDA, bf16, production head_dim
+// (64), both a GLOBAL-style theta (160_000, ModernBERT's
+// `global_rope_theta`) and a LOCAL-style theta (10_000,
+// `local_rope_theta`, contract v5's "both bases"), b1 AND b8, s128 AND
+// s512. RED control: sign flipped must NOT match.
+// =======================================================================
+
+fn rope_positions(
+    seq: usize,
+    negate_sin: bool,
+    qkv: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+) -> candle_core::Result<Tensor> {
+    apply3(
+        qkv,
+        cos,
+        sin,
+        jammi_kernels::ops::RopePositionsFused::new(seq, negate_sin),
+    )
+}
+
+/// Packs a `[b, h, s, d]` tensor's own values into slot `slot` of a fresh
+/// `[b*s, 3, h, d]` `qkv` tensor (the other two slots filled from
+/// `filler`) -- same construction as `ops::rope_positions`'s own CPU
+/// oracle test, reused here at CUDA device + bf16 + production shape.
+fn pack_bhsd_into_qkv_dev(x_bhsd: &Tensor, filler: &Tensor, slot: usize) -> Tensor {
+    let (b, h, s, d) = x_bhsd.dims4().unwrap();
+    let x_bshd = x_bhsd.transpose(1, 2).unwrap().contiguous().unwrap();
+    let filler_bshd = filler.transpose(1, 2).unwrap().contiguous().unwrap();
+    let mut slots = Vec::with_capacity(3);
+    for i in 0..3 {
+        let src = if i == slot { &x_bshd } else { &filler_bshd };
+        slots.push(src.reshape((b * s, 1, h, d)).unwrap());
+    }
+    Tensor::cat(&slots, 1).unwrap()
+}
+
+fn unpack_qkv_slot_dev(qkv: &Tensor, slot: usize, b: usize, s: usize) -> Tensor {
+    let (total, _, h, d) = qkv.dims4().unwrap();
+    assert_eq!(total, b * s);
+    qkv.narrow(1, slot, 1)
+        .unwrap()
+        .reshape((b, s, h, d))
+        .unwrap()
+        .transpose(1, 2)
+        .unwrap()
+        .contiguous()
+        .unwrap()
+}
+
+fn to_bits_f32(t: &Tensor) -> Vec<u32> {
+    t.to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap()
+        .into_iter()
+        .map(f32::to_bits)
+        .collect()
+}
+
+fn assert_rope_positions_bit_identical_to_rope_fused_bf16(
+    cuda: &Device,
+    b: usize,
+    h: usize,
+    s: usize,
+    theta_base: f64,
+) {
+    let d = 64usize; // ModernBERT-large's real head_dim (production).
+    let n = b * h * s * d;
+    let xv = fixture(n, 1.0);
+    let fv = fixture(n, 7.0);
+    let xb: Vec<bf16> = xv.iter().map(|&v| bf16::from_f32(v)).collect();
+    let fb: Vec<bf16> = fv.iter().map(|&v| bf16::from_f32(v)).collect();
+    let cos_v = rope_table(s, d, theta_base);
+    let sin_v = rope_sin_table(s, d, theta_base);
+    let cb: Vec<bf16> = cos_v.iter().map(|&v| bf16::from_f32(v)).collect();
+    let sb: Vec<bf16> = sin_v.iter().map(|&v| bf16::from_f32(v)).collect();
+
+    let x_bhsd = Tensor::from_slice(&xb, (b, h, s, d), cuda).unwrap();
+    let filler_bhsd = Tensor::from_slice(&fb, (b, h, s, d), cuda).unwrap();
+    let cos = Tensor::from_slice(&cb, (1, 1, s, d), cuda).unwrap();
+    let sin = Tensor::from_slice(&sb, (1, 1, s, d), cuda).unwrap();
+
+    // Reference: RopeFused directly on [b,h,s,d] -- the block arm's own
+    // operand shape (`gather_bhsd`'s target).
+    let reference = rope(false, &x_bhsd, &cos, &sin).unwrap();
+
+    let qkv = pack_bhsd_into_qkv_dev(&x_bhsd, &filler_bhsd, 0);
+    let out = rope_positions(s, false, &qkv, &cos, &sin).unwrap();
+    let got_q = unpack_qkv_slot_dev(&out, 0, b, s);
+    assert_eq!(
+        to_bits_f32(&got_q),
+        to_bits_f32(&reference),
+        "rope_positions_fused (CUDA, bf16) on slot 0 (q) must be bit-identical to RopeFused on \
+         [b,h,s,d]: b={b} h={h} s={s} d={d} theta={theta_base}"
+    );
+
+    // V slot pass-through, byte-identical.
+    let got_v = unpack_qkv_slot_dev(&out, 2, b, s);
+    let expected_v = unpack_qkv_slot_dev(&qkv, 2, b, s);
+    assert_eq!(
+        to_bits_f32(&got_v),
+        to_bits_f32(&expected_v),
+        "rope_positions_fused (CUDA) must pass V through unchanged: b={b} h={h} s={s} d={d}"
+    );
+
+    // RED control: sign flipped must NOT reproduce the reference.
+    let out_negated = rope_positions(s, true, &qkv, &cos, &sin).unwrap();
+    let got_q_negated = unpack_qkv_slot_dev(&out_negated, 0, b, s);
+    assert_ne!(
+        to_bits_f32(&got_q_negated),
+        to_bits_f32(&reference),
+        "RED control: sign-flipped rope_positions_fused (CUDA) must NOT match the reference: \
+         b={b} h={h} s={s} d={d}"
+    );
+}
+
+#[test]
+fn rope_positions_bit_identical_to_rope_fused_bf16_b8_s512_global_theta_cuda() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    assert_rope_positions_bit_identical_to_rope_fused_bf16(&cuda, 8, 16, 512, 160_000.0);
+}
+
+#[test]
+fn rope_positions_bit_identical_to_rope_fused_bf16_b8_s512_local_theta_cuda() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    assert_rope_positions_bit_identical_to_rope_fused_bf16(&cuda, 8, 16, 512, 10_000.0);
+}
+
+#[test]
+fn rope_positions_bit_identical_to_rope_fused_bf16_b1_s512_cuda() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    assert_rope_positions_bit_identical_to_rope_fused_bf16(&cuda, 1, 16, 512, 160_000.0);
+}
+
+#[test]
+fn rope_positions_bit_identical_to_rope_fused_bf16_b8_s128_cuda() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    assert_rope_positions_bit_identical_to_rope_fused_bf16(&cuda, 8, 16, 128, 160_000.0);
+}
+
+/// CPU<->CUDA parity for `rope_positions_fused` itself (own op, own two
+/// arms -- distinct from the identity-vs-`RopeFused` oracle above), f32,
+/// mirroring `assert_rope_parity_f32`'s own tolerance and shape
+/// conventions (contiguous, production head_dim).
+#[test]
+fn rope_positions_parity_f32_contiguous_head_dim_64_cuda() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let cpu = Device::Cpu;
+    let (b, h, s, d) = (2usize, 3usize, 6usize, 64usize);
+    let total = b * s;
+    let n = total * 3 * h * d;
+    let qkv_v = fixture(n, 4.0);
+    let cos_v = rope_table(s, d, 10_000.0);
+    let sin_v = rope_sin_table(s, d, 10_000.0);
+
+    let qkv_cpu = Tensor::from_slice(&qkv_v, (total, 3, h, d), &cpu).unwrap();
+    let cos_cpu = Tensor::from_slice(&cos_v, (s, d), &cpu).unwrap();
+    let sin_cpu = Tensor::from_slice(&sin_v, (s, d), &cpu).unwrap();
+    let out_cpu: Vec<f32> = rope_positions(s, false, &qkv_cpu, &cos_cpu, &sin_cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    let qkv_gpu = Tensor::from_slice(&qkv_v, (total, 3, h, d), &cuda).unwrap();
+    let cos_gpu = Tensor::from_slice(&cos_v, (s, d), &cuda).unwrap();
+    let sin_gpu = Tensor::from_slice(&sin_v, (s, d), &cuda).unwrap();
+    let out_gpu: Vec<f32> = rope_positions(s, false, &qkv_gpu, &cos_gpu, &sin_gpu)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    assert_eq!(out_cpu.len(), n);
+    assert_eq!(out_gpu.len(), n, "rope_positions GPU fwd length mismatch");
+    for (i, (c, g)) in out_cpu.iter().zip(out_gpu.iter()).enumerate() {
+        assert!(
+            ((*c - *g).abs() as f64) <= F32_TOL,
+            "rope_positions fwd[{i}]: cpu {c} vs cuda {g}"
+        );
+    }
+}
+
+/// Proves the CUDA bwd path (sign-flip reuse) is exercised via
+/// `backward()`, matching `RopeFused`'s own gradcheck-style coverage; the
+/// RED control for this op is the sign-flip already asserted inside
+/// `assert_rope_positions_bit_identical_to_rope_fused_bf16` (this
+/// elementwise op has no `softmax_scale`-style injection analogue).
+#[test]
+fn rope_positions_bwd_reaches_qkv_gradient_cuda() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let (b, h, s, d) = (1usize, 2usize, 4usize, 64usize);
+    let total = b * s;
+    let n = total * 3 * h * d;
+    let qkv_v = fixture(n, 5.0);
+    let cos_v = rope_table(s, d, 10_000.0);
+    let sin_v = rope_sin_table(s, d, 10_000.0);
+    let qkv =
+        Var::from_tensor(&Tensor::from_slice(&qkv_v, (total, 3, h, d), &cuda).unwrap()).unwrap();
+    let cos = Tensor::from_slice(&cos_v, (s, d), &cuda).unwrap();
+    let sin = Tensor::from_slice(&sin_v, (s, d), &cuda).unwrap();
+    let out = rope_positions(s, false, &qkv, &cos, &sin).unwrap();
+    let loss = out.sum_all().unwrap();
+    let grads = loss.backward().unwrap();
+    let dqkv = grads.get(&qkv).expect("qkv must have a gradient");
+    assert_eq!(dqkv.dims(), qkv.dims());
+    let dqkv_v: Vec<f32> = dqkv
+        .to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert!(
+        dqkv_v.iter().all(|v| v.is_finite()),
+        "rope_positions dqkv must be finite everywhere"
+    );
+    // V slot's gradient must be the identity seed (1.0 from sum_all's
+    // ones-backward) -- RoPE never touches V forward or backward.
+    let dqkv_v_slot = unpack_qkv_slot_dev(dqkv, 2, b, s);
+    let dqkv_v_slot_vals: Vec<f32> = dqkv_v_slot
+        .to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert!(
+        dqkv_v_slot_vals.iter().all(|&v| (v - 1.0).abs() < 1e-5),
+        "rope_positions must pass V's gradient through as the identity (sum_all's ones-seed)"
+    );
+}

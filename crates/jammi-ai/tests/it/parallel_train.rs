@@ -427,6 +427,156 @@ fn train_loop_final_loss_matches_an_independent_forward_recomputation() {
     );
 }
 
+/// `train_loop`'s `ParamsAdamW { weight_decay: config.weight_decay, ..
+/// Default::default() }` must actually forward the CALLER's `weight_decay`
+/// — `ParamsAdamW::default()`'s own `weight_decay` is `0.01` (candle-nn
+/// `optim.rs`), not `0.0`, so a deleted `weight_decay` field silently uses
+/// `0.01` regardless of what `ParallelTrainConfig` asked for. Every OTHER
+/// test in this file sets `weight_decay: 0.0`, but never in a fixture where
+/// decay is the only thing that could move the weight, so a silent `0.01`
+/// substitution is invisible to a directional loss-convergence bound.
+///
+/// A DIFFERENTIAL design, not a zero-gradient one (a `d(loss)/dw == 0.0`
+/// fixture — e.g. `model_fn` scaling `w` by a literal `0.0` — turned out to
+/// give candle's autodiff nothing to insert into the `GradStore` at all: with
+/// no entry for `theta`, `AdamW::step`'s `if let Some(g) = grads.get(theta)`
+/// skips the whole update, decay included, so the weight is BIT-IDENTICAL
+/// either way and such a fixture cannot discriminate a forwarded
+/// `weight_decay` from a substituted one — checked empirically, not assumed).
+/// Two runs from the SAME initial weight, real (nonzero) gradient, and
+/// EVERYTHING else equal except `weight_decay`, over exactly one step:
+/// `AdamW::step`'s decoupled-decay update is `theta * (1 - lr*weight_decay) -
+/// lr*adjusted_grad`, where `adjusted_grad` depends only on the gradient
+/// (identical in both runs) — so the two runs' `next_theta` differ by exactly
+/// `lr * (weight_decay_b - weight_decay_a) * theta`, nonzero whenever
+/// `weight_decay_a != weight_decay_b` and `theta != 0`. A field-deleted
+/// `weight_decay` (silently `0.01` in EVERY run) collapses that gap to zero.
+///
+/// Mutation tried: delete the `weight_decay` field from the `ParamsAdamW`
+/// literal in `train_loop` — RED: both runs land on the SAME final weight
+/// (both silently decayed by the same substituted `0.01`) instead of two
+/// measurably different ones.
+#[test]
+fn train_loop_forwards_the_configured_weight_decay() {
+    let dev = Device::Cpu;
+
+    let run_once = |weight_decay: f64| -> f32 {
+        let varmap = VarMap::new();
+        let w = Var::from_vec(vec![5.0f32], (1,), &dev).unwrap();
+        varmap
+            .data()
+            .lock()
+            .unwrap()
+            .insert("w".to_string(), w.clone());
+
+        let features = Tensor::from_vec(vec![1.0f32], (1, 1), &dev).unwrap();
+        let targets = Tensor::from_vec(vec![0.0f32], (1, 1), &dev).unwrap();
+        let batches = vec![TensorBatch { features, targets }];
+
+        let w_for_model = w.clone();
+        train_loop(
+            &varmap,
+            &batches,
+            &ParallelTrainConfig {
+                epochs: 1,
+                learning_rate: 0.01,
+                weight_decay,
+                grad_clip: 1.0,
+            },
+            &std::sync::atomic::AtomicBool::new(false),
+            move |batch: &TensorBatch| {
+                let wt: &Tensor = &w_for_model;
+                wt.broadcast_mul(&batch.features).map_err(into_err)
+            },
+            |preds, batch: &TensorBatch| {
+                let diff = (preds - &batch.targets).map_err(into_err)?;
+                diff.sqr().map_err(into_err)?.mean_all().map_err(into_err)
+            },
+        )
+        .unwrap();
+
+        w.as_tensor().to_vec1::<f32>().unwrap()[0]
+    };
+
+    let w_after_no_decay = run_once(0.0);
+    let w_after_heavy_decay = run_once(10.0);
+    assert_ne!(
+        w_after_no_decay, w_after_heavy_decay,
+        "weight_decay: 0.0 vs 10.0 from the SAME initial weight and gradient must land on \
+         different final weights (a silently-substituted constant weight_decay would not)"
+    );
+}
+
+/// `train_loop`'s `batch_count += 1` must count every batch — `last_epoch_
+/// loss = epoch_loss / batch_count.max(1)` divides by that count, and every
+/// OTHER test in this file trains on exactly ONE batch per epoch, where a
+/// stuck-at-`0`-then-`.max(1)`-to-`1` counter is indistinguishable from a
+/// correct count of `1`. `learning_rate: 0.0` freezes the weights for the
+/// WHOLE run (AdamW's update is `lr * (...)`, so `lr == 0.0` makes every
+/// term — gradient AND weight decay — a no-op), so every batch in this
+/// fixture's epoch sees the SAME initial weights: `report.final_loss` must
+/// equal the exact arithmetic mean of three INDEPENDENTLY recomputed,
+/// distinct per-batch losses — not their sum (what a `batch_count` stuck at
+/// `1` would report instead of `3`).
+///
+/// Mutation tried: `replace += with *=` on `batch_count += 1` — RED: `0 *= 1`
+/// stays `0` forever, `.max(1)` floors it to `1`, and `report.final_loss`
+/// comes back as the SUM of the three batches' losses instead of their mean.
+#[test]
+fn train_loop_divides_by_the_true_batch_count() {
+    let dev = Device::Cpu;
+    let varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &dev);
+    let linear = candle_nn::linear(2, 1, vb.pp("l")).unwrap();
+
+    // Three distinct batches — distinct targets give three distinct
+    // per-batch losses on the SAME (frozen, `learning_rate: 0.0`) weights.
+    let batch_specs: [(f32, f32, f32); 3] = [(1.0, -2.0, 0.7), (3.0, 0.5, -1.3), (-1.0, 1.0, 2.0)];
+    let mut batches = Vec::new();
+    let mut expected_losses = Vec::new();
+    for &(x0, x1, target) in &batch_specs {
+        let features = Tensor::from_vec(vec![x0, x1], (1, 2), &dev).unwrap();
+        let targets = Tensor::from_vec(vec![target], (1, 1), &dev).unwrap();
+        let preds = linear.forward(&features).unwrap();
+        let diff = (&preds - &targets).unwrap();
+        let loss: f64 = diff
+            .sqr()
+            .unwrap()
+            .mean_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap() as f64;
+        expected_losses.push(loss);
+        batches.push(TensorBatch { features, targets });
+    }
+    let expected_mean: f64 = expected_losses.iter().sum::<f64>() / expected_losses.len() as f64;
+
+    let report = train_loop(
+        &varmap,
+        &batches,
+        &ParallelTrainConfig {
+            epochs: 1,
+            learning_rate: 0.0,
+            weight_decay: 0.0,
+            grad_clip: 1.0,
+        },
+        &std::sync::atomic::AtomicBool::new(false),
+        |batch: &TensorBatch| linear.forward(&batch.features).map_err(into_err),
+        |preds, batch: &TensorBatch| {
+            let diff = (preds - &batch.targets).map_err(into_err)?;
+            diff.sqr().map_err(into_err)?.mean_all().map_err(into_err)
+        },
+    )
+    .unwrap();
+
+    assert!(
+        (report.final_loss - expected_mean).abs() < 1e-6,
+        "final_loss ({}) must be the MEAN of the three batches' losses ({}), not their sum",
+        report.final_loss,
+        expected_mean
+    );
+}
+
 /// B2/B3 last-step lattice row: **`parallel_train.rs`'s `train_loop`**.
 /// `is_last_step` here is `total_steps + 1 >= total_run_steps`, computed
 /// against `total_run_steps = epochs.saturating_mul(batches.len())` — already

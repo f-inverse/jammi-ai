@@ -1428,6 +1428,8 @@ mod tests {
             geglu_eager_dispatches: 0,
             lora_epilogue_fused_dispatches: 0,
             lora_epilogue_eager_dispatches: 0,
+            lora_linear_fused_dispatches: 0,
+            lora_linear_eager_dispatches: 0,
             s_per_step_p50: Measurement::measured(0.1, "s"),
             s_per_step_mean: Measurement::measured(0.1, "s"),
             steps_per_s: Measurement::measured(10.0, "steps/s"),

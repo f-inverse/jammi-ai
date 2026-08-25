@@ -468,6 +468,160 @@ mod tests {
         assert_bit_identical(&v, &want_v);
     }
 
+    /// MUT-triage (cargo-mutants): `InplaceOp2::name`/`InplaceOp3::name`
+    /// feed every typed error's `op` field — a mutant that replaces either
+    /// `name()` body with `""` or `"xyzzy"` survives unless some test pins
+    /// the exact string, not just the error VARIANT. Exercises both ops'
+    /// `name()` through their `ShapeMismatchBinaryOp` path (the cheapest
+    /// domain check to trigger for both).
+    #[test]
+    fn error_op_field_names_are_pinned_exactly() {
+        let dev = Device::Cpu;
+        let m = Tensor::zeros((2,), DType::F32, &dev).unwrap();
+        let g = Tensor::from_slice(&[1.0f32, 2.0, 3.0], (3,), &dev).unwrap();
+        let err =
+            super::super::apply_inplace2(&m, &g, AdamMomentUpdate::new(0.9, false)).unwrap_err();
+        match err {
+            Error::ShapeMismatchBinaryOp { op, .. } => assert_eq!(op, "adamw_moment_update"),
+            other => panic!("expected ShapeMismatchBinaryOp, got {other:?}"),
+        }
+
+        let theta = Tensor::zeros((2,), DType::F32, &dev).unwrap();
+        let m2 = Tensor::zeros((2,), DType::F32, &dev).unwrap();
+        let v2 = Tensor::from_slice(&[1.0f32, 2.0, 3.0], (3,), &dev).unwrap();
+        let err = super::super::apply_inplace3(
+            &theta,
+            &m2,
+            &v2,
+            AdamThetaUpdate::new(1e-3, 0.01, 1.0, 1.0, 1e-8),
+        )
+        .unwrap_err();
+        match err {
+            Error::ShapeMismatchBinaryOp { op, .. } => assert_eq!(op, "adamw_theta_update"),
+            other => panic!("expected ShapeMismatchBinaryOp, got {other:?}"),
+        }
+    }
+
+    /// MUT-triage: a dtype mismatch BETWEEN the two `InplaceOp2` inputs
+    /// (not just an unsupported-but-agreeing dtype like F64/F64) must hit
+    /// the `s1.dtype() != s2.dtype()` guard specifically — the previous
+    /// `unsupported_dtype_is_refused_with_a_typed_error` test used F64 for
+    /// EVERY tensor, which never took this branch (all dtypes agreed, so
+    /// it fell straight to the catch-all `UnsupportedDTypeForOp` arm),
+    /// leaving `s1.dtype() != s2.dtype() -> false`, `!=` -> `==`, and
+    /// `||`/`&&` swap mutants on this guard undetected.
+    #[test]
+    fn mismatched_dtype_between_moment_and_grad_is_refused() {
+        let dev = Device::Cpu;
+        let m = Tensor::zeros((2,), DType::F32, &dev).unwrap();
+        let g = Tensor::from_slice(&[1.0f64, 2.0], (2,), &dev).unwrap();
+        let err = super::super::apply_inplace2(&m, &g, AdamMomentUpdate::new(0.9, false))
+            .expect_err("F32 moment vs F64 grad must be refused, not silently reinterpreted");
+        assert!(matches!(err, Error::DTypeMismatchBinaryOp { .. }));
+    }
+
+    /// MUT-triage: same class of gap as
+    /// `mismatched_dtype_between_moment_and_grad_is_refused`, for
+    /// `AdamThetaUpdate`'s two-condition OR guard
+    /// (`s1.dtype() != s2.dtype() || s1.dtype() != s3.dtype()`) — covers
+    /// BOTH disjuncts (m mismatched, then v mismatched) so a `||` -> `&&`
+    /// swap or either `!=` -> `==` swap cannot hide behind the other
+    /// disjunct still catching it.
+    #[test]
+    fn mismatched_dtype_between_theta_and_either_moment_is_refused() {
+        let dev = Device::Cpu;
+        let theta = Tensor::zeros((2,), DType::F32, &dev).unwrap();
+        let v_ok = Tensor::zeros((2,), DType::F32, &dev).unwrap();
+        let m_wrong = Tensor::from_slice(&[1.0f64, 2.0], (2,), &dev).unwrap();
+        let err = super::super::apply_inplace3(
+            &theta,
+            &m_wrong,
+            &v_ok,
+            AdamThetaUpdate::new(1e-3, 0.01, 1.0, 1.0, 1e-8),
+        )
+        .expect_err("F32 theta vs F64 m must be refused");
+        // MUT-triage: pin the exact `lhs`/`rhs` reported, not just the
+        // error VARIANT — the inner `if s1.dtype() != s2.dtype() { .. }
+        // else { .. }` (line 241) selects WHICH mismatched pair to report;
+        // a `!=` -> `==` mutant there flips it to report the (agreeing)
+        // theta/v pair instead of the actually-mismatched theta/m pair,
+        // invisible to a `matches!` check alone.
+        match err {
+            Error::DTypeMismatchBinaryOp { lhs, rhs, .. } => {
+                assert_eq!(lhs, DType::F32);
+                assert_eq!(rhs, DType::F64);
+            }
+            other => panic!("expected DTypeMismatchBinaryOp, got {other:?}"),
+        }
+
+        let m_ok = Tensor::zeros((2,), DType::F32, &dev).unwrap();
+        let v_wrong = Tensor::from_slice(&[1.0f64, 2.0], (2,), &dev).unwrap();
+        let err = super::super::apply_inplace3(
+            &theta,
+            &m_ok,
+            &v_wrong,
+            AdamThetaUpdate::new(1e-3, 0.01, 1.0, 1.0, 1e-8),
+        )
+        .expect_err("F32 theta vs F64 v must be refused");
+        match err {
+            Error::DTypeMismatchBinaryOp { lhs, rhs, .. } => {
+                assert_eq!(lhs, DType::F32);
+                assert_eq!(rhs, DType::F64);
+            }
+            other => panic!("expected DTypeMismatchBinaryOp, got {other:?}"),
+        }
+    }
+
+    /// MUT-triage: `AdamThetaUpdate::cpu_fwd`'s dtype-mismatch guard
+    /// (`s1.dtype() != s2.dtype() || s1.dtype() != s3.dtype()`) must be
+    /// `false` — reaching the catch-all `UnsupportedDTypeForOp` arm, NOT
+    /// `DTypeMismatchBinaryOp` — when theta/m/v all AGREE with each other
+    /// but on a dtype other than F32. `adamw_step_fused`'s own
+    /// `unsupported_dtype_is_refused_with_a_typed_error` test never
+    /// exercises this: it feeds F64 to `first_moment`/`grad` too, so
+    /// `AdamMomentUpdate`'s OWN catch-all fires first and short-circuits
+    /// before `AdamThetaUpdate` is ever called — this test calls
+    /// `AdamThetaUpdate` directly to close that gap.
+    #[test]
+    fn all_agreeing_non_f32_dtype_hits_the_catchall_not_a_mismatch_error() {
+        let dev = Device::Cpu;
+        let theta = Tensor::from_slice(&[1.0f64, 2.0], (2,), &dev).unwrap();
+        let m = Tensor::zeros((2,), DType::F64, &dev).unwrap();
+        let v = Tensor::zeros((2,), DType::F64, &dev).unwrap();
+        let err = super::super::apply_inplace3(
+            &theta,
+            &m,
+            &v,
+            AdamThetaUpdate::new(1e-3, 0.01, 1.0, 1.0, 1e-8),
+        )
+        .expect_err("F64 has no AdamThetaUpdate CPU implementation (F32 only)");
+        assert!(
+            matches!(err, Error::UnsupportedDTypeForOp(..)),
+            "all-agreeing-but-non-F32 must hit the catch-all arm, not \
+             DTypeMismatchBinaryOp (which requires an actual disagreement \
+             between the three dtypes) — got {err:?}"
+        );
+    }
+
+    /// MUT-triage: `eps=1e-8` in every other test in this file is far
+    /// below `v_hat.sqrt()`'s magnitude at `f32` precision, so `+ eps` and
+    /// a mutated `- eps` round to the SAME bits — the mutant on
+    /// `crates/jammi-kernels/src/ops/adamw_step.rs:234` (`+` -> `-` in
+    /// `let denom = v_hat.sqrt() + eps;`) survived every bit-identity test
+    /// for exactly this reason. `eps` here is large enough, relative to a
+    /// small `v`, that `+`/`-` produce OBSERVABLY different `f32` bits.
+    #[test]
+    fn large_eps_relative_to_v_hat_matches_bit_for_bit() {
+        let (theta, m, v, g) = setup(&[1.0, -0.5], &[0.01, 0.02], (2,));
+        let eps = 0.25; // v starts at 0, so v_hat after one step is tiny — eps dominates.
+        let (want_theta, want_m, want_v) =
+            eager_step(&theta, &m, &v, &g, 0.9, 0.999, 1e-3, 0.01, eps, 1);
+        run_fused(&theta, &m, &v, &g, 0.9, 0.999, 1e-3, 0.01, eps, 1);
+        assert_bit_identical(&theta, &want_theta);
+        assert_bit_identical(&m, &want_m);
+        assert_bit_identical(&v, &want_v);
+    }
+
     /// Boundary oracle: `theta`/`g` identical everywhere (a common
     /// initialization for the LoRA `B` matrix, which starts at zero — see
     /// `lora_linear.rs:408`), so `g == 0` too — degenerate zero-gradient

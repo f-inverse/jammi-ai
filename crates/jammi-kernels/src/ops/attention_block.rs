@@ -1110,6 +1110,146 @@ mod tests {
         }
     }
 
+    /// Audit B1: no `bwd` oracle existed under a window arm at all —
+    /// deleting the band combination from a caller's mask entirely stayed
+    /// green, because every existing `bwd`-exercising test used
+    /// `window=None`. This is the fwd+bwd bit-exact proof, at a boundary
+    /// shape `(3, 9, 2, 64)` and a production-scale shape
+    /// `(2, 128, 16, 64)`, with a per-batch-VARYING padding mask (audit B2
+    /// — a `mrow_base` bug would silently broadcast one batch element's
+    /// row onto every other) and a genuinely non-uniform `dy` seed (audit
+    /// B11 — `sum_all().backward()`'s all-ones seed cancels exactly the
+    /// class of bug this oracle exists to catch). `assert_eq!` throughout:
+    /// F32 CPU, the SAME op sequence (`RopeFused` + matmul +
+    /// `SoftmaxLastDimFused` + matmul) either way, so the rounding model
+    /// predicts bit-exact equality, not a tolerance.
+    #[test]
+    fn cpu_fwd_and_bwd_bit_exact_vs_eager_with_window_nonuniform_dy_and_per_batch_mask() {
+        for &(b, h, s, d) in &[
+            (3usize, 2usize, 9usize, HEAD_DIM),
+            (2usize, 16usize, 128usize, HEAD_DIM),
+        ] {
+            let device = Device::Cpu;
+            let n = b * s * 3 * h * d;
+            let half_window = (s / 4).max(1);
+
+            // Per-batch-VARYING padding: batch `bi` pads its last
+            // `bi % (s/2).max(1)` keys — batch 0 is unpadded, later
+            // batches pad an increasing, DIFFERENT number of keys, so a
+            // hardcoded `mrow_base = 0` (always reading batch 0's row)
+            // would diverge from the correct per-batch mask visibly.
+            let mut mask_v = vec![0f32; b * s];
+            for bi in 0..b {
+                let pad = (bi % (s / 2).max(1)).min(s.saturating_sub(1));
+                for ki in (s - pad)..s {
+                    mask_v[bi * s + ki] = -10_000.0;
+                }
+            }
+            let mask = Tensor::from_vec(mask_v, (b, 1, 1, s), &device).unwrap();
+            let band =
+                test_sliding_window_band(s, half_window, mask.dtype(), mask.device()).unwrap();
+            let combined_mask = mask.broadcast_add(&band).unwrap();
+
+            let qkv0: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.013).sin() * 0.4).collect();
+            let qkv = Var::from_tensor(
+                &Tensor::from_vec(qkv0.clone(), (b, s, 3, h, d), &device).unwrap(),
+            )
+            .unwrap();
+            let (cos, sin) = rope_tables(s, d, &device);
+            let rope_pack = pack_rope(&cos, &sin).unwrap();
+            let scale = 1.0 / (d as f32).sqrt();
+            let dy_v: Vec<f32> = (0..(b * s * h * d))
+                .map(|i| ((i as f32) * 0.029).cos() * 0.6 + 0.05)
+                .collect();
+            let dy = Tensor::from_vec(dy_v, (b, s, h * d), &device).unwrap();
+
+            // Fused op under test.
+            let op = AttentionBlockFused::new(scale, FullyMaskedPolicy::Zeros, true).unwrap();
+            let out_fused = qkv
+                .as_tensor()
+                .apply_op3(&rope_pack, &combined_mask, op)
+                .unwrap();
+            let loss_fused = (&out_fused * &dy).unwrap().sum_all().unwrap();
+            let grads_fused = loss_fused.backward().unwrap();
+            let dqkv_fused: Vec<f32> = grads_fused
+                .get(&qkv)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let out_fused_v: Vec<f32> = out_fused.flatten_all().unwrap().to_vec1().unwrap();
+
+            // Independent eager reference, driven from the SAME `qkv` Var
+            // (narrow/transpose q/k/v out of it) so gradients accumulate
+            // into the SAME tensor `AttentionBlockFused`'s own `dqkv`
+            // scatter is compared against.
+            let qkv_eager =
+                Var::from_tensor(&Tensor::from_vec(qkv0, (b, s, 3, h, d), &device).unwrap())
+                    .unwrap();
+            let q0 = qkv_eager
+                .as_tensor()
+                .narrow(2, 0, 1)
+                .unwrap()
+                .squeeze(2)
+                .unwrap()
+                .transpose(1, 2)
+                .unwrap()
+                .contiguous()
+                .unwrap();
+            let k0 = qkv_eager
+                .as_tensor()
+                .narrow(2, 1, 1)
+                .unwrap()
+                .squeeze(2)
+                .unwrap()
+                .transpose(1, 2)
+                .unwrap()
+                .contiguous()
+                .unwrap();
+            let v0 = qkv_eager
+                .as_tensor()
+                .narrow(2, 2, 1)
+                .unwrap()
+                .squeeze(2)
+                .unwrap()
+                .transpose(1, 2)
+                .unwrap()
+                .contiguous()
+                .unwrap();
+            let out_eager = eager_reference(
+                &q0,
+                &k0,
+                &v0,
+                Some(&cos),
+                Some(&sin),
+                &combined_mask,
+                scale,
+                FullyMaskedPolicy::Zeros,
+            )
+            .unwrap();
+            let loss_eager = (&out_eager * &dy).unwrap().sum_all().unwrap();
+            let grads_eager = loss_eager.backward().unwrap();
+            let dqkv_eager: Vec<f32> = grads_eager
+                .get(&qkv_eager)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let out_eager_v: Vec<f32> = out_eager.flatten_all().unwrap().to_vec1().unwrap();
+
+            assert_eq!(
+                out_fused_v, out_eager_v,
+                "fwd not bit-exact @ (b={b},h={h},s={s},d={d})"
+            );
+            assert_eq!(
+                dqkv_fused, dqkv_eager,
+                "dqkv not bit-exact @ (b={b},h={h},s={s},d={d})"
+            );
+        }
+    }
+
     #[test]
     fn fully_masked_row_under_zeros_policy_outputs_zero_context() {
         // A short sequence with a wide window and a padding mask that

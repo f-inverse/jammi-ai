@@ -407,6 +407,19 @@ enum Command {
         /// shape for an A/B on the same box.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         batched_forward: bool,
+        /// Comma-separated op key(s) this invocation INTENDS
+        /// `JAMMI_KERNELS_DISABLE` to carry. When set, the run hard-errors
+        /// unless `jammi_kernels::admission::disabled_ops_requested()`
+        /// reads back exactly this set — the binary controls its own argv,
+        /// so a dropped/mistyped/unforwarded `JAMMI_KERNELS_DISABLE` env
+        /// var (which otherwise reads identically to "nothing requested")
+        /// becomes a hard failure on the SAME invocation instead of
+        /// something a caller has to notice by eyeballing
+        /// `kernels_disabled_requested` in the emitted JSON report
+        /// afterward. See `finetune_step::FinetuneStepParams::expect_kernels_disabled`'s
+        /// doc.
+        #[arg(long)]
+        expect_kernels_disabled: Option<String>,
     },
     /// The CPU-hermetic cache-hit SLO tier: drives the engine's opt-in producer
     /// memoization (`CachePolicy::Use`) on a cacheable producer (the
@@ -487,6 +500,7 @@ async fn main() -> std::process::ExitCode {
             cuda,
             seed,
             batched_forward,
+            expect_kernels_disabled,
         } => run_finetune_step(finetune_step::FinetuneStepParams {
             model_dir,
             batch,
@@ -514,6 +528,23 @@ async fn main() -> std::process::ExitCode {
             cuda_device: cuda,
             seed,
             batched_forward,
+            // `--expect-kernels-disabled` and `JAMMI_KERNELS_DISABLE` are
+            // the SAME grammar (a caller states the same disable list two
+            // ways) — routed through the identical
+            // `jammi_kernels::admission::parse_disable_list` a genuine
+            // `JAMMI_KERNELS_DISABLE` read goes through, rather than a
+            // second, hand-rolled parser that could (and did) diverge on
+            // duplicate entries. Sorted into a `Vec` here (not left as a
+            // `HashSet`) because `disabled_ops_requested()` — what this
+            // gets compared against in `finetune_step::run` — is itself a
+            // sorted, deduplicated `Vec`.
+            expect_kernels_disabled: expect_kernels_disabled.map(|s| {
+                let mut v: Vec<String> = jammi_kernels::admission::parse_disable_list(Some(&s))
+                    .into_iter()
+                    .collect();
+                v.sort();
+                v
+            }),
         }),
         Command::CacheSloScale => run_cache_slo_scale().await,
         Command::RecomputeScale => run_recompute_scale().await,
@@ -522,8 +553,12 @@ async fn main() -> std::process::ExitCode {
 
 /// The `finetune-step` subcommand: run the tier and emit the report. Records;
 /// does not gate. Exits non-zero only when the step could not be measured at
-/// all — a missing checkpoint, a target-module set that matched no linear, or a
-/// device that could not be resolved.
+/// all — a missing checkpoint, a target-module set that matched no linear, a
+/// device that could not be resolved, or (contract K-aux)
+/// `JAMMI_KERNELS_DISABLE` naming an op key that never disabled a live
+/// dispatch this run (`finetune_step::run`'s doc) — an INVALID run, reported
+/// as a failure rather than as a JSON tier with a suspiciously-clean
+/// dispatch split.
 fn run_finetune_step(params: finetune_step::FinetuneStepParams) -> std::process::ExitCode {
     let tier = match finetune_step::run(&params) {
         Ok(t) => t,

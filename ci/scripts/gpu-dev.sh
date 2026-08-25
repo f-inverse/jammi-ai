@@ -28,7 +28,10 @@
 # arch: a100 (default) | l40s | h100 | a40 | l4
 # --ref: branch, tag or commit the pod's checkout is placed on (default main).
 #        Verified against the remote BEFORE a pod is rented.
-# Env: RUNPOD_API_KEY (or ~/.config/runpod/key), RP_IMAGE, RP_TTL_HOURS (8).
+# Env: RUNPOD_API_KEY (or ~/.config/runpod/key), RP_IMAGE, RP_TTL_HOURS (8),
+#      RP_DISK_GB (60), RP_VOLUME_GB (0). Disk sizing rule of thumb: roughly
+#      25 GB base + 3 GB per concurrent agent target dir + 2 GB per
+#      `cargo mutants` job — a mutation-testing session wants >= 120 GB.
 set -uo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -58,7 +61,11 @@ arch: a100 (default) | l40s | h100 | a40 | l4
          against the remote before anything is rented. `up` does not move a live
          pod: `down` it first.
 Sessions are named after the arch; RP_SESSION overrides.
-Env: RUNPOD_API_KEY (or ~/.config/runpod/key), RP_IMAGE, RP_TTL_HOURS (default 8).
+Env: RUNPOD_API_KEY (or ~/.config/runpod/key), RP_IMAGE, RP_TTL_HOURS (default 8),
+     RP_DISK_GB (default 60), RP_VOLUME_GB (default 0).
+     Disk sizing rule of thumb: roughly 25 GB base + 3 GB per concurrent agent
+     target dir + 2 GB per `cargo mutants` job — a mutation-testing session
+     wants >= 120 GB (RP_DISK_GB=150).
 USAGE
   exit "${1:-2}"
 }

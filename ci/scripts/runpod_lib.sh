@@ -43,6 +43,16 @@
 #                 throwaway temp dir, wiped on exit.
 #   RP_KEEP       1 = leave the pod running when this process exits.
 #   RP_TTL_HOURS  hard deadline baked into every pod at deploy (default 8).
+#   RP_DISK_GB    container disk size in GB (default 60). Rule of thumb: roughly
+#                 25 GB base + 3 GB per concurrent agent CARGO_TARGET_DIR + 2 GB
+#                 per `cargo mutants -j N` job (COPY MODE makes one full
+#                 workspace+target copy per job — standing clause 1 REQUIRES
+#                 COPY MODE, never `--in-place`, so a shared target dir does not
+#                 report mutated sources as "Fresh"). A mutation-testing session
+#                 wants >= 120 GB.
+#   RP_VOLUME_GB  attached volume size in GB (default 0). The pod is deliberately
+#                 disposable (see "state" above) — leave this 0 unless a caller
+#                 has a specific reason to attach one.
 # Sets globals: RP_POD_ID, RP_HOST, RP_PORT, RP_REF. Installs an EXIT trap for
 # teardown.
 
@@ -68,6 +78,18 @@ case "$RP_TTL_HOURS" in
   ''|*[!0-9]*) echo "::error::RP_TTL_HOURS must be a positive integer (got '${RP_TTL_HOURS}')" >&2; exit 2 ;;
 esac
 [ "$RP_TTL_HOURS" -gt 0 ] || { echo "::error::RP_TTL_HOURS must be > 0" >&2; exit 2; }
+RP_DISK_GB="${RP_DISK_GB:-60}"
+RP_VOLUME_GB="${RP_VOLUME_GB:-0}"
+# Same validation shape as RP_TTL_HOURS above: both values go straight into a
+# GraphQL payload as unquoted JSON numbers (see _rp_deploy_payload), so a
+# non-integer here would send garbage to the API instead of failing loudly here.
+case "$RP_DISK_GB" in
+  ''|*[!0-9]*) echo "::error::RP_DISK_GB must be a positive integer (got '${RP_DISK_GB}')" >&2; exit 2 ;;
+esac
+[ "$RP_DISK_GB" -gt 0 ] || { echo "::error::RP_DISK_GB must be > 0" >&2; exit 2; }
+case "$RP_VOLUME_GB" in
+  ''|*[!0-9]*) echo "::error::RP_VOLUME_GB must be a non-negative integer (got '${RP_VOLUME_GB}')" >&2; exit 2 ;;
+esac
 RP_SESSION_ROOT="${RP_SESSION_ROOT:-${HOME}/.config/runpod/sessions}"
 RP_S3_CONF="${RP_S3_CONF:-${HOME}/.config/runpod/s3}"
 # An ssh config this tooling owns outright, so ~/.ssh/config is never rewritten.
@@ -264,9 +286,9 @@ rp_s3_load() {
 }
 
 _rp_deploy_payload() { # $1=cloudType $2=gpuTypeId
-  python3 - "$1" "$2" "$RP_IMAGE" "$RP_PUBKEY" "$RP_TTL_HOURS" "$RP_POD_PREFIX" <<'PY'
+  python3 - "$1" "$2" "$RP_IMAGE" "$RP_PUBKEY" "$RP_TTL_HOURS" "$RP_POD_PREFIX" "$RP_DISK_GB" "$RP_VOLUME_GB" <<'PY'
 import json, sys
-cloud, gpu, image, pub, ttl_h, prefix = sys.argv[1:7]
+cloud, gpu, image, pub, ttl_h, prefix, disk_gb, volume_gb = sys.argv[1:9]
 ttl = int(ttl_h) * 3600
 # The deadline is part of the pod's own entrypoint, so it exists from the moment
 # the container starts. It CANNOT be installed over SSH after the fact: the
@@ -314,7 +336,7 @@ assert "'" not in setup, "pod entrypoint must contain no single quotes (breaks b
 inp = {"cloudType": cloud, "gpuCount": 1, "gpuTypeId": gpu,
        # The deadline travels in the name so any sweeper honours THIS pod's limit.
        "name": "%s-ttl%s" % (prefix, ttl_h),
-       "imageName": image, "containerDiskInGb": 60, "volumeInGb": 0, "ports": "22/tcp",
+       "imageName": image, "containerDiskInGb": int(disk_gb), "volumeInGb": int(volume_gb), "ports": "22/tcp",
        "dockerArgs": "bash -c '%s'" % setup, "env": [{"key": "PUBLIC_KEY", "value": pub}]}
 print(json.dumps({"query": "mutation D($i: PodFindAndDeployOnDemandInput!){ podFindAndDeployOnDemand(input:$i){ id } }",
                   "variables": {"i": inp}}))

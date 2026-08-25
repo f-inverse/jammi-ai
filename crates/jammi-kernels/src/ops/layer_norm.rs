@@ -809,9 +809,9 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // `LayerNormFused::cpu_fwd`'s dtype-mismatch guard (`s1.dtype() !=
-    // s2.dtype()`), the SAME-unsupported-dtype cell (mutation MUT-1:
-    // `layer_norm.rs:216:25 true` survived). The "!=" false-arm (a real
+    // `LayerNormFused::cpu_fwd`'s dtype-mismatch guard (its `(s1, s2) if
+    // s1.dtype() != s2.dtype()` match arm), the SAME-unsupported-dtype
+    // cell (MUT-1: that guard forced `true` survived). The "!=" false-arm (a real
     // mismatch, e.g. F32 vs BF16) is already `dtype_mismatch_between_
     // x_and_gamma_is_refused` above; that test alone does not kill the
     // guard-forced-`true` mutant, because BOTH the real code and the
@@ -838,8 +838,9 @@ mod tests {
 
     // -----------------------------------------------------------------
     // `LayerNormBwdDx::cpu_fwd`'s own dtype guard (`s1` = x, `s2` =
-    // gamma; mutations at `layer_norm.rs:340`: guard forced `true`,
-    // forced `false`, and `!=` -> `==`). No existing test calls this
+    // gamma; MUT-1 mutations of its `(s1, s2, _) if s1.dtype() !=
+    // s2.dtype()` match arm: guard forced `true`, forced `false`, and
+    // `!=` -> `==`). No existing test calls this
     // internal helper directly (it is normally reached only through
     // `LayerNormFused::bwd`, which candle's autograd invokes with
     // matching dtypes by construction) — both cells below are new.
@@ -848,8 +849,9 @@ mod tests {
         crate::ops::apply3(x, gamma, dy, LayerNormBwdDx { eps })
     }
 
-    /// Real mismatch cell (x != gamma dtype, dy matches x so the earlier
-    /// `s1.dtype() != s3.dtype()` check at :297 is not what fires here):
+    /// Real mismatch cell (x != gamma dtype, dy matches x so
+    /// `LayerNormBwdDx::cpu_fwd`'s earlier `if s1.dtype() != s3.dtype()`
+    /// check is not what fires here):
     /// kills the guard-forced-`false` and `!=`->`==` mutants, which would
     /// otherwise report `UnsupportedDTypeForOp` instead of the correct
     /// `DTypeMismatchBinaryOp{lhs, rhs}`.
@@ -891,8 +893,9 @@ mod tests {
 
     // -----------------------------------------------------------------
     // `LayerNormBwdDgamma::cpu_fwd` has TWO copies of this same guard —
-    // one inside the `hidden == 0` fast path (:415) and one in the
-    // general `hidden > 0` path (:439) — each with its own `true`/
+    // the `(s1, s2) if s1.dtype() != s2.dtype()` arm of the `hidden == 0`
+    // fast path's `match (s1, s2)` and the identical arm of the general
+    // `hidden > 0` path's `match (s1, s2)` — each with its own `true`/
     // `false`/`!=`->`==` survivors. Both cells (mismatch, same-
     // unsupported) are needed at BOTH hidden==0 and hidden>0, four
     // tests total.
@@ -962,9 +965,9 @@ mod tests {
 
     // -----------------------------------------------------------------
     // The four `+`->`-` eps-sign-flip survivors in the row kernels
-    // (`ln_fwd_row_bf16`:530, `ln_bwd_dx_row_f32`:553,
-    // `ln_bwd_dgamma_f32`:641, `ln_bwd_dgamma_bf16`:658), all of the
-    // shape `invvar = 1.0 / (var + eps).sqrt()`. Rule 2 of the contract
+    // (`ln_fwd_row_bf16`, `ln_bwd_dx_row_f32`, `ln_bwd_dgamma_f32`,
+    // `ln_bwd_dgamma_bf16`), all of the shape `invvar = 1.0 / (var +
+    // eps).sqrt()`. Rule 2 of the contract
     // (tolerance failures): derive a bound so tight the flip cannot hide
     // inside it, rather than shrinking `eps` relative to a fixed abs
     // tolerance.
@@ -1095,10 +1098,19 @@ mod tests {
         }
     }
 
-    /// Cosmetic `name()` survivors (this file's three ops): the name is
-    /// part of this op's counters/admission keys (see `ops`'s module
-    /// doc), so ONE snapshot per op pins the exact string rather than
-    /// leaving `fn name` free to drift to any other non-empty value.
+    /// Cosmetic `name()` survivors (this file's three ops). What the
+    /// snapshot pins: `name()` is the `op` payload of every typed refusal
+    /// an op here raises on its CPU arm (`hidden_of(.., self.name())`,
+    /// `RequiresContiguous { op: self.name() }`, `DTypeMismatchBinaryOp {
+    /// op: self.name(), .. }`, `UnsupportedDTypeForOp(_, self.name())`)
+    /// and of candle's own `BackwardNotSupported { op: self.name() }` —
+    /// the diagnostic name a user matches error messages on, so a rename
+    /// silently changes every one of them. It is NOT an admission/counter
+    /// key: those are a consumer's own dispatch-site literals (`admit(..,
+    /// "<key>", ..)` / `counters_for("<key>")` — see
+    /// `crate::admission::counters_for`'s doc), independent of `name()`
+    /// by construction. ONE snapshot per op pins the exact string rather
+    /// than leaving `fn name` free to drift to any other non-empty value.
     #[test]
     fn every_ops_name_in_this_file_is_pinned() {
         assert_eq!(LayerNormFused::new(1e-5, false).name(), "layer_norm_fused");
@@ -1110,5 +1122,35 @@ mod tests {
             LayerNormBwdDgamma { eps: 1e-5 }.name(),
             "layer_norm_fused_bwd_dgamma"
         );
+    }
+
+    /// The CUDA arm fills the SAME `op` payload field from a fn-local
+    /// `const OP` literal in `cuda/layer_norm.rs` (a second copy of each
+    /// name — that arm is a free function without `&self`). A user
+    /// matching on the `op` payload must see one name per op on both
+    /// devices, so each copy is pinned to `name()`. `cuda` is
+    /// `#[cfg(feature = "cuda")]`-gated in `lib.rs`, so on a CPU-only
+    /// build the CUDA source TEXT is the only observable form of that
+    /// arm; the count assertion keeps the pin non-vacuous (a renamed or
+    /// added `const OP` cannot hide behind the per-name `contains`).
+    #[test]
+    fn cuda_arm_op_literal_agrees_with_name_for_every_op_in_this_file() {
+        let names = [
+            LayerNormFused::new(1e-5, false).name(),
+            LayerNormBwdDx { eps: 1e-5 }.name(),
+            LayerNormBwdDgamma { eps: 1e-5 }.name(),
+        ];
+        let cuda_src = include_str!("../cuda/layer_norm.rs");
+        assert_eq!(
+            cuda_src.matches("const OP: &str = \"").count(),
+            names.len(),
+            "cuda/layer_norm.rs must declare exactly one `const OP` per op in this file"
+        );
+        for name in names {
+            assert!(
+                cuda_src.contains(&format!("const OP: &str = \"{name}\";")),
+                "cuda/layer_norm.rs has no `const OP` equal to `{name}`"
+            );
+        }
     }
 }

@@ -2557,8 +2557,9 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // `mask_row_offset` (MUT-1: `/=` -> `%=`, `/=` -> `*=` at :698; `*`
-    // -> `/` at :703) -- a broadcast-offset oracle on a `[B, 1, 1, S]`
+    // `mask_row_offset` (MUT-1: `/=` -> `%=` and `/=` -> `*=` on its
+    // `rem /= d`; `*` -> `/` on its `flat = flat * m_lead[axis].max(1) +
+    // i`) -- a broadcast-offset oracle on a `[B, 1, 1, S]`
     // vs `[B, H, S, S]`-style leading-axis shape (`s_lead = [B, H, S]`,
     // `m_lead = [B, H, 1]` here -- broadcasting only the LAST leading
     // axis, `q`, so `m_lead` still has a non-1 entry at axis 1 that a
@@ -2591,8 +2592,8 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // `SoftmaxLastDimFused::cpu_fwd`'s dtype guard (MUT-1:
-    // `s1.dtype() != s2.dtype()` forced `true` at :912). The `false`-arm
+    // `SoftmaxLastDimFused::cpu_fwd`'s dtype guard (MUT-1: its `(s1, s2)
+    // if s1.dtype() != s2.dtype()` match-arm guard forced `true`). The `false`-arm
     // (a real mismatch) is the pre-existing `dtype_mismatch_is_refused`
     // test above; that test alone does not kill the guard-forced-`true`
     // mutant (both the real code and the `true` mutant return
@@ -2617,7 +2618,8 @@ mod tests {
 
     // -------------------------------------------------------------------
     // `SoftmaxBwdDScores::cpu_fwd`'s own dtype guard (MUT-1: `true`,
-    // `false`, and `!=`->`==` all survived at :1033) -- an internal
+    // `false`, and `!=`->`==` all survived on its `(s1, s2) if s1.dtype()
+    // != s2.dtype()` match-arm guard) -- an internal
     // helper never previously called directly by any test in this file
     // (only reachable through `SoftmaxLastDimFused::bwd`, which candle's
     // autograd invokes with matching dtypes by construction).
@@ -2657,7 +2659,8 @@ mod tests {
 
     // -------------------------------------------------------------------
     // `softmax_fwd_bf16`'s `mrow * last` mask-row-start computation
-    // (MUT-1: `*` -> `/` survived at :1246). A BF16 forward with a
+    // (MUT-1: `*` -> `/` survived in its `let mr = &mask[mrow * last..(mrow
+    // + 1) * last]`). A BF16 forward with a
     // genuinely-broadcast mask (`[B, 1, S]` over `[B, H, S]`, `B = 2`) so
     // `mrow` takes a NON-ZERO value (`b = 1`) for later rows -- under
     // `mrow / last` (integer division, `1 / 4 == 0`), row `b=1` would
@@ -2705,9 +2708,18 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Cosmetic `name()` survivors (this file's two ops): the name is
-    // part of this op's counters/admission keys (see `ops`'s module
-    // doc), so ONE snapshot per op pins the exact string.
+    // Cosmetic `name()` survivors (this file's two ops). What the
+    // snapshot pins: `name()` is the `op` payload of every typed refusal
+    // an op here raises on its CPU arm (`softmax_dims(.., self.name())`,
+    // `empty_like(.., self.name())`, `DTypeMismatchBinaryOp { op:
+    // self.name(), .. }`, `UnsupportedDTypeForOp(_, self.name())`) and of
+    // candle's own `BackwardNotSupported { op: self.name() }` — the
+    // diagnostic name a user matches error messages on, so a rename
+    // silently changes every one of them. It is NOT an admission/counter
+    // key: those are a consumer's own dispatch-site literals (`admit(..,
+    // "<key>", ..)` / `counters_for("<key>")` — see
+    // `crate::admission::counters_for`'s doc), independent of `name()`
+    // by construction. ONE snapshot per op pins the exact string.
     // -------------------------------------------------------------------
     #[test]
     fn every_ops_name_in_this_file_is_pinned() {
@@ -2719,5 +2731,81 @@ mod tests {
             SoftmaxBwdDScores.name(),
             "softmax_last_dim_fused_bwd_dscores"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // The CUDA arm fills the SAME `op` payload field from a fn-local
+    // `const OP` literal in `cuda/softmax.rs` (a second copy of each
+    // name — that arm is a free function without `&self`). A user
+    // matching on the `op` payload must see one name per op on both
+    // devices, so each copy is pinned to `name()`. `cuda` is
+    // `#[cfg(feature = "cuda")]`-gated in `lib.rs`, so on a CPU-only
+    // build the CUDA source TEXT is the only observable form of that
+    // arm; the count assertion keeps the pin non-vacuous.
+    // -------------------------------------------------------------------
+    #[test]
+    fn cuda_arm_op_literal_agrees_with_name_for_every_op_in_this_file() {
+        let names = [
+            SoftmaxLastDimFused::default().name(),
+            SoftmaxBwdDScores.name(),
+        ];
+        let cuda_src = include_str!("../cuda/softmax.rs");
+        assert_eq!(
+            cuda_src.matches("const OP: &str = \"").count(),
+            names.len(),
+            "cuda/softmax.rs must declare exactly one `const OP` per op in this file"
+        );
+        for name in names {
+            assert!(
+                cuda_src.contains(&format!("const OP: &str = \"{name}\";")),
+                "cuda/softmax.rs has no `const OP` equal to `{name}`"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // `softmax_row_f32`'s row-MAX loop `let scaled = scores[i] * scale`
+    // (MUT-1 final run: `*` -> `+` and `*` -> `/` both TIMED OUT instead
+    // of being caught — a resource artifact of the 18-way parallel run,
+    // see that commit's message — and this file's unit tests all PASSED
+    // under both, so nothing here killed them). Both mutants corrupt only
+    // the row max, and softmax is shift-invariant, so at unit scale and
+    // small magnitude they hide inside rounding. A large-magnitude row at
+    // a non-unit scale separates the max loop from the exp loop by more
+    // than f32's `exp` range: `+` puts the "max" at `2000 + 0.01` against
+    // true scaled arguments `<= 20`, so every `exp` underflows to `0`,
+    // `sum == 0`, and the row is `0 / 0 = NaN`; `/` puts it at
+    // `2000 / 0.01` (same). The oracle is the f64 closed form, asserted
+    // finite-and-close (a NaN fails both `is_finite` and `<=`).
+    // -------------------------------------------------------------------
+    #[test]
+    fn row_max_is_taken_over_the_scaled_scores_large_magnitude_non_unit_scale_oracle() {
+        let scores = [0.0f32, 1000.0, 2000.0];
+        let mask = [0.0f32; 3];
+        let scale = 0.01f32;
+        let mut out = [0.0f32; 3];
+        softmax_row_f32(
+            &scores,
+            &mask,
+            &mut out,
+            FullyMaskedPolicy::Propagate,
+            scale,
+        );
+
+        let scaled: Vec<f64> = scores
+            .iter()
+            .map(|&s| f64::from(s) * f64::from(scale))
+            .collect();
+        let max = scaled.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let exps: Vec<f64> = scaled.iter().map(|v| (v - max).exp()).collect();
+        let sum: f64 = exps.iter().sum();
+        for (i, (&o, e)) in out.iter().zip(exps.iter()).enumerate() {
+            let expected = e / sum;
+            assert!(o.is_finite(), "out[{i}] = {o} is not finite");
+            assert!(
+                (f64::from(o) - expected).abs() <= 1e-6,
+                "out[{i}] = {o} vs f64 reference {expected}"
+            );
+        }
     }
 }

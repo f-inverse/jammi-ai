@@ -557,11 +557,31 @@ impl TrainingLoop {
         //    entirely excluded is DROPPED, so a mined epoch's row (and
         //    therefore batch/window) count can differ from `train_loader`'s —
         //    what `total_steps` was computed from, once, before the loop.
-        //    This desync is NOT resolved here: an epoch whose mining drops
-        //    enough rows to change its window count can still make
-        //    `is_last_step` wrong on that epoch, because the true per-epoch
-        //    window count is only known once that epoch's `text_chunks()`/
-        //    mined triplets are built, not upfront. A known, open gap.
+        //    This desync is NOT resolved here, and why is specific, not just
+        //    "known gap": mining is lazy and re-mined only at
+        //    `hard_negatives.refresh_every`-epoch boundaries (`mining_eligible
+        //    ` + `should_refresh`, above), so the drop count for a REFRESHING
+        //    epoch is unknowable until that epoch's own `text_chunks()`/mined
+        //    triplets are built — after `total_steps` has already been used to
+        //    seed `compute_lr`'s horizon AND `LastStepHorizon`. A correct fix
+        //    needs one of: (a) mining every epoch upfront, before the loop,
+        //    to know every epoch's row count before the LR schedule is
+        //    seeded — defeats the "stale reuse between refreshes" cost
+        //    trade-off `mined_loader`'s own doc states as the reason it is
+        //    NOT re-mined every epoch; or (b) re-deriving `total_steps` (and
+        //    therefore `compute_lr`'s `progress` fraction for every step
+        //    already taken) mid-run, the first time a mined epoch's row count
+        //    diverges — which turns a fixed run-level LR schedule into one
+        //    that can retroactively change shape, a correctness contract this
+        //    round's `A1`/`A2`/`B2`/`B3` oracles do not cover and would need
+        //    their own sweep to add safely. Both are a materially larger,
+        //    separable change than a device-side clip; deferred, not silently
+        //    absorbed into "fixed" by this round. The risk this leaves is
+        //    bounded to hard-negative-mining runs specifically (`mining_
+        //    eligible()` gates it) whose mined pool loses enough rows on a
+        //    refresh epoch to shift that epoch's window count — every
+        //    non-mining run (the common path, and everything `last_step_run_
+        //    harness` and `last_step_horizon_run_oracles` drive) is unaffected.
         //  - **early stopping** (`break` on patience exhaustion): an
         //    early-stopped run's actual last step is whatever `global_step`
         //    reached before the `break`, which `total_optimizer_steps`

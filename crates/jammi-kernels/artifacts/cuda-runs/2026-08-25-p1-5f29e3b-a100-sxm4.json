@@ -1,0 +1,975 @@
+{
+  "artifact": "cuda-run",
+  "tag": "p1",
+  "git_sha": "5f29e3b87ba2305533e83d21223343a73100cb64",
+  "env": {
+    "gpu": "NVIDIA A100-SXM4-80GB, 580.126.16, 81920 MiB",
+    "nvcc": "Cuda compilation tools, release 12.6, V12.6.85",
+    "rustc": "rustc 1.94.0 (4a4ef493e 2026-03-02)",
+    "hostname": "4a4f23a83793",
+    "generated_at_utc": "2026-08-25T01:24:20Z"
+  },
+  "gates": "clippy=0 parity=0 tests=0",
+  "cuda_parity": {
+    "command": "JAMMI_REQUIRE_CUDA=1 JAMMI_KERNELS_STRICT=1 cargo test -p jammi-kernels --features cuda --test cuda_parity",
+    "results": [
+      {
+        "outcome": "ok",
+        "passed": 42,
+        "failed": 0,
+        "ignored": 0
+      }
+    ],
+    "tests": [
+      {
+        "name": "dropout_parity_empty",
+        "status": "ok"
+      },
+      {
+        "name": "geglu_parity_empty_last_dim",
+        "status": "ok"
+      },
+      {
+        "name": "geglu_parity_narrowed_with_nonzero_offset",
+        "status": "ok"
+      },
+      {
+        "name": "ln_parity_empty_batch",
+        "status": "ok"
+      },
+      {
+        "name": "dropout_parity_narrowed_with_nonzero_offset",
+        "status": "ok"
+      },
+      {
+        "name": "dropout_parity_p_zero_is_bit_exact_no_op_on_both_devices",
+        "status": "ok"
+      },
+      {
+        "name": "ln_parity_narrowed_with_nonzero_offset",
+        "status": "ok"
+      },
+      {
+        "name": "parity_empty",
+        "status": "ok"
+      },
+      {
+        "name": "dropout_parity_multi_block_not_a_multiple_of_block_size",
+        "status": "ok"
+      },
+      {
+        "name": "dropout_parity_contiguous_small",
+        "status": "ok"
+      },
+      {
+        "name": "geglu_parity_multi_block_exact_multiple_of_block_size",
+        "status": "ok"
+      },
+      {
+        "name": "parity_narrowed_with_nonzero_offset",
+        "status": "ok"
+      },
+      {
+        "name": "geglu_parity_contiguous_small",
+        "status": "ok"
+      },
+      {
+        "name": "philox_kat_vectors_match_on_cuda",
+        "status": "ok"
+      },
+      {
+        "name": "rope_parity_empty_batch",
+        "status": "ok"
+      },
+      {
+        "name": "rope_parity_narrowed_with_nonzero_offset",
+        "status": "ok"
+      },
+      {
+        "name": "parity_multi_block_exact_multiple_of_block_size",
+        "status": "ok"
+      },
+      {
+        "name": "geglu_parity_non_power_of_two_intermediate",
+        "status": "ok"
+      },
+      {
+        "name": "parity_contiguous_small",
+        "status": "ok"
+      },
+      {
+        "name": "geglu_parity_production_width_modernbert_large",
+        "status": "ok"
+      },
+      {
+        "name": "scaled_cast_add_parity_empty",
+        "status": "ok"
+      },
+      {
+        "name": "parity_multi_block_not_a_multiple_of_block_size",
+        "status": "ok"
+      },
+      {
+        "name": "softmax_parity_narrowed_with_nonzero_offset",
+        "status": "ok"
+      },
+      {
+        "name": "softmax_parity_empty_batch",
+        "status": "ok"
+      },
+      {
+        "name": "scaled_cast_add_parity_narrowed_with_nonzero_offset",
+        "status": "ok"
+      },
+      {
+        "name": "scaled_cast_add_parity_contiguous_small",
+        "status": "ok"
+      },
+      {
+        "name": "scaled_cast_add_parity_multi_block_exact_multiple_of_block_size",
+        "status": "ok"
+      },
+      {
+        "name": "rope_parity_non_power_of_two_even_head_dim",
+        "status": "ok"
+      },
+      {
+        "name": "ln_parity_contiguous_non_1024_hidden",
+        "status": "ok"
+      },
+      {
+        "name": "ln_parity_contiguous_hidden_1024_modernbert_shape",
+        "status": "ok"
+      },
+      {
+        "name": "rope_parity_contiguous_head_dim_64_modernbert_large_shape",
+        "status": "ok"
+      },
+      {
+        "name": "scaled_cast_add_parity_multi_block_not_a_multiple_of_block_size",
+        "status": "ok"
+      },
+      {
+        "name": "softmax_scale_parity_narrowed_with_nonzero_offset",
+        "status": "ok"
+      },
+      {
+        "name": "softmax_scale_bf16_small_additive_mask_bit_exact_same_device_head_dim_64",
+        "status": "ok"
+      },
+      {
+        "name": "softmax_parity_fully_masked_row_is_zero_on_both_devices",
+        "status": "ok"
+      },
+      {
+        "name": "softmax_parity_contiguous_small",
+        "status": "ok"
+      },
+      {
+        "name": "softmax_parity_long_row_seq_512_class",
+        "status": "ok"
+      },
+      {
+        "name": "softmax_scale_bf16_small_additive_mask_bit_exact_same_device_head_dim_128",
+        "status": "ok"
+      },
+      {
+        "name": "softmax_parity_non_power_of_two_last_dim",
+        "status": "ok"
+      },
+      {
+        "name": "softmax_scale_parity_contiguous_small",
+        "status": "ok"
+      },
+      {
+        "name": "softmax_scale_parity_head_dim_64_seq_128_class",
+        "status": "ok"
+      },
+      {
+        "name": "softmax_scale_parity_head_dim_64_seq_512_class",
+        "status": "ok"
+      }
+    ]
+  },
+  "crate_tests_cuda": {
+    "jammi-encoders": {
+      "tests": [
+        {
+          "name": "aggregate::tests::empty_input_is_all_zeros",
+          "status": "ok"
+        },
+        {
+          "name": "aggregate::tests::empty_segment_is_zero_not_nan",
+          "status": "ok"
+        },
+        {
+          "name": "aggregate::tests::max_handles_all_negative_values",
+          "status": "ok"
+        },
+        {
+          "name": "aggregate::tests::max_reduces_lanewise",
+          "status": "ok"
+        },
+        {
+          "name": "aggregate::tests::mean_divides_by_count",
+          "status": "ok"
+        },
+        {
+          "name": "aggregate::tests::sum_folds_rows_into_segments",
+          "status": "ok"
+        },
+        {
+          "name": "aggregate::tests::permutation_invariant",
+          "status": "ok"
+        },
+        {
+          "name": "clip_text::tests::config_from_open_clip_json",
+          "status": "ok"
+        },
+        {
+          "name": "clip_text::tests::config_heads_default_from_width",
+          "status": "ok"
+        },
+        {
+          "name": "attention::tests::layer_norm_and_softmax_last_dim_are_backward_free_in_candle",
+          "status": "ok"
+        },
+        {
+          "name": "attention::tests::softmax_last_dim_and_composed_softmax_agree_on_masked_production_domain",
+          "status": "ok"
+        },
+        {
+          "name": "clip_text::tests::sequence_too_long_rejected",
+          "status": "ok"
+        },
+        {
+          "name": "attention::tests::softmax_last_dim_and_composed_softmax_are_cpu_bit_identical",
+          "status": "ok"
+        },
+        {
+          "name": "context::attention::tests::masked_key_gets_zero_weight",
+          "status": "ok"
+        },
+        {
+          "name": "context::attncnp::tests::attention_concentrates_on_a_planted_member",
+          "status": "ok"
+        },
+        {
+          "name": "context::attncnp::tests::zero_k_context_is_finite",
+          "status": "ok"
+        },
+        {
+          "name": "context::attncnp::tests::empty_context_uses_prior_and_is_finite",
+          "status": "ok"
+        },
+        {
+          "name": "context::cnp::tests::empty_context_is_finite",
+          "status": "ok"
+        },
+        {
+          "name": "context::attention::tests::reproduces_bert_self_attention_math",
+          "status": "ok"
+        },
+        {
+          "name": "context::cnp::tests::zero_k_context_is_finite",
+          "status": "ok"
+        },
+        {
+          "name": "context::attncnp::tests::permutation_invariant_over_context",
+          "status": "ok"
+        },
+        {
+          "name": "context::cnp::tests::permutation_invariant_over_context",
+          "status": "ok"
+        },
+        {
+          "name": "clip_text::tests::forward_output_shape_and_l2_norm",
+          "status": "ok"
+        },
+        {
+          "name": "clip_text::tests::training_false_full_forward_grads_are_none_before_ln_final",
+          "status": "ok"
+        },
+        {
+          "name": "htsat_audio::tests::bicubic_matrix_small_case",
+          "status": "ok"
+        },
+        {
+          "name": "htsat_audio::tests::config_parity_with_fixture",
+          "status": "ok"
+        },
+        {
+          "name": "attention::tests::dropping_the_redundant_contiguous_calls_does_not_change_eval_output",
+          "status": "ok"
+        },
+        {
+          "name": "clip_text::tests::training_false_q_and_k_grad_are_exactly_zero_v_nonzero",
+          "status": "ok"
+        },
+        {
+          "name": "clip_text::tests::training_true_backward_gives_nonzero_grad_to_q_k_and_v_slices",
+          "status": "ok"
+        },
+        {
+          "name": "htsat_audio::tests::mel_conv2d_gradient_matches_the_hand_built_scatter_at_production_geometry",
+          "status": "ok"
+        },
+        {
+          "name": "htsat_audio::tests::mel_conv2d_gradient_matches_the_hand_built_scatter_with_dropped_row_tail",
+          "status": "ok"
+        },
+        {
+          "name": "htsat_audio::tests::rel_pos_table_and_index_are_window_sized",
+          "status": "ok"
+        },
+        {
+          "name": "context::tnp::tests::empty_context_is_finite",
+          "status": "ok"
+        },
+        {
+          "name": "htsat_audio::tests::tile_nonoverlapping_gradient_matches_central_finite_differences",
+          "status": "ok"
+        },
+        {
+          "name": "htsat_audio::tests::tile_nonoverlapping_rejects_input_smaller_than_the_kernel",
+          "status": "ok"
+        },
+        {
+          "name": "htsat_audio::tests::tile_nonoverlapping_is_forward_bit_identical_to_unfold_without_narrow_first",
+          "status": "ok"
+        },
+        {
+          "name": "clip_text::tests::eval_output_is_bit_identical_across_a_training_toggle_round_trip",
+          "status": "ok"
+        },
+        {
+          "name": "context::tnp::tests::zero_k_context_is_finite",
+          "status": "ok"
+        },
+        {
+          "name": "clip_text::tests::training_true_full_forward_reaches_every_parameter",
+          "status": "ok"
+        },
+        {
+          "name": "htsat_audio::tests::unfold_backward_is_a_plain_reshape_in_candle",
+          "status": "ok"
+        },
+        {
+          "name": "htsat_audio::tests::unfold_backward_on_a_non_last_dim_is_wrong_but_finite",
+          "status": "ok"
+        },
+        {
+          "name": "layer_norm::tests::biased_layer_norm_output_is_unaffected_in_training_and_eval",
+          "status": "ok"
+        },
+        {
+          "name": "layer_norm::tests::device_is_supported_rejects_metal",
+          "status": "ok"
+        },
+        {
+          "name": "layer_norm::tests::eval_mode_forward_is_bit_identical_regardless_of_fused_eligibility",
+          "status": "ok"
+        },
+        {
+          "name": "layer_norm::tests::fused_admission_predicate_accepts_cpu_device",
+          "status": "ok"
+        },
+        {
+          "name": "layer_norm::tests::fused_training_path_matches_slow_within_tolerance_fwd_and_bwd",
+          "status": "ok"
+        },
+        {
+          "name": "layer_norm::tests::strict_mode_errors_instead_of_falling_back_on_a_failed_predicate",
+          "status": "ok"
+        },
+        {
+          "name": "context::tnp::tests::permutation_invariant_over_context",
+          "status": "ok"
+        },
+        {
+          "name": "modernbert::tests::eval_mode_attention_softmax_is_bit_identical_regardless_of_fused_eligibility",
+          "status": "ok"
+        },
+        {
+          "name": "modernbert::tests::eval_mode_mlp_geglu_is_bit_identical_regardless_of_fused_eligibility",
+          "status": "ok"
+        },
+        {
+          "name": "modernbert::tests::eval_mode_rope_is_bit_identical_regardless_of_fused_eligibility",
+          "status": "ok"
+        },
+        {
+          "name": "modernbert::tests::fused_training_geglu_matches_eager_fwd_and_bwd",
+          "status": "ok"
+        },
+        {
+          "name": "modernbert::tests::fused_training_rope_matches_eager_fwd_and_bwd",
+          "status": "ok"
+        },
+        {
+          "name": "modernbert::tests::fused_training_softmax_call_site_drops_the_affine_node",
+          "status": "ok"
+        },
+        {
+          "name": "modernbert::tests::fused_training_softmax_matches_eager_fwd_and_bwd",
+          "status": "ok"
+        },
+        {
+          "name": "modernbert::tests::geglu_admission_predicate_accepts_a_typical_modernbert_shape",
+          "status": "ok"
+        },
+        {
+          "name": "modernbert::tests::geglu_admission_predicate_rejects_odd_last_dim",
+          "status": "ok"
+        },
+        {
+          "name": "modernbert::tests::rope_admission_predicate_accepts_cpu_device",
+          "status": "ok"
+        },
+        {
+          "name": "modernbert::tests::rope_admission_predicate_rejects_odd_head_dim",
+          "status": "ok"
+        },
+        {
+          "name": "modernbert::tests::softmax_admission_predicate_accepts_cpu_device",
+          "status": "ok"
+        },
+        {
+          "name": "modernbert::tests::softmax_admission_predicate_rejects_broadcast_class_violation",
+          "status": "ok"
+        },
+        {
+          "name": "modernbert::tests::softmax_admission_predicate_rejects_dtype_mismatch",
+          "status": "ok"
+        },
+        {
+          "name": "modernbert::tests::softmax_admission_predicate_rejects_last_dim_above_ceiling",
+          "status": "ok"
+        },
+        {
+          "name": "modernbert::tests::softmax_admission_predicate_rejects_non_contiguous_scores",
+          "status": "ok"
+        },
+        {
+          "name": "modernbert::tests::softmax_admission_predicate_rejects_rank_above_ceiling",
+          "status": "ok"
+        },
+        {
+          "name": "modernbert::tests::softmax_admission_predicate_scale_domain",
+          "status": "ok"
+        },
+        {
+          "name": "modernbert::tests::table_hoisting_is_bit_neutral_with_the_uncached_computation",
+          "status": "ok"
+        },
+        {
+          "name": "any::tests::any_encoder_set_training_reaches_clip_text_q_k_gradient",
+          "status": "ok"
+        },
+        {
+          "name": "htsat_audio::tests::training_false_rel_bias_table_grad_is_none_for_every_block",
+          "status": "ok"
+        },
+        {
+          "name": "context::tests::forward_shape_is_batch_by_head_width",
+          "status": "ok"
+        },
+        {
+          "name": "open_clip_vision::tests::test_config_from_open_clip_json",
+          "status": "ok"
+        },
+        {
+          "name": "open_clip_vision::tests::multi_head_attention_eval_zeros_qk_leaves_v_nonzero",
+          "status": "ok"
+        },
+        {
+          "name": "open_clip_vision::tests::eval_output_bit_identical_regardless_of_set_training_history",
+          "status": "ok"
+        },
+        {
+          "name": "htsat_audio::tests::training_true_rel_bias_table_grad_is_some_for_every_block",
+          "status": "ok"
+        },
+        {
+          "name": "open_clip_vision::tests::test_forward_cls_pooling",
+          "status": "ok"
+        },
+        {
+          "name": "precision::tests::maps_every_precision_to_its_dtype",
+          "status": "ok"
+        },
+        {
+          "name": "open_clip_vision::tests::test_forward_output_shape",
+          "status": "ok"
+        },
+        {
+          "name": "context::tests::gradients_flow_to_every_trainable_param",
+          "status": "ok"
+        },
+        {
+          "name": "open_clip_vision::tests::training_false_backward_has_no_in_proj_gradient_at_all",
+          "status": "ok"
+        },
+        {
+          "name": "htsat_audio::tests::mel_conv2d_backward_reaches_conv_weight_through_the_fused_patch_embed_path",
+          "status": "ok"
+        },
+        {
+          "name": "clip_text::tests::ln_1_and_ln_2_own_weight_gradient_present_under_training_absent_under_eval",
+          "status": "ok"
+        },
+        {
+          "name": "open_clip_vision::tests::training_true_backward_reaches_qk_through_softmax",
+          "status": "ok"
+        },
+        {
+          "name": "htsat_audio::tests::training_false_full_forward_grads_are_none_before_final_norm",
+          "status": "ok"
+        },
+        {
+          "name": "open_clip_vision::tests::ln_1_and_ln_2_own_weight_gradient_present_under_training_absent_under_eval",
+          "status": "ok"
+        },
+        {
+          "name": "modernbert::tests::eager_fallback_softmax_matches_inline_reference_fwd_and_bwd",
+          "status": "ok"
+        },
+        {
+          "name": "htsat_audio::tests::eval_output_is_bit_identical_across_a_training_toggle_round_trip",
+          "status": "ok"
+        },
+        {
+          "name": "htsat_audio::tests::training_true_full_forward_reaches_every_parameter",
+          "status": "ok"
+        },
+        {
+          "name": "htsat_audio::tests::layernorm_before_and_after_own_weight_gradient_present_under_training_absent_under_eval",
+          "status": "ok"
+        },
+        {
+          "name": "aggregate::max_gradient_only_to_winner",
+          "status": "ok"
+        },
+        {
+          "name": "aggregate::sum_gradient_matches_finite_difference",
+          "status": "ok"
+        },
+        {
+          "name": "aggregate::mean_gradient_matches_finite_difference",
+          "status": "ok"
+        },
+        {
+          "name": "aggregate::max_gradient_matches_finite_difference",
+          "status": "ok"
+        },
+        {
+          "name": "bert::bert_loads_with_lora_frozen",
+          "status": "ok"
+        },
+        {
+          "name": "bert::bert_max_seq_length_check",
+          "status": "ok"
+        },
+        {
+          "name": "bert::bert_loads_with_target_modules",
+          "status": "ok"
+        },
+        {
+          "name": "modernbert_sliding_window::fixture_exercises_local_attention",
+          "status": "ok"
+        },
+        {
+          "name": "clip_text::clip_text_loads_from_fixture",
+          "status": "ok"
+        },
+        {
+          "name": "modernbert::modernbert_loads_with_target_modules",
+          "status": "ok"
+        },
+        {
+          "name": "clip_text::clip_text_forward_shape_and_projection_dim",
+          "status": "ok"
+        },
+        {
+          "name": "modernbert_sliding_window::sliding_window_band_is_symmetric_and_keeps_the_diagonal",
+          "status": "ok"
+        },
+        {
+          "name": "bert::bert_forward_f16_backbone_with_padding",
+          "status": "ok"
+        },
+        {
+          "name": "distilbert::distilbert_loads_and_forwards",
+          "status": "ok"
+        },
+        {
+          "name": "bert::bert_forward_shape",
+          "status": "ok"
+        },
+        {
+          "name": "modernbert_sliding_window::zero_global_attn_every_n_layers_is_refused_at_load",
+          "status": "ok"
+        },
+        {
+          "name": "pooling::extended_attention_mask_values",
+          "status": "ok"
+        },
+        {
+          "name": "pooling::pool_and_normalize_cls_correctness",
+          "status": "ok"
+        },
+        {
+          "name": "pooling::pool_and_normalize_max_correctness",
+          "status": "ok"
+        },
+        {
+          "name": "pooling::pool_and_normalize_mean_correctness",
+          "status": "ok"
+        },
+        {
+          "name": "pooling::pool_and_normalize_weighted_mean_correctness",
+          "status": "ok"
+        },
+        {
+          "name": "modernbert::set_training_threading_gates_the_fused_geglu_dispatch_counters",
+          "status": "ok"
+        },
+        {
+          "name": "bert::bert_forward_pooled_f16_backbone_with_padding",
+          "status": "ok"
+        },
+        {
+          "name": "bert::bert_forward_pooled_f16_backbone_all_padding_row",
+          "status": "ok"
+        },
+        {
+          "name": "bert::bert_pooling_variants",
+          "status": "ok"
+        },
+        {
+          "name": "modernbert::set_training_threading_gates_the_fused_rope_dispatch_counters",
+          "status": "ok"
+        },
+        {
+          "name": "modernbert::set_training_threading_gates_the_fused_softmax_dispatch_counters",
+          "status": "ok"
+        },
+        {
+          "name": "modernbert_sliding_window::sliding_band_is_reused_across_forwards",
+          "status": "ok"
+        },
+        {
+          "name": "modernbert_sliding_window::hidden_states_match_huggingface_on_padded_input",
+          "status": "ok"
+        },
+        {
+          "name": "modernbert_sliding_window::hidden_states_match_huggingface_on_unpadded_input",
+          "status": "ok"
+        },
+        {
+          "name": "modernbert_sliding_window::training_mode_hidden_states_match_huggingface_on_padded_input",
+          "status": "ok"
+        },
+        {
+          "name": "modernbert_sliding_window::training_mode_hidden_states_match_huggingface_on_unpadded_input",
+          "status": "ok"
+        }
+      ],
+      "results": [
+        {
+          "outcome": "ok",
+          "passed": 88,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "outcome": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "outcome": "ok",
+          "passed": 32,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "outcome": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "outcome": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "outcome": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        }
+      ]
+    },
+    "jammi-lora": {
+      "tests": [
+        {
+          "name": "lora_linear::lora_scaling_tests::non_finite_alpha_propagates_visibly_not_silently",
+          "status": "ok"
+        },
+        {
+          "name": "lora_linear::lora_scaling_tests::rank_zero_is_a_typed_refusal_both_arms",
+          "status": "ok"
+        },
+        {
+          "name": "lora_linear::lora_scaling_tests::table_pins_vanilla_and_rslora_formulas_bit_exact",
+          "status": "ok"
+        },
+        {
+          "name": "seeded::tests::a_repeated_identical_name_is_not_a_false_positive_collision",
+          "status": "ok"
+        },
+        {
+          "name": "seeded::tests::forward_counter_overflow_is_a_typed_refusal_not_a_silent_wrap",
+          "status": "ok"
+        },
+        {
+          "name": "seeded::tests::kaiming_uniform_respects_bound_and_is_deterministic",
+          "status": "ok"
+        },
+        {
+          "name": "seeded::tests::layer_id_for_name_is_a_pure_function_of_the_name_alone",
+          "status": "ok"
+        },
+        {
+          "name": "seeded::tests::real_modernbert_large_names_are_collision_free",
+          "status": "ok"
+        },
+        {
+          "name": "seeded::tests::seed_for_param_is_name_keyed_not_order_keyed",
+          "status": "ok"
+        },
+        {
+          "name": "seeded::tests::restore_is_position_independent",
+          "status": "ok"
+        },
+        {
+          "name": "seeded::tests::gaussian_fill_is_deterministic_and_centred",
+          "status": "ok"
+        },
+        {
+          "name": "seeded::tests::post_restore_stream_would_catch_an_off_by_one_forward_idx",
+          "status": "ok"
+        },
+        {
+          "name": "seeded::tests::restore_position_reproduces_the_uninterrupted_masks",
+          "status": "ok"
+        },
+        {
+          "name": "seeded::tests::post_restore_stream_is_byte_identical_to_the_uninterrupted_run_across_many_forwards",
+          "status": "ok"
+        },
+        {
+          "name": "seeded::tests::two_layers_do_not_share_a_mask",
+          "status": "ok"
+        },
+        {
+          "name": "seeded::tests::successive_forwards_draw_different_masks",
+          "status": "ok"
+        },
+        {
+          "name": "seeded::tests::masks_are_deterministic_and_inverted_scaled",
+          "status": "ok"
+        },
+        {
+          "name": "seeded::tests::engineered_collision_is_a_typed_refusal_naming_both_sites",
+          "status": "ok"
+        },
+        {
+          "name": "training_mode_on_a_supported_dtype_dispatches_fused_and_is_counted",
+          "status": "ok"
+        },
+        {
+          "name": "esc_031_golden_holds_through_the_fused_path_with_dispatch_proof",
+          "status": "ok"
+        },
+        {
+          "name": "eval_mode_never_dispatches_the_fused_kernel",
+          "status": "ok"
+        },
+        {
+          "name": "fused_epilogue_matches_manual_eager_reconstruction_bit_exactly",
+          "status": "ok"
+        },
+        {
+          "name": "training_mode_on_an_unsupported_dtype_falls_back_and_is_counted",
+          "status": "ok"
+        },
+        {
+          "name": "adapter_config_default_optional_fields",
+          "status": "ok"
+        },
+        {
+          "name": "adapter_config_json_roundtrip",
+          "status": "ok"
+        },
+        {
+          "name": "effective_rank_substring_match",
+          "status": "ok"
+        },
+        {
+          "name": "lora_build_config_frozen_is_no_op",
+          "status": "ok"
+        },
+        {
+          "name": "lora_linear_trainable_params_count",
+          "status": "ok"
+        },
+        {
+          "name": "maybe_lora_linear_named_weights_only_for_lora",
+          "status": "ok"
+        },
+        {
+          "name": "rank_zero_is_a_typed_refusal_in_new_and_from_loaded",
+          "status": "ok"
+        },
+        {
+          "name": "should_apply_lora_all_linear",
+          "status": "ok"
+        },
+        {
+          "name": "should_apply_lora_exact_match",
+          "status": "ok"
+        },
+        {
+          "name": "should_apply_lora_layer_filter",
+          "status": "ok"
+        },
+        {
+          "name": "new_and_from_loaded_pin_bit_equal_scaling",
+          "status": "ok"
+        },
+        {
+          "name": "save_load_adapter_roundtrip",
+          "status": "ok"
+        },
+        {
+          "name": "maybe_lora_linear_frozen_forward_matches_underlying",
+          "status": "ok"
+        },
+        {
+          "name": "backbone_precision_parity::the_two_arms_agree_at_f32_too",
+          "status": "ok"
+        },
+        {
+          "name": "lora_linear_gaussian_init_diverges_from_base",
+          "status": "ok"
+        },
+        {
+          "name": "lora_linear_zeros_b_init_is_identity",
+          "status": "ok"
+        },
+        {
+          "name": "lora_linear_rslora_scaling",
+          "status": "ok"
+        },
+        {
+          "name": "backbone_precision_parity::lora_arm_honours_the_backbone_dtype_like_the_frozen_arm",
+          "status": "ok"
+        }
+      ],
+      "results": [
+        {
+          "outcome": "ok",
+          "passed": 18,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "outcome": "ok",
+          "passed": 5,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "outcome": "ok",
+          "passed": 18,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "outcome": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        }
+      ]
+    }
+  },
+  "bench_legs": [
+    {
+      "file": "p1base_b8_s128_d0.json",
+      "s_per_step_p50": 0.272082743,
+      "triplets_per_s": 29.40282030308699,
+      "peak_vram_bytes": 23876075520.0,
+      "max_grad_norm": null,
+      "dispatch_counters": {
+        "ln_fused_dispatches": 1425,
+        "ln_eager_dispatches": 0,
+        "rope_fused_dispatches": 1400,
+        "rope_eager_dispatches": 0,
+        "softmax_fused_dispatches": 700,
+        "softmax_eager_dispatches": 0,
+        "geglu_fused_dispatches": 700,
+        "geglu_eager_dispatches": 0,
+        "lora_epilogue_fused_dispatches": 2800,
+        "lora_epilogue_eager_dispatches": 0
+      },
+      "fused_proof": true
+    },
+    {
+      "file": "p1base_b8_s512_d0.05.json",
+      "s_per_step_p50": 1.091960584,
+      "triplets_per_s": 7.326271769531198,
+      "peak_vram_bytes": 79811313664.0,
+      "max_grad_norm": null,
+      "dispatch_counters": {
+        "ln_fused_dispatches": 1425,
+        "ln_eager_dispatches": 0,
+        "rope_fused_dispatches": 1400,
+        "rope_eager_dispatches": 0,
+        "softmax_fused_dispatches": 700,
+        "softmax_eager_dispatches": 0,
+        "geglu_fused_dispatches": 700,
+        "geglu_eager_dispatches": 0,
+        "lora_epilogue_fused_dispatches": 2800,
+        "lora_epilogue_eager_dispatches": 0
+      },
+      "fused_proof": true
+    },
+    {
+      "file": "p1base_b8_s512_d0.json",
+      "s_per_step_p50": 1.039417847,
+      "triplets_per_s": 7.696615969304211,
+      "peak_vram_bytes": 71858913280.0,
+      "max_grad_norm": null,
+      "dispatch_counters": {
+        "ln_fused_dispatches": 1425,
+        "ln_eager_dispatches": 0,
+        "rope_fused_dispatches": 1400,
+        "rope_eager_dispatches": 0,
+        "softmax_fused_dispatches": 700,
+        "softmax_eager_dispatches": 0,
+        "geglu_fused_dispatches": 700,
+        "geglu_eager_dispatches": 0,
+        "lora_epilogue_fused_dispatches": 2800,
+        "lora_epilogue_eager_dispatches": 0
+      },
+      "fused_proof": true
+    }
+  ],
+  "status": "GREEN"
+}

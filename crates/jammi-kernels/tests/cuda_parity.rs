@@ -29,12 +29,13 @@
 
 #![cfg(feature = "cuda")]
 
-use candle_core::{DType, Device, Error, Tensor, Var, D};
+use candle_core::{DType, Device, Error, Layout, Tensor, Var, D};
 use half::bf16;
 use jammi_kernels::ops::{
-    apply1, apply2, apply3, AttentionBlockFused, Axpy, DropoutFused, DropoutKey, FullyMaskedPolicy,
-    GegluFused, GeluVariant, LayerNormFused, LowRankResidualLinear, PhiloxKatProbe, RopeFused,
-    ScaledCastAdd, SoftmaxLastDimFused, ATTENTION_BLOCK_WINDOW_MASKED_VALUE,
+    apply1, apply2, apply3, bwd_gradient_gemm_layouts, AttentionBlockFused, Axpy, DropoutFused,
+    DropoutKey, FullyMaskedPolicy, GegluFused, GeluVariant, LayerNormFused, LowRankResidualLinear,
+    PhiloxKatProbe, RopeFused, ScaledCastAdd, SoftmaxLastDimFused,
+    ATTENTION_BLOCK_WINDOW_MASKED_VALUE,
 };
 
 fn axpy(alpha: f64, x: &Tensor, y: &Tensor) -> candle_core::Result<Tensor> {
@@ -3846,7 +3847,7 @@ fn combined_attention_mask(
 }
 
 // -----------------------------------------------------------------------
-// Derived bf16 bounds for the attention_block legs (audit B3).
+// Derived bf16 bounds for the attention_block legs.
 //
 // bf16 keeps 8 significand bits (7 stored + the hidden one), so the ULP at
 // |x| is `2^(e - 7)` for |x|'s binary exponent `e` — at most `2^-7 * |x|`
@@ -4073,7 +4074,7 @@ fn assert_attention_block_parity_f32(
     let mask_v = vec![0f32; batch * seq];
     let scale = 1.0 / (head_dim as f32).sqrt();
     let op = AttentionBlockFused::new(scale, FullyMaskedPolicy::Zeros, true).unwrap();
-    // A NON-UNIFORM gradient seed (audit B11): `sum_all().backward()`'s
+    // A NON-UNIFORM gradient seed: `sum_all().backward()`'s
     // all-ones `dy` cancels exactly the class of scatter/transpose bug
     // this cross-device oracle exists to catch.
     let dy_v = attention_dy_fixture(batch * seq * heads * head_dim, 3.0);
@@ -4423,12 +4424,12 @@ fn attention_block_bf16_emulated_cpu_reference(
 /// avoids (raw `[-10, 10]`) specifically BECAUSE bit-identity must hold
 /// regardless of score magnitude — unlike a tolerance bound, exact equality
 /// has no domain restriction to violate.
-/// A DELIBERATE cross-form probe (audit B2), not a value-correctness
-/// oracle: `out_eager` below builds its `k` transpose via `.contiguous()`
-/// (a MATERIALIZED copy — cuBLAS `OP_N` on a fresh buffer) where
+/// A DELIBERATE cross-form probe, not a value-correctness oracle:
+/// `out_eager` below builds its `k` transpose via `.contiguous()` (a
+/// MATERIALIZED copy — cuBLAS `OP_N` on a fresh buffer) where
 /// `AttentionBlockFused`'s own `fwd` passes a transpose VIEW (cuBLAS
 /// `OP_T`, no copy — see the module doc's "GEMM operand form is a
-/// determinism concern, not just admissibility" section, esc-P3-B0). The
+/// determinism concern, not just admissibility" section). The
 /// two GEMMs therefore compute the SAME real-number value through
 /// POSSIBLY different cuBLAS blocking/accumulation order, so this test
 /// asserts a DERIVED bf16-ULP bound (never `assert_eq!` — exact equality
@@ -4700,6 +4701,19 @@ fn mask_shape_of(mask_v: &[f32], batch: usize, seq: usize) -> (usize, usize, usi
 /// against. Returns `(out_values, dqkv_values)`, both cast to `f32`
 /// AFTER the graph runs in `dtype` (any divergence already happened in
 /// `dtype` and survives the upcast exactly).
+///
+/// NOT independent of `bwd`'s OWN operand-form choice for the round-4
+/// GEMM-operand-FORM defect (P3 fix round 4, deliverable 2/3): this
+/// reference's own `scores`/`ctx` matmuls deliberately keep `fwd`'s
+/// transposed-VIEW operand form (see the doc below on `k_rot`'s
+/// transpose), NOT production's `crate::contiguous_matmul` materialized
+/// form, specifically so `attention_block_bwd_parity_f32_*_cuda`'s
+/// `assert_eq!` tests operand-form-IDENTICAL GEMMs (a real, legitimate,
+/// narrower claim — see this function's own inline comment on `scores`).
+/// It is NOT a stand-in for production's eager arm: `three_way_vs_f32_
+/// reference` and `attention_block_bwd_fused_vs_eager_dqkv_divergence_
+/// grows_with_depth_bf16_cuda` (`jammi-encoders`, `src/modernbert.rs`)
+/// use the REAL `forward_eager_training_attention_composition` for that.
 #[allow(clippy::too_many_arguments)]
 fn attention_block_bwd_eager_reference(
     device: &Device,
@@ -4760,7 +4774,7 @@ fn attention_block_bwd_eager_reference(
     let q_scaled = (q_rot * scale as f64).unwrap();
     // `k_rot`'s transpose is a VIEW (no `.contiguous()`) — the SAME
     // operand form `AttentionBlockFused`'s own `fwd` issues (module doc's
-    // "GEMM operand form is a determinism concern" section, audit B2):
+    // "GEMM operand form is a determinism concern" section):
     // this reference's `backward()` therefore differentiates through
     // candle's generic `Op::Matmul` bwd (`backprop.rs`: always a `.t()`
     // VIEW) with the SAME cuBLAS operand forms the op under test uses,
@@ -5033,46 +5047,29 @@ fn attention_block_bwd_parity_bf16_window_s512_cuda() {
     assert_attention_block_bwd_parity_cuda(&cuda, DType::BF16, 2, 512, 16, 64, Some(64), 14.0);
 }
 
-// Batch=1 legs (esc-P3-B0 follow-up): every OTHER attention_block leg in
-// this file runs batch=2 or batch=8, which is exactly why this cell was
-// never covered before this round. `bh = b*h` is 16 here (vs 128 at
-// batch=8) and `check_mask`'s leading-axis rule (`dims[0] == 1 || dims[0]
-// == b`) is structurally AMBIGUOUS at `b == 1` (a genuine per-batch
-// `[1,1,S,S]` mask and a broadcast-over-batch mask are shape-
-// indistinguishable) — both candidates this leg is built to catch.
+// Batch=1 legs: every OTHER attention_block leg in this file runs
+// batch=2 or batch=8. `bh = b*h` is 16 here (vs 128 at batch=8) and
+// `check_mask`'s leading-axis rule (`dims[0] == 1 || dims[0] == b`) is
+// structurally AMBIGUOUS at `b == 1` (a genuine per-batch `[1,1,S,S]`
+// mask and a broadcast-over-batch mask are shape-indistinguishable) —
+// both candidates this leg is built to catch.
 //
-// RESOLVED, NOT A DEFECT (esc-P3-B0 follow-up, pod-measured, three-way
-// F32-reference comparison — see `attention_block_bf16_three_way_vs_f32_reference_b1_and_b8_cuda`
-// below for the method): a real ModernBERT-large 20-step training run at
-// batch=1 shows a step-0 `Σ|dqkv|` (over all 224 LoRA tensors) that is
-// ~0.17% off eager's, where batch=8's is EXACTLY 0% — the initial read
-// was "batch=1 is a live defect". It is not. Comparing BOTH bf16 arms
-// against the SAME eager composition run entirely in F32 (the closest
-// available ground truth) on the SAME real checkpoint at batch=1: fused
-// deviates from the F32 reference by `Σ|fused-ref| = 2111.54` (per-
-// tensor, summed over 224 tensors), eager by `Σ|eager-ref| = 2103.95` —
-// a 0.36% RELATIVE difference between the two arms' OWN errors, against
-// each arm's own ~37.6%/37.5% deviation from the reference (ordinary
-// bf16 rounding, present in BOTH arms). Per-tensor, eager lands closer
-// to the reference for 65 of 224 tensors, fused for 44, and 115 tie —
-// consistent with two independent bf16 roundings of the same real value,
-// not one arm being systematically worse. At batch=8 fused and eager are
-// bit-identical to each other (0 tensors differ) and BOTH deviate from
-// the F32 reference by the identical `Σ|Δ| = 342.81` — batch=8's
-// exact-zero fused-vs-eager agreement is LUCK (the two arms' bf16
-// roundings happen to coincide for that shape), not evidence that
-// batch=1's non-zero agreement is wrong. The single-triplet ReLU hinge
-// loss `jammi-bench`'s `finetune-step` uses turns this ordinary,
-// expected bf16 rounding difference into a full 20-step loss-trajectory
-// divergence at batch=1 ONLY (a coin-flip-style amplifier, not a
-// correctness signal) — the loss trajectory is therefore NOT a valid
-// oracle at batch=1 (or any batch small enough for one triplet's ReLU
-// to flip), unlike at batch>=2 where B0's fix reproduces main's
-// trajectory bit-for-bit. The op-level single-call legs below (both
-// dtypes, swept past the real checkpoint's own measured max|qkv|) were
-// already green before this finding and remain the right coverage: they
-// prove the op ITSELF has no defect at this shape, which the three-way
-// comparison now confirms end to end too.
+// A single-step, single-shape fused-vs-eager comparison — at batch=1 OR
+// any other batch — CANNOT distinguish the GEMM-operand-form defect this
+// crate carries a dedicated oracle for from ordinary bf16 rounding noise:
+// the defect's own per-call bias is smaller than that noise at a single
+// call (see `ops::attention_block`'s module doc's "GEMM operand form is
+// a determinism concern" section) and only separates from it by
+// COMPOUNDING through depth.
+// `jammi_encoders::modernbert::tests::attention_block_fused_vs_eager_
+// dqkv_divergence_grows_with_depth_bf16_cuda` is that oracle; the legs
+// below (both dtypes, swept past the real checkpoint's own measured
+// max|qkv|) are op-level VALUE-correctness coverage, not a defect
+// oracle, and were not sufficient on their own to catch this round's
+// defect — see the module doc's own citation of both this fact and the
+// depth oracle that replaces the earlier single-checkpoint measurement
+// this comment used to quote (unreproducible from this repo — withdrawn,
+// see `three_way_vs_f32_reference`'s own doc).
 #[test]
 fn attention_block_bwd_parity_f32_window_s512_b1_cuda() {
     let Some(cuda) = cuda_device() else {
@@ -5089,8 +5086,99 @@ fn attention_block_bwd_parity_bf16_window_s512_b1_cuda() {
     assert_attention_block_bwd_parity_cuda(&cuda, DType::BF16, 1, 512, 16, 64, Some(64), 22.0);
 }
 
+/// P3 fix round 4, deliverable 3's "mechanism pin": captures `bwd`'s OWN
+/// `dqs`/`dkr` gradient-GEMM operand `Layout`s via
+/// [`bwd_gradient_gemm_layouts`] — never a fixture reconstructed
+/// independently of `bwd`'s code (the earlier
+/// `bwd_every_gemm_operand_is_admissible_at_boundary_and_production_ranks`
+/// test, `src/ops/attention_block.rs`, rebuilds these operands in the
+/// test body with its OWN hardcoded `.contiguous()` placement, so it
+/// stays green under a `bwd` regression — demoted, not counted, as this
+/// round's oracle) — and asserts two STRUCTURAL properties that flip
+/// specifically between `bwd`'s pre-round-4 form (`dqs = ds.matmul(&
+/// k_rot)`, `dkr = ds.transpose(...).matmul(&q_scaled)`) and this round's
+/// fix (`kt_contig` materialized, `matmul_grad_lhs`/`matmul_grad_rhs`):
+/// (1) `dqs`'s second operand (`ds`'s matmul partner) has a NON-unit
+/// last-axis stride — true only when it is a transposed VIEW of a
+/// MATERIALIZED `[B,H,D,S]` buffer (`kt_contig.transpose(...)`, this
+/// round's fix); `k_rot` passed directly (pre-round-4) is `[B,H,S,D]`
+/// row-major, last-axis stride `1`. (2) `dkr`'s FIRST operand has shape
+/// `[B,H,D,S]`, not `[B,H,S,S]` — pre-round-4's `dkr` GEMM was `ds.t() @
+/// q_scaled` (lhs shape `[B,H,S,S]`); this round's is `q_scaled.t() @
+/// ds` (lhs shape `[B,H,D,S]`) — a categorically different GEMM, not
+/// merely a different operand form of the same one (deliverable 3's own
+/// finding: `m`/`n` swapped). Neither check depends on comparing against
+/// a "production" reconstruction in this test body — both are intrinsic
+/// properties of the Layout `bwd_core` itself produces.
+#[test]
+fn attention_block_bwd_dqs_dkr_gemm_layouts_match_production_orientation_cuda() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let (batch, seq, heads, head_dim) = (2usize, 512usize, 16usize, 64usize);
+    let qkv_v = qkv_fixture(batch, seq, heads, head_dim, 60.0);
+    let rope_v = attention_rope_pack(seq, head_dim);
+    let mask_v = combined_attention_mask(&cuda, batch, seq, &vec![0f32; batch * seq], Some(64))
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let dy_v = attention_dy_fixture(batch * seq * heads * head_dim, 61.0);
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    let cast = |v: &[f32], shape: (usize, usize, usize, usize, usize)| -> Tensor {
+        Tensor::from_slice(v, shape, &cuda)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap()
+    };
+    let qkv = cast(&qkv_v, (batch, seq, 3, heads, head_dim));
+    let rope_pack = Tensor::from_slice(&rope_v, (2, 1, 1, seq, head_dim), &cuda)
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
+    let mask = Tensor::from_slice(&mask_v, mask_shape_of(&mask_v, batch, seq), &cuda)
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
+    let dy = Tensor::from_slice(&dy_v, (batch, seq, heads * head_dim), &cuda)
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
+
+    let layouts: [(Layout, Layout); 4] = bwd_gradient_gemm_layouts(
+        true,
+        scale,
+        FullyMaskedPolicy::Zeros,
+        &qkv,
+        &rope_pack,
+        &mask,
+        &dy,
+    )
+    .unwrap();
+    let (_dqs_lhs, dqs_rhs) = &layouts[2];
+    let (dkr_lhs, _dkr_rhs) = &layouts[3];
+
+    let dqs_rhs_last_stride = *dqs_rhs.stride().last().unwrap();
+    assert_ne!(
+        dqs_rhs_last_stride, 1,
+        "dqs's rhs operand has unit last-axis stride ({dqs_rhs_last_stride}) — this is `k_rot` \
+         passed directly (pre-round-4's operand form), not a transposed VIEW of a materialized \
+         `kt_contig` (this round's fix) — layout={dqs_rhs:?}"
+    );
+    let dkr_lhs_dims = dkr_lhs.dims();
+    assert_eq!(
+        dkr_lhs_dims[dkr_lhs_dims.len() - 2..],
+        [head_dim, seq],
+        "dkr's lhs operand shape is {dkr_lhs_dims:?}, not [.., {head_dim}, {seq}] — this round's \
+         fix issues `q_scaled.t() @ ds` (lhs [B,H,D,S]); pre-round-4's `dkr` issued `ds.t() @ \
+         q_scaled` (lhs [B,H,S,S]) — a categorically different GEMM, not just a different operand \
+         form of the same one"
+    );
+}
+
 // -----------------------------------------------------------------------
-// Three-way accuracy check against an F32 reference (esc-P3-B0 follow-up):
+// Three-way accuracy check against an F32 reference:
 // answers "is fused's bf16 gradient WORSE than eager's, relative to the
 // real-valued gradient neither bf16 arm can reach exactly" — the question
 // a fused-vs-eager `assert_eq!`/derived-bound comparison alone cannot
@@ -5178,7 +5266,7 @@ fn three_way_vs_f32_reference(
         scale,
     );
 
-    fn stats(label: &str, a: &[f32], reference: &[f32]) {
+    fn stats(label: &str, a: &[f32], reference: &[f32]) -> (f32, f64) {
         let mut max_abs = 0f32;
         let mut sum_sq_diff = 0f64;
         let mut sum_sq_ref = 0f64;
@@ -5190,47 +5278,67 @@ fn three_way_vs_f32_reference(
         }
         let rel_l2 = sum_sq_diff.sqrt() / sum_sq_ref.sqrt().max(1e-30);
         eprintln!("THREEWAY {label}: max|Δ|={max_abs:e} rel_l2={rel_l2:e}");
+        (max_abs, rel_l2)
     }
 
     let label = format!("shape=({batch},{seq},{heads},{head_dim}) amp={amplitude}");
-    stats(
+    let (_, out_fused_rel) = stats(
         &format!("fused_bf16_vs_ref out {label}"),
         &out_fused_bf16,
         &out_ref,
     );
-    stats(
+    let (_, out_eager_rel) = stats(
         &format!("eager_bf16_vs_ref out {label}"),
         &out_eager_bf16,
         &out_ref,
     );
-    stats(
+    let (_, dqkv_fused_rel) = stats(
         &format!("fused_bf16_vs_ref dqkv {label}"),
         &dqkv_fused_bf16,
         &dqkv_ref,
     );
-    stats(
+    let (_, dqkv_eager_rel) = stats(
         &format!("eager_bf16_vs_ref dqkv {label}"),
         &dqkv_eager_bf16,
         &dqkv_ref,
     );
+
+    // A SANITY backstop, not this crate's discriminating oracle for the
+    // GEMM-operand-form defect (see `tests::attention_block_fused_vs_
+    // eager_dqkv_divergence_grows_with_depth_bf16_cuda`, `jammi-encoders`
+    // `src/modernbert.rs`, for that — a SINGLE `bwd` call's own
+    // systematic bias is smaller than ordinary bf16 rounding noise at
+    // this amplitude, so a single-step comparison cannot see it; it only
+    // separates from noise by compounding through depth). This assertion
+    // exists to catch a GROSS regression at the op level (a wrong
+    // transpose, a dropped scale) that would blow past ordinary bf16
+    // noise even at a single step — generous on purpose.
+    const GROSS_REGRESSION_MULTIPLE: f64 = 8.0;
+    const GROSS_REGRESSION_FLOOR: f64 = 0.05;
+    for (name, fused_rel, eager_rel) in [
+        ("out", out_fused_rel, out_eager_rel),
+        ("dqkv", dqkv_fused_rel, dqkv_eager_rel),
+    ] {
+        let bound = eager_rel * GROSS_REGRESSION_MULTIPLE + GROSS_REGRESSION_FLOOR;
+        assert!(
+            fused_rel.is_finite() && fused_rel <= bound,
+            "{name} {label}: fused's rel_l2 vs the F32 reference ({fused_rel:e}) exceeds \
+             {GROSS_REGRESSION_MULTIPLE}x eager's own ({eager_rel:e}) + {GROSS_REGRESSION_FLOOR} \
+             — a gross regression (wrong transpose, dropped scale), not ordinary bf16 rounding"
+        );
+    }
 }
 
-/// esc-P3-B0 follow-up: at production-scale amplitude, is fused's BF16
-/// `dqkv` a WORSE approximation of the real-valued gradient than eager's?
-/// (Not "does fused equal eager" — see this test's module-adjacent doc
-/// comment above the batch=1 legs for why that question alone cannot
-/// distinguish a defect from two independent, both-legitimate bf16
-/// roundings.) Pod-measured with the real ModernBERT-large checkpoint's
-/// own gradients (not just this op-level fixture): at batch=1,
-/// `Σ|fused-ref| = 2111.54` vs `Σ|eager-ref| = 2103.95` over 224 LoRA
-/// tensors (0.36% relative difference, each ~37.5% of the reference's
-/// own magnitude — ordinary bf16 noise in BOTH arms); at batch=8 fused
-/// and eager are bit-identical (0 of 224 tensors differ) and both
-/// deviate from the reference by the identical `Σ|Δ| = 342.81`. Neither
-/// batch size shows fused being a worse approximation than eager. This
-/// op-level leg is the cheap, portable version of that same comparison
-/// (no real checkpoint needed): run it and read the printed `max|Δ|`/
-/// `rel_l2` pairs — `--nocapture` to see them.
+/// A SANITY leg (see [`three_way_vs_f32_reference`]'s own doc for why it
+/// is not this crate's discriminating oracle for the round-4 GEMM-
+/// operand-form defect). WITHDRAWN: an earlier revision of this doc
+/// quoted per-tensor numbers (`Σ|fused-ref|`/`Σ|eager-ref|`/a 65-vs-44-
+/// vs-115 "closer tensor" split) measured on the real ModernBERT-large
+/// checkpoint by a script committed NOWHERE in this repo — unreproducible
+/// from this tree, so withdrawn rather than repeated. This op-level leg
+/// is the reproducible replacement: it asserts (not merely prints) a
+/// generous sanity bound at `--nocapture`-visible amplitude, no real
+/// checkpoint needed.
 #[test]
 fn attention_block_bf16_three_way_vs_f32_reference_b1_and_b8_cuda() {
     let Some(cuda) = cuda_device() else {

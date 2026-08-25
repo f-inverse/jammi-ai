@@ -149,16 +149,16 @@
 //! `batch=8, seq=512`, `seed=42`, sha `8922094aa35d381d108420fefe82cba122bf6ebb`
 //! (`JAMMI_DEBUG_QKV_AMP=1` on the `Wqkv` output feeding
 //! `forward_training_attention`'s fused arm) — an order of magnitude past
-//! this ceiling. The op still admits and runs correctly there (esc-P3-B0's
-//! actual defect was a GEMM-operand-form determinism issue, fixed in this
-//! round — see "GEMM operand form is a determinism concern" above — NOT
-//! an amplitude-domain violation), but this crate makes NO derived-bound
+//! this ceiling. The op still admits and runs correctly there (this op's
+//! own defect history was a GEMM-operand-form determinism issue — see
+//! "GEMM operand form is a determinism concern" above — NOT an
+//! amplitude-domain violation), but this crate makes NO derived-bound
 //! CLAIM at that amplitude: the encoder-level oracle above compares fused
 //! vs eager through the REAL call site at `F32` (this op's CPU-only dtype)
 //! specifically because no bf16 bound at production amplitude exists to
 //! assert. A future CUDA-side production-amplitude bf16 bound would need
 //! either a tighter softmax-flip model or accepting a much larger
-//! constant — out of this round's scope.
+//! constant.
 //!
 //! ## `bwd`: ordinary `Tensor` composition, reusing this crate's own ops
 //!
@@ -184,71 +184,120 @@
 //! rank, off the real `Layout` each carries (device-independent, mirroring
 //! `LowRankResidualLinear`'s own precedent).
 //!
-//! ### `bwd`'s seven GEMMs: which recompute a forward GEMM, which are new
+//! ### `bwd`'s six GEMMs: which recompute a forward GEMM, which are new,
+//! and which operand form each targets
 //!
 //! `fwd` issues exactly two GEMMs: `scores = q_scaled · kᵀ` (`k`'s
 //! transpose is a VIEW — cuBLAS `OP_T`, no materialize) and `ctx = p · v`
 //! (both row-major — `OP_N`/`OP_N`). `bwd` reissues ONE of those two
-//! (`scores`, to recompute `P`) and adds five NEW gradient GEMMs that have
-//! no forward counterpart at all:
+//! (`scores`, to recompute `P`) and adds four NEW gradient GEMMs, each
+//! issued through [`matmul_grad_lhs`]/[`matmul_grad_rhs`] — the ONE
+//! definition of "the gradient GEMM of `A@B`" this op shares with
+//! candle's own generic `Op::Matmul` backward (see those functions' own
+//! doc), so a gradient GEMM's operand form is chosen once, not re-derived
+//! independently at each call site:
 //!
-//! | `bwd` GEMM | recompute of a fwd GEMM? | operand shape |
+//! | `bwd` GEMM | recompute of a fwd GEMM? | operand form target |
 //! |---|---|---|
-//! | `scores = q_scaled · k_rotᵀ` | YES — `fwd`'s `QKᵀ`, same shape | `k_rot` transpose VIEW, no `.contiguous()` (see below) |
-//! | `dv = pᵀ · dctx` | no — new | `p` transpose VIEW, no `.contiguous()` (see "GEMM operand form is a determinism concern, not just admissibility" below) |
-//! | `dp = dctx · vᵀ` | no — new (NOT `fwd`'s `PV`: `v` is transposed here, `fwd`'s `PV` never transposes `v`) | `v` transpose VIEW, no `.contiguous()` |
-//! | `dqs = ds · k_rot` | no — new | both row-major (already contiguous — `ds` is a fresh `CustomOp2` output, `k_rot` a fresh `apply3`/`.contiguous()` result) |
-//! | `dkr = dsᵀ · q_scaled` | no — new | `ds` transpose VIEW, no `.contiguous()` |
+//! | `scores = q_scaled · k_rotᵀ` | YES — `fwd`'s `QKᵀ`, same shape | matches `fwd`'s OWN operand form (`k_rot` transpose VIEW, no `.contiguous()`) — see "fwd/bwd GEMM shape match" below |
+//! | `dv = matmul_grad_rhs(p, dctx)` | no — new | `p` transpose VIEW (already contiguous, no extra materialize) |
+//! | `dp = matmul_grad_lhs(dctx, v_c)` | no — new | `v_c` transpose VIEW (already contiguous) |
+//! | `dqs = matmul_grad_lhs(ds, kt_contig)` | no — new | `kt_contig`, a MATERIALIZED transpose of `k_rot` — NOT a view of it |
+//! | `dkr = matmul_grad_rhs(q_scaled, ds)` then `.transpose()` | no — new | `q_scaled` transpose VIEW (already contiguous); the trailing `.transpose()` is a view too |
 //!
 //! (`ctx` itself — `fwd`'s SECOND GEMM — is never recomputed in `bwd`: the
 //! op contract's "no packed `[O|L]` output" design means `bwd` only ever
 //! needs `dctx`, supplied by the caller as `grad_res`, never `ctx` itself.)
 //!
-//! ### GEMM operand form is a determinism concern, not just admissibility (esc-P3-B0)
+//! `dv`/`dp` reach production's own operand form for free: `p` and `v_c`
+//! are ALREADY naturally contiguous on both the fused and the production
+//! eager path (`crate::contiguous_matmul`'s `.contiguous()` on an
+//! already-contiguous tensor is a no-op clone), so
+//! `matmul_grad_rhs`/`matmul_grad_lhs` see the identical operand shapes
+//! either way. `dqs`/`dkr` do NOT get that for free: production's forward
+//! for the `scores` GEMM (`crate::contiguous_matmul`,
+//! `crates/jammi-encoders/src/lib.rs:139-141`, called from
+//! `modernbert.rs:1016`) materializes BOTH operands, unlike `fwd`'s own
+//! view-based `scores` GEMM this op recomputes above — so `bwd` builds a
+//! SEPARATE materialized `kt_contig` specifically for the `dqs`/`dkr`
+//! gradient GEMMs (never for the `scores` recompute, which keeps `fwd`'s
+//! own view form — see "fwd/bwd GEMM shape match" below for why those two
+//! targets are legitimately different GEMMs with legitimately different
+//! operand-form rules), so `matmul_grad_lhs`/`matmul_grad_rhs` differentiate
+//! the SAME `Op::Matmul(q_scaled, kt_contig)` shape production's own
+//! autograd does, byte-for-byte, not merely value-for-value.
 //!
-//! An earlier revision materialized (`.contiguous()`) the transposed operand
-//! of `dv`/`dp`/`dkr` (`pᵀ`, `vᵀ`, `dsᵀ`), reasoning that since none of these
-//! four GEMMs recomputes a `fwd` GEMM, their own `.contiguous()` placement
-//! was a free choice — "purely for correctness/admissibility, not parity".
-//! That reasoning MISSED the real constraint: candle's own generic
-//! `Op::Matmul` backward (`backprop.rs`, `Op::Matmul(lhs, rhs) =>
-//! grad.matmul(&rhs.t()) ... lhs.t().matmul(&grad)`) NEVER materializes —
-//! it always differentiates through a transposed VIEW. The eager training
-//! composition's forward (`jammi_encoders::modernbert::
-//! forward_eager_training_attention_composition`) therefore differentiates
-//! `P·V` and `Q·Kᵀ` into `dV`/`dP`/`dQ`/`dK` GEMMs whose transposed operand
-//! is ALWAYS a view, never a copy. cuBLAS's bf16 strided-batched GEMM picks
-//! its internal accumulation order from the operand's `(rows, cols,
-//! row_stride, col_stride)`, and a materialized-contiguous operand and a
-//! transposed-view operand of the SAME logical matrix can — and, measured
-//! at `b=8, h=16, s=512` on the real ModernBERT-large checkpoint, DO —
-//! drive cuBLAS to different blocking, producing a different bf16-rounded
-//! result for that one GEMM. The per-GEMM difference is small (a few ULPs,
-//! within this op's own derived-bound framework — see `Bf16LegBounds` in
-//! `tests/cuda_parity.rs`), but it is SYSTEMATIC (a fixed function of the
-//! two operand forms, not i.i.d. noise), so it does not average out: it
-//! compounds through the residual gradient path across a 28-layer stack
-//! and across training steps. Measured on the pod (A100, seed 42, LoRA
-//! rank 16 on `Wqkv,Wo,Wi`, `batch=8, seq=512`, bf16): with the
-//! materialized form, `attention_block_fused`'s own step-0 gradient sum
-//! (`Σ|dqkv|` over all 224 trainable tensors) was already ~0.2% off the
-//! eager composition's (1730.05 vs 1733.40); by step 1 the DIVERGED total
-//! was ~3.0x eager's (37383.6 vs 12528.8), and the resulting 20-step loss
-//! trajectory on the real checkpoint was FLAT (`0.3184 → 0.2910`) where
-//! eager LEARNS (`0.3184 → 0.1006`). Dropping the three `.contiguous()`
-//! calls above (matching candle's own view-based `Op::Matmul` backward
-//! convention) narrows the step-1 total to ~1.07x eager's (13357.7 vs
-//! 12528.8) and reproduces eager's 20-step trajectory to within bf16 noise
-//! (`crates/jammi-encoders/tests/it/modernbert.rs`'s
-//! `fused_attention_block_matches_eager_lora_gradients_at_production_seq_on_head64`
-//! is the regression oracle; `tests/cuda_parity.rs`'s
-//! `attention_block_bwd_parity_*` legs are the op-level oracles). The four
-//! remaining GEMMs whose operand is ALREADY naturally contiguous
-//! (`q_scaled`, `k_rot`, `ds`, `dctx` — each a fresh op output or a fresh
-//! `.contiguous()` result upstream) keep no redundant `.contiguous()`
-//! either, so every GEMM operand in `bwd` is either genuinely contiguous
-//! or a bare transposed VIEW — never a copy this op chose to make for its
-//! own sake.
+//! ### GEMM operand form is a determinism concern, not just admissibility
+//!
+//! cuBLAS's bf16 strided-batched GEMM picks its internal accumulation
+//! order from the operand's `(rows, cols, row_stride, col_stride)`, and a
+//! materialized-contiguous operand and a transposed-view operand of the
+//! SAME logical matrix can drive cuBLAS to different blocking, producing
+//! a different bf16-rounded result for that one GEMM. Any per-GEMM
+//! difference this causes is small (a few ULPs — `Bf16LegBounds` in
+//! `tests/cuda_parity.rs`) but SYSTEMATIC (a fixed function of the two
+//! operand forms, not i.i.d. noise): it does not average out across a
+//! training step or a layer stack. A prior round of this fix dropped
+//! `.contiguous()` from `dv`/`dp`/`dkr` on the theory that candle's
+//! `Op::Matmul` backward "never materializes"; that is true of `dv`/`dp`
+//! (whose forward operands are already contiguous either way) but false
+//! of `dqs`/`dkr`, whose forward (`scores`) IS materialized in
+//! production — a mismatch the prior round's own oracles could not see:
+//! a CPU/F32 encoder-level comparison runs at a dtype/device pair with no
+//! cuBLAS bf16 blocking sensitivity at all, and this file's bf16
+//! derived-bound legs compare a SINGLE `bwd` call, whose own
+//! `7 * bf16_ulp(dqkv_max)` floor swallows a divergence this small by
+//! construction (a single call cannot show that the divergence is
+//! SYSTEMATIC rather than ordinary bf16 rounding noise — only compounding
+//! it across a step can). `matmul_grad_lhs`/`matmul_grad_rhs` plus
+//! `kt_contig` (previous section) close the gap STRUCTURALLY: the fused
+//! and production GEMMs are the same call by definition now, not merely
+//! measured close. `tests::attention_block_bwd_two_step_compounding_
+//! defect_detector_cuda` (`tests/cuda_parity.rs`) is the numeric
+//! backstop — it applies one arm's own step-0 gradient as an SGD step
+//! before comparing step 1, the minimum compounding needed to separate a
+//! systematic divergence from ordinary per-call bf16 noise — and is RED
+//! with `kt_contig` removed (`dqs`/`dkr` computed from `k_rot`/`q_scaled`
+//! directly, `fwd`'s own operand form rather than production's), GREEN
+//! with it present; both readings are reported in this round's hand-off,
+//! not merely asserted here. `tests::attention_block_bwd_gemm_layouts_
+//! match_production_eager_cuda` is the structural companion: it captures
+//! each gradient GEMM's operand `Layout` directly from `bwd_core`'s own
+//! code (via [`bwd_gradient_gemm_layouts`], not a fixture reconstructed
+//! separately from it) and asserts two STRUCTURAL properties that flip
+//! specifically between the pre-round-4 operand forms and this round's
+//! fix (that test's own doc has the exact stride/shape claims), so a
+//! future re-introduction of a bare `k_rot`/`q_scaled` operand in place
+//! of `kt_contig` fails immediately, structurally, without needing bf16
+//! noise to average out first.
+//!
+//! ### The two-armed rule: which GEMMs stay a VIEW, which get materialized
+//!
+//! An earlier revision of this doc claimed every `bwd` GEMM operand is
+//! "either genuinely contiguous or a bare transposed VIEW — never a copy
+//! this op chose to make for its own sake". That is false on its face:
+//! `dctx` (`grad_res.reshape(...).transpose(1, 2)?.contiguous()?`) IS a
+//! copy `bwd` makes, unconditionally, every call. The REAL rule has two
+//! arms, and both are matches to a SPECIFIC real thing, never "for its
+//! own sake": (1) a GEMM that RECOMPUTES a `fwd` GEMM (`scores`, the one
+//! row in the table above) keeps `fwd`'s OWN operand form — a view stays
+//! a view, because that is what `fwd` itself issues, and `bwd`'s job
+//! there is to reproduce it exactly (see "fwd/bwd GEMM shape match"
+//! below). (2) every OTHER GEMM's operand form matches whatever
+//! PRODUCTION's OWN autograd would hand it, and production's own
+//! `Op::Matmul` backward NEVER hands a bare, unaccumulated view for an
+//! UPSTREAM gradient (as opposed to a forward-graph operand): candle
+//! accumulates every gradient through `GradStore::or_insert`
+//! (`backprop.rs:768-777`), which starts from `tensor.zeros_like()` (a
+//! fresh, CONTIGUOUS buffer) and `.add()`s into it — so the `grad`
+//! `Op::Matmul`'s own backward formula receives is ALWAYS contiguous on
+//! production's side too, whether or not the value it wraps came from a
+//! transposed view somewhere upstream. `dctx` (this op's own analogue of
+//! that `grad`) and `kt_contig` (`scores`'s forward operand, materialized
+//! on production via `crate::contiguous_matmul`) are both materialized
+//! for exactly this reason — matching a specific, cited real behaviour on
+//! the production side, not "for its own sake" and not merely "because it
+//! was needed for admissibility".
 //!
 //! ### fwd/bwd GEMM shape match (`scores`, the one recomputed GEMM)
 //!
@@ -269,8 +318,7 @@
 //! proves the VIEW form specifically.
 //!
 //! Two SEPARATE claims sit in this section, and only one of them is
-//! guaranteed (audit B2 flagged the earlier text for not distinguishing
-//! them): (1) `fwd`'s `scores` GEMM and `bwd`'s `scores` recompute issue
+//! guaranteed: (1) `fwd`'s `scores` GEMM and `bwd`'s `scores` recompute issue
 //! the IDENTICAL operand shape/transpose-mode pair — ARCHITECTURAL,
 //! guaranteed by this op's own source on every device, checked by
 //! `bwd_every_gemm_operand_is_admissible_at_boundary_and_production_ranks`.
@@ -473,8 +521,8 @@ impl AttentionBlockFused {
     /// that fails this check with a typed error rather than silently
     /// accepting a value whose bit-exactness claim this op cannot actually
     /// make (family D): `0.125` (`1/sqrt(64)`, this op's own production
-    /// value) passes; `0.1` (used by earlier, pre-fix-round test fixtures
-    /// as an "arbitrary" scale) is refused.
+    /// value) passes; `0.1` (used by earlier test fixtures as an
+    /// "arbitrary" scale) is refused.
     pub fn new(scale: f32, fully_masked: FullyMaskedPolicy, rope: bool) -> Result<Self> {
         if !scale.is_finite() || scale <= 0.0 {
             return Err(Error::Msg(format!(
@@ -628,6 +676,37 @@ pub(crate) fn check_rope_pack(l: &Layout, s: usize, d: usize, op: &'static str) 
     Ok(dims[3])
 }
 
+/// The `lhs`-gradient half of candle's own generic `Op::Matmul` backward,
+/// extracted as a named, standalone function rather than re-derived at
+/// each call site: `backprop.rs`'s `Op::Matmul(lhs, rhs) => { let
+/// lhs_grad = grad.matmul(&rhs.t()?)?; ... }` (candle-core 0.11.0,
+/// `src/backprop.rs:461`). Any GEMM's `lhs`-gradient — this op's `bwd`
+/// included — is `d(A@B)/dA` in matrix form: `grad @ Bᵀ`; this function
+/// computes exactly that, with `rhs.t()` a transposed VIEW of whatever
+/// `rhs` physically is (a bare view if `rhs` is a view, a view of a
+/// materialized buffer if `rhs` was `.contiguous()`-ed first — the caller
+/// controls which by choosing `rhs`'s own form, never this function).
+/// [`matmul_grad_rhs`] is the other half of the pair. Two things that are
+/// the same computation at different call sites — production's eager
+/// training composition's autograd, `crate::contiguous_matmul`'s implicit
+/// backward via candle's own `Op::Matmul`, and this op's hand-written
+/// `bwd` — are one thing: this function IS that one definition, so `bwd`
+/// and production's eager arm cannot silently drift into issuing
+/// different GEMMs for the same gradient again (P3 fix round 4,
+/// deliverable 3 — see `bwd`'s own doc comment on `dqs`/`dkr` for why
+/// this mattered there specifically).
+pub fn matmul_grad_lhs(grad: &Tensor, rhs: &Tensor) -> Result<Tensor> {
+    grad.matmul(&rhs.t()?)
+}
+
+/// The `rhs`-gradient half of the pair (`backprop.rs`: `let rhs_grad =
+/// lhs.t()?.matmul(&grad)?;`, `src/backprop.rs:465`) — `d(A@B)/dB = Aᵀ @
+/// grad`. See [`matmul_grad_lhs`]'s doc for the shared-definition
+/// rationale.
+pub fn matmul_grad_rhs(lhs: &Tensor, grad: &Tensor) -> Result<Tensor> {
+    lhs.t()?.matmul(grad)
+}
+
 impl CustomOp3 for AttentionBlockFused {
     fn name(&self) -> &'static str {
         "attention_block_fused"
@@ -736,6 +815,12 @@ impl CustomOp3 for AttentionBlockFused {
     }
 
     /// See the module doc's "`bwd`: ordinary `Tensor` composition" section.
+    /// Delegates to `bwd_core` (private, this module), which this op's `dqkv` output and
+    /// [`bwd_gradient_gemm_layouts`]'s test-side layout introspection both
+    /// call — the SAME code path, not two independently maintained copies
+    /// of it (P3 fix round 4: a fixture reconstructed separately from
+    /// `bwd`'s own logic cannot regress when `bwd` does — see
+    /// `bwd_gradient_gemm_layouts`'s own doc).
     fn bwd(
         &self,
         qkv: &Tensor,
@@ -752,107 +837,242 @@ impl CustomOp3 for AttentionBlockFused {
                  be tracked (never a Var, never downstream of one)"
             )));
         }
-        // DETACH every input before composing anything (module doc's
-        // "`bwd` runs DETACHED" section): `qkv` is a tracked graph node in
-        // production (downstream of the `Wqkv` LoRA `Var`s), so without
-        // this every `Tensor` built below would carry a `BackpropOp`
-        // cloning its inputs (candle-core 0.11.0 `op.rs`'s
-        // `BackpropOp::new1/new2/new3` — `if arg.track_op() {
-        // Some(f(arg.clone())) }`), the explicit `drop`s below would free
-        // NOTHING (the consumer's `Op` still owns a clone), and the whole
-        // chain would be handed back to the engine inside `dqkv`'s own
-        // `Op`. candle's engine detaches the incoming `grad` for exactly
-        // this reason (`backprop.rs`'s `grad.detach()` — "to avoid
-        // computing the backprop graph of the backprop itself"); this op
-        // does the same for its OTHER three inputs. `detach` shares
-        // storage (no copy) and is a no-op clone on an already-untracked
-        // tensor (`tensor.rs`'s `Tensor::detach`).
-        let qkv = qkv.detach();
-        let rope_pack = rope_pack.detach();
-        let mask = mask.detach();
-        let grad_res = grad_res.detach();
-        let (b, s, three, h, d) = qkv.dims5()?;
-        if three != 3 {
-            return Err(Error::Msg(format!(
-                "{op}: qkv must be rank 5 [batch, seq, 3, heads, head_dim], got 3-axis size {three}"
-            )));
-        }
-
-        let q0 = qkv.narrow(2, 0, 1)?.squeeze(2)?.transpose(1, 2)?;
-        let k0 = qkv.narrow(2, 1, 1)?.squeeze(2)?.transpose(1, 2)?;
-        let v0 = qkv.narrow(2, 2, 1)?.squeeze(2)?.transpose(1, 2)?;
-
-        let (q_rot, k_rot, cos_sin) = if self.rope {
-            let cos_full = rope_pack.narrow(0, 0, 1)?.squeeze(0)?;
-            let sin_full = rope_pack.narrow(0, 1, 1)?.squeeze(0)?;
-            let cos = cos_full.narrow(2, 0, s)?;
-            let sin = sin_full.narrow(2, 0, s)?;
-            let qr = apply3(&q0.contiguous()?, &cos, &sin, RopeFused::new(false))?;
-            let kr = apply3(&k0.contiguous()?, &cos, &sin, RopeFused::new(false))?;
-            (qr, kr, Some((cos, sin)))
-        } else {
-            (q0.contiguous()?, k0.contiguous()?, None)
-        };
-
-        let q_scaled = (&q_rot * f64::from(self.scale))?;
-        let v_c = v0.contiguous()?;
-
-        // `mask` is ALREADY the caller's combined padding-plus-band sum
-        // (module doc's "window is construction data at the call site"
-        // section) — no band to rebuild here, unlike earlier revisions of
-        // this op.
-        //
-        // `scores` uses the SAME transposed-VIEW `k_rot` GEMM shape `fwd`
-        // issues (`.transpose(...)` with NO trailing `.contiguous()` — see
-        // the module doc's "fwd/bwd GEMM shape match" section).
-        let scores = q_scaled
-            .contiguous()?
-            .matmul(&k_rot.transpose(D::Minus1, D::Minus2)?)?;
-        let p = apply2(&scores, &mask, SoftmaxLastDimFused::new(self.fully_masked))?;
-        // `scores`'s only use was building `p` above (module doc's
-        // "transient scoping" section) — drop it now instead of letting it
-        // live to the end of `bwd`.
-        drop(scores);
-
-        let dctx = grad_res
-            .reshape((b, s, h, d))?
-            .transpose(1, 2)?
-            .contiguous()?;
-
-        let dv = p.transpose(D::Minus1, D::Minus2)?.matmul(&dctx)?;
-        let dp = dctx.matmul(&v_c.transpose(D::Minus1, D::Minus2)?)?;
-        let ds = apply2(&p, &dp, SoftmaxBwdDScores)?;
-        // `p`'s last use (its second, after `dv` above) and `dp`'s only
-        // use were both building `ds` — drop both now.
-        drop(p);
-        drop(dp);
-
-        let dqs = ds.matmul(&k_rot)?;
-        let dkr = ds.transpose(D::Minus1, D::Minus2)?.matmul(&q_scaled)?;
-        // `ds`'s last use (its second, after `dqs`) was building `dkr` —
-        // drop it; no `[B,H,S,S]`-shaped tensor remains live for the rest
-        // of `bwd`.
-        drop(ds);
-        let dqr = (&dqs * f64::from(self.scale))?;
-
-        let (dq0, dk0) = if let Some((cos, sin)) = cos_sin {
-            let dq0 = apply3(&dqr, &cos, &sin, RopeFused::new(true))?;
-            let dk0 = apply3(&dkr, &cos, &sin, RopeFused::new(true))?;
-            (dq0, dk0)
-        } else {
-            (dqr, dkr)
-        };
-
-        let to_qkv_slot = |t: &Tensor| -> Result<Tensor> {
-            t.transpose(1, 2)?.contiguous()?.reshape((b, s, 1, h, d))
-        };
-        let dqkv = Tensor::cat(
-            &[&to_qkv_slot(&dq0)?, &to_qkv_slot(&dk0)?, &to_qkv_slot(&dv)?],
-            2,
+        let (dqkv, _gemm_operands) = bwd_core(
+            op,
+            self.rope,
+            self.scale,
+            self.fully_masked,
+            qkv,
+            rope_pack,
+            mask,
+            grad_res,
         )?;
-
         Ok((Some(dqkv), None, None))
     }
+}
+
+/// `bwd`'s real computation, factored out of the `CustomOp3::bwd` trait
+/// method so it has exactly one caller-visible definition: the trait
+/// method above (production) and [`bwd_gradient_gemm_layouts`] (this
+/// file's own layout-identity test oracle, `tests/cuda_parity.rs`) both
+/// call THIS function, never a re-derived copy of its logic. Returns
+/// `dqkv` plus the four `(lhs, rhs)` operand pairs actually issued to
+/// `.matmul()` for `dv`/`dp`/`dqs`/`dkr` respectively — cheap to capture
+/// (a `Tensor` clone is a handle/refcount bump, not a data copy) and
+/// otherwise unused in production, where the trait method above discards
+/// them.
+#[allow(clippy::too_many_arguments)]
+fn bwd_core(
+    op: &'static str,
+    rope: bool,
+    scale: f32,
+    fully_masked: FullyMaskedPolicy,
+    qkv: &Tensor,
+    rope_pack: &Tensor,
+    mask: &Tensor,
+    grad_res: &Tensor,
+) -> Result<(Tensor, [(Tensor, Tensor); 4])> {
+    // DETACH every input before composing anything (module doc's
+    // "`bwd` runs DETACHED" section): `qkv` is a tracked graph node in
+    // production (downstream of the `Wqkv` LoRA `Var`s), so without
+    // this every `Tensor` built below would carry a `BackpropOp`
+    // cloning its inputs (candle-core 0.11.0 `op.rs`'s
+    // `BackpropOp::new1/new2/new3` — `if arg.track_op() {
+    // Some(f(arg.clone())) }`), the explicit `drop`s below would free
+    // NOTHING (the consumer's `Op` still owns a clone), and the whole
+    // chain would be handed back to the engine inside `dqkv`'s own
+    // `Op`. candle's engine detaches the incoming `grad` for exactly
+    // this reason (`backprop.rs`'s `grad.detach()` — "to avoid
+    // computing the backprop graph of the backprop itself"); this op
+    // does the same for its OTHER three inputs. `detach` shares
+    // storage (no copy) and is a no-op clone on an already-untracked
+    // tensor (`tensor.rs`'s `Tensor::detach`).
+    let qkv = qkv.detach();
+    let rope_pack = rope_pack.detach();
+    let mask = mask.detach();
+    let grad_res = grad_res.detach();
+    let (b, s, three, h, d) = qkv.dims5()?;
+    if three != 3 {
+        return Err(Error::Msg(format!(
+            "{op}: qkv must be rank 5 [batch, seq, 3, heads, head_dim], got 3-axis size {three}"
+        )));
+    }
+
+    let q0 = qkv.narrow(2, 0, 1)?.squeeze(2)?.transpose(1, 2)?;
+    let k0 = qkv.narrow(2, 1, 1)?.squeeze(2)?.transpose(1, 2)?;
+    let v0 = qkv.narrow(2, 2, 1)?.squeeze(2)?.transpose(1, 2)?;
+
+    let (q_rot, k_rot, cos_sin) = if rope {
+        let cos_full = rope_pack.narrow(0, 0, 1)?.squeeze(0)?;
+        let sin_full = rope_pack.narrow(0, 1, 1)?.squeeze(0)?;
+        let cos = cos_full.narrow(2, 0, s)?;
+        let sin = sin_full.narrow(2, 0, s)?;
+        let qr = apply3(&q0.contiguous()?, &cos, &sin, RopeFused::new(false))?;
+        let kr = apply3(&k0.contiguous()?, &cos, &sin, RopeFused::new(false))?;
+        (qr, kr, Some((cos, sin)))
+    } else {
+        (q0.contiguous()?, k0.contiguous()?, None)
+    };
+
+    // Materialized ONCE here (not just at the `scores` call site) so
+    // the SAME contiguous buffer feeds both `scores`'s recompute below
+    // and `dkr`'s gradient GEMM further down — see that GEMM's own
+    // comment for why it needs a materialized `q_scaled`, not a view.
+    let q_scaled = (&q_rot * f64::from(scale))?.contiguous()?;
+    let v_c = v0.contiguous()?;
+
+    // `mask` is ALREADY the caller's combined padding-plus-band sum
+    // (module doc's "window is construction data at the call site"
+    // section) — no band to rebuild here, unlike earlier revisions of
+    // this op.
+    //
+    // `scores` uses the SAME transposed-VIEW `k_rot` GEMM shape `fwd`
+    // issues (`.transpose(...)` with NO trailing `.contiguous()` — see
+    // the module doc's "fwd/bwd GEMM shape match" section). This is a
+    // RECOMPUTE of `fwd`'s own GEMM, matched to `fwd`, not to
+    // production's `contiguous_matmul` — see the module doc's
+    // "two-armed rule" section for why `bwd` deliberately keeps two
+    // different operand-form targets for two different GEMMs.
+    let scores = q_scaled.matmul(&k_rot.transpose(D::Minus1, D::Minus2)?)?;
+    let p = apply2(&scores, &mask, SoftmaxLastDimFused::new(fully_masked))?;
+    // `scores`'s only use was building `p` above (module doc's
+    // "transient scoping" section) — drop it now instead of letting it
+    // live to the end of `bwd`.
+    drop(scores);
+
+    let dctx = grad_res
+        .reshape((b, s, h, d))?
+        .transpose(1, 2)?
+        .contiguous()?;
+
+    // `dv`/`dp` differentiate `ctx = p · v_c` (`fwd`'s SECOND GEMM,
+    // never itself recomputed — see the table above) through
+    // [`matmul_grad_rhs`]/[`matmul_grad_lhs`], candle's own generic
+    // `Op::Matmul` backward formula. `p` and `v_c` are ALREADY
+    // naturally contiguous (fresh op outputs), the exact form
+    // `crate::contiguous_matmul`'s `a.contiguous()?.matmul(&b.
+    // contiguous()?)` would leave them in on the production eager
+    // path too — the shared definition needs no extra materialize
+    // here to match it.
+    let dv_operands = (p.transpose(D::Minus1, D::Minus2)?, dctx.clone());
+    let dv = matmul_grad_rhs(&p, &dctx)?;
+    let dp_operands = (dctx.clone(), v_c.transpose(D::Minus1, D::Minus2)?);
+    let dp = matmul_grad_lhs(&dctx, &v_c)?;
+    let ds = apply2(&p, &dp, SoftmaxBwdDScores)?;
+    // `p`'s last use (its second, after `dv` above) and `dp`'s only
+    // use were both building `ds` — drop both now.
+    drop(p);
+    drop(dp);
+
+    // `dqs`/`dkr` differentiate `scores = q_scaled · k_rotᵀ` — but
+    // PRODUCTION's forward for THIS GEMM is
+    // `jammi_encoders::contiguous_matmul` (`crates/jammi-encoders/
+    // src/lib.rs:139-141`, called from `forward_eager_training_
+    // attention_composition` at `modernbert.rs:1016`), which
+    // materializes BOTH operands, NOT the transposed-VIEW `k_rotᵀ`
+    // `scores`'s recompute above uses. Matching `contiguous_matmul`'s
+    // materialization here (deliberately NOT `fwd`'s own form, unlike
+    // `scores` above) is the fix: differentiating a materialized
+    // `kt_contig` through [`matmul_grad_lhs`]/[`matmul_grad_rhs`]
+    // issues the IDENTICAL GEMM (rows/cols/row_stride/col_stride)
+    // production's own autograd issues for `dQ`. `dK` needs one more
+    // step to get there — candle differentiates `kt_contig =
+    // k_rotᵀ.contiguous()` itself through `Op::Copy` (identity —
+    // candle-core 0.11.0 `backprop.rs:525-527`) then `Op::Transpose`
+    // (`grad.transpose(dim1, dim2)` — `backprop.rs:710-713`), which is
+    // exactly the trailing `.transpose()` below. Candle's OWN engine
+    // would leave THAT particular transpose's output a view too (`Op::
+    // Transpose`'s backward, `backprop.rs:710-713`, is a bare
+    // `grad.transpose(...)`), because the engine's `GradStore::or_insert`
+    // (`backprop.rs:768-777`) materializes it downstream via `zeros_like`
+    // + `.add()` when `dK`'s OWN gradient is later accumulated — a step
+    // `bwd_core` has no equivalent of (it composes ordinary `Tensor` ops,
+    // not the engine's accumulation machinery). The trailing
+    // `.contiguous()` below reproduces that materialization directly,
+    // and doubles as satisfying [`super::RopeFused`]'s own admission
+    // contract (contiguous input only) when `rope` is `true`.
+    // (P3 fix round 4, deliverable 3: an earlier revision of `bwd`
+    // computed `dqs`/`dkr` from `k_rot` directly — `fwd`'s operand form,
+    // not production's — issuing a DIFFERENT cuBLAS call from
+    // production's eager arm for this GEMM specifically, even after the
+    // round-3 fix aligned `dv`/`dp`. Measured on the pod (A100, `b=8,
+    // s=512, h=16, d=64`, bf16): reverting ONLY this — `dqs`/`dkr` back
+    // to the pre-round-4 form, `dv`/`dp` left at this round's shared
+    // definition — does NOT redden `tests::attention_block_fused_vs_
+    // eager_dqkv_divergence_grows_with_depth_bf16_cuda`
+    // (`jammi-encoders`): `r(1)` stays exactly `0.0` for every slot, IDENTICAL
+    // to the fully-fixed build, at this shape. Restoring the ORIGINAL
+    // esc-044 defect too (`dv`/`dp`/`dkr`'s three `.contiguous()` calls)
+    // reddens it regardless of `dqs`/`dkr`'s form. This round's
+    // `kt_contig`/shared-definition change for `dqs`/`dkr` is therefore
+    // justified STRUCTURALLY here — it provably issues the identical GEMM
+    // production's own autograd would (checked by `tests::attention_
+    // block_bwd_dqs_dkr_gemm_layouts_match_production_orientation_cuda`)
+    // — not as a numerically-demonstrated-necessary fix at this shape;
+    // whether it matters at another shape or on another cuBLAS/driver
+    // version is unconfirmed, reported honestly rather than claimed.)
+    let kt_contig = k_rot.transpose(D::Minus1, D::Minus2)?.contiguous()?;
+    let dqs_operands = (ds.clone(), kt_contig.transpose(D::Minus1, D::Minus2)?);
+    let dqs = matmul_grad_lhs(&ds, &kt_contig)?;
+    let dkr_operands = (q_scaled.transpose(D::Minus1, D::Minus2)?, ds.clone());
+    let dkr = matmul_grad_rhs(&q_scaled, &ds)?
+        .transpose(D::Minus1, D::Minus2)?
+        .contiguous()?;
+    // `ds`'s last use (its second, after `dqs`) was building `dkr`,
+    // and `kt_contig` was single-use — drop both; no `[B,H,S,S]`- or
+    // `[B,H,D,S]`-shaped tensor remains live for the rest of `bwd`.
+    drop(ds);
+    drop(kt_contig);
+    let dqr = (&dqs * f64::from(scale))?;
+
+    let (dq0, dk0) = if let Some((cos, sin)) = cos_sin {
+        let dq0 = apply3(&dqr, &cos, &sin, RopeFused::new(true))?;
+        let dk0 = apply3(&dkr, &cos, &sin, RopeFused::new(true))?;
+        (dq0, dk0)
+    } else {
+        (dqr, dkr)
+    };
+
+    let to_qkv_slot = |t: &Tensor| -> Result<Tensor> {
+        t.transpose(1, 2)?.contiguous()?.reshape((b, s, 1, h, d))
+    };
+    let dqkv = Tensor::cat(
+        &[&to_qkv_slot(&dq0)?, &to_qkv_slot(&dk0)?, &to_qkv_slot(&dv)?],
+        2,
+    )?;
+
+    Ok((dqkv, [dv_operands, dp_operands, dqs_operands, dkr_operands]))
+}
+
+/// Test/introspection support: captures the four gradient-GEMM operand
+/// `Layout`s `bwd_core` (private, this module) ACTUALLY builds, never a
+/// fixture reconstructed independently of it. Order matches the module
+/// doc's GEMM table: `dv`, `dp`, `dqs`, `dkr`. Used by
+/// `tests/cuda_parity.rs`'s `attention_block_bwd_dqs_dkr_gemm_layouts_
+/// match_production_orientation_cuda` (P3 fix round 4, deliverable 3's
+/// "mechanism pin" — see that test's own doc).
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn bwd_gradient_gemm_layouts(
+    rope: bool,
+    scale: f32,
+    fully_masked: FullyMaskedPolicy,
+    qkv: &Tensor,
+    rope_pack: &Tensor,
+    mask: &Tensor,
+    grad_res: &Tensor,
+) -> Result<[(Layout, Layout); 4]> {
+    let (_dqkv, operands) = bwd_core(
+        "bwd_gradient_gemm_layouts",
+        rope,
+        scale,
+        fully_masked,
+        qkv,
+        rope_pack,
+        mask,
+        grad_res,
+    )?;
+    Ok(operands.map(|(a, b)| (a.layout().clone(), b.layout().clone())))
 }
 
 /// [`attention_fwd_f32`]'s inputs, already validated by `cpu_fwd`
@@ -970,7 +1190,7 @@ fn attention_fwd_f32(params: &AttentionFwdF32Params<'_>) -> Result<Vec<f32>> {
     let q_layout = Layout::contiguous((bh, s, d));
     let k_layout = Layout::contiguous((bh, s, d));
     let k_t_layout = k_layout.transpose(1, 2)?;
-    // PIN the convention audit B1 named: this is a transpose VIEW (cuBLAS/
+    // PIN the convention: this is a transpose VIEW (cuBLAS/
     // `gemm`'s OP_T), never a materialized contiguous copy — the module
     // doc's "fwd/bwd GEMM shape match" and "GEMM operand form is a
     // determinism concern" sections both depend on `fwd` and `bwd` issuing
@@ -1087,6 +1307,19 @@ mod tests {
     /// (`heads=1`) and a production-scale rank (ModernBERT-large's own
     /// `heads=16`) — proves `bwd`'s `.contiguous()` placement leaves no
     /// operand a raw doubly-strided view `gemm_config` would refuse.
+    ///
+    /// DEMOTED from "the" regression oracle for the round-4 GEMM-
+    /// operand-FORM defect (P3 fix round 4, deliverable 3): this test
+    /// answers ADMISSIBILITY ("would cuBLAS accept this operand at all"),
+    /// which the pre-round-4 `dqs`/`dkr` forms ALSO satisfied — a wrong
+    /// but ADMISSIBLE GEMM is exactly the failure mode that shipped.
+    /// Because this test reconstructs its own operands from a hardcoded
+    /// shape/transpose sequence rather than reading them FROM `bwd_core`,
+    /// it stays green under a `bwd_core` regression by construction.
+    /// `tests::attention_block_bwd_dqs_dkr_gemm_layouts_match_production_
+    /// orientation_cuda` (`tests/cuda_parity.rs`, via
+    /// [`bwd_gradient_gemm_layouts`]) is the oracle that actually reads
+    /// `bwd_core`'s own operands.
     #[test]
     fn bwd_every_gemm_operand_is_admissible_at_boundary_and_production_ranks() {
         let device = Device::Cpu;
@@ -1137,8 +1370,8 @@ mod tests {
             // dv = p.transpose(-1,-2) (VIEW, no `.contiguous()`) @ dctx —
             // see the module doc's "GEMM operand form is a determinism
             // concern" section: this is the SAME view-vs-materialize
-            // distinction as `scores` above, now extended to `dv`/`dp`/
-            // `dkr` (esc-P3-B0's fix).
+            // distinction as `scores` above, also applying to `dv`/`dp`/
+            // `dkr`.
             let lhs = p.transpose(D::Minus1, D::Minus2).unwrap();
             assert!(
                 is_gemm_operand_admissible(lhs.layout()),
@@ -1273,8 +1506,9 @@ mod tests {
         };
         // `k`'s transpose is passed as a VIEW (no `.contiguous()`) — the
         // SAME operand form `AttentionBlockFused`'s own `cpu_fwd`/`cuda_fwd`
-        // use for this GEMM (audit B1: this reference used to MATERIALIZE
-        // the transpose, which put a DIFFERENT operand form into `gemm`'s
+        // use for this GEMM (an earlier revision of this reference used to
+        // MATERIALIZE the transpose, which put a DIFFERENT operand form
+        // into `gemm`'s
         // packing/blocking decision on x86_64/AVX than the op under test —
         // `is_gemm_operand_admissible` accepts both forms, but only the
         // VIEW form is what `fwd` itself issues, so only it is a genuine
@@ -1287,8 +1521,8 @@ mod tests {
         // `rhs_cs=d, rhs_rs=1` in `attention_fwd_f32`'s own `k_t_layout` —
         // see that function's doc). Asserting the SHAPE here (rather than
         // re-deriving `attention_fwd_f32`'s private `Layout` to compare
-        // byte-for-byte) still catches the class of regression audit B1
-        // named: reintroducing `.contiguous()` here would flip `k_t` from
+        // byte-for-byte) still catches the relevant class of regression:
+        // reintroducing `.contiguous()` here would flip `k_t` from
         // a `(d, s, d, 1)`-strided view to a `(d, s, s, 1)`-strided fresh
         // buffer — i.e. exactly the `!is_contiguous()` flip the module's
         // own `bwd_every_gemm_operand_is_admissible_at_boundary_and_production_ranks`

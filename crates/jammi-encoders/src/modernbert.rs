@@ -1442,6 +1442,25 @@ impl ModernBert {
         // 3 launches — see `FusedAttentionMasks`'s doc for the count the
         // per-layer alternative paid) and shared by every layer; eval
         // never reads them, so they are not built there.
+        //
+        // KNOWN GAP, NOT FIXED THIS ROUND (P3 fix round 4, B4 — deferred a
+        // THIRD time, honestly, rather than risk a hard regression this
+        // late in the round): this bundle is built whenever `self.training`
+        // is true, regardless of `head_dim`, even though
+        // `AttentionBlockFused` admits ONLY `head_dim ==
+        // ATTENTION_BLOCK_HEAD_DIM` (module doc's "Fixed domain" section)
+        // — a head_dim-16 checkpoint (the cookbook's own
+        // `tiny_modernbert_local` fixture) never dispatches fused and pays
+        // a `batch·seq²` allocate-add-cast every training forward it
+        // cannot use. `ModernBertAttention::forward`'s OWN contract
+        // (this file, `fused_masks: Option<&FusedAttentionMasks>`'s doc
+        // table) makes `fused_masks` REQUIRED whenever `self.training` —
+        // `None` is a typed `Config` refusal, unconditionally, at EVERY
+        // layer, not just a fusable one — so skipping construction here
+        // for a non-fusable model requires first relaxing that contract to
+        // "required only at a layer that can actually dispatch fused",
+        // which is a real (if small) change to error-path behaviour this
+        // round did not have time to make and verify safely.
         let fused_masks = if self.training {
             Some(FusedAttentionMasks::build(
                 &extended,
@@ -2898,7 +2917,7 @@ mod tests {
     /// revision used zeros, under which `qkv ≡ 0`, every score was `0`,
     /// `wo(ctx) + hidden == hidden` for ANY `ctx`, and the eval
     /// bit-identity test below passed with the mask add deleted — a
-    /// vacuous oracle (audit B2).
+    /// vacuous oracle.
     fn attention_block_fixture(
         is_local: bool,
         h: usize,
@@ -3594,26 +3613,26 @@ mod tests {
         );
     }
 
-    /// esc-P3-B0's encoder-level regression oracle: drives the REAL
-    /// `forward_training_attention` fused arm and the REAL
-    /// `forward_eager_training_attention_composition` (not a synthetic
-    /// `jammi-kernels` test oracle) at PRODUCTION `heads=16`/`head_dim=64`
-    /// and `seq=512` — the exact `(b, h, s, d)` cell the round's own
-    /// pod measurement found flat-loss on before this round's fix (see
-    /// `ops::attention_block`'s module doc's "GEMM operand form is a
-    /// determinism concern" section for the measured before/after
-    /// numbers) — on a LOCAL layer (the sliding-window band is exactly
-    /// where the fix's `dv`/`dp`/`dkr` GEMMs matter: those gradients flow
-    /// through every masked AND unmasked key in the window). `qkv` is a
-    /// tracked `Var` (never a leaf fixture — clause 3: LoRA gradients are
-    /// downstream of a `Var` in production) at this op's own validated
-    /// bf16 amplitude ceiling (`|qkv| <= 1`, module doc's "Domain"
-    /// section), so both `out` and `dqkv` are held to `Bf16LegBounds`-
-    /// style derived bounds even though this test runs at `F32` (the CPU
-    /// arm's only dtype) — F32 has no meaningful bf16 ULP bound, so this
-    /// asserts a much tighter, F32-appropriate bound instead (`1e-4`
-    /// absolute, derived from `F32_TOL`-class tolerances this crate's own
-    /// other cross-arm oracles use, not bf16's).
+    /// A CPU/F32 fused-vs-eager comparison at PRODUCTION `heads=16`/
+    /// `head_dim=64` and `seq=512`, driving the REAL `forward_training_
+    /// attention` fused arm and the REAL `forward_eager_training_
+    /// attention_composition` on a LOCAL layer.
+    ///
+    /// NOT a regression oracle for the GEMM-operand-form defect (P3 fix
+    /// round 4's finding, correcting an earlier revision of this doc that
+    /// called it one): this test runs on `Device::Cpu` at `F32`, and the
+    /// defect is a `bf16` cuBLAS strided-batched-GEMM blocking artifact
+    /// with no CPU/F32 analogue at all — this test is bit-exact-clean
+    /// (`TOL = 1e-4`) with the defect present OR absent, on EITHER
+    /// device, because the divergence it would need to catch does not
+    /// exist at this dtype. Its real job is architectural: proving `qkv`
+    /// (a tracked `Var`, never a leaf fixture — clause 3: LoRA gradients
+    /// are downstream of a `Var` in production) reaches the fused arm at
+    /// all at this shape, and that fused/eager agree in VALUE at F32
+    /// where cuBLAS's bf16-specific operand-form sensitivity cannot
+    /// apply. `tests::attention_block_fused_vs_eager_dqkv_divergence_
+    /// grows_with_depth_bf16_cuda` (this file) is the actual defect
+    /// oracle.
     #[test]
     fn fused_attention_block_matches_eager_lora_gradients_at_production_seq_on_head64() {
         let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
@@ -3711,9 +3730,316 @@ mod tests {
         assert!(
             max_dqkv_delta <= TOL,
             "fused vs eager dqkv at production (b={b},h={h},s={s},d={d}) local layer: \
-             max|Δ|={max_dqkv_delta:e} > {TOL:e} — this is exactly the esc-P3-B0 regression \
-             oracle: before the fix this delta was large enough to flatten a real 20-step LoRA \
-             training loss trajectory on ModernBERT-large"
+             max|Δ|={max_dqkv_delta:e} > {TOL:e} (F32 — see this test's own doc for why this \
+             leg cannot see the bf16-specific GEMM-operand-form defect)"
+        );
+    }
+
+    /// Mirrors `tests/cuda_parity.rs`'s own `cuda_device` (`jammi-kernels`):
+    /// a machine that compiled with the `cuda` feature but has no
+    /// physical GPU is "skip", not "fail", UNLESS `JAMMI_REQUIRE_CUDA` is
+    /// set, in which case device-acquisition failure panics rather than
+    /// silently reading as a skip.
+    #[cfg(feature = "cuda")]
+    fn growth_oracle_cuda_device() -> Option<Device> {
+        match Device::new_cuda(0) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
+                    panic!(
+                        "attention_block_fused_vs_eager_dqkv_divergence_grows_with_depth_bf16_cuda: \
+                         JAMMI_REQUIRE_CUDA is set but no CUDA device could be acquired: {e}"
+                    );
+                }
+                eprintln!("depth-growth oracle: skipping — no CUDA device available ({e})");
+                None
+            }
+        }
+    }
+
+    /// P3 fix round 4, deliverable 1 (esc-044's phase-0.7 `symptom_spec`):
+    /// a `.contiguous()`-restored regression is invisible to any SINGLE
+    /// fused-vs-eager `bwd` call — its systematic bias is smaller than
+    /// ordinary bf16 rounding noise at depth 1 (this crate's own
+    /// per-element derived bounds already admit it) — and only separates
+    /// from noise by COMPOUNDING through depth. This drives the REAL
+    /// `forward_training_attention` (fused arm) and
+    /// `forward_eager_training_attention_composition` (production eager
+    /// arm) `L_MAX` times each, chaining each call's own output back into
+    /// the next call's `qkv` input (`qkv_next = cat([out, out, out],
+    /// last)` — a weight-free, shape-correct bridge: the mechanism under
+    /// test lives entirely inside the attention call itself, not in any
+    /// inter-layer projection, so no per-layer `Wqkv` is needed — family
+    /// L) from a SINGLE tracked `qkv` `Var`, then compares the two arms'
+    /// `dqkv` at the END of the chain, not after one call.
+    ///
+    /// Discriminating quantity: `r(L) = Σ|dqkv_fused - dqkv_eager| /
+    /// Σ|dqkv_eager|` per `qkv` slot. Gate: `r(L_MAX) <= C * max(r(1),
+    /// EPS)` — `r(1)`, MEASURED on this same run, is the noise floor, not
+    /// an absolute bf16-ULP constant (floor discipline). Six non-vacuity
+    /// clauses, all required for this leg to count: (1) RED-FIRST
+    /// PROVENANCE — this leg must be shown RED with the three
+    /// `.contiguous()` calls `jammi_kernels::ops::attention_block`'s
+    /// `bwd_core` removes restored, GREEN without — both runs reported in
+    /// this round's hand-off, not just asserted here. (2) DISPATCH
+    /// PROVENANCE — asserted below. (3) NON-FINITE — every comparison is
+    /// `assert!(x.is_finite() && x <= bound)`, never a negated `>`.
+    /// (4) SIGNAL — `Σ|dqkv_eager| > 0` per slot, asserted before it is
+    /// used as a denominator. (5) INDEPENDENCE — "eager" is
+    /// `forward_eager_training_attention_composition` itself, called
+    /// directly (the SAME method `forward_training_attention`'s own
+    /// fallback calls), never a copy of its logic in this test file.
+    /// (6) FLOOR DISCIPLINE — the gate above uses only measured
+    /// quantities from THIS run.
+    ///
+    /// An `F32` run of the SAME chain (`forward_eager_training_
+    /// attention_composition` at `L_MAX` deep, `F32`) is the
+    /// anti-vacuity anchor: it CANNOT itself redden on this defect (both
+    /// `bf16` arms' GEMM reduction orders are individually legal relative
+    /// to it), so it exists only to catch the two `bf16` arms being wrong
+    /// TOGETHER in some unrelated way — confirmation, never the gate.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn attention_block_fused_vs_eager_dqkv_divergence_grows_with_depth_bf16_cuda() {
+        let Some(device) = growth_oracle_cuda_device() else {
+            return;
+        };
+        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        const L_MAX: usize = 28; // the real ModernBERT-large depth this defect was found on.
+        let (b, s, h): (usize, usize, usize) = (8, 512, 16);
+        let d = ATTENTION_BLOCK_HEAD_DIM;
+        let hd = h * d;
+        let half_window = 64usize;
+        let attn = attention_block_fixture(true, h, s, &device);
+
+        let n = b * s * 3 * hd;
+        let qkv0_v: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.0137).sin() * 0.6).collect();
+        let dy_v: Vec<f32> = (0..(b * s * hd))
+            .map(|i| ((i as f32) * 0.0059).cos() * 0.5 + 0.05)
+            .collect();
+        let extended = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
+        let band = crate::mask::sliding_window_mask(s, half_window, &device).unwrap();
+        let fused_masks_bf16 =
+            FusedAttentionMasks::build(&extended, Some(&band), DType::BF16).unwrap();
+
+        // Returns `(dqkv, fused_dispatch_delta, eager_dispatch_delta)`.
+        let run = |force_eager: bool, dtype: DType, l: usize| -> (Vec<f32>, u64, u64) {
+            let before = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+            let qkv = Var::from_tensor(
+                &Tensor::from_vec(qkv0_v.clone(), (b, s, 3 * hd), &device)
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap(),
+            )
+            .unwrap();
+            let dy = Tensor::from_vec(dy_v.clone(), (b, s, hd), &device)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            assert!(l > 0, "run: l must be >= 1");
+            let mut cur = qkv.as_tensor().clone();
+            let mut last_out = None;
+            for _ in 0..l {
+                let out = if force_eager {
+                    attn.forward_eager_training_attention_composition(
+                        &cur,
+                        b,
+                        s,
+                        h,
+                        d,
+                        &extended,
+                        Some(&band),
+                    )
+                    .unwrap()
+                } else {
+                    let masks = TrainingMaskInputs {
+                        extended: &extended,
+                        local_band: Some(&band),
+                        fused: &fused_masks_bf16,
+                    };
+                    attn.forward_training_attention(&cur, b, s, h, d, masks)
+                        .unwrap()
+                };
+                // Amplitude control between chained calls (no residual/
+                // LayerNorm in this synthetic chain — see this test's own
+                // doc): a plain max-abs rescale keeps `cur` inside this
+                // op's own validated bf16 domain (module doc's "BF16
+                // validated-coverage ceiling" section) across `L_MAX`
+                // layers.
+                let out_max = out
+                    .abs()
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .max(0)
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .to_scalar::<f32>()
+                    .unwrap()
+                    .max(1e-6);
+                let out_n = (&out / f64::from(out_max)).unwrap();
+                cur = Tensor::cat(&[&out_n, &out_n, &out_n], D::Minus1).unwrap();
+                last_out = Some(out);
+            }
+            // `cur` (the last iteration's RE-TILED `[b, s, 3*hd]` bridge
+            // for a NEXT iteration that never runs) is NOT the loss input
+            // — `last_out` (`[b, s, hd]`, the last iteration's own
+            // attention output, matching `dy`'s shape) is.
+            let loss = (last_out.unwrap() * &dy).unwrap().sum_all().unwrap();
+            let grads = loss.backward().unwrap();
+            let dqkv: Vec<f32> = grads
+                .get(&qkv)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let after = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+            (dqkv, after.fused - before.fused, after.eager - before.eager)
+        };
+
+        let (dqkv_fused_1, fused_ctr_1, eager_ctr_1) = run(false, DType::BF16, 1);
+        let (dqkv_eager_1, ef_ctr_1, ee_ctr_1) = run(true, DType::BF16, 1);
+        let (dqkv_fused_l, fused_ctr_l, eager_ctr_l) = run(false, DType::BF16, L_MAX);
+        let (dqkv_eager_l, ef_ctr_l, ee_ctr_l) = run(true, DType::BF16, L_MAX);
+        let (dqkv_ref_l, _, _) = run(true, DType::F32, L_MAX);
+
+        // Clause (2): DISPATCH PROVENANCE — zero dispatch is RED, never
+        // green: a silently-eager-fallen-back fused leg would compare
+        // eager against itself.
+        assert_eq!(
+            fused_ctr_1, 1,
+            "fused leg (L=1) must dispatch fused exactly once"
+        );
+        assert_eq!(
+            eager_ctr_1, 0,
+            "fused leg (L=1) must never fall back to eager"
+        );
+        assert_eq!(
+            fused_ctr_l, L_MAX as u64,
+            "fused leg (L={L_MAX}) must dispatch fused every layer"
+        );
+        assert_eq!(
+            eager_ctr_l, 0,
+            "fused leg (L={L_MAX}) must never fall back to eager"
+        );
+        assert_eq!(ef_ctr_1, 0, "the eager leg calls the eager composition directly — it must never touch the fused dispatch counter");
+        assert_eq!(
+            ee_ctr_1, 0,
+            "the eager leg bypasses `admit` entirely — its own counter stays untouched"
+        );
+        assert_eq!(ef_ctr_l, 0, "the eager leg calls the eager composition directly — it must never touch the fused dispatch counter");
+        assert_eq!(
+            ee_ctr_l, 0,
+            "the eager leg bypasses `admit` entirely — its own counter stays untouched"
+        );
+
+        // Clause (3): NON-FINITE, checked BEFORE any comparison; clause
+        // (4): SIGNAL.
+        let finite_sum = |v: &[f32]| -> (bool, f64) {
+            let mut ok = true;
+            let mut sum = 0f64;
+            for &x in v {
+                ok &= x.is_finite();
+                sum += f64::from(x.abs());
+            }
+            (ok, sum)
+        };
+        let (fused_1_ok, _) = finite_sum(&dqkv_fused_1);
+        let (eager_1_ok, eager_1_sum) = finite_sum(&dqkv_eager_1);
+        let (fused_l_ok, _) = finite_sum(&dqkv_fused_l);
+        let (eager_l_ok, eager_l_sum) = finite_sum(&dqkv_eager_l);
+        let (ref_l_ok, _) = finite_sum(&dqkv_ref_l);
+        assert!(
+            fused_1_ok && eager_1_ok && fused_l_ok && eager_l_ok && ref_l_ok,
+            "non-finite dqkv element(s) present before any comparison"
+        );
+        assert!(
+            eager_1_sum.is_finite() && eager_1_sum > 0.0,
+            "Σ|dqkv_eager| at L=1 must be nonzero"
+        );
+        assert!(
+            eager_l_sum.is_finite() && eager_l_sum > 0.0,
+            "Σ|dqkv_eager| at L={L_MAX} must be nonzero"
+        );
+
+        // r(L) per qkv slot (0=Q,1=K,2=V — `dqkv`'s last axis is
+        // `[q_seg(hd), k_seg(hd), v_seg(hd)]`, `forward_eager_training_
+        // attention_composition`'s own `narrow` layout).
+        let r = |fused: &[f32], eager: &[f32]| -> [f64; 3] {
+            let mut num = [0f64; 3];
+            let mut den = [0f64; 3];
+            for (i, (&fv, &ev)) in fused.iter().zip(eager.iter()).enumerate() {
+                let slot = (i / hd) % 3;
+                num[slot] += f64::from((fv - ev).abs());
+                den[slot] += f64::from(ev.abs());
+            }
+            [
+                num[0] / den[0].max(1e-30),
+                num[1] / den[1].max(1e-30),
+                num[2] / den[2].max(1e-30),
+            ]
+        };
+        let r1 = r(&dqkv_fused_1, &dqkv_eager_1);
+        let rl = r(&dqkv_fused_l, &dqkv_eager_l);
+
+        // The gate: GROWTH, not magnitude. `EPS` guards only against a
+        // pathological exact `r(1) == 0` tie (measured: on the FIXED
+        // build `r(1)` is exactly `0.0` for every slot — this op's own
+        // GEMMs are bit-identical to production's at a single call, at
+        // this shape — and a floor at 0 would divide by zero below); it
+        // is set two orders of magnitude BELOW the smallest genuinely-
+        // measured `r(1)` this file's own pod run recorded with the
+        // defect present (`~1.04e-7`, F32-epsilon scale — an ordinary
+        // bf16 arm agrees with production almost exactly at ONE call even
+        // WITH the defect live, which is the whole reason a single-call
+        // comparison cannot see it), so it never competes with a real
+        // measurement — it is not the discriminating bound itself.
+        const C: f64 = 4.0;
+        const EPS: f64 = 1e-9;
+        for slot in 0..3 {
+            let floor = r1[slot].max(EPS);
+            let bound = C * floor;
+            assert!(
+                rl[slot].is_finite() && rl[slot] <= bound,
+                "slot {slot} (0=Q,1=K,2=V): r(L={L_MAX})={:e} exceeds {C}*max(r(1),{EPS:e})={bound:e} \
+                 (r(1)={:e}) — the fused/eager divergence is growing SYSTEMATICALLY with depth, not \
+                 staying at the L=1 bf16-noise scale",
+                rl[slot],
+                r1[slot],
+            );
+        }
+
+        // Anti-vacuity anchor (does NOT gate the defect — see this test's
+        // own doc): both bf16 arms must each stay within a generous,
+        // depth-scaled multiple of ordinary bf16 rounding of the F32
+        // reference, ruling out both arms being wrong TOGETHER.
+        let anchor = |bf16_v: &[f32]| -> f64 {
+            let mut num = 0f64;
+            let mut den = 0f64;
+            for (&x, &rf) in bf16_v.iter().zip(dqkv_ref_l.iter()) {
+                num += f64::from((x - rf).abs());
+                den += f64::from(rf.abs());
+            }
+            num / den.max(1e-30)
+        };
+        let fused_anchor = anchor(&dqkv_fused_l);
+        let eager_anchor = anchor(&dqkv_eager_l);
+        assert!(
+            fused_anchor.is_finite() && fused_anchor <= 0.5,
+            "fused dqkv at L={L_MAX} deviates from the F32 anchor by {fused_anchor:e} — too large \
+             to be ordinary bf16 rounding compounded over {L_MAX} layers"
+        );
+        assert!(
+            eager_anchor.is_finite() && eager_anchor <= 0.5,
+            "eager dqkv at L={L_MAX} deviates from the F32 anchor by {eager_anchor:e} — too large \
+             to be ordinary bf16 rounding compounded over {L_MAX} layers"
         );
     }
 

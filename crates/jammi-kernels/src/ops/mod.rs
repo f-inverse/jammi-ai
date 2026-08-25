@@ -70,6 +70,15 @@ mod scaled_cast_add;
 pub(crate) mod softmax;
 
 pub use attention_block::AttentionBlockFused;
+/// Test/introspection-only (P3 fix round 4, deliverable 3's "mechanism
+/// pin" — see `bwd_gradient_gemm_layouts`'s own doc): `#[doc(hidden)]`
+/// re-exports so `tests/cuda_parity.rs` can capture `bwd`'s own gradient-
+/// GEMM operand `Layout`s without depending on `CustomOp3::bwd`'s private
+/// trait-method signature. `matmul_grad_lhs`/`matmul_grad_rhs` are the
+/// shared `Op::Matmul`-backward definition `bwd` itself calls — see their
+/// own doc for the shared-definition rationale.
+#[doc(hidden)]
+pub use attention_block::{bwd_gradient_gemm_layouts, matmul_grad_lhs, matmul_grad_rhs};
 /// Re-exported under this name (rather than `ops::attention_block::HEAD_DIM`
 /// directly) so a call site's admission predicate reads `ATTENTION_BLOCK_HEAD_DIM`
 /// without a `attention_block::` path segment, mirroring `MAX_HEAD_DIM`/`MAX_LAST_DIM`'s

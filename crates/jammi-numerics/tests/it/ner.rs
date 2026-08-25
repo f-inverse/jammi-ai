@@ -35,7 +35,8 @@ fn decode_simple_bio_sequence() {
         &attention_mask,
         &id2label,
         "John works at Google",
-    );
+    )
+    .unwrap();
     assert_eq!(entities.len(), 2);
     assert_eq!(entities[0].text, "John");
     assert_eq!(entities[0].label, "PER");
@@ -61,7 +62,8 @@ fn decode_multi_token_entity() {
         &attention_mask,
         &id2label,
         "New York City",
-    );
+    )
+    .unwrap();
     assert_eq!(entities.len(), 1);
     assert_eq!(entities[0].text, "New York City");
     assert_eq!(entities[0].label, "ORG");
@@ -77,8 +79,62 @@ fn decode_all_o_returns_empty() {
         vec![10.0, 0.0, 0.0, 0.0, 0.0],
         vec![10.0, 0.0, 0.0, 0.0, 0.0],
     ];
-    let entities = decode_bio_spans(&token_logits, &offsets, &attention_mask, &id2label, "hello");
+    let entities =
+        decode_bio_spans(&token_logits, &offsets, &attention_mask, &id2label, "hello").unwrap();
     assert!(entities.is_empty());
+}
+
+#[test]
+fn decode_refuses_non_finite_logit() {
+    // Through the public entry point: a NaN logit at a non-skipped token
+    // must be refused before it reaches softmax/argmax, not silently
+    // decoded into a plausible-looking label.
+    let id2label = id2label();
+    let offsets = vec![(0, 0), (0, 4), (0, 0)];
+    let attention_mask = vec![1, 1, 1];
+    let token_logits = vec![
+        vec![10.0, 0.0, 0.0, 0.0, 0.0],
+        vec![0.0, f32::NAN, 0.0, 0.0, 0.0],
+        vec![10.0, 0.0, 0.0, 0.0, 0.0],
+    ];
+    let result = decode_bio_spans(&token_logits, &offsets, &attention_mask, &id2label, "John");
+    assert!(
+        result.is_err(),
+        "a non-finite logit must be refused, not decoded into a plausible label"
+    );
+}
+
+#[test]
+fn decode_refuses_infinite_logit() {
+    let id2label = id2label();
+    let offsets = vec![(0, 0), (0, 4), (0, 0)];
+    let attention_mask = vec![1, 1, 1];
+    let token_logits = vec![
+        vec![10.0, 0.0, 0.0, 0.0, 0.0],
+        vec![0.0, f32::INFINITY, 0.0, 0.0, 0.0],
+        vec![10.0, 0.0, 0.0, 0.0, 0.0],
+    ];
+    let result = decode_bio_spans(&token_logits, &offsets, &attention_mask, &id2label, "John");
+    assert!(result.is_err());
+}
+
+#[test]
+fn decode_ignores_non_finite_logit_on_a_skipped_special_token() {
+    // A logit row at a special-token position (offset (0, 0), or masked by
+    // attention_mask) is never fed to softmax, so it must not trip the
+    // refusal — only non-skipped rows are validated.
+    let id2label = id2label();
+    let offsets = vec![(0, 0), (0, 4), (0, 0)];
+    let attention_mask = vec![1, 1, 1];
+    let token_logits = vec![
+        vec![f32::NAN, 0.0, 0.0, 0.0, 0.0],
+        vec![0.0, 10.0, 0.0, 0.0, 0.0],
+        vec![f32::NAN, 0.0, 0.0, 0.0, 0.0],
+    ];
+    let entities =
+        decode_bio_spans(&token_logits, &offsets, &attention_mask, &id2label, "John").unwrap();
+    assert_eq!(entities.len(), 1);
+    assert_eq!(entities[0].text, "John");
 }
 
 fn gold_entity(label: &str, start: usize, end: usize) -> Entity {

@@ -25,6 +25,7 @@ owns:
   - deny.toml
   - pyproject.toml
   - rust-toolchain.toml
+  - .gitmodules
 ---
 
 # docs-ci

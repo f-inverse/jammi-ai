@@ -57,6 +57,42 @@ sentence-embedding recipe would do:
   `FinetuneStepParams::batched_forward`: one forward over the three groups
   concatenated on the batch axis, split by row AFTER pooling+normalizing.
 
+LOSS TRAJECTORY — `finetune_step.losses` (per measured step, warmup excluded)
+plus `loss_first`/`loss_last` mirror `finetune_step.rs`'s own `losses` /
+`loss_first` / `loss_last` fields, same placement convention (see
+`_step_once`'s docstring), so the two stacks' per-step loss sequences line up
+index-for-index IF the two runs used the same `--seed`/`--batch`/`--seq`/
+`--warmup`/vocab (the synthetic token ids are then bit-identical across the
+two stacks — see `synthetic_ids` below, a literal LCG port of
+`finetune_step.rs`'s own). This "line up index-for-index" claim depends on
+BOTH stacks discarding the same number of optimizer updates before recording
+starts: this script always runs one untimed `_step_once` pre-step before its
+`--warmup`/`--steps` loop (documented above), and `finetune_step.rs`'s own
+`run()` now does the identical untimed pre-step immediately before its own
+timed loop — so both stacks' `losses[k]` is the loss after `warmup+k+1` total
+optimizer updates. (An earlier revision of `finetune_step.rs` had no such
+pre-step, so its `losses[k]` was the loss after only `warmup+k` updates —
+one update stale relative to this script, worst-case visible in
+`loss_first`: with `LoraInitMode::ZerosB` the LoRA delta is identically zero
+at construction, so the un-fixed `loss_first` was literally the PRISTINE,
+zero-optimizer-update loss while this script's `loss_first` was already one
+update in. `finetune_step.rs::tests::finetune_step_loss_first_is_the_post_pre_step_update`
+pins the fixed placement.) `--warmup` values that differ between the two
+runs break the index correspondence even with everything else matched,
+since each stack's `losses[0]` is anchored to its OWN `--warmup` value.
+Identical INPUT ids does NOT make the two stacks' loss VALUES a meaningful
+apples-to-apples quality comparison by default: candle and torch run
+different arithmetic (different attention composition, different fused-vs-
+eager kernel paths, different reduction order), and — read the very next
+section — the LoRA adapters are not equivalently initialized unless
+`--lora-init jammi` is passed, and even then not bit-identically. Absent
+`--lora-init jammi`, a "jammi trajectory diverges from torch trajectory"
+observation conflates at least three variables (init distribution,
+attention-kernel arithmetic, framework reduction order) and proves nothing
+about correctness on its own; it is printed by `finetune_ab.sh`'s table as a
+same-data, cost-fixture ratio precisely so a large divergence is VISIBLE, not
+so it is read as a quality regression.
+
 LoRA INIT IS NOT A MATCH BY DEFAULT — read before comparing loss curves.
 peft's default init (`init_lora_weights=True`) draws `A` from PyTorch's
 `kaiming_uniform_(a=sqrt(5))`, whose bound is `1 / sqrt(fan_in)`. jammi's
@@ -133,10 +169,13 @@ high-water mark that cannot miss an intra-step spike the way a discrete poll
 (this script's old per-step read, or jammi's own 25ms `nvidia-smi` interval)
 can.
 
-jammi's `peak_vram_bytes` (`finetune_step.rs:112,:233`) is a whole-device
-`nvidia-smi` poll, sampled every 25ms over the ENTIRE warmup+measured loop,
-minus a baseline snapshot taken once right after the model+optimizer are
-built (before the loop starts) — at which point candle's `AdamW::new` has
+jammi's `peak_vram_bytes` is a whole-device `nvidia-smi` poll
+(`device_memory_used_bytes`, finetune_step.rs:115), sampled every 25ms
+(`std::thread::sleep`, finetune_step.rs:150) over the ENTIRE warmup+measured
+loop, then reduced via `peak.saturating_sub(baseline)`, finetune_step.rs:166
+against a baseline snapshot (`vram_baseline`, finetune_step.rs:540) taken
+once right after the model+optimizer are built (before the loop starts) — at
+which point candle's `AdamW::new` has
 ALREADY allocated the (zero-initialized) first/second moment tensors, since
 candle allocates them eagerly at construction. Torch's `AdamW`, by contrast,
 allocates its `exp_avg`/`exp_avg_sq` state LAZILY on the first `step()` call
@@ -245,6 +284,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime
+import hashlib
 import json
 import math
 import os
@@ -468,6 +508,51 @@ def build_dry_run_checkpoint(tmp_dir: str) -> str:
     return tmp_dir
 
 
+_HASH_CHUNK_BYTES = 65536  # 64 KiB -- same chunk size grad_oracle.rs's / this
+# file's own `sha256_and_len` (Rust) reuses; matching sizes is not required
+# for correctness (the digest is identical regardless of chunk size), only
+# picked here to keep the two implementations' own doc comments comparable.
+
+
+def checkpoint_identity(model_dir: str) -> dict:
+    """The base checkpoint's CONTENT identity -- sha256 (hex) of
+    `model_dir/config.json` and `model_dir/model.safetensors`'s raw bytes,
+    plus the weights file's byte length -- computed IDENTICALLY on both
+    stacks (`finetune_step.rs`'s/`grad_oracle.rs`'s shared `sha256_and_len`,
+    this function's Rust counterpart). Round-4 audit fold-in on PR #372:
+    lives HERE (torch_finetune_step.py, the file both torch_grad_oracle.py
+    and this file's own `run()` share machinery through) rather than as a
+    second, independently-drifting copy in torch_grad_oracle.py — that
+    script's own `checkpoint_identity` name is now a thin alias for this
+    function (see its own module doc).
+
+    STREAMING (a bounded-size chunk buffer, never `fh.read()` of the whole
+    file): a real checkpoint's `model.safetensors` can be several GB
+    (ModernBERT-large-class) -- reading it whole into memory just to hash it
+    would roughly double this tier's own peak RSS for no reason.
+    """
+
+    def _sha256_and_len(path: str) -> tuple[str, int]:
+        hasher = hashlib.sha256()
+        total_len = 0
+        with open(path, "rb") as fh:
+            while True:
+                chunk = fh.read(_HASH_CHUNK_BYTES)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+                total_len += len(chunk)
+        return hasher.hexdigest(), total_len
+
+    config_sha256, _config_len = _sha256_and_len(os.path.join(model_dir, "config.json"))
+    weights_sha256, weights_len = _sha256_and_len(os.path.join(model_dir, "model.safetensors"))
+    return {
+        "checkpoint_config_sha256": config_sha256,
+        "checkpoint_weights_sha256": weights_sha256,
+        "checkpoint_weights_size_bytes": weights_len,
+    }
+
+
 def load_config_reference_compile_off(model_dir):
     """`AutoConfig.from_pretrained(model_dir, reference_compile=False)`,
     guarded: on a `transformers` version that dropped the field (or, as
@@ -590,6 +675,22 @@ def _step_once(model, optimizer, scaler, blocks, mask, args, use_amp, device):
     the `reference_compile_after_first_forward` readback). Ends with a CUDA
     sync (guarded: a no-op on CPU) so the caller can rely on the step having
     actually completed, not just been submitted.
+
+    Returns the step's loss as a plain Python float — the same value read
+    off `loss.detach().float().item()` below (the call this function already
+    made to force the CUDA sync; no second read is added). PLACEMENT: this
+    read happens AFTER `optimizer.step()` / `scaler.step(optimizer)` returns,
+    exactly mirroring `finetune_step.rs`'s own placement (its comment at the
+    loss-read call site states the identical convention). In both stacks the
+    loss TENSOR was produced by the forward earlier in this same function,
+    BEFORE the optimizer step — reading it after only decides when the host
+    blocks on the (already-queued) device work, it does not recompute the
+    loss against the just-updated weights. So the returned value is the
+    PRE-UPDATE loss of this call's batch, not a re-evaluation after the
+    step. `run()`'s timed loop below records this for every MEASURED
+    (post-warmup) call, so `finetune_step.losses` here and
+    `finetune_step.rs`'s `losses` field share the same per-step placement
+    convention and are comparable step-for-step under that convention.
     """
     import torch
 
@@ -627,9 +728,10 @@ def _step_once(model, optimizer, scaler, blocks, mask, args, use_amp, device):
     # timed loop) would measure submission time, not execution time — the
     # same caveat `finetune_step.rs` documents at its own `.to_scalar()`
     # call.
-    _ = loss.detach().float().item()
+    loss_val = loss.detach().float().item()
     if device.type == "cuda":
         torch.cuda.synchronize()
+    return loss_val
 
 
 def _probe_sdpa_backend_forward(model, backend, input_ids, attention_mask):
@@ -814,6 +916,14 @@ def run(args):
         model, config = load_model(args)
         resolved_attn_implementation = getattr(model.config, "_attn_implementation", "absent")
         reference_compile_resolved = getattr(model.config, "reference_compile", "absent")
+        # Base-checkpoint CONTENT identity, computed BEFORE the LoRA wrap off
+        # the exact bytes `load_model` just read -- `args.model_dir` is valid
+        # here whether this run is a real `--model-dir` or a `--dry-run`
+        # donor checkpoint (the `TemporaryDirectory` context is still open
+        # for the rest of this function's body). Round-4 audit fold-in on
+        # PR #372: the SAME determinant `grad_oracle.rs`'s tier already
+        # carries, now on THIS tier too.
+        checkpoint_identity_fields = checkpoint_identity(args.model_dir)
 
         model = wrap_lora(model, args)
         lora_a_tensors_reinitialized = None
@@ -890,12 +1000,14 @@ def run(args):
             torch.cuda.reset_peak_memory_stats(device)
 
         times = []
+        losses = []
         for step in range(args.warmup + args.steps):
             t0 = time.perf_counter()
-            _step_once(model, optimizer, scaler, blocks, mask, args, use_amp, device)
+            loss_val = _step_once(model, optimizer, scaler, blocks, mask, args, use_amp, device)
             elapsed = time.perf_counter() - t0
             if step >= args.warmup:
                 times.append(elapsed)
+                losses.append(loss_val)
 
         times.sort()
         p50 = times[len(times) // 2]
@@ -932,6 +1044,10 @@ def run(args):
             "finetune_step": {
                 "device": str(device),
                 "backbone_dtype": args.dtype,
+                # Same placement as jammi's own FinetuneStepTier (round-4
+                # audit fold-in on PR #372) -- IDENTITY, see checkpoint_identity's
+                # own doc.
+                **checkpoint_identity_fields,
                 "attn_implementation": resolved_attn_implementation,
                 "sdpa_backend_probe": sdpa_backend_probe_result,
                 "reference_compile_resolved": reference_compile_resolved,
@@ -948,6 +1064,19 @@ def run(args):
                 "batched_forward": args.batched_forward,
                 "trainable_tensors": len(trainable),
                 "steps_measured": len(times),
+                "losses": losses,
+                "loss_first": losses[0],
+                "loss_last": losses[-1],
+                "loss_note": "cost-fixture data, not a quality result (synthetic uniform "
+                "token ids) — see finetune_step.rs's module doc's 'Honesty about what is "
+                "measured'. Each entry read after optimizer.step() returns; the value "
+                "itself is the PRE-update loss of that step's batch (see _step_once's "
+                "docstring for the placement convention shared with finetune_step.rs). "
+                "PRECISION: at --dtype bf16 (every real sweep leg) this value carries only "
+                "bf16's 7 explicit mantissa bits — ULP ~2^-9 ≈ 0.001953125 near 0.30 (the "
+                "[0.25, 0.5) exponent bucket) — so two adjacent steps repeating the exact "
+                "same float is expected quantization, not a stuck optimizer; do not read "
+                "more than ~3 decimal digits of this field as meaningful.",
                 "s_per_step_p50": {"value": p50, "unit": "s"},
                 "s_per_step_mean": {"value": mean, "unit": "s"},
                 "steps_per_s": {"value": 1.0 / p50, "unit": "steps/s"},

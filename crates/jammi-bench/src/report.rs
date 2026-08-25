@@ -1096,10 +1096,52 @@ pub struct FinetuneStepTier {
     pub device_name: String,
     /// The precision the frozen backbone ran at.
     pub backbone_dtype: String,
+    /// sha256 (hex) of `model_dir/config.json`'s raw bytes — round-4 audit
+    /// fold-in on PR #372: the SAME base-checkpoint content-identity
+    /// mechanism `grad_oracle.rs`'s `GradOracleReport` carries (see that
+    /// module's doc's determinant table), added to THIS tier too so
+    /// `ab_merge.py`'s leg-premise check can verify the jammi/torch legs of
+    /// one A/B config loaded the byte-identical checkpoint, not merely a
+    /// path string that happens to match. Computed via the SAME streaming
+    /// `sha256_and_len` `grad_oracle.rs` reuses (never a second,
+    /// independently-drifting hashing implementation).
+    pub checkpoint_config_sha256: String,
+    /// sha256 (hex) of `model_dir/model.safetensors`'s raw bytes.
+    pub checkpoint_weights_sha256: String,
+    /// `model_dir/model.safetensors`'s byte length — a cheap, redundant
+    /// cross-check alongside the sha256 above.
+    pub checkpoint_weights_size_bytes: u64,
+    /// Drives the synthetic batch AND (when `--lora-init jammi`) the fresh
+    /// LoRA draw — `ab_merge.py`'s own leg-premise check (the adjacent
+    /// probe that folded this field in: `ci/scripts/perf/ab_merge.py` had
+    /// NO premise-identity check at all before this round) reads this
+    /// alongside `torch_finetune_step.py`'s `args.seed` to verify the
+    /// jammi and torch legs of one A/B config actually ran the SAME batch,
+    /// not merely that the sweep script PASSED them the same `--seed` flag
+    /// (the difference matters the moment a leg is re-run by hand outside
+    /// `finetune_ab.sh`'s own matched-flags convention).
+    pub seed: u64,
     pub batch: usize,
     pub seq: usize,
     pub lora_rank: usize,
+    /// The LoRA scaling factor. Round-4 audit fold-in on PR #372: this input
+    /// (`FinetuneStepParams::lora_alpha`) was ALREADY threaded through from
+    /// the CLI but never actually emitted on this tier — `ab_merge.py`'s
+    /// leg-premise check reads it alongside torch's `args.lora_alpha`
+    /// (`torch_finetune_step.py`'s own report, one level up from this
+    /// tier's own sub-block, same asymmetry `seed`'s own doc above
+    /// describes).
+    pub lora_alpha: f64,
     pub lora_dropout: f64,
+    /// The triplet-loss margin. jammi HARDCODES this to `0.3`
+    /// (`finetune_step.rs`'s own `triplet_loss(&a, &p, &n, 0.3)` call site —
+    /// there is no `--margin` CLI flag on this tier); torch's own
+    /// `--margin` defaults to the SAME `0.3` but is independently
+    /// overridable, so this field exists to let the leg-premise check
+    /// catch an operator who overrode `--margin` on the torch leg only —
+    /// the two legs would then be minimizing a DIFFERENT loss, not merely
+    /// running different kernels.
+    pub margin: f64,
     /// The LoRA target-module selectors, which decide how many linears carry an
     /// adapter — and therefore how much of the step is adapter work.
     pub target_modules: Vec<String>,
@@ -1131,6 +1173,48 @@ pub struct FinetuneStepTier {
     pub trainable_tensors: usize,
     /// Measured steps after warmup.
     pub steps_measured: usize,
+    /// Per-measured-step triplet loss, in step order, warmup EXCLUDED — one
+    /// value per element of [`steps_measured`](Self::steps_measured), same
+    /// length. Each entry is read once, from the same loss tensor
+    /// `opt.step` for that iteration backpropagated through
+    /// (`finetune_step.rs`'s existing post-`opt.step` `.to_scalar()` read,
+    /// which exists to force the CUDA queue to completion before the clock
+    /// stops — no second device-to-host read was added to get this field).
+    /// Reading the tensor AFTER `opt.step` only decides when the host
+    /// blocks; the loss value itself was computed by the forward BEFORE
+    /// that step's optimizer update, so `losses[i]` is the PRE-update loss
+    /// of measured step `i`'s batch, not a re-evaluation against the
+    /// updated weights. `torch_finetune_step.py` reads its own loss at the
+    /// mirror-image point for the identical reason, so the two stacks'
+    /// trajectories share a placement convention — see that file's
+    /// `_step_once` doc.
+    ///
+    /// This is cost-fixture data, not a quality result: the module doc's
+    /// "Honesty about what is measured" section applies unchanged — token
+    /// ids are synthetic and uniform, so a falling or rising trajectory
+    /// here says nothing about learning quality, only that the forward /
+    /// backward / optimizer path executed and produced finite numbers.
+    /// Never quote this field as a quality result.
+    ///
+    /// PRECISION: this field is read in the BACKBONE dtype (`finetune_step.rs`'s
+    /// `loss.to_dtype(DType::F32)` widens the STORAGE type for the D2H read,
+    /// it never adds mantissa bits the upstream tensor did not have) —
+    /// every real sweep leg runs `--backbone-dtype bf16`, whose 7 explicit
+    /// mantissa bits give a ULP of `2^-9 ≈ 0.001953125` at a value near
+    /// `0.30` (exponent bucket `[0.25, 0.5)`). Two adjacent recorded steps
+    /// CAN legitimately repeat the exact same `f32` bit pattern even though
+    /// the true (infinite-precision) loss moved, because the move landed
+    /// inside that ULP — this is not a stuck optimizer, it is bf16
+    /// quantization made visible. A caller printing more than ~3 decimal
+    /// digits of a bf16-sourced entry here is displaying precision the
+    /// dtype does not carry; see `ci/scripts/perf/ab_merge.py`'s `fmt_loss`
+    /// for the table formatter that respects this.
+    pub losses: Vec<f32>,
+    /// `losses[0]`, carried as a scalar for table/summary use so a reader
+    /// does not have to index into `losses` for the common case.
+    pub loss_first: f32,
+    /// `losses[losses.len() - 1]`.
+    pub loss_last: f32,
     /// How many times `jammi_encoders`' bias-free training-mode LayerNorm
     /// actually dispatched the fused kernel (`jammi_kernels::ops::LayerNormFused`)
     /// during this run (warmup + measured steps) — a delta over the
@@ -1231,6 +1315,51 @@ pub struct FinetuneStepTier {
     /// field at `0` — not evidence the eager arm ran, just evidence
     /// neither counter was ever touched.
     pub lora_linear_eager_dispatches: u64,
+    /// How many times ModernBERT's training-mode fused whole-attention-block
+    /// kernel (`jammi_kernels::ops::AttentionBlockFused`) actually
+    /// dispatched during this run — the same positive-proof channel as
+    /// `ln_fused_dispatches` / `rope_fused_dispatches` /
+    /// `softmax_fused_dispatches` / `geglu_fused_dispatches` /
+    /// `lora_epilogue_fused_dispatches`, for the fused attention-block
+    /// commit (see `jammi_encoders::modernbert`'s
+    /// `ModernBertAttention::forward_training_attention` doc). Read via
+    /// `jammi_encoders::attention_block_dispatch_snapshot`, mirroring the
+    /// sibling counters' read API exactly.
+    pub attention_block_fused_dispatches: u64,
+    /// How many times that same call site fell back to the eager
+    /// (`apply1`/`apply2`/`apply3` composed masked-softmax attention)
+    /// path instead — outside the fused kernel's domain
+    /// (dtype/contiguity/device/`seq`/mask-shape), or because `head_dim`
+    /// is not exactly the fused kernel's fixed domain (64 —
+    /// `jammi_kernels::ops::ATTENTION_BLOCK_HEAD_DIM`). On a checkpoint
+    /// whose `head_dim != 64` this is the only path admitted, so the pair
+    /// reads `0` fused / `N` eager (`N` = the number of attention calls
+    /// the step made) — that is the predicate refusing by domain, not a
+    /// broken counter.
+    pub attention_block_eager_dispatches: u64,
+    /// The `JAMMI_KERNELS_DISABLE` op keys this process REQUESTED (sorted,
+    /// empty when the env var was unset or empty) —
+    /// `jammi_kernels::admission::disabled_ops_requested`. Always present,
+    /// even on an ordinary run with nothing disabled: an omitted key would
+    /// read as "this report predates the field", which is false.
+    pub kernels_disabled_requested: Vec<String>,
+    /// The `JAMMI_KERNELS_DISABLE` op keys that actually FIRED (disabled at
+    /// least one live dispatch) this run (sorted) —
+    /// `jammi_kernels::admission::disabled_ops_fired`. A run whose intended
+    /// `JAMMI_KERNELS_DISABLE` never reached this process at all (a
+    /// var-NAME typo, an unforwarded ssh/`docker -e` environment) reads
+    /// BOTH this field and `kernels_disabled_requested` as `[]` —
+    /// indistinguishable, on this pair alone, from a run that genuinely
+    /// requested nothing. This is the field a downstream A/B harness
+    /// compares against its OWN recorded intent (the op key(s) it meant to
+    /// pass) to catch that drop: a non-empty intended request paired with
+    /// an empty `kernels_disabled_requested` here is exactly the failure
+    /// mode this pair exists to make visible — the eager leg of a
+    /// forced-eager A/B silently measuring the fused arm instead. See
+    /// `jammi_kernels::admission`'s module doc's "safety property" section
+    /// for the separate, narrower guarantee `run` already hard-errors on
+    /// (an entry that WAS requested but never fired).
+    pub kernels_disabled_fired: Vec<String>,
     pub s_per_step_p50: Measurement,
     pub s_per_step_mean: Measurement,
     pub steps_per_s: Measurement,
@@ -1238,9 +1367,20 @@ pub struct FinetuneStepTier {
     /// Peak resident set. Absent off Linux rather than faked.
     pub peak_rss_bytes: Measurement,
     /// Peak device memory growth during the measured steps, over a baseline read
-    /// AFTER the model and optimizer are resident.
+    /// AFTER the model and optimizer are resident but BEFORE the untimed
+    /// pre-step `finetune_step::run` takes (see that function's doc comment
+    /// on `vram_baseline` for the full reasoning).
     ///
-    /// So this is activation and workspace growth: it deliberately excludes the
+    /// This ordering matters because the underlying sample
+    /// (`nvidia-smi --query-gpu=memory.used`) is a DRIVER-level allocator
+    /// POOL high-water mark, not live-allocated bytes: once the pool grows
+    /// to admit a tensor it does not shrink back down between steps (the
+    /// same convention `baselines/p1_softmax_scale_fold_ab.json` reasons
+    /// about in 32 MiB pool blocks). A baseline read AFTER the pre-step
+    /// would already sit at (or near) the run's own high-water mark, and
+    /// the peak-minus-baseline subtraction would then floor at (or near)
+    /// zero regardless of how much the run actually allocates. So this is
+    /// activation and workspace growth: it deliberately excludes the
     /// backbone weights and the optimizer moments, because those are constant
     /// for a configuration and would mask the term that actually moves. It is
     /// device-total minus that baseline rather than a per-process figure — exact
@@ -1399,25 +1539,37 @@ pub struct RecomputeScaleTier {
 mod tests {
     use super::*;
 
-    /// A minimal, otherwise-arbitrary [`FinetuneStepTier`] for the schema
-    /// tests below. Field VALUES do not matter except where the test itself
-    /// varies them; what is pinned is the emitted key SET and the
-    /// present-vs-omitted / null-vs-value policy for `max_grad_norm`, not any
-    /// particular number.
+    /// A minimal, fully-populated [`FinetuneStepTier`] for the serialization
+    /// tests below. Field VALUES are arbitrary except where a test itself
+    /// varies them (`max_grad_norm`, for the null-vs-value policy tests);
+    /// what is pinned is the emitted key SET and the present-vs-omitted /
+    /// null-vs-value policy for `max_grad_norm`, so a field added or renamed
+    /// on `FinetuneStepTier` is a visible, reviewed diff here rather than a
+    /// silent addition/removal a downstream JSON-diffing perf gate would
+    /// only notice indirectly.
     fn sample_finetune_step_tier(max_grad_norm: Option<f32>) -> FinetuneStepTier {
         FinetuneStepTier {
             device: "cpu".to_string(),
             device_name: "cpu".to_string(),
+            seed: 42,
             backbone_dtype: "f32".to_string(),
+            checkpoint_config_sha256: "a".repeat(64),
+            checkpoint_weights_sha256: "b".repeat(64),
+            checkpoint_weights_size_bytes: 1024,
             batch: 2,
             seq: 6,
             lora_rank: 2,
+            lora_alpha: 4.0,
             lora_dropout: 0.0,
-            target_modules: vec!["Wqkv".to_string()],
+            margin: 0.3,
+            target_modules: vec!["query".to_string()],
             batched_forward: true,
             max_grad_norm,
             trainable_tensors: 2,
             steps_measured: 1,
+            losses: vec![0.5],
+            loss_first: 0.5,
+            loss_last: 0.5,
             ln_fused_dispatches: 0,
             ln_eager_dispatches: 0,
             rope_fused_dispatches: 0,
@@ -1430,10 +1582,14 @@ mod tests {
             lora_epilogue_eager_dispatches: 0,
             lora_linear_fused_dispatches: 0,
             lora_linear_eager_dispatches: 0,
-            s_per_step_p50: Measurement::measured(0.1, "s"),
-            s_per_step_mean: Measurement::measured(0.1, "s"),
-            steps_per_s: Measurement::measured(10.0, "steps/s"),
-            triplets_per_s: Measurement::measured(20.0, "triplets/s"),
+            attention_block_fused_dispatches: 0,
+            attention_block_eager_dispatches: 0,
+            kernels_disabled_requested: Vec::new(),
+            kernels_disabled_fired: Vec::new(),
+            s_per_step_p50: Measurement::measured(0.01, "s"),
+            s_per_step_mean: Measurement::measured(0.01, "s"),
+            steps_per_s: Measurement::measured(100.0, "steps/s"),
+            triplets_per_s: Measurement::measured(200.0, "triplets/s"),
             peak_rss_bytes: Measurement::not_yet_measured("bytes"),
             peak_vram_bytes: Measurement::not_yet_measured("bytes"),
         }
@@ -1469,5 +1625,71 @@ mod tests {
             serde_json::json!(1.0f32),
             "present max_grad_norm must serialize as the numeric value: {obj:?}"
         );
+    }
+
+    /// The full emitted key set, pinned so a field added or renamed on
+    /// `FinetuneStepTier` — including the two `attention_block_*_dispatches`
+    /// counters the fused whole-attention-block kernel needs for its own
+    /// positive-proof channel, `kernels_disabled_requested` /
+    /// `kernels_disabled_fired` (contract K-aux, round 2 / B3: the RESOLVED
+    /// `JAMMI_KERNELS_DISABLE` state a downstream A/B harness names the
+    /// measured arm from), and `max_grad_norm` (the device-side clip's
+    /// on/off flag for this row) — is a visible, reviewed diff here rather
+    /// than a silent addition/removal a downstream JSON-diffing perf gate
+    /// would only notice indirectly.
+    #[test]
+    fn finetune_step_tier_emits_the_full_pinned_key_set() {
+        let tier = sample_finetune_step_tier(Some(1.0));
+        let value = serde_json::to_value(&tier).expect("serialize FinetuneStepTier");
+        let obj = value.as_object().expect("object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let mut expected = vec![
+            "attention_block_eager_dispatches",
+            "attention_block_fused_dispatches",
+            "batch",
+            "batched_forward",
+            "backbone_dtype",
+            "checkpoint_config_sha256",
+            "checkpoint_weights_sha256",
+            "checkpoint_weights_size_bytes",
+            "device",
+            "device_name",
+            "geglu_eager_dispatches",
+            "geglu_fused_dispatches",
+            "kernels_disabled_fired",
+            "kernels_disabled_requested",
+            "ln_eager_dispatches",
+            "ln_fused_dispatches",
+            "lora_alpha",
+            "lora_dropout",
+            "lora_epilogue_eager_dispatches",
+            "lora_epilogue_fused_dispatches",
+            "lora_linear_eager_dispatches",
+            "lora_linear_fused_dispatches",
+            "lora_rank",
+            "loss_first",
+            "loss_last",
+            "losses",
+            "margin",
+            "max_grad_norm",
+            "peak_rss_bytes",
+            "peak_vram_bytes",
+            "rope_eager_dispatches",
+            "rope_fused_dispatches",
+            "s_per_step_mean",
+            "s_per_step_p50",
+            "seed",
+            "seq",
+            "softmax_eager_dispatches",
+            "softmax_fused_dispatches",
+            "steps_measured",
+            "steps_per_s",
+            "target_modules",
+            "trainable_tensors",
+            "triplets_per_s",
+        ];
+        expected.sort_unstable();
+        assert_eq!(keys, expected);
     }
 }

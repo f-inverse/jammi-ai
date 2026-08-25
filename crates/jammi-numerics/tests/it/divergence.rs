@@ -40,18 +40,72 @@ fn psi_finite_under_smoothing() {
 #[test]
 fn wasserstein_self_is_zero() {
     let v: Vec<f32> = (0..200).map(|i| (i as f32) * 0.01).collect();
-    assert_abs_diff_eq!(wasserstein_1d(&v, &v), 0.0, epsilon = 1e-9);
+    assert_abs_diff_eq!(wasserstein_1d(&v, &v).unwrap(), 0.0, epsilon = 1e-9);
 }
 
 #[test]
 fn wasserstein_is_scale_invariant() {
     let a: Vec<f32> = (0..200).map(|i| (i as f32) * 0.01).collect();
     let b: Vec<f32> = (0..200).map(|i| (i as f32) * 0.01 + 0.5).collect();
-    let unscaled = wasserstein_1d(&a, &b);
+    let unscaled = wasserstein_1d(&a, &b).unwrap();
     let a_scaled: Vec<f32> = a.iter().map(|x| x * 2.0).collect();
     let b_scaled: Vec<f32> = b.iter().map(|x| x * 2.0).collect();
-    let scaled = wasserstein_1d(&a_scaled, &b_scaled);
+    let scaled = wasserstein_1d(&a_scaled, &b_scaled).unwrap();
     assert_abs_diff_eq!(unscaled, scaled, epsilon = 1e-6);
+}
+
+#[test]
+fn wasserstein_refuses_empty_reference() {
+    // Matches scipy.stats.wasserstein_distance, which raises
+    // ValueError("Distribution can't be empty.") from
+    // _validate_distribution for an empty input (verified against
+    // scipy/stats/_stats_py.py and empirically: `wasserstein_distance([],
+    // [1.0, 2.0, 3.0])` raises). Without this guard, `padded_range(&[])`
+    // falls back to `(0.0, 1.0)`, fixing `scale = 1.0` and silently
+    // breaking scale-invariance.
+    let reference: Vec<f32> = vec![];
+    let current: Vec<f32> = (0..10).map(|i| i as f32).collect();
+    assert!(wasserstein_1d(&reference, &current).is_err());
+}
+
+#[test]
+fn wasserstein_refuses_empty_current() {
+    let reference: Vec<f32> = (0..10).map(|i| i as f32).collect();
+    let current: Vec<f32> = vec![];
+    assert!(wasserstein_1d(&reference, &current).is_err());
+}
+
+#[test]
+fn wasserstein_refuses_nan_reference() {
+    // scipy.stats.wasserstein_distance propagates a NaN input straight to a
+    // NaN distance; jammi's chosen policy is stricter — refuse at the edge.
+    // The reason is downstream-meaninglessness (a NaN score can never trip a
+    // fixed drift threshold: `NaN > c` is always `false`), not sort-safety —
+    // the implementation sorts with `total_cmp`, a genuine total order over
+    // NaN, so the sort itself would not be corrupted either way.
+    let reference = [1.0_f32, f32::NAN, 3.0];
+    let current: Vec<f32> = (0..10).map(|i| i as f32).collect();
+    assert!(wasserstein_1d(&reference, &current).is_err());
+}
+
+#[test]
+fn wasserstein_refuses_nan_current() {
+    let reference: Vec<f32> = (0..10).map(|i| i as f32).collect();
+    let current = [1.0_f32, 2.0, f32::NAN];
+    assert!(wasserstein_1d(&reference, &current).is_err());
+}
+
+#[test]
+fn wasserstein_refuses_infinite_input() {
+    // scipy.stats.wasserstein_distance does NOT refuse this: it has no
+    // finiteness guard, so `wasserstein_distance([1, inf, 3], [1, 2, 3])`
+    // returns `inf`. jammi refuses it anyway, for the same
+    // downstream-meaninglessness reason as the NaN case above (not scipy
+    // parity): an unbounded distance carries no magnitude information past
+    // "already over any finite drift threshold".
+    let reference: Vec<f32> = (0..10).map(|i| i as f32).collect();
+    let current = [1.0_f32, f32::INFINITY, 3.0];
+    assert!(wasserstein_1d(&reference, &current).is_err());
 }
 
 #[test]

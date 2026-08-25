@@ -33,6 +33,28 @@ workspace crate.
   expression, and pins that locally with rounding intrinsics rather than a
   global flag).
 
+- `flash` (feature `flash-attn`, implies `cuda`, never implied by it) — the
+  vendored FlashAttention-2 hdim64/bf16/sm80 varlen forward + backward
+  kernels (`third_party/flash-attention/`, tag v2.8.3.post1, unmodified,
+  behind jammi's torch-free C wrapper `flash_api_jammi.cu`) and the safe
+  Rust boundary over them: `flash_varlen_fwd` → `(o, lse)`,
+  `flash_varlen_bwd` → `d_qkv`, packed `[total_q, 3, H, 64]` layout,
+  `cu_seqlens` varlen, symmetric window, deterministic backward. Built by
+  `build.rs` with a hand-rolled `nvcc` (upstream's flag group, the crate's
+  one `--use_fast_math` unit) into `libjammi_flash.a`. Needs the CUDA
+  toolkit AND the CUTLASS submodule:
+
+  ```sh
+  git submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass
+  cargo build -p jammi-kernels --features flash-attn
+  JAMMI_REQUIRE_CUDA=1 cargo test -p jammi-kernels --features flash-attn --test flash_smoke
+  ```
+
+  Provenance, file hashes, shims, flags and measured compile time:
+  `third_party/flash-attention/VENDORED.md`. No consumer's feature closure
+  reaches `flash-attn` (`ci/scripts/check_flash_attn_closure.py`); it is
+  not part of `cuda` and not default.
+
 ## Non-goals of this crate
 
 No architecture-specific code, no fusion policy for *which* op runs where —

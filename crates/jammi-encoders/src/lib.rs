@@ -103,6 +103,18 @@ pub fn geglu_dispatch_snapshot() -> jammi_kernels::admission::DispatchSnapshot {
     modernbert::GEGLU_DISPATCH_COUNTERS.snapshot()
 }
 
+/// A snapshot of ModernBERT's training-mode fused whole-attention-block
+/// (`jammi_kernels::ops::AttentionBlockFused`) dispatch counts (see
+/// `crate::modernbert`'s `ModernBertAttention::forward_training_attention`
+/// for the call site this counts).
+/// `modernbert::ATTENTION_BLOCK_DISPATCH_COUNTERS` is `pub(crate)` — this
+/// is the read API a durable job record or a bench report uses, mirroring
+/// [`ln_dispatch_snapshot`] / [`rope_dispatch_snapshot`] /
+/// [`softmax_dispatch_snapshot`] / [`geglu_dispatch_snapshot`] exactly.
+pub fn attention_block_dispatch_snapshot() -> jammi_kernels::admission::DispatchSnapshot {
+    modernbert::ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot()
+}
+
 /// Contiguity-safe matmul — the single matmul primitive every encoder uses.
 ///
 /// candle's **CUDA** matmul rejects two operand layouts its **CPU** matmul

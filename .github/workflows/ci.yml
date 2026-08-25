@@ -30,6 +30,45 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # `--all-targets` above only compiles test targets whose
+      # `required-features` are satisfied by default. Exactly three
+      # workspace test targets are NOT (`cargo metadata` enumerated): jammi-ai
+      # `gpu_capability` (`required-features = ["live-gpu-tests"]`), jammi-ai
+      # `distributed` (`required-features = ["live-distributed-tests"]`) —
+      # both covered by the step below, neither needs an actual GPU/CUDA
+      # toolchain or a distributed harness to *compile*, only to run
+      # meaningfully, so this step stays hermetic and cheap — and jammi-kernels
+      # `cuda_parity` (`required-features = ["cuda"]`, crates/jammi-kernels/
+      # Cargo.toml:66), which CANNOT be covered here: `cuda` pulls
+      # `dep:bindgen_cuda`, a real CUDA toolchain requirement this hermetic
+      # runner does not have. That target is linted instead in
+      # `ci/scripts/runpod_gpu_prove.sh`, the one lane with a real GPU.
+      #
+      # This step is what actually closes the doc_lazy_continuation escape
+      # `ci/scripts/check_doc_list_indent.py` was written to catch (a real
+      # hit in gpu_capability's `graph_propagation_parity.rs`, confirmed via
+      # this exact command going from EXIT=101/4 errors to EXIT=0 once the
+      # doc was fixed). That script was retired, not merged in alongside
+      # this step: it both OVER-approximates the lint (flags markdown-list-
+      # shaped lines mid-paragraph, e.g. `2. text`, that clippy is silent on)
+      # and UNDER-approximates it (misses flush-left prose following a
+      # properly-indented continuation, which clippy does flag) — a fixed
+      # text scanner cannot track clippy's own CommonMark-interruption rules,
+      # so it is not a substitute for running the real lint.
+      #
+      # Residual gap, disclosed rather than silently accepted: a doc comment
+      # attached to an item behind a proc-macro attribute (e.g. `#[test_case
+      # (...)]`) is invisible to `clippy::doc_lazy_continuation` — the macro
+      # expansion masks the lint, a class no `cargo clippy` invocation can
+      # see through. `check_doc_list_indent.py` DID cover that class (it is
+      # a text scanner, not macro-aware), so retiring it trades away
+      # detection there. `crates ci` at HEAD has zero such hits, so this is
+      # a prospective gap, not a live one; if it needs closing, it needs a
+      # macro-aware (or item-doc-scoped) checker, not a reinstated line-shape
+      # scanner with the over/under-approximation problems above.
+      - name: Clippy (gated test surfaces — compile-only feature closure)
+        run: cargo clippy -p jammi-ai --tests --features live-gpu-tests,live-distributed-tests -- -D warnings
+
   test:
     name: Test (hermetic)
     runs-on: ubuntu-latest
@@ -186,6 +225,114 @@ jobs:
       # Cargo.toml.
       - name: Assert no proprietary crate in the OSS engine dep tree
         run: cargo metadata --format-version 1 --locked | python3 ci/scripts/check_dep_direction.py
+
+  flash-attn-closure:
+    name: Guard (flash-attn feature closure)
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust-ci
+
+      # `jammi-kernels/flash-attn` vendors CUTLASS + a multi-minute `nvcc`
+      # build; it must depend on `cuda` but never be IMPLIED by it, or the
+      # release lane (`release-binaries.yml`'s `cuda,jetstream-broker,
+      # storage-cloud` build) silently drags CUTLASS into every release
+      # build. This walks the workspace feature graph the way the resolver
+      # does (own `cargo metadata --no-deps` call, so it runs unpiped unlike
+      # the dep-direction guard above) and fails if `flash-attn` is reachable
+      # from `default`, the release lane's feature set, or `--all-features`.
+      - name: Assert no consumer's feature closure reaches jammi-kernels/flash-attn
+        run: python3 ci/scripts/check_flash_attn_closure.py
+
+  # This is a COMPILE lane, not a correctness lane: it proves the vendored
+  # FlashAttention-2 tree, the torch-free C wrapper, the shim headers, and
+  # `build.rs::build_flash_attn` still produce a valid `nvcc` build (a
+  # source-tree or wrapper edit that FAILS to compile is caught here). It
+  # does NOT prove the kernels are numerically correct — no test in this job
+  # runs on a GPU. `tests/flash_smoke.rs` (16 cases) and the `flash::` unit
+  # tests (17 cases) are the only lane that checks output values, and they
+  # currently run nowhere in CI; they exist only as ad-hoc `JAMMI_REQUIRE_
+  # CUDA=1 cargo test -p jammi-kernels --features flash-attn --test
+  # flash_smoke` pod sessions (see the P6 stage-A artifact commit). Closing
+  # THAT gap needs a self-hosted GPU runner wired the way `_gpu-prove-gate.yml`
+  # already does for the release lane — out of scope here; do not read a green
+  # run of this job as evidence the kernels compute the right numbers.
+  #
+  # `cargo check` (not `cargo build`) is enough: build scripts run in full —
+  # unconditionally compiled AND executed — for `cargo check` exactly as for
+  # `cargo build`, because the primary crate's check needs the build script's
+  # `cargo:rustc-link-lib` / `cargo:rustc-cfg` output regardless of whether the
+  # crate itself is only being metadata-checked. `build.rs::build_flash_attn`
+  # is gated on `CARGO_FEATURE_FLASH_ATTN` in `main()`, not on the downstream
+  # check/build distinction, so `cargo check -p jammi-kernels --features
+  # flash-attn` invokes it — and therefore `nvcc` — the same as a full build.
+  #
+  # Needs the CUDA toolkit (`nvcc`) but NOT a GPU: reuses the established CUDA
+  # CI base image (`JAMMI_CI_IMAGE_CUDA`, the same image `server-cu12` in
+  # release-binaries.yml and the `_pypi-server.yml` CUDA leg already build
+  # in), which ships CUDA 12.6 + gcc-toolset-13 on PATH
+  # (`.docker/ci-cuda.Dockerfile`) and needs no `nvidia-smi`/driver at build
+  # time (`CUDA_COMPUTE_CAP=80` is pinned, matching this crate's own
+  # `build_cuda` precedent).
+  #
+  # The CUTLASS submodule init below is scoped to THIS job's own checkout
+  # step only — GitHub Actions jobs run on independent, ephemeral runners
+  # with independent checkouts, so it cannot leak an initialised CUTLASS tree
+  # into `crates.yml`'s publish checkout. That distinction matters: `cargo
+  # package -p jammi-kernels` (crates.yml, no per-crate `include`/`exclude`)
+  # walks any submodule that IS checked out at package time and would ship
+  # BSD-3-Clause CUTLASS source inside the Apache-2.0-declared tarball
+  # undisclosed (the gap `third_party/flash-attention/VENDORED.md` already
+  # flags, unrelated to and not fixed by this job) — so `submodules:` is never
+  # added to `crates.yml`'s own checkout step.
+  #
+  # Cost, measured on an A100 pod build (the three vendored TUs compile
+  # CONCURRENTLY — `build.rs`'s `tus.iter().map(..).spawn(..)`, so wall time
+  # is bounded by the slowest, not the sum): fwd ~48 s, bwd ~77 s, the
+  # wrapper ~5 s, so the `nvcc` stage alone is ~80 s. Add checkout, a shallow
+  # CUTLASS submodule clone, the CUDA-image pull, and the rest of the crate's
+  # own `cuda`-feature PTX build (`build_cuda`, 7 kernel files, also
+  # nvcc-driven) and the job is realistically a few minutes end to end — real
+  # but bounded, and it runs on every PR here (no `paths:` filter, matching
+  # every other job in this file and the swarm's own no-paths-filter
+  # discipline: a filtered-out required check hangs unrelated PRs). If that
+  # per-PR cost is judged too high, the alternative is scoping it to changes
+  # under `crates/jammi-kernels/build.rs`, `crates/jammi-kernels/src/flash/**`,
+  # `crates/jammi-kernels/third_party/**`, `crates/jammi-kernels/Cargo.toml`,
+  # and `.gitmodules` — EVERY one of those five paths, since missing any is
+  # worse than no filter (it looks like coverage and isn't) — left to the
+  # maintainer to decide, not applied unilaterally here.
+  flash-attn-compile:
+    name: Compile-check (flash-attn / CUTLASS, nvcc — no GPU)
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ vars.JAMMI_CI_IMAGE_CUDA || 'ghcr.io/f-inverse/jammi-ai-ci-cuda:latest' }}
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Deliberately NOT `submodules: recursive` on the checkout itself —
+          # initialise only the one submodule this job needs, explicitly, so
+          # the scope is auditable from this one line rather than implicit in
+          # a blanket flag.
+          submodules: false
+
+      # A bare `git` in a container `run:` step hits "fatal: detected dubious
+      # ownership" (exit 128) — the checkout is owned by a different user than
+      # the container's git, and the safe.directory `actions/checkout` sets is
+      # not visible here (same trap as `dep-dag.yml`'s dep-DAG freshness step).
+      - name: Init the CUTLASS submodule (scoped to this job's checkout only)
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass
+
+      - uses: ./.github/actions/setup-rust-ci
+
+      - name: Compile-check jammi-kernels --features flash-attn (nvcc, no GPU)
+        run: cargo check -p jammi-kernels --features flash-attn
 
   oss-only-build:
     name: Guard (OSS-only build)
@@ -480,6 +627,48 @@ jobs:
           # can't be authored and left silently unwired into CI.
           - name: CI guard wiring
             cmd: python3 ci/scripts/check_ci_guard_wiring.py
+          # check_ci_guard_wiring.py's OWN suite (advisory iii, PR #372
+          # round 2): drives the real python_test_suites()/main() entry
+          # points against throwaway git-init'd fixtures, pinning the
+          # comment-vs-code-line tightening and the root generalization.
+          - name: CI guard wiring suite
+            cmd: python3 ci/scripts/test_check_ci_guard_wiring.py
+          # Re-resolves every finetune_step.rs:<n>/grad_oracle.rs:<n>
+          # PATH:LINE citation under crates/jammi-bench/** and
+          # ci/scripts/perf/** against the file at HEAD (advisory i, PR #372
+          # round 2) -- stdlib-only, hermetic, catches the F7-class
+          # regression (an in-bounds but STALE line number) an eyeballed
+          # diff review missed twice in a row on this same PR.
+          - name: citation resolver
+            cmd: python3 ci/scripts/perf/check_citations.py
+          - name: citation resolver suite
+            cmd: python3 ci/scripts/perf/test_check_citations.py
+          # jammi-vs-torch gradient-oracle comparator's own math/refusal
+          # suite (F6, PR #372 audit round): stdlib-only (`unittest`), no
+          # torch/numpy required — `compare_grad_oracle.py`'s own module
+          # doc's "numpy-first oracle, pure-Python fallback" convention —
+          # so this is exactly the hermetic script-guard shape, never a
+          # torch-dependent lane. Was previously invoked from ZERO
+          # workflows (49 assertions enforced by nothing); execution
+          # provenance principle: zero-execution is RED, not a skip.
+          - name: perf compare_grad_oracle suite
+            cmd: python3 ci/scripts/perf/test_compare_grad_oracle.py
+          # `finetune_ab.sh`'s merge/table stage suite (F6): stdlib-only,
+          # drives `ab_merge.main` (the real entry point that script's own
+          # heredoc-turned-module extraction was built to make testable —
+          # see `ab_merge.py`'s own module doc's B3 note). Same
+          # zero-execution gap as `compare_grad_oracle`'s suite above.
+          - name: perf ab_merge suite
+            cmd: python3 ci/scripts/perf/test_ab_merge.py
+          # `torch_grad_oracle.py`'s NAME-TRANSLATION suite (F6): stdlib-
+          # only, importable without torch installed (that module's own
+          # `import torch_finetune_step as tfs` succeeds torch-free because
+          # `torch_finetune_step.py` imports torch lazily inside its
+          # functions, never at module scope — see this suite's own module
+          # doc). Caught and pinned a real bug (the `Wi`/`mlp.Wi` name
+          # misroute) before this fix; was wired into no workflow at all.
+          - name: reference torch_grad_oracle name-translation suite
+            cmd: python3 crates/jammi-bench/reference/test_torch_grad_oracle_names.py
     steps:
       - uses: actions/checkout@v4
       - name: Run guard
@@ -500,6 +689,8 @@ jobs:
       - test-clients
       - guard
       - dep-direction
+      - flash-attn-closure
+      - flash-attn-compile
       - oss-only-build
       - dep-audit
       - ts-client

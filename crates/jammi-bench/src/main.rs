@@ -62,6 +62,7 @@ mod eval;
 mod finetune_step;
 mod fixture;
 mod gpu_inference;
+mod grad_oracle;
 mod graph_train;
 mod model_inference;
 mod operator_mirror;
@@ -417,6 +418,68 @@ enum Command {
         /// finite and > 0.0 when supplied.
         #[arg(long)]
         max_grad_norm: Option<f32>,
+        /// Comma-separated op key(s) this invocation INTENDS
+        /// `JAMMI_KERNELS_DISABLE` to carry. When set, the run hard-errors
+        /// unless `jammi_kernels::admission::disabled_ops_requested()`
+        /// reads back exactly this set — the binary controls its own argv,
+        /// so a dropped/mistyped/unforwarded `JAMMI_KERNELS_DISABLE` env
+        /// var (which otherwise reads identically to "nothing requested")
+        /// becomes a hard failure on the SAME invocation instead of
+        /// something a caller has to notice by eyeballing
+        /// `kernels_disabled_requested` in the emitted JSON report
+        /// afterward. See `finetune_step::FinetuneStepParams::expect_kernels_disabled`'s
+        /// doc.
+        #[arg(long)]
+        expect_kernels_disabled: Option<String>,
+    },
+    /// The jammi-vs-torch LEARNING oracle: one forward+backward at
+    /// IDENTICAL LoRA weights (never an optimizer step), dumped per
+    /// trainable tensor by name (loss + f32 gradient) for
+    /// `ci/scripts/perf/compare_grad_oracle.py` to compare against a
+    /// torch-side dump by GRADIENT DIRECTION (cosine similarity), not by
+    /// loss trajectory — see `grad_oracle.rs`'s module doc for why a loss-
+    /// trajectory comparison cannot certify learning parity even after the
+    /// B1 placement fix. `--lora-weights-out` writes the LoRA `A`/`B`
+    /// values this call actually used (jammi's own internal safetensors
+    /// naming); a LATER call's `--lora-weights-in` loads them back,
+    /// overwriting the fresh seeded draw before the forward runs.
+    GradOracle {
+        /// Directory holding `config.json` + `model.safetensors`.
+        #[arg(long)]
+        model_dir: PathBuf,
+        #[arg(long, default_value_t = 8)]
+        batch: usize,
+        #[arg(long, default_value_t = 128)]
+        seq: usize,
+        #[arg(long, default_value_t = 16)]
+        lora_rank: usize,
+        #[arg(long, default_value_t = 32.0)]
+        lora_alpha: f64,
+        /// Comma-separated LoRA target selectors.
+        #[arg(long, default_value = "Wqkv,Wo,Wi")]
+        target_modules: String,
+        /// Backbone precision: f32, f16, or bf16.
+        #[arg(long, default_value = "f32")]
+        backbone_dtype: String,
+        /// CUDA ordinal; omit for CPU.
+        #[arg(long)]
+        cuda: Option<usize>,
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        batched_forward: bool,
+        /// Load LoRA A/B from this safetensors file before the forward
+        /// (jammi's own internal tensor naming — see `grad_oracle.rs`'s
+        /// module doc). Omit to use a fresh seeded draw instead.
+        #[arg(long)]
+        lora_weights_in: Option<PathBuf>,
+        /// Write the LoRA A/B values actually used (post-load, if any) to
+        /// this safetensors file.
+        #[arg(long)]
+        lora_weights_out: Option<PathBuf>,
+        /// Write the gradient/loss dump (JSON) here.
+        #[arg(long)]
+        out: PathBuf,
     },
     /// The CPU-hermetic cache-hit SLO tier: drives the engine's opt-in producer
     /// memoization (`CachePolicy::Use`) on a cacheable producer (the
@@ -498,6 +561,7 @@ async fn main() -> std::process::ExitCode {
             seed,
             batched_forward,
             max_grad_norm,
+            expect_kernels_disabled,
         } => run_finetune_step(finetune_step::FinetuneStepParams {
             model_dir,
             batch,
@@ -526,17 +590,113 @@ async fn main() -> std::process::ExitCode {
             seed,
             batched_forward,
             max_grad_norm,
+            // `--expect-kernels-disabled` and `JAMMI_KERNELS_DISABLE` are
+            // the SAME grammar (a caller states the same disable list two
+            // ways) — routed through the identical
+            // `jammi_kernels::admission::parse_disable_list` a genuine
+            // `JAMMI_KERNELS_DISABLE` read goes through, rather than a
+            // second, hand-rolled parser that could (and did) diverge on
+            // duplicate entries. Sorted into a `Vec` here (not left as a
+            // `HashSet`) because `disabled_ops_requested()` — what this
+            // gets compared against in `finetune_step::run` — is itself a
+            // sorted, deduplicated `Vec`.
+            expect_kernels_disabled: expect_kernels_disabled.map(|s| {
+                let mut v: Vec<String> = jammi_kernels::admission::parse_disable_list(Some(&s))
+                    .into_iter()
+                    .collect();
+                v.sort();
+                v
+            }),
         }),
+        Command::GradOracle {
+            model_dir,
+            batch,
+            seq,
+            lora_rank,
+            lora_alpha,
+            target_modules,
+            backbone_dtype,
+            cuda,
+            seed,
+            batched_forward,
+            lora_weights_in,
+            lora_weights_out,
+            out,
+        } => run_grad_oracle(
+            grad_oracle::GradOracleParams {
+                model_dir,
+                batch,
+                seq,
+                lora_rank,
+                lora_alpha,
+                target_modules: target_modules
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                backbone_dtype: match backbone_dtype.as_str() {
+                    "f32" => jammi_numerics::ComputePrecision::F32,
+                    "f16" => jammi_numerics::ComputePrecision::F16,
+                    "bf16" => jammi_numerics::ComputePrecision::BF16,
+                    other => {
+                        eprintln!("unknown backbone_dtype {other:?}; expected f32, f16, or bf16");
+                        return std::process::ExitCode::FAILURE;
+                    }
+                },
+                cuda_device: cuda,
+                seed,
+                batched_forward,
+                lora_weights_in,
+                lora_weights_out,
+            },
+            &out,
+        ),
         Command::CacheSloScale => run_cache_slo_scale().await,
         Command::RecomputeScale => run_recompute_scale().await,
     }
 }
 
+/// The `grad-oracle` subcommand: run one forward+backward (no optimizer
+/// step) and write the JSON gradient/loss dump to `out`. Records; does not
+/// gate (the same recorded-not-gated posture `finetune-step` takes — the
+/// comparison this dump feeds, `ci/scripts/perf/compare_grad_oracle.py`, is
+/// the piece that asserts a bound, kept out-of-process so a Python-side
+/// numpy oracle is never coupled to this binary's own exit code). Exits
+/// non-zero only when the step could not be measured at all.
+fn run_grad_oracle(
+    params: grad_oracle::GradOracleParams,
+    out: &std::path::Path,
+) -> std::process::ExitCode {
+    let report = match grad_oracle::run(&params) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("grad-oracle failed: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let json = match serde_json::to_string_pretty(&report) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("grad-oracle: failed to serialize report: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = std::fs::write(out, json) {
+        eprintln!("grad-oracle: failed to write {out:?}: {e}");
+        return std::process::ExitCode::FAILURE;
+    }
+    std::process::ExitCode::SUCCESS
+}
+
 /// The `finetune-step` subcommand: run the tier and emit the report. Records;
 /// does not gate. Exits non-zero only when the step could not be measured at
 /// all — a missing checkpoint, a target-module set that matched no linear, a
-/// device that could not be resolved, or a `--max-grad-norm` that was
-/// supplied but not finite and > 0.0.
+/// device that could not be resolved, a `--max-grad-norm` that was supplied
+/// but not finite and > 0.0, or (contract K-aux) `JAMMI_KERNELS_DISABLE`
+/// naming an op key that never disabled a live dispatch this run
+/// (`finetune_step::run`'s doc) — an INVALID run, reported as a failure
+/// rather than as a JSON tier with a suspiciously-clean dispatch split.
 fn run_finetune_step(params: finetune_step::FinetuneStepParams) -> std::process::ExitCode {
     let tier = match finetune_step::run(&params) {
         Ok(t) => t,

@@ -288,10 +288,18 @@ impl CalibrationEvalReport {
     /// headline, so its paired test is what turns "this predictor is
     /// better-calibrated than the baseline" into a p-value rather than a vibe.
     ///
-    /// Returns `None` when the two runs share no `record_id` to pair on. A
-    /// `ci_upper` below zero is the resampling analogue of "this run's CRPS is
+    /// Returns `Ok(None)` when the two runs share no `record_id` to pair on —
+    /// the only condition that means "nothing to compare". Returns
+    /// `Err(SignificanceError)` when the pairing is non-empty but a paired
+    /// CRPS is non-finite (class-sweep audit r3): that is a data-integrity
+    /// fault on a corrupted/hand-crafted `PerRecordCalibration`, never
+    /// "empty", so it no longer collapses to the same `None`. A `ci_upper`
+    /// below zero is the resampling analogue of "this run's CRPS is
     /// significantly lower (better) than the baseline's".
-    pub fn significance_vs(&self, baseline: &CalibrationEvalReport) -> Option<MetricSignificance> {
+    pub fn significance_vs(
+        &self,
+        baseline: &CalibrationEvalReport,
+    ) -> Result<Option<MetricSignificance>, SignificanceError> {
         calibration_significance(&baseline.per_record, &self.per_record)
     }
 }
@@ -420,13 +428,44 @@ where
         .collect()
 }
 
+/// Why a paired significance computation failed for a *non-empty* pairing —
+/// distinct from "no shared id to pair on", which resolves to `Ok(None)` in
+/// `metric_significance` / `calibration_significance` rather than this
+/// error. `bootstrap_ci` and `mann_whitney_u` both refuse non-finite input at
+/// the edge (class-sweep audit r3); before this type existed, that refusal
+/// was swallowed by `.ok()?` and surfaced as the SAME `None` an empty pairing
+/// produces, so a corrupted or hand-crafted per-query/per-record value (e.g.
+/// a `PerQueryRecord` deserialized off a persisted row) was silently
+/// indistinguishable from "nothing to pair". `metric` names which of the four
+/// `AggregateDelta` metrics (or `"crps"` for calibration) the failing paired
+/// sample belonged to.
+#[derive(Debug, thiserror::Error)]
+#[error("significance computation for metric '{metric}' failed on a non-empty pairing: {source}")]
+pub struct SignificanceError {
+    pub metric: &'static str,
+    #[source]
+    pub source: jammi_numerics::NumericsError,
+}
+
 /// Compute the distribution-free significance of one metric's paired deltas:
 /// a bootstrap CI on the mean paired difference plus a Mann–Whitney U p-value
-/// between the baseline and treatment distributions. Returns `None` when the
-/// pairing is empty (no shared `query_id`).
-fn metric_significance(paired: &[PairedMetric]) -> Option<MetricSignificance> {
+/// between the baseline and treatment distributions.
+///
+/// Returns `Ok(None)` when the pairing is empty (no shared `query_id`) — the
+/// ONLY condition that means "nothing to compare". Returns
+/// `Err(SignificanceError)` when the pairing is non-empty but a paired value
+/// is non-finite, so `bootstrap_ci` / `mann_whitney_u` refuse it: that is a
+/// data-integrity fault, never "empty", and must not collapse to the same
+/// `None` (class-sweep audit r3). In-tree callers never observe the `Err` arm
+/// today — `eval_embeddings`'s computed metrics are always finite
+/// (`retrieval.rs` guards every denominator) — so reaching it requires a
+/// non-finite value read back from a persisted/deserialized `PerQueryRecord`.
+fn metric_significance(
+    metric: &'static str,
+    paired: &[PairedMetric],
+) -> Result<Option<MetricSignificance>, SignificanceError> {
     if paired.is_empty() {
-        return None;
+        return Ok(None);
     }
     let differences: Vec<f64> = paired.iter().map(|p| p.treatment - p.baseline).collect();
     let baseline: Vec<f64> = paired.iter().map(|p| p.baseline).collect();
@@ -439,28 +478,49 @@ fn metric_significance(paired: &[PairedMetric]) -> Option<MetricSignificance> {
         BOOTSTRAP_ALPHA,
         BOOTSTRAP_SEED,
     )
-    .ok()?;
-    let p_value = mann_whitney_u(&baseline, &treatment).ok()?.p_value;
+    .map_err(|source| SignificanceError { metric, source })?;
+    let p_value = mann_whitney_u(&baseline, &treatment)
+        .map_err(|source| SignificanceError { metric, source })?
+        .p_value;
 
-    Some(MetricSignificance {
+    Ok(Some(MetricSignificance {
         p_value,
         ci_lower: lower,
         ci_upper: upper,
-    })
+    }))
 }
 
 /// Compute paired significance for all four metrics between a baseline and a
 /// treatment run's per-query records. Returns `None` when the two runs share
 /// no `query_id` (nothing to pair).
+///
+/// This function's own return type is pinned — `jammi-ai`'s `eval_compare`
+/// runner assigns it directly into a non-fallible `TableEvalReport.delta`
+/// field — so a [`SignificanceError`] from `metric_significance` (a
+/// non-finite paired value on an otherwise non-empty pairing) also degrades
+/// to `None` at THIS boundary, the same outcome as an empty pairing. That is
+/// a known, narrow limitation of this specific pinned signature, not a silent
+/// swallow: `metric_significance` itself distinguishes the two cases and is
+/// the fn to call directly (or extend this one's signature, in a follow-up
+/// that also updates its caller) when that distinction needs to reach here.
+/// No in-tree caller observes the difference today — `eval_embeddings`'s
+/// computed metrics are always finite, so a non-finite paired value can only
+/// arise from a corrupted/hand-crafted `PerQueryRecord` deserialized off a
+/// persisted row.
 pub fn delta_significance(
     baseline: &[PerQueryRecord],
     treatment: &[PerQueryRecord],
 ) -> Option<DeltaSignificance> {
+    let significance_for = |metric: &'static str, extract: fn(&QueryMetrics) -> f64| {
+        metric_significance(metric, &paired_metric(baseline, treatment, extract))
+            .ok()
+            .flatten()
+    };
     Some(DeltaSignificance {
-        recall_at_k: metric_significance(&paired_metric(baseline, treatment, |m| m.recall))?,
-        precision_at_k: metric_significance(&paired_metric(baseline, treatment, |m| m.precision))?,
-        mrr: metric_significance(&paired_metric(baseline, treatment, |m| m.mrr))?,
-        ndcg: metric_significance(&paired_metric(baseline, treatment, |m| m.ndcg))?,
+        recall_at_k: significance_for("recall_at_k", |m| m.recall)?,
+        precision_at_k: significance_for("precision_at_k", |m| m.precision)?,
+        mrr: significance_for("mrr", |m| m.mrr)?,
+        ndcg: significance_for("ndcg", |m| m.ndcg)?,
     })
 }
 
@@ -670,13 +730,20 @@ fn compute_cohort_calibration(per_record: &[PerRecordCalibration]) -> Vec<Cohort
 /// Distribution-free paired significance of the per-record CRPS deltas between
 /// a baseline and a treatment calibration run (reusing R1's bootstrap CI +
 /// Mann–Whitney U — no new stats). Records are paired by `record_id`; pairs
-/// present in only one run are dropped. Returns `None` when no `record_id` is
-/// shared. The CRPS is the proper-score headline, so its paired test is what
-/// turns "B is better-calibrated than A" into a p-value.
+/// present in only one run are dropped. The CRPS is the proper-score
+/// headline, so its paired test is what turns "B is better-calibrated than
+/// A" into a p-value.
+///
+/// Returns `Ok(None)` when no `record_id` is shared — the only condition
+/// that means "nothing to pair". Returns `Err(SignificanceError)` when the
+/// pairing is non-empty but a paired CRPS is non-finite, so `bootstrap_ci` /
+/// `mann_whitney_u` refuse it (class-sweep audit r3): that is a
+/// data-integrity fault, never "empty", so it no longer collapses to the
+/// same `None` a genuinely empty pairing produces.
 pub(crate) fn calibration_significance(
     baseline: &[PerRecordCalibration],
     treatment: &[PerRecordCalibration],
-) -> Option<MetricSignificance> {
+) -> Result<Option<MetricSignificance>, SignificanceError> {
     let treatment_by_id: BTreeMap<&str, f64> = treatment
         .iter()
         .map(|r| (r.record_id.as_str(), r.crps))
@@ -690,7 +757,7 @@ pub(crate) fn calibration_significance(
         })
         .collect();
     if paired.is_empty() {
-        return None;
+        return Ok(None);
     }
     let differences: Vec<f64> = paired.iter().map(|(b, t)| t - b).collect();
     let base: Vec<f64> = paired.iter().map(|(b, _)| *b).collect();
@@ -703,13 +770,21 @@ pub(crate) fn calibration_significance(
         BOOTSTRAP_ALPHA,
         BOOTSTRAP_SEED,
     )
-    .ok()?;
-    let p_value = mann_whitney_u(&base, &treat).ok()?.p_value;
-    Some(MetricSignificance {
+    .map_err(|source| SignificanceError {
+        metric: "crps",
+        source,
+    })?;
+    let p_value = mann_whitney_u(&base, &treat)
+        .map_err(|source| SignificanceError {
+            metric: "crps",
+            source,
+        })?
+        .p_value;
+    Ok(Some(MetricSignificance {
         p_value,
         ci_lower: lower,
         ci_upper: upper,
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -935,7 +1010,9 @@ mod calibration_tests {
         )
         .unwrap()
         .per_record;
-        let sig = calibration_significance(&baseline, &treatment).expect("shared ids");
+        let sig = calibration_significance(&baseline, &treatment)
+            .expect("finite paired CRPS values must compute")
+            .expect("shared ids");
         // Treatment CRPS is lower, so treatment - baseline is negative: the CI
         // sits below zero.
         assert!(
@@ -953,7 +1030,35 @@ mod calibration_tests {
         let treatment = compute_calibration("t".into(), &[gaussian("z", 0.0, 1.0, 0.0)])
             .unwrap()
             .per_record;
-        assert!(calibration_significance(&baseline, &treatment).is_none());
+        assert!(calibration_significance(&baseline, &treatment)
+            .expect("empty pairing must be Ok(None), not an error")
+            .is_none());
+    }
+
+    #[test]
+    fn crps_significance_errors_on_non_finite_paired_value() {
+        // Two records share `record_id`, but the baseline's CRPS is corrupted
+        // to NaN — as would happen reading back a persisted-then-corrupted
+        // `PerRecordCalibration` row, never from `compute_calibration` itself
+        // (its CRPS is always finite; see `score_prediction`). Before this
+        // fix, `bootstrap_ci`'s refusal was swallowed by `.ok()?` and this
+        // returned the SAME `None` an empty pairing produces (class-sweep
+        // audit r3); it must now surface as a typed error instead.
+        let row = |record_id: &str, crps: f64| PerRecordCalibration {
+            record_id: record_id.into(),
+            crps,
+            nll: 0.0,
+            pit: 0.5,
+            covered: true,
+            interval_width: 1.0,
+            cohorts: BTreeMap::new(),
+        };
+        let baseline = vec![row("r0", f64::NAN), row("r1", 0.5)];
+        let treatment = vec![row("r0", 0.4), row("r1", 0.3)];
+        let err = calibration_significance(&baseline, &treatment).expect_err(
+            "a non-finite paired CRPS on a non-empty pairing must be a typed error, not None",
+        );
+        assert_eq!(err.metric, "crps");
     }
 }
 
@@ -1281,6 +1386,55 @@ mod significance_tests {
         assert_eq!(paired.len(), 1, "only query 'b' is shared");
         assert_eq!(paired[0].baseline, 0.2);
         assert_eq!(paired[0].treatment, 0.5);
+    }
+
+    #[test]
+    fn metric_significance_empty_pairing_is_ok_none() {
+        assert!(metric_significance("recall_at_k", &[])
+            .expect("an empty pairing is Ok(None), not an error")
+            .is_none());
+    }
+
+    #[test]
+    fn metric_significance_positive_control_succeeds() {
+        // A non-degenerate, all-finite paired sample: the function must
+        // actually compute and return `Some`, not merely fail to error —
+        // otherwise the RED-first non-finite test below would pass vacuously
+        // on a fn that errors (or returns `None`) unconditionally.
+        let paired: Vec<PairedMetric> = (0..20)
+            .map(|i| PairedMetric {
+                baseline: 0.2,
+                treatment: 0.2 + 0.03 * i as f64,
+            })
+            .collect();
+        let sig = metric_significance("recall_at_k", &paired)
+            .expect("finite paired values must compute")
+            .expect("a non-empty pairing must not be None");
+        assert!(sig.p_value.is_finite());
+        assert!(sig.ci_lower.is_finite());
+        assert!(sig.ci_upper.is_finite());
+    }
+
+    #[test]
+    fn metric_significance_errors_on_non_finite_paired_value() {
+        // A non-empty pairing where one query's paired value is non-finite —
+        // a corrupted or hand-crafted `PerQueryRecord`, never one
+        // `eval_embeddings` computes (`retrieval.rs` guards every
+        // denominator). Before this fix, `bootstrap_ci`'s refusal was
+        // swallowed by `.ok()?` and this returned the SAME `None` an empty
+        // pairing produces (class-sweep audit r3); it must now be a typed
+        // error naming the offending metric.
+        let mut paired: Vec<PairedMetric> = (0..10)
+            .map(|i| PairedMetric {
+                baseline: 0.2,
+                treatment: 0.2 + 0.01 * i as f64,
+            })
+            .collect();
+        paired[3].treatment = f64::NAN;
+        let err = metric_significance("mrr", &paired).expect_err(
+            "a non-finite paired value on a non-empty pairing must be a typed error, not None",
+        );
+        assert_eq!(err.metric, "mrr");
     }
 
     #[test]

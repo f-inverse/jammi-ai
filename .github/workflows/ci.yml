@@ -30,18 +30,42 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      # `--all-targets` above only compiles test binaries whose
-      # `required-features` are satisfied by jammi-ai's default features
-      # ("local"). `gpu_capability` (`required-features = ["live-gpu-tests"]`)
-      # and `distributed` (`required-features = ["live-distributed-tests"]`)
-      # are gated off and so escape plain `--workspace --all-targets` clippy
-      # entirely — a real `clippy::doc_lazy_continuation` hit went unwired
-      # through exactly this gap. Neither feature needs an actual GPU/CUDA
+      # `--all-targets` above only compiles test targets whose
+      # `required-features` are satisfied by default. Exactly three
+      # workspace test targets are NOT (`cargo metadata` enumerated): jammi-ai
+      # `gpu_capability` (`required-features = ["live-gpu-tests"]`), jammi-ai
+      # `distributed` (`required-features = ["live-distributed-tests"]`) —
+      # both covered by the step below, neither needs an actual GPU/CUDA
       # toolchain or a distributed harness to *compile*, only to run
-      # meaningfully, so this step stays hermetic and cheap. Kept as
-      # its own step (not folded into the line above) so a failure here is
-      # legible as "gated-test-surface lint", not conflated with the default
-      # workspace lint pass.
+      # meaningfully, so this step stays hermetic and cheap — and jammi-kernels
+      # `cuda_parity` (`required-features = ["cuda"]`, crates/jammi-kernels/
+      # Cargo.toml:66), which CANNOT be covered here: `cuda` pulls
+      # `dep:bindgen_cuda`, a real CUDA toolchain requirement this hermetic
+      # runner does not have. That target is linted instead in
+      # `ci/scripts/runpod_gpu_prove.sh`, the one lane with a real GPU.
+      #
+      # This step is what actually closes the doc_lazy_continuation escape
+      # `ci/scripts/check_doc_list_indent.py` was written to catch (a real
+      # hit in gpu_capability's `graph_propagation_parity.rs`, confirmed via
+      # this exact command going from EXIT=101/4 errors to EXIT=0 once the
+      # doc was fixed). That script was retired, not merged in alongside
+      # this step: it both OVER-approximates the lint (flags markdown-list-
+      # shaped lines mid-paragraph, e.g. `2. text`, that clippy is silent on)
+      # and UNDER-approximates it (misses flush-left prose following a
+      # properly-indented continuation, which clippy does flag) — a fixed
+      # text scanner cannot track clippy's own CommonMark-interruption rules,
+      # so it is not a substitute for running the real lint.
+      #
+      # Residual gap, disclosed rather than silently accepted: a doc comment
+      # attached to an item behind a proc-macro attribute (e.g. `#[test_case
+      # (...)]`) is invisible to `clippy::doc_lazy_continuation` — the macro
+      # expansion masks the lint, a class no `cargo clippy` invocation can
+      # see through. `check_doc_list_indent.py` DID cover that class (it is
+      # a text scanner, not macro-aware), so retiring it trades away
+      # detection there. `crates ci` at HEAD has zero such hits, so this is
+      # a prospective gap, not a live one; if it needs closing, it needs a
+      # macro-aware (or item-doc-scoped) checker, not a reinstated line-shape
+      # scanner with the over/under-approximation problems above.
       - name: Clippy (gated test surfaces — compile-only feature closure)
         run: cargo clippy -p jammi-ai --tests --features live-gpu-tests,live-distributed-tests -- -D warnings
 

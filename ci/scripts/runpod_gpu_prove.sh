@@ -51,6 +51,9 @@ echo "::endgroup::"
 echo "::group::jammi-kernels lib tests, --features cuda (this pod's A100 is the GPU the suite needs)"
 cargo test -p jammi-kernels --features cuda -- --nocapture --test-threads=1 || rc=\$?
 echo "::endgroup::"
+echo "::group::jammi-kernels clippy, --all-targets --features cuda (the only lane that can compile cuda_parity — required-features = [\"cuda\"] pulls dep:bindgen_cuda, a real CUDA toolchain the hermetic runner does not have)"
+cargo clippy -p jammi-kernels --all-targets --features cuda -- -D warnings || rc=\$?
+echo "::endgroup::"
 echo "PROVE_EXIT=\${rc}"; exit \$rc
 REMOTE
 rc=$?

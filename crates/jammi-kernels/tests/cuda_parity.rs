@@ -5033,126 +5033,39 @@ fn attention_block_bwd_parity_bf16_window_s512_cuda() {
     assert_attention_block_bwd_parity_cuda(&cuda, DType::BF16, 2, 512, 16, 64, Some(64), 14.0);
 }
 
-// --- B0 SCRATCH boundary probes (temporary, deleted before commit) ---
+// Batch=1 legs (esc-P3-B0 follow-up): every OTHER attention_block leg in
+// this file runs batch=2 or batch=8, which is exactly why this cell was
+// never covered before this round. `bh = b*h` is 16 here (vs 128 at
+// batch=8) and `check_mask`'s leading-axis rule (`dims[0] == 1 || dims[0]
+// == b`) is structurally AMBIGUOUS at `b == 1` (a genuine per-batch
+// `[1,1,S,S]` mask and a broadcast-over-batch mask are shape-
+// indistinguishable) — both candidates this leg is built to catch.
+//
+// STATUS (esc-P3-B0 follow-up, pod-measured): op-level (single call,
+// synthetic fixture, amplitude swept 0.1-18 i.e. past the real
+// checkpoint's own measured max|qkv|) is CLEAN at batch=1 — both legs
+// below pass, matching every other batch size. The real ModernBERT-large
+// 20-step training run at batch=1 nonetheless shows a step-0 total|dqkv|
+// (summed over all 224 LoRA tensors, real checkpoint weights) that is
+// ~0.17% off eager's, GROWING with depth (0.005% at 4 real layers, 0.17%
+// at 28) — a compounding-through-the-residual-stream signature these
+// SINGLE-CALL legs cannot see by construction (there is no depth to
+// compound over in one call). This is therefore NECESSARY but not
+// SUFFICIENT coverage for that defect; see the crate hand-off notes for
+// the open item (a multi-layer batch-1 oracle, and the not-yet-isolated
+// root cause).
 #[test]
-fn zzb0_probe_b1_s512() {
+fn attention_block_bwd_parity_f32_window_s512_b1_cuda() {
     let Some(cuda) = cuda_device() else {
         return;
     };
-    assert_attention_block_bwd_parity_cuda(&cuda, DType::BF16, 1, 512, 16, 64, Some(64), 20.0);
-}
-#[test]
-fn zzb0_probe_b2_s512() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
-    assert_attention_block_bwd_parity_cuda(&cuda, DType::BF16, 2, 512, 16, 64, Some(64), 20.0);
-}
-#[test]
-fn zzb0_probe_b4_s512() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
-    assert_attention_block_bwd_parity_cuda(&cuda, DType::BF16, 4, 512, 16, 64, Some(64), 20.0);
-}
-#[test]
-fn zzb0_probe_b8_s512() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
-    assert_attention_block_bwd_parity_cuda(&cuda, DType::BF16, 8, 512, 16, 64, Some(64), 20.0);
-}
-
-#[allow(clippy::too_many_arguments)]
-fn zzb0_amp_probe(
-    cuda: &Device,
-    batch: usize,
-    seq: usize,
-    heads: usize,
-    head_dim: usize,
-    window: Option<usize>,
-    seed: f32,
-    amplitude: f32,
-) {
-    let qkv_v: Vec<f32> = qkv_fixture(batch, seq, heads, head_dim, seed)
-        .into_iter()
-        .map(|v| v * amplitude)
-        .collect();
-    let rope_v = attention_rope_pack(seq, head_dim);
-    // PER-BATCH varying padding (not all-zero): batch bi pads its last
-    // `bi * 3` keys, so a `mrow_base` bug hardcoded to batch 0 (or any
-    // fixed batch) would be visible in the fwd/bwd delta, unlike an
-    // all-zero mask_base where every batch row is identical.
-    let mut mask_base = vec![0f32; batch * seq];
-    for bi in 0..batch {
-        let pad_len = (bi * 3).min(seq / 2);
-        for ki in (seq - pad_len)..seq {
-            mask_base[bi * seq + ki] = -10_000.0;
-        }
-    }
-    let mask_v: Vec<f32> = match window {
-        None => mask_base,
-        Some(hw) => {
-            let combined = combined_attention_mask(cuda, batch, seq, &mask_base, Some(hw));
-            combined.flatten_all().unwrap().to_vec1().unwrap()
-        }
-    };
-    let dy_v = attention_dy_fixture(batch * seq * heads * head_dim, seed + 100.0);
-    let scale = 1.0 / (head_dim as f32).sqrt();
-    let dtype = DType::BF16;
-
-    let (out_fused, dqkv_fused) = attention_block_bwd_fused(
-        cuda, dtype, &qkv_v, &rope_v, &mask_v, &dy_v, batch, seq, heads, head_dim, scale,
-    );
-    let (out_eager, dqkv_eager) = attention_block_bwd_eager_reference(
-        cuda, dtype, &qkv_v, &rope_v, &mask_v, &dy_v, batch, seq, heads, head_dim, scale,
-    );
-    let s_max = attention_scores_max_f32_cpu(&qkv_v, &rope_v, batch, seq, heads, head_dim, scale);
-    let v_max = qkv_v
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| qkv_slot(*i, heads, head_dim) == 2)
-        .fold(0f32, |m, (_, x)| m.max(x.abs()));
-    let mut max_out_delta = 0f32;
-    for (a, b) in out_fused.iter().zip(out_eager.iter()) {
-        max_out_delta = max_out_delta.max((a - b).abs());
-    }
-    let mut max_dqkv_delta = 0f32;
-    let mut argmax_i = 0usize;
-    for (i, (a, b)) in dqkv_fused.iter().zip(dqkv_eager.iter()).enumerate() {
-        let d = (a - b).abs();
-        if d > max_dqkv_delta {
-            max_dqkv_delta = d;
-            argmax_i = i;
-        }
-    }
-    eprintln!(
-        "zzb0_amp_probe amp={amplitude} shape=({batch},{seq},{heads},{head_dim}) window={window:?} \
-         S_max={s_max:e} V_max={v_max:e} max_out_delta={max_out_delta:e} \
-         max_dqkv_delta={max_dqkv_delta:e} argmax_i={argmax_i} slot={} \
-         fused[argmax]={} eager[argmax]={}",
-        qkv_slot(argmax_i, heads, head_dim),
-        dqkv_fused[argmax_i],
-        dqkv_eager[argmax_i],
-    );
+    assert_attention_block_bwd_parity_cuda(&cuda, DType::F32, 1, 512, 16, 64, Some(64), 21.0);
 }
 
 #[test]
-fn zzb0_amp_sweep_b8_s512() {
+fn attention_block_bwd_parity_bf16_window_s512_b1_cuda() {
     let Some(cuda) = cuda_device() else {
         return;
     };
-    for amp in [0.1f32, 0.3, 1.0, 2.0, 3.0, 5.0] {
-        zzb0_amp_probe(&cuda, 8, 512, 16, 64, Some(64), 30.0, amp);
-    }
-}
-
-#[test]
-fn zzb0_amp_sweep_b2_s512() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
-    for amp in [0.1f32, 0.3, 1.0, 2.0, 3.0, 5.0] {
-        zzb0_amp_probe(&cuda, 2, 512, 16, 64, Some(64), 30.0, amp);
-    }
+    assert_attention_block_bwd_parity_cuda(&cuda, DType::BF16, 1, 512, 16, 64, Some(64), 22.0);
 }

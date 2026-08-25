@@ -26,6 +26,7 @@
 //! NOT a multiple of it (exercises the kernel's `if (i < n)` bounds check
 //! on a partial last block), both supported dtypes (f32, bf16), and both
 //! forward AND backward.
+
 #![cfg(feature = "cuda")]
 
 use candle_core::{DType, Device, Error, Tensor, Var, D};
@@ -3844,6 +3845,218 @@ fn combined_attention_mask(
     }
 }
 
+// -----------------------------------------------------------------------
+// Derived bf16 bounds for the attention_block legs (audit B3).
+//
+// bf16 keeps 8 significand bits (7 stored + the hidden one), so the ULP at
+// |x| is `2^(e - 7)` for |x|'s binary exponent `e` — at most `2^-7 * |x|`
+// — and the two implementations compared below can only ever differ by
+// whole ULPs of the OUTPUT ELEMENT being rounded: every kernel on both
+// sides computes in f32 and rounds once (`rope_fwd_bf16` and the softmax
+// kernel in `src/cuda/*.cu`; cuBLAS via candle-core 0.11's
+// `gemm_strided_batched_bf16`). Two f32 interiors that differ only in
+// accumulation ORDER differ by ~`K * 2^-24` relative (`K` = the reduced
+// extent) and therefore round to DIFFERENT bf16 values only when the
+// exact value lies within that band of a rounding boundary — an isolated
+// one-ULP flip of that element, probability ~`K * 2^-16` per element, not
+// a systematic drift. That is the whole error model:
+//
+//   |Δ_i| <= k · ulp(|x_i|) + k · ulp(max_j |x_j|) [+ softmax-flip term]
+//
+// * `k · ulp(|x_i|)`: the element's OWN rounding may flip at each of the
+//   `k` rounding points on its chain (counted per leg below).
+// * `k · ulp(max_j |x_j|)`: an upstream flip lands in `x_i` through a
+//   dot product as ONE product term, bounded by one ULP of the largest
+//   element of that output (the floor the audit asked for — never `1.0`,
+//   which was ~60x the gradient signal).
+// * softmax-flip term (forward `out` only): a flipped SCORE `s_j`
+//   perturbs its row's softmax by `Δp_j = p_j (1 - p_j) Δs_j`, at most
+//   `ulp(S_max) / 4`, which reaches `out_i` as `Δp_j (v_j - out_i)` —
+//   at most `ulp(S_max) * V_max / 2`, where `S_max` is the largest
+//   |score| (measured on the CPU in f32 from the same fixture) and
+//   `V_max` the largest |v|. This is the softmax's exponential
+//   sensitivity made explicit, and it is why the bf16 legs run at the
+//   IN-DOMAIN amplitude (`|qkv| <= 1`, `S_max` of a few units — post-
+//   LayerNorm activations after the `1/sqrt(64)` fold): at the raw
+//   `[-10, 10]` amplitude `S_max` is `O(800)`, `ulp(S_max) = 4`, and no
+//   non-vacuous bound exists.
+// * For `dqkv` there is deliberately NO softmax-flip term: a single
+//   flipped score moves `dq` by ~`scale * p(1-p) * DP_max * K_max *
+//   ulp(S_max)`, comparable to the gradient signal itself, so any
+//   tolerance wide enough to admit one such flip would admit a broken
+//   kernel. The gradient bound is therefore premised on the SAME kernel
+//   sequence on both sides (fwd/bwd recompute in the identical shape and
+//   transpose mode — proven byte-identical at f32 on A100 for exactly
+//   these shapes by the f32 `assert_eq!` legs, and at bf16 by the diag
+//   leg), under which the expected `max|Δ|` is exactly 0; the printed
+//   `max|Δ| / max|signal|` per leg is what the pod artifact records.
+//
+// Discrimination (per assertion, verified on the CPU arm of the same
+// op): dropping the scale from `dq` (`let dqr = dqs.clone()` in `bwd`)
+// multiplies the Q-slot gradient by 8 — `|Δ| = 7 |dq|`, against a bound
+// of a few ULPs (`<= 7 * 2^-7 = 5.5%` of |dq| plus the floor), a ratio
+// of ~130x or more; dropping a RoPE half-term or the mask add moves
+// `out` by O(signal) against a ~1-5% bound.
+// -----------------------------------------------------------------------
+
+/// One bf16 ULP at `|x|` (`2^(e - 7)`); the smallest bf16 subnormal
+/// (`2^-133`) at zero. Exact, via the f32 exponent field.
+fn bf16_ulp(x: f32) -> f32 {
+    let x = x.abs();
+    if x == 0.0 || !x.is_finite() {
+        return 2f32.powi(-133);
+    }
+    let e = ((x.to_bits() >> 23) & 0xff) as i32 - 127;
+    2f32.powi((e - 7).max(-133))
+}
+
+fn max_abs(v: &[f32]) -> f32 {
+    v.iter().fold(0f32, |m, x| m.max(x.abs()))
+}
+
+/// `[batch, seq, 3, heads, head_dim]` flat index → slot (`0` Q, `1` K,
+/// `2` V).
+fn qkv_slot(i: usize, heads: usize, head_dim: usize) -> usize {
+    (i / (heads * head_dim)) % 3
+}
+
+/// The largest |score| (post-scale, pre-mask) the fixture produces,
+/// measured on the CPU in f32 through the SAME RoPE + GEMM the op
+/// composes — the `S_max` the softmax-flip term is stated in.
+fn attention_scores_max_f32_cpu(
+    qkv_v: &[f32],
+    rope_v: &[f32],
+    batch: usize,
+    seq: usize,
+    heads: usize,
+    head_dim: usize,
+    scale: f32,
+) -> f32 {
+    let cpu = Device::Cpu;
+    let qkv = Tensor::from_slice(qkv_v, (batch, seq, 3, heads, head_dim), &cpu).unwrap();
+    let rope_pack = Tensor::from_slice(rope_v, (2, 1, 1, seq, head_dim), &cpu).unwrap();
+    let slot = |k: usize| -> Tensor {
+        qkv.narrow(2, k, 1)
+            .unwrap()
+            .squeeze(2)
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap()
+            .contiguous()
+            .unwrap()
+    };
+    let cos = rope_pack.narrow(0, 0, 1).unwrap();
+    let sin = rope_pack.narrow(0, 1, 1).unwrap();
+    let q_rot = apply3(&slot(0), &cos, &sin, RopeFused::new(false)).unwrap();
+    let k_rot = apply3(&slot(1), &cos, &sin, RopeFused::new(false)).unwrap();
+    let scores = (q_rot * scale as f64)
+        .unwrap()
+        .matmul(&k_rot.transpose(2, 3).unwrap().contiguous().unwrap())
+        .unwrap();
+    let v: Vec<f32> = scores.flatten_all().unwrap().to_vec1().unwrap();
+    max_abs(&v)
+}
+
+/// The per-leg bound constants (see the section comment above).
+struct Bf16LegBounds {
+    /// `max_j |out_j|` over the compared forward vector.
+    out_max: f32,
+    /// `max_j |dqkv_j|` over the compared gradient vector (per slot).
+    dqkv_max: [f32; 3],
+    /// `ulp(S_max) * V_max / 2` — the forward's softmax-flip term.
+    softmax_flip: f32,
+}
+
+impl Bf16LegBounds {
+    /// Rounding points on the forward chain that can differ between the
+    /// two sides: the scores GEMM, `P`, the `PV` GEMM (3); plus the RoPE
+    /// output when the two sides run DIFFERENT RoPE code (the cross-device
+    /// leg: CPU row math vs `rope_fwd_bf16` — same f32 expression, but
+    /// the GPU may contract it into an FMA).
+    fn k_fwd(cross_device: bool) -> f32 {
+        if cross_device {
+            4.0
+        } else {
+            3.0
+        }
+    }
+
+    /// Rounding points to each `dqkv` slot: `dv` = fwd (3) + the `dv`
+    /// GEMM (4); `dq` = fwd (3) + `dp`, `ds`, `dqs`, RoPE-bwd (7); `dk`
+    /// likewise via `dkr` (7).
+    fn k_slot(slot: usize) -> f32 {
+        match slot {
+            2 => 4.0,
+            _ => 7.0,
+        }
+    }
+
+    /// `out`/`dqkv` are the two compared vectors of each leg (either may
+    /// be empty for a forward-only leg).
+    fn new(
+        out: [&[f32]; 2],
+        dqkv: [&[f32]; 2],
+        (heads, head_dim): (usize, usize),
+        s_max: f32,
+        v_max: f32,
+    ) -> Self {
+        let mut dqkv_max = [0f32; 3];
+        for (i, (a, b)) in dqkv[0].iter().zip(dqkv[1].iter()).enumerate() {
+            let slot = qkv_slot(i, heads, head_dim);
+            dqkv_max[slot] = dqkv_max[slot].max(a.abs()).max(b.abs());
+        }
+        Self {
+            out_max: max_abs(out[0]).max(max_abs(out[1])),
+            dqkv_max,
+            softmax_flip: bf16_ulp(s_max) * v_max / 2.0,
+        }
+    }
+
+    fn fwd(&self, c: f32, g: f32, cross_device: bool) -> f32 {
+        let k = Self::k_fwd(cross_device);
+        k * bf16_ulp(c.abs().max(g.abs())) + k * bf16_ulp(self.out_max) + self.softmax_flip
+    }
+
+    fn dqkv(&self, slot: usize, c: f32, g: f32) -> f32 {
+        let k = Self::k_slot(slot);
+        k * bf16_ulp(c.abs().max(g.abs())) + k * bf16_ulp(self.dqkv_max[slot])
+    }
+}
+
+/// Asserts `|a_i - b_i| <= bound(i)` elementwise and PRINTS the leg's
+/// `max|Δ|`, `max|signal|`, the largest bound, and the two ratios the pod
+/// artifact records (`max|Δ| / max|signal|`, `max|Δ| / bound`) — run the
+/// pod's `cuda_parity` with `--show-output` (or `--nocapture`) to land
+/// them in the captured log.
+fn assert_within_and_report(
+    label: &str,
+    a: &[f32],
+    b: &[f32],
+    bound: impl Fn(usize, f32, f32) -> f32,
+) {
+    assert_eq!(a.len(), b.len(), "{label}: length mismatch");
+    let mut max_delta = 0f32;
+    let mut max_bound = 0f32;
+    let mut worst_ratio = 0f32;
+    for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+        let delta = (x - y).abs();
+        let bd = bound(i, *x, *y);
+        assert!(
+            delta <= bd,
+            "{label}[{i}]: {x} vs {y}, |Δ| = {delta:e} > derived bound {bd:e}"
+        );
+        max_delta = max_delta.max(delta);
+        max_bound = max_bound.max(bd);
+        worst_ratio = worst_ratio.max(delta / bd);
+    }
+    let signal = max_abs(a).max(max_abs(b));
+    eprintln!(
+        "attention_block bf16 leg {label}: max|Δ|={max_delta:e} max|signal|={signal:e} \
+         max_bound={max_bound:e} Δ/signal={:e} worst Δ/bound={worst_ratio:e}",
+        max_delta / signal.max(f32::MIN_POSITIVE)
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn assert_attention_block_parity_f32(
     cuda: &Device,
@@ -4003,8 +4216,18 @@ fn attention_block_parity_f32_fully_masked_row_is_zero_on_both_devices() {
 }
 
 /// `BF16` on CUDA only (CPU domain is F32-only — see this section's own
-/// doc), against an F32 CPU reference with a `BF16`-width tolerance. A
-/// smoke-plus-bound test, not a same-dtype cross-device comparison.
+/// doc), against a CPU reference that EMULATES the CUDA arm's bf16
+/// rounding chain in f32 (`attention_block_bf16_emulated_cpu_reference`:
+/// bf16-quantised inputs, RoPE in f32 rounded to bf16, the scores GEMM in
+/// f32 rounded to bf16, softmax in f32 rounded to bf16, `PV` in f32
+/// rounded to bf16 — exactly the rounding points `rope_fwd_bf16`, cuBLAS
+/// and the softmax kernel apply on the device), so the only differences
+/// left are f32 accumulation-ORDER flips, bounded per element by the
+/// derived `Bf16LegBounds::fwd` (section comment above; `k = 4` here:
+/// RoPE output, scores, `P`, `PV`, plus the softmax-flip term). An
+/// earlier revision compared against a plain f32 reference under
+/// `4 * 2^-7 * max(|c|, |g|, 1.0)` — an absolute `0.031` floor with no
+/// derivation behind it.
 ///
 /// The `qkv` fixture is scaled to `0.1x` the amplitude every OTHER fixture
 /// in this file uses (`fixture()` is bounded `[-10, 10]`). At the full
@@ -4078,14 +4301,111 @@ fn attention_block_parity_bf16_cuda_vs_f32_cpu_reference() {
         .to_vec1()
         .unwrap();
 
-    let bf16_bound = |c: f32, g: f32| 4.0 * 2.0f32.powi(-7) * c.abs().max(g.abs()).max(1.0);
-    assert_eq!(out_cpu.len(), out_gpu.len());
-    for (i, (c, g)) in out_cpu.iter().zip(out_gpu.iter()).enumerate() {
+    // The plain-f32 CPU forward stays as a SANITY check that the emulated
+    // reference is itself the same computation up to bf16 rounding (a
+    // loose, non-derived check — the derived assertion is the one below).
+    let out_emulated = attention_block_bf16_emulated_cpu_reference(
+        &qkv_v, &rope_v, &mask_v, batch, seq, heads, head_dim, scale,
+    );
+    assert_eq!(out_cpu.len(), out_emulated.len());
+    for (i, (c, e)) in out_cpu.iter().zip(out_emulated.iter()).enumerate() {
         assert!(
-            (c - g).abs() <= bf16_bound(*c, *g),
-            "attention_block bf16 fwd[{i}]: f32 cpu {c} vs bf16 cuda {g}"
+            (c - e).abs() <= 0.1 * c.abs().max(e.abs()).max(0.05),
+            "emulated reference diverged from the f32 forward at [{i}]: {c} vs {e}"
         );
     }
+
+    let s_max = attention_scores_max_f32_cpu(&qkv_v, &rope_v, batch, seq, heads, head_dim, scale);
+    let v_max = qkv_v
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| qkv_slot(*i, heads, head_dim) == 2)
+        .fold(0f32, |m, (_, x)| m.max(x.abs()));
+    let bounds = Bf16LegBounds::new(
+        [&out_emulated, &out_gpu],
+        [&[], &[]],
+        (heads, head_dim),
+        s_max,
+        v_max,
+    );
+    eprintln!("attention_block bf16 cross-device fwd: S_max={s_max:e} V_max={v_max:e}");
+    assert_within_and_report(
+        "cross-device fwd (bf16 CUDA vs bf16-emulated CPU)",
+        &out_emulated,
+        &out_gpu,
+        |_, c, g| bounds.fwd(c, g, true),
+    );
+}
+
+/// The CUDA arm's bf16 forward, emulated on the CPU in f32 with a bf16
+/// rounding (`to_dtype(BF16)` then back) at every point the device
+/// rounds: inputs, RoPE output, scores, `P`, `PV`. Returns `out` as f32.
+#[allow(clippy::too_many_arguments)]
+fn attention_block_bf16_emulated_cpu_reference(
+    qkv_v: &[f32],
+    rope_v: &[f32],
+    mask_v: &[f32],
+    batch: usize,
+    seq: usize,
+    heads: usize,
+    head_dim: usize,
+    scale: f32,
+) -> Vec<f32> {
+    let cpu = Device::Cpu;
+    let round = |t: Tensor| -> Tensor {
+        t.to_dtype(DType::BF16)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+    };
+    let qkv = round(Tensor::from_slice(qkv_v, (batch, seq, 3, heads, head_dim), &cpu).unwrap());
+    let rope_pack = round(Tensor::from_slice(rope_v, (2, 1, 1, seq, head_dim), &cpu).unwrap());
+    let mask = round(Tensor::from_slice(mask_v, mask_shape_of(mask_v, batch, seq), &cpu).unwrap());
+    let slot = |k: usize| -> Tensor {
+        qkv.narrow(2, k, 1)
+            .unwrap()
+            .squeeze(2)
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap()
+            .contiguous()
+            .unwrap()
+    };
+    let cos = rope_pack.narrow(0, 0, 1).unwrap();
+    let sin = rope_pack.narrow(0, 1, 1).unwrap();
+    let q_rot = round(apply3(&slot(0), &cos, &sin, RopeFused::new(false)).unwrap());
+    let k_rot = round(apply3(&slot(1), &cos, &sin, RopeFused::new(false)).unwrap());
+    // `* scale` is exact (a power of two) — no rounding point.
+    let q_scaled = (q_rot * scale as f64).unwrap();
+    let scores = round(
+        q_scaled
+            .matmul(&k_rot.transpose(2, 3).unwrap().contiguous().unwrap())
+            .unwrap(),
+    );
+    let mask_bc = mask
+        .broadcast_as(scores.shape())
+        .unwrap()
+        .contiguous()
+        .unwrap();
+    let p = round(
+        apply2(
+            &scores,
+            &mask_bc,
+            SoftmaxLastDimFused::new(FullyMaskedPolicy::Zeros),
+        )
+        .unwrap(),
+    );
+    let ctx = round(p.matmul(&slot(2)).unwrap());
+    ctx.transpose(1, 2)
+        .unwrap()
+        .contiguous()
+        .unwrap()
+        .reshape((batch, seq, heads * head_dim))
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap()
 }
 
 /// The actual Tier-0 bit-exact claim: the fused CUDA `bf16` kernel is
@@ -4517,7 +4837,15 @@ fn assert_attention_block_bwd_parity_cuda(
     window: Option<usize>,
     seed: f32,
 ) {
-    let qkv_v = qkv_fixture(batch, seq, heads, head_dim, seed);
+    // The bf16 legs run at the IN-DOMAIN amplitude (`|qkv| <= 1`, scores
+    // of a few units after the `1/sqrt(64)` fold) the derived bound is
+    // stated for — see the `Bf16LegBounds` section comment; the f32 legs
+    // keep the raw `[-10, 10]` fixture (exact equality has no domain).
+    let amplitude = if dtype == DType::BF16 { 0.1 } else { 1.0 };
+    let qkv_v: Vec<f32> = qkv_fixture(batch, seq, heads, head_dim, seed)
+        .into_iter()
+        .map(|v| v * amplitude)
+        .collect();
     let rope_v = attention_rope_pack(seq, head_dim);
     let mask_base = vec![0f32; batch * seq];
     let mask_v: Vec<f32> = match window {
@@ -4561,21 +4889,45 @@ fn assert_attention_block_bwd_parity_cuda(
             );
         }
         DType::BF16 => {
-            let bf16_bound = |c: f32, g: f32| 8.0 * 2.0f32.powi(-7) * c.abs().max(g.abs()).max(1.0);
-            for (i, (c, g)) in out_fused.iter().zip(out_eager.iter()).enumerate() {
-                assert!(
-                    (c - g).abs() <= bf16_bound(*c, *g),
-                    "attention_block CUDA bf16 fwd[{i}] vs eager: {c} vs {g} (window={window:?}, \
-                     shape=({batch},{seq},{heads},{head_dim}))"
-                );
-            }
-            for (i, (c, g)) in dqkv_fused.iter().zip(dqkv_eager.iter()).enumerate() {
-                assert!(
-                    (c - g).abs() <= bf16_bound(*c, *g),
-                    "attention_block CUDA bf16 dqkv[{i}] vs eager: {c} vs {g} (window={window:?}, \
-                     shape=({batch},{seq},{heads},{head_dim}))"
-                );
-            }
+            // Derived per-element bounds (section comment above
+            // `bf16_ulp`): `k` ULPs of the element's own magnitude plus
+            // `k` ULPs of the leg's largest element, `k = 3` for `out`
+            // (+ the softmax-flip term), `4` for the V slot, `7` for the
+            // Q/K slots of `dqkv`. Same device, same kernels on both
+            // sides, so the expected `max|Δ|` is 0 — the printed ratio is
+            // the record. An earlier revision used
+            // `8 * 2^-7 * max(|c|, |g|, 1.0)`: an absolute `0.0625` floor,
+            // ~60x the O(1e-3) gradient signal.
+            let s_max =
+                attention_scores_max_f32_cpu(&qkv_v, &rope_v, batch, seq, heads, head_dim, scale);
+            let v_max = qkv_v
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| qkv_slot(*i, heads, head_dim) == 2)
+                .fold(0f32, |m, (_, x)| m.max(x.abs()));
+            let bounds = Bf16LegBounds::new(
+                [&out_fused, &out_eager],
+                [&dqkv_fused, &dqkv_eager],
+                (heads, head_dim),
+                s_max,
+                v_max,
+            );
+            let label = format!(
+                "window={window:?} shape=({batch},{seq},{heads},{head_dim}) S_max={s_max:e} \
+                 V_max={v_max:e}"
+            );
+            assert_within_and_report(
+                &format!("fused-vs-eager fwd {label}"),
+                &out_fused,
+                &out_eager,
+                |_, c, g| bounds.fwd(c, g, false),
+            );
+            assert_within_and_report(
+                &format!("fused-vs-eager dqkv {label}"),
+                &dqkv_fused,
+                &dqkv_eager,
+                |i, c, g| bounds.dqkv(qkv_slot(i, heads, head_dim), c, g),
+            );
         }
         other => panic!("unexpected dtype {other:?}"),
     }

@@ -3556,6 +3556,83 @@ fn lora_linear_parity_bf16_base_backward_production_width() {
     }
 }
 
+/// Cast-boundary lever Wave 1 (e)/(f) — `ops::cast_scale`'s
+/// `CastScaleBf16F32`/`CastAddBf16`, folded directly into
+/// `LowRankResidualLinear::bwd`'s B1/B3 sites (see that op's module doc).
+/// Zero dispatch is RED, never green (guide §3.5): this asserts the
+/// `DispatchCounters` for BOTH new op keys actually incremented `fused`
+/// (and recorded no `eager`) across a real CUDA `bf16`-base backward at
+/// PRODUCTION width — the same shape
+/// `lora_linear_parity_bf16_base_backward_production_width` above already
+/// proves numerically correct; this proves the fused kernels are the ones
+/// that ACTUALLY RAN, not merely that the math checks out via some other
+/// path. Snapshots the counters BEFORE and asserts on the DELTA, since
+/// `DispatchCounters` is process-wide (additive across every test in this
+/// binary) and `cargo test`'s default parallel-per-test-thread model means
+/// other tests sharing this process may have already incremented these
+/// same counters before this test's turn.
+#[test]
+fn lora_linear_bf16_base_backward_dispatches_the_fused_cast_boundary_kernels_on_cuda() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let (rows, inf, outf, r) = (256usize, 1024usize, 3072usize, 16usize);
+    let scale = 0.5f32;
+
+    let xv = fixture(rows * inf, 1.0);
+    let wv = fixture(outf * inf, 2.0);
+    let av = fixture(r * inf, 3.0);
+    let bv = fixture(outf * r, 4.0);
+    let x_bf16: Vec<bf16> = xv.iter().map(|&v| bf16::from_f32(v)).collect();
+    let w_bf16: Vec<bf16> = wv.iter().map(|&v| bf16::from_f32(v)).collect();
+
+    let cast_scale_counters = jammi_kernels::admission::counters_for("cast_scale_bf16_f32");
+    let cast_add_counters = jammi_kernels::admission::counters_for("cast_add_bf16");
+    let before_scale = cast_scale_counters.snapshot();
+    let before_add = cast_add_counters.snapshot();
+
+    let x_gpu =
+        Var::from_tensor(&Tensor::from_slice(&x_bf16, (rows, inf), &cuda).unwrap()).unwrap();
+    let w_gpu = Tensor::from_slice(&w_bf16, (outf, inf), &cuda).unwrap();
+    let a_gpu = Var::from_tensor(&Tensor::from_slice(&av, (r, inf), &cuda).unwrap()).unwrap();
+    let b_gpu = Var::from_tensor(&Tensor::from_slice(&bv, (outf, r), &cuda).unwrap()).unwrap();
+    let ab_gpu = pack_ab(a_gpu.as_tensor(), b_gpu.as_tensor()).unwrap();
+    let params = LoraLinearParams {
+        scale,
+        inf,
+        outf,
+        r,
+        dropout: None,
+        dweight_needed: false,
+    };
+    let out_gpu = lora_linear(x_gpu.as_tensor(), &w_gpu, &ab_gpu, params).unwrap();
+    let _grads_gpu = out_gpu.sum_all().unwrap().backward().unwrap();
+
+    let after_scale = cast_scale_counters.snapshot();
+    let after_add = cast_add_counters.snapshot();
+
+    assert!(
+        after_scale.fused > before_scale.fused,
+        "cast_scale_bf16_f32: fused dispatch did not increment (before {before_scale:?}, after \
+         {after_scale:?}) — zero dispatch is RED, never green"
+    );
+    assert_eq!(
+        after_scale.eager, before_scale.eager,
+        "cast_scale_bf16_f32: eager dispatch incremented unexpectedly on an unmodified \
+         JAMMI_KERNELS_DISABLE env (before {before_scale:?}, after {after_scale:?})"
+    );
+    assert!(
+        after_add.fused > before_add.fused,
+        "cast_add_bf16: fused dispatch did not increment (before {before_add:?}, after \
+         {after_add:?}) — zero dispatch is RED, never green"
+    );
+    assert_eq!(
+        after_add.eager, before_add.eager,
+        "cast_add_bf16: eager dispatch incremented unexpectedly on an unmodified \
+         JAMMI_KERNELS_DISABLE env (before {before_add:?}, after {after_add:?})"
+    );
+}
+
 /// The bit-exact counterpart the loose, DERIVED tolerance above cannot
 /// stand in for: [`lora_linear_parity_tolerance`]'s bound is sized to
 /// catch a real bug (an error on the order of a single term's own

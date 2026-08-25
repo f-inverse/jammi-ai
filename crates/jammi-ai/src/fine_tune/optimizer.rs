@@ -137,9 +137,15 @@ pub(crate) fn thread_sync_read_count() -> u64 {
 /// them into one scalar, then `sqrt` + `affine` (+ eps) + `recip` + `affine`
 /// (× `max_norm`) + `minimum` (the ≤ 1.0 clamp) = 5 fixed ops for the
 /// coefficient, and `n` × `broadcast_mul` to rescale every gradient — `4n + 4`
-/// device ops total, zero of them a host read. (Grads that are not already
-/// `F32` pay one extra `to_dtype` each, not counted above — unchanged from
-/// the pre-existing behavior.)
+/// device ops total, zero of them a host read. (A gradient that is not
+/// already `F32` pays one extra `to_dtype` in the squared-sum loop AND one
+/// more in the rescale loop, not counted above — `coef` is always `F32`
+/// [`total_sq`'s dtype, from the per-`Var` upconvert above], so a non-`F32`
+/// gradient must upconvert for `broadcast_mul` and downconvert back to its
+/// OWN dtype afterward, the same round trip torch's `foreach_mul_` leaves a
+/// non-`F32` `.grad` in: gradient dtype is a contract with whatever built the
+/// `GradStore` — typically the `Var`'s own dtype, which the optimizer's
+/// moments are shaped to — not something this function may silently change.)
 pub fn clip_gradients(
     trainable_vars: &[Var],
     grads: &mut GradStore,
@@ -238,9 +244,31 @@ pub fn clip_gradients(
     for var in trainable_vars {
         let t: &Tensor = var;
         if let Some(g) = grads.remove(t) {
-            let scaled = g
+            // `coef` is always F32 (folded from the per-`Var` squared sums,
+            // upconverted above): a non-F32 gradient must upconvert here too
+            // — the SAME class of bug this function's `is_finite` guard
+            // exists to catch, just a dtype-domain edge instead of a
+            // value-domain one (family D). Round-trip back to the
+            // gradient's OWN dtype afterward rather than leaving it F32:
+            // dtype is part of the `GradStore` contract this function did
+            // not create and must not silently change.
+            let orig_dtype = g.dtype();
+            let g_f32 = if orig_dtype == DType::F32 {
+                g
+            } else {
+                g.to_dtype(DType::F32)
+                    .map_err(|e| JammiError::FineTune(format!("GradClip dtype (scale): {e}")))?
+            };
+            let scaled_f32 = g_f32
                 .broadcast_mul(&coef)
                 .map_err(|e| JammiError::FineTune(format!("GradClip scale: {e}")))?;
+            let scaled = if orig_dtype == DType::F32 {
+                scaled_f32
+            } else {
+                scaled_f32.to_dtype(orig_dtype).map_err(|e| {
+                    JammiError::FineTune(format!("GradClip dtype (scale, downconvert): {e}"))
+                })?
+            };
             grads.insert(t, scaled);
         }
     }
@@ -673,6 +701,89 @@ mod tests {
     #[test]
     fn multi_var_clip_matches_host_reference_on_cpu() {
         assert_multi_var_clip_matches_host(&Device::Cpu);
+    }
+
+    /// A gradient that is NOT already `F32` (the AMP path this function's own
+    /// doc calls out) must be upconverted before `.sqr()`/`.sum_all()` in the
+    /// squared-sum loop AND before `broadcast_mul` in the rescale loop, then
+    /// downconverted back to its OWN dtype before it is stored — every other
+    /// test in this file only ever sees F32 gradients, so neither `else` arm
+    /// (the actual conversions) is otherwise entered.
+    ///
+    /// This test found a REAL bug, not just a mutant-shaped one: before this
+    /// fix, the rescale loop multiplied the gradient's ORIGINAL dtype
+    /// against `coef` (always `F32`, folded from the upconverted squared
+    /// sums) with no matching upconvert of its own — candle's
+    /// `broadcast_mul` refuses mismatched dtypes, so `clip_gradients` errored
+    /// on every call where any trainable `Var`'s gradient was not already
+    /// `F32`, unconditionally, clipping disabled or not test coverage aside.
+    ///
+    /// Mutation tried: `replace == with !=` on the squared-sum loop's
+    /// `g.dtype() == DType::F32` — the mutant keeps a non-F32 gradient's
+    /// dtype through `.sqr()`/`.sum_all()` (BF16 arithmetic) instead of
+    /// upconverting it, and routes an already-F32 gradient through a
+    /// redundant (no-op, invisible) `to_dtype` instead. RED here: the
+    /// untouched-dtype BF16 squared-sum and the second `Var`'s F32 squared-sum
+    /// land in the SAME `Option<Tensor>` fold, and candle's `+` refuses
+    /// mismatched dtypes — the fold itself errors, so this test's `.unwrap()`
+    /// panics instead of returning `Ok`. The rescale loop's OWN `==`/dtype
+    /// round-trip is pinned directly below by asserting the returned
+    /// gradient's dtype.
+    #[test]
+    fn non_f32_gradient_is_upconverted_before_the_fold() {
+        let dev = Device::Cpu;
+        let w_bf16 = Var::from_tensor(&Tensor::zeros((4,), DType::F32, &dev).unwrap()).unwrap();
+        let w_f32 = Var::from_tensor(&Tensor::zeros((4,), DType::F32, &dev).unwrap()).unwrap();
+        let coeff_bf16 = Tensor::full(3.0f32, (4,), &dev).unwrap();
+        let coeff_f32 = Tensor::full(2.0f32, (4,), &dev).unwrap();
+        let loss = ((w_bf16.as_tensor() * &coeff_bf16)
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            + (w_f32.as_tensor() * &coeff_f32).unwrap().sum_all().unwrap())
+        .unwrap();
+        let mut grads = loss.backward().unwrap();
+
+        // Downcast the first Var's real gradient to BF16 in place — the
+        // class of gradient the function's doc calls out. `3.0` round-trips
+        // through BF16 exactly, so the host reference below needs no BF16
+        // emulation of its own: it reads back the SAME bf16-then-f32 value
+        // `clip_gradients` itself would compute.
+        let g_f32 = grads.get(w_bf16.as_tensor()).unwrap().clone();
+        let g_bf16 = g_f32.to_dtype(DType::BF16).unwrap();
+        let g_bf16_roundtrip: Vec<f32> = g_bf16.to_dtype(DType::F32).unwrap().to_vec1().unwrap();
+        assert_eq!(
+            g_bf16_roundtrip,
+            vec![3.0; 4],
+            "test setup: 3.0 must round-trip through BF16 exactly"
+        );
+        grads.insert(w_bf16.as_tensor(), g_bf16);
+
+        let vars = vec![w_bf16.clone(), w_f32.clone()];
+        let total_norm = clip_gradients(&vars, &mut grads, 1.0)
+            .unwrap()
+            .expect("clipping enabled");
+        let norm_val: f32 = total_norm.to_scalar().unwrap();
+
+        let bf16_sq: f64 = 4.0 * (3.0f64 * 3.0);
+        let f32_sq: f64 = 4.0 * (2.0f64 * 2.0);
+        let host_norm = (bf16_sq + f32_sq).sqrt();
+        assert!(
+            (norm_val as f64 - host_norm).abs() < 1e-3,
+            "expected {host_norm} (host), got {norm_val} (device)"
+        );
+
+        // The rescale loop's own dtype contract: the clipped gradient must
+        // come back in the SAME dtype it went in with, not silently promoted
+        // to F32 by the upconvert-for-`broadcast_mul` round trip.
+        let clipped_bf16 = grads.get(w_bf16.as_tensor()).unwrap();
+        assert_eq!(
+            clipped_bf16.dtype(),
+            DType::BF16,
+            "a BF16 gradient must come back BF16, not silently promoted to F32"
+        );
+        let clipped_f32 = grads.get(w_f32.as_tensor()).unwrap();
+        assert_eq!(clipped_f32.dtype(), DType::F32);
     }
 
     /// Acquire CUDA device 0, or skip — unless `JAMMI_REQUIRE_CUDA` is set

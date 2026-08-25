@@ -107,10 +107,18 @@ extern "C" __global__ void geglu_bwd_dwi_out_f32(
     }
 }
 
-// BF16: f32-accumulate throughout, rounding EACH of d_gate/d_up to bf16
-// exactly once at the very end — this crate's usual bf16-backward
-// convention (see `../ops/geglu.rs`'s module doc for why this
-// deliberately does NOT mirror eager's own multi-op rounding cascade).
+// BF16 — esc-045 (GH#374 round 2) fix: matches torch's OWN two-kernel
+// rounding for `act(x) * gate` (`mul_tensor_backward`,
+// `torch/csrc/autograd/FunctionsManual.cpp`, then
+// `GeluBackwardCUDAKernelImpl`, `ActivationGeluKernel.cu`), not the
+// crate's usual "accumulate in f32, round once at the end" convention —
+// see `../ops/geglu.rs`'s module doc's "esc-045 fix" section for the full
+// derivation. `d_up` rounds the activation to bf16 BEFORE the multiply
+// (matching the SAVED, already-bf16-rounded forward tensor `mul`'s
+// backward actually reads); `d_gate` rounds `dy*up` to bf16 BEFORE
+// multiplying by `gelu_erf'(gate)` (matching `mul`'s backward output
+// being a real bf16 tensor before `gelu_backward` ever runs) — two
+// kernel-shaped roundings, not one.
 extern "C" __global__ void geglu_bwd_dwi_out_bf16(
     const __nv_bfloat16* wi_out, const __nv_bfloat16* dy, __nv_bfloat16* dwi_out,
     const unsigned int intermediate, const unsigned int n_out
@@ -127,7 +135,9 @@ extern "C" __global__ void geglu_bwd_dwi_out_bf16(
         float pdf = gelu_erf_pdf(gate);
         float gelu_val = gate * cdf;
         float gelu_deriv = cdf + gate * pdf;
-        dwi_out[base + col] = __float2bfloat16(dyi * up * gelu_deriv);
-        dwi_out[base + intermediate + col] = __float2bfloat16(dyi * gelu_val);
+        __nv_bfloat16 gelu_val_bf16 = __float2bfloat16(gelu_val); // matches fwd's ROUND 1
+        __nv_bfloat16 d_act_bf16 = __float2bfloat16(dyi * up);    // mul backward's own rounding
+        dwi_out[base + intermediate + col] = __float2bfloat16(dyi * __bfloat162float(gelu_val_bf16)); // d_up
+        dwi_out[base + col] = __float2bfloat16(__bfloat162float(d_act_bf16) * gelu_deriv);             // d_gate
     }
 }

@@ -183,37 +183,66 @@
 //! bug, and not reducible to zero without candle changing its own
 //! (independently rounded) constant.
 //!
-//! **BF16 backward rounding — a disclosed, deliberate divergence from
-//! eager's own multi-op cascade**: eager's backward walks candle's
-//! hand-written `Op::Unary(_, GeluErf)` gradient
-//! (`candle_core::backprop`: `0.5 + 0.398942*exp(-x^2/2)*x +
-//! 0.5*erf(x/sqrt(2))`, `backprop.rs`) as roughly half a dozen SEPARATE
-//! `Tensor` ops chained together (`sqr`, `neg`, `exp`, a scaled `erf`,
-//! several affines/adds), each one rounding its own bf16 output
-//! independently — a genuinely different rounding path from a single
-//! closed-form kernel evaluation. Reproducing that op-by-op cascade would
-//! buy no correctness (it is the identical closed form, just computed in
-//! more separately-rounded steps) at real implementation cost, so
-//! [`GegluBwdDWiOut`]'s BF16 arm instead follows this crate's USUAL bf16
-//! backward convention (`LayerNormBwdDx`, `SoftmaxBwdDScores`):
-//! accumulate `d_gate`/`d_up` in F32 throughout, rounding EACH to bf16
-//! exactly once at the very end. This is a MEASURED, non-vacuous
-//! divergence (a RELATIVE-tolerance-with-an-absolute-floor oracle in
-//! `tests/geglu_oracles.rs`,
+//! **BF16 backward rounding — esc-045 fix, matches torch's OWN two-kernel
+//! rounding, not "round once at the end."** The PREVIOUS version of this
+//! kernel accumulated `d_gate`/`d_up` in F32 throughout and rounded EACH to
+//! bf16 exactly once at the very end, on the theory that the forward's own
+//! two-rounding-point design (above) had "no such argument" on the
+//! backward side. That theory was wrong, checked against source, not
+//! against candle-eager (esc-045/GH#374 round 2):
+//!
+//! HF ModernBERT's MLP tail is `act(input) * gate` — TWO real torch ops,
+//! `gelu` then `mul` — so torch's autograd walks TWO real backward
+//! kernels, not one closed-form evaluation:
+//!
+//! - `mul`'s backward (`torch/csrc/autograd/FunctionsManual.cpp`,
+//!   `mul_tensor_backward`): `grad * other`, a plain SAME-DTYPE tensor
+//!   multiply against the SAVED forward operand — so `d_up = grad *
+//!   saved_gelu_output`, where `saved_gelu_output` is `gelu`'s own
+//!   bf16-ROUNDED forward output (the actual tensor the forward
+//!   materialized and fed into `mul`), and `d_act = grad * saved_up` is
+//!   ITSELF a real, bf16-rounded intermediate gradient tensor — not kept
+//!   in float across the two backward kernels.
+//! - `gelu`'s backward (`GeluBackwardCUDAKernelImpl`,
+//!   `ActivationGeluKernel.cu`, erf mode): `dy * (cdf(x) + x*pdf(x))` in
+//!   float (`opmath_t`), ONE cast on store — `dy` here is `d_act` from the
+//!   step above, ALREADY bf16-rounded before this kernel ever sees it.
+//!
+//! So torch's `d_gate` (this op's naming; HF's `input`) carries TWO
+//! roundings end to end (`mul`'s then `gelu_backward`'s), and `d_up`
+//! (HF's `gate`) carries ONE (`mul`'s alone, against the FORWARD's
+//! already-rounded saved activation, never the unrounded f32 value). This
+//! op's fix reproduces exactly that: [`geglu_bwd_row_bf16`] rounds
+//! `gelu_val` to bf16 before using it for `d_up` (matching the SAVED
+//! tensor `mul_tensor_backward` actually reads), and rounds `dy * up` to
+//! bf16 BEFORE multiplying by `gelu_erf'(gate)` for `d_gate` (matching
+//! `mul`'s backward output being a real bf16 tensor before `gelu_backward`
+//! ever runs) — two kernel-shaped roundings, not one f32-accumulate-then-
+//! round-once shortcut. The magnitude on real ModernBERT-large layer-18
+//! activations (`max|gate|` 27.5, `max|up|` 20.5): the discarded shortcut
+//! put `d_up` `~1.8e-3` relative-sum away from a real candle `Var`+
+//! `backward()` autodiff of the eager two-op composition on those same
+//! inputs; this fix halves that to `~1.2e-3` (`geglu_recheck.py`, esc-045
+//! investigation notes) — real, not the whole 28-layer training defect on
+//! its own (see [`crate::ops::geglu`]'s crate-level oracle and esc-045's
+//! own accounting for why a single-call divergence this size compounds
+//! rather than explains outright).
+//!
+//! `tests/geglu_oracles.rs`'s
 //! `eager_vs_fused_bf16_bwd_diverges_and_stays_within_the_stated_
-//! tolerance_at_production_width` — not a raw bit-diff/ULP count, because
-//! this op's own value range can sit arbitrarily close to zero, where a
-//! bf16 bit-pattern diff is a degenerate metric; see the forward oracle's
-//! identical reasoning), not an assumed-zero one — forward's two-
-//! rounding-point design above and backward's one-rounding-point design
-//! here are DIFFERENT, disclosed choices, not an inconsistency: forward
-//! is chosen to match the upstream two-op reference's OWN rounding;
-//! backward has no such "the reference literally does this" argument
-//! against candle-eager specifically (eager's own backward cascade is an
-//! artifact of candle's autodiff decomposing one closed-form gradient
-//! into several ops, not a deliberate reference design) — but it DOES
-//! match the ATen reference's own round-once shape more closely than
-//! eager's cascade does, per the point above.
+//! tolerance_at_production_width` oracle (a RELATIVE-tolerance-with-an-
+//! absolute-floor bound, not a raw bit-diff/ULP count — this op's own
+//! value range can sit arbitrarily close to zero, where a bf16
+//! bit-pattern diff is a degenerate metric) still passes fused-vs-
+//! candle-eager after this change (candle-eager is not the reference
+//! being matched here — torch is; see the F32-backward point above for
+//! why candle-eager is not the more-correct baseline to converge toward
+//! on this op) — but it is no longer the oracle that PROVES this fix: see
+//! `tests/geglu_torch_bwd_rounding.rs` for the torch-anchored,
+//! self-consistency assertion that actually catches the regression this
+//! fix closes (asserts `d_up` differentiates the FORWARD'S OWN rounded
+//! activation, not a hypothetical unrounded one — independent of any
+//! eager comparison).
 //!
 //! ## Memory note (the actual win this commit targets)
 //!
@@ -614,18 +643,40 @@ fn geglu_bwd_f32(wi_out: &[f32], dy: &[f32], rows: usize, intermediate: usize) -
     out
 }
 
-/// BF16: f32-accumulate throughout, rounding EACH of `d_gate`/`d_up` to
-/// bf16 exactly once at the very end — see the module doc's "BF16
-/// backward rounding" section for why this deliberately does NOT mirror
-/// eager's own multi-op rounding cascade.
+/// BF16: matches ATen's OWN two-kernel rounding shape for `act(x) * gate`
+/// (esc-045 round 2 fix — see the module doc's "BF16 backward rounding"
+/// section, rewritten). `mul_tensor_backward`
+/// (`torch/csrc/autograd/FunctionsManual.cpp`) is a plain same-dtype
+/// tensor multiply — `grad * other`, where `other` is the SAVED forward
+/// operand at ITS stored dtype — so for `out = gelu(gate) * up` (jammi's
+/// naming) each of the two `mul` backward outputs rounds to bf16 on its
+/// own:
+///
+/// - `d_up = round(dy * saved_gelu_bf16)` — `saved_gelu_bf16` is the
+///   FORWARD's own bf16-rounded activation (this op's `geglu_fwd_row_bf16`
+///   ROUND 1), never the unrounded f32 `gelu_val` — using the unrounded
+///   value differentiates a computation the forward never actually ran.
+/// - `d_act = round(dy * up)` feeds `GeluBackwardCUDAKernelImpl`
+///   (`ActivationGeluKernel.cu`) as ITS `dy` argument (a real,
+///   bf16-rounded gradient tensor `mul`'s backward produces), which then
+///   computes `d_gate = round(d_act * gelu_erf'(gate))` in float with one
+///   final cast.
+///
+/// So `d_gate` gets TWO roundings (matching the two kernel launches torch
+/// actually issues), where the old formula had one — a genuine
+/// widening, not a narrowing, of jammi's bf16 backward relative to its
+/// former self, done because a wider single f32 product here would round
+/// past torch's own intermediate bf16 boundary.
 fn geglu_bwd_row_bf16(row: &[bf16], dy: &[bf16], intermediate: usize, dwi: &mut [bf16]) {
     for i in 0..intermediate {
         let gate = row[i].to_f32();
         let up = row[intermediate + i].to_f32();
         let dyi = dy[i].to_f32();
         let (gelu_val, gelu_deriv) = gelu_erf_and_grad_f32(gate);
-        dwi[i] = bf16::from_f32(dyi * up * gelu_deriv);
-        dwi[intermediate + i] = bf16::from_f32(dyi * gelu_val);
+        let gelu_val_bf16 = bf16::from_f32(gelu_val); // matches fwd's ROUND 1
+        dwi[intermediate + i] = bf16::from_f32(dyi * gelu_val_bf16.to_f32()); // d_up
+        let d_act_bf16 = bf16::from_f32(dyi * up); // mul backward's own rounding
+        dwi[i] = bf16::from_f32(d_act_bf16.to_f32() * gelu_deriv); // d_gate
     }
 }
 

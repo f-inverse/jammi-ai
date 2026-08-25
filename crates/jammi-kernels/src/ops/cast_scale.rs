@@ -384,6 +384,55 @@ fn cast_add_bf16(base: &[bf16], lb: &Layout, f32val: &[f32], lf: &Layout) -> Vec
         .collect()
 }
 
+// ---------------------------------------------------------------------
+// TEST-ONLY preallocated-output entry points (doc-hidden — no
+// `admit`/`DispatchCounters` involvement, not part of either op's
+// production dispatch surface). `tests/cuda_parity.rs`'s isolated-timing
+// harness needs to separate a kernel's own device cost from
+// `cuMemAlloc`/`cuMemFree`'s: cudarc has no caching allocator, so the
+// normal `apply1`/`apply2` path's fresh output allocation on EVERY call
+// dominates wall-clock at `cast_scale_bf16_f32`'s 151 MB production
+// output width (measured directly — see that test's own printed
+// numbers, not assumed). These write into an existing, caller-owned
+// output `Tensor` instead, so a timing harness can preallocate it once,
+// outside the timed loop, and measure the launch alone.
+#[cfg(feature = "cuda")]
+#[doc(hidden)]
+pub fn cast_scale_bf16_f32_into(x: &Tensor, scale: f64, out: &Tensor) -> Result<()> {
+    let (s1, l1) = x.storage_and_layout();
+    let (s2, l2) = out.storage_and_layout();
+    match (&*s1, &*s2) {
+        (candle_core::Storage::Cuda(cs1), candle_core::Storage::Cuda(cs2)) => {
+            crate::cuda::cast_scale::cuda_launch_cast_scale_bf16_f32_into(scale, cs1, l1, cs2, l2)
+        }
+        _ => Err(Error::Msg(
+            "cast_scale_bf16_f32_into requires both x and out to be on a CUDA device \
+             (test-only preallocated-output scaffolding, not a general-purpose entry point)"
+                .into(),
+        )),
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[doc(hidden)]
+pub fn cast_add_bf16_into(base: &Tensor, f32val: &Tensor, out: &Tensor) -> Result<()> {
+    let (s1, l1) = base.storage_and_layout();
+    let (s2, l2) = f32val.storage_and_layout();
+    let (s3, l3) = out.storage_and_layout();
+    match (&*s1, &*s2, &*s3) {
+        (
+            candle_core::Storage::Cuda(cs1),
+            candle_core::Storage::Cuda(cs2),
+            candle_core::Storage::Cuda(cs3),
+        ) => crate::cuda::cast_scale::cuda_launch_cast_add_bf16_into(cs1, l1, cs2, l2, cs3, l3),
+        _ => Err(Error::Msg(
+            "cast_add_bf16_into requires base, f32val and out to all be on a CUDA device \
+             (test-only preallocated-output scaffolding, not a general-purpose entry point)"
+                .into(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -32,11 +32,11 @@
 use candle_core::{DType, Device, Error, Layout, Tensor, Var, D};
 use half::bf16;
 use jammi_kernels::ops::{
-    apply1, apply2, apply3, bwd_gradient_gemm_layouts, AttentionBlockFused, Axpy,
-    BwdGemmLayoutsParams, CastAddBf16, CastScaleBf16F32, DropoutFused, DropoutKey,
-    FullyMaskedPolicy, GegluFused, GeluVariant, LayerNormFused, LowRankResidualLinear,
-    PhiloxKatProbe, RopeFused, ScaledCastAdd, SoftmaxLastDimFused,
-    ATTENTION_BLOCK_WINDOW_MASKED_VALUE,
+    apply1, apply2, apply3, bwd_gradient_gemm_layouts, cast_add_bf16_into,
+    cast_scale_bf16_f32_into, AttentionBlockFused, Axpy, BwdGemmLayoutsParams, CastAddBf16,
+    CastScaleBf16F32, DropoutFused, DropoutKey, FullyMaskedPolicy, GegluFused, GeluVariant,
+    LayerNormFused, LowRankResidualLinear, PhiloxKatProbe, RopeFused, ScaledCastAdd,
+    SoftmaxLastDimFused, ATTENTION_BLOCK_WINDOW_MASKED_VALUE,
 };
 
 fn axpy(alpha: f64, x: &Tensor, y: &Tensor) -> candle_core::Result<Tensor> {
@@ -5997,6 +5997,39 @@ fn time_kernel<S>(
     }
 }
 
+/// Prints one [`TimingStats`] line in the shared format both legs below
+/// use, labelled with which of the two paths it measured — `label` is
+/// `"kernel-only (preallocated output)"` or `"wrapper (apply1/apply2,
+/// includes a fresh output alloc every call)"`, never left implicit,
+/// since the whole point of measuring both is that they are NOT the same
+/// number (see this file's own module doc on the cast-boundary Wave 1
+/// section for the magnitude — cudarc has no caching allocator, so a
+/// 151 MB `cuMemAlloc`/`cuMemFree` pair dominates `cast_scale_bf16_f32`'s
+/// wrapper number).
+fn print_timing_stats(
+    op: &str,
+    shape: &str,
+    elems: usize,
+    bytes_per_elem: f64,
+    label: &str,
+    stats: &TimingStats,
+) {
+    let bytes = elems as f64 * bytes_per_elem;
+    let gb_min = bytes / (stats.min_ms / 1000.0) / 1e9;
+    let gb_median = bytes / (stats.median_ms / 1000.0) / 1e9;
+    println!(
+        "{op} [{label}]: {shape} elems={elems} min {:.4} ms ({gb_min:.1} GB/s, {:.2}% of 2039 \
+         GB/s SXM4 roofline)  median {:.4} ms ({gb_median:.1} GB/s, {:.2}%)  [{} iters after {} \
+         warm-ups, per-iteration synchronize, wall-clock]",
+        stats.min_ms,
+        100.0 * gb_min / 2039.0,
+        stats.median_ms,
+        100.0 * gb_median / 2039.0,
+        stats.iters,
+        stats.warmups
+    );
+}
+
 // ---------------------------------------------------------------------
 // Cast-boundary lever Wave 1 — ISOLATED kernel timing (guide §4), on
 // [`time_kernel`] above. `cargo test --features cuda --test cuda_parity
@@ -6007,6 +6040,25 @@ fn time_kernel<S>(
 // Block-1 fix instruction) — see [`time_kernel`]'s own doc for the
 // batching defect this replaced and the 2.35x-spread number that proved
 // it.
+//
+// SECOND FORM (post-lead-review): the FIRST fix (per-iteration sync,
+// min+median) was necessary but not sufficient — a clean, exclusive-box
+// re-run of that fixed harness (both on a100d and on a100b) still showed
+// `cast_scale_bf16_f32` at ~2.1 ms (5.2% roofline), not the 53% this
+// file's own earlier revision reported. Root cause, found by the lead:
+// `apply1` allocates its 151 MB `f32` OUTPUT storage inside `launch`
+// EVERY iteration (`device.alloc::<f32>(n)`, `src/cuda/cast_scale.rs`),
+// and cudarc has NO caching allocator — a fresh `cuMemAlloc` + the
+// matching `cuMemFree` when the returned `Tensor` drops at the end of
+// each iteration is a genuine ~2 ms of device-driver work, not a
+// measurement artifact. `cast_add_bf16`'s 25 MB output pays far less of
+// this tax, which is why ITS number was already accurate. This test now
+// measures and reports BOTH numbers for both ops, explicitly labelled:
+// the WRAPPER number (`apply1`/`apply2`, what a real caller pays, alloc
+// included) and the KERNEL-ONLY number (`cast_scale_bf16_f32_into`/
+// `cast_add_bf16_into`, `ops/cast_scale.rs`'s `#[doc(hidden)]`
+// preallocated-output entry points — the SAME kernel, writing into a
+// `Tensor` allocated ONCE outside the timed loop).
 #[test]
 #[ignore]
 fn isolated_kernel_timing_cast_boundary_wave1() {
@@ -6024,7 +6076,35 @@ fn isolated_kernel_timing_cast_boundary_wave1() {
     let (m_e, outf_e) = (12_288usize, 3_072usize);
     let scale = 0.03125_f64; // alpha/rank-shaped (e.g. alpha=32/rank=... ).
     let cast_scale_op = CastScaleBf16F32::new(scale);
-    let stats_e = time_kernel(
+    let shape_e = format!("m={m_e} outf={outf_e}");
+
+    // Correctness FIRST (family F: a claimed number is measured AND
+    // asserted, never assumed) — the preallocated-output path must be
+    // bit-identical to `apply1`'s own output before its timing means
+    // anything.
+    {
+        let grad_res_v: Vec<bf16> = (0..m_e * outf_e)
+            .map(|i| bf16::from_f32(((i as f32) * 0.0001).sin() * 5000.0))
+            .collect();
+        let grad_res = Tensor::from_slice(&grad_res_v, (m_e, outf_e), &cuda).unwrap();
+        let expected = apply1(&grad_res, cast_scale_op)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let out = Tensor::zeros((m_e, outf_e), DType::F32, &cuda).unwrap();
+        cast_scale_bf16_f32_into(&grad_res, scale, &out).unwrap();
+        let got = out.to_vec1::<f32>().unwrap();
+        for i in 0..m_e * outf_e {
+            assert_eq!(
+                got[i].to_bits(),
+                expected[i].to_bits(),
+                "cast_scale_bf16_f32_into (preallocated-output path) diverged from apply1 at \
+                 index {i} — the kernel-only timing below would be measuring the wrong kernel"
+            );
+        }
+    }
+
+    let stats_e_wrapper = time_kernel(
         &cuda,
         N_WARMUP,
         N_ITERS,
@@ -6038,29 +6118,74 @@ fn isolated_kernel_timing_cast_boundary_wave1() {
             let _ = apply1(grad_res, cast_scale_op).unwrap();
         },
     );
+    let stats_e_kernel_only = time_kernel(
+        &cuda,
+        N_WARMUP,
+        N_ITERS,
+        || {
+            let grad_res_v: Vec<bf16> = (0..m_e * outf_e)
+                .map(|i| bf16::from_f32(((i as f32) * 0.0001).sin() * 5000.0))
+                .collect();
+            let grad_res = Tensor::from_slice(&grad_res_v, (m_e, outf_e), &cuda).unwrap();
+            let out = Tensor::zeros((m_e, outf_e), DType::F32, &cuda).unwrap();
+            (grad_res, out)
+        },
+        |(grad_res, out): &mut (Tensor, Tensor)| {
+            cast_scale_bf16_f32_into(grad_res, scale, out).unwrap();
+        },
+    );
     // Traffic: read bf16 (2B) + write f32 (4B) per element (ops::cast_scale's
     // own module doc).
-    let bytes_e = (m_e * outf_e) as f64 * 6.0;
-    let gb_min_e = bytes_e / (stats_e.min_ms / 1000.0) / 1e9;
-    let gb_median_e = bytes_e / (stats_e.median_ms / 1000.0) / 1e9;
-    println!(
-        "cast_scale_bf16_f32: m={m_e} outf={outf_e} elems={} min {:.4} ms ({gb_min_e:.1} GB/s, \
-         {:.2}% of 2039 GB/s SXM4 roofline)  median {:.4} ms ({gb_median_e:.1} GB/s, {:.2}%)  \
-         [{} iters after {} warm-ups, per-iteration synchronize, wall-clock]",
+    print_timing_stats(
+        "cast_scale_bf16_f32",
+        &shape_e,
         m_e * outf_e,
-        stats_e.min_ms,
-        100.0 * gb_min_e / 2039.0,
-        stats_e.median_ms,
-        100.0 * gb_median_e / 2039.0,
-        stats_e.iters,
-        stats_e.warmups
+        6.0,
+        "wrapper (apply1, includes a fresh 151 MB output alloc every call)",
+        &stats_e_wrapper,
+    );
+    print_timing_stats(
+        "cast_scale_bf16_f32",
+        &shape_e,
+        m_e * outf_e,
+        6.0,
+        "kernel-only (preallocated output)",
+        &stats_e_kernel_only,
     );
 
     // (f) B3's own shape at the census's m/inf: the Wqkv site's Σin-sized
     // population, m = 12288, inf = 1024.
     let (m_f, inf_f) = (12_288usize, 1_024usize);
     let cast_add_op = CastAddBf16::new();
-    let stats_f = time_kernel(
+    let shape_f = format!("m={m_f} inf={inf_f}");
+
+    {
+        let base_v: Vec<bf16> = (0..m_f * inf_f)
+            .map(|i| bf16::from_f32(((i as f32) * 0.00013).cos() * 4000.0))
+            .collect();
+        let f32val_v: Vec<f32> = (0..m_f * inf_f)
+            .map(|i| ((i as f32) * 0.00029).sin() * 30.0)
+            .collect();
+        let base = Tensor::from_slice(&base_v, (m_f, inf_f), &cuda).unwrap();
+        let f32val = Tensor::from_slice(&f32val_v, (m_f, inf_f), &cuda).unwrap();
+        let expected = apply2(&base, &f32val, cast_add_op)
+            .unwrap()
+            .to_vec1::<bf16>()
+            .unwrap();
+        let out = Tensor::zeros((m_f, inf_f), DType::BF16, &cuda).unwrap();
+        cast_add_bf16_into(&base, &f32val, &out).unwrap();
+        let got = out.to_vec1::<bf16>().unwrap();
+        for i in 0..m_f * inf_f {
+            assert_eq!(
+                got[i].to_bits(),
+                expected[i].to_bits(),
+                "cast_add_bf16_into (preallocated-output path) diverged from apply2 at index \
+                 {i} — the kernel-only timing below would be measuring the wrong kernel"
+            );
+        }
+    }
+
+    let stats_f_wrapper = time_kernel(
         &cuda,
         N_WARMUP,
         N_ITERS,
@@ -6079,20 +6204,41 @@ fn isolated_kernel_timing_cast_boundary_wave1() {
             let _ = apply2(base, f32val, cast_add_op).unwrap();
         },
     );
+    let stats_f_kernel_only = time_kernel(
+        &cuda,
+        N_WARMUP,
+        N_ITERS,
+        || {
+            let base_v: Vec<bf16> = (0..m_f * inf_f)
+                .map(|i| bf16::from_f32(((i as f32) * 0.00013).cos() * 4000.0))
+                .collect();
+            let f32val_v: Vec<f32> = (0..m_f * inf_f)
+                .map(|i| ((i as f32) * 0.00029).sin() * 30.0)
+                .collect();
+            let base = Tensor::from_slice(&base_v, (m_f, inf_f), &cuda).unwrap();
+            let f32val = Tensor::from_slice(&f32val_v, (m_f, inf_f), &cuda).unwrap();
+            let out = Tensor::zeros((m_f, inf_f), DType::BF16, &cuda).unwrap();
+            (base, f32val, out)
+        },
+        |(base, f32val, out): &mut (Tensor, Tensor, Tensor)| {
+            cast_add_bf16_into(base, f32val, out).unwrap();
+        },
+    );
     // Traffic: read f32 (4B) + read bf16 (2B) + write bf16 (2B) per element.
-    let bytes_f = (m_f * inf_f) as f64 * 8.0;
-    let gb_min_f = bytes_f / (stats_f.min_ms / 1000.0) / 1e9;
-    let gb_median_f = bytes_f / (stats_f.median_ms / 1000.0) / 1e9;
-    println!(
-        "cast_add_bf16: m={m_f} inf={inf_f} elems={} min {:.4} ms ({gb_min_f:.1} GB/s, {:.2}% \
-         of 2039 GB/s SXM4 roofline)  median {:.4} ms ({gb_median_f:.1} GB/s, {:.2}%)  [{} iters \
-         after {} warm-ups, per-iteration synchronize, wall-clock]",
+    print_timing_stats(
+        "cast_add_bf16",
+        &shape_f,
         m_f * inf_f,
-        stats_f.min_ms,
-        100.0 * gb_min_f / 2039.0,
-        stats_f.median_ms,
-        100.0 * gb_median_f / 2039.0,
-        stats_f.iters,
-        stats_f.warmups
+        8.0,
+        "wrapper (apply2, includes a fresh 25 MB output alloc every call)",
+        &stats_f_wrapper,
+    );
+    print_timing_stats(
+        "cast_add_bf16",
+        &shape_f,
+        m_f * inf_f,
+        8.0,
+        "kernel-only (preallocated output)",
+        &stats_f_kernel_only,
     );
 }

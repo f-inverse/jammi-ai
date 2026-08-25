@@ -119,8 +119,12 @@
 //! [`super::SoftmaxLastDimFused`] accepts, since the caller may pass
 //! either the padding mask alone (global layer) or the padding-plus-band
 //! sum (local layer) — see the "window is construction data at the call
-//! site" section above. `b == 0 || seq == 0 || heads == 0` takes the empty
-//! fast path (nothing to compute).
+//! site" section above. `b == 0 || seq == 0 || heads == 0` is in-domain
+//! and yields an empty `[batch, seq, heads * head_dim]` output: the CPU
+//! arm computes it through its general path (zero-trip loops, zero-extent
+//! GEMMs — no separate fast path, see `cpu_fwd`); the CUDA arm returns an
+//! empty allocation before touching cuBLAS. The domain checks above apply
+//! to empty inputs exactly as to non-empty ones.
 //!
 //! ## `bwd`: ordinary `Tensor` composition, reusing this crate's own ops
 //!
@@ -409,6 +413,18 @@ impl super::sealed::Sealed for AttentionBlockFused {}
 
 /// Validates `qkv`'s domain (module doc). Returns `(batch, seq, heads,
 /// head_dim)`.
+///
+/// State table (one test per row, `tests::attention_dims_*` /
+/// `tests::head_dim_other_than_64_is_refused`):
+///
+/// | rank | `dims[2]` | `head_dim` | `seq` | outcome |
+/// |---|---|---|---|---|
+/// | ≠ 5 (`dims[2] == 3` still) | — | — | — | refused (rank) |
+/// | 5 | ≠ 3 | — | — | refused (3-axis) |
+/// | 5 | 3 | ≠ `HEAD_DIM` | — | refused (head_dim) |
+/// | 5 | 3 | `HEAD_DIM` | `> MAX_SEQ` (`MAX_SEQ + 1`, `MAX_SEQ + 2`) | refused (seq) |
+/// | 5 | 3 | `HEAD_DIM` | `== MAX_SEQ` (the boundary itself) | accepted |
+/// | 5 | 3 | `HEAD_DIM` | `< MAX_SEQ` (incl. `0`) | accepted |
 pub(crate) fn attention_dims(
     l_qkv: &Layout,
     op: &'static str,
@@ -441,6 +457,19 @@ pub(crate) fn attention_dims(
 /// this op's `mask` is now [`super::SoftmaxLastDimFused`]'s OWN broadcast
 /// class (padding alone, `[batch|1, 1, 1, seq]`, or padding-plus-band,
 /// `[batch|1, 1, seq, seq]`), not a narrower padding-only shape.
+///
+/// State table (one test per row, `tests::check_mask_*`; `b`/`s` are
+/// `qkv`'s own batch/seq):
+///
+/// | rank | `dims[0]` | `dims[1]` | `dims[2]` | `dims[3]` | outcome |
+/// |---|---|---|---|---|---|
+/// | ≠ 4 (every axis it has otherwise valid) | — | — | — | — | refused (rank) |
+/// | 4 | — | ≠ 1 | — | — | refused (heads axis) |
+/// | 4 | — | 1 | — | ≠ `s` | refused (key axis) |
+/// | 4 | — | 1 | ∉ {1, `s`} | `s` | refused (query-row axis) |
+/// | 4 | ∉ {1, `b`} | 1 | ∈ {1, `s`} | `s` | refused (leading axis) |
+/// | 4 | 1 | 1 | 1 | `s` | accepted (padding-only, broadcast over batch) |
+/// | 4 | `b` | 1 | `s` | `s` | accepted (padding-plus-band, per batch) |
 pub(crate) fn check_mask(
     l_mask: &Layout,
     b: usize,
@@ -472,6 +501,20 @@ pub(crate) fn check_mask(
 /// Returns the RoPE table's own leading position-axis size (the module
 /// doc's shape notation calls it seq_max, without backticks — not a
 /// bound identifier anywhere in this crate's own source).
+///
+/// State table (one test per row, `tests::check_rope_pack_*`; `s`/`d` are
+/// `qkv`'s own seq/head_dim):
+///
+/// | rank | `dims[0]` | `dims[1]` | `dims[2]` | `dims[3]` (seq_max) | `dims[4]` | outcome |
+/// |---|---|---|---|---|---|---|
+/// | ≠ 5 (every axis it has otherwise valid) | — | — | — | — | — | refused (rank) |
+/// | 5 | ≠ 2 | — | — | — | — | refused (cos/sin axis) |
+/// | 5 | 2 | ≠ 1 | — | — | — | refused (axis 1) |
+/// | 5 | 2 | 1 | ≠ 1 | — | — | refused (axis 2) |
+/// | 5 | 2 | 1 | 1 | — | ≠ `d` | refused (head_dim) |
+/// | 5 | 2 | 1 | 1 | `< s` (`s - 1`) | `d` | refused (short table) |
+/// | 5 | 2 | 1 | 1 | `== s` (boundary) | `d` | accepted |
+/// | 5 | 2 | 1 | 1 | `> s` | `d` | accepted (the op reads rows `[0, s)`) |
 pub(crate) fn check_rope_pack(l: &Layout, s: usize, d: usize, op: &'static str) -> Result<usize> {
     let dims = l.dims();
     if dims.len() != 5 || dims[0] != 2 || dims[1] != 1 || dims[2] != 1 || dims[4] != d {
@@ -505,12 +548,16 @@ impl CustomOp3 for AttentionBlockFused {
         let op = self.name();
         let (b, s, h, d) = attention_dims(l1, op)?;
         let out_shape = Shape::from((b, s, h * d));
-        if b == 0 || s == 0 || h == 0 {
-            return match s1 {
-                CpuStorage::F32(_) => Ok((CpuStorage::F32(Vec::new()), out_shape)),
-                other => Err(Error::UnsupportedDTypeForOp(other.dtype(), op)),
-            };
-        }
+        // No empty fast path on this arm: `b == 0 || s == 0 || h == 0`
+        // flows through the general path below (zero-trip gather loops,
+        // zero-extent GEMMs — `tests::empty_{batch,seq,heads}_is_a_no_op_
+        // not_a_panic`), so the domain checks below run on empty inputs
+        // too. An earlier revision returned an empty buffer here first; it
+        // was byte-equivalent to the general path on every empty cell
+        // (verified by disabling it under all three tests) — dead weight
+        // of the same class as the deleted dtype-mismatch arm below. The
+        // CUDA arm keeps its own early return: cuBLAS is never handed a
+        // zero-extent GEMM there.
         let (mask_b, mask_q) = check_mask(l3, b, s, op)?;
         if s1.dtype() != s3.dtype() {
             return Err(Error::DTypeMismatchBinaryOp {
@@ -563,11 +610,12 @@ impl CustomOp3 for AttentionBlockFused {
                 )?;
                 Ok((CpuStorage::F32(out), out_shape))
             }
-            (s1, s3) if s1.dtype() != s3.dtype() => Err(Error::DTypeMismatchBinaryOp {
-                lhs: s1.dtype(),
-                rhs: s3.dtype(),
-                op,
-            }),
+            // A `qkv`/`mask` dtype MISMATCH never reaches this match — it is
+            // refused by the explicit `DTypeMismatchBinaryOp` check above,
+            // so the only non-`F32` pair left here is a MATCHING non-`F32`
+            // pair (an earlier revision carried a second, unreachable
+            // mismatch arm at this point; deleted).
+            //
             // `BF16` (or any other dtype) on CPU: candle-core 0.11's CPU
             // backend has no `BF16` `MatMul` impl — the same pre-existing
             // limitation `LowRankResidualLinear`'s module doc discloses.
@@ -1494,6 +1542,191 @@ mod tests {
         let err =
             fused(&qkv, &rope_pack, &mask, op).expect_err("mask query-row axis 3 must be refused");
         assert!(matches!(err, Error::Msg(_)));
+    }
+
+    // ── Validator lattices: one typed-refusal test per state-table row
+    // (see `attention_dims`/`check_mask`/`check_rope_pack`'s docs). Each
+    // calls the validator DIRECTLY on a `Layout`, so a `MAX_SEQ`-sized
+    // boundary cell costs no `[seq, seq]` buffer. ──
+
+    fn lay(dims: &[usize]) -> Layout {
+        Layout::contiguous(dims)
+    }
+
+    fn is_msg(r: &Result<impl std::fmt::Debug>) -> bool {
+        matches!(r, Err(Error::Msg(_)))
+    }
+
+    /// `attention_dims`: rank ≠ 5 while the 3-axis IS 3 (so a `||`→`&&`
+    /// mutation of the rank/3-axis check is what this cell reddens).
+    #[test]
+    fn attention_dims_rank_other_than_5_is_refused_even_with_a_valid_3_axis() {
+        let r = attention_dims(&lay(&[1, 2, 3, HEAD_DIM]), "t");
+        assert!(is_msg(&r), "rank 4 with dims[2]==3 must be refused: {r:?}");
+        let r = attention_dims(&lay(&[1, 2, 3, 1, HEAD_DIM, 1]), "t");
+        assert!(is_msg(&r), "rank 6 must be refused: {r:?}");
+    }
+
+    /// `attention_dims`: rank 5 but the 3-axis is not 3.
+    #[test]
+    fn attention_dims_three_axis_other_than_3_is_refused() {
+        let r = attention_dims(&lay(&[1, 2, 2, 1, HEAD_DIM]), "t");
+        assert!(is_msg(&r), "3-axis of 2 must be refused: {r:?}");
+        let r = attention_dims(&lay(&[1, 2, 4, 1, HEAD_DIM]), "t");
+        assert!(is_msg(&r), "3-axis of 4 must be refused: {r:?}");
+    }
+
+    /// `attention_dims`: the `MAX_SEQ` boundary from BOTH sides —
+    /// `MAX_SEQ` itself accepted (a `>=` mutation would refuse it),
+    /// `MAX_SEQ + 1` AND `MAX_SEQ + 2` refused (an `==` mutation would
+    /// accept the latter).
+    #[test]
+    fn attention_dims_seq_at_max_seq_is_accepted_and_past_it_is_refused() {
+        let ok = attention_dims(&lay(&[1, MAX_SEQ, 3, 1, HEAD_DIM]), "t").unwrap();
+        assert_eq!(ok, (1, MAX_SEQ, 1, HEAD_DIM));
+        for over in [MAX_SEQ + 1, MAX_SEQ + 2, 2 * MAX_SEQ] {
+            let r = attention_dims(&lay(&[1, over, 3, 1, HEAD_DIM]), "t");
+            assert!(is_msg(&r), "seq={over} > MAX_SEQ must be refused: {r:?}");
+        }
+        let ok = attention_dims(&lay(&[0, 0, 3, 0, HEAD_DIM]), "t").unwrap();
+        assert_eq!(ok, (0, 0, 0, HEAD_DIM), "all-zero extents are in-domain");
+    }
+
+    /// `check_mask`: rank ≠ 4 while every axis it DOES have is valid
+    /// (`dims[1] == 1`, `dims[3] == s`) — the cell a `||`→`&&` mutation
+    /// of the rank/heads/key-axis check reddens on.
+    #[test]
+    fn check_mask_rank_other_than_4_is_refused_even_with_valid_axes() {
+        let (b, s) = (2usize, 4usize);
+        let r = check_mask(&lay(&[1, 1, 1, s, 1]), b, s, "t");
+        assert!(is_msg(&r), "rank-5 mask must be refused: {r:?}");
+        let r = check_mask(&lay(&[1, 1, s]), b, s, "t");
+        assert!(is_msg(&r), "rank-3 mask must be refused: {r:?}");
+    }
+
+    /// `check_mask`: a heads axis other than 1 (the mask never carries
+    /// heads — see `SoftmaxLastDimFused`'s broadcast class).
+    #[test]
+    fn check_mask_heads_axis_other_than_1_is_refused() {
+        let (b, s) = (2usize, 4usize);
+        let r = check_mask(&lay(&[1, 2, 1, s]), b, s, "t");
+        assert!(is_msg(&r), "heads axis 2 must be refused: {r:?}");
+    }
+
+    /// `check_mask`: a key axis other than `seq`.
+    #[test]
+    fn check_mask_key_axis_other_than_seq_is_refused() {
+        let (b, s) = (2usize, 4usize);
+        for bad in [s - 1, s + 1, 1] {
+            let r = check_mask(&lay(&[1, 1, 1, bad]), b, s, "t");
+            assert!(
+                is_msg(&r),
+                "key axis {bad} != seq={s} must be refused: {r:?}"
+            );
+        }
+    }
+
+    /// `check_mask`: the query-row axis must be exactly 1 or `seq`; the
+    /// two accepted cells return the axis size the caller indexes with.
+    #[test]
+    fn check_mask_query_row_axis_cells() {
+        let (b, s) = (2usize, 4usize);
+        assert_eq!(check_mask(&lay(&[1, 1, 1, s]), b, s, "t").unwrap(), (1, 1));
+        assert_eq!(check_mask(&lay(&[1, 1, s, s]), b, s, "t").unwrap(), (1, s));
+        for bad in [2usize, 3, s + 1] {
+            let r = check_mask(&lay(&[1, 1, bad, s]), b, s, "t");
+            assert!(is_msg(&r), "query-row axis {bad} must be refused: {r:?}");
+        }
+    }
+
+    /// `check_mask`: the leading axis must be exactly 1 or `batch`; both
+    /// accepted cells are returned so the caller can pick its row block.
+    #[test]
+    fn check_mask_leading_axis_cells() {
+        let (b, s) = (2usize, 4usize);
+        assert_eq!(check_mask(&lay(&[1, 1, 1, s]), b, s, "t").unwrap(), (1, 1));
+        assert_eq!(check_mask(&lay(&[b, 1, s, s]), b, s, "t").unwrap(), (b, s));
+        for bad in [b + 1, b + 2, 0] {
+            let r = check_mask(&lay(&[bad, 1, 1, s]), b, s, "t");
+            assert!(is_msg(&r), "leading axis {bad} must be refused: {r:?}");
+        }
+    }
+
+    /// `check_rope_pack`: rank ≠ 5 while every axis it DOES have is valid.
+    #[test]
+    fn check_rope_pack_rank_other_than_5_is_refused_even_with_valid_axes() {
+        let (s, d) = (4usize, HEAD_DIM);
+        let r = check_rope_pack(&lay(&[2, 1, 1, s, d, 1]), s, d, "t");
+        assert!(is_msg(&r), "rank-6 rope_pack must be refused: {r:?}");
+        let r = check_rope_pack(&lay(&[2, 1, 1, s]), s, d, "t");
+        assert!(is_msg(&r), "rank-4 rope_pack must be refused: {r:?}");
+    }
+
+    /// `check_rope_pack`: each of the three fixed leading axes and the
+    /// head_dim axis, violated one at a time.
+    #[test]
+    fn check_rope_pack_each_fixed_axis_is_refused_when_violated_alone() {
+        let (s, d) = (4usize, HEAD_DIM);
+        for (bad, why) in [
+            ([3, 1, 1, s, d], "cos/sin axis 3"),
+            ([1, 1, 1, s, d], "cos/sin axis 1"),
+            ([2, 2, 1, s, d], "axis 1 == 2"),
+            ([2, 1, 2, s, d], "axis 2 == 2"),
+            ([2, 1, 1, s, 32], "head_dim 32"),
+            ([2, 1, 1, s, d + 2], "head_dim d+2"),
+        ] {
+            let r = check_rope_pack(&lay(&bad), s, d, "t");
+            assert!(is_msg(&r), "{why} must be refused: {r:?}");
+        }
+    }
+
+    /// `check_rope_pack`: the table's position axis from both sides of
+    /// `seq` — `s - 1` refused, `s` (boundary) and `s + 1` accepted and
+    /// returned as seq_max.
+    #[test]
+    fn check_rope_pack_short_table_is_refused_and_boundary_is_accepted() {
+        let (s, d) = (4usize, HEAD_DIM);
+        let r = check_rope_pack(&lay(&[2, 1, 1, s - 1, d]), s, d, "t");
+        assert!(is_msg(&r), "seq_max = s - 1 must be refused: {r:?}");
+        assert_eq!(
+            check_rope_pack(&lay(&[2, 1, 1, s, d]), s, d, "t").unwrap(),
+            s
+        );
+        assert_eq!(
+            check_rope_pack(&lay(&[2, 1, 1, s + 1, d]), s, d, "t").unwrap(),
+            s + 1
+        );
+    }
+
+    /// `cpu_fwd`'s empty fast path, `b == 0` cell (`s == 0`'s cell is
+    /// `empty_seq_is_a_no_op_not_a_panic`, `h == 0`'s is below).
+    #[test]
+    fn empty_batch_is_a_no_op_not_a_panic() {
+        let device = Device::Cpu;
+        let (b, s, h, d) = (0usize, 3usize, 2usize, HEAD_DIM);
+        let qkv = Tensor::zeros((b, s, 3, h, d), DType::F32, &device).unwrap();
+        let mask = Tensor::zeros((1, 1, 1, s), DType::F32, &device).unwrap();
+        let (cos, sin) = rope_tables(s, d, &device);
+        let rope_pack = pack_rope(&cos, &sin).unwrap();
+        let op = AttentionBlockFused::new(0.125, FullyMaskedPolicy::Propagate, true).unwrap();
+        let got = fused(&qkv, &rope_pack, &mask, op).unwrap();
+        assert_eq!(got.dims(), &[b, s, h * d]);
+        assert_eq!(got.elem_count(), 0);
+    }
+
+    /// `cpu_fwd`'s empty fast path, `h == 0` cell.
+    #[test]
+    fn empty_heads_is_a_no_op_not_a_panic() {
+        let device = Device::Cpu;
+        let (b, s, h, d) = (2usize, 3usize, 0usize, HEAD_DIM);
+        let qkv = Tensor::zeros((b, s, 3, h, d), DType::F32, &device).unwrap();
+        let mask = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
+        let (cos, sin) = rope_tables(s, d, &device);
+        let rope_pack = pack_rope(&cos, &sin).unwrap();
+        let op = AttentionBlockFused::new(0.125, FullyMaskedPolicy::Propagate, true).unwrap();
+        let got = fused(&qkv, &rope_pack, &mask, op).unwrap();
+        assert_eq!(got.dims(), &[b, s, 0]);
+        assert_eq!(got.elem_count(), 0);
     }
 
     #[test]

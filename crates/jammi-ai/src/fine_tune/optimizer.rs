@@ -62,14 +62,27 @@ pub(crate) fn sync_read_count() -> u64 {
 /// reduction order — and therefore the bits — is deterministic run to run).
 /// Every gradient is then rescaled by `clip_coef = (max_norm / (total_norm +
 /// 1e-6)).min(1.0)` **unconditionally**, matching torch's own avoidance of a
-/// host-syncing `if total_norm > max_norm` branch (ref-077). When `total_norm
-/// <= max_norm`, `clip_coef` clamps to exactly `1.0` and the multiply is a
-/// no-op in the bits (`x * 1.0 == x` for every finite `x`), so a non-clipping
-/// step here is bit-identical to skipping the rescale entirely — the same
-/// guarantee the old early-return gave, without needing the host read that
-/// made that branch possible. `max_norm <= 0.0` disables clipping entirely
-/// (unchanged from before — no compute is issued, and this is the ONE
-/// remaining place `clip_gradients` returns `None`).
+/// host-syncing `if total_norm > max_norm` branch (ref-077).
+///
+/// **Exact bit-identity predicate.** `clip_coef` clamps to EXACTLY `1.0` —
+/// making the rescale bit-identical to skipping it entirely, since `x * 1.0 ==
+/// x` for every finite `x` — iff `max_norm / (total_norm + 1e-6) >= 1.0`,
+/// i.e. iff `total_norm <= max_norm - 1e-6`. That predicate is **not**
+/// `total_norm <= max_norm`: on the half-open band `total_norm ∈ (max_norm -
+/// 1e-6, max_norm]`, `clip_coef` is strictly less than `1.0` (torch's own
+/// `1e-6` epsilon in the denominator puts it there — the same epsilon ref-077
+/// uses, so this is torch's documented behavior, not a divergence from it) and
+/// the rescale perturbs every element. Concretely: 4 gradients of `0.5` each
+/// give `total_norm == max_norm == 1.0`, which sits inside that band —
+/// `clip_coef ≈ 0.9999990463256836` scales each `0.5` down to
+/// `≈ 0.49999952316284180`, NOT bit-identical to the unclipped `0.5`. See
+/// `tests::at_max_norm_boundary_coef_is_not_bit_identical_to_no_clip` for that
+/// pinned closed-form value, and
+/// `tests::below_max_norm_clip_is_bit_identical_to_no_clip` for a `total_norm`
+/// safely inside the `<= max_norm - 1e-6` region, where the guarantee does
+/// hold. `max_norm <= 0.0` disables clipping entirely (unchanged from before
+/// — no compute is issued, and this is the ONE remaining place
+/// `clip_gradients` returns `None`).
 ///
 /// Returns the on-device `total_norm` scalar tensor (`None` when clipping was
 /// disabled) so a caller can read it back — at whatever cadence it chooses —
@@ -132,10 +145,17 @@ pub fn clip_gradients(
     // clip_coef = max_norm / (total_norm + 1e-6), clamped to at most 1.0 —
     // torch's exact order and epsilon (ref-077). `affine`/`recip` bake their
     // constants as kernel-launch scalars (no tensor upload); only `minimum`'s
-    // `1.0` is materialized as a tensor, and that one is exactly the kind of
-    // tiny constant [`candle_core::CudaDevice::enable_cuda_graph_htod_cache`]
-    // is meant to cache across steps (see [`crate::fine_tune::trainer`]'s
-    // guard).
+    // `1.0` is materialized as a tensor — one small H2D upload per call. That
+    // upload is NOT cached: nothing in this crate holds candle's
+    // `CUDA_GRAPH_HTOD_CACHE` for the run (see [`crate::fine_tune::trainer`]'s
+    // doc on why an unbounded, never-evicted, run-lifetime cache is the wrong
+    // trade). Below, `broadcast_mul` has the same shape on the CUDA backend:
+    // `coef` is a stride-0 scalar broadcast against every gradient, which
+    // candle routes through its general strided-binary-op kernel (a fresh
+    // per-call dims/strides upload) rather than `Tensor::affine`'s
+    // host-`f64`-constant fast path — kept as `broadcast_mul` rather than
+    // rewritten to a `CustomOp`, with that extra upload's cost meant to be
+    // measured on device (not assumed) before it is optimized away.
     let clip_coef = total_norm
         .affine(1.0, 1e-6)
         .and_then(|d| d.recip())
@@ -205,10 +225,20 @@ pub const DEFAULT_NORM_CHECK_INTERVAL: usize = 50;
 /// identical. `max_grad_norm <= 0.0` skips clipping.
 ///
 /// `check_every_n_steps` gates [`refuse_nonfinite_norm`]: the norm is read
-/// back and checked only when `step` (the 1-based index of the optimizer step
-/// about to run — pass `global_step + 1`) is a multiple of it, and never when
-/// `check_every_n_steps == 0`. Every call site decides its own cadence; see
-/// each call site for why.
+/// back and checked when `step` (the 1-based index of the optimizer step
+/// about to run — pass `global_step + 1`) is `1`, is a multiple of
+/// `check_every_n_steps`, OR `is_last_step` is `true` — and never when
+/// `check_every_n_steps == 0` (an explicit full opt-out every call site in
+/// this crate currently leaves unused). The `step == 1` and `is_last_step`
+/// arms exist because the modulo cadence alone silently skips every run
+/// shorter than `check_every_n_steps` steps end to end: with only the modulo
+/// check, a run of, say, 12 steps against the default interval of 50 would
+/// never call [`refuse_nonfinite_norm`] even once, and a NaN gradient on its
+/// very last step would train silently and get saved into the adapter. `step
+/// == 1` catches a bad start immediately; `is_last_step` (the caller states
+/// whether `step` is the final optimizer step of the whole run — trainer.rs's
+/// callers know this from the LR-schedule horizon they already compute)
+/// catches a bad end even when the run never reaches a full interval.
 pub fn clip_and_step(
     optimizer: &mut AdamW,
     trainable_vars: &[Var],
@@ -216,9 +246,12 @@ pub fn clip_and_step(
     max_grad_norm: f64,
     check_every_n_steps: usize,
     step: usize,
+    is_last_step: bool,
 ) -> Result<()> {
     let total_norm = clip_gradients(trainable_vars, grads, max_grad_norm)?;
-    if check_every_n_steps > 0 && step.is_multiple_of(check_every_n_steps) {
+    let on_cadence = check_every_n_steps > 0
+        && (step == 1 || step.is_multiple_of(check_every_n_steps) || is_last_step);
+    if on_cadence {
         if let Some(norm) = &total_norm {
             refuse_nonfinite_norm(norm, step)?;
         }
@@ -272,12 +305,19 @@ pub(crate) fn accumulate_grads(
 /// non-text parallel loop has one batch per step and uses this directly. That
 /// loop has no epoch boundary to hang the non-finite check on, so this checks
 /// every [`DEFAULT_NORM_CHECK_INTERVAL`] steps (`optimizer.step_t() + 1`,
-/// the 1-based index of the step about to run).
+/// the 1-based index of the step about to run), plus step `1` and
+/// `is_last_step` unconditionally (see [`clip_and_step`]'s doc — a run
+/// shorter than the interval must still be checked at least once).
+/// `is_last_step`: the caller states whether this call is the final optimizer
+/// step of the whole run (this loop has no epoch boundary of its own to
+/// derive that from, so the caller — which knows the batch/epoch count —
+/// supplies it).
 pub fn optimizer_step(
     optimizer: &mut AdamW,
     trainable_vars: &[Var],
     loss: &Tensor,
     max_grad_norm: f64,
+    is_last_step: bool,
 ) -> Result<()> {
     let mut grads = loss
         .backward()
@@ -290,6 +330,7 @@ pub fn optimizer_step(
         max_grad_norm,
         DEFAULT_NORM_CHECK_INTERVAL,
         step,
+        is_last_step,
     )
 }
 
@@ -342,6 +383,44 @@ mod tests {
             before, after,
             "sub-threshold clip must not perturb a single bit"
         );
+    }
+
+    #[test]
+    fn at_max_norm_boundary_coef_is_not_bit_identical_to_no_clip() {
+        // total_norm == max_norm == 1.0 sits INSIDE the (max_norm - 1e-6,
+        // max_norm] band where clip_coef is strictly < 1.0 — the doc's exact
+        // predicate is `total_norm <= max_norm - 1e-6`, not the naive (and
+        // FALSE) `total_norm <= max_norm` reading. Closed form pinned by hand
+        // in f32: total_norm + 1e-6 = 1.0000009536743164, recip =
+        // 0.9999990463256836, * max_norm (1.0) = same, min(1.0) = same
+        // (already < 1.0) → clip_coef = 0.9999990463256836; 0.5 * clip_coef =
+        // 0.49999952316284180.
+        let (w, mut grads, _g_before) = one_var_with_grad(0.5, 4);
+        let max_norm = 1.0f64;
+        let total_norm = clip_gradients(std::slice::from_ref(&w), &mut grads, max_norm)
+            .unwrap()
+            .expect("clipping was enabled");
+        let norm_val: f32 = total_norm.to_scalar().unwrap();
+        assert_eq!(
+            norm_val, 1.0,
+            "test setup: total_norm must equal max_norm exactly to be on the boundary"
+        );
+
+        let expected: f32 = 0.499_999_52; // pinned closed form, see doc above
+        let after: Vec<f32> = grads.get(w.as_tensor()).unwrap().to_vec1().unwrap();
+        for a in &after {
+            assert_ne!(
+                *a, 0.5,
+                "boundary batch (total_norm == max_norm) must NOT be bit-identical to \
+                 the unclipped gradient — a regression to the FALSE `total_norm <= \
+                 max_norm` reading of the guarantee would make this pass"
+            );
+            let ulp = f32::EPSILON * expected.abs().max(f32::MIN_POSITIVE);
+            assert!(
+                (*a - expected).abs() <= 2.0 * ulp,
+                "expected the boundary batch scaled to ≈{expected}, got {a}"
+            );
+        }
     }
 
     #[test]
@@ -428,13 +507,9 @@ mod tests {
         );
     }
 
-    #[test]
-    #[serial(grad_clip_sync_read_count)]
-    fn clip_and_step_skips_the_check_off_cadence() {
-        // check_every_n_steps = 10, step = 3 → not a multiple of 10, so the
-        // check must not run even though the norm happens to be NaN — this
-        // is the "acceptable off the critical path" contract: the sync is
-        // opt-in per step, gated by cadence, not by the norm's value.
+    /// Build a `Var`/`grads` pair whose gradient is NaN everywhere (mirrors
+    /// the setup shared by every cadence test below).
+    fn one_var_with_nan_grad() -> (Var, GradStore, AdamW) {
         let dev = Device::Cpu;
         let w = Var::from_tensor(&Tensor::zeros((2,), DType::F32, &dev).unwrap()).unwrap();
         let coeff = Tensor::new(f32::NAN, &dev)
@@ -442,11 +517,22 @@ mod tests {
             .broadcast_as((2,))
             .unwrap();
         let loss = (w.as_tensor() * &coeff).unwrap().sum_all().unwrap();
-        let mut grads = loss.backward().unwrap();
-        let mut optimizer = AdamW::new(vec![w.clone()], params_adamw(0.1)).unwrap();
+        let grads = loss.backward().unwrap();
+        let optimizer = AdamW::new(vec![w.clone()], params_adamw(0.1)).unwrap();
+        (w, grads, optimizer)
+    }
 
+    #[test]
+    #[serial(grad_clip_sync_read_count)]
+    fn clip_and_step_skips_the_check_off_cadence() {
+        // check_every_n_steps = 10, step = 3, is_last_step = false → not step
+        // 1, not a multiple of 10, not the run's last step, so the check must
+        // not run even though the norm happens to be NaN — this is the
+        // "acceptable off the critical path" contract: the sync is opt-in per
+        // step, gated by cadence, not by the norm's value.
+        let (w, mut grads, mut optimizer) = one_var_with_nan_grad();
         let before = sync_read_count();
-        clip_and_step(&mut optimizer, &[w], &mut grads, 1.0, 10, 3).unwrap();
+        clip_and_step(&mut optimizer, &[w], &mut grads, 1.0, 10, 3, false).unwrap();
         assert_eq!(
             sync_read_count(),
             before,
@@ -457,19 +543,59 @@ mod tests {
     #[test]
     #[serial(grad_clip_sync_read_count)]
     fn clip_and_step_refuses_a_nonfinite_norm_on_cadence() {
-        let dev = Device::Cpu;
-        let w = Var::from_tensor(&Tensor::zeros((2,), DType::F32, &dev).unwrap()).unwrap();
-        let coeff = Tensor::new(f32::NAN, &dev)
-            .unwrap()
-            .broadcast_as((2,))
-            .unwrap();
-        let loss = (w.as_tensor() * &coeff).unwrap().sum_all().unwrap();
-        let mut grads = loss.backward().unwrap();
-        let mut optimizer = AdamW::new(vec![w.clone()], params_adamw(0.1)).unwrap();
-
-        let err = clip_and_step(&mut optimizer, &[w], &mut grads, 1.0, 10, 10)
+        let (w, mut grads, mut optimizer) = one_var_with_nan_grad();
+        let err = clip_and_step(&mut optimizer, &[w], &mut grads, 1.0, 10, 10, false)
             .unwrap_err()
             .to_string();
+        assert!(err.contains("non-finite"), "got: {err}");
+    }
+
+    /// RED-first (B5): before this fix, `check_every_n_steps > 0 &&
+    /// step.is_multiple_of(check_every_n_steps)` was the WHOLE gate, so
+    /// `step == 1` against `check_every_n_steps == 50` never checked. Mutation
+    /// tried: delete the `step == 1 ||` disjunct from `clip_and_step`'s
+    /// `on_cadence` — this test goes red (an `Ok` where it expects `Err`).
+    #[test]
+    #[serial(grad_clip_sync_read_count)]
+    fn clip_and_step_always_checks_step_one_regardless_of_cadence() {
+        let (w, mut grads, mut optimizer) = one_var_with_nan_grad();
+        let err = clip_and_step(
+            &mut optimizer,
+            &[w],
+            &mut grads,
+            1.0,
+            DEFAULT_NORM_CHECK_INTERVAL,
+            1,
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("non-finite"), "got: {err}");
+    }
+
+    /// RED-first (B5): a run shorter than `check_every_n_steps` steps end to
+    /// end (e.g. 12 steps against the default interval of 50) never hits a
+    /// multiple of the interval and, before this fix, would train an entire
+    /// run — including a NaN on its very last step — without ever calling
+    /// `refuse_nonfinite_norm`. Mutation tried: delete the `|| is_last_step`
+    /// disjunct — this test goes red.
+    #[test]
+    #[serial(grad_clip_sync_read_count)]
+    fn clip_and_step_checks_the_last_step_of_a_short_run() {
+        let (w, mut grads, mut optimizer) = one_var_with_nan_grad();
+        // step = 12, well short of the default interval (50) and not a
+        // multiple of it — only `is_last_step = true` should trigger the check.
+        let err = clip_and_step(
+            &mut optimizer,
+            &[w],
+            &mut grads,
+            1.0,
+            DEFAULT_NORM_CHECK_INTERVAL,
+            12,
+            true,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("non-finite"), "got: {err}");
     }
 

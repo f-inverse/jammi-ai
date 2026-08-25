@@ -6389,13 +6389,13 @@ fn assert_adamw_bit_identical(
     num_steps: usize,
 ) {
     let cpu = Device::Cpu;
-    let mut theta_fused_cpu = Tensor::from_slice(theta0_v, shape, &cpu).unwrap();
-    let mut m_fused_cpu = Tensor::from_slice(m0_v, shape, &cpu).unwrap();
-    let mut v_fused_cpu = Tensor::from_slice(v0_v, shape, &cpu).unwrap();
+    let theta_fused_cpu = Tensor::from_slice(theta0_v, shape, &cpu).unwrap();
+    let m_fused_cpu = Tensor::from_slice(m0_v, shape, &cpu).unwrap();
+    let v_fused_cpu = Tensor::from_slice(v0_v, shape, &cpu).unwrap();
 
-    let mut theta_fused_cuda = Tensor::from_slice(theta0_v, shape, cuda).unwrap();
-    let mut m_fused_cuda = Tensor::from_slice(m0_v, shape, cuda).unwrap();
-    let mut v_fused_cuda = Tensor::from_slice(v0_v, shape, cuda).unwrap();
+    let theta_fused_cuda = Tensor::from_slice(theta0_v, shape, cuda).unwrap();
+    let m_fused_cuda = Tensor::from_slice(m0_v, shape, cuda).unwrap();
+    let v_fused_cuda = Tensor::from_slice(v0_v, shape, cuda).unwrap();
 
     let mut theta_eager_cuda = Tensor::from_slice(theta0_v, shape, cuda).unwrap();
     let mut m_eager_cuda = Tensor::from_slice(m0_v, shape, cuda).unwrap();

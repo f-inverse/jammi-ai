@@ -37,7 +37,12 @@
 //! single kernel for that case) and should call `Tensor::affine` directly,
 //! never routing an `F32` input through this op. `cpu_fwd` refuses any
 //! other input dtype with a typed `Error::UnsupportedDTypeForOp` (never a
-//! silent reinterpretation).
+//! silent reinterpretation). The CUDA arm additionally REQUIRES contiguous
+//! storage (`Error::RequiresContiguous`, never a silent misread of a
+//! strided view) — matching every other elementwise op in this crate
+//! ([`super::Axpy`]/[`super::ScaledCastAdd`]'s own documented CUDA domain).
+//! See "Contiguity at the call site" below for why `bwd` never actually
+//! reaches this refusal in production.
 //!
 //! ## [`CastAddBf16`] — B3's `to_dtype(bf16)` + the `dx_base + d_x_lora` add
 //!
@@ -58,6 +63,35 @@
 //! bf16 IN-REGISTER first (`__float2bfloat16`), THEN add in native bf16 —
 //! is exactly what the two-argument order encodes: `f32val` is rounded to
 //! `delta: __nv_bfloat16` before it ever reaches the `+`.
+//!
+//! **Why this rounding order, not accumulate-then-round-once — the PEFT
+//! citation trail.** PEFT's `Linear.forward` (installed `peft==0.20.0`,
+//! `peft/tuners/lora/layer.py:1056`) casts its input UP before the adapter
+//! GEMMs: `x = self._cast_input_dtype(x, lora_A.weight.dtype)`.
+//! `_cast_input_dtype` (`peft/tuners/tuners_utils.py:1777-1792`, verified at
+//! the installed source this session) is a plain `x.to(dtype=dtype)` when
+//! the dtypes differ (`:1790-1792`) — an ordinary torch `.to()` cast, not a
+//! custom op. `dx` (this op's `f32val` argument, `d_xd` in
+//! `LowRankResidualLinear::bwd`) is the gradient flowing BACKWARD through
+//! that SAME forward cast, so its backward is `.to()`'s own backward
+//! (`aten::_to_copy`) — torch's `_to_copy_backward` casts the upstream f32
+//! gradient DOWN to the input's original (`bf16`) dtype BEFORE autograd
+//! accumulates it against the base branch's own (already-`bf16`) gradient
+//! contribution at the shared leaf, per `_to_copy`'s standard "backward of
+//! a cast is a cast of the gradient" rule (`tools/autograd/derivatives.yaml`
+//! / `torch/csrc/autograd/FunctionsManual.cpp`'s `_to_copy_backward`) — i.e.
+//! round-then-add on the `dx` path, exactly what this kernel's argument
+//! order preserves. UNVERIFIED-AT-SOURCE-THIS-SESSION: no torch
+//! installation or vendored `derivatives.yaml`/`FunctionsManual.cpp` was
+//! reachable from this environment (checked: no `torch` Python module, no
+//! `derivatives.yaml` on this filesystem) — the `_to_copy_backward`
+//! citation is stated from the standard "cast backward is a cast" autograd
+//! convention documented in torch's own public docs and PEFT's own
+//! matching forward-cast shape, NOT confirmed by reading the C++ source
+//! directly this session. A future reader with pod/torch access should
+//! confirm `derivatives.yaml`'s `_to_copy: self: _to_copy_backward(grad,
+//! self.options())` line before treating this as source-verified rather
+//! than convention-inferred.
 //!
 //! **CPU arm and the double-rounding argument.** The CPU arm cannot call an
 //! `operator+`; it must decide what "native bf16 add" means in software.
@@ -117,7 +151,40 @@
 //! `LowRankResidualLinear::bwd` (`dx = dx_base + d_x_lora`, both already
 //! `F32`) is already a single candle `badd_f32` launch with nothing to
 //! fuse, and is NOT this op's domain — the call site keeps using a plain
-//! `Tensor::add` for it.
+//! `Tensor::add` for it. The CUDA arm additionally REQUIRES contiguous
+//! storage for both operands, same as [`CastScaleBf16F32`] above.
+//!
+//! ## Contiguity at the call site — why the CUDA refusal is defense in
+//! ## depth, not a live production path
+//!
+//! Neither op's CUDA arm falls back to the two-kernel eager chain on a
+//! non-contiguous input the way a CALL SITE'S OWN admission predicate can
+//! (e.g. `LoraLinear::forward`'s `lora_linear_admission_predicate`) — it
+//! returns `Error::RequiresContiguous`, matching every other elementwise op
+//! in this crate ([`super::Axpy`]/[`super::ScaledCastAdd`]'s documented
+//! CUDA domain: "additionally requires contiguous storage"). `bwd` itself
+//! has no eager alternative to fall back TO at this point (unlike the
+//! outer `LowRankResidualLinear` site, which decided fused-vs-eager BEFORE
+//! `bwd` ever ran) — a `RequiresContiguous` here would fail the whole
+//! backward pass, not degrade gracefully, so it matters that this path is
+//! never actually reachable in production: `CastScaleBf16F32`'s only
+//! argument is `grad_res`, the raw upstream gradient `CustomOp3::bwd`
+//! receives — candle's own `GradStore::or_insert`/`insert`
+//! (`backprop.rs`) accumulates gradients via `zeros_like` + `add`, both of
+//! which allocate fresh, contiguous storage, so `grad_res` is contiguous
+//! by construction every time `bwd` is invoked through candle's normal
+//! `Tensor::backward` walk. `CastAddBf16`'s two arguments are
+//! `dx_base_2d` (a FRESH `Tensor::matmul` output — `BackendStorage::matmul`
+//! always allocates a new contiguous buffer, `cuda_backend/mod.rs`'s
+//! `dev.alloc::<T>(elem_count)` calls) and `d_x_lora_f32_2d` (either that
+//! same fresh-GEMM shape or [`super::DropoutFused`]'s own kernel output,
+//! also freshly allocated) — neither is ever a narrowed/transposed VIEW.
+//! `RequiresContiguous` is therefore reachable only if a future change to
+//! `bwd` threads a genuinely non-contiguous tensor through one of these two
+//! slots; kept as a typed refusal (not a panic, not silently misread
+//! strides) rather than trusted away, per this crate's usual "an op trusts
+//! no caller for its own domain" doctrine — but not exercised by any
+//! oracle in this file, since production never reaches it.
 //!
 //! Both ops dispatch through [`crate::admission::admit`] with their own
 //! [`crate::admission::DispatchCounters`] key (`op.name()`), so
@@ -329,6 +396,61 @@ mod tests {
     // ---- CastScaleBf16F32 ----
 
     #[test]
+    fn cast_scale_op_name_is_pinned() {
+        assert_eq!(CastScaleBf16F32::new(1.0).name(), "cast_scale_bf16_f32");
+    }
+
+    #[test]
+    fn cast_scale_bwd_matches_a_hand_computed_straight_through_gradient() {
+        // Dead in `LowRankResidualLinear::bwd`'s own usage (see this op's
+        // `bwd` doc), but implemented for completeness as a generic
+        // primitive — exercised directly here (not through `apply1`+
+        // `backward()`, since `grad_res` in the real call site is never
+        // itself tracked) to close the mutation surface `bwd` otherwise
+        // leaves untested (MUT-1 discipline: every function this crate
+        // ships gets a covering test, not only the ones a current call
+        // site happens to reach).
+        let device = Device::Cpu;
+        let arg = Tensor::from_slice(&[bf16::from_f32(1.0), bf16::from_f32(-2.0)], (2,), &device)
+            .unwrap();
+        let res = Tensor::from_slice(&[0.0f32, 0.0], (2,), &device).unwrap();
+        let grad_res = Tensor::from_slice(&[4.0f32, -8.0], (2,), &device).unwrap();
+        let op = CastScaleBf16F32::new(0.5);
+        let d = CustomOp1::bwd(&op, &arg, &res, &grad_res)
+            .unwrap()
+            .expect("bwd must return Some");
+        assert_eq!(
+            d.dtype(),
+            DType::BF16,
+            "d must be cast back to arg's own dtype"
+        );
+        let got: Vec<bf16> = d.to_vec1().unwrap();
+        // grad_res.affine(0.5, 0.0) = [2.0, -4.0], cast to bf16 (exact at
+        // these magnitudes).
+        assert_eq!(got, [bf16::from_f32(2.0), bf16::from_f32(-4.0)]);
+    }
+
+    #[test]
+    fn cast_scale_bwd_is_identity_when_arg_is_already_f32() {
+        // Isolates the `arg.dtype() == d.dtype()` branch (the `==` -> `!=`
+        // mutation): when `arg` is `F32` (matching `d`'s own dtype, since
+        // this op's forward always produces `F32`), `bwd` must return `d`
+        // UNCHANGED (no `to_dtype` round-trip), not a cast that this
+        // fixture's exact-integer values would otherwise hide.
+        let device = Device::Cpu;
+        let arg = Tensor::from_slice(&[1.0f32, -2.0], (2,), &device).unwrap();
+        let res = Tensor::from_slice(&[0.0f32, 0.0], (2,), &device).unwrap();
+        let grad_res = Tensor::from_slice(&[4.0f32, -8.0], (2,), &device).unwrap();
+        let op = CastScaleBf16F32::new(0.5);
+        let d = CustomOp1::bwd(&op, &arg, &res, &grad_res)
+            .unwrap()
+            .expect("bwd must return Some");
+        assert_eq!(d.dtype(), DType::F32);
+        let got: Vec<f32> = d.to_vec1().unwrap();
+        assert_eq!(got, [2.0, -4.0]);
+    }
+
+    #[test]
     fn cpu_fwd_matches_hand_computed_values() {
         let device = Device::Cpu;
         let xv = [
@@ -507,6 +629,102 @@ mod tests {
     }
 
     // ---- CastAddBf16 ----
+
+    #[test]
+    fn cast_add_op_name_is_pinned() {
+        assert_eq!(CastAddBf16::new().name(), "cast_add_bf16");
+    }
+
+    #[test]
+    fn cast_add_bwd_matches_a_hand_computed_straight_through_gradient() {
+        // Dead in `LowRankResidualLinear::bwd`'s own usage (see this op's
+        // `bwd` doc); exercised directly for the same MUT-1 reason
+        // `cast_scale_bwd_matches_a_hand_computed_straight_through_gradient`
+        // states.
+        let device = Device::Cpu;
+        let base = Tensor::from_slice(&[bf16::from_f32(1.0), bf16::from_f32(-2.0)], (2,), &device)
+            .unwrap();
+        let f32val = Tensor::from_slice(&[0.5f32, 3.25], (2,), &device).unwrap();
+        let res =
+            Tensor::from_slice(&[bf16::from_f32(0.0), bf16::from_f32(0.0)], (2,), &device).unwrap();
+        let grad_res =
+            Tensor::from_slice(&[bf16::from_f32(4.0), bf16::from_f32(-8.0)], (2,), &device)
+                .unwrap();
+        let op = CastAddBf16::new();
+        let (d_base, d_f32val) = CustomOp2::bwd(&op, &base, &f32val, &res, &grad_res).unwrap();
+        let d_base = d_base.expect("d_base must be Some");
+        let d_f32val = d_f32val.expect("d_f32val must be Some");
+        assert_eq!(
+            d_base.dtype(),
+            DType::BF16,
+            "d_base is identity — base's own dtype"
+        );
+        assert_eq!(
+            d_f32val.dtype(),
+            DType::F32,
+            "d_f32val is cast to f32val's own dtype"
+        );
+        let got_base: Vec<bf16> = d_base.to_vec1().unwrap();
+        let got_f32val: Vec<f32> = d_f32val.to_vec1().unwrap();
+        assert_eq!(got_base, [bf16::from_f32(4.0), bf16::from_f32(-8.0)]);
+        assert_eq!(got_f32val, [4.0, -8.0]);
+    }
+
+    #[test]
+    fn cast_add_bwd_is_identity_when_grad_res_already_matches_f32val_dtype() {
+        // Isolates the `grad_res.dtype() == f32val.dtype()` branch (the
+        // `==` -> `!=` mutation): both `f32val` and `grad_res` are `F32`
+        // here, so `d_f32val` must be `grad_res` UNCHANGED (no `to_dtype`
+        // round-trip).
+        let device = Device::Cpu;
+        let base = Tensor::from_slice(&[bf16::from_f32(1.0), bf16::from_f32(-2.0)], (2,), &device)
+            .unwrap();
+        let f32val = Tensor::from_slice(&[0.5f32, 3.25], (2,), &device).unwrap();
+        let res = base.clone();
+        // A `CustomOp2::bwd` signature requires `grad_res` to match `res`'s
+        // OWN dtype in the real candle call graph, but this op's `bwd` is
+        // exercised directly (white-box) here — an `F32` `grad_res` is
+        // exactly the branch under test, matching the doc's own "chain
+        // rule through the round" derivation for a caller that reaches
+        // this op with an already-`F32` upstream gradient.
+        let grad_res = Tensor::from_slice(&[4.0f32, -8.0], (2,), &device).unwrap();
+        let op = CastAddBf16::new();
+        let (_d_base, d_f32val) = CustomOp2::bwd(&op, &base, &f32val, &res, &grad_res).unwrap();
+        let d_f32val = d_f32val.expect("d_f32val must be Some");
+        assert_eq!(d_f32val.dtype(), DType::F32);
+        let got: Vec<f32> = d_f32val.to_vec1().unwrap();
+        assert_eq!(got, [4.0, -8.0]);
+    }
+
+    #[test]
+    fn cast_add_dtype_error_reports_the_actual_offending_argument() {
+        // Discriminates the `s1.dtype() != DType::BF16` branch (the `!=`
+        // -> `==` mutation): `base` (s1) is the invalid one (`F32`, not
+        // `BF16`) while `f32val` (s2) is ALSO invalid but at a DIFFERENT
+        // dtype (`BF16`, not `F32`) — a mutated `==` would report `s2`'s
+        // dtype (`BF16`) instead of `s1`'s own (`F32`), distinguishably
+        // wrong (unlike a same-dtype fixture, where both branches report
+        // the same value and the mutation is invisible).
+        let device = Device::Cpu;
+        let base = Tensor::from_slice(&[1.0f32, 2.0], (2,), &device).unwrap();
+        let f32val =
+            Tensor::from_slice(&[bf16::from_f32(1.0), bf16::from_f32(2.0)], (2,), &device).unwrap();
+        let err = cast_add(&base, &f32val)
+            .expect_err("both dtypes invalid — must refuse, reporting base's own dtype");
+        match err {
+            Error::UnsupportedDTypeForOp(dtype, op) => {
+                assert_eq!(
+                    dtype,
+                    DType::F32,
+                    "must report base's (s1's) own offending dtype"
+                );
+                assert_eq!(op, "cast_add_bf16");
+            }
+            other => {
+                panic!("expected UnsupportedDTypeForOp(F32, \"cast_add_bf16\"), got {other:?}")
+            }
+        }
+    }
 
     #[test]
     fn cast_add_cpu_fwd_matches_hand_computed_values() {

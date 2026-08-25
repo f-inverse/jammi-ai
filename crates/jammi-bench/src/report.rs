@@ -1234,6 +1234,34 @@ pub struct FinetuneStepTier {
     /// the step made) — that is the predicate refusing by domain, not a
     /// broken counter.
     pub attention_block_eager_dispatches: u64,
+    /// How many times the FlashAttention-2 DENSE cascade
+    /// (`attention_block_flash`, P6 Stage B B3-dense) actually dispatched
+    /// `Fused` — a THIRD training-attention arm, separate from
+    /// `attention_block_fused_dispatches` (the BLOCK arm's own counter):
+    /// when this arm fires for a layer, the block arm's own `admit` call
+    /// for that SAME layer is never reached at all (an early return, see
+    /// `jammi_encoders::modernbert`'s
+    /// `ModernBertAttention::forward_training_attention` doc) — so a run
+    /// where flash fires on every layer reads `attention_block_fused_
+    /// dispatches == 0` and `attention_block_flash_fused_dispatches ==
+    /// num_hidden_layers * forwards_per_step * steps_measured`, not a
+    /// contradiction. Read via
+    /// `jammi_encoders::attention_block_flash_dispatch_snapshot`.
+    pub attention_block_flash_fused_dispatches: u64,
+    /// How many times that cascade DECLINED (a domain miss -- e.g. real
+    /// padding, out of this unit's dense-only scope -- or a capability
+    /// miss -- not CUDA, `flash-attn` not compiled, wrong arch, or named
+    /// in `JAMMI_KERNELS_DISABLE`) instead of dispatching `Fused`. A
+    /// VALID flash-arm timing leg must read `0` here (contract v5 §3.8:
+    /// "`declined > 0` on any bench leg -> INVALID -- bench masks are
+    /// prefix by construction").
+    pub attention_block_flash_declined_dispatches: u64,
+    /// Whether THIS BUILD compiled the vendored FlashAttention-2 kernels
+    /// (`jammi_kernels::admission::FLASH_COMPILED`) -- always present so a
+    /// `attention_block_flash_fused_dispatches == 0` reading is
+    /// distinguishable between "this build cannot run flash at all" and
+    /// "flash was compiled in but declined/disabled this run".
+    pub flash_compiled: bool,
     /// The `JAMMI_KERNELS_DISABLE` op keys this process REQUESTED (sorted,
     /// empty when the env var was unset or empty) —
     /// `jammi_kernels::admission::disabled_ops_requested`. Always present,
@@ -1457,6 +1485,9 @@ mod tests {
             lora_linear_eager_dispatches: 0,
             attention_block_fused_dispatches: 0,
             attention_block_eager_dispatches: 0,
+            attention_block_flash_fused_dispatches: 0,
+            attention_block_flash_declined_dispatches: 0,
+            flash_compiled: jammi_kernels::admission::FLASH_COMPILED,
             kernels_disabled_requested: Vec::new(),
             kernels_disabled_fired: Vec::new(),
             s_per_step_p50: Measurement::measured(0.01, "s"),
@@ -1486,12 +1517,15 @@ mod tests {
         keys.sort_unstable();
         let mut expected = vec![
             "attention_block_eager_dispatches",
+            "attention_block_flash_declined_dispatches",
+            "attention_block_flash_fused_dispatches",
             "attention_block_fused_dispatches",
             "batch",
             "batched_forward",
             "backbone_dtype",
             "device",
             "device_name",
+            "flash_compiled",
             "geglu_eager_dispatches",
             "geglu_fused_dispatches",
             "kernels_disabled_fired",

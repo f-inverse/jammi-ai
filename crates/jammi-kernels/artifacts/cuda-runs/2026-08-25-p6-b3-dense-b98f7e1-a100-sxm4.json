@@ -1,0 +1,217 @@
+{
+  "unit": "P6 Stage B B3-dense",
+  "git_sha": "b98f7e1de35b5cfcac00325089fd5eeaf7c6259a",
+  "git_sha7": "b98f7e1",
+  "branch": "perf/p6-fa2-dense",
+  "box": {
+    "gpu": "NVIDIA A100-SXM4-80GB",
+    "driver_version": "580.126.16",
+    "cuda_toolkit": "12.6.85",
+    "pod": "a100c (exclusive during timing)"
+  },
+  "harness": "jammi-bench finetune-step",
+  "cli_common": {
+    "model_dir": "/root/checkpoints/ModernBERT-large",
+    "batch": 8,
+    "steps": 25,
+    "warmup": 5,
+    "backbone_dtype": "bf16",
+    "cuda": 0,
+    "seed": 42,
+    "batched_forward": true,
+    "target_modules": "Wqkv,Wo,Wi",
+    "lora_rank": 8,
+    "lora_alpha": 16.0,
+    "lora_dropout": 0.05,
+    "JAMMI_KERNELS_STRICT": "1 (every leg)"
+  },
+  "build_features": "cuda,jammi-encoders/flash-attn (release profile)",
+  "gate_outcomes_this_session": {
+    "cargo clippy -p jammi-kernels --all-targets --features flash-attn -- -D warnings": "PASS",
+    "cargo clippy -p jammi-encoders --all-targets --features cuda,jammi-kernels/flash-attn -- -D warnings": "PASS",
+    "cargo test -p jammi-kernels --features cuda --test cuda_parity (JAMMI_REQUIRE_CUDA=1)": "PASS 76/76 (6 new rope_positions_fused tests + 70 pre-existing)",
+    "cargo test -p jammi-encoders --features cuda,flash-attn --lib forward_hidden_dispatches_attention_block_flash_fused_on_a_dense_cuda_bf16_checkpoint (JAMMI_REQUIRE_CUDA=1)": "PASS",
+    "cargo test -p jammi-encoders --features cuda --lib (padded fixture, cuda-only, flash-attn feature off)": "PASS 34/34 (all pre-existing tests incl. the padded-loss/grad tolerance fix)",
+    "note": "cuda_parity / dense end-to-end test run individually and filtered above; the full jammi-kernels/jammi-encoders --features cuda,flash-attn suites were not run to completion in this session -- see the hand-off's 'what remains' for the full-suite pod pass still owed"
+  },
+  "legs": {
+    "b8-s512-flash-on": {
+      "seq": 512,
+      "flash_compiled": true,
+      "runs": [
+        {
+          "file": "s512_flash_on_1.json",
+          "s_per_step_p50": 0.499194671,
+          "s_per_step_mean": 0.49959383548,
+          "peak_vram_bytes": 18943574016.0,
+          "peak_rss_bytes": 1885704192.0,
+          "attention_block_flash_fused_dispatches": 840,
+          "attention_block_flash_declined_dispatches": 0,
+          "attention_block_fused_dispatches": 0,
+          "attention_block_eager_dispatches": 0,
+          "kernels_disabled_requested": [],
+          "kernels_disabled_fired": []
+        },
+        {
+          "file": "s512_flash_on_2.json",
+          "s_per_step_p50": 0.49670063,
+          "s_per_step_mean": 0.49683829003999996,
+          "peak_vram_bytes": 19312672768.0,
+          "peak_rss_bytes": 1884680192.0,
+          "attention_block_flash_fused_dispatches": 840,
+          "attention_block_flash_declined_dispatches": 0,
+          "attention_block_fused_dispatches": 0,
+          "attention_block_eager_dispatches": 0,
+          "kernels_disabled_requested": [],
+          "kernels_disabled_fired": []
+        }
+      ],
+      "expected_dispatch_identity": "attention_block_flash.fused == 28 * forwards_per_step(1, batched) * (warmup+steps=30) == 840 on the flash-on leg; attention_block_flash.declined == 840 and attention_block_fused == 840 on the flash-off (DISABLE) leg"
+    },
+    "b8-s512-flash-off-block-baseline": {
+      "seq": 512,
+      "flash_compiled": true,
+      "runs": [
+        {
+          "file": "s512_flash_off_1.json",
+          "s_per_step_p50": 0.709580153,
+          "s_per_step_mean": 0.70963836676,
+          "peak_vram_bytes": 16997416960.0,
+          "peak_rss_bytes": 1885704192.0,
+          "attention_block_flash_fused_dispatches": 0,
+          "attention_block_flash_declined_dispatches": 840,
+          "attention_block_fused_dispatches": 840,
+          "attention_block_eager_dispatches": 0,
+          "kernels_disabled_requested": [
+            "attention_block_flash"
+          ],
+          "kernels_disabled_fired": [
+            "attention_block_flash"
+          ]
+        },
+        {
+          "file": "s512_flash_off_2.json",
+          "s_per_step_p50": 0.709136619,
+          "s_per_step_mean": 0.70925289288,
+          "peak_vram_bytes": 16594763776.0,
+          "peak_rss_bytes": 1885728768.0,
+          "attention_block_flash_fused_dispatches": 0,
+          "attention_block_flash_declined_dispatches": 840,
+          "attention_block_fused_dispatches": 840,
+          "attention_block_eager_dispatches": 0,
+          "kernels_disabled_requested": [
+            "attention_block_flash"
+          ],
+          "kernels_disabled_fired": [
+            "attention_block_flash"
+          ]
+        }
+      ],
+      "expected_dispatch_identity": "attention_block_flash.fused == 28 * forwards_per_step(1, batched) * (warmup+steps=30) == 840 on the flash-on leg; attention_block_flash.declined == 840 and attention_block_fused == 840 on the flash-off (DISABLE) leg"
+    },
+    "b8-s128-flash-on": {
+      "seq": 128,
+      "flash_compiled": true,
+      "runs": [
+        {
+          "file": "s128_flash_on_1.json",
+          "s_per_step_p50": 0.153071357,
+          "s_per_step_mean": 0.15325442227999997,
+          "peak_vram_bytes": 5286920192.0,
+          "peak_rss_bytes": 1884786688.0,
+          "attention_block_flash_fused_dispatches": 840,
+          "attention_block_flash_declined_dispatches": 0,
+          "attention_block_fused_dispatches": 0,
+          "attention_block_eager_dispatches": 0,
+          "kernels_disabled_requested": [],
+          "kernels_disabled_fired": []
+        },
+        {
+          "file": "s128_flash_on_2.json",
+          "s_per_step_p50": 0.153158212,
+          "s_per_step_mean": 0.15352998512,
+          "peak_vram_bytes": 4448059392.0,
+          "peak_rss_bytes": 1885605888.0,
+          "attention_block_flash_fused_dispatches": 840,
+          "attention_block_flash_declined_dispatches": 0,
+          "attention_block_fused_dispatches": 0,
+          "attention_block_eager_dispatches": 0,
+          "kernels_disabled_requested": [],
+          "kernels_disabled_fired": []
+        }
+      ],
+      "expected_dispatch_identity": "attention_block_flash.fused == 28 * forwards_per_step(1, batched) * (warmup+steps=30) == 840 on the flash-on leg; attention_block_flash.declined == 840 and attention_block_fused == 840 on the flash-off (DISABLE) leg"
+    },
+    "b8-s128-flash-off-block-baseline": {
+      "seq": 128,
+      "flash_compiled": true,
+      "runs": [
+        {
+          "file": "s128_flash_off_1.json",
+          "s_per_step_p50": 0.19521598,
+          "s_per_step_mean": 0.19599719664,
+          "peak_vram_bytes": 4347396096.0,
+          "peak_rss_bytes": 1885712384.0,
+          "attention_block_flash_fused_dispatches": 0,
+          "attention_block_flash_declined_dispatches": 840,
+          "attention_block_fused_dispatches": 840,
+          "attention_block_eager_dispatches": 0,
+          "kernels_disabled_requested": [
+            "attention_block_flash"
+          ],
+          "kernels_disabled_fired": [
+            "attention_block_flash"
+          ]
+        },
+        {
+          "file": "s128_flash_off_2.json",
+          "s_per_step_p50": 0.194262578,
+          "s_per_step_mean": 0.19445354743999999,
+          "peak_vram_bytes": 3844079616.0,
+          "peak_rss_bytes": 1885794304.0,
+          "attention_block_flash_fused_dispatches": 0,
+          "attention_block_flash_declined_dispatches": 840,
+          "attention_block_fused_dispatches": 840,
+          "attention_block_eager_dispatches": 0,
+          "kernels_disabled_requested": [
+            "attention_block_flash"
+          ],
+          "kernels_disabled_fired": [
+            "attention_block_flash"
+          ]
+        }
+      ],
+      "expected_dispatch_identity": "attention_block_flash.fused == 28 * forwards_per_step(1, batched) * (warmup+steps=30) == 840 on the flash-on leg; attention_block_flash.declined == 840 and attention_block_fused == 840 on the flash-off (DISABLE) leg"
+    }
+  },
+  "summary": {
+    "b8-s512": {
+      "block_arm_p50_s": [
+        0.709580153,
+        0.709136619
+      ],
+      "flash_arm_p50_s": [
+        0.499194671,
+        0.49670063
+      ],
+      "block_arm_p50_mean_of_2_s": 0.709358386,
+      "flash_arm_p50_mean_of_2_s": 0.4979476505,
+      "step_time_reduction_fraction": 0.2980309243852373,
+      "flash_over_block_ratio": 0.7019690756147626
+    },
+    "b8-s128": {
+      "block_arm_p50_s": [
+        0.19521598,
+        0.194262578
+      ],
+      "flash_arm_p50_s": [
+        0.153071357,
+        0.153158212
+      ],
+      "block_arm_p50_mean_of_2_s": 0.194739279,
+      "flash_arm_p50_mean_of_2_s": 0.1531147845,
+      "step_time_reduction_fraction": 0.21374472943386014,
+      "flash_over_block_ratio": 0.7862552705661399
+    }
+  }
+}

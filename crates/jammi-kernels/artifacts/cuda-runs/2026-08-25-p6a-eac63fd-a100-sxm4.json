@@ -1,0 +1,84 @@
+{
+  "unit": "P6-stage-A",
+  "git_sha": "eac63fdb83bfabb5f6e6bcb9811ddf55e822c59c",
+  "date": "2026-08-25T11:53:13Z",
+  "gpu": "NVIDIA A100-SXM4-80GB, 580.126.16",
+  "nvcc": "Cuda compilation tools, release 12.6, V12.6.85",
+  "features": "cuda,flash-attn",
+  "env": {
+    "JAMMI_REQUIRE_CUDA": "1"
+  },
+  "status": "GREEN",
+  "exit_code": 0,
+  "flash_smoke": {
+    "passed": 16,
+    "failed": 0,
+    "tests": [
+      {
+        "name": "abi_sizes_match_between_rust_and_c",
+        "status": "ok"
+      },
+      {
+        "name": "c_wrapper_refuses_dropout_with_the_typed_status",
+        "status": "ok"
+      },
+      {
+        "name": "c_wrapper_refusal_cells",
+        "status": "ok"
+      },
+      {
+        "name": "fwd_twice_is_bit_identical_in_o_and_lse",
+        "status": "ok"
+      },
+      {
+        "name": "num_sms_and_dq_accum_splits_agree",
+        "status": "ok"
+      },
+      {
+        "name": "bwd_deterministic_rerun_is_bit_identical",
+        "status": "ok"
+      },
+      {
+        "name": "rust_boundary_refuses_wrong_buffer_lengths_and_splits",
+        "status": "ok"
+      },
+      {
+        "name": "fwd_matches_cpu_reference_window_none_and_some2",
+        "status": "ok"
+      },
+      {
+        "name": "bwd_deterministic_ignores_a_poisoned_dq_accum_on_entry",
+        "status": "ok"
+      },
+      {
+        "name": "guard_regions_around_every_output_and_scratch_buffer_are_untouched",
+        "status": "ok"
+      },
+      {
+        "name": "fwd_twice_is_bit_identical_in_o_and_lse_multi_tile",
+        "status": "ok"
+      },
+      {
+        "name": "bwd_deterministic_rerun_is_bit_identical_multi_tile",
+        "status": "ok"
+      },
+      {
+        "name": "guard_regions_around_every_output_and_scratch_buffer_are_untouched_multi_tile",
+        "status": "ok"
+      },
+      {
+        "name": "fwd_matches_cpu_reference_window_none_and_some2_multi_tile",
+        "status": "ok"
+      },
+      {
+        "name": "bwd_matches_analytic_reference_multi_tile",
+        "status": "ok"
+      },
+      {
+        "name": "bwd_matches_central_finite_differences",
+        "status": "ok"
+      }
+    ]
+  },
+  "note": "Execution provenance for tests/flash_smoke.rs, which no CI lane compiles (the flash-attn feature is never implied by cuda, by design). Acceptance-verifier flagged the absence of this artifact; this closes it."
+}

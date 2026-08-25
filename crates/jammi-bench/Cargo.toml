@@ -35,6 +35,16 @@ serde_json.workspace = true
 futures.workspace = true
 libc.workspace = true
 tempfile = "3"
+# The grad-oracle tier's base-checkpoint CONTENT identity (sha256 of
+# config.json / model.safetensors, replacing the un-comparable `model_dir`
+# path string — see `grad_oracle.rs`'s module doc's determinant table).
+# Both `sha2` and `hex` are ALREADY workspace dependencies (see the
+# workspace root `Cargo.toml`'s `[workspace.dependencies]`, and
+# `jammi-db/src/store/manifest.rs`'s identical `Sha256`/`hex::encode` usage)
+# — this is a reference to an existing, already-vetted workspace dependency,
+# not a new external crate entering the tree.
+sha2.workspace = true
+hex.workspace = true
 
 [features]
 # Enables the on-GPU observability tier (`gpu-inference-scale`, embedding +

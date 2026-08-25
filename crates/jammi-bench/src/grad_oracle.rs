@@ -123,14 +123,75 @@
 //! `AdamW::new`+`.step()` call added and the updated `VarMap` re-dumped)
 //! so that extension is a thin wrapper around repeated single-step calls,
 //! not a rewrite. Not implemented this round.
+//!
+//! ## Determinant table — every field either producer emits, classified
+//!
+//! `ci/scripts/perf/compare_grad_oracle.py`'s `_premise_violations`
+//! certifies that two dumps were produced under IDENTICAL premises. That
+//! certification is only as complete as the field list it actually checks.
+//! This table enumerates EVERY output-affecting determinant either producer
+//! emits, classified as:
+//!
+//! - **identity** — must match across the two dumps for the comparison to
+//!   mean anything; a mismatch is a hard premise violation
+//!   (`compare_grad_oracle.RUN_IDENTITY_FIELDS` — the single source of
+//!   truth both `_premise_violations`'s per-field loop and
+//!   `test_compare_grad_oracle.py::RunIdentityFieldCanonicalizationLattice`
+//!   iterate, never a second, hand-maintained field list).
+//! - **provenance** — recorded, reported, NEVER compared: legitimately
+//!   differs across two independent producers/boxes (e.g. device model,
+//!   library versions), and comparing it would either always fail (two
+//!   different stacks never share a torch version) or be meaningless.
+//! - **measurement** — this run's OWN output (loss, gradients, dispatch
+//!   counters); the thing the oracle exists to compare or report, not a
+//!   premise the comparison depends on.
+//!
+//! | field | class | jammi emit site | torch emit site |
+//! |---|---|---|---|
+//! | `seed` | identity | `grad_oracle.rs:GradOracleReport::seed` field, `run()`'s report literal | `torch_grad_oracle.py:546` (`"seed": args.seed`) |
+//! | `batch` | identity | `run()`'s report literal | `torch_grad_oracle.py:547` |
+//! | `seq` | identity | `run()`'s report literal | `torch_grad_oracle.py:548` |
+//! | `lora_rank` | identity | `run()`'s report literal | `torch_grad_oracle.py:549` |
+//! | `lora_alpha` | identity | `run()`'s report literal | `torch_grad_oracle.py:546` (`args.lora_alpha`, see line cited above for the block) |
+//! | `target_modules` | identity | `run()`'s report literal | `torch_grad_oracle.py:551` |
+//! | `batched_forward` | identity | `run()`'s report literal | `torch_grad_oracle.py:552` |
+//! | `backbone_dtype` | identity | `run()`'s report literal (`format!("{:?}", ..).to_lowercase()`) | `torch_grad_oracle.py:542` (`translate_dtype_flag_to_jammi_spelling`) |
+//! | `checkpoint_config_sha256` | identity | `sha256_and_len(&model_dir.join("config.json"))`, called in `run()` before the forward | `torch_grad_oracle.py:261` `checkpoint_identity`, called in `_run_with_model` (`torch_grad_oracle.py:278`) |
+//! | `checkpoint_weights_sha256` | identity | `sha256_and_len(&weights)` | `torch_grad_oracle.py:279` |
+//! | `checkpoint_weights_size_bytes` | identity | `sha256_and_len`'s byte-length return | `torch_grad_oracle.py:280` |
+//! | `lora_weights_in` (presence, not value) | identity (checked separately — `_premise_violations`'s `lora_weights_in` loop, not `RUN_IDENTITY_FIELDS`) | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
+//! | `batch_token_id_sums` | identity (checked separately, `or`-gated presence) | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
+//! | `model_dir` | provenance (human debugging only — a path string is not comparable across two boxes; superseded by the two checksum fields above) | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
+//! | `device` / `device_name` | provenance | `run()`'s report literal (`device_name` reuses `finetune_step::device_name`) | `torch_grad_oracle.py:518` (nested under `provenance`, via `torch_finetune_step.provenance()`) |
+//! | `git_rev` (jammi) / `provenance.git_rev` (torch) | provenance | `tip_sha()`, called in `run()`'s report literal | `torch_finetune_step.py`'s `git_rev()`, via `provenance()` |
+//! | torch/transformers/peft versions | provenance (jammi has no equivalent — no torch/transformers/peft dependency) | n/a | `torch_grad_oracle.py:518`, via `torch_finetune_step.provenance()` |
+//! | `attn_requested` / `attn_implementation` | provenance (jammi has no `--attn` lever; its own analog is the MEASUREMENT dispatch counters below) | n/a | `torch_grad_oracle.py:527`/`528`, resolved in `run()` mirroring `torch_finetune_step.py:871`/`982`/`993`'s own pattern |
+//! | `lora_dropout` | identity, but UNCONDITIONALLY forced to `0.0` by both producers so it can never legitimately differ — excluded from `RUN_IDENTITY_FIELDS` on that basis, not compared | `run()`'s report literal (hardcoded `0.0`) | `torch_grad_oracle.py`'s report literal (hardcoded `0.0`) |
+//! | `trainable_tensor_count` | measurement (redundant with the tensor NAME SET, which `compare_reports`'s `only_in_a`/`only_in_b` already checks structurally) | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
+//! | `loss` / `gradients` / per-tensor `weight` | measurement — the oracle's actual output | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
+//! | `ln`/`rope`/`softmax`/`geglu`/`lora_epilogue`/`lora_linear`/`attention_block` `_fused_dispatches`/`_eager_dispatches` (14 fields) | measurement (jammi-only; no torch equivalent — torch's analog is the `attn_requested`/`attn_implementation` provenance pair above) | `run()`'s dispatch-counter delta, mirroring `finetune_step.rs`'s own `*_dispatch_before`/`*_dispatch_after` snapshot pattern | n/a |
+//! | `kernels_disabled_requested`/`kernels_disabled_fired` | NOT YET APPLICABLE — the underlying instrumentation (`feat/kernels-admission-disable`, "K-aux") has not landed on `main` as of this round (`grep -rn kernels_disabled crates/` finds zero hits at this branch's base) | n/a (add alongside the dispatch counters above once K-aux lands) | n/a |
+//! | `tool` | identity, but only for SAME-vs-DIFFERENT-producer detection, not compared as a normal identity field — `compare_grad_oracle.py`'s `_same_producer_violation` refuses when both dumps carry the SAME `tool` string (`compare a.json a.json`, or a jammi-vs-jammi mix-up), overridable via `--allow-same-producer` for a deliberate self-consistency check | `run()`'s report literal (`"jammi_grad_oracle"`) | `torch_grad_oracle.py`'s report literal (`"torch_grad_oracle"`) |
+//!
+//! `RUN_IDENTITY_FIELDS` in `compare_grad_oracle.py` is the tuple that
+//! actually encodes the **identity** rows above (the `lora_weights_in`
+//! presence check and `batch_token_id_sums` equality check are separate,
+//! purpose-built checks in `_premise_violations`, not members of that
+//! tuple) — `test_grad_oracle_cross_producer_parity.py`'s
+//! `test_run_identity_key_set_present_on_both_real_dumps` asserts every
+//! entry is PRESENT on a REAL dump from EACH producer, and
+//! `test_compare_grad_oracle.py::RunIdentityFieldCanonicalizationLattice::test_every_run_identity_field_has_a_lattice_cell`
+//! fails loudly if a field is added to the tuple without per-field test
+//! coverage.
 
 use std::path::PathBuf;
 
 use candle_core::{DType, Device, Tensor, Var};
 use candle_nn::VarMap;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
-use crate::finetune_step::{synthetic_ids, triplet_loss};
+use crate::finetune_step::{device_name, synthetic_ids, triplet_loss};
 
 /// Parameters the oracle drives its single forward+backward off of.
 #[derive(Debug, Clone)]
@@ -179,8 +240,36 @@ pub struct GradOracleTensor {
 #[derive(Debug, Serialize)]
 pub struct GradOracleReport {
     pub tool: &'static str,
+    /// Human-readable, for debugging only — NOT a comparator identity field
+    /// (a path string is not comparable across two boxes/producers; see this
+    /// module's doc's determinant table). `checkpoint_config_sha256`/
+    /// `checkpoint_weights_sha256` below are the field the comparator's
+    /// premise actually depends on.
     pub model_dir: String,
     pub device: String,
+    /// The concrete device sub-class (`finetune_step.rs`'s own
+    /// `device_name`, reused unchanged — see this module's doc's
+    /// determinant table). PROVENANCE, never compared: two producers
+    /// legitimately run on different device models.
+    pub device_name: String,
+    /// Best-effort `git rev-parse HEAD` against this crate's own directory —
+    /// `None` if `git` is unavailable or this binary is running outside a
+    /// git worktree. PROVENANCE, never compared (mirrors
+    /// `torch_finetune_step.py`'s `git_rev`).
+    pub git_rev: Option<String>,
+    /// sha256 of `model_dir/config.json`'s raw bytes — half of the base
+    /// checkpoint's CONTENT identity (see this module's doc's determinant
+    /// table). IDENTITY: both producers must have loaded the byte-identical
+    /// checkpoint for a gradient comparison to mean anything.
+    pub checkpoint_config_sha256: String,
+    /// sha256 of `model_dir/model.safetensors`'s raw bytes — the other half
+    /// of the base checkpoint's CONTENT identity. IDENTITY.
+    pub checkpoint_weights_sha256: String,
+    /// `model_dir/model.safetensors`'s byte length — a cheap, redundant
+    /// cross-check alongside the sha256 above (a size mismatch is a coarser,
+    /// faster-to-eyeball signal of "not the same file" than a hex digest).
+    /// IDENTITY.
+    pub checkpoint_weights_size_bytes: u64,
     pub backbone_dtype: String,
     pub batch: usize,
     pub seq: usize,
@@ -206,10 +295,65 @@ pub struct GradOracleReport {
     /// `gradients` (one forward, one loss, `gradients.len()` backward
     /// destinations), never per-tensor.
     pub loss: f32,
+    // The 14 process-wide dispatch-counter fields (7 op families x
+    // fused/eager), a snapshot DELTA taken around this call's ONE
+    // forward+backward — the SAME shape `finetune_step.rs`'s own
+    // `*_fused_dispatches`/`*_eager_dispatches` fields carry (see this
+    // module's doc's determinant table), so a jammi-side dump also records
+    // WHICH kernel composition actually ran (fused whole-attention-block /
+    // fused LoRA site where eligible), not just that a forward+backward
+    // happened. MEASUREMENT, never compared cross-producer: torch has no
+    // equivalent counter (its own analog is `attn_implementation`, a
+    // torch-only PROVENANCE field on that side).
+    pub ln_fused_dispatches: u64,
+    pub ln_eager_dispatches: u64,
+    pub rope_fused_dispatches: u64,
+    pub rope_eager_dispatches: u64,
+    pub softmax_fused_dispatches: u64,
+    pub softmax_eager_dispatches: u64,
+    pub geglu_fused_dispatches: u64,
+    pub geglu_eager_dispatches: u64,
+    pub lora_epilogue_fused_dispatches: u64,
+    pub lora_epilogue_eager_dispatches: u64,
+    pub lora_linear_fused_dispatches: u64,
+    pub lora_linear_eager_dispatches: u64,
+    pub attention_block_fused_dispatches: u64,
+    pub attention_block_eager_dispatches: u64,
     /// Keyed by jammi's internal `VarBuilder`-path tensor name (e.g.
     /// `layer.3.Wqkv.lora_a`), sorted for determinism (a `BTreeMap`
     /// serializes in key order; a `HashMap` would not).
     pub gradients: std::collections::BTreeMap<String, GradOracleTensor>,
+}
+
+/// sha256 (hex-encoded) of `path`'s raw bytes, plus the byte length —
+/// `model_dir`'s CONTENT identity in place of the un-comparable path string
+/// (see this module's doc's determinant table). Loud, never silent, on a
+/// read failure — a missing/unreadable checkpoint file is a hard error for
+/// this tier, not a `None` field.
+fn sha256_and_len(path: &std::path::Path) -> Result<(String, u64), Box<dyn std::error::Error>> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| -> Box<dyn std::error::Error> { format!("reading {path:?}: {e}").into() })?;
+    Ok((hex::encode(Sha256::digest(&bytes)), bytes.len() as u64))
+}
+
+/// Best-effort `git rev-parse HEAD` run against THIS crate's own directory
+/// (`CARGO_MANIFEST_DIR`) — mirrors `torch_finetune_step.py`'s `git_rev`
+/// exactly (PROVENANCE, never gates anything, never a hard error): `None` if
+/// `git` is not on `PATH`, this binary is running outside a git worktree
+/// (e.g. a packaged/vendored copy), or the command otherwise fails.
+fn tip_sha() -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Run the oracle and return its report. NO optimizer step — see this
@@ -227,6 +371,14 @@ pub fn run(params: &GradOracleParams) -> Result<GradOracleReport, Box<dyn std::e
     let config_raw = std::fs::read_to_string(params.model_dir.join("config.json"))?;
     let config: jammi_encoders::ModernBertConfig = serde_json::from_str(&config_raw)?;
     let weights = params.model_dir.join("model.safetensors");
+
+    // Base-checkpoint CONTENT identity — computed BEFORE the forward, off
+    // the exact bytes this run loads, so it can never drift from what the
+    // model actually built from (see this module's doc's determinant
+    // table).
+    let (checkpoint_config_sha256, _config_len) =
+        sha256_and_len(&params.model_dir.join("config.json"))?;
+    let (checkpoint_weights_sha256, checkpoint_weights_size_bytes) = sha256_and_len(&weights)?;
 
     let mut varmap = VarMap::new();
     let empty_ranks = std::collections::HashMap::new();
@@ -323,6 +475,19 @@ pub fn run(params: &GradOracleParams) -> Result<GradOracleReport, Box<dyn std::e
         batch_token_id_sums[i] = ids.iter().map(|&x| x as u64).sum();
     }
 
+    // Dispatch-counter "before" snapshots, taken immediately around this
+    // call's ONE forward+backward — same mechanism `finetune_step.rs` uses
+    // (see this module's doc's determinant table), so a jammi-side dump
+    // also records WHICH kernel composition actually ran, isolated from
+    // anything an earlier tier in the same process invocation did.
+    let ln_dispatch_before = jammi_encoders::ln_dispatch_snapshot();
+    let rope_dispatch_before = jammi_encoders::rope_dispatch_snapshot();
+    let softmax_dispatch_before = jammi_encoders::softmax_dispatch_snapshot();
+    let geglu_dispatch_before = jammi_encoders::geglu_dispatch_snapshot();
+    let lora_epilogue_dispatch_before = jammi_lora::lora_epilogue_dispatch_snapshot();
+    let lora_linear_fused_dispatch_before = jammi_lora::lora_linear_fused_dispatch_snapshot();
+    let attention_block_dispatch_before = jammi_encoders::attention_block_dispatch_snapshot();
+
     let (a, p, n) = if params.batched_forward {
         let joined = Tensor::cat(&[&blocks[0], &blocks[1], &blocks[2]], 0)?;
         let joined_mask = Tensor::cat(&[&mask, &mask, &mask], 0)?;
@@ -343,6 +508,14 @@ pub fn run(params: &GradOracleParams) -> Result<GradOracleReport, Box<dyn std::e
     let loss = triplet_loss(&a, &p, &n, 0.3)?;
     let grads = loss.backward()?;
     let loss_val = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
+
+    let ln_dispatch_after = jammi_encoders::ln_dispatch_snapshot();
+    let rope_dispatch_after = jammi_encoders::rope_dispatch_snapshot();
+    let softmax_dispatch_after = jammi_encoders::softmax_dispatch_snapshot();
+    let geglu_dispatch_after = jammi_encoders::geglu_dispatch_snapshot();
+    let lora_epilogue_dispatch_after = jammi_lora::lora_epilogue_dispatch_snapshot();
+    let lora_linear_fused_dispatch_after = jammi_lora::lora_linear_fused_dispatch_snapshot();
+    let attention_block_dispatch_after = jammi_encoders::attention_block_dispatch_snapshot();
 
     let mut gradients = std::collections::BTreeMap::new();
     for (name, var) in trainable_names.into_iter().zip(trainable.into_iter()) {
@@ -373,6 +546,11 @@ pub fn run(params: &GradOracleParams) -> Result<GradOracleReport, Box<dyn std::e
         tool: "jammi_grad_oracle",
         model_dir: params.model_dir.display().to_string(),
         device: device_label,
+        device_name: device_name(params.cuda_device),
+        git_rev: tip_sha(),
+        checkpoint_config_sha256,
+        checkpoint_weights_sha256,
+        checkpoint_weights_size_bytes,
         backbone_dtype: format!("{:?}", params.backbone_dtype).to_lowercase(),
         batch: params.batch,
         seq: params.seq,
@@ -387,6 +565,48 @@ pub fn run(params: &GradOracleParams) -> Result<GradOracleReport, Box<dyn std::e
         trainable_tensor_count: gradients.len(),
         batch_token_id_sums,
         loss: loss_val,
+        ln_fused_dispatches: ln_dispatch_after
+            .fused
+            .saturating_sub(ln_dispatch_before.fused),
+        ln_eager_dispatches: ln_dispatch_after
+            .eager
+            .saturating_sub(ln_dispatch_before.eager),
+        rope_fused_dispatches: rope_dispatch_after
+            .fused
+            .saturating_sub(rope_dispatch_before.fused),
+        rope_eager_dispatches: rope_dispatch_after
+            .eager
+            .saturating_sub(rope_dispatch_before.eager),
+        softmax_fused_dispatches: softmax_dispatch_after
+            .fused
+            .saturating_sub(softmax_dispatch_before.fused),
+        softmax_eager_dispatches: softmax_dispatch_after
+            .eager
+            .saturating_sub(softmax_dispatch_before.eager),
+        geglu_fused_dispatches: geglu_dispatch_after
+            .fused
+            .saturating_sub(geglu_dispatch_before.fused),
+        geglu_eager_dispatches: geglu_dispatch_after
+            .eager
+            .saturating_sub(geglu_dispatch_before.eager),
+        lora_epilogue_fused_dispatches: lora_epilogue_dispatch_after
+            .fused
+            .saturating_sub(lora_epilogue_dispatch_before.fused),
+        lora_epilogue_eager_dispatches: lora_epilogue_dispatch_after
+            .eager
+            .saturating_sub(lora_epilogue_dispatch_before.eager),
+        lora_linear_fused_dispatches: lora_linear_fused_dispatch_after
+            .fused
+            .saturating_sub(lora_linear_fused_dispatch_before.fused),
+        lora_linear_eager_dispatches: lora_linear_fused_dispatch_after
+            .eager
+            .saturating_sub(lora_linear_fused_dispatch_before.eager),
+        attention_block_fused_dispatches: attention_block_dispatch_after
+            .fused
+            .saturating_sub(attention_block_dispatch_before.fused),
+        attention_block_eager_dispatches: attention_block_dispatch_after
+            .eager
+            .saturating_sub(attention_block_dispatch_before.eager),
         gradients,
     })
 }

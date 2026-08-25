@@ -453,6 +453,7 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     Ok(FinetuneStepTier {
         device: device_label,
         device_name: device_name(params.cuda_device),
+        seed: params.seed,
         backbone_dtype: format!("{:?}", params.backbone_dtype).to_lowercase(),
         batch: params.batch,
         seq: params.seq,
@@ -520,8 +521,11 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
 }
 
 /// The concrete device sub-class, so a recorded rate stays interpretable across
-/// a heterogeneous rented fleet.
-fn device_name(cuda_device: Option<usize>) -> String {
+/// a heterogeneous rented fleet. `pub(crate)`: `grad_oracle.rs`'s own report
+/// reuses this EXACT function (never a second `nvidia-smi --query-gpu=name`
+/// call site that could drift from this one) — see that module's doc's
+/// determinant table.
+pub(crate) fn device_name(cuda_device: Option<usize>) -> String {
     match cuda_device {
         None => "cpu".to_string(),
         Some(_) => std::process::Command::new("nvidia-smi")

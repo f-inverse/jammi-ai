@@ -1096,6 +1096,16 @@ pub struct FinetuneStepTier {
     pub device_name: String,
     /// The precision the frozen backbone ran at.
     pub backbone_dtype: String,
+    /// Drives the synthetic batch AND (when `--lora-init jammi`) the fresh
+    /// LoRA draw — `ab_merge.py`'s own leg-premise check (the adjacent
+    /// probe that folded this field in: `ci/scripts/perf/ab_merge.py` had
+    /// NO premise-identity check at all before this round) reads this
+    /// alongside `torch_finetune_step.py`'s `args.seed` to verify the
+    /// jammi and torch legs of one A/B config actually ran the SAME batch,
+    /// not merely that the sweep script PASSED them the same `--seed` flag
+    /// (the difference matters the moment a leg is re-run by hand outside
+    /// `finetune_ab.sh`'s own matched-flags convention).
+    pub seed: u64,
     pub batch: usize,
     pub seq: usize,
     pub lora_rank: usize,
@@ -1464,6 +1474,7 @@ mod tests {
         FinetuneStepTier {
             device: "cpu".to_string(),
             device_name: "cpu".to_string(),
+            seed: 42,
             backbone_dtype: "f32".to_string(),
             batch: 2,
             seq: 6,
@@ -1539,6 +1550,7 @@ mod tests {
             "rope_fused_dispatches",
             "s_per_step_mean",
             "s_per_step_p50",
+            "seed",
             "seq",
             "softmax_eager_dispatches",
             "softmax_fused_dispatches",

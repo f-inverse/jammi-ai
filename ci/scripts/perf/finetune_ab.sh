@@ -21,14 +21,35 @@
 # Emits one merged JSON report + a printed table: s/step p50, triplets/s,
 # peak VRAM (delta, comparable across stacks, and absolute where torch has
 # it — see "VRAM columns" below), EVERY fused-kernel dispatch counter PAIR
-# present in the jammi-fused report (the positive-proof channel: fused > 0
-# AND eager == 0 for EVERY pair — ln, rope, softmax, geglu, lora_epilogue,
-# lora_linear, attention_block, and whatever lands next — is what "the
-# fused path actually ran, end to end" looks like; a step-time win alone
-# cannot distinguish that from "one op silently fell back and the rest were
-# fast anyway"; see `fused_proof`/`dispatch_pairs` in the merge stage for
-# why this reads the pairs off the report's own keys rather than a
-# hardcoded name list), each leg's per-step loss_first->loss_last and a
+# present in the jammi-fused report (the positive-proof channel `ab_merge.py`'s
+# `fused_proof` computes: `eager == 0` on EVERY pair, ALWAYS, no exceptions —
+# but `fused > 0` is NOT a flat per-pair rule; it is the classification
+# `ab_merge.py`'s `REQUIRED_PAIRS`/`ABSORBABLE_BY_ATTENTION_BLOCK`/
+# `LORA_SITE_EXCLUSIVE_GROUP` (their union, `ALL_BASES`) declares and that
+# module's own doc is the authority on — restated here only for a reader of
+# THIS script, not duplicated logic:
+#     * ln, geglu, attention_block   — each MUST independently show fused > 0.
+#     * rope, softmax                — MUST be present; may read (0, 0) ONLY
+#                                       when attention_block's OWN fused count
+#                                       is > 0 this run (its fused arm folds
+#                                       RoPE+softmax into itself and never
+#                                       calls their independent sites at all);
+#                                       otherwise each independently needs
+#                                       fused > 0.
+#     * lora_epilogue, lora_linear   — MUST both be present; mutually
+#                                       EXCLUSIVE call sites for the same LoRA
+#                                       adapted forward, so only their SUM
+#                                       needs fused > 0 — either one alone may
+#                                       legitimately read (0, 0).
+# Every classified base (present in `ALL_BASES`) must be PRESENT in the
+# report at all — an ABSENT pair (the field renamed, deleted, or
+# feature-gated off) is a hard fail for every one of them, never silently
+# excluded. A pair discovered in the report but NOT in `ALL_BASES` (a NEW
+# fused kernel this script's classification tables were never updated for)
+# is a loud per-config schema-drift ERROR, not a silently-ignored base — see
+# `fused_proof`/`dispatch_pairs` in the merge stage for the full rule table
+# and "whatever lands next" being read off the report's own keys rather than
+# a hardcoded name list), each leg's per-step loss_first->loss_last and a
 # loss_final_ratio jammi-fused/torch-sdpa column (SAME DATA, COST FIXTURE —
 # NOT A QUALITY RESULT, printed only so a large divergence is visible — see
 # "loss_final_ratio" below), the ratio jammi-fused/torch-sdpa, and a

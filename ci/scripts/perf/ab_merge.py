@@ -32,16 +32,53 @@ LEGS = ["jammi-eager", "jammi-fused", "torch-eager", "torch-sdpa"]
 # pre-generalization check, which positively required ln/rope/softmax each
 # `fused > 0`).
 #
+# F5 (PR #372 audit round): the FIRST generalization of this table fixed
+# the "(0, 0) silently excluded" bug for `ln` only, and in doing so
+# introduced the SAME bug with the polarity flipped for every OTHER base:
+# `rope`/`softmax` being ENTIRELY ABSENT from a report's schema (a real
+# field renamed/deleted/feature-gated-off regression, not merely reading
+# `(0, 0)`) was silently `continue`d past rather than failed, and any base
+# not named in ANY of the three sets below (`geglu` — required by nothing,
+# despite `finetune_ab.sh`'s own header claiming otherwise) was never
+# checked AT ALL, present or absent, zero or nonzero. `fused_proof([('ln',
+# 9, 0)])` — EVERY other pair entirely missing from the report — used to
+# return `True`. The invariant this table now enforces: EVERY base that
+# `dispatch_pairs` discovers in a real report must be in EXACTLY ONE of the
+# three sets below (`ALL_BASES` is their union); a discovered base outside
+# `ALL_BASES` is a schema-drift ERROR (`dispatch_pairs` raises, same B6
+# per-leg-loud/whole-merge-safe handling `build_report` already gives a
+# solo counter), never a silent exemption. Within each set, ABSENCE from
+# the report is now ALSO a hard fail for every member (not just the
+# `REQUIRED_PAIRS` ones) — a classified base that vanishes from the schema
+# is exactly the regression this proof exists to catch.
+#
 #   * REQUIRED_PAIRS — no fused block in this crate absorbs these; each
-#     MUST show its own `fused > 0` (and, like every pair, `eager == 0`).
-#     `ln` is the floor: it dispatches inside every layer's own norm call,
-#     never folded into a whole-attention or whole-MLP kernel, and
-#     `finetune_step.rs`'s own counter-delta test already asserts its
-#     (fused+eager) total is nonzero on every run.
-#   * ABSORBABLE_BY_ATTENTION_BLOCK — `rope`/`softmax` legitimately read
-#     `(0, 0)` IFF `attention_block`'s OWN `fused` count is `> 0` this run:
-#     `ModernBertAttention::forward_training_attention`'s FUSED arm is the
-#     whole RoPE+QKᵀ+mask+softmax+PV chain as one op and never calls
+#     MUST be PRESENT and show its own `fused > 0` (and, like every pair,
+#     `eager == 0`).
+#       - `ln`: dispatches inside every layer's own norm call, never folded
+#         into a whole-attention or whole-MLP kernel, and
+#         `finetune_step.rs`'s own counter-delta test already asserts its
+#         (fused+eager) total is nonzero on every run.
+#       - `geglu`: same reasoning as `ln` — `ModernBertMlp::forward`'s
+#         training arm calls `geglu_apply_training` unconditionally for
+#         every layer's MLP (see that function's own doc); its admission
+#         domain (F32/BF16, contiguous, nonzero-even last dim) holds for
+#         every real ModernBERT MLP shape, so nothing legitimately
+#         absorbs or exempts it the way `attention_block` absorbs
+#         `rope`/`softmax`. This closes F4/F5's own reproduction (a
+#         "deleted/feature-gated-off fused MLP" reading `geglu = (0, 0)`
+#         used to still print `fused_proof YES`).
+#       - `attention_block`: the whole-attention fused kernel itself. A
+#         checkpoint whose `head_dim != 64` legitimately falls back to
+#         eager here (`report.rs`'s `attention_block_eager_dispatches`
+#         field doc) — that is ALREADY caught by rule 1 below (`eager >
+#         0` anywhere is a hard fail), so requiring `fused > 0` here for
+#         the cases rule 1 does not already reject adds detection without
+#         changing behaviour on that documented domain-refusal case.
+#   * ABSORBABLE_BY_ATTENTION_BLOCK — `rope`/`softmax` MUST be PRESENT; may
+#     read `(0, 0)` IFF `attention_block`'s OWN `fused` count is `> 0` this
+#     run: `ModernBertAttention::forward_training_attention`'s FUSED arm is
+#     the whole RoPE+QKᵀ+mask+softmax+PV chain as one op and never calls
 #     `rope_apply`/`softmax_apply_training` at all (see that method's own
 #     doc), so their independent admission call sites are simply never
 #     reached. When `attention_block` itself never goes fused (the eager
@@ -49,16 +86,21 @@ LEGS = ["jammi-eager", "jammi-fused", "torch-eager", "torch-sdpa"]
 #     `rope_apply`/`softmax_apply_training` — each independently
 #     admission-gated — so they must clear the same `fused > 0` bar a
 #     required pair does.
-#   * LORA_SITE_EXCLUSIVE_GROUP — `lora_epilogue`/`lora_linear` are
-#     genuinely exclusive with EACH OTHER, not with a third pair: every
-#     training-arm LoRA-adapted forward routes through EXACTLY ONE of
-#     these two call sites (`jammi_lora::lora_linear::lora_linear_fused_counters`'s
-#     own doc — today `lora_epilogue` is PERMANENTLY `(0, 0)`, superseded
-#     by the fused whole-site kernel `lora_linear` now reports). So only
-#     the GROUP's sum needs a `fused > 0` proof, never each member alone.
-REQUIRED_PAIRS = frozenset({"ln"})
+#   * LORA_SITE_EXCLUSIVE_GROUP — `lora_epilogue`/`lora_linear` MUST both be
+#     PRESENT, and are genuinely exclusive with EACH OTHER, not with a
+#     third pair: every training-arm LoRA-adapted forward routes through
+#     EXACTLY ONE of these two call sites
+#     (`jammi_lora::lora_linear::lora_linear_fused_counters`'s own doc —
+#     today `lora_epilogue` is PERMANENTLY `(0, 0)`, superseded by the
+#     fused whole-site kernel `lora_linear` now reports). So only the
+#     GROUP's sum needs a `fused > 0` proof, never each member alone.
+REQUIRED_PAIRS = frozenset({"ln", "geglu", "attention_block"})
 ABSORBABLE_BY_ATTENTION_BLOCK = frozenset({"rope", "softmax"})
 LORA_SITE_EXCLUSIVE_GROUP = frozenset({"lora_epilogue", "lora_linear"})
+ALL_BASES = REQUIRED_PAIRS | ABSORBABLE_BY_ATTENTION_BLOCK | LORA_SITE_EXCLUSIVE_GROUP
+assert (
+    len(REQUIRED_PAIRS) + len(ABSORBABLE_BY_ATTENTION_BLOCK) + len(LORA_SITE_EXCLUSIVE_GROUP) == len(ALL_BASES)
+), "REQUIRED_PAIRS / ABSORBABLE_BY_ATTENTION_BLOCK / LORA_SITE_EXCLUSIVE_GROUP must be pairwise disjoint -- every base gets exactly ONE class"
 
 # B5 — bf16's ULP near a loss value around 0.30: 7 explicit mantissa bits,
 # exponent bucket [0.25, 0.5) => 2^-9. Every real sweep leg runs
@@ -127,17 +169,26 @@ def dispatch_pairs(fs):
     B6 SCHEMA STRICTNESS: this function stays LOUD (raises `KeyError`) on a
     solo counter — a fused key with no eager sibling is a genuine schema
     bug (a struct field added without its pair), never a config this script
-    should silently skip. `metrics()`'s two `.get()` reads for
-    `loss_first`/`loss_last` are the OPPOSITE choice, deliberately: those
-    two fields are optional/best-effort table decoration (present since the
-    loss-trajectory unit landed, absent on an older report schema, and
-    absence there changes nothing this proof depends on), while a dispatch
-    pair is STRUCTURAL to `fused_proof`'s entire claim. The two windows are
+    should silently skip. F5 extends the SAME loudness to a base
+    `fused_proof`'s classification tables (`REQUIRED_PAIRS` /
+    `ABSORBABLE_BY_ATTENTION_BLOCK` / `LORA_SITE_EXCLUSIVE_GROUP`, whose
+    union is `ALL_BASES`) do not know about: a NEW fused kernel landing in
+    `finetune_step.rs` without this module's classification tables being
+    updated in lockstep is exactly the same class of schema drift as a
+    solo counter — `fused_proof` would otherwise silently never require
+    anything of it (the F5 bug this closes). `metrics()`'s two `.get()`
+    reads for `loss_first`/`loss_last` are the OPPOSITE choice,
+    deliberately: those two fields are optional/best-effort table
+    decoration (present since the loss-trajectory unit landed, absent on
+    an older report schema, and absence there changes nothing this proof
+    depends on), while a dispatch pair — and its classification — is
+    STRUCTURAL to `fused_proof`'s entire claim. The two windows are
     intentionally different; what changed in this revision is only WHERE
     this exception is caught — see `build_report`'s per-leg `try`/`except`,
-    which stops one bad leg's solo-counter `KeyError` from discarding the
-    merged table for every other config (previously this raise propagated
-    all the way to the top-level script and aborted the entire merge).
+    which stops one bad leg's solo-counter (or now, unclassified-base)
+    `KeyError` from discarding the merged table for every other config
+    (previously this raise propagated all the way to the top-level script
+    and aborted the entire merge).
     """
     pairs = []
     for key in fs:
@@ -151,6 +202,15 @@ def dispatch_pairs(fs):
                 "finetune_step.rs's fused/eager counters are supposed to "
                 "always come in pairs; a solo counter is a schema bug, not "
                 "a config this script should silently skip."
+            )
+        if base not in ALL_BASES:
+            raise KeyError(
+                f"dispatch-pair base {base!r} (from {key!r}) is not classified in ALL_BASES "
+                f"({sorted(ALL_BASES)!r}) — a NEW fused kernel landed in finetune_step.rs "
+                "without fused_proof's REQUIRED_PAIRS / ABSORBABLE_BY_ATTENTION_BLOCK / "
+                "LORA_SITE_EXCLUSIVE_GROUP tables being updated to cover it. This is a "
+                "schema-drift bug, not a base this script should silently leave unchecked "
+                "(see F5's own fix note on the module-level classification tables)."
             )
         pairs.append((base, fs[key], fs[eager_key]))
     return pairs
@@ -185,11 +245,18 @@ def metrics(entry, leg):
 
 def fused_proof(m):
     """See the module-level `REQUIRED_PAIRS`/`ABSORBABLE_BY_ATTENTION_BLOCK`/
-    `LORA_SITE_EXCLUSIVE_GROUP` doc for the classification this checks each
-    pair against. Returns `True`/`False`/`None` (no `dispatch_pairs` at
-    all — not a jammi leg, or the leg itself did not run).
+    `LORA_SITE_EXCLUSIVE_GROUP` (union `ALL_BASES`) doc for the
+    classification this checks each pair against. Returns `True`/`False`/
+    `None` (no `dispatch_pairs` at all — not a jammi leg, or the leg itself
+    did not run). Raises (via `dispatch_pairs`, which `metrics()` already
+    calls before this function ever sees `m` — see that function's own doc)
+    if `m["dispatch_pairs"]` would ever contain a base outside `ALL_BASES`;
+    `fused_proof` itself never receives an unclassified base to begin with.
 
-    Rules, in order:
+    Rules, in order — EVERY base in `ALL_BASES` (not just `REQUIRED_PAIRS`)
+    must be PRESENT in this report's pairs; absence is a hard fail for
+    every classified base, never a silently-granted exemption (F5: the
+    pre-fix code granted this exemption to every base except `ln`):
       1. ANY pair with `eager > 0` is a hard, unconditional fail — an
          admitted call site that actually fell back, on ANY pair, in ANY
          group. Never exempted.
@@ -198,12 +265,15 @@ def fused_proof(m):
          renamed, deleted, or feature-gated off — is exactly the schema
          regression this proof exists to catch, never silently excluded)
          AND show `fused > 0`.
-      3. Each `ABSORBABLE_BY_ATTENTION_BLOCK` member may read `(0, 0)`
-         ONLY when `attention_block`'s own `fused` count is `> 0` in this
-         SAME report; otherwise it must independently clear `fused > 0`.
-      4. `LORA_SITE_EXCLUSIVE_GROUP`'s members are checked as a GROUP: the
-         SUM of their `fused` counts must be `> 0` (whichever member
-         actually carries this run's dispatch — see the group's own doc).
+      3. Every `ABSORBABLE_BY_ATTENTION_BLOCK` member must be PRESENT (same
+         "absence is a fail" rule as step 2 — F5's fix), and may read
+         `(0, 0)` ONLY when `attention_block`'s own `fused` count is `> 0`
+         in this SAME report; otherwise it must independently clear
+         `fused > 0`.
+      4. Every `LORA_SITE_EXCLUSIVE_GROUP` member must be PRESENT (same
+         rule again), and the GROUP is then checked AS A GROUP: the SUM of
+         their `fused` counts must be `> 0` (whichever member actually
+         carries this run's dispatch — see the group's own doc).
       5. Overall: at least one pair ANYWHERE in the report must show
          `fused > 0` — a report where every single pair reads `(0, 0)`
          (e.g. a schema regression that dropped every counter) is NOT
@@ -232,16 +302,17 @@ def fused_proof(m):
     attention_block_fused = by_base.get("attention_block", (0, 0))[0]
     for base in ABSORBABLE_BY_ATTENTION_BLOCK:
         if base not in by_base:
-            continue  # not part of this report's schema at all
+            return False  # F5: absence is a schema regression, never silently excluded
         fused, _eager = by_base[base]
         if fused == 0 and attention_block_fused == 0:
             return False
 
-    lora_group_present = any(base in by_base for base in LORA_SITE_EXCLUSIVE_GROUP)
-    if lora_group_present:
-        lora_group_fused = sum(by_base.get(base, (0, 0))[0] for base in LORA_SITE_EXCLUSIVE_GROUP)
-        if lora_group_fused == 0:
-            return False
+    for base in LORA_SITE_EXCLUSIVE_GROUP:
+        if base not in by_base:
+            return False  # F5: absence is a schema regression, never silently excluded
+    lora_group_fused = sum(by_base[base][0] for base in LORA_SITE_EXCLUSIVE_GROUP)
+    if lora_group_fused == 0:
+        return False
 
     return any(fused > 0 for fused, _eager in by_base.values())
 

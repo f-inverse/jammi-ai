@@ -81,6 +81,23 @@ def jammi_fs(dispatches, **overrides):
     return {"tiers": {"finetune_step": fs}}
 
 
+def drop_dispatch_keys(*bases):
+    """An `overrides` dict for `jammi_fs` that DELETES both
+    `_fused_dispatches` and `_eager_dispatches` for each given base
+    entirely (`jammi_fs`'s own `None`-deletes-the-key convention) --
+    simulates the base being ABSENT from the schema (a field renamed,
+    deleted, or feature-gated off), never merely reading `(0, 0)`. F5's
+    fix requires every `ALL_BASES` member to be PRESENT; this is how the
+    fixtures below construct the "classified base vanished from the
+    schema entirely" regression it now catches.
+    """
+    overrides = {}
+    for base in bases:
+        overrides[f"{base}_fused_dispatches"] = None
+        overrides[f"{base}_eager_dispatches"] = None
+    return overrides
+
+
 def torch_fs(**overrides):
     fs = {
         "device": "cpu",
@@ -286,12 +303,126 @@ class FusedProofFixtureTests(unittest.TestCase):
         self.assertIs(merged["configs"]["b8-s128-d0"]["jammi_fused_dispatch_proof"], False)
 
     def test_no_dispatch_pairs_at_all_reads_false_not_none(self):
-        """`fused_proof(None)` (the leg itself did not run -- MISSING/FAIL)
-        is `None`; a leg that DID run OK but somehow carries an empty pair
-        list is `False`, never treated the same as "did not run".
+        """`jammi_fused_dispatch_proof` is `None` when the jammi-fused leg
+        itself did not run at all (MISSING/FAIL), and `False` (never
+        treated the same as "did not run") when it DID run OK but its
+        schema carries literally ZERO dispatch-pair keys (every base's
+        `_fused_dispatches`/`_eager_dispatches` pair entirely absent) --
+        both driven through `ab_merge.main`, the REAL entry point, never
+        `fused_proof`/`dispatch_pairs` called directly with a literal dict
+        standing in for a report (F5's own fix to this exact test: an
+        earlier draft called `fused_proof({"dispatch_pairs": []})`
+        directly, contradicting this file's and `ab_merge.py`'s own "never
+        a hand-rolled call with literal tuples" claim).
         """
-        self.assertIsNone(ab_merge.fused_proof(None))
-        self.assertIs(ab_merge.fused_proof({"dispatch_pairs": []}), False)
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_leg(raw_dir, "b8-s128-missing", "jammi-eager", report=jammi_fs({}))
+            write_leg(raw_dir, "b8-s128-missing", "jammi-fused", exit_code=1, stderr="boom")
+            write_leg(raw_dir, "b8-s128-missing", "torch-eager", report=torch_fs(attn_implementation="eager"))
+            write_leg(raw_dir, "b8-s128-missing", "torch-sdpa", report=torch_fs())
+
+            write_leg(raw_dir, "b8-s128-empty", "jammi-eager", report=jammi_fs({}))
+            empty_report = jammi_fs({}, **drop_dispatch_keys(*ALL_BASES))
+            write_leg(raw_dir, "b8-s128-empty", "jammi-fused", report=empty_report)
+            write_leg(raw_dir, "b8-s128-empty", "torch-eager", report=torch_fs(attn_implementation="eager"))
+            write_leg(raw_dir, "b8-s128-empty", "torch-sdpa", report=torch_fs())
+
+            rc, merged, _table = self.run_merge(raw_dir)
+
+        self.assertEqual(rc, 0)
+        self.assertIsNone(merged["configs"]["b8-s128-missing"]["jammi_fused_dispatch_proof"])
+        self.assertIs(merged["configs"]["b8-s128-empty"]["jammi_fused_dispatch_proof"], False)
+
+    def test_geglu_zero_zero_now_fails_the_f5_reproduction(self):
+        """F5 REPRODUCTION: before this fix, `fused_proof` over pairs
+        including `geglu = (0, 0)` (present, reading zero -- e.g. a
+        deleted/feature-gated-off fused MLP) returned `True` as long as
+        `ln`/`attention_block`/`lora_linear` each independently cleared
+        their own bar, because `geglu` was in NO classification set at
+        all. `geglu` is now in `REQUIRED_PAIRS` (matching
+        `finetune_ab.sh`'s header, which always claimed this) -- must now
+        be NO.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_ok_config(
+                raw_dir,
+                "b8-s128-d0",
+                {
+                    "ln": (9, 0),
+                    "geglu": (0, 0),
+                    "attention_block": (3, 0),
+                    "lora_linear": (3, 0),
+                },
+            )
+            rc, merged, _table = self.run_merge(raw_dir)
+        self.assertEqual(rc, 0)
+        self.assertIs(merged["configs"]["b8-s128-d0"]["jammi_fused_dispatch_proof"], False)
+
+    def test_rope_softmax_entirely_absent_from_schema_now_fails_the_f5_reproduction(self):
+        """F5 REPRODUCTION: `fused_proof([('ln', 9, 0), ('lora_linear', 3,
+        0)])` -- rope/softmax/geglu/attention_block ALL entirely ABSENT
+        from the report's schema, not merely reading `(0, 0)` -- used to
+        return `True`: the old code's `continue`d past an
+        `ABSORBABLE_BY_ATTENTION_BLOCK` member that was simply not present
+        at all, granting it a free pass no `REQUIRED_PAIRS` member ever
+        got. Must now be NO: an ABSENT classified base is a hard fail for
+        EVERY class, the same treatment `ln`'s absence already got before
+        this fix.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_leg(raw_dir, "b8-s128-d0", "jammi-eager", report=jammi_fs({}))
+            report = jammi_fs(
+                {"ln": (9, 0), "lora_linear": (3, 0)},
+                **drop_dispatch_keys("rope", "softmax", "geglu", "attention_block", "lora_epilogue"),
+            )
+            write_leg(raw_dir, "b8-s128-d0", "jammi-fused", report=report)
+            write_leg(raw_dir, "b8-s128-d0", "torch-eager", report=torch_fs(attn_implementation="eager"))
+            write_leg(raw_dir, "b8-s128-d0", "torch-sdpa", report=torch_fs())
+            rc, merged, _table = self.run_merge(raw_dir)
+        self.assertEqual(rc, 0)
+        self.assertIs(merged["configs"]["b8-s128-d0"]["jammi_fused_dispatch_proof"], False)
+
+    def test_only_ln_present_everything_else_absent_now_fails_the_f5_reproduction(self):
+        """F5's most extreme reproduction, quoted directly from the audit:
+        `fused_proof([('ln', 9, 0)])` -- EVERY OTHER classified base
+        entirely missing from the schema -- used to return `True`. Must
+        now be NO.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_leg(raw_dir, "b8-s128-d0", "jammi-eager", report=jammi_fs({}))
+            report = jammi_fs(
+                {"ln": (9, 0)},
+                **drop_dispatch_keys("rope", "softmax", "geglu", "attention_block", "lora_epilogue", "lora_linear"),
+            )
+            write_leg(raw_dir, "b8-s128-d0", "jammi-fused", report=report)
+            write_leg(raw_dir, "b8-s128-d0", "torch-eager", report=torch_fs(attn_implementation="eager"))
+            write_leg(raw_dir, "b8-s128-d0", "torch-sdpa", report=torch_fs())
+            rc, merged, _table = self.run_merge(raw_dir)
+        self.assertEqual(rc, 0)
+        self.assertIs(merged["configs"]["b8-s128-d0"]["jammi_fused_dispatch_proof"], False)
+
+    def test_unclassified_base_is_a_loud_per_config_error_not_a_silent_pass(self):
+        """A NEW fused kernel's dispatch pair landing in `finetune_step.rs`
+        without `ab_merge.py`'s classification tables being updated in
+        lockstep is a schema-drift bug (`dispatch_pairs` raises), never a
+        silently-ignored/exempted base -- caught per-leg (B6), never
+        crashing the whole merge for every OTHER config.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_leg(raw_dir, "b8-s128-d0", "jammi-eager", report=jammi_fs({}))
+            report = jammi_fs({"ln": (9, 0), "geglu": (3, 0), "attention_block": (3, 0), "lora_linear": (3, 0)})
+            report["tiers"]["finetune_step"]["mystery_kernel_fused_dispatches"] = 5
+            report["tiers"]["finetune_step"]["mystery_kernel_eager_dispatches"] = 0
+            write_leg(raw_dir, "b8-s128-d0", "jammi-fused", report=report)
+            write_leg(raw_dir, "b8-s128-d0", "torch-eager", report=torch_fs(attn_implementation="eager"))
+            write_leg(raw_dir, "b8-s128-d0", "torch-sdpa", report=torch_fs())
+            rc, merged, table = self.run_merge(raw_dir)
+        self.assertEqual(rc, 0, "one bad leg must not abort the whole merge (B6)")
+        proof = merged["configs"]["b8-s128-d0"]["jammi_fused_dispatch_proof"]
+        self.assertIsInstance(proof, str)
+        self.assertIn("ERROR", proof)
+        self.assertIn("mystery_kernel", proof)
+        self.assertIn("ERROR", table)
 
 
 class LoraInitProvenanceTests(unittest.TestCase):

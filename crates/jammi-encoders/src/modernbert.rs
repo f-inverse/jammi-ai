@@ -1584,8 +1584,12 @@ fn compute_lengths_and_prefix(mask: &Tensor) -> Result<(Vec<usize>, bool), Encod
 /// [`CompactedBatch`]). Named to keep [`flash_admission_predicate`]'s and
 /// [`decide_flash_admission`]'s signatures under clippy's `type_complexity`
 /// ceiling.
-type FlashPredicateResult =
-    Result<(PredicateOutcome, &'static str, Option<(Vec<usize>, usize)>), EncoderError>;
+type FlashPredicateResult = Result<FlashPredicateTriple, EncoderError>;
+
+/// The `(outcome, reason, eligible)` triple itself, named separately from
+/// [`FlashPredicateResult`] so [`flash_capability_gates`] — which never
+/// fails (`Option`, not `Result`) — can reuse the same shape.
+type FlashPredicateTriple = (PredicateOutcome, &'static str, Option<(Vec<usize>, usize)>);
 
 fn flash_admission_predicate(
     device: &Device,
@@ -1605,30 +1609,59 @@ fn flash_admission_predicate(
     // compiled `bool` reflecting how `jammi-kernels` itself was actually
     // built, readable regardless of whether THIS crate's own feature flag is
     // forwarded — see that constant's own doc.
-    if !jammi_kernels::admission::FLASH_COMPILED {
-        return Ok((
+    if let Some(miss) = flash_capability_gates(
+        jammi_kernels::admission::FLASH_COMPILED,
+        device,
+        dtype,
+        head_dim,
+    ) {
+        return Ok(miss);
+    }
+    resolve_lengths_and_prefix(mask, trusted_lengths)
+}
+
+/// The cheap, sync-free capability/domain gates — split out (and
+/// `feature_compiled` taken as a PARAMETER, not read from
+/// `jammi_kernels::admission::FLASH_COMPILED` directly) so every branch is
+/// directly unit-testable with a literal input, independent of the REAL
+/// build's `FLASH_COMPILED` value (this crate's own test suite always
+/// builds with the `flash-attn` feature off, so the real constant is always
+/// `false` here — a test that only ever calls
+/// [`flash_admission_predicate`] itself can never observe the `device`/
+/// `arch`/`dtype`/`head_dim` gates below it, since the feature gate always
+/// short-circuits FIRST). `Some((outcome, reason, None))` on a miss;
+/// `None` when every gate passes (the caller proceeds to
+/// [`resolve_lengths_and_prefix`]).
+fn flash_capability_gates(
+    feature_compiled: bool,
+    device: &Device,
+    dtype: DType,
+    head_dim: usize,
+) -> Option<FlashPredicateTriple> {
+    if !feature_compiled {
+        return Some((
             PredicateOutcome::CapabilityMiss,
             "flash_attn_feature_compiled",
             None,
         ));
     }
     if !device.is_cuda() {
-        return Ok((PredicateOutcome::CapabilityMiss, "device_is_cuda", None));
+        return Some((PredicateOutcome::CapabilityMiss, "device_is_cuda", None));
     }
     if !flash_arch_ok(device) {
-        return Ok((PredicateOutcome::CapabilityMiss, "arch_is_sm80_exact", None));
+        return Some((PredicateOutcome::CapabilityMiss, "arch_is_sm80_exact", None));
     }
     if dtype != DType::BF16 {
-        return Ok((PredicateOutcome::DomainMiss, "dtype_is_bf16", None));
+        return Some((PredicateOutcome::DomainMiss, "dtype_is_bf16", None));
     }
     if head_dim != FLASH_HEAD_DIM {
-        return Ok((
+        return Some((
             PredicateOutcome::DomainMiss,
             "head_dim_is_flash_head_dim",
             None,
         ));
     }
-    resolve_lengths_and_prefix(mask, trusted_lengths)
+    None
 }
 
 /// The tail of [`flash_admission_predicate`] — everything AFTER the cheap,
@@ -2474,6 +2507,57 @@ mod tests {
         );
     }
 
+    /// [`flash_capability_gates`]'s `feature_compiled` gate, tested
+    /// directly with a literal `bool` — independent of the REAL build's
+    /// `jammi_kernels::admission::FLASH_COMPILED` (always `false` in this
+    /// crate's own test suite, which is exactly why
+    /// [`flash_admission_predicate`] itself can never exercise the gates
+    /// AFTER this one — see this function's own doc).
+    #[test]
+    fn flash_capability_gates_feature_off_is_capability_miss() {
+        let miss = flash_capability_gates(false, &Device::Cpu, DType::BF16, FLASH_HEAD_DIM);
+        assert_eq!(
+            miss,
+            Some((
+                PredicateOutcome::CapabilityMiss,
+                "flash_attn_feature_compiled",
+                None
+            ))
+        );
+    }
+
+    /// The device gate, reachable ONLY with `feature_compiled = true`
+    /// (forced here as a literal — the real build never sets it) — this is
+    /// the one cheap gate past the feature check this crate's test suite
+    /// CAN exercise without a real CUDA device: `Device::Cpu` always fails
+    /// `device.is_cuda()` regardless of `feature_compiled`.
+    #[test]
+    fn flash_capability_gates_feature_on_cpu_device_is_capability_miss() {
+        let miss = flash_capability_gates(true, &Device::Cpu, DType::BF16, FLASH_HEAD_DIM);
+        assert_eq!(
+            miss,
+            Some((PredicateOutcome::CapabilityMiss, "device_is_cuda", None))
+        );
+    }
+
+    /// Every gate passes: `None` (proceed to `resolve_lengths_and_prefix`).
+    /// UNREACHABLE on `Device::Cpu` (this crate's test suite has no CUDA
+    /// device) — this test is a hermetic placeholder honestly documenting
+    /// that gap, not a real coverage claim: the arch/dtype/head_dim gates
+    /// (`flash_arch_ok`'s call site, `dtype != DType::BF16`, `head_dim !=
+    /// FLASH_HEAD_DIM`) can only be exercised with `device.is_cuda() ==
+    /// true`, which requires an actual CUDA device this environment does
+    /// not have. `flash_arch_ok`'s OWN internal `==` comparison IS tested
+    /// directly (`flash_arch_ok_rejects_cpu`) — what remains untestable
+    /// here is only the CALL SITE inside `flash_capability_gates`, and the
+    /// two gates after it. A pod run (`JAMMI_REQUIRE_CUDA=1`) closing this
+    /// residual class is listed explicitly in this agent's hand-off.
+    #[test]
+    fn flash_capability_gates_arch_dtype_head_dim_gates_are_untestable_without_cuda() {
+        // Documents the gap; asserts nothing about the untestable branches.
+        assert!(!Device::Cpu.is_cuda());
+    }
+
     /// Path P (contract v4 §3.7, v5 item 3): trusted host-side lengths pay
     /// ZERO `flash_d2h_syncs` — the whole point of skipping the device
     /// reduction — and still reach `Holds` with the right `CompactedBatch`
@@ -2547,6 +2631,12 @@ mod tests {
     /// prefix `[1, 1, 0, 0]` reports, but is not one (an interior zero, L3).
     #[test]
     fn compute_lengths_and_prefix_distinguishes_interior_zero_from_a_true_prefix_of_equal_length() {
+        // Doesn't read `flash_d2h_syncs()` itself, but DOES increment the
+        // same process-wide counter another test measures exactly — must
+        // still take the lock so it cannot interleave with that one.
+        let _guard = FLASH_D2H_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let device = Device::Cpu;
         let genuine_prefix = Tensor::from_slice(&[1f32, 1.0, 0.0, 0.0], (1, 4), &device).unwrap();
         let interior_zero = Tensor::from_slice(&[1f32, 0.0, 1.0, 0.0], (1, 4), &device).unwrap();
@@ -2569,6 +2659,10 @@ mod tests {
 
     #[test]
     fn compute_lengths_and_prefix_all_ones_and_mixed_batch() {
+        // See the sibling test's identical lock rationale.
+        let _guard = FLASH_D2H_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let device = Device::Cpu;
         let all_ones = Tensor::from_slice(&[1f32, 1.0, 1.0, 1.0], (1, 4), &device).unwrap();
         let (lengths, is_prefix) = compute_lengths_and_prefix(&all_ones).unwrap();

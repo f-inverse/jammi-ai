@@ -201,6 +201,23 @@ use crate::error::{KernelError, Result};
 // exclusively and is untouched by this section — its behaviour is
 // BYTE-IDENTICAL before and after this addition (no test in that lattice
 // was edited to add this feature).
+//
+// **HELD, per the lead's P6 Stage B v5 pressure-test correction: the
+// `JAMMI_KERNELS_DISABLE=attention_block_flash` lattice cell (contract v4
+// §3.3's L11) and `ab_merge.py`'s bench-side "absorber class" semantics are
+// deliberately NOT implemented here.** [`admit_cascade`]'s disabled branch
+// below records the decline in `declined` (not `eager` — see
+// [`CascadeDispatchCounters`]'s doc), which means a leg that intentionally
+// disables `attention_block_flash` reads `declined > 0` exactly like a
+// genuine domain/capability miss would — indistinguishable from the bench
+// side without a "fire-without-counting" signal that does not exist yet. A
+// numerics design v2 is being dispatched specifically to resolve this (a
+// public fire-without-counting entry point plus an `ab_merge.py` exemption
+// admitting `eager > 0` on a disabled pair, with an absorber CASCADE
+// `attention_block_flash ⊃ attention_block_fused ⊃ {rope_fused,
+// softmax_last_dim_fused}` rather than a flat disabled-op class) — do not
+// build on top of the mechanism below for that specific lattice cell until
+// it lands.
 
 /// The outcome of a CASCADE arm's own domain/capability predicate — see
 /// this module's "Cascade admission" section above for why this exists

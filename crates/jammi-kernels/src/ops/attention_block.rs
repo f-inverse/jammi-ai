@@ -1,6 +1,7 @@
-//! Fused scaled-dot-product attention block: rotary embedding + `QKᵀ` +
-//! an additive mask (a padding tensor arg plus a construction-time
-//! sliding-window band) + softmax + `PV`, composed inside ONE `CustomOp3`
+//! Fused scaled-dot-product attention block: rotary embedding, `QKᵀ`,
+//! an additive mask (the caller's own pre-combined padding-plus-band
+//! tensor — see "the window is construction data at the call site" below),
+//! softmax, then `PV`, composed inside ONE `CustomOp3`
 //! tape node instead of the ~10-op eager chain (`RoPE` twice, a matmul, a
 //! scale, up to two mask adds, a softmax, a second matmul, a transpose and
 //! a reshape) `jammi-encoders`' ModernBERT attention call site builds today.
@@ -64,36 +65,43 @@
 //! this op refuses any other width rather than silently losing the
 //! guarantee.
 //!
-//! ## The window predicate (family D)
+//! ## The window is construction data at the CALL SITE, not this op (family D)
 //!
-//! `window: Option<u32>` is `half_window` — construction data, not a
-//! tensor: a local-attention layer's query at position `i` attends to key
-//! `k` iff `i.abs_diff(k) <= half_window`. In-window contributes `0.0`
-//! (the "unmasked" identity, matching this crate's additive-mask
-//! convention documented in [`super::softmax`]'s module doc); out-of-window
-//! contributes `WINDOW_MASKED_VALUE` (`-10_000.0`, the SAME numeric value
-//! `jammi_encoders::mask::MASKED_LOGIT` uses — cited by value for
-//! numeric-parity purposes, not a dependency this crate takes on). The
-//! band is computed ON THE FLY per `(query, key)` pair rather than
-//! materialized as a `[seq, seq]` tensor argument — this is the "materialize
-//! the band into the scratch mask exactly as the encoder does today"
-//! option the op contract offers at Tier 0, chosen over extending the
-//! softmax kernel's own mask-handling signature (a smaller, self-contained
-//! change at this tier). `window` combines with the `mask` argument (padding
-//! only) by ADDITION, in the SAME order the current ModernBERT training arm
-//! combines them (padding-plus-band summed once, then added to the raw
-//! score) — see [`AttentionBlockFused::bwd`]'s `build_band_tensor` and this
-//! op's forward math below.
+//! This op has no `window`/`half_window` field and computes no band
+//! predicate of its own. A local-attention layer's sliding-window band is
+//! `jammi_encoders::mask::sliding_window_mask`'s job, built ONCE per
+//! `(seq, half_window, dtype, device)` by the call site's own cache
+//! (`ModernBert::band_cache`/`sliding_band`) and summed into the padding
+//! mask BEFORE this op ever runs — the caller passes this op ONE already-
+//! combined additive mask, exactly the shape
+//! [`super::SoftmaxLastDimFused`] already accepts (`[batch|1, 1, seq|1,
+//! seq]` — see that op's module doc's "supported mask broadcast class").
+//! Earlier revisions of this op re-derived the SAME band predicate three
+//! times more (once per CPU-forward row, once in a CUDA scratch-mask
+//! builder, once in `bwd`'s recompute) on top of the encoder's own copy —
+//! four copies of `i.abs_diff(k) <= half_window` for one predicate. This
+//! design removes all three: the op reads whatever additive value the
+//! caller's combined mask carries at `(b, q, k)` and never asks whether
+//! that value came from padding, a window band, or both — it does not
+//! need to know, since [`WINDOW_MASKED_VALUE`] (`-10_000.0`) and
+//! `jammi_encoders::mask::MASKED_LOGIT` are the SAME numeric sentinel (see
+//! the encoder-side test pinning that equality), so a doubly-masked key
+//! (`padded AND out-of-window`, `-20_000.0`) still reads as "masked, not
+//! attendable" under the exact same `< 0.0` rule
+//! [`super::softmax::row_is_fully_masked`] already applies.
 //!
-//! A row `(b, q)` is fully masked (every key masked) iff
-//! `max_k (mask[b,k] + band(q,k)) < 0.0`: the band alone can never fully
-//! mask a row (`band(q,q) == 0.0` always, `q` is its own in-window key), so
-//! full masking arises exactly when every in-window key is ALSO a padding
-//! key — the same "deep pad-query row in a local layer" case
-//! `jammi_encoders::mask::sliding_window_mask`'s doc proves. This op's
-//! [`FullyMaskedPolicy`] governs what happens there, identically to
-//! [`super::SoftmaxLastDimFused`] (this op reuses that exact policy type
-//! and, for the CPU/composed-CUDA arms, that exact row math).
+//! A row `(b, q)` is fully masked (every key masked) iff `max_k
+//! combined_mask[b, q, k] < 0.0` — [`FullyMaskedPolicy`] governs what
+//! happens there, identically to [`super::SoftmaxLastDimFused`] (this op
+//! reuses that exact policy type and, for the CPU arm, that exact row
+//! math — [`super::softmax::softmax_row_f32`] directly).
+//!
+//! `mask`'s domain therefore widened from the padding-only `[batch|1, 1,
+//! 1, seq]` shape earlier revisions required to `[batch|1, 1, seq|1,
+//! seq]` — the `seq|1` third axis lets a global layer keep passing the
+//! narrower padding-only shape (no query-row broadcast needed) while a
+//! local layer passes the wider padding-plus-band sum. See
+//! [`check_mask`].
 //!
 //! ## Domain (family D)
 //!
@@ -106,15 +114,13 @@
 //! calls deep inside a matmul). `head_dim` must be exactly `HEAD_DIM`.
 //! `seq` must be `<= MAX_SEQ`. `rope_pack` (when `rope == true`): rank
 //! 5 `[2, 1, 1, seq_max, head_dim]`, `seq_max >= seq`, contiguous, same
-//! dtype as `qkv`. `mask`: rank 4 `[batch|1, 1, 1, seq]`, contiguous, same
-//! dtype as `qkv` — narrower than [`super::SoftmaxLastDimFused`]'s general
-//! broadcast class, since this op only ever receives the padding mask
-//! (never a pre-combined padding+band tensor — the band is construction
-//! data, per above). `window`, when `Some`, must satisfy `half_window <
-//! seq` (a `half_window >= seq` degenerates to "every key is in window",
-//! which is what `window: None` already means — refused rather than
-//! silently accepted as a no-op, so a caller error is visible). `b == 0 ||
-//! seq == 0 || heads == 0` takes the empty fast path (nothing to compute).
+//! dtype as `qkv`. `mask`: rank 4 `[batch|1, 1, seq|1, seq]`, contiguous,
+//! same dtype as `qkv` — the SAME broadcast class
+//! [`super::SoftmaxLastDimFused`] accepts, since the caller may pass
+//! either the padding mask alone (global layer) or the padding-plus-band
+//! sum (local layer) — see the "window is construction data at the call
+//! site" section above. `b == 0 || seq == 0 || heads == 0` takes the empty
+//! fast path (nothing to compute).
 //!
 //! ## `bwd`: ordinary `Tensor` composition, reusing this crate's own ops
 //!
@@ -142,6 +148,72 @@
 //! rank, off the real `Layout` each carries (device-independent, mirroring
 //! `LowRankResidualLinear`'s own precedent).
 //!
+//! ### `bwd`'s seven GEMMs: which recompute a forward GEMM, which are new
+//!
+//! `fwd` issues exactly two GEMMs: `scores = q_scaled · kᵀ` (`k`'s
+//! transpose is a VIEW — cuBLAS `OP_T`, no materialize) and `ctx = p · v`
+//! (both row-major — `OP_N`/`OP_N`). `bwd` reissues ONE of those two
+//! (`scores`, to recompute `P`) and adds five NEW gradient GEMMs that have
+//! no forward counterpart at all:
+//!
+//! | `bwd` GEMM | recompute of a fwd GEMM? | operand shape |
+//! |---|---|---|
+//! | `scores = q_scaled · k_rotᵀ` | YES — `fwd`'s `QKᵀ`, same shape | `k_rot` transpose VIEW, no `.contiguous()` (see below) |
+//! | `dv = pᵀ · dctx` | no — new | `p` transpose materialized (`p` is not reused row-major elsewhere) |
+//! | `dp = dctx · vᵀ` | no — new (NOT `fwd`'s `PV`: `v` is transposed here, `fwd`'s `PV` never transposes `v`) | `v` transpose materialized |
+//! | `dqs = ds · k_rot` | no — new | both row-major |
+//! | `dkr = dsᵀ · q_scaled` | no — new | `ds` transpose materialized |
+//!
+//! (`ctx` itself — `fwd`'s SECOND GEMM — is never recomputed in `bwd`: the
+//! op contract's "no packed `[O|L]` output" design means `bwd` only ever
+//! needs `dctx`, supplied by the caller as `grad_res`, never `ctx` itself.)
+//!
+//! Only the `scores` recompute is held to `fwd`'s exact GEMM shape (module
+//! doc's "fwd/bwd GEMM shape match" below) — the other four have no
+//! forward shape to match in the first place, so their own `.contiguous()`
+//! placement is chosen purely for correctness/admissibility, not parity.
+//!
+//! ### fwd/bwd GEMM shape match (`scores`, the one recomputed GEMM)
+//!
+//! `fwd` computes `scores` from a TRANSPOSED VIEW of `k` (cuBLAS `OP_T`,
+//! no separate materialize — see `attention_fwd_f32`'s `k_t_layout` on
+//! CPU, `cuda::attention_block::cuda_fwd`'s `k_t_l` on CUDA). `bwd`'s own
+//! `scores` recompute uses the SAME transposed VIEW on `k_rot` (no
+//! `.contiguous()` call) rather than materializing a contiguous transpose
+//! (cuBLAS `OP_N` on a copy) — the two GEMMs `fwd` and `bwd` issue for
+//! `scores` are therefore identical in shape AND transpose mode on both
+//! devices, not merely equal in VALUE. `Tensor::matmul`'s public API
+//! (`candle_core::Tensor::matmul`, `tensor.rs`) passes each operand's own
+//! `Layout` straight to `BackendStorage::matmul` without forcing
+//! contiguity first, so a transposed VIEW here is exactly as valid a GEMM
+//! operand as an explicit `.contiguous()` copy — `is_gemm_operand_admissible`
+//! accepts both forms, and the module's own oracle
+//! (`bwd_every_gemm_operand_is_admissible_at_boundary_and_production_ranks`)
+//! proves the VIEW form specifically.
+//!
+//! ### Transient scoping: `scores`/`p`/`dp`/`ds` never all coexist
+//!
+//! Each of `bwd`'s four `[B, H, S, S]`-shaped intermediates (`scores`,
+//! `p`, `dp`, `ds`) is dropped (`std::mem::drop`, explicit) the moment its
+//! LAST use inside `bwd` completes, rather than staying bound until the
+//! function returns: `scores` drops right after `p` is computed from it;
+//! `p` and `dp` both drop right after `ds` is computed from them; `ds`
+//! drops right after `dqs`/`dkr` (its two uses) are both computed. The
+//! SUSTAINED live set is therefore at most TWO of these four
+//! `[B, H, S, S]` tensors at once (`p` alongside `dp` while building
+//! `ds`); THREE are simultaneously alive only for the single instant
+//! `ds` itself is being constructed from `p` and `dp` (an unavoidable
+//! "inputs plus the output under construction" overlap any allocator has,
+//! not a design choice this scoping controls), never all four. At
+//! `b=8, h=16, s=512` (BF16, `2` bytes/element — the training arm's own
+//! dtype), one `[8, 16, 512, 512]` tensor is `8·16·512·512·2 =
+//! 67_108_864` bytes (≈ 67.1 MB): the sustained two-tensor live set is
+//! therefore ≈ 134.2 MB (briefly ≈ 201.3 MB during the one `ds`-
+//! construction instant), against ≈ 268.4 MB when all four intermediates
+//! lived to the end of `bwd` (this op's own pre-fix-round shape, and
+//! `SoftmaxLastDimFused::bwd`'s/every other fused op's own default
+//! without explicit scoping).
+//!
 //! `rope_pack`/`mask` are asserted `!track_op()` at the top of `bwd` — this
 //! op computes no `dcos`/`dsin`/`dmask` (unlike `RopeFused`/
 //! `SoftmaxLastDimFused`, which DO compute those for the dead-in-practice
@@ -158,9 +230,10 @@
 //! op reuses that op's own row math on CPU and that op's own kernel on
 //! CUDA) → fold `scale` into `Q` (exact, see "Fixed domain" above) → `QKᵀ`
 //! (`f32` accumulate throughout on this op's F32-only CPU domain) → add the
-//! padding mask and the window band (both exactly `0.0` or a value at the
-//! `MASKED_LOGIT` magnitude — no meaningful rounding at F32 for scores of
-//! `O(1)`-`O(10)` combined with either exact term) → softmax (bit-exact to
+//! caller's already-combined mask (padding alone, or padding-plus-band —
+//! either way exactly `0.0` or a value at the `MASKED_LOGIT` magnitude —
+//! no meaningful rounding at F32 for scores of `O(1)`-`O(10)` combined
+//! with either exact term) → softmax (bit-exact to
 //! [`super::SoftmaxLastDimFused`]'s own row math, reused directly) → `PV`
 //! (`f32` accumulate). No `BF16` rounding points exist on the CPU arm at
 //! all (this op's CPU domain is F32-only); the CUDA arm's `BF16` rounding
@@ -168,7 +241,7 @@
 //! [`super::SoftmaxLastDimFused`]'s own documented ones, reused unchanged.
 
 use candle_core::backend::BackendStorage;
-use candle_core::{CpuStorage, CustomOp3, DType, Error, Layout, Result, Shape, Tensor, D};
+use candle_core::{CpuStorage, CustomOp3, Error, Layout, Result, Shape, Tensor, D};
 
 use super::rope::rope_fwd_row_f32;
 use super::softmax::{softmax_row_f32, SoftmaxBwdDScores};
@@ -185,13 +258,20 @@ pub const HEAD_DIM: usize = 64;
 /// crate (see e.g. `ops::softmax::MAX_LAST_DIM`'s doc for the same status).
 pub const MAX_SEQ: usize = 4096;
 
-/// The additive out-of-window sentinel this op's `window` predicate uses.
-/// Matches `jammi_encoders::mask::MASKED_LOGIT` BY VALUE — cited for
-/// numeric parity with this crate's largest consumer, not a dependency
-/// (family L: this crate names no consumer). Large enough that
-/// `softmax(score + WINDOW_MASKED_VALUE)` underflows to zero at F32;
-/// finite (not `-inf`) for the same "a visible bug beats a silent NaN"
-/// reason `jammi_encoders::mask::MASKED_LOGIT`'s own doc gives.
+/// `jammi_encoders::mask::MASKED_LOGIT`'s numeric value, cited BY VALUE —
+/// the encoder-side sliding-window band this op's callers pre-combine into
+/// `mask` (see the module doc's "window is construction data at the call
+/// site" section) uses this exact sentinel for an out-of-window key, and
+/// this crate's own `< 0.0` fully-masked-row rule
+/// ([`super::softmax::row_is_fully_masked`]) only needs the two crates'
+/// sentinels to agree in SIGN, not in magnitude — but pinning the same
+/// magnitude here means a doubly-masked key's combined value
+/// (`WINDOW_MASKED_VALUE * 2` in the worst case) stays comfortably clear
+/// of the F32/BF16 rounding noise floor around `0.0`, not merely on the
+/// correct side of it by an arbitrarily thin margin. See
+/// `jammi-encoders`' own test pinning `MASKED_LOGIT == WINDOW_MASKED_VALUE`
+/// (family L: this crate names no consumer, so the pin lives on the
+/// encoder side, which DOES know this constant by name).
 pub const WINDOW_MASKED_VALUE: f32 = -10_000.0;
 
 /// Fused attention block. See the module doc for the full design.
@@ -201,9 +281,6 @@ pub struct AttentionBlockFused {
     /// `Q` before `QKᵀ` (see the module doc's "Fixed domain" section for
     /// why this is bit-exact only because `head_dim == ``HEAD_DIM`).
     pub scale: f32,
-    /// `half_window`; `None` for global attention. See the module doc's
-    /// "The window predicate" section.
-    pub window: Option<u32>,
     /// See [`super::FullyMaskedPolicy`]'s own doc; reused unchanged.
     pub fully_masked: FullyMaskedPolicy,
     /// Whether `rope_pack` is applied to `Q`/`K` at all. `false` lets a
@@ -213,12 +290,7 @@ pub struct AttentionBlockFused {
 }
 
 impl AttentionBlockFused {
-    pub fn new(
-        scale: f32,
-        window: Option<u32>,
-        fully_masked: FullyMaskedPolicy,
-        rope: bool,
-    ) -> Result<Self> {
+    pub fn new(scale: f32, fully_masked: FullyMaskedPolicy, rope: bool) -> Result<Self> {
         if !scale.is_finite() {
             return Err(Error::Msg(format!(
                 "attention_block_fused: scale must be finite, got {scale}"
@@ -226,7 +298,6 @@ impl AttentionBlockFused {
         }
         Ok(Self {
             scale,
-            window,
             fully_masked,
             rope,
         })
@@ -264,12 +335,27 @@ pub(crate) fn attention_dims(
 }
 
 /// Validates `mask`'s domain (module doc). Returns the mask's own leading
-/// (batch) axis size — `1` (broadcasts over every batch element) or `b`.
-pub(crate) fn check_mask(l_mask: &Layout, b: usize, s: usize, op: &'static str) -> Result<usize> {
+/// (batch) axis size and its query-row axis size (`1` or `s`) — see the
+/// module doc's "window is construction data at the call site" section:
+/// this op's `mask` is now [`super::SoftmaxLastDimFused`]'s OWN broadcast
+/// class (padding alone, `[batch|1, 1, 1, seq]`, or padding-plus-band,
+/// `[batch|1, 1, seq, seq]`), not a narrower padding-only shape.
+pub(crate) fn check_mask(
+    l_mask: &Layout,
+    b: usize,
+    s: usize,
+    op: &'static str,
+) -> Result<(usize, usize)> {
     let dims = l_mask.dims();
-    if dims.len() != 4 || dims[1] != 1 || dims[2] != 1 || dims[3] != s {
+    if dims.len() != 4 || dims[1] != 1 || dims[3] != s {
         return Err(Error::Msg(format!(
-            "{op}: mask must be [batch|1, 1, 1, {s}], got {dims:?}"
+            "{op}: mask must be [batch|1, 1, {s}|1, {s}], got {dims:?}"
+        )));
+    }
+    if dims[2] != 1 && dims[2] != s {
+        return Err(Error::Msg(format!(
+            "{op}: mask's query-row axis must be 1 or seq={s}, got {}",
+            dims[2]
         )));
     }
     if dims[0] != 1 && dims[0] != b {
@@ -278,7 +364,7 @@ pub(crate) fn check_mask(l_mask: &Layout, b: usize, s: usize, op: &'static str) 
             dims[0]
         )));
     }
-    Ok(dims[0])
+    Ok((dims[0], dims[2]))
 }
 
 /// Validates `rope_pack`'s domain (module doc, only when `self.rope`).
@@ -299,27 +385,6 @@ pub(crate) fn check_rope_pack(l: &Layout, s: usize, d: usize, op: &'static str) 
         )));
     }
     Ok(dims[3])
-}
-
-/// Validates `window` against `seq` (module doc). Returns `half_window`.
-pub(crate) fn check_window(
-    window: Option<u32>,
-    s: usize,
-    op: &'static str,
-) -> Result<Option<usize>> {
-    match window {
-        Some(w) => {
-            let w = w as usize;
-            if w >= s {
-                return Err(Error::Msg(format!(
-                    "{op}: window (half_window={w}) must be < seq={s} — use window=None for \
-                     global attention instead of a window wide enough to be a no-op"
-                )));
-            }
-            Ok(Some(w))
-        }
-        None => Ok(None),
-    }
 }
 
 impl CustomOp3 for AttentionBlockFused {
@@ -345,8 +410,7 @@ impl CustomOp3 for AttentionBlockFused {
                 other => Err(Error::UnsupportedDTypeForOp(other.dtype(), op)),
             };
         }
-        let mask_b = check_mask(l3, b, s, op)?;
-        let half_window = check_window(self.window, s, op)?;
+        let (mask_b, mask_q) = check_mask(l3, b, s, op)?;
         if s1.dtype() != s3.dtype() {
             return Err(Error::DTypeMismatchBinaryOp {
                 lhs: s1.dtype(),
@@ -388,12 +452,12 @@ impl CustomOp3 for AttentionBlockFused {
                     rope_slice,
                     &mask[m1..m2],
                     mask_b,
+                    mask_q,
                     b,
                     s,
                     h,
                     d,
                     self.scale,
-                    half_window,
                     self.fully_masked,
                 )?;
                 Ok((CpuStorage::F32(out), out_shape))
@@ -468,28 +532,22 @@ impl CustomOp3 for AttentionBlockFused {
         let q_scaled = (&q_rot * f64::from(self.scale))?;
         let v_c = v0.contiguous()?;
 
-        let band = match self.window {
-            Some(w) => Some(build_band_tensor(
-                s,
-                w as usize,
-                mask.dtype(),
-                mask.device(),
-            )?),
-            None => None,
-        };
-        let combined_mask = match &band {
-            Some(band) => mask.broadcast_add(band)?,
-            None => mask.clone(),
-        };
-
+        // `mask` is ALREADY the caller's combined padding-plus-band sum
+        // (module doc's "window is construction data at the call site"
+        // section) — no band to rebuild here, unlike earlier revisions of
+        // this op.
+        //
+        // `scores` uses the SAME transposed-VIEW `k_rot` GEMM shape `fwd`
+        // issues (`.transpose(...)` with NO trailing `.contiguous()` — see
+        // the module doc's "fwd/bwd GEMM shape match" section).
         let scores = q_scaled
             .contiguous()?
-            .matmul(&k_rot.transpose(D::Minus1, D::Minus2)?.contiguous()?)?;
-        let p = apply2(
-            &scores,
-            &combined_mask,
-            SoftmaxLastDimFused::new(self.fully_masked),
-        )?;
+            .matmul(&k_rot.transpose(D::Minus1, D::Minus2)?)?;
+        let p = apply2(&scores, mask, SoftmaxLastDimFused::new(self.fully_masked))?;
+        // `scores`'s only use was building `p` above (module doc's
+        // "transient scoping" section) — drop it now instead of letting it
+        // live to the end of `bwd`.
+        drop(scores);
 
         let dctx = grad_res
             .reshape((b, s, h, d))?
@@ -502,12 +560,20 @@ impl CustomOp3 for AttentionBlockFused {
             .matmul(&dctx)?;
         let dp = dctx.matmul(&v_c.transpose(D::Minus1, D::Minus2)?.contiguous()?)?;
         let ds = apply2(&p, &dp, SoftmaxBwdDScores)?;
+        // `p`'s last use (its second, after `dv` above) and `dp`'s only
+        // use were both building `ds` — drop both now.
+        drop(p);
+        drop(dp);
 
         let dqs = ds.contiguous()?.matmul(&k_rot.contiguous()?)?;
         let dkr = ds
             .transpose(D::Minus1, D::Minus2)?
             .contiguous()?
             .matmul(&q_scaled.contiguous()?)?;
+        // `ds`'s last use (its second, after `dqs`) was building `dkr` —
+        // drop it; no `[B,H,S,S]`-shaped tensor remains live for the rest
+        // of `bwd`.
+        drop(ds);
         let dqr = (&dqs * f64::from(self.scale))?;
 
         let (dq0, dk0) = if let Some((cos, sin)) = cos_sin {
@@ -530,31 +596,6 @@ impl CustomOp3 for AttentionBlockFused {
     }
 }
 
-/// Builds the `[1, 1, seq, seq]` sliding-window band `bwd` adds to the
-/// padding mask before recomputing `P` — see the module doc's "The window
-/// predicate" section. A real, disclosed host-side cost (`seq^2` floats
-/// built on the CPU then uploaded, once per `bwd` call): Tier 0 recomputes
-/// this fresh every backward rather than caching it (no cache is available
-/// to a stateless `Copy` op — see this crate's module doc on what `Copy`
-/// does and does not prove), cheap next to the GEMMs it feeds at the `seq`
-/// classes this crate targets (128/512) but not free, and not hidden here.
-fn build_band_tensor(
-    s: usize,
-    half_window: usize,
-    dtype: DType,
-    device: &candle_core::Device,
-) -> Result<Tensor> {
-    let mut band = vec![0f32; s * s];
-    for qi in 0..s {
-        for ki in 0..s {
-            if qi.abs_diff(ki) > half_window {
-                band[qi * s + ki] = WINDOW_MASKED_VALUE;
-            }
-        }
-    }
-    Tensor::from_vec(band, (1, 1, s, s), device)?.to_dtype(dtype)
-}
-
 /// The composed CPU forward: gather `Q`/`K`/`V` out of `qkv` into
 /// `[batch*heads, seq, head_dim]` contiguous buffers (fixed ascending
 /// `(batch, seq, heads)` gather order — family J), RoPE-rotate `Q`/`K`
@@ -564,19 +605,23 @@ fn build_band_tensor(
 /// `candle_core::Tensor::matmul` issues), per-row mask-add-then-softmax
 /// (reusing [`softmax_row_f32`] directly — bit-exact to
 /// [`super::SoftmaxLastDimFused`]'s own CPU math), batched `PV`, then
-/// scatter back to `[batch, seq, heads*head_dim]`.
+/// scatter back to `[batch, seq, heads*head_dim]`. `mask` here is ALREADY
+/// the caller's combined padding-plus-band sum (see the module doc's
+/// "window is construction data at the call site" section) — this
+/// function computes no band predicate of its own, unlike earlier
+/// revisions.
 #[allow(clippy::too_many_arguments)]
 fn attention_fwd_f32(
     qkv: &[f32],
     rope: Option<(&[f32], usize)>,
     mask: &[f32],
     mask_batch: usize,
+    mask_query_rows: usize,
     b: usize,
     s: usize,
     h: usize,
     d: usize,
     scale: f32,
-    half_window: Option<usize>,
     policy: FullyMaskedPolicy,
 ) -> Result<Vec<f32>> {
     let bh = b * h;
@@ -646,19 +691,29 @@ fn attention_fwd_f32(
     };
 
     let mut p = vec![0f32; bh * s * s];
-    let mut combined = vec![0f32; s];
+    // `mask`'s own flat layout is `[mask_batch, 1, mask_query_rows, s]`
+    // row-major (the SAME leading-axis broadcast class
+    // `super::softmax::softmax_dims` validates for `SoftmaxLastDimFused`
+    // — see `check_mask`'s doc): a batch element's own row block starts at
+    // `bi * mask_query_rows * s` (`0` when `mask_batch == 1`, broadcasting
+    // over every batch element — this is the exact indexing audit item B2
+    // named: an `mrow_base` that stayed hardcoded to `0` regardless of
+    // `mask_batch` would silently broadcast batch element 0's mask onto
+    // every OTHER batch element too, a bug this function's own oracle
+    // (`cpu_fwd_per_batch_mask_row_indexing_is_not_hardcoded_to_zero`)
+    // exercises directly), and a query row's own row within that block
+    // starts at `qi * s` (`0` when `mask_query_rows == 1`, broadcasting
+    // over every query position — the padding-only global-layer shape).
     for bh_i in 0..bh {
         let bi = bh_i / h;
-        let mrow_base = if mask_batch == 1 { 0 } else { bi * s };
+        let mrow_base = if mask_batch == 1 {
+            0
+        } else {
+            bi * mask_query_rows * s
+        };
         for qi in 0..s {
-            for ki in 0..s {
-                let pad = mask[mrow_base + ki];
-                let band = match half_window {
-                    Some(hw) if qi.abs_diff(ki) > hw => WINDOW_MASKED_VALUE,
-                    _ => 0.0,
-                };
-                combined[ki] = pad + band;
-            }
+            let qrow_base = if mask_query_rows == 1 { 0 } else { qi * s };
+            let mrow = &mask[mrow_base + qrow_base..mrow_base + qrow_base + s];
             let srow = &scores[(bh_i * s + qi) * s..(bh_i * s + qi + 1) * s];
             let prow = &mut p[(bh_i * s + qi) * s..(bh_i * s + qi + 1) * s];
             // scale is already folded into `q` above (the same fold the
@@ -667,7 +722,7 @@ fn attention_fwd_f32(
             // no second scaling, matching the module doc's "fold 1/√d into
             // Q, pass scale=1.0 to softmax" resolution (exact power of two,
             // bit-exact either way it is applied).
-            softmax_row_f32(srow, &combined, prow, policy, 1.0);
+            softmax_row_f32(srow, mrow, prow, policy, 1.0);
         }
     }
 
@@ -698,7 +753,7 @@ fn attention_fwd_f32(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::{Device, Var};
+    use candle_core::{DType, Device, Var};
 
     /// Mirrors `LowRankResidualLinear`'s own `is_gemm_operand_admissible`
     /// (candle-core 0.11.0's `cuda_backend::gemm_config`,
@@ -834,13 +889,43 @@ mod tests {
         qkv.apply_op3(rope_pack, mask, op)
     }
 
+    /// TEST-ONLY: builds the `[1, 1, seq, seq]` sliding-window band a
+    /// local-attention CALLER combines with its padding mask before
+    /// invoking [`AttentionBlockFused`] — this op itself has no `window`
+    /// construction data and computes no band predicate of its own (see
+    /// the module doc's "window is construction data at the call site"
+    /// section); this is the test suite's own stand-in for what
+    /// `jammi_encoders::mask::sliding_window_mask` does at the real call
+    /// site, kept here (not imported — family L: this crate names no
+    /// consumer) purely to build EXPECTED values.
+    fn test_sliding_window_band(
+        s: usize,
+        half_window: usize,
+        dtype: candle_core::DType,
+        device: &candle_core::Device,
+    ) -> Result<Tensor> {
+        let mut band = vec![0f32; s * s];
+        for qi in 0..s {
+            for ki in 0..s {
+                if qi.abs_diff(ki) > half_window {
+                    band[qi * s + ki] = WINDOW_MASKED_VALUE;
+                }
+            }
+        }
+        Tensor::from_vec(band, (1, 1, s, s), device)?.to_dtype(dtype)
+    }
+
     /// A small deterministic eager reference, built from the SAME
     /// conceptual steps this op's forward composes (RoPE, scale-fold,
     /// `QKᵀ`, mask-add, softmax, `PV`), via ordinary `Tensor` ops —
     /// EXACTLY the shape `ops::softmax::tests::eager`/`ops::rope::tests`
     /// use as their own comparison targets. Assembled here rather than
     /// imported from `jammi-encoders` (family L: this crate names no
-    /// consumer).
+    /// consumer). `mask` here is the CALLER's already-combined mask (the
+    /// SAME value [`fused`]'s own `mask` argument gets) — this function
+    /// does no band-building itself; callers that want a window arm build
+    /// one via [`test_sliding_window_band`] and combine it in first,
+    /// mirroring [`AttentionBlockFused`]'s own real call site.
     #[allow(clippy::too_many_arguments)]
     fn eager_reference(
         q0: &Tensor,
@@ -849,7 +934,6 @@ mod tests {
         cos: Option<&Tensor>,
         sin: Option<&Tensor>,
         mask: &Tensor,
-        window: Option<usize>,
         scale: f32,
         policy: FullyMaskedPolicy,
     ) -> Result<Tensor> {
@@ -865,14 +949,7 @@ mod tests {
             .contiguous()?
             .matmul(&k.transpose(D::Minus1, D::Minus2)?.contiguous()?)?
             * f64::from(scale))?;
-        let combined_mask = match window {
-            Some(hw) => {
-                let band = build_band_tensor(s, hw, mask.dtype(), mask.device())?;
-                mask.broadcast_add(&band)?
-            }
-            None => mask.clone(),
-        };
-        let p = apply2(&scores, &combined_mask, SoftmaxLastDimFused::new(policy))?;
+        let p = apply2(&scores, mask, SoftmaxLastDimFused::new(policy))?;
         let ctx = p.matmul(&v0.contiguous()?)?;
         ctx.transpose(1, 2)?.contiguous()?.reshape((b, s, h * d))
     }
@@ -930,7 +1007,6 @@ mod tests {
             None,
             None,
             &mask,
-            None,
             scale,
             FullyMaskedPolicy::Propagate,
         )
@@ -939,8 +1015,7 @@ mod tests {
         let qkv = qkv_from(&q0, &k0, &v0).unwrap();
         let (cos, sin) = rope_tables(s, d, &device); // unused (rope=false) but still a valid pack
         let rope_pack = pack_rope(&cos, &sin).unwrap();
-        let op =
-            AttentionBlockFused::new(scale, None, FullyMaskedPolicy::Propagate, false).unwrap();
+        let op = AttentionBlockFused::new(scale, FullyMaskedPolicy::Propagate, false).unwrap();
         let got = fused(&qkv, &rope_pack, &mask, op).unwrap();
 
         let e: Vec<f32> = expected.flatten_all().unwrap().to_vec1().unwrap();
@@ -967,14 +1042,15 @@ mod tests {
         let half_window = 2usize;
 
         let (cos, sin) = rope_tables(s, d, &device);
+        let band = test_sliding_window_band(s, half_window, mask.dtype(), mask.device()).unwrap();
+        let combined_mask = mask.broadcast_add(&band).unwrap();
         let expected = eager_reference(
             &q0,
             &k0,
             &v0,
             Some(&cos),
             Some(&sin),
-            &mask,
-            Some(half_window),
+            &combined_mask,
             scale,
             FullyMaskedPolicy::Zeros,
         )
@@ -982,14 +1058,8 @@ mod tests {
 
         let qkv = qkv_from(&q0, &k0, &v0).unwrap();
         let rope_pack = pack_rope(&cos, &sin).unwrap();
-        let op = AttentionBlockFused::new(
-            scale,
-            Some(half_window as u32),
-            FullyMaskedPolicy::Zeros,
-            true,
-        )
-        .unwrap();
-        let got = fused(&qkv, &rope_pack, &mask, op).unwrap();
+        let op = AttentionBlockFused::new(scale, FullyMaskedPolicy::Zeros, true).unwrap();
+        let got = fused(&qkv, &rope_pack, &combined_mask, op).unwrap();
 
         let e: Vec<f32> = expected.flatten_all().unwrap().to_vec1().unwrap();
         let g: Vec<f32> = got.flatten_all().unwrap().to_vec1().unwrap();
@@ -1020,7 +1090,7 @@ mod tests {
         let qkv = qkv_from(&q0, &k0, &v0).unwrap();
         let (cos, sin) = rope_tables(s, d, &device);
         let rope_pack = pack_rope(&cos, &sin).unwrap();
-        let op = AttentionBlockFused::new(scale, None, FullyMaskedPolicy::Zeros, false).unwrap();
+        let op = AttentionBlockFused::new(scale, FullyMaskedPolicy::Zeros, false).unwrap();
         let got = fused(&qkv, &rope_pack, &mask, op).unwrap();
         let g: Vec<f32> = got.flatten_all().unwrap().to_vec1().unwrap();
         assert!(g.iter().all(|&x| x == 0.0), "{g:?}");
@@ -1034,22 +1104,26 @@ mod tests {
         let mask = zero_mask(b, s, &device);
         let (cos, sin) = rope_tables(s, d, &device);
         let rope_pack = pack_rope(&cos, &sin).unwrap();
-        let op = AttentionBlockFused::new(0.1, None, FullyMaskedPolicy::Propagate, false).unwrap();
+        let op = AttentionBlockFused::new(0.125, FullyMaskedPolicy::Propagate, false).unwrap();
         let err = fused(&qkv, &rope_pack, &mask, op).expect_err("head_dim != 64 must be refused");
         assert!(matches!(err, Error::Msg(_)));
     }
 
+    /// A mask whose query-row axis is neither `1` nor `seq` (the ONE new
+    /// domain this op's `mask` gained under the band-as-input redesign —
+    /// see `check_mask`'s doc) is refused, not silently mis-broadcast.
     #[test]
-    fn window_at_or_above_seq_is_refused() {
+    fn mask_query_row_axis_outside_one_or_seq_is_refused() {
         let device = Device::Cpu;
-        let (b, s, h, d) = (1usize, 4usize, 1usize, HEAD_DIM);
+        let (b, s, h, d) = (1usize, 6usize, 1usize, HEAD_DIM);
         let qkv = Tensor::zeros((b, s, 3, h, d), DType::F32, &device).unwrap();
-        let mask = zero_mask(b, s, &device);
+        // query-row axis = 3, neither 1 nor seq=6.
+        let mask = Tensor::zeros((b, 1, 3, s), DType::F32, &device).unwrap();
         let (cos, sin) = rope_tables(s, d, &device);
         let rope_pack = pack_rope(&cos, &sin).unwrap();
-        let op =
-            AttentionBlockFused::new(0.1, Some(4), FullyMaskedPolicy::Propagate, false).unwrap();
-        let err = fused(&qkv, &rope_pack, &mask, op).expect_err("window >= seq must be refused");
+        let op = AttentionBlockFused::new(0.125, FullyMaskedPolicy::Propagate, false).unwrap();
+        let err =
+            fused(&qkv, &rope_pack, &mask, op).expect_err("mask query-row axis 3 must be refused");
         assert!(matches!(err, Error::Msg(_)));
     }
 
@@ -1061,7 +1135,7 @@ mod tests {
         let mask = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
         let (cos, sin) = rope_tables(1, d, &device);
         let rope_pack = pack_rope(&cos, &sin).unwrap();
-        let op = AttentionBlockFused::new(0.1, None, FullyMaskedPolicy::Propagate, false).unwrap();
+        let op = AttentionBlockFused::new(0.125, FullyMaskedPolicy::Propagate, false).unwrap();
         let got = fused(&qkv, &rope_pack, &mask, op).unwrap();
         assert_eq!(got.elem_count(), 0);
     }
@@ -1084,7 +1158,7 @@ mod tests {
         let (cos, sin) = rope_tables(s, d, &device);
         let rope_pack = pack_rope(&cos, &sin).unwrap();
         let scale = 1.0 / (d as f32).sqrt();
-        let op = AttentionBlockFused::new(scale, None, FullyMaskedPolicy::Propagate, true).unwrap();
+        let op = AttentionBlockFused::new(scale, FullyMaskedPolicy::Propagate, true).unwrap();
 
         let out = fused(qkv.as_tensor(), &rope_pack, &mask, op).unwrap();
         let grads = out.sum_all().unwrap().backward().unwrap();
@@ -1134,7 +1208,7 @@ mod tests {
         let rope_pack = Var::from_tensor(&pack_rope(&cos, &sin).unwrap()).unwrap();
         let mask = zero_mask(b, s, &device);
         let scale = 1.0 / (d as f32).sqrt();
-        let op = AttentionBlockFused::new(scale, None, FullyMaskedPolicy::Propagate, true).unwrap();
+        let op = AttentionBlockFused::new(scale, FullyMaskedPolicy::Propagate, true).unwrap();
         let out = fused(qkv.as_tensor(), rope_pack.as_tensor(), &mask, op).unwrap();
         let err = out.sum_all().unwrap().backward().expect_err(
             "a tracked rope_pack must make backward fail loudly, not silently drop its gradient",

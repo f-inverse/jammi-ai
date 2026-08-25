@@ -540,17 +540,22 @@ pub(crate) static ATTENTION_BLOCK_DISPATCH_COUNTERS: DispatchCounters = Dispatch
 /// refuses a strided `qkv`, same idiom as every other op in this crate),
 /// `head_dim` is exactly [`ATTENTION_BLOCK_HEAD_DIM`] (`AttentionBlockFused`'s
 /// own fixed domain — see that op's module doc's "Fixed domain" section),
-/// `seq` is nonzero and within [`ATTENTION_BLOCK_MAX_SEQ`], and
-/// `extended_mask` is contiguous and shaped `[batch|1, 1, 1, seq]` (the
-/// padding-only mask this op's own domain requires — the window band is
-/// NEVER passed as a tensor to this predicate or this op; it is
-/// `ModernBertAttention::half_window`, construction data).
+/// `seq` is nonzero and within [`ATTENTION_BLOCK_MAX_SEQ`], `extended_mask`
+/// (the padding mask ALONE, before any band is folded in — this op has no
+/// `window` construction data of its own; the caller combines padding and
+/// band into ONE tensor before calling it, see
+/// [`ModernBertAttention::forward_training_attention`]'s doc) is contiguous
+/// and shaped `[batch|1, 1, 1, seq]`, and — on a local layer only —
+/// `local_band` is present, contiguous, and shaped `[1, 1, seq, seq]` (the
+/// exact shape [`crate::mask::sliding_window_mask`] produces).
 fn attention_block_admission_predicate(
     qkv: &Tensor,
     seq: usize,
     _h: usize,
     d: usize,
     extended_mask: &Tensor,
+    is_local: bool,
+    local_band: Option<&Tensor>,
 ) -> (bool, &'static str) {
     if !device_is_supported(qkv.device()) {
         return (false, "device_is_cpu_or_cuda");
@@ -574,6 +579,18 @@ fn attention_block_admission_predicate(
     if m_dims.len() != 4 || m_dims[1] != 1 || m_dims[2] != 1 || m_dims[3] != seq {
         return (false, "mask_shape_batch_or_one_1_1_seq");
     }
+    if is_local {
+        let Some(band) = local_band else {
+            return (false, "local_band_present");
+        };
+        if !band.is_contiguous() {
+            return (false, "local_band_contiguous");
+        }
+        let b_dims = band.dims();
+        if b_dims != [1, 1, seq, seq] {
+            return (false, "local_band_shape_1_1_seq_seq");
+        }
+    }
     (true, "domain_ok")
 }
 
@@ -590,11 +607,6 @@ struct ModernBertAttention {
     /// the whole sequence. The band itself is built once per forward and passed
     /// in, since it depends only on the sequence length.
     is_local: bool,
-    /// `half_window`, mirrored from `ModernBertConfig::half_window()` at
-    /// build time: `Some` iff `is_local`. Construction data for
-    /// [`AttentionBlockFused::window`] — the fused call site reads this
-    /// directly rather than deriving it from `local_band`'s own shape.
-    half_window: Option<usize>,
     num_heads: usize,
     head_dim: usize,
     /// Whether the fused RoPE kernel may be attempted on Q/K (still gated
@@ -732,8 +744,15 @@ impl ModernBertAttention {
             ));
         }
         let extended_mask = extended_mask.to_dtype(qkv.dtype())?;
-        let (holds, predicate) =
-            attention_block_admission_predicate(qkv, seq, h, d, &extended_mask);
+        let (holds, predicate) = attention_block_admission_predicate(
+            qkv,
+            seq,
+            h,
+            d,
+            &extended_mask,
+            self.is_local,
+            local_band,
+        );
         let outcome = admit(
             admission_mode(),
             "attention_block_fused",
@@ -745,14 +764,33 @@ impl ModernBertAttention {
             DispatchOutcome::Fused => {
                 let qkv5 = qkv.reshape((batch, seq, 3, h, d))?;
                 let rope_pack = self.rope.cached_rope_pack(qkv.dtype())?;
-                let window = self.half_window.map(|w| w as u32);
+                // `AttentionBlockFused` has no `window` construction data —
+                // the combined padding-plus-band mask is built ONCE here
+                // and passed as the op's ONE `mask` argument (see that
+                // op's module doc's "window is construction data at the
+                // call site" section). `local_band` is `Some` here iff
+                // `self.is_local` (the admission predicate above already
+                // checked that pairing), so this mirrors the SAME
+                // combination `forward_eager_training_attention_composition`'s
+                // own training arm builds, independently, on its own
+                // fallback path.
+                let combined_mask = match (self.is_local, local_band) {
+                    (true, Some(band)) => {
+                        extended_mask.broadcast_add(&band.to_dtype(extended_mask.dtype())?)?
+                    }
+                    (true, None) => {
+                        return Err(EncoderError::Config(
+                            "local-attention layer reached without a sliding-window band".into(),
+                        ))
+                    }
+                    (false, _) => extended_mask.clone(),
+                };
                 let op = AttentionBlockFused::new(
                     1.0 / (d as f32).sqrt(),
-                    window,
                     FullyMaskedPolicy::Zeros,
                     true,
                 )?;
-                Ok(apply3(&qkv5, &rope_pack, &extended_mask, op)?)
+                Ok(apply3(&qkv5, &rope_pack, &combined_mask, op)?)
             }
             DispatchOutcome::Eager => self.forward_eager_training_attention_composition(
                 qkv,
@@ -1558,7 +1596,6 @@ impl<'a> ModernBertBuilder<'a> {
                     attn_norm,
                     rope,
                     is_local,
-                    half_window: is_local.then(|| config.half_window()),
                     num_heads: config.num_attention_heads,
                     head_dim,
                     training: false,
@@ -2604,7 +2641,6 @@ mod tests {
     /// weights are placeholder zeros.
     fn attention_block_fixture(
         is_local: bool,
-        half_window: Option<usize>,
         h: usize,
         seq_for_table: usize,
         device: &Device,
@@ -2625,7 +2661,6 @@ mod tests {
             attn_norm: None,
             rope: Arc::new(rope(d, seq_for_table, 10_000.0, device)),
             is_local,
-            half_window,
             num_heads: h,
             head_dim: d,
             training: true,
@@ -2638,7 +2673,8 @@ mod tests {
         let (b, s, h, d) = (1usize, 4usize, 2usize, ATTENTION_BLOCK_HEAD_DIM);
         let qkv = Tensor::zeros((b, s, 3, h, d), DType::F32, &device).unwrap();
         let mask = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
-        let (holds, predicate) = attention_block_admission_predicate(&qkv, s, h, d, &mask);
+        let (holds, predicate) =
+            attention_block_admission_predicate(&qkv, s, h, d, &mask, false, None);
         assert!(holds, "predicate={predicate}");
     }
 
@@ -2648,9 +2684,34 @@ mod tests {
         let (b, s, h, d) = (1usize, 4usize, 2usize, 16usize);
         let qkv = Tensor::zeros((b, s, 3, h, d), DType::F32, &device).unwrap();
         let mask = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
-        let (holds, predicate) = attention_block_admission_predicate(&qkv, s, h, d, &mask);
+        let (holds, predicate) =
+            attention_block_admission_predicate(&qkv, s, h, d, &mask, false, None);
         assert!(!holds);
         assert_eq!(predicate, "head_dim_is_attention_block_fixed_head_dim");
+    }
+
+    #[test]
+    fn attention_block_admission_predicate_rejects_missing_local_band() {
+        let device = Device::Cpu;
+        let (b, s, h, d) = (1usize, 4usize, 2usize, ATTENTION_BLOCK_HEAD_DIM);
+        let qkv = Tensor::zeros((b, s, 3, h, d), DType::F32, &device).unwrap();
+        let mask = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
+        let (holds, predicate) =
+            attention_block_admission_predicate(&qkv, s, h, d, &mask, true, None);
+        assert!(!holds);
+        assert_eq!(predicate, "local_band_present");
+    }
+
+    #[test]
+    fn attention_block_admission_predicate_accepts_a_local_band_shaped_1_1_seq_seq() {
+        let device = Device::Cpu;
+        let (b, s, h, d) = (1usize, 4usize, 2usize, ATTENTION_BLOCK_HEAD_DIM);
+        let qkv = Tensor::zeros((b, s, 3, h, d), DType::F32, &device).unwrap();
+        let mask = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
+        let band = sliding_window_mask(s, 1, &device).unwrap();
+        let (holds, predicate) =
+            attention_block_admission_predicate(&qkv, s, h, d, &mask, true, Some(&band));
+        assert!(holds, "predicate={predicate}");
     }
 
     /// Global-attention arm: the fused whole-attention-block forward must
@@ -2670,8 +2731,9 @@ mod tests {
         let qkv = Tensor::from_slice(&qkv_v, (b, s, 3 * h * d), &device).unwrap();
         let mask = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
 
-        let attn = attention_block_fixture(false, None, h, s, &device);
-        let (holds, predicate) = attention_block_admission_predicate(&qkv, s, h, d, &mask);
+        let attn = attention_block_fixture(false, h, s, &device);
+        let (holds, predicate) =
+            attention_block_admission_predicate(&qkv, s, h, d, &mask, false, None);
         assert!(holds, "predicate={predicate}");
 
         let before = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
@@ -2708,8 +2770,9 @@ mod tests {
         let mask = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
         let band = sliding_window_mask(s, half_window, &device).unwrap();
 
-        let attn = attention_block_fixture(true, Some(half_window), h, s, &device);
-        let (holds, predicate) = attention_block_admission_predicate(&qkv, s, h, d, &mask);
+        let attn = attention_block_fixture(true, h, s, &device);
+        let (holds, predicate) =
+            attention_block_admission_predicate(&qkv, s, h, d, &mask, true, Some(&band));
         assert!(holds, "predicate={predicate}");
 
         let before = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
@@ -2752,7 +2815,7 @@ mod tests {
         let n = b * s * 3 * h * d;
         let qkv_v: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.11).sin()).collect();
         let mask = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
-        let attn = attention_block_fixture(false, None, h, s, &device);
+        let attn = attention_block_fixture(false, h, s, &device);
 
         let qkv_eager =
             Var::from_tensor(&Tensor::from_slice(&qkv_v, (b, s, 3 * h * d), &device).unwrap())

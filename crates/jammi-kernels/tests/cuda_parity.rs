@@ -33,7 +33,7 @@ use half::bf16;
 use jammi_kernels::ops::{
     apply1, apply2, apply3, AttentionBlockFused, Axpy, DropoutFused, DropoutKey, FullyMaskedPolicy,
     GegluFused, GeluVariant, LayerNormFused, LowRankResidualLinear, PhiloxKatProbe, RopeFused,
-    ScaledCastAdd, SoftmaxLastDimFused,
+    ScaledCastAdd, SoftmaxLastDimFused, ATTENTION_BLOCK_WINDOW_MASKED_VALUE,
 };
 
 fn axpy(alpha: f64, x: &Tensor, y: &Tensor) -> candle_core::Result<Tensor> {
@@ -3800,6 +3800,54 @@ fn qkv_fixture(batch: usize, seq: usize, heads: usize, head_dim: usize, seed: f3
     fixture(batch * seq * 3 * heads * head_dim, seed)
 }
 
+/// The `[1, 1, seq, seq]` sliding-window band flattened, TEST-SIDE
+/// construction of what a real call site (`jammi_encoders::mask::
+/// sliding_window_mask`) combines into its padding mask BEFORE calling
+/// `AttentionBlockFused` — this op itself has no `window` construction
+/// data (see its own module doc's "window is construction data at the
+/// call site" section), so this file's own oracle builds and combines the
+/// band exactly the way that real call site does.
+fn attention_window_band(seq: usize, half_window: usize) -> Vec<f32> {
+    let mut band = vec![0f32; seq * seq];
+    for qi in 0..seq {
+        for ki in 0..seq {
+            if qi.abs_diff(ki) > half_window {
+                band[qi * seq + ki] = ATTENTION_BLOCK_WINDOW_MASKED_VALUE;
+            }
+        }
+    }
+    band
+}
+
+/// Combines a `[batch, seq]`-flat padding mask with an OPTIONAL
+/// `[seq, seq]`-flat window band into the ONE tensor `AttentionBlockFused`
+/// accepts as `mask` (`[batch, 1, 1, seq]` when `window` is `None`,
+/// `[batch, 1, seq, seq]` when `Some` — see `check_mask`'s doc).
+fn combined_attention_mask(
+    device: &Device,
+    batch: usize,
+    seq: usize,
+    mask_v: &[f32],
+    window: Option<usize>,
+) -> Tensor {
+    match window {
+        None => Tensor::from_slice(mask_v, (batch, 1, 1, seq), device).unwrap(),
+        Some(hw) => {
+            let band_v = attention_window_band(seq, hw);
+            let mut combined = vec![0f32; batch * seq * seq];
+            for bi in 0..batch {
+                for qi in 0..seq {
+                    for ki in 0..seq {
+                        combined[(bi * seq + qi) * seq + ki] =
+                            mask_v[bi * seq + ki] + band_v[qi * seq + ki];
+                    }
+                }
+            }
+            Tensor::from_slice(&combined, (batch, 1, seq, seq), device).unwrap()
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn assert_attention_block_parity_f32(
     cuda: &Device,
@@ -3807,7 +3855,7 @@ fn assert_attention_block_parity_f32(
     seq: usize,
     heads: usize,
     head_dim: usize,
-    window: Option<u32>,
+    window: Option<usize>,
     qkv_v: &[f32],
 ) {
     let cpu = Device::Cpu;
@@ -3815,14 +3863,14 @@ fn assert_attention_block_parity_f32(
     let rope_v = attention_rope_pack(seq, head_dim);
     let mask_v = vec![0f32; batch * seq];
     let scale = 1.0 / (head_dim as f32).sqrt();
-    let op = AttentionBlockFused::new(scale, window, FullyMaskedPolicy::Zeros, true).unwrap();
+    let op = AttentionBlockFused::new(scale, FullyMaskedPolicy::Zeros, true).unwrap();
 
     let qkv_cpu = Var::from_tensor(
         &Tensor::from_slice(qkv_v, (batch, seq, 3, heads, head_dim), &cpu).unwrap(),
     )
     .unwrap();
     let rope_cpu = Tensor::from_slice(&rope_v, (2, 1, 1, seq, head_dim), &cpu).unwrap();
-    let mask_cpu = Tensor::from_slice(&mask_v, (batch, 1, 1, seq), &cpu).unwrap();
+    let mask_cpu = combined_attention_mask(&cpu, batch, seq, &mask_v, window);
     let out_cpu = qkv_cpu
         .as_tensor()
         .apply_op3(&rope_cpu, &mask_cpu, op)
@@ -3834,7 +3882,7 @@ fn assert_attention_block_parity_f32(
     )
     .unwrap();
     let rope_gpu = Tensor::from_slice(&rope_v, (2, 1, 1, seq, head_dim), cuda).unwrap();
-    let mask_gpu = Tensor::from_slice(&mask_v, (batch, 1, 1, seq), cuda).unwrap();
+    let mask_gpu = combined_attention_mask(cuda, batch, seq, &mask_v, window);
     let out_gpu = qkv_gpu
         .as_tensor()
         .apply_op3(&rope_gpu, &mask_gpu, op)
@@ -3925,7 +3973,7 @@ fn attention_block_parity_f32_fully_masked_row_is_zero_on_both_devices() {
     // Every key masked (padding) -> every row is fully masked (no window).
     let mask_v = vec![-10_000.0f32; batch * seq];
     let scale = 1.0 / (head_dim as f32).sqrt();
-    let op = AttentionBlockFused::new(scale, None, FullyMaskedPolicy::Zeros, true).unwrap();
+    let op = AttentionBlockFused::new(scale, FullyMaskedPolicy::Zeros, true).unwrap();
 
     let qkv_gpu = Tensor::from_slice(&qkv_v, (batch, seq, 3, heads, head_dim), &cuda).unwrap();
     let rope_gpu = Tensor::from_slice(&rope_v, (2, 1, 1, seq, head_dim), &cuda).unwrap();
@@ -3987,7 +4035,7 @@ fn attention_block_parity_bf16_cuda_vs_f32_cpu_reference() {
     let rope_v = attention_rope_pack(seq, head_dim);
     let mask_v = vec![0f32; batch * seq];
     let scale = 1.0 / (head_dim as f32).sqrt();
-    let op = AttentionBlockFused::new(scale, None, FullyMaskedPolicy::Zeros, true).unwrap();
+    let op = AttentionBlockFused::new(scale, FullyMaskedPolicy::Zeros, true).unwrap();
 
     let qkv_cpu = Tensor::from_slice(&qkv_v, (batch, seq, 3, heads, head_dim), &cpu).unwrap();
     let rope_cpu = Tensor::from_slice(&rope_v, (2, 1, 1, seq, head_dim), &cpu).unwrap();
@@ -4053,7 +4101,7 @@ fn attention_block_diag_bf16_fused_bit_exact_vs_eager_cuda() {
     let rope_v = attention_rope_pack(seq, head_dim);
     let mask_v = vec![0f32; batch * seq];
     let scale = 1.0 / (head_dim as f32).sqrt();
-    let op = AttentionBlockFused::new(scale, None, FullyMaskedPolicy::Zeros, true).unwrap();
+    let op = AttentionBlockFused::new(scale, FullyMaskedPolicy::Zeros, true).unwrap();
 
     let qkv_b: Vec<bf16> = qkv_v.iter().map(|&v| bf16::from_f32(v)).collect();
     let rope_b: Vec<bf16> = rope_v.iter().map(|&v| bf16::from_f32(v)).collect();

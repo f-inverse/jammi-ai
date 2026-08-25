@@ -50,9 +50,9 @@ use candle_core::{
 };
 
 // `pub(crate)`, not private like `axpy`/`layer_norm`/`rope`: `crate::cuda::attention_block`
-// imports `attention_dims`/`check_mask`/`check_rope_pack`/`check_window` directly
-// from here (the SAME domain checks the CPU arm applies), mirroring
-// `ops::softmax`'s identical `pub(crate)` rationale.
+// imports `attention_dims`/`check_mask`/`check_rope_pack` directly from here
+// (the SAME domain checks the CPU arm applies), mirroring `ops::softmax`'s
+// identical `pub(crate)` rationale.
 pub(crate) mod attention_block;
 mod axpy;
 mod dropout;
@@ -78,6 +78,16 @@ pub const ATTENTION_BLOCK_HEAD_DIM: usize = attention_block::HEAD_DIM;
 /// See [`ATTENTION_BLOCK_HEAD_DIM`]'s doc for why this is a real `const`
 /// definition here rather than a `pub use ... as` rename.
 pub const ATTENTION_BLOCK_MAX_SEQ: usize = attention_block::MAX_SEQ;
+/// See [`ATTENTION_BLOCK_HEAD_DIM`]'s doc for the re-export shape. A call
+/// site combining its own padding mask with a sliding-window band before
+/// calling [`AttentionBlockFused`] (the op has no `window` construction
+/// data of its own — see that op's module doc) needs this SAME sentinel
+/// so the combined mask's out-of-window contribution matches what
+/// [`AttentionBlockFused`]'s own `< 0.0` fully-masked-row rule expects;
+/// pinned by value, not merely by sign, so a caller can assert the two
+/// crates agree exactly (family F: a measured, asserted equality, not an
+/// assumed one).
+pub const ATTENTION_BLOCK_WINDOW_MASKED_VALUE: f32 = attention_block::WINDOW_MASKED_VALUE;
 pub use axpy::Axpy;
 pub use dropout::{DropoutFused, PhiloxKatProbe};
 pub use geglu::{GegluFused, GeluVariant};

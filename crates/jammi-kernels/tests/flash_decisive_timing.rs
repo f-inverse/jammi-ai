@@ -128,7 +128,7 @@ fn stats(mut samples: Vec<f64>) -> Stats {
     samples.sort_by(|a, b| a.total_cmp(b));
     let n = samples.len();
     let mean = samples.iter().sum::<f64>() / n as f64;
-    let median = if n % 2 == 0 {
+    let median = if n.is_multiple_of(2) {
         (samples[n / 2 - 1] + samples[n / 2]) / 2.0
     } else {
         samples[n / 2]

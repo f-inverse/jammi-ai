@@ -130,7 +130,7 @@ macro_rules! queue_catalog {
 /// Two concurrent claims against a single queued job run on separate tasks of a
 /// multi-thread runtime: exactly one wins, the other sees an empty queue. The
 /// winner's record is `running`, leased to it, and `attempts` is incremented to
-/// 1. Spawning the claims as distinct tasks (rather than `tokio::join!`, which
+/// one. Spawning the claims as distinct tasks (rather than `tokio::join!`, which
 /// interleaves two futures on one task deterministically) puts the Postgres
 /// `FOR UPDATE SKIP LOCKED` path under real lock contention.
 #[test_case(BackendKind::Sqlite ; "sqlite")]

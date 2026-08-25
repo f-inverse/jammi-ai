@@ -2255,48 +2255,119 @@ mod device_tests {
         fn exit(&self, _: &tracing::span::Id) {}
     }
 
+    /// Whether a CUDA device actually initializes in this process right now —
+    /// probed the exact way [`select_device`] probes it (`Device::new_cuda`),
+    /// never inferred from the `cuda` feature flag. The flag only says the
+    /// *code path* to try CUDA was compiled in; CI's compile-check lane
+    /// builds `--features cuda` on a box with no GPU, so the flag alone
+    /// cannot decide which arm of the tests below is meaningful — only an
+    /// actual device-open attempt can. `Device::new_cuda` itself always
+    /// compiles regardless of the feature (candle-core falls back to a dummy
+    /// backend that unconditionally errors when its own `cuda` feature is
+    /// off), so this probe is safe to call in every build configuration.
+    fn gpu_actually_present() -> bool {
+        Device::new_cuda(0).is_ok()
+    }
+
+    /// Shared assertion for the "a real device opened" arm, used by both
+    /// `require_gpu=true` and `require_gpu=false` below: once
+    /// `Device::new_cuda` in [`select_device`] succeeds, `require_gpu` plays
+    /// no further role — the only remaining outcomes are `Ok(Device::Cuda)`
+    /// or a driver/arch admission-floor rejection (`check_driver_floor`,
+    /// `check_compute_cap_floor`, boundary-tested without hardware just
+    /// below), never a silent CPU downgrade and never the "no usable GPU was
+    /// found" message that only `gpu_unavailable`'s device-absent path emits.
+    fn assert_present_device_outcome(outcome: Result<Device>, warned: bool) {
+        match outcome {
+            Ok(Device::Cuda(_)) => {
+                assert!(
+                    !warned,
+                    "a present GPU was selected; no CPU-fallback warning should fire"
+                );
+            }
+            Err(JammiError::Gpu(msg)) => {
+                assert!(
+                    !msg.contains("no usable GPU was found"),
+                    "device is present; must not claim absence: {msg}"
+                );
+                assert!(
+                    !warned,
+                    "a present-but-floor-rejected GPU must not also claim the CPU-fallback path fired"
+                );
+            }
+            other => panic!(
+                "device present: expected Device::Cuda or a floor-rejection Gpu error, got {other:?}"
+            ),
+        }
+    }
+
+    /// `require_gpu=true` must never silently serve on CPU, on any box.
+    ///
+    /// Two arms, chosen by [`gpu_actually_present`] (a runtime probe of
+    /// whether CUDA truly initializes), not by the `cuda` feature flag —
+    /// `--features cuda` compiles on a GPU-less box too (CI's compile-check
+    /// lane), so the feature alone doesn't tell us whether a device is
+    /// really there:
+    /// - **No device** (the default CPU CI lane, or a `cuda`-feature build
+    ///   with no hardware): selection must surface a typed [`JammiError::Gpu`]
+    ///   naming the requirement, not fall back to CPU.
+    /// - **Device present** (a real GPU pod): selection must actually select
+    ///   the GPU — see [`assert_present_device_outcome`].
     #[test]
-    fn require_gpu_without_device_fails_fast() {
+    fn require_gpu_reflects_device_presence() {
         let config = DeviceConfig {
             gpu_device: 0,
             memory_fraction: 0.9,
             require_gpu: true,
             compute_precision: jammi_numerics::ComputePrecision::F32,
         };
-        // On a host with no usable GPU (and on the default non-accelerator
-        // build), selection must surface a typed GPU error rather than serving
-        // on CPU.
-        match select_device(&config) {
-            Err(JammiError::Gpu(msg)) => {
-                assert!(msg.contains("GPU required"), "unexpected message: {msg}");
+        let outcome = select_device(&config);
+        if gpu_actually_present() {
+            assert_present_device_outcome(outcome, false);
+        } else {
+            match outcome {
+                Err(JammiError::Gpu(msg)) => {
+                    assert!(msg.contains("GPU required"), "unexpected message: {msg}");
+                }
+                other => panic!("no device present: expected JammiError::Gpu, got {other:?}"),
             }
-            other => panic!("expected JammiError::Gpu, got {other:?}"),
         }
     }
 
+    /// The default (`require_gpu=false`) path degrades to CPU *only* when
+    /// there truly is no GPU — and warns loudly when it does. On a real GPU
+    /// pod it must select the GPU without a fallback warning, never
+    /// downgrade a present device to CPU.
+    ///
+    /// Same two arms as [`require_gpu_reflects_device_presence`], gated on
+    /// [`gpu_actually_present`] rather than the `cuda` feature flag for the
+    /// same compile-check-lane reason.
     #[test]
-    fn default_without_device_falls_back_to_cpu_with_warning() {
+    fn default_reflects_device_presence() {
         let capture = WarnCapture::default();
         let flag = Arc::clone(&capture.saw_fallback_warning);
+        let present = gpu_actually_present();
 
-        let device = tracing::subscriber::with_default(capture, || {
+        let outcome = tracing::subscriber::with_default(capture, || {
             let config = DeviceConfig {
                 gpu_device: 0,
                 memory_fraction: 0.9,
                 require_gpu: false,
                 compute_precision: jammi_numerics::ComputePrecision::F32,
             };
-            select_device(&config).expect("default fallback must not error")
+            select_device(&config)
         });
+        let warned = flag.load(Ordering::SeqCst);
 
-        assert!(
-            matches!(device, Device::Cpu),
-            "expected CPU fallback, got {device:?}"
-        );
-        assert!(
-            flag.load(Ordering::SeqCst),
-            "expected a loud warn-level CPU-fallback log"
-        );
+        if present {
+            assert_present_device_outcome(outcome, warned);
+        } else {
+            assert!(
+                matches!(outcome, Ok(Device::Cpu)),
+                "expected CPU fallback, got {outcome:?}"
+            );
+            assert!(warned, "expected a loud warn-level CPU-fallback log");
+        }
     }
 
     /// The PTX-ISA driver floor (#304): a driver below the CUDA 12.6 line the

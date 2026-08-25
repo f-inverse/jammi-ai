@@ -230,14 +230,34 @@ mod tests {
         assert_eq!(sched.available(), usize::MAX);
     }
 
-    /// When the device cannot be probed — which is always true in the hermetic
-    /// CPU test build, where `detect_gpu_memory` reports no CUDA runtime —
-    /// `for_device` degrades to unlimited rather than fabricating a budget.
-    #[cfg(not(feature = "cuda"))]
+    /// `for_device` must reflect whether the probe actually succeeds, not
+    /// whether the `cuda` feature happens to be compiled in.
+    ///
+    /// Two arms, chosen by [`GpuScheduler::detect_gpu_memory`] itself (the
+    /// exact probe `for_device` calls), not by `#[cfg(feature = "cuda")]`:
+    /// `--features cuda` compiles on a GPU-less box too (CI's compile-check
+    /// lane), where the probe still fails, so a feature-gated test would
+    /// either assume absence wrongly or — as the previous
+    /// `#[cfg(not(feature = "cuda"))]` version of this test did — simply not
+    /// run at all under `--features cuda`, leaving both the compile-check
+    /// lane and a real GPU pod unverified.
+    /// - **No device** (hermetic CPU build, or a `cuda`-feature build with no
+    ///   hardware/driver): the probe errs, so `for_device` must degrade to
+    ///   unlimited rather than fabricating a budget.
+    /// - **Device present** (a real GPU pod): the probe succeeds, so
+    ///   `for_device` must enable real memory-budget admission, not the
+    ///   unlimited pass-through.
     #[test]
-    fn for_device_falls_back_to_unlimited_when_probe_fails() {
+    fn for_device_reflects_probe_presence() {
         let sched = GpuScheduler::for_device(0, 0.9);
-        assert!(sched.unlimited);
+        if GpuScheduler::detect_gpu_memory(0).is_ok() {
+            assert!(
+                !sched.unlimited,
+                "a real, probed GPU must enable memory-budget admission, not unlimited pass-through"
+            );
+        } else {
+            assert!(sched.unlimited);
+        }
     }
 
     /// `memory_fraction` maps to usable budget: with a 1 GiB card and 0.9,

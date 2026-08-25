@@ -51,6 +51,12 @@ def jammi_fs(dispatches, **overrides):
     fs = {
         "device": "cpu",
         "device_name": "cpu",
+        # `seed` is new this round (`crates/jammi-bench/src/report.rs`'s
+        # `FinetuneStepTier::seed` field): the leg-premise check below reads
+        # it directly off THIS sub-block for a jammi leg (jammi's own
+        # `finetune_step.rs` carries it inline, unlike torch's — see
+        # `torch_fs`'s own doc for why torch's lives one level up).
+        "seed": 42,
         "backbone_dtype": "bf16",
         "batch": 8,
         "seq": 128,
@@ -98,7 +104,19 @@ def drop_dispatch_keys(*bases):
     return overrides
 
 
-def torch_fs(**overrides):
+def torch_fs(seed=42, attn_requested="sdpa", **overrides):
+    """Builds the FULL top-level `torch_finetune_step.py` report shape, not
+    just the `finetune_step` sub-block: `seed`/`attn_requested` live under
+    `report["args"]` on the REAL torch producer (`torch_finetune_step.py`'s
+    own report literal), never inside `report["finetune_step"]` — the leg-
+    premise check reads jammi's `seed` off `finetune_step.rs`'s own
+    `FinetuneStepTier` (one level down, see `jammi_fs`'s doc) and torch's
+    off `args.seed` (one level UP) precisely because the two real producers
+    do not put it in the same place; this fixture mirrors that asymmetry
+    rather than flattening it away, matching the REAL producer's own shape.
+    `**overrides` still lands in the `finetune_step` sub-block (e.g.
+    `attn_implementation="eager"`), unchanged from before this round.
+    """
     fs = {
         "device": "cpu",
         "backbone_dtype": "bf16",
@@ -125,7 +143,11 @@ def torch_fs(**overrides):
         "peak_vram_delta_bytes": {"value": 1000.0, "unit": "bytes"},
     }
     fs.update(overrides)
-    return {"tool": "torch_finetune_step", "finetune_step": fs}
+    return {
+        "tool": "torch_finetune_step",
+        "args": {"seed": seed, "attn_requested": attn_requested},
+        "finetune_step": fs,
+    }
 
 
 def write_leg(raw_dir, slug, leg, exit_code=0, report=None, stderr=""):
@@ -460,6 +482,159 @@ class FusedProofFixtureTests(unittest.TestCase):
         # allowed -- expected -- to reflect this config's own bad leg.
         self.assertTrue(merged["configs"]["b8-s128-d0"]["verdict"].startswith("INVALID"))
         self.assertEqual(rc, 1)
+
+
+_CLEAN_YES_DISPATCHES = {
+    "ln": (9, 0),
+    "rope": (0, 0),
+    "softmax": (0, 0),
+    "geglu": (3, 0),
+    "lora_epilogue": (0, 0),
+    "lora_linear": (3, 0),
+    "attention_block": (3, 0),
+}
+
+
+class LegPremiseCheckTests(unittest.TestCase):
+    """Fold-in this round (the lead's own adjacent probe on this PR): before
+    this fix, `ab_merge.py` merged jammi-vs-torch legs with NO premise-
+    identity check at all -- identity was "by construction" of
+    `finetune_ab.sh`'s own matched CLI flags, an ASSUMPTION never a checked
+    RECORD in the merged artifact. Every test here uses `_CLEAN_YES_DISPATCHES`
+    (the same dispatch shape `test_exclusive_pair_yes` uses) so `fused_proof`
+    itself stays `True` -- isolating the leg-premise check as the ONLY
+    possible source of an `INVALID` verdict in these fixtures.
+    """
+
+    def run_merge(self, raw_dir):
+        out_dir = tempfile.mkdtemp()
+        rc = ab_merge.main([raw_dir, out_dir, "20", "5", "0.9"])
+        with open(os.path.join(out_dir, "finetune_ab_report.json")) as fh:
+            merged = json.load(fh)
+        return rc, merged
+
+    def test_matching_premise_across_all_four_legs_is_not_invalid(self):
+        """Positive control: the check above must not false-fail a
+        genuinely matching sweep -- otherwise `test_exclusive_pair_yes` and
+        every other existing fixture test would have been a false negative
+        waiting to happen.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_ok_config(raw_dir, "b8-s128-d0", _CLEAN_YES_DISPATCHES)
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertEqual(cfg["leg_premise_violations"], [])
+        self.assertFalse(cfg["verdict"].startswith("INVALID"), cfg["verdict"])
+        self.assertEqual(rc, 0)
+
+    def test_seed_mismatch_between_jammi_and_torch_legs_is_invalid(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_leg(raw_dir, "b8-s128-d0", "jammi-eager", report=jammi_fs({}))
+            write_leg(raw_dir, "b8-s128-d0", "jammi-fused", report=jammi_fs(_CLEAN_YES_DISPATCHES, seed=42))
+            write_leg(raw_dir, "b8-s128-d0", "torch-eager", report=torch_fs(attn_implementation="eager"))
+            write_leg(raw_dir, "b8-s128-d0", "torch-sdpa", report=torch_fs(seed=999))
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertTrue(any("seed" in v for v in cfg["leg_premise_violations"]))
+        self.assertTrue(cfg["verdict"].startswith("INVALID"), cfg["verdict"])
+        self.assertIn("leg premise mismatch", cfg["verdict"])
+        self.assertEqual(rc, 1)
+
+    def test_batch_mismatch_between_jammi_and_torch_legs_is_invalid(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_leg(raw_dir, "b8-s128-d0", "jammi-eager", report=jammi_fs({}))
+            write_leg(raw_dir, "b8-s128-d0", "jammi-fused", report=jammi_fs(_CLEAN_YES_DISPATCHES, batch=8))
+            write_leg(raw_dir, "b8-s128-d0", "torch-eager", report=torch_fs(attn_implementation="eager"))
+            write_leg(raw_dir, "b8-s128-d0", "torch-sdpa", report=torch_fs(batch=64))
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertTrue(any("batch" in v for v in cfg["leg_premise_violations"]))
+        self.assertTrue(cfg["verdict"].startswith("INVALID"))
+        self.assertEqual(rc, 1)
+
+    def test_seed_missing_from_jammi_leg_is_invalid(self):
+        """A jammi binary built BEFORE this round's `FinetuneStepTier::seed`
+        field lands here -- the field is simply absent, not present-and-
+        wrong. Must refuse just as loudly as a value mismatch, never
+        silently skip the check because one side has nothing to compare.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_leg(raw_dir, "b8-s128-d0", "jammi-eager", report=jammi_fs({}))
+            report = jammi_fs(_CLEAN_YES_DISPATCHES, seed=None)  # jammi_fs's None-deletes-the-key convention
+            write_leg(raw_dir, "b8-s128-d0", "jammi-fused", report=report)
+            write_leg(raw_dir, "b8-s128-d0", "torch-eager", report=torch_fs(attn_implementation="eager"))
+            write_leg(raw_dir, "b8-s128-d0", "torch-sdpa", report=torch_fs())
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertTrue(any("seed" in v and "missing" in v for v in cfg["leg_premise_violations"]))
+        self.assertTrue(cfg["verdict"].startswith("INVALID"))
+        self.assertEqual(rc, 1)
+
+    def test_backbone_dtype_legacy_spelling_is_not_a_violation_shared_canonicalizer(self):
+        """Proves the SHARED `identity_fields.canonicalize_identity_field`
+        is actually wired in here, not a second copy: torch's legacy
+        CLI-flag spelling `fp32` (see `identity_fields.py`'s own doc) must
+        canonicalize against jammi's `f32` here exactly as it does in
+        `compare_grad_oracle.py`.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_leg(raw_dir, "b8-s128-d0", "jammi-eager", report=jammi_fs({}))
+            write_leg(
+                raw_dir, "b8-s128-d0", "jammi-fused",
+                report=jammi_fs(_CLEAN_YES_DISPATCHES, backbone_dtype="f32"),
+            )
+            write_leg(raw_dir, "b8-s128-d0", "torch-eager", report=torch_fs(attn_implementation="eager"))
+            write_leg(raw_dir, "b8-s128-d0", "torch-sdpa", report=torch_fs(backbone_dtype="fp32"))
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertEqual(
+            [v for v in cfg["leg_premise_violations"] if "backbone_dtype" in v], [],
+            f"leg_premise_violations={cfg['leg_premise_violations']!r}",
+        )
+
+    def test_backbone_dtype_genuinely_different_is_still_a_violation(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_leg(raw_dir, "b8-s128-d0", "jammi-eager", report=jammi_fs({}))
+            write_leg(
+                raw_dir, "b8-s128-d0", "jammi-fused",
+                report=jammi_fs(_CLEAN_YES_DISPATCHES, backbone_dtype="bf16"),
+            )
+            write_leg(raw_dir, "b8-s128-d0", "torch-eager", report=torch_fs(attn_implementation="eager"))
+            write_leg(raw_dir, "b8-s128-d0", "torch-sdpa", report=torch_fs(backbone_dtype="f32"))
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertTrue(any("backbone_dtype" in v for v in cfg["leg_premise_violations"]))
+        self.assertTrue(cfg["verdict"].startswith("INVALID"))
+
+    def test_provenance_recorded_for_both_legs(self):
+        """torch's `attn_requested`/`attn_implementation` pair and jammi's
+        14 dispatch counters, recorded (never compared) in the merged row.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_ok_config(raw_dir, "b8-s128-d0", _CLEAN_YES_DISPATCHES)
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertEqual(cfg["provenance"]["torch"]["torch_attn_requested"], "sdpa")
+        self.assertEqual(cfg["provenance"]["torch"]["torch_attn_implementation"], "sdpa")
+        self.assertIsNone(cfg["provenance"]["jammi"]["torch_attn_requested"])
+        self.assertIn("ln_fused_dispatches", cfg["provenance"]["jammi"]["jammi_dispatch_counters"])
+        self.assertEqual(cfg["provenance"]["jammi"]["jammi_dispatch_counters"]["ln_fused_dispatches"], 9)
+        self.assertIsNone(cfg["provenance"]["torch"]["jammi_dispatch_counters"])
+
+    def test_no_ok_leg_on_either_side_skips_the_check_without_crashing(self):
+        """When neither side has an OK leg to compare, the check reports
+        `None` (checked=nothing), never an empty-list false claim of "no
+        violations found" -- and must not crash the merge for this config.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_leg(raw_dir, "b8-s128-fail", "jammi-eager", exit_code=1, stderr="boom")
+            write_leg(raw_dir, "b8-s128-fail", "jammi-fused", exit_code=1, stderr="boom")
+            write_leg(raw_dir, "b8-s128-fail", "torch-eager", exit_code=1, stderr="boom")
+            write_leg(raw_dir, "b8-s128-fail", "torch-sdpa", exit_code=1, stderr="boom")
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-fail"]
+        self.assertIsNone(cfg["leg_premise_violations"])
+        self.assertIsNone(cfg["leg_premise_checked_legs"])
 
 
 class LoraInitProvenanceTests(unittest.TestCase):

@@ -22,7 +22,39 @@ import json
 import os
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from identity_fields import canonicalize_identity_field  # noqa: E402
+
 LEGS = ["jammi-eager", "jammi-fused", "torch-eager", "torch-sdpa"]
+
+# The premise-identity check (fold-in, this round: the adjacent probe found
+# this module carried NO premise-identity check at all -- identity was
+# "by construction" of `finetune_ab.sh`'s own matched CLI flags across its
+# `run_jammi_leg`/`run_torch_leg` call sites only, i.e. an assumption, never
+# a checked record in the merged artifact). Shares
+# `identity_fields.canonicalize_identity_field` with
+# `compare_grad_oracle.py`'s OWN identity check (one definition, per the
+# lead's own fold-in instruction) rather than a second, independently-
+# drifting copy of the SAME `backbone_dtype`/`target_modules` representational
+# gaps.
+#
+# `seed` lives in a DIFFERENT place on each producer (jammi's own
+# `finetune_step.rs`'s `FinetuneStepTier::seed` field, added this round,
+# sits directly in the `finetune_step` block this module already reads via
+# `finetune_block`; torch's sits one level UP, in `report["args"]["seed"]`
+# -- `torch_finetune_step.py`'s own report literal never duplicates it into
+# the `finetune_step` sub-block) -- `leg_identity_fields` below reads each
+# from its OWN real location per leg, never assumes a shared schema.
+FINETUNE_IDENTITY_FIELDS = (
+    "seed",
+    "batch",
+    "seq",
+    "lora_rank",
+    "lora_dropout",
+    "target_modules",
+    "batched_forward",
+    "backbone_dtype",
+)
 
 # B2 — the DECLARED classification `fused_proof` checks a dispatch-counter
 # pair against, replacing the old blanket "(fused, eager) == (0, 0) is
@@ -151,6 +183,96 @@ def load_leg(raw_dir, config_slug, leg):
 
 def finetune_block(report, leg):
     return report["tiers"]["finetune_step"] if leg.startswith("jammi") else report["finetune_step"]
+
+
+_MISSING = object()  # sentinel -- see leg_identity_fields's own doc
+
+
+def leg_identity_fields(report, leg):
+    """This leg's `FINETUNE_IDENTITY_FIELDS` values, read from their REAL
+    location on the RAW report (never `metrics()`'s already-narrowed dict,
+    which drops `lora_dropout`/`target_modules`/`seed` entirely). `seed` is
+    the one field whose location differs by producer -- see
+    `FINETUNE_IDENTITY_FIELDS`'s own doc.
+
+    Returns a `{field: value_or_MISSING}` dict — `_MISSING` (a private
+    sentinel, never `None`) marks a field ABSENT from this report, so
+    `leg_premise_violations` can distinguish "present but `None`" (which
+    neither real producer ever emits, but a fixture could) from "the key
+    was never there at all" — the SAME presence-vs-equality distinction
+    `compare_grad_oracle.py`'s `_premise_violations` closes for the
+    grad-oracle side this round.
+    """
+    fs = finetune_block(report, leg)
+    fields = {}
+    for field in FINETUNE_IDENTITY_FIELDS:
+        if field == "seed":
+            if leg.startswith("jammi"):
+                fields[field] = fs[field] if field in fs else _MISSING
+            else:
+                args = report.get("args")
+                fields[field] = args["seed"] if isinstance(args, dict) and "seed" in args else _MISSING
+        else:
+            fields[field] = fs[field] if field in fs else _MISSING
+    return fields
+
+
+def leg_premise_violations(jammi_fields, torch_fields):
+    """Per-config leg-premise check: BOTH legs' records must carry every
+    `FINETUNE_IDENTITY_FIELDS` entry (present on both, equal after
+    `canonicalize_identity_field` — the SAME canonicalizer table
+    `compare_grad_oracle.py` uses for its own identity fields, imported
+    from `identity_fields.py`), mirroring that module's own
+    `_premise_violations` shape: presence checked EXPLICITLY (a field
+    absent from BOTH sides must not silently compare `None == None` and
+    pass — the same class of bug that module's own `_premise_violations`
+    closed this round), never inferred from a bare `==`.
+    """
+    violations = []
+    for field in FINETUNE_IDENTITY_FIELDS:
+        ja = jammi_fields.get(field, _MISSING)
+        jb = torch_fields.get(field, _MISSING)
+        missing_sides = []
+        if ja is _MISSING:
+            missing_sides.append("jammi")
+        if jb is _MISSING:
+            missing_sides.append("torch")
+        if missing_sides:
+            violations.append(
+                f"leg-identity field {field!r} missing from {missing_sides} leg's record -- cannot "
+                "verify the two legs of this config ran under the same premise"
+            )
+            continue
+        va = canonicalize_identity_field(field, ja)
+        vb = canonicalize_identity_field(field, jb)
+        if va != vb:
+            violations.append(f"leg-identity field {field!r} differs: jammi={va!r} torch={vb!r}")
+    return violations
+
+
+def leg_provenance(report, leg):
+    """PROVENANCE (recorded, never compared — see `grad_oracle.rs`'s module
+    doc's determinant table for the same identity/provenance/measurement
+    split applied to this OTHER cross-producer comparator): torch's
+    `attn_requested`/`attn_implementation` pair, jammi's 14 dispatch
+    counters. `None` for the fields the OTHER producer has no equivalent
+    for (never fabricated).
+    """
+    fs = finetune_block(report, leg)
+    if leg.startswith("jammi"):
+        return {
+            "torch_attn_requested": None,
+            "torch_attn_implementation": None,
+            "jammi_dispatch_counters": {
+                k: v for k, v in fs.items() if k.endswith("_fused_dispatches") or k.endswith("_eager_dispatches")
+            },
+        }
+    args = report.get("args") if isinstance(report.get("args"), dict) else {}
+    return {
+        "torch_attn_requested": args.get("attn_requested"),
+        "torch_attn_implementation": fs.get("attn_implementation"),
+        "jammi_dispatch_counters": None,
+    }
 
 
 def dispatch_pairs(fs):
@@ -402,6 +524,36 @@ def build_report(raw_dir, steps, warmup, pass_ratio, torch_lora_init="peft"):
         else:
             proof = fused_proof(leg_metrics["jammi-fused"])
 
+        # LEG-PREMISE CHECK (fold-in, this round): compares whichever jammi
+        # leg's record is available (prefer jammi-fused, the one this
+        # sweep's own ratio/proof are computed from; fall back to
+        # jammi-eager) against whichever torch leg's is (prefer torch-sdpa
+        # for the SAME reason; fall back to torch-eager) — the two legs of
+        # ONE config are supposed to have run under the IDENTICAL
+        # seed/batch/seq/dtype/dropout/lora premise (`finetune_ab.sh`'s
+        # matched-flags convention), and this is the first place that
+        # premise is actually CHECKED rather than merely assumed. `None`
+        # (never an empty list) when neither side has an OK leg to compare
+        # -- an EMPTY list asserts "checked, no violations found", which
+        # would be false when there was nothing to check at all.
+        jammi_premise_leg = "jammi-fused" if entries["jammi-fused"]["outcome"] == "OK" else (
+            "jammi-eager" if entries["jammi-eager"]["outcome"] == "OK" else None
+        )
+        torch_premise_leg = "torch-sdpa" if entries["torch-sdpa"]["outcome"] == "OK" else (
+            "torch-eager" if entries["torch-eager"]["outcome"] == "OK" else None
+        )
+        leg_premise_violations_list = None
+        jammi_provenance = None
+        torch_provenance = None
+        if jammi_premise_leg is not None:
+            jammi_provenance = leg_provenance(entries[jammi_premise_leg]["report"], jammi_premise_leg)
+        if torch_premise_leg is not None:
+            torch_provenance = leg_provenance(entries[torch_premise_leg]["report"], torch_premise_leg)
+        if jammi_premise_leg is not None and torch_premise_leg is not None:
+            jammi_id_fields = leg_identity_fields(entries[jammi_premise_leg]["report"], jammi_premise_leg)
+            torch_id_fields = leg_identity_fields(entries[torch_premise_leg]["report"], torch_premise_leg)
+            leg_premise_violations_list = leg_premise_violations(jammi_id_fields, torch_id_fields)
+
         for leg in LEGS:
             err_tail = entries[leg]["err_tail"]
             if leg_merge_errors[leg] is not None:
@@ -501,10 +653,34 @@ def build_report(raw_dir, steps, warmup, pass_ratio, torch_lora_init="peft"):
                 f"discarded, not merely annotated)"
             )
 
+        # Same carve-out `proof is False`'s own INVALID branch above takes
+        # from this crate's record-don't-gate doctrine: a leg-premise
+        # mismatch (or absence) is a correctness-of-MEASUREMENT problem —
+        # the ratio/loss numbers computed above may not even describe the
+        # SAME configuration on both sides — so it REPLACES (never merely
+        # annotates) whatever verdict was computed, same mechanism `main()`
+        # already gates its own exit code on. Checked independently of, and
+        # in addition to, the fused-dispatch proof above -- either alone can
+        # invalidate this config's verdict.
+        if leg_premise_violations_list:
+            verdict = (
+                f"INVALID (leg premise mismatch: {'; '.join(leg_premise_violations_list)} — the "
+                f"{jammi_premise_leg}/{torch_premise_leg} legs of this config did not run under the "
+                "same seed/batch/seq/dtype/dropout/lora premise; the ratio-based verdict this would "
+                "otherwise have been is discarded, not merely annotated)"
+            )
+
         summary_rows.append((slug, ratio, loss_ratio, verdict))
         merged["configs"][slug] = {
             "legs": {leg: {"outcome": entries[leg]["outcome"], "metrics": leg_metrics[leg]} for leg in LEGS},
             "jammi_fused_dispatch_proof": proof,
+            "leg_premise_violations": leg_premise_violations_list,
+            "leg_premise_checked_legs": (
+                {"jammi": jammi_premise_leg, "torch": torch_premise_leg}
+                if leg_premise_violations_list is not None
+                else None
+            ),
+            "provenance": {"jammi": jammi_provenance, "torch": torch_provenance},
             "ratio_jammi_fused_over_torch_sdpa": ratio,
             "loss_final_ratio_jammi_fused_over_torch_sdpa": loss_ratio,
             "loss_final_ratio_note": "same data, cost fixture -- NOT a quality result "

@@ -598,10 +598,15 @@ fn decisive_timing_measurement() {
         runs_json.join(",")
     );
 
+    // `artifacts/cuda-runs/README.md`'s naming convention is
+    // `<date>-<unit>-<sha7>-<gpu>.json` — a SHORT (7-char) sha in the
+    // filename (the JSON body's own `tip_sha` field, above, carries the
+    // full 40-char sha for exact verification).
+    let sha7 = &sha[..7.min(sha.len())];
     let out_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("artifacts/cuda-runs")
         .join(format!(
-            "2026-08-25-p6-b1-flash-timing-{sha}-a100-sxm4.json"
+            "2026-08-25-p6-b1-flash-timing-{sha7}-a100-sxm4.json"
         ));
     std::fs::create_dir_all(out_path.parent().unwrap()).unwrap();
     std::fs::write(&out_path, &artifact).unwrap();

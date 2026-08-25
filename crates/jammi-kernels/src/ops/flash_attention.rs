@@ -359,3 +359,114 @@ pub fn flash_attention_varlen(
     };
     super::apply_stateful1(qkv, op)
 }
+
+#[cfg(test)]
+mod tests {
+    //! Pure cells (no CUDA device needed) — `check_qkv_domain`/
+    //! `check_o_domain` are OR-chains of independent predicates
+    //! (family K's "a lattice per predicate" standing clause): each
+    //! disjunct gets its OWN cell, violated ALONE (every other field
+    //! correct), so a `||` -> `&&` mutation (which only fails when
+    //! MULTIPLE disjuncts are simultaneously true) cannot survive —
+    //! these are exactly the two cells `cargo mutants` found MISSED
+    //! before this block existed (only integration-level, CUDA-requiring
+    //! tests exercised these functions previously, none violating a
+    //! single disjunct in isolation).
+    use super::*;
+
+    const OK_DIMS: [usize; 4] = [21, 3, 4, HEAD_DIM];
+
+    #[test]
+    fn check_qkv_domain_accepts_the_canonical_shape() {
+        let (total_q, num_heads) = check_qkv_domain(&OK_DIMS, DType::BF16).unwrap();
+        assert_eq!(total_q, 21);
+        assert_eq!(num_heads, 4);
+    }
+
+    #[test]
+    fn check_qkv_domain_refuses_wrong_rank_alone() {
+        // Rank 3 (missing the `3` axis) — dims[1]/dims[3] positions shift,
+        // but the point of THIS cell is "rank wrong, nothing else checked
+        // yet" (a rank-5 case establishes rank-wrongness independent of
+        // what dims[1]/dims[3] would even mean).
+        let dims = [21usize, 3, 4, HEAD_DIM, 1];
+        let e = check_qkv_domain(&dims, DType::BF16).unwrap_err();
+        assert!(matches!(e, Error::Msg(_)), "{e}");
+    }
+
+    #[test]
+    fn check_qkv_domain_refuses_wrong_middle_axis_alone() {
+        // Rank correct (4), dims[3] correct (HEAD_DIM) — ONLY dims[1] != 3
+        // is violated. This is exactly the cell a `||` -> `&&` mutation
+        // survives on (both other disjuncts are false here).
+        let dims = [21usize, 5, 4, HEAD_DIM];
+        assert_eq!(dims.len(), 4);
+        assert_eq!(dims[3], HEAD_DIM);
+        let e = check_qkv_domain(&dims, DType::BF16).unwrap_err();
+        assert!(matches!(e, Error::Msg(_)), "{e}");
+    }
+
+    #[test]
+    fn check_qkv_domain_refuses_wrong_head_dim_alone() {
+        // Rank correct (4), dims[1] correct (3) — ONLY dims[3] != HEAD_DIM
+        // is violated — the SECOND cell the mutation run found missed.
+        let dims = [21usize, 3, 4, HEAD_DIM + 1];
+        assert_eq!(dims.len(), 4);
+        assert_eq!(dims[1], 3);
+        let e = check_qkv_domain(&dims, DType::BF16).unwrap_err();
+        assert!(matches!(e, Error::Msg(_)), "{e}");
+    }
+
+    #[test]
+    fn check_qkv_domain_refuses_non_bf16_with_shape_otherwise_correct() {
+        let e = check_qkv_domain(&OK_DIMS, DType::F32).unwrap_err();
+        assert!(
+            matches!(e, Error::UnsupportedDTypeForOp(DType::F32, OP_NAME)),
+            "{e}"
+        );
+    }
+
+    const OK_O_DIMS: [usize; 3] = [21, 4, HEAD_DIM];
+
+    #[test]
+    fn check_o_domain_accepts_the_canonical_shape() {
+        check_o_domain(&OK_O_DIMS, DType::BF16, 21, 4).unwrap();
+    }
+
+    #[test]
+    fn check_o_domain_refuses_wrong_rank_alone() {
+        let dims = [21usize, 4, HEAD_DIM, 1];
+        let e = check_o_domain(&dims, DType::BF16, 21, 4).unwrap_err();
+        assert!(matches!(e, Error::Msg(_)), "{e}");
+    }
+
+    #[test]
+    fn check_o_domain_refuses_wrong_total_q_alone() {
+        let dims = [20usize, 4, HEAD_DIM]; // total_q off by one, rest correct
+        let e = check_o_domain(&dims, DType::BF16, 21, 4).unwrap_err();
+        assert!(matches!(e, Error::Msg(_)), "{e}");
+    }
+
+    #[test]
+    fn check_o_domain_refuses_wrong_num_heads_alone() {
+        let dims = [21usize, 5, HEAD_DIM]; // num_heads off by one, rest correct
+        let e = check_o_domain(&dims, DType::BF16, 21, 4).unwrap_err();
+        assert!(matches!(e, Error::Msg(_)), "{e}");
+    }
+
+    #[test]
+    fn check_o_domain_refuses_wrong_head_dim_alone() {
+        let dims = [21usize, 4, HEAD_DIM + 1];
+        let e = check_o_domain(&dims, DType::BF16, 21, 4).unwrap_err();
+        assert!(matches!(e, Error::Msg(_)), "{e}");
+    }
+
+    #[test]
+    fn check_o_domain_refuses_non_bf16_with_shape_otherwise_correct() {
+        let e = check_o_domain(&OK_O_DIMS, DType::F32, 21, 4).unwrap_err();
+        assert!(
+            matches!(e, Error::UnsupportedDTypeForOp(DType::F32, OP_NAME)),
+            "{e}"
+        );
+    }
+}

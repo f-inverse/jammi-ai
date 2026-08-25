@@ -130,15 +130,13 @@
 //! scores, and the softmax output `P` from `qkv`/`rope_pack`/`mask` —
 //! calling [`super::apply3`] with [`super::RopeFused`] and
 //! [`super::apply2`] with [`super::SoftmaxLastDimFused`] DIRECTLY, rather
-//! than a second hand-written kernel. This is safe and does NOT reintroduce
-//! the retained-activation cost this op exists to remove: `bwd` runs OUTSIDE
-//! the forward tape — every intermediate `Tensor` it builds (`scores`, `p`,
-//! `dp`, …) is a plain, un-walked `BackpropOp` graph that is dropped the
-//! moment `bwd` returns; candle's backward engine never calls `.backward()`
-//! on it. This is the same pattern [`super::RopeFused::bwd`] and
-//! [`super::SoftmaxLastDimFused::bwd`] already use (composing ordinary
-//! `Tensor` ops, including calls into EACH OTHER's `apply*` entry points,
-//! inside their own `bwd`), just with a longer chain. `bwd` forces
+//! than a second hand-written kernel. This is the same pattern
+//! [`super::RopeFused::bwd`] and [`super::SoftmaxLastDimFused::bwd`]
+//! already use (composing ordinary `Tensor` ops, including calls into EACH
+//! OTHER's `apply*` entry points, inside their own `bwd`), just with a
+//! longer chain — and, unlike them, it runs DETACHED (next section), which
+//! is what makes the "no retained `[batch, heads, seq, seq]` activation"
+//! claim true rather than merely stated. `bwd` forces
 //! `.contiguous()` on every GEMM operand that is not either fully
 //! row-major OR a single transposed view of one (`gemm_config`'s admissible
 //! shapes — see `LowRankResidualLinear`'s module doc for the citation and
@@ -191,28 +189,69 @@
 //! (`bwd_every_gemm_operand_is_admissible_at_boundary_and_production_ranks`)
 //! proves the VIEW form specifically.
 //!
-//! ### Transient scoping: `scores`/`p`/`dp`/`ds` never all coexist
+//! ### `bwd` runs DETACHED: why the drops below free anything at all
 //!
-//! Each of `bwd`'s four `[B, H, S, S]`-shaped intermediates (`scores`,
-//! `p`, `dp`, `ds`) is dropped (`std::mem::drop`, explicit) the moment its
-//! LAST use inside `bwd` completes, rather than staying bound until the
-//! function returns: `scores` drops right after `p` is computed from it;
-//! `p` and `dp` both drop right after `ds` is computed from them; `ds`
-//! drops right after `dqs`/`dkr` (its two uses) are both computed. The
-//! SUSTAINED live set is therefore at most TWO of these four
-//! `[B, H, S, S]` tensors at once (`p` alongside `dp` while building
-//! `ds`); THREE are simultaneously alive only for the single instant
-//! `ds` itself is being constructed from `p` and `dp` (an unavoidable
-//! "inputs plus the output under construction" overlap any allocator has,
-//! not a design choice this scoping controls), never all four. At
-//! `b=8, h=16, s=512` (BF16, `2` bytes/element — the training arm's own
-//! dtype), one `[8, 16, 512, 512]` tensor is `8·16·512·512·2 =
-//! 67_108_864` bytes (≈ 67.1 MB): the sustained two-tensor live set is
-//! therefore ≈ 134.2 MB (briefly ≈ 201.3 MB during the one `ds`-
-//! construction instant), against ≈ 268.4 MB when all four intermediates
-//! lived to the end of `bwd` (this op's own pre-fix-round shape, and
-//! `SoftmaxLastDimFused::bwd`'s/every other fused op's own default
-//! without explicit scoping).
+//! In production `qkv` is a TRACKED graph node (downstream of the `Wqkv`
+//! LoRA `Var`s), and candle records an `Op` on every result whose input
+//! tracks — `BackpropOp::new1/new2/new3` (candle-core 0.11.0 `op.rs`)
+//! clone each tracking argument INTO the result's `Op`. Had `bwd` composed
+//! its chain from the tracked `qkv` directly, every intermediate (`scores`
+//! inside `p`'s `Op::CustomOp2`, `p`/`dp` inside `ds`'s, `ds` inside
+//! `dqs`'s `Op::Matmul`, the materialised transposes `pᵀ`/`dsᵀ` inside
+//! their consumers' …) would have stayed alive through its consumer's
+//! `Op` no matter when the local binding was dropped, the four explicit
+//! `drop`s would have freed nothing, and the entire chain would have been
+//! handed back to the engine inside `dqkv`'s own `Op` — where it lives
+//! until the engine detaches the `Var`'s accumulated grad, i.e. until the
+//! backward pass finishes with that `Var`'s node. Six `[B, H, S, S]`-
+//! shaped tensors (`scores`, `p`, `pᵀ`, `dp`, `ds`, `dsᵀ`) per layer,
+//! ≈ 402.7 MB at the shape below, would have been the true sustained cost.
+//!
+//! `bwd` therefore starts by calling `Tensor::detach` on all four of its
+//! tensor inputs (`qkv`, `rope_pack`, `mask`, `grad_res`) — the SAME move
+//! candle's own engine makes on the incoming `grad` before calling any
+//! `bwd` (`backprop.rs`: "call `.detach` to avoid computing the backprop
+//! graph of the backprop itself"). `detach` shares storage (no copy) and
+//! yields an untracked tensor, so NOTHING built downstream records an
+//! `Op`, no input is cloned anywhere, `dqkv` returns with an EMPTY tape
+//! (`!track_op()`, `sorted_nodes().len() == 0` — the test
+//! `bwd_from_a_tracked_qkv_returns_an_untracked_dqkv_with_no_tape` drives
+//! this from a `Var`, since a leaf fixture could not observe retention),
+//! and the drop points below are the REAL free points. Second-order
+//! derivatives through this op are therefore not supported — the same
+//! standing limitation candle's engine already imposes on every `bwd`.
+//!
+//! ### Transient scoping: the live set, derived from the drop points
+//!
+//! With every intermediate untracked, a `[B, H, S, S]`-shaped tensor is
+//! freed exactly when its last `Tensor` handle goes away. Walking `bwd`'s
+//! statements in order (each row names what is alive AFTER the statement):
+//!
+//! | statement | `[B, H, S, S]` tensors alive | count |
+//! |---|---|---|
+//! | `scores = q_scaled · k_rotᵀ` | `scores` | 1 |
+//! | `p = softmax(scores, mask)` | `scores`, `p` | 2 |
+//! | `drop(scores)` | `p` | 1 |
+//! | `dv = pᵀ.contiguous() · dctx` | `p` (+ `pᵀ` for the statement's own duration only — a temporary, freed at the `;`) | 1 (2 momentarily) |
+//! | `dp = dctx · vᵀ` | `p`, `dp` | 2 |
+//! | `ds = softmax_bwd(p, dp)` | `p`, `dp`, `ds` | 3 |
+//! | `drop(p); drop(dp)` | `ds` | 1 |
+//! | `dqs = ds · k_rot` | `ds` (`ds.contiguous()` is a storage-sharing clone, not a copy) | 1 |
+//! | `dkr = dsᵀ.contiguous() · q_scaled` | `ds` (+ `dsᵀ` momentarily, as for `dv`) | 1 (2 momentarily) |
+//! | `drop(ds)` | — | 0 |
+//!
+//! The SUSTAINED maximum is therefore TWO (`p` alongside `dp`), the
+//! momentary maximum THREE (while `ds` is being written from `p` and
+//! `dp`), and NOTHING `[B, H, S, S]`-shaped survives past `drop(ds)` — in
+//! particular nothing is returned to the engine. At `b=8, h=16, s=512`
+//! (BF16, `2` bytes/element — the training arm's own dtype) one
+//! `[8, 16, 512, 512]` tensor is `8·16·512·512·2 = 67_108_864` bytes
+//! (≈ 67.1 MB): sustained ≈ 134.2 MB, momentary peak ≈ 201.3 MB, against
+//! the ≈ 402.7 MB (six tensors, above) the tracked composition would have
+//! held until the engine released the `Var`'s grad. These are DERIVATIONS
+//! from the drop points, not measurements; the CUDA run artifact
+//! (`artifacts/cuda-runs/`) records the measured `peak_vram` per bench
+//! leg.
 //!
 //! `rope_pack`/`mask` are asserted `!track_op()` at the top of `bwd` — this
 //! op computes no `dcos`/`dsin`/`dmask` (unlike `RopeFused`/
@@ -532,6 +571,25 @@ impl CustomOp3 for AttentionBlockFused {
                  be tracked (never a Var, never downstream of one)"
             )));
         }
+        // DETACH every input before composing anything (module doc's
+        // "`bwd` runs DETACHED" section): `qkv` is a tracked graph node in
+        // production (downstream of the `Wqkv` LoRA `Var`s), so without
+        // this every `Tensor` built below would carry a `BackpropOp`
+        // cloning its inputs (candle-core 0.11.0 `op.rs`'s
+        // `BackpropOp::new1/new2/new3` — `if arg.track_op() {
+        // Some(f(arg.clone())) }`), the explicit `drop`s below would free
+        // NOTHING (the consumer's `Op` still owns a clone), and the whole
+        // chain would be handed back to the engine inside `dqkv`'s own
+        // `Op`. candle's engine detaches the incoming `grad` for exactly
+        // this reason (`backprop.rs`'s `grad.detach()` — "to avoid
+        // computing the backprop graph of the backprop itself"); this op
+        // does the same for its OTHER three inputs. `detach` shares
+        // storage (no copy) and is a no-op clone on an already-untracked
+        // tensor (`tensor.rs`'s `Tensor::detach`).
+        let qkv = qkv.detach();
+        let rope_pack = rope_pack.detach();
+        let mask = mask.detach();
+        let grad_res = grad_res.detach();
         let (b, s, three, h, d) = qkv.dims5()?;
         if three != 3 {
             return Err(Error::Msg(format!(
@@ -569,7 +627,7 @@ impl CustomOp3 for AttentionBlockFused {
         let scores = q_scaled
             .contiguous()?
             .matmul(&k_rot.transpose(D::Minus1, D::Minus2)?)?;
-        let p = apply2(&scores, mask, SoftmaxLastDimFused::new(self.fully_masked))?;
+        let p = apply2(&scores, &mask, SoftmaxLastDimFused::new(self.fully_masked))?;
         // `scores`'s only use was building `p` above (module doc's
         // "transient scoping" section) — drop it now instead of letting it
         // live to the end of `bwd`.
@@ -1484,6 +1542,77 @@ mod tests {
             "a tracked rope_pack must make backward fail loudly, not silently drop its gradient",
         );
         let _ = err;
+    }
+
+    /// `bwd` runs DETACHED (module doc's "`bwd` runs DETACHED" section):
+    /// driven from a TRACKED `qkv` (a `Var`, exactly as production's
+    /// `Wqkv` output is downstream of the LoRA `Var`s — standing rule: a
+    /// leaf-tensor fixture cannot see tape retention at all), the `dqkv`
+    /// it returns must carry NO `BackpropOp` — `!track_op()` and an EMPTY
+    /// `sorted_nodes()` — both when `bwd` is called directly and when
+    /// candle's engine stores it in the `GradStore` (`grads.get(&var)`,
+    /// which is `zeros_like(var) + dqkv` and therefore tracks iff `dqkv`
+    /// does). Without the four `detach()` calls at the top of `bwd`, every
+    /// intermediate clones into its consumer's `Op` (candle-core 0.11.0
+    /// `op.rs`'s `BackpropOp::new2`), `dqkv`'s graph reaches all the way
+    /// back to the `Var`, and this test's `sorted_nodes()` count is in
+    /// the dozens — the mutation this test reddens under (verified:
+    /// deleting the four `detach()` lines).
+    #[test]
+    fn bwd_from_a_tracked_qkv_returns_an_untracked_dqkv_with_no_tape() {
+        let device = Device::Cpu;
+        let (b, h, s, d) = (2usize, 2usize, 5usize, HEAD_DIM);
+        let n = b * s * 3 * h * d;
+        let qkv0: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.05).sin() * 0.5).collect();
+        let qkv =
+            Var::from_tensor(&Tensor::from_vec(qkv0, (b, s, 3, h, d), &device).unwrap()).unwrap();
+        let (cos, sin) = rope_tables(s, d, &device);
+        let rope_pack = pack_rope(&cos, &sin).unwrap();
+        let mask = zero_mask(b, s, &device);
+        let scale = 1.0 / (d as f32).sqrt();
+        let op = AttentionBlockFused::new(scale, FullyMaskedPolicy::Zeros, true).unwrap();
+        let dy_v: Vec<f32> = (0..(b * s * h * d))
+            .map(|i| ((i as f32) * 0.031).cos() * 0.6 + 0.05)
+            .collect();
+        let dy = Tensor::from_vec(dy_v, (b, s, h * d), &device).unwrap();
+
+        // Non-vacuity: the forward output IS tracked (the fixture reaches
+        // `bwd` through a Var), so an untracked `dqkv` is `bwd`'s doing.
+        let res = fused(qkv.as_tensor(), &rope_pack, &mask, op).unwrap();
+        assert!(qkv.as_tensor().track_op());
+        assert!(res.track_op());
+        assert!(!res.sorted_nodes().is_empty());
+
+        // Direct call, exactly as candle's engine makes it (the engine
+        // hands `bwd` an already-DETACHED `grad`, mirrored here by `dy`
+        // being a leaf).
+        let (dqkv, d_rope, d_mask) =
+            CustomOp3::bwd(&op, qkv.as_tensor(), &rope_pack, &mask, &res, &dy).unwrap();
+        let dqkv = dqkv.expect("dqkv is always Some");
+        assert!(d_rope.is_none() && d_mask.is_none());
+        assert!(
+            !dqkv.track_op(),
+            "dqkv must be detached: bwd's intermediates would otherwise all be retained by \
+             their consumers' Ops and handed back to the engine"
+        );
+        assert_eq!(
+            dqkv.sorted_nodes().len(),
+            0,
+            "dqkv must carry an EMPTY tape — every intermediate freed at its drop point"
+        );
+
+        // Through the engine: the stored grad for the Var is
+        // `zeros_like + dqkv`, tracked iff `dqkv` is.
+        let loss = (&res * &dy).unwrap().sum_all().unwrap();
+        let grads = loss.backward().unwrap();
+        let stored = grads.get(&qkv).unwrap();
+        assert!(!stored.track_op());
+        assert_eq!(stored.sorted_nodes().len(), 0);
+        // And the VALUES are the same either way (detaching changes no
+        // byte — `detach` shares storage).
+        let direct: Vec<f32> = dqkv.flatten_all().unwrap().to_vec1().unwrap();
+        let via_engine: Vec<f32> = stored.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(direct, via_engine);
     }
 
     /// `cuda_fwd`'s `cos_l`/`sin_l` derivation assumes `rope_pack`

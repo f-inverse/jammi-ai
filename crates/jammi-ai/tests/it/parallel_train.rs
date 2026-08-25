@@ -345,6 +345,88 @@ fn train_loop_signature_is_text_free() {
     assert!(report.final_loss < 0.1, "final loss {}", report.final_loss);
 }
 
+/// `report.final_loss` is MEASURED against an independent recomputation, not
+/// merely bounded (family F: a headline number is measured-and-asserted,
+/// never transcribed). A one-epoch, one-batch run means `train_loop`'s
+/// `epoch_loss` accumulator sees exactly ONE `scalar_loss` call BEFORE that
+/// epoch's single `optimizer_step` ever updates the weights — so
+/// `report.final_loss` must equal the forward-pass loss computed on the
+/// weights as they stood BEFORE `train_loop` was called, exactly (both sides
+/// are the same `mean_all((preds - targets)^2)` over the same batch on the
+/// same initial weights; no floating-point slack from a second, later
+/// forward pass to account for).
+///
+/// A directional bound alone (`final_loss < threshold`) cannot tell a correct
+/// accumulator from a broken one: `epoch_loss -= scalar_loss(&loss)?` makes
+/// `final_loss` NEGATIVE, which still satisfies "loss is small"; `epoch_loss
+/// *= scalar_loss(&loss)?` starting from `0.0` stays EXACTLY `0.0` forever,
+/// which also satisfies it. Both are invisible to `train_loop_converges_on_
+/// synthetic_regression`'s `< 1e-3` and `train_loop_signature_is_text_free`'s
+/// `< 0.1` — this test's exact-match oracle catches both.
+///
+/// Mutation tried: `replace += with -=` / `replace += with *=` on
+/// `parallel_train.rs`'s `epoch_loss += scalar_loss(&loss)?` — RED on both:
+/// the reported `final_loss` (negative, or exactly `0.0`) no longer matches
+/// the independently recomputed forward-pass loss.
+#[test]
+fn train_loop_final_loss_matches_an_independent_forward_recomputation() {
+    let dev = Device::Cpu;
+    let varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &dev);
+    let linear = candle_nn::linear(2, 1, vb.pp("l")).unwrap();
+
+    let features = Tensor::from_vec(vec![1.0f32, -2.0, 3.0, 0.5], (2, 2), &dev).unwrap();
+    let targets = Tensor::from_vec(vec![0.7f32, -1.3], (2, 1), &dev).unwrap();
+    let batches = vec![TensorBatch {
+        features: features.clone(),
+        targets: targets.clone(),
+    }];
+
+    // Independently recompute the loss BEFORE train_loop touches the
+    // weights — the exact value `report.final_loss` must equal, since a
+    // one-epoch run's reported loss is measured before that epoch's only
+    // optimizer step ever runs.
+    let preds_before = linear.forward(&features).unwrap();
+    let diff = (&preds_before - &targets).unwrap();
+    let expected_loss: f64 = diff
+        .sqr()
+        .unwrap()
+        .mean_all()
+        .unwrap()
+        .to_scalar::<f32>()
+        .unwrap() as f64;
+
+    let report = train_loop(
+        &varmap,
+        &batches,
+        &ParallelTrainConfig {
+            epochs: 1,
+            learning_rate: 0.05,
+            weight_decay: 0.0,
+            grad_clip: 1.0,
+        },
+        &std::sync::atomic::AtomicBool::new(false),
+        |batch: &TensorBatch| linear.forward(&batch.features).map_err(into_err),
+        |preds, batch: &TensorBatch| {
+            let diff = (preds - &batch.targets).map_err(into_err)?;
+            diff.sqr().map_err(into_err)?.mean_all().map_err(into_err)
+        },
+    )
+    .unwrap();
+
+    assert!(
+        report.final_loss >= 0.0,
+        "an MSE loss can never be negative, got {}",
+        report.final_loss
+    );
+    assert!(
+        (report.final_loss - expected_loss).abs() < 1e-6,
+        "final_loss ({}) must exactly match the independent recomputation ({})",
+        report.final_loss,
+        expected_loss
+    );
+}
+
 /// B2/B3 last-step lattice row: **`parallel_train.rs`'s `train_loop`**.
 /// `is_last_step` here is `total_steps + 1 >= total_run_steps`, computed
 /// against `total_run_steps = epochs.saturating_mul(batches.len())` — already

@@ -167,6 +167,14 @@ fn synthetic_ids(batch: usize, seq: usize, vocab: usize, seed: u64, device: &Dev
 }
 
 /// Run the tier and return its report block.
+///
+/// Returns `Err` — not a `FinetuneStepTier` with a suspiciously-clean
+/// dispatch split — when `JAMMI_KERNELS_DISABLE` named an op key that
+/// never actually disabled a live dispatch this run (see the check just
+/// before this function returns, and
+/// `jammi_kernels::admission::unmatched_disables`'s doc): that is a typo
+/// in the disable list, not evidence the forced-eager arm ran, and must
+/// never be reported as a datum (contract K-aux).
 pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std::error::Error>> {
     let device = match params.cuda_device {
         Some(ordinal) => Device::new_cuda(ordinal)?,
@@ -300,6 +308,44 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     let lora_linear_fused_dispatch_after = jammi_lora::lora_linear_fused_dispatch_snapshot();
     let attention_block_dispatch_after = jammi_encoders::attention_block_dispatch_snapshot();
 
+    // `JAMMI_KERNELS_DISABLE` safety property (contract K-aux): a
+    // disable-list entry that never actually disabled a live `admit` call
+    // this run is a typo, not a forced-eager measurement — this run is
+    // INVALID, not a datum with a plausible-looking JSON tier. Checked at
+    // the END of the run, after every dispatch site above has had its
+    // chance to fire: `jammi_kernels::admission`'s registry is populated
+    // by observation and cannot be validated at process start (see
+    // `jammi_kernels::admission::unmatched_disables`'s doc).
+    let unmatched_kernel_disables = jammi_kernels::admission::unmatched_disables();
+    if !unmatched_kernel_disables.is_empty() {
+        return Err(format!(
+            "JAMMI_KERNELS_DISABLE named op key(s) that never disabled a live \
+             dispatch this run (INVALID run, not a datum): {unmatched_kernel_disables:?}"
+        )
+        .into());
+    }
+
+    // The RESOLVED disable state, for the report artifact (contract K-aux,
+    // round 2 / B3): `requested` is what `JAMMI_KERNELS_DISABLE` named this
+    // process (sorted, empty when unset); `fired` is which of those entries
+    // actually disabled a live dispatch this run (a strict subset once
+    // `unmatched_kernel_disables` is empty, per the check just above).
+    // Recorded even on an ordinary undisabled run (both empty), rather than
+    // only on a forced-eager one: an omitted pair would read as "this
+    // report predates the field", which is false — every report from this
+    // build carries an opinion on which arm it measured. This is what lets
+    // a downstream A/B harness catch the "env var silently dropped" failure
+    // mode `unmatched_disables` does NOT cover: a run whose
+    // `JAMMI_KERNELS_DISABLE` never reached this process at all (a var-NAME
+    // typo, an unforwarded ssh/`docker -e` environment) has NOTHING
+    // requested, so `unmatched_disables()` is trivially empty and the run
+    // succeeds — but `kernels_disabled_requested`/`kernels_disabled_fired`
+    // then both read `[]` here too, distinguishing it from a genuine
+    // forced-eager run (both non-empty and equal) that a caller intended to
+    // compare against.
+    let kernels_disabled_requested = jammi_kernels::admission::disabled_ops_requested();
+    let kernels_disabled_fired = jammi_kernels::admission::disabled_ops_fired();
+
     times.sort_by(f64::total_cmp);
     let p50 = times[times.len() / 2];
     let mean = times.iter().sum::<f64>() / times.len() as f64;
@@ -358,6 +404,8 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
         attention_block_eager_dispatches: attention_block_dispatch_after
             .eager
             .saturating_sub(attention_block_dispatch_before.eager),
+        kernels_disabled_requested,
+        kernels_disabled_fired,
         s_per_step_p50: Measurement::measured(p50, "s"),
         s_per_step_mean: Measurement::measured(mean, "s"),
         steps_per_s: Measurement::measured(1.0 / p50, "steps/s"),

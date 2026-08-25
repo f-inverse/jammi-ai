@@ -522,8 +522,12 @@ async fn main() -> std::process::ExitCode {
 
 /// The `finetune-step` subcommand: run the tier and emit the report. Records;
 /// does not gate. Exits non-zero only when the step could not be measured at
-/// all — a missing checkpoint, a target-module set that matched no linear, or a
-/// device that could not be resolved.
+/// all — a missing checkpoint, a target-module set that matched no linear, a
+/// device that could not be resolved, or (contract K-aux)
+/// `JAMMI_KERNELS_DISABLE` naming an op key that never disabled a live
+/// dispatch this run (`finetune_step::run`'s doc) — an INVALID run, reported
+/// as a failure rather than as a JSON tier with a suspiciously-clean
+/// dispatch split.
 fn run_finetune_step(params: finetune_step::FinetuneStepParams) -> std::process::ExitCode {
     let tier = match finetune_step::run(&params) {
         Ok(t) => t,

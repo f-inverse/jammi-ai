@@ -1512,6 +1512,10 @@ mod tests {
     fn new_accepts_an_exact_power_of_two_scale_and_refuses_a_non_power_of_two_one() {
         let op = AttentionBlockFused::new(0.125, FullyMaskedPolicy::Propagate, false)
             .expect("0.125 = 2^-3 is an exact power of two");
+        // The op's tape name is what error messages and the consumer-side
+        // dispatch counters key on — pinned here (cargo-mutants' `""` /
+        // `"xyzzy"` replacements were otherwise unobserved).
+        assert_eq!(op.name(), "attention_block_fused");
         assert_eq!(
             op.scale(),
             0.125,

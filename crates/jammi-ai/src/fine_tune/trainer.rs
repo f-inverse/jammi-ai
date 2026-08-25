@@ -210,7 +210,23 @@ pub struct TrainingLoop {
     /// `state.last_completed_epoch + 1` with weights, optimizer moments, scaler,
     /// and dropout positions restored.
     resume: Option<RestoredCheckpoint>,
+    /// Test seam: runs on the gradients every optimizer step is about to
+    /// consume, right after `backward` (and, on the GradCache arm, after the
+    /// two-pass `gradcache_backward`), keyed by the 1-based index of that
+    /// step. Lets a test poison a chosen step's gradient — the only way to
+    /// reach `clip_and_step`'s last-step check through the REAL `run` with a
+    /// NaN that the pre-step loss read cannot see. Never compiled into the
+    /// production binary.
+    #[cfg(test)]
+    after_backward: Option<AfterBackwardHook>,
 }
+
+/// See [`TrainingLoop::after_backward`]: `(step, grads, trainable_vars)`,
+/// where `step` is the 1-based index of the optimizer step about to consume
+/// `grads` (`global_step + 1`). `Send` because a `TrainingLoop` is driven
+/// from `spawn_blocking`.
+#[cfg(test)]
+type AfterBackwardHook = Box<dyn FnMut(usize, &mut GradStore, &[Var]) -> Result<()> + Send>;
 
 /// Builder for [`TrainingLoop`].
 pub struct TrainingLoopBuilder {
@@ -350,6 +366,8 @@ impl TrainingLoopBuilder {
             cancel: self.cancel,
             artifact_store: self.artifact_store,
             resume: self.resume,
+            #[cfg(test)]
+            after_backward: None,
         })
     }
 }
@@ -1176,7 +1194,10 @@ impl TrainingLoop {
         })();
 
         self.target.set_training(true);
-        let (mut grads, loss_val) = outcome?;
+        let (grads, loss_val) = outcome?;
+        #[cfg(test)]
+        let grads = self.poke_after_backward(global_step + 1, grads, trainable_vars)?;
+        let mut grads = grads;
 
         // GradCache takes exactly ONE optimizer step per EPOCH, not one per
         // accumulation window — the caller passes `total_optimizer_steps` as
@@ -1659,6 +1680,21 @@ impl TrainingLoop {
         }
     }
 
+    /// Run the [`Self::after_backward`] test seam (if installed) over the
+    /// gradients optimizer step `step` (1-based) is about to consume.
+    #[cfg(test)]
+    fn poke_after_backward(
+        &mut self,
+        step: usize,
+        mut grads: GradStore,
+        trainable_vars: &[Var],
+    ) -> Result<GradStore> {
+        if let Some(hook) = self.after_backward.as_mut() {
+            hook(step, &mut grads, trainable_vars)?;
+        }
+        Ok(grads)
+    }
+
     /// Process a single batch loss: divergence detection, gradient accumulation
     /// via immediate backward, and optimizer step every N micro-batches.
     ///
@@ -1723,6 +1759,9 @@ impl TrainingLoop {
         let new_grads = scaled_loss
             .backward()
             .map_err(|e| JammiError::FineTune(format!("Backward: {e}")))?;
+        #[cfg(test)]
+        let new_grads =
+            self.poke_after_backward(*epoch.global_step + 1, new_grads, ctx.trainable_vars)?;
 
         #[cfg(test)]
         PER_MICRO_BATCH_HOST_READ_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -3964,22 +4003,14 @@ mod host_read_discipline {
 /// `refuse_nonfinite_norm`, so getting `is_last_step` right on this arm is
 /// load-bearing in a way the accumulation-window arm (which has the
 /// loss-value backstop too) is not.
+/// Fixtures shared by the run-level oracles below: the hermetic `tiny_bert`
+/// base model and the registered-model + claimed-job catalog state
+/// [`TrainingLoop::run`] stamps its start metrics against.
 #[cfg(test)]
-mod gradcache_last_step_oracle {
+mod test_fixtures {
     use std::sync::Arc;
 
-    use candle_core::{DType, Device, Tensor};
-    use candle_nn::{ParamsAdamW, VarBuilder, VarMap};
-
-    use super::super::data::TrainingDataLoader;
-    use super::super::lora::build_projection_head;
-    use super::super::target::TrainingTarget;
-    use super::super::{EmbeddingLoss, FineTuneConfig};
-    use super::TrainingLoopBuilder;
-    use crate::fine_tune::adamw::AdamW;
     use crate::model::{ModelSource, ModelTask};
-
-    const HIDDEN: usize = 32; // tiny_bert's hidden width.
 
     /// Load the hermetic `tiny_bert` cookbook fixture through a real
     /// `InferenceSession`'s model cache — the same resolve+backend-load path
@@ -3987,7 +4018,7 @@ mod gradcache_last_step_oracle {
     /// `session.rs`'s equivalent seam). Real, but tiny and local: no network,
     /// sub-second load, matching every other `tiny_bert`-fixture test in
     /// `tests/it`.
-    async fn tiny_bert() -> Arc<crate::model::LoadedModel> {
+    pub(super) async fn tiny_bert() -> Arc<crate::model::LoadedModel> {
         let dir = tempfile::tempdir().unwrap();
         let config = jammi_test_utils::test_config(dir.path());
         let session = crate::session::InferenceSession::new(config).await.unwrap();
@@ -3999,6 +4030,67 @@ mod gradcache_last_step_oracle {
             .unwrap();
         guard.model.clone()
     }
+
+    /// A catalog holding a registered model and a training job `tag`
+    /// claimed by `{tag}-worker` — what `run`'s lease-guarded
+    /// `mark_training_running` needs. Returns the catalog and the tempdir
+    /// backing it (also usable as the loop's `artifact_dir`).
+    pub(super) async fn claimed_job(
+        tag: &str,
+    ) -> (Arc<jammi_db::catalog::Catalog>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(jammi_db::catalog::Catalog::open(dir.path()).await.unwrap());
+        let model_id = format!("{tag}-model");
+        catalog
+            .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
+                model_id: &model_id,
+                version: 1,
+                model_type: "embedding",
+                backend: "candle",
+                task: ModelTask::TextEmbedding,
+                base_model_id: None,
+                artifact_path: None,
+                config_json: None,
+            })
+            .await
+            .unwrap();
+        catalog
+            .create_training_job(jammi_db::catalog::training_repo::CreateTrainingJobParams {
+                job_id: tag,
+                base_model_id: &format!("{model_id}::1"),
+                training_source: "src",
+                loss_type: "mnrl",
+                hyperparams: "{}",
+                kind: "fine_tune",
+                training_spec: "{}",
+            })
+            .await
+            .unwrap();
+        catalog
+            .claim_next_training_job(&format!("{tag}-worker"), std::time::Duration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("queued job is claimable");
+        (catalog, dir)
+    }
+}
+
+#[cfg(test)]
+mod gradcache_last_step_oracle {
+    use std::sync::Arc;
+
+    use candle_core::{DType, Device, Tensor};
+    use candle_nn::{ParamsAdamW, VarBuilder, VarMap};
+
+    use super::super::data::TrainingDataLoader;
+    use super::super::lora::build_projection_head;
+    use super::super::target::TrainingTarget;
+    use super::super::{EmbeddingLoss, FineTuneConfig};
+    use super::test_fixtures::tiny_bert;
+    use super::TrainingLoopBuilder;
+    use crate::fine_tune::adamw::AdamW;
+
+    const HIDDEN: usize = 32; // tiny_bert's hidden width.
 
     /// RED-first (B2/B3): `run_gradcache_epoch`'s `is_last_step` must reflect
     /// GradCache's TRUE per-epoch horizon (`self.config.epochs`), not the
@@ -4126,6 +4218,221 @@ mod gradcache_last_step_oracle {
                 "expected a non-finite grad-norm refusal, got: {err}"
             );
         });
+    }
+}
+
+/// End-to-end last-step harness: every arm of `TrainingLoop::run` drives the
+/// REAL entry point with a fixture that reaches that arm, and a gradient
+/// poisoned to NaN (through the `after_backward` test seam) on exactly the
+/// run's LAST optimizer step. The run is shorter than
+/// `DEFAULT_NORM_CHECK_INTERVAL`, so the ONLY thing that can surface that
+/// NaN as the grad-norm refusal is the arm's `is_last_step` — the modulo
+/// cadence never fires, and step 1 (always checked) is never the poisoned
+/// step. Each test asserts the SPECIFIC grad-norm refusal (naming the step),
+/// not just "some error": with `is_last_step` forced `false` the NaN trains
+/// in silently and the run ends in `refuse_nonfinite_params`'s DIFFERENT
+/// refusal at the epoch boundary — so the assertion discriminates the two.
+///
+/// Per arm, the horizon is that arm's actual loop, not a shared formula:
+///  - accumulation window: `ceil(micro_batches / grad_accum) * epochs`, the
+///    last step taken INSIDE `process_batch_loss` (micro-batch count a
+///    multiple of `grad_accum`);
+///  - trailing partial-window flush: same horizon, the last step taken at
+///    `run`'s epoch-end flush (micro-batch count NOT a multiple);
+///  - plain per-batch (`grad_accum == 1`): `micro_batches * epochs`, the last
+///    step inside `process_batch_loss`;
+///  - GradCache: `epochs` (one step per epoch, `run_gradcache_epoch`).
+///
+/// The healthy control per arm (no poison) must complete with
+/// `result.total_steps` equal to that horizon — proof the fixture reaches
+/// the arm and that the poisoned step IS the run's last.
+#[cfg(test)]
+mod last_step_run_harness {
+    use candle_core::{DType, Device, Tensor};
+    use candle_nn::{VarBuilder, VarMap};
+
+    use super::super::data::TrainingDataLoader;
+    use super::super::lora::build_projection_head;
+    use super::super::target::TrainingTarget;
+    use super::super::{EarlyStoppingMetric, EmbeddingLoss, FineTuneConfig};
+    use super::{AfterBackwardHook, TrainingLoopBuilder, TrainingResult};
+    use crate::fine_tune::optimizer::DEFAULT_NORM_CHECK_INTERVAL;
+
+    const HIDDEN: usize = 32; // tiny_bert's hidden width.
+
+    fn text_config() -> FineTuneConfig {
+        FineTuneConfig {
+            epochs: 1,
+            batch_size: 2,
+            validation_fraction: 0.0,
+            warmup_steps: 0,
+            gradient_accumulation_steps: 1,
+            lora_rank: 2,
+            early_stopping_metric: EarlyStoppingMetric::TrainLoss,
+            early_stopping_patience: 10_000,
+            learning_rate: 1e-3,
+            ..Default::default()
+        }
+    }
+
+    fn pairs(n: usize) -> TrainingDataLoader {
+        TrainingDataLoader::from_pairs(
+            (0..n)
+                .map(|i| (format!("anchor text {i}"), format!("positive text {i}")))
+                .collect(),
+        )
+    }
+
+    /// A hook that replaces the first trainable var's gradient with NaN on
+    /// optimizer step `step` (1-based) and leaves every other step untouched.
+    fn poison_grad_at(step: usize) -> AfterBackwardHook {
+        Box::new(move |s, grads, vars| {
+            if s == step {
+                let t: &Tensor = &vars[0];
+                let nan = Tensor::full(f32::NAN, t.dims(), t.device())
+                    .map_err(|e| jammi_db::error::JammiError::FineTune(e.to_string()))?;
+                grads.insert(t, nan);
+            }
+            Ok(())
+        })
+    }
+
+    /// Build a real text-path loop over `tiny_bert` (registered model +
+    /// claimed job, as `run` requires) and run it to completion on `loader`,
+    /// with an optional after-backward hook installed.
+    fn run_text_loop(
+        tag: &str,
+        config: FineTuneConfig,
+        loader: TrainingDataLoader,
+        hook: Option<AfterBackwardHook>,
+    ) -> jammi_db::error::Result<TrainingResult> {
+        // A multi-thread runtime: `run` blocks on the catalog through
+        // `Handle::current()`, which on a current-thread runtime cannot
+        // drive the IO driver from outside `Runtime::block_on`. Driving it
+        // from `spawn_blocking` is exactly the worker's production shape.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (mut loop_, _dir) = rt.block_on(async {
+            let base_model = super::test_fixtures::tiny_bert().await;
+            let (catalog, dir) = super::test_fixtures::claimed_job(tag).await;
+            let device = Device::Cpu;
+            let varmap = VarMap::new();
+            let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+            let head = build_projection_head(HIDDEN, &config, &varmap, &vb).unwrap();
+            let loop_ =
+                TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+                    .device(device)
+                    .job_id(tag.into())
+                    .worker_id(format!("{tag}-worker"))
+                    .catalog(catalog)
+                    .artifact_dir(dir.path().to_path_buf())
+                    .base_model(base_model)
+                    .build()
+                    .unwrap();
+            (loop_, dir)
+        });
+        loop_.after_backward = hook;
+        rt.block_on(async move { tokio::task::spawn_blocking(move || loop_.run(&loader)).await })
+            .unwrap()
+    }
+    /// The typed grad-norm refusal, discriminated from every other error the
+    /// run could end in: it must name the poisoned step.
+    fn assert_grad_norm_refusal(err: &jammi_db::error::JammiError, step: usize) {
+        let msg = err.to_string();
+        assert!(
+            msg.contains("non-finite total gradient norm") && msg.contains(&format!("step {step}")),
+            "expected the grad-norm refusal naming optimizer step {step}, got: {msg}"
+        );
+    }
+
+    /// Arm: accumulation window, the last step taken INSIDE
+    /// `process_batch_loss` — 8 pairs at `batch_size: 2` = 4 micro-batches,
+    /// `grad_accum: 2`, one epoch → 2 optimizer steps, both at window
+    /// boundaries (no trailing flush). Poisoned step: 2.
+    ///
+    /// Mutation: force `is_last_step = false` at `process_batch_loss`'s
+    /// `clip_and_step` — RED (the NaN trains in; the run ends in
+    /// `refuse_nonfinite_params`'s epoch-boundary refusal, not this one).
+    #[test]
+    fn accumulation_window_arm_refuses_a_nonfinite_gradient_on_the_runs_last_step() {
+        let config = FineTuneConfig {
+            gradient_accumulation_steps: 2,
+            ..text_config()
+        };
+        let healthy = run_text_loop("last-step-accum-ok", config.clone(), pairs(8), None).unwrap();
+        assert_eq!(healthy.total_steps, 2, "control: the arm's horizon");
+        assert!(2 < DEFAULT_NORM_CHECK_INTERVAL);
+
+        let err = run_text_loop("last-step-accum", config, pairs(8), Some(poison_grad_at(2)))
+            .expect_err("a NaN gradient on the run's last window must be refused");
+        assert_grad_norm_refusal(&err, 2);
+    }
+
+    /// Arm: the trailing partial-window flush at `run`'s epoch end — 6
+    /// pairs = 3 micro-batches, `grad_accum: 2`, one epoch → step 1 at
+    /// micro-batch 2 (inside `process_batch_loss`), step 2 = the flush of the
+    /// lone trailing micro-batch. Poisoned step: 2.
+    ///
+    /// Mutation: force `is_last_step = false` at the epoch-end flush's
+    /// `clip_and_step` in `run` — RED.
+    #[test]
+    fn trailing_flush_arm_refuses_a_nonfinite_gradient_on_the_runs_last_step() {
+        let config = FineTuneConfig {
+            gradient_accumulation_steps: 2,
+            ..text_config()
+        };
+        let healthy = run_text_loop("last-step-flush-ok", config.clone(), pairs(6), None).unwrap();
+        assert_eq!(healthy.total_steps, 2, "control: the arm's horizon");
+
+        let err = run_text_loop("last-step-flush", config, pairs(6), Some(poison_grad_at(2)))
+            .expect_err("a NaN gradient on the run's trailing flush must be refused");
+        assert_grad_norm_refusal(&err, 2);
+    }
+
+    /// Arm: plain per-batch stepping (`grad_accum: 1`) — 6 pairs = 3
+    /// micro-batches, one epoch → 3 steps, every one inside
+    /// `process_batch_loss`. Poisoned step: 3 (not step 1, not on the
+    /// modulo cadence).
+    ///
+    /// Mutation: force `is_last_step = false` at `process_batch_loss`'s
+    /// `clip_and_step` — RED.
+    #[test]
+    fn per_batch_arm_refuses_a_nonfinite_gradient_on_the_runs_last_step() {
+        let config = text_config();
+        let healthy = run_text_loop("last-step-plain-ok", config.clone(), pairs(6), None).unwrap();
+        assert_eq!(healthy.total_steps, 3, "control: the arm's horizon");
+
+        let err = run_text_loop("last-step-plain", config, pairs(6), Some(poison_grad_at(3)))
+            .expect_err("a NaN gradient on the run's last per-batch step must be refused");
+        assert_grad_norm_refusal(&err, 3);
+    }
+
+    /// Arm: GradCache (non-precomputed loader, `cached` + in-batch-negative
+    /// objective) — one optimizer step per EPOCH: 6 pairs chunked at
+    /// `batch_size: 2` (3 memory-bounded passes per epoch), `epochs: 2` →
+    /// horizon 2. Poisoned step: 2.
+    ///
+    /// Mutations: force `is_last_step = false` in `run_gradcache_epoch` —
+    /// RED; replace `total_optimizer_steps`'s arm selection with the
+    /// accumulation-window `total_steps` (`ceil(3 / 1) * 2 == 6`) — RED
+    /// (step 2 is then neither the horizon nor past it).
+    #[test]
+    fn gradcache_arm_refuses_a_nonfinite_gradient_on_the_runs_last_step() {
+        let config = FineTuneConfig {
+            cached: true,
+            embedding_loss: Some(EmbeddingLoss::MultipleNegativesRanking { temperature: 20.0 }),
+            epochs: 2,
+            ..text_config()
+        };
+        let healthy = run_text_loop("last-step-gc-ok", config.clone(), pairs(6), None).unwrap();
+        assert_eq!(healthy.total_steps, 2, "control: one step per epoch");
+
+        let err = run_text_loop("last-step-gc", config, pairs(6), Some(poison_grad_at(2)))
+            .expect_err("a NaN gradient on the run's last GradCache epoch must be refused");
+        assert_grad_norm_refusal(&err, 2);
     }
 }
 

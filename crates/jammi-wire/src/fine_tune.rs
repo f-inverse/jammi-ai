@@ -313,8 +313,8 @@ pub struct FineTuneConfig {
     /// Maximum global L2 norm for gradient clipping. `0.0` disables clipping.
     /// Default: 1.0. Matches `train_embedding_model.py` which uses
     /// `torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)`. Must be
-    /// finite: refused at deserialization ([`finite_max_grad_norm`]) and by
-    /// [`Self::validate`].
+    /// finite: refused at deserialization (`finite_max_grad_norm`, the
+    /// `deserialize_with` hook) and by [`Self::validate`].
     #[serde(
         default = "default_max_grad_norm",
         deserialize_with = "finite_max_grad_norm"

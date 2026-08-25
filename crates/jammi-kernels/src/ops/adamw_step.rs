@@ -112,6 +112,30 @@
 //! without an explicit `.mul_add()` call, so no intrinsic-pinning is needed
 //! there — but the `+ 0.0` laundering above is required on CPU too (Rust
 //! does not add it for you either).
+//!
+//! **Roofline (guide §2), measured, not assumed.** This fused step's
+//! traffic model per `Var`, one full [`adamw_step_fused_t`] call: 4 bytes
+//! each for `theta`/`first_moment`/`second_moment` READ, 4 bytes for
+//! `grad` READ, 3×4 bytes for `theta`/`first_moment`/`second_moment`
+//! WRITTEN — 28 B/elt. Measured on jammi-a100 (A100 SXM4 80GB, 2039 GB/s
+//! HBM2e), same-run, one `Var` at a time, at the four production LoRA
+//! shapes this module's tests use: `[16,1024]` (16384 elem) 9.2 µs/call,
+//! 49.7 GB/s, 2.44% of roofline; `[3072,16]` (49152 elem) 9.3 µs/call,
+//! 147.8 GB/s, 7.25%; `[1024,16]` (16384 elem) 9.2 µs/call, 50.0 GB/s,
+//! 2.45%; `[5248,16]` (83968 elem) 9.8 µs/call, 241.1 GB/s, 11.82%. The
+//! per-call time barely moves (9.2-9.8 µs) while element count varies 5x
+//! (16384-83968) — this is LAUNCH-LATENCY bound, not bandwidth-bound, at
+//! every one of this module's production shapes (three kernel launches per
+//! call dominate; see this doc's "unit of fusion" note above). Stating
+//! this plainly rather than asserting a bandwidth-bound framing the data
+//! does not support: the lever this op pays for is eliminating the
+//! `Var::set` D2D memcpy `CustomOp` would otherwise force, not reaching a
+//! bandwidth roofline at these small per-`Var` element counts. Not a
+//! committed artifact (`crates/jammi-kernels/artifacts/cuda-runs/`,
+//! guide §4) — that, and the end-to-end `s_per_step_p50`/`peak_vram_bytes`
+//! comparison against the eager phase, is the wiring's job once
+//! `admission`/`DispatchCounters` are live at the call site (advisory,
+//! left to `jammi-ai::fine_tune::adamw`).
 
 use candle_core::backend::BackendStorage;
 use candle_core::{CpuStorage, Error, InplaceOp2, InplaceOp3, Layout, Result, Tensor};
@@ -1354,6 +1378,34 @@ mod tests {
         )
         .expect_err("F32 moment vs F64 grad must be refused, not silently reinterpreted");
         assert!(matches!(err, Error::DTypeMismatchBinaryOp { .. }));
+    }
+
+    /// MUT-triage: `red_control_mismatched_dtype_is_refused` (above) only
+    /// exercises the guard with an ACTUAL disagreement (F32 vs F64), so it
+    /// cannot distinguish the real `s1.dtype() != s2.dtype()` guard from a
+    /// mutant that replaces it with the literal `true` (both give
+    /// `DTypeMismatchBinaryOp` when the dtypes really do disagree). This
+    /// test uses AGREEING non-F32 dtypes (both F64) — the real guard is
+    /// `false` here, falling to the catch-all `UnsupportedDTypeForOp`; a
+    /// `!= -> true` mutant would incorrectly report `DTypeMismatchBinaryOp`
+    /// instead. Mirrors `all_agreeing_non_f32_dtype_hits_the_catchall_not_
+    /// a_mismatch_error`'s pattern for `AdamThetaUpdate`.
+    #[test]
+    fn red_control_all_agreeing_non_f32_dtype_hits_the_catchall() {
+        let dev = Device::Cpu;
+        let m = Tensor::zeros((2,), DType::F64, &dev).unwrap();
+        let g = Tensor::from_slice(&[1.0f64, 2.0], (2,), &dev).unwrap();
+        let err = super::super::apply_inplace2(
+            &m,
+            &g,
+            AdamMomentUpdateFmaContractedRedControl::new(0.9, false),
+        )
+        .expect_err("F64 has no red-control CPU implementation (F32 only)");
+        assert!(
+            matches!(err, Error::UnsupportedDTypeForOp(..)),
+            "all-agreeing-but-non-F32 must hit the catch-all arm, not DTypeMismatchBinaryOp \
+             — got {err:?}"
+        );
     }
 
     /// Non-contiguous view oracle (CPU walks arbitrary strides): a

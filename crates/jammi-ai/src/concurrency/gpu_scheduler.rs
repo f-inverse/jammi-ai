@@ -115,7 +115,21 @@ impl GpuScheduler {
         if gpu_device < 0 {
             return Self::new_unlimited();
         }
-        match Self::detect_gpu_memory(gpu_device as usize) {
+        Self::from_probe(
+            gpu_device,
+            memory_fraction,
+            Self::detect_gpu_memory(gpu_device as usize),
+        )
+    }
+
+    /// Build the scheduler from an already-obtained [`Self::detect_gpu_memory`]
+    /// result, so a caller that needs to know the probe's own outcome (a test
+    /// asserting `for_device` reflects it) probes exactly once. A second,
+    /// separate `detect_gpu_memory` call to "check what the probe said" would
+    /// be a TOCTOU: on a live pod the card's free memory — and thus whether
+    /// the probe itself succeeds — can change between two calls.
+    fn from_probe(gpu_device: i32, memory_fraction: f64, probe: Result<(usize, usize)>) -> Self {
+        match probe {
             Ok((_free, total)) => {
                 let headroom_fraction = (1.0 - memory_fraction).clamp(0.0, 1.0);
                 tracing::info!(
@@ -234,13 +248,16 @@ mod tests {
     /// whether the `cuda` feature happens to be compiled in.
     ///
     /// Two arms, chosen by [`GpuScheduler::detect_gpu_memory`] itself (the
-    /// exact probe `for_device` calls), not by `#[cfg(feature = "cuda")]`:
-    /// `--features cuda` compiles on a GPU-less box too (CI's compile-check
-    /// lane), where the probe still fails, so a feature-gated test would
-    /// either assume absence wrongly or — as the previous
-    /// `#[cfg(not(feature = "cuda"))]` version of this test did — simply not
-    /// run at all under `--features cuda`, leaving both the compile-check
-    /// lane and a real GPU pod unverified.
+    /// exact probe `for_device` calls — probed exactly once here and fed into
+    /// [`GpuScheduler::from_probe`], since a second, separate
+    /// `detect_gpu_memory` call to decide which arm applies would be a
+    /// TOCTOU on a live pod), not by `#[cfg(feature = "cuda")]`: there is no
+    /// CI lane that builds `--features cuda` on a GPU-less box and runs this
+    /// suite — the only `--features cuda` builds are the from-source release
+    /// lanes (`cargo build --bin jammi-server`, never `cargo test`) and the
+    /// GPU-prove lane, which always runs on a real rented A100. So a
+    /// feature-gated test would never exercise its "device absent" branch in
+    /// CI at all.
     /// - **No device** (hermetic CPU build, or a `cuda`-feature build with no
     ///   hardware/driver): the probe errs, so `for_device` must degrade to
     ///   unlimited rather than fabricating a budget.
@@ -249,8 +266,10 @@ mod tests {
     ///   unlimited pass-through.
     #[test]
     fn for_device_reflects_probe_presence() {
-        let sched = GpuScheduler::for_device(0, 0.9);
-        if GpuScheduler::detect_gpu_memory(0).is_ok() {
+        let probe = GpuScheduler::detect_gpu_memory(0);
+        let probe_ok = probe.is_ok();
+        let sched = GpuScheduler::from_probe(0, 0.9, probe);
+        if probe_ok {
             assert!(
                 !sched.unlimited,
                 "a real, probed GPU must enable memory-budget admission, not unlimited pass-through"
@@ -258,6 +277,40 @@ mod tests {
         } else {
             assert!(sched.unlimited);
         }
+    }
+
+    /// The CPU-only-build stub is a fixed contract, not merely "whatever the
+    /// `cuda` feature happens to leave uncalled": under
+    /// `#[cfg(not(feature = "cuda"))]`, `detect_gpu_memory` must always
+    /// report `Err`, for every `device_id` — there is no CUDA runtime to
+    /// probe in this build, full stop. `for_device_reflects_probe_presence`
+    /// above only checks that `for_device`'s `unlimited` flag tracks whether
+    /// the probe succeeded or failed; it never checks the probe's own
+    /// Err/Ok verdict independently, so a stub mutated to fabricate
+    /// `Ok((0, 0))` slips through undetected there (confirmed by `cargo
+    /// mutants --file gpu_scheduler.rs`, which missed exactly this).
+    #[test]
+    #[cfg(not(feature = "cuda"))]
+    fn detect_gpu_memory_cpu_only_build_always_errs() {
+        assert!(GpuScheduler::detect_gpu_memory(0).is_err());
+        assert!(GpuScheduler::detect_gpu_memory(7).is_err());
+    }
+
+    /// `try_acquire`'s admission check is a SUM against the budget
+    /// (`current + bytes > usable`), not a product. With the round numbers
+    /// `budget_reflects_memory_fraction` (below) uses, `+` and `*` happen to
+    /// agree on every assertion there (`cargo mutants` confirmed `replace +
+    /// with *` survives it), so this picks small values where they visibly
+    /// disagree: after a 10-byte reservation, `10 + 50 = 60` fits a 100-byte
+    /// budget but `10 * 50 = 500` would not.
+    #[test]
+    fn try_acquire_is_additive_not_multiplicative() {
+        let sched = Arc::new(GpuScheduler::new(100, 0.0));
+        let _first = sched.try_acquire(10).expect("10 <= 100 admits");
+        assert!(
+            sched.try_acquire(50).is_some(),
+            "10 (already reserved) + 50 (requested) = 60 must fit a 100-byte budget"
+        );
     }
 
     /// `memory_fraction` maps to usable budget: with a 1 GiB card and 0.9,

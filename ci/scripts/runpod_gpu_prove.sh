@@ -42,6 +42,9 @@ echo "::endgroup::"
 echo "::group::engine-core GPU correctness (jammi-ai gpu_capability)"
 cargo test -p jammi-ai --features cuda,live-gpu-tests --test gpu_capability -- --nocapture --test-threads=1 || rc=\$?
 echo "::endgroup::"
+echo "::group::engine-core CUDA device-selection unit tests (jammi-ai --lib, no other lane runs --lib under --features cuda)"
+cargo test -p jammi-ai --lib --features cuda -- --nocapture --test-threads=1 || rc=\$?
+echo "::endgroup::"
 echo "::group::GPU embedding perf — recorded observability, non-gating (jammi-bench gpu-inference-scale)"
 cargo run -p jammi-bench --release --features cuda -- gpu-inference-scale || rc=\$?
 echo "::endgroup::"

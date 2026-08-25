@@ -2255,93 +2255,231 @@ mod device_tests {
         fn exit(&self, _: &tracing::span::Id) {}
     }
 
-    /// Whether a CUDA device actually initializes in this process right now —
-    /// probed the exact way [`select_device`] probes it (`Device::new_cuda`),
-    /// never inferred from the `cuda` feature flag. The flag only says the
-    /// *code path* to try CUDA was compiled in; CI's compile-check lane
-    /// builds `--features cuda` on a box with no GPU, so the flag alone
-    /// cannot decide which arm of the tests below is meaningful — only an
-    /// actual device-open attempt can. `Device::new_cuda` itself always
-    /// compiles regardless of the feature (candle-core falls back to a dummy
-    /// backend that unconditionally errors when its own `cuda` feature is
-    /// off), so this probe is safe to call in every build configuration.
-    fn gpu_actually_present() -> bool {
-        Device::new_cuda(0).is_ok()
+    /// Which accelerator, if any, actually initializes in this process right
+    /// now — probed the exact way [`select_device`] probes it
+    /// (`Device::new_cuda` / `Device::new_metal`), never inferred from the
+    /// `cuda` / `metal` feature flags. Both constructors always compile
+    /// regardless of the feature (candle-core falls back to a dummy backend
+    /// that unconditionally errors when its own feature is off — see
+    /// `candle_core::{cuda, dummy_metal_backend}` in its `lib.rs`), so
+    /// calling both here is safe in every build configuration and the
+    /// feature flags alone never decide which arm of the tests below is
+    /// meaningful.
+    ///
+    /// There is no CI "compile-check lane" that builds `--features cuda` on
+    /// a GPU-less box: `ci.yml`'s `compile-check-gated` job explicitly
+    /// compile-checks the GPU-capability suite *without* `cuda` ("Compile-
+    /// checked without `cuda`"). `--features cuda` does compile on a
+    /// GPU-less runner, but only as `cargo build --release -p jammi-server
+    /// --bin jammi-server` in the from-source release lanes
+    /// (`release-binaries.yml`'s `server-cu12` job, `pypi-server-cuda.yml`)
+    /// — never `--lib`, `--test`, or any `cargo test`. The only lane that
+    /// runs `cargo test -p jammi-ai --lib --features cuda` (this module,
+    /// wired into `ci/scripts/runpod_gpu_prove.sh` in this round) always
+    /// runs on a real rented A100, never a GPU-less box. So a feature flag
+    /// never stands in for hardware presence in this suite; only the
+    /// runtime probe below does.
+    ///
+    /// Returns the opened device so a caller probes exactly once: reusing
+    /// this return value (rather than re-opening the device to decide what
+    /// "present" implies) avoids a TOCTOU between the presence check and the
+    /// outcome assertion.
+    fn gpu_actually_present() -> Option<Device> {
+        if let Ok(dev) = Device::new_cuda(0) {
+            return Some(dev);
+        }
+        if let Ok(dev) = Device::new_metal(0) {
+            return Some(dev);
+        }
+        None
     }
 
-    /// Shared assertion for the "a real device opened" arm, used by both
-    /// `require_gpu=true` and `require_gpu=false` below: once
-    /// `Device::new_cuda` in [`select_device`] succeeds, `require_gpu` plays
-    /// no further role — the only remaining outcomes are `Ok(Device::Cuda)`
-    /// or a driver/arch admission-floor rejection (`check_driver_floor`,
-    /// `check_compute_cap_floor`, boundary-tested without hardware just
-    /// below), never a silent CPU downgrade and never the "no usable GPU was
-    /// found" message that only `gpu_unavailable`'s device-absent path emits.
-    fn assert_present_device_outcome(outcome: Result<Device>, warned: bool) {
-        match outcome {
-            Ok(Device::Cuda(_)) => {
-                assert!(
-                    !warned,
-                    "a present GPU was selected; no CPU-fallback warning should fire"
+    /// # LATTICE — `select_device`'s outcome space
+    ///
+    /// `select_device` tries CUDA before Metal (:2012-2033) and only CUDA has
+    /// admission floors (driver, compute-cap); Metal has none. Full outcome
+    /// table, one row per cell this box can construct and the test/arm that
+    /// covers it:
+    ///
+    /// | device state | CUDA | Metal |
+    /// |---|---|---|
+    /// | no device | `require_gpu_reflects_device_presence` / `default_reflects_device_presence`, absent-arm: `Err(Gpu("GPU required…"))` (require_gpu=true) / `Ok(Cpu)` + warn (require_gpu=false) | same absent-arm (`Device::new_cuda` and `Device::new_metal` both fail, falling through to `gpu_unavailable`) |
+    /// | present + admitted | this fn, `Device::Cuda(_)` branch, `Ok(())` case: `Ok(Device::Cuda)`, no warn | this fn, `Device::Metal(_)` branch: `Ok(Device::Metal)`, no warn (Metal has no floor to refuse on) |
+    /// | present + floor-refused | this fn, `Device::Cuda(_)` branch, `Err(Gpu(_))` case: the exact rejection message `check_driver_floor`/`check_compute_cap_floor` compute, no warn | unreachable — `select_device` runs no floor check on `Device::Metal` |
+    /// | present + probe-broken | this fn, `Device::Cuda(_)` branch, `Err(Gpu(_))` case (same arm as floor-refused — both are `?`-propagated by `select_device` identically): the exact message `cuda_driver_cuda_version`/`cuda_compute_capability` compute, no warn | unreachable — nothing past `Device::new_metal` itself can fail on this path |
+    ///
+    /// Every present-arm cell is decided by re-running the SAME probes
+    /// `select_device` runs, against the SAME opened device, then asserting
+    /// `outcome` equals exactly what those probes compute — never "any
+    /// `Err(Gpu(_))` is acceptable". Round 1's bug: a permanently-broken
+    /// `cuda_compute_capability` probe (mutated to always
+    /// `Err(Gpu("could not query CUDA compute capability"))`) left the
+    /// present arm accepting that wrong outcome 3/3 GREEN, because the old
+    /// assertion only checked the message didn't say "no usable GPU was
+    /// found" — a probe-broken message trivially passes that too.
+    fn assert_present_device_outcome(dev: &Device, outcome: Result<Device>, warned: bool) {
+        assert!(
+            !warned,
+            "a present GPU must never also claim the CPU-fallback path fired"
+        );
+
+        match dev {
+            Device::Cuda(_) => {
+                // The independent probes below (raw `cuDriverGetVersion` FFI,
+                // `as_cuda_device`/`cuda_stream`/`compute_capability`) are
+                // only available through the real cudarc/candle-core CUDA
+                // backend, which is only linked under `#[cfg(feature =
+                // "cuda")]` (unlike `check_driver_floor` /
+                // `check_compute_cap_floor`, which also compile under
+                // `#[cfg(test)]` for boundary-testing without hardware). So
+                // this arm needs the real feature gate — not just `test`.
+                // Reaching `Device::Cuda(_)` without the `cuda` feature would
+                // mean `Device::new_cuda` succeeded against candle-core's
+                // dummy backend, which unconditionally errs; if that contract
+                // ever changes, this `unreachable!` is the signal to wire the
+                // real probes in for that cfg too.
+                #[cfg(feature = "cuda")]
+                {
+                    // Independent probes — deliberately NOT
+                    // `cuda_driver_cuda_version` / `cuda_compute_capability`
+                    // themselves. Calling those two wrapper functions again
+                    // here would make `expected` and `outcome` both depend on
+                    // the identical (possibly mutated) wrapper body: a
+                    // wrapper mutated to always return a fixed wrong value
+                    // would then agree with itself and `assert_eq!` below
+                    // would pass vacuously — `cargo mutants --file candle.rs`
+                    // confirmed exactly this: every value-substitution mutant
+                    // of these two functions was MISSED under an earlier
+                    // draft of this test that called them here too. Calling
+                    // the underlying cudarc/candle-core APIs directly (code
+                    // outside this crate, so this crate's own mutants sweep
+                    // cannot touch it) makes a mutation to either wrapper
+                    // show up as a genuine mismatch instead.
+                    use candle_core::cuda::cudarc::driver::sys as cuda_sys;
+                    let expected: Result<()> = (|| {
+                        let mut version: core::ffi::c_int = 0;
+                        // SAFETY: identical justification to
+                        // `cuda_driver_cuda_version`'s own comment — the
+                        // driver is loaded because `Device::new_cuda` already
+                        // succeeded (this is the present arm).
+                        let status = unsafe { cuda_sys::cuDriverGetVersion(&mut version) };
+                        assert_eq!(
+                            status,
+                            cuda_sys::CUresult::CUDA_SUCCESS,
+                            "independent cuDriverGetVersion probe failed ({status:?})"
+                        );
+                        check_driver_floor(version)?;
+
+                        let cuda_dev = dev
+                            .as_cuda_device()
+                            .expect("dev is Device::Cuda by the outer match");
+                        let (major, minor) = cuda_dev
+                            .cuda_stream()
+                            .context()
+                            .compute_capability()
+                            .expect("independent compute_capability probe failed");
+                        check_compute_cap_floor(major, minor)
+                    })();
+                    match expected {
+                        Ok(()) => assert!(
+                            matches!(outcome, Ok(Device::Cuda(_))),
+                            "this box's own driver/compute-cap probes clear both floors: \
+                             expected admission, got {outcome:?}"
+                        ),
+                        Err(JammiError::Gpu(expected_msg)) => match outcome {
+                            Err(JammiError::Gpu(msg)) => assert_eq!(
+                                msg, expected_msg,
+                                "select_device's rejection must be exactly what this box's own \
+                                 probes compute, not merely SOME Gpu error"
+                            ),
+                            other => panic!(
+                                "this box's own probes say {expected_msg:?}: expected that \
+                                 exact rejection, got {other:?}"
+                            ),
+                        },
+                        Err(other) => unreachable!(
+                            "check_driver_floor / check_compute_cap_floor only ever construct \
+                             JammiError::Gpu, got {other:?}"
+                        ),
+                    }
+                }
+                #[cfg(not(feature = "cuda"))]
+                unreachable!(
+                    "Device::new_cuda returned Ok without the `cuda` feature compiled in; \
+                     candle-core's dummy CUDA backend unconditionally errs, so this is \
+                     impossible for outcome={outcome:?}"
                 );
             }
-            Err(JammiError::Gpu(msg)) => {
+            Device::Metal(_) => {
+                // Metal has no floor checks in `select_device` (:2028-2033):
+                // once `Device::new_metal` opens, admission is unconditional.
                 assert!(
-                    !msg.contains("no usable GPU was found"),
-                    "device is present; must not claim absence: {msg}"
-                );
-                assert!(
-                    !warned,
-                    "a present-but-floor-rejected GPU must not also claim the CPU-fallback path fired"
+                    matches!(outcome, Ok(Device::Metal(_))),
+                    "Metal has no admission floor: a present Metal device must always be \
+                     admitted, got {outcome:?}"
                 );
             }
-            other => panic!(
-                "device present: expected Device::Cuda or a floor-rejection Gpu error, got {other:?}"
-            ),
+            Device::Cpu => unreachable!("gpu_actually_present only ever returns Cuda or Metal"),
         }
     }
 
     /// `require_gpu=true` must never silently serve on CPU, on any box.
     ///
-    /// Two arms, chosen by [`gpu_actually_present`] (a runtime probe of
-    /// whether CUDA truly initializes), not by the `cuda` feature flag —
-    /// `--features cuda` compiles on a GPU-less box too (CI's compile-check
-    /// lane), so the feature alone doesn't tell us whether a device is
-    /// really there:
-    /// - **No device** (the default CPU CI lane, or a `cuda`-feature build
-    ///   with no hardware): selection must surface a typed [`JammiError::Gpu`]
-    ///   naming the requirement, not fall back to CPU.
-    /// - **Device present** (a real GPU pod): selection must actually select
-    ///   the GPU — see [`assert_present_device_outcome`].
+    /// See the LATTICE doc on [`assert_present_device_outcome`] for the full
+    /// outcome table this test and [`default_reflects_device_presence`]
+    /// jointly cover; both are gated on the runtime probe
+    /// [`gpu_actually_present`], never on a feature flag.
     #[test]
     fn require_gpu_reflects_device_presence() {
-        let config = DeviceConfig {
-            gpu_device: 0,
-            memory_fraction: 0.9,
-            require_gpu: true,
-            compute_precision: jammi_numerics::ComputePrecision::F32,
-        };
-        let outcome = select_device(&config);
-        if gpu_actually_present() {
-            assert_present_device_outcome(outcome, false);
-        } else {
-            match outcome {
-                Err(JammiError::Gpu(msg)) => {
-                    assert!(msg.contains("GPU required"), "unexpected message: {msg}");
+        let capture = WarnCapture::default();
+        let flag = Arc::clone(&capture.saw_fallback_warning);
+        let present = gpu_actually_present();
+
+        let outcome = tracing::subscriber::with_default(capture, || {
+            let config = DeviceConfig {
+                gpu_device: 0,
+                memory_fraction: 0.9,
+                require_gpu: true,
+                compute_precision: jammi_numerics::ComputePrecision::F32,
+            };
+            select_device(&config)
+        });
+        let warned = flag.load(Ordering::SeqCst);
+
+        match present {
+            Some(dev) => assert_present_device_outcome(&dev, outcome, warned),
+            None => {
+                assert!(
+                    !warned,
+                    "require_gpu=true must hard-error on an absent device, never warn-and-fallback"
+                );
+                match outcome {
+                    Err(JammiError::Gpu(msg)) => {
+                        assert!(msg.contains("GPU required"), "unexpected message: {msg}");
+                    }
+                    other => panic!("no device present: expected JammiError::Gpu, got {other:?}"),
                 }
-                other => panic!("no device present: expected JammiError::Gpu, got {other:?}"),
             }
         }
     }
 
     /// The default (`require_gpu=false`) path degrades to CPU *only* when
-    /// there truly is no GPU — and warns loudly when it does. On a real GPU
-    /// pod it must select the GPU without a fallback warning, never
-    /// downgrade a present device to CPU.
+    /// there truly is no GPU — and warns loudly when it does
+    /// (`select_device`'s doc, :2000-2004). A present-but-floor-refused (or
+    /// probe-broken) GPU is a genuinely DIFFERENT case, documented
+    /// separately at :1996-1999 ("A CUDA device additionally clears two
+    /// floors before admission") as a hard `Err` unconditional on
+    /// `require_gpu` — it is NOT the ":2000-2004 degrades to CPU with a
+    /// warning" case, even though both paragraphs describe "a GPU was
+    /// requested but something went wrong". This test's present-arm (via
+    /// [`assert_present_device_outcome`]) can therefore assert `Err(Gpu(_))`
+    /// with no warn on a floor-refused/probe-broken box — naming that
+    /// distinction here, rather than silently reusing the "degrades to CPU"
+    /// doc paragraph for a case it doesn't describe, is the point of this
+    /// comment.
     ///
-    /// Same two arms as [`require_gpu_reflects_device_presence`], gated on
-    /// [`gpu_actually_present`] rather than the `cuda` feature flag for the
-    /// same compile-check-lane reason.
+    /// See the LATTICE doc on [`assert_present_device_outcome`] for the full
+    /// outcome table.
     #[test]
     fn default_reflects_device_presence() {
         let capture = WarnCapture::default();
@@ -2359,15 +2497,43 @@ mod device_tests {
         });
         let warned = flag.load(Ordering::SeqCst);
 
-        if present {
-            assert_present_device_outcome(outcome, warned);
-        } else {
-            assert!(
-                matches!(outcome, Ok(Device::Cpu)),
-                "expected CPU fallback, got {outcome:?}"
-            );
-            assert!(warned, "expected a loud warn-level CPU-fallback log");
+        match present {
+            Some(dev) => assert_present_device_outcome(&dev, outcome, warned),
+            None => {
+                assert!(
+                    matches!(outcome, Ok(Device::Cpu)),
+                    "expected CPU fallback, got {outcome:?}"
+                );
+                assert!(warned, "expected a loud warn-level CPU-fallback log");
+            }
         }
+    }
+
+    /// A negative `gpu_device` selects CPU unconditionally (`select_device`'s
+    /// doc, :1993), on every box, present GPU or not — the negative-ordinal
+    /// branch (:2009) returns before any accelerator probe runs. Runs on any
+    /// box with no hardware requirement: `cargo mutants` on this file caught
+    /// every other mutant of that `<` comparison
+    /// (`replace < with ==` / `replace < with <=` are caught by the existing
+    /// `gpu_device: 0` fixtures above, which trip the mutated `<=`/`==`
+    /// comparisons into taking the CPU branch when they shouldn't) but MISSED
+    /// `replace < with >`, because with `gpu_device: 0` both `0 < 0` and
+    /// `0 > 0` are `false` — the two comparisons are indistinguishable at
+    /// zero. Only a negative ordinal separates them (`-1 < 0` is `true`,
+    /// `-1 > 0` is `false`), which is exactly what this test exercises.
+    #[test]
+    fn negative_gpu_device_selects_cpu_unconditionally() {
+        let config = DeviceConfig {
+            gpu_device: -1,
+            memory_fraction: 0.9,
+            require_gpu: true,
+            compute_precision: jammi_numerics::ComputePrecision::F32,
+        };
+        assert!(
+            matches!(select_device(&config), Ok(Device::Cpu)),
+            "a negative gpu_device must select CPU unconditionally, even with require_gpu=true \
+             and regardless of whether a GPU is actually present"
+        );
     }
 
     /// The PTX-ISA driver floor (#304): a driver below the CUDA 12.6 line the

@@ -1237,6 +1237,21 @@ fn guard_regions_around_every_output_and_scratch_buffer_are_untouched() {
 }
 
 #[test]
+fn num_sms_and_dq_accum_splits_agree() {
+    let Some(dev) = cuda_device() else { return };
+    let n = flash::num_sms(&dev).unwrap();
+    // Any GPU this feature targets has many SMs (A100: 108); a stub
+    // answer of 0 or 1 is not a device.
+    assert!(n >= 2, "num_sms = {n}");
+    // ceil(num_SM / (1·1)) = num_SM: the two helpers share one source.
+    assert_eq!(dq_accum_splits(&dev, 1, 1, true).unwrap(), n);
+    assert_eq!(dq_accum_splits(&dev, 1, 1, false).unwrap(), 1);
+    // ceil(n / 6) for the fixture's B·H = 6.
+    assert_eq!(dq_accum_splits(&dev, 3, 2, true).unwrap(), n.div_ceil(6));
+    println!("num_sms = {n}");
+}
+
+#[test]
 fn abi_sizes_match_between_rust_and_c() {
     // No device needed, but the library must be linked: the C side
     // reports its sizeof, Rust its own.

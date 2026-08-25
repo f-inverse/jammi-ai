@@ -777,6 +777,7 @@ impl CustomOp3 for LowRankResidualLinear {
 mod tests {
     use super::*;
     use candle_core::{Device, Var};
+    use half::bf16;
 
     /// Small-integer-valued, deterministic fixture (`{-4, .., 4}`, no
     /// `rand` dependency): every product/partial-sum this crate's LoRA
@@ -1948,5 +1949,277 @@ mod tests {
             "measured FUSED node count: x, A, B (3 leaves) + A.t(), ab (Op::Cat), \
              out (CustomOp3) (3 tracked intermediates/output) — w contributes 0"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // `check_w_and_ab` (MUT-1: the whole body forced to `Ok(())`) — every
+    // shape/dtype refusal cell it covers, each its own test (the
+    // contract's explicit lattice requirement): `w`'s shape, `ab`'s row
+    // count, `ab`'s column count (`rank`), and `ab`'s dtype. Driven
+    // through `fused_forward` (the real call site path), not the
+    // `pub(crate)` helper directly, so these also prove the op refuses
+    // BEFORE reading any storage at the wrong shape (rather than
+    // panicking or reading garbage downstream).
+    // -----------------------------------------------------------------
+    #[test]
+    fn w_wrong_shape_is_refused() {
+        let device = Device::Cpu;
+        let (rows, inf, outf, r) = (3usize, 3usize, 4usize, 2usize);
+        let x = Tensor::from_slice(&exact_fixture(rows * inf, 1), (rows, inf), &device).unwrap();
+        // `w` has the WRONG `out_features` (outf + 1 rows).
+        let w = Tensor::from_slice(
+            &exact_fixture((outf + 1) * inf, 2),
+            (outf + 1, inf),
+            &device,
+        )
+        .unwrap();
+        let ab = pack_ab(
+            &exact_fixture(r * inf, 3),
+            inf,
+            &exact_fixture(outf * r, 4),
+            outf,
+            r,
+            &device,
+        );
+        let op = LowRankResidualLinear::new(1.0, inf, outf, r, None, false).unwrap();
+        let err = fused_forward(&x, &w, &ab, op).expect_err("a wrong-shaped w must be refused");
+        match err {
+            Error::Msg(msg) => assert!(
+                msg.contains("w must be"),
+                "expected a 'w must be [...]' message, got: {msg}"
+            ),
+            other => panic!("expected Error::Msg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ab_wrong_row_count_is_refused() {
+        let device = Device::Cpu;
+        let (rows, inf, outf, r) = (3usize, 3usize, 4usize, 2usize);
+        let x = Tensor::from_slice(&exact_fixture(rows * inf, 1), (rows, inf), &device).unwrap();
+        let w = Tensor::from_slice(&exact_fixture(outf * inf, 2), (outf, inf), &device).unwrap();
+        // `ab` has ONE EXTRA row: `[in+out+1, r]` instead of `[in+out, r]`.
+        let ab_v = exact_fixture((inf + outf + 1) * r, 5);
+        let ab = Tensor::from_slice(&ab_v, (inf + outf + 1, r), &device).unwrap();
+        let op = LowRankResidualLinear::new(1.0, inf, outf, r, None, false).unwrap();
+        let err = fused_forward(&x, &w, &ab, op).expect_err("a wrong row-count ab must be refused");
+        match err {
+            Error::Msg(msg) => assert!(
+                msg.contains("ab must be"),
+                "expected an 'ab must be [...]' message, got: {msg}"
+            ),
+            other => panic!("expected Error::Msg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ab_wrong_col_count_is_refused() {
+        let device = Device::Cpu;
+        let (rows, inf, outf, r) = (3usize, 3usize, 4usize, 2usize);
+        let x = Tensor::from_slice(&exact_fixture(rows * inf, 1), (rows, inf), &device).unwrap();
+        let w = Tensor::from_slice(&exact_fixture(outf * inf, 2), (outf, inf), &device).unwrap();
+        // `ab`'s column count (`rank`) is wrong: `r + 1` instead of `r`.
+        let ab_v = exact_fixture((inf + outf) * (r + 1), 6);
+        let ab = Tensor::from_slice(&ab_v, (inf + outf, r + 1), &device).unwrap();
+        let op = LowRankResidualLinear::new(1.0, inf, outf, r, None, false).unwrap();
+        let err =
+            fused_forward(&x, &w, &ab, op).expect_err("a wrong column-count ab must be refused");
+        match err {
+            Error::Msg(msg) => assert!(
+                msg.contains("ab must be"),
+                "expected an 'ab must be [...]' message, got: {msg}"
+            ),
+            other => panic!("expected Error::Msg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ab_wrong_dtype_is_refused() {
+        let device = Device::Cpu;
+        let (rows, inf, outf, r) = (3usize, 3usize, 4usize, 2usize);
+        let x = Tensor::from_slice(&exact_fixture(rows * inf, 1), (rows, inf), &device).unwrap();
+        let w = Tensor::from_slice(&exact_fixture(outf * inf, 2), (outf, inf), &device).unwrap();
+        // `ab` has the right SHAPE but the wrong DTYPE (BF16, not F32).
+        let ab_v: Vec<bf16> = exact_fixture((inf + outf) * r, 7)
+            .into_iter()
+            .map(bf16::from_f32)
+            .collect();
+        let ab = Tensor::from_slice(&ab_v, (inf + outf, r), &device).unwrap();
+        let op = LowRankResidualLinear::new(1.0, inf, outf, r, None, false).unwrap();
+        let err = fused_forward(&x, &w, &ab, op).expect_err("a BF16 ab must be refused");
+        match err {
+            Error::UnsupportedDTypeForOp(dtype, _) => assert_eq!(dtype, DType::BF16),
+            other => panic!("expected UnsupportedDTypeForOp(BF16, _), got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // `cpu_fwd`'s `for (l, what) in [(l2, "w"), (l3, "ab")]` loop (MUT-1:
+    // the `"w"` match arm deleted, leaving only the `_ => "...(ab)"`
+    // catch-all) — a non-contiguous `w` (contiguous `ab`) must be
+    // refused with the `w`-labeled op string specifically, not the
+    // `ab`-labeled one the deleted-arm mutant would report instead.
+    // -----------------------------------------------------------------
+    #[test]
+    fn non_contiguous_w_is_refused_with_the_w_op_label() {
+        let device = Device::Cpu;
+        let (rows, inf, outf, r) = (3usize, 3usize, 4usize, 2usize);
+        let x = Tensor::from_slice(&exact_fixture(rows * inf, 1), (rows, inf), &device).unwrap();
+        // A transposed `[inf, outf] -> [outf, inf]` view: contiguous
+        // along the WRONG axis for this op's `[out_features,
+        // in_features]` row-major expectation.
+        let w = Tensor::from_slice(&exact_fixture(inf * outf, 2), (inf, outf), &device)
+            .unwrap()
+            .t()
+            .unwrap();
+        assert!(!w.is_contiguous());
+        let ab = pack_ab(
+            &exact_fixture(r * inf, 3),
+            inf,
+            &exact_fixture(outf * r, 4),
+            outf,
+            r,
+            &device,
+        );
+        let op = LowRankResidualLinear::new(1.0, inf, outf, r, None, false).unwrap();
+        let err = fused_forward(&x, &w, &ab, op).expect_err("non-contiguous w must be refused");
+        match err {
+            Error::RequiresContiguous { op } => {
+                assert_eq!(op, "low_rank_residual_linear(w)");
+            }
+            other => panic!("expected RequiresContiguous{{op: \"...(w)\"}}, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // `bwd`'s three `==`->`!=` dtype-dispatch-branch survivors (MUT-1:
+    // :686 `grad_res.dtype() == F32`, :696 `base_dtype == F32`, :738
+    // `base_dtype == F32`). `bwd` is called DIRECTLY (bypassing
+    // `apply_op3`/`cpu_fwd`'s own dtype gate, which refuses a BF16 base
+    // on CPU today — see `bf16_base_on_cpu_is_a_typed_error...` above),
+    // white-box, so each branch's effect is observable even though the
+    // gate above never lets a BF16 base reach `bwd` through the real
+    // call site.
+    //
+    // Oracle A (all dtypes BF16, matching each other -- the only way
+    // EVERY intermediate GEMM in `bwd` stays dtype-consistent with its
+    // neighbour): this can never fully SUCCEED on this crate's CPU
+    // build (BF16 CPU matmul needs `mkl`/`accelerate`, neither enabled
+    // here — the same pre-existing limitation
+    // `bf16_base_on_cpu_is_a_typed_error...` discloses), so the real
+    // assertion is WHERE it fails: correct code upcasts `dy`/`x` to F32
+    // for every intermediate GEMM (:686, :696) and only the FINAL
+    // `dy_base_2d.matmul(w)` (unavoidably BF16xBF16) fails, with
+    // `UnsupportedDTypeForOp`. Either :686 or :696 mutated instead skips
+    // an upcast, so an EARLIER GEMM sees mismatched operand dtypes and
+    // fails with `DTypeMismatchBinaryOp` instead — a different, earlier,
+    // and therefore DISTINGUISHABLE failure.
+    // -----------------------------------------------------------------
+    #[test]
+    fn bwd_direct_all_bf16_oracle_fails_exactly_at_the_known_cpu_matmul_limit() {
+        let device = Device::Cpu;
+        let (rows, inf, outf, r) = (3usize, 3usize, 4usize, 2usize);
+        let xb: Vec<bf16> = exact_fixture(rows * inf, 1)
+            .into_iter()
+            .map(bf16::from_f32)
+            .collect();
+        let wb: Vec<bf16> = exact_fixture(outf * inf, 2)
+            .into_iter()
+            .map(bf16::from_f32)
+            .collect();
+        let x = Tensor::from_slice(&xb, (rows, inf), &device).unwrap();
+        let w = Tensor::from_slice(&wb, (outf, inf), &device).unwrap();
+        assert!(!w.is_variable() && !w.track_op(), "w must be a plain leaf");
+        let ab = pack_ab(
+            &exact_fixture(r * inf, 3),
+            inf,
+            &exact_fixture(outf * r, 4),
+            outf,
+            r,
+            &device,
+        );
+        let dyb: Vec<bf16> = exact_fixture(rows * outf, 6)
+            .into_iter()
+            .map(bf16::from_f32)
+            .collect();
+        let grad_res = Tensor::from_slice(&dyb, (rows, outf), &device).unwrap();
+        let res_dummy = Tensor::from_slice(&dyb, (rows, outf), &device).unwrap();
+
+        let op = LowRankResidualLinear::new(1.0, inf, outf, r, None, true).unwrap();
+        let err = op
+            .bwd(&x, &w, &ab, &res_dummy, &grad_res)
+            .expect_err("an all-BF16 bwd on this crate's mkl/accelerate-less CPU build must fail");
+        match err {
+            Error::UnsupportedDTypeForOp(dtype, _) => assert_eq!(
+                dtype,
+                DType::BF16,
+                "must fail at the SAME BF16-CPU-matmul limitation forward hits, not an \
+                 earlier dtype-mismatch caused by a skipped F32 upcast"
+            ),
+            other => panic!(
+                "expected UnsupportedDTypeForOp(BF16, _) (the pre-existing CPU limitation, \
+                 reached only once every earlier intermediate GEMM upcast correctly), got \
+                 {other:?}"
+            ),
+        }
+    }
+
+    // Oracle B (isolates :738 specifically, which Oracle A's fixture
+    // cannot reach — see this test's own module-doc analysis: with
+    // `base_dtype = BF16`, the all-BF16 fixture always fails at the
+    // FINAL `dy_base_2d.matmul(w)` line, one step BEFORE :738's own
+    // effect (`d_x_lora`'s dtype) is ever consumed by the `dx_base +
+    // d_x_lora` addition). Here `w`/`grad_res` are F32 (so that final
+    // matmul-and-add DOES succeed, or fails for a REASON ISOLATED to
+    // :738): `x` alone is BF16, so :696 correctly upcasts it to F32 for
+    // the LoRA-path GEMMs, and :738 is what decides whether `d_x_lora`
+    // is cast back to `x`'s own BF16 (correct — mismatches `dx_base`'s
+    // F32, giving `DTypeMismatchBinaryOp` at the final add) or left at
+    // F32 (:738 mutated — matches `dx_base`, so the call WRONGLY
+    // succeeds).
+    #[test]
+    fn bwd_direct_mixed_dtype_oracle_isolates_the_final_downcast_branch() {
+        let device = Device::Cpu;
+        let (rows, inf, outf, r) = (3usize, 3usize, 4usize, 2usize);
+        let xb: Vec<bf16> = exact_fixture(rows * inf, 1)
+            .into_iter()
+            .map(bf16::from_f32)
+            .collect();
+        let x = Tensor::from_slice(&xb, (rows, inf), &device).unwrap();
+        let w = Tensor::from_slice(&exact_fixture(outf * inf, 2), (outf, inf), &device).unwrap();
+        assert!(!w.is_variable() && !w.track_op(), "w must be a plain leaf");
+        let ab = pack_ab(
+            &exact_fixture(r * inf, 3),
+            inf,
+            &exact_fixture(outf * r, 4),
+            outf,
+            r,
+            &device,
+        );
+        let grad_res =
+            Tensor::from_slice(&exact_fixture(rows * outf, 6), (rows, outf), &device).unwrap();
+        let res_dummy = grad_res.clone();
+
+        let op = LowRankResidualLinear::new(1.0, inf, outf, r, None, true).unwrap();
+        let err = op.bwd(&x, &w, &ab, &res_dummy, &grad_res).expect_err(
+            "x=BF16 with w/grad_res=F32 must fail at the final dx_base + d_x_lora add \
+                 (dx_base is F32, d_x_lora is correctly cast back to x's own BF16) — success \
+                 here means the final downcast to base_dtype was skipped",
+        );
+        match err {
+            Error::DTypeMismatchBinaryOp { lhs, rhs, .. } => {
+                assert_eq!(lhs, DType::F32);
+                assert_eq!(rhs, DType::BF16);
+            }
+            other => panic!("expected DTypeMismatchBinaryOp{{F32, BF16}}, got {other:?}"),
+        }
+    }
+
+    /// Cosmetic `name()` survivor (this file's one op): the name is part
+    /// of this op's counters/admission keys (see `ops`'s module doc).
+    #[test]
+    fn ops_name_in_this_file_is_pinned() {
+        let op = LowRankResidualLinear::new(1.0, 3, 4, 2, None, false).unwrap();
+        assert_eq!(op.name(), "low_rank_residual_linear");
     }
 }

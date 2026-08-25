@@ -2879,13 +2879,23 @@ mod tests {
             "the fused whole-attention-block must retain FEWER tape nodes than today's \
              partial-fusion eager composition: eager={nodes_eager} fused={nodes_fused}"
         );
-        // MEASURED numbers, printed for the record (not asserted a priori
-        // beyond the "fewer than" property above, which is the load-bearing
-        // claim — the exact counts are a function of this file's own
-        // composition and will legitimately drift as ops here change).
-        eprintln!(
-            "attention_block node counts (b={b},s={s},h={h},d={d}): eager={nodes_eager} \
-             fused={nodes_fused}"
+        // The EXACT fused count, not merely "fewer than": three nodes are
+        // the only ones `forward_training_attention`'s fused arm can
+        // build from a leaf `qkv` `Var` — the `Var` leaf itself, the
+        // `qkv.reshape((batch, seq, 3, h, d))` view (`Op::Reshape`), and
+        // the ONE `apply3`/`AttentionBlockFused` `CustomOp3` node —
+        // `combined_mask` contributes NO node here because this fixture
+        // is global (`window=None`, so `combined_mask` is a plain
+        // `extended_mask.clone()`, never a `broadcast_add`).
+        // `Tensor::op()` (the field that would let this test inspect
+        // EACH node's `Op` variant directly) is `pub(crate)` inside
+        // `candle-core` — not reachable from this crate — so this
+        // count IS the proof that exactly one `CustomOp3` node exists
+        // here, not a substitute for inspecting it directly.
+        assert_eq!(
+            nodes_fused, 3,
+            "fused whole-attention-block tape must be exactly {{qkv leaf, reshape, \
+             AttentionBlockFused CustomOp3}} — got {nodes_fused} nodes"
         );
     }
 
@@ -3058,5 +3068,35 @@ mod tests {
             after_eval2.fused, before_eval2.fused,
             "set_training(false) must restore the eval-only dispatch path"
         );
+    }
+
+    /// Mirrors `crate::layer_norm::tests::strict_mode_errors_instead_of_
+    /// falling_back_on_a_failed_predicate`, for `"attention_block_fused"`:
+    /// a domain miss under `AdmissionMode::Strict` must return
+    /// `KernelError::StrictModeFallback`, never a silent eager fallback.
+    /// Calls `jammi_kernels::admission::admit` directly with an explicit
+    /// `Strict` mode (not the `JAMMI_KERNELS_STRICT` env var, which
+    /// `admission_mode()` memoizes into a process-wide `OnceLock` the
+    /// first time anything calls it — depending on env-var timing across
+    /// `cargo test`'s parallel thread pool would be racy).
+    #[test]
+    fn attention_block_strict_mode_errors_instead_of_falling_back_on_a_failed_predicate() {
+        use jammi_kernels::admission::AdmissionMode;
+        let counters = jammi_kernels::admission::DispatchCounters::new();
+        let err = admit(
+            AdmissionMode::Strict,
+            "attention_block_fused",
+            "mask_shape_batch_or_one_1_1_seq",
+            false,
+            &counters,
+        )
+        .expect_err("a failed predicate in Strict mode must error");
+        assert!(matches!(
+            err,
+            jammi_kernels::error::KernelError::StrictModeFallback {
+                op: "attention_block_fused",
+                predicate: "mask_shape_batch_or_one_1_1_seq"
+            }
+        ));
     }
 }

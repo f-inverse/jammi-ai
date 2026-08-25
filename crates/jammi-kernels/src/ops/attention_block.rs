@@ -1274,6 +1274,59 @@ mod tests {
         assert!(g.iter().all(|&x| x == 0.0), "{g:?}");
     }
 
+    /// The WINDOW-restricted fully-masked row: not every key in the
+    /// sequence is padding (unlike the global case above), but for a
+    /// query row deep enough that its ENTIRE window neighborhood happens
+    /// to fall on padded keys, the row is still fully masked — the exact
+    /// case `jammi_encoders::mask::sliding_window_mask`'s own doc proves
+    /// ("a deep pad-query row in a local layer"). `s=6`, `half_window=1`:
+    /// keys `4`/`5` are padding, keys `0..4` are real. Query row `5`'s
+    /// window is `{4, 5}` (both padded) — fully masked, zero context row.
+    /// Query row `0`'s window is `{0, 1}` (both real) — NOT fully masked,
+    /// a non-vacuity check that this fixture's OTHER rows are ordinary.
+    #[test]
+    fn window_restricted_fully_masked_row_outputs_zero_context_row() {
+        let device = Device::Cpu;
+        let (b, h, s, d) = (1usize, 1usize, 6usize, HEAD_DIM);
+        let half_window = 1usize;
+        let n = b * h * s * d;
+        let q0v: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.19).sin() * 0.4).collect();
+        let k0v: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.23).cos() * 0.4).collect();
+        let v0v: Vec<f32> = (0..n).map(|i| (i as f32) + 1.0).collect();
+        let q0 = Tensor::from_vec(q0v, (b, h, s, d), &device).unwrap();
+        let k0 = Tensor::from_vec(k0v, (b, h, s, d), &device).unwrap();
+        let v0 = Tensor::from_vec(v0v, (b, h, s, d), &device).unwrap();
+        let mut mask_v = vec![0f32; s];
+        mask_v[4] = -10_000.0;
+        mask_v[5] = -10_000.0;
+        let mask = Tensor::from_vec(mask_v, (1, 1, 1, s), &device).unwrap();
+        let band = test_sliding_window_band(s, half_window, mask.dtype(), mask.device()).unwrap();
+        let combined_mask = mask.broadcast_add(&band).unwrap();
+        let scale = 1.0 / (d as f32).sqrt();
+
+        let qkv = qkv_from(&q0, &k0, &v0).unwrap();
+        let (cos, sin) = rope_tables(s, d, &device);
+        let rope_pack = pack_rope(&cos, &sin).unwrap();
+        let op = AttentionBlockFused::new(scale, FullyMaskedPolicy::Zeros, true).unwrap();
+        let got = fused(&qkv, &rope_pack, &combined_mask, op).unwrap();
+        // got: [batch=1, seq=6, heads*head_dim=64].
+        let g: Vec<f32> = got.flatten_all().unwrap().to_vec1().unwrap();
+        let row = |qi: usize| &g[qi * h * d..(qi + 1) * h * d];
+
+        assert!(
+            row(5).iter().all(|&x| x == 0.0),
+            "query row 5 (window {{4,5}}, both padded) must be all-zero: {:?}",
+            row(5)
+        );
+        assert!(
+            row(0).iter().any(|&x| x != 0.0),
+            "query row 0 (window {{0,1}}, both real) must NOT be all-zero — otherwise this \
+             fixture is vacuously all-masked and proves nothing about the WINDOW-restricted \
+             case specifically: {:?}",
+            row(0)
+        );
+    }
+
     /// `0.125` (`1/sqrt(64)`, this op's own production scale) is an exact
     /// power of two — accepted; `0.1` has a nonzero f32 mantissa (a
     /// terminating-but-not-power-of-two binary fraction) — refused. See

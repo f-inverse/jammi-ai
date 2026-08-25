@@ -1149,6 +1149,25 @@ pub struct FinetuneStepTier {
     /// trainer's behaviour) or three. On a dispatch-bound device this is the
     /// largest single term in the step, so it is recorded alongside every rate.
     pub batched_forward: bool,
+    /// The `--max-grad-norm` this row ran with, or `null` when the flag was
+    /// absent (no clipping — today's behaviour, bit-identical to before this
+    /// field existed). Present so the step this row measured is unambiguous:
+    /// the shipped trainer always calls
+    /// [`jammi_ai::fine_tune::optimizer::clip_gradients`] at the default
+    /// `max_grad_norm = 1.0`
+    /// (`jammi_wire::fine_tune::FineTuneConfig::max_grad_norm`'s default), so
+    /// a step measured with this field `null` is NOT the step the trainer
+    /// runs — it is a distinct, useful reference point (the device-side
+    /// clip's `4n + 4`-op cost isolated out), not an oversight. Deliberately
+    /// NOT
+    /// `#[serde(skip_serializing_if = "Option::is_none")]`: an omitted key
+    /// reads as "this report predates the field", which is false — every
+    /// `finetune-step` report from this build carries an opinion on
+    /// clipping, so absence is always meaningful and always emitted as an
+    /// explicit `null`, never folded away. See
+    /// `finetune_step_tier_serializes_null_not_omitted_for_absent_max_grad_norm`
+    /// below for the pinned schema shape.
+    pub max_grad_norm: Option<f32>,
     /// Trainable tensor count. Zero would mean the selectors matched nothing and
     /// the measurement is of a frozen forward, so it is reported, not assumed.
     pub trainable_tensors: usize,
@@ -1318,6 +1337,25 @@ pub struct FinetuneStepTier {
     /// the step made) — that is the predicate refusing by domain, not a
     /// broken counter.
     pub attention_block_eager_dispatches: u64,
+    /// How many times [`jammi_ai::fine_tune::adamw::AdamW::step`]'s
+    /// per-`Var` dispatch actually admitted the fused multi-tensor kernel
+    /// (`jammi_kernels::ops::adamw_step_fused_t`, one `InplaceOp3` launch —
+    /// EMA the moments, bias-correct, decoupled weight decay, and the
+    /// adaptive update all in place, zero `Var::set`/memcpy) during this
+    /// run — the same positive-proof channel as `ln_fused_dispatches` /
+    /// … / `attention_block_fused_dispatches`, for the multi-tensor AdamW
+    /// commit. Read via
+    /// `jammi_kernels::admission::counters_for("adamw_step_fused")`,
+    /// mirroring the sibling counters' read API exactly — `"adamw_step_fused"`
+    /// is also the op key a caller names in `JAMMI_KERNELS_DISABLE` to force
+    /// every `Var` this run onto the eager arm below.
+    pub adamw_fused_dispatches: u64,
+    /// How many times that same per-`Var` dispatch fell back to the eager
+    /// candle-op chain (`step_eager_one`) instead — outside the fused
+    /// kernel's domain (device/dtype/contiguity/shape agreement across
+    /// `theta`/`m`/`v`/`grad`), or because `JAMMI_KERNELS_DISABLE` named
+    /// `"adamw_step_fused"` for this process.
+    pub adamw_eager_dispatches: u64,
     /// The `JAMMI_KERNELS_DISABLE` op keys this process REQUESTED (sorted,
     /// empty when the env var was unset or empty) —
     /// `jammi_kernels::admission::disabled_ops_requested`. Always present,
@@ -1520,12 +1558,15 @@ pub struct RecomputeScaleTier {
 mod tests {
     use super::*;
 
-    /// A minimal, fully-populated [`FinetuneStepTier`] for the serialization
-    /// test below. Field VALUES are arbitrary; what is pinned is the emitted
-    /// key SET, so a field added or renamed on `FinetuneStepTier` is a
-    /// visible, reviewed diff here rather than a silent addition/removal a
-    /// downstream JSON-diffing perf gate would only notice indirectly.
-    fn sample_finetune_step_tier() -> FinetuneStepTier {
+    /// A minimal, otherwise-arbitrary [`FinetuneStepTier`] for the schema
+    /// tests below. Field VALUES do not matter except where a test itself
+    /// varies them (`max_grad_norm`); what is pinned is the emitted key SET
+    /// and the present-vs-omitted / null-vs-value policy for
+    /// `max_grad_norm`, so a field added or renamed on `FinetuneStepTier`
+    /// is a visible, reviewed diff here rather than a silent
+    /// addition/removal a downstream JSON-diffing perf gate would only
+    /// notice indirectly.
+    fn sample_finetune_step_tier(max_grad_norm: Option<f32>) -> FinetuneStepTier {
         FinetuneStepTier {
             device: "cpu".to_string(),
             device_name: "cpu".to_string(),
@@ -1542,6 +1583,7 @@ mod tests {
             margin: 0.3,
             target_modules: vec!["query".to_string()],
             batched_forward: true,
+            max_grad_norm,
             trainable_tensors: 2,
             steps_measured: 1,
             losses: vec![0.5],
@@ -1561,6 +1603,8 @@ mod tests {
             lora_linear_eager_dispatches: 0,
             attention_block_fused_dispatches: 0,
             attention_block_eager_dispatches: 0,
+            adamw_fused_dispatches: 0,
+            adamw_eager_dispatches: 0,
             kernels_disabled_requested: Vec::new(),
             kernels_disabled_fired: Vec::new(),
             s_per_step_p50: Measurement::measured(0.01, "s"),
@@ -1575,20 +1619,24 @@ mod tests {
     /// The full emitted key set, pinned so a field added or renamed on
     /// `FinetuneStepTier` — including the two `attention_block_*_dispatches`
     /// counters the fused whole-attention-block kernel needs for its own
-    /// positive-proof channel, and `kernels_disabled_requested` /
-    /// `kernels_disabled_fired` (contract K-aux, round 2 / B3: the RESOLVED
-    /// `JAMMI_KERNELS_DISABLE` state a downstream A/B harness names the
-    /// measured arm from) — is a visible, reviewed diff here rather than
-    /// a silent addition/removal a downstream JSON-diffing perf gate would
+    /// positive-proof channel, the two `adamw_*_dispatches` counters the
+    /// fused multi-tensor AdamW kernel needs for the same reason,
+    /// `kernels_disabled_requested` / `kernels_disabled_fired` (contract
+    /// K-aux, round 2 / B3: the RESOLVED `JAMMI_KERNELS_DISABLE` state a
+    /// downstream A/B harness names the measured arm from), and
+    /// `max_grad_norm` — is a visible, reviewed diff here rather than a
+    /// silent addition/removal a downstream JSON-diffing perf gate would
     /// only notice indirectly.
     #[test]
     fn finetune_step_tier_emits_the_full_pinned_key_set() {
-        let tier = sample_finetune_step_tier();
+        let tier = sample_finetune_step_tier(None);
         let value = serde_json::to_value(&tier).expect("serialize FinetuneStepTier");
         let obj = value.as_object().expect("object");
         let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
         keys.sort_unstable();
         let mut expected = vec![
+            "adamw_eager_dispatches",
+            "adamw_fused_dispatches",
             "attention_block_eager_dispatches",
             "attention_block_fused_dispatches",
             "batch",
@@ -1616,6 +1664,7 @@ mod tests {
             "loss_last",
             "losses",
             "margin",
+            "max_grad_norm",
             "peak_rss_bytes",
             "peak_vram_bytes",
             "rope_eager_dispatches",
@@ -1634,5 +1683,37 @@ mod tests {
         ];
         expected.sort_unstable();
         assert_eq!(keys, expected);
+    }
+
+    /// Pins the null-when-absent policy: `max_grad_norm` is the field that
+    /// tells a reader whether this row measured the shipped trainer's step
+    /// (clip on) or the idealized no-clip step — an OMITTED key would read as
+    /// "this report predates the field" (a build-provenance question) rather
+    /// than "clipping was off for this row" (a run-provenance fact), so the
+    /// key must be present, explicit `null`, when the flag was not supplied.
+    #[test]
+    fn finetune_step_tier_serializes_null_not_omitted_for_absent_max_grad_norm() {
+        let tier = sample_finetune_step_tier(None);
+        let value = serde_json::to_value(&tier).expect("serialize FinetuneStepTier");
+        let obj = value.as_object().expect("object");
+        assert!(
+            obj.contains_key("max_grad_norm"),
+            "max_grad_norm must be present (as null), not omitted, when absent: {obj:?}"
+        );
+        assert_eq!(obj["max_grad_norm"], serde_json::Value::Null);
+    }
+
+    /// The mirror case: a supplied `--max-grad-norm` serializes as the number,
+    /// not as a string or a re-wrapped option shape.
+    #[test]
+    fn finetune_step_tier_serializes_number_for_present_max_grad_norm() {
+        let tier = sample_finetune_step_tier(Some(1.0f32));
+        let value = serde_json::to_value(&tier).expect("serialize FinetuneStepTier");
+        let obj = value.as_object().expect("object");
+        assert_eq!(
+            obj["max_grad_norm"],
+            serde_json::json!(1.0f32),
+            "present max_grad_norm must serialize as the numeric value: {obj:?}"
+        );
     }
 }

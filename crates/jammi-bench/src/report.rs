@@ -1115,8 +1115,9 @@ pub struct FinetuneStepTier {
     /// `max_grad_norm = 1.0`
     /// (`jammi_wire::fine_tune::FineTuneConfig::max_grad_norm`'s default), so
     /// a step measured with this field `null` is NOT the step the trainer
-    /// runs — it is a distinct, useful reference point (the clip's D2H-sync
-    /// cost isolated out), not an oversight. Deliberately NOT
+    /// runs — it is a distinct, useful reference point (the device-side
+    /// clip's `4n + 4`-op cost isolated out), not an oversight. Deliberately
+    /// NOT
     /// `#[serde(skip_serializing_if = "Option::is_none")]`: an omitted key
     /// reads as "this report predates the field", which is false — every
     /// `finetune-step` report from this build carries an opinion on

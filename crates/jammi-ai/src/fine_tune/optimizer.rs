@@ -598,6 +598,7 @@ mod tests {
     ///  - `affine(max_norm, 0.0)` with `max_norm == 1.0`: exact, 0 ulp;
     ///  - `minimum(1.0)`: exact (no rounding), 0 ulp;
     ///  - `broadcast_mul`: one rounding per element, 0.5 ulp.
+    ///
     /// The host reference computes the same chain in f64 (error ≪ 1 f32 ulp)
     /// and rounds to f32 once (0.5 ulp). Total: ≤ 2.5 ulp device + 0.5 ulp
     /// host = 3 ulp of the result; asserted at 4 ulp (one ulp of headroom for

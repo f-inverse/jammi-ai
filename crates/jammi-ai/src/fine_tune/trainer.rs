@@ -4494,7 +4494,7 @@ mod last_step_run_harness {
         let healthy =
             run_text_loop("last-step-accum-ok", config.clone(), pairs(8), None, None).unwrap();
         assert_eq!(healthy.total_steps, 2, "control: the arm's horizon");
-        assert!(2 < DEFAULT_NORM_CHECK_INTERVAL);
+        assert!(healthy.total_steps < DEFAULT_NORM_CHECK_INTERVAL);
 
         let err = run_text_loop(
             "last-step-accum",
@@ -4617,7 +4617,7 @@ mod last_step_horizon_run_oracles {
         let before = thread_sync_read_count();
         let result = run_text_loop("horizon-fresh", text_config(), pairs(6), None, None).unwrap();
         assert_eq!(result.total_steps, 3, "control: the run's horizon");
-        assert!(3 < DEFAULT_NORM_CHECK_INTERVAL);
+        assert!(result.total_steps < DEFAULT_NORM_CHECK_INTERVAL);
         assert_eq!(
             thread_sync_read_count() - before,
             2,

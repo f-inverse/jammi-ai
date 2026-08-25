@@ -421,32 +421,104 @@ fn real_rows_loss(hidden: &Tensor, lengths: &[usize]) -> Tensor {
         .expect("at least one non-empty row")
 }
 
+/// Elementwise oracle + the shared scale a linear (Higham) summation-error
+/// bound derives from: for every element of `unpadded`'s real row against
+/// the CORRESPONDING row (`batch_idx`) of `padded`'s real positions
+/// (`0..len`), asserts `|padded − unpadded| <= 64 * f32::EPSILON *
+/// max(|padded|, |unpadded|, f32::EPSILON)` — a few-ULP fold-order
+/// tolerance relative to the larger of the two PRE-cancellation values
+/// (see the oracle's own doc above) — and returns `Σ max(|padded|,
+/// |unpadded|, f32::EPSILON)` over the compared elements, the exact
+/// quantity the loss bound below multiplies by the SAME `64 *
+/// f32::EPSILON` constant (a sum of `n` terms each within `k_i` of their
+/// target is within `Σk_i` of the target sum).
+fn assert_real_row_matches_and_scale(
+    padded: &Tensor,
+    batch_idx: usize,
+    unpadded: &Tensor,
+    len: usize,
+    label: &str,
+) -> f32 {
+    let p_row: Vec<f32> = padded
+        .narrow(0, batch_idx, 1)
+        .unwrap()
+        .narrow(1, 0, len)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let u_row: Vec<f32> = unpadded
+        .narrow(0, 0, 1)
+        .unwrap()
+        .narrow(1, 0, len)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(
+        p_row.len(),
+        u_row.len(),
+        "{label}: padded and unpadded real rows must cover the same element count"
+    );
+    let mut scale_sum = 0.0f32;
+    for (i, (&p, &u)) in p_row.iter().zip(u_row.iter()).enumerate() {
+        assert!(
+            p.is_finite() && u.is_finite(),
+            "{label}[{i}]: non-finite hidden state (padded={p}, unpadded={u})"
+        );
+        let scale = p.abs().max(u.abs()).max(f32::EPSILON);
+        let bound = 64.0 * f32::EPSILON * scale;
+        let diff = (p - u).abs();
+        assert!(
+            diff.is_finite() && diff <= bound,
+            "{label}[{i}]: padded hidden state must match the unpadded row's own value within a \
+             few-ULP fold-order tolerance -- batch-size-dependent GEMM blocking/accumulation \
+             order, not a batch-mixing leak (padded={p}, unpadded={u}, diff={diff}, bound={bound})"
+        );
+        scale_sum += scale;
+    }
+    scale_sum
+}
+
 /// THE oracle: a batch with real padding (row 0 fully real, row 1 padded)
 /// vs the SAME two rows run UNPADDED one-by-one — f32 on CPU (the block
 /// arm — `AttentionBlockFused` admits on this fixture, contract v4 §1 F1).
-/// The LOSS (summed over real positions only) is BIT-IDENTICAL between the
-/// two legs (the forward pass is row-independent — no batch-mixing op
-/// exists anywhere in this architecture, so `hidden_padded[0, s, :]` for
-/// `s < 6` is literally the same computation as `hidden_row0[s, :]`).
 ///
-/// **Finding, not the deliverable's original assumption:** the LoRA A/B
-/// GRADIENTS are measured here to be within a tight, principled few-ULP
-/// tolerance of the sum of the two unpadded runs' own gradients, NOT
-/// bit-identical — `dL/dW` for a weight shared across the batch sums each
-/// row's contribution, and the padded run performs that sum in ONE batched
-/// reduction (row-major order over `batch * seq` rows, including the
-/// exactly-zero-gradient pad rows) while comparing against TWO
-/// independently-computed (batch=1) reductions summed externally is a
-/// DIFFERENT fold order over the same mathematical terms — floating-point
-/// addition is non-associative (family J), and this specific case hits a
-/// near-cancellation (two ~1e-10-magnitude terms summing to ~1e-12) that
-/// amplifies the RELATIVE error at the tiny cancelled value while the
-/// ABSOLUTE error stays at ordinary f32-ULP scale on the pre-cancellation
-/// operands — see the tolerance's own derivation, inline below. Pad rows
-/// still contribute EXACTLY nothing (that half of the claim holds exactly:
-/// the loss comparison above proves it, and the gradient tolerance would
-/// need to be many orders of magnitude looser than a few ULPs if a pad
-/// row's residual gradient were leaking in).
+/// **Finding, not the deliverable's original assumption (widened on the
+/// a100c pod, `P6 B3-dense`, `crates/jammi-kernels/src/admission.rs`
+/// commit `86aa9da`'s gate run):** the LOSS is NOT bit-identical between
+/// the two legs on every host. The original assumption ("the forward pass
+/// is row-independent, so `hidden_padded[0, s, :]` for `s < 6` is
+/// literally the same computation as `hidden_row0[s, :]`") is true
+/// MATHEMATICALLY but not at the FLOAT level: candle's CPU `gemm` picks
+/// its blocking/accumulation order from the operand shape, and a
+/// batch-of-2 GEMM (`M=2` rows total) is not guaranteed to issue the SAME
+/// per-row reduction order as two independent batch-of-1 GEMMs (`M=1`
+/// each) — floating-point addition is non-associative (family J), so a
+/// different fold order over mathematically-identical terms is not
+/// guaranteed bit-identical. This box hits it (macOS's `gemm` blocking
+/// happened not to depend on `M` at this tiny shape; this pod's does);
+/// x86_64/Linux CPU BLAS microkernel selection differing by total-M is
+/// architecture-dependent, not a code defect.
+///
+/// Rather than fudge a single ad hoc constant on the near-zero (post-
+/// LayerNorm, heavily cancelled) final scalar loss, the SAME per-element
+/// few-ULP tolerance already established below for the LoRA gradients is
+/// asserted one level EARLIER, directly on the compared hidden-state
+/// elements (`assert_real_row_matches_and_scale`), and the loss bound is
+/// then a linear CONSEQUENCE of that per-element bound (Higham's
+/// summation-error bound: if every one of `n` summed terms differs by at
+/// most `k_i`, the sum differs by at most `Σk_i`) — one derived constant
+/// (`64 * f32::EPSILON` per element, relative to the larger of the two
+/// pre-cancellation values, never the cancelled result) drives both the
+/// loss and the gradient tolerance, not two independently-chosen fudge
+/// factors. Pad rows still contribute EXACTLY nothing (the non-vacuity
+/// control below proves the reduction itself excludes pad columns; the
+/// bound above would need to be many orders of magnitude looser than a
+/// few ULPs if a pad row's residual value were leaking in — see
+/// `padded_training_oracle_is_non_vacuous_including_pad_columns_changes_the_loss`).
 #[test]
 fn padded_training_loss_and_lora_grads_match_unpadded_rows_run_individually_f32_cpu() {
     // This fixture is GeGLU/RoPE/softmax fused-eligible too, so a training
@@ -500,11 +572,26 @@ fn padded_training_loss_and_lora_grads_match_unpadded_rows_run_individually_f32_
 
     let loss_row0_v: f32 = loss_row0.to_scalar().unwrap();
     let loss_row1_v: f32 = loss_row1.to_scalar().unwrap();
-    assert_eq!(
-        loss_padded_v,
-        loss_row0_v + loss_row1_v,
-        "the padded batch's real-rows loss must be bit-identical to the sum of the two \
-         unpadded rows' own losses -- pad rows contribute exactly nothing"
+
+    // Elementwise oracle FIRST (proves row-independence at the tensor
+    // level, within a derived few-ULP tolerance) -- its returned scale
+    // sums are what the loss bound below is a linear consequence of, per
+    // this test's own doc comment.
+    let scale_sum_row0 =
+        assert_real_row_matches_and_scale(&hidden_padded, 0, &hidden_row0, 6, "row0");
+    let scale_sum_row1 =
+        assert_real_row_matches_and_scale(&hidden_padded, 1, &hidden_row1, 4, "row1");
+
+    let loss_bound = 64.0 * f32::EPSILON * (scale_sum_row0 + scale_sum_row1);
+    let loss_summed = loss_row0_v + loss_row1_v;
+    let loss_diff = (loss_padded_v - loss_summed).abs();
+    assert!(
+        loss_diff.is_finite() && loss_diff <= loss_bound,
+        "the padded batch's real-rows loss must match the sum of the two unpadded rows' own \
+         losses within the SAME per-element few-ULP tolerance summed over every compared \
+         element (Higham's summation-error bound), not bit-identical -- batch-size-dependent \
+         GEMM rounding, not a batch-mixing leak (padded={loss_padded_v}, row0={loss_row0_v}, \
+         row1={loss_row1_v}, summed={loss_summed}, diff={loss_diff}, bound={loss_bound})"
     );
 
     // Every LoRA A/B tensor, every layer, every site: the padded run's

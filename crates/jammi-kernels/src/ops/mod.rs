@@ -78,7 +78,9 @@ pub use attention_block::AttentionBlockFused;
 /// shared `Op::Matmul`-backward definition `bwd` itself calls — see their
 /// own doc for the shared-definition rationale.
 #[doc(hidden)]
-pub use attention_block::{bwd_gradient_gemm_layouts, matmul_grad_lhs, matmul_grad_rhs};
+pub use attention_block::{
+    bwd_gradient_gemm_layouts, matmul_grad_lhs, matmul_grad_rhs, BwdGemmLayoutsParams,
+};
 /// Re-exported under this name (rather than `ops::attention_block::HEAD_DIM`
 /// directly) so a call site's admission predicate reads `ATTENTION_BLOCK_HEAD_DIM`
 /// without a `attention_block::` path segment, mirroring `MAX_HEAD_DIM`/`MAX_LAST_DIM`'s

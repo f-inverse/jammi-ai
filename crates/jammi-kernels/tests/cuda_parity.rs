@@ -32,10 +32,10 @@
 use candle_core::{DType, Device, Error, Layout, Tensor, Var, D};
 use half::bf16;
 use jammi_kernels::ops::{
-    apply1, apply2, apply3, bwd_gradient_gemm_layouts, AttentionBlockFused, Axpy, DropoutFused,
-    DropoutKey, FullyMaskedPolicy, GegluFused, GeluVariant, LayerNormFused, LowRankResidualLinear,
-    PhiloxKatProbe, RopeFused, ScaledCastAdd, SoftmaxLastDimFused,
-    ATTENTION_BLOCK_WINDOW_MASKED_VALUE,
+    apply1, apply2, apply3, bwd_gradient_gemm_layouts, AttentionBlockFused, Axpy,
+    BwdGemmLayoutsParams, DropoutFused, DropoutKey, FullyMaskedPolicy, GegluFused, GeluVariant,
+    LayerNormFused, LowRankResidualLinear, PhiloxKatProbe, RopeFused, ScaledCastAdd,
+    SoftmaxLastDimFused, ATTENTION_BLOCK_WINDOW_MASKED_VALUE,
 };
 
 fn axpy(alpha: f64, x: &Tensor, y: &Tensor) -> candle_core::Result<Tensor> {
@@ -4245,8 +4245,8 @@ fn attention_block_parity_f32_fully_masked_row_is_zero_on_both_devices() {
 /// point measured; a `~1 ULP` `Q`/`K` rounding perturbation is enough to
 /// move it by `e^{O(1)}`-scale factors) and the resulting context vector
 /// differs by more than a generic bf16-ULP bound allows. This is NOT a
-/// kernel bug: `attention_block_diag_bf16_fused_bit_exact_vs_eager_cuda`
-/// below proves the fused CUDA kernel is BIT-IDENTICAL (not just within
+/// kernel bug: `attention_block_diag_bf16_fused_cublas_cross_form_
+/// determinism_probe_cuda` below proves the fused CUDA kernel is BIT-IDENTICAL (not just within
 /// tolerance) to composing `RopeFused` + `Tensor::matmul` +
 /// `SoftmaxLastDimFused` + `Tensor::matmul` by hand, all in bf16, on the
 /// SAME device — i.e. whatever the fused kernel computes here, the eager
@@ -5146,15 +5146,15 @@ fn attention_block_bwd_dqs_dkr_gemm_layouts_match_production_orientation_cuda() 
         .to_dtype(DType::BF16)
         .unwrap();
 
-    let layouts: [(Layout, Layout); 4] = bwd_gradient_gemm_layouts(
-        true,
+    let layouts: [(Layout, Layout); 4] = bwd_gradient_gemm_layouts(BwdGemmLayoutsParams {
+        rope: true,
         scale,
-        FullyMaskedPolicy::Zeros,
-        &qkv,
-        &rope_pack,
-        &mask,
-        &dy,
-    )
+        fully_masked: FullyMaskedPolicy::Zeros,
+        qkv: &qkv,
+        rope_pack: &rope_pack,
+        mask: &mask,
+        grad_res: &dy,
+    })
     .unwrap();
     let (_dqs_lhs, dqs_rhs) = &layouts[2];
     let (dkr_lhs, _dkr_rhs) = &layouts[3];

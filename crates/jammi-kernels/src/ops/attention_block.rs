@@ -252,24 +252,38 @@
 //! it across a step can). `matmul_grad_lhs`/`matmul_grad_rhs` plus
 //! `kt_contig` (previous section) close the gap STRUCTURALLY: the fused
 //! and production GEMMs are the same call by definition now, not merely
-//! measured close. `tests::attention_block_bwd_two_step_compounding_
-//! defect_detector_cuda` (`tests/cuda_parity.rs`) is the numeric
-//! backstop — it applies one arm's own step-0 gradient as an SGD step
-//! before comparing step 1, the minimum compounding needed to separate a
-//! systematic divergence from ordinary per-call bf16 noise — and is RED
-//! with `kt_contig` removed (`dqs`/`dkr` computed from `k_rot`/`q_scaled`
-//! directly, `fwd`'s own operand form rather than production's), GREEN
-//! with it present; both readings are reported in this round's hand-off,
-//! not merely asserted here. `tests::attention_block_bwd_gemm_layouts_
-//! match_production_eager_cuda` is the structural companion: it captures
-//! each gradient GEMM's operand `Layout` directly from `bwd_core`'s own
-//! code (via [`bwd_gradient_gemm_layouts`], not a fixture reconstructed
-//! separately from it) and asserts two STRUCTURAL properties that flip
-//! specifically between the pre-round-4 operand forms and this round's
-//! fix (that test's own doc has the exact stride/shape claims), so a
-//! future re-introduction of a bare `k_rot`/`q_scaled` operand in place
-//! of `kt_contig` fails immediately, structurally, without needing bf16
-//! noise to average out first.
+//! measured close —
+//! `tests::attention_block_bwd_dqs_dkr_gemm_layouts_match_production_
+//! orientation_cuda` (`tests/cuda_parity.rs`, via
+//! [`bwd_gradient_gemm_layouts`]) proves it directly: it captures each
+//! gradient GEMM's operand `Layout` FROM `bwd_core`'s own code (not a
+//! fixture reconstructed separately from it) and asserts two STRUCTURAL
+//! properties that flip specifically between the pre-round-4 operand
+//! forms and this round's fix (that test's own doc has the exact
+//! stride/shape claims), so a future re-introduction of a bare
+//! `k_rot`/`q_scaled` operand in place of `kt_contig` fails immediately,
+//! structurally, without needing bf16 noise to average out first.
+//!
+//! This op's numeric backstop — for the ORIGINAL divergence this round
+//! exists to guard against, not for the `dqs`/`dkr` change specifically
+//! (see the next paragraph) — lives one crate up:
+//! `jammi_encoders::modernbert::tests::attention_block_fused_vs_eager_
+//! dqkv_divergence_grows_with_depth_bf16_cuda` (`jammi-encoders`,
+//! `src/modernbert.rs`) drives the REAL `forward_training_attention`/
+//! `forward_eager_training_attention_composition` 28 layers deep from
+//! ONE tracked `qkv` `Var` and asserts the fused/eager divergence does
+//! NOT grow with depth. It is RED with the original three
+//! `.contiguous()` calls restored on `dv`/`dp`/`dkr`, GREEN at this
+//! file's tip — both readings reported, not merely asserted, in this
+//! round's hand-off. Measured on the SAME pod run: reverting ONLY
+//! `dqs`/`dkr`'s operand form to the pre-round-4 form (`dv`/`dp` left at
+//! this round's fix) does NOT redden that oracle — its step-1 `r(1)` is
+//! exactly `0.0` for every slot, bit-identical to the fully-fixed build,
+//! at `b=8, s=512, h=16, d=64` bf16. The `dqs`/`dkr` change above is
+//! therefore justified STRUCTURALLY (the layout test, previous
+//! paragraph), not as a numerically-demonstrated-necessary fix at this
+//! shape; whether it matters at another shape or another GPU/driver is
+//! UNCONFIRMED — stated here, not claimed.
 //!
 //! ### The two-armed rule: which GEMMs stay a VIEW, which get materialized
 //!
@@ -837,18 +851,38 @@ impl CustomOp3 for AttentionBlockFused {
                  be tracked (never a Var, never downstream of one)"
             )));
         }
-        let (dqkv, _gemm_operands) = bwd_core(
+        let (dqkv, _gemm_operands) = bwd_core(BwdCoreParams {
             op,
-            self.rope,
-            self.scale,
-            self.fully_masked,
+            rope: self.rope,
+            scale: self.scale,
+            fully_masked: self.fully_masked,
             qkv,
             rope_pack,
             mask,
             grad_res,
-        )?;
+        })?;
         Ok((Some(dqkv), None, None))
     }
+}
+
+/// `bwd_core`'s inputs, bundled into one struct rather than passed
+/// positionally — the SAME hazard `AttentionFwdF32Params` exists to
+/// remove for `attention_fwd_f32` (see that struct's own doc): four
+/// ADJACENT `&Tensor` parameters (`qkv`, `rope_pack`, `mask`, `grad_res`)
+/// are silently swappable at a call site with no compiler help, and
+/// `bwd_core` has exactly that shape. Named fields make a transposition
+/// a compile error instead of a silent wrong-tensor bug (P3 fix round 4
+/// closing round: the file's own precedent, reintroduced by this round's
+/// refactor, now closed the same way as the forward path).
+struct BwdCoreParams<'a> {
+    op: &'static str,
+    rope: bool,
+    scale: f32,
+    fully_masked: FullyMaskedPolicy,
+    qkv: &'a Tensor,
+    rope_pack: &'a Tensor,
+    mask: &'a Tensor,
+    grad_res: &'a Tensor,
 }
 
 /// `bwd`'s real computation, factored out of the `CustomOp3::bwd` trait
@@ -861,17 +895,17 @@ impl CustomOp3 for AttentionBlockFused {
 /// (a `Tensor` clone is a handle/refcount bump, not a data copy) and
 /// otherwise unused in production, where the trait method above discards
 /// them.
-#[allow(clippy::too_many_arguments)]
-fn bwd_core(
-    op: &'static str,
-    rope: bool,
-    scale: f32,
-    fully_masked: FullyMaskedPolicy,
-    qkv: &Tensor,
-    rope_pack: &Tensor,
-    mask: &Tensor,
-    grad_res: &Tensor,
-) -> Result<(Tensor, [(Tensor, Tensor); 4])> {
+fn bwd_core(params: BwdCoreParams<'_>) -> Result<(Tensor, [(Tensor, Tensor); 4])> {
+    let BwdCoreParams {
+        op,
+        rope,
+        scale,
+        fully_masked,
+        qkv,
+        rope_pack,
+        mask,
+        grad_res,
+    } = params;
     // DETACH every input before composing anything (module doc's
     // "`bwd` runs DETACHED" section): `qkv` is a tracked graph node in
     // production (downstream of the `Wqkv` LoRA `Var`s), so without
@@ -1044,6 +1078,22 @@ fn bwd_core(
     Ok((dqkv, [dv_operands, dp_operands, dqs_operands, dkr_operands]))
 }
 
+/// [`bwd_gradient_gemm_layouts`]'s inputs, bundled for the SAME reason
+/// [`BwdCoreParams`] exists (see that struct's own doc) — this one is
+/// `pub` because the function it feeds is a cross-crate test entry point
+/// (`tests/cuda_parity.rs`), so the transposition hazard is a real
+/// cross-crate call-site risk, not just an in-module one.
+#[doc(hidden)]
+pub struct BwdGemmLayoutsParams<'a> {
+    pub rope: bool,
+    pub scale: f32,
+    pub fully_masked: FullyMaskedPolicy,
+    pub qkv: &'a Tensor,
+    pub rope_pack: &'a Tensor,
+    pub mask: &'a Tensor,
+    pub grad_res: &'a Tensor,
+}
+
 /// Test/introspection support: captures the four gradient-GEMM operand
 /// `Layout`s `bwd_core` (private, this module) ACTUALLY builds, never a
 /// fixture reconstructed independently of it. Order matches the module
@@ -1052,26 +1102,19 @@ fn bwd_core(
 /// match_production_orientation_cuda` (P3 fix round 4, deliverable 3's
 /// "mechanism pin" — see that test's own doc).
 #[doc(hidden)]
-#[allow(clippy::too_many_arguments)]
 pub fn bwd_gradient_gemm_layouts(
-    rope: bool,
-    scale: f32,
-    fully_masked: FullyMaskedPolicy,
-    qkv: &Tensor,
-    rope_pack: &Tensor,
-    mask: &Tensor,
-    grad_res: &Tensor,
+    params: BwdGemmLayoutsParams<'_>,
 ) -> Result<[(Layout, Layout); 4]> {
-    let (_dqkv, operands) = bwd_core(
-        "bwd_gradient_gemm_layouts",
-        rope,
-        scale,
-        fully_masked,
-        qkv,
-        rope_pack,
-        mask,
-        grad_res,
-    )?;
+    let (_dqkv, operands) = bwd_core(BwdCoreParams {
+        op: "bwd_gradient_gemm_layouts",
+        rope: params.rope,
+        scale: params.scale,
+        fully_masked: params.fully_masked,
+        qkv: params.qkv,
+        rope_pack: params.rope_pack,
+        mask: params.mask,
+        grad_res: params.grad_res,
+    })?;
     Ok(operands.map(|(a, b)| (a.layout().clone(), b.layout().clone())))
 }
 

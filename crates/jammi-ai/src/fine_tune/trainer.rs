@@ -508,8 +508,7 @@ impl TrainingLoop {
         //    compared against, so a resumed run's `is_last_step` uses exactly
         //    the same horizon a fresh run would. Already correct; unaffected
         //    by this fix.
-        let total_optimizer_steps = if !train_loader.is_precomputed() && self.gradcache_eligible()
-        {
+        let total_optimizer_steps = if !train_loader.is_precomputed() && self.gradcache_eligible() {
             self.config.epochs
         } else {
             total_steps
@@ -765,23 +764,22 @@ impl TrainingLoop {
             // `Self::accumulate_sim_stats`'s doc). `SimStats` makes "a
             // populated count implies both sums are populated" structural, so
             // there is no `.expect()` here to fire.
-            let (avg_pos_sim, avg_neg_sim) = match &sim_stats {
-                Some(stats) => {
-                    let pos_sum: f32 = stats
-                        .pos
-                        .to_scalar()
-                        .map_err(|e| JammiError::FineTune(format!("epoch pos sim read: {e}")))?;
-                    let neg_sum: f32 = stats
-                        .neg
-                        .to_scalar()
-                        .map_err(|e| JammiError::FineTune(format!("epoch neg sim read: {e}")))?;
-                    (
-                        pos_sum as f64 / stats.count as f64,
-                        neg_sum as f64 / stats.count as f64,
-                    )
-                }
-                None => (0.0, 0.0),
-            };
+            let (avg_pos_sim, avg_neg_sim) =
+                match &sim_stats {
+                    Some(stats) => {
+                        let pos_sum: f32 = stats.pos.to_scalar().map_err(|e| {
+                            JammiError::FineTune(format!("epoch pos sim read: {e}"))
+                        })?;
+                        let neg_sum: f32 = stats.neg.to_scalar().map_err(|e| {
+                            JammiError::FineTune(format!("epoch neg sim read: {e}"))
+                        })?;
+                        (
+                            pos_sum as f64 / stats.count as f64,
+                            neg_sum as f64 / stats.count as f64,
+                        )
+                    }
+                    None => (0.0, 0.0),
+                };
 
             // Validation — skip entirely when monitoring train loss to avoid wasting time.
             // `None` when no validation pass ran. Not `0.0`: a sentinel that
@@ -3753,10 +3751,10 @@ mod host_read_discipline {
     #[test]
     fn accumulate_sim_stats_accumulator_is_always_a_graph_leaf() {
         let device = Device::Cpu;
-        let w = Var::from_tensor(&Tensor::new(&[[1.0f32, 0.0], [0.0, 1.0]], &device).unwrap())
-            .unwrap();
-        let neg_w = Var::from_tensor(&Tensor::new(&[[0.0f32, 1.0], [1.0, 0.0]], &device).unwrap())
-            .unwrap();
+        let w =
+            Var::from_tensor(&Tensor::new(&[[1.0f32, 0.0], [0.0, 1.0]], &device).unwrap()).unwrap();
+        let neg_w =
+            Var::from_tensor(&Tensor::new(&[[0.0f32, 1.0], [1.0, 0.0]], &device).unwrap()).unwrap();
 
         let mut stats: Option<SimStats> = None;
         for n in 1..=5usize {
@@ -3996,19 +3994,16 @@ mod gradcache_last_step_oracle {
                     .await
                     .unwrap(),
             );
-            let mut loop_ = TrainingLoopBuilder::new(
-                TrainingTarget::ProjectionHead { head },
-                varmap,
-                config,
-            )
-            .device(device.clone())
-            .job_id("gradcache-last-step-job".into())
-            .worker_id("gradcache-last-step-worker".into())
-            .catalog(catalog)
-            .artifact_dir(job_dir.path().to_path_buf())
-            .base_model(base_model)
-            .build()
-            .unwrap();
+            let mut loop_ =
+                TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+                    .device(device.clone())
+                    .job_id("gradcache-last-step-job".into())
+                    .worker_id("gradcache-last-step-worker".into())
+                    .catalog(catalog)
+                    .artifact_dir(job_dir.path().to_path_buf())
+                    .base_model(base_model)
+                    .build()
+                    .unwrap();
 
             // 6 (anchor, positive) pairs — MNRL's in-batch-negative pool —
             // chunked at `batch_size: 2` into 3 memory-bounded GradCache

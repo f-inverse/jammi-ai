@@ -2,7 +2,7 @@
 //! box). Raw `crate::flash::flash_varlen_fwd`/`flash_varlen_bwd` wall
 //! time at the FFI-boundary layer (no op/autograd overhead) — b8-s512
 //! h16 d64 dense `cu_seqlens` and b1-s512, `deterministic` ON vs OFF,
-//! >=25 launches after 5 warmup, a device sync bracketing each launch
+//! at least 25 launches after 5 warmup, a device sync bracketing each launch
 //! (candle's `BackendDevice::synchronize`, equivalent to a `cudaEvent`
 //! pair for wall-time purposes — no async queue depth to hide behind
 //! since each iteration syncs before starting the next), bf16 random

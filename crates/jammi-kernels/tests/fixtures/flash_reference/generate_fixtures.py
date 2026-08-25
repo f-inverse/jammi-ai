@@ -5,31 +5,50 @@ Stage B, contract-P6-stage-B-v4.md §5 B0 / §4 O0(a)).
 Reference: torch's OWN vendored FlashAttention-2, `torch.ops.aten.
 _flash_attention_forward` / `_flash_attention_backward` (varlen, packed
 `cu_seqlens_q/k` + `max_q/max_k`, `window_size_left/right`, returns
-`softmax_logsumexp`). Torch 2.13.0+cu130 vendors flash-attention at commit
-6c4f74fb338e0c3cdb07ac6f5eab5f54fc367c15 (`__version__ == "2.8.4"`,
-2026-05-26) via `FLASH_NAMESPACE::mha_varlen_fwd`/`mha_varlen_bwd`
+`softmax_logsumexp`) via `FLASH_NAMESPACE::mha_varlen_fwd`/`mha_varlen_bwd`
 (`aten/src/ATen/native/transformers/cuda/attention.cu:539` at the v2.13.0
-tag) — the UNPACKED (separate q/k/v) varlen entry point. jammi vendors
-flash-attention tag v2.8.3.post1 (commit a8aa52b1ab3e9ca574c8a33b3f35afc0
-17ffa2e2, see `crates/jammi-kernels/third_party/flash-attention/VENDORED.
-md`) via the qkv-PACKED entry point (`flash_attn_varlen_qkvpacked_func`
-upstream). VERSION MISMATCH recorded: jammi v2.8.3.post1 vs torch's
-~v2.8.4-dev (torch is NEWER by ~1 release, same 2.8.x kernel family). The
-packed and unpacked upstream Python wrappers both dispatch to the SAME
-`mha_varlen_fwd`/`mha_varlen_bwd` C++ entry points (upstream `flash_attn_
-interface.py`: `flash_attn_varlen_qkvpacked_func`'s docstring — "avoids
-explicit concatenation of the gradients of Q, K, V" — i.e. the ONLY
-difference is whether the caller already has one packed buffer or three
-separate ones; the CUDA math is identical), so torch's separate-q/k/v
-call is a legitimate numerical oracle for jammi's packed op PROVIDED q,
-k, v here are exactly the three [total_q, 3, H, 64] slabs.
+tag) — the UNPACKED (separate q/k/v) varlen entry point.
+
+**Corrected identity** (lead's v4 pressure-test, verified at source by this
+script's own author): torch 2.13.0's `third_party/flash-attention` submodule
+is pinned at commit `6c4f74fb338e0c3cdb07ac6f5eab5f54fc367c15`, which is the
+git tag `fa4-v4.0.0.beta15` on Dao-AILab/flash-attention — NOT a 2.8.x
+release (`flash_attn/__init__.py`'s `__version__ = "2.8.4"` at that commit is
+a stale string, not the repo's real version; confirmed by
+`GET /repos/Dao-AILab/flash-attention/git/refs/tags` resolving
+`fa4-v4.0.0.beta15` to that exact SHA). Torch's CMake build
+(`aten/src/ATen/CMakeLists.txt:359-365` at v2.13.0) still points at the
+CLASSIC kernel tree within that tag (`third_party/flash-attention/csrc/
+flash_attn/src`, the same subtree jammi vendors), so the kernel SOURCE
+lineage is comparable — but the build defines `UNFUSE_FMA` (verified at
+`csrc/flash_attn/src/softmax.h:85-89` in the fa4-v4.0.0.beta15 tag: this
+macro switches the online-softmax's `exp2f` call from a compiler-fusable
+`x * scale - max` to an explicit `__fmul_rn(x, scale) - max`, forcing IEEE
+multiply-then-subtract instead of a contracted FMA) and is NOT compiled
+with `--use_fast_math` (jammi's three flash translation units ARE, see
+`third_party/flash-attention/VENDORED.md`'s Build section). jammi vendors
+flash-attention tag v2.8.3.post1 (commit
+a8aa52b1ab3e9ca574c8a33b3f35afc017ffa2e2) from the SAME classic
+`csrc/flash_attn/src` subtree, without `UNFUSE_FMA`, with `--use_fast_math`.
+
+Net: this is a CROSS-BUILD reference, not a same-kernel-same-flags oracle —
+the tolerance below is NOT "two runs of the reference with different
+`deterministic` settings" for `o`/`lse` (forward has no split-KV path
+reachable from either build's varlen-packed/unpacked entry, so two runs of
+the SAME build's forward are bit-identical regardless of `deterministic`,
+which only affects backward `dQ` accumulation — see `flash/mod.rs`'s own
+determinism doc); `o`/`lse` self-diff is expected to be, and measured as,
+0. The `o`/`lse` tolerance is instead a stated ANALYTIC bound (bf16 output
+ULP scaled by the online-softmax accumulation depth, i.e. the number of
+128-row KV tiles = `ceil(max_seqlen/128)`, plus the fast-math/FMA-fusion
+error the two builds disagree on) computed in the Rust oracle, not baked
+into this sidecar. The `dq`/`dk`/`dv` self-diff below (same q/k/v/grad_out,
+two backward calls) DOES isolate genuine kernel-level accumulation
+nondeterminism in torch's own build and is used as-is for those three.
 
 Every leg's `o`/`lse`/`dq`/`dk`/`dv` from run 1 are saved as float32 .npy
 (from bf16 tensors — the loss of precision from bf16->f32 is exact/lossless,
-this is NOT a re-round). The run-to-run self-diff (run 1 vs run 2, same
-inputs, no explicit determinism knob exposed by this ATen op's schema) is
-recorded in the sidecar JSON as the reference's own noise floor, per §4 O0(a)
-("tolerance DERIVED from two runs of the reference itself").
+this is NOT a re-round).
 
 Usage: /root/jammi-ai/.venv-torch-ref/bin/python generate_fixtures.py
 Requires CUDA. Writes into this directory.
@@ -159,18 +178,36 @@ def main():
         "torch_version": torch.__version__,
         "torch_cuda": torch.version.cuda,
         "torch_flash_attention_vendored_commit": "6c4f74fb338e0c3cdb07ac6f5eab5f54fc367c15",
-        "torch_flash_attention_vendored_version_string": "2.8.4",
+        "torch_flash_attention_vendored_tag": "fa4-v4.0.0.beta15",
+        "torch_flash_attention_kernel_subtree": "third_party/flash-attention/csrc/flash_attn/src (classic tree, same subtree jammi vendors; the fa4 tag also carries newer hopper/ kernels torch's sm80 build does not compile)",
+        "torch_flash_attention_build_defines": ["FLASHATTENTION_DISABLE_ALIBI", "FLASHATTENTION_DISABLE_SOFTCAP", "UNFUSE_FMA"],
+        "torch_flash_attention_use_fast_math": False,
         "jammi_flash_attention_vendored_tag": "v2.8.3.post1",
         "jammi_flash_attention_vendored_commit": "a8aa52b1ab3e9ca574c8a33b3f35afc017ffa2e2",
+        "jammi_flash_attention_use_fast_math": True,
         "version_mismatch_note": (
-            "torch's vendored FA2 (2.8.4-dev @ 2026-05-26) is one release "
-            "newer than jammi's pinned v2.8.3.post1; both are in the 2.8.x "
-            "kernel family (no head_dim/window/varlen ABI break between "
-            "them per upstream CHANGELOG) — parity is tolerance-based "
-            "regardless (fast-math), so this bounds INTERPRETATION (a "
-            "true kernel-level divergence between the two versions would "
-            "look identical to fast-math noise) more than it bounds the "
-            "numeric bar itself."
+            "torch's third_party/flash-attention submodule is pinned at the "
+            "fa4-v4.0.0.beta15 tag (commit 6c4f74fb338e), NOT a 2.8.x "
+            "release (flash_attn/__init__.py's __version__=='2.8.4' string "
+            "at that commit is stale, not the repo's real version — "
+            "confirmed by resolving the tag ref to the exact SHA via the "
+            "GitHub API). jammi vendors v2.8.3.post1. Both pull from the "
+            "SAME classic csrc/flash_attn/src kernel subtree "
+            "(aten/src/ATen/CMakeLists.txt:359-365 at the v2.13.0 torch "
+            "tag), so this is a cross-build (not cross-kernel-generation) "
+            "comparison, but torch's build additionally defines UNFUSE_FMA "
+            "(verified at csrc/flash_attn/src/softmax.h:85-89 in the "
+            "fa4-v4.0.0.beta15 tag: forces exp2f(__fmul_rn(x,scale)-max) "
+            "instead of the fusable exp2f(x*scale-max)) and does NOT pass "
+            "--use_fast_math, while jammi's three flash translation units "
+            "DO (crates/jammi-kernels/third_party/flash-attention/"
+            "VENDORED.md's Build section). This is a real numeric "
+            "divergence source (FMA fusion + fast-math approximation), not "
+            "merely interpretation — the O0(a) parity tolerance for o/lse "
+            "is derived analytically (bf16 ULP x accumulation depth + a "
+            "stated fast-math error bound) rather than from a same-build "
+            "self-diff, which is 0 for o/lse regardless (forward has no "
+            "split-KV path on either build)."
         ),
         "device": torch.cuda.get_device_name(0),
         "seed": SEED,

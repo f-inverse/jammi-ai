@@ -4333,6 +4333,71 @@ mod tests {
         Tensor::from_vec(ids, (batch, seq), device).expect("build synthetic token-id batch")
     }
 
+    /// esc-045 round 5 (GH #374): seeds ONE shared LoRA weights file (rank
+    /// 16 / alpha 32 / `target_modules=[Wqkv,Wo,Wi]` / `ZerosB` init, seed
+    /// `JAMMI_ROUND4_SEED` or `42`) and saves it via `VarMap::save`, so
+    /// every round-4/round-5 arm invocation below loads the SAME LoRA
+    /// starting point via `JAMMI_ROUND4_LORA_WEIGHTS_IN` (isolating each
+    /// arm's arithmetic as the only variable, exactly like round 4's own
+    /// shared-weights discipline — see that test's doc). A standalone tool
+    /// test, not a check on its own; SKIPS unless
+    /// `JAMMI_ROUND5_SEED_LORA_WEIGHTS_OUT` is set, mirroring
+    /// `esc045_round4_per_layer_activation_gradient_dump`'s own
+    /// no-committed-checkpoint skip convention.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn esc045_round5_seed_shared_lora_weights() {
+        let Ok(model_dir) = std::env::var("JAMMI_ROUND4_MODEL_DIR") else {
+            eprintln!(
+                "esc045_round5_seed_shared_lora_weights: skipping — JAMMI_ROUND4_MODEL_DIR not \
+                 set"
+            );
+            return;
+        };
+        let Ok(out_path) = std::env::var("JAMMI_ROUND5_SEED_LORA_WEIGHTS_OUT") else {
+            eprintln!(
+                "esc045_round5_seed_shared_lora_weights: skipping — \
+                 JAMMI_ROUND5_SEED_LORA_WEIGHTS_OUT not set"
+            );
+            return;
+        };
+        let seed: u64 = std::env::var("JAMMI_ROUND4_SEED")
+            .map(|v| v.parse().expect("JAMMI_ROUND4_SEED must parse as u64"))
+            .unwrap_or(42);
+
+        let device = Device::new_cuda(0).expect("esc-045 round 5 requires a CUDA device");
+        let dir = std::path::PathBuf::from(&model_dir);
+        let config: ModernBertConfig =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                .unwrap();
+        let weights = dir.join("model.safetensors");
+
+        let varmap = VarMap::new();
+        let target_modules = ["Wqkv".to_string(), "Wo".to_string(), "Wi".to_string()];
+        let rank_pattern = HashMap::new();
+        let lora = LoraBuildConfig {
+            target_modules: &target_modules,
+            layers_to_transform: &None,
+            lora_rank: 16,
+            lora_alpha: 32.0,
+            use_rslora: false,
+            lora_dropout: None,
+            rank_pattern: &rank_pattern,
+            init_mode: jammi_lora::LoraInitMode::ZerosB,
+            seed,
+        };
+        let _model = ModernBert::builder()
+            .pooling(Pooling::Mean)
+            .backbone_dtype(DType::BF16)
+            .lora(lora)
+            .build(&[weights.as_path()], &config, &device, &varmap)
+            .expect("build ModernBert-large with LoRA");
+        varmap
+            .save(&out_path)
+            .unwrap_or_else(|e| panic!("save shared LoRA weights to {out_path:?} failed: {e}"));
+        eprintln!("esc045_round5_seed_shared_lora_weights: wrote {out_path} (seed={seed})");
+    }
+
     /// esc-045 round 4 (GH #374): per-layer ACTIVATION-gradient dump for
     /// ONE arm, driving the REAL `ModernBert::forward_hidden` on a real
     /// on-disk checkpoint with the REAL admission machinery

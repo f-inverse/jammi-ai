@@ -981,7 +981,7 @@ fn mask_grad(dscores: &Tensor, mask_shape: &Shape) -> Result<Tensor> {
 /// [`super::apply2`]. `CustomOp2` over `(y, dy)` — see the module doc for
 /// why this needs no `scores`/`mask` input at all.
 #[derive(Debug, Clone, Copy)]
-struct SoftmaxBwdDScores;
+pub(crate) struct SoftmaxBwdDScores;
 
 impl super::sealed::Sealed for SoftmaxBwdDScores {}
 
@@ -1075,7 +1075,7 @@ fn row_is_fully_masked(mask: &[f32]) -> bool {
     mask.iter().cloned().fold(f32::NEG_INFINITY, f32::max) < 0.0
 }
 
-fn softmax_row_f32(
+pub(crate) fn softmax_row_f32(
     scores: &[f32],
     mask: &[f32],
     out: &mut [f32],

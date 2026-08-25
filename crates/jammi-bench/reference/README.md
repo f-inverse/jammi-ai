@@ -391,20 +391,65 @@ table it owns (jammi's `grad-oracle` subcommand does zero translation — the
 shared weight-interchange file is a plain `safetensors` file in jammi's OWN
 internal naming; this script translates both directions).
 
-**PROVENANCE — read before trusting this script's output**: it has not
-been run. No `torch`/`transformers`/`peft` install was available in the
-environment it was written in (see `torch_grad_oracle.py`'s own module-doc
-banner for the full disclosure). Its NAME-TRANSLATION functions ARE
-locally tested (`test_torch_grad_oracle_names.py`, stdlib-only, no torch
-needed — that suite caught and pinned a real bug in an early draft: `Wi`,
-an MLP site whose jammi-side name carries no `mlp.` prefix, was misrouted
-to `attn.Wi` by a naive string-prefix heuristic). Everything past the name
-translation (the actual model load / forward / backward / gradient dump)
-is unverified against a live run.
+**PROVENANCE — read before trusting this script's output**: as of the
+F2/F3 audit-fix round on PR #372, it HAS been run once, live, on an A100
+pod (ModernBERT-large, `--batch 8 --seq 128 --seed 42`, jammi tip
+`e62c8a8`) — reported by the lead who dispatched that pod job, not
+verified locally by this fix round (no GPU was available here). See
+`torch_grad_oracle.py`'s own module-doc PROVENANCE banner for the full
+disclosure, including the measured cosine similarities from that run.
+Beyond that one confirmed config, everything else (other checkpoints,
+`target_modules` sets, dtypes/ranks/batch/seq combinations) remains
+UNVERIFIED against a live run — one successful execution is evidence the
+mechanism works, not a proof it is correct everywhere this script accepts
+flags for. Its NAME-TRANSLATION functions are, independently, locally
+tested (`test_torch_grad_oracle_names.py`, stdlib-only, no torch needed —
+that suite caught and pinned a real bug in an early draft: `Wi`, an MLP
+site whose jammi-side name carries no `mlp.` prefix, was misrouted to
+`attn.Wi` by a naive string-prefix heuristic).
+
+**Structural limitation, confirmed on that live run: a single fresh-init
+call tests ONLY `dL/dB`, never `dL/dA`.** Both `grad_oracle.rs` and this
+script run at `LoraInitMode::ZerosB` — `B` starts at the exact zero
+matrix, and the LoRA forward's chain rule routes `dL/dA` through `B^T @
+dL/d(output)`, which is IDENTICALLY zero whenever `B == 0`, for ANY value
+of `A`, on BOTH stacks, REGARDLESS of whether either stack's `dL/dA`
+arithmetic is actually correct. On the live A100 run, every `lora_a`
+tensor's gradient measured EXACTLY `0.0` on both dumps (112 of 224
+matched tensors) — a structural guarantee, not evidence the two stacks
+agree on that path. See `grad_oracle.rs`'s own "Structural limitation"
+doc section and `compare_grad_oracle.py`'s `is_vacuous_pair`/
+`vacuous_tensor_count`, which classify and surface this case explicitly
+rather than let a `0.0` cosine there masquerade as either a pass or a
+fail. Catching a real `dL/dA` defect needs at least one optimizer step
+first (moving `B` away from zero); not implemented this round.
 
 `ci/scripts/perf/compare_grad_oracle.py` reads a jammi `grad-oracle` dump
-and a `torch_grad_oracle.py` dump — SAME JSON schema on both sides — and
-reports gradient-DIRECTION agreement (cosine similarity), never a loss
-comparison; see that script's own module doc for the derived (never
-fitted) bf16 ULP-based cosine floor, and `ci/scripts/perf/test_compare_grad_oracle.py`
+and a `torch_grad_oracle.py` dump — SAME JSON schema on both sides,
+INCLUDING `batch_token_id_sums` (both producers emit it; the comparator
+refuses if either side omits it or the two disagree — an earlier draft of
+this script left `batch_token_id_sums` out of this dict entirely, which
+this line used to describe as "same schema" while that gap existed; fixed
+in the F3 audit round on PR #372) — and reports gradient-DIRECTION
+agreement (cosine similarity), never a loss comparison, ONLY after
+verifying its own premise: that both dumps recorded a loaded
+`--lora-weights-in` file, that their per-tensor `weight` arrays actually
+agree, and that their run-identity fields (seed/batch/seq/lora_rank/
+target_modules/batched_forward/backbone_dtype) and `batch_token_id_sums`
+match — a mismatch on any of those REFUSES the comparison (never a silent
+`PASS`) regardless of how well the gradients themselves happen to agree.
+On the live A100 run above, this weight-identity check held by actual
+agreement, not by luck of a loose bound: `max|w_jammi - w_torch| =
+1.86e-9` over 224 tensors, five orders of magnitude inside
+`compare_grad_oracle.py`'s `WEIGHT_MATCH_ATOL`.
+
+See that script's own module doc for the derived (never fitted) bf16
+ULP-based cosine floor, and its `derive_cosine_floor` doc for why that
+DERIVED worst-case bound (~-0.40 at ModernBERT-large's own default
+`--num-layers`/`--hidden-size`) is far looser than what real bf16 noise
+actually costs — the live run's measured overall cosines (torch-eager vs
+torch-sdpa 0.825; torch-bf16 vs torch-f32 0.924; jammi-f32 vs torch-f32
+0.9999998; a separately-introduced real defect on the same run scored
+0.30-0.53) are the empirical anchor for picking a real `--cosine-floor`,
+not the derived bound. See `ci/scripts/perf/test_compare_grad_oracle.py`
 for its (numpy-optional) test suite.

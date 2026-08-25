@@ -7,26 +7,66 @@ SPECIFIC to the torch side: the name translation this script does that
 `grad_oracle.rs` does not need to.
 
 ============================================================================
-PROVENANCE / HONESTY (execution-provenance principle): THIS SCRIPT HAS NOT
-BEEN RUN. No `torch`/`transformers`/`peft`/`safetensors` install was
-available in the environment this file was written in (no GPU, no torch
-venv provisioned — the lead's own dispatch message named the A100 pod as
-busy/self-terminating and asked for LOCAL build+unit-test only). Every
-claim below about PEFT's exact `named_parameters()` naming is derived by
-READING `torch_finetune_step.py`'s own already-working `wrap_lora`/
-`reinit_lora_a_jammi_distribution` (which DOES iterate
-`model.named_parameters()` against a real installed peft in that script's
-own dry-run CI/pod usage) and PEFT's public documented naming convention,
-never verified against a live run of THIS file. `translate_peft_name_to_jammi`
-below FAILS LOUDLY (raises, never silently drops a tensor) the moment its
-assumption is wrong, and `main()` asserts the translated name count against
-the model's own trainable-parameter count before writing anything — so a
-wrong assumption here is a hard crash on first run, not a silently-wrong
-gradient dump. Treat this file as a reviewed-but-unexecuted design + full
-implementation, not a verified oracle, until it has actually been run once
-against a real checkpoint and its output round-tripped through
-`compare_grad_oracle.py` against a real jammi `grad-oracle` dump.
+PROVENANCE / HONESTY (execution-provenance principle): AS OF THE F2/F3
+AUDIT-FIX ROUND ON PR #372, THIS SCRIPT HAS BEEN RUN — once, live, on an
+A100 pod (ModernBERT-large, `--batch 8 --seq 128 --seed 42`, jammi tip
+`e62c8a8`), reported by the lead who dispatched that pod job (not verified
+locally by this fix round — no GPU was available here; see this repo's
+`crates/jammi-bench` agent contract's "no GPU" disclosure). That run's
+translated-name count DID match the model's own trainable-parameter count
+(the `main()` assertion described below did not fire), and its output DID
+round-trip through `compare_grad_oracle.py` against a real jammi
+`grad-oracle` dump, producing (among others) these overall cosine
+similarities: torch-eager vs torch-sdpa 0.825; torch-bf16 vs torch-f32
+0.924; jammi-f32 vs torch-f32 0.9999998 (near-perfect, as expected — f32
+has no bf16 rounding to diverge on). A separately-introduced defect on
+that same run scored 0.30-0.53. Treat those five numbers as the empirical
+anchor for picking a REAL `--cosine-floor` (see
+`compare_grad_oracle.py`'s `derive_cosine_floor` doc for why its own
+DERIVED worst-case bound, ~-0.40 at these dimensions, is far looser than
+what real bf16 noise actually costs) — not the abstractly-derived floor.
+That run ALSO surfaced that `dL/dA` is EXACTLY `0.0` on BOTH stacks for
+every `lora_a` tensor at this fresh `LoraInitMode::ZerosB` init (112 of
+224 matched tensors) — see "Structural limitation: a single fresh-init
+call tests only `dL/dB`" below — and that the weight-identity check F3
+added (`compare_grad_oracle.py`'s `_weight_mismatches`) held on that run
+by actual agreement, not by luck of a loose bound: `max|w_jammi - w_torch|
+= 1.86e-9` over 224 tensors, five orders of magnitude inside
+`WEIGHT_MATCH_ATOL`.
+
+Everything ELSE about this file beyond that one confirmed run (arbitrary
+checkpoints, other `target_modules` sets, other dtypes/ranks/batch/seq
+combinations) remains UNVERIFIED against a live run — one successful
+execution at one config is evidence the mechanism works, not a proof it
+is correct at every config this script accepts. `translate_peft_name_to_jammi`
+below still FAILS LOUDLY (raises, never silently drops a tensor) the
+moment its naming assumption is wrong for a config not yet exercised, and
+`main()` still asserts the translated name count against the model's own
+trainable-parameter count before writing anything.
 ============================================================================
+
+STRUCTURAL LIMITATION — a single fresh-init call tests ONLY `dL/dB`:
+`LoraLinear`'s forward is `base(x) + scaling * dropout(x @ A^T @ B^T)`
+(`lora_linear.rs`'s own doc). At `LoraInitMode::ZerosB` (both `grad_oracle.rs`
+and this script use it — see `run()`'s `lora_args`/`lora.init_mode` above),
+`B` starts at the exact zero matrix, so `dL/dA` — which the chain rule
+routes through `B^T @ dL/d(output)` — is the EXACT zero vector for ANY
+value of `A`, on BOTH stacks, REGARDLESS of whether either stack's
+backward arithmetic is correct. Confirmed empirically on the one live run
+described above: every `lora_a` tensor's gradient measured EXACTLY `0.0`
+on both dumps. This means a single forward+backward at a fresh init
+provides ZERO evidence about whether jammi's and torch's `dL/dA`
+computations agree — a real defect specific to the `dL/dA` path (a
+transposed axis, a dropped scale factor) could NOT be caught this way; it
+would print an uninformative, structurally-guaranteed cosine of `0.0` on
+both an agreeing and a disagreeing implementation alike.
+`compare_grad_oracle.py`'s `is_vacuous_pair`/`vacuous_tensor_count`
+classify and surface exactly this case rather than let it masquerade as
+either a pass or a fail signal. Catching a real `dL/dA` defect requires AT
+LEAST one optimizer step first (moving `B` away from zero) — the
+N-step teacher-forced extension `grad_oracle.rs`'s own module doc scopes
+under "What this tier does NOT do" is what would close this gap; not
+implemented this round.
 
 NAME TRANSLATION — the crux this script owns (jammi's own
 `grad_oracle.rs` does ZERO translation; the shared weight-interchange file
@@ -288,6 +328,14 @@ def run(args) -> dict:
 
     mask = torch.ones(args.batch, args.seq, dtype=torch.long, device=device)
     blocks = [tfs.synthetic_ids(args.batch, args.seq, config.vocab_size, args.seed + i).to(device) for i in range(3)]
+    # Same digest jammi's `grad_oracle.rs` reports as `batch_token_id_sums`
+    # (see that module's field doc): `[sum(anchor ids), sum(positive ids),
+    # sum(negative ids)]`, computed from the SAME `blocks` both the batched
+    # and unbatched forward arms below consume, so `compare_grad_oracle.py`
+    # can refuse a comparison whose two dumps ran different token content
+    # even though `synthetic_ids` is meant to be bit-identical across the
+    # two stacks for the same `(seed, vocab)`.
+    batch_token_id_sums = [int(b.sum().item()) for b in blocks]
 
     if args.batched_forward:
         joined_ids = torch.cat(blocks, dim=0)
@@ -332,6 +380,7 @@ def run(args) -> dict:
         "lora_weights_in": args.lora_weights_in,
         "lora_weights_out": args.lora_weights_out,
         "trainable_tensor_count": len(gradients),
+        "batch_token_id_sums": batch_token_id_sums,
         "loss": float(loss.detach().float().item()),
         "gradients": gradients,
     }

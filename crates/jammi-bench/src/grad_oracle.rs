@@ -87,6 +87,30 @@
 //! test-suite doc / the dispatch verdict for what WAS exercised
 //! (jammi-side unit tests only, CPU/F32, the tiny fixture).
 //!
+//! ## Structural limitation: a single fresh-init call tests ONLY `dL/dB`
+//!
+//! At [`jammi_lora::LoraInitMode::ZerosB`] (this tier's only mode — see
+//! [`GradOracleParams::lora_weights_in`]'s doc), `B` starts at the exact
+//! zero matrix. The LoRA forward is `base(x) + scaling *
+//! dropout(x @ A^T @ B^T)`; the chain rule routes `dL/dA` through `B^T @
+//! dL/d(output)`, which is the ZERO matrix whenever `B == 0`, for ANY value
+//! of `A`, on BOTH stacks, REGARDLESS of whether either stack's backward
+//! arithmetic is actually correct there. Confirmed empirically on a live
+//! A100 run (ModernBERT-large, tip `e62c8a8`): every `lora_a` tensor's
+//! gradient measured EXACTLY `0.0` on both the jammi and the torch dump
+//! (112 of 224 matched tensors that run). A single forward+backward at a
+//! fresh init therefore provides ZERO evidence about whether jammi's and
+//! torch's `dL/dA` computations agree — a real defect specific to that
+//! path (a transposed axis, a dropped scale factor) could NOT be caught
+//! this way; it would read as the same uninformative, structurally
+//! guaranteed cosine of `0.0` whether the two stacks agree or not.
+//! `compare_grad_oracle.py`'s `is_vacuous_pair`/`vacuous_tensor_count`
+//! classify and surface exactly this case rather than let it masquerade as
+//! either a pass or a fail signal. Catching a real `dL/dA` defect needs AT
+//! LEAST one optimizer step first (moving `B` away from zero) — see "What
+//! this tier does NOT do" below for the N-step extension that would close
+//! this gap; not implemented this round.
+//!
 //! ## What this tier does NOT do (design, not shipped, this round)
 //!
 //! Extending to N steps in TEACHER-FORCED form — after each step,
@@ -497,18 +521,27 @@ mod tests {
 
     /// NEGATIVE CONTROL (family F: non-vacuous): loading a DIFFERENT LoRA
     /// weights file must actually change the dumped weight values (proving
-    /// `--lora-weights-in` is not silently ignored) AND must generally
-    /// change the gradient too (proving the forward+backward actually ran
-    /// against the loaded values, not the pre-load seeded draw). Two
-    /// DIFFERENT seeds give two different fresh `A` draws (`B` starts at
-    /// zero either way under `LoraInitMode::ZerosB`, so this checks `A`'s
-    /// effect specifically by taking a small AdamW-free training step
-    /// first — see the mutation this guards: a `varmap.load` call that
-    /// silently no-ops (wrong path variable, swallowed error) would leave
-    /// `second.weight == baseline.weight` here and this test would catch
-    /// it where the round-trip test above alone would not (that test only
-    /// proves round-trip CONSISTENCY, not that the load call is REACHED
-    /// at all when a fresh run never wrote+read its own file).
+    /// `--lora-weights-in` is not silently ignored) AND must actually
+    /// change the gradient of the `lora_b` tensor too (proving the
+    /// forward+backward actually ran against the loaded values, not the
+    /// pre-load seeded draw). Two DIFFERENT seeds give two different fresh
+    /// `A` draws (`B` starts at zero either way under
+    /// `LoraInitMode::ZerosB`).
+    ///
+    /// This deliberately does NOT compare the `lora_a` tensor's gradient:
+    /// under `LoraInitMode::ZerosB`, `dL/dA` is IDENTICALLY zero at a fresh
+    /// (pre-optimizer-step) init regardless of `A`'s own value — the LoRA
+    /// forward's `B @ (A @ x)` has `B == 0`, so the chain rule's `B^T @
+    /// dL/d(output)` factor that backprops into `dL/dA` is the zero
+    /// matrix. Asserting `lora_a`'s gradient differs would therefore be
+    /// VACUOUS (0.0 != 0.0 never holds; the assertion would trivially pass
+    /// for the wrong reason, or trivially fail always, neither of which
+    /// tests the load path). `dL/dB`, in contrast, IS `A`-dependent even
+    /// though `B == 0` — `dL/dB` is proportional to `(A @ x)`, which
+    /// changes with `A` — so it is both meaningful (catches a silently
+    /// skipped/wrong-path `varmap.load`) and cheap (no optimizer step
+    /// needed to make it informative, unlike an earlier draft of this
+    /// test's docstring claimed).
     #[test]
     fn grad_oracle_lora_weights_in_actually_overrides_the_fresh_init() {
         let dir = tempdir();
@@ -543,6 +576,30 @@ mod tests {
             loaded.gradients[&any_name].weight, seeded.gradients[&any_name].weight,
             "the loaded weight does not match the file's own recorded value"
         );
+
+        // `any_name` is a `lora_a`-suffixed key (`.lora_a` < `.lora_b`
+        // lexically, so `BTreeMap`'s first key is always `lora_a` here —
+        // see this test's doc for why `lora_b`'s gradient, not `lora_a`'s,
+        // is the informative one to assert on).
+        assert!(
+            any_name.ends_with("lora_a"),
+            "fixture assumption broken: expected the sorted-first gradient key to be a \
+             lora_a-suffixed name, got {any_name:?} -- update the lora_b lookup below to match"
+        );
+        // NOTE: `loaded` and `seeded` do NOT share a batch (`loaded_params`
+        // keeps `seed = 999`, only its WEIGHTS come from the `seed = 123`
+        // file), so their `lora_b` gradients are not expected to match —
+        // only `baseline` (also `seed = 999`, no file loaded) is the right
+        // same-batch comparator for the load-actually-took-effect check.
+        let lora_b_name = format!("{}lora_b", any_name.strip_suffix("lora_a").unwrap());
+        assert_ne!(
+            baseline.gradients[&lora_b_name].grad, loaded.gradients[&lora_b_name].grad,
+            "lora_weights_in changed the weight (asserted above) but NOT the lora_b gradient -- \
+             looks like the forward+backward ran against the PRE-load seeded draw instead of the \
+             loaded values (dL/dB is A-dependent even under LoraInitMode::ZerosB, see this test's \
+             doc)"
+        );
+
         let _ = std::fs::remove_file(&weights_path);
     }
 

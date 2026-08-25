@@ -137,15 +137,37 @@ def derive_cosine_floor(num_layers: int, hidden_size: int, safety_factor: float 
     where `eps = derive_relative_error_bound(...)` and `safety_factor`
     widens the bound (default 3x) so ordinary bf16 rounding noise —
     which is a STATISTICAL bound, not a hard cap — does not false-trip
-    this assertion; a REAL arithmetic defect (wrong sign on a whole
-    tensor, a missing scale factor, a transposed axis) produces an angle
-    close to 90 degrees or worse, nowhere near this floor regardless of
-    the safety factor. See this module's docstring for the citable
-    example: the P3 defect (b8-s512, fused arm's total |dqkv| 0.19% off
-    at step 0, 3x off after one update) — a 3x magnitude error on a
-    SHARED tensor is not isotropic per-element noise, and would read as a
-    LARGE angle (cosine well below 0.9, typically much lower), not a
-    small perturbation near 1.0.
+    this assertion.
+
+    THIS IS ONLY TRUE WHEN THE DERIVED FLOOR IS INFORMATIVE (`> 0`, in
+    practice close to `1.0`). An earlier draft of this docstring claimed a
+    REAL arithmetic defect (wrong sign on a whole tensor, a missing scale
+    factor, a transposed axis) "produces an angle close to 90 degrees or
+    worse, nowhere near this floor regardless of the safety factor" — that
+    claim is FALSE at the depth/width this module's OWN default arguments
+    select (`--num-layers 28 --hidden-size 1024`, ModernBERT-large):
+    `eps = sqrt(28*1024) * 2^-8 ~= 0.661`, so `safety_factor * eps ~=
+    1.984` radians, and `cos(1.984) ~= -0.402` — a floor BELOW zero, which
+    a full 90-degree defect (cosine exactly `0.0`) clears with room to
+    spare, and which even a WORSE-than-90-degree defect (cosine down to
+    `-0.402`) still clears. `derive_relative_error_bound`'s own doc already
+    discloses that its statistical bound is not tight at this depth; this
+    function's docstring must not separately claim the resulting floor is
+    always discriminating when it is not. See
+    `test_compare_grad_oracle.py::test_derive_cosine_floor_is_non_positive_at_modernbert_large_defaults`
+    for the pinned numeric reproduction, and `main()`'s own doc for the
+    refusal this module now performs instead of silently comparing against
+    a non-positive floor.
+
+    A perturbation that genuinely IS small and isotropic (the ordinary
+    bf16-rounding case this bound is meant to size) does satisfy
+    `sin(theta) ~ eps` to first order (the perturbation's component
+    ORTHOGONAL to `a`, relative to `|a|`, is what rotates the vector; a
+    perturbation purely along `a` does not change direction at all) — the
+    derivation above is correct AS A DERIVATION. What breaks at depth is
+    only the SIZE of `eps` itself, which the safety-factor multiplication
+    and `cos` can push at or past the point where the resulting floor stops
+    discriminating between "rounding noise" and "wrong direction entirely".
 
     `eps` can legitimately exceed `pi` for a large `num_layers *
     hidden_size` (see `derive_relative_error_bound`'s own doc — the
@@ -155,7 +177,30 @@ def derive_cosine_floor(num_layers: int, hidden_size: int, safety_factor: float 
     `[-1.0, 1.0]`, never raises on a large `eps`. A caller whose derived
     floor comes out at or below 0.0 should treat the bound as
     UNINFORMATIVE at that depth and prefer a NAMED, empirically-set floor
-    instead — this function never silently substitutes one.
+    instead — this function never silently substitutes one; `main()`
+    enforces this by REFUSING (non-zero exit, no `PASS` ever printed)
+    rather than running a vacuous comparison.
+
+    EMPIRICAL ANCHOR FOR CHOOSING THAT NAMED FLOOR: a live A100 run
+    (ModernBERT-large, `--batch 8 --seq 128 --seed 42`, jammi tip
+    `e62c8a8` — reported by the lead who dispatched that pod job, not
+    reproduced by this module's own test suite, which has no GPU) measured
+    these overall cosine similarities: torch-eager vs torch-sdpa `0.825`;
+    torch-bf16 vs torch-f32 `0.924`; jammi-f32 vs torch-f32 `0.9999998`
+    (near-perfect, as expected — f32 has no bf16 rounding to diverge on).
+    A separately-introduced real defect on that same run scored `0.30` to
+    `0.53`. So real bf16-through-a-28-layer-triplet-loss noise sits around
+    `0.82`-`0.93`, nowhere near this function's derived `~-0.40` at these
+    dimensions, and a real defect sits well below both — an explicit
+    `--cosine-floor` picked from THIS band (e.g. `0.7`-`0.8`, between the
+    noise band and the defect band) is what a real bf16 sweep should pass,
+    not the derived worst-case bound, which this function's own doc above
+    already says to treat as uninformative once it goes non-positive. This
+    paragraph is a citation of an EXTERNALLY reported measurement, not a
+    claim this module's local test suite verifies (no GPU here) — see
+    `test_compare_grad_oracle.py` for what IS locally verified (the pure
+    arithmetic these external numbers are consistent with, never the
+    external numbers themselves).
     """
     eps = derive_relative_error_bound(num_layers, hidden_size)
     return math.cos(min(safety_factor * eps, math.pi))
@@ -203,6 +248,30 @@ def cosine_similarity(a, b) -> float:
     return _dot(a, b) / denom
 
 
+def is_vacuous_pair(a, b) -> bool:
+    """`True` iff BOTH `a` and `b` are (numerically) the zero vector.
+
+    Confirmed live on a real A100 run (ModernBERT-large, tip e62c8a8): at a
+    fresh `LoraInitMode::ZerosB` init, `dL/dA` is EXACTLY `0.0` on BOTH
+    stacks for every `lora_a` tensor (`max|dL/dA| == 0` on all four dumps
+    from that run) -- LoRA's forward is `base(x) + scaling *
+    dropout(x @ A^T @ B^T)` (`lora_linear.rs`'s own doc), and with `B ==
+    0` the chain rule's `B^T @ dL/d(output)` factor that backprops into
+    `dL/dA` is the zero matrix, for ANY `A`. In that run this was HALF the
+    matched tensors (112 of 224) — every `lora_a` entry, none of the
+    `lora_b` ones. `cosine_similarity`'s `denom < NORM_FLOOR` branch
+    already returns a well-defined `0.0` rather than `NaN` for this case
+    (family F's non-vacuous-control invariant), but a bare `0.0` in
+    `per_tensor[name]["cosine_similarity"]` does not, on its own, say
+    WHETHER that `0.0` means "the two stacks disagree" or "neither stack
+    has a signal here at all, by construction" — those are opposite
+    conclusions from the same number. `compare_tensor`/`compare_reports`
+    use this to classify and report that distinction explicitly rather
+    than let a vacuous `0.0` masquerade as either a pass or a fail.
+    """
+    return _norm(a) < NORM_FLOOR and _norm(b) < NORM_FLOOR
+
+
 def compare_tensor(name, grad_a, grad_b):
     if len(grad_a) != len(grad_b):
         raise ValueError(f"{name}: length mismatch ({len(grad_a)} vs {len(grad_b)})")
@@ -212,17 +281,153 @@ def compare_tensor(name, grad_a, grad_b):
         "max_abs_delta": max_delta,
         "max_abs_delta_over_max_signal": (max_delta / max_signal) if max_signal > NORM_FLOOR else None,
         "cosine_similarity": cosine_similarity(grad_a, grad_b),
+        "vacuous": is_vacuous_pair(grad_a, grad_b),
         "n": len(grad_a),
     }
+
+
+# Run-identity fields this comparator's premise (module docstring line 6:
+# "IDENTICAL LoRA weights", plus an identical batch — see
+# `_premise_violations`'s own doc) actually depends on. `lora_alpha` and
+# `lora_dropout` are DELIBERATELY excluded: `lora_alpha` only rescales the
+# LoRA delta by a constant both stacks apply identically post-matmul (a
+# mismatch there would show up as a magnitude difference, which
+# `max_abs_delta_over_max_signal` already surfaces, not a premise
+# violation), and `lora_dropout` is unconditionally forced to `0.0` by both
+# producers (`grad_oracle.rs`'s and `torch_grad_oracle.py`'s own module
+# docs) so it can never legitimately differ.
+RUN_IDENTITY_FIELDS = (
+    "seed",
+    "batch",
+    "seq",
+    "lora_rank",
+    "target_modules",
+    "batched_forward",
+    "backbone_dtype",
+)
+
+# How tightly a `weight` array recorded by the two INDEPENDENT producers
+# (jammi's `grad_oracle.rs`, torch's `torch_grad_oracle.py`) must agree to
+# count as "the identical weight file". Both producers read the SAME
+# safetensors file and re-serialize its values through JSON at f32/f64
+# precision, so a genuine same-file load should agree far tighter than
+# this — this bound is deliberately loose relative to that (not a fitted
+# noise floor) so it never false-trips on JSON round-trip precision, while
+# staying many orders of magnitude below a real content mismatch (the
+# reproduction that motivated this check compared `weight = [0, 0, 0, 0]`
+# against `[9, 9, 9, 9]`).
+WEIGHT_MATCH_ATOL = 1e-4
+
+
+def _weight_mismatches(report_a, report_b, matched_names):
+    """Per-tensor `weight` agreement over the tensors matched by name.
+
+    This is the check the comparator's own premise (module docstring line
+    6, "IDENTICAL LoRA weights") depends on and, before this fix, never
+    ran: both `grad_oracle.rs` and `torch_grad_oracle.py` dump the exact
+    weight value the forward actually used specifically so a comparator
+    can verify this — reading only `grad` and ignoring `weight` compares
+    gradients that may have been taken at DIFFERENT weights and calls that
+    a pass.
+    """
+    mismatches = []
+    for name in matched_names:
+        ta = report_a["gradients"][name]
+        tb = report_b["gradients"][name]
+        wa = ta.get("weight")
+        wb = tb.get("weight")
+        if not wa or not wb:
+            mismatches.append(f"{name}: missing/empty 'weight' field in one or both dumps")
+            continue
+        if len(wa) != len(wb):
+            mismatches.append(f"{name}: weight length mismatch ({len(wa)} vs {len(wb)})")
+            continue
+        delta = _max_abs_delta(wa, wb)
+        if delta > WEIGHT_MATCH_ATOL:
+            mismatches.append(
+                f"{name}: weight mismatch, max|delta|={delta} (> {WEIGHT_MATCH_ATOL}) -- the two "
+                "dumps were NOT produced from identical LoRA weights"
+            )
+    return mismatches
+
+
+def _premise_violations(report_a, report_b):
+    """Everything besides the gradient arrays themselves that this
+    comparator's stated premise (module docstring line 6: "IDENTICAL LoRA
+    weights", and an identical batch) depends on, and that
+    `compare_reports` used to never look at: whether each side actually
+    loaded a shared weight file at all, whether the two runs were
+    configured identically (seed/shape/LoRA rank/target modules/forward
+    mode/backbone dtype), and whether the two runs fed the encoder the
+    SAME synthetic tokens (`batch_token_id_sums`, jammi's batch digest --
+    see `grad_oracle.rs`'s field doc; `torch_grad_oracle.py` now emits the
+    same field in the same schema).
+    """
+    violations = []
+    for label, report in (("A", report_a), ("B", report_b)):
+        if not report.get("lora_weights_in"):
+            violations.append(
+                f"report {label} records no loaded --lora-weights-in file -- this comparator's "
+                "premise is IDENTICAL LoRA weights loaded from a SHARED file on both sides; a "
+                "fresh/unloaded run compares gradients taken at DIFFERENT, independently-seeded "
+                "weights, which this comparator cannot certify agrees with anything"
+            )
+
+    for field in RUN_IDENTITY_FIELDS:
+        va = report_a.get(field)
+        vb = report_b.get(field)
+        if va != vb:
+            violations.append(f"run-identity field {field!r} differs: A={va!r} B={vb!r}")
+
+    sums_a = report_a.get("batch_token_id_sums")
+    sums_b = report_b.get("batch_token_id_sums")
+    if sums_a is None or sums_b is None:
+        violations.append(
+            "batch_token_id_sums missing from one or both dumps -- cannot verify the two runs "
+            "fed the encoder the SAME synthetic batch"
+        )
+    elif list(sums_a) != list(sums_b):
+        violations.append(f"batch_token_id_sums differ: A={sums_a!r} B={sums_b!r}")
+
+    return violations
 
 
 def compare_reports(report_a, report_b, cosine_floor):
     """Match tensors by NAME (loud on a mismatch, never silently skipped --
     B6's schema-strictness posture: a structural mismatch here is exactly
     the failure mode this oracle exists to catch, e.g. a target-modules
-    set that resolved differently on the two stacks) and compute per-tensor
-    and OVERALL (every matched tensor's gradient concatenated into one
-    vector) statistics.
+    set that resolved differently on the two stacks), verify the
+    comparator's own premise (`_premise_violations`, `_weight_mismatches`
+    -- IDENTICAL weights, identical batch, identical run configuration),
+    and compute per-tensor and OVERALL (every matched tensor's gradient
+    concatenated into one vector) gradient-direction statistics.
+
+    `passed` requires ALL of: no name-set mismatch, at least one matched
+    tensor, no premise violation, no weight mismatch, and the overall
+    cosine similarity at or above `cosine_floor`. A premise violation or a
+    weight mismatch forces `passed = False` regardless of how well the
+    gradients happen to agree -- agreement computed at the WRONG premise
+    (different weights, different batch, different config) proves nothing
+    about the two stacks' arithmetic.
+
+    VACUOUS TENSORS (confirmed live on a real A100 run: at a fresh
+    `LoraInitMode::ZerosB` init, every `lora_a` tensor's gradient is
+    EXACTLY zero on BOTH stacks -- see `is_vacuous_pair`'s own doc): these
+    are counted in `vacuous_tensor_count`/named in `vacuous_tensor_names`,
+    separately from `matched_tensor_count`, and are NEVER excluded from
+    `overall_cosine_similarity`'s concatenated vector (a both-sides-zero
+    segment contributes exactly `0` to both the dot product and each
+    vector's sum-of-squares, so including vs excluding it is
+    mathematically IDENTICAL -- this is a reporting/classification fix,
+    not a correction to the overall statistic, which was never corrupted
+    by these tensors). What was missing before this fix is visibility: a
+    reader of `per_tensor[name]["cosine_similarity"] == 0.0` could not
+    tell "these two stacks disagree here" apart from "this tensor has no
+    signal on EITHER side, by construction, regardless of correctness" --
+    opposite conclusions from the identical number. See
+    `crates/jammi-bench/reference/README.md`'s own disclosure that a
+    single fresh-init forward+backward tests ONLY `dL/dB`; `dL/dA`
+    agreement (or disagreement) cannot be observed this way at all.
     """
     names_a = set(report_a["gradients"].keys())
     names_b = set(report_b["gradients"].keys())
@@ -239,26 +444,68 @@ def compare_reports(report_a, report_b, cosine_floor):
         all_a.extend(ga)
         all_b.extend(gb)
 
+    vacuous_tensor_names = sorted(name for name in matched if per_tensor[name]["vacuous"])
+
     overall_cosine = cosine_similarity(all_a, all_b) if all_a else None
+    weight_mismatches = _weight_mismatches(report_a, report_b, matched)
+    premise_violations = _premise_violations(report_a, report_b)
+
     passed = (
         not only_a
         and not only_b
         and bool(matched)
         and overall_cosine is not None
         and overall_cosine >= cosine_floor
+        and not weight_mismatches
+        and not premise_violations
     )
 
+    loss_a = report_a.get("loss")
+    loss_b = report_b.get("loss")
+    # INFORMATIONAL ONLY -- never gates `passed`. jammi and torch are
+    # different arithmetic implementations of the same architecture; even
+    # at identical weights and an identical batch, their losses are not
+    # expected to be BIT-identical (different reduction/op order, same
+    # "not associative" reasoning `finetune_step.rs`'s own
+    # batched-vs-unbatched test documents), so asserting equality here
+    # would risk a false FAIL on ordinary cross-framework rounding. It is
+    # still computed and surfaced (previously dead-lettered: recorded in
+    # the report, read by nothing) so a caller can eyeball whether it is
+    # "small rounding noise" or "wildly different", the same qualitative
+    # read the cosine floor's own derivation relies on.
+    loss_relative_diff = None
+    if loss_a is not None and loss_b is not None:
+        denom = max(abs(loss_a), abs(loss_b), NORM_FLOOR)
+        loss_relative_diff = abs(loss_a - loss_b) / denom
+
     return {
-        "loss_a": report_a.get("loss"),
-        "loss_b": report_b.get("loss"),
+        "loss_a": loss_a,
+        "loss_b": loss_b,
+        "loss_relative_diff": loss_relative_diff,
         "only_in_a": only_a,
         "only_in_b": only_b,
         "matched_tensor_count": len(matched),
+        "vacuous_tensor_count": len(vacuous_tensor_names),
+        "vacuous_tensor_names": vacuous_tensor_names,
         "cosine_floor": cosine_floor,
         "overall_cosine_similarity": overall_cosine,
         "per_tensor": per_tensor,
+        "weight_mismatches": weight_mismatches,
+        "premise_violations": premise_violations,
         "passed": passed,
     }
+
+
+# Exit codes `main()` returns. `REFUSED` is deliberately distinct from
+# `FAIL`: `FAIL` means the comparison RAN and did not pass (a real
+# gradient/premise disagreement); `REFUSED` means the comparison never ran
+# at all because the floor in use could not have discriminated a real
+# defect from noise -- printing `PASS` (or even `FAIL`) in that state would
+# claim a certification this invocation cannot back up. Never print `PASS`
+# on a `REFUSED` exit.
+EXIT_PASS = 0
+EXIT_FAIL = 1
+EXIT_REFUSED = 2
 
 
 def main(argv=None):
@@ -271,16 +518,48 @@ def main(argv=None):
     p.add_argument("--out", type=str, default=None)
     args = p.parse_args(argv)
 
-    with open(args.report_a) as fh:
-        report_a = json.load(fh)
-    with open(args.report_b) as fh:
-        report_b = json.load(fh)
-
     cosine_floor = (
         args.cosine_floor
         if args.cosine_floor is not None
         else derive_cosine_floor(args.num_layers, args.hidden_size)
     )
+
+    # REFUSE before even opening the report files: a floor `<= 0` cannot
+    # discriminate a real arithmetic defect (which can itself read as
+    # cosine `<= 0`, e.g. a 90-degree-or-worse rotation) from noise, so
+    # attempting the comparison at all would be theater regardless of what
+    # the two dumps contain. This enforces `derive_cosine_floor`'s own doc
+    # ("A caller whose derived floor comes out at or below 0.0 should ...
+    # prefer a NAMED, empirically-set floor instead") and closes the
+    # reproduction where ModernBERT-large's OWN default `--num-layers
+    # 28 --hidden-size 1024` derives a floor of ~-0.402 and two EXACTLY
+    # ORTHOGONAL gradient vectors (cosine 0.0) print `PASS`.
+    #
+    # This also refuses an EXPLICIT `--cosine-floor` at or below `0.0`:
+    # such a floor is uninformative regardless of where it came from (see
+    # this module's docstring), and silently accepting one would just move
+    # the same vacuous-pass hazard from the derived path to the explicit
+    # one.
+    if cosine_floor <= 0.0:
+        source = "an explicit --cosine-floor" if args.cosine_floor is not None else (
+            f"the DERIVED floor at --num-layers {args.num_layers} --hidden-size {args.hidden_size}"
+        )
+        print(
+            f"REFUSED: cosine_floor = {cosine_floor} (<= 0.0), from {source}. A non-positive "
+            "cosine floor cannot distinguish ordinary bf16 rounding noise from a real arithmetic "
+            "defect (a 90-degree-or-worse rotation can itself score <= 0.0) -- this comparator "
+            "will not run a comparison that cannot fail. Pass an explicit --cosine-floor > 0.0 "
+            "(see derive_cosine_floor's docstring), or scope --num-layers/--hidden-size to the "
+            "specific tensor(s) actually being checked rather than the whole-model default.",
+            file=sys.stderr,
+        )
+        return EXIT_REFUSED
+
+    with open(args.report_a) as fh:
+        report_a = json.load(fh)
+    with open(args.report_b) as fh:
+        report_b = json.load(fh)
+
     result = compare_reports(report_a, report_b, cosine_floor)
 
     if args.out:
@@ -290,12 +569,22 @@ def main(argv=None):
     print(f"overall_cosine_similarity: {result['overall_cosine_similarity']}")
     print(f"cosine_floor: {result['cosine_floor']} (numpy={'yes' if HAVE_NUMPY else 'no, pure-python fallback'})")
     print(f"matched_tensor_count: {result['matched_tensor_count']}")
+    print(
+        f"vacuous_tensor_count: {result['vacuous_tensor_count']} "
+        "(both sides exactly zero -- e.g. lora_a at a fresh ZerosB init; carries "
+        "NO evidence about agreement either way; see is_vacuous_pair's doc)"
+    )
+    print(f"loss_a: {result['loss_a']}  loss_b: {result['loss_b']}  loss_relative_diff: {result['loss_relative_diff']}")
     if result["only_in_a"]:
         print(f"only_in_a: {result['only_in_a']}", file=sys.stderr)
     if result["only_in_b"]:
         print(f"only_in_b: {result['only_in_b']}", file=sys.stderr)
+    for msg in result["premise_violations"]:
+        print(f"PREMISE VIOLATION: {msg}", file=sys.stderr)
+    for msg in result["weight_mismatches"]:
+        print(f"WEIGHT MISMATCH: {msg}", file=sys.stderr)
     print("PASS" if result["passed"] else "FAIL")
-    return 0 if result["passed"] else 1
+    return EXIT_PASS if result["passed"] else EXIT_FAIL
 
 
 if __name__ == "__main__":

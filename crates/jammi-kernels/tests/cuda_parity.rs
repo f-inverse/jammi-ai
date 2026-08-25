@@ -4202,6 +4202,31 @@ fn adamw_step_empty_tensor_on_cuda_is_a_no_op_not_a_crash() {
         .is_empty());
 }
 
+/// `validate_step_domain`'s CUDA-arm contiguity check (`Error::
+/// RequiresContiguous`) is only reachable with a real `Device::Cuda` — a
+/// CPU-only `cargo mutants` run can never enter the `theta.device().
+/// is_cuda()` branch at all, so this is the ONLY lane that can exercise
+/// it. A non-contiguous `first_moment` (a transposed view) must be
+/// refused before any kernel launches, not silently misread.
+#[test]
+fn non_contiguous_first_moment_is_refused_on_cuda() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let theta = Tensor::zeros((2, 3), DType::F32, &cuda).unwrap();
+    let m_base = Tensor::zeros((3, 2), DType::F32, &cuda).unwrap();
+    let m = m_base.t().unwrap();
+    assert!(!m.is_contiguous());
+    let v = Tensor::zeros((2, 3), DType::F32, &cuda).unwrap();
+    let g = Tensor::from_slice(&[0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6], (2, 3), &cuda).unwrap();
+    let err = adamw_step_fused_t(&theta, &m, &v, &g, 1, default_adamw_params())
+        .expect_err("a non-contiguous first_moment must be refused on CUDA");
+    assert!(
+        matches!(err, candle_core::Error::RequiresContiguous { .. }),
+        "got {err:?}"
+    );
+}
+
 /// RED CONTROL (family F, CUDA leg — the CPU-side twin lives in
 /// `ops::adamw_step::tests::negative_control_...`): the deliberately WRONG,
 /// FMA-contracted [`AdamMomentUpdateFmaContractedRedControl`] kernel MUST

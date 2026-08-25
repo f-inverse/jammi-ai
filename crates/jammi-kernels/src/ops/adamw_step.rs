@@ -1268,6 +1268,94 @@ mod tests {
         );
     }
 
+    /// MUT-triage: `negative_control_the_fma_contracted_kernel_diverges_
+    /// from_the_real_one` (above) only proves the red-control's output
+    /// DIFFERS from the real kernel's — true even for a stub `cpu_fwd`
+    /// that never mutates `m` at all (the stale `m0` differs from the
+    /// real kernel's updated value too). This test is a DIRECT value
+    /// oracle instead (family F, numpy-first-style): the red control's
+    /// output must equal the EXACT `f32::mul_add`-contracted formula,
+    /// computed independently here — covering both `square_grad` branches
+    /// (`gv*gv` is untested by every other red-control test, which all use
+    /// `square_grad=false`) and killing the `cpu_fwd -> Ok(())` stub
+    /// mutant as a side effect (a stub leaves `m` at its stale `m0`, which
+    /// will not bit-match the computed formula for any of these nonzero,
+    /// non-idempotent fixtures).
+    #[test]
+    fn red_control_matches_the_exact_fma_contracted_formula() {
+        let dev = Device::Cpu;
+        let cases: [(f32, f32, f64, bool); 4] = [
+            (0.5, 0.1, 0.9, false),
+            (-1.25, -0.3, 0.9, false),
+            (0.5, 0.1, 0.9, true),
+            (-1.25, -0.3, 0.999, true),
+        ];
+        for &(m0, g0, beta, square_grad) in &cases {
+            let m = Tensor::from_slice(&[m0], (1,), &dev).unwrap();
+            let g = Tensor::from_slice(&[g0], (1,), &dev).unwrap();
+            super::super::apply_inplace2(
+                &m,
+                &g,
+                AdamMomentUpdateFmaContractedRedControl::new(beta, square_grad),
+            )
+            .unwrap();
+            let got: f32 = m.to_vec1::<f32>().unwrap()[0];
+
+            let beta_f32 = beta as f32;
+            let one_minus_beta_f32 = (1.0 - beta) as f32;
+            let gv = if square_grad { g0 * g0 } else { g0 };
+            let want = beta_f32.mul_add(m0, one_minus_beta_f32 * gv);
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "red control (m0={m0}, g0={g0}, beta={beta}, square_grad={square_grad}): \
+                 got {got} ({:#010x}), want {want} ({:#010x})",
+                got.to_bits(),
+                want.to_bits()
+            );
+        }
+    }
+
+    /// MUT-triage: pins `AdamMomentUpdateFmaContractedRedControl::name`'s
+    /// exact string through its `ShapeMismatchBinaryOp` path — mirrors
+    /// `error_op_field_names_are_pinned_exactly`'s pattern for the real
+    /// ops, which never exercises the red control's own `name()` at all.
+    #[test]
+    fn red_control_name_is_pinned_exactly() {
+        let dev = Device::Cpu;
+        let m = Tensor::zeros((2,), DType::F32, &dev).unwrap();
+        let g = Tensor::from_slice(&[1.0f32, 2.0, 3.0], (3,), &dev).unwrap();
+        let err = super::super::apply_inplace2(
+            &m,
+            &g,
+            AdamMomentUpdateFmaContractedRedControl::new(0.9, false),
+        )
+        .unwrap_err();
+        match err {
+            Error::ShapeMismatchBinaryOp { op, .. } => {
+                assert_eq!(op, "adamw_moment_update_fma_contracted_red_control")
+            }
+            other => panic!("expected ShapeMismatchBinaryOp, got {other:?}"),
+        }
+    }
+
+    /// MUT-triage: the red control's own `s1.dtype() != s2.dtype()` guard
+    /// (a separate copy from `AdamMomentUpdate`'s, since this type
+    /// implements its own `cpu_fwd`) must be exercised the same way.
+    #[test]
+    fn red_control_mismatched_dtype_is_refused() {
+        let dev = Device::Cpu;
+        let m = Tensor::zeros((2,), DType::F32, &dev).unwrap();
+        let g = Tensor::from_slice(&[1.0f64, 2.0], (2,), &dev).unwrap();
+        let err = super::super::apply_inplace2(
+            &m,
+            &g,
+            AdamMomentUpdateFmaContractedRedControl::new(0.9, false),
+        )
+        .expect_err("F32 moment vs F64 grad must be refused, not silently reinterpreted");
+        assert!(matches!(err, Error::DTypeMismatchBinaryOp { .. }));
+    }
+
     /// Non-contiguous view oracle (CPU walks arbitrary strides): a
     /// transposed `g` must still read the right elements.
     #[test]

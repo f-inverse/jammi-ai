@@ -182,7 +182,7 @@ every 25ms (`std::thread::sleep`, finetune_step.rs:98) over the ENTIRE step
 loop (warmup + measured), then subtracts a baseline snapshot
 (`peak.saturating_sub(baseline)`, finetune_step.rs:114) read once, right
 after the model+optimizer are built (before the loop starts) — see
-`vram_baseline`, finetune_step.rs:370.
+`vram_baseline`, finetune_step.rs:431.
 
 **An earlier draft of this script got the sampling point wrong.** It polled
 `torch.cuda.memory_allocated()` once per step, at the same point the clock

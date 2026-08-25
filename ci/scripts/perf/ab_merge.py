@@ -26,21 +26,22 @@ jammi-vs-torch comparator this repo carries:
 
 | field | class | jammi emit site | torch emit site |
 |---|---|---|---|
-| `seed` | identity | `report.rs:FinetuneStepTier::seed` field; `seed: params.seed,` (`finetune_step.rs:468`) | `"seed": args.seed` (`torch_finetune_step.py:1038`) |
-| `batch` | identity | `batch: params.batch,` (`finetune_step.rs:473`) | `"batch": args.batch,` (`torch_finetune_step.py:1055`) |
-| `seq` | identity | `seq: params.seq,` (`finetune_step.rs:474`) | `"seq": args.seq,` (`torch_finetune_step.py:1056`) |
-| `lora_rank` | identity | `lora_rank: params.lora_rank,` (`finetune_step.rs:475`) | `"lora_rank": args.lora_rank,` (`torch_finetune_step.py:1057`) |
-| `lora_alpha` | identity — input was already threaded through `FinetuneStepParams::lora_alpha`, just never emitted before this round | `lora_alpha: params.lora_alpha,` (`finetune_step.rs:476`) | `"lora_alpha": args.lora_alpha,` (`torch_finetune_step.py:1031`) |
-| `lora_dropout` | identity | `lora_dropout: params.lora_dropout` (`finetune_step.rs:477`) | `"lora_dropout": args.lora_dropout,` (`torch_finetune_step.py:1058`) |
-| `margin` | identity, but jammi HARDCODES `0.3` (no `--margin` CLI flag — the call site's own literal, `let loss = triplet_loss(&a, &p, &n, 0.3)?;` (`finetune_step.rs:316`)) | `margin: 0.3,` (`finetune_step.rs:484`) | `"margin": args.margin,` (`torch_finetune_step.py:1040`) — `--margin` default `0.3` |
-| `target_modules` | identity | `target_modules: params.target_modules.clone(),` (`finetune_step.rs:485`) | `"target_modules": [` (`torch_finetune_step.py:1061`) |
-| `batched_forward` | identity | `batched_forward: params.batched_forward,` (`finetune_step.rs:486`) | `"batched_forward": args.batched_forward,` (`torch_finetune_step.py:1064`) |
-| `backbone_dtype` | identity | `backbone_dtype: format!("{:?}", params.backbone_dtype)` (`finetune_step.rs:469`) | `"backbone_dtype": args.dtype,` (`torch_finetune_step.py:1046`) |
-| `steps_measured` | identity — the reachable divergence this table used to miss entirely: two legs measured at a DIFFERENT step count (e.g. a mismatched `--steps`/`--warmup` override) still merged to a "clean" ratio before this field was compared | `steps_measured: times.len(),` (`finetune_step.rs:488`) | `"steps_measured": len(times),` (`torch_finetune_step.py:1066`) |
-| `checkpoint_config_sha256` | identity — same base-checkpoint CONTENT identity `grad_oracle.rs`'s tier already carries, added to THIS tier too | `let (checkpoint_config_sha256, _config_len) =` (`finetune_step.rs:337`), via the SHARED streaming `pub(crate) fn sha256_and_len` (`finetune_step.rs:574`) | `checkpoint_identity_fields = checkpoint_identity(args.model_dir)` (`torch_finetune_step.py:926`) |
-| `checkpoint_weights_sha256` | identity | `let (checkpoint_weights_sha256, checkpoint_weights_size_bytes) =` (`finetune_step.rs:339`) | `"checkpoint_weights_sha256": weights_sha256,` (`torch_finetune_step.py:551`) |
-| `checkpoint_weights_size_bytes` | identity | `checkpoint_weights_size_bytes) =` (`finetune_step.rs:339`) — same call as the row above, its second return value | `"checkpoint_weights_size_bytes": weights_len,` (`torch_finetune_step.py:552`) |
+| `seed` | identity | `report.rs:FinetuneStepTier::seed` field; `seed: params.seed,` (`finetune_step.rs:567`) | `"seed": args.seed` (`torch_finetune_step.py:1038`) |
+| `batch` | identity | `batch: params.batch,` (`finetune_step.rs:572`) | `"batch": args.batch,` (`torch_finetune_step.py:1055`) |
+| `seq` | identity | `seq: params.seq,` (`finetune_step.rs:573`) | `"seq": args.seq,` (`torch_finetune_step.py:1056`) |
+| `lora_rank` | identity | `lora_rank: params.lora_rank,` (`finetune_step.rs:574`) | `"lora_rank": args.lora_rank,` (`torch_finetune_step.py:1057`) |
+| `lora_alpha` | identity — input was already threaded through `FinetuneStepParams::lora_alpha`, just never emitted before this round | `lora_alpha: params.lora_alpha,` (`finetune_step.rs:575`) | `"lora_alpha": args.lora_alpha,` (`torch_finetune_step.py:1031`) |
+| `lora_dropout` | identity | `lora_dropout: params.lora_dropout` (`finetune_step.rs:576`) | `"lora_dropout": args.lora_dropout,` (`torch_finetune_step.py:1058`) |
+| `margin` | identity, but jammi HARDCODES `0.3` (no `--margin` CLI flag — the call site's own literal, `let loss = triplet_loss(&a, &p, &n, 0.3)?;` (`finetune_step.rs:331`)) | `margin: 0.3,` (`finetune_step.rs:583`) | `"margin": args.margin,` (`torch_finetune_step.py:1040`) — `--margin` default `0.3` |
+| `target_modules` | identity | `target_modules: params.target_modules.clone(),` (`finetune_step.rs:584`) | `"target_modules": [` (`torch_finetune_step.py:1061`) |
+| `batched_forward` | identity | `batched_forward: params.batched_forward,` (`finetune_step.rs:585`) | `"batched_forward": args.batched_forward,` (`torch_finetune_step.py:1064`) |
+| `backbone_dtype` | identity | `backbone_dtype: format!("{:?}", params.backbone_dtype)` (`finetune_step.rs:568`) | `"backbone_dtype": args.dtype,` (`torch_finetune_step.py:1046`) |
+| `steps_measured` | identity — the reachable divergence this table used to miss entirely: two legs measured at a DIFFERENT step count (e.g. a mismatched `--steps`/`--warmup` override) still merged to a "clean" ratio before this field was compared | `steps_measured: times.len(),` (`finetune_step.rs:587`) | `"steps_measured": len(times),` (`torch_finetune_step.py:1066`) |
+| `checkpoint_config_sha256` | identity — same base-checkpoint CONTENT identity `grad_oracle.rs`'s tier already carries, added to THIS tier too | `let (checkpoint_config_sha256, _config_len) =` (`finetune_step.rs:398`), via the SHARED streaming `pub(crate) fn sha256_and_len` (`finetune_step.rs:675`) | `checkpoint_identity_fields = checkpoint_identity(args.model_dir)` (`torch_finetune_step.py:926`) |
+| `checkpoint_weights_sha256` | identity | `let (checkpoint_weights_sha256, checkpoint_weights_size_bytes) =` (`finetune_step.rs:400`) | `"checkpoint_weights_sha256": weights_sha256,` (`torch_finetune_step.py:551`) |
+| `checkpoint_weights_size_bytes` | identity | `checkpoint_weights_size_bytes) =` (`finetune_step.rs:400`) — same call as the row above, its second return value | `"checkpoint_weights_size_bytes": weights_len,` (`torch_finetune_step.py:552`) |
 | `attn_requested` / `attn_implementation` | provenance — jammi has no `--attn` lever; recorded in `leg_provenance`, never compared (see `grad_oracle.rs`'s own table for the fuller rationale) | n/a | `"attn_requested": args.attn,` just above `"attn_implementation": resolved_attn_implementation,` (`torch_finetune_step.py:1051`) |
+| `kernels_disabled_requested` / `kernels_disabled_fired` | provenance (K-aux, landed on `main` at `c0f0e98`) — torch has no equivalent env var; recorded in `leg_provenance`, never compared | `let kernels_disabled_fired = jammi_kernels::admission::disabled_ops_fired();` (`finetune_step.rs:552`) | n/a |
 | `ln`/`rope`/`softmax`/`geglu`/`lora_epilogue`/`lora_linear`/`attention_block` `_fused_dispatches`/`_eager_dispatches` (14 fields) | measurement — this IS the fused-dispatch proof `fused_proof`/`dispatch_pairs` gate on, and `leg_provenance` additionally records the raw counters per config | `finetune_step.rs`'s own `*_fused_dispatches`/`*_eager_dispatches` fields | n/a |
 | `losses` / `loss_first` / `loss_last` | measurement — `loss_final_ratio` is printed for visibility, never gated (see that field's own note in `build_report`) | `finetune_step.rs`'s own fields | `torch_finetune_step.py`'s own fields |
 | `s_per_step_p50` / `triplets_per_s` / VRAM fields | measurement — the actual perf numbers this sweep exists to produce | `finetune_step.rs`'s own fields | `torch_finetune_step.py`'s own fields |
@@ -336,8 +337,13 @@ def leg_provenance(report, leg):
     doc's determinant table for the same identity/provenance/measurement
     split applied to this OTHER cross-producer comparator): torch's
     `attn_requested`/`attn_implementation` pair, jammi's 14 dispatch
-    counters. `None` for the fields the OTHER producer has no equivalent
-    for (never fabricated).
+    counters, and (K-aux, landed on `main` at `c0f0e98`) jammi's resolved
+    `JAMMI_KERNELS_DISABLE` state (`kernels_disabled_requested`/
+    `kernels_disabled_fired`) — deliberately NOT `FINETUNE_IDENTITY_FIELDS`
+    members (torch has no equivalent env var to compare against), recorded
+    here purely so a human reading the merged JSON can see which arm
+    jammi's OWN leg measured. `None` for the fields the OTHER producer has
+    no equivalent for (never fabricated).
     """
     fs = finetune_block(report, leg)
     if leg.startswith("jammi"):
@@ -347,12 +353,16 @@ def leg_provenance(report, leg):
             "jammi_dispatch_counters": {
                 k: v for k, v in fs.items() if k.endswith("_fused_dispatches") or k.endswith("_eager_dispatches")
             },
+            "jammi_kernels_disabled_requested": fs.get("kernels_disabled_requested"),
+            "jammi_kernels_disabled_fired": fs.get("kernels_disabled_fired"),
         }
     args = report.get("args") if isinstance(report.get("args"), dict) else {}
     return {
         "torch_attn_requested": args.get("attn_requested"),
         "torch_attn_implementation": fs.get("attn_implementation"),
         "jammi_dispatch_counters": None,
+        "jammi_kernels_disabled_requested": None,
+        "jammi_kernels_disabled_fired": None,
     }
 
 

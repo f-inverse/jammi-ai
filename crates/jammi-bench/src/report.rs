@@ -1318,6 +1318,29 @@ pub struct FinetuneStepTier {
     /// the step made) — that is the predicate refusing by domain, not a
     /// broken counter.
     pub attention_block_eager_dispatches: u64,
+    /// The `JAMMI_KERNELS_DISABLE` op keys this process REQUESTED (sorted,
+    /// empty when the env var was unset or empty) —
+    /// `jammi_kernels::admission::disabled_ops_requested`. Always present,
+    /// even on an ordinary run with nothing disabled: an omitted key would
+    /// read as "this report predates the field", which is false.
+    pub kernels_disabled_requested: Vec<String>,
+    /// The `JAMMI_KERNELS_DISABLE` op keys that actually FIRED (disabled at
+    /// least one live dispatch) this run (sorted) —
+    /// `jammi_kernels::admission::disabled_ops_fired`. A run whose intended
+    /// `JAMMI_KERNELS_DISABLE` never reached this process at all (a
+    /// var-NAME typo, an unforwarded ssh/`docker -e` environment) reads
+    /// BOTH this field and `kernels_disabled_requested` as `[]` —
+    /// indistinguishable, on this pair alone, from a run that genuinely
+    /// requested nothing. This is the field a downstream A/B harness
+    /// compares against its OWN recorded intent (the op key(s) it meant to
+    /// pass) to catch that drop: a non-empty intended request paired with
+    /// an empty `kernels_disabled_requested` here is exactly the failure
+    /// mode this pair exists to make visible — the eager leg of a
+    /// forced-eager A/B silently measuring the fused arm instead. See
+    /// `jammi_kernels::admission`'s module doc's "safety property" section
+    /// for the separate, narrower guarantee `run` already hard-errors on
+    /// (an entry that WAS requested but never fired).
+    pub kernels_disabled_fired: Vec<String>,
     pub s_per_step_p50: Measurement,
     pub s_per_step_mean: Measurement,
     pub steps_per_s: Measurement,
@@ -1538,6 +1561,8 @@ mod tests {
             lora_linear_eager_dispatches: 0,
             attention_block_fused_dispatches: 0,
             attention_block_eager_dispatches: 0,
+            kernels_disabled_requested: Vec::new(),
+            kernels_disabled_fired: Vec::new(),
             s_per_step_p50: Measurement::measured(0.01, "s"),
             s_per_step_mean: Measurement::measured(0.01, "s"),
             steps_per_s: Measurement::measured(100.0, "steps/s"),
@@ -1550,7 +1575,10 @@ mod tests {
     /// The full emitted key set, pinned so a field added or renamed on
     /// `FinetuneStepTier` — including the two `attention_block_*_dispatches`
     /// counters the fused whole-attention-block kernel needs for its own
-    /// positive-proof channel — is a visible, reviewed diff here rather than
+    /// positive-proof channel, and `kernels_disabled_requested` /
+    /// `kernels_disabled_fired` (contract K-aux, round 2 / B3: the RESOLVED
+    /// `JAMMI_KERNELS_DISABLE` state a downstream A/B harness names the
+    /// measured arm from) — is a visible, reviewed diff here rather than
     /// a silent addition/removal a downstream JSON-diffing perf gate would
     /// only notice indirectly.
     #[test]
@@ -1573,6 +1601,8 @@ mod tests {
             "device_name",
             "geglu_eager_dispatches",
             "geglu_fused_dispatches",
+            "kernels_disabled_fired",
+            "kernels_disabled_requested",
             "ln_eager_dispatches",
             "ln_fused_dispatches",
             "lora_alpha",

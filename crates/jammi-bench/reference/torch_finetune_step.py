@@ -173,7 +173,7 @@ jammi's `peak_vram_bytes` is a whole-device `nvidia-smi` poll
 (`device_memory_used_bytes`, finetune_step.rs:63), sampled every 25ms
 (`std::thread::sleep`, finetune_step.rs:98) over the ENTIRE warmup+measured
 loop, then reduced via `peak.saturating_sub(baseline)`, finetune_step.rs:114
-against a baseline snapshot (`vram_baseline`, finetune_step.rs:370) taken
+against a baseline snapshot (`vram_baseline`, finetune_step.rs:431) taken
 once right after the model+optimizer are built (before the loop starts) — at
 which point candle's `AdamW::new` has
 ALREADY allocated the (zero-initialized) first/second moment tensors, since

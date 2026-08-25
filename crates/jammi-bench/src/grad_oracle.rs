@@ -156,7 +156,7 @@
 //! | `target_modules` | identity | `run()`'s report literal | `"target_modules": [t.strip()` (`torch_grad_oracle.py:536`) |
 //! | `batched_forward` | identity | `run()`'s report literal | `"batched_forward": args.batched_forward` (`torch_grad_oracle.py:537`) |
 //! | `backbone_dtype` | identity | `run()`'s report literal (`format!("{:?}", ..).to_lowercase()`) | `translate_dtype_flag_to_jammi_spelling(args.dtype)` (`torch_grad_oracle.py:531`) |
-//! | `checkpoint_config_sha256` | identity | `sha256_and_len(&model_dir.join("config.json"))` — called in `run()` before the forward, via the SAME shared streaming implementation `finetune_step.rs` also uses: `pub(crate) fn sha256_and_len` (`finetune_step.rs:574`) | `checkpoint_identity_fields = checkpoint_identity(args.model_dir)` (`torch_grad_oracle.py:413`) — `checkpoint_identity` is a bare alias for the real, streaming implementation torch_finetune_step.py's own `checkpoint_identity` function provides (see the two field citations directly below) |
+//! | `checkpoint_config_sha256` | identity | `sha256_and_len(&model_dir.join("config.json"))` — called in `run()` before the forward, via the SAME shared streaming implementation `finetune_step.rs` also uses: `pub(crate) fn sha256_and_len` (`finetune_step.rs:675`) | `checkpoint_identity_fields = checkpoint_identity(args.model_dir)` (`torch_grad_oracle.py:413`) — `checkpoint_identity` is a bare alias for the real, streaming implementation torch_finetune_step.py's own `checkpoint_identity` function provides (see the two field citations directly below) |
 //! | `checkpoint_weights_sha256` | identity | `sha256_and_len(&weights)` | `"checkpoint_weights_sha256": weights_sha256` (`torch_finetune_step.py:551`) |
 //! | `checkpoint_weights_size_bytes` | identity | `sha256_and_len`'s byte-length return | `"checkpoint_weights_size_bytes": weights_len` (`torch_finetune_step.py:552`) |
 //! | `lora_weights_in` (presence, not value) | identity (checked separately — `_premise_violations`'s `lora_weights_in` loop, not `RUN_IDENTITY_FIELDS`) | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
@@ -170,7 +170,7 @@
 //! | `trainable_tensor_count` | measurement (redundant with the tensor NAME SET, which `compare_reports`'s `only_in_a`/`only_in_b` already checks structurally) | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
 //! | `loss` / `gradients` / per-tensor `weight` | measurement — the oracle's actual output | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
 //! | `ln`/`rope`/`softmax`/`geglu`/`lora_epilogue`/`lora_linear`/`attention_block` `_fused_dispatches`/`_eager_dispatches` (14 fields) | measurement (jammi-only; no torch equivalent — torch's analog is the `attn_requested`/`attn_implementation` provenance pair above) | `run()`'s dispatch-counter delta, mirroring `finetune_step.rs`'s own `*_dispatch_before`/`*_dispatch_after` snapshot pattern | n/a |
-//! | `kernels_disabled_requested`/`kernels_disabled_fired` | NOT YET APPLICABLE — the underlying instrumentation (`feat/kernels-admission-disable`, "K-aux") has not landed on `main` as of this round (`grep -rn kernels_disabled crates/` finds zero hits at this branch's base) | n/a (add alongside the dispatch counters above once K-aux lands) | n/a |
+//! | `kernels_disabled_requested`/`kernels_disabled_fired` | provenance — K-aux (`feat/kernels-admission-disable`) landed on `main` at `c0f0e98`; this tier now records the resolved `JAMMI_KERNELS_DISABLE` state unconditionally, mirroring `FinetuneStepTier`'s own pair exactly, but does NOT gate on `unmatched_disables()` the way `finetune_step.rs`'s `run()` does (that INVALID-run check is scoped to the forced-eager A/B use case this oracle's own CLI has no equivalent flag for) | `run()`'s report literal, via `jammi_kernels::admission::disabled_ops_requested`/`disabled_ops_fired` | n/a (torch has no equivalent env var) |
 //! | `tool` | identity, but only for SAME-vs-DIFFERENT-producer detection, not compared as a normal identity field — `compare_grad_oracle.py`'s `_same_producer_violation` refuses when both dumps carry the SAME `tool` string (`compare a.json a.json`, or a jammi-vs-jammi mix-up), overridable via `--allow-same-producer` for a deliberate self-consistency check | `run()`'s report literal (`"jammi_grad_oracle"`) | `torch_grad_oracle.py`'s report literal (`"torch_grad_oracle"`) |
 //!
 //! `RUN_IDENTITY_FIELDS` in `compare_grad_oracle.py` is the tuple that
@@ -317,6 +317,23 @@ pub struct GradOracleReport {
     pub lora_linear_eager_dispatches: u64,
     pub attention_block_fused_dispatches: u64,
     pub attention_block_eager_dispatches: u64,
+    /// The `JAMMI_KERNELS_DISABLE` op keys this process REQUESTED (sorted,
+    /// empty when the env var was unset or empty) — K-aux lands on `main`
+    /// this round; mirrors `FinetuneStepTier::kernels_disabled_requested`
+    /// exactly (`jammi_kernels::admission::disabled_ops_requested`).
+    /// PROVENANCE (recorded, never compared cross-producer — torch has no
+    /// equivalent env var).
+    pub kernels_disabled_requested: Vec<String>,
+    /// The `JAMMI_KERNELS_DISABLE` op keys that actually FIRED (disabled at
+    /// least one live dispatch) this run (sorted) — mirrors
+    /// `FinetuneStepTier::kernels_disabled_fired` exactly
+    /// (`jammi_kernels::admission::disabled_ops_fired`). PROVENANCE. This
+    /// tier does NOT gate on `jammi_kernels::admission::unmatched_disables`
+    /// the way `finetune_step.rs`'s `run()` does (contract K-aux's INVALID-run
+    /// check is scoped to that tier's forced-eager A/B use case, which this
+    /// oracle's own CLI has no equivalent flag for) — recorded unconditionally,
+    /// same posture as the 14 dispatch counters above.
+    pub kernels_disabled_fired: Vec<String>,
     /// Keyed by jammi's internal `VarBuilder`-path tensor name (e.g.
     /// `layer.3.Wqkv.lora_a`), sorted for determinism (a `BTreeMap`
     /// serializes in key order; a `HashMap` would not).
@@ -504,6 +521,13 @@ pub fn run(params: &GradOracleParams) -> Result<GradOracleReport, Box<dyn std::e
     let lora_linear_fused_dispatch_after = jammi_lora::lora_linear_fused_dispatch_snapshot();
     let attention_block_dispatch_after = jammi_encoders::attention_block_dispatch_snapshot();
 
+    // The RESOLVED `JAMMI_KERNELS_DISABLE` state (contract K-aux, now on
+    // `main`) — see `GradOracleReport::kernels_disabled_requested`'s own
+    // doc for why this tier records it unconditionally but does not gate
+    // on `unmatched_disables()` the way `finetune_step.rs`'s `run()` does.
+    let kernels_disabled_requested = jammi_kernels::admission::disabled_ops_requested();
+    let kernels_disabled_fired = jammi_kernels::admission::disabled_ops_fired();
+
     let mut gradients = std::collections::BTreeMap::new();
     for (name, var) in trainable_names.into_iter().zip(trainable.into_iter()) {
         let tensor = var.as_tensor();
@@ -594,6 +618,8 @@ pub fn run(params: &GradOracleParams) -> Result<GradOracleReport, Box<dyn std::e
         attention_block_eager_dispatches: attention_block_dispatch_after
             .eager
             .saturating_sub(attention_block_dispatch_before.eager),
+        kernels_disabled_requested,
+        kernels_disabled_fired,
         gradients,
     })
 }

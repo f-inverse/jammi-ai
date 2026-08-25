@@ -57,6 +57,26 @@ sentence-embedding recipe would do:
   `FinetuneStepParams::batched_forward`: one forward over the three groups
   concatenated on the batch axis, split by row AFTER pooling+normalizing.
 
+LOSS TRAJECTORY — `finetune_step.losses` (per measured step, warmup excluded)
+plus `loss_first`/`loss_last` mirror `finetune_step.rs`'s own `losses` /
+`loss_first` / `loss_last` fields, same placement convention (see
+`_step_once`'s docstring), so the two stacks' per-step loss sequences line up
+index-for-index IF the two runs used the same `--seed`/`--batch`/`--seq`/
+vocab (the synthetic token ids are then bit-identical across the two stacks —
+see `synthetic_ids` below, a literal LCG port of `finetune_step.rs`'s own).
+Identical INPUT ids does NOT make the two stacks' loss VALUES a meaningful
+apples-to-apples quality comparison by default: candle and torch run
+different arithmetic (different attention composition, different fused-vs-
+eager kernel paths, different reduction order), and — read the very next
+section — the LoRA adapters are not equivalently initialized unless
+`--lora-init jammi` is passed, and even then not bit-identically. Absent
+`--lora-init jammi`, a "jammi trajectory diverges from torch trajectory"
+observation conflates at least three variables (init distribution,
+attention-kernel arithmetic, framework reduction order) and proves nothing
+about correctness on its own; it is printed by `finetune_ab.sh`'s table as a
+same-data, cost-fixture ratio precisely so a large divergence is VISIBLE, not
+so it is read as a quality regression.
+
 LoRA INIT IS NOT A MATCH BY DEFAULT — read before comparing loss curves.
 peft's default init (`init_lora_weights=True`) draws `A` from PyTorch's
 `kaiming_uniform_(a=sqrt(5))`, whose bound is `1 / sqrt(fan_in)`. jammi's
@@ -590,6 +610,22 @@ def _step_once(model, optimizer, scaler, blocks, mask, args, use_amp, device):
     the `reference_compile_after_first_forward` readback). Ends with a CUDA
     sync (guarded: a no-op on CPU) so the caller can rely on the step having
     actually completed, not just been submitted.
+
+    Returns the step's loss as a plain Python float — the same value read
+    off `loss.detach().float().item()` below (the call this function already
+    made to force the CUDA sync; no second read is added). PLACEMENT: this
+    read happens AFTER `optimizer.step()` / `scaler.step(optimizer)` returns,
+    exactly mirroring `finetune_step.rs`'s own placement (its comment at the
+    loss-read call site states the identical convention). In both stacks the
+    loss TENSOR was produced by the forward earlier in this same function,
+    BEFORE the optimizer step — reading it after only decides when the host
+    blocks on the (already-queued) device work, it does not recompute the
+    loss against the just-updated weights. So the returned value is the
+    PRE-UPDATE loss of this call's batch, not a re-evaluation after the
+    step. `run()`'s timed loop below records this for every MEASURED
+    (post-warmup) call, so `finetune_step.losses` here and
+    `finetune_step.rs`'s `losses` field share the same per-step placement
+    convention and are comparable step-for-step under that convention.
     """
     import torch
 
@@ -627,9 +663,10 @@ def _step_once(model, optimizer, scaler, blocks, mask, args, use_amp, device):
     # timed loop) would measure submission time, not execution time — the
     # same caveat `finetune_step.rs` documents at its own `.to_scalar()`
     # call.
-    _ = loss.detach().float().item()
+    loss_val = loss.detach().float().item()
     if device.type == "cuda":
         torch.cuda.synchronize()
+    return loss_val
 
 
 def _probe_sdpa_backend_forward(model, backend, input_ids, attention_mask):
@@ -890,12 +927,14 @@ def run(args):
             torch.cuda.reset_peak_memory_stats(device)
 
         times = []
+        losses = []
         for step in range(args.warmup + args.steps):
             t0 = time.perf_counter()
-            _step_once(model, optimizer, scaler, blocks, mask, args, use_amp, device)
+            loss_val = _step_once(model, optimizer, scaler, blocks, mask, args, use_amp, device)
             elapsed = time.perf_counter() - t0
             if step >= args.warmup:
                 times.append(elapsed)
+                losses.append(loss_val)
 
         times.sort()
         p50 = times[len(times) // 2]
@@ -948,6 +987,14 @@ def run(args):
                 "batched_forward": args.batched_forward,
                 "trainable_tensors": len(trainable),
                 "steps_measured": len(times),
+                "losses": losses,
+                "loss_first": losses[0],
+                "loss_last": losses[-1],
+                "loss_note": "cost-fixture data, not a quality result (synthetic uniform "
+                "token ids) — see finetune_step.rs's module doc's 'Honesty about what is "
+                "measured'. Each entry read after optimizer.step() returns; the value "
+                "itself is the PRE-update loss of that step's batch (see _step_once's "
+                "docstring for the placement convention shared with finetune_step.rs).",
                 "s_per_step_p50": {"value": p50, "unit": "s"},
                 "s_per_step_mean": {"value": mean, "unit": "s"},
                 "steps_per_s": {"value": 1.0 / p50, "unit": "steps/s"},

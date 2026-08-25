@@ -14,6 +14,7 @@ Run directly: `python3 ci/scripts/perf/test_compare_grad_oracle.py`
 
 from __future__ import annotations
 
+import itertools
 import json
 import math
 import os
@@ -24,30 +25,54 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import compare_grad_oracle as cgo  # noqa: E402
 
+# Every `make_report()` call gets a UNIQUE default `tool` value (a monotonic
+# counter, not a fixed literal) — the class-level fix for "compare a.json
+# a.json passes" (advisory (6), this round's audit): TWO SEPARATE calls
+# (the overwhelmingly common shape below — one for `report_a`, one for
+# `report_b`) now differ by construction, so `_same_producer_violation`'s
+# new same-tool check does NOT spuriously fire on the ~30 existing
+# gradient-math tests in this file, none of which were EVER testing
+# same-producer-ness in the first place. The one test that IS a genuine
+# same-producer/self-consistency check
+# (`test_compare_reports_identical_dumps_passes_with_cosine_one`, which
+# passes the literal SAME dict object twice) opts in explicitly via
+# `allow_same_producer=True`.
+_MAKE_REPORT_TOOL_COUNTER = itertools.count()
+
 
 def make_report(loss, gradients, **overrides):
     """`gradients`: {name: [f32, ...]}.
 
     Fills in a MATCHING, premise-satisfying run-identity/weight-provenance
     envelope by default (`lora_weights_in` set, standard seed/batch/etc.,
-    `batch_token_id_sums` present) — F3's fix made `compare_reports` check
-    all of these, so a test that only cares about the gradient-DIRECTION
-    math (the vast majority below) must not ALSO have to hand-build a full
-    premise or it would spuriously fail on a premise violation it never
-    meant to test. Pass e.g. `lora_weights_in=None` or `seed=7` via
-    `overrides` to specifically construct a premise violation (see
-    `PremiseAndWeightChecks` below).
+    `batch_token_id_sums` present, every `RUN_IDENTITY_FIELDS` entry) — F3's
+    fix made `compare_reports` check all of these, so a test that only
+    cares about the gradient-DIRECTION math (the vast majority below) must
+    not ALSO have to hand-build a full premise or it would spuriously fail
+    on a premise violation it never meant to test. Pass e.g.
+    `lora_weights_in=None` or `seed=7` via `overrides` to specifically
+    construct a premise violation (see `PremiseAndWeightChecks` below).
     """
     report = {
-        "tool": "test-fixture",
+        "tool": f"test-fixture-{next(_MAKE_REPORT_TOOL_COUNTER)}",
         "loss": loss,
         "seed": 1,
         "batch": 2,
         "seq": 4,
         "lora_rank": 2,
+        "lora_alpha": 4.0,
         "target_modules": ["Wqkv"],
         "batched_forward": True,
         "backbone_dtype": "f32",
+        # Fixture placeholder digests -- both sides get the SAME literal
+        # constant via TWO separate `make_report()` calls (never computed
+        # from real bytes here; this file's whole point is testing the
+        # comparator's ARITHMETIC/premise logic in isolation from either
+        # real producer -- see `test_grad_oracle_cross_producer_parity.py`
+        # for the version driven against real dumps).
+        "checkpoint_config_sha256": "a" * 64,
+        "checkpoint_weights_sha256": "b" * 64,
+        "checkpoint_weights_size_bytes": 1024,
         "lora_weights_in": "shared_lora.safetensors",
         "batch_token_id_sums": [11, 22, 33],
         "gradients": {name: {"shape": [len(vals)], "grad": vals, "weight": [0.0] * len(vals)} for name, vals in gradients.items()},
@@ -155,9 +180,30 @@ class ComparatorMathTestsMixin:
         with self.assertRaises(ValueError):
             cgo.compare_tensor("t", [1.0, 2.0], [1.0])
 
+    def test_dot_and_max_abs_delta_raise_on_length_mismatch_under_whichever_arm_is_active(self):
+        """UNGATED companion of `ArmParityTests`' own length-mismatch
+        coverage (that class `skipUnless(cgo.HAVE_NUMPY, ...)`s, so it does
+        not run at all in an environment without numpy -- see that class's
+        own doc for the CI Guard disclosure). This mixin runs under BOTH
+        `ComparatorMathTestsWhateverNumpyIsAvailable` and
+        `ComparatorMathTestsForcedPureFallback`, so `_require_same_length`
+        gets AT LEAST one arm's worth of real coverage regardless of
+        whether numpy is importable here.
+        """
+        with self.assertRaises(ValueError):
+            cgo._dot([1.0, 2.0], [1.0])
+        with self.assertRaises(ValueError):
+            cgo._max_abs_delta([1.0, 2.0, 3.0], [1.0, 2.0])
+
     def test_compare_reports_identical_dumps_passes_with_cosine_one(self):
+        """A genuine same-producer/self-consistency check (the SAME dict
+        object on both sides) — opts INTO `allow_same_producer=True`
+        explicitly, since this is exactly the case
+        `_same_producer_violation` exists to refuse by default (see that
+        function's own doc and `SameProducerGuardTests` below).
+        """
         report = make_report(0.31, {"layer.0.Wqkv.lora_b": [0.1, -0.2, 0.3, 0.05]})
-        result = cgo.compare_reports(report, report, cosine_floor=0.999)
+        result = cgo.compare_reports(report, report, cosine_floor=0.999, allow_same_producer=True)
         self.assertEqual(result["overall_cosine_similarity"], 1.0)
         self.assertTrue(result["passed"])
         self.assertEqual(result["only_in_a"], [])
@@ -334,9 +380,13 @@ class PremiseAndWeightChecks(unittest.TestCase):
             ("batch", 64),
             ("seq", 512),
             ("lora_rank", 16),
+            ("lora_alpha", 8.0),
             ("target_modules", ["Wo"]),
             ("batched_forward", False),
             ("backbone_dtype", "bf16"),
+            ("checkpoint_config_sha256", "c" * 64),
+            ("checkpoint_weights_sha256", "d" * 64),
+            ("checkpoint_weights_size_bytes", 2048),
         ):
             report_a = make_report(0.3, {"t": [1.0, 2.0]})
             report_b = make_report(0.3, {"t": [1.0, 2.0]}, **{field: other_value})
@@ -346,6 +396,43 @@ class PremiseAndWeightChecks(unittest.TestCase):
                 any(field in v for v in result["premise_violations"]),
                 f"expected a premise_violations entry naming {field!r}, got {result['premise_violations']!r}",
             )
+
+    def test_run_identity_field_missing_from_both_dumps_fails(self):
+        """ITEM 2 REPRODUCTION: `_premise_violations`'s per-field loop used
+        to `report.get(field)` on BOTH sides, then compare — a field absent
+        from BOTH dumps compared `None == None` and silently PASSED. This is
+        the class-level closure, driven over EVERY `RUN_IDENTITY_FIELDS`
+        entry (not only `batch_token_id_sums`, which already had a
+        correctly-`or`-gated presence check before this round).
+        """
+        for field in cgo.RUN_IDENTITY_FIELDS:
+            report_a = make_report(0.3, {"t": [1.0, 2.0]})
+            report_b = make_report(0.3, {"t": [1.0, 2.0]})
+            del report_a[field]
+            del report_b[field]
+            result = cgo.compare_reports(report_a, report_b, cosine_floor=0.9)
+            self.assertFalse(
+                result["passed"],
+                f"{field!r} missing from BOTH dumps must not silently compare None == None and pass",
+            )
+            self.assertTrue(
+                any(field in v for v in result["premise_violations"]),
+                f"expected a premise_violations entry naming {field!r}, got {result['premise_violations']!r}",
+            )
+
+    def test_run_identity_field_missing_from_one_dump_fails(self):
+        """The one-sided companion of the test above -- was ALREADY caught
+        correctly before this round (`None != <value>`), pinned here per
+        field so the whole `RUN_IDENTITY_FIELDS` tuple has both halves of
+        the presence lattice covered, not just the both-missing half.
+        """
+        for field in cgo.RUN_IDENTITY_FIELDS:
+            report_a = make_report(0.3, {"t": [1.0, 2.0]})
+            report_b = make_report(0.3, {"t": [1.0, 2.0]})
+            del report_a[field]
+            result = cgo.compare_reports(report_a, report_b, cosine_floor=0.9)
+            self.assertFalse(result["passed"], f"{field!r} missing from ONE dump must refuse")
+            self.assertTrue(any(field in v for v in result["premise_violations"]))
 
     def test_batch_token_id_sums_mismatch_fails(self):
         report_a = make_report(0.3, {"t": [1.0, 2.0]}, batch_token_id_sums=[1, 2, 3])
@@ -375,6 +462,71 @@ class PremiseAndWeightChecks(unittest.TestCase):
         self.assertTrue(result["passed"])
         self.assertEqual(result["weight_mismatches"], [])
         self.assertEqual(result["premise_violations"], [])
+
+    def test_weight_nan_on_one_side_fails_never_reads_as_max_abs_delta_zero(self):
+        """ITEM 3 REPRODUCTION (the auditor's own reproduction, reproduced
+        here as a RED->GREEN test): a NaN weight element on ONE side used to
+        make `delta > tol` compare `False` (NaN comparisons are always
+        `False` in IEEE-754 ordering), so `_weight_max_violation` counted it
+        as "not bad" and `max_delta` could silently read `0.0` via a naive
+        `max(0.0, nan)` reduction — PASS, exit 0, max_abs_delta=0.0. Must now
+        FAIL, and the weight_mismatches entry must name the nonfinite cause
+        explicitly, not report a numeric max_abs_delta at all.
+        """
+        report_a = make_report(0.3, {"t": [1.0, 2.0, 3.0]})
+        report_b = make_report(0.3, {"t": [1.0, 2.0, 3.0]})
+        report_a["gradients"]["t"]["weight"] = [1.0, 1.0, 1.0]
+        report_b["gradients"]["t"]["weight"] = [1.0, float("nan"), 1.0]
+        result = cgo.compare_reports(report_a, report_b, cosine_floor=0.9)
+        self.assertFalse(result["passed"])
+        self.assertTrue(result["weight_mismatches"])
+        self.assertTrue(
+            any("NaN" in m or "nonfinite" in m for m in result["weight_mismatches"]),
+            f"expected the nonfinite cause to be named, got {result['weight_mismatches']!r}",
+        )
+
+    def test_weight_nan_on_both_sides_still_fails(self):
+        """A NaN on BOTH sides at the SAME index is not 'equal enough'
+        either — a nonfinite weight can never certify 'the identical weight
+        file' regardless of which side(s) carry it.
+        """
+        report_a = make_report(0.3, {"t": [1.0, 2.0, 3.0]})
+        report_b = make_report(0.3, {"t": [1.0, 2.0, 3.0]})
+        report_a["gradients"]["t"]["weight"] = [1.0, float("nan"), 1.0]
+        report_b["gradients"]["t"]["weight"] = [1.0, float("nan"), 1.0]
+        result = cgo.compare_reports(report_a, report_b, cosine_floor=0.9)
+        self.assertFalse(result["passed"])
+        self.assertTrue(result["weight_mismatches"])
+
+    def test_weight_infinity_fails_the_same_way_as_nan(self):
+        report_a = make_report(0.3, {"t": [1.0, 2.0, 3.0]})
+        report_b = make_report(0.3, {"t": [1.0, 2.0, 3.0]})
+        report_a["gradients"]["t"]["weight"] = [1.0, 1.0, 1.0]
+        report_b["gradients"]["t"]["weight"] = [1.0, float("inf"), 1.0]
+        result = cgo.compare_reports(report_a, report_b, cosine_floor=0.9)
+        self.assertFalse(result["passed"])
+        self.assertTrue(result["weight_mismatches"])
+
+    def test_weight_max_violation_reports_nan_max_delta_never_a_silent_zero(self):
+        """Drives `_weight_max_violation` directly, under BOTH arms (numpy
+        forced on, pure-Python forced off) — `bad` must count the nonfinite
+        element and `max_delta` must be NaN (not `0.0`), in BOTH arms,
+        mirroring the arm-parity discipline `ArmParityTests` pins for the
+        gradient-side helpers.
+        """
+        wa = [1.0, 1.0, 1.0]
+        wb = [1.0, float("nan"), 1.0]
+        for forced_numpy in (True, False):
+            if forced_numpy and not cgo.HAVE_NUMPY:
+                continue  # this arm genuinely does not exist here -- see ArmParityTests' skip
+            orig = cgo.HAVE_NUMPY
+            cgo.HAVE_NUMPY = forced_numpy
+            try:
+                bad, max_delta = cgo._weight_max_violation(wa, wb)
+            finally:
+                cgo.HAVE_NUMPY = orig
+            self.assertGreaterEqual(bad, 1, f"forced_numpy={forced_numpy}: nan element must count as bad")
+            self.assertTrue(math.isnan(max_delta), f"forced_numpy={forced_numpy}: max_delta must be NaN, got {max_delta}")
 
 
 class BackboneDtypeSpellingNormalizationTests(unittest.TestCase):
@@ -586,6 +738,89 @@ class RunIdentityFieldCanonicalizationLattice(unittest.TestCase):
         result = self._result(batched_forward=False)
         self.assertFalse(result["passed"])
         self.assertTrue(any("batched_forward" in v for v in result["premise_violations"]))
+
+    # ---- lora_alpha (promoted from advisory-only to identity this round) --
+
+    def test_lora_alpha_matching_is_not_a_violation(self):
+        result = self._result()  # no overrides -- matches by construction
+        self.assertNotIn(
+            True, [ "lora_alpha" in v for v in result["premise_violations"] ]
+        )
+
+    def test_lora_alpha_genuinely_different_value_is_still_a_violation(self):
+        """Advisory (6) closure: `lora_alpha` used to be EXCLUDED from
+        `RUN_IDENTITY_FIELDS` on the theory that `max_abs_delta_over_max_signal`
+        "already surfaces" a mismatch -- that field never gates `passed` (see
+        `compare_tensor`'s own doc), so it gated NOTHING. Now identity.
+        """
+        result = self._result(lora_alpha=8.0)
+        self.assertFalse(result["passed"])
+        self.assertTrue(any("lora_alpha" in v for v in result["premise_violations"]))
+
+    # ---- checkpoint content identity (replaces the un-comparable model_dir path) --
+
+    def test_checkpoint_hash_fields_matching_is_not_a_violation(self):
+        result = self._result()
+        self.assertEqual(result["premise_violations"], [])
+
+    def test_checkpoint_config_sha256_mismatch_is_a_violation(self):
+        result = self._result(checkpoint_config_sha256="c" * 64)
+        self.assertFalse(result["passed"])
+        self.assertTrue(any("checkpoint_config_sha256" in v for v in result["premise_violations"]))
+
+    def test_checkpoint_weights_sha256_mismatch_is_a_violation(self):
+        result = self._result(checkpoint_weights_sha256="d" * 64)
+        self.assertFalse(result["passed"])
+        self.assertTrue(any("checkpoint_weights_sha256" in v for v in result["premise_violations"]))
+
+    def test_checkpoint_weights_size_bytes_mismatch_is_a_violation(self):
+        result = self._result(checkpoint_weights_size_bytes=2048)
+        self.assertFalse(result["passed"])
+        self.assertTrue(any("checkpoint_weights_size_bytes" in v for v in result["premise_violations"]))
+
+    # ---- completeness meta-test (item 5 of this round's audit) ------------
+
+    def test_every_run_identity_field_has_a_lattice_cell(self):
+        """CLASS-LEVEL closure of the round-2 hard-coded-field-name gap
+        (this class previously named fields directly in its own methods,
+        disconnected from `cgo.RUN_IDENTITY_FIELDS`): this test iterates
+        `cgo.RUN_IDENTITY_FIELDS` (the single source of truth — see that
+        tuple's own doc) and fails LOUDLY if a field has been added there
+        without a corresponding entry in `_RUN_IDENTITY_FIELD_LATTICE_COVERAGE`
+        below — a NEW identity field that ships with zero lattice coverage
+        is exactly the shape of gap this round's audit named (the round-2
+        fix's `backbone_dtype`-only special case looked complete but
+        silently had none for every other field).
+        """
+        missing = [f for f in cgo.RUN_IDENTITY_FIELDS if f not in _RUN_IDENTITY_FIELD_LATTICE_COVERAGE]
+        self.assertEqual(
+            missing, [],
+            f"RUN_IDENTITY_FIELDS field(s) {missing!r} have NO lattice test coverage in this "
+            "class -- add a per-field test method above (a representationally-different-but-"
+            "equal cell if the field has one, plus a genuinely-different negative control "
+            "either way) and register the field name in "
+            "_RUN_IDENTITY_FIELD_LATTICE_COVERAGE",
+        )
+
+
+# Manually-maintained registry `test_every_run_identity_field_has_a_lattice_cell`
+# checks `cgo.RUN_IDENTITY_FIELDS` against — see that test's own doc. Updating
+# this set alone does NOT substitute for writing the real per-field test
+# methods above; it is the mechanical tripwire that makes forgetting to do so
+# loud instead of silent.
+_RUN_IDENTITY_FIELD_LATTICE_COVERAGE = frozenset({
+    "seed",
+    "batch",
+    "seq",
+    "lora_rank",
+    "lora_alpha",
+    "target_modules",
+    "batched_forward",
+    "backbone_dtype",
+    "checkpoint_config_sha256",
+    "checkpoint_weights_sha256",
+    "checkpoint_weights_size_bytes",
+})
 
 
 class PerTensorGatingLattice(unittest.TestCase):
@@ -1053,6 +1288,194 @@ class VacuousTensorClassificationTests(unittest.TestCase):
                 code = cgo.main([pa, pb, "--cosine-floor", "0.9"])
         self.assertIn("vacuous_tensor_count: 1", out.getvalue())
         self.assertEqual(code, cgo.EXIT_PASS)
+
+
+class SameProducerGuardTests(unittest.TestCase):
+    """ITEM 6 of this round's audit: `compare a.json a.json` (or, more
+    generally, comparing a producer against itself) used to PASS —
+    `compare_reports` never checked that the two dumps came from two
+    INDEPENDENT producers at all. `_same_producer_violation` closes this;
+    every test here constructs two dumps sharing the SAME `tool` value
+    (never relying on `make_report`'s new unique-by-default tool, which is
+    exactly the mechanism that keeps every OTHER test in this file from
+    tripping this guard by accident).
+    """
+
+    def test_same_tool_value_is_refused_by_default(self):
+        report_a = make_report(0.3, {"t": [1.0, 2.0, 3.0]}, tool="same_tool")
+        report_b = make_report(0.3, {"t": [1.0, 2.0, 3.0]}, tool="same_tool")
+        result = cgo.compare_reports(report_a, report_b, cosine_floor=0.9)
+        self.assertFalse(result["passed"])
+        self.assertTrue(any("same tool" in v for v in result["premise_violations"]))
+
+    def test_literal_same_file_compared_to_itself_is_refused_at_main(self):
+        """THE LITERAL REPRODUCTION: `compare_grad_oracle.py a.json a.json`
+        -- driven at `main()`, the real entry point, with the SAME path
+        passed twice.
+        """
+        report = make_report(0.31, {"t": [0.1, -0.2, 0.3]})
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "a.json")
+            with open(path, "w") as fh:
+                json.dump(report, fh)
+            import contextlib
+            import io
+
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = cgo.main([path, path, "--cosine-floor", "0.9"])
+        self.assertEqual(code, cgo.EXIT_FAIL, f"stdout={out.getvalue()!r} stderr={err.getvalue()!r}")
+        self.assertNotIn("PASS", out.getvalue().splitlines())
+        self.assertIn("PREMISE VIOLATION", err.getvalue())
+
+    def test_allow_same_producer_override_lets_a_genuine_self_check_pass(self):
+        report_a = make_report(0.3, {"t": [1.0, 2.0, 3.0]}, tool="same_tool")
+        report_b = make_report(0.3, {"t": [1.0, 2.0, 3.0]}, tool="same_tool")
+        result = cgo.compare_reports(report_a, report_b, cosine_floor=0.9, allow_same_producer=True)
+        self.assertTrue(result["passed"], f"premise_violations={result['premise_violations']!r}")
+
+    def test_allow_same_producer_flag_wires_through_main(self):
+        report = make_report(0.31, {"t": [0.1, -0.2, 0.3]})
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "a.json")
+            with open(path, "w") as fh:
+                json.dump(report, fh)
+            import contextlib
+            import io
+
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = cgo.main([path, path, "--cosine-floor", "0.9", "--allow-same-producer"])
+        self.assertEqual(code, cgo.EXIT_PASS, f"stdout={out.getvalue()!r}")
+        self.assertIn("PASS", out.getvalue().splitlines())
+
+    def test_genuinely_different_tools_are_not_flagged(self):
+        """Positive control: real producers set DIFFERENT literal `tool`
+        strings by construction (`jammi_grad_oracle` vs `torch_grad_oracle`)
+        -- this guard must never fire on a genuine cross-framework pair.
+        """
+        report_a = make_report(0.3, {"t": [1.0, 2.0, 3.0]}, tool="jammi_grad_oracle")
+        report_b = make_report(0.3, {"t": [1.0, 2.0, 3.0]}, tool="torch_grad_oracle")
+        result = cgo.compare_reports(report_a, report_b, cosine_floor=0.9)
+        self.assertEqual(
+            [v for v in result["premise_violations"] if "same tool" in v], [],
+        )
+
+
+@unittest.skipUnless(
+    cgo.HAVE_NUMPY,
+    "numpy is not importable in this environment -- this class compares the numpy arm "
+    "against the pure-Python fallback arm on the SAME divergent inputs; with no numpy, there "
+    "is only one arm to compare, so arm PARITY cannot be exercised here. NOTE (item 4 of this "
+    "round's audit): this repo's CI Guard job (.github/workflows/ci.yml's `guard` matrix, the "
+    "lane that runs this file) installs NO python packages at all before invoking `python3` -- "
+    "no actions/setup-python with a requirements file, no `pip install numpy` step anywhere in "
+    "that job -- so on a stock ubuntu-latest runner's system python3 this class is expected to "
+    "SKIP there too. Treat 'the numpy arm's own correctness' as verified ONLY in an environment "
+    "that separately provisions numpy (e.g. $TORCH_VENV, which pulls it in as torch's own "
+    "transitive dependency) -- do not claim CI Guard coverage this class does not actually run.",
+)
+class ArmParityTests(unittest.TestCase):
+    """ITEM 4 of this round's audit: the numpy arm and the pure-Python
+    fallback arm are never asserted equal on the SAME divergent input --
+    the "run twice" pattern other tests use (`ComparatorMathTestsMixin`'s
+    two concrete subclasses) each runs the FULL suite under exactly ONE
+    arm; neither ever compares the two arms' OUTPUT on the same input
+    within a single test. This class does: every test here calls the SAME
+    helper under `HAVE_NUMPY = True` and then `HAVE_NUMPY = False`
+    (explicitly toggled, restored in `tearDown` -- never silently reusing
+    one arm's result for both, which would make a "ran both arms" test
+    into a "ran one arm twice" test without anyone noticing) and asserts
+    the two results agree.
+    """
+
+    def setUp(self):
+        self._orig = cgo.HAVE_NUMPY
+        self.assertTrue(self._orig, "guarded by skipUnless(cgo.HAVE_NUMPY, ...) above")
+
+    def tearDown(self):
+        cgo.HAVE_NUMPY = self._orig
+
+    def _numpy_arm(self, fn, *args):
+        cgo.HAVE_NUMPY = True
+        return fn(*args)
+
+    def _pure_arm(self, fn, *args):
+        cgo.HAVE_NUMPY = False
+        return fn(*args)
+
+    def test_cosine_similarity_agrees_on_a_nan_poisoned_pair(self):
+        a, b = [float("nan"), 1.0, 2.0], [1.0, 1.0, 1.0]
+        numpy_result = self._numpy_arm(cgo.cosine_similarity, a, b)
+        pure_result = self._pure_arm(cgo.cosine_similarity, a, b)
+        self.assertTrue(math.isnan(numpy_result), f"numpy arm: {numpy_result}")
+        self.assertTrue(math.isnan(pure_result), f"pure arm: {pure_result}")
+
+    def test_has_nonfinite_agrees_on_a_nan_poisoned_pair(self):
+        a = [float("nan"), 1.0]
+        numpy_result = self._numpy_arm(cgo._has_nonfinite, a)
+        pure_result = self._pure_arm(cgo._has_nonfinite, a)
+        self.assertEqual(numpy_result, pure_result)
+        self.assertTrue(numpy_result)
+
+    def test_has_nonfinite_agrees_on_a_finite_pair(self):
+        a = [1.0, 2.0, 3.0]
+        self.assertEqual(self._numpy_arm(cgo._has_nonfinite, a), self._pure_arm(cgo._has_nonfinite, a))
+        self.assertFalse(self._numpy_arm(cgo._has_nonfinite, a))
+
+    def test_dot_raises_valueerror_on_length_mismatch_in_both_arms(self):
+        """THE REPRODUCTION this closes: `zip(a, b)` in the pure-Python arm
+        used to SILENTLY TRUNCATE to the shorter length on a length
+        mismatch instead of raising -- numpy's own arithmetic raises for a
+        genuine shape mismatch. `_require_same_length` now makes both arms
+        raise `ValueError` identically, checked BEFORE either arm's own
+        branch.
+        """
+        a, b = [1.0, 2.0], [1.0]
+        with self.assertRaises(ValueError):
+            self._numpy_arm(cgo._dot, a, b)
+        with self.assertRaises(ValueError):
+            self._pure_arm(cgo._dot, a, b)
+
+    def test_max_abs_delta_raises_valueerror_on_length_mismatch_in_both_arms(self):
+        a, b = [1.0, 2.0, 3.0], [1.0, 2.0]
+        with self.assertRaises(ValueError):
+            self._numpy_arm(cgo._max_abs_delta, a, b)
+        with self.assertRaises(ValueError):
+            self._pure_arm(cgo._max_abs_delta, a, b)
+
+    def test_max_abs_delta_length_one_vs_n_does_not_silently_broadcast(self):
+        """The BROADCASTING variant of the same reproduction: numpy's own
+        elementwise `a - b` would silently SUCCEED (no raise at all) for a
+        length-1-vs-length-N pair via ordinary numpy broadcasting rules --
+        arguably worse than truncation, since it produces a plausible-
+        looking number instead of an obvious crash. `_require_same_length`
+        closes this for the numpy arm too, not just the pure-Python one.
+        """
+        a, b = [1.0], [1.0, 2.0, 3.0]
+        with self.assertRaises(ValueError):
+            self._numpy_arm(cgo._max_abs_delta, a, b)
+        with self.assertRaises(ValueError):
+            self._pure_arm(cgo._max_abs_delta, a, b)
+
+    def test_weight_max_violation_agrees_on_a_nan_weight_in_both_arms(self):
+        wa = [1.0, float("nan")]
+        wb = [1.0, 1.0]
+        numpy_bad, numpy_max = self._numpy_arm(cgo._weight_max_violation, wa, wb)
+        pure_bad, pure_max = self._pure_arm(cgo._weight_max_violation, wa, wb)
+        self.assertGreaterEqual(numpy_bad, 1)
+        self.assertGreaterEqual(pure_bad, 1)
+        self.assertTrue(math.isnan(numpy_max))
+        self.assertTrue(math.isnan(pure_max))
+
+    def test_weight_max_violation_agrees_on_a_finite_agreeing_pair(self):
+        wa = [1.0, 2.0, 3.0]
+        wb = [1.0, 2.0, 3.0]
+        numpy_result = self._numpy_arm(cgo._weight_max_violation, wa, wb)
+        pure_result = self._pure_arm(cgo._weight_max_violation, wa, wb)
+        self.assertEqual(numpy_result[0], 0)
+        self.assertEqual(pure_result[0], 0)
+        self.assertAlmostEqual(numpy_result[1], pure_result[1], places=9)
 
 
 class ComparatorMathTestsWhateverNumpyIsAvailable(ComparatorMathTestsMixin, unittest.TestCase):

@@ -47,7 +47,15 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from identity_fields import (  # noqa: E402
+    canonicalize_identity_field,
+    normalize_backbone_dtype,
+    normalize_target_modules,
+)
 
 try:
     import numpy as np  # type: ignore
@@ -206,7 +214,26 @@ def derive_cosine_floor(num_layers: int, hidden_size: int, safety_factor: float 
     return math.cos(min(safety_factor * eps, math.pi))
 
 
+def _require_same_length(a, b, fn_name: str) -> None:
+    """ARM PARITY (family F): `zip(a, b)` in the pure-Python arm SILENTLY
+    TRUNCATES to the shorter length on a mismatch instead of raising, where
+    numpy's own elementwise `a - b` would raise `ValueError` for two
+    genuinely unrelated lengths -- but numpy's BROADCASTING rules would
+    instead silently succeed (no raise at all) for a length-1-vs-length-N
+    pair, which is arguably worse: a length-1 array broadcasts against ANY
+    length without complaint, elementwise-comparing one shared value against
+    every element of the other side. This explicit check, called BEFORE
+    branching on `HAVE_NUMPY`, makes BOTH arms behave identically (raise
+    `ValueError`, always) on every length mismatch, including the
+    length-1 broadcasting case numpy's own arithmetic would otherwise let
+    through un-refused.
+    """
+    if len(a) != len(b):
+        raise ValueError(f"{fn_name}: length mismatch ({len(a)} vs {len(b)})")
+
+
 def _dot(a, b):
+    _require_same_length(a, b, "_dot")
     if HAVE_NUMPY:
         return float(np.dot(np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)))
     return float(sum(x * y for x, y in zip(a, b)))
@@ -219,6 +246,7 @@ def _norm(a):
 
 
 def _max_abs_delta(a, b):
+    _require_same_length(a, b, "_max_abs_delta")
     if HAVE_NUMPY:
         return float(np.max(np.abs(np.asarray(a, dtype=np.float64) - np.asarray(b, dtype=np.float64))))
     return max(abs(x - y) for x, y in zip(a, b))
@@ -372,116 +400,79 @@ def compare_tensor(name, grad_a, grad_b):
 
 # Run-identity fields this comparator's premise (module docstring line 6:
 # "IDENTICAL LoRA weights", plus an identical batch — see
-# `_premise_violations`'s own doc) actually depends on. `lora_alpha` and
-# `lora_dropout` are DELIBERATELY excluded: `lora_alpha` only rescales the
-# LoRA delta by a constant both stacks apply identically post-matmul (a
-# mismatch there would show up as a magnitude difference, which
-# `max_abs_delta_over_max_signal` already surfaces, not a premise
-# violation), and `lora_dropout` is unconditionally forced to `0.0` by both
-# producers (`grad_oracle.rs`'s and `torch_grad_oracle.py`'s own module
-# docs) so it can never legitimately differ.
+# `_premise_violations`'s own doc) actually depends on. THE SINGLE SOURCE OF
+# TRUTH: `_premise_violations`'s per-field loop iterates this tuple (never a
+# hard-coded field list), `RunIdentityFieldCanonicalizationLattice` in
+# `test_compare_grad_oracle.py` iterates it too (a field added here without a
+# lattice cell fails that suite's own completeness test), and
+# `test_grad_oracle_cross_producer_parity.py`'s
+# `test_run_identity_key_set_present_on_both_real_dumps` asserts every entry
+# is PRESENT on a REAL dump from EACH producer — see `grad_oracle.rs`'s
+# module doc's determinant table for the full identity/provenance/measurement
+# classification of every field either producer emits (not just this tuple).
+#
+# `lora_dropout` is DELIBERATELY excluded: it is unconditionally forced to
+# `0.0` by both producers (`grad_oracle.rs`'s and `torch_grad_oracle.py`'s
+# own module docs), so it can never legitimately differ and adds no
+# discriminating power. `lora_alpha` was ALSO excluded in an earlier round on
+# the theory that a mismatch there "would show up as a magnitude difference,
+# which `max_abs_delta_over_max_signal` already surfaces" — that field is
+# advisory-only (never gates `passed`, see `compare_tensor`'s own doc), so it
+# gated NOTHING; `lora_alpha` is promoted to a real identity field here
+# instead (advisory (6) of this round's audit).
 RUN_IDENTITY_FIELDS = (
     "seed",
     "batch",
     "seq",
     "lora_rank",
+    "lora_alpha",
     "target_modules",
     "batched_forward",
     "backbone_dtype",
+    # Base-checkpoint CONTENT identity (replaces the un-comparable
+    # `model_dir` path string — see `grad_oracle.rs`'s module doc's
+    # determinant table): both producers compute these off the checkpoint's
+    # RAW BYTES (`grad_oracle.rs`'s `sha256_and_len`,
+    # `torch_grad_oracle.py`'s `checkpoint_identity`), so a mismatch here
+    # means the two dumps loaded genuinely different checkpoint files, not
+    # merely a different path spelling for the same one.
+    "checkpoint_config_sha256",
+    "checkpoint_weights_sha256",
+    "checkpoint_weights_size_bytes",
 )
 
-# B1 audit finding on PR #372: jammi's OWN CLI/interchange vocabulary
-# (`crates/jammi-bench/src/main.rs`'s `--backbone-dtype` choices,
-# `grad_oracle.rs`'s `format!("{:?}", ComputePrecision::F32).to_lowercase()`)
-# is `f32`/`f16`/`bf16` -- picked as the CANONICAL spelling this comparator
-# normalizes to, since it is already the spelling used across every jammi
-# entry point AND the weight-interchange file's own naming convention (see
-# `grad_oracle.rs`'s module doc's "Weight interchange format" section),
-# never invented fresh for this comparator. `torch_grad_oracle.py`'s `run()`
-# now emits `f32`/`bf16` directly to match (this fix's own change to that
-# script), so this map exists for LEGACY dumps only -- an older
-# `torch_grad_oracle.py` binary, or any external producer, that still
-# carries torch's bare CLI-flag spelling `fp32`. Every
-# jammi-f32-vs-torch-f32 comparison — including this oracle's own
-# near-perfect control (0.9999998, see this module's own doc) — was
-# UNRUNNABLE before this map existed, refused on a spurious SPELLING
-# mismatch (`"f32" != "fp32"`) despite both sides having run at the
-# identical, actual precision.
-_LEGACY_BACKBONE_DTYPE_SPELLINGS = {
-    "fp32": "f32",
-}
-
-
-def normalize_backbone_dtype(value):
-    """Map a legacy `backbone_dtype` spelling to jammi's canonical one;
-    anything not a recognized legacy spelling (including an already-
-    canonical value, or a non-string/`None`) passes through UNCHANGED --
-    this function only ever narrows two spellings of the SAME precision
-    together, never widens what counts as a match.
-    """
-    if not isinstance(value, str):
-        return value
-    return _LEGACY_BACKBONE_DTYPE_SPELLINGS.get(value, value)
-
-
-def normalize_target_modules(value):
-    """Canonicalize a `target_modules` run-identity value to an
-    ORDER-INDEPENDENT representation before comparison.
-
-    WHY ORDER IS NOT SEMANTICALLY MEANINGFUL: jammi's OWN consumer of this
-    list, `jammi_lora::config::should_apply_lora`
-    (`crates/jammi-lora/src/config.rs`), tests membership via
-    `target_modules.iter().any(|t| module_name == t ||
-    module_name.ends_with(t))` -- an UNORDERED existence check over the
-    whole slice, never indexed by position. Both producers build this field
-    by literally splitting the operator's `--target-modules` CLI string on
-    commas, preserving whatever order the operator typed (`main.rs`'s
-    `target_modules.split(',')...` collect,
-    `torch_grad_oracle.py`'s `args.target_modules.split(",")` list
-    comprehension) -- so two operators who pass the SAME SET in a different
-    order (a plausible, innocent difference: nobody agrees in advance on a
-    comma-order convention for what is semantically a set) produce
-    representationally different but semantically IDENTICAL
-    `target_modules` values, and the un-normalized comparator refused this
-    exact case (`compare_reports` reported a spurious
-    "run-identity field 'target_modules' differs" premise violation for two
-    dumps configured identically save for CLI argument order).
-
-    Narrows ONLY order, never MEMBERSHIP: returns `tuple(sorted(value))`
-    when `value` is a list -- duplicates are preserved and still compared
-    (`["Wqkv", "Wqkv"]` vs `["Wqkv"]` remain different after sorting, since
-    sorting a 2-element list does not collapse it to a 1-element one), so a
-    caller passing a duplicate on only one side is still caught as a real
-    difference even though `should_apply_lora`'s own predicate would apply
-    LoRA identically either way -- this comparator's job is to detect
-    REPRESENTATIONAL noise (order), not to also decide a duplicate is
-    harmless. Passes anything else (a non-list, `None`) through UNCHANGED,
-    mirroring `normalize_backbone_dtype`'s own narrowing discipline.
-    """
-    if not isinstance(value, list):
-        return value
-    return tuple(sorted(value))
-
-
-# Per-field canonicalizer table: the GENERAL rule the round-2 fix's
-# `backbone_dtype`-only special case (an inline `if field ==
-# "backbone_dtype":` branch in `_premise_violations`) promised in its own
-# comment ("every OTHER run-identity field is compared as-is") but did not
-# actually deliver -- `target_modules`'s order-independence needed the
-# IDENTICAL treatment `backbone_dtype`'s legacy spelling got, not a bespoke
-# second special case one field over. Every `RUN_IDENTITY_FIELDS` entry NOT
-# listed here is compared with NO canonicalization (the JSON-decoded value
-# as-is), because it carries no known cross-producer representational gap:
+# `normalize_backbone_dtype`/`normalize_target_modules`/
+# `canonicalize_identity_field` now live in the SHARED `identity_fields.py`
+# module (imported at the top of this file) — `ab_merge.py`'s own new leg-
+# premise check (this round's fold-in: the adjacent probe found `ab_merge.py`
+# carried NO premise-identity check at all) applies the IDENTICAL
+# canonicalization to the IDENTICAL representational gaps
+# (`backbone_dtype`'s legacy `fp32` spelling, `target_modules`'s CLI-order
+# dependence) rather than a second, independently-drifting copy. See that
+# module's own doc for the full rationale each function previously carried
+# here inline.
 #
-# | field            | jammi (`grad_oracle.rs`)         | torch (`torch_grad_oracle.py`)              | canonicalizer            |
-# |------------------|-----------------------------------|----------------------------------------------|---------------------------|
-# | seed             | `u64` field, `#[derive(Serialize)]` -> JSON int | `argparse` `type=int` -> JSON int | none (already like-for-like) |
-# | batch            | `usize` field -> JSON int          | `argparse` `type=int` -> JSON int             | none (already like-for-like) |
-# | seq              | `usize` field -> JSON int          | `argparse` `type=int` -> JSON int             | none (already like-for-like) |
-# | lora_rank        | `usize` field -> JSON int          | `argparse` `type=int` -> JSON int             | none (already like-for-like) |
-# | target_modules   | `Vec<String>` -> JSON array, CLI split ORDER preserved | `list[str]` -> JSON array, CLI split ORDER preserved | `normalize_target_modules` (sorted tuple) |
-# | batched_forward  | `bool` field -> JSON bool           | `argparse.BooleanOptionalAction` -> JSON bool | none (already like-for-like) |
-# | backbone_dtype   | already-canonical `f32`/`f16`/`bf16` string | may carry legacy CLI-flag spelling `fp32`     | `normalize_backbone_dtype` |
+# Per-field canonicalizer table for THIS comparator's `RUN_IDENTITY_FIELDS`
+# (`ab_merge.py`'s `FINETUNE_IDENTITY_FIELDS` carries its OWN table, since
+# the two producers' finetune-step schemas are not identical to their
+# grad-oracle schemas): every `RUN_IDENTITY_FIELDS` entry NOT listed in
+# `identity_fields.IDENTITY_FIELD_CANONICALIZERS` is compared with NO
+# canonicalization (the JSON-decoded value as-is), because it carries no
+# known cross-producer representational gap:
+#
+# | field                         | jammi (`grad_oracle.rs`)         | torch (`torch_grad_oracle.py`)              | canonicalizer            |
+# |-------------------------------|-----------------------------------|----------------------------------------------|---------------------------|
+# | seed                          | `u64` field, `#[derive(Serialize)]` -> JSON int | `argparse` `type=int` -> JSON int | none (already like-for-like) |
+# | batch                         | `usize` field -> JSON int          | `argparse` `type=int` -> JSON int             | none (already like-for-like) |
+# | seq                           | `usize` field -> JSON int          | `argparse` `type=int` -> JSON int             | none (already like-for-like) |
+# | lora_rank                     | `usize` field -> JSON int          | `argparse` `type=int` -> JSON int             | none (already like-for-like) |
+# | lora_alpha                    | `f64` field -> JSON number         | `argparse` `type=float` -> JSON number        | none (already like-for-like) |
+# | target_modules                | `Vec<String>` -> JSON array, CLI split ORDER preserved | `list[str]` -> JSON array, CLI split ORDER preserved | `normalize_target_modules` (sorted tuple) |
+# | batched_forward               | `bool` field -> JSON bool           | `argparse.BooleanOptionalAction` -> JSON bool | none (already like-for-like) |
+# | backbone_dtype                | already-canonical `f32`/`f16`/`bf16` string | may carry legacy CLI-flag spelling `fp32`     | `normalize_backbone_dtype` |
+# | checkpoint_config_sha256      | `String` (hex) from `sha256_and_len` | `str` (hex) from `checkpoint_identity`      | none (both hexdigest of the identical algorithm over identical bytes) |
+# | checkpoint_weights_sha256     | `String` (hex) from `sha256_and_len` | `str` (hex) from `checkpoint_identity`      | none |
+# | checkpoint_weights_size_bytes | `u64` field -> JSON int             | `int` (`len(bytes)`) -> JSON int              | none |
 #
 # `seed`/`batch`/`seq`/`lora_rank` are native Python `int`/Rust
 # `u64`/`usize` on BOTH sides -- Python's `json` module serializes an `int`
@@ -494,25 +485,9 @@ def normalize_target_modules(value):
 # for the per-field lattice (representationally-different-but-equal -> OK;
 # genuinely-different -> still a violation) that pins this table, including
 # the negative controls confirming these five fields are NOT silently
-# widened by a canonicalizer they do not need.
-_IDENTITY_FIELD_CANONICALIZERS = {
-    "backbone_dtype": normalize_backbone_dtype,
-    "target_modules": normalize_target_modules,
-}
-
-
-def canonicalize_identity_field(field, value):
-    """Apply `field`'s registered canonicalizer (see
-    `_IDENTITY_FIELD_CANONICALIZERS`'s own table), or return `value`
-    unchanged if none is registered. The SINGLE dispatch point
-    `_premise_violations` calls for EVERY `RUN_IDENTITY_FIELDS` entry --
-    closing a future representational gap for a NEW field means
-    registering one function in the table above, not writing a new
-    `if field == ...` branch inline (the shape the round-2 fix left
-    behind, and the shape this round replaces).
-    """
-    fn = _IDENTITY_FIELD_CANONICALIZERS.get(field)
-    return value if fn is None else fn(value)
+# widened by a canonicalizer they do not need. `canonicalize_identity_field`
+# itself (imported from `identity_fields.py` above) is the SINGLE dispatch
+# point `_premise_violations` calls for EVERY `RUN_IDENTITY_FIELDS` entry.
 
 # How tightly a `weight` array recorded by the two INDEPENDENT producers
 # (jammi's `grad_oracle.rs`, torch's `torch_grad_oracle.py`) must agree to
@@ -564,24 +539,46 @@ def _weight_max_violation(wa, wb):
     tensor's `weight` arrays — numpy-vectorized when available, a plain
     Python loop otherwise (mirrors this module's numpy-first/pure-Python-
     fallback convention throughout).
+
+    AFFIRMATIVE NaN/+-inf refusal (790eb4b: "refuse at the edge, never rely
+    on ordering comparing False for a NaN"), applied here exactly as
+    `_has_nonfinite` already applies it to `grad`: `delta > tol` is `False`
+    for a NaN `delta` in IEEE-754 ordering, so a naive tolerance check alone
+    would silently NOT count a nonfinite weight element as a mismatch — a
+    NaN on one side would compare "equal enough" to anything on the other.
+    A nonfinite element is now counted as bad REGARDLESS of the tolerance
+    comparison (`| ~np.isfinite(delta)` / an explicit `math.isfinite` guard
+    in the pure arm), and `max_delta` becomes NaN (propagated, mirroring
+    `np.max`'s own NaN-propagating reduction) the moment ANY nonfinite
+    element is seen — never silently `0.0`, the exact reproduction this
+    closes (a NaN weight on one side previously read PASS, exit 0,
+    `max_abs_delta=0.0`).
     """
+    _require_same_length(wa, wb, "_weight_max_violation")
     if HAVE_NUMPY:
         a = np.asarray(wa, dtype=np.float64)
         b = np.asarray(wb, dtype=np.float64)
         scale = np.maximum(np.maximum(np.abs(a), np.abs(b)), 1.0)
         tol = WEIGHT_MATCH_ULPS * scale * F32_EPSILON
         delta = np.abs(a - b)
-        bad = int(np.count_nonzero(delta > tol))
+        bad_mask = (delta > tol) | ~np.isfinite(delta)
+        bad = int(np.count_nonzero(bad_mask))
         max_delta = float(np.max(delta)) if len(a) else 0.0
         return bad, max_delta
     bad = 0
     max_delta = 0.0
+    saw_nonfinite = False
     for x, y in zip(wa, wb):
         d = abs(x - y)
-        max_delta = max(max_delta, d)
+        if not math.isfinite(d):
+            bad += 1
+            saw_nonfinite = True
+            continue
+        if not saw_nonfinite:
+            max_delta = max(max_delta, d)
         if d > _weight_element_tolerance(x, y):
             bad += 1
-    return bad, max_delta
+    return bad, (float("nan") if saw_nonfinite else max_delta)
 
 
 def _weight_mismatches(report_a, report_b, matched_names):
@@ -610,6 +607,18 @@ def _weight_mismatches(report_a, report_b, matched_names):
         if len(wa) != len(wb):
             mismatches.append(f"{name}: weight length mismatch ({len(wa)} vs {len(wb)})")
             continue
+        # AFFIRMATIVE refusal, checked BEFORE the tolerance path (790eb4b):
+        # a NaN/+-inf weight element can never be "the identical weight
+        # file", regardless of how its `delta` compares to `tol` — see
+        # `_weight_max_violation`'s own doc for the reproduction this
+        # closes (a NaN previously read as max_abs_delta=0.0, PASS).
+        if _has_nonfinite(wa) or _has_nonfinite(wb):
+            mismatches.append(
+                f"{name}: weight contains a NaN/+-inf element on at least one side -- a "
+                "nonfinite weight can never be 'the identical weight file' (refuse affirmatively "
+                "at the edge, never rely on `delta > tol` comparing False for a NaN delta)"
+            )
+            continue
         bad_count, max_delta = _weight_max_violation(wa, wb)
         if bad_count > 0:
             mismatches.append(
@@ -620,19 +629,66 @@ def _weight_mismatches(report_a, report_b, matched_names):
     return mismatches
 
 
-def _premise_violations(report_a, report_b):
+def _same_producer_violation(report_a, report_b, allow_same_producer: bool):
+    """`True` iff both dumps report the SAME `tool` string and
+    `allow_same_producer` was not set — this comparator's WHOLE JOB (module
+    docstring line 6 and the file's own opening paragraph) is comparing TWO
+    INDEPENDENT producers; a dump compared against itself (`compare
+    a.json a.json`, or two runs of the SAME stack passed as if they were the
+    cross-framework pair) proves nothing about jammi-vs-torch agreement,
+    even if every other check above passes. `tool_a is None` never trips
+    this (an omitted `tool` is not itself evidence of same-producer-ness;
+    `RUN_IDENTITY_FIELDS`'s own presence check would already flag a report
+    missing expected fields via other means if that ever mattered here).
+    Real producers set DIFFERENT literal `tool` values by construction
+    (`"jammi_grad_oracle"` vs `"torch_grad_oracle"`), so this never fires on
+    a genuine cross-framework comparison.
+    """
+    if allow_same_producer:
+        return None
+    tool_a = report_a.get("tool")
+    tool_b = report_b.get("tool")
+    if tool_a is not None and tool_a == tool_b:
+        return (
+            f"both dumps report the same tool {tool_a!r} -- this comparator's entire purpose is "
+            "comparing two INDEPENDENT producers (see this module's own doc); comparing a "
+            "producer against itself (or literally the same file twice) proves nothing about "
+            "cross-framework agreement. Pass allow_same_producer=True "
+            "(main(): --allow-same-producer) if a same-producer self-consistency check is "
+            "genuinely what you want"
+        )
+    return None
+
+
+def _premise_violations(report_a, report_b, allow_same_producer: bool = False):
     """Everything besides the gradient arrays themselves that this
     comparator's stated premise (module docstring line 6: "IDENTICAL LoRA
     weights", and an identical batch) depends on, and that
-    `compare_reports` used to never look at: whether each side actually
-    loaded a shared weight file at all, whether the two runs were
-    configured identically (seed/shape/LoRA rank/target modules/forward
-    mode/backbone dtype), and whether the two runs fed the encoder the
-    SAME synthetic tokens (`batch_token_id_sums`, jammi's batch digest --
-    see `grad_oracle.rs`'s field doc; `torch_grad_oracle.py` now emits the
-    same field in the same schema).
+    `compare_reports` used to never look at: whether the two dumps come from
+    two INDEPENDENT producers at all (`_same_producer_violation`), whether
+    each side actually loaded a shared weight file, whether the two runs
+    were configured identically (every `RUN_IDENTITY_FIELDS` entry — see
+    that tuple's own doc for the full field-by-field determinant table),
+    and whether the two runs fed the encoder the SAME synthetic tokens
+    (`batch_token_id_sums`, jammi's batch digest -- see `grad_oracle.rs`'s
+    field doc; `torch_grad_oracle.py` now emits the same field in the same
+    schema).
+
+    PRESENCE, not just equality: a field absent from BOTH dumps is a
+    violation too, checked via an explicit `field in report` test BEFORE
+    falling back to `.get(field)` — the previous shape (`report.get(field)`
+    on both sides, then `va != vb`) compared `None == None` for a
+    both-missing field and silently PASSED, the exact gap a mechanical guard
+    (this function, plus the presence-driven parity test in
+    `test_grad_oracle_cross_producer_parity.py`) closes for EVERY identity
+    field, not only `batch_token_id_sums` (which already had its own,
+    separately-written, correctly-`or`-gated presence check below).
     """
     violations = []
+    same_producer_violation = _same_producer_violation(report_a, report_b, allow_same_producer)
+    if same_producer_violation is not None:
+        violations.append(same_producer_violation)
+
     for label, report in (("A", report_a), ("B", report_b)):
         if not report.get("lora_weights_in"):
             violations.append(
@@ -643,18 +699,26 @@ def _premise_violations(report_a, report_b):
             )
 
     for field in RUN_IDENTITY_FIELDS:
-        va = report_a.get(field)
-        vb = report_b.get(field)
-        # Class-level fix (this round): EVERY field is routed through
+        present_a = field in report_a
+        present_b = field in report_b
+        if not present_a or not present_b:
+            missing_sides = [s for s, present in (("A", present_a), ("B", present_b)) if not present]
+            violations.append(
+                f"run-identity field {field!r} missing from dump(s) {missing_sides} -- a field "
+                "absent on BOTH sides must not silently compare None == None and pass; cannot "
+                "verify this premise determinant"
+            )
+            continue
+        # Class-level fix (round 2): EVERY field is routed through
         # `canonicalize_identity_field`'s dispatch table, not just
         # `backbone_dtype` -- see `_IDENTITY_FIELD_CANONICALIZERS`'s own
-        # table for what each field's canonicalizer narrows (and why the
-        # other five fields need none). A genuine difference (e.g. `seed`
-        # differing, or a real `target_modules` SET difference) still
-        # compares unequal after canonicalization -- these functions only
-        # ever narrow a REPRESENTATIONAL gap, never widen what counts as a
-        # match.
-        va, vb = canonicalize_identity_field(field, va), canonicalize_identity_field(field, vb)
+        # table for what each field's canonicalizer narrows (and which
+        # fields need none). A genuine difference (e.g. `seed` differing, or
+        # a real `target_modules` SET difference) still compares unequal
+        # after canonicalization -- these functions only ever narrow a
+        # REPRESENTATIONAL gap, never widen what counts as a match.
+        va = canonicalize_identity_field(field, report_a[field])
+        vb = canonicalize_identity_field(field, report_b[field])
         if va != vb:
             violations.append(f"run-identity field {field!r} differs: A={va!r} B={vb!r}")
 
@@ -671,7 +735,7 @@ def _premise_violations(report_a, report_b):
     return violations
 
 
-def compare_reports(report_a, report_b, cosine_floor):
+def compare_reports(report_a, report_b, cosine_floor, allow_same_producer: bool = False):
     """Match tensors by NAME (loud on a mismatch, never silently skipped --
     B6's schema-strictness posture: a structural mismatch here is exactly
     the failure mode this oracle exists to catch, e.g. a target-modules
@@ -743,7 +807,7 @@ def compare_reports(report_a, report_b, cosine_floor):
 
     overall_cosine = cosine_similarity(all_a, all_b) if all_a else None
     weight_mismatches = _weight_mismatches(report_a, report_b, matched)
-    premise_violations = _premise_violations(report_a, report_b)
+    premise_violations = _premise_violations(report_a, report_b, allow_same_producer)
 
     passed = (
         not only_a
@@ -944,6 +1008,17 @@ def main(argv=None):
     p.add_argument("--num-layers", type=int, default=28, help="default: ModernBERT-large")
     p.add_argument("--hidden-size", type=int, default=1024, help="default: ModernBERT-large")
     p.add_argument("--out", type=str, default=None)
+    p.add_argument(
+        "--allow-same-producer",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip the same-producer premise check (both dumps report the same 'tool', or "
+            "literally the same file twice — see _same_producer_violation's own doc). Only for "
+            "a deliberate same-producer self-consistency check; never pass this for a real "
+            "jammi-vs-torch comparison."
+        ),
+    )
     args = p.parse_args(argv)
 
     cosine_floor = (
@@ -1001,7 +1076,7 @@ def main(argv=None):
     with open(args.report_b) as fh:
         report_b = json.load(fh)
 
-    result = compare_reports(report_a, report_b, cosine_floor)
+    result = compare_reports(report_a, report_b, cosine_floor, args.allow_same_producer)
 
     if args.out:
         with open(args.out, "w") as fh:

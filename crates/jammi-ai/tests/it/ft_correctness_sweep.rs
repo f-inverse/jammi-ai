@@ -342,16 +342,32 @@ fn oracle_compute_lr_goes_negative_past_horizon() {
 // a horizon that is not a multiple of its interval (the floor in the count).
 // The oracle counts the `checkpoint_{step}.safetensors` files the run left in
 // its artifact dir — the realised cadence, not the formula re-derived.
+//
+// Cell 5 (mutants sweep finding, R3 finishing round): the first four cells
+// never combine `grad_accum > 1` (so the trailing-partial-window flush at
+// `run`'s own `checkpoint_interval > 0 && global_step.is_multiple_of(...)`
+// gate is actually reached) with `interval > 1` (so the gate's `&&` is
+// distinguishable from `||` — cells 3/4 have `grad_accum == 1`, so no
+// partial window ever accumulates and the flush's checkpoint block is never
+// entered; cells 1/2 reach it but with `interval == 1`, where every step
+// checkpoints under EITHER operator). `cargo mutants --in-diff` on this
+// round's trainer.rs diff survived exactly that mutant. Cell 5 reaches the
+// flush with `interval == 2` and lands it on step 11 (odd, not a multiple),
+// so an `||` regression would write an extra `checkpoint_11.safetensors`
+// this oracle's exact-set assertion below would catch.
 // ════════════════════════════════════════════════════════════════════════════
 #[tokio::test(flavor = "multi_thread")]
 async fn oracle_total_steps_and_checkpoint_cadence_boundaries() {
     let device = Device::Cpu;
     // (batches_per_epoch, grad_accum, epochs)
-    let cells: [(usize, usize, usize); 4] = [
+    let cells: [(usize, usize, usize); 5] = [
         (5, 2, 1),  // partial window, epochs=1: 3 steps, interval 1 → 3 files
         (7, 3, 2),  // partial window, epochs=2: 6 steps, interval 1 → 6 files
         (4, 1, 3),  // 12 steps, interval 2 → 6 files
         (11, 1, 1), // 11 steps, interval 2 → 5 files (floor: step 11 is not a multiple)
+        (31, 3, 1), // partial-window flush AND interval 2: flush lands on step
+                    // 11 (not a multiple of 2) — pins the flush's own cadence gate,
+                    // not just process_batch_loss's in-window one.
     ];
     for (n, ga, epochs) in cells {
         let varmap = VarMap::new();

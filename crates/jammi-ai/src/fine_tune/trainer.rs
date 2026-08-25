@@ -4704,6 +4704,43 @@ mod last_step_run_harness {
     }
 }
 
+/// `refuse_nonfinite_params`'s fold over per-`Var` sums must be `+` (mutants
+/// sweep finding, P4b R3 finishing round). A finite/non-finite gate cannot
+/// distinguish `+`/`-`/`*` when the only corruption on offer is NaN — NaN
+/// propagates identically through all three ops — so
+/// `checkpoint_best_refuses_a_nonfinite_parameter_the_monitored_loss_cannot_see`
+/// above cannot see `+` swapped for `-` or `*`; a scoped `cargo mutants
+/// --in-diff` sweep of this round's trainer.rs diff survived both. This
+/// oracle instead picks two `Var`s whose sums are `+C`/`-C` for `C` close to
+/// `f32::MAX`: the CORRECT `+` fold cancels to `0.0` (finite — a healthy run
+/// with two ordinary, if extreme, finite parameters that never touched a
+/// NaN must not be refused), while `-` folds to `2C` and `*` to `-C²`, both
+/// of which overflow `f32` to infinity.
+#[cfg(test)]
+mod refuse_nonfinite_params_fold_oracle {
+    use candle_core::{Device, Tensor, Var};
+
+    use super::TrainingLoop;
+
+    /// A `Var` whose value-sum is exactly `value` (a single-element tensor,
+    /// so `sum_all()` needs no scaling to reach the target).
+    fn const_var(value: f32, device: &Device) -> Var {
+        Var::from_tensor(&Tensor::new(&[value], device).unwrap()).unwrap()
+    }
+
+    /// Mutation: `+` → `-` in the fold — RED (`2C` overflows `f32` to
+    /// `+inf`). Mutation: `+` → `*` — RED (`-C²` overflows to `-inf`).
+    #[test]
+    fn two_var_fold_of_opposite_near_max_sums_stays_finite() {
+        let device = Device::Cpu;
+        let c = 2.0e38_f32;
+        let pos = const_var(c, &device);
+        let neg = const_var(-c, &device);
+        TrainingLoop::refuse_nonfinite_params(&[pos, neg], 0)
+            .expect("c + (-c) == 0.0 must fold to a finite total via +");
+    }
+}
+
 /// Run-level oracles for `LastStepHorizon`'s lattice, driven through the
 /// REAL `TrainingLoop::run` over the `tiny_bert` text path (the precomputed
 /// arm computes its loss straight from the given embeddings, touching no

@@ -1685,6 +1685,19 @@ mod tests {
     use candle_core::Var;
     use half::bf16;
 
+    /// Serializes every test in THIS module that reads
+    /// `ATTENTION_BLOCK_DISPATCH_COUNTERS` (a process-wide, `#[cfg(test)]`-
+    /// shared static): `cargo test`'s default per-binary thread pool runs
+    /// `#[test]` fns in parallel, so an exact-equality "eval must not
+    /// advance the counter" assertion in one such test would be flaky if
+    /// another concurrently ran a training-mode `AttentionBlockFused`
+    /// dispatch — mirrors `tests/it/modernbert.rs`'s
+    /// `DISPATCH_COUNTER_TEST_LOCK` (a SEPARATE lock: that one guards the
+    /// integration-test binary's own tests reading the SAME process-wide
+    /// counters through the crate's public `attention_block_dispatch_
+    /// snapshot` API — a different binary, so a different `Mutex`).
+    static ATTENTION_BLOCK_COUNTER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn rope(head_dim: usize, max_seq: usize, theta: f64, device: &Device) -> RotaryEmbedding {
         RotaryEmbedding::new(head_dim, max_seq, theta, device).unwrap()
     }
@@ -2724,6 +2737,9 @@ mod tests {
     /// re-proven here).
     #[test]
     fn fused_training_attention_block_matches_eager_composition_within_tolerance_global() {
+        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let device = Device::Cpu;
         let (b, s, h, d) = (2usize, 5usize, 2usize, ATTENTION_BLOCK_HEAD_DIM);
         let n = b * s * 3 * h * d;
@@ -2761,6 +2777,9 @@ mod tests {
     /// window band supplied to both arms.
     #[test]
     fn fused_training_attention_block_matches_eager_composition_within_tolerance_local() {
+        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let device = Device::Cpu;
         let (b, s, h, d) = (1usize, 9usize, 3usize, ATTENTION_BLOCK_HEAD_DIM);
         let half_window = 2usize;
@@ -2810,6 +2829,9 @@ mod tests {
     /// self-comparison).
     #[test]
     fn fused_attention_block_retains_fewer_tape_nodes_than_the_eager_training_composition() {
+        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let device = Device::Cpu;
         let (b, s, h, d) = (1usize, 4usize, 1usize, ATTENTION_BLOCK_HEAD_DIM);
         let n = b * s * 3 * h * d;
@@ -2859,6 +2881,177 @@ mod tests {
         eprintln!(
             "attention_block node counts (b={b},s={s},h={h},d={d}): eager={nodes_eager} \
              fused={nodes_fused}"
+        );
+    }
+
+    /// Audit B10: `forward_eval_attention` was exercised by NO unit test —
+    /// the cited deletion test (`eval_mode_attention_softmax_is_bit_
+    /// identical_regardless_of_fused_eligibility`) only tests the softmax
+    /// PREDICATE in isolation, never `ModernBertAttention::forward`'s own
+    /// `self.training` branch. This test builds an INDEPENDENT hand
+    /// composition (RoPE via `self.rope.apply` directly, `scores / scale`,
+    /// one `broadcast_add`, `candle_nn::ops::softmax`, matmul, `Wo`, plus
+    /// residual — the exact formula `forward_eval_attention`'s own doc
+    /// describes, reconstructed here rather than calling that function, so
+    /// this is not a vacuous self-comparison) and asserts `attn.forward()`
+    /// at `training=false` is BYTE-IDENTICAL to it, on a fixture proven
+    /// fused-eligible (so the test demonstrates eval structurally never
+    /// reaches `AttentionBlockFused`, not merely that this fixture happens
+    /// to fail admission) — plus that `ATTENTION_BLOCK_DISPATCH_COUNTERS`
+    /// does not move at all during the eval call.
+    #[test]
+    fn attention_block_eval_output_is_bit_identical_regardless_of_fused_eligibility() {
+        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let device = Device::Cpu;
+        let (b, s, h, d) = (2usize, 5usize, 2usize, ATTENTION_BLOCK_HEAD_DIM);
+        let n = b * s * h * d;
+        let hidden_v: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.037).sin() * 0.5).collect();
+        let hidden = Tensor::from_slice(&hidden_v, (b, s, h * d), &device).unwrap();
+        let mask = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
+
+        let mut attn = attention_block_fixture(false, h, s, &device);
+        attn.set_training(false);
+
+        // Non-vacuity: the SAME `qkv` this fixture's `wqkv` would project
+        // is fused-eligible (mirrors the two `fused_training_attention_
+        // block_matches_eager_composition_within_tolerance_*` tests
+        // above, which already prove this admission path holds for this
+        // fixture shape).
+        let qkv = attn.wqkv.forward(&hidden).unwrap();
+        let (holds, predicate) =
+            attention_block_admission_predicate(&qkv, s, h, d, &mask, false, None);
+        assert!(
+            holds,
+            "fixture must satisfy the fused attention-block domain — this test proves eval \
+             skips it anyway, not that the fixture happens to be ineligible: {predicate}"
+        );
+
+        // Independent hand composition of `forward_eval_attention`'s own
+        // documented formula.
+        let q = qkv
+            .narrow(D::Minus1, 0, h * d)
+            .unwrap()
+            .reshape((b, s, h, d))
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap();
+        let k = qkv
+            .narrow(D::Minus1, h * d, h * d)
+            .unwrap()
+            .reshape((b, s, h, d))
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap();
+        let v = qkv
+            .narrow(D::Minus1, 2 * h * d, h * d)
+            .unwrap()
+            .reshape((b, s, h, d))
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap();
+        let q = attn.rope.apply(&q).unwrap();
+        let k = attn.rope.apply(&k).unwrap();
+        let scale = (d as f64).sqrt();
+        let scores =
+            crate::contiguous_matmul(&q, &k.transpose(D::Minus1, D::Minus2).unwrap()).unwrap();
+        let scores = (scores / scale).unwrap();
+        let scores = scores.broadcast_add(&mask).unwrap();
+        let p = candle_nn::ops::softmax(&scores, D::Minus1).unwrap();
+        let ctx = crate::contiguous_matmul(&p, &v)
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap()
+            .contiguous()
+            .unwrap()
+            .reshape((b, s, h * d))
+            .unwrap();
+        let before_ref: Vec<f32> = (attn.wo.forward(&ctx).unwrap() + &hidden)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        let counters_before = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+        let after: Vec<f32> = attn
+            .forward(&hidden, &mask, None)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let counters_after = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+
+        assert_eq!(
+            counters_after.fused, counters_before.fused,
+            "eval must never dispatch AttentionBlockFused (fused count moved)"
+        );
+        assert_eq!(
+            counters_after.eager, counters_before.eager,
+            "eval must never even consult this op's admission machinery (eager-fallback count \
+             moved — forward_eval_attention must be a structurally separate code path, not a \
+             domain-miss fallback of the training path)"
+        );
+        assert_eq!(
+            before_ref, after,
+            "eval-mode ModernBertAttention::forward output must be byte-identical to the \
+             hand-composed reference regardless of AttentionBlockFused's existence"
+        );
+    }
+
+    /// Audit B10's other half: the counter-threading deletion test —
+    /// `attn.training` gating `forward_training_attention` vs
+    /// `forward_eval_attention` (`ModernBertAttention::forward`'s own
+    /// `if self.training` branch) is the ONLY thing that would catch that
+    /// branch being accidentally deleted or inverted. Mirrors
+    /// `tests/it/modernbert.rs`'s `set_training_threading_gates_the_fused_
+    /// {rope,softmax,geglu}_dispatch_counters`, at the unit level (no
+    /// checkpoint has `head_dim == ATTENTION_BLOCK_HEAD_DIM == 64`, so this
+    /// op's own counter-threading proof lives here, driven through
+    /// `attention_block_fixture` + `ModernBertAttention::forward` directly,
+    /// rather than through a full `ModernBert::forward_hidden`).
+    #[test]
+    fn set_training_threading_gates_the_fused_attention_block_dispatch_counters() {
+        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let device = Device::Cpu;
+        let (b, s, h, d) = (1usize, 4usize, 2usize, ATTENTION_BLOCK_HEAD_DIM);
+        let n = b * s * h * d;
+        let hidden_v: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.041).cos() * 0.3).collect();
+        let hidden = Tensor::from_slice(&hidden_v, (b, s, h * d), &device).unwrap();
+        let mask = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
+
+        let mut attn = attention_block_fixture(false, h, s, &device);
+
+        attn.set_training(false);
+        let before_eval = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+        let _ = attn.forward(&hidden, &mask, None).unwrap();
+        let after_eval = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+        assert_eq!(
+            after_eval.fused, before_eval.fused,
+            "eval must never dispatch the fused attention block"
+        );
+
+        attn.set_training(true);
+        let before_train = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+        let _ = attn.forward(&hidden, &mask, None).unwrap();
+        let after_train = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+        assert!(
+            after_train.fused > before_train.fused,
+            "training=true must dispatch the fused attention block at least once \
+             (before={before_train:?}, after={after_train:?})"
+        );
+
+        attn.set_training(false);
+        let before_eval2 = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+        let _ = attn.forward(&hidden, &mask, None).unwrap();
+        let after_eval2 = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+        assert_eq!(
+            after_eval2.fused, before_eval2.fused,
+            "set_training(false) must restore the eval-only dispatch path"
         );
     }
 }

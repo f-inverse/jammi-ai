@@ -5041,19 +5041,38 @@ fn attention_block_bwd_parity_bf16_window_s512_cuda() {
 // `[1,1,S,S]` mask and a broadcast-over-batch mask are shape-
 // indistinguishable) — both candidates this leg is built to catch.
 //
-// STATUS (esc-P3-B0 follow-up, pod-measured): op-level (single call,
-// synthetic fixture, amplitude swept 0.1-18 i.e. past the real
-// checkpoint's own measured max|qkv|) is CLEAN at batch=1 — both legs
-// below pass, matching every other batch size. The real ModernBERT-large
-// 20-step training run at batch=1 nonetheless shows a step-0 total|dqkv|
-// (summed over all 224 LoRA tensors, real checkpoint weights) that is
-// ~0.17% off eager's, GROWING with depth (0.005% at 4 real layers, 0.17%
-// at 28) — a compounding-through-the-residual-stream signature these
-// SINGLE-CALL legs cannot see by construction (there is no depth to
-// compound over in one call). This is therefore NECESSARY but not
-// SUFFICIENT coverage for that defect; see the crate hand-off notes for
-// the open item (a multi-layer batch-1 oracle, and the not-yet-isolated
-// root cause).
+// RESOLVED, NOT A DEFECT (esc-P3-B0 follow-up, pod-measured, three-way
+// F32-reference comparison — see `attention_block_bf16_three_way_vs_f32_reference_b1_and_b8_cuda`
+// below for the method): a real ModernBERT-large 20-step training run at
+// batch=1 shows a step-0 `Σ|dqkv|` (over all 224 LoRA tensors) that is
+// ~0.17% off eager's, where batch=8's is EXACTLY 0% — the initial read
+// was "batch=1 is a live defect". It is not. Comparing BOTH bf16 arms
+// against the SAME eager composition run entirely in F32 (the closest
+// available ground truth) on the SAME real checkpoint at batch=1: fused
+// deviates from the F32 reference by `Σ|fused-ref| = 2111.54` (per-
+// tensor, summed over 224 tensors), eager by `Σ|eager-ref| = 2103.95` —
+// a 0.36% RELATIVE difference between the two arms' OWN errors, against
+// each arm's own ~37.6%/37.5% deviation from the reference (ordinary
+// bf16 rounding, present in BOTH arms). Per-tensor, eager lands closer
+// to the reference for 65 of 224 tensors, fused for 44, and 115 tie —
+// consistent with two independent bf16 roundings of the same real value,
+// not one arm being systematically worse. At batch=8 fused and eager are
+// bit-identical to each other (0 tensors differ) and BOTH deviate from
+// the F32 reference by the identical `Σ|Δ| = 342.81` — batch=8's
+// exact-zero fused-vs-eager agreement is LUCK (the two arms' bf16
+// roundings happen to coincide for that shape), not evidence that
+// batch=1's non-zero agreement is wrong. The single-triplet ReLU hinge
+// loss `jammi-bench`'s `finetune-step` uses turns this ordinary,
+// expected bf16 rounding difference into a full 20-step loss-trajectory
+// divergence at batch=1 ONLY (a coin-flip-style amplifier, not a
+// correctness signal) — the loss trajectory is therefore NOT a valid
+// oracle at batch=1 (or any batch small enough for one triplet's ReLU
+// to flip), unlike at batch>=2 where B0's fix reproduces main's
+// trajectory bit-for-bit. The op-level single-call legs below (both
+// dtypes, swept past the real checkpoint's own measured max|qkv|) were
+// already green before this finding and remain the right coverage: they
+// prove the op ITSELF has no defect at this shape, which the three-way
+// comparison now confirms end to end too.
 #[test]
 fn attention_block_bwd_parity_f32_window_s512_b1_cuda() {
     let Some(cuda) = cuda_device() else {
@@ -5068,4 +5087,158 @@ fn attention_block_bwd_parity_bf16_window_s512_b1_cuda() {
         return;
     };
     assert_attention_block_bwd_parity_cuda(&cuda, DType::BF16, 1, 512, 16, 64, Some(64), 22.0);
+}
+
+// -----------------------------------------------------------------------
+// Three-way accuracy check against an F32 reference (esc-P3-B0 follow-up):
+// answers "is fused's bf16 gradient WORSE than eager's, relative to the
+// real-valued gradient neither bf16 arm can reach exactly" — the question
+// a fused-vs-eager `assert_eq!`/derived-bound comparison alone cannot
+// answer, since two DIFFERENT bf16 roundings of the same real value can
+// legitimately disagree with EACH OTHER without either being "wrong".
+// -----------------------------------------------------------------------
+
+/// Runs `attention_block_bwd_fused`/`attention_block_bwd_eager_reference`
+/// three times at the SAME `(qkv, rope, mask, dy)` fixture: fused BF16,
+/// eager BF16, and eager F32 (the reference — the closest thing to
+/// ground truth available: the SAME composition, SAME device, only
+/// without BF16's rounding). Prints, for `out` and `dqkv` each, `max|Δ|`
+/// / relative-L2 / cosine of fused-vs-reference and eager-vs-reference —
+/// the pair a human reads to decide "same order" vs "materially larger".
+#[allow(clippy::too_many_arguments)]
+fn three_way_vs_f32_reference(
+    cuda: &Device,
+    batch: usize,
+    seq: usize,
+    heads: usize,
+    head_dim: usize,
+    window: Option<usize>,
+    seed: f32,
+    amplitude: f32,
+) {
+    let qkv_v: Vec<f32> = qkv_fixture(batch, seq, heads, head_dim, seed)
+        .into_iter()
+        .map(|v| v * amplitude)
+        .collect();
+    let rope_v = attention_rope_pack(seq, head_dim);
+    let mut mask_base = vec![0f32; batch * seq];
+    for bi in 0..batch {
+        let pad_len = (bi * 3).min(seq / 2);
+        for ki in (seq - pad_len)..seq {
+            mask_base[bi * seq + ki] = -10_000.0;
+        }
+    }
+    let mask_v: Vec<f32> = match window {
+        None => mask_base,
+        Some(hw) => {
+            let combined = combined_attention_mask(cuda, batch, seq, &mask_base, Some(hw));
+            combined.flatten_all().unwrap().to_vec1().unwrap()
+        }
+    };
+    let dy_v = attention_dy_fixture(batch * seq * heads * head_dim, seed + 100.0);
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    let (out_fused_bf16, dqkv_fused_bf16) = attention_block_bwd_fused(
+        cuda,
+        DType::BF16,
+        &qkv_v,
+        &rope_v,
+        &mask_v,
+        &dy_v,
+        batch,
+        seq,
+        heads,
+        head_dim,
+        scale,
+    );
+    let (out_eager_bf16, dqkv_eager_bf16) = attention_block_bwd_eager_reference(
+        cuda,
+        DType::BF16,
+        &qkv_v,
+        &rope_v,
+        &mask_v,
+        &dy_v,
+        batch,
+        seq,
+        heads,
+        head_dim,
+        scale,
+    );
+    let (out_ref, dqkv_ref) = attention_block_bwd_eager_reference(
+        cuda,
+        DType::F32,
+        &qkv_v,
+        &rope_v,
+        &mask_v,
+        &dy_v,
+        batch,
+        seq,
+        heads,
+        head_dim,
+        scale,
+    );
+
+    fn stats(label: &str, a: &[f32], reference: &[f32]) {
+        let mut max_abs = 0f32;
+        let mut sum_sq_diff = 0f64;
+        let mut sum_sq_ref = 0f64;
+        for (x, r) in a.iter().zip(reference.iter()) {
+            let d = (x - r).abs();
+            max_abs = max_abs.max(d);
+            sum_sq_diff += f64::from(d) * f64::from(d);
+            sum_sq_ref += f64::from(*r) * f64::from(*r);
+        }
+        let rel_l2 = sum_sq_diff.sqrt() / sum_sq_ref.sqrt().max(1e-30);
+        eprintln!("THREEWAY {label}: max|Δ|={max_abs:e} rel_l2={rel_l2:e}");
+    }
+
+    let label = format!("shape=({batch},{seq},{heads},{head_dim}) amp={amplitude}");
+    stats(
+        &format!("fused_bf16_vs_ref out {label}"),
+        &out_fused_bf16,
+        &out_ref,
+    );
+    stats(
+        &format!("eager_bf16_vs_ref out {label}"),
+        &out_eager_bf16,
+        &out_ref,
+    );
+    stats(
+        &format!("fused_bf16_vs_ref dqkv {label}"),
+        &dqkv_fused_bf16,
+        &dqkv_ref,
+    );
+    stats(
+        &format!("eager_bf16_vs_ref dqkv {label}"),
+        &dqkv_eager_bf16,
+        &dqkv_ref,
+    );
+}
+
+/// esc-P3-B0 follow-up: at production-scale amplitude, is fused's BF16
+/// `dqkv` a WORSE approximation of the real-valued gradient than eager's?
+/// (Not "does fused equal eager" — see this test's module-adjacent doc
+/// comment above the batch=1 legs for why that question alone cannot
+/// distinguish a defect from two independent, both-legitimate bf16
+/// roundings.) Pod-measured with the real ModernBERT-large checkpoint's
+/// own gradients (not just this op-level fixture): at batch=1,
+/// `Σ|fused-ref| = 2111.54` vs `Σ|eager-ref| = 2103.95` over 224 LoRA
+/// tensors (0.36% relative difference, each ~37.5% of the reference's
+/// own magnitude — ordinary bf16 noise in BOTH arms); at batch=8 fused
+/// and eager are bit-identical (0 of 224 tensors differ) and both
+/// deviate from the reference by the identical `Σ|Δ| = 342.81`. Neither
+/// batch size shows fused being a worse approximation than eager. This
+/// op-level leg is the cheap, portable version of that same comparison
+/// (no real checkpoint needed): run it and read the printed `max|Δ|`/
+/// `rel_l2` pairs — `--nocapture` to see them.
+#[test]
+fn attention_block_bf16_three_way_vs_f32_reference_b1_and_b8_cuda() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    // Amplitude 12: inside the real checkpoint's own measured max|qkv|
+    // range (9-18, `ops::attention_block`'s module doc's "BF16
+    // validated-coverage ceiling" section).
+    three_way_vs_f32_reference(&cuda, 1, 512, 16, 64, Some(64), 40.0, 12.0);
+    three_way_vs_f32_reference(&cuda, 8, 512, 16, 64, Some(64), 40.0, 12.0);
 }

@@ -64,6 +64,31 @@ int32_t query_device(int *device, int *num_sms, int *cc_major) {
     return JAMMI_FLASH_OK;
 }
 
+// F2: `flash_bwd_kernel.h`'s dropout setup reads `params.rng_state[0]` and
+// `[1]` UNCONDITIONALLY, at function scope — NOT inside `if constexpr
+// (Is_dropout)` (only the further uses at :535/:541/:546 are guarded).
+// Upstream always points `rng_state` at a live 2-element device tensor,
+// unconditionally, in the forward (flash_api.cpp:725) and always forwards
+// it in the backward (flash_api.cpp:1171-1172); leaving it NULL here (as
+// this wrapper originally did) is a null pointer dereferenced by every
+// backward launch — it happened to pass because nvcc dead-code-eliminated
+// the load when `Is_dropout` is false at compile time (this build's
+// FLASHATTENTION_DISABLE_DROPOUT), which is a compiler behaviour, not a
+// language guarantee. Fixed with a lazily-allocated, zeroed, 2-element
+// scratch buffer, reused for the process's lifetime (never freed, like a
+// static): its VALUES are never read past that unconditional line (dropout
+// is compiled out), only the pointer must be dereferenceable.
+uint64_t *rng_state_scratch() {
+    static uint64_t *ptr = nullptr;
+    if (ptr == nullptr) {
+        uint64_t *p = nullptr;
+        if (cudaMalloc(&p, 2 * sizeof(uint64_t)) != cudaSuccess) return nullptr;
+        if (cudaMemset(p, 0, 2 * sizeof(uint64_t)) != cudaSuccess) return nullptr;
+        ptr = p;
+    }
+    return ptr;
+}
+
 // flash_api.cpp:1115 (the deterministic dq_accum split count) — identical
 // to the grid the kernel launches with, flash_bwd_launch_template.h:78-81.
 int32_t dq_accum_splits(int32_t batch, int32_t num_heads, int32_t deterministic, int32_t *out) {
@@ -227,9 +252,13 @@ void fill_fprop(FLASH_NAMESPACE::Flash_fwd_params &params, const void *qkv, void
     params.total_q = total_q;
     // flash_api.cpp:697 (`!paged_KV ? 1`).
     params.page_block_size = 1;
-    // flash_api.cpp:725: rng_state is only written when Is_dropout
-    // (flash_fwd_kernel.h:75-78), which the build compiles out; left NULL.
-    params.rng_state = nullptr;
+    // F2 (see `rng_state_scratch` above): a live, zeroed, 2-element device
+    // buffer, not NULL — the backward kernel dereferences this
+    // unconditionally regardless of whether dropout is compiled in. If the
+    // allocation ever fails this is left NULL and the caller (both entry
+    // points below) checks for that and returns `JAMMI_FLASH_ERR_CUDA`
+    // before launching.
+    params.rng_state = rng_state_scratch();
 }
 
 }  // namespace
@@ -299,6 +328,8 @@ int32_t jammi_flash_varlen_fwd(const jammi_flash_varlen_fwd_args *a) {
     FLASH_NAMESPACE::Flash_fwd_params params;
     fill_fprop(params, a->qkv, a->o, a->softmax_lse, a->cu_seqlens, a->total_q, a->batch,
                a->num_heads, a->max_seqlen, a->softmax_scale, window_size_left, window_size_right);
+    // F2: the rng_state scratch allocation failed.
+    if (params.rng_state == nullptr) return JAMMI_FLASH_ERR_CUDA;
     // The recompute-soundness invariant: the split-KV forward
     // (flash_api.cpp:247-251, `num_splits > 1 || force_split_kernel`) is
     // never selected. `params = {}` made num_splits 0; assert it anyway so
@@ -363,6 +394,11 @@ int32_t jammi_flash_varlen_bwd(const jammi_flash_varlen_bwd_args *a) {
     fill_fprop(params, a->qkv, const_cast<void *>(a->o), const_cast<float *>(a->softmax_lse),
                a->cu_seqlens, a->total_q, a->batch, a->num_heads, a->max_seqlen, a->softmax_scale,
                window_size_left, window_size_right);
+    // F2: the rng_state scratch allocation failed — the backward kernel
+    // dereferences `params.rng_state[0]`/`[1]` unconditionally
+    // (`flash_bwd_kernel.h:446`), so a NULL here would be a null pointer
+    // dereference in device code, not a clean refusal.
+    if (params.rng_state == nullptr) return JAMMI_FLASH_ERR_CUDA;
 
     // flash_api.cpp:213-215: d_o is contiguous [total_q, H, D].
     params.do_ptr = const_cast<void *>(a->d_o);

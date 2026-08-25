@@ -1,7 +1,60 @@
 # Vendored FlashAttention-2 (Dao-AILab/flash-attention)
 
 Upstream: <https://github.com/Dao-AILab/flash-attention>, BSD-3-Clause
-(`LICENSE` in this directory is the upstream file, verbatim).
+(`LICENSE` in this directory is the upstream file, verbatim; its notice at
+line 3, "as shown by the AUTHORS file", refers to the sibling `AUTHORS`
+file in this same directory — also vendored verbatim, see the file table
+below).
+
+## Licensing (jammi-kernels is Apache-2.0; this directory is BSD-3)
+
+`crates/jammi-kernels/Cargo.toml` inherits `license = "Apache-2.0"` from
+the workspace (`license.workspace = true`). Everything under
+`third_party/flash-attention/{src,jammi,shim}` and this file's sibling
+`LICENSE`/`AUTHORS` is BSD-3-Clause (Dao-AILab) — a DIFFERENT license than
+the crate that vendors it, which is legal (Apache-2.0 code may embed BSD-3
+code with its notice retained, as here) but must not be silently erased by
+packaging. Two consequences, flagged to the lead as a shared-declaration
+(`Cargo.toml`) change this crate does not make unilaterally:
+- `cargo publish -p jammi-kernels` runs on release tags via
+  `.github/workflows/crates.yml:344` with NO `include`/`exclude` in
+  `Cargo.toml` today — a published crate tarball would carry BSD-3 sources
+  under an `Apache-2.0`-declared `license`, with the LICENSE/AUTHORS text
+  present but the top-level `license` field not disclosing the mix.
+- Proposed `Cargo.toml` shape (NOT applied here — shared-declaration file,
+  routed to the lead):
+  ```toml
+  [package]
+  license = "Apache-2.0"
+  # third_party/flash-attention/{src,jammi,shim,LICENSE,AUTHORS,VENDORED.md}
+  # is Dao-AILab's BSD-3-Clause code, vendored (not re-licensed); the
+  # crate's own code stays Apache-2.0. Cargo has no per-subtree license
+  # field, so this is surfaced two ways: (1) `license-file` conventions
+  # cannot express "mostly Apache-2.0, one vendored subtree BSD-3-Clause" —
+  # the crate-level `license` stays "Apache-2.0" (accurate for the code
+  # jammi-ai wrote) and the vendored subtree's own LICENSE/AUTHORS travel
+  # WITH it in the published tarball (do NOT `exclude` them — that would
+  # strip attribution while still shipping the compiled kernels built from
+  # that source); (2) this note, and a one-line pointer in the crate's own
+  # top-level doc comment / README, name the exception explicitly for
+  # anyone auditing the published crate.
+  include = [
+      "src/**", "build.rs", "README.md",
+      "third_party/flash-attention/src/**",
+      "third_party/flash-attention/jammi/**",
+      "third_party/flash-attention/shim/**",
+      "third_party/flash-attention/LICENSE",
+      "third_party/flash-attention/AUTHORS",
+      "third_party/flash-attention/VENDORED.md",
+      # third_party/cutlass is a git submodule, NOT vendored into this
+      # crate's published tarball at all today (build.rs panics without it
+      # checked out) — `flash-attn` was never a publishable-from-crates.io
+      # feature; if that changes, CUTLASS's own license (BSD-3) needs the
+      # same treatment.
+  ]
+  ```
+  This is a PROPOSAL for the lead/docs-ci lane to apply; this round does
+  not edit `Cargo.toml` (shared-declaration class).
 
 | item | value |
 |---|---|
@@ -10,7 +63,7 @@ Upstream: <https://github.com/Dao-AILab/flash-attention>, BSD-3-Clause
 | CUTLASS submodule | `dc4817921edda44a549197ff3a9dcf5df0636e7b` (the tag's `csrc/cutlass` gitlink), vendored as the git submodule `crates/jammi-kernels/third_party/cutlass` |
 | upstream directory | `csrc/flash_attn/src/` → `src/` here |
 | local edits to upstream files | **none** (see "Shims") |
-| kernels compiled | `run_mha_fwd_<cutlass::bfloat16_t, 64, false>`, `run_mha_bwd_<cutlass::bfloat16_t, 64, false>` (head dim 64, bf16, non-causal, sm80 cubin + compute_80 PTX) |
+| kernels compiled | `run_mha_fwd_<cutlass::bfloat16_t, 64, false>`, `run_mha_bwd_<cutlass::bfloat16_t, 64, false>` (head dim 64, bf16, non-causal, sm80 cubin ONLY — no PTX, see "Supported archs") |
 | wrapper | `jammi/flash_api_jammi.{h,cu}` — jammi's own, torch-free, not upstream |
 
 Why this tag: it is the newest `2.8.x` release at vendoring time and the
@@ -59,6 +112,7 @@ Nothing else is fetched at build time.
 | `src/static_switch.h` | `52da74dec74f8b9a26ef34bf4a311950c28c0c77b73eab8b9a169f8e65ae1616` |
 | `src/utils.h` | `abc6d4c73522af35f6c31be3938830b9474f620d7c8083168d80dab226a0fdc9` |
 | `LICENSE` | `8c9ccb96c065e706135b6cbad279b721da6156e51f3a5f27c6b3329af9416d73` |
+| `AUTHORS` | `b102042819a44c39dd7af31e8f29358db944bd6eb372459fba3529c2e0584523` |
 
 `src/philox_unpack.cuh` is one file beyond the planned list: `flash_fwd_kernel.h:8`
 includes it (quoted, same directory) and it is a two-line forward to
@@ -102,7 +156,7 @@ sm80 group), archived by `ar` into `$OUT_DIR/libjammi_flash.a`, linked with
 
 ```
 -O3 -std=c++17
--gencode arch=compute_80,code=sm_80 -gencode arch=compute_80,code=compute_80
+-gencode arch=compute_80,code=sm_80
 --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math
 -U__CUDA_NO_HALF_OPERATORS__ -U__CUDA_NO_HALF_CONVERSIONS__
 -U__CUDA_NO_HALF2_OPERATORS__ -U__CUDA_NO_BFLOAT16_CONVERSIONS__
@@ -123,13 +177,32 @@ sm80 group), archived by `ar` into `$OUT_DIR/libjammi_flash.a`, linked with
   `softcap == 0`, `head_dim == 64` is a multiple of 32) — bit-neutral,
   ~16× fewer instantiations. `FLASHATTENTION_DISABLE_LOCAL` is NOT set:
   the sliding window is the product.
-- `-Xcompiler -fPIC` is the one addition to the spike's group (host-code
-  relocation model only; Rust links PIE executables on Linux).
+- `-Xcompiler -fPIC` is the ONE addition to upstream `setup.py`'s sm80
+  group (host-code relocation model only; Rust links PIE executables on
+  Linux). An EARLIER revision of this file also documented a SECOND
+  addition — `-gencode arch=compute_80,code=compute_80` (embedded PTX) —
+  that was wrong on two counts: it was not in upstream's group (`setup.py`
+  appends only `code=sm_80` for the sm80 arch too), and it was never
+  validated (see "Supported archs" below). Dropped.
 - Both traits configs of the backward are instantiated; the launch picks
   128×128 (8 warps, 144 KB dynamic smem) when the device's opt-in smem
   allows it (A100/H100), else 64×128 (sm86/sm89, 99 KB)
   (`src/flash_bwd_launch_template.h:178-190`). The forward uses 128×128,
   4 warps (`src/flash_fwd_launch_template.h:188`).
+
+### Supported archs
+
+This build emits ONLY an sm_80 cubin (no PTX) — the ABI hard-refuses
+(`JAMMI_FLASH_ERR_COMPUTE_CAPABILITY`) below compute capability 8.0, and a
+device above sm80 (8.6/8.9/9.0) simply cannot LOAD this module at all
+(no PTX to JIT), rather than silently loading the wrong-tile-config kernel.
+This is deliberate: shipping the PTX would let 8.6/8.9/9.0 devices JIT a
+DIFFERENT `Flash_bwd_kernel_traits` branch (the 64×128 config vs. this
+crate's 128×128, `flash_bwd_launch_template.h:178-190`) with ZERO oracles
+run against it — `tests/flash_smoke.rs`'s landing proof runs on an A100
+(sm80) only. If a jammi deployment target needs sm86/89/90, the PTX
+gencode returns together with its own build-and-parity run on that arch,
+recorded here — not silently re-added.
 
 ### Measured compile time
 

@@ -32,18 +32,22 @@
 //! (the split kernel's translation unit is not compiled; the wrapper
 //! asserts `num_splits <= 1`), and dropout is compiled out AND refused —
 //! so two forwards on identical inputs are BIT-IDENTICAL in `o` and `lse`.
-//! The backward is deterministic iff [`VarlenConfig::deterministic`]: it
+//! The backward is deterministic iff `VarlenConfig::deterministic`: it
 //! then gives every (batch, head) its own `ceil(num_SM / (B·H))` private
 //! `dq_accum` split buffers (no cross-block atomics on shared rows) and
 //! reduces them in a fixed order (`flash_bwd_preprocess_kernel.h:243`);
-//! those buffers MUST be zero on entry, which [`BwdScratch::alloc`] does.
+//! those buffers MUST be zero on entry, which `BwdScratch::alloc` does.
 //! With `deterministic = false` the kernel clears `dq_accum` itself and
 //! accumulates with atomics — cheaper, order-dependent.
 //!
 //! # Refusal lattice
 //!
-//! Every predicate below is a cell with one test (`tests/flash_smoke.rs`
-//! for the C-side cells, this module's unit tests for the pure ones).
+//! Every predicate reachable from this crate's own inputs on the SUPPORTED
+//! hardware (an Ampere-or-newer GPU that this build's own driver can open)
+//! is a cell with one test (`tests/flash_smoke.rs` for the C-side cells,
+//! this module's unit tests for the pure ones). Five cells below are
+//! UNREACHABLE by construction under that scope and are documented, not
+//! tested, rather than claimed as covered:
 //!
 //! Rust side (before any FFI call):
 //!
@@ -55,17 +59,56 @@
 //! | `softmax_scale` not finite or `<= 0` | `FlashError::Geometry` |
 //! | `window > i32::MAX` | `FlashError::Geometry` |
 //! | a buffer's element count `!=` the shape's | `FlashError::Geometry` |
-//! | `dq_accum` split count `!=` [`dq_accum_splits`] | `FlashError::Geometry` |
+//! | `dq_accum` split count `!=` `dq_accum_splits` | `FlashError::Geometry` |
 //! | args struct size `!=` the C struct's | `FlashError::Refused(Abi)` |
+//! | a sequence length `== 0`, or the batch is empty (`CuSeqlens::from_lengths`) | `FlashError::Geometry` |
+//! | `total_q`/per-length `> i32::MAX` (`CuSeqlens::from_lengths`) | `FlashError::Geometry` |
 //!
 //! C side (`flash_api_jammi.cu`, every upstream `TORCH_CHECK` that applies),
-//! each mapped to a [`FlashStatus`]: `NullPointer`, `HeadDim`, `Dims`,
+//! each mapped to a `FlashStatus`: `NullPointer`, `HeadDim`, `Dims`,
 //! `DropoutUnsupported`, `CausalUnsupported`, `Scale`, `BufferLen`,
 //! `ComputeCapability`, `Cuda`, `SplitKernel`, `Abi`, `DqAccumSplits`,
 //! `Window`. The safe API cannot produce `DropoutUnsupported` (it has no
 //! dropout parameter at all — the type system is the Rust-boundary
 //! refusal) or `HeadDim` (64 is a constant); the smoke test drives those
-//! two through [`raw`] to prove the C side refuses them on its own.
+//! two through `raw` to prove the C side refuses them on its own.
+//!
+//! UNTESTED cells (honest accounting, not claimed as covered by the "one
+//! test per cell" statement above):
+//!
+//! - **`FlashStatus::ComputeCapability`** (`check_device`, compute
+//!   capability major `< 8`): unreachable on the CI/pod hardware this crate
+//!   targets (the landing proof runs on an A100, cc 8.0); would need a
+//!   pre-Ampere device to drive for real. Not simulated (faking
+//!   `cudaDeviceGetAttribute`'s return would test the C `if`, not the
+//!   actual refusal a pre-Ampere caller hits).
+//! - **`FlashStatus::Cuda`** (a `cudaGetDevice`/`cudaDeviceGetAttribute`/
+//!   post-launch `cudaGetLastError` failure): needs an actual CUDA runtime
+//!   fault (OOM, driver reset, an invalid context) to trigger honestly;
+//!   nothing in this crate's control flow can force one without mocking
+//!   the CUDA runtime, which would test the mock, not the wrapper.
+//! - **`FlashStatus::SplitKernel`** (internal: `params.num_splits > 1`):
+//!   documented in the wrapper as unreachable by construction — `params =
+//!   {}` zero-initialises `num_splits` to `0`, and the split-KV kernel's
+//!   translation unit is not even linked into `libjammi_flash.a`. There is
+//!   no code path, mutated or otherwise, that sets it to `> 1`; a test
+//!   would have to hand-edit the C wrapper to fabricate one, which is not
+//!   testing this crate.
+//! - **`FlashError::UnknownStatus`** (a wrapper status code this Rust
+//!   build's `FlashStatus::from_code` does not recognise): unreachable
+//!   as long as the Rust `#[repr(i32)]` enum and the C header's status list
+//!   are kept in lock-step (`status_codes_round_trip_and_zero_is_ok`
+//!   exercises every KNOWN code both directions); would only fire if the
+//!   two drifted, which `check_abi`'s struct-size check does not itself
+//!   catch (a new status variant added to one side without the other is a
+//!   silent hole this crate does not currently guard against — flagged,
+//!   not fixed, this round).
+//! - **`stream == NULL`** (the header's documented "legacy default stream"
+//!   arm): legal per `flash_api_jammi.h`, but neither this module's safe
+//!   API nor the smoke test's `raw` calls ever pass a NULL stream — every
+//!   call site has a real `CudaStream` from `dev.cuda_stream()`. The arm
+//!   exists for a hypothetical caller of `raw` outside this crate; this
+//!   crate itself never exercises it.
 //!
 //! # Window semantics
 //!
@@ -82,9 +125,40 @@
 //! (`CudaDevice::cuda_stream`); the cudarc `SyncOnDrop` guards from
 //! `device_ptr`/`device_ptr_mut` record the read/write events so later
 //! candle ops on the same buffers order correctly. Nothing here reads
-//! device memory on the host: `total_q` and `max_seqlen` are host inputs
-//! ([`VarlenGeometry`]), derived by the caller from the same lengths that
-//! built `cu_seqlens`.
+//! device memory on the host: `total_q` and `max_seqlen` are host inputs,
+//! derived from the same lengths that build `cu_seqlens` — see
+//! `CuSeqlens` below.
+//!
+//! # `CuSeqlens`: the only way to reach a launch
+//!
+//! Every kernel launch in this module indexes memory using `total_q` and
+//! `max_seqlen` from the HOST while the actual row extents live in the
+//! DEVICE `cu_seqlens` array — the kernels themselves do not bounds-check
+//! `cu_seqlens` against them (upstream `flash_api.cpp:1103-1111`). If those
+//! two ever disagree (a `VarlenGeometry` claiming `total_q = 21` paired with
+//! a device array whose last entry is `4_000_000`), the launch reads/writes
+//! past the buffers it was given — an illegal memory access from safe Rust,
+//! not a panic or a `Result`, because it happens on the device after the
+//! host-side call already returned `Ok`.
+//!
+//! `CuSeqlens` makes that disagreement unrepresentable: it is the ONLY
+//! type that carries a device `cu_seqlens` array, and the only way to build
+//! one is `CuSeqlens::from_lengths`, which computes `total_q` and
+//! `max_seqlen` FROM the same host lengths that build the array — they are
+//! never independent inputs. `VarlenGeometry` (below) is consequently a
+//! private-field projection: the only way to obtain one is
+//! `CuSeqlens::geometry`, so a geometry can never describe a different
+//! array than the one it was derived from. Every public function that used
+//! to take a raw `cu_seqlens: CudaView<i32>` alongside a `&VarlenGeometry`
+//! now takes `&CuSeqlens` instead, closing the gap even for two
+//! independently-legitimate values (a geometry from one batch paired with
+//! the device array of another would have reintroduced the same
+//! disagreement).
+//!
+//! The one caller who legitimately owns a device `cu_seqlens` array already
+//! (none in this codebase today; a future producer of one) has
+//! `CuSeqlens::from_device_unchecked` — `unsafe`, with the exact contract
+//! spelled out on the function.
 
 use std::ffi::{c_void, CStr};
 
@@ -358,25 +432,42 @@ fn check_abi() -> Result<()> {
     }
 }
 
-/// The batch's shape, host-side. `total_q` and `max_seqlen` are derived
-/// by the caller from the same per-sequence lengths that built
-/// `cu_seqlens` — nothing here reads `cu_seqlens` back from the device.
+/// The batch's shape, host-side. Fields are PRIVATE: the only way to build
+/// one is [`CuSeqlens::geometry`], which derives `total_q` and `max_seqlen`
+/// from the very lengths that built the paired device `cu_seqlens` array —
+/// see the module doc's "`CuSeqlens`: the only way to reach a launch"
+/// section. A `VarlenGeometry` can therefore never disagree with the
+/// `CuSeqlens` it came from; it is a read-only projection, not an
+/// independent input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VarlenGeometry {
     /// Sum of the sequence lengths (`cu_seqlens[batch]`).
-    pub total_q: usize,
+    total_q: usize,
     /// Number of sequences (`cu_seqlens.len() - 1`).
-    pub batch: usize,
+    batch: usize,
     /// Attention heads (q, k and v share it — no GQA in this layout).
-    pub num_heads: usize,
-    /// The longest sequence in the batch. Sizes the kernel grid; a value
-    /// below the true maximum would leave that sequence's tail rows
-    /// unvisited, and cannot be checked without a device read — it is the
-    /// caller's contract.
-    pub max_seqlen: usize,
+    num_heads: usize,
+    /// The longest sequence in the batch. Sizes the kernel grid.
+    max_seqlen: usize,
 }
 
 impl VarlenGeometry {
+    /// Sum of the sequence lengths.
+    pub fn total_q(&self) -> usize {
+        self.total_q
+    }
+    /// Number of sequences.
+    pub fn batch(&self) -> usize {
+        self.batch
+    }
+    /// Attention heads.
+    pub fn num_heads(&self) -> usize {
+        self.num_heads
+    }
+    /// The longest sequence in the batch.
+    pub fn max_seqlen(&self) -> usize {
+        self.max_seqlen
+    }
     /// `total_q · 3 · H · 64`.
     pub fn qkv_len(&self) -> usize {
         self.total_q * 3 * self.num_heads * HEAD_DIM
@@ -407,8 +498,11 @@ impl VarlenGeometry {
         splits * self.rows_padded() * self.num_heads * HEAD_DIM
     }
 
-    /// The pure refusal cells of the lattice in the module doc.
-    pub fn validate(&self) -> Result<()> {
+    /// The pure refusal cells of the lattice in the module doc. Called by
+    /// [`CuSeqlens::geometry`] on every construction; not `pub` because a
+    /// `VarlenGeometry` cannot be built without it (there is no other path
+    /// to an unvalidated instance to call this on).
+    fn validate(&self) -> Result<()> {
         if self.total_q == 0 || self.batch == 0 || self.num_heads == 0 || self.max_seqlen == 0 {
             return Err(FlashError::Geometry(format!(
                 "every dimension must be > 0: {self:?}"
@@ -432,6 +526,174 @@ impl VarlenGeometry {
             )));
         }
         Ok(())
+    }
+}
+
+/// Host-only: builds the cumulative-sum array and validates it, without
+/// touching any device. Pure so the whole lattice (including the exact
+/// disagreement an adversarial audit demonstrated an illegal memory access
+/// with) is unit-tested here with no CUDA device required;
+/// [`CuSeqlens::from_lengths`] is this plus the upload.
+fn cu_seqlens_from_lengths(lengths: &[usize]) -> Result<(Vec<i32>, usize, usize, usize)> {
+    if lengths.is_empty() {
+        return Err(FlashError::Geometry(
+            "cu_seqlens: batch must be non-empty (at least one sequence length)".to_string(),
+        ));
+    }
+    let mut cu: Vec<i64> = Vec::with_capacity(lengths.len() + 1);
+    cu.push(0);
+    let mut max_seqlen: usize = 0;
+    for (i, &len) in lengths.iter().enumerate() {
+        // A zero-length sequence has no rows to attend from or to; the
+        // downstream kernel grid is sized per-sequence and has no
+        // representation for "this sequence contributes nothing" — refused
+        // rather than silently producing an empty (and un-attended-to)
+        // slice of the batch.
+        if len == 0 {
+            return Err(FlashError::Geometry(format!(
+                "cu_seqlens: sequence {i} has length 0 — every sequence must be non-empty"
+            )));
+        }
+        if len > i32::MAX as usize {
+            return Err(FlashError::Geometry(format!(
+                "cu_seqlens: sequence {i} length {len} exceeds i32::MAX"
+            )));
+        }
+        max_seqlen = max_seqlen.max(len);
+        // SAFETY-of-invariant note (not unsafe code): every `len` here is a
+        // `usize` (never negative) checked `> 0` above, so `cu` is built by
+        // repeated STRICT increase — it is non-decreasing (in fact strictly
+        // increasing) BY CONSTRUCTION. A non-monotone cumulative array is
+        // consequently unreachable through this function; see
+        // `cu_seqlens_is_strictly_increasing_by_construction` below and
+        // `CuSeqlens::from_device_unchecked`'s `# Safety` section, which is
+        // where a non-monotone array becomes representable again (and is
+        // exactly the misuse that contract forbids).
+        let prev = *cu.last().expect("cu always has at least one element");
+        let next = prev + len as i64;
+        cu.push(next);
+    }
+    let total_q_i64 = *cu.last().expect("cu always has at least one element");
+    if total_q_i64 > i32::MAX as i64 {
+        return Err(FlashError::Geometry(format!(
+            "cu_seqlens: total_q {total_q_i64} exceeds i32::MAX"
+        )));
+    }
+    let batch = lengths.len();
+    // batch <= total_q <= i32::MAX (every length >= 1), but check the
+    // element count (batch + 1) explicitly with the module's own i32 guard
+    // rather than relying on that inequality.
+    as_i32("batch", batch)?;
+    as_i32("cu_seqlens_len", batch + 1)?;
+    let cu_i32: Vec<i32> = cu.iter().map(|&v| v as i32).collect();
+    Ok((cu_i32, total_q_i64 as usize, batch, max_seqlen))
+}
+
+/// A validated, uploaded `cu_seqlens` array — the ONLY way any function in
+/// this module accepts one. See the module doc's "`CuSeqlens`: the only way
+/// to reach a launch" section for why: `total_q` and `max_seqlen` are
+/// derived FROM the lengths that build the device array, so a `CuSeqlens`
+/// can never claim extents its own array does not have.
+pub struct CuSeqlens {
+    cu: CudaSlice<i32>,
+    total_q: usize,
+    batch: usize,
+    max_seqlen: usize,
+}
+
+impl CuSeqlens {
+    /// Builds `cu_seqlens` from HOST sequence lengths: computes the prefix
+    /// sum, validates it (non-empty batch, every length `> 0` and `<=
+    /// i32::MAX`, `total_q <= i32::MAX`, the element-count guard the module
+    /// already uses elsewhere), uploads the `i32` array, and derives
+    /// `total_q`/`batch`/`max_seqlen` from the SAME lengths — they are never
+    /// independent inputs. This is the sanctioned entry point; Stage B's
+    /// encoder always has host lengths already (`BatchEncoding`), so this
+    /// costs the real caller nothing beyond one small H2D copy per forward.
+    pub fn from_lengths(lengths: &[usize], dev: &CudaDevice) -> Result<Self> {
+        let (cu_i32, total_q, batch, max_seqlen) = cu_seqlens_from_lengths(lengths)?;
+        bind(dev)?;
+        let cu = dev.clone_htod(&cu_i32)?;
+        Ok(Self {
+            cu,
+            total_q,
+            batch,
+            max_seqlen,
+        })
+    }
+
+    /// Builds a `CuSeqlens` from a device array the caller already owns,
+    /// WITHOUT validating it against the device contents (that would need a
+    /// synchronous device read, which this module never does).
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee, for the exact array `cu` points to on
+    /// `dev`'s stream:
+    ///
+    /// - `cu.len() == batch + 1`.
+    /// - Every element is a valid `i32` (no reinterpreted garbage).
+    /// - `cu[0] == 0`.
+    /// - `cu` is strictly non-decreasing: `cu[i] <= cu[i + 1]` for every `i`.
+    /// - `cu[batch] == total_q` EXACTLY.
+    /// - `max_seqlen >= cu[i + 1] - cu[i]` for every `i` (the true maximum
+    ///   sequence length in the batch; a value below it leaves that
+    ///   sequence's tail rows unvisited by the kernel grid — silently wrong,
+    ///   not a crash).
+    /// - `cu` is valid on the same device/stream every later call in this
+    ///   module is made with.
+    ///
+    /// Violating any of these is exactly the shape of the illegal memory
+    /// access an adversarial audit demonstrated against the pre-`CuSeqlens`
+    /// API (`total_q`/`batch`/`max_seqlen` claiming a small extent while the
+    /// device array's real last entry was far larger): the kernels index
+    /// `cu[0..batch]` using the HOST `total_q`/`max_seqlen` and never
+    /// bounds-check them against the array's actual contents.
+    pub unsafe fn from_device_unchecked(
+        cu: CudaSlice<i32>,
+        total_q: usize,
+        batch: usize,
+        max_seqlen: usize,
+    ) -> Self {
+        Self {
+            cu,
+            total_q,
+            batch,
+            max_seqlen,
+        }
+    }
+
+    /// Sum of the sequence lengths.
+    pub fn total_q(&self) -> usize {
+        self.total_q
+    }
+    /// Number of sequences.
+    pub fn batch(&self) -> usize {
+        self.batch
+    }
+    /// The longest sequence in the batch.
+    pub fn max_seqlen(&self) -> usize {
+        self.max_seqlen
+    }
+    /// A view of the uploaded `[batch + 1]` `i32` array.
+    pub fn as_view(&self) -> CudaView<'_, i32> {
+        self.cu.as_view()
+    }
+
+    /// The batch's [`VarlenGeometry`] for `num_heads` attention heads —
+    /// the ONLY way to construct one, so it can never disagree with `self`.
+    /// Validates the num_heads-dependent cells (the int32 offset budget for
+    /// `qkv`/`dq_accum`) that `from_lengths`/`from_device_unchecked` cannot
+    /// check without knowing the head count.
+    pub fn geometry(&self, num_heads: usize) -> Result<VarlenGeometry> {
+        let g = VarlenGeometry {
+            total_q: self.total_q,
+            batch: self.batch,
+            num_heads,
+            max_seqlen: self.max_seqlen,
+        };
+        g.validate()?;
+        Ok(g)
     }
 }
 
@@ -546,10 +808,13 @@ pub struct BwdScratch {
 }
 
 impl BwdScratch {
-    /// Allocates both buffers for `geom` on `dev`.
+    /// Allocates both buffers for `geom` on `dev`. `geom` (from
+    /// [`CuSeqlens::geometry`]) is already validated by construction; this
+    /// re-validates anyway (cheap, defense in depth for anyone who obtains
+    /// one and holds it across an unrelated mutation).
     pub fn alloc(dev: &CudaDevice, geom: &VarlenGeometry, deterministic: bool) -> Result<Self> {
         geom.validate()?;
-        let splits = dq_accum_splits(dev, geom.batch, geom.num_heads, deterministic)?;
+        let splits = dq_accum_splits(dev, geom.batch(), geom.num_heads(), deterministic)?;
         // SAFETY: uninitialised device memory that the kernel fully
         // overwrites before reading (compute_dot_do_o writes dP_sum for
         // every row of every block it visits).
@@ -571,19 +836,20 @@ impl BwdScratch {
 }
 
 /// Forward into caller-provided `o` / `lse` views (sizes checked exactly).
+/// `cu` is the ONLY source of `total_q`/`batch`/`max_seqlen` — see the
+/// module doc.
 pub fn flash_varlen_fwd_into(
     dev: &CudaDevice,
     qkv: CudaView<'_, bf16>,
-    cu_seqlens: CudaView<'_, i32>,
+    cu: &CuSeqlens,
     mut o: CudaViewMut<'_, bf16>,
     mut lse: CudaViewMut<'_, f32>,
-    geom: &VarlenGeometry,
+    num_heads: usize,
     cfg: &VarlenConfig,
 ) -> Result<()> {
-    geom.validate()?;
+    let geom = cu.geometry(num_heads)?;
     cfg.validate()?;
     check_len("qkv", qkv.len(), geom.qkv_len())?;
-    check_len("cu_seqlens", cu_seqlens.len(), geom.cu_seqlens_len())?;
     check_len("o", o.len(), geom.o_len())?;
     check_len("lse", lse.len(), geom.lse_len())?;
     let (window_size_left, window_size_right) = cfg.window_sizes()?;
@@ -591,6 +857,7 @@ pub fn flash_varlen_fwd_into(
     check_abi()?;
 
     let stream = dev.cuda_stream();
+    let cu_seqlens = cu.as_view();
     let (qkv_p, _g_qkv) = qkv.device_ptr(&stream);
     let (cu_p, _g_cu) = cu_seqlens.device_ptr(&stream);
     let (o_p, _g_o) = o.device_ptr_mut(&stream);
@@ -606,11 +873,11 @@ pub fn flash_varlen_fwd_into(
         softmax_lse_len: geom.lse_len() as i64,
         cu_seqlens_len: geom.cu_seqlens_len() as i64,
         struct_size: std::mem::size_of::<raw::FwdArgs>() as i32,
-        total_q: as_i32("total_q", geom.total_q)?,
-        batch: as_i32("batch", geom.batch)?,
-        num_heads: as_i32("num_heads", geom.num_heads)?,
+        total_q: as_i32("total_q", geom.total_q())?,
+        batch: as_i32("batch", geom.batch())?,
+        num_heads: as_i32("num_heads", geom.num_heads())?,
         head_dim: HEAD_DIM as i32,
-        max_seqlen: as_i32("max_seqlen", geom.max_seqlen)?,
+        max_seqlen: as_i32("max_seqlen", geom.max_seqlen())?,
         window_size_left,
         window_size_right,
         softmax_scale: cfg.softmax_scale,
@@ -627,11 +894,11 @@ pub fn flash_varlen_fwd_into(
 pub fn flash_varlen_fwd(
     dev: &CudaDevice,
     qkv: &CudaSlice<bf16>,
-    cu_seqlens: &CudaSlice<i32>,
-    geom: &VarlenGeometry,
+    cu: &CuSeqlens,
+    num_heads: usize,
     cfg: &VarlenConfig,
 ) -> Result<(CudaSlice<bf16>, CudaSlice<f32>)> {
-    geom.validate()?;
+    let geom = cu.geometry(num_heads)?;
     // SAFETY: uninitialised outputs the kernel fully overwrites (every
     // (row, head) of `o` and `lse` belongs to exactly one launched block).
     let mut o = unsafe { dev.alloc::<bf16>(geom.o_len()) }?;
@@ -639,42 +906,48 @@ pub fn flash_varlen_fwd(
     flash_varlen_fwd_into(
         dev,
         qkv.as_view(),
-        cu_seqlens.as_view(),
+        cu,
         o.as_view_mut(),
         lse.as_view_mut(),
-        geom,
+        num_heads,
         cfg,
     )?;
     Ok((o, lse))
 }
 
-/// The backward's buffers, as views (see the module-doc table).
+/// The backward's buffers, as views (see the module-doc table). `cu_seqlens`
+/// is NOT a field here: it is a separate `&CuSeqlens` parameter to
+/// [`flash_varlen_bwd_into`] so it can never be paired with a geometry
+/// derived from a different array.
 pub struct BwdBuffers<'a> {
     pub qkv: CudaView<'a, bf16>,
-    pub cu_seqlens: CudaView<'a, i32>,
     pub o: CudaView<'a, bf16>,
     pub lse: CudaView<'a, f32>,
     pub d_o: CudaView<'a, bf16>,
     pub d_qkv: CudaViewMut<'a, bf16>,
     pub softmax_d: CudaViewMut<'a, f32>,
-    /// Must be all-zero when `cfg.deterministic`.
+    /// Must be all-zero when `cfg.deterministic` (F4); [`flash_varlen_bwd_into`]
+    /// zeroes it itself when that holds, so callers do not need to (and a
+    /// caller who reuses a poisoned buffer cannot silently produce a wrong
+    /// `dQ`).
     pub dq_accum: CudaViewMut<'a, f32>,
     /// The split count `dq_accum` was sized with ([`dq_accum_splits`]).
     pub dq_accum_splits: usize,
 }
 
-/// Backward into caller-provided buffers (sizes checked exactly).
+/// Backward into caller-provided buffers (sizes checked exactly). `cu` is
+/// the ONLY source of `total_q`/`batch`/`max_seqlen`.
 pub fn flash_varlen_bwd_into(
     dev: &CudaDevice,
+    cu: &CuSeqlens,
+    num_heads: usize,
     bufs: BwdBuffers<'_>,
-    geom: &VarlenGeometry,
     cfg: &VarlenConfig,
 ) -> Result<()> {
-    geom.validate()?;
+    let geom = cu.geometry(num_heads)?;
     cfg.validate()?;
     let BwdBuffers {
         qkv,
-        cu_seqlens,
         o,
         lse,
         d_o,
@@ -684,13 +957,12 @@ pub fn flash_varlen_bwd_into(
         dq_accum_splits: splits,
     } = bufs;
     check_len("qkv", qkv.len(), geom.qkv_len())?;
-    check_len("cu_seqlens", cu_seqlens.len(), geom.cu_seqlens_len())?;
     check_len("o", o.len(), geom.o_len())?;
     check_len("lse", lse.len(), geom.lse_len())?;
     check_len("d_o", d_o.len(), geom.o_len())?;
     check_len("d_qkv", d_qkv.len(), geom.qkv_len())?;
     check_len("softmax_d", softmax_d.len(), geom.softmax_d_len())?;
-    let expected_splits = dq_accum_splits(dev, geom.batch, geom.num_heads, cfg.deterministic)?;
+    let expected_splits = dq_accum_splits(dev, geom.batch(), geom.num_heads(), cfg.deterministic)?;
     if splits != expected_splits {
         return Err(FlashError::Geometry(format!(
             "dq_accum was sized for {splits} split(s) but this device/config uses {expected_splits}"
@@ -702,6 +974,23 @@ pub fn flash_varlen_bwd_into(
     check_abi()?;
 
     let stream = dev.cuda_stream();
+    // F4: `dq_accum` MUST be all-zero on entry when `cfg.deterministic`
+    // (the deterministic launch selects `Clear_dQaccum=false` and
+    // accumulates into whatever is already there,
+    // `flash_bwd_launch_template.h:84-88`) — a caller that violates this
+    // gets a silently WRONG `dQ`, not an error. `BwdScratch::alloc` already
+    // zeroes it, but `BwdBuffers` is a public struct any caller can fill
+    // with a reused/poisoned view, so this function re-zeroes it itself
+    // rather than trusting the caller: one `cudaMemsetAsync` of
+    // `dq_accum.num_bytes()` (a few MB at production geometry, e.g. ~63 MB
+    // at B=24,S=512 per the module doc's memory line — already paid once by
+    // `BwdScratch::alloc`'s own zeroing, so a `BwdScratch`-backed caller
+    // pays it twice; the alternative, trusting the caller, was the
+    // silently-wrong-gradient failure mode this closes).
+    if cfg.deterministic {
+        stream.memset_zeros(&mut dq_accum)?;
+    }
+    let cu_seqlens = cu.as_view();
     let (qkv_p, _g_qkv) = qkv.device_ptr(&stream);
     let (cu_p, _g_cu) = cu_seqlens.device_ptr(&stream);
     let (o_p, _g_o) = o.device_ptr(&stream);
@@ -729,11 +1018,11 @@ pub fn flash_varlen_bwd_into(
         dq_accum_len: geom.dq_accum_len(splits) as i64,
         cu_seqlens_len: geom.cu_seqlens_len() as i64,
         struct_size: std::mem::size_of::<raw::BwdArgs>() as i32,
-        total_q: as_i32("total_q", geom.total_q)?,
-        batch: as_i32("batch", geom.batch)?,
-        num_heads: as_i32("num_heads", geom.num_heads)?,
+        total_q: as_i32("total_q", geom.total_q())?,
+        batch: as_i32("batch", geom.batch())?,
+        num_heads: as_i32("num_heads", geom.num_heads())?,
         head_dim: HEAD_DIM as i32,
-        max_seqlen: as_i32("max_seqlen", geom.max_seqlen)?,
+        max_seqlen: as_i32("max_seqlen", geom.max_seqlen())?,
         window_size_left,
         window_size_right,
         softmax_scale: cfg.softmax_scale,
@@ -758,23 +1047,24 @@ pub fn flash_varlen_bwd_into(
 pub fn flash_varlen_bwd(
     dev: &CudaDevice,
     qkv: &CudaSlice<bf16>,
-    cu_seqlens: &CudaSlice<i32>,
+    cu: &CuSeqlens,
+    num_heads: usize,
     o: &CudaSlice<bf16>,
     lse: &CudaSlice<f32>,
     d_o: &CudaSlice<bf16>,
-    geom: &VarlenGeometry,
     cfg: &VarlenConfig,
 ) -> Result<CudaSlice<bf16>> {
-    geom.validate()?;
-    let mut scratch = BwdScratch::alloc(dev, geom, cfg.deterministic)?;
+    let geom = cu.geometry(num_heads)?;
+    let mut scratch = BwdScratch::alloc(dev, &geom, cfg.deterministic)?;
     // SAFETY: uninitialised output the kernel fully overwrites (dq via
     // convert_dQ over every row block, dk/dv over every key block).
     let mut d_qkv = unsafe { dev.alloc::<bf16>(geom.qkv_len()) }?;
     flash_varlen_bwd_into(
         dev,
+        cu,
+        num_heads,
         BwdBuffers {
             qkv: qkv.as_view(),
-            cu_seqlens: cu_seqlens.as_view(),
             o: o.as_view(),
             lse: lse.as_view(),
             d_o: d_o.as_view(),
@@ -783,7 +1073,6 @@ pub fn flash_varlen_bwd(
             dq_accum: scratch.dq_accum.as_view_mut(),
             dq_accum_splits: scratch.splits,
         },
-        geom,
         cfg,
     )?;
     Ok(d_qkv)
@@ -815,6 +1104,155 @@ mod tests {
         assert_eq!(g.dq_accum_len(1), (21 + 384) * 2 * 64);
         assert_eq!(g.dq_accum_len(4), 4 * (21 + 384) * 2 * 64);
         assert!(g.validate().is_ok());
+    }
+
+    // -----------------------------------------------------------------
+    // `CuSeqlens` / `cu_seqlens_from_lengths` — the F1 fix. All pure (no
+    // device): `cu_seqlens_from_lengths` is `CuSeqlens::from_lengths` minus
+    // the upload, so the whole host-side lattice is testable here; the
+    // device-touching half is exercised by `flash_smoke.rs` on the pod.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn cu_seqlens_derives_total_q_and_max_seqlen_from_a_hand_computed_prefix_sum() {
+        // Hand-computed: lengths [5, 9, 7] -> cu = [0, 5, 14, 21].
+        let (cu, total_q, batch, max_seqlen) = cu_seqlens_from_lengths(&[5, 9, 7]).unwrap();
+        assert_eq!(cu, vec![0, 5, 14, 21]);
+        assert_eq!(total_q, 21);
+        assert_eq!(batch, 3);
+        assert_eq!(max_seqlen, 9);
+        // A second fixture with a different max position (first, not middle).
+        let (cu, total_q, batch, max_seqlen) = cu_seqlens_from_lengths(&[100, 1, 2, 3]).unwrap();
+        assert_eq!(cu, vec![0, 100, 101, 103, 106]);
+        assert_eq!(total_q, 106);
+        assert_eq!(batch, 4);
+        assert_eq!(max_seqlen, 100);
+        // Singleton batch: total_q == max_seqlen == the one length.
+        let (cu, total_q, batch, max_seqlen) = cu_seqlens_from_lengths(&[42]).unwrap();
+        assert_eq!(cu, vec![0, 42]);
+        assert_eq!(total_q, 42);
+        assert_eq!(batch, 1);
+        assert_eq!(max_seqlen, 42);
+    }
+
+    /// THE AUDITOR'S DEMONSTRATION: pre-fix, `VarlenGeometry { total_q: 21,
+    /// batch: 3, max_seqlen: 9 }` could be paired with a device
+    /// `cu_seqlens = [0, 5, 14, 4_000_000]` — a host claim of 21/9 attached
+    /// to an array whose real extent was 4,000,000 rows, producing
+    /// `CUDA_ERROR_ILLEGAL_ADDRESS` on sync. `cu_seqlens_from_lengths` (and
+    /// therefore `CuSeqlens::from_lengths`, its device-touching wrapper) can
+    /// only produce that EXACT array from lengths `[5, 9, 3_999_986]` — and
+    /// derives `total_q = 4_000_000`, `max_seqlen = 3_999_986` from it, NEVER
+    /// the auditor's (21, 9). The mismatched pair is unrepresentable through
+    /// the safe API: there is no longer a code path where a caller supplies
+    /// `total_q`/`max_seqlen` independently of the array that produces them.
+    #[test]
+    fn auditor_demonstration_geometry_is_now_unrepresentable() {
+        let lengths = [5usize, 9, 3_999_986];
+        let (cu, total_q, batch, max_seqlen) = cu_seqlens_from_lengths(&lengths).unwrap();
+        assert_eq!(cu, vec![0, 5, 14, 4_000_000]);
+        assert_eq!(batch, 3);
+        assert_eq!(
+            total_q, 4_000_000,
+            "derived total_q must be the array's real extent, not the auditor's claimed 21"
+        );
+        assert_eq!(
+            max_seqlen, 3_999_986,
+            "derived max_seqlen must be the array's real longest sequence, not the auditor's claimed 9"
+        );
+        assert_ne!(
+            (total_q, max_seqlen),
+            (21, 9),
+            "the auditor's mismatched (total_q, max_seqlen) claim must never come out of this function"
+        );
+    }
+
+    #[test]
+    fn cu_seqlens_refuses_empty_batch() {
+        let e = cu_seqlens_from_lengths(&[]).unwrap_err();
+        assert!(matches!(e, FlashError::Geometry(_)), "{e}");
+        assert!(e.to_string().contains("non-empty"), "{e}");
+    }
+
+    #[test]
+    fn cu_seqlens_refuses_zero_length_sequence() {
+        // One cell per position: first, middle, last, and the singleton case.
+        for lengths in [
+            &[0usize, 5, 7][..],
+            &[5, 0, 7][..],
+            &[5, 7, 0][..],
+            &[0][..],
+        ] {
+            let e = cu_seqlens_from_lengths(lengths).unwrap_err();
+            assert!(matches!(e, FlashError::Geometry(_)), "{lengths:?}: {e}");
+            assert!(e.to_string().contains("length 0"), "{lengths:?}: {e}");
+        }
+    }
+
+    #[test]
+    fn cu_seqlens_refuses_per_sequence_length_overflow() {
+        let lengths = [5usize, i32::MAX as usize + 1, 7];
+        let e = cu_seqlens_from_lengths(&lengths).unwrap_err();
+        assert!(matches!(e, FlashError::Geometry(_)), "{e}");
+        assert!(e.to_string().contains("exceeds i32::MAX"), "{e}");
+        // The boundary itself (a single sequence of exactly i32::MAX) is
+        // legal on its own (batch of one).
+        assert!(cu_seqlens_from_lengths(&[i32::MAX as usize]).is_ok());
+    }
+
+    #[test]
+    fn cu_seqlens_refuses_total_q_overflow() {
+        // Each length individually fits i32::MAX, but the SUM does not.
+        let half = i32::MAX as usize / 2 + 1;
+        let lengths = [half, half];
+        assert!(half <= i32::MAX as usize, "each length fits alone");
+        let e = cu_seqlens_from_lengths(&lengths).unwrap_err();
+        assert!(matches!(e, FlashError::Geometry(_)), "{e}");
+        assert!(e.to_string().contains("total_q"), "{e}");
+        assert!(e.to_string().contains("exceeds i32::MAX"), "{e}");
+    }
+
+    /// A non-monotone cumulative array is UNREACHABLE from
+    /// `cu_seqlens_from_lengths`: every `length` is a `usize` (never
+    /// negative) and is checked `> 0` before being added, so each partial
+    /// sum is STRICTLY greater than the last — by construction, not by a
+    /// runtime check. This is exactly the class of misuse
+    /// `CuSeqlens::from_device_unchecked`'s `# Safety` section forbids for a
+    /// caller-supplied array (its contract requires "strictly
+    /// non-decreasing"): the safe constructor never needs to check it
+    /// because it cannot produce anything else.
+    #[test]
+    fn cu_seqlens_is_strictly_increasing_by_construction() {
+        for lengths in [
+            &[5usize, 9, 7][..],
+            &[1, 1, 1, 1][..],
+            &[1000, 1, 1][..],
+            &[7][..],
+        ] {
+            let (cu, ..) = cu_seqlens_from_lengths(lengths).unwrap();
+            assert!(
+                cu.windows(2).all(|w| w[0] < w[1]),
+                "{lengths:?}: cu = {cu:?} is not strictly increasing"
+            );
+            assert_eq!(cu[0], 0, "{lengths:?}: cu[0] must be 0");
+        }
+    }
+
+    /// A length mismatch — the derived `VarlenGeometry`/uploaded array
+    /// disagreeing on element count — is likewise unreachable here: the
+    /// device array `CuSeqlens::from_lengths` uploads is built from exactly
+    /// this function's `cu` (length `lengths.len() + 1`), and
+    /// `VarlenGeometry::cu_seqlens_len` (`batch + 1`) uses the SAME `batch`
+    /// this function returns (`lengths.len()`) — the two can never drift
+    /// apart because they are computed from the same host input in the same
+    /// call.
+    #[test]
+    fn cu_seqlens_array_length_matches_geometrys_batch_plus_one_by_construction() {
+        for lengths in [&[5usize, 9, 7][..], &[1][..], &[2, 2, 2, 2, 2][..]] {
+            let (cu, _total_q, batch, _max_seqlen) = cu_seqlens_from_lengths(lengths).unwrap();
+            assert_eq!(cu.len(), batch + 1);
+            assert_eq!(batch, lengths.len());
+        }
     }
 
     #[test]

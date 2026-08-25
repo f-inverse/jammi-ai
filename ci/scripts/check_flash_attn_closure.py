@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Assert no consumer's feature closure reaches `jammi-kernels/flash-attn`.
+"""Assert no workspace member's feature closure reaches
+`jammi-kernels/flash-attn` except through the feature itself.
 
 `jammi-kernels`'s `flash-attn` feature builds the vendored FlashAttention-2
 kernels (CUTLASS submodule + a minute of `nvcc` + a static archive). It
@@ -12,23 +13,32 @@ does and proves the property mechanically.
 Method (hermetic: `cargo metadata --no-deps`, no network, no build):
 
   1. Load every workspace package's `[features]` table and dependency list.
-  2. For each ROOT selection — `default`, the release lane's
-     `cuda,jetstream-broker,storage-cloud`, and `--all-features` (the
-     superset) — activate the root and propagate to a fixpoint using the
-     resolver-v2 rules for workspace members: a plain `feat` enables it on
-     the same package; `dep:name` activates an optional dependency (with its
-     declared `features` and, unless `default-features = false`, `default`);
-     `name/feat` activates `name` and enables `feat` on it; `name?/feat`
-     enables `feat` on `name` only if `name` is already active. Non-optional
-     normal/build dependencies of an active package are active. Dev
-     dependencies are ignored (they are not part of a binary's closure).
-     Non-workspace packages are opaque (they cannot enable a workspace
-     member's feature).
-  3. FAIL if `flash-attn` is enabled on `jammi-kernels` under any selection.
-     Also FAIL the positive control if the `cuda` selection does NOT enable
-     `jammi-kernels/cuda` — that proves the walk actually traverses the
-     server → ai → encoders/lora → kernels chain rather than trivially
-     seeing an empty set.
+  2. For `jammi-server` specifically (`ROOT`) — the package
+     `release-binaries.yml` actually builds — check three selections:
+     `default`, the release lane's `cuda,jetstream-broker,storage-cloud`,
+     and `jammi-server --all-features`.
+  3. WIDEN beyond `jammi-server`: for EVERY OTHER workspace member (a leak
+     through `jammi-bench` or `jammi-python`, both of which reach
+     `jammi-ai` → ... → `jammi-kernels` transitively, would not be visible
+     from `jammi-server`'s closure alone), check THAT member's own
+     `--all-features` selection. `jammi-kernels` itself is excluded from
+     this loop — asking "does building jammi-kernels with all its own
+     features enable jammi-kernels/flash-attn" is vacuously true and not
+     the property this script guards (a crate is not its own consumer).
+  4. Propagation uses the resolver-v2 rules for workspace members: a plain
+     `feat` enables it on the same package; `dep:name` activates an
+     optional dependency (with its declared `features` and, unless
+     `default-features = false`, `default`); `name/feat` activates `name`
+     and enables `feat` on it; `name?/feat` enables `feat` on `name` only if
+     `name` is already active. Non-optional normal/build dependencies of an
+     active package are active. Dev dependencies are ignored (they are not
+     part of a binary's closure). Non-workspace packages are opaque (they
+     cannot enable a workspace member's feature).
+  5. FAIL if `flash-attn` is enabled on `jammi-kernels` under any selection
+     in steps 2 or 3. Also FAIL the positive control if `jammi-server`'s
+     cuda-lane selection does NOT enable `jammi-kernels/cuda` — that proves
+     the walk actually traverses the server → ai → encoders/lora → kernels
+     chain rather than trivially seeing an empty set.
 
 `--self-test` runs the walker over synthetic metadata: a leaked edge
 (`ai: cuda = ["jammi-kernels/flash-attn"]`), a weak-dep edge, and a clean
@@ -210,6 +220,26 @@ def verdict(graph: Graph, verbose: bool = True) -> int:
                     file=sys.stderr,
                 )
             rc = 1
+
+    # Widen beyond ROOT: every OTHER workspace member's OWN --all-features
+    # selection (jammi-kernels itself excluded — see the module docstring).
+    for pkg in sorted(graph.pkgs):
+        if pkg in (ROOT, TARGET_PKG):
+            continue
+        deferred.clear()
+        enabled = graph.closure(pkg, graph.all_features(pkg))
+        kernels = sorted(enabled.get(TARGET_PKG, set()))
+        if verbose:
+            print(f"{pkg} [--all-features] -> {TARGET_PKG} features: {kernels}")
+        if FORBIDDEN_FEATURE in kernels:
+            if verbose:
+                print(
+                    f"FAIL: {pkg} [--all-features] reaches {TARGET_PKG}/{FORBIDDEN_FEATURE} — "
+                    f"a workspace member other than {ROOT} would compile the vendored "
+                    f"FlashAttention-2 kernels",
+                    file=sys.stderr,
+                )
+            rc = 1
     return rc
 
 
@@ -263,14 +293,32 @@ def self_test() -> int:
     # Broken chain: the positive control must trip.
     g = Graph(_synthetic([]))
     assert verdict(g, verbose=False) == 1, "unreached control must fail"
-    # Weak dep edge `dep?/feat` does not activate an inactive optional dep.
+    # Weak dep edge `dep?/feat` does not activate an inactive optional dep —
+    # checked against ROOT's OWN selections directly (`closure`, not
+    # `verdict`): `verdict` ALSO runs the widened per-member loop below, and
+    # jammi-ai's OWN `--all-features` DOES activate "extra" (the pseudo-
+    # feature every optional dependency gets) as part of that selection,
+    # which correctly fires the weak edge — that is the NEXT assertion.
     meta = _synthetic(["jammi-kernels/cuda"])
     meta["packages"][1]["features"]["cuda"] = ["jammi-kernels/cuda", "extra?/flash-attn"]
     meta["packages"][1]["dependencies"].append(
         {"name": "jammi-kernels", "rename": "extra", "optional": True, "uses_default_features": True, "features": []}
     )
     g = Graph(meta)
-    assert verdict(g, verbose=False) == 0, "weak edge on an inactive optional dep must not leak"
+    deferred.clear()
+    enabled = g.closure(ROOT, CUDA_LANE)
+    assert FORBIDDEN_FEATURE not in enabled.get(TARGET_PKG, set()), (
+        "weak edge on an inactive optional dep must not leak from ROOT's own cuda-lane selection"
+    )
+    # The WIDENED per-member loop (F6) catches what ROOT's own selections
+    # cannot see: `jammi-ai --all-features` activates "extra" directly,
+    # which makes `extra?/flash-attn` fire — a genuine leak under
+    # `cargo build -p jammi-ai --all-features` that a jammi-server-only
+    # closure walk would miss entirely.
+    assert verdict(g, verbose=False) == 1, (
+        "the widened per-member --all-features loop must catch the leak "
+        "jammi-server's own selections cannot see"
+    )
     print("self-test: ok")
     return 0
 

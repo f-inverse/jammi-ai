@@ -129,14 +129,25 @@ fn build_cuda() {
 /// `&'static str` — it cannot express this flag group. The existing PTX
 /// path above is untouched.
 ///
-/// FLAG GROUP — exactly upstream `setup.py`'s nvcc group for sm80 as
-/// measured in the build spike (`third_party/flash-attention/VENDORED.md`):
+/// FLAG GROUP — upstream `setup.py`'s nvcc group for sm80, WITH ONE
+/// DELIBERATE OMISSION (see below), as measured in the build spike
+/// (`third_party/flash-attention/VENDORED.md`):
 ///
 /// - `-O3 -std=c++17`
-/// - `-gencode arch=compute_80,code=sm_80 -gencode arch=compute_80,code=compute_80`
-///   (sm_80 cubin AND compute_80 PTX, so 8.6 / 8.9 / 9.0 devices JIT the
-///   PTX; the bwd tile config is chosen at runtime from the device's
-///   opt-in shared-memory limit, `flash_bwd_launch_template.h:160-191`).
+/// - `-gencode arch=compute_80,code=sm_80` (sm_80 cubin ONLY — upstream
+///   `setup.py` appends only `code=sm_80` for this arch too; an earlier
+///   revision of this file ALSO appended `code=compute_80` (embedded PTX),
+///   which is NOT in upstream's group and was never validated: shipping
+///   that PTX would mean an 8.6/8.9/9.0 device JITs it at RUNTIME and takes
+///   a DIFFERENT `Flash_bwd_kernel_traits` branch (the 64×128 config,
+///   `flash_bwd_launch_template.h:178-190`, vs the 128×128 this crate's
+///   smoke test actually exercises on the A100) — a second shipped code
+///   path with zero oracles. Dropped rather than validated because no jammi
+///   deployment target has been identified that needs a non-sm80 GPU; if
+///   one is, the PTX gencode returns WITH its own oracle run on that arch,
+///   not silently. Every jammi deployment target for this feature is sm80
+///   (A100) until stated otherwise — see `VENDORED.md`'s "Supported archs"
+///   note.
 /// - `--expt-relaxed-constexpr --expt-extended-lambda`
 /// - `--use_fast_math` — THE ONE-TU DIVERGENCE from this crate's
 ///   no-fast-math rule (`build_cuda` above pins it off for `src/cuda/*.cu`).
@@ -220,8 +231,6 @@ fn build_flash_attn() {
         "-std=c++17",
         "-gencode",
         "arch=compute_80,code=sm_80",
-        "-gencode",
-        "arch=compute_80,code=compute_80",
         "--expt-relaxed-constexpr",
         "--expt-extended-lambda",
         "--use_fast_math",
@@ -396,9 +405,19 @@ fn build_flash_attn() {
             }
         }
         roots.push(PathBuf::from("/usr/local/cuda"));
+        // F6: the previous predicate was `p.join("libcudart.so").is_file()
+        // || p.is_dir()` — since a candidate `lib64` directory almost
+        // always exists once CUDA is installed at all, `p.is_dir()` wins
+        // for the FIRST candidate root regardless of whether `libcudart.so`
+        // is actually in it, making the specific library check inert (a
+        // `lib64` with every OTHER `.so` but not `libcudart.so` would still
+        // "find" a match). The predicate this function's name promises is
+        // "the directory that HAS libcudart.so" — check only that; a
+        // directory existing without the library is not a match, it falls
+        // through to the next candidate root.
         roots
             .into_iter()
             .map(|r| r.join("lib64"))
-            .find(|p| p.join("libcudart.so").is_file() || p.is_dir())
+            .find(|p| p.join("libcudart.so").is_file())
     }
 }

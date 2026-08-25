@@ -16,8 +16,11 @@
 //! max_norm / (total_norm + 1e-6)`, clamps it to at most `1.0`, and multiplies
 //! every gradient by the clamped coefficient **unconditionally** — its comment
 //! is explicit that this "avoids a `if clip_coef < 1:` conditional which can
-//! require a CPU <=> device synchronization" (ref-077,
-//! `torch/nn/utils/clip_grad.py`). [`clip_gradients`] now does the same: the
+//! require a CPU <=> device synchronization" (`torch/nn/utils/clip_grad.py`,
+//! `_clip_grads_with_norm_`, called from `clip_grad_norm_`; pinned to
+//! `torch==2.13.0`, the version this repo's own PyTorch reference harness
+//! targets — see `crates/jammi-bench/reference/README.md`). [`clip_gradients`]
+//! now does the same: the
 //! whole computation — per-`Var` squared sums, the global-norm reduction,
 //! `sqrt`, the `max_norm / (total_norm + eps)` coefficient, its `<= 1.0`
 //! clamp, and every gradient's rescale — stays on the device as one tensor
@@ -62,26 +65,40 @@ pub(crate) fn sync_read_count() -> u64 {
 /// reduction order — and therefore the bits — is deterministic run to run).
 /// Every gradient is then rescaled by `clip_coef = (max_norm / (total_norm +
 /// 1e-6)).min(1.0)` **unconditionally**, matching torch's own avoidance of a
-/// host-syncing `if total_norm > max_norm` branch (ref-077).
+/// host-syncing `if total_norm > max_norm` branch (`torch/nn/utils/
+/// clip_grad.py`, `_clip_grads_with_norm_`; see the module doc's citation).
 ///
-/// **Exact bit-identity predicate.** `clip_coef` clamps to EXACTLY `1.0` —
-/// making the rescale bit-identical to skipping it entirely, since `x * 1.0 ==
-/// x` for every finite `x` — iff `max_norm / (total_norm + 1e-6) >= 1.0`,
-/// i.e. iff `total_norm <= max_norm - 1e-6`. That predicate is **not**
-/// `total_norm <= max_norm`: on the half-open band `total_norm ∈ (max_norm -
-/// 1e-6, max_norm]`, `clip_coef` is strictly less than `1.0` (torch's own
-/// `1e-6` epsilon in the denominator puts it there — the same epsilon ref-077
-/// uses, so this is torch's documented behavior, not a divergence from it) and
-/// the rescale perturbs every element. Concretely: 4 gradients of `0.5` each
-/// give `total_norm == max_norm == 1.0`, which sits inside that band —
-/// `clip_coef ≈ 0.9999990463256836` scales each `0.5` down to
-/// `≈ 0.49999952316284180`, NOT bit-identical to the unclipped `0.5`. See
-/// `tests::at_max_norm_boundary_coef_is_not_bit_identical_to_no_clip` for that
-/// pinned closed-form value, and
+/// **Bit-identity guarantee — ONE DIRECTION ONLY.** Real-number algebra says
+/// `clip_coef` clamps to EXACTLY `1.0` — making the rescale bit-identical to
+/// skipping it entirely, since `x * 1.0 == x` for every finite `x` — exactly
+/// when `max_norm / (total_norm + 1e-6) >= 1.0`, i.e. when `total_norm <=
+/// max_norm - 1e-6`. In `f32`, only the FORWARD implication is true:
+/// `total_norm <= max_norm - 1e-6` (with enough margin that `f32` rounding of
+/// `total_norm + 1e-6` cannot push the ratio back above `1.0`) DOES guarantee
+/// `clip_coef == 1.0` exactly. The CONVERSE — `clip_coef == 1.0` implies
+/// `total_norm <= max_norm - 1e-6` — is **FALSE** in `f32`: `total_norm =
+/// 0.999999046` (`max_norm = 1.0`) is strictly GREATER than `max_norm - 1e-6
+/// = 0.999999` in real-number terms, yet `total_norm + 1e-6` rounds to
+/// exactly `1.0` in `f32` (the true sum, `1.000000046`, is within half a
+/// `f32` ULP of `1.0` at that magnitude), so `clip_coef` still comes out
+/// EXACTLY `1.0` — a counterexample to the converse, not an edge case this
+/// doc can wave away. Do not read "clip_coef == 1.0" as a certificate that
+/// `total_norm` was safely below the threshold; it only certifies the
+/// rescale was a no-op THIS time.
+///
+/// Separately from that boundary: on the half-open band `total_norm ∈
+/// (max_norm - 1e-6, max_norm]`, `clip_coef` is generally strictly less than
+/// `1.0` (torch's own `1e-6` epsilon in the denominator puts it there) and the
+/// rescale perturbs every element. Concretely: 4 gradients of `0.5` each give
+/// `total_norm == max_norm == 1.0`, which sits inside that band — `clip_coef
+/// == 0.9999990463256836` (`f32` bits `0x3f7ffff0`) scales each `0.5` down to
+/// exactly `0.49999952316284180`, NOT bit-identical to the unclipped `0.5`.
+/// See `tests::at_max_norm_boundary_coef_is_not_bit_identical_to_no_clip` for
+/// that pinned exact-bits value, and
 /// `tests::below_max_norm_clip_is_bit_identical_to_no_clip` for a `total_norm`
-/// safely inside the `<= max_norm - 1e-6` region, where the guarantee does
-/// hold. `max_norm <= 0.0` disables clipping entirely (unchanged from before
-/// — no compute is issued, and this is the ONE remaining place
+/// safely inside the `<= max_norm - 1e-6` region, where the forward guarantee
+/// does hold. `max_norm <= 0.0` disables clipping entirely (unchanged from
+/// before — no compute is issued, and this is the ONE remaining place
 /// `clip_gradients` returns `None`).
 ///
 /// Returns the on-device `total_norm` scalar tensor (`None` when clipping was
@@ -101,6 +118,31 @@ pub fn clip_gradients(
     grads: &mut GradStore,
     max_norm: f64,
 ) -> Result<Option<Tensor>> {
+    // Domain-validity at the edge (family D): `max_norm.is_nan()` makes
+    // `max_norm <= 0.0` below `false` (NaN compares false against
+    // everything), so a NaN `max_norm` would otherwise fall THROUGH the
+    // disable-clipping guard and into the clip computation, where
+    // `clip_coef = max_norm / (total_norm + eps)` is NaN unconditionally —
+    // every gradient silently scaled by NaN, forever, on every step. Worse:
+    // `total_norm` itself (the value [`refuse_nonfinite_norm`] later checks)
+    // is computed from the GRADIENTS, not from `max_norm`, so it stays
+    // perfectly finite even while the coefficient corrupts every parameter —
+    // the existing non-finite-norm check cannot see this class of bug at
+    // all. `max_norm = ±inf` has the same defect in kind even though its
+    // arithmetic happens to clamp back to a merely-wasteful (not corrupting)
+    // `coef == 1.0`: it is still a caller passing a non-finite tuning
+    // parameter into a numeric contract that promises finite behavior, and a
+    // typed refusal here is cheap (checked once per call, off the per-`Var`
+    // loop) versus silently accepting it. Refuse both up front, at this
+    // function's own boundary — the abstraction `clip_and_step`/`optimizer_
+    // step`/every training loop shares — rather than trusting every future
+    // caller (or `FineTuneConfig`'s deserialization, which does not validate
+    // this field's finiteness) to pre-filter it.
+    if !max_norm.is_finite() {
+        return Err(JammiError::FineTune(format!(
+            "GradClip: max_norm must be finite, got {max_norm}"
+        )));
+    }
     if max_norm <= 0.0 {
         return Ok(None);
     }
@@ -126,7 +168,7 @@ pub fn clip_gradients(
             total_sq = Some(match total_sq {
                 None => sq,
                 Some(acc) => {
-                    (&acc + &sq).map_err(|e| JammiError::FineTune(format!("GradClip acc: {e}")))?
+                    (&acc * /* ~ changed by cargo-mutants ~ */ &sq).map_err(|e| JammiError::FineTune(format!("GradClip acc: {e}")))?
                 }
             });
         }
@@ -143,7 +185,8 @@ pub fn clip_gradients(
         .map_err(|e| JammiError::FineTune(format!("GradClip sqrt: {e}")))?;
 
     // clip_coef = max_norm / (total_norm + 1e-6), clamped to at most 1.0 —
-    // torch's exact order and epsilon (ref-077). `affine`/`recip` bake their
+    // torch's exact order and epsilon (`torch/nn/utils/clip_grad.py`, see the
+    // module doc's citation). `affine`/`recip` bake their
     // constants as kernel-launch scalars (no tensor upload); only `minimum`'s
     // `1.0` is materialized as a tensor — one small H2D upload per call. That
     // upload is NOT cached: nothing in this crate holds candle's
@@ -356,9 +399,15 @@ mod tests {
         // predicate is `total_norm <= max_norm - 1e-6`, not the naive (and
         // FALSE) `total_norm <= max_norm` reading. Closed form pinned by hand
         // in f32: total_norm + 1e-6 = 1.0000009536743164, recip =
-        // 0.9999990463256836, * max_norm (1.0) = same, min(1.0) = same
-        // (already < 1.0) → clip_coef = 0.9999990463256836; 0.5 * clip_coef =
-        // 0.49999952316284180.
+        // 0.9999990463256836 (bits `0x3f7ffff0`), * max_norm (1.0) = same,
+        // min(1.0) = same (already < 1.0) → clip_coef = 0.9999990463256836.
+        // `0.5 * clip_coef` is an EXACT `f32` operation (multiplying by 0.5 —
+        // a power of two — only decrements the exponent; it introduces no
+        // rounding for a normal, non-underflowing value), so the result is
+        // pinned EXACTLY too: `0.49999952316284180` (bits `0x3efffff0`).
+        // Pinned to the exact bit patterns (not a `<= N ulp` tolerance band):
+        // this whole chain is deterministic `f32` arithmetic with no
+        // data-dependent rounding, so there is no reason to accept slop here.
         let (w, mut grads, _g_before) = one_var_with_grad(0.5, 4);
         let max_norm = 1.0f64;
         let total_norm = clip_gradients(std::slice::from_ref(&w), &mut grads, max_norm)
@@ -370,7 +419,20 @@ mod tests {
             "test setup: total_norm must equal max_norm exactly to be on the boundary"
         );
 
-        let expected: f32 = 0.499_999_52; // pinned closed form, see doc above
+        // The host-computed coefficient, same op sequence `clip_gradients`
+        // uses (`(total_norm + eps).recip() * max_norm`), pinned to its exact
+        // bits — independent corroboration of the doc's closed form above.
+        let host_coef: f32 = (1.0f32 / (norm_val + 1e-6)) * max_norm as f32;
+        assert_eq!(
+            host_coef.to_bits(),
+            0x3f7f_fff0,
+            "clip_coef at the boundary must be EXACTLY 0.9999990463256836 (bits 0x3f7ffff0), \
+             got {host_coef} (bits {:#010x})",
+            host_coef.to_bits()
+        );
+
+        let expected: f32 = 0.499_999_52; // == 0.49999952316284180, bits 0x3efffff0
+        assert_eq!(expected.to_bits(), 0x3eff_fff0);
         let after: Vec<f32> = grads.get(w.as_tensor()).unwrap().to_vec1().unwrap();
         for a in &after {
             assert_ne!(
@@ -379,10 +441,12 @@ mod tests {
                  the unclipped gradient — a regression to the FALSE `total_norm <= \
                  max_norm` reading of the guarantee would make this pass"
             );
-            let ulp = f32::EPSILON * expected.abs().max(f32::MIN_POSITIVE);
-            assert!(
-                (*a - expected).abs() <= 2.0 * ulp,
-                "expected the boundary batch scaled to ≈{expected}, got {a}"
+            assert_eq!(
+                a.to_bits(),
+                0x3eff_fff0,
+                "expected the boundary batch scaled to EXACTLY {expected} (bits 0x3efffff0), \
+                 got {a} (bits {:#010x})",
+                a.to_bits()
             );
         }
     }
@@ -399,8 +463,9 @@ mod tests {
         let norm_val: f32 = total_norm.to_scalar().unwrap();
 
         // Host reference computed from the SAME grads, torch's exact formula
-        // (ref-077): max_norm / (total_norm + 1e-6), never clamped here since
-        // it is well under 1.0.
+        // (`torch/nn/utils/clip_grad.py`, see the module doc's citation):
+        // max_norm / (total_norm + 1e-6), never clamped here since it is well
+        // under 1.0.
         let host_coef = (max_norm / (norm_val as f64 + 1e-6)) as f32;
         let before: Vec<f32> = g_before.to_vec1().unwrap();
         let expected: Vec<f32> = before.iter().map(|x| x * host_coef).collect();
@@ -593,5 +658,48 @@ mod tests {
         let after: Vec<f32> = grads.get(w.as_tensor()).unwrap().to_vec1().unwrap();
         let before_vals: Vec<f32> = g_before.to_vec1().unwrap();
         assert_eq!(before_vals, after);
+    }
+
+    /// RED-first (advisory c, both cells): `max_norm.is_nan()` makes
+    /// `max_norm <= 0.0` `false` (family F: a NaN comparison is always
+    /// false, in EITHER direction), so a NaN `max_norm` used to fall through
+    /// the disable-clipping guard and into the clip computation — silently
+    /// scaling every gradient by a NaN coefficient forever, invisible to
+    /// [`refuse_nonfinite_norm`] because `total_norm` (what that function
+    /// checks) is computed from the GRADIENTS, not from `max_norm`, and stays
+    /// finite throughout. Mutation tried: delete the `!max_norm.is_finite()`
+    /// guard — this test goes red (`Ok` instead of the expected `Err`, and
+    /// the returned gradient is silently all-NaN).
+    #[test]
+    fn clip_gradients_refuses_nan_max_norm() {
+        let (w, mut grads, _g_before) = one_var_with_grad(2.0, 4);
+        let err = clip_gradients(std::slice::from_ref(&w), &mut grads, f64::NAN)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("finite"),
+            "expected a typed non-finite max_norm refusal, got: {err}"
+        );
+    }
+
+    /// RED-first (advisory c, the other cell): `+inf`/`-inf` are equally
+    /// non-finite `max_norm` values — `f64::INFINITY <= 0.0` is `false` too,
+    /// so this also fell through the same guard before this fix (its
+    /// arithmetic happens to clamp back to a merely-wasteful `coef == 1.0`
+    /// rather than corrupting every gradient, but it is still a non-finite
+    /// tuning parameter this abstraction's contract should never silently
+    /// accept). Mutation tried: same as above — this test goes red.
+    #[test]
+    fn clip_gradients_refuses_infinite_max_norm() {
+        let (w, mut grads, _g_before) = one_var_with_grad(2.0, 4);
+        let err_pos = clip_gradients(std::slice::from_ref(&w), &mut grads, f64::INFINITY)
+            .unwrap_err()
+            .to_string();
+        assert!(err_pos.contains("finite"), "got: {err_pos}");
+
+        let err_neg = clip_gradients(std::slice::from_ref(&w), &mut grads, f64::NEG_INFINITY)
+            .unwrap_err()
+            .to_string();
+        assert!(err_neg.contains("finite"), "got: {err_neg}");
     }
 }

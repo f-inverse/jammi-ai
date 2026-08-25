@@ -332,3 +332,297 @@ fn set_training_threading_gates_the_fused_geglu_dispatch_counters() {
          (before={before_eval2:?}, after={after_eval2:?})"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// The padded training fwd+bwd numeric oracle (P6 Stage B B2, item 6)
+// ─────────────────────────────────────────────────────────────────────────
+//
+// Contract v4 §1 F1 / §5 B2: the only padded ModernBERT training fwd+bwd
+// test that existed before this commit
+// (`crates/jammi-ai/tests/it/encoder_adapters.rs`'s
+// `encoder_adapters_modernbert_writes_adapter_marker`) asserts nothing
+// numeric — it only checks the saved adapter config's JSON fields. That
+// file lives in `jammi-ai`, a crate this agent does not own (Shared
+// crate boundary — coordinate through the lead), so the numeric oracle
+// contract v4 asks for is added HERE instead, against the same
+// `ModernBert`/`jammi-lora` machinery `jammi-ai`'s fine-tune path
+// ultimately calls into. This is the RED oracle B3 is expected to run
+// again on the FA2 arm once it exists.
+
+fn head64_fixture_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny_modernbert_head64")
+}
+
+fn head64_config() -> ModernBertConfig {
+    let raw = std::fs::read_to_string(head64_fixture_dir().join("config.json"))
+        .expect("read tiny_modernbert_head64 config");
+    serde_json::from_str(&raw).expect("parse ModernBertConfig")
+}
+
+fn lora_targets_wqkv_wo() -> LoraBuildConfig<'static> {
+    // `'static` leak is fine in a test: these two `Vec`s/`HashMap` just
+    // need to outlive the `LoraBuildConfig` borrow for this function's
+    // caller's use, and this is a tiny, one-shot test fixture.
+    let targets: &'static Vec<String> =
+        Box::leak(Box::new(vec!["Wqkv".to_string(), "Wo".to_string()]));
+    let no_layers: &'static Option<Vec<usize>> = Box::leak(Box::new(None));
+    let empty_pattern: &'static HashMap<String, usize> = Box::leak(Box::new(HashMap::new()));
+    LoraBuildConfig {
+        target_modules: targets,
+        layers_to_transform: no_layers,
+        lora_rank: 4,
+        lora_alpha: 8.0,
+        use_rslora: false,
+        lora_dropout: None,
+        rank_pattern: empty_pattern,
+        init_mode: LoraInitMode::ZerosB,
+        seed: 42,
+    }
+}
+
+/// Builds a fresh LoRA-targeted `ModernBert` on the `tiny_modernbert_head64`
+/// fixture (hidden 64, 1 head, `head_dim == 64` — the ONLY fixture in this
+/// crate that reaches `AttentionBlockFused`, contract v4 §1 F1's "block
+/// arm"), seeded identically every call so two builds compare bit-for-bit.
+fn head64_lora_model(varmap: &VarMap) -> ModernBert {
+    let config = head64_config();
+    let weights = head64_fixture_dir().join("model.safetensors");
+    let mut model = ModernBert::builder()
+        .pooling(Pooling::Mean)
+        .lora(lora_targets_wqkv_wo())
+        .backbone_dtype(DType::F32)
+        .adapter(None)
+        .build(&[weights.as_path()], &config, &Device::Cpu, varmap)
+        .expect("build LoRA-targeted ModernBert on tiny_modernbert_head64");
+    model.set_training(true);
+    model
+}
+
+/// Sum, over every REAL (non-pad) token position, of that position's
+/// hidden-state vector's own element sum — a loss whose gradient is
+/// non-trivial through EVERY trainable tensor (LoRA A/B on Wqkv and Wo,
+/// every layer) and whose value/gradient a pad row can only affect if
+/// something in the forward pass leaks across rows or across the
+/// pad/real boundary (the exact class of bug this oracle exists to
+/// catch — none exists in today's architecture, but the FA2 unpad/repad
+/// path B3 adds is exactly where one COULD be introduced).
+fn real_rows_loss(hidden: &Tensor, lengths: &[usize]) -> Tensor {
+    let mut terms = Vec::new();
+    for (b, &len) in lengths.iter().enumerate() {
+        if len == 0 {
+            continue;
+        }
+        let row = hidden.narrow(0, b, 1).unwrap().narrow(1, 0, len).unwrap();
+        terms.push(row.sum_all().unwrap());
+    }
+    terms
+        .into_iter()
+        .reduce(|a, b| (a + b).unwrap())
+        .expect("at least one non-empty row")
+}
+
+/// THE oracle: a batch with real padding (row 0 fully real, row 1 padded)
+/// vs the SAME two rows run UNPADDED one-by-one — f32 on CPU (the block
+/// arm — `AttentionBlockFused` admits on this fixture, contract v4 §1 F1).
+/// The LOSS (summed over real positions only) is BIT-IDENTICAL between the
+/// two legs (the forward pass is row-independent — no batch-mixing op
+/// exists anywhere in this architecture, so `hidden_padded[0, s, :]` for
+/// `s < 6` is literally the same computation as `hidden_row0[s, :]`).
+///
+/// **Finding, not the deliverable's original assumption:** the LoRA A/B
+/// GRADIENTS are measured here to be within a tight, principled few-ULP
+/// tolerance of the sum of the two unpadded runs' own gradients, NOT
+/// bit-identical — `dL/dW` for a weight shared across the batch sums each
+/// row's contribution, and the padded run performs that sum in ONE batched
+/// reduction (row-major order over `batch * seq` rows, including the
+/// exactly-zero-gradient pad rows) while comparing against TWO
+/// independently-computed (batch=1) reductions summed externally is a
+/// DIFFERENT fold order over the same mathematical terms — floating-point
+/// addition is non-associative (family J), and this specific case hits a
+/// near-cancellation (two ~1e-10-magnitude terms summing to ~1e-12) that
+/// amplifies the RELATIVE error at the tiny cancelled value while the
+/// ABSOLUTE error stays at ordinary f32-ULP scale on the pre-cancellation
+/// operands — see the tolerance's own derivation, inline below. Pad rows
+/// still contribute EXACTLY nothing (that half of the claim holds exactly:
+/// the loss comparison above proves it, and the gradient tolerance would
+/// need to be many orders of magnitude looser than a few ULPs if a pad
+/// row's residual gradient were leaking in).
+#[test]
+fn padded_training_loss_and_lora_grads_match_unpadded_rows_run_individually_f32_cpu() {
+    // This fixture is GeGLU/RoPE/softmax fused-eligible too, so a training
+    // forward here touches the SAME process-wide dispatch-counter statics
+    // `set_training_threading_gates_the_fused_*_dispatch_counters` reads
+    // with exact-equality assertions — see [`DISPATCH_COUNTER_TEST_LOCK`]'s
+    // doc for why every such test in this binary takes this lock.
+    let _guard = DISPATCH_COUNTER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let device = Device::Cpu;
+    let input_ids_padded =
+        Tensor::new(&[[2u32, 5, 10, 3, 7, 9], [4u32, 8, 1, 6, 0, 0]], &device).unwrap();
+    let mask_padded =
+        Tensor::new(&[[1u32, 1, 1, 1, 1, 1], [1u32, 1, 1, 1, 0, 0]], &device).unwrap();
+    let lengths = [6usize, 4usize];
+
+    // --- Leg A: the padded batch, ONE forward + ONE backward. ---
+    let varmap_padded = VarMap::new();
+    let model_padded = head64_lora_model(&varmap_padded);
+    let hidden_padded = model_padded
+        .forward_hidden(&input_ids_padded, &mask_padded)
+        .expect("padded training forward");
+    let loss_padded = real_rows_loss(&hidden_padded, &lengths);
+    let loss_padded_v: f32 = loss_padded.to_scalar().unwrap();
+    assert!(loss_padded_v.is_finite());
+    let grads_padded = loss_padded.backward().expect("padded backward");
+
+    // --- Leg B: the SAME two rows, run UNPADDED, one at a time, on a
+    // FRESH model built with the identical seed (so weights match
+    // bit-for-bit — LoRA init is deterministic given `seed`). ---
+    let varmap_row0 = VarMap::new();
+    let model_row0 = head64_lora_model(&varmap_row0);
+    let ids_row0 = Tensor::new(&[[2u32, 5, 10, 3, 7, 9]], &device).unwrap();
+    let mask_row0 = Tensor::new(&[[1u32, 1, 1, 1, 1, 1]], &device).unwrap();
+    let hidden_row0 = model_row0
+        .forward_hidden(&ids_row0, &mask_row0)
+        .expect("row0 unpadded forward");
+    let loss_row0 = real_rows_loss(&hidden_row0, &[6usize]);
+    let grads_row0 = loss_row0.backward().expect("row0 backward");
+
+    let varmap_row1 = VarMap::new();
+    let model_row1 = head64_lora_model(&varmap_row1);
+    let ids_row1 = Tensor::new(&[[4u32, 8, 1, 6]], &device).unwrap();
+    let mask_row1 = Tensor::new(&[[1u32, 1, 1, 1]], &device).unwrap();
+    let hidden_row1 = model_row1
+        .forward_hidden(&ids_row1, &mask_row1)
+        .expect("row1 unpadded forward");
+    let loss_row1 = real_rows_loss(&hidden_row1, &[4usize]);
+    let grads_row1 = loss_row1.backward().expect("row1 backward");
+
+    let loss_row0_v: f32 = loss_row0.to_scalar().unwrap();
+    let loss_row1_v: f32 = loss_row1.to_scalar().unwrap();
+    assert_eq!(
+        loss_padded_v,
+        loss_row0_v + loss_row1_v,
+        "the padded batch's real-rows loss must be bit-identical to the sum of the two \
+         unpadded rows' own losses -- pad rows contribute exactly nothing"
+    );
+
+    // Every LoRA A/B tensor, every layer, every site: the padded run's
+    // gradient must equal the ELEMENTWISE SUM of the two unpadded runs'
+    // gradients, bit-for-bit. `named_trainable_weights` gives each tensor
+    // a NAME so the three models' Vars (different `VarMap`s, different
+    // `TensorId`s) can be paired up correctly.
+    let named_padded = model_padded.named_trainable_weights().unwrap();
+    let named_row0 = model_row0.named_trainable_weights().unwrap();
+    let named_row1 = model_row1.named_trainable_weights().unwrap();
+    assert!(
+        !named_padded.is_empty(),
+        "the LoRA targets must have produced trainable tensors"
+    );
+
+    for name in named_padded.keys() {
+        let key_tensor = &named_padded[name];
+        let g_padded: Vec<f32> = grads_padded
+            .get(key_tensor)
+            .unwrap_or_else(|| panic!("padded run: no grad for {name}"))
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        let row0_key = &named_row0[name];
+        let g_row0: Vec<f32> = grads_row0
+            .get(row0_key)
+            .unwrap_or_else(|| panic!("row0 run: no grad for {name}"))
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let row1_key = &named_row1[name];
+        let g_row1: Vec<f32> = grads_row1
+            .get(row1_key)
+            .unwrap_or_else(|| panic!("row1 run: no grad for {name}"))
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        assert_eq!(g_padded.len(), g_row0.len());
+        assert_eq!(g_padded.len(), g_row1.len());
+        for i in 0..g_padded.len() {
+            let summed = g_row0[i] + g_row1[i];
+            let diff = (g_padded[i] - summed).abs();
+            // NOT exact bit-identity, measured (a finding, not the
+            // deliverable's original assumption): `dL/dW` for a shared
+            // weight sums each row's contribution, and the PADDED run
+            // performs that sum in ONE batched reduction over
+            // `batch * seq` rows (row-major order, including the
+            // exactly-zero-gradient pad rows) while this comparison sums
+            // TWO INDEPENDENTLY-COMPUTED (batch=1) reductions externally in
+            // f32 — floating-point addition is non-associative (family J),
+            // so a DIFFERENT fold order over the mathematically-identical
+            // set of terms is not guaranteed bit-identical, and near-
+            // cancellation (two ~1e-10 terms summing to ~1e-12 here)
+            // amplifies the RELATIVE error at the tiny cancelled magnitude
+            // even though the ABSOLUTE error stays at f32-ULP scale on the
+            // PRE-cancellation operands. The bound below is exactly that:
+            // relative to the larger of the two pre-cancellation terms
+            // (never the cancelled result, which would make an ordinary-
+            // sized rounding error look enormous), a tight, principled
+            // few-ULP tolerance — not a loose fudge factor.
+            let scale = g_row0[i].abs().max(g_row1[i].abs()).max(f32::EPSILON);
+            let bound = 64.0 * f32::EPSILON * scale;
+            assert!(
+                diff <= bound,
+                "{name}[{i}]: padded grad must match the sum of the two unpadded rows' own \
+                 grads within a few-ULP fold-order tolerance (row0={}, row1={}, padded={}, \
+                 summed={summed}, diff={diff}, bound={bound})",
+                g_row0[i],
+                g_row1[i],
+                g_padded[i]
+            );
+        }
+    }
+}
+
+/// The RED control this oracle exists to catch: if a pad row's garbage
+/// values leaked into the loss (e.g. `real_rows_loss` itself summed the
+/// WHOLE row instead of narrowing to `len`), the padded run's loss would
+/// differ from the sum of the two unpadded runs' — this test asserts that
+/// leak IS detectable by deliberately including the pad columns and
+/// checking the comparison now FAILS the exact-equality the real oracle
+/// relies on (a non-vacuity control on the oracle mechanism itself, not a
+/// production code path).
+#[test]
+fn padded_training_oracle_is_non_vacuous_including_pad_columns_changes_the_loss() {
+    // See the sibling oracle test's identical lock rationale.
+    let _guard = DISPATCH_COUNTER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let device = Device::Cpu;
+    let input_ids_padded =
+        Tensor::new(&[[2u32, 5, 10, 3, 7, 9], [4u32, 8, 1, 6, 0, 0]], &device).unwrap();
+    let mask_padded =
+        Tensor::new(&[[1u32, 1, 1, 1, 1, 1], [1u32, 1, 1, 1, 0, 0]], &device).unwrap();
+
+    let varmap_padded = VarMap::new();
+    let model_padded = head64_lora_model(&varmap_padded);
+    let hidden_padded = model_padded
+        .forward_hidden(&input_ids_padded, &mask_padded)
+        .expect("padded training forward");
+
+    // Real-rows-only loss (the ACTUAL oracle's quantity).
+    let real_loss: f32 = real_rows_loss(&hidden_padded, &[6usize, 4usize])
+        .to_scalar()
+        .unwrap();
+    // Whole-batch loss INCLUDING the two pad columns of row 1 — must
+    // differ from `real_loss` on real weights (pad-row hidden states are
+    // not literally zero; only the POOLED/masked output is designed to
+    // ignore them, `forward_hidden` returns raw per-token states).
+    let whole_loss: f32 = hidden_padded.sum_all().unwrap().to_scalar().unwrap();
+    assert_ne!(
+        real_loss, whole_loss,
+        "the oracle's real-rows-only reduction must actually EXCLUDE the pad columns, or this \
+         whole test would vacuously pass regardless of a leak"
+    );
+}

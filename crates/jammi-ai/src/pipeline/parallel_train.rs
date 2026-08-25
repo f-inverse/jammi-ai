@@ -174,3 +174,38 @@ fn scalar_loss(loss: &Tensor) -> Result<f64> {
         .to_scalar::<f32>()
         .map_err(|e| JammiError::FineTune(format!("Loss scalar: {e}")))? as f64)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::{DType, Device};
+
+    /// `scalar_loss`'s `loss.dtype() == DType::F32` branch is only exercised
+    /// by an already-F32 loss in every OTHER test that reaches this function
+    /// (every `loss_fn` in this file's/`tests/it/parallel_train.rs`'s
+    /// fixtures reduces through `.sqr()`/`.mean_all()` on F32 tensors), so
+    /// the `else` arm — the actual `to_dtype` cast this function's own doc
+    /// promises for "a reduced-precision dtype" — is never entered. A BF16
+    /// loss forces it.
+    ///
+    /// Mutation tried: `replace == with !=` on that condition — the mutant
+    /// keeps a non-F32 loss in ITS OWN dtype (skips the cast) and routes an
+    /// already-F32 loss through a redundant (no-op, invisible) `to_dtype`
+    /// instead. RED here: `to_scalar::<f32>()` on an uncast BF16 tensor is a
+    /// dtype mismatch candle refuses — `Result::unwrap()` panics instead of
+    /// returning `Ok`.
+    #[test]
+    fn scalar_loss_casts_a_non_f32_loss_before_reading_it() {
+        let dev = Device::Cpu;
+        let loss_bf16 = Tensor::new(3.5f32, &dev)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let got = scalar_loss(&loss_bf16).unwrap();
+        // 3.5 round-trips through BF16 exactly, so the cast-then-read value
+        // must equal it precisely — not just "close enough" (a tolerance
+        // would blur this test's exact-match oracle with BF16's own rounding
+        // error on values that do NOT round-trip).
+        assert_eq!(got, 3.5);
+    }
+}

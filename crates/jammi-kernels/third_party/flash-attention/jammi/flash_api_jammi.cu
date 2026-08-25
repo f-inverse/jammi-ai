@@ -64,7 +64,7 @@ int32_t query_device(int *device, int *num_sms, int *cc_major) {
     return JAMMI_FLASH_OK;
 }
 
-// F2: `flash_bwd_kernel.h`'s dropout setup reads `params.rng_state[0]` and
+// `flash_bwd_kernel.h`'s dropout setup reads `params.rng_state[0]` and
 // `[1]` UNCONDITIONALLY, at function scope — NOT inside `if constexpr
 // (Is_dropout)` (only the further uses at :535/:541/:546 are guarded).
 // Upstream always points `rng_state` at a live 2-element device tensor,
@@ -252,7 +252,7 @@ void fill_fprop(FLASH_NAMESPACE::Flash_fwd_params &params, const void *qkv, void
     params.total_q = total_q;
     // flash_api.cpp:697 (`!paged_KV ? 1`).
     params.page_block_size = 1;
-    // F2 (see `rng_state_scratch` above): a live, zeroed, 2-element device
+    // `rng_state_scratch` above: a live, zeroed, 2-element device
     // buffer, not NULL — the backward kernel dereferences this
     // unconditionally regardless of whether dropout is compiled in. If the
     // allocation ever fails this is left NULL and the caller (both entry
@@ -328,7 +328,7 @@ int32_t jammi_flash_varlen_fwd(const jammi_flash_varlen_fwd_args *a) {
     FLASH_NAMESPACE::Flash_fwd_params params;
     fill_fprop(params, a->qkv, a->o, a->softmax_lse, a->cu_seqlens, a->total_q, a->batch,
                a->num_heads, a->max_seqlen, a->softmax_scale, window_size_left, window_size_right);
-    // F2: the rng_state scratch allocation failed.
+    // the rng_state scratch allocation failed.
     if (params.rng_state == nullptr) return JAMMI_FLASH_ERR_CUDA;
     // The recompute-soundness invariant: the split-KV forward
     // (flash_api.cpp:247-251, `num_splits > 1 || force_split_kernel`) is
@@ -394,7 +394,7 @@ int32_t jammi_flash_varlen_bwd(const jammi_flash_varlen_bwd_args *a) {
     fill_fprop(params, a->qkv, const_cast<void *>(a->o), const_cast<float *>(a->softmax_lse),
                a->cu_seqlens, a->total_q, a->batch, a->num_heads, a->max_seqlen, a->softmax_scale,
                window_size_left, window_size_right);
-    // F2: the rng_state scratch allocation failed — the backward kernel
+    // the rng_state scratch allocation failed — the backward kernel
     // dereferences `params.rng_state[0]`/`[1]` unconditionally
     // (`flash_bwd_kernel.h:446`), so a NULL here would be a null pointer
     // dereference in device code, not a clean refusal.

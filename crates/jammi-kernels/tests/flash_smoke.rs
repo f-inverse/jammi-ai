@@ -19,7 +19,7 @@
 //!   sit at/one-past the 128 boundary) — every OTHER oracle in this file
 //!   (forward-vs-reference, bit-identity, backward-vs-analytic-reference,
 //!   guard regions) also runs at this fixture, in a `_multi_tile` test
-//!   (F3: the small fixture alone never exercises the multi-`n_block` loop,
+//!   (the small fixture alone never exercises the multi-`n_block` loop,
 //!   the backward's `Is_first`/`Is_last` split, or the sliding-window
 //!   `n_block_min` skip).
 //!
@@ -72,7 +72,7 @@ fn cuda_device() -> Option<CudaDevice> {
 /// in this file also runs at [`LARGE_LENS`] (the `_multi_tile` variant of
 /// each test), which crosses several tiles instead.
 const SMALL_LENS: [usize; 3] = [5, 9, 7];
-/// Multi-tile, ragged fixture (F3): five sequences, none a multiple of the
+/// Multi-tile, ragged fixture: five sequences, none a multiple of the
 /// other, `max_seqlen = 260` crosses TWO `kBlockN = 128` tiles (the
 /// backward's `n_block` loop, `Is_first`/`Is_last` split at
 /// `flash_bwd_kernel.h:811-818`, and the forward's multi-block loop all run
@@ -259,7 +259,7 @@ fn cfg(window: Option<u32>, deterministic: bool) -> VarlenConfig {
 struct DeviceFixture {
     qkv: candle_core::cuda_backend::cudarc::driver::CudaSlice<bf16>,
     /// Built via [`CuSeqlens::from_lengths`] — the only sanctioned way to
-    /// reach a launch (F1). The `raw`-escape-hatch tests (`c_wrapper_refusal_cells`
+    /// reach a launch. The `raw`-escape-hatch tests (`c_wrapper_refusal_cells`
     /// etc.) still reach the device array through this `CuSeqlens` (via
     /// [`dptr_cu`]), not a second independent buffer — there is no other
     /// legitimate way to get one.
@@ -688,7 +688,7 @@ fn bwd_matches_central_finite_differences() {
     }
 }
 
-/// Multi-tile leg of the backward oracle (F3): the analytic reference
+/// Multi-tile leg of the backward oracle: the analytic reference
 /// (`attn_bwd_ref`) ONLY — no finite differences (intractable at this
 /// scale, see [`SMALL_LENS`]'s doc) — but `bwd_matches_central_finite_differences`
 /// already proves the analytic reference agrees with FD to `1e-6·scale`
@@ -821,8 +821,8 @@ fn dptr<T>(
 
 /// Like [`dptr`], but for the `CuSeqlens`' device array — the `raw`
 /// escape hatch is the one place this module deliberately reaches past
-/// `CuSeqlens` to drive the C wrapper's OWN refusal cells directly (F1's
-/// safe API is not involved in these tests at all).
+/// `CuSeqlens` to drive the C wrapper's OWN refusal cells directly; the
+/// safe API's own refusal lattice is not involved in these tests at all.
 fn dptr_cu(dev: &CudaDevice, cu: &CuSeqlens) -> *const i32 {
     use candle_core::cuda_backend::cudarc::driver::DevicePtr;
     let stream = dev.cuda_stream();
@@ -1236,7 +1236,7 @@ fn rust_boundary_refuses_wrong_buffer_lengths_and_splits() {
     // == 0 is the analogue of the old "independently-supplied bad
     // VarlenGeometry" cell — driven through the REAL entry point now that
     // `VarlenGeometry` can no longer be constructed independently of a
-    // `CuSeqlens` (F1).
+    // `CuSeqlens`.
     let e = flash_varlen_fwd(&dev, &dfx.qkv, &dfx.cu, 0, &c).unwrap_err();
     assert!(matches!(e, FlashError::Geometry(_)), "{e}");
 }
@@ -1416,15 +1416,15 @@ fn guard_regions_around_every_output_and_scratch_buffer_are_untouched_multi_tile
     guard_regions_around_every_output_and_scratch_buffer_are_untouched_body(&dev, &LARGE_LENS);
 }
 
-/// F4: `flash_varlen_bwd_into` re-zeroes `dq_accum` itself when
+/// `flash_varlen_bwd_into` re-zeroes `dq_accum` itself when
 /// `cfg.deterministic`, rather than trusting the caller's `BwdBuffers` to
 /// arrive zeroed (the deterministic launch accumulates without clearing,
 /// `flash_bwd_launch_template.h:84-88` — a non-zero-on-entry `dq_accum`
-/// silently produces a WRONG `dQ`, not an error). This is RED under the
-/// pre-fix behaviour: poison `dq_accum` with a large non-zero pattern
-/// (deliberately NOT zeroing it, unlike the guard-region test above) and
-/// assert the deterministic backward still matches a clean run — that can
-/// only hold if the function zeroes the buffer itself.
+/// silently produces a WRONG `dQ`, not an error): poison `dq_accum` with a
+/// large non-zero pattern (deliberately NOT zeroing it, unlike the
+/// guard-region test above) and assert the deterministic backward still
+/// matches a clean run — that can only hold if the function zeroes the
+/// buffer itself.
 #[test]
 fn bwd_deterministic_ignores_a_poisoned_dq_accum_on_entry() {
     let Some(dev) = cuda_device() else { return };

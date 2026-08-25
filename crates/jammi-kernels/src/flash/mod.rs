@@ -100,9 +100,9 @@
 //!   are kept in lock-step (`status_codes_round_trip_and_zero_is_ok`
 //!   exercises every KNOWN code both directions); would only fire if the
 //!   two drifted, which `check_abi`'s struct-size check does not itself
-//!   catch (a new status variant added to one side without the other is a
-//!   silent hole this crate does not currently guard against — flagged,
-//!   not fixed, this round).
+//!   catch: a new status variant added to one side without the other is
+//!   an unguarded hole (the enum count and the C header's status count
+//!   are not cross-checked anywhere).
 //! - **`stream == NULL`** (the header's documented "legacy default stream"
 //!   arm): legal per `flash_api_jammi.h`, but neither this module's safe
 //!   API nor the smoke test's `raw` calls ever pass a NULL stream — every
@@ -148,12 +148,12 @@
 //! never independent inputs. `VarlenGeometry` (below) is consequently a
 //! private-field projection: the only way to obtain one is
 //! `CuSeqlens::geometry`, so a geometry can never describe a different
-//! array than the one it was derived from. Every public function that used
-//! to take a raw `cu_seqlens: CudaView<i32>` alongside a `&VarlenGeometry`
-//! now takes `&CuSeqlens` instead, closing the gap even for two
-//! independently-legitimate values (a geometry from one batch paired with
-//! the device array of another would have reintroduced the same
-//! disagreement).
+//! array than the one it was derived from. Every public function in this
+//! module that launches a kernel takes `&CuSeqlens`, never a raw
+//! `cu_seqlens: CudaView<i32>` alongside a separate `&VarlenGeometry` — a
+//! geometry from one batch paired with the device array of a different
+//! batch would reintroduce the same disagreement even though both values
+//! are individually legitimate.
 //!
 //! The one caller who legitimately owns a device `cu_seqlens` array already
 //! (none in this codebase today; a future producer of one) has
@@ -530,10 +530,11 @@ impl VarlenGeometry {
 }
 
 /// Host-only: builds the cumulative-sum array and validates it, without
-/// touching any device. Pure so the whole lattice (including the exact
-/// disagreement an adversarial audit demonstrated an illegal memory access
-/// with) is unit-tested here with no CUDA device required;
-/// [`CuSeqlens::from_lengths`] is this plus the upload.
+/// touching any device. Pure so the whole lattice — including the class of
+/// disagreement that produces an illegal memory access (host-claimed
+/// `total_q`/`max_seqlen` smaller than the device array's real extent) — is
+/// unit-tested here with no CUDA device required; `CuSeqlens::from_lengths`
+/// is this plus the upload.
 fn cu_seqlens_from_lengths(lengths: &[usize]) -> Result<(Vec<i32>, usize, usize, usize)> {
     if lengths.is_empty() {
         return Err(FlashError::Geometry(
@@ -643,12 +644,12 @@ impl CuSeqlens {
     /// - `cu` is valid on the same device/stream every later call in this
     ///   module is made with.
     ///
-    /// Violating any of these is exactly the shape of the illegal memory
-    /// access an adversarial audit demonstrated against the pre-`CuSeqlens`
-    /// API (`total_q`/`batch`/`max_seqlen` claiming a small extent while the
-    /// device array's real last entry was far larger): the kernels index
-    /// `cu[0..batch]` using the HOST `total_q`/`max_seqlen` and never
-    /// bounds-check them against the array's actual contents.
+    /// Violating any of these produces an illegal memory access: the
+    /// kernels index `cu[0..batch]` using the HOST `total_q`/`max_seqlen`
+    /// and never bounds-check them against the array's actual contents, so
+    /// a small `total_q`/`max_seqlen` claim paired with a device array
+    /// whose real last entry is far larger reads and writes past the
+    /// buffers the launch was given.
     pub unsafe fn from_device_unchecked(
         cu: CudaSlice<i32>,
         total_q: usize,
@@ -926,7 +927,7 @@ pub struct BwdBuffers<'a> {
     pub d_o: CudaView<'a, bf16>,
     pub d_qkv: CudaViewMut<'a, bf16>,
     pub softmax_d: CudaViewMut<'a, f32>,
-    /// Must be all-zero when `cfg.deterministic` (F4); [`flash_varlen_bwd_into`]
+    /// Must be all-zero when `cfg.deterministic` ; `flash_varlen_bwd_into`
     /// zeroes it itself when that holds, so callers do not need to (and a
     /// caller who reuses a poisoned buffer cannot silently produce a wrong
     /// `dQ`).
@@ -974,7 +975,7 @@ pub fn flash_varlen_bwd_into(
     check_abi()?;
 
     let stream = dev.cuda_stream();
-    // F4: `dq_accum` MUST be all-zero on entry when `cfg.deterministic`
+    // `dq_accum` MUST be all-zero on entry when `cfg.deterministic`
     // (the deterministic launch selects `Clear_dQaccum=false` and
     // accumulates into whatever is already there,
     // `flash_bwd_launch_template.h:84-88`) — a caller that violates this
@@ -1107,7 +1108,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // `CuSeqlens` / `cu_seqlens_from_lengths` — the F1 fix. All pure (no
+    // `CuSeqlens` / `cu_seqlens_from_lengths`. All pure (no
     // device): `cu_seqlens_from_lengths` is `CuSeqlens::from_lengths` minus
     // the upload, so the whole host-side lattice is testable here; the
     // device-touching half is exercised by `flash_smoke.rs` on the pod.
@@ -1135,35 +1136,33 @@ mod tests {
         assert_eq!(max_seqlen, 42);
     }
 
-    /// THE AUDITOR'S DEMONSTRATION: pre-fix, `VarlenGeometry { total_q: 21,
-    /// batch: 3, max_seqlen: 9 }` could be paired with a device
-    /// `cu_seqlens = [0, 5, 14, 4_000_000]` — a host claim of 21/9 attached
-    /// to an array whose real extent was 4,000,000 rows, producing
-    /// `CUDA_ERROR_ILLEGAL_ADDRESS` on sync. `cu_seqlens_from_lengths` (and
-    /// therefore `CuSeqlens::from_lengths`, its device-touching wrapper) can
-    /// only produce that EXACT array from lengths `[5, 9, 3_999_986]` — and
-    /// derives `total_q = 4_000_000`, `max_seqlen = 3_999_986` from it, NEVER
-    /// the auditor's (21, 9). The mismatched pair is unrepresentable through
-    /// the safe API: there is no longer a code path where a caller supplies
-    /// `total_q`/`max_seqlen` independently of the array that produces them.
+    /// `total_q`/`max_seqlen` are ALWAYS derived from the device array's own
+    /// construction — never an independent input a caller can mismatch
+    /// against it. Concretely: the only lengths that produce the device
+    /// array `[0, 5, 14, 4_000_000]` are `[5, 9, 3_999_986]`, which derive
+    /// `total_q = 4_000_000`, `max_seqlen = 3_999_986` — a claim of
+    /// `(total_q, max_seqlen) = (21, 9)` against that same array (small host
+    /// numbers paired with an array whose real extent is 4,000,000 rows) can
+    /// never come out of this function, so a kernel launch can never be
+    /// handed that disagreement through the safe API.
     #[test]
-    fn auditor_demonstration_geometry_is_now_unrepresentable() {
+    fn geometry_cannot_disagree_with_the_array_it_is_derived_from() {
         let lengths = [5usize, 9, 3_999_986];
         let (cu, total_q, batch, max_seqlen) = cu_seqlens_from_lengths(&lengths).unwrap();
         assert_eq!(cu, vec![0, 5, 14, 4_000_000]);
         assert_eq!(batch, 3);
         assert_eq!(
             total_q, 4_000_000,
-            "derived total_q must be the array's real extent, not the auditor's claimed 21"
+            "derived total_q must be the array's real extent"
         );
         assert_eq!(
             max_seqlen, 3_999_986,
-            "derived max_seqlen must be the array's real longest sequence, not the auditor's claimed 9"
+            "derived max_seqlen must be the array's real longest sequence"
         );
         assert_ne!(
             (total_q, max_seqlen),
             (21, 9),
-            "the auditor's mismatched (total_q, max_seqlen) claim must never come out of this function"
+            "a small mismatched (total_q, max_seqlen) claim must never come out of this function"
         );
     }
 

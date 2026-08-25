@@ -17,7 +17,7 @@ Method (hermetic: `cargo metadata --no-deps`, no network, no build):
      `release-binaries.yml` actually builds — check three selections:
      `default`, the release lane's `cuda,jetstream-broker,storage-cloud`,
      and `jammi-server --all-features`.
-  3. WIDEN beyond `jammi-server`: for EVERY OTHER workspace member (a leak
+  3. Beyond `jammi-server`: for EVERY OTHER workspace member (a leak
      through `jammi-bench` or `jammi-python`, both of which reach
      `jammi-ai` → ... → `jammi-kernels` transitively, would not be visible
      from `jammi-server`'s closure alone), check THAT member's own
@@ -310,8 +310,8 @@ def self_test() -> int:
     assert FORBIDDEN_FEATURE not in enabled.get(TARGET_PKG, set()), (
         "weak edge on an inactive optional dep must not leak from ROOT's own cuda-lane selection"
     )
-    # The WIDENED per-member loop (F6) catches what ROOT's own selections
-    # cannot see: `jammi-ai --all-features` activates "extra" directly,
+    # The per-member loop catches what ROOT's own selections cannot see:
+    # `jammi-ai --all-features` activates "extra" directly,
     # which makes `extra?/flash-attn` fire — a genuine leak under
     # `cargo build -p jammi-ai --all-features` that a jammi-server-only
     # closure walk would miss entirely.

@@ -53,8 +53,8 @@ packaging. Two consequences, flagged to the lead as a shared-declaration
       # same treatment.
   ]
   ```
-  This is a PROPOSAL for the lead/docs-ci lane to apply; this round does
-  not edit `Cargo.toml` (shared-declaration class).
+  This is a PROPOSAL for the lead/docs-ci lane to apply; `crates/jammi-kernels/Cargo.toml`
+  is shared-declaration class and is not edited from this directory's own change.
 
 | item | value |
 |---|---|
@@ -179,11 +179,10 @@ sm80 group), archived by `ar` into `$OUT_DIR/libjammi_flash.a`, linked with
   the sliding window is the product.
 - `-Xcompiler -fPIC` is the ONE addition to upstream `setup.py`'s sm80
   group (host-code relocation model only; Rust links PIE executables on
-  Linux). An EARLIER revision of this file also documented a SECOND
-  addition — `-gencode arch=compute_80,code=compute_80` (embedded PTX) —
-  that was wrong on two counts: it was not in upstream's group (`setup.py`
-  appends only `code=sm_80` for the sm80 arch too), and it was never
-  validated (see "Supported archs" below). Dropped.
+  Linux). This build does NOT add `-gencode arch=compute_80,code=compute_80`
+  (embedded PTX): upstream's own group appends only `code=sm_80` for the
+  sm80 arch, and embedding the PTX would ship a second, unvalidated code
+  path (see "Supported archs" below).
 - Both traits configs of the backward are instantiated; the launch picks
   128×128 (8 warps, 144 KB dynamic smem) when the device's opt-in smem
   allows it (A100/H100), else 64×128 (sm86/sm89, 99 KB)

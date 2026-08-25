@@ -534,7 +534,7 @@ pub(crate) static ATTENTION_BLOCK_DISPATCH_COUNTERS: DispatchCounters = Dispatch
 
 /// The fused whole-attention-block kernel's domain, checked at the call
 /// site (family D / K2): `qkv`'s device is one
-/// [`crate::layer_norm::device_is_supported`] accepts, `qkv`/`extended_mask`
+/// [`jammi_kernels::admission::device_is_supported`] accepts, `qkv`/`extended_mask`
 /// share a dtype the kernel implements (F32 or BF16), `qkv` is contiguous
 /// (the free reshape from `Wqkv`'s own output — `AttentionBlockFused`
 /// refuses a strided `qkv`, same idiom as every other op in this crate),
@@ -552,7 +552,7 @@ fn attention_block_admission_predicate(
     d: usize,
     extended_mask: &Tensor,
 ) -> (bool, &'static str) {
-    if !crate::layer_norm::device_is_supported(qkv.device()) {
+    if !device_is_supported(qkv.device()) {
         return (false, "device_is_cpu_or_cuda");
     }
     if qkv.dtype() != extended_mask.dtype() || !matches!(qkv.dtype(), DType::F32 | DType::BF16) {
@@ -735,7 +735,7 @@ impl ModernBertAttention {
         let (holds, predicate) =
             attention_block_admission_predicate(qkv, seq, h, d, &extended_mask);
         let outcome = admit(
-            crate::layer_norm::admission_mode(),
+            admission_mode(),
             "attention_block_fused",
             predicate,
             holds,

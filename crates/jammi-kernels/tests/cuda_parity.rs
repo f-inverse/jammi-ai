@@ -5427,3 +5427,93 @@ fn attention_block_bf16_three_way_vs_f32_reference_b1_and_b8_cuda() {
     three_way_vs_f32_reference(&cuda, 1, 512, 16, 64, Some(64), 40.0, 12.0);
     three_way_vs_f32_reference(&cuda, 8, 512, 16, 64, Some(64), 40.0, 12.0);
 }
+
+// ---------------------------------------------------------------------
+// Cast-boundary lever Wave 1 — ISOLATED kernel timing (guide §4). `cargo
+// test --features cuda --test cuda_parity -- --ignored --nocapture
+// isolated_kernel_timing_cast_boundary_wave1` on an EXCLUSIVE box (check
+// `nvidia-smi` first — co-tenancy inflates wall-clock launch time, not
+// just kernel occupancy). Wall-clock around a `Device::synchronize()`
+// bracket, NOT `nsys` (unavailable/broken on this pod image at the time
+// this ran — `nsys --version` errors "hasn't been installed with CUDA
+// Toolkit 12.6"); reported honestly as wall-clock including per-launch
+// CPU-side dispatch overhead, not a device-side-only `nsys` timeline.
+#[test]
+#[ignore]
+fn isolated_kernel_timing_cast_boundary_wave1() {
+    let Some(cuda) = cuda_device() else {
+        eprintln!("isolated_kernel_timing: skipping — no CUDA device available");
+        return;
+    };
+
+    // (e) B1's own shape at the census's m/outf: the Wqkv site's
+    // Σout-sized population, m = 12288 (b8-s512 batched-forward), outf =
+    // 3072 (design study v2's Σin/Σout table).
+    let (m_e, outf_e) = (12_288usize, 3_072usize);
+    let grad_res_v: Vec<bf16> = (0..m_e * outf_e)
+        .map(|i| bf16::from_f32(((i as f32) * 0.0001).sin() * 5000.0))
+        .collect();
+    let grad_res = Tensor::from_slice(&grad_res_v, (m_e, outf_e), &cuda).unwrap();
+    let scale = 0.03125_f64; // alpha/rank-shaped (e.g. alpha=32/rank=... ).
+
+    let cast_scale_op = jammi_kernels::ops::CastScaleBf16F32::new(scale);
+    // Warm-up (first launch pays one-time PTX JIT/module-load cost).
+    let _ = apply1(&grad_res, cast_scale_op).unwrap();
+    cuda.synchronize().unwrap();
+
+    let n_iters = 50u32;
+    let start = std::time::Instant::now();
+    for _ in 0..n_iters {
+        let _ = apply1(&grad_res, cast_scale_op).unwrap();
+    }
+    cuda.synchronize().unwrap();
+    let elapsed_e = start.elapsed();
+    let ms_per_launch_e = elapsed_e.as_secs_f64() * 1000.0 / f64::from(n_iters);
+    // Traffic: read bf16 (2B) + write f32 (4B) per element (ops::cast_scale's
+    // own module doc).
+    let bytes_e = (m_e * outf_e) as f64 * 6.0;
+    let gb_per_s_e = bytes_e / (ms_per_launch_e / 1000.0) / 1e9;
+    println!(
+        "cast_scale_bf16_f32: m={m_e} outf={outf_e} elems={} {:.4} ms/launch, {:.1} GB/s, \
+         {:.2}% of 2039 GB/s SXM4 roofline",
+        m_e * outf_e,
+        ms_per_launch_e,
+        gb_per_s_e,
+        100.0 * gb_per_s_e / 2039.0
+    );
+
+    // (f) B3's own shape at the census's m/inf: the Wqkv site's Σin-sized
+    // population, m = 12288, inf = 1024.
+    let (m_f, inf_f) = (12_288usize, 1_024usize);
+    let base_v: Vec<bf16> = (0..m_f * inf_f)
+        .map(|i| bf16::from_f32(((i as f32) * 0.00013).cos() * 4000.0))
+        .collect();
+    let f32val_v: Vec<f32> = (0..m_f * inf_f)
+        .map(|i| ((i as f32) * 0.00029).sin() * 30.0)
+        .collect();
+    let base = Tensor::from_slice(&base_v, (m_f, inf_f), &cuda).unwrap();
+    let f32val = Tensor::from_slice(&f32val_v, (m_f, inf_f), &cuda).unwrap();
+
+    let cast_add_op = jammi_kernels::ops::CastAddBf16::new();
+    let _ = apply2(&base, &f32val, cast_add_op).unwrap();
+    cuda.synchronize().unwrap();
+
+    let start = std::time::Instant::now();
+    for _ in 0..n_iters {
+        let _ = apply2(&base, &f32val, cast_add_op).unwrap();
+    }
+    cuda.synchronize().unwrap();
+    let elapsed_f = start.elapsed();
+    let ms_per_launch_f = elapsed_f.as_secs_f64() * 1000.0 / f64::from(n_iters);
+    // Traffic: read f32 (4B) + read bf16 (2B) + write bf16 (2B) per element.
+    let bytes_f = (m_f * inf_f) as f64 * 8.0;
+    let gb_per_s_f = bytes_f / (ms_per_launch_f / 1000.0) / 1e9;
+    println!(
+        "cast_add_bf16: m={m_f} inf={inf_f} elems={} {:.4} ms/launch, {:.1} GB/s, {:.2}% of \
+         2039 GB/s SXM4 roofline",
+        m_f * inf_f,
+        ms_per_launch_f,
+        gb_per_s_f,
+        100.0 * gb_per_s_f / 2039.0
+    );
+}

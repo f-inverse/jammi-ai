@@ -3593,29 +3593,47 @@ mod tests {
         seed: u64,
         label: &str,
     ) {
-        let bf16_model = flash_oracle_build_model(config, weights, DType::BF16, seed, cuda, true);
-        let f32_model = flash_oracle_build_model(config, weights, DType::F32, seed, cuda, false);
+        // Interleaved (forward -> pooled+grad -> DROP the hidden tensor and
+        // its whole backward graph) rather than building all three arms'
+        // forward graphs before any backward -- ModernBERT-large at
+        // production shape (28 layers, hidden=1024) is real production-scale
+        // memory; holding three arms' graphs alive simultaneously OOM'd on
+        // an 80GB A100 (confirmed live). One arm's forward+backward at a
+        // time keeps peak VRAM close to a single training step's, matching
+        // BLOCK 3's own measured per-arm range (16-19 GB at b8-s512).
         let ids = flash_oracle_synthetic_ids(batch, seq, config.vocab_size, seed, cuda);
         let mask = Tensor::ones((batch, seq), DType::U32, cuda).unwrap();
 
-        let flash_before = cascade_counters_for("attention_block_flash").snapshot();
-        let hidden_flash = forward_hidden_forcing_flash(&bf16_model, &ids, &mask, false).unwrap();
-        let flash_after = cascade_counters_for("attention_block_flash").snapshot();
-        assert_eq!(
-            flash_after.fused - flash_before.fused,
-            config.num_hidden_layers as u64,
-            "[{label}] flash arm: zero dispatch is RED (guide §3.5) -- every layer must have \
-             actually dispatched Fused on this dense batch"
-        );
+        let (pooled_flash, grad_flash) = {
+            let bf16_model =
+                flash_oracle_build_model(config, weights, DType::BF16, seed, cuda, true);
+            let flash_before = cascade_counters_for("attention_block_flash").snapshot();
+            let hidden_flash =
+                forward_hidden_forcing_flash(&bf16_model, &ids, &mask, false).unwrap();
+            let flash_after = cascade_counters_for("attention_block_flash").snapshot();
+            assert_eq!(
+                flash_after.fused - flash_before.fused,
+                config.num_hidden_layers as u64,
+                "[{label}] flash arm: zero dispatch is RED (guide §3.5) -- every layer must have \
+                 actually dispatched Fused on this dense batch"
+            );
+            flash_oracle_pooled_and_grad(&bf16_model, &hidden_flash, &mask)
+        };
 
-        let hidden_block = forward_hidden_forcing_flash(&bf16_model, &ids, &mask, true).unwrap();
-        let hidden_f32 = f32_model.forward_hidden(&ids, &mask).unwrap();
+        let (pooled_block, grad_block) = {
+            let bf16_model =
+                flash_oracle_build_model(config, weights, DType::BF16, seed, cuda, true);
+            let hidden_block =
+                forward_hidden_forcing_flash(&bf16_model, &ids, &mask, true).unwrap();
+            flash_oracle_pooled_and_grad(&bf16_model, &hidden_block, &mask)
+        };
 
-        let (pooled_flash, grad_flash) =
-            flash_oracle_pooled_and_grad(&bf16_model, &hidden_flash, &mask);
-        let (pooled_block, grad_block) =
-            flash_oracle_pooled_and_grad(&bf16_model, &hidden_block, &mask);
-        let (pooled_f32, grad_f32) = flash_oracle_pooled_and_grad(&f32_model, &hidden_f32, &mask);
+        let (pooled_f32, grad_f32) = {
+            let f32_model =
+                flash_oracle_build_model(config, weights, DType::F32, seed, cuda, false);
+            let hidden_f32 = f32_model.forward_hidden(&ids, &mask).unwrap();
+            flash_oracle_pooled_and_grad(&f32_model, &hidden_f32, &mask)
+        };
 
         let err_flash_pooled = relative_l1_error(&pooled_flash, &pooled_f32);
         let err_block_pooled = relative_l1_error(&pooled_block, &pooled_f32);
@@ -3724,27 +3742,43 @@ mod tests {
         let seed = 44;
         let (batch, seq) = (8usize, 512usize);
 
-        let mut bf16_model =
-            flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda, true);
-        let f32_model = flash_oracle_build_model(&config, &weights, DType::F32, seed, &cuda, false);
         let ids = flash_oracle_synthetic_ids(batch, seq, config.vocab_size, seed, &cuda);
         let mask = Tensor::ones((batch, seq), DType::U32, &cuda).unwrap();
 
-        let hidden_block = forward_hidden_forcing_flash(&bf16_model, &ids, &mask, true).unwrap();
-        // FAULT: force every layer's flash-arm sliding window off -- the
-        // window is construction data ONLY the flash arm reads (see
-        // `ModernBertAttention::half_window`'s own doc); the block arm's
-        // sliding band above is unaffected (it comes from
-        // `ModernBert::local_half_window`, a separate field).
-        for layer in bf16_model.layers.iter_mut() {
-            layer.attention.half_window = None;
-        }
-        let hidden_fault = forward_hidden_forcing_flash(&bf16_model, &ids, &mask, false).unwrap();
-        let hidden_f32 = f32_model.forward_hidden(&ids, &mask).unwrap();
+        // Interleaved (forward -> pooled+grad -> DROP that hidden tensor's
+        // whole backward graph before the next arm) for the same reason
+        // `run_flash_oracle_shape` is: production-scale ModernBERT-large
+        // OOM'd on an 80GB A100 holding three arms' graphs alive at once
+        // (confirmed live).
+        let (pooled_block, pooled_fault) = {
+            let mut bf16_model =
+                flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda, true);
+            let hidden_block =
+                forward_hidden_forcing_flash(&bf16_model, &ids, &mask, true).unwrap();
+            let (pooled_block, _) = flash_oracle_pooled_and_grad(&bf16_model, &hidden_block, &mask);
+            drop(hidden_block);
 
-        let (pooled_block, _) = flash_oracle_pooled_and_grad(&bf16_model, &hidden_block, &mask);
-        let (pooled_fault, _) = flash_oracle_pooled_and_grad(&bf16_model, &hidden_fault, &mask);
-        let (pooled_f32, _) = flash_oracle_pooled_and_grad(&f32_model, &hidden_f32, &mask);
+            // FAULT: force every layer's flash-arm sliding window off -- the
+            // window is construction data ONLY the flash arm reads (see
+            // `ModernBertAttention::half_window`'s own doc); the block arm's
+            // sliding band above is unaffected (it comes from
+            // `ModernBert::local_half_window`, a separate field).
+            for layer in bf16_model.layers.iter_mut() {
+                layer.attention.half_window = None;
+            }
+            let hidden_fault =
+                forward_hidden_forcing_flash(&bf16_model, &ids, &mask, false).unwrap();
+            let (pooled_fault, _) = flash_oracle_pooled_and_grad(&bf16_model, &hidden_fault, &mask);
+            (pooled_block, pooled_fault)
+        };
+
+        let pooled_f32 = {
+            let f32_model =
+                flash_oracle_build_model(&config, &weights, DType::F32, seed, &cuda, false);
+            let hidden_f32 = f32_model.forward_hidden(&ids, &mask).unwrap();
+            let (pooled_f32, _) = flash_oracle_pooled_and_grad(&f32_model, &hidden_f32, &mask);
+            pooled_f32
+        };
 
         let err_block = relative_l1_error(&pooled_block, &pooled_f32);
         let err_fault = relative_l1_error(&pooled_fault, &pooled_f32);
@@ -3816,20 +3850,32 @@ mod tests {
         let weights = dir.join("model.safetensors");
         let (batch, seq) = (8usize, 512usize);
 
-        let bf16_model =
-            flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda, true);
-        let f32_model = flash_oracle_build_model(&config, &weights, DType::F32, seed, &cuda, false);
         let ids = flash_oracle_synthetic_ids(batch, seq, config.vocab_size, seed, &cuda);
         let mask = Tensor::ones((batch, seq), DType::U32, &cuda).unwrap();
 
-        let hidden_block = forward_hidden_forcing_flash(&bf16_model, &ids, &mask, true).unwrap();
-        let hidden_fault =
-            forward_hidden_flash_with_fault(&bf16_model, &ids, &mask, fault).unwrap();
-        let hidden_f32 = f32_model.forward_hidden(&ids, &mask).unwrap();
+        // Interleaved -- see `run_flash_oracle_shape`'s own comment for why
+        // (production-scale ModernBERT-large OOM'd on an 80GB A100 holding
+        // three arms' graphs alive at once, confirmed live).
+        let (pooled_block, pooled_fault) = {
+            let bf16_model =
+                flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda, true);
+            let hidden_block =
+                forward_hidden_forcing_flash(&bf16_model, &ids, &mask, true).unwrap();
+            let (pooled_block, _) = flash_oracle_pooled_and_grad(&bf16_model, &hidden_block, &mask);
+            drop(hidden_block);
+            let hidden_fault =
+                forward_hidden_flash_with_fault(&bf16_model, &ids, &mask, fault).unwrap();
+            let (pooled_fault, _) = flash_oracle_pooled_and_grad(&bf16_model, &hidden_fault, &mask);
+            (pooled_block, pooled_fault)
+        };
 
-        let (pooled_block, _) = flash_oracle_pooled_and_grad(&bf16_model, &hidden_block, &mask);
-        let (pooled_fault, _) = flash_oracle_pooled_and_grad(&bf16_model, &hidden_fault, &mask);
-        let (pooled_f32, _) = flash_oracle_pooled_and_grad(&f32_model, &hidden_f32, &mask);
+        let pooled_f32 = {
+            let f32_model =
+                flash_oracle_build_model(&config, &weights, DType::F32, seed, &cuda, false);
+            let hidden_f32 = f32_model.forward_hidden(&ids, &mask).unwrap();
+            let (pooled_f32, _) = flash_oracle_pooled_and_grad(&f32_model, &hidden_f32, &mask);
+            pooled_f32
+        };
 
         let err_block = relative_l1_error(&pooled_block, &pooled_f32);
         let err_fault = relative_l1_error(&pooled_fault, &pooled_f32);

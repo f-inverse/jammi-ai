@@ -109,3 +109,33 @@ pub(crate) fn sliding_window_mask(
     }
     Ok(Tensor::from_vec(band, (1, 1, seq, seq), device)?)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `AttentionBlockFused` (`jammi-kernels`) has no `window` construction
+    /// data — a caller combines `MASKED_LOGIT`-sentinel padding with a
+    /// `sliding_window_mask` band into ONE additive mask before calling it
+    /// (see that op's module doc's "window is construction data at the
+    /// call site" section), and the op's own fully-masked-row rule reads
+    /// that combined value with NO knowledge of which crate contributed
+    /// which term. This test is the measured, asserted proof (family F)
+    /// the two crates' independently-defined sentinels are the SAME value
+    /// — not merely the same sign — so a doubly-masked key (padded AND
+    /// out-of-window, `MASKED_LOGIT + jammi_kernels`'s own sentinel) lands
+    /// at a magnitude with the same clearance from the `0.0`/masked
+    /// boundary as a singly-masked one, rather than silently drifting if
+    /// either crate's constant were ever edited independently.
+    #[test]
+    fn masked_logit_matches_jammi_kernels_window_masked_value() {
+        assert_eq!(
+            MASKED_LOGIT,
+            jammi_kernels::ops::ATTENTION_BLOCK_WINDOW_MASKED_VALUE,
+            "jammi-encoders::mask::MASKED_LOGIT and \
+             jammi_kernels::ops::ATTENTION_BLOCK_WINDOW_MASKED_VALUE must be the exact same \
+             sentinel — AttentionBlockFused combines whichever mask a caller hands it with no \
+             way to tell padding from a window band apart"
+        );
+    }
+}

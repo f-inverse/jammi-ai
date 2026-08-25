@@ -24,20 +24,22 @@
 //! invoked here at the STORAGE level so it creates no autograd node (this
 //! whole function runs inside ONE `CustomOp3::cuda_fwd`).
 //!
-//! ## The window band: materialized as a scratch mask (module doc's
-//! disclosed Tier-0 choice)
+//! ## The window band is the caller's job, not this file's
 //!
-//! `[crate::ops::attention_block]`'s module doc states the Tier-0 choice
-//! between extending the softmax kernel's mask-broadcast signature and
-//! materializing the band into a scratch mask; this file takes the LATTER
-//! (matching the CPU arm): [`build_band_storage`] uploads a HOST-computed
-//! `[1, 1, seq, seq]` band (`clone_htod` — a real, disclosed host-to-device
-//! transfer of `seq^2` floats, pure position math with no data dependency,
-//! done once per forward call; not hidden here) and combines it with the
-//! padding mask via `BackendStorage::binary_impl::<candle_core::op::Add>`
-//! over `Layout::broadcast_as`-expanded views — the SAME additive
-//! combination, in the SAME order (band-plus-padding, summed once, then fed
-//! to softmax), the CPU arm and the current ModernBERT training arm both use.
+//! [`crate::ops::attention_block`]'s module doc states this op has no
+//! `window`/`half_window` construction data at all: the caller pre-combines
+//! its padding mask with any sliding-window band (`jammi_encoders::mask
+//! ::sliding_window_mask`, built once per `(seq, half_window, dtype,
+//! device)` by the call site's own cache) BEFORE this op ever runs, so
+//! `s3`/`l3` here are already the final additive mask —
+//! [`crate::ops::SoftmaxLastDimFused`]'s `cuda_fwd` is handed `s3`/`l3`
+//! DIRECTLY, with no scratch-mask build, no host-to-device band upload,
+//! and no `broadcast_as`/`binary_impl::<Add>` combination step in this
+//! file at all: `SoftmaxLastDimFused::cuda_fwd` already implements the
+//! general `[batch|1, 1, seq|1, seq]`-broadcasts-onto-`[batch, heads, seq,
+//! seq]` class this op's own `mask` domain now matches exactly (see
+//! `crate::ops::attention_block::check_mask`'s doc) — reusing that
+//! broadcast logic rather than re-deriving it here.
 //!
 //! ## UNVERIFIED ON HARDWARE at Tier 0
 //!
@@ -52,8 +54,7 @@ use candle_core::backend::BackendStorage;
 use candle_core::{CudaStorage, CustomOp2, CustomOp3, DType, Error, Layout, Result, Shape};
 
 use crate::ops::attention_block::{
-    attention_dims, check_mask, check_rope_pack, check_window, AttentionBlockFused,
-    WINDOW_MASKED_VALUE,
+    attention_dims, check_mask, check_rope_pack, AttentionBlockFused,
 };
 use crate::ops::{RopeFused, SoftmaxLastDimFused};
 
@@ -104,32 +105,6 @@ fn gather_bhsd(
     Ok((dst, Layout::contiguous(view.shape().clone())))
 }
 
-/// See the module doc's "The window band" section.
-fn build_band_storage(
-    s: usize,
-    half_window: usize,
-    dtype: DType,
-    device: &CudaDevice,
-) -> Result<(CudaStorage, Layout)> {
-    let mut band = vec![0f32; s * s];
-    for qi in 0..s {
-        for ki in 0..s {
-            if qi.abs_diff(ki) > half_window {
-                band[qi * s + ki] = WINDOW_MASKED_VALUE;
-            }
-        }
-    }
-    let l = Layout::contiguous((1, 1, s, s));
-    let slice = device.clone_htod(&band)?;
-    let storage = CudaStorage::wrap_cuda_slice(slice, device.clone());
-    if dtype == DType::F32 {
-        Ok((storage, l))
-    } else {
-        let cast = storage.to_dtype(&l, dtype)?;
-        Ok((cast, l))
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn cuda_fwd(
     op: &AttentionBlockFused,
@@ -148,9 +123,11 @@ pub(crate) fn cuda_fwd(
         let out = alloc_scratch(&device, s1.dtype(), 0)?;
         return Ok((out, out_shape));
     }
-    let mask_b = check_mask(l3, b, s, name)?;
-    let _ = mask_b; // broadcast handled structurally by `Layout::broadcast_as` below
-    let half_window = check_window(op.window, s, name)?;
+    // `check_mask` validates `mask`'s domain (module doc); the broadcast
+    // itself is handled structurally by `SoftmaxLastDimFused::cuda_fwd`
+    // below, which is handed `s3`/`l3` directly — no local unravel of
+    // `mask_b`/`mask_q` is needed in this file at all.
+    let (_mask_b, _mask_q) = check_mask(l3, b, s, name)?;
     if s1.dtype() != s3.dtype() {
         return Err(Error::DTypeMismatchBinaryOp {
             lhs: s1.dtype(),
@@ -199,30 +176,17 @@ pub(crate) fn cuda_fwd(
     let scores_storage = q_scaled.matmul(&k_rot, (bh, s, s, d), &flat_l, &k_t_l)?;
     let scores_l = Layout::contiguous((b, h, s, s));
 
-    let (combined_mask_storage, combined_mask_l) = match half_window {
-        Some(hw) => {
-            let (band_storage, band_l) = build_band_storage(s, hw, s1.dtype(), &device)?;
-            let mask_target = (b, 1usize, s, s);
-            let mask_bc_l = l3.broadcast_as(mask_target)?;
-            let band_bc_l = band_l.broadcast_as(mask_target)?;
-            let combined =
-                s3.binary_impl::<candle_core::op::Add>(&band_storage, &mask_bc_l, &band_bc_l)?;
-            (combined, Layout::contiguous(mask_target))
-        }
-        None => (s3.try_clone(l3)?, l3.clone()),
-    };
-
+    // `s3`/`l3` are ALREADY the caller's combined padding-plus-band mask
+    // (module doc's "The window band is the caller's job" section) — no
+    // scratch band to build or broadcast here; `SoftmaxLastDimFused::
+    // cuda_fwd` implements the `[batch|1, 1, seq|1, seq]`-onto-`[batch,
+    // heads, seq, seq]` broadcast class directly.
     let softmax_op = SoftmaxLastDimFused::new(op.fully_masked);
-    let (p_storage, p_shape) = CustomOp2::cuda_fwd(
-        &softmax_op,
-        &scores_storage,
-        &scores_l,
-        &combined_mask_storage,
-        &combined_mask_l,
-    )?;
+    let (p_storage, p_shape) =
+        CustomOp2::cuda_fwd(&softmax_op, &scores_storage, &scores_l, s3, l3)?;
     let p_flat_l = Layout::contiguous((bh, s, s));
     let v_flat_l = Layout::contiguous((bh, s, d));
-    let _ = p_shape;
+    debug_assert_eq!(p_shape, *scores_l.shape());
     let ctx_storage = p_storage.matmul(&v_storage, (bh, s, d, s), &p_flat_l, &v_flat_l)?;
 
     // Scatter [batch, heads, seq, head_dim] -> [batch, seq, heads*head_dim]

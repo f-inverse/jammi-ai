@@ -1705,6 +1705,7 @@ impl ModelBackend for CandleBackend {
                         load_projection_head(
                             weights_path,
                             cfg.lora_alpha,
+                            cfg.use_rslora,
                             &device,
                             &dimensions,
                             &resolved.model_id.0,
@@ -1715,6 +1716,7 @@ impl ModelBackend for CandleBackend {
                         load_distribution_head(
                             weights_path,
                             cfg.lora_alpha,
+                            cfg.use_rslora,
                             &device,
                             &dimensions,
                             &resolved.model_id.0,
@@ -1870,14 +1872,21 @@ fn tokens_to_tensor(vecs: &[Vec<u32>], device: &Device) -> Result<Tensor> {
     Tensor::from_vec(flat, (rows, cols), device).map_err(|e| JammiError::Inference(e.to_string()))
 }
 
-/// Load the projection head from `adapter_file` using the alpha recorded in
-/// the adapter's saved config. Returns `Some(LoraLinear)` keyed at
-/// `projection.lora_a` / `projection.lora_b`, or `None` if the projection
-/// keys are absent (the adapter was a classifier/NER head with no embedding
-/// projection — that case does not produce a post-pool projection).
+/// Load the projection head from `adapter_file` using the alpha (and
+/// rSLoRA flag) recorded in the adapter's saved config — `use_rslora` must
+/// be the persisted training-time choice
+/// ([`crate::fine_tune::target::ProjectionHeadConfig::use_rslora`]), never a
+/// fixed default: rSLoRA scales by `alpha / sqrt(rank)` instead of `alpha /
+/// rank`, so serving a rSLoRA-trained adapter at the vanilla scaling
+/// silently shrinks its contribution by `1/sqrt(rank)` (esc-041). Returns
+/// `Some(LoraLinear)` keyed at `projection.lora_a` / `projection.lora_b`, or
+/// `None` if the projection keys are absent (the adapter was a
+/// classifier/NER head with no embedding projection — that case does not
+/// produce a post-pool projection).
 fn load_projection_head(
     adapter_file: &std::path::Path,
     lora_alpha: f64,
+    use_rslora: bool,
     device: &Device,
     dimensions: &crate::model::ModelDimensions,
     model_id: &str,
@@ -1904,12 +1913,13 @@ fn load_projection_head(
         None => return Ok(None),
     };
 
-    Ok(Some(jammi_lora::LoraLinear::from_loaded(
-        base_linear,
-        lora_a,
-        lora_b,
-        lora_alpha,
-    )))
+    let lora =
+        jammi_lora::LoraLinear::from_loaded(base_linear, lora_a, lora_b, lora_alpha, use_rslora)
+            .map_err(|e| JammiError::Model {
+                model_id: model_id.to_string(),
+                message: format!("projection LoRA scaling: {e}"),
+            })?;
+    Ok(Some(lora))
 }
 
 /// Reload the regression `distribution` head layer — the `hidden → output_dim`
@@ -1919,6 +1929,10 @@ fn load_projection_head(
 /// `head.layers[1]`, the distribution layer — NOT the `projection` layer), so
 /// serving must apply the same one to reproduce the trained output shape.
 ///
+/// `use_rslora` must be the persisted training-time choice — see
+/// [`load_projection_head`]'s doc for why a fixed default silently mis-scales
+/// a rSLoRA-trained adapter (esc-041).
+///
 /// Its zeros base spans `output_dim → hidden_size`; `output_dim` is recovered
 /// from the persisted `distribution.lora_b` row count (B is `output_dim × rank`),
 /// so the served head width matches the trained head without re-deriving it from
@@ -1927,6 +1941,7 @@ fn load_projection_head(
 fn load_distribution_head(
     adapter_file: &std::path::Path,
     lora_alpha: f64,
+    use_rslora: bool,
     device: &Device,
     dimensions: &crate::model::ModelDimensions,
     model_id: &str,
@@ -1965,12 +1980,13 @@ fn load_distribution_head(
     })?;
     let base_linear = candle_nn::Linear::new(base, None);
 
-    Ok(Some(jammi_lora::LoraLinear::from_loaded(
-        base_linear,
-        lora_a,
-        lora_b,
-        lora_alpha,
-    )))
+    let lora =
+        jammi_lora::LoraLinear::from_loaded(base_linear, lora_a, lora_b, lora_alpha, use_rslora)
+            .map_err(|e| JammiError::Model {
+                model_id: model_id.to_string(),
+                message: format!("distribution LoRA scaling: {e}"),
+            })?;
+    Ok(Some(lora))
 }
 
 /// Normalize DistilBERT config fields to standard BERT names.
@@ -2219,6 +2235,96 @@ fn gpu_unavailable(gpu_device: i32, require_gpu: bool) -> Result<Device> {
         );
     }
     Ok(Device::Cpu)
+}
+
+/// esc-041: `load_projection_head` must apply the *persisted* rSLoRA choice,
+/// not a fixed default. Every quantity here is measured through the
+/// production `load_projection_head` — writing a real adapter.safetensors to
+/// a tempdir, loading it, and reading the actual forward-pass magnitude —
+/// never asserted against a hand-derived formula alone.
+#[cfg(test)]
+mod projection_head_rslora_tests {
+    use super::*;
+    use candle_core::safetensors;
+    use std::collections::HashMap;
+
+    /// Build a one-`projection`-layer adapter file with `lora_a`/`lora_b`
+    /// filled with ones (so the LoRA delta on an all-ones input is a known,
+    /// nonzero constant — `hidden * rank`), load it through the production
+    /// `load_projection_head` with the given `use_rslora`, and return the
+    /// scaling factor `load_projection_head` actually applied (back-derived
+    /// from the base-identity forward-pass delta, not asserted directly).
+    fn served_scaling(rank: usize, alpha: f64, use_rslora: bool) -> f64 {
+        let device = Device::Cpu;
+        let hidden = 4usize;
+        let lora_a = Tensor::ones((rank, hidden), DType::F32, &device).unwrap();
+        let lora_b = Tensor::ones((hidden, rank), DType::F32, &device).unwrap();
+        let mut weights: HashMap<String, Tensor> = HashMap::new();
+        weights.insert("projection.lora_a".to_string(), lora_a);
+        weights.insert("projection.lora_b".to_string(), lora_b);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("adapter.safetensors");
+        safetensors::save(&weights, &path).unwrap();
+
+        let dims = crate::model::ModelDimensions {
+            hidden_size: hidden,
+            num_layers: 1,
+            num_attention_heads: 1,
+            intermediate_size: hidden,
+        };
+        let lora = load_projection_head(&path, alpha, use_rslora, &device, &dims, "esc-041-test")
+            .unwrap()
+            .expect("adapter carries a projection layer");
+        let x = Tensor::ones((1, hidden), DType::F32, &device).unwrap();
+        let out = lora.forward(&x).unwrap();
+        let out_v: Vec<Vec<f32>> = out.to_vec2().unwrap();
+        // base is identity, so `out - x = scaling * (hidden * rank)` (see
+        // this fn's doc for the ones-filled A/B derivation).
+        let delta = out_v[0][0] - 1.0;
+        (delta / (hidden as f32 * rank as f32)) as f64
+    }
+
+    /// esc-041 (a) anti-vacuity, (b) finiteness, (c) two-sided ratio: at both
+    /// r = 16 and r = 4, serving with `use_rslora = false` (what
+    /// `load_projection_head` did unconditionally before this fix) applies
+    /// only `1/sqrt(rank)` of the true rSLoRA-trained scaling — `1/4` at
+    /// r = 16, `1/2` at r = 4 — while serving with the *persisted*
+    /// `use_rslora = true` matches the trained scaling exactly (ratio
+    /// `1.0`). The two served values are also required to differ (anti-
+    /// vacuity: the parameter has a real, non-trivial effect), and both to
+    /// be finite.
+    #[test]
+    fn served_scaling_ratio_matches_persisted_rslora_flag() {
+        let alpha = 8.0;
+        for (rank, expected_naive_ratio) in [(16usize, 0.25), (4usize, 0.5)] {
+            let true_scaling = alpha / (rank as f64).sqrt();
+
+            let naive = served_scaling(rank, alpha, false);
+            let fixed = served_scaling(rank, alpha, true);
+
+            assert!(naive.is_finite(), "naive-path scaling must be finite");
+            assert!(fixed.is_finite(), "fixed-path scaling must be finite");
+            assert!(
+                (naive - fixed).abs() > 1e-9,
+                "use_rslora must have a non-vacuous effect: naive={naive}, fixed={fixed}"
+            );
+
+            let naive_ratio = naive / true_scaling;
+            let fixed_ratio = fixed / true_scaling;
+            assert!(
+                (naive_ratio - expected_naive_ratio).abs() < 1e-9,
+                "rank={rank}: serving without the persisted rSLoRA flag should apply \
+                 1/sqrt(rank) = {expected_naive_ratio} of the trained scaling, got ratio \
+                 {naive_ratio}"
+            );
+            assert!(
+                (fixed_ratio - 1.0).abs() < 1e-9,
+                "rank={rank}: serving with the persisted rSLoRA flag must match the trained \
+                 scaling exactly (ratio 1.0), got {fixed_ratio}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

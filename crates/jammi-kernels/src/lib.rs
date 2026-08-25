@@ -27,3 +27,10 @@ pub mod philox;
 
 #[cfg(feature = "cuda")]
 mod cuda;
+
+/// Vendored FlashAttention-2 varlen forward/backward behind a torch-free C
+/// ABI — the FFI declarations, the safe Rust entry points, and the scratch
+/// allocation rules. Feature `flash-attn` only (implies `cuda`); no
+/// `KernelOp` here yet — this is the kernel boundary a later op composes.
+#[cfg(feature = "flash-attn")]
+pub mod flash;

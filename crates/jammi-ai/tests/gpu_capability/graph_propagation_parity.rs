@@ -9,7 +9,7 @@
 //! `f32` cast (see `pipeline::graph_propagation`), deterministic and identical
 //! regardless of the session's `gpu.device`. So this is not a GPU-kernel parity
 //! proof (there is nothing on the GPU to diverge) — it is a **device-independence
-//! + determinism guard**: the GPU-pinned session (which really holds CUDA, via
+//! and determinism guard**: the GPU-pinned session (which really holds CUDA, via
 //! `require_gpu`) and the CPU-pinned session run the same propagation over the
 //! same fixture and must produce **bit-identical** per-node vectors. A
 //! regression that routed propagation through a device-sensitive path, or made

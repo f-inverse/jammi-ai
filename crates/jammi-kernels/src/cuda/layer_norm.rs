@@ -4,6 +4,7 @@ use candle_core::{CudaStorage, DType, Error, Layout, Result, Shape};
 use half::bf16;
 
 use super::PTX_LAYER_NORM;
+use crate::ops::layer_norm::hidden_of;
 use crate::ops::MAX_HIDDEN;
 
 /// See `../../cuda/axpy.rs`'s identical constant for the module-name
@@ -12,23 +13,6 @@ const MODULE_NAME: &str = "jammi_kernels_layer_norm";
 
 /// One CUDA thread block per row; must match `LN_BLOCK` in `layer_norm.cu`.
 const LN_BLOCK: u32 = 256;
-
-fn hidden_of(l1: &Layout, l2: &Layout, op: &'static str) -> Result<usize> {
-    let dims = l1.dims();
-    let hidden = *dims.last().ok_or_else(|| {
-        Error::Msg(format!(
-            "{op}: input must have rank >= 1 to define a last (hidden) dimension"
-        ))
-    })?;
-    if l2.dims() != [hidden] {
-        return Err(Error::ShapeMismatchBinaryOp {
-            lhs: l1.shape().clone(),
-            rhs: l2.shape().clone(),
-            op,
-        });
-    }
-    Ok(hidden)
-}
 
 /// `hidden > MAX_HIDDEN`: refused above a conservative, VALIDATED ceiling
 /// — NOT a hardware limit (see `ops::MAX_HIDDEN`'s doc: the block-per-row
@@ -46,13 +30,7 @@ fn check_cuda_domain(op: &'static str, n: usize, hidden: usize) -> Result<()> {
              ops::MAX_HIDDEN's doc); the CPU arm has no such ceiling"
         )));
     }
-    if n > u32::MAX as usize {
-        return Err(Error::Msg(format!(
-            "{op}: {n} elements exceeds u32::MAX; the CUDA launch grid and the \
-             kernel's indices are both 32-bit"
-        )));
-    }
-    Ok(())
+    super::check_elem_count_fits_u32(op, n)
 }
 
 pub(crate) fn cuda_fwd(
@@ -69,18 +47,14 @@ pub(crate) fn cuda_fwd(
     let n = l1.shape().elem_count();
 
     if hidden == 0 || n == 0 {
-        return match (s1.dtype(), s2.dtype()) {
-            (DType::F32, DType::F32) => {
-                let out = unsafe { device.alloc::<f32>(0) }?;
-                Ok((CudaStorage::wrap_cuda_slice(out, device), shape))
-            }
-            (DType::BF16, DType::BF16) => {
-                let out = unsafe { device.alloc::<bf16>(0) }?;
-                Ok((CudaStorage::wrap_cuda_slice(out, device), shape))
-            }
-            (lhs, rhs) if lhs != rhs => Err(Error::DTypeMismatchBinaryOp { lhs, rhs, op: OP }),
-            (dtype, _) => Err(Error::UnsupportedDTypeForOp(dtype, OP)),
-        };
+        if s1.dtype() != s2.dtype() {
+            return Err(Error::DTypeMismatchBinaryOp {
+                lhs: s1.dtype(),
+                rhs: s2.dtype(),
+                op: OP,
+            });
+        }
+        return Ok((super::alloc_empty(&device, s1.dtype(), OP)?, shape));
     }
     check_cuda_domain(OP, n, hidden)?;
     let rows = n / hidden;
@@ -172,18 +146,14 @@ pub(crate) fn cuda_bwd_dx(
     let n = l1.shape().elem_count();
 
     if hidden == 0 || n == 0 {
-        return match (s1.dtype(), s2.dtype()) {
-            (DType::F32, DType::F32) => {
-                let out = unsafe { device.alloc::<f32>(0) }?;
-                Ok((CudaStorage::wrap_cuda_slice(out, device), shape))
-            }
-            (DType::BF16, DType::BF16) => {
-                let out = unsafe { device.alloc::<bf16>(0) }?;
-                Ok((CudaStorage::wrap_cuda_slice(out, device), shape))
-            }
-            (lhs, rhs) if lhs != rhs => Err(Error::DTypeMismatchBinaryOp { lhs, rhs, op: OP }),
-            (dtype, _) => Err(Error::UnsupportedDTypeForOp(dtype, OP)),
-        };
+        if s1.dtype() != s2.dtype() {
+            return Err(Error::DTypeMismatchBinaryOp {
+                lhs: s1.dtype(),
+                rhs: s2.dtype(),
+                op: OP,
+            });
+        }
+        return Ok((super::alloc_empty(&device, s1.dtype(), OP)?, shape));
     }
     check_cuda_domain(OP, n, hidden)?;
     let rows = n / hidden;
@@ -277,24 +247,17 @@ pub(crate) fn cuda_bwd_dgamma(
     let n = l1.shape().elem_count();
 
     if hidden == 0 || n == 0 {
-        return match (s1.dtype(), s2.dtype()) {
-            (DType::F32, DType::F32) => {
-                let out = unsafe { device.alloc::<f32>(0) }?;
-                Ok((
-                    CudaStorage::wrap_cuda_slice(out, device),
-                    Shape::from(0usize),
-                ))
-            }
-            (DType::BF16, DType::BF16) => {
-                let out = unsafe { device.alloc::<bf16>(0) }?;
-                Ok((
-                    CudaStorage::wrap_cuda_slice(out, device),
-                    Shape::from(0usize),
-                ))
-            }
-            (lhs, rhs) if lhs != rhs => Err(Error::DTypeMismatchBinaryOp { lhs, rhs, op: OP }),
-            (dtype, _) => Err(Error::UnsupportedDTypeForOp(dtype, OP)),
-        };
+        if s1.dtype() != s2.dtype() {
+            return Err(Error::DTypeMismatchBinaryOp {
+                lhs: s1.dtype(),
+                rhs: s2.dtype(),
+                op: OP,
+            });
+        }
+        return Ok((
+            super::alloc_empty(&device, s1.dtype(), OP)?,
+            Shape::from(0usize),
+        ));
     }
     check_cuda_domain(OP, n, hidden)?;
     let rows = n / hidden;

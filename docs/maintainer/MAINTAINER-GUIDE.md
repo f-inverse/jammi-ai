@@ -1868,7 +1868,7 @@ statefulness is a review concern, stated in the module doc rather than overclaim
   the driver JIT-forwards that single `sm_80` PTX to 8.6/8.9/9.0 devices at
   first load (no `-use_fast_math`; `--fmad` contraction is accepted within each
   oracle's stated tolerance, not pinned away globally).
-- **The five ops** (`crates/jammi-kernels/src/ops/`): `LayerNormFused`
+- **The ops** (`crates/jammi-kernels/src/ops/`): `LayerNormFused`
   (`layer_norm.rs`) — bias-free LayerNorm fwd+bwd, reduced over the last dim;
   `bwd` recomputes mean/invvar from `x` (candle 0.11 has no save-for-backward
   channel) via an internal `CustomOp3` helper, `dgamma` skippable via
@@ -1884,7 +1884,18 @@ statefulness is a review concern, stated in the module doc rather than overclaim
   `ScaledCastAdd` (`scaled_cast_add.rs`) — the LoRA-site epilogue `base +
   cast(lora * scaling)`, replacing `[mul, cast, add]`; a generic Tensor-API
   primitive, not LoRA-specific by name (family L), whose one real caller today
-  is `jammi-lora`'s `LoraLinear::forward`.
+  is `jammi-lora`'s `LoraLinear::forward`. `LowRankResidualLinear`
+  (`low_rank_residual_linear.rs`) — the whole LoRA SITE (base matmul, dropout,
+  both LoRA GEMMs, and `ScaledCastAdd`'s own epilogue, reused as an internal
+  step) as one `CustomOp3`, called from `jammi-lora`'s `LoraLinear::forward`
+  when its own domain holds; `ScaledCastAdd`'s standalone dispatch counters
+  stay at zero on a run where this op's are nonzero (see that op's own module
+  doc). `AttentionBlockFused` (`attention_block.rs`) — the WHOLE
+  RoPE+`QKᵀ`+mask+softmax+`PV` attention chain as one `CustomOp3`, composed
+  from this crate's own existing primitives at the storage level (no new
+  `.cu` kernel); has no `window` construction data of its own — a
+  local-attention caller pre-combines its padding mask with a sliding-window
+  band into ONE additive `mask` argument before calling it.
 
 **Admission (`crates/jammi-kernels/src/admission.rs`): validate-and-fall-back
 with typed refusals.** No op decides fusion *policy* in this module — a call
@@ -1915,7 +1926,12 @@ outcome through the shared mechanism:
   entry point: it always records the outcome, then on a failed predicate either
   logs-once-and-falls-back (`AdmissionMode::Fallback`, the default) or returns
   `KernelError::StrictModeFallback` (`AdmissionMode::Strict`) — never a silent
-  wrong number.
+  wrong number. `KernelError` (`crates/jammi-kernels/src/error.rs`) also carries
+  a second, unrelated variant for the SAME "typed refusal, never a confident
+  wrong number" doctrine at a different point in the pipeline:
+  `KernelError::InvalidScale` — an op's own construction-time domain check
+  (`SoftmaxLastDimFused::with_scale`, below), which runs before `apply2`/`admit`
+  ever see the op, not a failed admission predicate.
 - **`JAMMI_KERNELS_STRICT`** — `admission_mode()` reads this env var once per
   process (`OnceLock`); its presence (any value) selects `Strict`. ONE env var
   governs every fused op in every crate that calls `admit`, rather than one per
@@ -2005,6 +2021,21 @@ disclosed choice against a named upstream reference, not this crate's own
   (see `ops`'s module doc's `Copy` discussion), and a caller whose masking/
   activation convention does not match a policy's premise simply never
   requests it, rather than the op silently guessing.
+- **`SoftmaxLastDimFused::scale` — construction data with a numeric domain,
+  not an enum policy, so it gets its own doctrine.** Folds `1/sqrt(head_dim)`
+  into the fused softmax op (`scale * scores + mask`, applied strictly before
+  the mask add — see `ops/softmax.rs`'s module doc's "scale semantics"
+  section), replacing the `Op::Affine` node ModernBERT's training arm used to
+  retain per layer. The field is PRIVATE (unlike `fully_masked`, whose
+  `FullyMaskedPolicy` has no invalid inhabitant): the only way to set it is
+  `SoftmaxLastDimFused::with_scale(scale: f32) -> Result<Self, KernelError>`,
+  which refuses non-finite or non-positive `scale` (`KernelError::InvalidScale`
+  — see above), and the only way to read it back is the `scale()` accessor.
+  Default `1.0`, an exact no-op at every dtype. `jammi-encoders`'
+  `softmax_admission_predicate` gains a `scale_finite_positive` clause so a
+  bad scale becomes a counted eager fallback at the call site (Fallback mode)
+  or `KernelError::StrictModeFallback` (Strict mode), never a `with_scale`
+  refusal surfacing from inside the training arm.
 - **The relative-with-floor bf16 metric.** Every bf16 oracle bounds divergence
   as `|a - b| <= REL_TOL * max(|a|, |b|) + ABS_FLOOR` (each op's own
   `bf16_close`/equivalent, e.g. `tests/geglu_oracles.rs`), never bit-exact

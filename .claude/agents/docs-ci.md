@@ -25,6 +25,7 @@ owns:
   - deny.toml
   - pyproject.toml
   - rust-toolchain.toml
+  - .gitmodules
 ---
 
 # docs-ci
@@ -57,7 +58,7 @@ You are a subagent. Every "user" message is your caller (the lead). The lead see
 
 ## Acceptance
 
-Run the hermetic static gates the change touches, capturing `$?` per step (no pipe-masking): `python3 ci/scripts/check_swarm_bijection.py`, `python3 ci/scripts/check_doc_parity.py`, `python3 ci/scripts/check_constitution_anchors.py`, `python3 ci/scripts/check_no_consumer_names.py`, and `python3 ci/scripts/check_dep_direction.py` / `bash ci/scripts/check_cookbook_one_way.sh` as relevant. When a shared-declaration file (`lib.rs`/`Cargo.toml`/`error.rs`) is edited, also run the owning crate's `cargo fmt`/`clippy`/`test` (the edit compiles into that crate) and coordinate the atomic cross-crate change with the lead.
+Run the hermetic static gates the change touches, capturing `$?` per step (no pipe-masking): `python3 ci/scripts/check_swarm_bijection.py`, `python3 ci/scripts/check_doc_parity.py`, `python3 ci/scripts/check_constitution_anchors.py`, `python3 ci/scripts/check_no_consumer_names.py`, and `python3 ci/scripts/check_dep_direction.py` / `bash ci/scripts/check_cookbook_one_way.sh` as relevant. When a shared-declaration file (`lib.rs`/`Cargo.toml`/`error.rs`) is edited, also run the owning crate's `cargo fmt`/`clippy`/`test` (the edit compiles into that crate), the owning crate's rustdoc gate — `RUSTDOCFLAGS="-D warnings" cargo doc -p <crate> --no-deps` (`jammi-python` excepted per its `.github/workflows/docs.yml` exclusion — use its own per-crate form and note the exclusion) — and the workspace form `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --exclude jammi-python --no-deps` since a shared root can move any crate's public doc surface (the exact lane behind 7fd457e/ec756d3), and coordinate the atomic cross-crate change with the lead.
 
 ## Hand-off
 

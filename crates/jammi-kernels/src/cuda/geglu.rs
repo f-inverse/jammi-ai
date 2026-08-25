@@ -29,19 +29,6 @@ fn launch_config(n: u32) -> LaunchConfig {
     }
 }
 
-/// `n > u32::MAX`: the launch grid and the kernel's own indices are
-/// 32-bit, exactly the guard every other op's CUDA glue in this crate
-/// documents for the same reason.
-fn check_n(op: &'static str, n: usize) -> Result<()> {
-    if n > u32::MAX as usize {
-        return Err(Error::Msg(format!(
-            "{op}: {n} elements exceeds u32::MAX; the CUDA launch grid and \
-             the kernel's indices are both 32-bit"
-        )));
-    }
-    Ok(())
-}
-
 pub(crate) fn cuda_fwd(
     variant: GeluVariant,
     s1: &CudaStorage,
@@ -54,20 +41,10 @@ pub(crate) fn cuda_fwd(
     let device = s1.device().clone();
 
     if intermediate == 0 {
-        return match s1.dtype() {
-            DType::F32 => {
-                let out = unsafe { device.alloc::<f32>(0) }?;
-                Ok((CudaStorage::wrap_cuda_slice(out, device), out_shape))
-            }
-            DType::BF16 => {
-                let out = unsafe { device.alloc::<bf16>(0) }?;
-                Ok((CudaStorage::wrap_cuda_slice(out, device), out_shape))
-            }
-            dtype => Err(Error::UnsupportedDTypeForOp(dtype, OP)),
-        };
+        return Ok((super::alloc_empty(&device, s1.dtype(), OP)?, out_shape));
     }
     let n_out = rows * intermediate;
-    check_n(OP, n_out)?;
+    super::check_elem_count_fits_u32(OP, n_out)?;
     let (o1, o2) = l1
         .contiguous_offsets()
         .ok_or(Error::RequiresContiguous { op: OP })?;
@@ -133,20 +110,10 @@ pub(crate) fn cuda_bwd_dwi_out(
     let wi_shape = l1.shape().clone();
 
     if intermediate == 0 {
-        return match s1.dtype() {
-            DType::F32 => {
-                let out = unsafe { device.alloc::<f32>(0) }?;
-                Ok((CudaStorage::wrap_cuda_slice(out, device), wi_shape))
-            }
-            DType::BF16 => {
-                let out = unsafe { device.alloc::<bf16>(0) }?;
-                Ok((CudaStorage::wrap_cuda_slice(out, device), wi_shape))
-            }
-            dtype => Err(Error::UnsupportedDTypeForOp(dtype, OP)),
-        };
+        return Ok((super::alloc_empty(&device, s1.dtype(), OP)?, wi_shape));
     }
     let n_out = rows * intermediate;
-    check_n(OP, n_out)?;
+    super::check_elem_count_fits_u32(OP, n_out)?;
     let n_full = rows * 2 * intermediate;
     let (o1, o2) = l1
         .contiguous_offsets()

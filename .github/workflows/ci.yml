@@ -30,6 +30,45 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # `--all-targets` above only compiles test targets whose
+      # `required-features` are satisfied by default. Exactly three
+      # workspace test targets are NOT (`cargo metadata` enumerated): jammi-ai
+      # `gpu_capability` (`required-features = ["live-gpu-tests"]`), jammi-ai
+      # `distributed` (`required-features = ["live-distributed-tests"]`) —
+      # both covered by the step below, neither needs an actual GPU/CUDA
+      # toolchain or a distributed harness to *compile*, only to run
+      # meaningfully, so this step stays hermetic and cheap — and jammi-kernels
+      # `cuda_parity` (`required-features = ["cuda"]`, crates/jammi-kernels/
+      # Cargo.toml:66), which CANNOT be covered here: `cuda` pulls
+      # `dep:bindgen_cuda`, a real CUDA toolchain requirement this hermetic
+      # runner does not have. That target is linted instead in
+      # `ci/scripts/runpod_gpu_prove.sh`, the one lane with a real GPU.
+      #
+      # This step is what actually closes the doc_lazy_continuation escape
+      # `ci/scripts/check_doc_list_indent.py` was written to catch (a real
+      # hit in gpu_capability's `graph_propagation_parity.rs`, confirmed via
+      # this exact command going from EXIT=101/4 errors to EXIT=0 once the
+      # doc was fixed). That script was retired, not merged in alongside
+      # this step: it both OVER-approximates the lint (flags markdown-list-
+      # shaped lines mid-paragraph, e.g. `2. text`, that clippy is silent on)
+      # and UNDER-approximates it (misses flush-left prose following a
+      # properly-indented continuation, which clippy does flag) — a fixed
+      # text scanner cannot track clippy's own CommonMark-interruption rules,
+      # so it is not a substitute for running the real lint.
+      #
+      # Residual gap, disclosed rather than silently accepted: a doc comment
+      # attached to an item behind a proc-macro attribute (e.g. `#[test_case
+      # (...)]`) is invisible to `clippy::doc_lazy_continuation` — the macro
+      # expansion masks the lint, a class no `cargo clippy` invocation can
+      # see through. `check_doc_list_indent.py` DID cover that class (it is
+      # a text scanner, not macro-aware), so retiring it trades away
+      # detection there. `crates ci` at HEAD has zero such hits, so this is
+      # a prospective gap, not a live one; if it needs closing, it needs a
+      # macro-aware (or item-doc-scoped) checker, not a reinstated line-shape
+      # scanner with the over/under-approximation problems above.
+      - name: Clippy (gated test surfaces — compile-only feature closure)
+        run: cargo clippy -p jammi-ai --tests --features live-gpu-tests,live-distributed-tests -- -D warnings
+
   test:
     name: Test (hermetic)
     runs-on: ubuntu-latest
@@ -186,6 +225,27 @@ jobs:
       # Cargo.toml.
       - name: Assert no proprietary crate in the OSS engine dep tree
         run: cargo metadata --format-version 1 --locked | python3 ci/scripts/check_dep_direction.py
+
+  flash-attn-closure:
+    name: Guard (flash-attn feature closure)
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust-ci
+
+      # `jammi-kernels/flash-attn` vendors CUTLASS + a multi-minute `nvcc`
+      # build; it must depend on `cuda` but never be IMPLIED by it, or the
+      # release lane (`release-binaries.yml`'s `cuda,jetstream-broker,
+      # storage-cloud` build) silently drags CUTLASS into every release
+      # build. This walks the workspace feature graph the way the resolver
+      # does (own `cargo metadata --no-deps` call, so it runs unpiped unlike
+      # the dep-direction guard above) and fails if `flash-attn` is reachable
+      # from `default`, the release lane's feature set, or `--all-features`.
+      - name: Assert no consumer's feature closure reaches jammi-kernels/flash-attn
+        run: python3 ci/scripts/check_flash_attn_closure.py
 
   oss-only-build:
     name: Guard (OSS-only build)
@@ -500,6 +560,7 @@ jobs:
       - test-clients
       - guard
       - dep-direction
+      - flash-attn-closure
       - oss-only-build
       - dep-audit
       - ts-client

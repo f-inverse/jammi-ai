@@ -57,41 +57,39 @@
 //! populated`, `backprop.rs:175`) rather than silently training a
 //! grad-less parameter — a safe failure mode, not a silent-wrong one.
 
+use std::sync::LazyLock;
+
 use candle_core::{DType, Tensor, D};
 use candle_nn::{Init, VarBuilder};
-use jammi_kernels::admission::{admit, DispatchCounters, DispatchOutcome};
+use jammi_kernels::admission::{
+    admission_mode, admit, counters_for, device_is_supported, DispatchCounters, DispatchOutcome,
+};
 use jammi_kernels::ops::{apply2, LayerNormFused, MAX_HIDDEN};
 
 use crate::error::EncoderError;
 
 /// Per-op fused/eager dispatch counts for the bias-free training
-/// LayerNorm. This static itself is `pub` but lives inside a
-/// crate-private module (`mod layer_norm;` in `lib.rs`) — unnameable
-/// from outside this crate. [`crate::ln_dispatch_snapshot`] is the actual
-/// public read API a durable job record or a bench report uses.
-pub static LN_DISPATCH_COUNTERS: DispatchCounters = DispatchCounters::new();
-
-/// `Strict` mode (an explicit fused-path request errors instead of
-/// falling back), and whether a device is one every fused CPU/CUDA op in
-/// this crate can run on — MOVED (the C6 commit) to
-/// `jammi_kernels::admission` as the canonical home: `jammi-lora`, which
-/// has no dependency on this crate, needed the exact same two audited
-/// predicates for its own fused LoRA-site epilogue, and duplicating them a
-/// second time was the wrong fix (see `jammi_kernels::admission`'s module
-/// doc for the full "op-keyed dispatch-counter registry" rationale).
-///
-/// Re-exported here under their ORIGINAL names/paths
-/// (`crate::layer_norm::admission_mode`, `crate::layer_norm::
-/// device_is_supported`) so every existing call site in this crate —
-/// this file's own [`LayerNorm::forward_fused_or_fallback`] and
-/// `crate::modernbert`'s RoPE/softmax/GeGLU admission predicates, all of
-/// which reach these through `crate::layer_norm::` — keeps compiling
-/// unchanged. See `jammi_kernels::admission::admission_mode` /
-/// `jammi_kernels::admission::device_is_supported` for the full
-/// documentation (Metal-rejection rationale, the `JAMMI_KERNELS_STRICT`
-/// env var, etc.), which now lives at the canonical definition rather
-/// than here.
-pub(crate) use jammi_kernels::admission::{admission_mode, device_is_supported};
+/// LayerNorm, read from `jammi_kernels::admission`'s op-keyed registry
+/// (`counters_for`) rather than a directly-owned `static DispatchCounters`
+/// — this crate's C2-C5 four ops (this one plus RoPE/softmax/GeGLU in
+/// `crate::modernbert`) were the registry's pre-existing hand-declared
+/// statics; migrating them here is what makes the registry the SOLE
+/// source of dispatch counters crate-wide (`jammi-lora`'s LoRA-site ops
+/// already used it from the start — see `jammi_kernels::admission`'s
+/// module doc). A `LazyLock`, not a plain `fn`, so `LN_DISPATCH_COUNTERS`
+/// stays a `static` item: `crate::ln_dispatch_snapshot` (`lib.rs`, shared
+/// class, not touched by this migration) calls
+/// `layer_norm::LN_DISPATCH_COUNTERS.snapshot()` — a bare path followed by
+/// a method call — which keeps compiling unchanged against a `LazyLock`
+/// (auto-deref resolves `.snapshot()` through it to
+/// `DispatchCounters::snapshot`) but would NOT compile against a renamed
+/// function (`LN_DISPATCH_COUNTERS().snapshot()` is a different call
+/// shape). This static itself is `pub` but lives inside a crate-private
+/// module (`mod layer_norm;` in `lib.rs`) — unnameable from outside this
+/// crate; `crate::ln_dispatch_snapshot` is the actual public read API a
+/// durable job record or a bench report uses.
+pub static LN_DISPATCH_COUNTERS: LazyLock<&'static DispatchCounters> =
+    LazyLock::new(|| counters_for("layer_norm_fused"));
 
 /// The fused kernel's domain, checked at the call site (family D / K2):
 /// `x` and `weight` live on a device [`device_is_supported`] accepts,
@@ -193,7 +191,7 @@ impl LayerNorm {
             "layer_norm_fused",
             predicate,
             holds,
-            &LN_DISPATCH_COUNTERS,
+            *LN_DISPATCH_COUNTERS,
         )?;
         match outcome {
             DispatchOutcome::Fused => Ok(apply2(

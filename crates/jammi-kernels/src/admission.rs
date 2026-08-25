@@ -284,15 +284,42 @@ pub fn device_is_supported(d: &Device) -> bool {
 /// the registry can hand back a genuine `&'static DispatchCounters` without
 /// any unsafe lifetime extension.
 pub fn counters_for(op: &'static str) -> &'static DispatchCounters {
-    static REGISTRY: OnceLock<Mutex<HashMap<&'static str, &'static DispatchCounters>>> =
-        OnceLock::new();
-    let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = registry
+    registry()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    guard
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .entry(op)
         .or_insert_with(|| Box::leak(Box::new(DispatchCounters::new())))
+}
+
+/// The registry [`counters_for`] reads/writes — split out so [`snapshot_all`]
+/// can take the SAME lock rather than maintaining a second table.
+fn registry() -> &'static Mutex<HashMap<&'static str, &'static DispatchCounters>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<&'static str, &'static DispatchCounters>>> =
+        OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// A snapshot of every op currently registered in [`counters_for`]'s
+/// table, keyed by op name — the read API a durable job record or a bench
+/// report uses to state which kernel paths ran during a measured run
+/// WITHOUT needing to know each op's name ahead of time (unlike a
+/// per-op `*_dispatch_snapshot()` function, which does). `BTreeMap` (not
+/// `HashMap`): a deterministic iteration order for anything that logs or
+/// serializes this snapshot (family J — hashmap iteration order is not a
+/// fold order this codebase relies on for a durable artifact).
+///
+/// Only reflects ops that have been looked up via [`counters_for`] at
+/// least once (an op with zero forwards taken through it — e.g. a code
+/// path never reached in this run — is simply ABSENT, not present with
+/// zero counts); a caller that needs to distinguish "never registered"
+/// from "registered but never dispatched" should track that separately.
+pub fn snapshot_all() -> std::collections::BTreeMap<&'static str, DispatchSnapshot> {
+    registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .map(|(&op, counters)| (op, counters.snapshot()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -417,6 +444,34 @@ mod tests {
         a.record(DispatchOutcome::Fused);
         assert_eq!(b.snapshot(), DispatchSnapshot { fused: 1, eager: 0 });
         assert!(std::ptr::eq(a, b), "must be the identical instance");
+    }
+
+    #[test]
+    fn snapshot_all_contains_every_registered_op_name() {
+        // Distinct, test-local op names so this assertion is not racy
+        // under `cargo test`'s parallel execution (other tests in this
+        // binary register their OWN op names into the same process-wide
+        // registry — additive-only, never removed, so checking for
+        // PRESENCE of these specific keys is safe; asserting the full map
+        // is exactly these entries would not be).
+        let a = counters_for("registry_test_op_snapshot_all_a");
+        let b = counters_for("registry_test_op_snapshot_all_b");
+        a.record(DispatchOutcome::Fused);
+        b.record(DispatchOutcome::Eager);
+        b.record(DispatchOutcome::Eager);
+
+        let all = snapshot_all();
+        assert_eq!(
+            all.get("registry_test_op_snapshot_all_a"),
+            Some(&DispatchSnapshot { fused: 1, eager: 0 })
+        );
+        assert_eq!(
+            all.get("registry_test_op_snapshot_all_b"),
+            Some(&DispatchSnapshot { fused: 0, eager: 2 })
+        );
+        // Non-vacuity: an op name never passed to `counters_for` must be
+        // absent, not present-with-zeros.
+        assert!(!all.contains_key("registry_test_op_never_registered"));
     }
 
     #[test]

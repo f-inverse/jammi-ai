@@ -7,11 +7,16 @@
 //! (`ShapeMismatchBinaryOp`, `DTypeMismatchBinaryOp`,
 //! `UnsupportedDTypeForOp`, `RequiresContiguous`) rather than wrapping them,
 //! since `CustomOp2`'s trait methods are fixed to return `candle_core::Result`.
-//! `KernelError` is for the admission scaffolding, which is not bound to that
-//! trait signature.
+//! `KernelError` is for errors raised OUTSIDE that trait boundary — both the
+//! admission scaffolding (`crate::admission`) and an op's own
+//! construction-time domain validation (e.g.
+//! `ops::softmax::SoftmaxLastDimFused::with_scale`, which runs before any
+//! `CustomOp2` method and so is not bound to `candle_core::Result` either).
 use thiserror::Error;
 
-/// Errors surfaced by the admission scaffolding (`crate::admission`).
+/// Errors surfaced outside the `CustomOp` trait boundary: the admission
+/// scaffolding (`crate::admission`) and an op's own construction-time
+/// domain validation.
 #[derive(Debug, Error)]
 pub enum KernelError {
     /// STRICT admission mode (scope-6 / K2 in the fused-kernels plan): a
@@ -24,6 +29,16 @@ pub enum KernelError {
         op: &'static str,
         predicate: &'static str,
     },
+    /// Domain-validity refusal (family D) for a multiplicative scale
+    /// construction argument (e.g. `ops::softmax::SoftmaxLastDimFused::with_scale`):
+    /// `scale` must be finite and strictly positive. `0.0` would silently
+    /// yield a uniform-attention forward (`scale * scores == 0` everywhere,
+    /// so only `mask` survives the reduction) rather than an error, and a
+    /// negative or non-finite value has no meaning as an attention scale at
+    /// all — refused at construction rather than propagated as a confident
+    /// wrong number.
+    #[error("invalid scale {scale}: must be finite and > 0.0")]
+    InvalidScale { scale: f32 },
 }
 
 /// Crate-local `Result` alias for the admission scaffolding.

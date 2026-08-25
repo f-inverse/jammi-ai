@@ -1185,6 +1185,55 @@ pub struct FinetuneStepTier {
     /// see the doc above), or because the admission predicate failed for
     /// any other stated reason.
     pub lora_epilogue_eager_dispatches: u64,
+    /// How many times the fused LoRA SITE
+    /// (`jammi_kernels::ops::LowRankResidualLinear` — one `CustomOp3` covering
+    /// the base matmul, dropout, both LoRA GEMMs, AND the epilogue, not
+    /// just `ScaledCastAdd`'s standalone epilogue) actually dispatched
+    /// during this run — the same positive-proof channel as
+    /// `ln_fused_dispatches` / … / `lora_epilogue_fused_dispatches`. Read
+    /// via `jammi_lora::lora_linear_fused_dispatch_snapshot`.
+    /// `lora_epilogue_fused_dispatches`/`lora_epilogue_eager_dispatches`
+    /// (above) are PERMANENTLY ZERO on a run where this field is nonzero:
+    /// `LowRankResidualLinear` reuses `ScaledCastAdd`'s `cpu_fwd`/`cuda_fwd`
+    /// directly as an internal step, never through the standalone
+    /// epilogue's own `admit` call (see `jammi_lora::lora_epilogue_counters`'s
+    /// doc) — that pairing going to `0` is the expected baseline, not a
+    /// missing-dispatch regression.
+    pub lora_linear_fused_dispatches: u64,
+    /// How many times that same call site fell back to the eager
+    /// composition (`[base matmul, dropout, A-matmul, B-matmul, mul,
+    /// cast, add]`) instead — outside the fused kernel's domain
+    /// (bias-carrying base, unsupported dtype/device, non-contiguous
+    /// view, unsupported rank) DURING TRAINING. `training == false`
+    /// (eval/serving) does NOT increment this field: `LoraLinear::forward`
+    /// returns through its own always-eager composition BEFORE ever
+    /// calling `admit` (the thing that increments either counter), so an
+    /// eval-only run leaves BOTH `lora_linear_fused_dispatches` and this
+    /// field at `0` — not evidence the eager arm ran, just evidence
+    /// neither counter was ever touched.
+    pub lora_linear_eager_dispatches: u64,
+    /// How many times ModernBERT's training-mode fused whole-attention-block
+    /// kernel (`jammi_kernels::ops::AttentionBlockFused`) actually
+    /// dispatched during this run — the same positive-proof channel as
+    /// `ln_fused_dispatches` / `rope_fused_dispatches` /
+    /// `softmax_fused_dispatches` / `geglu_fused_dispatches` /
+    /// `lora_epilogue_fused_dispatches`, for the fused attention-block
+    /// commit (see `jammi_encoders::modernbert`'s
+    /// `ModernBertAttention::forward_training_attention` doc). Read via
+    /// `jammi_encoders::attention_block_dispatch_snapshot`, mirroring the
+    /// sibling counters' read API exactly.
+    pub attention_block_fused_dispatches: u64,
+    /// How many times that same call site fell back to the eager
+    /// (`apply1`/`apply2`/`apply3` composed masked-softmax attention)
+    /// path instead — outside the fused kernel's domain
+    /// (dtype/contiguity/device/`seq`/mask-shape), or because `head_dim`
+    /// is not exactly the fused kernel's fixed domain (64 —
+    /// `jammi_kernels::ops::ATTENTION_BLOCK_HEAD_DIM`). On a checkpoint
+    /// whose `head_dim != 64` this is the only path admitted, so the pair
+    /// reads `0` fused / `N` eager (`N` = the number of attention calls
+    /// the step made) — that is the predicate refusing by domain, not a
+    /// broken counter.
+    pub attention_block_eager_dispatches: u64,
     pub s_per_step_p50: Measurement,
     pub s_per_step_mean: Measurement,
     pub steps_per_s: Measurement,
@@ -1347,4 +1396,100 @@ pub struct RecomputeScaleTier {
     /// The whole Downstream sweep's wall-time, milliseconds. Machine-dependent
     /// reference only — never gated.
     pub sweep_ms: Measurement,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal, fully-populated [`FinetuneStepTier`] for the serialization
+    /// test below. Field VALUES are arbitrary; what is pinned is the emitted
+    /// key SET, so a field added or renamed on `FinetuneStepTier` is a
+    /// visible, reviewed diff here rather than a silent addition/removal a
+    /// downstream JSON-diffing perf gate would only notice indirectly.
+    fn sample_finetune_step_tier() -> FinetuneStepTier {
+        FinetuneStepTier {
+            device: "cpu".to_string(),
+            device_name: "cpu".to_string(),
+            backbone_dtype: "f32".to_string(),
+            batch: 2,
+            seq: 6,
+            lora_rank: 2,
+            lora_dropout: 0.0,
+            target_modules: vec!["query".to_string()],
+            batched_forward: true,
+            trainable_tensors: 2,
+            steps_measured: 1,
+            ln_fused_dispatches: 0,
+            ln_eager_dispatches: 0,
+            rope_fused_dispatches: 0,
+            rope_eager_dispatches: 0,
+            softmax_fused_dispatches: 0,
+            softmax_eager_dispatches: 0,
+            geglu_fused_dispatches: 0,
+            geglu_eager_dispatches: 0,
+            lora_epilogue_fused_dispatches: 0,
+            lora_epilogue_eager_dispatches: 0,
+            lora_linear_fused_dispatches: 0,
+            lora_linear_eager_dispatches: 0,
+            attention_block_fused_dispatches: 0,
+            attention_block_eager_dispatches: 0,
+            s_per_step_p50: Measurement::measured(0.01, "s"),
+            s_per_step_mean: Measurement::measured(0.01, "s"),
+            steps_per_s: Measurement::measured(100.0, "steps/s"),
+            triplets_per_s: Measurement::measured(200.0, "triplets/s"),
+            peak_rss_bytes: Measurement::not_yet_measured("bytes"),
+            peak_vram_bytes: Measurement::not_yet_measured("bytes"),
+        }
+    }
+
+    /// The full emitted key set, pinned so a field added or renamed on
+    /// `FinetuneStepTier` — including the two `attention_block_*_dispatches`
+    /// counters the fused whole-attention-block kernel needs for its own
+    /// positive-proof channel — is a visible, reviewed diff here rather than
+    /// a silent addition/removal a downstream JSON-diffing perf gate would
+    /// only notice indirectly.
+    #[test]
+    fn finetune_step_tier_emits_the_full_pinned_key_set() {
+        let tier = sample_finetune_step_tier();
+        let value = serde_json::to_value(&tier).expect("serialize FinetuneStepTier");
+        let obj = value.as_object().expect("object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let mut expected = vec![
+            "attention_block_eager_dispatches",
+            "attention_block_fused_dispatches",
+            "batch",
+            "batched_forward",
+            "backbone_dtype",
+            "device",
+            "device_name",
+            "geglu_eager_dispatches",
+            "geglu_fused_dispatches",
+            "ln_eager_dispatches",
+            "ln_fused_dispatches",
+            "lora_dropout",
+            "lora_epilogue_eager_dispatches",
+            "lora_epilogue_fused_dispatches",
+            "lora_linear_eager_dispatches",
+            "lora_linear_fused_dispatches",
+            "lora_rank",
+            "peak_rss_bytes",
+            "peak_vram_bytes",
+            "rope_eager_dispatches",
+            "rope_fused_dispatches",
+            "s_per_step_mean",
+            "s_per_step_p50",
+            "seq",
+            "softmax_eager_dispatches",
+            "softmax_fused_dispatches",
+            "steps_measured",
+            "steps_per_s",
+            "target_modules",
+            "trainable_tensors",
+            "triplets_per_s",
+        ];
+        expected.sort_unstable();
+        assert_eq!(keys, expected);
+    }
 }

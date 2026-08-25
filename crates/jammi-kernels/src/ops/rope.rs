@@ -154,8 +154,10 @@ impl super::sealed::Sealed for RopeFused {}
 /// without a broadcast" section for what `period`/`total_rows` mean.
 /// `hidden == 0` is signalled via `period == 0` in the returned tuple; the
 /// caller checks that and takes the empty fast path rather than dividing
-/// by it.
-fn rope_dims(
+/// by it. `pub(crate)`: `crate::cuda::rope` imports this exact check
+/// rather than re-deriving it (the same "shared, not duplicated" choice
+/// `ops::softmax::softmax_dims` and `ops::layer_norm::hidden_of` make).
+pub(crate) fn rope_dims(
     l_x: &Layout,
     l_cos: &Layout,
     l_sin: &Layout,
@@ -247,14 +249,6 @@ fn rope_dims(
     Ok((hidden, period, total_rows))
 }
 
-fn empty_like(s1: &CpuStorage, op: &'static str) -> Result<(CpuStorage, Shape)> {
-    match s1 {
-        CpuStorage::F32(_) => Ok((CpuStorage::F32(Vec::new()), Shape::from(0usize))),
-        CpuStorage::BF16(_) => Ok((CpuStorage::BF16(Vec::new()), Shape::from(0usize))),
-        s1 => Err(Error::UnsupportedDTypeForOp(s1.dtype(), op)),
-    }
-}
-
 impl CustomOp3 for RopeFused {
     fn name(&self) -> &'static str {
         "rope_fused"
@@ -279,8 +273,18 @@ impl CustomOp3 for RopeFused {
             });
         }
         if hidden == 0 {
-            let (out, _) = empty_like(s1, op)?;
-            return Ok((out, l1.shape().clone()));
+            // `s1`'s dtype agreement with `s2`/`s3` is already checked
+            // above, so passing `s1` for both of `super::empty_like`'s
+            // storage arguments is safe: its dtype-mismatch arm can never
+            // fire for `(s1, s1)`. `super::empty_like` (shared with
+            // `LayerNormFused`/`SoftmaxLastDimFused`) already returns
+            // `l1.shape().clone()`, which for this call IS the correct
+            // output shape (`RopeFused`'s output is always shaped like
+            // `x`) — no separate shape override needed, unlike the CUDA
+            // glue's OWN unary empty-alloc path (`cuda::alloc_empty`),
+            // which is not tied to `LayerNormFused`/`SoftmaxLastDimFused`'s
+            // two-storage dtype check and stays a distinct helper.
+            return super::empty_like(s1, s1, l1, op);
         }
         let (x1, x2) = l1
             .contiguous_offsets()
@@ -423,7 +427,7 @@ fn rope_grad_table(
 /// performed here (this op is purely elementwise, unlike LayerNorm), so
 /// determinism follows directly from the absence of any accumulation
 /// order to fix.
-fn rope_fwd_row_f32(x: &[f32], cos: &[f32], sin: &[f32], sign: f32, out: &mut [f32]) {
+pub(crate) fn rope_fwd_row_f32(x: &[f32], cos: &[f32], sin: &[f32], sign: f32, out: &mut [f32]) {
     let hidden = x.len();
     let half = hidden / 2;
     for col in 0..hidden {

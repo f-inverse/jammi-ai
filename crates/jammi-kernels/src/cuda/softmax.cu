@@ -30,7 +30,14 @@
 //
 // Backward (`softmax_bwd_dscores_*`) needs only `y` and `dy` — no mask,
 // no broadcast index at all (the standard softmax backward identity is
-// output-only): `dscores = (dy - dot(dy, y)) * y`.
+// output-only): `dscores = (dy - dot(dy, y)) * y`. The `scale`
+// multiplicative factor (see `../ops/softmax.rs`'s "scale semantics"
+// module-doc section) is applied to `scores` BEFORE the mask add in the
+// FORWARD kernels below; it does NOT appear here, because
+// `SoftmaxLastDimFused::bwd` multiplies this kernel's raw
+// `d(y)/d(pre_softmax)` output by `scale` at the Rust/Tensor level
+// (a plain `Tensor::affine` call, not a further CUDA launch this file
+// owns) to produce the gradient flowing back into `scores`.
 #include <cuda_bf16.h>
 #include <cstddef>
 
@@ -64,6 +71,17 @@ __device__ __forceinline__ float block_reduce_max(float val, float* scratch) {
     float total = scratch[0];
     __syncthreads();
     return total;
+}
+
+// Rounds `s * scale_bf` to BF16 immediately, matching `half::bf16`'s own
+// `Mul` impl (round-trip through f32, round once) — see
+// `../ops/softmax.rs`'s module doc's "scale semantics" -> "reproducing
+// candle's own affine rounding point" section: this is the SAME rounding
+// `Affine<bf16>::f` performs for the `v * mul` step, `mul` here being
+// `scale_bf` (itself already rounded to bf16 once, per-launch, matching
+// `Affine`'s own `mul = T::from_f64(self.0)`).
+__device__ __forceinline__ __nv_bfloat16 bf16_mul_rounded(__nv_bfloat16 s, __nv_bfloat16 scale_bf) {
+    return __float2bfloat16(__bfloat162float(s) * __bfloat162float(scale_bf));
 }
 
 // Rounds `scores_i + mask_i` to BF16 immediately, matching
@@ -137,7 +155,8 @@ extern "C" __global__ void softmax_fwd_f32(
     const unsigned int last,
     const unsigned int s0, const unsigned int s1, const unsigned int s2,
     const unsigned int m0, const unsigned int m1, const unsigned int m2,
-    const unsigned int zero_on_fully_masked
+    const unsigned int zero_on_fully_masked,
+    const float scale
 ) {
     __shared__ float scratch[SM_BLOCK];
     size_t row = blockIdx.x;
@@ -168,16 +187,23 @@ extern "C" __global__ void softmax_fwd_f32(
         }
     }
 
+    // `scale` then the mask add, as TWO separate f32 operations (matching
+    // candle's own `scores.affine(scale, 0.0)` followed by
+    // `broadcast_add(mask)` for `T = f32` — see `../ops/softmax.rs`'s
+    // module doc's "scale semantics" section). `--fmad` contraction is
+    // accepted here within this op's stated CUDA tolerance, per this
+    // crate's existing build-flags doctrine (`../../build.rs`) — not
+    // pinned away, unlike the CPU arm's Rust code which never auto-fuses.
     float maxv = -INFINITY;
     for (unsigned int i = threadIdx.x; i < last; i += blockDim.x) {
-        float v = sr[i] + mr[i];
+        float v = sr[i] * scale + mr[i];
         maxv = fmaxf(maxv, v);
     }
     maxv = block_reduce_max(maxv, scratch);
 
     float sum = 0.0f;
     for (unsigned int i = threadIdx.x; i < last; i += blockDim.x) {
-        float v = sr[i] + mr[i];
+        float v = sr[i] * scale + mr[i];
         float e = expf(v - maxv);
         yr[i] = e;
         sum += e;
@@ -205,7 +231,8 @@ extern "C" __global__ void softmax_fwd_bf16(
     const unsigned int last,
     const unsigned int s0, const unsigned int s1, const unsigned int s2,
     const unsigned int m0, const unsigned int m1, const unsigned int m2,
-    const unsigned int zero_on_fully_masked
+    const unsigned int zero_on_fully_masked,
+    const float scale
 ) {
     __shared__ float scratch[SM_BLOCK];
     size_t row = blockIdx.x;
@@ -213,6 +240,11 @@ extern "C" __global__ void softmax_fwd_bf16(
     const __nv_bfloat16* sr = scores + row * (size_t)last;
     const __nv_bfloat16* mr = mask + mrow * (size_t)last;
     __nv_bfloat16* yr = y + row * (size_t)last;
+    // Rounded ONCE per launch (matching `Affine<bf16>::f`'s own `mul =
+    // T::from_f64(self.0)` — a single conversion of the scale CONSTANT,
+    // not a per-element re-conversion; see `../ops/softmax.rs`'s matching
+    // `softmax_fwd_bf16`'s identical `scale_bf` hoist).
+    const __nv_bfloat16 scale_bf = __float2bfloat16(scale);
 
     // Safe softmax first (see `softmax_fwd_f32`'s identical check and the
     // module doc), under `zero_on_fully_masked` ONLY: short-circuit a
@@ -237,20 +269,23 @@ extern "C" __global__ void softmax_fwd_bf16(
 
     float maxv = -INFINITY;
     for (unsigned int i = threadIdx.x; i < last; i += blockDim.x) {
-        float v = bf16_add_rounded(sr[i], mr[i]);
+        __nv_bfloat16 scaled = bf16_mul_rounded(sr[i], scale_bf);
+        float v = bf16_add_rounded(scaled, mr[i]);
         maxv = fmaxf(maxv, v);
     }
     maxv = block_reduce_max(maxv, scratch);
 
     float sum = 0.0f;
     for (unsigned int i = threadIdx.x; i < last; i += blockDim.x) {
-        float v = bf16_add_rounded(sr[i], mr[i]);
+        __nv_bfloat16 scaled = bf16_mul_rounded(sr[i], scale_bf);
+        float v = bf16_add_rounded(scaled, mr[i]);
         sum += expf(v - maxv);
     }
     sum = block_reduce_sum(sum, scratch);
 
     for (unsigned int i = threadIdx.x; i < last; i += blockDim.x) {
-        float v = bf16_add_rounded(sr[i], mr[i]);
+        __nv_bfloat16 scaled = bf16_mul_rounded(sr[i], scale_bf);
+        float v = bf16_add_rounded(scaled, mr[i]);
         float e = expf(v - maxv);
         yr[i] = __float2bfloat16(e / sum);
     }

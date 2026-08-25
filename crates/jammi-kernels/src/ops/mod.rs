@@ -44,31 +44,66 @@
 //!   is a REVIEW concern this bound cannot catch at compile time — stated
 //!   here explicitly rather than left as an overclaim.
 
-use candle_core::{CustomOp1, CustomOp2, CustomOp3, Result, Tensor};
+use candle_core::backend::BackendStorage;
+use candle_core::{
+    CpuStorage, CustomOp1, CustomOp2, CustomOp3, Error, Layout, Result, Shape, Tensor,
+};
 
+// `pub(crate)`, not private like `axpy`/`layer_norm`/`rope`: `crate::cuda::attention_block`
+// imports `attention_dims`/`check_mask`/`check_rope_pack` directly from here
+// (the SAME domain checks the CPU arm applies), mirroring `ops::softmax`'s
+// identical `pub(crate)` rationale.
+pub(crate) mod attention_block;
 mod axpy;
 mod dropout;
-// `pub(crate)`, not private like `axpy`/`layer_norm`/`rope`: `crate::cuda::geglu`
-// imports `geglu_dims`/`output_shape`/`check_variant` directly from here
-// rather than duplicating them — the same "shared, not duplicated" choice
-// `ops::softmax` makes for its own (more complex) broadcast-domain logic.
+// `pub(crate)`, not private like `axpy`/`scaled_cast_add`: each op's CUDA
+// glue (`crate::cuda::geglu`/`layer_norm`/`rope`/`softmax`) imports its
+// shared dims/domain helper (`geglu_dims`/`output_shape`/`check_variant`,
+// `hidden_of`, `rope_dims`, `softmax_dims`) directly from here rather than
+// carrying an independently-maintained CUDA-side copy — one definition per
+// op's domain check, not two that could silently drift apart.
 pub(crate) mod geglu;
-mod layer_norm;
-mod rope;
+pub(crate) mod layer_norm;
+pub(crate) mod low_rank_residual_linear;
+pub(crate) mod rope;
 mod scaled_cast_add;
-// `pub(crate)`, not private like the three above: `crate::cuda::softmax`
-// imports `softmax_dims` directly from here rather than duplicating it (a
-// deliberate, disclosed departure from `layer_norm`'s/`rope`'s per-file
-// duplication precedent — see `ops::softmax`'s module doc for why this
-// op's broadcast-domain logic is complex enough that a second,
-// independently-maintained copy is a real divergence risk, not just
-// boilerplate).
 pub(crate) mod softmax;
 
+pub use attention_block::AttentionBlockFused;
+/// Test/introspection-only (P3 fix round 4, deliverable 3's "mechanism
+/// pin" — see `bwd_gradient_gemm_layouts`'s own doc): `#[doc(hidden)]`
+/// re-exports so `tests/cuda_parity.rs` can capture `bwd`'s own gradient-
+/// GEMM operand `Layout`s without depending on `CustomOp3::bwd`'s private
+/// trait-method signature. `matmul_grad_lhs`/`matmul_grad_rhs` are the
+/// shared `Op::Matmul`-backward definition `bwd` itself calls — see their
+/// own doc for the shared-definition rationale.
+#[doc(hidden)]
+pub use attention_block::{
+    bwd_gradient_gemm_layouts, matmul_grad_lhs, matmul_grad_rhs, BwdGemmLayoutsParams,
+};
+/// Re-exported under this name (rather than `ops::attention_block::HEAD_DIM`
+/// directly) so a call site's admission predicate reads `ATTENTION_BLOCK_HEAD_DIM`
+/// without a `attention_block::` path segment, mirroring `MAX_HEAD_DIM`/`MAX_LAST_DIM`'s
+/// own flat re-export shape.
+pub const ATTENTION_BLOCK_HEAD_DIM: usize = attention_block::HEAD_DIM;
+/// See [`ATTENTION_BLOCK_HEAD_DIM`]'s doc for why this is a real `const`
+/// definition here rather than a `pub use ... as` rename.
+pub const ATTENTION_BLOCK_MAX_SEQ: usize = attention_block::MAX_SEQ;
+/// See [`ATTENTION_BLOCK_HEAD_DIM`]'s doc for the re-export shape. A call
+/// site combining its own padding mask with a sliding-window band before
+/// calling [`AttentionBlockFused`] (the op has no `window` construction
+/// data of its own — see that op's module doc) needs this SAME sentinel
+/// so the combined mask's out-of-window contribution matches what
+/// [`AttentionBlockFused`]'s own `< 0.0` fully-masked-row rule expects;
+/// pinned by value, not merely by sign, so a caller can assert the two
+/// crates agree exactly (family F: a measured, asserted equality, not an
+/// assumed one).
+pub const ATTENTION_BLOCK_WINDOW_MASKED_VALUE: f32 = attention_block::WINDOW_MASKED_VALUE;
 pub use axpy::Axpy;
 pub use dropout::{DropoutFused, PhiloxKatProbe};
 pub use geglu::{GegluFused, GeluVariant};
 pub use layer_norm::{LayerNormFused, MAX_HIDDEN};
+pub use low_rank_residual_linear::{DropoutKey, LowRankResidualLinear};
 pub use rope::{RopeFused, MAX_HEAD_DIM};
 pub use scaled_cast_add::ScaledCastAdd;
 pub use softmax::{
@@ -127,4 +162,39 @@ pub fn apply3<T: KernelOp + CustomOp3>(
     op: T,
 ) -> Result<Tensor> {
     x.apply_op3(y, z, op)
+}
+
+/// The "output dtype must match `s1`, and equal `s2`" degenerate-input
+/// empty-storage builder shared by [`layer_norm`] (`hidden == 0`),
+/// [`softmax`] (`last == 0`), and [`rope`] (`hidden == 0`) — all bail to an
+/// empty CPU output of `l1`'s own shape (preserving every OTHER dimension,
+/// unlike a bare `[0]`) once their reduction axis itself is zero-length.
+/// `pub(crate)`: byte-identical across all three files before this, now
+/// one definition. `rope`'s pre-existing local copy returned a bare
+/// `Shape::from(0)` instead of `l1.shape().clone()` and took only ONE
+/// storage argument — checked and confirmed NOT load-bearing (its call
+/// site discarded that returned shape and substituted `l1.shape().clone()`
+/// itself, and by the time it ran `s1`'s dtype was already known to equal
+/// `s2`/`s3`'s), so `rope::cpu_fwd` now calls this directly with `(s1, s1)`
+/// rather than keeping a second, narrower copy.
+pub(crate) fn empty_like(
+    s1: &CpuStorage,
+    s2: &CpuStorage,
+    l1: &Layout,
+    op: &'static str,
+) -> Result<(CpuStorage, Shape)> {
+    match (s1, s2) {
+        (CpuStorage::F32(_), CpuStorage::F32(_)) => {
+            Ok((CpuStorage::F32(Vec::new()), l1.shape().clone()))
+        }
+        (CpuStorage::BF16(_), CpuStorage::BF16(_)) => {
+            Ok((CpuStorage::BF16(Vec::new()), l1.shape().clone()))
+        }
+        (s1, s2) if s1.dtype() != s2.dtype() => Err(Error::DTypeMismatchBinaryOp {
+            lhs: s1.dtype(),
+            rhs: s2.dtype(),
+            op,
+        }),
+        (s1, _) => Err(Error::UnsupportedDTypeForOp(s1.dtype(), op)),
+    }
 }

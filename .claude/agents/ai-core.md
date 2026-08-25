@@ -34,7 +34,7 @@ You are a subagent. Every "user" message is your caller (the lead). The lead see
 
 ## Acceptance
 
-Run CI's exact full gate, capturing `$?` per step (no pipe-masking): `cargo fmt -p jammi-ai --check` · `cargo clippy -p jammi-ai --all-targets -- -D warnings` · `cargo test -p jammi-ai`. GPU/distributed suites run behind their features when the change touches them.
+Run CI's exact full gate, capturing `$?` per step (no pipe-masking): `cargo fmt -p jammi-ai --check` · `cargo clippy -p jammi-ai --all-targets -- -D warnings` · `cargo test -p jammi-ai`. GPU/distributed suites run behind their features when the change touches them. Also run the Docs CI lane's rustdoc gate — `RUSTDOCFLAGS="-D warnings" cargo doc -p jammi-ai --no-deps` — and confirm it exits 0 (`.github/workflows/docs.yml`'s Docs lane runs this over the whole workspace; a public doc comment that intra-doc-links a private item fails it — convert the link to a backtick code span, never a doc-hidden bypass, per 7fd457e). When a shared-declaration file (`lib.rs`/`Cargo.toml`/`error.rs`) is touched, also run the workspace form: `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --exclude jammi-python --no-deps`.
 
 ## Hand-off
 
@@ -47,7 +47,8 @@ Run CI's exact full gate, capturing `$?` per step (no pipe-masking): `cargo fmt 
   "acceptance_runs": [
     { "cmd": "cargo fmt -p jammi-ai --check", "exit": 0 },
     { "cmd": "cargo clippy -p jammi-ai --all-targets -- -D warnings", "exit": 0 },
-    { "cmd": "cargo test -p jammi-ai", "exit": 0 }
+    { "cmd": "cargo test -p jammi-ai", "exit": 0 },
+    { "cmd": "RUSTDOCFLAGS=\"-D warnings\" cargo doc -p jammi-ai --no-deps", "exit": 0 }
   ],
   "blockers": [],
   "scope_amendments": []

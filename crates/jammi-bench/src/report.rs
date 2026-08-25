@@ -1283,9 +1283,20 @@ pub struct FinetuneStepTier {
     /// Peak resident set. Absent off Linux rather than faked.
     pub peak_rss_bytes: Measurement,
     /// Peak device memory growth during the measured steps, over a baseline read
-    /// AFTER the model and optimizer are resident.
+    /// AFTER the model and optimizer are resident but BEFORE the untimed
+    /// pre-step `finetune_step::run` takes (see that function's doc comment
+    /// on `vram_baseline` for the full reasoning).
     ///
-    /// So this is activation and workspace growth: it deliberately excludes the
+    /// This ordering matters because the underlying sample
+    /// (`nvidia-smi --query-gpu=memory.used`) is a DRIVER-level allocator
+    /// POOL high-water mark, not live-allocated bytes: once the pool grows
+    /// to admit a tensor it does not shrink back down between steps (the
+    /// same convention `baselines/p1_softmax_scale_fold_ab.json` reasons
+    /// about in 32 MiB pool blocks). A baseline read AFTER the pre-step
+    /// would already sit at (or near) the run's own high-water mark, and
+    /// the peak-minus-baseline subtraction would then floor at (or near)
+    /// zero regardless of how much the run actually allocates. So this is
+    /// activation and workspace growth: it deliberately excludes the
     /// backbone weights and the optimizer moments, because those are constant
     /// for a configuration and would mask the term that actually moves. It is
     /// device-total minus that baseline rather than a per-process figure — exact

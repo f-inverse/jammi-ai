@@ -184,7 +184,15 @@ pub(crate) fn synthetic_ids(
 /// loop against. Factored out of `run()` so a test can build a SEPARATE,
 /// independent instance of the identical fixture as a numeric oracle for the
 /// update-index-placement test below — never to bypass `run()` (the control
-/// flow under test for that fix) as the code path a test drives.
+/// flow under test for that fix) as the code path a test drives. Also
+/// returns the `VarMap` itself (cheap: `VarMap` is an `Arc<Mutex<..>>`
+/// handle, `all_vars()`/`data()` both borrow rather than consume it) so a
+/// test can read a NAMED trainable tensor's value directly — e.g. pinning
+/// the optimizer's actual learning rate via the ZerosB-init `lora_b`
+/// tensor's magnitude after exactly one step (see
+/// `finetune_step_one_step_moves_lora_b_by_approximately_lr` below), which
+/// nothing reachable through `FinetuneStepTier`'s own public fields could
+/// otherwise verify.
 #[allow(clippy::type_complexity)]
 fn build_fixture(
     params: &FinetuneStepParams,
@@ -195,6 +203,7 @@ fn build_fixture(
         usize,
         Vec<Tensor>,
         Tensor,
+        VarMap,
     ),
     Box<dyn std::error::Error>,
 > {
@@ -257,7 +266,7 @@ fn build_fixture(
         })
         .collect();
 
-    Ok((encoder, opt, trainable_count, blocks, mask))
+    Ok((encoder, opt, trainable_count, blocks, mask, varmap))
 }
 
 /// One forward + cosine-margin triplet loss + backward + optimizer step —
@@ -318,29 +327,59 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
         None => "cpu".to_string(),
     };
 
-    let (mut encoder, mut opt, trainable_count, blocks, mask) = build_fixture(params)?;
+    let (mut encoder, mut opt, trainable_count, blocks, mask, _varmap) = build_fixture(params)?;
 
-    // ONE untimed step, BEFORE the timed loop and BEFORE the VRAM/dispatch
-    // baselines below — mirrors `torch_finetune_step.py`'s own untimed
-    // `_step_once` pre-step (see that file's `run()` for the identical
-    // reasoning), so BOTH stacks discard the SAME "update 0" before the
-    // officially reported `--warmup` step 0 begins. Without this, jammi's
-    // `losses[k]` was the loss after `warmup+k` total optimizer updates
-    // while torch's `losses[k]` was the loss after `warmup+k+1` updates (one
-    // update ahead) — `loss_first` was the worst case, since
-    // `LoraInitMode::ZerosB` makes the LoRA delta identically zero at
-    // construction, so jammi's un-fixed `loss_first` was the PRISTINE
-    // (zero-optimizer-update) loss while torch's was already one update in.
-    // With this pre-step, both stacks' `losses[k]` is the loss after
-    // `warmup+k+1` total updates — see
+    // The VRAM baseline is taken here, BEFORE the untimed pre-step below and
+    // BEFORE the sampler starts — see the comment on `vram_baseline` for why
+    // this snapshot is deliberately taken at a DIFFERENT point in the
+    // sequence than the dispatch-counter "before" snapshots a few lines
+    // down, which are taken AFTER the pre-step.
+    //
+    // `peak_vram_bytes` is measured via `nvidia-smi --query-gpu=memory.used`
+    // (`device_memory_used_bytes` above), which is a DRIVER-level allocator
+    // POOL high-water mark, not live-allocated bytes — it does NOT shrink
+    // back down between steps (the same convention
+    // `baselines/p1_softmax_scale_fold_ab.json` reasons about in 32 MiB pool
+    // blocks). For a monotone pool high-water, "baseline" means "before any
+    // of this run's allocation happened" — i.e. right after the model,
+    // optimizer, and fixture tensors are built (`build_fixture` above) but
+    // before the untimed pre-step drives the pool up. If this baseline were
+    // instead taken AFTER the pre-step, the pre-step's own allocation would
+    // already have pushed `memory.used` up to (or near) the run's
+    // high-water, and `VramSampler::finish`'s `peak.saturating_sub(baseline)`
+    // would floor the reported delta at (or near) zero even though the run
+    // legitimately uses many GB. Torch's counterpart
+    // (`torch_finetune_step.py`) does not have this hazard because it reads
+    // `max_memory_allocated() - memory_allocated()`, an allocator
+    // live-bytes high-water that DOES recover between calls — so the two
+    // stacks' baselines are deliberately taken at different points in their
+    // respective step sequences in order to stay comparable under
+    // `vram_delta(comparable)`.
+    let vram_baseline = device_memory_used_bytes().unwrap_or(0);
+    let sampler = VramSampler::start();
+
+    // ONE untimed step, BEFORE the timed loop — mirrors
+    // `torch_finetune_step.py`'s own untimed `_step_once` pre-step (see that
+    // file's `run()` for the identical reasoning), so BOTH stacks discard
+    // the SAME "update 0" before the officially reported `--warmup` step 0
+    // begins. Without this, jammi's `losses[k]` was the loss after
+    // `warmup+k` total optimizer updates while torch's `losses[k]` was the
+    // loss after `warmup+k+1` updates (one update ahead) — `loss_first` was
+    // the worst case, since `LoraInitMode::ZerosB` makes the LoRA delta
+    // identically zero at construction, so jammi's un-fixed `loss_first` was
+    // the PRISTINE (zero-optimizer-update) loss while torch's was already
+    // one update in. With this pre-step, both stacks' `losses[k]` is the
+    // loss after `warmup+k+1` total updates — see
     // `finetune_step_loss_first_is_the_post_pre_step_update` below, which
     // pins this exactly by driving this same `run()` entry point.
     //
-    // Never timed, never appended to `losses`/`times`. The VRAM baseline and
-    // the dispatch-counter "before" snapshots a few lines down are BOTH
-    // taken AFTER this call returns, so this discarded step's own
-    // allocation/dispatch activity is absorbed into the baseline / excluded
-    // from the delta, never counted as part of the measured run.
+    // Never timed, never appended to `losses`/`times`. The dispatch-counter
+    // "before" snapshots immediately below are taken AFTER this call
+    // returns, so this discarded step's own dispatch activity is excluded
+    // from the measured delta. The VRAM sampler above, in contrast, IS
+    // already running by this point (see above), so this step's allocation
+    // legitimately contributes to the run's reported peak — it is part of
+    // the same allocator pool the timed steps run in.
     step_once(
         &mut encoder,
         &mut opt,
@@ -349,9 +388,6 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
         params.batch,
         params.batched_forward,
     )?;
-
-    let vram_baseline = device_memory_used_bytes().unwrap_or(0);
-    let sampler = VramSampler::start();
 
     // Positive-proof channel for the fused-vs-eager LayerNorm A/B: a
     // delta over the process-wide dispatch counters taken immediately
@@ -765,7 +801,7 @@ mod tests {
         // `build_fixture` calls with the same `params` start bit-identical).
         // `lora_dropout: 0.0` in `tiny_params()` means no dropout RNG is in
         // play either, so this replay is exactly reproducible on CPU/F32.
-        let (mut o_encoder, mut o_opt, _count, o_blocks, o_mask) =
+        let (mut o_encoder, mut o_opt, _count, o_blocks, o_mask, _o_varmap) =
             build_fixture(&params).expect("oracle fixture");
         // Call #1: the PRISTINE (zero prior updates) loss.
         let pristine_loss = step_once(
@@ -810,6 +846,305 @@ mod tests {
             "losses[0] equals the PRISTINE (zero-optimizer-update) loss — \
              looks like the B1 regression re-appeared: run() is no longer \
              executing its untimed pre-step before recording starts"
+        );
+    }
+
+    /// MUTATION-TRIAGE test (cargo-mutants caught `build_fixture`'s literal
+    /// `lr: 2e-4` field being DELETED from the `ParamsAdamW` struct-update
+    /// expression, silently falling back to `..Default::default()`'s `lr =
+    /// 0.001` — 5x larger — completely undetected): no existing test reads
+    /// the optimizer's actual learning rate; every test so far only
+    /// compares LOSS VALUES produced by build_fixture, either against a
+    /// SECOND independent build_fixture call (self-consistent even if BOTH
+    /// silently used the wrong Default lr) or against a qualitative "not
+    /// near margin" bound loose enough not to notice a 5x rate change.
+    ///
+    /// AdamW's own well-known first-step property is the oracle:
+    /// `candle_nn::AdamW::step`'s formula (`next_theta = theta*(1-lr*wd) -
+    /// lr*(m_hat/(sqrt(v_hat)+eps))`, `optim.rs`) reduces, at `step_t ==
+    /// 1`, to `m_hat == grad` and `v_hat == grad^2` exactly (bias
+    /// correction cancels the `(1-beta1)`/`(1-beta2)` EMA blend on the
+    /// very first update), so `m_hat/(sqrt(v_hat)+eps) == grad/(|grad| +
+    /// eps) ≈ sign(grad)` for any `|grad| >> eps` (`eps` is `1e-8`,
+    /// several orders below any real gradient this fixture produces). And
+    /// since `LoraInitMode::ZerosB` makes `lora_b` start at EXACTLY `0.0`
+    /// elementwise, the `theta*(1-lr*wd)` term is also exactly `0` on step
+    /// 1 (`0 * anything == 0`) — so `next_theta ≈ -lr*sign(grad)`, meaning
+    /// `max(|lora_b|)` after exactly one step is a direct, cheap read of
+    /// "what lr did the optimizer actually apply", independent of the
+    /// gradient's own scale. `2e-4` (the real value) is trivially
+    /// distinguished from `0.001` (the mutant's 5x-larger Default
+    /// fallback) or `0.0` (an lr that silently vanished) this way.
+    #[test]
+    fn finetune_step_one_step_moves_lora_b_by_approximately_lr() {
+        let params = FinetuneStepParams {
+            warmup: 0,
+            steps: 1,
+            ..tiny_params()
+        };
+        let (mut encoder, mut opt, _count, blocks, mask, varmap) =
+            build_fixture(&params).expect("build fixture");
+
+        let lora_b_name = {
+            let data = varmap.data().lock().expect("varmap mutex poisoned");
+            data.keys()
+                .find(|k| k.ends_with("lora_b"))
+                .cloned()
+                .expect("at least one lora_b tensor in the fixture's target_modules")
+        };
+        let read_lora_b = |varmap: &VarMap, name: &str| -> Vec<f32> {
+            let data = varmap.data().lock().expect("varmap mutex poisoned");
+            let var = data.get(name).expect("lora_b var");
+            var.as_tensor()
+                .to_dtype(DType::F32)
+                .and_then(|t| t.flatten_all())
+                .and_then(|t| t.to_vec1::<f32>())
+                .expect("read lora_b")
+        };
+
+        let before = read_lora_b(&varmap, &lora_b_name);
+        assert!(
+            before.iter().all(|&v| v == 0.0),
+            "lora_b must start at EXACTLY zero under LoraInitMode::ZerosB — {before:?}"
+        );
+
+        step_once(
+            &mut encoder,
+            &mut opt,
+            &blocks,
+            &mask,
+            params.batch,
+            params.batched_forward,
+        )
+        .expect("one step");
+
+        let after = read_lora_b(&varmap, &lora_b_name);
+        let max_abs_after = after.iter().fold(0.0_f32, |m, &v| m.max(v.abs()));
+        assert!(
+            max_abs_after > 0.0,
+            "lora_b did not move at all after one optimizer step -- lr silently zero?"
+        );
+
+        const LR: f32 = 2e-4;
+        let relative_diff = (max_abs_after - LR).abs() / LR;
+        assert!(
+            relative_diff < 0.05,
+            "max(|lora_b|) after one step = {max_abs_after}, expected ~{LR} (AdamW's step-1 \
+             update is ≈lr per moved element under LoraInitMode::ZerosB) -- relative diff \
+             {relative_diff} exceeds 5%; looks like the configured lr silently changed (e.g. \
+             to ParamsAdamW::default()'s 0.001, 5x larger)"
+        );
+    }
+
+    /// MUTATION-TRIAGE test (cargo-mutants caught TWO of THREE comparison-
+    /// operator mutations in `build_fixture`'s `(params.lora_dropout >
+    /// 0.0).then_some(...)` boundary: `>` -> `==` and `>` -> `<`, both of
+    /// which WRONGLY disable dropout for any POSITIVE `lora_dropout`
+    /// value): builds two otherwise-identical fixtures differing ONLY in
+    /// `lora_dropout` (0.5 vs 0.0, same seed), takes ONE untimed
+    /// `step_once` on each (moving `lora_b` away from its `ZerosB`-init
+    /// exact zero — see below for why this step is required), then
+    /// compares a SECOND `step_once` call's loss between the two fixtures.
+    ///
+    /// The pre-step is NOT optional here: at the FRESH `ZerosB` init,
+    /// `lora_b == 0` exactly, and the LoRA forward is `base(x) + scaling *
+    /// dropout(x @ A^T @ B^T)` — with `B == 0`, `B^T` is the zero matrix,
+    /// so the WHOLE LoRA term is `0` regardless of what dropout did to the
+    /// `A^T` intermediate. This means the loss `step_once`'s FIRST call
+    /// ever returns (the PRE-update loss of a pristine `B`) is
+    /// mathematically INDEPENDENT of dropout — confirmed empirically: an
+    /// earlier draft of this test compared FIRST-call losses directly and
+    /// they were bit-identical (`0.26643285` both) even on the
+    /// UN-mutated, correctly-dropout-engaging code, which is why this
+    /// draft takes a pre-step first (mirrors `run()`'s own untimed
+    /// pre-step reasoning, see `finetune_step_loss_first_is_the_post_pre_step_update`).
+    /// After one update, `lora_b != 0`, so the SECOND call's forward DOES
+    /// depend on dropout: `seed makes the A/B init and the dropout mask a
+    /// pure function of the run` (`lora_linear.rs`'s own doc), so a
+    /// correctly-engaged dropout at `p=0.5` changes the computation
+    /// relative to the SAME seed's no-dropout computation; a mutant that
+    /// wrongly leaves dropout disabled at 0.5 makes the two fixtures
+    /// compute the IDENTICAL forward throughout, giving BIT-IDENTICAL
+    /// losses even after the pre-step.
+    ///
+    /// LATTICE NOTE — the THIRD comparison-operator mutant at this site
+    /// (`>` -> `>=`, which wrongly enables dropout AT EXACTLY `0.0`) is
+    /// deliberately NOT tested and is not a gap: dropout at rate EXACTLY
+    /// `0.0` drops nothing and scales by `1/(1-0.0) == 1` regardless of the
+    /// mask, so "dropout engaged at p=0" and "dropout skipped entirely"
+    /// are the mathematically IDENTICAL forward computation — no test
+    /// could observe a difference, the same vacuous class this crate's
+    /// `weight_decay: 0.01` (which happens to equal
+    /// `ParamsAdamW::default().weight_decay`) already carries for its own
+    /// deleted-field mutant (see `build_fixture`'s own comment).
+    #[test]
+    fn finetune_step_positive_lora_dropout_actually_changes_the_computation() {
+        fn pre_step_then_loss(lora_dropout: f32) -> f32 {
+            let mut params = tiny_params();
+            params.lora_dropout = lora_dropout;
+            let (mut encoder, mut opt, _count, blocks, mask, _varmap) =
+                build_fixture(&params).expect("fixture");
+            // Untimed pre-step: moves `lora_b` off its `ZerosB` exact
+            // zero — see this test's own doc for why the FIRST call's
+            // loss is provably dropout-independent regardless.
+            step_once(
+                &mut encoder,
+                &mut opt,
+                &blocks,
+                &mask,
+                params.batch,
+                params.batched_forward,
+            )
+            .expect("pre-step");
+            step_once(
+                &mut encoder,
+                &mut opt,
+                &blocks,
+                &mask,
+                params.batch,
+                params.batched_forward,
+            )
+            .expect("observed step")
+        }
+
+        let dropout_loss = pre_step_then_loss(0.5);
+        let no_dropout_loss = pre_step_then_loss(0.0);
+
+        assert_ne!(
+            dropout_loss, no_dropout_loss,
+            "lora_dropout=0.5 produced the IDENTICAL loss to lora_dropout=0.0 at the same \
+             seed, post-pre-step -- looks like dropout was never actually engaged \
+             (build_fixture's `> 0.0` boundary check regressed to always leaving dropout \
+             disabled)"
+        );
+    }
+
+    /// MUTATION-TRIAGE test (cargo-mutants caught FIVE distinct arithmetic
+    /// mutations inside `triplet_loss` itself — `a * p` -> `a + p`, `a *
+    /// n` -> `a + n`, `neg - pos` -> `neg + pos`/`neg / pos`, `+ margin` ->
+    /// `* margin` — ALL undetected): every other test that exercises
+    /// `triplet_loss` does so only through `build_fixture`/`run`, either
+    /// comparing losses against a SECOND independent call to the SAME
+    /// (possibly identically-mutated) function, or checking a loose "not
+    /// exactly margin" / "within a wide range" bound that a differently
+    /// but still-bounded arithmetic expression can still clear. This test
+    /// drives `triplet_loss` DIRECTLY (no candle model, no GPU) against a
+    /// HAND-COMPUTED expected scalar for a tiny, exactly-representable-in-
+    /// f32 fixture:
+    ///
+    /// `a = [[1,0],[0,1]]`, `p = [[1,0],[1,0]]`, `n = [[0,1],[0,1]]`,
+    /// `margin = 0.3`:
+    ///   `pos = sum(a*p, -1) = [1*1+0*0, 0*1+1*0] = [1.0, 0.0]`
+    ///   `neg = sum(a*n, -1) = [1*0+0*1, 0*0+1*1] = [0.0, 1.0]`
+    ///   `raw = relu(neg - pos + margin) = relu([0.0-1.0+0.3, 1.0-0.0+0.3])
+    ///        = relu([-0.7, 1.3]) = [0.0, 1.3]`
+    ///   `mean = (0.0 + 1.3) / 2 = 0.65`
+    #[test]
+    fn triplet_loss_matches_hand_computed_value() {
+        let device = Device::Cpu;
+        let a = Tensor::from_vec(vec![1.0f32, 0.0, 0.0, 1.0], (2, 2), &device).unwrap();
+        let p = Tensor::from_vec(vec![1.0f32, 0.0, 1.0, 0.0], (2, 2), &device).unwrap();
+        let n = Tensor::from_vec(vec![0.0f32, 1.0, 0.0, 1.0], (2, 2), &device).unwrap();
+        let loss = triplet_loss(&a, &p, &n, 0.3)
+            .expect("triplet_loss")
+            .to_scalar::<f32>()
+            .expect("scalar");
+        assert!(
+            (loss - 0.65).abs() < 1e-5,
+            "triplet_loss = {loss}, expected 0.65 (hand-computed, see this test's own doc)"
+        );
+    }
+
+    /// MUTATION-TRIAGE test (cargo-mutants caught THREE arithmetic
+    /// mutations inside `synthetic_ids`'s own LCG step — `1 + (...)` ->
+    /// `1 * (...)`, `>> 33` -> `<< 33`, and the `vocab - 1` subtraction ->
+    /// `vocab / 1` — ALL undetected): the existing
+    /// `finetune_step_synthetic_batch_offset_is_seed_plus_group_index_not_seed_times_group_index`
+    /// test only pins the BLOCK-OFFSET arithmetic (`seed + i`) via a
+    /// degeneracy signature, never the LCG's OWN internal formula, and
+    /// `grad_oracle.rs`'s `batch_token_id_sums`-based test recomputes ids
+    /// by calling THIS SAME function again (self-consistent, not
+    /// independent). This test hand-computes the first 5 ids for `seed=1,
+    /// vocab=10` (verified independently in Python using the identical
+    /// 64-bit modular recurrence, masked to 64 bits at every step exactly
+    /// like Rust's `wrapping_mul`/`wrapping_add`) and compares bit-for-bit.
+    #[test]
+    fn synthetic_ids_matches_hand_computed_lcg_sequence() {
+        let device = Device::Cpu;
+        let ids = synthetic_ids(1, 5, 10, 1, &device);
+        let got: Vec<u32> = ids.flatten_all().unwrap().to_vec1::<u32>().unwrap();
+        assert_eq!(got, vec![6, 1, 6, 8, 7]);
+    }
+
+    /// MUTATION-TRIAGE test (cargo-mutants caught `device_name`'s whole
+    /// function body being replaced with `String::new()`/`"xyzzy".into()`):
+    /// no existing test reads `FinetuneStepTier::device_name`'s actual
+    /// VALUE — only the pinned-key-set test in `report.rs` checks the key
+    /// EXISTS, and that test constructs a literal fixture value rather
+    /// than reading `device_name`'s real return.
+    #[test]
+    fn finetune_step_device_name_is_cpu_off_cuda() {
+        let tier = run(&tiny_params()).expect("finetune-step run");
+        assert_eq!(tier.device_name, "cpu");
+    }
+
+    /// MUTATION-TRIAGE test (cargo-mutants caught `run()`'s
+    /// `s_per_step_mean` division `sum/len` surviving as `sum%len`/
+    /// `sum*len`): wall-clock timings are real and non-reproducible, so
+    /// this cannot hand-check an EXACT value — instead it pins a
+    /// MATHEMATICAL INVARIANT that holds regardless of the actual
+    /// timings: the mean of N positive reals is NEVER greater than their
+    /// MAXIMUM, and `s_per_step_p50` (`times[len/2]`, which for
+    /// `tiny_params()`'s `steps: 2` — exactly 2 samples — is the LARGER of
+    /// the two, i.e. the max) IS that maximum. A `%`/`*` mutant breaks
+    /// this invariant for realistic (sub-multi-second) per-step timings:
+    /// `sum % len` returns ~`sum` unchanged when `sum < len` (true for any
+    /// timing well under `len` seconds), which equals `2 * mean_correct >
+    /// max(t1,t2) = p50`; `sum * len` inflates by `len^2` relative to the
+    /// true mean, likewise `> p50` for any nonzero timing. The correct
+    /// `sum/len` is provably `<= p50` (average never exceeds max).
+    #[test]
+    fn finetune_step_mean_never_exceeds_p50() {
+        let tier = run(&tiny_params()).expect("finetune-step run");
+        let mean = tier.s_per_step_mean.value.expect("mean measured");
+        let p50 = tier.s_per_step_p50.value.expect("p50 measured");
+        assert!(
+            mean <= p50 + 1e-9,
+            "s_per_step_mean ({mean}) exceeds s_per_step_p50 ({p50}) -- the mean of real, \
+             sub-multi-second per-step timings can never exceed their maximum (p50, for a \
+             2-sample steps:2 fixture); looks like the sum/len division was replaced with % \
+             or *"
+        );
+    }
+
+    /// MUTATION-TRIAGE test (cargo-mutants caught `run()`'s `steps_per_s =
+    /// 1.0/p50` and `triplets_per_s = batch/p50` divisions surviving as
+    /// `%`/`*`): pins the ALGEBRAIC IDENTITY each derived rate must
+    /// satisfy (`rate * p50 == numerator`) rather than a raw wall-clock
+    /// value, so this holds regardless of the actual (non-reproducible)
+    /// timing.
+    #[test]
+    fn finetune_step_derived_rates_satisfy_their_defining_identity() {
+        let params = tiny_params();
+        let tier = run(&params).expect("finetune-step run");
+        let p50 = tier.s_per_step_p50.value.expect("p50 measured");
+        let steps_per_s = tier.steps_per_s.value.expect("steps_per_s measured");
+        let triplets_per_s = tier.triplets_per_s.value.expect("triplets_per_s measured");
+
+        let steps_identity = steps_per_s * p50;
+        assert!(
+            (steps_identity - 1.0).abs() < 1e-6,
+            "steps_per_s ({steps_per_s}) * p50 ({p50}) = {steps_identity}, expected ~1.0 -- \
+             looks like `1.0 / p50` was replaced with a non-division op"
+        );
+
+        let triplets_identity = triplets_per_s * p50;
+        let expected = params.batch as f64;
+        assert!(
+            (triplets_identity - expected).abs() < 1e-6 * expected.max(1.0),
+            "triplets_per_s ({triplets_per_s}) * p50 ({p50}) = {triplets_identity}, expected \
+             ~batch ({expected}) -- looks like `batch / p50` was replaced with a non-division \
+             op"
         );
     }
 
@@ -903,5 +1238,96 @@ mod tests {
                  noise"
             );
         }
+    }
+
+    /// F1 REGRESSION (audit finding on PR #372): `peak_vram_bytes` is
+    /// `VramSampler::finish`'s `peak.saturating_sub(baseline)`
+    /// (`finetune_step.rs:112` at the time of writing). `saturating_sub`
+    /// FLOORS at zero rather than wrapping — so if `baseline` is ever
+    /// captured AT (or above) the run's own high-water mark, the reported
+    /// delta collapses to zero even though the run legitimately allocated
+    /// many GB. This pins the arithmetic directly, independent of
+    /// `nvidia-smi`/a real GPU (`VramSampler`'s fields are plain atomics
+    /// this test constructs directly, bypassing `start()`'s `nvidia-smi`
+    /// precheck), using magnitudes drawn from a real A100 measurement of
+    /// `main`'s (pre-regression) convention (b8-s512-d0.05,
+    /// `peak_vram_bytes` = 14.98 GB) so the test is anchored to a
+    /// production-scale number, not an arbitrary toy pair.
+    ///
+    /// This test cannot, by itself, prove `run()` captures `vram_baseline`
+    /// BEFORE the untimed pre-step (that ordering fix has no CPU-observable
+    /// effect: this box has no `nvidia-smi`, so `VramSampler::start()`
+    /// returns `None` and `run()`'s `peak_vram_bytes` is
+    /// `Measurement::not_yet_measured` regardless of ordering — see
+    /// `finetune_step_peak_vram_bytes_is_not_yet_measured_off_gpu` below).
+    /// The pod check that closes that gap is named in the PR's hand-off.
+    #[test]
+    fn vram_sampler_finish_reports_true_delta_not_floored_by_a_baseline_at_the_peak() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        // `baseline`: model + optimizer resident, BEFORE any of this run's
+        // allocation (the F1-fixed convention). `delta_bytes`: the exact
+        // real-measurement magnitude for b8-s512-d0.05 (peak_vram_bytes =
+        // 14.98 GB, tip 2c1a68d) so the asserted delta is traceable to a
+        // live pod number, not an invented one.
+        let baseline = 3 * GIB;
+        let delta_bytes = 14_980_000_000_u64;
+        let peak = baseline + delta_bytes;
+        let sampler = VramSampler {
+            peak: Arc::new(AtomicU64::new(peak)),
+            stop: Arc::new(AtomicBool::new(false)),
+            handle: None,
+        };
+        let m = sampler.finish(baseline);
+        assert_eq!(
+            m.value,
+            Some((peak - baseline) as f64),
+            "a baseline captured BEFORE this run's allocation must report the FULL delta, \
+             not a floored/near-zero one"
+        );
+        assert!(
+            m.value.unwrap() > 1.0e10,
+            "expected a multi-GB delta (this pins the F1 class: a baseline mistakenly \
+             captured AT the peak would floor this to ~0 via saturating_sub)"
+        );
+
+        // The bug this finding describes, reproduced in the arithmetic
+        // alone: a baseline captured AT (or above) the peak — i.e. AFTER
+        // the pool has already been driven to its high-water mark by an
+        // untimed pre-step — floors to zero via `saturating_sub`, silently,
+        // with no panic and no `None`.
+        let collapsed_sampler = VramSampler {
+            peak: Arc::new(AtomicU64::new(peak)),
+            stop: Arc::new(AtomicBool::new(false)),
+            handle: None,
+        };
+        let collapsed = collapsed_sampler.finish(peak); // baseline == peak
+        assert_eq!(
+            collapsed.value,
+            Some(0.0),
+            "sanity: this is the exact failure mode F1 describes — a same-or-later baseline \
+             silently reports zero, never an error, which is precisely why the CALL-SITE \
+             ordering in run() (fixed by this PR round) matters and cannot be caught by this \
+             arithmetic test alone"
+        );
+    }
+
+    /// Lattice-cell arm for `run()`'s `peak_vram_bytes`: off any device with
+    /// no `nvidia-smi` on `PATH` (this CI/test box), `VramSampler::start()`
+    /// returns `None` (its first call to `device_memory_used_bytes()`
+    /// fails), so `run()`'s `match sampler { None => ... }` arm is what
+    /// actually executes here — pinned so a future change that panics or
+    /// fabricates a value in the absent-GPU arm reddens immediately. The
+    /// present-GPU arm (`Some(sampler) => sampler.finish(vram_baseline)`) is
+    /// the arm the F1 fix targets and is NOT observable on this box; see the
+    /// pod check named in the hand-off for that arm.
+    #[test]
+    fn finetune_step_peak_vram_bytes_is_not_yet_measured_off_gpu() {
+        let tier = run(&tiny_params()).expect("finetune-step run");
+        assert_eq!(
+            tier.peak_vram_bytes.value, None,
+            "no nvidia-smi on this box => VramSampler::start() returns None => \
+             peak_vram_bytes must be the not-yet-measured sentinel, never a fabricated 0.0"
+        );
+        assert_eq!(tier.peak_vram_bytes.unit, "bytes");
     }
 }

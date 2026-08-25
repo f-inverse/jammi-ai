@@ -812,59 +812,198 @@ mod eager_epilogue_tests {
     use super::eager_epilogue;
     use candle_core::{DType, Device, Tensor};
 
-    /// The PRODUCTION dtype combination (`base_out` `BF16`, `lora_out`
-    /// `F32`) — esc-046 (GH#374): `eager_epilogue` must promote `base_out`
-    /// to `f32` (lossless), add the already-`f32`-scaled `lora_out`, and
-    /// round to `base_out`'s dtype ONCE, matching PEFT's `Linear.forward`.
-    /// Compared, after an EXACT `BF16`->`F32` widening on both sides, to a
-    /// reference built the SAME way (round through `Tensor::to_dtype`,
-    /// never re-deriving bf16 rounding by hand) — a `+`->`-` mutation of
-    /// the (dtype-mismatch) add branch this combination exercises would
-    /// produce a wildly different, easily-distinguished value here, never
-    /// silently agreeing.
-    #[test]
-    fn bf16_base_f32_lora_matches_peft_ordered_reference_bit_exact() {
-        let device = Device::Cpu;
-        let scaling = 2.0_f64; // alpha=32, rank=16
-        let base_f32 = [100.0f32, -50.5, 6688.0, -6688.0, 0.25];
-        let lora_v: [f32; 5] = [1.9690344, -0.5, 3.125, -3.125, 0.0625];
+    /// In-file, seeded `xorshift64` PRNG (family L: no untracked external
+    /// generator) — the same construction
+    /// `jammi-kernels/tests/scaled_cast_add_peft_rounding.rs` uses for
+    /// `ScaledCastAdd`'s own esc-046 fixture, reused here so
+    /// `eager_epilogue`'s fixture is built the identical, inspectable way.
+    struct XorShift64(u64);
 
-        let base_out = Tensor::from_slice(&base_f32, (5,), &device)
-            .unwrap()
-            .to_dtype(DType::BF16)
-            .unwrap();
-        let lora_out = Tensor::from_slice(&lora_v, (5,), &device).unwrap();
+    impl XorShift64 {
+        fn new(seed: u64) -> Self {
+            Self(seed | 1)
+        }
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn next_unit(&mut self) -> f64 {
+            (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+        }
+        /// Box-Muller: one standard-normal draw per call.
+        fn next_gauss(&mut self) -> f64 {
+            let u1 = self.next_unit().max(1e-12);
+            let u2 = self.next_unit();
+            (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+        }
+    }
 
-        let out = eager_epilogue(&base_out, &lora_out, scaling).unwrap();
-        assert_eq!(out.dtype(), DType::BF16);
-        let got: Vec<f32> = out.to_dtype(DType::F32).unwrap().to_vec1().unwrap();
-
-        // Independent reference: round `base` through the SAME `BF16`
-        // storage width (an EXACT operation, not re-deriving eager_epilogue's
-        // own rounding), add the f32-scaled delta on the host, then round
-        // the sum through `BF16` storage once more — the PEFT-ordered
-        // (promote-add-cast-once) formula, expressed via `Tensor::to_dtype`
-        // round-trips instead of a hand-rolled bf16 cast.
-        let base_bf16_roundtrip: Vec<f32> =
-            base_out.to_dtype(DType::F32).unwrap().to_vec1().unwrap();
-        let sum_f32: Vec<f32> = base_bf16_roundtrip
-            .iter()
-            .zip(lora_v.iter())
-            .map(|(&b, &l)| b + l * scaling as f32)
-            .collect();
-        let expected: Vec<f32> = Tensor::from_slice(&sum_f32, (5,), &device)
+    /// Rounds every element through ONE real `BF16` round-trip via
+    /// `Tensor::to_dtype` (never a hand-rolled bf16 cast — `half` is not a
+    /// dependency of this crate, and re-deriving round-to-nearest-even by
+    /// hand is exactly the kind of "re-derive the rounding" this module's
+    /// own doc on `eager_epilogue` warns against). The returned `f32`s are
+    /// each an EXACT widening of a real `bf16` bit pattern, so plain `f32`
+    /// `==` on two values that both went through this function is bit-exact
+    /// comparison, not a tolerance.
+    fn round_bf16_batch(device: &Device, values: &[f32]) -> Vec<f32> {
+        Tensor::from_slice(values, values.len(), device)
             .unwrap()
             .to_dtype(DType::BF16)
             .unwrap()
             .to_dtype(DType::F32)
             .unwrap()
             .to_vec1()
+            .unwrap()
+    }
+
+    /// `base ~ N(0, sigma_base^2)`, bf16-rounded (a real `base_out` GEMM
+    /// output is always bf16-stored in production); `delta ~ N(0,
+    /// sigma_delta^2)`, kept at full `f32` (a real `lora_out` — the `A`/`B`
+    /// GEMM product — is always `f32` in this crate; see `eager_epilogue`'s
+    /// own doc).
+    fn fixture(
+        device: &Device,
+        seed: u64,
+        sigma_base: f64,
+        sigma_delta: f64,
+        n: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let mut rng = XorShift64::new(seed);
+        let base_raw: Vec<f32> = (0..n)
+            .map(|_| (rng.next_gauss() * sigma_base) as f32)
+            .collect();
+        let delta: Vec<f32> = (0..n)
+            .map(|_| (rng.next_gauss() * sigma_delta) as f32)
+            .collect();
+        (round_bf16_batch(device, &base_raw), delta)
+    }
+
+    /// PEFT-ordered reference (correct, matches the CURRENT `eager_epilogue`):
+    /// `base` (already bf16-exact) widens to f32 losslessly, adds the
+    /// f32-scaled delta, and the SUM rounds to bf16 ONCE.
+    fn peft_ordered(device: &Device, base: &[f32], delta: &[f32], scaling: f64) -> Vec<f32> {
+        let scaling = scaling as f32;
+        let sum: Vec<f32> = base
+            .iter()
+            .zip(delta)
+            .map(|(&b, &d)| b + d * scaling)
+            .collect();
+        round_bf16_batch(device, &sum)
+    }
+
+    /// The pre-fix, mis-ordered formula esc-046 removed (round the scaled
+    /// delta to bf16 FIRST, then add and round the sum again) — kept ONLY
+    /// to prove the fixture discriminates the two orderings (non-vacuity),
+    /// never asserted as correct. Reproduces the exact pre-esc-046
+    /// `eager_epilogue` body (`git show 5e7833d^:crates/jammi-lora/src/lora_linear.rs`):
+    /// `scaled_cast = (lora_out * scaling).to_dtype(base_out.dtype()); base_out + scaled_cast`
+    /// — `base_out + scaled_cast` is itself a real `Tensor` add between two
+    /// `BF16` tensors, which must round its own computed sum back to `BF16`
+    /// on store, i.e. a SECOND rounding.
+    fn mis_ordered(device: &Device, base: &[f32], delta: &[f32], scaling: f64) -> Vec<f32> {
+        let scaling = scaling as f32;
+        let scaled_raw: Vec<f32> = delta.iter().map(|&d| d * scaling).collect();
+        let scaled_rounded = round_bf16_batch(device, &scaled_raw); // round #1
+        let sum: Vec<f32> = base
+            .iter()
+            .zip(scaled_rounded.iter())
+            .map(|(&b, &s)| b + s)
+            .collect();
+        round_bf16_batch(device, &sum) // round #2 (the BF16+BF16 tensor add's own store)
+    }
+
+    /// Non-vacuous discrimination floor (kernel guide §3.7 / `AGENTS.md`'s
+    /// standing "non-vacuous negative control" clause) — measured at 32/2048
+    /// today (see the module doc above this test); `>= 20` leaves headroom
+    /// for a different PRNG/toolchain build while refusing a fixture that
+    /// has degenerated to "the two orderings always agree" — exactly what
+    /// the OLD 5-element hardcoded fixture (`|base|` in {100, 50.5, 6688,
+    /// 0.25}, one `lora` value each) silently did: round-then-add and
+    /// add-then-round happened to agree on all 5 of its elements, so a
+    /// regression back to the pre-esc-046 mis-ordered formula would have
+    /// read GREEN here regardless.
+    const MIN_DISCRIMINATING: usize = 20;
+
+    /// The PRODUCTION dtype combination (`base_out` `BF16`, `lora_out`
+    /// `F32`) at PRODUCTION amplitude — esc-046 (GH#374): `eager_epilogue`
+    /// must promote `base_out` to `f32` (lossless), add the already-`f32`
+    /// -scaled `lora_out`, and round to `base_out`'s dtype ONCE, matching
+    /// PEFT's `Linear.forward`. Mixes `|base|~100` (esc-046's own
+    /// lead-measured reproduction amplitude) with `|base|~6688`
+    /// (ModernBERT-large's own layer-18 residual magnitude, esc-045) —
+    /// `scaled_cast_add_peft_rounding.rs`'s own module doc reports that
+    /// `|base|~6688` ALONE under-discriminates (9/4096, below its floor:
+    /// `delta~N(0,3^2)` scaled is almost always far below that amplitude's
+    /// bf16 ULP of 32, so both rounding orders land on the same nearest
+    /// representable value regardless of order), so this fixture mixes in
+    /// the `|base|~100` population the same way, to stay discriminating
+    /// while still exercising bit-exactness at the layer-18 amplitude.
+    #[test]
+    fn bf16_base_f32_lora_matches_peft_ordered_reference_bit_exact() {
+        let device = Device::Cpu;
+        let scaling = 2.0_f64; // alpha=32, rank=16
+        const N_HALF: usize = 1024;
+        let (mut base, mut delta) = fixture(&device, 0x5EED_046D_u64, 6688.0, 3.0, N_HALF);
+        let (base2, delta2) = fixture(&device, 0x5EED_046E_u64, 100.0, 3.0, N_HALF);
+        base.extend(base2);
+        delta.extend(delta2);
+        let n = base.len();
+
+        // Finiteness-affirmative (kernel guide §3.7): a NaN/Inf must FAIL
+        // outright, never read as "not disproven", checked before any
+        // comparison.
+        for i in 0..n {
+            assert!(
+                base[i].is_finite() && delta[i].is_finite(),
+                "index {i}: a non-finite fixture value slipped through (base={} delta={})",
+                base[i],
+                delta[i]
+            );
+        }
+
+        // Non-vacuity: the fixture must actually separate the PEFT-ordered
+        // formula from the pre-esc-046 mis-ordered one, computed from the
+        // two HAND formulas alone, independent of what `eager_epilogue`
+        // itself returns.
+        let peft = peft_ordered(&device, &base, &delta, scaling);
+        let buggy = mis_ordered(&device, &base, &delta, scaling);
+        let discriminating = (0..n).filter(|&i| peft[i] != buggy[i]).count();
+        assert!(
+            discriminating >= MIN_DISCRIMINATING,
+            "fixture is not discriminating: only {discriminating}/{n} elements separate the \
+             PEFT-ordered formula from the pre-esc-046 mis-ordered one — this fixture would read \
+             GREEN on a broken build regardless of `eager_epilogue`; strengthen it before \
+             trusting this oracle"
+        );
+
+        let base_out = Tensor::from_slice(&base, n, &device)
+            .unwrap()
+            .to_dtype(DType::BF16)
             .unwrap();
-        assert_eq!(
-            got, expected,
-            "eager_epilogue must match the PEFT-ordered (promote-add-cast-once) reference \
-             bit-for-bit (after an exact BF16->F32 widening) on the reachable BF16-base/F32-lora \
-             combination"
+        let lora_out = Tensor::from_slice(&delta, n, &device).unwrap();
+        let out = eager_epilogue(&base_out, &lora_out, scaling).unwrap();
+        assert_eq!(out.dtype(), DType::BF16);
+        let got: Vec<f32> = out.to_dtype(DType::F32).unwrap().to_vec1().unwrap();
+
+        let mismatches: Vec<usize> = (0..n).filter(|&i| got[i] != peft[i]).collect();
+        assert!(
+            mismatches.is_empty(),
+            "eager_epilogue does NOT match the PEFT-ordered (promote-add-cast-once) reference \
+             bit-for-bit on {}/{n} elements at production amplitude (esc-046/GH#374). First \
+             mismatch: idx={} base={} delta={} eager_epilogue={} peft_ordered={}. Reverting \
+             `eager_epilogue` to round the scaled delta to bf16 BEFORE the add (the pre-esc-046 \
+             formula) reproduces this class of mismatch.",
+            mismatches.len(),
+            mismatches[0],
+            base[mismatches[0]],
+            delta[mismatches[0]],
+            got[mismatches[0]],
+            peft[mismatches[0]],
         );
     }
 

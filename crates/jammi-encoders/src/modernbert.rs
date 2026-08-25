@@ -976,39 +976,6 @@ impl ModernBertAttention {
         }
     }
 
-    /// esc-045 round 5 (GH #374), E2 diagnostic ONLY — read once per call
-    /// (an uncached `env::var`, exactly like `jammi_kernels`' own
-    /// `JAMMI_KERNELS_DISABLE`/`JAMMI_KERNELS_STRICT` K-aux levers this
-    /// mirrors), defaulting to `false` (unset) so it changes NO shipped
-    /// behavior unless deliberately opted into. Tests round 5's H2
-    /// hypothesis: round 4 localized the bf16 fused-backward divergence to
-    /// `RopeFused`, but round 5's E1 (`jammi-kernels/tests/rope_oracles.rs`)
-    /// measured that op's OWN fwd/bwd at production amplitude to be no
-    /// further from an independent f64 truth than this crate's eager RoPE
-    /// composition — ruling out a defect INSIDE `RopeFused` itself. H2 is
-    /// that a tiny (sub-bf16-ulp-scale) difference between the fused and
-    /// eager RoPE outputs gets amplified downstream, in THIS function's own
-    /// `Q @ Kᵀ` scores GEMM: unlike torch's FlashAttention-2/SDPA reference
-    /// on sm80 (which keeps the scores/softmax entirely in `float`
-    /// accumulator registers — never materializing a BF16-rounded logit —
-    /// see FA2's `softmax.h`, `struct Softmax`'s `TensorT = decltype
-    /// (make_tensor<float>(...))`), this crate's own scores GEMM output
-    /// (`raw_scores` below) is BF16 when the backbone is, so a huge score
-    /// magnitude at massive-activation amplitude gets rounded to a
-    /// BF16-sized absolute error BEFORE softmax ever runs. Setting
-    /// `JAMMI_ROUND5_UPCAST_SCORES=1` upcasts `q`/`k` to `F32` for the
-    /// scores GEMM and softmax (mirroring torch's reference), then casts
-    /// the resulting probabilities back down to the backbone dtype for the
-    /// `P @ V` GEMM (matching FA2's own P-cast right before that GEMM) —
-    /// isolating whether THIS mechanism, not `RopeFused`, is where the
-    /// divergence is introduced. NOT a production kernel change: a real
-    /// fix (if this diagnostic confirms the mechanism) belongs in
-    /// `jammi_kernels::ops::AttentionBlockFused`'s own CUDA GEMM, a
-    /// separate, larger change out of this round's scope.
-    fn round5_e2_upcast_scores_diagnostic() -> bool {
-        std::env::var("JAMMI_ROUND5_UPCAST_SCORES").is_ok()
-    }
-
     /// TODAY'S exact training-arm composition, extracted verbatim (not
     /// rewritten) so [`Self::forward_training_attention`]'s eager fallback
     /// is provably identical to what this crate shipped before
@@ -1042,28 +1009,16 @@ impl ModernBertAttention {
         let k = self.rope_apply(&k)?;
 
         let scale = (d as f64).sqrt();
-        // esc-045 round 5 (GH #374), E2 diagnostic ONLY — see
-        // `round5_e2_upcast_scores_diagnostic`'s doc. `false` (the env var
-        // unset) reproduces EXACTLY the pre-round-5 composition below, byte
-        // for byte; this branch changes NO shipped behavior by default.
-        let upcast_diag = self.training && Self::round5_e2_upcast_scores_diagnostic();
-        let (q_scores, k_scores) = if upcast_diag {
-            (q.to_dtype(DType::F32)?, k.to_dtype(DType::F32)?)
-        } else {
-            (q.clone(), k.clone())
-        };
         // UNSCALED — the training arm folds `1/scale` into
         // `SoftmaxLastDimFused` itself (see `softmax_apply_training`'s
         // doc) rather than dividing here; an eager `scores / scale`
         // division at this point would retain a full `[batch, heads, seq,
         // seq]` `Op::Affine` tape tensor per layer, present for the
         // training arm alone. The eval arm below still divides explicitly.
-        let raw_scores =
-            crate::contiguous_matmul(&q_scores, &k_scores.transpose(D::Minus1, D::Minus2)?)?;
+        let raw_scores = crate::contiguous_matmul(&q, &k.transpose(D::Minus1, D::Minus2)?)?;
         // The additive mask is always built in F32 (see `extended_attention_mask`);
         // cast to the scores' dtype so a F16/BF16 backbone can add it (a no-op
-        // when scores are already F32; also a no-op under `upcast_diag`, whose
-        // `raw_scores` is already F32).
+        // when scores are already F32).
         let extended_mask = extended_mask.to_dtype(raw_scores.dtype())?;
 
         let attn = if self.training {
@@ -1090,19 +1045,7 @@ impl ModernBertAttention {
                 }
                 (false, _) => extended_mask,
             };
-            let probs = softmax_apply_training(&raw_scores, &mask, scale)?;
-            // esc-045 round 5, E2: cast probs back down to the backbone
-            // dtype for the PV GEMM — matching FA2's own P cast (`softmax.h`:
-            // the normalized probabilities are converted to the kernel's
-            // storage dtype right before the `P @ V` GEMM, after the
-            // ENTIRE max/exp/sum reduction has run in `float` registers) —
-            // never leaving the diagnostic's output at a different dtype
-            // than `v`, which `contiguous_matmul` below requires to match.
-            if upcast_diag {
-                probs.to_dtype(qkv.dtype())?
-            } else {
-                probs
-            }
+            softmax_apply_training(&raw_scores, &mask, scale)?
         } else {
             // Eval's UNCHANGED code path, bit-identical to before this
             // commit: divides by `scale` exactly as before (the ONE `Op::Affine`

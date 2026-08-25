@@ -731,6 +731,86 @@ fn eager_vs_fused_bf16_fwd_and_bwd_at_production_amplitude_vs_independent_f64_tr
     );
 }
 
+/// esc-045 round 5, E1's RED control — pinned here as an automated
+/// assertion. The round-5 cuda-runs artifact's own `red_control` field
+/// (`.jammi/escapes.jsonl`'s esc-045 row) reports it as a MANUAL,
+/// un-committed check: "Negating the rotate-half sign convention in
+/// `rope_fwd_row_bf16` (reverted after the check) drove fwd relerr to
+/// 4.183690e-1 — confirms the oracle discriminates a real defect, not a
+/// vacuous pass." A duplicated reference (never a runtime hook into the
+/// production kernel: `RopeFused::negate_sin` is a DIFFERENT, already
+/// production-legitimate flag — it flips the WHOLE `sin` term's sign for
+/// `bwd`'s reuse of the fwd kernel, not which half of `rotate_half` gets
+/// negated — see `ops::rope`'s module doc) that swaps `rotate_half`'s
+/// sign convention (`[x2, -x1]` in place of the correct `[-x2, x1]`) on
+/// the SAME production-amplitude fixture, at bf16 precision, measured
+/// against the SAME independent f64 truth
+/// [`eager_vs_fused_bf16_fwd_and_bwd_at_production_amplitude_vs_independent_f64_truth`]
+/// anchors to.
+fn buggy_wrong_rotate_half_sign_fwd_bf16(
+    x: &[f32],
+    theta_base: f64,
+    total_rows: usize,
+    period: usize,
+    hidden: usize,
+) -> Vec<bf16> {
+    let half = hidden / 2;
+    let mut out = vec![bf16::ZERO; total_rows * hidden];
+    for r in 0..total_rows {
+        let seq_idx = r % period;
+        for col in 0..hidden {
+            let i = col % half;
+            let theta = (seq_idx as f64) * theta_base.powf(-2.0 * i as f64 / hidden as f64);
+            let (c, s) = (theta.cos() as f32, theta.sin() as f32);
+            let xv = x[r * hidden + col];
+            // WRONG sign convention — the exact reverse of `truth_fwd_f64`'s
+            // `rh` (which mirrors the real `rotate_half`'s `[-x2, x1]`
+            // pairing): `col < half` reads the POSITIVE partner and
+            // `col >= half` reads the NEGATED one.
+            let rh = if col < half {
+                x[r * hidden + col + half]
+            } else {
+                -x[r * hidden + col - half]
+            };
+            out[r * hidden + col] = bf16::from_f32(xv * c + rh * s);
+        }
+    }
+    out
+}
+
+#[test]
+fn wrong_rotate_half_sign_convention_is_caught_relerr_over_0_1() {
+    let (heads, seq, hidden) = (4usize, 128usize, 64usize);
+    let total_rows = heads * seq;
+    let theta_base = 10_000.0f64;
+
+    let x0 = massive_amplitude_fixture(total_rows, hidden, 0.0);
+    assert!(
+        x0.iter().any(|&v| v.abs() > 6000.0),
+        "fixture must actually reach production amplitude"
+    );
+    let truth_fwd = truth_fwd_f64(&x0, theta_base, total_rows, seq, hidden);
+    let buggy = buggy_wrong_rotate_half_sign_fwd_bf16(&x0, theta_base, total_rows, seq, hidden);
+
+    // Finiteness-affirmative (guide §3.7) before the discriminating compare.
+    for (i, v) in buggy.iter().enumerate() {
+        assert!(
+            v.to_f32().is_finite(),
+            "index {i}: a non-finite value slipped through the buggy reference (v={v:?})"
+        );
+    }
+
+    let (relerr, _norm_ratio) = relerr_and_norm_ratio(&buggy, &truth_fwd);
+    println!("[E1 RED control] wrong-sign relerr={relerr:.6e}");
+    assert!(
+        relerr.is_finite() && relerr > 0.1,
+        "RED CONTROL did not fire: a wrong rotate_half sign convention must diverge sharply \
+         from the independent f64 truth (round 5's manual check measured 4.18e-1; `> 0.1` pins \
+         that this oracle's fixture and tolerance band actually discriminate a real \
+         sign-convention defect, not vacuously agree with everything) — got relerr={relerr:.6e}"
+    );
+}
+
 #[test]
 fn f32_dtype_forward_matches_double_precision_reference() {
     // A numpy/f64-first reference at a hand-verifiable head_dim=2 (a

@@ -47,6 +47,38 @@
 //! oracle is not comparing two things that were always going to be equal
 //! (the kernel guide's §3.7 "controls are non-vacuous" clause, and
 //! `AGENTS.md`'s standing "non-vacuous negative control" clause).
+//!
+//! ## `d_gate` (the other half of `dwi_out`)
+//!
+//! [`bf16_bwd_d_gate_gets_the_atens_two_kernel_rounding_not_one`] closes
+//! the other half of `geglu_bwd_row_bf16` (`ops/geglu.rs`'s `d_gate` line)
+//! that the `d_up` test above does not touch — asserting only `d_up` from
+//! a kernel that computes BOTH outputs in the same launch is a tautology
+//! risk: a fix (or a regression) that touches only the `d_gate` line reads
+//! GREEN on this file's `d_up`-only assertion regardless of what `d_gate`
+//! does. Unlike `d_up`, this reference CANNOT be read off the crate's own
+//! forward dispatch (the forward never materializes `gelu_erf'(gate)`), so
+//! it is reimplemented independently here, straight from ATen's own two
+//! kernels the module doc's "BF16 backward rounding" section cites:
+//!
+//! - `mul_tensor_backward` (`torch/csrc/autograd/FunctionsManual.cpp`):
+//!   `grad * other`, same-dtype — `d_act = round(dy * up)`, a REAL
+//!   bf16-rounded intermediate tensor, not kept in float across the two
+//!   backward kernels.
+//! - `GeluBackwardCUDAKernelImpl` (`ActivationGeluKernel.cu`, erf mode):
+//!   `dy * (cdf(x) + x*pdf(x))` computed in float (`opmath_t`) with ONE
+//!   cast on store, where this kernel's `dy` argument is the ALREADY
+//!   bf16-rounded `d_act` from the step above — so
+//!   `d_gate = round(round(dy*up) * (cdf(gate) + gate*pdf(gate)))`.
+//!
+//! `cdf`/`pdf` are recomputed here from `libm::erff` directly (the same
+//! primitive `ops/geglu.rs`'s `GELU_ALPHA_F32`/`GELU_BETA_F32` wrap, per
+//! its own doc comment citing ATen's `kAlpha`/`kBeta`), never by calling
+//! the crate's private `gelu_erf_and_grad_f32` — that function is not
+//! reachable from this integration test (it is `fn`, not `pub(crate)`),
+//! and even if it were, reusing the implementation under test as its own
+//! reference would make the assertion tautological, exactly the defect
+//! this section exists to close.
 
 use candle_core::{Device, Tensor, Var};
 use half::bf16;
@@ -392,6 +424,142 @@ fn bf16_bwd_d_up_differentiates_the_forwards_own_rounded_activation_not_an_unrou
          gelu_val` (the unrounded activation) reproduces every one of these mismatches — this \
          is the exact regression this test exists to catch; see `ops/geglu.rs`'s \"esc-045 \
          fix\" doc block.",
+        mismatches.len(),
+        mismatches[0].0,
+        mismatches[0].1,
+        mismatches[0].2,
+        mismatches[0].3,
+        mismatches[0].4,
+    );
+}
+
+/// `1/sqrt(2)` — ATen's `kAlpha`, reimplemented independently of
+/// `ops/geglu.rs`'s private `GELU_ALPHA_F32` (see the module doc's
+/// "`d_gate`" section for why this must NOT call the crate's own helper).
+const GELU_ALPHA_F32_REF: f32 = std::f32::consts::FRAC_1_SQRT_2;
+
+/// `1/sqrt(2*pi)` — ATen's `kBeta`, independently reimplemented (see above).
+const GELU_BETA_F32_REF: f32 =
+    std::f32::consts::FRAC_2_SQRT_PI * std::f32::consts::FRAC_1_SQRT_2 * 0.5;
+
+/// `gelu_erf'(x) = Phi(x) + x*phi(x)` — ATen's `ActivationGeluKernel.cu`
+/// erf-mode `gelu_backward`'s `cdf + x*pdf`, computed straight from
+/// `libm::erff` (never through `jammi_kernels::ops::geglu`'s private
+/// `gelu_erf_and_grad_f32`, which this integration test cannot even name).
+fn gelu_erf_deriv_f32_reference(x: f32) -> f32 {
+    let cdf = (libm::erff(x * GELU_ALPHA_F32_REF) + 1.0) * 0.5;
+    let pdf = GELU_BETA_F32_REF * (-0.5 * x * x).exp();
+    cdf + x * pdf
+}
+
+/// Non-vacuous floor for `d_gate`'s fixture-discrimination control —
+/// measured at 64/214 today; `>= 40` mirrors [`MIN_DISCRIMINATING_ROWS`]'s
+/// rationale (headroom for a different libm/erf build without degenerating
+/// to "always agrees").
+const MIN_DISCRIMINATING_ROWS_D_GATE: usize = 40;
+
+/// One captured `d_gate` mismatch: `(row index, the FIXTURE triple,
+/// kernel's real `d_gate`, the ATen-two-kernel-rounding reference, the
+/// pre-fix single-rounding buggy value)`.
+type MismatchDGate = (usize, (f32, f32, f32), bf16, bf16, bf16);
+
+/// Closes the `d_gate` half `bf16_bwd_d_up_differentiates_...` above does
+/// not touch (see the module doc's "`d_gate`" section) — `GegluFused`'s
+/// bf16 backward must round `dy*up` to bf16 BEFORE multiplying by
+/// `gelu_erf'(gate)`, matching `mul_tensor_backward`'s real bf16-rounded
+/// output feeding `GeluBackwardCUDAKernelImpl` as ITS `dy` argument — never
+/// a single-rounding `dy * up * gelu_erf'(gate)` computed and rounded once.
+#[test]
+fn bf16_bwd_d_gate_gets_the_atens_two_kernel_rounding_not_one() {
+    let device = Device::Cpu;
+    let rows = FIXTURE.len();
+
+    // The REAL bwd dispatch — same construction as the `d_up` test above:
+    // `Var` + `backward()` through `GegluFused`'s own `CustomOp1::bwd`, on
+    // the fixture's real `(gate, up)` pairs seeded by the fixture's real,
+    // non-uniform `dy`.
+    let mut wi = Vec::with_capacity(rows * 2);
+    let mut dy = Vec::with_capacity(rows);
+    for &(g, u, d) in FIXTURE {
+        wi.push(bf16::from_f32(g));
+        wi.push(bf16::from_f32(u));
+        dy.push(bf16::from_f32(d));
+    }
+    let wi_var = Var::from_tensor(&Tensor::from_slice(&wi, (rows, 2), &device).unwrap()).unwrap();
+    let out = fused(wi_var.as_tensor()).unwrap();
+    let dy_t = Tensor::from_slice(&dy, (rows, 1), &device).unwrap();
+    let loss = (&out * &dy_t).unwrap().sum_all().unwrap();
+    let grads = loss.backward().unwrap();
+    let dwi: Vec<bf16> = grads
+        .get(wi_var.as_tensor())
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    let mut discriminating_rows = 0usize;
+    let mut mismatches: Vec<MismatchDGate> = Vec::new();
+    for (i, &(g, u, d)) in FIXTURE.iter().enumerate() {
+        let gate_bf16 = bf16::from_f32(g);
+        let up_bf16 = bf16::from_f32(u);
+        let dy_bf16 = bf16::from_f32(d);
+        let deriv = gelu_erf_deriv_f32_reference(gate_bf16.to_f32());
+
+        // ATen-consistent: `d_act` rounds to bf16 (a real intermediate
+        // tensor `mul`'s backward materializes) BEFORE multiplying by the
+        // gelu derivative.
+        let d_act_correct_bf16 = bf16::from_f32(dy_bf16.to_f32() * up_bf16.to_f32());
+        let d_gate_correct = bf16::from_f32(d_act_correct_bf16.to_f32() * deriv);
+
+        // Pre-fix buggy: single f32 accumulation, rounded once at the end —
+        // this crate's OLD (esc-045-round-2-buggy) formula, reproduced
+        // exactly by reverting `ops/geglu.rs`'s `geglu_bwd_row_bf16`
+        // `d_gate` line to `dy * up * gelu_deriv`.
+        let d_gate_old_buggy = bf16::from_f32(dy_bf16.to_f32() * up_bf16.to_f32() * deriv);
+
+        if d_gate_correct != d_gate_old_buggy {
+            discriminating_rows += 1;
+        }
+
+        let d_gate_kernel = dwi[i * 2];
+        // Affirmative, never `!(x > bound)` (guide §3.7) — a NaN/Inf must
+        // fail this assertion outright, not read as "not disproven".
+        assert!(
+            d_gate_kernel.to_f32().is_finite() && d_gate_correct.to_f32().is_finite(),
+            "row {i}: a non-finite value slipped through (kernel={d_gate_kernel:?}, \
+             reference={d_gate_correct:?}) — FIXTURE={:?}",
+            FIXTURE[i]
+        );
+        if d_gate_kernel != d_gate_correct {
+            mismatches.push((
+                i,
+                FIXTURE[i],
+                d_gate_kernel,
+                d_gate_correct,
+                d_gate_old_buggy,
+            ));
+        }
+    }
+
+    assert!(
+        discriminating_rows >= MIN_DISCRIMINATING_ROWS_D_GATE,
+        "fixture is not discriminating for d_gate: only {discriminating_rows}/{rows} rows \
+         separate the ATen-two-kernel-rounding formula from the pre-fix single-rounding one — \
+         this fixture would read GREEN on a broken build regardless of the kernel (kernel guide \
+         §3.4/§3.7); strengthen it before trusting this oracle"
+    );
+
+    assert!(
+        mismatches.is_empty(),
+        "GegluFused's bf16 bwd `d_gate` does NOT match ATen's two-kernel rounding \
+         (`mul_tensor_backward` then `GeluBackwardCUDAKernelImpl`) on {}/{rows} real \
+         ModernBERT-large layer-18 rows (esc-045/GH#374). First mismatch: idx={} \
+         (gate,up,dy)={:?} kernel_d_gate={:?} ATen-consistent d_gate={:?} \
+         pre-fix-single-rounding d_gate={:?}. Reverting `ops/geglu.rs`'s `geglu_bwd_row_bf16`'s \
+         `d_gate` line to `bf16::from_f32(dyi * up * gelu_deriv)` (single rounding) reproduces \
+         this class of mismatch — this is the exact regression this test exists to catch; see \
+         `ops/geglu.rs`'s \"esc-045 fix\" doc block.",
         mismatches.len(),
         mismatches[0].0,
         mismatches[0].1,

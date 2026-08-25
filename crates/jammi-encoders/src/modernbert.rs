@@ -551,8 +551,18 @@ pub(crate) static ATTENTION_BLOCK_DISPATCH_COUNTERS: LazyLock<&'static DispatchC
 /// band into ONE tensor before calling it, see
 /// [`ModernBertAttention::forward_training_attention`]'s doc) is contiguous
 /// and shaped `[batch|1, 1, 1, seq]`, and — on a local layer only —
-/// `local_band` is present, contiguous, and shaped `[1, 1, seq, seq]` (the
-/// exact shape [`crate::mask::sliding_window_mask`] produces).
+/// `local_mask` (the per-forward padding-plus-band sum,
+/// [`FusedAttentionMasks::local`]) is present, contiguous, and shaped
+/// `[batch|1, 1, seq, seq]` — the op's own `check_mask` domain for the
+/// padding-plus-band class.
+///
+/// | `is_local` | `local_mask` | contiguous | shape | outcome |
+/// |---|---|---|---|---|
+/// | `false` | any | — | — | not consulted |
+/// | `true` | `None` | — | — | `local_mask_present` |
+/// | `true` | `Some` | no | — | `local_mask_contiguous` |
+/// | `true` | `Some` | yes | ≠ `[batch\|1, 1, seq, seq]` | `local_mask_shape_batch_or_one_1_seq_seq` |
+/// | `true` | `Some` | yes | `[batch\|1, 1, seq, seq]` | `domain_ok` |
 fn attention_block_admission_predicate(
     qkv: &Tensor,
     seq: usize,
@@ -560,7 +570,7 @@ fn attention_block_admission_predicate(
     d: usize,
     extended_mask: &Tensor,
     is_local: bool,
-    local_band: Option<&Tensor>,
+    local_mask: Option<&Tensor>,
 ) -> (bool, &'static str) {
     if !device_is_supported(qkv.device()) {
         return (false, "device_is_cpu_or_cuda");
@@ -585,18 +595,88 @@ fn attention_block_admission_predicate(
         return (false, "mask_shape_batch_or_one_1_1_seq");
     }
     if is_local {
-        let Some(band) = local_band else {
-            return (false, "local_band_present");
+        let Some(local) = local_mask else {
+            return (false, "local_mask_present");
         };
-        if !band.is_contiguous() {
-            return (false, "local_band_contiguous");
+        if !local.is_contiguous() {
+            return (false, "local_mask_contiguous");
         }
-        let b_dims = band.dims();
-        if b_dims != [1, 1, seq, seq] {
-            return (false, "local_band_shape_1_1_seq_seq");
+        let l_dims = local.dims();
+        if l_dims.len() != 4
+            || (l_dims[0] != 1 && l_dims[0] != m_dims[0])
+            || l_dims[1] != 1
+            || l_dims[2] != seq
+            || l_dims[3] != seq
+        {
+            return (false, "local_mask_shape_batch_or_one_1_seq_seq");
         }
     }
     (true, "domain_ok")
+}
+
+/// The additive masks the FUSED whole-attention-block arm consumes,
+/// built ONCE per training forward by [`ModernBert::forward_hidden`] —
+/// never per layer. An earlier revision rebuilt them inside every local
+/// layer's fused arm (`extended.to_dtype` + `band.to_dtype` +
+/// `broadcast_add`, 3 launches) and every global layer's (`to_dtype`, 1
+/// launch): on a 28-layer / 10-global / 18-local ModernBERT-large
+/// forward that is `10 + 18 * 3 = 64` mask launches per training step;
+/// this struct's [`Self::build`] issues at most 3 (`global` cast, band
+/// add, `local` cast — and the casts are storage-sharing clones, not
+/// launches, when the backbone dtype is already `F32`).
+///
+/// ## Rounding: add-in-F32-then-cast is bit-identical to cast-then-add
+///
+/// The per-layer revision cast each term to the backbone dtype and added
+/// in that dtype; this one adds in `F32` and casts the SUM. On the only
+/// values either term takes — `0.0` and [`crate::mask::MASKED_LOGIT`]
+/// (`-10_000.0`) — the two orders agree byte-for-byte at every backbone
+/// dtype the fused arm admits: at `F32` both are exact; at `BF16`
+/// (8 significand bits, spacing `64` at `2^13`) `-10_000` rounds to
+/// `-9_984` either way, and the doubly-masked `-20_000` rounds to
+/// `-19_968`, which is exactly `-9_984 + -9_984` (spacing `128` at
+/// `2^14`: `20_000` sits `32` above `19_968` and `96` below `20_096`).
+/// `tests::fused_masks_add_then_cast_is_bit_identical_to_cast_then_add_on_the_masked_logit_lattice`
+/// sweeps all four `(padding, band)` cells at both dtypes — the sweep is
+/// the claim, not this arithmetic.
+struct FusedAttentionMasks {
+    /// `[batch, 1, 1, seq]` in the backbone dtype — the padding mask
+    /// alone, what a GLOBAL layer's fused arm passes as `mask`.
+    global: Tensor,
+    /// `[batch, 1, seq, seq]` in the backbone dtype — padding plus the
+    /// sliding-window band, what a LOCAL layer's fused arm passes.
+    /// `None` iff the model has no local layer.
+    local: Option<Tensor>,
+}
+
+impl FusedAttentionMasks {
+    /// `extended_f32` is [`extended_attention_mask`]'s `[batch, 1, 1,
+    /// seq]` output, `local_band_f32` is [`sliding_window_mask`]'s
+    /// `[1, 1, seq, seq]` band (or `None` for an all-global model), and
+    /// `dtype` is the backbone dtype the attention `qkv` will carry.
+    fn build(
+        extended_f32: &Tensor,
+        local_band_f32: Option<&Tensor>,
+        dtype: DType,
+    ) -> Result<Self, EncoderError> {
+        let global = extended_f32.to_dtype(dtype)?;
+        let local = match local_band_f32 {
+            Some(band) => Some(extended_f32.broadcast_add(band)?.to_dtype(dtype)?),
+            None => None,
+        };
+        Ok(Self { global, local })
+    }
+}
+
+/// The three mask inputs [`ModernBertAttention::forward_training_attention`]
+/// takes, bundled: the `F32` padding mask and band the eager FALLBACK
+/// composition consumes verbatim (unchanged from before the fused arm
+/// existed), and the per-forward [`FusedAttentionMasks`] the fused arm
+/// consumes.
+struct TrainingMaskInputs<'a> {
+    extended: &'a Tensor,
+    local_band: Option<&'a Tensor>,
+    fused: &'a FusedAttentionMasks,
 }
 
 struct ModernBertAttention {
@@ -633,11 +713,24 @@ impl ModernBertAttention {
 
     /// `local_band` is the `[1, 1, seq, seq]` sliding-window mask, supplied
     /// whenever the model has any local layer. A global layer ignores it.
+    /// `fused_masks` is the per-forward [`FusedAttentionMasks`] bundle:
+    /// REQUIRED in training mode (a typed `Config` refusal otherwise — the
+    /// fused arm never rebuilds it per layer), ignored in eval (eval never
+    /// reads it; passing `Some` or `None` there is byte-identical — see
+    /// `tests::attention_block_eval_output_is_bit_identical_regardless_of_fused_eligibility`).
+    ///
+    /// | `self.training` | `fused_masks` | outcome |
+    /// |---|---|---|
+    /// | `false` | `None` | eval path |
+    /// | `false` | `Some` | eval path (identical output; the bundle is unread) |
+    /// | `true` | `Some` | training path |
+    /// | `true` | `None` | `EncoderError::Config` (`tests::training_attention_forward_without_fused_masks_is_a_typed_refusal`) |
     fn forward(
         &self,
         hidden: &Tensor,
         extended_mask: &Tensor,
         local_band: Option<&Tensor>,
+        fused_masks: Option<&FusedAttentionMasks>,
     ) -> Result<Tensor, EncoderError> {
         let normed = match &self.attn_norm {
             Some(ln) => ln.forward(hidden)?,
@@ -650,7 +743,26 @@ impl ModernBertAttention {
         let qkv = self.wqkv.forward(&normed)?;
 
         let ctx = if self.training {
-            self.forward_training_attention(&qkv, batch, seq, h, d, extended_mask, local_band)?
+            let Some(fused) = fused_masks else {
+                return Err(EncoderError::Config(
+                    "training-mode attention reached without the per-forward fused masks — \
+                     ModernBert::forward_hidden builds them once per forward; a direct caller \
+                     in training mode must supply them too"
+                        .into(),
+                ));
+            };
+            self.forward_training_attention(
+                &qkv,
+                batch,
+                seq,
+                h,
+                d,
+                TrainingMaskInputs {
+                    extended: extended_mask,
+                    local_band,
+                    fused,
+                },
+            )?
         } else {
             self.forward_eval_attention(&qkv, batch, seq, h, d, extended_mask, local_band)?
         };
@@ -732,7 +844,14 @@ impl ModernBertAttention {
     /// eager — this crate shipped before this commit), UNCHANGED. Recording
     /// which happened either way, mirroring every other admission-gated
     /// call site in this file.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// The fused arm's `mask` argument is read STRAIGHT out of
+    /// `masks.fused` (`global` for a global layer, `local` for a local
+    /// one) — this method builds, casts, or combines NO mask of its own;
+    /// [`FusedAttentionMasks::build`] in `ModernBert::forward_hidden` did
+    /// that once for the whole forward (see that struct's doc for the
+    /// launch count). The eager fallback keeps consuming the `F32`
+    /// `masks.extended`/`masks.local_band` pair verbatim.
     fn forward_training_attention(
         &self,
         qkv: &Tensor,
@@ -740,23 +859,21 @@ impl ModernBertAttention {
         seq: usize,
         h: usize,
         d: usize,
-        extended_mask: &Tensor,
-        local_band: Option<&Tensor>,
+        masks: TrainingMaskInputs<'_>,
     ) -> Result<Tensor, EncoderError> {
-        if self.is_local && local_band.is_none() {
+        if self.is_local && masks.local_band.is_none() {
             return Err(EncoderError::Config(
                 "local-attention layer reached without a sliding-window band".into(),
             ));
         }
-        let extended_mask = extended_mask.to_dtype(qkv.dtype())?;
         let (holds, predicate) = attention_block_admission_predicate(
             qkv,
             seq,
             h,
             d,
-            &extended_mask,
+            &masks.fused.global,
             self.is_local,
-            local_band,
+            masks.fused.local.as_ref(),
         );
         let outcome = admit(
             admission_mode(),
@@ -769,33 +886,29 @@ impl ModernBertAttention {
             DispatchOutcome::Fused => {
                 let qkv5 = qkv.reshape((batch, seq, 3, h, d))?;
                 let rope_pack = self.rope.cached_rope_pack(qkv.dtype())?;
-                // `AttentionBlockFused` has no `window` construction data —
-                // the combined padding-plus-band mask is built ONCE here
-                // and passed as the op's ONE `mask` argument (see that
-                // op's module doc's "window is construction data at the
-                // call site" section). `local_band` is `Some` here iff
-                // `self.is_local` (the admission predicate above already
-                // checked that pairing), so this mirrors the SAME
-                // combination `forward_eager_training_attention_composition`'s
-                // own training arm builds, independently, on its own
-                // fallback path.
-                let combined_mask = match (self.is_local, local_band) {
-                    (true, Some(band)) => {
-                        extended_mask.broadcast_add(&band.to_dtype(extended_mask.dtype())?)?
-                    }
+                // `AttentionBlockFused` has no `window` construction data
+                // (its module doc's "window is construction data at the
+                // call site" section): a local layer hands it the
+                // per-forward padding-plus-band sum, a global layer the
+                // padding mask alone. The admission predicate above
+                // already refused a local layer whose `local` bundle is
+                // missing, so the `(true, None)` arm below is a typed
+                // belt-and-braces refusal, not a reachable path.
+                let mask = match (self.is_local, masks.fused.local.as_ref()) {
+                    (true, Some(local)) => local,
                     (true, None) => {
                         return Err(EncoderError::Config(
-                            "local-attention layer reached without a sliding-window band".into(),
+                            "local-attention layer reached without a combined fused mask".into(),
                         ))
                     }
-                    (false, _) => extended_mask.clone(),
+                    (false, _) => &masks.fused.global,
                 };
                 let op = AttentionBlockFused::new(
                     1.0 / (d as f32).sqrt(),
                     FullyMaskedPolicy::Zeros,
                     true,
                 )?;
-                Ok(apply3(&qkv5, &rope_pack, &combined_mask, op)?)
+                Ok(apply3(&qkv5, &rope_pack, mask, op)?)
             }
             DispatchOutcome::Eager => self.forward_eager_training_attention_composition(
                 qkv,
@@ -803,8 +916,8 @@ impl ModernBertAttention {
                 seq,
                 h,
                 d,
-                &extended_mask,
-                local_band,
+                masks.extended,
+                masks.local_band,
             ),
         }
     }
@@ -1171,8 +1284,11 @@ impl ModernBertLayer {
         hidden: &Tensor,
         extended_mask: &Tensor,
         local_band: Option<&Tensor>,
+        fused_masks: Option<&FusedAttentionMasks>,
     ) -> Result<Tensor, EncoderError> {
-        let after_attn = self.attention.forward(hidden, extended_mask, local_band)?;
+        let after_attn = self
+            .attention
+            .forward(hidden, extended_mask, local_band, fused_masks)?;
         self.mlp.forward(&after_attn)
     }
 }
@@ -1210,6 +1326,11 @@ pub struct ModernBert {
     ///
     /// A `Mutex` rather than a `RefCell`: the model is held across threads.
     band_cache: Mutex<HashMap<usize, Tensor>>,
+    /// Mirrors the flag [`Self::set_training`] propagates to every layer,
+    /// so [`Self::forward_hidden`] knows whether to build the per-forward
+    /// [`FusedAttentionMasks`] at all (eval never reads them, so eval's
+    /// call sequence stays exactly what it was).
+    training: bool,
 }
 
 impl ModernBert {
@@ -1265,8 +1386,26 @@ impl ModernBert {
             None => None,
             Some(half) => Some(self.sliding_band(seq, half, input_ids.device())?),
         };
+        // The FUSED training arm's masks, built ONCE per forward (at most
+        // 3 launches — see `FusedAttentionMasks`'s doc for the count the
+        // per-layer alternative paid) and shared by every layer; eval
+        // never reads them, so they are not built there.
+        let fused_masks = if self.training {
+            Some(FusedAttentionMasks::build(
+                &extended,
+                local_band.as_ref(),
+                hidden.dtype(),
+            )?)
+        } else {
+            None
+        };
         for layer in &self.layers {
-            hidden = layer.forward(&hidden, &extended, local_band.as_ref())?;
+            hidden = layer.forward(
+                &hidden,
+                &extended,
+                local_band.as_ref(),
+                fused_masks.as_ref(),
+            )?;
         }
 
         self.final_norm.forward(&hidden)
@@ -1339,6 +1478,7 @@ impl ModernBert {
     /// `ModernBertAttention::rope_apply`. Propagating the flag keeps the
     /// surface consistent with [`crate::Bert`] and [`crate::DistilBert`].
     pub fn set_training(&mut self, training: bool) {
+        self.training = training;
         self.emb_norm.set_training(training);
         for layer in &mut self.layers {
             layer.attention.wqkv.set_training(training);
@@ -1633,6 +1773,7 @@ impl<'a> ModernBertBuilder<'a> {
                 .any(|n| config.is_local_layer(n))
                 .then(|| config.half_window()),
             band_cache: Mutex::new(HashMap::new()),
+            training: false,
         })
     }
 }
@@ -2727,19 +2868,130 @@ mod tests {
         let (holds, predicate) =
             attention_block_admission_predicate(&qkv, s, h, d, &mask, true, None);
         assert!(!holds);
-        assert_eq!(predicate, "local_band_present");
+        assert_eq!(predicate, "local_mask_present");
     }
 
+    /// The local-mask cells of `attention_block_admission_predicate`'s
+    /// state table: `[1, 1, seq, seq]` and `[batch, 1, seq, seq]` accepted,
+    /// a non-contiguous one and a wrong-shaped one refused by name.
     #[test]
-    fn attention_block_admission_predicate_accepts_a_local_band_shaped_1_1_seq_seq() {
+    fn attention_block_admission_predicate_local_mask_cells() {
         let device = Device::Cpu;
-        let (b, s, h, d) = (1usize, 4usize, 2usize, ATTENTION_BLOCK_HEAD_DIM);
+        let (b, s, h, d) = (2usize, 4usize, 2usize, ATTENTION_BLOCK_HEAD_DIM);
         let qkv = Tensor::zeros((b, s, 3, h, d), DType::F32, &device).unwrap();
         let mask = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
         let band = sliding_window_mask(s, 1, &device).unwrap();
         let (holds, predicate) =
             attention_block_admission_predicate(&qkv, s, h, d, &mask, true, Some(&band));
-        assert!(holds, "predicate={predicate}");
+        assert!(holds, "[1,1,s,s]: predicate={predicate}");
+        let combined = mask.broadcast_add(&band).unwrap();
+        assert_eq!(combined.dims(), &[b, 1, s, s]);
+        let (holds, predicate) =
+            attention_block_admission_predicate(&qkv, s, h, d, &mask, true, Some(&combined));
+        assert!(holds, "[b,1,s,s]: predicate={predicate}");
+        let transposed = combined.transpose(2, 3).unwrap();
+        assert!(!transposed.is_contiguous());
+        let (holds, predicate) =
+            attention_block_admission_predicate(&qkv, s, h, d, &mask, true, Some(&transposed));
+        assert!(!holds);
+        assert_eq!(predicate, "local_mask_contiguous");
+        let wrong_batch = Tensor::zeros((b + 1, 1, s, s), DType::F32, &device).unwrap();
+        let (holds, predicate) =
+            attention_block_admission_predicate(&qkv, s, h, d, &mask, true, Some(&wrong_batch));
+        assert!(!holds);
+        assert_eq!(predicate, "local_mask_shape_batch_or_one_1_seq_seq");
+        let padding_shaped = Tensor::zeros((1, 1, 1, s), DType::F32, &device).unwrap();
+        let (holds, predicate) =
+            attention_block_admission_predicate(&qkv, s, h, d, &mask, true, Some(&padding_shaped));
+        assert!(!holds);
+        assert_eq!(predicate, "local_mask_shape_batch_or_one_1_seq_seq");
+        // A global layer never consults the local bundle.
+        let (holds, predicate) =
+            attention_block_admission_predicate(&qkv, s, h, d, &mask, false, None);
+        assert!(holds, "global: predicate={predicate}");
+    }
+
+    /// `FusedAttentionMasks::build` adds the padding and band terms in
+    /// `F32` and casts the SUM; the per-layer revision it replaces cast
+    /// each term and added in the backbone dtype. Sweep every `(padding,
+    /// band)` cell of the `{0.0, MASKED_LOGIT}` lattice at both admitted
+    /// backbone dtypes and assert the two orders are byte-identical — the
+    /// bit-neutrality claim the hoist rests on (see the struct's doc for
+    /// the BF16 arithmetic this sweep checks rather than trusts).
+    #[test]
+    fn fused_masks_add_then_cast_is_bit_identical_to_cast_then_add_on_the_masked_logit_lattice() {
+        let device = Device::Cpu;
+        let m = crate::mask::MASKED_LOGIT;
+        // One row holds every cell: padding [0, 0, M, M] against band
+        // rows [0, M, 0, M] — the broadcast lays the 2x2 lattice out in
+        // full, plus the real band geometry from `sliding_window_mask`.
+        let s = 4usize;
+        let padding = Tensor::from_slice(&[0f32, 0.0, m, m], (1, 1, 1, s), &device).unwrap();
+        let band_v: Vec<f32> = (0..s * s)
+            .map(|i| {
+                if (i / s + i % s).is_multiple_of(2) {
+                    0.0
+                } else {
+                    m
+                }
+            })
+            .collect();
+        let band = Tensor::from_slice(&band_v, (1, 1, s, s), &device).unwrap();
+        for dtype in [DType::F32, DType::BF16] {
+            let hoisted = FusedAttentionMasks::build(&padding, Some(&band), dtype).unwrap();
+            let per_layer_global = padding.to_dtype(dtype).unwrap();
+            let per_layer_local = padding
+                .to_dtype(dtype)
+                .unwrap()
+                .broadcast_add(&band.to_dtype(dtype).unwrap())
+                .unwrap();
+            let bytes = |t: &Tensor| -> Vec<f32> {
+                t.to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1()
+                    .unwrap()
+            };
+            assert_eq!(hoisted.global.dtype(), dtype);
+            assert_eq!(hoisted.local.as_ref().unwrap().dtype(), dtype);
+            assert_eq!(
+                bytes(&hoisted.global),
+                bytes(&per_layer_global),
+                "{dtype:?} global"
+            );
+            assert_eq!(
+                bytes(hoisted.local.as_ref().unwrap()),
+                bytes(&per_layer_local),
+                "{dtype:?} local"
+            );
+            // Non-vacuity: the lattice really has all three distinct
+            // values (0, one mask, two masks) in the local tensor.
+            let local = bytes(hoisted.local.as_ref().unwrap());
+            let mut distinct: Vec<f32> = local.clone();
+            distinct.sort_by(|a, b| a.total_cmp(b));
+            distinct.dedup();
+            assert_eq!(distinct.len(), 3, "{dtype:?}: {distinct:?}");
+        }
+        let no_local = FusedAttentionMasks::build(&padding, None, DType::BF16).unwrap();
+        assert!(no_local.local.is_none());
+    }
+
+    /// The `(training, fused_masks == None)` cell of
+    /// `ModernBertAttention::forward`'s state table: a typed refusal, not
+    /// a per-layer rebuild of the masks.
+    #[test]
+    fn training_attention_forward_without_fused_masks_is_a_typed_refusal() {
+        let device = Device::Cpu;
+        let (b, s, h, d) = (1usize, 4usize, 2usize, ATTENTION_BLOCK_HEAD_DIM);
+        let hidden = Tensor::zeros((b, s, h * d), DType::F32, &device).unwrap();
+        let mask = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
+        let mut attn = attention_block_fixture(false, h, s, &device);
+        attn.set_training(true);
+        let err = attn
+            .forward(&hidden, &mask, None, None)
+            .expect_err("training mode without fused masks must be refused");
+        assert!(matches!(err, EncoderError::Config(_)), "{err:?}");
     }
 
     /// Global-attention arm: the fused whole-attention-block forward must
@@ -2767,9 +3019,21 @@ mod tests {
             attention_block_admission_predicate(&qkv, s, h, d, &mask, false, None);
         assert!(holds, "predicate={predicate}");
 
+        let fused = FusedAttentionMasks::build(&mask, None, DType::F32).unwrap();
         let before = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
         let y_fused = attn
-            .forward_training_attention(&qkv, b, s, h, d, &mask, None)
+            .forward_training_attention(
+                &qkv,
+                b,
+                s,
+                h,
+                d,
+                TrainingMaskInputs {
+                    extended: &mask,
+                    local_band: None,
+                    fused: &fused,
+                },
+            )
             .unwrap();
         let after = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
         assert!(
@@ -2809,9 +3073,21 @@ mod tests {
             attention_block_admission_predicate(&qkv, s, h, d, &mask, true, Some(&band));
         assert!(holds, "predicate={predicate}");
 
+        let fused = FusedAttentionMasks::build(&mask, Some(&band), DType::F32).unwrap();
         let before = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
         let y_fused = attn
-            .forward_training_attention(&qkv, b, s, h, d, &mask, Some(&band))
+            .forward_training_attention(
+                &qkv,
+                b,
+                s,
+                h,
+                d,
+                TrainingMaskInputs {
+                    extended: &mask,
+                    local_band: Some(&band),
+                    fused: &fused,
+                },
+            )
             .unwrap();
         let after = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
         assert!(
@@ -2873,9 +3149,21 @@ mod tests {
         let qkv_fused =
             Var::from_tensor(&Tensor::from_slice(&qkv_v, (b, s, 3 * h * d), &device).unwrap())
                 .unwrap();
+        let fused = FusedAttentionMasks::build(&mask, None, DType::F32).unwrap();
         let before = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
         let y_fused = attn
-            .forward_training_attention(qkv_fused.as_tensor(), b, s, h, d, &mask, None)
+            .forward_training_attention(
+                qkv_fused.as_tensor(),
+                b,
+                s,
+                h,
+                d,
+                TrainingMaskInputs {
+                    extended: &mask,
+                    local_band: None,
+                    fused: &fused,
+                },
+            )
             .unwrap();
         let after = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
         assert!(
@@ -2893,10 +3181,9 @@ mod tests {
         // the only ones `forward_training_attention`'s fused arm can
         // build from a leaf `qkv` `Var` — the `Var` leaf itself, the
         // `qkv.reshape((batch, seq, 3, h, d))` view (`Op::Reshape`), and
-        // the ONE `apply3`/`AttentionBlockFused` `CustomOp3` node —
-        // `combined_mask` contributes NO node here because this fixture
-        // is global (`window=None`, so `combined_mask` is a plain
-        // `extended_mask.clone()`, never a `broadcast_add`).
+        // the ONE `apply3`/`AttentionBlockFused` `CustomOp3` node — the
+        // mask contributes NO node: it is a per-forward
+        // `FusedAttentionMasks` tensor built from untracked inputs.
         // `Tensor::op()` (the field that would let this test inspect
         // EACH node's `Op` variant directly) is `pub(crate)` inside
         // `candle-core` — not reachable from this crate — so this
@@ -3029,12 +3316,26 @@ mod tests {
 
         let counters_before = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
         let after: Vec<f32> = attn
-            .forward(&hidden, &mask, None)
+            .forward(&hidden, &mask, None, None)
             .unwrap()
             .flatten_all()
             .unwrap()
             .to_vec1()
             .unwrap();
+        // The `(eval, Some(fused))` cell: the bundle is unread in eval, so
+        // supplying it changes nothing, byte for byte.
+        let fused = FusedAttentionMasks::build(&mask, None, DType::F32).unwrap();
+        let after_with_bundle: Vec<f32> = attn
+            .forward(&hidden, &mask, None, Some(&fused))
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(
+            after, after_with_bundle,
+            "eval must not read the fused-mask bundle"
+        );
         let counters_after = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
 
         assert_eq!(
@@ -3079,9 +3380,10 @@ mod tests {
 
         let mut attn = attention_block_fixture(false, h, s, &device);
 
+        let fused = FusedAttentionMasks::build(&mask, None, DType::F32).unwrap();
         attn.set_training(false);
         let before_eval = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
-        let _ = attn.forward(&hidden, &mask, None).unwrap();
+        let _ = attn.forward(&hidden, &mask, None, None).unwrap();
         let after_eval = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
         assert_eq!(
             after_eval.fused, before_eval.fused,
@@ -3090,7 +3392,7 @@ mod tests {
 
         attn.set_training(true);
         let before_train = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
-        let _ = attn.forward(&hidden, &mask, None).unwrap();
+        let _ = attn.forward(&hidden, &mask, None, Some(&fused)).unwrap();
         let after_train = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
         assert!(
             after_train.fused > before_train.fused,
@@ -3100,7 +3402,7 @@ mod tests {
 
         attn.set_training(false);
         let before_eval2 = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
-        let _ = attn.forward(&hidden, &mask, None).unwrap();
+        let _ = attn.forward(&hidden, &mask, None, None).unwrap();
         let after_eval2 = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
         assert_eq!(
             after_eval2.fused, before_eval2.fused,

@@ -30,6 +30,73 @@
 //! blast-radius change this commit does not make), but every op added after
 //! this one — starting with the LoRA epilogue's `"lora_epilogue"` counters —
 //! uses the registry instead of adding a fifth hand-declared static.
+//!
+//! **Update (contract K-aux):** the four C2-C5 statics named above
+//! (`LN_DISPATCH_COUNTERS`, `ROPE_DISPATCH_COUNTERS`,
+//! `SOFTMAX_DISPATCH_COUNTERS`, `GEGLU_DISPATCH_COUNTERS`) have SINCE been
+//! migrated onto this registry themselves — each is now a
+//! `LazyLock<&'static DispatchCounters>` that calls `counters_for(..)`
+//! under the hood (`crates/jammi-encoders/src/layer_norm.rs:91-92`,
+//! `crates/jammi-encoders/src/modernbert.rs:149-150,163-164,1220-1221`;
+//! `ATTENTION_BLOCK_DISPATCH_COUNTERS` at `modernbert.rs:579-580` is a
+//! fifth, added the same way rather than as a sixth hand-declared static).
+//! The paragraph above is kept for its historical rationale (why the
+//! registry exists at all), not as a description of the current state —
+//! there are no hand-declared `DispatchCounters::new()` statics left
+//! outside this module's own tests and `admit`'s registry-population path
+//! (`grep -rn 'DispatchCounters::new()' crates/`, confirmed at this
+//! contract's tip). What matters for [`admit`]'s `JAMMI_KERNELS_DISABLE`
+//! (below) is unaffected either way: every one of these call sites passes
+//! its op name through `admit` itself, so the disable list covers it
+//! regardless of how its counters are stored.
+//!
+//! ## `JAMMI_KERNELS_DISABLE` — forcing the eager arm without a second build
+//!
+//! A comma-separated list of op keys (`admit`'s own `op: &'static str`
+//! parameter — the literal each call site passes, e.g.
+//! `"layer_norm_fused"`), or the literal `"all"` to disable every op. An op
+//! named in the list makes [`admit`] return `Ok(DispatchOutcome::Eager)`
+//! UNCONDITIONALLY for that op — the predicate is not even consulted, and
+//! `Strict` mode does NOT turn this into an error (disable wins over
+//! Strict: forcing an op eager is a deliberate instruction, not the
+//! predicate failure `Strict` exists to catch). This is what lets a
+//! same-build A/B force exactly one op eager while every other op is still
+//! strictly proven fused (`JAMMI_KERNELS_STRICT=1
+//! JAMMI_KERNELS_DISABLE=softmax_last_dim_fused`), instead of the
+//! previous two-build, `Strict`-losing `sed`-patch-and-rebuild approach.
+//!
+//! The op keys [`admit`] is actually called with today (confirmed by
+//! `grep -rn 'admit(' crates/ | grep -v /target/` at this contract's tip,
+//! excluding this module's own tests): `"layer_norm_fused"`
+//! (`jammi-encoders/src/layer_norm.rs:189`), `"rope_fused"`
+//! (`jammi-encoders/src/modernbert.rs:478`), `"attention_block_fused"`
+//! (`modernbert.rs:930`), `"softmax_last_dim_fused"` (`modernbert.rs:1188`),
+//! `"geglu_fused"` (`modernbert.rs:1259`), and `"lora_linear_fused"`
+//! (`jammi-lora/src/lora_linear.rs:642-644`). `"lora_epilogue"` and
+//! `"lora_dropout"` are also registered names (`counters_for("lora_epilogue")`
+//! / `counters_for("lora_dropout")`, `lora_linear.rs:36,65`) but — per
+//! `lora_dropout_counters`'s and `lora_epilogue_counters`'s own doc
+//! comments at those lines — neither one is EVER passed to `admit` in
+//! today's call graph: both stand-alone call sites they used to guard were
+//! superseded by `crate::ops::LowRankResidualLinear`'s single fused-site
+//! `CustomOp3`,
+//! which reuses their `cpu_fwd`/`cuda_fwd` directly, bypassing `admit`
+//! entirely. Naming either one in `JAMMI_KERNELS_DISABLE` is therefore
+//! exactly the "typo" failure mode [`unmatched_disables`] exists to catch
+//! — a real, present-in-the-registry op name that nonetheless never fires,
+//! not a synthetic example.
+//!
+//! ### The safety property: a typo must never read as a successful forced-eager run
+//!
+//! [`unmatched_disables`] returns every `JAMMI_KERNELS_DISABLE` entry that
+//! has never actually disabled a live `admit` call (tracked via
+//! `fired_disables` (this module's own internal bookkeeping), populated by
+//! `op_is_disabled`). A caller that
+//! turns dispatch counters into a durable/report artifact (this crate's
+//! own callers in `jammi-bench`) is expected to treat a non-empty
+//! `unmatched_disables()` as an INVALID run rather than a datum — the same
+//! "absent counters is not evidence of zero" discipline
+//! [`snapshot_all`]'s doc already states for a never-registered op name.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -180,20 +247,159 @@ pub fn warn_fallback_once(op: &'static str, predicate: &'static str) {
     }
 }
 
-/// Applies one fused-op call site's admission decision: records the
-/// dispatch outcome, and in `Strict` mode turns a failed predicate into a
-/// typed error instead of a silent fallback.
+/// Parses `JAMMI_KERNELS_DISABLE`'s raw value into the requested op-key
+/// set: comma-separated, each entry trimmed, empty entries dropped (a
+/// trailing comma or stray whitespace must not manufacture a bogus `""`
+/// entry that [`unmatched_disables`] would then report as unmatched
+/// forever). `None` (unset) and `Some("")`/an all-whitespace/all-comma
+/// value collapse to the SAME empty set — [`op_is_disabled`] treats an
+/// empty set as unconditionally inert, so unset and "set but empty" are
+/// byte-identical in their effect on [`admit`].
 ///
-/// `predicate_holds` is the call site's own domain check (already evaluated
-/// — this function does not know what the predicate means, only whether it
-/// held); `predicate_name` is what gets logged/erred on failure.
-pub fn admit(
+/// Pure/no I/O — split out from [`disabled_ops`] so the parsing edge
+/// cases are unit-testable with literal inputs, independent of the
+/// process-wide [`OnceLock`] `disabled_ops` memoizes into.
+fn parse_disable_list(raw: Option<&str>) -> HashSet<String> {
+    raw.map(|s| {
+        s.split(',')
+            .map(str::trim)
+            .filter(|tok| !tok.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// The op keys named by `JAMMI_KERNELS_DISABLE`, read once per process —
+/// mirrors [`admission_mode`]'s `OnceLock` contract (set before the
+/// process starts; a bench/CI lane's convention, not something a running
+/// process is expected to observe change). An op name in this set makes
+/// [`admit`] return `Ok(DispatchOutcome::Eager)` for that op regardless of
+/// `AdmissionMode` or the predicate — see this module's doc.
+fn disabled_ops() -> &'static HashSet<String> {
+    static DISABLED: OnceLock<HashSet<String>> = OnceLock::new();
+    DISABLED
+        .get_or_init(|| parse_disable_list(std::env::var("JAMMI_KERNELS_DISABLE").ok().as_deref()))
+}
+
+/// Which of [`disabled_ops`]'s requested entries have actually disabled a
+/// live [`admit`] call at least once — the observation
+/// [`unmatched_disables`] diffs `disabled_ops()` against. Populated by
+/// [`op_is_disabled`].
+fn fired_disables() -> &'static Mutex<HashSet<String>> {
+    static FIRED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    FIRED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Whether `op` is disabled by `requested` (an exact-name entry, or the
+/// `"all"` wildcard), recording which of `requested`'s entries actually
+/// matched into `fired`.
+///
+/// Pure with respect to global state — both collections are passed in —
+/// so the disable lattice's cells are unit-testable against literal,
+/// test-local `requested`/`fired` instances, never the process-wide
+/// `OnceLock`s [`admit`] itself reads through
+/// [`disabled_ops`]/[`fired_disables`]. (This crate does not test the
+/// env-var plumbing itself via `std::env::set_var` inside `cargo test`:
+/// the `OnceLock` is initialized by whichever test's thread reads it
+/// FIRST in the shared test binary, exactly the hazard
+/// `admission_mode_defaults_to_fallback_without_the_env_var`'s doc
+/// already names for `JAMMI_KERNELS_STRICT`. `crates/jammi-bench/tests/`
+/// proves the real env-var path end to end by spawning the compiled
+/// `jammi-bench` binary as a fresh child PROCESS instead, where a fresh
+/// `OnceLock` is guaranteed.)
+///
+/// An exact match and the `"all"` wildcard are recorded independently:
+/// `requested = {"all", "foo"}` with `op = "foo"` marks BOTH `"all"` and
+/// `"foo"` fired (each legitimately requested it); `requested = {"all"}`
+/// with `op = "foo"` marks only `"all"` fired (`"foo"` was never
+/// requested by name, so it must never appear in `fired` — that would
+/// let an unrelated op's dispatch paper over a genuinely-never-matched
+/// literal entry).
+fn op_is_disabled(
+    requested: &HashSet<String>,
+    fired: &Mutex<HashSet<String>>,
+    op: &'static str,
+) -> bool {
+    if requested.is_empty() {
+        return false;
+    }
+    let via_all = requested.contains("all");
+    let via_exact = requested.contains(op);
+    if !via_all && !via_exact {
+        return false;
+    }
+    let mut fired = fired
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if via_exact {
+        fired.insert(op.to_string());
+    }
+    if via_all {
+        fired.insert("all".to_string());
+    }
+    true
+}
+
+/// `requested` entries absent from `fired`, sorted (family J: `HashSet`
+/// iteration order is not a fold order this codebase relies on for a
+/// durable artifact — a caller that logs/serializes this list needs a
+/// deterministic order, not whatever the default hasher's bucket layout
+/// happens to produce on a given run).
+fn compute_unmatched(requested: &HashSet<String>, fired: &HashSet<String>) -> Vec<String> {
+    let mut unmatched: Vec<String> = requested.difference(fired).cloned().collect();
+    unmatched.sort();
+    unmatched
+}
+
+/// Every `JAMMI_KERNELS_DISABLE` entry that has not disabled a single live
+/// [`admit`] call this process — the safety-property read API. A
+/// non-empty result means the disable list named at least one op key that
+/// this run never actually dispatched through, which is EXACTLY the "a
+/// typo in the disable list silently reads as a successful forced-eager
+/// run" failure this mechanism exists to prevent (see this module's doc's
+/// "safety property" section). A caller building a durable run record
+/// (`jammi-bench`'s report/proof path) must treat a non-empty result as
+/// an INVALID run, not a datum.
+///
+/// `disabled_ops`'s registry is lazily populated by observation (an op
+/// name only becomes "seen" the first time a call site actually reaches
+/// [`admit`]), so this cannot be validated at process startup — only at
+/// the end of a run, after every call site that was going to fire this
+/// process has had the chance to.
+pub fn unmatched_disables() -> Vec<String> {
+    let fired = fired_disables()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    compute_unmatched(disabled_ops(), &fired)
+}
+
+/// [`admit`]'s decision core: `disabled` is already resolved (by the
+/// caller, from [`op_is_disabled`]) rather than read from process state
+/// here, so every lattice cell is testable with literal, deterministic
+/// inputs — see [`admit`]'s doc for the full state table.
+fn admit_inner(
     mode: AdmissionMode,
     op: &'static str,
     predicate_name: &'static str,
     predicate_holds: bool,
+    disabled: bool,
     counters: &DispatchCounters,
 ) -> Result<DispatchOutcome> {
+    if disabled {
+        // Disable wins over BOTH the predicate and `Strict` mode — an
+        // explicit `JAMMI_KERNELS_DISABLE` entry is a deliberate
+        // instruction to force the eager arm, not the predicate failure
+        // `Strict` exists to turn into an error. This is the load-bearing
+        // cell (predicate holds AND mode is `Strict`, and disable STILL
+        // wins) that makes `JAMMI_KERNELS_STRICT=1
+        // JAMMI_KERNELS_DISABLE=<op>` a one-build A/B oracle: `<op>` is
+        // forced eager while every OTHER op passing through this same
+        // function is still strictly proven fused.
+        counters.record(DispatchOutcome::Eager);
+        warn_fallback_once(op, "disabled_by_JAMMI_KERNELS_DISABLE");
+        return Ok(DispatchOutcome::Eager);
+    }
     if predicate_holds {
         counters.record(DispatchOutcome::Fused);
         return Ok(DispatchOutcome::Fused);
@@ -209,6 +415,40 @@ pub fn admit(
             predicate: predicate_name,
         }),
     }
+}
+
+/// Applies one fused-op call site's admission decision: records the
+/// dispatch outcome, and in `Strict` mode turns a failed predicate into a
+/// typed error instead of a silent fallback.
+///
+/// `predicate_holds` is the call site's own domain check (already evaluated
+/// — this function does not know what the predicate means, only whether it
+/// held); `predicate_name` is what gets logged/erred on failure.
+///
+/// Before consulting `predicate_holds` or `mode` at all, checks whether
+/// `op` is named in `JAMMI_KERNELS_DISABLE` (this module's doc has the
+/// full mechanism and the state table): if so, this ALWAYS returns
+/// `Ok(DispatchOutcome::Eager)`, unconditionally, in either `AdmissionMode`
+/// — disable wins over `Strict`. With the env var unset (or set but
+/// empty), `disabled_ops` is an empty set and `op_is_disabled` returns
+/// `false` for every `op`, so this reduces to exactly the two-outcome
+/// decision this function has always made.
+pub fn admit(
+    mode: AdmissionMode,
+    op: &'static str,
+    predicate_name: &'static str,
+    predicate_holds: bool,
+    counters: &DispatchCounters,
+) -> Result<DispatchOutcome> {
+    let disabled = op_is_disabled(disabled_ops(), fired_disables(), op);
+    admit_inner(
+        mode,
+        op,
+        predicate_name,
+        predicate_holds,
+        disabled,
+        counters,
+    )
 }
 
 /// `Strict` mode (an explicit fused-path request errors instead of falling
@@ -484,5 +724,330 @@ mod tests {
         b.record(DispatchOutcome::Eager);
         assert_eq!(a.snapshot(), DispatchSnapshot { fused: 1, eager: 0 });
         assert_eq!(b.snapshot(), DispatchSnapshot { fused: 0, eager: 1 });
+    }
+
+    // ---- JAMMI_KERNELS_DISABLE: the contract K-aux lattice ----------------
+    //
+    // Cells 1-8 drive `admit_inner` directly with a literal `disabled: bool`
+    // (see `admit_inner`'s and `op_is_disabled`'s docs for why: this makes
+    // every cell hermetic and parallel-safe, independent of the
+    // process-wide `OnceLock`s the real `JAMMI_KERNELS_DISABLE` env var
+    // memoizes into). Cell 9 (env unset/empty) is covered twice: the
+    // parser-level tests below prove `parse_disable_list` collapses unset
+    // and empty to the identical empty set, and
+    // `lattice_cell_09_env_unset_admit_reduces_to_the_pre_disable_two_outcome_function`
+    // is a guarded, documentation-level assertion about the real `admit`
+    // (mirroring `admission_mode_defaults_to_fallback_without_the_env_var`'s
+    // precedent). Cell 10's hermetic half (`compute_unmatched`) is below;
+    // its REAL-entry-point half lives in
+    // `crates/jammi-bench/tests/finetune_step_kernel_disable.rs` (a fresh
+    // child process, so the `OnceLock` hazard does not apply there).
+
+    #[test]
+    fn lattice_cell_01_not_disabled_predicate_holds_fallback_is_fused() {
+        let counters = DispatchCounters::new();
+        let outcome = admit_inner(
+            AdmissionMode::Fallback,
+            "lattice_op",
+            "pred",
+            true,
+            false,
+            &counters,
+        )
+        .expect("never errors");
+        assert_eq!(outcome, DispatchOutcome::Fused);
+        assert_eq!(counters.snapshot(), DispatchSnapshot { fused: 1, eager: 0 });
+    }
+
+    #[test]
+    fn lattice_cell_02_not_disabled_predicate_holds_strict_is_fused() {
+        let counters = DispatchCounters::new();
+        let outcome = admit_inner(
+            AdmissionMode::Strict,
+            "lattice_op",
+            "pred",
+            true,
+            false,
+            &counters,
+        )
+        .expect("a satisfied predicate never errors, in either mode");
+        assert_eq!(outcome, DispatchOutcome::Fused);
+        assert_eq!(counters.snapshot(), DispatchSnapshot { fused: 1, eager: 0 });
+    }
+
+    #[test]
+    fn lattice_cell_03_not_disabled_predicate_fails_fallback_is_eager() {
+        let counters = DispatchCounters::new();
+        let outcome = admit_inner(
+            AdmissionMode::Fallback,
+            "lattice_op",
+            "pred_failed",
+            false,
+            false,
+            &counters,
+        )
+        .expect("Fallback mode never errors");
+        assert_eq!(outcome, DispatchOutcome::Eager);
+        assert_eq!(counters.snapshot(), DispatchSnapshot { fused: 0, eager: 1 });
+    }
+
+    #[test]
+    fn lattice_cell_04_not_disabled_predicate_fails_strict_errors() {
+        let counters = DispatchCounters::new();
+        let err = admit_inner(
+            AdmissionMode::Strict,
+            "lattice_op",
+            "pred_failed",
+            false,
+            false,
+            &counters,
+        )
+        .expect_err("Strict mode must error, never silently fall back");
+        assert!(matches!(
+            err,
+            KernelError::StrictModeFallback {
+                op: "lattice_op",
+                predicate: "pred_failed"
+            }
+        ));
+        assert_eq!(counters.snapshot(), DispatchSnapshot { fused: 0, eager: 1 });
+    }
+
+    #[test]
+    fn lattice_cell_05_disabled_predicate_holds_fallback_is_eager() {
+        let counters = DispatchCounters::new();
+        let outcome = admit_inner(
+            AdmissionMode::Fallback,
+            "lattice_op",
+            "pred",
+            true,
+            true,
+            &counters,
+        )
+        .expect("a disabled op never errors");
+        assert_eq!(outcome, DispatchOutcome::Eager);
+        assert_eq!(counters.snapshot(), DispatchSnapshot { fused: 0, eager: 1 });
+    }
+
+    #[test]
+    fn lattice_cell_06_disabled_predicate_holds_strict_is_eager_not_error() {
+        // The load-bearing cell: disable wins over BOTH a holding
+        // predicate AND `Strict` mode. Without this cell,
+        // `JAMMI_KERNELS_STRICT=1 JAMMI_KERNELS_DISABLE=<op>` would error
+        // instead of forcing the eager arm, and the one-build A/B oracle
+        // this contract exists for would not work.
+        let counters = DispatchCounters::new();
+        let outcome = admit_inner(
+            AdmissionMode::Strict,
+            "lattice_op",
+            "pred",
+            true,
+            true,
+            &counters,
+        )
+        .expect("disable must win over Strict — this must NOT error");
+        assert_eq!(outcome, DispatchOutcome::Eager);
+        assert_eq!(counters.snapshot(), DispatchSnapshot { fused: 0, eager: 1 });
+    }
+
+    #[test]
+    fn lattice_cell_07_disabled_predicate_fails_fallback_is_eager() {
+        let counters = DispatchCounters::new();
+        let outcome = admit_inner(
+            AdmissionMode::Fallback,
+            "lattice_op",
+            "pred_failed",
+            false,
+            true,
+            &counters,
+        )
+        .expect("a disabled op never errors");
+        assert_eq!(outcome, DispatchOutcome::Eager);
+        assert_eq!(counters.snapshot(), DispatchSnapshot { fused: 0, eager: 1 });
+    }
+
+    #[test]
+    fn lattice_cell_08_disabled_predicate_fails_strict_is_eager_not_error() {
+        let counters = DispatchCounters::new();
+        let outcome = admit_inner(
+            AdmissionMode::Strict,
+            "lattice_op",
+            "pred_failed",
+            false,
+            true,
+            &counters,
+        )
+        .expect("disable must win over Strict even when the predicate ALSO fails — must NOT error");
+        assert_eq!(outcome, DispatchOutcome::Eager);
+        assert_eq!(counters.snapshot(), DispatchSnapshot { fused: 0, eager: 1 });
+    }
+
+    #[test]
+    fn lattice_cell_09_env_unset_admit_reduces_to_the_pre_disable_two_outcome_function() {
+        // `op_is_disabled` on an empty requested set is `false` for every
+        // op, so with `disabled_ops()` empty (the unset/empty-string case
+        // `parse_disable_list`'s tests below cover directly), the real,
+        // process-wide `admit`'s behaviour is `admit_inner` with
+        // `disabled = false` for every call — EXACTLY this function's
+        // pre-K-aux two-outcome shape. Guarded the same way
+        // `admission_mode_defaults_to_fallback_without_the_env_var` is:
+        // only meaningful if the real env var happens to be unset for
+        // this test run (see `op_is_disabled`'s doc for why an in-process
+        // `std::env::set_var` test is not attempted here).
+        if std::env::var_os("JAMMI_KERNELS_DISABLE").is_none() {
+            let counters = DispatchCounters::new();
+            let outcome = admit(
+                AdmissionMode::Strict,
+                "cell9_never_disabled_op",
+                "always_true",
+                true,
+                &counters,
+            )
+            .expect("undisabled, satisfied predicate never errors");
+            assert_eq!(outcome, DispatchOutcome::Fused);
+            assert_eq!(counters.snapshot(), DispatchSnapshot { fused: 1, eager: 0 });
+            assert!(disabled_ops().is_empty());
+            assert!(unmatched_disables().is_empty());
+        }
+    }
+
+    #[test]
+    fn parse_disable_list_unset_is_empty() {
+        assert!(parse_disable_list(None).is_empty());
+    }
+
+    #[test]
+    fn parse_disable_list_empty_string_is_empty() {
+        assert!(parse_disable_list(Some("")).is_empty());
+    }
+
+    #[test]
+    fn parse_disable_list_whitespace_and_stray_commas_produce_no_bogus_empty_entry() {
+        // A trailing comma or stray whitespace must not manufacture a
+        // bogus `""` entry — that would make `unmatched_disables()`
+        // report a phantom unmatched entry for formatting alone.
+        assert!(parse_disable_list(Some("  ,, , ")).is_empty());
+    }
+
+    #[test]
+    fn parse_disable_list_trims_and_splits_on_comma() {
+        let parsed = parse_disable_list(Some(" softmax_last_dim_fused ,rope_fused,,geglu_fused "));
+        let expected: HashSet<String> = ["softmax_last_dim_fused", "rope_fused", "geglu_fused"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(parsed, expected);
+    }
+
+    #[test]
+    fn parse_disable_list_all_keyword_is_a_plain_member_not_special_cased_here() {
+        // `"all"`'s WILDCARD semantics live in `op_is_disabled`, not the
+        // parser — the parser just preserves the literal entry.
+        let parsed = parse_disable_list(Some("all"));
+        assert_eq!(
+            parsed,
+            ["all".to_string()].into_iter().collect::<HashSet<_>>()
+        );
+    }
+
+    #[test]
+    fn op_is_disabled_unlisted_op_is_false_and_does_not_touch_fired() {
+        let requested: HashSet<String> = ["foo".to_string()].into_iter().collect();
+        let fired = Mutex::new(HashSet::new());
+        assert!(!op_is_disabled(&requested, &fired, "bar"));
+        assert!(fired.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn op_is_disabled_empty_requested_set_is_always_false() {
+        let requested: HashSet<String> = HashSet::new();
+        let fired = Mutex::new(HashSet::new());
+        assert!(!op_is_disabled(&requested, &fired, "anything"));
+    }
+
+    #[test]
+    fn op_is_disabled_exact_match_disables_and_records_only_that_name() {
+        let requested: HashSet<String> = ["foo".to_string()].into_iter().collect();
+        let fired = Mutex::new(HashSet::new());
+        assert!(op_is_disabled(&requested, &fired, "foo"));
+        let snap = fired.lock().unwrap();
+        assert_eq!(snap.len(), 1);
+        assert!(snap.contains("foo"));
+    }
+
+    #[test]
+    fn op_is_disabled_all_wildcard_disables_any_op_without_marking_its_own_name_fired() {
+        let requested: HashSet<String> = ["all".to_string()].into_iter().collect();
+        let fired = Mutex::new(HashSet::new());
+        assert!(op_is_disabled(&requested, &fired, "some_op"));
+        assert!(op_is_disabled(&requested, &fired, "another_op"));
+        let snap = fired.lock().unwrap();
+        // Only `"all"` itself was ever a REQUESTED entry — neither op's
+        // own literal name was requested, so neither may appear in
+        // `fired` (that would let an unrelated op's dispatch paper over
+        // a genuinely-never-matched literal entry, e.g. a mistyped
+        // `"al"` sitting alongside a correct `"all"`).
+        assert_eq!(snap.len(), 1);
+        assert!(snap.contains("all"));
+        assert!(!snap.contains("some_op"));
+        assert!(!snap.contains("another_op"));
+    }
+
+    #[test]
+    fn op_is_disabled_exact_and_all_both_present_marks_both_fired() {
+        let requested: HashSet<String> =
+            ["all".to_string(), "foo".to_string()].into_iter().collect();
+        let fired = Mutex::new(HashSet::new());
+        assert!(op_is_disabled(&requested, &fired, "foo"));
+        let snap = fired.lock().unwrap();
+        assert_eq!(snap.len(), 2);
+        assert!(snap.contains("all"));
+        assert!(snap.contains("foo"));
+    }
+
+    #[test]
+    fn compute_unmatched_reports_requested_entries_never_fired() {
+        // Cell 10 — the safety property — hermetic half: a typo'd entry
+        // that never fired must be the one and only name reported.
+        let requested: HashSet<String> =
+            ["foo".to_string(), "bar".to_string()].into_iter().collect();
+        let fired: HashSet<String> = ["foo".to_string()].into_iter().collect();
+        assert_eq!(
+            compute_unmatched(&requested, &fired),
+            vec!["bar".to_string()]
+        );
+    }
+
+    #[test]
+    fn compute_unmatched_is_empty_when_every_requested_entry_fired() {
+        let requested: HashSet<String> = ["foo".to_string()].into_iter().collect();
+        let fired: HashSet<String> = ["foo".to_string()].into_iter().collect();
+        assert!(compute_unmatched(&requested, &fired).is_empty());
+    }
+
+    #[test]
+    fn compute_unmatched_output_is_sorted_regardless_of_hashset_insertion_order() {
+        // Family J: two `HashSet`s built by inserting in opposite order
+        // must still yield the SAME `Vec` — the ordering is a property of
+        // `compute_unmatched`'s explicit `.sort()`, not of insertion
+        // order or the default hasher's bucket layout (which is
+        // randomized per-process and is not a fold order this codebase
+        // relies on for a durable/logged artifact).
+        let mut requested_a = HashSet::new();
+        for k in ["zeta", "alpha", "mu"] {
+            requested_a.insert(k.to_string());
+        }
+        let mut requested_b = HashSet::new();
+        for k in ["mu", "zeta", "alpha"] {
+            requested_b.insert(k.to_string());
+        }
+        let fired = HashSet::new();
+        let out_a = compute_unmatched(&requested_a, &fired);
+        let out_b = compute_unmatched(&requested_b, &fired);
+        assert_eq!(out_a, out_b);
+        assert_eq!(
+            out_a,
+            vec!["alpha".to_string(), "mu".to_string(), "zeta".to_string()]
+        );
     }
 }

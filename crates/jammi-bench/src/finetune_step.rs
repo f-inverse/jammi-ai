@@ -167,6 +167,14 @@ fn synthetic_ids(batch: usize, seq: usize, vocab: usize, seed: u64, device: &Dev
 }
 
 /// Run the tier and return its report block.
+///
+/// Returns `Err` — not a `FinetuneStepTier` with a suspiciously-clean
+/// dispatch split — when `JAMMI_KERNELS_DISABLE` named an op key that
+/// never actually disabled a live dispatch this run (see the check just
+/// before this function returns, and
+/// `jammi_kernels::admission::unmatched_disables`'s doc): that is a typo
+/// in the disable list, not evidence the forced-eager arm ran, and must
+/// never be reported as a datum (contract K-aux).
 pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std::error::Error>> {
     let device = match params.cuda_device {
         Some(ordinal) => Device::new_cuda(ordinal)?,
@@ -299,6 +307,23 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     let lora_epilogue_dispatch_after = jammi_lora::lora_epilogue_dispatch_snapshot();
     let lora_linear_fused_dispatch_after = jammi_lora::lora_linear_fused_dispatch_snapshot();
     let attention_block_dispatch_after = jammi_encoders::attention_block_dispatch_snapshot();
+
+    // `JAMMI_KERNELS_DISABLE` safety property (contract K-aux): a
+    // disable-list entry that never actually disabled a live `admit` call
+    // this run is a typo, not a forced-eager measurement — this run is
+    // INVALID, not a datum with a plausible-looking JSON tier. Checked at
+    // the END of the run, after every dispatch site above has had its
+    // chance to fire: `jammi_kernels::admission`'s registry is populated
+    // by observation and cannot be validated at process start (see
+    // `jammi_kernels::admission::unmatched_disables`'s doc).
+    let unmatched_kernel_disables = jammi_kernels::admission::unmatched_disables();
+    if !unmatched_kernel_disables.is_empty() {
+        return Err(format!(
+            "JAMMI_KERNELS_DISABLE named op key(s) that never disabled a live \
+             dispatch this run (INVALID run, not a datum): {unmatched_kernel_disables:?}"
+        )
+        .into());
+    }
 
     times.sort_by(f64::total_cmp);
     let p50 = times[times.len() / 2];

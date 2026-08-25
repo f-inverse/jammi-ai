@@ -1,0 +1,261 @@
+{
+  "unit": "cast-boundary-wave1-A/B",
+  "git_sha": "80f02fb993806266f05929b6295d7fb9a159696a",
+  "date": "2026-08-25T21:05:13Z",
+  "gpu": "NVIDIA A100-SXM4-80GB, 580.126.16",
+  "nvcc": "Cuda compilation tools, release 12.6, V12.6.85",
+  "features": "cuda",
+  "box": "a100b (exclusive, per the lead)",
+  "env": {
+    "JAMMI_KERNELS_STRICT": "1"
+  },
+  "status": "GREEN",
+  "note": "Same-build forced arm A/B (JAMMI_KERNELS_DISABLE=cast_scale_bf16_f32,cast_add_bf16), run by the lead on the exclusive timing box; pulled from /root/castw1-ab/*.json + /root/castw1-ab.log on a100b and committed verbatim (2 shapes x 2 arms x 2 reps). This headline end-to-end delta (~-38.5 ms/step) is NOT re-measured by this revision of the artifact (the lead's own instruction: 'the lever's number stands; do not re-measure it') — only the isolated_kernel_timing_a100d section below (Block 1 of the phase-4 audit) was corrected, in two rounds — see that section's own round_1/round_2 fields.",
+  "legs": {
+    "b8_s512_fused_r1": {
+      "s_per_step_p50": 0.634850336,
+      "s_per_step_mean": 0.6349387365200001,
+      "lora_linear_fused_dispatches": 3360,
+      "lora_linear_eager_dispatches": 0,
+      "attention_block_fused_dispatches": 840,
+      "kernels_disabled_requested": [],
+      "kernels_disabled_fired": []
+    },
+    "b8_s512_fused_r2": {
+      "s_per_step_p50": 0.635428075,
+      "s_per_step_mean": 0.6446690411199999,
+      "lora_linear_fused_dispatches": 3360,
+      "lora_linear_eager_dispatches": 0,
+      "attention_block_fused_dispatches": 840,
+      "kernels_disabled_requested": [],
+      "kernels_disabled_fired": []
+    },
+    "b8_s512_disabled_r1": {
+      "s_per_step_p50": 0.674415994,
+      "s_per_step_mean": 0.67451149768,
+      "lora_linear_fused_dispatches": 3360,
+      "lora_linear_eager_dispatches": 0,
+      "attention_block_fused_dispatches": 840,
+      "kernels_disabled_requested": [
+        "cast_add_bf16",
+        "cast_scale_bf16_f32"
+      ],
+      "kernels_disabled_fired": [
+        "cast_add_bf16",
+        "cast_scale_bf16_f32"
+      ]
+    },
+    "b8_s512_disabled_r2": {
+      "s_per_step_p50": 0.672819099,
+      "s_per_step_mean": 0.6729609303600002,
+      "lora_linear_fused_dispatches": 3360,
+      "lora_linear_eager_dispatches": 0,
+      "attention_block_fused_dispatches": 840,
+      "kernels_disabled_requested": [
+        "cast_add_bf16",
+        "cast_scale_bf16_f32"
+      ],
+      "kernels_disabled_fired": [
+        "cast_add_bf16",
+        "cast_scale_bf16_f32"
+      ]
+    },
+    "b8_s128_fused_r1": {
+      "s_per_step_p50": 0.18826833,
+      "s_per_step_mean": 0.18832536248,
+      "lora_linear_fused_dispatches": 3360,
+      "lora_linear_eager_dispatches": 0,
+      "attention_block_fused_dispatches": 840,
+      "kernels_disabled_requested": [],
+      "kernels_disabled_fired": []
+    },
+    "b8_s128_fused_r2": {
+      "s_per_step_p50": 0.188276095,
+      "s_per_step_mean": 0.18834605752000005,
+      "lora_linear_fused_dispatches": 3360,
+      "lora_linear_eager_dispatches": 0,
+      "attention_block_fused_dispatches": 840,
+      "kernels_disabled_requested": [],
+      "kernels_disabled_fired": []
+    },
+    "b8_s128_disabled_r1": {
+      "s_per_step_p50": 0.197832099,
+      "s_per_step_mean": 0.19786697296,
+      "lora_linear_fused_dispatches": 3360,
+      "lora_linear_eager_dispatches": 0,
+      "attention_block_fused_dispatches": 840,
+      "kernels_disabled_requested": [
+        "cast_add_bf16",
+        "cast_scale_bf16_f32"
+      ],
+      "kernels_disabled_fired": [
+        "cast_add_bf16",
+        "cast_scale_bf16_f32"
+      ]
+    },
+    "b8_s128_disabled_r2": {
+      "s_per_step_p50": 0.197707723,
+      "s_per_step_mean": 0.19776508287999994,
+      "lora_linear_fused_dispatches": 3360,
+      "lora_linear_eager_dispatches": 0,
+      "attention_block_fused_dispatches": 840,
+      "kernels_disabled_requested": [
+        "cast_add_bf16",
+        "cast_scale_bf16_f32"
+      ],
+      "kernels_disabled_fired": [
+        "cast_add_bf16",
+        "cast_scale_bf16_f32"
+      ]
+    }
+  },
+  "deltas": {
+    "b8_s512_p50_ms": {
+      "fused_r1": 634.850336,
+      "disabled_r1": 674.415994,
+      "delta_ms": 39.565658000000006,
+      "delta_pct": 6.232281178157861
+    },
+    "b8_s128_p50_ms": {
+      "fused_r1": 188.26833000000002,
+      "disabled_r1": 197.832099,
+      "delta_ms": 9.563769
+    }
+  },
+  "dispatch_counter_proof": "requested == fired on both disabled legs (['cast_add_bf16', 'cast_scale_bf16_f32']) — the forced-eager arm genuinely fell back, not a no-op disable key.",
+  "known_gap": "FinetuneStepTier's JSON does not surface cast_scale_bf16_f32/cast_add_bf16 DispatchCounters as named fields (only lora_linear_fused/eager, attention_block_fused/eager, etc. are wired) — flagged as a jammi-bench-domain follow-up, not fixed in this crate's scope (numerics does not own jammi-bench).",
+  "peak_vram_bytes_by_leg": {
+    "source": "raw jammi-bench finetune-step JSONs from the lead's a100b run, at scratchpad/pod/a100b-castw1-ab/*.json in the main checkout (this agent read them there directly; a100b itself stays off-limits under this agent's own hard clause and the permission classifier).",
+    "field": "tiers.finetune_step.peak_vram_bytes.value (report.rs:1275 — device-total minus a post-model/optimizer baseline, an OVER-report on a shared GPU).",
+    "b8_s512": {
+      "fused_r1_gb": 16.15855616,
+      "fused_r2_gb": 16.292773888,
+      "disabled_r1_gb": 15.923675136,
+      "disabled_r2_gb": 15.923675136,
+      "delta_gb": "fused - disabled = +0.235 to +0.369 GB (fused higher both reps)"
+    },
+    "b8_s128": {
+      "fused_r1_gb": 3.944742912,
+      "fused_r2_gb": 4.011851776,
+      "disabled_r1_gb": 4.076863488,
+      "disabled_r2_gb": 4.009754624,
+      "delta_gb": "~0, within run-to-run noise (fused LOWER in r1, essentially equal in r2) — no consistent direction at this shape"
+    }
+  },
+  "isolated_kernel_timing_a100d": {
+    "box": "a100d (this agent, contended throughout) and a100b (the lead, confirmed exclusive: nvidia-smi 0% util, 296 MiB) — both boxes' kernel-only numbers agree to within 0.3%, so the artifact cites both; the exclusive a100b run is the number of record. This section went through TWO fix rounds.",
+    "round_1_method_fixed_but_incomplete": "Per-ITERATION Device::synchronize() (never one sync batching N launches), >=20 warm-ups, >=200 timed iterations, min AND median (fixed fold order, f64::total_cmp) — see tests/cuda_parity.rs's time_kernel(). This closed the ORIGINAL batching defect (0.7459 ms REFUTED — a re-run of that flawed method spread 2.35x across repeats, 0.273/0.619/0.641/0.321 ms) but was NOT sufficient: the lead's own exclusive-box re-run of round 1's committed harness (a100b, 0% util, 296 MiB) still measured cast_scale_bf16_f32 at ~2.12 ms (5.24% roofline), not the ~0.21 ms/53% this agent had attributed to a clean re-measurement. That attribution was WRONG — see round_2 below.",
+    "round_2_root_cause_and_fix": "The lead found the actual cause: apply1 allocates its 151 MB f32 OUTPUT storage INSIDE launch on EVERY iteration (device.alloc::<f32>(n), src/cuda/cast_scale.rs), and cudarc has NO caching allocator — a fresh cuMemAlloc, freed via Drop at the end of every timed iteration, is genuinely ~2 ms of device-driver work, not a measurement artifact, and NOT the pod contention this agent had (incorrectly) blamed round 1's own contended re-measurement attempts on. cast_add_bf16's 25 MB output pays far less of this tax, which is why ITS number was already accurate in round 1. FIX: cast_scale_bf16_f32_into/cast_add_bf16_into (#[doc(hidden)] pub, ops/cast_scale.rs) launch the IDENTICAL kernel into a Tensor allocated ONCE outside the timed loop, backed by pub(crate) cuda_launch_*_into functions in src/cuda/cast_scale.rs that reuse the exact launch config/module/kernel name as the production path. tests/cuda_parity.rs now measures and prints BOTH numbers, labelled: 'wrapper' (apply1/apply2, what a real caller pays, alloc included) and 'kernel-only' (preallocated output). A correctness assertion (bit-identical vs apply1/apply2, flattened) runs before either timing loop, so a bug in the new path could not silently make the kernel-only number meaningless.",
+    "nsys_note": "unavailable/broken on this pod image (nsys --version errors \"hasn't been installed with CUDA Toolkit 12.6\"), so both numbers below stay wall-clock (including per-launch CPU-side dispatch overhead for the kernel-only path too, though that overhead is a much smaller fraction of a ~0.2 ms launch than of a ~2 ms alloc+launch).",
+    "cast_scale_bf16_f32": {
+      "shape": "m=12288 outf=3072 (Wqkv-site B1 population), 151 MB f32 output",
+      "original_headline_number_REFUTED": {
+        "ms_per_launch": 0.7459,
+        "pct_of_2039_roofline": 14.89,
+        "status": "REFUTED (round 1) — not reproducible; a re-run of the SAME batching method on an idle a100d spread 2.35x across repeats (0.273/0.619/0.641/0.321 ms)."
+      },
+      "wrapper_apply1_this_agent_a100d": {
+        "min_ms": 1.8892,
+        "median_ms": 3.8513,
+        "min_pct_roofline": 5.88,
+        "median_pct_roofline": 2.88,
+        "note": "a100d was NOT idle at measurement time (another agent's live job resident throughout this whole session) — but round 2 shows this number is dominated by the 151 MB alloc/free either way, not primarily by contention; the lead's OWN a100b exclusive re-run of the SAME wrapper path got ~2.12 ms, close to this contended 1.89-3.85 ms range, confirming the alloc cost (not contention) is the dominant term."
+      },
+      "kernel_only_preallocated_this_agent_a100d": {
+        "min_ms": 0.1804,
+        "median_ms": 0.1812,
+        "min_gb_per_s": 1255.2,
+        "median_gb_per_s": 1250.0,
+        "min_pct_roofline": 61.56,
+        "median_pct_roofline": 61.30,
+        "iters": 200,
+        "warmups": 20,
+        "status": "measured by this agent on a100d, contended by another agent's job throughout — the kernel-only path isolates the launch from the 151 MB alloc/free, so it is far less sensitive to that neighbour's memory-bandwidth pressure than the wrapper number is; not claimed as a fully clean exclusive-box number."
+      },
+      "kernel_only_preallocated_LEAD_a100b_exclusive": {
+        "box": "a100b, exclusive at measurement time (nvidia-smi 0% util, 296 MiB), run by the lead",
+        "committed_sha": "f972cea",
+        "timestamps_utc": ["2026-08-25T23:06:41Z", "2026-08-25T23:06:52Z"],
+        "run_1": { "min_ms": 0.1809, "min_pct_roofline": 61.39, "min_gb_per_s": 1251.9, "median_ms": 0.1821, "median_gb_per_s": 1243.8, "median_pct_roofline": 61.00 },
+        "run_2": { "min_ms": 0.1805, "min_pct_roofline": 61.56, "min_gb_per_s": 1255.5, "median_ms": 0.1821, "median_gb_per_s": 1243.8, "median_pct_roofline": 61.00 },
+        "median_gb_per_s_note": "GB/s and % for the median are derived here from the lead's reported ms via this op's own traffic model (6 B/elem x 37,748,736 elems) — the lead reported the ms directly, not the derived GB/s/%.",
+        "iters": 200,
+        "warmups": 20,
+        "status": "VALID, exclusive-box, the number of record for this op's kernel-only cost. Matches this agent's own contended a100d kernel-only measurement (0.1804 ms) to within 0.3% (|0.1804-0.1809|/0.1809 = 0.28%, |0.1804-0.1805|/0.1805 = 0.06%) — the kernel-only path is confirmed insensitive to the a100d contention that inflated the WRAPPER number, corroborating round_2's root-cause diagnosis independently of exclusivity."
+      },
+      "wrapper_apply1_LEAD_a100b_exclusive": {
+        "box": "a100b, exclusive at measurement time (nvidia-smi 0% util, 296 MiB), run by the lead",
+        "committed_sha": "f972cea",
+        "run_1": { "min_ms": 1.8596, "min_pct_roofline": 5.97, "min_gb_per_s": 121.7 },
+        "run_2": { "min_ms": 2.1789, "min_pct_roofline": 5.10, "min_gb_per_s": 104.0 },
+        "median_ms_both_runs": 3.80,
+        "median_gb_per_s_note": "~59.6 GB/s / ~2.92% roofline, derived from the reported 3.80 ms via this op's own traffic model — not reported directly by the lead.",
+        "status": "VALID, exclusive-box — confirms round_2's diagnosis directly: even with ZERO contention, the wrapper path (apply1's per-iteration 151 MB cuMemAlloc/cuMemFree) costs ~1.86-2.18 ms min / ~3.80 ms median, an order of magnitude above the kernel-only cost above, so the original 0.7459 ms REFUTED number was never achievable by any variant of the alloc-inside-the-loop method — the allocator cost, not co-tenancy, was always the dominant term."
+      },
+      "comparison_to_candle_own_cast_bf16_f32": {
+        "ms_per_launch": 0.1891,
+        "achieved_gb_per_s": 1198.0,
+        "pct_of_2039_roofline": 58.7,
+        "note": "the exclusive-box kernel-only number (61.0-61.6%) is close to (and slightly above) candle's own single-purpose cast_bf16_f32 kernel doing LESS work (no affine) — consistent with a well-fused elementwise kernel, not a regression."
+      },
+      "traffic_model": "read bf16 (2B) + write f32 (4B) per element"
+    },
+    "cast_add_bf16": {
+      "shape": "m=12288 inf=1024 (Wqkv-site B3 population), 25 MB bf16 output",
+      "original_number": {
+        "ms_per_launch": 0.1027,
+        "achieved_gb_per_s": 980.5,
+        "pct_of_2039_roofline": 48.09,
+        "status": "reproduced closely by both the round-1 wrapper number and round-2's wrapper/kernel-only split below — this op's much smaller output buffer was never much affected by the allocator cost or by contention."
+      },
+      "wrapper_apply2_this_agent_a100d": {
+        "min_ms": 0.0812,
+        "median_ms": 0.0831,
+        "min_pct_roofline": 60.82,
+        "median_pct_roofline": 59.43
+      },
+      "kernel_only_preallocated_this_agent_a100d": {
+        "min_ms": 0.0755,
+        "median_ms": 0.0766,
+        "min_gb_per_s": 1332.7,
+        "median_gb_per_s": 1314.9,
+        "min_pct_roofline": 65.36,
+        "median_pct_roofline": 64.49,
+        "iters": 200,
+        "warmups": 20
+      },
+      "kernel_only_preallocated_LEAD_a100b_exclusive": {
+        "box": "a100b, exclusive at measurement time (nvidia-smi 0% util, 296 MiB), run by the lead",
+        "committed_sha": "f972cea",
+        "timestamps_utc": ["2026-08-25T23:06:41Z", "2026-08-25T23:06:52Z"],
+        "run_1": { "min_ms": 0.0756, "min_pct_roofline": 65.34, "min_gb_per_s": 1332.3, "median_ms": 0.0764, "median_gb_per_s": 1317.6, "median_pct_roofline": 64.62 },
+        "run_2": { "min_ms": 0.0756, "min_pct_roofline": 65.33, "min_gb_per_s": 1332.1, "median_ms": 0.0763, "median_gb_per_s": 1319.3, "median_pct_roofline": 64.70 },
+        "median_gb_per_s_note": "GB/s and % for the median are derived here from the lead's reported ms via this op's own traffic model (8 B/elem x 12,582,912 elems) — the lead reported the ms directly, not the derived GB/s/%.",
+        "iters": 200,
+        "warmups": 20,
+        "status": "VALID, exclusive-box — matches this agent's own contended a100d kernel-only measurement (min 0.0755 ms) essentially exactly."
+      },
+      "wrapper_apply2_LEAD_a100b_exclusive": {
+        "box": "a100b, exclusive at measurement time (nvidia-smi 0% util, 296 MiB), run by the lead",
+        "committed_sha": "f972cea",
+        "run_1": { "min_ms": 0.0809, "min_pct_roofline": 61.1, "min_gb_per_s": 1245.8 },
+        "run_2": { "min_ms": 0.0805, "min_pct_roofline": 61.3, "min_gb_per_s": 1249.9 },
+        "median_note": "not reported by the lead for this op's wrapper leg.",
+        "status": "VALID, exclusive-box — confirms this op's own small (25 MB) output buffer pays far less of the cuMemAlloc/cuMemFree tax cast_scale_bf16_f32's 151 MB buffer does: wrapper and kernel-only are close for cast_add_bf16 (0.0809 vs 0.0756 ms) where they differ by an order of magnitude for cast_scale_bf16_f32 (1.86-2.18 ms vs 0.18 ms)."
+      },
+      "comparison": "60-65% of roofline both ways (contended a100d and exclusive a100b agree), inside/above the guide's realistic 25-50% band — an excellent bandwidth-bound elementwise kernel.",
+      "traffic_model": "read f32 (4B) + read bf16 (2B) + write bf16 (2B) per element"
+    },
+    "wave_1_1_vectorize_followup_status": "REFUTED as originally seeded (round 1's conclusion stands under round 2's numbers too, now on firmer ground): the original 0.7459 ms/14.89% number that motivated a 'Wave 1.1 vectorize (128-bit loads)' follow-up was a batching-defect artifact; the kernel's OWN cost (excluding the unrelated allocator tax) is 61-65% of roofline even on a contended box — a well-fused, near-ceiling elementwise op for its traffic shape, not a 3.5x-off kernel needing vectorization."
+  },
+  "cuda_parity_suite": "76/76 passed + 1 ignored (isolated_kernel_timing_cast_boundary_wave1, needs --ignored) at every one of this branch's tips re-checked on a100d under JAMMI_REQUIRE_CUDA=1: 36fdb97, b5f9ea7 (post-rebase-onto-main), and f1a71ee (this branch's FINAL tip, after the Block-1 second-form preallocated-output fix). The ignored timing test's own correctness assertions (cast_scale_bf16_f32_into/cast_add_bf16_into bit-identical vs apply1/apply2) also passed at f1a71ee, run with --ignored --nocapture, confirming the new preallocated-output path computes the SAME kernel before its timing numbers are trusted. Includes the 5 new device-side oracles this revision adds (Block 2): cast_scale_bit_identical_to_the_eager_two_kernel_chain_on_cuda_across_scales, cast_add_bit_identical_to_the_eager_two_kernel_chain_on_cuda_with_red_control, cast_ops_nonzero_start_offset_and_noncontiguous_view_refused_on_cuda, cast_ops_n_sweep_partial_block_and_empty_on_cuda, lrrl_bwd_dx_fused_vs_disabled_cast_boundary_dump_and_dispatch_proof.",
+  "cuda_clippy_final_sha": "cargo clippy -p jammi-kernels --all-targets --features cuda -- -D warnings: clean at 36fdb97, b5f9ea7, and f1a71ee (this branch's final tip), all a100d.",
+  "lrrl_bwd_dx_fused_vs_disabled_byte_identity": {
+    "method": "two invocations of the SAME built test binary (CARGO_TARGET_DIR=/root/target-audit-castw1, tip 36fdb97 — pre-rebase; the dx computation and dispatch-counter mechanism are unchanged by the rebase and by the Block-1 second-form fix, neither of which touches low_rank_residual_linear.rs's bwd, so this result carries forward unchanged to f1a71ee), differing only in JAMMI_KERNELS_DISABLE, each dumping LowRankResidualLinear::bwd's real dx output (rows=256, inf=1024, outf=3072, r=16) to a file via JAMMI_CAST_BOUNDARY_DX_DUMP.",
+    "fused_run": "JAMMI_REQUIRE_CUDA=1 cargo test ... --exact lrrl_bwd_dx_fused_vs_disabled_cast_boundary_dump_and_dispatch_proof -> 1 passed (dispatch assertions confirmed BOTH cast_scale_bf16_f32 and cast_add_bf16 recorded a fused dispatch, zero eager)",
+    "disabled_run": "JAMMI_REQUIRE_CUDA=1 JAMMI_KERNELS_STRICT=1 JAMMI_KERNELS_DISABLE=cast_scale_bf16_f32,cast_add_bf16 cargo test ... --exact lrrl_bwd_dx_fused_vs_disabled_cast_boundary_dump_and_dispatch_proof -> 1 passed (dispatch assertions confirmed BOTH ops recorded an eager dispatch — the disable genuinely fired, not a no-op key)",
+    "sha256_both_dumps": "b73a8b742d1019968a53c492d4c928ff9614682375a7882b37c92b8dc553fcf0",
+    "result": "BIT-IDENTICAL — `cmp` reports no difference between the two 524288-byte dumps; both files hash to the SAME sha256."
+  },
+  "mutation_triage_eager_arm_closure": "cargo-mutants (jammi-kernels/src/ops/low_rank_residual_linear.rs, --re '::bwd\\b', -j1 --timeout 300) found 2 real survivors, both at the SAME line: the CastAddBf16 Eager fallback's `(&dx_base_2d + &d_x_lora_2d)?` (the '+' -> '-'/'*' mutants) — unreachable on CPU (candle's CPU BF16 matmul limitation blocks the base GEMM before this line is ever reached with base_dtype=BF16) and unreachable without JAMMI_KERNELS_DISABLE set (an env var an in-process OnceLock reads once, so an in-process test would race every other test in the same binary). Closed by a FRESH-PROCESS run instead (no new test code needed — env vars are per-process, so a plain ssh-invoked `cargo test` is already isolated): `JAMMI_REQUIRE_CUDA=1 JAMMI_KERNELS_STRICT=1 JAMMI_KERNELS_DISABLE=cast_add_bf16,cast_scale_bf16_f32 cargo test -p jammi-kernels --features cuda --test cuda_parity lora_linear_parity_bf16_base_backward_production_width` on a100d at 32d7917 -> 1 passed (STRICT mode: every OTHER op is still strictly proven fused while these two are forced eager) — the mutated line, exercised, against the same CPU f32 reference/tolerance the fused-arm run already passed against."
+}

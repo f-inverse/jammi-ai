@@ -525,12 +525,17 @@ fn rope_admission_predicate(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Fused/eager dispatch counters for ModernBERT's training-mode fused
-/// whole-attention-block, mirroring `SOFTMAX_DISPATCH_COUNTERS` /
-/// `ROPE_DISPATCH_COUNTERS` — see `ModernBertAttention::forward_training_attention`'s
-/// doc for the training-only gate this counts. `pub(crate)` (not `pub`) —
-/// read via [`crate::attention_block_dispatch_snapshot`], the same shape
-/// the other three snapshot functions use.
-pub(crate) static ATTENTION_BLOCK_DISPATCH_COUNTERS: DispatchCounters = DispatchCounters::new();
+/// whole-attention-block, read from `jammi_kernels::admission`'s op-keyed
+/// registry — mirroring `ROPE_DISPATCH_COUNTERS`/`SOFTMAX_DISPATCH_COUNTERS`
+/// (a `LazyLock` over `counters_for`, not a directly-owned
+/// `static DispatchCounters`; this op is new enough to start on the
+/// registry directly rather than needing its own migration) — see
+/// `ModernBertAttention::forward_training_attention`'s doc for the
+/// training-only gate this counts. `pub(crate)` (not `pub`) — read via
+/// [`crate::attention_block_dispatch_snapshot`], the same shape the other
+/// three snapshot functions use.
+pub(crate) static ATTENTION_BLOCK_DISPATCH_COUNTERS: LazyLock<&'static DispatchCounters> =
+    LazyLock::new(|| counters_for("attention_block_fused"));
 
 /// The fused whole-attention-block kernel's domain, checked at the call
 /// site (family D / K2): `qkv`'s device is one
@@ -758,7 +763,7 @@ impl ModernBertAttention {
             "attention_block_fused",
             predicate,
             holds,
-            &ATTENTION_BLOCK_DISPATCH_COUNTERS,
+            *ATTENTION_BLOCK_DISPATCH_COUNTERS,
         )?;
         match outcome {
             DispatchOutcome::Fused => {
@@ -2884,8 +2889,8 @@ mod tests {
         );
     }
 
-    /// Audit B10: `forward_eval_attention` was exercised by NO unit test —
-    /// the cited deletion test (`eval_mode_attention_softmax_is_bit_
+    /// `forward_eval_attention` is exercised by NO OTHER unit test —
+    /// the closest existing one (`eval_mode_attention_softmax_is_bit_
     /// identical_regardless_of_fused_eligibility`) only tests the softmax
     /// PREDICATE in isolation, never `ModernBertAttention::forward`'s own
     /// `self.training` branch. This test builds an INDEPENDENT hand
@@ -3001,7 +3006,7 @@ mod tests {
         );
     }
 
-    /// Audit B10's other half: the counter-threading deletion test —
+    /// The counter-threading deletion test:
     /// `attn.training` gating `forward_training_attention` vs
     /// `forward_eval_attention` (`ModernBertAttention::forward`'s own
     /// `if self.training` branch) is the ONLY thing that would catch that

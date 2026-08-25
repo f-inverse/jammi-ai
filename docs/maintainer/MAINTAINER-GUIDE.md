@@ -1868,7 +1868,7 @@ statefulness is a review concern, stated in the module doc rather than overclaim
   the driver JIT-forwards that single `sm_80` PTX to 8.6/8.9/9.0 devices at
   first load (no `-use_fast_math`; `--fmad` contraction is accepted within each
   oracle's stated tolerance, not pinned away globally).
-- **The five ops** (`crates/jammi-kernels/src/ops/`): `LayerNormFused`
+- **The ops** (`crates/jammi-kernels/src/ops/`): `LayerNormFused`
   (`layer_norm.rs`) — bias-free LayerNorm fwd+bwd, reduced over the last dim;
   `bwd` recomputes mean/invvar from `x` (candle 0.11 has no save-for-backward
   channel) via an internal `CustomOp3` helper, `dgamma` skippable via
@@ -1884,7 +1884,18 @@ statefulness is a review concern, stated in the module doc rather than overclaim
   `ScaledCastAdd` (`scaled_cast_add.rs`) — the LoRA-site epilogue `base +
   cast(lora * scaling)`, replacing `[mul, cast, add]`; a generic Tensor-API
   primitive, not LoRA-specific by name (family L), whose one real caller today
-  is `jammi-lora`'s `LoraLinear::forward`.
+  is `jammi-lora`'s `LoraLinear::forward`. `LowRankResidualLinear`
+  (`low_rank_residual_linear.rs`) — the whole LoRA SITE (base matmul, dropout,
+  both LoRA GEMMs, and `ScaledCastAdd`'s own epilogue, reused as an internal
+  step) as one `CustomOp3`, called from `jammi-lora`'s `LoraLinear::forward`
+  when its own domain holds; `ScaledCastAdd`'s standalone dispatch counters
+  stay at zero on a run where this op's are nonzero (see that op's own module
+  doc). `AttentionBlockFused` (`attention_block.rs`) — the WHOLE
+  RoPE+`QKᵀ`+mask+softmax+`PV` attention chain as one `CustomOp3`, composed
+  from this crate's own existing primitives at the storage level (no new
+  `.cu` kernel); has no `window` construction data of its own — a
+  local-attention caller pre-combines its padding mask with a sliding-window
+  band into ONE additive `mask` argument before calling it.
 
 **Admission (`crates/jammi-kernels/src/admission.rs`): validate-and-fall-back
 with typed refusals.** No op decides fusion *policy* in this module — a call

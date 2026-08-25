@@ -1112,6 +1112,34 @@ pub struct FinetuneStepTier {
     pub trainable_tensors: usize,
     /// Measured steps after warmup.
     pub steps_measured: usize,
+    /// Per-measured-step triplet loss, in step order, warmup EXCLUDED — one
+    /// value per element of [`steps_measured`](Self::steps_measured), same
+    /// length. Each entry is read once, from the same loss tensor
+    /// `opt.step` for that iteration backpropagated through
+    /// (`finetune_step.rs`'s existing post-`opt.step` `.to_scalar()` read,
+    /// which exists to force the CUDA queue to completion before the clock
+    /// stops — no second device-to-host read was added to get this field).
+    /// Reading the tensor AFTER `opt.step` only decides when the host
+    /// blocks; the loss value itself was computed by the forward BEFORE
+    /// that step's optimizer update, so `losses[i]` is the PRE-update loss
+    /// of measured step `i`'s batch, not a re-evaluation against the
+    /// updated weights. `torch_finetune_step.py` reads its own loss at the
+    /// mirror-image point for the identical reason, so the two stacks'
+    /// trajectories share a placement convention — see that file's
+    /// `_step_once` doc.
+    ///
+    /// This is cost-fixture data, not a quality result: the module doc's
+    /// "Honesty about what is measured" section applies unchanged — token
+    /// ids are synthetic and uniform, so a falling or rising trajectory
+    /// here says nothing about learning quality, only that the forward /
+    /// backward / optimizer path executed and produced finite numbers.
+    /// Never quote this field as a quality result.
+    pub losses: Vec<f32>,
+    /// `losses[0]`, carried as a scalar for table/summary use so a reader
+    /// does not have to index into `losses` for the common case.
+    pub loss_first: f32,
+    /// `losses[losses.len() - 1]`.
+    pub loss_last: f32,
     /// How many times `jammi_encoders`' bias-free training-mode LayerNorm
     /// actually dispatched the fused kernel (`jammi_kernels::ops::LayerNormFused`)
     /// during this run (warmup + measured steps) — a delta over the
@@ -1420,6 +1448,9 @@ mod tests {
             batched_forward: true,
             trainable_tensors: 2,
             steps_measured: 1,
+            losses: vec![0.5],
+            loss_first: 0.5,
+            loss_last: 0.5,
             ln_fused_dispatches: 0,
             ln_eager_dispatches: 0,
             rope_fused_dispatches: 0,
@@ -1474,6 +1505,9 @@ mod tests {
             "lora_linear_eager_dispatches",
             "lora_linear_fused_dispatches",
             "lora_rank",
+            "loss_first",
+            "loss_last",
+            "losses",
             "peak_rss_bytes",
             "peak_vram_bytes",
             "rope_eager_dispatches",

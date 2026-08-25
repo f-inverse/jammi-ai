@@ -256,6 +256,7 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     let attention_block_dispatch_before = jammi_encoders::attention_block_dispatch_snapshot();
 
     let mut times = Vec::with_capacity(params.steps);
+    let mut losses = Vec::with_capacity(params.steps);
     for step in 0..(params.warmup + params.steps) {
         let t0 = Instant::now();
         let (a, p, n) = if params.batched_forward {
@@ -286,9 +287,25 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
         // far better than the work it did. Cast first: the loss carries the
         // backbone dtype, and reading a BF16 tensor as f32 is an error, not a
         // conversion.
-        let _ = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
+        //
+        // LOSS-VALUE PLACEMENT (read once per step, right here, for both the
+        // sync and the recorded trajectory — no second D2H is added): the
+        // `Tensor` this reads is the one `triplet_loss` produced BEFORE
+        // `opt.step(&grads)` ran a few lines up. Reading it AFTER `opt.step`
+        // only decides when the host blocks on the (already-queued) device
+        // computation; it does not recompute the loss against the just-updated
+        // weights. So `loss_val` is the PRE-STEP loss of this iteration's
+        // batch — the loss the optimizer step just applied was computed FROM,
+        // not the loss the model would produce if re-evaluated after the
+        // update. `torch_finetune_step.py`'s `_step_once` reads its loss at
+        // the mirror-image point (`loss.detach().float().item()` after
+        // `optimizer.step()`/`scaler.step()` returns, before its own CUDA
+        // sync) for the identical reason, so the two stacks' recorded
+        // trajectories carry the same placement convention.
+        let loss_val = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
         if step >= params.warmup {
             times.push(t0.elapsed().as_secs_f64());
+            losses.push(loss_val);
         }
     }
 
@@ -303,6 +320,12 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     times.sort_by(f64::total_cmp);
     let p50 = times[times.len() / 2];
     let mean = times.iter().sum::<f64>() / times.len() as f64;
+    // `losses` is pushed in lockstep with `times` above (same `if step >=
+    // params.warmup` guard, same loop iteration), so it is never empty when
+    // `times` is not — the same precondition `times[times.len() / 2]` above
+    // already relies on (an `--steps 0` run panics there first).
+    let loss_first = *losses.first().expect("losses populated alongside times");
+    let loss_last = *losses.last().expect("losses populated alongside times");
 
     Ok(FinetuneStepTier {
         device: device_label,
@@ -316,6 +339,9 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
         batched_forward: params.batched_forward,
         trainable_tensors: trainable.len(),
         steps_measured: times.len(),
+        losses,
+        loss_first,
+        loss_last,
         ln_fused_dispatches: ln_dispatch_after
             .fused
             .saturating_sub(ln_dispatch_before.fused),
@@ -403,4 +429,209 @@ fn peak_rss_bytes() -> Measurement {
         }
     }
     Measurement::not_yet_measured("bytes")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The engine's own tiny 1-layer, 32-hidden ModernBERT fixture — shared
+    /// with `jammi-bench`'s `model_inference` tier and `jammi-encoders`'
+    /// own tests, referenced (never copied) so this test exercises the SAME
+    /// checkpoint format the real GPU path loads. `ModernBertConfig`'s
+    /// `serde(default = ...)` fields tolerate the classifier-only keys
+    /// (`id2label`/`classifier_pooling`/…) this fixture's `config.json`
+    /// also carries — no `deny_unknown_fields` on that struct — and
+    /// `ModernBert::builder().build()` only reads the `model.*` backbone
+    /// prefix out of the safetensors, ignoring the classifier head weights
+    /// this bundle also contains.
+    fn tiny_model_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../cookbook/fixtures/tiny_modernbert_classifier")
+    }
+
+    /// A CPU, single-Wqkv-site LoRA config over the tiny fixture — small
+    /// enough to run twice in one test with no GPU.
+    fn tiny_params() -> FinetuneStepParams {
+        FinetuneStepParams {
+            model_dir: tiny_model_dir(),
+            batch: 2,
+            seq: 8,
+            steps: 2,
+            warmup: 1,
+            lora_rank: 1,
+            lora_alpha: 1.0,
+            lora_dropout: 0.0,
+            target_modules: vec!["Wqkv".to_string()],
+            backbone_dtype: jammi_numerics::ComputePrecision::F32,
+            cuda_device: None,
+            seed: 1,
+            batched_forward: true,
+        }
+    }
+
+    /// The `*_fused_dispatches` / `*_eager_dispatches` counter fields on
+    /// [`FinetuneStepTier`] MUST be a DELTA over the process-wide dispatch
+    /// registries — `run()`'s `*_dispatch_before` snapshot taken right
+    /// before the step loop, subtracted (via `saturating_sub`) from the
+    /// `*_dispatch_after` snapshot taken right after it — never the raw
+    /// ambient "after" total. The registries are process-global counters
+    /// (`jammi_kernels::admission::DispatchCounters`, atomics shared by
+    /// every call site in the process, including an EARLIER call to this
+    /// same `run()`), so a report that skipped the "before" subtraction
+    /// would leak an earlier run's (or an earlier test's) dispatch activity
+    /// into this run's numbers.
+    ///
+    /// Proven directly, not inferred: run the identical tiny config through
+    /// `run()` TWICE in one process and assert the two reports carry the
+    /// SAME per-counter totals. If `run()` reported the raw "after"
+    /// snapshot instead of `after - before`, the second call's totals would
+    /// include the first call's dispatches too and come out roughly double
+    /// — this test reddens the moment that subtraction is removed (the
+    /// acceptance gap this test closes: deleting the before/after snapshot
+    /// pair and reporting the bare "after" counters previously had no test
+    /// noticing).
+    #[test]
+    fn finetune_step_counters_are_a_snapshot_delta_not_a_running_total() {
+        // `cargo test` runs this crate's tests on multiple threads by
+        // default, and `model_inference`'s own tests build and forward
+        // real encoders in the same process — so the process-global
+        // dispatch registries these counters read are NOT exclusive to
+        // this test. An exact-equality check between two back-to-back
+        // `run()` calls is therefore genuinely flaky (observed: a 6-count
+        // gap from concurrent noise on an otherwise-correct implementation)
+        // and would not distinguish "noisy" from "actually broken". So
+        // instead of comparing two like-sized runs for exact equality, this
+        // DELIBERATELY manufactures a large, known step of ambient-counter
+        // growth (the "inflation" run, ~50x a baseline run's own step
+        // count) BETWEEN two baseline-sized runs, and asserts the second
+        // baseline-sized run's totals stayed close to the first's — a
+        // generous absolute tolerance absorbs ordinary cross-test noise
+        // (single digits, per the observation above) without absorbing the
+        // inflation run's ~50x contribution, which a raw (non-delta)
+        // counter would leak straight into the report.
+        let small = tiny_params();
+        let mut big = small.clone();
+        big.steps = 100;
+        big.warmup = 0;
+
+        let baseline = run(&small).expect("baseline finetune-step run");
+        let _inflate = run(&big).expect("inflation finetune-step run (report discarded)");
+        let after_inflation = run(&small).expect("post-inflation finetune-step run");
+
+        // Encoder-side counters: every training step's forward touches
+        // LayerNorm (embeddings + MLP norm), RoPE, the masked softmax, and
+        // GeGLU at least once regardless of which linear carries a LoRA
+        // adapter, so each pair's total is non-zero.
+        let ln_total = |t: &FinetuneStepTier| t.ln_fused_dispatches + t.ln_eager_dispatches;
+        let rope_total = |t: &FinetuneStepTier| t.rope_fused_dispatches + t.rope_eager_dispatches;
+        let softmax_total =
+            |t: &FinetuneStepTier| t.softmax_fused_dispatches + t.softmax_eager_dispatches;
+        let geglu_total =
+            |t: &FinetuneStepTier| t.geglu_fused_dispatches + t.geglu_eager_dispatches;
+        let attention_block_total = |t: &FinetuneStepTier| {
+            t.attention_block_fused_dispatches + t.attention_block_eager_dispatches
+        };
+
+        for (name, total_of) in [
+            ("ln", ln_total as fn(&FinetuneStepTier) -> u64),
+            ("rope", rope_total),
+            ("softmax", softmax_total),
+            ("geglu", geglu_total),
+            ("attention_block", attention_block_total),
+        ] {
+            let base = total_of(&baseline);
+            let after = total_of(&after_inflation);
+            assert!(base > 0, "{name}: expected at least one dispatch per run");
+            let tolerance = base.max(4) * 4 + 40;
+            assert!(
+                after <= base + tolerance,
+                "{name}: post-inflation total {after} vs baseline {base} \
+                 (tolerance {tolerance}) — the 100-step inflation run's dispatches \
+                 appear to have leaked into this report; counters must be a \
+                 before/after snapshot DELTA over this run's own window, not the \
+                 raw ambient (process-lifetime) total"
+            );
+        }
+
+        // LoRA-side counters: `target_modules = ["Wqkv"]` guarantees exactly
+        // one adapted linear, but WHICH counter family carries the
+        // dispatches (the standalone epilogue vs the fused whole-site
+        // kernel) is an admission-predicate outcome, not something this
+        // test pins — see `lora_linear_fused_dispatches`'s own doc for why
+        // the epilogue pair is permanently zero on a run where the fused
+        // LoRA-site counter is non-zero. Sum both families and apply the
+        // same inflation-leak check to the sum.
+        let lora_total = |t: &FinetuneStepTier| {
+            t.lora_epilogue_fused_dispatches
+                + t.lora_epilogue_eager_dispatches
+                + t.lora_linear_fused_dispatches
+                + t.lora_linear_eager_dispatches
+        };
+        let (lora_base, lora_after) = (lora_total(&baseline), lora_total(&after_inflation));
+        assert!(
+            lora_base > 0,
+            "expected the LoRA-adapted Wqkv site to dispatch at least once"
+        );
+        let lora_tolerance = lora_base.max(4) * 4 + 40;
+        assert!(
+            lora_after <= lora_base + lora_tolerance,
+            "lora: post-inflation total {lora_after} vs baseline {lora_base} \
+             (tolerance {lora_tolerance}) — the inflation run's LoRA-site \
+             dispatches appear to have leaked into this report; counters must be \
+             a before/after snapshot DELTA, not the raw ambient total"
+        );
+    }
+
+    /// `losses`/`loss_first`/`loss_last` are populated from the SAME
+    /// post-`opt.step` read the step loop already does for its CUDA sync
+    /// (see the loss-read call site's own comment) — one entry per measured
+    /// step, warmup excluded, `loss_first`/`loss_last` matching the ends of
+    /// `losses`. Every value must be finite: a NaN/Inf loss silently
+    /// poisoning `losses` while `loss_first`/`loss_last` still "looked like
+    /// numbers" would be exactly the non-finite-control gap the fixtures
+    /// contract warns about (`NaN > c` is `false`), so this asserts
+    /// `is_finite()` explicitly rather than only checking shape.
+    #[test]
+    fn finetune_step_losses_track_measured_steps_and_are_finite() {
+        let params = tiny_params();
+        let tier = run(&params).expect("finetune-step run");
+
+        assert_eq!(tier.losses.len(), params.steps);
+        assert_eq!(tier.losses.len(), tier.steps_measured);
+        assert_eq!(tier.loss_first, tier.losses[0]);
+        assert_eq!(tier.loss_last, tier.losses[tier.losses.len() - 1]);
+
+        // Theoretical range of `triplet_loss` (margin=0.3, cosines in
+        // [-1, 1]): `relu(margin - cos(a,p) + cos(a,n))` is in
+        // `[0, margin + 2]`, and `mean_all` over that range stays in it —
+        // so every recorded value must land in `[0, margin + 2]` with a
+        // small float-slop margin. A finiteness check alone would NOT
+        // catch a mutation that hardcodes the read to a fixed in-range
+        // constant (e.g. always `0.0`); the bound plus the non-degenerate
+        // check below together do.
+        const MAX_TRIPLET_LOSS: f32 = 0.3 + 2.0 + 1e-3;
+        for (i, &l) in tier.losses.iter().enumerate() {
+            assert!(l.is_finite(), "losses[{i}] = {l} is not finite");
+            assert!(
+                (0.0..=MAX_TRIPLET_LOSS).contains(&l),
+                "losses[{i}] = {l} is outside triplet_loss's theoretical range [0, {MAX_TRIPLET_LOSS}]"
+            );
+        }
+        // Non-degenerate: a mutation that hardcoded the loss read to a
+        // fixed constant (in-range, e.g. `0.0`) would still pass every
+        // check above. A real triplet-margin loss over a random-init tiny
+        // model's random synthetic tokens landing at EXACTLY the same
+        // float value on every one of the measured steps is not something
+        // real floating-point computation does (LoRA weights move every
+        // step via AdamW, even against the same fixed batch) — so requiring
+        // at least one value to differ from the first is a cheap, reliable
+        // non-degeneracy check without needing a numeric oracle.
+        assert!(
+            tier.losses.iter().any(|&l| l != tier.losses[0]),
+            "every measured loss is bit-identical ({:?}) — looks like the loss read was \
+             replaced by a fixed constant instead of the real per-step tensor value",
+            tier.losses
+        );
+    }
 }

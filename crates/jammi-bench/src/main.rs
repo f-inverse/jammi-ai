@@ -528,12 +528,19 @@ async fn main() -> std::process::ExitCode {
             cuda_device: cuda,
             seed,
             batched_forward,
+            // `--expect-kernels-disabled` and `JAMMI_KERNELS_DISABLE` are
+            // the SAME grammar (a caller states the same disable list two
+            // ways) — routed through the identical
+            // `jammi_kernels::admission::parse_disable_list` a genuine
+            // `JAMMI_KERNELS_DISABLE` read goes through, rather than a
+            // second, hand-rolled parser that could (and did) diverge on
+            // duplicate entries. Sorted into a `Vec` here (not left as a
+            // `HashSet`) because `disabled_ops_requested()` — what this
+            // gets compared against in `finetune_step::run` — is itself a
+            // sorted, deduplicated `Vec`.
             expect_kernels_disabled: expect_kernels_disabled.map(|s| {
-                let mut v: Vec<String> = s
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|tok| !tok.is_empty())
-                    .map(str::to_string)
+                let mut v: Vec<String> = jammi_kernels::admission::parse_disable_list(Some(&s))
+                    .into_iter()
                     .collect();
                 v.sort();
                 v

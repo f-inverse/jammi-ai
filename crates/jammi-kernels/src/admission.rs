@@ -381,19 +381,36 @@ pub fn warn_fallback_once(op: &'static str, predicate: &'static str) {
     );
 }
 
-/// Parses `JAMMI_KERNELS_DISABLE`'s raw value into the requested op-key
-/// set: comma-separated, each entry trimmed, empty entries dropped (a
-/// trailing comma or stray whitespace must not manufacture a bogus `""`
-/// entry that [`unmatched_disables`] would then report as unmatched
-/// forever). `None` (unset) and `Some("")`/an all-whitespace/all-comma
-/// value collapse to the SAME empty set — [`op_is_disabled`] treats an
-/// empty set as unconditionally inert, so unset and "set but empty" are
-/// byte-identical in their effect on [`admit`].
+/// Parses a `JAMMI_KERNELS_DISABLE`-shaped value into an op-key SET:
+/// comma-separated, each entry trimmed, empty entries dropped (a trailing
+/// comma or stray whitespace must not manufacture a bogus `""` entry that
+/// [`unmatched_disables`] would then report as unmatched forever), and
+/// DUPLICATES COLLAPSED (a `HashSet`, not a `Vec` — the grammar this
+/// parses is a SET of op keys, not an ordered, possibly-repeating list;
+/// `"foo,foo"` and `"foo"` name the same request). `None` (unset) and
+/// `Some("")`/an all-whitespace/all-comma value collapse to the SAME empty
+/// set — `op_is_disabled` treats an empty set as unconditionally inert,
+/// so unset and "set but empty" are byte-identical in their effect on
+/// [`admit`].
 ///
-/// Pure/no I/O — split out from [`disabled_ops`] so the parsing edge
+/// Public and reused verbatim by `jammi-bench`'s `--expect-kernels-disabled`
+/// flag (`crates/jammi-bench/src/main.rs`): that flag's value and
+/// `JAMMI_KERNELS_DISABLE` are the SAME grammar (a caller states the SAME
+/// disable list two ways — one via the env var this process reads, one via
+/// an argv claim about what it expects that env var to carry), so there is
+/// exactly ONE parser for it. A round-3 audit found `--expect-kernels-disabled`
+/// had grown a SECOND, divergent parser that collected into a `Vec` with no
+/// dedup: `JAMMI_KERNELS_DISABLE=op --expect-kernels-disabled op,op` then
+/// compared `disabled_ops_requested()`'s deduplicated `["op"]` against the
+/// duplicate-preserving `["op", "op"]` and hard-failed a VALID leg, blaming
+/// a dropped env var that was never dropped. Both parsers reading through
+/// this one function makes that class of divergence structurally
+/// impossible, not just untested.
+///
+/// Pure/no I/O — split out from `disabled_ops` so the parsing edge
 /// cases are unit-testable with literal inputs, independent of the
 /// process-wide [`OnceLock`] `disabled_ops` memoizes into.
-fn parse_disable_list(raw: Option<&str>) -> HashSet<String> {
+pub fn parse_disable_list(raw: Option<&str>) -> HashSet<String> {
     raw.map(|s| {
         s.split(',')
             .map(str::trim)
@@ -1046,11 +1063,23 @@ mod tests {
             .env("ADMISSION_MODE_CHILD", "1")
             .output()
             .expect("spawn child test binary");
+        let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             output.status.success(),
-            "child process assertion failed: stdout={}\nstderr={}",
-            String::from_utf8_lossy(&output.stdout),
+            "child process assertion failed: stdout={stdout}\nstderr={}",
             String::from_utf8_lossy(&output.stderr)
+        );
+        // Non-vacuity: `cargo test`'s libtest harness exits 0 on a filter
+        // that matches ZERO tests (a typo'd `--exact` path, or a module
+        // rename that silently stops matching, would make this test
+        // "pass" having run NOTHING). Asserting the child actually ran and
+        // passed exactly the one test it was told to run is what makes
+        // `output.status.success()` alone mean what this test claims it
+        // means.
+        assert!(
+            stdout.contains("1 passed"),
+            "the child process must have actually run (and passed) exactly one test — \
+             stdout={stdout}"
         );
     }
 

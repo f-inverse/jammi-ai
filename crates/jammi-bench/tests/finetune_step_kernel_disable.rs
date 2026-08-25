@@ -519,3 +519,58 @@ fn expect_kernels_disabled_matches_a_genuine_correctly_forwarded_run() {
         "tier={tier}"
     );
 }
+
+/// Round-3 audit fix: `--expect-kernels-disabled` used to hand-roll its own
+/// comma-split parser (a `Vec`, no dedup) instead of routing through
+/// `jammi_kernels::admission::parse_disable_list` (a `HashSet`) the way a
+/// genuine `JAMMI_KERNELS_DISABLE` read does — so a VALID leg naming the
+/// same two ops on both sides, with a duplicate entry and a DIFFERENT
+/// comma-order on each side, hard-failed blaming a dropped env var that
+/// was never dropped (`disabled_ops_requested()`'s deduplicated two-entry
+/// list never equalled the duplicate-preserving four-entry list the old
+/// parser produced). Both `JAMMI_KERNELS_DISABLE` (two real ops, WITH a
+/// duplicate, in one order) and `--expect-kernels-disabled` (the SAME two
+/// ops, WITH a duplicate, in the REVERSED order) must now resolve to the
+/// identical two-entry SET regardless: this must succeed, and
+/// `kernels_disabled_requested` must equal `kernels_disabled_fired`
+/// (both ops are real and dispatch on this fixture, so nothing is
+/// unmatched either).
+#[test]
+fn expect_kernels_disabled_tolerates_duplicates_and_reordering_like_the_real_env_var_does() {
+    let dir = model_dir();
+    let output = base_command(&dir)
+        .args([
+            "--expect-kernels-disabled",
+            "attention_block_fused,layer_norm_fused,attention_block_fused",
+        ])
+        .env(
+            "JAMMI_KERNELS_DISABLE",
+            "layer_norm_fused,attention_block_fused,layer_norm_fused",
+        )
+        .output()
+        .expect("spawn jammi-bench finetune-step");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "a duplicate entry and reversed comma-order on either side must not change what SET \
+         of ops was requested — stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("invalid JSON report: {e}\n{stdout}"));
+    let tier = &report["tiers"]["finetune_step"];
+    let expected = serde_json::json!(["attention_block_fused", "layer_norm_fused"]);
+    assert_eq!(tier["kernels_disabled_requested"], expected, "tier={tier}");
+    assert_eq!(
+        tier["kernels_disabled_requested"], tier["kernels_disabled_fired"],
+        "both named ops are real and dispatch on this fixture — nothing should be unmatched; \
+         tier={tier}"
+    );
+    assert_eq!(tier["ln_fused_dispatches"].as_u64(), Some(0), "tier={tier}");
+    assert_eq!(
+        tier["attention_block_fused_dispatches"].as_u64(),
+        Some(0),
+        "tier={tier}"
+    );
+}

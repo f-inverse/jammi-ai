@@ -189,11 +189,46 @@ fn synthetic_ids(batch: usize, seq: usize, vocab: usize, seed: u64, device: &Dev
 /// before this function returns, and
 /// `jammi_kernels::admission::unmatched_disables`'s doc): that is a typo
 /// in the disable list, not evidence the forced-eager arm ran, and must
-/// never be reported as a datum (contract K-aux). Also returns `Err` when
+/// never be reported as a datum (contract K-aux). Also returns `Err`,
+/// FIRST — before any device, checkpoint, or tensor work — when
 /// `params.expect_kernels_disabled` is `Some` and does not match what this
 /// process's `JAMMI_KERNELS_DISABLE` actually resolved to — see
 /// `FinetuneStepParams::expect_kernels_disabled`'s doc.
 pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std::error::Error>> {
+    // `--expect-kernels-disabled` (contract K-aux, round 2 advisory): the
+    // binary controls its own argv, so a caller that names its intended
+    // `JAMMI_KERNELS_DISABLE` set on the SAME command line gets a hard
+    // error instead of having to notice, after the fact, that the
+    // process-observed `kernels_disabled_requested` in the emitted JSON
+    // report came back empty (or different) — machine-enforced rather than
+    // eyeballed. Compared as SORTED sets: `disabled_ops_requested()` is
+    // already sorted, and the expectation is sorted here so the caller's
+    // ordering on the command line is not load-bearing.
+    //
+    // Checked HERE, at the very top, before the checkpoint is even loaded
+    // or a single tensor is built — unlike `unmatched_kernel_disables`
+    // below (which genuinely cannot be checked before every dispatch site
+    // has had its chance to fire this run), `disabled_ops_requested()` is
+    // a pure function of the real `JAMMI_KERNELS_DISABLE` env var, resolved
+    // once at first read and never dependent on anything this function
+    // does afterward — so a mismatch here can fail fast, before paying for
+    // a build + warmup + measured steps that were never going to produce a
+    // valid report.
+    if let Some(expected) = &params.expect_kernels_disabled {
+        let mut expected_sorted = expected.clone();
+        expected_sorted.sort();
+        let kernels_disabled_requested = jammi_kernels::admission::disabled_ops_requested();
+        if kernels_disabled_requested != expected_sorted {
+            return Err(format!(
+                "--expect-kernels-disabled named {expected_sorted:?} but this process's real \
+                 JAMMI_KERNELS_DISABLE resolved to {kernels_disabled_requested:?} — the env var \
+                 was dropped, mistyped, or not forwarded to this process (INVALID run, not a \
+                 datum)"
+            )
+            .into());
+        }
+    }
+
     let device = match params.cuda_device {
         Some(ordinal) => Device::new_cuda(ordinal)?,
         None => Device::Cpu,
@@ -363,29 +398,6 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     // compare against.
     let kernels_disabled_requested = jammi_kernels::admission::disabled_ops_requested();
     let kernels_disabled_fired = jammi_kernels::admission::disabled_ops_fired();
-
-    // `--expect-kernels-disabled` (contract K-aux, round 2 advisory): the
-    // binary controls its own argv, so a caller that names its intended
-    // `JAMMI_KERNELS_DISABLE` set on the SAME command line gets a hard
-    // error instead of having to notice, after the fact, that the
-    // process-observed `kernels_disabled_requested` in the emitted JSON
-    // report came back empty (or different) — machine-enforced rather than
-    // eyeballed. Compared as SORTED sets: `kernels_disabled_requested` is
-    // already sorted, and the expectation is sorted here so the caller's
-    // ordering on the command line is not load-bearing.
-    if let Some(expected) = &params.expect_kernels_disabled {
-        let mut expected_sorted = expected.clone();
-        expected_sorted.sort();
-        if kernels_disabled_requested != expected_sorted {
-            return Err(format!(
-                "--expect-kernels-disabled named {expected_sorted:?} but this process's real \
-                 JAMMI_KERNELS_DISABLE resolved to {kernels_disabled_requested:?} — the env var \
-                 was dropped, mistyped, or not forwarded to this process (INVALID run, not a \
-                 datum)"
-            )
-            .into());
-        }
-    }
 
     times.sort_by(f64::total_cmp);
     let p50 = times[times.len() / 2];

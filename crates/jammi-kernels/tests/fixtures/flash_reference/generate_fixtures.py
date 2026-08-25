@@ -75,34 +75,38 @@ def flash_attention_leg(name, lengths, window, dev, dtype):
     )
     scale = 1.0 / (D ** 0.5)
 
-    def make_qkv():
-        q = torch.randn(total_q, H, D, device=dev, dtype=dtype, requires_grad=True)
-        k = torch.randn(total_q, H, D, device=dev, dtype=dtype, requires_grad=True)
-        v = torch.randn(total_q, H, D, device=dev, dtype=dtype, requires_grad=True)
-        return q, k, v
-
     window_left = -1 if window is None else window
     window_right = -1 if window is None else window
 
-    def run_once():
-        q, k, v = make_qkv()
+    # Fixed inputs, generated ONCE: `q`/`k`/`v`/`g` must be the SAME tensors
+    # across both runs below, or a diff between the two runs measures input
+    # variation (a fresh `torch.randn` draw), not the kernel's own
+    # run-to-run behaviour — exactly the bug this comment replaces (the
+    # first version of this script called `torch.randn` again inside each
+    # `run_once`, so "self noise" was actually measuring two independent
+    # random problems and came out comparable to the signal itself).
+    q = torch.randn(total_q, H, D, device=dev, dtype=dtype, requires_grad=True)
+    k = torch.randn(total_q, H, D, device=dev, dtype=dtype, requires_grad=True)
+    v = torch.randn(total_q, H, D, device=dev, dtype=dtype, requires_grad=True)
+
+    def run_once(g_in=None):
         out, lse, rng_state, unused, _dbg = torch.ops.aten._flash_attention_forward(
             q, k, v, cu, cu, max_seqlen, max_seqlen,
             0.0, False, False,
             scale=scale, window_size_left=window_left, window_size_right=window_right,
         )
-        g = torch.randn_like(out)
+        g = g_in if g_in is not None else torch.randn_like(out)
         dq, dk, dv = torch.ops.aten._flash_attention_backward(
             g, q, k, v, out, lse, cu, cu, max_seqlen, max_seqlen,
             0.0, False, rng_state, unused,
             scale=scale, window_size_left=window_left, window_size_right=window_right,
         )
-        return q, k, v, out, lse, g, dq, dk, dv
+        return out, lse, g, dq, dk, dv
 
-    q1, k1, v1, o1, lse1, g1, dq1, dk1, dv1 = run_once()
-    # second run: SAME seed (so q/k/v/g are bit-identical inputs) — isolates
-    # the *kernel's own* run-to-run variation, not input variation.
-    q2, k2, v2, o2, lse2, g2, dq2, dk2, dv2 = run_once()
+    o1, lse1, g1, dq1, dk1, dv1 = run_once()
+    # second run: SAME q/k/v/g (fixed above) — isolates the *kernel's own*
+    # run-to-run variation, not input variation.
+    o2, lse2, g2, dq2, dk2, dv2 = run_once(g_in=g1)
 
     def npf32(t):
         return t.detach().to(torch.float32).cpu().numpy()
@@ -118,9 +122,9 @@ def flash_attention_leg(name, lengths, window, dev, dtype):
         "dv": maxabsdiff(dv1, dv2),
     }
 
-    np.save(HERE / f"{name}_q.npy", npf32(q1))
-    np.save(HERE / f"{name}_k.npy", npf32(k1))
-    np.save(HERE / f"{name}_v.npy", npf32(v1))
+    np.save(HERE / f"{name}_q.npy", npf32(q))
+    np.save(HERE / f"{name}_k.npy", npf32(k))
+    np.save(HERE / f"{name}_v.npy", npf32(v))
     np.save(HERE / f"{name}_grad_out.npy", npf32(g1))
     np.save(HERE / f"{name}_o.npy", npf32(o1))
     np.save(HERE / f"{name}_lse.npy", npf32(lse1))

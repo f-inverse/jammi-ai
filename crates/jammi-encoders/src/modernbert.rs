@@ -309,6 +309,11 @@ struct RotaryEmbedding {
     cos: Tensor,
     sin: Tensor,
     cast_cache: Mutex<Option<CastCache>>,
+    /// [`Self::cached_rope_pack`]'s memo, keyed by dtype exactly like
+    /// `cast_cache` (single-entry: one backbone dtype per model
+    /// lifetime). Separate from `cast_cache` so eval — which calls
+    /// [`Self::cached_tables`] but never the pack — never pays the stack.
+    rope_pack_cache: Mutex<Option<(DType, Tensor)>>,
 }
 
 impl RotaryEmbedding {
@@ -339,6 +344,7 @@ impl RotaryEmbedding {
             cos,
             sin,
             cast_cache: Mutex::new(None),
+            rope_pack_cache: Mutex::new(None),
         })
     }
 
@@ -407,15 +413,51 @@ impl RotaryEmbedding {
     /// `rope_pack` argument" section for why: `CustomOp3`'s 3-tensor arity
     /// has no room for `cos`/`sin` as separate arguments alongside `qkv`
     /// and `mask`). A pure memory copy of the SAME cached bytes
-    /// `Self::cached_tables` already produces — no new rounding. Built
-    /// fresh on every call (not memoised alongside `cast_cache`): a real,
-    /// disclosed small cost (one `[2,1,1,max_seq_len,head_dim]` stack per
-    /// training-arm forward per layer), not hidden here; a Tier 1/2 pass
-    /// could fold this into `cast_cache` the same way the tables
-    /// themselves already are.
+    /// `Self::cached_tables` already produces — no new rounding.
+    ///
+    /// MEMOISED per dtype (`rope_pack_cache`), built on the first call.
+    /// An earlier revision stacked it fresh on every call: one
+    /// `[2, 1, 1, max_seq_len, head_dim]` device copy per training-arm
+    /// forward per layer, AND — because each layer's `AttentionBlockFused`
+    /// node clones its `rope_pack` argument into its own `Op` until the
+    /// backward pass releases it — one such tensor RETAINED per layer for
+    /// the whole step: at `max_position_embeddings = 8192`, `head_dim =
+    /// 64`, `BF16`, `2 * 8192 * 64 * 2 = 2_097_152` bytes (2 MB) per
+    /// layer, `28 * 2 MB = 56 MB` retained per step plus 28 device-to-
+    /// device copies on a 28-layer model. Now: the SAME storage (one
+    /// `Arc`) is handed to every layer, so per forward per layer the pack
+    /// costs 0 bytes and 0 copies; what is retained is one pack per
+    /// `RotaryEmbedding` per dtype for the model's lifetime — 2 MB per
+    /// table at the shape above, 4 MB for the global+local pair.
+    ///
+    /// Not NARROWED to `seq`: a `narrow` along the pack's position axis
+    /// is non-contiguous (the cos block and the sin block sit
+    /// `max_seq_len * head_dim` elements apart), the op refuses a
+    /// non-contiguous `rope_pack` (its `check_rope_pack` +
+    /// `contiguous_offsets`), and a contiguous narrow would be a fresh
+    /// per-call copy — exactly the cost this memo removes. The op reads
+    /// rows `[0, seq)` of each block and nothing else, so the full table
+    /// costs no extra reads.
     fn cached_rope_pack(&self, dtype: DType) -> Result<Tensor, EncoderError> {
+        {
+            let cache = self
+                .rope_pack_cache
+                .lock()
+                .map_err(|_| EncoderError::Config("RoPE pack cache poisoned".into()))?;
+            if let Some((cached_dtype, pack)) = cache.as_ref() {
+                if *cached_dtype == dtype {
+                    return Ok(pack.clone());
+                }
+            }
+        }
         let (cos, sin) = self.cached_tables(dtype)?;
-        Ok(Tensor::stack(&[&cos, &sin], 0)?)
+        let pack = Tensor::stack(&[&cos, &sin], 0)?;
+        let mut cache = self
+            .rope_pack_cache
+            .lock()
+            .map_err(|_| EncoderError::Config("RoPE pack cache poisoned".into()))?;
+        *cache = Some((dtype, pack.clone()));
+        Ok(pack)
     }
 
     /// The training-mode arm: dispatches to
@@ -2790,6 +2832,51 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────
     // Fused whole-attention-block (P3, Tier 0)
     // ─────────────────────────────────────────────────────────────────
+
+    /// `cached_rope_pack` hands every caller the SAME tensor (same
+    /// `TensorId`, therefore the same storage `Arc`) for a given dtype —
+    /// the "0 bytes, 0 copies per layer" claim in its doc — and that
+    /// tensor is byte-identical to a fresh `Tensor::stack` of the cached
+    /// tables. A different dtype recomputes (new id, right dtype), and
+    /// switching back recomputes again (single-entry memo, like
+    /// `cast_cache`). Mutation this reddens under (verified, reverted):
+    /// stacking fresh on every call (`TensorId`s differ).
+    #[test]
+    fn cached_rope_pack_is_memoised_per_dtype_and_bit_identical_to_a_fresh_stack() {
+        let device = Device::Cpu;
+        let (d, max_seq) = (ATTENTION_BLOCK_HEAD_DIM, 16usize);
+        let rope = rope(d, max_seq, 10_000.0, &device);
+        let first = rope.cached_rope_pack(DType::F32).unwrap();
+        let second = rope.cached_rope_pack(DType::F32).unwrap();
+        assert_eq!(
+            first.id(),
+            second.id(),
+            "same dtype must return the memoised tensor"
+        );
+        assert_eq!(first.dims(), &[2, 1, 1, max_seq, d]);
+        let (cos, sin) = rope.cached_tables(DType::F32).unwrap();
+        let fresh = Tensor::stack(&[&cos, &sin], 0).unwrap();
+        let bytes = |t: &Tensor| -> Vec<f32> {
+            t.to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap()
+        };
+        assert_eq!(bytes(&first), bytes(&fresh));
+        let bf16 = rope.cached_rope_pack(DType::BF16).unwrap();
+        assert_ne!(bf16.id(), first.id());
+        assert_eq!(bf16.dtype(), DType::BF16);
+        assert_eq!(bf16.id(), rope.cached_rope_pack(DType::BF16).unwrap().id());
+        let back = rope.cached_rope_pack(DType::F32).unwrap();
+        assert_ne!(
+            back.id(),
+            first.id(),
+            "single-entry memo recomputes after a dtype switch"
+        );
+        assert_eq!(bytes(&back), bytes(&fresh));
+    }
 
     /// A minimal `ModernBertAttention` at `head_dim ==
     /// ATTENTION_BLOCK_HEAD_DIM`, for exercising

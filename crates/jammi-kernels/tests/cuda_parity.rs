@@ -3913,16 +3913,44 @@ fn cast_ops_nonzero_start_offset_and_noncontiguous_view_refused_on_cuda() {
 }
 
 /// Block 2 — the launch-config boundary sweep both ops need alongside the
-/// bulk oracles above: `n=0` is the illegal `(0,1,1)` grid special case,
-/// `n=1024` exercises an EXACT multiple of the elementwise launch's
-/// block size, and `n=1023`/`1025`/`4097`/`65537` exercise a PARTIAL last
-/// block on either side of that boundary.
+/// bulk oracles above: `n=1024` exercises an EXACT multiple of the
+/// elementwise launch's block size, and `n=1023`/`1025`/`4097`/`65537`
+/// exercise a PARTIAL last block on either side of that boundary. `n=0`
+/// (the illegal `(0,1,1)` grid special case both ops' own CUDA glue
+/// avoids via `super::alloc_empty`) is asserted SEPARATELY below, against
+/// `elem_count() == 0` rather than candle's own eager `to_dtype`/`affine`/
+/// `Tensor::add` chain: candle's OWN CUDA cast kernel has no such guard
+/// and itself panics with `DriverError(CUDA_ERROR_INVALID_VALUE, "invalid
+/// argument")` on a 0-element input (confirmed live on device — a candle
+/// limitation on the REFERENCE side, not a defect in either op here), so
+/// it cannot serve as this sweep's eager comparator at `n=0`.
 #[test]
 fn cast_ops_n_sweep_partial_block_and_empty_on_cuda() {
     let Some(cuda) = cuda_device() else {
         return;
     };
-    for &n in &[0usize, 1, 2, 1023, 1024, 1025, 4097, 65_537] {
+
+    // n=0: candle's own eager `to_dtype`/`Tensor::add` cannot run on an
+    // empty CUDA tensor (see this test's own doc), so this asserts only
+    // that BOTH fused ops accept it and return a genuinely empty output —
+    // the illegal `(0, 1, 1)` launch grid this crate's own CUDA glue
+    // special-cases via `super::alloc_empty`.
+    let empty_bf16 = Tensor::from_slice(&[] as &[bf16], (0,), &cuda).unwrap();
+    let empty_f32 = Tensor::from_slice(&[] as &[f32], (0,), &cuda).unwrap();
+    let o1 = apply1(&empty_bf16, CastScaleBf16F32::new(2.0)).unwrap();
+    assert_eq!(
+        o1.elem_count(),
+        0,
+        "cast_scale_bf16_f32 n=0 must be a no-op, not an error"
+    );
+    let o2 = apply2(&empty_bf16, &empty_f32, CastAddBf16::new()).unwrap();
+    assert_eq!(
+        o2.elem_count(),
+        0,
+        "cast_add_bf16 n=0 must be a no-op, not an error"
+    );
+
+    for &n in &[1usize, 2, 1023, 1024, 1025, 4097, 65_537] {
         let xv: Vec<bf16> = (0..n)
             .map(|i| bf16::from_f32(((i as f32) * 0.37).sin() * 6700.0))
             .collect();

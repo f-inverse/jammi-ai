@@ -10,11 +10,27 @@
 //! `crate::ops::flash_attention`) runs ONLY through [`apply_stateful1`]/
 //! [`apply_stateful3`], which require [`StatefulKernelOp`] instead — a
 //! SEPARATE sealed trait with no `Copy`/`Clone` bound (see its own doc).
-//! The two families are mutually exclusive by construction: `KernelOp`
-//! requires `Copy`, `StatefulKernelOp`'s whole point is that a type holding
-//! interior-mutable state (`Saved<T>`) CANNOT be `Copy`, so no type
-//! satisfies both, and there is exactly one `applyN`/`apply_statefulN`
-//! entry point per arity a real op ever needs.
+//!
+//! **This is NOT mutual exclusion, and the two entry-point families are
+//! NOT type-checked apart** — a correction of an earlier draft of this doc,
+//! caught by `10b1f3b`'s audit (BLOCKING finding 4). `StatefulKernelOp`'s
+//! blanket impl (below) requires only `Send + Sync + 'static + Sealed` —
+//! it drops the `Copy` requirement entirely, it does not additionally
+//! FORBID `Copy`. So every existing `KernelOp` op (e.g. [`Axpy`], which is
+//! `Copy`) ALSO satisfies `StatefulKernelOp`'s bound; the set of types
+//! implementing `StatefulKernelOp` is a SUPERSET of those implementing
+//! `KernelOp`, not a disjoint set. What genuinely IS one-directional and
+//! load-bearing: a type holding an OWNED [`Saved`] field can never be
+//! `Copy` (`Saved<T>` wraps `Arc<Mutex<Option<T>>>`, and `Arc` is not
+//! `Copy`), so a real stateful op is structurally FORCED away from
+//! [`apply1`]/[`apply2`]/[`apply3`] (which require `Copy`) — it has no
+//! choice but [`apply_stateful1`]/[`apply_stateful3`]. The reverse
+//! direction — nothing stops a `Copy` op from being ROUTED through
+//! `apply_stateful1`/`apply_stateful3` instead of `apply1`/`apply2`/
+//! `apply3` — is a convention this crate follows (every stateless op here
+//! goes through the `Copy`-bounded family) enforced by review and
+//! `tests/stateful_op_discipline.rs`'s regression scan, not by the trait
+//! bounds themselves.
 //!
 //! ## Every STATELESS op in this module implements `KernelOp`
 //!
@@ -187,16 +203,23 @@ pub fn apply3<T: KernelOp + CustomOp3>(
     x.apply_op3(y, z, op)
 }
 
-/// A SECOND, DISJOINT op family from [`KernelOp`]: ops that legitimately
-/// carry per-instance interior-mutable state (a [`Saved`] field) between
-/// their own `fwd` and their own `bwd`. `KernelOp`'s `Copy` bound exists
-/// PRECISELY to forbid that shape (see this module's top doc, "What
-/// `Copy` … proves, and what it does not") — so a stateful op cannot and
-/// must not implement `KernelOp`; it implements this trait instead.
+/// A distinct op family from [`KernelOp`]: ops that legitimately carry
+/// per-instance interior-mutable state (a [`Saved`] field) between their own
+/// `fwd` and their own `bwd`. `KernelOp`'s `Copy` bound exists PRECISELY to
+/// forbid that shape (see this module's top doc, "What `Copy` … proves, and
+/// what it does not") — so a stateful op cannot and must not implement
+/// `KernelOp`; it implements this trait instead. (This direction is real
+/// and type-checked. The REVERSE direction is not — see [`KernelOp`]'s own
+/// doc, "This is NOT mutual exclusion".)
 ///
 /// Bound: `Send + Sync + 'static + Sealed`, deliberately WITHOUT `Copy`
-/// **or `Clone`**. This is not merely "we don't need Clone" — Clone is
-/// actively refused:
+/// **or `Clone`** — for every op that ACTUALLY EXISTS in this crate today
+/// (`crate::ops::flash_attention::FlashVarlenAttention` and its bwd
+/// helper, the crate's only two `StatefulKernelOp`s — a plain code span,
+/// not a doc link: that module is feature-gated behind `flash-attn` and is
+/// absent from a default-feature `cargo doc` build). This is not merely
+/// "we don't need Clone" for those two types — Clone is actively refused
+/// AT THEIR DEFINITION SITE (neither derives it):
 ///
 /// - Every call site in this crate constructs a fresh instance and passes
 ///   it BY VALUE into [`apply_stateful1`] (mirroring [`apply1`]/[`apply2`]/
@@ -213,15 +236,30 @@ pub fn apply3<T: KernelOp + CustomOp3>(
 ///   original, so `set()` on a REUSED clone would fail with
 ///   `SavedError::AlreadySet` (harmless — a typed error, not silent
 ///   corruption) but only because `Saved` itself refuses to be `Clone`
-///   either; the real defence is one level up, at THIS bound, making the
-///   reuse impossible to WRITE in the first place: without `Copy` or
-///   `Clone`, `op: FlashVarlenAttention` cannot be moved out of `&self` in
-///   a method (`cannot move out of `self.op` which is behind a shared
-///   reference` — a compile error, not a runtime one), so a struct field
-///   holding one can never be handed to [`apply_stateful1`] (which takes
-///   the op BY VALUE) more than once. Hoisting a stateful op into a
-///   long-lived field is therefore unrepresentable at compile time, not
-///   merely discouraged by convention.
+///   either; the real defence is one level up, at THIS bound making the
+///   reuse impossible to WRITE — **conditionally**: without `Copy` or
+///   `Clone` on the op struct ITSELF, `op: FlashVarlenAttention` cannot be
+///   moved out of `&self` in a method (`cannot move out of `self.op` which
+///   is behind a shared reference` — a compile error, not a runtime one),
+///   so a struct field holding one can never be handed to
+///   [`apply_stateful1`] (which takes the op BY VALUE) more than once.
+///
+///   **This is a discipline this crate follows, not a guarantee
+///   `StatefulKernelOp`'s bound enforces** — a correction of an earlier
+///   draft of this doc, caught by `10b1f3b`'s audit (BLOCKING finding 4).
+///   Nothing in `Send + Sync + 'static + Sealed` forbids `#[derive(Clone)]`
+///   on the op struct, and nothing forbids a field of type
+///   `Arc<Saved<T>>` in place of an owned `Saved<T>` (`Arc<X>` is `Clone`
+///   regardless of whether `X` itself is `Clone` — `Saved<T>`'s own refusal
+///   to derive `Clone`, above, does not propagate through an `Arc`
+///   wrapper). Either change makes the OUTER op struct `Clone`, and
+///   `.clone()` — unlike a move — can be called through `&self` any number
+///   of times, reopening the exact aliasing hazard this section otherwise
+///   closes: a compile-time PROOF for the two ops that exist today, and a
+///   REVIEW + regression-test discipline (`tests/stateful_op_discipline.rs`,
+///   which asserts no `Saved`-bearing op struct derives `Clone`/`Copy` or
+///   wraps its `Saved` field in an `Arc`) for whatever the next one looks
+///   like.
 ///
 /// `candle_core::Tensor::apply_op1_arc`/`apply_op3_arc` (`custom_op.rs:
 /// 216-234,236-243`) are PUBLIC candle APIs that take an already-
@@ -249,7 +287,19 @@ pub fn apply3<T: KernelOp + CustomOp3>(
 /// `FlashVarlenAttention` cannot be hoisted is exactly the shape below —
 /// it holds a `Saved<T>` field and derives neither `Copy` nor `Clone` —
 /// so this generic minimal reproduction is a faithful proof of the
-/// mechanism, not a proof about `FlashVarlenAttention` by name specifically:
+/// mechanism, not a proof about `FlashVarlenAttention` by name specifically.
+///
+/// **What this doctest proves, precisely:** `HoldsSaved` below derives
+/// neither `Copy` nor `Clone`, so moving `self.op` out of `&self` is a
+/// compile error — the exact shape `FlashVarlenAttention`/
+/// `FlashVarlenBwdHelper` are in today. **What it does NOT prove:** that no
+/// `StatefulKernelOp`-implementing type could ever be hoisted — a type
+/// deriving `Clone` (directly, or by wrapping its `Saved` field in an
+/// extra `Arc`, see this trait's own doc above) would sidestep this
+/// exact failure via `.clone()` instead of a move, and neither `Send +
+/// Sync + 'static + Sealed` nor this doctest catches that shape; the
+/// property-based regression scan in `tests/stateful_op_discipline.rs`
+/// does.
 ///
 /// ```compile_fail,E0507
 /// use jammi_kernels::ops::Saved;

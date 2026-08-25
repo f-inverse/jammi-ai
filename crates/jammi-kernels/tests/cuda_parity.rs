@@ -5474,6 +5474,32 @@ fn assert_rope_positions_bit_identical_to_rope_fused_bf16(
         "RED control: sign-flipped rope_positions_fused (CUDA) must NOT match the reference: \
          b={b} h={h} s={s} d={d}"
     );
+
+    // Slot 1 (K) must ALSO be bit-identical to `RopeFused` on the SAME
+    // data -- mirrors `ops::rope_positions`'s own CPU oracle's slot-1
+    // addition: the slot-0 (Q) check above says nothing about K, and a
+    // defect that rotates only slot 0 (e.g. `slot == 2` mutated to
+    // `slot >= 1` in `cuda/rope_positions.cu`, leaving K a silent
+    // pass-through) would sail through every assertion above. Packed
+    // independently (`x_bhsd` now at slot 1, `filler_bhsd` at slots 0 and
+    // 2) so this cannot hide behind slot 0's already-rotated data.
+    let qkv_k = pack_bhsd_into_qkv_dev(&x_bhsd, &filler_bhsd, 1);
+    let out_k = rope_positions(s, false, &qkv_k, &cos, &sin).unwrap();
+    let got_k = unpack_qkv_slot_dev(&out_k, 1, b, s);
+    assert_eq!(
+        to_bits_f32(&got_k),
+        to_bits_f32(&reference),
+        "rope_positions_fused (CUDA, bf16) on slot 1 (k) must be bit-identical to RopeFused on \
+         [b,h,s,d]: b={b} h={h} s={s} d={d} theta={theta_base}"
+    );
+    let out_k_negated = rope_positions(s, true, &qkv_k, &cos, &sin).unwrap();
+    let got_k_negated = unpack_qkv_slot_dev(&out_k_negated, 1, b, s);
+    assert_ne!(
+        to_bits_f32(&got_k_negated),
+        to_bits_f32(&reference),
+        "RED control: sign-flipped rope_positions_fused (CUDA) on slot 1 (k) must NOT match \
+         the reference: b={b} h={h} s={s} d={d}"
+    );
 }
 
 #[test]
@@ -5607,4 +5633,50 @@ fn rope_positions_bwd_reaches_qkv_gradient_cuda() {
         dqkv_v_slot_vals.iter().all(|&v| (v - 1.0).abs() < 1e-5),
         "rope_positions must pass V's gradient through as the identity (sum_all's ones-seed)"
     );
+
+    // Slot 1 (K) must be rotated in `bwd` too, not just fwd -- an
+    // independently hand-derived closed form, NOT a second call into the
+    // op. `bwd` reuses this op's own forward kernel with `negate_sin`
+    // flipped, applied to `grad_res`; since `loss = out.sum_all()` makes
+    // `grad_res` the all-ones seed (same premise the V-slot check above
+    // already relies on), the forward formula `out[c] = x[c]*cos[c] +
+    // rotate_half(x)[c]*sin[c]*sign` reduces, for `x = ones` and
+    // `sign = -1` (bwd's flipped sign), to a closed form with no
+    // dependency on the kernel under test:
+    //   c <  half: rotate_half(ones)[c] = -1  =>  dK[c] = cos[c] + sin[c]
+    //   c >= half: rotate_half(ones)[c] = +1  =>  dK[c] = cos[c] - sin[c]
+    // A `slot == 2` -> `slot >= 1` mutant (K left as an unrotated
+    // pass-through) would instead leave dK == 1.0 everywhere, identical to
+    // V's gradient above, and diverge from this closed form for any
+    // non-trivial theta/position where sin != 0.
+    let dqkv_k_slot = unpack_qkv_slot_dev(dqkv, 1, b, s);
+    let dqkv_k_slot_vals: Vec<f32> = dqkv_k_slot
+        .to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let half = d / 2;
+    let mut expected_k = vec![0f32; b * h * s * d];
+    for b_idx in 0..b {
+        for h_idx in 0..h {
+            for s_idx in 0..s {
+                let seq_idx = s_idx; // token = b_idx*s + s_idx; token % s == s_idx.
+                let base = ((b_idx * h + h_idx) * s + s_idx) * d;
+                for c in 0..d {
+                    let cc = cos_v[seq_idx * d + c];
+                    let ss = sin_v[seq_idx * d + c];
+                    expected_k[base + c] = if c < half { cc + ss } else { cc - ss };
+                }
+            }
+        }
+    }
+    assert_eq!(dqkv_k_slot_vals.len(), expected_k.len());
+    for (i, (got, want)) in dqkv_k_slot_vals.iter().zip(expected_k.iter()).enumerate() {
+        assert!(
+            got.is_finite() && (*got - *want).abs() as f64 <= F32_TOL,
+            "rope_positions dqkv K slot[{i}]: cuda {got} vs closed-form {want}"
+        );
+    }
 }

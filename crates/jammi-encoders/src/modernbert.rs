@@ -3200,6 +3200,652 @@ mod tests {
         }
     }
 
+    // =====================================================================
+    // BLOCK 1 (adversarial audit, `perf/p6-fa2-dense`): the flash arm had
+    // NO encoder-level numeric oracle -- the sibling test above only
+    // asserts `is_finite` + dispatch counters, which two auditor-built
+    // mutants (K-slot never rotated; a local layer's sliding window
+    // dropped) survive completely. This ships the cuda-kernel-guide's
+    // §3.3 three-way oracle (flash-bf16 vs block-bf16 vs an f32
+    // reference) on the REAL ModernBERT-large checkpoint, at production
+    // shape, on BOTH the pooled embedding and a step-0 LoRA gradient.
+    //
+    // ## Bound derivation (no absolute floor -- guide §3.8)
+    //
+    // The auditor's hand-run three-way oracle on this exact checkpoint
+    // measured `err(flash, f32) = 5.71e-2` and `err(block, f32) =
+    // 9.11e-2` (both against the SAME f32 reference, same seed/data) --
+    // flash is ALREADY closer to truth than the block arm on this
+    // checkpoint. `FLASH_ORACLE_K = 1.5` keeps `1.5 * err(block)` well
+    // above flash's OWN measured distance (`1.5 * 9.11e-2 = 1.37e-1 >>
+    // 5.71e-2`, a healthy margin for run-to-run bf16 noise) while still
+    // reddening the K-unrotated mutant comfortably over (that mutant
+    // measured `6.42e-1` against the SAME f32 reference --
+    // `6.42e-1 / 1.37e-1 ≈ 4.7x` over the realized bound) and the
+    // window-dropped mutant similarly (`4.73e-1 / 1.37e-1 ≈ 3.5x`).
+    //
+    // ## RED controls: fault injections, not source mutations
+    //
+    // Neither control edits `cuda/rope_positions.cu`, `ops/rope_positions.rs`,
+    // or this file's own committed dispatch logic:
+    //   - K-unrotated (`FlashFault::KUnrotated`): runs the REAL
+    //     `RopePositionsFused` (already proven correct by BLOCK 2's own
+    //     slot-1 oracle above) and then SPLICES the pre-rotation K slot
+    //     back in, observably reproducing exactly what a `slot == 2` ->
+    //     `slot >= 1` kernel mutant would produce, without touching the
+    //     kernel.
+    //   - Window dropped: mutates the ALREADY-BUILT model's own
+    //     `ModernBertAttention::half_window` field to `None` on every
+    //     layer (a private, same-module field -- not a source edit)
+    //     before running the SAME production `forward_flash_dense_attention`.
+    //
+    // ## Class sweep (other flash wiring quantities)
+    //
+    // `softmax_scale` gets its own cheap fault (`FlashFault::BadSoftmaxScale`)
+    // below, reusing the K-unrotated harness -- three injections total. The
+    // `[b,s,3hd]->[b*s,3,h,d]` reshape and the output unpack
+    // (`o.reshape((batch, seq, h*d))`) are NOT separately injected: either
+    // one scrambles EVERY element of EVERY token (not a narrow-band or
+    // single-slot defect), an unmissably larger distortion than the
+    // committed controls that would fail this same oracle by a much wider
+    // margin -- the K-unrotated and window-dropped controls are the
+    // NARROW, hard-to-catch defects this oracle exists to prove it catches;
+    // a reshape defect is not in that class.
+    // =====================================================================
+
+    /// See the block comment above for the derivation.
+    #[cfg(feature = "cuda")]
+    const FLASH_ORACLE_K: f64 = 1.5;
+
+    /// A deterministic (SplitMix64-derived) token-id batch, `vocab`-bounded
+    /// and `seed`-keyed -- every arm below is driven by the exact SAME
+    /// `input_ids` for a given `(batch, seq, seed)`.
+    #[cfg(feature = "cuda")]
+    fn flash_oracle_synthetic_ids(
+        batch: usize,
+        seq: usize,
+        vocab: usize,
+        seed: u64,
+        device: &Device,
+    ) -> Tensor {
+        let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
+        let mut ids = Vec::with_capacity(batch * seq);
+        for _ in 0..batch * seq {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            ids.push((z % vocab as u64) as u32);
+        }
+        Tensor::from_vec(ids, (batch, seq), device).expect("build synthetic token-id batch")
+    }
+
+    /// Builds a real ModernBERT-large checkpoint with a Gaussian-initialised
+    /// (non-identity from step 0 -- unlike the default `ZerosB`, whose `dA`
+    /// is trivially zero regardless of any arm's numerics) LoRA adapter on
+    /// `Wqkv` only, at the given backbone `dtype`. `training` selects
+    /// whether `forward_hidden` reaches the admission cascade at all
+    /// (`true`) or takes the always-eager eval composition (`false` -- the
+    /// F32 reference's own arm).
+    #[cfg(feature = "cuda")]
+    fn flash_oracle_build_model(
+        config: &ModernBertConfig,
+        weights: &std::path::Path,
+        dtype: DType,
+        seed: u64,
+        device: &Device,
+        training: bool,
+    ) -> ModernBert {
+        let varmap = VarMap::new();
+        let target_modules = ["Wqkv".to_string()];
+        let rank_pattern: HashMap<String, usize> = HashMap::new();
+        let lora = LoraBuildConfig {
+            target_modules: &target_modules,
+            layers_to_transform: &None,
+            lora_rank: 16,
+            lora_alpha: 32.0,
+            use_rslora: false,
+            lora_dropout: None,
+            rank_pattern: &rank_pattern,
+            init_mode: jammi_lora::LoraInitMode::Gaussian,
+            seed,
+        };
+        let mut model = ModernBert::builder()
+            .pooling(Pooling::Mean)
+            .backbone_dtype(dtype)
+            .lora(lora)
+            .build(&[weights], config, device, &varmap)
+            .unwrap_or_else(|e| panic!("flash oracle: build ModernBert ({dtype:?}) failed: {e}"));
+        model.set_training(training);
+        model
+    }
+
+    /// Test-only mirror of [`ModernBert::forward_hidden_with_lengths`]'s
+    /// body, with the flash-cascade decision **forced** rather than derived
+    /// fresh per layer from `decide_flash_admission` -- lets ONE process
+    /// compute the flash arm AND the block arm from the SAME loaded
+    /// weights, without touching `JAMMI_KERNELS_DISABLE` (a process-wide
+    /// `OnceLock` -- see `jammi_kernels::admission`'s module doc; setting
+    /// it mid-test would not un-set for a later call in the SAME process).
+    /// `force_decline == true` passes `declined_flash()` to every layer
+    /// regardless of what the real admission would decide (the block-bf16
+    /// arm); `force_decline == false` runs the REAL `decide_flash_admission`
+    /// (the flash-bf16 arm) -- production's exact `forward_hidden_with_lengths`
+    /// body, kept in sync by hand.
+    #[cfg(feature = "cuda")]
+    fn forward_hidden_forcing_flash(
+        model: &ModernBert,
+        input_ids: &Tensor,
+        mask: &Tensor,
+        force_decline: bool,
+    ) -> Result<Tensor, EncoderError> {
+        let (_batch, seq) = input_ids.dims2()?;
+        let word_emb = model.word_embeddings.forward(input_ids)?;
+        let mut hidden = model.emb_norm.forward(&word_emb)?;
+        let extended = extended_attention_mask(mask)?;
+        let local_band = match model.local_half_window {
+            None => None,
+            Some(half) => Some(model.sliding_band(seq, half, input_ids.device())?),
+        };
+        let fused_masks = if model.training {
+            Some(FusedAttentionMasks::build(
+                &extended,
+                local_band.as_ref(),
+                hidden.dtype(),
+            )?)
+        } else {
+            None
+        };
+        let flash_admission = if model.training {
+            if force_decline {
+                Some(declined_flash())
+            } else {
+                let head_dim = model
+                    .layers
+                    .first()
+                    .map(|l| l.attention.head_dim)
+                    .unwrap_or(0);
+                Some(decide_flash_admission(
+                    input_ids.device(),
+                    hidden.dtype(),
+                    head_dim,
+                    mask,
+                    None,
+                )?)
+            }
+        } else {
+            None
+        };
+        for layer in &model.layers {
+            hidden = layer.forward(
+                &hidden,
+                &extended,
+                local_band.as_ref(),
+                fused_masks.as_ref(),
+                flash_admission.as_ref(),
+            )?;
+        }
+        model.final_norm.forward(&hidden)
+    }
+
+    /// The three encoder-level flash wiring faults this oracle proves it
+    /// catches (see the block comment above).
+    #[cfg(all(feature = "cuda", feature = "flash-attn"))]
+    enum FlashFault {
+        /// K (slot 1) never rotated -- the observable effect of a
+        /// `slot == 2` -> `slot >= 1` kernel mutant, injected without
+        /// touching the kernel (see the block comment above).
+        KUnrotated,
+        /// `VarlenConfig::softmax_scale` replaced with a wrong constant.
+        BadSoftmaxScale(f32),
+    }
+
+    /// Test-only mirror of [`ModernBertAttention::forward_flash_dense_attention`]
+    /// (called per layer, replacing `ModernBertLayer::forward`'s whole body)
+    /// with one of [`FlashFault`] injected at the ctx-computation step.
+    /// Requires the batch to be genuinely flash-`Holds`-eligible (asserted
+    /// up front) -- this harness does not implement the block-arm
+    /// fallback, since its whole point is to characterize the flash arm's
+    /// OWN fault surface.
+    #[cfg(all(feature = "cuda", feature = "flash-attn"))]
+    fn forward_hidden_flash_with_fault(
+        model: &ModernBert,
+        input_ids: &Tensor,
+        mask: &Tensor,
+        fault: &FlashFault,
+    ) -> Result<Tensor, EncoderError> {
+        use jammi_kernels::flash::{CuSeqlens, VarlenConfig};
+        use jammi_kernels::ops::{flash_attention_varlen, RopePositionsFused};
+
+        let (batch, seq) = input_ids.dims2()?;
+        let device = input_ids.device();
+        let word_emb = model.word_embeddings.forward(input_ids)?;
+        let mut hidden = model.emb_norm.forward(&word_emb)?;
+
+        let head_dim = model
+            .layers
+            .first()
+            .map(|l| l.attention.head_dim)
+            .unwrap_or(0);
+        let decision = decide_flash_admission(device, hidden.dtype(), head_dim, mask, None)?;
+        assert_eq!(
+            decision.outcome,
+            PredicateOutcome::Holds,
+            "flash oracle fault harness requires flash to actually be eligible on this batch \
+             (reason={})",
+            decision.reason
+        );
+        let admission = decision.admission.as_ref().expect(
+            "PredicateOutcome::Holds always pairs with a CompactedBatch -- \
+             decide_flash_admission's own contract",
+        );
+        let cuda_device = match device {
+            Device::Cuda(dev) => dev,
+            _ => panic!("flash oracle fault harness requires a CUDA device"),
+        };
+
+        for layer in &model.layers {
+            let attn = &layer.attention;
+            let normed = match &attn.attn_norm {
+                Some(ln) => ln.forward(&hidden)?,
+                None => hidden.clone(),
+            };
+            let h = attn.num_heads;
+            let d = attn.head_dim;
+            let qkv = attn.wqkv.forward(&normed)?;
+            let total = batch * seq;
+            let qkv5 = qkv.reshape((total, 3, h, d))?;
+            let (cos_full, sin_full) = attn.rope.cached_tables(qkv5.dtype())?;
+            let cos = cos_full.narrow(2, 0, seq)?;
+            let sin = sin_full.narrow(2, 0, seq)?;
+
+            let mut softmax_scale = 1.0 / (d as f32).sqrt();
+            let qkv_rot = match fault {
+                FlashFault::KUnrotated => {
+                    // The REAL op rotates every slot correctly (BLOCK 2's
+                    // own oracle proves it); splice the PRE-rotation K
+                    // slot back in so K alone is left unrotated.
+                    let rotated = apply3(&qkv5, &cos, &sin, RopePositionsFused::new(seq, false))?;
+                    let q_rot = rotated.narrow(1, 0, 1)?;
+                    let k_unrotated = qkv5.narrow(1, 1, 1)?;
+                    let v = rotated.narrow(1, 2, 1)?;
+                    Tensor::cat(&[&q_rot, &k_unrotated, &v], 1)?.contiguous()?
+                }
+                FlashFault::BadSoftmaxScale(bad) => {
+                    softmax_scale = *bad;
+                    apply3(&qkv5, &cos, &sin, RopePositionsFused::new(seq, false))?
+                }
+            };
+
+            let cu_seqlens = CuSeqlens::from_lengths(&admission.lengths, cuda_device)
+                .map_err(|e| EncoderError::Config(format!("flash oracle fault: {e}")))?;
+            let cfg = VarlenConfig {
+                softmax_scale,
+                window: attn.half_window.map(|w| w as u32),
+                deterministic: true,
+            };
+            let o = flash_attention_varlen(&qkv_rot, &cu_seqlens, &cfg)
+                .map_err(|e| EncoderError::Config(format!("flash oracle fault: {e}")))?;
+            let ctx = o.reshape((batch, seq, h * d))?;
+            let out = attn.wo.forward(&ctx)?;
+            hidden = (out + &hidden)?;
+            hidden = layer.mlp.forward(&hidden)?;
+        }
+        model.final_norm.forward(&hidden)
+    }
+
+    /// `model.layers[0].attention.wqkv`'s LoRA `B` matrix -- `target_modules
+    /// = ["Wqkv"]` guarantees this is the `Lora` variant. Layer 0 is always
+    /// present and always global (no sliding window), so this gradient is
+    /// well-defined regardless of the checkpoint's local/global layout.
+    #[cfg(feature = "cuda")]
+    fn flash_oracle_wqkv_lora_b(model: &ModernBert) -> &Tensor {
+        match &model.layers[0].attention.wqkv {
+            MaybeLoraLinear::Lora(l) => &l.lora_b,
+            MaybeLoraLinear::Frozen(_) => panic!(
+                "flash oracle: layer 0's Wqkv must be LoRA-wrapped -- target_modules=[\"Wqkv\"]"
+            ),
+        }
+    }
+
+    /// `L = ||pool_and_normalize(hidden)||^2` (family L: a generic,
+    /// consumer-free scalar) -- this oracle's job is comparing arms'
+    /// NUMERICS, not reproducing the production triplet-hinge objective.
+    /// Returns `(pooled embedding, dL/d(layer 0 Wqkv LoRA B))`, both `F32`,
+    /// flattened.
+    #[cfg(feature = "cuda")]
+    fn flash_oracle_pooled_and_grad(
+        model: &ModernBert,
+        hidden: &Tensor,
+        mask: &Tensor,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let pooled = pool_and_normalize(hidden, mask, Pooling::Mean).unwrap();
+        let pooled_v: Vec<f32> = pooled
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let loss = pooled
+            .to_dtype(DType::F32)
+            .unwrap()
+            .sqr()
+            .unwrap()
+            .sum_all()
+            .unwrap();
+        assert!(
+            loss.to_scalar::<f32>().unwrap().is_finite(),
+            "flash oracle: loss must be finite before backward"
+        );
+        let grads = loss.backward().unwrap();
+        let lora_b = flash_oracle_wqkv_lora_b(model);
+        let grad_v: Vec<f32> = grads
+            .get(lora_b)
+            .expect("flash oracle: layer 0 Wqkv lora_b must have a gradient")
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        (pooled_v, grad_v)
+    }
+
+    /// `Σ|arm - reference| / Σ|reference|`. Affirmative non-finite check
+    /// FIRST (guide §3.7: never let a NaN read as a silent pass), no
+    /// absolute floor (guide §3.8).
+    #[cfg(feature = "cuda")]
+    fn relative_l1_error(arm: &[f32], reference: &[f32]) -> f64 {
+        assert_eq!(
+            arm.len(),
+            reference.len(),
+            "relative_l1_error: length mismatch"
+        );
+        let non_finite = arm
+            .iter()
+            .chain(reference.iter())
+            .filter(|v| !v.is_finite())
+            .count();
+        assert_eq!(
+            non_finite, 0,
+            "relative_l1_error: {non_finite} non-finite value(s)"
+        );
+        let mut num = 0.0f64;
+        let mut den = 0.0f64;
+        for (&a, &r) in arm.iter().zip(reference.iter()) {
+            num += (a as f64 - r as f64).abs();
+            den += (r as f64).abs();
+        }
+        num / den
+    }
+
+    /// The main oracle: flash-bf16 vs block-bf16 vs f32, on the pooled
+    /// embedding AND the step-0 `dL/dWqkv-LoRA` gradient, for ONE shape.
+    #[cfg(feature = "cuda")]
+    fn run_flash_oracle_shape(
+        config: &ModernBertConfig,
+        weights: &std::path::Path,
+        cuda: &Device,
+        batch: usize,
+        seq: usize,
+        seed: u64,
+        label: &str,
+    ) {
+        let bf16_model = flash_oracle_build_model(config, weights, DType::BF16, seed, cuda, true);
+        let f32_model = flash_oracle_build_model(config, weights, DType::F32, seed, cuda, false);
+        let ids = flash_oracle_synthetic_ids(batch, seq, config.vocab_size, seed, cuda);
+        let mask = Tensor::ones((batch, seq), DType::U32, cuda).unwrap();
+
+        let flash_before = cascade_counters_for("attention_block_flash").snapshot();
+        let hidden_flash = forward_hidden_forcing_flash(&bf16_model, &ids, &mask, false).unwrap();
+        let flash_after = cascade_counters_for("attention_block_flash").snapshot();
+        assert_eq!(
+            flash_after.fused - flash_before.fused,
+            config.num_hidden_layers as u64,
+            "[{label}] flash arm: zero dispatch is RED (guide §3.5) -- every layer must have \
+             actually dispatched Fused on this dense batch"
+        );
+
+        let hidden_block = forward_hidden_forcing_flash(&bf16_model, &ids, &mask, true).unwrap();
+        let hidden_f32 = f32_model.forward_hidden(&ids, &mask).unwrap();
+
+        let (pooled_flash, grad_flash) =
+            flash_oracle_pooled_and_grad(&bf16_model, &hidden_flash, &mask);
+        let (pooled_block, grad_block) =
+            flash_oracle_pooled_and_grad(&bf16_model, &hidden_block, &mask);
+        let (pooled_f32, grad_f32) = flash_oracle_pooled_and_grad(&f32_model, &hidden_f32, &mask);
+
+        let err_flash_pooled = relative_l1_error(&pooled_flash, &pooled_f32);
+        let err_block_pooled = relative_l1_error(&pooled_block, &pooled_f32);
+        let err_flash_grad = relative_l1_error(&grad_flash, &grad_f32);
+        let err_block_grad = relative_l1_error(&grad_block, &grad_f32);
+
+        eprintln!(
+            "flash_oracle[{label}]: pooled err flash={err_flash_pooled:.4e} \
+             block={err_block_pooled:.4e} (bound {:.4e}); grad err flash={err_flash_grad:.4e} \
+             block={err_block_grad:.4e} (bound {:.4e})",
+            FLASH_ORACLE_K * err_block_pooled,
+            FLASH_ORACLE_K * err_block_grad,
+        );
+
+        assert!(
+            err_flash_pooled.is_finite() && err_flash_pooled <= FLASH_ORACLE_K * err_block_pooled,
+            "[{label}] pooled embedding: flash err {err_flash_pooled:.4e} exceeds \
+             {FLASH_ORACLE_K} * block err {err_block_pooled:.4e}"
+        );
+        assert!(
+            err_flash_grad.is_finite() && err_flash_grad <= FLASH_ORACLE_K * err_block_grad,
+            "[{label}] LoRA gradient (layer 0 Wqkv B): flash err {err_flash_grad:.4e} exceeds \
+             {FLASH_ORACLE_K} * block err {err_block_grad:.4e}"
+        );
+    }
+
+    /// Skips (does not fail) unless `JAMMI_FLASH_ORACLE_MODEL_DIR` is set --
+    /// no ModernBERT-large checkpoint is committed to this repo, mirroring
+    /// this file's other real-checkpoint-gated tests. `JAMMI_REQUIRE_CUDA`
+    /// still turns a missing CUDA device into a hard failure
+    /// (`growth_oracle_cuda_device`'s own contract).
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn flash_arm_encoder_level_three_way_oracle_dense_cuda_bf16() {
+        let Ok(model_dir) = std::env::var("JAMMI_FLASH_ORACLE_MODEL_DIR") else {
+            eprintln!(
+                "flash_arm_encoder_level_three_way_oracle_dense_cuda_bf16: skipping — \
+                 JAMMI_FLASH_ORACLE_MODEL_DIR not set"
+            );
+            return;
+        };
+        let Some(cuda) = growth_oracle_cuda_device() else {
+            return;
+        };
+        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _d2h_guard = FLASH_D2H_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !jammi_kernels::admission::FLASH_COMPILED {
+            eprintln!(
+                "flash_arm_encoder_level_three_way_oracle_dense_cuda_bf16: skipping — built \
+                 without the flash-attn feature (FLASH_COMPILED=false); this oracle needs a \
+                 real flash arm to compare against"
+            );
+            return;
+        }
+
+        let dir = std::path::PathBuf::from(&model_dir);
+        let config: ModernBertConfig =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                .unwrap();
+        let weights = dir.join("model.safetensors");
+
+        run_flash_oracle_shape(&config, &weights, &cuda, 8, 512, 42, "b8_s512");
+        run_flash_oracle_shape(&config, &weights, &cuda, 1, 128, 43, "b1_s128");
+    }
+
+    /// RED control: the window-dropped fault (`half_window` forced `None`
+    /// on every layer, see the block comment above) must VIOLATE the same
+    /// bound the real oracle asserts above -- proving the oracle actually
+    /// catches it, not merely that the fault "looks wrong" by inspection.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn flash_arm_encoder_level_oracle_red_control_window_dropped() {
+        let Ok(model_dir) = std::env::var("JAMMI_FLASH_ORACLE_MODEL_DIR") else {
+            eprintln!(
+                "flash_arm_encoder_level_oracle_red_control_window_dropped: skipping — \
+                 JAMMI_FLASH_ORACLE_MODEL_DIR not set"
+            );
+            return;
+        };
+        let Some(cuda) = growth_oracle_cuda_device() else {
+            return;
+        };
+        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _d2h_guard = FLASH_D2H_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !jammi_kernels::admission::FLASH_COMPILED {
+            eprintln!(
+                "flash_arm_encoder_level_oracle_red_control_window_dropped: skipping — built \
+                 without the flash-attn feature"
+            );
+            return;
+        }
+
+        let dir = std::path::PathBuf::from(&model_dir);
+        let config: ModernBertConfig =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                .unwrap();
+        let weights = dir.join("model.safetensors");
+        let seed = 44;
+        let (batch, seq) = (8usize, 512usize);
+
+        let mut bf16_model =
+            flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda, true);
+        let f32_model = flash_oracle_build_model(&config, &weights, DType::F32, seed, &cuda, false);
+        let ids = flash_oracle_synthetic_ids(batch, seq, config.vocab_size, seed, &cuda);
+        let mask = Tensor::ones((batch, seq), DType::U32, &cuda).unwrap();
+
+        let hidden_block = forward_hidden_forcing_flash(&bf16_model, &ids, &mask, true).unwrap();
+        // FAULT: force every layer's flash-arm sliding window off -- the
+        // window is construction data ONLY the flash arm reads (see
+        // `ModernBertAttention::half_window`'s own doc); the block arm's
+        // sliding band above is unaffected (it comes from
+        // `ModernBert::local_half_window`, a separate field).
+        for layer in bf16_model.layers.iter_mut() {
+            layer.attention.half_window = None;
+        }
+        let hidden_fault = forward_hidden_forcing_flash(&bf16_model, &ids, &mask, false).unwrap();
+        let hidden_f32 = f32_model.forward_hidden(&ids, &mask).unwrap();
+
+        let (pooled_block, _) = flash_oracle_pooled_and_grad(&bf16_model, &hidden_block, &mask);
+        let (pooled_fault, _) = flash_oracle_pooled_and_grad(&bf16_model, &hidden_fault, &mask);
+        let (pooled_f32, _) = flash_oracle_pooled_and_grad(&f32_model, &hidden_f32, &mask);
+
+        let err_block = relative_l1_error(&pooled_block, &pooled_f32);
+        let err_fault = relative_l1_error(&pooled_fault, &pooled_f32);
+        let bound = FLASH_ORACLE_K * err_block;
+        eprintln!(
+            "RED control [window_dropped_b8_s512]: pooled err fault={err_fault:.4e} \
+             block={err_block:.4e} bound={bound:.4e}"
+        );
+        assert!(
+            err_fault.is_finite() && err_fault > bound,
+            "RED control [window_dropped_b8_s512] must VIOLATE the oracle bound (fault err \
+             {err_fault:.4e} must exceed {FLASH_ORACLE_K} * block err {err_block:.4e} = \
+             {bound:.4e}) -- if this assertion fails, the real oracle above would NOT have \
+             caught this defect"
+        );
+    }
+
+    /// RED control: the K-unrotated fault (`FlashFault::KUnrotated`, see
+    /// the block comment above) must VIOLATE the same bound the real
+    /// oracle asserts above.
+    #[test]
+    #[cfg(all(feature = "cuda", feature = "flash-attn"))]
+    fn flash_arm_encoder_level_oracle_red_control_k_unrotated() {
+        run_flash_arm_fault_red_control("k_unrotated_b8_s512", 45, &FlashFault::KUnrotated);
+    }
+
+    /// RED control: a wrong `softmax_scale` (class sweep -- see the block
+    /// comment above) must VIOLATE the same bound too.
+    #[test]
+    #[cfg(all(feature = "cuda", feature = "flash-attn"))]
+    fn flash_arm_encoder_level_oracle_red_control_bad_softmax_scale() {
+        run_flash_arm_fault_red_control(
+            "bad_softmax_scale_b8_s512",
+            46,
+            &FlashFault::BadSoftmaxScale(1.0),
+        );
+    }
+
+    #[cfg(all(feature = "cuda", feature = "flash-attn"))]
+    fn run_flash_arm_fault_red_control(label: &str, seed: u64, fault: &FlashFault) {
+        let Ok(model_dir) = std::env::var("JAMMI_FLASH_ORACLE_MODEL_DIR") else {
+            eprintln!(
+                "run_flash_arm_fault_red_control[{label}]: skipping — \
+                        JAMMI_FLASH_ORACLE_MODEL_DIR not set"
+            );
+            return;
+        };
+        let Some(cuda) = growth_oracle_cuda_device() else {
+            return;
+        };
+        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _d2h_guard = FLASH_D2H_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !jammi_kernels::admission::FLASH_COMPILED {
+            eprintln!(
+                "run_flash_arm_fault_red_control[{label}]: skipping — built without the \
+                        flash-attn feature"
+            );
+            return;
+        }
+
+        let dir = std::path::PathBuf::from(&model_dir);
+        let config: ModernBertConfig =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                .unwrap();
+        let weights = dir.join("model.safetensors");
+        let (batch, seq) = (8usize, 512usize);
+
+        let bf16_model =
+            flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda, true);
+        let f32_model = flash_oracle_build_model(&config, &weights, DType::F32, seed, &cuda, false);
+        let ids = flash_oracle_synthetic_ids(batch, seq, config.vocab_size, seed, &cuda);
+        let mask = Tensor::ones((batch, seq), DType::U32, &cuda).unwrap();
+
+        let hidden_block = forward_hidden_forcing_flash(&bf16_model, &ids, &mask, true).unwrap();
+        let hidden_fault =
+            forward_hidden_flash_with_fault(&bf16_model, &ids, &mask, fault).unwrap();
+        let hidden_f32 = f32_model.forward_hidden(&ids, &mask).unwrap();
+
+        let (pooled_block, _) = flash_oracle_pooled_and_grad(&bf16_model, &hidden_block, &mask);
+        let (pooled_fault, _) = flash_oracle_pooled_and_grad(&bf16_model, &hidden_fault, &mask);
+        let (pooled_f32, _) = flash_oracle_pooled_and_grad(&f32_model, &hidden_f32, &mask);
+
+        let err_block = relative_l1_error(&pooled_block, &pooled_f32);
+        let err_fault = relative_l1_error(&pooled_fault, &pooled_f32);
+        let bound = FLASH_ORACLE_K * err_block;
+        eprintln!(
+            "RED control [{label}]: pooled err fault={err_fault:.4e} block={err_block:.4e} \
+             bound={bound:.4e}"
+        );
+        assert!(
+            err_fault.is_finite() && err_fault > bound,
+            "RED control [{label}] must VIOLATE the oracle bound (fault err {err_fault:.4e} \
+             must exceed {FLASH_ORACLE_K} * block err {err_block:.4e} = {bound:.4e}) -- if this \
+             assertion fails, the real oracle above would NOT have caught this defect"
+        );
+    }
+
     /// Path P's encoders-side seam (`forward_hidden_with_lengths`, contract
     /// v5 item 3): `lengths: None` is byte-identical to `forward_hidden`,
     /// and — on THIS build (no CUDA / no flash-attn feature, so the flash

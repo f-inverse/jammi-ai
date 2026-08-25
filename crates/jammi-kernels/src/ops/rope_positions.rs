@@ -158,6 +158,20 @@ pub(crate) fn rope_positions_dims(
              undefined"
         )));
     }
+    // Dense-only scope (module doc): `total` MUST be `batch * seq` for some
+    // integer `batch`. `token % seq` is arithmetically well-defined even
+    // when `total` is not a multiple of `seq`, but it is then SEMANTICALLY
+    // wrong -- the tail rows of the last, incomplete "batch" would wrap
+    // into positions that belong to a batch element that never existed,
+    // silently misindexing rather than refusing a shape outside this op's
+    // domain. Mirrors `rope_dims`'s own "silently misindexed" guard.
+    if seq > 0 && !total.is_multiple_of(seq) {
+        return Err(Error::Msg(format!(
+            "{OP}: total={total} is not a multiple of seq={seq} -- this op's DENSE scope \
+             requires total == batch * seq for some integer batch, or `position = token % seq` \
+             silently wraps into a batch element that does not exist"
+        )));
+    }
     Ok((total, h, d))
 }
 
@@ -524,6 +538,35 @@ mod tests {
                  b={b} h={h} s={s} d={d}"
             );
         }
+
+        // Slot 1 (K) must ALSO be bit-identical to `RopeFused` on the SAME
+        // data -- RoPE applies to Q *and* K (contract v5 §3.6), and the
+        // slot-0 check above says nothing about slot 1: a defect that
+        // rotates only slot 0 (leaving K a pass-through, e.g. a
+        // `slot == 2` condition mutated to `slot >= 1`) would sail through
+        // every assertion above while silently returning an unrotated K to
+        // every downstream attention call. Packed independently (`x_bhsd`
+        // now at slot 1, `filler_bhsd` at slots 0 and 2) so this cannot
+        // hide behind slot 0's already-rotated data.
+        let qkv_k = pack_bhsd_into_qkv(&x_bhsd, &filler_bhsd, 1);
+        let out_k = fused(s, false, &qkv_k, &cos, &sin).unwrap();
+        let got_k = unpack_qkv_slot(&out_k, 1, b, s);
+        assert_eq!(
+            to_bits(&got_k),
+            to_bits(&reference),
+            "rope_positions on slot 1 (k) must be bit-identical to RopeFused on [b,h,s,d], \
+             b={b} h={h} s={s} d={d}"
+        );
+        if check_red_control {
+            let out_k_negated = fused(s, true, &qkv_k, &cos, &sin).unwrap();
+            let got_k_negated = unpack_qkv_slot(&out_k_negated, 1, b, s);
+            assert_ne!(
+                to_bits(&got_k_negated),
+                to_bits(&reference),
+                "RED control: sign-flipped rope_positions on slot 1 (k) must NOT match the \
+                 reference, b={b} h={h} s={s} d={d}"
+            );
+        }
     }
 
     #[test]
@@ -564,6 +607,25 @@ mod tests {
         let (cos, sin) = rope_table(5, 4, 10_000.0); // period=5, matches neither seq=2 nor seq=3
         let err = fused(2, false, &qkv, &cos, &sin).unwrap_err();
         assert!(format!("{err}").contains("cos/sin table covers"));
+    }
+
+    /// Family D: `total` not a multiple of `seq` must be refused, not
+    /// silently misindexed (`token % seq` is well-defined arithmetic even
+    /// then, but semantically wrong -- mirrors `rope_dims`'s
+    /// `total_rows_not_a_multiple_of_period_is_refused`). The table's own
+    /// period matches `seq` exactly, so this exercises ONLY the new
+    /// `total % seq` guard, not the pre-existing period check.
+    #[test]
+    fn total_not_a_multiple_of_seq_is_refused() {
+        let device = Device::Cpu;
+        // total=5, seq=2: 5 is not a multiple of 2.
+        let qkv = Tensor::zeros((5, 3, 2, 4), DType::F32, &device).unwrap();
+        let (cos, sin) = rope_table(2, 4, 10_000.0); // period=2, matches seq=2 exactly
+        let err = fused(2, false, &qkv, &cos, &sin).unwrap_err();
+        assert!(
+            format!("{err}").contains("is not a multiple of seq"),
+            "expected the total%seq guard's message, got: {err}"
+        );
     }
 
     /// Family D boundary: `seq=0` with a nonempty qkv is refused, not a

@@ -314,12 +314,40 @@ pub const MAX_SEQ: usize = 4096;
 pub const WINDOW_MASKED_VALUE: f32 = -10_000.0;
 
 /// Fused attention block. See the module doc for the full design.
+///
+/// Constructed ONLY through [`AttentionBlockFused::new`] — `scale` is a
+/// private field (see its own doc), so a struct literal does not compile
+/// from outside this module, and the power-of-two guard in `new` cannot be
+/// bypassed:
+///
+/// ```compile_fail,E0451
+/// use jammi_kernels::ops::{AttentionBlockFused, FullyMaskedPolicy};
+/// // `0.1` is exactly the value `new` refuses; a literal would smuggle it in.
+/// let _op = AttentionBlockFused {
+///     scale: 0.1,
+///     fully_masked: FullyMaskedPolicy::Zeros,
+///     rope: true,
+/// };
+/// ```
 #[derive(Debug, Clone, Copy)]
 pub struct AttentionBlockFused {
     /// The scaled-dot-product scale, `1 / sqrt(head_dim)` — folded into
     /// `Q` before `QKᵀ` (see the module doc's "Fixed domain" section for
     /// why this is bit-exact only because `head_dim == ``HEAD_DIM`).
-    pub scale: f32,
+    ///
+    /// PRIVATE, exactly as [`super::SoftmaxLastDimFused`]'s own `scale`
+    /// is, and for the same reason: `f32` has invalid inhabitants for this
+    /// field (`0.0`, negative, `NaN`, `±inf`, and — specific to this op —
+    /// any value that is not an exact power of two, which voids the
+    /// fold-into-`Q` bit-exactness argument). A `pub` field would let a
+    /// struct literal set one directly, bypassing [`Self::new`]'s guard
+    /// entirely. The only ways to set or read it from outside this module
+    /// are [`Self::new`] (construction, checked) and [`Self::scale`] (the
+    /// accessor). [`Self::fully_masked`] and [`Self::rope`] stay `pub`
+    /// because neither type has an invalid inhabitant (every enum variant
+    /// is a valid policy; both `bool`s are valid), mirroring
+    /// `SoftmaxLastDimFused`'s `pub fully_masked` / private `scale` split.
+    scale: f32,
     /// See [`super::FullyMaskedPolicy`]'s own doc; reused unchanged.
     pub fully_masked: FullyMaskedPolicy,
     /// Whether `rope_pack` is applied to `Q`/`K` at all. `false` lets a
@@ -366,6 +394,14 @@ impl AttentionBlockFused {
             fully_masked,
             rope,
         })
+    }
+
+    /// Reads the validated [`Self::scale`] — always a value that already
+    /// passed [`Self::new`]'s finite/positive/power-of-two check; with the
+    /// field private, no struct literal or field assignment outside this
+    /// module can put a refused value here.
+    pub fn scale(&self) -> f32 {
+        self.scale
     }
 }
 
@@ -1392,8 +1428,13 @@ mod tests {
     /// just finiteness).
     #[test]
     fn new_accepts_an_exact_power_of_two_scale_and_refuses_a_non_power_of_two_one() {
-        AttentionBlockFused::new(0.125, FullyMaskedPolicy::Propagate, false)
+        let op = AttentionBlockFused::new(0.125, FullyMaskedPolicy::Propagate, false)
             .expect("0.125 = 2^-3 is an exact power of two");
+        assert_eq!(
+            op.scale(),
+            0.125,
+            "the accessor reads back the validated value"
+        );
         let err = AttentionBlockFused::new(0.1, FullyMaskedPolicy::Propagate, false)
             .expect_err("0.1 has a nonzero f32 mantissa — not an exact power of two");
         assert!(matches!(err, Error::Msg(_)));

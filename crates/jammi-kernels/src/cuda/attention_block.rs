@@ -183,7 +183,7 @@ pub(crate) fn cuda_fwd(
         (q_storage, q_l, k_storage)
     };
 
-    let q_scaled = q_rot.affine(&q_rot_l, f64::from(op.scale), 0.0)?;
+    let q_scaled = q_rot.affine(&q_rot_l, f64::from(op.scale()), 0.0)?;
 
     let bh = b * h;
     let flat_l = Layout::contiguous((bh, s, d));

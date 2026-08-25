@@ -34,7 +34,7 @@
 #![cfg(feature = "cuda")]
 
 use candle_core::{DType, Device, Tensor};
-use candle_nn::{Linear, Module, VarBuilder, VarMap};
+use candle_nn::{Linear, VarBuilder, VarMap};
 use jammi_lora::{LoraInitMode, LoraLinear};
 
 /// Deterministic, non-degenerate `f32`-then-cast fixture spanning a real
@@ -114,17 +114,23 @@ fn fused_vs_eager_forced_arm_ab_is_bit_identical_both_pre_and_post_fix_bf16_cuda
 
     let fused_out = lora_fused_arm.forward(&x).unwrap();
 
-    let fused_v: Vec<half::bf16> = fused_out
+    // Widened to `F32` for readback ONLY (never introduces its own
+    // rounding: `BF16` is exactly the top 16 bits of `F32`, so this
+    // widening is injective — two DISTINCT `BF16` bit patterns always
+    // widen to two DISTINCT `F32` values, making an `F32` equality
+    // comparison here exactly equivalent to comparing raw `BF16` bit
+    // patterns, without needing the `half` crate as a direct dependency).
+    let fused_v: Vec<f32> = fused_out
         .flatten_all()
         .unwrap()
-        .to_dtype(DType::BF16)
+        .to_dtype(DType::F32)
         .unwrap()
         .to_vec1()
         .unwrap();
-    let eager_v: Vec<half::bf16> = eager_out
+    let eager_v: Vec<f32> = eager_out
         .flatten_all()
         .unwrap()
-        .to_dtype(DType::BF16)
+        .to_dtype(DType::F32)
         .unwrap()
         .to_vec1()
         .unwrap();
@@ -133,8 +139,8 @@ fn fused_vs_eager_forced_arm_ab_is_bit_identical_both_pre_and_post_fix_bf16_cuda
     // Finiteness-affirmative (clause 4) before the bit-identity compare.
     for (i, (&f, &e)) in fused_v.iter().zip(eager_v.iter()).enumerate() {
         assert!(
-            f.to_f32().is_finite() && e.to_f32().is_finite(),
-            "index {i}: a non-finite value slipped through (fused={f:?}, eager={e:?})"
+            f.is_finite() && e.is_finite(),
+            "index {i}: a non-finite value slipped through (fused={f}, eager={e})"
         );
     }
     let mismatches: Vec<usize> = fused_v
@@ -150,7 +156,7 @@ fn fused_vs_eager_forced_arm_ab_is_bit_identical_both_pre_and_post_fix_bf16_cuda
          forced-eager arm (`JAMMI_KERNELS_DISABLE=lora_linear_fused` -> `eager_epilogue`) \
          disagree on {}/{} elements — they must round IDENTICALLY (both arms were fixed \
          together in the same esc-046 change; a fix that touched only one arm reads RED here, \
-         not GREEN). First mismatch at index {}: fused={:?} eager={:?}",
+         not GREEN). First mismatch at index {}: fused={} eager={}",
         mismatches.len(),
         fused_v.len(),
         mismatches[0],

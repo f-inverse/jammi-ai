@@ -4327,8 +4327,8 @@ fn mask_shape_of(mask_v: &[f32], batch: usize, seq: usize) -> (usize, usize, usi
     }
 }
 
-/// Hand-composed eager backward reference on `device`: RopeFused + matmul
-/// + SoftmaxLastDimFused + matmul, run under `Var`/`backward()` so
+/// Hand-composed eager backward reference on `device`: RopeFused, matmul,
+/// SoftmaxLastDimFused, then matmul again, run under `Var`/`backward()` so
 /// candle's own autograd (not this op's `bwd`) produces `dqkv` — the
 /// independent reference [`AttentionBlockFused`]'s own `dqkv` is compared
 /// against. Returns `(out_values, dqkv_values)`, both cast to `f32`

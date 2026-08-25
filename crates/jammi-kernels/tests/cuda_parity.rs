@@ -6089,11 +6089,13 @@ fn isolated_kernel_timing_cast_boundary_wave1() {
         let grad_res = Tensor::from_slice(&grad_res_v, (m_e, outf_e), &cuda).unwrap();
         let expected = apply1(&grad_res, cast_scale_op)
             .unwrap()
+            .flatten_all()
+            .unwrap()
             .to_vec1::<f32>()
             .unwrap();
         let out = Tensor::zeros((m_e, outf_e), DType::F32, &cuda).unwrap();
         cast_scale_bf16_f32_into(&grad_res, scale, &out).unwrap();
-        let got = out.to_vec1::<f32>().unwrap();
+        let got = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         for i in 0..m_e * outf_e {
             assert_eq!(
                 got[i].to_bits(),
@@ -6170,11 +6172,13 @@ fn isolated_kernel_timing_cast_boundary_wave1() {
         let f32val = Tensor::from_slice(&f32val_v, (m_f, inf_f), &cuda).unwrap();
         let expected = apply2(&base, &f32val, cast_add_op)
             .unwrap()
+            .flatten_all()
+            .unwrap()
             .to_vec1::<bf16>()
             .unwrap();
         let out = Tensor::zeros((m_f, inf_f), DType::BF16, &cuda).unwrap();
         cast_add_bf16_into(&base, &f32val, &out).unwrap();
-        let got = out.to_vec1::<bf16>().unwrap();
+        let got = out.flatten_all().unwrap().to_vec1::<bf16>().unwrap();
         for i in 0..m_f * inf_f {
             assert_eq!(
                 got[i].to_bits(),

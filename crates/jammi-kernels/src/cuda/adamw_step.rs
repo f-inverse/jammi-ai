@@ -90,6 +90,64 @@ pub(crate) fn moment_update_cuda_fwd(
     Ok(())
 }
 
+/// TEST-ONLY negative control: launches `adamw_moment_update_f32_fma_
+/// contracted_red_control` (see the `.cu` file's doc on that kernel) —
+/// deliberately the WRONG, single-rounding-FMA expression, sharing every
+/// domain check `moment_update_cuda_fwd` uses so the ONLY difference
+/// between the two is which kernel function gets launched. The sole
+/// caller is `ops::adamw_step::AdamMomentUpdateFmaContractedRedControl`.
+pub(crate) fn moment_update_fma_contracted_red_control_cuda_fwd(
+    beta: f64,
+    square_grad: bool,
+    s1: &mut CudaStorage,
+    l1: &Layout,
+    s2: &CudaStorage,
+    l2: &Layout,
+) -> Result<()> {
+    const OP: &str = "adamw_moment_update_fma_contracted_red_control";
+    if l1.dims() != l2.dims() {
+        return Err(Error::ShapeMismatchBinaryOp {
+            lhs: l1.shape().clone(),
+            rhs: l2.shape().clone(),
+            op: OP,
+        });
+    }
+    let n = l1.shape().elem_count();
+    if n == 0 {
+        if s1.dtype() != DType::F32 || s2.dtype() != DType::F32 {
+            return Err(Error::UnsupportedDTypeForOp(s1.dtype(), OP));
+        }
+        return Ok(());
+    }
+    super::check_elem_count_fits_u32(OP, n)?;
+    let ranges = require_contiguous_f32(OP, &[(s1, l1), (s2, l2)])?;
+    let (o1, o2) = ranges[0];
+    let (o1_g, o2_g) = ranges[1];
+
+    let device = s2.device().clone();
+    let g = s2.as_cuda_slice::<f32>()?.slice(o1_g..o2_g);
+    let mut m = s1.as_cuda_slice_mut::<f32>()?.slice_mut(o1..o2);
+
+    let cfg = super::elemwise_launch_config(n as u32);
+    let func = device.get_or_load_custom_func(
+        "adamw_moment_update_f32_fma_contracted_red_control",
+        MODULE_NAME,
+        super::PTX_ADAMW_STEP,
+    )?;
+    let beta_f32 = beta as f32;
+    let one_minus_beta_f32 = (1.0 - beta) as f32;
+    let square_grad_i32: i32 = if square_grad { 1 } else { 0 };
+    let mut builder = func.builder();
+    builder.arg(&mut m);
+    builder.arg(&g);
+    builder.arg(&beta_f32);
+    builder.arg(&one_minus_beta_f32);
+    builder.arg(&square_grad_i32);
+    builder.arg(&n);
+    unsafe { builder.launch(cfg) }.map_err(|e| Error::Cuda(Box::new(e)))?;
+    Ok(())
+}
+
 /// `theta[i] = theta[i]*one_minus_lr_lambda - lr*m_hat[i]/(sqrt(v_hat[i])+eps)`,
 /// in place. Mirrors `ops::AdamThetaUpdate::cpu_fwd`'s CPU arm exactly.
 #[allow(clippy::too_many_arguments)]

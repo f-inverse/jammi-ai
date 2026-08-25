@@ -3448,11 +3448,15 @@ mod tests {
     /// `if self.training` branch) is the ONLY thing that would catch that
     /// branch being accidentally deleted or inverted. Mirrors
     /// `tests/it/modernbert.rs`'s `set_training_threading_gates_the_fused_
-    /// {rope,softmax,geglu}_dispatch_counters`, at the unit level (no
-    /// checkpoint has `head_dim == ATTENTION_BLOCK_HEAD_DIM == 64`, so this
-    /// op's own counter-threading proof lives here, driven through
-    /// `attention_block_fixture` + `ModernBertAttention::forward` directly,
-    /// rather than through a full `ModernBert::forward_hidden`).
+    /// {rope,softmax,geglu}_dispatch_counters`, at the unit level — driven
+    /// through `attention_block_fixture` + `ModernBertAttention::forward`
+    /// directly. (The cookbook's `tiny_modernbert_classifier` fixture has
+    /// `head_dim == 16`, so it cannot reach this op; real ModernBERT-base
+    /// and -large checkpoints have `head_dim == 64` — `768 / 12`, `1024 /
+    /// 16` — and so does this crate's own `tests/fixtures/
+    /// tiny_modernbert_head64`, which
+    /// `forward_hidden_reaches_the_fused_attention_block_on_a_head_dim_64_checkpoint`
+    /// drives through the full `ModernBert::forward_hidden`.)
     #[test]
     fn set_training_threading_gates_the_fused_attention_block_dispatch_counters() {
         let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
@@ -3494,6 +3498,89 @@ mod tests {
         assert_eq!(
             after_eval2.fused, before_eval2.fused,
             "set_training(false) must restore the eval-only dispatch path"
+        );
+    }
+
+    /// The full-model proof: `ModernBert::forward_hidden` on a
+    /// `head_dim == 64` checkpoint (this crate's own
+    /// `tests/fixtures/tiny_modernbert_head64`: hidden 64, 1 head, 2
+    /// layers with `global_attn_every_n_layers = 2` — layer 0 global,
+    /// layer 1 local with `local_attention = 8`) reaches the fused
+    /// whole-attention-block arm on BOTH layer kinds in training: the
+    /// fused counter advances by exactly `num_hidden_layers` per training
+    /// forward with zero eager fallbacks, and does not move in eval. This
+    /// is what exercises the per-forward `FusedAttentionMasks` build in
+    /// `forward_hidden` end to end (a global layer consuming `global`, a
+    /// local layer consuming `local`) — the mutation it reddens under
+    /// (verified, reverted): deleting `self.training = training` from
+    /// `ModernBert::set_training`, which leaves `forward_hidden` building
+    /// no masks and the training forward a typed `Config` refusal. The
+    /// padded input (batch 1 pads its last two tokens) makes the local
+    /// layer's combined mask carry all three lattice values.
+    #[test]
+    fn forward_hidden_reaches_the_fused_attention_block_on_a_head_dim_64_checkpoint() {
+        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let device = Device::Cpu;
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/tiny_modernbert_head64");
+        let config: ModernBertConfig =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            config.hidden_size / config.num_attention_heads,
+            ATTENTION_BLOCK_HEAD_DIM
+        );
+        assert!(!config.is_local_layer(0) && config.is_local_layer(1));
+        let weights = dir.join("model.safetensors");
+        let varmap = candle_nn::VarMap::new();
+        let mut model = ModernBert::builder()
+            .build(&[weights.as_path()], &config, &device, &varmap)
+            .unwrap();
+        let input_ids =
+            Tensor::new(&[[2u32, 5, 10, 3, 7, 9], [4u32, 8, 1, 6, 0, 0]], &device).unwrap();
+        let mask = Tensor::new(&[[1u32, 1, 1, 1, 1, 1], [1u32, 1, 1, 1, 0, 0]], &device).unwrap();
+
+        let before_eval = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+        let eval_out = model.forward_hidden(&input_ids, &mask).unwrap();
+        let after_eval = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+        assert_eq!(
+            after_eval.fused, before_eval.fused,
+            "eval never dispatches fused"
+        );
+        assert_eq!(
+            after_eval.eager, before_eval.eager,
+            "eval never consults admission"
+        );
+
+        model.set_training(true);
+        let before = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+        let train_out = model.forward_hidden(&input_ids, &mask).unwrap();
+        let after = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+        assert_eq!(
+            after.fused - before.fused,
+            config.num_hidden_layers as u64,
+            "every layer (global AND local) must take the fused arm: {before:?} -> {after:?}"
+        );
+        assert_eq!(
+            after.eager, before.eager,
+            "no eager fallback on a head_dim-64 checkpoint"
+        );
+        assert_eq!(train_out.dims(), eval_out.dims());
+        let t: Vec<f32> = train_out.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(
+            t.iter().all(|x| x.is_finite()),
+            "training output must be finite"
+        );
+
+        model.set_training(false);
+        let before2 = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+        let _ = model.forward_hidden(&input_ids, &mask).unwrap();
+        let after2 = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+        assert_eq!(
+            after2.fused, before2.fused,
+            "set_training(false) restores eval"
         );
     }
 

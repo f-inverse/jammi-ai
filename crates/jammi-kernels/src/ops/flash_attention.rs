@@ -329,10 +329,34 @@ impl CustomOp3 for FlashVarlenBwdHelper {
         Ok((CudaStorage::wrap_cuda_slice(d_qkv, device), out_shape))
     }
 
-    // `bwd` (differentiating THROUGH a gradient computation — second-order
-    // grad) is intentionally unimplemented: candle's default
-    // `CustomOp3::bwd` returns `Error::BackwardNotSupported`, which is the
-    // honest answer here (out of scope, see the module doc's "Domain").
+    // Second-order gradient (differentiating THROUGH `d_qkv`, this op's own
+    // output) is NOT routed to candle's default `CustomOp3::bwd`
+    // (`Error::BackwardNotSupported`) — an earlier version of this comment
+    // claimed that, and `10b1f3b`'s audit found it FALSE (advisory finding,
+    // confirmed correct by the auditor; pinned by a test below). The real
+    // mechanism: `FlashVarlenAttention::bwd` (above) calls `arg.detach()` /
+    // `res.detach()` / `grad_res.detach()` before constructing `d_qkv`
+    // through `apply_stateful3` — by design, so backpropagating through
+    // `FlashVarlenAttention` does not grow the graph with a second
+    // differentiable node for no reason (see that call site's own comment).
+    // A DETACHED input means candle's autograd never records a
+    // `BackpropOp` edge from `d_qkv` back to `qkv`/`o`/`d_o` at all, so a
+    // caller who tries to differentiate a second time through `d_qkv`
+    // reaches `candle_core::Tensor::backward`'s "no gradient recorded for
+    // this leaf" path, not this `bwd` method — `grads.get(qkv)` on that
+    // second pass returns `None`, an ABSENT gradient, silently (candle does
+    // not error on a detached/untracked leaf; it simply omits it from the
+    // returned `GradStore`). This method is never called for a
+    // second-order pass through `FlashVarlenAttention`'s own output for
+    // that reason, and is therefore correctly left unimplemented (candle's
+    // default IS reached, but only if something ELSE calls `.backward()`
+    // directly on a `Tensor` produced by `apply_stateful3` on THIS type,
+    // which no code path in this crate does) — but the second-order
+    // CALLER's experience is "no gradient", not "a typed error", and that
+    // is the fact worth stating plainly rather than the wrong one.
+    // See `flash_op_oracles.rs`'s
+    // `second_order_backward_through_flash_attention_varlen_output_is_a_silent_absent_gradient_not_an_error`
+    // for the pinned behaviour.
 }
 
 /// The ONLY public entry point. Constructs a FRESH `FlashVarlenAttention`
@@ -358,6 +382,53 @@ pub fn flash_attention_varlen(
         lse: Saved::empty(),
     };
     super::apply_stateful1(qkv, op)
+}
+
+/// Structural (white-box) proof that [`flash_attention_varlen`] does not
+/// silently pin `cfg.deterministic` — see the module doc's "Domain"
+/// section: "`cfg.deterministic` is whatever the caller passes ... this op
+/// itself has no opinion". `10b1f3b`'s audit asked for a test deciding and
+/// documenting this ("a caller passing `deterministic: false` gets it
+/// PINNED to true by the op, or the op refuses"): the decision is NEITHER
+/// — a generic primitive (family L) has no opinion of its own; Stage B2's
+/// encoder is the ONLY place that pins `true`, at ITS call site, not here.
+/// Mirrors `flash_attention_varlen`'s own construction exactly and reads
+/// the field back — CUDA is needed only to build a real `CuSeqlens`, not to
+/// launch anything.
+#[cfg(test)]
+mod deterministic_passthrough {
+    use super::*;
+
+    #[test]
+    fn cfg_deterministic_flows_through_construction_unmodified() {
+        let Ok(cuda) = candle_core::Device::new_cuda(0) else {
+            eprintln!(
+                "cfg_deterministic_flows_through_construction_unmodified: skipping — no CUDA \
+                 device available"
+            );
+            return;
+        };
+        let dev = cuda.as_cuda_device().unwrap().clone();
+        for det in [true, false] {
+            let cu_seqlens = crate::flash::CuSeqlens::from_lengths(&[8usize], &dev).unwrap();
+            let cfg = crate::flash::VarlenConfig {
+                softmax_scale: 0.125,
+                window: None,
+                deterministic: det,
+            };
+            // The SAME construction `flash_attention_varlen` performs.
+            let op = FlashVarlenAttention {
+                cu_seqlens,
+                num_heads: 1,
+                cfg,
+                lse: Saved::empty(),
+            };
+            assert_eq!(
+                op.cfg.deterministic, det,
+                "the op must store exactly what the caller passed — never overriding it"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

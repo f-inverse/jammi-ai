@@ -33,35 +33,46 @@ import sys
 CRATES_IO_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
 
 
+def _unusable_stdin(raw: str, detail: str) -> int:
+    # Empty/truncated/malformed/wrongly-shaped stdin all mean the same thing:
+    # the upstream `cargo metadata` producer failed (or was never run) and
+    # this script silently inherited a pipe it cannot use — most commonly
+    # `cargo metadata --locked` refusing to run because Cargo.lock is out of
+    # sync with Cargo.toml, or a registry-index fetch failure. Surface that
+    # as one diagnosable message rather than a raw traceback (JSONDecodeError
+    # on empty/non-JSON text, or KeyError/TypeError on JSON that parses but
+    # is not cargo-metadata's shape, e.g. `{}` or `null`) that names no cause.
+    print(
+        f"ERROR: stdin is not usable cargo-metadata output: {detail}\n"
+        f"  stdin was {len(raw)} byte(s) "
+        f"({raw[:200]!r}{'...' if len(raw) > 200 else ''}).\n"
+        "  This script expects `cargo metadata --format-version 1 "
+        "[--locked]` piped in on stdin. Empty, non-JSON, or JSON that is "
+        "not cargo-metadata's shape usually means that upstream command "
+        "failed or exited non-zero (e.g. `--locked` rejecting a Cargo.lock "
+        "out of sync with Cargo.toml, or a registry-index fetch failure) — "
+        "check its stderr, not this traceback.",
+        file=sys.stderr,
+    )
+    return 2
+
+
 def main() -> int:
     raw = sys.stdin.read()
     try:
         metadata = json.loads(raw)
     except json.JSONDecodeError as e:
-        # Empty/truncated stdin means the upstream `cargo metadata` producer
-        # failed (or was never run) and this script silently inherited an
-        # empty pipe — most commonly `cargo metadata --locked` refusing to
-        # run because Cargo.lock is out of sync with Cargo.toml, or a
-        # registry-index fetch failure. Surface that as a diagnosable
-        # message instead of a raw JSONDecodeError traceback pointing at a
-        # line/column in an empty string, which names no cause.
-        print(
-            f"ERROR: failed to parse cargo-metadata JSON from stdin: {e}\n"
-            f"  stdin was {len(raw)} byte(s) "
-            f"({raw[:200]!r}{'...' if len(raw) > 200 else ''}).\n"
-            "  This script expects `cargo metadata --format-version 1 "
-            "[--locked]` piped in on stdin. Empty/non-JSON stdin usually "
-            "means that upstream command failed or exited non-zero (e.g. "
-            "`--locked` rejecting a Cargo.lock out of sync with Cargo.toml, "
-            "or a registry-index fetch failure) — check its stderr, not "
-            "this traceback.",
-            file=sys.stderr,
-        )
-        return 2
+        return _unusable_stdin(raw, str(e))
 
-    packages_by_id = {pkg["id"]: pkg for pkg in metadata["packages"]}
-    resolve_nodes = {node["id"]: node for node in metadata["resolve"]["nodes"]}
-    default_members = metadata["workspace_default_members"]
+    if not isinstance(metadata, dict):
+        return _unusable_stdin(raw, f"parsed to a {type(metadata).__name__}, not a JSON object")
+
+    try:
+        packages_by_id = {pkg["id"]: pkg for pkg in metadata["packages"]}
+        resolve_nodes = {node["id"]: node for node in metadata["resolve"]["nodes"]}
+        default_members = metadata["workspace_default_members"]
+    except (KeyError, TypeError) as e:
+        return _unusable_stdin(raw, f"valid JSON but missing/malformed cargo-metadata field: {e!r}")
 
     # BFS the normal-dependency closure. A `deps` entry contributes a normal
     # edge when any of its dep_kinds has kind == null (cargo metadata encodes

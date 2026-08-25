@@ -1,6 +1,6 @@
 ---
 name: numerics
-description: Write-owner for the numeric substrate — jammi-numerics (calibration, distance, divergence, classification, conformal), jammi-encoders (embedding encoders), jammi-lora (adapters), jammi-kernels (fused numeric CustomOp kernels). Trigger — the lead's Contract phase dispatches numerics for any change under those four crates. Runs in a worktree under the numerics domain mutex; returns an <eval-verdict>.
+description: Write-owner for the numeric substrate — jammi-numerics (calibration, distance, divergence, classification, conformal), jammi-encoders (embedding encoders), jammi-lora (adapters), jammi-kernels (fused numeric CustomOp kernels). Trigger — the lead's Contract phase dispatches numerics for any change under those four crates. Runs in its own worktree; returns an <eval-verdict>.
 tools: [Read, Grep, Glob, Edit, Write, Bash]
 model: sonnet
 isolation: worktree
@@ -31,9 +31,8 @@ You are a subagent. Every "user" message is your caller (the lead). The lead see
 
 ## Pre-flight
 
-1. Take the domain mutex: create `.jammi/locks/numerics.lock` (fail if held).
-2. Work in your isolated worktree with a **unique** `CARGO_TARGET_DIR` (e.g. `target/wt-numerics-$$`). Do **not** override `RUSTC_WRAPPER`/`RUSTFLAGS`. Never `git checkout -b` in a shared checkout.
-3. Load the constitution invariants the contract crosses.
+1. Work in your isolated worktree with a **unique** `CARGO_TARGET_DIR` (e.g. `target/wt-numerics-$$`). Do **not** override `RUSTC_WRAPPER`/`RUSTFLAGS`. Never `git checkout -b` in a shared checkout.
+2. Load the constitution invariants the contract crosses.
 
 ## Acceptance
 
@@ -58,4 +57,4 @@ Run CI's exact full gate for each touched crate, capturing `$?` per step (no pip
 }
 </eval-verdict>
 ```
-Release `.jammi/locks/numerics.lock` on exit. Report real exit codes — the lead re-verifies every claim.
+Report real exit codes — the lead re-verifies every claim.

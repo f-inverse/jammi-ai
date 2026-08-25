@@ -36,7 +36,7 @@ AGENTS_DIR = REPO_ROOT / ".claude" / "agents"
 COVERED_DIRS = ("crates", "cookbook", "docs", "ci", ".github", ".claude", ".jammi")
 
 # The shared-declaration class: module roots, manifests, and error taxonomies
-# under crates/ are lead/`docs-ci`-owned and exempt from the domain mutex
+# under crates/ are lead/`docs-ci`-owned and exempt from domain write-ownership
 # (ARCHITECTURE §2.2, §6). A domain glob will also match them; that specific
 # overlap is the one permitted double-match.
 SHARED_BASENAMES = frozenset({"lib.rs", "Cargo.toml", "error.rs"})

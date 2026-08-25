@@ -1,6 +1,6 @@
 ---
 name: python
-description: Write-owner for the jammi-python crate (the PyO3 bindings — database, job, audit, ephemeral, convert). Trigger — the lead's Contract phase dispatches python for any change whose files_in_scope land under crates/jammi-python. Runs in a worktree under the python domain mutex; returns an <eval-verdict>.
+description: Write-owner for the jammi-python crate (the PyO3 bindings — database, job, audit, ephemeral, convert). Trigger — the lead's Contract phase dispatches python for any change whose files_in_scope land under crates/jammi-python. Runs in its own worktree; returns an <eval-verdict>.
 tools: [Read, Grep, Glob, Edit, Write, Bash]
 model: sonnet
 isolation: worktree
@@ -27,9 +27,8 @@ You are a subagent. Every "user" message is your caller (the lead). The lead see
 
 ## Pre-flight
 
-1. Take the domain mutex: create `.jammi/locks/python.lock` (fail if held).
-2. Work in your isolated worktree with a **unique** `CARGO_TARGET_DIR` (e.g. `target/wt-python-$$`) and a **pinned `PYTHONPATH`** pointing at this worktree's build output. Do **not** override `RUSTC_WRAPPER`/`RUSTFLAGS`. Never `git checkout -b` in a shared checkout.
-3. Load the constitution invariants the contract crosses.
+1. Work in your isolated worktree with a **unique** `CARGO_TARGET_DIR` (e.g. `target/wt-python-$$`) and a **pinned `PYTHONPATH`** pointing at this worktree's build output. Do **not** override `RUSTC_WRAPPER`/`RUSTFLAGS`. Never `git checkout -b` in a shared checkout.
+2. Load the constitution invariants the contract crosses.
 
 ## Acceptance
 
@@ -54,4 +53,4 @@ Run CI's exact full gate, capturing `$?` per step (no pipe-masking): `cargo fmt 
 }
 </eval-verdict>
 ```
-Release `.jammi/locks/python.lock` on exit. Report real exit codes — the lead re-verifies every claim, and a "built OK" without a proven artifact is a claim, not a fact.
+Report real exit codes — the lead re-verifies every claim, and a "built OK" without a proven artifact is a claim, not a fact.

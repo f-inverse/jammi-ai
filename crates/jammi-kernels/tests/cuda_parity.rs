@@ -32,7 +32,7 @@
 use candle_core::{DType, Device, Error, Layout, Tensor, Var, D};
 use half::bf16;
 use jammi_kernels::ops::{
-    apply1, apply2, apply3, bwd_gradient_gemm_layouts, cast_add_bf16_into,
+    adamw_step_fused, apply1, apply2, apply3, bwd_gradient_gemm_layouts, cast_add_bf16_into,
     cast_scale_bf16_f32_into, AttentionBlockFused, Axpy, BwdGemmLayoutsParams, CastAddBf16,
     CastScaleBf16F32, DropoutFused, DropoutKey, FullyMaskedPolicy, GegluFused, GeluVariant,
     LayerNormFused, LowRankResidualLinear, PhiloxKatProbe, RopeFused, ScaledCastAdd,
@@ -6245,4 +6245,320 @@ fn isolated_kernel_timing_cast_boundary_wave1() {
         "kernel-only (preallocated output)",
         &stats_f_kernel_only,
     );
+}
+// ---------------------------------------------------------------------
+// adamw_step_fused — the multi-tensor-AdamW lever's CPU-vs-CUDA parity leg.
+//
+// This does NOT re-check bit-identity against the eager candle chain (that
+// is `ops::adamw_step::tests`' job, entirely CPU-hermetic and run on every
+// `cargo test -p jammi-kernels`); it checks that the SAME fused op, given
+// the SAME inputs, agrees within `F32_TOL` whether it runs on `Device::Cpu`
+// or `Device::Cuda` — exactly the pattern every other op in this file uses
+// (`assert_parity_f32` for `Axpy`), and the reason the CUDA acceptance
+// criterion in this lever's design study
+// (`scratchpad/design-multi-tensor-adamw.md`, §3) is a TOLERANCE, not
+// bit-exact: nvcc's `--fmad=true` default may contract the `a*b+c`-shaped
+// sub-expressions in `adamw_theta_update_f32`/`adamw_moment_update_f32`
+// into single-rounding FMAs, differing from the CPU arm's (and candle's own
+// eager chain's) separately-rounded operations by up to ~1 ULP — the same
+// class of gap `F32_TOL` already exists to absorb for `Axpy`.
+//
+// Shapes are the production LoRA A/B matrix shapes this lever's census
+// targets (ModernBERT-large, rank 16, `Wqkv`/`Wo`/`Wi` — see the design
+// study's Cargo shapes, derived from `jammi-lora/src/lora_linear.rs:374-375`
+// `lora_a: (rank, in_features)`, `lora_b: (out_features, rank)`).
+#[allow(clippy::too_many_arguments)]
+fn assert_adamw_parity(
+    cuda: &Device,
+    shape: (usize, usize),
+    theta_v: &[f32],
+    grad_v: &[f32],
+    beta1: f64,
+    beta2: f64,
+    lr: f64,
+    weight_decay: f64,
+    eps: f64,
+    t: i32,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let cpu = Device::Cpu;
+    let scale_m = 1f64 / (1f64 - beta1.powi(t));
+    let scale_v = 1f64 / (1f64 - beta2.powi(t));
+
+    let theta_cpu = Tensor::from_slice(theta_v, shape, &cpu).unwrap();
+    let m_cpu = Tensor::zeros(shape, DType::F32, &cpu).unwrap();
+    let v_cpu = Tensor::zeros(shape, DType::F32, &cpu).unwrap();
+    let g_cpu = Tensor::from_slice(grad_v, shape, &cpu).unwrap();
+    adamw_step_fused(
+        &theta_cpu,
+        &m_cpu,
+        &v_cpu,
+        &g_cpu,
+        beta1,
+        beta2,
+        scale_m,
+        scale_v,
+        lr,
+        weight_decay,
+        eps,
+    )
+    .unwrap();
+
+    let theta_gpu = Tensor::from_slice(theta_v, shape, cuda).unwrap();
+    let m_gpu = Tensor::zeros(shape, DType::F32, cuda).unwrap();
+    let v_gpu = Tensor::zeros(shape, DType::F32, cuda).unwrap();
+    let g_gpu = Tensor::from_slice(grad_v, shape, cuda).unwrap();
+    adamw_step_fused(
+        &theta_gpu,
+        &m_gpu,
+        &v_gpu,
+        &g_gpu,
+        beta1,
+        beta2,
+        scale_m,
+        scale_v,
+        lr,
+        weight_decay,
+        eps,
+    )
+    .unwrap();
+
+    let theta_cpu_v: Vec<f32> = theta_cpu.flatten_all().unwrap().to_vec1().unwrap();
+    let theta_gpu_v: Vec<f32> = theta_gpu
+        .flatten_all()
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let n = shape.0 * shape.1;
+    assert_eq!(theta_cpu_v.len(), n);
+    // Vacuous-pass guard (see `assert_parity_f32`'s identical comment): a
+    // short GPU output would make the zip below stop early and pass with
+    // nothing actually compared.
+    assert_eq!(
+        theta_gpu_v.len(),
+        n,
+        "GPU theta length mismatch (got {}, expected {n})",
+        theta_gpu_v.len()
+    );
+    for (i, (c, g)) in theta_cpu_v.iter().zip(theta_gpu_v.iter()).enumerate() {
+        assert!(
+            ((*c - *g).abs() as f64) <= F32_TOL,
+            "theta[{i}]: cpu {c} vs cuda {g} (shape={shape:?}, t={t})"
+        );
+        assert!(
+            c.is_finite() && g.is_finite(),
+            "theta[{i}] non-finite: cpu {c}, cuda {g}"
+        );
+    }
+
+    let m_cpu_v: Vec<f32> = m_cpu.flatten_all().unwrap().to_vec1().unwrap();
+    let m_gpu_v: Vec<f32> = m_gpu
+        .flatten_all()
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    for (i, (c, g)) in m_cpu_v.iter().zip(m_gpu_v.iter()).enumerate() {
+        assert!(
+            ((*c - *g).abs() as f64) <= F32_TOL,
+            "m[{i}]: cpu {c} vs cuda {g}"
+        );
+    }
+    let v_cpu_v: Vec<f32> = v_cpu.flatten_all().unwrap().to_vec1().unwrap();
+    let v_gpu_v: Vec<f32> = v_gpu
+        .flatten_all()
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    for (i, (c, g)) in v_cpu_v.iter().zip(v_gpu_v.iter()).enumerate() {
+        assert!(
+            ((*c - *g).abs() as f64) <= F32_TOL,
+            "v[{i}]: cpu {c} vs cuda {g}"
+        );
+    }
+    (theta_cpu_v, m_cpu_v, v_cpu_v)
+}
+
+/// Production LoRA-A shape (`rank=16, in_features=1024`) — ModernBERT-large
+/// `Wqkv`/`Wo`/`Wi`'s shared LoRA-A shape.
+#[test]
+fn adamw_step_cpu_cuda_parity_lora_a_shape() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let (rows, cols) = (16usize, 1024usize);
+    let n = rows * cols;
+    let theta_v = fixture(n, 0.1);
+    let grad_v = fixture(n, 5.7);
+    assert_adamw_parity(
+        &cuda,
+        (rows, cols),
+        &theta_v,
+        &grad_v,
+        0.9,
+        0.999,
+        1e-3,
+        0.01,
+        1e-8,
+        1,
+    );
+}
+
+/// Production LoRA-B shape for `Wqkv` (`out_features=3072, rank=16`) —
+/// fused QKV projection.
+#[test]
+fn adamw_step_cpu_cuda_parity_lora_b_wqkv_shape() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let (rows, cols) = (3072usize, 16usize);
+    let n = rows * cols;
+    let theta_v = fixture(n, 1.3);
+    let grad_v = fixture(n, 8.1);
+    assert_adamw_parity(
+        &cuda,
+        (rows, cols),
+        &theta_v,
+        &grad_v,
+        0.9,
+        0.999,
+        1e-3,
+        0.01,
+        1e-8,
+        1,
+    );
+}
+
+/// Production LoRA-B shape for `Wo` (`out_features=1024, rank=16`).
+#[test]
+fn adamw_step_cpu_cuda_parity_lora_b_wo_shape() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let (rows, cols) = (1024usize, 16usize);
+    let n = rows * cols;
+    let theta_v = fixture(n, 2.2);
+    let grad_v = fixture(n, 6.4);
+    assert_adamw_parity(
+        &cuda,
+        (rows, cols),
+        &theta_v,
+        &grad_v,
+        0.9,
+        0.999,
+        1e-3,
+        0.01,
+        1e-8,
+        1,
+    );
+}
+
+/// Production LoRA-B shape for `Wi` (`out_features=5248, rank=16`) — the
+/// GeGLU-doubled FFN-up projection.
+#[test]
+fn adamw_step_cpu_cuda_parity_lora_b_wi_shape() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let (rows, cols) = (5248usize, 16usize);
+    let n = rows * cols;
+    let theta_v = fixture(n, 3.9);
+    let grad_v = fixture(n, 4.4);
+    assert_adamw_parity(
+        &cuda,
+        (rows, cols),
+        &theta_v,
+        &grad_v,
+        0.9,
+        0.999,
+        1e-3,
+        0.01,
+        1e-8,
+        1,
+    );
+}
+
+/// At least 3 consecutive steps with a changing `lr` and nonzero `weight_decay` —
+/// the bias-correction scalars (`scale_m`/`scale_v`) change with `t`, and
+/// each step's CPU-vs-CUDA parity is checked independently rather than just
+/// the final one, so a divergence that only shows up after several steps
+/// (e.g. an accumulating rounding gap) cannot hide behind a single-step
+/// check.
+#[test]
+fn adamw_step_three_consecutive_steps_cpu_cuda_parity_with_changing_lr() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let (rows, cols) = (16usize, 1024usize);
+    let n = rows * cols;
+    let mut theta_v = fixture(n, 0.4);
+    let lrs = [1e-3, 5e-4, 2e-3];
+    for (i, &lr) in lrs.iter().enumerate() {
+        let t = (i + 1) as i32;
+        let grad_v = fixture(n, 2.0 + i as f32);
+        let (theta_next, _m, _v) = assert_adamw_parity(
+            &cuda,
+            (rows, cols),
+            &theta_v,
+            &grad_v,
+            0.9,
+            0.999,
+            lr,
+            0.05,
+            1e-8,
+            t,
+        );
+        theta_v = theta_next;
+    }
+}
+
+/// `weight_decay == 0.0` — the decoupled-decay term must not corrupt the
+/// pure-Adam update path on either device.
+#[test]
+fn adamw_step_zero_weight_decay_cpu_cuda_parity() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let (rows, cols) = (16usize, 1024usize);
+    let n = rows * cols;
+    let theta_v = fixture(n, 0.9);
+    let grad_v = fixture(n, 7.3);
+    assert_adamw_parity(
+        &cuda,
+        (rows, cols),
+        &theta_v,
+        &grad_v,
+        0.9,
+        0.999,
+        1e-3,
+        0.0,
+        1e-8,
+        1,
+    );
+}
+
+/// Boundary/degenerate oracle (family D) on CUDA specifically: an empty
+/// tensor must not build the illegal `(0,1,1)` launch grid
+/// `LaunchConfig::for_num_elems(0)` would yield — `moment_update_cuda_fwd`/
+/// `theta_update_cuda_fwd` both return early before ever launching.
+#[test]
+fn adamw_step_empty_tensor_on_cuda_is_a_no_op_not_a_crash() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let theta = Tensor::from_slice(&[] as &[f32], (0,), &cuda).unwrap();
+    let m = Tensor::zeros((0,), DType::F32, &cuda).unwrap();
+    let v = Tensor::zeros((0,), DType::F32, &cuda).unwrap();
+    let g = Tensor::from_slice(&[] as &[f32], (0,), &cuda).unwrap();
+    adamw_step_fused(&theta, &m, &v, &g, 0.9, 0.999, 1.0, 1.0, 1e-3, 0.01, 1e-8).unwrap();
+    assert!(theta
+        .to_device(&Device::Cpu)
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap()
+        .is_empty());
 }

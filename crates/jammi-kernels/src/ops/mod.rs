@@ -46,9 +46,11 @@
 
 use candle_core::backend::BackendStorage;
 use candle_core::{
-    CpuStorage, CustomOp1, CustomOp2, CustomOp3, Error, Layout, Result, Shape, Tensor,
+    CpuStorage, CustomOp1, CustomOp2, CustomOp3, Error, InplaceOp2, InplaceOp3, Layout, Result,
+    Shape, Tensor,
 };
 
+mod adamw_step;
 // `pub(crate)`, not private like `axpy`/`layer_norm`/`rope`: `crate::cuda::attention_block`
 // imports `attention_dims`/`check_mask`/`check_rope_pack` directly from here
 // (the SAME domain checks the CPU arm applies), mirroring `ops::softmax`'s
@@ -73,6 +75,7 @@ pub(crate) mod rope;
 mod scaled_cast_add;
 pub(crate) mod softmax;
 
+pub use adamw_step::{adamw_step_fused, AdamMomentUpdate, AdamThetaUpdate};
 pub use attention_block::AttentionBlockFused;
 /// Test/introspection-only (P3 fix round 4, deliverable 3's "mechanism
 /// pin" — see `bwd_gradient_gemm_layouts`'s own doc): `#[doc(hidden)]`
@@ -177,6 +180,28 @@ pub fn apply3<T: KernelOp + CustomOp3>(
     op: T,
 ) -> Result<Tensor> {
     x.apply_op3(y, z, op)
+}
+
+/// The sanctioned way to run an in-place binary (`InplaceOp2`) fused op:
+/// mutates `x`'s storage directly (through candle's own
+/// `Arc<RwLock<Storage>>` write guard — see `adamw_step`'s module doc for
+/// why this, not `CustomOp2` + a follow-up `Var::set`, is the zero-memcpy
+/// path), reading `y`. Requires `T: KernelOp + InplaceOp2`, the same
+/// compile-time enforcement point as [`apply2`]/[`apply3`].
+pub fn apply_inplace2<T: KernelOp + InplaceOp2>(x: &Tensor, y: &Tensor, op: T) -> Result<()> {
+    x.inplace_op2(y, &op)
+}
+
+/// The sanctioned way to run an in-place ternary (`InplaceOp3`) fused op:
+/// mutates `x`'s storage directly, reading `y` and `z`. Requires
+/// `T: KernelOp + InplaceOp3`.
+pub fn apply_inplace3<T: KernelOp + InplaceOp3>(
+    x: &Tensor,
+    y: &Tensor,
+    z: &Tensor,
+    op: T,
+) -> Result<()> {
+    x.inplace_op3(y, z, &op)
 }
 
 /// The "output dtype must match `s1`, and equal `s2`" degenerate-input

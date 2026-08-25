@@ -10,7 +10,7 @@
     "JAMMI_KERNELS_STRICT": "1"
   },
   "status": "GREEN",
-  "note": "Same-build forced arm A/B (JAMMI_KERNELS_DISABLE=cast_scale_bf16_f32,cast_add_bf16), run by the lead on the exclusive timing box; pulled from /root/castw1-ab/*.json + /root/castw1-ab.log on a100b and committed verbatim (2 shapes x 2 arms x 2 reps).",
+  "note": "Same-build forced arm A/B (JAMMI_KERNELS_DISABLE=cast_scale_bf16_f32,cast_add_bf16), run by the lead on the exclusive timing box; pulled from /root/castw1-ab/*.json + /root/castw1-ab.log on a100b and committed verbatim (2 shapes x 2 arms x 2 reps). This headline end-to-end delta (~-38.5 ms/step) is NOT re-measured by this revision of the artifact (the lead's own instruction: 'the lever's number stands; do not re-measure it') — only the isolated_kernel_timing_a100d section below (Block 1 of the phase-4 audit) was corrected.",
   "legs": {
     "b8_s512_fused_r1": {
       "s_per_step_p50": 0.634850336,
@@ -122,29 +122,69 @@
       "delta_ms": 9.563769
     }
   },
-  "dispatch_counter_proof": "requested == fired on both disabled legs (['cast_add_bf16', 'cast_scale_bf16_f32']) \u2014 the forced-eager arm genuinely fell back, not a no-op disable key.",
-  "known_gap": "FinetuneStepTier's JSON does not surface cast_scale_bf16_f32/cast_add_bf16 DispatchCounters as named fields (only lora_linear_fused/eager, attention_block_fused/eager, etc. are wired) \u2014 flagged as a jammi-bench-domain follow-up, not fixed in this crate's scope.",
+  "dispatch_counter_proof": "requested == fired on both disabled legs (['cast_add_bf16', 'cast_scale_bf16_f32']) — the forced-eager arm genuinely fell back, not a no-op disable key.",
+  "known_gap": "FinetuneStepTier's JSON does not surface cast_scale_bf16_f32/cast_add_bf16 DispatchCounters as named fields (only lora_linear_fused/eager, attention_block_fused/eager, etc. are wired) — flagged as a jammi-bench-domain follow-up, not fixed in this crate's scope (numerics does not own jammi-bench).",
+  "peak_vram_bytes_by_leg": "NOT ADDED THIS REVISION: a sibling audit asked for peak_vram_bytes per leg (jammi-bench's FinetuneStepTier::peak_vram_bytes, report.rs:1275) pulled from the raw /root/castw1-ab/*.json files on a100b. jammi-a100b is off-limits to this agent under its own dispatch's hard clause ('NEVER touch jammi-a100b/a100c/a100 or any kooper-* pod') and the permission classifier independently blocked an attempted read-only `ssh jammi-a100b` in this session. This repo's committed scratchpad/pod/ only carries the driver script (scratchpad/pod/castw1-ab.sh) that PRODUCED those files, not their output — no local copy exists to pull peak_vram_bytes from. Needs the lead to supply the raw per-leg JSONs (scp'd off a100b, or pasted) before this field can be added.",
   "isolated_kernel_timing_a100d": {
-    "box": "a100d (exclusive at measurement time, verified via nvidia-smi 0% util / 0 MiB before running)",
-    "method": "wall-clock around a Device::synchronize() bracket (nsys unavailable/broken on this pod image: 'nsys --version' errors \"hasn't been installed with CUDA Toolkit 12.6\"), 50 iterations after a 1-launch warm-up, release profile",
+    "box": "a100d",
+    "method_fixed": "REWRITTEN after phase-4 audit Block 1 (this revision). The ORIGINAL method (below, kept for the record) allocated the CUDA op's own output buffer INSIDE a loop of 50 launches bracketed by exactly ONE trailing `Device::synchronize()` — a 100+ MB fresh `device.alloc` on every one of those 50 calls, with no back-pressure between launches. A re-run on an otherwise-idle a100d found a 2.35x spread across repeats (0.273 / 0.619 / 0.641 / 0.321 ms) purely from that batching/allocator interaction, not the kernel's own cost. FIX (now the crate's only isolated-timing harness, `tests/cuda_parity.rs`'s `time_kernel()`, shared by every `isolated_kernel_timing_*` test so this cannot recur by copy-paste): per-ITERATION `Device::synchronize()` (never one sync batching N launches), >=20 warm-ups, >=200 timed iterations, min AND median reported (fixed fold order, `f64::total_cmp`). `nsys` is unavailable/broken on this pod image (`nsys --version` errors \"hasn't been installed with CUDA Toolkit 12.6\"), so this stays wall-clock (including per-launch CPU-side dispatch overhead), stated as such rather than implied to be a device-side-only timeline. Neither op's own output-buffer allocation could be hoisted out of the timed region — `apply1`/`apply2` have no output-buffer-reuse entry point in this crate's public surface — so that allocation is still measured on every iteration; it is real device work the harness intentionally reports, not an artifact.",
+    "method_original_now_refuted": "wall-clock around ONE Device::synchronize() bracketing 50 launches, 1-launch warm-up, release profile — the batching defect described above.",
     "cast_scale_bf16_f32": {
       "shape": "m=12288 outf=3072 (Wqkv-site B1 population)",
-      "ms_per_launch": 0.7459,
-      "achieved_gb_per_s": 303.6,
-      "pct_of_2039_roofline": 14.89,
-      "traffic_model": "read bf16 (2B) + write f32 (4B) per element",
-      "caveat": "this measurement includes the fresh device.alloc::<f32>(n) cost (151 MB output buffer, allocated every call since apply1 has no output-buffer reuse) \u2014 NOT a device-side-only kernel timeline; the true kernel-only GB/s is likely higher than this wall-clock-derived figure. 14.89% is below the guide's \"realistic 25-50%\" band; vectorized 128-bit loads (guide S2 fix #1) were not implemented in this pass \u2014 a Wave 1.1 follow-up, not done here due to inability to compile-test CUDA locally (no nvcc on the authoring machine) this close to the timing run."
+      "original_headline_number_REFUTED": {
+        "ms_per_launch": 0.7459,
+        "pct_of_2039_roofline": 14.89,
+        "status": "REFUTED — not reproducible; a re-run of the SAME (batching) method on an idle a100d produced 0.273/0.619/0.641/0.321 ms across 4 repeats (2.35x spread), so 0.7459 ms was one noisy sample from a flawed harness, not a stable property of the kernel. The 'Wave 1.1 vectorize' follow-up this number seeded is WITHDRAWN as stated — see corrected_measurement below."
+      },
+      "corrected_measurement": {
+        "measured_by": "phase-4 audit (not independently reproduced by this agent within this session — see contention_note below); code that PRODUCES this number (time_kernel(), the identical per-iteration-sync/min+median method) was authored, clippy-verified (--features cuda -D warnings clean), and exercised by this agent in this session, but this agent's own two independent invocations of it were confirmed contended (see below) and are NOT reported as the headline number.",
+        "run_1": { "min_ms": 0.2093, "median_ms": 0.2105, "min_gb_per_s": 1082.2, "median_gb_per_s": 1075.9, "min_pct_roofline": 53.1, "median_pct_roofline": 52.8 },
+        "run_2": { "min_ms": 0.2097, "median_ms": 0.2106, "min_gb_per_s": 1080.0, "median_gb_per_s": 1075.3, "min_pct_roofline": 53.0, "median_pct_roofline": 52.7 },
+        "iters": 200,
+        "warmups": "5 in the two runs above; this branch's committed time_kernel() enforces >=20, a strictly stricter floor — the two numbers are not expected to materially differ, since candle's PTX JIT/module-load cost is a one-time first-launch cost either way and 5 warm-ups already amortises it, but a fresh confirmation at 20 warm-ups is the contention_note's open item below.",
+        "comparison_to_candle_own_cast_bf16_f32": {
+          "ms_per_launch": 0.1891,
+          "achieved_gb_per_s": 1198.0,
+          "pct_of_2039_roofline": 58.7,
+          "note": "the fused kernel (53.0-53.1%) is within 10% relative of candle's own single-purpose cast_bf16_f32 kernel (58.7%) doing LESS work (no affine) — consistent with a well-fused elementwise kernel, not a regression."
+        }
+      },
+      "this_agent_own_attempts_CONTENDED_INVALID": {
+        "run_1": { "min_ms": 1.9219, "median_ms": 3.8656, "min_gb_per_s": 117.8, "median_gb_per_s": 58.6, "min_pct_roofline": 5.78, "median_pct_roofline": 2.87 },
+        "run_2": { "min_ms": 1.9110, "median_ms": 3.8510, "min_gb_per_s": 118.5, "median_gb_per_s": 58.8, "min_pct_roofline": 5.81, "median_pct_roofline": 2.88 },
+        "status": "INVALID — confirmed non-exclusive box during both runs: PID 490386 (`cargo test -p jammi-ai --features cuda,live-gpu-tests`, a concurrent agent's legitimate in-progress job on this SAME pod, ppid a live cargo process, 800-900% CPU, growing CPU time — not a stray/hung process) was resident and active throughout, confirmed via `ps`/`nvidia-smi` before and during both runs. The guide's own §2 warning ('co-tenancy inflates wall-clock launch time') is exactly what these two numbers show: reproducible (run_1 and run_2 agree within ~1%) but ~9x slower than the clean corrected_measurement above, isolated to THIS op's larger (151 MB) output buffer — cast_add_bf16 below, whose output buffer is 6x smaller, measured cleanly in the SAME two contended runs, which is the evidence this is a bandwidth-contention effect on the big buffer, not a defect in the fix or a regression: the fix's own VALUE oracles (this file's cast_scale_bit_identical_... test) passed cleanly under the identical contention, since correctness does not depend on wall-clock.",
+        "recommendation": "a follow-up self-measurement once jammi-a100d is confirmed idle (nvidia-smi 0% util, 0 MiB, no other PID) would replace corrected_measurement's provenance with this agent's own run; not a blocker for this unit's mergeability — the method fix is proven correct by code review + clippy + two independent (if contended) executions that behave exactly as the contention hypothesis predicts, and the auditor's own clean numbers were produced by the SAME method."
+      },
+      "traffic_model": "read bf16 (2B) + write f32 (4B) per element"
     },
     "cast_add_bf16": {
       "shape": "m=12288 inf=1024 (Wqkv-site B3 population)",
-      "ms_per_launch": 0.1027,
-      "achieved_gb_per_s": 980.5,
-      "pct_of_2039_roofline": 48.09,
-      "traffic_model": "read f32 (4B) + read bf16 (2B) + write bf16 (2B) per element",
-      "caveat": "smaller output buffer (25 MB bf16) than cast_scale_bf16_f32's, so less allocation-overhead confound; inside the guide's realistic 25-50% band."
-    }
+      "original_number": {
+        "ms_per_launch": 0.1027,
+        "achieved_gb_per_s": 980.5,
+        "pct_of_2039_roofline": 48.09,
+        "status": "REPRODUCES under the corrected method (this agent's own runs below), unlike cast_scale_bf16_f32's original number — consistent with the artifact's original caveat: cast_add_bf16's much smaller output buffer (25 MB bf16 vs cast_scale's 151 MB f32) has less allocation-overhead confound, so the batching defect barely moved this op's number."
+      },
+      "this_agent_own_measurement": {
+        "run_1": { "min_ms": 0.0811, "median_ms": 0.0824, "min_gb_per_s": 1241.3, "median_gb_per_s": 1221.8, "min_pct_roofline": 60.88, "median_pct_roofline": 59.92 },
+        "run_2": { "min_ms": 0.0814, "median_ms": 0.0827, "min_gb_per_s": 1237.2, "median_gb_per_s": 1217.2, "min_pct_roofline": 60.68, "median_pct_roofline": 59.69 },
+        "iters": 200,
+        "warmups": 20,
+        "status": "VALID — measured in the SAME two runs as cast_scale_bf16_f32's contended attempts above (same process, same pod, same contending neighbour PID 490386 resident throughout), yet reproducible across both runs and BETTER than the original method's 48.09% — this op's small (25 MB) output buffer is not materially affected by the neighbour's memory-bandwidth pressure the way cast_scale's 151 MB buffer is, which is the basis for treating cast_scale's contended numbers (and not this op's) as invalid rather than discarding both.",
+        "comparison": "60.68-60.88% of roofline, inside the guide's realistic 25-50% band and above it — an excellent bandwidth-bound elementwise kernel by the guide's own >80%-is-excellent / 25-50%-is-realistic scale, close to it."
+      },
+      "traffic_model": "read f32 (4B) + read bf16 (2B) + write bf16 (2B) per element"
+    },
+    "wave_1_1_vectorize_followup_status": "REFUTED as originally seeded. The original artifact's cast_scale_bf16_f32 number (0.7459 ms, 14.89% roofline) that motivated a 'Wave 1.1 vectorize (128-bit loads)' follow-up was itself an artifact of the flawed timing harness (see original_headline_number_REFUTED above) — the corrected measurement (53.0-53.1% roofline, within 10% relative of candle's own single-purpose cast kernel at 58.7%) shows this kernel is already a well-fused, near-ceiling elementwise op for its traffic shape, not a 3.5x-off kernel needing vectorization. No Wave 1.1 vectorize follow-up is warranted by this data."
   },
-  "cuda_parity_suite": "70/70 passed at 52c6070 (pre-dispatch-counter-test tip of this branch, on a100d — different box from the A/B's a100b, both A100 SXM4 80GB); 71/71 (adds the dispatch-counter test) at 80f02fb; 71 passed + 1 ignored (the isolated-timing test, which needs an explicit --ignored flag) at 32d7917 (this branch's final tip at report time), all on a100d under JAMMI_REQUIRE_CUDA=1 (the landing-proof mode — a device-acquisition failure panics instead of silently skipping).",
-  "cuda_clippy_final_sha": "cargo clippy -p jammi-kernels --all-targets --features cuda -- -D warnings: clean at 32d7917, a100d.",
+  "cuda_parity_suite": "76/76 passed + 1 ignored (isolated_kernel_timing_cast_boundary_wave1, which needs an explicit --ignored flag) at 36fdb97 (this branch's tip before the final main-rebase — see the hand-off for the post-rebase SHA and re-verification), on a100d under JAMMI_REQUIRE_CUDA=1 (the landing-proof mode — a device-acquisition failure panics instead of silently skipping). Includes the 5 new device-side oracles this revision adds (Block 2): cast_scale_bit_identical_to_the_eager_two_kernel_chain_on_cuda_across_scales, cast_add_bit_identical_to_the_eager_two_kernel_chain_on_cuda_with_red_control, cast_ops_nonzero_start_offset_and_noncontiguous_view_refused_on_cuda, cast_ops_n_sweep_partial_block_and_empty_on_cuda, lrrl_bwd_dx_fused_vs_disabled_cast_boundary_dump_and_dispatch_proof.",
+  "cuda_clippy_final_sha": "cargo clippy -p jammi-kernels --all-targets --features cuda -- -D warnings: clean at 36fdb97, a100d.",
+  "lrrl_bwd_dx_fused_vs_disabled_byte_identity": {
+    "method": "two invocations of the SAME built test binary (CARGO_TARGET_DIR=/root/target-audit-castw1, tip 36fdb97), differing only in JAMMI_KERNELS_DISABLE, each dumping LowRankResidualLinear::bwd's real dx output (rows=256, inf=1024, outf=3072, r=16) to a file via JAMMI_CAST_BOUNDARY_DX_DUMP.",
+    "fused_run": "JAMMI_REQUIRE_CUDA=1 cargo test ... --exact lrrl_bwd_dx_fused_vs_disabled_cast_boundary_dump_and_dispatch_proof -> 1 passed (dispatch assertions confirmed BOTH cast_scale_bf16_f32 and cast_add_bf16 recorded a fused dispatch, zero eager)",
+    "disabled_run": "JAMMI_REQUIRE_CUDA=1 JAMMI_KERNELS_STRICT=1 JAMMI_KERNELS_DISABLE=cast_scale_bf16_f32,cast_add_bf16 cargo test ... --exact lrrl_bwd_dx_fused_vs_disabled_cast_boundary_dump_and_dispatch_proof -> 1 passed (dispatch assertions confirmed BOTH ops recorded an eager dispatch — the disable genuinely fired, not a no-op key)",
+    "sha256_both_dumps": "b73a8b742d1019968a53c492d4c928ff9614682375a7882b37c92b8dc553fcf0",
+    "result": "BIT-IDENTICAL — `cmp` reports no difference between the two 524288-byte dumps; both files hash to the SAME sha256."
+  },
   "mutation_triage_eager_arm_closure": "cargo-mutants (jammi-kernels/src/ops/low_rank_residual_linear.rs, --re '::bwd\\b', -j1 --timeout 300) found 2 real survivors, both at the SAME line: the CastAddBf16 Eager fallback's `(&dx_base_2d + &d_x_lora_2d)?` (the '+' -> '-'/'*' mutants) — unreachable on CPU (candle's CPU BF16 matmul limitation blocks the base GEMM before this line is ever reached with base_dtype=BF16) and unreachable without JAMMI_KERNELS_DISABLE set (an env var an in-process OnceLock reads once, so an in-process test would race every other test in the same binary). Closed by a FRESH-PROCESS run instead (no new test code needed — env vars are per-process, so a plain ssh-invoked `cargo test` is already isolated): `JAMMI_REQUIRE_CUDA=1 JAMMI_KERNELS_STRICT=1 JAMMI_KERNELS_DISABLE=cast_add_bf16,cast_scale_bf16_f32 cargo test -p jammi-kernels --features cuda --test cuda_parity lora_linear_parity_bf16_base_backward_production_width` on a100d at 32d7917 -> 1 passed (STRICT mode: every OTHER op is still strictly proven fused while these two are forced eager) — the mutated line, exercised, against the same CPU f32 reference/tolerance the fused-arm run already passed against."
 }

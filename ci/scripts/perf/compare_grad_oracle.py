@@ -636,19 +636,36 @@ def _same_producer_violation(report_a, report_b, allow_same_producer: bool):
     INDEPENDENT producers; a dump compared against itself (`compare
     a.json a.json`, or two runs of the SAME stack passed as if they were the
     cross-framework pair) proves nothing about jammi-vs-torch agreement,
-    even if every other check above passes. `tool_a is None` never trips
-    this (an omitted `tool` is not itself evidence of same-producer-ness;
-    `RUN_IDENTITY_FIELDS`'s own presence check would already flag a report
-    missing expected fields via other means if that ever mattered here).
-    Real producers set DIFFERENT literal `tool` values by construction
-    (`"jammi_grad_oracle"` vs `"torch_grad_oracle"`), so this never fires on
-    a genuine cross-framework comparison.
+    even if every other check above passes.
+
+    round-4 audit fold-in on PR #372: `tool` MISSING (or `None`/null) on
+    EITHER side is ALSO refused here, never allowed to fall through — an
+    earlier draft of this docstring claimed "`tool_a is None` never trips
+    this... RUN_IDENTITY_FIELDS's own presence check would already flag a
+    report missing expected fields" — that claim was FALSE: `tool` is
+    deliberately NOT a member of `RUN_IDENTITY_FIELDS` (see that tuple's own
+    doc — it is compared for SAME-vs-DIFFERENT, never equality), so nothing
+    else in this module ever checked its presence at all. `compare a.json
+    a.json` on a dump with no `"tool"` key used to sail through this
+    function unrefused (only the equality branch below ever fired, and
+    `None == None` -- two absent-`tool` reports -- never satisfied
+    `tool_a is not None`). Real producers set DIFFERENT, always-PRESENT
+    literal `tool` values by construction (`"jammi_grad_oracle"` vs
+    `"torch_grad_oracle"`), so neither branch below ever fires on a genuine
+    cross-framework comparison.
     """
     if allow_same_producer:
         return None
     tool_a = report_a.get("tool")
     tool_b = report_b.get("tool")
-    if tool_a is not None and tool_a == tool_b:
+    if tool_a is None or tool_b is None:
+        missing = [s for s, t in (("A", tool_a), ("B", tool_b)) if t is None]
+        return (
+            f"report(s) {missing} have no (or a null) 'tool' field -- this comparator cannot "
+            "verify the two dumps came from two INDEPENDENT producers without knowing what "
+            "produced each one; both real producers always emit this field"
+        )
+    if tool_a == tool_b:
         return (
             f"both dumps report the same tool {tool_a!r} -- this comparator's entire purpose is "
             "comparing two INDEPENDENT producers (see this module's own doc); comparing a "
@@ -699,14 +716,23 @@ def _premise_violations(report_a, report_b, allow_same_producer: bool = False):
             )
 
     for field in RUN_IDENTITY_FIELDS:
-        present_a = field in report_a
-        present_b = field in report_b
+        # round-4 audit fold-in on PR #372: PRESENT-BUT-null on BOTH sides
+        # must ALSO be a violation, not just genuinely-absent — `field in
+        # report` alone treats `{"lora_alpha": null}` as "present", and
+        # `None == None` then silently passes the equality check below. This
+        # is REACHABLE, not hypothetical: `serde_json` serializes a NaN/inf
+        # `f64` as JSON `null` (JSON itself has no NaN/Infinity token), so a
+        # NaN `lora_alpha` on jammi's side would emit exactly this shape.
+        # `is not None` folds this into the SAME presence branch as a
+        # genuinely-missing key, rather than a second, easy-to-forget check.
+        present_a = field in report_a and report_a[field] is not None
+        present_b = field in report_b and report_b[field] is not None
         if not present_a or not present_b:
             missing_sides = [s for s, present in (("A", present_a), ("B", present_b)) if not present]
             violations.append(
-                f"run-identity field {field!r} missing from dump(s) {missing_sides} -- a field "
-                "absent on BOTH sides must not silently compare None == None and pass; cannot "
-                "verify this premise determinant"
+                f"run-identity field {field!r} missing or null in dump(s) {missing_sides} -- a "
+                "field absent (or present-but-null) on BOTH sides must not silently compare "
+                "None == None and pass; cannot verify this premise determinant"
             )
             continue
         # Class-level fix (round 2): EVERY field is routed through
@@ -855,10 +881,21 @@ def compare_reports(report_a, report_b, cosine_floor, allow_same_producer: bool 
     # the report, read by nothing) so a caller can eyeball whether it is
     # "small rounding noise" or "wildly different", the same qualitative
     # read the cosine floor's own derivation relies on.
+    # Advisory, round-4 audit fold-in on PR #372: AFFIRMATIVE NaN/+-inf
+    # handling (790eb4b) here too -- `max(abs(loss_a), abs(loss_b), ...)` is
+    # the SAME unreliable-with-NaN reduction `_weight_max_violation`'s own
+    # doc already warns about (a NaN could silently sail through `max()`
+    # instead of propagating). This field is informational only (never
+    # gates `passed`), so the fix is just making a nonfinite loss report
+    # HONESTLY as `nan`/`None`, never a value that happens to fall out of an
+    # unreliable comparison.
     loss_relative_diff = None
     if loss_a is not None and loss_b is not None:
-        denom = max(abs(loss_a), abs(loss_b), NORM_FLOOR)
-        loss_relative_diff = abs(loss_a - loss_b) / denom
+        if not (math.isfinite(loss_a) and math.isfinite(loss_b)):
+            loss_relative_diff = float("nan")
+        else:
+            denom = max(abs(loss_a), abs(loss_b), NORM_FLOOR)
+            loss_relative_diff = abs(loss_a - loss_b) / denom
 
     return {
         "loss_a": loss_a,

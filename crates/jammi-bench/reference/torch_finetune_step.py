@@ -170,10 +170,10 @@ high-water mark that cannot miss an intra-step spike the way a discrete poll
 can.
 
 jammi's `peak_vram_bytes` is a whole-device `nvidia-smi` poll
-(`device_memory_used_bytes`, finetune_step.rs:61), sampled every 25ms
-(`std::thread::sleep`, finetune_step.rs:96) over the ENTIRE warmup+measured
-loop, then reduced via `peak.saturating_sub(baseline)`, finetune_step.rs:112
-against a baseline snapshot (`vram_baseline`, finetune_step.rs:358) taken
+(`device_memory_used_bytes`, finetune_step.rs:63), sampled every 25ms
+(`std::thread::sleep`, finetune_step.rs:98) over the ENTIRE warmup+measured
+loop, then reduced via `peak.saturating_sub(baseline)`, finetune_step.rs:114
+against a baseline snapshot (`vram_baseline`, finetune_step.rs:370) taken
 once right after the model+optimizer are built (before the loop starts) — at
 which point candle's `AdamW::new` has
 ALREADY allocated the (zero-initialized) first/second moment tensors, since
@@ -284,6 +284,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime
+import hashlib
 import json
 import math
 import os
@@ -505,6 +506,51 @@ def build_dry_run_checkpoint(tmp_dir: str) -> str:
     model = ModernBertModel(config)
     model.save_pretrained(tmp_dir)
     return tmp_dir
+
+
+_HASH_CHUNK_BYTES = 65536  # 64 KiB -- same chunk size grad_oracle.rs's / this
+# file's own `sha256_and_len` (Rust) reuses; matching sizes is not required
+# for correctness (the digest is identical regardless of chunk size), only
+# picked here to keep the two implementations' own doc comments comparable.
+
+
+def checkpoint_identity(model_dir: str) -> dict:
+    """The base checkpoint's CONTENT identity -- sha256 (hex) of
+    `model_dir/config.json` and `model_dir/model.safetensors`'s raw bytes,
+    plus the weights file's byte length -- computed IDENTICALLY on both
+    stacks (`finetune_step.rs`'s/`grad_oracle.rs`'s shared `sha256_and_len`,
+    this function's Rust counterpart). Round-4 audit fold-in on PR #372:
+    lives HERE (torch_finetune_step.py, the file both torch_grad_oracle.py
+    and this file's own `run()` share machinery through) rather than as a
+    second, independently-drifting copy in torch_grad_oracle.py — that
+    script's own `checkpoint_identity` name is now a thin alias for this
+    function (see its own module doc).
+
+    STREAMING (a bounded-size chunk buffer, never `fh.read()` of the whole
+    file): a real checkpoint's `model.safetensors` can be several GB
+    (ModernBERT-large-class) -- reading it whole into memory just to hash it
+    would roughly double this tier's own peak RSS for no reason.
+    """
+
+    def _sha256_and_len(path: str) -> tuple[str, int]:
+        hasher = hashlib.sha256()
+        total_len = 0
+        with open(path, "rb") as fh:
+            while True:
+                chunk = fh.read(_HASH_CHUNK_BYTES)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+                total_len += len(chunk)
+        return hasher.hexdigest(), total_len
+
+    config_sha256, _config_len = _sha256_and_len(os.path.join(model_dir, "config.json"))
+    weights_sha256, weights_len = _sha256_and_len(os.path.join(model_dir, "model.safetensors"))
+    return {
+        "checkpoint_config_sha256": config_sha256,
+        "checkpoint_weights_sha256": weights_sha256,
+        "checkpoint_weights_size_bytes": weights_len,
+    }
 
 
 def load_config_reference_compile_off(model_dir):
@@ -870,6 +916,14 @@ def run(args):
         model, config = load_model(args)
         resolved_attn_implementation = getattr(model.config, "_attn_implementation", "absent")
         reference_compile_resolved = getattr(model.config, "reference_compile", "absent")
+        # Base-checkpoint CONTENT identity, computed BEFORE the LoRA wrap off
+        # the exact bytes `load_model` just read -- `args.model_dir` is valid
+        # here whether this run is a real `--model-dir` or a `--dry-run`
+        # donor checkpoint (the `TemporaryDirectory` context is still open
+        # for the rest of this function's body). Round-4 audit fold-in on
+        # PR #372: the SAME determinant `grad_oracle.rs`'s tier already
+        # carries, now on THIS tier too.
+        checkpoint_identity_fields = checkpoint_identity(args.model_dir)
 
         model = wrap_lora(model, args)
         lora_a_tensors_reinitialized = None
@@ -990,6 +1044,10 @@ def run(args):
             "finetune_step": {
                 "device": str(device),
                 "backbone_dtype": args.dtype,
+                # Same placement as jammi's own FinetuneStepTier (round-4
+                # audit fold-in on PR #372) -- IDENTITY, see checkpoint_identity's
+                # own doc.
+                **checkpoint_identity_fields,
                 "attn_implementation": resolved_attn_implementation,
                 "sdpa_backend_probe": sdpa_backend_probe_result,
                 "reference_compile_resolved": reference_compile_resolved,

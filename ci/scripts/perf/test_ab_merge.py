@@ -58,10 +58,20 @@ def jammi_fs(dispatches, **overrides):
         # `torch_fs`'s own doc for why torch's lives one level up).
         "seed": 42,
         "backbone_dtype": "bf16",
+        # round-4 audit fold-in: checkpoint content identity, lora_alpha,
+        # and margin — all new `FinetuneStepTier` fields this round. Same
+        # literal defaults as `torch_fs` below so a matching-premise pair
+        # (the overwhelming default use of both fixtures) stays matching
+        # without every existing call site having to override them.
+        "checkpoint_config_sha256": "a" * 64,
+        "checkpoint_weights_sha256": "b" * 64,
+        "checkpoint_weights_size_bytes": 1024,
         "batch": 8,
         "seq": 128,
         "lora_rank": 16,
+        "lora_alpha": 32.0,
         "lora_dropout": 0.0,
+        "margin": 0.3,
         "target_modules": ["Wqkv", "Wo", "Wi"],
         "batched_forward": True,
         "trainable_tensors": 4,
@@ -104,22 +114,28 @@ def drop_dispatch_keys(*bases):
     return overrides
 
 
-def torch_fs(seed=42, attn_requested="sdpa", **overrides):
+def torch_fs(seed=42, attn_requested="sdpa", lora_alpha=32.0, margin=0.3, **overrides):
     """Builds the FULL top-level `torch_finetune_step.py` report shape, not
-    just the `finetune_step` sub-block: `seed`/`attn_requested` live under
-    `report["args"]` on the REAL torch producer (`torch_finetune_step.py`'s
-    own report literal), never inside `report["finetune_step"]` — the leg-
-    premise check reads jammi's `seed` off `finetune_step.rs`'s own
-    `FinetuneStepTier` (one level down, see `jammi_fs`'s doc) and torch's
-    off `args.seed` (one level UP) precisely because the two real producers
-    do not put it in the same place; this fixture mirrors that asymmetry
-    rather than flattening it away, matching the REAL producer's own shape.
-    `**overrides` still lands in the `finetune_step` sub-block (e.g.
-    `attn_implementation="eager"`), unchanged from before this round.
+    just the `finetune_step` sub-block: `seed`/`attn_requested`/`lora_alpha`/
+    `margin` live under `report["args"]` on the REAL torch producer
+    (`torch_finetune_step.py`'s own report literal), never inside
+    `report["finetune_step"]` — the leg-premise check reads jammi's copies
+    off `finetune_step.rs`'s own `FinetuneStepTier` (one level down, see
+    `jammi_fs`'s doc) and torch's off `args.*` (one level UP) precisely
+    because the two real producers do not put them in the same place; this
+    fixture mirrors that asymmetry rather than flattening it away, matching
+    the REAL producer's own shape. `**overrides` still lands in the
+    `finetune_step` sub-block (e.g. `attn_implementation="eager"`),
+    unchanged from before this round.
     """
     fs = {
         "device": "cpu",
         "backbone_dtype": "bf16",
+        # Same literal defaults as `jammi_fs` above -- see that fixture's
+        # own comment for why.
+        "checkpoint_config_sha256": "a" * 64,
+        "checkpoint_weights_sha256": "b" * 64,
+        "checkpoint_weights_size_bytes": 1024,
         "attn_implementation": "sdpa",
         "batch": 8,
         "seq": 128,
@@ -145,7 +161,7 @@ def torch_fs(seed=42, attn_requested="sdpa", **overrides):
     fs.update(overrides)
     return {
         "tool": "torch_finetune_step",
-        "args": {"seed": seed, "attn_requested": attn_requested},
+        "args": {"seed": seed, "attn_requested": attn_requested, "lora_alpha": lora_alpha, "margin": margin},
         "finetune_step": fs,
     }
 
@@ -635,6 +651,99 @@ class LegPremiseCheckTests(unittest.TestCase):
         cfg = merged["configs"]["b8-s128-fail"]
         self.assertIsNone(cfg["leg_premise_violations"])
         self.assertIsNone(cfg["leg_premise_checked_legs"])
+
+    def test_steps_measured_mismatch_between_legs_is_invalid(self):
+        """ROUND-4 AUDIT REPRODUCTION: two legs measured at a DIFFERENT step
+        count (e.g. `--steps 20` vs `--steps 5`, a mismatched per-leg
+        override) used to still merge to a "clean" ratio and PASS verdict --
+        `steps_measured` is recorded on BOTH sides already but was never
+        compared.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_leg(raw_dir, "b8-s128-d0", "jammi-eager", report=jammi_fs({}))
+            write_leg(
+                raw_dir, "b8-s128-d0", "jammi-fused",
+                report=jammi_fs(_CLEAN_YES_DISPATCHES, steps_measured=20),
+            )
+            write_leg(raw_dir, "b8-s128-d0", "torch-eager", report=torch_fs(attn_implementation="eager"))
+            write_leg(raw_dir, "b8-s128-d0", "torch-sdpa", report=torch_fs(steps_measured=5))
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertTrue(any("steps_measured" in v for v in cfg["leg_premise_violations"]))
+        self.assertTrue(cfg["verdict"].startswith("INVALID"))
+        self.assertEqual(rc, 1)
+
+    def test_lora_alpha_mismatch_between_legs_is_invalid(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_leg(raw_dir, "b8-s128-d0", "jammi-eager", report=jammi_fs({}))
+            write_leg(
+                raw_dir, "b8-s128-d0", "jammi-fused",
+                report=jammi_fs(_CLEAN_YES_DISPATCHES, lora_alpha=32.0),
+            )
+            write_leg(raw_dir, "b8-s128-d0", "torch-eager", report=torch_fs(attn_implementation="eager"))
+            write_leg(raw_dir, "b8-s128-d0", "torch-sdpa", report=torch_fs(lora_alpha=16.0))
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertTrue(any("lora_alpha" in v for v in cfg["leg_premise_violations"]))
+        self.assertTrue(cfg["verdict"].startswith("INVALID"))
+
+    def test_margin_mismatch_between_legs_is_invalid(self):
+        """jammi hardcodes `margin=0.3` (no CLI flag) -- an operator running
+        the torch leg with `--margin` overridden away from the matching
+        default is exactly the case this field exists to catch: the two
+        legs would then be minimizing a DIFFERENT loss.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_leg(raw_dir, "b8-s128-d0", "jammi-eager", report=jammi_fs({}))
+            write_leg(raw_dir, "b8-s128-d0", "jammi-fused", report=jammi_fs(_CLEAN_YES_DISPATCHES))
+            write_leg(raw_dir, "b8-s128-d0", "torch-eager", report=torch_fs(attn_implementation="eager"))
+            write_leg(raw_dir, "b8-s128-d0", "torch-sdpa", report=torch_fs(margin=0.5))
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertTrue(any("margin" in v for v in cfg["leg_premise_violations"]))
+        self.assertTrue(cfg["verdict"].startswith("INVALID"))
+
+    def test_checkpoint_weights_sha256_mismatch_between_legs_is_invalid(self):
+        """Two legs pointed at DIFFERENT `--model-dir` checkpoints -- the
+        same base-checkpoint content-identity check `grad_oracle.rs`'s
+        determinant table already covers, now on this tier too.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_leg(raw_dir, "b8-s128-d0", "jammi-eager", report=jammi_fs({}))
+            write_leg(
+                raw_dir, "b8-s128-d0", "jammi-fused",
+                report=jammi_fs(_CLEAN_YES_DISPATCHES, checkpoint_weights_sha256="b" * 64),
+            )
+            write_leg(raw_dir, "b8-s128-d0", "torch-eager", report=torch_fs(attn_implementation="eager"))
+            write_leg(raw_dir, "b8-s128-d0", "torch-sdpa", report=torch_fs(checkpoint_weights_sha256="c" * 64))
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertTrue(any("checkpoint_weights_sha256" in v for v in cfg["leg_premise_violations"]))
+        self.assertTrue(cfg["verdict"].startswith("INVALID"))
+
+    def test_identity_field_present_but_null_on_both_legs_is_invalid(self):
+        """ROUND-4 AUDIT REPRODUCTION: present-but-`null` (`None` in the
+        fixture dict, matching a JSON `null` — e.g. `serde_json` serializing
+        a NaN `lora_alpha`) on BOTH legs used to compare `None == None` and
+        silently PASS, the same class `compare_grad_oracle.py`'s own fix
+        this round closes on the grad-oracle side. `jammi_fs`'s existing
+        `None`-deletes-the-key convention cannot express "present but
+        null" (it removes the key entirely, testing ABSENCE, not nullness)
+        -- this test sets the finetune_step sub-block key directly instead.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_leg(raw_dir, "b8-s128-d0", "jammi-eager", report=jammi_fs({}))
+            jammi_report = jammi_fs(_CLEAN_YES_DISPATCHES)
+            jammi_report["tiers"]["finetune_step"]["lora_alpha"] = None
+            write_leg(raw_dir, "b8-s128-d0", "jammi-fused", report=jammi_report)
+            write_leg(raw_dir, "b8-s128-d0", "torch-eager", report=torch_fs(attn_implementation="eager"))
+            torch_report = torch_fs()
+            torch_report["args"]["lora_alpha"] = None
+            write_leg(raw_dir, "b8-s128-d0", "torch-sdpa", report=torch_report)
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertTrue(any("lora_alpha" in v for v in cfg["leg_premise_violations"]))
+        self.assertTrue(cfg["verdict"].startswith("INVALID"))
 
 
 class LoraInitProvenanceTests(unittest.TestCase):

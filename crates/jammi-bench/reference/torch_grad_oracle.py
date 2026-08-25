@@ -127,9 +127,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import hashlib
 import json
-import os
 import re
 import sys
 import tempfile
@@ -258,27 +256,18 @@ def translate_dtype_flag_to_jammi_spelling(dtype_flag: str) -> str:
         ) from None
 
 
-def checkpoint_identity(model_dir: str) -> dict:
-    """The base checkpoint's CONTENT identity -- sha256 (hex) of
-    `model_dir/config.json` and `model_dir/model.safetensors`'s raw bytes,
-    plus the weights file's byte length -- computed IDENTICALLY on both
-    stacks (`grad_oracle.rs`'s own `sha256_and_len`, this function's Rust
-    counterpart). Replaces `model_dir` (a path string, not comparable across
-    two boxes/producers) as this comparator's actual IDENTITY determinant
-    for "the two dumps loaded the byte-identical checkpoint" -- see
-    `grad_oracle.rs`'s module doc's determinant table.
-    """
-    config_path = os.path.join(model_dir, "config.json")
-    weights_path = os.path.join(model_dir, "model.safetensors")
-    with open(config_path, "rb") as fh:
-        config_bytes = fh.read()
-    with open(weights_path, "rb") as fh:
-        weights_bytes = fh.read()
-    return {
-        "checkpoint_config_sha256": hashlib.sha256(config_bytes).hexdigest(),
-        "checkpoint_weights_sha256": hashlib.sha256(weights_bytes).hexdigest(),
-        "checkpoint_weights_size_bytes": len(weights_bytes),
-    }
+# round-4 audit fold-in on PR #372: THIS module's own `checkpoint_identity`
+# used to be a second, independently-drifting copy (and non-streaming,
+# `fh.read()` of the whole file) — `torch_finetune_step.py` is the file both
+# this module and `torch_finetune_step.py`'s own `run()` now share the
+# STREAMING implementation through (mirrors this module's own doc's
+# "Reuse EVERY piece of machinery torch_finetune_step.py already has
+# working" convention for `synthetic_ids`/`triplet_loss`/etc — never
+# reimplemented here). A bare module-level alias, not a wrapper function,
+# so `tgo.checkpoint_identity` (every existing call site, including
+# `test_torch_grad_oracle_names.py::CheckpointIdentityTests`) keeps working
+# unchanged.
+checkpoint_identity = tfs.checkpoint_identity
 
 
 def load_lora_weights_into_model(model, path: str) -> int:

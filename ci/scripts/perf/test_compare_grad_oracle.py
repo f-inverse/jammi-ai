@@ -434,6 +434,38 @@ class PremiseAndWeightChecks(unittest.TestCase):
             self.assertFalse(result["passed"], f"{field!r} missing from ONE dump must refuse")
             self.assertTrue(any(field in v for v in result["premise_violations"]))
 
+    def test_run_identity_field_present_but_null_on_both_sides_fails(self):
+        """ROUND-4 AUDIT REPRODUCTION: `field in report` alone treats
+        `{"lora_alpha": null}` as PRESENT -- the equality check then compares
+        `None == None` and silently PASSES, exactly as the both-MISSING case
+        used to before this round's earlier fix (the same class, one
+        presence check deep). REACHABLE: `serde_json` serializes a NaN/inf
+        `f64` as JSON `null` (JSON has no NaN/Infinity token), so a NaN
+        `lora_alpha` on jammi's side emits precisely this shape -- not a
+        contrived fixture.
+        """
+        for field in cgo.RUN_IDENTITY_FIELDS:
+            report_a = make_report(0.3, {"t": [1.0, 2.0]}, **{field: None})
+            report_b = make_report(0.3, {"t": [1.0, 2.0]}, **{field: None})
+            result = cgo.compare_reports(report_a, report_b, cosine_floor=0.9)
+            self.assertFalse(
+                result["passed"],
+                f"{field!r} present-but-null on BOTH dumps must not silently compare "
+                "None == None and pass",
+            )
+            self.assertTrue(
+                any(field in v for v in result["premise_violations"]),
+                f"expected a premise_violations entry naming {field!r}, got {result['premise_violations']!r}",
+            )
+
+    def test_run_identity_field_null_on_one_side_fails(self):
+        for field in cgo.RUN_IDENTITY_FIELDS:
+            report_a = make_report(0.3, {"t": [1.0, 2.0]}, **{field: None})
+            report_b = make_report(0.3, {"t": [1.0, 2.0]})
+            result = cgo.compare_reports(report_a, report_b, cosine_floor=0.9)
+            self.assertFalse(result["passed"], f"{field!r} null on ONE dump must refuse")
+            self.assertTrue(any(field in v for v in result["premise_violations"]))
+
     def test_batch_token_id_sums_mismatch_fails(self):
         report_a = make_report(0.3, {"t": [1.0, 2.0]}, batch_token_id_sums=[1, 2, 3])
         report_b = make_report(0.3, {"t": [1.0, 2.0]}, batch_token_id_sums=[1, 2, 4])
@@ -462,6 +494,20 @@ class PremiseAndWeightChecks(unittest.TestCase):
         self.assertTrue(result["passed"])
         self.assertEqual(result["weight_mismatches"], [])
         self.assertEqual(result["premise_violations"], [])
+
+    def test_loss_relative_diff_is_honestly_nan_on_a_nonfinite_loss_never_a_lucky_max(self):
+        """Advisory, round-4 audit fold-in on PR #372: `loss_relative_diff`
+        used `max(abs(loss_a), abs(loss_b), NORM_FLOOR)` -- the same
+        unreliable-with-NaN reduction `_weight_max_violation` was fixed for
+        this round. This field is informational only (never gates
+        `passed`), so the fix is honesty: a nonfinite loss reports
+        `loss_relative_diff` as `nan`, never a value that happened to fall
+        out of a NaN-blind `max()`.
+        """
+        report_a = make_report(float("nan"), {"t": [1.0, 2.0, 3.0]})
+        report_b = make_report(0.3, {"t": [1.0, 2.0, 3.0]})
+        result = cgo.compare_reports(report_a, report_b, cosine_floor=0.9)
+        self.assertTrue(math.isnan(result["loss_relative_diff"]))
 
     def test_weight_nan_on_one_side_fails_never_reads_as_max_abs_delta_zero(self):
         """ITEM 3 REPRODUCTION (the auditor's own reproduction, reproduced
@@ -1360,6 +1406,51 @@ class SameProducerGuardTests(unittest.TestCase):
         self.assertEqual(
             [v for v in result["premise_violations"] if "same tool" in v], [],
         )
+
+    def test_tool_absent_on_both_sides_is_refused(self):
+        """ROUND-4 AUDIT REPRODUCTION: an earlier draft of
+        `_same_producer_violation`'s own docstring claimed a missing `tool`
+        was already covered elsewhere -- it was not (`tool` is deliberately
+        NOT a `RUN_IDENTITY_FIELDS` member). `compare a.json a.json` on a
+        tool-less dump (or two independently-built tool-less dumps) used to
+        sail through this function entirely unrefused.
+        """
+        report_a = make_report(0.3, {"t": [1.0, 2.0, 3.0]})
+        report_b = make_report(0.3, {"t": [1.0, 2.0, 3.0]})
+        del report_a["tool"]
+        del report_b["tool"]
+        result = cgo.compare_reports(report_a, report_b, cosine_floor=0.9)
+        self.assertFalse(result["passed"])
+        self.assertTrue(any("'tool'" in v for v in result["premise_violations"]))
+
+    def test_tool_absent_on_one_side_is_refused(self):
+        report_a = make_report(0.3, {"t": [1.0, 2.0, 3.0]})
+        report_b = make_report(0.3, {"t": [1.0, 2.0, 3.0]})
+        del report_a["tool"]
+        result = cgo.compare_reports(report_a, report_b, cosine_floor=0.9)
+        self.assertFalse(result["passed"])
+        self.assertTrue(any("'tool'" in v for v in result["premise_violations"]))
+
+    def test_literal_same_file_with_no_tool_field_is_refused_at_main(self):
+        """THE LEAD'S OWN NAMED REPRODUCTION: `compare a.json a.json` where
+        the dump has NO `"tool"` key at all -- driven at `main()`, the real
+        entry point.
+        """
+        report = make_report(0.31, {"t": [0.1, -0.2, 0.3]})
+        del report["tool"]
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "a.json")
+            with open(path, "w") as fh:
+                json.dump(report, fh)
+            import contextlib
+            import io
+
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = cgo.main([path, path, "--cosine-floor", "0.9"])
+        self.assertEqual(code, cgo.EXIT_FAIL, f"stdout={out.getvalue()!r} stderr={err.getvalue()!r}")
+        self.assertNotIn("PASS", out.getvalue().splitlines())
+        self.assertIn("PREMISE VIOLATION", err.getvalue())
 
 
 @unittest.skipUnless(

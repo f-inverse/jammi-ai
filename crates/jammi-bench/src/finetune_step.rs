@@ -51,6 +51,8 @@ use std::sync::Arc;
 
 use crate::report::{FinetuneStepTier, Measurement};
 
+use sha2::{Digest, Sha256};
+
 /// Poll total device memory in use, in bytes, via `nvidia-smi`.
 ///
 /// Whole-device, not per-process: on a dedicated pod this session is the only
@@ -327,6 +329,16 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
         None => "cpu".to_string(),
     };
 
+    // Base-checkpoint CONTENT identity — computed BEFORE `build_fixture`
+    // loads the model, off the exact bytes this run reads, so it can never
+    // drift from what the model actually built from (round-4 audit
+    // fold-in on PR #372: the SAME mechanism `grad_oracle.rs`'s `run()`
+    // uses, see this module's doc's determinant table).
+    let (checkpoint_config_sha256, _config_len) =
+        sha256_and_len(&params.model_dir.join("config.json"))?;
+    let (checkpoint_weights_sha256, checkpoint_weights_size_bytes) =
+        sha256_and_len(&params.model_dir.join("model.safetensors"))?;
+
     let (mut encoder, mut opt, trainable_count, blocks, mask, _varmap) = build_fixture(params)?;
 
     // The VRAM baseline is taken here, BEFORE the untimed pre-step below and
@@ -455,10 +467,21 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
         device_name: device_name(params.cuda_device),
         seed: params.seed,
         backbone_dtype: format!("{:?}", params.backbone_dtype).to_lowercase(),
+        checkpoint_config_sha256,
+        checkpoint_weights_sha256,
+        checkpoint_weights_size_bytes,
         batch: params.batch,
         seq: params.seq,
         lora_rank: params.lora_rank,
+        lora_alpha: params.lora_alpha,
         lora_dropout: params.lora_dropout as f64,
+        // HARDCODED, unconditionally — see `FinetuneStepTier::margin`'s own
+        // field doc: this tier has no `--margin` CLI flag, and the ONE call
+        // site that uses this constant (`triplet_loss(&a, &p, &n, 0.3)`,
+        // below) is not parameterized by it either — this field exists so
+        // the VALUE is emitted for the leg-premise check, not so the run
+        // itself becomes configurable this round.
+        margin: 0.3,
         target_modules: params.target_modules.clone(),
         batched_forward: params.batched_forward,
         trainable_tensors: trainable_count,
@@ -536,6 +559,45 @@ pub(crate) fn device_name(cuda_device: Option<usize>) -> String {
             .map(|s| s.trim().lines().next().unwrap_or("unknown").to_string())
             .unwrap_or_else(|| "unknown".to_string()),
     }
+}
+
+/// sha256 (hex-encoded) of `path`'s raw bytes, plus the byte length —
+/// STREAMING (a bounded-size buffer, never `std::fs::read`'s whole-file
+/// `Vec`): a real checkpoint's `model.safetensors` can be on the order of a
+/// few GB (ModernBERT-large-class), and loading the entire file into
+/// memory just to hash it would roughly double this tier's peak RSS for no
+/// reason — the hasher only ever needs the CURRENT chunk. `pub(crate)`:
+/// shared with `grad_oracle.rs`, which reuses this EXACT function (never a
+/// second, independently-drifting hashing implementation) — see that
+/// module's doc's determinant table and this tier's own
+/// `checkpoint_config_sha256`/`checkpoint_weights_sha256` field docs.
+pub(crate) fn sha256_and_len(
+    path: &std::path::Path,
+) -> Result<(String, u64), Box<dyn std::error::Error>> {
+    use std::io::Read;
+
+    let file = std::fs::File::open(path)
+        .map_err(|e| -> Box<dyn std::error::Error> { format!("opening {path:?}: {e}").into() })?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut hasher = Sha256::new();
+    // 64 KiB: large enough to amortize the syscall overhead of many small
+    // reads, small enough that this function's own peak RSS contribution
+    // stays negligible regardless of the file's total size.
+    let mut buf = [0u8; 65536];
+    let mut total_len: u64 = 0;
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .map_err(|e| -> Box<dyn std::error::Error> {
+                format!("reading {path:?}: {e}").into()
+            })?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        total_len += n as u64;
+    }
+    Ok((hex::encode(hasher.finalize()), total_len))
 }
 
 /// Peak resident set from `/proc/self/status` `VmHWM`. `None` off Linux, where
@@ -1246,7 +1308,7 @@ mod tests {
 
     /// F1 REGRESSION (audit finding on PR #372): `peak_vram_bytes` is
     /// `VramSampler::finish`'s `peak.saturating_sub(baseline)`
-    /// (`finetune_step.rs:112` at the time of writing). `saturating_sub`
+    /// (`finetune_step.rs:114` at the time of writing). `saturating_sub`
     /// FLOORS at zero rather than wrapping — so if `baseline` is ever
     /// captured AT (or above) the run's own high-water mark, the reported
     /// delta collapses to zero even though the run legitimately allocated

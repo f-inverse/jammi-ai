@@ -14,6 +14,42 @@ report.
 Never imported by any Cargo crate, never a jammi-bench dependency — a
 CI-adjacent script the sweep alone runs, same footing `finetune_ab.sh`
 itself already has.
+
+## Determinant table (round-4 audit fold-in on PR #372)
+
+`leg_premise_violations` certifies that a config's jammi and torch legs ran
+under the SAME premise before their ratio/loss numbers are treated as
+comparable. Every field either producer's finetune-step report emits,
+classified — mirrors `grad_oracle.rs`'s own determinant table
+(`crates/jammi-bench/src/grad_oracle.rs`'s module doc) for the OTHER
+jammi-vs-torch comparator this repo carries:
+
+| field | class | jammi emit site | torch emit site |
+|---|---|---|---|
+| `seed` | identity | `report.rs:FinetuneStepTier::seed` field; `seed: params.seed,` (`finetune_step.rs:468`) | `"seed": args.seed` (`torch_finetune_step.py:1038`) |
+| `batch` | identity | `batch: params.batch,` (`finetune_step.rs:473`) | `"batch": args.batch,` (`torch_finetune_step.py:1055`) |
+| `seq` | identity | `seq: params.seq,` (`finetune_step.rs:474`) | `"seq": args.seq,` (`torch_finetune_step.py:1056`) |
+| `lora_rank` | identity | `lora_rank: params.lora_rank,` (`finetune_step.rs:475`) | `"lora_rank": args.lora_rank,` (`torch_finetune_step.py:1057`) |
+| `lora_alpha` | identity — input was already threaded through `FinetuneStepParams::lora_alpha`, just never emitted before this round | `lora_alpha: params.lora_alpha,` (`finetune_step.rs:476`) | `"lora_alpha": args.lora_alpha,` (`torch_finetune_step.py:1031`) |
+| `lora_dropout` | identity | `lora_dropout: params.lora_dropout` (`finetune_step.rs:477`) | `"lora_dropout": args.lora_dropout,` (`torch_finetune_step.py:1058`) |
+| `margin` | identity, but jammi HARDCODES `0.3` (no `--margin` CLI flag — the call site's own literal, `let loss = triplet_loss(&a, &p, &n, 0.3)?;` (`finetune_step.rs:316`)) | `margin: 0.3,` (`finetune_step.rs:484`) | `"margin": args.margin,` (`torch_finetune_step.py:1040`) — `--margin` default `0.3` |
+| `target_modules` | identity | `target_modules: params.target_modules.clone(),` (`finetune_step.rs:485`) | `"target_modules": [` (`torch_finetune_step.py:1061`) |
+| `batched_forward` | identity | `batched_forward: params.batched_forward,` (`finetune_step.rs:486`) | `"batched_forward": args.batched_forward,` (`torch_finetune_step.py:1064`) |
+| `backbone_dtype` | identity | `backbone_dtype: format!("{:?}", params.backbone_dtype)` (`finetune_step.rs:469`) | `"backbone_dtype": args.dtype,` (`torch_finetune_step.py:1046`) |
+| `steps_measured` | identity — the reachable divergence this table used to miss entirely: two legs measured at a DIFFERENT step count (e.g. a mismatched `--steps`/`--warmup` override) still merged to a "clean" ratio before this field was compared | `steps_measured: times.len(),` (`finetune_step.rs:488`) | `"steps_measured": len(times),` (`torch_finetune_step.py:1066`) |
+| `checkpoint_config_sha256` | identity — same base-checkpoint CONTENT identity `grad_oracle.rs`'s tier already carries, added to THIS tier too | `let (checkpoint_config_sha256, _config_len) =` (`finetune_step.rs:337`), via the SHARED streaming `pub(crate) fn sha256_and_len` (`finetune_step.rs:574`) | `checkpoint_identity_fields = checkpoint_identity(args.model_dir)` (`torch_finetune_step.py:926`) |
+| `checkpoint_weights_sha256` | identity | `let (checkpoint_weights_sha256, checkpoint_weights_size_bytes) =` (`finetune_step.rs:339`) | `"checkpoint_weights_sha256": weights_sha256,` (`torch_finetune_step.py:551`) |
+| `checkpoint_weights_size_bytes` | identity | `checkpoint_weights_size_bytes) =` (`finetune_step.rs:339`) — same call as the row above, its second return value | `"checkpoint_weights_size_bytes": weights_len,` (`torch_finetune_step.py:552`) |
+| `attn_requested` / `attn_implementation` | provenance — jammi has no `--attn` lever; recorded in `leg_provenance`, never compared (see `grad_oracle.rs`'s own table for the fuller rationale) | n/a | `"attn_requested": args.attn,` just above `"attn_implementation": resolved_attn_implementation,` (`torch_finetune_step.py:1051`) |
+| `ln`/`rope`/`softmax`/`geglu`/`lora_epilogue`/`lora_linear`/`attention_block` `_fused_dispatches`/`_eager_dispatches` (14 fields) | measurement — this IS the fused-dispatch proof `fused_proof`/`dispatch_pairs` gate on, and `leg_provenance` additionally records the raw counters per config | `finetune_step.rs`'s own `*_fused_dispatches`/`*_eager_dispatches` fields | n/a |
+| `losses` / `loss_first` / `loss_last` | measurement — `loss_final_ratio` is printed for visibility, never gated (see that field's own note in `build_report`) | `finetune_step.rs`'s own fields | `torch_finetune_step.py`'s own fields |
+| `s_per_step_p50` / `triplets_per_s` / VRAM fields | measurement — the actual perf numbers this sweep exists to produce | `finetune_step.rs`'s own fields | `torch_finetune_step.py`'s own fields |
+| `model_dir` | provenance (a path string, not compared — superseded by the checksum fields above) | `FinetuneStepParams::model_dir` (not itself emitted on the tier) | `torch_finetune_step.py`'s own `args["model_dir"]` |
+| `device` / `device_name` | provenance | `finetune_step.rs`'s own fields | `torch_finetune_step.py`'s own `provenance` block |
+
+`FINETUNE_IDENTITY_FIELDS` (below) is the tuple that actually encodes the
+**identity** rows above — the single source of truth `leg_identity_fields`/
+`leg_premise_violations` iterate.
 """
 
 from __future__ import annotations
@@ -38,23 +74,64 @@ LEGS = ["jammi-eager", "jammi-fused", "torch-eager", "torch-sdpa"]
 # drifting copy of the SAME `backbone_dtype`/`target_modules` representational
 # gaps.
 #
-# `seed` lives in a DIFFERENT place on each producer (jammi's own
-# `finetune_step.rs`'s `FinetuneStepTier::seed` field, added this round,
-# sits directly in the `finetune_step` block this module already reads via
-# `finetune_block`; torch's sits one level UP, in `report["args"]["seed"]`
-# -- `torch_finetune_step.py`'s own report literal never duplicates it into
+# `seed`/`lora_alpha`/`margin` live in a DIFFERENT place on each producer
+# (jammi's own `finetune_step.rs`'s `FinetuneStepTier` fields sit directly
+# in the `finetune_step` block this module already reads via
+# `finetune_block`; torch's sit one level UP, in `report["args"]` --
+# `torch_finetune_step.py`'s own report literal never duplicates them into
 # the `finetune_step` sub-block) -- `leg_identity_fields` below reads each
-# from its OWN real location per leg, never assumes a shared schema.
+# from its OWN real location per leg (`_TORCH_ARGS_LEVEL_FIELDS`), never
+# assumes a shared schema.
+#
+# `lora_alpha`/`margin` (round-4 audit fold-in on PR #372): torch has always
+# emitted both under `args`; jammi's `FinetuneStepTier` did not carry either
+# field at all until this round (`lora_alpha` was already a CLI input,
+# `FinetuneStepParams::lora_alpha`, just never emitted on the report;
+# `margin` has no jammi CLI flag at all -- this tier hardcodes `0.3`,
+# matching torch's own `--margin` default, see `FinetuneStepTier::margin`'s
+# own field doc).
+#
+# `steps_measured` (round-4 audit fold-in): reachable divergence this table
+# used to miss entirely -- two legs run at `--steps 20`/`--warmup 5` vs
+# `--steps 5`/`--warmup 5` (e.g. `finetune_ab.sh` invoked with mismatched
+# per-leg overrides, or a leg re-run by hand) still merge to a "clean" ratio
+# and PASS verdict; `steps_measured` is recorded on BOTH sides already
+# (`FinetuneStepTier::steps_measured`, `torch_finetune_step.py`'s own
+# `"steps_measured": len(times)`) and is a genuine per-run fact, not
+# metadata `main()`'s `steps`/`warmup` CLI args alone can stand in for
+# (those describe what THIS MERGE INVOCATION was told, not what either leg
+# actually measured).
+#
+# `checkpoint_config_sha256`/`checkpoint_weights_sha256`/
+# `checkpoint_weights_size_bytes` (round-4 audit fold-in): the SAME
+# base-checkpoint content-identity fields `grad_oracle.rs`'s determinant
+# table already covers, now also on the finetune-step tier (both
+# producers), replacing an implicit "the operator passed the same
+# --model-dir path" assumption with a checked record.
 FINETUNE_IDENTITY_FIELDS = (
     "seed",
     "batch",
     "seq",
     "lora_rank",
+    "lora_alpha",
     "lora_dropout",
+    "margin",
     "target_modules",
     "batched_forward",
     "backbone_dtype",
+    "steps_measured",
+    "checkpoint_config_sha256",
+    "checkpoint_weights_sha256",
+    "checkpoint_weights_size_bytes",
 )
+
+# torch keeps these fields one level UP from the `finetune_step` sub-block
+# (`report["args"][field]`) rather than inside it — see
+# `FINETUNE_IDENTITY_FIELDS`'s own doc. Every OTHER field (including the 3
+# new checkpoint-identity ones, which torch now emits directly inside the
+# `finetune_step` block, matching jammi's own placement) lives at the SAME
+# level `finetune_block` already reads for both producers.
+_TORCH_ARGS_LEVEL_FIELDS = frozenset({"seed", "lora_alpha", "margin"})
 
 # B2 — the DECLARED classification `fused_proof` checks a dispatch-counter
 # pair against, replacing the old blanket "(fused, eager) == (0, 0) is
@@ -191,29 +268,31 @@ _MISSING = object()  # sentinel -- see leg_identity_fields's own doc
 def leg_identity_fields(report, leg):
     """This leg's `FINETUNE_IDENTITY_FIELDS` values, read from their REAL
     location on the RAW report (never `metrics()`'s already-narrowed dict,
-    which drops `lora_dropout`/`target_modules`/`seed` entirely). `seed` is
-    the one field whose location differs by producer -- see
-    `FINETUNE_IDENTITY_FIELDS`'s own doc.
+    which drops `lora_dropout`/`target_modules`/`seed`/etc. entirely).
+    `_TORCH_ARGS_LEVEL_FIELDS` names the fields whose location differs by
+    producer -- see `FINETUNE_IDENTITY_FIELDS`'s own doc.
 
     Returns a `{field: value_or_MISSING}` dict — `_MISSING` (a private
-    sentinel, never `None`) marks a field ABSENT from this report, so
-    `leg_premise_violations` can distinguish "present but `None`" (which
-    neither real producer ever emits, but a fixture could) from "the key
-    was never there at all" — the SAME presence-vs-equality distinction
-    `compare_grad_oracle.py`'s `_premise_violations` closes for the
-    grad-oracle side this round.
+    sentinel, never `None`) marks a field ABSENT *or present-but-null* on
+    this report, so `leg_premise_violations` treats BOTH the same way (a
+    genuinely-absent key and a present-but-`None` value are the SAME
+    "cannot verify this premise determinant" state — round-4 audit fold-in
+    on PR #372: an earlier draft of this function's own doc claimed a
+    present-but-`None` value was something "no real producer ever emits,
+    but a fixture could" — that is FALSE for the SAME reason
+    `compare_grad_oracle.py`'s own fix this round applies: `serde_json`
+    serializes a NaN/inf `f64` as JSON `null`, so a NaN `lora_alpha` on
+    jammi's side is reachable, not hypothetical).
     """
     fs = finetune_block(report, leg)
     fields = {}
     for field in FINETUNE_IDENTITY_FIELDS:
-        if field == "seed":
-            if leg.startswith("jammi"):
-                fields[field] = fs[field] if field in fs else _MISSING
-            else:
-                args = report.get("args")
-                fields[field] = args["seed"] if isinstance(args, dict) and "seed" in args else _MISSING
+        if field in _TORCH_ARGS_LEVEL_FIELDS and not leg.startswith("jammi"):
+            args = report.get("args")
+            value = args.get(field) if isinstance(args, dict) else None
         else:
-            fields[field] = fs[field] if field in fs else _MISSING
+            value = fs.get(field)
+        fields[field] = _MISSING if value is None else value
     return fields
 
 
@@ -224,9 +303,11 @@ def leg_premise_violations(jammi_fields, torch_fields):
     `compare_grad_oracle.py` uses for its own identity fields, imported
     from `identity_fields.py`), mirroring that module's own
     `_premise_violations` shape: presence checked EXPLICITLY (a field
-    absent from BOTH sides must not silently compare `None == None` and
-    pass — the same class of bug that module's own `_premise_violations`
-    closed this round), never inferred from a bare `==`.
+    absent OR present-but-null from BOTH sides must not silently compare
+    `None == None` and pass — `leg_identity_fields` already folds
+    present-but-null into `_MISSING` before this function ever sees it, so
+    both shapes land on the SAME branch here), never inferred from a bare
+    `==`.
     """
     violations = []
     for field in FINETUNE_IDENTITY_FIELDS:

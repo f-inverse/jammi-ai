@@ -1096,6 +1096,21 @@ pub struct FinetuneStepTier {
     pub device_name: String,
     /// The precision the frozen backbone ran at.
     pub backbone_dtype: String,
+    /// sha256 (hex) of `model_dir/config.json`'s raw bytes — round-4 audit
+    /// fold-in on PR #372: the SAME base-checkpoint content-identity
+    /// mechanism `grad_oracle.rs`'s `GradOracleReport` carries (see that
+    /// module's doc's determinant table), added to THIS tier too so
+    /// `ab_merge.py`'s leg-premise check can verify the jammi/torch legs of
+    /// one A/B config loaded the byte-identical checkpoint, not merely a
+    /// path string that happens to match. Computed via the SAME streaming
+    /// `sha256_and_len` `grad_oracle.rs` reuses (never a second,
+    /// independently-drifting hashing implementation).
+    pub checkpoint_config_sha256: String,
+    /// sha256 (hex) of `model_dir/model.safetensors`'s raw bytes.
+    pub checkpoint_weights_sha256: String,
+    /// `model_dir/model.safetensors`'s byte length — a cheap, redundant
+    /// cross-check alongside the sha256 above.
+    pub checkpoint_weights_size_bytes: u64,
     /// Drives the synthetic batch AND (when `--lora-init jammi`) the fresh
     /// LoRA draw — `ab_merge.py`'s own leg-premise check (the adjacent
     /// probe that folded this field in: `ci/scripts/perf/ab_merge.py` had
@@ -1109,7 +1124,24 @@ pub struct FinetuneStepTier {
     pub batch: usize,
     pub seq: usize,
     pub lora_rank: usize,
+    /// The LoRA scaling factor. Round-4 audit fold-in on PR #372: this input
+    /// (`FinetuneStepParams::lora_alpha`) was ALREADY threaded through from
+    /// the CLI but never actually emitted on this tier — `ab_merge.py`'s
+    /// leg-premise check reads it alongside torch's `args.lora_alpha`
+    /// (`torch_finetune_step.py`'s own report, one level up from this
+    /// tier's own sub-block, same asymmetry `seed`'s own doc above
+    /// describes).
+    pub lora_alpha: f64,
     pub lora_dropout: f64,
+    /// The triplet-loss margin. jammi HARDCODES this to `0.3`
+    /// (`finetune_step.rs`'s own `triplet_loss(&a, &p, &n, 0.3)` call site —
+    /// there is no `--margin` CLI flag on this tier); torch's own
+    /// `--margin` defaults to the SAME `0.3` but is independently
+    /// overridable, so this field exists to let the leg-premise check
+    /// catch an operator who overrode `--margin` on the torch leg only —
+    /// the two legs would then be minimizing a DIFFERENT loss, not merely
+    /// running different kernels.
+    pub margin: f64,
     /// The LoRA target-module selectors, which decide how many linears carry an
     /// adapter — and therefore how much of the step is adapter work.
     pub target_modules: Vec<String>,
@@ -1476,10 +1508,15 @@ mod tests {
             device_name: "cpu".to_string(),
             seed: 42,
             backbone_dtype: "f32".to_string(),
+            checkpoint_config_sha256: "a".repeat(64),
+            checkpoint_weights_sha256: "b".repeat(64),
+            checkpoint_weights_size_bytes: 1024,
             batch: 2,
             seq: 6,
             lora_rank: 2,
+            lora_alpha: 4.0,
             lora_dropout: 0.0,
+            margin: 0.3,
             target_modules: vec!["query".to_string()],
             batched_forward: true,
             trainable_tensors: 2,
@@ -1529,12 +1566,16 @@ mod tests {
             "batch",
             "batched_forward",
             "backbone_dtype",
+            "checkpoint_config_sha256",
+            "checkpoint_weights_sha256",
+            "checkpoint_weights_size_bytes",
             "device",
             "device_name",
             "geglu_eager_dispatches",
             "geglu_fused_dispatches",
             "ln_eager_dispatches",
             "ln_fused_dispatches",
+            "lora_alpha",
             "lora_dropout",
             "lora_epilogue_eager_dispatches",
             "lora_epilogue_fused_dispatches",
@@ -1544,6 +1585,7 @@ mod tests {
             "loss_first",
             "loss_last",
             "losses",
+            "margin",
             "peak_rss_bytes",
             "peak_vram_bytes",
             "rope_eager_dispatches",

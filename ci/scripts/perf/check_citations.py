@@ -67,6 +67,14 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 _KNOWN_FILES = {
     "finetune_step.rs": REPO_ROOT / "crates" / "jammi-bench" / "src" / "finetune_step.rs",
     "grad_oracle.rs": REPO_ROOT / "crates" / "jammi-bench" / "src" / "grad_oracle.rs",
+    # round-4 audit fold-in on PR #372: the determinant tables in
+    # `grad_oracle.rs`/`ab_merge.py` cite dozens of `.py:<n>` lines in the
+    # torch reference scripts — those citations were NEVER mechanically
+    # re-checked (this script only knew about the two `.rs` files above),
+    # which is exactly how the `.py` line-drift this round's own audit
+    # caught went unnoticed.
+    "torch_grad_oracle.py": REPO_ROOT / "crates" / "jammi-bench" / "reference" / "torch_grad_oracle.py",
+    "torch_finetune_step.py": REPO_ROOT / "crates" / "jammi-bench" / "reference" / "torch_finetune_step.py",
 }
 
 # The two roots this advisory names, both searched recursively for every

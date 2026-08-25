@@ -148,24 +148,24 @@
 //!
 //! | field | class | jammi emit site | torch emit site |
 //! |---|---|---|---|
-//! | `seed` | identity | `grad_oracle.rs:GradOracleReport::seed` field, `run()`'s report literal | `torch_grad_oracle.py:546` (`"seed": args.seed`) |
-//! | `batch` | identity | `run()`'s report literal | `torch_grad_oracle.py:547` |
-//! | `seq` | identity | `run()`'s report literal | `torch_grad_oracle.py:548` |
-//! | `lora_rank` | identity | `run()`'s report literal | `torch_grad_oracle.py:549` |
-//! | `lora_alpha` | identity | `run()`'s report literal | `torch_grad_oracle.py:546` (`args.lora_alpha`, see line cited above for the block) |
-//! | `target_modules` | identity | `run()`'s report literal | `torch_grad_oracle.py:551` |
-//! | `batched_forward` | identity | `run()`'s report literal | `torch_grad_oracle.py:552` |
-//! | `backbone_dtype` | identity | `run()`'s report literal (`format!("{:?}", ..).to_lowercase()`) | `torch_grad_oracle.py:542` (`translate_dtype_flag_to_jammi_spelling`) |
-//! | `checkpoint_config_sha256` | identity | `sha256_and_len(&model_dir.join("config.json"))`, called in `run()` before the forward | `torch_grad_oracle.py:261` `checkpoint_identity`, called in `_run_with_model` (`torch_grad_oracle.py:278`) |
-//! | `checkpoint_weights_sha256` | identity | `sha256_and_len(&weights)` | `torch_grad_oracle.py:279` |
-//! | `checkpoint_weights_size_bytes` | identity | `sha256_and_len`'s byte-length return | `torch_grad_oracle.py:280` |
+//! | `seed` | identity | `grad_oracle.rs:GradOracleReport::seed` field, `run()`'s report literal | `"seed": args.seed` (`torch_grad_oracle.py:538`) |
+//! | `batch` | identity | `run()`'s report literal | `"batch": args.batch` (`torch_grad_oracle.py:532`) |
+//! | `seq` | identity | `run()`'s report literal | `"seq": args.seq` (`torch_grad_oracle.py:533`) |
+//! | `lora_rank` | identity | `run()`'s report literal | `"lora_rank": args.lora_rank` (`torch_grad_oracle.py:534`) |
+//! | `lora_alpha` | identity | `run()`'s report literal | `"lora_alpha": args.lora_alpha` (`torch_grad_oracle.py:535`) |
+//! | `target_modules` | identity | `run()`'s report literal | `"target_modules": [t.strip()` (`torch_grad_oracle.py:536`) |
+//! | `batched_forward` | identity | `run()`'s report literal | `"batched_forward": args.batched_forward` (`torch_grad_oracle.py:537`) |
+//! | `backbone_dtype` | identity | `run()`'s report literal (`format!("{:?}", ..).to_lowercase()`) | `translate_dtype_flag_to_jammi_spelling(args.dtype)` (`torch_grad_oracle.py:531`) |
+//! | `checkpoint_config_sha256` | identity | `sha256_and_len(&model_dir.join("config.json"))` — called in `run()` before the forward, via the SAME shared streaming implementation `finetune_step.rs` also uses: `pub(crate) fn sha256_and_len` (`finetune_step.rs:574`) | `checkpoint_identity_fields = checkpoint_identity(args.model_dir)` (`torch_grad_oracle.py:413`) — `checkpoint_identity` is a bare alias for the real, streaming implementation torch_finetune_step.py's own `checkpoint_identity` function provides (see the two field citations directly below) |
+//! | `checkpoint_weights_sha256` | identity | `sha256_and_len(&weights)` | `"checkpoint_weights_sha256": weights_sha256` (`torch_finetune_step.py:551`) |
+//! | `checkpoint_weights_size_bytes` | identity | `sha256_and_len`'s byte-length return | `"checkpoint_weights_size_bytes": weights_len` (`torch_finetune_step.py:552`) |
 //! | `lora_weights_in` (presence, not value) | identity (checked separately — `_premise_violations`'s `lora_weights_in` loop, not `RUN_IDENTITY_FIELDS`) | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
 //! | `batch_token_id_sums` | identity (checked separately, `or`-gated presence) | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
 //! | `model_dir` | provenance (human debugging only — a path string is not comparable across two boxes; superseded by the two checksum fields above) | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
-//! | `device` / `device_name` | provenance | `run()`'s report literal (`device_name` reuses `finetune_step::device_name`) | `torch_grad_oracle.py:518` (nested under `provenance`, via `torch_finetune_step.provenance()`) |
+//! | `device` / `device_name` | provenance | `run()`'s report literal (`device_name` reuses `finetune_step::device_name`) | `"provenance": tfs.provenance(device, fast_path_globals)` (`torch_grad_oracle.py:507`) |
 //! | `git_rev` (jammi) / `provenance.git_rev` (torch) | provenance | `tip_sha()`, called in `run()`'s report literal | `torch_finetune_step.py`'s `git_rev()`, via `provenance()` |
-//! | torch/transformers/peft versions | provenance (jammi has no equivalent — no torch/transformers/peft dependency) | n/a | `torch_grad_oracle.py:518`, via `torch_finetune_step.provenance()` |
-//! | `attn_requested` / `attn_implementation` | provenance (jammi has no `--attn` lever; its own analog is the MEASUREMENT dispatch counters below) | n/a | `torch_grad_oracle.py:527`/`528`, resolved in `run()` mirroring `torch_finetune_step.py:871`/`982`/`993`'s own pattern |
+//! | torch/transformers/peft versions | provenance (jammi has no equivalent — no torch/transformers/peft dependency) | n/a | same call site as the `device` row directly above (`torch_grad_oracle.py`'s `provenance` field) |
+//! | `attn_requested` / `attn_implementation` | provenance (jammi has no `--attn` lever; its own analog is the MEASUREMENT dispatch counters below) | n/a | `"attn_requested": args.attn` (`torch_grad_oracle.py:516`), `"attn_implementation": resolved_attn_implementation` (`torch_grad_oracle.py:517`), resolved in `run()` mirroring the identical pattern `torch_finetune_step.py`'s own `run()` already established (see `ab_merge.py`'s determinant table for that file's own citations of this exact pair) |
 //! | `lora_dropout` | identity, but UNCONDITIONALLY forced to `0.0` by both producers so it can never legitimately differ — excluded from `RUN_IDENTITY_FIELDS` on that basis, not compared | `run()`'s report literal (hardcoded `0.0`) | `torch_grad_oracle.py`'s report literal (hardcoded `0.0`) |
 //! | `trainable_tensor_count` | measurement (redundant with the tensor NAME SET, which `compare_reports`'s `only_in_a`/`only_in_b` already checks structurally) | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
 //! | `loss` / `gradients` / per-tensor `weight` | measurement — the oracle's actual output | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
@@ -186,12 +186,10 @@
 
 use std::path::PathBuf;
 
+use crate::finetune_step::{device_name, sha256_and_len, synthetic_ids, triplet_loss};
 use candle_core::{DType, Device, Tensor, Var};
 use candle_nn::VarMap;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
-
-use crate::finetune_step::{device_name, synthetic_ids, triplet_loss};
 
 /// Parameters the oracle drives its single forward+backward off of.
 #[derive(Debug, Clone)]
@@ -323,17 +321,6 @@ pub struct GradOracleReport {
     /// `layer.3.Wqkv.lora_a`), sorted for determinism (a `BTreeMap`
     /// serializes in key order; a `HashMap` would not).
     pub gradients: std::collections::BTreeMap<String, GradOracleTensor>,
-}
-
-/// sha256 (hex-encoded) of `path`'s raw bytes, plus the byte length —
-/// `model_dir`'s CONTENT identity in place of the un-comparable path string
-/// (see this module's doc's determinant table). Loud, never silent, on a
-/// read failure — a missing/unreadable checkpoint file is a hard error for
-/// this tier, not a `None` field.
-fn sha256_and_len(path: &std::path::Path) -> Result<(String, u64), Box<dyn std::error::Error>> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| -> Box<dyn std::error::Error> { format!("reading {path:?}: {e}").into() })?;
-    Ok((hex::encode(Sha256::digest(&bytes)), bytes.len() as u64))
 }
 
 /// Best-effort `git rev-parse HEAD` run against THIS crate's own directory

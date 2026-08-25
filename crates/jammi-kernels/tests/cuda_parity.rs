@@ -31,9 +31,9 @@
 use candle_core::{DType, Device, Tensor, Var, D};
 use half::bf16;
 use jammi_kernels::ops::{
-    apply1, apply2, apply3, AttentionBlockFused, Axpy, DropoutFused, DropoutKey,
-    FullyMaskedPolicy, GegluFused, GeluVariant, LayerNormFused, LowRankResidualLinear,
-    PhiloxKatProbe, RopeFused, ScaledCastAdd, SoftmaxLastDimFused,
+    apply1, apply2, apply3, AttentionBlockFused, Axpy, DropoutFused, DropoutKey, FullyMaskedPolicy,
+    GegluFused, GeluVariant, LayerNormFused, LowRankResidualLinear, PhiloxKatProbe, RopeFused,
+    ScaledCastAdd, SoftmaxLastDimFused,
 };
 
 fn axpy(alpha: f64, x: &Tensor, y: &Tensor) -> candle_core::Result<Tensor> {
@@ -3762,6 +3762,8 @@ fn lora_linear_parity_bf16_exact_integer_fixture_is_bit_exact() {
         "exact-integer bf16 fixture must be bit-exact against a reference built from the \
          SAME single rounding point the op's own epilogue documents"
     );
+}
+
 // -----------------------------------------------------------------------
 // AttentionBlockFused (P3, Tier 0) — CPU<->CUDA parity, forward AND
 // backward. AWAITING THE POD: these legs were authored and pass `cargo

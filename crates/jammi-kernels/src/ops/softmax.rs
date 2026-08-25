@@ -1298,7 +1298,7 @@ fn dscores_bf16(y: &[bf16], dy: &[bf16], rows: usize, last: usize) -> Vec<bf16> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::{Device, Var};
+    use candle_core::{DType, Device, Var};
 
     /// `SoftmaxLastDimFused::default()` (`FullyMaskedPolicy::Propagate`) —
     /// every test using this helper is either not exercising a
@@ -2515,5 +2515,297 @@ mod tests {
             "sanity: the eager composition must actually retain multiple nodes for this \
              comparison to mean anything, got {eager_nodes}"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // `mask_broadcast_class_holds` (MUT-1: both `true` and `false` forced
+    // survived) — the predicate itself, exercised directly, at BOTH
+    // cells: a shape that genuinely IS in the supported broadcast class
+    // (rank-equal, every leading axis either `1` or matching) must
+    // return `true`; a shape genuinely OUTSIDE it (a leading axis that
+    // is neither `1` nor equal, mirroring `softmax_dims`'s own refusal)
+    // must return `false`. `SoftmaxLastDimFused` is invoked too, to
+    // confirm the predicate agrees with what the op itself actually
+    // admits/refuses on that same input pair (the doc's "the EXACT same
+    // check" claim, checked, not merely assumed).
+    // -------------------------------------------------------------------
+    #[test]
+    fn mask_broadcast_class_holds_is_true_for_an_admitted_shape_and_the_op_agrees() {
+        let device = Device::Cpu;
+        let scores = Tensor::from_slice(&[0.0f32; 24], (2, 3, 4), &device).unwrap();
+        let mask = Tensor::from_slice(&[0.0f32; 8], (2, 1, 4), &device).unwrap();
+        assert!(mask_broadcast_class_holds(&scores, &mask));
+        assert!(
+            fused(&scores, &mask).is_ok(),
+            "the op itself must also admit this shape"
+        );
+    }
+
+    #[test]
+    fn mask_broadcast_class_holds_is_false_for_a_refused_shape_and_the_op_agrees() {
+        let device = Device::Cpu;
+        // Leading axis 1 (`heads`): mask has 2, scores has 3 -- neither
+        // `1` (broadcast) nor equal (`3`), so this is OUTSIDE the
+        // supported broadcast class.
+        let scores = Tensor::from_slice(&[0.0f32; 24], (2, 3, 4), &device).unwrap();
+        let mask = Tensor::from_slice(&[0.0f32; 16], (2, 2, 4), &device).unwrap();
+        assert!(!mask_broadcast_class_holds(&scores, &mask));
+        assert!(
+            fused(&scores, &mask).is_err(),
+            "the op itself must also refuse this shape"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // `mask_row_offset` (MUT-1: `/=` -> `%=` and `/=` -> `*=` on its
+    // `rem /= d`; `*` -> `/` on its `flat = flat * m_lead[axis].max(1) +
+    // i`) -- a broadcast-offset oracle on a `[B, 1, 1, S]`
+    // vs `[B, H, S, S]`-style leading-axis shape (`s_lead = [B, H, S]`,
+    // `m_lead = [B, H, 1]` here -- broadcasting only the LAST leading
+    // axis, `q`, so `m_lead` still has a non-1 entry at axis 1 that a
+    // pure `* -> /` or `/= -> *=/%=` corruption cannot hide behind,
+    // unlike an all-but-one-axis-broadcast shape where the arithmetic
+    // happens to cancel to the same answer for small inputs) where the
+    // row offset genuinely differs per `(b, h, q)` triple. Hand-unraveled
+    // below, independently of the function under test.
+    // -------------------------------------------------------------------
+    #[test]
+    fn mask_row_offset_broadcast_oracle_differs_per_b_h_q() {
+        let s_lead = [2usize, 3, 4]; // B=2, H=3, S=4
+        let m_lead = [2usize, 3, 1]; // broadcasts only q (the last leading axis)
+
+        // (row, expected mrow) -- each hand-unraveled from `row = b*(H*S)
+        // + h*S + q` against `s_lead`, then re-raveled against `m_lead`
+        // (`q` maps to `0` since `m_lead[2] == 1`).
+        let cases = [
+            (0usize, 0usize),  // (b=0, h=0, q=0) -> flat 0*2+0=0, *3+0=0
+            (23usize, 5usize), // (b=1, h=2, q=3) -> flat 0*2+1=1, *3+2=5
+            (14usize, 3usize), // (b=1, h=0, q=2) -> flat 0*2+1=1, *3+0=3
+        ];
+        for (row, expected) in cases {
+            let got = mask_row_offset(row, &s_lead, &m_lead);
+            assert_eq!(
+                got, expected,
+                "row={row}: got mrow={got}, expected {expected}"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // `SoftmaxLastDimFused::cpu_fwd`'s dtype guard (MUT-1: its `(s1, s2)
+    // if s1.dtype() != s2.dtype()` match-arm guard forced `true`). The `false`-arm
+    // (a real mismatch) is the pre-existing `dtype_mismatch_is_refused`
+    // test above; that test alone does not kill the guard-forced-`true`
+    // mutant (both the real code and the `true` mutant return
+    // `DTypeMismatchBinaryOp` on a genuine mismatch) — only a SAME,
+    // unsupported dtype on both operands (F16 here) tells them apart.
+    // -------------------------------------------------------------------
+    #[test]
+    fn same_unsupported_dtype_is_unsupported_not_a_false_mismatch() {
+        use half::f16;
+        let device = Device::Cpu;
+        let scores =
+            Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0].map(f16::from_f32), (1, 4), &device)
+                .unwrap();
+        let mask = Tensor::from_slice(&[0.0f32; 4].map(f16::from_f32), (1, 4), &device).unwrap();
+        let err = fused(&scores, &mask)
+            .expect_err("F16/F16 is a real, equal-dtype pair this op does not implement");
+        match err {
+            Error::UnsupportedDTypeForOp(dtype, _) => assert_eq!(dtype, DType::F16),
+            other => panic!("expected UnsupportedDTypeForOp(F16, _), got {other:?}"),
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // `SoftmaxBwdDScores::cpu_fwd`'s own dtype guard (MUT-1: `true`,
+    // `false`, and `!=`->`==` all survived on its `(s1, s2) if s1.dtype()
+    // != s2.dtype()` match-arm guard) -- an internal
+    // helper never previously called directly by any test in this file
+    // (only reachable through `SoftmaxLastDimFused::bwd`, which candle's
+    // autograd invokes with matching dtypes by construction).
+    // -------------------------------------------------------------------
+    fn bwd_dscores(y: &Tensor, dy: &Tensor) -> Result<Tensor> {
+        crate::ops::apply2(y, dy, SoftmaxBwdDScores)
+    }
+
+    #[test]
+    fn bwd_dscores_dtype_mismatch_is_refused() {
+        let device = Device::Cpu;
+        let y = Tensor::from_slice(&[0.25f32; 4], (1, 4), &device).unwrap();
+        let dy = Tensor::from_slice(&[bf16::from_f32(1.0); 4], (1, 4), &device).unwrap();
+        let err = bwd_dscores(&y, &dy).expect_err("y/dy dtype mismatch must be refused");
+        match err {
+            Error::DTypeMismatchBinaryOp { lhs, rhs, .. } => {
+                assert_eq!(lhs, DType::F32);
+                assert_eq!(rhs, DType::BF16);
+            }
+            other => panic!("expected DTypeMismatchBinaryOp{{F32, BF16}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bwd_dscores_same_unsupported_dtype_is_unsupported_not_a_false_mismatch() {
+        use half::f16;
+        let device = Device::Cpu;
+        let y = Tensor::from_slice(&[0.25f32; 4].map(f16::from_f32), (1, 4), &device).unwrap();
+        let dy = Tensor::from_slice(&[1.0f32; 4].map(f16::from_f32), (1, 4), &device).unwrap();
+        let err = bwd_dscores(&y, &dy)
+            .expect_err("F16/F16 is a real, equal-dtype pair this op does not implement");
+        match err {
+            Error::UnsupportedDTypeForOp(dtype, _) => assert_eq!(dtype, DType::F16),
+            other => panic!("expected UnsupportedDTypeForOp(F16, _), got {other:?}"),
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // `softmax_fwd_bf16`'s `mrow * last` mask-row-start computation
+    // (MUT-1: `*` -> `/` survived in its `let mr = &mask[mrow * last..(mrow
+    // + 1) * last]`). A BF16 forward with a
+    // genuinely-broadcast mask (`[B, 1, S]` over `[B, H, S]`, `B = 2`) so
+    // `mrow` takes a NON-ZERO value (`b = 1`) for later rows -- under
+    // `mrow / last` (integer division, `1 / 4 == 0`), row `b=1` would
+    // silently read mask row `0` instead of row `1`. Mask row `1` is
+    // made FULLY masked (`FullyMaskedPolicy::Zeros`) while mask row `0`
+    // is NOT, so the two rows have observably different outputs (zero
+    // vs. non-zero) -- the mutant's wrong offset (falling back to row 0)
+    // must be caught. F32 is unaffected by this line (`softmax_fwd_f32`
+    // has its own copy at a different line and its own row-max value),
+    // so this deliberately drives the BF16 arm.
+    // -------------------------------------------------------------------
+    #[test]
+    fn bf16_forward_honors_the_correct_broadcast_mask_row_not_a_divided_offset() {
+        let device = Device::Cpu;
+        let (b, h, s) = (2usize, 3usize, 4usize);
+        let scores_v: Vec<bf16> = (0..b * h * s)
+            .map(|i| bf16::from_f32((i as f32 * 0.37).sin()))
+            .collect();
+        // mask row 0 (batch 0): unmasked (all zero). mask row 1 (batch
+        // 1): fully masked (all a real negative sentinel).
+        let mut mask_v = vec![bf16::from_f32(0.0); s];
+        mask_v.extend(std::iter::repeat_n(bf16::from_f32(-1.0), s));
+        let scores = Tensor::from_slice(&scores_v, (b, h, s), &device).unwrap();
+        let mask = Tensor::from_slice(&mask_v, (b, 1, s), &device).unwrap();
+
+        let out: Vec<bf16> = fused_with_policy(&scores, &mask, FullyMaskedPolicy::Zeros)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        // Rows for b=1 are the LAST `h*s` elements (row-major [b, h, s]).
+        let (unmasked_rows, masked_rows) = out.split_at(h * s);
+        assert!(
+            masked_rows.iter().all(|v| v.to_f32() == 0.0),
+            "b=1 rows must read mask row 1 (fully masked -> all zero under \
+             FullyMaskedPolicy::Zeros); a `mrow / last` bug would instead read row 0 \
+             (unmasked) and produce ordinary non-zero softmax output here: {masked_rows:?}"
+        );
+        assert!(
+            unmasked_rows.iter().any(|v| v.to_f32() != 0.0),
+            "sanity: b=0 rows (mask row 0, unmasked) must NOT be all-zero, or this test \
+             cannot distinguish the two mask rows at all"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Cosmetic `name()` survivors (this file's two ops). What the
+    // snapshot pins: `name()` is the `op` payload of every typed refusal
+    // an op here raises on its CPU arm (`softmax_dims(.., self.name())`,
+    // `empty_like(.., self.name())`, `DTypeMismatchBinaryOp { op:
+    // self.name(), .. }`, `UnsupportedDTypeForOp(_, self.name())`) and of
+    // candle's own `BackwardNotSupported { op: self.name() }` — the
+    // diagnostic name a user matches error messages on, so a rename
+    // silently changes every one of them. It is NOT an admission/counter
+    // key: those are a consumer's own dispatch-site literals (`admit(..,
+    // "<key>", ..)` / `counters_for("<key>")` — see
+    // `crate::admission::counters_for`'s doc), independent of `name()`
+    // by construction. ONE snapshot per op pins the exact string.
+    // -------------------------------------------------------------------
+    #[test]
+    fn every_ops_name_in_this_file_is_pinned() {
+        assert_eq!(
+            SoftmaxLastDimFused::default().name(),
+            "softmax_last_dim_fused"
+        );
+        assert_eq!(
+            SoftmaxBwdDScores.name(),
+            "softmax_last_dim_fused_bwd_dscores"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // The CUDA arm fills the SAME `op` payload field from a fn-local
+    // `const OP` literal in `cuda/softmax.rs` (a second copy of each
+    // name — that arm is a free function without `&self`). A user
+    // matching on the `op` payload must see one name per op on both
+    // devices, so each copy is pinned to `name()`. `cuda` is
+    // `#[cfg(feature = "cuda")]`-gated in `lib.rs`, so on a CPU-only
+    // build the CUDA source TEXT is the only observable form of that
+    // arm; the count assertion keeps the pin non-vacuous.
+    // -------------------------------------------------------------------
+    #[test]
+    fn cuda_arm_op_literal_agrees_with_name_for_every_op_in_this_file() {
+        let names = [
+            SoftmaxLastDimFused::default().name(),
+            SoftmaxBwdDScores.name(),
+        ];
+        let cuda_src = include_str!("../cuda/softmax.rs");
+        assert_eq!(
+            cuda_src.matches("const OP: &str = \"").count(),
+            names.len(),
+            "cuda/softmax.rs must declare exactly one `const OP` per op in this file"
+        );
+        for name in names {
+            assert!(
+                cuda_src.contains(&format!("const OP: &str = \"{name}\";")),
+                "cuda/softmax.rs has no `const OP` equal to `{name}`"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // `softmax_row_f32`'s row-MAX loop `let scaled = scores[i] * scale`
+    // (MUT-1 final run: `*` -> `+` and `*` -> `/` both TIMED OUT instead
+    // of being caught — a resource artifact of the 18-way parallel run,
+    // see that commit's message — and this file's unit tests all PASSED
+    // under both, so nothing here killed them). Both mutants corrupt only
+    // the row max, and softmax is shift-invariant, so at unit scale and
+    // small magnitude they hide inside rounding. A large-magnitude row at
+    // a non-unit scale separates the max loop from the exp loop by more
+    // than f32's `exp` range: `+` puts the "max" at `2000 + 0.01` against
+    // true scaled arguments `<= 20`, so every `exp` underflows to `0`,
+    // `sum == 0`, and the row is `0 / 0 = NaN`; `/` puts it at
+    // `2000 / 0.01` (same). The oracle is the f64 closed form, asserted
+    // finite-and-close (a NaN fails both `is_finite` and `<=`).
+    // -------------------------------------------------------------------
+    #[test]
+    fn row_max_is_taken_over_the_scaled_scores_large_magnitude_non_unit_scale_oracle() {
+        let scores = [0.0f32, 1000.0, 2000.0];
+        let mask = [0.0f32; 3];
+        let scale = 0.01f32;
+        let mut out = [0.0f32; 3];
+        softmax_row_f32(
+            &scores,
+            &mask,
+            &mut out,
+            FullyMaskedPolicy::Propagate,
+            scale,
+        );
+
+        let scaled: Vec<f64> = scores
+            .iter()
+            .map(|&s| f64::from(s) * f64::from(scale))
+            .collect();
+        let max = scaled.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let exps: Vec<f64> = scaled.iter().map(|v| (v - max).exp()).collect();
+        let sum: f64 = exps.iter().sum();
+        for (i, (&o, e)) in out.iter().zip(exps.iter()).enumerate() {
+            let expected = e / sum;
+            assert!(o.is_finite(), "out[{i}] = {o} is not finite");
+            assert!(
+                (f64::from(o) - expected).abs() <= 1e-6,
+                "out[{i}] = {o} vs f64 reference {expected}"
+            );
+        }
     }
 }

@@ -15,7 +15,7 @@
 //! `Arc` can back many forward calls from one instance, which is exactly
 //! what `Saved`'s per-call-freshness argument depends on NOT happening).
 //!
-//! Two checks, at two different scopes:
+//! Three checks:
 //!
 //! 1. `FORBIDDEN_EVERYWHERE` (the `_arc`/`_no_bwd` names): banned in every
 //!    file. Pre-existing STATELESS ops in this crate never call these
@@ -30,24 +30,43 @@
 //!    construction-data-only op, so reusing one instance across calls is
 //!    harmless by construction; banning these globally would flag
 //!    ALREADY-REVIEWED, correct code). The REAL hazard is scoped to
-//!    `ops/flash_attention.rs` specifically — the ONLY file defining a
-//!    `StatefulKernelOp` today (`FlashVarlenAttention`,
-//!    `FlashVarlenBwdHelper`) — which must reach candle's `apply_op1`/
-//!    `apply_op3` ONLY through `super::apply_stateful1`/
-//!    `super::apply_stateful3`, never directly. This test enforces the
-//!    bare-call ban ONLY in that one file, not crate-wide.
+//!    whichever file(s) actually DEFINE a `Saved`-bearing op — which must
+//!    reach candle's `apply_op1`/`apply_op3` ONLY through
+//!    `super::apply_stateful1`/`super::apply_stateful3`, never directly.
 //!
-//! Comment lines (trimmed text starting `//`) are skipped in both checks:
-//! several files discuss these names in PROSE without calling them (e.g.
-//! `ops/softmax.rs`'s esc-037 disposition section: `` (`apply_op1_no_bwd`) ``,
-//! no trailing paren — a bare mention; `jammi-encoders/src/attention.rs`'s
-//! own doc comment additionally quotes a REAL call-syntax example,
-//! `` xs.apply_op1_no_bwd(&SoftmaxLastDim) ``, WITH a trailing paren, of
-//! candle_nn's own pre-existing (non-jammi) softmax path — exactly the
-//! shape that would false-positive without comment-skipping; that file is
-//! outside this test's scanned tree (`jammi-kernels/src` only) today, but
-//! the skip is correctness regardless of scope). No CUDA needed (pure
-//! source-text scan); runs in every default `cargo test -p jammi-kernels`.
+//!    **Scoped by PROPERTY, not by filename** — `10b1f3b`'s audit found the
+//!    previous version hardcoded `flash_attention.rs` by name (advisory
+//!    finding: "discipline test keyed on filename"). A file is in scope iff
+//!    it declares a struct field of type `Saved<...>` on a non-comment line
+//!    ([`declares_a_saved_field`]) — the exact shape every
+//!    `StatefulKernelOp`-implementing op in this crate uses to hold its
+//!    interior-mutable state (`ops::saved`'s module doc). A future stateful
+//!    op added under ANY OTHER filename is caught automatically; the
+//!    previous filename-keyed version would have silently stopped
+//!    enforcing the ban on it.
+//! 3. No `Saved`-bearing struct may derive `Clone`/`Copy`, and no field may
+//!    be `Arc<Saved<...>>` in place of an owned `Saved<...>` — the shape
+//!    `10b1f3b`'s audit demonstrated compiles and ALIASES (`Arc<X>` is
+//!    `Clone` regardless of whether `X` itself is; wrapping the `Saved`
+//!    field in an extra `Arc` makes the OUTER op struct cheaply `Clone`-able
+//!    through `&self`, sidestepping the move-out-of-`&self` compile error
+//!    the crate's whole "cannot hoist a stateful op" argument rests on —
+//!    see `ops/mod.rs`'s `StatefulKernelOp` doc for the corrected claim).
+//!
+//! Comment lines (trimmed text starting `//`) are skipped in all three
+//! checks: several files discuss these names/types in PROSE without using
+//! them (e.g. `ops/softmax.rs`'s esc-037 disposition section:
+//! `` (`apply_op1_no_bwd`) ``, no trailing paren — a bare mention;
+//! `jammi-encoders/src/attention.rs`'s own doc comment additionally quotes
+//! a REAL call-syntax example, `` xs.apply_op1_no_bwd(&SoftmaxLastDim) ``,
+//! WITH a trailing paren, of candle_nn's own pre-existing (non-jammi)
+//! softmax path — exactly the shape that would false-positive without
+//! comment-skipping; that file is outside this test's scanned tree
+//! (`jammi-kernels/src` only) today, but the skip is correctness
+//! regardless of scope; `ops/mod.rs`'s own doc discusses `Saved<T>` in
+//! prose extensively and must NOT be swept into check 2/3's scope by that
+//! alone). No CUDA needed (pure source-text scan); runs in every default
+//! `cargo test -p jammi-kernels`.
 
 use std::fs;
 use std::path::Path;
@@ -62,9 +81,8 @@ const FORBIDDEN_EVERYWHERE: &[&str] = &[
     "apply_op3_no_bwd(",
 ];
 
-/// Needles forbidden ONLY in `ops/flash_attention.rs` — see the module doc's
-/// point 2 for why this is scoped to that one file rather than crate-wide.
-const FORBIDDEN_IN_FLASH_ATTENTION_RS: &[&str] = &[".apply_op1(", ".apply_op2(", ".apply_op3("];
+/// Needles forbidden ONLY in files [`declares_a_saved_field`] scopes.
+const FORBIDDEN_IN_SAVED_FIELD_FILES: &[&str] = &[".apply_op1(", ".apply_op2(", ".apply_op3("];
 
 fn walk_rs_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else {
@@ -84,8 +102,46 @@ fn is_comment_line(line: &str) -> bool {
     line.trim_start().starts_with("//")
 }
 
-fn is_flash_attention_rs(path: &Path) -> bool {
-    path.file_name().is_some_and(|f| f == "flash_attention.rs")
+/// PROPERTY-based scope check (see module doc, point 2): a file is in scope
+/// for the bare-call ban iff it declares a struct FIELD of type `Saved<`
+/// somewhere on a non-comment line. Broad enough to also (harmlessly) scope
+/// `ops/saved.rs` itself (`Saved<T>`'s own definition + its `#[cfg(test)]`
+/// module, neither of which calls `apply_op1/2/3`) — a false POSITIVE
+/// there would just mean an extra file gets checked and passes; the
+/// property must never produce a false NEGATIVE (a real stateful op file
+/// escaping scope), which filename-keying could.
+fn declares_a_saved_field(text: &str) -> bool {
+    text.lines()
+        .any(|line| !is_comment_line(line) && line.contains("Saved<"))
+}
+
+/// Check 3 (module doc, point 3): a `Saved`-scoped file must not derive
+/// `Clone`/`Copy` and must not wrap its `Saved` field in an `Arc`.
+fn clone_copy_or_arc_saved_violations(path: &Path, text: &str) -> Vec<String> {
+    let mut hits = Vec::new();
+    for (line_no, line) in text.lines().enumerate() {
+        if is_comment_line(line) {
+            continue;
+        }
+        if line.contains("#[derive(") && (line.contains("Clone") || line.contains("Copy")) {
+            hits.push(format!(
+                "{}:{}: derives Clone/Copy in a Saved-bearing file — {}",
+                path.display(),
+                line_no + 1,
+                line.trim()
+            ));
+        }
+        if line.contains("Arc<Saved") {
+            hits.push(format!(
+                "{}:{}: Arc<Saved<...>> field — Arc is Clone regardless of Saved's own refusal, \
+                 aliasing the interior-mutable slot — {}",
+                path.display(),
+                line_no + 1,
+                line.trim()
+            ));
+        }
+    }
+    hits
 }
 
 #[test]
@@ -102,10 +158,14 @@ fn no_src_file_bypasses_the_kernelop_stateful_kernelop_gate() {
     );
 
     let mut violations = Vec::new();
+    let mut saved_field_files_seen = 0usize;
     for path in &files {
         let text =
             fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
-        let check_bare_calls = is_flash_attention_rs(path);
+        let in_scope = declares_a_saved_field(&text);
+        if in_scope {
+            saved_field_files_seen += 1;
+        }
         for (line_no, line) in text.lines().enumerate() {
             if is_comment_line(line) {
                 continue;
@@ -120,12 +180,12 @@ fn no_src_file_bypasses_the_kernelop_stateful_kernelop_gate() {
                     ));
                 }
             }
-            if check_bare_calls {
-                for needle in FORBIDDEN_IN_FLASH_ATTENTION_RS {
+            if in_scope {
+                for needle in FORBIDDEN_IN_SAVED_FIELD_FILES {
                     if line.contains(needle) {
                         violations.push(format!(
-                            "{}:{}: {needle:?} (this file's stateful ops must reach candle only \
-                             via super::apply_stateful1/apply_stateful3) — {}",
+                            "{}:{}: {needle:?} (a file declaring a Saved<...> field must reach \
+                             candle only via super::apply_stateful1/apply_stateful3) — {}",
                             path.display(),
                             line_no + 1,
                             line.trim()
@@ -134,16 +194,25 @@ fn no_src_file_bypasses_the_kernelop_stateful_kernelop_gate() {
                 }
             }
         }
+        // Check 3 is ALSO scoped to `in_scope` files: every stateless
+        // (KernelOp) op in this crate deliberately DOES derive Clone/Copy
+        // (that is the whole point of KernelOp's `Copy` bound) — flagging
+        // that crate-wide would ban the correct, common case. The hazard
+        // this check exists for is a Saved-bearing struct ALSO deriving
+        // Clone/Copy (see this file's module doc, point 3).
+        if in_scope {
+            violations.extend(clone_copy_or_arc_saved_violations(path, &text));
+        }
     }
     assert!(
-        !files.is_empty() && files.iter().any(|p| is_flash_attention_rs(p)),
-        "sanity: ops/flash_attention.rs was not found by the walk (feature-gated files are \
-         still on disk regardless of which features this test binary was built with) — the \
-         bare-call check above would be silently untested"
+        saved_field_files_seen >= 2,
+        "sanity: expected at least 2 files declaring a Saved<...> field (ops/saved.rs's own \
+         definition + ops/flash_attention.rs's two op structs) — found {saved_field_files_seen}; \
+         the PROPERTY scope is untested if this is 0/1"
     );
     assert!(
         violations.is_empty(),
-        "found direct call(s) that bypass KernelOp/StatefulKernelOp:\n{}",
+        "found violation(s) of the KernelOp/StatefulKernelOp discipline:\n{}",
         violations.join("\n")
     );
 }
@@ -161,7 +230,7 @@ fn the_forbidden_needle_match_is_not_vacuous() {
 
     let injected_bare = "    let out = qkv.apply_op3(o, grad_o, helper);";
     assert!(
-        FORBIDDEN_IN_FLASH_ATTENTION_RS
+        FORBIDDEN_IN_SAVED_FIELD_FILES
             .iter()
             .any(|n| injected_bare.contains(n)),
         "the bare apply_op3( needle scan does not catch an obvious violation"
@@ -187,17 +256,52 @@ fn the_forbidden_needle_match_is_not_vacuous() {
          comment SKIP, not the needle, is what protects this case"
     );
 
+    // --- Scope property (check 2): a struct field, not a doc mention.
+    let real_field = "    lse: Saved<CudaSlice<f32>>,";
+    assert!(
+        declares_a_saved_field(real_field),
+        "a real Saved<...> struct field must scope the file in"
+    );
+    let no_mention = "    lse: CudaSlice<f32>,";
+    assert!(
+        !declares_a_saved_field(no_mention),
+        "a file mentioning nothing about Saved must not be scoped in"
+    );
+    let comment_only = "//! discusses `Saved<T>` in prose only, never as a field";
+    assert!(
+        !declares_a_saved_field(comment_only),
+        "a Saved<...> MENTION inside a comment must not scope the file in — ops/mod.rs's own \
+         module doc does exactly this and must stay out of scope"
+    );
+
     // Existing, already-reviewed bare `.apply_op3(` call sites in OTHER
-    // files (attention_block.rs, low_rank_residual_linear.rs — both pass a
-    // Copy, stateless op) must NOT be flagged — the scope restriction to
-    // `flash_attention.rs` is load-bearing, not incidental.
-    assert!(!is_flash_attention_rs(Path::new(
-        "crates/jammi-kernels/src/ops/attention_block.rs"
-    )));
-    assert!(!is_flash_attention_rs(Path::new(
-        "crates/jammi-kernels/src/ops/low_rank_residual_linear.rs"
-    )));
-    assert!(is_flash_attention_rs(Path::new(
-        "crates/jammi-kernels/src/ops/flash_attention.rs"
-    )));
+    // (non-Saved-declaring) files must NOT be flagged — the scope
+    // restriction is load-bearing, not incidental.
+    let attention_block_text = "pub(crate) fn foo() { qkv.apply_op3(rope_pack, mask, op) }";
+    assert!(
+        !declares_a_saved_field(attention_block_text),
+        "a file with no Saved<...> field must stay out of scope even if it calls apply_op3"
+    );
+
+    // --- Check 3: Clone/Copy derive and Arc<Saved<...>> detection.
+    let bad_derive = "#[derive(Clone)]\nstruct Evil { lse: Saved<u32> }";
+    assert!(
+        !clone_copy_or_arc_saved_violations(Path::new("evil.rs"), bad_derive).is_empty(),
+        "a #[derive(Clone)] on a Saved-bearing struct must be flagged"
+    );
+    let bad_arc = "struct Evil { lse: Arc<Saved<u32>> }";
+    assert!(
+        !clone_copy_or_arc_saved_violations(Path::new("evil.rs"), bad_arc).is_empty(),
+        "an Arc<Saved<...>> field must be flagged"
+    );
+    let fine = "struct Fine { lse: Saved<u32> }\nimpl super::sealed::Sealed for Fine {}";
+    assert!(
+        clone_copy_or_arc_saved_violations(Path::new("fine.rs"), fine).is_empty(),
+        "a plain owned Saved<...> field with no Clone/Copy derive must NOT be flagged"
+    );
+    let comment_derive = "// #[derive(Clone)] would be wrong here, do not add it";
+    assert!(
+        clone_copy_or_arc_saved_violations(Path::new("commented.rs"), comment_derive).is_empty(),
+        "a #[derive(Clone)] MENTIONED inside a comment must not be flagged"
+    );
 }

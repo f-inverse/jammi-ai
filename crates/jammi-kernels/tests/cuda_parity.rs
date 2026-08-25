@@ -3675,10 +3675,10 @@ fn assert_lora_linear_parity_f32_bit_exact(
 /// rounding point this leg cannot eliminate: the final store of that exact
 /// sum down to `bf16`. The expected reference is built with that SAME
 /// single rounding (`bf16::from_f32(exact_sum)`), and the epilogue's own
-/// two rounding points (`ScaledCastAdd`'s "round delta to `bf16` first,
-/// then add-and-round-once" — see `ops::scaled_cast_add`'s module doc) are
-/// reproduced by hand with the exact same formula
-/// `scaled_cast_add_bf16_f32` uses. This is BIT-EXACT (not a tolerance
+/// ONE rounding point (esc-046, GH#374: `ScaledCastAdd` widens `base` to
+/// `f32`, adds the already-`f32` delta, rounds ONCE — see
+/// `ops::scaled_cast_add`'s module doc) is reproduced by hand with the
+/// exact same formula `scaled_cast_add_bf16_f32` uses. This is BIT-EXACT (not a tolerance
 /// leg): a half-term drop, a wrong row, or a transposed operand would
 /// almost certainly miss this exact reference, unlike the loose
 /// term-magnitude bound `lora_linear_parity_bf16_base_production_width`
@@ -3728,10 +3728,9 @@ fn lora_linear_parity_bf16_exact_integer_fixture_is_bit_exact() {
         .iter()
         .zip(delta_f32_exact.iter())
         .map(|(&base, &delta)| {
-            // Mirrors `scaled_cast_add_bf16_f32` exactly (round delta to
-            // bf16 first, then add-and-round-once).
-            let delta_bf16 = bf16::from_f32(delta * scale);
-            bf16::from_f32(base.to_f32() + delta_bf16.to_f32())
+            // Mirrors `scaled_cast_add_bf16_f32` exactly (esc-046: widen
+            // base to f32, add the f32-scaled delta, round ONCE).
+            bf16::from_f32(base.to_f32() + delta * scale)
         })
         .collect();
 

@@ -6,7 +6,7 @@
 //! (and the `torch.nn.utils.clip_grad_norm_` semantics it implements) lives in
 //! exactly one location rather than being copy-pasted per call site.
 //!
-//! ## Device-side clip (P4b)
+//! ## Device-side clip
 //!
 //! [`clip_gradients`] used to end every trainable [`Var`]'s contribution to
 //! the global norm with a `to_scalar::<f32>()` — a full-pipeline device→host
@@ -795,7 +795,7 @@ mod tests {
     #[test]
     #[serial(grad_clip_sync_read_count)]
     fn refuse_nonfinite_norm_is_red_when_the_check_is_removed() {
-        // RED-first: a NaN total norm must produce a typed error when
+        // A NaN total norm must produce a typed error when
         // `refuse_nonfinite_norm` runs. The mutation this guards against is
         // deleting the `is_finite()` guard inside that function — simulate
         // it by asserting the *positive* behavior here, and rely on
@@ -876,11 +876,12 @@ mod tests {
         assert!(err.contains("non-finite"), "got: {err}");
     }
 
-    /// RED-first (B5): before this fix, `check_every_n_steps > 0 &&
-    /// step.is_multiple_of(check_every_n_steps)` was the WHOLE gate, so
-    /// `step == 1` against `check_every_n_steps == 50` never checked. Mutation
-    /// tried: delete the `step == 1 ||` disjunct from `clip_and_step`'s
-    /// `on_cadence` — this test goes red (an `Ok` where it expects `Err`).
+    /// Why `step == 1` is its own arm: with the modulo cadence alone
+    /// (`check_every_n_steps > 0 && step.is_multiple_of(check_every_n_steps)`
+    /// as the WHOLE gate), `step == 1` against `check_every_n_steps == 50` is
+    /// never checked. Mutation tried: delete the `step == 1 ||` disjunct from
+    /// `clip_and_step`'s `on_cadence` — this test goes red (an `Ok` where it
+    /// expects `Err`).
     #[test]
     #[serial(grad_clip_sync_read_count)]
     fn clip_and_step_always_checks_step_one_regardless_of_cadence() {
@@ -899,11 +900,11 @@ mod tests {
         assert!(err.contains("non-finite"), "got: {err}");
     }
 
-    /// RED-first (B5): a run shorter than `check_every_n_steps` steps end to
-    /// end (e.g. 12 steps against the default interval of 50) never hits a
-    /// multiple of the interval and, before this fix, would train an entire
-    /// run — including a NaN on its very last step — without ever calling
-    /// `refuse_nonfinite_norm`. Mutation tried: delete the `|| is_last_step`
+    /// Why `is_last_step` is its own arm: a run shorter than
+    /// `check_every_n_steps` steps end to end (e.g. 12 steps against the
+    /// default interval of 50) never hits a multiple of the interval and, on
+    /// the modulo cadence alone, would train an entire run — including a NaN
+    /// on its very last step — without ever calling `refuse_nonfinite_norm`. Mutation tried: delete the `|| is_last_step`
     /// disjunct — this test goes red.
     #[test]
     #[serial(grad_clip_sync_read_count)]
@@ -957,9 +958,9 @@ mod tests {
         assert_eq!(before_vals, after);
     }
 
-    /// RED-first (advisory c, both cells): `max_norm.is_nan()` makes
+    /// The non-finite `max_norm` cell, NaN: `max_norm.is_nan()` makes
     /// `max_norm <= 0.0` `false` (family F: a NaN comparison is always
-    /// false, in EITHER direction), so a NaN `max_norm` used to fall through
+    /// false, in EITHER direction), so a NaN `max_norm` would fall through
     /// the disable-clipping guard and into the clip computation — silently
     /// scaling every gradient by a NaN coefficient forever, invisible to
     /// [`refuse_nonfinite_norm`] because `total_norm` (what that function
@@ -979,9 +980,9 @@ mod tests {
         );
     }
 
-    /// RED-first (advisory c, the other cell): `+inf`/`-inf` are equally
+    /// The non-finite `max_norm` cell, ±inf: `+inf`/`-inf` are equally
     /// non-finite `max_norm` values — `f64::INFINITY <= 0.0` is `false` too,
-    /// so this also fell through the same guard before this fix (its
+    /// so this would also fall through the same guard (its
     /// arithmetic happens to clamp back to a merely-wasteful `coef == 1.0`
     /// rather than corrupting every gradient, but it is still a non-finite
     /// tuning parameter this abstraction's contract should never silently

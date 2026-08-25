@@ -522,12 +522,12 @@ impl TrainingLoop {
         // step per full `grad_accum`-sized window, `div_ceil` also covering a
         // trailing partial window). GradCache takes exactly ONE optimizer
         // step per EPOCH (`run_gradcache_epoch`), so its true horizon is
-        // `self.config.epochs`, not `total_steps` — using `total_steps` there
-        // was B2's bug: `global_step + 1 >= total_steps` was false on
-        // GradCache's actual last step whenever `num_batches > 1`, so the
-        // run's real final step never forced `clip_and_step`'s non-finite
-        // check the way a run shorter than `DEFAULT_NORM_CHECK_INTERVAL`
-        // needs it to (see `optimizer::clip_and_step`'s doc). Computed ONCE,
+        // `self.config.epochs`, not `total_steps` — with `total_steps`,
+        // `global_step + 1` never reaches the horizon on GradCache's actual
+        // last step whenever `num_batches > 1`, so the run's real final step
+        // would never force `clip_and_step`'s non-finite check the way a run
+        // shorter than `DEFAULT_NORM_CHECK_INTERVAL` needs it to (see
+        // `optimizer::clip_and_step`'s doc). Computed ONCE,
         // here, and threaded to every `is_last_step` call site below instead
         // of each site re-deriving it — `gradcache_eligible()` is a fixed
         // property of `self.config`/`self.base_model` for the run's whole
@@ -540,30 +540,28 @@ impl TrainingLoop {
         // takes.
         //
         // LAST-STEP LATTICE — every arm/edge `is_last_step` must be right
-        // for, and this fix's disposition for each:
+        // for, and how each is handled (each arm has a run-level oracle in
+        // `last_step_run_harness` driving `run` with a NaN gradient on that
+        // arm's last step):
         //
-        //  - **accumulation window** (`process_batch_loss`'s flush): one step
-        //    per full `grad_accum`-sized window. `total_steps`'s `div_ceil`
-        //    already counts these correctly; unaffected by this fix.
-        //  - **partial last batch** (trailing window smaller than
-        //    `grad_accum`, `batches_per_epoch % grad_accum != 0`): the same
-        //    `div_ceil` above already accounts for it as one extra step;
-        //    unaffected by this fix.
-        //  - **GradCache**: one step per epoch. THE BUG THIS FIX CLOSES —
-        //    `total_optimizer_steps` uses `self.config.epochs` on this arm
-        //    instead of `total_steps`.
+        //  - **accumulation window** (`process_batch_loss`'s window
+        //    boundary): one step per full `grad_accum`-sized window;
+        //    `total_steps`'s `div_ceil` counts these.
+        //  - **partial last batch** (the epoch-end flush of a trailing window
+        //    smaller than `grad_accum`, `batches_per_epoch % grad_accum !=
+        //    0`): the same `div_ceil` counts it as one extra step.
+        //  - **GradCache**: one step per epoch — `total_optimizer_steps` is
+        //    `self.config.epochs` on this arm, not `total_steps`.
         //  - **mined loader** (`trainer.rs`'s hard-negative refresh; see
         //    `mine_hard_negative_loader`'s doc): a row whose mined pool is
         //    entirely excluded is DROPPED, so a mined epoch's row (and
         //    therefore batch/window) count can differ from `train_loader`'s —
         //    what `total_steps` was computed from, once, before the loop.
-        //    This is a PRE-EXISTING desync this fix does NOT resolve: an
-        //    epoch whose mining drops enough rows to change its window count
-        //    can still make `is_last_step` wrong on that epoch, because the
-        //    true per-epoch window count is only known once that epoch's
-        //    `text_chunks()`/mined triplets are built, not upfront. Flagged
-        //    as a known, tracked gap — not silently absorbed into "fixed" by
-        //    this commit.
+        //    This desync is NOT resolved here: an epoch whose mining drops
+        //    enough rows to change its window count can still make
+        //    `is_last_step` wrong on that epoch, because the true per-epoch
+        //    window count is only known once that epoch's `text_chunks()`/
+        //    mined triplets are built, not upfront. A known, open gap.
         //  - **early stopping** (`break` on patience exhaustion): an
         //    early-stopped run's actual last step is whatever `global_step`
         //    reached before the `break`, which `total_optimizer_steps`
@@ -1175,18 +1173,10 @@ impl TrainingLoop {
     /// per-epoch horizon (`self.config.epochs`) rather than the
     /// accumulation-window arm's `total_steps`. Pulled out of the `if` at its
     /// one call site into its own pure function so the boolean condition
-    /// itself — not just its downstream effect on `is_last_step`, three
-    /// calls and a real forward pass away — is directly unit-testable
-    /// without needing a full `run()` call. This is exactly the gap a
-    /// mutation sweep found: deleting the `!` on `is_precomputed` at the
-    /// inlined call site was invisible to every test in this file, because
-    /// the only test that reaches GradCache's `total_optimizer_steps`
-    /// (`gradcache_last_step_oracle`) calls `run_gradcache_epoch` directly
-    /// with a literal value, bypassing this computation entirely — `run()`
-    /// itself is never driven end-to-end with a real GradCache-eligible,
-    /// non-precomputed loader anywhere in this crate's test suite. Testing
-    /// the pure boolean function here closes that gap without needing the
-    /// heavier end-to-end harness.
+    /// itself is directly unit-testable in isolation — a secondary to the
+    /// GradCache arm of `last_step_run_harness`, which drives `run()` with a
+    /// real GradCache-eligible, non-precomputed loader and is what reddens
+    /// when the selection is wrong (e.g. `total_steps` on this arm).
     fn wants_gradcache_horizon(is_precomputed: bool, gradcache_eligible: bool) -> bool {
         !is_precomputed && gradcache_eligible
     }
@@ -1219,11 +1209,11 @@ impl TrainingLoop {
         // Dropout off for the whole GradCache region so the two encode passes
         // (and the logging re-encode) agree. Toggled while no encode closure
         // borrows `self`, so it does not collide with the immutable borrows
-        // below. Concretely, this means a WHOLE GradCache epoch trains with
-        // LoRA dropout OFF — an undocumented (until now) behavior difference
-        // from the standard per-batch training path, flagged by #352; left
-        // as-is here (out of this commit's scope — a follow-up question,
-        // not a defect this commit fixes).
+        // below. Concretely, a WHOLE GradCache epoch trains with LoRA
+        // dropout OFF — a behavior difference from the per-batch training
+        // path that is deliberate: the two-pass gradient equals the
+        // single-pass one only when both passes see the same activations,
+        // and dropout off is what makes them agree.
         self.target.set_training(false);
 
         // Immutable-borrow region: the encode closures borrow `self`, so no
@@ -1663,7 +1653,7 @@ impl TrainingLoop {
     /// the *number* of per-micro-batch host reads for the sim-stats path from
     /// 2 to 0, not just their timing relative to `backward`.
     ///
-    /// **Graph retention (B1).** In production `anchor`/`positive`/`negative`
+    /// **Graph retention.** In production `anchor`/`positive`/`negative`
     /// come from `encode_chunk` over the LoRA `Var`s, so `cosine_similarity`'s
     /// output is TRACKED (`track_op() == true`): its forward subgraph reaches
     /// all the way back to the LoRA weights. Folding a tracked scalar into an
@@ -1678,7 +1668,9 @@ impl TrainingLoop {
     /// suspenders: two detached operands under candle's `BackpropOp::new2`
     /// never re-attach — `op` stays `None` when neither operand tracks — but
     /// detaching both ends keeps that invariant true even if the fold's
-    /// implementation changes to something that isn't a plain `+`). The
+    /// implementation changes to something that isn't a plain `+` — which
+    /// also makes that second `detach` untestable by construction, see the
+    /// fold's own comment). The
     /// result: [`SimStats`] is always a graph LEAF (`track_op() == false`) at
     /// every point in the epoch, regardless of how many micro-batches have
     /// folded into it — and, being neither `is_variable()` nor carrying an
@@ -1735,7 +1727,7 @@ impl TrainingLoop {
                     .map_err(|e| JammiError::FineTune(format!("{e}")))?
             };
             // Detach BEFORE this scalar ever reaches the epoch-lifetime
-            // accumulator (see the doc's "Graph retention (B1)" section) —
+            // accumulator (see the doc's "Graph retention" section) —
             // this is a logging mean, never a scored loss, so it must never
             // hold the forward graph open.
             Ok(mean.detach())
@@ -1749,6 +1741,14 @@ impl TrainingLoop {
         };
 
         let fold = |acc: &Tensor, new: &Tensor| -> Result<Tensor> {
+            // Untestable by construction: both operands are already detached
+            // leaves, so candle's `BackpropOp::new2` gives their sum no `op`
+            // and this `detach()` is observationally the identity — no
+            // fixture can make deleting it visible (a mutant that removes it
+            // survives by design, not by a coverage gap). Kept as the belt
+            // to `batch_mean_f32`'s suspenders: it is what keeps the
+            // accumulator a leaf if this fold ever stops being a plain `+`
+            // over detached operands.
             (acc + new)
                 .map(|t| t.detach())
                 .map_err(|e| JammiError::FineTune(format!("{e}")))
@@ -2959,19 +2959,16 @@ mod tests {
         (sq as f64).sqrt()
     }
 
-    /// RED-first (mutants sweep finding, P4b R2): `total_optimizer_steps`
-    /// (in `run`) must use GradCache's per-epoch horizon ONLY when the loader
-    /// is NOT precomputed AND the run is GradCache-eligible — all four
-    /// truth-table cells pinned directly, since no test drives `run()`
-    /// end-to-end with a real GradCache-eligible, non-precomputed loader
-    /// (see `wants_gradcache_horizon`'s doc).
+    /// Secondary to `last_step_run_harness::gradcache_arm_refuses_a_nonfinite_
+    /// gradient_on_the_runs_last_step` (which drives `run()` end-to-end):
+    /// `total_optimizer_steps` (in `run`) must use GradCache's per-epoch
+    /// horizon ONLY when the loader is NOT precomputed AND the run is
+    /// GradCache-eligible — all four truth-table cells pinned directly.
     ///
-    /// Mutation tried: delete the `!` on `is_precomputed` at this function's
-    /// inlined call site in `run` (its pre-extraction form) — invisible to
-    /// every other test in this file. Mutation tried against this function's
-    /// OWN body (`!is_precomputed && gradcache_eligible` → `is_precomputed &&
-    /// gradcache_eligible`): the `(false, true)` case flips from `true` to
-    /// `false` — this test goes red.
+    /// Mutation tried against this function's body (`!is_precomputed &&
+    /// gradcache_eligible` → `is_precomputed && gradcache_eligible`): the
+    /// `(false, true)` case flips from `true` to `false` — this test goes
+    /// red.
     #[test]
     fn wants_gradcache_horizon_requires_a_non_precomputed_loader() {
         assert!(
@@ -3868,7 +3865,7 @@ mod tests {
     }
 }
 
-/// Host-read accounting for the per-micro-batch training path (B3 close):
+/// Host-read accounting for the per-micro-batch training path:
 /// [`TrainingLoop::accumulate_sim_stats`] must issue ZERO device→host reads
 /// (it used to do two `to_scalar::<f32>()` per triplet micro-batch, BEFORE
 /// `backward` ever ran), and [`TrainingLoop::process_batch_loss`] must issue
@@ -3978,19 +3975,17 @@ mod host_read_discipline {
         assert!(stats.is_none());
     }
 
-    /// RED-first (B1): before this fix, `accumulate_sim_stats` folded a
-    /// TRACKED per-batch mean (`track_op() == true` whenever
+    /// Folding a TRACKED per-batch mean (`track_op() == true` whenever
     /// `anchor`/`positive`/`negative` come from a real forward pass, as they
     /// do in production via `encode_chunk`'s LoRA `Var`s) into the epoch
-    /// accumulator with no `detach()`, retaining every micro-batch's forward
-    /// subgraph for the whole epoch — the auditor measured the accumulator's
-    /// `sorted_nodes().len()` growing by a fixed per-call increment (23, 46,
-    /// 69, 92, 115) over five calls. This test builds its triplet batch
-    /// THROUGH a `Var` (`w.as_tensor()` has `is_variable() == true`, so every
+    /// accumulator with no `detach()` retains every micro-batch's forward
+    /// subgraph for the whole epoch — the accumulator's
+    /// `sorted_nodes().len()` grows by a fixed per-call increment on every
+    /// fold. This test builds its triplet batch THROUGH a `Var`
+    /// (`w.as_tensor()` has `is_variable() == true`, so every
     /// `cosine_similarity`/`mean_all` op stacked on top of it is tracked) — a
     /// leaf `Tensor::new` fixture, as the two tests above use, is untracked
-    /// from the start and CANNOT see this regression (the audit's exact
-    /// point: "the existing tests use leaf tensors and cannot see this").
+    /// from the start and CANNOT see this regression.
     ///
     /// Mutation tried: delete the `.detach()` calls inside
     /// `accumulate_sim_stats` (both the per-batch mean's and the fold's) —
@@ -4048,9 +4043,8 @@ mod host_read_discipline {
         }
     }
 
-    /// RED-first (B3): before this fix, `accumulate_sim_stats` did two
-    /// `to_scalar::<f32>()` calls on every triplet micro-batch, BEFORE
-    /// `backward` ever ran. Mutation tried: reinstate a `to_scalar` inside
+    /// `accumulate_sim_stats` used to do two `to_scalar::<f32>()` calls on
+    /// every triplet micro-batch, BEFORE `backward` ever ran. Mutation tried: reinstate a `to_scalar` inside
     /// `accumulate_sim_stats` (re-add the old per-call host read that used to
     /// populate `epoch_pos_sim`/`epoch_neg_sim` as `f64`s directly, instead of
     /// folding device tensors) — `accumulate_sim_stats_never_reads_the_device_
@@ -4149,7 +4143,7 @@ mod host_read_discipline {
     }
 }
 
-/// B2/B3 last-step lattice row: **GradCache**. `run_gradcache_epoch` has no
+/// Last-step lattice row: **GradCache**. `run_gradcache_epoch` has no
 /// loss-value divergence check of its own (unlike `process_batch_loss`'s
 /// `loss_val.is_nan() || loss_val > 100.0` guard) — the ONLY thing that can
 /// ever catch a diverged GradCache step is `clip_and_step`'s cadence-gated
@@ -4245,7 +4239,9 @@ mod gradcache_last_step_oracle {
 
     const HIDDEN: usize = 32; // tiny_bert's hidden width.
 
-    /// RED-first (B2/B3): `run_gradcache_epoch`'s `is_last_step` must reflect
+    /// Secondary to `last_step_run_harness::gradcache_arm_refuses_a_nonfinite_
+    /// gradient_on_the_runs_last_step` (which drives `run()` end-to-end):
+    /// `run_gradcache_epoch`'s `is_last_step` must reflect
     /// GradCache's TRUE per-epoch horizon (`self.config.epochs`), not the
     /// accumulation-window arm's `ceil(batches / grad_accum) * epochs` — the
     /// two differ whenever a GradCache epoch chunks into more than one
@@ -4265,7 +4261,7 @@ mod gradcache_last_step_oracle {
     /// reaches).
     ///
     /// Mutation tried: hardcode `is_last_step = false` inside
-    /// `run_gradcache_epoch` (the bug B2 fixed, reintroduced) — this test
+    /// `run_gradcache_epoch` — this test
     /// goes red: the second call returns `Ok` with a NaN weight trained in
     /// silently, instead of the typed non-finite refusal.
     #[test]
@@ -4738,8 +4734,8 @@ mod last_step_horizon_run_oracles {
     /// 101, then disarm) — never on all 8.
     ///
     /// Mutation tried: decide `is_last_step` with `step >= horizon` (the
-    /// pre-fix form) — RED (8 reads, one per step: the sync amplification
-    /// this fix closes). The contract's run-level bound is
+    /// `>=` form) — RED (8 reads, one per step: the sync amplification the
+    /// one-shot arm exists to prevent). The contract's run-level bound is
     /// `≤ ceil(N / interval) + 2` reads over `N` steps; the exact count for
     /// this fixture is pinned alongside it.
     #[test]

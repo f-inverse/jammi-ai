@@ -894,6 +894,16 @@ impl ModernBertAttention {
     /// that once for the whole forward (see that struct's doc for the
     /// launch count). The eager fallback keeps consuming the `F32`
     /// `masks.extended`/`masks.local_band` pair verbatim.
+    ///
+    /// This is the call site `AttentionBlockFused`'s own module doc's
+    /// "`BF16` validated-coverage ceiling" section cites: the `qkv`
+    /// reaching the fused arm here, on the REAL ModernBERT-large
+    /// checkpoint (`batch=8, seq=512`, seed 42, sha
+    /// `8922094aa35d381d108420fefe82cba122bf6ebb`), measures
+    /// `max|qkv| ≈ 9`–`18` — an order of magnitude past that op's own
+    /// `BF16`-derived-bound validated range (`|qkv| <= 1`). The op still
+    /// computes correctly there; see that section for what IS and is NOT
+    /// claimed at this amplitude.
     fn forward_training_attention(
         &self,
         qkv: &Tensor,
@@ -3581,6 +3591,129 @@ mod tests {
         assert_eq!(
             after2.fused, before2.fused,
             "set_training(false) restores eval"
+        );
+    }
+
+    /// esc-P3-B0's encoder-level regression oracle: drives the REAL
+    /// `forward_training_attention` fused arm and the REAL
+    /// `forward_eager_training_attention_composition` (not a synthetic
+    /// `jammi-kernels` test oracle) at PRODUCTION `heads=16`/`head_dim=64`
+    /// and `seq=512` — the exact `(b, h, s, d)` cell the round's own
+    /// pod measurement found flat-loss on before this round's fix (see
+    /// `ops::attention_block`'s module doc's "GEMM operand form is a
+    /// determinism concern" section for the measured before/after
+    /// numbers) — on a LOCAL layer (the sliding-window band is exactly
+    /// where the fix's `dv`/`dp`/`dkr` GEMMs matter: those gradients flow
+    /// through every masked AND unmasked key in the window). `qkv` is a
+    /// tracked `Var` (never a leaf fixture — clause 3: LoRA gradients are
+    /// downstream of a `Var` in production) at this op's own validated
+    /// bf16 amplitude ceiling (`|qkv| <= 1`, module doc's "Domain"
+    /// section), so both `out` and `dqkv` are held to `Bf16LegBounds`-
+    /// style derived bounds even though this test runs at `F32` (the CPU
+    /// arm's only dtype) — F32 has no meaningful bf16 ULP bound, so this
+    /// asserts a much tighter, F32-appropriate bound instead (`1e-4`
+    /// absolute, derived from `F32_TOL`-class tolerances this crate's own
+    /// other cross-arm oracles use, not bf16's).
+    #[test]
+    fn fused_attention_block_matches_eager_lora_gradients_at_production_seq_on_head64() {
+        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let device = Device::Cpu;
+        let b = 2usize;
+        let s = 512usize; // production ModernBERT-large seq the pod repro used
+        let h = 16usize; // production ModernBERT-large head count
+        let d = ATTENTION_BLOCK_HEAD_DIM;
+        let half_window = 64usize; // production local_attention=128 -> half_window=64
+        let attn = attention_block_fixture(true, h, s, &device);
+
+        let n = b * s * 3 * h * d;
+        let qkv_v: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.0197).sin() * 0.9).collect();
+        let dy_v: Vec<f32> = (0..(b * s * h * d))
+            .map(|i| ((i as f32) * 0.0071).cos() * 0.6 + 0.05)
+            .collect();
+        let dy = Tensor::from_vec(dy_v, (b, s, h * d), &device).unwrap();
+
+        // Padding-free extended mask (matches the bench's own synthetic
+        // all-ones attention_mask — the cell the round's own pod repro
+        // actually exercised) combined with the production window band,
+        // via the SAME `FusedAttentionMasks::build`/`sliding_window_mask`
+        // the real `ModernBert::forward_hidden` call site uses.
+        let extended = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
+        let band = crate::mask::sliding_window_mask(s, half_window, &device).unwrap();
+        let fused_masks = FusedAttentionMasks::build(&extended, Some(&band), DType::F32).unwrap();
+
+        let run = |label: &str, force_eager: bool| -> (Vec<f32>, Vec<f32>) {
+            let qkv = Var::from_tensor(
+                &Tensor::from_vec(qkv_v.clone(), (b, s, 3 * h * d), &device).unwrap(),
+            )
+            .unwrap();
+            let masks = TrainingMaskInputs {
+                extended: &extended,
+                local_band: Some(&band),
+                fused: &fused_masks,
+            };
+            let out = if force_eager {
+                attn.forward_eager_training_attention_composition(
+                    qkv.as_tensor(),
+                    b,
+                    s,
+                    h,
+                    d,
+                    &extended,
+                    Some(&band),
+                )
+                .unwrap()
+            } else {
+                attn.forward_training_attention(qkv.as_tensor(), b, s, h, d, masks)
+                    .unwrap()
+            };
+            let loss = (&out * &dy).unwrap().sum_all().unwrap();
+            let grads = loss.backward().unwrap();
+            let dqkv: Vec<f32> = grads
+                .get(&qkv)
+                .unwrap_or_else(|| panic!("{label}: no dqkv"))
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let out_v: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
+            (out_v, dqkv)
+        };
+
+        let before = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+        let (out_fused, dqkv_fused) = run("fused", false);
+        let after = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+        assert_eq!(
+            after.fused,
+            before.fused + 1,
+            "the fused arm must actually admit at this (b,h,s,d) cell — a domain miss would \
+             silently fall back to eager and make this test compare eager against itself"
+        );
+        let (out_eager, dqkv_eager) = run("eager", true);
+
+        assert_eq!(out_fused.len(), out_eager.len());
+        assert_eq!(dqkv_fused.len(), dqkv_eager.len());
+        const TOL: f32 = 1e-4;
+        let mut max_out_delta = 0f32;
+        for (c, g) in out_fused.iter().zip(out_eager.iter()) {
+            max_out_delta = max_out_delta.max((c - g).abs());
+        }
+        assert!(
+            max_out_delta <= TOL,
+            "fused vs eager forward output at production (b={b},h={h},s={s},d={d}) local layer: \
+             max|Δ|={max_out_delta:e} > {TOL:e}"
+        );
+        let mut max_dqkv_delta = 0f32;
+        for (c, g) in dqkv_fused.iter().zip(dqkv_eager.iter()) {
+            max_dqkv_delta = max_dqkv_delta.max((c - g).abs());
+        }
+        assert!(
+            max_dqkv_delta <= TOL,
+            "fused vs eager dqkv at production (b={b},h={h},s={s},d={d}) local layer: \
+             max|Δ|={max_dqkv_delta:e} > {TOL:e} — this is exactly the esc-P3-B0 regression \
+             oracle: before the fix this delta was large enough to flatten a real 20-step LoRA \
+             training loss trajectory on ModernBERT-large"
         );
     }
 

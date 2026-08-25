@@ -84,6 +84,10 @@ use candle_core::{
 // identical `pub(crate)` rationale.
 pub(crate) mod attention_block;
 mod axpy;
+// Private, like `axpy`/`scaled_cast_add`: `crate::cuda::cast_scale` does its
+// own domain checks directly (mirroring `crate::cuda::scaled_cast_add`'s
+// shape) rather than importing a shared helper from here.
+mod cast_scale;
 mod dropout;
 // `flash-attn`-gated: `crate::flash` (the FFI boundary) exists only under
 // that feature, so the op composing it can only exist under it too — see
@@ -137,6 +141,17 @@ pub const ATTENTION_BLOCK_MAX_SEQ: usize = attention_block::MAX_SEQ;
 /// assumed one).
 pub const ATTENTION_BLOCK_WINDOW_MASKED_VALUE: f32 = attention_block::WINDOW_MASKED_VALUE;
 pub use axpy::Axpy;
+/// TEST-ONLY preallocated-output entry points (doc-hidden in
+/// `ops::cast_scale`'s own doc — see there for why they exist:
+/// `tests/cuda_parity.rs`'s isolated-timing harness needs to separate a
+/// kernel's own device cost from `cuMemAlloc`/`cuMemFree`'s, which cudarc
+/// does not cache). Re-exported here, gated identically to their
+/// definitions, so the integration-test crate (which only sees this
+/// crate's PUBLIC surface) can reach them without `ops::cast_scale`
+/// itself becoming a public module.
+#[cfg(feature = "cuda")]
+pub use cast_scale::{cast_add_bf16_into, cast_scale_bf16_f32_into};
+pub use cast_scale::{CastAddBf16, CastScaleBf16F32};
 pub use dropout::{DropoutFused, PhiloxKatProbe};
 #[cfg(feature = "flash-attn")]
 pub use flash_attention::flash_attention_varlen;

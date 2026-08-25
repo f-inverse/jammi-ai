@@ -96,6 +96,22 @@
 //! `"rope_fused"` (`modernbert.rs:478`), `"softmax_last_dim_fused"`
 //! (`modernbert.rs:1188`).
 //!
+//! **Subsumed by `"lora_linear_fused"`** (reachable ONLY when
+//! `"lora_linear_fused"` itself admits Fused — `crate::ops::
+//! LowRankResidualLinear::bwd` is the sole call site that ever passes
+//! either key to [`admit`], and `LowRankResidualLinear` is only
+//! constructed on the branch where `lora_linear_fused` already admitted;
+//! see `jammi-lora/src/lora_linear.rs:642-644` and `ops::cast_scale`'s
+//! module doc's "cast-boundary lever"): `"cast_scale_bf16_f32"` and
+//! `"cast_add_bf16"` (`ops/low_rank_residual_linear.rs`'s
+//! `admit_cast_boundary`, called at its B1/B3 sites). Each ALSO has its
+//! own runtime dtype gate above the `admit` call (`grad_res`/`base_dtype`
+//! must be `BF16`, not merely `lora_linear_fused` admitting) — a
+//! `JAMMI_KERNELS_DISABLE=cast_scale_bf16_f32`-only run on a checkpoint
+//! where `lora_linear_fused` never admits, OR where the base/grad_res
+//! dtype is `F32` (nothing to fuse, see that op's own module doc), is
+//! INVALID for the same reason as the attention-block case above.
+//!
 //! **Registered but permanently dead** (never passed to [`admit`] in
 //! today's call graph — see the "safety property" section below):
 //! `"lora_epilogue"` and `"lora_dropout"` (`counters_for("lora_epilogue")` /

@@ -299,7 +299,7 @@ use candle_core::{
     CpuStorage, CustomOp1, CustomOp2, CustomOp3, DType, Error, Layout, Result, Shape, Tensor,
 };
 
-use super::{DropoutFused, ScaledCastAdd};
+use super::{CastAddBf16, CastScaleBf16F32, DropoutFused, ScaledCastAdd};
 
 /// The Philox draw's `(seed, layer_id, forward_idx, p)` key, reserved ONCE
 /// per site per forward by the CALL SITE's own key-reservation function
@@ -525,6 +525,58 @@ pub(crate) fn materialize_contiguous_if_needed<S: BackendStorage>(
     Ok(Some((owned, Layout::contiguous(l.shape().clone()))))
 }
 
+/// Converts [`crate::admission::admit`]'s own error type (`KernelError`,
+/// NOT bound to `candle_core::Result` — see `crate::error`'s module doc for
+/// why this crate deliberately has no blanket `From<KernelError> for
+/// candle_core::Error` impl) to `candle_core::Error` at the one boundary
+/// `bwd` crosses it: `CustomOp3::bwd`'s signature is fixed by candle-core
+/// to `candle_core::Result`, so `admit(..)?` inside it needs an explicit
+/// conversion. `predicate_holds` is always `true` at both of this file's
+/// two call sites (Wave 1 (e)/(f) — see `bwd`'s own comments): the fused
+/// kernel is structurally applicable for every `BF16` case `bwd` reaches
+/// it from (this op's own domain already restricts `x`'s dtype to `F32`/
+/// `BF16`), so there is no runtime domain gap to gate on — `admit` is
+/// called purely for its `JAMMI_KERNELS_DISABLE`/`DispatchCounters`
+/// observability, not to decide fused-vs-eager itself.
+///
+/// This `true` is a DTYPE-applicability claim only — it says nothing about
+/// the CONTIGUITY of `grad_res` (cast-scale site) or `dx_base_2d`/
+/// `d_x_lora_f32_2d` (cast-add site), which `CastScaleBf16F32`/
+/// `CastAddBf16`'s own CUDA arms separately require and enforce with a
+/// TYPED `Error::RequiresContiguous` refusal (never a silent misread of a
+/// strided view). That refusal is believed unreachable in production
+/// today: `ops::cast_scale`'s module doc's "Contiguity at the call site"
+/// section derives, from candle's own `GradStore::or_insert`/`insert`
+/// (`backprop.rs`, `zeros_like` + `add`) and `BackendStorage::matmul`
+/// (`cuda_backend/mod.rs`'s `dev.alloc::<T>(elem_count)`), that all three
+/// tensors are FRESH, contiguous allocations by construction every time
+/// `bwd` is reached through candle's normal `Tensor::backward` walk.
+/// Making `predicate_holds` an `is_contiguous()` check on those tensors
+/// instead of a hardcoded `true` was considered and rejected: it would
+/// only change behaviour on a branch already proven unreachable, it would
+/// tax every real backward pass with three extra `is_contiguous()` calls
+/// on a hot path, and — worse — in `Strict` mode a failed predicate is a
+/// hard `KernelError::StrictModeFallback` (`admission.rs`'s `admit_inner`),
+/// a SECOND error surface for the exact case `RequiresContiguous` already
+/// covers, rather than one typed refusal a reader has to reason about
+/// once. The CUDA kernel's own `RequiresContiguous` stays the single
+/// source of truth for that (impossible-in-practice) case; kept as
+/// defense in depth, not trusted away, per this crate's usual "an op
+/// trusts no caller for its own domain" doctrine.
+fn admit_cast_boundary(
+    op: &'static str,
+    predicate_name: &'static str,
+) -> Result<crate::admission::DispatchOutcome> {
+    crate::admission::admit(
+        crate::admission::admission_mode(),
+        op,
+        predicate_name,
+        true,
+        crate::admission::counters_for(op),
+    )
+    .map_err(|e| Error::Msg(e.to_string()))
+}
+
 impl super::sealed::Sealed for LowRankResidualLinear {}
 
 impl CustomOp3 for LowRankResidualLinear {
@@ -704,15 +756,34 @@ impl CustomOp3 for LowRankResidualLinear {
         let m: usize = dims[..dims.len() - 1].iter().product();
 
         // d_lora = cast_f32(dy) * scale — ScaledCastAdd::bwd's own order
-        // (cast to the LoRA dtype FIRST, scale second).
-        let dy_f32 = if grad_res.dtype() == DType::F32 {
-            grad_res.clone()
+        // (cast to the LoRA dtype FIRST, scale second). The `grad_res` ==
+        // `F32` branch has nothing to fuse (a single `affine` launch is
+        // already minimal); the `BF16` branch is the cast-boundary lever's
+        // Wave 1 (e) — `CastScaleBf16F32` folds the widening cast and the
+        // affine into one kernel (`ops::cast_scale`'s module doc has the
+        // full traffic model and bit-identity derivation). Dispatched
+        // through `admit` so `JAMMI_KERNELS_DISABLE=cast_scale_bf16_f32`
+        // forces the original two-kernel chain back on for a same-build
+        // forced A/B, and the dispatch count is observable either way
+        // (zero dispatch is RED, never green — guide §3.5).
+        let d_lora_2d = if grad_res.dtype() == DType::F32 {
+            grad_res
+                .affine(f64::from(self.scale), 0.0)?
+                .reshape((m, outf))?
         } else {
-            grad_res.to_dtype(DType::F32)?
+            let dy_f32 = match admit_cast_boundary(
+                "cast_scale_bf16_f32",
+                "grad_res_is_bf16_a_fusable_two_kernel_chain",
+            )? {
+                crate::admission::DispatchOutcome::Fused => {
+                    super::apply1(grad_res, CastScaleBf16F32::new(f64::from(self.scale)))?
+                }
+                crate::admission::DispatchOutcome::Eager => grad_res
+                    .to_dtype(DType::F32)?
+                    .affine(f64::from(self.scale), 0.0)?,
+            };
+            dy_f32.reshape((m, outf))?
         };
-        let d_lora_2d = dy_f32
-            .affine(f64::from(self.scale), 0.0)?
-            .reshape((m, outf))?;
 
         // Recompute x32 / xd / h (no save-for-backward in candle 0.11).
         let x32_2d = if base_dtype == DType::F32 {
@@ -757,17 +828,37 @@ impl CustomOp3 for LowRankResidualLinear {
             Some(op) => super::apply1(&d_xd, op)?,
             None => d_xd,
         };
-        let d_x_lora_2d = if base_dtype == DType::F32 {
-            d_x_lora_f32_2d
-        } else {
-            d_x_lora_f32_2d.to_dtype(base_dtype)?
-        };
-        let d_x_lora = d_x_lora_2d.reshape(x.shape())?;
-
-        // dx = dy @ w + d_x_lora, at the base dtype.
+        // dx = dy @ w + d_x_lora, at the base dtype. The `base_dtype ==
+        // F32` branch has nothing to fuse (a single `badd_f32` launch is
+        // already minimal — `d_x_lora_f32_2d` needs no cast at all); the
+        // `BF16` branch is the cast-boundary lever's Wave 1 (f) —
+        // `CastAddBf16` folds the narrowing cast and the residual add into
+        // one kernel, rounding `d_xd` to `bf16` IN-REGISTER first and then
+        // adding in native `bf16` (`ops::cast_scale`'s module doc has the
+        // full traffic model, the rounding-order derivation, and the
+        // double-rounding-safety argument for the CPU arm). Dispatched
+        // through `admit` so `JAMMI_KERNELS_DISABLE=cast_add_bf16` forces
+        // the original two-kernel chain back on for a same-build forced
+        // A/B (guide §3.5/§3.6).
         let dy_base_2d = grad_res.reshape((m, outf))?;
-        let dx_base = dy_base_2d.matmul(w)?.reshape(x.shape())?;
-        let dx = (&dx_base + &d_x_lora)?;
+        let dx_base_2d = dy_base_2d.matmul(w)?; // [M, in], base_dtype.
+        let dx_2d = if base_dtype == DType::F32 {
+            (&dx_base_2d + &d_x_lora_f32_2d)?
+        } else {
+            match admit_cast_boundary(
+                "cast_add_bf16",
+                "base_dtype_is_bf16_a_fusable_two_kernel_chain",
+            )? {
+                crate::admission::DispatchOutcome::Fused => {
+                    super::apply2(&dx_base_2d, &d_x_lora_f32_2d, CastAddBf16::new())?
+                }
+                crate::admission::DispatchOutcome::Eager => {
+                    let d_x_lora_2d = d_x_lora_f32_2d.to_dtype(base_dtype)?;
+                    (&dx_base_2d + &d_x_lora_2d)?
+                }
+            }
+        };
+        let dx = dx_2d.reshape(x.shape())?;
 
         // The MIRROR gate (family D — the same doctrine as the
         // `!dweight_needed && w.is_variable()` refusal above, but this
@@ -2200,20 +2291,25 @@ mod tests {
         }
     }
 
-    // Oracle B (isolates the final `d_x_lora_2d` downcast specifically,
+    // Oracle B (isolates the final `dx_2d` fused-vs-plain-add branch,
     // which Oracle A's fixture cannot reach — see this test's own
     // module-doc analysis: with `base_dtype = BF16`, the all-BF16 fixture
     // always fails at the FINAL `dy_base_2d.matmul(w)` line, one step
-    // BEFORE that downcast's own effect (`d_x_lora`'s dtype) is ever
-    // consumed by the `dx_base + d_x_lora` addition). Here `w`/`grad_res`
-    // are F32 (so that final matmul-and-add DOES succeed, or fails for a
-    // REASON ISOLATED to the downcast): `x` alone is BF16, so the `x`
-    // upcast (`let x32_2d = ...`) correctly lifts it to F32 for the
-    // LoRA-path GEMMs, and the `let d_x_lora_2d = if base_dtype ==
-    // DType::F32` branch is what decides whether `d_x_lora` is cast back
-    // to `x`'s own BF16 (correct — mismatches `dx_base`'s F32, giving
-    // `DTypeMismatchBinaryOp` at the final add) or left at F32 (that
-    // branch mutated — matches `dx_base`, so the call WRONGLY succeeds).
+    // BEFORE `dx_2d`'s own branch is ever reached). Here `w`/`grad_res`
+    // are F32 (so that final matmul DOES succeed) and `x` alone is BF16,
+    // so `base_dtype == BF16`: the `let dx_2d = if base_dtype == DType::F32
+    // { .. } else { .. CastAddBf16 .. }` branch takes the CastAddBf16 arm,
+    // which requires its FIRST argument (`dx_base_2d`) to be `BF16` — but
+    // `dx_base_2d = dy_base_2d.matmul(w)` is `F32` here (both operands are
+    // F32), so `CastAddBf16::cpu_fwd`'s own domain check refuses it with a
+    // typed `UnsupportedDTypeForOp(F32, "cast_add_bf16")`. This is the
+    // POST-cast-boundary-lever descendant of the pre-fusion
+    // `dx_base + d_x_lora` `DTypeMismatchBinaryOp` this oracle used to
+    // observe (MUT-1): the branch it isolates moved (from a bare downcast
+    // `if` to `CastAddBf16`'s own dtype match), but the property proven is
+    // the same — a `base_dtype == BF16` site with a mismatched `w`/`x`
+    // dtype fails loudly rather than silently computing with `x`'s F32
+    // gradient miscast as `bf16`.
     #[test]
     fn bwd_direct_mixed_dtype_oracle_isolates_the_final_downcast_branch() {
         let device = Device::Cpu;
@@ -2239,18 +2335,22 @@ mod tests {
 
         let op = LowRankResidualLinear::new(1.0, inf, outf, r, None, true).unwrap();
         let err = op.bwd(&x, &w, &ab, &res_dummy, &grad_res).expect_err(
-            "x=BF16 with w/grad_res=F32 must fail at the final dx_base + d_x_lora add \
-                 (dx_base is F32, d_x_lora is correctly cast back to x's own BF16) — success \
-                 here means the final downcast to base_dtype was skipped",
+            "x=BF16 with w/grad_res=F32 must fail inside CastAddBf16's own domain check \
+                 (dx_base_2d is F32, but base_dtype=BF16 routes it through the fused \
+                 cast_add_bf16 op, which requires a BF16 first argument) — success here means \
+                 the fused-vs-plain-add branch was skipped or CastAddBf16 silently accepted F32",
         );
-        // Also a candle-RAISED error (the `+` on two mismatched-dtype
-        // `Tensor`s) — see `peel_backtrace`'s doc.
-        match peel_backtrace(&err) {
-            Error::DTypeMismatchBinaryOp { lhs, rhs, .. } => {
-                assert_eq!(*lhs, DType::F32);
-                assert_eq!(*rhs, DType::BF16);
+        // This op's OWN typed refusal (`CastAddBf16::cpu_fwd`), not a
+        // candle-raised one — no `.bt()` peeling needed (see the module
+        // doc's "CPU BF16 matmul" section for when peeling IS required).
+        match err {
+            Error::UnsupportedDTypeForOp(dtype, op) => {
+                assert_eq!(dtype, DType::F32);
+                assert_eq!(op, "cast_add_bf16");
             }
-            other => panic!("expected DTypeMismatchBinaryOp{{F32, BF16}}, got {other:?}"),
+            other => {
+                panic!("expected UnsupportedDTypeForOp(F32, \"cast_add_bf16\"), got {other:?}")
+            }
         }
     }
 

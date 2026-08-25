@@ -75,19 +75,38 @@ pub fn lora_epilogue_dispatch_snapshot() -> DispatchSnapshot {
     lora_epilogue_counters().snapshot()
 }
 
-/// The eager `[mul, cast, add]` composition the fused epilogue replaces:
-/// `base_out + cast_to(base_out.dtype())(lora_out * scaling)`. Kept as its
-/// own function so both the eval-mode path (which always uses it — see
-/// `forward`'s doc) and the training-mode fallback (when the fused
-/// kernel's domain does not hold) share exactly one implementation.
+/// The eager `[mul, add, cast]` composition the fused epilogue replaces:
+/// `cast_to(base_out.dtype())(cast_to(lora_out.dtype())(base_out) +
+/// lora_out * scaling)` — esc-046 fix (GH#374): `base_out` widens to
+/// `lora_out`'s (`f32`) dtype (lossless), adds the already-scaled `f32`
+/// delta, and the SUM rounds to `base_out`'s original dtype ONCE, matching
+/// PEFT's `Linear.forward` (`peft/tuners/lora/layer.py` 1044-1069,
+/// `v0.20.0`): torch's `+` promotes a bf16 `result` to the delta's `f32`
+/// dtype under ordinary type promotion (no rounding lost on `result`'s
+/// side), adds in `f32`, and only THEN casts back down once via
+/// `.to(torch_result_dtype)`. An earlier revision of this function cast
+/// the scaled delta DOWN to `base_out`'s dtype BEFORE the add (an extra
+/// round point PEFT's own source never takes — see
+/// `jammi_kernels::ops::ScaledCastAdd`'s module doc, corrected in the same
+/// round; both arms MUST move together or the same-build fused-vs-eager
+/// A/B goes blind to exactly this class of defect, per esc-046's own
+/// control clauses). Kept as its own function so both the eval-mode path
+/// (which always uses it — see `forward`'s doc) and the training-mode
+/// fallback (when the fused kernel's domain does not hold) share exactly
+/// one implementation.
 fn eager_epilogue(base_out: &Tensor, lora_out: &Tensor, scaling: f64) -> Result<Tensor, LoraError> {
     let scaled = (lora_out * scaling)?;
-    let scaled_cast = if scaled.dtype() != base_out.dtype() {
-        scaled.to_dtype(base_out.dtype())?
+    let base_dtype = base_out.dtype();
+    let sum = if base_dtype == scaled.dtype() {
+        (base_out + &scaled)?
     } else {
-        scaled
+        (&base_out.to_dtype(scaled.dtype())? + &scaled)?
     };
-    Ok((base_out + &scaled_cast)?)
+    Ok(if sum.dtype() == base_dtype {
+        sum
+    } else {
+        sum.to_dtype(base_dtype)?
+    })
 }
 
 /// Per-op fused/eager dispatch counts for the fused LoRA SITE
@@ -785,6 +804,83 @@ mod frozen_weight_gate_tests {
         assert!(tracked.track_op(), "fixture must actually be tracked");
         let err = frozen_weight_gate(&tracked).unwrap_err();
         assert!(matches!(err, crate::error::LoraError::Config(_)));
+    }
+}
+
+#[cfg(test)]
+mod eager_epilogue_tests {
+    use super::eager_epilogue;
+    use candle_core::{DType, Device, Tensor};
+
+    /// The PRODUCTION dtype combination (`base_out` `BF16`, `lora_out`
+    /// `F32`) — esc-046 (GH#374): `eager_epilogue` must promote `base_out`
+    /// to `f32` (lossless), add the already-`f32`-scaled `lora_out`, and
+    /// round to `base_out`'s dtype ONCE, matching PEFT's `Linear.forward`.
+    /// Compared, after an EXACT `BF16`->`F32` widening on both sides, to a
+    /// reference built the SAME way (round through `Tensor::to_dtype`,
+    /// never re-deriving bf16 rounding by hand) — a `+`->`-` mutation of
+    /// the (dtype-mismatch) add branch this combination exercises would
+    /// produce a wildly different, easily-distinguished value here, never
+    /// silently agreeing.
+    #[test]
+    fn bf16_base_f32_lora_matches_peft_ordered_reference_bit_exact() {
+        let device = Device::Cpu;
+        let scaling = 2.0_f64; // alpha=32, rank=16
+        let base_f32 = [100.0f32, -50.5, 6688.0, -6688.0, 0.25];
+        let lora_v: [f32; 5] = [1.9690344, -0.5, 3.125, -3.125, 0.0625];
+
+        let base_out = Tensor::from_slice(&base_f32, (5,), &device)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let lora_out = Tensor::from_slice(&lora_v, (5,), &device).unwrap();
+
+        let out = eager_epilogue(&base_out, &lora_out, scaling).unwrap();
+        assert_eq!(out.dtype(), DType::BF16);
+        let got: Vec<f32> = out.to_dtype(DType::F32).unwrap().to_vec1().unwrap();
+
+        // Independent reference: round `base` through the SAME `BF16`
+        // storage width (an EXACT operation, not re-deriving eager_epilogue's
+        // own rounding), add the f32-scaled delta on the host, then round
+        // the sum through `BF16` storage once more — the PEFT-ordered
+        // (promote-add-cast-once) formula, expressed via `Tensor::to_dtype`
+        // round-trips instead of a hand-rolled bf16 cast.
+        let base_bf16_roundtrip: Vec<f32> =
+            base_out.to_dtype(DType::F32).unwrap().to_vec1().unwrap();
+        let sum_f32: Vec<f32> = base_bf16_roundtrip
+            .iter()
+            .zip(lora_v.iter())
+            .map(|(&b, &l)| b + l * scaling as f32)
+            .collect();
+        let expected: Vec<f32> = Tensor::from_slice(&sum_f32, (5,), &device)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(
+            got, expected,
+            "eager_epilogue must match the PEFT-ordered (promote-add-cast-once) reference \
+             bit-for-bit (after an exact BF16->F32 widening) on the reachable BF16-base/F32-lora \
+             combination"
+        );
+    }
+
+    /// The same-dtype branch (`F32`/`F32`) — exact, no rounding anywhere,
+    /// covering the OTHER branch of `eager_epilogue`'s `if base_dtype ==
+    /// scaled.dtype()`.
+    #[test]
+    fn f32_base_f32_lora_is_exact() {
+        let device = Device::Cpu;
+        let scaling = 1.5_f64;
+        let base_out = Tensor::from_slice(&[1.0f32, -2.0, 3.5], (3,), &device).unwrap();
+        let lora_out = Tensor::from_slice(&[0.5f32, 1.5, -1.0], (3,), &device).unwrap();
+        let out = eager_epilogue(&base_out, &lora_out, scaling).unwrap();
+        assert_eq!(out.dtype(), DType::F32);
+        let got: Vec<f32> = out.to_vec1().unwrap();
+        assert_eq!(got, vec![1.75f32, 0.25, 2.0]);
     }
 }
 

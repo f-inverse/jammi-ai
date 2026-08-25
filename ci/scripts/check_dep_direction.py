@@ -34,7 +34,30 @@ CRATES_IO_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
 
 
 def main() -> int:
-    metadata = json.load(sys.stdin)
+    raw = sys.stdin.read()
+    try:
+        metadata = json.loads(raw)
+    except json.JSONDecodeError as e:
+        # Empty/truncated stdin means the upstream `cargo metadata` producer
+        # failed (or was never run) and this script silently inherited an
+        # empty pipe — most commonly `cargo metadata --locked` refusing to
+        # run because Cargo.lock is out of sync with Cargo.toml, or a
+        # registry-index fetch failure. Surface that as a diagnosable
+        # message instead of a raw JSONDecodeError traceback pointing at a
+        # line/column in an empty string, which names no cause.
+        print(
+            f"ERROR: failed to parse cargo-metadata JSON from stdin: {e}\n"
+            f"  stdin was {len(raw)} byte(s) "
+            f"({raw[:200]!r}{'...' if len(raw) > 200 else ''}).\n"
+            "  This script expects `cargo metadata --format-version 1 "
+            "[--locked]` piped in on stdin. Empty/non-JSON stdin usually "
+            "means that upstream command failed or exited non-zero (e.g. "
+            "`--locked` rejecting a Cargo.lock out of sync with Cargo.toml, "
+            "or a registry-index fetch failure) — check its stderr, not "
+            "this traceback.",
+            file=sys.stderr,
+        )
+        return 2
 
     packages_by_id = {pkg["id"]: pkg for pkg in metadata["packages"]}
     resolve_nodes = {node["id"]: node for node in metadata["resolve"]["nodes"]}

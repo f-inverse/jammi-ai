@@ -208,12 +208,12 @@ fn poison_softmax_d_before_backward_does_not_change_any_output_bit() {
     let host_qkv: Vec<bf16> = (0..total_q * 3 * NUM_HEADS * FD)
         .map(|i| bf16::from_f32(((i % 13) as f32 - 6.0) * 0.05))
         .collect();
-    let qkv = dev.htod_copy(host_qkv).unwrap();
+    let qkv = dev.clone_htod(&host_qkv).unwrap();
     let (o, lse) = flash_varlen_fwd(&dev, &qkv, &cu, NUM_HEADS, &cfg).unwrap();
     let host_do: Vec<bf16> = (0..total_q * NUM_HEADS * FD)
         .map(|i| bf16::from_f32(((i % 7) as f32 - 3.0) * 0.03))
         .collect();
-    let d_o = dev.htod_copy(host_do).unwrap();
+    let d_o = dev.clone_htod(&host_do).unwrap();
 
     let geom = cu.geometry(NUM_HEADS).unwrap();
 
@@ -241,7 +241,7 @@ fn poison_softmax_d_before_backward_does_not_change_any_output_bit() {
     // Run 2: `softmax_d` poisoned with NaN before the launch.
     let mut scratch2 = BwdScratch::alloc(&dev, &geom, cfg.deterministic).unwrap();
     let nan_host = vec![f32::NAN; geom.softmax_d_len()];
-    scratch2.softmax_d = dev.htod_copy(nan_host).unwrap();
+    scratch2.softmax_d = dev.clone_htod(&nan_host).unwrap();
     let mut d_qkv2 = unsafe { dev.alloc::<bf16>(geom.qkv_len()) }.unwrap();
     flash_varlen_bwd_into(
         &dev,
@@ -261,8 +261,8 @@ fn poison_softmax_d_before_backward_does_not_change_any_output_bit() {
     )
     .unwrap();
 
-    let h1: Vec<bf16> = dev.dtoh_sync_copy(&d_qkv1).unwrap();
-    let h2: Vec<bf16> = dev.dtoh_sync_copy(&d_qkv2).unwrap();
+    let h1: Vec<bf16> = dev.clone_dtoh(&d_qkv1).unwrap();
+    let h2: Vec<bf16> = dev.clone_dtoh(&d_qkv2).unwrap();
     assert_eq!(h1.len(), h2.len());
     assert!(
         h1.iter()
@@ -306,12 +306,12 @@ fn poison_non_deterministic_dq_accum_is_a_dead_path_guard_not_reachable_via_the_
     let host_qkv: Vec<bf16> = (0..total_q * 3 * NUM_HEADS * FD)
         .map(|i| bf16::from_f32(((i % 11) as f32 - 5.0) * 0.04))
         .collect();
-    let qkv = dev.htod_copy(host_qkv).unwrap();
+    let qkv = dev.clone_htod(&host_qkv).unwrap();
     let (o, lse) = flash_varlen_fwd(&dev, &qkv, &cu, NUM_HEADS, &cfg_nondet).unwrap();
     let host_do: Vec<bf16> = (0..total_q * NUM_HEADS * FD)
         .map(|i| bf16::from_f32(((i % 9) as f32 - 4.0) * 0.02))
         .collect();
-    let d_o = dev.htod_copy(host_do).unwrap();
+    let d_o = dev.clone_htod(&host_do).unwrap();
     let geom = cu.geometry(NUM_HEADS).unwrap();
 
     let mut scratch1 = BwdScratch::alloc(&dev, &geom, cfg_nondet.deterministic).unwrap();
@@ -336,7 +336,7 @@ fn poison_non_deterministic_dq_accum_is_a_dead_path_guard_not_reachable_via_the_
 
     let mut scratch2 = BwdScratch::alloc(&dev, &geom, cfg_nondet.deterministic).unwrap();
     let nan_host = vec![f32::NAN; geom.dq_accum_len(scratch2.splits)];
-    scratch2.dq_accum = dev.htod_copy(nan_host).unwrap();
+    scratch2.dq_accum = dev.clone_htod(&nan_host).unwrap();
     let mut d_qkv2 = unsafe { dev.alloc::<bf16>(geom.qkv_len()) }.unwrap();
     flash_varlen_bwd_into(
         &dev,
@@ -356,8 +356,8 @@ fn poison_non_deterministic_dq_accum_is_a_dead_path_guard_not_reachable_via_the_
     )
     .unwrap();
 
-    let h1: Vec<bf16> = dev.dtoh_sync_copy(&d_qkv1).unwrap();
-    let h2: Vec<bf16> = dev.dtoh_sync_copy(&d_qkv2).unwrap();
+    let h1: Vec<bf16> = dev.clone_dtoh(&d_qkv1).unwrap();
+    let h2: Vec<bf16> = dev.clone_dtoh(&d_qkv2).unwrap();
     assert!(
         h1.iter()
             .zip(h2.iter())

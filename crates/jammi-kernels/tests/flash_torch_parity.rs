@@ -182,18 +182,16 @@ fn o_lse_dq_dk_dv_match_the_torch_reference_within_the_analytic_tolerance() {
     let Some(dev) = cuda_device() else { return };
 
     for leg in LEGS {
-        let q = load_f32(leg.name, "q")
-            .to_device(dev.as_ref().into())
-            .unwrap();
-        let k = load_f32(leg.name, "k")
-            .to_device(dev.as_ref().into())
-            .unwrap();
-        let v = load_f32(leg.name, "v")
-            .to_device(dev.as_ref().into())
-            .unwrap();
+        // Fixtures load as CPU f32 tensors (`Tensor::read_npy`'s own
+        // device); pack + cast on CPU, then extract the ONE host `Vec`
+        // `crate::flash`'s FFI-boundary layer needs — no intermediate
+        // CUDA `Tensor` required at all, since this test drives
+        // `crate::flash::flash_varlen_fwd`/`flash_varlen_bwd` directly
+        // (see the module doc).
+        let q = load_f32(leg.name, "q");
+        let k = load_f32(leg.name, "k");
+        let v = load_f32(leg.name, "v");
         let grad_out = load_f32(leg.name, "grad_out")
-            .to_device(dev.as_ref().into())
-            .unwrap()
             .to_dtype(DType::BF16)
             .unwrap();
         let ref_o = load_f32(leg.name, "o");
@@ -203,7 +201,8 @@ fn o_lse_dq_dk_dv_match_the_torch_reference_within_the_analytic_tolerance() {
         let ref_dv = load_f32(leg.name, "dv");
 
         let qkv = pack_qkv(&q, &k, &v);
-        let qkv_slice = qkv.flatten_all().unwrap().to_dtype(DType::BF16).unwrap();
+        let (total_q, _, num_h, _d) = qkv.dims4().unwrap();
+        assert_eq!(num_h, NUM_HEADS);
         let cu = CuSeqlens::from_lengths(leg.lengths, &dev).unwrap();
         let cfg = VarlenConfig {
             softmax_scale: SOFTMAX_SCALE,
@@ -211,34 +210,18 @@ fn o_lse_dq_dk_dv_match_the_torch_reference_within_the_analytic_tolerance() {
             deterministic: true,
         };
 
-        // Drive through `crate::flash` directly (see module doc) using
-        // the raw `CudaSlice` the packed `qkv` tensor owns.
-        let qkv_cuda = qkv_slice.storage_and_layout().0.clone(); // placeholder shape only — real access below
-        drop(qkv_cuda);
-
-        // Practical path: build the packed qkv as a raw CudaSlice via
-        // candle's own device-transfer, then call the safe `flash`
-        // functions with it directly (mirrors `flash_smoke.rs`'s own
-        // idiom of building fixtures as host `Vec<bf16>` then
-        // `dev.htod_copy`).
-        let (total_q, _, num_h, _d) = qkv.dims4().unwrap();
-        assert_eq!(num_h, NUM_HEADS);
         let host_qkv: Vec<bf16> = qkv.flatten_all().unwrap().to_vec1::<bf16>().unwrap();
-        let dev_raw = candle_core::cuda_backend::cudarc::driver::CudaDevice::new(0)
-            .map(|_| ())
-            .ok();
-        let _ = dev_raw;
-        let qkv_dev = dev.htod_copy(host_qkv).unwrap();
+        let qkv_dev = dev.clone_htod(&host_qkv).unwrap();
 
         let (o, lse) =
             jammi_kernels::flash::flash_varlen_fwd(&dev, &qkv_dev, &cu, NUM_HEADS, &cfg).unwrap();
 
-        let o_host: Vec<bf16> = dev.dtoh_sync_copy(&o).unwrap();
+        let o_host: Vec<bf16> = dev.clone_dtoh(&o).unwrap();
         let o_tensor = Tensor::from_vec(o_host, (total_q, NUM_HEADS, HEAD_DIM), &Device::Cpu)
             .unwrap()
             .to_dtype(DType::F64)
             .unwrap();
-        let lse_host: Vec<f32> = dev.dtoh_sync_copy(&lse).unwrap();
+        let lse_host: Vec<f32> = dev.clone_dtoh(&lse).unwrap();
         let lse_tensor = Tensor::from_vec(lse_host, (NUM_HEADS, total_q), &Device::Cpu)
             .unwrap()
             .to_dtype(DType::F64)
@@ -283,12 +266,12 @@ fn o_lse_dq_dk_dv_match_the_torch_reference_within_the_analytic_tolerance() {
 
         // Backward.
         let do_host: Vec<bf16> = grad_out.flatten_all().unwrap().to_vec1::<bf16>().unwrap();
-        let do_dev = dev.htod_copy(do_host).unwrap();
+        let do_dev = dev.clone_htod(&do_host).unwrap();
         let d_qkv = jammi_kernels::flash::flash_varlen_bwd(
             &dev, &qkv_dev, &cu, NUM_HEADS, &o, &lse, &do_dev, &cfg,
         )
         .unwrap();
-        let d_qkv_host: Vec<bf16> = dev.dtoh_sync_copy(&d_qkv).unwrap();
+        let d_qkv_host: Vec<bf16> = dev.clone_dtoh(&d_qkv).unwrap();
         let d_qkv_tensor =
             Tensor::from_vec(d_qkv_host, (total_q, 3, NUM_HEADS, HEAD_DIM), &Device::Cpu)
                 .unwrap()
@@ -336,21 +319,15 @@ fn softmax_scale_doubling_injection_reds_the_parity_oracle() {
 
     let leg_name = "b1_s512";
     let lengths: &[usize] = &[512];
-    let q = load_f32(leg_name, "q")
-        .to_device(dev.as_ref().into())
-        .unwrap();
-    let k = load_f32(leg_name, "k")
-        .to_device(dev.as_ref().into())
-        .unwrap();
-    let v = load_f32(leg_name, "v")
-        .to_device(dev.as_ref().into())
-        .unwrap();
+    let q = load_f32(leg_name, "q");
+    let k = load_f32(leg_name, "k");
+    let v = load_f32(leg_name, "v");
     let ref_o = load_f32(leg_name, "o");
 
     let qkv = pack_qkv(&q, &k, &v);
     let (total_q, ..) = qkv.dims4().unwrap();
     let host_qkv: Vec<bf16> = qkv.flatten_all().unwrap().to_vec1::<bf16>().unwrap();
-    let qkv_dev = dev.htod_copy(host_qkv).unwrap();
+    let qkv_dev = dev.clone_htod(&host_qkv).unwrap();
     let cu = CuSeqlens::from_lengths(lengths, &dev).unwrap();
     let bad_cfg = VarlenConfig {
         softmax_scale: SOFTMAX_SCALE * 2.0, // INJECTED — the fixture was generated at SOFTMAX_SCALE.
@@ -360,7 +337,7 @@ fn softmax_scale_doubling_injection_reds_the_parity_oracle() {
 
     let (o, _lse) =
         jammi_kernels::flash::flash_varlen_fwd(&dev, &qkv_dev, &cu, NUM_HEADS, &bad_cfg).unwrap();
-    let o_host: Vec<bf16> = dev.dtoh_sync_copy(&o).unwrap();
+    let o_host: Vec<bf16> = dev.clone_dtoh(&o).unwrap();
     let o_tensor = Tensor::from_vec(o_host, (total_q, NUM_HEADS, HEAD_DIM), &Device::Cpu)
         .unwrap()
         .to_dtype(DType::F64)

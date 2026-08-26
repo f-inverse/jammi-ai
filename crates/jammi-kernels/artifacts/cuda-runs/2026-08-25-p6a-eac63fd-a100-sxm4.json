@@ -2,6 +2,8 @@
   "schema_version": 1,
   "unit": "P6-stage-A",
   "git_sha": "eac63fdb83bfabb5f6e6bcb9811ddf55e822c59c",
+  "merged_as": "0ee65de94e0f1a2c5973ae08c670148729009238",
+  "merged_via_pr": 366,
   "date": "2026-08-25T11:53:13Z",
   "gpu": "NVIDIA A100-SXM4-80GB, 580.126.16",
   "nvcc": "Cuda compilation tools, release 12.6, V12.6.85",

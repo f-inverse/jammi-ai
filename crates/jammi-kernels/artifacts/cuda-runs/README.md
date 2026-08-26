@@ -39,6 +39,15 @@ leg rather than the top-level artifact). Required top-level fields:
   - `gating`: `"#[ignore]"` | `"env:<VAR>"` | `"required-features"` | `"none"` — how the named
     test/script stays out of a plain `cargo test`/CI run.
 - **`status`** (string).
+- **`merged_as`** (40 lowercase hex chars, OPTIONAL) + **`merged_via_pr`** (int, OPTIONAL, only
+  valid together with `merged_as`) — a branch tip a measurement ran on can be squash-merged, so
+  `git_sha` is then legitimately never an ancestor of anything again. `merged_as` names the squash
+  commit the SAME content landed on `main` as (verified by checking that squash commit's own diff
+  literally introduces this artifact's own file, carrying `git_sha` unchanged inside it — not by
+  title/branch-name matching alone); `merged_via_pr` is the PR number that merged it. Rule (d)
+  PASSES if EITHER `git_sha` is an ancestor of `HEAD`, OR `merged_as` is. `git_sha` is always kept
+  verbatim (the tip that was actually measured) — `merged_as` only ever supplements it, never
+  replaces it, and requires a resolved `git_sha` (never valid alongside `git_sha_unresolved`).
 
 Run the gate: `python3 ci/scripts/check_cuda_run_artifacts.py`. Self-test (RED cases for every
 rule, on a throwaway fixture repo — never this checkout):

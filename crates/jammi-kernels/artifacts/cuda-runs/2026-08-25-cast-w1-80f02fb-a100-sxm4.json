@@ -2,6 +2,8 @@
   "schema_version": 1,
   "unit": "cast-boundary-wave1-A/B",
   "git_sha": "80f02fb993806266f05929b6295d7fb9a159696a",
+  "merged_as": "eaac3fda6be155983bb584bb04268df41e810b2f",
+  "merged_via_pr": 377,
   "date": "2026-08-25T21:05:13Z",
   "gpu": "NVIDIA A100-SXM4-80GB, 580.126.16",
   "nvcc": "Cuda compilation tools, release 12.6, V12.6.85",

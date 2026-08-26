@@ -51,12 +51,22 @@ must carry:
         `cargo test`/CI run (mirrors `docs/maintainer/cuda-kernel-guide.md`
         §5's "no CI lane has a GPU" constraint).
   - `status` (string)
+  - `merged_as` (40-hex, OPTIONAL) + `merged_via_pr` (int, OPTIONAL, required
+    together with `merged_as`) — for a measured tip that was itself
+    squash-merged (so `git_sha` is legitimately never an ancestor of
+    anything again): the squash commit the SAME content landed on `main`
+    as, and the PR that merged it. `git_sha` is kept VERBATIM (the tip that
+    was actually measured); `merged_as` only ever supplements it, never
+    replaces it, and is only valid alongside a resolved `git_sha` (never
+    `git_sha_unresolved`).
 
 ## Fail-closed contract
 
   (a) Every required field is present and well-typed (including the
-      `git_sha` XOR `git_sha_unresolved` split, and the `git_sha_unresolved`
-      ⇒ `producer.kind == "none"` consistency rule).
+      `git_sha` XOR `git_sha_unresolved` split, the `git_sha_unresolved`
+      ⇒ `producer.kind == "none"` consistency rule, and the
+      `merged_as`/`merged_via_pr` pairing — `merged_as` requires
+      `merged_via_pr` and a resolved `git_sha`, and vice versa).
   (b) `producer.path`, when non-null, exists on disk AND is `git
       ls-files`-tracked (an artifact cannot cite a producer CI's own
       checkout would not have).
@@ -67,9 +77,10 @@ must carry:
       (`#[ignore]` immediately above the fn; the named env var — or the
       `cuda_device()` helper — inside the fn body; or a `required-features`
       key on the matching `[[test]]` section of the crate's `Cargo.toml`).
-  (d) `git merge-base --is-ancestor <git_sha> HEAD` — a non-ancestor is a
-      hard FAIL naming the guide's own sentence (never silently accepted as
-      "was green once").
+  (d) PASS if `git merge-base --is-ancestor <git_sha> HEAD`, OR — for a
+      squash-merged tip — if `merged_as` is ALSO an ancestor of HEAD (with
+      `merged_via_pr` present). Neither ancestor is a hard FAIL naming the
+      guide's own sentence (never silently accepted as "was green once").
   (e) `cuda-runs/README.md`'s named producer script is itself
       `git ls-files`-tracked (the README cannot point at a file CI's
       checkout would not have either).
@@ -189,6 +200,31 @@ def check_schema_types(data: dict) -> list[str]:
         unresolved = data["git_sha_unresolved"]
         if not isinstance(unresolved, str) or not unresolved.strip():
             failures.append(f"git_sha_unresolved must be a non-empty string, got {unresolved!r}")
+
+    # `merged_as` / `merged_via_pr` — the optional squash-landing pair. A
+    # branch tip a measurement ran on can be squash-merged, so `git_sha`
+    # itself is legitimately never an ancestor of any ref again; `merged_as`
+    # names the squash commit the SAME content landed on `main` as, kept
+    # alongside (never instead of) the measured `git_sha`.
+    has_merged_as = "merged_as" in data
+    has_merged_via_pr = "merged_via_pr" in data
+    if has_merged_as:
+        merged_as = data["merged_as"]
+        if not isinstance(merged_as, str) or not GIT_SHA_RE.match(merged_as):
+            failures.append(f"merged_as must be 40 lowercase hex chars, got {merged_as!r}")
+        if not has_merged_via_pr:
+            failures.append("merged_as is present but merged_via_pr is missing")
+        if not has_sha:
+            failures.append(
+                "merged_as requires git_sha (the measured tip, kept verbatim) — not valid "
+                "alongside git_sha_unresolved"
+            )
+    if has_merged_via_pr:
+        merged_via_pr = data["merged_via_pr"]
+        if not isinstance(merged_via_pr, int) or isinstance(merged_via_pr, bool):
+            failures.append(f"merged_via_pr must be an int, got {merged_via_pr!r}")
+        if not has_merged_as:
+            failures.append("merged_via_pr is present but merged_as is missing")
 
     producer = data.get("producer")
     if not isinstance(producer, dict):
@@ -362,14 +398,39 @@ def check_cargo_test_gating(data: dict, producer: dict, repo_root: Path) -> list
 # --------------------------------------------------------------------------- #
 # rule (d) — ancestry
 # --------------------------------------------------------------------------- #
+def _is_ancestor(sha: str, repo_root: Path) -> bool:
+    proc = _run(["git", "merge-base", "--is-ancestor", sha, "HEAD"], repo_root)
+    return proc.returncode == 0
+
+
 def check_ancestry(data: dict, repo_root: Path) -> list[str]:
+    """PASS if `git_sha` is an ancestor of HEAD, OR — for a branch tip that
+    was squash-merged, so `git_sha` itself can never be an ancestor of
+    anything again — if `merged_as` is an ancestor of HEAD and the artifact
+    also carries `git_sha` (the measured tip, kept verbatim) plus
+    `merged_via_pr`. `merged_as`'s own well-typedness (40-hex, paired with
+    `merged_via_pr`, only valid alongside a resolved `git_sha`) is rule (a)'s
+    job (`check_schema_types`); this function only re-checks GIT_SHA_RE here
+    so a malformed `merged_as` cannot be handed to `git merge-base` as a
+    literal ref expression.
+    """
     sha = data.get("git_sha")
     if not sha:
         return []  # git_sha_unresolved artifacts have nothing resolvable to check
-    proc = _run(["git", "merge-base", "--is-ancestor", sha, "HEAD"], repo_root)
-    if proc.returncode != 0:
-        return [f"git_sha {sha} {ANCESTOR_MESSAGE}"]
-    return []
+    if _is_ancestor(sha, repo_root):
+        return []
+
+    merged_as = data.get("merged_as")
+    merged_via_pr = data.get("merged_via_pr")
+    if isinstance(merged_as, str) and GIT_SHA_RE.match(merged_as) and merged_via_pr is not None:
+        if _is_ancestor(merged_as, repo_root):
+            return []
+        return [
+            f"git_sha {sha} {ANCESTOR_MESSAGE} merged_as {merged_as} (PR #{merged_via_pr}) is "
+            "ALSO not an ancestor of HEAD — the squash-landing claim does not hold either."
+        ]
+
+    return [f"git_sha {sha} {ANCESTOR_MESSAGE}"]
 
 
 # --------------------------------------------------------------------------- #
@@ -681,6 +742,46 @@ def self_test() -> int:
         bad["git_sha"] = "f" * 40
         expect_hit(bad, "x.json", "is not an ancestor of HEAD", "rule (d): non-ancestor git_sha")
 
+        # GREEN control: a squash-merged tip whose OWN sha is not (and never
+        # will be again) an ancestor of HEAD, but whose content landed on
+        # HEAD via a real (here: the fixture repo's own) commit named by
+        # merged_as + merged_via_pr.
+        merged_ok = baseline()
+        merged_ok["git_sha"] = "f" * 40
+        merged_ok["merged_as"] = root_sha
+        merged_ok["merged_via_pr"] = 363
+        expect_clean(merged_ok, "control-merged-as.json", "non-ancestor git_sha rescued by an ancestor merged_as")
+
+        # RED: merged_as ALSO not an ancestor of HEAD — the rescue must not
+        # be granted just because the field is present and well-shaped.
+        bad = baseline()
+        bad["git_sha"] = "f" * 40
+        bad["merged_as"] = "e" * 40
+        bad["merged_via_pr"] = 999
+        expect_hit(bad, "x.json", "is ALSO not an ancestor of HEAD", "rule (d): non-ancestor merged_as too")
+
+        # RED: merged_as present but git_sha is NOT (only git_sha_unresolved)
+        # — merged_as must never stand in for an actually-resolved git_sha.
+        bad = {
+            "schema_version": 1,
+            "git_sha_unresolved": "abc1234",
+            "box": "a100-fixture",
+            "merged_as": root_sha,
+            "merged_via_pr": 363,
+            "producer": {"path": None, "kind": "none", "invocation": None, "gating": "none"},
+            "status": "GREEN",
+        }
+        expect_hit(bad, "legacy-none.json", "merged_as requires git_sha", "rule (a): merged_as without a resolved git_sha")
+
+        # RED: merged_as present without merged_via_pr, and vice versa.
+        bad = baseline()
+        bad["merged_as"] = root_sha
+        expect_hit(bad, "x.json", "merged_as is present but merged_via_pr is missing", "rule (a): merged_as without merged_via_pr")
+
+        bad = baseline()
+        bad["merged_via_pr"] = 363
+        expect_hit(bad, "x.json", "merged_via_pr is present but merged_as is missing", "rule (a): merged_via_pr without merged_as")
+
         # rule (e) — README's named producer is tracked -------------------------
         untracked_readme = repo / "untracked-readme-dir"
         untracked_readme.mkdir()
@@ -714,11 +815,13 @@ def self_test() -> int:
         print("cuda-run-artifacts self-test: FAIL", file=sys.stderr)
         return 1
     print(
-        "cuda-run-artifacts self-test: OK — every rule (a) schema/typing, (b) producer.path "
-        "existence+tracking, (c) cargo-test static gating verification (#[ignore]/env:VAR/"
-        "required-features), (d) ancestry, (e) README producer tracking, and (f) the none-"
-        "allowlist closure all bite on a throwaway fixture repo, and three GREEN controls "
-        "(ignore/env/required-features) plus one allow-listed none control stay clean."
+        "cuda-run-artifacts self-test: OK — every rule (a) schema/typing (including the "
+        "merged_as/merged_via_pr pairing), (b) producer.path existence+tracking, (c) cargo-test "
+        "static gating verification (#[ignore]/env:VAR/required-features), (d) ancestry (both the "
+        "plain git_sha path and the merged_as squash-landing rescue, and its own non-ancestor RED "
+        "case), (e) README producer tracking, and (f) the none-allowlist closure all bite on a "
+        "throwaway fixture repo, and GREEN controls (ignore/env/required-features/merged_as-rescue) "
+        "plus one allow-listed none control stay clean."
     )
     return 0
 

@@ -1,0 +1,150 @@
+{
+  "schema_version": 1,
+  "unit": "Phase-4 re-audit close-out (perf/p6-fa2-dense, ledger rows 207, 214, 215): the flash-arm encoder-level three-way oracle's vacuous gradient leg and seed-unstable 1.5x bound.",
+  "git_sha": "2aa1551321716d13b100a2c97d9e9d8646822787",
+  "git_sha7": "2aa1551",
+  "branch": "perf/p6-fa2-dense",
+  "box": "a100c",
+  "status": "GREEN",
+  "producer": {
+    "path": "crates/jammi-encoders/src/modernbert.rs",
+    "kind": "cargo-test",
+    "invocation": "cargo test -p jammi-encoders --lib --features cuda,flash-attn -- --exact modernbert::tests::flash_arm_encoder_level_three_way_oracle_dense_cuda_bf16",
+    "gating": "env:JAMMI_FLASH_ORACLE_MODEL_DIR"
+  },
+  "gate_outcomes_this_session": {
+    "cargo fmt -p jammi-encoders --check (local)": "PASS",
+    "cargo clippy -p jammi-numerics -p jammi-encoders -p jammi-lora -p jammi-kernels --all-targets -- -D warnings (local, no cuda)": "PASS",
+    "cargo test -p jammi-numerics -p jammi-encoders -p jammi-lora -p jammi-kernels (local, no cuda)": "PASS (encoders 125/125, kernels 274+ integration suites, lora 19+32, numerics 34+77)",
+    "RUSTDOCFLAGS=-D warnings cargo doc -p jammi-encoders --no-deps (local)": "PASS",
+    "cargo fmt -p jammi-encoders --check (pod)": "PASS",
+    "cargo clippy -p jammi-encoders -p jammi-kernels --all-targets --features cuda,flash-attn -- -D warnings (pod)": "PASS",
+    "cargo test -p jammi-kernels --features cuda,flash-attn --test cuda_parity (pod, JAMMI_REQUIRE_CUDA=1)": "PASS 82/82, 1 ignored",
+    "cargo test -p jammi-kernels --features cuda,flash-attn (pod, JAMMI_REQUIRE_CUDA=1)": "PASS 308 lib + all integration suites, 0 failed",
+    "cargo test -p jammi-encoders --features cuda,flash-attn (pod, JAMMI_REQUIRE_CUDA=1, JAMMI_FLASH_ORACLE_MODEL_DIR=/root/checkpoints/ModernBERT-large, JAMMI_REQUIRE_FLASH_ORACLE=1)": "PASS 133 lib + 34 it, 0 failed",
+    "RUSTDOCFLAGS=-D warnings cargo doc -p jammi-encoders -p jammi-kernels --no-deps --features cuda,flash-attn (pod)": "PASS"
+  },
+  "defects_closed": {
+    "1_vacuous_gradient_leg": {
+      "old_loss": "sum(l2_normalize(mean_pool(hidden))^2) -- identically `batch` since pool_and_normalize returns unit-norm rows; dL/d(theta) == 0 at every dtype, for every arm, always. A real K-unrotated kernel mutant IMPROVED this leg's reported 'grad err' and PASSED it.",
+      "fix": "flash_oracle_pooled_and_grad now takes a fixed, seed-keyed random cotangent dy (SplitMix64-derived, [-1,1), independent stream from the token-id draw); loss = (pooled * dy).sum(). relative_l1_error now asserts sum|reference| > 0 (signal) before dividing, on both legs.",
+      "grad_target_change": "The gradient leg now targets the LAST layer's Wqkv LoRA B, not layer 0 -- layer 0's gradient is 28 backward matmuls removed from the loss, and guide SS3.2's 'compounding grows with depth' phenomenon applies to ORDINARY bf16 rounding noise exactly as it does to a real defect. Measured (this round, AT LAYER 0, cosine-distance metric): the block arm's OWN cosine distance from f32 ranged 0.23-1.04 across seeds (sometimes near-orthogonal to truth) and the K-unrotated/window-dropped mutants' mean grad RATIO (1.9833 and 1.9800 respectively) sat only marginally above the healthy oracle's own mean at layer 0 (1.5587) -- noise-dominated, not comfortably discriminating (an earlier intermediate attempt using relative_l1_error instead of cosine distance at layer 0 was WORSE: the mutants' mean ratio, 1.1795 and 0.7224, fell BELOW the healthy oracle's own mean, 2.3865). At the LAST layer the SAME mutants' mean grad ratio (26.6004 and 13.6483) clears the healthy oracle's own mean (1.4604) by 9-18x -- a clean separation.",
+      "metric_change": "The grad leg's error metric is cosine_distance (1 - cosine_similarity), not relative_l1_error: the step-0 gradient's magnitude (sum|grad_f32|) varies ~60x across FLASH_ORACLE_SWEEP_SEEDS (some dy draws are nearly orthogonal to the local Jacobian), so a magnitude-relative ratio is noise-dominated at low-signal seeds; cosine distance is scale-invariant and asks whether the fused arm's gradient points the same way as truth. The pooled leg keeps relative_l1_error (guide SS3.2's own aggregate shape, Sum|Delta|/Sum|ref|) -- it did not show this instability."
+    },
+    "2_seed_unstable_bound": {
+      "old": "K = 1.5, derived from ONE seed's draw (auditor's own 8-seed sweep found the healthy pooled ratio ranging 0.80-1.48, mutants clearing the bound by only 1.38-1.55x on some seeds).",
+      "fix": "FLASH_ORACLE_SWEEP_SEEDS = [201..208], 8 fixed seeds reused identically by the healthy oracle and all three RED controls, at every shape. Every oracle/control asserts both the MEAN ratio and the MAX per-seed ratio; RED controls assert the mutant's MEAN ratio exceeds the SAME bound the healthy oracle must clear, on BOTH legs."
+    },
+    "3_stale_sign_claim": {
+      "old_sentence_deleted": "\"the auditor's hand-run oracle measured err(flash,f32)=5.71e-2 vs err(block,f32)=9.11e-2 -- flash already closer to truth\" -- this earlier revision of the section's block comment was WRONG.",
+      "honest_finding": "On the pooled leg flash is NOT closer to the f32 reference than the block arm -- it is measurably, mildly, FURTHER (mean pooled ratio 1.0798 at b8_s512, 1.0250 at b1_s128; the prior committed GREEN run under the old single-seed code already showed this sign, 0.18823 > 0.17482 and 0.16754 > 0.15673, just mislabeled). Stated as a finding, not smoothed over by the K multiplier."
+    }
+  },
+  "healthy_oracle_measured": {
+    "note": "flash_arm_encoder_level_three_way_oracle_dense_cuda_bf16, over FLASH_ORACLE_SWEEP_SEEDS = [201,202,203,204,205,206,207,208]. pooled: relative_l1_error(flash,f32) / relative_l1_error(block,f32). grad: cosine_distance(flash,f32) / cosine_distance(block,f32), last-layer Wqkv LoRA B, fixed-cotangent loss.",
+    "b8_s512": {
+      "per_seed": [
+        {"seed": 201, "pooled_flash_err": 5.34217e-2, "pooled_block_err": 7.68105e-2, "pooled_ratio": 0.6955, "grad_flash_cos_dist": 3.79239e-3, "grad_block_cos_dist": 1.11510e-2, "grad_ratio": 0.3401},
+        {"seed": 202, "pooled_flash_err": 1.12315e-1, "pooled_block_err": 1.23478e-1, "pooled_ratio": 0.9096, "grad_flash_cos_dist": 9.76577e-3, "grad_block_cos_dist": 2.45722e-2, "grad_ratio": 0.3974},
+        {"seed": 203, "pooled_flash_err": 9.01875e-2, "pooled_block_err": 7.18730e-2, "pooled_ratio": 1.2548, "grad_flash_cos_dist": 7.45611e-3, "grad_block_cos_dist": 4.32981e-3, "grad_ratio": 1.7220},
+        {"seed": 204, "pooled_flash_err": 5.55027e-2, "pooled_block_err": 8.35302e-2, "pooled_ratio": 0.6645, "grad_flash_cos_dist": 3.83763e-3, "grad_block_cos_dist": 7.80493e-3, "grad_ratio": 0.4917},
+        {"seed": 205, "pooled_flash_err": 6.08842e-2, "pooled_block_err": 4.82292e-2, "pooled_ratio": 1.2624, "grad_flash_cos_dist": 4.16701e-3, "grad_block_cos_dist": 1.87320e-3, "grad_ratio": 2.2245},
+        {"seed": 206, "pooled_flash_err": 1.55902e-1, "pooled_block_err": 8.34822e-2, "pooled_ratio": 1.8675, "grad_flash_cos_dist": 4.81170e-2, "grad_block_cos_dist": 9.82250e-3, "grad_ratio": 4.8987},
+        {"seed": 207, "pooled_flash_err": 9.58719e-2, "pooled_block_err": 9.26123e-2, "pooled_ratio": 1.0352, "grad_flash_cos_dist": 5.43573e-3, "grad_block_cos_dist": 6.42908e-3, "grad_ratio": 0.8455},
+        {"seed": 208, "pooled_flash_err": 5.72927e-2, "pooled_block_err": 6.03744e-2, "pooled_ratio": 0.9490, "grad_flash_cos_dist": 2.53004e-3, "grad_block_cos_dist": 3.31492e-3, "grad_ratio": 0.7632}
+      ],
+      "pooled_ratio_mean": 1.0798,
+      "pooled_ratio_max": 1.8675,
+      "grad_ratio_mean": 1.4604,
+      "grad_ratio_max": 4.8987
+    },
+    "b1_s128": {
+      "per_seed": [
+        {"seed": 201, "pooled_ratio": 0.8474, "grad_ratio": 0.7980},
+        {"seed": 202, "pooled_ratio": 0.9924, "grad_ratio": 0.9232},
+        {"seed": 203, "pooled_ratio": 0.9445, "grad_ratio": 1.2508},
+        {"seed": 204, "pooled_ratio": 0.8992, "grad_ratio": 1.5425},
+        {"seed": 205, "pooled_ratio": 0.7396, "grad_ratio": 0.6098},
+        {"seed": 206, "pooled_ratio": 1.5193, "grad_ratio": 1.3481},
+        {"seed": 207, "pooled_ratio": 1.2140, "grad_ratio": 1.1716},
+        {"seed": 208, "pooled_ratio": 1.0435, "grad_ratio": 0.6856}
+      ],
+      "pooled_ratio_mean": 1.0250,
+      "pooled_ratio_max": 1.5193,
+      "grad_ratio_mean": 1.0412,
+      "grad_ratio_max": 1.5425
+    }
+  },
+  "K_derivation": {
+    "FLASH_ORACLE_K_MEAN_POOLED": {
+      "value": 1.6,
+      "healthy_worst_mean": 1.0798,
+      "margin_over_healthy": "1.48x",
+      "weakest_mutant_mean": 5.2189,
+      "margin_below_weakest_mutant": "3.26x"
+    },
+    "FLASH_ORACLE_K_MAX_POOLED": {
+      "value": 2.3,
+      "healthy_worst_max": 1.8675,
+      "margin_over_healthy": "1.23x"
+    },
+    "FLASH_ORACLE_K_MEAN_GRAD": {
+      "value": 4.5,
+      "healthy_worst_mean": 1.4604,
+      "margin_over_healthy": "3.08x",
+      "weakest_mutant_mean": 13.6483,
+      "margin_below_weakest_mutant": "3.03x"
+    },
+    "FLASH_ORACLE_K_MAX_GRAD": {
+      "value": 7.0,
+      "healthy_worst_max": 4.8987,
+      "margin_over_healthy": "1.43x"
+    }
+  },
+  "red_controls_measured": {
+    "note": "Same FLASH_ORACLE_SWEEP_SEEDS, b8_s512 only. Both legs, both means, asserted to VIOLATE the healthy bound.",
+    "window_dropped": {
+      "per_seed_pooled_ratio": [4.5595, 2.9691, 5.8749, 4.1663, 7.5000, 5.2607, 4.6480, 6.7727],
+      "per_seed_grad_ratio": [8.0498, 3.0808, 14.7148, 13.0123, 26.1065, 12.6971, 9.1322, 22.3926],
+      "pooled_mean": 5.2189,
+      "pooled_mean_over_bound_x": 3.26,
+      "grad_mean": 13.6483,
+      "grad_mean_over_bound_x": 3.03
+    },
+    "k_unrotated": {
+      "per_seed_pooled_ratio": [10.2640, 5.3265, 9.9724, 8.6710, 15.7173, 8.8175, 7.8070, 13.0228],
+      "per_seed_grad_ratio": [11.0175, 6.6182, 33.0334, 23.4413, 60.7946, 19.4718, 16.0136, 42.4129],
+      "pooled_mean": 9.9498,
+      "pooled_mean_over_bound_x": 6.22,
+      "grad_mean": 26.6004,
+      "grad_mean_over_bound_x": 5.91
+    },
+    "bad_softmax_scale": {
+      "note": "FlashFault::BadSoftmaxScale(1.0) vs the production 0.125 (head_dim=64).",
+      "per_seed_pooled_ratio": [20.8974, 9.7984, 22.3927, 16.9414, 31.4860, 15.5701, 14.1848, 24.0441],
+      "per_seed_grad_ratio": [69.9559, 18.6619, 137.0456, 83.0265, 333.3743, 66.8131, 75.8223, 218.4070],
+      "pooled_mean": 19.4144,
+      "pooled_mean_over_bound_x": 12.13,
+      "grad_mean": 125.3883,
+      "grad_mean_over_bound_x": 27.86
+    }
+  },
+  "softmax_scale_1_02_diagnostic": {
+    "note": "Not a committed test (would be a flaky assertion this close to the bound) -- run once as a diagnostic per the dispatch's request, over the same 8 seeds, at BadSoftmaxScale(0.1275) vs production 0.125.",
+    "caught_by_pooled_leg": false,
+    "caught_by_grad_leg": false,
+    "pooled_mean_ratio": 1.3364,
+    "pooled_bound": 1.6,
+    "grad_mean_ratio": 1.7335,
+    "grad_bound": 4.5,
+    "conclusion": "NEITHER leg catches this narrow a perturbation at the current bound. The op-level flash_torch_parity (jammi-kernels) already covers * 1.05 at the kernel level; this encoder-level oracle does not duplicate that coverage."
+  },
+  "nofault_bit_identity": {
+    "test": "modernbert::tests::flash_arm_fault_harness_nofault_matches_production_bit_identical",
+    "description": "FlashFault::NoFault (no injection) run through the fault-injection harness (forward_hidden_flash_with_fault) is asserted bit-identical to forward_hidden_forcing_flash(force_decline=false) -- production's real dispatch through ModernBertLayer::forward/decide_flash_admission. Proves the hand-synced fault-injection mirror has not drifted from what production actually runs.",
+    "result": "PASS (b=2, s=64, seed=99)"
+  },
+  "production_op_exercised": {
+    "note": "forward_hidden_flash_with_fault now calls jammi_kernels::ops::flash_attention_varlen_with_rope (FlashVarlenAttentionFusedRope) directly -- the op forward_flash_dense_attention calls in production -- not the superseded two-op composition (RopePositionsFused then flash_attention_varlen) the previous round's harness used. The K-unrotated fault is injected by pre-inverse-rotating the K slot only (using the op's own un-rotation mechanism, RopePositionsFused::new(seq, true)) so the SAME unmodified production op, given that input, reproduces exactly what a `slot==2 -> slot>=1` kernel mutant would produce."
+  }
+}

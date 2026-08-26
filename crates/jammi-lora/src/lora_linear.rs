@@ -670,36 +670,52 @@ impl LoraLinear {
                 )?;
                 Ok(apply3(x, self.base.weight(), &ab, op)?)
             }
-            DispatchOutcome::Eager => {
-                let base_dtype = self.base.weight().dtype();
-                let x_base = if x.dtype() == base_dtype {
-                    x.clone()
-                } else {
-                    x.to_dtype(base_dtype)?
-                };
-                let base_out = self.base.forward(&x_base)?;
-
-                let lora_dtype = self.lora_a.dtype();
-                let x_lora = if x.dtype() != lora_dtype {
-                    x.to_dtype(lora_dtype)?
-                } else {
-                    x.clone()
-                };
-                let lora_in = match dropout_key {
-                    Some(key) => {
-                        let op = DropoutFused::new(key.seed, key.layer_id, key.forward_idx, key.p)?;
-                        apply1(&x_lora, op)?
-                    }
-                    None => x_lora,
-                };
-
-                let a_lin = Linear::new(self.lora_a.clone(), None);
-                let after_a = a_lin.forward(&lora_in)?;
-                let b_lin = Linear::new(self.lora_b.clone(), None);
-                let lora_out = b_lin.forward(&after_a)?;
-                eager_epilogue(&base_out, &lora_out, self.scaling)
-            }
+            DispatchOutcome::Eager => self.forward_eager_training_composition(x, dropout_key),
         }
+    }
+
+    /// TODAY'S exact training-arm eager composition, extracted verbatim
+    /// (not rewritten) from `forward`'s own `DispatchOutcome::Eager` arm —
+    /// same pattern as `jammi_encoders::modernbert`'s
+    /// `forward_eager_training_attention_composition` (extracted so the
+    /// production fallback is directly callable, bypassing admission,
+    /// for a same-process fused-vs-eager A/B without a second
+    /// `JAMMI_KERNELS_DISABLE`-configured build). `forward`'s own
+    /// `DispatchOutcome::Eager` arm calls this SAME function — there is
+    /// exactly one definition of the training-arm eager composition, not
+    /// one per caller.
+    fn forward_eager_training_composition(
+        &self,
+        x: &Tensor,
+        dropout_key: Option<DropoutKey>,
+    ) -> Result<Tensor, LoraError> {
+        let base_dtype = self.base.weight().dtype();
+        let x_base = if x.dtype() == base_dtype {
+            x.clone()
+        } else {
+            x.to_dtype(base_dtype)?
+        };
+        let base_out = self.base.forward(&x_base)?;
+
+        let lora_dtype = self.lora_a.dtype();
+        let x_lora = if x.dtype() != lora_dtype {
+            x.to_dtype(lora_dtype)?
+        } else {
+            x.clone()
+        };
+        let lora_in = match dropout_key {
+            Some(key) => {
+                let op = DropoutFused::new(key.seed, key.layer_id, key.forward_idx, key.p)?;
+                apply1(&x_lora, op)?
+            }
+            None => x_lora,
+        };
+
+        let a_lin = Linear::new(self.lora_a.clone(), None);
+        let after_a = a_lin.forward(&lora_in)?;
+        let b_lin = Linear::new(self.lora_b.clone(), None);
+        let lora_out = b_lin.forward(&after_a)?;
+        eager_epilogue(&base_out, &lora_out, self.scaling)
     }
 
     /// References to the two trainable LoRA parameter tensors.
@@ -850,5 +866,613 @@ mod lora_scaling_tests {
     fn non_finite_alpha_propagates_visibly_not_silently() {
         let got = lora_scaling(f64::NAN, 4, false).unwrap();
         assert!(got.is_nan(), "NaN alpha must yield a visible NaN scaling");
+    }
+}
+
+/// BF16/CUDA production-width oracles for the fused LoRA site
+/// (`jammi_kernels::ops::LowRankResidualLinear`, dispatched here as
+/// `"lora_linear_fused"`), against the REAL production eager composition
+/// (`LoraLinear::forward_eager_training_composition` — the exact function
+/// `forward`'s own `DispatchOutcome::Eager` arm calls, extracted so this
+/// module can call it directly, bypassing admission, for a same-process
+/// A/B — never a re-implementation of its math). Pod-run only (CUDA
+/// feature + a physical device): `cuda_device` skips (not fails) on a
+/// CUDA-feature build with no physical GPU, per `docs/maintainer/
+/// cuda-kernel-guide.md`'s own `cuda_parity.rs`/`modernbert.rs` convention.
+///
+/// `jammi-kernels` is a declared leaf crate ("no jammi-* dependencies") —
+/// this suite therefore lives HERE, in `jammi-lora` (which already depends
+/// on `jammi-kernels`), rather than as a `jammi-kernels` dev-dependency on
+/// `jammi-lora` (which would need a dev-dependency cycle jammi-kernels'
+/// own `Cargo.toml` disclaims).
+///
+/// Three deliverables, each a `#[test]` below:
+/// 1. `lora_linear_bwd_bf16_production_oracle_sweep_cuda` — fwd + all
+///    three backward outputs (`dx`, `dA`, `dB`) at production geometry
+///    (`in=1024`, `out ∈ {1024, 3072, 4096}`, `rank=16`, `alpha=32`,
+///    `rows ∈ {128, 512, 4096}`, 3 seeds), Gaussian `x` at production
+///    amplitude and a Gaussian `N(0, 1e-3)` cotangent (the live-gradient
+///    regime — an upstream loss gradient is small relative to the
+///    activations that produced it, not unit-amplitude), compared via the
+///    FA2-upstream form: `max|fused−ref_f32| <= 2×max|eager_bf16−ref_f32|`
+///    (fwd) / `<= 3×` (each gradient), NO absolute floor (guide §3.8).
+/// 2. `lora_linear_bwd_bf16_wrong_alpha_scale_red_control_trips_the_bound_cuda`
+///    — a committed RED control: the REAL fused kernel, called directly
+///    with a deliberately wrong `scale` (a 50% alpha error), must FAIL
+///    every one of the four bounds above — proving this file's own
+///    assertion machinery is non-vacuous (fix-verifier's red-green
+///    discipline, permanently embedded rather than a one-off pod finding).
+/// 3. `lora_linear_fused_vs_eager_error_ratio_does_not_grow_with_depth_bf16_cuda`
+///    — the growth oracle (guide §3.2/esc-044's signature): 8 fused sites
+///    chained back-to-back (a self-loop, `in == out == 1024`, so one
+///    site's output feeds the next site's input with no extra
+///    projection — family L, a weight-free shape-correct bridge), `r(L) =
+///    Σ|dx_fused − dx_eager| / Σ|dx_eager|` reported at every depth `L =
+///    1..=8`, gated on `r(L) <= C·max(r(1), EPS)` — a budget derived from
+///    THIS RUN'S OWN `r(1)`, never an absolute ULP constant.
+///
+/// Every leg is dispatch-counted (guide §3.5: zero dispatch is RED, never
+/// green) using `>`/`>=` deltas, not `==` — the process-wide dispatch
+/// counters are shared with every OTHER test in this binary running
+/// concurrently (`cargo test`'s default thread-per-test model), the same
+/// raciness `crates/jammi-lora/tests/fused_epilogue.rs`'s own
+/// `eval_mode_never_dispatches_the_fused_kernel` documents.
+#[cfg(all(test, feature = "cuda"))]
+mod cuda_bf16_production_oracles {
+    use super::*;
+    use candle_core::{Device, Var};
+
+    /// Production ModernBERT-large hidden width — shared by every geometry
+    /// this suite exercises (`out_features` varies; `in_features` does
+    /// not, so a single production hidden-state activation feeds every
+    /// leg identically, matching how one hidden state feeds Wqkv/Wo/Wi in
+    /// production).
+    const IN_FEATURES: usize = 1024;
+    const RANK: usize = 16;
+    const ALPHA: f64 = 32.0;
+    /// A production-representative activation amplitude: this crate has
+    /// no single canonical "hidden state std" constant, but
+    /// `jammi_encoders::modernbert`'s own module doc measures
+    /// `max|qkv| ≈ 9–18` on the REAL ModernBERT-large checkpoint (`qkv =
+    /// Wqkv(hidden)`, the same hidden state a LoRA-augmented `Wqkv`/`Wo`/
+    /// `Wi` consumes as `x` here) — `X_STD` is chosen so a Gaussian draw
+    /// at this row count lands `max|x|` in that same order of magnitude
+    /// (reported, not hardcoded — see each test's own `eprintln!`).
+    /// Generic/synthetic (family L: this crate names no consumer), not a
+    /// literal replay of that measurement.
+    const X_STD: f32 = 3.5;
+    /// A small base-weight init amplitude (matches a typical
+    /// Kaiming/Xavier-scale frozen `Linear` weight — NOT LoRA's own
+    /// `A`/`B` amplitude, which `LoraInitMode::Gaussian` already fixes at
+    /// `0.02`, `crate::seeded::gaussian_fill`'s call sites in `LoraLinear
+    /// ::new`).
+    const W_STD: f32 = 0.04;
+    /// The live-gradient regime (task contract): an upstream loss
+    /// gradient is small relative to the activations/weights that
+    /// produced it, not unit-amplitude — never `X_STD`/`W_STD`-scale.
+    const DY_STD: f32 = 1e-3;
+
+    /// Mirrors `tests/cuda_parity.rs`'s own `cuda_device` (`jammi-kernels`)
+    /// and `jammi_encoders::modernbert`'s `growth_oracle_cuda_device`: a
+    /// machine that compiled with the `cuda` feature but has no physical
+    /// GPU is "skip", not "fail", UNLESS `JAMMI_REQUIRE_CUDA` is set, in
+    /// which case device-acquisition failure panics rather than silently
+    /// reading as a skip.
+    fn cuda_device() -> Option<Device> {
+        match Device::new_cuda(0) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
+                    panic!(
+                        "lora_linear BF16/CUDA production oracle: JAMMI_REQUIRE_CUDA is set but \
+                         no CUDA device could be acquired: {e}"
+                    );
+                }
+                eprintln!(
+                    "lora_linear BF16/CUDA production oracle: skipping — no CUDA device \
+                     available ({e})"
+                );
+                None
+            }
+        }
+    }
+
+    /// A deterministic Gaussian `f32` host buffer via this crate's own
+    /// `SplitMix64`/`gaussian_fill` (no `rand` dependency — the same
+    /// seeded-init machinery `LoraLinear::new`'s own `LoraInitMode::
+    /// Gaussian` branch uses), never candle's unseedable global RNG.
+    fn gaussian_vec(seed: u64, n: usize, stdev: f32) -> Vec<f32> {
+        let mut rng = SplitMix64::new(seed);
+        gaussian_fill(&mut rng, n, stdev)
+    }
+
+    /// A matched pair of `LoraLinear`s sharing ONE seed: `bf16` runs the
+    /// production `BF16` base / `F32` LoRA-adapter combination this op's
+    /// own domain doc calls out (`(BF16, BF16, F32)`); `f32_ref` runs the
+    /// SAME recipe with NOTHING rounded to `bf16` anywhere — the base
+    /// weight is the pre-rounding `F32` values, not `w_bf16` cast back up
+    /// (which would already carry `bf16`'s rounding). Both layers' `lora_a`/
+    /// `lora_b` are bit-identical: `LoraLinear::new`'s seeded draw is a
+    /// pure function of `(seed, fully-qualified parameter name)`
+    /// (`crate::seeded::seed_for_param`'s own doc), independent of the
+    /// base weight's dtype, so two fresh `VarMap`/`VarBuilder` pairs
+    /// constructed with the same `seed` and the same (default, empty)
+    /// prefix draw byte-identical `F32` `lora_a`/`lora_b` regardless of
+    /// which `base` they are paired with.
+    struct ProdLayers {
+        bf16: LoraLinear,
+        f32_ref: LoraLinear,
+    }
+
+    fn build_prod_layers(out_features: usize, seed: u64, device: &Device) -> ProdLayers {
+        let w_v = gaussian_vec(seed ^ 0x5741_1E17, out_features * IN_FEATURES, W_STD);
+        let w_f32 = Tensor::from_vec(w_v, (out_features, IN_FEATURES), device).unwrap();
+        let w_bf16 = w_f32.to_dtype(DType::BF16).unwrap();
+        let base_bf16 = Linear::new(w_bf16, None);
+        let base_f32 = Linear::new(w_f32.clone(), None);
+
+        let varmap_bf16 = VarMap::new();
+        let vb_bf16 = VarBuilder::from_varmap(&varmap_bf16, DType::F32, device);
+        let bf16_layer = LoraLinear::new(
+            base_bf16,
+            RANK,
+            ALPHA,
+            false,
+            LoraInitMode::Gaussian,
+            None,
+            seed,
+            &varmap_bf16,
+            &vb_bf16,
+        )
+        .unwrap();
+
+        let varmap_f32 = VarMap::new();
+        let vb_f32 = VarBuilder::from_varmap(&varmap_f32, DType::F32, device);
+        let f32_layer = LoraLinear::new(
+            base_f32,
+            RANK,
+            ALPHA,
+            false,
+            LoraInitMode::Gaussian,
+            None,
+            seed,
+            &varmap_f32,
+            &vb_f32,
+        )
+        .unwrap();
+
+        ProdLayers {
+            bf16: bf16_layer,
+            f32_ref: f32_layer,
+        }
+    }
+
+    fn to_f32_vec(t: &Tensor) -> Vec<f32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap()
+    }
+
+    fn assert_all_finite(v: &[f32], label: &str) {
+        assert!(
+            v.iter().all(|x| x.is_finite()),
+            "{label}: non-finite element present"
+        );
+    }
+
+    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b.iter())
+            .fold(0f32, |m, (&x, &y)| m.max((x - y).abs()))
+    }
+
+    /// The FA2-upstream comparison form: `max|fused-ref| <=
+    /// multiplier*max|eager-ref|`, NO absolute floor (guide §3.8 — a
+    /// `k*ulp(max)` floor would charge every element the allowance of the
+    /// largest element and hide exactly the divergence an oracle exists
+    /// to catch). Non-finite checked BEFORE any comparison (guide §3.7/
+    /// family F), written affirmatively. Returns `(within_bound, e_fused,
+    /// e_eager)` rather than asserting directly, so the RED control below
+    /// can assert the NEGATION without a `catch_unwind`.
+    fn fa2_bound(
+        label: &str,
+        fused: &[f32],
+        eager: &[f32],
+        reference: &[f32],
+        multiplier: f32,
+    ) -> (bool, f32, f32) {
+        assert_all_finite(fused, &format!("{label} fused"));
+        assert_all_finite(eager, &format!("{label} eager"));
+        assert_all_finite(reference, &format!("{label} reference"));
+        assert_eq!(
+            fused.len(),
+            reference.len(),
+            "{label}: fused/reference length mismatch"
+        );
+        assert_eq!(
+            eager.len(),
+            reference.len(),
+            "{label}: eager/reference length mismatch"
+        );
+        let e_fused = max_abs_diff(fused, reference);
+        let e_eager = max_abs_diff(eager, reference);
+        let bound = multiplier * e_eager;
+        let ok = e_fused.is_finite() && e_fused <= bound;
+        (ok, e_fused, e_eager)
+    }
+
+    fn assert_fa2_bound(
+        label: &str,
+        fused: &[f32],
+        eager: &[f32],
+        reference: &[f32],
+        multiplier: f32,
+        context: &str,
+    ) {
+        let (ok, e_fused, e_eager) = fa2_bound(label, fused, eager, reference, multiplier);
+        assert!(
+            ok,
+            "{label} ({context}): max|fused-ref_f32|={e_fused:e} exceeds {multiplier}x \
+             max|eager_bf16-ref_f32|={e_eager:e} (bound={:e}, NO floor)",
+            multiplier * e_eager
+        );
+    }
+
+    struct OracleOutputs {
+        out: Vec<f32>,
+        dx: Vec<f32>,
+        da: Vec<f32>,
+        db: Vec<f32>,
+    }
+
+    /// Runs ONE arm of `layer` on `(x, dy)` and returns its forward output
+    /// plus all three backward outputs (`dx`, `dA`, `dB`), together with
+    /// the `lora_linear_fused` dispatch-counter delta observed around the
+    /// call (`(fused_delta, eager_delta)`). `force_eager == false` calls
+    /// the REAL public dispatch site (`LoraLinear::forward`, which admits
+    /// the fused kernel on this domain); `force_eager == true` calls
+    /// `forward_eager_training_composition` DIRECTLY — the exact function
+    /// `forward`'s own `Eager` arm calls, bypassing `admit` entirely (so
+    /// its own dispatch counters never move) — never a re-implementation.
+    fn run_arm(
+        layer: &LoraLinear,
+        x: &Tensor,
+        dy: &Tensor,
+        force_eager: bool,
+    ) -> (OracleOutputs, u64, u64) {
+        let before = lora_linear_fused_dispatch_snapshot();
+        let x_var = Var::from_tensor(x).unwrap();
+        let out = if force_eager {
+            layer
+                .forward_eager_training_composition(x_var.as_tensor(), None)
+                .unwrap()
+        } else {
+            layer.forward(x_var.as_tensor()).unwrap()
+        };
+        let loss = (&out * dy).unwrap().sum_all().unwrap();
+        let grads = loss.backward().unwrap();
+        let dx = grads
+            .get(&x_var)
+            .unwrap_or_else(|| panic!("run_arm: no dx (force_eager={force_eager})"));
+        let da = grads
+            .get(&layer.lora_a)
+            .unwrap_or_else(|| panic!("run_arm: no dA (force_eager={force_eager})"));
+        let db = grads
+            .get(&layer.lora_b)
+            .unwrap_or_else(|| panic!("run_arm: no dB (force_eager={force_eager})"));
+        let outputs = OracleOutputs {
+            out: to_f32_vec(&out),
+            dx: to_f32_vec(dx),
+            da: to_f32_vec(da),
+            db: to_f32_vec(db),
+        };
+        let after = lora_linear_fused_dispatch_snapshot();
+        (
+            outputs,
+            after.fused - before.fused,
+            after.eager - before.eager,
+        )
+    }
+
+    /// Deliverable 1: one production geometry cell — builds the matched
+    /// `bf16`/`f32_ref` pair, draws production-amplitude `x` and a
+    /// live-gradient-regime `dy`, runs all three arms (fused-bf16,
+    /// eager-bf16, eager-f32-reference), and asserts the FA2-upstream
+    /// bound on `fwd`/`dx`/`dA`/`dB`.
+    fn compare_production_geometry(
+        layers: &ProdLayers,
+        device: &Device,
+        out_features: usize,
+        rows: usize,
+        seed: u64,
+    ) {
+        let context = format!("out_features={out_features} rows={rows} seed={seed}");
+
+        let x_v = gaussian_vec(
+            seed ^ 0x5EED_1234 ^ (rows as u64),
+            rows * IN_FEATURES,
+            X_STD,
+        );
+        let x_f32 = Tensor::from_vec(x_v, (rows, IN_FEATURES), device).unwrap();
+        let x_bf16 = x_f32.to_dtype(DType::BF16).unwrap();
+
+        let dy_v = gaussian_vec(
+            seed ^ 0xD137_1234 ^ (rows as u64) ^ ((out_features as u64) << 32),
+            rows * out_features,
+            DY_STD,
+        );
+        let dy_f32 = Tensor::from_vec(dy_v, (rows, out_features), device).unwrap();
+        let dy_bf16 = dy_f32.to_dtype(DType::BF16).unwrap();
+
+        let (fused, fused_ctr, fused_eager_ctr) = run_arm(&layers.bf16, &x_bf16, &dy_bf16, false);
+        assert!(
+            fused_ctr > 0,
+            "{context}: fused leg must dispatch the fused kernel at least once (zero dispatch \
+             is RED, never green — guide §3.5)"
+        );
+        assert_eq!(
+            fused_eager_ctr, 0,
+            "{context}: fused leg must never silently fall back to eager"
+        );
+
+        let (eager, _, _) = run_arm(&layers.bf16, &x_bf16, &dy_bf16, true);
+        let (reference, _, _) = run_arm(&layers.f32_ref, &x_f32, &dy_f32, true);
+
+        assert_fa2_bound("fwd", &fused.out, &eager.out, &reference.out, 2.0, &context);
+        assert_fa2_bound("dx", &fused.dx, &eager.dx, &reference.dx, 3.0, &context);
+        assert_fa2_bound("dA", &fused.da, &eager.da, &reference.da, 3.0, &context);
+        assert_fa2_bound("dB", &fused.db, &eager.db, &reference.db, 3.0, &context);
+    }
+
+    /// Deliverable 1. Production geometry: `in=1024`, `out ∈ {1024,
+    /// 3072, 4096}`, `rank=16`, `alpha=32` (scaling = 2.0, vanilla), rows
+    /// `∈ {128, 512, 4096}`, 3 seeds — 27 cells, each independently
+    /// asserted (the panic message names the failing cell). `layers`
+    /// (and hence the base weight / `lora_a` / `lora_b`) is rebuilt once
+    /// per `(out_features, seed)` pair and reused across the 3 row
+    /// counts, so the same weights are exercised at every row count
+    /// (matching how one adapter serves every batch shape in production).
+    #[test]
+    fn lora_linear_bwd_bf16_production_oracle_sweep_cuda() {
+        let Some(device) = cuda_device() else {
+            return;
+        };
+        const OUT_FEATURES: [usize; 3] = [1024, 3072, 4096];
+        const ROWS: [usize; 3] = [128, 512, 4096];
+        const SEEDS: [u64; 3] = [41, 42, 43];
+
+        for &seed in &SEEDS {
+            for &out_features in &OUT_FEATURES {
+                let layers = build_prod_layers(out_features, seed, &device);
+                for &rows in &ROWS {
+                    compare_production_geometry(&layers, &device, out_features, rows, seed);
+                }
+            }
+        }
+    }
+
+    /// Deliverable 2: a committed RED control. The REAL fused kernel
+    /// (`LowRankResidualLinear`, called directly through `apply3` — the
+    /// SAME function `LoraLinear::forward`'s `Fused` arm calls, same GEMM
+    /// sequence, same CUDA kernel), given a deliberately WRONG `scale`
+    /// (`1.5x` the layer's real `alpha/rank` — a 50% alpha-scale error),
+    /// must FAIL the FA2-upstream bound on every one of `fwd`/`dx`/`dA`/
+    /// `dB` against the honest eager-bf16/f32-reference pair. If this
+    /// does NOT trip, the oracle above is vacuous — it would pass on a
+    /// broken kernel just as readily as on a correct one (fix-verifier's
+    /// red-green discipline, permanently embedded rather than a one-off
+    /// pod finding).
+    #[test]
+    fn lora_linear_bwd_bf16_wrong_alpha_scale_red_control_trips_the_bound_cuda() {
+        let Some(device) = cuda_device() else {
+            return;
+        };
+        let out_features = 1024usize;
+        let rows = 512usize;
+        let seed = 42u64;
+        let layers = build_prod_layers(out_features, seed, &device);
+
+        let x_v = gaussian_vec(
+            seed ^ 0x5EED_1234 ^ (rows as u64),
+            rows * IN_FEATURES,
+            X_STD,
+        );
+        let x_f32 = Tensor::from_vec(x_v, (rows, IN_FEATURES), &device).unwrap();
+        let x_bf16 = x_f32.to_dtype(DType::BF16).unwrap();
+        let dy_v = gaussian_vec(
+            seed ^ 0xD137_1234 ^ (rows as u64) ^ ((out_features as u64) << 32),
+            rows * out_features,
+            DY_STD,
+        );
+        let dy_f32 = Tensor::from_vec(dy_v, (rows, out_features), &device).unwrap();
+        let dy_bf16 = dy_f32.to_dtype(DType::BF16).unwrap();
+
+        // Honest legs, unchanged.
+        let (eager, _, _) = run_arm(&layers.bf16, &x_bf16, &dy_bf16, true);
+        let (reference, _, _) = run_arm(&layers.f32_ref, &x_f32, &dy_f32, true);
+
+        // BROKEN "fused": the REAL op, the REAL `apply3` call site, a
+        // deliberately wrong `scale` — `dweight_needed = false` matches
+        // `layers.bf16`'s own base (an untracked leaf; see
+        // `frozen_weight_gate`).
+        let wrong_scale = (layers.bf16.scaling() * 1.5) as f32;
+        let ab = Tensor::cat(&[&layers.bf16.lora_a.t().unwrap(), &layers.bf16.lora_b], 0).unwrap();
+        let op =
+            LowRankResidualLinear::new(wrong_scale, IN_FEATURES, out_features, RANK, None, false)
+                .unwrap();
+        let x_var = Var::from_tensor(&x_bf16).unwrap();
+        let out = apply3(x_var.as_tensor(), layers.bf16.base.weight(), &ab, op).unwrap();
+        let loss = (&out * &dy_bf16).unwrap().sum_all().unwrap();
+        let grads = loss.backward().unwrap();
+        let broken = OracleOutputs {
+            out: to_f32_vec(&out),
+            dx: to_f32_vec(grads.get(&x_var).unwrap()),
+            da: to_f32_vec(grads.get(&layers.bf16.lora_a).unwrap()),
+            db: to_f32_vec(grads.get(&layers.bf16.lora_b).unwrap()),
+        };
+
+        let (fwd_ok, e_fwd, ee_fwd) =
+            fa2_bound("fwd", &broken.out, &eager.out, &reference.out, 2.0);
+        let (dx_ok, e_dx, ee_dx) = fa2_bound("dx", &broken.dx, &eager.dx, &reference.dx, 3.0);
+        let (da_ok, e_da, ee_da) = fa2_bound("dA", &broken.da, &eager.da, &reference.da, 3.0);
+        let (db_ok, e_db, ee_db) = fa2_bound("dB", &broken.db, &eager.db, &reference.db, 3.0);
+
+        assert!(
+            !fwd_ok,
+            "RED CONTROL FAILED TO TRIP (fwd): a 50% wrong alpha scale must exceed the FA2 \
+             bound, but e_fused={e_fwd:e} <= 2*e_eager={:e} — this oracle's own assertion \
+             machinery is vacuous",
+            2.0 * ee_fwd
+        );
+        assert!(
+            !dx_ok,
+            "RED CONTROL FAILED TO TRIP (dx): e_fused={e_dx:e} <= 3*e_eager={:e}",
+            3.0 * ee_dx
+        );
+        assert!(
+            !da_ok,
+            "RED CONTROL FAILED TO TRIP (dA): e_fused={e_da:e} <= 3*e_eager={:e}",
+            3.0 * ee_da
+        );
+        assert!(
+            !db_ok,
+            "RED CONTROL FAILED TO TRIP (dB): e_fused={e_db:e} <= 3*e_eager={:e}",
+            3.0 * ee_db
+        );
+    }
+
+    /// Deliverable 3: the growth oracle (guide §3.2, esc-044's
+    /// signature). 8 fused sites chained back-to-back from ONE tracked
+    /// `x` `Var` (`in == out == 1024`: a self-loop, weight-free
+    /// shape-correct bridge — the SAME `LoraLinear` instance is reused at
+    /// every depth, exactly as `jammi_encoders::modernbert`'s own
+    /// `attention_block_fused_vs_eager_dqkv_divergence_grows_with_depth_
+    /// bf16_cuda` reuses one `attn`), a plain max-abs rescale between
+    /// calls (no residual/LayerNorm in this synthetic chain) to stay
+    /// inside this op's own validated `bf16` domain across 8 layers.
+    /// `r(L) = Σ|dx_fused − dx_eager| / Σ|dx_eager|` is computed
+    /// INDEPENDENTLY at every depth `L = 1..=8` (not just `L=1` and
+    /// `L=8`) via 8 separate forward+backward chains per arm, reported in
+    /// full via `eprintln!` and in every failing assertion's own message.
+    #[test]
+    fn lora_linear_fused_vs_eager_error_ratio_does_not_grow_with_depth_bf16_cuda() {
+        let Some(device) = cuda_device() else {
+            return;
+        };
+        const L_MAX: usize = 8;
+        let out_features = IN_FEATURES; // self-loop chain.
+        let rows = 512usize;
+        let seed = 44u64;
+        let layers = build_prod_layers(out_features, seed, &device);
+
+        let x0_v = gaussian_vec(seed ^ 0x6060_A11A, rows * IN_FEATURES, X_STD);
+        let x0 = Tensor::from_vec(x0_v, (rows, IN_FEATURES), &device)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let dy_v = gaussian_vec(seed ^ 0x7070_B22B, rows * out_features, DY_STD);
+        let dy = Tensor::from_vec(dy_v, (rows, out_features), &device)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+
+        // Returns `(dx, fused_dispatch_delta)`.
+        let run = |force_eager: bool, l: usize| -> (Vec<f32>, u64) {
+            assert!(l > 0, "run: l must be >= 1");
+            let before = lora_linear_fused_dispatch_snapshot();
+            let x_var = Var::from_tensor(&x0).unwrap();
+            let mut cur = x_var.as_tensor().clone();
+            let mut last_out = None;
+            for _ in 0..l {
+                let out = if force_eager {
+                    layers
+                        .bf16
+                        .forward_eager_training_composition(&cur, None)
+                        .unwrap()
+                } else {
+                    layers.bf16.forward(&cur).unwrap()
+                };
+                let out_max = out
+                    .abs()
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .max(0)
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .to_scalar::<f32>()
+                    .unwrap()
+                    .max(1e-6);
+                cur = (&out / f64::from(out_max)).unwrap();
+                last_out = Some(out);
+            }
+            let loss = (last_out.unwrap() * &dy).unwrap().sum_all().unwrap();
+            let grads = loss.backward().unwrap();
+            let dx: Vec<f32> = grads
+                .get(&x_var)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let after = lora_linear_fused_dispatch_snapshot();
+            (dx, after.fused - before.fused)
+        };
+
+        let mut r_table: Vec<(usize, f64)> = Vec::with_capacity(L_MAX);
+        for l in 1..=L_MAX {
+            let (dx_fused, fused_ctr) = run(false, l);
+            let (dx_eager, _) = run(true, l);
+            assert!(
+                fused_ctr as usize >= l,
+                "growth oracle depth {l}: fused arm must dispatch fused at every one of the {l} \
+                 layers (zero dispatch is RED, never green) — got {fused_ctr}"
+            );
+            assert_all_finite(&dx_fused, &format!("growth L={l} fused dx"));
+            assert_all_finite(&dx_eager, &format!("growth L={l} eager dx"));
+            let mut num = 0f64;
+            let mut den = 0f64;
+            for (&f, &e) in dx_fused.iter().zip(dx_eager.iter()) {
+                num += f64::from((f - e).abs());
+                den += f64::from(e.abs());
+            }
+            assert!(
+                den.is_finite() && den > 0.0,
+                "growth oracle depth {l}: Σ|dx_eager| must be nonzero (signal check)"
+            );
+            r_table.push((l, num / den));
+        }
+
+        let report: String = r_table
+            .iter()
+            .map(|(l, r)| format!("r({l})={r:.3e}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!("lora_linear fused-vs-eager depth-growth (dx): {report}");
+
+        // The gate: GROWTH, not magnitude — the same budget shape
+        // `jammi_encoders::modernbert`'s own esc-044 growth oracle uses.
+        // `EPS` guards only a pathological exact `r(1) == 0` tie; it is
+        // two orders below any bf16-noise-scale `r(1)` this suite could
+        // plausibly measure, so it never competes with a real
+        // measurement.
+        const C: f64 = 4.0;
+        const EPS: f64 = 1e-9;
+        let r1 = r_table[0].1;
+        let bound = C * r1.max(EPS);
+        for &(l, r) in &r_table {
+            assert!(
+                r.is_finite() && r <= bound,
+                "lora_linear depth-growth oracle: r({l})={r:e} exceeds {C}*max(r(1),{EPS:e})=\
+                 {bound:e} — table: {report} — the fused/eager divergence is growing \
+                 SYSTEMATICALLY with depth, not staying at the L=1 bf16-noise scale"
+            );
+        }
     }
 }

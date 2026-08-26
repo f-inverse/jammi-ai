@@ -536,28 +536,78 @@ FN_HEAD_RE = re.compile(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)\s*[(<]")
 _ATTR_LINE_RE = re.compile(r"^\s*#!?\[")
 
 
+# Round-3b (lead probe of the class): a fail-closed check with NO review/
+# escape mechanism is a check no conforming file can ever satisfy once a
+# real fn-shaped string literal legitimately exists (the live instance:
+# crates/jammi-kernels/tests/stateful_op_discipline.rs's own grep-
+# discipline fixture, `let attention_block_text = "pub(crate) fn foo() {
+# ... }";` — a real, reviewed, intentional test string, not a bug). Mirrors
+# this repo's own `no-producer: <reason>` opt-out idiom: fail-closed by
+# default, escapable ONLY by a reviewed, per-line marker — never a whole-
+# file or whole-repo suppression.
+KERNEL_ORACLES_FN_IN_LITERAL_MARKER_RE = re.compile(
+    r"//\s*kernel-oracles:\s*fn-in-literal reviewed:\s*(?P<reason>.+?)\s*$"
+)
+
+
 def check_fn_desync(source: str, file_label: str) -> None:
-    """Fail-closed tripwire (round-3 audit): the count of `fn ` keyword
-    matches in the FULL stripper's output must equal the count in the
-    independent comments-only stripper's output. These legitimately
-    disagree only if a string/char literal contains a `fn <name>(`-shaped
-    substring (rare — `_strip_rust` blanks it, `_strip_comments_only_
-    independent` does not, since it never touches strings at all) — in
-    that case a human must look, same as any other uncomputable input this
-    module raises `OracleError` for; this is also the tripwire that would
-    have caught the feature_table.rs desync BEFORE it silently produced
-    `0 runtime skip(s), 0 ungated` for a file with real skips.
+    """PER-LINE fail-closed tripwire: for each line, the count of `fn `
+    keyword matches in the FULL stripper's output must equal the count in
+    the independent comments-only stripper's output. A line where they
+    disagree (a string/char literal on that line contains a `fn <name>(`-
+    shaped substring) must carry a `// kernel-oracles: fn-in-literal
+    reviewed: <reason>` marker on ITS OWN raw text or the line DIRECTLY
+    ABOVE it (raw text, since the marker is itself a `//` comment both
+    strippers would otherwise blank) — an unmarked desync line still fails
+    closed exactly as before. A marker present on a line that covers NO
+    desync (neither its own line nor the line below) is itself a FAIL —
+    mirrors the doc-number allowlist's "only shrinks" discipline: a marker
+    that no longer corresponds to a real desync must be REMOVED, never
+    accumulate as dead weight nobody can tell is still load-bearing.
     """
-    full = len(FN_HEAD_RE.findall(_strip_rust(source)))
-    comments_only = len(FN_HEAD_RE.findall(_strip_comments_only_independent(source)))
-    if full != comments_only:
-        raise OracleError(
-            f"{file_label}: fn-keyword desync — {full} `fn` keyword(s) visible in the "
-            f"fully-stripped text vs {comments_only} in the comments-only-stripped text. "
-            "Either a string/char literal in this file contains a fn-shaped substring "
-            "(needs manual review) or the stripper has a state-tracking bug — this fails "
-            "closed rather than silently trusting either count."
-        )
+    lines_raw = source.splitlines()
+    n = len(lines_raw)
+    lines_full = _strip_rust(source).splitlines()
+    lines_comments_only = _strip_comments_only_independent(source).splitlines()
+    # length-preserving strippers keep the same line COUNT; defensively pad
+    # in case a trailing no-newline partial line differs by one empty entry.
+    while len(lines_full) < n:
+        lines_full.append("")
+    while len(lines_comments_only) < n:
+        lines_comments_only.append("")
+
+    desynced = [
+        len(FN_HEAD_RE.findall(lines_full[i])) != len(FN_HEAD_RE.findall(lines_comments_only[i]))
+        for i in range(n)
+    ]
+    marked = [bool(KERNEL_ORACLES_FN_IN_LITERAL_MARKER_RE.search(lines_raw[i])) for i in range(n)]
+
+    unmarked_desync = [
+        i + 1
+        for i in range(n)
+        if desynced[i] and not (marked[i] or (i > 0 and marked[i - 1]))
+    ]
+    stale_markers = [
+        i + 1
+        for i in range(n)
+        if marked[i] and not (desynced[i] or (i + 1 < n and desynced[i + 1]))
+    ]
+
+    if unmarked_desync or stale_markers:
+        parts = []
+        if unmarked_desync:
+            parts.append(
+                f"unmarked fn-keyword desync at line(s) {', '.join(map(str, unmarked_desync))} "
+                "(a string/char literal on that line contains a fn-shaped substring — add "
+                "`// kernel-oracles: fn-in-literal reviewed: <reason>` on that line or the "
+                "line directly above it, or fix the stripper if this is a real bug)"
+            )
+        if stale_markers:
+            parts.append(
+                f"stale `fn-in-literal reviewed` marker at line(s) {', '.join(map(str, stale_markers))} "
+                "(no fn-keyword desync on that line or the line below it anymore — remove the marker)"
+            )
+        raise OracleError(f"{file_label}: " + "; ".join(parts))
 
 
 def _extract_balanced_block(text: str, open_brace_idx: int) -> tuple[str, int, int]:

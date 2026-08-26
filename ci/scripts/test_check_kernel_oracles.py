@@ -1011,6 +1011,70 @@ class TestFnKeywordDesyncCheck(unittest.TestCase):
             ko.check_fn_desync(src, "f.rs")
 
 
+class TestFnDesyncMarkerEscapeHatch(unittest.TestCase):
+    """Round-3b (lead probe): a fail-closed desync check with NO review/
+    escape mechanism is a check no conforming file can ever satisfy — the
+    live instance: crates/jammi-kernels/tests/stateful_op_discipline.rs's
+    own grep-discipline fixture string. Mirrors this repo's own
+    `no-producer: <reason>` opt-out idiom.
+    """
+
+    def test_marker_on_the_same_line_satisfies(self) -> None:
+        src = (
+            'fn t() {\n'
+            '    let s = "fn phantom() {}"; // kernel-oracles: fn-in-literal reviewed: grep fixture\n'
+            "    assert!(s.len() > 0);\n"
+            "}\n"
+        )
+        ko.check_fn_desync(src, "f.rs")  # must not raise
+
+    def test_marker_on_the_line_above_satisfies(self) -> None:
+        src = (
+            "fn t() {\n"
+            "    // kernel-oracles: fn-in-literal reviewed: grep fixture, not a real fn\n"
+            '    let s = "fn phantom() {}";\n'
+            "    assert!(s.len() > 0);\n"
+            "}\n"
+        )
+        ko.check_fn_desync(src, "f.rs")  # must not raise
+
+    def test_unmarked_desync_still_fails(self) -> None:
+        src = 'fn t() {\n    let s = "fn phantom() {}";\n    assert!(s.len() > 0);\n}\n'
+        with self.assertRaises(ko.OracleError):
+            ko.check_fn_desync(src, "f.rs")
+
+    def test_stale_marker_with_no_nearby_desync_fails(self) -> None:
+        src = (
+            "fn t() {\n"
+            "    // kernel-oracles: fn-in-literal reviewed: nothing to review here anymore\n"
+            "    let s = 1 + 1;\n"
+            "    assert!(s == 2);\n"
+            "}\n"
+        )
+        with self.assertRaises(ko.OracleError):
+            ko.check_fn_desync(src, "f.rs")
+
+    def test_raw_string_with_hash_levels_containing_fn_plus_marker_satisfies(self) -> None:
+        src = (
+            "// kernel-oracles: fn-in-literal reviewed: raw-string fixture text, not a real fn\n"
+            'const SRC: &str = r##"fn rawgate() -> Option<u32> { None }"##;\n'
+            "fn t() { assert!(SRC.len() > 0); }\n"
+        )
+        ko.check_fn_desync(src, "f.rs")  # must not raise
+
+    def test_reproduces_the_stateful_op_discipline_shape(self) -> None:
+        # the exact live instance the audit found (paraphrased, not copied).
+        src = (
+            "fn t() {\n"
+            "    // kernel-oracles: fn-in-literal reviewed: grep-discipline fixture "
+            "string, not a real fn declaration\n"
+            '    let attention_block_text = "pub(crate) fn foo() { qkv.apply_op3(rope_pack, mask, op) }";\n'
+            "    assert!(!attention_block_text.is_empty());\n"
+            "}\n"
+        )
+        ko.check_fn_desync(src, "f.rs")  # must not raise
+
+
 class TestHelperRegistrationIfShape(unittest.TestCase):
     """Registration requires the panic to be on the ENV READ'S OWN CONTROL
     PATH: an `if <env-read> { ... panic!/.expect(/unreachable! ... }` shape.

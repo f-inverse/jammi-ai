@@ -147,14 +147,23 @@ terminated an unrelated stale pod.
 
 `down` never trusts the locally-recorded pod id on its own. Before issuing a
 terminate, it confirms the id is **both** still present in the account's own
-live pod list **and** still carries this session's own name (its
-`<prefix>-ttl<H>`) — a mismatch refuses rather than acts. On a refusal the
-local session record is deliberately **kept**, not forgotten: this is exactly
-the ambiguous case where a follow-up `up` on the same alias most needs to
-still see a recorded pod and refuse (or ask for `--replace`) rather than
-deploying a third pod on top of the confusion. The pod itself, if it still
-exists under a different session's name, is left running for that session to
-manage.
+live pod list **and** still carries a name this session could plausibly own
+— a mismatch refuses rather than acts. On a refusal the local session record
+is deliberately **kept**, not forgotten: this is exactly the ambiguous case
+where a follow-up `up` on the same alias most needs to still see a recorded
+pod and refuse (or ask for `--replace`) rather than deploying a third pod on
+top of the confusion. The pod itself, if it still exists under a different
+session's name, is left running for that session to manage.
+
+A session recorded before this repo tracked `RP_TTL_HOURS` in the session
+file has no TTL to check against — `down` does not guess (a guessed "8"
+against a real `jammi-gpu-ttl72` pod would refuse to release a pod this
+tooling itself rented, and it would then bill its full 72h). Absence is
+checked on the meta *file*, not a fallback-defaulted variable: with no
+recorded TTL, `down` verifies by the pod id plus the `<prefix>-ttl<digits>`
+name *shape* alone, and any refusal names the recovery command
+(`RP_TTL_HOURS=<H> gpu-dev.sh down <session>`) if you know the pod's actual
+TTL and want to force an exact match.
 
 ## Reproducing the shipped runtime image
 

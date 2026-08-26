@@ -142,17 +142,30 @@ rp_terminate() { # $1=podId
 }
 
 # Confirm a pod id is BOTH present in the account's live pod list AND carries
-# the name this SESSION itself recorded (its own "<prefix>-ttl<H>") before any
-# caller acts on it irreversibly. Never trusts a locally-recorded id on its
-# own: the id could be stale (the account-side pod is already gone), or — the
-# incident this closes — a DIFFERENT pod could now be recorded under this
-# session's name (two processes racing `up` on the same alias). $1=podId
-# $2=expected TTL hours (the SESSION's own, as recorded at deploy time — never
-# the caller's current RP_TTL_HOURS, which may differ and would defeat the
-# whole check). Prints the account's name for the id on success (id present
-# AND named correctly). Returns 1 (not found, or name does not match) or 2
-# (could not query the account at all) — both are "do not act", never "assume
-# safe".
+# a name this SESSION could plausibly own before any caller acts on it
+# irreversibly. Never trusts a locally-recorded id on its own: the id could
+# be stale (the account-side pod is already gone), or — the incident this
+# closes — a DIFFERENT pod could now be recorded under this session's name
+# (two processes racing `up` on the same alias). $1=podId $2=expected TTL
+# hours, OR EMPTY.
+#
+# A non-empty $2 (the SESSION's own, as recorded at deploy time — never the
+# caller's current RP_TTL_HOURS, which may differ and would defeat the whole
+# check) requires an EXACT "<prefix>-ttl<H>" match. An EMPTY $2 means the
+# caller genuinely does not know this session's own TTL — a meta file
+# written before RP_TTL_HOURS was tracked in the session record has no such
+# line, and `${RP_TTL_HOURS:-8}` cannot tell that apart from an EXPLICIT
+# ttl8 record; confidently verifying against the wrong guessed number
+# refused to release a real `jammi-gpu-ttl72` pod this tooling itself
+# rented, which then billed its full 72h. With $2 empty this instead matches
+# on the id plus the "<prefix>-ttl<digits>" NAME SHAPE alone — the id is the
+# authoritative half of the check; the exact number only disambiguates
+# between multiple pods this tooling could have rented under one alias, and
+# an unknown number is not evidence the id is wrong.
+#
+# Prints the account's name for the id on success. Returns 1 (not found, or
+# name does not match/does not have the shape) or 2 (could not query the
+# account at all) — both are "do not act", never "assume safe".
 #
 # Piped input (the account's own pod list) and script source cannot both come
 # from stdin — `python3 -` with a heredoc reads the heredoc AS THE PROGRAM,
@@ -161,12 +174,11 @@ rp_terminate() { # $1=podId
 # `rp_deploy_live`'s own parser already uses, so the piped JSON reaches
 # `sys.stdin` intact and dynamic values travel as argv, never interpolated
 # into the script source.
-rp_pod_verify() { # $1=podId $2=expectedTtlHours
-  local id="$1" ttl="$2" base
-  base="${RP_POD_PREFIX}-ttl${ttl}"
+rp_pod_verify() { # $1=podId $2=expectedTtlHours (empty = unknown; match by name SHAPE only)
+  local id="$1" ttl="${2:-}"
   rp_gql '{"query":"query{ myself{ pods{ id name } } }"}' | python3 -c '
-import sys, json
-podid, base = sys.argv[1], sys.argv[2]
+import sys, json, re
+podid, ttl, prefix = sys.argv[1], sys.argv[2], sys.argv[3]
 try:
     d = json.load(sys.stdin)
 except Exception as e:
@@ -179,17 +191,24 @@ me = (d.get("data") or {}).get("myself")
 if me is None or me.get("pods") is None:
     print("response contained no pod list", file=sys.stderr)
     sys.exit(2)
+if ttl:
+    want_desc = "%s-ttl%s" % (prefix, ttl)
+    matches = lambda name: name == want_desc
+else:
+    want_desc = "%s-ttl<digits> (this session recorded no TTL -- matching by name shape only)" % prefix
+    shape = re.compile(r"^%s-ttl[0-9]+$" % re.escape(prefix))
+    matches = lambda name: shape.match(name) is not None
 for p in me["pods"]:
     if p.get("id") == podid:
         name = p.get("name") or ""
-        if name == base:
+        if matches(name):
             print(name)
             sys.exit(0)
-        print("pod %s account name %s does not match this session own name %s -- refusing to act on it" % (podid, name, base), file=sys.stderr)
+        print("pod %s account name %s does not match %s -- refusing to act on it" % (podid, name, want_desc), file=sys.stderr)
         sys.exit(1)
 print("pod %s is not in the account pod list" % podid, file=sys.stderr)
 sys.exit(1)
-' "$id" "$base"
+' "$id" "$ttl" "$RP_POD_PREFIX"
 }
 
 rp_cleanup() {

@@ -671,7 +671,7 @@ jobs:
           - name: CI guard wiring
             cmd: python3 ci/scripts/check_ci_guard_wiring.py
           # check_ci_guard_wiring.py's OWN suite (advisory iii, PR #372
-          # round 2): drives the real python_test_suites()/main() entry
+          # round 2): drives the real tracked_test_suites()/main() entry
           # points against throwaway git-init'd fixtures, pinning the
           # comment-vs-code-line tightening and the root generalization.
           - name: CI guard wiring suite

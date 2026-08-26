@@ -19,7 +19,7 @@ combined) landed with ZERO workflow ever mentioning any of their names —
 structurally INVISIBLE to the original `gate_scripts()` glob, which only
 looked at `check_*.py`/`check_*.sh` sitting directly in `ci/scripts/`, never
 recursing into a subdirectory (`ci/scripts/perf/`) and never looking outside
-`ci/scripts/` at all (`crates/jammi-bench/reference/`). `python_test_suites()`
+`ci/scripts/` at all (`crates/jammi-bench/reference/`). `tracked_test_suites()`
 below closes that blind spot.
 
 F7 (round-2 audit fix on PR #372, advisory iii) WIDENED it AGAIN: F6's own fix
@@ -28,7 +28,7 @@ still hand-picked exactly TWO roots (`ci/scripts/` and
 calls — a THIRD `test_*.py` suite landing under a different crate's own
 `reference/` directory, or under the repo's top-level `tests/`, would have
 reproduced the EXACT SAME blind spot F6 closed, just one directory over.
-`python_test_suites()` below is now driven by `git ls-files` (TRACKED files
+`tracked_test_suites()` below is now driven by `git ls-files` (TRACKED files
 only — an untracked/generated `test_*.py` was never really "shipped", and
 `git ls-files` is what CI's own checkout actually contains, so this matches
 what a CI run can see) filtered against three PREFIX roots: `ci/`,
@@ -131,9 +131,9 @@ def gate_scripts() -> list[Path]:
     `ci/scripts/perf/check_citations.py` (advisory i) — a nested
     `check_*.py` gate script the top-level-only glob below would have been
     STRUCTURALLY BLIND to, the exact class of gap this module's own doc
-    already names for `python_test_suites()` (F6/F7), just one function
+    already names for `tracked_test_suites()` (F6/F7), just one function
     over. Rather than special-case ONE nested exception, this function now
-    matches `python_test_suites()`'s own tracked-and-recursive shape (`git
+    matches `tracked_test_suites()`'s own tracked-and-recursive shape (`git
     ls-files` under `ci/`, filtered to `check_*.py`/`check_*.sh` by name),
     so a FOURTH nested gate script needs no future PR to remember to widen
     this again either.
@@ -148,23 +148,23 @@ def gate_scripts() -> list[Path]:
     return sorted(scripts)
 
 
-def python_test_suites() -> list[Path]:
+def tracked_test_suites() -> list[Path]:
     """Every TRACKED `test_*.py` OR `test_*.sh` test suite under one of the
     three prefix roots this module's doc names — the general, root-driven
     replacement for F6's two hand-picked `Path.rglob`/`Path.glob` roots (see
     this module's own doc for why hand-picking a root reproduces the exact
     blind spot it was meant to close, one directory over).
 
-    Widened to `.sh` (audit round on PR #387): `ci/scripts/test_gpu_dev_lifecycle.sh`
+    Widened to `.sh` (round-2 audit on PR #387): `ci/scripts/test_gpu_dev_lifecycle.sh`
     landed as a hermetic `test_*.sh` regression suite and was structurally
     INVISIBLE to this function's original `.py`-only filter — the exact F6/F7
     blind-spot shape, one extension over, catchable only because this suite
-    happened to also be hand-wired into `ci.yml`'s Guard matrix already. The
-    function keeps its `python_test_suites` name (every existing call site —
-    `main()` below and `test_check_ci_guard_wiring.py`'s own pinned suite —
-    already references it) even though it is no longer python-exclusive,
-    rather than rippling a rename through a file this change does not
-    otherwise need to touch.
+    happened to also be hand-wired into `ci.yml`'s Guard matrix already.
+    Renamed from `python_test_suites` in the SAME round once it stopped being
+    python-exclusive — a name that no longer describes what a function
+    returns is exactly the kind of drift this module's own gate exists to
+    catch in OTHER files; every call site (here and
+    `test_check_ci_guard_wiring.py`'s own pinned suite) was updated with it.
     """
     suites: list[Path] = []
     for rel in _tracked_files():
@@ -212,7 +212,7 @@ def workflow_run_text() -> str:
 
 
 def main() -> int:
-    scripts = gate_scripts() + python_test_suites()
+    scripts = gate_scripts() + tracked_test_suites()
     if not scripts:
         print(
             "ci-guard-wiring: FAIL — no check_*.py/check_*.sh gate scripts or test_*.py/test_*.sh suites found",

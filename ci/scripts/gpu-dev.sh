@@ -75,8 +75,10 @@ gpu-dev.sh — GPU development on RunPod
   pull    [session] <path>    rsync <path> back FROM the pod
   down    [session]           terminate the pod, forget the session
   ls                          list sessions
-  reap    [hours]             terminate orphaned pods past their own deadline
-                              ([hours] force-reaps everything older than that)
+  reap    [hours]             ACCOUNT-WIDE: terminate every orphaned jammi-gpu*
+                              pod past its own deadline, not just one session's
+                              ([hours] force-reaps EVERY such pod older than
+                              that, regardless of session — not a per-pod verb)
 
 A running measurement is protected only by its own TTL — there is no verb to
 pause the sweep for a single pod (RunPod's pod-edit API has no rename/name
@@ -192,7 +194,16 @@ esac
 # (runpod_gpu_prove.sh sets its own default before sourcing this file) are
 # untouched.
 if [ "$CMD" = "up" ] && [ -z "${RP_TTL_HOURS:-}" ]; then
-  RP_TTL_HOURS="${RP_DEV_TTL_HOURS:-72}"
+  RP_DEV_TTL_HOURS="${RP_DEV_TTL_HOURS:-72}"
+  # Validated HERE, under its OWN name, not left to runpod_lib.sh's shared
+  # RP_TTL_HOURS check below: a bad RP_DEV_TTL_HOURS would otherwise be
+  # assigned into RP_TTL_HOURS first and reported as "RP_TTL_HOURS must be
+  # a positive integer" — naming a variable the caller never set as the
+  # thing that is wrong.
+  case "$RP_DEV_TTL_HOURS" in
+    ''|*[!0-9]*) echo "::error::RP_DEV_TTL_HOURS must be a positive integer (got '${RP_DEV_TTL_HOURS}')"; exit 2 ;;
+  esac
+  RP_TTL_HOURS="$RP_DEV_TTL_HOURS"
   export RP_TTL_HOURS
 fi
 
@@ -413,12 +424,27 @@ EOF
   down)
     if rp_session_load; then
       # Never trust the locally-recorded id on its own: confirm it is BOTH
-      # still present in the account AND still carries this session's OWN
-      # name (its "<prefix>-ttl<H>") before terminating anything. This is
-      # what stops `down` from ending a pod that a race with another `up` on
-      # the same alias silently swapped in underneath this session's record
+      # still present in the account AND still carries a name this session
+      # could plausibly own before terminating anything. This is what stops
+      # `down` from ending a pod that a race with another `up` on the same
+      # alias silently swapped in underneath this session's record
       # (2026-08-25 incident) — a mismatch refuses rather than acts.
-      if rp_pod_verify "$RP_POD_ID" "${RP_TTL_HOURS:-8}" >/dev/null; then
+      #
+      # A meta written before RP_TTL_HOURS was tracked in the session file
+      # has no such line — `${RP_TTL_HOURS:-8}` cannot tell that apart from
+      # an EXPLICIT ttl8 record, and confidently verifying against the wrong
+      # guessed "8" refused to release a real jammi-gpu-ttl72 pod this
+      # tooling itself rented (it then billed its full 72h). Checked on the
+      # META FILE, not the fallback-defaulted shell variable, so absence is
+      # representable: pass rp_pod_verify an EMPTY ttl when the file does not
+      # record one, and it matches by id + name SHAPE alone instead of a
+      # specific number (see rp_pod_verify's own doc in runpod_lib.sh).
+      if grep -q '^RP_TTL_HOURS=' "$RP_META" 2>/dev/null; then
+        DOWN_TTL="$RP_TTL_HOURS"
+      else
+        DOWN_TTL=""
+      fi
+      if rp_pod_verify "$RP_POD_ID" "$DOWN_TTL" >/dev/null; then
         rp_terminate "$RP_POD_ID"
         echo "=== terminated pod ${RP_POD_ID} (session '${SESSION}') ==="
         RP_POD_ID=""   # already gone; keep the EXIT trap from acting on it again
@@ -433,7 +459,12 @@ EOF
         # deploying a THIRD pod on top of an already-confused alias.
         echo "::error::refusing to terminate pod ${RP_POD_ID} for session '${SESSION}' — it did not verify against the account's live pod list (see above)."
         echo "::error::the local session record is KEPT (not forgotten), so this alias still refuses a plain 'up' rather than deploying on top of the ambiguity."
-        echo "::error::inspect it: $(basename "$0") ls   /   force-reap by hand: $(basename "$0") reap <hours>   /   the RunPod console"
+        # `reap` is ACCOUNT-WIDE — it judges EVERY jammi-gpu* pod against its
+        # OWN deadline, never just this one (probed: `reap 1` terminated
+        # unrelated 4h-old pods) — so it is never a per-pod remedy and must
+        # not be suggested as one here.
+        echo "::error::inspect it: $(basename "$0") ls   /   the RunPod console"
+        echo "::error::if this pod's actual TTL is known, retry verification with: RP_TTL_HOURS=<H> $(basename "$0") down ${SESSION}"
         exit 1
       fi
     else

@@ -123,6 +123,22 @@ EOF
   chmod 600 "$RP_SESSION_ROOT/$1/meta"
 }
 
+# A legacy meta -- no RP_TTL_HOURS line at all, exactly what 3b48a8f (or any
+# up on base, before RP_TTL_HOURS was added to rp_session_save) would have
+# written. $1=session $2=podId
+write_meta_legacy() {
+  mkdir -p "$RP_SESSION_ROOT/$1"
+  cat > "$RP_SESSION_ROOT/$1/meta" <<EOF
+RP_POD_ID=$2
+RP_HOST=127.0.0.1
+RP_PORT=1
+RP_ARCH=a100
+RP_IMAGE=ghcr.io/f-inverse/jammi-ai-ci-cuda:latest
+RP_REF=main
+EOF
+  chmod 600 "$RP_SESSION_ROOT/$1/meta"
+}
+
 iso_from_epoch() { # $1=epoch seconds -- portable across GNU and BSD `date`
   date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -r "$1" +%Y-%m-%dT%H:%M:%SZ
 }
@@ -267,7 +283,44 @@ unset MOCK_DEPLOY_RESPONSE
   MOCK_RESPONSE_FILE="$SANDBOX/acct5.json"
   rp_pod_verify "pod-x" "72" >/dev/null 2>&1
   [ $? -eq 2 ] && record PASS "group2-verify-query-failure-refused" || record FAIL "group2-verify-query-failure-refused"
+
+  # Round-2 audit finding 1: an EMPTY ttl (the "this session's meta recorded
+  # no TTL" case) matches by id + "<prefix>-ttl<digits>" name SHAPE, not a
+  # specific number -- any TTL-shaped name for this id passes...
+  echo '{"data":{"myself":{"pods":[{"id":"pod-x","name":"jammi-gpu-ttl72"}]}}}' > "$SANDBOX/acct6.json"
+  MOCK_RESPONSE_FILE="$SANDBOX/acct6.json"
+  out="$(rp_pod_verify "pod-x" "" 2>/dev/null)"; rc=$?
+  [ "$rc" -eq 0 ] && [ "$out" = "jammi-gpu-ttl72" ] \
+    && record PASS "group2-verify-empty-ttl-matches-any-ttl-shape" || record FAIL "group2-verify-empty-ttl-matches-any-ttl-shape (rc=$rc out=$out)"
+  # ...but a name that is NOT this tooling's TTL shape at all still refuses --
+  # an empty ttl relaxes the NUMBER, never the id-and-prefix requirement.
+  echo '{"data":{"myself":{"pods":[{"id":"pod-x","name":"some-unrelated-name"}]}}}' > "$SANDBOX/acct7.json"
+  MOCK_RESPONSE_FILE="$SANDBOX/acct7.json"
+  rp_pod_verify "pod-x" "" >/dev/null 2>&1
+  [ $? -eq 1 ] && record PASS "group2-verify-empty-ttl-still-refuses-non-ttl-shaped-name" || record FAIL "group2-verify-empty-ttl-still-refuses-non-ttl-shaped-name"
 )
+
+# ═════════════════════════════════════════════════════════════════════════
+# Group 2b — CLI-level: an invalid RP_DEV_TTL_HOURS must be reported under
+# its OWN name, not misattributed to RP_TTL_HOURS (round-2 audit finding 4:
+# it is assigned into RP_TTL_HOURS before runpod_lib.sh's shared validation
+# runs, so an unvalidated-at-the-source bad value would otherwise be
+# reported as "RP_TTL_HOURS must be a positive integer" -- a variable the
+# caller never set).
+# ═════════════════════════════════════════════════════════════════════════
+reset_log
+RP_DEV_TTL_HOURS=not-a-number bash "$DIR/gpu-dev.sh" up a100 >"$SANDBOX/out-bad-dev-ttl.log" 2>&1
+rc=$?
+[ "$rc" -eq 2 ] && ok "finding-4: an invalid RP_DEV_TTL_HOURS exits 2" \
+  || bad "finding-4: expected exit 2 for an invalid RP_DEV_TTL_HOURS (got $rc)"
+grep -q "RP_DEV_TTL_HOURS must be a positive integer" "$SANDBOX/out-bad-dev-ttl.log" \
+  && ok "finding-4: the validation error names RP_DEV_TTL_HOURS, not RP_TTL_HOURS" \
+  || bad "finding-4: expected the error to name RP_DEV_TTL_HOURS ($(cat "$SANDBOX/out-bad-dev-ttl.log"))"
+if grep -q "RP_TTL_HOURS must be a positive integer" "$SANDBOX/out-bad-dev-ttl.log"; then
+  bad "finding-4: the error must not misattribute a bad RP_DEV_TTL_HOURS to RP_TTL_HOURS (regression!)"
+else
+  ok "finding-4: the error does not misattribute a bad RP_DEV_TTL_HOURS to RP_TTL_HOURS"
+fi
 
 # ═════════════════════════════════════════════════════════════════════════
 # Group 3 — CLI-level: `up` refuses a session alias that already has a
@@ -368,6 +421,18 @@ fi
 grep -q "refusing to terminate" "$SANDBOX/out-down-mismatch.log" \
   && ok "finding-3(down): mismatch prints a refusal message" \
   || bad "finding-3(down): expected a refusal message on mismatch"
+# Round-2 audit finding 1: every `down` refusal names the exact recovery
+# command (an explicit RP_TTL_HOURS override, for when the operator knows
+# the pod's real TTL and wants to force a match) -- not just the generic
+# "inspect it" pointers.
+grep -q -- "RP_TTL_HOURS=<H> $(basename "$DIR/gpu-dev.sh") down ${SESSION_DOWN_MISMATCH}" "$SANDBOX/out-down-mismatch.log" \
+  && ok "finding-1(down): refusal names the RP_TTL_HOURS=<H> recovery command" \
+  || bad "finding-1(down): expected the RP_TTL_HOURS=<H> recovery line in the refusal ($(cat "$SANDBOX/out-down-mismatch.log"))"
+# Round-2 audit finding 2: `reap` is account-wide, not a per-pod remedy --
+# the refusal must not suggest it as one.
+grep -q -- "reap <hours>" "$SANDBOX/out-down-mismatch.log" \
+  && bad "finding-2: down's refusal must not suggest 'reap <hours>' as a per-pod remedy (it is account-wide; regression!)" \
+  || ok "finding-2: down's refusal does not suggest reap as a per-pod remedy"
 # A refusal must KEEP the local record, not forget it — an earlier version of
 # this fix forgot it unconditionally, which would let a follow-up `up` on
 # this same alias see NO recorded session and deploy a third pod straight
@@ -390,6 +455,26 @@ fi
 [ -f "$RP_SESSION_ROOT/$SESSION_DOWN_GHOST/meta" ] \
   && ok "finding-3(down): the local record is KEPT after a ghost-id refusal" \
   || bad "finding-3(down): the local record must survive a ghost-id refusal (regression!)"
+
+# Round-2 audit finding 1: a LEGACY meta (no RP_TTL_HOURS line at all -- what
+# 3b48a8f, or any `up` on base before this repo tracked TTL in the session
+# file, would have written) must not make `down` guess "8" and confidently
+# refuse to release a real jammi-gpu-ttl72 pod this tooling itself rented
+# (reproduced by the audit: rc=1, zero terminates, the pod then bills its
+# full 72h). With no recorded TTL, verification falls back to id + name
+# SHAPE ("<prefix>-ttl<digits>"), so a genuinely-owned ttl72 pod terminates.
+SESSION_DOWN_LEGACY="down-legacy-no-ttl"
+write_meta_legacy "$SESSION_DOWN_LEGACY" "pod-legacy-ttl72"
+echo '{"data":{"myself":{"pods":[{"id":"pod-legacy-ttl72","name":"jammi-gpu-ttl72"}]}}}' > "$SANDBOX/acct-down-legacy.json"
+export MOCK_ACCOUNT_RESPONSE="$SANDBOX/acct-down-legacy.json"
+reset_log
+bash "$DIR/gpu-dev.sh" down "$SESSION_DOWN_LEGACY" >"$SANDBOX/out-down-legacy.log" 2>&1
+term_count_legacy="$(grep -c "podTerminate.*pod-legacy-ttl72" "$CALL_LOG")"
+if [ "$term_count_legacy" = "1" ]; then
+  ok "finding-1(down, legacy meta): a genuinely-owned ttl72 pod terminates exactly once despite no recorded TTL"
+else
+  bad "finding-1(down, legacy meta): expected exactly one podTerminate for pod-legacy-ttl72 (got ${term_count_legacy}); output: $(cat "$SANDBOX/out-down-legacy.log")"
+fi
 
 # ═════════════════════════════════════════════════════════════════════════
 # Group 4 — rp_sweep's age-based judgement (function-level). Age math is

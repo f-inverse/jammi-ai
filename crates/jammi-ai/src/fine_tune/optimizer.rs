@@ -33,9 +33,49 @@
 //! callers) hold that sync to, so it never reappears on every step.
 
 use candle_core::{backprop::GradStore, DType, Tensor, Var};
+use candle_nn::VarMap;
 use jammi_db::error::{JammiError, Result};
 
 use crate::fine_tune::adamw::AdamW;
+
+/// Snapshot every trainable `Var` in `varmap`, in a DETERMINISTIC order —
+/// sorted by its `VarBuilder`-path NAME, never `VarMap::all_vars()`'s raw
+/// `HashMap` iteration order.
+///
+/// Why this matters (esc-182, a sibling audit finding): `VarMap::data()` is a
+/// `std::collections::HashMap<String, Var>` (candle-nn 0.11.0, `var_map.rs`)
+/// — `all_vars()` is `tensor_data.values().collect()`, and `std::HashMap`'s
+/// default hasher is keyed by a PER-PROCESS random seed (`RandomState`), so
+/// its iteration order is stable within one process's lifetime for a given
+/// table (never mutated between reads) but is NOT reproducible across two
+/// separate process invocations of the identical program with the identical
+/// `seed` — a second `cargo test`/training run gets a DIFFERENT `all_vars()`
+/// order from the first, purely from HashMap's own randomized hashing, wholly
+/// independent of the caller's `seed` parameter. [`clip_gradients`]'s own doc
+/// claims a "fixed left-to-right fold order… deterministic run to run" — that
+/// claim is only as true as the ORDER its `trainable_vars: &[Var]` argument
+/// arrives in, which this function's caller (not `clip_gradients` itself,
+/// which cannot see names) is responsible for pinning. `trainer.rs`'s
+/// `TrainingLoop::run` and `parallel_train.rs`'s `run_parallel_training` both
+/// snapshot `trainable_vars` ONCE (`self.varmap.all_vars()`, pre-esc-182) and
+/// reuse that same `Vec` for gradient accumulation, the clip's fold, AND the
+/// `AdamW` optimizer's positional moment vector — self-consistent WITHIN one
+/// run (the snapshot itself never reorders), but the clip's fold order (and
+/// therefore the last bits of `total_norm`, and therefore the last bits of
+/// every clipped gradient) still differs BETWEEN independent process
+/// invocations of the same seed. Sorting by name here removes that
+/// process-level nondeterminism from a parity-critical path (family J: no
+/// unseeded RNG) — the optimizer's OWN moment-restoration path already had to
+/// solve this same problem for a different reason (`trainer.rs`'s
+/// `optim_param_names`, keying `AdamW`'s resume-from-checkpoint moments by
+/// name rather than by this same unstable position) — this closes the
+/// matching gap for the clip's own fold.
+pub fn sorted_trainable_vars(varmap: &VarMap) -> Vec<Var> {
+    let data = varmap.data().lock().unwrap_or_else(|e| e.into_inner());
+    let mut named: Vec<(&String, &Var)> = data.iter().collect();
+    named.sort_by(|a, b| a.0.cmp(b.0));
+    named.into_iter().map(|(_, v)| v.clone()).collect()
+}
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -77,8 +117,18 @@ pub(crate) fn thread_sync_read_count() -> u64 {
 /// `torch.nn.utils.clip_grad_norm_(params, max_norm)`, entirely on-device.
 ///
 /// Computes `total_norm = sqrt(sum ||g||² for all g)` as a device scalar
-/// tensor (a fixed left-to-right fold over `trainable_vars` in order, so the
-/// reduction order — and therefore the bits — is deterministic run to run).
+/// tensor (a fixed left-to-right fold over `trainable_vars` IN THE ORDER THE
+/// CALLER SUPPLIES IT). This function has no way to see `Var` names and
+/// cannot enforce ordering itself — the "deterministic run to run" half of
+/// that claim is only as true as its caller's ordering. Every production
+/// caller in this crate (`trainer.rs`, `parallel_train.rs`) now builds
+/// `trainable_vars` via [`sorted_trainable_vars`], never a raw
+/// `VarMap::all_vars()` — see that function's own doc (esc-182) for why a raw
+/// `all_vars()` order is stable WITHIN one process's use of one `VarMap` but
+/// NOT reproducible ACROSS separate process invocations of the identical
+/// `seed`, which would otherwise make this fold's last bits (and therefore
+/// every clipped gradient's last bits) a function of `HashMap`'s per-instance
+/// hash-randomization rather than of `seed` alone.
 /// Reduction order versus torch: `clip_grad_norm_` takes a norm of
 /// per-parameter norms (`torch._foreach_norm` per gradient, then
 /// `vector_norm` of the stacked norms — `sqrt(Σ_i (sqrt(Σ g_i²))²)`), while
@@ -446,6 +496,65 @@ mod tests {
             lr,
             ..Default::default()
         }
+    }
+
+    /// esc-182: [`sorted_trainable_vars`] must return the SAME `Var` sequence
+    /// regardless of the order names were INSERTED into the `VarMap` — the
+    /// property that removes the `HashMap`-iteration-order dependence
+    /// `VarMap::all_vars()` has. Two `VarMap`s, built by inserting the SAME
+    /// four names in OPPOSITE orders (a stand-in for two different
+    /// processes' independently-randomized `HashMap` hashers producing
+    /// different `all_vars()` orders for the identical variable set — this
+    /// test cannot literally launch two processes, but insertion order is
+    /// the one lever that visibly perturbs a `HashMap`'s internal bucket
+    /// layout without needing to), must still walk their SHAPES (each name
+    /// here gets a distinct element count, so the SHAPE sequence pins the
+    /// NAME sequence indirectly) in IDENTICAL order.
+    #[test]
+    fn sorted_trainable_vars_is_independent_of_varmap_insertion_order() {
+        let dev = Device::Cpu;
+        let names_shapes: [(&str, usize); 4] =
+            [("zed", 4), ("alpha", 1), ("mid.b", 3), ("mid.a", 2)];
+
+        let forward = VarMap::new();
+        for &(name, n) in &names_shapes {
+            forward
+                .get((n,), name, candle_nn::Init::Const(0.0), DType::F32, &dev)
+                .unwrap();
+        }
+        let backward = VarMap::new();
+        for &(name, n) in names_shapes.iter().rev() {
+            backward
+                .get((n,), name, candle_nn::Init::Const(0.0), DType::F32, &dev)
+                .unwrap();
+        }
+
+        let forward_shapes: Vec<usize> = sorted_trainable_vars(&forward)
+            .iter()
+            .map(|v| v.as_tensor().dims1().unwrap())
+            .collect();
+        let backward_shapes: Vec<usize> = sorted_trainable_vars(&backward)
+            .iter()
+            .map(|v| v.as_tensor().dims1().unwrap())
+            .collect();
+
+        // The expected order is the NAME-sorted order:
+        // "alpha" < "mid.a" < "mid.b" < "zed" -> shapes [1, 2, 3, 4].
+        let expected = vec![1, 2, 3, 4];
+        assert_eq!(
+            forward_shapes, expected,
+            "forward-inserted VarMap did not come back name-sorted"
+        );
+        assert_eq!(
+            backward_shapes, expected,
+            "reverse-inserted VarMap did not come back name-sorted"
+        );
+        assert_eq!(
+            forward_shapes, backward_shapes,
+            "sorted_trainable_vars must be independent of VarMap insertion order — a mutant \
+             that reads VarMap::all_vars() directly (raw HashMap order) would very likely \
+             diverge here"
+        );
     }
 
     /// A single trainable `Var` with a gradient whose norm we control exactly
@@ -1110,5 +1219,435 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err_neg.contains("finite"), "got: {err_neg}");
+    }
+
+    // ── Production-shape torch-parity acceptance leg (esc-182 finding item 1) ──
+    //
+    // Every oracle above proves the op-sequence derivation at a TOY scale: 4
+    // Vars, a handful of elements each, values chosen so every intermediate
+    // sum is an EXACTLY representable integer (0 ulp of rounding at every
+    // step, by construction — see `assert_multi_var_clip_matches_host`'s own
+    // doc). That is a mechanism proof, not a SCALE proof: it says nothing
+    // about whether the same derivation still bounds the same code at the
+    // tensor COUNT and ELEMENT COUNT this module's own top-of-file doc cites
+    // as the motivating case — "224 [Vars] on a ModernBERT-large r16
+    // Wqkv/Wo/Wi LoRA config" — with REAL (seeded-random, non-integer)
+    // per-element gradient values, never a hand-picked constant.
+    //
+    // ## Real production shape
+    //
+    // `production_lora_site_shapes` is ModernBERT-large's actual dimensions
+    // (`hidden_size = 1024`, `intermediate_size = 2624`, 28 layers) at
+    // `lora_rank = 16`, four LoRA sites per layer (`jammi-encoders`'
+    // `ModernBert::build` names the MLP output projection `"mlp.Wo"`,
+    // distinct from attention's own `"Wo"` — see `grad_oracle.rs`'s
+    // "Wqkv/Wo/Wi" table in `jammi-bench` for the same four-site
+    // enumeration), two Vars per site (`lora_a`, `lora_b`):
+    // `4 * 2 * 28 == 224`, pinned by
+    // `production_shape_224_vars_matches_torch_parity_within_probabilistic_bound`'s
+    // own `assert_eq!(k, 224, ..)` rather than assumed.
+    //
+    // ## Bound derivation, generalized from the toy fixture's own doc to real k/n
+    //
+    // The toy fixture's derivation states the WORST-CASE per-step rounding as
+    // `(n_i - 1) * 0.5` ulp for a Var's own `n_i`-element `sqr`+`sum_all`
+    // fold and `(k - 1) * 0.5` ulp for the cross-Var fold over `k` Vars — a
+    // fully-correlated, every-rounding-in-the-same-direction bound. At
+    // `k = 224` and `Σn_i ≈ 7.2M` (this fixture's real element count — LoRA
+    // A/B matrices at the dimensions above), that worst-case additive bound
+    // evaluates to several MILLION ulp (tens of percent, relative) —
+    // vacuous: a bound that loose would accept almost any output, catching
+    // nothing. The worst-case bound that was TIGHT at 4 toy Vars with a
+    // handful of elements each is USELESS at production scale; a meaningful
+    // acceptance criterion here needs a DIFFERENT (still-derived, never
+    // fitted) bound.
+    //
+    // Standard numerical-analysis practice (Higham, *Accuracy and Stability
+    // of Numerical Algorithms*, 2nd ed., the probabilistic summation-error
+    // bound of §4.2) treats per-step rounding errors as independent,
+    // zero-mean perturbations when the summands' signs are not
+    // adversarially correlated — true here: every summand is `g_i²` for a
+    // genuinely-random `g_i`, never engineered to round in one direction —
+    // so the accumulated error grows like `sqrt(n) * u`, not `n * u`, with
+    // high probability. `production_bound_ulp` uses THAT bound instead:
+    // `0.5 * (Σ sqrt(n_i - 1) + sqrt(k - 1)) + 2.0` (the intra-Var folds'
+    // probabilistic term, the cross-Var fold's probabilistic term, and the
+    // toy fixture's own fixed `sqrt`/`affine(eps)`/`recip`/`broadcast_mul`
+    // roundings, none of which scale with `n`/`k`) — computed FROM the
+    // fixture's actual measured `n_i`/`k` in code, never a literal. This is
+    // still a DERIVED bound (no absolute floor, nothing fitted to what a run
+    // happened to produce), just the appropriate ONE for this scale.
+    //
+    // ## RED control
+    //
+    // `production_shape_old_formula_fails_the_bound_at_small_total_norm`
+    // shows the pre-PR host-clip formula (`clip_coef = max_norm /
+    // total_norm`, no epsilon) applied to the SAME 224-Var production-shaped
+    // topology, at a `total_norm` small enough that torch's `+ 1e-6` term is
+    // a material fraction of the denominator, EXCEEDS this same bound by
+    // ORDERS of magnitude — the mechanism (an entirely missing additive
+    // term, not merely a different rounding order) a scale-invariant ulp
+    // bound is built to catch. That same leg's disclosure in the PARITY
+    // test's own `eprintln!` reports the honest complement: at the SHIPPED
+    // DEFAULT `max_grad_norm = 1.0` and a REALISTIC per-element gradient
+    // magnitude, the epsilon term is only a few ulp — comparable to or
+    // smaller than ordinary rounding noise — so the pre-PR formula's defect
+    // is NOT reliably detectable at that specific (common) operating point;
+    // it is real and material specifically in the small-`total_norm`
+    // (near-convergence / small-`max_grad_norm`) regime this RED control
+    // targets. That is the honest finding, reported rather than papered
+    // over (family K).
+
+    /// ModernBERT-large's real hidden width.
+    const PROD_HIDDEN: usize = 1024;
+    /// ModernBERT-large's real (per-branch) MLP intermediate width — the
+    /// GeGLU `Wi` projection packs TWO of these (gate + up).
+    const PROD_INTERMEDIATE: usize = 2624;
+    /// The `r16` LoRA rank this module's own top-of-file doc cites.
+    const PROD_LORA_RANK: usize = 16;
+    /// ModernBERT-large's real depth.
+    const PROD_NUM_LAYERS: usize = 28;
+
+    /// Every LoRA-site `(lora_a_shape, lora_b_shape)` pair at the constants
+    /// above, matching jammi-lora's own `A: [rank, in_features]` /
+    /// `B: [out_features, rank]` orientation. Four sites per layer: packed
+    /// `Wqkv` (`out = 3 * hidden`), attention `Wo`, packed GeGLU `mlp.Wi`
+    /// (`out = 2 * intermediate`), `mlp.Wo`.
+    fn production_lora_site_shapes() -> [([usize; 2], [usize; 2]); 4] {
+        [
+            (
+                [PROD_LORA_RANK, PROD_HIDDEN],
+                [3 * PROD_HIDDEN, PROD_LORA_RANK],
+            ),
+            ([PROD_LORA_RANK, PROD_HIDDEN], [PROD_HIDDEN, PROD_LORA_RANK]),
+            (
+                [PROD_LORA_RANK, PROD_HIDDEN],
+                [2 * PROD_INTERMEDIATE, PROD_LORA_RANK],
+            ),
+            (
+                [PROD_LORA_RANK, PROD_INTERMEDIATE],
+                [PROD_HIDDEN, PROD_LORA_RANK],
+            ),
+        ]
+    }
+
+    /// Build the REAL 224-Var production trainable set (see
+    /// `production_lora_site_shapes`) on `device`, each Var's gradient a
+    /// GENUINE `backward()`-sourced value (never a literal): `d/dw[sum(c ⊙
+    /// w)] = c` for a per-element coefficient tensor `c` drawn from a seeded
+    /// `Normal(0, element_std)` — real (non-integer, non-hand-picked)
+    /// floating-point noise, not the toy fixtures' friendly constants.
+    /// Returns the Vars, the GradStore, and each Var's PRE-clip gradient as
+    /// `Vec<f32>` (flattened, same order as the Vars) for an INDEPENDENT
+    /// host reference.
+    fn production_shaped_vars_with_grads(
+        element_std: f64,
+        seed: u64,
+        device: &Device,
+    ) -> (Vec<Var>, GradStore, Vec<Vec<f32>>) {
+        use rand::{rngs::StdRng, SeedableRng};
+        use rand_distr::{Distribution, Normal};
+
+        let mut rng = StdRng::seed_from_u64(seed);
+        let normal = Normal::new(0.0f64, element_std).expect("valid std");
+
+        let mut vars = Vec::with_capacity(PROD_NUM_LAYERS * 8);
+        let mut before = Vec::with_capacity(PROD_NUM_LAYERS * 8);
+        let mut loss: Option<Tensor> = None;
+
+        for _layer in 0..PROD_NUM_LAYERS {
+            for (a_shape, b_shape) in production_lora_site_shapes() {
+                for shape in [a_shape, b_shape] {
+                    let n = shape[0] * shape[1];
+                    let w =
+                        Var::from_tensor(&Tensor::zeros(&shape[..], DType::F32, device).unwrap())
+                            .unwrap();
+                    let coeff_vals: Vec<f32> =
+                        (0..n).map(|_| normal.sample(&mut rng) as f32).collect();
+                    before.push(coeff_vals.clone());
+                    let coeff = Tensor::from_vec(coeff_vals, &shape[..], device).unwrap();
+                    let term = (w.as_tensor() * &coeff).unwrap().sum_all().unwrap();
+                    loss = Some(match loss {
+                        None => term,
+                        Some(acc) => (&acc + &term).unwrap(),
+                    });
+                    vars.push(w);
+                }
+            }
+        }
+        let grads = loss.unwrap().backward().unwrap();
+        (vars, grads, before)
+    }
+
+    /// The scale-appropriate ulp bound for this fixture's ACTUAL measured
+    /// `n_i`/`k` (see this section's leading doc: the toy fixture's
+    /// worst-case `(n-1)*0.5` additive bound is vacuous at `Σn_i` in the
+    /// millions; this uses the standard probabilistic `sqrt(n)`
+    /// summation-error bound instead — still derived from the op sequence,
+    /// never fitted to a measured value).
+    fn production_bound_ulp(n_per_var: &[usize]) -> f64 {
+        let k = n_per_var.len();
+        let intra_var: f64 = n_per_var
+            .iter()
+            .map(|&n| (n.saturating_sub(1) as f64).sqrt() * 0.5)
+            .sum();
+        let cross_var = (k.saturating_sub(1) as f64).sqrt() * 0.5;
+        // `sqrt`, `affine(1.0, eps)`, `recip`, `broadcast_mul`: 4 further
+        // roundings at 0.5 ulp each that do not scale with n/k (see
+        // `clip_gradients`'s own doc's op-count derivation); `affine(max_norm,
+        // 0.0)`/`minimum` are exact here (max_norm == 1.0 or the clamp is not
+        // engaged in either leg below).
+        intra_var + cross_var + 4.0 * 0.5
+    }
+
+    /// ULP distance between a host-truth value `e` and a device-measured
+    /// value `a`, in `f64` (the bounds this section computes can run into
+    /// the tens of thousands of ulp — see `production_bound_ulp`'s own doc —
+    /// well past where `f32` ulp arithmetic would itself lose precision).
+    fn ulp_distance(e: f32, a: f32) -> f64 {
+        let u = (f32::EPSILON as f64) * (e.abs() as f64).max(f32::MIN_POSITIVE as f64);
+        ((e as f64) - (a as f64)).abs() / u
+    }
+
+    /// THE production-shape torch-parity acceptance leg. 224 real
+    /// ModernBERT-large-r16-shaped LoRA Vars, real (seeded-random, non-toy)
+    /// per-element gradients at a REALISTIC per-element magnitude
+    /// (`element_std = 1e-3`), clipped at the SHIPPED DEFAULT `max_grad_norm
+    /// = 1.0`, in the ACTIVE-clipping regime (`total_norm > max_norm` —
+    /// asserted below, never assumed). Compared against an INDEPENDENT host
+    /// `f64` reference of the SAME torch formula (`max_norm / (total_norm +
+    /// 1e-6)`, clamped to at most `1.0` — never reached here since active),
+    /// within `production_bound_ulp`.
+    #[test]
+    fn production_shape_224_vars_matches_torch_parity_within_probabilistic_bound() {
+        let device = Device::Cpu;
+        let (vars, mut grads, before) = production_shaped_vars_with_grads(1e-3, 20260825, &device);
+        let n_per_var: Vec<usize> = before.iter().map(|v| v.len()).collect();
+        let k = vars.len();
+        assert_eq!(
+            k, 224,
+            "esc-182: this fixture must build EXACTLY the 224 Vars this module's own doc cites \
+             (28 layers * 4 LoRA sites * 2 (A, B))"
+        );
+
+        let total_sq_host: f64 = before
+            .iter()
+            .flat_map(|g| g.iter())
+            .map(|&x| (x as f64) * (x as f64))
+            .sum();
+        let host_norm = total_sq_host.sqrt();
+
+        let max_norm = 1.0f64; // the shipped default (`max_grad_norm = 1.0`)
+        assert!(
+            host_norm > max_norm,
+            "test setup: must be in the ACTIVE-clipping regime (total_norm > max_norm), got \
+             total_norm={host_norm} at max_norm={max_norm}"
+        );
+
+        let host_coef = max_norm / (host_norm + 1e-6); // torch's exact formula, f64
+        assert!(
+            host_coef < 1.0,
+            "test setup: coefficient must be unclamped (active, not at the 1.0 ceiling)"
+        );
+
+        let total_norm = clip_gradients(&vars, &mut grads, max_norm)
+            .unwrap()
+            .expect("clipping enabled");
+        let norm_val: f32 = total_norm.to_scalar().unwrap();
+
+        let bound = production_bound_ulp(&n_per_var);
+        let norm_ulp = ulp_distance(host_norm as f32, norm_val);
+        assert!(
+            norm_ulp <= bound,
+            "total_norm: host {host_norm} vs device {norm_val} — {norm_ulp} ulp exceeds the \
+             derived bound {bound} ulp"
+        );
+
+        let mut max_grad_ulp = 0.0f64;
+        for (w, g_before) in vars.iter().zip(&before) {
+            let g_after: Vec<f32> = grads
+                .get(w.as_tensor())
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            for (x, a) in g_before.iter().zip(&g_after) {
+                let e = ((*x as f64) * host_coef) as f32;
+                let u = ulp_distance(e, *a);
+                max_grad_ulp = max_grad_ulp.max(u);
+                assert!(
+                    u <= bound,
+                    "clipped gradient: host {e} vs device {a} — {u} ulp exceeds the derived \
+                     bound {bound} ulp"
+                );
+            }
+        }
+
+        // Honest disclosure (family K / esc-182 item 2's own instruction —
+        // "report, do not paper over" — applies here too): at THIS realistic
+        // production amplitude and the shipped default max_norm, torch's `+
+        // 1e-6` term is TINY relative to `total_norm`. Measure it rather
+        // than silently leave it implicit.
+        let old_coef = max_norm / host_norm; // pre-PR formula, no epsilon
+        let old_vs_new_relative = (old_coef - host_coef).abs() / host_coef;
+        eprintln!(
+            "esc-182 production-scale disclosure: total_norm={host_norm:.6}, max_norm=\
+             {max_norm}, torch_coef={host_coef:.10}, old_coef={old_coef:.10}, relative diff=\
+             {old_vs_new_relative:.3e} (~{:.1} f32 ulp of the coefficient) — measured max \
+             device/host deviation this run: total_norm {norm_ulp:.2} ulp, gradients \
+             {max_grad_ulp:.2} ulp, against a derived bound of {bound:.1} ulp",
+            old_vs_new_relative / (f32::EPSILON as f64)
+        );
+    }
+
+    /// CUDA leg for the production-shape acceptance test — bounded against
+    /// the SAME independent host `f64` reference, NOT asserted bit-identical
+    /// to CPU. Why: the toy fixture's CPU/CUDA bit-identity claim
+    /// (`multi_var_clip_matches_host_reference_on_cuda_and_is_bit_identical_to_cpu`)
+    /// holds ONLY because its sums are of EXACTLY representable small
+    /// integers, so CPU's and CUDA's differently-ordered reductions land on
+    /// the identical value regardless of associativity. At PRODUCTION scale
+    /// with millions of genuinely-random `f32` values, CPU's
+    /// (BLAS/sequential) and CUDA's (parallel-tree) reduction orders are
+    /// mathematically equivalent but NOT bitwise so (`f32` addition is not
+    /// associative) — bit-identity is not a claim this fixture can honestly
+    /// make, and asserting it would test an accident of the toy fixture's
+    /// exact integers, not a property of `clip_gradients` itself. This leg
+    /// instead holds CUDA to the SAME truth-relative `production_bound_ulp`
+    /// the CPU leg above uses.
+    #[test]
+    fn production_shape_224_vars_cuda_matches_host_within_bound() {
+        let Some(cuda) = cuda_device_or_skip("production_shape_cuda") else {
+            return;
+        };
+        let (vars, mut grads, before) = production_shaped_vars_with_grads(1e-3, 20260825, &cuda);
+        let n_per_var: Vec<usize> = before.iter().map(|v| v.len()).collect();
+
+        let total_sq_host: f64 = before
+            .iter()
+            .flat_map(|g| g.iter())
+            .map(|&x| (x as f64) * (x as f64))
+            .sum();
+        let host_norm = total_sq_host.sqrt();
+        let max_norm = 1.0f64;
+        assert!(
+            host_norm > max_norm,
+            "test setup: active regime on CUDA too, got total_norm={host_norm}"
+        );
+        let host_coef = max_norm / (host_norm + 1e-6);
+
+        let total_norm = clip_gradients(&vars, &mut grads, max_norm)
+            .unwrap()
+            .expect("clipping enabled");
+        let norm_val: f32 = total_norm.to_scalar().unwrap();
+        let bound = production_bound_ulp(&n_per_var);
+        let norm_ulp = ulp_distance(host_norm as f32, norm_val);
+        assert!(
+            norm_ulp <= bound,
+            "CUDA total_norm: host {host_norm} vs device {norm_val} — {norm_ulp} ulp exceeds \
+             bound {bound}"
+        );
+
+        for (w, g_before) in vars.iter().zip(&before) {
+            let g_after: Vec<f32> = grads
+                .get(w.as_tensor())
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            for (x, a) in g_before.iter().zip(&g_after) {
+                let e = ((*x as f64) * host_coef) as f32;
+                let u = ulp_distance(e, *a);
+                assert!(
+                    u <= bound,
+                    "CUDA clipped gradient exceeds bound: host {e} vs device {a} — {u} ulp > \
+                     {bound}"
+                );
+            }
+        }
+    }
+
+    /// RED control (esc-182 finding item 1): the SAME 224 production-shaped
+    /// LoRA Vars/topology, at a `total_norm` small enough (`element_std =
+    /// 1e-9`, deliberately far below the realistic-amplitude leg above —
+    /// see this section's leading doc for why the realistic-amplitude leg
+    /// alone cannot fire this control) that torch's `1e-6` epsilon is a
+    /// LARGE fraction of the denominator. Still `total_norm > max_norm`
+    /// (active — asserted below, chosen well away from the boundary band so
+    /// this is unambiguously the "> max_norm" regime, not the
+    /// already-covered `at_max_norm_boundary_coef_is_not_bit_identical_to_
+    /// no_clip` edge).
+    #[test]
+    fn production_shape_old_formula_fails_the_bound_at_small_total_norm() {
+        let device = Device::Cpu;
+        let (vars, mut grads, before) = production_shaped_vars_with_grads(1e-9, 20260826, &device);
+        let n_per_var: Vec<usize> = before.iter().map(|v| v.len()).collect();
+
+        let total_sq_host: f64 = before
+            .iter()
+            .flat_map(|g| g.iter())
+            .map(|&x| (x as f64) * (x as f64))
+            .sum();
+        let host_norm = total_sq_host.sqrt();
+        let max_norm = host_norm * 0.5; // deep active, not boundary-adjacent
+        assert!(
+            host_norm > max_norm,
+            "test setup: active regime, got total_norm={host_norm} max_norm={max_norm}"
+        );
+        assert!(
+            host_norm < 1e-4,
+            "test setup: total_norm must be small enough that the 1e-6 epsilon term is \
+             MATERIAL (got {host_norm}) — see this section's leading doc for the derivation \
+             of why realistic (production-amplitude) total_norm cannot fire this control"
+        );
+
+        let new_coef = max_norm / (host_norm + 1e-6);
+        let old_coef = max_norm / host_norm;
+        let bound = production_bound_ulp(&n_per_var);
+
+        // The device path (NEW formula) — must stay INSIDE the bound at this
+        // SAME small-norm scale, proving the bound itself is not simply too
+        // tight to ever pass anything at this magnitude (the non-vacuous
+        // control half of this leg).
+        let total_norm = clip_gradients(&vars, &mut grads, max_norm)
+            .unwrap()
+            .expect("clipping enabled");
+        let norm_val: f32 = total_norm.to_scalar().unwrap();
+        let norm_ulp = ulp_distance(host_norm as f32, norm_val);
+        assert!(
+            norm_ulp <= bound,
+            "sanity: the NEW formula must stay within the bound at this same scale (got \
+             {norm_ulp} ulp vs bound {bound})"
+        );
+
+        // The OLD formula's OUTPUT — computed host-side from the SAME
+        // pre-clip gradients — compared against the SAME truth (the
+        // new/torch formula's host reference) at the SAME bound.
+        // `max_grad_ulp` tracks the WORST element so one clean number
+        // carries the "must fail" claim.
+        let mut max_grad_ulp = 0.0f64;
+        for g_before in &before {
+            for &x in g_before {
+                let truth = ((x as f64) * new_coef) as f32;
+                let old_val = ((x as f64) * old_coef) as f32;
+                max_grad_ulp = max_grad_ulp.max(ulp_distance(truth, old_val));
+            }
+        }
+        assert!(
+            max_grad_ulp > bound,
+            "esc-182 RED control did not fire: the pre-PR (no-epsilon) formula's output should \
+             exceed the SAME bound the new formula clears at this total_norm scale (host_norm \
+             {host_norm}, old_coef {old_coef:.10} vs torch_coef {new_coef:.10}), but only \
+             reached {max_grad_ulp} ulp against a bound of {bound} ulp — the epsilon-driven \
+             divergence (relative ~{:.3e}) was not large enough at this scale; the leg's \
+             total_norm choice needs to be smaller",
+            (old_coef - new_coef).abs() / new_coef
+        );
+        eprintln!(
+            "esc-182 RED control fired as expected: pre-PR formula {max_grad_ulp:.1} ulp from \
+             truth (bound {bound:.1} ulp) at total_norm={host_norm:.6}, max_norm={max_norm:.6}"
+        );
     }
 }

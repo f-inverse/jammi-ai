@@ -104,6 +104,19 @@ const GAUSSIAN_MIN_SEPARATION: f32 = 3.0;
 /// it was one draw from a distribution wide enough to fail on its own,
 /// TODAY, without any dropout-stream change. See this commit's message for
 /// the full per-level table.
+///
+/// esc-182 finding item 2 tried widening THIS pool (shared with
+/// [`untrained_quantile_head_collapses_to_mu_no_separation`]) to 24 seeds and
+/// scaling [`QUANTILE_SEP_POSITIVE_BAR`] proportionally (9→18) — REVERTED:
+/// the 24-seed measurement showed level-0.1's TRUE per-seed sign-flip rate is
+/// ~29% (17/24 positive), not the ~8% the original 12-seed sample happened to
+/// show (11/12) — a naive proportional rescale from a SMALL sample's lucky
+/// rate is not a sound way to recalibrate a sign-count bar, and this test's
+/// pool was passing fine before esc-182 (the flip was isolated to
+/// [`untrained_quantile_head_collapses_to_mu_no_separation`]'s SE-margin arm,
+/// never this test). [`UNTRAINED_QUANTILE_POWER_SEEDS`] below is a dedicated,
+/// SEPARATE 24-seed pool for that one test instead, leaving this pool/bar
+/// untouched for the test that was never broken.
 const QUANTILE_SEP_SEEDS: [u64; 12] = [
     1,
     2,
@@ -144,6 +157,44 @@ const QUANTILE_SEP_AGG_MIN: f32 = 3.0;
 /// negative seeds → 12/12 positive. `9` keeps 2-3 seeds of headroom under
 /// the weakest measured level.
 const QUANTILE_SEP_POSITIVE_BAR: usize = 9;
+
+/// esc-182 finding item 2: a DEDICATED, wider seed pool for
+/// [`untrained_quantile_head_collapses_to_mu_no_separation`] ONLY — kept
+/// separate from [`QUANTILE_SEP_SEEDS`] (see that const's own doc for why a
+/// shared pool was tried and reverted: widening it also silently changed
+/// [`quantile_regression_serves_and_separates_groups`]'s sign-count arm,
+/// a test that was never broken by esc-182 and whose true per-seed sign-flip
+/// rate at level-0.1 turned out to need its OWN, independently-calibrated
+/// bar, not a proportional rescale). Includes the original 12 (`1..=11` plus
+/// `42`) plus `12..=23`, so `1..=23` union `{42}`, 24 total — see that
+/// function's own doc for the full power-analysis derivation and the
+/// CONFIRMED (not just extrapolated) 24-seed margin-ratio measurement.
+const UNTRAINED_QUANTILE_POWER_SEEDS: [u64; 24] = [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    jammi_wire::fine_tune::DEFAULT_FINE_TUNE_SEED,
+];
 
 /// The `trim_frac`-trimmed mean of `values` (mirrors
 /// `fine_tune::trainer::trimmed_mean`): sorts a copy, drops the top/bottom
@@ -655,8 +706,7 @@ async fn untrained_regression_head_collapses_to_mu_no_separation() {
 /// message.
 ///
 /// FIX (self-normalizing, stream-agnostic BY CONSTRUCTION): sweep
-/// [`QUANTILE_SEP_SEEDS`] (reusing the same pinned 12 seeds as the primary
-/// sweep test) for BOTH the trained and the destructively-zeroed
+/// [`UNTRAINED_QUANTILE_POWER_SEEDS`] for BOTH the trained and the destructively-zeroed
 /// (`served_regression_col0_for_test(.., true)`) separation, then judge via
 /// numbers derived ENTIRELY from what THIS run measures — no
 /// stream-calibrated literal anywhere:
@@ -672,19 +722,91 @@ async fn untrained_regression_head_collapses_to_mu_no_separation() {
 ///      indistinguishable from zero) — proves `mutant_zero_band` is not so
 ///      wide a genuinely-separating head could sneak through it as
 ///      "collapsed", i.e. the control is non-vacuous.
-///   3. `margin = max(std(trained_seps), 1e-3)`: the trained aggregate must
-///      clear the zeroed aggregate by more than the TRAINED distribution's
-///      own measured spread — a second, independent arm derived from BOTH
-///      distributions (the real one this time), so a construction that
-///      happened to satisfy arm 1/2 by chance still has to clear a
-///      distribution-derived gap, not a borrowed literal.
+///   3. `margin = max(2 × real_spread / sqrt(n), 1e-3)`: the trained
+///      aggregate must clear the zeroed aggregate by more than 2x the
+///      trained distribution's own measured STANDARD ERROR (spread /
+///      `sqrt(n)`, `n` = the number of seeds this run measured) — a second,
+///      independent arm derived from BOTH distributions (the real one this
+///      time), so a construction that happened to satisfy arm 1/2 by chance
+///      still has to clear a distribution-derived gap, not a borrowed
+///      literal.
+///
+/// ## Power analysis (esc-182 finding item 2 — CI hermetic-lane REGRESSION)
+///
+/// PR #373 (`perf/p4b-device-side-clip-r3`) flipped arm 3 above on the
+/// hermetic x86_64 CI lane: at the ORIGINAL 12-seed pool, level-0.1
+/// `real_tm - mutant_tm` measured `3.29` against a required `2×SE` margin of
+/// `3.90` (fails by `0.61`), where it had measured `4.25` against `3.43`
+/// (passes) on `main`. A same-build forced-formula A/B on the SAME x86_64
+/// box (this file's own `clip_gradients` body swapped, byte-for-byte, back
+/// to the pre-PR conditional/no-epsilon formula, nothing else on the branch
+/// touched) reproduced `main`'s 12-seed trained-separation vector
+/// BIT-FOR-BIT — proving the flip's ENTIRE cause is the clip formula's
+/// last-few-bits difference propagating through 120 epochs at
+/// `learning_rate = 1e-1` (a genuinely chaotic trajectory at that LR: this
+/// same-formula, same-platform comparison rules out a training-loop defect,
+/// a different code path, or "clipping engaged where it previously didn't"
+/// — see this PR's own doc for why the new formula is the CORRECT one
+/// (torch parity); the test, not the formula, was under-powered). The fix
+/// applied here is two independent, STACKED levers, each verified on x86_64
+/// before/after:
+///
+/// 1. **Pool every quantile level, not only column 0, per seed** (this
+///    function's own loop, `served_regression_col_for_test`): a per-seed
+///    sample is now the MEAN of that seed's `levels.len()` (3) separately
+///    re-served columns off the SAME already-trained model — zero extra
+///    training cost, since it re-serves an already-trained model at
+///    different columns rather than training more models. This is variance
+///    REDUCTION (3 correlated-but-not-identical measurements of one trained
+///    head averaged into one number), never sample-count inflation:
+///    `trained_seps`/`zeroed_seps` still hold exactly one entry per seed, so
+///    the `2×SE/sqrt(n)` arithmetic stays honest about `n` (never treats the
+///    3 levels as independent draws in the `sqrt(n)` denominator). MEASURED
+///    (x86_64, 12-seed pool, level-averaged): NEW-formula `real_tm = 4.62`,
+///    `real_spread = 4.16` (down from `real_spread = 6.76` at level-0.1
+///    alone — the averaging materially reduced noise); OLD-formula
+///    `real_tm = 5.24`, `real_spread = 3.43`.
+/// 2. **Sweep a DEDICATED, widened pool of 24 seeds**
+///    ([`UNTRAINED_QUANTILE_POWER_SEEDS`], not the shared [`QUANTILE_SEP_SEEDS`]
+///    — see that const's own doc: widening the SHARED pool was tried first
+///    and reverted, since it also silently changed
+///    [`quantile_regression_serves_and_separates_groups`]'s sign-count arm, a
+///    test esc-182 never broke) — a genuine `sqrt(n)`-driven power increase:
+///    solving `real_tm / (2 × spread /
+///    sqrt(n)) >= 2` (margin-ratio >= 2, this section's own bar) for `n`
+///    against the level-averaged 12-seed pilot numbers above gives `n >=
+///    (4 × spread / real_tm)²` — `n >= 12.9` for the NEW (binding, weaker)
+///    formula, `n >= 6.9` for the OLD. 24 (double the original pool) was
+///    chosen over the bare minimum for headroom against the pilot's OWN
+///    sampling noise (a 12-seed spread/mean estimate is itself imprecise).
+///    CONFIRMED by an actual 24-seed run on x86_64 under BOTH formulas (not
+///    left as an extrapolation): NEW-formula `real_tm = 4.32`, `real_spread
+///    = 4.78`, `margin = 1.95`, margin-ratio `= 2.22`; OLD-formula `real_tm
+///    = 4.42`, `real_spread = 3.88`, `margin = 1.59`, margin-ratio `= 2.79`
+///    — both `>= 2`. (`real_spread` did not shrink between the 12- and
+///    24-seed pools — the level-averaging pilot's `4.16` was itself a noisy
+///    estimate of a `~4` population spread, not evidence the true spread is
+///    smaller than `~4` — but `margin = 2 × spread / sqrt(n)` still shrinks
+///    with `n` regardless, which is the whole mechanism this lever relies
+///    on.)
+///
+/// A first attempt at this fix scaled [`QUANTILE_SEP_POSITIVE_BAR`] `9 -> 18`
+/// (the same 75% relative bar) and widened the SHARED [`QUANTILE_SEP_SEEDS`]
+/// instead of a dedicated pool — REVERTED after an actual 24-seed run showed
+/// [`quantile_regression_serves_and_separates_groups`]'s level-0.1 sign-count
+/// arm fail at `17/24` (its TRUE per-seed sign-flip rate at that level is
+/// `~29%`, not the `~8%` the original 12-seed sample happened to show): a
+/// naive proportional rescale of a bar CALIBRATED FROM a small, lucky sample
+/// is not a sound way to recalibrate it against a differently-sampled pool.
+/// [`UNTRAINED_QUANTILE_POWER_SEEDS`] is a dedicated pool instead, so this
+/// fix touches ONLY the test esc-182 actually broke.
 #[tokio::test(flavor = "multi_thread")]
 async fn untrained_quantile_head_collapses_to_mu_no_separation() {
     let levels = vec![0.1, 0.5, 0.9];
-    let mut trained_seps = Vec::with_capacity(QUANTILE_SEP_SEEDS.len());
-    let mut zeroed_seps = Vec::with_capacity(QUANTILE_SEP_SEEDS.len());
+    let mut trained_seps = Vec::with_capacity(UNTRAINED_QUANTILE_POWER_SEEDS.len());
+    let mut zeroed_seps = Vec::with_capacity(UNTRAINED_QUANTILE_POWER_SEEDS.len());
 
-    for &seed in &QUANTILE_SEP_SEEDS {
+    for &seed in &UNTRAINED_QUANTILE_POWER_SEEDS {
         let (session, _dir) = session_with_regression_data().await;
         let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
             .expect("default worker intervals are valid");
@@ -717,38 +839,60 @@ async fn untrained_quantile_head_collapses_to_mu_no_separation() {
         let a = group_strings(GROUP_A);
         let b = group_strings(GROUP_B);
 
-        let trained_a = session
-            .served_regression_col0_for_test(&model_source, &a, false)
-            .await
-            .unwrap();
-        let trained_b = session
-            .served_regression_col0_for_test(&model_source, &b, false)
-            .await
-            .unwrap();
-        trained_seps.push(mean(&trained_b) - mean(&trained_a));
+        // esc-182 power fix: average the separation over EVERY quantile
+        // level (all `levels.len()` columns of the SAME already-trained
+        // model — `served_regression_col_for_test`, zero extra training
+        // cost), not just column 0, before pushing ONE sample for this seed.
+        // This is a per-seed VARIANCE-REDUCTION step (3 correlated-but-not-
+        // identical measurements of the same trained head averaged into one
+        // number), never a sample-count inflation: `trained_seps`/
+        // `zeroed_seps` still hold exactly one entry per seed, so the
+        // `margin`/SE arithmetic below stays honest about its true
+        // independent sample size (`UNTRAINED_QUANTILE_POWER_SEEDS.len()`, never
+        // `UNTRAINED_QUANTILE_POWER_SEEDS.len() * levels.len()` — the 3 levels are NOT
+        // independent draws and must never be treated as such in a
+        // `sqrt(n)` standard-error denominator).
+        let mut trained_sep_by_level = Vec::with_capacity(levels.len());
+        let mut zeroed_sep_by_level = Vec::with_capacity(levels.len());
+        let mut zeroed_mu_values: Vec<f32> = Vec::new();
+        for col_idx in 0..levels.len() {
+            let trained_a = session
+                .served_regression_col_for_test(&model_source, &a, false, col_idx)
+                .await
+                .unwrap();
+            let trained_b = session
+                .served_regression_col_for_test(&model_source, &b, false, col_idx)
+                .await
+                .unwrap();
+            trained_sep_by_level.push(mean(&trained_b) - mean(&trained_a));
 
-        // Destructive: zero the trained distribution head.
-        let zeroed_a = session
-            .served_regression_col0_for_test(&model_source, &a, true)
-            .await
-            .unwrap();
-        let zeroed_b = session
-            .served_regression_col0_for_test(&model_source, &b, true)
-            .await
-            .unwrap();
-        zeroed_seps.push(mean(&zeroed_b) - mean(&zeroed_a));
+            // Destructive: zero the trained distribution head.
+            let zeroed_a = session
+                .served_regression_col_for_test(&model_source, &a, true, col_idx)
+                .await
+                .unwrap();
+            let zeroed_b = session
+                .served_regression_col_for_test(&model_source, &b, true, col_idx)
+                .await
+                .unwrap();
+            zeroed_sep_by_level.push(mean(&zeroed_b) - mean(&zeroed_a));
+            zeroed_mu_values.extend(zeroed_a.iter().chain(zeroed_b.iter()).copied());
+        }
+        trained_seps.push(mean(&trained_sep_by_level));
+        zeroed_seps.push(mean(&zeroed_sep_by_level));
 
         // Structural, per-seed, seed/stream-independent invariant: a zeroed
         // head's base weight is a literal zero matrix, so EVERY served value
-        // (both groups) must be the SAME constant regardless of input. This
-        // is a property of the construction, not a distributional claim, so
-        // it is checked every seed at a tight literal tolerance.
-        let mu = zeroed_a[0];
-        for v in zeroed_a.iter().chain(zeroed_b.iter()) {
+        // (every group, every level) must be the SAME constant regardless of
+        // input. This is a property of the construction, not a
+        // distributional claim, so it is checked every seed at a tight
+        // literal tolerance.
+        let mu = zeroed_mu_values[0];
+        for v in &zeroed_mu_values {
             assert!(
                 (v - mu).abs() < 1e-2,
                 "seed {seed}: a zeroed quantile head must emit one constant \
-                 μ_y for every input, got {v} vs {mu}"
+                 μ_y for every input and every level, got {v} vs {mu}"
             );
         }
     }
@@ -770,7 +914,7 @@ async fn untrained_quantile_head_collapses_to_mu_no_separation() {
          ±{mutant_zero_band:.4} (3x measured mutant spread {mutant_spread:.4} \
          over the {}-seed sweep) — the sweep test's aggregate arm would then \
          be vacuous. per-seed zeroed separations: {zeroed_seps:?}",
-        QUANTILE_SEP_SEEDS.len()
+        UNTRAINED_QUANTILE_POWER_SEEDS.len()
     );
 
     // Arm 2 (positive-signal sanity leg): the SAME zero-indistinguishability
@@ -797,7 +941,8 @@ async fn untrained_quantile_head_collapses_to_mu_no_separation() {
     // instead of its standard error made this arm fail on genuinely-good
     // signal). `2x` the standard error is a conventional "clearly outside
     // noise" multiplier without hard-coding an absolute raw-unit literal.
-    let margin = (2.0 * real_spread / (QUANTILE_SEP_SEEDS.len() as f32).sqrt()).max(1e-3);
+    let margin =
+        (2.0 * real_spread / (UNTRAINED_QUANTILE_POWER_SEEDS.len() as f32).sqrt()).max(1e-3);
     assert!(
         real_tm - mutant_tm > margin,
         "the trained aggregate ({real_tm:.4}) must clear the zeroed \
@@ -807,6 +952,6 @@ async fn untrained_quantile_head_collapses_to_mu_no_separation() {
          trained sweep's separation is not reliably distinguishable from an \
          untrained head's. trained per-seed: {trained_seps:?}; zeroed \
          per-seed: {zeroed_seps:?}",
-        QUANTILE_SEP_SEEDS.len()
+        UNTRAINED_QUANTILE_POWER_SEEDS.len()
     );
 }

@@ -634,15 +634,23 @@ impl TrainingLoop {
         };
         let mut last_step_horizon = LastStepHorizon::new(total_optimizer_steps);
 
-        // Snapshot the trainable variables ONCE. `VarMap::all_vars()` iterates a
-        // HashMap, so a second call could return a different order — and `AdamW`'s
-        // optimizer state is positional in the order it was built from. Building
-        // the optimizer and `trainable_vars` from one snapshot keeps the gradient
-        // accumulation, clipping, and the optimizer's moment vector all aligned to
-        // the same parameter order within this process. The cross-process
-        // correlation that makes resume safe is `optim_param_names` below — the
-        // moments serialize/restore BY NAME, never by this in-process order.
-        let trainable_vars = self.varmap.all_vars();
+        // Snapshot the trainable variables ONCE, in a DETERMINISTIC (name-sorted)
+        // order — `optimizer::sorted_trainable_vars`, never a raw `VarMap::
+        // all_vars()` (its `HashMap` iteration order is stable within a process
+        // but randomized ACROSS processes by `HashMap`'s default per-process
+        // hasher seed, which would otherwise make the clip's f32 fold order —
+        // and therefore its last bits — a function of process-launch randomness
+        // rather than `self.config.seed`; see that function's own doc, esc-182).
+        // `AdamW`'s optimizer state is positional in the order it was built
+        // from, so building the optimizer and `trainable_vars` from one
+        // snapshot keeps the gradient accumulation, clipping, and the
+        // optimizer's moment vector all aligned to the same (now
+        // cross-process-stable) parameter order. The cross-process correlation
+        // that makes RESUME safe is still `optim_param_names` below — the
+        // moments serialize/restore BY NAME, independent of this order too —
+        // this change makes the in-process order itself reproducible on top of
+        // that, not a replacement for it.
+        let trainable_vars = super::optimizer::sorted_trainable_vars(&self.varmap);
 
         // weight_decay matches train_embedding_model.py: AdamW(weight_decay=0.01).
         let mut optimizer = AdamW::new(

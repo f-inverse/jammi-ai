@@ -774,6 +774,29 @@ impl InferenceSession {
         texts: &[String],
         zero_head: bool,
     ) -> Result<Vec<f32>> {
+        self.served_regression_col_for_test(model, texts, zero_head, 0)
+            .await
+    }
+
+    /// TEST-ONLY non-vacuity seam for the regression surface, generalized
+    /// from [`Self::served_regression_col0_for_test`] to any distribution
+    /// column (`col_idx < head_width` — a Gaussian head has `head_width ==
+    /// 2`, a quantile head `head_width == quantile_levels.len()`). Added so a
+    /// power-limited seed sweep (esc-182: `untrained_quantile_head_collapses_
+    /// to_mu_no_separation` in `tests/it/regression_surface.rs`) can pool
+    /// EVERY already-trained quantile level's separation, not only column 0,
+    /// for `3x` the independent samples per seed at ZERO extra training cost
+    /// (same already-trained model, re-served at a different column) —
+    /// `served_regression_col0_for_test` keeps its own signature (six
+    /// existing call sites) and delegates here at `col_idx = 0`.
+    #[doc(hidden)]
+    pub async fn served_regression_col_for_test(
+        &self,
+        model: &ModelSource,
+        texts: &[String],
+        zero_head: bool,
+        col_idx: usize,
+    ) -> Result<Vec<f32>> {
         use arrow::array::StringArray;
 
         let mut loaded = self
@@ -786,14 +809,20 @@ impl InferenceSession {
         let col: arrow::array::ArrayRef = Arc::new(StringArray::from(texts.to_vec()));
         let output = loaded.forward(&[col], ModelTask::Regression)?;
         let (num_rows, head_width) = output.shapes[0];
+        if col_idx >= head_width {
+            return Err(JammiError::Inference(format!(
+                "served_regression_col_for_test: col_idx {col_idx} out of range for head_width \
+                 {head_width}"
+            )));
+        }
         let flat = &output.float_outputs[0];
-        let mut col0 = Vec::with_capacity(num_rows);
+        let mut col = Vec::with_capacity(num_rows);
         for row in 0..num_rows {
             if output.row_status[row] {
-                col0.push(flat[row * head_width]);
+                col.push(flat[row * head_width + col_idx]);
             }
         }
-        Ok(col0)
+        Ok(col)
     }
 
     /// Run inference on a registered source using a model.

@@ -105,7 +105,14 @@ where
     M: Fn(&B) -> Result<Tensor>,
     L: Fn(&Tensor, &B) -> Result<Tensor>,
 {
-    let trainable_vars: Vec<Var> = varmap.all_vars();
+    // Deterministic (name-sorted) order, never `VarMap::all_vars()`'s raw
+    // `HashMap` iteration order — see `optimizer::sorted_trainable_vars`'s own
+    // doc (esc-182): a raw `all_vars()` order is stable within one process but
+    // randomized ACROSS process invocations by `HashMap`'s per-process hasher
+    // seed, which would make the clip's f32 fold order — and therefore its
+    // last bits — depend on process-launch randomness rather than `config`'s
+    // seed.
+    let trainable_vars: Vec<Var> = crate::fine_tune::optimizer::sorted_trainable_vars(varmap);
     let mut optimizer = AdamW::new(
         trainable_vars.clone(),
         ParamsAdamW {

@@ -6,6 +6,32 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+### Fixed
+- **Gradient clipping now matches `torch.nn.utils.clip_grad_norm_` exactly
+  (`jammi-ai`).** The device-side global-L2 gradient clip computes `clip_coef
+  = min(1, max_norm / (total_norm + 1e-6))` and rescales every gradient
+  UNCONDITIONALLY, mirroring torch's own `_clip_grads_with_norm_`. The
+  previous (pre-device-clip) implementation was a parity defect: it skipped
+  rescaling entirely whenever `total_norm <= max_norm` (a silent no-op torch
+  never performs — torch always applies its computed coefficient, which is
+  `< 1.0` on the half-open band `total_norm ∈ (max_norm - 1e-6, max_norm]`)
+  and omitted torch's `1e-6` epsilon from the denominator. Both defects are
+  now fixed; a run whose gradient norm regularly lands in that boundary band
+  will see slightly different (more torch-faithful) updates there. See
+  `crates/jammi-ai/src/fine_tune/optimizer.rs`'s module doc for the full
+  derivation and citation.
+- **The trainer's gradient-clip fold order is now reproducible across process
+  invocations of the same seed (`jammi-ai`).** `TrainingLoop::run` and
+  `parallel_train::train_loop` snapshotted their trainable `Var`s via
+  `VarMap::all_vars()`, whose `HashMap`-iteration order is stable within one
+  process but randomized ACROSS separate process invocations by `HashMap`'s
+  default per-instance hasher seed — so the clip's f32 fold order (and
+  therefore the last bits of every clipped gradient) depended on
+  process-launch randomness, not on the training `seed`. Both call sites now
+  use the new `optimizer::sorted_trainable_vars` (name-sorted), closing that
+  gap the same way `AdamW`'s resume-from-checkpoint moment restoration
+  already had to (by name, never by this unstable position).
+
 ## [0.47.0] - 2026-07-17
 
 A derived embedding table now records the origin column its keys actually came

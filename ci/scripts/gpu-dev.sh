@@ -94,7 +94,12 @@ arch: a100 (default) | l40s | h100 | a40 | l4
          deploying a second pod under the same alias. --replace overwrites only
          the LOCAL record; it never terminates the old pod itself — `down` it
          first if it should be.
-Sessions are named after the arch; RP_SESSION overrides.
+Sessions are named after the arch; RP_SESSION names one explicitly. On
+down/attach/run/logs/push/pull, RP_SESSION and an explicit positional session
+must AGREE — a differing pair REFUSES (exit 2, naming both) rather than
+silently picking one. A session name may contain letters, digits, _, -, and .
+anywhere but as the whole name (so bench.1 is fine; ., .., a name containing
+/, or one starting with - are refused).
 Env: RUNPOD_API_KEY (or ~/.config/runpod/key), RP_IMAGE,
      RP_TTL_HOURS (default 8; explicit always wins), RP_DEV_TTL_HOURS (default
      72 — what `up` alone falls back to when RP_TTL_HOURS is not set),
@@ -173,15 +178,52 @@ case "$CMD" in
     ;;
   *)
     ARG="${1:-}"; [ $# -gt 0 ] && shift
-    SESSION="${RP_SESSION:-${ARG:-a100}}"; ARCH=""
+    # Unlike shell|up above (where ARCH and RP_SESSION are genuinely
+    # different axes — RP_SESSION deliberately overrides the session ALIAS
+    # for a second pod of the same arch, per this file's own header doc),
+    # here the positional IS the session name: `down`/`attach`/`run`/`logs`/
+    # `push`/`pull` all take `[session]` directly. `${RP_SESSION:-${ARG:-a100}}`
+    # let an exported RP_SESSION silently WIN over an explicit positional —
+    # `RP_SESSION=a100 gpu-dev.sh down l40s` terminated pod-a100 and forgot
+    # ITS record, never touching l40s at all, discarding the one argument
+    # the caller typed on the command line. An explicit positional is never
+    # discarded: when it conflicts with a differing exported RP_SESSION,
+    # that is a real ambiguity (which one did the caller mean?) and this
+    # refuses rather than silently picking either; when only one is set, it
+    # wins; when neither is, the a100 default applies exactly as before.
+    if [ -n "$ARG" ] && [ -n "${RP_SESSION:-}" ] && [ "$ARG" != "$RP_SESSION" ]; then
+      echo "::error::conflicting session: positional argument '${ARG}' vs exported RP_SESSION='${RP_SESSION}' — they name different sessions"
+      echo "::error::pick one: unset RP_SESSION to act on '${ARG}', or drop the positional to act on RP_SESSION='${RP_SESSION}'"
+      exit 2
+    fi
+    SESSION="${ARG:-${RP_SESSION:-a100}}"; ARCH=""
     ;;
 esac
 
 # `shell` is throwaway: no named session, so the EXIT trap wipes
-# the temp dir and terminates the pod.
+# the temp dir and terminates the pod. RP_SESSION is force-cleared here, not
+# merely left unset, because an EXPORTED RP_SESSION set earlier in the SAME
+# shell (`export RP_SESSION=a100` — a one-off command-prefix assignment like
+# `RP_SESSION=a100 gpu-dev.sh attach a100` does NOT persist past that single
+# invocation, so it is not the precondition here) survives into this
+# invocation's environment untouched otherwise — runpod_lib.sh's own default
+# is only "${RP_SESSION:-}", which keeps whatever is already set. A `shell`
+# that silently inherited a live session's name would then write the
+# throwaway pod's coordinates over that session's own meta file
+# (rp_session_save keys off RP_SESSION alone) and, on exit, terminate the
+# throwaway pod under RP_POD_CREATED — leaving the REAL, still-running pod
+# behind with no record pointing at it at all.
+# RP_SESSION_VALIDATE_SESSION tells runpod_lib.sh's own rp_session_name_check
+# gate (see its doc) that THIS invocation resolved a real, named session and
+# must have it validated before RP_WORK is derived from it. Set only here —
+# never for `shell` (deliberately anonymous) and never reached at all by
+# `ls`/`reap` (account-level, they source runpod_lib.sh from their own early
+# dispatch branch above, before this line ever runs) — so an unrelated
+# exported RP_SESSION sitting in the caller's shell for some other purpose
+# can never block a verb that was never going to consume it.
 case "$CMD" in
-  shell) : ;;
-  *) export RP_SESSION="$SESSION" ;;
+  shell) RP_SESSION="" ;;
+  *) export RP_SESSION="$SESSION"; RP_SESSION_VALIDATE_SESSION=1 ;;
 esac
 
 # `up` sessions persist past the terminal and are the ones the 2026-08-25
@@ -467,6 +509,13 @@ EOF
         # Nothing is left to release, so this is cleanup, not a refusal:
         # forget the record and say so plainly, rather than leaving it
         # stuck until an operator remembers `up --replace`.
+        #
+        # This shares rp_pod_verify's underlying assumption (see
+        # rp_pod_gone's own doc in runpod_lib.sh, which states it directly):
+        # the account's `myself{ pods{...} } }` response is COMPLETE, never
+        # paginated. "Absent from the returned list" is only "absent from
+        # the account" under that assumption, verified live on first use —
+        # not merely inferred from the schema.
         echo "recorded pod ${RP_POD_ID} is gone from the account (deadline/sweep) — forgetting the record"
         RP_POD_ID=""   # already gone; keep the EXIT trap from acting on it again
         rp_session_forget

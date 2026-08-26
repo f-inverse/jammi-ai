@@ -236,9 +236,11 @@ server, say — occupies the pod's only slot until something displaces it.
 
 Sessions are named after the arch. `RP_SESSION` names one explicitly, and is
 needed only on `up` and `shell`, the two verbs that take an *arch* where the rest
-take a *session*; it overrides the positional argument for the rest, which is a
-sharp edge worth knowing before you export it. The worked form is in
-[dev-gpu-recipes.md](dev-gpu-recipes.md).
+take a *session*; on the rest, an exported `RP_SESSION` that disagrees with an
+explicit positional session argument REFUSES (exit 2, naming both) rather than
+silently picking one — worth knowing before you export it in a shell you keep
+around, rather than inline on the one command that needs it. The worked form is
+in [dev-gpu-recipes.md](dev-gpu-recipes.md).
 
 `push` deliberately excludes `target/` — your host build output is the wrong
 architecture and would poison the pod's.

@@ -628,6 +628,16 @@ jobs:
             cmd: python3 ci/scripts/check_doc_numbers_have_producers.py
           - name: doc numbers have producers self-test
             cmd: python3 ci/scripts/check_doc_numbers_have_producers.py --self-test
+          # ci/doc_number_allowlist.txt is only-shrinks, mechanically: fetches
+          # origin/main and fails on any entry this branch ADDS relative to
+          # it (never on one it removes). The one leg of this gate that is
+          # not otherwise hermetic (a single `git fetch origin main`),
+          # matching swarm.yml's own TOUCHED-guard precedent for comparing a
+          # branch against its merge base. Trivially passes (bootstrap) on
+          # the one PR that introduces the allowlist file for the first
+          # time, since there is no baseline yet to have grown past.
+          - name: doc numbers allowlist only shrinks
+            cmd: python3 ci/scripts/check_doc_numbers_have_producers.py --check-allowlist-only-shrinks
           # GPU-parity coverage-completeness guard — the device-axis analog of
           # the required Postgres/SQLite backend it-matrix. It enumerates every
           # SHIPPED (encoder architecture × GPU-dispatching ModelTask verb)

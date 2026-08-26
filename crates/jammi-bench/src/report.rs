@@ -2242,6 +2242,8 @@ mod tests {
         // value, never confused with `""`.
         let value = serde_json::json!({ "widget": 0 });
         assert_identity_fields_present(&value, nonnull_string_fields); // must not panic
+    }
+
     /// Cross-language pin of the ONE shared identity declaration (PR #381
     /// audit B1): every name in `ci/scripts/perf/identity_fields.py`'s
     /// `FINETUNE_IDENTITY_FIELDS` tuple must be a key `FinetuneStepTier`

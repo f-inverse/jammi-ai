@@ -135,9 +135,7 @@ and a bound is covered iff, checked in this order:
      positions, anywhere in the fn body. Adjacency (not mere co-occurrence in
      the same statement) is what keeps `let f = compute(TOL) as u32 > 0;`
      correctly UNCOVERED (`TOL` feeds a value that is later compared, but is
-     never itself an operand); it is also what keeps a generic bracket
-     (`Vec<f32>`, `foo::<f32>(...)`) from ever matching — a bound name is never
-     the token immediately touching either side of `<`/`>` there.
+     never itself an operand).
 
 A bare declaration or passing mention never counts; one level of same-file
 helper-fn indirection is followed (a fn the control CALLS, checked the same
@@ -146,10 +144,17 @@ DECLARED_UNCONTROLLED (see reconciliation below), never silently passed.
 
 Known, out-of-scope class limitations (documented, not silently claimed fixed):
 a bound compared to ITSELF (`assert!(TOL == TOL)`), a bound used inside a
-provably-dead branch (`if false { assert!(d < TOL); } `), and a bound SHADOWED
-by a later same-name local (`let TOL = 1e9; assert!(d < TOL);`) all still read
-as covered — none of these are syntactic facts a lexical scanner can refute;
-each needs real value/reachability/scope analysis this gate does not attempt.
+provably-dead branch (`if false { assert!(d < TOL); } `), a bound SHADOWED by
+a later same-name local (`let TOL = 1e9; assert!(d < TOL);`), and (round-4
+audit — the H3 fix's own honest cost, dropping round-3's space-padding
+requirement to stop it from rejecting a real unpadded `if d<TOL {...}`) a
+GENERIC BRACKET (`let v: Vec<TOL> = ..;`, `foo::<TOL>(..)`) all still read as
+COVERED — none of these are syntactic facts a lexical scanner can refute;
+each needs real value/reachability/scope/type analysis this gate does not
+attempt. A false COVERED is a silent miss in the SAFE direction for KO-2's
+own stated job (KO-2 only ever flags MISSING coverage), not a new class of
+false alarm — narrowing adjacency back to reject `Vec<TOL>` without also
+reintroducing the H3 regression is future work, not attempted this round.
 
 **KO-5 (off-sample bounds).** When BOTH `derived-on` and `asserted-on` are real
 seed lists (neither is the literal `none`), their intersection — after
@@ -582,7 +587,15 @@ def _strip_comments_only_independent(source: str) -> str:
     return "".join(out)
 
 
-FN_HEAD_RE = re.compile(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)\s*[(<]")
+# Round-4 audit item 3: a raw identifier (`fn r#match(`, legal Rust for a
+# name that collides with a keyword) or a macro_rules! metavariable
+# (`fn $name(`, the standard "generate N #[test] fns from one template"
+# idiom) previously matched NEITHER alternative, so the fn was invisible to
+# `find_fns` while its `#[test]` attribute was still counted by the
+# attribute scan — a totality mismatch with no remedy. Both are accepted as
+# valid "name" shapes now, closing the class at its source instead of only
+# via the marker escape hatch below (`check_test_attr_totality`).
+FN_HEAD_RE = re.compile(r"\bfn\s+((?:r#)?[A-Za-z_][A-Za-z0-9_]*|\$[A-Za-z_][A-Za-z0-9_]*)\s*[(<]")
 
 
 # Round-3b (lead probe of the class): a fail-closed check with NO review/
@@ -798,7 +811,31 @@ def _has_test_attr(stripped: str, attr_spans: list[tuple[int, int, str]], fn_kw_
     return found_test
 
 
-def check_test_attr_totality(stripped: str, attr_spans: list[tuple[int, int, str]], records: list, file_label: str) -> None:
+# Round-4 audit item 3: the SAME lesson round-3b learned for `check_fn_
+# desync` (:602) applies here — a fail-closed check with NO review/escape
+# mechanism is a check no conforming file can ever satisfy once a genuine,
+# lexically-unresolvable shape exists (a proc-macro-attribute-generated
+# test, or any other totality-breaking shape the `FN_HEAD_RE` widening
+# above doesn't close). Mirrors the SAME `// kernel-oracles: <check>
+# reviewed: <reason>` idiom, with the same "a marker that no longer
+# corresponds to a real discrepancy is itself a FAIL" symmetry — a marker
+# never accumulates as unverifiable dead weight. Totality is a whole-file
+# SCALAR count (not a single line), so the marker's cardinality — not its
+# exact line — is what's checked: the file must carry EXACTLY `|delta|`
+# reviewed markers, no more, no fewer, each a deliberate, individually
+# reviewed acknowledgment (never a blanket one-marker-covers-all escape).
+KERNEL_ORACLES_TEST_ATTR_MARKER_RE = re.compile(
+    r"//\s*kernel-oracles:\s*test-attr reviewed:\s*(?P<reason>.+?)\s*$"
+)
+
+
+def check_test_attr_totality(
+    stripped: str,
+    attr_spans: list[tuple[int, int, str]],
+    records: list,
+    file_label: str,
+    raw_lines: list[str] | None = None,
+) -> None:
     """TOTALITY CROSS-CHECK (round-4, item 2), fail-closed: the count of
     `#[test]`/`#[<path>::test]`-shaped ATTRIBUTE TOKENS in the stripped
     text must equal the number of fns this gate classified `is_test=True`
@@ -806,17 +843,37 @@ def check_test_attr_totality(stripped: str, attr_spans: list[tuple[int, int, str
     construction; a genuine mismatch (a test attribute orphaned — not
     immediately followed, across only whitespace/other attributes, by any
     `fn` at all — or two attributes stacked before one fn) means this
-    file is UNCOMPUTABLE, not silently under- or over-counted.
+    file is UNCOMPUTABLE, not silently under- or over-counted — UNLESS the
+    file carries exactly `|delta|` `// kernel-oracles: test-attr reviewed:
+    <reason>` markers (round-4 audit item 3), each a deliberate sign-off on
+    one lexically-unresolvable shape.
     """
     attr_test_count = sum(1 for _s, _e, path in attr_spans if _is_test_attr_path(path))
     fn_test_count = sum(1 for r in records if r.is_test)
-    if attr_test_count != fn_test_count:
+    delta = attr_test_count - fn_test_count
+    marker_lines = [
+        i + 1
+        for i, line in enumerate(raw_lines or [])
+        if KERNEL_ORACLES_TEST_ATTR_MARKER_RE.search(line)
+    ]
+    if delta == 0:
+        if marker_lines:
+            raise OracleError(
+                f"{file_label}: stale `test-attr reviewed` marker(s) at line(s) "
+                f"{', '.join(map(str, marker_lines))} (attribute/fn totality already balances "
+                "exactly — remove the marker(s))"
+            )
+        return
+    if len(marker_lines) != abs(delta):
         raise OracleError(
             f"{file_label}: test-attribute totality mismatch — {attr_test_count} `#[test]`-shaped "
             f"attribute(s) in the stripped text vs {fn_test_count} fn(s) this gate classified as "
             "tests. Totality here means exact PARITY between attribute-token count and classified-"
             "test-fn count — a genuine mismatch means a test attribute is not attached to exactly "
-            "one fn (orphaned, or stacked with another) and needs manual review."
+            "one fn (orphaned, stacked with another, or a proc-macro-attribute-generated shape "
+            f"this lexical scanner cannot resolve). Found {len(marker_lines)} `// kernel-oracles: "
+            f"test-attr reviewed: <reason>` marker(s); need exactly {abs(delta)} (one per "
+            "unresolvable shape) to accept this file as reviewed rather than uncomputable."
         )
 
 
@@ -854,7 +911,7 @@ def find_fns(source: str, file_label: str) -> list[FnRecord]:
                 is_test=is_test,
             )
         )
-    check_test_attr_totality(stripped_full, attr_spans, records, file_label)
+    check_test_attr_totality(stripped_full, attr_spans, records, file_label, source.splitlines())
     return records
 
 
@@ -895,22 +952,97 @@ def find_fns(source: str, file_label: str) -> list[FnRecord]:
 # gate is a REGISTRY FAIL naming the offending file/fn.
 HELPERS_REGISTRY_PATH = REPO_ROOT / "ci" / "kernel-oracle-helpers.txt"
 
-ENV_READ_CALL_ALTERNATION = r"(?:std::env::var_os|env::var_os|std::env::var|env::var|option_env!)"
+# Round-4 audit advisory: `option_env!` reads a value baked in AT COMPILE
+# TIME (the macro is expanded by the compiler that BUILDS this test binary,
+# not by the process that RUNS it) — a `JAMMI_REQUIRE_*` gate is a runtime
+# enforcement switch (the pod lane exports it before `cargo test` runs, not
+# before it was compiled), so `option_env!` can never observe it and a
+# helper gated only that way silently never fires. Runtime reads
+# (`std::env::var_os`/`var`) only.
+ENV_READ_CALL_ALTERNATION = r"(?:std::env::var_os|env::var_os|std::env::var|env::var)"
+# Round-4 audit advisory: the ORIGINAL `[^{]*?` wildcards (both before AND
+# after the env-read call, up to the opening `{`) accepted ANY surrounding
+# condition text — `... .is_some() && false { panic!(..) }` (a conjunct
+# that makes the guard never actually fire) and `... .is_none() {
+# panic!(..) }` (an INVERTED gate — panics when the flag is NOT set) both
+# satisfied the old regex. The `if` condition must now be EXACTLY the
+# env-read call followed by `.is_some()` or `.is_ok()` — nothing before it
+# in the condition, nothing after it but the opening `{`.
 IF_ENV_READ_RE = re.compile(
-    rf'\bif\b[^{{]*?\b{ENV_READ_CALL_ALTERNATION}\s*\(\s*"(JAMMI_REQUIRE_[A-Z0-9_]*)"[^{{]*\{{'
+    rf'\bif\s+{ENV_READ_CALL_ALTERNATION}\s*\(\s*"(JAMMI_REQUIRE_[A-Z0-9_]*)"\s*\)'
+    r"\s*\.\s*(?:is_some|is_ok)\s*\(\s*\)\s*\{"
 )
 MATCH_ENV_READ_RE = re.compile(
     rf'\bmatch\b[^{{]*?\b{ENV_READ_CALL_ALTERNATION}\s*\(\s*"(JAMMI_REQUIRE_[A-Z0-9_]*)"[^{{]*\{{'
 )
 # `return;` / brace-tail `return}`, plus `return Ok(...)`/`return Err(...)`,
-# plus `std::process::exit(` (round-4 audit F15 — a #[test] fn that skips
-# by TERMINATING THE PROCESS instead of returning is just as invisible to
-# KO-7 without this) — a #[test] fn early-exiting via any of these shapes
-# is just as much a silent skip as a bare `return;`. Only the START of the
-# statement is matched (sufficient for textual ordering/windowing below).
+# plus `process::exit(`/`std::process::exit(` (round-4 audit F15 — a
+# #[test] fn that skips by TERMINATING THE PROCESS instead of returning is
+# just as invisible to KO-7 without this) — a #[test] fn early-exiting via
+# any of these shapes is just as much a silent skip as a bare `return;`.
+# Only the START of the statement is matched (sufficient for textual
+# ordering/windowing below). A bare, imported `exit(` (round-4 audit
+# advisory) is handled separately by `BARE_EXIT_RE`, gated on the file
+# actually importing it (`_file_imports_exit`) — an unqualified `exit(`
+# with no import in scope is at least as likely a local/shadowed name as
+# `std::process::exit`.
 RETURN_SKIP_RE = re.compile(
-    r"\breturn\b\s*(?:;|\}|Ok\s*\(|Err\s*\()|\bstd::process::exit\s*\("
+    r"\breturn\b\s*(?:;|\}|Ok\s*\(|Err\s*\()|\b(?:std::)?process::exit\s*\("
 )
+BARE_EXIT_RE = re.compile(r"(?<![.:])\bexit\s*\(")
+_EXIT_IMPORT_RE = re.compile(r"\buse\s+std::process::(?:exit\b|\{[^}]*\bexit\b[^}]*\})")
+
+
+def _file_imports_exit(source_text: str) -> bool:
+    return bool(_EXIT_IMPORT_RE.search(source_text))
+
+
+# Round-4 audit advisory: a `return`/`process::exit` inside a CLOSURE
+# (`v.iter().for_each(|x| { if .. { return; } })`) or a nested `fn` ITEM
+# defined inside the test body (`fn helper() { .. return; .. }
+# helper();`) does not skip the TEST — it is a different control-flow
+# scope entirely. `body_stripped` starts at the test fn's own opening `{`
+# (no head text before it), so any `FN_HEAD_RE` match found INSIDE it is
+# necessarily a NESTED fn; any `|params| { .. }`/`|params| -> Ty { .. }`
+# closure head found INSIDE it opens a nested scope the same way.
+_CLOSURE_HEAD_END_RE = re.compile(r"\|[^|{}]*\|\s*(?:->\s*[^{;]+?)?\s*\{$")
+
+
+def _nested_scope_open_braces(body_stripped: str) -> set[int]:
+    opens: set[int] = set()
+    for m in FN_HEAD_RE.finditer(body_stripped):
+        brace = body_stripped.find("{", m.end())
+        if brace != -1:
+            opens.add(brace)
+    for i, c in enumerate(body_stripped):
+        if c != "{":
+            continue
+        if _CLOSURE_HEAD_END_RE.search(body_stripped[max(0, i - 200) : i + 1]):
+            opens.add(i)
+    return opens
+
+
+def _top_level_skip_matches(body_stripped: str, extra_res: tuple[re.Pattern, ...] = ()) -> list[re.Match]:
+    """Every `RETURN_SKIP_RE` (plus any `extra_res`, e.g. `BARE_EXIT_RE`)
+    match that sits at the test fn's OWN body depth — not inside a nested
+    closure or `fn` item (see module note above)."""
+    opens = _nested_scope_open_braces(body_stripped)
+    skips_by_pos: dict[int, re.Match] = {}
+    for m in RETURN_SKIP_RE.finditer(body_stripped):
+        skips_by_pos[m.start()] = m
+    for cre in extra_res:
+        for m in cre.finditer(body_stripped):
+            skips_by_pos.setdefault(m.start(), m)
+    stack = [False]
+    result: list[re.Match] = []
+    for i, c in enumerate(body_stripped):
+        if i in skips_by_pos and not stack[-1]:
+            result.append(skips_by_pos[i])
+        if c == "{":
+            stack.append(stack[-1] or i in opens)
+        elif c == "}" and len(stack) > 1:
+            stack.pop()
+    return sorted(result, key=lambda m: m.start())
 
 
 def _extract_call_and_rest(text: str) -> tuple[str, str]:
@@ -993,24 +1125,39 @@ def helper_shape_ok(fn_body_stripped: str) -> tuple[bool, str]:
         block, _, _ = _extract_balanced_block(fn_body_stripped, m.end() - 1)
         inner = block[1:-1]
         for pattern, body in _split_match_arms(inner):
+            # Round-4 audit advisory: a MATCH GUARD (`Some(v) if <cond> =>
+            # panic!(..)`) makes the panic conditional on more than "the
+            # env var is set" — a guard that can never be true (or is
+            # merely narrower than the bare pattern) would otherwise let
+            # this arm satisfy verification while never actually firing.
+            # Reject any guarded arm outright; only a bare `Some(..)`/
+            # `Ok(..)` pattern (no `if`) counts.
+            if re.search(r"\bif\b", pattern):
+                continue
             if re.search(r"\b(?:Some|Ok)\b", pattern) and _is_exactly_one_panic_stmt(body):
                 return True, ""
     return (
         False,
-        "no canonical if/match env-read (std::env::var_os/var/option_env! of a JAMMI_REQUIRE_* "
-        "name) whose taken-when-set branch is EXACTLY one panic!/unreachable! statement (no "
-        ".expect(, no closures, no other statements)",
+        "no canonical if/match RUNTIME env-read (std::env::var_os/var of a JAMMI_REQUIRE_* name — "
+        "option_env! is a COMPILE-TIME read, never accepted) whose taken-when-set branch is "
+        "EXACTLY one panic!/unreachable! statement (no .expect(, no closures, no other "
+        "statements, no match-arm guard)",
     )
 
 
 def load_helper_registry(path: Path = HELPERS_REGISTRY_PATH) -> list[tuple[str, str]]:
     """`[(file_rel_path, fn_name), ...]` from `ci/kernel-oracle-helpers.txt`
     — `#`-prefixed and blank lines ignored. Fails closed on a malformed
-    line (never silently skips one).
+    line (never silently skips one), and on an exact DUPLICATE `<file>::
+    <fn_name>` entry (round-4 audit advisory — a repeated line is either a
+    copy-paste mistake or dead weight nobody would notice is redundant;
+    the registry is a reviewed list, and a duplicate was never itself
+    reviewed as a second, distinct fact).
     """
     if not path.is_file():
         raise OracleError(f"helper registry not found: {path}")
     entries: list[tuple[str, str]] = []
+    seen: dict[tuple[str, str], int] = {}
     for line_no, line in enumerate(path.read_text().splitlines(), start=1):
         stripped_line = line.strip()
         if not stripped_line or stripped_line.startswith("#"):
@@ -1020,26 +1167,40 @@ def load_helper_registry(path: Path = HELPERS_REGISTRY_PATH) -> list[tuple[str, 
                 f"{path.name}:{line_no}: malformed line (expected `<file>::<fn_name>`): {line!r}"
             )
         file_part, fn_part = stripped_line.rsplit("::", 1)
-        entries.append((file_part, fn_part))
+        key = (file_part, fn_part)
+        if key in seen:
+            raise OracleError(
+                f"{path.name}:{line_no}: duplicate registry entry {file_part}::{fn_part} "
+                f"(already present at line {seen[key]} — remove the repeat)"
+            )
+        seen[key] = line_no
+        entries.append(key)
     return entries
 
 
 def verify_helper_registry(
     entries: list[tuple[str, str]], source_texts: dict[str, str]
-) -> tuple[set[str], list[str]]:
-    """Returns (registered_fn_names, failures). Each entry's `file` must
-    resolve among the scanned `source_texts`; the named `fn` must exist in
-    it; and (at least one same-named candidate's) body must pass
-    `helper_shape_ok` — else a REGISTRY FAIL naming the file/fn and why.
-    `registered_fn_names` is a flat (not file-scoped) set of NAMES — KO-7's
-    gating never needed file-scoping (a call textually named after a
-    registered helper, inside the SAME file being scanned for skips, is
-    calling that file's own local helper under ordinary Rust scoping; two
-    different files legitimately registering same-named helpers, e.g. both
-    `cuda_parity.rs` and `flash_smoke.rs` each defining their own
-    `cuda_device`, is the ordinary case, not a collision to resolve).
+) -> tuple[set[tuple[str, str]], list[str]]:
+    """Returns `(verified, failures)` — `verified` is a set of `(file,
+    fn_name)` PAIRS, not a flat name set (round-4 audit item 1: a flat name
+    set lets an UNREGISTERED same-named fn in a DIFFERENT file "borrow"
+    another file's review by name alone — `flash_op_oracles.rs` defining
+    its own, never-reviewed `cuda_device()` gated silently because
+    `cuda_device` was a registered NAME for `cuda_parity.rs`'s unrelated
+    fn. Same-NAME, different-FILE helpers, e.g. both `cuda_parity.rs` and
+    `flash_smoke.rs` each defining their own `cuda_device`, remain the
+    ordinary case — each is verified, and gates, independently against its
+    OWN file).
+
+    Each entry's `file` must resolve among the scanned `source_texts`; the
+    named `fn` must exist in it EXACTLY ONCE — two fns sharing that name in
+    one file (this lexical scanner does not track `mod` boundaries, so
+    "the real one" vs. a same-named decoy elsewhere in the file is
+    undecidable) is a REGISTRY FAIL, never a best-effort pick of whichever
+    candidate happens to pass; and that one candidate's body must pass
+    `helper_shape_ok` — else a REGISTRY FAIL naming the file:line and why.
     """
-    names: set[str] = set()
+    verified: set[tuple[str, str]] = set()
     failures: list[str] = []
     for file_rel, fn_name in entries:
         text = source_texts.get(file_rel)
@@ -1050,19 +1211,22 @@ def verify_helper_registry(
         if not candidates:
             failures.append(f"{file_rel}::{fn_name}: fn not found in file")
             continue
-        reasons = []
-        ok = False
-        for c in candidates:
-            shape_ok, reason = helper_shape_ok(c.body_stripped)
-            if shape_ok:
-                ok = True
-                break
-            reasons.append(reason)
-        if not ok:
-            failures.append(f"{file_rel}::{fn_name}: {reasons[0] if reasons else 'shape check failed'}")
+        if len(candidates) > 1:
+            lines = sorted(text.count("\n", 0, c.body_start_idx) + 1 for c in candidates)
+            failures.append(
+                f"{file_rel}::{fn_name}: {len(candidates)} fns named {fn_name!r} in this one "
+                f"file (at lines {', '.join(map(str, lines))}) — which one this entry reviews is "
+                "undecidable; rename or restructure so exactly one fn in the file has this name"
+            )
             continue
-        names.add(fn_name)
-    return names, failures
+        candidate = candidates[0]
+        line_no = text.count("\n", 0, candidate.body_start_idx) + 1
+        shape_ok, reason = helper_shape_ok(candidate.body_stripped)
+        if not shape_ok:
+            failures.append(f"{file_rel}:{line_no}::{fn_name}: {reason}")
+            continue
+        verified.add((file_rel, fn_name))
+    return verified, failures
 
 
 @dataclass(frozen=True)
@@ -1072,27 +1236,59 @@ class UngatedSkip:
     line_no: int
 
 
-def check_ko7(all_fns: list[FnRecord], helper_names: set[str], source_texts: dict[str, str]) -> list[UngatedSkip]:
-    """Every `return;`/`return}`/`return Ok(`/`return Err(` inside every
-    `#[test]` fn's STRIPPED body must be textually dominated by a call to a
-    name in `helper_names` — PER SKIP: the dominance window for a given
-    `return` is `[end of the PREVIOUS skip (or fn start), this skip's
-    start)`, so an early helper call gates only the skip(s) immediately
-    downstream of it, never every later skip in the same fn unconditionally
-    — a gated CUDA-device check followed by an UNRELATED, ungated
-    `if !FLASH_COMPILED { return; }` further down the same fn still reds.
+def _is_bare_call(text: str, pos: int) -> bool:
+    """True iff the identifier match starting at `pos` in `text` is called
+    in the file's OWN local scope — not as a method (`self.name(`), a
+    qualified path (`Other::name(`), or a `fn name(` DEFINITION (round-4
+    audit item 4 — all three textually contain `name(` and would otherwise
+    "gate" a skip without ever having called the file's OWN reviewed
+    helper: a nested `fn cuda_device() {..}` DEFINITION inside the test
+    body, never called, previously satisfied the bare regex; so did an
+    explicitly-qualified `a::cuda_device()` reaching a DIFFERENT module's
+    same-named decoy).
     """
-    helper_call_res = {name: re.compile(rf"\b{re.escape(name)}\s*\(") for name in helper_names}
+    return not re.search(r"(?:\.\s*|::\s*|\bfn\s+)$", text[:pos])
+
+
+def check_ko7(
+    all_fns: list[FnRecord], verified: set[tuple[str, str]], source_texts: dict[str, str]
+) -> list[UngatedSkip]:
+    """Every top-level `return;`/`return}`/`return Ok(`/`return Err(`/
+    `process::exit(`/gated bare `exit(` inside every `#[test]` fn's
+    STRIPPED body (round-4 audit advisory: NOT one sitting inside a nested
+    closure or `fn` item — see `_top_level_skip_matches`) must be textually
+    dominated by a BARE call (see `_is_bare_call`) to a name registered FOR
+    THIS FN'S OWN FILE (round-4 audit item 1 — `verified` is `(file,
+    fn_name)`-scoped, never a flat cross-file name set) — PER SKIP: the
+    dominance window for a given skip is `[end of the PREVIOUS skip (or fn
+    start), this skip's start)`, so an early helper call gates only the
+    skip(s) immediately downstream of it, never every later skip in the
+    same fn unconditionally — a gated CUDA-device check followed by an
+    UNRELATED, ungated `if !FLASH_COMPILED { return; }` further down the
+    same fn still reds.
+    """
+    verified_by_file: dict[str, set[str]] = {}
+    for file_rel, fn_name in verified:
+        verified_by_file.setdefault(file_rel, set()).add(fn_name)
+    call_res: dict[str, re.Pattern] = {}
     findings: list[UngatedSkip] = []
     for fn in all_fns:
         if not fn.is_test:
             continue
-        skip_matches = sorted(RETURN_SKIP_RE.finditer(fn.body_stripped), key=lambda m: m.start())
+        extra_res: tuple[re.Pattern, ...] = ()
+        if _file_imports_exit(source_texts[fn.file]):
+            extra_res = (BARE_EXIT_RE,)
+        skip_matches = _top_level_skip_matches(fn.body_stripped, extra_res)
         if not skip_matches:
             continue
-        helper_positions = sorted(
-            m.start() for cre in helper_call_res.values() for m in cre.finditer(fn.body_stripped)
-        )
+        local_names = verified_by_file.get(fn.file, set())
+        helper_positions = []
+        for name in local_names:
+            cre = call_res.setdefault(name, re.compile(rf"\b{re.escape(name)}\s*\("))
+            for m in cre.finditer(fn.body_stripped):
+                if _is_bare_call(fn.body_stripped, m.start()):
+                    helper_positions.append(m.start())
+        helper_positions.sort()
         window_start = 0
         for m in skip_matches:
             pos = m.start()
@@ -1129,12 +1325,16 @@ _APPROX_EQ_MACRO_NAMES = frozenset({"assert_relative_eq", "assert_abs_diff_eq"})
 # Round-4 audit fix (H3 regression): round 3's space-padded ` < `/` > `
 # requirement (meant to exclude a generic bracket like `Vec<f32>`) also
 # excluded a real, unpadded comparison (`if d<TOL { ... }`, legal rustfmt
-# output inside some contexts) — dropped. The adjacency requirement itself
-# (below: the bound must be the operator's OWN, DIRECTLY TOUCHING operand,
-# not merely "present somewhere near it") is what actually keeps
-# `foo::<f32>(TOL)`/`Vec<f32>` excluded — TOL is never immediately
-# touching the `<`/`>` in either shape — so the space padding was
-# redundant protection this fix removes, not protection this fix loses.
+# output inside some contexts) — dropped. This is an honest, KNOWN cost,
+# not a wash: `let v: Vec<TOL> = ..;` DOES now read COVERED (TOL is
+# directly touching the bracket's own `<`/`>`, same adjacency shape as a
+# real comparison operand — a lexical scanner cannot tell "generic
+# bracket" from "comparison" apart without a type grammar). See the
+# module docstring's KO-2 "known, out-of-scope class limitations"
+# paragraph — a false COVERED here is a silent miss in the safe
+# direction (KO-2 only ever flags MISSING coverage), traded deliberately
+# against H3's real comparisons going undetected, never both closed at
+# once by an adjacency-only rule.
 _COMPARISON_OP_RE_KO2 = re.compile(r"<=|>=|==|<|>")
 
 
@@ -1383,11 +1583,17 @@ def scan_files() -> dict[str, str]:
         raise OracleError(f"scan root not found: {KERNELS_TESTS_DIR}")
     if not ENCODERS_SRC_DIR.is_dir():
         raise OracleError(f"scan root not found: {ENCODERS_SRC_DIR}")
+    # Round-4 audit advisory: RECURSIVE under the two roots (not additional
+    # roots — `crates/jammi-encoders/src/context/*.rs` is a real,
+    # previously-silently-unscanned subdirectory of the already-in-scope
+    # `crates/jammi-encoders/src/`; scope.py's 19 files elsewhere are a
+    # DIFFERENT crate entirely and stay out of scope, documented, not
+    # pulled in).
     texts: dict[str, str] = {}
-    for path in sorted(KERNELS_TESTS_DIR.glob("*.rs")):
+    for path in sorted(KERNELS_TESTS_DIR.rglob("*.rs")):
         rel = str(path.relative_to(REPO_ROOT))
         texts[rel] = path.read_text(encoding="utf-8", errors="ignore")
-    for path in sorted(ENCODERS_SRC_DIR.glob("*.rs")):
+    for path in sorted(ENCODERS_SRC_DIR.rglob("*.rs")):
         rel = str(path.relative_to(REPO_ROOT))
         texts[rel] = path.read_text(encoding="utf-8", errors="ignore")
     return texts
@@ -1416,8 +1622,8 @@ def run_gate(
         all_fns.extend(find_fns(text, file_label))
         all_markers.extend(parse_markers(text, file_label))
 
-    helper_names, registry_failures = verify_helper_registry(registry_entries, source_texts)
-    ko7 = check_ko7(all_fns, helper_names, source_texts)
+    verified_helpers, registry_failures = verify_helper_registry(registry_entries, source_texts)
+    ko7 = check_ko7(all_fns, verified_helpers, source_texts)
     ko2 = check_ko2(all_markers, all_fns)
     ko5 = check_ko5(all_markers)
 
@@ -1461,8 +1667,11 @@ def main() -> int:
     print("\nKO-7 (unrun-is-RED) per scanned file:")
     for file_label, text in source_texts.items():
         fns_in_file = find_fns(text, file_label)
+        extra_res: tuple[re.Pattern, ...] = (BARE_EXIT_RE,) if _file_imports_exit(text) else ()
         n_skips = sum(
-            len(RETURN_SKIP_RE.findall(fn.body_stripped)) for fn in fns_in_file if fn.is_test
+            len(_top_level_skip_matches(fn.body_stripped, extra_res))
+            for fn in fns_in_file
+            if fn.is_test
         )
         n_ungated = len(ko7_by_file.get(file_label, []))
         print(f"    {file_label}: {n_skips} runtime skip(s), {n_ungated} ungated")

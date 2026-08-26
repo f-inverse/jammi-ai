@@ -90,7 +90,7 @@ fn real_helper() -> Option<i32> {
 }
 """
         names, failures = ko.verify_helper_registry([("fixture.rs", "real_helper")], {"fixture.rs": src})
-        self.assertEqual(names, {"real_helper"})
+        self.assertEqual(names, {("fixture.rs", "real_helper")})
         self.assertEqual(failures, [])
 
     def test_registered_fn_with_env_read_but_no_panic_is_a_registry_fail(self) -> None:
@@ -141,7 +141,7 @@ fn cuda_device() -> Option<i32> {
 }
 """
         names, failures = ko.verify_helper_registry([("fixture.rs", "cuda_device")], {"fixture.rs": src})
-        self.assertEqual(names, {"cuda_device"})
+        self.assertEqual(names, {("fixture.rs", "cuda_device")})
         self.assertEqual(failures, [])
 
     def test_unreachable_macro_counts_as_the_panic_arm(self) -> None:
@@ -154,9 +154,16 @@ fn helper() -> Option<i32> {
 }
 """
         names, _f = ko.verify_helper_registry([("fixture.rs", "helper")], {"fixture.rs": src})
-        self.assertEqual(names, {"helper"})
+        self.assertEqual(names, {("fixture.rs", "helper")})
 
-    def test_option_env_macro_counts_as_the_env_read(self) -> None:
+    def test_option_env_macro_is_rejected_compile_time_only(self) -> None:
+        # round-4 audit advisory: `option_env!` is resolved AT COMPILE
+        # TIME by the compiler that BUILT this test binary — a
+        # `JAMMI_REQUIRE_*` gate is a RUNTIME enforcement switch (the pod
+        # lane exports it before `cargo test` runs, long after the binary
+        # was already compiled), so a helper gated only this way would
+        # silently never observe it. Runtime `std::env::var_os`/`var`
+        # reads only — this is a registry FAIL, not a conforming shape.
         src = """
 fn helper() -> Option<i32> {
     if option_env!("JAMMI_REQUIRE_CUDA").is_some() {
@@ -165,8 +172,10 @@ fn helper() -> Option<i32> {
     None
 }
 """
-        names, _f = ko.verify_helper_registry([("fixture.rs", "helper")], {"fixture.rs": src})
-        self.assertEqual(names, {"helper"})
+        names, failures = ko.verify_helper_registry([("fixture.rs", "helper")], {"fixture.rs": src})
+        self.assertEqual(names, set())
+        self.assertEqual(len(failures), 1)
+        self.assertIn("COMPILE-TIME", failures[0])
 
     def test_env_var_argument_not_starting_with_jammi_require_is_a_registry_fail(self) -> None:
         src = """
@@ -244,19 +253,23 @@ fn launder() -> Option<u32> {
         self.assertEqual(len(failures), 1)
 
     def test_real_registry_file_parses_and_every_seeded_helper_verifies(self) -> None:
+        # Round-4 audit advisory: pinning an EXACT entry count/set makes
+        # this test a required-edit tax on every legitimate new helper
+        # registration — the actual invariant this test protects is "every
+        # entry that is IN the file loads, resolves, and shape-verifies",
+        # not "the registry has exactly N entries." >= this seed set, each
+        # individually shape-ok.
         entries = ko.load_helper_registry()
-        self.assertEqual(
-            set(entries),
-            {
-                ("crates/jammi-kernels/tests/cuda_parity.rs", "cuda_device"),
-                ("crates/jammi-kernels/tests/flash_smoke.rs", "cuda_device"),
-                ("crates/jammi-encoders/src/modernbert.rs", "growth_oracle_cuda_device"),
-            },
-        )
+        seed = {
+            ("crates/jammi-kernels/tests/cuda_parity.rs", "cuda_device"),
+            ("crates/jammi-kernels/tests/flash_smoke.rs", "cuda_device"),
+            ("crates/jammi-encoders/src/modernbert.rs", "growth_oracle_cuda_device"),
+        }
+        self.assertTrue(seed.issubset(set(entries)), f"seed entries missing from {entries}")
         source_texts = {rel: (ko.REPO_ROOT / rel).read_text() for rel, _name in entries}
         names, failures = ko.verify_helper_registry(entries, source_texts)
         self.assertEqual(failures, [])
-        self.assertEqual(names, {"cuda_device", "growth_oracle_cuda_device"})
+        self.assertEqual(names, set(entries))
 
 
 class TestKo7(unittest.TestCase):
@@ -655,7 +668,7 @@ fn a_test() {
         # specifically that a COMMENT mentioning it is not a real CALL,
         # not that the helper itself fails to register.
         helpers = _helpers_for({file_label: src}, [(file_label, "cuda_device")])
-        self.assertEqual(helpers, {"cuda_device"})
+        self.assertEqual(helpers, {(file_label, "cuda_device")})
         findings = ko.check_ko7(fns, helpers, {file_label: src})
         self.assertEqual(len(findings), 1)
 
@@ -715,7 +728,7 @@ fn cuda_device() -> Option<i32> {
 }
 """
         names, failures = ko.verify_helper_registry([("fixture.rs", "cuda_device")], {"fixture.rs": src})
-        self.assertEqual(names, {"cuda_device"})
+        self.assertEqual(names, {("fixture.rs", "cuda_device")})
         self.assertEqual(failures, [])
 
     def test_panic_shaped_text_inside_an_unrelated_string_is_a_registry_fail(self) -> None:
@@ -1484,7 +1497,7 @@ fn parity_bf16() {
             "}\n"
         )
         helpers = _helpers_for({"f.rs": src}, [("f.rs", "cuda_device")])
-        self.assertEqual(helpers, {"cuda_device"})
+        self.assertEqual(helpers, {("f.rs", "cuda_device")})
         fns = ko.find_fns(src, "f.rs")
         findings = ko.check_ko7(fns, helpers, {"f.rs": src})
         self.assertEqual(len(findings), 1)
@@ -1569,6 +1582,296 @@ fn parity_bf16() {
         )
         fns = ko.find_fns(src, "f.rs")  # must not raise
         self.assertEqual({f.name for f in fns}, {"cuda_device", "parity_bf16"})
+
+
+# --------------------------------------------------------------------------- #
+# round-4 (scoped re-audit of 07308fc) — CLASS A + advisory fixes, adopting
+# every audit fixture (b1_registry.py, b2_totality.py, b34.py, fp.py,
+# tot_fp.py, a_prior.py) as a permanent regression with the audit's own
+# stated expected outcome.
+# --------------------------------------------------------------------------- #
+class TestFileScopedHelperGating(unittest.TestCase):
+    """Item 1: `verify_helper_registry`/`check_ko7` are (file, fn)-scoped —
+    a flat NAME set let an unregistered same-named fn in a DIFFERENT file
+    "borrow" another file's review."""
+
+    def test_b1j_a_different_files_own_unregistered_same_named_fn_does_not_gate(self) -> None:
+        real = """
+fn cuda_device() -> Option<u8> {
+    if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() { panic!("req"); }
+    Some(0)
+}
+"""
+        a_src = real + """
+#[test]
+fn t_real() { let d = cuda_device(); let Some(_d) = d else { return; }; }
+"""
+        b_src = """
+fn cuda_device() -> Option<u8> { None }
+#[test]
+fn t_vacuous() {
+    let d = cuda_device();
+    let Some(_d) = d else { return; };
+}
+"""
+        sources = {"a.rs": a_src, "b.rs": b_src}
+        verified, failures = ko.verify_helper_registry([("a.rs", "cuda_device")], sources)
+        self.assertEqual(failures, [])
+        fns = ko.find_fns(a_src, "a.rs") + ko.find_fns(b_src, "b.rs")
+        findings = ko.check_ko7(fns, verified, sources)
+        by_fn = {f.fn_name for f in findings}
+        self.assertNotIn("t_real", by_fn)
+        self.assertIn("t_vacuous", by_fn)
+
+    def test_b1c_two_same_named_fns_in_one_file_is_a_registry_fail_not_a_pick(self) -> None:
+        src = """
+mod a {
+    fn cuda_device() -> Option<u8> { Some(0) }
+}
+mod b {
+    fn cuda_device() -> Option<u8> {
+        if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() { panic!("req"); }
+        Some(0)
+    }
+}
+#[test]
+fn t_mods() {
+    let d = a::cuda_device();
+    let Some(_d) = d else { return; };
+}
+"""
+        verified, failures = ko.verify_helper_registry([("a.rs", "cuda_device")], {"a.rs": src})
+        self.assertEqual(verified, set())
+        self.assertEqual(len(failures), 1)
+        self.assertIn("2 fns named", failures[0])
+        fns = ko.find_fns(src, "a.rs")
+        findings = ko.check_ko7(fns, verified, {"a.rs": src})
+        self.assertEqual(len(findings), 1)
+
+    def test_b1k_nested_fn_definition_never_called_does_not_gate(self) -> None:
+        real = """
+fn cuda_device() -> Option<u8> {
+    if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() { panic!("req"); }
+    Some(0)
+}
+"""
+        src = real + """
+#[test]
+fn t_defonly() {
+    fn cuda_device() -> Option<u8> { None }
+    let x: Option<u8> = None;
+    let Some(_d) = x else { return; };
+}
+"""
+        # The nested fn IS a second same-named fn in this one file, so the
+        # registry entry itself correctly fails too (item 1) — both
+        # signals point the same direction (RED), not a contradiction.
+        verified, failures = ko.verify_helper_registry([("a.rs", "cuda_device")], {"a.rs": src})
+        self.assertTrue(failures)
+        fns = ko.find_fns(src, "a.rs")
+        findings = ko.check_ko7(fns, verified, {"a.rs": src})
+        self.assertEqual(len(findings), 1)
+
+    def test_qualified_and_method_calls_are_not_bare_calls(self) -> None:
+        self.assertFalse(ko._is_bare_call("Other::cuda_device(", len("Other::")))
+        self.assertFalse(ko._is_bare_call("self.cuda_device(", len("self.")))
+        self.assertFalse(ko._is_bare_call("fn cuda_device(", len("fn ")))
+        self.assertTrue(ko._is_bare_call("let d = cuda_device(", len("let d = ")))
+
+
+class TestTotalityMacroMetavarAndRawIdent(unittest.TestCase):
+    """Item 3: `FN_HEAD_RE` accepts `fn $name(` (macro_rules! generator
+    template) and `fn r#match(` (raw ident) — both previously desynced
+    totality with no remedy."""
+
+    def test_macro_rules_test_generator_template_is_computable(self) -> None:
+        src = """
+macro_rules! gen_case {
+    ($name:ident, $v:expr) => {
+        #[test]
+        fn $name() {
+            assert_eq!($v, $v);
+        }
+    };
+}
+gen_case!(case_a, 1);
+gen_case!(case_b, 2);
+"""
+        fns = ko.find_fns(src, "f.rs")  # must not raise
+        self.assertEqual([f.name for f in fns if f.is_test], ["$name"])
+
+    def test_raw_ident_test_fn_is_computable(self) -> None:
+        src = "#[test]\nfn r#match() { assert!(true); }\n"
+        fns = ko.find_fns(src, "f.rs")  # must not raise
+        self.assertEqual([f.name for f in fns if f.is_test], ["r#match"])
+
+    def test_marker_escape_hatch_resolves_a_genuine_mismatch(self) -> None:
+        src = (
+            "#[test]\n#[test]\nfn t() { assert!(true); }\n"
+            "// kernel-oracles: test-attr reviewed: two stacked #[test]-shaped "
+            "attributes before one fn, fixture-reviewed\n"
+        )
+        fns = ko.find_fns(src, "f.rs")  # must not raise (1 marker == delta of 1)
+        self.assertEqual([f.name for f in fns if f.is_test], ["t"])
+
+    def test_stale_marker_when_totality_already_balances_fails(self) -> None:
+        src = (
+            "#[test]\nfn t() { assert!(true); }\n"
+            "// kernel-oracles: test-attr reviewed: nothing to review\n"
+        )
+        with self.assertRaises(ko.OracleError):
+            ko.find_fns(src, "f.rs")
+
+    def test_wrong_marker_count_still_fails(self) -> None:
+        src = "#[test]\n#[test]\nfn t() { assert!(true); }\n"  # delta=1, 0 markers
+        with self.assertRaises(ko.OracleError):
+            ko.find_fns(src, "f.rs")
+
+
+class TestNestedScopeSkipExclusion(unittest.TestCase):
+    """Advisory: a `return`/`process::exit` inside a closure or a nested
+    `fn` item does not skip the TEST itself."""
+
+    def test_for_each_closure_return_is_not_a_test_skip(self) -> None:
+        src = (
+            "#[test]\nfn t() { v.iter().for_each(|x| { "
+            "if *x == 0 { return; } total += x; }); }\n"
+        )
+        fns = ko.find_fns(src, "f.rs")
+        self.assertEqual(ko.check_ko7(fns, set(), {"f.rs": src}), [])
+
+    def test_closure_returning_ok_is_not_a_test_skip(self) -> None:
+        src = (
+            "#[test]\nfn t() { let f = || -> Result<(), u8> { "
+            "if flag { return Ok(()); } Err(1) }; assert!(f().is_ok()); }\n"
+        )
+        fns = ko.find_fns(src, "f.rs")
+        self.assertEqual(ko.check_ko7(fns, set(), {"f.rs": src}), [])
+
+    def test_nested_fn_item_return_is_not_a_test_skip(self) -> None:
+        src = (
+            "#[test]\nfn t() { fn helper(x: u8) { "
+            'if x == 0 { return; } println!("{x}"); } helper(1); }\n'
+        )
+        fns = ko.find_fns(src, "f.rs")
+        self.assertEqual(ko.check_ko7(fns, set(), {"f.rs": src}), [])
+
+    def test_top_level_return_inside_an_if_inside_the_test_body_still_skips(self) -> None:
+        src = "#[test]\nfn t() { let x: Option<u8> = None; let Some(_d) = x else { return; }; }\n"
+        fns = ko.find_fns(src, "f.rs")
+        self.assertEqual(len(ko.check_ko7(fns, set(), {"f.rs": src})), 1)
+
+
+class TestProcessExitSpellings(unittest.TestCase):
+    """Advisory: bare `process::exit(` (no `std::` prefix) is always
+    detected; a bare, unqualified `exit(` is detected only when the file
+    imports it via `use std::process::exit;` (or a `{.., exit, ..}` list
+    import) — an unqualified `exit(` with no import is at least as likely
+    a locally-defined/shadowed name."""
+
+    def test_bare_process_colon_colon_exit_is_detected(self) -> None:
+        src = "#[test]\nfn t() { if cond { process::exit(1); } }\n"
+        fns = ko.find_fns(src, "f.rs")
+        self.assertEqual(len(ko.check_ko7(fns, set(), {"f.rs": src})), 1)
+
+    def test_bare_exit_without_import_is_not_detected(self) -> None:
+        src = "#[test]\nfn t() { if cond { exit(1); } }\n"
+        fns = ko.find_fns(src, "f.rs")
+        self.assertEqual(ko.check_ko7(fns, set(), {"f.rs": src}), [])
+
+    def test_bare_exit_with_import_is_detected(self) -> None:
+        src = (
+            "use std::process::exit;\n"
+            "#[test]\nfn t() { if cond { exit(1); } }\n"
+        )
+        fns = ko.find_fns(src, "f.rs")
+        self.assertEqual(len(ko.check_ko7(fns, set(), {"f.rs": src})), 1)
+
+    def test_bare_exit_with_list_import_is_detected(self) -> None:
+        src = (
+            "use std::process::{self, exit};\n"
+            "#[test]\nfn t() { if cond { exit(1); } }\n"
+        )
+        fns = ko.find_fns(src, "f.rs")
+        self.assertEqual(len(ko.check_ko7(fns, set(), {"f.rs": src})), 1)
+
+
+class TestHelperShapeGuardsAndConjuncts(unittest.TestCase):
+    """Advisory: a match-arm GUARD, or any trailing/leading condition
+    beyond the bare env-read `.is_some()`/`.is_ok()`, is rejected — a
+    conjunct like `&& false` or an inverted `.is_none()` previously still
+    verified even though the panic could never (or never should) fire."""
+
+    def test_always_false_conjunct_is_rejected(self) -> None:
+        src = 'fn h() { if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() && false { panic!("x"); } }'
+        ok, _reason = ko.helper_shape_ok(ko._strip_rust(src))
+        self.assertFalse(ok)
+
+    def test_inverted_is_none_condition_is_rejected(self) -> None:
+        src = 'fn h() { if std::env::var_os("JAMMI_REQUIRE_CUDA").is_none() { panic!("x"); } }'
+        ok, _reason = ko.helper_shape_ok(ko._strip_rust(src))
+        self.assertFalse(ok)
+
+    def test_plain_is_some_if_form_still_verifies(self) -> None:
+        src = 'fn h() { if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() { panic!("x"); } }'
+        ok, _reason = ko.helper_shape_ok(ko._strip_rust(src))
+        self.assertTrue(ok)
+
+    def test_guarded_match_arm_is_rejected(self) -> None:
+        src = (
+            'fn h() { match std::env::var("JAMMI_REQUIRE_CUDA") { '
+            'Ok(v) if v == "impossible" => panic!("x"), _ => {} } }'
+        )
+        ok, _reason = ko.helper_shape_ok(ko._strip_rust(src))
+        self.assertFalse(ok)
+
+    def test_unguarded_match_arm_still_verifies(self) -> None:
+        src = (
+            'fn h() { match std::env::var_os("JAMMI_REQUIRE_CUDA") { '
+            "Some(_) => panic!(\"x\"), None => {} } }"
+        )
+        ok, _reason = ko.helper_shape_ok(ko._strip_rust(src))
+        self.assertTrue(ok)
+
+
+class TestRegistryFailureLineNumbersAndDuplicates(unittest.TestCase):
+    """Advisory: a REGISTRY FAIL names `file:LINE`; an exact duplicate
+    registry line is flagged, not silently deduplicated."""
+
+    def test_shape_fail_message_names_the_line(self) -> None:
+        src = "\n\nfn helper() -> Option<i32> { None }\n"
+        _names, failures = ko.verify_helper_registry([("fixture.rs", "helper")], {"fixture.rs": src})
+        self.assertEqual(len(failures), 1)
+        self.assertIn("fixture.rs:3::helper:", failures[0])
+
+    def test_duplicate_ambiguous_fail_message_names_both_lines(self) -> None:
+        src = "fn helper() {}\nfn helper() {}\n"
+        _names, failures = ko.verify_helper_registry([("fixture.rs", "helper")], {"fixture.rs": src})
+        self.assertEqual(len(failures), 1)
+        self.assertIn("lines 1, 2", failures[0])
+
+    def test_duplicate_registry_line_raises(self) -> None:
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+            f.write("a.rs::helper\na.rs::helper\n")
+            path = Path(f.name)
+        try:
+            with self.assertRaises(ko.OracleError):
+                ko.load_helper_registry(path)
+        finally:
+            path.unlink()
+
+
+class TestRecursiveScanRoots(unittest.TestCase):
+    """Advisory: the two scan roots are walked RECURSIVELY (not widened —
+    `crates/jammi-encoders/src/context/*.rs` is a real subdirectory of the
+    already-in-scope `crates/jammi-encoders/src/` that a flat glob
+    silently missed)."""
+
+    def test_context_subdirectory_is_scanned_on_the_real_tree(self) -> None:
+        texts = ko.scan_files()
+        self.assertIn("crates/jammi-encoders/src/context/attention.rs", texts)
 
 
 if __name__ == "__main__":

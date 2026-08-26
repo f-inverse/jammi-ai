@@ -248,9 +248,9 @@ fn count_bound_violations(
 /// right after its own affirmative per-element pass loop: first prove the
 /// unperturbed comparison is clean (a discriminating proof against an
 /// already-red leg means nothing), then push the reference's LARGEST-
-/// magnitude element's paired actual value to exactly `bound_fn(reference)
-/// + one ULP` beyond `reference` and prove the SAME bound this leg just
-/// used now flags exactly that one element.
+/// magnitude element's paired actual value to exactly one ULP past this
+/// leg's own bound, beyond `reference`, and prove the SAME bound this leg
+/// just used now flags exactly that one element.
 ///
 /// This is NOT "flip the actual value's own least-significant bit and
 /// hope": this leg's clean run may already sit anywhere in

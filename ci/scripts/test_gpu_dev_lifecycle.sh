@@ -130,7 +130,7 @@ cat > "$STUBBIN/curl" <<'STUB'
 payload=""
 for a in "$@"; do
   case "$a" in
-    *podTerminate*|*podFindAndDeployOnDemand*|*'myself{'*)
+    *podTerminate*|*podFindAndDeployOnDemand*|*'myself{'*|*'pod(input:'*)
       payload="$a" ;;
   esac
 done
@@ -147,6 +147,20 @@ case "$payload" in
       cat "${MOCK_ACCOUNT_RESPONSE_1:?MOCK_ACCOUNT_RESPONSE_1 unset}"
     else
       cat "${MOCK_ACCOUNT_RESPONSE_2:-${MOCK_ACCOUNT_RESPONSE_1:?MOCK_ACCOUNT_RESPONSE_1 unset}}"
+    fi
+    ;;
+  # rp_deploy_live's SSH-reachability poll (the `pod(input:{podId:...})`
+  # runtime/ports query). No public port-22 mapping by default — "still
+  # booting, keep polling" — so a caller that wants to exercise the poll's
+  # OWN wall-clock deadline (RP_SSH_WAIT_SECS) never needs to fake a
+  # reachable host; it can just let the deadline run out against this
+  # default. A caller that DOES want a specific reply (a reachable mapping,
+  # a malformed body) sets MOCK_PORT_RESPONSE to a fixture file.
+  *'pod(input:'*)
+    if [ -n "${MOCK_PORT_RESPONSE:-}" ] && [ -f "$MOCK_PORT_RESPONSE" ]; then
+      cat "$MOCK_PORT_RESPONSE"
+    else
+      echo '{"data":{"pod":{"runtime":{"ports":[]}}}}'
     fi
     ;;
   *) echo '{}' ;;
@@ -1082,6 +1096,81 @@ JSON
     record PASS "group4b-reap-one-does-not-sweep-the-20m-pod"
   fi
 )
+
+# ═════════════════════════════════════════════════════════════════════════
+# Group 5 — RP_SSHO must pin every connection to the tooling's own key via
+# IdentitiesOnly=yes (2026-08-26 incident, ledger row 328): without it, an
+# ssh-agent holding many identities offers all of them before RP_SSH_KEY,
+# and the reachability probe in rp_deploy_live can exhaust the pod's own
+# MaxAuthTries before RP_SSH_KEY is ever tried — reading a perfectly
+# reachable pod as unreachable and terminating it. `ssh -G` resolves the
+# EFFECTIVE configuration for a candidate host with zero network traffic (it
+# never actually connects), so this is a hermetic, direct assertion on the
+# real option array rp_deploy_live and every gpu-dev.sh ssh/rsync call
+# share — not a grep on the source text, which could pass with the option
+# spelled right but never actually reaching ssh's own argv.
+# ═════════════════════════════════════════════════════════════════════════
+(
+  export RUNPOD_API_KEY="dummy-key"
+  unset RP_SESSION
+  # shellcheck source=ci/scripts/runpod_lib.sh
+  source "$DIR/runpod_lib.sh"
+  rp_init
+  g5_out="$(ssh -G "${RP_SSHO[@]}" placeholder-host 2>&1)"
+  if printf '%s\n' "$g5_out" | grep -qi '^identitiesonly yes$'; then
+    record PASS "group5-RP_SSHO-identitiesonly-yes"
+  else
+    record FAIL "group5-RP_SSHO-identitiesonly-yes (ssh -G output: $g5_out)"
+  fi
+)
+
+# ═════════════════════════════════════════════════════════════════════════
+# Group 6 — CLI-level: rp_deploy_live's SSH-reachability poll honours
+# RP_SSH_WAIT_SECS as a real WALL-CLOCK deadline, not the old fixed
+# 24-iteration/10s-sleep budget (a hard-coded ~4 minutes no caller could
+# raise or shrink). The port query is mocked to NEVER return a public
+# port-22 mapping (the curl stub's own default for `pod(input:...)` — see
+# above), so the loop runs out its own deadline rather than taking the
+# reachable-pod branch; a 2s deadline keeps this test fast while still
+# proving the deadline is real wall-clock time — a fixed-iteration budget
+# would run ~4 minutes regardless of what RP_SSH_WAIT_SECS says.
+# ═════════════════════════════════════════════════════════════════════════
+echo '{"data":{"podFindAndDeployOnDemand":{"id":"pod-wait-secs-test"}}}' > "$SANDBOX/deploy-wait-secs.json"
+export MOCK_DEPLOY_RESPONSE="$SANDBOX/deploy-wait-secs.json"
+reset_log
+g6_start="$SECONDS"
+RP_SSH_WAIT_SECS=2 bash "$DIR/gpu-dev.sh" shell a100 --ref abcdef1234567890 \
+  >"$SANDBOX/out-wait-secs.log" 2>&1 &
+G6_PID=$!
+# Bounded wait: this run needs no signal — it naturally exits once the
+# poll's own 2s deadline expires. Never an indefinite `wait`: a regression
+# that reintroduced the old fixed-iteration budget fails this assertion
+# instead of wedging the whole suite for minutes.
+g6_deadline=$((SECONDS + 20))
+while kill -0 "$G6_PID" 2>/dev/null && [ "$SECONDS" -lt "$g6_deadline" ]; do sleep 0.2; done
+if kill -0 "$G6_PID" 2>/dev/null; then
+  kill -KILL "$G6_PID" 2>/dev/null
+  wait "$G6_PID" 2>/dev/null
+  bad "finding(RP_SSH_WAIT_SECS): 'shell' with RP_SSH_WAIT_SECS=2 did not exit within 20s (regression to a fixed-iteration budget?); output: $(cat "$SANDBOX/out-wait-secs.log")"
+else
+  wait "$G6_PID" 2>/dev/null
+  g6_rc=$?
+  g6_elapsed=$((SECONDS - g6_start))
+  # >=2 proves the deadline was actually honoured (not skipped or zeroed);
+  # <15 proves it is bounded by RP_SSH_WAIT_SECS, not the old ~240s budget —
+  # a wide ceiling since this also carries process start/CLI-parse overhead.
+  if [ "$g6_elapsed" -ge 2 ] && [ "$g6_elapsed" -lt 15 ]; then
+    ok "finding(RP_SSH_WAIT_SECS): the reachability poll's wall-clock deadline is honoured (${g6_elapsed}s for a 2s budget)"
+  else
+    bad "finding(RP_SSH_WAIT_SECS): expected roughly 2-15s elapsed for RP_SSH_WAIT_SECS=2 (got ${g6_elapsed}s, rc=${g6_rc}); output: $(cat "$SANDBOX/out-wait-secs.log")"
+  fi
+  [ "$g6_rc" -eq 75 ] && ok "finding(RP_SSH_WAIT_SECS): exhausting the deadline with no reachable candidate returns 75 (neutral skip)" \
+    || bad "finding(RP_SSH_WAIT_SECS): expected exit 75 once the deadline is exhausted (got $g6_rc)"
+  grep -q "never became reachable within 2s" "$SANDBOX/out-wait-secs.log" \
+    && ok "finding(RP_SSH_WAIT_SECS): the refusal names the actual budget (2s), not a hard-coded '4m'" \
+    || bad "finding(RP_SSH_WAIT_SECS): expected 'never became reachable within 2s' in output ($(cat "$SANDBOX/out-wait-secs.log"))"
+fi
+unset MOCK_DEPLOY_RESPONSE
 
 # ── tally ────────────────────────────────────────────────────────────────
 while IFS=: read -r status name; do

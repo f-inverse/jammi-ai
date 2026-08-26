@@ -57,6 +57,11 @@
 #   RP_VOLUME_GB  attached volume size in GB (default 0). The pod is deliberately
 #                 disposable (see "state" above) — leave this 0 unless a caller
 #                 has a specific reason to attach one.
+#   RP_SSH_WAIT_SECS  wall-clock deadline on rp_deploy_live's SSH-reachability
+#                 poll, in seconds (default 600). A cold host still pulling the
+#                 multi-GB CUDA image can take minutes before sshd is even up;
+#                 raise this rather than losing a healthy pod to the poll's own
+#                 timeout.
 # Sets globals: RP_POD_ID, RP_HOST, RP_PORT, RP_REF. Installs an EXIT trap for
 # teardown.
 
@@ -94,6 +99,32 @@ esac
 case "$RP_VOLUME_GB" in
   ''|*[!0-9]*) echo "::error::RP_VOLUME_GB must be a non-negative integer (got '${RP_VOLUME_GB}')" >&2; exit 2 ;;
 esac
+# Wall-clock deadline for rp_deploy_live's SSH-reachability poll. Default 600s:
+# a cold image pull alone has measured ~2 minutes, and a healthy candidate has
+# needed over 4 minutes end to end (2026-08-26) — the previous fixed
+# 24-iteration/10s-sleep budget (4m total) could terminate a pod that was
+# still becoming reachable, not one that never would.
+#
+# Validated here, not at use, same reasoning as RP_TTL_HOURS above: it drives
+# arithmetic (the deadline computed in rp_deploy_live) with no -e set
+# anywhere in this file, so a non-integer would otherwise fail silently
+# rather than loudly at the one place its value is known. The digit-only
+# pattern match alone is not sufficient — an unquoted leading-zero operand
+# (`08`) is read by bash arithmetic in its DEFAULT (octal) base, and
+# `08`/`09` are not even legal octal digits, so `$(( ))` on a raw `08` is a
+# fatal "value too great for base" error, not a misread — the read below is
+# forced to base 10 with an explicit `10#` prefix instead of trusting the
+# shell's own default base. The length check runs BEFORE that arithmetic, on
+# the string's length alone: 9 digits is generous headroom above 600 while
+# ruling out a decimal string long enough to overflow bash's signed 64-bit
+# arithmetic in the `SECONDS + RP_SSH_WAIT_SECS` deadline computation.
+RP_SSH_WAIT_SECS="${RP_SSH_WAIT_SECS:-600}"
+case "$RP_SSH_WAIT_SECS" in
+  ''|*[!0-9]*) echo "::error::RP_SSH_WAIT_SECS must be a positive integer (got '${RP_SSH_WAIT_SECS}')" >&2; exit 2 ;;
+esac
+[ "${#RP_SSH_WAIT_SECS}" -le 9 ] || { echo "::error::RP_SSH_WAIT_SECS has too many digits (got '${RP_SSH_WAIT_SECS}')" >&2; exit 2; }
+RP_SSH_WAIT_SECS=$((10#$RP_SSH_WAIT_SECS))
+[ "$RP_SSH_WAIT_SECS" -gt 0 ] || { echo "::error::RP_SSH_WAIT_SECS must be > 0" >&2; exit 2; }
 RP_SESSION_ROOT="${RP_SESSION_ROOT:-${HOME}/.config/runpod/sessions}"
 RP_S3_CONF="${RP_S3_CONF:-${HOME}/.config/runpod/s3}"
 # An ssh config this tooling owns outright, so ~/.ssh/config is never rewritten.
@@ -396,7 +427,16 @@ rp_init() {
   _rp_work_mkdir
   [ -f "$RP_SSH_KEY" ] || ssh-keygen -t ed25519 -N '' -f "$RP_SSH_KEY" -q
   RP_PUBKEY="$(cat "${RP_SSH_KEY}.pub")"
-  RP_SSHO=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -i "$RP_SSH_KEY")
+  # IdentitiesOnly=yes pins every connection to exactly $RP_SSH_KEY. Without
+  # it, ssh offers every identity ssh-agent already holds BEFORE this key —
+  # on macOS the agent auto-adds each session key it uses, so once it holds
+  # more than a handful the reachability probe below can exhaust the
+  # server's MaxAuthTries before $RP_SSH_KEY is ever tried, reading a
+  # perfectly healthy, reachable pod as unreachable and terminating it.
+  # Confirmed 2026-08-26 on a kept candidate: sshd was up and
+  # `-o IdentitiesOnly=yes` connected cleanly while the agent held 12
+  # identities (ledger row 328).
+  RP_SSHO=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o IdentitiesOnly=yes -i "$RP_SSH_KEY")
 }
 
 # Create the work dir on first write. Split out so read-only commands against a
@@ -654,9 +694,17 @@ else:
     # being unreachable/under-floor: any pod rented after it is equally this
     # invocation's own.
     RP_POD_CREATED=1
-    echo "  deployed ${RP_POD_ID} on ${cloud} / ${gpu}; waiting for SSH (≤4m)..."
+    echo "  deployed ${RP_POD_ID} on ${cloud} / ${gpu}; waiting for SSH (≤${RP_SSH_WAIT_SECS}s)..."
     RP_HOST=""; RP_PORT=""
-    for _ in $(seq 1 24); do
+    # A wall-clock deadline, not a fixed iteration count: the old
+    # 24-iteration/10s-sleep loop was a HARD-CODED 4-minute budget no caller
+    # could raise, and a cold host still pulling the multi-GB CUDA image can
+    # take longer than that before sshd is even up (see RP_SSH_WAIT_SECS's own
+    # doc at the top of this file). `SECONDS` is bash's own
+    # elapsed-since-this-shell-started counter — no subprocess per check, unlike
+    # `date +%s`.
+    local _rp_deploy_deadline=$((SECONDS + RP_SSH_WAIT_SECS)) _rp_deploy_remaining
+    while [ "$SECONDS" -lt "$_rp_deploy_deadline" ]; do
       R="$(rp_gql "{\"query\":\"query{ pod(input:{podId:\\\"${RP_POD_ID}\\\"}){ runtime{ ports{ ip publicPort privatePort isIpPublic type } } } }\"}")"
       read -r RP_HOST RP_PORT < <(printf '%s' "$R" | python3 -c 'import sys,json
 p=(json.load(sys.stdin).get("data",{}).get("pod") or {}).get("runtime") or {}
@@ -679,10 +727,17 @@ p=(json.load(sys.stdin).get("data",{}).get("pod") or {}).get("runtime") or {}
         rp_terminate "$RP_POD_ID"
         RP_POD_ID=""; break
       fi
-      RP_HOST=""; sleep 10
+      RP_HOST=""
+      # Sleep only up to what is left of the budget, never past it — a fixed
+      # 10s sleep against a short RP_SSH_WAIT_SECS (a test's 2s deadline, or a
+      # caller's own tight override) would otherwise overrun the deadline by
+      # up to a full sleep cycle on every iteration.
+      _rp_deploy_remaining=$((_rp_deploy_deadline - SECONDS))
+      [ "$_rp_deploy_remaining" -gt 0 ] || break
+      sleep "$(( _rp_deploy_remaining < 10 ? _rp_deploy_remaining : 10 ))"
     done
     if [ -n "$RP_POD_ID" ]; then
-      echo "  pod ${RP_POD_ID} never became reachable; terminating and trying next candidate"
+      echo "  pod ${RP_POD_ID} never became reachable within ${RP_SSH_WAIT_SECS}s; terminating and trying next candidate"
       rp_terminate "$RP_POD_ID"
       RP_POD_ID=""
     fi

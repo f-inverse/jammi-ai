@@ -32,11 +32,13 @@
 use candle_core::{DType, Device, Error, Layout, Tensor, Var, D};
 use half::bf16;
 use jammi_kernels::ops::{
-    apply1, apply2, apply3, bwd_gradient_gemm_layouts, cast_add_bf16_into,
-    cast_scale_bf16_f32_into, AttentionBlockFused, Axpy, BwdGemmLayoutsParams, CastAddBf16,
-    CastScaleBf16F32, DropoutFused, DropoutKey, FullyMaskedPolicy, GegluFused, GeluVariant,
-    LayerNormFused, LowRankResidualLinear, PhiloxKatProbe, RopeFused, ScaledCastAdd,
-    SoftmaxLastDimFused, ATTENTION_BLOCK_WINDOW_MASKED_VALUE,
+    adamw_step_fused_t, apply1, apply2, apply3, apply_inplace2, bwd_gradient_gemm_layouts,
+    cast_add_bf16_into, cast_scale_bf16_f32_into, AdamMomentUpdate,
+    AdamMomentUpdateFmaContractedRedControl, AdamWParams, AttentionBlockFused, Axpy,
+    BwdGemmLayoutsParams, CastAddBf16, CastScaleBf16F32, DropoutFused, DropoutKey,
+    FullyMaskedPolicy, GegluFused, GeluVariant, LayerNormFused, LowRankResidualLinear,
+    PhiloxKatProbe, RopeFused, ScaledCastAdd, SoftmaxLastDimFused,
+    ATTENTION_BLOCK_WINDOW_MASKED_VALUE,
 };
 
 fn axpy(alpha: f64, x: &Tensor, y: &Tensor) -> candle_core::Result<Tensor> {
@@ -7139,5 +7141,529 @@ fn isolated_kernel_timing_cast_boundary_wave1() {
         8.0,
         "kernel-only (preallocated output)",
         &stats_f_kernel_only,
+    );
+}
+// ---------------------------------------------------------------------
+// adamw_step_fused_t — the multi-tensor-AdamW lever's bit-identity leg.
+//
+// FIX ROUND (adversarial audit `.jammi/ledger/perf-s2-20260825.jsonl`,
+// "AdamW fused-step kernel @0498f8b adversarial audit"): the previous
+// version of this section compared fused-CPU vs fused-CUDA within an
+// absolute `F32_TOL`, on ZERO prior moments only, and never checked the
+// CUDA arm against candle's OWN eager CUDA chain at all — so nvcc silently
+// FMA-contracting `adamw_moment_update_f32`'s `beta*m[i] + one_minus_beta*
+// gv` into a single-rounding hardware FMA (measured: 5145/16384 `m`
+// elements differed from the eager CUDA chain at t=3, nonzero prior
+// moments) passed every test in this file. Per `cuda/adamw_step.cu`'s fix
+// (explicit-rounding `__fmul_rn`/`__fadd_rn`/`__fsub_rn`/`__fdiv_rn`
+// intrinsics, matching candle's own per-site `affine(x, mul, 0.0)`
+// composition bit-for-bit), this is now a BIT-IDENTITY oracle on THREE
+// legs, all via `to_bits()` equality, finiteness-affirmative first (guide
+// §3.7/§3.8 — no absolute ULP floor):
+//   1. fused-CUDA  vs  eager-CUDA  (the real oracle: candle's own eager
+//      chain run ON THE CUDA DEVICE, via [`eager_step`] below — proves the
+//      fused kernel matches the arm it REPLACES, not just itself).
+//   2. fused-CPU   vs  fused-CUDA  (cross-architecture determinism: both
+//      arms are correctly-rounded IEEE-754 binary32 — `sqrtf`/`f32::sqrt`
+//      are both required-correctly-rounded, `__fmul_rn`/`__fadd_rn`/etc.
+//      are explicit round-to-nearest, and sm_80's default (non-fast-math)
+//      mode does not flush denormals — so the SAME operation sequence on
+//      both arms is expected to agree exactly, not just closely).
+//   3. fused-CPU   vs  eager-CPU   — already `ops::adamw_step::tests`' job
+//      (CPU-hermetic, runs on every `cargo test -p jammi-kernels`); not
+//      re-checked here, but (1)+(2) together imply it transitively for
+//      every fixture this file also exercises.
+// NONZERO prior moments (`m0`/`v0` fixtures below, not `Tensor::zeros`),
+// `t` swept 1..=5 (chained — each step's `m`/`v` feed the next, matching
+// how a real optimizer runs), production LoRA A/B shapes, and inputs
+// including exact `-0.0`, a subnormal, and an exact `0.0` (see
+// [`edge_fixture`]).
+#[allow(clippy::too_many_arguments)]
+fn eager_step(
+    theta: &Tensor,
+    m: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta1: f64,
+    beta2: f64,
+    lr: f64,
+    weight_decay: f64,
+    eps: f64,
+    t: i32,
+) -> (Tensor, Tensor, Tensor) {
+    let lr_lambda = lr * weight_decay;
+    let scale_m = 1f64 / (1f64 - beta1.powi(t));
+    let scale_v = 1f64 / (1f64 - beta2.powi(t));
+    let next_m = ((m * beta1).unwrap() + (g * (1.0 - beta1)).unwrap()).unwrap();
+    let next_v = ((v * beta2).unwrap() + (g.sqr().unwrap() * (1.0 - beta2)).unwrap()).unwrap();
+    let m_hat = (&next_m * scale_m).unwrap();
+    let v_hat = (&next_v * scale_v).unwrap();
+    let next_theta = (theta * (1f64 - lr_lambda)).unwrap();
+    let adjusted_grad = (m_hat / (v_hat.sqrt().unwrap() + eps).unwrap()).unwrap();
+    let next_theta = (next_theta - (adjusted_grad * lr).unwrap()).unwrap();
+    (next_theta, next_m, next_v)
+}
+
+/// A fixture including the specific values a `+ 0.0` laundering bug or a
+/// naive strides walk would mishandle: index 0 is exact `-0.0`, index 1 is
+/// the smallest positive `f32` subnormal (`f32::from_bits(1)`), index 2 is
+/// an exact `0.0` — the rest is [`fixture`]'s normal deterministic range.
+/// `n` must be `>= 3`.
+fn edge_fixture(n: usize, seed: f32) -> Vec<f32> {
+    let mut v = fixture(n, seed);
+    v[0] = -0.0f32;
+    v[1] = f32::from_bits(1); // smallest positive subnormal.
+    v[2] = 0.0f32;
+    v
+}
+
+fn assert_all_finite(v: &[f32], label: &str) {
+    let non_finite = v.iter().filter(|x| !x.is_finite()).count();
+    assert_eq!(non_finite, 0, "{label}: {non_finite} non-finite elements");
+}
+
+/// `to_bits()` equality, elementwise, reporting the COUNT of mismatches
+/// (never an absolute ULP floor — guide §3.8) and the first mismatch's
+/// values for a useful failure message.
+fn bit_diff_count(a: &[f32], b: &[f32]) -> usize {
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "length mismatch: {} vs {}",
+        a.len(),
+        b.len()
+    );
+    a.iter()
+        .zip(b)
+        .filter(|(x, y)| x.to_bits() != y.to_bits())
+        .count()
+}
+
+fn assert_bit_identical_slices(a: &[f32], b: &[f32], label: &str) {
+    let n = bit_diff_count(a, b);
+    if n > 0 {
+        let (i, (x, y)) = a
+            .iter()
+            .zip(b)
+            .enumerate()
+            .find(|(_, (x, y))| x.to_bits() != y.to_bits())
+            .unwrap();
+        panic!(
+            "{label}: {n}/{} elements differ (first at [{i}]: {x} ({:#010x}) vs {y} ({:#010x}))",
+            a.len(),
+            x.to_bits(),
+            y.to_bits()
+        );
+    }
+}
+
+fn to_cpu_vec(t: &Tensor) -> Vec<f32> {
+    t.flatten_all()
+        .unwrap()
+        .to_device(&Device::Cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap()
+}
+
+/// The main bit-identity harness: runs `num_steps` (`t = 1..=num_steps`)
+/// on THREE parallel tracks from the SAME nonzero `(theta0, m0, v0, grad)`
+/// fixtures — fused-CPU, fused-CUDA, and eager-CUDA (candle's own chain run
+/// on the CUDA device) — chaining each track's own `theta`/`m`/`v` forward
+/// step to step, and asserts fused-CUDA == eager-CUDA and fused-CPU ==
+/// fused-CUDA, bit-for-bit, on `theta`/`m`/`v`, EVERY step.
+#[allow(clippy::too_many_arguments)]
+fn assert_adamw_bit_identical(
+    cuda: &Device,
+    shape: (usize, usize),
+    theta0_v: &[f32],
+    m0_v: &[f32],
+    v0_v: &[f32],
+    grad_seed: f32,
+    params: AdamWParams,
+    num_steps: usize,
+) {
+    let cpu = Device::Cpu;
+    let theta_fused_cpu = Tensor::from_slice(theta0_v, shape, &cpu).unwrap();
+    let m_fused_cpu = Tensor::from_slice(m0_v, shape, &cpu).unwrap();
+    let v_fused_cpu = Tensor::from_slice(v0_v, shape, &cpu).unwrap();
+
+    let theta_fused_cuda = Tensor::from_slice(theta0_v, shape, cuda).unwrap();
+    let m_fused_cuda = Tensor::from_slice(m0_v, shape, cuda).unwrap();
+    let v_fused_cuda = Tensor::from_slice(v0_v, shape, cuda).unwrap();
+
+    let mut theta_eager_cuda = Tensor::from_slice(theta0_v, shape, cuda).unwrap();
+    let mut m_eager_cuda = Tensor::from_slice(m0_v, shape, cuda).unwrap();
+    let mut v_eager_cuda = Tensor::from_slice(v0_v, shape, cuda).unwrap();
+
+    for step in 0..num_steps {
+        let t = (step + 1) as i32;
+        let grad_v = fixture(shape.0 * shape.1, grad_seed + step as f32);
+        let g_cpu = Tensor::from_slice(&grad_v, shape, &cpu).unwrap();
+        let g_cuda = Tensor::from_slice(&grad_v, shape, cuda).unwrap();
+
+        adamw_step_fused_t(
+            &theta_fused_cpu,
+            &m_fused_cpu,
+            &v_fused_cpu,
+            &g_cpu,
+            t as usize,
+            params,
+        )
+        .unwrap();
+        adamw_step_fused_t(
+            &theta_fused_cuda,
+            &m_fused_cuda,
+            &v_fused_cuda,
+            &g_cuda,
+            t as usize,
+            params,
+        )
+        .unwrap();
+        let (next_theta_eager, next_m_eager, next_v_eager) = eager_step(
+            &theta_eager_cuda,
+            &m_eager_cuda,
+            &v_eager_cuda,
+            &g_cuda,
+            params.beta1,
+            params.beta2,
+            params.lr,
+            params.weight_decay,
+            params.eps,
+            t,
+        );
+        theta_eager_cuda = next_theta_eager;
+        m_eager_cuda = next_m_eager;
+        v_eager_cuda = next_v_eager;
+
+        let theta_fused_cpu_v = to_cpu_vec(&theta_fused_cpu);
+        let theta_fused_cuda_v = to_cpu_vec(&theta_fused_cuda);
+        let theta_eager_cuda_v = to_cpu_vec(&theta_eager_cuda);
+        let m_fused_cpu_v = to_cpu_vec(&m_fused_cpu);
+        let m_fused_cuda_v = to_cpu_vec(&m_fused_cuda);
+        let m_eager_cuda_v = to_cpu_vec(&m_eager_cuda);
+        let v_fused_cpu_v = to_cpu_vec(&v_fused_cpu);
+        let v_fused_cuda_v = to_cpu_vec(&v_fused_cuda);
+        let v_eager_cuda_v = to_cpu_vec(&v_eager_cuda);
+
+        // Finiteness affirmative FIRST (guide §3.7): a NaN must fail, not
+        // read as agreement (two identical NaN bit patterns would pass a
+        // bare `to_bits()` equality).
+        for (v, label) in [
+            (&theta_fused_cpu_v, "theta_fused_cpu"),
+            (&theta_fused_cuda_v, "theta_fused_cuda"),
+            (&theta_eager_cuda_v, "theta_eager_cuda"),
+            (&m_fused_cpu_v, "m_fused_cpu"),
+            (&m_fused_cuda_v, "m_fused_cuda"),
+            (&m_eager_cuda_v, "m_eager_cuda"),
+            (&v_fused_cpu_v, "v_fused_cpu"),
+            (&v_fused_cuda_v, "v_fused_cuda"),
+            (&v_eager_cuda_v, "v_eager_cuda"),
+        ] {
+            assert_all_finite(v, &format!("{label} (shape={shape:?}, t={t})"));
+        }
+
+        // (1) fused-CUDA vs eager-CUDA — the real oracle.
+        assert_bit_identical_slices(
+            &theta_fused_cuda_v,
+            &theta_eager_cuda_v,
+            &format!("theta: fused-CUDA vs eager-CUDA (shape={shape:?}, t={t})"),
+        );
+        assert_bit_identical_slices(
+            &m_fused_cuda_v,
+            &m_eager_cuda_v,
+            &format!("m: fused-CUDA vs eager-CUDA (shape={shape:?}, t={t})"),
+        );
+        assert_bit_identical_slices(
+            &v_fused_cuda_v,
+            &v_eager_cuda_v,
+            &format!("v: fused-CUDA vs eager-CUDA (shape={shape:?}, t={t})"),
+        );
+
+        // (2) fused-CPU vs fused-CUDA — cross-architecture determinism.
+        assert_bit_identical_slices(
+            &theta_fused_cpu_v,
+            &theta_fused_cuda_v,
+            &format!("theta: fused-CPU vs fused-CUDA (shape={shape:?}, t={t})"),
+        );
+        assert_bit_identical_slices(
+            &m_fused_cpu_v,
+            &m_fused_cuda_v,
+            &format!("m: fused-CPU vs fused-CUDA (shape={shape:?}, t={t})"),
+        );
+        assert_bit_identical_slices(
+            &v_fused_cpu_v,
+            &v_fused_cuda_v,
+            &format!("v: fused-CPU vs fused-CUDA (shape={shape:?}, t={t})"),
+        );
+    }
+}
+
+fn default_adamw_params() -> AdamWParams {
+    AdamWParams {
+        beta1: 0.9,
+        beta2: 0.999,
+        lr: 1e-3,
+        weight_decay: 0.01,
+        eps: 1e-8,
+    }
+}
+
+/// Production LoRA-A shape (`rank=16, in_features=1024`) — ModernBERT-large
+/// `Wqkv`/`Wo`/`Wi`'s shared LoRA-A shape. NONZERO prior moments, `t` swept
+/// `1..=5`, edge-value theta (`-0.0`, a subnormal, an exact `0.0`).
+#[test]
+fn adamw_step_cpu_cuda_bit_identical_lora_a_shape() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let (rows, cols) = (16usize, 1024usize);
+    let n = rows * cols;
+    assert_adamw_bit_identical(
+        &cuda,
+        (rows, cols),
+        &edge_fixture(n, 0.1),
+        &fixture(n, 0.55),                                             // nonzero m0
+        &fixture(n, 0.77).iter().map(|x| x.abs()).collect::<Vec<_>>(), // v0 >= 0
+        5.7,
+        default_adamw_params(),
+        5,
+    );
+}
+
+/// Production LoRA-B shape for `Wqkv` (`out_features=3072, rank=16`) —
+/// fused QKV projection.
+#[test]
+fn adamw_step_cpu_cuda_bit_identical_lora_b_wqkv_shape() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let (rows, cols) = (3072usize, 16usize);
+    let n = rows * cols;
+    assert_adamw_bit_identical(
+        &cuda,
+        (rows, cols),
+        &edge_fixture(n, 1.3),
+        &fixture(n, 0.21),
+        &fixture(n, 0.44).iter().map(|x| x.abs()).collect::<Vec<_>>(),
+        8.1,
+        default_adamw_params(),
+        5,
+    );
+}
+
+/// Production LoRA-B shape for `Wo` (`out_features=1024, rank=16`).
+#[test]
+fn adamw_step_cpu_cuda_bit_identical_lora_b_wo_shape() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let (rows, cols) = (1024usize, 16usize);
+    let n = rows * cols;
+    assert_adamw_bit_identical(
+        &cuda,
+        (rows, cols),
+        &edge_fixture(n, 2.2),
+        &fixture(n, 0.33),
+        &fixture(n, 0.66).iter().map(|x| x.abs()).collect::<Vec<_>>(),
+        6.4,
+        default_adamw_params(),
+        5,
+    );
+}
+
+/// Production LoRA-B shape for `Wi` (`out_features=5248, rank=16`) — the
+/// GeGLU-doubled FFN-up projection.
+#[test]
+fn adamw_step_cpu_cuda_bit_identical_lora_b_wi_shape() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let (rows, cols) = (5248usize, 16usize);
+    let n = rows * cols;
+    assert_adamw_bit_identical(
+        &cuda,
+        (rows, cols),
+        &edge_fixture(n, 3.9),
+        &fixture(n, 0.12),
+        &fixture(n, 0.88).iter().map(|x| x.abs()).collect::<Vec<_>>(),
+        4.4,
+        default_adamw_params(),
+        5,
+    );
+}
+
+/// A changing `lr` mid-run and nonzero `weight_decay` — the bias-correction
+/// scalars (`scale_m`/`scale_v`) change with `t`, and every step's
+/// three-way bit-identity is checked independently (via
+/// [`assert_adamw_bit_identical`]'s own per-step assertions), not just the
+/// final one, so a divergence that only shows up after several steps
+/// cannot hide behind a single-step check.
+#[test]
+fn adamw_step_changing_lr_over_five_steps_bit_identical() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let (rows, cols) = (16usize, 1024usize);
+    let n = rows * cols;
+    // `assert_adamw_bit_identical` re-derives its own grad fixture per
+    // step; a changing lr is exercised by running the 5-step sweep once
+    // per lr value, each starting fresh from the same nonzero moments —
+    // still covers t=1..=5 with a nonzero weight_decay, at production
+    // shape and amplitude.
+    for &lr in &[1e-3, 5e-4, 2e-3] {
+        assert_adamw_bit_identical(
+            &cuda,
+            (rows, cols),
+            &edge_fixture(n, 0.4),
+            &fixture(n, 0.15),
+            &fixture(n, 0.29).iter().map(|x| x.abs()).collect::<Vec<_>>(),
+            2.0,
+            AdamWParams {
+                beta1: 0.9,
+                beta2: 0.999,
+                lr,
+                weight_decay: 0.05,
+                eps: 1e-8,
+            },
+            5,
+        );
+    }
+}
+
+/// `weight_decay == 0.0` — the decoupled-decay term must not corrupt the
+/// pure-Adam update path on either device.
+#[test]
+fn adamw_step_zero_weight_decay_bit_identical() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let (rows, cols) = (16usize, 1024usize);
+    let n = rows * cols;
+    assert_adamw_bit_identical(
+        &cuda,
+        (rows, cols),
+        &edge_fixture(n, 0.9),
+        &fixture(n, 0.61),
+        &fixture(n, 0.82).iter().map(|x| x.abs()).collect::<Vec<_>>(),
+        7.3,
+        AdamWParams {
+            beta1: 0.9,
+            beta2: 0.999,
+            lr: 1e-3,
+            weight_decay: 0.0,
+            eps: 1e-8,
+        },
+        5,
+    );
+}
+
+/// Boundary/degenerate oracle (family D) on CUDA specifically: an empty
+/// tensor must not build the illegal `(0,1,1)` launch grid
+/// `LaunchConfig::for_num_elems(0)` would yield — `moment_update_cuda_fwd`/
+/// `theta_update_cuda_fwd` both return early before ever launching.
+#[test]
+fn adamw_step_empty_tensor_on_cuda_is_a_no_op_not_a_crash() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let theta = Tensor::from_slice(&[] as &[f32], (0,), &cuda).unwrap();
+    let m = Tensor::zeros((0,), DType::F32, &cuda).unwrap();
+    let v = Tensor::zeros((0,), DType::F32, &cuda).unwrap();
+    let g = Tensor::from_slice(&[] as &[f32], (0,), &cuda).unwrap();
+    adamw_step_fused_t(&theta, &m, &v, &g, 1, default_adamw_params()).unwrap();
+    assert!(theta
+        .to_device(&Device::Cpu)
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap()
+        .is_empty());
+}
+
+/// `validate_step_domain`'s CUDA-arm contiguity check (`Error::
+/// RequiresContiguous`) is only reachable with a real `Device::Cuda` — a
+/// CPU-only `cargo mutants` run can never enter the `theta.device().
+/// is_cuda()` branch at all, so this is the ONLY lane that can exercise
+/// it. A non-contiguous `first_moment` (a transposed view) must be
+/// refused before any kernel launches, not silently misread.
+#[test]
+fn non_contiguous_first_moment_is_refused_on_cuda() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let theta = Tensor::zeros((2, 3), DType::F32, &cuda).unwrap();
+    let m_base = Tensor::zeros((3, 2), DType::F32, &cuda).unwrap();
+    let m = m_base.t().unwrap();
+    assert!(!m.is_contiguous());
+    let v = Tensor::zeros((2, 3), DType::F32, &cuda).unwrap();
+    let g = Tensor::from_slice(&[0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6], (2, 3), &cuda).unwrap();
+    let err = adamw_step_fused_t(&theta, &m, &v, &g, 1, default_adamw_params())
+        .expect_err("a non-contiguous first_moment must be refused on CUDA");
+    assert!(
+        matches!(err, candle_core::Error::RequiresContiguous { .. }),
+        "got {err:?}"
+    );
+}
+
+/// RED CONTROL (family F, CUDA leg — the CPU-side twin lives in
+/// `ops::adamw_step::tests::negative_control_...`): the deliberately WRONG,
+/// FMA-contracted [`AdamMomentUpdateFmaContractedRedControl`] kernel MUST
+/// diverge from candle's own eager CUDA chain on nonzero prior moments,
+/// proving this file's bit-identity harness has the POWER to catch the
+/// exact defect class 0498f8b shipped (nvcc silently contracting
+/// `adamw_moment_update_f32`'s `beta*m[i] + one_minus_beta*gv`). Runs the
+/// REAL kernel too, on a separate `m`, so the SAME nonzero-moment fixture
+/// proves both: the real kernel agrees with eager (0 mismatches) and the
+/// red-control kernel does not (>0 mismatches) — a same-fixture, both-
+/// directions control, not two different setups that could each pass for
+/// unrelated reasons.
+#[test]
+fn adamw_step_fma_contracted_red_control_diverges_from_eager_cuda() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let (rows, cols) = (16usize, 1024usize);
+    let n = rows * cols;
+    let m0_v = fixture(n, 0.55);
+    let g_v = fixture(n, 5.7);
+    let beta1 = 0.9;
+
+    let m_real = Tensor::from_slice(&m0_v, (rows, cols), &cuda).unwrap();
+    let m_wrong = Tensor::from_slice(&m0_v, (rows, cols), &cuda).unwrap();
+    let m_eager = Tensor::from_slice(&m0_v, (rows, cols), &cuda).unwrap();
+    let g = Tensor::from_slice(&g_v, (rows, cols), &cuda).unwrap();
+
+    apply_inplace2(&m_real, &g, AdamMomentUpdate::new(beta1, false)).unwrap();
+    apply_inplace2(
+        &m_wrong,
+        &g,
+        AdamMomentUpdateFmaContractedRedControl::new(beta1, false),
+    )
+    .unwrap();
+    let m_eager_next = ((&m_eager * beta1).unwrap() + (&g * (1.0 - beta1)).unwrap()).unwrap();
+
+    let real_v = to_cpu_vec(&m_real);
+    let wrong_v = to_cpu_vec(&m_wrong);
+    let eager_v = to_cpu_vec(&m_eager_next);
+    assert_all_finite(&real_v, "m_real");
+    assert_all_finite(&wrong_v, "m_wrong");
+    assert_all_finite(&eager_v, "m_eager");
+
+    // The real kernel: 0 mismatches against eager CUDA.
+    assert_bit_identical_slices(&real_v, &eager_v, "real AdamMomentUpdate vs eager CUDA");
+
+    // The RED control: MUST show mismatches — this is what proves the
+    // oracle above has power (it is not vacuously green because nothing
+    // could ever diverge).
+    let red_control_mismatches = bit_diff_count(&wrong_v, &eager_v);
+    assert!(
+        red_control_mismatches > 0,
+        "AdamMomentUpdateFmaContractedRedControl must diverge from eager CUDA on nonzero \
+         prior moments (production shape {rows}x{cols}) — got 0 mismatches, meaning the \
+         bit-identity harness above would not have caught this defect class"
+    );
+    eprintln!(
+        "adamw_step_fma_contracted_red_control_diverges_from_eager_cuda: \
+         {red_control_mismatches}/{n} elements differ (RED control, expected > 0)"
     );
 }

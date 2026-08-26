@@ -5914,6 +5914,337 @@ fn attention_block_bf16_three_way_vs_f32_reference_b1_and_b8_cuda() {
 }
 
 // =======================================================================
+// FA2 dense arm's OWN op-level oracle, in the vendored kernel's own
+// upstream acceptance form (numerics agent, round 7, lead course-
+// correction on top of the encoder-level rebuild below). `three_way_vs_
+// f32_reference` above compares `AttentionBlockFused` (the BLOCK arm) —
+// never the flash op — against an F32 reference; it is not a claim about
+// the FA2 dense arm this round is actually about. This section is that
+// claim, using the SAME acceptance form the vendored kernel ships its own
+// numeric-parity tests with.
+//
+// Dao-AILab/flash-attention `tests/test_flash_attn.py` (the SAME tree as
+// this crate's vendored `v2.8.3.post1`, `third_party/flash-attention/
+// VENDORED.md`), with `deterministic=True`, per tensor, NO absolute
+// floor:
+//   max|out_fused - out_ref| <= 2 * max|out_eager_bf16 - out_ref|
+//   max|d(q,k,v)_fused - d(q,k,v)_ref| <= 3 * max|d(q,k,v)_eager_bf16 - d(q,k,v)_ref|
+// where `out_ref`/`d*_ref` is the SAME composition computed in F32 and
+// `out_eager_bf16`/`d*_eager_bf16` is the SAME composition at BF16 without
+// any fused kernel. Our analogue: `ref` = `attention_block_bwd_eager_
+// reference` at F32 (the eager attention-block composition upcast to
+// F32); `eager` = the SAME function at BF16; `fused` = the FLASH op
+// (`flash_attention_varlen_with_rope`, `ops::flash_attention`) — the FA2
+// op this crate actually ships, never `AttentionBlockFused`.
+//
+// Window semantics cross-check (both arms must mean the SAME thing by
+// "window"): FA's own `mask.h` keeps columns `[row - left, row + right]`
+// INCLUSIVE; HF ModernBERT (`transformers` 5.15.1) passes `sliding_window
+// = local_attention // 2 + 1` to the flash interface, which sends
+// `window_size = (sliding_window - 1, sliding_window - 1) = (64, 64)`, and
+// its own sdpa/eager mask is `abs(q - kv) <= 64` — radius 64 on BOTH arms
+// is the parity point this crate's own `Some(64)` convention already
+// relies on (`ModernBertAttention::half_window`, read identically by the
+// block arm's `local_band`/`sliding_window_mask` and the flash arm's
+// `VarlenConfig::window`). `window` below is that SAME radius, fed to
+// `combined_attention_mask` on the reference/eager side and to
+// `VarlenConfig::window` on the flash side — never re-derived per side.
+// =======================================================================
+
+/// One shape's four `max|Δ|` numbers against the F32 reference — the
+/// upstream form's own building block. `flash_window` is normally equal to
+/// `window` (the healthy oracle); the RED control below passes a
+/// DIFFERENT value on the flash leg only (an off-by-one radius), while the
+/// reference/eager side keeps the real `window`.
+struct FlashUpstreamMeasurement {
+    out_fused_max: f64,
+    out_eager_max: f64,
+    dqkv_fused_max: f64,
+    dqkv_eager_max: f64,
+}
+
+impl FlashUpstreamMeasurement {
+    /// `max|out_fused - ref| <= 2 * max|out_eager_bf16 - ref|` — upstream's
+    /// own `out` multiple.
+    fn out_ok(&self) -> bool {
+        self.out_fused_max.is_finite()
+            && self.out_eager_max.is_finite()
+            && self.out_fused_max <= 2.0 * self.out_eager_max
+    }
+    /// `max|dqkv_fused - ref| <= 3 * max|dqkv_eager_bf16 - ref|` —
+    /// upstream's own `dq`/`dk`/`dv` multiple.
+    fn dqkv_ok(&self) -> bool {
+        self.dqkv_fused_max.is_finite()
+            && self.dqkv_eager_max.is_finite()
+            && self.dqkv_fused_max <= 3.0 * self.dqkv_eager_max
+    }
+}
+
+/// Affirmative-finite-first (guide §3.7) `max|a_i - b_i|`, over `f64` —
+/// NEVER a silent `NaN`-dropping fold (family J: `f64::max` is NaN-blind).
+fn max_abs_diff_finite_first(label: &str, a: &[f32], b: &[f32]) -> f64 {
+    assert_eq!(a.len(), b.len(), "{label}: length mismatch");
+    let non_finite = a.iter().chain(b.iter()).filter(|v| !v.is_finite()).count();
+    assert_eq!(non_finite, 0, "{label}: {non_finite} non-finite value(s)");
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (f64::from(*x) - f64::from(*y)).abs())
+        .fold(0f64, |m, d| if d.total_cmp(&m).is_gt() { d } else { m })
+}
+
+/// Runs the FLASH op (`flash_attention_varlen_with_rope`, a DENSE
+/// `CuSeqlens` of `batch` copies of `seq`) at the SAME `(qkv, rope, dy)`
+/// fixture `attention_block_bwd_eager_reference` uses, so the two sides
+/// are directly comparable. `qkv_v`'s flat layout is already
+/// `(batch, seq, 3, heads, head_dim)` row-major — identical bytes to the
+/// flash op's own packed `[total_q=batch*seq, 3, heads, head_dim]`, since
+/// a dense uniform-length `CuSeqlens` concatenates each batch's `seq`
+/// tokens contiguously, batch-major — the SAME ordering the reshape below
+/// assumes without moving any element.
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "flash-attn")]
+fn flash_bwd_fused(
+    cuda: &Device,
+    qkv_v: &[f32],
+    rope_v: &[f32],
+    dy_v: &[f32],
+    batch: usize,
+    seq: usize,
+    heads: usize,
+    head_dim: usize,
+    scale: f32,
+    window: Option<usize>,
+) -> (Vec<f32>, Vec<f32>) {
+    use jammi_kernels::flash::{CuSeqlens, VarlenConfig};
+    use jammi_kernels::ops::flash_attention_varlen_with_rope;
+
+    let cuda_dev = match cuda {
+        Device::Cuda(dev) => dev,
+        _ => panic!("flash_bwd_fused requires a CUDA device"),
+    };
+    let cast = |t: Tensor| -> Tensor { t.to_dtype(DType::BF16).unwrap() };
+    let qkv = Var::from_tensor(&cast(
+        Tensor::from_slice(qkv_v, (batch * seq, 3, heads, head_dim), cuda).unwrap(),
+    ))
+    .unwrap();
+    let rope_pack = cast(Tensor::from_slice(rope_v, (2, 1, 1, seq, head_dim), cuda).unwrap());
+    let cos = rope_pack.narrow(0, 0, 1).unwrap();
+    let sin = rope_pack.narrow(0, 1, 1).unwrap();
+    let dy = cast(Tensor::from_slice(dy_v, (batch, seq, heads * head_dim), cuda).unwrap());
+
+    let lengths = vec![seq; batch];
+    let cu_seqlens = CuSeqlens::from_lengths(&lengths, cuda_dev).unwrap();
+    let cfg = VarlenConfig {
+        softmax_scale: scale,
+        window: window.map(|w| w as u32),
+        deterministic: true,
+    };
+    let o = flash_attention_varlen_with_rope(qkv.as_tensor(), &cos, &sin, seq, &cu_seqlens, &cfg)
+        .unwrap();
+    let out = o.reshape((batch, seq, heads * head_dim)).unwrap();
+    let loss = (&out * &dy).unwrap().sum_all().unwrap();
+    let grads = loss.backward().unwrap();
+    let dqkv = grads
+        .get(qkv.as_tensor())
+        .expect("flash_bwd_fused: qkv must have a gradient")
+        .to_dtype(DType::F32)
+        .unwrap();
+
+    let out_v: Vec<f32> = out
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_device(&Device::Cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let dqkv_v: Vec<f32> = dqkv
+        .to_device(&Device::Cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    (out_v, dqkv_v)
+}
+
+/// One shape's full measurement: builds `(qkv, rope, mask, dy)` once,
+/// runs the flash op (with `flash_window` — normally `== window`, a
+/// DIFFERENT value only for the RED control below), the BF16 eager
+/// composition, and the F32 reference, all from the SAME fixture.
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "flash-attn")]
+fn measure_flash_upstream_form(
+    cuda: &Device,
+    batch: usize,
+    seq: usize,
+    heads: usize,
+    head_dim: usize,
+    window: Option<usize>,
+    flash_window: Option<usize>,
+    seed: f32,
+    amplitude: f32,
+) -> FlashUpstreamMeasurement {
+    let qkv_v: Vec<f32> = qkv_fixture(batch, seq, heads, head_dim, seed)
+        .into_iter()
+        .map(|v| v * amplitude)
+        .collect();
+    let rope_v = attention_rope_pack(seq, head_dim);
+    let mask_base = vec![0f32; batch * seq];
+    let mask_v: Vec<f32> = match window {
+        None => mask_base,
+        Some(hw) => {
+            let combined = combined_attention_mask(cuda, batch, seq, &mask_base, Some(hw));
+            combined.flatten_all().unwrap().to_vec1().unwrap()
+        }
+    };
+    let dy_v = attention_dy_fixture(batch * seq * heads * head_dim, seed + 100.0);
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    let (out_fused, dqkv_fused) = flash_bwd_fused(
+        cuda,
+        &qkv_v,
+        &rope_v,
+        &dy_v,
+        batch,
+        seq,
+        heads,
+        head_dim,
+        scale,
+        flash_window,
+    );
+    let (out_eager, dqkv_eager) = attention_block_bwd_eager_reference(
+        cuda,
+        DType::BF16,
+        &qkv_v,
+        &rope_v,
+        &mask_v,
+        &dy_v,
+        batch,
+        seq,
+        heads,
+        head_dim,
+        scale,
+    );
+    let (out_ref, dqkv_ref) = attention_block_bwd_eager_reference(
+        cuda,
+        DType::F32,
+        &qkv_v,
+        &rope_v,
+        &mask_v,
+        &dy_v,
+        batch,
+        seq,
+        heads,
+        head_dim,
+        scale,
+    );
+
+    let label = format!(
+        "shape=({batch},{seq},{heads},{head_dim}) window={window:?} flash_window={flash_window:?}"
+    );
+    let m = FlashUpstreamMeasurement {
+        out_fused_max: max_abs_diff_finite_first(
+            &format!("out fused-vs-ref {label}"),
+            &out_fused,
+            &out_ref,
+        ),
+        out_eager_max: max_abs_diff_finite_first(
+            &format!("out eager-vs-ref {label}"),
+            &out_eager,
+            &out_ref,
+        ),
+        dqkv_fused_max: max_abs_diff_finite_first(
+            &format!("dqkv fused-vs-ref {label}"),
+            &dqkv_fused,
+            &dqkv_ref,
+        ),
+        dqkv_eager_max: max_abs_diff_finite_first(
+            &format!("dqkv eager-vs-ref {label}"),
+            &dqkv_eager,
+            &dqkv_ref,
+        ),
+    };
+    eprintln!(
+        "FLASH_UPSTREAM {label}: out fused={:e} eager={:e} bound(2x)={:e}; dqkv fused={:e} \
+         eager={:e} bound(3x)={:e}",
+        m.out_fused_max,
+        m.out_eager_max,
+        2.0 * m.out_eager_max,
+        m.dqkv_fused_max,
+        m.dqkv_eager_max,
+        3.0 * m.dqkv_eager_max,
+    );
+    m
+}
+
+/// The healthy oracle: production geometry (`b1`/`b8`, `s512`/`s128`,
+/// `window` `Some(64)`/`None`), production amplitude (12 — inside the real
+/// checkpoint's own measured `max|qkv|` range 9-18, same citation
+/// `attention_block_bf16_three_way_vs_f32_reference_b1_and_b8_cuda` uses),
+/// `deterministic=true` (the op's only real call-site value).
+#[test]
+#[cfg(feature = "flash-attn")]
+fn flash_upstream_acceptance_form_vs_f32_reference_dense_cuda() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    for &(batch, seq, window, seed) in &[
+        (1usize, 512usize, Some(64usize), 70.0f32),
+        (1usize, 128usize, None, 71.0f32),
+        (8usize, 512usize, Some(64usize), 72.0f32),
+        (8usize, 128usize, None, 73.0f32),
+    ] {
+        let m = measure_flash_upstream_form(&cuda, batch, seq, 16, 64, window, window, seed, 12.0);
+        assert!(
+            m.out_ok(),
+            "shape=({batch},{seq},16,64) window={window:?}: out max|Δ| {:e} exceeds 2x eager's \
+             own {:e} (upstream flash-attention's own out bound, v2.8.3.post1 test_flash_attn.py)",
+            m.out_fused_max,
+            m.out_eager_max
+        );
+        assert!(
+            m.dqkv_ok(),
+            "shape=({batch},{seq},16,64) window={window:?}: dqkv max|Δ| {:e} exceeds 3x eager's \
+             own {:e} (upstream flash-attention's own dq/dk/dv bound, v2.8.3.post1 \
+             test_flash_attn.py)",
+            m.dqkv_fused_max,
+            m.dqkv_eager_max
+        );
+    }
+}
+
+/// RED control: the FLASH leg's own window radius perturbed by one column
+/// (`Some(64)` -> `Some(63)`) while the reference/eager side keeps the
+/// real radius — must VIOLATE the upstream bound (out, dqkv, or both).
+/// This is the discriminating half of the sibling this section adds next
+/// to `three_way_vs_f32_reference`'s own generous sanity bound (guide
+/// §3.8: no absolute floor here, so a one-column radius defect is not
+/// absorbed the way it would be under a `+ 0.05` floor).
+#[test]
+#[cfg(feature = "flash-attn")]
+fn flash_upstream_acceptance_form_red_control_window_off_by_one_cuda() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let m = measure_flash_upstream_form(&cuda, 8, 512, 16, 64, Some(64), Some(63), 74.0, 12.0);
+    assert!(
+        !m.out_ok() || !m.dqkv_ok(),
+        "off-by-one flash window radius (Some(64) -> Some(63)) must VIOLATE the upstream bound \
+         on at least one leg -- out fused={:e} eager={:e} bound(2x)={:e}; dqkv fused={:e} \
+         eager={:e} bound(3x)={:e} -- if this assertion fails, the healthy oracle above would NOT \
+         have caught this defect",
+        m.out_fused_max,
+        m.out_eager_max,
+        2.0 * m.out_eager_max,
+        m.dqkv_fused_max,
+        m.dqkv_eager_max,
+        3.0 * m.dqkv_eager_max,
+    );
+}
+
+// =======================================================================
 // RopePositionsFused CPU<->CUDA parity + THE B3-dense identity oracle
 // (P6 Stage B B3-dense, contract v5 §3.6): `rope_positions_fused` on the
 // packed `[total, 3, h, d]` buffer is bit-identical to `RopeFused` on the

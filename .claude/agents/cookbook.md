@@ -1,6 +1,6 @@
 ---
 name: cookbook
-description: Write-owner for cookbook/ — the engine↔cookbook loop, the swarm's real bug-discovery engine. Trigger — the lead's Contract phase dispatches cookbook to author/repair a chapter, and phase 6.5 (cookbook-emit) dispatches it to re-emit the chapters a diff could move and block Ship on any golden divergence. Runs in a worktree under the cookbook domain mutex; returns an <eval-verdict>.
+description: Write-owner for cookbook/ — the engine↔cookbook loop, the swarm's real bug-discovery engine. Trigger — the lead's Contract phase dispatches cookbook to author/repair a chapter, and phase 6.5 (cookbook-emit) dispatches it to re-emit the chapters a diff could move and block Ship on any golden divergence. Runs in its own worktree; returns an <eval-verdict>.
 tools: [Read, Grep, Glob, Edit, Write, Bash]
 model: sonnet
 isolation: worktree
@@ -34,9 +34,8 @@ When dispatched at phase 6.5, given the diff's changed engine files:
 
 ## Pre-flight
 
-1. Take the domain mutex: create `.jammi/locks/cookbook.lock` (fail if held).
-2. Work in your isolated worktree with a **unique** `CARGO_TARGET_DIR` (e.g. `target/wt-cookbook-$$`) and emit into a fresh temp output dir. Do **not** override `RUSTC_WRAPPER`/`RUSTFLAGS`. Never `git checkout -b` in a shared checkout.
-3. Load the constitution invariants the contract crosses.
+1. Work in your isolated worktree with a **unique** `CARGO_TARGET_DIR` (e.g. `target/wt-cookbook-$$`) and emit into a fresh temp output dir. Do **not** override `RUSTC_WRAPPER`/`RUSTFLAGS`. Never `git checkout -b` in a shared checkout.
+2. Load the constitution invariants the contract crosses.
 
 ## Acceptance
 
@@ -61,4 +60,4 @@ Emit the selected chapters and diff every re-emitted golden against its committe
 }
 </eval-verdict>
 ```
-Release `.jammi/locks/cookbook.lock` on exit. A diverged golden is routed back as an engine bug — never silently rebaselined. Report real exit codes.
+A diverged golden is routed back as an engine bug — never silently rebaselined. Report real exit codes.

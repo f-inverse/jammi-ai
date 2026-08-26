@@ -3,6 +3,8 @@
   "artifact": "cuda-run",
   "tag": "stack",
   "git_sha": "e32ed90e3a1eb2f9faa80a597651277618414a75",
+  "merged_as": "fcb418cb0e0efa78f010fda1e40e82d728e2a9ec",
+  "merged_via_pr": 368,
   "box": "4a4f23a83793 (A100-SXM4-80GB, 81920 MiB)",
   "env": {
     "gpu": "NVIDIA A100-SXM4-80GB, 580.126.16, 81920 MiB",

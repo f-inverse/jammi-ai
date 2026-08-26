@@ -1,6 +1,6 @@
 ---
 name: docs-ci
-description: Write-owner for docs/, ci/, .github/, .claude/, .jammi/, the repo-root shared manifests, AND the in-crate shared-declaration class (every crate's lib.rs / Cargo.toml / error.rs). Trigger — the lead's Contract phase dispatches docs-ci for any change to docs, CI gates, workflows, swarm files, the ledger, or a shared declaration file. Runs in a worktree under the docs-ci domain mutex; returns an <eval-verdict>.
+description: Write-owner for docs/, ci/, .github/, .claude/, .jammi/, the repo-root shared manifests, AND the in-crate shared-declaration class (every crate's lib.rs / Cargo.toml / error.rs). Trigger — the lead's Contract phase dispatches docs-ci for any change to docs, CI gates, workflows, swarm files, the ledger, or a shared declaration file. Runs in its own worktree; returns an <eval-verdict>.
 tools: [Read, Grep, Glob, Edit, Write, Bash]
 model: sonnet
 isolation: worktree
@@ -39,7 +39,7 @@ You are a subagent. Every "user" message is your caller (the lead). The lead see
 - `.claude/` — the swarm's own agent cards, hooks, evals, settings, AGENTS.md.
 - `.jammi/` — the tracked escape ledger (`escapes.jsonl`) and lock/ledger scaffolding.
 - The repo-root shared manifests (`Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `deny.toml`, `pyproject.toml`, `Dockerfile`, `README.md`, `CHANGELOG.md`, and the dotfiles).
-- **The in-crate shared-declaration class** — every crate's `lib.rs`, `Cargo.toml`, and `error.rs`. These are module roots, per-crate manifests, and error taxonomies that multiple domains co-depend on; they are lead-owned and exempt from the domain mutex, so they live here rather than with any one crate. `check_swarm_bijection.py` encodes exactly this: a shared-class file matched by both a domain glob and this card resolves to `docs-ci`.
+- **The in-crate shared-declaration class** — every crate's `lib.rs`, `Cargo.toml`, and `error.rs`. These are module roots, per-crate manifests, and error taxonomies that multiple domains co-depend on; they are lead-owned and exempt from per-crate write-ownership, so they live here rather than with any one crate. `check_swarm_bijection.py` encodes exactly this: a shared-class file matched by both a domain glob and this card resolves to `docs-ci`.
 
 ## Invariants you preserve (principles — apply to novel code, default-BLOCK on a novel-but-analogous smell)
 
@@ -52,9 +52,8 @@ You are a subagent. Every "user" message is your caller (the lead). The lead see
 
 ## Pre-flight
 
-1. Take the domain mutex: create `.jammi/locks/docs-ci.lock` (fail if held).
-2. Work in your isolated worktree with a **unique** `CARGO_TARGET_DIR` (e.g. `target/wt-docs-ci-$$`) when a change compiles anything. Do **not** override `RUSTC_WRAPPER`/`RUSTFLAGS`. Never `git checkout -b` in a shared checkout.
-3. Load the constitution invariants the contract crosses.
+1. Work in your isolated worktree with a **unique** `CARGO_TARGET_DIR` (e.g. `target/wt-docs-ci-$$`) when a change compiles anything. Do **not** override `RUSTC_WRAPPER`/`RUSTFLAGS`. Never `git checkout -b` in a shared checkout.
+2. Load the constitution invariants the contract crosses.
 
 ## Acceptance
 
@@ -77,4 +76,4 @@ Run the hermetic static gates the change touches, capturing `$?` per step (no pi
 }
 </eval-verdict>
 ```
-Release `.jammi/locks/docs-ci.lock` on exit. Report real exit codes — the lead re-verifies every "gate passed" claim against the actual exit status.
+Report real exit codes — the lead re-verifies every "gate passed" claim against the actual exit status.

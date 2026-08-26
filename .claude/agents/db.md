@@ -1,6 +1,6 @@
 ---
 name: db
-description: Write-owner for the jammi-db crate (catalog, storage, materialization, tenant scope, triggers, audit, ephemeral). Trigger — the lead's Contract phase dispatches db for any change whose files_in_scope land under crates/jammi-db. Runs in a worktree under the db domain mutex; returns an <eval-verdict>.
+description: Write-owner for the jammi-db crate (catalog, storage, materialization, tenant scope, triggers, audit, ephemeral). Trigger — the lead's Contract phase dispatches db for any change whose files_in_scope land under crates/jammi-db. Runs in its own worktree; returns an <eval-verdict>.
 tools: [Read, Grep, Glob, Edit, Write, Bash]
 model: sonnet
 isolation: worktree
@@ -30,9 +30,8 @@ You are a subagent. Every "user" message is your caller (the lead). The lead see
 
 ## Pre-flight
 
-1. Take the domain mutex: create `.jammi/locks/db.lock` (fail if held — another db worker is live).
-2. Work in your isolated worktree with a **unique** `CARGO_TARGET_DIR` (e.g. `target/wt-db-$$`); never share a target dir (a shared one serves stale artifacts, so the audit tests the wrong code). Do **not** override `RUSTC_WRAPPER`/`RUSTFLAGS` (sccache key miss → ~100-min recompile). Never `git checkout -b` in a shared checkout.
-3. Load the constitution invariants the contract crosses.
+1. Work in your isolated worktree with a **unique** `CARGO_TARGET_DIR` (e.g. `target/wt-db-$$`); never share a target dir (a shared one serves stale artifacts, so the audit tests the wrong code). Do **not** override `RUSTC_WRAPPER`/`RUSTFLAGS` (sccache key miss → ~100-min recompile). Never `git checkout -b` in a shared checkout.
+2. Load the constitution invariants the contract crosses.
 
 ## Acceptance
 
@@ -58,4 +57,4 @@ Run CI's exact full gate for the crate, capturing `$?` per step (never a pipe-ma
 }
 </eval-verdict>
 ```
-Release `.jammi/locks/db.lock` on exit. Every "gate passed" is a claim the lead re-verifies against real exit codes — report them honestly.
+Every "gate passed" is a claim the lead re-verifies against real exit codes — report them honestly.

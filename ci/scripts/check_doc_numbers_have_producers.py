@@ -11,7 +11,17 @@ reader (or an implementer citing it as ground truth) cannot re-derive or even
 locate where it came from. `docs/maintainer/cuda-kernel-guide.md` §3.9 states
 this rule in one paragraph, alongside the adjacent oracle disciplines §3.7
 (write comparisons affirmatively) and §3.8 (no absolute ULP floor) this is a
-third leg of.
+third leg of. §3.9 is also `KO-4` of that guide's kernel-acceptance-oracle
+standard.
+
+ROUND-6 (KO-4) WIDENING: the same "unproduced number reads as evidence"
+class applies to a FLOOR TERM in CODE, not just a number in a doc comment —
+a `const`/`let` whose name ends `_floor` (covers `_FLOOR`, `_ABS_FLOOR`, and
+the lowercase `abs_floor` local-variable idiom), or a `.max(<literal>)`/
+`+ <literal>` inside a fn whose name or `-> bool` return reads as
+comparison-feeding. `find_floor_hits`/its call site in `scan_lines` below
+carry the full rule and citation-scope rationale; the shape is otherwise
+independent of (never a repeat of) the three number shapes below.
 
 BINDING UNIT: the contiguous doc-comment BLOCK — a maximal run of `///`/
 `//!`/`//` lines — containing the number (round-3 audit fix: a 12-line
@@ -487,6 +497,127 @@ def find_number_hits(line: str) -> list[NumberHit]:
     return hits
 
 
+# --- KO-4: floor terms (round-6, kernel-acceptance-oracle standard) -----
+#
+# A FLOOR is a literal numeric constant added to a bound to keep a
+# discriminating assertion from charging a near-zero-magnitude element the
+# full relative tolerance (§3.8 of the cuda-kernel-guide). Two shapes, both
+# code (never a doc-comment number the shapes above already catch):
+#
+#   (B) a `const`/`let` declaration whose name ends `_floor`, case-
+#       insensitive — covers `_FLOOR`, `_ABS_FLOOR` (both END in `_floor`),
+#       and the lowercase `abs_floor` local-variable idiom this repo's own
+#       oracles use (`abs_floor` itself ends in `_floor`), all with ONE
+#       suffix check.
+#   (A) a `.max(<numeric literal>)` or `+ <numeric literal>` (the latter
+#       only on a line that ALSO carries a comparison operator, `<=`/`>=` —
+#       otherwise too many ordinary arithmetic `+`s would fire) inside a fn
+#       whose SIGNATURE (name or return type) reads as comparison-feeding:
+#       returns `bool`, or its name contains `bound`/`close`/`tol`/`floor`/
+#       `threshold`/`within`. Conservative on purpose — this shape's
+#       precision is unproven at scale, so it rides the SAME advisory bare-
+#       scan leg every other shape here does; it never gates on its own.
+#
+# CITATION SCOPE for a floor line is narrower than a doc-comment number's:
+# a `const`/`let` line is CODE, so `compute_blocks` gives it its own
+# singleton block (code lines never merge with a preceding comment run) —
+# there is no comment block "the floor sits inside" the way a `///` number
+# does. The citation text checked is that singleton line's own text PLUS,
+# only when the line immediately above is itself a real (non-separator)
+# comment line, that comment block's text — i.e. a doc comment DIRECTLY
+# attached to the declaration (rustdoc's own attachment convention) or an
+# inline trailing `// see fn` on the declaration line itself. A citation
+# one comment-block further up (separated by so much as one other code
+# line) does NOT reach a floor two lines below it — exactly why
+# `GROSS_REGRESSION_FLOOR` (preceded by another `const` line, not a
+# comment) is uncited even though a `see`-citable comment sits three lines
+# above the *other* const beside it.
+FLOOR_DECL_RE = re.compile(
+    r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:const|let(?:\s+mut)?)\s+"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=]+)?=\s*(?P<rest>.+?);?\s*$"
+)
+FLOOR_NAME_SUFFIX_RE = re.compile(r"(?i)_floor$")
+FLOOR_LITERAL_RE = re.compile(r"-?\d[\d_]*(?:\.\d+)?(?:[eE]-?\d+)?(?:f32|f64)?")
+
+FN_SIG_RE = re.compile(
+    r"^\s*(?:pub(?:\([^)]*\))?\s+)?fn\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\([^)]*\)"
+    r"\s*(?:->\s*(?P<ret>[A-Za-z_][A-Za-z0-9_:<>&' ]*))?\s*\{?\s*$"
+)
+_COMPARISON_FEEDING_NAME_RE = re.compile(
+    r"(?i)\b(?:bound|close|tol|floor|threshold|within)"
+)
+FLOOR_MAX_RE = re.compile(
+    r"\.max\(\s*(-?\d[\d_]*(?:\.\d+)?(?:[eE]-?\d+)?(?:f32|f64)?)\s*\)"
+)
+FLOOR_ADD_RE = re.compile(r"\+\s*(-?\d[\d_]*\.\d+(?:[eE]-?\d+)?(?:f32|f64)?)\b")
+_COMPARISON_OP_RE = re.compile(r"<=|>=")
+
+
+@dataclass(frozen=True)
+class FloorHit:
+    line_idx: int  # 0-indexed
+    text: str
+    # For a category (A) hit: the 0-indexed line of the ENCLOSING fn's own
+    # `fn` signature — its citation home is that fn's attached doc comment
+    # (directly above the `fn` line), not necessarily the call-site line
+    # itself, which usually sits deep in the fn body with no comment
+    # immediately above it. `None` for a category (B) declaration hit (whose
+    # citation home is its OWN directly-attached line, per `scan_lines`).
+    fn_sig_line_idx: int | None = None
+
+
+def find_floor_hits(lines: list[str]) -> list[FloorHit]:
+    """Category (B) declaration scan (whole-file, name-suffix driven) plus
+    category (A) fn-scoped `.max(<num>)`/`+ <num>` scan (brace-depth
+    tracked via a plain per-line `{`/`}` count — the same textual
+    approximation `compute_blocks` already uses elsewhere in this file;
+    exact for code with no string/char literal containing an unmatched
+    brace, which this repo's fn bodies do not).
+    """
+    hits: list[FloorHit] = []
+
+    # (B) — declaration name ends `_floor`.
+    for i, line in enumerate(lines):
+        m = FLOOR_DECL_RE.match(line)
+        if not m:
+            continue
+        if not FLOOR_NAME_SUFFIX_RE.search(m.group("name")):
+            continue
+        lit = FLOOR_LITERAL_RE.search(m.group("rest"))
+        if lit:
+            hits.append(FloorHit(i, lit.group(0)))
+
+    # (A) — `.max(<num>)` / `+ <num>` inside a comparison-feeding fn.
+    depth = 0
+    in_fn = False
+    fn_is_comparison_feeding = False
+    fn_base_depth = 0
+    fn_sig_line_idx = 0
+    for i, line in enumerate(lines):
+        if not in_fn:
+            sig = FN_SIG_RE.match(line)
+            if sig:
+                in_fn = True
+                fn_base_depth = depth
+                fn_sig_line_idx = i
+                name_hit = bool(_COMPARISON_FEEDING_NAME_RE.search(sig.group("name")))
+                ret = sig.group("ret") or ""
+                ret_hit = ret.strip() == "bool"
+                fn_is_comparison_feeding = name_hit or ret_hit
+        if in_fn and fn_is_comparison_feeding:
+            for m in FLOOR_MAX_RE.finditer(line):
+                hits.append(FloorHit(i, m.group(1), fn_sig_line_idx))
+            if _COMPARISON_OP_RE.search(line):
+                for m in FLOOR_ADD_RE.finditer(line):
+                    hits.append(FloorHit(i, m.group(1), fn_sig_line_idx))
+        depth += line.count("{") - line.count("}")
+        if in_fn and depth <= fn_base_depth:
+            in_fn = False
+            fn_is_comparison_feeding = False
+
+    return hits
+
+
 @dataclass(frozen=True)
 class Finding:
     file: str
@@ -539,6 +670,38 @@ def scan_lines(
             continue
         for hit in hits:
             findings.append(Finding(file_label, i + 1, hit.text, hit.kind, line))
+
+    # KO-4 — floor terms. Not gated by `_ADJACENT_RE` (the floor SHAPE
+    # itself is the trigger, unlike a bare number in prose); citation scope
+    # is the floor's own singleton (code) line plus a directly-attached
+    # preceding comment block, per `find_floor_hits`'s own doc.
+    def attached_comment_text(above_idx: int) -> str:
+        """The comment block directly above `lines[above_idx]`, if any (empty
+        string otherwise) — a citation must be DIRECTLY attached (no
+        intervening code line), never reaching across one.
+        """
+        j = above_idx - 1
+        if j >= 0 and is_comment_line(lines[j]) and not is_bare_separator_line(lines[j]):
+            return clean_text(block_of[j])
+        return ""
+
+    for fh in find_floor_hits(lines):
+        i = fh.line_idx
+        if NO_PRODUCER_RE.search(lines[i]):
+            continue
+        own_text = clean_text(block_of[i])
+        parts = [own_text, attached_comment_text(i)]
+        if fh.fn_sig_line_idx is not None:
+            # category (A): also check the ENCLOSING fn's own attached doc
+            # comment (directly above its `fn` line) — the natural citation
+            # home for a floor buried in the fn body, not the call-site
+            # line itself.
+            parts.append(attached_comment_text(fh.fn_sig_line_idx))
+        combined = " ".join(p for p in parts if p)
+        if is_block_bound(combined, fn_index, tracked):
+            continue
+        findings.append(Finding(file_label, i + 1, fh.text, "floor", lines[i]))
+
     return findings
 
 
@@ -905,6 +1068,73 @@ fn unrelated_marker() {{}}
         """
 // bf16 mantissa ceiling is 0.780000 observed, on this fixture.
 // no-producer: derived from the IEEE 754 bf16 format, not measured.
+""",
+    )
+
+    # --- KO-4: floor terms (round-6) ---
+    clean(
+        f"category (B) floor const cited by a DIRECTLY-attached preceding doc comment — see [`{real_fn}`]",
+        f"""
+/// Derived directly from the fixture's own measured tail — see [`{real_fn}`].
+const BF16_ABS_FLOOR: f32 = 0.03125;
+""",
+    )
+    flagged(
+        "category (B) floor const with NO directly-attached comment (blocked by an "
+        "intervening code line) is uncited — the exact GROSS_REGRESSION_FLOOR "
+        "reproduction: a citable comment sits above the OTHER const beside it, not "
+        "directly above this one",
+        """
+// A SANITY backstop — see some_unrelated_test for the real discriminating oracle.
+const GROSS_REGRESSION_MULTIPLE: f64 = 8.0;
+const GROSS_REGRESSION_FLOOR: f64 = 0.05;
+""",
+    )
+    flagged(
+        "category (B) lowercase `abs_floor` local-variable idiom is caught too, and a "
+        "self-referential 'cited in this test's doc' is NOT a real citation",
+        """
+// A small floor covers the f32-only summation-order noise (measured negligible
+// by the forward test's own standalone probe, cited in its doc).
+let abs_floor = 1e-1f64;
+""",
+    )
+    clean(
+        "category (A) `.max(<num>)` floor inside a comparison-feeding (`bound`-named, "
+        f"`-> bool`) fn, cited on the fn's own attached doc comment — see [`{real_fn}`]",
+        f"""
+/// Divide-by-zero guard on the denominator — see [`{real_fn}`].
+fn within_some_bound(diff: f64, magnitude: f64) -> bool {{
+    diff <= (diff) / magnitude.max(1e-12)
+}}
+""",
+    )
+    flagged(
+        "category (A) `.max(<num>)` floor inside a comparison-feeding fn with NO "
+        "citation at all is flagged",
+        """
+fn within_some_bound(diff: f64, magnitude: f64) -> bool {
+    diff <= (diff) / magnitude.max(1e-12)
+}
+""",
+    )
+    clean(
+        "category (A) `+ <num>` floor requires a comparison operator on the SAME "
+        "line to trigger at all — an ordinary uncited arithmetic `+` inside a "
+        "comparison-feeding fn, with no `<=`/`>=` on its own line, is NOT a floor hit",
+        """
+fn within_some_bound(diff: f64, magnitude: f64) -> bool {
+    let padded = diff + 0.05;
+    padded <= magnitude
+}
+""",
+    )
+    flagged(
+        "category (B) `no-producer:` opt-out stays LINE-scoped for a floor const too "
+        "— on a DIFFERENT line in the same file it does not launder this one",
+        """
+const SOME_ABS_FLOOR: f64 = 0.25;
+// no-producer: this opt-out is written on the wrong line on purpose.
 """,
     )
 

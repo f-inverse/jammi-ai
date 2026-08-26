@@ -27,6 +27,13 @@ Registered bindings:
     replay-parity.
   - `StoragePrecision` (the ANN index's storage/compute precision) —
     set-equality-only; this enum has no replay-parity dimension.
+  - `KernelOracleStandardIds` (the `KO-1`..`KO-8` stable ids
+    `docs/maintainer/cuda-kernel-guide.md` §3's conformance list reports) —
+    set-equality-only, code side is a PYTHON list constant
+    (`ci/scripts/check_kernel_oracles.py`'s `STABLE_IDS`), not a Rust enum —
+    see `variant_source`/`parse_python_list_variants` below, added ONLY as a
+    second leaf-level source parser feeding the SAME `Binding`/`check_binding`
+    machinery every other binding uses (no second reconciliation mechanism).
 
 Any parse failure — a missing marker, an unparseable enum, an absent match block
 — is a non-zero exit with a message naming what could not be resolved. A silent
@@ -48,6 +55,8 @@ GUIDE = REPO_ROOT / "docs" / "maintainer" / "MAINTAINER-GUIDE.md"
 MANIFEST = REPO_ROOT / "crates" / "jammi-db" / "src" / "store" / "manifest.rs"
 RECOMPUTE = REPO_ROOT / "crates" / "jammi-ai" / "src" / "pipeline" / "recompute.rs"
 CONFIG = REPO_ROOT / "crates" / "jammi-db" / "src" / "config.rs"
+CUDA_KERNEL_GUIDE = REPO_ROOT / "docs" / "maintainer" / "cuda-kernel-guide.md"
+KERNEL_ORACLES_SCRIPT = REPO_ROOT / "ci" / "scripts" / "check_kernel_oracles.py"
 
 
 class ParityError(Exception):
@@ -74,6 +83,18 @@ class Binding:
     # error the exception's `recompute_file` arm must return.
     exception_phrase: str | None = None
     no_replay_marker: str | None = None
+    # Which guide file carries this binding's BEGIN/END markers — defaults to
+    # the maintainer guide every pre-existing binding uses; a binding may
+    # point at a different guide (e.g. `cuda-kernel-guide.md`) without this
+    # module growing a second guide-parsing mechanism.
+    guide_file: Path = GUIDE
+    # "rust_enum" (default, `parse_enum_variants`) or "python_list"
+    # (`parse_python_list_variants`) — which leaf parser reads `enum_file` to
+    # produce the code-side variant set. Both feed the SAME `check_binding`
+    # set-equality logic below; this is the one place a binding's *source
+    # format* (Rust enum vs. a Python list constant) is a variable, not a
+    # second reconciliation mechanism.
+    variant_source: str = "rust_enum"
 
     @property
     def has_replay_parity(self) -> bool:
@@ -107,7 +128,17 @@ STORAGE_PRECISION = Binding(
     guide_end="<!-- END STORAGE-PRECISION-VARIANTS -->",
 )
 
-BINDINGS = [PRODUCING_DESCRIPTOR, STORAGE_PRECISION]
+KERNEL_ORACLE_STANDARD_IDS = Binding(
+    name="KernelOracleStandardIds",
+    enum_name="STABLE_IDS",
+    enum_file=KERNEL_ORACLES_SCRIPT,
+    guide_begin="<!-- BEGIN KERNEL-ORACLE-STANDARD-IDS -->",
+    guide_end="<!-- END KERNEL-ORACLE-STANDARD-IDS -->",
+    guide_file=CUDA_KERNEL_GUIDE,
+    variant_source="python_list",
+)
+
+BINDINGS = [PRODUCING_DESCRIPTOR, STORAGE_PRECISION, KERNEL_ORACLE_STANDARD_IDS]
 
 
 def _strip_rust_comments(text: str) -> str:
@@ -173,6 +204,42 @@ def parse_enum_variants(source: str, enum_name: str) -> list[str]:
     return variants
 
 
+def parse_python_list_variants(source: str, list_name: str) -> list[str]:
+    """String-literal elements of a top-level Python list/tuple constant
+    `<list_name> = [...]` or `<list_name>: <ty> = (...)` — the `python_list`
+    sibling of `parse_enum_variants` above, for a binding whose code side is
+    a Python source file rather than a Rust `enum`. Brace/bracket-balanced
+    (mirrors `parse_enum_variants`'s brace-balanced enum-body isolation), so
+    a nested collection inside the tuple would not prematurely end the scan
+    — not needed by `STABLE_IDS` today, but keeps this parser as robust as
+    its Rust-enum sibling rather than a narrower one-off.
+    """
+    match = re.search(rf"\b{re.escape(list_name)}\b\s*(?::[^=]+)?=\s*([\[\(])", source)
+    if match is None:
+        raise ParityError(f"python list constant `{list_name}` not found in source")
+    open_ch = match.group(1)
+    close_ch = "]" if open_ch == "[" else ")"
+    open_idx = match.end() - 1
+    depth = 0
+    end_idx = None
+    for i in range(open_idx, len(source)):
+        ch = source[i]
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+            if depth == 0:
+                end_idx = i
+                break
+    if end_idx is None:
+        raise ParityError(f"python list constant `{list_name}` is not bracket-balanced")
+    body = source[open_idx + 1 : end_idx]
+    variants = re.findall(r"""["']([^"']+)["']""", body)
+    if not variants:
+        raise ParityError(f"python list constant `{list_name}` parsed to zero string elements")
+    return variants
+
+
 def parse_guide_variants(
     guide: str, binding: Binding
 ) -> tuple[list[str], set[str]]:
@@ -180,7 +247,11 @@ def parse_guide_variants(
 
     Each line in the marked block names a variant in the first `backticked` token;
     a line carrying the binding's exception phrase (e.g. "no replay arm") marks
-    that variant a documented replay exception.
+    that variant a documented replay exception. The identifier class includes
+    `-` (hyphen) so a hyphenated id like `` `KO-7` `` resolves as ONE token —
+    Rust variant names (the only prior users of this parser) never contain a
+    hyphen, so this widening is behavior-preserving for every pre-existing
+    binding.
     """
     begin = guide.find(binding.guide_begin)
     end = guide.find(binding.guide_end)
@@ -205,7 +276,7 @@ def parse_guide_variants(
     for line in block.splitlines():
         if not line.strip():
             continue
-        ident = re.search(r"`([A-Za-z_][A-Za-z0-9_]*)`", line)
+        ident = re.search(r"`([A-Za-z_][A-Za-z0-9_-]*)`", line)
         if ident is None:
             continue
         name = ident.group(1)
@@ -285,9 +356,17 @@ def check_binding(binding: Binding) -> list[str]:
     around a `recompute_file` it doesn't have.
     """
     enum_src = binding.enum_file.read_text()
-    guide_src = GUIDE.read_text()
+    guide_src = binding.guide_file.read_text()
 
-    code_variants = set(parse_enum_variants(enum_src, binding.enum_name))
+    if binding.variant_source == "python_list":
+        code_variants = set(parse_python_list_variants(enum_src, binding.enum_name))
+    elif binding.variant_source == "rust_enum":
+        code_variants = set(parse_enum_variants(enum_src, binding.enum_name))
+    else:
+        raise ParityError(
+            f"binding `{binding.name}`: unknown variant_source `{binding.variant_source}` "
+            "(must be 'rust_enum' or 'python_list')"
+        )
     guide_names, guide_exceptions = parse_guide_variants(guide_src, binding)
     guide_variants = set(guide_names)
 

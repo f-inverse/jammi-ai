@@ -65,7 +65,60 @@ Fixes, in the order that usually pays:
 
 Ordered by how much pain each one has already saved. Every claim below is from a real escape.
 
-**3.1 Match the eager reference's GEMM OPERAND FORM, not just its maths (esc-044).**
+**The kernel-acceptance-oracle standard.** An oracle is not evidence because it exists; it is
+evidence only if it (a) genuinely ran (never silently skipped in a way that still reports green),
+(b) checks every bound it claims to check, (c) grounds every number and every floor it asserts
+against in a real producer, (d) was validated out-of-sample of wherever it was calibrated, and (e)
+demonstrates — not merely asserts — real separation between healthy noise and the defect it exists
+to catch. The eight rules below (`KO-1` through `KO-8`) are the standing checklist an auditor runs
+over any oracle, novel or not; five of them (`KO-2`, `KO-3`, `KO-4`, `KO-5`, `KO-7`) are mechanically
+enforced today by `ci/scripts/check_kernel_oracles.py` and `ci/scripts/check_doc_numbers_have_producers.py`
+(KO-4) / `ci/scripts/check_cuda_run_artifacts.py` (KO-3, optional per artifact); the remaining three
+(`KO-1`, `KO-6`, `KO-8`) require running code or human judgment a static scan cannot make and stay
+auditor-only. Each mechanical id below is an INSTANCE of one of the numbered rules 3.1-3.9 that
+follow — tagged inline — never a parallel standard: the checklist and the numbered rules are the
+same discipline read two ways, not two disciplines.
+
+<!-- BEGIN KERNEL-ORACLE-STANDARD-IDS -->
+- `KO-1` — producer-injected controls (auditor-only; generalizes 3.6)
+- `KO-2` — bound coverage parity (mechanical; instances 3.7)
+- `KO-3` — separation in the artifact (mechanical, optional per artifact leg; instances 3.8)
+- `KO-4` — floors cite a producer (mechanical; instances 3.9)
+- `KO-5` — off-sample bounds (mechanical, marker-scoped; instances 3.2)
+- `KO-6` — live signal (auditor-only; generalizes 3.5)
+- `KO-7` — unrun-is-RED (mechanical, total over every scanned file; instances 3.5)
+- `KO-8` — independent reference (auditor-only; generalizes 3.1 and 3.3)
+<!-- END KERNEL-ORACLE-STANDARD-IDS -->
+
+`KO-1` (producer-injected controls) is not mechanical because whether a RED control's failure is
+CAUSALLY the specific defect under test, rather than some unrelated red result, is a semantic
+judgment about what a perturbation means — the same discipline esc-046's leg 3 states ("a
+deliberately mis-ordered reference MUST read GREEN pre-fix and RED post-fix") but verifying the
+perturbation is the real one, not a stand-in, needs a human (or `fix-verifier`) reading the diff.
+
+`KO-6` (live signal) is not mechanical because "this value is genuinely nonzero at runtime, not
+zeroed/detached/short-circuited" (esc-045's `||g_f32|| > 0` signal clause) can only be known by
+executing the oracle — a static scan cannot evaluate a tensor norm.
+
+`KO-8` (independent reference) is not mechanical because "the reference computation does not share
+the arm-under-test's own bug" (esc-044's root cause: an eager reference rebuilt in the test body,
+GREEN under revert BY CONSTRUCTION) requires reading the reference's provenance against upstream
+truth (PyTorch/HF/PEFT at source, never this repo's own prior belief about them) — exactly the
+`validate-kernel-semantics-at-aten-source` discipline, which is a research act, not a grep.
+
+**Pressure-test design rule: a metric is inadmissible until its own noise floor is measured.** A
+bound is not "the fused arm agrees with the reference" in the abstract; it is only meaningful
+relative to how much the EXTERNAL reference stack itself disagrees with ITS OWN higher-precision
+version, at the SAME operating point (same shape, same seed, same dtype) — never a constant pulled
+from a different run or a different amplitude. esc-045's backward budget is the working instance:
+`mean_cos(jammi bf16, jammi f32) >= mean_cos(torch bf16, torch f32) minus the same run's own noise
+leg (torch bf16-eager vs bf16-sdpa)` — the reference stack's (torch's) own bf16-vs-f32 spread, on
+the identical fixture, IS the budget; a hand-picked absolute constant would be unfalsifiable (there
+would be no way to tell "the fused kernel is worse" from "bf16 is just noisy at this shape" apart).
+Until that external-stack spread is measured at the operating point, the metric has no basis for a
+pass/fail line at all.
+
+**3.1 Match the eager reference's GEMM OPERAND FORM, not just its maths (esc-044). [`KO-8`]
 candle's own `Op::Matmul` backward differentiates through transposed **views**
 (`grad.matmul(&rhs.t())`); both candle's CPU `gemm` and cuBLAS pick packing/blocking/split-k from
 operand STRIDES. A fused bwd that materialises `pᵀ`/`vᵀ`/`dsᵀ` with `.contiguous()` issues a
@@ -75,12 +128,12 @@ different kernel than the arm it replaces and diverges systematically. That defe
 each GEMM is issued, called by both arms; assert the `(rows, cols, row_stride, col_stride)` of every
 operand, captured FROM the op, never rebuilt in the test body.
 
-**3.2 A compounding defect is invisible at one call — key the oracle on GROWTH.**
+**3.2 A compounding defect is invisible at one call — key the oracle on GROWTH. [`KO-5`]**
 esc-044's single-layer divergence was ~2e-3 relative, INSIDE the bf16 bound, and reached O(1) over 28
 layers. So assert `r(L) = Σ|fused−eager| / Σ|eager|` over an L-deep stack against **the same run's own
 r(1)** — `r(L_max) <= C · max(r(1), measured_floor)`, C small. Never against an absolute ULP constant.
 
-**3.3 Agreement is not accuracy.** Two bf16 arms can agree and both be wrong. Anchor with a
+**3.3 Agreement is not accuracy. [`KO-8`]** Two bf16 arms can agree and both be wrong. Anchor with a
 **higher-precision reference**: run the same composition in F32 and compare each arm to it. Report
 Σ|arm−ref| for both; accept only if the fused arm is no further than eager. (This is how a batch-1
 anomaly was correctly closed as ordinary rounding rather than chased as a defect.)
@@ -90,24 +143,24 @@ when production is batch 8, seq 512, `max|qkv|` 9-18 are decoration. jammi shipp
 every parity leg missed for exactly this reason. Include **batch 1** at the op level — it is where a
 `[1,1,S,S]` per-batch mask and a broadcast-over-batch mask become shape-indistinguishable.
 
-**3.5 Zero dispatch is RED, never green.** Assert the `DispatchCounters` delta shows the fused arm
+**3.5 Zero dispatch is RED, never green. [`KO-6`, `KO-7`]** Assert the `DispatchCounters` delta shows the fused arm
 actually ran (`fused == layers·steps`, `eager == 0`). The repo's end-to-end `learns_on_gpu` tests
 were green on a broken build partly because they train a head_dim-16 model that never reaches a
 head_dim-64 kernel at all.
 
-**3.6 The learning gate (fused kernels only).** Same build, arm forced on vs off, same seed and
+**3.6 The learning gate (fused kernels only). [`KO-1`]** Same build, arm forced on vs off, same seed and
 data, loss sequences compared **elementwise** across a shape sweep. Equal ⇒ value-neutral. Use
 **batch ≥ 2**: jammi-bench's loss is `mean(relu(margin − cos(a,p) + cos(a,n)))` over `batch`
 triplets, so at batch 1 it is ONE hinge — a binary switch, useless as an oracle.
 
-**3.7 Write comparisons affirmatively.** `assert!(x.is_finite() && x <= bound)`, never
+**3.7 Write comparisons affirmatively. [`KO-2`]** `assert!(x.is_finite() && x <= bound)`, never
 `assert!(!(x > bound))` — a NaN must FAIL, not read as a fit. Count non-finite elements before
 comparing anything.
 
-**3.8 No absolute ULP floor** in a discriminating assertion — a `k · ulp(max)` floor charges every
+**3.8 No absolute ULP floor [`KO-3`]** in a discriminating assertion — a `k · ulp(max)` floor charges every
 element the allowance of the largest and hides exactly the divergence you are hunting.
 
-**3.9 No number without a producer.** A doc comment or `assert!` message that states a
+**3.9 No number without a producer. [`KO-4`]** A doc comment or `assert!` message that states a
 precise-looking measurement — a mismatch count (`5145/16384`), a percentage (`26% of elements`), a
 bare cosine (`0.796`) — reads as evidence, so a reader (or a fix agent citing it as ground truth)
 must be able to re-derive or re-locate it: cite the real producer inline, `see <test_fn>` /

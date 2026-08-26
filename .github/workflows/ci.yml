@@ -771,6 +771,21 @@ jobs:
           # misroute) before this fix; was wired into no workflow at all.
           - name: reference torch_grad_oracle name-translation suite
             cmd: python3 crates/jammi-bench/reference/test_torch_grad_oracle_names.py
+          # Kernel-acceptance-oracle standard (v1) — mechanizes KO-7 (every
+          # `#[test]`-body runtime skip in crates/jammi-kernels/tests/*.rs and
+          # crates/jammi-encoders/src/*.rs must be dominated by a call to a
+          # registered require-gate helper, TOTAL over every scanned file
+          # today), and, marker-scoped, KO-2 (a marked oracle-cell's control
+          # fn covers every bound it claims) and KO-5 (a marker's derived-on
+          # and asserted-on seed sets stay disjoint). Reconciles the SHIPPED
+          # admission-key op domain against COVERED/STRUCTURALLY_EXCLUDED/
+          # PENDING the same way check_gpu_parity_matrix.py does for the
+          # device axis — v1 ships with zero markers, so every op is
+          # honestly PENDING; see docs/maintainer/cuda-kernel-guide.md §3.
+          - name: kernel oracle standard
+            cmd: python3 ci/scripts/check_kernel_oracles.py
+          - name: kernel oracle standard suite
+            cmd: python3 ci/scripts/test_check_kernel_oracles.py
     steps:
       - uses: actions/checkout@v4
         with:

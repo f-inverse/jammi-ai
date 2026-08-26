@@ -170,10 +170,10 @@ high-water mark that cannot miss an intra-step spike the way a discrete poll
 can.
 
 jammi's `peak_vram_bytes` is a whole-device `nvidia-smi` poll
-(`device_memory_used_bytes`, finetune_step.rs:73), sampled every 25ms
-(`std::thread::sleep`, finetune_step.rs:108) over the ENTIRE warmup+measured
-loop, then reduced via `peak.saturating_sub(baseline)`, finetune_step.rs:124
-against a baseline snapshot (`vram_baseline`, finetune_step.rs:441) taken
+(`device_memory_used_bytes`, finetune_step.rs:167), sampled every 25ms
+(`std::thread::sleep`, finetune_step.rs:202) over the ENTIRE warmup+measured
+loop, then reduced via `peak.saturating_sub(baseline)`, finetune_step.rs:218
+against a baseline snapshot (`vram_baseline`, finetune_step.rs:600) taken
 once right after the model+optimizer are built (before the loop starts) — at
 which point candle's `AdamW::new` has
 ALREADY allocated the (zero-initialized) first/second moment tensors, since
@@ -666,7 +666,33 @@ def forward_hidden(model, input_ids, attention_mask):
     return out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
 
 
-def _step_once(model, optimizer, scaler, blocks, mask, args, use_amp, device):
+# HF `_attn_implementation` strings that are ONE fused attention kernel
+# (scores never materialised) — the throughput-reference class jammi's own
+# fused whole-attention-block CustomOp sits in. `"eager"` is the OTHER class
+# (materialised scores + softmax; the semantic reference). See
+# `ci/scripts/perf/identity_fields.py`'s `attention_arm` entry.
+_FUSED_ATTN_IMPLEMENTATIONS = frozenset({"sdpa", "flash_attention_2", "flash_attention_3", "flex_attention"})
+
+
+def attention_arm_of(resolved_attn_implementation):
+    """The attention REFERENCE CLASS this run's model actually resolved to
+    (`identity_fields.FINETUNE_IDENTITY_FIELDS`'s `attention_arm`): the
+    RESOLVED implementation, never `--attn` as requested, so a config that
+    silently fell back reads as what ran. `"eager"` → `"eager"`; every HF
+    fused-kernel implementation → `"fused"`; anything else (including the
+    `"absent"` sentinel `run()` records when a config carries no
+    `_attn_implementation` at all) passes through VERBATIM — an unknown
+    string must MISMATCH jammi's `"eager"`/`"fused"` loudly in
+    `ab_merge.leg_premise_violations`, never be guessed into a class.
+    """
+    if resolved_attn_implementation == "eager":
+        return "eager"
+    if resolved_attn_implementation in _FUSED_ATTN_IMPLEMENTATIONS:
+        return "fused"
+    return resolved_attn_implementation
+
+
+def _step_once(model, optimizer, scaler, blocks, mask, args, use_amp, device, trainable, clip_counter):
     """One full forward + cosine-margin triplet loss + backward + optimizer
     step — the exact body the timed loop in `run()` executes, factored out
     so the SAME code can also be run once, untimed, before the timed loop
@@ -691,6 +717,28 @@ def _step_once(model, optimizer, scaler, blocks, mask, args, use_amp, device):
     (post-warmup) call, so `finetune_step.losses` here and
     `finetune_step.rs`'s `losses` field share the same per-step placement
     convention and are comparable step-for-step under that convention.
+
+    `trainable`: the SAME list `torch.optim.AdamW` was constructed over
+    (`run()`'s own `trainable = [p for p in model.parameters() if p.
+    requires_grad]`), threaded through rather than re-derived here so the
+    clip below (when `args.max_grad_norm is not None`) is guaranteed to
+    clip exactly the tensors the optimizer steps, never a param set that
+    could silently drift from it. `args.max_grad_norm is None` (the
+    default) skips clipping entirely — mirrors jammi's own `--max-grad-norm`
+    CLI flag (`crates/jammi-bench/src/main.rs`) absent-by-default.
+    `max_grad_norm` is a member of the SHARED identity set
+    (`ci/scripts/perf/identity_fields.py`'s `FINETUNE_IDENTITY_FIELDS`), so
+    `ab_merge.py`'s generic `leg_premise_violations` refuses a jammi/torch
+    A/B row where the two legs' values differ (a clip-on leg against a
+    clip-off leg is a different step, not a comparable one).
+
+    `clip_counter`: a one-key dict (`{"clip_invocations": int}`) this
+    function increments on EVERY `clip_grad_norm_` call it makes — the
+    COUNTED fact `run()` reports as `finetune_step.clip_invocations`
+    (jammi's twin is `finetune_step.rs`'s `CLIP_INVOCATIONS` delta), which
+    `ab_merge.clip_fact_violations` cross-checks against `max_grad_norm`.
+    Counts the pre-loop call and every warmup/measured loop iteration alike,
+    exactly as jammi's counter does.
     """
     import torch
 
@@ -717,10 +765,32 @@ def _step_once(model, optimizer, scaler, blocks, mask, args, use_amp, device):
 
     if use_amp:
         scaler.scale(loss).backward()
+        if args.max_grad_norm is not None:
+            # AMP requires unscaling BEFORE clipping: the gradients backward()
+            # just produced are scaled by GradScaler's loss-scale factor, and
+            # torch.nn.utils.clip_grad_norm_ has no idea that scale exists —
+            # clipping against the SCALED norm would clip to the wrong
+            # threshold (off by the scale factor, silently). `scaler.
+            # unscale_` divides every trainable tensor's `.grad` by the
+            # current scale in place, exactly once, before the clip; calling
+            # it again inside `scaler.step` is a documented no-op (GradScaler
+            # tracks which optimizer has already been unscaled this step).
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
+            clip_counter["clip_invocations"] += 1
         scaler.step(optimizer)
         scaler.update()
     else:
         loss.backward()
+        if args.max_grad_norm is not None:
+            # Matches jammi's `clip_gradients`/`torch.nn.utils.clip_grad.
+            # _clip_grads_with_norm_`: global L2 norm over every trainable
+            # tensor's gradient, scaled down to `max_grad_norm` when it
+            # exceeds that bound. `trainable` is threaded in from `run()`
+            # (the SAME list `torch.optim.AdamW` was built over), never
+            # re-derived from `model.parameters()` here.
+            torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
+            clip_counter["clip_invocations"] += 1
         optimizer.step()
 
     # Force completion before returning: CUDA's queue is asynchronous, so
@@ -972,7 +1042,13 @@ def run(args):
         # Not counted in `--warmup`/`--steps`, never reported as a timed
         # sample. Runs regardless of device (CPU included), guarded
         # internally for CUDA-only calls.
-        _step_once(model, optimizer, scaler, blocks, mask, args, use_amp, device)
+        #
+        # `clip_counter` starts HERE, before the pre-step, so the reported
+        # `clip_invocations` counts pre-step + warmup + measured — the same
+        # window jammi's `finetune_step.rs` snapshots its `CLIP_INVOCATIONS`
+        # delta over (see `_step_once`'s own doc).
+        clip_counter = {"clip_invocations": 0}
+        _step_once(model, optimizer, scaler, blocks, mask, args, use_amp, device, trainable, clip_counter)
         reference_compile_after_first_forward = getattr(
             model.config, "reference_compile", "absent"
         )
@@ -1003,7 +1079,9 @@ def run(args):
         losses = []
         for step in range(args.warmup + args.steps):
             t0 = time.perf_counter()
-            loss_val = _step_once(model, optimizer, scaler, blocks, mask, args, use_amp, device)
+            loss_val = _step_once(
+                model, optimizer, scaler, blocks, mask, args, use_amp, device, trainable, clip_counter
+            )
             elapsed = time.perf_counter() - t0
             if step >= args.warmup:
                 times.append(elapsed)
@@ -1038,6 +1116,7 @@ def run(args):
                 "seed": args.seed,
                 "batched_forward": args.batched_forward,
                 "margin": args.margin,
+                "max_grad_norm": args.max_grad_norm,
                 "adamw_foreach": adamw_foreach,
                 "moment_warmup_step_executed": True,
             },
@@ -1062,6 +1141,27 @@ def run(args):
                     t.strip() for t in args.target_modules.split(",") if t.strip()
                 ],
                 "batched_forward": args.batched_forward,
+                # `None` (never omitted) when `--max-grad-norm` was not supplied,
+                # mirroring jammi's own FinetuneStepTier::max_grad_norm field doc
+                # (deliberately not skip_serializing_if=is_none): every report from
+                # this build carries an opinion on clipping. A member of the SHARED
+                # identity set (`ci/scripts/perf/identity_fields.py`'s
+                # `FINETUNE_IDENTITY_FIELDS`, where `null` is declared a VALUE for
+                # this field) — `ab_merge.py`'s generic `leg_premise_violations`
+                # refuses a row whose jammi and torch legs differ here.
+                "max_grad_norm": args.max_grad_norm,
+                # The COUNTED fact behind the clip row (jammi's twin is
+                # `FinetuneStepTier::clip_invocations`): how many times this
+                # process actually called `torch.nn.utils.clip_grad_norm_` —
+                # pre-step + warmup + measured — `0` whenever `max_grad_norm` is
+                # `None`. `ab_merge.clip_fact_violations` refuses a leg whose
+                # request and count disagree in kind.
+                "clip_invocations": clip_counter["clip_invocations"],
+                # Identity: the attention REFERENCE CLASS this run resolved to
+                # (`"eager"` | `"fused"`), from the RESOLVED implementation
+                # `attn_implementation` above records raw — see
+                # `attention_arm_of`'s own doc and `identity_fields.py`'s entry.
+                "attention_arm": attention_arm_of(resolved_attn_implementation),
                 "trainable_tensors": len(trainable),
                 "steps_measured": len(times),
                 "losses": losses,
@@ -1204,6 +1304,21 @@ def parse_args(argv=None):
         "its own CLI; the default here matches it.",
     )
     p.add_argument(
+        "--max-grad-norm",
+        type=float,
+        default=None,
+        help="torch.nn.utils.clip_grad_norm_'s max_norm, applied after backward and "
+        "before the optimizer step (AMP: after scaler.unscale_). Mirrors jammi's own "
+        "--max-grad-norm (crates/jammi-bench/src/main.rs), absent by default — omitting "
+        "this flag skips clipping entirely, bit-identical to this script's behaviour "
+        "before this flag existed. Must be finite and > 0.0 when supplied. "
+        "max_grad_norm is a shared identity field (ci/scripts/perf/identity_fields.py's "
+        "FINETUNE_IDENTITY_FIELDS), so ci/scripts/perf/ab_merge.py refuses an A/B row "
+        "where the jammi and torch legs' values differ; a config run with jammi's own "
+        "default (max_grad_norm = 1.0, FineTuneConfig's shipped default) must pass "
+        "--max-grad-norm 1.0 here too.",
+    )
+    p.add_argument(
         "--dry-run",
         action="store_true",
         help="Build a tiny random-init 2-layer ModernBERT, save it to a temp dir, and "
@@ -1233,6 +1348,10 @@ def parse_args(argv=None):
         p.error("--lora-rank must be >= 1")
     if not (0.0 <= args.lora_dropout < 1.0):
         p.error("--lora-dropout must be in [0, 1)")
+    if args.max_grad_norm is not None and not (
+        math.isfinite(args.max_grad_norm) and args.max_grad_norm > 0.0
+    ):
+        p.error("--max-grad-norm must be finite and > 0.0 when supplied")
     return args
 
 

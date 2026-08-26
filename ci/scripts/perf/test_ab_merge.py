@@ -33,6 +33,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -84,6 +85,16 @@ def jammi_fs(dispatches, **overrides):
         "margin": 0.3,
         "target_modules": ["Wqkv", "Wo", "Wi"],
         "batched_forward": True,
+        # PR #381 audit B1/B2: the clip's REQUEST (`null` = clip off, the
+        # sweep's default), its COUNTED fact (`0` when off), and the
+        # attention reference class — all three now on every real
+        # `FinetuneStepTier`. `attention_arm` defaults to `"fused"` here (the
+        # jammi-fused leg is the one the premise check reads); a test that
+        # writes an eager or clip-on leg overrides them explicitly.
+        "max_grad_norm": None,
+        "clip_invocations": 0,
+        "attention_arm": "fused",
+        "warmup": 5,
         "trainable_tensors": 4,
         "steps_measured": 20,
         "losses": [0.3046, 0.3012],
@@ -102,7 +113,12 @@ def jammi_fs(dispatches, **overrides):
         fs[f"{base}_eager_dispatches"] = eager
     fs.update(overrides)
     for key, value in list(fs.items()):
-        if value is None:
+        # `None`-deletes-the-key convention — EXCEPT for the fields where a
+        # real producer's JSON `null` is a VALUE (`identity_fields.
+        # FINETUNE_NULL_IS_A_VALUE_FIELDS`: `max_grad_norm = null` is "clip
+        # off", the sweep's default). A test that wants that key ABSENT
+        # (a pre-#381 binary) deletes it from the returned dict directly.
+        if value is None and key not in ab_merge.FINETUNE_NULL_IS_A_VALUE_FIELDS:
             del fs[key]
     return {"tiers": {"finetune_step": fs}}
 
@@ -158,7 +174,7 @@ def load_fixture_finetune_step(name):
         return json.load(fh)
 
 
-def torch_fs(seed=42, attn_requested="sdpa", lora_alpha=32.0, margin=0.3, **overrides):
+def torch_fs(seed=42, attn_requested="sdpa", lora_alpha=32.0, margin=0.3, warmup=5, **overrides):
     """Builds the FULL top-level `torch_finetune_step.py` report shape, not
     just the `finetune_step` sub-block: `seed`/`attn_requested`/`lora_alpha`/
     `margin` live under `report["args"]` on the REAL torch producer
@@ -188,6 +204,13 @@ def torch_fs(seed=42, attn_requested="sdpa", lora_alpha=32.0, margin=0.3, **over
         "lora_init": "peft",
         "target_modules": ["Wqkv", "Wo", "Wi"],
         "batched_forward": True,
+        # PR #381 audit B1/B2 — same trio as `jammi_fs`, same defaults, so
+        # a matching-premise pair stays matching. `attention_arm` is derived
+        # from the (possibly overridden) `attn_implementation` below, the
+        # way the real producer's `attention_arm_of` derives it, unless a
+        # test overrides `attention_arm` itself.
+        "max_grad_norm": None,
+        "clip_invocations": 0,
         "trainable_tensors": 4,
         "steps_measured": 20,
         "losses": [0.31, 0.10],
@@ -203,9 +226,16 @@ def torch_fs(seed=42, attn_requested="sdpa", lora_alpha=32.0, margin=0.3, **over
         "peak_vram_delta_bytes": {"value": 1000.0, "unit": "bytes"},
     }
     fs.update(overrides)
+    fs.setdefault("attention_arm", "eager" if fs.get("attn_implementation") == "eager" else "fused")
     return {
         "tool": "torch_finetune_step",
-        "args": {"seed": seed, "attn_requested": attn_requested, "lora_alpha": lora_alpha, "margin": margin},
+        "args": {
+            "seed": seed,
+            "attn_requested": attn_requested,
+            "lora_alpha": lora_alpha,
+            "margin": margin,
+            "warmup": warmup,
+        },
         "finetune_step": fs,
     }
 
@@ -1083,6 +1113,310 @@ class LossPrecisionTests(unittest.TestCase):
             with open(os.path.join(out_dir, "finetune_ab_table.txt")) as fh:
                 table = fh.read()
         self.assertIn("0.00195", table)
+
+
+class ClipAndAttentionIdentityTests(unittest.TestCase):
+    """PR #381 audit B1 (+ the lead's class probe): `max_grad_norm` and the
+    attention reference class are IDENTITY — two legs differing in either
+    compute a different step. Before this round `ab_merge.py`'s hand-kept
+    tuple lacked both, so a clip-on jammi leg merged against a clip-off
+    torch leg and printed PASS. Every test here drives `ab_merge.main`
+    against fixture legs, the same way the premise tests above do.
+    """
+
+    def run_merge(self, raw_dir):
+        out_dir = tempfile.mkdtemp()
+        rc = ab_merge.main([raw_dir, out_dir, "20", "5", "0.9"])
+        with open(os.path.join(out_dir, "finetune_ab_report.json")) as fh:
+            merged = json.load(fh)
+        return rc, merged
+
+    def write_pair(self, raw_dir, jammi_overrides=None, torch_overrides=None, torch_sdpa_ok=True):
+        write_leg(raw_dir, "b8-s128-d0", "jammi-eager", report=jammi_fs({}, attention_arm="eager"))
+        write_leg(
+            raw_dir, "b8-s128-d0", "jammi-fused", report=jammi_fs(_CLEAN_YES_DISPATCHES, **(jammi_overrides or {}))
+        )
+        write_leg(raw_dir, "b8-s128-d0", "torch-eager", report=torch_fs(attn_implementation="eager"))
+        if torch_sdpa_ok:
+            write_leg(raw_dir, "b8-s128-d0", "torch-sdpa", report=torch_fs(**(torch_overrides or {})))
+        else:
+            write_leg(raw_dir, "b8-s128-d0", "torch-sdpa", exit_code=1, stderr="CUDA out of memory")
+
+    def test_jammi_clip_on_vs_torch_clip_off_is_refused(self):
+        """THE B1 REPRODUCTION: jammi ran `--max-grad-norm 1.0` (and counted
+        26 clip calls: 20 steps + 5 warmup + 1 pre-step), torch ran with the
+        flag absent. Used to PASS.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self.write_pair(raw_dir, jammi_overrides={"max_grad_norm": 1.0, "clip_invocations": 26})
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertTrue(
+            any("max_grad_norm" in v and "differs" in v for v in cfg["leg_premise_violations"]),
+            cfg["leg_premise_violations"],
+        )
+        self.assertTrue(cfg["verdict"].startswith("INVALID"), cfg["verdict"])
+        self.assertEqual(rc, 1)
+
+    def test_torch_clip_on_vs_jammi_clip_off_is_refused(self):
+        """The mirror image — the refusal is symmetric, not a jammi-only
+        rule."""
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self.write_pair(raw_dir, torch_overrides={"max_grad_norm": 1.0, "clip_invocations": 26})
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertTrue(any("max_grad_norm" in v and "differs" in v for v in cfg["leg_premise_violations"]))
+        self.assertEqual(rc, 1)
+
+    def test_different_max_grad_norm_values_are_refused(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self.write_pair(
+                raw_dir,
+                jammi_overrides={"max_grad_norm": 1.0, "clip_invocations": 26},
+                torch_overrides={"max_grad_norm": 0.5, "clip_invocations": 26},
+            )
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertTrue(any("max_grad_norm" in v and "differs" in v for v in cfg["leg_premise_violations"]))
+        self.assertEqual(rc, 1)
+
+    def test_matching_clip_on_both_sides_is_not_refused(self):
+        """Positive control: a genuinely matched clip-on pair (same bound,
+        both counted) must not false-fail."""
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self.write_pair(
+                raw_dir,
+                jammi_overrides={"max_grad_norm": 1.0, "clip_invocations": 26},
+                torch_overrides={"max_grad_norm": 1.0, "clip_invocations": 26},
+            )
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertEqual(cfg["leg_premise_violations"], [])
+        self.assertFalse(cfg["verdict"].startswith("INVALID"), cfg["verdict"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(cfg["provenance"]["jammi"]["jammi_clip_invocations"], 26)
+        self.assertEqual(cfg["provenance"]["torch"]["torch_clip_invocations"], 26)
+
+    def test_clip_off_on_both_sides_null_is_a_value_not_missing(self):
+        """`max_grad_norm: null` on BOTH legs is the sweep's default (clip
+        OFF) and must compare as a matching VALUE — the round-4 null-folds-
+        to-MISSING rule is deliberately NOT applied to this field
+        (`identity_fields.FINETUNE_NULL_IS_A_VALUE_FIELDS`)."""
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self.write_pair(raw_dir)
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertEqual(cfg["leg_premise_violations"], [])
+        self.assertEqual(rc, 0)
+
+    def test_max_grad_norm_absent_from_a_leg_is_still_missing(self):
+        """A jammi binary built before the field existed: the KEY is absent
+        (not null). Must refuse as MISSING — a producer that cannot state
+        its clip premise is not a matching one."""
+        with tempfile.TemporaryDirectory() as raw_dir:
+            report = jammi_fs(_CLEAN_YES_DISPATCHES)
+            del report["tiers"]["finetune_step"]["max_grad_norm"]
+            del report["tiers"]["finetune_step"]["clip_invocations"]
+            write_leg(raw_dir, "b8-s128-d0", "jammi-eager", report=jammi_fs({}, attention_arm="eager"))
+            write_leg(raw_dir, "b8-s128-d0", "jammi-fused", report=report)
+            write_leg(raw_dir, "b8-s128-d0", "torch-eager", report=torch_fs(attn_implementation="eager"))
+            write_leg(raw_dir, "b8-s128-d0", "torch-sdpa", report=torch_fs())
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertTrue(any("max_grad_norm" in v and "missing" in v for v in cfg["leg_premise_violations"]))
+        self.assertEqual(rc, 1)
+
+    def test_clip_requested_but_never_counted_is_refused(self):
+        """B2: the counted fact must back the request. `max_grad_norm: 1.0`
+        with `clip_invocations: 0` is a row claiming a clip that never
+        ran."""
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self.write_pair(
+                raw_dir,
+                jammi_overrides={"max_grad_norm": 1.0, "clip_invocations": 0},
+                torch_overrides={"max_grad_norm": 1.0, "clip_invocations": 26},
+            )
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertTrue(any("jammi-fused" in v and "clip never ran" in v for v in cfg["leg_premise_violations"]))
+        self.assertEqual(rc, 1)
+
+    def test_clip_counted_but_not_requested_is_refused(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self.write_pair(raw_dir, torch_overrides={"max_grad_norm": None, "clip_invocations": 26})
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertTrue(any("torch-sdpa" in v and "ran anyway" in v for v in cfg["leg_premise_violations"]))
+        self.assertEqual(rc, 1)
+
+    def test_clip_request_without_a_counted_fact_is_refused(self):
+        """`max_grad_norm` present but `clip_invocations` absent: a clip
+        claim with nothing counted behind it."""
+        with tempfile.TemporaryDirectory() as raw_dir:
+            report = jammi_fs(_CLEAN_YES_DISPATCHES, max_grad_norm=1.0)
+            del report["tiers"]["finetune_step"]["clip_invocations"]
+            write_leg(raw_dir, "b8-s128-d0", "jammi-eager", report=jammi_fs({}, attention_arm="eager"))
+            write_leg(raw_dir, "b8-s128-d0", "jammi-fused", report=report)
+            write_leg(raw_dir, "b8-s128-d0", "torch-eager", report=torch_fs(attn_implementation="eager"))
+            write_leg(raw_dir, "b8-s128-d0", "torch-sdpa", report=torch_fs(max_grad_norm=1.0, clip_invocations=26))
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertTrue(any("clip_invocations" in v and "absent" in v for v in cfg["leg_premise_violations"]))
+        self.assertEqual(rc, 1)
+
+    def test_torch_sdpa_oom_fallback_to_torch_eager_is_not_comparable_not_invalid(self):
+        """PR #381 re-audit, face A2: `build_report` falls back to the
+        `torch-eager` leg for PROVENANCE when `torch-sdpa` OOM'd — a
+        documented NON-gating outcome. That leg is the other attention
+        reference class by construction, so the identity check is SKIPPED
+        for the row (never refused as an `attention_arm` mismatch, which
+        would have turned every torch-OOM config into INVALID + exit 1),
+        the reason is recorded, and the verdict/ratio logic is unchanged.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self.write_pair(raw_dir, torch_sdpa_ok=False)
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertIsNone(cfg["leg_premise_violations"])
+        self.assertIsNone(cfg["leg_premise_checked_legs"])
+        self.assertIn("torch-eager is a fallback for torch-sdpa (OOM)", cfg["leg_premise_not_comparable"])
+        self.assertIsNone(cfg["ratio_jammi_fused_over_torch_sdpa"])
+        self.assertFalse(str(cfg["verdict"]).startswith("INVALID"), cfg["verdict"])
+        self.assertEqual(cfg["provenance"]["torch"]["torch_attn_implementation"], "eager")
+        self.assertEqual(rc, 0)
+
+    def test_jammi_fused_failed_fallback_to_jammi_eager_is_not_comparable(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_leg(raw_dir, "b8-s128-d0", "jammi-eager", report=jammi_fs({}, attention_arm="eager"))
+            write_leg(raw_dir, "b8-s128-d0", "jammi-fused", exit_code=1, stderr="CUDA out of memory")
+            write_leg(raw_dir, "b8-s128-d0", "torch-eager", report=torch_fs(attn_implementation="eager"))
+            write_leg(raw_dir, "b8-s128-d0", "torch-sdpa", report=torch_fs())
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertIsNone(cfg["leg_premise_violations"])
+        self.assertIn("jammi-eager is a fallback for jammi-fused (OOM)", cfg["leg_premise_not_comparable"])
+        self.assertFalse(str(cfg["verdict"]).startswith("INVALID (leg premise"), cfg["verdict"])
+
+    def test_preferred_legs_record_no_not_comparable_reason(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self.write_pair(raw_dir)
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertIsNone(cfg["leg_premise_not_comparable"])
+        self.assertEqual(cfg["leg_premise_violations"], [])
+
+    def test_jammi_fused_leg_with_attention_disabled_against_torch_sdpa_is_refused(self):
+        """A `jammi-fused` leg whose operator's `JAMMI_KERNELS_DISABLE`
+        named an attention base (leaked into the fused leg's environment)
+        reads `attention_arm: "eager"` — the REQUEST, not the counters —
+        and must not pair with torch-sdpa."""
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self.write_pair(
+                raw_dir,
+                jammi_overrides={
+                    "attention_arm": "eager",
+                    "kernels_disabled_requested": ["attention_block"],
+                    "kernels_disabled_fired": ["attention_block"],
+                },
+            )
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertTrue(
+            any("attention_arm" in v and "jammi='eager' torch='fused'" in v for v in cfg["leg_premise_violations"]),
+            cfg["leg_premise_violations"],
+        )
+        self.assertEqual(rc, 1)
+
+    def test_domain_declined_counters_do_not_make_a_fused_leg_eager(self):
+        """PR #381 re-audit, face A1: a jammi-fused leg on a checkpoint the
+        fused attention predicate DECLINES BY DOMAIN (e.g. head_dim != 64)
+        has eager attention_block counters but `attention_arm: "fused"`
+        (nothing was disabled). The identity check must NOT refuse it; the
+        counters remain `fused_proof`'s business (this fixture's proof
+        fails for other reasons, and that is the ONLY thing allowed to
+        turn the verdict INVALID here)."""
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self.write_pair(
+                raw_dir,
+                jammi_overrides={"attention_block": None, "attention_block_fused_dispatches": 0, "attention_block_eager_dispatches": 840},
+            )
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertEqual(cfg["leg_premise_violations"], [])
+        self.assertNotIn("leg premise mismatch", str(cfg["verdict"]))
+
+    def test_warmup_mismatch_between_legs_is_refused(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self.write_pair(raw_dir, jammi_overrides={"warmup": 5}, torch_overrides={"warmup": 0})
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertTrue(any("warmup" in v and "differs" in v for v in cfg["leg_premise_violations"]))
+        self.assertEqual(rc, 1)
+
+    def test_attention_arm_absent_from_torch_leg_is_missing(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            torch_report = torch_fs()
+            del torch_report["finetune_step"]["attention_arm"]
+            write_leg(raw_dir, "b8-s128-d0", "jammi-eager", report=jammi_fs({}, attention_arm="eager"))
+            write_leg(raw_dir, "b8-s128-d0", "jammi-fused", report=jammi_fs(_CLEAN_YES_DISPATCHES))
+            write_leg(raw_dir, "b8-s128-d0", "torch-eager", report=torch_fs(attn_implementation="eager"))
+            write_leg(raw_dir, "b8-s128-d0", "torch-sdpa", report=torch_report)
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertTrue(any("attention_arm" in v and "missing" in v for v in cfg["leg_premise_violations"]))
+        self.assertEqual(rc, 1)
+
+
+class SharedIdentityDeclarationTests(unittest.TestCase):
+    """The ONE shared declaration (`identity_fields.FINETUNE_IDENTITY_FIELDS`)
+    is what `ab_merge` iterates AND what both producers must emit. These
+    tests pin the three ends together statically: `ab_merge` carries no
+    tuple of its own; the torch producer's report literal names every
+    member; and jammi's `FinetuneStepTier` names every member (its own
+    Rust-side pin, `finetune_step_tier_emits_every_shared_identity_field`,
+    reads the same tuple from the same file — this test reads the struct
+    source so the pin holds from BOTH languages).
+    """
+
+    REPO = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
+
+    def test_ab_merge_iterates_the_shared_tuple_not_its_own(self):
+        import identity_fields
+
+        self.assertIs(ab_merge.FINETUNE_IDENTITY_FIELDS, identity_fields.FINETUNE_IDENTITY_FIELDS)
+        with open(ab_merge.__file__) as fh:
+            src = fh.read()
+        self.assertNotIn("FINETUNE_IDENTITY_FIELDS = (", src, "ab_merge.py must not redeclare the identity tuple")
+        self.assertIn("max_grad_norm", identity_fields.FINETUNE_IDENTITY_FIELDS)
+        self.assertIn("attention_arm", identity_fields.FINETUNE_IDENTITY_FIELDS)
+
+    def test_torch_producer_emits_every_shared_identity_field(self):
+        path = os.path.join(self.REPO, "crates", "jammi-bench", "reference", "torch_finetune_step.py")
+        with open(path) as fh:
+            src = fh.read()
+        # The report literal: `"args": {` ... and `"finetune_step": {` ...
+        # Both blocks' keys, by the `"<name>":` spelling the literal uses.
+        start = src.index('        report = {')
+        end = src.index("\n        }\n", start)
+        literal = src[start:end]
+        emitted = set(re.findall(r'^\s*"([a-z_0-9]+)":', literal, flags=re.MULTILINE))
+        # `checkpoint_*` come in via `**checkpoint_identity_fields` — the
+        # `checkpoint_identity` helper's own literal.
+        ci_start = src.index("def checkpoint_identity(")
+        ci_end = src.index("\ndef ", ci_start + 1)
+        emitted |= set(re.findall(r'"([a-z_0-9]+)":', src[ci_start:ci_end]))
+        missing = [f for f in ab_merge.FINETUNE_IDENTITY_FIELDS if f not in emitted]
+        self.assertEqual(missing, [], f"torch_finetune_step.py's report literal does not emit {missing}")
+
+    def test_jammi_tier_struct_names_every_shared_identity_field(self):
+        path = os.path.join(self.REPO, "crates", "jammi-bench", "src", "report.rs")
+        with open(path) as fh:
+            src = fh.read()
+        start = src.index("pub struct FinetuneStepTier {")
+        end = src.index("\n}\n", start)
+        fields = set(re.findall(r"^\s*pub ([a-z_0-9]+):", src[start:end], flags=re.MULTILINE))
+        missing = [f for f in ab_merge.FINETUNE_IDENTITY_FIELDS if f not in fields]
+        self.assertEqual(missing, [], f"FinetuneStepTier does not carry {missing}")
 
 
 class EmptyRawDirTests(unittest.TestCase):

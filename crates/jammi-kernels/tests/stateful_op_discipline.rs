@@ -277,6 +277,7 @@ fn the_forbidden_needle_match_is_not_vacuous() {
     // Existing, already-reviewed bare `.apply_op3(` call sites in OTHER
     // (non-Saved-declaring) files must NOT be flagged — the scope
     // restriction is load-bearing, not incidental.
+    // kernel-oracles: fn-in-literal reviewed: grep-discipline fixture text, not code
     let attention_block_text = "pub(crate) fn foo() { qkv.apply_op3(rope_pack, mask, op) }";
     assert!(
         !declares_a_saved_field(attention_block_text),

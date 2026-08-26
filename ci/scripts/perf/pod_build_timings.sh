@@ -23,8 +23,15 @@
 #         BEFORE and AFTER the clone build and asserts the delta is zero
 #         requests — a live check that the wrapper really is off, not an
 #         assumption.
-#   (iv)  byte-equality of the jammi-bench binary and every emitted .ptx
-#         between the clone build (CLONE_DIR) and a COLD build (COLD_DIR) —
+#   (iv)  byte-equality of the DETERMINISTIC release outputs — every
+#         emitted .ptx plus every workspace member's own compiled
+#         libjammi_*.rlib/.rmeta (round-6 fix: the LINKED BINARY,
+#         release/jammi-bench, is EXCLUDED — ThinLTO local-symbol
+#         suffixes make it non-deterministic across two builds of the
+#         IDENTICAL tree on the SAME box with this toolchain (mold
+#         2.35.1 / clang 21), a real, live a100c finding; the excluded
+#         path and reason are named in the JSON's own byte_equal_scope
+#         field, never silently dropped from the claim) —
 #         round-4 addendum: these are DELIBERATELY two DIFFERENT literal
 #         CARGO_TARGET_DIR paths, not the same directory reused; an earlier
 #         revision of this doc said "the SAME target dir path", which was
@@ -43,18 +50,42 @@
 #         (jammi_flash_build_times.txt — wall-clock timing text;
 #         .rustc_info.json — a cache of the toolchain's OWN self-report, not
 #         build output; CACHEDIR.TAG — a static marker; .cargo-*lock — cargo's
-#         own transient lockfiles).
+#         own transient lockfiles). round-6 fix (live a100c run at
+#         63bf905): both snapshots are scoped to release/ ONLY (T2's
+#         `cargo test --no-run` — debug profile by default — leaves
+#         third-party PTX in the CLONE's debug/ subtree, inherited from
+#         the seed, that the COLD dir never has at all; comparing the
+#         whole tree compared two different FILE SETS, not the same
+#         artifacts' bytes). byte_equal_state is a FOUR-state result:
+#         invalid (empty match set on either side) / set_mismatch (both
+#         non-empty, but the PATHS present differ) / true / false — never
+#         collapsed into a bare true/false.
 #   (v)   S_src (git source tree size), S_seed (seed CARGO_TARGET_DIR size),
 #         S_clone (clone CARGO_TARGET_DIR size), copy wall clock, and whether
 #         the filesystem actually reflinked (pod_target_clone.sh's own
 #         du/du---apparent-size printout, parsed back out here).
-#   (vi)  clone wall clock vs ledger row 1's cold baseline (284 s), with the
-#         flash-attn term (T1b, main-only) reported SEPARATELY since row 1's
-#         284 s baseline did not include it.
+#   (vi)  clone wall clock vs THIS SAME RUN's own cold build wall clock
+#         (round-5 fix: no cross-box/uncommitted constant baked in — a
+#         reader computes any delta they want from the two real numbers
+#         both already in the JSON), with the flash-attn term (fa2_wall,
+#         main-only, resolved-sha-gated — round-6 fix, see fa2_ran/
+#         fa2_reason) reported SEPARATELY and always-recorded, never
+#         silently absent with no stated reason.
 #
 # Usage (on the pod, inside the checkout the seed was built from):
-#   JAMMI_FA2_TIP_REF=<ref> JAMMI_BUILD_TIMINGS_OUT=<path> \
+#   JAMMI_FA2_TIP_REF=<ref> JAMMI_BUILD_TIMINGS_OUT=<path> [JAMMI_MAIN_SHA=<sha>] \
 #     ci/scripts/perf/pod_build_timings.sh
+# REQUIRES $JAMMI_TREE_DIR to be a git-backed tree with a reachable
+# 'origin' remote (round-6 fix, lead probe item 2): step (ii) below runs
+# `git fetch` + `git checkout` directly against it — a tree populated
+# purely by `push` (rsync, no `.git` at all — see pod_push_stamp.sh)
+# cannot run this script. Further, the FA2 leg specifically needs
+# `origin/main` to be a RESOLVABLE remote-tracking ref — a bundle clone
+# (this runner's own standard shape; measured on all three real
+# a100c/a100e runs) typically carries no such ref, in which case the FA2
+# leg reports "could not resolve origin/main" and is skipped, not run.
+# Set `JAMMI_MAIN_SHA` explicitly (the runner, from the laptop, already
+# knows it) to bypass that resolution entirely.
 # Writes the result JSON to JAMMI_BUILD_TIMINGS_OUT (never stdout — round-4
 # addendum: this script's own progress markers, `::group::`/`::endgroup::`
 # and every intermediate status line, went to stdout too, so "redirect
@@ -136,13 +167,11 @@ fi
 
 # shellcheck disable=SC1091
 . "$CI_SCRIPTS/pod_seed_target.sh"
-# round-5 note: no pod_push_* function is actually called anywhere else in
-# THIS file (grep confirms) — this sourcing is vestigial. Left in place
-# (removing it is a separate, non-behavior-changing cleanup) but the
-# swallow is now named honestly: a source failure here can never affect
-# this script's own correctness, since nothing downstream depends on it.
-# shellcheck disable=SC1091
-. "$CI_SCRIPTS/pod_push_stamp.sh" 2>/dev/null || true # tripwire-ok: dead/vestigial sourcing -- no pod_push_* function is called anywhere else in this file, so a failure here is inert by construction, not silently masking a real dependency
+# round-6 advisory (folded): the round-5 sourcing of pod_push_stamp.sh
+# here was dead code (no pod_push_* function was ever called directly by
+# THIS file — pod_provision_cutlass.sh invokes it as a separate `bash`
+# subprocess, never via this script's own sourced namespace) — deleted,
+# never merely re-annotated.
 
 cd "$JAMMI_TREE_DIR" || fail "no tree at $JAMMI_TREE_DIR"
 
@@ -198,43 +227,46 @@ echo "::endgroup::"
 S_src_bytes="$(du -sk --exclude=.git "$JAMMI_TREE_DIR" 2>/dev/null | awk '{print $1*1024}')" # tripwire-ok: same as S_seed_bytes above -- best-effort report-only size, empty result -> JSON null, never a silent zero
 
 # ---- (ii) clone build at the FA2 tip -------------------------------------
+# round-6 fix (lead probe item 2): this whole leg REQUIRES $JAMMI_TREE_DIR
+# to be a git-backed tree with a remote ("origin") that actually carries
+# history — a tree populated purely by `push` (rsync, no .git — see
+# pod_push_stamp.sh) cannot run this script at all, and even a git-backed
+# BUNDLE clone (this runner's own standard shape, measured on all three
+# real a100c/a100e runs) typically carries no `origin/main` remote-
+# tracking ref, which is why the FA2 leg below reliably reports "could
+# not resolve origin/main" on every such run — not a bug in that leg, a
+# real precondition of the whole (ii) block. Named explicitly in both
+# `fail` messages (the OLD messages here said only "failed", not why),
+# and `JAMMI_MAIN_SHA` (see the FA2 gate below) is the escape hatch for a
+# runner that already knows main's sha without needing a resolvable
+# origin/main remote-tracking ref at all.
 echo "::group::(ii) clone build @ ${JAMMI_FA2_TIP_REF}"
-git fetch --all --tags --prune --quiet || fail "git fetch failed"
-git checkout --quiet "$JAMMI_FA2_TIP_REF" || fail "checkout of ${JAMMI_FA2_TIP_REF} failed"
-# round-3 audit N1: the checkout ALONE does not move a submodule's checked-
-# out commit — `git submodule update` was never called after the checkout
-# at all, so cutlass silently stayed on whatever commit it was at BEFORE
-# (compiling the WRONG headers against this tip). Always re-sync it to
-# THIS checkout's own gitlink, then assert the submodule's actual HEAD
-# equals the superproject's pin — refusing loudly rather than silently
-# building stale/mismatched CUTLASS headers.
-# Gated on `.gitmodules` DECLARING the path (this ref's own tree), never on
-# whether the submodule dir already happens to have a `.git` — the OLD
-# guard required a PRE-EXISTING `.git` before it would even try
-# `--init`, which defeats the entire purpose of `--init` (first-time
-# initialisation) on a fresh pod that has never touched cutlass before.
-if grep -q 'crates/jammi-kernels/third_party/cutlass' .gitmodules 2>/dev/null; then # tripwire-ok: a missing .gitmodules is a REAL, valid state on a ref that never carried the cutlass submodule at all -- the whole cutlass-pin block below is correctly SKIPPED, not silently passed
-  git submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass \
-    || fail "git submodule update for cutlass failed after checking out ${JAMMI_FA2_TIP_REF}"
-  [ -d "crates/jammi-kernels/third_party/cutlass/.git" ] || [ -f "crates/jammi-kernels/third_party/cutlass/.git" ] \
-    || fail "crates/jammi-kernels/third_party/cutlass has no .git after submodule update — deinitialised or never checked out"
-  _pinned_sha="$(git rev-parse "HEAD:crates/jammi-kernels/third_party/cutlass" 2>/dev/null || true)" # tripwire-ok: rc discarded deliberately -- an empty result here is a REAL, checked state (see the round-5 fix right below), never silently treated as "no pin to check"
-  _actual_sha="$(git -C crates/jammi-kernels/third_party/cutlass rev-parse HEAD 2>/dev/null || true)" # tripwire-ok: same -- submodule dir's own HEAD read; empty is impossible here (the .git existence check two lines up already guarantees a real checkout), kept symmetric with _pinned_sha's form
-  # round-5 fix (round-4 audit advisory, promoted): the OLD guard only
-  # compared the two shas when BOTH were non-empty (`[ -n "$_pinned_sha" ]
-  # && ...`) — an EMPTY `_pinned_sha` (this ref's own HEAD has NO gitlink
-  # at this path even though .gitmodules — checked just above — DOES
-  # declare it: a gitlink removed at this exact ref while .gitmodules
-  # still lists the path) silently skipped the whole assertion. ".gitmodules
-  # declares the path" is what gated entry into this block in the first
-  # place, so an empty pin here is itself the anomaly to report, never a
-  # silent "nothing to check".
-  if [ -z "$_pinned_sha" ]; then
-    fail ".gitmodules declares crates/jammi-kernels/third_party/cutlass but HEAD has no gitlink there (empty 'git rev-parse HEAD:<path>') — refusing to build against an unpinned cutlass checkout"
-  fi
-  if [ "$_pinned_sha" != "$_actual_sha" ]; then
-    fail "cutlass MISMATCH after submodule update: superproject pins ${_pinned_sha}, submodule is actually at ${_actual_sha}"
-  fi
+git fetch --all --tags --prune --quiet \
+  || fail "git fetch failed — this script requires \$JAMMI_TREE_DIR to be a git-backed tree with a reachable 'origin' remote (a tree populated purely by 'push' has no .git at all and cannot run this script)"
+git checkout --quiet "$JAMMI_FA2_TIP_REF" \
+  || fail "checkout of ${JAMMI_FA2_TIP_REF} failed — \$JAMMI_TREE_DIR must be a git-backed tree whose 'origin' remote actually carries this ref (see the (ii) block's own module-doc note)"
+# round-6 fix (audit item 1 — the class this round closes: "the scripts
+# assume a git state of the tree that a pushed/provisioned tree does not
+# have"): the OLD form ran `git submodule update --init` DIRECTLY on
+# $JAMMI_TREE_DIR's own cutlass path — but that SAME path can ALREADY be
+# populated by an earlier `target --with-cutlass` copy-provisioning call
+# (pod_provision_cutlass.sh's own `cp -a` + `rm -rf .git`), which git's
+# own submodule machinery REFUSES to touch (a non-empty, non-submodule-
+# shaped directory) — the live a100c failure: rc=1, wall=819s wasted
+# before failing. ONE provisioning surface now handles cutlass in EVERY
+# tree pod_build_timings.sh operates on: pod_provision_cutlass.sh's own
+# `rm -rf` + `cp -a` never asks git to touch the destination path at all
+# — a stale copy-provisioned dir, an empty dir, or a never-touched path
+# are all handled identically — and it derives the expected pin from
+# $JAMMI_TREE_DIR's OWN git index (this checkout just fetched+checked out
+# $JAMMI_FA2_TIP_REF above, so its recorded gitlink pin at this path IS
+# the correct expectation) rather than requiring a push-stamp file — see
+# that script's own citation for the full mechanism (including its own
+# content-floor validation of SUPER_DIR's submodule before ever copying
+# from it).
+if grep -q 'crates/jammi-kernels/third_party/cutlass' .gitmodules 2>/dev/null; then # tripwire-ok: a missing .gitmodules is a REAL, valid state on a ref that never carried the cutlass submodule at all -- provisioning is correctly SKIPPED, not silently passed
+  bash "$CI_SCRIPTS/pod_provision_cutlass.sh" "$JAMMI_TREE_DIR" \
+    || fail "cutlass provisioning into ${JAMMI_TREE_DIR} failed (pod_provision_cutlass.sh, after checking out ${JAMMI_FA2_TIP_REF}) — see the ::error:: above"
 fi
 CLONE_DIR="/root/.jammi-clone-a2"
 rm -rf "$CLONE_DIR"
@@ -280,8 +312,43 @@ S_clone_bytes="$(du -sk "$CLONE_DIR" 2>/dev/null | awk '{print $1*1024}')" # tri
 # files — `pod_sha256_of_file`, sourced from pod_seed_target.sh above,
 # prefers coreutils sha256sum and refuses loudly rather than printing
 # nothing if neither hashing tool exists).
-snapshot_hashes() { # $1=dir -> "path<TAB>sha256" lines, denylist excluded, sorted
-  find "$1" -type f \( -name 'jammi-bench' -o -name '*.ptx' \) \
+# round-6 fix (live a100c run at 63bf905, real evidence: byte_equal=false
+# with 54 files on the clone side vs 21 on the cold side, clone+cold wall
+# 360s): this used to `find "$1"` UNSCOPED across the WHOLE target dir,
+# matching *.ptx/jammi-bench in BOTH debug/ and release/ — but T1 (the
+# command this leg actually measures, `cargo build --release`) and the
+# cold leg both build ONLY the release profile. The CLONE inherits the
+# SEED's own debug/ subtree too (T2's `cargo test --no-run` — debug
+# profile by default, no --release flag — leaves third-party dependency
+# PTX files there that survive the seed's own member-free clean since
+# they belong to non-jammi crates), while COLD_DIR never had anything
+# but a release build run against it at all, so it has no debug/
+# subtree. The two snapshots were comparing DIFFERENT FILE SETS, not the
+# same artifacts' bytes — scoping to release/ (the ONE profile both legs
+# actually build) makes this a like-for-like comparison BY CONSTRUCTION,
+# never merely asserted after the fact.
+# round-6 fix (audit item B, live a100c evidence): release/jammi-bench —
+# the FINAL LINKED BINARY — carries 467 ThinLTO local-symbol suffixes
+# (anon.<h>.N.llvm.<hash>) that differ between TWO BUILDS OF THE
+# IDENTICAL TREE ON THE SAME BOX (mold 2.35.1 / clang 21's own ThinLTO
+# codegen is not byte-deterministic for the linked binary), while every
+# one of the 20 release/*.ptx files this leg also hashes IS byte-
+# identical clone<->cold, across boxes, across passes — and rustc's own
+# compiled outputs for workspace members (.rlib/.rmeta) are equally
+# deterministic. Binary byte-equality is UNATTAINABLE with this
+# toolchain; comparing it anyway makes a real, attainable claim (every
+# DETERMINISTIC output byte-matches) read as a permanent false negative.
+# The comparison set is release/*.ptx + release/**/libjammi_*.rlib|
+# .rmeta (workspace members' own compiled outputs, for the measured
+# feature set) — the linked binary is EXCLUDED, named explicitly in the
+# JSON (byte_equal_scope), never silently dropped from the claim.
+snapshot_hashes() { # $1=dir -> "path<TAB>sha256" lines, denylist excluded, sorted, release/ ONLY
+  # tripwire-ok (the 2>/dev/null on the find below): a missing release/
+  # subtree (a build that produced nothing where something was expected)
+  # yields an empty match set, which the caller's own byte_equal=
+  # "invalid" path (empty-set floor) catches explicitly -- never a
+  # silent pass.
+  find "$1/release" -type f \( -name '*.ptx' -o -name 'libjammi_*.rlib' -o -name 'libjammi_*.rmeta' \) 2>/dev/null \
     | grep -Ev "$DENYLIST_RE" \
     | while read -r f; do printf '%s\t%s\n' "${f#"$1"/}" "$(pod_sha256_of_file "$f")"; done | sort
 }
@@ -291,6 +358,8 @@ recompiled="$(grep -oE '^ *Compiling [^ ]+' /tmp/pod_build_timings.clone_t1.log 
 
 fa2_wall=""
 fa2_features=""
+fa2_ran="false"
+fa2_reason=""
 # Detected via pod_seed_pkg_has_feature (sourced from pod_seed_target.sh
 # above), never hand-asserted: `jammi-encoders/flash-attn` does not exist
 # (round-2 audit finding 3) — flash-attn lives on jammi-kernels, forwarded
@@ -298,7 +367,42 @@ fa2_features=""
 # FA2 leg gets its OWN clone dir (fresh from the seed) and its OWN log —
 # never CLONE_DIR/the T1 log, which are already snapshotted above and must
 # stay untouched by anything that runs after this point.
-if [ "$(git rev-parse --abbrev-ref HEAD)" = "main" ]; then
+#
+# round-6 fix (audit item 4, the class this round closes: "the scripts
+# assume a git state of the tree that a pushed/provisioned tree does not
+# have"): the OLD gate compared `git rev-parse --abbrev-ref HEAD` to the
+# literal "main" — but this leg runs AFTER `git checkout --quiet
+# "$JAMMI_FA2_TIP_REF"` (:203 above), which checks out BY SHA whenever
+# JAMMI_FA2_TIP_REF is a sha (the ordinary case for an FA2 PR tip) — a
+# checkout-by-sha ALWAYS leaves a DETACHED HEAD, whose abbrev-ref reads
+# the literal string "HEAD", never any branch name. The OLD gate could
+# therefore never match in the ordinary case, and — with no `else` arm at
+# all — the ENTIRE FA2 measurement leg silently vanished: fa2_wall stayed
+# empty (flash_attn_leg_wall_s: null in the committed JSON) with NO
+# recorded reason, indistinguishable from "ran and measured nothing" or
+# "correctly determined this isn't main". Gated on the RESOLVED sha
+# instead — identical whether the checkout landed on a real branch or a
+# detached HEAD — and fa2_ran/fa2_reason are now ALWAYS recorded,
+# mirroring the seed's own t1b_flash_attn_ran/reason
+# (pod_seed_target.sh's completion marker), so a reader of the committed
+# JSON never has to guess why this leg did or did not run.
+_head_sha="$(git rev-parse HEAD)"
+# round-6 fix (lead probe item 2): `origin/main` is UNRESOLVABLE on a
+# bundle clone (this runner's own standard shape — measured on all three
+# real a100c/a100e runs: origin carries no main remote-tracking ref at
+# all), which made this leg report "could not resolve origin/main" every
+# time on real hardware, never actually exercising the FA2 leg end to
+# end. `JAMMI_MAIN_SHA` is an explicit escape hatch: a caller (the
+# runner, from the laptop) that already KNOWS main's sha can pass it
+# directly, bypassing the need for a resolvable remote-tracking ref.
+if [ -n "${JAMMI_MAIN_SHA:-}" ]; then
+  _main_sha="$JAMMI_MAIN_SHA"
+  _main_sha_source="JAMMI_MAIN_SHA override"
+else
+  _main_sha="$(git rev-parse --verify --quiet origin/main 2>/dev/null || true)" # tripwire-ok: no origin/main remote-tracking ref (e.g. a bundle clone, or a fetch that never populated it) is a REAL state; the empty result is checked explicitly right below (fa2_reason names it), never silently treated as "on main"
+  _main_sha_source="origin/main"
+fi
+if [ -n "$_main_sha" ] && [ "$_head_sha" = "$_main_sha" ]; then
   feat_rc=0
   pod_seed_pkg_has_feature jammi-kernels flash-attn || feat_rc=$?
   if [ "$feat_rc" -eq 0 ]; then
@@ -315,13 +419,18 @@ if [ "$(git rev-parse --abbrev-ref HEAD)" = "main" ]; then
       if [ "$fa2_rc" -eq 0 ]; then
         fa2_wall=$((fa2_t1 - fa2_t0))
         fa2_features="cuda,jammi-kernels/flash-attn"
+        fa2_ran="true"
+        fa2_reason="declared (cargo metadata) and built (resolved sha ${_head_sha} matches ${_main_sha_source})"
       else
+        fa2_reason="FA2 leg build failed (exit ${fa2_rc}) — see /tmp/pod_build_timings.clone_fa2.log; T1's own snapshot is unaffected"
         echo "::warning::FA2 leg build failed (exit $fa2_rc) — see /tmp/pod_build_timings.clone_fa2.log; T1's own snapshot above is unaffected" >&2
       fi
     else
+      fa2_reason="FA2 leg's own clone was refused (member-freedom check) — see the log above; T1's own snapshot is unaffected"
       echo "::warning::FA2 leg's own clone at ${CLONE_FA2_DIR} was refused (member-freedom check) — see the log above; T1's own snapshot is unaffected" >&2
     fi
   elif [ "$feat_rc" -eq 1 ]; then
+    fa2_reason="jammi-kernels declares no flash-attn feature (cargo metadata, resolved sha ${_head_sha})"
     echo "FA2 leg skipped: jammi-kernels declares no flash-attn feature (cargo metadata)"
   else
     # round-5 fix (round-4 audit finding, family O — "trace the mechanism
@@ -341,6 +450,10 @@ if [ "$(git rev-parse --abbrev-ref HEAD)" = "main" ]; then
     # T1b gate was fixed for in round 4).
     fail "FA2 leg: could not determine whether jammi-kernels declares flash-attn (cargo metadata query failed or the package was not found) — refusing to guess 'absent'; see pod_seed_pkg_has_feature's own ::error:: above for the real cause"
   fi
+elif [ -z "$_main_sha" ]; then
+  fa2_reason="could not resolve ${_main_sha_source} (no such remote-tracking ref found after 'git fetch --all --tags --prune' — this tree's 'origin' remote may not carry main at all, the ordinary shape for a bundle clone; set JAMMI_MAIN_SHA to bypass) — FA2 is main-only by design, skipping"
+else
+  fa2_reason="resolved sha ${_head_sha} != ${_main_sha_source} (${_main_sha}) — FA2 is main-only by design, skipping"
 fi
 echo "::endgroup::"
 
@@ -381,9 +494,30 @@ cold_hashes="$(snapshot_hashes "$COLD_DIR")"
 # expected). A non-empty match set on BOTH sides is required before
 # "equal" can mean anything; otherwise the comparison is INVALID, not a
 # silent true.
+clone_paths="$(printf '%s' "$clone_hashes" | cut -f1)"
+cold_paths="$(printf '%s' "$cold_hashes" | cut -f1)"
+clone_file_count="$(printf '%s' "$clone_hashes" | grep -c . || true)" # tripwire-ok: grep -c on an empty string legitimately returns 0 with rc=1 (no lines matched) -- the count itself (0) is exactly what byte_equal="invalid" below reads, never a silent miscount
+cold_file_count="$(printf '%s' "$cold_hashes" | grep -c . || true)" # tripwire-ok: same as clone_file_count above
+# round-6 fix: recorded in the JSON below so a reader (or a future CI
+# check) can confirm a `set_mismatch` verdict, or independently notice a
+# future one, WITHOUT re-deriving the full path list from raw logs — a
+# compact fingerprint of "which artifacts did this side even produce".
+clone_path_set_sha256="$(printf '%s\n' "$clone_paths" | pod_sha256_of_stdin)"
+cold_path_set_sha256="$(printf '%s\n' "$cold_paths" | pod_sha256_of_stdin)"
 if [ -z "$clone_hashes" ] || [ -z "$cold_hashes" ]; then
   byte_equal="invalid"
   byte_equal_diff="clone_hashes or cold_hashes matched ZERO files (clone empty: $([ -z "$clone_hashes" ] && echo yes || echo no); cold empty: $([ -z "$cold_hashes" ] && echo yes || echo no)) — the byte-equality comparison is MEANINGLESS, not a pass"
+elif [ "$clone_paths" != "$cold_paths" ]; then
+  # round-6 fix (live a100c run at 63bf905): a SET mismatch (different
+  # PATHS present, e.g. the debug/-vs-release/ scoping bug snapshot_hashes
+  # itself was just fixed for above) is a DISTINCT finding from a byte
+  # mismatch on files both sides agree exist — collapsing it into "false"
+  # reads, at a glance, exactly like a genuine build-reproducibility
+  # regression, when the real story is "the oracle compared two different
+  # sets of artifacts, not the same artifacts' bytes." Named explicitly,
+  # with the symmetric difference (paths present on only one side).
+  byte_equal="set_mismatch"
+  byte_equal_diff="$(diff <(printf '%s\n' "$clone_paths") <(printf '%s\n' "$cold_paths"))"
 elif [ "$clone_hashes" = "$cold_hashes" ]; then
   byte_equal="true"; byte_equal_diff=""
 else
@@ -410,12 +544,16 @@ RECOMPILED="$recompiled" SCCACHE_DELTA_NOTE="$sccache_delta_note" \
   "$copy_wall" "$reflink_took" "$S_src_bytes" "$S_seed_bytes" "$S_clone_bytes" \
   "$byte_equal" "$(date -u +%FT%TZ)" "$cold_wall" "$LOCK_HELD" "$clone_features" "$cold_features" "$fa2_features" \
   "$seed_tuples_json" "$seed_t1b_ran" "$seed_t1b_reason" \
+  "$clone_file_count" "$cold_file_count" "$clone_path_set_sha256" "$cold_path_set_sha256" "$byte_equal_diff" \
+  "$fa2_ran" "$fa2_reason" \
   > "$JAMMI_BUILD_TIMINGS_OUT" <<'PY'
 import json, sys, os
 (box, sha, tip_ref, clone_wall, fa2_wall, copy_wall, reflink_took,
  s_src, s_seed, s_clone, byte_equal, ts, cold_wall, lock_held,
  clone_features, cold_features, fa2_features,
- seed_tuples_json, seed_t1b_ran, seed_t1b_reason) = sys.argv[1:21]
+ seed_tuples_json, seed_t1b_ran, seed_t1b_reason,
+ clone_file_count, cold_file_count, clone_path_set_sha256, cold_path_set_sha256,
+ byte_equal_diff, fa2_ran, fa2_reason) = sys.argv[1:28]
 try:
     seed_tuples = json.loads(seed_tuples_json)
 except Exception:
@@ -431,6 +569,15 @@ result = {
     "clone_build_wall_s": int(clone_wall),
     "cold_build_wall_s": int(cold_wall),
     "flash_attn_leg_wall_s": int(fa2_wall) if fa2_wall else None,
+    # round-6 fix (audit item 4): ALWAYS recorded, mirroring seed_t1b_*
+    # above — a reader never has to guess whether flash_attn_leg_wall_s
+    # is null because this leg correctly determined it should not run
+    # (fa2_ran=false, a real reason given) vs. silently failed to run at
+    # all (the exact class this fix closes: the OLD gate compared HEAD's
+    # own detached-after-checkout-by-sha abbrev-ref to "main", which
+    # never matched, with no else arm to record why).
+    "fa2_ran": fa2_ran == "true",
+    "fa2_reason": fa2_reason or None,
     "copy_wall_s": int(copy_wall),
     "reflink": reflink_took,
     "S_src_bytes": int(s_src) if s_src else None,
@@ -477,7 +624,34 @@ result = {
   # NAME still asserted the claim the doc retracted. Renamed to describe
   # what the mechanism actually compares.
   "byte_equal_clone_vs_cold": byte_equal == "true",
+  # round-6 fix (live a100c run at 63bf905: byte_equal=false because the
+  # clone snapshot enumerated 54 files — it inherited the seed's debug/
+  # build outputs — against the cold snapshot's 21 release-only files; a
+  # SET mismatch, not a byte mismatch, reported as a bare "false"
+  # indistinguishable from a genuine reproducibility regression).
+  # `byte_equal_state` now includes "set_mismatch" as its own value
+  # (distinct from "true"/"false"/"invalid"); these four fields record
+  # what each side's snapshot actually enumerated so a reader — or this
+  # producer's own next run — never has to re-derive it from raw logs to
+  # tell "different artifacts" from "different bytes of the same
+  # artifacts".
   "byte_equal_state": byte_equal,
+  "clone_file_count": int(clone_file_count) if clone_file_count else 0,
+  "cold_file_count": int(cold_file_count) if cold_file_count else 0,
+  "clone_path_set_sha256": clone_path_set_sha256,
+  "cold_path_set_sha256": cold_path_set_sha256,
+  "byte_equal_diff": byte_equal_diff if byte_equal != "true" else None,
+  # round-6 fix (audit item B, live a100c evidence): binary byte-equality
+  # is UNATTAINABLE with this toolchain (release/jammi-bench carries 467
+  # ThinLTO local-symbol suffixes that differ between two builds of the
+  # IDENTICAL tree on the SAME box — mold 2.35.1 / clang 21's own ThinLTO
+  # codegen). Recorded explicitly, a constant description of what THIS
+  # comparison covers and what it deliberately excludes (and why) — never
+  # a claim the linked binary matches when it structurally cannot.
+  "byte_equal_scope": {
+    "compared": ["release/*.ptx", "release/**/libjammi_*.rlib", "release/**/libjammi_*.rmeta"],
+    "excluded": ["release/jammi-bench: thinlto-local-symbol-nondeterminism (mold 2.35.1 / clang 21 — differs between two builds of the identical tree on the same box)"],
+  },
   "sccache_note": os.environ.get("SCCACHE_DELTA_NOTE", ""),
   "sccache_before": os.environ.get("SCCACHE_BEFORE", ""),
   "sccache_after": os.environ.get("SCCACHE_AFTER", ""),
@@ -493,6 +667,9 @@ PY
 # from one where (iv) genuinely passed or genuinely failed.
 if [ "$byte_equal" = "invalid" ]; then
   fail "byte-equality check (iv) is INVALID, not a pass or a fail: $byte_equal_diff"
+elif [ "$byte_equal" = "set_mismatch" ]; then
+  echo "::warning::byte-equality check (iv) is a SET MISMATCH (iv), not a byte-level pass/fail — clone_file_count=${clone_file_count} cold_file_count=${cold_file_count}; the two sides enumerated DIFFERENT artifacts, see diff below" >&2
+  echo "$byte_equal_diff" >&2
 elif [ "$byte_equal" != "true" ]; then
   echo "::warning::byte-equality FAILED (iv) — see diff below" >&2
   echo "$byte_equal_diff" >&2

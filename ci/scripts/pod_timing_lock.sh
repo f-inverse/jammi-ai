@@ -86,7 +86,7 @@ done
 [ ${#flock_args[@]} -gt 0 ] || usage
 [ $# -ge 1 ] || { echo "::error::no command given after --" >&2; exit 2; }
 
-command -v flock >/dev/null 2>&1 || {
+command -v flock >/dev/null 2>&1 || {  # tripwire-ok: command -v's own existence probe -- absence is the EXPECTED, checked branch (elif/fallback/error right here), never a silent pass
   echo "::error::flock (util-linux) not found on PATH — the pod image is expected to carry it" >&2
   exit 2
 }

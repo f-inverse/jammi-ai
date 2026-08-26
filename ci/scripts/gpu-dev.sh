@@ -645,7 +645,21 @@ EOF
       [ -n "$pat" ] || continue
       EXCLUDE_ARGS+=(--exclude "$pat")
     done < <("$DIR/pod_push_stamp.sh" excludes)
-    rsync -azc --no-times --delete "${EXCLUDE_ARGS[@]}" \
+    # round-6 audit item D (a real, class-shaped failure: "the scripts
+    # assume a git state of the tree that a pushed/provisioned tree does
+    # not have"): `-a` (archive) includes `-o -g` (preserve owner/group)
+    # — meaningful only when the RECEIVING process can chown, which this
+    # one can, since it connects as root@pod. Without `--no-owner
+    # --no-group`, the pushed tree's files land OWNED BY THE LAPTOP
+    # USER's uid (e.g. 501 for a typical macOS account), copied verbatim
+    # from the local files' own metadata — NOT root, even though rsync
+    # itself runs as root on the receiving end. `git`, run later inside
+    # that SAME tree as root, then refuses with "fatal: detected dubious
+    # ownership" (euid root != file owner uid 501) on both the tree and
+    # its submodule. `--no-owner --no-group` makes the receiver leave
+    # ownership at its own create-time default (root:root, since the
+    # connection itself is root@pod), never copying the laptop's uid.
+    rsync -azc --no-times --no-owner --no-group --delete "${EXCLUDE_ARGS[@]}" \
       -e "ssh ${RP_SSHO[*]} -p ${RP_PORT}" \
       "${REPO_ROOT}/" "root@${RP_HOST}:${TREE_DIR}/" \
       && echo "=== pushed $(basename "$REPO_ROOT") → pod (tree: ${TREE}) ==="
@@ -653,7 +667,7 @@ EOF
     if [ "$rc" -eq 0 ]; then
       STAMP="$(mktemp)"
       "$DIR/pod_push_stamp.sh" compute "$REPO_ROOT" "$SESSION" > "$STAMP" \
-        && rsync -az -e "ssh ${RP_SSHO[*]} -p ${RP_PORT}" \
+        && rsync -az --no-owner --no-group -e "ssh ${RP_SSHO[*]} -p ${RP_PORT}" \
              "$STAMP" "root@${RP_HOST}:${TREE_DIR}/.jammi-push-stamp.json" \
         && echo "=== push-stamp written to ${TREE_DIR}/.jammi-push-stamp.json (iteration provenance only — a COMMITTED artifact still requires a pushed sha) ==="
       rm -f "$STAMP"

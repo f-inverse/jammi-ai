@@ -74,9 +74,9 @@ FAILED_MARKER="${JAMMI_SEED_DIR}.jammi-seed-failed"
 # absent on the pod) only if `sha256sum` itself is missing; loudly refuse
 # (rc=2, never a silent empty string) if NEITHER exists.
 pod_sha256_of_file() { # $1=file
-  if command -v sha256sum >/dev/null 2>&1; then
+  if command -v sha256sum >/dev/null 2>&1; then  # tripwire-ok: command -v's own existence probe -- absence is the EXPECTED, checked branch (elif/fallback/error right here), never a silent pass
     sha256sum "$1" | awk '{print $1}'
-  elif command -v shasum >/dev/null 2>&1; then
+  elif command -v shasum >/dev/null 2>&1; then  # tripwire-ok: command -v's own existence probe -- absence is the EXPECTED, checked branch (elif/fallback/error right here), never a silent pass
     shasum -a 256 "$1" | awk '{print $1}'
   else
     echo "::error::pod_sha256_of_file: neither sha256sum nor shasum found on PATH — cannot hash $1" >&2
@@ -84,9 +84,9 @@ pod_sha256_of_file() { # $1=file
   fi
 }
 pod_sha256_of_stdin() {
-  if command -v sha256sum >/dev/null 2>&1; then
+  if command -v sha256sum >/dev/null 2>&1; then  # tripwire-ok: command -v's own existence probe -- absence is the EXPECTED, checked branch (elif/fallback/error right here), never a silent pass
     sha256sum | awk '{print $1}'
-  elif command -v shasum >/dev/null 2>&1; then
+  elif command -v shasum >/dev/null 2>&1; then  # tripwire-ok: command -v's own existence probe -- absence is the EXPECTED, checked branch (elif/fallback/error right here), never a silent pass
     shasum -a 256 | awk '{print $1}'
   else
     echo "::error::pod_sha256_of_stdin: neither sha256sum nor shasum found on PATH" >&2
@@ -105,9 +105,9 @@ pod_sha256_of_stdin() {
 pod_seed_assert_required_tools() {
   local missing="" t
   for t in cargo git python3; do
-    command -v "$t" >/dev/null 2>&1 || missing="${missing}${missing:+ }${t}"
+    command -v "$t" >/dev/null 2>&1 || missing="${missing}${missing:+ }${t}"  # tripwire-ok: command -v's own existence probe -- absence is the EXPECTED, checked branch (elif/fallback/error right here), never a silent pass
   done
-  command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 || missing="${missing}${missing:+ }sha256sum-or-shasum"
+  command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 || missing="${missing}${missing:+ }sha256sum-or-shasum"  # tripwire-ok: command -v's own existence probe -- absence is the EXPECTED, checked branch (elif/fallback/error right here), never a silent pass
   if [ -n "$missing" ]; then
     echo "::error::pod_seed_assert_required_tools: missing required tool(s): ${missing}" >&2
     return 1
@@ -709,6 +709,31 @@ pod_seed_target_main() {
     set -euo pipefail
     cd "$JAMMI_TREE_DIR" || { echo "no tree at $JAMMI_TREE_DIR"; exit 1; }
     sha="$(git rev-parse HEAD)"; ref="$(git rev-parse --abbrev-ref HEAD)"
+    # round-6 fix (lead probe, same class as pod_build_timings.sh's own
+    # FA2 gate fix): `ref` above is kept as-is for the completion
+    # marker's own informational "ref" field (a genuinely detached HEAD
+    # SHOULD read literally "HEAD" there) — but gating T1b on `ref =
+    # "main"` has the identical detached-HEAD hole: a seed built from a
+    # bundle/sha checkout AT main's exact commit reads abbrev-ref "HEAD",
+    # never "main", so T1b silently never runs. Gated on the RESOLVED
+    # sha instead, with an explicit `JAMMI_SEED_IS_MAIN=1` override for a
+    # caller (the bootstrap) that already KNOWS it is on main without
+    # needing to re-derive it, and an honest reason when origin/main
+    # itself cannot be resolved at all (never conflated with "genuinely
+    # not on main").
+    _seed_main_sha="$(git rev-parse --verify --quiet origin/main 2>/dev/null || true)" # tripwire-ok: no origin/main remote-tracking ref is a REAL state (e.g. a bundle clone with no such remote) -- named explicitly in t1b_reason below, never silently treated as "not main"
+    _seed_is_main="false"
+    if [ "${JAMMI_SEED_IS_MAIN:-0}" = "1" ]; then
+      _seed_is_main="true"
+      _seed_main_reason="JAMMI_SEED_IS_MAIN=1 override"
+    elif [ -z "$_seed_main_sha" ]; then
+      _seed_main_reason="could not resolve origin/main (no such remote-tracking ref — a bundle/sha-only checkout has none)"
+    elif [ "$sha" = "$_seed_main_sha" ]; then
+      _seed_is_main="true"
+      _seed_main_reason="resolved sha matches origin/main"
+    else
+      _seed_main_reason="resolved sha ${sha} != origin/main (${_seed_main_sha})"
+    fi
     capture="$(mktemp -d)"
 
     export CARGO_TARGET_DIR="$JAMMI_SEED_DIR"
@@ -759,18 +784,18 @@ pod_seed_target_main() {
     # reader to know which seed tuples were actually built — t1b_ran/
     # t1b_reason below make that legible in the committed marker itself.
     t1b_ran="false"
-    t1b_reason="ref != main (ref=${ref}) — T1b is main-only by design"
-    if [ "$ref" = "main" ]; then
+    t1b_reason="not main (${_seed_main_reason}) — T1b is main-only by design"
+    if [ "$_seed_is_main" = "true" ]; then
       feat_rc=0
       pod_seed_pkg_has_feature jammi-kernels flash-attn || feat_rc=$?
       if [ "$feat_rc" -eq 0 ]; then
         echo "=== T1b (main only): release -p jammi-bench --features cuda,jammi-kernels/flash-attn ==="
         cargo build --release -p jammi-bench --features cuda,jammi-kernels/flash-attn || exit 1
         t1b_ran="true"
-        t1b_reason="declared (cargo metadata) and built (ref=main)"
+        t1b_reason="declared (cargo metadata) and built (${_seed_main_reason})"
       elif [ "$feat_rc" -eq 1 ]; then
         echo "=== T1b skipped: jammi-kernels declares no flash-attn feature (cargo metadata) ==="
-        t1b_reason="jammi-kernels declares no flash-attn feature (cargo metadata, ref=main)"
+        t1b_reason="jammi-kernels declares no flash-attn feature (cargo metadata, ${_seed_main_reason})"
       else
         # round-4 addendum: rc=2 ("could not determine") used to be treated
         # the SAME as rc=1 ("genuinely absent") — silently skip T1b. That is

@@ -1080,8 +1080,8 @@ DRV
   # mechanism (pod_provision_cutlass.sh's own real bytes, never a
   # reimplementation) to prove `cp -a` really does copy `.git` and the
   # strip really does remove it while preserving real content.
-  if grep -q 'rm -rf "\$TREE_SOURCE_DIR/crates/jammi-kernels/third_party/cutlass/.git"' "$PROVISION_SH" \
-     && grep -q '\[ -e "\$TREE_SOURCE_DIR/crates/jammi-kernels/third_party/cutlass/.git" \]' "$PROVISION_SH"; then
+  if grep -q 'rm -rf "\${TREE_SOURCE_DIR:?}/\${CUTLASS_PATH:?}/.git"' "$PROVISION_SH" \
+     && grep -q '\[ -e "\$TREE_SOURCE_DIR/\$CUTLASS_PATH/.git" \]' "$PROVISION_SH"; then
     ok "(m/A6) pod_provision_cutlass.sh strips the copied .git gitlink and asserts its absence"
   else
     bad "(m/A6) pod_provision_cutlass.sh does not strip+assert-absent the copied cutlass/.git"
@@ -1127,15 +1127,23 @@ DRV
 
   a1_git() { git -c protocol.file.allow=always -c init.defaultBranch=main "$@"; }
 
-  # A real upstream cutlass repo with two real commits.
+  # A real upstream cutlass repo with two real commits. Includes
+  # include/cutlass/cutlass.h — round-6 audit item C's content-validation
+  # (pod_provision_cutlass.sh now requires this exact path plus an
+  # on-disk file count >= the pinned commit's own `git ls-tree` count) —
+  # a fixture without it would trip that check on every leg below, never
+  # reaching the mechanism these legs actually exist to exercise.
   A1_UPSTREAM="$A1_ROOT/cutlass-upstream"
   a1_git init -q "$A1_UPSTREAM"
   a1_git -C "$A1_UPSTREAM" config user.email t@t; a1_git -C "$A1_UPSTREAM" config user.name t
+  mkdir -p "$A1_UPSTREAM/include/cutlass"
   echo v1 > "$A1_UPSTREAM/header.h"
-  a1_git -C "$A1_UPSTREAM" add header.h
+  echo 'v1 cutlass.h' > "$A1_UPSTREAM/include/cutlass/cutlass.h"
+  a1_git -C "$A1_UPSTREAM" add header.h include/cutlass/cutlass.h
   a1_git -C "$A1_UPSTREAM" commit -q -m v1
   A1_SHA1="$(a1_git -C "$A1_UPSTREAM" rev-parse HEAD)"
   echo v2 > "$A1_UPSTREAM/header.h"
+  echo 'v2 cutlass.h' > "$A1_UPSTREAM/include/cutlass/cutlass.h"
   a1_git -C "$A1_UPSTREAM" commit -q -am v2
   A1_SHA2="$(a1_git -C "$A1_UPSTREAM" rev-parse HEAD)"
 
@@ -1223,6 +1231,102 @@ DRV
     ok "(m/A1 fetch-failure) an unreachable stamped sha -> loud refusal, nothing copied"
   else
     bad "(m/A1 fetch-failure) expected a loud fetch-failure refusal (rc=$a1_rc): $a1_out"
+  fi
+
+  # ---- leg 5 (round-6 audit item C): SUPER_DIR's own submodule checkout
+  # is EMPTY (a .git + a resolvable HEAD sha, but the checked-out content
+  # itself was deleted out from under it — the real a100e incident: "another
+  # unit's push deleted its content at 15:51Z") -> refuse loudly, content-
+  # validated BEFORE ever reading a stamp or attempting a copy. -----------
+  A1_SUPER_EMPTYCONTENT="$A1_ROOT/super_emptycontent"
+  a1_make_super "$A1_SUPER_EMPTYCONTENT" "$A1_SHA1"
+  rm -f "$A1_SUPER_EMPTYCONTENT/crates/jammi-kernels/third_party/cutlass/header.h" \
+        "$A1_SUPER_EMPTYCONTENT/crates/jammi-kernels/third_party/cutlass/include/cutlass/cutlass.h"
+  A1_TREE_EMPTYCONTENT="$A1_ROOT/tree_emptycontent"
+  a1_make_tree "$A1_TREE_EMPTYCONTENT" "$A1_SHA1"
+  a1_out="$(env GIT_ALLOW_PROTOCOL=file bash "$PROVISION_SH" "$A1_TREE_EMPTYCONTENT" "$A1_SUPER_EMPTYCONTENT" 2>&1)"; a1_rc=$?
+  if [ "$a1_rc" -ne 0 ] && printf '%s' "$a1_out" | grep -q 'missing include/cutlass/cutlass.h' \
+     && [ ! -e "$A1_TREE_EMPTYCONTENT/crates/jammi-kernels/third_party/cutlass" ]; then
+    ok "(m/A1 empty-content) SUPER_DIR's own submodule has a valid .git/HEAD but its checked-out content was deleted (the real a100e shape) -> refused loudly, nothing copied"
+  else
+    bad "(m/A1 empty-content) expected a loud content-validation refusal (rc=$a1_rc): $a1_out"
+  fi
+
+  # ---- leg 6 (round-6 audit item 1, the live a100c failure at 63bf905,
+  # rc=1 wall=819): a tree whose cutlass path is ALREADY populated by an
+  # EARLIER copy-provisioning call (.git-stripped, real content) — the
+  # exact precondition `pod_build_timings.sh`'s OLD in-tree `git
+  # submodule update --init` collided with. pod_provision_cutlass.sh's
+  # `rm -rf` + `cp -a` never asks git to touch that path, so it PROCEEDS
+  # cleanly; the revert-RED runs the OLD bare `git submodule update
+  # --init` DIRECTLY against the SAME already-populated path and shows it
+  # FAILS — reproducing the real incident, not a hypothetical one. -------
+  A1_SUPER_COLLIDE="$A1_ROOT/super_collide"
+  a1_make_super "$A1_SUPER_COLLIDE" "$A1_SHA1"
+  # The "tree" is ITSELF git-backed with a REAL submodule reference (the
+  # same shape as pod_build_timings.sh's own $JAMMI_TREE_DIR after its
+  # FA2-tip checkout) — never a plain rsync-pushed stand-in — so the
+  # revert-RED's `git submodule update --init` below is a faithful
+  # reproduction, not a "not a git repository" false negative.
+  A1_TREE_COLLIDE="$A1_ROOT/tree_collide"
+  a1_make_super "$A1_TREE_COLLIDE" "$A1_SHA1"
+  # First call: an EARLIER `target --with-cutlass`-shaped provisioning —
+  # overwrites the tree's own (currently real submodule) cutlass path
+  # with a plain, .git-stripped copy, simulating a prior copy-
+  # provisioning call against this SAME git-backed tree.
+  env GIT_ALLOW_PROTOCOL=file bash "$PROVISION_SH" "$A1_TREE_COLLIDE" "$A1_SUPER_COLLIDE" >/dev/null 2>&1
+  [ -f "$A1_TREE_COLLIDE/crates/jammi-kernels/third_party/cutlass/header.h" ] \
+    && [ ! -e "$A1_TREE_COLLIDE/crates/jammi-kernels/third_party/cutlass/.git" ] \
+    || bad "(m/A1 collide) setup: the first provisioning call did not leave the expected populated, .git-stripped precondition"
+  # Second call (the SAME shape pod_build_timings.sh's own call now
+  # takes): must PROCEED despite the destination already being populated.
+  a1_out="$(env GIT_ALLOW_PROTOCOL=file bash "$PROVISION_SH" "$A1_TREE_COLLIDE" "$A1_SUPER_COLLIDE" 2>&1)"; a1_rc=$?
+  if [ "$a1_rc" -eq 0 ] && [ -f "$A1_TREE_COLLIDE/crates/jammi-kernels/third_party/cutlass/header.h" ]; then
+    ok "(m/A1 collide) a SECOND provisioning call against an ALREADY-populated (.git-stripped) destination PROCEEDS cleanly — the filesystem-level rm -rf + cp -a never asks git to touch that path"
+  else
+    bad "(m/A1 collide) expected the second provisioning call to proceed despite the already-populated destination (rc=$a1_rc): $a1_out"
+  fi
+  # revert-RED: the OLD in-tree `git submodule update --init`, run
+  # DIRECTLY against the SAME already-populated path, reproduces the real
+  # a100c failure. Also strip the tree's OWN `.git/modules/.../cutlass`
+  # backing repo first: a100c's real failure was a FIRST-EVER `--init`
+  # (this specific $JAMMI_TREE_DIR had never run `git submodule update`
+  # for this path before) hitting an occupied destination — a submodule
+  # that was already locally initialised once tolerates a re-checkout
+  # over stray files; a genuinely fresh `--init` clone into an occupied,
+  # non-empty, non-submodule directory does not (reproduced: WITHOUT this
+  # step, git's already-initialised backing repo silently overwrote the
+  # foreign files and returned rc=0 — not the real incident's shape).
+  rm -rf "$A1_TREE_COLLIDE/.git/modules/crates/jammi-kernels/third_party/cutlass"
+  a1_collide_revert_out="$(git -C "$A1_TREE_COLLIDE" submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass 2>&1)"; a1_collide_revert_rc=$?
+  if [ "$a1_collide_revert_rc" -ne 0 ]; then
+    ok "(m/A1 collide revert-RED) the OLD in-tree 'git submodule update --init', run directly against the SAME already-populated path, FAILS — reproducing the real a100c incident, confirming the fix (never running that command against the destination at all) is genuinely load-bearing"
+  else
+    bad "(m/A1 collide revert-RED) expected the OLD in-tree git submodule update to fail against an already-populated, non-submodule path (rc=$a1_collide_revert_rc): $a1_collide_revert_out"
+  fi
+
+  # ---- leg 7 (lead probe item 3): SUPER_DIR's own `submodule update
+  # --init` needs network + a reachable submodule remote — an unreachable
+  # remote must produce the NAMED error, never git's bare stderr with no
+  # step name. -------------------------------------------------------------
+  A1_SUPER_UNREACHABLE="$A1_ROOT/super_unreachable"
+  a1_make_super "$A1_SUPER_UNREACHABLE" "$A1_SHA1"
+  # Deinitialise the submodule so the NEXT `--init` is a genuinely fresh
+  # clone attempt (not a re-checkout of an already-local backing repo —
+  # same reasoning as the collide leg's own revert-RED above), then make
+  # the ONLY remote it could clone from unreachable.
+  a1_git -C "$A1_SUPER_UNREACHABLE" submodule deinit -f crates/jammi-kernels/third_party/cutlass >/dev/null 2>&1
+  rm -rf "$A1_SUPER_UNREACHABLE/.git/modules/crates/jammi-kernels/third_party/cutlass"
+  A1_UPSTREAM_MOVED="$A1_ROOT/cutlass-upstream-MOVED-away"
+  mv "$A1_UPSTREAM" "$A1_UPSTREAM_MOVED"
+  A1_TREE_UNREACHABLE="$A1_ROOT/tree_unreachable"
+  a1_make_tree "$A1_TREE_UNREACHABLE" "$A1_SHA1"
+  a1_out="$(env GIT_ALLOW_PROTOCOL=file bash "$PROVISION_SH" "$A1_TREE_UNREACHABLE" "$A1_SUPER_UNREACHABLE" 2>&1)"; a1_rc=$?
+  mv "$A1_UPSTREAM_MOVED" "$A1_UPSTREAM"
+  if [ "$a1_rc" -ne 0 ] && printf '%s' "$a1_out" | grep -q 'pod_provision_cutlass: submodule update failed (network/remote unreachable?)'; then
+    ok "(m/A1 unreachable-remote) SUPER_DIR's own submodule update, with its remote made unreachable, FAILS with the NAMED error (never git's bare stderr alone)"
+  else
+    bad "(m/A1 unreachable-remote) expected the named submodule-update-failed error (rc=$a1_rc): $a1_out"
   fi
 
   # ---- revert-RED: the round-4 regression, reproduced and re-fixed -------
@@ -1382,41 +1486,94 @@ DRV
     bad "(n/addendum) pod_build_timings.sh's FA2 leg dispatch text changed unexpectedly"
   fi
 
-  # round-5 EXECUTABLE fixture (Class-A item 4): the REAL FA2-leg bytes
+  # round-6 EXECUTABLE fixture (audit item 4): the REAL FA2-leg bytes
   # (sed-extracted from pod_build_timings.sh, never a reimplementation),
-  # run on a real git repo checked out on a branch literally named "main",
-  # with `pod_seed_pkg_has_feature` stubbed to return 2 — must ABORT
-  # (never warn-and-skip) and name the real cause.
+  # run against a real git repo + a real "origin" remote, gated on the
+  # RESOLVED sha (never the OLD abbrev-ref-vs-"main" comparison, which a
+  # checkout-by-sha — the ordinary case, since JAMMI_FA2_TIP_REF is
+  # normally a sha — ALWAYS leaves detached, so the old gate could never
+  # match at all). Four legs: (a) checked out ON the branch "main" ->
+  # gate matches, reaches pod_seed_pkg_has_feature (stubbed rc=2) ->
+  # ABORTS naming the cause; (b) checked out DETACHED at the EXACT SAME
+  # sha as origin/main (the realistic FA2-tip-by-sha shape) -> the gate
+  # STILL matches (sha-based, not branch-based) -> same abort; (c)
+  # checked out DETACHED at a DIFFERENT sha (not on main) -> the leg is
+  # correctly SKIPPED, with fa2_ran=false and a real, non-empty
+  # fa2_reason recorded — never silently vanishing with no explanation.
   PBT_SH="$REPO_ROOT/ci/scripts/perf/pod_build_timings.sh"
-  FA2_START="$(grep -n '^if \[ "\$(git rev-parse --abbrev-ref HEAD)" = "main" \]; then$' "$PBT_SH" | head -1 | cut -d: -f1)"
+  FA2_START="$(grep -n '^fa2_wall=""$' "$PBT_SH" | head -1 | cut -d: -f1)"
   FA2_END="$(awk -v s="$FA2_START" 'NR>=s && /^echo "::endgroup::"$/{print NR; exit}' "$PBT_SH")"
   if [ -n "$FA2_START" ] && [ -n "$FA2_END" ]; then
-    FA2_MAINREPO="$SANDBOX/fa2_mainrepo"
-    rm -rf "$FA2_MAINREPO"; git init -q -b main "$FA2_MAINREPO" 2>/dev/null || { git init -q "$FA2_MAINREPO"; git -C "$FA2_MAINREPO" checkout -q -b main 2>/dev/null; }
-    git -C "$FA2_MAINREPO" config user.email t@t; git -C "$FA2_MAINREPO" config user.name t
-    echo x > "$FA2_MAINREPO/f"; git -C "$FA2_MAINREPO" add f; git -C "$FA2_MAINREPO" commit -q -m x
+    fa2_git() { git -c protocol.file.allow=always -c init.defaultBranch=main "$@"; }
+    FA2_UPSTREAM="$SANDBOX/fa2_upstream"
+    rm -rf "$FA2_UPSTREAM"; fa2_git init -q "$FA2_UPSTREAM"
+    fa2_git -C "$FA2_UPSTREAM" config user.email t@t; fa2_git -C "$FA2_UPSTREAM" config user.name t
+    echo x > "$FA2_UPSTREAM/f"; fa2_git -C "$FA2_UPSTREAM" add f; fa2_git -C "$FA2_UPSTREAM" commit -q -m x
+    FA2_MAIN_SHA="$(fa2_git -C "$FA2_UPSTREAM" rev-parse HEAD)"
+    echo y > "$FA2_UPSTREAM/f2"; fa2_git -C "$FA2_UPSTREAM" add f2; fa2_git -C "$FA2_UPSTREAM" commit -q -m y
+    FA2_OTHER_SHA="$(fa2_git -C "$FA2_UPSTREAM" rev-parse HEAD)"
 
-    FA2_DRIVER="$SANDBOX/fa2_driver.sh"
-    {
-      echo '#!/usr/bin/env bash'
-      echo 'set -uo pipefail'
-      echo 'fail() { echo "::error::$*" >&2; exit 1; }'
-      echo 'pod_seed_pkg_has_feature() { return 2; }'
-      echo "cd '$FA2_MAINREPO' || exit 9"
-      sed -n "${FA2_START},${FA2_END}p" "$PBT_SH"
-      echo 'echo FA2_LEG_REACHED_END'
-    } > "$FA2_DRIVER"
-    chmod +x "$FA2_DRIVER"
-    if bash -n "$FA2_DRIVER"; then
-      fa2_abort_out="$(bash "$FA2_DRIVER" 2>&1)"; fa2_abort_rc=$?
-      if [ "$fa2_abort_rc" -ne 0 ] && printf '%s' "$fa2_abort_out" | grep -q 'could not determine whether jammi-kernels declares flash-attn' \
-         && ! printf '%s' "$fa2_abort_out" | grep -q 'FA2_LEG_REACHED_END'; then
-        ok "(n/addendum EXECUTABLE) the real FA2-leg bytes, run with pod_seed_pkg_has_feature stubbed to rc=2 on a real 'main'-branch repo, ABORT (never warn-and-skip) and name the real cause"
+    FA2_CLONE="$SANDBOX/fa2_clone"
+    rm -rf "$FA2_CLONE"
+    export GIT_ALLOW_PROTOCOL=file
+    fa2_git clone -q "$FA2_UPSTREAM" "$FA2_CLONE" || echo "fa2 clone failed rc=$?" >&2
+    unset GIT_ALLOW_PROTOCOL
+
+    fa2_build_driver() { # $1=checkout-target -> writes+returns driver path
+      local checkout_to="$1" driver="$SANDBOX/fa2_driver_$$_${RANDOM}.sh"
+      {
+        echo '#!/usr/bin/env bash'
+        echo 'set -uo pipefail'
+        echo 'fail() { echo "::error::$*" >&2; exit 1; }'
+        echo 'pod_seed_pkg_has_feature() { return 2; }'
+        echo "cd '$FA2_CLONE' || exit 9"
+        echo "env GIT_ALLOW_PROTOCOL=file git -c protocol.file.allow=always checkout -q '$checkout_to' || exit 8"
+        sed -n "${FA2_START},${FA2_END}p" "$PBT_SH"
+        echo 'printf "FA2_RAN=%s FA2_REASON=%s\n" "$fa2_ran" "$fa2_reason"'
+      } > "$driver"
+      chmod +x "$driver"
+      printf '%s' "$driver"
+    }
+
+    # (a) on the branch "main"
+    fa2_driver_a="$(fa2_build_driver main)"
+    if bash -n "$fa2_driver_a"; then
+      fa2_out_a="$(bash "$fa2_driver_a" 2>&1)"; fa2_rc_a=$?
+      if [ "$fa2_rc_a" -ne 0 ] && printf '%s' "$fa2_out_a" | grep -q 'could not determine whether jammi-kernels declares flash-attn'; then
+        ok "(n/addendum EXECUTABLE a) on branch 'main': the real FA2-leg bytes reach pod_seed_pkg_has_feature (stubbed rc=2) and ABORT naming the real cause"
       else
-        bad "(n/addendum EXECUTABLE) expected the real FA2-leg bytes to abort on rc=2 (rc=$fa2_abort_rc): $fa2_abort_out"
+        bad "(n/addendum EXECUTABLE a) expected the real FA2-leg bytes to abort on rc=2 when on main (rc=$fa2_rc_a): $fa2_out_a"
       fi
     else
-      bad "(n/addendum EXECUTABLE) FA2-leg driver fixture has a syntax error"
+      bad "(n/addendum EXECUTABLE a) driver fixture has a syntax error"
+    fi
+
+    # (b) DETACHED at the exact same sha as origin/main — the realistic
+    # FA2-tip-by-sha shape; this is the actual bug: the OLD gate never
+    # matched here at all. FA2_OTHER_SHA (the SECOND commit, made after
+    # FA2_MAIN_SHA was captured but BEFORE cloning) is origin/main's
+    # ACTUAL tip once cloned — FA2_MAIN_SHA is now merely an ANCESTOR of
+    # main, not main itself; the two legs below use whichever sha is
+    # ACTUALLY origin/main's tip vs ACTUALLY not, never by variable name
+    # alone.
+    fa2_driver_b="$(fa2_build_driver "$FA2_OTHER_SHA")"
+    fa2_out_b="$(bash "$fa2_driver_b" 2>&1)"; fa2_rc_b=$?
+    if [ "$fa2_rc_b" -ne 0 ] && printf '%s' "$fa2_out_b" | grep -q 'could not determine whether jammi-kernels declares flash-attn'; then
+      ok "(n/addendum EXECUTABLE b) DETACHED HEAD at the SAME sha as origin/main: the gate STILL matches (sha-based, not abbrev-ref) — reaches pod_seed_pkg_has_feature and ABORTS naming the cause, exactly like leg (a)"
+    else
+      bad "(n/addendum EXECUTABLE b) expected a detached HEAD at origin/main's own sha to still match the gate (rc=$fa2_rc_b): $fa2_out_b"
+    fi
+
+    # (c) DETACHED at a DIFFERENT sha (not main's tip — an ANCESTOR of
+    # it) — correctly skipped, fa2_ran=false, with a real, non-empty
+    # reason recorded — never a silent null.
+    fa2_driver_c="$(fa2_build_driver "$FA2_MAIN_SHA")"
+    fa2_out_c="$(bash "$fa2_driver_c" 2>&1)"; fa2_rc_c=$?
+    if [ "$fa2_rc_c" -eq 0 ] && printf '%s' "$fa2_out_c" | grep -q 'FA2_RAN=false' \
+       && printf '%s' "$fa2_out_c" | grep -q 'FA2_REASON=resolved sha'; then
+      ok "(n/addendum EXECUTABLE c) DETACHED HEAD at a sha that is NOT origin/main: fa2_ran=false with a real, non-empty reason recorded — never silently vanishing with no explanation"
+    else
+      bad "(n/addendum EXECUTABLE c) expected fa2_ran=false with a real reason for a non-main detached sha (rc=$fa2_rc_c): $fa2_out_c"
     fi
   else
     bad "(n/addendum EXECUTABLE) could not locate the FA2 leg's start/end lines in pod_build_timings.sh (start=${FA2_START:-?} end=${FA2_END:-?})"
@@ -2029,7 +2186,11 @@ DRV
 # ═════════════════════════════════════════════════════════════════════════
 {
   PBT_SH="$REPO_ROOT/ci/scripts/perf/pod_build_timings.sh"
-  R_TRISTATE_START="$(grep -n '^if \[ -z "\$clone_hashes" \] || \[ -z "\$cold_hashes" \]; then$' "$PBT_SH" | head -1 | cut -d: -f1)"
+  # round-6: the tri-state block now starts at clone_paths= (the SET
+  # comparison this same round added, for byte_equal="set_mismatch") —
+  # the extraction must include it, or clone_paths/cold_paths are
+  # unbound (set -u) inside the harness below.
+  R_TRISTATE_START="$(grep -n '^clone_paths="\$(printf' "$PBT_SH" | head -1 | cut -d: -f1)"
   R_TRISTATE_END="$(awk -v s="$R_TRISTATE_START" 'NR>=s && /^fi$/{print NR; exit}' "$PBT_SH")"
 
   r_run_tristate() { # $1=clone_hashes $2=cold_hashes -> prints "byte_equal=<val> diff_nonempty=<yes|no>" on stdout
@@ -2038,6 +2199,11 @@ DRV
     {
       echo '#!/usr/bin/env bash'
       echo 'set -uo pipefail'
+      # round-6: the extracted range now calls pod_sha256_of_stdin (for
+      # clone_path_set_sha256/cold_path_set_sha256) — sourced from the
+      # real pod_seed_target.sh, never reimplemented.
+      echo "# shellcheck disable=SC1091"
+      echo ". '$REPO_ROOT/ci/scripts/pod_seed_target.sh'"
       printf 'clone_hashes=%q\n' "$clone_hashes"
       printf 'cold_hashes=%q\n' "$cold_hashes"
       sed -n "${R_TRISTATE_START},${R_TRISTATE_END}p" "$PBT_SH"
@@ -2073,6 +2239,20 @@ DRV
       ok "(r/A4) differing, non-empty hash sets -> byte_equal=false, with a real diff"
     else
       bad "(r/A4) expected byte_equal=false for differing non-empty snapshots: $r_out"
+    fi
+
+    # round-6 fix (byte_equal set_mismatch): a clone snapshot with an
+    # EXTRA path the cold side doesn't have (the debug/-vs-release/
+    # scoping bug's own shape, at the SET level, once snapshot_hashes
+    # itself is correctly scoped to release/ — this proves the tri-state
+    # ITSELF, independent of that scoping fix) must be named
+    # "set_mismatch", never collapsed into a bare "false" that reads
+    # exactly like a genuine byte-reproducibility regression.
+    r_out="$(r_run_tristate "$(printf 'a\tsha1\nb\tsha2')" $'a\tsha1')"
+    if printf '%s' "$r_out" | grep -q 'byte_equal=set_mismatch diff_nonempty=yes'; then
+      ok "(r/A4) a clone snapshot with an EXTRA path the cold side lacks -> byte_equal=set_mismatch (never a bare false), with the symmetric difference"
+    else
+      bad "(r/A4) expected byte_equal=set_mismatch for a path-set mismatch: $r_out"
     fi
 
     # revert-RED: the `>= 1` / non-vacuity floor, removed.
@@ -2253,7 +2433,10 @@ PY
   cat > "$T_SCANNER" <<'PYEOF'
 import re, sys
 
-pat = re.compile(r'2>/dev/null|\|\|\s*true\b|\|\|\s*:(\s|$)')
+# round-6 advisory (folded): also catch >/dev/null 2>&1, &>/dev/null, and
+# 2>&- — the same "producing command's diagnostic silenced" class as
+# 2>/dev/null, just spelled differently.
+pat = re.compile(r'2>/dev/null|>/dev/null 2>&1|&>/dev/null|2>&-|\|\|\s*true\b|\|\|\s*:(\s|$)')
 
 def is_annotated(lines, idx):
     if "tripwire-ok" in lines[idx]:
@@ -2344,7 +2527,7 @@ def find_labels(path):
     out = []
     for m in citation_re.finditer(text):
         label = m.group(1).strip()
-        if not label or not re.match(r'^[a-z]', label):
+        if not label or not re.match(r'^[A-Za-z]', label):
             continue
         line_no = text.count("\n", 0, m.start()) + 1
         out.append((path, line_no, label))

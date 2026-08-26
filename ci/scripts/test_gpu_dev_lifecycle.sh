@@ -34,6 +34,18 @@
 #       a still-present id (a rejected mutation, most likely) keeps the
 #       record and exits 1 asking for a retry, rather than leaking the pod
 #       while also destroying the only record pointing at it.
+#   (7) `reap 0` / `reap 00` must REFUSE (exit 2), never sweep — "0" is
+#       all-digit (no non-digit character), so a digit-shape check alone
+#       lets it through, and Python's `if override:` is true for the STRING
+#       "0" exactly as for "8", giving `limit = 0` under which every
+#       RUNNING pod reads as already past its deadline: `reap 0` would
+#       mass-terminate the whole account's jammi-gpu* fleet.
+#   (8) `down` finding the recorded id ABSENT from the account (as opposed
+#       to present-but-mismatched) is NOT a refusal — it is the ordinary
+#       shape of "this pod already ended on its own" (its own deadline, or
+#       the sweep), the single most common way a session's pod goes away.
+#       `down` forgets the record and exits 0, rather than getting stuck
+#       refusing forever until an operator remembers `up --replace`.
 #
 # There is deliberately no "pause the sweep for one pod" feature (an earlier
 # version of this branch shipped `hold`/`unhold`, backed by a `podEditJob`
@@ -320,10 +332,14 @@ unset MOCK_DEPLOY_RESPONSE
   rp_pod_verify "pod-x" >/dev/null 2>&1
   [ $? -eq 1 ] && record PASS "group2-verify-non-shaped-name-refused" || record FAIL "group2-verify-non-shaped-name-refused"
 
+  # An ABSENT id is its own return code (3), never folded into the
+  # present-but-mismatched code (1): `down` treats them completely
+  # differently — absent is normal cleanup (round-4 audit advisory), not a
+  # refusal — and needs rp_pod_verify to tell them apart.
   echo '{"data":{"myself":{"pods":[]}}}' > "$SANDBOX/acct3.json"
   MOCK_RESPONSE_FILE="$SANDBOX/acct3.json"
   rp_pod_verify "pod-x" >/dev/null 2>&1
-  [ $? -eq 1 ] && record PASS "group2-verify-ghost-id-refused" || record FAIL "group2-verify-ghost-id-refused"
+  [ $? -eq 3 ] && record PASS "group2-verify-absent-id-distinct-code" || record FAIL "group2-verify-absent-id-distinct-code"
 
   echo 'not json' > "$SANDBOX/acct4.json"
   MOCK_RESPONSE_FILE="$SANDBOX/acct4.json"
@@ -506,25 +522,31 @@ term_count_differs="$(grep -c "podTerminate.*pod-ttl-differs" "$CALL_LOG")"
   && ok "finding-5(down): a differing TTL NUMBER (meta ttl8, account ttl72, same id) still terminates — the id is authoritative" \
   || bad "finding-5(down): expected exactly one podTerminate for pod-ttl-differs despite the differing TTL number (got ${term_count_differs}); $(cat "$SANDBOX/out-down-ttl-differs.log")"
 
-# A recorded id absent from the account entirely — the ghost-id shape —
-# refuses without ever attempting a terminate, and keeps the local record.
-SESSION_DOWN_GHOST="down-ghost"
-write_meta "$SESSION_DOWN_GHOST" "pod-ghost" "8"
-echo '{"data":{"myself":{"pods":[]}}}' > "$SANDBOX/acct-down-ghost-1.json"
+# A recorded id absent from the account entirely is NOT a refusal — it is
+# the ordinary shape of "this pod already ended on its own" (its own
+# deadline, or the sweep), the single most common way a session's pod goes
+# away. `down` must forget the record and exit 0, not get stuck refusing
+# forever until someone remembers `up --replace` (round-4 audit advisory).
+SESSION_DOWN_GONE="down-gone-already"
+write_meta "$SESSION_DOWN_GONE" "pod-gone-already" "8"
+echo '{"data":{"myself":{"pods":[]}}}' > "$SANDBOX/acct-down-gone-1.json"
 reset_log; reset_account_seq
-export MOCK_ACCOUNT_RESPONSE_1="$SANDBOX/acct-down-ghost-1.json"
-bash "$DIR/gpu-dev.sh" down "$SESSION_DOWN_GHOST" >"$SANDBOX/out-down-ghost.log" 2>&1
+export MOCK_ACCOUNT_RESPONSE_1="$SANDBOX/acct-down-gone-1.json"
+bash "$DIR/gpu-dev.sh" down "$SESSION_DOWN_GONE" >"$SANDBOX/out-down-gone.log" 2>&1
+rc=$?
 if log_has "podTerminate"; then
-  bad "finding-5(down): a ghost id absent from the account must refuse to terminate (regression!)"
+  bad "finding(round-4, down): an already-absent id must never attempt a terminate (nothing to release; regression!)"
 else
-  ok "finding-5(down): a ghost id refused to terminate"
+  ok "finding(round-4, down): an already-absent id issues no terminate call (nothing to release)"
 fi
-grep -q "refusing to terminate" "$SANDBOX/out-down-ghost.log" \
-  && ok "finding-5(down): ghost-id refusal prints a refusal message" \
-  || bad "finding-5(down): expected a refusal message on a ghost id"
-[ -f "$RP_SESSION_ROOT/$SESSION_DOWN_GHOST/meta" ] \
-  && ok "finding-5(down): the local record is KEPT after a ghost-id refusal" \
-  || bad "finding-5(down): the local record must survive a ghost-id refusal (regression!)"
+[ "$rc" -eq 0 ] && ok "finding(round-4, down): an already-absent id exits 0 (not a refusal)" \
+  || bad "finding(round-4, down): expected exit 0 for an already-absent id (got $rc)"
+grep -q "is gone from the account" "$SANDBOX/out-down-gone.log" \
+  && ok "finding(round-4, down): an already-absent id prints the gone-from-account message" \
+  || bad "finding(round-4, down): expected the 'is gone from the account' message ($(cat "$SANDBOX/out-down-gone.log"))"
+[ -f "$RP_SESSION_ROOT/$SESSION_DOWN_GONE/meta" ] \
+  && bad "finding(round-4, down): the local record should be forgotten once the id is confirmed absent (regression!)" \
+  || ok "finding(round-4, down): the local record is forgotten once the id is confirmed absent"
 
 # The recorded id IS present, but its account name is not this tooling's
 # shape at all (some entirely unrelated pod happens to share the id space —
@@ -544,19 +566,6 @@ fi
 [ -f "$RP_SESSION_ROOT/$SESSION_DOWN_UNSHAPED/meta" ] \
   && ok "finding-5(down): the local record is KEPT after a non-shaped-name refusal" \
   || bad "finding-5(down): the local record must survive a non-shaped-name refusal (regression!)"
-
-# Neither refusal path suggests `reap <hours>` (account-wide, never a
-# per-pod remedy) or the removed, INERT RP_TTL_HOURS=<H> override.
-if grep -q -- "reap <hours>" "$SANDBOX/out-down-ghost.log" "$SANDBOX/out-down-unshaped.log"; then
-  bad "finding: down's refusal must not suggest 'reap <hours>' as a per-pod remedy (it is account-wide; regression!)"
-else
-  ok "finding: down's refusal does not suggest reap as a per-pod remedy"
-fi
-if grep -q -- "RP_TTL_HOURS=<H>" "$SANDBOX/out-down-ghost.log" "$SANDBOX/out-down-unshaped.log"; then
-  bad "finding: down's refusal must not promise the removed, inert RP_TTL_HOURS=<H> override (regression!)"
-else
-  ok "finding: down's refusal does not promise the removed RP_TTL_HOURS=<H> override"
-fi
 
 # Verified (id + shape match), but the SECOND account query — the
 # post-terminate confirmation — still shows the pod present: the terminate
@@ -584,6 +593,22 @@ grep -q "terminate not confirmed" "$SANDBOX/out-down-rejected.log" \
 [ -f "$RP_SESSION_ROOT/$SESSION_DOWN_REJECTED/meta" ] \
   && ok "finding-6(down): the local record is KEPT when the terminate is not confirmed (no leak-and-destroy)" \
   || bad "finding-6(down): the local record must survive an unconfirmed terminate (regression!)"
+
+# Neither real refusal path (non-shaped name, unconfirmed terminate)
+# suggests `reap <hours>` (account-wide, never a per-pod remedy) or the
+# removed, INERT RP_TTL_HOURS=<H> override. The already-gone case above is
+# deliberately NOT checked here — it is not a refusal, so it never had
+# either suggestion to begin with.
+if grep -q -- "reap <hours>" "$SANDBOX/out-down-unshaped.log" "$SANDBOX/out-down-rejected.log"; then
+  bad "finding: down's refusal must not suggest 'reap <hours>' as a per-pod remedy (it is account-wide; regression!)"
+else
+  ok "finding: down's refusal does not suggest reap as a per-pod remedy"
+fi
+if grep -q -- "RP_TTL_HOURS=<H>" "$SANDBOX/out-down-unshaped.log" "$SANDBOX/out-down-rejected.log"; then
+  bad "finding: down's refusal must not promise the removed, inert RP_TTL_HOURS=<H> override (regression!)"
+else
+  ok "finding: down's refusal does not promise the removed RP_TTL_HOURS=<H> override"
+fi
 
 # ═════════════════════════════════════════════════════════════════════════
 # Group 4 — rp_sweep's age-based judgement (function-level). Age math is
@@ -621,6 +646,69 @@ JSON
     record FAIL "group4-fresh-pod-not-terminated (well within its deadline)"
   else
     record PASS "group4-fresh-pod-not-terminated"
+  fi
+)
+
+# ═════════════════════════════════════════════════════════════════════════
+# Group 4b — rp_sweep's override validation (function-level; round-4 audit
+# BLOCK). "0" and "00" are all-digit (no non-digit character), so the
+# digit-shape check alone lets them through; Python's `if override:` is then
+# true for the STRING "0" exactly as it is for "8", giving `limit = 0` —
+# every RUNNING pod's age is "past-deadline-0s", so `reap 0` mass-terminates
+# the whole account's jammi-gpu* fleet instead of refusing.
+# ═════════════════════════════════════════════════════════════════════════
+(
+  export RUNPOD_API_KEY="dummy-key"
+  unset RP_SESSION
+  # shellcheck source=ci/scripts/runpod_lib.sh
+  source "$DIR/runpod_lib.sh"
+  G4B_TERM="$SANDBOX/g4b-terminate.log"; : > "$G4B_TERM"
+  rp_terminate() { echo "$1" >> "$G4B_TERM"; }
+  # The validation must reject BEFORE any account query — a query the fix
+  # doesn't even need should never be reached on a rejected override.
+  rp_gql() { echo "SHOULD_NOT_BE_CALLED" >> "$SANDBOX/g4b-query.log"; echo '{}'; }
+
+  : > "$G4B_TERM"; : > "$SANDBOX/g4b-query.log"
+  rp_sweep 0 >/dev/null 2>&1
+  rc0=$?
+  [ "$rc0" -eq 2 ] && record PASS "group4b-reap-zero-exits-2" || record FAIL "group4b-reap-zero-exits-2 (rc=$rc0)"
+  [ -s "$G4B_TERM" ] && record FAIL "group4b-reap-zero-terminates-nothing (regression!)" \
+    || record PASS "group4b-reap-zero-terminates-nothing"
+  [ -s "$SANDBOX/g4b-query.log" ] && record FAIL "group4b-reap-zero-issues-no-query (regression!)" \
+    || record PASS "group4b-reap-zero-issues-no-query"
+
+  : > "$G4B_TERM"; : > "$SANDBOX/g4b-query.log"
+  rp_sweep 00 >/dev/null 2>&1
+  rc00=$?
+  [ "$rc00" -eq 2 ] && record PASS "group4b-reap-double-zero-exits-2" || record FAIL "group4b-reap-double-zero-exits-2 (rc=$rc00)"
+  [ -s "$G4B_TERM" ] && record FAIL "group4b-reap-double-zero-terminates-nothing (regression!)" \
+    || record PASS "group4b-reap-double-zero-terminates-nothing"
+
+  # Positive control: `reap 1` (a REAL positive override) must still work —
+  # this fix must not have broken force-reap itself, only the zero case.
+  # Two pods: one 4h old (past a 1h force-reap ceiling) and one 20m old
+  # (well within it) — only the 4h one is swept.
+  rp_gql() { cat "$SANDBOX/g4b-account.json"; }
+  now_epoch="$(date -u +%s)"
+  h4_iso="$(iso_from_epoch $((now_epoch - 4 * 3600)))"
+  m20_iso="$(iso_from_epoch $((now_epoch - 20 * 60)))"
+  cat > "$SANDBOX/g4b-account.json" <<JSON
+{"data":{"myself":{"pods":[
+  {"id":"pod-4h","name":"jammi-gpu-ttl8","desiredStatus":"RUNNING","createdAt":"${h4_iso}","runtime":{"uptimeInSeconds":14000}},
+  {"id":"pod-20m","name":"jammi-gpu-ttl8","desiredStatus":"RUNNING","createdAt":"${m20_iso}","runtime":{"uptimeInSeconds":1200}}
+]}}}
+JSON
+  : > "$G4B_TERM"
+  rp_sweep 1 >/dev/null 2>&1
+  if grep -q "^pod-4h$" "$G4B_TERM"; then
+    record PASS "group4b-reap-one-still-sweeps-the-4h-pod"
+  else
+    record FAIL "group4b-reap-one-still-sweeps-the-4h-pod"
+  fi
+  if grep -q "^pod-20m$" "$G4B_TERM"; then
+    record FAIL "group4b-reap-one-does-not-sweep-the-20m-pod (well within a 1h force-reap ceiling)"
+  else
+    record PASS "group4b-reap-one-does-not-sweep-the-20m-pod"
   fi
 )
 

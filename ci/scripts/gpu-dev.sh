@@ -438,7 +438,9 @@ EOF
       # gates release — see rp_pod_verify's own doc in runpod_lib.sh for why
       # two earlier attempts to make the TTL part of this check were both
       # removed rather than patched again.
-      if rp_pod_verify "$RP_POD_ID" >/dev/null; then
+      rp_pod_verify "$RP_POD_ID" >/dev/null
+      verify_rc=$?
+      if [ "$verify_rc" -eq 0 ]; then
         rp_terminate "$RP_POD_ID"
         # rp_terminate's own result is thrown away by design (it also runs
         # as rp_cleanup's best-effort EXIT-trap teardown) — `down` is a
@@ -457,12 +459,27 @@ EOF
           echo "::error::the local session record is KEPT — retry: $(basename "$0") down ${SESSION}"
           exit 1
         fi
+      elif [ "$verify_rc" -eq 3 ]; then
+        # The recorded id is ABSENT from the account entirely — not an
+        # ambiguity to refuse on. This is the ORDINARY shape of "this pod
+        # already ended on its own" (its own in-pod deadline, or the
+        # sweep) — the single most common way a session's pod goes away.
+        # Nothing is left to release, so this is cleanup, not a refusal:
+        # forget the record and say so plainly, rather than leaving it
+        # stuck until an operator remembers `up --replace`.
+        echo "recorded pod ${RP_POD_ID} is gone from the account (deadline/sweep) — forgetting the record"
+        RP_POD_ID=""   # already gone; keep the EXIT trap from acting on it again
+        rp_session_forget
+        rp_ssh_config_sync
       else
-        # The LOCAL record is deliberately KEPT here, not forgotten: this is
-        # exactly the ambiguous case (a mismatched or ghost id) where a
-        # follow-up `up` on this alias most needs to still see a recorded
-        # pod and refuse (or ask for --replace) rather than silently
-        # deploying a THIRD pod on top of an already-confused alias.
+        # verify_rc is 1 (present, but under a name that is not this
+        # tooling's shape) or 2 (could not query the account at all) — both
+        # REAL ambiguities, unlike a confirmed-absent id above. The LOCAL
+        # record is deliberately KEPT here, not forgotten: this is exactly
+        # the case where a follow-up `up` on this alias most needs to still
+        # see a recorded pod and refuse (or ask for --replace) rather than
+        # silently deploying a THIRD pod on top of an already-confused
+        # alias.
         echo "::error::refusing to terminate pod ${RP_POD_ID} for session '${SESSION}' — it did not verify against the account's live pod list (see above)."
         echo "::error::the local session record is KEPT (not forgotten), so this alias still refuses a plain 'up' rather than deploying on top of the ambiguity."
         # `reap` is ACCOUNT-WIDE — it judges EVERY jammi-gpu* pod against its

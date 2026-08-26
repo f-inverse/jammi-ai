@@ -172,9 +172,15 @@ rp_terminate() { # $1=podId
 # opposed to some entirely unrelated pod in the account); the specific
 # number never added a real safety margin once the id already matched.
 #
-# Prints the account's name for the id on success. Returns 1 (not found, or
-# name is not this tooling's shape) or 2 (could not query the account at
-# all) — both are "do not act", never "assume safe".
+# Prints the account's name for the id on success. Returns 1 (present, but
+# the name is not this tooling's shape — a REAL ambiguity, "do not act, never
+# assume safe"), 2 (could not query the account at all — same "do not act"),
+# or 3 (id ABSENT from the account entirely). 3 is deliberately its OWN code,
+# not folded into 1: an absent id is NOT an ambiguity to refuse on — it is
+# the ordinary, expected shape of "this pod already ended on its own" (its
+# in-pod deadline, or the sweep), the single most common way a session's
+# pod goes away, and `down`'s caller treats it as a normal cleanup, not a
+# refusal (round-4 audit advisory).
 #
 # Piped input (the account's own pod list) and script source cannot both come
 # from stdin — `python3 -` with a heredoc reads the heredoc AS THE PROGRAM,
@@ -210,7 +216,7 @@ for p in me["pods"]:
         print("pod %s account name %s is not this tooling shape %s-ttl<digits> -- refusing to act on it" % (podid, name, prefix), file=sys.stderr)
         sys.exit(1)
 print("pod %s is not in the account pod list" % podid, file=sys.stderr)
-sys.exit(1)
+sys.exit(3)
 ' "$id" "$RP_POD_PREFIX"
 }
 
@@ -635,6 +641,14 @@ rp_sweep() { # $1=optional override age in hours
     case "$override" in
       ''|*[!0-9]*) echo "::error::reap: hours must be a positive integer (got '${override}')"; return 2 ;;
     esac
+    # "0" and "00" are all-digit (no non-digit character), so they pass the
+    # shape check above untouched, and the python override BELOW treats any
+    # non-empty override STRING as truthy — `if override:` is true for "0"
+    # just as it is for "8" — giving `limit = 0`, under which every RUNNING
+    # pod's age is "past-deadline-0s": `reap 0` mass-terminates the whole
+    # account's jammi-gpu* fleet instead of refusing. Mirrors the
+    # RP_DEV_TTL_HOURS >0 check in gpu-dev.sh.
+    [ "$override" -gt 0 ] || { echo "::error::reap: hours must be > 0"; return 2; }
   fi
   out="$(rp_gql '{"query":"query{ myself{ pods{ id name desiredStatus createdAt runtime{ uptimeInSeconds } } } }"}' \
     | python3 -c "

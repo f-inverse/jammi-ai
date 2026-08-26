@@ -157,6 +157,15 @@ still exists under a different session's name, is left running for that
 session to manage. The only manual path out of a refusal is the RunPod
 console.
 
+An id that is **absent from the account entirely** is a different case, not
+a refusal: it is the ordinary shape of "this pod already ended on its own"
+(its own in-pod deadline, or the sweep) — the single most common way a
+session's pod goes away, since `RP_TTL_HOURS`/`RP_DEV_TTL_HOURS` ceilings are
+wall-clock, not idle detection (see the cost-guard section above). There is
+nothing left to release, so `down` says so plainly and forgets the record —
+without this, a session whose pod already self-terminated would sit stuck
+until an operator remembered `up --replace` to clear it.
+
 The **id is authoritative**; the TTL never gates release, and the check does
 not look at it at all. Two earlier attempts to make the TTL part of this
 check were both removed rather than patched further: matching an *exact*
@@ -178,6 +187,16 @@ once the id is confirmed **absent**. A pod still present after the
 terminate call — a rejected mutation, most likely — keeps its local record
 and exits with a message to retry `down`, rather than silently leaking the
 pod while also destroying the only record that pointed at it.
+
+This confirmation (`rp_pod_gone` in `runpod_lib.sh`) assumes a successful
+`podTerminate` removes the pod's id from `myself.pods` promptly — the same
+account-query shape `rp_pod_verify` and `rp_sweep` already read, but not yet
+verified live for this specific before/after transition. Confirmed on first
+live use; if RunPod instead retains a terminated pod in that list for some
+period (e.g. under a different `desiredStatus`), `rp_pod_gone` would read a
+just-succeeded terminate as unconfirmed and `down` would report "not
+confirmed" for a pod that in fact already ended — a false alarm asking for
+an unnecessary retry, not a leak.
 
 ## Reproducing the shipped runtime image
 

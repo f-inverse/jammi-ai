@@ -630,8 +630,16 @@ jobs:
           # attribute) or a reviewed legacy `kind: "none"` entry — closes the
           # class where a green artifact quietly proved a squash-merged,
           # no-longer-reachable tip (docs/maintainer/cuda-kernel-guide.md §4).
+          # Needs REAL commit history (git merge-base --is-ancestor), unlike
+          # every other leg in this matrix — the shared checkout step below
+          # reads this entry's own `fetch_depth: 0` (full history; this
+          # repo's `.git` is tens of MB, negligible next to the Rust build
+          # jobs) and defaults every other leg to the normal shallow
+          # `actions/checkout` clone (`fetch_depth` unset -> `1`), so only
+          # this one runner instance pays the deeper-clone cost.
           - name: CUDA run artifact schema
             cmd: python3 ci/scripts/check_cuda_run_artifacts.py
+            fetch_depth: 0
           # Completeness tripwire for this very guard class: every
           # ci/scripts/check_*.py|.sh gate script must be referenced by at
           # least one workflow (this file included), so a new check script
@@ -682,6 +690,11 @@ jobs:
             cmd: python3 crates/jammi-bench/reference/test_torch_grad_oracle_names.py
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Every leg but "CUDA run artifact schema" leaves this at the
+          # normal shallow default (`fetch_depth` unset in its matrix entry
+          # -> `1`); that one leg's ancestry check needs real history.
+          fetch-depth: ${{ matrix.fetch_depth || 1 }}
       - name: Run guard
         run: ${{ matrix.cmd }}
 

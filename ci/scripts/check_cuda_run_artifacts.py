@@ -88,6 +88,19 @@ must carry:
       in-script `LEGACY_NONE_ALLOWLIST` — a NEW artifact defaulting to
       `"none"` is a hard FAIL.
 
+Rule (d) needs REAL commit history to mean anything: `git merge-base
+--is-ancestor` on a shallow checkout (`actions/checkout`'s default
+`fetch-depth: 1`) reads back EVERY `git_sha` as a false non-ancestor —
+indistinguishable from a genuine one without checking first. Before any
+per-file work, `run_gate` calls `git rev-parse --is-shallow-repository` and,
+if shallow, raises ONE explicit failure ("shallow checkout — ancestry cannot
+be evaluated; use fetch-depth: 0") instead of N misleading per-file findings
+that would look like real drift. `.github/workflows/ci.yml`'s `guard` job
+gives ONLY this matrix leg `fetch-depth: 0` (a full clone; this repository's
+`.git` is small — see the PR that added this check for the measured size —
+negligible next to the Rust build jobs elsewhere in this workflow); every
+other leg stays at the normal shallow default.
+
 Run: `python3 ci/scripts/check_cuda_run_artifacts.py`
 Self-test (RED cases for every rule above, on a throwaway `git init`'d
 fixture repo — never the real checkout):
@@ -166,6 +179,26 @@ def git_ls_files(repo_root: Path) -> set[str]:
     if proc.returncode != 0:
         raise ArtifactError(f"`git ls-files` failed in {repo_root}: {proc.stderr.strip()}")
     return set(proc.stdout.splitlines())
+
+
+SHALLOW_CHECKOUT_MESSAGE = "shallow checkout — ancestry cannot be evaluated; use fetch-depth: 0"
+
+
+def is_shallow_repository(repo_root: Path) -> bool:
+    """`actions/checkout`'s default (`fetch-depth: 1`) hands `git merge-base
+    --is-ancestor` a truncated object graph — every `git_sha` this gate has
+    ever seen reads back as a false non-ancestor in that state, which is
+    indistinguishable from a REAL non-ancestor without this check (the exact
+    failure mode that made even `p1`'s genuinely-ancestor `git_sha` FAIL in
+    CI: `.github/workflows/ci.yml`'s `guard` job checked out at the default
+    depth). `git rev-parse --is-shallow-repository` is the one command that
+    tells the two apart; a non-zero exit (e.g. run outside a git repo at
+    all) is treated as "not shallow" here — `git_ls_files`/`_is_ancestor`
+    will raise their own, more specific errors moments later if the
+    checkout is unusable for some other reason.
+    """
+    proc = _run(["git", "rev-parse", "--is-shallow-repository"], repo_root)
+    return proc.returncode == 0 and proc.stdout.strip() == "true"
 
 
 # --------------------------------------------------------------------------- #
@@ -491,6 +524,13 @@ def run_gate(cuda_runs_dir: Path, repo_root: Path, allowlist: dict[str, str]) ->
     if not cuda_runs_dir.is_dir():
         raise ArtifactError(f"cuda-runs dir not found: {cuda_runs_dir}")
 
+    # Checked BEFORE any per-file work: a shallow checkout makes every
+    # single git_sha (even a genuine ancestor's) read back as a false
+    # non-ancestor — one explicit, named failure here, never N misleading
+    # per-file ancestry findings that look like real drift.
+    if is_shallow_repository(repo_root):
+        raise ArtifactError(SHALLOW_CHECKOUT_MESSAGE)
+
     tracked = git_ls_files(repo_root)
     files = sorted(cuda_runs_dir.rglob("*.json"))
     if not files:
@@ -809,6 +849,71 @@ def self_test() -> int:
         }
         expect_hit(bad, "brand-new-not-allowlisted.json", "not in the reviewed LEGACY_NONE_ALLOWLIST", "rule (f): new file defaulting to none")
 
+    # Shallow-checkout detection — a GENUINE `git clone --depth 1` (not a
+    # simulated flag), proving `is_shallow_repository` tells a shallow
+    # checkout apart from a normal one, and that `run_gate` raises ONE
+    # explicit ArtifactError naming the exact remediation instead of
+    # false-failing every artifact's ancestry check. This is the regression
+    # a real CI run hit: `p1`'s TRUE-ancestor git_sha FAILED under the
+    # default `actions/checkout` (fetch-depth 1) shallow clone.
+    with tempfile.TemporaryDirectory() as shallow_src_dir, tempfile.TemporaryDirectory() as shallow_dst_dir:
+        shallow_src = Path(shallow_src_dir)
+        _run(["git", "init", "-q"], shallow_src)
+        _run(["git", "config", "user.email", "test@example.com"], shallow_src)
+        _run(["git", "config", "user.name", "Test"], shallow_src)
+        cr = shallow_src / "crates" / "jammi-kernels" / "artifacts" / "cuda-runs"
+        cr.mkdir(parents=True)
+        (cr / "README.md").write_text("Produced by `ci/scripts/perf/proof_artifact.py`.\n")
+        (cr / "one.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "git_sha": "0" * 40,
+                    "box": "x",
+                    "producer": {"path": None, "kind": "none", "invocation": None, "gating": "none"},
+                    "status": "GREEN",
+                }
+            )
+        )
+        _run(["git", "add", "-A"], shallow_src)
+        _run(["git", "commit", "-q", "-m", "c1"], shallow_src)
+        (shallow_src / "unrelated.txt").write_text("x\n")
+        _run(["git", "add", "-A"], shallow_src)
+        _run(["git", "commit", "-q", "-m", "c2"], shallow_src)
+
+        if is_shallow_repository(shallow_src):
+            failures.append("self-test FAILED: a normal (non-shallow, 2-commit) fixture repo was reported shallow")
+
+        shallow_clone = Path(shallow_dst_dir) / "clone"
+        # `--depth` is silently ignored for a plain local path ("warning:
+        # --depth is ignored in local clones; use file:// instead.") — the
+        # `file://` scheme is required to force git to actually honor it and
+        # produce a genuinely shallow clone, not just a fast local hardlink
+        # copy of the full history.
+        clone_proc = _run(
+            ["git", "clone", "-q", "--depth", "1", "file://" + str(shallow_src), str(shallow_clone)],
+            shallow_src,
+        )
+        if clone_proc.returncode != 0:
+            failures.append(f"self-test FAILED: could not create a --depth 1 clone fixture: {clone_proc.stderr}")
+        else:
+            if not is_shallow_repository(shallow_clone):
+                failures.append("self-test FAILED: a genuine `git clone --depth 1` was NOT detected as shallow")
+
+            shallow_allowlist = {"one.json": "synthetic shallow-checkout fixture"}
+            try:
+                run_gate(
+                    shallow_clone / "crates" / "jammi-kernels" / "artifacts" / "cuda-runs",
+                    shallow_clone,
+                    shallow_allowlist,
+                )
+                failures.append("self-test FAILED: run_gate did not raise on a shallow checkout")
+            except ArtifactError as exc:
+                if SHALLOW_CHECKOUT_MESSAGE not in str(exc):
+                    failures.append(
+                        f"self-test FAILED: shallow-checkout ArtifactError had the wrong message: {exc}"
+                    )
+
     if failures:
         for f in failures:
             print(f, file=sys.stderr)
@@ -820,8 +925,10 @@ def self_test() -> int:
         "static gating verification (#[ignore]/env:VAR/required-features), (d) ancestry (both the "
         "plain git_sha path and the merged_as squash-landing rescue, and its own non-ancestor RED "
         "case), (e) README producer tracking, and (f) the none-allowlist closure all bite on a "
-        "throwaway fixture repo, and GREEN controls (ignore/env/required-features/merged_as-rescue) "
-        "plus one allow-listed none control stay clean."
+        "throwaway fixture repo; GREEN controls (ignore/env/required-features/merged_as-rescue) "
+        "plus one allow-listed none control stay clean; and a GENUINE `git clone --depth 1` fixture "
+        "proves is_shallow_repository tells shallow from normal apart and run_gate raises the one "
+        "explicit shallow-checkout ArtifactError instead of N false per-file ancestry findings."
     )
     return 0
 

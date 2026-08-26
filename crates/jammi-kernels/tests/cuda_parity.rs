@@ -3958,7 +3958,25 @@ fn lora_linear_parity_bf16_base_backward_production_width() {
     // `|dy| <= 1` under the retired all-ones seed) a valid — if now
     // slightly conservative rather than exact — upper bound, with no
     // re-derivation needed.
-    let dyv_shared = cotangent_fixture(rows * outf, 0xB16E_1D5E_2000_0001, 1.0);
+    //
+    // Rounded through `bf16` ONCE here, up front — `dy_gpu` below must be
+    // a real `bf16` tensor (this op's own output dtype), and if `dy_cpu`
+    // instead carried the UNROUNDED `f32` cotangent, `dx_base_cpu`/
+    // `d_x_lora_cpu` (this test's own closed-form re-derivation of what
+    // the bound below sizes itself to) would silently omit `dy`'s own
+    // bf16 quantization error propagated through a `outf`-wide (`3072`)
+    // reduction — a real pod run measured exactly this gap (a `4.16x`
+    // bound overshoot at one index, `dx_base ~= 4.5`, `d_x_lora ~=
+    // -1.4`) before this fix. Rounding once and reusing the SAME
+    // round-tripped values for both `dy_cpu` (cast back to `f32`, exact)
+    // and `dy_gpu` (native `bf16`, exact) makes them the identical real
+    // number in two dtypes, eliminating that gap at its source rather
+    // than padding the bound to cover it.
+    let dyv_shared: Vec<f32> = cotangent_fixture(rows * outf, 0xB16E_1D5E_2000_0001, 1.0)
+        .iter()
+        .map(|&v| bf16::from_f32(v).to_f32())
+        .collect();
+    let dyb_shared: Vec<bf16> = dyv_shared.iter().map(|&v| bf16::from_f32(v)).collect();
     let dy_cpu = Tensor::from_slice(&dyv_shared, (rows, outf), &cpu).unwrap();
     let grads_cpu = (&out_cpu * &dy_cpu)
         .unwrap()
@@ -4056,9 +4074,9 @@ fn lora_linear_parity_bf16_base_backward_production_width() {
     // `out_gpu` is this op's real `bf16` output (the base GEMM's own
     // storage dtype) — `dy_gpu` must match it dtype-for-dtype for the
     // elementwise multiply below, unlike `dy_cpu` above (matches
-    // `out_cpu`'s `f32` eager-reference dtype). Same underlying values,
-    // just bf16-rounded once.
-    let dyb_shared: Vec<bf16> = dyv_shared.iter().map(|&v| bf16::from_f32(v)).collect();
+    // `out_cpu`'s `f32` eager-reference dtype). `dyb_shared` (built above,
+    // alongside `dyv_shared`) already IS the bf16-rounded form of the
+    // same values `dy_cpu` carries — reused here, not re-derived.
     let dy_gpu = Tensor::from_slice(&dyb_shared, (rows, outf), &cuda).unwrap();
     let grads_gpu = (&out_gpu * &dy_gpu)
         .unwrap()

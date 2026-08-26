@@ -2,6 +2,8 @@
   "schema_version": 1,
   "unit": "esc-046-biting-oracle",
   "git_sha": "7874e98ff3a76f4685bcdc86d115de9ceea7894d",
+  "merged_as": "6be93f058c6af1e2cb7f2ac362fa78142ec650b3",
+  "merged_via_pr": 398,
   "date": "2026-08-26T17:07:55Z",
   "box": "jammi-a100d (NVIDIA A100-SXM4-80GB, driver 580.126.16)",
   "driver": "580.126.16",

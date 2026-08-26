@@ -659,10 +659,21 @@ def _extract_fn_body_ko4(text: str, fn_kw_end: int) -> tuple[str, int, int]:
 
 
 def _find_stmt_terminator(text: str, start: int) -> int:
-    """Index just PAST the depth-balanced `;` that terminates the
-    statement beginning at `start`, OR the position of the first
-    depth-0 CLOSING bracket (an ENCLOSING scope's own `}`/`)`/`]`) if no
-    such `;` exists — the tail-expression case (no trailing `;`).
+    """Index just PAST the `;` that terminates the statement beginning at
+    `start`, OR the position of the enclosing scope's own `}` if no such
+    `;` exists (the tail-expression case). Depth is tracked for ALL of
+    `([{`/`)]}`, but ONLY `{`/`}` (never a bare `(`/`)`/`[`/`]`) can ever
+    STOP the scan — round-3b audit fix (K1/K4): `start` itself may already
+    sit INSIDE an enclosing `(...)`/`[...]` group (e.g. a `.max()` call
+    nested inside `(diff / mag.max(1e-12))`); the OLD version stopped at
+    THAT group's own closing `)` because it was (wrongly) treated as a
+    statement boundary just like `}` — truncating the "statement" to a
+    bare sub-expression and hiding its own `<=`/`>=` comparison, which
+    sits OUTSIDE that group. A `)`/`]` encountered at depth 0 (relative to
+    `start`) is the close of a group `start` itself is nested in — NOT a
+    real Rust statement boundary (only `{}`/`;` are) — so it is consumed
+    transparently (depth stays 0) and the scan continues rightward past
+    it, never returning early and never going negative.
     """
     depth = 0
     i, n = start, len(text)
@@ -670,10 +681,14 @@ def _find_stmt_terminator(text: str, start: int) -> int:
         c = text[i]
         if c in "([{":
             depth += 1
-        elif c in ")]}":
+        elif c == "}":
             if depth == 0:
                 return i
             depth -= 1
+        elif c in ")]":
+            if depth > 0:
+                depth -= 1
+            # depth == 0: pop transparently, see the docstring above.
         elif c == ";" and depth == 0:
             return i + 1
         i += 1
@@ -681,13 +696,16 @@ def _find_stmt_terminator(text: str, start: int) -> int:
 
 
 def _find_stmt_start(text: str, pos: int) -> int:
-    """Index just PAST the depth-balanced `;`/`{` that PRECEDES the
-    statement containing `pos` — the round-3 audit item 4 fix
-    ("STATEMENT-scoped, not same-line"): a comparison operator or an
-    assert!-family call on a DIFFERENT LINE than a `.max()`/`+ <num>`
-    literal, but in the SAME statement, must still be found (the
-    `scaled_cast_add_oracles.rs:436` shape: `.max(1e-12)` on one line,
-    its `<= REL` comparison on the next).
+    """Index just PAST the `;`/`{` that PRECEDES the statement containing
+    `pos` — the mirror-image backward scan of `_find_stmt_terminator`
+    (same round-3b K1/K4 fix: `(`/`[` encountered at depth 0, going
+    backward, is the OPEN of a group `pos` itself is nested in — popped
+    transparently, never a stop, never negative). Needed for the STATEMENT-
+    scoped (not same-line) comparison/assert-family detection: a
+    comparison operator or an `assert!`-family call on a DIFFERENT line
+    than a `.max()`/`+ <num>` literal, but in the SAME statement, must
+    still be found (the `scaled_cast_add_oracles.rs:436` shape: `.max
+    (1e-12)` on one line, its `<= REL` comparison on the next).
     """
     depth = 0
     i = pos - 1
@@ -695,10 +713,14 @@ def _find_stmt_start(text: str, pos: int) -> int:
         c = text[i]
         if c in ")]}":
             depth += 1
-        elif c in "([{":
+        elif c == "{":
             if depth == 0:
                 return i + 1
             depth -= 1
+        elif c in "([":
+            if depth > 0:
+                depth -= 1
+            # depth == 0: pop transparently, see the docstring above.
         elif c == ";" and depth == 0:
             return i + 1
         i -= 1
@@ -850,7 +872,14 @@ def find_floor_hits(lines: list[str], file_label: str = "") -> list[FloorHit]:
             rhs_start = let_m.end()
             rhs_end = _find_stmt_terminator(body, rhs_start)
             rhs = body[rhs_start:rhs_end]
-            if name == "expected" or rhs.lstrip().startswith("["):
+            # round-3b audit fix (K4): the ORIGINAL `or` blanket-excluded
+            # EVERY array-literal-RHS `let` binding, not just ones actually
+            # named `expected` — silently swallowing an unrelated `let
+            # ratio = [num[0] / den[0].max(1e-30)];` (an ordinary indexing
+            # convenience, not a hand-computed expected-value fixture).
+            # `and` narrows this back to exactly the axpy.rs:200 shape the
+            # exclusion was written for.
+            if name == "expected" and rhs.lstrip().startswith("["):
                 continue
             lit = _first_float_floor_literal(rhs)
             if lit is None:
@@ -1565,6 +1594,57 @@ mod tests {
 """,
         label="crates/jammi-kernels/src/ops/cast_scale.rs",
     )
+
+    # --- round-4 audit (scoped re-audit of 8041c09/73e2e50) — K1/K4 fix ----
+    # `_find_stmt_start`/`_find_stmt_terminator` originally stopped at ANY
+    # `(`/`)` at depth 0, even one `pos` itself was already nested inside —
+    # truncating the "statement" to a bare sub-expression and hiding a
+    # `<=`/`>=` sitting OUTSIDE that group. Fixed to depth-relative-to-`pos`
+    # tracking where only `;`/`{`/`}` (never a bare paren) can ever stop the
+    # scan.
+    flagged(
+        "round-4 K1: .max(1e-12) wrapped in an EXTRA layer of parens on the "
+        "same line as its <= — the paren-nesting depth bug this fixes",
+        """
+fn ctl(diff: f64, mag: f64) -> bool {
+    diff <= (diff / mag.max(1e-12))
+}
+""",
+    )
+    flagged(
+        "round-4 K4: the SAME paren-nesting bug via array-INDEXED receivers "
+        "(num[0] / den[0].max(1e-30)) inside a let-binding later compared — "
+        "also confirms the 'let expected = [...]'-exclusion (round-3 item 5) "
+        "is narrowed to bindings actually NAMED expected, not every "
+        "array-literal-RHS let (this one is named 'ratio')",
+        """
+fn ctl(num: [f64;3], den: [f64;3]) -> bool {
+    let ratio = [num[0] / den[0].max(1e-30)];
+    ratio[0] <= REL
+}
+""",
+    )
+    clean(
+        "round-4: the 'let expected = [...]' exclusion still holds for its "
+        "OWN motivating shape (axpy.rs:200) after the K4 narrowing",
+        """
+fn t() {
+    let expected = [f(2.0 * 1.5 + 0.25)];
+    assert_eq!(out, expected);
+}
+""",
+    )
+    # Known, documented, OUT-OF-SCOPE gaps (round-4 audit fx_ko4.py J1-J9):
+    # additional floor SHAPES this round did not extend detection to —
+    # `f32::max(mag, 1e-6)`/`.clamp(1e-6, 1.0)` free-fn and clamp forms,
+    # a NAMED const additive floor requiring const-value resolution
+    # (`(mag + EPS) * REL`), a custom non-std `.maximum(1e-6)` method, an
+    # if-else hand-rolled max, and a strict `<`-only comparison (KO-4's
+    # `_COMPARISON_OP_RE` stays `<=`/`>=`-only — widening to bare `<`/`>`
+    # risks the SAME generic-bracket false-positive class KO-2's own
+    # adjacency check exists to avoid, and was not asked for here). Each
+    # would need real, separately-scoped work; listed here so they are
+    # NEVER silently claimed fixed, never silently dropped from view.
 
     # --- (C) number shapes ---
     flagged(

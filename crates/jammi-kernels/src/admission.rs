@@ -1287,11 +1287,15 @@ mod tests {
     }
 
     #[test]
-    // `cargo test -p jammi-kernels` (no `--features cuda`) makes `CUDA_COMPILED`
-    // a compile-time-known `false` for THIS test target; that is precisely
-    // the value being pinned, not an accident of how the assertion is
-    // written, so the `assertions_on_constants` lint is suppressed here
-    // rather than obscured behind a non-`assert!` rewrite.
+    // `#[cfg(not(feature = "cuda"))]`-gated: on a `--features cuda` build
+    // (the GPU prove lane, `ci/scripts/runpod_gpu_prove.sh`)
+    // `CUDA_COMPILED` is `true`, so this assertion would fail
+    // deterministically there — the twin below
+    // (`cuda_compiled_is_true_on_a_cuda_build`) pins that arm instead.
+    #[cfg(not(feature = "cuda"))]
+    // Compile-time-known `false` for THIS (non-cuda) test target; that is
+    // precisely the value being pinned, so `assertions_on_constants` is
+    // suppressed here rather than obscured behind a non-`assert!` rewrite.
     #[allow(clippy::assertions_on_constants)]
     fn cuda_compiled_is_false_on_a_non_cuda_build() {
         // This test target is built by a plain `cargo test -p jammi-kernels`
@@ -1302,9 +1306,18 @@ mod tests {
     }
 
     #[test]
-    // See the comment on `cuda_compiled_is_false_on_a_non_cuda_build`: the
-    // implication below is compile-time-known on every feature set this
-    // crate can be built with, which is the property under test.
+    // Twin of `cuda_compiled_is_false_on_a_non_cuda_build`, gated the other
+    // way: only compiled (and only true) under `--features cuda`.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::assertions_on_constants)]
+    fn cuda_compiled_is_true_on_a_cuda_build() {
+        assert!(CUDA_COMPILED);
+    }
+
+    #[test]
+    // Valid under both feature sets (an implication, not a fixed value), so
+    // this one carries no `#[cfg(...)]` gate — it runs, and holds, on both
+    // the CPU lane and the GPU prove lane.
     #[allow(clippy::assertions_on_constants)]
     fn flash_compiled_implies_cuda_compiled() {
         // `flash-attn = ["cuda"]` in `Cargo.toml`: every build that turns on

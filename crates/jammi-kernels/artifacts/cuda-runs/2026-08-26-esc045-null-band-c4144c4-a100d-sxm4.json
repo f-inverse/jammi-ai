@@ -1,0 +1,423 @@
+{
+  "schema_version": 1,
+  "unit": "esc-045 control (a): the NULL BAND of the paired gradient-cosine statistic, measured BEFORE any arm difference is read (docs/maintainer/fine-tune-performance-guide.md section 6; .jammi/escapes.jsonl esc-045 row, control (a)). At the SAME 6 b4-s128 operating points row 11/s4:42's table covers (seeds 42/43/44 x {gaussian, poststep}), the IDENTICAL statistic run_esc045_torch_column.sh's own table reports -- full_tensor_cosine(bf16_arm, jammi_f32_truth), the 224-tensor concatenated cosine analyze_esc045_torch_column.py's compare_arm_vs_truth computes, imported unchanged -- is computed TWICE per (arm, operating point): two independent process invocations of the IDENTICAL command (same seed, same --lora-weights-in shared safetensors file, same batch/config, same jammi_f32_truth dump reused for both). The paired difference (repA - repB) and its sign are reported per point, then the sign test over the 6 points, for torch-vs-torch and jammi-eager-vs-jammi-eager.",
+  "replicate_design": {
+    "chosen_nuisance": "run-to-run nondeterminism only (independent process reruns of the identical CLI invocation)",
+    "justification": "grad_oracle.rs's own determinant table (module doc, 'Determinant table -- every field either producer emits, classified') marks seed, batch, seq, lora_rank, lora_alpha, target_modules, batched_forward, backbone_dtype, checkpoint_config_sha256, checkpoint_weights_sha256, checkpoint_weights_size_bytes, lora_weights_in (presence), batch_token_id_sums, and lora_init as IDENTITY fields -- pinned equal between the two REAL arms esc-045's own table compares (block/flash/eager-jammi vs torch_bf16), since both load the IDENTICAL LoRA weights via the shared safetensors interchange file and the SAME synthetic batch (grad_oracle.rs module doc, 'Weight interchange format': 'this is the crux: it removes the init mismatch ENTIRELY, on both the value and the bit level'). A replicate that varied LoRA init or the data seed between repA/repB would therefore inject a nuisance the REAL between-arm comparison never carries -- an apples-to-oranges null band, not this control's null band. The ONLY thing left that can legitimately differ between two runs at an otherwise fully-pinned operating point is run-to-run nondeterminism in that arm's OWN kernel execution (GPU reduction-order / algorithm-selection variability) -- which is the SAME CATEGORY of nuisance (floating-point accumulation-order variability in a bf16 forward+backward) that separates two INDEPENDENTLY-IMPLEMENTED bf16 backward paths (torch's vs jammi's) at a shared operating point. This is the design run_esc045_null_band.sh/analyze_esc045_null_band.py implement.",
+    "second_replicate_considered_and_rejected": "Toggling --batched-forward (single joined 3b-row forward vs three separate per-group forwards) was considered as a second, mechanistically different nuisance: it changes GEMM/reduction grouping while holding seed/weights/batch content identical, and grad_oracle.rs's own test grad_oracle_batched_and_unbatched_forward_agree documents this is NOT bit-exact (~1e-6 relative, reduction-order noise). It was REJECTED as a null-band replicate here: batched_forward IS a RUN_IDENTITY_FIELDS entry in compare_grad_oracle.py, and BOTH real arms in esc-045's own table hold it fixed identically (True, the default, on every leg of run_esc045_torch_column.sh) -- so varying it between repA/repB would, like a different init draw, inject a nuisance the real between-arm comparison never carries. It does not satisfy this control's own 'same nuisance that varies between arms' criterion and was not run."
+  },
+  "git_sha": "c4144c4cd4059494574711eaecface444d5106fa",
+  "git_sha7": "c4144c4",
+  "branch": "bench/esc045-null-band",
+  "branch_base": {
+    "ref": "bench/esc045-torch-column-flash",
+    "sha": "fb807e061385731ff9277840d7585ce77a186704"
+  },
+  "box": "a100d",
+  "status": "measured",
+  "producer": {
+    "path": "ci/scripts/perf/run_esc045_null_band.sh + ci/scripts/perf/analyze_esc045_null_band.py",
+    "kind": "manual pod-lane shell script + python comparator (no CI lane has a GPU)",
+    "invocation": "MODEL_DIR=/root/checkpoints/ModernBERT-large TORCH_PY=/root/jammi-ai/.venv-torch-ref/bin/python3 CARGO_TARGET_DIR=/root/target-esc045nb bash ci/scripts/perf/run_esc045_null_band.sh /root/esc045_nullband b4-s128-seed42:4:128:42 b4-s128-seed43:4:128:43 b4-s128-seed44:4:128:44",
+    "analyzer_invocation": "ci/scripts/perf/analyze_esc045_null_band.py /root/esc045_nullband --out .../null_band_report.json (torch-ref venv python3, numpy 2.2.6)",
+    "binary": "cargo build -p jammi-bench --release --features cuda, CARGO_TARGET_DIR=/root/target-esc045nb, git_sha c4144c4 (built on top of fb807e0/3206581)"
+  },
+  "box_identity": {
+    "gpu": "NVIDIA A100-SXM4-80GB",
+    "driver_version": "580.126.16",
+    "cuda_toolkit_nvcc": "12.6.85"
+  },
+  "torch_reference_venv": {
+    "path": "/root/jammi-ai/.venv-torch-ref",
+    "torch_version": "2.11.0+cu128",
+    "torch_cuda_version": "12.8",
+    "transformers_version": "5.15.1",
+    "peft_version": "0.20.0"
+  },
+  "checkpoint_identity": {
+    "model_dir": "/root/checkpoints/ModernBERT-large (answerdotai/ModernBERT-large, public HF) -- rsynced pod-to-pod from a100e",
+    "checkpoint_config_sha256": "55dca68059e98f0debf8eb63ab355c451c65b1f5d90fdca4754113fdaadd2cca",
+    "checkpoint_weights_sha256": "44510fec5d3a81a1877f225637b869495f18e55f6f23a09abb9be0acc030295f",
+    "checkpoint_weights_size_bytes": 1583544840,
+    "note": "identical to the torch-column artifact's checkpoint identity (byte-for-byte same checkpoint, confirmed by matching sha256)"
+  },
+  "eager_arm_dispatch_evidence": {
+    "mechanism": "Every jammi_bf16_eager leg ran with JAMMI_KERNELS_DISABLE=all JAMMI_KERNELS_STRICT=1. Verified directly against all 12 raw dumps (2 replicates x 6 operating points): every one of the 7 named op-family *_fused_dispatches counters (ln, rope, softmax, geglu, lora_epilogue, lora_linear, attention_block) reads EXACTLY 0 on every leg, kernels_disabled_requested == kernels_disabled_fired == ['all'] on every leg (the disable actually took effect, not merely requested), and eager dispatch counts are nonzero and IDENTICAL across repA/repB at each operating point (ln=57, rope=56, softmax=28, geglu=28, lora_linear=112, attention_block=28; lora_epilogue=0 on both arms/reps -- a registered-but-not-independently-dispatched key at this call site, per grad_oracle.rs's own live_admit_keys doc).",
+    "requested_equals_fired": true,
+    "all_fused_zero": true
+  },
+  "combined_report": {
+    "rows": [
+      {
+        "config": "b4-s128-seed42",
+        "batch": 4,
+        "seq": 128,
+        "seed": 42,
+        "op_point": "gaussian",
+        "torch_bf16_repA": 0.7956541320953485,
+        "torch_bf16_repB": 0.7956541320953485,
+        "torch_bf16_paired_diff": 0.0,
+        "torch_bf16_sign": "0",
+        "torch_bf16_null_band": 0.0,
+        "jammi_bf16_eager_repA": 0.7667437335446826,
+        "jammi_bf16_eager_repB": 0.7667437335446826,
+        "jammi_bf16_eager_paired_diff": 0.0,
+        "jammi_bf16_eager_sign": "0",
+        "jammi_bf16_eager_null_band": 0.0
+      },
+      {
+        "config": "b4-s128-seed42",
+        "batch": 4,
+        "seq": 128,
+        "seed": 42,
+        "op_point": "poststep",
+        "torch_bf16_repA": -0.20137275117605652,
+        "torch_bf16_repB": -0.20137275117605652,
+        "torch_bf16_paired_diff": 0.0,
+        "torch_bf16_sign": "0",
+        "torch_bf16_null_band": 0.0,
+        "jammi_bf16_eager_repA": -0.1983498346936972,
+        "jammi_bf16_eager_repB": -0.1983498346936972,
+        "jammi_bf16_eager_paired_diff": 0.0,
+        "jammi_bf16_eager_sign": "0",
+        "jammi_bf16_eager_null_band": 0.0
+      },
+      {
+        "config": "b4-s128-seed43",
+        "batch": 4,
+        "seq": 128,
+        "seed": 43,
+        "op_point": "gaussian",
+        "torch_bf16_repA": 0.42451132711029876,
+        "torch_bf16_repB": 0.42451132711029876,
+        "torch_bf16_paired_diff": 0.0,
+        "torch_bf16_sign": "0",
+        "torch_bf16_null_band": 0.0,
+        "jammi_bf16_eager_repA": 0.45064983895706484,
+        "jammi_bf16_eager_repB": 0.45064983895706484,
+        "jammi_bf16_eager_paired_diff": 0.0,
+        "jammi_bf16_eager_sign": "0",
+        "jammi_bf16_eager_null_band": 0.0
+      },
+      {
+        "config": "b4-s128-seed43",
+        "batch": 4,
+        "seq": 128,
+        "seed": 43,
+        "op_point": "poststep",
+        "torch_bf16_repA": 0.6791048342885285,
+        "torch_bf16_repB": 0.6791048342885285,
+        "torch_bf16_paired_diff": 0.0,
+        "torch_bf16_sign": "0",
+        "torch_bf16_null_band": 0.0,
+        "jammi_bf16_eager_repA": 0.22881176050775764,
+        "jammi_bf16_eager_repB": 0.22881176050775764,
+        "jammi_bf16_eager_paired_diff": 0.0,
+        "jammi_bf16_eager_sign": "0",
+        "jammi_bf16_eager_null_band": 0.0
+      },
+      {
+        "config": "b4-s128-seed44",
+        "batch": 4,
+        "seq": 128,
+        "seed": 44,
+        "op_point": "gaussian",
+        "torch_bf16_repA": 0.48517930509616874,
+        "torch_bf16_repB": 0.48517930509616874,
+        "torch_bf16_paired_diff": 0.0,
+        "torch_bf16_sign": "0",
+        "torch_bf16_null_band": 0.0,
+        "jammi_bf16_eager_repA": 0.13334156997638053,
+        "jammi_bf16_eager_repB": 0.13334156997638053,
+        "jammi_bf16_eager_paired_diff": 0.0,
+        "jammi_bf16_eager_sign": "0",
+        "jammi_bf16_eager_null_band": 0.0
+      },
+      {
+        "config": "b4-s128-seed44",
+        "batch": 4,
+        "seq": 128,
+        "seed": 44,
+        "op_point": "poststep",
+        "torch_bf16_repA": -0.061878709393948274,
+        "torch_bf16_repB": -0.061878709393948274,
+        "torch_bf16_paired_diff": 0.0,
+        "torch_bf16_sign": "0",
+        "torch_bf16_null_band": 0.0,
+        "jammi_bf16_eager_repA": -0.08684238131334485,
+        "jammi_bf16_eager_repB": -0.08684238131334485,
+        "jammi_bf16_eager_paired_diff": 0.0,
+        "jammi_bf16_eager_sign": "0",
+        "jammi_bf16_eager_null_band": 0.0
+      }
+    ],
+    "summary": {
+      "torch_bf16": {
+        "signs": [
+          "0",
+          "0",
+          "0",
+          "0",
+          "0",
+          "0"
+        ],
+        "positive": 0,
+        "negative": 0,
+        "zero": 6,
+        "n": 6,
+        "null_band_per_point": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "null_band_min": 0.0,
+        "null_band_max": 0.0,
+        "null_band_range": 0.0
+      },
+      "jammi_bf16_eager": {
+        "signs": [
+          "0",
+          "0",
+          "0",
+          "0",
+          "0",
+          "0"
+        ],
+        "positive": 0,
+        "negative": 0,
+        "zero": 6,
+        "n": 6,
+        "null_band_per_point": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "null_band_min": 0.0,
+        "null_band_max": 0.0,
+        "null_band_range": 0.0
+      }
+    }
+  },
+  "paired_table": {
+    "description": "Per (config, op_point), the full-tensor cosine of dL/dB vs jammi_f32_truth for TWO independent process replicates of each arm (torch_bf16, jammi_bf16_eager), their paired difference (repA - repB), sign, and the resulting sign test over the 6 b4-s128 operating points row 11/s4:42's table covers. NO cross-arm verdict is computed here -- this artifact answers ONLY 'is the paired-sign statistic itself chaotic under run-to-run nondeterminism', control (a) of the esc-045 ledger row.",
+    "table_text": "config           op           torch repA    torch repB       diff sign      eager repA    eager repB       diff sign\n--------------------------------------------------------------------------------------------------------------------\nb4-s128-seed42   gaussian    0.795654132   0.795654132  +0.000000    0     0.766743734   0.766743734  +0.000000    0\nb4-s128-seed42   poststep   -0.201372751  -0.201372751  +0.000000    0    -0.198349835  -0.198349835  +0.000000    0\nb4-s128-seed43   gaussian    0.424511327   0.424511327  +0.000000    0     0.450649839   0.450649839  +0.000000    0\nb4-s128-seed43   poststep    0.679104834   0.679104834  +0.000000    0     0.228811761   0.228811761  +0.000000    0\nb4-s128-seed44   gaussian    0.485179305   0.485179305  +0.000000    0     0.133341570   0.133341570  +0.000000    0\nb4-s128-seed44   poststep   -0.061878709  -0.061878709  +0.000000    0    -0.086842381  -0.086842381  +0.000000    0\n\ntorch_bf16: signs=['0', '0', '0', '0', '0', '0'] -> 0 positive / 0 negative / 6 zero (n=6); null band per point (|repA-repB|) min=0.000000000 max=0.000000000\njammi_bf16_eager: signs=['0', '0', '0', '0', '0', '0'] -> 0 positive / 0 negative / 6 zero (n=6); null band per point (|repA-repB|) min=0.000000000 max=0.000000000\n\nblock-torch (row11) deficit magnitudes over the same 6 points: min=0.008 max=0.749 (values: ['-0.186', '-0.149', '-0.125', '-0.116', '-0.749', '-0.008'])\nnull band (both arms, run-to-run nondeterminism only) = EXACTLY 0.000000000 at every one of the 6 points -- narrower than every block-torch deficit above (0.008 .. 0.749).",
+    "rows": [
+      {
+        "config": "b4-s128-seed42",
+        "batch": 4,
+        "seq": 128,
+        "seed": 42,
+        "op_point": "gaussian",
+        "torch_bf16_repA": 0.7956541320953485,
+        "torch_bf16_repB": 0.7956541320953485,
+        "torch_bf16_paired_diff": 0.0,
+        "torch_bf16_sign": "0",
+        "torch_bf16_null_band": 0.0,
+        "jammi_bf16_eager_repA": 0.7667437335446826,
+        "jammi_bf16_eager_repB": 0.7667437335446826,
+        "jammi_bf16_eager_paired_diff": 0.0,
+        "jammi_bf16_eager_sign": "0",
+        "jammi_bf16_eager_null_band": 0.0
+      },
+      {
+        "config": "b4-s128-seed42",
+        "batch": 4,
+        "seq": 128,
+        "seed": 42,
+        "op_point": "poststep",
+        "torch_bf16_repA": -0.20137275117605652,
+        "torch_bf16_repB": -0.20137275117605652,
+        "torch_bf16_paired_diff": 0.0,
+        "torch_bf16_sign": "0",
+        "torch_bf16_null_band": 0.0,
+        "jammi_bf16_eager_repA": -0.1983498346936972,
+        "jammi_bf16_eager_repB": -0.1983498346936972,
+        "jammi_bf16_eager_paired_diff": 0.0,
+        "jammi_bf16_eager_sign": "0",
+        "jammi_bf16_eager_null_band": 0.0
+      },
+      {
+        "config": "b4-s128-seed43",
+        "batch": 4,
+        "seq": 128,
+        "seed": 43,
+        "op_point": "gaussian",
+        "torch_bf16_repA": 0.42451132711029876,
+        "torch_bf16_repB": 0.42451132711029876,
+        "torch_bf16_paired_diff": 0.0,
+        "torch_bf16_sign": "0",
+        "torch_bf16_null_band": 0.0,
+        "jammi_bf16_eager_repA": 0.45064983895706484,
+        "jammi_bf16_eager_repB": 0.45064983895706484,
+        "jammi_bf16_eager_paired_diff": 0.0,
+        "jammi_bf16_eager_sign": "0",
+        "jammi_bf16_eager_null_band": 0.0
+      },
+      {
+        "config": "b4-s128-seed43",
+        "batch": 4,
+        "seq": 128,
+        "seed": 43,
+        "op_point": "poststep",
+        "torch_bf16_repA": 0.6791048342885285,
+        "torch_bf16_repB": 0.6791048342885285,
+        "torch_bf16_paired_diff": 0.0,
+        "torch_bf16_sign": "0",
+        "torch_bf16_null_band": 0.0,
+        "jammi_bf16_eager_repA": 0.22881176050775764,
+        "jammi_bf16_eager_repB": 0.22881176050775764,
+        "jammi_bf16_eager_paired_diff": 0.0,
+        "jammi_bf16_eager_sign": "0",
+        "jammi_bf16_eager_null_band": 0.0
+      },
+      {
+        "config": "b4-s128-seed44",
+        "batch": 4,
+        "seq": 128,
+        "seed": 44,
+        "op_point": "gaussian",
+        "torch_bf16_repA": 0.48517930509616874,
+        "torch_bf16_repB": 0.48517930509616874,
+        "torch_bf16_paired_diff": 0.0,
+        "torch_bf16_sign": "0",
+        "torch_bf16_null_band": 0.0,
+        "jammi_bf16_eager_repA": 0.13334156997638053,
+        "jammi_bf16_eager_repB": 0.13334156997638053,
+        "jammi_bf16_eager_paired_diff": 0.0,
+        "jammi_bf16_eager_sign": "0",
+        "jammi_bf16_eager_null_band": 0.0
+      },
+      {
+        "config": "b4-s128-seed44",
+        "batch": 4,
+        "seq": 128,
+        "seed": 44,
+        "op_point": "poststep",
+        "torch_bf16_repA": -0.061878709393948274,
+        "torch_bf16_repB": -0.061878709393948274,
+        "torch_bf16_paired_diff": 0.0,
+        "torch_bf16_sign": "0",
+        "torch_bf16_null_band": 0.0,
+        "jammi_bf16_eager_repA": -0.08684238131334485,
+        "jammi_bf16_eager_repB": -0.08684238131334485,
+        "jammi_bf16_eager_paired_diff": 0.0,
+        "jammi_bf16_eager_sign": "0",
+        "jammi_bf16_eager_null_band": 0.0
+      }
+    ],
+    "summary": {
+      "torch_bf16": {
+        "signs": [
+          "0",
+          "0",
+          "0",
+          "0",
+          "0",
+          "0"
+        ],
+        "positive": 0,
+        "negative": 0,
+        "zero": 6,
+        "n": 6,
+        "null_band_per_point": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "null_band_min": 0.0,
+        "null_band_max": 0.0,
+        "null_band_range": 0.0
+      },
+      "jammi_bf16_eager": {
+        "signs": [
+          "0",
+          "0",
+          "0",
+          "0",
+          "0",
+          "0"
+        ],
+        "positive": 0,
+        "negative": 0,
+        "zero": 6,
+        "n": 6,
+        "null_band_per_point": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "null_band_min": 0.0,
+        "null_band_max": 0.0,
+        "null_band_range": 0.0
+      }
+    },
+    "block_minus_torch_row11_deficits": {
+      "b4-s128-seed42|gaussian": -0.186,
+      "b4-s128-seed42|poststep": -0.149,
+      "b4-s128-seed43|gaussian": -0.125,
+      "b4-s128-seed43|poststep": -0.116,
+      "b4-s128-seed44|gaussian": -0.749,
+      "b4-s128-seed44|poststep": -0.008
+    }
+  },
+  "red_green_reading": {
+    "torch_vs_torch_signs": [
+      "0",
+      "0",
+      "0",
+      "0",
+      "0",
+      "0"
+    ],
+    "jammi_eager_vs_jammi_eager_signs": [
+      "0",
+      "0",
+      "0",
+      "0",
+      "0",
+      "0"
+    ],
+    "torch_vs_torch_sign_counts": {
+      "positive": 0,
+      "negative": 0,
+      "zero": 6
+    },
+    "jammi_eager_vs_jammi_eager_sign_counts": {
+      "positive": 0,
+      "negative": 0,
+      "zero": 6
+    },
+    "null_band_torch": {
+      "min": 0.0,
+      "max": 0.0
+    },
+    "null_band_jammi_eager": {
+      "min": 0.0,
+      "max": 0.0
+    },
+    "verdict": "GREEN",
+    "reading": "Under the run-to-run-nondeterminism-only replicate design (the only nuisance that does not violate the 'same nuisance the real arms carry' constraint), BOTH torch_bf16 and jammi_bf16_eager are BIT-FOR-BIT DETERMINISTIC across independent process invocations at every one of the 6 operating points -- confirmed both via the analyzer's full-float64 paired diff (exactly 0.0, not a rounding artifact) and via a raw byte-level diff of the two repA/repB dumps at seed42/gaussian (jammi's two dumps are byte-IDENTICAL; torch's two dumps differ in exactly one field, the ISO-8601 date_utc provenance timestamp -- confirmed by diffing with that one line stripped). The null band is therefore EXACTLY 0.000000000 for both arms at every point, strictly narrower than every one of the 6 block-vs-torch deficits in the existing table (magnitudes 0.008 .. 0.749). The sign counts are 0 positive / 0 negative / 6 zero (a degenerate tie, not a directional 6/6) for BOTH arms -- this is NOT the 'consistent 6/6 same-direction sign' pattern the control's own RED criterion describes, so this control does not find the paired-sign statistic to be an artifact of run-to-run nondeterminism. esc-045's block-vs-torch 6/6 sign stands with respect to THIS control. Scope: this control only rules out run-to-run GPU/kernel nondeterminism as the source of the cross-arm sign pattern; it does not by itself settle whether that pattern reflects a real defect vs an inherent (but reproducible) sensitivity of bf16 gradient direction to which stack computed it, and it does not touch esc-046's rounding confound or control (d)'s forced-defect positive control -- both remain open per the ledger row."
+  },
+  "known_limitations": [
+    {
+      "id": "single-box-single-driver",
+      "description": "Determinism is measured on ONE box (a100d, A100-SXM4-80GB, driver 580.126.16) with SAME-PROCESS-family reruns (repA/repB launched sequentially from the same script, same box, same driver/cuda-toolkit version, same checkpoint bytes). This rules out run-to-run nondeterminism ON THIS BOX under these conditions; it does not claim cross-box/cross-driver bit-reproducibility (out of scope for control (a), which is about the metric's OWN resolving power on a single measurement apparatus, not cross-box portability -- see guide section 8's own box-identity discipline for why that is a separate question)."
+    },
+    {
+      "id": "shared-truth-not-replicated",
+      "description": "jammi_f32_truth is generated ONCE per (config, op_point) and reused for BOTH replicates' cosine, by design (this module's own doc: 'f32 accumulation order is not the noise source under test'). If f32 accumulation itself carried run-to-run nondeterminism at this shape, this design would not detect it -- considered unlikely (f32 GEMM/reduction paths are the same deterministic cuBLAS/candle call sites as bf16's, just at higher precision) but not independently verified this round."
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+config           op           torch repA    torch repB       diff sign      eager repA    eager repB       diff sign
+--------------------------------------------------------------------------------------------------------------------
+b4-s128-seed42   gaussian    0.795654132   0.795654132  +0.000000    0     0.766743734   0.766743734  +0.000000    0
+b4-s128-seed42   poststep   -0.201372751  -0.201372751  +0.000000    0    -0.198349835  -0.198349835  +0.000000    0
+b4-s128-seed43   gaussian    0.424511327   0.424511327  +0.000000    0     0.450649839   0.450649839  +0.000000    0
+b4-s128-seed43   poststep    0.679104834   0.679104834  +0.000000    0     0.228811761   0.228811761  +0.000000    0
+b4-s128-seed44   gaussian    0.485179305   0.485179305  +0.000000    0     0.133341570   0.133341570  +0.000000    0
+b4-s128-seed44   poststep   -0.061878709  -0.061878709  +0.000000    0    -0.086842381  -0.086842381  +0.000000    0
+
+torch_bf16: signs=['0', '0', '0', '0', '0', '0'] -> 0 positive / 0 negative / 6 zero (n=6); null band per point (|repA-repB|) min=0.000000000 max=0.000000000
+jammi_bf16_eager: signs=['0', '0', '0', '0', '0', '0'] -> 0 positive / 0 negative / 6 zero (n=6); null band per point (|repA-repB|) min=0.000000000 max=0.000000000
+
+block-torch (row11) deficit magnitudes over the same 6 points: min=0.008 max=0.749 (values: ['-0.186', '-0.149', '-0.125', '-0.116', '-0.749', '-0.008'])
+null band (both arms, run-to-run nondeterminism only) = EXACTLY 0.000000000 at every one of the 6 points -- narrower than every block-torch deficit above (0.008 .. 0.749).

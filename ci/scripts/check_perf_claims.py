@@ -111,44 +111,57 @@ error, never a silent pass):
                  scope, so this is an explicit, closed stand-in, not an
                  author-trusted marker.
 
-ARTIFACT-FIELD PRECEDENCE (P3, C10.4; rewritten per audit A1). For a
-`diff`/`ratio`/`pct` tag, gather every leaf pointer among its operands; if
-all leaves share the same tracked file, search the WHOLE FILE (not merely
-the operands' common-ancestor subtree — the original walk stopped there and
-missed a computed field living in a SIBLING subtree, e.g. cast-w1's own
-`/deltas/b8_s512_p50_ms/delta_ms` relative to operands under `/legs/...`,
-which are siblings of `/deltas` at the artifact's top level, not ancestors
-of it) for a leaf whose OWN key matches `delta*`/`ratio*`/`speedup*`/
-`*_pct`/`spread*` AND whose OWN json-pointer path shares every
-digit-bearing identifier token (`_path_digit_tokens`) common to ALL the
-operands' own paths, EXCLUDING any per-replicate suffix (`r1`, `r2`,
-`rep...`) — round-3 audit fix: a per-rep suffix is explicitly STRIPPED
-before intersecting, not left to "never survive the intersection" as an
-earlier revision's docstring claimed. That claim was false: a SAME-rep
-pair (`.../legs/b8_s512_disabled_r1/s_per_step_p50` vs `.../legs/
-b8_s512_fused_r1/s_per_step_p50` — both `r1`) keeps `r1` in the natural
-intersection, over-constrains the candidate search, and silently misses
-the artifact's own `/deltas/b8_s512_p50_ms/delta_ms` (whose path carries
-no rep suffix at all) — binding `39.565658` bit-for-bit as an unchecked
-free diff. Stripping the suffix outright closes the class regardless of
-whether the two operands happen to share or differ on their own rep index.
-The remaining identifier tokens must ALSO be consistent with a matching
-UNIT FAMILY (`_unit_family`: `ms`/`s`/`bytes` inferred from each leaf key's
-own suffix) — a `_ms`-family candidate is only offered to `_ms`/`s_per_
-step`-shaped operands, a `_gb`/bytes-family candidate only to VRAM-shaped
-operands; a shared shape token like `b8_s512` alone is not enough (it
-would otherwise let a VRAM diff match a millisecond field of the same
-shape, or vice versa). When the operands span more than one tracked file,
-or share NO digit-bearing identifier token at all, precedence is
-UNDECIDABLE and the tag is a FINDING naming that explicitly ("precedence
-undecidable: ...") — never a silent pass just because the mechanism could
-not determine an answer. NUMBER and STRING leaves are both hits (audit A1:
-a string-valued field, e.g. a hand-written `"+0.235 to +0.369 GB"` range,
-is a FINDING too — "artifact states a range: bind two tokens or ledger it"
-— never a silently blessed pass just because it isn't a JSON number the
-pointer grammar could resolve to). If a hit exists, the tag is a FINDING
-naming the field's own pointer, unless the tag's own operand pointers
-already include that exact leaf.
+ARTIFACT-FIELD PRECEDENCE (P3, C10.3; VALUE-based, round-4 audit rewrite).
+Two prior mechanisms (token-identifier intersection, then token +
+unit-family) were both found live-broken by an adversarial sweep of the
+real tracked tree: the subset test always required the CANDIDATE field to
+be at least as token-specific as the OPERANDS, but a real computed field is
+almost always LESS specific than its operands (`delta_ms` carries no rep
+suffix; the operands that produce it do) — 172 free-bind evasions across 14
+committed fields in the 79 tracked cuda-run JSONs, e.g. a same-rep pair, a
+`run_1`-suffixed ratio field the rep-strip didn't recognize, and — since
+`_unit_family` returned `None` on 27 of 32 real computed leaves — a
+millisecond operand pair silently binding past an unrelated `_pct` field
+because the (inert) family veto never fired. Identity/token reasoning is
+abandoned entirely. The mechanism is now VALUE-based: for a `diff`/`ratio`/
+`pct` tag, evaluate the FREE result (the raw diff/ratio/pct over the
+operands, in their own native unit, before this tag's own `neg`/`as unit`/
+`legacy` wrapping); if all operand leaves share one tracked file, scan the
+WHOLE FILE for every NUMBER leaf whose OWN key matches `delta*`/`ratio*`/
+`speedup*`/`*_pct`/`spread*` (`_COMPUTED_FIELD_RE`) and test whether that
+leaf's value equals the free result — same sign, opposite sign, or after a
+`×1000`/`÷1000`/`÷1e9` unit rescale (`s<->ms`, `bytes<->GB`) — within a 5e-4
+RELATIVE tolerance (`_values_match`). ANY match is a FINDING naming the
+matched field's own pointer: the free aggregate is not legal when the
+artifact already states the identical number under a name that says it is
+computed, REGARDLESS of which two leaves produced it or what either leaf is
+called. A coincidental match (two genuinely unrelated quantities landing
+within 5e-4 of each other by chance) is still reported, on purpose — the
+finding names the field so a human decides "point at it" or "ledger this
+cell, it's a coincidence," never a silent mechanical exemption for
+"probably unrelated." Operands spanning more than one tracked file are
+UNDECIDABLE (a FINDING, "precedence undecidable: ...") since the whole-file
+value scan needs one file to search; a same-family STRING-valued field
+(the pre-round-4 mechanism's other hit class) is NOT checked here anymore
+— value equality cannot be tested against free text — and is instead
+caught only if a human names it in review; this is a stated, deliberate
+narrowing (the ONE live case, cast-w1's `delta_gb` range, is already
+ledgered in the guide, C11). If a hit exists, the tag is a FINDING naming
+the field's own pointer, unless the tag's own operand pointers already
+include that exact leaf.
+
+FREE-BIND-EVASION SWEEP (`--sweep`, wired as a required guard leg). A
+regression oracle over the real tracked tree, independent of any specific
+guide tag: for every dict in every tracked cuda-run JSON that has >=2
+child dicts sharing a common relative leaf sub-path (the exact shape every
+`legs`/`runs`/`shapes`/`summary` container in this tree uses — e.g. two
+sibling `legs.<name>` objects both carrying `s_per_step_p50`), every pair
+of same-sub-path values is tried as `diff`/`ratio`/`pct` operands and
+checked with the SAME value-match function against every computed-family
+leaf in that file. A nonzero count means the runtime precedence check
+would ALSO miss it (it is the identical matcher) — the sweep is a
+completeness check on the CANDIDATE ENUMERATION (whole-file scan) and the
+MATCH FUNCTION, run over real data instead of hand-picked fixtures.
 
 EQUALITY (P3). The token is parsed as `Decimal` at ITS OWN printed
 precision (digits after `.`); the evaluated expression is quantized to that
@@ -603,56 +616,31 @@ def _rfc6901_walk(doc, pointer: str):
     return cur, segs
 
 
-_REP_SUFFIX_RE = re.compile(r"^r\d+$|^rep\w*$")
+_COMPUTED_FIELD_RE = re.compile(r"^(delta|ratio|speedup).*$|.*_pct$|^spread.*$")
+
+# round-4 audit rewrite: VALUE-based precedence. 5e-4 relative tolerance;
+# a free result is tried at its own scale, x1000/-x1000 (s<->ms), and
+# /=1e9 (bytes<->GB) — both sign directions, since a delta's stored sign
+# convention need not match a free diff's natural (A-B) sign.
+_VALUE_REL_TOL = Decimal("0.0005")
+_VALUE_SCALE_FACTORS = (Decimal(1), Decimal(1000), Decimal(1) / Decimal(1000), Decimal(1) / Decimal(10**9))
 
 
-def _path_digit_tokens(pointer: str) -> set[str]:
-    """Digit-bearing identifier tokens in a JSON-pointer path — `b8`,
-    `s512`, `p50` — split generically on any non-alphanumeric character. A
-    token with NO digit (`legs`, `deltas`, `fused`) is structural prose,
-    never an identifier, and is dropped. A per-REPLICATE suffix (`r1`,
-    `r2`, `rep...`) is ALSO dropped (round-3 audit fix) — it identifies
-    WHICH RUN an operand came from, never the QUANTITY being computed, and
-    keeping it let a same-rep operand pair over-constrain the search (see
-    the module doc's PRECEDENCE section)."""
-    segs = re.split(r"[^A-Za-z0-9]+", pointer)
-    return {
-        s.lower()
-        for s in segs
-        if s and any(ch.isdigit() for ch in s) and not _REP_SUFFIX_RE.match(s.lower())
-    }
+def _values_match(a: Decimal, b: Decimal, rel_tol: Decimal = _VALUE_REL_TOL) -> bool:
+    if a == b:
+        return True
+    denom = max(abs(a), abs(b))
+    if denom == 0:
+        return False
+    return abs(a - b) <= rel_tol * denom
 
 
-_UNIT_FAMILY_TIME_RE = re.compile(r"(?:^|_)(?:ms|s)(?:$|_)|s_per_step")
-_UNIT_FAMILY_BYTES_RE = re.compile(r"(?:^|_)(?:gb|gib|mib|bytes)(?:$|_)|bytes")
-
-
-def _unit_family(key: str) -> str | None:
-    """A coarse unit-family guess from a leaf key's own suffix (round-3
-    audit fix): `time` for a seconds- OR milliseconds-shaped name
-    (`s_per_step_p50`, `..._s`, `delta_ms` — a delta computed FROM raw
-    seconds is routinely REPORTED in ms, same physical quantity, so `s`
-    and `ms` are ONE family, not two — an earlier draft of this function
-    split them and vetoed the real cast-w1 s_per_step-vs-delta_ms match,
-    caught by this file's own self-test), `bytes` for a VRAM/byte-shaped
-    name (`_gb`/`_gib`/`_mib`/`bytes`). `None` if undetermined —
-    undetermined NEVER blocks a match by itself; it only means the family
-    check cannot VETO a token-identifier match. Used to stop a shared
-    shape token (`b8_s512`) alone from matching a candidate of the WRONG
-    family — a VRAM diff must never bind to a time field of the same
-    shape, or vice versa."""
-    low = key.lower()
-    if _UNIT_FAMILY_TIME_RE.search(low):
-        return "time"
-    if _UNIT_FAMILY_BYTES_RE.search(low):
-        return "bytes"
-    return None
-
-
-def _operand_family(refs: list[PointerRef]) -> str | None:
-    families = {_unit_family(r.pointer.rsplit("/", 1)[-1]) for r in refs}
-    families.discard(None)
-    return next(iter(families)) if len(families) == 1 else None
+def _value_matches_any_scale(free_value: Decimal, candidate: Decimal) -> bool:
+    for scale in _VALUE_SCALE_FACTORS:
+        scaled = free_value * scale
+        if _values_match(scaled, candidate) or _values_match(-scaled, candidate):
+            return True
+    return False
 
 
 def _iter_leaves(doc, prefix: str = ""):
@@ -664,6 +652,126 @@ def _iter_leaves(doc, prefix: str = ""):
             yield from _iter_leaves(v, f"{prefix}/{i}")
     else:
         yield prefix, doc
+
+
+def _collect_dicts(doc, prefix: str = ""):
+    if isinstance(doc, dict):
+        yield prefix or "/", doc
+        for k, v in doc.items():
+            yield from _collect_dicts(v, f"{prefix}/{k}")
+    elif isinstance(doc, list):
+        for i, v in enumerate(doc):
+            yield from _collect_dicts(v, f"{prefix}/{i}")
+
+
+def _numeric_leaf_map(node, prefix: str = "") -> dict[str, Decimal]:
+    out: dict[str, Decimal] = {}
+    for ptr, val in _iter_leaves(node, prefix):
+        if isinstance(val, bool) or not isinstance(val, (Decimal, int)):
+            continue
+        out[ptr] = Decimal(val)
+    return out
+
+
+def sibling_operand_pairs(doc) -> list[tuple[str, Decimal, str, Decimal]]:
+    """Every pair of numeric leaves a real author could plausibly write as
+    diff/ratio/pct operands, generated PURELY STRUCTURALLY — no
+    identifier-token reasoning (round-4 audit: token reasoning is exactly
+    what round 2/3's precedence check used and both were found live-broken
+    by an adversarial sweep). For every dict with >=2 CHILD dicts, and
+    every relative leaf sub-path the children hold in COMMON, every pair
+    of children's values at that sub-path — the exact shape every real
+    `legs`/`runs`/`shapes`/`summary` container in this tree uses (two
+    sibling leg objects both carrying `s_per_step_p50`; two sibling run
+    objects both carrying a stat)."""
+    pairs: list[tuple[str, Decimal, str, Decimal]] = []
+    for base_ptr, d in _collect_dicts(doc):
+        child_containers = {k: v for k, v in d.items() if isinstance(v, (dict, list))}
+        if len(child_containers) < 2:
+            continue
+        rel_maps: dict[str, dict[str, tuple[str, Decimal]]] = {}
+        for k, v in child_containers.items():
+            child_prefix = f"{base_ptr.rstrip('/')}/{k}"
+            leaves = _numeric_leaf_map(v, child_prefix)
+            rel: dict[str, tuple[str, Decimal]] = {}
+            for full_ptr, val in leaves.items():
+                rel[full_ptr[len(child_prefix):]] = (full_ptr, val)
+            if rel:
+                rel_maps[k] = rel
+        keys = sorted(rel_maps)
+        for i in range(len(keys)):
+            for j in range(i + 1, len(keys)):
+                common_subs = set(rel_maps[keys[i]]) & set(rel_maps[keys[j]])
+                for sub in common_subs:
+                    pa, va = rel_maps[keys[i]][sub]
+                    pb, vb = rel_maps[keys[j]][sub]
+                    pairs.append((pa, va, pb, vb))
+    return pairs
+
+
+def sweep_free_bind_evasions(doc, own_pointers: frozenset[str] = frozenset()) -> list[tuple[str, str, str, str, str]]:
+    """For one parsed JSON document: every plausible operand pair
+    (`sibling_operand_pairs`), every one of the three free forms, checked
+    against every computed-family leaf in the SAME document via the exact
+    runtime value-match function (`_value_matches_any_scale`). Returns
+    `(form, op_a_pointer, op_b_pointer, matched_field_pointer,
+    free_value_str)` evasions — a nonzero count means the runtime
+    precedence check (identical matcher) would ALSO miss it."""
+    evasions: list[tuple[str, str, str, str, str]] = []
+    pairs = sibling_operand_pairs(doc)
+    targets = [
+        (ptr, val)
+        for ptr, val in _numeric_leaf_map(doc).items()
+        if _COMPUTED_FIELD_RE.match(ptr.rsplit("/", 1)[-1]) and ptr not in own_pointers
+    ]
+    for pa, va, pb, vb in pairs:
+        forms: list[tuple[str, Decimal | None]] = [("diff", va - vb)]
+        if vb != 0:
+            forms.append(("ratio", va / vb))
+            forms.append(("pct", (va / vb - Decimal(1)) * Decimal(100)))
+        for form, free in forms:
+            if free is None:
+                continue
+            for target_ptr, target_val in targets:
+                if target_ptr in (pa, pb):
+                    continue
+                if _value_matches_any_scale(free, target_val):
+                    evasions.append((form, pa, pb, target_ptr, str(free)))
+    return evasions
+
+
+def run_real_tree_sweep() -> tuple[int, list[tuple[str, str, str, str, str]], int]:
+    """Runs `sweep_free_bind_evasions` over every tracked cuda-run JSON
+    under `POINTER_ROOTS`, then re-checks each candidate match through the
+    REAL runtime path (`evaluate_expr` on an actually-constructed
+    diff/ratio/pct `Expr`) rather than trusting the sweep's own duplicate
+    matcher. Returns `(total_matches, uncaught, files_swept)` — `uncaught`
+    must be empty; a nonzero `total_matches` alone is not a failure (it is
+    the population of coincidences the mechanism is SUPPOSED to catch)."""
+    tracked = tracked_files()
+    loader = Loader(tracked=tracked)
+    total_matches = 0
+    uncaught: list[tuple[str, str, str, str, str]] = []
+    files_swept = 0
+    for rel in sorted(tracked):
+        if not any(rel == r or rel.startswith(r + "/") for r in POINTER_ROOTS):
+            continue
+        if not rel.endswith(".json"):
+            continue
+        try:
+            doc = loader.doc(rel)
+        except ResolutionError:
+            continue
+        files_swept += 1
+        for form, pa, pb, target_ptr, free_str in sweep_free_bind_evasions(doc):
+            total_matches += 1
+            expr = Expr(form, (PointerRef(rel, pa), PointerRef(rel, pb)))
+            try:
+                evaluate_expr(expr, loader)
+                uncaught.append((rel, form, pa, pb, target_ptr))
+            except ClaimParseError:
+                pass
+    return total_matches, uncaught, files_swept
 
 
 class Loader:
@@ -700,18 +808,19 @@ class Loader:
             raise ResolutionError(f"pointer does not resolve to a number: {ref.path}{ref.pointer}")
         return Decimal(val)
 
-    def same_quantity_field(self, refs: list[PointerRef]) -> tuple[str, object] | None:
-        """audit A1 + round-3 fix: whole-FILE search for a computed field
-        describing the SAME quantity as `refs`' common leg/shape
-        identifiers (rep suffix stripped) AND unit family — NOT limited to
-        the operands' common-ancestor SUBTREE (the original walk stopped
-        there and missed a field like cast-w1's own
-        `/deltas/b8_s512_p50_ms/delta_ms` sitting in a SIBLING subtree of
-        the operands' own `/legs/...`). Returns (pointer, value) of the
-        first match; NUMBER and STRING leaves both count. Raises
+    def same_quantity_field(self, free_value: Decimal, refs: list[PointerRef]) -> tuple[str, Decimal] | None:
+        """round-4 audit rewrite: VALUE-based whole-FILE search — NOT
+        limited to the operands' common-ancestor subtree, and NOT keyed on
+        any identifier-token/unit-family reasoning (both were found
+        live-broken by an adversarial sweep of the real tracked tree: the
+        candidate is almost always LESS token-specific than the operands,
+        e.g. `delta_ms` carries no rep suffix while its own operands do).
+        Scans every NUMBER leaf in the file whose key matches
+        `_COMPUTED_FIELD_RE` and returns the first whose value equals
+        `free_value` within `_value_matches_any_scale` (5e-4 relative,
+        either sign, or after a x1000/1000/1e9 rescale). Raises
         `PrecedenceUndecidable` — never returns `None` for this case —
-        when the operands span more than one file or share no digit-
-        bearing identifier token at all."""
+        when the operands span more than one tracked file."""
         paths = {r.path for r in refs}
         if len(paths) != 1:
             raise PrecedenceUndecidable(
@@ -721,35 +830,18 @@ class Loader:
         path = next(iter(paths))
         doc = self.doc(path)
         operand_pointers = {r.pointer for r in refs}
-        operand_token_sets = [_path_digit_tokens(r.pointer) for r in refs]
-        common = set.intersection(*operand_token_sets) if operand_token_sets else set()
-        if not common:
-            raise PrecedenceUndecidable(
-                "precedence undecidable: the operands share no digit-bearing identifier "
-                f"token to key a same-quantity search off of ({sorted(operand_pointers)}) — "
-                "point directly at a field or ledger this cell"
-            )
-        operand_family = _operand_family(refs)
         for leaf_pointer, leaf_value in _iter_leaves(doc):
             if leaf_pointer in operand_pointers:
                 continue
             last_seg = leaf_pointer.rsplit("/", 1)[-1]
             if not _COMPUTED_FIELD_RE.match(last_seg):
                 continue
-            if isinstance(leaf_value, bool):
+            if isinstance(leaf_value, bool) or not isinstance(leaf_value, (Decimal, int)):
                 continue
-            if not isinstance(leaf_value, (Decimal, int, str)):
-                continue
-            if not (common <= _path_digit_tokens(leaf_pointer)):
-                continue
-            candidate_family = _unit_family(last_seg)
-            if operand_family is not None and candidate_family is not None and operand_family != candidate_family:
-                continue
-            return leaf_pointer, leaf_value
+            leaf_dec = Decimal(leaf_value)
+            if _value_matches_any_scale(free_value, leaf_dec):
+                return leaf_pointer, leaf_dec
         return None
-
-
-_COMPUTED_FIELD_RE = re.compile(r"^(delta|ratio|speedup).*$|.*_pct$|^spread.*$")
 
 
 def leaves_of(expr_or_ref) -> list[PointerRef]:
@@ -761,14 +853,15 @@ def leaves_of(expr_or_ref) -> list[PointerRef]:
     return out
 
 
-def precedence_violation(expr: Expr, loader: Loader) -> str | None:
+def precedence_violation(expr: Expr, raw_value: Decimal, loader: Loader) -> str | None:
     """None, or the offending field's own json-pointer, for a
-    diff/ratio/pct tag whose operands describe a quantity the pointed
-    artifact ALSO states elsewhere via a delta*/ratio*/speedup*/*_pct/
-    spread* field (number OR string) sharing the operands' identifiers."""
+    diff/ratio/pct tag whose free result (`raw_value`, evaluated BEFORE
+    this tag's own neg/unit/legacy wrapping) equals — value-wise — a
+    delta*/ratio*/speedup*/*_pct/spread* field the pointed artifact ALSO
+    states, regardless of which leaves produced either number."""
     if expr.kind not in ("diff", "ratio", "pct"):
         return None
-    hit = loader.same_quantity_field(leaves_of(expr))
+    hit = loader.same_quantity_field(raw_value, leaves_of(expr))
     return hit[0] if hit is not None else None
 
 
@@ -798,14 +891,18 @@ def eval_value(expr_or_ref, loader: Loader) -> Decimal:
 
 
 def evaluate_expr(expr: Expr, loader: Loader) -> tuple[Decimal, bool]:
-    """Returns (value, is_legacy). Applies the precedence check, the
-    legacy() allowlist, sign negation, and the unit factor, in that order."""
-    hit_pointer = precedence_violation(expr, loader)
+    """Returns (value, is_legacy). Computes the FREE (raw) result first —
+    precedence (round-4: value-based) needs it — then applies the
+    precedence check, the legacy() allowlist, sign negation, and the unit
+    factor, in that order."""
+    raw_val = eval_value(Expr(expr.kind, expr.args), loader)
+    hit_pointer = precedence_violation(expr, raw_val, loader)
     if hit_pointer is not None:
         field = hit_pointer.rsplit("/", 1)[-1]
         raise ClaimParseError(
-            f"artifact states this quantity elsewhere at {hit_pointer} ({field}); "
-            "bind directly to it or ledger this cell — a free aggregate is not legal here"
+            f"artifact states this value elsewhere at {hit_pointer} ({field}) — free "
+            f"result {raw_val} matches within tolerance; bind directly to it or ledger "
+            "this cell — a free aggregate matching a stated computed field is not legal here"
         )
     if expr.is_legacy:
         for leaf in leaves_of(expr):
@@ -814,7 +911,7 @@ def evaluate_expr(expr: Expr, loader: Loader) -> tuple[Decimal, bool]:
                     f"legacy(...) is not allowlisted for {leaf.path}{leaf.pointer} "
                     "(LEGACY_POINTER_ALLOWLIST is closed — add the exact cell by hand)"
                 )
-    val = eval_value(Expr(expr.kind, expr.args), loader)
+    val = raw_val
     if expr.is_neg:
         val = -val
     if expr.unit:
@@ -1254,11 +1351,9 @@ def self_test() -> int:
         if not cond:
             failures.append(f"self-test FAILED: {name}")
 
-    # --- (A1) whole-artifact same-quantity precedence, reproducing the
-    # real cast-w1 shape: operands under /legs/..., the computed field
-    # lives at /deltas/... — a SIBLING subtree, not an ancestor. The OLD
-    # common-ancestor-only walk missed this; the audit's end-to-end probe
-    # found it binding -38.5 beside an unread delta_ms=39.565658. ---
+    # --- round-4 audit: VALUE-based precedence. Reproduces the real
+    # cast-w1 shape: operands under /legs/..., the computed field lives at
+    # /deltas/... — a SIBLING subtree, not an ancestor. ---
     cast_w1_doc = {
         "legs": {
             "b8_s512_fused_r1": {"s_per_step_p50": Decimal("0.634850336")},
@@ -1271,24 +1366,11 @@ def self_test() -> int:
                 "fused_r1": Decimal("634.850336"),
                 "disabled_r1": Decimal("674.415994"),
                 "delta_ms": Decimal("39.565658"),
+                "delta_pct": Decimal("6.232281178"),
             }
         },
     }
     loader_cw1 = _mem_loader(cast_w1_doc)
-    end_to_end_expr = parse_expr(
-        "neg(diff(mean(fixture.json#/legs/b8_s512_disabled_r1/s_per_step_p50,"
-        "fixture.json#/legs/b8_s512_disabled_r2/s_per_step_p50),"
-        "mean(fixture.json#/legs/b8_s512_fused_r1/s_per_step_p50,"
-        "fixture.json#/legs/b8_s512_fused_r2/s_per_step_p50))) as ms"
-    )
-    try:
-        evaluate_expr(end_to_end_expr, loader_cw1)
-        failures.append(
-            "self-test FAILED (A1 end-to-end reproduction): the real cast-w1 shape "
-            "(operands under /legs, computed field under a sibling /deltas) did not raise"
-        )
-    except ClaimParseError as exc:
-        check("A1 end-to-end: violation names the sibling-subtree field", "delta_ms" in str(exc))
 
     # direct pointer AT the flagged field is exempt (bare pointer, not a
     # diff/ratio/pct tag at all).
@@ -1296,119 +1378,78 @@ def self_test() -> int:
     direct_val, _ = evaluate_expr(direct_expr, loader_cw1)
     check("direct pointer to the computed field is legal", direct_val == Decimal("-39.565658"))
 
-    # (A1) a STRING-valued same-quantity field is ALSO a finding — never a
-    # blessed pass (this INVERTS the pre-audit self-test, which wrongly
-    # asserted a string sibling does not block).
-    doc2 = {
-        "peak": {
-            "b8_s512": {
-                "fused_r1_gb": Decimal("16.0"),
-                "fused_r2_gb": Decimal("16.2"),
-                "disabled_r1_gb": Decimal("15.9"),
-                "disabled_r2_gb": Decimal("15.9"),
-                "delta_gb": "+0.1 to +0.3 GB",
-            }
-        }
-    }
-    loader2 = _mem_loader(doc2)
-    expr3 = parse_expr(
-        "diff(mean(fixture.json#/peak/b8_s512/fused_r1_gb,fixture.json#/peak/b8_s512/fused_r2_gb),"
-        "mean(fixture.json#/peak/b8_s512/disabled_r1_gb,fixture.json#/peak/b8_s512/disabled_r2_gb))"
-    )
-    try:
-        evaluate_expr(expr3, loader2)
-        failures.append(
-            "self-test FAILED (A1): a STRING-valued delta_gb sibling did not block a free diff "
-            "— it must be a finding ('bind two tokens or ledger it'), never a silent pass"
-        )
-    except ClaimParseError as exc:
-        check("A1: string-valued same-quantity field named in the finding", "delta_gb" in str(exc))
-
-    # (round-3 audit) a quantity with NO shared digit-identifier across
-    # operands is UNDECIDABLE, not silently clean — FAILS LOUDLY rather
-    # than returning None (an earlier revision let this bind freely).
-    doc4 = {"a": {"x1": Decimal("1"), "delta_x": Decimal("9")}, "b": {"y2": Decimal("2")}}
-    loader4 = _mem_loader(doc4)
-    expr4 = parse_expr("diff(fixture.json#/a/x1,fixture.json#/b/y2)")
-    try:
-        evaluate_expr(expr4, loader4)
-        failures.append(
-            "self-test FAILED (round-3, digit-free-leg): operands sharing no digit-bearing "
-            "identifier token must be UNDECIDABLE (a finding), not a silent free bind"
-        )
-    except PrecedenceUndecidable as exc:
-        check("digit-free-leg case fails loudly and says 'undecidable'", "undecidable" in str(exc))
-    except ClaimParseError:
-        failures.append(
-            "self-test FAILED (round-3, digit-free-leg): raised a plain ClaimParseError, "
-            "not the more specific PrecedenceUndecidable"
-        )
-
-    # (round-3 audit) operands spanning more than one tracked file are
-    # ALSO undecidable, not silently clean.
-    loader4b = _mem_loader({"v": Decimal("1")})
-    loader4b._cache["other.json"] = {"w": Decimal("2")}
-    expr4b = parse_expr("diff(fixture.json#/v,other.json#/w)")
-    try:
-        evaluate_expr(expr4b, loader4b)
-        failures.append("self-test FAILED (round-3, multi-file): cross-file operands did not raise")
-    except PrecedenceUndecidable as exc:
-        check("multi-file operands fail loudly and say 'undecidable'", "undecidable" in str(exc))
-
-    # --- (round-3 audit, THE CLASS FIX) a SAME-REP operand pair — both
-    # named `r1` — must still be caught. Reproduces the auditor's
-    # end-to-end probe: pre-fix, diff(disabled_r1, fused_r1) bound
-    # 39.565658 bit-for-bit as a free diff because `r1`, shared by BOTH
-    # operands, survived the (un-stripped) intersection and over-
-    # constrained the search past delta_ms (whose own path carries no rep
-    # suffix at all). ---
-    same_rep_doc = {
-        "legs": {
-            "b8_s512_disabled_r1": {"s_per_step_p50": Decimal("0.674415994")},
-            "b8_s512_fused_r1": {"s_per_step_p50": Decimal("0.634850336")},
-        },
-        "deltas": {
-            "b8_s512_p50_ms": {
-                "delta_ms": Decimal("39.565658"),
-                "delta_pct": Decimal("6.232"),
-            }
-        },
-    }
-    loader_same_rep = _mem_loader(same_rep_doc)
+    # --- REQUIRED FIXTURE 1 (round-4 acceptance): real cast-w1 SAME-REP
+    # diff/pct. `diff(disabled_r1, fused_r1)` (both literally `r1`) in raw
+    # seconds equals `delta_ms` after x1000 EXACTLY (0.039565658 * 1000 =
+    # 39.565658) — the identity/token mechanisms in rounds 2-3 both missed
+    # this (round 2: no rep-stripping at all; round 3: rep IS shared by
+    # both operands so it survived the intersection and over-constrained
+    # the candidate search past delta_ms, whose own path carries none).
+    # Value-based matching does not care what either leaf is CALLED. ---
     same_rep_diff_expr = parse_expr(
         "diff(fixture.json#/legs/b8_s512_disabled_r1/s_per_step_p50,"
         "fixture.json#/legs/b8_s512_fused_r1/s_per_step_p50)"
     )
     try:
-        val, _ = evaluate_expr(same_rep_diff_expr, loader_same_rep)
+        val, _ = evaluate_expr(same_rep_diff_expr, loader_cw1)
         failures.append(
-            f"self-test FAILED (round-3, same-rep diff): bound FREELY to {val} — the exact "
-            "class the audit's end-to-end probe found live on 5c8eef5"
+            f"self-test FAILED (REQUIRED FIXTURE 1, same-rep diff): bound FREELY to {val} "
+            "— the exact evasion class the round-3/4 audits found live"
         )
     except ClaimParseError as exc:
         check(
-            "same-rep diff (both r1) is still caught — names a delta*/*_pct field",
-            "delta" in str(exc),
+            "same-rep diff (both r1) is caught by VALUE match, names delta_ms",
+            "delta_ms" in str(exc),
         )
     same_rep_pct_expr = parse_expr(
         "pct(fixture.json#/legs/b8_s512_disabled_r1/s_per_step_p50,"
         "fixture.json#/legs/b8_s512_fused_r1/s_per_step_p50)"
     )
     try:
-        evaluate_expr(same_rep_pct_expr, loader_same_rep)
-        failures.append("self-test FAILED (round-3, same-rep pct): bound freely, not caught")
+        evaluate_expr(same_rep_pct_expr, loader_cw1)
+        failures.append("self-test FAILED (REQUIRED FIXTURE 1, same-rep pct): bound freely, not caught")
     except ClaimParseError as exc:
-        check("same-rep pct (both r1) is also caught", "delta" in str(exc))
+        check("same-rep pct (both r1) is also caught by value match", "delta" in str(exc))
 
-    # (round-3 audit) a multi-computed-field artifact: the search must
-    # name WHICH field it found (not just "a" field) — and the UNIT-FAMILY
-    # veto must pick the family-consistent one, never a same-shape field
-    # of the WRONG family (a `_ms` operand must never be blocked by a
-    # `_gb` field of the identical shape, and vice versa).
-    multi_field_doc = {
+    # --- REQUIRED FIXTURE 2 (round-4 acceptance): the REAL adamw
+    # evasion the audit named — `speedup_median_run1 = 9.2065` reproduced
+    # freely by `ratio(eager_arm.run_1.median_ms, fused_arm.run_1.
+    # median_ms)`. `run_1` (with an underscore, inside a longer path
+    # segment) never matched the old `^r\d+$` rep-suffix regex at all —
+    # value-based matching does not need to recognize "run" as a
+    # replicate marker in the first place. ---
+    adamw_doc = {
+        "optimizer_phase_wall_time_ms": {
+            "eager_arm": {"run_1": {"median_ms": Decimal("24.7481")}},
+            "fused_arm": {"run_1": {"median_ms": Decimal("2.6881")}},
+            "speedup_median_run1": Decimal("9.2065"),
+        }
+    }
+    loader_adamw = _mem_loader(adamw_doc)
+    adamw_run1_ratio_expr = parse_expr(
+        "ratio(fixture.json#/optimizer_phase_wall_time_ms/eager_arm/run_1/median_ms,"
+        "fixture.json#/optimizer_phase_wall_time_ms/fused_arm/run_1/median_ms)"
+    )
+    try:
+        evaluate_expr(adamw_run1_ratio_expr, loader_adamw)
+        failures.append(
+            "self-test FAILED (REQUIRED FIXTURE 2, adamw run_1 ratio): bound freely to "
+            "~9.2065 without naming speedup_median_run1 — the real, named live evasion"
+        )
+    except ClaimParseError as exc:
+        check(
+            "adamw run_1 ratio is caught by value match, names speedup_median_run1",
+            "speedup_median_run1" in str(exc),
+        )
+
+    # --- REQUIRED FIXTURE 3 (round-4 acceptance): a NUMERIC bytes pair
+    # whose diff equals a `delta_gb` field (never `delta_ms`, even though
+    # a `delta_ms` field of unrelated value sits in the SAME file) —
+    # value equality, not a unit-family guess, is what selects the right
+    # field; there is no family veto anymore because there is no family
+    # heuristic anymore. ---
+    bytes_doc = {
         "legs": {
-            "b8_s512_disabled_r1": {"s_per_step_p50": Decimal("0.674415994")},
-            "b8_s512_fused_r1": {"s_per_step_p50": Decimal("0.634850336")},
             "b8_s512_disabled_r1_gb": {"peak_vram_bytes": Decimal("1000")},
             "b8_s512_fused_r1_gb": {"peak_vram_bytes": Decimal("900")},
         },
@@ -1417,33 +1458,94 @@ def self_test() -> int:
             "b8_s512_p50_gb": {"delta_gb": Decimal("100")},
         },
     }
-    loader_multi = _mem_loader(multi_field_doc)
-    ms_operand_expr = parse_expr(
-        "diff(fixture.json#/legs/b8_s512_disabled_r1/s_per_step_p50,"
-        "fixture.json#/legs/b8_s512_fused_r1/s_per_step_p50)"
-    )
-    try:
-        evaluate_expr(ms_operand_expr, loader_multi)
-        failures.append("self-test FAILED (round-3, multi-field): ms-family operand pair not caught")
-    except ClaimParseError as exc:
-        check(
-            "multi-field artifact: an s_per_step (ms-family) operand pair is matched to "
-            "delta_ms, never the same-shape delta_gb field",
-            "delta_ms" in str(exc) and "delta_gb" not in str(exc),
-        )
+    loader_bytes = _mem_loader(bytes_doc)
     gb_operand_expr = parse_expr(
         "diff(fixture.json#/legs/b8_s512_disabled_r1_gb/peak_vram_bytes,"
         "fixture.json#/legs/b8_s512_fused_r1_gb/peak_vram_bytes)"
     )
     try:
-        evaluate_expr(gb_operand_expr, loader_multi)
-        failures.append("self-test FAILED (round-3, multi-field): gb-family operand pair not caught")
+        evaluate_expr(gb_operand_expr, loader_bytes)
+        failures.append("self-test FAILED (REQUIRED FIXTURE 3, bytes pair): not caught")
     except ClaimParseError as exc:
         check(
-            "multi-field artifact: a peak_vram_bytes (bytes-family) operand pair is matched "
-            "to delta_gb, never the same-shape delta_ms field",
+            "a numeric bytes-shaped diff (=100) is matched to delta_gb (=100), never the "
+            "unrelated delta_ms (=39.565658) in the same file",
             "delta_gb" in str(exc) and "delta_ms" not in str(exc),
         )
+
+    # --- REQUIRED FIXTURE 4 (round-4 acceptance): the CONTROL — a free
+    # aggregate that matches NOTHING stays legal. Reuses the pre-round-4
+    # MEAN-based cast-w1 diff: mean(disabled_r1,disabled_r2) -
+    # mean(fused_r1,fused_r2) = 38.478341 ms, genuinely 2.7% away from
+    # delta_ms=39.565658 (nowhere near the 5e-4 relative tolerance) — a
+    # real, different number, not a reproduction, and must bind cleanly. ---
+    control_expr = parse_expr(
+        "neg(diff(mean(fixture.json#/legs/b8_s512_disabled_r1/s_per_step_p50,"
+        "fixture.json#/legs/b8_s512_disabled_r2/s_per_step_p50),"
+        "mean(fixture.json#/legs/b8_s512_fused_r1/s_per_step_p50,"
+        "fixture.json#/legs/b8_s512_fused_r2/s_per_step_p50))) as ms"
+    )
+    control_val, _ = evaluate_expr(control_expr, loader_cw1)
+    check(
+        "CONTROL: a free aggregate matching NOTHING (mean-based, 2.7% away from delta_ms) "
+        "stays legal, no exception",
+        control_val.quantize(Decimal("0.001")) == Decimal("-38.478"),
+    )
+
+    # a STRING-valued same-family field (delta_gb as a hand-written range)
+    # is a STATED, deliberate limitation of the round-4 value-based
+    # mechanism (documented in the module doc's PRECEDENCE section) —
+    # value equality cannot be tested against free text, so this case is
+    # NOT caught here; it binds cleanly (the one live guide cell of this
+    # shape is already ledgered, C11).
+    string_field_doc = {
+        "peak": {
+            "b8_s512": {
+                "fused_r1_gb": Decimal("16.0"),
+                "disabled_r1_gb": Decimal("15.7"),
+                "delta_gb": "+0.1 to +0.3 GB",
+            }
+        }
+    }
+    loader_string = _mem_loader(string_field_doc)
+    string_field_expr = parse_expr(
+        "diff(fixture.json#/peak/b8_s512/fused_r1_gb,fixture.json#/peak/b8_s512/disabled_r1_gb)"
+    )
+    val_str, _ = evaluate_expr(string_field_expr, loader_string)
+    check(
+        "STATED LIMITATION: a string-valued delta_gb field is not value-checked (documented, "
+        "not silently forgotten) — the free diff binds cleanly",
+        val_str == Decimal("0.3"),
+    )
+
+    # operands spanning more than one tracked file are STILL undecidable
+    # (round-3 mechanism kept for this one case, per the audit).
+    loader4b = _mem_loader({"v": Decimal("1")})
+    loader4b._cache["other.json"] = {"w": Decimal("2")}
+    expr4b = parse_expr("diff(fixture.json#/v,other.json#/w)")
+    try:
+        evaluate_expr(expr4b, loader4b)
+        failures.append("self-test FAILED (multi-file): cross-file operands did not raise")
+    except PrecedenceUndecidable as exc:
+        check("multi-file operands fail loudly and say 'undecidable'", "undecidable" in str(exc))
+
+    # round-4 acceptance (1): the free-bind-evasion sweep over the real
+    # tracked tree. `sweep_free_bind_evasions` enumerates every plausible
+    # operand pair whose free VALUE equals a declared computed field
+    # (the population — informational; cross-shape numeric coincidences
+    # are EXPECTED here and are supposed to be caught, not absent). What
+    # must be exactly zero is how many of those matches slip PAST the
+    # real runtime path uncaught: for each match, the actual
+    # diff/ratio/pct Expr is constructed and run through `evaluate_expr`
+    # — the same call a real guide tag makes — and must raise. This is
+    # the regression oracle the audit named: "no free tag reproduces a
+    # stated computed field" (without being caught).
+    sweep_matches, sweep_uncaught, swept_files = run_real_tree_sweep()
+    check(
+        f"real-tree sweep ({swept_files} tracked cuda-run JSONs): {sweep_matches} candidate "
+        "free-bind match(es) found, ALL caught by the real evaluate_expr path (0 slip through)",
+        len(sweep_uncaught) == 0,
+    )
 
     # (ii) Decimal + ROUND_HALF_EVEN string equality.
     loader3 = _mem_loader({"v": Decimal("1.265")})
@@ -1659,21 +1761,39 @@ def self_test() -> int:
         return 1
 
     print(
-        "check_perf_claims self-test: OK — whole-artifact same-quantity precedence (A1, incl. "
-        "the real cast-w1 sibling-subtree reproduction and the string-field finding), Decimal/"
-        "ROUND_HALF_EVEN string equality, the six-form grammar's parse-error refusal, "
-        "uncovered-token findings with file:line:col, the extended lexical exclusion class "
-        "(seed/section/formula/type-name/product-name, plus the unified rows-list pattern and "
-        "the layer/launch-count non-exclusion), the .json.raw/out-of-root/untracked pointer "
+        "check_perf_claims self-test: OK — round-4 VALUE-based precedence (real cast-w1 "
+        "same-rep diff/pct, the real adamw speedup_median_run1 evasion, a numeric bytes pair "
+        "naming delta_gb over an unrelated delta_ms in the same file, a mean-based CONTROL "
+        "that matches nothing and stays legal, the stated string-field limitation, multi-file "
+        "PrecedenceUndecidable, and the real-tree sweep finding zero uncaught matches), "
+        "Decimal/ROUND_HALF_EVEN string equality, the six-form grammar's parse-error refusal, "
+        "uncovered-token findings with file:line:col, the lexical exclusion class (seed/"
+        "section/formula/type-name/product-name, the unified rows-list pattern, and the "
+        "layer/launch-count non-exclusion), the .json.raw/out-of-root/untracked pointer "
         "refusals, neg()'s sign-preserving compare, legacy()'s closed allowlist, the injective "
-        "file:token:sha1:col allowlist key, the KNOWN_TABLES exactly-one-match invariant (A3-S1 "
-        "rename + duplicate), the citation-table header exclusion, the classification-file "
-        "verification, the round-3 same-rep diff/pct fix (rep-suffix stripped before "
-        "intersecting; reproduces and closes the audit's live 5c8eef5 free-bind of 39.565658), "
-        "the multi-computed-field unit-family veto (names the family-consistent field, never "
-        "a same-shape field of the wrong family), and the multi-file/digit-free "
-        "PrecedenceUndecidable fail-loud (never a silent None) all confirmed."
+        "file:token:sha1:col allowlist key, the KNOWN_TABLES exactly-one-match invariant "
+        "(rename + duplicate), the citation-table header exclusion, and the "
+        "classification-file verification all confirmed."
     )
+    return 0
+
+
+def sweep_command() -> int:
+    """`--sweep`: the free-bind-evasion regression oracle (round-4 audit
+    acceptance (1)) as its own CI leg, independent of `--self-test`'s
+    in-memory fixtures — runs over the REAL tracked cuda-run tree.
+    Prints the match population (informational) and the uncaught count
+    (must be zero); exits non-zero on any uncaught match, naming it."""
+    total_matches, uncaught, files_swept = run_real_tree_sweep()
+    print(f"check_perf_claims --sweep: {files_swept} tracked cuda-run JSON(s) swept")
+    print(f"  candidate free-bind value-matches found: {total_matches} (population; expected > 0)")
+    print(f"  uncaught (must be 0): {len(uncaught)}")
+    if uncaught:
+        print("check_perf_claims --sweep: FAIL", file=sys.stderr)
+        for rel, form, pa, pb, target_ptr in uncaught:
+            print(f"  {rel}: {form}({pa}, {pb}) reproduces {target_ptr} UNCAUGHT", file=sys.stderr)
+        return 1
+    print("check_perf_claims --sweep: OK — every free-bind value-match is caught")
     return 0
 
 
@@ -1683,6 +1803,8 @@ def main() -> int:
         return self_test()
     if "--check-allowlist-only-shrinks" in argv:
         return check_allowlist_only_shrinks()
+    if "--sweep" in argv:
+        return sweep_command()
     stats, findings, scope_problems = scan_tree()
     if "--report" in argv:
         exit_code = report(stats, findings, argv)

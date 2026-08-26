@@ -83,23 +83,32 @@ See `DESIGN-STUDY.md` §1 for the grammar. Implementation notes fixed here:
    `d0.05`), issue/PR refs (`#377`) and the escape-ledger's own `esc-NNN` row id, version strings
    (`2.13.0+cu126`, `cu126`), ledger cites (`s2:89`, `row 5`, `cont row 11`, `fusion rows 30, 36`),
    dates (`2026-08-23`). A layer/tensor/launch count (`563 launches`) is explicitly NOT excluded.
-3. **Artifact-field precedence**, mechanical (round-3 audit fix — this item previously described the
-   ORIGINAL, common-ancestor-only walk and stated the INVERSE of the shipped rule for a string field;
-   both corrected here): for a `diff`/`ratio`/`pct` tag, the WHOLE tracked file the operands share (not
-   merely their common-ancestor subtree — a field can live in a SIBLING subtree, e.g. cast-w1's own
-   `/deltas/b8_s512_p50_ms/delta_ms` relative to operands under `/legs/...`) is searched for a leaf
-   whose key matches `delta*`/`ratio*`/`speedup*`/`*_pct`/`spread*` (NUMBER or STRING — a hand-written
-   range is a finding too, "bind two tokens or ledger it," never a silently blessed free aggregate just
-   because it isn't a JSON number) and whose own path shares every digit-bearing identifier token
-   common to ALL the operands' paths, with any per-replicate suffix (`r1`, `r2`, `rep...`) STRIPPED
-   before that comparison — a same-rep operand pair (both named `r1`) must not retain `r1` in the
-   intersection and thereby over-constrain the search past the real field, which carries no rep suffix
-   at all. The identifier match must also agree on unit FAMILY (time vs. bytes, inferred from each
-   leaf's own key) — a millisecond/seconds-shaped operand pair is never matched to a byte-shaped field
-   of the identical shape token, or vice versa. If the operands span more than one tracked file, or
-   share no digit-bearing identifier token at all, precedence is UNDECIDABLE and the tag is a finding
-   naming that explicitly — never a silent pass just because the mechanism could not determine an
-   answer.
+3. **Artifact-field precedence**, VALUE-based (round-4 audit rewrite — this item went through two prior
+   mechanisms, common-ancestor-subtree identity then whole-file identifier-token + unit-family, and an
+   adversarial sweep of the real tracked tree found BOTH live-broken: the candidate field is almost
+   always LESS token-specific than its operands, e.g. `delta_ms` carries no replicate suffix while the
+   operands producing it do, so a token-subset test that requires the candidate to be AT LEAST as
+   specific as the operands structurally cannot work — 172 free-bind evasions across 14 committed
+   fields in the 79 tracked cuda-run JSONs, reproduced and closed). Identity/token reasoning is
+   abandoned. For a `diff`/`ratio`/`pct` tag: evaluate the FREE result (the raw operation over the
+   operands, in their native unit, before this tag's own `neg`/`as unit`/`legacy` wrapping); if all
+   operand leaves share one tracked file, scan the WHOLE file for every NUMBER leaf whose key matches
+   `delta*`/`ratio*`/`speedup*`/`*_pct`/`spread*` and test whether ITS VALUE equals the free result —
+   same sign, opposite sign, or after a `×1000`/`÷1000`/`÷1e9` unit rescale (`s<->ms`, `bytes<->GB`) —
+   within a 5e-4 RELATIVE tolerance. ANY match is a finding naming the matched field, regardless of
+   which two leaves produced the free result or what either is called — the artifact already states
+   this exact number under a name that says it is computed. A coincidental match (two genuinely
+   unrelated quantities landing within tolerance by chance) is STILL reported, on purpose: the finding
+   names the field so a human decides "point at it" or "ledger this cell, it's a coincidence," never a
+   silent mechanical exemption for "probably unrelated." STRING-valued same-family fields are NOT
+   checked (a stated, deliberate narrowing — value equality cannot be tested against free text; the one
+   live case, cast-w1's `delta_gb` range, stays ledgered as an editorial choice, C11). Operands spanning
+   more than one tracked file are UNDECIDABLE and the tag is a finding naming that explicitly — never a
+   silent pass just because the mechanism could not determine an answer. A regression oracle
+   (`check_perf_claims.py --sweep`, required guard leg) enumerates every structurally plausible operand
+   pair in the real tracked tree (two sibling containers sharing a leaf sub-path — the exact shape every
+   `legs`/`runs`/`shapes`/`summary` container in this tree uses) and asserts every value-match is
+   actually caught by the real runtime path.
 4. **Equality.** `Decimal` at the token's own printed precision; `ROUND_HALF_EVEN` quantization;
    STRING comparison. A mismatch prints the evaluated value at full precision.
 5. **Pointer roots.** Tracked `*.json` under `crates/jammi-kernels/artifacts/cuda-runs/**` and
@@ -147,8 +156,13 @@ See `DESIGN-STUDY.md` §1 for the grammar. Implementation notes fixed here:
 - Cast-w1's `−38.5 ms` cell is corrected to `−39.6 ms`, bound via `neg(P)` (sign-preserving; round-3
   fix — REPLACES an earlier `abs(P)`, which discarded sign on both sides and would have silently
   accepted a wrong-signed token as long as the magnitude matched) directly to the artifact's own
-  `delta_ms` field (39.565658) — precedence (C10.3) forbids a free `diff(mean,mean)` here since that
-  computed field exists.
+  `delta_ms` field (39.565658). Precedence (C10.3, round-4 value-based) forbids a free `diff(r1,r1)`
+  here — the same-rep pair whose difference equals `delta_ms` bit-for-bit — but does NOT forbid the
+  MEAN-based `diff(mean(r1,r2),mean(r1,r2))` a prior draft used to compute `−38.5 ms`: that mean
+  genuinely differs from `delta_ms` by ~2.7%, outside the 5e-4 tolerance, so it is a real, different
+  number, not a reproduction. Binding directly to `delta_ms` is still the right call — it is the
+  artifact's own authoritative computed field for this exact quantity — but it is a documentation
+  choice here, not a precedence-forced one.
 - T8 (the torch-column table) is entirely `ledger`, reason `superseded-run`: its artifact lives on an
   unmerged branch until the sha is an ancestor of `HEAD` or carries `merged_as`/`merged_via_pr`.
 

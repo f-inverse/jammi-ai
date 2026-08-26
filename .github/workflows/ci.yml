@@ -775,6 +775,17 @@ jobs:
           # bound cell to `ledger` without a compensating new bind elsewhere.
           - name: perf claims bind-rate floor (F1)
             cmd: python3 ci/scripts/check_perf_claims.py --report --min-fully-bound=1 --min-v=50
+          # Round-4 audit acceptance (1): the free-bind-evasion regression
+          # oracle over the REAL tracked cuda-run tree (not just the nine
+          # guide tables) — every structurally plausible diff/ratio/pct
+          # operand pair (two sibling containers sharing a leaf sub-path)
+          # whose free VALUE reproduces a declared delta*/ratio*/speedup*/
+          # *_pct/spread* field must be caught by the real evaluate_expr
+          # path. Reproduces and closes the class an adversarial sweep
+          # found 172 live instances of under the prior identity-based
+          # mechanism (rounds 2-3).
+          - name: perf claims sweep
+            cmd: python3 ci/scripts/check_perf_claims.py --sweep
           # Mocks-only, no-network regression suite for the 2026-08-25
           # gpu-dev pod-lifecycle incident (ledger rows 279-289) and the
           # mechanism defects three follow-up audit rounds found in this

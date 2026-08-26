@@ -43,8 +43,14 @@ jobs:
       group: gpu-prove-${{ github.ref }}
       cancel-in-progress: false
     # A job-timeout kill is another trap bypass. The remote job is capped by
-    # RP_TIMEOUT (50m) plus deploy; this bounds the rest well under the 360m default.
-    timeout-minutes: 75
+    # RP_TIMEOUT (50m); deploy itself is capped by RP_SSH_WAIT_SECS (default
+    # 600s) PER CANDIDATE, and the a100 arch fails over across up to 4
+    # candidates (SECURE/COMMUNITY × PCIe/SXM4) before returning 75 — so the
+    # worst case (every candidate rents but none becomes reachable) is
+    # 4 × 600s = 40m of deploy on top of the 50m job cap, well under this
+    # ceiling but no longer under the previous 75m one (raised here for
+    # exactly that reason — see runpod_lib.sh's own RP_SSH_WAIT_SECS doc).
+    timeout-minutes: 100
     steps:
       - uses: actions/checkout@v4
 

@@ -196,9 +196,17 @@ other verb takes a *session*. Each session is its own pod with its own SSH key,
 its own `jammi-<session>` block in the generated ssh config, and its own bill;
 `ls` shows them all regardless of which one you are pointed at.
 
-Set it inline on the one command that needs it, never in your shell profile: an
-exported `RP_SESSION` **overrides the positional session argument** everywhere,
-so `RP_SESSION=bench … down a100` terminates `bench` and says so.
+Set it inline on the one command that needs it, never in your shell profile: on
+`down`/`attach`/`run`/`logs`/`push`/`pull`, an exported `RP_SESSION` that
+**disagrees with an explicit positional session argument refuses** (exit 2,
+naming both) rather than silently picking one — `RP_SESSION=bench … down a100`
+refuses outright instead of guessing which one you meant. Either alone still
+resolves exactly as you would expect: drop the positional to act on
+`RP_SESSION`, or leave `RP_SESSION` unset to act on the positional.
+
+A session name may contain letters, digits, `_`, `-`, and `.` anywhere but as
+the *whole* name (so `bench.1` is a fine session name, but `.` and `..` are
+refused, along with any name containing `/` or starting with `-`).
 
 ---
 
@@ -453,9 +461,22 @@ Your prepaid balance is the real ceiling, provided auto-recharge stays off.
 **`exit 75` / "no GPU capacity"** — a genuine provider condition. Retry, or pick
 another arch. This is a neutral skip, not a failure.
 
-**"deployed … never became reachable"** — a dead host: it rented and never
-exposed SSH. The tooling terminates it and tries the next candidate. Common
-enough not to worry about; just retry.
+**"deployed … never became reachable"** — the pod never answered SSH within
+`RP_SSH_WAIT_SECS` (default 600s), so the tooling terminated it and tried
+the next candidate. Two real causes look identical from this one message:
+
+- **Cold pull** — a genuinely slow host, still pulling the multi-GB CUDA
+  image when the budget ran out. A longer `RP_SSH_WAIT_SECS` gives it more
+  room to finish (see [dev-gpu.md](dev-gpu.md)); common enough not to worry
+  about on the first retry.
+- **ssh-agent identity exhaustion** — sshd was up the whole time, but the
+  connection itself never got past auth: a macOS ssh-agent holding many
+  identities offers all of them before the pod's own key, and the server's
+  `MaxAuthTries` rejects the connection before that key is ever tried. Every
+  connection here pins to the one explicit key (`IdentitiesOnly=yes` in
+  `RP_SSHO`), which rules this out by construction; if reachability failures
+  recur even with a generous `RP_SSH_WAIT_SECS`, check how many identities
+  `ssh-add -l` reports before assuming it is capacity or a cold pull.
 
 **Any other refusal fails loudly and stops**, e.g. `INSUFFICIENT_BALANCE`. Only a
 capacity condition is treated as a skip — anything else is a real fault and says

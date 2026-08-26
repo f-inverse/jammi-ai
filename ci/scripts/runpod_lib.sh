@@ -57,6 +57,11 @@
 #   RP_VOLUME_GB  attached volume size in GB (default 0). The pod is deliberately
 #                 disposable (see "state" above) — leave this 0 unless a caller
 #                 has a specific reason to attach one.
+#   RP_SSH_WAIT_SECS  wall-clock deadline on rp_deploy_live's SSH-reachability
+#                 poll, in seconds (default 600). A cold host still pulling the
+#                 multi-GB CUDA image can take minutes before sshd is even up;
+#                 raise this rather than losing a healthy pod to the poll's own
+#                 timeout.
 # Sets globals: RP_POD_ID, RP_HOST, RP_PORT, RP_REF. Installs an EXIT trap for
 # teardown.
 
@@ -94,11 +99,85 @@ esac
 case "$RP_VOLUME_GB" in
   ''|*[!0-9]*) echo "::error::RP_VOLUME_GB must be a non-negative integer (got '${RP_VOLUME_GB}')" >&2; exit 2 ;;
 esac
+# Wall-clock deadline for rp_deploy_live's SSH-reachability poll. Default 600s:
+# a cold image pull alone has measured ~2 minutes, and a healthy candidate has
+# needed over 4 minutes end to end (2026-08-26) — the previous fixed
+# 24-iteration/10s-sleep budget (4m total) could terminate a pod that was
+# still becoming reachable, not one that never would.
+#
+# Validated here, not at use, same reasoning as RP_TTL_HOURS above: it drives
+# arithmetic (the deadline computed in rp_deploy_live) with no -e set
+# anywhere in this file, so a non-integer would otherwise fail silently
+# rather than loudly at the one place its value is known. The digit-only
+# pattern match alone is not sufficient — an unquoted leading-zero operand
+# (`08`) is read by bash arithmetic in its DEFAULT (octal) base, and
+# `08`/`09` are not even legal octal digits, so `$(( ))` on a raw `08` is a
+# fatal "value too great for base" error, not a misread — the read below is
+# forced to base 10 with an explicit `10#` prefix instead of trusting the
+# shell's own default base. The length check runs BEFORE that arithmetic, on
+# the string's length alone: 9 digits is generous headroom above 600 while
+# ruling out a decimal string long enough to overflow bash's signed 64-bit
+# arithmetic in the `SECONDS + RP_SSH_WAIT_SECS` deadline computation.
+RP_SSH_WAIT_SECS="${RP_SSH_WAIT_SECS:-600}"
+case "$RP_SSH_WAIT_SECS" in
+  ''|*[!0-9]*) echo "::error::RP_SSH_WAIT_SECS must be a positive integer (got '${RP_SSH_WAIT_SECS}')" >&2; exit 2 ;;
+esac
+[ "${#RP_SSH_WAIT_SECS}" -le 9 ] || { echo "::error::RP_SSH_WAIT_SECS has too many digits (got '${RP_SSH_WAIT_SECS}')" >&2; exit 2; }
+RP_SSH_WAIT_SECS=$((10#$RP_SSH_WAIT_SECS))
+[ "$RP_SSH_WAIT_SECS" -gt 0 ] || { echo "::error::RP_SSH_WAIT_SECS must be > 0" >&2; exit 2; }
 RP_SESSION_ROOT="${RP_SESSION_ROOT:-${HOME}/.config/runpod/sessions}"
 RP_S3_CONF="${RP_S3_CONF:-${HOME}/.config/runpod/s3}"
 # An ssh config this tooling owns outright, so ~/.ssh/config is never rewritten.
 RP_SSH_CONFIG="${RP_SSH_CONFIG:-${HOME}/.config/runpod/ssh_config}"
 RP_REPO_URL="${RP_REPO_URL:-https://github.com/f-inverse/jammi-ai}"
+
+# A named session becomes a directory under RP_SESSION_ROOT and, in
+# rp_cleanup/rp_session_forget below, the target of an UNCONDITIONAL
+# `rm -rf "$RP_WORK"`. RP_SESSION reaches here from gpu-dev.sh's own SESSION
+# resolution (an arch name, a caller-supplied alias, or an exported
+# environment variable) with no sanitization upstream, so a value containing
+# a path separator or a `.`/`..` segment could point RP_WORK — and therefore
+# that `rm -rf` — OUTSIDE RP_SESSION_ROOT entirely (`RP_SESSION=../../etc`).
+#
+# A CONTAINMENT blacklist, not a character WHITELIST (round-3 audit on
+# #388): the previous `[A-Za-z0-9_-]+` whitelist rejected every session
+# name containing a `.` — including one gpu-dev.sh's OWN dispatch is happy
+# to create, e.g. `RP_SESSION=bench.1 gpu-dev.sh up` — so EVERY verb
+# refused against a session that had already rented a real pod, stranding
+# it for its full deadline with no `down` able to reach it. Only the shapes
+# that actually let RP_SESSION resolve outside RP_SESSION_ROOT are refused:
+# empty, `.`, or `..` (this function only ever runs for a NAMED session —
+# see the RP_SESSION_VALIDATE_SESSION gate below — so an empty value here
+# is a caller bug, never `shell`'s own genuinely anonymous RP_SESSION="",
+# which never reaches this check at all); anything containing a `/` (a
+# multi-segment path); and a leading `-` (reads as an option to any tool
+# RP_SESSION is later passed to positionally). Every OTHER shape — a dot
+# anywhere but as the WHOLE name included — is a legitimate session name.
+rp_session_name_check() {
+  case "$RP_SESSION" in
+    ''|.|..)
+      echo "::error::RP_SESSION may not be empty, '.', or '..' (got '${RP_SESSION}')" >&2
+      return 2 ;;
+    */*)
+      echo "::error::RP_SESSION may not contain '/' (got '${RP_SESSION}')" >&2
+      return 2 ;;
+    -*)
+      echo "::error::RP_SESSION may not start with '-' (got '${RP_SESSION}')" >&2
+      return 2 ;;
+  esac
+}
+# Gated on RP_SESSION_VALIDATE_SESSION, set by gpu-dev.sh only for the verbs
+# that actually RESOLVE a named session (up/attach/run/logs/push/pull/down)
+# — never `ls`/`reap` (account-level; they never read RP_SESSION at all,
+# and source this file from their OWN early dispatch branch before this
+# variable would ever be set) and never `shell` (deliberately anonymous,
+# RP_SESSION force-cleared to "" before sourcing). Without this gate, an
+# UNRELATED exported RP_SESSION sitting in a maintainer's own shell for
+# some other purpose made `ls`/`reap` refuse outright even though neither
+# verb was ever going to consume it (round-3 audit finding, mechanism 2).
+if [ "${RP_SESSION_VALIDATE_SESSION:-0}" = "1" ]; then
+  rp_session_name_check || exit $?
+fi
 
 # A named session must outlive the process; an anonymous one must not leak. The
 # session dir is created lazily by the first writer, so read-only commands
@@ -107,7 +186,27 @@ if [ -n "$RP_SESSION" ]; then
   RP_WORK="${RP_SESSION_ROOT}/${RP_SESSION}"
   RP_WORK_IS_TEMP=0
 else
-  RP_WORK="$(mktemp -d)"
+  # An explicit path TEMPLATE ("$dir/prefix.XXXXXX"), not a bare `mktemp -d`,
+  # so the base directory is resolved the SAME way on every `mktemp`
+  # implementation this tooling runs under: GNU `mktemp -d` (Linux CI) reads
+  # $TMPDIR itself, but BSD `mktemp -d` (macOS, a maintainer's own laptop)
+  # does NOT — it ignores $TMPDIR entirely for a bare `-d` with no template
+  # and always resolves under its own darwin temp root, so a bare call would
+  # behave differently across the two platforms this tooling actually runs
+  # on. Building the base path ourselves from "${TMPDIR:-/tmp}" removes that
+  # divergence, defaults identically to the previous bare call (`/tmp` when
+  # $TMPDIR is unset, which is the common case), and is what makes the
+  # temp-dir-isolation regression test in test_gpu_dev_lifecycle.sh able to
+  # observe which root a throwaway `shell` invocation's RP_WORK actually
+  # resolved under.
+  #
+  # A failed `mktemp` (e.g. a nonexistent/unwritable $TMPDIR) must abort
+  # here, not fall through with RP_WORK unset/empty: every later use of
+  # RP_WORK (the ssh key path, the meta path, and eventually the pod
+  # deploy) would then operate on a garbage or empty path instead of
+  # failing loudly at the one place the real cause is known.
+  RP_WORK="$(mktemp -d "${TMPDIR:-/tmp}/jammi-gpu-dev.XXXXXX")" \
+    || { echo "::error::could not create a temp work dir under ${TMPDIR:-/tmp}" >&2; exit 2; }
   RP_WORK_IS_TEMP=1
 fi
 RP_SSH_KEY="$RP_WORK/id_ed25519"
@@ -189,9 +288,27 @@ rp_terminate() { # $1=podId
 # `rp_deploy_live`'s own parser already uses, so the piped JSON reaches
 # `sys.stdin` intact and dynamic values travel as argv, never interpolated
 # into the script source.
+#
+# The query is captured into `body` FIRST, with its own `||` gate, rather
+# than piped straight into the parser (`rp_gql ... | python3 -c ...`). Every
+# caller of this file runs under `set -o pipefail`, where a pipeline's exit
+# status is the LAST command to fail non-zero — so a direct pipe would report
+# rp_gql's (curl's) own exit code whenever curl itself failed, EVEN IF curl
+# still delivered a complete, parseable body and the python parser reached a
+# real verdict. That collides with this function's own return codes, which
+# are not all equivalent: code 3 means "id confirmed ABSENT — ordinary
+# cleanup, `down` forgets the record", not "could not query". A curl exit
+# that happens to also be 3 would then read as a confirmed absence and make
+# `down` forget a session record for a pod the account list still actually
+# shows present — the opposite of "do not act, never assume safe" this
+# function exists to enforce. Splitting the capture from the parse removes
+# the collision entirely: a curl failure returns 2 ("could not query")
+# unconditionally, and only a successful query ever reaches the parser, whose
+# own exit code is then this function's exit code with nothing to alias.
 rp_pod_verify() { # $1=podId
-  local id="$1"
-  rp_gql '{"query":"query{ myself{ pods{ id name } } }"}' | python3 -c '
+  local id="$1" body
+  body="$(rp_gql '{"query":"query{ myself{ pods{ id name } } }"}')" || return 2
+  printf '%s' "$body" | python3 -c '
 import sys, json, re
 podid, prefix = sys.argv[1], sys.argv[2]
 try:
@@ -234,9 +351,29 @@ sys.exit(3)
 # $1=podId. Returns 0 (confirmed gone — absent from the account's pod list
 # entirely) or 1 (still present, OR the query itself failed — both are "not
 # confirmed", never "must have succeeded anyway").
+#
+# Assumes `myself{ pods{...} } }` returns the account's COMPLETE pod list in
+# one response — RunPod's schema documents no pagination on this field, and
+# it was verified live against a real account on first use (this tooling has
+# never observed a truncated list). "Absent from the returned list" and
+# "absent from the account" are the same fact only under that assumption; if
+# RunPod ever pages this field, both this function's code-0 and
+# `rp_pod_verify`'s code-3 would need to change together, since they read
+# the account's pod list the same way for the same reason.
 rp_pod_gone() { # $1=podId
-  local id="$1"
-  rp_gql '{"query":"query{ myself{ pods{ id } } }"}' | python3 -c '
+  local id="$1" body
+  # Same capture-then-parse shape as rp_pod_verify's own fix (see its doc): a
+  # direct `rp_gql | python3` pipe would report curl's own exit code under
+  # `set -o pipefail` whenever curl fails, even if the body it still
+  # delivered was complete. This function only has two return codes (0
+  # confirmed-gone, 1 everything else), so a curl failure landing on 1 was
+  # already the correct answer either way — there was no code-3-shaped
+  # collision to alias with, unlike rp_pod_verify. Applied anyway so this
+  # function does not depend on pipefail's own last-failing-command rule to
+  # get the right answer by coincidence, and so both functions read the
+  # account the same way for the same reason.
+  body="$(rp_gql '{"query":"query{ myself{ pods{ id } } }"}')" || return 1
+  printf '%s' "$body" | python3 -c '
 import sys, json
 podid = sys.argv[1]
 try:
@@ -290,7 +427,16 @@ rp_init() {
   _rp_work_mkdir
   [ -f "$RP_SSH_KEY" ] || ssh-keygen -t ed25519 -N '' -f "$RP_SSH_KEY" -q
   RP_PUBKEY="$(cat "${RP_SSH_KEY}.pub")"
-  RP_SSHO=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -i "$RP_SSH_KEY")
+  # IdentitiesOnly=yes pins every connection to exactly $RP_SSH_KEY. Without
+  # it, ssh offers every identity ssh-agent already holds BEFORE this key —
+  # on macOS the agent auto-adds each session key it uses, so once it holds
+  # more than a handful the reachability probe below can exhaust the
+  # server's MaxAuthTries before $RP_SSH_KEY is ever tried, reading a
+  # perfectly healthy, reachable pod as unreachable and terminating it.
+  # Confirmed 2026-08-26 on a kept candidate: sshd was up and
+  # `-o IdentitiesOnly=yes` connected cleanly while the agent held 12
+  # identities (ledger row 328).
+  RP_SSHO=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o IdentitiesOnly=yes -i "$RP_SSH_KEY")
 }
 
 # Create the work dir on first write. Split out so read-only commands against a
@@ -548,9 +694,17 @@ else:
     # being unreachable/under-floor: any pod rented after it is equally this
     # invocation's own.
     RP_POD_CREATED=1
-    echo "  deployed ${RP_POD_ID} on ${cloud} / ${gpu}; waiting for SSH (≤4m)..."
+    echo "  deployed ${RP_POD_ID} on ${cloud} / ${gpu}; waiting for SSH (≤${RP_SSH_WAIT_SECS}s)..."
     RP_HOST=""; RP_PORT=""
-    for _ in $(seq 1 24); do
+    # A wall-clock deadline, not a fixed iteration count: the old
+    # 24-iteration/10s-sleep loop was a HARD-CODED 4-minute budget no caller
+    # could raise, and a cold host still pulling the multi-GB CUDA image can
+    # take longer than that before sshd is even up (see RP_SSH_WAIT_SECS's own
+    # doc at the top of this file). `SECONDS` is bash's own
+    # elapsed-since-this-shell-started counter — no subprocess per check, unlike
+    # `date +%s`.
+    local _rp_deploy_deadline=$((SECONDS + RP_SSH_WAIT_SECS)) _rp_deploy_remaining
+    while [ "$SECONDS" -lt "$_rp_deploy_deadline" ]; do
       R="$(rp_gql "{\"query\":\"query{ pod(input:{podId:\\\"${RP_POD_ID}\\\"}){ runtime{ ports{ ip publicPort privatePort isIpPublic type } } } }\"}")"
       read -r RP_HOST RP_PORT < <(printf '%s' "$R" | python3 -c 'import sys,json
 p=(json.load(sys.stdin).get("data",{}).get("pod") or {}).get("runtime") or {}
@@ -573,10 +727,17 @@ p=(json.load(sys.stdin).get("data",{}).get("pod") or {}).get("runtime") or {}
         rp_terminate "$RP_POD_ID"
         RP_POD_ID=""; break
       fi
-      RP_HOST=""; sleep 10
+      RP_HOST=""
+      # Sleep only up to what is left of the budget, never past it — a fixed
+      # 10s sleep against a short RP_SSH_WAIT_SECS (a test's 2s deadline, or a
+      # caller's own tight override) would otherwise overrun the deadline by
+      # up to a full sleep cycle on every iteration.
+      _rp_deploy_remaining=$((_rp_deploy_deadline - SECONDS))
+      [ "$_rp_deploy_remaining" -gt 0 ] || break
+      sleep "$(( _rp_deploy_remaining < 10 ? _rp_deploy_remaining : 10 ))"
     done
     if [ -n "$RP_POD_ID" ]; then
-      echo "  pod ${RP_POD_ID} never became reachable; terminating and trying next candidate"
+      echo "  pod ${RP_POD_ID} never became reachable within ${RP_SSH_WAIT_SECS}s; terminating and trying next candidate"
       rp_terminate "$RP_POD_ID"
       RP_POD_ID=""
     fi
@@ -636,7 +797,7 @@ rp_run_remote() {
 # cannot reason about is far more likely to be a leak than healthy work, and the
 # cost of a wrong sweep is one re-run; the cost of a wrong spare is $187.
 rp_sweep() { # $1=optional override age in hours
-  local override="${1:-}" out rc id age why n=0
+  local override="${1:-}" body out rc id age why n=0
   if [ -n "$override" ]; then
     case "$override" in
       ''|*[!0-9]*) echo "::error::reap: hours must be a positive integer (got '${override}')"; return 2 ;;
@@ -648,10 +809,41 @@ rp_sweep() { # $1=optional override age in hours
     # pod's age is "past-deadline-0s": `reap 0` mass-terminates the whole
     # account's jammi-gpu* fleet instead of refusing. Mirrors the
     # RP_DEV_TTL_HOURS >0 check in gpu-dev.sh.
+    #
+    # An all-digit override too large for `[ -gt ]`'s arithmetic (e.g. forty
+    # 9s) still refuses — but not with a message naming the real cause. The
+    # `test` builtin errors out on it ("integer expected" / "value too large
+    # for defined data type", bash-version-dependent) with a non-zero status,
+    # which `||` catches the same as an ordinary `false`, so the operator
+    # sees this function's own "hours must be > 0" text layered under bash's
+    # raw builtin error — accurate in effect (refused, exit 2) but not in
+    # wording (an overflow is not "not greater than 0"). Left as-is rather
+    # than special-cased: the shape check above already bounds the digit
+    # count in every REALISTIC input (an operator fat-fingering a TTL), and
+    # a wrong wording on a refusal is not the failure mode this guard exists
+    # to prevent — a wrong wording on an ACCEPTED input would be.
+    #
+    # A leading zero ("08") is deliberately NOT a shape-check rejection: it
+    # is all-digit like any other override, `[ "08" -gt 0 ]` compares it as
+    # decimal (the `test` builtin never applies bash's `$(( ))` octal-prefix
+    # rule), and Python's `int("08")` likewise reads it as decimal 8 — so
+    # `reap 08` sweeps exactly like `reap 8`, never like a rejected or
+    # differently-valued input.
     [ "$override" -gt 0 ] || { echo "::error::reap: hours must be > 0"; return 2; }
   fi
-  out="$(rp_gql '{"query":"query{ myself{ pods{ id name desiredStatus createdAt runtime{ uptimeInSeconds } } } }"}' \
-    | python3 -c "
+  # Captured before parsing — the same capture-then-parse shape as
+  # rp_pod_verify's own fix (see its doc): under `set -o pipefail`, a direct
+  # `rp_gql | python3 ...` pipe reports CURL's own exit code whenever curl
+  # fails, even if python still received (and successfully parsed) a
+  # complete body. This function's own "rc -ne 0" check below already
+  # treats every nonzero rc uniformly (return 1, "could not enumerate
+  # pods"), so there was no distinct-code aliasing bug here the way there
+  # was in rp_pod_verify's 0/1/2/3 codes — applied anyway so this function's
+  # correctness does not depend on pipefail's last-failing-command rule
+  # working out by coincidence.
+  body="$(rp_gql '{"query":"query{ myself{ pods{ id name desiredStatus createdAt runtime{ uptimeInSeconds } } } }"}')" \
+    || { echo "::error::sweep could NOT enumerate pods; orphans may exist unseen: RunPod query failed"; return 1; }
+  out="$(printf '%s' "$body" | python3 -c "
 import sys, json, datetime
 override = '''$override'''.strip()
 prefix = '$RP_POD_PREFIX'

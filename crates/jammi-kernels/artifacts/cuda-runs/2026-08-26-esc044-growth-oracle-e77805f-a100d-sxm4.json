@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "unit": "esc-044-growth-oracle",
+  "git_sha": "e77805f6f523877e7ed71fe46503289bb5e30491",
+  "date": "2026-08-26T11:06:32Z",
+  "box": "jammi-a100d (NVIDIA A100-SXM4-80GB, driver 580.126.16)",
+  "driver": "580.126.16",
+  "gpu": "NVIDIA A100-SXM4-80GB",
+  "features": "cuda",
+  "status": "GREEN",
+  "env": {
+    "JAMMI_REQUIRE_CUDA": "1"
+  },
+  "producer": {
+    "path": "crates/jammi-encoders/src/modernbert.rs",
+    "kind": "cargo-test",
+    "invocation": "JAMMI_REQUIRE_CUDA=1 cargo test -p jammi-encoders --features cuda --lib -- --exact modernbert::tests::attention_block_fused_vs_eager_dqkv_divergence_grows_with_depth_bf16_cuda --test-threads=1",
+    "gating": "env:JAMMI_REQUIRE_CUDA"
+  },
+  "closes_escape": "esc-044-fused-attention-bwd-gemm-operand-form-diverges-from-eager",
+  "note": "Execution provenance for esc-044's growth-oracle test (introduced by PR #368, fcb418c) proving the `.contiguous()`-removal fix (5929324) at the depth-28 chained r(L) gate on real CUDA hardware, at this exact branch tip. `growth_oracle_cuda_device()` (crates/jammi-encoders/src/modernbert.rs:4152-4166) panics rather than silently reading as a skip when JAMMI_REQUIRE_CUDA is set and no CUDA device is acquired, so this leg's `ok` result is proof the fused-vs-eager depth-growth chain actually dispatched on GPU, not that the device was absent and the test no-op'd. Re-run by the closing agent on pod a100d (warm CARGO_TARGET_DIR=/root/target-main) directly against `git -C /root/jammi-ai rev-parse HEAD` == this git_sha, confirmed a second time independently of the original fix-verifier run recorded in the esc-044 ledger row.",
+  "legs": [
+    {
+      "name": "modernbert::tests::attention_block_fused_vs_eager_dqkv_divergence_grows_with_depth_bf16_cuda",
+      "status": "ok",
+      "passed": 1,
+      "failed": 0,
+      "filtered_out": 116,
+      "duration_s": 4.24
+    }
+  ]
+}

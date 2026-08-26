@@ -195,6 +195,48 @@ class PyFileSupportTests(CheckCitationsFixture):
             )
 
 
+class SearchRootsTests(CheckCitationsFixture):
+    """Unification contract C8.4 (NF15): `_SEARCH_ROOTS` gained a THIRD root
+    (`crates/jammi-kernels/artifacts/cuda-runs`) in phase 2, the same PR that
+    moves the two baselines OUT of `crates/jammi-bench/baselines/` into it —
+    without this, a citation living under the new root would silently drop
+    out of coverage the moment the move landed. This pins that a fixture
+    file under a THIRD, independent root (not just `self.root` as a whole,
+    which `_set_target` already collapses `_SEARCH_ROOTS` to) is still
+    walked and its citations still resolved/violated exactly like the other
+    two roots.
+    """
+
+    def test_a_fixture_under_a_third_search_root_is_walked_and_resolves(self):
+        self._set_target("fake.rs", "line one\nlet peak_thing = compute();\n")
+        third_root = self.root / "third-root"
+        third_root.mkdir()
+        cc._SEARCH_ROOTS = (self.root / "target", third_root)
+        src = third_root / "moved-baseline.json"
+        src.write_text('{"_comment": "see `peak_thing`, fake.rs:2"}')
+        code = cc.main()
+        self.assertEqual(code, 0)
+
+    def test_a_stale_citation_under_a_third_search_root_still_fails(self):
+        self._set_target("fake.rs", "line one\nlet totally_different = 1;\n")
+        third_root = self.root / "third-root"
+        third_root.mkdir()
+        cc._SEARCH_ROOTS = (self.root / "target", third_root)
+        src = third_root / "moved-baseline.json"
+        src.write_text('{"_comment": "see `peak_thing`, fake.rs:2"}')
+        code = cc.main()
+        self.assertEqual(code, 1)
+
+    def test_real_search_roots_include_the_cuda_runs_directory(self):
+        """Drives the REAL (non-monkeypatched) `_SEARCH_ROOTS` — confirms
+        this phase's addition actually registered, not just a fixture-only
+        code path."""
+        real_roots = self._orig_roots
+        cuda_runs = cc.REPO_ROOT / "crates" / "jammi-kernels" / "artifacts" / "cuda-runs"
+        self.assertIn(cuda_runs, real_roots)
+        self.assertTrue(cuda_runs.is_dir())
+
+
 class MainEntryPointTests(CheckCitationsFixture):
     def test_main_returns_nonzero_on_a_violation(self):
         self._set_target("fake.rs", "line one\nline two\n")

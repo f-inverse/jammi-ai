@@ -88,7 +88,7 @@ def parse_test_log(path: str) -> tuple[list[dict], list[dict]]:
     return tests, results
 
 
-def bench_leg(path: str) -> dict:
+def bench_leg(path: str, *, expected_git_sha: str | None = None) -> dict:
     try:
         d = json.load(open(path))
         t = d["tiers"]["finetune_step"]
@@ -105,6 +105,20 @@ def bench_leg(path: str) -> dict:
     row["fused_proof"] = all(
         v > 0 for k, v in row["dispatch_counters"].items() if k.endswith("_fused_dispatches") and v
     ) and all(v == 0 for k, v in row["dispatch_counters"].items() if k.endswith("_eager_dispatches"))
+
+    # Unification contract C5.1: cross-check the RAW leg's own baked
+    # provenance (`report.provenance.build_sha`, phase 1) against the tag's
+    # resolved `.ref`. Absent when the leg predates phase 1 (no `provenance`
+    # key at all) — nothing to cross-check, not a finding of its own; a
+    # PRESENT-but-mismatched/unknown/-dirty build_sha invalidates the leg
+    # (never silently folded into a GREEN summary).
+    build_sha = (d.get("provenance") or {}).get("build_sha") if isinstance(d, dict) else None
+    if expected_git_sha is not None and build_sha is not None:
+        if build_sha != expected_git_sha:
+            row["status"] = (
+                f"INVALID (leg provenance.build_sha={build_sha!r} != tag git_sha={expected_git_sha!r})"
+            )
+            row["fused_proof"] = False
     return row
 
 
@@ -140,9 +154,14 @@ def build_artifact(src: str, tag: str, *, repo_root: str | None = None) -> dict:
     for p in sorted(glob.glob(f"{src}/{tag}_test_*.log")):
         crate = os.path.basename(p)[len(tag) + 6 : -4]
         crate_logs[crate] = dict(zip(("tests", "results"), parse_test_log(p)))
-    legs = [bench_leg(p) for p in sorted(glob.glob(f"{src}/{tag}*_b*_s*_d*.json"))]
 
+    # Resolved BEFORE the leg loop (contract C5.1): each leg's own baked
+    # provenance.build_sha is cross-checked against THIS tag's resolved sha.
     git_sha, git_sha_unresolved = resolve_git_sha(ref, repo_root)
+    legs = [
+        bench_leg(p, expected_git_sha=git_sha)
+        for p in sorted(glob.glob(f"{src}/{tag}*_b*_s*_d*.json"))
+    ]
 
     art: dict = {
         "schema_version": SCHEMA_VERSION,
@@ -287,6 +306,69 @@ def self_test() -> int:
         if art_short.get("producer", {}).get("kind") != "none":
             failures.append(f"self-test FAILED: an unresolved git_sha did not collapse producer.kind to 'none': {art_short.get('producer')}")
 
+        # RED case (unification contract C5.1): a leg whose OWN baked
+        # provenance.build_sha does not match the tag's resolved .ref must
+        # be written INVALID — never silently folded into a GREEN summary
+        # off a binary that was not proven at the sha the tag claims.
+        with open(f"{tmp}/provmismatch.ref", "w") as f:
+            f.write("5f29e3b87ba2305533e83d21223343a73100cb64\n")
+        with open(f"{tmp}/provmismatch_cuda_parity.log", "w") as f:
+            f.write("test some_parity_case ... ok\n")
+            f.write("test result: ok. 1 passed; 0 failed; 0 ignored\n")
+        with open(f"{tmp}/provmismatch_b8_s128_d0.json", "w") as f:
+            json.dump(
+                {
+                    "provenance": {"build_sha": "f" * 40},  # != the tag's resolved ref above
+                    "tiers": {
+                        "finetune_step": {
+                            "s_per_step_p50": {"value": 0.5},
+                            "triplets_per_s": {"value": 10.0},
+                            "peak_vram_bytes": {"value": 123456.0},
+                            "max_grad_norm": None,
+                            "lora_linear_fused_dispatches": 10,
+                            "lora_linear_eager_dispatches": 0,
+                        }
+                    },
+                },
+                f,
+            )
+        art_provmismatch = build_artifact(tmp, "provmismatch")
+        prov_leg = art_provmismatch["bench_legs"][0]
+        if "INVALID" not in prov_leg.get("status", ""):
+            failures.append(f"self-test FAILED: a leg whose provenance.build_sha != the tag's ref was not written INVALID: {prov_leg}")
+        if prov_leg.get("fused_proof") is not False:
+            failures.append(f"self-test FAILED: a provenance-mismatched leg must not also report fused_proof=True: {prov_leg}")
+
+        # GREEN control: a leg whose provenance.build_sha MATCHES the tag's
+        # resolved ref stays clean (the cross-check must not false-positive
+        # on a genuinely matching leg).
+        with open(f"{tmp}/provmatch.ref", "w") as f:
+            f.write("5f29e3b87ba2305533e83d21223343a73100cb64\n")
+        with open(f"{tmp}/provmatch_cuda_parity.log", "w") as f:
+            f.write("test some_parity_case ... ok\n")
+            f.write("test result: ok. 1 passed; 0 failed; 0 ignored\n")
+        with open(f"{tmp}/provmatch_b8_s128_d0.json", "w") as f:
+            json.dump(
+                {
+                    "provenance": {"build_sha": "5f29e3b87ba2305533e83d21223343a73100cb64"},
+                    "tiers": {
+                        "finetune_step": {
+                            "s_per_step_p50": {"value": 0.5},
+                            "triplets_per_s": {"value": 10.0},
+                            "peak_vram_bytes": {"value": 123456.0},
+                            "max_grad_norm": None,
+                            "lora_linear_fused_dispatches": 10,
+                            "lora_linear_eager_dispatches": 0,
+                        }
+                    },
+                },
+                f,
+            )
+        art_provmatch = build_artifact(tmp, "provmatch")
+        prov_match_leg = art_provmatch["bench_legs"][0]
+        if "INVALID" in prov_match_leg.get("status", ""):
+            failures.append(f"self-test FAILED: a leg whose provenance.build_sha MATCHES the tag's ref was wrongly written INVALID: {prov_match_leg}")
+
         # RED case: a failing parity log must report RED, never GREEN.
         with open(f"{tmp}/failing.ref", "w") as f:
             f.write("5f29e3b87ba2305533e83d21223343a73100cb64\n")
@@ -305,7 +387,8 @@ def self_test() -> int:
     print(
         "proof_artifact self-test: OK — zero-tests-parsed INVALID, a happy-path GREEN with schema fields "
         "and fused_proof, a malformed leg's INVALID isolation, an unresolved short-sha's producer collapse, "
-        "and a failing parity log's RED are all exercised."
+        "a provenance.build_sha mismatch's leg-level INVALID (contract C5.1) plus its GREEN matching "
+        "control, and a failing parity log's RED are all exercised."
     )
     return 0
 

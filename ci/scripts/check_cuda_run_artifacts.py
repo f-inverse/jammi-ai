@@ -157,7 +157,40 @@ LEGACY_NONE_ALLOWLIST: dict[str, str] = {
         "pre-schema artifact: a flash_smoke execution-provenance dump captured by "
         "hand (16 test names from one binary run, not a single #[test] fn)."
     ),
+    # Unification contract C8.3 (phase 2, B6): the two `crates/jammi-bench/
+    # baselines/*.json` records `git mv`d under this directory. Neither has a
+    # tracked producer script (both were hand-driven `jammi-bench finetune-step`
+    # invocations run on the lead's own box — see each file's own `_comment`),
+    # so `producer.kind == "none"` is the honest reading, same as the five
+    # entries above. Growth of this list is no longer purely a human review
+    # call: `check_none_allowlist_history` (rule (f)'s mechanical companion)
+    # requires every entry's FIRST INTRODUCTION commit (`git log --follow
+    # --diff-filter=A`) to be an ancestor of this gate's own introduction
+    # (`c7fd1df`, GATE_INTRODUCTION_SHA below) — both of these predate it
+    # (`3719bc8`, `5879c48`), so a genuinely NEW artifact can never satisfy the
+    # condition and this list cannot grow again without a gate edit AND a
+    # history it does not have.
+    "2026-08-24-finetune-step-reference-d361515-a100-pcie.json": (
+        "pre-schema baseline, moved from crates/jammi-bench/baselines/"
+        "finetune_step_reference.json (unification contract C8): a same-box "
+        "A/B reference run by hand via jammi-bench finetune-step invocations, "
+        "not a single #[test] fn or a tracked producer script — see this "
+        "file's own _comment."
+    ),
+    "2026-08-24-p1-softmax-fold-bf8e807-a100-sxm4.json": (
+        "pre-schema baseline, moved from crates/jammi-bench/baselines/"
+        "p1_softmax_scale_fold_ab.json (unification contract C8): a same-box "
+        "A/B run by hand proving the P1 softmax-scale-fold change, not a "
+        "single #[test] fn or a tracked producer script — see this file's "
+        "own _comment."
+    ),
 }
+
+# Unification contract C8.3: the commit that introduced THIS gate (schema +
+# ancestry + producer-provenance for cuda-run artifacts, #379). Every
+# `LEGACY_NONE_ALLOWLIST` entry's own first-introduction commit must be an
+# ancestor of this one — see `check_none_allowlist_history`.
+GATE_INTRODUCTION_SHA = "c7fd1df58b81761374431597d6de414a863f0f83"
 
 ANCESTOR_MESSAGE = (
     "is not an ancestor of HEAD — a green artifact whose sha is not an ancestor "
@@ -431,8 +464,8 @@ def check_cargo_test_gating(data: dict, producer: dict, repo_root: Path) -> list
 # --------------------------------------------------------------------------- #
 # rule (d) — ancestry
 # --------------------------------------------------------------------------- #
-def _is_ancestor(sha: str, repo_root: Path) -> bool:
-    proc = _run(["git", "merge-base", "--is-ancestor", sha, "HEAD"], repo_root)
+def _is_ancestor(sha: str, repo_root: Path, target: str = "HEAD") -> bool:
+    proc = _run(["git", "merge-base", "--is-ancestor", sha, target], repo_root)
     return proc.returncode == 0
 
 
@@ -498,6 +531,485 @@ def check_none_allowlist(data: dict, relpath: str, allowlist: dict[str, str]) ->
     return []
 
 
+def _first_introduction_sha(relpath: str, cuda_runs_dir: Path, repo_root: Path) -> str | None:
+    """The oldest commit that `git log --follow --diff-filter=A` reports for
+    `<cuda_runs_dir>/<relpath>` — the commit that FIRST added this exact file
+    path (following renames). `None` if git found no such commit (the file
+    was never added under this name, or the repo has no history for it)."""
+    try:
+        full_path = (cuda_runs_dir / relpath).resolve().relative_to(repo_root.resolve())
+    except ValueError:
+        return None
+    proc = _run(["git", "log", "--follow", "--diff-filter=A", "--format=%H", "--", str(full_path)], repo_root)
+    if proc.returncode != 0:
+        return None
+    lines = [line for line in proc.stdout.splitlines() if line.strip()]
+    return lines[-1] if lines else None
+
+
+def check_none_allowlist_history(
+    relpath: str,
+    cuda_runs_dir: Path,
+    repo_root: Path,
+    gate_introduction_sha: str = GATE_INTRODUCTION_SHA,
+) -> list[str]:
+    """Unification contract C8.3 — rule (f)'s mechanical companion: an entry
+    in `LEGACY_NONE_ALLOWLIST` is legitimate ONLY if the artifact it names
+    was first committed (under this exact path, following renames) BEFORE
+    this gate itself existed. A genuinely NEW artifact's first-introduction
+    commit can never predate `gate_introduction_sha` (the gate did not exist
+    yet when a truly pre-schema artifact was added, but it DOES exist by the
+    time any new commit lands), so this list cannot grow again without a
+    gate edit — which is SWARM_GATE_TOUCHED by construction — AND a history
+    it does not have.
+    """
+    intro = _first_introduction_sha(relpath, cuda_runs_dir, repo_root)
+    if intro is None:
+        return [
+            f"LEGACY_NONE_ALLOWLIST entry `{relpath}`: could not determine its first-introduction "
+            f"commit via `git log --follow --diff-filter=A` — cannot verify it predates the gate "
+            f"({gate_introduction_sha})"
+        ]
+    if not _is_ancestor(intro, repo_root, gate_introduction_sha):
+        return [
+            f"LEGACY_NONE_ALLOWLIST entry `{relpath}`: its first-introduction commit {intro} is NOT "
+            f"an ancestor of this gate's own introduction ({gate_introduction_sha}) — a genuinely NEW "
+            f"artifact can never satisfy this condition; LEGACY_NONE_ALLOWLIST cannot grow for it"
+        ]
+    return []
+
+
+# --------------------------------------------------------------------------- #
+# rule (g) — leg identity on self-declaring v2 legs (unification contract C6,
+# phase 2). A v2 leg is ANY JSON object, anywhere in a `cuda-runs/**` tree,
+# carrying `leg_schema_version >= 2` — a key with ZERO occurrences anywhere
+# in this repo at the time this rule was written, so no pre-existing (v1)
+# leg can satisfy it by accident. A leg WITHOUT the key is v1 and is
+# validated only by rules (a)-(f) above, exactly as before this rule existed.
+#
+# The required identity TUPLE per (tier, producer_kind) is never hand-typed
+# here: the jammi side is extracted by regex from `FinetuneStepTier::
+# IDENTITY_FIELDS` + `REPORT_IDENTITY_FIELDS` in `crates/jammi-bench/src/
+# report.rs` (the SAME const `ci/scripts/perf/test_identity_fields_subset.py`
+# reads, contract C4.2); the torch side is IMPORTED directly from
+# `crates/jammi-bench/reference/torch_finetune_step.py`'s own
+# `TORCH_IDENTITY_FIELDS` / `TORCH_IDENTITY_FIELDS_NULL_MEANS` (contract
+# C3.5) and `ci/scripts/perf/ab_merge.py`'s own `_TORCH_ARGS_LEVEL_FIELDS`
+# (the field-placement map the existing jammi-vs-torch comparator already
+# depends on) — never re-typed as a second, independently-drifting copy.
+# --------------------------------------------------------------------------- #
+LEG_SCHEMA_VERSION_KEY = "leg_schema_version"
+RAW_RUNS_DIR_SUFFIX = "-raw-runs"
+
+# CLOSED — exactly the 10 `*.json.raw` files committed by #380 (`6d07b20`)
+# AFTER this gate existed (`c7fd1df`, #379), deliberately renamed to dodge
+# the `*.json` glob rather than fabricate a `git_sha` (contract §1 Part D
+# CV3; §2 A3 quotes the artifact's own `provenance_note`; pressure-v2 NF8/
+# pin B). Every one is a bare `Report` dump ({engine_version, host,
+# subcommand, tiers}) with no schema/provenance fields at all — they cannot
+# be brought under rules (a)-(f), let alone rule (g), without inventing a
+# sha the run never resolved. `--self-test` (`check_legacy_raw_nonjson_files_
+# exist`) proves every listed relpath still exists; a deletion must shrink
+# this list in the SAME commit, and growth is a gate edit (SWARM_GATE_TOUCHED
+# by construction — the list is closed, not merely long).
+LEGACY_RAW_NONJSON: dict[str, str] = {
+    "2026-08-25-adamw-d959805-a100-sxm4-raw-runs/a100b/b8_s128_disabled.r1.json.raw": (
+        "pre-rule-(g) raw leg (a100b box, s128, disabled arm, replicate 1): bare Report "
+        "dump committed by #380 before rule (g) existed; kept .json.raw per this parent "
+        "artifact's own provenance_note (a100b_full_step_ab_reference) rather than "
+        "fabricate a git_sha for a tip not resolvable against this worktree's ancestry."
+    ),
+    "2026-08-25-adamw-d959805-a100-sxm4-raw-runs/a100b/b8_s128_disabled.r2.json.raw": (
+        "pre-rule-(g) raw leg (a100b box, s128, disabled arm, replicate 2): same "
+        "provenance_note as the r1 sibling above."
+    ),
+    "2026-08-25-adamw-d959805-a100-sxm4-raw-runs/a100b/b8_s128_fused.r1.json.raw": (
+        "pre-rule-(g) raw leg (a100b box, s128, fused arm, replicate 1): same "
+        "provenance_note as the disabled-arm siblings above."
+    ),
+    "2026-08-25-adamw-d959805-a100-sxm4-raw-runs/a100b/b8_s128_fused.r2.json.raw": (
+        "pre-rule-(g) raw leg (a100b box, s128, fused arm, replicate 2): same "
+        "provenance_note as the disabled-arm siblings above."
+    ),
+    "2026-08-25-adamw-d959805-a100-sxm4-raw-runs/a100b/b8_s512_disabled.r1.json.raw": (
+        "pre-rule-(g) raw leg (a100b box, s512, disabled arm, replicate 1): same "
+        "provenance_note as the s128 siblings above."
+    ),
+    "2026-08-25-adamw-d959805-a100-sxm4-raw-runs/a100b/b8_s512_disabled.r2.json.raw": (
+        "pre-rule-(g) raw leg (a100b box, s512, disabled arm, replicate 2): same "
+        "provenance_note as the s128 siblings above."
+    ),
+    "2026-08-25-adamw-d959805-a100-sxm4-raw-runs/a100b/b8_s512_fused.r1.json.raw": (
+        "pre-rule-(g) raw leg (a100b box, s512, fused arm, replicate 1): same "
+        "provenance_note as the s128 siblings above."
+    ),
+    "2026-08-25-adamw-d959805-a100-sxm4-raw-runs/a100b/b8_s512_fused.r2.json.raw": (
+        "pre-rule-(g) raw leg (a100b box, s512, fused arm, replicate 2): same "
+        "provenance_note as the s128 siblings above."
+    ),
+    "2026-08-25-adamw-d959805-a100-sxm4-raw-runs/r2/b8_s128_disabled.json.raw": (
+        "pre-rule-(g) raw leg (r2 box, s128, disabled arm, single replicate): a separate "
+        "confirmation session, same 'kept .json.raw rather than fabricate a git_sha' "
+        "reasoning as the a100b/ siblings above — see this dir's own PROVENANCE.md."
+    ),
+    "2026-08-25-adamw-d959805-a100-sxm4-raw-runs/r2/b8_s128_fused.json.raw": (
+        "pre-rule-(g) raw leg (r2 box, s128, fused arm, single replicate): same "
+        "PROVENANCE.md reasoning as the r2/ sibling above."
+    ),
+}
+_ABSENT = object()  # sentinel: key genuinely absent from the object (never confused with JSON null)
+
+_JAMMI_REPORT_RS = REPO_ROOT / "crates" / "jammi-bench" / "src" / "report.rs"
+_AB_MERGE_PY = REPO_ROOT / "ci" / "scripts" / "perf" / "ab_merge.py"
+_TORCH_FINETUNE_STEP_PY = REPO_ROOT / "crates" / "jammi-bench" / "reference" / "torch_finetune_step.py"
+
+_TIER_IDENTITY_FIELDS_BLOCK_RE = re.compile(
+    r"pub const IDENTITY_FIELDS:\s*&'static \[\(&'static str,\s*"
+    r"[\w:]*Nullable\)\]\s*=\s*&\[(.*?)\n    \];",
+    re.DOTALL,
+)
+_REPORT_IDENTITY_FIELDS_BLOCK_RE = re.compile(
+    r"pub const REPORT_IDENTITY_FIELDS:\s*&\[\(&str,\s*Nullable\)\]\s*=\s*&\[(.*?)\n\];",
+    re.DOTALL,
+)
+# `("field_name", Nullable::NonNull)` or `("field_name",
+# crate::report::Nullable::NullMeans("reason"))` (both single-line and the
+# multi-line, one-item-per-line spelling `grad_oracle.rs` uses for long
+# field names) — captures (name, NonNull|NullMeans, reason-or-empty).
+_FIELD_ENTRY_RE = re.compile(
+    r'\(\s*"([A-Za-z0-9_]+)"\s*,\s*(?:crate::report::)?Nullable::(NonNull|NullMeans)'
+    r'(?:\(\s*"((?:[^"\\]|\\.)*)"\s*\))?\s*,?\s*\)',
+    re.DOTALL,
+)
+
+
+def _extract_rust_identity_block(path: Path, block_re: re.Pattern) -> list[tuple[str, str, str | None]]:
+    if not path.is_file():
+        raise ArtifactError(f"{path} does not exist — cannot derive rule (g)'s jammi identity tuple")
+    text = path.read_text(encoding="utf-8")
+    m = block_re.search(text)
+    if m is None:
+        raise ArtifactError(f"no matching IDENTITY_FIELDS-shaped const block found in {path}")
+    entries = [(name, kind, reason or None) for name, kind, reason in _FIELD_ENTRY_RE.findall(m.group(1))]
+    if not entries:
+        raise ArtifactError(f"IDENTITY_FIELDS-shaped block in {path} matched but named zero fields")
+    return entries
+
+
+def _load_module_from_path(module_name: str, path: Path):
+    import importlib.util
+
+    if not path.is_file():
+        raise ArtifactError(f"{path} does not exist — cannot derive rule (g)'s torch identity tuple")
+    perf_dir = str((REPO_ROOT / "ci" / "scripts" / "perf"))
+    if perf_dir not in sys.path:
+        sys.path.insert(0, perf_dir)  # ab_merge.py imports its sibling identity_fields.py
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise ArtifactError(f"could not load {path} as a Python module")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# torch_finetune_step.py's own report-assembly code (`run()`, its `report =
+# {...}` literal) places every TORCH_IDENTITY_FIELDS entry under EXACTLY one
+# of three top-level keys: `args` (the three `ab_merge.py::
+# _TORCH_ARGS_LEVEL_FIELDS` entries, plus `adamw_foreach` — the K7-only
+# addition sharing that same placement), `provenance` (the nine fields the
+# `provenance()` function itself fills), and `finetune_step` for every other
+# entry.
+_TORCH_PROVENANCE_ROOT_FIELDS = frozenset(
+    {
+        "torch_version",
+        "torch_cuda_version",
+        "transformers_version",
+        "peft_version",
+        "python_version",
+        "fast_path_globals",
+        "device_name",
+        "nvidia_driver_version",
+        "git_rev",
+    }
+)
+
+_IDENTITY_TUPLES_CACHE: dict[tuple[str, str], dict] | None = None
+
+
+def build_identity_tuples() -> dict[tuple[str, str], dict]:
+    """`{(tier, producer_kind): {"sha_root": ..., "sha_field": ..., "fields":
+    [(name, root, "NonNull"|"NullMeans", reason_or_None), ...]}}` — computed
+    once (module-level cache) by reading the Rust consts and importing the
+    Python reference/comparator modules described above; never hand-typed.
+    """
+    global _IDENTITY_TUPLES_CACHE
+    if _IDENTITY_TUPLES_CACHE is not None:
+        return _IDENTITY_TUPLES_CACHE
+
+    tier_entries = _extract_rust_identity_block(_JAMMI_REPORT_RS, _TIER_IDENTITY_FIELDS_BLOCK_RE)
+    report_entries = _extract_rust_identity_block(_JAMMI_REPORT_RS, _REPORT_IDENTITY_FIELDS_BLOCK_RE)
+    jammi_fields = [(name, "tier", kind, reason) for name, kind, reason in tier_entries]
+    jammi_fields += [(name, "provenance", kind, reason) for name, kind, reason in report_entries]
+
+    ab_merge = _load_module_from_path("_gate_ab_merge", _AB_MERGE_PY)
+    torch_mod = _load_module_from_path("_gate_torch_finetune_step", _TORCH_FINETUNE_STEP_PY)
+    torch_args_fields = set(ab_merge._TORCH_ARGS_LEVEL_FIELDS) | {"adamw_foreach"}
+    null_means: dict = torch_mod.TORCH_IDENTITY_FIELDS_NULL_MEANS
+    torch_fields = []
+    for field in torch_mod.TORCH_IDENTITY_FIELDS:
+        if field in torch_args_fields:
+            root = "args"
+        elif field in _TORCH_PROVENANCE_ROOT_FIELDS:
+            root = "provenance"
+        else:
+            root = "finetune_step"
+        if field in null_means:
+            torch_fields.append((field, root, "NullMeans", null_means[field]))
+        else:
+            torch_fields.append((field, root, "NonNull", None))
+
+    _IDENTITY_TUPLES_CACHE = {
+        ("finetune_step", "jammi"): {"sha_root": "provenance", "sha_field": "build_sha", "fields": jammi_fields},
+        ("finetune_step", "torch"): {"sha_root": "provenance", "sha_field": "git_rev", "fields": torch_fields},
+    }
+    return _IDENTITY_TUPLES_CACHE
+
+
+def _leg_field_value(leg: dict, field: str, root: str):
+    if root == "tier":
+        tiers = leg.get("tiers")
+        tier = tiers.get("finetune_step") if isinstance(tiers, dict) else None
+        return tier.get(field, _ABSENT) if isinstance(tier, dict) else _ABSENT
+    src = leg.get(root)
+    return src.get(field, _ABSENT) if isinstance(src, dict) else _ABSENT
+
+
+def _is_v2(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 2
+
+
+def check_raw_leg_identity_fields(leg: dict, tuple_spec: dict, label: str) -> list[str]:
+    failures: list[str] = []
+    for field, root, kind, _reason in tuple_spec["fields"]:
+        value = _leg_field_value(leg, field, root)
+        if value is _ABSENT:
+            failures.append(f"{label}: v2 raw leg missing identity field `{field}` (expected under `{root}`)")
+        elif value is None and kind == "NonNull":
+            failures.append(f"{label}: identity field `{field}` is declared NonNull but reads null")
+        # kind == "NullMeans" and value is None: OK — a declared-nullable reading.
+    return failures
+
+
+def check_raw_leg_sha(leg: dict, tuple_spec: dict, parent_git_sha: str | None, label: str) -> list[str]:
+    if parent_git_sha is None:
+        return []  # nothing to cross-check the leg's own sha against
+    sha_root, sha_field = tuple_spec["sha_root"], tuple_spec["sha_field"]
+    value = _leg_field_value(leg, sha_field, sha_root)
+    if value is _ABSENT:
+        return [f"{label}: v2 raw leg missing `{sha_root}.{sha_field}` — cannot cross-check provenance"]
+    if value is None:
+        entry = next((e for e in tuple_spec["fields"] if e[0] == sha_field), None)
+        if entry is not None and entry[2] == "NullMeans":
+            return []  # legitimately nullable on this producer_kind (e.g. torch git_rev)
+        return [f"{label}: `{sha_root}.{sha_field}` is null and not declared nullable"]
+    if not isinstance(value, str) or not GIT_SHA_RE.match(value):
+        return [
+            f"{label}: `{sha_root}.{sha_field}` = {value!r} is not a resolved 40-hex sha (covers "
+            f"'unknown', a '-dirty' suffix, or any other unresolved reading) — a GREEN v2 leg can "
+            f"never carry an unresolved build identity"
+        ]
+    if value != parent_git_sha:
+        return [
+            f"{label}: `{sha_root}.{sha_field}` = {value} does not match the parent artifact's "
+            f"git_sha {parent_git_sha} — this leg was not proven at the sha the artifact claims"
+        ]
+    return []
+
+
+def check_v2_leg(
+    leg: dict,
+    label: str,
+    parent_git_sha: str | None,
+    raw_runs_dir: Path,
+    cuda_runs_dir: Path,
+) -> list[str]:
+    identity = leg.get("identity")
+    if not isinstance(identity, dict):
+        return [f"{label}: v2 leg missing `identity` object"]
+    tier = identity.get("tier")
+    producer_kind = identity.get("producer_kind")
+    leg_shape = identity.get("leg_shape")
+    failures: list[str] = []
+    if not isinstance(tier, str) or not tier:
+        failures.append(f"{label}: identity.tier must be a non-empty string")
+    if producer_kind not in ("jammi", "torch"):
+        failures.append(f"{label}: identity.producer_kind must be 'jammi' or 'torch', got {producer_kind!r}")
+    if leg_shape not in ("raw", "folded"):
+        failures.append(f"{label}: identity.leg_shape must be 'raw' or 'folded', got {leg_shape!r}")
+    if failures:
+        return failures
+
+    tuple_spec = build_identity_tuples().get((tier, producer_kind))
+    if tuple_spec is None:
+        return [f"{label}: no known identity tuple for (tier={tier!r}, producer_kind={producer_kind!r})"]
+
+    if leg_shape == "folded":
+        own_field_names = {f[0] for f in tuple_spec["fields"]}
+        leaked = sorted(own_field_names & set(leg.keys()))
+        if leaked:
+            failures.append(f"{label}: folded leg carries identity field(s) of its own {leaked} — identity has ONE home (the raw leg)")
+        file_name = leg.get("file")
+        if not isinstance(file_name, str) or not file_name:
+            return failures + [f"{label}: folded leg missing `file` naming its raw sibling"]
+        raw_path = raw_runs_dir / file_name
+        if not raw_path.is_file():
+            try:
+                shown_dir = raw_runs_dir.relative_to(cuda_runs_dir)
+            except ValueError:
+                shown_dir = raw_runs_dir
+            return failures + [f"{label}: folded leg's file `{file_name}` does not exist under {shown_dir}"]
+        try:
+            raw_data = json.loads(raw_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as e:
+            return failures + [f"{label}: folded leg's raw sibling `{file_name}` failed to parse: {e}"]
+        if not isinstance(raw_data, dict) or not _is_v2(raw_data.get(LEG_SCHEMA_VERSION_KEY)):
+            return failures + [f"{label}: folded leg's raw sibling `{file_name}` does not carry leg_schema_version >= 2"]
+        raw_label = f"{label} -> {file_name}"
+        failures += check_v2_leg(raw_data, raw_label, parent_git_sha, raw_runs_dir, cuda_runs_dir)
+        return failures
+
+    # raw
+    failures += check_raw_leg_identity_fields(leg, tuple_spec, label)
+    failures += check_raw_leg_sha(leg, tuple_spec, parent_git_sha, label)
+    return failures
+
+
+def find_v2_legs(data, path_prefix: str = "") -> list[tuple[str, dict]]:
+    """Recursively walks `data` for every dict carrying `leg_schema_version
+    >= 2` — this is the WHOLE discriminator (contract C6.1): a v2 leg can be
+    the top-level document itself, or nested anywhere inside it (a folded
+    `shapes.<s>.legs.<leg>` record, a `bench_legs[i]` entry, an embedded
+    `clip_on_flash_leg.record`, ...). Recursion continues INTO a matched leg
+    too (harmless: no real leg nests a second `leg_schema_version` key)."""
+    found: list[tuple[str, dict]] = []
+    if isinstance(data, dict):
+        if _is_v2(data.get(LEG_SCHEMA_VERSION_KEY)):
+            found.append((path_prefix, data))
+        for k, v in data.items():
+            found += find_v2_legs(v, f"{path_prefix}/{k}" if path_prefix else k)
+    elif isinstance(data, list):
+        for i, v in enumerate(data):
+            found += find_v2_legs(v, f"{path_prefix}[{i}]")
+    return found
+
+
+def _raw_runs_dir_for(artifact_path: Path) -> Path:
+    return artifact_path.parent / (artifact_path.stem + RAW_RUNS_DIR_SUFFIX)
+
+
+def find_objects_with_key(data, key: str, path_prefix: str = "") -> list[str]:
+    found: list[str] = []
+    if isinstance(data, dict):
+        if key in data:
+            found.append(path_prefix)
+        for k, v in data.items():
+            found += find_objects_with_key(v, key, f"{path_prefix}/{k}" if path_prefix else k)
+    elif isinstance(data, list):
+        for i, v in enumerate(data):
+            found += find_objects_with_key(v, key, f"{path_prefix}[{i}]")
+    return found
+
+
+def _covered_by(path: str, reached_paths: set[str]) -> bool:
+    return any(path == r or path.startswith(r + "/") or path.startswith(r + "[") for r in reached_paths)
+
+
+def census_unreached_measurement_objects(cuda_runs_dir: Path) -> list[str]:
+    """Falsifier F4 (contract §6): for every top-level artifact whose OWN
+    `schema_version >= 2`, every JSON object anywhere in its tree — the
+    document itself and every `*.json` payload under its sibling
+    `*-raw-runs/` directory — that carries `s_per_step_p50` must be
+    REACHABLE as (or nested inside) a v2 leg rule (g) actually validated.
+    Trivially empty today (zero `schema_version >= 2` top-level artifacts
+    exist yet) — the falsifier is standing for the day one does."""
+    unreached: list[str] = []
+    for f in sorted(cuda_runs_dir.glob("*.json")):
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if not isinstance(data, dict) or not _is_v2(data.get("schema_version")):
+            continue
+        reached = {p for p, _ in find_v2_legs(data)}
+        for measure_path in find_objects_with_key(data, "s_per_step_p50"):
+            if not _covered_by(measure_path, reached):
+                unreached.append(f"{f.name}#{measure_path}")
+        raw_runs_dir = _raw_runs_dir_for(f)
+        if raw_runs_dir.is_dir():
+            for rf in sorted(raw_runs_dir.rglob("*.json")):
+                try:
+                    rdata = json.loads(rf.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    continue
+                if not isinstance(rdata, dict) or _is_v2(rdata.get(LEG_SCHEMA_VERSION_KEY)):
+                    continue  # a genuine v2 raw leg IS reached, by definition
+                for measure_path in find_objects_with_key(rdata, "s_per_step_p50"):
+                    rel = rf.relative_to(cuda_runs_dir).as_posix()
+                    unreached.append(f"{rel}#{measure_path}")
+    return unreached
+
+
+def check_legacy_raw_nonjson_files_exist(cuda_runs_dir: Path) -> list[str]:
+    """`--self-test`'s own shrink-only proof for `LEGACY_RAW_NONJSON`: every
+    listed relpath must exist on disk. A deletion must shrink this list in
+    the SAME commit — growth (a new entry) is a gate edit, i.e.
+    SWARM_GATE_TOUCHED by construction (contract C6.2)."""
+    return [
+        f"LEGACY_RAW_NONJSON lists `{relpath}` but no such file exists under {cuda_runs_dir}"
+        for relpath in LEGACY_RAW_NONJSON
+        if not (cuda_runs_dir / relpath).is_file()
+    ]
+
+
+def check_raw_runs_nonjson_coverage(cuda_runs_dir: Path) -> list[str]:
+    """Every non-`.json` payload (excluding `.md`/`.log`) under ANY `*-raw-
+    runs/` directory must be in the closed `LEGACY_RAW_NONJSON` list — the
+    `.json.raw` rename bypass (contract C6.2, pressure-v2 NF8) a NEW leg may
+    never reuse."""
+    failures: list[str] = []
+    for artifact_path in sorted(cuda_runs_dir.glob("*.json")):
+        raw_runs_dir = _raw_runs_dir_for(artifact_path)
+        if not raw_runs_dir.is_dir():
+            continue
+        for p in sorted(raw_runs_dir.rglob("*")):
+            if p.is_dir() or p.suffix in (".md", ".log", ".json"):
+                continue
+            relpath = p.relative_to(cuda_runs_dir).as_posix()
+            if relpath not in LEGACY_RAW_NONJSON:
+                failures.append(
+                    f"{relpath}: non-`.json` payload under a `*-raw-runs/` directory is not in the "
+                    f"closed LEGACY_RAW_NONJSON list — a NEW raw leg must be named `*.json`, never "
+                    f"renamed to dodge the schema gate's glob"
+                )
+    return failures
+
+
+def check_raw_runs_require_v2(data: dict, f: Path, schema_v2_raw_runs_dirs: set[Path]) -> list[str]:
+    """Contract C6.2's last sentence: under a parent artifact with
+    `schema_version >= 2`, every `*.json` payload under its `*-raw-runs/`
+    sibling MUST carry `leg_schema_version >= 2` (else RED) — a v1-shaped
+    raw leg silently coexisting under an already-v2 parent is exactly the
+    kind of container drift rule (g) exists to catch."""
+    if f.parent not in schema_v2_raw_runs_dirs:
+        return []
+    if _is_v2(data.get(LEG_SCHEMA_VERSION_KEY)):
+        return []
+    return [
+        f"sits under a `*-raw-runs/` directory whose parent artifact is schema_version >= 2 — "
+        f"this payload MUST carry leg_schema_version >= 2"
+    ]
+
+
 # --------------------------------------------------------------------------- #
 # orchestration — pure over (data, relpath, repo_root, tracked, allowlist) so
 # `--self-test` can drive it against a synthetic fixture repo.
@@ -520,7 +1032,13 @@ def validate_artifact(
     return failures
 
 
-def run_gate(cuda_runs_dir: Path, repo_root: Path, allowlist: dict[str, str]) -> list[str]:
+def run_gate(
+    cuda_runs_dir: Path,
+    repo_root: Path,
+    allowlist: dict[str, str],
+    *,
+    gate_introduction_sha: str = GATE_INTRODUCTION_SHA,
+) -> list[str]:
     if not cuda_runs_dir.is_dir():
         raise ArtifactError(f"cuda-runs dir not found: {cuda_runs_dir}")
 
@@ -536,6 +1054,18 @@ def run_gate(cuda_runs_dir: Path, repo_root: Path, allowlist: dict[str, str]) ->
     if not files:
         raise ArtifactError(f"no *.json artifacts found under {cuda_runs_dir}")
 
+    # rule (g) precompute: which `*-raw-runs/` directories sit under a
+    # top-level artifact whose OWN schema_version is already >= 2 (C6.2's
+    # "MUST carry leg_schema_version >= 2" mandate is conditional on this).
+    schema_v2_raw_runs_dirs: set[Path] = set()
+    for tf in sorted(cuda_runs_dir.glob("*.json")):
+        try:
+            tdata = json.loads(tf.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if isinstance(tdata, dict) and _is_v2(tdata.get("schema_version")):
+            schema_v2_raw_runs_dirs.add(_raw_runs_dir_for(tf))
+
     all_failures: list[str] = []
     for f in files:
         relpath = f.relative_to(cuda_runs_dir).as_posix()
@@ -550,6 +1080,28 @@ def run_gate(cuda_runs_dir: Path, repo_root: Path, allowlist: dict[str, str]) ->
         failures = validate_artifact(data, relpath, repo_root, tracked, allowlist)
         all_failures.extend(f"{relpath}: {msg}" for msg in failures)
 
+        # rule (g): every v2-leg-shaped object anywhere in THIS document
+        # (the document itself, at "<root>", or nested inside it).
+        parent_git_sha = data.get("git_sha") if isinstance(data.get("git_sha"), str) else None
+        raw_runs_dir = _raw_runs_dir_for(f)
+        for subpath, leg in find_v2_legs(data):
+            label = f"{relpath}#{subpath}" if subpath else relpath
+            all_failures.extend(
+                f"{msg}" for msg in check_v2_leg(leg, label, parent_git_sha, raw_runs_dir, cuda_runs_dir)
+            )
+        all_failures.extend(
+            f"{relpath}: {msg}" for msg in check_raw_runs_require_v2(data, f, schema_v2_raw_runs_dirs)
+        )
+
+    all_failures.extend(check_raw_runs_nonjson_coverage(cuda_runs_dir))
+
+    # rule (f)'s mechanical companion (C8.3): every LEGACY_NONE_ALLOWLIST
+    # entry's own first-introduction commit must predate this gate.
+    for relpath in allowlist:
+        all_failures.extend(
+            check_none_allowlist_history(relpath, cuda_runs_dir, repo_root, gate_introduction_sha)
+        )
+
     all_failures.extend(
         f"README.md: {msg}"
         for msg in check_readme_producer(cuda_runs_dir / "README.md", repo_root, tracked)
@@ -560,12 +1112,20 @@ def run_gate(cuda_runs_dir: Path, repo_root: Path, allowlist: dict[str, str]) ->
 def main() -> int:
     if "--self-test" in sys.argv[1:]:
         return self_test()
+    if "--census" in sys.argv[1:]:
+        return run_census()
 
     try:
         failures = run_gate(CUDA_RUNS_DIR, REPO_ROOT, LEGACY_NONE_ALLOWLIST)
     except ArtifactError as exc:
         print(f"cuda-run-artifacts: FAIL (uncomputable) — {exc}", file=sys.stderr)
         return 1
+
+    # LEGACY_RAW_NONJSON's own shrink-only closure — only meaningful against
+    # the REAL checkout (the module-level dict names real repo relpaths), so
+    # this runs here, never inside `run_gate` (which `--self-test` also
+    # drives against synthetic fixture repos that do not carry these files).
+    failures = failures + check_legacy_raw_nonjson_files_exist(CUDA_RUNS_DIR)
 
     if failures:
         print("cuda-run-artifacts: FAIL", file=sys.stderr)
@@ -579,6 +1139,22 @@ def main() -> int:
         f"{CUDA_RUNS_DIR.relative_to(REPO_ROOT)} satisfies the schema, ancestry, and "
         "producer-provenance contract."
     )
+    return 0
+
+
+def run_census() -> int:
+    """`--census`: falsifier F4 — lists every `s_per_step_p50`-carrying JSON
+    object under a `schema_version >= 2` top-level artifact that rule (g)
+    did NOT reach. Must print 0 today (no such artifact exists yet); the
+    check is standing for the day one does."""
+    unreached = census_unreached_measurement_objects(CUDA_RUNS_DIR)
+    if unreached:
+        print("cuda-run-artifacts --census: FAIL — unreached measurement object(s):", file=sys.stderr)
+        for u in unreached:
+            print(f"  - {u}", file=sys.stderr)
+        print(f"\ncuda-run-artifacts --census: {len(unreached)} unreached.", file=sys.stderr)
+        return 1
+    print("cuda-run-artifacts --census: PASS — 0 unreached measurement objects under a schema_version >= 2 parent.")
     return 0
 
 
@@ -849,6 +1425,273 @@ def self_test() -> int:
         }
         expect_hit(bad, "brand-new-not-allowlisted.json", "not in the reviewed LEGACY_NONE_ALLOWLIST", "rule (f): new file defaulting to none")
 
+    # rule (g) — v2 leg identity (contract C6) -----------------------------
+    # A dedicated, isolated fixture repo per case (never the real checkout),
+    # exercised through `run_gate` end-to-end so the discovery walk,
+    # raw/folded dispatch, and sha cross-check all fire together, exactly as
+    # they would on a committed artifact.
+    def _rule_g_fixture(tmp_root: Path) -> tuple[Path, str]:
+        _run(["git", "init", "-q"], tmp_root)
+        _run(["git", "config", "user.email", "test@example.com"], tmp_root)
+        _run(["git", "config", "user.name", "Test"], tmp_root)
+        cr = tmp_root / "crates" / "jammi-kernels" / "artifacts" / "cuda-runs"
+        cr.mkdir(parents=True)
+        (cr / "README.md").write_text("Produced by `ci/scripts/perf/proof_artifact.py`.\n")
+        perf_dir = tmp_root / "ci" / "scripts" / "perf"
+        perf_dir.mkdir(parents=True)
+        (perf_dir / "proof_artifact.py").write_text("# stub producer\n")
+        _run(["git", "add", "-A"], tmp_root)
+        _run(["git", "commit", "-q", "-m", "root"], tmp_root)
+        sha = _run(["git", "rev-parse", "HEAD"], tmp_root).stdout.strip()
+        return cr, sha
+
+    def _none_producer() -> dict:
+        return {"path": None, "kind": "none", "invocation": None, "gating": "none"}
+
+    def _synthetic_value_for(field: str):
+        if field.endswith("_bytes") or field in ("seed", "batch", "seq", "lora_rank", "steps_measured"):
+            return 1
+        if field in ("lora_alpha", "lora_dropout", "margin"):
+            return 0.1
+        if field == "batched_forward":
+            return True
+        if field in ("target_modules", "kernels_disabled_requested", "kernels_disabled_fired", "build_features"):
+            return []
+        if field in ("fast_path_globals", "sdpa_backend_probe"):
+            return {}
+        return "x"
+
+    def _full_leg_fixture(producer_kind: str, build_sha: str, outer_sha: str = "1" * 40) -> dict:
+        """Every identity-tuple field for `producer_kind`, populated with a
+        typed placeholder — derived from `build_identity_tuples()` itself
+        (never a second, independently-drifting hand-typed field list), so
+        this fixture builder tracks the Rust/Python source automatically.
+        ALSO carries the base rules (a)-(f) schema (`schema_version`,
+        `git_sha`, `box`, `producer`, `status`) — a v2 raw leg is written
+        as its own standalone `*.json` document under `*-raw-runs/`, and
+        the pre-existing rules (a)-(f) already apply to EVERY such file,
+        regardless of rule (g). `outer_sha` (rules a-f's own `git_sha`) is
+        deliberately a SEPARATE parameter from `build_sha` (rule (g)'s
+        `provenance.build_sha`/`git_rev`) — a case exercising an invalid/
+        mismatched `build_sha` must not also break the file's OWN base
+        schema, or the two rules' findings become impossible to tell apart.
+        """
+        tuple_spec = build_identity_tuples()[("finetune_step", producer_kind)]
+        doc: dict = {
+            "identity": {"tier": "finetune_step", "producer_kind": producer_kind, "leg_shape": "raw"},
+            LEG_SCHEMA_VERSION_KEY: 2,
+            "schema_version": 2,
+            "git_sha": outer_sha,
+            "box": "a100-fixture",
+            "producer": {
+                "path": "ci/scripts/perf/proof_artifact.py", "kind": "script",
+                "invocation": "python3 ci/scripts/perf/proof_artifact.py <out> <tag>", "gating": "none",
+            },
+            "status": "GREEN",
+        }
+        for field, root, _kind, _reason in tuple_spec["fields"]:
+            value = _synthetic_value_for(field)
+            if root == "tier":
+                doc.setdefault("tiers", {}).setdefault("finetune_step", {})[field] = value
+            else:
+                doc.setdefault(root, {})[field] = value
+        sha_root, sha_field = tuple_spec["sha_root"], tuple_spec["sha_field"]
+        doc.setdefault(sha_root, {})[sha_field] = build_sha
+        return doc
+
+    # (iii) v2 raw leg missing a NonNull field, missing a NullMeans field,
+    # and a NullMeans field present-null — checked directly against
+    # `check_raw_leg_identity_fields`, the unit rule (g)'s presence/nullness
+    # logic lives in.
+    jammi_tuple = build_identity_tuples()[("finetune_step", "jammi")]
+    torch_tuple = build_identity_tuples()[("finetune_step", "torch")]
+
+    good_jammi_leg = _full_leg_fixture("jammi", "a" * 40)
+    if check_raw_leg_identity_fields(good_jammi_leg, jammi_tuple, "x"):
+        failures.append(f"self-test FAILED: rule (g) iii control: a fully-populated jammi leg fixture reported findings: {check_raw_leg_identity_fields(good_jammi_leg, jammi_tuple, 'x')}")
+
+    missing_nonnull_leg = _full_leg_fixture("jammi", "a" * 40)
+    del missing_nonnull_leg["tiers"]["finetune_step"]["seed"]
+    got = check_raw_leg_identity_fields(missing_nonnull_leg, jammi_tuple, "x")
+    if not any("missing identity field `seed`" in g for g in got):
+        failures.append(f"self-test FAILED: rule (g) iii: missing NonNull field `seed` not caught: {got}")
+
+    # torch_cuda_version is a real TORCH_IDENTITY_FIELDS_NULL_MEANS entry.
+    good_torch_leg = _full_leg_fixture("torch", "b" * 40)
+    if check_raw_leg_identity_fields(good_torch_leg, torch_tuple, "x"):
+        failures.append(f"self-test FAILED: rule (g) iii control: a fully-populated torch leg fixture reported findings: {check_raw_leg_identity_fields(good_torch_leg, torch_tuple, 'x')}")
+
+    missing_nullmeans_leg = _full_leg_fixture("torch", "b" * 40)
+    del missing_nullmeans_leg["provenance"]["torch_cuda_version"]
+    got = check_raw_leg_identity_fields(missing_nullmeans_leg, torch_tuple, "x")
+    if not any("missing identity field `torch_cuda_version`" in g for g in got):
+        failures.append(f"self-test FAILED: rule (g) iii: missing NullMeans field `torch_cuda_version` not caught: {got}")
+
+    present_null_nullmeans_leg = _full_leg_fixture("torch", "b" * 40)
+    present_null_nullmeans_leg["provenance"]["torch_cuda_version"] = None
+    got = check_raw_leg_identity_fields(present_null_nullmeans_leg, torch_tuple, "x")
+    if any("torch_cuda_version" in g for g in got):
+        failures.append(f"self-test FAILED: rule (g) iii: a present-but-null NullMeans field must NOT be a finding: {got}")
+
+    # (iv)/(v) sha cross-check: mismatch, and unknown/-dirty on an
+    # otherwise-GREEN leg — exercised end to end via run_gate so the
+    # parent-artifact git_sha comparison (not just field presence) fires.
+    with tempfile.TemporaryDirectory() as tmp_iv:
+        cr, root = _rule_g_fixture(Path(tmp_iv))
+        parent = {
+            "schema_version": 1, "git_sha": root, "box": "a100-fixture",
+            "producer": {
+                "path": "ci/scripts/perf/proof_artifact.py", "kind": "script",
+                "invocation": "python3 ci/scripts/perf/proof_artifact.py <out> <tag>", "gating": "none",
+            },
+            "status": "GREEN",
+        }
+        (cr / "rg-iv-parent.json").write_text(json.dumps(parent))
+        raw_dir = cr / "rg-iv-parent-raw-runs"
+        raw_dir.mkdir()
+        mismatched_leg = _full_leg_fixture("jammi", "f" * 40, outer_sha=root)  # build_sha != root
+        (raw_dir / "leg.json").write_text(json.dumps(mismatched_leg))
+        got = run_gate(cr, Path(tmp_iv), {})
+        if not any("does not match the parent artifact's git_sha" in g for g in got):
+            failures.append(f"self-test FAILED: rule (g) iv: build_sha/git_sha mismatch not caught: {got}")
+
+    with tempfile.TemporaryDirectory() as tmp_v:
+        cr, root = _rule_g_fixture(Path(tmp_v))
+        parent = {
+            "schema_version": 1, "git_sha": root, "box": "a100-fixture",
+            "producer": {
+                "path": "ci/scripts/perf/proof_artifact.py", "kind": "script",
+                "invocation": "python3 ci/scripts/perf/proof_artifact.py <out> <tag>", "gating": "none",
+            },
+            "status": "GREEN",
+        }
+        (cr / "rg-v-parent.json").write_text(json.dumps(parent))
+        raw_dir = cr / "rg-v-parent-raw-runs"
+        raw_dir.mkdir()
+        dirty_leg = _full_leg_fixture("jammi", root + "-dirty", outer_sha=root)
+        (raw_dir / "leg.json").write_text(json.dumps(dirty_leg))
+        got = run_gate(cr, Path(tmp_v), {})
+        if not any("not a resolved 40-hex sha" in g for g in got):
+            failures.append(f"self-test FAILED: rule (g) v: a '-dirty'-suffixed build_sha on a GREEN leg was not caught: {got}")
+
+    # (vi) folded leg carrying identity fields of its own -> RED
+    with tempfile.TemporaryDirectory() as tmp_vi:
+        cr, root = _rule_g_fixture(Path(tmp_vi))
+        raw_dir = cr / "rg-vi-parent-raw-runs"
+        raw_dir.mkdir()
+        raw_leg = _full_leg_fixture("jammi", root, outer_sha=root)
+        (raw_dir / "leg.json").write_text(json.dumps(raw_leg))
+        folded_leg_with_leak = {
+            "identity": {"tier": "finetune_step", "producer_kind": "jammi", "leg_shape": "folded"},
+            LEG_SCHEMA_VERSION_KEY: 2,
+            "file": "leg.json",
+            "seed": 42,  # LEAK: a folded leg must carry NO identity fields of its own
+        }
+        parent = {
+            "schema_version": 1, "git_sha": root, "box": "a100-fixture",
+            "producer": {
+                "path": "ci/scripts/perf/proof_artifact.py", "kind": "script",
+                "invocation": "python3 ci/scripts/perf/proof_artifact.py <out> <tag>", "gating": "none",
+            },
+            "status": "GREEN",
+            "bench_legs": [folded_leg_with_leak],
+        }
+        (cr / "rg-vi-parent.json").write_text(json.dumps(parent))
+        got = run_gate(cr, Path(tmp_vi), {})
+        if not any("carries identity field(s) of its own" in g for g in got):
+            failures.append(f"self-test FAILED: rule (g) vi: a folded leg leaking an identity field was not caught: {got}")
+
+    # (ii)/(i) — a non-.json raw payload (e.g. a `.json.raw` rename) under a
+    # `*-raw-runs/` dir that is NOT in the closed LEGACY_RAW_NONJSON list ->
+    # RED, regardless of the parent's own schema_version or the payload's
+    # own leg_schema_version (both contract acceptance bullets (i) and (ii)
+    # land on this SAME finding under this gate's design: the rename bypass
+    # is caught before content is ever inspected).
+    with tempfile.TemporaryDirectory() as tmp_ii:
+        cr, root = _rule_g_fixture(Path(tmp_ii))
+        parent = {
+            "schema_version": 2, "git_sha": root, "box": "a100-fixture",
+            "producer": {
+                "path": "ci/scripts/perf/proof_artifact.py", "kind": "script",
+                "invocation": "python3 ci/scripts/perf/proof_artifact.py <out> <tag>", "gating": "none",
+            },
+            "status": "GREEN",
+        }
+        (cr / "rg-ii-parent.json").write_text(json.dumps(parent))
+        raw_dir = cr / "rg-ii-parent-raw-runs"
+        raw_dir.mkdir()
+        (raw_dir / "leg.json.raw").write_text(json.dumps({"engine_version": "0.0.0"}))
+        got = run_gate(cr, Path(tmp_ii), {})
+        if not any("not in the closed LEGACY_RAW_NONJSON list" in g for g in got):
+            failures.append(f"self-test FAILED: rule (g) i/ii: a non-allowlisted .json.raw payload was not caught: {got}")
+
+    # (vii) a v1 leg (no `leg_schema_version` at all) under a schema_version:
+    # 1 parent -> unchanged behaviour: rule (g) finds nothing, only rules
+    # (a)-(f) apply, exactly as before this rule existed.
+    with tempfile.TemporaryDirectory() as tmp_vii:
+        cr, root = _rule_g_fixture(Path(tmp_vii))
+        parent = {
+            "schema_version": 1, "git_sha": root, "box": "a100-fixture",
+            "producer": {
+                "path": "ci/scripts/perf/proof_artifact.py", "kind": "script",
+                "invocation": "python3 ci/scripts/perf/proof_artifact.py <out> <tag>", "gating": "none",
+            },
+            "status": "GREEN",
+        }
+        (cr / "rg-vii-parent.json").write_text(json.dumps(parent))
+        raw_dir = cr / "rg-vii-parent-raw-runs"
+        raw_dir.mkdir()
+        v1_leg = {"tiers": {"finetune_step": {"seed": 1}}, "schema_version": 1, "git_sha": root, "box": "x", "producer": _none_producer(), "status": "GREEN"}
+        (raw_dir / "leg.json").write_text(json.dumps(v1_leg))
+        got = run_gate(cr, Path(tmp_vii), {"rg-vii-parent-raw-runs/leg.json": "v1 control, allowlisted for this fixture only"})
+        if any("leg_schema_version" in g or "identity" in g for g in got):
+            failures.append(f"self-test FAILED: rule (g) vii: a v1 leg under a v1 parent triggered rule (g) findings unexpectedly: {got}")
+
+    # (viii) allowlisted `kind: none` relpath whose first-introduction commit
+    # is AFTER the (fixture) gate-introduction sha -> RED. A GREEN control
+    # (introduced BEFORE) must pass.
+    with tempfile.TemporaryDirectory() as tmp_viii:
+        cr, gate_sha = _rule_g_fixture(Path(tmp_viii))
+        # `git log --follow`'s rename detection is CONTENT-similarity based
+        # (needed for real `git mv`-tracked baselines, contract C8.2/C8.3).
+        # A single-line, LOW-ENTROPY body (shared JSON key/value boilerplate,
+        # or even a long run of one repeated padding character) can hash-
+        # similar enough for git to treat the second file as a rename of the
+        # first regardless of intent — confirmed empirically: single-line
+        # bodies differing only by a repeated-character suffix (`"p"*400` vs
+        # `"n"*400`) STILL cross-attributed under git 2.50. Multi-line,
+        # varied-word bodies do not.
+        (cr / "pre-existing.json").write_text(
+            "line one alpha bravo charlie\nline two delta echo foxtrot\nline three golf hotel india\n"
+        )
+        _run(["git", "add", "-A"], Path(tmp_viii))
+        _run(["git", "commit", "-q", "-m", "pre-existing artifact, then the gate lands"], Path(tmp_viii))
+        gate_sha2 = _run(["git", "rev-parse", "HEAD"], Path(tmp_viii)).stdout.strip()
+
+        (cr / "new-after-gate.json").write_text(
+            "totally unrelated juliet kilo lima\nmike november oscar papa quebec\nromeo sierra tango uniform victor\n"
+        )
+        _run(["git", "add", "-A"], Path(tmp_viii))
+        _run(["git", "commit", "-q", "-m", "a NEW artifact, introduced after the fixture gate sha"], Path(tmp_viii))
+
+        got_control = check_none_allowlist_history(
+            "pre-existing.json", cr, Path(tmp_viii), gate_introduction_sha=gate_sha2
+        )
+        if got_control:
+            failures.append(f"self-test FAILED: rule (f) history GREEN control: a legitimately pre-gate artifact was flagged: {got_control}")
+
+        got_red = check_none_allowlist_history(
+            "new-after-gate.json", cr, Path(tmp_viii), gate_introduction_sha=gate_sha2
+        )
+        if not any("is NOT an ancestor of this gate's own introduction" in g for g in got_red):
+            failures.append(f"self-test FAILED: rule (f) history: a post-gate-introduction allowlist entry was not caught: {got_red}")
+
+    # LEGACY_RAW_NONJSON's own shrink-only closure: every listed relpath
+    # must exist on disk under the REAL cuda-runs dir.
+    real_missing = check_legacy_raw_nonjson_files_exist(CUDA_RUNS_DIR)
+    if real_missing:
+        failures.append(f"self-test FAILED: LEGACY_RAW_NONJSON lists a relpath that does not exist on disk: {real_missing}")
+
     # Shallow-checkout detection — a GENUINE `git clone --depth 1` (not a
     # simulated flag), proving `is_shallow_repository` tells a shallow
     # checkout apart from a normal one, and that `run_gate` raises ONE
@@ -924,11 +1767,16 @@ def self_test() -> int:
         "merged_as/merged_via_pr pairing), (b) producer.path existence+tracking, (c) cargo-test "
         "static gating verification (#[ignore]/env:VAR/required-features), (d) ancestry (both the "
         "plain git_sha path and the merged_as squash-landing rescue, and its own non-ancestor RED "
-        "case), (e) README producer tracking, and (f) the none-allowlist closure all bite on a "
-        "throwaway fixture repo; GREEN controls (ignore/env/required-features/merged_as-rescue) "
-        "plus one allow-listed none control stay clean; and a GENUINE `git clone --depth 1` fixture "
-        "proves is_shallow_repository tells shallow from normal apart and run_gate raises the one "
-        "explicit shallow-checkout ArtifactError instead of N false per-file ancestry findings."
+        "case), (e) README producer tracking, and (f) the none-allowlist closure (including its "
+        "C8.3 first-introduction-predates-the-gate history check) all bite on a throwaway fixture "
+        "repo; GREEN controls (ignore/env/required-features/merged_as-rescue) plus one allow-listed "
+        "none control stay clean; rule (g) v2-leg identity (missing NonNull/NullMeans fields, a "
+        "present-null NullMeans pass, the build_sha/git_rev cross-check on both mismatch and "
+        "unknown/-dirty, the folded-leg-must-carry-no-identity-of-its-own rule, the LEGACY_RAW_NONJSON "
+        "closed-list rename-bypass rejection, and a v1 leg's unchanged no-op) all bite too; and a "
+        "GENUINE `git clone --depth 1` fixture proves is_shallow_repository tells shallow from normal "
+        "apart and run_gate raises the one explicit shallow-checkout ArtifactError instead of N false "
+        "per-file ancestry findings."
     )
     return 0
 

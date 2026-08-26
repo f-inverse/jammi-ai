@@ -77,13 +77,27 @@ _KNOWN_FILES = {
     "torch_finetune_step.py": REPO_ROOT / "crates" / "jammi-bench" / "reference" / "torch_finetune_step.py",
 }
 
-# The two roots this advisory names, both searched recursively for every
-# file (not just `.py`/`.json` -- a `.md` doc citation is just as resolvable
+# The roots this advisory names, all searched recursively for every file
+# (not just `.py`/`.json` -- a `.md` doc citation is just as resolvable
 # and just as capable of going stale, see README.md's own citation this
 # round fixed).
+#
+# Unification contract C8.4/NF15: `crates/jammi-kernels/artifacts/cuda-runs`
+# joined this tuple in phase 2, the same PR that `git mv`s the two
+# `finetune_step_reference.json`/`p1_softmax_scale_fold_ab.json` baselines
+# OUT of `crates/jammi-bench/baselines/` and into this directory (contract
+# C8) -- without this addition, the moved p1 record's own two citations of
+# finetune_step.rs's batched-forward concatenation call site (see that
+# record's own `_comment`) would silently drop OUT of this script's coverage
+# the moment the move landed (a citation this script used to check would
+# simply never be visited again, not a citation that fails loudly), which is
+# precisely the "coverage regression" pressure-v2 pin H / NF15 named. (This
+# comment deliberately avoids spelling out a bare `file.rs:N` citation of its
+# own -- this script scans `ci/scripts/perf/**`, itself included.)
 _SEARCH_ROOTS = (
     REPO_ROOT / "crates" / "jammi-bench",
     REPO_ROOT / "ci" / "scripts" / "perf",
+    REPO_ROOT / "crates" / "jammi-kernels" / "artifacts" / "cuda-runs",
 )
 
 # A known filename, a colon, and a line number -- optionally wrapped in a

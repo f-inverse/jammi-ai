@@ -77,8 +77,8 @@ jobs:
           base="origin/${{ github.base_ref }}"
           changed="$(git diff --name-only "$base"...HEAD -- \
             ':(glob).claude/agents/*.md' \
-            ':(glob)ci/scripts/check_*.py' \
-            ':(glob)ci/scripts/check_*.sh' \
+            ':(glob)ci/scripts/**/check_*.py' \
+            ':(glob)ci/scripts/**/check_*.sh' \
             '.claude/settings.json' \
             ':(glob).claude/evals/**' \
             ':(glob).claude/hooks/**' \

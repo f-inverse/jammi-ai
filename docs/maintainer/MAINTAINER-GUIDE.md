@@ -1838,10 +1838,14 @@ staleness→recompute loop — that is the platform's, not the engine's
 ### 2.6a Fused training kernels (`jammi-kernels`)
 
 Companion guides: `docs/maintainer/cuda-kernel-guide.md` (writing and proving a
-kernel: roofline method, the oracle rules, the benchmarking protocol) and
+kernel: roofline method, the oracle rules, the benchmarking protocol),
 `docs/maintainer/fine-tune-performance-guide.md` (the fine-tune performance track
 end to end: the tape-tax diagnosis, each lever's design and measured effect, bf16
-rounding placement, the esc-045 metric finding, and the measurement checklists).
+rounding placement, the esc-045 metric finding, and the measurement checklists),
+and `docs/maintainer/pod-build-guide.md` (the ops manual for the pod build
+substrate every lever above was measured on: seed/clone/push-stamp/timing-lock
+procedures, exact commands and failure recovery, and the tree-state invariant
+catalogue `test_pod_substrate.sh` pins).
 
 **The model.** `crates/jammi-kernels` is a leaf crate: `candle-core`/`candle-nn`
 (+ `half`, `libm`, `thiserror`, `tracing`) only, no `jammi-*` dependency, names no

@@ -275,6 +275,38 @@ fn git(dir: &Path, args: &[&str]) {
     );
 }
 
+/// Same as `git`, but returns trimmed stdout — for the handful of new
+/// git-state fixtures below that need the resulting sha (`rev-parse HEAD`),
+/// not just success/failure.
+fn git_capture(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap_or_else(|e| panic!("spawn git {args:?} in {}: {e}", dir.display()));
+    assert!(
+        out.status.success(),
+        "git {args:?} failed in {}: stderr={}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// `git commit` with a fixed, deterministic identity (this suite never
+/// depends on the ambient environment having `user.email`/`user.name`
+/// configured — several CI images intentionally don't).
+fn git_commit(dir: &Path, args: &[&str]) {
+    let mut full = vec![
+        "-c",
+        "user.email=probe@example.com",
+        "-c",
+        "user.name=probe",
+    ];
+    full.extend_from_slice(args);
+    git(dir, &full);
+}
+
 /// Build AND run the probe crate's `probe` binary, returning its stdout.
 /// `--offline`: zero dependencies means this never legitimately needs the
 /// network, so this stays hermetic even off a real network. A dedicated
@@ -304,6 +336,39 @@ fn cargo_run_probe(root: &Path, extra_env: &[(&str, &str)]) -> String {
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// Runs `cargo build -v --offline` for the probe crate at `root` and reports
+/// whether the verbose transcript shows cargo actually INVOKING the compiled
+/// build-script binary (`Running \`.../build-script-build\``) — the one
+/// cargo-verbose signal that distinguishes "the script reran" from "cargo
+/// reused the cached `cargo:rustc-env` output from a prior run" (empirically
+/// confirmed: a build script watching an unchanged file prints this line on
+/// the first build and NOT on an unchanged second build; the false-positive
+/// direction — printing it on every build — is what state (b)'s
+/// nonexistent-loose-ref window causes, and is a documented cost, not a
+/// correctness bug; see `packed_ref_repo_still_tracks_the_next_commit`).
+fn cargo_build_verbose_ran_build_script(root: &Path) -> bool {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let out = Command::new(cargo)
+        .args(["build", "-v", "--offline"])
+        .current_dir(root.join("crates").join("probe"))
+        .env("CARGO_TARGET_DIR", root.join("target"))
+        .env_remove("JAMMI_BUILD_SHA")
+        .output()
+        .unwrap_or_else(|e| panic!("spawn cargo build -v for the probe crate: {e}"));
+    assert!(
+        out.status.success(),
+        "cargo build -v (probe crate) failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    combined.contains("build-script-build`")
 }
 
 fn parse_field(output: &str, key: &str) -> String {
@@ -416,5 +481,336 @@ fn deadbeef_env_var_falls_through_to_unknown_when_git_is_unavailable() {
         sha, "unknown",
         "JAMMI_BUILD_SHA=deadbeef (8 chars, not 40-hex) must fall through the env-var shape \
          check, and with no git available at all must resolve to the literal \"unknown\""
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Unification contract §6 F3, class closure (esc: `.github/workflows/ci.yml`
+// run 32995714545 — build-sha hermeticity leg RED). The class is "git states
+// in which a new commit changes none of build.rs's rerun-if-changed targets
+// (or changes them in a way cargo does not see)". Each state below is a
+// fixture pinning WHAT build.rs watches and WHAT a commit in that state
+// actually moves; `ci.yml`'s own F3 leg reproduces state (a) for real (the
+// one state that needs an actual `actions/checkout` clone, per that step's
+// own comment), the rest are covered here as fast local regression tests.
+//
+//   (a) detached HEAD        — `detached_head_commit_moves_baked_sha_and_forces_rerun`
+//   (b) packed refs          — `packed_ref_repo_still_tracks_the_next_commit`
+//   (c) linked worktree      — `linked_worktree_commit_moves_baked_sha_and_forces_rerun`
+//   (d) commit outside watch — `commit_outside_watched_roots_still_moves_baked_sha`
+//   (e) amend                — `amend_moves_baked_sha_and_forces_rerun` (a
+//       rebase ends the same way: a sequence of resets/commits that leaves
+//       HEAD/the branch ref pointing at a new sha — mechanically identical
+//       to what amend exercises here, so it is not duplicated as a third
+//       near-identical integration test)
+//   (f) mtime granularity    — engineered in `ci.yml`'s F3 step via `sleep 1`
+//       between reading `A` and the commit (a filesystem-clock property, not
+//       a `build.rs` decision, so there is no local `#[test]` for it — see
+//       that step's own comment)
+//   (g) stale-source reuse   — ruled out STRUCTURALLY by every test in this
+//       block asserting the exact rebuilt VALUE (not just "it changed") and
+//       by `build.rs::git_build_sha` never reading a ref FILE's bytes as its
+//       sha source (only `git rev-parse HEAD`, live, every build) — a
+//       regression to "bake whatever the ref file's content looked like"
+//       would fail every `_and_forces_rerun` assertion below on the exact
+//       resulting sha, not merely on whether a rebuild happened
+//
+// Must-still-count (the leg's other half):
+// `clean_rebuild_with_no_git_change_does_not_rerun_build_script` pins that a
+// rebuild with NOTHING changed must NOT rerun `build.rs` at all.
+// ---------------------------------------------------------------------------
+
+/// State (a): `actions/checkout@v4` leaves a CI job's clone in a DETACHED
+/// HEAD — `.git/HEAD` holds a bare sha directly, there is no branch ref file
+/// to watch instead (`build.rs`'s own module doc names this exact state).
+/// This is the LOCAL proxy for `ci.yml`'s own F3 step (a fast scratch repo,
+/// not a real `actions/checkout` clone) — the mutation-check vehicle: make
+/// `build.rs` stop watching `.git/HEAD` and this test goes red.
+#[test]
+fn detached_head_commit_moves_baked_sha_and_forces_rerun() {
+    let tmp = tempfile::tempdir().expect("create scratch workspace");
+    let root = tmp.path();
+    scaffold_probe_crate(root);
+    git(root, &["init", "--quiet", "-b", "main"]);
+    git_commit(root, &["add", "-A"]);
+    git_commit(root, &["commit", "--quiet", "-m", "initial"]);
+    let first_head = git_capture(root, &["rev-parse", "HEAD"]);
+
+    git(root, &["checkout", "--quiet", "--detach", &first_head]);
+    let symref = Command::new("git")
+        .args(["symbolic-ref", "-q", "HEAD"])
+        .current_dir(root)
+        .output()
+        .expect("spawn git symbolic-ref");
+    assert!(
+        !symref.status.success(),
+        "HEAD must be detached (no symbolic ref) for this fixture to mean anything"
+    );
+
+    let baseline = cargo_run_probe(root, &[]);
+    let baseline_sha = parse_field(&baseline, "JAMMI_BUILD_SHA");
+    assert_eq!(
+        baseline_sha, first_head,
+        "a detached-HEAD build must resolve the checked-out commit's own sha"
+    );
+
+    // The exact ci.yml F3-leg move: a real commit while detached rewrites
+    // `.git/HEAD` ITSELF (no branch ref exists to watch instead).
+    git_commit(
+        root,
+        &["commit", "--quiet", "--allow-empty", "-m", "detached probe"],
+    );
+    let new_head = git_capture(root, &["rev-parse", "HEAD"]);
+    assert_ne!(new_head, first_head, "fixture invalid: HEAD did not move");
+
+    let rebuilt = cargo_run_probe(root, &[]);
+    let rebuilt_sha = parse_field(&rebuilt, "JAMMI_BUILD_SHA");
+    assert_eq!(
+        rebuilt_sha.trim_end_matches("-dirty"),
+        new_head,
+        "a real commit in a DETACHED HEAD state — the exact state ci.yml's F3 leg's own CI \
+         checkout is in — must move the baked sha to the new HEAD"
+    );
+}
+
+/// State (b): `.git/refs/heads/<branch>` is absent (folded into
+/// `.git/packed-refs`) until a commit writes a fresh loose ref. Cargo's own
+/// `rerun-if-changed` fingerprint treats a WATCHED PATH THAT DOES NOT EXIST
+/// as always-stale (confirmed empirically against real cargo, not assumed:
+/// a build script watching a nonexistent path reruns on every subsequent
+/// build, never caching "clean") — so a packed branch ref is naturally safe
+/// by construction: worst case it reruns `build.rs` more than strictly
+/// necessary, never less. This test pins that BOTH halves hold: packing
+/// alone changes nothing, and a commit landing on a previously-packed branch
+/// still forces the sha forward.
+#[test]
+fn packed_ref_repo_still_tracks_the_next_commit() {
+    let tmp = tempfile::tempdir().expect("create scratch workspace");
+    let root = tmp.path();
+    scaffold_probe_crate(root);
+    git(root, &["init", "--quiet", "-b", "main"]);
+    git_commit(root, &["add", "-A"]);
+    git_commit(root, &["commit", "--quiet", "-m", "initial"]);
+
+    let baseline = cargo_run_probe(root, &[]);
+    let baseline_sha = parse_field(&baseline, "JAMMI_BUILD_SHA");
+
+    git(root, &["pack-refs", "--all", "--prune"]);
+    let loose_ref = root.join(".git").join("refs").join("heads").join("main");
+    assert!(
+        !loose_ref.exists(),
+        "fixture invalid: pack-refs --prune should have removed the loose ref file at {}",
+        loose_ref.display()
+    );
+
+    let after_pack = cargo_run_probe(root, &[]);
+    assert_eq!(
+        parse_field(&after_pack, "JAMMI_BUILD_SHA"),
+        baseline_sha,
+        "packing refs alone (no content change) must not change the resolved sha"
+    );
+
+    git_commit(
+        root,
+        &["commit", "--quiet", "--allow-empty", "-m", "second"],
+    );
+    let new_head = git_capture(root, &["rev-parse", "HEAD"]);
+    assert!(
+        loose_ref.exists(),
+        "fixture invalid: a commit on a packed branch must (re)create the loose ref file"
+    );
+
+    let rebuilt = cargo_run_probe(root, &[]);
+    let rebuilt_sha = parse_field(&rebuilt, "JAMMI_BUILD_SHA");
+    assert_eq!(
+        rebuilt_sha.trim_end_matches("-dirty"),
+        new_head,
+        "a commit on a previously-packed branch must still move the baked sha to the new HEAD"
+    );
+}
+
+/// State (c): a linked worktree (`.git` is a FILE, not a directory —
+/// `build.rs`'s module doc names this exact shape, citing `fa2_ab.sh:5`; the
+/// agent-worktree layout this very repo uses for parallel work is this
+/// state, checked out on a NEW branch rather than detached). Confirms
+/// `git rev-parse --git-path HEAD` resolves the worktree's OWN private
+/// `HEAD` (so a commit made INSIDE the worktree is seen) while
+/// `--git-path refs/heads/<branch>` still resolves into the SHARED main
+/// repo's `.git` dir (branch refs are not per-worktree) — both paths are
+/// real, existing files cargo can watch either way.
+#[test]
+fn linked_worktree_commit_moves_baked_sha_and_forces_rerun() {
+    let tmp = tempfile::tempdir().expect("create scratch workspace");
+    let root = tmp.path().join("main");
+    fs::create_dir_all(&root).expect("mkdir main checkout");
+    scaffold_probe_crate(&root);
+    git(&root, &["init", "--quiet", "-b", "main"]);
+    git_commit(&root, &["add", "-A"]);
+    git_commit(&root, &["commit", "--quiet", "-m", "initial"]);
+
+    let baseline = cargo_run_probe(&root, &[]);
+    let baseline_sha = parse_field(&baseline, "JAMMI_BUILD_SHA");
+    assert!(!baseline_sha.ends_with("-dirty"));
+
+    let worktree = tmp.path().join("wt");
+    git(
+        &root,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "probe-wt",
+            worktree.to_str().expect("worktree path is valid utf-8"),
+        ],
+    );
+    let dot_git = worktree.join(".git");
+    assert!(
+        dot_git.is_file(),
+        "fixture invalid: `.git` inside a linked worktree must be a FILE (pointer), not a \
+         directory — got a non-file at {}",
+        dot_git.display()
+    );
+
+    let wt_baseline = cargo_run_probe(&worktree, &[]);
+    let wt_baseline_sha = parse_field(&wt_baseline, "JAMMI_BUILD_SHA");
+    assert_eq!(
+        wt_baseline_sha, baseline_sha,
+        "a fresh linked-worktree build must resolve the SAME HEAD sha as the checkout it was \
+         created from"
+    );
+
+    git_commit(
+        &worktree,
+        &[
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "second (worktree)",
+        ],
+    );
+    let new_head = git_capture(&worktree, &["rev-parse", "HEAD"]);
+
+    let wt_rebuilt = cargo_run_probe(&worktree, &[]);
+    let wt_rebuilt_sha = parse_field(&wt_rebuilt, "JAMMI_BUILD_SHA");
+    assert_eq!(
+        wt_rebuilt_sha.trim_end_matches("-dirty"),
+        new_head,
+        "a commit made INSIDE a linked worktree must move THAT worktree's own baked sha to its \
+         own new HEAD — `--git-path HEAD` must resolve the worktree-private HEAD, not the main \
+         checkout's"
+    );
+}
+
+/// State (d): a commit that touches ONLY a file outside the dirtiness
+/// query's own pathspec (`:/crates`, `:/Cargo.lock`, `:/Cargo.toml`) must
+/// still move the baked sha — the sha-tracking watch (`.git/HEAD` + branch
+/// ref) is a separate mechanism from the dirtiness query, not gated by it.
+#[test]
+fn commit_outside_watched_roots_still_moves_baked_sha() {
+    let tmp = tempfile::tempdir().expect("create scratch workspace");
+    let root = tmp.path();
+    scaffold_probe_crate(root);
+    fs::write(root.join("NOTES.md"), "v1\n").expect("write NOTES.md");
+    git(root, &["init", "--quiet", "-b", "main"]);
+    git_commit(root, &["add", "-A"]);
+    git_commit(root, &["commit", "--quiet", "-m", "initial"]);
+
+    let baseline = cargo_run_probe(root, &[]);
+    let baseline_sha = parse_field(&baseline, "JAMMI_BUILD_SHA");
+    assert!(!baseline_sha.ends_with("-dirty"));
+
+    // A commit to NOTES.md ONLY — outside crates/Cargo.lock/Cargo.toml, so
+    // the dirtiness QUERY's own pathspec never sees it either.
+    fs::write(root.join("NOTES.md"), "v2\n").expect("edit NOTES.md");
+    git_commit(root, &["add", "NOTES.md"]);
+    git_commit(root, &["commit", "--quiet", "-m", "notes v2"]);
+    let new_head = git_capture(root, &["rev-parse", "HEAD"]);
+
+    let rebuilt = cargo_run_probe(root, &[]);
+    let rebuilt_sha = parse_field(&rebuilt, "JAMMI_BUILD_SHA");
+    assert!(
+        !rebuilt_sha.ends_with("-dirty"),
+        "committing NOTES.md leaves crates/Cargo.lock/Cargo.toml clean, so this must NOT be \
+         dirty: {rebuilt_sha:?}"
+    );
+    assert_eq!(
+        rebuilt_sha, new_head,
+        "a commit that touches ONLY files outside the watched crates/Cargo.lock/Cargo.toml \
+         roots must still move the baked sha — the branch-ref watch is independent of the \
+         dirtiness pathspec"
+    );
+}
+
+/// State (e): `git commit --amend` rewrites the branch ref to a NEW commit
+/// object (a different sha even when the tree is unchanged, since the
+/// message/timestamp differ) without going through an ordinary fast-forward
+/// commit. A `rebase` ends the same way (HEAD/the branch ref pointing at a
+/// new sha via a sequence of resets/commits) — mechanically identical from
+/// `build.rs`'s perspective, so it is not exercised as a separate test.
+#[test]
+fn amend_moves_baked_sha_and_forces_rerun() {
+    let tmp = tempfile::tempdir().expect("create scratch workspace");
+    let root = tmp.path();
+    scaffold_probe_crate(root);
+    git(root, &["init", "--quiet", "-b", "main"]);
+    git_commit(root, &["add", "-A"]);
+    git_commit(root, &["commit", "--quiet", "-m", "initial"]);
+
+    let baseline = cargo_run_probe(root, &[]);
+    let baseline_sha = parse_field(&baseline, "JAMMI_BUILD_SHA");
+
+    git_commit(
+        root,
+        &[
+            "commit",
+            "--quiet",
+            "--amend",
+            "--allow-empty",
+            "-m",
+            "amended",
+        ],
+    );
+    let new_head = git_capture(root, &["rev-parse", "HEAD"]);
+    assert_ne!(
+        new_head,
+        baseline_sha.trim_end_matches("-dirty"),
+        "fixture invalid: amend must produce a different commit object"
+    );
+
+    let rebuilt = cargo_run_probe(root, &[]);
+    let rebuilt_sha = parse_field(&rebuilt, "JAMMI_BUILD_SHA");
+    assert_eq!(
+        rebuilt_sha.trim_end_matches("-dirty"),
+        new_head,
+        "amending the last commit must move the baked sha to the amended HEAD"
+    );
+}
+
+/// Must-still-count — the F3 leg's other half: a clean rebuild with no
+/// commit and no tracked-file edit must NOT rerun `build.rs` at all.
+/// Distinguished from "reused the same cached VALUE" (which a broken
+/// build.rs that recomputed but happened to get the same answer would also
+/// pass) by observing cargo's own verbose transcript for the literal
+/// `Running \`.../build-script-build\`` line.
+#[test]
+fn clean_rebuild_with_no_git_change_does_not_rerun_build_script() {
+    let tmp = tempfile::tempdir().expect("create scratch workspace");
+    let root = tmp.path();
+    scaffold_probe_crate(root);
+    git(root, &["init", "--quiet", "-b", "main"]);
+    git_commit(root, &["add", "-A"]);
+    git_commit(root, &["commit", "--quiet", "-m", "initial"]);
+
+    assert!(
+        cargo_build_verbose_ran_build_script(root),
+        "the FIRST build of a fresh crate must invoke the build script"
+    );
+    assert!(
+        !cargo_build_verbose_ran_build_script(root),
+        "a rebuild with NOTHING changed (no commit, no tracked-file edit) must NOT rerun \
+         build.rs — cargo must reuse the cached JAMMI_BUILD_SHA/TARGET/PROFILE from the prior \
+         run"
     );
 }

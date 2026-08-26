@@ -650,6 +650,16 @@ jobs:
           - name: CUDA run artifact schema
             cmd: python3 ci/scripts/check_cuda_run_artifacts.py
             fetch_depth: "0"
+          # Mocks-only, no-network regression suite for the 2026-08-25
+          # gpu-dev pod-lifecycle incident (ledger rows 279-289): a read-only
+          # subcommand's require_pod failure must never issue podTerminate,
+          # `up` refuses a session alias that already has a recorded pod
+          # unless --replace, `down` only terminates a pod that verifies
+          # against the account's own live pod list, and rp_sweep honours a
+          # `-hold` marker. See ci/scripts/test_gpu_dev_lifecycle.sh's own
+          # module doc.
+          - name: gpu-dev lifecycle safety
+            cmd: bash ci/scripts/test_gpu_dev_lifecycle.sh
           # Completeness tripwire for this very guard class: every
           # ci/scripts/check_*.py|.sh gate script must be referenced by at
           # least one workflow (this file included), so a new check script

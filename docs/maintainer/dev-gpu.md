@@ -122,6 +122,37 @@ reading.
 again. A `--ref` that names a ref the live pod is **not** on is an error rather
 than a silently ignored flag; naming the ref it is already on is a no-op.
 
+### `up` refuses a session alias that already has a recorded pod
+
+If a session alias already has a recorded pod id — even one that failed to
+answer SSH (reaped, mid-reboot, or a *different* process's `up` on the same
+alias winning a race) — `up` refuses outright (exit 2) rather than silently
+deploying a second pod and overwriting the local record of whichever pod is
+real:
+
+```
+$ ci/scripts/gpu-dev.sh up a100
+::error::session 'a100' already has a recorded pod (…) that did not answer SSH.
+::error::refusing to silently replace it. Inspect it: gpu-dev.sh ls
+::error::once you are sure it should be replaced: gpu-dev.sh up a100 --replace
+```
+
+`--replace` overwrites only the *local* record so a new pod can be deployed
+under the alias; it never terminates the old one — run `down` first if it
+should be. This, together with the check below, is what closed the
+2026-08-25 incident where an agent's `up`/`down` under an existing alias
+terminated an unrelated stale pod.
+
+### `down` verifies before it terminates
+
+`down` never trusts the locally-recorded pod id on its own. Before issuing a
+terminate, it confirms the id is **both** still present in the account's own
+live pod list **and** still carries this session's own name (its
+`<prefix>-ttl<H>`, held or not) — a mismatch refuses rather than acts, and the
+local session record is forgotten either way (the pod itself, if it still
+exists under a different session's name, is left running for that session to
+manage).
+
 ## Reproducing the shipped runtime image
 
 The **runtime** image (e.g. for the uid-65532 JIT-cache case in #305) is not the
@@ -195,10 +226,16 @@ Three guards, in order of when they act:
 
 2. **A deadline armed inside the pod's own entrypoint**, before the container
    does anything else — including its package install, which reaches the network
-   and could hang. Every pod self-terminates after `RP_TTL_HOURS` (default 8; the
-   CI prove lane uses 3). It deliberately is *not* installed over SSH: the gap
-   between "pod rented" and "pod reachable" is minutes long, and that gap is
-   where the orphan above was created.
+   and could hang. Every pod self-terminates after `RP_TTL_HOURS`. The default
+   depends on the caller: `runpod_lib.sh` itself defaults to 8h (`shell`, and
+   any other throwaway pod); the CI prove lane sets its own 3h; `gpu-dev.sh up`
+   alone raises the default to `RP_DEV_TTL_HOURS` (72h) when `RP_TTL_HOURS` is
+   not set explicitly, because a dev session someone is actively using is
+   meant to survive a workday, not die at the throwaway-pod default (an 8h
+   ceiling killed every dev pod overnight on 2026-08-25). An explicit
+   `RP_TTL_HOURS` always wins over either default. It deliberately is *not*
+   installed over SSH: the gap between "pod rented" and "pod reachable" is
+   minutes long, and that gap is where the orphan above was created.
 
    It terminates via `runpodctl remove pod $RUNPOD_POD_ID`. RunPod special-cases
    self-removal, so this succeeds in our custom image with no config file and
@@ -231,6 +268,27 @@ Three guards, in order of when they act:
    unparseable deadline, or a stopped pod is swept. And a sweep that cannot
    *reach* RunPod fails loudly rather than reporting "nothing to clean up".
 
+   **Pausing the sweep for a specific pod** — a measurement you need to keep
+   running past its own deadline's *sweep window* without disabling the sweep
+   for everyone else:
+
+   ```bash
+   ci/scripts/gpu-dev.sh hold a100      # sweep skips this pod
+   ci/scripts/gpu-dev.sh unhold a100    # sweep judges it again
+   ```
+
+   `hold` renames the pod on RunPod's own side to append `-hold` — the only
+   account-visible field a *stateless* cron sweep, with no access to this
+   machine's session directory, can actually see. `reap` skips any pod whose
+   name carries that marker, with a `::warning::` so a held pod is never
+   silently invisible in the sweep's own log.
+
+   **`hold` does not touch `RP_TTL_HOURS` or the in-pod watchdog.** The
+   deadline baked into the pod's entrypoint at deploy time fires on schedule
+   regardless — a held pod left forever still bills only until *that*
+   deadline, never past it. `hold` pauses the *external* sweep backstop, not
+   the pod's own self-termination.
+
 Guard 2 needs the network at deadline time; guard 3 needs this repo's CI to be
 running. They fail for unrelated reasons, which is the point of having both.
 
@@ -238,10 +296,12 @@ Guards 2 and 3 are **wall-clock ceilings, not idle detection** — a pod you sto
 using bills until its deadline. Run `down` when you're finished; the guards are
 for the times something kills the process before you can.
 
-Lower the ceiling when you know the work is short:
+Lower the ceiling when you know the work is short, or raise it past `up`'s own
+72h dev default for something that genuinely needs longer:
 
 ```bash
-RP_TTL_HOURS=2 ci/scripts/gpu-dev.sh up a100
+RP_TTL_HOURS=2  ci/scripts/gpu-dev.sh up a100   # a quick check
+RP_TTL_HOURS=96 ci/scripts/gpu-dev.sh up a100   # a longer measurement
 ```
 
 ### `RP_TIMEOUT` is not a fourth guard

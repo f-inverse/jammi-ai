@@ -15,23 +15,39 @@
 # See `docs/maintainer/dev-gpu.md`.
 #
 # Usage:
-#   gpu-dev.sh shell   [arch] [--ref R]    throwaway shell; pod dies on exit
-#   gpu-dev.sh up      [arch] [--ref R]    start a surviving session (name = arch)
-#   gpu-dev.sh attach  [session]           shell into a surviving session
-#   gpu-dev.sh run     [session] <cmd...>  run <cmd> detached under tmux
-#   gpu-dev.sh logs    [session]           tail the detached job's output
-#   gpu-dev.sh push    [session]           rsync your working tree TO the pod
-#   gpu-dev.sh pull    [session] <path>    rsync <path> back FROM the pod
-#   gpu-dev.sh down    [session]           terminate the pod, forget the session
-#   gpu-dev.sh ls                          list sessions
+#   gpu-dev.sh shell   [arch] [--ref R]     throwaway shell; pod dies on exit
+#   gpu-dev.sh up      [arch] [--ref R]     start a surviving session (name = arch)
+#                      [--replace]          replace an alias's existing record
+#   gpu-dev.sh attach  [session]            shell into a surviving session
+#   gpu-dev.sh run     [session] <cmd...>   run <cmd> detached under tmux
+#   gpu-dev.sh logs    [session]            tail the detached job's output
+#   gpu-dev.sh push    [session]            rsync your working tree TO the pod
+#   gpu-dev.sh pull    [session] <path>     rsync <path> back FROM the pod
+#   gpu-dev.sh hold    [session]            pause the sweep for this pod
+#   gpu-dev.sh unhold  [session]            resume normal sweep judgement
+#   gpu-dev.sh down    [session]            terminate the pod, forget the session
+#   gpu-dev.sh ls                           list sessions
 #
 # arch: a100 (default) | l40s | h100 | a40 | l4
 # --ref: branch, tag or commit the pod's checkout is placed on (default main).
 #        Verified against the remote BEFORE a pod is rented.
-# Env: RUNPOD_API_KEY (or ~/.config/runpod/key), RP_IMAGE, RP_TTL_HOURS (8),
+# --replace: `up` normally REFUSES to touch a session alias that already has a
+#        recorded pod id — even one that failed to answer SSH — rather than
+#        silently deploying a second pod under the same alias (that is how an
+#        unrelated stale pod got terminated on 2026-08-25). --replace opts in
+#        to overwriting the LOCAL record only; it does not terminate the old
+#        pod (`down` it first if it should be).
+# Env: RUNPOD_API_KEY (or ~/.config/runpod/key), RP_IMAGE,
+#      RP_TTL_HOURS (default 8 for `shell`; CI's own lanes use 3/8 — see
+#      runpod_gpu_prove.sh), RP_DEV_TTL_HOURS (default 72 — the deadline `up`
+#      alone uses when RP_TTL_HOURS is not set explicitly: a dev session is
+#      meant to survive a workday, not die at the throwaway-pod default),
 #      RP_DISK_GB (60), RP_VOLUME_GB (0). Disk sizing rule of thumb: roughly
 #      25 GB base + 3 GB per concurrent agent target dir + 2 GB per
 #      `cargo mutants` job — a mutation-testing session wants >= 120 GB.
+#      `hold` does NOT change RP_TTL_HOURS or the in-pod watchdog deadline —
+#      it only pauses `reap`'s automatic sweep; the pod still self-terminates
+#      on its original schedule unless you also extend that another way.
 set -uo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -45,23 +61,37 @@ gpu-dev.sh — GPU development on RunPod
 
   shell   [arch] [--ref R]    throwaway shell; the pod dies when you exit
   up      [arch] [--ref R]    start a session whose pod SURVIVES disconnect
+          [--replace]         (default TTL 72h — see RP_DEV_TTL_HOURS below)
+                              refuses if the alias already has a recorded pod
+                              unless --replace is given (see --replace below)
   attach  [session]           join a surviving session's running job
                               (--shell for a plain prompt instead)
   run     [session] <cmd...>  run <cmd> detached under tmux
   logs    [session]           tail the detached job's output
   push    [session]           rsync your working tree TO the pod
   pull    [session] <path>    rsync <path> back FROM the pod
+  hold    [session]           pause `reap`'s sweep for this pod (does NOT
+                              change its in-pod deadline — see `unhold`)
+  unhold  [session]           resume normal sweep judgement for this pod
   down    [session]           terminate the pod, forget the session
   ls                          list sessions
   reap    [hours]             terminate orphaned pods past their own deadline
-                              ([hours] force-reaps everything older than that)
+                              ([hours] force-reaps everything older than that;
+                              a `hold`-marked pod is skipped either way)
 
 arch: a100 (default) | l40s | h100 | a40 | l4
 --ref R: branch, tag or commit for the pod's checkout (default main), checked
          against the remote before anything is rented. `up` does not move a live
          pod: `down` it first.
+--replace: `up` normally REFUSES (exit 2) a session alias that already has a
+         recorded pod id, even an unreachable one, rather than silently
+         deploying a second pod under the same alias. --replace overwrites only
+         the LOCAL record; it never terminates the old pod itself — `down` it
+         first if it should be.
 Sessions are named after the arch; RP_SESSION overrides.
-Env: RUNPOD_API_KEY (or ~/.config/runpod/key), RP_IMAGE, RP_TTL_HOURS (default 8),
+Env: RUNPOD_API_KEY (or ~/.config/runpod/key), RP_IMAGE,
+     RP_TTL_HOURS (default 8; explicit always wins), RP_DEV_TTL_HOURS (default
+     72 — what `up` alone falls back to when RP_TTL_HOURS is not set),
      RP_DISK_GB (default 60), RP_VOLUME_GB (default 0).
      Disk sizing rule of thumb: roughly 25 GB base + 3 GB per concurrent agent
      target dir + 2 GB per `cargo mutants` job — a mutation-testing session
@@ -101,6 +131,7 @@ esac
 # there would eat `cargo test -- --nocapture` alive.
 REF=main
 REF_EXPLICIT=0
+REPLACE=0
 case "$CMD" in
   shell|up)
     ARCH=""
@@ -113,6 +144,13 @@ case "$CMD" in
           REF="$2"; REF_EXPLICIT=1; shift 2 ;;
         --ref=*)
           REF="${1#--ref=}"; REF_EXPLICIT=1; shift ;;
+        # `--replace` only means something for `up` (it overwrites a session's
+        # LOCAL record — see the `up` case below); `shell` has no session to
+        # overwrite, so accepting it silently there would look like it did
+        # something. Reject it explicitly instead of ignoring it.
+        --replace)
+          [ "$CMD" = "up" ] || { echo "::error::--replace applies only to 'up' ($CMD has no session to replace)"; exit 2; }
+          REPLACE=1; shift ;;
         # Asking for help is not an error, and `up -h` is where someone reaches
         # when they have forgotten the flag they came to look up.
         -h|--help) usage 0 ;;
@@ -139,6 +177,20 @@ case "$CMD" in
   shell) : ;;
   *) export RP_SESSION="$SESSION" ;;
 esac
+
+# `up` sessions persist past the terminal and are the ones the 2026-08-25
+# incident hit: runpod_lib.sh's own RP_TTL_HOURS default (8h) is sized for a
+# throwaway `shell`/CI pod, not a dev session someone is actively using —
+# so a session rented at the default died at 8h no matter what. An explicit
+# RP_TTL_HOURS from the caller always wins (checked BEFORE runpod_lib.sh
+# applies its OWN "${RP_TTL_HOURS:-8}" default); only in its absence does `up`
+# alone raise the floor to RP_DEV_TTL_HOURS. `shell` and every CI lane
+# (runpod_gpu_prove.sh sets its own default before sourcing this file) are
+# untouched.
+if [ "$CMD" = "up" ] && [ -z "${RP_TTL_HOURS:-}" ]; then
+  RP_TTL_HOURS="${RP_DEV_TTL_HOURS:-72}"
+  export RP_TTL_HOURS
+fi
 
 # shellcheck source=ci/scripts/runpod_lib.sh
 source "$DIR/runpod_lib.sh"
@@ -213,34 +265,50 @@ case "$CMD" in
     ;;
 
   up)
-    if rp_session_load && rp_session_alive; then
-      # rp_keep FIRST: this pod belongs to a session that is already running, and
-      # every exit below must leave it alone.
-      rp_keep
-      echo "session '${SESSION}' already live on ${RP_HOST}:${RP_PORT} (pod ${RP_POD_ID}, ref ${RP_REF:-<none>})"
-      # `up` never moves a live pod. Reporting success on an ignored --ref would
-      # leave you reading results from one ref while believing they came from
-      # another — the exact failure this flag exists to remove.
-      if [ "$REF_EXPLICIT" = 1 ] && [ "$REF" != "${RP_REF:-}" ]; then
-        # `up` takes an ARCH, never a session name — they are only the same
-        # string until RP_SESSION overrides it. Suggesting a bare `up ${ARCH}`
-        # would then boot a DIFFERENT session than the `down` beside it, so the
-        # override is carried explicitly whenever there is one.
-        SESSION_ENV=""
-        [ "$SESSION" = "$ARCH" ] || SESSION_ENV="RP_SESSION=${SESSION} "
-        echo "::error::--ref ${REF} was IGNORED: the live pod is on '${RP_REF:-<none>}'"
-        echo "::error::to boot on ${REF}: $(basename "$0") down ${SESSION} && ${SESSION_ENV}$(basename "$0") ${CMD} ${ARCH} --ref ${REF}"
-        exit 1
+    if rp_session_load; then
+      if rp_session_alive; then
+        # rp_keep FIRST: this pod belongs to a session that is already running,
+        # and every exit below must leave it alone.
+        rp_keep
+        echo "session '${SESSION}' already live on ${RP_HOST}:${RP_PORT} (pod ${RP_POD_ID}, ref ${RP_REF:-<none>})"
+        # `up` never moves a live pod. Reporting success on an ignored --ref
+        # would leave you reading results from one ref while believing they
+        # came from another — the exact failure this flag exists to remove.
+        if [ "$REF_EXPLICIT" = 1 ] && [ "$REF" != "${RP_REF:-}" ]; then
+          # `up` takes an ARCH, never a session name — they are only the same
+          # string until RP_SESSION overrides it. Suggesting a bare `up ${ARCH}`
+          # would then boot a DIFFERENT session than the `down` beside it, so the
+          # override is carried explicitly whenever there is one.
+          SESSION_ENV=""
+          [ "$SESSION" = "$ARCH" ] || SESSION_ENV="RP_SESSION=${SESSION} "
+          echo "::error::--ref ${REF} was IGNORED: the live pod is on '${RP_REF:-<none>}'"
+          echo "::error::to boot on ${REF}: $(basename "$0") down ${SESSION} && ${SESSION_ENV}$(basename "$0") ${CMD} ${ARCH} --ref ${REF}"
+          exit 1
+        fi
+        echo "attach with: $(basename "$0") attach ${SESSION}"
+        exit 0
+      elif [ "$REPLACE" != "1" ]; then
+        # A recorded-but-unreachable pod is NOT proof the pod is gone — it can
+        # be reaped, mid-reboot, or (the 2026-08-25 incident) a DIFFERENT
+        # process's `up` on this same alias racing this one. Silently deploying
+        # a second pod here overwrites the local record of whichever pod is
+        # real, so the wrong one gets `down`ed later. Refuse instead: the
+        # operator decides, with the recorded pod in front of them.
+        echo "::error::session '${SESSION}' already has a recorded pod (${RP_POD_ID}, ${RP_HOST:-?}:${RP_PORT:-?}) that did not answer SSH."
+        echo "::error::it may be reaped, mid-reboot, or another process's — refusing to silently replace it."
+        echo "::error::inspect it first: $(basename "$0") ls   (or the RunPod console)"
+        echo "::error::once you are sure it should be replaced: $(basename "$0") up ${SESSION} --replace"
+        exit 2
+      else
+        echo "::warning::--replace: overwriting session '${SESSION}''s local record of pod ${RP_POD_ID} WITHOUT terminating it — run '$(basename "$0") down ${SESSION}' first if it should be terminated"
       fi
-      echo "attach with: $(basename "$0") attach ${SESSION}"
-      exit 0
     fi
     rp_ref_precheck "$REF" || exit 2
     # A recorded-but-dead pod (reaped, or a host that died) must not be carried
     # into the deploy — the EXIT trap would act on a stale id.
     RP_POD_ID=""
     rp_init
-    echo "=== provisioning ${ARCH} on ${REF} (image: ${RP_IMAGE}) ==="
+    echo "=== provisioning ${ARCH} on ${REF} (image: ${RP_IMAGE}, TTL: ${RP_TTL_HOURS}h) ==="
     rp_deploy_arch "$ARCH" || exit $?
     # No separate arming step: the ${RP_TTL_HOURS}h deadline is baked into the
     # pod's entrypoint at deploy, so it is already running.
@@ -250,6 +318,7 @@ case "$CMD" in
     rp_ssh_config_sync
     echo
     echo "=== session '${SESSION}' up on ${RP_HOST}:${RP_PORT} @ ${RP_REF:-<none>} (pod ${RP_POD_ID}) ==="
+    echo "    deadline: self-terminates in ${RP_TTL_HOURS}h unless you 'down' it first (RP_DEV_TTL_HOURS to change the default; 'hold' to pause the sweep, not the deadline)"
     echo "    ssh:     ssh -F ${RP_SSH_CONFIG} jammi-${SESSION}"
     echo "    attach:  $(basename "$0") attach ${SESSION}"
     echo "    run job: $(basename "$0") run ${SESSION} cargo test -p jammi-ai --features cuda,live-gpu-tests"
@@ -309,14 +378,58 @@ EOF
       && echo "=== pulled ${REMOTE} → .gpu-pull/ ==="
     ;;
 
+  hold)
+    require_pod; rp_keep
+    # Renamed FROM the account's own current name, never from a locally
+    # guessed one (a session recorded before RP_TTL_HOURS was tracked in the
+    # session file would guess wrong) — see rp_pod_current_name in
+    # runpod_lib.sh. Does NOT touch RP_TTL_HOURS or the in-pod watchdog: the
+    # deadline baked in at deploy fires regardless, so a held pod left forever
+    # still bills only until that deadline, never past it.
+    CUR_NAME="$(rp_pod_current_name "$RP_POD_ID")" \
+      || { echo "::error::could not read pod ${RP_POD_ID}'s current name — refusing to rename blind"; exit 1; }
+    case "$CUR_NAME" in
+      *-hold) echo "=== pod ${RP_POD_ID} already held (${CUR_NAME}) ==="; exit 0 ;;
+    esac
+    rp_rename "$RP_POD_ID" "${CUR_NAME}-hold" \
+      && echo "=== pod ${RP_POD_ID} held (${CUR_NAME}-hold) — 'reap' will skip it. Its in-pod deadline is UNCHANGED and still fires. ===" \
+      || { echo "::error::could not mark pod ${RP_POD_ID} held — rename failed; it remains sweepable"; exit 1; }
+    ;;
+
+  unhold)
+    require_pod; rp_keep
+    CUR_NAME="$(rp_pod_current_name "$RP_POD_ID")" \
+      || { echo "::error::could not read pod ${RP_POD_ID}'s current name — refusing to rename blind"; exit 1; }
+    case "$CUR_NAME" in
+      *-hold) BASE_NAME="${CUR_NAME%-hold}" ;;
+      *) echo "=== pod ${RP_POD_ID} was not held (name: ${CUR_NAME}) ==="; exit 0 ;;
+    esac
+    rp_rename "$RP_POD_ID" "$BASE_NAME" \
+      && echo "=== pod ${RP_POD_ID} unheld (${BASE_NAME}) — 'reap' will judge it against its deadline again ===" \
+      || { echo "::error::could not clear the hold on pod ${RP_POD_ID} — rename failed; it is still marked held (fails toward safety, but check manually)"; exit 1; }
+    ;;
+
   down)
     if rp_session_load; then
-      rp_terminate "$RP_POD_ID"
-      echo "=== terminated pod ${RP_POD_ID} (session '${SESSION}') ==="
+      # Never trust the locally-recorded id on its own: confirm it is BOTH
+      # still present in the account AND still carries this session's OWN
+      # name (its "<prefix>-ttl<H>", held or not) before terminating anything.
+      # This is what stops `down` from ending a pod that a race with another
+      # `up` on the same alias silently swapped in underneath this session's
+      # record (2026-08-25 incident) — a mismatch refuses rather than acts.
+      if rp_pod_verify "$RP_POD_ID" "${RP_TTL_HOURS:-8}" >/dev/null; then
+        rp_terminate "$RP_POD_ID"
+        echo "=== terminated pod ${RP_POD_ID} (session '${SESSION}') ==="
+      else
+        echo "::error::refusing to terminate pod ${RP_POD_ID} for session '${SESSION}' — it did not verify against the account's live pod list (see above)."
+        echo "::error::the LOCAL session record is forgotten below regardless, but the pod itself, if it still exists, was left running."
+        echo "::error::inspect it: $(basename "$0") ls   /   force-reap by hand: $(basename "$0") reap <hours>   /   the RunPod console"
+      fi
     else
       echo "no recorded pod for session '${SESSION}'"
     fi
-    RP_POD_ID=""   # already gone; keep the EXIT trap from double-terminating
+    RP_POD_ID=""   # local record forgotten either way; keep the EXIT trap from
+                    # acting on it again (verified-terminate, if any, already ran above)
     rp_session_forget
     # After the session file is gone, so the dead host stops being offered.
     rp_ssh_config_sync

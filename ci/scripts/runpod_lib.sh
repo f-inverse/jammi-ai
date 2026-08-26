@@ -42,7 +42,11 @@
 #                 RP_SESSION_ROOT so a *different* terminal can reattach. Unset =
 #                 throwaway temp dir, wiped on exit.
 #   RP_KEEP       1 = leave the pod running when this process exits.
-#   RP_TTL_HOURS  hard deadline baked into every pod at deploy (default 8).
+#   RP_TTL_HOURS  hard deadline baked into every pod at deploy (default 8 in
+#                 this file). gpu-dev.sh's own `up` raises the default to
+#                 RP_DEV_TTL_HOURS (72h) before sourcing this file, since a
+#                 throwaway-pod default is too short for a dev session someone
+#                 is actively using — an explicit RP_TTL_HOURS always wins.
 #   RP_DISK_GB    container disk size in GB (default 60). Rule of thumb: roughly
 #                 25 GB base + 3 GB per concurrent agent CARGO_TARGET_DIR + 2 GB
 #                 per `cargo mutants -j N` job (COPY MODE makes one full
@@ -108,7 +112,16 @@ else
 fi
 RP_SSH_KEY="$RP_WORK/id_ed25519"
 RP_META="$RP_WORK/meta"
-RP_POD_ID=""; RP_HOST=""; RP_PORT=""; RP_PUBKEY=""; RP_ARCH=""; RP_SSHO=()
+# RP_POD_CREATED is 1 only once THIS invocation's own rp_deploy_live actually
+# rented a pod (set at its single success point). rp_session_load — used by
+# every read-only subcommand (attach/run/logs/push/pull/down/hold/unhold) to
+# recognize a pod someone else's invocation already rented — deliberately
+# never sets it. rp_cleanup below gates termination-on-failure on this flag,
+# not merely on "RP_POD_ID is non-empty": before this flag existed, a
+# read-only subcommand against an unreachable session left RP_POD_ID set from
+# the loaded session and exited 1, and the EXIT trap terminated a pod that
+# invocation never rented — the incident this flag closes.
+RP_POD_ID=""; RP_HOST=""; RP_PORT=""; RP_PUBKEY=""; RP_ARCH=""; RP_SSHO=(); RP_POD_CREATED=0
 # The git ref the pod's checkout sits on. Two sites keep it honest, so recorded
 # state never claims a ref the pod is not on: rp_bootstrap sets it only after the
 # checkout succeeded, and rp_deploy_live clears it the moment pod identity
@@ -125,13 +138,136 @@ rp_terminate() { # $1=podId
   rp_gql "{\"query\":\"mutation{ podTerminate(input:{podId:\\\"${1}\\\"}) }\"}" >/dev/null 2>&1
 }
 
+# Confirm a pod id is BOTH present in the account's live pod list AND carries
+# the name this SESSION itself recorded (its own "<prefix>-ttl<H>", optionally
+# with the "-hold" suffix `gpu-dev.sh hold` adds) before any caller acts on it
+# irreversibly. Never trusts a locally-recorded id on its own: the id could be
+# stale (the account-side pod is already gone), or — the incident this closes —
+# a DIFFERENT pod could now be recorded under this session's name (two
+# processes racing `up` on the same alias). $1=podId $2=expected TTL hours (the
+# SESSION's own, as recorded at deploy time — never the caller's current
+# RP_TTL_HOURS, which may differ and would defeat the whole check).
+# Prints the account's name for the id on success (id present AND named
+# correctly). Returns 1 (not found, or name does not match) or 2 (could not
+# query the account at all) — both are "do not act", never "assume safe".
+#
+# Piped input (the account's own pod list) and script source cannot both come
+# from stdin — `python3 -` with a heredoc reads the heredoc AS THE PROGRAM,
+# leaving nothing for the piped JSON to land on (shellcheck SC2259). Every
+# function below therefore uses `python3 -c '<script>' argv...`, the same
+# shape `rp_deploy_live`'s own parser already uses, so the piped JSON reaches
+# `sys.stdin` intact and dynamic values travel as argv, never interpolated
+# into the script source.
+rp_pod_verify() { # $1=podId $2=expectedTtlHours
+  local id="$1" ttl="$2" base
+  base="${RP_POD_PREFIX}-ttl${ttl}"
+  rp_gql '{"query":"query{ myself{ pods{ id name } } }"}' | python3 -c '
+import sys, json
+podid, base = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(sys.stdin)
+except Exception as e:
+    print("could not parse RunPod response: %s" % e, file=sys.stderr)
+    sys.exit(2)
+if d.get("errors"):
+    print(json.dumps(d["errors"])[:200], file=sys.stderr)
+    sys.exit(2)
+me = (d.get("data") or {}).get("myself")
+if me is None or me.get("pods") is None:
+    print("response contained no pod list", file=sys.stderr)
+    sys.exit(2)
+for p in me["pods"]:
+    if p.get("id") == podid:
+        name = p.get("name") or ""
+        if name == base or name == base + "-hold":
+            print(name)
+            sys.exit(0)
+        print("pod %s account name %s does not match this session own name %s (or %s-hold) -- refusing to act on it" % (podid, name, base, base), file=sys.stderr)
+        sys.exit(1)
+print("pod %s is not in the account pod list" % podid, file=sys.stderr)
+sys.exit(1)
+' "$id" "$base"
+}
+
+# The pod's CURRENT name as the account itself reports it — never
+# reconstructed from local state (RP_TTL_HOURS, a session's recorded value,
+# or any other guess), so `hold`/`unhold` rename FROM what is actually there
+# rather than FROM a locally-assumed name that may be wrong (a session
+# recorded before RP_TTL_HOURS was added to the session file, or a name
+# another process already changed). $1=podId. Prints the name and returns 0
+# on success; prints nothing and returns 1 (not found) or 2 (could not query)
+# otherwise — both are "do not act on this blindly".
+rp_pod_current_name() { # $1=podId
+  local id="$1"
+  rp_gql '{"query":"query{ myself{ pods{ id name } } }"}' | python3 -c '
+import sys, json
+podid = sys.argv[1]
+try:
+    d = json.load(sys.stdin)
+except Exception as e:
+    print("could not parse RunPod response: %s" % e, file=sys.stderr)
+    sys.exit(2)
+if d.get("errors"):
+    print(json.dumps(d["errors"])[:200], file=sys.stderr)
+    sys.exit(2)
+me = (d.get("data") or {}).get("myself")
+if me is None or me.get("pods") is None:
+    print("response contained no pod list", file=sys.stderr)
+    sys.exit(2)
+for p in me["pods"]:
+    if p.get("id") == podid:
+        print(p.get("name") or "")
+        sys.exit(0)
+print("pod %s is not in the account pod list" % podid, file=sys.stderr)
+sys.exit(1)
+' "$id"
+}
+
+# Rename a pod on the RunPod side. Used only by `hold`/`unhold`: the "-hold"
+# marker rp_sweep honours (see rp_sweep below) has to live somewhere the sweep
+# — a stateless cron run with no access to this machine's session dir — can
+# see it, and the pod's own `name` field (already how the TTL deadline
+# travels) is the only account-visible, mutable-after-deploy field this
+# tooling has. A rename failure is surfaced to the caller rather than
+# swallowed the way rp_terminate's best-effort failure is: an unattached hold
+# is a hold that protects nothing, and hold/unhold must never report success
+# on a marker that did not actually take.
+rp_rename() { # $1=podId $2=newName
+  local id="$1" name="$2"
+  rp_gql "{\"query\":\"mutation{ podEditJob(input:{podId:\\\"${id}\\\", name:\\\"${name}\\\"}){ id name } }\"}" \
+    | python3 -c '
+import sys, json
+want = sys.argv[1]
+try:
+    d = json.load(sys.stdin)
+except Exception as e:
+    print("could not parse RunPod response: %s" % e, file=sys.stderr)
+    sys.exit(1)
+if d.get("errors"):
+    print(json.dumps(d["errors"])[:200], file=sys.stderr)
+    sys.exit(1)
+got = ((d.get("data") or {}).get("podEditJob") or {}).get("name")
+if got != want:
+    print("rename did not take: wanted %s, pod reports %s" % (want, got), file=sys.stderr)
+    sys.exit(1)
+' "$name"
+}
+
 rp_cleanup() {
   if [ -n "$RP_POD_ID" ]; then
     if [ "$RP_KEEP" = "1" ]; then
       echo "::notice::pod ${RP_POD_ID} left running (self-terminates in ≤${RP_TTL_HOURS}h)"
-    else
+    elif [ "$RP_POD_CREATED" = "1" ]; then
       rp_terminate "$RP_POD_ID"
       echo "::notice::terminated RunPod pod ${RP_POD_ID}"
+    else
+      # This invocation loaded an EXISTING session's pod (attach/run/logs/
+      # push/pull/down/hold/unhold) rather than renting one itself, and is
+      # exiting without having called rp_keep — e.g. require_pod failing
+      # against an unreachable pod. That pod is not this invocation's to
+      # terminate; only its own creator (an `up`/`shell` that actually
+      # deployed it, or an explicit `down`) may end it.
+      echo "::notice::pod ${RP_POD_ID} left running — this invocation did not create it; not terminating"
     fi
   fi
   [ "$RP_WORK_IS_TEMP" = "1" ] && rm -rf "$RP_WORK"
@@ -158,8 +294,14 @@ _rp_work_mkdir() { [ -d "$RP_WORK" ] || { mkdir -p "$RP_WORK" && chmod 700 "$RP_
 rp_session_save() {
   [ -n "$RP_SESSION" ] || return 0
   _rp_work_mkdir
+  # RP_TTL_HOURS travels with the session because it is baked into the pod's
+  # OWN name at deploy ("<prefix>-ttl<H>") and cannot be re-derived from the
+  # caller's current environment later — a `down` or `hold` run with a
+  # different RP_TTL_HOURS in its own shell must still reason about THIS pod's
+  # actual name, not whatever the current invocation happens to default to.
   { echo "RP_POD_ID=$RP_POD_ID"; echo "RP_HOST=$RP_HOST"; echo "RP_PORT=$RP_PORT"
-    echo "RP_ARCH=$RP_ARCH"; echo "RP_IMAGE=$RP_IMAGE"; echo "RP_REF=$RP_REF"; } > "$RP_META"
+    echo "RP_ARCH=$RP_ARCH"; echo "RP_IMAGE=$RP_IMAGE"; echo "RP_REF=$RP_REF"
+    echo "RP_TTL_HOURS=$RP_TTL_HOURS"; } > "$RP_META"
   chmod 600 "$RP_META"
 }
 
@@ -406,7 +548,12 @@ p=(json.load(sys.stdin).get("data",{}).get("pod") or {}).get("runtime") or {}
           "nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1" 2>/dev/null)"
         drv_major="${drv%%.*}"
         if [ -n "$drv_major" ] && [ "$drv_major" -ge "$RP_MIN_DRIVER_MAJOR" ] 2>/dev/null; then
-          echo "  SSH up on ${RP_HOST}:${RP_PORT} (driver ${drv})"; rp_session_save; return 0
+          echo "  SSH up on ${RP_HOST}:${RP_PORT} (driver ${drv})"
+          # The ONE place a pod becomes "this invocation's own" — rp_cleanup's
+          # terminate-on-failure branch is gated on this, never on RP_POD_ID
+          # alone (see rp_cleanup's own comment).
+          RP_POD_CREATED=1
+          rp_session_save; return 0
         fi
         echo "  pod ${RP_POD_ID} driver '${drv:-unknown}' is below the r${RP_MIN_DRIVER_MAJOR} floor; terminating and trying next candidate"
         rp_terminate "$RP_POD_ID"
@@ -499,6 +646,17 @@ now = datetime.datetime.now(datetime.timezone.utc)
 for p in me['pods']:
     name = p.get('name') or ''
     if not name.startswith(prefix):
+        continue
+    # gpu-dev.sh hold <session> renames the pod to append -hold
+    # (rp_rename in this file) precisely so a stateless cron sweep -- no access
+    # to any session's local state -- can still see it: the pod's own name
+    # is the only account-visible, mutable-after-deploy field this tooling
+    # has. Skipped, never terminated, no matter its age; unhold (or down,
+    # which accepts the -hold name too) is the only way off this list. This
+    # does NOT touch the in-pod watchdog deadline baked in at deploy -- a held
+    # pod still self-terminates on schedule; hold only pauses the SWEEP.
+    if name.endswith('-hold'):
+        print('::warning::pod %s (%s) is held — sweep skipping it (the in-pod deadline is unaffected and still fires)' % (p['id'], name), file=sys.stderr)
         continue
     # Age comes from createdAt, never from runtime.uptimeInSeconds. Measured on
     # live pods: uptime is null for the first minutes of a perfectly healthy pod,

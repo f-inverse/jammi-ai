@@ -27,10 +27,19 @@
 //! program with **zero** `to_scalar`/`to_vec` calls. `torch.nn.utils.
 //! clip_grad_norm_`'s default is `error_if_nonfinite=False`: a NaN gradient is
 //! silently scaled by a NaN coefficient and training continues. jammi keeps
-//! its stricter contract — a non-finite total norm is a typed refusal, never
-//! silent — but pays for that check with the one sync [`refuse_nonfinite_norm`]
-//! performs; that function's docs cover the cadence this file (and its
-//! callers) hold that sync to, so it never reappears on every step.
+//! a stricter contract — a non-finite total norm is a typed refusal — but
+//! pays for that check with the one sync [`refuse_nonfinite_norm`] performs,
+//! and therefore holds it to a CADENCE, not every step: [`clip_and_step`]
+//! reads the norm back on step 1, every `check_every_n_steps`, and on the
+//! run's last step (see that function's doc). Between cadence points a
+//! NaN norm is NOT caught here — the clip scales every gradient by NaN and
+//! `optimizer.step` writes the poisoned update into the parameters, exactly
+//! as torch would. What bounds the damage is the trainer's epoch-boundary
+//! backstop, `TrainingLoop::refuse_nonfinite_params` (`trainer.rs`): one
+//! host read per epoch over the trainable parameters, a typed refusal before
+//! any `checkpoint_best` can hold a non-finite weight. So the honest
+//! statement is "refused within one cadence interval of steps, and never
+//! checkpointed", not "never silent".
 //!
 //! ## Accumulator precision: an undisclosed change the device rewrite also
 //! made, and why the new value is the correct one to keep
@@ -54,7 +63,21 @@
 //! closer match to it (family K: parity target is PyTorch, not a candle
 //! implementation detail some earlier revision of this file happened to
 //! have). The device-side `f32` fold this file now performs is the one that
-//! matches torch's own precision, end to end. `tests::multi_var_clip_
+//! matches torch's own accumulator precision for `f32` gradients. It is NOT
+//! bit-identical to torch, and this doc does not claim it: (1) the
+//! coefficient is `(total_norm + 1e-6).recip() * max_norm` — TWO roundings
+//! (a reciprocal, then a multiply) where torch's `max_norm / (total_norm +
+//! 1e-6)` is ONE division — so the two coefficients can differ by ~1 ULP of
+//! `f32`, and every rescaled gradient inherits that ULP; (2) the fold shape
+//! differs (`sqrt(Σ_i Σ g_i²)` here vs torch's norm-of-per-parameter-norms,
+//! bounded in [`clip_gradients`]'s doc); and (3) for a NON-`f32` gradient
+//! (bf16 LoRA training) torch keeps the whole computation in the gradient's
+//! own dtype — `torch._foreach_norm` returns bf16 per-parameter norms, the
+//! coefficient is bf16, `foreach_mul_` is a bf16 × bf16 — while this file
+//! upcasts each gradient to `f32`, folds/scales in `f32`, and rounds back to
+//! bf16 once at the end, a genuinely different (fewer-rounding) arithmetic
+//! that is closer to the real-number clip than torch's, not equal to it.
+//! `tests::multi_var_clip_
 //! matches_host_reference_on_cpu` and `tests::clip_gradients_device_and_
 //! host_agree_bit_identically_on_cpu` (below) pin that the fold's own
 //! op-sequence behavior matches an independent host reference at the
@@ -112,14 +135,22 @@ pub fn sorted_trainable_vars(varmap: &VarMap) -> Vec<Var> {
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Test-only counter of device→host reads issued by [`refuse_nonfinite_norm`]
-/// — the *only* function on this file's per-step path allowed to call
-/// `to_scalar`/`to_vec`. A CPU test cannot observe "no CUDA sync happened"
-/// directly (there is no CUDA stream to inspect), so this counter is the
-/// structural proxy: [`clip_gradients`] and an unchecked [`clip_and_step`]
-/// call must never move it. If a future edit adds a host read anywhere else
-/// on the hot path, a test asserting this counter stays at `0` across
-/// [`clip_gradients`] goes red.
+/// Test-only counter of calls to [`refuse_nonfinite_norm`] — the *only*
+/// function on this file's per-step path allowed to call
+/// `to_scalar`/`to_vec`, and the ONLY site that bumps this counter. A CPU
+/// test cannot observe "no CUDA sync happened" directly (there is no CUDA
+/// stream to inspect), so this counter is a structural proxy for exactly
+/// one claim: that [`clip_gradients`] and an off-cadence [`clip_and_step`]
+/// never reach `refuse_nonfinite_norm`. It does NOT count `to_scalar`/
+/// `to_vec` calls themselves — candle's host reads are not instrumented —
+/// so a future edit that adds a host read somewhere ELSE on the hot path
+/// would leave this counter at `0` and the tests below green. That gap is
+/// closed by review, not by this counter: the module doc's "zero
+/// `to_scalar`/`to_vec` calls" claim is checked by reading
+/// [`clip_gradients`]'s body (`grep -n 'to_scalar\|to_vec'` over this file
+/// must match only `refuse_nonfinite_norm` and `#[cfg(test)]` code), and
+/// the CUDA leg `clip_gradients_never_reads_the_norm_back_on_cuda` proves the
+/// same proxy on a real device, no more.
 #[cfg(test)]
 static SYNC_READ_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -160,6 +191,9 @@ pub(crate) fn thread_sync_read_count() -> u64 {
 /// from "clipping ran but touched nothing", so [`clip_and_step`] silently
 /// skipped BOTH the clip and the non-finite check in either case.
 #[derive(Debug)]
+#[must_use = "a ClipOutcome says whether the clip actually ran (`Clipped`) or was skipped \
+              (`Disabled`/`NoGradients`); a caller that drops it cannot tell a clip-on step \
+              from a no-op — match on it (see `clip_and_step`)"]
 pub enum ClipOutcome {
     /// `max_norm <= 0.0` — clipping was turned off by the caller.
     Disabled,
@@ -362,8 +396,15 @@ pub fn clip_gradients(
         .map_err(|e| JammiError::FineTune(format!("GradClip sqrt: {e}")))?;
 
     // clip_coef = max_norm / (total_norm + 1e-6), clamped to at most 1.0 —
-    // torch's exact order and epsilon (`torch/nn/utils/clip_grad.py`, see the
-    // module doc's citation). `affine`/`recip` bake their
+    // torch's epsilon and clamp (`torch/nn/utils/clip_grad.py`, see the
+    // module doc's citation), but NOT torch's rounding: this computes
+    // `(total_norm + 1e-6).recip() * max_norm` — a reciprocal then a
+    // multiply, two `f32` roundings — where torch performs one division,
+    // so the coefficient can differ from torch's by ~1 ULP (bounded, never
+    // claimed exact; see the module doc's "Accumulator precision" section
+    // for the full list of where this file and torch part ways). Candle
+    // has no scalar-numerator `div` op that keeps `max_norm` a host
+    // constant without an extra tensor upload. `affine`/`recip` bake their
     // constants as kernel-launch scalars (no tensor upload); only `minimum`'s
     // `1.0` is materialized as a tensor — one small H2D upload per call. That
     // upload is NOT cached: nothing in this crate holds candle's
@@ -1144,7 +1185,7 @@ mod tests {
     /// Acquire CUDA device 0, or skip — unless `JAMMI_REQUIRE_CUDA` is set
     /// (the pod session that is this leg's landing proof), in which case a
     /// missing device is a failure, never a silent skip.
-    fn cuda_device_or_skip(test: &str) -> Option<Device> {
+    fn cuda_device(test: &str) -> Option<Device> {
         match Device::new_cuda(0) {
             Ok(d) => Some(d),
             Err(e) => {
@@ -1183,13 +1224,20 @@ mod tests {
     /// `1.0` and only the gradient that was already NaN stays NaN. Neither
     /// arm changes what `refuse_nonfinite_norm` sees — `total_norm` itself is
     /// NaN on both, computed before the clamp — so the typed refusal is
-    /// device-independent; only the (never-consumed, since the step is
-    /// refused on cadence) rescaled gradients differ. `nan_gradient_poisons_
-    /// every_gradient_through_the_cpu_minimum` pins the CPU arm; this leg
-    /// pins the CUDA arm when a device is present.
+    /// device-independent ON A CADENCE STEP. OFF cadence, `clip_and_step`
+    /// skips `refuse_nonfinite_norm` and DOES consume the rescaled store:
+    /// `optimizer.step` runs over it, so on CPU every parameter is poisoned
+    /// at once while on CUDA only the already-NaN gradient's parameter is
+    /// — a real CPU≠CUDA divergence in the parameters until the next
+    /// cadence point (step 1, every `check_every_n_steps`, or the last
+    /// step) refuses the norm, with `TrainingLoop::refuse_nonfinite_params`'
+    /// epoch-boundary read as the backstop that keeps either arm out of a
+    /// checkpoint. `nan_gradient_poisons_every_gradient_through_the_cpu_
+    /// minimum` pins the CPU arm; this leg pins the CUDA arm when a device
+    /// is present.
     #[test]
     fn multi_var_clip_matches_host_reference_on_cuda_and_is_bit_identical_to_cpu() {
-        let Some(cuda) = cuda_device_or_skip("multi_var_clip_cuda") else {
+        let Some(cuda) = cuda_device("multi_var_clip_cuda") else {
             return;
         };
         let after_cuda = assert_multi_var_clip_matches_host(&cuda);
@@ -1295,7 +1343,10 @@ mod tests {
         // leave it untouched.
         let before = sync_read_count();
         let (w, mut grads, _g) = one_var_with_grad(3.0, 4);
-        clip_gradients(&[w], &mut grads, 1.0).unwrap();
+        // `unwrap_clipped` only pattern-matches the arm — no host read.
+        let _norm_on_device = clip_gradients(&[w], &mut grads, 1.0)
+            .unwrap()
+            .unwrap_clipped();
         assert_eq!(
             sync_read_count(),
             before,
@@ -1319,14 +1370,16 @@ mod tests {
     #[test]
     #[serial(grad_clip_sync_read_count)]
     fn clip_gradients_never_reads_the_norm_back_on_cuda() {
-        let Some(cuda) = cuda_device_or_skip("clip_gradients_sync_cuda") else {
+        let Some(cuda) = cuda_device("clip_gradients_sync_cuda") else {
             return;
         };
 
         // Bare clip_gradients: 0 reads.
         let before = sync_read_count();
         let (vars, mut grads, _before) = four_vars_with_grads(&cuda);
-        clip_gradients(&vars, &mut grads, 1.0).unwrap();
+        let _norm_on_device = clip_gradients(&vars, &mut grads, 1.0)
+            .unwrap()
+            .unwrap_clipped();
         assert_eq!(
             sync_read_count(),
             before,
@@ -1546,7 +1599,9 @@ mod tests {
         // before and after the clip.
         let (w, mut grads, _g) = one_var_with_grad(2.0, 4);
         let before = w.as_tensor().sorted_nodes().len();
-        clip_gradients(std::slice::from_ref(&w), &mut grads, 1.0).unwrap();
+        let _norm_on_device = clip_gradients(std::slice::from_ref(&w), &mut grads, 1.0)
+            .unwrap()
+            .unwrap_clipped();
         let after = w.as_tensor().sorted_nodes().len();
         assert_eq!(before, 1, "a Var is its own sole node");
         assert_eq!(

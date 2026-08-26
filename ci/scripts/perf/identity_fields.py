@@ -81,13 +81,121 @@ def normalize_target_modules(value):
     return tuple(sorted(value))
 
 
+# THE finetune-step identity set — the ONE declaration every consumer
+# derives from (PR #381 audit B1: `ab_merge.py` used to carry its own
+# hand-kept 14-tuple, which lacked `max_grad_norm`, so a clip-ON jammi leg
+# merged against a clip-OFF torch leg and printed PASS; the lead's class
+# probe found the attention implementation absent from it for the same
+# reason — "a knob that changes what the step computes is not an identity
+# field" was the class, not one missing name). The rule for membership: a
+# field is IDENTITY when two legs differing in it are computing a DIFFERENT
+# step, so their throughput/loss numbers are not comparable at all. It is
+# NOT a place for provenance (recorded, never compared — torch's raw
+# `attn_implementation` string, jammi's dispatch counters) or measurement.
+#
+# Both producers MUST emit every name here, at the level `ab_merge.py`'s
+# `leg_identity_fields` reads it from:
+#   * jammi — `crates/jammi-bench/src/report.rs`'s `FinetuneStepTier`
+#     (`report["tiers"]["finetune_step"][field]`); that struct's own
+#     `finetune_step_tier_emits_every_shared_identity_field` test reads THIS
+#     tuple back out of THIS file and refuses a field it does not serialize.
+#   * torch — `crates/jammi-bench/reference/torch_finetune_step.py`'s report
+#     literal (`report["finetune_step"][field]`, or `report["args"][field]`
+#     for the `ab_merge._TORCH_ARGS_LEVEL_FIELDS` trio); `test_ab_merge.py`'s
+#     `SharedIdentityDeclarationTests` scans that literal for every name.
+# `ab_merge.leg_premise_violations` refuses GENERICALLY on any member that
+# is missing from either side or differs after `canonicalize_identity_field`
+# — never through a per-field `if`.
+FINETUNE_IDENTITY_FIELDS = (
+    "seed",
+    "batch",
+    "seq",
+    "lora_rank",
+    "lora_alpha",
+    "lora_dropout",
+    "margin",
+    "target_modules",
+    "batched_forward",
+    "backbone_dtype",
+    "steps_measured",
+    "checkpoint_config_sha256",
+    "checkpoint_weights_sha256",
+    "checkpoint_weights_size_bytes",
+    # The gradient clip's on/off + bound for this row: `null` (clip OFF —
+    # the step the tier measured before the flag existed) or the positive
+    # finite `max_norm` the PRODUCTION `clip_gradients` ran with (jammi:
+    # `--max-grad-norm`; torch: `--max-grad-norm` →
+    # `torch.nn.utils.clip_grad_norm_`). Two legs differing here run a
+    # different step (one pays the `4n + 4` device ops and rescales its
+    # gradients, the other does not), so the row's ratio is meaningless.
+    # `null` is a VALUE here, not "missing" — see
+    # `FINETUNE_NULL_IS_A_VALUE_FIELDS` below.
+    "max_grad_norm",
+    # Which attention REFERENCE CLASS the leg was ASKED to run — `"eager"`
+    # (the materialised-scores softmax path; the semantic reference) or
+    # `"fused"` (one fused attention kernel; the throughput reference).
+    #   * torch: the class of the RESOLVED `_attn_implementation` (`eager`
+    #     → "eager"; `sdpa` / flash / flex → "fused";
+    #     `torch_finetune_step.py`'s `attention_arm_of`).
+    #   * jammi: jammi has no `--attn` lever — `JAMMI_KERNELS_DISABLE` is the
+    #     lever — so the value is the OPERATOR'S REQUEST: "eager" iff an
+    #     attention base (`attention_block`, `attention_block_flash`, or the
+    #     `all` wildcard) is in the resolved `kernels_disabled_requested`,
+    #     else "fused" (`finetune_step.rs`'s `attention_arm`). It is
+    #     deliberately NOT read off the `attention_block_*_dispatches`
+    #     counters: those read eager whenever the fused predicate DECLINES
+    #     BY DOMAIN (`head_dim != 64`, `seq > 4096`, dtype/contiguity/mask
+    #     arms — documented as by-design in `report.rs`), so a legitimate
+    #     jammi-fused leg on a non-64-head_dim checkpoint would have read
+    #     "eager", mismatched torch's "fused", and INVALIDated the row over a
+    #     MEASUREMENT. Whether the fused arm actually ran stays where it
+    #     already lives (`ab_merge.fused_proof` + the counters); an identity
+    #     field describes what was asked for.
+    # This is the "two references, never mixed" rule (eager ↔ eager is the
+    # semantic reference, sdpa ↔ fused the throughput one) made a CHECKED
+    # premise instead of a leg-naming convention. A leg that is only a
+    # FALLBACK (torch-sdpa OOM → torch-eager; jammi-fused failed →
+    # jammi-eager) is "not comparable" — `ab_merge.build_report` skips the
+    # identity check for that row and records why, rather than refusing a
+    # documented non-gating outcome as an identity mismatch. The RAW value
+    # each side ran with stays in provenance (torch: `attn_requested` /
+    # `attn_implementation`; jammi: `kernels_disabled_requested` + the
+    # `attention_block_*_dispatches` counters), recorded, never compared.
+    "attention_arm",
+    # Warmup iterations executed before the measured ones. Identity because
+    # it changes what `clip_invocations` (pre-step + warmup + measured)
+    # counts — two legs at different warmups are not comparable on that
+    # counted fact. jammi: `FinetuneStepTier::warmup`; torch: `args.warmup`
+    # (an `ab_merge._TORCH_ARGS_LEVEL_FIELDS` member).
+    "warmup",
+)
+
+# Identity fields for which a JSON `null` is a legitimate VALUE (compared as
+# such, `null == null` matches) rather than the "present-but-unverifiable"
+# state `ab_merge.leg_identity_fields` otherwise folds into MISSING (the
+# round-4 PR #372 rule: `serde_json` writes a NaN `f64` as `null`, so a null
+# numeric identity field is normally a producer that could not state its
+# premise). `max_grad_norm` is the exception BY CONSTRUCTION: both producers
+# validate a supplied value as finite and `> 0.0` before running (jammi's
+# `validate_max_grad_norm`, torch's `parse_args` check), so NaN can never
+# reach the report — `null` there means exactly one thing, clip OFF. A key
+# that is ABSENT entirely is still MISSING for these fields too (a producer
+# built before the field existed cannot state its premise).
+FINETUNE_NULL_IS_A_VALUE_FIELDS = frozenset({"max_grad_norm"})
+
+
 # Per-field canonicalizer table: every identity field NOT listed here is
 # compared with NO canonicalization (the JSON-decoded value as-is), because
 # it carries no known cross-producer representational gap — see
-# `compare_grad_oracle.py`'s `RUN_IDENTITY_FIELDS` doc and `ab_merge.py`'s
-# `FINETUNE_IDENTITY_FIELDS` doc for the full field-by-field determinant
+# `compare_grad_oracle.py`'s `RUN_IDENTITY_FIELDS` doc and
+# `FINETUNE_IDENTITY_FIELDS` above for the full field-by-field determinant
 # table each comparator maintains for ITS OWN field set (this table is
-# shared machinery, not a duplicate of either).
+# shared machinery, not a duplicate of either). `max_grad_norm` and
+# `attention_arm` deliberately have NO canonicalizer: both producers emit
+# the same vocabulary directly (a JSON number-or-null; `"eager"`/`"fused"`),
+# and a canonicalizer that mapped torch's raw `"sdpa"` onto jammi's
+# `"fused"` here would be WIDENING what counts as a match inside the
+# comparator rather than each producer stating its own class honestly.
 IDENTITY_FIELD_CANONICALIZERS = {
     "backbone_dtype": normalize_backbone_dtype,
     "target_modules": normalize_target_modules,

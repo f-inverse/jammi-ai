@@ -1171,6 +1171,12 @@ pub struct FinetuneStepTier {
     /// Trainable tensor count. Zero would mean the selectors matched nothing and
     /// the measurement is of a frozen forward, so it is reported, not assumed.
     pub trainable_tensors: usize,
+    /// Warmup iterations this run executed before the measured ones — an
+    /// IDENTITY field (shared set, see `attention_arm`'s doc): `warmup`
+    /// changes what [`clip_invocations`](Self::clip_invocations) counts
+    /// (pre-step + warmup + measured), so two legs at different warmups
+    /// are not comparable on that fact. torch emits it under `args`.
+    pub warmup: usize,
     /// Measured steps after warmup.
     pub steps_measured: usize,
     /// Per-measured-step triplet loss, in step order, warmup EXCLUDED — one
@@ -1357,6 +1363,41 @@ pub struct FinetuneStepTier {
     /// `theta`/`m`/`v`/`grad`), or because `JAMMI_KERNELS_DISABLE` named
     /// `"adamw_step_fused"` for this process.
     pub adamw_eager_dispatches: u64,
+    /// How many times this run invoked the PRODUCTION
+    /// [`jammi_ai::fine_tune::optimizer::clip_gradients`] — a before/after
+    /// delta over `finetune_step.rs`'s process-wide `CLIP_INVOCATIONS`
+    /// counter taken around `run()`'s pre-step + warmup + measured loop, so
+    /// it reads `warmup + steps + 1` on a clip-on row and exactly `0` on a
+    /// clip-off one. The COUNTED fact behind [`max_grad_norm`](Self::max_grad_norm)
+    /// (which only echoes what was REQUESTED), emitted next to the fused-
+    /// dispatch deltas above for the same reason they exist: a row's claim
+    /// about what ran is a number a merge stage can check, not a log line
+    /// an operator trusts. `torch_finetune_step.py` emits its twin
+    /// (`finetune_step.clip_invocations`, counting `clip_grad_norm_`
+    /// calls over the identical window); `ci/scripts/perf/ab_merge.py`'s
+    /// `clip_fact_violations` refuses a leg whose request and count
+    /// disagree in kind.
+    pub clip_invocations: u64,
+    /// The attention REFERENCE CLASS the operator ASKED this run to measure
+    /// — `"eager"` iff an attention base (`attention_block`,
+    /// `attention_block_flash`, or the `"all"` wildcard) is in
+    /// [`kernels_disabled_requested`](Self::kernels_disabled_requested),
+    /// else `"fused"` (jammi has no `--attn` lever; `JAMMI_KERNELS_DISABLE`
+    /// is the lever). A member of the SHARED jammi/torch identity set
+    /// (`ci/scripts/perf/identity_fields.py`'s `FINETUNE_IDENTITY_FIELDS`,
+    /// whose entry carries the full rationale): `torch_finetune_step.py`
+    /// emits `"eager"` for a resolved `eager` implementation and `"fused"`
+    /// for `sdpa` (and every other HF fused-kernel implementation), so
+    /// `ab_merge.py`'s leg-premise check refuses a jammi-eager ↔ torch-sdpa
+    /// pairing — the "two references, never mixed" rule as a CHECKED
+    /// premise. Deliberately NOT derived from the
+    /// `attention_block_*_dispatches` deltas above: those read eager on a
+    /// by-design DOMAIN decline (`head_dim != 64`, `seq > 4096`, dtype /
+    /// contiguity / mask arms — see `attention_block_eager_dispatches`'s
+    /// own doc), which is a measurement about the checkpoint, not a
+    /// premise; whether the fused arm actually ran is `fused_proof`'s and
+    /// the counters' job. See `finetune_step.rs`'s `attention_arm`.
+    pub attention_arm: String,
     /// The `JAMMI_KERNELS_DISABLE` op keys this process REQUESTED (sorted,
     /// empty when the env var was unset or empty) —
     /// `jammi_kernels::admission::disabled_ops_requested`. Always present,
@@ -1586,6 +1627,7 @@ mod tests {
             batched_forward: true,
             max_grad_norm,
             trainable_tensors: 2,
+            warmup: 5,
             steps_measured: 1,
             losses: vec![0.5],
             loss_first: 0.5,
@@ -1606,6 +1648,8 @@ mod tests {
             attention_block_eager_dispatches: 0,
             adamw_fused_dispatches: 0,
             adamw_eager_dispatches: 0,
+            clip_invocations: 0,
+            attention_arm: "fused".to_string(),
             kernels_disabled_requested: Vec::new(),
             kernels_disabled_fired: Vec::new(),
             s_per_step_p50: Measurement::measured(0.01, "s"),
@@ -1671,6 +1715,7 @@ mod tests {
         let mut expected = vec![
             "adamw_eager_dispatches",
             "adamw_fused_dispatches",
+            "attention_arm",
             "attention_block_eager_dispatches",
             "attention_block_fused_dispatches",
             "batch",
@@ -1679,6 +1724,7 @@ mod tests {
             "checkpoint_config_sha256",
             "checkpoint_weights_sha256",
             "checkpoint_weights_size_bytes",
+            "clip_invocations",
             "device",
             "device_name",
             "geglu_eager_dispatches",
@@ -1714,8 +1760,87 @@ mod tests {
             "target_modules",
             "trainable_tensors",
             "triplets_per_s",
+            "warmup",
         ];
         expected.sort_unstable();
         assert_eq!(keys, expected);
+    }
+
+    /// Cross-language pin of the ONE shared identity declaration (PR #381
+    /// audit B1): every name in `ci/scripts/perf/identity_fields.py`'s
+    /// `FINETUNE_IDENTITY_FIELDS` tuple must be a key `FinetuneStepTier`
+    /// actually serializes, read back out of THAT FILE — never a second
+    /// hand-kept list here that could drift from it (the exact drift the
+    /// audit found: `ab_merge.py`'s own tuple lacked `max_grad_norm`, so a
+    /// clip-on jammi leg merged against a clip-off torch leg and PASSED).
+    /// `ab_merge.leg_premise_violations` refuses a leg MISSING any member,
+    /// so a member this struct does not emit would make every real A/B row
+    /// INVALID; this test makes that a compile-time-adjacent failure
+    /// instead of a pod-time one. The torch producer's side of the same
+    /// pin is `test_ab_merge.py`'s `SharedIdentityDeclarationTests`.
+    ///
+    /// The tuple is parsed with a deliberately narrow scanner (the literal
+    /// `FINETUNE_IDENTITY_FIELDS = (` ... `)` block, one double-quoted name
+    /// per entry, `#` comments skipped) so a reshaped declaration fails
+    /// loudly here (zero names parsed → panic) rather than silently pinning
+    /// nothing — the execution-provenance rule that zero-matched is red.
+    #[test]
+    fn finetune_step_tier_emits_every_shared_identity_field() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crates/<name>")
+            .parent()
+            .expect("workspace root")
+            .join("ci")
+            .join("scripts")
+            .join("perf")
+            .join("identity_fields.py");
+        let src = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let start = src
+            .find("FINETUNE_IDENTITY_FIELDS = (")
+            .expect("identity_fields.py must declare `FINETUNE_IDENTITY_FIELDS = (`");
+        let body = &src[start + "FINETUNE_IDENTITY_FIELDS = (".len()..];
+        let end = body
+            .find("\n)")
+            .expect("FINETUNE_IDENTITY_FIELDS tuple must close with a `)` on its own line");
+        let mut declared: Vec<String> = Vec::new();
+        for line in body[..end].lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let name = line.trim_end_matches(',').trim_matches('"').to_string();
+            assert!(
+                line.starts_with('"') && line.ends_with("\","),
+                "unrecognised FINETUNE_IDENTITY_FIELDS entry shape: {line:?}"
+            );
+            declared.push(name);
+        }
+        assert!(
+            declared.len() >= 14,
+            "parsed only {} identity names from {} — the scanner or the declaration changed shape",
+            declared.len(),
+            path.display()
+        );
+        for required in ["max_grad_norm", "attention_arm"] {
+            assert!(
+                declared.iter().any(|n| n == required),
+                "{required} must be a shared identity field (PR #381 audit B1)"
+            );
+        }
+
+        let tier = sample_finetune_step_tier(Some(1.0));
+        let value = serde_json::to_value(&tier).expect("serialize FinetuneStepTier");
+        let obj = value.as_object().expect("object");
+        let missing: Vec<&String> = declared
+            .iter()
+            .filter(|n| !obj.contains_key(n.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "FinetuneStepTier does not emit shared identity field(s) {missing:?} declared in {}",
+            path.display()
+        );
     }
 }

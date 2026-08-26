@@ -58,7 +58,7 @@ use std::sync::Arc;
 // SAME `admit`-gated path production does, not a foreign optimizer that
 // never touches `jammi_kernels::admission`'s registry at all.
 use jammi_ai::fine_tune::adamw::AdamW;
-use jammi_ai::fine_tune::optimizer::clip_gradients;
+use jammi_ai::fine_tune::optimizer::{clip_gradients, sorted_trainable_vars, ClipOutcome};
 
 use crate::report::{FinetuneStepTier, Measurement};
 
@@ -101,17 +101,60 @@ fn validate_max_grad_norm(v: f32) -> Result<f32, InvalidMaxGradNorm> {
 
 /// How many times this run's step loop invoked the production
 /// [`clip_gradients`] — the counted fact backing the "clip on" A/B row,
-/// rather than a log line an operator has to trust. Process-wide, so tests
-/// read it as a before/after delta the same way the fused-kernel dispatch
-/// counters above are read.
+/// rather than a log line an operator has to trust. Process-wide, so both
+/// `run()` (which emits it as `FinetuneStepTier::clip_invocations`) and the
+/// tests read it as a before/after delta the same way the fused-kernel
+/// dispatch counters are read.
 static CLIP_INVOCATIONS: AtomicU64 = AtomicU64::new(0);
 
-/// Snapshot the clip-invocation counter. Test-only: the counted-fact channel
-/// the invocation-count tests below read as a before/after delta; nothing in
-/// the production report reads it today.
-#[cfg(test)]
+/// Snapshot the clip-invocation counter. `run()` takes one BEFORE its
+/// untimed pre-step and one after the loop, and emits the delta on the
+/// report (PR #381 audit B2: the counted fact was previously
+/// `#[cfg(test)]`-readable only, so the emitted row carried the
+/// `max_grad_norm` REQUEST but nothing counted); the invocation-count tests
+/// below read the same delta around their own `run` call.
 fn clip_invocations_snapshot() -> u64 {
     CLIP_INVOCATIONS.load(Ordering::Relaxed)
+}
+
+/// Attention-base op keys whose presence in `JAMMI_KERNELS_DISABLE`
+/// (`kernels_disabled_requested`) means the OPERATOR asked for the eager
+/// attention arm: the fused whole-attention-block CustomOp, the FA2 cascade
+/// key that absorbs it on the flash branch, or the `"all"` wildcard
+/// (`jammi_kernels::admission`'s module doc).
+const ATTENTION_DISABLE_KEYS: [&str; 3] = ["attention_block", "attention_block_flash", "all"];
+
+/// The attention REFERENCE CLASS the operator ASKED this run to measure —
+/// the value `FinetuneStepTier::attention_arm` carries into the shared
+/// jammi/torch identity check (see that field's doc and
+/// `ci/scripts/perf/identity_fields.py`'s entry): `"eager"` iff an
+/// attention base (`ATTENTION_DISABLE_KEYS`) is in
+/// `kernels_disabled_requested`, else `"fused"`.
+///
+/// Deliberately NOT derived from the `attention_block_*_dispatches`
+/// counters (PR #381 re-audit, class-A): those read EAGER whenever the
+/// fused predicate declines BY DOMAIN — `head_dim != 64`, `seq > 4096`, a
+/// dtype/contiguity/mask arm (`jammi_encoders::modernbert`'s predicate;
+/// `report.rs`'s `attention_block_eager_dispatches` doc calls that reading
+/// by-design) — so a legitimate jammi-fused leg on a non-64 `head_dim`
+/// checkpoint would have read `"eager"`, mismatched torch's `"fused"`, and
+/// INVALIDated the row over a MEASUREMENT, not a premise. Whether the fused
+/// arm actually ran stays where it already lives: `fused_proof` and the
+/// counters themselves. An identity field describes what was asked for;
+/// a domain decline is a datum about the checkpoint, never an identity
+/// mismatch. (The flash cascade is folded in for free: on the FA2 branch
+/// `attention_block_flash` is the key the eager leg disables, and the
+/// committed `s128_flash_on_1.json` fixture — block `0/0`, flash `840` —
+/// reads `"fused"` here, where a counter derivation read `"none"`.)
+fn attention_arm(kernels_disabled_requested: &[String]) -> &'static str {
+    if kernels_disabled_requested
+        .iter()
+        .any(|k| ATTENTION_DISABLE_KEYS.contains(&k.as_str()))
+    {
+        "eager"
+    } else {
+        "fused"
+    }
 }
 
 /// Poll total device memory in use, in bytes, via `nvidia-smi`.
@@ -335,7 +378,7 @@ fn build_fixture(
         .build(&[weights.as_path()], &config, &device, &varmap)?;
     encoder.set_training(true);
 
-    let trainable = varmap.all_vars();
+    let trainable = sorted_trainable_vars(&varmap);
     if trainable.is_empty() {
         return Err("no trainable LoRA tensors — target_modules matched nothing".into());
     }
@@ -379,9 +422,10 @@ fn build_fixture(
 /// `clip_gradients` then `optimizer.step`). `None` skips clipping entirely
 /// and is bit-identical to this function's behaviour before `max_grad_norm`
 /// existed. `trainable` is the SAME `Var` list `opt` was built over
-/// (`build_fixture`'s `varmap.all_vars()`) — `clip_gradients` needs it to
-/// look up each `Var`'s gradient in the `GradStore` `loss.backward()`
-/// returns.
+/// (`build_fixture`'s name-sorted `sorted_trainable_vars(&varmap)`) —
+/// `clip_gradients` needs it to look up each `Var`'s gradient in the
+/// `GradStore` `loss.backward()` returns, and folds the global norm in
+/// exactly this order (see `run()`'s own note on why it must be sorted).
 ///
 /// Returns the step's loss as `f32` — the same value the loop's CUDA-sync
 /// read already needed. PLACEMENT: the returned tensor was produced by the
@@ -431,8 +475,31 @@ fn step_once(
     // reverse). `None` skips this block entirely: bit-identical to the step
     // this function measured before `max_grad_norm` existed.
     if let Some(max_norm) = max_grad_norm {
-        clip_gradients(trainable, &mut grads, max_norm as f64)
+        // `ClipOutcome` is `#[must_use]`: this tier asked for a clip over a
+        // non-empty `trainable` with a validated `max_norm > 0`, so the ONLY
+        // outcome that makes this a clip-on row is `Clipped`. `Disabled`
+        // cannot happen (`validate_max_grad_norm` refused `<= 0` up front)
+        // and `NoGradients` means the fixture's loss did not route through
+        // any trainable `Var` — a broken measurement, not a datum; refuse
+        // it rather than count an invocation that clipped nothing.
+        let outcome = clip_gradients(trainable, &mut grads, max_norm as f64)
             .map_err(|e| format!("finetune-step clip_gradients: {e}"))?;
+        match outcome {
+            ClipOutcome::Clipped(_total_norm) => {
+                // The norm tensor is deliberately NOT read back here: this
+                // is the timed path, and the production trainer reads it
+                // only on `refuse_nonfinite_norm`'s cadence, never per step.
+            }
+            other @ (ClipOutcome::Disabled | ClipOutcome::NoGradients) => {
+                return Err(format!(
+                    "finetune-step clip_gradients returned {other:?} for max_grad_norm={max_norm} \
+                     over {} trainable Var(s) — the clip-on row would be claiming a clip that \
+                     never ran (INVALID run, not a datum)",
+                    trainable.len()
+                )
+                .into());
+            }
+        }
         CLIP_INVOCATIONS.fetch_add(1, Ordering::Relaxed);
     }
     opt.step(&grads)?;
@@ -514,11 +581,20 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
 
     let (mut encoder, mut opt, trainable_count, blocks, mask, varmap) = build_fixture(params)?;
     // The SAME `Var` list `opt` was built over (`build_fixture`'s own
-    // `varmap.all_vars()` — `Var` is a cheap `Arc`-backed handle, so this is
-    // a fresh `Vec` over the identical underlying storage, not a second
-    // fixture) — `step_once` needs it to look up each `Var`'s gradient in
-    // the `GradStore` when `params.max_grad_norm` is `Some`.
-    let trainable = varmap.all_vars();
+    // `sorted_trainable_vars(&varmap)` — `Var` is a cheap `Arc`-backed
+    // handle, so this is a fresh `Vec` over the identical underlying
+    // storage, not a second fixture) — `step_once` needs it to look up each
+    // `Var`'s gradient in the `GradStore` when `params.max_grad_norm` is
+    // `Some`. NAME-SORTED, never `VarMap::all_vars()`'s raw `HashMap` order
+    // (PR #381 audit B3, the esc-182 class): `clip_gradients` folds the
+    // global norm left-to-right over THIS slice, so its order decides the
+    // last bits of `total_norm` and of every clipped gradient — and
+    // therefore of every clip-on `losses` entry this tier emits. A raw
+    // `all_vars()` order is re-randomised per process by `HashMap`'s
+    // hasher seed, which would make two same-seed invocations of this
+    // binary disagree bit-for-bit; `clip_on_losses_are_bit_identical_
+    // across_processes` below pins that they do not.
+    let trainable = sorted_trainable_vars(&varmap);
 
     // The VRAM baseline is taken here, BEFORE the untimed pre-step below and
     // BEFORE the sampler starts — see the comment on `vram_baseline` for why
@@ -571,6 +647,14 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     // already running by this point (see above), so this step's allocation
     // legitimately contributes to the run's reported peak — it is part of
     // the same allocator pool the timed steps run in.
+    //
+    // The clip-invocation "before" snapshot is taken HERE, before the
+    // pre-step — unlike the dispatch-counter snapshots below, which are
+    // taken after it — so the emitted `clip_invocations` counts EVERY
+    // `step_once` this run made (pre-step + warmup + measured), the same
+    // window `torch_finetune_step.py`'s `clip_counter` covers. It is a
+    // count of what ran, not a per-measured-step rate.
+    let clip_invocations_before = clip_invocations_snapshot();
     step_once(
         &mut encoder,
         &mut opt,
@@ -717,6 +801,7 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
         batched_forward: params.batched_forward,
         max_grad_norm: params.max_grad_norm,
         trainable_tensors: trainable_count,
+        warmup: params.warmup,
         steps_measured: times.len(),
         losses,
         loss_first,
@@ -769,6 +854,13 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
         adamw_eager_dispatches: adamw_dispatch_after
             .eager
             .saturating_sub(adamw_dispatch_before.eager),
+        // Counted over pre-step + warmup + measured (the "before" snapshot
+        // sits above the pre-step, see there) — `warmup + steps + 1` on a
+        // clip-on row, `0` on a clip-off one.
+        clip_invocations: clip_invocations_snapshot().saturating_sub(clip_invocations_before),
+        // What the operator ASKED for (the resolved `JAMMI_KERNELS_DISABLE`
+        // request), never what the predicate measured — see `attention_arm`.
+        attention_arm: attention_arm(&kernels_disabled_requested).to_string(),
         kernels_disabled_requested,
         kernels_disabled_fired,
         s_per_step_p50: Measurement::measured(p50, "s"),
@@ -1041,7 +1133,7 @@ mod tests {
         let params = clip_tiny_params(max_grad_norm, 2, 0);
         let (mut encoder, mut opt, _count, blocks, mask, varmap) =
             build_fixture(&params).expect("build fixture");
-        let trainable = varmap.all_vars();
+        let trainable = sorted_trainable_vars(&varmap);
         assert!(!trainable.is_empty(), "target_modules matched nothing");
         for _ in 0..2 {
             step_once(
@@ -1149,6 +1241,309 @@ mod tests {
              bit-identical to no-op when max_norm is far above the actual \
              grad norm (clip_coef clamps to exactly 1.0)"
         );
+    }
+
+    /// One un-clipped backward over the tiny fixture (the SAME forward
+    /// `step_once` runs, `batched_forward` on), returning the name-sorted
+    /// trainable `Var`s, the raw `GradStore`, and a HOST-side `f64`
+    /// reference of the global L2 norm over exactly those gradients — the
+    /// independent oracle the active-arm test and the cross-process
+    /// determinism test below both need (the latter to prove its chosen
+    /// `max_norm` actually puts the coefficient strictly below `1.0`).
+    fn first_step_grads_and_host_norm(
+        params: &FinetuneStepParams,
+    ) -> (Vec<Var>, candle_core::backprop::GradStore, f64) {
+        let (encoder, _opt, _count, blocks, mask, varmap) =
+            build_fixture(params).expect("build fixture");
+        let trainable = sorted_trainable_vars(&varmap);
+        assert!(!trainable.is_empty(), "target_modules matched nothing");
+        let joined = Tensor::cat(&[&blocks[0], &blocks[1], &blocks[2]], 0).expect("cat");
+        let joined_mask = Tensor::cat(&[&mask, &mask, &mask], 0).expect("cat mask");
+        let all = encoder.forward(&joined, &joined_mask).expect("forward");
+        let b = params.batch;
+        let (a, p, n) = (
+            all.narrow(0, 0, b).expect("a"),
+            all.narrow(0, b, b).expect("p"),
+            all.narrow(0, 2 * b, b).expect("n"),
+        );
+        let loss = triplet_loss(&a, &p, &n, 0.3).expect("loss");
+        let grads = loss.backward().expect("backward");
+        let mut total_sq = 0.0f64;
+        let mut present = 0usize;
+        for var in &trainable {
+            if let Some(g) = grads.get(var.as_tensor()) {
+                present += 1;
+                for x in g
+                    .flatten_all()
+                    .expect("flatten")
+                    .to_vec1::<f32>()
+                    .expect("to_vec1")
+                {
+                    total_sq += (x as f64) * (x as f64);
+                }
+            }
+        }
+        assert!(
+            present > 0,
+            "no trainable Var received a gradient — broken fixture"
+        );
+        (trainable, grads, total_sq.sqrt())
+    }
+
+    /// The ACTIVE clip arm, against the host reference (PR #381 advisory:
+    /// this module's other clip tests run at `max_norm = 1e9` — where the
+    /// coefficient clamps to exactly `1.0` and the rescale is a bit-exact
+    /// no-op — or with the flag absent, so none of them ever exercised a
+    /// coefficient strictly below `1.0` through the bench's own fixture).
+    /// Picks `max_norm = total_norm / 2` off the host-side norm so `coef ≈
+    /// 0.5`, runs the PRODUCTION `clip_gradients` over the name-sorted
+    /// `Var`s exactly as `step_once` does, and checks every clipped element
+    /// against `g · min(1, max_norm / (norm + 1e-6))` computed on the host
+    /// in `f64`, within 4 `f32` ULPs — the same band `jammi-ai`'s own
+    /// `multi_var_clip_matches_host_reference_on_cpu` uses. Non-vacuous
+    /// control: at least one element must have CHANGED, or the arm did not
+    /// bite.
+    #[test]
+    fn active_clip_matches_host_reference_at_coefficient_below_one() {
+        let params = clip_tiny_params(None, 1, 0);
+        let (trainable, mut grads, host_norm) = first_step_grads_and_host_norm(&params);
+        assert!(
+            host_norm.is_finite() && host_norm > 0.0,
+            "host norm {host_norm}"
+        );
+        let max_norm = host_norm / 2.0;
+        let host_coef = (max_norm / (host_norm + 1e-6)).min(1.0);
+        assert!(
+            host_coef < 1.0,
+            "test setup: coefficient must be strictly below 1.0, got {host_coef}"
+        );
+
+        let before: Vec<(usize, Vec<f32>)> = trainable
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| {
+                grads.get(v.as_tensor()).map(|g| {
+                    (
+                        i,
+                        g.flatten_all()
+                            .expect("flatten")
+                            .to_vec1::<f32>()
+                            .expect("to_vec1"),
+                    )
+                })
+            })
+            .collect();
+
+        let outcome = clip_gradients(&trainable, &mut grads, max_norm).expect("clip");
+        let total_norm = match outcome {
+            ClipOutcome::Clipped(t) => t.to_scalar::<f32>().expect("norm read"),
+            other => panic!("expected Clipped, got {other:?}"),
+        };
+        let device_vs_host_norm = ((total_norm as f64) - host_norm).abs();
+        assert!(
+            device_vs_host_norm <= 4.0 * (host_norm as f32).abs() as f64 * f32::EPSILON as f64,
+            "device total_norm {total_norm} vs host {host_norm}: off by {device_vs_host_norm}"
+        );
+
+        let mut changed = 0usize;
+        for (i, orig) in &before {
+            let after = grads
+                .get(trainable[*i].as_tensor())
+                .expect("gradient still present after clip")
+                .flatten_all()
+                .expect("flatten")
+                .to_vec1::<f32>()
+                .expect("to_vec1");
+            assert_eq!(orig.len(), after.len());
+            for (j, (o, a)) in orig.iter().zip(&after).enumerate() {
+                let expected = (*o as f64) * host_coef;
+                let tol = 4.0
+                    * (expected.abs() as f32).max(f32::MIN_POSITIVE) as f64
+                    * f32::EPSILON as f64;
+                assert!(
+                    ((*a as f64) - expected).abs() <= tol,
+                    "Var {i} elem {j}: clipped {a} vs host {expected} (orig {o}, coef {host_coef}), tol {tol}"
+                );
+                if a.to_bits() != o.to_bits() {
+                    changed += 1;
+                }
+            }
+        }
+        assert!(
+            changed > 0,
+            "non-vacuous control: the active arm must have rescaled at least one element"
+        );
+    }
+
+    /// `max_norm` for the cross-process determinism test below — small
+    /// enough that the tiny fixture's first-step gradient norm is
+    /// comfortably above it (the child ASSERTS that, off the host-side
+    /// norm, so a fixture whose norm ever drops below this fails loudly
+    /// instead of silently testing the clamp-to-1.0 no-op arm).
+    const CROSS_PROCESS_MAX_NORM: f32 = 1e-3;
+    const CROSS_PROCESS_CHILD_ENV: &str = "JAMMI_BENCH_CLIP_DETERMINISM_CHILD";
+
+    /// PR #381 audit B3 — the cross-PROCESS determinism proof the PR body
+    /// called "not yet run": two separate invocations of this test binary,
+    /// same seed, `--max-grad-norm` active (coefficient strictly below
+    /// `1.0`, asserted), must emit bit-identical `losses`. This is the
+    /// esc-182 class made observable at the bench's own CLI-shaped entry
+    /// point (`run()`): `clip_gradients` folds the global norm in the
+    /// order its `trainable` slice arrives, and a raw `VarMap::all_vars()`
+    /// order is re-randomised per process by `HashMap`'s hasher seed — so
+    /// with `all_vars()` at `build_fixture`/`run` (as before this round)
+    /// the last bits of every clipped gradient, and therefore of every
+    /// loss after the first, differed between two launches of the same
+    /// command. A single-process test cannot see this (one process, one
+    /// hasher seed); this one re-executes itself as two child processes
+    /// (`std::env::current_exe()`, filtered `--exact` to this test, with
+    /// `CROSS_PROCESS_CHILD_ENV` set) and compares what they printed.
+    /// Also checks the counted fact: `clip_invocations == steps + warmup
+    /// + 1` in each child.
+    #[test]
+    fn clip_on_losses_are_bit_identical_across_processes() {
+        const STEPS: usize = 3;
+        const WARMUP: usize = 1;
+        if std::env::var_os(CROSS_PROCESS_CHILD_ENV).is_some() {
+            // CHILD: prove the clip is active, run the real entry point,
+            // print the loss bits for the parent to compare.
+            let params = clip_tiny_params(Some(CROSS_PROCESS_MAX_NORM), STEPS, WARMUP);
+            let (_, _, host_norm) = first_step_grads_and_host_norm(&params);
+            assert!(
+                host_norm > (CROSS_PROCESS_MAX_NORM as f64) * 2.0,
+                "child: first-step grad norm {host_norm} is not comfortably above \
+                 CROSS_PROCESS_MAX_NORM {CROSS_PROCESS_MAX_NORM} — the clip would not bite"
+            );
+            let tier = run(&params).expect("child run");
+            let bits: Vec<String> = tier
+                .losses
+                .iter()
+                .map(|l| format!("{:08x}", l.to_bits()))
+                .collect();
+            println!("CLIP_DETERMINISM_LOSSES {}", bits.join(","));
+            println!("CLIP_DETERMINISM_INVOCATIONS {}", tier.clip_invocations);
+            println!("CLIP_DETERMINISM_ATTENTION_ARM {}", tier.attention_arm);
+            return;
+        }
+
+        let exe = std::env::current_exe().expect("current_exe");
+        // libtest's name for this fn is the module path WITHOUT the crate
+        // prefix (`finetune_step::tests::…`), which `module_path!()` carries.
+        let (_, module) = module_path!()
+            .split_once("::")
+            .expect("module_path has a crate prefix");
+        let name = format!("{module}::clip_on_losses_are_bit_identical_across_processes");
+        let run_child = |label: &str| -> (String, String, String) {
+            let out = std::process::Command::new(&exe)
+                .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+                .env(CROSS_PROCESS_CHILD_ENV, "1")
+                .output()
+                .expect("spawn child test process");
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            assert!(
+                out.status.success(),
+                "child {label} failed ({:?})\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+                out.status
+            );
+            // libtest prints `test <name> ... ` WITHOUT a newline before the
+            // test body's own first `println!` under `--nocapture`, so the
+            // first marker sits mid-line: match by substring, not prefix.
+            let grab = |key: &str| -> String {
+                stdout
+                    .lines()
+                    .find_map(|l| l.split_once(key).map(|(_, v)| v.trim().to_string()))
+                    .unwrap_or_else(|| panic!("child {label} printed no `{key}` line:\n{stdout}"))
+            };
+            (
+                grab("CLIP_DETERMINISM_LOSSES "),
+                grab("CLIP_DETERMINISM_INVOCATIONS "),
+                grab("CLIP_DETERMINISM_ATTENTION_ARM "),
+            )
+        };
+        let (losses_a, invocations_a, arm_a) = run_child("A");
+        let (losses_b, invocations_b, arm_b) = run_child("B");
+        assert_eq!(
+            losses_a.split(',').count(),
+            STEPS,
+            "child A must report one loss per measured step: {losses_a}"
+        );
+        assert_eq!(
+            losses_a, losses_b,
+            "same seed, same --max-grad-norm, two processes: clip-on losses must be bit-identical \
+             (A={losses_a} B={losses_b}) — a mismatch is the esc-182 HashMap-order class"
+        );
+        assert_eq!(
+            invocations_a,
+            (STEPS + WARMUP + 1).to_string(),
+            "clip_invocations must count pre-step + warmup + measured"
+        );
+        assert_eq!(invocations_a, invocations_b);
+        assert_eq!(
+            arm_a, arm_b,
+            "attention_arm must be a function of the run, not the process"
+        );
+        assert!(
+            ["fused", "eager"].contains(&arm_a.as_str()),
+            "a single-arm run must read fused or eager, got {arm_a}"
+        );
+    }
+
+    /// The `attention_arm` derivation, pinned (see the tier field's doc):
+    /// it is the OPERATOR'S REQUEST — an attention base in the resolved
+    /// `JAMMI_KERNELS_DISABLE` list — never the counters' verdict.
+    #[test]
+    fn attention_arm_is_the_operators_request_not_the_predicates_verdict() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(attention_arm(&s(&[])), "fused");
+        assert_eq!(attention_arm(&s(&["layer_norm_fused"])), "fused");
+        assert_eq!(attention_arm(&s(&["attention_block"])), "eager");
+        assert_eq!(attention_arm(&s(&["attention_block_flash"])), "eager");
+        assert_eq!(attention_arm(&s(&["all"])), "eager");
+        assert_eq!(
+            attention_arm(&s(&["geglu_fused", "attention_block"])),
+            "eager"
+        );
+    }
+
+    /// The emitted `clip_invocations` is the SAME delta the invocation-count
+    /// tests above read off the process-wide counter — `warmup + steps + 1`
+    /// on a clip-on row, `0` on a clip-off one — and `attention_arm` is a
+    /// single-arm value on this fixture.
+    #[test]
+    fn tier_emits_counted_clip_invocations_and_a_single_attention_arm() {
+        let _serial = CLIP_COUNTER_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let on = run(&clip_tiny_params(Some(1.0), 2, 1)).expect("clip-on run");
+        assert_eq!(on.clip_invocations, 2 + 1 + 1);
+        assert_eq!(on.max_grad_norm, Some(1.0));
+        let off = run(&clip_tiny_params(None, 2, 1)).expect("clip-off run");
+        assert_eq!(off.clip_invocations, 0);
+        assert_eq!(off.max_grad_norm, None);
+        for tier in [&on, &off] {
+            assert_eq!(tier.warmup, 1);
+            assert_eq!(
+                tier.attention_arm,
+                attention_arm(&tier.kernels_disabled_requested),
+                "attention_arm must be the resolved JAMMI_KERNELS_DISABLE request"
+            );
+            // THE CLASS-A REPRODUCTION (PR #381 re-audit): this fixture has
+            // `head_dim = 16`, so the fused attention-block predicate
+            // DECLINES BY DOMAIN and the counters read eager — yet nothing
+            // was disabled, so the leg the operator asked for is the fused
+            // one and must read "fused" (a counter-derived value read
+            // "eager" here and would have INVALIDated a real non-64-head_dim
+            // A/B row against torch-sdpa).
+            assert!(tier.kernels_disabled_requested.is_empty());
+            assert_eq!(tier.attention_arm, "fused");
+            assert!(
+                tier.attention_block_eager_dispatches > 0 && tier.attention_block_fused_dispatches == 0,
+                "test premise: the tiny fixture must be a domain decline (eager counters), got fused={} eager={}",
+                tier.attention_block_fused_dispatches,
+                tier.attention_block_eager_dispatches
+            );
+        }
     }
 
     /// The engine's own tiny 1-layer, 32-hidden ModernBERT fixture — shared
@@ -1405,7 +1800,7 @@ mod tests {
         // play either, so this replay is exactly reproducible on CPU/F32.
         let (mut o_encoder, mut o_opt, _count, o_blocks, o_mask, o_varmap) =
             build_fixture(&params).expect("oracle fixture");
-        let o_trainable = o_varmap.all_vars();
+        let o_trainable = sorted_trainable_vars(&o_varmap);
         // Call #1: the PRISTINE (zero prior updates) loss.
         let pristine_loss = step_once(
             &mut o_encoder,
@@ -1517,7 +1912,7 @@ mod tests {
             "lora_b must start at EXACTLY zero under LoraInitMode::ZerosB — {before:?}"
         );
 
-        let trainable = varmap.all_vars();
+        let trainable = sorted_trainable_vars(&varmap);
         step_once(
             &mut encoder,
             &mut opt,
@@ -1596,7 +1991,7 @@ mod tests {
             params.lora_dropout = lora_dropout;
             let (mut encoder, mut opt, _count, blocks, mask, varmap) =
                 build_fixture(&params).expect("fixture");
-            let trainable = varmap.all_vars();
+            let trainable = sorted_trainable_vars(&varmap);
             // Untimed pre-step: moves `lora_b` off its `ZerosB` exact
             // zero — see this test's own doc for why the FIRST call's
             // loss is provably dropout-independent regardless.
@@ -1859,7 +2254,7 @@ mod tests {
 
     /// F1 REGRESSION (audit finding on PR #372): `peak_vram_bytes` is
     /// `VramSampler::finish`'s `peak.saturating_sub(baseline)`
-    /// (`finetune_step.rs:175` at the time of writing). `saturating_sub`
+    /// (`finetune_step.rs:218` at the time of writing). `saturating_sub`
     /// FLOORS at zero rather than wrapping — so if `baseline` is ever
     /// captured AT (or above) the run's own high-water mark, the reported
     /// delta collapses to zero even though the run legitimately allocated

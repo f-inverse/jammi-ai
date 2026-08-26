@@ -68,13 +68,13 @@
     }
   },
   "schema_version": 1,
-  "git_sha": "b98f7e1de35b5cfcac00325089fd5eeaf7c6259a",
+  "git_sha": "5886c6b627c7a943df384a8aaadb7c3d6714e79c",
   "box": "a100b",
   "status": "GREEN",
   "producer": {
-    "path": "crates/jammi-bench/src/finetune_step.rs",
+    "path": "ci/scripts/perf/fa2_ab.sh",
     "kind": "script",
-    "invocation": "jammi-bench finetune-step --model-dir /root/checkpoints/ModernBERT-large --batch 8 --steps 25 --warmup 5 --backbone-dtype bf16 --cuda 0 --seed 42 --batched-forward --target-modules Wqkv,Wo,Wi --lora-rank 8 --lora-alpha 16.0 --lora-dropout 0.05 (JAMMI_KERNELS_STRICT=1)",
+    "invocation": "JAMMI_KERNELS_STRICT=1 jammi-bench finetune-step --model-dir /root/checkpoints/ModernBERT-large --lora-rank 16 --lora-alpha 32 --target-modules Wqkv,Wo,Wi --backbone-dtype bf16 --cuda 0 --seed 42 --batched-forward true --steps 25 --warmup 5 --lora-dropout 0 --batch 8 --seq 128",
     "gating": "none"
   }
 }

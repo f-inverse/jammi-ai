@@ -715,6 +715,24 @@ jobs:
           - name: CUDA run artifact schema
             cmd: python3 ci/scripts/check_cuda_run_artifacts.py
             fetch_depth: "0"
+          # Mocks-only, no-network regression suite for the 2026-08-25
+          # gpu-dev pod-lifecycle incident (ledger rows 279-289) and the
+          # mechanism defects three follow-up audit rounds found in this
+          # suite's own first pass: an EXIT trap firing during the
+          # SSH-readiness wait must still terminate a pod this invocation
+          # just rented; a read-only subcommand's require_pod failure must
+          # never issue podTerminate; `up` refuses a session alias that
+          # already has a recorded pod unless --replace, and --replace must
+          # not inherit a dead session's own RP_TTL_HOURS/RP_IMAGE;
+          # RP_DEV_TTL_HOURS validates under its own name; `down` verifies a
+          # recorded pod by id + this tooling's own name SHAPE only (never
+          # an exact TTL — two earlier attempts to make the TTL part of the
+          # check were both removed as unsafe/inert), keeps the local record
+          # on a refusal, and CONFIRMS a terminate actually took before
+          # forgetting the record. See
+          # ci/scripts/test_gpu_dev_lifecycle.sh's own module doc.
+          - name: gpu-dev lifecycle safety
+            cmd: bash ci/scripts/test_gpu_dev_lifecycle.sh
           # Completeness tripwire for this very guard class: every
           # ci/scripts/check_*.py|.sh gate script must be referenced by at
           # least one workflow (this file included), so a new check script
@@ -722,7 +740,7 @@ jobs:
           - name: CI guard wiring
             cmd: python3 ci/scripts/check_ci_guard_wiring.py
           # check_ci_guard_wiring.py's OWN suite (advisory iii, PR #372
-          # round 2): drives the real python_test_suites()/main() entry
+          # round 2): drives the real tracked_test_suites()/main() entry
           # points against throwaway git-init'd fixtures, pinning the
           # comment-vs-code-line tightening and the root generalization.
           - name: CI guard wiring suite

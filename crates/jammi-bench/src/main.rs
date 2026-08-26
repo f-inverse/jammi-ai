@@ -80,13 +80,9 @@ use clap::{Parser, Subcommand};
 
 use std::path::PathBuf;
 
-use report::{ArxivTier, Host, Report, Tiers};
+use report::{ArxivTier, Provenance, Report, Tiers};
 use search_rss::Variant;
 use train_scale::BackwardPath;
-
-/// Workspace version this binary was built from, stamped into every report so a
-/// downstream gate can reject a cross-version comparison.
-const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Parser)]
 #[command(
@@ -500,6 +496,17 @@ enum Command {
     /// report with the `recompute` tier set and exits non-zero if the sweep
     /// dropped a node, double-counted one, or mis-ordered a parent/child.
     RecomputeScale,
+    /// Internal: print this binary's own baked build-time identity
+    /// (`build_sha`, `target`, `profile`, `build_features`,
+    /// `report_schema_version`) as standalone JSON — the SAME object every
+    /// other subcommand's report carries at `report.provenance`
+    /// (`report::Provenance::baked`, filled by `build.rs` at COMPILE time,
+    /// never read at run time). A shell producer (`stacked_sweep.sh`,
+    /// `proof_artifact.py`) runs this BEFORE a leg to cross-check
+    /// `build_sha` against its own resolved sha, rather than discovering a
+    /// stale binary only after paying for the measurement.
+    #[command(hide = true)]
+    Provenance,
 }
 
 #[tokio::main]
@@ -654,7 +661,23 @@ async fn main() -> std::process::ExitCode {
         ),
         Command::CacheSloScale => run_cache_slo_scale().await,
         Command::RecomputeScale => run_recompute_scale().await,
+        Command::Provenance => run_provenance(),
     }
+}
+
+/// The `provenance` subcommand: print this binary's baked build-time
+/// identity as standalone JSON. Never fails — every field is a compile-time
+/// literal or a linked-crate `const`, so there is nothing to read at run
+/// time that could error (`provenance_baked.rs`'s
+/// `runtime_env_and_cwd_are_inert` proves the run-time inertness this
+/// relies on).
+fn run_provenance() -> std::process::ExitCode {
+    let provenance = Provenance::baked();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&provenance).expect("serialize provenance")
+    );
+    std::process::ExitCode::SUCCESS
 }
 
 /// The `grad-oracle` subcommand: run one forward+backward (no optimizer
@@ -705,15 +728,13 @@ fn run_finetune_step(params: finetune_step::FinetuneStepParams) -> std::process:
             return std::process::ExitCode::FAILURE;
         }
     };
-    let report = Report {
-        engine_version: ENGINE_VERSION,
-        host: Host::detect(),
-        subcommand: "finetune-step",
-        tiers: Tiers {
+    let report = Report::new(
+        "finetune-step",
+        Tiers {
             finetune_step: Some(tier),
             ..Default::default()
         },
-    };
+    );
     println!(
         "{}",
         serde_json::to_string_pretty(&report).expect("serialize report")
@@ -741,11 +762,9 @@ async fn run_cache_slo_scale() -> std::process::ExitCode {
         }
     };
     let passed = cache_slo::gate_passed(&tier);
-    let report = Report {
-        engine_version: ENGINE_VERSION,
-        host: Host::detect(),
-        subcommand: "cache-slo-scale",
-        tiers: Tiers {
+    let report = Report::new(
+        "cache-slo-scale",
+        Tiers {
             arxiv: None,
             binding: None,
             recall_sweep: None,
@@ -761,7 +780,7 @@ async fn run_cache_slo_scale() -> std::process::ExitCode {
             cache_slo: Some(tier),
             recompute: None,
         },
-    };
+    );
     emit(&report);
     if passed {
         std::process::ExitCode::SUCCESS
@@ -794,11 +813,9 @@ async fn run_recompute_scale() -> std::process::ExitCode {
         }
     };
     let passed = recompute_scale::gate_passed(&tier);
-    let report = Report {
-        engine_version: ENGINE_VERSION,
-        host: Host::detect(),
-        subcommand: "recompute-scale",
-        tiers: Tiers {
+    let report = Report::new(
+        "recompute-scale",
+        Tiers {
             arxiv: None,
             binding: None,
             recall_sweep: None,
@@ -814,7 +831,7 @@ async fn run_recompute_scale() -> std::process::ExitCode {
             cache_slo: None,
             recompute: Some(tier),
         },
-    };
+    );
     emit(&report);
     if passed {
         std::process::ExitCode::SUCCESS
@@ -898,11 +915,9 @@ async fn run_train_scale() -> std::process::ExitCode {
     let tier = train_scale::build_tier(throughput, baseline, oom);
     let oom_passed = tier.oom.assertion.passed;
     let rate_passed = tier.rate_gate.as_ref().is_none_or(|v| v.passed);
-    let report = Report {
-        engine_version: ENGINE_VERSION,
-        host: Host::detect(),
-        subcommand: "train-scale",
-        tiers: Tiers {
+    let report = Report::new(
+        "train-scale",
+        Tiers {
             arxiv: None,
             binding: None,
             recall_sweep: None,
@@ -918,7 +933,7 @@ async fn run_train_scale() -> std::process::ExitCode {
             cache_slo: None,
             recompute: None,
         },
-    };
+    );
     emit(&report);
     if !oom_passed {
         eprintln!(
@@ -961,11 +976,9 @@ fn run_conformal_scale() -> std::process::ExitCode {
         }
     };
     let passed = conformal::all_gates_passed(&tier);
-    let report = Report {
-        engine_version: ENGINE_VERSION,
-        host: Host::detect(),
-        subcommand: "conformal-scale",
-        tiers: Tiers {
+    let report = Report::new(
+        "conformal-scale",
+        Tiers {
             arxiv: None,
             binding: None,
             recall_sweep: None,
@@ -981,7 +994,7 @@ fn run_conformal_scale() -> std::process::ExitCode {
             cache_slo: None,
             recompute: None,
         },
-    };
+    );
     emit(&report);
     if passed {
         std::process::ExitCode::SUCCESS
@@ -1014,11 +1027,9 @@ fn run_eval_scale() -> std::process::ExitCode {
         }
     };
     let passed = eval::all_gates_passed(&tier);
-    let report = Report {
-        engine_version: ENGINE_VERSION,
-        host: Host::detect(),
-        subcommand: "eval-scale",
-        tiers: Tiers {
+    let report = Report::new(
+        "eval-scale",
+        Tiers {
             arxiv: None,
             binding: None,
             recall_sweep: None,
@@ -1034,7 +1045,7 @@ fn run_eval_scale() -> std::process::ExitCode {
             cache_slo: None,
             recompute: None,
         },
-    };
+    );
     emit(&report);
     if passed {
         std::process::ExitCode::SUCCESS
@@ -1068,11 +1079,9 @@ async fn run_propagate_scale() -> std::process::ExitCode {
         }
     };
     let passed = propagate::gate_passed(&tier);
-    let report = Report {
-        engine_version: ENGINE_VERSION,
-        host: Host::detect(),
-        subcommand: "propagate-scale",
-        tiers: Tiers {
+    let report = Report::new(
+        "propagate-scale",
+        Tiers {
             arxiv: None,
             binding: None,
             recall_sweep: None,
@@ -1088,7 +1097,7 @@ async fn run_propagate_scale() -> std::process::ExitCode {
             cache_slo: None,
             recompute: None,
         },
-    };
+    );
     emit(&report);
     if passed {
         std::process::ExitCode::SUCCESS
@@ -1278,11 +1287,9 @@ fn run_graph_train_scale() -> std::process::ExitCode {
         }
     };
     let passed = graph_train::gates_passed(&tier);
-    let report = Report {
-        engine_version: ENGINE_VERSION,
-        host: Host::detect(),
-        subcommand: "graph-train-scale",
-        tiers: Tiers {
+    let report = Report::new(
+        "graph-train-scale",
+        Tiers {
             arxiv: None,
             binding: None,
             recall_sweep: None,
@@ -1298,7 +1305,7 @@ fn run_graph_train_scale() -> std::process::ExitCode {
             cache_slo: None,
             recompute: None,
         },
-    };
+    );
     emit(&report);
     if passed {
         std::process::ExitCode::SUCCESS
@@ -1379,11 +1386,9 @@ async fn run_context_predictor_scale() -> std::process::ExitCode {
         }
     };
     let passed = context_predictor::gates_passed(&tier);
-    let report = Report {
-        engine_version: ENGINE_VERSION,
-        host: Host::detect(),
-        subcommand: "context-predictor-scale",
-        tiers: Tiers {
+    let report = Report::new(
+        "context-predictor-scale",
+        Tiers {
             arxiv: None,
             binding: None,
             recall_sweep: None,
@@ -1399,7 +1404,7 @@ async fn run_context_predictor_scale() -> std::process::ExitCode {
             cache_slo: None,
             recompute: None,
         },
-    };
+    );
     emit(&report);
     if passed {
         std::process::ExitCode::SUCCESS
@@ -1487,11 +1492,9 @@ async fn run_model_inference_scale() -> std::process::ExitCode {
         }
     };
     let passed = model_inference::gates_passed(&tier);
-    let report = Report {
-        engine_version: ENGINE_VERSION,
-        host: Host::detect(),
-        subcommand: "model-inference-scale",
-        tiers: Tiers {
+    let report = Report::new(
+        "model-inference-scale",
+        Tiers {
             arxiv: None,
             binding: None,
             recall_sweep: None,
@@ -1507,7 +1510,7 @@ async fn run_model_inference_scale() -> std::process::ExitCode {
             cache_slo: None,
             recompute: None,
         },
-    };
+    );
     emit(&report);
     if passed {
         std::process::ExitCode::SUCCESS
@@ -1581,15 +1584,13 @@ async fn run_gpu_inference_scale() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    let report = Report {
-        engine_version: ENGINE_VERSION,
-        host: Host::detect(),
-        subcommand: "gpu-inference-scale",
-        tiers: Tiers {
+    let report = Report::new(
+        "gpu-inference-scale",
+        Tiers {
             gpu_inference: Some(tier),
             ..Default::default()
         },
-    };
+    );
     emit(&report);
     std::process::ExitCode::SUCCESS
 }
@@ -1636,11 +1637,9 @@ async fn run_search_rss() -> std::process::ExitCode {
         }
     };
     let passed = tier.assertion.passed;
-    let report = Report {
-        engine_version: ENGINE_VERSION,
-        host: Host::detect(),
-        subcommand: "search-rss",
-        tiers: Tiers {
+    let report = Report::new(
+        "search-rss",
+        Tiers {
             arxiv: None,
             binding: Some(tier),
             recall_sweep: None,
@@ -1656,7 +1655,7 @@ async fn run_search_rss() -> std::process::ExitCode {
             cache_slo: None,
             recompute: None,
         },
-    };
+    );
     emit(&report);
     if passed {
         std::process::ExitCode::SUCCESS
@@ -1691,11 +1690,9 @@ async fn run_arxiv() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    let report = Report {
-        engine_version: ENGINE_VERSION,
-        host: Host::detect(),
-        subcommand: "arxiv",
-        tiers: Tiers {
+    let report = Report::new(
+        "arxiv",
+        Tiers {
             arxiv: Some(ArxivTier::with_recall(recall)),
             binding: None,
             recall_sweep: None,
@@ -1711,7 +1708,7 @@ async fn run_arxiv() -> std::process::ExitCode {
             cache_slo: None,
             recompute: None,
         },
-    };
+    );
     emit(&report);
     std::process::ExitCode::SUCCESS
 }
@@ -1752,11 +1749,9 @@ async fn run_recall_sweep(
             return std::process::ExitCode::FAILURE;
         }
     };
-    let report = Report {
-        engine_version: ENGINE_VERSION,
-        host: Host::detect(),
-        subcommand: "recall-sweep",
-        tiers: Tiers {
+    let report = Report::new(
+        "recall-sweep",
+        Tiers {
             arxiv: None,
             binding: None,
             recall_sweep: Some(tier),
@@ -1772,7 +1767,7 @@ async fn run_recall_sweep(
             cache_slo: None,
             recompute: None,
         },
-    };
+    );
     emit(&report);
     std::process::ExitCode::SUCCESS
 }

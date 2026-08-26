@@ -483,6 +483,94 @@ def provenance(device, fast_path_globals):
     return info
 
 
+# Unification contract C3.5 — this producer's own K7-completeness identity
+# list: the SAME shape `FinetuneStepTier::IDENTITY_FIELDS` /
+# `GradOracleReport::IDENTITY_FIELDS` carry on the Rust side
+# (`crates/jammi-bench/src/report.rs`, `grad_oracle.rs`), for THIS producer.
+# The 14 entries `ab_merge.py`'s own `FINETUNE_IDENTITY_FIELDS` compares
+# (`ab_merge.py:114-129`) — present here at whichever placement this
+# producer's own report actually uses (`report["args"][field]` for the three
+# named in `ab_merge.py`'s `_TORCH_ARGS_LEVEL_FIELDS`, `report["finetune_step"]
+# [field]` for the rest — see that module's own doc) — plus 14
+# K7-completeness additions this producer alone carries: five environment/
+# version facts (`torch_version`, `torch_cuda_version`, `transformers_version`,
+# `peft_version`, `python_version`), the attention/compile/LoRA-init
+# determinants this producer's own `--attn`/`--lora-init` CLI flags resolve
+# (`attn_implementation`, `sdpa_backend_probe`, `reference_compile_resolved`,
+# `lora_init`), `adamw_foreach` (torch's own multi-tensor-vs-loop optimizer
+# fast path, the torch peer of jammi's `adamw_fused_dispatches`), and three
+# provenance fields this function (`provenance`, above) itself fills:
+# `fast_path_globals`, `device_name`, `git_rev`.
+#
+# `provenance`'s own `if device.type == "cuda":` guard (immediately above)
+# governs THREE fields, not one — round-2 audit (B4) caught the other two:
+# `device_name` (:476, initialised `None`, filled only under that guard) and
+# `torch_cuda_version` (:471, `torch.version.cuda` — `None` on a CPU-only
+# torch build regardless of THIS run's `--cuda` flag, since it reflects how
+# the installed torch package itself was compiled). All three are nullable
+# entries (`TORCH_IDENTITY_FIELDS_NULL_MEANS` below): `null` on any of them
+# means "this run had no CUDA device" / "this torch install has no CUDA
+# support", never "this producer predates the field".
+#
+# Round-3 audit (advisory 1): three MORE fields are independently nullable,
+# each governed by its OWN separate guard (not the CUDA one above) — `git_rev`
+# (:441-452, `None` when `git` is not on `PATH`, this file is not inside a
+# git worktree, or the subprocess times out — mirrors `grad_oracle.rs`'s own
+# `git_rev` field, which is likewise `None` when the baked `build_sha`
+# resolved to `"unknown"`), `transformers_version` / `peft_version` (:472-473,
+# `getattr(transformers/peft, "__version__", None)` — `None` when that
+# OPTIONAL package (imported inside a `try`/`except ImportError` a few lines
+# above `info = {...}`) is not installed at all, never "this producer
+# predates the field"). See `TORCH_IDENTITY_FIELDS_NULL_MEANS`, immediately
+# below, for the full six-entry nullable set and each one's declared meaning
+# — every `TORCH_IDENTITY_FIELDS` entry NOT listed there is `NonNull`.
+TORCH_IDENTITY_FIELDS = (
+    "seed",
+    "batch",
+    "seq",
+    "lora_rank",
+    "lora_alpha",
+    "lora_dropout",
+    "margin",
+    "target_modules",
+    "batched_forward",
+    "backbone_dtype",
+    "steps_measured",
+    "checkpoint_config_sha256",
+    "checkpoint_weights_sha256",
+    "checkpoint_weights_size_bytes",
+    "torch_version",
+    "torch_cuda_version",
+    "transformers_version",
+    "peft_version",
+    "python_version",
+    "attn_implementation",
+    "sdpa_backend_probe",
+    "reference_compile_resolved",
+    "lora_init",
+    "adamw_foreach",
+    "fast_path_globals",
+    "device_name",
+    "nvidia_driver_version",
+    "git_rev",
+)
+
+# Field -> what a `null`/absent reading on THIS producer means. Every
+# `TORCH_IDENTITY_FIELDS` entry not listed here is `NonNull` (a null/absent
+# reading is itself a finding, mirroring the Rust `Nullable::NonNull` class).
+# Round-3 audit (advisory 1): `git_rev`/`transformers_version`/`peft_version`
+# joined the CUDA-guard trio below — each has its OWN independent reason to
+# read `null` (see the doc paragraph directly above `TORCH_IDENTITY_FIELDS`).
+TORCH_IDENTITY_FIELDS_NULL_MEANS = {
+    "nvidia_driver_version": "no CUDA",
+    "device_name": "no CUDA",
+    "torch_cuda_version": "no CUDA (this torch install has no CUDA support)",
+    "git_rev": "git unavailable (not on PATH, not a git worktree, or the subprocess timed out)",
+    "transformers_version": "transformers not installed",
+    "peft_version": "peft not installed",
+}
+
+
 def build_dry_run_checkpoint(tmp_dir: str) -> str:
     """Materialize a tiny random-init 2-layer ModernBERT to `tmp_dir` via
     `save_pretrained`, so the `--dry-run` path can reload it through the

@@ -120,16 +120,35 @@ missed a computed field living in a SIBLING subtree, e.g. cast-w1's own
 which are siblings of `/deltas` at the artifact's top level, not ancestors
 of it) for a leaf whose OWN key matches `delta*`/`ratio*`/`speedup*`/
 `*_pct`/`spread*` AND whose OWN json-pointer path shares every
-digit-bearing identifier token (`_path_digit_tokens`: e.g. `b8`, `s512`,
-`p50`) common to ALL the operands' own paths — a leg-specific suffix like
-`r1`/`r2` never survives that intersection since it differs per operand, so
-it never over-constrains the match. NUMBER and STRING leaves are both hits
-(audit A1: a string-valued field, e.g. a hand-written `"+0.235 to +0.369
-GB"` range, is a FINDING too — "artifact states a range: bind two tokens or
-ledger it" — never a silently blessed pass just because it isn't a JSON
-number the pointer grammar could resolve to). If a hit exists, the tag is a
-FINDING naming the field's own pointer, unless the tag's own operand
-pointers already include that exact leaf.
+digit-bearing identifier token (`_path_digit_tokens`) common to ALL the
+operands' own paths, EXCLUDING any per-replicate suffix (`r1`, `r2`,
+`rep...`) — round-3 audit fix: a per-rep suffix is explicitly STRIPPED
+before intersecting, not left to "never survive the intersection" as an
+earlier revision's docstring claimed. That claim was false: a SAME-rep
+pair (`.../legs/b8_s512_disabled_r1/s_per_step_p50` vs `.../legs/
+b8_s512_fused_r1/s_per_step_p50` — both `r1`) keeps `r1` in the natural
+intersection, over-constrains the candidate search, and silently misses
+the artifact's own `/deltas/b8_s512_p50_ms/delta_ms` (whose path carries
+no rep suffix at all) — binding `39.565658` bit-for-bit as an unchecked
+free diff. Stripping the suffix outright closes the class regardless of
+whether the two operands happen to share or differ on their own rep index.
+The remaining identifier tokens must ALSO be consistent with a matching
+UNIT FAMILY (`_unit_family`: `ms`/`s`/`bytes` inferred from each leaf key's
+own suffix) — a `_ms`-family candidate is only offered to `_ms`/`s_per_
+step`-shaped operands, a `_gb`/bytes-family candidate only to VRAM-shaped
+operands; a shared shape token like `b8_s512` alone is not enough (it
+would otherwise let a VRAM diff match a millisecond field of the same
+shape, or vice versa). When the operands span more than one tracked file,
+or share NO digit-bearing identifier token at all, precedence is
+UNDECIDABLE and the tag is a FINDING naming that explicitly ("precedence
+undecidable: ...") — never a silent pass just because the mechanism could
+not determine an answer. NUMBER and STRING leaves are both hits (audit A1:
+a string-valued field, e.g. a hand-written `"+0.235 to +0.369 GB"` range,
+is a FINDING too — "artifact states a range: bind two tokens or ledger it"
+— never a silently blessed pass just because it isn't a JSON number the
+pointer grammar could resolve to). If a hit exists, the tag is a FINDING
+naming the field's own pointer, unless the tag's own operand pointers
+already include that exact leaf.
 
 EQUALITY (P3). The token is parsed as `Decimal` at ITS OWN printed
 precision (digits after `.`); the evaluated expression is quantized to that
@@ -153,6 +172,21 @@ mechanically by `check_classification_file` (audit advisory: these two
 constants used to be dead weight; every allowlist entry now must have
 EXACTLY one classification row with a reason in the closed set, or the bare
 run FAILS naming the drift).
+
+KNOWN LEDGER-KEY LIMITATION (inherited from `check_doc_numbers_have_
+producers.py`, `ac2c5cb`; out of scope to redesign here — stated, not
+fixed). The key is `file:token:sha1(normalized line):col`. A purely
+EDITORIAL edit to an already-ledgered row (a typo fix, a rewording that
+never touches the token itself) changes that row's normalized-line hash and
+therefore its key: the OLD key becomes an orphaned allowlist entry (a
+`check_classification_file` finding) and the still-unproducible token needs
+a NEW entry under the new hash — which `--check-allowlist-only-shrinks`
+reads as a plain ADDITION and REDS, indistinguishable from genuinely new
+debt. The remedy is a human one, stated in the same PR: remove the orphaned
+old entry, add the new one with the SAME classification-row content
+(reason and note unchanged), and say in the PR body that this is a
+net-zero editorial swap, not new debt — the ratchet cannot tell the two
+apart mechanically, and does not try to.
 
 F1 (audit A4, lead decision — `docs/plans/61-perf-unification/CONTRACT.md`
 §6). The acceptance bar is `>= 1 fully-bound table AND V >= 50 AND the
@@ -406,6 +440,15 @@ class ClaimParseError(Exception):
     pass
 
 
+class PrecedenceUndecidable(ClaimParseError):
+    """round-3 audit fix: raised (never silently swallowed to `None`) when
+    the artifact-field precedence check (P3) cannot determine an answer —
+    the operands span more than one tracked file, or share no digit-
+    bearing identifier token to key a same-quantity search off of. A
+    subclass of `ClaimParseError` so it is caught by the same handler and
+    reported as a FINDING, exactly like a genuine precedence violation."""
+
+
 @dataclass(frozen=True)
 class PointerRef:
     path: str  # repo-relative
@@ -560,13 +603,56 @@ def _rfc6901_walk(doc, pointer: str):
     return cur, segs
 
 
+_REP_SUFFIX_RE = re.compile(r"^r\d+$|^rep\w*$")
+
+
 def _path_digit_tokens(pointer: str) -> set[str]:
     """Digit-bearing identifier tokens in a JSON-pointer path — `b8`,
-    `s512`, `p50`, `r1` — split generically on any non-alphanumeric
-    character. A token with NO digit (`legs`, `deltas`, `fused`) is
-    structural prose, never an identifier, and is dropped."""
+    `s512`, `p50` — split generically on any non-alphanumeric character. A
+    token with NO digit (`legs`, `deltas`, `fused`) is structural prose,
+    never an identifier, and is dropped. A per-REPLICATE suffix (`r1`,
+    `r2`, `rep...`) is ALSO dropped (round-3 audit fix) — it identifies
+    WHICH RUN an operand came from, never the QUANTITY being computed, and
+    keeping it let a same-rep operand pair over-constrain the search (see
+    the module doc's PRECEDENCE section)."""
     segs = re.split(r"[^A-Za-z0-9]+", pointer)
-    return {s.lower() for s in segs if s and any(ch.isdigit() for ch in s)}
+    return {
+        s.lower()
+        for s in segs
+        if s and any(ch.isdigit() for ch in s) and not _REP_SUFFIX_RE.match(s.lower())
+    }
+
+
+_UNIT_FAMILY_TIME_RE = re.compile(r"(?:^|_)(?:ms|s)(?:$|_)|s_per_step")
+_UNIT_FAMILY_BYTES_RE = re.compile(r"(?:^|_)(?:gb|gib|mib|bytes)(?:$|_)|bytes")
+
+
+def _unit_family(key: str) -> str | None:
+    """A coarse unit-family guess from a leaf key's own suffix (round-3
+    audit fix): `time` for a seconds- OR milliseconds-shaped name
+    (`s_per_step_p50`, `..._s`, `delta_ms` — a delta computed FROM raw
+    seconds is routinely REPORTED in ms, same physical quantity, so `s`
+    and `ms` are ONE family, not two — an earlier draft of this function
+    split them and vetoed the real cast-w1 s_per_step-vs-delta_ms match,
+    caught by this file's own self-test), `bytes` for a VRAM/byte-shaped
+    name (`_gb`/`_gib`/`_mib`/`bytes`). `None` if undetermined —
+    undetermined NEVER blocks a match by itself; it only means the family
+    check cannot VETO a token-identifier match. Used to stop a shared
+    shape token (`b8_s512`) alone from matching a candidate of the WRONG
+    family — a VRAM diff must never bind to a time field of the same
+    shape, or vice versa."""
+    low = key.lower()
+    if _UNIT_FAMILY_TIME_RE.search(low):
+        return "time"
+    if _UNIT_FAMILY_BYTES_RE.search(low):
+        return "bytes"
+    return None
+
+
+def _operand_family(refs: list[PointerRef]) -> str | None:
+    families = {_unit_family(r.pointer.rsplit("/", 1)[-1]) for r in refs}
+    families.discard(None)
+    return next(iter(families)) if len(families) == 1 else None
 
 
 def _iter_leaves(doc, prefix: str = ""):
@@ -615,23 +701,35 @@ class Loader:
         return Decimal(val)
 
     def same_quantity_field(self, refs: list[PointerRef]) -> tuple[str, object] | None:
-        """audit A1: whole-FILE search for a computed field describing the
-        SAME quantity as `refs`' common leg/shape identifiers — NOT limited
-        to the operands' common-ancestor SUBTREE (which is what the
-        original walk did, and which misses a field like cast-w1's
+        """audit A1 + round-3 fix: whole-FILE search for a computed field
+        describing the SAME quantity as `refs`' common leg/shape
+        identifiers (rep suffix stripped) AND unit family — NOT limited to
+        the operands' common-ancestor SUBTREE (the original walk stopped
+        there and missed a field like cast-w1's own
         `/deltas/b8_s512_p50_ms/delta_ms` sitting in a SIBLING subtree of
         the operands' own `/legs/...`). Returns (pointer, value) of the
-        first match; NUMBER and STRING leaves both count."""
+        first match; NUMBER and STRING leaves both count. Raises
+        `PrecedenceUndecidable` — never returns `None` for this case —
+        when the operands span more than one file or share no digit-
+        bearing identifier token at all."""
         paths = {r.path for r in refs}
         if len(paths) != 1:
-            return None
+            raise PrecedenceUndecidable(
+                f"precedence undecidable: operands span {len(paths)} different tracked "
+                f"files ({sorted(paths)}) — point directly at a field or ledger this cell"
+            )
         path = next(iter(paths))
         doc = self.doc(path)
         operand_pointers = {r.pointer for r in refs}
         operand_token_sets = [_path_digit_tokens(r.pointer) for r in refs]
         common = set.intersection(*operand_token_sets) if operand_token_sets else set()
         if not common:
-            return None
+            raise PrecedenceUndecidable(
+                "precedence undecidable: the operands share no digit-bearing identifier "
+                f"token to key a same-quantity search off of ({sorted(operand_pointers)}) — "
+                "point directly at a field or ledger this cell"
+            )
+        operand_family = _operand_family(refs)
         for leaf_pointer, leaf_value in _iter_leaves(doc):
             if leaf_pointer in operand_pointers:
                 continue
@@ -642,8 +740,12 @@ class Loader:
                 continue
             if not isinstance(leaf_value, (Decimal, int, str)):
                 continue
-            if common <= _path_digit_tokens(leaf_pointer):
-                return leaf_pointer, leaf_value
+            if not (common <= _path_digit_tokens(leaf_pointer)):
+                continue
+            candidate_family = _unit_family(last_seg)
+            if operand_family is not None and candidate_family is not None and operand_family != candidate_family:
+                continue
+            return leaf_pointer, leaf_value
         return None
 
 
@@ -1222,13 +1324,126 @@ def self_test() -> int:
     except ClaimParseError as exc:
         check("A1: string-valued same-quantity field named in the finding", "delta_gb" in str(exc))
 
-    # a quantity with NO shared digit-identifier across operands never
-    # false-positives (nothing specific enough to key off).
+    # (round-3 audit) a quantity with NO shared digit-identifier across
+    # operands is UNDECIDABLE, not silently clean — FAILS LOUDLY rather
+    # than returning None (an earlier revision let this bind freely).
     doc4 = {"a": {"x1": Decimal("1"), "delta_x": Decimal("9")}, "b": {"y2": Decimal("2")}}
     loader4 = _mem_loader(doc4)
     expr4 = parse_expr("diff(fixture.json#/a/x1,fixture.json#/b/y2)")
-    val4, _ = evaluate_expr(expr4, loader4)
-    check("no shared identifier token -> no false-positive precedence hit", val4 == Decimal("-1"))
+    try:
+        evaluate_expr(expr4, loader4)
+        failures.append(
+            "self-test FAILED (round-3, digit-free-leg): operands sharing no digit-bearing "
+            "identifier token must be UNDECIDABLE (a finding), not a silent free bind"
+        )
+    except PrecedenceUndecidable as exc:
+        check("digit-free-leg case fails loudly and says 'undecidable'", "undecidable" in str(exc))
+    except ClaimParseError:
+        failures.append(
+            "self-test FAILED (round-3, digit-free-leg): raised a plain ClaimParseError, "
+            "not the more specific PrecedenceUndecidable"
+        )
+
+    # (round-3 audit) operands spanning more than one tracked file are
+    # ALSO undecidable, not silently clean.
+    loader4b = _mem_loader({"v": Decimal("1")})
+    loader4b._cache["other.json"] = {"w": Decimal("2")}
+    expr4b = parse_expr("diff(fixture.json#/v,other.json#/w)")
+    try:
+        evaluate_expr(expr4b, loader4b)
+        failures.append("self-test FAILED (round-3, multi-file): cross-file operands did not raise")
+    except PrecedenceUndecidable as exc:
+        check("multi-file operands fail loudly and say 'undecidable'", "undecidable" in str(exc))
+
+    # --- (round-3 audit, THE CLASS FIX) a SAME-REP operand pair — both
+    # named `r1` — must still be caught. Reproduces the auditor's
+    # end-to-end probe: pre-fix, diff(disabled_r1, fused_r1) bound
+    # 39.565658 bit-for-bit as a free diff because `r1`, shared by BOTH
+    # operands, survived the (un-stripped) intersection and over-
+    # constrained the search past delta_ms (whose own path carries no rep
+    # suffix at all). ---
+    same_rep_doc = {
+        "legs": {
+            "b8_s512_disabled_r1": {"s_per_step_p50": Decimal("0.674415994")},
+            "b8_s512_fused_r1": {"s_per_step_p50": Decimal("0.634850336")},
+        },
+        "deltas": {
+            "b8_s512_p50_ms": {
+                "delta_ms": Decimal("39.565658"),
+                "delta_pct": Decimal("6.232"),
+            }
+        },
+    }
+    loader_same_rep = _mem_loader(same_rep_doc)
+    same_rep_diff_expr = parse_expr(
+        "diff(fixture.json#/legs/b8_s512_disabled_r1/s_per_step_p50,"
+        "fixture.json#/legs/b8_s512_fused_r1/s_per_step_p50)"
+    )
+    try:
+        val, _ = evaluate_expr(same_rep_diff_expr, loader_same_rep)
+        failures.append(
+            f"self-test FAILED (round-3, same-rep diff): bound FREELY to {val} — the exact "
+            "class the audit's end-to-end probe found live on 5c8eef5"
+        )
+    except ClaimParseError as exc:
+        check(
+            "same-rep diff (both r1) is still caught — names a delta*/*_pct field",
+            "delta" in str(exc),
+        )
+    same_rep_pct_expr = parse_expr(
+        "pct(fixture.json#/legs/b8_s512_disabled_r1/s_per_step_p50,"
+        "fixture.json#/legs/b8_s512_fused_r1/s_per_step_p50)"
+    )
+    try:
+        evaluate_expr(same_rep_pct_expr, loader_same_rep)
+        failures.append("self-test FAILED (round-3, same-rep pct): bound freely, not caught")
+    except ClaimParseError as exc:
+        check("same-rep pct (both r1) is also caught", "delta" in str(exc))
+
+    # (round-3 audit) a multi-computed-field artifact: the search must
+    # name WHICH field it found (not just "a" field) — and the UNIT-FAMILY
+    # veto must pick the family-consistent one, never a same-shape field
+    # of the WRONG family (a `_ms` operand must never be blocked by a
+    # `_gb` field of the identical shape, and vice versa).
+    multi_field_doc = {
+        "legs": {
+            "b8_s512_disabled_r1": {"s_per_step_p50": Decimal("0.674415994")},
+            "b8_s512_fused_r1": {"s_per_step_p50": Decimal("0.634850336")},
+            "b8_s512_disabled_r1_gb": {"peak_vram_bytes": Decimal("1000")},
+            "b8_s512_fused_r1_gb": {"peak_vram_bytes": Decimal("900")},
+        },
+        "deltas": {
+            "b8_s512_p50_ms": {"delta_ms": Decimal("39.565658")},
+            "b8_s512_p50_gb": {"delta_gb": Decimal("100")},
+        },
+    }
+    loader_multi = _mem_loader(multi_field_doc)
+    ms_operand_expr = parse_expr(
+        "diff(fixture.json#/legs/b8_s512_disabled_r1/s_per_step_p50,"
+        "fixture.json#/legs/b8_s512_fused_r1/s_per_step_p50)"
+    )
+    try:
+        evaluate_expr(ms_operand_expr, loader_multi)
+        failures.append("self-test FAILED (round-3, multi-field): ms-family operand pair not caught")
+    except ClaimParseError as exc:
+        check(
+            "multi-field artifact: an s_per_step (ms-family) operand pair is matched to "
+            "delta_ms, never the same-shape delta_gb field",
+            "delta_ms" in str(exc) and "delta_gb" not in str(exc),
+        )
+    gb_operand_expr = parse_expr(
+        "diff(fixture.json#/legs/b8_s512_disabled_r1_gb/peak_vram_bytes,"
+        "fixture.json#/legs/b8_s512_fused_r1_gb/peak_vram_bytes)"
+    )
+    try:
+        evaluate_expr(gb_operand_expr, loader_multi)
+        failures.append("self-test FAILED (round-3, multi-field): gb-family operand pair not caught")
+    except ClaimParseError as exc:
+        check(
+            "multi-field artifact: a peak_vram_bytes (bytes-family) operand pair is matched "
+            "to delta_gb, never the same-shape delta_ms field",
+            "delta_gb" in str(exc) and "delta_ms" not in str(exc),
+        )
 
     # (ii) Decimal + ROUND_HALF_EVEN string equality.
     loader3 = _mem_loader({"v": Decimal("1.265")})
@@ -1452,8 +1667,12 @@ def self_test() -> int:
         "the layer/launch-count non-exclusion), the .json.raw/out-of-root/untracked pointer "
         "refusals, neg()'s sign-preserving compare, legacy()'s closed allowlist, the injective "
         "file:token:sha1:col allowlist key, the KNOWN_TABLES exactly-one-match invariant (A3-S1 "
-        "rename + duplicate), the citation-table header exclusion, and the classification-file "
-        "verification all confirmed."
+        "rename + duplicate), the citation-table header exclusion, the classification-file "
+        "verification, the round-3 same-rep diff/pct fix (rep-suffix stripped before "
+        "intersecting; reproduces and closes the audit's live 5c8eef5 free-bind of 39.565658), "
+        "the multi-computed-field unit-family veto (names the family-consistent field, never "
+        "a same-shape field of the wrong family), and the multi-file/digit-free "
+        "PrecedenceUndecidable fail-loud (never a silent None) all confirmed."
     )
     return 0
 

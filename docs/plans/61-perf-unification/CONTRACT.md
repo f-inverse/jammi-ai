@@ -83,10 +83,23 @@ See `DESIGN-STUDY.md` §1 for the grammar. Implementation notes fixed here:
    `d0.05`), issue/PR refs (`#377`) and the escape-ledger's own `esc-NNN` row id, version strings
    (`2.13.0+cu126`, `cu126`), ledger cites (`s2:89`, `row 5`, `cont row 11`, `fusion rows 30, 36`),
    dates (`2026-08-23`). A layer/tensor/launch count (`563 launches`) is explicitly NOT excluded.
-3. **Artifact-field precedence**, mechanical: for a `diff`/`ratio`/`pct` tag, if the operands' common
-   ancestor JSON object carries its own numeric `delta*`/`ratio*`/`speedup*`/`*_pct`/`spread*` field,
-   the tag is a finding unless it points at that field directly. A same-named STRING field (a
-   hand-written range) does not block a free aggregate — it cannot be pointed to as a number either.
+3. **Artifact-field precedence**, mechanical (round-3 audit fix — this item previously described the
+   ORIGINAL, common-ancestor-only walk and stated the INVERSE of the shipped rule for a string field;
+   both corrected here): for a `diff`/`ratio`/`pct` tag, the WHOLE tracked file the operands share (not
+   merely their common-ancestor subtree — a field can live in a SIBLING subtree, e.g. cast-w1's own
+   `/deltas/b8_s512_p50_ms/delta_ms` relative to operands under `/legs/...`) is searched for a leaf
+   whose key matches `delta*`/`ratio*`/`speedup*`/`*_pct`/`spread*` (NUMBER or STRING — a hand-written
+   range is a finding too, "bind two tokens or ledger it," never a silently blessed free aggregate just
+   because it isn't a JSON number) and whose own path shares every digit-bearing identifier token
+   common to ALL the operands' paths, with any per-replicate suffix (`r1`, `r2`, `rep...`) STRIPPED
+   before that comparison — a same-rep operand pair (both named `r1`) must not retain `r1` in the
+   intersection and thereby over-constrain the search past the real field, which carries no rep suffix
+   at all. The identifier match must also agree on unit FAMILY (time vs. bytes, inferred from each
+   leaf's own key) — a millisecond/seconds-shaped operand pair is never matched to a byte-shaped field
+   of the identical shape token, or vice versa. If the operands span more than one tracked file, or
+   share no digit-bearing identifier token at all, precedence is UNDECIDABLE and the tag is a finding
+   naming that explicitly — never a silent pass just because the mechanism could not determine an
+   answer.
 4. **Equality.** `Decimal` at the token's own printed precision; `ROUND_HALF_EVEN` quantization;
    STRING comparison. A mismatch prints the evaluated value at full precision.
 5. **Pointer roots.** Tracked `*.json` under `crates/jammi-kernels/artifacts/cuda-runs/**` and
@@ -94,12 +107,22 @@ See `DESIGN-STUDY.md` §1 for the grammar. Implementation notes fixed here:
    file, or a path outside these roots is a finding ("unprovenanced producer").
 6. **The escape.** A token with no producer is marked `ledger` (a bare word — never an inline
    reason string) and MUST have a matching entry in `ci/perf_claims_allowlist.txt`, keyed
-   `file:token:sha1(normalized line)` exactly as `check_doc_numbers_have_producers.py`. Every entry
-   has one row in `ci/perf_claims_allowlist_classification.md` with a closed reason (`ledger-only |
-   modeled | issue-text | superseded-run`) and a distinct note. `--check-allowlist-only-shrinks`
-   fetches `origin/main` (fails CLOSED on a failed fetch or an unresolvable ref) and fails on any
-   entry this branch ADDS; bootstrap (no allowlist file on `origin/main` yet) passes only on the
-   introducing PR.
+   `file:token:sha1(normalized line):col` (round-3 fix: `col`, the token's own column offset, makes
+   the key injective — two identical tokens on one line, e.g. `112 / 112`, used to collapse into a
+   single entry covering both). Every entry has one row in `ci/perf_claims_allowlist_classification.md`
+   with a closed reason (`ledger-only | modeled | issue-text | superseded-run`) and a distinct note,
+   verified mechanically by `check_classification_file` (a missing, duplicated, or orphaned row is a
+   named problem, not a silent gap). `--check-allowlist-only-shrinks` fetches `origin/main` (fails
+   CLOSED on a failed fetch or an unresolvable ref) and fails on any entry this branch ADDS; bootstrap
+   (no allowlist file on `origin/main` yet) passes only on the introducing PR. **Known limitation,
+   inherited from `check_doc_numbers_have_producers.py` (`ac2c5cb`) and out of scope to redesign here:**
+   because the key includes `sha1(normalized line)`, an editorial edit to an already-ledgered row (a
+   typo fix, a rewording that does not touch the token itself) changes the row's hash and therefore its
+   key — the OLD key becomes an orphaned allowlist entry (a `check_classification_file` finding) and the
+   token needs a NEW entry, which `--check-allowlist-only-shrinks` reads as an ADDITION and reds. The
+   remedy is the same PR that makes the edit: remove the orphaned old entry, add the new one with the
+   SAME classification row content, and justify the net-zero swap in the PR body — the ratchet cannot
+   distinguish "editorial reword" from "new debt" mechanically, so a human states which one this is.
 7. **`legacy(<form>)`** is the explicit, auditable marker for a pointer bind reported as `V-legacy`
    rather than `V` — used only for the two AdamW summary-block cells this contract names (below),
    standing in for what rule (g)'s v2-schema classification would infer automatically once it lands.
@@ -121,9 +144,11 @@ See `DESIGN-STUDY.md` §1 for the grammar. Implementation notes fixed here:
 - T3's P2/P3 measured cells: `ledger`, note naming the committed p2/p3 artifacts and their own,
   different values (`b8_s512_d0` reads 0.7817 s / 39.58 GB, not the row's printed 0.780 s / 39.1 GB —
   a different session).
-- Cast-w1's `−38.5 ms` cell is corrected to `−39.6 ms`, bound via `abs(P)` directly to the artifact's
-  own `delta_ms` field (39.565658) — precedence (C10.3) forbids a free `diff(mean,mean)` here since
-  that computed field exists.
+- Cast-w1's `−38.5 ms` cell is corrected to `−39.6 ms`, bound via `neg(P)` (sign-preserving; round-3
+  fix — REPLACES an earlier `abs(P)`, which discarded sign on both sides and would have silently
+  accepted a wrong-signed token as long as the magnitude matched) directly to the artifact's own
+  `delta_ms` field (39.565658) — precedence (C10.3) forbids a free `diff(mean,mean)` here since that
+  computed field exists.
 - T8 (the torch-column table) is entirely `ledger`, reason `superseded-run`: its artifact lives on an
   unmerged branch until the sha is an ancestor of `HEAD` or carries `merged_as`/`merged_via_pr`.
 

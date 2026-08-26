@@ -1859,7 +1859,7 @@ mod tests {
 
     /// F1 REGRESSION (audit finding on PR #372): `peak_vram_bytes` is
     /// `VramSampler::finish`'s `peak.saturating_sub(baseline)`
-    /// (`finetune_step.rs:183` at the time of writing). `saturating_sub`
+    /// (`finetune_step.rs:175` at the time of writing). `saturating_sub`
     /// FLOORS at zero rather than wrapping — so if `baseline` is ever
     /// captured AT (or above) the run's own high-water mark, the reported
     /// delta collapses to zero even though the run legitimately allocated

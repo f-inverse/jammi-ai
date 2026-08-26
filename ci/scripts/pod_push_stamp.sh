@@ -55,6 +55,38 @@
 #       drift apart.
 set -uo pipefail
 
+# round-4 addendum (on-pod incident, a100c A2 run at b3cafda): `shasum` is
+# ABSENT on the pod image — a raw `shasum -a 256 ... 2>/dev/null` on a host
+# without it produces an EMPTY string via command substitution, no error
+# the caller notices, so every hash this file computes would have been
+# silently vacuous there. `pod_push_stamp.sh`'s own `compute`/`excludes`
+# subcommands run on the laptop (macOS ships `shasum`), but `cutlass-check`
+# ships to and runs ON the pod (gpu-dev.sh's `target --with-cutlass`), so
+# this file gets the same coreutils-first, shasum-fallback, loud-refusal-
+# never-silent-empty helper as pod_seed_target.sh/pod_build_timings.sh —
+# duplicated (not sourced from pod_seed_target.sh) to keep this file
+# self-contained, matching its existing design.
+pod_push_sha256_of_file() { # $1=file (or "-" is not supported; pipe into pod_push_sha256_of_stdin instead)
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    echo "::error::pod_push_sha256_of_file: neither sha256sum nor shasum found on PATH — cannot hash $1" >&2
+    return 2
+  fi
+}
+pod_push_sha256_of_stdin() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | awk '{print $1}'
+  else
+    echo "::error::pod_push_sha256_of_stdin: neither sha256sum nor shasum found on PATH" >&2
+    return 2
+  fi
+}
+
 # The one exclude list. cutlass is excluded from push (and from this
 # manifest) because it is a git submodule OWNED by tree provisioning, never
 # by the working-tree sync — `target --with-cutlass` provisions it (`cp -a`
@@ -99,18 +131,18 @@ pod_push_manifest_sha256() { # $1=repo-root
         [ -f "$f" ] || continue
         local mode sha
         mode="$(stat -f '%Lp' "$f" 2>/dev/null || stat -c '%a' "$f" 2>/dev/null || echo '?')"
-        sha="$(shasum -a 256 "$f" 2>/dev/null | awk '{print $1}')"
+        sha="$(pod_push_sha256_of_file "$f" 2>/dev/null)"
         printf '%s\t%s\t%s\n' "$rel" "$mode" "$sha"
       done | sort > "$manifest"
-  shasum -a 256 "$manifest" | awk '{print $1}'
+  pod_push_sha256_of_file "$manifest"
   rm -rf "$empty" "$manifest"
 }
 
 pod_push_compute() { # $1=repo-root $2=session
   local repo="$1" session="$2" head porcelain_sha diff_sha manifest_sha cutlass_gitlink ts
   head="$(git -C "$repo" rev-parse HEAD 2>/dev/null || echo unknown)"
-  porcelain_sha="$(git -C "$repo" status --porcelain 2>/dev/null | shasum -a 256 | awk '{print $1}')"
-  diff_sha="$(git -C "$repo" diff HEAD 2>/dev/null | shasum -a 256 | awk '{print $1}')"
+  porcelain_sha="$(git -C "$repo" status --porcelain 2>/dev/null | pod_push_sha256_of_stdin)"
+  diff_sha="$(git -C "$repo" diff HEAD 2>/dev/null | pod_push_sha256_of_stdin)"
   manifest_sha="$(pod_push_manifest_sha256 "$repo")"
   cutlass_gitlink="$(git -C "$repo" rev-parse HEAD:crates/jammi-kernels/third_party/cutlass 2>/dev/null || true)"
   ts="$(date -u +%FT%TZ)"

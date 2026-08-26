@@ -717,28 +717,64 @@ EOF
       # commit into /root/jammi-ai's own submodule (network — fails loudly
       # if unreachable) and re-verify before copying; refuses the copy on
       # any remaining mismatch, naming both shas.
+      # round-4 audit A1: `git rev-parse HEAD:<gitlink-path>` reads the
+      # SUPERPROJECT's own recorded pin for that path — a property of
+      # /root/jammi-ai's OWN HEAD commit, entirely UNAFFECTED by whether
+      # `submodule update` actually ran, or what the submodule's working
+      # directory is actually checked out to. It is not a proxy for "what
+      # commit does the submodule dir cp -a would copy actually hold" —
+      # `git -C <submodule-dir> rev-parse HEAD` is that. Reproduced (the
+      # auditor's own repro, confirmed against a real two-commit submodule
+      # fixture — see this fix's own hermetic test): the superproject pin
+      # stayed unchanged while the submodule HEAD differed, and `cp -a`
+      # would have copied the WRONG commit's tree. This also means the
+      # OLD remediation arm could never succeed: checking out a different
+      # commit INSIDE the submodule cannot change what `HEAD:path` reports
+      # in the superproject, so the old re-check after fetch+checkout
+      # compared the exact same (always-passing-or-always-failing) pair
+      # every time. `set -euo pipefail` (not `-uo pipefail`) so
+      # `submodule update` failing aborts here rather than silently
+      # continuing into a stale/absent submodule.
       rp_run_remote <<EOF
-set -uo pipefail
+set -euo pipefail
 git -C /root/jammi-ai submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass
 [ -d '${NAME_SOURCE_TREE_DIR}' ] || { echo "::error::tree source dir '${NAME_SOURCE_TREE_DIR}' does not exist — push to it first (target --with-cutlass provisions cutlass INTO an existing tree, it does not create one)"; exit 1; }
+CUTLASS_DIR=/root/jammi-ai/crates/jammi-kernels/third_party/cutlass
+[ -d "\$CUTLASS_DIR/.git" ] || [ -f "\$CUTLASS_DIR/.git" ] || { echo "::error::\$CUTLASS_DIR has no .git after submodule update — deinitialised or never checked out; refusing the copy"; exit 1; }
 STAMP='${NAME_SOURCE_TREE_DIR}/.jammi-push-stamp.json'
-ACTUAL_SHA="\$(git -C /root/jammi-ai rev-parse HEAD:crates/jammi-kernels/third_party/cutlass)"
+ACTUAL_SHA="\$(git -C "\$CUTLASS_DIR" rev-parse HEAD)"
 bash /root/jammi-ai/ci/scripts/pod_push_stamp.sh cutlass-check "\$STAMP" "\$ACTUAL_SHA"
 CHECK_RC=\$?
 if [ "\$CHECK_RC" -eq 1 ]; then
   STAMP_SHA="\$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("cutlass_gitlink") or "")' "\$STAMP")"
-  echo "attempting to fetch+checkout the stamp's pinned cutlass commit \$STAMP_SHA into /root/jammi-ai's own submodule..."
-  git -C /root/jammi-ai/crates/jammi-kernels/third_party/cutlass fetch --depth 1 origin "\$STAMP_SHA" \
-    && git -C /root/jammi-ai/crates/jammi-kernels/third_party/cutlass checkout --quiet "\$STAMP_SHA" \
-    || { echo "::error::could not fetch/checkout cutlass \$STAMP_SHA (network unreachable?) — refusing the copy"; exit 1; }
-  ACTUAL_SHA="\$(git -C /root/jammi-ai rev-parse HEAD:crates/jammi-kernels/third_party/cutlass)"
-  bash /root/jammi-ai/ci/scripts/pod_push_stamp.sh cutlass-check "\$STAMP" "\$ACTUAL_SHA" || { echo "::error::even after fetch+checkout, the gitlink still does not match the stamp — refusing the copy"; exit 1; }
+  echo "attempting to fetch+checkout the stamp's pinned cutlass commit \$STAMP_SHA into the submodule at \$CUTLASS_DIR..."
+  git -C "\$CUTLASS_DIR" fetch --depth 1 origin "\$STAMP_SHA" \
+    && git -C "\$CUTLASS_DIR" checkout --quiet "\$STAMP_SHA" \
+    || { echo "::error::could not fetch/checkout cutlass \$STAMP_SHA into \$CUTLASS_DIR (network unreachable?) — refusing the copy"; exit 1; }
+  ACTUAL_SHA="\$(git -C "\$CUTLASS_DIR" rev-parse HEAD)"
+  bash /root/jammi-ai/ci/scripts/pod_push_stamp.sh cutlass-check "\$STAMP" "\$ACTUAL_SHA" || { echo "::error::even after fetch+checkout, the SUBMODULE's own HEAD still does not match the stamp — refusing the copy"; exit 1; }
 elif [ "\$CHECK_RC" -ne 0 ]; then
   exit 1
 fi
 mkdir -p '${NAME_SOURCE_TREE_DIR}/crates/jammi-kernels/third_party'
 rm -rf '${NAME_SOURCE_TREE_DIR}/crates/jammi-kernels/third_party/cutlass'
-cp -a /root/jammi-ai/crates/jammi-kernels/third_party/cutlass '${NAME_SOURCE_TREE_DIR}/crates/jammi-kernels/third_party/cutlass'
+cp -a "\$CUTLASS_DIR" '${NAME_SOURCE_TREE_DIR}/crates/jammi-kernels/third_party/cutlass'
+# round-4 addendum: \$CUTLASS_DIR's own \`.git\` is a SUBMODULE GITLINK
+# pointer file (not a full repo), and \`cp -a\` copies it verbatim into the
+# destination tree — a plain directory tree that is not itself registered
+# as owning that gitlink. \${NAME_SOURCE_TREE_DIR} is itself a real git
+# checkout (rp_bootstrap's default tree, or a pushed tree whose OWN .git
+# already exists); a second, foreign, un-registered .git nested inside it
+# makes \`git status\`/\`git add\` run from that tree's root treat the path
+# as an embedded-repository boundary it cannot resolve, failing fatally.
+# The gitlink file is never needed in the copy (this path is deliberately
+# NOT git-managed inside the destination tree at all — target --with-
+# cutlass provisions it by \`cp -a\`, never by \`git submodule\` inside the
+# tree, exactly because a pushed tree carries no .git of its own to attach
+# a submodule to). Strip it and assert it is gone.
+rm -rf '${NAME_SOURCE_TREE_DIR}/crates/jammi-kernels/third_party/cutlass/.git'
+[ -e '${NAME_SOURCE_TREE_DIR}/crates/jammi-kernels/third_party/cutlass/.git' ] && { echo "::error::cutlass/.git still present in the destination tree after stripping — refusing to leave a foreign gitlink in a git-backed tree"; exit 1; }
+true
 EOF
       rc=$?
     fi

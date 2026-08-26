@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # A2 producer (pod-build-substrate acceptance, contract v6) — runs ON A LIVE
 # POD, never in CI. Not run by this PR; the lead runs it on a100d after this
-# commit lands and commits the JSON it prints under
+# commit lands and commits the JSON it writes (to JAMMI_BUILD_TIMINGS_OUT,
+# never stdout — see Usage below) under
 # ci/artifacts/pod-build-timings/. Until that JSON exists, no doc in this
 # repo may cite a number from it (see docs/maintainer/dev-gpu.md, which cites
 # ledger rows 1/17 only and marks the RP_DISK_GB formula's S values
@@ -23,14 +24,22 @@
 #         requests — a live check that the wrapper really is off, not an
 #         assumption.
 #   (iv)  byte-equality of the jammi-bench binary and every emitted .ptx
-#         between the clone build and a COLD build at the SAME
-#         CARGO_TARGET_DIR path — the cold leg builds from a genuinely EMPTY
-#         directory (`rm -rf && mkdir`), never a copy of the clone with only
-#         `cargo clean --workspace` run over it (that still reuses every
-#         third-party dependency rlib the clone already built, so a
-#         poisoned SEED dependency artifact could never register — round-2
-#         audit finding 8); both legs' walls are recorded. Deny-listing
-#         files expected to differ run-to-run for reasons unrelated to code
+#         between the clone build (CLONE_DIR) and a COLD build (COLD_DIR) —
+#         round-4 addendum: these are DELIBERATELY two DIFFERENT literal
+#         CARGO_TARGET_DIR paths, not the same directory reused; an earlier
+#         revision of this doc said "the SAME target dir path", which was
+#         never true of the mechanism and is corrected here. Comparing
+#         across genuinely different paths is the STRONGER claim: it also
+#         catches any artifact that embeds its own CARGO_TARGET_DIR's
+#         absolute path (debug info, `.d` files, panic messages), which a
+#         same-path comparison could never distinguish from a real defect.
+#         The cold leg builds from a genuinely EMPTY directory (`rm -rf &&
+#         mkdir`), never a copy of the clone with only `cargo clean
+#         --workspace` run over it (that still reuses every third-party
+#         dependency rlib the clone already built, so a poisoned SEED
+#         dependency artifact could never register — round-2 audit finding
+#         8); both legs' walls are recorded. Deny-listing files expected to
+#         differ run-to-run for reasons unrelated to code
 #         (jammi_flash_build_times.txt — wall-clock timing text;
 #         .rustc_info.json — a cache of the toolchain's OWN self-report, not
 #         build output; CACHEDIR.TAG — a static marker; .cargo-*lock — cargo's
@@ -44,9 +53,17 @@
 #         284 s baseline did not include it.
 #
 # Usage (on the pod, inside the checkout the seed was built from):
-#   JAMMI_FA2_TIP_REF=<ref> ci/scripts/perf/pod_build_timings.sh
-# Prints the result JSON to stdout; the caller redirects it into
-# ci/artifacts/pod-build-timings/<ts>-<sha>.json and commits it.
+#   JAMMI_FA2_TIP_REF=<ref> JAMMI_BUILD_TIMINGS_OUT=<path> \
+#     ci/scripts/perf/pod_build_timings.sh
+# Writes the result JSON to JAMMI_BUILD_TIMINGS_OUT (never stdout — round-4
+# addendum: this script's own progress markers, `::group::`/`::endgroup::`
+# and every intermediate status line, went to stdout too, so "redirect
+# stdout into the artifact" silently corrupted the artifact with everything
+# else this script printed while running; a caller doing exactly what the
+# OLD usage line said would never have produced valid JSON). The caller
+# copies JAMMI_BUILD_TIMINGS_OUT to ci/artifacts/pod-build-timings/<ts>-
+# <sha>.json and commits it. Progress/status still goes to stdout/stderr as
+# before, safe to watch live or log verbatim.
 #
 # Runs under pod_timing_lock.sh itself (round-2 audit finding 7: every wall
 # number this producer measures is meaningless if a concurrent `run
@@ -68,6 +85,9 @@ JAMMI_TREE_DIR="${JAMMI_TREE_DIR:-/root/jammi-ai}"
 JAMMI_SEED_DIR="${JAMMI_SEED_DIR:-/root/.jammi-seed}"
 JAMMI_FA2_TIP_REF="${JAMMI_FA2_TIP_REF:?set JAMMI_FA2_TIP_REF to the FA2 PR tip ref/sha to measure}"
 BOX="${JAMMI_BOX_LABEL:?set JAMMI_BOX_LABEL, e.g. 'a100d (A100 PCIe, driver 570)'}"
+# round-4 addendum: the JSON result is written HERE, never to stdout — see
+# the module doc above.
+JAMMI_BUILD_TIMINGS_OUT="${JAMMI_BUILD_TIMINGS_OUT:?set JAMMI_BUILD_TIMINGS_OUT to the output JSON path -- never stdout, since this script also prints progress markers to stdout}"
 JAMMI_BUILD_TIMINGS_LOCK_WAIT_SECS="${JAMMI_BUILD_TIMINGS_LOCK_WAIT_SECS:-3600}"
 
 fail() { echo "::error::$*" >&2; exit 1; }
@@ -79,6 +99,7 @@ if [ "$NO_LOCK" != "1" ]; then
     exec "$CI_SCRIPTS/pod_timing_lock.sh" acquire -w "$JAMMI_BUILD_TIMINGS_LOCK_WAIT_SECS" -- \
       env JAMMI_TREE_DIR="$JAMMI_TREE_DIR" JAMMI_SEED_DIR="$JAMMI_SEED_DIR" \
           JAMMI_FA2_TIP_REF="$JAMMI_FA2_TIP_REF" JAMMI_BOX_LABEL="$BOX" \
+          JAMMI_BUILD_TIMINGS_OUT="$JAMMI_BUILD_TIMINGS_OUT" \
       "$0" --no-lock
 fi
 # LOCK_HELD is a LIVE WITNESS, not a constant (round-3 audit Class B): the
@@ -87,12 +108,27 @@ fi
 # would still print "held" even if the re-exec chain above were somehow
 # skipped or the lock file were on a different path than pod_timing_lock.sh
 # actually used.
+#
+# round-4 audit A3: the holder file ALONE is not sufficient — before
+# pod_timing_lock.sh started removing it on release, a PRIOR run's holder
+# file (same label) stayed on disk forever, so this witness read `true`
+# for every run after the first, genuinely held or not (reproduced: prior
+# run exits, witness reads true, an outsider acquires the lock
+# immediately). pod_timing_lock.sh now removes the holder on EXIT/INT/TERM,
+# but this witness ALSO cross-checks the recorded `pid=` is a LIVE process
+# (`kill -0`) rather than trusting the file's mere existence — belt-and-
+# suspenders against a removal that itself raced or failed. The pid
+# recorded is the flock-held bash wrapper's own pid (pod_build_timings.sh
+# is its direct child, so that wrapper being alive IS this invocation
+# genuinely holding the lock right now).
 _LOCK_FILE="${JAMMI_TIMING_LOCK:-/root/.jammi-timing.lock}"
-if [ -f "${_LOCK_FILE}.holder" ] && grep -q '^holder=pod_build_timings$' "${_LOCK_FILE}.holder" 2>/dev/null; then
+_HOLDER_PID="$(grep -o '^pid=[0-9]*$' "${_LOCK_FILE}.holder" 2>/dev/null | cut -d= -f2)"
+if [ -f "${_LOCK_FILE}.holder" ] && grep -q '^holder=pod_build_timings$' "${_LOCK_FILE}.holder" 2>/dev/null \
+   && [ -n "$_HOLDER_PID" ] && kill -0 "$_HOLDER_PID" 2>/dev/null; then
   LOCK_HELD=true
 else
   LOCK_HELD=false
-  echo "::warning::LOCK_HELD=false — ${_LOCK_FILE}.holder does not name this invocation; every wall-clock number below is UNPROTECTED against a concurrent producer" >&2
+  echo "::warning::LOCK_HELD=false — ${_LOCK_FILE}.holder does not name this invocation with a live pid; every wall-clock number below is UNPROTECTED against a concurrent producer" >&2
 fi
 
 # shellcheck disable=SC1091
@@ -101,6 +137,11 @@ fi
 . "$CI_SCRIPTS/pod_push_stamp.sh" 2>/dev/null || true
 
 cd "$JAMMI_TREE_DIR" || fail "no tree at $JAMMI_TREE_DIR"
+
+# round-4 addendum: fail loudly, naming every missing tool, before spending
+# any wall-clock time on the legs below (pod_seed_assert_required_tools is
+# sourced from pod_seed_target.sh above).
+pod_seed_assert_required_tools || fail "required tool(s) missing — see ::error:: above"
 
 # ---- (i) seed + marker + manifest cross-check --------------------------
 echo "::group::(i) seed"
@@ -128,9 +169,16 @@ git checkout --quiet "$JAMMI_FA2_TIP_REF" || fail "checkout of ${JAMMI_FA2_TIP_R
 # THIS checkout's own gitlink, then assert the submodule's actual HEAD
 # equals the superproject's pin — refusing loudly rather than silently
 # building stale/mismatched CUTLASS headers.
-if [ -f "crates/jammi-kernels/third_party/cutlass/.git" ] || [ -d "crates/jammi-kernels/third_party/cutlass/.git" ]; then
+# Gated on `.gitmodules` DECLARING the path (this ref's own tree), never on
+# whether the submodule dir already happens to have a `.git` — the OLD
+# guard required a PRE-EXISTING `.git` before it would even try
+# `--init`, which defeats the entire purpose of `--init` (first-time
+# initialisation) on a fresh pod that has never touched cutlass before.
+if grep -q 'crates/jammi-kernels/third_party/cutlass' .gitmodules 2>/dev/null; then
   git submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass \
     || fail "git submodule update for cutlass failed after checking out ${JAMMI_FA2_TIP_REF}"
+  [ -d "crates/jammi-kernels/third_party/cutlass/.git" ] || [ -f "crates/jammi-kernels/third_party/cutlass/.git" ] \
+    || fail "crates/jammi-kernels/third_party/cutlass has no .git after submodule update — deinitialised or never checked out"
   _pinned_sha="$(git rev-parse "HEAD:crates/jammi-kernels/third_party/cutlass" 2>/dev/null || true)"
   _actual_sha="$(git -C crates/jammi-kernels/third_party/cutlass rev-parse HEAD 2>/dev/null || true)"
   if [ -n "$_pinned_sha" ] && [ "$_pinned_sha" != "$_actual_sha" ]; then
@@ -172,10 +220,19 @@ clone_features="cuda"
 # byte_equal against the T1-only cold leg was GUARANTEED false, and
 # recompiled_units was the union of two different feature builds' logs.
 S_clone_bytes="$(du -sk "$CLONE_DIR" 2>/dev/null | awk '{print $1*1024}')"
+# round-4 addendum (on-pod incident, a100c A2 run at b3cafda): `shasum` is
+# ABSENT on the pod image — this used to make every hash in this leg
+# SILENTLY empty there, so byte_equal's "equal" was comparing two empty
+# strings (a pass that never actually compared anything; A4's own
+# invalid-state fix catches an EMPTY MATCH SET on the `find` side, but not
+# a hashing tool that is simply missing while `find` still matches real
+# files — `pod_sha256_of_file`, sourced from pod_seed_target.sh above,
+# prefers coreutils sha256sum and refuses loudly rather than printing
+# nothing if neither hashing tool exists).
 snapshot_hashes() { # $1=dir -> "path<TAB>sha256" lines, denylist excluded, sorted
   find "$1" -type f \( -name 'jammi-bench' -o -name '*.ptx' \) \
     | grep -Ev "$DENYLIST_RE" \
-    | while read -r f; do printf '%s\t%s\n' "${f#"$1"/}" "$(shasum -a 256 "$f" | awk '{print $1}')"; done | sort
+    | while read -r f; do printf '%s\t%s\n' "${f#"$1"/}" "$(pod_sha256_of_file "$f")"; done | sort
 }
 DENYLIST_RE='(jammi_flash_build_times\.txt|\.rustc_info\.json|CACHEDIR\.TAG|\.cargo-.*lock)$'
 clone_hashes="$(snapshot_hashes "$CLONE_DIR")"
@@ -224,11 +281,11 @@ echo "::endgroup::"
 # ---- (iii) sccache requests unchanged by construction --------------------
 sccache_delta_note="wrapper is off (CARGO_BUILD_RUSTC_WRAPPER=); sccache --show-stats before/after recorded verbatim below — expect identical (0 additional requests) since rustc never invoked it"
 
-# ---- (iv) byte-equality vs a cold build at the SAME target dir -----------
+# ---- (iv) byte-equality vs a cold build at a SEPARATE, genuinely-empty target dir ----
 # clone_hashes/recompiled were ALREADY snapshotted immediately after T1,
 # above (round-3 audit N3) — this leg reads that snapshot, never re-takes
 # it after the FA2 leg has had a chance to touch anything.
-echo "::group::(iv) cold build @ same CARGO_TARGET_DIR path (from empty)"
+echo "::group::(iv) cold build @ a separate, genuinely-empty CARGO_TARGET_DIR"
 cold_features="cuda"
 COLD_DIR="/root/.jammi-cold-a2"
 # A genuinely EMPTY directory — never `cp -a $CLONE_DIR $COLD_DIR` +
@@ -245,11 +302,23 @@ rm -rf "$COLD_DIR"
 mkdir -p "$COLD_DIR"
 cold_t0=$(date +%s)
 CARGO_TARGET_DIR="$COLD_DIR" cargo build --release -p jammi-bench --features cuda \
-  > /tmp/pod_build_timings.cold_build.log 2>&1 || fail "cold build (same target dir, from empty) failed"
+  > /tmp/pod_build_timings.cold_build.log 2>&1 || fail "cold build (separate empty target dir) failed"
 cold_t1=$(date +%s)
 cold_wall=$((cold_t1 - cold_t0))
 cold_hashes="$(snapshot_hashes "$COLD_DIR")"
-if [ "$clone_hashes" = "$cold_hashes" ]; then
+# round-4 audit A4: an EMPTY match set on both sides made byte_equal read
+# "true" (empty string equals empty string) — the SAME empty-glob vacuity
+# N4 fixed for the env-surface cross-check, never applied to this
+# acceptance oracle itself, whose whole claim (byte-equality of jammi-bench
+# + every .ptx) is meaningless if `find` matched zero files on either leg
+# (a path bug, a build that produced nothing where something was
+# expected). A non-empty match set on BOTH sides is required before
+# "equal" can mean anything; otherwise the comparison is INVALID, not a
+# silent true.
+if [ -z "$clone_hashes" ] || [ -z "$cold_hashes" ]; then
+  byte_equal="invalid"
+  byte_equal_diff="clone_hashes or cold_hashes matched ZERO files (clone empty: $([ -z "$clone_hashes" ] && echo yes || echo no); cold empty: $([ -z "$cold_hashes" ] && echo yes || echo no)) — the byte-equality comparison is MEANINGLESS, not a pass"
+elif [ "$clone_hashes" = "$cold_hashes" ]; then
   byte_equal="true"; byte_equal_diff=""
 else
   byte_equal="false"
@@ -268,7 +337,8 @@ RECOMPILED="$recompiled" SCCACHE_DELTA_NOTE="$sccache_delta_note" \
   SCCACHE_BEFORE="$sccache_before" SCCACHE_AFTER="$sccache_after" \
   python3 - "$BOX" "$(git rev-parse HEAD)" "$JAMMI_FA2_TIP_REF" "$clone_wall" "${fa2_wall:-}" \
   "$copy_wall" "$reflink_took" "$S_src_bytes" "$S_seed_bytes" "$S_clone_bytes" \
-  "$byte_equal" "$(date -u +%FT%TZ)" "$cold_wall" "$LOCK_HELD" "$clone_features" "$cold_features" "$fa2_features" <<'PY'
+  "$byte_equal" "$(date -u +%FT%TZ)" "$cold_wall" "$LOCK_HELD" "$clone_features" "$cold_features" "$fa2_features" \
+  > "$JAMMI_BUILD_TIMINGS_OUT" <<'PY'
 import json, sys, os
 (box, sha, tip_ref, clone_wall, fa2_wall, copy_wall, reflink_took,
  s_src, s_seed, s_clone, byte_equal, ts, cold_wall, lock_held,
@@ -298,7 +368,15 @@ result = {
   "cold_features": cold_features,
   "fa2_features": fa2_features or None,
   "recompiled_units": os.environ.get("RECOMPILED", "").splitlines(),
+  # round-4 audit A4: this field used to collapse "invalid" (empty match set
+  # on one or both legs — the comparison never actually ran) into the same
+  # False as a genuine byte mismatch, so a reader of the committed JSON could
+  # not tell "the byte-equality check FAILED" from "the byte-equality check
+  # never meaningfully ran". Emit the raw tri-state string so both cases are
+  # distinguishable in the artifact; the boolean below is kept for existing
+  # consumers that only care about the true/not-true axis.
   "byte_equal_clone_vs_cold_same_target_dir": byte_equal == "true",
+  "byte_equal_state": byte_equal,
   "sccache_note": os.environ.get("SCCACHE_DELTA_NOTE", ""),
   "sccache_before": os.environ.get("SCCACHE_BEFORE", ""),
   "sccache_after": os.environ.get("SCCACHE_AFTER", ""),
@@ -307,8 +385,16 @@ assert clone_features == cold_features, "clone_features/cold_features must match
 print(json.dumps(result, indent=2))
 PY
 
-if [ "$byte_equal" != "true" ]; then
+# round-4 audit A4: "invalid" is not a milder form of "false" — it means the
+# comparison never ran (find matched zero files on one or both legs), so the
+# committed artifact would otherwise carry a byte_equal value that looks like
+# a completed check. Hard-fail rather than warn: a warning here would let a
+# meaningless leg produce a JSON artifact indistinguishable, at a glance,
+# from one where (iv) genuinely passed or genuinely failed.
+if [ "$byte_equal" = "invalid" ]; then
+  fail "byte-equality check (iv) is INVALID, not a pass or a fail: $byte_equal_diff"
+elif [ "$byte_equal" != "true" ]; then
   echo "::warning::byte-equality FAILED (iv) — see diff below" >&2
   echo "$byte_equal_diff" >&2
 fi
-echo "pipeline complete: pipe this script's stdout JSON into ci/artifacts/pod-build-timings/<ts>-<sha7>.json and commit it (see this file's header)." >&2
+echo "pipeline complete: result JSON written to ${JAMMI_BUILD_TIMINGS_OUT} — copy it to ci/artifacts/pod-build-timings/<ts>-<sha7>.json and commit it (see this file's header)." >&2

@@ -254,13 +254,31 @@ DRV
     fi
 
     # Holder file written under the lock, tmp+rename: readable and complete
-    # immediately after a successful acquire.
+    # WHILE held (checked mid-hold, on a backgrounded slow command — round-4
+    # audit A3 made pod_timing_lock.sh remove the holder file on release, so
+    # checking AFTER the wrapped command has already returned would always
+    # see it gone; this is a genuine change to this test's own assumption,
+    # not a relaxation of what it verifies).
     rm -f "$LOCKFILE" "${LOCKFILE}.holder"
-    JAMMI_TIMING_LABEL="probe-d" bash "$LOCK_SH" acquire -n -- bash -c 'exit 0' >/dev/null 2>&1
+    ( JAMMI_TIMING_LABEL="probe-d" JAMMI_TIMING_LOCK="$LOCKFILE" bash "$LOCK_SH" acquire -n -- bash -c 'sleep 1' ) >/dev/null 2>&1 &
+    D_HOLDER_BG=$!
+    sleep 0.3
     if [ -f "${LOCKFILE}.holder" ] && grep -q '^holder=probe-d$' "${LOCKFILE}.holder"; then
-      ok "(d) holder file is written (tmp+rename) under the lock with the caller's label"
+      ok "(d) holder file is written (tmp+rename) under the lock with the caller's label, WHILE genuinely held"
     else
-      bad "(d) holder file missing or malformed after a successful acquire"
+      bad "(d) holder file missing or malformed while the lock is genuinely held"
+    fi
+    wait "$D_HOLDER_BG" 2>/dev/null
+    # round-4 audit A3: the holder file must be REMOVED on release, not
+    # merely left behind as a witness that can only ever read "held" —
+    # reproduced (pre-fix): a prior run's holder file stayed on disk
+    # forever, so a downstream reader (pod_build_timings.sh's own
+    # LOCK_HELD check) read "held" for every subsequent run regardless of
+    # whether the lock was actually free.
+    if [ ! -f "${LOCKFILE}.holder" ]; then
+      ok "(d/A3) holder file is REMOVED on release — a subsequent reader cannot mistake a past hold for a current one"
+    else
+      bad "(d/A3) holder file survived release: $(cat "${LOCKFILE}.holder" 2>/dev/null)"
     fi
 
     # Holder dies -> the lock frees (kernel-owned liveness: no stale marker,
@@ -997,6 +1015,44 @@ DRV
   else
     bad "(m/N1) gpu-dev.sh's target --with-cutlass does not call pod_push_stamp.sh cutlass-check"
   fi
+
+  # round-4 addendum: `cp -a` of the cutlass submodule copies its own
+  # `.git` gitlink FILE into the destination tree, which is a real git
+  # checkout of its own — an un-registered, foreign `.git` nested inside it
+  # makes `git status`/`git add` at the tree's root fail. Structural (the
+  # remote heredoc only runs on a live pod) for the SOURCE TEXT: the
+  # gitlink must be stripped from the destination and its absence asserted,
+  # never left in place; EXECUTABLE against a real fixture for the actual
+  # mechanism (extracted from gpu-dev.sh's own heredoc bytes, never a
+  # reimplementation) to prove `cp -a` really does copy `.git` and the
+  # strip really does remove it while preserving real content.
+  GD_SH="$REPO_ROOT/ci/scripts/gpu-dev.sh"
+  if grep -q "rm -rf '\${NAME_SOURCE_TREE_DIR}/crates/jammi-kernels/third_party/cutlass/.git'" "$GD_SH" \
+     && grep -q "\[ -e '\${NAME_SOURCE_TREE_DIR}/crates/jammi-kernels/third_party/cutlass/.git' \] &&" "$GD_SH"; then
+    ok "(m/A6) gpu-dev.sh's target --with-cutlass strips the copied .git gitlink and asserts its absence"
+  else
+    bad "(m/A6) gpu-dev.sh's target --with-cutlass does not strip+assert-absent the copied cutlass/.git"
+  fi
+
+  M6_SRC="$SANDBOX/m6_cutlass_src"
+  M6_DEST="$SANDBOX/m6_tree_dest/crates/jammi-kernels/third_party/cutlass"
+  rm -rf "$M6_SRC" "$SANDBOX/m6_tree_dest"
+  mkdir -p "$M6_SRC"
+  echo "gitdir: /root/jammi-ai/.git/modules/crates/jammi-kernels/third_party/cutlass" > "$M6_SRC/.git"
+  echo "real header content" > "$M6_SRC/header.h"
+  mkdir -p "$(dirname "$M6_DEST")"
+  cp -a "$M6_SRC" "$M6_DEST"
+  if [ -e "$M6_DEST/.git" ]; then
+    ok "(m/A6) negative control: cp -a genuinely DOES copy the submodule's .git gitlink (confirms the bug this fix addresses is real)"
+  else
+    bad "(m/A6) negative control failed: cp -a did not copy .git — the fixture itself is wrong"
+  fi
+  rm -rf "$M6_DEST/.git"
+  if [ ! -e "$M6_DEST/.git" ] && [ -f "$M6_DEST/header.h" ] && [ "$(cat "$M6_DEST/header.h")" = "real header content" ]; then
+    ok "(m/A6) stripping .git removes the foreign gitlink while preserving real cutlass content"
+  else
+    bad "(m/A6) strip either left .git behind or damaged real content"
+  fi
 }
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -1067,6 +1123,179 @@ DRV
     ok "(n) T1b's dispatch has a DISTINCT message for 'could not determine' vs 'genuinely absent'"
   else
     bad "(n) T1b's dispatch does not distinguish a metadata-query failure from a genuine feature absence"
+  fi
+
+  # round-4 addendum: rc=2 ("could not determine") now ABORTS the seed's own
+  # T1b gate (never silently skips it as a soft "treat as absent") — the
+  # on-pod incident's own failure mode. Structural (reaching this branch
+  # live needs a real `main`-branch checkout mid-seed-build): the source
+  # must `exit 1` on rc=2, and must NOT still read "T1b skipped" for that
+  # branch (round-3's wording, now wrong for rc=2 specifically — only rc=1
+  # keeps that wording).
+  if grep -q 'refusing to guess .absent.; see pod_seed_cargo_metadata_frozen' "$REPO_ROOT/ci/scripts/pod_seed_target.sh"; then
+    ok "(n/addendum) T1b's rc=2 branch names the real cause and refuses to guess, rather than silently skipping"
+  else
+    bad "(n/addendum) T1b's rc=2 branch does not name the refusal-to-guess"
+  fi
+  N2_SEEDSH="$REPO_ROOT/ci/scripts/pod_seed_target.sh"
+  N2_T1B_START="$(grep -n 'pod_seed_pkg_has_feature jammi-kernels flash-attn || feat_rc=\$?' "$N2_SEEDSH" | head -1 | cut -d: -f1)"
+  N2_T1B_ELSE="$(awk -v s="$N2_T1B_START" 'NR>s && /^      else$/{print NR; exit}' "$N2_SEEDSH")"
+  N2_T1B_FI="$(awk -v s="$N2_T1B_START" 'NR>s && /^      fi$/{print NR; exit}' "$N2_SEEDSH")"
+  if [ -n "$N2_T1B_ELSE" ] && [ -n "$N2_T1B_FI" ] \
+     && sed -n "${N2_T1B_ELSE},${N2_T1B_FI}p" "$N2_SEEDSH" | grep -q 'exit 1'; then
+    ok "(n/addendum) T1b's rc=2 else-branch genuinely contains 'exit 1' (aborts the seed subshell), not merely a warning"
+  else
+    bad "(n/addendum) could not confirm T1b's rc=2 else-branch aborts (start=${N2_T1B_START:-?} else=${N2_T1B_ELSE:-?} fi=${N2_T1B_FI:-?})"
+  fi
+
+  # round-4 addendum: pod_build_timings.sh's OWN, separate FA2 *measurement*
+  # leg deliberately still WARNS-and-skips on rc=2 (it decides only whether
+  # to run an ADDITIONAL optional measurement, never whether the seed
+  # itself — validated by its own real pod_seed_target.sh invocation at
+  # step (i), which now aborts — is valid). Confirms the two callers
+  # genuinely diverge, not that the seed's own fix leaked/failed to leak.
+  if grep -q 'FA2 leg skipped: could not determine' "$REPO_ROOT/ci/scripts/perf/pod_build_timings.sh"; then
+    ok "(n/addendum) pod_build_timings.sh's OWN FA2 measurement leg still warns-and-skips on rc=2 (a different call site, a different decision)"
+  else
+    bad "(n/addendum) pod_build_timings.sh's FA2 leg dispatch text changed unexpectedly"
+  fi
+
+  # round-4 addendum: every `--frozen` metadata call site goes through the
+  # shared stderr-capturing helper — never a raw `cargo metadata --frozen
+  # ... 2>/dev/null` left un-migrated (a regression tripwire: a future edit
+  # re-introducing a raw discarding call site should fail this).
+  N2_RAW_SITES="$(grep -c 'cargo metadata --frozen --format-version 1 2>/dev/null\|cargo metadata --frozen --format-version 1 --features jammi-kernels/cuda 2>/dev/null' "$N2_SEEDSH" 2>/dev/null || true)"
+  if [ "${N2_RAW_SITES:-0}" -eq 0 ]; then
+    ok "(n/addendum) no raw, stderr-discarding 'cargo metadata --frozen ... 2>/dev/null' call site remains in pod_seed_target.sh"
+  else
+    bad "(n/addendum) found ${N2_RAW_SITES} raw stderr-discarding cargo metadata call site(s) still in pod_seed_target.sh"
+  fi
+
+  # round-4 addendum: pod_seed_cargo_metadata_frozen actually surfaces real
+  # stderr (never silently returns empty) — exercised against a REAL
+  # broken --frozen query (no Cargo.lock at all) rather than asserted.
+  N2_METASH="$SANDBOX/n2_metash"
+  mkdir -p "$N2_METASH"
+  # shellcheck disable=SC1090
+  N2_META_OUT="$( (cd "$N2_METASH" && . "$N2_SEEDSH" && pod_seed_cargo_metadata_frozen) 2>&1 1>/dev/null )"
+  N2_META_RC=0
+  # shellcheck disable=SC1090
+  (cd "$N2_METASH" && . "$N2_SEEDSH" && pod_seed_cargo_metadata_frozen >/dev/null 2>/dev/null) || N2_META_RC=$?
+  if [ "$N2_META_RC" -eq 2 ] && [ -n "$N2_META_OUT" ]; then
+    ok "(n/addendum) pod_seed_cargo_metadata_frozen returns 2 and prints REAL stderr on a genuinely broken query (no silent empty string)"
+  else
+    bad "(n/addendum) expected rc=2 with non-empty stderr on a broken metadata query (rc=$N2_META_RC, stderr empty=$([ -z "$N2_META_OUT" ] && echo yes || echo no))"
+  fi
+
+  # round-4 addendum: the seed's own one-time, network-allowed priming call
+  # (`cargo metadata --locked`, never `--frozen`) runs BEFORE T1 — a
+  # structural, line-position check (a real priming run needs network, out
+  # of scope for a hermetic suite).
+  N2_PRIME_LINE="$(grep -n 'cargo metadata --locked --format-version 1 --features jammi-kernels/cuda' "$N2_SEEDSH" | head -1 | cut -d: -f1)"
+  N2_T1_LINE="$(grep -n 'echo "=== T1: release -p jammi-bench --features cuda ==="' "$N2_SEEDSH" | head -1 | cut -d: -f1)"
+  if [ -n "$N2_PRIME_LINE" ] && [ -n "$N2_T1_LINE" ] && [ "$N2_PRIME_LINE" -lt "$N2_T1_LINE" ]; then
+    ok "(n/addendum) the seed's one-time network-allowed metadata priming call (line ${N2_PRIME_LINE}) runs BEFORE T1 (line ${N2_T1_LINE})"
+  else
+    bad "(n/addendum) expected the priming call to precede T1 (prime=${N2_PRIME_LINE:-?} T1=${N2_T1_LINE:-?})"
+  fi
+
+  # round-4 addendum: pod_seed_write_failure_marker captures a diagnostic
+  # buried far above a plain tail, against a REAL fixture log (not asserted
+  # from a written claim) — command+output already verified manually; this
+  # is that proof made permanent, plus the OLD tail-only form's own miss
+  # reproduced alongside it as the regression tripwire.
+  N2_FIXTURE_LOG="$SANDBOX/n2_fixture.log"
+  { echo "   Compiling jammi-kernels v0.47.0"
+    echo "error[E0433]: failed to resolve: use of undeclared crate or module foo"
+    for i in $(seq 1 200); do echo "   Checking some-other-crate-$i v0.1.$i"; done
+    echo "    Finished release [optimized] target(s) in 40.12s"
+  } > "$N2_FIXTURE_LOG"
+  N2_NEW_MARKER="$SANDBOX/n2_new_marker.txt"
+  # shellcheck disable=SC1090
+  (cd "$N2_METASH" && . "$N2_SEEDSH" && pod_seed_write_failure_marker "$N2_FIXTURE_LOG" "$N2_NEW_MARKER" 1)
+  if grep -q 'E0433' "$N2_NEW_MARKER"; then
+    ok "(n/addendum) pod_seed_write_failure_marker's NEW form catches an error buried 200 lines above the tail"
+  else
+    bad "(n/addendum) pod_seed_write_failure_marker missed a buried E0433 error"
+  fi
+  N2_OLD_MARKER="$SANDBOX/n2_old_marker.txt"
+  { echo "seed build FAILED (exit 1) — log tail:"; tail -100 "$N2_FIXTURE_LOG"; } > "$N2_OLD_MARKER"
+  if ! grep -q 'E0433' "$N2_OLD_MARKER"; then
+    ok "(n/addendum revert-RED) the OLD plain-tail-100 form genuinely MISSES the same buried error on the SAME fixture — the new form's fix is real, not vacuous"
+  else
+    bad "(n/addendum revert-RED) the OLD tail-100 form unexpectedly caught the error too — the fixture does not discriminate"
+  fi
+
+  # round-4 addendum: pod_seed_assert_required_tools fails loudly, naming
+  # every missing tool, and passes when everything required is present.
+  # POSIX prefix-assignment resolves the COMMAND NAME using the assignment's
+  # OWN new PATH, not the caller's — `PATH="$narrow_dir" bash -c ...` fails
+  # to find "bash" itself once PATH no longer contains it. Captured once,
+  # as an ABSOLUTE path, and invoked as "$N2_REAL_BASH" below instead of a
+  # bare `bash` (reproduced in isolation before fixing: the bare form fails
+  # with "bash: command not found" on every PATH-narrowing leg below).
+  N2_REAL_BASH="$(command -v bash)"
+
+  N2_TOOLBIN_MISSING="$SANDBOX/n2_toolbin_missing"
+  mkdir -p "$N2_TOOLBIN_MISSING"
+  # dirname is needed by pod_seed_target.sh's own TOP-LEVEL code (computing
+  # $DIR at source time, before any function is even called) — omitting it
+  # from a narrow-PATH sandbox breaks sourcing itself with unrelated noise
+  # ("dirname: command not found"), not the specific behavior under test.
+  for t in dirname git python3 sha256sum shasum; do
+    REAL="$(command -v "$t" 2>/dev/null || true)"
+    [ -n "$REAL" ] && ln -sf "$REAL" "$N2_TOOLBIN_MISSING/$t"
+  done
+  # cargo deliberately left OFF PATH here.
+  N2_TOOLS_OUT="$(PATH="$N2_TOOLBIN_MISSING" "$N2_REAL_BASH" -c '. "'"$N2_SEEDSH"'"; pod_seed_assert_required_tools' 2>&1)"
+  N2_TOOLS_RC=$?
+  if [ "$N2_TOOLS_RC" -ne 0 ] && printf '%s' "$N2_TOOLS_OUT" | grep -q 'cargo'; then
+    ok "(n/addendum) pod_seed_assert_required_tools fails and NAMES 'cargo' when it is missing from PATH"
+  else
+    bad "(n/addendum) expected a failure naming 'cargo' (rc=$N2_TOOLS_RC): $N2_TOOLS_OUT"
+  fi
+  if (PATH="$HOME/.cargo/bin:$PATH" "$N2_REAL_BASH" -c '. "'"$N2_SEEDSH"'"; pod_seed_assert_required_tools') >/dev/null 2>&1; then
+    ok "(n/addendum) pod_seed_assert_required_tools passes cleanly when every required tool is present"
+  else
+    bad "(n/addendum) pod_seed_assert_required_tools unexpectedly failed with a normal PATH"
+  fi
+
+  # round-4 addendum: pod_sha256_of_file prefers sha256sum, falls back to
+  # shasum, and refuses loudly (never a silent empty string) if neither
+  # exists — exercised against real fake-tool PATH sandboxes.
+  N2_HASH_FILE="$SANDBOX/n2_hash_target.txt"
+  echo "hash me" > "$N2_HASH_FILE"
+  N2_REAL_HASH="$(shasum -a 256 "$N2_HASH_FILE" 2>/dev/null | awk '{print $1}')"
+
+  N2_NOTOOLS="$SANDBOX/n2_notools_bin"
+  mkdir -p "$N2_NOTOOLS"
+  N2_REAL_DIRNAME="$(command -v dirname 2>/dev/null || true)"
+  [ -n "$N2_REAL_DIRNAME" ] && ln -sf "$N2_REAL_DIRNAME" "$N2_NOTOOLS/dirname"
+  N2_NOHASH_OUT="$(PATH="$N2_NOTOOLS" "$N2_REAL_BASH" -c '. "'"$N2_SEEDSH"'"; pod_sha256_of_file "'"$N2_HASH_FILE"'"' 2>&1)"
+  N2_NOHASH_RC=$?
+  if [ "$N2_NOHASH_RC" -eq 2 ] && [ -z "$(printf '%s' "$N2_NOHASH_OUT" | grep -v '::error::')" ]; then
+    ok "(n/addendum) pod_sha256_of_file refuses loudly (rc=2, no hash printed) when neither sha256sum nor shasum exists"
+  else
+    bad "(n/addendum) pod_sha256_of_file should have refused loudly with no hashing tool available (rc=$N2_NOHASH_RC): $N2_NOHASH_OUT"
+  fi
+
+  N2_SHASUM_ONLY="$SANDBOX/n2_shasum_only_bin"
+  mkdir -p "$N2_SHASUM_ONLY"
+  [ -n "$N2_REAL_DIRNAME" ] && ln -sf "$N2_REAL_DIRNAME" "$N2_SHASUM_ONLY/dirname"
+  # pod_sha256_of_file's own shasum-fallback branch pipes through awk.
+  N2_REAL_AWK="$(command -v awk 2>/dev/null || true)"
+  [ -n "$N2_REAL_AWK" ] && ln -sf "$N2_REAL_AWK" "$N2_SHASUM_ONLY/awk"
+  REAL_SHASUM="$(command -v shasum 2>/dev/null || true)"
+  if [ -n "$REAL_SHASUM" ]; then
+    ln -sf "$REAL_SHASUM" "$N2_SHASUM_ONLY/shasum"
+    N2_SHASUM_HASH="$(PATH="$N2_SHASUM_ONLY" "$N2_REAL_BASH" -c '. "'"$N2_SEEDSH"'"; pod_sha256_of_file "'"$N2_HASH_FILE"'"' 2>/dev/null)"
+    if [ "$N2_SHASUM_HASH" = "$N2_REAL_HASH" ] && [ -n "$N2_SHASUM_HASH" ]; then
+      ok "(n/addendum) pod_sha256_of_file falls back to shasum -a 256 when sha256sum is absent, and computes the CORRECT hash"
+    else
+      bad "(n/addendum) shasum fallback hash mismatch or empty (got '$N2_SHASUM_HASH', want '$N2_REAL_HASH')"
+    fi
+  else
+    skip "(n/addendum) shasum not present on this host — fallback leg skipped"
   fi
 }
 
@@ -1160,6 +1389,219 @@ DRV
     bad "(o/item8) found 'cp -a \$CLONE_DIR \$COLD_DIR' — the cold leg is copying the clone again, defeating the whole point of a cold comparison"
   else
     ok "(o/item8) no 'cp -a \$CLONE_DIR \$COLD_DIR' anywhere — the cold leg never reuses the clone's own artifacts"
+  fi
+}
+
+# ═════════════════════════════════════════════════════════════════════════
+# (p) round-4 audit A5: the OTHER two unconditional member-freedom call
+# sites — only pod_target_clone.sh's (b/N2 above) had revert-RED coverage
+# before this round. pod_seed_target.sh's own completion-stamp gate (T4,
+# right before .jammi-seed-complete is written) and pod_build_timings.sh's
+# second, independent witness (right after step (i)'s seed-marker check)
+# are exercised here against the REAL scripts, the REAL
+# pod_seed_assert_member_free function, and a REAL `cargo metadata --frozen`
+# query against THIS checkout's own workspace (never a fixture workspace,
+# same technique (b) already uses) — only cargo build/test/clippy are
+# stubbed to a silent exit 0 (metadata/fetch pass straight through to the
+# real cargo binary), so the T1-T4 pipeline finishes in well under a second
+# without ever compiling anything, and whatever is planted in JAMMI_SEED_DIR
+# before the call survives untouched all the way to the gate under test.
+# ═════════════════════════════════════════════════════════════════════════
+{
+  P_STUBBIN="$SANDBOX/p_cargo_stubbin"
+  mkdir -p "$P_STUBBIN"
+  P_REAL_CARGO="$(command -v cargo)"
+  cat > "$P_STUBBIN/cargo" <<STUB
+#!/usr/bin/env bash
+case "\$1" in
+  metadata|fetch) exec "$P_REAL_CARGO" "\$@" ;;
+  *) exit 0 ;;
+esac
+STUB
+  chmod +x "$P_STUBBIN/cargo"
+
+  # ---- p1: pod_seed_target.sh's own completion-stamp gate (~line 557) ----
+  P1_SEED="$SANDBOX/p1_seed"
+  rm -rf "$P1_SEED"; mkdir -p "$P1_SEED/release/deps"
+  : > "$P1_SEED/release/deps/libjammi_kernels-cafef00d.rlib"
+
+  P1_DRIVER="$SANDBOX/probe_p1_seedmain.sh"
+  cat > "$P1_DRIVER" <<DRV
+#!/usr/bin/env bash
+set -uo pipefail
+export PATH="$P_STUBBIN:\$PATH"
+export JAMMI_SEED_DIR="$P1_SEED"
+export JAMMI_TREE_DIR="$REPO_ROOT"
+export JAMMI_SEED_MANIFEST="$REPO_ROOT/ci/scripts/pod_seed_key_inputs.toml"
+# shellcheck disable=SC1091
+. "$REPO_ROOT/ci/scripts/pod_seed_target.sh"
+pod_seed_target_main --no-lock
+DRV
+  chmod +x "$P1_DRIVER"
+
+  p1_out="$(bash "$P1_DRIVER" 2>&1)"; p1_rc=$?
+  if [ "$p1_rc" -ne 0 ] && printf '%s' "$p1_out" | grep -q 'libjammi_kernels-cafef00d.rlib' \
+     && [ ! -f "${P1_SEED}.jammi-seed-complete" ]; then
+    ok "(p1/A5) pod_seed_target_main's own completion-stamp gate refuses a lib-prefixed poisoned target dir (real T1-T4 pipeline, real cargo metadata) and writes no completion marker"
+  else
+    bad "(p1/A5) expected the real seed pipeline to refuse the poisoned target dir before stamping complete (rc=$p1_rc): $p1_out"
+  fi
+
+  # Negative control: an UNPOISONED target dir must not trip THIS check —
+  # asserted as the absence of a "NOT member-free" line, even though the run
+  # still fails later for an UNRELATED reason (the env-surface cross-check,
+  # since the stubbed cargo never produces real build-script capture
+  # output) — isolating this gate's own pass/fail from the rest of the
+  # pipeline's.
+  P1_CLEAN="$SANDBOX/p1_clean"
+  rm -rf "$P1_CLEAN"; mkdir -p "$P1_CLEAN"
+  P1_CLEAN_DRIVER="$SANDBOX/probe_p1_clean.sh"
+  cat > "$P1_CLEAN_DRIVER" <<DRV
+#!/usr/bin/env bash
+set -uo pipefail
+export PATH="$P_STUBBIN:\$PATH"
+export JAMMI_SEED_DIR="$P1_CLEAN"
+export JAMMI_TREE_DIR="$REPO_ROOT"
+export JAMMI_SEED_MANIFEST="$REPO_ROOT/ci/scripts/pod_seed_key_inputs.toml"
+# shellcheck disable=SC1091
+. "$REPO_ROOT/ci/scripts/pod_seed_target.sh"
+pod_seed_target_main --no-lock
+DRV
+  chmod +x "$P1_CLEAN_DRIVER"
+  p1c_out="$(bash "$P1_CLEAN_DRIVER" 2>&1)"
+  if ! printf '%s' "$p1c_out" | grep -q 'NOT member-free'; then
+    ok "(p1/A5) an unpoisoned target dir passes the member-free gate cleanly (no 'NOT member-free' from THIS check)"
+  else
+    bad "(p1/A5) the member-free gate false-positived on a clean target dir: $p1c_out"
+  fi
+
+  # revert-RED proof: neutering pod_seed_target.sh's OWN completion-stamp
+  # call, on a FRESH copy of the same poisoned fixture (a fresh dir, not
+  # p1_seed itself — p1_seed's own .jammi-seed-failed marker would short-
+  # circuit a second invocation via the "previously FAILED, not retrying"
+  # arm before ever reaching T1-T4 again), makes the "NOT member-free"
+  # catch DISAPPEAR — proving this exact call site, not some other check,
+  # is what caught p1_seed above.
+  P1_SEED_REVERT="$SANDBOX/p1_seed_revert"
+  rm -rf "$P1_SEED_REVERT"; mkdir -p "$P1_SEED_REVERT/release/deps"
+  : > "$P1_SEED_REVERT/release/deps/libjammi_kernels-cafef00d.rlib"
+
+  P1_REVERTED="$SANDBOX/p1_seed_target_reverted.sh"
+  cp "$REPO_ROOT/ci/scripts/pod_seed_target.sh" "$P1_REVERTED"
+  REVERT_LINE="$(grep -n 'pod_seed_assert_member_free "\$JAMMI_SEED_DIR" "\$JAMMI_TREE_DIR" || exit 1' "$P1_REVERTED" | head -1 | cut -d: -f1)"
+  if [ -n "$REVERT_LINE" ]; then
+    sed -i.bak "${REVERT_LINE}s/^\([[:space:]]*\)pod_seed_assert_member_free/\1: pod_seed_assert_member_free_DISABLED_FOR_REVERT_PROOF #/" "$P1_REVERTED"
+    if bash -n "$P1_REVERTED"; then
+      P1_REVERT_DRIVER="$SANDBOX/probe_p1_revert.sh"
+      cat > "$P1_REVERT_DRIVER" <<DRV
+#!/usr/bin/env bash
+set -uo pipefail
+export PATH="$P_STUBBIN:\$PATH"
+export JAMMI_SEED_DIR="$P1_SEED_REVERT"
+export JAMMI_TREE_DIR="$REPO_ROOT"
+export JAMMI_SEED_MANIFEST="$REPO_ROOT/ci/scripts/pod_seed_key_inputs.toml"
+# shellcheck disable=SC1091
+. "$P1_REVERTED"
+pod_seed_target_main --no-lock
+DRV
+      chmod +x "$P1_REVERT_DRIVER"
+      p1r_out="$(bash "$P1_REVERT_DRIVER" 2>&1)"
+      if ! printf '%s' "$p1r_out" | grep -q 'NOT member-free'; then
+        ok "(p1/A5 revert-RED) neutering pod_seed_target.sh's own completion-stamp gate call (line ${REVERT_LINE}) on the SAME-shaped poisoned dir makes the 'NOT member-free' catch disappear — the call site is genuinely load-bearing, not a proxy"
+      else
+        bad "(p1/A5 revert-RED) expected the poison catch to disappear after neutering line ${REVERT_LINE}, but it is still present: $p1r_out"
+      fi
+    else
+      bad "(p1/A5) revert-RED fixture has a syntax error after neutering line ${REVERT_LINE}"
+    fi
+  else
+    bad "(p1/A5) could not locate pod_seed_target.sh's completion-stamp member-free call site to build the revert-RED fixture"
+  fi
+
+  # ---- p2: pod_build_timings.sh's second, independent witness (~line 128) ----
+  # Everything past the (i) seed block needs a live cargo/nvcc toolchain
+  # (item 8's own established convention in this file), so this drives the
+  # REAL bytes of pod_build_timings.sh from its shebang through the (i)
+  # block (a verbatim `sed` extraction, never a hand-reimplementation) with
+  # a synthetic tail appended, placed at the same relative depth
+  # (<root>/perf/driver.sh) so the script's own `CI_SCRIPTS="$(cd
+  # "$DIR/.." && pwd)"` resolution finds a REAL copy of pod_seed_target.sh
+  # (for its `.` sourcing at (i)) and a REAL pod_push_stamp.sh alongside it.
+  PBT_SH="$REPO_ROOT/ci/scripts/perf/pod_build_timings.sh"
+  # Anchored to the actual CODE line (`echo "::endgroup::"`), never a bare
+  # substring match — a module-doc comment mentioning the literal marker
+  # text (as this file's own round-4-addendum comment does) would otherwise
+  # be picked up as line 1, truncating the driver before it ever reaches
+  # the real (i) block.
+  P2_ENDGROUP_LINE="$(grep -n '^echo "::endgroup::"$' "$PBT_SH" | head -1 | cut -d: -f1)"
+  if [ -z "$P2_ENDGROUP_LINE" ]; then
+    bad "(p2/A5) could not locate the first '::endgroup::' in pod_build_timings.sh to build the truncated driver"
+  else
+    P2_ROOT="$SANDBOX/p2_pbt_root"
+    rm -rf "$P2_ROOT"; mkdir -p "$P2_ROOT/perf"
+    cp "$REPO_ROOT/ci/scripts/pod_seed_target.sh" "$P2_ROOT/pod_seed_target.sh"
+    cp "$REPO_ROOT/ci/scripts/pod_push_stamp.sh" "$P2_ROOT/pod_push_stamp.sh"
+    sed -n "1,${P2_ENDGROUP_LINE}p" "$PBT_SH" > "$P2_ROOT/perf/driver.sh"
+    { printf '\necho P2_REACHED_PAST_MEMBER_CHECK\nexit 0\n'; } >> "$P2_ROOT/perf/driver.sh"
+    chmod +x "$P2_ROOT/perf/driver.sh"
+
+    # Poisoned fixture: seed marker pre-created (so the (i) block's own
+    # external call to the REAL pod_seed_target.sh --no-lock takes the fast
+    # "seed already complete" path — verified idempotent, never touches
+    # cargo) with a lib-prefixed poisoned artifact already in place.
+    P2_SEED_POISON="$SANDBOX/p2_seed_poison"
+    rm -rf "$P2_SEED_POISON"; mkdir -p "$P2_SEED_POISON/release/deps"
+    : > "$P2_SEED_POISON/release/deps/libjammi_kernels-deadbeef.rlib"
+    : > "${P2_SEED_POISON}.jammi-seed-complete"
+
+    p2_poison_out="$(JAMMI_TREE_DIR="$REPO_ROOT" JAMMI_SEED_DIR="$P2_SEED_POISON" \
+      JAMMI_FA2_TIP_REF=irrelevant JAMMI_BOX_LABEL=probe JAMMI_BUILD_TIMINGS_OUT=/dev/null \
+      bash "$P2_ROOT/perf/driver.sh" --no-lock 2>&1)"
+    p2_poison_rc=$?
+    if [ "$p2_poison_rc" -ne 0 ] && printf '%s' "$p2_poison_out" | grep -q 'NOT member-free' \
+       && ! printf '%s' "$p2_poison_out" | grep -q 'P2_REACHED_PAST_MEMBER_CHECK'; then
+      ok "(p2/A5) pod_build_timings.sh's own second, independent member-free witness refuses a poisoned seed and never reaches past it (real script bytes through the (i) block)"
+    else
+      bad "(p2/A5) expected pod_build_timings.sh's own witness to refuse the poisoned seed and not reach past it (rc=$p2_poison_rc): $p2_poison_out"
+    fi
+
+    # Negative control: a clean seed reaches past the (i) block.
+    P2_SEED_CLEAN="$SANDBOX/p2_seed_clean"
+    rm -rf "$P2_SEED_CLEAN"; mkdir -p "$P2_SEED_CLEAN/release"
+    echo unrelated > "$P2_SEED_CLEAN/release/thing.txt"
+    : > "${P2_SEED_CLEAN}.jammi-seed-complete"
+    p2_clean_out="$(JAMMI_TREE_DIR="$REPO_ROOT" JAMMI_SEED_DIR="$P2_SEED_CLEAN" \
+      JAMMI_FA2_TIP_REF=irrelevant JAMMI_BOX_LABEL=probe JAMMI_BUILD_TIMINGS_OUT=/dev/null \
+      bash "$P2_ROOT/perf/driver.sh" --no-lock 2>&1)"
+    p2_clean_rc=$?
+    if [ "$p2_clean_rc" -eq 0 ] && printf '%s' "$p2_clean_out" | grep -q 'P2_REACHED_PAST_MEMBER_CHECK'; then
+      ok "(p2/A5) a clean seed reaches past pod_build_timings.sh's own witness (negative control — the gate does not block legitimate runs)"
+    else
+      bad "(p2/A5) expected a clean seed to reach past the witness (rc=$p2_clean_rc): $p2_clean_out"
+    fi
+
+    # revert-RED proof: neutering the REAL script's own call line, on the
+    # SAME poisoned fixture, makes it reach past the check.
+    CALL_LINE="$(grep -n 'pod_seed_assert_member_free "\$JAMMI_SEED_DIR" "\$JAMMI_TREE_DIR" || fail "seed at' "$P2_ROOT/perf/driver.sh" | head -1 | cut -d: -f1)"
+    if [ -n "$CALL_LINE" ]; then
+      cp "$P2_ROOT/perf/driver.sh" "$P2_ROOT/perf/driver_reverted.sh"
+      sed -i.bak "${CALL_LINE}s/^pod_seed_assert_member_free/: pod_seed_assert_member_free_DISABLED_FOR_REVERT_PROOF #/" "$P2_ROOT/perf/driver_reverted.sh"
+      if bash -n "$P2_ROOT/perf/driver_reverted.sh"; then
+        p2_revert_out="$(JAMMI_TREE_DIR="$REPO_ROOT" JAMMI_SEED_DIR="$P2_SEED_POISON" \
+          JAMMI_FA2_TIP_REF=irrelevant JAMMI_BOX_LABEL=probe JAMMI_BUILD_TIMINGS_OUT=/dev/null \
+          bash "$P2_ROOT/perf/driver_reverted.sh" --no-lock 2>&1)"
+        p2_revert_rc=$?
+        if [ "$p2_revert_rc" -eq 0 ] && printf '%s' "$p2_revert_out" | grep -q 'P2_REACHED_PAST_MEMBER_CHECK'; then
+          ok "(p2/A5 revert-RED) neutering pod_build_timings.sh's own witness call (line ${CALL_LINE}) on the SAME poisoned seed lets it reach past the check — the call site is genuinely load-bearing, not a proxy"
+        else
+          bad "(p2/A5 revert-RED) expected the poisoned seed to reach past the check after neutering line ${CALL_LINE} (rc=$p2_revert_rc): $p2_revert_out"
+        fi
+      else
+        bad "(p2/A5) revert-RED fixture has a syntax error after neutering line ${CALL_LINE}"
+      fi
+    else
+      bad "(p2/A5) could not locate pod_build_timings.sh's own member-free call site in the truncated driver to build the revert-RED fixture"
+    fi
   fi
 }
 

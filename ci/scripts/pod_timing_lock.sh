@@ -42,6 +42,21 @@
 # truncated/partial one — verified empirically (pt8/holder_race.py-style
 # probe: truncate+write showed torn reads under a scheduling gap between
 # the truncate and the write; tmp+rename showed zero).
+#
+# The holder file is REMOVED on release (round-4 audit A3): a witness file
+# that is written once and never cleaned up answers "is this held, right
+# now" correctly only until the FIRST release, then reads as "held" forever
+# after — a downstream reader (pod_build_timings.sh's own LOCK_HELD check)
+# reproduced exactly that: the prior run exits, the witness still reads
+# true, and an outsider acquires the lock immediately despite it. Removal
+# happens via a trap on EXIT/INT/TERM set INSIDE the flock-held child, after
+# the holder file is written and BEFORE the wrapped command runs (so a
+# crash/kill of the wrapped command still triggers cleanup) — the wrapped
+# command is run as a normal child (never `exec`'d away), because `exec`
+# REPLACES the process image and would discard the trap before it could
+# ever fire on the wrapped command's own later exit. Readers ALSO
+# cross-check the recorded `pid=` against a live process (`kill -0`),
+# belt-and-suspenders against a removal that itself raced or failed.
 set -uo pipefail
 
 LOCK="${JAMMI_TIMING_LOCK:-/root/.jammi-timing.lock}"
@@ -96,5 +111,7 @@ exec flock "${flock_args[@]}" -E 75 "$LOCK" bash -c '
     printf "job=%s\n" "${JAMMI_TIMING_JOB:-}"
     printf "started=%s\n" "$(date -u +%FT%TZ 2>/dev/null || echo unknown)"
   } > "$tmp" && mv -f "$tmp" "$holder"
-  exec "$@"
+  trap "rm -f \"$holder\"" EXIT INT TERM
+  "$@"
+  exit "$?"
 ' _ "$LOCK" "$HOLDER" "$label" "$@"

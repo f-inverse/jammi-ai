@@ -64,7 +64,7 @@ edges, by design — not a discrepancy.
 <!-- BEGIN GENERATED: dep-dag -->
 ```
 jammi-admin -> jammi-db, jammi-wire
-jammi-ai -> jammi-db, jammi-encoders, jammi-lora, jammi-numerics, jammi-test-utils, jammi-wire
+jammi-ai -> jammi-db, jammi-encoders, jammi-kernels, jammi-lora, jammi-numerics, jammi-test-utils, jammi-wire
 jammi-bench -> jammi-ai, jammi-db, jammi-encoders, jammi-kernels, jammi-lora, jammi-numerics
 jammi-cli -> jammi-admin, jammi-db
 jammi-client -> jammi-admin, jammi-db, jammi-wire
@@ -101,7 +101,8 @@ jammi-client ──► jammi-wire, jammi-admin, jammi-db               [data-pla
    │  (jammi-cli ──► jammi-admin, jammi-db  — control-plane only, NO jammi-ai)
    │
 jammi-ai ──► jammi-db, jammi-numerics, jammi-lora, jammi-wire,   [EMBEDDED ENGINE]
-             jammi-encoders(opt, `local`), candle(opt, `local`)
+             jammi-encoders(opt, `local`), jammi-kernels(opt, `cuda`),
+             candle(opt, `local`)
    ▲   ▲
 jammi-server ──► jammi-wire, jammi-ai, jammi-db, jammi-numerics  [serves the wire over the engine]
    │
@@ -3076,6 +3077,16 @@ graphs don't exhaust runner disk) → `test-clients` (clients + the **two candle
   backend-specific SQL tokens (SQLite-only `rowid`/`AUTOINCREMENT`/`PRAGMA`/`strftime(`/`glob(`;
   Postgres-only `ctid`). A syntactic first-pass tripwire only — it stops the obvious cheap
   regression; `test-pg` above is what actually enforces backend-behavioral parity.
+- **`ci/scripts/check_cuda_run_artifacts.py`** enforces a schema over every `*.json` under
+  `crates/jammi-kernels/artifacts/cuda-runs/` (see that directory's own `README.md` for the field
+  list, and `docs/maintainer/cuda-kernel-guide.md` §4): a well-typed `schema_version` / `git_sha`
+  / `box` / `producer` / `status`, a `producer` that is either statically verifiable (a real
+  `#[test] fn` found under its stated `#[ignore]`/`env:<VAR>`/`required-features` gating
+  attribute) or a reviewed legacy `kind: "none"` entry in the script's own closed allow-list, and
+  `git_sha` an ancestor of `HEAD` (`git merge-base --is-ancestor`) — OR, when the measured tip was
+  itself squash-merged, the optional `merged_as` (the squash commit, verified to literally
+  reintroduce this same artifact file) + `merged_via_pr` pair naming an ancestor instead, with
+  `git_sha` kept verbatim either way.
 
 **Postgres coverage note (heuristic, not a certified gap list).** A name-based grep of
 `crates/jammi-db/tests/it/` for the following `jammi-db` catalog/store functions found zero direct

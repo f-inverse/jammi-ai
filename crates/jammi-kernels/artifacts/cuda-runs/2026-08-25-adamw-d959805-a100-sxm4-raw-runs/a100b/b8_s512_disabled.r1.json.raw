@@ -1,0 +1,109 @@
+{
+  "engine_version": "0.47.0",
+  "host": {
+    "logical_cpus": 15,
+    "total_ram_mib": 2051942
+  },
+  "subcommand": "finetune-step",
+  "tiers": {
+    "finetune_step": {
+      "device": "cuda:0",
+      "device_name": "NVIDIA A100-SXM4-80GB",
+      "backbone_dtype": "bf16",
+      "checkpoint_config_sha256": "55dca68059e98f0debf8eb63ab355c451c65b1f5d90fdca4754113fdaadd2cca",
+      "checkpoint_weights_sha256": "44510fec5d3a81a1877f225637b869495f18e55f6f23a09abb9be0acc030295f",
+      "checkpoint_weights_size_bytes": 1583544840,
+      "seed": 42,
+      "batch": 8,
+      "seq": 512,
+      "lora_rank": 16,
+      "lora_alpha": 32.0,
+      "lora_dropout": 0.0,
+      "margin": 0.3,
+      "target_modules": [
+        "Wqkv",
+        "Wo",
+        "Wi"
+      ],
+      "batched_forward": true,
+      "max_grad_norm": null,
+      "trainable_tensors": 224,
+      "steps_measured": 25,
+      "losses": [
+        0.30078125,
+        0.296875,
+        0.29882812,
+        0.29882812,
+        0.29492188,
+        0.29101562,
+        0.2890625,
+        0.28320312,
+        0.27539062,
+        0.25976562,
+        0.23046875,
+        0.17871094,
+        0.125,
+        0.10058594,
+        0.11669922,
+        0.10644531,
+        0.078125,
+        0.05859375,
+        0.03125,
+        0.017089844,
+        0.008544922,
+        0.013549805,
+        0.0,
+        0.0009765625,
+        0.0
+      ],
+      "loss_first": 0.30078125,
+      "loss_last": 0.0,
+      "ln_fused_dispatches": 1710,
+      "ln_eager_dispatches": 0,
+      "rope_fused_dispatches": 0,
+      "rope_eager_dispatches": 0,
+      "softmax_fused_dispatches": 0,
+      "softmax_eager_dispatches": 0,
+      "geglu_fused_dispatches": 840,
+      "geglu_eager_dispatches": 0,
+      "lora_epilogue_fused_dispatches": 0,
+      "lora_epilogue_eager_dispatches": 0,
+      "lora_linear_fused_dispatches": 3360,
+      "lora_linear_eager_dispatches": 0,
+      "attention_block_fused_dispatches": 840,
+      "attention_block_eager_dispatches": 0,
+      "adamw_fused_dispatches": 0,
+      "adamw_eager_dispatches": 6720,
+      "kernels_disabled_requested": [
+        "adamw_step_fused"
+      ],
+      "kernels_disabled_fired": [
+        "adamw_step_fused"
+      ],
+      "s_per_step_p50": {
+        "value": 0.675926908,
+        "unit": "s"
+      },
+      "s_per_step_mean": {
+        "value": 0.6760538979200001,
+        "unit": "s"
+      },
+      "steps_per_s": {
+        "value": 1.4794499052551404,
+        "unit": "steps/s"
+      },
+      "triplets_per_s": {
+        "value": 11.835599242041123,
+        "unit": "triplets/s"
+      },
+      "peak_rss_bytes": {
+        "value": 1885794304.0,
+        "unit": "bytes"
+      },
+      "peak_vram_bytes": {
+        "value": 16259219456.0,
+        "unit": "bytes"
+      }
+    }
+  }
+}

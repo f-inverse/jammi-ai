@@ -1337,6 +1337,26 @@ pub struct FinetuneStepTier {
     /// the step made) — that is the predicate refusing by domain, not a
     /// broken counter.
     pub attention_block_eager_dispatches: u64,
+    /// How many times [`jammi_ai::fine_tune::adamw::AdamW::step`]'s
+    /// per-`Var` dispatch actually admitted the fused multi-tensor kernel
+    /// (`jammi_kernels::ops::adamw_step_fused_t`, three launches — two
+    /// `InplaceOp2` calls (EMA the first/second moment) then one
+    /// `InplaceOp3` call (bias-correct, decoupled weight decay, and the
+    /// adaptive update), all in place, zero `Var::set`/memcpy) during this
+    /// run — the same positive-proof channel as `ln_fused_dispatches` /
+    /// … / `attention_block_fused_dispatches`, for the multi-tensor AdamW
+    /// commit. Read via
+    /// `jammi_kernels::admission::counters_for("adamw_step_fused")`,
+    /// mirroring the sibling counters' read API exactly — `"adamw_step_fused"`
+    /// is also the op key a caller names in `JAMMI_KERNELS_DISABLE` to force
+    /// every `Var` this run onto the eager arm below.
+    pub adamw_fused_dispatches: u64,
+    /// How many times that same per-`Var` dispatch fell back to the eager
+    /// candle-op chain instead — outside the fused kernel's domain
+    /// (device/dtype/contiguity/shape agreement across
+    /// `theta`/`m`/`v`/`grad`), or because `JAMMI_KERNELS_DISABLE` named
+    /// `"adamw_step_fused"` for this process.
+    pub adamw_eager_dispatches: u64,
     /// The `JAMMI_KERNELS_DISABLE` op keys this process REQUESTED (sorted,
     /// empty when the env var was unset or empty) —
     /// `jammi_kernels::admission::disabled_ops_requested`. Always present,
@@ -1584,6 +1604,8 @@ mod tests {
             lora_linear_eager_dispatches: 0,
             attention_block_fused_dispatches: 0,
             attention_block_eager_dispatches: 0,
+            adamw_fused_dispatches: 0,
+            adamw_eager_dispatches: 0,
             kernels_disabled_requested: Vec::new(),
             kernels_disabled_fired: Vec::new(),
             s_per_step_p50: Measurement::measured(0.01, "s"),
@@ -1630,7 +1652,9 @@ mod tests {
     /// The full emitted key set, pinned so a field added or renamed on
     /// `FinetuneStepTier` — including the two `attention_block_*_dispatches`
     /// counters the fused whole-attention-block kernel needs for its own
-    /// positive-proof channel, `kernels_disabled_requested` /
+    /// positive-proof channel, the two `adamw_*_dispatches` counters the
+    /// fused multi-tensor AdamW kernel needs for the same reason, and
+    /// `kernels_disabled_requested` /
     /// `kernels_disabled_fired` (contract K-aux, round 2 / B3: the RESOLVED
     /// `JAMMI_KERNELS_DISABLE` state a downstream A/B harness names the
     /// measured arm from), and `max_grad_norm` (the device-side clip's
@@ -1645,6 +1669,8 @@ mod tests {
         let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
         keys.sort_unstable();
         let mut expected = vec![
+            "adamw_eager_dispatches",
+            "adamw_fused_dispatches",
             "attention_block_eager_dispatches",
             "attention_block_fused_dispatches",
             "batch",

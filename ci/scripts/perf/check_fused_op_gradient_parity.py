@@ -1,58 +1,58 @@
 #!/usr/bin/env python3
 """CI-shaped gate for a fused-op PR: fail if a SINGLE-op kernel ablation
 moves the gradient-direction cosine (against an f32-precision truth run)
-too far from the all-fused reference arm.
+too far from the all-fused reference arm, AT BOTH of two required shapes.
 
-Consumes a `jammi-bench grad-oracle --ablate-each-op` `AblationReport`
+Consumes TWO `jammi-bench grad-oracle --ablate-each-op` `AblationReport`s
 (`crates/jammi-bench/src/grad_oracle_ablation.rs`'s own schema — the SAME
-file `ci/scripts/perf/compare_grad_oracle.py --ablation` reads) and, for
-every `ablate:<op_key>` arm (one op forced eager via
+files `ci/scripts/perf/compare_grad_oracle.py --ablation` reads), one at
+shape `b4-s128` (batch=4, seq=128) and one at `b8-s128` (batch=8, seq=128).
+For every `ablate:<op_key>` arm (one op forced eager via
 `JAMMI_KERNELS_DISABLE=<op_key>`, every OTHER op still strictly proven fused
-via `JAMMI_KERNELS_STRICT=1` — see that module's own doc), computes
-`|cosine(ablate:<op_key>) - cosine(all_fused)|` and FAILS if it exceeds
-[`FUSED_OP_COSINE_DELTA_THRESHOLD`].
+— see that module's own doc), computes the MEDIAN-over-seeds delta
+`|median(cosine) - median(all_fused cosine)|` at EACH shape and FAILS the
+op only if BOTH shapes' deltas exceed THAT SHAPE'S OWN derived budget.
 
-## Threshold derivation (ledger row 240) — never fitted to a specific PR
+## Round-7 audit fix (PR #383): why this is no longer a fixed-fraction threshold
 
-A live A100 run of this feature's own commissioning dispatch (ModernBERT-
-large, `--lora-init gaussian`, so `dL/dA` and the LoRA epilogue's own
-gradient term are LIVE — see `grad_oracle.rs`'s module doc's "Structural
-limitation" section for why a `ZerosB`-init run cannot even see this)
-measured:
+Round 6 of this gate derived a single fixed threshold (`0.20 whole-gap /
+10`) from ONE run at ONE shape/seed. Round 7's own two-shape run on the
+SAME build inverted the story entirely (`b4-s128`: `all_fused=0.610 <
+all_off=0.810`; `b8-s128`: `all_fused=0.843 > all_off=0.773`) — a
+single-seed cosine at this operating point is CHAOTIC, so ANY fixed
+constant fitted to one measurement is unsound. The FIX is not a better
+constant; it is deriving the budget from the MEASURED SPREAD of the
+`all_fused` arm's OWN cosine across `--seeds` (see `AblationReport::
+derived_per_op_budget`'s own Rust-side doc: `3 * (max - min)` of
+`all_fused`'s median-per-seed cosine, AT THAT SHAPE), and requiring a
+median-delta to exceed that spread-derived budget at BOTH `b4-s128` and
+`b8-s128` before calling it a real, shape-independent defect — a single
+shape's own instability (however it happens to land relative to any FIXED
+threshold) must not, alone, gate a PR.
 
-    all_fused (bf16, every fused op ON)  cosine vs f32 truth = 0.610
-    all_off   (bf16, every fused op OFF) cosine vs f32 truth = 0.810
-
-The WHOLE gap between "every fused op forced eager" and "every fused op
-forced on" on this architecture is `|0.610 - 0.810| = 0.20`, distributed
-across (at most) the four op keys that were LIVE that run
-(`attention_block_fused`, `geglu_fused`, `layer_norm_fused`,
-`lora_linear_fused` — see `GradOracleReport::live_admit_keys`'s own doc for
-why the exact set is discovered per run, never hardcoded). A SINGLE-op
-ablation — every OTHER op still strictly proven fused in the SAME run —
-should therefore move the cosine by, at most, a SMALL FRACTION of that
-whole-composition gap: `FUSED_OP_COSINE_DELTA_THRESHOLD` picks 1/10th of the
-measured whole-gap (`0.20 / 10 = 0.02`) as the per-op budget. This is a
-derived, STATED number, not a value chosen to make any specific PR's own
-measurement pass — if a future measured whole-gap differs meaningfully from
-`0.20`, re-derive this constant from the new number and cite it here, never
-silently widen the threshold to clear a failing PR.
+This module does NOT recompute the budget from scratch itself: it reads
+`derived_per_op_budget` from EACH report (already Rust-computed from that
+report's own `per_seed` data) and INDEPENDENTLY RE-DERIVES it from the same
+`per_seed` values as a cross-check (`_recompute_budget`) — a disagreement
+between the two computations of the identical formula is itself a
+refusal, never silently accepted.
 
 ## What else this gate refuses (never only the cosine delta)
 
 Reuses `compare_grad_oracle._ablation_provenance_problems` (imported, not
-reimplemented — the SAME mechanism `compare_grad_oracle.py --ablation`
-checks) so a report whose provenance is not self-describing (an unmatched
-`JAMMI_KERNELS_DISABLE` entry, a nonzero `vacuous_tensor_count`, a
-non-finite `overall_cosine_vs_f32_truth`) FAILS here too, never silently
-passing a threshold check computed off untrustworthy inputs.
+reimplemented) so a report whose provenance is not self-describing (an
+unmatched `JAMMI_KERNELS_DISABLE` entry, a nonzero `vacuous_tensor_count`
+on any seed, a non-finite cosine) FAILS here too, never silently passing a
+budget check computed off untrustworthy inputs. A report with ZERO
+`ablate:<op_key>` arms is ALSO a refusal (family F non-vacuous control:
+this gate proves nothing about any fused op without at least one).
 
 Usage:
-    python3 check_fused_op_gradient_parity.py ABLATION_REPORT_JSON
+    python3 check_fused_op_gradient_parity.py B4_S128.json B8_S128.json
     python3 check_fused_op_gradient_parity.py --self-test
 
-Exit codes: 0 PASS, 1 FAIL (report loaded, a real problem found), 2 REFUSED
-(malformed input — cannot even attempt the check).
+Exit codes: 0 PASS, 1 FAIL (both reports loaded, a real problem found), 2
+REFUSED (malformed/insufficient input — cannot even attempt the check).
 """
 
 from __future__ import annotations
@@ -63,69 +63,151 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from compare_grad_oracle import _ablation_provenance_problems  # noqa: E402
+from compare_grad_oracle import _ablation_provenance_problems, _recompute_seed_stat  # noqa: E402
 
-# See this module's own doc's "Threshold derivation" section: 1/10th of the
-# measured 0.20 whole-composition (all_fused vs all_off) gap on ModernBERT-
-# large at a live-gradient (`--lora-init gaussian`) fixture.
-FUSED_OP_COSINE_DELTA_THRESHOLD = 0.02
+# The two shapes this gate REQUIRES, both present, before it will render any
+# verdict — see this module's own doc's "why this is no longer a
+# fixed-fraction threshold" section. Keyed by (batch, seq); the label is
+# purely for messages.
+REQUIRED_SHAPES = {(4, 128): "b4-s128", (8, 128): "b8-s128"}
 
 EXIT_PASS = 0
 EXIT_FAIL = 1
 EXIT_REFUSED = 2
 
 
-def check_report(report: dict, threshold: float = FUSED_OP_COSINE_DELTA_THRESHOLD) -> tuple[bool, list[str]]:
-    """`(passed, problems)` — `problems` is empty iff `passed`. Never raises
-    on a malformed report (every lookup is defensive); a structurally
-    missing/malformed field is reported as a PROBLEM (which makes `passed`
-    `False`), never silently skipped.
+def _shape_label(report: dict) -> str:
+    batch = report.get("batch")
+    seq = report.get("seq")
+    return REQUIRED_SHAPES.get((batch, seq), f"b{batch}-s{seq}")
+
+
+def _recompute_budget(report: dict) -> tuple[float | None, list[str]]:
+    """Independently re-derive `derived_per_op_budget` from the
+    `all_fused` arm's OWN `per_seed` `full_tensor_cosine` values — `3 *
+    (max - min)`, the SAME formula `grad_oracle_ablation.rs` uses, computed
+    here from scratch rather than trusted verbatim (family F). Returns
+    `(budget_or_None, problems)`.
+    """
+    arms = report.get("arms") or []
+    reference = next((a for a in arms if a.get("arm") == "all_fused"), None)
+    if reference is None:
+        return None, ["no 'all_fused' reference arm present"]
+    per_seed = reference.get("per_seed") or []
+    values = [
+        s["full_tensor_cosine"]
+        for s in per_seed
+        if isinstance(s.get("full_tensor_cosine"), (int, float)) and math.isfinite(s["full_tensor_cosine"])
+    ]
+    if not values:
+        return None, ["all_fused arm has no usable per_seed full_tensor_cosine values"]
+    stat = _recompute_seed_stat(values)
+    recomputed = 3.0 * (stat["max"] - stat["min"])
+    reported = report.get("derived_per_op_budget")
+    problems = []
+    if not isinstance(reported, (int, float)) or abs(reported - recomputed) > 1e-9:
+        problems.append(
+            f"reported derived_per_op_budget={reported!r} disagrees with this gate's own "
+            f"recomputation from all_fused's per_seed data ({recomputed!r})"
+        )
+    return recomputed, problems
+
+
+def _median_cosine(arm: dict) -> float | None:
+    c = arm.get("full_tensor_cosine") or {}
+    m = c.get("median")
+    return m if isinstance(m, (int, float)) and math.isfinite(m) else None
+
+
+def check_reports(reports: list[dict]) -> tuple[bool, list[str]]:
+    """`(passed, problems)` — `problems` is empty iff `passed`. Never
+    raises on a malformed report (every lookup is defensive).
     """
     problems: list[str] = []
 
-    provenance_problems = _ablation_provenance_problems(report)
-    problems.extend(provenance_problems)
+    if len(reports) != 2:
+        return False, [f"expected exactly 2 shape reports (b4-s128, b8-s128), got {len(reports)}"]
 
-    arms = report.get("arms")
-    if not isinstance(arms, list) or not arms:
-        return False, problems + ["ablation report has no non-empty 'arms' list"]
+    seen_shapes: dict[str, dict] = {}
+    for report in reports:
+        problems.extend(_ablation_provenance_problems(report))
+        label = _shape_label(report)
+        seen_shapes[label] = report
 
-    reference = next((a for a in arms if a.get("arm") == "all_fused"), None)
-    if reference is None:
-        return False, problems + ["no 'all_fused' reference arm present"]
-    ref_cosine = reference.get("overall_cosine_vs_f32_truth")
-    if not isinstance(ref_cosine, (int, float)) or not math.isfinite(ref_cosine):
-        return False, problems + [f"all_fused arm's overall_cosine_vs_f32_truth is not finite: {ref_cosine!r}"]
+    required_labels = set(REQUIRED_SHAPES.values())
+    missing = sorted(required_labels - seen_shapes.keys())
+    if missing:
+        problems.append(
+            f"missing required shape(s) {missing} -- both b4-s128 and b8-s128 must be present, "
+            "a single shape's own instability must not, alone, gate this PR"
+        )
+        return False, problems
 
-    ablate_arms = [
-        a for a in arms if isinstance(a.get("arm"), str) and a["arm"].startswith("ablate:")
-    ]
-    if not ablate_arms:
-        # NON-VACUOUS CONTROL (family F): a report with zero per-op ablation
-        # arms would otherwise silently PASS this gate (an empty loop below
-        # finds no violation) despite proving NOTHING about any fused op --
-        # this is the exact "controls are non-vacuous" trap this repo's own
-        # constitution names. A report with no live admit keys on this
-        # checkpoint (e.g. an all-CPU-eager fixture with no fused kernel
-        # reachable at all) is a REFUSAL, not a silent pass.
-        return False, problems + [
-            "ablation report has zero 'ablate:<op_key>' arms -- this gate proves nothing about "
-            "any fused op without at least one; refusing to report a vacuous PASS"
-        ]
-
-    for arm in ablate_arms:
-        label = arm.get("arm", "<unnamed>")
-        c = arm.get("overall_cosine_vs_f32_truth")
-        if not isinstance(c, (int, float)) or not math.isfinite(c):
-            problems.append(f"{label}: overall_cosine_vs_f32_truth is not finite: {c!r}")
+    per_shape_budget: dict[str, float] = {}
+    per_shape_ref_median: dict[str, float] = {}
+    per_shape_ablate_arms: dict[str, dict[str, dict]] = {}
+    for label, report in seen_shapes.items():
+        budget, budget_problems = _recompute_budget(report)
+        problems.extend([f"{label}: {p}" for p in budget_problems])
+        if budget is None:
             continue
-        delta = abs(c - ref_cosine)
-        if delta > threshold:
+        per_shape_budget[label] = budget
+
+        arms = report.get("arms") or []
+        reference = next((a for a in arms if a.get("arm") == "all_fused"), None)
+        ref_median = _median_cosine(reference) if reference else None
+        if ref_median is None:
+            problems.append(f"{label}: all_fused arm has no finite full_tensor_cosine.median")
+            continue
+        per_shape_ref_median[label] = ref_median
+
+        ablate_arms = {
+            a["op_key"]: a
+            for a in arms
+            if isinstance(a.get("arm"), str) and a["arm"].startswith("ablate:") and a.get("op_key")
+        }
+        if not ablate_arms:
             problems.append(
-                f"{label}: |cosine_vs_f32_truth - all_fused_cosine| = {delta:.6f} exceeds the "
-                f"per-op threshold {threshold} (all_fused={ref_cosine:.6f}, {label}={c:.6f}) -- "
-                "this single op's own gradient contribution moved the direction more than the "
-                "derived per-op budget allows"
+                f"{label}: zero 'ablate:<op_key>' arms present -- this gate proves nothing about "
+                "any fused op without at least one; refusing to report a vacuous PASS"
+            )
+            continue
+        per_shape_ablate_arms[label] = ablate_arms
+
+    if problems:
+        return False, problems
+
+    all_op_keys = sorted(set().union(*(set(d.keys()) for d in per_shape_ablate_arms.values())))
+    if not all_op_keys:
+        return False, ["no op key was tested (ablate arm) at any required shape"]
+
+    for op_key in all_op_keys:
+        shapes_that_fail: list[str] = []
+        for label in sorted(required_labels):
+            arms = per_shape_ablate_arms.get(label, {})
+            arm = arms.get(op_key)
+            if arm is None:
+                # This op was not live/ablated at this particular shape --
+                # not itself a failure (a real, structural absence, e.g. a
+                # dtype-gated op that never admits at one shape); only
+                # shapes where the op WAS actually tested count toward the
+                # "both shapes" requirement below.
+                continue
+            median = _median_cosine(arm)
+            if median is None:
+                problems.append(f"{label}: ablate:{op_key} has no finite full_tensor_cosine.median")
+                continue
+            delta = abs(median - per_shape_ref_median[label])
+            budget = per_shape_budget[label]
+            if delta > budget:
+                shapes_that_fail.append(
+                    f"{label} (delta={delta:.6f} > budget={budget:.6f}, all_fused_median="
+                    f"{per_shape_ref_median[label]:.6f}, {op_key}_median={median:.6f})"
+                )
+        if len(shapes_that_fail) >= 2:
+            problems.append(
+                f"{op_key}: median cosine delta exceeds its shape's own derived budget at BOTH "
+                f"required shapes: {shapes_that_fail}"
             )
 
     return (len(problems) == 0), problems
@@ -133,38 +215,51 @@ def check_report(report: dict, threshold: float = FUSED_OP_COSINE_DELTA_THRESHOL
 
 def _self_test() -> int:
     """RED/GREEN cases against SYNTHETIC reports — never a real GPU run.
-    Every field this function's own `check_report` reads gets at least one
-    case that flips it from clean to a problem, one at a time.
+    Includes a dedicated pair of MATERIALLY DIVERGING bf16-vs-f32-shaped
+    synthetic reports (round-7 audit item 6, PR #383): `all_fused` itself
+    sits well below `1.0` (a real bf16-vs-f32 divergence, not the trivial
+    f32-vs-f32 vacuous case), exercised BOTH ways -- once engineered to
+    PASS (the per-op deltas stay inside the derived budget at both shapes)
+    and once to FAIL (one op's delta exceeds the budget at both shapes).
     """
     failures = 0
 
-    def clean_arm(label: str, cosine: float, op_key: str | None = None) -> dict:
+    def sample(seed: int, cosine: float, op_key: str | None) -> dict:
         return {
-            "arm": label,
-            "op_key": op_key,
+            "seed": seed,
+            "full_tensor_cosine": cosine,
+            "vacuous_tensor_count": 0,
             "kernels_disabled_requested": [] if op_key is None else [op_key],
             "kernels_disabled_fired": [] if op_key is None else [op_key],
             "unmatched_disables": [],
-            "vacuous_tensor_count": 0,
-            "overall_cosine_vs_f32_truth": cosine,
         }
 
-    def clean_report(deltas: dict[str, float], ref_cosine: float = 0.90) -> dict:
-        arms = [clean_arm("all_fused", ref_cosine), clean_arm("f32_truth", 1.0)]
-        for key, cosine in deltas.items():
-            arms.append(clean_arm(f"ablate:{key}", cosine, op_key=key))
-        arms.append(clean_arm("all_off", 0.70))
-        return {"arms": arms}
+    def arm(label: str, op_key: str | None, cosines: dict[int, float]) -> dict:
+        per_seed = [sample(seed, c, op_key) for seed, c in cosines.items()]
+        values = list(cosines.values())
+        return {
+            "arm": label,
+            "op_key": op_key,
+            "full_tensor_cosine": {
+                "median": sorted(values)[len(values) // 2],
+                "min": min(values),
+                "max": max(values),
+            },
+            "per_seed": per_seed,
+        }
 
-    def expect(
-        name: str,
-        report: dict,
-        want_pass: bool,
-        needle: str | None = None,
-        threshold: float = FUSED_OP_COSINE_DELTA_THRESHOLD,
-    ) -> None:
+    def report(batch: int, seq: int, ref_cosines: dict[int, float], ablate: dict[str, dict[int, float]]) -> dict:
+        arms = [arm("all_fused", None, ref_cosines)]
+        for key, cosines in ablate.items():
+            arms.append(arm(f"ablate:{key}", key, cosines))
+        arms.append(arm("all_off", None, {s: c - 0.05 for s, c in ref_cosines.items()}))
+        ref_values = list(ref_cosines.values())
+        budget = 3.0 * (max(ref_values) - min(ref_values))
+        return {"batch": batch, "seq": seq, "seeds": list(ref_cosines.keys()), "derived_per_op_budget": budget, "arms": arms}
+
+    def expect(name: str, reports: list[dict], want_pass: bool, needle: str | None = None) -> None:
         nonlocal failures
-        passed, problems = check_report(report, threshold)
+        passed, problems = check_reports(reports)
         if passed != want_pass:
             print(f"SELF-TEST FAIL [{name}]: expected passed={want_pass}, got {passed} ({problems})")
             failures += 1
@@ -173,74 +268,64 @@ def _self_test() -> int:
             print(f"SELF-TEST FAIL [{name}]: expected a problem containing {needle!r}, got {problems}")
             failures += 1
 
-    # GREEN: every per-op arm within the threshold of all_fused (0.90).
-    expect("green: within threshold", clean_report({"layer_norm_fused": 0.885, "geglu_fused": 0.905}), True)
+    seeds = {42: 0.80, 43: 0.82, 44: 0.78}  # spread 0.04, budget = 0.12
 
-    # RED: one op's ablation moves the cosine beyond the threshold.
-    expect(
-        "red: one op exceeds threshold",
-        clean_report({"layer_norm_fused": 0.60, "geglu_fused": 0.905}),
-        False,
-        "layer_norm_fused",
-    )
+    # GREEN: within-budget ablations at BOTH shapes.
+    b4_clean = report(4, 128, seeds, {"layer_norm_fused": {42: 0.75, 43: 0.79, 44: 0.83}})
+    b8_clean = report(8, 128, seeds, {"layer_norm_fused": {42: 0.78, 43: 0.80, 44: 0.82}})
+    expect("green: within budget at both shapes", [b4_clean, b8_clean], True)
 
-    # RED: exactly AT the threshold boundary must still PASS (`>`, not
-    # `>=`) -- pinned so a mutant flipping the comparison operator is
-    # detectable. Uses a reference/threshold/cosine triple that is EXACT in
-    # binary floating point (0.75, 0.25, 0.5 are all exact powers-of-two
-    # fractions) so the boundary itself is not obscured by ordinary float
-    # subtraction noise (`0.90 - 0.02`, for example, is NOT exact in
-    # binary64 -- an earlier draft of this test used exactly that pair and
-    # false-failed on rounding noise it never intended to test).
+    # RED: an op that exceeds the budget at BOTH shapes.
+    b4_bad = report(4, 128, seeds, {"geglu_fused": {42: 0.30, 43: 0.32, 44: 0.28}})
+    b8_bad = report(8, 128, seeds, {"geglu_fused": {42: -0.20, 43: -0.10, 44: -0.30}})
+    expect("red: exceeds budget at both shapes", [b4_bad, b8_bad], False, "geglu_fused")
+
+    # A shape-SPECIFIC defect (fails at ONE shape only) must NOT fail the
+    # gate alone -- this is the exact "b4/b8 inverted story" property this
+    # round's fix is FOR.
+    b4_one_shape_bad = report(4, 128, seeds, {"lora_linear_fused": {42: 0.30, 43: 0.32, 44: 0.28}})
+    b8_one_shape_ok = report(8, 128, seeds, {"lora_linear_fused": {42: 0.79, 43: 0.81, 44: 0.83}})
     expect(
-        "boundary: exactly at threshold passes",
-        clean_report({"layer_norm_fused": 0.5}, ref_cosine=0.75),
+        "green: fails budget at ONLY one shape -- must not gate alone",
+        [b4_one_shape_bad, b8_one_shape_ok],
         True,
-        threshold=0.25,
-    )
-    expect(
-        "boundary: just past threshold fails",
-        clean_report({"layer_norm_fused": 0.5 - 1e-9}, ref_cosine=0.75),
-        False,
-        threshold=0.25,
     )
 
-    # RED: missing arms list entirely.
-    expect("red: no arms key", {}, False, "arms")
+    # A MATERIALLY DIVERGING bf16-vs-f32-shaped pair (round-7 audit item 6):
+    # all_fused itself sits at ~0.62 (a real cross-dtype divergence, NOT
+    # the trivial f32-vs-f32 near-1.0 vacuous case) -- exercised both ways.
+    bf16_seeds = {1: 0.60, 2: 0.65, 3: 0.62}  # spread 0.05, budget 0.15
+    bf16_pass_b4 = report(4, 128, bf16_seeds, {"layer_norm_fused": {1: 0.55, 2: 0.70, 3: 0.60}})
+    bf16_pass_b8 = report(8, 128, bf16_seeds, {"layer_norm_fused": {1: 0.58, 2: 0.68, 3: 0.63}})
+    expect("bf16-shaped: within-budget PASS", [bf16_pass_b4, bf16_pass_b8], True)
 
-    # RED (non-vacuous control): zero ablate: arms must never silently pass.
-    expect(
-        "red: zero ablate arms",
-        {"arms": [clean_arm("all_fused", 0.90), clean_arm("f32_truth", 1.0), clean_arm("all_off", 0.70)]},
-        False,
-        "zero",
-    )
+    bf16_fail_b4 = report(4, 128, bf16_seeds, {"layer_norm_fused": {1: -0.10, 2: -0.05, 3: -0.08}})
+    bf16_fail_b8 = report(8, 128, bf16_seeds, {"layer_norm_fused": {1: -0.20, 2: -0.15, 3: -0.18}})
+    expect("bf16-shaped: exceeds-budget FAIL", [bf16_fail_b4, bf16_fail_b8], False, "layer_norm_fused")
 
-    # RED: missing all_fused reference arm.
-    no_ref = clean_report({"layer_norm_fused": 0.89})
-    no_ref["arms"] = [a for a in no_ref["arms"] if a["arm"] != "all_fused"]
-    expect("red: no all_fused arm", no_ref, False, "all_fused")
+    # RED: missing a required shape.
+    expect("red: only one shape provided", [b4_clean], False)
+    duplicate_shape = report(4, 128, seeds, {"layer_norm_fused": {42: 0.75, 43: 0.79, 44: 0.83}})
+    expect("red: same shape twice, b8-s128 missing", [b4_clean, duplicate_shape], False, "missing")
 
-    # AFFIRMATIVE non-finite refusal (family F): NaN must not silently
-    # compare `False` on `> threshold` and slip through as a pass.
-    nan_report = clean_report({"layer_norm_fused": float("nan")})
-    expect("red: nan cosine on an ablate arm", nan_report, False, "not finite")
+    # RED (non-vacuous control): zero ablate arms at one shape.
+    b4_no_ablate = report(4, 128, seeds, {})
+    expect("red: zero ablate arms at one shape", [b4_no_ablate, b8_clean], False, "zero")
 
-    nan_ref = clean_report({"layer_norm_fused": 0.89})
-    nan_ref["arms"][0]["overall_cosine_vs_f32_truth"] = float("nan")
-    expect("red: nan cosine on all_fused", nan_ref, False, "not finite")
-
-    # RED: provenance not self-describing (unmatched disable).
-    unmatched_report = clean_report({"layer_norm_fused": 0.89})
-    for arm in unmatched_report["arms"]:
-        if arm["arm"] == "ablate:layer_norm_fused":
-            arm["kernels_disabled_fired"] = []  # requested but never fired
-    expect("red: unmatched disable", unmatched_report, False, "not self-describing")
+    # RED: provenance not self-describing (unmatched disable) at one shape.
+    b4_unmatched = report(4, 128, seeds, {"layer_norm_fused": {42: 0.75, 43: 0.79, 44: 0.83}})
+    b4_unmatched["arms"][1]["per_seed"][0]["kernels_disabled_fired"] = []
+    expect("red: unmatched disable", [b4_unmatched, b8_clean], False, "not self-describing")
 
     # RED: vacuous_tensor_count nonzero anywhere.
-    vacuous_report = clean_report({"layer_norm_fused": 0.89})
-    vacuous_report["arms"][0]["vacuous_tensor_count"] = 3
-    expect("red: nonzero vacuous_tensor_count", vacuous_report, False, "vacuous_tensor_count")
+    b4_vacuous = report(4, 128, seeds, {"layer_norm_fused": {42: 0.75, 43: 0.79, 44: 0.83}})
+    b4_vacuous["arms"][0]["per_seed"][0]["vacuous_tensor_count"] = 5
+    expect("red: nonzero vacuous_tensor_count", [b4_vacuous, b8_clean], False, "vacuous_tensor_count")
+
+    # RED: budget cross-check disagreement (a tampered derived_per_op_budget).
+    b4_tampered_budget = report(4, 128, seeds, {"layer_norm_fused": {42: 0.75, 43: 0.79, 44: 0.83}})
+    b4_tampered_budget["derived_per_op_budget"] = 999.0
+    expect("red: tampered derived_per_op_budget", [b4_tampered_budget, b8_clean], False, "disagrees")
 
     if failures:
         print(f"SELF-TEST: {failures} case(s) failed")
@@ -253,29 +338,33 @@ def main(argv=None) -> int:
     import argparse
 
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("ablation_report", nargs="?")
+    p.add_argument("reports", nargs="*", help="Exactly 2 AblationReport JSON paths: b4-s128 and b8-s128.")
     p.add_argument("--self-test", action="store_true", default=False)
-    p.add_argument("--threshold", type=float, default=FUSED_OP_COSINE_DELTA_THRESHOLD)
     args = p.parse_args(argv)
 
     if args.self_test:
         return _self_test()
 
-    if not args.ablation_report:
-        print("REFUSED: an ABLATION_REPORT_JSON path (or --self-test) is required", file=sys.stderr)
+    if len(args.reports) != 2:
+        print(
+            f"REFUSED: expected exactly 2 report paths (b4-s128, b8-s128), got {len(args.reports)} "
+            "(or --self-test)",
+            file=sys.stderr,
+        )
         return EXIT_REFUSED
 
-    try:
-        with open(args.ablation_report) as fh:
-            report = json.load(fh)
-    except (OSError, json.JSONDecodeError) as e:
-        print(f"REFUSED: could not load {args.ablation_report!r}: {e}", file=sys.stderr)
-        return EXIT_REFUSED
+    reports = []
+    for path in args.reports:
+        try:
+            with open(path) as fh:
+                reports.append(json.load(fh))
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"REFUSED: could not load {path!r}: {e}", file=sys.stderr)
+            return EXIT_REFUSED
 
-    passed, problems = check_report(report, args.threshold)
+    passed, problems = check_reports(reports)
     for msg in problems:
         print(f"PROBLEM: {msg}", file=sys.stderr)
-    print(f"threshold: {args.threshold}")
     print("PASS" if passed else "FAIL")
     return EXIT_PASS if passed else EXIT_FAIL
 

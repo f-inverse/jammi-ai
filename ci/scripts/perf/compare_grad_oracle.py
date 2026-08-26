@@ -1037,86 +1037,132 @@ def floor_domain_violation(cosine_floor: float) -> str | None:
     return None
 
 
-def _ablation_provenance_problems(report: dict) -> list[str]:
-    """Every arm's provenance must be SELF-DESCRIBING before this mode
-    prints anything resembling a verdict: `unmatched_disables` empty (the
-    arm's OWN recorded `kernels_disabled_requested`/`kernels_disabled_fired`
-    pair, already diffed by `grad_oracle_ablation.rs::unmatched` — re-checked
-    here independently, never trusted verbatim) and `vacuous_tensor_count ==
-    0` (family F: this tool's whole premise is a `--lora-init gaussian`
-    fixture where EVERY gradient is live — see
-    `grad_oracle.rs::GradOracleReport::vacuous_tensor_count`'s own doc).
-    Returns one message per violation found (empty list means clean).
+def _ablation_arm_problems(arm: dict) -> list[str]:
+    """Every SEED SAMPLE inside one arm must be self-describing before this
+    mode prints anything resembling a verdict — round-7 audit fix on PR
+    #383: the schema moved from one scalar per arm to a `per_seed` list of
+    samples, so this check now iterates that list rather than the arm's own
+    (now-removed) top-level `unmatched_disables`/`vacuous_tensor_count`
+    fields. `unmatched_disables` empty (re-derived here independently from
+    `kernels_disabled_requested`/`kernels_disabled_fired`, never trusted
+    verbatim) and `vacuous_tensor_count == 0` (family F: this tool's whole
+    premise is a fixture where EVERY gradient is live) on EVERY seed.
     """
     problems: list[str] = []
-    arms = report.get("arms")
-    if not isinstance(arms, list) or not arms:
-        return ["ablation report has no non-empty 'arms' list"]
-    for arm in arms:
-        label = arm.get("arm", "<unnamed arm>")
-        requested = set(arm.get("kernels_disabled_requested") or [])
-        fired = set(arm.get("kernels_disabled_fired") or [])
+    label = arm.get("arm", "<unnamed arm>")
+    per_seed = arm.get("per_seed")
+    if not isinstance(per_seed, list) or not per_seed:
+        return [f"arm {label!r}: has no non-empty 'per_seed' list"]
+    for sample in per_seed:
+        seed = sample.get("seed", "<unknown seed>")
+        requested = set(sample.get("kernels_disabled_requested") or [])
+        fired = set(sample.get("kernels_disabled_fired") or [])
         unmatched = sorted(requested - fired)
         if unmatched:
             problems.append(
-                f"arm {label!r}: kernels_disabled_requested not fully fired (unmatched="
-                f"{unmatched}) -- this arm's JAMMI_KERNELS_DISABLE provenance is not "
+                f"arm {label!r} seed {seed}: kernels_disabled_requested not fully fired "
+                f"(unmatched={unmatched}) -- this arm's JAMMI_KERNELS_DISABLE provenance is not "
                 "self-describing"
             )
-        # Independent re-derivation, not a re-print of the field already
-        # reported by the same arm's own `unmatched_disables` (Rust-computed
-        # off the SAME two lists) -- both must agree; a disagreement would
-        # mean the two computations of the identical set-difference drifted.
-        reported_unmatched = arm.get("unmatched_disables")
+        reported_unmatched = sample.get("unmatched_disables")
         if reported_unmatched is not None and sorted(reported_unmatched) != unmatched:
             problems.append(
-                f"arm {label!r}: this comparator's own unmatched-disables recomputation "
-                f"({unmatched}) disagrees with the report's own unmatched_disables field "
-                f"({sorted(reported_unmatched)})"
+                f"arm {label!r} seed {seed}: this comparator's own unmatched-disables "
+                f"recomputation ({unmatched}) disagrees with the sample's own unmatched_disables "
+                f"field ({sorted(reported_unmatched)})"
             )
-        vacuous = arm.get("vacuous_tensor_count")
+        vacuous = sample.get("vacuous_tensor_count")
         if vacuous is None or vacuous != 0:
             problems.append(
-                f"arm {label!r}: vacuous_tensor_count={vacuous!r} -- every gradient must be "
-                "live for this comparison to carry evidence (see is_vacuous_pair's own doc for "
-                "the ZerosB structural blind spot this --lora-init gaussian fixture exists to "
-                "close)"
+                f"arm {label!r} seed {seed}: vacuous_tensor_count={vacuous!r} -- every gradient "
+                "must be live for this comparison to carry evidence"
             )
-        cosine = arm.get("overall_cosine_vs_f32_truth")
+        cosine = sample.get("full_tensor_cosine")
         if not isinstance(cosine, (int, float)) or not math.isfinite(cosine):
-            problems.append(f"arm {label!r}: overall_cosine_vs_f32_truth is not a finite number: {cosine!r}")
+            problems.append(f"arm {label!r} seed {seed}: full_tensor_cosine is not finite: {cosine!r}")
+    return problems
+
+
+def _ablation_provenance_problems(report: dict) -> list[str]:
+    """Every arm's provenance must be SELF-DESCRIBING (see
+    `_ablation_arm_problems`, above, applied to every arm) before this mode
+    prints anything resembling a verdict.
+    """
+    arms = report.get("arms")
+    if not isinstance(arms, list) or not arms:
+        return ["ablation report has no non-empty 'arms' list"]
+    problems: list[str] = []
+    for arm in arms:
+        problems.extend(_ablation_arm_problems(arm))
+    return problems
+
+
+def _recompute_seed_stat(values: list[float]) -> dict:
+    """INDEPENDENTLY recompute `{median, min, max}` from raw per-seed values
+    (family F: never trust a Rust-computed aggregate verbatim when the raw
+    inputs to re-derive it are right there in the same report). Pure
+    Python/numpy-optional, mirroring this module's own `_norm`/`_dot`
+    numpy-first-with-fallback convention.
+    """
+    if HAVE_NUMPY:
+        arr = np.asarray(values, dtype=np.float64)
+        return {"median": float(np.median(arr)), "min": float(np.min(arr)), "max": float(np.max(arr))}
+    s = sorted(values)
+    n = len(s)
+    median_val = s[n // 2] if n % 2 == 1 else (s[n // 2 - 1] + s[n // 2]) / 2.0
+    return {"median": median_val, "min": s[0], "max": s[-1]}
+
+
+def _cross_check_arm_aggregate(arm: dict) -> list[str]:
+    """Recompute `full_tensor_cosine`'s `{median, min, max}` from the arm's
+    OWN `per_seed` samples and compare against the Rust-reported aggregate
+    — a disagreement means the two independent computations of the exact
+    same statistic drifted, which is itself worth refusing on.
+    """
+    label = arm.get("arm", "<unnamed>")
+    per_seed = arm.get("per_seed") or []
+    values = [s["full_tensor_cosine"] for s in per_seed if isinstance(s.get("full_tensor_cosine"), (int, float))]
+    if not values:
+        return [f"arm {label!r}: no usable full_tensor_cosine values in per_seed"]
+    recomputed = _recompute_seed_stat(values)
+    reported = arm.get("full_tensor_cosine") or {}
+    problems = []
+    for key in ("median", "min", "max"):
+        r = reported.get(key)
+        c = recomputed[key]
+        if not isinstance(r, (int, float)) or abs(r - c) > 1e-9:
+            problems.append(
+                f"arm {label!r}: reported full_tensor_cosine.{key}={r!r} disagrees with this "
+                f"comparator's own recomputation from per_seed ({c!r})"
+            )
     return problems
 
 
 def main_ablation(args) -> int:
     """`--ablation ABLATION_REPORT_JSON`: read a `jammi-bench grad-oracle
     --ablate-each-op` `AblationReport` (`grad_oracle_ablation.rs`'s own
-    schema — a list of arms, each already carrying a Rust-computed
-    `overall_cosine_vs_f32_truth`), print the arm -> cosine table with each
-    arm's delta against the `all_fused` reference arm, and REFUSE (non-zero
-    exit, never print anything resembling PASS) if ANY arm's provenance is
-    not self-describing (`_ablation_provenance_problems`, above) — this
-    mode never re-derives the per-arm cosine itself (see
-    `grad_oracle_ablation.rs`'s own module doc, "Design: which side computes
-    the cosine", for why that split is deliberate here); it verifies the
-    MECHANISM (dispatch bookkeeping, non-vacuous premise) around a
-    Rust-computed number instead.
+    schema — a list of arms, each carrying `per_seed` samples plus a
+    Rust-computed `{median, min, max}` aggregate), print the arm ->
+    cosine(median[min, max]) -> delta-vs-`all_fused` table, and REFUSE
+    (non-zero exit, never print anything resembling PASS) if ANY arm's
+    provenance is not self-describing (`_ablation_provenance_problems`) or
+    if this comparator's OWN independent recomputation of the aggregate
+    from `per_seed` disagrees with the report's own aggregate
+    (`_cross_check_arm_aggregate` — family F: verify the mechanism, don't
+    just print a transcribed number).
 
     `--cosine-floor`: per this module's own `derive_cosine_floor`/
     `floor_domain_violation` (reused verbatim, not reimplemented), a
     DERIVED floor at ModernBERT-large's own depth/width is non-positive
-    (ledger row 240; `test_derive_cosine_floor_is_non_positive_at_modernbert_large_defaults`)
-    -- so at the DEFAULT `--num-layers 28 --hidden-size 1024`, this mode
-    REFUSES exactly like `main()`'s own two-positional path does, printing
-    WHY via `format_empirical_band`, unless an explicit `--cosine-floor`
-    (inside the valid `(0.0, 1.0]` domain) is supplied. This mode does not
-    itself PASS/FAIL an arm against the floor (that is
-    `ci/scripts/perf/check_fused_op_gradient_parity.py`'s job — a per-op
-    THRESHOLD against the `all_fused` arm, not an absolute floor against
-    `f32_truth`); the floor is required and printed here purely so the
-    table is shown next to the same empirical band `main()`'s own
-    two-positional path anchors against, never a silent, unexplained
-    number.
+    (ledger row 240) -- so at the DEFAULT `--num-layers 28 --hidden-size
+    1024`, this mode REFUSES exactly like `main()`'s own two-positional
+    path does, printing WHY via `format_empirical_band`, unless an explicit
+    `--cosine-floor` (inside the valid `(0.0, 1.0]` domain) is supplied.
+    This mode does not itself PASS/FAIL an op against a budget (that is
+    `ci/scripts/perf/check_fused_op_gradient_parity.py`'s job, across BOTH
+    shapes); the floor is required and printed here purely so the table is
+    shown next to the same empirical band `main()`'s own two-positional
+    path anchors against, never a silent, unexplained number.
     """
     with open(args.ablation) as fh:
         report = json.load(fh)
@@ -1140,32 +1186,66 @@ def main_ablation(args) -> int:
         )
         return EXIT_REFUSED
 
+    arms = report.get("arms")
+    if not isinstance(arms, list) or not arms:
+        print("REFUSED: ablation report has no non-empty 'arms' list", file=sys.stderr)
+        return EXIT_REFUSED
+
     problems = _ablation_provenance_problems(report)
+    for arm in arms:
+        problems.extend(_cross_check_arm_aggregate(arm))
     if problems:
         for msg in problems:
             print(f"PROVENANCE VIOLATION: {msg}", file=sys.stderr)
         print("REFUSED")
         return EXIT_REFUSED
 
-    arms = report["arms"]
     reference = next((a for a in arms if a.get("arm") == "all_fused"), None)
     if reference is None:
         print("REFUSED: ablation report has no 'all_fused' reference arm", file=sys.stderr)
         return EXIT_REFUSED
-    ref_cosine = reference["overall_cosine_vs_f32_truth"]
+    ref_median = reference["full_tensor_cosine"]["median"]
+    seeds = report.get("seeds")
+    budget = report.get("derived_per_op_budget")
+    print(f"seeds: {seeds}   derived_per_op_budget: {budget}")
+    untestable = report.get("untestable_op_keys") or []
+    if untestable:
+        print(f"untestable (subsumed, never dispatched standalone on this checkpoint): {untestable}")
 
-    print(f"{'arm':<40} {'cosine_vs_f32_truth':>20} {'delta_vs_all_fused':>20}")
+    header = f"{'arm':<28} {'classification':<12} {'cosine median [min, max]':<32} {'delta vs all_fused':>20}"
+    print(header)
     table = []
     for arm in arms:
-        c = arm["overall_cosine_vs_f32_truth"]
-        delta = c - ref_cosine
+        c = arm["full_tensor_cosine"]
+        delta = c["median"] - ref_median
         label = arm.get("arm", "<unnamed>")
-        print(f"{label:<40} {c:>20.6f} {delta:>20.6f}")
-        table.append({"arm": label, "op_key": arm.get("op_key"), "cosine_vs_f32_truth": c, "delta_vs_all_fused": delta})
+        classification = arm.get("classification", "?")
+        cosine_str = f"{c['median']:.6f} [{c['min']:.6f}, {c['max']:.6f}]"
+        print(f"{label:<28} {classification:<12} {cosine_str:<32} {delta:>20.6f}")
+        table.append(
+            {
+                "arm": label,
+                "op_key": arm.get("op_key"),
+                "classification": classification,
+                "full_tensor_cosine": c,
+                "delta_vs_all_fused_median": delta,
+            }
+        )
 
     if args.out:
         with open(args.out, "w") as fh:
-            json.dump({"cosine_floor": cosine_floor, "all_fused_cosine": ref_cosine, "table": table}, fh, indent=2)
+            json.dump(
+                {
+                    "cosine_floor": cosine_floor,
+                    "seeds": seeds,
+                    "derived_per_op_budget": budget,
+                    "untestable_op_keys": untestable,
+                    "all_fused_cosine_median": ref_median,
+                    "table": table,
+                },
+                fh,
+                indent=2,
+            )
 
     print("OK")
     return EXIT_PASS

@@ -457,6 +457,17 @@ enum Command {
         cuda: Option<usize>,
         #[arg(long, default_value_t = 42)]
         seed: u64,
+        /// `--ablate-each-op` ONLY: comma-separated seeds this run drives
+        /// the WHOLE arm cascade (all_fused/f32_truth/each ablate:key/
+        /// all_off) over, once per seed — every arm's cosine is then
+        /// aggregated (median, min, max) across these seeds (round-7 audit
+        /// finding on PR #383: a single-seed cosine is not a stable
+        /// quantity — the SAME shape can read `all_fused > all_off` on one
+        /// seed and the reverse on another). Defaults to `42,43,44` when
+        /// `--ablate-each-op` is set and this flag is omitted; ignored
+        /// (and `--seed` used instead) without `--ablate-each-op`.
+        #[arg(long)]
+        seeds: Option<String>,
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         batched_forward: bool,
         /// Load LoRA A/B from this safetensors file before the forward
@@ -474,12 +485,19 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
         /// How a FRESH (no `--lora-weights-in`) call draws LoRA `A`/`B`:
-        /// `gaussian` (both nonzero, default — see `GradOracleParams::lora_init`'s
-        /// doc for why this is what makes every gradient LIVE) or
-        /// `zeros-b` (the legacy mode; `dL/dA` is structurally zero at a
-        /// fresh init under this mode).
-        #[arg(long, default_value = "gaussian")]
-        lora_init: String,
+        /// `peft-step1` (PEFT's own init, ZerosB, plus one real AdamW step
+        /// — the DEFAULT under `--ablate-each-op` as of round 7's audit fix
+        /// on PR #383: real training's first live-gradient operating
+        /// point), `gaussian` (both A and B drawn nonzero — a DIAGNOSTIC
+        /// operating point, not the gate's default; `alpha/rank = 2` at
+        /// this draw is a loss-surface region no real training run
+        /// occupies), or `zeros-b` (the legacy mode; `dL/dA` is
+        /// structurally zero at a fresh init under this mode). Omit to get
+        /// the mode-dependent default: `peft-step1` with
+        /// `--ablate-each-op`, `gaussian` otherwise (see
+        /// `GradOracleLoraInit`'s own doc).
+        #[arg(long)]
+        lora_init: Option<String>,
         /// Run the full per-op ablation instead of a single dump: `all_fused`
         /// (STRICT) → `f32_truth` → one arm per live admit key with
         /// `JAMMI_KERNELS_DISABLE=<key>` → `all_off`, each at IDENTICAL LoRA
@@ -631,6 +649,7 @@ async fn main() -> std::process::ExitCode {
             backbone_dtype,
             cuda,
             seed,
+            seeds,
             batched_forward,
             lora_weights_in,
             lora_weights_out,
@@ -654,15 +673,48 @@ async fn main() -> std::process::ExitCode {
                     return std::process::ExitCode::FAILURE;
                 }
             };
-            let lora_init = match lora_init.as_str() {
-                "gaussian" => jammi_lora::LoraInitMode::Gaussian,
-                "zeros-b" => jammi_lora::LoraInitMode::ZerosB,
-                other => {
-                    eprintln!("unknown lora_init {other:?}; expected gaussian or zeros-b");
+            // Mode-dependent default (`GradOracleLoraInit`'s own doc,
+            // round-7 audit fix on PR #383): `peft-step1` under
+            // `--ablate-each-op`, `gaussian` otherwise — resolved here
+            // (not via clap's own `default_value`) because the default
+            // itself depends on ANOTHER flag (`--ablate-each-op`).
+            let lora_init_flag = lora_init
+                .as_deref()
+                .unwrap_or(if ablate_each_op {
+                    "peft-step1"
+                } else {
+                    "gaussian"
+                })
+                .to_string();
+            let lora_init = match grad_oracle::GradOracleLoraInit::from_flag(&lora_init_flag) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("{e}");
                     return std::process::ExitCode::FAILURE;
                 }
             };
             if ablate_each_op {
+                let parsed_seeds: Result<Vec<u64>, String> = seeds
+                    .as_deref()
+                    .unwrap_or("42,43,44")
+                    .split(',')
+                    .map(|s| {
+                        s.trim()
+                            .parse::<u64>()
+                            .map_err(|e| format!("--seeds: invalid seed {s:?}: {e}"))
+                    })
+                    .collect();
+                let seeds = match parsed_seeds {
+                    Ok(v) if !v.is_empty() => v,
+                    Ok(_) => {
+                        eprintln!("--seeds: must name at least one seed");
+                        return std::process::ExitCode::FAILURE;
+                    }
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return std::process::ExitCode::FAILURE;
+                    }
+                };
                 run_grad_oracle_ablation(
                     grad_oracle_ablation::AblationParams {
                         model_dir,
@@ -673,7 +725,7 @@ async fn main() -> std::process::ExitCode {
                         target_modules,
                         backbone_dtype,
                         cuda_device: cuda,
-                        seed,
+                        seeds,
                         batched_forward,
                         lora_init,
                         keep_arm_dumps,

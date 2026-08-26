@@ -699,12 +699,17 @@ jobs:
           - name: reference torch_grad_oracle name-translation suite
             cmd: python3 crates/jammi-bench/reference/test_torch_grad_oracle_names.py
           # The fused-op-gradient-parity gate's OWN self-test (RED/GREEN
-          # cases against synthetic AblationReport fixtures, never a real
-          # GPU run — `check_fused_op_gradient_parity.py`'s own module doc).
-          # This gate's REAL invocation (a real
-          # `jammi-bench grad-oracle --ablate-each-op` report, checked
-          # against the per-op cosine-delta threshold derived from ledger
-          # row 240) needs a live CUDA box and is a MANUAL pod-lane step
+          # cases, including a shape-specific-defect-must-not-gate-alone
+          # case and a materially-diverging bf16-vs-f32-shaped pair
+          # exercised both PASS and FAIL, against synthetic AblationReport
+          # fixtures — never a real GPU run;
+          # `check_fused_op_gradient_parity.py`'s own module doc). This
+          # gate's REAL invocation (TWO real `jammi-bench grad-oracle
+          # --ablate-each-op` reports, `b4-s128` and `b8-s128`, each an
+          # internal 3-seed cascade, checked against a PER-SHAPE budget
+          # derived from the `all_fused` arm's OWN measured seed spread —
+          # round-7 audit fix on PR #383, never a fixed constant) needs a
+          # live CUDA box and is a MANUAL pod-lane step
           # (`docs/maintainer/cuda-kernel-guide.md` §5: no CI lane has a
           # GPU) — this leg only proves the gate's own logic is sound, the
           # same "hermetic self-test wired, GPU-dependent real run manual"

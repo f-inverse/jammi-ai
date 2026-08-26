@@ -411,8 +411,9 @@ site whose jammi-side name carries no `mlp.` prefix, was misrouted to
 `attn.Wi` by a naive string-prefix heuristic).
 
 **Structural limitation, confirmed on that live run: a single fresh-init
-call tests ONLY `dL/dB`, never `dL/dA`.** Both `grad_oracle.rs` and this
-script run at `LoraInitMode::ZerosB` — `B` starts at the exact zero
+call tests ONLY `dL/dB`, never `dL/dA`.** Both `grad_oracle.rs` and THIS
+SCRIPT (`torch_grad_oracle.py`) STILL run at `LoraInitMode::ZerosB` for the
+jammi-vs-torch CROSS-FRAMEWORK comparison — `B` starts at the exact zero
 matrix, and the LoRA forward's chain rule routes `dL/dA` through `B^T @
 dL/d(output)`, which is IDENTICALLY zero whenever `B == 0`, for ANY value
 of `A`, on BOTH stacks, REGARDLESS of whether either stack's `dL/dA`
@@ -423,8 +424,20 @@ agree on that path. See `grad_oracle.rs`'s own "Structural limitation"
 doc section and `compare_grad_oracle.py`'s `is_vacuous_pair`/
 `vacuous_tensor_count`, which classify and surface this case explicitly
 rather than let a `0.0` cosine there masquerade as either a pass or a
-fail. Catching a real `dL/dA` defect needs at least one optimizer step
-first (moving `B` away from zero); not implemented this round.
+fail.
+
+**UPDATE (PR #383): this blind spot is now closed for the SAME-PRODUCER
+`--ablate-each-op` gate, not for this cross-framework script.** jammi's own
+`grad-oracle` gained `--lora-init gaussian`/`peft-step1` (`GradOracleLoraInit`'s
+own doc) — `peft-step1` runs PEFT's own `ZerosB` init plus ONE real `AdamW`
+step before the measured forward, moving `B` away from zero the way real
+training actually does, and is now the default for `--ablate-each-op`. THIS
+script (`torch_grad_oracle.py`) and the plain jammi-vs-torch
+`compare_grad_oracle.py A.json B.json` path are UNCHANGED by that work — they
+still only exercise `LoraInitMode::ZerosB`, so the `dL/dA`-blind-spot
+disclosure above remains accurate for THAT comparison specifically. Closing
+it for the cross-framework path too (a `torch_grad_oracle.py` peft-step1
+mode) is separate, not-yet-started follow-up work.
 
 `ci/scripts/perf/compare_grad_oracle.py` reads a jammi `grad-oracle` dump
 and a `torch_grad_oracle.py` dump — SAME JSON schema on both sides,
@@ -462,70 +475,100 @@ for its (numpy-optional) test suite.
 
 **Every fused-op PR (a new/changed `CustomOp1|2|3` under
 `crates/jammi-kernels/src/ops/`, or a new admission call site) must attach
-an ablation report to its PR description.** This is the gate that finally
-exposed a real defect (ledger row 240) that every earlier fused-vs-eager
-oracle in this repo stayed green on — see
-`crates/jammi-bench/src/grad_oracle_ablation.rs`'s own module doc for why:
-a `LoraInitMode::ZerosB`-init `grad-oracle` run (this repo's ORIGINAL
-`grad-oracle` mode, still the default `finetune_step.rs`/`torch_grad_oracle.py`
-build off) makes `dL/dA` and the LoRA epilogue's own gradient term
-STRUCTURALLY zero on both sides, whatever the arithmetic feeding them —
-`--lora-init gaussian` (this feature's new default) is what makes the
-comparison non-vacuous.
+TWO ablation reports (shapes `b4-s128` and `b8-s128`) to its PR
+description.** This is the gate that finally exposed a real defect (ledger
+row 240) that every earlier fused-vs-eager oracle in this repo stayed green
+on — see `crates/jammi-bench/src/grad_oracle_ablation.rs`'s own module doc
+for why: a `LoraInitMode::ZerosB`-init `grad-oracle` run (this repo's
+ORIGINAL `grad-oracle` mode, still what `finetune_step.rs`/
+`torch_grad_oracle.py` build off) makes `dL/dA` and the LoRA epilogue's own
+gradient term STRUCTURALLY zero on both sides, whatever the arithmetic
+feeding them — `--ablate-each-op`'s own default, `--lora-init peft-step1`
+(PEFT's own init plus one real `AdamW` step — real training's first
+live-gradient operating point), is what makes the comparison non-vacuous.
+
+**Round-7 audit fix (PR #383): a SINGLE seed's cosine is not a stable
+enough quantity to gate on.** The first round's own two shapes on the SAME
+build INVERTED the story (`b4-s128`: `all_fused=0.610 < all_off=0.810`;
+`b8-s128`: `all_fused=0.843 > all_off=0.773`) — `--ablate-each-op` now runs
+every arm across THREE seeds (`--seeds 42,43,44`, the default) and reports
+`{median, min, max}`, and the gate below derives its per-op FAIL budget
+from the MEASURED SEED SPREAD rather than a fixed constant, requiring BOTH
+shapes to exceed that budget before calling an op a real defect.
 
 ### What to run (on a CUDA pod — no CI lane has a GPU)
 
 ```
 cargo run -p jammi-bench --release --features cuda -- grad-oracle \
     --model-dir /path/to/ModernBERT-large \
-    --batch 4 --seq 128 --seed 42 \
+    --batch 4 --seq 128 \
     --lora-rank 16 --lora-alpha 32 --target-modules Wqkv,Wo,Wi \
     --backbone-dtype bf16 --cuda 0 \
     --ablate-each-op \
     --out grad-ablation-b4-s128.json
 ```
-(`JAMMI_KERNELS_STRICT`/`JAMMI_KERNELS_DISABLE` are set PER ARM internally by
-the orchestrator — a caller of `--ablate-each-op` does not set either
-itself; see `grad_oracle_ablation.rs`'s module doc for the exact per-arm
-env-var table.) This spawns: `all_fused` (STRICT, seeds the shared LoRA
-weight file) → `f32_truth` (an f32-precision higher-precision reference,
-`docs/maintainer/cuda-kernel-guide.md` §3.3) → one `ablate:<op_key>` arm per
-op key that actually dispatched FUSED on `all_fused`'s own run (never a
+Repeat with `--batch 8` for `grad-ablation-b8-s128.json`. (`--seeds` defaults
+to `42,43,44` and `--lora-init` defaults to `peft-step1` under
+`--ablate-each-op` — both are only worth overriding for a deliberate
+diagnostic run, e.g. `--lora-init gaussian` to compare against the earlier
+operating point. `JAMMI_KERNELS_STRICT`/`JAMMI_KERNELS_DISABLE` are set PER
+ARM internally by the orchestrator — a caller of `--ablate-each-op` does not
+set either itself.) Each `--seeds` entry runs the FULL cascade — `all_fused`
+(STRICT, seeds that seed's own shared LoRA weight file) → `f32_truth` (an
+f32-precision higher-precision reference, `docs/maintainer/
+cuda-kernel-guide.md` §3.3) → one `ablate:<op_key>` arm per op key that
+actually dispatched FUSED on the FIRST seed's `all_fused` run (never a
 hand-maintained list — `GradOracleReport::live_admit_keys`) → `all_off`
-(`JAMMI_KERNELS_DISABLE=all`). Every arm loads the IDENTICAL LoRA weights
-(`--lora-weights-out`/`--lora-weights-in` round trip, unchanged from the
-single-run `grad-oracle` mode). The command REFUSES (nonzero exit, no `--out`
-file written) if the fixture is not actually non-vacuous
-(`vacuous_tensor_count != 0` on any arm) or if any arm's
-`JAMMI_KERNELS_DISABLE` provenance is not self-describing
-(`unmatched_disables` non-empty) — a written report is always a trustworthy
+(`JAMMI_KERNELS_DISABLE=all`) — then aggregates every arm's `full_tensor_cosine`/
+`per_tensor_median_cosine`/`mass_weighted_mean_cosine` across seeds. The
+command REFUSES (nonzero exit, no `--out` file written) if any seed's
+`all_fused` arm is not actually non-vacuous, if any arm's
+`JAMMI_KERNELS_DISABLE` provenance is not self-describing on any seed, or if
+an `ablate:<key>` arm's OWN dispatch counters show `<key>` still fired FUSED
+(a hard mechanism contradiction) — a written report is always a trustworthy
 one, never merely "the command exited 0".
 
 ### Attach to the PR
 
-1. The `--out` JSON itself (or a link to the committed artifact, if this is
-   the kind of PR that commits one under
-   `crates/jammi-kernels/artifacts/cuda-runs/` —
+1. Both `--out` JSON files themselves (or a link to the committed artifact +
+   its `-raw-runs/` siblings, if this is the kind of PR that commits one
+   under `crates/jammi-kernels/artifacts/cuda-runs/` —
    `python3 ci/scripts/check_cuda_run_artifacts.py` gates that path's
    schema).
 2. `python3 ci/scripts/perf/check_fused_op_gradient_parity.py
-   grad-ablation-b4-s128.json` — the CI-shaped per-op threshold gate
-   (`FUSED_OP_COSINE_DELTA_THRESHOLD`, derived from ledger row 240's
-   measured 0.20 all-fused-to-all-eager whole-composition gap; see that
-   script's own module doc for the full derivation). PASTE its stdout (the
-   `threshold:`/`PASS`|`FAIL` lines and any `PROBLEM:` lines on stderr) into
-   the PR description — this is the number a reviewer checks, not an
+   grad-ablation-b4-s128.json grad-ablation-b8-s128.json` — the CI-shaped
+   per-op gate, BOTH shapes required. See that script's own module doc for
+   the full derivation of the per-shape budget (`3 * (max - min)` of
+   `all_fused`'s own seed spread — never a fixed constant). PASTE its
+   stdout (the `PASS`|`FAIL` line and any `PROBLEM:` lines on stderr) into
+   the PR description — this is the verdict a reviewer checks, not an
    eyeballed diff of the raw JSON.
 3. Optionally, `python3 ci/scripts/perf/compare_grad_oracle.py --ablation
-   grad-ablation-b4-s128.json --cosine-floor <F>` for the human-readable
-   arm → cosine → Δ-vs-all_fused table (see that mode's own doc for why an
-   explicit `--cosine-floor` is REQUIRED at ModernBERT-large's own
-   depth/width — the derived floor is non-positive there, ledger row 240).
+   grad-ablation-b4-s128.json --cosine-floor <F>` (run once per shape) for
+   the human-readable arm → classification → cosine(median[min,max]) →
+   Δ-vs-`all_fused` table (see that mode's own doc for why an explicit
+   `--cosine-floor` is REQUIRED at ModernBERT-large's own depth/width — the
+   derived floor is non-positive there, ledger row 240).
+
+**What a FAIL means TODAY, honestly disclosed:** the real a100d run
+committed as this feature's own artifact (`crates/jammi-kernels/artifacts/
+cuda-runs/2026-08-2X-grad-ablation-*.json`) FAILS this gate on main's own
+tip — `geglu_fused`/`layer_norm_fused`/`lora_linear_fused` each move the
+median cosine past their shape's own derived budget at BOTH `b4-s128` and
+`b8-s128`. That is the PRE-EXISTING esc-045 defect this tool was built to
+surface, not a regression this PR introduces or fixes; `check_fused_op_gradient_parity.py`'s
+own exit code on that artifact is `1` (FAIL), by design — a caller running
+this gate against the committed artifact should EXPECT that FAIL until
+esc-045 itself is fixed (separate, follow-up work), and must not read it as
+this ablation TOOL being broken.
 
 `check_fused_op_gradient_parity.py --self-test` is the ONLY leg of this
 gate wired into `ci.yml` (`.github/workflows/ci.yml`'s `guard` matrix,
 "fused-op gradient parity gate self-test") — it proves the gate's own
-RED/GREEN logic against synthetic reports, never a real GPU run. The real
-invocation against a live ablation report is manual, pod-lane work, the
-same "no CI lane has a GPU" posture every other GPU-dependent measurement in
-this repo takes (`docs/maintainer/cuda-kernel-guide.md` §5).
+RED/GREEN logic (including the "a shape-specific defect must not gate
+alone" property and a materially-diverging bf16-vs-f32-shaped synthetic
+pair, exercised both PASS and FAIL) against synthetic reports, never a real
+GPU run. The real invocation against live ablation reports is manual,
+pod-lane work, the same "no CI lane has a GPU" posture every other
+GPU-dependent measurement in this repo takes (`docs/maintainer/
+cuda-kernel-guide.md` §5).

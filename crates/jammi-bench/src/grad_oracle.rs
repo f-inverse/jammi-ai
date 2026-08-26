@@ -188,8 +188,60 @@ use std::path::PathBuf;
 
 use crate::finetune_step::{device_name, sha256_and_len, synthetic_ids, triplet_loss};
 use candle_core::{DType, Device, Tensor, Var};
-use candle_nn::VarMap;
+use candle_nn::{Optimizer, VarMap};
 use serde::Serialize;
+
+/// How this tier seeds LoRA `A`/`B` on a FRESH (no `--lora-weights-in`)
+/// call — a jammi-bench-local enum, NOT `jammi_lora::LoraInitMode`
+/// (2 variants: `ZerosB`/`Gaussian`), because `PeftStep1` is a PROCEDURE
+/// (an init plus one real optimizer step), not a distribution jammi-lora
+/// itself knows how to draw — see [`GradOracleParams::lora_init`]'s doc for
+/// the full rationale of each variant, and [`peft_step1_weights`] for the
+/// procedure `PeftStep1` runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GradOracleLoraInit {
+    ZerosB,
+    Gaussian,
+    PeftStep1,
+}
+
+impl GradOracleLoraInit {
+    /// Parses the `--lora-init` CLI flag's value. Shared by `main.rs` (both
+    /// the plain `grad-oracle` path and `--ablate-each-op`) so there is
+    /// exactly one spelling table, never two independently-drifting
+    /// `match` arms.
+    pub fn from_flag(s: &str) -> Result<Self, String> {
+        match s {
+            "zeros-b" => Ok(Self::ZerosB),
+            "gaussian" => Ok(Self::Gaussian),
+            "peft-step1" => Ok(Self::PeftStep1),
+            other => Err(format!(
+                "unknown lora_init {other:?}; expected gaussian, zeros-b, or peft-step1"
+            )),
+        }
+    }
+
+    pub fn as_flag(self) -> &'static str {
+        match self {
+            Self::ZerosB => "zeros-b",
+            Self::Gaussian => "gaussian",
+            Self::PeftStep1 => "peft-step1",
+        }
+    }
+
+    /// The `jammi_lora::LoraInitMode` this variant's INITIAL draw uses —
+    /// `PeftStep1` maps to `ZerosB` (PEFT's own default: `A` Kaiming-
+    /// uniform, `B` zeros) because the "PEFT" part of `PeftStep1` IS
+    /// `LoraInitMode::ZerosB`; what makes it different from plain `ZerosB`
+    /// is the one optimizer step [`peft_step1_weights`] takes afterward,
+    /// not a different initial distribution.
+    fn initial_jammi_mode(self) -> jammi_lora::LoraInitMode {
+        match self {
+            Self::ZerosB | Self::PeftStep1 => jammi_lora::LoraInitMode::ZerosB,
+            Self::Gaussian => jammi_lora::LoraInitMode::Gaussian,
+        }
+    }
+}
 
 /// Parameters the oracle drives its single forward+backward off of.
 #[derive(Debug, Clone)]
@@ -219,24 +271,28 @@ pub struct GradOracleParams {
     /// invocation seed the shared file a second, independent invocation
     /// then loads via `lora_weights_in`.
     pub lora_weights_out: Option<PathBuf>,
-    /// How the LoRA `A`/`B` matrices are drawn on a FRESH (no
-    /// `lora_weights_in`) call — `jammi_lora::LoraInitMode::ZerosB` (this
-    /// tier's ORIGINAL, only mode) or `Gaussian`. See this module's doc's
-    /// "Structural limitation: a single fresh-init call tests ONLY dL/dA"
-    /// section: under `ZerosB`, `B` starts at the exact zero matrix, so
-    /// `dL/dA` is IDENTICALLY zero on every `lora_a` tensor regardless of
-    /// whether either stack's backward arithmetic is correct there — a
-    /// single forward+backward at that init is STRUCTURALLY BLIND to a
-    /// `dL/dA` defect. `Gaussian` (both `A` and `B` drawn from `Normal(0,
-    /// 0.02)`, `jammi_lora::LoraInitMode::Gaussian`'s own doc) starts BOTH
-    /// factors nonzero, so `dL/dA` and the LoRA epilogue's own gradient term
-    /// are live from a single call — this is what
-    /// [`GradOracleReport::vacuous_tensor_count`] exists to certify: a
-    /// caller that needs every gradient live (the ablation orchestrator
-    /// below) asserts `vacuous_tensor_count == 0` on a `Gaussian` run and
-    /// refuses to proceed otherwise, never silently accepting a
-    /// structurally-blind fixture as if it were a real oracle.
-    pub lora_init: jammi_lora::LoraInitMode,
+    /// How the LoRA `A`/`B` matrices are seeded on a FRESH (no
+    /// `lora_weights_in`) call. See this module's doc's "Structural
+    /// limitation: a single fresh-init call tests ONLY dL/dA" section:
+    /// under `ZerosB`, `B` starts at the exact zero matrix, so `dL/dA` is
+    /// IDENTICALLY zero on every `lora_a` tensor regardless of whether
+    /// either stack's backward arithmetic is correct there — a single
+    /// forward+backward at that init is STRUCTURALLY BLIND to a `dL/dA`
+    /// defect. `Gaussian` (both `A` and `B` drawn from `Normal(0, 0.02)`)
+    /// starts both factors nonzero, so `dL/dA` and the LoRA epilogue's own
+    /// gradient term are live from a single call — a DIAGNOSTIC operating
+    /// point (round-7 audit finding on PR #383: `alpha/rank = 2` with both
+    /// factors at `N(0, 0.02)` is a loss-surface region real training never
+    /// occupies). `PeftStep1` is the REALISTIC operating point instead
+    /// (`--ablate-each-op`'s own default as of this round): PEFT's own
+    /// init (`ZerosB`), one real `AdamW` step at the reference lr
+    /// (`peft_step1_weights`'s own doc) on this call's own synthetic batch,
+    /// THEN the measured forward+backward — real training's first LIVE-
+    /// gradient point, not a synthetic distribution nothing ever trains
+    /// from. See [`GradOracleReport::vacuous_tensor_count`] for the
+    /// non-vacuous certification every mode still carries (only `ZerosB`
+    /// is expected to fail it).
+    pub lora_init: GradOracleLoraInit,
 }
 
 /// Below this L2 norm, a gradient vector is treated as (numerically) the
@@ -254,6 +310,14 @@ const VACUOUS_NORM_FLOOR: f64 = 1e-12;
 fn grad_is_vacuous(grad: &[f32]) -> bool {
     let sum_sq: f64 = grad.iter().map(|&g| (g as f64) * (g as f64)).sum();
     sum_sq.sqrt() < VACUOUS_NORM_FLOOR
+}
+
+/// A `(fused, eager)` dispatch-count pair for one `jammi_kernels::admission`
+/// op key — see [`GradOracleReport::admit_key_dispatches`]'s own doc.
+#[derive(Debug, Clone, Copy, Serialize, serde::Deserialize)]
+pub struct DispatchPair {
+    pub fused: u64,
+    pub eager: u64,
 }
 
 /// One trainable tensor's dumped gradient (and, for the non-vacuous check
@@ -321,6 +385,19 @@ pub struct GradOracleReport {
     pub batched_forward: bool,
     pub seed: u64,
     pub lora_dropout: f64,
+    /// `"zeros-b"` | `"gaussian"` | `"peft-step1"` — [`GradOracleLoraInit::as_flag`].
+    /// IDENTITY within a same-producer comparison (the ablation
+    /// orchestrator's whole premise depends on every arm having used the
+    /// SAME init procedure); no torch-side equivalent.
+    pub lora_init: String,
+    /// `true` iff this run synthesized its OWN LoRA weights via
+    /// [`peft_step1_weights`] (i.e. `lora_init == "peft-step1"` AND no
+    /// `--lora-weights-in` was supplied) rather than loading a caller-
+    /// supplied file. `lora_weights_in` below stays `None` in that case —
+    /// the synthesized file lives in a `TempDir` that is deleted before
+    /// this function returns, so reporting its path would name a file that
+    /// no longer exists.
+    pub peft_step1_applied: bool,
     pub lora_weights_in: Option<String>,
     pub lora_weights_out: Option<String>,
     pub trainable_tensor_count: usize,
@@ -397,6 +474,20 @@ pub struct GradOracleReport {
     /// PROVENANCE (a fact about which kernels this run reached, not a value
     /// either producer's gradient math depends on).
     pub live_admit_keys: Vec<String>,
+    /// The RAW `(fused, eager)` snapshot-delta for EVERY op key
+    /// `jammi_kernels::admission::snapshot_all()` observed this run (a
+    /// superset of [`Self::live_admit_keys`]: an op key can appear here
+    /// with `fused == 0` — e.g. disabled-and-therefore-always-eager, or a
+    /// SUBSUMED key that only reaches `admit` once its subsuming parent is
+    /// ALSO disabled — without qualifying as "live"). Round-7 audit finding
+    /// (PR #383): `grad_oracle_ablation`'s per-op table needs each arm's
+    /// OWN dispatch counters for the key it claims to have ablated, not
+    /// just a boolean "did this key fire fused ANYWHERE this run" — an
+    /// `ablate:<key>` arm whose OWN `admit_key_dispatches[key].fused > 0`
+    /// is a hard contradiction (the disable did not actually take effect
+    /// for every call) and [`crate::grad_oracle_ablation::run`] refuses on
+    /// exactly that condition.
+    pub admit_key_dispatches: std::collections::BTreeMap<String, DispatchPair>,
     /// How many of [`Self::gradients`]' tensors are [`grad_is_vacuous`] —
     /// the fixture's own non-vacuous-control self-check (family F): under
     /// `LoraInitMode::Gaussian` this must be `0` (both `dL/dA` and `dL/dB`
@@ -439,8 +530,117 @@ fn tip_sha() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Run the oracle and return its report. NO optimizer step — see this
-/// module's doc for why a gradient-direction comparison does not need one.
+/// Real training's FIRST live-gradient point: PEFT's own init (`ZerosB`),
+/// one real `AdamW` step on THIS call's own synthetic batch
+/// (`synthetic_ids(.., params.seed + i, ..)`, `i` in `0..3` — the SAME
+/// batch `run()`'s own measured forward will reuse, since `params.seed` is
+/// unchanged between this call and the one that loads its output — see
+/// `GradOracleLoraInit::PeftStep1`'s own doc: "on the SAME data, then dump
+/// gradients on the second step"), then writes the POST-step LoRA weights
+/// to `out_path`. Deliberately duplicates (never shares) the model-
+/// construction prologue `run()` itself uses below — the same
+/// `finetune_step.rs::build_fixture`-style duplication this crate already
+/// takes for its own per-tier fixtures, rather than a shared helper with a
+/// growing parameter list neither call site fully needs.
+///
+/// `lr = 2e-4`, the SAME reference lr `finetune_step.rs::build_fixture`
+/// uses (`crates/jammi-bench/src/finetune_step.rs`) — not a new number
+/// invented for this tier.
+const PEFT_STEP1_REFERENCE_LR: f64 = 2e-4;
+
+fn peft_step1_weights(
+    params: &GradOracleParams,
+    out_path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let device = match params.cuda_device {
+        Some(ordinal) => Device::new_cuda(ordinal)?,
+        None => Device::Cpu,
+    };
+    let config_raw = std::fs::read_to_string(params.model_dir.join("config.json"))?;
+    let config: jammi_encoders::ModernBertConfig = serde_json::from_str(&config_raw)?;
+    let weights = params.model_dir.join("model.safetensors");
+
+    let varmap = VarMap::new();
+    let empty_ranks = std::collections::HashMap::new();
+    let lora = jammi_lora::LoraBuildConfig {
+        target_modules: &params.target_modules,
+        layers_to_transform: &None,
+        lora_rank: params.lora_rank,
+        lora_alpha: params.lora_alpha,
+        use_rslora: false,
+        lora_dropout: None,
+        rank_pattern: &empty_ranks,
+        init_mode: jammi_lora::LoraInitMode::ZerosB,
+        seed: params.seed,
+    };
+    let mut encoder = jammi_encoders::ModernBert::builder()
+        .pooling(jammi_encoders::Pooling::Mean)
+        .backbone_dtype(jammi_encoders::compute_precision_to_dtype(
+            params.backbone_dtype,
+        ))
+        .lora(lora)
+        .build(&[weights.as_path()], &config, &device, &varmap)?;
+    encoder.set_training(true);
+
+    let trainable = varmap.all_vars();
+    if trainable.is_empty() {
+        return Err(
+            "peft_step1_weights: no trainable LoRA tensors -- target_modules matched nothing"
+                .into(),
+        );
+    }
+    let mut opt = candle_nn::AdamW::new(
+        trainable,
+        candle_nn::ParamsAdamW {
+            lr: PEFT_STEP1_REFERENCE_LR,
+            weight_decay: 0.01,
+            ..Default::default()
+        },
+    )?;
+
+    let mask = Tensor::ones((params.batch, params.seq), DType::U32, &device)?;
+    let blocks: Vec<Tensor> = (0..3)
+        .map(|i| {
+            synthetic_ids(
+                params.batch,
+                params.seq,
+                config.vocab_size,
+                params.seed + i,
+                &device,
+            )
+        })
+        .collect();
+
+    let (a, p, n) = if params.batched_forward {
+        let joined = Tensor::cat(&[&blocks[0], &blocks[1], &blocks[2]], 0)?;
+        let joined_mask = Tensor::cat(&[&mask, &mask, &mask], 0)?;
+        let all = encoder.forward(&joined, &joined_mask)?;
+        let b = params.batch;
+        (
+            all.narrow(0, 0, b)?,
+            all.narrow(0, b, b)?,
+            all.narrow(0, 2 * b, b)?,
+        )
+    } else {
+        (
+            encoder.forward(&blocks[0], &mask)?,
+            encoder.forward(&blocks[1], &mask)?,
+            encoder.forward(&blocks[2], &mask)?,
+        )
+    };
+    let loss = triplet_loss(&a, &p, &n, 0.3)?;
+    let grads = loss.backward()?;
+    opt.step(&grads)?;
+
+    varmap.save(out_path)?;
+    Ok(())
+}
+
+/// Run the oracle and return its report. The MEASURED step itself takes NO
+/// optimizer step (`PeftStep1`'s own step happens in [`peft_step1_weights`]
+/// BEFORE this function's own forward — see this module's doc for why a
+/// gradient-direction comparison at the MEASURED step does not need one of
+/// its own).
 pub fn run(params: &GradOracleParams) -> Result<GradOracleReport, Box<dyn std::error::Error>> {
     let device = match params.cuda_device {
         Some(ordinal) => Device::new_cuda(ordinal)?,
@@ -478,7 +678,7 @@ pub fn run(params: &GradOracleParams) -> Result<GradOracleReport, Box<dyn std::e
         // purpose.
         lora_dropout: None,
         rank_pattern: &empty_ranks,
-        init_mode: params.lora_init,
+        init_mode: params.lora_init.initial_jammi_mode(),
         seed: params.seed,
     };
 
@@ -497,7 +697,26 @@ pub fn run(params: &GradOracleParams) -> Result<GradOracleReport, Box<dyn std::e
     // eval-mode composition.
     encoder.set_training(true);
 
-    if let Some(path) = &params.lora_weights_in {
+    // `PeftStep1` with no explicit `--lora-weights-in`: compute the
+    // POST-one-optimizer-step weights ourselves (`peft_step1_weights`'s own
+    // doc), then load them exactly as if they had been an
+    // externally-supplied `--lora-weights-in` file — `_peft_step1_scratch`
+    // keeps the backing `TempDir` alive through the `varmap.load` call
+    // below (a `TempDir` deletes its contents on drop).
+    let _peft_step1_scratch;
+    let effective_lora_weights_in: Option<PathBuf> =
+        if params.lora_init == GradOracleLoraInit::PeftStep1 && params.lora_weights_in.is_none() {
+            let dir = tempfile::tempdir()?;
+            let path = dir.path().join("peft_step1_weights.safetensors");
+            peft_step1_weights(params, &path)?;
+            _peft_step1_scratch = Some(dir);
+            Some(path)
+        } else {
+            _peft_step1_scratch = None;
+            params.lora_weights_in.clone()
+        };
+
+    if let Some(path) = &effective_lora_weights_in {
         varmap
             .load(path)
             .map_err(|e| -> Box<dyn std::error::Error> {
@@ -607,13 +826,24 @@ pub fn run(params: &GradOracleParams) -> Result<GradOracleReport, Box<dyn std::e
     let lora_linear_fused_dispatch_after = jammi_lora::lora_linear_fused_dispatch_snapshot();
     let attention_block_dispatch_after = jammi_encoders::attention_block_dispatch_snapshot();
     let admit_snapshot_after = jammi_kernels::admission::snapshot_all();
-    let mut live_admit_keys: Vec<String> = admit_snapshot_after
+    let admit_key_dispatches: std::collections::BTreeMap<String, DispatchPair> =
+        admit_snapshot_after
+            .iter()
+            .map(|(op, after)| {
+                let before = admit_snapshot_before.get(*op).copied().unwrap_or_default();
+                (
+                    (*op).to_string(),
+                    DispatchPair {
+                        fused: after.fused.saturating_sub(before.fused),
+                        eager: after.eager.saturating_sub(before.eager),
+                    },
+                )
+            })
+            .collect();
+    let mut live_admit_keys: Vec<String> = admit_key_dispatches
         .iter()
-        .filter(|(op, after)| {
-            let before_fused = admit_snapshot_before.get(*op).map(|s| s.fused).unwrap_or(0);
-            after.fused.saturating_sub(before_fused) > 0
-        })
-        .map(|(op, _)| (*op).to_string())
+        .filter(|(_, pair)| pair.fused > 0)
+        .map(|(op, _)| op.clone())
         .collect();
     live_admit_keys.sort();
 
@@ -674,6 +904,9 @@ pub fn run(params: &GradOracleParams) -> Result<GradOracleReport, Box<dyn std::e
         batched_forward: params.batched_forward,
         seed: params.seed,
         lora_dropout: 0.0,
+        lora_init: params.lora_init.as_flag().to_string(),
+        peft_step1_applied: params.lora_init == GradOracleLoraInit::PeftStep1
+            && params.lora_weights_in.is_none(),
         lora_weights_in: path_display(&params.lora_weights_in),
         lora_weights_out: path_display(&params.lora_weights_out),
         trainable_tensor_count: gradients.len(),
@@ -724,6 +957,7 @@ pub fn run(params: &GradOracleParams) -> Result<GradOracleReport, Box<dyn std::e
         kernels_disabled_requested,
         kernels_disabled_fired,
         live_admit_keys,
+        admit_key_dispatches,
         vacuous_tensor_count,
         vacuous_tensor_names,
         gradients,
@@ -771,7 +1005,7 @@ mod tests {
             // unchanged by this field's addition; the new
             // `LoraInitMode::Gaussian`-specific tests below override it
             // explicitly.
-            lora_init: jammi_lora::LoraInitMode::ZerosB,
+            lora_init: GradOracleLoraInit::ZerosB,
         }
     }
 
@@ -1149,7 +1383,7 @@ mod tests {
     #[test]
     fn grad_oracle_gaussian_init_makes_every_gradient_live() {
         let mut params = tiny_params();
-        params.lora_init = jammi_lora::LoraInitMode::Gaussian;
+        params.lora_init = GradOracleLoraInit::Gaussian;
         let report = run(&params).expect("grad-oracle run (Gaussian)");
 
         assert_eq!(
@@ -1167,6 +1401,57 @@ mod tests {
                 !grad_is_vacuous(&t.grad),
                 "{name}: report claims vacuous_tensor_count == 0 but this tensor's own gradient \
                  is (numerically) the zero vector"
+            );
+        }
+    }
+
+    /// The REALISTIC operating point (round-7 audit fix, PR #383):
+    /// `GradOracleLoraInit::PeftStep1` must ALSO make every gradient live
+    /// (the one real `AdamW` step moves `B` away from zero on this
+    /// fixture) and must set `peft_step1_applied` on the report.
+    #[test]
+    fn grad_oracle_peft_step1_makes_every_gradient_live() {
+        let mut params = tiny_params();
+        params.lora_init = GradOracleLoraInit::PeftStep1;
+        let report = run(&params).expect("grad-oracle run (PeftStep1)");
+
+        assert!(report.peft_step1_applied);
+        assert_eq!(report.lora_init, "peft-step1");
+        assert_eq!(
+            report.vacuous_tensor_count, 0,
+            "PeftStep1's one real AdamW step must move B away from zero, making dL/dA live too"
+        );
+        for (name, t) in &report.gradients {
+            assert!(
+                !grad_is_vacuous(&t.grad),
+                "{name}: report claims vacuous_tensor_count == 0 but this tensor's own gradient \
+                 is (numerically) the zero vector"
+            );
+        }
+    }
+
+    /// `PeftStep1`'s own weight-file round trip: TWO independent `run()`
+    /// calls at the SAME seed must produce BIT-IDENTICAL `peft_step1`
+    /// weights (the step-1 AdamW update is deterministic given the seed),
+    /// which in turn makes the SECOND step's loss/gradients bit-identical
+    /// too (CPU/F32 is deterministic) -- proving the internally-synthesized
+    /// weights file is not itself a source of run-to-run noise.
+    #[test]
+    fn grad_oracle_peft_step1_is_deterministic_given_the_same_seed() {
+        let mut params = tiny_params();
+        params.lora_init = GradOracleLoraInit::PeftStep1;
+        let first = run(&params).expect("first PeftStep1 run");
+        let second = run(&params).expect("second PeftStep1 run");
+        assert_eq!(first.loss, second.loss);
+        assert_eq!(
+            first.gradients.keys().collect::<Vec<_>>(),
+            second.gradients.keys().collect::<Vec<_>>()
+        );
+        for (name, t1) in &first.gradients {
+            let t2 = &second.gradients[name];
+            assert_eq!(
+                t1.grad, t2.grad,
+                "{name}: PeftStep1 gradients diverged across two runs at the SAME seed"
             );
         }
     }

@@ -21,7 +21,7 @@ fn model_dir() -> PathBuf {
         .join("../jammi-encoders/tests/fixtures/tiny_modernbert_head64")
 }
 
-fn base_command(model_dir: &Path, out: &Path, lora_init: &str) -> Command {
+fn base_command(model_dir: &Path, out: &Path, lora_init: &str, seeds: &str) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_jammi-bench"));
     cmd.args([
         "grad-oracle",
@@ -39,10 +39,10 @@ fn base_command(model_dir: &Path, out: &Path, lora_init: &str) -> Command {
         "Wqkv,Wo",
         "--backbone-dtype",
         "f32",
-        "--seed",
-        "11",
         "--lora-init",
         lora_init,
+        "--seeds",
+        seeds,
         "--ablate-each-op",
         "--out",
     ])
@@ -70,11 +70,12 @@ fn scratch_out(name: &str) -> PathBuf {
     ))
 }
 
-/// The load-bearing end-to-end case: a real `--ablate-each-op` run produces
-/// a report with `all_fused`, `f32_truth`, `all_off`, and at least one
-/// `ablate:<key>` arm, every arm's `vacuous_tensor_count == 0` and
-/// `unmatched_disables` empty, and `f32_truth` scores a cosine of
-/// (numerically) `1.0` against itself.
+/// The load-bearing end-to-end case (single seed, for CPU test speed): a
+/// real `--ablate-each-op` run produces a report with `all_fused`,
+/// `f32_truth`, `all_off`, and at least one `ablate:<key>` arm, every arm's
+/// `per_seed` samples carrying `vacuous_tensor_count == 0` and
+/// `unmatched_disables` empty, and `f32_truth` scores a `full_tensor_cosine`
+/// of (numerically) `1.0` against itself.
 #[test]
 fn ablate_each_op_end_to_end_on_cpu_fixture() {
     let dir = model_dir();
@@ -85,7 +86,7 @@ fn ablate_each_op_end_to_end_on_cpu_fixture() {
     );
     let out = scratch_out("report.json");
 
-    let output = base_command(&dir, &out, "gaussian")
+    let output = base_command(&dir, &out, "gaussian", "11")
         .output()
         .expect("spawn jammi-bench grad-oracle --ablate-each-op");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -99,6 +100,7 @@ fn ablate_each_op_end_to_end_on_cpu_fixture() {
     let report: serde_json::Value = serde_json::from_str(&text).expect("parse ablation report");
 
     assert_eq!(report["tool"], "jammi_grad_oracle_ablation");
+    assert_eq!(report["seeds"], serde_json::json!([11]));
     let arms = report["arms"].as_array().expect("arms array");
     let arm_names: Vec<&str> = arms
         .iter()
@@ -120,8 +122,6 @@ fn ablate_each_op_end_to_end_on_cpu_fixture() {
         !ablated_op_keys.is_empty(),
         "ablated_op_keys must be non-empty on this fixture"
     );
-    // Every declared ablated_op_key must have a matching arm, and vice
-    // versa for the per-op arms.
     let ablate_arm_keys: Vec<&str> = arm_names
         .iter()
         .filter_map(|n| n.strip_prefix("ablate:"))
@@ -143,31 +143,62 @@ fn ablate_each_op_end_to_end_on_cpu_fixture() {
         }
     );
 
+    // Every arm's classification is one of the documented labels, and the
+    // three structural arms carry the expected fixed label.
     for arm in arms {
         let name = arm["arm"].as_str().unwrap();
+        let classification = arm["classification"].as_str().unwrap();
+        match name {
+            "all_fused" => assert_eq!(classification, "reference"),
+            "f32_truth" => assert_eq!(classification, "truth"),
+            "all_off" => assert_eq!(classification, "control"),
+            _ => assert!(
+                classification == "neutral" || classification == "divergent",
+                "arm {name:?}: unexpected classification {classification:?}"
+            ),
+        }
+        let per_seed = arm["per_seed"].as_array().expect("per_seed array");
         assert_eq!(
-            arm["vacuous_tensor_count"], 0,
-            "arm {name:?} has a nonzero vacuous_tensor_count -- Gaussian init should make every \
-             gradient live on every arm"
+            per_seed.len(),
+            1,
+            "single-seed run must carry exactly 1 per_seed sample"
         );
-        assert!(
-            arm["unmatched_disables"]
-                .as_array()
-                .expect("unmatched_disables array")
-                .is_empty(),
-            "arm {name:?} has a non-empty unmatched_disables -- provenance not self-describing"
-        );
-        assert!(
-            arm["matched_tensor_count"].as_u64().unwrap() > 0,
-            "arm {name:?} matched zero tensors against f32_truth"
-        );
+        for sample in per_seed {
+            assert_eq!(
+                sample["vacuous_tensor_count"], 0,
+                "arm {name:?} has a nonzero vacuous_tensor_count -- Gaussian init should make \
+                 every gradient live on every arm"
+            );
+            assert!(
+                sample["unmatched_disables"]
+                    .as_array()
+                    .expect("unmatched_disables array")
+                    .is_empty(),
+                "arm {name:?} has a non-empty unmatched_disables -- provenance not self-describing"
+            );
+            assert!(
+                sample["matched_tensor_count"].as_u64().unwrap() > 0,
+                "arm {name:?} matched zero tensors against f32_truth"
+            );
+            assert!(
+                !sample["per_tensor"]
+                    .as_array()
+                    .expect("per_tensor array")
+                    .is_empty(),
+                "arm {name:?}: per_tensor rows must be committed (round-7 audit finding)"
+            );
+        }
+        // Single-seed run: median == min == max (a degenerate SeedStat).
+        let full = &arm["full_tensor_cosine"];
+        assert_eq!(full["median"], full["min"]);
+        assert_eq!(full["median"], full["max"]);
     }
 
     let f32_truth_arm = arms
         .iter()
         .find(|a| a["arm"] == "f32_truth")
         .expect("f32_truth arm");
-    let f32_truth_cosine = f32_truth_arm["overall_cosine_vs_f32_truth"]
+    let f32_truth_cosine = f32_truth_arm["full_tensor_cosine"]["median"]
         .as_f64()
         .unwrap();
     assert!(
@@ -181,7 +212,7 @@ fn ablate_each_op_end_to_end_on_cpu_fixture() {
     // at all -- the only source of divergence is kernel COMPOSITION, not
     // dtype). Expect near-perfect agreement, not merely "positive".
     let all_fused_arm = arms.iter().find(|a| a["arm"] == "all_fused").unwrap();
-    let all_fused_cosine = all_fused_arm["overall_cosine_vs_f32_truth"]
+    let all_fused_cosine = all_fused_arm["full_tensor_cosine"]["median"]
         .as_f64()
         .unwrap();
     assert!(
@@ -190,20 +221,90 @@ fn ablate_each_op_end_to_end_on_cpu_fixture() {
          {all_fused_cosine}"
     );
 
+    // derived_per_op_budget must be a finite, non-negative number (a
+    // single-seed run has a degenerate spread of exactly 0.0 -- max==min).
+    let budget = report["derived_per_op_budget"].as_f64().unwrap();
+    assert!(budget.is_finite() && budget >= 0.0, "budget={budget}");
+    assert_eq!(budget, 0.0, "single-seed spread must be exactly 0.0");
+
     let _ = std::fs::remove_file(&out);
 }
 
-/// NEGATIVE CONTROL (family F): `LoraInitMode::ZerosB` leaves `dL/dA`
-/// structurally vacuous, so an `--ablate-each-op` run at `--lora-init
-/// zeros-b` must REFUSE (nonzero exit, no report written) rather than
-/// silently emit a comparison that carries no evidence about half the
-/// adapter's own gradients.
+/// Multi-seed aggregation: three DIFFERENT seeds must each independently
+/// draw fresh weights/data (the `all_fused` arm's `per_seed` samples must
+/// not be bit-identical to each other), and the reported `full_tensor_cosine`
+/// `{median, min, max}` must be internally consistent with the raw
+/// `per_seed` values (never trust the aggregate without recomputing it
+/// here independently).
+#[test]
+fn ablate_each_op_multi_seed_aggregation_is_internally_consistent() {
+    let dir = model_dir();
+    let out = scratch_out("report-multiseed.json");
+
+    let output = base_command(&dir, &out, "gaussian", "101,102,103")
+        .output()
+        .expect("spawn jammi-bench grad-oracle --ablate-each-op --seeds 101,102,103");
+    assert!(
+        output.status.success(),
+        "multi-seed run failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let text = std::fs::read_to_string(&out).expect("read ablation report");
+    let report: serde_json::Value = serde_json::from_str(&text).expect("parse ablation report");
+    assert_eq!(report["seeds"], serde_json::json!([101, 102, 103]));
+
+    let arms = report["arms"].as_array().unwrap();
+    let all_fused = arms.iter().find(|a| a["arm"] == "all_fused").unwrap();
+    let per_seed = all_fused["per_seed"].as_array().unwrap();
+    assert_eq!(per_seed.len(), 3);
+    let seeds_seen: Vec<i64> = per_seed
+        .iter()
+        .map(|s| s["seed"].as_i64().unwrap())
+        .collect();
+    assert_eq!(seeds_seen, vec![101, 102, 103]);
+
+    let cosines: Vec<f64> = per_seed
+        .iter()
+        .map(|s| s["full_tensor_cosine"].as_f64().unwrap())
+        .collect();
+    let mut sorted = cosines.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let expected_min = sorted[0];
+    let expected_max = sorted[2];
+    let expected_median = sorted[1];
+
+    let agg = &all_fused["full_tensor_cosine"];
+    assert!((agg["min"].as_f64().unwrap() - expected_min).abs() < 1e-12);
+    assert!((agg["max"].as_f64().unwrap() - expected_max).abs() < 1e-12);
+    assert!((agg["median"].as_f64().unwrap() - expected_median).abs() < 1e-12);
+
+    // Different seeds (different weight draws) generally produce
+    // DIFFERENT losses across the three per_seed samples -- a fixture
+    // that ignored --seeds and reused the same weights/data every time
+    // would show all three losses identical.
+    let losses: Vec<f64> = per_seed
+        .iter()
+        .map(|s| s["loss"].as_f64().unwrap())
+        .collect();
+    assert!(
+        losses[0] != losses[1] || losses[1] != losses[2],
+        "all three seeds produced the IDENTICAL loss -- looks like --seeds is not actually \
+         varying the weights/data: {losses:?}"
+    );
+}
+
+/// NEGATIVE CONTROL (family F): `zeros-b` leaves `dL/dA` structurally
+/// vacuous, so an `--ablate-each-op` run at `--lora-init zeros-b` must
+/// REFUSE (nonzero exit, no report written) rather than silently emit a
+/// comparison that carries no evidence about half the adapter's own
+/// gradients.
 #[test]
 fn ablate_each_op_refuses_a_structurally_vacuous_fixture() {
     let dir = model_dir();
     let out = scratch_out("report-vacuous.json");
 
-    let output = base_command(&dir, &out, "zeros-b")
+    let output = base_command(&dir, &out, "zeros-b", "11")
         .output()
         .expect("spawn jammi-bench grad-oracle --ablate-each-op --lora-init zeros-b");
 
@@ -220,4 +321,55 @@ fn ablate_each_op_refuses_a_structurally_vacuous_fixture() {
         !out.exists(),
         "a REFUSED run must never write the --out report file"
     );
+}
+
+/// The `peft-step1` operating point (round-7 audit fix, PR #383): default
+/// under `--ablate-each-op` when `--lora-init` is omitted, and must ALSO
+/// produce a non-vacuous, successful run — proving the one real `AdamW`
+/// step actually moved `B` away from zero on this fixture.
+#[test]
+fn ablate_each_op_peft_step1_is_the_default_and_succeeds() {
+    let dir = model_dir();
+    let out = scratch_out("report-peftstep1.json");
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_jammi-bench"));
+    cmd.args([
+        "grad-oracle",
+        "--model-dir",
+        &dir.to_string_lossy(),
+        "--batch",
+        "3",
+        "--seq",
+        "6",
+        "--lora-rank",
+        "2",
+        "--lora-alpha",
+        "4",
+        "--target-modules",
+        "Wqkv,Wo",
+        "--backbone-dtype",
+        "f32",
+        "--seeds",
+        "11",
+        "--ablate-each-op",
+        // NOTE: no --lora-init at all -- must resolve to peft-step1.
+        "--out",
+    ])
+    .arg(&out);
+    cmd.env_remove("JAMMI_KERNELS_DISABLE");
+    cmd.env_remove("JAMMI_KERNELS_STRICT");
+
+    let output = cmd
+        .output()
+        .expect("spawn jammi-bench grad-oracle --ablate-each-op (no --lora-init)");
+    assert!(
+        output.status.success(),
+        "peft-step1 default run failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = std::fs::read_to_string(&out).expect("read ablation report");
+    let report: serde_json::Value = serde_json::from_str(&text).expect("parse ablation report");
+    assert_eq!(report["lora_init"], "peft-step1");
+
+    let _ = std::fs::remove_file(&out);
 }

@@ -8,19 +8,24 @@ workspace ships every publishable crate at the same
 
 ### Fixed
 - **Gradient clipping now follows `torch.nn.utils.clip_grad_norm_`'s
-  semantics (`jammi-ai`) — not bit-exact: three divergences, one of which
-  is ~1 ULP.** The
+  semantics (`jammi-ai`) — not bit-exact: two remaining divergences.** The
   device-side global-L2 gradient clip computes `clip_coef = min(1, max_norm /
   (total_norm + 1e-6))` and rescales every gradient UNCONDITIONALLY,
-  mirroring torch's own `_clip_grads_with_norm_`. Where it still parts ways
-  with torch, stated rather than papered over: the coefficient is computed
-  as `(total_norm + 1e-6).recip() * max_norm` (two `f32` roundings) against
-  torch's single division, so the two can differ by ~1 ULP; the global norm
-  is one `sqrt` over a fold of per-`Var` squared sums rather than torch's
-  norm-of-per-parameter-norms (bounded in `clip_gradients`'s doc); and for
-  a non-`f32` (bf16) gradient jammi upcasts to `f32`, folds and scales
-  there, and rounds back once, where torch keeps the whole computation in
-  the gradient's own dtype. The
+  mirroring torch's own `_clip_grads_with_norm_`. The coefficient now
+  matches torch's own ROUNDING COUNT too: `total_norm.affine(1.0, 1e-6)`
+  (one add) then a genuine `max_norm / denom` division (candle's `Div`
+  kernel, over a device-materialized `max_norm` scalar — candle has no
+  scalar-numerator `div`), not the reciprocal-then-multiply an earlier
+  revision used (two `f32` roundings where torch performs one — invisible
+  at the shipped `max_grad_norm = 1.0` default, since `x * 1.0` is exact,
+  but a real ~1 ULP divergence for any other `max_norm`; pinned by
+  `tests::rounding_count_fix_changes_the_result_only_when_max_norm_is_not_
+  one`). Where it still parts ways with torch, stated rather than papered
+  over: the global norm is one `sqrt` over a fold of per-`Var` squared sums
+  rather than torch's norm-of-per-parameter-norms (bounded in
+  `clip_gradients`'s doc); and for a non-`f32` (bf16) gradient jammi
+  upcasts to `f32`, folds and scales there, and rounds back once, where
+  torch keeps the whole computation in the gradient's own dtype. The
   previous (pre-device-clip) implementation was a parity defect: it skipped
   rescaling entirely whenever `total_norm <= max_norm` (a silent no-op torch
   never performs — torch always applies its computed coefficient, which is
@@ -34,6 +39,20 @@ workspace ships every publishable crate at the same
   per-`Var` host round-trip. See
   `crates/jammi-ai/src/fine_tune/optimizer.rs`'s module doc for the full
   derivation and citation.
+- **`regression_surface::untrained_quantile_head_collapses_to_mu_no_
+  separation`'s aggregate arm replaced with a paired sign-count arm
+  (`jammi-ai` tests).** The prior arm (a trimmed-mean margin over a 12-seed
+  sweep) had no resolving power at its operating point: a forced
+  1-ULP-of-`f32` clip-coefficient perturbation — orthogonal to any code
+  change, an unavoidable floating-point rounding choice — swung the
+  trimmed-mean aggregate 12-30% on both `main` and this branch (one seed
+  even sign-flipped). Replaced with a per-seed sign count
+  (`trained_sep[i] > zeroed_sep[i]`, i.e. `> 0.0`, since a zeroed head's
+  separation is exactly `0.0` on every seed by construction) against
+  `QUANTILE_SEP_UNTRAINED_POSITIVE_BAR`, which gave an IDENTICAL verdict
+  across five independent runs (main and this branch, clip formula before
+  and after the rounding-count fix, the 1-ULP mutant on and off, plus one
+  CI run) despite the same magnitude swings.
 - **The trainer's gradient-clip fold order is now reproducible across process
   invocations of the same seed (`jammi-ai`).** `TrainingLoop::run` and
   `parallel_train::train_loop` snapshotted their trainable `Var`s via

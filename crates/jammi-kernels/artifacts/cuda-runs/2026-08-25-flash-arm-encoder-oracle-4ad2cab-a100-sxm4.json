@@ -3,12 +3,7 @@
   "git_sha": "4ad2cabdcf3dedd6c8199bd691b619c8971428aa",
   "git_sha7": "4ad2cab",
   "branch": "perf/p6-fa2-dense",
-  "box": {
-    "gpu": "NVIDIA A100-SXM4-80GB",
-    "driver_version": "580.126.16",
-    "cuda_toolkit": "12.6.85",
-    "pod": "a100c"
-  },
+  "box": "a100c (NVIDIA A100-SXM4-80GB)",
   "gate_outcomes_this_session": {
     "cargo fmt -p jammi-kernels --check": "PASS",
     "cargo fmt -p jammi-encoders --check": "PASS",
@@ -93,14 +88,31 @@
   "block3_vram_attribution": {
     "reference_numbers_this_branch_already_committed": {
       "source": "crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-p6-b3-dense-b98f7e1-a100-sxm4.json",
-      "b8_s512_flash_peak_vram_bytes": [18943574016.0, 19312672768.0],
-      "b8_s512_block_peak_vram_bytes": [16997416960.0, 16594763776.0],
+      "b8_s512_flash_peak_vram_bytes": [
+        18943574016.0,
+        19312672768.0
+      ],
+      "b8_s512_block_peak_vram_bytes": [
+        16997416960.0,
+        16594763776.0
+      ],
       "delta_gb": "1.8-2.7 GB"
     },
     "dq_accum_measured_live_a100c": {
       "description": "Live-measured (not estimated) via jammi_kernels::flash::{CuSeqlens, dq_accum_splits, VarlenGeometry::dq_accum_len} at deterministic=true -- the ONE flash-only backward allocation this branch's own module doc already names.",
-      "b8_s512_h16": { "splits": 1, "dq_accum_len": 5242880, "bytes": 20971520, "mb": 20.97 },
-      "b24_s512_h16_sanity_check_vs_module_doc": { "splits": 1, "dq_accum_len": 15728640, "bytes": 62914560, "mb": 62.91, "module_doc_citation": "~63 MB at B=24,S=512 -- matches to within rounding, confirming the measurement methodology" },
+      "b8_s512_h16": {
+        "splits": 1,
+        "dq_accum_len": 5242880,
+        "bytes": 20971520,
+        "mb": 20.97
+      },
+      "b24_s512_h16_sanity_check_vs_module_doc": {
+        "splits": 1,
+        "dq_accum_len": 15728640,
+        "bytes": 62914560,
+        "mb": 62.91,
+        "module_doc_citation": "~63 MB at B=24,S=512 -- matches to within rounding, confirming the measurement methodology"
+      },
       "verdict": "dq_accum is real, flash-only, deterministic-backward VRAM, but at ~21 MB it is TWO ORDERS OF MAGNITUDE too small to explain the 1.8-2.7 GB b8-s512 delta. It is a confirmed, precisely-quantified contributor, NOT the dominant one."
     },
     "fused_masks_local_band_common_mode_waste": {
@@ -108,5 +120,19 @@
       "elimination_attempted": false,
       "why_not_attempted_this_round": "Skipping the build requires relaxing TWO separate, currently-unconditional, already-tested contract checks: (1) ModernBertAttention::forward's 'fused_masks required whenever self.training' typed-refusal (doc table + training_attention_forward_without_fused_masks_is_a_typed_refusal), and (2) forward_training_attention's 'is_local && local_band.is_none() -> Err' check, which fires BEFORE the flash-cascade decision is even consulted. A safe relaxation is possible (decide_flash_admission's outcome==Holds, combined with a side-effect-free replica of admission::op_is_disabled via the public disabled_ops_requested() getter, deterministically predicts every layer will dispatch Fused), but implementing and re-verifying it touches a widely-tested invariant this file's own 'KNOWN GAP, NOT FIXED THIS ROUND (P3 fix round 4, B4 -- deferred a THIRD time)' comment already flags as deferred twice by the original authors for the same reason: real (if small) error-path risk without pod-iteration budget to verify safely. Not attempted this round; flagged as an open item for the lead, not silently dropped."
     }
+  },
+  "schema_version": 1,
+  "box_detail": {
+    "gpu": "NVIDIA A100-SXM4-80GB",
+    "driver_version": "580.126.16",
+    "cuda_toolkit": "12.6.85",
+    "pod": "a100c"
+  },
+  "status": "GREEN",
+  "producer": {
+    "path": "crates/jammi-encoders/src/modernbert.rs",
+    "kind": "cargo-test",
+    "invocation": "cargo test -p jammi-encoders --lib --features cuda,flash-attn -- --exact modernbert::tests::flash_arm_encoder_level_three_way_oracle_dense_cuda_bf16",
+    "gating": "env:JAMMI_FLASH_ORACLE_MODEL_DIR"
   }
 }

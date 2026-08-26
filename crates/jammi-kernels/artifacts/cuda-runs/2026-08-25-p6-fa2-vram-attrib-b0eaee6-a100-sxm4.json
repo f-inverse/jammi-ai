@@ -5,10 +5,7 @@
   "after_git_sha": "b0eaee6710c979c6eb074c18c3d2b5d12ddd2de7",
   "after_git_sha7": "b0eaee6",
   "branch": "fix/p6-fa2-dense-vram-attrib (based on origin/perf/p6-fa2-dense @ 5f48839)",
-  "box": {
-    "gpu": "NVIDIA A100-SXM4-80GB",
-    "pod": "a100c (exclusive during timing)"
-  },
+  "box": "a100c (exclusive during timing) (NVIDIA A100-SXM4-80GB)",
   "harness": "jammi-bench finetune-step",
   "cli_common": {
     "model_dir": "/root/checkpoints/ModernBERT-large",
@@ -56,30 +53,62 @@
     "b8-s512": {
       "flash_arm": {
         "runs_before": [
-          { "file": "2026-08-25-p6-fa2-vram-attrib-b0eaee6-a100-sxm4-raw-runs/before_flash_r1.json", "s_per_step_p50": 0.460953305, "peak_vram_bytes": 18910019584.0 },
-          { "file": "2026-08-25-p6-fa2-vram-attrib-b0eaee6-a100-sxm4-raw-runs/before_flash_r2.json", "s_per_step_p50": 0.460006606, "peak_vram_bytes": 18910019584.0 }
+          {
+            "file": "2026-08-25-p6-fa2-vram-attrib-b0eaee6-a100-sxm4-raw-runs/before_flash_r1.json",
+            "s_per_step_p50": 0.460953305,
+            "peak_vram_bytes": 18910019584.0
+          },
+          {
+            "file": "2026-08-25-p6-fa2-vram-attrib-b0eaee6-a100-sxm4-raw-runs/before_flash_r2.json",
+            "s_per_step_p50": 0.460006606,
+            "peak_vram_bytes": 18910019584.0
+          }
         ],
         "runs_after": [
-          { "file": "2026-08-25-p6-fa2-vram-attrib-b0eaee6-a100-sxm4-raw-runs/after_flash_r1.json", "s_per_step_p50": 0.45983508, "peak_vram_bytes": 16393437184.0 },
-          { "file": "2026-08-25-p6-fa2-vram-attrib-b0eaee6-a100-sxm4-raw-runs/after_flash_r2.json", "s_per_step_p50": 0.459441973, "peak_vram_bytes": 16460546048.0 }
+          {
+            "file": "2026-08-25-p6-fa2-vram-attrib-b0eaee6-a100-sxm4-raw-runs/after_flash_r1.json",
+            "s_per_step_p50": 0.45983508,
+            "peak_vram_bytes": 16393437184.0
+          },
+          {
+            "file": "2026-08-25-p6-fa2-vram-attrib-b0eaee6-a100-sxm4-raw-runs/after_flash_r2.json",
+            "s_per_step_p50": 0.459441973,
+            "peak_vram_bytes": 16460546048.0
+          }
         ],
         "peak_vram_mean_before_bytes": 18910019584.0,
         "peak_vram_mean_after_bytes": 16426991616.0,
         "peak_vram_reduction_bytes": 2483027968.0,
         "peak_vram_reduction_gb": 2.483027968,
-        "peak_vram_reduction_fraction": 0.13130753022069424,
+        "peak_vram_reduction_fraction": 0.13130753022069425,
         "s_per_step_p50_mean_before_s": 0.4604799555,
         "s_per_step_p50_mean_after_s": 0.459638527,
         "s_per_step_note": "no meaningful change (expected -- this fix changes RETENTION, not the compute this op issues; the difference is within ordinary run-to-run noise)."
       },
       "block_arm_baseline_unchanged_code": {
         "runs_before": [
-          { "file": "2026-08-25-p6-fa2-vram-attrib-b0eaee6-a100-sxm4-raw-runs/before_block_r1.json", "s_per_step_p50": 0.67179871, "peak_vram_bytes": 16594763776.0 },
-          { "file": "2026-08-25-p6-fa2-vram-attrib-b0eaee6-a100-sxm4-raw-runs/before_block_r2.json", "s_per_step_p50": 0.671717567, "peak_vram_bytes": 16426991616.0 }
+          {
+            "file": "2026-08-25-p6-fa2-vram-attrib-b0eaee6-a100-sxm4-raw-runs/before_block_r1.json",
+            "s_per_step_p50": 0.67179871,
+            "peak_vram_bytes": 16594763776.0
+          },
+          {
+            "file": "2026-08-25-p6-fa2-vram-attrib-b0eaee6-a100-sxm4-raw-runs/before_block_r2.json",
+            "s_per_step_p50": 0.671717567,
+            "peak_vram_bytes": 16426991616.0
+          }
         ],
         "runs_after": [
-          { "file": "2026-08-25-p6-fa2-vram-attrib-b0eaee6-a100-sxm4-raw-runs/after_block_r1.json", "s_per_step_p50": 0.670999572, "peak_vram_bytes": 16594763776.0 },
-          { "file": "2026-08-25-p6-fa2-vram-attrib-b0eaee6-a100-sxm4-raw-runs/after_block_r2.json", "s_per_step_p50": 0.6723565, "peak_vram_bytes": 16661872640.0 }
+          {
+            "file": "2026-08-25-p6-fa2-vram-attrib-b0eaee6-a100-sxm4-raw-runs/after_block_r1.json",
+            "s_per_step_p50": 0.670999572,
+            "peak_vram_bytes": 16594763776.0
+          },
+          {
+            "file": "2026-08-25-p6-fa2-vram-attrib-b0eaee6-a100-sxm4-raw-runs/after_block_r2.json",
+            "s_per_step_p50": 0.6723565,
+            "peak_vram_bytes": 16661872640.0
+          }
         ],
         "peak_vram_mean_before_bytes": 16510877696.0,
         "peak_vram_mean_after_bytes": 16628318208.0,
@@ -106,5 +135,18 @@
     "cargo test -p jammi-kernels --features cuda,flash-attn --test cuda_parity (pod, JAMMI_REQUIRE_CUDA=1)": "PASS 82 passed, 1 ignored, 0 failed",
     "RUSTDOCFLAGS=-D warnings cargo doc -p jammi-kernels -p jammi-encoders --no-deps --features cuda,flash-attn (pod)": "PASS (one round: a public-fn doc comment linked a crate-private type and an out-of-scope bare bracket link -- fixed by converting to a backtick code span / a fully-qualified super:: link, never a doc-hidden bypass, per 7fd457e's precedent)"
   },
-  "what_remains": "the FusedAttentionMasks::build reordering (build only when the block arm will actually run, flash decision first) is NOT done this round -- disclosed as deferred in the fix commit, not silently dropped. Its VRAM cost is small (a few MB, built once per forward) relative to the ~2.5 GB this round closes. The residual after-fix flash/block gap (-0.20 GB, i.e. flash now slightly BELOW block, not the full ~1.8 GB theoretical saving) was not further decomposed between dq_accum's backward scratch and ordinary allocator fragmentation -- both are named candidates in the dispatch, neither is jammi's own wiring, and the SIGN is now correct."
+  "what_remains": "the FusedAttentionMasks::build reordering (build only when the block arm will actually run, flash decision first) is NOT done this round -- disclosed as deferred in the fix commit, not silently dropped. Its VRAM cost is small (a few MB, built once per forward) relative to the ~2.5 GB this round closes. The residual after-fix flash/block gap (-0.20 GB, i.e. flash now slightly BELOW block, not the full ~1.8 GB theoretical saving) was not further decomposed between dq_accum's backward scratch and ordinary allocator fragmentation -- both are named candidates in the dispatch, neither is jammi's own wiring, and the SIGN is now correct.",
+  "schema_version": 1,
+  "box_detail": {
+    "gpu": "NVIDIA A100-SXM4-80GB",
+    "pod": "a100c (exclusive during timing)"
+  },
+  "git_sha": "b0eaee6710c979c6eb074c18c3d2b5d12ddd2de7",
+  "status": "GREEN",
+  "producer": {
+    "path": "crates/jammi-encoders/src/modernbert.rs",
+    "kind": "cargo-test",
+    "invocation": "cargo test -p jammi-encoders --lib --features cuda,flash-attn -- --exact modernbert::tests::flash_vs_block_per_layer_vram_attribution_probe_cuda",
+    "gating": "env:JAMMI_FLASH_ORACLE_MODEL_DIR"
+  }
 }

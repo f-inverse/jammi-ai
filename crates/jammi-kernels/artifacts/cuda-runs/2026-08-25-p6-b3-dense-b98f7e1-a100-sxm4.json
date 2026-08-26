@@ -3,12 +3,7 @@
   "git_sha": "b98f7e1de35b5cfcac00325089fd5eeaf7c6259a",
   "git_sha7": "b98f7e1",
   "branch": "perf/p6-fa2-dense",
-  "box": {
-    "gpu": "NVIDIA A100-SXM4-80GB",
-    "driver_version": "580.126.16",
-    "cuda_toolkit": "12.6.85",
-    "pod": "a100c (exclusive during timing)"
-  },
+  "box": "a100c (exclusive during timing) (NVIDIA A100-SXM4-80GB)",
   "harness": "jammi-bench finetune-step",
   "cli_common": {
     "model_dir": "/root/checkpoints/ModernBERT-large",
@@ -249,7 +244,9 @@
               "peak_vram_bytes": 16426991616.0,
               "attention_block_flash_fused_dispatches": 0,
               "attention_block_fused_dispatches": 840,
-              "kernels_disabled_fired": ["attention_block_flash"]
+              "kernels_disabled_fired": [
+                "attention_block_flash"
+              ]
             },
             {
               "file": "a100b/b8_s512_block.r2.json",
@@ -257,7 +254,9 @@
               "peak_vram_bytes": 16292773888.0,
               "attention_block_flash_fused_dispatches": 0,
               "attention_block_fused_dispatches": 840,
-              "kernels_disabled_fired": ["attention_block_flash"]
+              "kernels_disabled_fired": [
+                "attention_block_flash"
+              ]
             }
           ]
         },
@@ -291,7 +290,9 @@
               "peak_vram_bytes": 3944742912.0,
               "attention_block_flash_fused_dispatches": 0,
               "attention_block_fused_dispatches": 840,
-              "kernels_disabled_fired": ["attention_block_flash"]
+              "kernels_disabled_fired": [
+                "attention_block_flash"
+              ]
             },
             {
               "file": "a100b/b8_s128_block.r2.json",
@@ -299,7 +300,9 @@
               "peak_vram_bytes": 3978297344.0,
               "attention_block_flash_fused_dispatches": 0,
               "attention_block_fused_dispatches": 840,
-              "kernels_disabled_fired": ["attention_block_flash"]
+              "kernels_disabled_fired": [
+                "attention_block_flash"
+              ]
             }
           ]
         }
@@ -310,8 +313,14 @@
           "flash_arm_p50_mean_of_2_s": 0.4631953345,
           "step_time_reduction_fraction": 0.3147766575157461,
           "flash_over_block_ratio": 0.6852233424842539,
-          "block_arm_peak_vram_bytes": [16426991616.0, 16292773888.0],
-          "flash_arm_peak_vram_bytes": [18071158784.0, 18406703104.0],
+          "block_arm_peak_vram_bytes": [
+            16426991616.0,
+            16292773888.0
+          ],
+          "flash_arm_peak_vram_bytes": [
+            18071158784.0,
+            18406703104.0
+          ],
           "note": "the SAME anomaly the a100c box's own numbers show: flash's peak_vram exceeds block's, opposite the theoretical direction (flash should retain LESS, not more) -- see this round's own fix artifact, 2026-08-25-p6-fa2-vram-attrib-<sha7>-a100-sxm4.json, for the attribution and the same-build before/after that closes it (measured on a100c; this a100b capture predates the fix and is cited here as further confirming evidence the regression was not a100c-specific)."
         },
         "b8-s128": {
@@ -319,10 +328,30 @@
           "flash_arm_p50_mean_of_2_s": 0.155804333,
           "step_time_reduction_fraction": 0.21689684639182552,
           "flash_over_block_ratio": 0.7831031536081745,
-          "block_arm_peak_vram_bytes": [3944742912.0, 3978297344.0],
-          "flash_arm_peak_vram_bytes": [4682940416.0, 4817158144.0]
+          "block_arm_peak_vram_bytes": [
+            3944742912.0,
+            3978297344.0
+          ],
+          "flash_arm_peak_vram_bytes": [
+            4682940416.0,
+            4817158144.0
+          ]
         }
       }
     }
+  },
+  "schema_version": 1,
+  "box_detail": {
+    "gpu": "NVIDIA A100-SXM4-80GB",
+    "driver_version": "580.126.16",
+    "cuda_toolkit": "12.6.85",
+    "pod": "a100c (exclusive during timing)"
+  },
+  "status": "GREEN",
+  "producer": {
+    "path": "crates/jammi-bench/src/finetune_step.rs",
+    "kind": "script",
+    "invocation": "jammi-bench finetune-step --model-dir /root/checkpoints/ModernBERT-large --batch 8 --steps 25 --warmup 5 --backbone-dtype bf16 --cuda 0 --seed 42 --batched-forward --target-modules Wqkv,Wo,Wi --lora-rank 8 --lora-alpha 16.0 --lora-dropout 0.05 (JAMMI_KERNELS_STRICT=1)",
+    "gating": "none"
   }
 }

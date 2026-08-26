@@ -105,5 +105,15 @@
         "unit": "bytes"
       }
     }
+  },
+  "schema_version": 1,
+  "git_sha": "b0eaee6710c979c6eb074c18c3d2b5d12ddd2de7",
+  "box": "a100c",
+  "status": "GREEN",
+  "producer": {
+    "path": "crates/jammi-bench/src/finetune_step.rs",
+    "kind": "script",
+    "invocation": "jammi-bench finetune-step --model-dir /root/checkpoints/ModernBERT-large --batch 8 --steps 25 --warmup 5 --backbone-dtype bf16 --cuda 0 --seed 42 --batched-forward --target-modules Wqkv,Wo,Wi --lora-rank 8 --lora-alpha 16.0 --lora-dropout 0.05 (JAMMI_KERNELS_STRICT=1)",
+    "gating": "none"
   }
 }

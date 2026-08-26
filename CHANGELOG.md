@@ -52,7 +52,8 @@ workspace ships every publishable crate at the same
   reproduction was never an eager-PARITY oracle, only a fused-kernel-vs-
   hand-derived-math check) now measure the fused kernel against that
   updated formula as bit-exact on their fixtures (previously bounded by a
-  stated ULP tolerance).
+  stated ULP tolerance). `closes_escape: esc-047-eager-ln-rope-double-rounds-at-bf16-boundary`
+  (`.jammi/escapes.jsonl`).
 
 ## [0.47.0] - 2026-07-17
 

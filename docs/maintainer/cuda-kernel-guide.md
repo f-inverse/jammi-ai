@@ -107,6 +107,19 @@ comparing anything.
 **3.8 No absolute ULP floor** in a discriminating assertion — a `k · ulp(max)` floor charges every
 element the allowance of the largest and hides exactly the divergence you are hunting.
 
+**3.9 No number without a producer.** A doc comment or `assert!` message that states a
+precise-looking measurement — a mismatch count (`5145/16384`), a percentage (`26% of elements`), a
+bare cosine (`0.796`) — reads as evidence, so a reader (or a fix agent citing it as ground truth)
+must be able to re-derive or re-locate it: cite the real producer inline, `see <test_fn>` /
+`printed by <test_fn>` (a real function, grep-verifiable) or `measured by <artifact path>` (a
+tracked file), or tag it `no-producer: <reason>` when the number is genuinely *derived*, not
+measured (e.g. `2^-7` bf16 ULP). `ci/scripts/check_doc_numbers_have_producers.py` enforces this
+over `crates/jammi-kernels/{src,tests}`, `crates/jammi-encoders/src`, `crates/jammi-lora/src`, and
+`crates/jammi-bench/src`, fail-closed with file:line and the offending number. The scan leg reports
+(advisory) until precision on main reaches >= 80% real; the self-test and only-shrinks legs are
+required — currently 33/69 = 47.8% real, 36/69 = 52.2% noise (see
+`ci/doc_number_allowlist_classification.md`).
+
 ## 4. Benchmarking
 
 Two levels, always both. HF's own warning: their RMSNorm was **1.88x isolated but ~6% end-to-end**,

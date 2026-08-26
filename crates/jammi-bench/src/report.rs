@@ -14,6 +14,10 @@ use serde::Serialize;
 
 use jammi_db::config::StoragePrecision;
 
+/// Workspace version this binary was built from, stamped into every report so a
+/// downstream gate can reject a cross-version comparison.
+const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// One harness invocation's full output.
 #[derive(Debug, Serialize)]
 pub struct Report {
@@ -24,10 +28,203 @@ pub struct Report {
     pub host: Host,
     /// Which subcommand produced this report.
     pub subcommand: &'static str,
+    /// This binary's own baked build-time identity — see [`Provenance`]'s
+    /// own doc. Present on every report (never conditionally omitted),
+    /// exactly like `engine_version`/`host`.
+    pub provenance: Provenance,
     /// The measured tiers. Each tier is a named bag of measurements; a tier
     /// not exercised by this subcommand is omitted entirely (absent, not null).
     pub tiers: Tiers,
 }
+
+impl Report {
+    /// Construct a report for `subcommand`, filling `engine_version`/`host`/
+    /// `provenance` from this process's own identity — the ONE constructor
+    /// unification contract C2.1 introduces to replace the 14 hand-written
+    /// `Report { engine_version: ENGINE_VERSION, host: Host::detect(), .. }`
+    /// literals `main.rs` carried before it (one place the three shared
+    /// fields are filled, not fourteen that could individually drift).
+    pub fn new(subcommand: &'static str, tiers: Tiers) -> Self {
+        let report = Self {
+            engine_version: ENGINE_VERSION,
+            host: Host::detect(),
+            subcommand,
+            provenance: Provenance::baked(),
+            tiers,
+        };
+        // K7-completeness, enforced on every real run — not only in a test
+        // that could itself drift from a future field rename (see
+        // `assert_identity_fields_present`'s own doc).
+        let value =
+            serde_json::to_value(&report.provenance).expect("serialize provenance for self-check");
+        assert_identity_fields_present(&value, REPORT_IDENTITY_FIELDS);
+        report
+    }
+}
+
+/// Verify every `(field, nullable)` entry in `fields` is present in `value`
+/// (a serialized report/tier/provenance object), and non-null where
+/// declared [`Nullable::NonNull`] — the RUNTIME enforcement half of the K7-
+/// completeness identity consts ([`FinetuneStepTier::IDENTITY_FIELDS`],
+/// `crate::grad_oracle::GradOracleReport::IDENTITY_FIELDS`,
+/// [`REPORT_IDENTITY_FIELDS`]). Called from `Report::new` (every emitted
+/// report), `finetune_step::run`, and `grad_oracle::run` — a producer's own
+/// declared identity contract is checked against its OWN emitted JSON on
+/// every real invocation, not only inside a `#[test]` fixture that could
+/// itself silently drift out of sync with a future field rename. Panics (a
+/// bug in THIS crate, never a caller input — see `finetune_step_identity_
+/// fields_are_emitted`/`grad_oracle_identity_fields_are_emitted` for the
+/// same check exercised as a `#[test]`), mirroring the `.expect(..)`-heavy
+/// posture every emit site already takes on its own serialization.
+pub fn assert_identity_fields_present(value: &serde_json::Value, fields: &[(&str, Nullable)]) {
+    let obj = value
+        .as_object()
+        .expect("identity-checked value must be a JSON object");
+    for (field, nullable) in fields {
+        let entry = obj
+            .get(*field)
+            .unwrap_or_else(|| panic!("IDENTITY_FIELDS names {field:?}, absent on this report"));
+        if *nullable == Nullable::NonNull {
+            assert!(
+                !entry.is_null(),
+                "{field:?} is declared NonNull but serialized as null"
+            );
+        }
+    }
+}
+
+/// This exact binary's build-time identity, baked by `build.rs` and read
+/// back here with `env!()` — a compile-time literal, NEVER a run-time
+/// `std::env::var`/`git` read (unification contract C1; `provenance_baked.rs`'s
+/// `runtime_env_and_cwd_are_inert` is the mechanical proof: re-running the
+/// same binary with a DIFFERENT `JAMMI_BUILD_SHA` in the environment, from a
+/// fresh `cwd`, yields a byte-identical [`Provenance`]).
+///
+/// One instance per process, shared by every emitted [`Report`] (at
+/// `report.provenance`) AND by the standalone `jammi-bench provenance`
+/// subcommand (`main.rs`'s `run_provenance`), so a shell producer
+/// (`stacked_sweep.sh`, `proof_artifact.py`) can cross-check `build_sha`
+/// against its own resolved sha BEFORE spending any wall-clock on a leg,
+/// rather than discovering a stale binary only after the fact.
+///
+/// The three fields [`REPORT_IDENTITY_FIELDS`] names — `build_sha`,
+/// `target`, `profile` — are what let a downstream K7-completeness reader
+/// (`ab_merge.py`'s leg-premise check, `check_cuda_run_artifacts.py`'s rule
+/// (g)) tell "these two legs ran the same code on the same target" apart
+/// from "these two legs merely both filled in the same COMPARISON tuple";
+/// `build_features` is measurement/provenance context (what this binary
+/// COULD dispatch), not part of that identity triple.
+#[derive(Debug, Serialize)]
+pub struct Provenance {
+    /// `<sha>`, `<sha>-dirty`, or the literal `"unknown"` — see `build.rs`'s
+    /// own module doc for the full precedence. NEVER asserted 40-hex by any
+    /// reader in this tree: a dev tree is legitimately dirty, or entirely
+    /// git-less (a packaged source tarball), and both are honest states,
+    /// not failures.
+    pub build_sha: &'static str,
+    /// Cargo's own `$TARGET` for this build (e.g.
+    /// `x86_64-unknown-linux-gnu`).
+    pub target: &'static str,
+    /// Cargo's own `$PROFILE` for this build (`debug` or `release`).
+    pub profile: &'static str,
+    /// Sorted, deduplicated linked-crate feature names this binary was
+    /// compiled with — see [`build_features`]'s own doc for why these are
+    /// cross-crate `const`s, never `CARGO_FEATURE_*`.
+    pub build_features: Vec<&'static str>,
+    /// The `Report` JSON shape version this struct's own introduction
+    /// bumped to (unification contract C2.1): `2`.
+    pub report_schema_version: u32,
+}
+
+impl Provenance {
+    /// Read this binary's baked identity. Every field is a compile-time
+    /// literal (`env!()`) or a linked-crate `const` — nothing here touches
+    /// the process environment or the filesystem at RUN time.
+    pub fn baked() -> Self {
+        Self {
+            build_sha: env!("JAMMI_BUILD_SHA"),
+            target: env!("JAMMI_BUILD_TARGET"),
+            profile: env!("JAMMI_BUILD_PROFILE"),
+            build_features: build_features(),
+            report_schema_version: 2,
+        }
+    }
+}
+
+/// The linked-crate feature facts baked into [`Provenance::build_features`] —
+/// sorted, deduplicated. Read as `const`s from the crate that actually OWNS
+/// each feature's resolution (`jammi_kernels::admission::{CUDA_COMPILED,
+/// FLASH_COMPILED}`), never `CARGO_FEATURE_*`: that family of env vars only
+/// ever reflects THIS crate's (`jammi-bench`'s) own `[features]` graph, and
+/// would silently miss `jammi-kernels`' actual cuda/flash-attn resolution —
+/// `jammi_kernels::admission::FLASH_COMPILED`'s own doc blesses exactly
+/// this cross-crate constant read for a process-identity report. `"bench-cuda"`
+/// is jammi-bench's OWN `cuda` feature (`Cargo.toml`'s `cuda = ["jammi-ai/cuda"]`,
+/// the on-GPU inference tier's own gate) — named distinctly from
+/// `jammi-kernels`' `"cuda"` so the two are never conflated: a build can
+/// have one on without the other (e.g. `jammi-bench` built with `--features
+/// cuda` while `jammi-kernels` itself resolved `cuda` off is impossible in
+/// practice given the dependency chain, but the two facts are still
+/// independently-sourced constants, not one flag standing in for both).
+///
+/// `pub(crate)`: `finetune_step.rs` calls this SAME function to fill
+/// `FinetuneStepTier::build_features` (a tier-level echo of this exact
+/// list, never a second, independently-drifting computation — see that
+/// field's own doc for why a raw leg needs this locally, not only via
+/// `report.provenance.build_features`).
+pub(crate) fn build_features() -> Vec<&'static str> {
+    let mut features = Vec::new();
+    if jammi_kernels::admission::CUDA_COMPILED {
+        features.push("cuda");
+    }
+    if jammi_kernels::admission::FLASH_COMPILED {
+        features.push("flash-attn");
+    }
+    if cfg!(feature = "cuda") {
+        features.push("bench-cuda");
+    }
+    features.sort_unstable();
+    features.dedup();
+    features
+}
+
+/// Whether a K7-completeness identity field may legitimately serialize as
+/// JSON `null`, and what that null MEANS when it does — never a bare
+/// "absent"/"producer predates this field" reading (unification contract
+/// P8/C3.3). A field with no [`NullMeans`](Nullable::NullMeans) entry is
+/// [`NonNull`](Nullable::NonNull): a null reading on it is itself a
+/// finding, not a legitimate state a downstream leg-premise check should
+/// silently accept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Nullable {
+    /// Must always be present and non-null on a valid report.
+    NonNull,
+    /// May be present-and-null, and when it is, means exactly this — e.g.
+    /// `max_grad_norm: null` means "no clip was applied", never "this
+    /// producer predates the clip determinant". Unconstructed on `main`
+    /// today (unification contract C3.4: `max_grad_norm` itself enters
+    /// `FinetuneStepTier::IDENTITY_FIELDS` only once PR #381 lands, and
+    /// `nvidia_driver_version`'s own `NullMeans` use lives on the PYTHON
+    /// side, `torch_finetune_step.py::TORCH_IDENTITY_FIELDS`) — kept here,
+    /// not deleted, because whichever of #381 and this phase lands second
+    /// is the one that constructs it, and the variant needs to already
+    /// exist for that rebase to be a one-line addition rather than a type
+    /// change.
+    #[allow(dead_code)]
+    NullMeans(&'static str),
+}
+
+/// The three [`Provenance`] fields every tier-level `IDENTITY_FIELDS` const
+/// appends (contract C3.1's "at the report level" half) — `build_sha`,
+/// `target`, `profile`. Declared once here so
+/// [`FinetuneStepTier::IDENTITY_FIELDS`] and
+/// [`crate::grad_oracle::GradOracleReport::IDENTITY_FIELDS`] both cite the
+/// SAME three names rather than each spelling them out independently.
+pub const REPORT_IDENTITY_FIELDS: &[(&str, Nullable)] = &[
+    ("build_sha", Nullable::NonNull),
+    ("target", Nullable::NonNull),
+    ("profile", Nullable::NonNull),
+];
 
 /// Host facts that contextualize a measurement.
 #[derive(Debug, Serialize)]
@@ -1366,6 +1563,15 @@ pub struct FinetuneStepTier {
     /// distinguishable between "this build cannot run flash at all" and
     /// "flash was compiled in but declined/disabled this run".
     pub flash_compiled: bool,
+    /// This tier's own echo of [`Provenance::build_features`] — sorted,
+    /// deduplicated linked-crate feature names this binary was compiled
+    /// with (`crate::report::build_features`, the SAME function
+    /// `Provenance::baked` calls, never a second copy). Carried directly on
+    /// the tier (not only via the wrapping `Report.provenance`) because a
+    /// STACKED/raw leg (unification contract C7 row 3a) IS this tier's own
+    /// JSON sub-object with a stamp — it has no `report.provenance` wrapper
+    /// to fall back on, so the tier stays self-describing on its own.
+    pub build_features: Vec<&'static str>,
     /// The `JAMMI_KERNELS_DISABLE` op keys this process REQUESTED (sorted,
     /// empty when the env var was unset or empty) —
     /// `jammi_kernels::admission::disabled_ops_requested`. Always present,
@@ -1416,6 +1622,57 @@ pub struct FinetuneStepTier {
     /// on a dedicated pod, an over-report on a shared GPU. Absent when
     /// `nvidia-smi` is not present.
     pub peak_vram_bytes: Measurement,
+}
+
+impl FinetuneStepTier {
+    /// K7-completeness: every field a downstream leg-premise check needs to
+    /// establish that two `finetune-step` legs measured the "same" thing —
+    /// a STRICT SUPERSET of `ci/scripts/perf/ab_merge.py`'s own
+    /// `FINETUNE_IDENTITY_FIELDS` COMPARISON tuple (14 entries, unification
+    /// contract C4.1: that tuple is UNCHANGED by this const — growing it
+    /// would invalidate every existing merge, since torch never emits the
+    /// Rust-only entries added here). The 14 comparison entries, plus five
+    /// K7-completeness additions the comparison tuple omits BY DESIGN
+    /// (provenance never compared cross-producer — see `ab_merge.py:43`'s
+    /// own doc): `device_name`, `kernels_disabled_requested`,
+    /// `kernels_disabled_fired`, `flash_compiled`, `build_features`.
+    ///
+    /// `max_grad_norm` enters this list ONLY once PR #381
+    /// (`perf/device-clip-narrow`) lands (contract C3.4) — `main` has no
+    /// such field on this tier today, so it is absent here entirely, never
+    /// present-and-null; whichever of #381 and this phase lands second
+    /// rebases and adds the entry.
+    ///
+    /// `ci/scripts/perf/test_identity_fields_subset.py` (contract C4.2)
+    /// parses `FINETUNE_IDENTITY_FIELDS` out of `ab_merge.py` and this
+    /// const out of this file's own source and asserts the Python tuple is
+    /// a SUBSET; `finetune_step_identity_fields_are_emitted` (below)
+    /// asserts every field named here is actually present on a real,
+    /// serialized tier.
+    pub const IDENTITY_FIELDS: &'static [(&'static str, Nullable)] = &[
+        // The 14 entries `ab_merge.py::FINETUNE_IDENTITY_FIELDS` compares —
+        // every one `NonNull` on this tier.
+        ("seed", Nullable::NonNull),
+        ("batch", Nullable::NonNull),
+        ("seq", Nullable::NonNull),
+        ("lora_rank", Nullable::NonNull),
+        ("lora_alpha", Nullable::NonNull),
+        ("lora_dropout", Nullable::NonNull),
+        ("margin", Nullable::NonNull),
+        ("target_modules", Nullable::NonNull),
+        ("batched_forward", Nullable::NonNull),
+        ("backbone_dtype", Nullable::NonNull),
+        ("steps_measured", Nullable::NonNull),
+        ("checkpoint_config_sha256", Nullable::NonNull),
+        ("checkpoint_weights_sha256", Nullable::NonNull),
+        ("checkpoint_weights_size_bytes", Nullable::NonNull),
+        // K7-completeness additions beyond the comparison tuple.
+        ("device_name", Nullable::NonNull),
+        ("kernels_disabled_requested", Nullable::NonNull),
+        ("kernels_disabled_fired", Nullable::NonNull),
+        ("flash_compiled", Nullable::NonNull),
+        ("build_features", Nullable::NonNull),
+    ];
 }
 
 /// The on-GPU throughput/latency tier: the engine's two GPU-model serving
@@ -1614,6 +1871,7 @@ mod tests {
             attention_block_flash_fused_dispatches: 0,
             attention_block_flash_declined_dispatches: 0,
             flash_compiled: jammi_kernels::admission::FLASH_COMPILED,
+            build_features: build_features(),
             kernels_disabled_requested: Vec::new(),
             kernels_disabled_fired: Vec::new(),
             s_per_step_p50: Measurement::measured(0.01, "s"),
@@ -1653,6 +1911,7 @@ mod tests {
             "batch",
             "batched_forward",
             "backbone_dtype",
+            "build_features",
             "checkpoint_config_sha256",
             "checkpoint_weights_sha256",
             "checkpoint_weights_size_bytes",
@@ -1694,5 +1953,54 @@ mod tests {
         ];
         expected.sort_unstable();
         assert_eq!(keys, expected);
+    }
+
+    /// Unification contract C3.1/C3.4: every field named in
+    /// `FinetuneStepTier::IDENTITY_FIELDS` must actually be present on a
+    /// real, serialized tier, and a field declared [`Nullable::NonNull`]
+    /// must not read `null`. RED at base: `IDENTITY_FIELDS` does not exist
+    /// on `main`, so this test fails to COMPILE (a `const` reference to a
+    /// name that is not there), not merely to assert — the strongest RED
+    /// shape this repo's own K7-completeness discipline can produce.
+    #[test]
+    fn finetune_step_identity_fields_are_emitted() {
+        let tier = sample_finetune_step_tier();
+        let value = serde_json::to_value(&tier).expect("serialize FinetuneStepTier");
+        let obj = value.as_object().expect("object");
+        for (field, nullable) in FinetuneStepTier::IDENTITY_FIELDS {
+            let entry = obj
+                .get(*field)
+                .unwrap_or_else(|| panic!("IDENTITY_FIELDS names {field:?}, absent on the tier"));
+            if *nullable == Nullable::NonNull {
+                assert!(
+                    !entry.is_null(),
+                    "{field:?} is declared NonNull but serialized as null"
+                );
+            }
+        }
+    }
+
+    /// The report-level twin of the test above: `REPORT_IDENTITY_FIELDS`'
+    /// three entries must all be present, non-null, under `report.provenance`
+    /// of a real `Report`.
+    #[test]
+    fn report_identity_fields_are_emitted_under_provenance() {
+        let report = Report::new("finetune-step", Tiers::default());
+        let value = serde_json::to_value(&report).expect("serialize Report");
+        let provenance = value
+            .get("provenance")
+            .and_then(|p| p.as_object())
+            .expect("report.provenance object");
+        for (field, nullable) in REPORT_IDENTITY_FIELDS {
+            let entry = provenance.get(*field).unwrap_or_else(|| {
+                panic!("REPORT_IDENTITY_FIELDS names {field:?}, absent under report.provenance")
+            });
+            if *nullable == Nullable::NonNull {
+                assert!(
+                    !entry.is_null(),
+                    "provenance.{field} is declared NonNull but serialized as null"
+                );
+            }
+        }
     }
 }

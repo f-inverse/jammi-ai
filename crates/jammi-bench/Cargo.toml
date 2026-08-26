@@ -7,6 +7,11 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
+# Bakes this binary's build-time identity (`JAMMI_BUILD_SHA`/`JAMMI_BUILD_TARGET`/
+# `JAMMI_BUILD_PROFILE`) into compile-time env vars `report::Provenance::baked`
+# reads back with `env!()` — never at run time (unification contract C1; see
+# `build.rs`'s own module doc).
+build = "build.rs"
 
 [[bin]]
 name = "jammi-bench"

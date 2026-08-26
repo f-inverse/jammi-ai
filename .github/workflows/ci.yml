@@ -800,6 +800,19 @@ jobs:
           # zero-execution gap as `compare_grad_oracle`'s suite above.
           - name: perf ab_merge suite
             cmd: python3 ci/scripts/perf/test_ab_merge.py
+          # Unification contract C4.2 (unit 61 phase 1): `ab_merge.py`'s
+          # `FINETUNE_IDENTITY_FIELDS` and `compare_grad_oracle.py`'s
+          # `RUN_IDENTITY_FIELDS` — the two jammi-vs-torch COMPARISON tuples,
+          # UNCHANGED by this unit (C4.1) — must each be a SUBSET of the
+          # corresponding Rust K7-completeness const
+          # (`FinetuneStepTier::IDENTITY_FIELDS` /
+          # `GradOracleReport::IDENTITY_FIELDS`, `crates/jammi-bench/src/
+          # report.rs` / `grad_oracle.rs`). Stdlib-only, a regex scan over
+          # tracked `.rs` source (never `cargo`/`rustc`) plus a direct import
+          # of the two Python modules — no network, no build, same footing
+          # every other `perf/test_*.py` leg in this matrix takes.
+          - name: identity fields subset
+            cmd: python3 ci/scripts/perf/test_identity_fields_subset.py
           # `torch_grad_oracle.py`'s NAME-TRANSLATION suite (F6): stdlib-
           # only, importable without torch installed (that module's own
           # `import torch_finetune_step as tfs` succeeds torch-free because

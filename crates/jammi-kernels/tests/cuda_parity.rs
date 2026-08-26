@@ -6065,7 +6065,7 @@ fn three_way_vs_f32_reference(
     // this amplitude, so a single-step comparison cannot see it; it only
     // separates from noise by compounding through depth). This assertion
     // exists to catch a GROSS regression at the op level (a wrong
-    // transpose, a dropped scale) that would blow past ordinary bf16
+    // transpose, K left unrotated) that would blow past ordinary bf16
     // noise even at a single step — generous on purpose.
     const GROSS_REGRESSION_MULTIPLE: f64 = 8.0;
     const GROSS_REGRESSION_FLOOR: f64 = 0.05;
@@ -6078,7 +6078,7 @@ fn three_way_vs_f32_reference(
             fused_rel.is_finite() && fused_rel <= bound,
             "{name} {label}: fused's rel_l2 vs the F32 reference ({fused_rel:e}) exceeds \
              {GROSS_REGRESSION_MULTIPLE}x eager's own ({eager_rel:e}) + {GROSS_REGRESSION_FLOOR} \
-             — a gross regression (wrong transpose, dropped scale), not ordinary bf16 rounding"
+             — a gross regression (wrong transpose, K left unrotated), not ordinary bf16 rounding"
         );
     }
 }
@@ -6198,6 +6198,19 @@ fn max_abs_diff_finite_first(label: &str, a: &[f32], b: &[f32]) -> f64 {
 /// a dense uniform-length `CuSeqlens` concatenates each batch's `seq`
 /// tokens contiguously, batch-major — the SAME ordering the reshape below
 /// assumes without moving any element.
+///
+/// `k_unrotated`: the SAME injection mechanism `jammi-encoders`'
+/// `FlashFault::KUnrotated` uses (`crates/jammi-encoders/src/modernbert.rs`,
+/// `forward_hidden_flash_with_fault`) — pre-apply the INVERSE rotation
+/// (`RopePositionsFused::new(seq, true)`, `negate_sin: true`) to the WHOLE
+/// packed `qkv`, then splice ONLY the inverse-rotated K slot back in
+/// alongside the original (still-to-be-rotated) Q and V. The flash op's
+/// own forward RoPE rotation then rotates that pre-inverted K forward
+/// again, cancelling exactly and leaving K exactly as it was BEFORE any
+/// rotation — observably identical to a `slot == 2` -> `slot >= 1` kernel
+/// mutant, without editing the op or its kernel. `false` (the default for
+/// every existing caller) performs no injection at all: `qkv_for_op ==
+/// qkv`, byte-identical to this function's prior behavior.
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "flash-attn")]
 fn flash_bwd_fused(
@@ -6211,9 +6224,10 @@ fn flash_bwd_fused(
     head_dim: usize,
     scale: f32,
     window: Option<usize>,
+    k_unrotated: bool,
 ) -> (Vec<f32>, Vec<f32>) {
     use jammi_kernels::flash::{CuSeqlens, VarlenConfig};
-    use jammi_kernels::ops::flash_attention_varlen_with_rope;
+    use jammi_kernels::ops::{flash_attention_varlen_with_rope, RopePositionsFused};
 
     let cuda_dev = match cuda {
         Device::Cuda(dev) => dev,
@@ -6229,6 +6243,25 @@ fn flash_bwd_fused(
     let sin = rope_pack.narrow(0, 1, 1).unwrap();
     let dy = cast(Tensor::from_slice(dy_v, (batch, seq, heads * head_dim), cuda).unwrap());
 
+    let qkv_for_op: Tensor = if k_unrotated {
+        let q_orig = qkv.as_tensor().narrow(1, 0, 1).unwrap();
+        let v_orig = qkv.as_tensor().narrow(1, 2, 1).unwrap();
+        let inv = apply3(
+            qkv.as_tensor(),
+            &cos,
+            &sin,
+            RopePositionsFused::new(seq, true),
+        )
+        .unwrap();
+        let k_inv = inv.narrow(1, 1, 1).unwrap();
+        Tensor::cat(&[&q_orig, &k_inv, &v_orig], 1)
+            .unwrap()
+            .contiguous()
+            .unwrap()
+    } else {
+        qkv.as_tensor().clone()
+    };
+
     let lengths = vec![seq; batch];
     let cu_seqlens = CuSeqlens::from_lengths(&lengths, cuda_dev).unwrap();
     let cfg = VarlenConfig {
@@ -6236,8 +6269,8 @@ fn flash_bwd_fused(
         window: window.map(|w| w as u32),
         deterministic: true,
     };
-    let o = flash_attention_varlen_with_rope(qkv.as_tensor(), &cos, &sin, seq, &cu_seqlens, &cfg)
-        .unwrap();
+    let o =
+        flash_attention_varlen_with_rope(&qkv_for_op, &cos, &sin, seq, &cu_seqlens, &cfg).unwrap();
     let out = o.reshape((batch, seq, heads * head_dim)).unwrap();
     let loss = (&out * &dy).unwrap().sum_all().unwrap();
     let grads = loss.backward().unwrap();
@@ -6282,10 +6315,22 @@ enum FlashFixtureKind {
 
 /// One shape's full measurement: builds `(qkv, rope, mask, dy)` once,
 /// runs the flash op (with `flash_window` — normally `== window`, and
-/// `flash_scale` — normally `None`, meaning "use the SAME production
-/// scale the reference/eager legs use" — each a DIFFERENT value only for
-/// one of the two RED controls below), the BF16 eager composition, and
-/// the F32 reference, all from the SAME fixture.
+/// `k_unrotated` — normally `false`, meaning "feed the flash op's own
+/// forward rotation the SAME qkv the reference/eager legs' RoPE application
+/// sees" — each a DIFFERENT value only for one of the RED controls below),
+/// the BF16 eager composition, and the F32 reference, all from the SAME
+/// fixture. `flash_scale` (normally `None`, meaning "use the SAME
+/// production scale the reference/eager legs use") is still threaded
+/// through, but no op-level RED control here exercises it: a dropped
+/// softmax scale (`flash_scale = Some(1.0)`) is a bounded convex
+/// combination of V, so it is NOT visible to this op-level magnitude
+/// bound — measured on a100c, `softmax_scale=1.0` gave out max|Δ|=85.0
+/// against a 2x bound of 115.8 and dqkv max|Δ|=2496 against a 3x bound of
+/// 4272, both INSIDE bound (ledger row 344). That defect class IS caught
+/// by the encoder-level three-way oracle (20.9x/70x over bound,
+/// `jammi-encoders::modernbert::flash_arm_encoder_level_oracle_red_
+/// control_bad_softmax_scale`), which is why the op-level RED control here
+/// exercises `k_unrotated` instead.
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "flash-attn")]
 fn measure_flash_upstream_form(
@@ -6297,6 +6342,7 @@ fn measure_flash_upstream_form(
     window: Option<usize>,
     flash_window: Option<usize>,
     flash_scale: Option<f32>,
+    k_unrotated: bool,
     seed: u64,
     fixture_kind: FlashFixtureKind,
 ) -> FlashUpstreamMeasurement {
@@ -6339,6 +6385,7 @@ fn measure_flash_upstream_form(
         head_dim,
         flash_scale.unwrap_or(scale),
         flash_window,
+        k_unrotated,
     );
     let (out_eager, dqkv_eager) = attention_block_bwd_production_eager_reference(
         cuda,
@@ -6369,7 +6416,7 @@ fn measure_flash_upstream_form(
 
     let label = format!(
         "shape=({batch},{seq},{heads},{head_dim}) window={window:?} flash_window={flash_window:?} \
-         flash_scale={flash_scale:?}"
+         flash_scale={flash_scale:?} k_unrotated={k_unrotated}"
     );
     let m = FlashUpstreamMeasurement {
         out_fused_max: max_abs_diff_finite_first(
@@ -6440,6 +6487,7 @@ fn flash_upstream_acceptance_form_vs_f32_reference_dense_cuda() {
                         window,
                         window,
                         None,
+                        false,
                         seed,
                         fixture_kind,
                     );
@@ -6499,6 +6547,7 @@ fn flash_upstream_acceptance_form_red_control_window_radius_zero_cuda() {
         Some(64),
         Some(0),
         None,
+        false,
         74,
         FlashFixtureKind::SmoothAmplitude(12.0),
     );
@@ -6517,18 +6566,26 @@ fn flash_upstream_acceptance_form_red_control_window_radius_zero_cuda() {
     );
 }
 
-/// RED control: the FLASH leg's own `softmax_scale` DROPPED (fed `1.0`
-/// instead of the real `1 / sqrt(head_dim) = 0.125`, the "forgot to scale"
-/// defect class) while the reference/eager side keeps the real scale —
-/// must VIOLATE the upstream bound (out, dqkv, or both). An unscaled
-/// `q @ k^T` product is `8x` too large at `head_dim=64`
-/// (`sqrt(64) = 8`), which saturates the softmax onto whichever position
-/// has the single largest raw dot product per row — a qualitatively
-/// different attention distribution the 2x/3x upstream bound is not built
-/// to absorb.
+/// RED control: the FLASH leg's own K slot NOT RoPE-rotated (the SAME
+/// `slot == 2` -> `slot >= 1` kernel mutant `jammi-encoders`'
+/// `FlashFault::KUnrotated` models at the encoder level — see
+/// `flash_bwd_fused`'s own doc for the injection mechanism this control
+/// reuses) while the reference/eager side keeps K correctly rotated —
+/// must VIOLATE the upstream bound (out, dqkv, or both).
+///
+/// WITHDRAWN (ledger row 344): an earlier revision of this control dropped
+/// the FLASH leg's `softmax_scale` to `1.0` instead. Measured on a100c,
+/// that perturbation was VACUOUS at this op-level magnitude bound: out
+/// max|Δ|=85.0 stayed under the 2x bound of 115.8, and dqkv max|Δ|=2496
+/// stayed under the 3x bound of 4272 — a dropped softmax scale still
+/// yields a bounded convex combination of V, so magnitude alone can't see
+/// it. That defect class IS caught by the encoder-level three-way oracle
+/// (20.9x/70x over bound,
+/// `jammi-encoders::modernbert::flash_arm_encoder_level_oracle_red_
+/// control_bad_softmax_scale`), so it is covered there rather than here.
 #[test]
 #[cfg(feature = "flash-attn")]
-fn flash_upstream_acceptance_form_red_control_scale_dropped_cuda() {
+fn flash_upstream_acceptance_form_red_control_k_unrotated_cuda() {
     let Some(cuda) = cuda_device() else {
         return;
     };
@@ -6540,16 +6597,16 @@ fn flash_upstream_acceptance_form_red_control_scale_dropped_cuda() {
         64,
         Some(64),
         Some(64),
-        Some(1.0),
-        75,
+        None,
+        true,
+        76,
         FlashFixtureKind::SmoothAmplitude(12.0),
     );
     assert!(
         !m.out_ok() || !m.dqkv_ok(),
-        "flash softmax_scale dropped to 1.0 (real value 0.125) must VIOLATE the upstream bound \
-         on at least one leg -- out fused={:e} eager={:e} bound(2x)={:e}; dqkv fused={:e} \
-         eager={:e} bound(3x)={:e} -- if this assertion fails, the healthy oracle above would \
-         NOT have caught this defect",
+        "flash K slot left unrotated must VIOLATE the upstream bound on at least one leg -- out \
+         fused={:e} eager={:e} bound(2x)={:e}; dqkv fused={:e} eager={:e} bound(3x)={:e} -- if \
+         this assertion fails, the healthy oracle above would NOT have caught this defect",
         m.out_fused_max,
         m.out_eager_max,
         2.0 * m.out_eager_max,

@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "unit": "cuda-parity-discriminating-backward",
+  "git_sha": "f9227a414f912ef34213792e187678198746ea87",
+  "date": "2026-08-26T08:36:46Z",
+  "box": "jammi-a100c (A100 80GB PCIe, driver 570)",
+  "driver": "570.172.08",
+  "gpu": "NVIDIA A100 80GB PCIe",
+  "nvcc": "Cuda compilation tools, release 12.6, V12.6.85",
+  "features": "cuda",
+  "status": "GREEN",
+  "producer": {
+    "path": "crates/jammi-kernels/tests/cuda_parity.rs",
+    "kind": "cargo-test",
+    "invocation": "JAMMI_REQUIRE_CUDA=1 cargo test -p jammi-kernels --features cuda --release --test cuda_parity -- --exact attention_block_bwd_parity_f32_global_s512_cuda",
+    "gating": "required-features"
+  },
+  "note": "Class-2 pod gates for PR #386 (test/cuda-parity-discriminating-backward). git_sha names the tip the gates below actually ran against, on jammi-a100c; this artifact is committed as the next commit on the same branch, so git_sha is its own parent, not itself.",
+  "gates_run_on_this_worktree_tip": {
+    "cargo_clippy_cuda": "cargo clippy -p jammi-kernels --all-targets --features cuda -- -D warnings -- PASS, 0 warnings/errors, `Finished \\`dev\\` profile [unoptimized + debuginfo] target(s) in 2m 03s` (this pod, CARGO_TARGET_DIR=/root/target-class2)"
+  },
+  "cuda_parity_full_suite": {
+    "invocation": "JAMMI_REQUIRE_CUDA=1 cargo test -p jammi-kernels --features cuda --release --test cuda_parity -- --nocapture",
+    "passed": 85,
+    "failed": 0,
+    "ignored": 1,
+    "measured": 0,
+    "filtered_out": 0,
+    "wall_time_reported_by_cargo": "14.02s (GPU shared with a concurrent build job on this pod -- not a timing claim)"
+  },
+  "assert_bound_discriminates_sites": {
+    "helper": "assert_bound_discriminates(reference, actual, bound_fn, margin_fn, label) in crates/jammi-kernels/tests/cuda_parity.rs:286",
+    "static_call_site_count": 25,
+    "mechanism": "each call first asserts the clean (unperturbed) comparison is 0 violations against bound_fn, then pushes the reference's largest-magnitude paired actual value to bound_fn(reference)+1ulp and asserts the SAME bound now catches exactly 1 violation; either assert_eq! panicking would fail its enclosing #[test] -- all 85 passing on this run is the proof every one of the 25 sites held both halves (clean=0, red=1) on this box",
+    "labels_by_source_line": [
+      { "line": 453, "label": "axpy bf16 fwd" },
+      { "line": 655, "label": "ln f32 fwd" },
+      { "line": 722, "label": "ln f32 dx" },
+      { "line": 743, "label": "ln f32 dgamma" },
+      { "line": 802, "label": "ln bf16 fwd" },
+      { "line": 841, "label": "ln bf16 dx" },
+      { "line": 860, "label": "ln bf16 dgamma" },
+      { "line": 1091, "label": "rope f32 fwd" },
+      { "line": 1141, "label": "rope f32 dx" },
+      { "line": 1190, "label": "rope bf16 fwd" },
+      { "line": 1217, "label": "rope bf16 dx" },
+      { "line": 1573, "label": "softmax bf16 fwd" },
+      { "line": 1621, "label": "softmax bf16 dscores" },
+      { "line": 1961, "label": "softmax scale bf16 fwd" },
+      { "line": 2012, "label": "softmax scale bf16 dscores" },
+      { "line": 2301, "label": "geglu f32 fwd" },
+      { "line": 2354, "label": "geglu f32 dwi_out" },
+      { "line": 2419, "label": "geglu bf16 fwd" },
+      { "line": 2457, "label": "geglu bf16 dwi_out" },
+      { "line": 2681, "label": "scaled_cast_add f32 fwd" },
+      { "line": 2740, "label": "scaled_cast_add f32 d_base" },
+      { "line": 2755, "label": "scaled_cast_add f32 d_lora" },
+      { "line": 2814, "label": "scaled_cast_add bf16-base fwd" },
+      { "line": 5348, "label": "attention_block f32 fwd" },
+      { "line": 5386, "label": "attention_block f32 dqkv" }
+    ],
+    "note_on_the_task_briefs_26_count": "the brief cited 26 sites; a static grep for the helper name over-counts by 1 because it also matches the `fn assert_bound_discriminates(` definition itself at line 286 -- 25 is the real call-site count, and it matches PR #386's own per-leg table row totals (1+3+3+2+2+2+2+2+2+3+1+2=25) exactly."
+  },
+  "explicit_red_control_tests_with_printed_mismatch_counts": [
+    {
+      "name": "adamw_step_fma_contracted_red_control_diverges_from_eager_cuda",
+      "status": "ok",
+      "printed": "adamw_step_fma_contracted_red_control_diverges_from_eager_cuda: 4172/16384 elements differ (RED control, expected > 0)"
+    },
+    {
+      "name": "cast_add_bit_identical_to_the_eager_two_kernel_chain_on_cuda_with_red_control",
+      "status": "ok",
+      "printed": "no per-element mismatch count printed by this test (assertion-only); test itself passed"
+    }
+  ],
+  "per_leg_printed_diagnostics_attention_bf16_three_way": [
+    "THREEWAY fused_bf16_vs_ref out shape=(1,512,16,64) amp=12: max|Δ|=3.7329144e1 rel_l2=8.077845605294395e-3",
+    "THREEWAY eager_bf16_vs_ref out shape=(1,512,16,64) amp=12: max|Δ|=3.7329144e1 rel_l2=8.077845605294395e-3",
+    "THREEWAY fused_bf16_vs_ref dqkv shape=(1,512,16,64) amp=12: max|Δ|=3.38e2 rel_l2=2.081640218289164e1",
+    "THREEWAY eager_bf16_vs_ref dqkv shape=(1,512,16,64) amp=12: max|Δ|=3.38e2 rel_l2=2.081640218289164e1",
+    "THREEWAY fused_bf16_vs_ref out shape=(8,512,16,64) amp=12: max|Δ|=5.6205425e1 rel_l2=1.371845462265913e-2",
+    "THREEWAY eager_bf16_vs_ref out shape=(8,512,16,64) amp=12: max|Δ|=5.6205425e1 rel_l2=1.371845462265913e-2",
+    "THREEWAY fused_bf16_vs_ref dqkv shape=(8,512,16,64) amp=12: max|Δ|=9.4e2 rel_l2=8.918082990586338e0",
+    "THREEWAY eager_bf16_vs_ref dqkv shape=(8,512,16,64) amp=12: max|Δ|=9.4e2 rel_l2=8.918082990586338e0",
+    "attention_block bf16 leg fused-vs-eager dqkv window=Some(64) shape=(2,512,16,64) S_max=3.7875957e0 V_max=1e0: max|Δ|=0e0 max|signal|=1.9238281e-1 max_bound=7.8125e-3 Δ/signal=0e0 worst Δ/bound=0e0"
+  ]
+}

@@ -1,0 +1,152 @@
+{
+  "tool": "torch_finetune_step",
+  "provenance": {
+    "date_utc": "2026-08-26T10:13:45.018773+00:00",
+    "git_rev": "eee7e6a91b25221de7d72df30e42fdc7412ab42d",
+    "torch_version": "2.13.0+cu126",
+    "torch_cuda_version": "12.6",
+    "transformers_version": "5.15.1",
+    "peft_version": "0.20.0",
+    "python_version": "3.10.20",
+    "cuda_available": true,
+    "device_name": "NVIDIA A100 80GB PCIe",
+    "nvidia_driver_version": "570.172.08",
+    "fast_path_globals": {
+      "cuda_matmul_allow_tf32": false,
+      "cudnn_allow_tf32": false,
+      "cudnn_benchmark": false,
+      "float32_matmul_precision": "highest"
+    }
+  },
+  "args": {
+    "model_dir": "/root/checkpoints/ModernBERT-large",
+    "dry_run": false,
+    "batch": 16,
+    "seq": 512,
+    "steps": 25,
+    "warmup": 5,
+    "lora_rank": 16,
+    "lora_alpha": 32.0,
+    "lora_dropout": 0.0,
+    "lora_init": "peft",
+    "target_modules": "Wqkv,Wo,Wi",
+    "dtype": "bf16",
+    "attn_requested": "sdpa",
+    "cuda": 0,
+    "seed": 42,
+    "batched_forward": true,
+    "margin": 0.3,
+    "adamw_foreach": false,
+    "moment_warmup_step_executed": true
+  },
+  "finetune_step": {
+    "device": "cuda:0",
+    "backbone_dtype": "bf16",
+    "checkpoint_config_sha256": "55dca68059e98f0debf8eb63ab355c451c65b1f5d90fdca4754113fdaadd2cca",
+    "checkpoint_weights_sha256": "44510fec5d3a81a1877f225637b869495f18e55f6f23a09abb9be0acc030295f",
+    "checkpoint_weights_size_bytes": 1583544840,
+    "attn_implementation": "sdpa",
+    "sdpa_backend_probe": {
+      "flash": "ineligible: No available kernel. Aborting execution.",
+      "efficient": "ok",
+      "cudnn": "ok",
+      "sdpa_params_probe": {
+        "flash_can_use": true,
+        "efficient_can_use": true,
+        "cudnn_can_use": true,
+        "note": "debug=True only enables PyTorch's internal C++ LOG(WARNING) (a c10/glog-style sink), which writes to the process's native stderr fd outside Python's logging/warnings machinery -- not capturable as a string in this JSON field. Redirect the pod's own stderr if the specific ineligibility message text is needed; the booleans above are the reliably observable half of this probe."
+      }
+    },
+    "reference_compile_resolved": "absent",
+    "reference_compile_after_first_forward": "absent",
+    "batch": 16,
+    "seq": 512,
+    "lora_rank": 16,
+    "lora_dropout": 0.0,
+    "lora_init": "peft",
+    "lora_a_tensors_reinitialized": null,
+    "target_modules": [
+      "Wqkv",
+      "Wo",
+      "Wi"
+    ],
+    "batched_forward": true,
+    "trainable_tensors": 224,
+    "steps_measured": 25,
+    "losses": [
+      0.298828125,
+      0.298828125,
+      0.294921875,
+      0.294921875,
+      0.294921875,
+      0.294921875,
+      0.298828125,
+      0.294921875,
+      0.2890625,
+      0.287109375,
+      0.287109375,
+      0.2890625,
+      0.291015625,
+      0.294921875,
+      0.29296875,
+      0.291015625,
+      0.29296875,
+      0.29296875,
+      0.29296875,
+      0.2890625,
+      0.28515625,
+      0.279296875,
+      0.26953125,
+      0.255859375,
+      0.2451171875
+    ],
+    "loss_first": 0.298828125,
+    "loss_last": 0.2451171875,
+    "loss_note": "cost-fixture data, not a quality result (synthetic uniform token ids) \u2014 see finetune_step.rs's module doc's 'Honesty about what is measured'. Each entry read after optimizer.step() returns; the value itself is the PRE-update loss of that step's batch (see _step_once's docstring for the placement convention shared with finetune_step.rs). PRECISION: at --dtype bf16 (every real sweep leg) this value carries only bf16's 7 explicit mantissa bits \u2014 ULP ~2^-9 \u2248 0.001953125 near 0.30 (the [0.25, 0.5) exponent bucket) \u2014 so two adjacent steps repeating the exact same float is expected quantization, not a stuck optimizer; do not read more than ~3 decimal digits of this field as meaningful.",
+    "s_per_step_p50": {
+      "value": 0.8866505669429898,
+      "unit": "s"
+    },
+    "s_per_step_mean": {
+      "value": 0.8873633581772447,
+      "unit": "s"
+    },
+    "steps_per_s": {
+      "value": 1.1278400277212008,
+      "unit": "steps/s"
+    },
+    "triplets_per_s": {
+      "value": 18.045440443539214,
+      "unit": "triplets/s"
+    },
+    "peak_rss_bytes": {
+      "value": 2569469952.0,
+      "unit": "bytes"
+    },
+    "peak_vram_baseline_bytes": {
+      "value": 922013696.0,
+      "unit": "bytes",
+      "note": "memory_allocated() snapshot taken after model+optimizer construction AND after one untimed optimizer warm-up step (so AdamW's lazily-allocated moments already exist) \u2014 the honest equivalent of candle's eager moment allocation before jammi's own baseline read."
+    },
+    "peak_vram_absolute_bytes": {
+      "value": 40132986880.0,
+      "unit": "bytes",
+      "note": "torch's continuous allocator high-water mark (reset_peak_memory_stats once before the warmup+measured loop, max_memory_allocated read after it) over the SAME window as peak_vram_delta_bytes, WITHOUT the baseline subtraction. No jammi analogue."
+    },
+    "peak_vram_delta_bytes": {
+      "value": 39210973184.0,
+      "unit": "bytes",
+      "note": "Comparable to jammi's peak_vram_bytes column: same window (warmup+measured), same baseline convention (snapshot after model+optimizer construction, moments already forced into existence). RESIDUAL ASYMMETRY: this is a CONTINUOUS allocator high-water mark; jammi's is a 25ms-interval discrete nvidia-smi poll, which can miss an intra-step spike this cannot \u2014 so this figure may legitimately read higher than jammi's for identical underlying work."
+    }
+  },
+  "schema_version": 1,
+  "git_sha": "eee7e6a91b25221de7d72df30e42fdc7412ab42d",
+  "box": "a100c",
+  "status": "GREEN",
+  "producer": {
+    "path": "crates/jammi-bench/reference/torch_finetune_step.py",
+    "kind": "script",
+    "invocation": "torch_finetune_step.py --model-dir /root/checkpoints/ModernBERT-large --steps 25 --warmup 5 --lora-rank 16 --lora-alpha 32 --lora-dropout 0 --target-modules Wqkv,Wo,Wi --dtype bf16 --lora-init peft --cuda 0 --seed 42 --attn sdpa --batch <B> --seq <S>",
+    "gating": "none"
+  }
+}

@@ -47,6 +47,22 @@ default = []
 # that chain). Adds jammi-kernels' CUDA build (nvcc/PTX) — never required
 # by a plain `cargo build` (see jammi-kernels/build.rs's early-return gate).
 cuda = ["jammi-kernels/cuda"]
+# Forwards to `jammi-kernels`'s `flash-attn` feature — one link of the
+# `jammi-kernels -> jammi-encoders -> jammi-ai -> jammi-bench` chain the
+# lead's P6 Stage B v5 correction asks B2 to lay down now, with no real
+# code depending on it yet: `crate::modernbert`'s flash-cascade admission
+# predicate reads `jammi_kernels::admission::FLASH_COMPILED` (a plain,
+# unconditionally-compiled `bool`, NOT this local feature) precisely
+# because it must stay correct even before `jammi-ai`/`jammi-bench` forward
+# this feature — see `FLASH_COMPILED`'s own doc. This feature exists so a
+# FUTURE real dependency on `jammi_kernels::flash` types (B1's
+# `CuSeqlens`/`flash_attention_varlen`) has a declared forwarding path to
+# land behind, and so `rustc`'s `unexpected_cfgs` lint has a declared
+# feature name if a future call site DOES need `#[cfg(feature =
+# "flash-attn")]` (never a bare `cfg!()` runtime check around a
+# `jammi_kernels::flash` type reference — see `FLASH_COMPILED`'s doc for
+# why that would fail to compile with this feature off).
+flash-attn = ["jammi-kernels/flash-attn"]
 # Enables tests/parity.rs which depends on candle-transformers as a numerical
 # oracle for the Bert frozen forward pass.
 parity-test = []

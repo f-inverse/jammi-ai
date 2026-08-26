@@ -7,6 +7,103 @@ workspace ships every publishable crate at the same
 ## [Unreleased]
 
 ### Fixed
+- **Gradient clipping now follows `torch.nn.utils.clip_grad_norm_`'s
+  semantics (`jammi-ai`) — not bit-exact: two remaining divergences.** The
+  device-side global-L2 gradient clip computes `clip_coef = min(1, max_norm /
+  (total_norm + 1e-6))` and rescales every gradient UNCONDITIONALLY,
+  mirroring torch's own `_clip_grads_with_norm_`. The coefficient now
+  matches torch's own ROUNDING COUNT too: `total_norm.affine(1.0, 1e-6)`
+  (one add) then a genuine `max_norm / denom` division (candle's `Div`
+  kernel, over a device-materialized `max_norm` scalar — candle has no
+  scalar-numerator `div`), not the reciprocal-then-multiply an earlier
+  revision used (two `f32` roundings where torch performs one — invisible
+  at the shipped `max_grad_norm = 1.0` default, since `x * 1.0` is exact,
+  but a real ~1 ULP divergence for any other `max_norm`; pinned by
+  `tests::rounding_count_fix_changes_the_result_only_when_max_norm_is_not_
+  one`). Where it still parts ways with torch, stated rather than papered
+  over: the global norm is one `sqrt` over a fold of per-`Var` squared sums
+  rather than torch's norm-of-per-parameter-norms (bounded in
+  `clip_gradients`'s doc); and for a non-`f32` (bf16) gradient jammi
+  upcasts to `f32`, folds and scales there, and rounds back once, where
+  torch keeps the whole computation in the gradient's own dtype. The
+  previous (pre-device-clip) implementation was a parity defect: it skipped
+  rescaling entirely whenever `total_norm <= max_norm` (a silent no-op torch
+  never performs — torch always applies its computed coefficient, which is
+  `< 1.0` on the half-open band `total_norm ∈ (max_norm - 1e-6, max_norm]`)
+  and omitted torch's `1e-6` epsilon from the denominator. Both defects are
+  now fixed; a run whose gradient norm regularly lands in that boundary band
+  will see slightly different (more torch-faithful) updates there.
+  Global-norm accumulation also moved from a host `f64` scalar fold to a
+  device `f32` tensor fold — matching torch's own `f32`-throughout precision
+  rather than an accidental higher-precision side effect of the old
+  per-`Var` host round-trip. See
+  `crates/jammi-ai/src/fine_tune/optimizer.rs`'s module doc for the full
+  derivation and citation.
+- **`regression_surface::untrained_quantile_head_collapses_to_mu_no_
+  separation`'s aggregate arm replaced with a paired sign-count arm
+  (`jammi-ai` tests).** The prior arm (a trimmed-mean margin over a 12-seed
+  sweep) had no resolving power at its operating point: a forced
+  1-ULP-of-`f32` clip-coefficient perturbation — orthogonal to any code
+  change, an unavoidable floating-point rounding choice — swung the
+  trimmed-mean aggregate 12-30% on both `main` and this branch (one seed
+  even sign-flipped). Replaced with a per-seed sign count
+  (`trained_sep[i] > zeroed_sep[i]`, i.e. `> 0.0`, since a zeroed head's
+  separation is exactly `0.0` on every seed by construction) against
+  `QUANTILE_SEP_UNTRAINED_POSITIVE_BAR`, which gave an IDENTICAL verdict
+  across five independent runs (main and this branch, clip formula before
+  and after the rounding-count fix, the 1-ULP mutant on and off, plus one
+  CI run) despite the same magnitude swings. Stated honestly, not hidden:
+  this trade has a known limit — the new arm was proven robust against
+  ULP-scale rounding noise (above) but was NOT shown to have power against
+  a GRADED degradation of the trained head; measured (throwaway, reverted)
+  overrides on the same fixture still clear the bar at `learning_rate:
+  1e-5` (`positive_count = 8`, aggregate collapses ~215× to `0.0222`) and
+  at `epochs: 1` (`positive_count = 8`, aggregate `2.5824`) — an ORDINAL
+  (sign-count) arm cannot see a MAGNITUDE collapse that does not also flip
+  enough seeds' signs. A future arm wanting that coverage needs to be
+  magnitude-sensitive AND chaos-robust by construction (see the test's own
+  doc on `QUANTILE_SEP_UNTRAINED_POSITIVE_BAR`), not an extension of this
+  one. Separately, pre-existing and unrelated to this round: Arm 1's
+  `mutant_zero_band` (`max(3 × std(zeroed_seps), 1e-3)`) has been measured
+  `0.0` for `std(zeroed_seps)` on every run to date (a zeroed head's
+  separation is exactly `0.0` per seed, by construction), so it reduces to
+  its `1e-3` floor in practice rather than a live data-dependent band —
+  documented in the test itself, not widened in scope by this round.
+- **The trainer's gradient-clip fold order is now reproducible across process
+  invocations of the same seed (`jammi-ai`).** `TrainingLoop::run` and
+  `parallel_train::train_loop` snapshotted their trainable `Var`s via
+  `VarMap::all_vars()`, whose `HashMap`-iteration order is stable within one
+  process but randomized ACROSS separate process invocations by `HashMap`'s
+  default per-instance hasher seed — so the clip's f32 fold order (and
+  therefore the last bits of every clipped gradient) depended on
+  process-launch randomness, not on the training `seed`. Both call sites now
+  use the new `optimizer::sorted_trainable_vars` (name-sorted), closing that
+  gap the same way `AdamW`'s resume-from-checkpoint moment restoration
+  already had to (by name, never by this unstable position). The bench's
+  own folds (`jammi-bench`'s `finetune-step` clip site and `train-scale`'s
+  head) now go through the same function, and `finetune_step.rs` carries a
+  two-process test proving a clip-on `finetune-step` run's `losses` are
+  bit-identical across invocations of the same seed.
+- **The jammi-vs-torch finetune-step A/B now refuses a clip-on leg against a
+  clip-off one, and a fused-attention leg against an eager one
+  (`ci/scripts/perf`).** `max_grad_norm` and `attention_arm` (the attention
+  reference class a leg was ASKED to run — `"eager"` or `"fused"`, jammi's
+  from the operator's resolved `JAMMI_KERNELS_DISABLE` request (never the
+  dispatch counters, which read eager on a by-design domain decline), torch's
+  from the resolved `_attn_implementation`) and `warmup` (it changes what
+  `clip_invocations` counts) are identity fields; a fallback leg (torch-sdpa
+  OOM → torch-eager) is "not comparable", never an identity mismatch. The
+  identity set is declared ONCE, in `ci/scripts/perf/identity_fields.py`'s
+  `FINETUNE_IDENTITY_FIELDS`; `ab_merge.py` iterates it (its own hand-kept
+  tuple, which lacked both, is gone), and both producers are pinned against
+  it (`report.rs`'s `finetune_step_tier_emits_every_shared_identity_field`
+  reads the tuple out of that file; `test_ab_merge.py` scans the torch
+  report literal). `FinetuneStepTier` and `torch_finetune_step.py` both emit
+  `clip_invocations` — the counted number of production clip calls (pre-step
+  + warmup + measured) — next to the dispatch deltas, and `ab_merge.py`
+  refuses a leg whose `max_grad_norm` request and counted fact disagree.
+  `ClipOutcome` is `#[must_use]`; the bench refuses a clip-on row whose clip
+  returned anything but `Clipped`.
 - **Eager LayerNorm and RoPE now round once, matching torch/HF (`jammi-encoders`).**
   `LayerNorm::slow`'s bias-free (and biased, non-fast-path) arm rounded `x̂` to
   the backbone dtype BEFORE multiplying by `gamma` (and, when biased, before

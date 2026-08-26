@@ -105,7 +105,14 @@ where
     M: Fn(&B) -> Result<Tensor>,
     L: Fn(&Tensor, &B) -> Result<Tensor>,
 {
-    let trainable_vars: Vec<Var> = varmap.all_vars();
+    // Deterministic (name-sorted) order, never `VarMap::all_vars()`'s raw
+    // `HashMap` iteration order — see `optimizer::sorted_trainable_vars`'s own
+    // doc (esc-182): a raw `all_vars()` order is stable within one process but
+    // randomized ACROSS process invocations by `HashMap`'s per-process hasher
+    // seed, which would make the clip's f32 fold order — and therefore its
+    // last bits — depend on process-launch randomness rather than `config`'s
+    // seed.
+    let trainable_vars: Vec<Var> = crate::fine_tune::optimizer::sorted_trainable_vars(varmap);
     let mut optimizer = AdamW::new(
         trainable_vars.clone(),
         ParamsAdamW {
@@ -118,6 +125,12 @@ where
 
     let mut total_steps = 0usize;
     let mut last_epoch_loss = 0.0f64;
+    // The whole run's optimizer-step horizon, known upfront (one step per
+    // batch per epoch) — passed to `optimizer_step` so its non-finite check
+    // fires on this run's actual last step even when the run is shorter than
+    // `DEFAULT_NORM_CHECK_INTERVAL` steps (see `optimizer::clip_and_step`'s
+    // doc).
+    let total_run_steps = config.epochs.saturating_mul(batches.len());
 
     for _epoch in 0..config.epochs {
         if cancel.load(Ordering::Relaxed) {
@@ -135,7 +148,14 @@ where
             epoch_loss += scalar_loss(&loss)?;
             batch_count += 1;
 
-            optimizer_step(&mut optimizer, &trainable_vars, &loss, config.grad_clip)?;
+            let is_last_step = total_steps + 1 >= total_run_steps;
+            optimizer_step(
+                &mut optimizer,
+                &trainable_vars,
+                &loss,
+                config.grad_clip,
+                is_last_step,
+            )?;
             total_steps += 1;
         }
 
@@ -160,4 +180,39 @@ fn scalar_loss(loss: &Tensor) -> Result<f64> {
     Ok(loss
         .to_scalar::<f32>()
         .map_err(|e| JammiError::FineTune(format!("Loss scalar: {e}")))? as f64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::{DType, Device};
+
+    /// `scalar_loss`'s `loss.dtype() == DType::F32` branch is only exercised
+    /// by an already-F32 loss in every OTHER test that reaches this function
+    /// (every `loss_fn` in this file's/`tests/it/parallel_train.rs`'s
+    /// fixtures reduces through `.sqr()`/`.mean_all()` on F32 tensors), so
+    /// the `else` arm — the actual `to_dtype` cast this function's own doc
+    /// promises for "a reduced-precision dtype" — is never entered. A BF16
+    /// loss forces it.
+    ///
+    /// Mutation tried: `replace == with !=` on that condition — the mutant
+    /// keeps a non-F32 loss in ITS OWN dtype (skips the cast) and routes an
+    /// already-F32 loss through a redundant (no-op, invisible) `to_dtype`
+    /// instead. RED here: `to_scalar::<f32>()` on an uncast BF16 tensor is a
+    /// dtype mismatch candle refuses — `Result::unwrap()` panics instead of
+    /// returning `Ok`.
+    #[test]
+    fn scalar_loss_casts_a_non_f32_loss_before_reading_it() {
+        let dev = Device::Cpu;
+        let loss_bf16 = Tensor::new(3.5f32, &dev)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let got = scalar_loss(&loss_bf16).unwrap();
+        // 3.5 round-trips through BF16 exactly, so the cast-then-read value
+        // must equal it precisely — not just "close enough" (a tolerance
+        // would blur this test's exact-match oracle with BF16's own rounding
+        // error on values that do NOT round-trip).
+        assert_eq!(got, 3.5);
+    }
 }

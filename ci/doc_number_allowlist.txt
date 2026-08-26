@@ -2,21 +2,22 @@
 #
 # Tracked exceptions for check_doc_numbers_have_producers.py: a measurement-
 # shaped number in a kernel/test doc comment or assert! message with no
-# producer citation tightly bound to it (see that script's module doc for
-# the exact binding rule). Seeded from origin/main (the base this gate was
-# authored against) so landing the gate does not retroactively red every
-# branch already in flight fixing its own doc numbers.
+# producer citation resolvable anywhere in its comment block (see that
+# script's module doc for the exact citation grammar and binding rule).
+# Seeded from origin/main so landing this gate does not retroactively red
+# every branch already in flight fixing its own doc numbers. Every entry
+# is classified real/noise in ci/doc_number_allowlist_classification.md.
 #
-# Keyed on `file:number:sha1(normalized line text)`, NOT line number — a
+# Keyed on `file:number:sha1(normalized line text)`, NOT line number -- a
 # line shift elsewhere in the file must not silently re-trigger an
 # already-tracked entry, and must not silently un-flag a genuinely edited
 # line either (the hash changes with the text).
 #
-# This file MAY ONLY SHRINK: `--check-allowlist-only-shrinks` diffs it
+# This file MAY ONLY SHRINK: --check-allowlist-only-shrinks diffs it
 # against origin/main and fails on any ADDED entry. A future PR either adds
 # a real producer citation / a `no-producer:` opt-out and removes the line,
 # or (rarely, and only with a documented reason inline) narrows an
-# over-broad trigger-word match in the gate itself — never grows this file
+# over-broad trigger-word match in the gate itself -- never grows this file
 # to silence a NEW instance of this class landing after the gate.
 
 crates/jammi-kernels/src/admission.rs:8/200:78858dd0c2d835733ce33353e29117cea8055d6b
@@ -25,15 +26,25 @@ crates/jammi-kernels/src/cuda/adamw_step.cu:5145/16384:2239d68b75ce003d522bc250f
 crates/jammi-kernels/src/ops/adamw_step.rs:5145/16384:45655b9528056bed39570ed8a628214210fe8428
 crates/jammi-kernels/src/ops/adamw_step.rs:2.44%:0d34666e85490099ad18f1f2dc2e25daeb790906
 crates/jammi-kernels/src/ops/adamw_step.rs:7.25%:cc3445b607fa3dd0abd19bf68618142de32dd815
+crates/jammi-kernels/src/ops/adamw_step.rs:2.45%:6b1ef0affb291b219f9dc41276197872e86b1f27
+crates/jammi-kernels/src/ops/adamw_step.rs:11.82%:6b1ef0affb291b219f9dc41276197872e86b1f27
+crates/jammi-kernels/src/ops/attention_block.rs:0.125:b6e1b39496bd29a1fe35fc05283509aa7ee1447a
 crates/jammi-kernels/src/ops/attention_block.rs:0.08:d5bec6a7b62cf08617561fa7f0897ce5ac819007
 crates/jammi-kernels/src/ops/attention_block.rs:0.166:35db1c54afe43e14af0be4f9ec333a80cd19b1d0
-crates/jammi-kernels/src/ops/dropout.rs:0.05:6540101029df117eaaca434f66143290c8547c5c
+crates/jammi-kernels/src/ops/dropout.rs:0.05:d2a811da74014d9607a161852a7524006b3075bc
+crates/jammi-kernels/src/ops/dropout.rs:0.05:16c7d3f460f5feb1804c8eab6f7e1102346ac2fc
 crates/jammi-kernels/src/ops/dropout.rs:0.0013:5ff0b1d7895fd852c4b1f3b4e0f734293c09b9e5
-crates/jammi-kernels/src/ops/softmax.rs:128/512:10bcc9190db5104b81bdfd9171fe59950ae750ce
+crates/jammi-kernels/src/ops/geglu.rs:0.398942:b1429cbf4bed021941e0e663cd2a64024f6ab4f0
+crates/jammi-kernels/src/ops/geglu.rs:0.398942:01098447d161aff0825a6c49782af852800d49e3
+crates/jammi-kernels/src/ops/softmax.rs:0.01:9443c242570c75bebd79b515a94ee84895ed592d
+crates/jammi-kernels/src/ops/softmax.rs:0.01:f68986f64dca350dce42190c12f93d3ec9deb76c
 crates/jammi-kernels/tests/cuda_parity.rs:5%:512f50b61b936db2eebbb21d36df38468528e465
 crates/jammi-kernels/tests/cuda_parity.rs:0.008:272ff0fb3753fb857620add6ab73e782619015aa
 crates/jammi-kernels/tests/cuda_parity.rs:0.15:bd5e4a5fa0aa1e4e6c4efcb04eeac8a3abd28cda
 crates/jammi-kernels/tests/cuda_parity.rs:0.15:339929c7d0e70c21a283cdb185617d26f436a47f
+crates/jammi-kernels/tests/cuda_parity.rs:5.5%:acff23f0f6eacab6032a5273292303a555a52a1e
+crates/jammi-kernels/tests/cuda_parity.rs:5%:d1c1ae605b5047b7a13d0ef328fc29422fa04b18
+crates/jammi-kernels/tests/cuda_parity.rs:0.031:6e53579896653fde2a50266a482c4a512312fb79
 crates/jammi-kernels/tests/cuda_parity.rs:0.06:26ef6c6c842d2da68ef4008c758e4f1c43a16e53
 crates/jammi-kernels/tests/cuda_parity.rs:0.94:26ef6c6c842d2da68ef4008c758e4f1c43a16e53
 crates/jammi-kernels/tests/cuda_parity.rs:0.273:0060c558347e1b84aba368487c05ea42a2991d5c
@@ -43,29 +54,49 @@ crates/jammi-kernels/tests/cuda_parity.rs:0.321:6dfb0e0b8a64409374099272291deb3b
 crates/jammi-kernels/tests/cuda_parity.rs:5.2%:a4900a42ad85ffa08361adf36952fa5b38a58167
 crates/jammi-kernels/tests/cuda_parity.rs:53%:a4900a42ad85ffa08361adf36952fa5b38a58167
 crates/jammi-kernels/tests/cuda_parity.rs:5145/16384:ac0f90668906500fcb7d2237f5eade836a80a08c
+crates/jammi-kernels/tests/flash_smoke.rs:0.39:053f7dd1b2837cd1f490cf122d69e983321187fa
 crates/jammi-kernels/tests/flash_smoke.rs:0.06:7c245f8f456eddb81114f10b0342ec497906e1da
 crates/jammi-kernels/tests/flash_smoke.rs:0.60:7c245f8f456eddb81114f10b0342ec497906e1da
+crates/jammi-kernels/tests/geglu_oracles.rs:0.398942:fa911e541784429b49aaf87aaf39ea918e4f7e1a
+crates/jammi-kernels/tests/geglu_oracles.rs:2%:5399f2d3d1bf18bf31636905d6693f187ff0023a
 crates/jammi-kernels/tests/geglu_oracles.rs:0.125:f3836a032305756b2d22cd4f6fa5611a66ec682b
+crates/jammi-kernels/tests/geglu_oracles.rs:1.02%:17dd4abe8353068431b994b13c7a177c028a8f68
 crates/jammi-kernels/tests/geglu_oracles.rs:0.125:17dd4abe8353068431b994b13c7a177c028a8f68
+crates/jammi-kernels/tests/geglu_oracles.rs:1.5625%:9e84c762993c213029aa3c2c0fac06b1314e556b
 crates/jammi-kernels/tests/geglu_oracles.rs:0.0120:5d83e73ee15926efce6b3c8990624a758399f951
+crates/jammi-kernels/tests/geglu_oracles.rs:0.03125:911d0375f7fff33a0c6d5c317af473bf287e620c
+crates/jammi-kernels/tests/geglu_oracles.rs:1.06%:6c1650410a4976ab49ecfc6939a345b2d057d753
+crates/jammi-kernels/tests/geglu_oracles.rs:1.5625%:db5cb02a51104f27cec58cca3b55983c4521041a
 crates/jammi-kernels/tests/geglu_oracles.rs:0.125:344e23dce741de3bbbd3cc2f35d090199594b2f8
+crates/jammi-kernels/tests/geglu_oracles.rs:0.125:4d40c3222d4846ff0976cc4be5914fb8621935bb
 crates/jammi-kernels/tests/geglu_oracles.rs:0.125:c580b9b0096a3d58b2ee92c3c9d61ff5dfe6c6d1
+crates/jammi-kernels/tests/oracles.rs:0.125:37f8a686ea8919ec88791fc6b860fd23a99f7b73
 crates/jammi-kernels/tests/scaled_cast_add_oracles.rs:0.0625:634f9e387a4e0058ca91f8b3af4d511db4be68de
-crates/jammi-kernels/tests/scaled_cast_add_oracles.rs:3/16:dd0d2003b7ea6f53571535f287ce0a86e1a89b54
+crates/jammi-kernels/tests/scaled_cast_add_oracles.rs:0.015625:e97e23eedec4bf8229daf0618cd5e97f6d3658ca
 crates/jammi-kernels/tests/scaled_cast_add_oracles.rs:0.333:046758a11ba1153f29eb0c31e9cffe79b527305d
-crates/jammi-kernels/tests/scaled_cast_add_oracles.rs:333/83:2b56b801477105a705ed5ed646c81f311904e6fe
+crates/jammi-kernels/tests/scaled_cast_add_oracles.rs:0.4%:2b56b801477105a705ed5ed646c81f311904e6fe
+crates/jammi-kernels/tests/scaled_cast_add_oracles.rs:0.333:2b56b801477105a705ed5ed646c81f311904e6fe
 crates/jammi-kernels/tests/scaled_cast_add_oracles.rs:21%:b06b2e9b77072387552289b6a2587822d0c7940f
 crates/jammi-kernels/tests/scaled_cast_add_oracles.rs:0.174:b06b2e9b77072387552289b6a2587822d0c7940f
 crates/jammi-kernels/tests/scaled_cast_add_oracles.rs:0.82:b06b2e9b77072387552289b6a2587822d0c7940f
+crates/jammi-kernels/tests/scaled_cast_add_oracles.rs:0.25:1959f26fcf1fdf4c676a47543e967089addeecce
 crates/jammi-kernels/tests/scaled_cast_add_oracles.rs:0.174:2013c1cd46598dbd444d6e356eadce81856a2fe6
 crates/jammi-kernels/tests/scaled_cast_add_oracles.rs:0.333:51e2112f5347edec8aef28d6ff11c8cf5fe34f74
 crates/jammi-kernels/tests/scaled_cast_add_oracles.rs:0.52%:71ffe7889fd72be59fa421f0febc8539a857d8fa
-crates/jammi-encoders/src/clip_text.rs:29/29:d0468985dbef7dab07d8c00b3f621cf09eeee805
-crates/jammi-encoders/src/open_clip_vision.rs:32/32:a3a3ba24b8465bc0cd5e9faa877247bbd121c775
+crates/jammi-kernels/tests/scaled_cast_add_oracles.rs:1.5625%:71ffe7889fd72be59fa421f0febc8539a857d8fa
+crates/jammi-encoders/src/htsat_audio.rs:0.75:8f291de57c2a718a465a0e06422e41a14b45d0c7
 crates/jammi-bench/src/eval.rs:75%:39afbfc7f6892619b17b68542bfd8133ce9bde1f
+crates/jammi-bench/src/finetune_step.rs:0.001:1d208a97d8fc5607ddd09f29afcc65487f37437c
+crates/jammi-bench/src/finetune_step.rs:0.001:2e5977d3c96752b24249169363d5c7028842dc25
+crates/jammi-bench/src/finetune_step.rs:0.65:81b7a5734f6ef0b2330a41b4eb7039af461695a2
 crates/jammi-bench/src/fixture.rs:0.04:1d772a8c0f633a2b3c11e6566ebbb6140ac5c01d
 crates/jammi-bench/src/fixture.rs:100%:9f44804876abc195305c62c0cd798789dc002980
+crates/jammi-bench/src/rate_gate.rs:30%:5d4580dd51da426cd6ce2cd960020dad6d831e9c
 crates/jammi-bench/src/rate_gate.rs:30%:a16cbba7cb619e7eae2f6ddf0d9b7b5623f541d6
+crates/jammi-bench/src/recall.rs:95%:be0b30b095c1226161a55160220765150961bfff
+crates/jammi-bench/src/recall.rs:0.95:ecde9d39664b5db8938eb799efb581d75065fc92
 crates/jammi-bench/src/recall.rs:0.27:a628dfd29b201fa1c164b6db93aaca17de32ef79
 crates/jammi-bench/src/recall.rs:0.17:a628dfd29b201fa1c164b6db93aaca17de32ef79
 crates/jammi-bench/src/recall.rs:0.10:a628dfd29b201fa1c164b6db93aaca17de32ef79
+crates/jammi-bench/src/report.rs:0.30:848e8d5691a451f627a04d72fb9952fcb094cfb6
+crates/jammi-bench/src/report.rs:0.25:848e8d5691a451f627a04d72fb9952fcb094cfb6

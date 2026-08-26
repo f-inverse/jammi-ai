@@ -13,30 +13,46 @@ this rule in one paragraph, alongside the adjacent oracle disciplines §3.7
 (write comparisons affirmatively) and §3.8 (no absolute ULP floor) this is a
 third leg of.
 
+BINDING UNIT: the contiguous doc-comment BLOCK — a maximal run of `///`/
+`//!`/`//` lines — containing the number (round-3 audit fix: a 12-line
+window both missed a same-block citation written one sentence AWAY from the
+number it covers, and could reach a citation several lines off that has
+nothing to do with the number it happened to sit near). A citation ANYWHERE
+in the block covers every number in that block. `no-producer: <reason>` is
+the one exception — it stays LINE-scoped: it exempts only the number(s) on
+its own line, never the rest of the block, so a stray opt-out cannot
+silently launder an unrelated number several lines away. An
+`assert!`/`panic!`-family message is always its own singleton block (it is
+code, not a comment run).
+
 WHAT COUNTS AS "measurement-shaped": three number shapes, each REQUIRED to
-sit within `TRIGGER_WINDOW` lines of one of `ADJACENT_WORDS` — a plain `N/M`,
-`X%`, or `0.XXX` floating around in math notation, an enumeration ("cell
-3/7"), a domain bound ("rank 1/2/3"), a fixed statistical constant ("a 95%
-CI"), or a defined threshold ("DEFAULT_REGRESSION_THRESHOLD, 30%, see the
-module docs") is NOT measurement-shaped by this gate — it carries no claim of
-an observed run, so it needs no producer. Only a number sitting near a word
-that signals "this was seen to happen" is treated as a claimed measurement:
+have one of `ADJACENT_WORD_ALTS` appear (case-insensitively) ANYWHERE in the
+number's own BLOCK — not a plain N/M, X%, or 0.XXX floating around in math
+notation, an enumeration, a fixed statistical constant, or a defined
+threshold, all of which carry no claim of an observed run:
 
-  - `N/M` element/mismatch counts:      `\\d+\\s*/\\s*\\d+`
-  - percentages:                        `\\d+(\\.\\d+)?\\s*%`
-  - bare cosines (e.g. `0.610`,
-    `0.796`):                           `0\\.\\d{2,4}`
+  - `N/M` element/mismatch counts, REQUIRED to have `M >= 64` (a smaller
+    denominator is almost always an index/enumeration/small ratio in this
+    codebase, never a real mismatch-element count, which starts in the
+    hundreds) and NOT: immediately preceded by `.` (a decimal-embedded
+    fragment, e.g. the `3/16` inside `1.3/16`), `/` or immediately followed
+    by `/` (a fragment of a longer `a/b/c` chain — excluding both
+    directions kills every non-first segment of a chain in one rule), `^`
+    (an exponent, `x^2/2`), or an `n=`-prefixed shape enumeration
+    (`n=32/900`).
+  - percentages (`X%`, `X.Y%`).
+  - bare cosines (`0.dd` through `0.dddddd` — 2 to 6 decimal digits).
 
-Three SHAPE EXCLUSIONS keep the above from firing on plain math/notation that
-happens to sit near a trigger word in the same paragraph (see `NM_EXCLUDED`):
-a version string (`0.11.0`), an exponent/grouped-division numerator
-immediately preceded by `^` or `)` (`x^2/2`), an indeterminate form
-(`= 0/0`), an `n=`-prefixed shape enumeration (`n=32/900`), and a `k/N` ratio
-whose denominator `N < 16` (almost always an index/enumeration/small ratio,
-never a real mismatch-element count in this codebase's own measured spans,
-which start in the hundreds). A percentage's own fractional digits
-(`0.52%`'s `0.52`) are claimed by the `%` match and never separately
-re-flagged as a bare cosine — one hit per token.
+  A version string (`0.11.0`, or a known crate name immediately before a
+  bare `X.Y` — `candle 0.11`, `candle-core 0.11's`) is excluded from all
+  three shapes: it is never a measurement.
+
+  Round-3 audit fix: the round-2 "definitional operator" exclusion
+  (anything right of `=`/`>=`/etc. was dropped) and the "same line as a
+  `[`CONST`]` doc-link" exclusion (a whole line was blanket-suppressed by
+  the mere presence of an unrelated link on it) are BOTH REMOVED — a
+  measured value restated as an equality (`measured on the A100: 3.1e-3 =
+  0.39`) still counts.
 
 WHERE: doc comments (`///`, `//!`) and plain `//` comment blocks, plus the
 message string of an `assert!`/`assert_eq!`/`assert_ne!`/`debug_assert!`/
@@ -45,57 +61,57 @@ inside the macro call is out of scope for this pass, the same "cheap,
 visible, first-pass tripwire" cost `check_sqlite_isms.py`'s own doc accepts),
 under `crates/jammi-kernels/{src,tests}`, `crates/jammi-encoders/src`,
 `crates/jammi-lora/src`, `crates/jammi-bench/src` — `.rs` and CUDA source
-(`.cu`/`.cuh`) files, since the class this closes was found in a `.cu` file
-(`adamw_step.cu`) as often as a `.rs` one.
+(`.cu`/`.cuh`) files.
 
-PRODUCER CITATION — TIGHTLY BOUND to the flagged number, never a wide
-line-window (a prior version of this gate accepted any citation within 12
-lines of the number; a two-line shift in an unrelated edit re-triggered an
-already-cited number on a live branch — see `is_bound`). A number at line L
-is bound iff ONE of:
+PRODUCER CITATION GRAMMAR (round-3 audit fix: the round-2 grammar only
+recognised a BARE identifier after `see`/`printed by`, rejecting this
+repo's own dominant idioms — `` see [`fn`] `` alone outnumbers the bare
+form several times over — while ALSO accepting `see below`/`see table
+3`/`see step 2`, none of which name a real producer). A citation is one of:
 
-  - a `see <fn>` / `printed by <fn>` / `measured by <path>` citation sits on
-    line L itself, with `<fn>` resolving to a real `fn <fn>` in some tracked
-    `.rs` file (see `FN_INDEX`) or `<path>` a `git ls-files`-tracked path.
-  - line L (rstripped of trailing punctuation) ENDS with `see` / `printed
-    by` / `measured by` — a doc-comment line wrap — and the immediately
-    FOLLOWING line supplies the `<fn>`/`<path>` (the wrap case; the citation
-    keyword and its target may legitimately fall on either side of a
-    comment-width line break, but the number's own line must be the one
-    that starts the citation).
-  - an explicit per-number tag `[producer: <fn_or_path>]` sits on line L,
-    resolved the same way as `<fn>`/`<path>` above.
-  - `no-producer: <reason>` sits on line L — covers ONLY its own line, never
-    a neighboring one, so a stray opt-out elsewhere in the same comment
-    block cannot silently launder an unrelated number.
+  - `` see [`<path>`] ``, `` see `<path>` ``, or `see <path>` — `<path>` is
+    a `::`-separated identifier chain (`ops::softmax::MAX_LAST_DIM`,
+    `Self::with_scale`, a bare `check_bit_identity_fixture`); resolved by
+    its LAST segment.
+  - `printed by` in the same three forms, resolved the same way.
+  - `measured by <path>` — `<path>` is a filesystem path; resolved by
+    `git ls-files` membership (a committed artifact), never a bare
+    `Path.exists()` (which would accept an untracked, gitignored file).
+  - `` [producer: <path or fn form>] `` — the same resolution as `see`,
+    OR (if the content isn't a `::`-path/identifier shape) a tracked path.
 
-Everything else in the citation space (a bare "see the module docs", "see
-that commit's message") does NOT satisfy this gate: it names no
-grep-verifiable function and no tracked artifact, so a reader still cannot
-resolve the claim. That is intentional, not a bug — those are exactly the
-un-resolvable citations this gate exists to catch.
+A resolved fn name is REQUIRED to be a `#[test]`-attributed function
+(including `#[tokio::test]`/any attribute whose text contains "test"), or a
+`pub fn` declared in a file under a `tests/` directory — never "any fn with
+that name exists somewhere", which is what let `see below` resolve against
+a real, but wholly unrelated, non-test `fn below` a prior round of this
+gate shipped with. This is the one piece of real discipline in the
+grammar: it is what makes `see table 3` and `see step 2` correctly stay
+unresolved (neither names a real identifier at all) and what makes `see
+below` correctly stay unresolved EVEN THOUGH a real `fn below` exists
+elsewhere in the tree (it is not a test).
 
 FAIL-CLOSED, file:line, offending number. A committed allowlist
 (`ALLOWLIST_PATH`) carries pre-existing debt, keyed on `file:number:sha1` —
 `sha1` of the NORMALIZED text of the number's own line (not the line
 number), so a line shift elsewhere in the file does not silently re-trigger
 an already-tracked entry, and does not silently un-flag a genuinely edited
-line either (the hash changes with the text). The allowlist may only shrink:
-`--check-allowlist-only-shrinks` diffs it against `origin/main` and fails
-closed on any ADDED entry — never on a removed one — so it is mechanically
-impossible to launder a brand-new instance of this class through the
-allowlist; the only sanctioned way to clear a violation is a real producer
-citation or a `no-producer:` tag.
+line either (the hash changes with the text). `ci/doc_number_allowlist_
+classification.md` marks every seeded entry real/noise by hand, with the
+noise rate computed directly from that table — not asserted in prose.
+
+The allowlist may only shrink: `--check-allowlist-only-shrinks` fetches
+`origin/main` (fails CLOSED — `check=True` — if the fetch itself fails,
+never silently proceeding on stale/absent data), requires `origin/main` to
+resolve at all (`git rev-parse --verify origin/main`, fails the leg if
+not), and only THEN treats "no allowlist file at `origin/main`" as a
+legitimate bootstrap (this PR is the one introducing the file) rather than
+conflating it with "the ref didn't resolve" — the message states which
+case fired.
 
 Run: `python3 ci/scripts/check_doc_numbers_have_producers.py`
-Self-test (positive: unproduced measurements — including four reworded
-probes drawn from a prior audit round — are flagged; negative: a citation
-resolving to a REAL tracked fn, a wrapped citation, a per-number tag, a
-no-producer-tagged derived constant, and every shape exclusion are clean):
-`python3 ci/scripts/check_doc_numbers_have_producers.py --self-test`
-Allowlist-only-shrinks leg (network: fetches `origin/main` to diff against —
-the one leg of this gate that is not otherwise hermetic, matching
-`swarm.yml`'s own TOUCHED-guard precedent):
+Self-test: `python3 ci/scripts/check_doc_numbers_have_producers.py --self-test`
+Allowlist-only-shrinks leg (network: fetches `origin/main`):
 `python3 ci/scripts/check_doc_numbers_have_producers.py --check-allowlist-only-shrinks`
 """
 
@@ -122,15 +138,9 @@ SCAN_ROOTS = [
 SCAN_EXTENSIONS = {".rs", ".cu", ".cuh"}
 
 ALLOWLIST_PATH = REPO_ROOT / "ci" / "doc_number_allowlist.txt"
+CLASSIFICATION_PATH = REPO_ROOT / "ci" / "doc_number_allowlist_classification.md"
 
-# How many lines around a number's own line count as "nearby" for the
-# TRIGGER-WORD check only (NOT the producer-citation binding, which is
-# tightly bound to the number's own line ± one wrap line — see `is_bound`).
-# Prose commonly wraps a phrase like "5145/16384 `m` elements differed"
-# across a line boundary in a doc comment, so same-line-only trigger
-# detection would miss it; going wider than a couple of lines starts roping
-# in an unrelated trigger word from elsewhere in the same paragraph.
-TRIGGER_WINDOW = 3
+# --- trigger words -----------------------------------------------------
 
 ADJACENT_WORD_ALTS = [
     r"cosine",
@@ -151,68 +161,52 @@ ADJACENT_WORD_ALTS = [
 ]
 _ADJACENT_RE = re.compile(r"\b(?:" + "|".join(ADJACENT_WORD_ALTS) + r")\b", re.IGNORECASE)
 
+# --- number shapes -----------------------------------------------------
+
 NM_RE = re.compile(r"\b\d{1,7}\s*/\s*\d{1,7}\b")
 PCT_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,4})?\s*%")
-COSINE_RE = re.compile(r"\b0\.\d{2,4}\b")
+COSINE_RE = re.compile(r"\b0\.\d{2,6}\b")
 VERSION_RE = re.compile(r"\b\d+\.\d+\.\d+(?:\.\d+)*\b")
 
 # A crate name (this workspace's own deps that show up in prose as "candle
 # 0.11", "candle-core 0.11's") immediately before a bare `X.Y` reads as a
 # version mention, not a measurement — `VERSION_RE` above only catches
 # 3-component versions (`0.11.0`); this catches the 2-component form this
-# codebase actually writes crate versions as.
+# codebase actually writes crate versions as. Kept per the round-3 audit's
+# "keep the version-string exclusion" — this is the same exclusion, just
+# covering the 2-component spelling `VERSION_RE` cannot.
 _CRATE_NAME_PREFIX_RE = re.compile(
     r"(?i)\b(?:candle(?:-[a-z]+)*|torch|cudarc|half|rayon|tokio|serde(?:-[a-z]+)*|"
     r"anyhow|thiserror|usearch)\s*$"
 )
 
-# A number immediately preceded (ignoring backticks/whitespace) by a
-# definitional/comparison operator — `=`, `==`, `~=`, `>=`, `<=`, `≥`, `≤` —
-# is the RHS of a formula, threshold, or named-constant definition ("FLOOR =
-# 2^-2 = 0.25", "REL = 2^-6 = 1.5625%", "recall@k >= 0.95"), not a claimed
-# observation. A bare comparison/approx symbol with nothing bound to it
-# (`~5%`, `~0.008`) is NOT in this set — that is the ordinary hedge a real
-# measurement is reported with, not a definition.
-_DEFINITIONAL_OPERATOR_RE = re.compile(r"(==|~=|>=|<=|≥|≤|=)\s*$")
-
-# A rustdoc intra-link to a SCREAMING_SNAKE constant — `` [`FLOOR_NAME`] `` —
-# anywhere on the same line means the sentence is discussing a NAMED,
-# already-defined code constant (its own producer is the `const`/`static`
-# declaration the link resolves to), not reporting a fresh unproduced
-# measurement. Deliberately restricted to ALL-CAPS identifiers (the Rust
-# convention for `const`/`static`) so a lowercase/CamelCase link to a
-# function or type (which says nothing about whether a NEARBY number is a
-# measurement) does not trigger this.
-_NAMED_CONST_LINK_RE = re.compile(r"\[`[A-Z][A-Z0-9_]*`\]")
-
-# "95% CI" / "90% interval" / "95% confidence" — a fixed statistical
-# convention (a chosen significance level), never itself a reported
-# measurement, across every stats-adjacent file in this tree.
-_STATISTICAL_CONVENTION_TAIL_RE = re.compile(r"(?i)^\s*(?:CI\b|interval\b|confidence\b)")
-
-SEE_RE = re.compile(r"\bsee\s+`?([A-Za-z_][A-Za-z0-9_]*)\b")
-PRINTED_BY_RE = re.compile(r"\bprinted by\s+`?([A-Za-z_][A-Za-z0-9_]*)\b")
-MEASURED_BY_RE = re.compile(r"\bmeasured by\s+`?([^\s`,;]+)")
-PRODUCER_TAG_RE = re.compile(r"\[producer:\s*([^\]]+)\]")
-NO_PRODUCER_RE = re.compile(r"\bno-producer:")
-
-# A line "ending with" one of the three citation keywords (rstripped of
-# trailing whitespace and common trailing punctuation/dashes first) is the
-# WRAP case: the keyword's target identifier/path continues on the next
-# line. Longest alternative first so "measured by"/"printed by" don't get
-# shadowed by a bare "see" (not applicable here since the three phrases
-# share no textual overlap, but kept for the same discipline as elsewhere in
-# this repo's own regex-ordering convention).
-_WRAP_TAIL_RE = re.compile(r"(?i)\b(measured by|printed by|see)\s*$")
+_N_EQUALS_CHAIN_RE = re.compile(r"(?i)\bn\s*=\s*$")
 
 ASSERT_CALL_RE = re.compile(
     r"\b(?:assert|assert_eq|assert_ne|debug_assert|debug_assert_eq|debug_assert_ne|panic)!\s*\("
 )
 STRING_LITERAL_RE = re.compile(r'"')
 
-_FN_DEF_RE = re.compile(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)\s*[(<]")
+NO_PRODUCER_RE = re.compile(r"\bno-producer:")
+
 _COMMENT_PREFIX_RE = re.compile(r"^\s*(?://!|///|//)")
-_CONST_DECL_RE = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?const\s+[A-Za-z_][A-Za-z0-9_]*\s*:")
+_FN_LINE_RE = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*[(<]")
+_ATTR_LINE_RE = re.compile(r"^\s*#!?\[")
+
+# --- citation grammar ----------------------------------------------------
+
+_IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
+_PATH = rf"{_IDENT}(?:::{_IDENT})*"
+
+_BRACKET_BACKTICK_TARGET_RE = re.compile(rf"^\[`({_PATH})`\]")
+_BACKTICK_TARGET_RE = re.compile(rf"^`({_PATH})`")
+_BARE_TARGET_RE = re.compile(rf"^({_PATH})")
+
+_SEE_KW_RE = re.compile(r"\bsee\s+")
+_PRINTED_BY_KW_RE = re.compile(r"\bprinted by\s+")
+_MEASURED_BY_KW_RE = re.compile(r"\bmeasured by\s+")
+_PRODUCER_TAG_RE = re.compile(r"\[producer:\s*([^\]]+)\]")
+_ARTIFACT_PATH_RE = re.compile(r"^`?([^\s`,;]+)")
 
 
 def _run(cmd: list[str]) -> str:
@@ -224,49 +218,106 @@ def tracked_files() -> set[str]:
     return set(_run(["git", "ls-files"]).splitlines())
 
 
-def build_fn_index() -> set[str]:
-    """Every `fn <name>` defined in any tracked `.rs` file, resolved entirely
-    in Python (no `git grep -E`): BSD/Apple grep (macOS's system `grep`,
-    which `git grep` shells out to on that platform) does not support the
-    `\\b`/`\\s` PCRE-style escapes `-E`/POSIX ERE define, so the previous
-    `git grep -InE '\\bfn\\s+NAME\\s*[(<]'` resolved NOTHING on macOS while
-    working on Linux CI — a platform-dependent gate that silently diverged
-    (44 findings on macOS vs 42 on Linux, two allowlist entries dead on the
-    CI platform that actually runs this check). Reading every tracked `.rs`
-    file's text once and matching with Python's own `re` module is
-    platform-independent by construction.
+def build_test_fn_index() -> set[str]:
+    """Every `fn <name>` in a tracked `.rs` file that is either
+    `#[test]`-attributed (any attribute whose text contains "test",
+    case-insensitively — covers `#[test]`, `#[tokio::test]`,
+    `#[test_log::test]`, ...; walks backward through however many stacked
+    attribute lines sit directly above the `fn` line) or a `pub fn`
+    declared in a file under a `tests/` directory.
+
+    Round-3 audit fix: the round-2 index accepted ANY `fn` with a matching
+    name, which is what let `` see [`below`] ``/`` see below `` resolve
+    against a real, but wholly unrelated, non-test `fn below` — a citation
+    is only real evidence if it points at something that actually
+    PRODUCED a result (a test), not merely at some function that happens
+    to share a word with ordinary English prose ("below", "table", "step"
+    are all plausible fn names somewhere in a repo this size).
     """
     names: set[str] = set()
     for rel in _run(["git", "ls-files", "--", "*.rs"]).splitlines():
         path = REPO_ROOT / rel
         try:
-            text = path.read_text(errors="ignore")
+            lines = path.read_text(errors="ignore").splitlines()
         except OSError:
             continue
-        for m in _FN_DEF_RE.finditer(text):
-            names.add(m.group(1))
+        under_tests_dir = f"/{rel}".find("/tests/") != -1 or rel.startswith("tests/")
+        for i, line in enumerate(lines):
+            m = _FN_LINE_RE.match(line)
+            if not m:
+                continue
+            name = m.group(1)
+            is_pub = bool(re.match(r"^\s*pub\b", line))
+            has_test_attr = False
+            j = i - 1
+            while j >= 0 and _ATTR_LINE_RE.match(lines[j]):
+                if "test" in lines[j].lower():
+                    has_test_attr = True
+                j -= 1
+            if has_test_attr or (is_pub and under_tests_dir):
+                names.add(name)
     return names
 
 
-def fn_exists(name: str, fn_index: set[str], extra: set[str] | None = None) -> bool:
-    """True if `name` is a real `fn` definition somewhere in the tracked
-    `.rs` tree (`fn_index`, built once by `build_fn_index`), OR `name` is in
-    `extra` — the self-test's injected set of SYNTHETIC-negative fixture
-    names only (a fn that deliberately does NOT exist in the real tree, used
-    to prove the resolver correctly rejects it). The self-test's
-    positive-resolution leg cites a REAL tracked fn (`main`) and goes
-    through `fn_index` like every other caller — `extra` is never used to
-    fake a positive resolution.
-    """
-    if name in fn_index:
-        return True
-    if extra and name in extra:
-        return True
-    return False
+def is_test_fn(name: str, fn_index: set[str]) -> bool:
+    return name in fn_index
 
 
 def strip_comment_prefix(line: str) -> str:
     return _COMMENT_PREFIX_RE.sub("", line, count=1).lstrip()
+
+
+def _citation_target(text_after_keyword: str) -> str | None:
+    """`text_after_keyword` is everything right after `see `/`printed by `
+    in a joined, comment-prefix-stripped block string. Returns the full
+    matched `::`-path (e.g. `ops::softmax::MAX_LAST_DIM`), trying the
+    rustdoc-link form first, then a bare backtick-wrapped form, then a
+    fully bare form — or `None` if none match.
+    """
+    for pattern in (_BRACKET_BACKTICK_TARGET_RE, _BACKTICK_TARGET_RE, _BARE_TARGET_RE):
+        m = pattern.match(text_after_keyword)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _last_segment(path: str) -> str:
+    return path.rsplit("::", 1)[-1]
+
+
+def is_block_bound(block_text: str, fn_index: set[str], tracked: set[str]) -> bool:
+    """`block_text` is the WHOLE comment block's text, comment prefixes
+    stripped and lines joined by a single space (so a `see`/`printed by`
+    keyword at one line's end and its target on the next line resolve
+    exactly like an unwrapped one-line citation would). True iff ANY
+    citation anywhere in it resolves.
+    """
+    for kw_re in (_SEE_KW_RE, _PRINTED_BY_KW_RE):
+        for m in kw_re.finditer(block_text):
+            target = _citation_target(block_text[m.end() :])
+            if target and is_test_fn(_last_segment(target), fn_index):
+                return True
+
+    for m in _MEASURED_BY_KW_RE.finditer(block_text):
+        am = _ARTIFACT_PATH_RE.match(block_text[m.end() :])
+        if am:
+            candidate = am.group(1).strip("`").rstrip(".,;")
+            if candidate in tracked:
+                return True
+
+    for m in _PRODUCER_TAG_RE.finditer(block_text):
+        raw = m.group(1).strip()
+        target = _citation_target(raw)
+        if target and is_test_fn(_last_segment(target), fn_index):
+            return True
+        candidate = raw.strip("`").rstrip(".,;")
+        if candidate in tracked:
+            return True
+
+    return False
+
+
+# --- scanning ------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -292,198 +343,93 @@ def is_scan_line(line: str) -> bool:
     return False
 
 
-def _tail_before(line: str, start: int) -> str:
-    """The text immediately before `start`, with trailing whitespace and
-    backticks stripped — the shared lookbehind window every shape exclusion
-    below tests against.
+def is_comment_line(line: str) -> bool:
+    return line.lstrip().startswith("//")
+
+
+def compute_blocks(lines: list[str]) -> list[int]:
+    """`block_of[i]` is the block id line `i` belongs to. Contiguous
+    comment lines (any run of lines starting with `//`, covering `///`,
+    `//!`, and plain `//` — including a bare `//`/`///`/`//!` paragraph
+    separator, which still starts with `//` and so does NOT break the
+    block) share one id; every other line (code, including an
+    `assert!`/`panic!` line) is its own singleton block.
     """
-    return line[:start].rstrip().rstrip("`").rstrip()
+    block_of = [0] * len(lines)
+    next_id = 0
+    current: int | None = None
+    for i, line in enumerate(lines):
+        if is_comment_line(line):
+            if current is None:
+                current = next_id
+                next_id += 1
+            block_of[i] = current
+        else:
+            block_of[i] = next_id
+            next_id += 1
+            current = None
+    return block_of
 
 
-def find_number_hits(
-    line: str, trigger_context: str, prev_line: str = "", next_line: str = ""
-) -> list[NumberHit]:
-    """Measurement-shaped numbers on `line`, each REQUIRED to sit within
-    `TRIGGER_WINDOW` lines (i.e. somewhere in `trigger_context`) of one of
-    `ADJACENT_WORD_ALTS` (see module doc's WHAT COUNTS AS section), and each
-    passed through the shape exclusions documented there. `prev_line` is
-    only consulted when `line`'s own text before the number is empty (a
-    doc-comment line-wrap put the number right after the `//`/`///` prefix
-    with nothing else before it) — a wrapped `lr =\\n0.001` counts as
-    definitional the same as an unwrapped `lr = 0.001` would.
+def find_number_hits(line: str) -> list[NumberHit]:
+    """Measurement-shaped numbers on `line`, passed through the shape
+    exclusions the module doc's WHAT COUNTS AS section documents. Trigger-
+    word and binding checks are NOT done here — both are BLOCK-scoped (see
+    `scan_lines`), not line-scoped.
     """
-    if not _ADJACENT_RE.search(trigger_context):
-        return []
-    if _NAMED_CONST_LINK_RE.search(line):
-        return []
-
     version_spans = [m.span() for m in VERSION_RE.finditer(line)]
 
     def in_version(span: tuple[int, int]) -> bool:
         return any(_overlaps(span, v) for v in version_spans)
 
-    def is_definitional_or_versioned(start: int) -> bool:
-        tail = _tail_before(line, start)
-        if not strip_comment_prefix(line[:start]).strip() and prev_line:
-            tail = _tail_before(prev_line, len(prev_line))
-        return bool(_DEFINITIONAL_OPERATOR_RE.search(tail)) or bool(
-            _CRATE_NAME_PREFIX_RE.search(tail)
-        )
+    def is_versioned(start: int) -> bool:
+        tail = line[:start].rstrip().rstrip("`").rstrip()
+        return bool(_CRATE_NAME_PREFIX_RE.search(tail))
 
-    def is_call_argument(start: int) -> bool:
-        """A number that is a non-first, comma-separated argument inside an
-        UNCLOSED `identifier(` on this same line — `Normal(0, 0.02)`,
-        `swept ... values (\\`0.1\\`, \\`1.3/16\\`, ...)` — is a literal
-        parameter in an input list, not free-standing prose reporting an
-        observed result.
-        """
-        tail = _tail_before(line, start)
-        if not tail.endswith(","):
-            return False
-        prefix = line[:start]
-        return prefix.count("(") > prefix.count(")")
-
-    claimed: list[tuple[int, int]] = []
     hits: list[NumberHit] = []
 
     for m in NM_RE.finditer(line):
         span = m.span()
-        if in_version(span):
+        start, end = span
+        if in_version(span) or is_versioned(start):
             continue
         text = m.group(0)
-        start = span[0]
-        if is_definitional_or_versioned(start) or is_call_argument(start):
-            continue
         _, denom_str = re.split(r"\s*/\s*", text)
         try:
             denom = int(denom_str)
         except ValueError:
             denom = None
-        # k/N where N < 16: an index/enumeration/small ratio, not a
-        # mismatch-element count (this codebase's own real measured spans
-        # start in the hundreds).
-        if denom is not None and denom < 16:
+        if denom is None or denom < 64:
             continue
         prev_char = line[start - 1] if start > 0 else ""
-        # x^2/2-style exponent, or a grouped-division numerator right after
-        # a closing paren — neither is a measured ratio.
-        if prev_char in ("^", ")"):
+        if prev_char in (".", "/", "^"):
             continue
-        # "= 0/0" indeterminate form: covered by `is_definitional_or_versioned`
-        # above (an immediately-preceding "="). A bare "0/0" with NO
-        # preceding "=" is deliberately left flagged — the audit scoped this
-        # exclusion to the "= 0/0" shape specifically, not every "0/0".
-        # "n=32/900"-style shape enumeration.
-        if re.search(r"(?i)\bn\s*=\s*$", line[:start].rstrip()):
+        if end < len(line) and line[end] == "/":
             continue
-        claimed.append(span)
+        if _N_EQUALS_CHAIN_RE.search(line[:start].rstrip()):
+            continue
         hits.append(NumberHit(text, "N/M"))
 
+    pct_spans: list[tuple[int, int]] = []
     for m in PCT_RE.finditer(line):
         span = m.span()
-        if in_version(span):
+        if in_version(span) or is_versioned(span[0]):
             continue
-        if is_definitional_or_versioned(span[0]) or is_call_argument(span[0]):
-            continue
-        after = line[span[1] :]
-        if not after.strip() and next_line:
-            after = strip_comment_prefix(next_line)
-        if _STATISTICAL_CONVENTION_TAIL_RE.match(after):
-            continue
-        claimed.append(span)
+        pct_spans.append(span)
         hits.append(NumberHit(m.group(0), "%"))
 
     for m in COSINE_RE.finditer(line):
         span = m.span()
-        if in_version(span):
+        if in_version(span) or is_versioned(span[0]):
             continue
-        if is_definitional_or_versioned(span[0]) or is_call_argument(span[0]):
-            continue
-        # One hit per token: a percentage's own fractional digits (e.g.
-        # `0.52` inside `0.52%`) are already claimed above; don't also flag
-        # them as a separate bare cosine.
-        if any(_overlaps(span, c) for c in claimed):
+        # One hit per token: a percentage's own fractional digits (e.g. the
+        # `0.52` inside `0.52%`) are already claimed above as the `%` hit —
+        # don't also flag the identical span as a separate bare cosine.
+        if any(_overlaps(span, p) for p in pct_spans):
             continue
         hits.append(NumberHit(m.group(0), "cosine"))
 
     return hits
-
-
-def _resolve_wrap_target(
-    lines: list[str],
-    i: int,
-    keyword: str,
-    fn_index: set[str],
-    extra_fns: set[str] | None,
-    tracked: set[str],
-) -> bool:
-    if i + 1 >= len(lines):
-        return False
-    nxt = strip_comment_prefix(lines[i + 1])
-    if keyword in ("see", "printed by"):
-        m = re.match(r"`?([A-Za-z_][A-Za-z0-9_]*)", nxt)
-        return bool(m) and fn_exists(m.group(1), fn_index, extra_fns)
-    if keyword == "measured by":
-        m = re.match(r"`?([^\s`,;]+)", nxt)
-        if not m:
-            return False
-        candidate = m.group(1).strip("`").rstrip(".,;")
-        return candidate in tracked
-    return False
-
-
-def _resolve_tag_or_citation(
-    candidate: str, fn_index: set[str], extra_fns: set[str] | None, tracked: set[str]
-) -> bool:
-    candidate = candidate.strip().strip("`").rstrip(".,;")
-    if not candidate:
-        return False
-    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", candidate) and fn_exists(
-        candidate, fn_index, extra_fns
-    ):
-        return True
-    return candidate in tracked
-
-
-def is_bound(
-    lines: list[str],
-    i: int,
-    fn_index: set[str],
-    extra_fns: set[str] | None,
-    tracked: set[str],
-) -> bool:
-    """True iff the number on `lines[i]` has a producer citation TIGHTLY
-    bound to it — see module doc's PRODUCER CITATION section for the exact
-    four accepted shapes. No line-window search: a citation elsewhere in the
-    same comment block, even one line further than the wrap case allows,
-    does not bind.
-    """
-    line = lines[i]
-
-    m = SEE_RE.search(line)
-    if m and fn_exists(m.group(1), fn_index, extra_fns):
-        return True
-    m = PRINTED_BY_RE.search(line)
-    if m and fn_exists(m.group(1), fn_index, extra_fns):
-        return True
-    m = MEASURED_BY_RE.search(line)
-    if m:
-        candidate = m.group(1).strip("`").rstrip(".,;")
-        if candidate in tracked:
-            return True
-    m = PRODUCER_TAG_RE.search(line)
-    if m and _resolve_tag_or_citation(m.group(1), fn_index, extra_fns, tracked):
-        return True
-    if NO_PRODUCER_RE.search(line):
-        return True
-
-    wrap = _WRAP_TAIL_RE.search(line)
-    if wrap and _resolve_wrap_target(
-        lines, i, wrap.group(1).lower(), fn_index, extra_fns, tracked
-    ):
-        return True
-
-    return False
 
 
 @dataclass(frozen=True)
@@ -496,44 +442,53 @@ class Finding:
 
 
 def scan_lines(
-    lines: list[str],
-    file_label: str,
-    fn_index: set[str],
-    tracked: set[str],
-    extra_fns: set[str] | None = None,
+    lines: list[str], file_label: str, fn_index: set[str], tracked: set[str]
 ) -> list[Finding]:
     """`lines` is 0-indexed; line numbers reported are 1-indexed."""
     n = len(lines)
     scan_mask = [is_scan_line(l) for l in lines]
+    block_of = compute_blocks(lines)
+
+    block_line_indices: dict[int, list[int]] = {}
+    for i in range(n):
+        block_line_indices.setdefault(block_of[i], []).append(i)
+
+    trigger_text_cache: dict[int, str] = {}
+    clean_text_cache: dict[int, str] = {}
+
+    def trigger_text(bid: int) -> str:
+        if bid not in trigger_text_cache:
+            trigger_text_cache[bid] = "\n".join(lines[j] for j in block_line_indices[bid])
+        return trigger_text_cache[bid]
+
+    def clean_text(bid: int) -> str:
+        if bid not in clean_text_cache:
+            clean_text_cache[bid] = " ".join(
+                strip_comment_prefix(lines[j]) for j in block_line_indices[bid]
+            )
+        return clean_text_cache[bid]
 
     findings: list[Finding] = []
     for i, line in enumerate(lines):
         if not scan_mask[i]:
             continue
-        # A doc-comment line immediately preceding (zero gap) a `const NAME:
-        # T = ...;` declaration is that constant's own closing summary
-        # line — its "producer" is the declaration one line below, not a
-        # fresh measurement claim. Deliberately zero-gap only: a number on a
-        # line separated from its const by even one more `///` continuation
-        # line is left flagged (two files in this tree place a genuinely
-        # MEASURED result, not a definition, exactly one comment line above
-        # their own const declaration — a wider lookahead could not tell
-        # those two shapes apart, so this stays the narrower, safer rule).
-        if i + 1 < n and _CONST_DECL_RE.match(lines[i + 1]):
+        hits = find_number_hits(line)
+        if not hits:
             continue
-        trig_lo = max(0, i - TRIGGER_WINDOW)
-        trig_hi = min(n - 1, i + TRIGGER_WINDOW)
-        trigger_context = "\n".join(lines[trig_lo : trig_hi + 1])
-        prev_line = lines[i - 1] if i > 0 else ""
-        next_line = lines[i + 1] if i + 1 < n else ""
-        for hit in find_number_hits(line, trigger_context, prev_line, next_line):
-            if not is_bound(lines, i, fn_index, extra_fns, tracked):
-                findings.append(Finding(file_label, i + 1, hit.text, hit.kind, line))
+        bid = block_of[i]
+        if not _ADJACENT_RE.search(trigger_text(bid)):
+            continue
+        if NO_PRODUCER_RE.search(line):
+            continue
+        if is_block_bound(clean_text(bid), fn_index, tracked):
+            continue
+        for hit in hits:
+            findings.append(Finding(file_label, i + 1, hit.text, hit.kind, line))
     return findings
 
 
 def scan_tree() -> list[Finding]:
-    fn_index = build_fn_index()
+    fn_index = build_test_fn_index()
     tracked = tracked_files()
     findings: list[Finding] = []
     for root in SCAN_ROOTS:
@@ -548,7 +503,7 @@ def scan_tree() -> list[Finding]:
     return findings
 
 
-# --- allowlist ---------------------------------------------------------
+# --- allowlist -------------------------------------------------------------
 
 
 def normalize_line(text: str) -> str:
@@ -601,57 +556,106 @@ def report(findings: list[Finding]) -> int:
     for f in unallowlisted:
         print(
             f"  {f.file}:{f.line_no}: {f.kind} `{f.number}` has no producer citation "
-            "bound to it (see <fn> / printed by <fn> / measured by <path> / "
-            "[producer: <fn_or_path>]), and no `no-producer:` opt-out on its own line.",
+            "resolvable anywhere in its comment block (see [`fn`] / see mod::fn / "
+            "printed by <same> / measured by <path> / [producer: <same>]), and no "
+            "`no-producer:` opt-out on its own line.",
             file=sys.stderr,
         )
     print(
         "\ndoc-numbers-have-producers: a measurement-shaped number in a kernel/test doc "
         "comment or assert! message claims an observed run with nothing in the tree that "
-        "produces it. Cite the real producer (`see <fn>`, `printed by <fn>`, `measured by "
-        "<path>`, or `[producer: <fn_or_path>]`), or tag it `no-producer: <reason>` if it "
-        "is genuinely derived (not measured) — never add it to "
-        f"{ALLOWLIST_PATH.relative_to(REPO_ROOT)}, which only ever shrinks.",
+        "produces it. Cite the real producer anywhere in the same comment block (`see "
+        "[`fn`]`, `see mod::fn`, `printed by <same>`, `measured by <path>`, or `[producer: "
+        "<same>]`, where the resolved fn must be a #[test] function or a pub fn under "
+        "tests/), or tag the number `no-producer: <reason>` on its own line if it is "
+        f"genuinely derived — never add it to {ALLOWLIST_PATH.relative_to(REPO_ROOT)}, "
+        "which only ever shrinks.",
         file=sys.stderr,
     )
     return 1
 
 
 def check_allowlist_only_shrinks() -> int:
-    """The allowlist tracks PRE-EXISTING debt only. This diffs the working
-    tree's `ci/doc_number_allowlist.txt` against the version committed on
-    `origin/main` and fails on any ADDED entry (never on a removed one — a
-    shrink is always welcome). The one network call in this gate (`git
-    fetch origin main`), matching `swarm.yml`'s own TOUCHED-guard precedent
-    for comparing a branch against its merge base.
+    """The allowlist tracks PRE-EXISTING debt only and may only shrink.
+
+    Round-3 audit fix: the round-2 version used `check=False` on `git
+    fetch` and a single `returncode == 0` test on `git show`, so a FAILED
+    fetch (network flake, `origin` misconfigured) and a genuinely ABSENT
+    file on `origin/main` were indistinguishable — both silently took the
+    "nothing to compare against, pass" branch, meaning a fetch failure
+    made this leg fail OPEN instead of closed. Now: `git fetch` raises via
+    `check=True`; `git rev-parse --verify origin/main` must succeed (a
+    real ref) or the leg FAILS outright with that fact stated; only once
+    the ref is confirmed to resolve is "the allowlist file itself doesn't
+    exist there" checked via `git cat-file -e`, and ONLY THAT case is
+    treated as the legitimate bootstrap (this PR is the one introducing
+    the file) — the message states which case fired.
     """
-    subprocess.run(
-        ["git", "fetch", "--quiet", "origin", "main"], cwd=REPO_ROOT, check=False
-    )
-    base_out = subprocess.run(
-        ["git", "show", "origin/main:ci/doc_number_allowlist.txt"],
+    try:
+        subprocess.run(
+            ["git", "fetch", "--quiet", "origin", "main"],
+            cwd=REPO_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        print("doc-number-allowlist-only-shrinks: FAIL", file=sys.stderr)
+        print(
+            f"  git fetch origin main failed (exit {exc.returncode}): "
+            f"{exc.stderr.strip() if exc.stderr else '<no stderr>'}",
+            file=sys.stderr,
+        )
+        print(
+            "\ndoc-number-allowlist-only-shrinks: cannot compare against origin/main "
+            "because the fetch itself failed — this fails CLOSED (a network/config "
+            "problem is not license to skip the only-shrinks check), not open.",
+            file=sys.stderr,
+        )
+        return 1
+
+    rev = subprocess.run(
+        ["git", "rev-parse", "--verify", "origin/main"],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
     )
-    if base_out.returncode != 0:
-        # `origin/main` has no allowlist file at all yet — this IS the PR
-        # introducing it. There is no baseline to shrink relative to, so
-        # every entry is, by construction, "new" against an empty file;
-        # trivially pass rather than permanently red the one PR that lands
-        # the mechanism. Strict enforcement (fails on any entry ADDED
-        # relative to a real baseline) starts on the very next PR, once
-        # this one merges and `origin/main` has the file.
-        current = load_allowlist()
+    if rev.returncode != 0:
+        print("doc-number-allowlist-only-shrinks: FAIL", file=sys.stderr)
         print(
-            "doc-number-allowlist-only-shrinks: OK (bootstrap) — "
-            f"origin/main has no {ALLOWLIST_PATH.relative_to(REPO_ROOT)} yet "
-            f"({len(current)} entries in this branch's copy establish the baseline)."
+            "  origin/main does not resolve after a successful fetch — "
+            f"`git rev-parse --verify origin/main` exit {rev.returncode}: "
+            f"{rev.stderr.strip()}",
+            file=sys.stderr,
+        )
+        print(
+            "\ndoc-number-allowlist-only-shrinks: this is NOT the bootstrap case (that "
+            "requires origin/main to resolve, just without the allowlist file) — it is an "
+            "unresolvable ref, which fails CLOSED.",
+            file=sys.stderr,
+        )
+        return 1
+
+    file_exists = (
+        subprocess.run(
+            ["git", "cat-file", "-e", "origin/main:ci/doc_number_allowlist.txt"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+        ).returncode
+        == 0
+    )
+    current = load_allowlist()
+
+    if not file_exists:
+        print(
+            "doc-number-allowlist-only-shrinks: OK (bootstrap) — origin/main resolves "
+            f"({rev.stdout.strip()}) but has no {ALLOWLIST_PATH.relative_to(REPO_ROOT)} "
+            f"yet: this branch's {len(current)} entries establish the baseline."
         )
         return 0
-    base_text = base_out.stdout
+
+    base_text = _run(["git", "show", "origin/main:ci/doc_number_allowlist.txt"])
     base = parse_allowlist_text(base_text)
-    current = load_allowlist()
     added = current - base
 
     if added:
@@ -662,9 +666,10 @@ def check_allowlist_only_shrinks() -> int:
             "\ndoc-number-allowlist-only-shrinks: this branch adds a NEW entry to "
             f"{ALLOWLIST_PATH.relative_to(REPO_ROOT)}. The allowlist tracks pre-existing "
             "debt from before this gate landed and may never grow. Do not add an entry "
-            "here — cite the real producer instead (`see <fn>`, `printed by <fn>`, "
-            "`measured by <path>`, or `[producer: <fn_or_path>]`), or tag the number "
-            "`no-producer: <reason>` if it is genuinely derived, not measured.",
+            "here — cite the real producer instead anywhere in the number's comment block "
+            "(`see [`fn`]`, `see mod::fn`, `printed by <same>`, `measured by <path>`, or "
+            "`[producer: <same>]`), or tag the number `no-producer: <reason>` on its own "
+            "line if it is genuinely derived, not measured.",
             file=sys.stderr,
         )
         return 1
@@ -676,194 +681,249 @@ def check_allowlist_only_shrinks() -> int:
     return 0
 
 
-# --- self-test -------------------------------------------------------------
-
-REAL_TRACKED_FN = "main"  # a real fn this repo's own tracked .rs tree defines many times over
-
-POSITIVE_FRAGMENT = """
-// measured on jammi-a100: 5145/16384 `m` elements differed from the eager
-// CUDA chain at t=3 with nonzero prior moments — no producer cited anywhere
-// near this claim.
-"""
-
-POSITIVE_PROBE_1 = """
-// The RED drill measured 67546/262144 elements against the f32 truth run,
-// with no citation anywhere near this line.
-"""
-
-POSITIVE_PROBE_2 = """
-// bf16 scored 0.610 against the f32 truth run over the whole fixture,
-// versus 0.810 for the f32-only baseline — neither number is cited.
-"""
-
-POSITIVE_PROBE_3 = """
-// the two arms differ on 176/4096 values in this sweep, uncited.
-"""
-
-POSITIVE_PROBE_4 = """
-// the fused kernel gives a 39% memory reduction measured on that pod,
-// with nothing here saying how.
-"""
-
-NEGATIVE_CITED_SAME_LINE_FRAGMENT = f"""
-// 100% (6144/6144) elements bit-match — see {REAL_TRACKED_FN} for the run
-// that produced this count.
-"""
-
-NEGATIVE_CITED_WRAP_FRAGMENT = """
-// 100% (6144/6144) elements bit-match — measured by
-// Cargo.toml, a real tracked path (used here only as a stand-in artifact).
-"""
-
-NEGATIVE_TAG_FRAGMENT = f"""
-// worst observed 0.796 cosine mismatch [producer: {REAL_TRACKED_FN}] on this
-// fixture.
-"""
-
-NEGATIVE_NO_PRODUCER_OWN_LINE_FRAGMENT = """
-// bf16 mantissa ceiling is 0.78% observed — no-producer: derived from the
-// IEEE 754 bf16 format, not measured.
-"""
-
-NEGATIVE_NO_PRODUCER_WRONG_LINE_FRAGMENT = """
-// bf16 mantissa ceiling is 0.78% observed, on this fixture.
-// no-producer: derived from the IEEE 754 bf16 format, not measured.
-"""
-
-NEGATIVE_NO_TRIGGER_WORD_FRAGMENT = """
-// the significance level is a fixed 95% CI (DEFAULT_REGRESSION_THRESHOLD is
-// a fixed 30%, see the module docs), plain statistical constants with no
-// claim attached to either one.
-"""
-
-NEGATIVE_UNRESOLVABLE_CITATION_FRAGMENT = """
-// 26% of elements diverge — see the module docs for context.
-"""
-
-NEGATIVE_SHAPE_EXCLUSIONS_FRAGMENT = """
-// candle-kernels-0.11.0 measured phi(x) = (1/sqrt(2*pi)) * exp(-x^2/2),
-// and the degenerate-variance regime is bound/max|signal| = 0/0 — the
-// strongest possible measurement of an eps-sign flip. Elsewhere n=32/900
-// values were observed, and 1/8 of elements differed in a small run.
-// candle-core 0.11's backend has no observed BF16 impl. FLOOR = 2^-2 = 0.25
-// covers every element measured; recall@k >= 0.95 is the observed gate
-// floor. Reports a 95% CI alongside the observed point mean, a fixed
-// significance level, not a measured value: Both A and B ~ Normal(0, 0.02),
-// independent name-keyed streams, differed on the observed run. The
-// two-tailed significance level for this measured, observed gate is a 95%
-// interval, the same level another module's bootstrap significance CI uses.
-// The wrapped form: this measured, observed gate's significance level is a
-// 95%
-// interval too, wrapped mid-phrase across the doc-comment line break.
-"""
+# --- self-test ---------------------------------------------------------
 
 
-def _assert_flagged(name: str, fragment: str, fn_index: set[str], tracked: set[str], failures):
-    hits = scan_lines(fragment.strip("\n").splitlines(), f"<self-test: {name}>", fn_index, tracked)
-    if not hits:
-        failures.append(f"self-test FAILED ({name}): expected a finding, got none")
+def _pick_real_test_fn(fn_index: set[str]) -> str:
+    """A REAL `#[test]`/pub-fn-under-tests name, picked from the live
+    tree at self-test time — never hardcoded, so this fixture never rots
+    as the repo's own test names change. Deterministic (sorted) so the
+    self-test's own output is stable across runs.
+    """
+    if not fn_index:
+        raise SystemExit(
+            "check_doc_numbers_have_producers self-test: build_test_fn_index() found "
+            "ZERO test functions in the tracked tree — cannot build the positive-"
+            "resolution fixture. This means either the tree has no #[test] fns at all "
+            "(implausible) or build_test_fn_index() itself is broken."
+        )
+    return sorted(fn_index)[0]
 
 
-def _assert_clean(
-    name: str, fragment: str, fn_index: set[str], tracked: set[str], failures, extra_fns=None
-):
-    hits = scan_lines(
-        fragment.strip("\n").splitlines(), f"<self-test: {name}>", fn_index, tracked, extra_fns
-    )
-    if hits:
-        failures.append(f"self-test FAILED ({name}): expected no finding, got {hits}")
+def _scan_fragment(text: str, label: str, fn_index: set[str], tracked: set[str]) -> list[Finding]:
+    return scan_lines(text.strip("\n").splitlines(), label, fn_index, tracked)
 
 
 def self_test() -> int:
     failures: list[str] = []
-    fn_index = build_fn_index()
+    fn_index = build_test_fn_index()
     tracked = tracked_files()
+    real_fn = _pick_real_test_fn(fn_index)
 
-    if REAL_TRACKED_FN not in fn_index:
-        failures.append(
-            f"self-test FAILED: precondition — {REAL_TRACKED_FN!r} must be a real fn "
-            "somewhere in the tracked .rs tree for the positive-resolution leg to mean "
-            "anything; build_fn_index() did not find it"
-        )
+    def flagged(name: str, text: str) -> None:
+        hits = _scan_fragment(text, f"<self-test: {name}>", fn_index, tracked)
+        if not hits:
+            failures.append(f"self-test FAILED ({name}): expected a finding, got none")
 
-    _assert_flagged("positive: unproduced measurement", POSITIVE_FRAGMENT, fn_index, tracked, failures)
-    _assert_flagged("probe 1: RED drill 67546/262144", POSITIVE_PROBE_1, fn_index, tracked, failures)
-    _assert_flagged("probe 2: 0.610 vs 0.810", POSITIVE_PROBE_2, fn_index, tracked, failures)
-    _assert_flagged("probe 3: differ on 176/4096 values", POSITIVE_PROBE_3, fn_index, tracked, failures)
-    _assert_flagged("probe 4: 39% memory reduction on a pod", POSITIVE_PROBE_4, fn_index, tracked, failures)
+    def clean(name: str, text: str) -> None:
+        hits = _scan_fragment(text, f"<self-test: {name}>", fn_index, tracked)
+        if hits:
+            failures.append(f"self-test FAILED ({name}): expected no finding, got {hits}")
 
-    _assert_clean(
-        "cited same-line, real fn (no extra_fns)",
-        NEGATIVE_CITED_SAME_LINE_FRAGMENT,
-        fn_index,
-        tracked,
-        failures,
+    # --- (A) citation grammar: positive forms, resolved via a REAL test fn ---
+    clean(
+        "see [`fn`] rustdoc-link form",
+        f"""
+// measured 5145/16384 elements differed from the eager chain — see [`{real_fn}`]
+// for the run that produced this count.
+""",
     )
-    _assert_clean(
-        "cited via wrap (measured by <path> continuing on next line)",
-        NEGATIVE_CITED_WRAP_FRAGMENT,
-        fn_index,
-        tracked,
-        failures,
+    clean(
+        "see mod::path::fn form, resolved by last segment",
+        f"""
+// measured 5145/16384 elements differed from the eager chain — see
+// some::nested::module::{real_fn} for the run that produced this count.
+""",
     )
-    _assert_clean(
-        "per-number [producer: ...] tag, real fn",
-        NEGATIVE_TAG_FRAGMENT,
-        fn_index,
-        tracked,
-        failures,
+    clean(
+        "printed by `fn` form",
+        f"""
+// 100% (6144/6144) elements bit-match — printed by `{real_fn}` for the run
+// that produced this count.
+""",
     )
-    _assert_clean(
+    clean(
+        "[producer: mod::fn] tag form",
+        f"""
+// worst observed 0.796123 cosine mismatch [producer: some::mod::{real_fn}] on
+// this fixture.
+""",
+    )
+    clean(
+        "measured by <tracked path>",
+        """
+// 100% (6144/6144) elements bit-match — measured by Cargo.toml, a real
+// tracked path (used here only as a stand-in artifact).
+""",
+    )
+
+    # --- (A) citation grammar: must NOT resolve, even if a real fn exists ---
+    flagged(
+        "see below must not resolve (fn below is not a #[test]/pub-under-tests fn)",
+        """
+// measured 87/128 elements differed from the eager chain — see below for
+// the run that produced this count.
+fn below() {}
+""",
+    )
+    flagged(
+        "see table 3 must not resolve (names no real identifier)",
+        """
+// measured 87/128 elements differed from the eager chain — see table 3
+// for the breakdown.
+""",
+    )
+    flagged(
+        "see step 2 must not resolve (names no real identifier)",
+        """
+// measured 87/128 elements differed from the eager chain — see step 2 for
+// the setup.
+""",
+    )
+
+    # --- (B) binding unit is the whole block ---
+    clean(
+        "citation one sentence earlier in the same block covers a later number",
+        f"""
+// The bound is verified directly against a real run — see [`{real_fn}`] for
+// the harness. Over that run the worst divergence measured is 0.512345 at
+// the fixture's peak magnitude, comfortably inside tolerance.
+""",
+    )
+    flagged(
+        "a blank-line-separated (different) block is NOT covered by an earlier block's citation",
+        f"""
+// see [`{real_fn}`] for the harness this whole module relies on.
+
+fn unrelated_marker() {{}}
+
+// measured 87/128 elements differed from the eager chain in a totally
+// separate block with no citation of its own.
+""",
+    )
+    clean(
         "no-producer: on the number's own line",
-        NEGATIVE_NO_PRODUCER_OWN_LINE_FRAGMENT,
-        fn_index,
-        tracked,
-        failures,
+        """
+// bf16 mantissa ceiling is 0.780000 observed — no-producer: derived from
+// the IEEE 754 bf16 format, not measured.
+""",
     )
-    # no-producer: on a DIFFERENT line must NOT bind (finding 2: "no-producer:
-    # covers ONLY its own line") — this fragment's number is expected to be
-    # FLAGGED, not clean.
-    _assert_flagged(
-        "no-producer: on the WRONG line must not bind",
-        NEGATIVE_NO_PRODUCER_WRONG_LINE_FRAGMENT,
-        fn_index,
-        tracked,
-        failures,
-    )
-    _assert_clean(
-        "no adjacent trigger word",
-        NEGATIVE_NO_TRIGGER_WORD_FRAGMENT,
-        fn_index,
-        tracked,
-        failures,
-    )
-    _assert_clean(
-        "shape exclusions (version, exponent, indeterminate, n=, k/N<16)",
-        NEGATIVE_SHAPE_EXCLUSIONS_FRAGMENT,
-        fn_index,
-        tracked,
-        failures,
+    flagged(
+        "no-producer: on a DIFFERENT line in the SAME block must still flag (line-scoped, not block-scoped)",
+        """
+// bf16 mantissa ceiling is 0.780000 observed, on this fixture.
+// no-producer: derived from the IEEE 754 bf16 format, not measured.
+""",
     )
 
-    hits = scan_lines(
-        NEGATIVE_UNRESOLVABLE_CITATION_FRAGMENT.strip("\n").splitlines(),
-        "<self-test: unresolvable citation>",
-        fn_index,
-        tracked,
+    # --- (C) number shapes ---
+    flagged(
+        "definitional '=' no longer suppresses a measured value",
+        """
+// measured on the A100: 3.1e-3 = 0.390000 of the sup; a looser bound let
+// a mutation pass.
+""",
     )
-    if not hits:
+    flagged(
+        "a [`CONST`] doc-link on the line no longer blanket-suppresses it",
+        """
+// [`SOME_CONST`] aside, the worst observed divergence measured on an
+// otherwise-idle box was 0.273456, run three of three.
+""",
+    )
+    flagged(
+        "5-6 decimal cosines are now in COSINE_RE's range",
+        """
+// worst observed cosine mismatch measured on this run: 0.123456.
+""",
+    )
+    clean(
+        "N/M with M < 64 stays excluded (index/enumeration, not a mismatch count)",
+        """
+// measured 29/32 elements differed on this fixture, a small run.
+""",
+    )
+    clean(
+        "N/M immediately preceded by '.' stays excluded (decimal-embedded fragment)",
+        """
+// measured on the A100: swept scaling 1.3/1600 against the fixture and
+// observed no divergence worth flagging in this run.
+""",
+    )
+    clean(
+        "N/M chain (a/b/c) is fully excluded in both directions",
+        """
+// measured on a run: n=32/900/1024/6144 elements differed across the
+// sweep, a shape enumeration not a single mismatch count.
+""",
+    )
+    clean(
+        "N/M immediately preceded by '^' stays excluded (exponent)",
+        """
+// measured phi(x) = exp(-x^2/6144) on this run, observed to match the
+// standard normal density.
+""",
+    )
+    clean(
+        "version strings (3- and 2-component) stay excluded",
+        """
+// candle-kernels-0.11.0 measured this; candle-core 0.11's own run
+// observed no divergence worth flagging at all in this fixture.
+""",
+    )
+    flagged(
+        "a genuine N/M (M >= 64, no chain/decimal/exponent context) is still caught",
+        """
+// candle-core 0.11's own run observed no divergence worth flagging, but
+// separately measured 128/6144 elements as a genuine finding.
+""",
+    )
+
+    # --- (F) fn_index has no extra_fns escape hatch in the production path ---
+    if is_test_fn("definitely_not_a_real_fn_anywhere", fn_index):
         failures.append(
-            "self-test FAILED: 'see the module docs' (names no grep-verifiable fn, no "
-            "tracked artifact) incorrectly satisfied the producer requirement"
+            "self-test FAILED: is_test_fn resolved a name that isn't in the real fn_index "
+            "— there is no extra_fns parameter to explain this; the resolver itself is "
+            "broken."
         )
 
-    # fn_exists: extra_fns is for SYNTHETIC negatives only — a name not in
-    # the real tree must still resolve when explicitly injected, but must
-    # NOT resolve without it.
-    if fn_exists("definitely_not_a_real_fn_anywhere", fn_index, None):
-        failures.append("self-test FAILED: fn_exists resolved a nonexistent fn with no extra_fns")
-    if not fn_exists("definitely_not_a_real_fn_anywhere", fn_index, {"definitely_not_a_real_fn_anywhere"}):
-        failures.append("self-test FAILED: fn_exists did not resolve a name explicitly in extra_fns")
+    # --- the eight audit-reworded probes (all MUST be caught) ----------------
+    probes = {
+        "probe 1: measured X = Y (definitional-= no longer kills it)": """
+// The RED drill's fused arm measured on the A100: 67546/262144 elements
+// differed = 0.257600 of the total, no producer cited.
+""",
+        "probe 2: [`CONST`] link no longer blanket-suppresses the line": """
+// [`REL_TOL`] context aside, bf16 scored 0.610000 against the f32 truth
+// run, versus 0.810000 for the f32-only baseline — neither is cited.
+""",
+        "probe 3: differ on N/M values, M >= 64": """
+// the two arms differ on 176/4096 values in this sweep, uncited.
+""",
+        "probe 4: percentage measured on a pod": """
+// the fused kernel gives a 39% memory reduction measured on that pod,
+// with nothing here saying how.
+""",
+        "probe 5: 5-6 decimal cosine": """
+// worst observed cosine mismatch measured on this run: 0.512345, uncited.
+""",
+        "probe 6: see below (real fn, wrong kind)": """
+// measured 512/4096 elements differed on this run — see below for the
+// harness.
+fn below() {}
+""",
+        "probe 7: see table 3 (no real identifier)": """
+// measured 512/4096 elements differed on this run — see table 3 for the
+// per-shape breakdown.
+""",
+        "probe 8: no-producer one line off in the same block": """
+// measured 512/4096 elements differed on this run, uncited on this exact
+// line.
+// no-producer: this reasoning applies to a DIFFERENT number, not this one.
+""",
+    }
+    for name, text in probes.items():
+        flagged(name, text)
 
     if failures:
         for f in failures:
@@ -872,10 +932,12 @@ def self_test() -> int:
         return 1
 
     print(
-        "doc-numbers-have-producers self-test: OK — unproduced measurements (including all "
-        "four reworded probes) flagged; same-line/wrap/tagged/no-producer-on-its-own-line "
-        "citations clean; no-producer on the wrong line still flags; shape exclusions hold; "
-        "fn_exists resolves only real or explicitly-injected names."
+        "doc-numbers-have-producers self-test: OK — citation grammar (rustdoc-link/path/"
+        "bare forms) resolves via a REAL #[test] fn and rejects see-below/table/step; "
+        "block-level binding covers a same-block citation and refuses a different block's; "
+        "no-producer: stays line-scoped; every shape exclusion (M>=64, decimal/chain/"
+        "exponent/n=/version) holds without over-firing; the definitional-= and "
+        "[`CONST`]-link exclusions are gone; all eight reworded probes caught."
     )
     return 0
 

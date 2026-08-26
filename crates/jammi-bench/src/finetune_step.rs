@@ -2323,22 +2323,84 @@ mod tests {
         );
     }
 
-    /// Lattice-cell arm for `run()`'s `peak_vram_bytes`: off any device with
-    /// no `nvidia-smi` on `PATH` (this CI/test box), `VramSampler::start()`
-    /// returns `None` (its first call to `device_memory_used_bytes()`
-    /// fails), so `run()`'s `match sampler { None => ... }` arm is what
-    /// actually executes here — pinned so a future change that panics or
-    /// fabricates a value in the absent-GPU arm reddens immediately. The
-    /// present-GPU arm (`Some(sampler) => sampler.finish(vram_baseline)`) is
-    /// the arm the F1 fix targets and is NOT observable on this box; see the
-    /// pod check named in the hand-off for that arm.
+    /// Whether THIS box can drive `VramSampler` at all — the SAME probe
+    /// `VramSampler::start()` gates on (`device_memory_used_bytes()`, an
+    /// `nvidia-smi --query-gpu=memory.used` call), so the two lattice-cell
+    /// tests below branch on exactly what `run()` branches on, never on a
+    /// proxy (a CUDA feature flag, a hostname). `JAMMI_REQUIRE_CUDA` is the
+    /// RED-on-demand hatch the crate's other device-gated tests use
+    /// (`jammi-ai`'s `cuda_device`): with it set, the arm a box CANNOT
+    /// observe is a hard failure, never a skip.
+    fn vram_probe_present() -> bool {
+        device_memory_used_bytes().is_some()
+    }
+
+    /// Lattice-cell arm for `run()`'s `peak_vram_bytes`, NO-`nvidia-smi`
+    /// box (every CI lane): `VramSampler::start()` returns `None` (its
+    /// first `device_memory_used_bytes()` call fails), so `run()`'s `match
+    /// sampler { None => ... }` arm executes — pinned so a future change
+    /// that panics or fabricates a value in the absent-GPU arm reddens
+    /// immediately. On a box WITH `nvidia-smi` this arm is unobservable:
+    /// the test says so and returns (the sibling
+    /// `finetune_step_peak_vram_bytes_is_measured_on_a_box_with_nvidia_smi`
+    /// asserts that box's arm), and — before PR #381's fix round — asserted
+    /// `None` unconditionally, so it FAILED on every GPU box
+    /// (`Some(0.0) != None`; seen on a100b at `main` 6d07b20 and at every
+    /// PR tip since: the pod's `finetune_step::tests` leg could never be
+    /// green, which is exactly what blocked #381's cuda-run artifact).
     #[test]
     fn finetune_step_peak_vram_bytes_is_not_yet_measured_off_gpu() {
+        if vram_probe_present() {
+            eprintln!(
+                "finetune_step_peak_vram_bytes_is_not_yet_measured_off_gpu: nvidia-smi is present \
+                 on this box, so the no-GPU arm is unobservable here — see the sibling \
+                 `..._is_measured_on_a_box_with_nvidia_smi` test for this box's arm"
+            );
+            return;
+        }
         let tier = run(&tiny_params()).expect("finetune-step run");
         assert_eq!(
             tier.peak_vram_bytes.value, None,
             "no nvidia-smi on this box => VramSampler::start() returns None => \
              peak_vram_bytes must be the not-yet-measured sentinel, never a fabricated 0.0"
+        );
+        assert_eq!(tier.peak_vram_bytes.unit, "bytes");
+    }
+
+    /// The OTHER lattice-cell arm: a box WITH `nvidia-smi` (a pod).
+    /// `VramSampler::start()` returns `Some`, the sampler runs for the
+    /// whole warmup+measured loop, and `run()`'s `Some(sampler) =>
+    /// sampler.finish(vram_baseline)` arm emits a MEASURED, finite,
+    /// non-negative device-total-minus-baseline delta — `Some(0.0)` is the
+    /// honest reading for this CPU-resident tiny model (nothing of it lives
+    /// on the device; the pool high-water never moves), never the
+    /// not-yet-measured sentinel. Off a GPU box this arm is unobservable:
+    /// with `JAMMI_REQUIRE_CUDA` set that is a hard failure (the
+    /// RED-on-demand hatch, so a pod job that meant to prove this arm can
+    /// never silently skip it); otherwise the test says so and returns.
+    #[test]
+    fn finetune_step_peak_vram_bytes_is_measured_on_a_box_with_nvidia_smi() {
+        if !vram_probe_present() {
+            assert!(
+                std::env::var_os("JAMMI_REQUIRE_CUDA").is_none(),
+                "JAMMI_REQUIRE_CUDA is set but nvidia-smi is not usable on this box — the \
+                 on-GPU peak_vram_bytes arm cannot be proven here; a silent skip is not acceptable"
+            );
+            eprintln!(
+                "finetune_step_peak_vram_bytes_is_measured_on_a_box_with_nvidia_smi: no nvidia-smi \
+                 on this box, so the on-GPU arm is unobservable here — see the sibling \
+                 `..._is_not_yet_measured_off_gpu` test for this box's arm"
+            );
+            return;
+        }
+        let tier = run(&tiny_params()).expect("finetune-step run");
+        let v = tier
+            .peak_vram_bytes
+            .value
+            .expect("nvidia-smi present => VramSampler ran => peak_vram_bytes must be measured");
+        assert!(
+            v.is_finite() && v >= 0.0,
+            "measured peak_vram_bytes must be a finite non-negative delta, got {v}"
         );
         assert_eq!(tier.peak_vram_bytes.unit, "bytes");
     }

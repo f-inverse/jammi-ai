@@ -198,11 +198,16 @@ if [ "$CMD" = "up" ] && [ -z "${RP_TTL_HOURS:-}" ]; then
   # Validated HERE, under its OWN name, not left to runpod_lib.sh's shared
   # RP_TTL_HOURS check below: a bad RP_DEV_TTL_HOURS would otherwise be
   # assigned into RP_TTL_HOURS first and reported as "RP_TTL_HOURS must be
-  # a positive integer" — naming a variable the caller never set as the
-  # thing that is wrong.
+  # a positive integer" (or "> 0") — naming a variable the caller never set
+  # as the thing that is wrong. Both the digit-shape check AND the >0 check
+  # are mirrored here: "0" passes a digit-only pattern (it has no non-digit
+  # character), so without the second check RP_DEV_TTL_HOURS=0 slips past
+  # THIS validation and still gets misattributed by runpod_lib.sh's own
+  # "RP_TTL_HOURS must be > 0" once it has already been assigned in.
   case "$RP_DEV_TTL_HOURS" in
     ''|*[!0-9]*) echo "::error::RP_DEV_TTL_HOURS must be a positive integer (got '${RP_DEV_TTL_HOURS}')"; exit 2 ;;
   esac
+  [ "$RP_DEV_TTL_HOURS" -gt 0 ] || { echo "::error::RP_DEV_TTL_HOURS must be > 0"; exit 2; }
   RP_TTL_HOURS="$RP_DEV_TTL_HOURS"
   export RP_TTL_HOURS
 fi
@@ -424,33 +429,34 @@ EOF
   down)
     if rp_session_load; then
       # Never trust the locally-recorded id on its own: confirm it is BOTH
-      # still present in the account AND still carries a name this session
-      # could plausibly own before terminating anything. This is what stops
-      # `down` from ending a pod that a race with another `up` on the same
-      # alias silently swapped in underneath this session's record
-      # (2026-08-25 incident) — a mismatch refuses rather than acts.
-      #
-      # A meta written before RP_TTL_HOURS was tracked in the session file
-      # has no such line — `${RP_TTL_HOURS:-8}` cannot tell that apart from
-      # an EXPLICIT ttl8 record, and confidently verifying against the wrong
-      # guessed "8" refused to release a real jammi-gpu-ttl72 pod this
-      # tooling itself rented (it then billed its full 72h). Checked on the
-      # META FILE, not the fallback-defaulted shell variable, so absence is
-      # representable: pass rp_pod_verify an EMPTY ttl when the file does not
-      # record one, and it matches by id + name SHAPE alone instead of a
-      # specific number (see rp_pod_verify's own doc in runpod_lib.sh).
-      if grep -q '^RP_TTL_HOURS=' "$RP_META" 2>/dev/null; then
-        DOWN_TTL="$RP_TTL_HOURS"
-      else
-        DOWN_TTL=""
-      fi
-      if rp_pod_verify "$RP_POD_ID" "$DOWN_TTL" >/dev/null; then
+      # still present in the account AND named like one of this tooling's
+      # own pods before terminating anything. This is what stops `down`
+      # from ending a pod that a race with another `up` on the same alias
+      # silently swapped in underneath this session's record (2026-08-25
+      # incident) — a mismatch refuses rather than acts. The id is
+      # authoritative (RunPod pod ids are globally unique); the TTL never
+      # gates release — see rp_pod_verify's own doc in runpod_lib.sh for why
+      # two earlier attempts to make the TTL part of this check were both
+      # removed rather than patched again.
+      if rp_pod_verify "$RP_POD_ID" >/dev/null; then
         rp_terminate "$RP_POD_ID"
-        echo "=== terminated pod ${RP_POD_ID} (session '${SESSION}') ==="
-        RP_POD_ID=""   # already gone; keep the EXIT trap from acting on it again
-        rp_session_forget
-        # After the session file is gone, so the dead host stops being offered.
-        rp_ssh_config_sync
+        # rp_terminate's own result is thrown away by design (it also runs
+        # as rp_cleanup's best-effort EXIT-trap teardown) — `down` is a
+        # single deliberate action and demands independent confirmation
+        # before it forgets the local record. A rejected podTerminate must
+        # never both leak the pod AND destroy the only record pointing at
+        # it.
+        if rp_pod_gone "$RP_POD_ID"; then
+          echo "=== terminated pod ${RP_POD_ID} (session '${SESSION}') ==="
+          RP_POD_ID=""   # already gone; keep the EXIT trap from acting on it again
+          rp_session_forget
+          # After the session file is gone, so the dead host stops being offered.
+          rp_ssh_config_sync
+        else
+          echo "::error::terminate not confirmed for pod ${RP_POD_ID} (session '${SESSION}') — it is still present in the account's pod list."
+          echo "::error::the local session record is KEPT — retry: $(basename "$0") down ${SESSION}"
+          exit 1
+        fi
       else
         # The LOCAL record is deliberately KEPT here, not forgotten: this is
         # exactly the ambiguous case (a mismatched or ghost id) where a
@@ -461,10 +467,14 @@ EOF
         echo "::error::the local session record is KEPT (not forgotten), so this alias still refuses a plain 'up' rather than deploying on top of the ambiguity."
         # `reap` is ACCOUNT-WIDE — it judges EVERY jammi-gpu* pod against its
         # OWN deadline, never just this one (probed: `reap 1` terminated
-        # unrelated 4h-old pods) — so it is never a per-pod remedy and must
-        # not be suggested as one here.
+        # unrelated 4h-old pods) — so it is never a per-pod remedy. There is
+        # also no per-pod OVERRIDE remedy any more: an explicit
+        # RP_TTL_HOURS on this invocation was tried and found INERT — the
+        # exact TTL was never part of the check to begin with once
+        # rp_pod_verify moved to id + name shape, so an override had nothing
+        # left to override (round-3 audit, probe d2) — and was removed
+        # rather than left as a promise that does nothing.
         echo "::error::inspect it: $(basename "$0") ls   /   the RunPod console"
-        echo "::error::if this pod's actual TTL is known, retry verification with: RP_TTL_HOURS=<H> $(basename "$0") down ${SESSION}"
         exit 1
       fi
     else

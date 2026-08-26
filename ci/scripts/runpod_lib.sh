@@ -142,30 +142,39 @@ rp_terminate() { # $1=podId
 }
 
 # Confirm a pod id is BOTH present in the account's live pod list AND carries
-# a name this SESSION could plausibly own before any caller acts on it
-# irreversibly. Never trusts a locally-recorded id on its own: the id could
-# be stale (the account-side pod is already gone), or — the incident this
-# closes — a DIFFERENT pod could now be recorded under this session's name
-# (two processes racing `up` on the same alias). $1=podId $2=expected TTL
-# hours, OR EMPTY.
+# a name shaped like one of THIS TOOLING'S OWN pods ("<prefix>-ttl<digits>")
+# before any caller acts on it irreversibly. Never trusts a locally-recorded
+# id on its own: the id could be stale (the account-side pod is already
+# gone), or — the incident this closes — a DIFFERENT pod could now be
+# recorded under this session's name (two processes racing `up` on the same
+# alias). $1=podId.
 #
-# A non-empty $2 (the SESSION's own, as recorded at deploy time — never the
-# caller's current RP_TTL_HOURS, which may differ and would defeat the whole
-# check) requires an EXACT "<prefix>-ttl<H>" match. An EMPTY $2 means the
-# caller genuinely does not know this session's own TTL — a meta file
-# written before RP_TTL_HOURS was tracked in the session record has no such
-# line, and `${RP_TTL_HOURS:-8}` cannot tell that apart from an EXPLICIT
-# ttl8 record; confidently verifying against the wrong guessed number
-# refused to release a real `jammi-gpu-ttl72` pod this tooling itself
-# rented, which then billed its full 72h. With $2 empty this instead matches
-# on the id plus the "<prefix>-ttl<digits>" NAME SHAPE alone — the id is the
-# authoritative half of the check; the exact number only disambiguates
-# between multiple pods this tooling could have rented under one alias, and
-# an unknown number is not evidence the id is wrong.
+# The id is the AUTHORITATIVE half of this check; the exact TTL never gates
+# release, and this function no longer takes one. Two earlier versions tried
+# anyway, and both were removed rather than patched further:
+#   - v1 matched an EXACT "<prefix>-ttl<H>" against the session's own
+#     recorded TTL. A meta file written before RP_TTL_HOURS was tracked in
+#     the session record has no TTL to check, and verifying against a
+#     guessed default made `down` refuse to release a real
+#     `jammi-gpu-ttl72` pod this tooling itself rented, billing its full 72h
+#     (round-2 audit, PR #387).
+#   - v2 tried an explicit `RP_TTL_HOURS=<H>` override as the recovery path
+#     for exactly that case, documented in every refusal message. It was
+#     found INERT on every input: `rp_session_load`'s meta dot-source always
+#     ran before the override was read, so it either clobbered an explicit
+#     override (when the meta recorded a TTL) or forced it empty (when it
+#     did not) — the promised remedy never once took effect (round-3 audit,
+#     probe d2).
+# RunPod pod ids are globally unique — if the recorded id names a REAL pod
+# in the account, that pod IS the one with that id; there is no id-level
+# ambiguity a TTL number could ever have resolved. The name-shape check
+# alone already establishes "this is one of our own jammi-gpu* pods" (as
+# opposed to some entirely unrelated pod in the account); the specific
+# number never added a real safety margin once the id already matched.
 #
 # Prints the account's name for the id on success. Returns 1 (not found, or
-# name does not match/does not have the shape) or 2 (could not query the
-# account at all) — both are "do not act", never "assume safe".
+# name is not this tooling's shape) or 2 (could not query the account at
+# all) — both are "do not act", never "assume safe".
 #
 # Piped input (the account's own pod list) and script source cannot both come
 # from stdin — `python3 -` with a heredoc reads the heredoc AS THE PROGRAM,
@@ -174,11 +183,11 @@ rp_terminate() { # $1=podId
 # `rp_deploy_live`'s own parser already uses, so the piped JSON reaches
 # `sys.stdin` intact and dynamic values travel as argv, never interpolated
 # into the script source.
-rp_pod_verify() { # $1=podId $2=expectedTtlHours (empty = unknown; match by name SHAPE only)
-  local id="$1" ttl="${2:-}"
+rp_pod_verify() { # $1=podId
+  local id="$1"
   rp_gql '{"query":"query{ myself{ pods{ id name } } }"}' | python3 -c '
 import sys, json, re
-podid, ttl, prefix = sys.argv[1], sys.argv[2], sys.argv[3]
+podid, prefix = sys.argv[1], sys.argv[2]
 try:
     d = json.load(sys.stdin)
 except Exception as e:
@@ -191,24 +200,57 @@ me = (d.get("data") or {}).get("myself")
 if me is None or me.get("pods") is None:
     print("response contained no pod list", file=sys.stderr)
     sys.exit(2)
-if ttl:
-    want_desc = "%s-ttl%s" % (prefix, ttl)
-    matches = lambda name: name == want_desc
-else:
-    want_desc = "%s-ttl<digits> (this session recorded no TTL -- matching by name shape only)" % prefix
-    shape = re.compile(r"^%s-ttl[0-9]+$" % re.escape(prefix))
-    matches = lambda name: shape.match(name) is not None
+shape = re.compile(r"^%s-ttl[0-9]+$" % re.escape(prefix))
 for p in me["pods"]:
     if p.get("id") == podid:
         name = p.get("name") or ""
-        if matches(name):
+        if shape.match(name):
             print(name)
             sys.exit(0)
-        print("pod %s account name %s does not match %s -- refusing to act on it" % (podid, name, want_desc), file=sys.stderr)
+        print("pod %s account name %s is not this tooling shape %s-ttl<digits> -- refusing to act on it" % (podid, name, prefix), file=sys.stderr)
         sys.exit(1)
 print("pod %s is not in the account pod list" % podid, file=sys.stderr)
 sys.exit(1)
-' "$id" "$ttl" "$RP_POD_PREFIX"
+' "$id" "$RP_POD_PREFIX"
+}
+
+# Confirm a pod id is ABSENT from the account's live pod list — the only
+# signal `down` trusts that a `rp_terminate` mutation actually took. Never
+# assumed from rp_terminate's own return: that call throws its response away
+# (`>/dev/null 2>&1`) by design, since it also runs as rp_cleanup's
+# best-effort EXIT-trap teardown, where a network hiccup must not turn a
+# normal shell exit into a hard failure. `down` is a single, deliberate,
+# foreground action instead, and gets to demand confirmation before it
+# forgets the local record — a rejected `podTerminate` must never both leak
+# the pod AND destroy the only record pointing at it (round-3 audit
+# advisory, PR #387).
+#
+# $1=podId. Returns 0 (confirmed gone — absent from the account's pod list
+# entirely) or 1 (still present, OR the query itself failed — both are "not
+# confirmed", never "must have succeeded anyway").
+rp_pod_gone() { # $1=podId
+  local id="$1"
+  rp_gql '{"query":"query{ myself{ pods{ id } } }"}' | python3 -c '
+import sys, json
+podid = sys.argv[1]
+try:
+    d = json.load(sys.stdin)
+except Exception as e:
+    print("could not parse RunPod response: %s" % e, file=sys.stderr)
+    sys.exit(1)
+if d.get("errors"):
+    print(json.dumps(d["errors"])[:200], file=sys.stderr)
+    sys.exit(1)
+me = (d.get("data") or {}).get("myself")
+if me is None or me.get("pods") is None:
+    print("response contained no pod list", file=sys.stderr)
+    sys.exit(1)
+for p in me["pods"]:
+    if p.get("id") == podid:
+        print("pod %s is still present in the account pod list" % podid, file=sys.stderr)
+        sys.exit(1)
+sys.exit(0)
+' "$id"
 }
 
 rp_cleanup() {

@@ -143,27 +143,41 @@ should be. This, together with the check below, is what closed the
 2026-08-25 incident where an agent's `up`/`down` under an existing alias
 terminated an unrelated stale pod.
 
-### `down` verifies before it terminates
+### `down` verifies before it terminates, and confirms after
 
 `down` never trusts the locally-recorded pod id on its own. Before issuing a
 terminate, it confirms the id is **both** still present in the account's own
-live pod list **and** still carries a name this session could plausibly own
-— a mismatch refuses rather than acts. On a refusal the local session record
-is deliberately **kept**, not forgotten: this is exactly the ambiguous case
-where a follow-up `up` on the same alias most needs to still see a recorded
-pod and refuse (or ask for `--replace`) rather than deploying a third pod on
-top of the confusion. The pod itself, if it still exists under a different
-session's name, is left running for that session to manage.
+live pod list **and** named like one of this tooling's own pods
+(`<prefix>-ttl<digits>`) — a mismatch refuses rather than acts. On a refusal
+the local session record is deliberately **kept**, not forgotten: this is
+exactly the ambiguous case where a follow-up `up` on the same alias most
+needs to still see a recorded pod and refuse (or ask for `--replace`) rather
+than deploying a third pod on top of the confusion. The pod itself, if it
+still exists under a different session's name, is left running for that
+session to manage. The only manual path out of a refusal is the RunPod
+console.
 
-A session recorded before this repo tracked `RP_TTL_HOURS` in the session
-file has no TTL to check against — `down` does not guess (a guessed "8"
-against a real `jammi-gpu-ttl72` pod would refuse to release a pod this
-tooling itself rented, and it would then bill its full 72h). Absence is
-checked on the meta *file*, not a fallback-defaulted variable: with no
-recorded TTL, `down` verifies by the pod id plus the `<prefix>-ttl<digits>`
-name *shape* alone, and any refusal names the recovery command
-(`RP_TTL_HOURS=<H> gpu-dev.sh down <session>`) if you know the pod's actual
-TTL and want to force an exact match.
+The **id is authoritative**; the TTL never gates release, and the check does
+not look at it at all. Two earlier attempts to make the TTL part of this
+check were both removed rather than patched further: matching an *exact*
+recorded TTL refused to release a real `jammi-gpu-ttl72` pod when the
+session's meta predated TTL tracking (round-2 audit), and the
+`RP_TTL_HOURS=<H>` override this repo tried next as the recovery path was
+found **inert on every input** — the session meta is always loaded *before*
+any override is read, so it either got clobbered or forced empty regardless
+of what was set on the command line (round-3 audit). RunPod pod ids are
+globally unique, so a name shaped like this tooling's own naming convention,
+on the exact id this session recorded, is already sufficient; the specific
+number never added a real safety margin.
+
+`down` also confirms *after* terminating: `rp_terminate` itself throws its
+response away (it doubles as `rp_cleanup`'s best-effort EXIT-trap teardown,
+where a network hiccup must never turn a normal shell exit into a hard
+failure), so `down` re-queries the account and only forgets the local record
+once the id is confirmed **absent**. A pod still present after the
+terminate call — a rejected mutation, most likely — keeps its local record
+and exits with a message to retry `down`, rather than silently leaking the
+pod while also destroying the only record that pointed at it.
 
 ## Reproducing the shipped runtime image
 

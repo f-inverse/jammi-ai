@@ -6281,9 +6281,11 @@ enum FlashFixtureKind {
 }
 
 /// One shape's full measurement: builds `(qkv, rope, mask, dy)` once,
-/// runs the flash op (with `flash_window` — normally `== window`, a
-/// DIFFERENT value only for the RED control below), the BF16 eager
-/// composition, and the F32 reference, all from the SAME fixture.
+/// runs the flash op (with `flash_window` — normally `== window`, and
+/// `flash_scale` — normally `None`, meaning "use the SAME production
+/// scale the reference/eager legs use" — each a DIFFERENT value only for
+/// one of the two RED controls below), the BF16 eager composition, and
+/// the F32 reference, all from the SAME fixture.
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "flash-attn")]
 fn measure_flash_upstream_form(
@@ -6294,6 +6296,7 @@ fn measure_flash_upstream_form(
     head_dim: usize,
     window: Option<usize>,
     flash_window: Option<usize>,
+    flash_scale: Option<f32>,
     seed: u64,
     fixture_kind: FlashFixtureKind,
 ) -> FlashUpstreamMeasurement {
@@ -6334,7 +6337,7 @@ fn measure_flash_upstream_form(
         seq,
         heads,
         head_dim,
-        scale,
+        flash_scale.unwrap_or(scale),
         flash_window,
     );
     let (out_eager, dqkv_eager) = attention_block_bwd_production_eager_reference(
@@ -6365,7 +6368,8 @@ fn measure_flash_upstream_form(
     );
 
     let label = format!(
-        "shape=({batch},{seq},{heads},{head_dim}) window={window:?} flash_window={flash_window:?}"
+        "shape=({batch},{seq},{heads},{head_dim}) window={window:?} flash_window={flash_window:?} \
+         flash_scale={flash_scale:?}"
     );
     let m = FlashUpstreamMeasurement {
         out_fused_max: max_abs_diff_finite_first(
@@ -6435,6 +6439,7 @@ fn flash_upstream_acceptance_form_vs_f32_reference_dense_cuda() {
                         64,
                         window,
                         window,
+                        None,
                         seed,
                         fixture_kind,
                     );
@@ -6493,6 +6498,7 @@ fn flash_upstream_acceptance_form_red_control_window_radius_zero_cuda() {
         64,
         Some(64),
         Some(0),
+        None,
         74,
         FlashFixtureKind::SmoothAmplitude(12.0),
     );
@@ -6502,6 +6508,48 @@ fn flash_upstream_acceptance_form_red_control_window_radius_zero_cuda() {
          one leg -- out fused={:e} eager={:e} bound(2x)={:e}; dqkv fused={:e} eager={:e} \
          bound(3x)={:e} -- if this assertion fails, the healthy oracle above would NOT have \
          caught this defect",
+        m.out_fused_max,
+        m.out_eager_max,
+        2.0 * m.out_eager_max,
+        m.dqkv_fused_max,
+        m.dqkv_eager_max,
+        3.0 * m.dqkv_eager_max,
+    );
+}
+
+/// RED control: the FLASH leg's own `softmax_scale` DROPPED (fed `1.0`
+/// instead of the real `1 / sqrt(head_dim) = 0.125`, the "forgot to scale"
+/// defect class) while the reference/eager side keeps the real scale —
+/// must VIOLATE the upstream bound (out, dqkv, or both). An unscaled
+/// `q @ k^T` product is `8x` too large at `head_dim=64`
+/// (`sqrt(64) = 8`), which saturates the softmax onto whichever position
+/// has the single largest raw dot product per row — a qualitatively
+/// different attention distribution the 2x/3x upstream bound is not built
+/// to absorb.
+#[test]
+#[cfg(feature = "flash-attn")]
+fn flash_upstream_acceptance_form_red_control_scale_dropped_cuda() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let m = measure_flash_upstream_form(
+        &cuda,
+        8,
+        512,
+        16,
+        64,
+        Some(64),
+        Some(64),
+        Some(1.0),
+        75,
+        FlashFixtureKind::SmoothAmplitude(12.0),
+    );
+    assert!(
+        !m.out_ok() || !m.dqkv_ok(),
+        "flash softmax_scale dropped to 1.0 (real value 0.125) must VIOLATE the upstream bound \
+         on at least one leg -- out fused={:e} eager={:e} bound(2x)={:e}; dqkv fused={:e} \
+         eager={:e} bound(3x)={:e} -- if this assertion fails, the healthy oracle above would \
+         NOT have caught this defect",
         m.out_fused_max,
         m.out_eager_max,
         2.0 * m.out_eager_max,

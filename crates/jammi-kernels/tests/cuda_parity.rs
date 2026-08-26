@@ -194,6 +194,26 @@ fn measured_near_zero_floor(reference: &[f32]) -> f32 {
     }
 }
 
+// Every `f32` leg below floors its bound at `max_abs(INPUT fixture)`
+// (this file's own `max_abs`), NOT at [`measured_near_zero_floor`] of the
+// comparison (output/gradient) array. A first pass floored at the
+// comparison array's own smallest-nonzero element and a real pod run
+// found it insufficient: several ops (RoPE's rotation, GeGLU's `gelu`
+// near its root, LayerNorm's centered reduction) can produce an
+// OUTPUT/gradient value orders of magnitude smaller than the operands
+// that computed it — via ordinary cancellation, not a defect — while the
+// absolute CPU<->CUDA divergence AT that element is still set by the
+// INPUT's own `f32` precision (`ulp(max|input|)`), not by the tiny
+// output's. Flooring at the tiny output's own magnitude gave that
+// element an absurdly tight allowance and false-failed on ordinary
+// fmad/rsqrt-intrinsic noise (measured: LN `dgamma` off by ~13-14 ULPs
+// of ITS OWN value at `rows` 3-4, comfortably under `k * ulp(max_abs(xv,
+// gv))`'s much larger allowance at the same `k`). `bf16` legs keep
+// [`measured_near_zero_floor`] — untested against this failure mode
+// (the `f32` leg in each shared test function panics first), and
+// `bf16`'s much coarser mantissa makes an input-amplitude floor
+// disproportionately loose for a genuinely small `bf16` output.
+
 /// `k` bf16 ULPs of `reference`'s own magnitude (floored at `floor` for a
 /// near-zero reference) — the shared bound every `assert_*_parity_bf16` leg
 /// in this file calls, per element (never `k * ulp(max)`; see [`bf16_ulp`]
@@ -616,7 +636,7 @@ fn assert_ln_parity_f32(
     assert_eq!(out_gpu_v.len(), n, "LN GPU fwd length mismatch");
     // `k = 2 * hidden`: `mean`/`var` both reduce over `hidden`, same
     // Higham-shaped, amplitude-scaled rationale as `dx`'s bound below.
-    let out_floor = measured_near_zero_floor(&out_cpu_v);
+    let out_floor = max_abs(xv).max(max_abs(gv));
     let out_bound = |r: f32| f32_relative_bound(r, out_floor, 2.0 * hidden as f32);
     for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
         assert!(
@@ -683,7 +703,7 @@ fn assert_ln_parity_f32(
     // replaces (`ulp(1.0) * 2 * 1024 ~= 2.4e-4`... at hidden=1024 comparable,
     // but SCALES DOWN with hidden, unlike a flat constant, and the
     // discriminating proof below confirms it still catches a single ULP).
-    let dx_floor = measured_near_zero_floor(&dx_cpu);
+    let dx_floor = max_abs(xv).max(max_abs(gv));
     let dx_bound = |r: f32| f32_relative_bound(r, dx_floor, 2.0 * hidden as f32);
     for (i, (c, g)) in dx_cpu.iter().zip(dx_gpu.iter()).enumerate() {
         assert!(
@@ -704,7 +724,7 @@ fn assert_ln_parity_f32(
     assert_eq!(dg_cpu.len(), hidden);
     assert_eq!(dg_gpu.len(), hidden, "LN GPU dgamma length mismatch");
     // `dgamma` reduces over `rows`, not `hidden`.
-    let dg_floor = measured_near_zero_floor(&dg_cpu);
+    let dg_floor = max_abs(xv).max(max_abs(gv));
     let dg_bound = |r: f32| f32_relative_bound(r, dg_floor, 2.0 * rows as f32);
     for (i, (c, g)) in dg_cpu.iter().zip(dg_gpu.iter()).enumerate() {
         assert!(
@@ -1052,7 +1072,7 @@ fn assert_rope_parity_f32(cuda: &Device, batch: usize, seq: usize, hidden: usize
     // `k = 4`: RoPE is purely elementwise (one rotation per (x, x_rot)
     // pair, no cross-element reduction) — a small chain-of-two-products
     // fmad allowance, never scaled by `seq`/`hidden`.
-    let out_floor = measured_near_zero_floor(&out_cpu_v);
+    let out_floor = max_abs(xv);
     let out_bound = |r: f32| f32_relative_bound(r, out_floor, 4.0);
     for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
         assert!(
@@ -1102,7 +1122,7 @@ fn assert_rope_parity_f32(cuda: &Device, batch: usize, seq: usize, hidden: usize
         .unwrap();
     assert_eq!(dx_cpu.len(), n);
     assert_eq!(dx_gpu.len(), n, "rope GPU dx length mismatch");
-    let dx_floor = measured_near_zero_floor(&dx_cpu);
+    let dx_floor = max_abs(xv);
     let dx_bound = |r: f32| f32_relative_bound(r, dx_floor, 4.0);
     for (i, (c, g)) in dx_cpu.iter().zip(dx_gpu.iter()).enumerate() {
         assert!(
@@ -2262,7 +2282,7 @@ fn assert_geglu_parity_f32(cuda: &Device, rows: usize, intermediate: usize, wv: 
     // `k = 4`: GeGLU is purely elementwise (`gelu(x1) * x2`, no
     // cross-element reduction) — a small chain-of-two-ops fmad allowance,
     // never scaled by `rows`/`intermediate`.
-    let out_floor = measured_near_zero_floor(&out_cpu_v);
+    let out_floor = max_abs(wv);
     let out_bound = |r: f32| f32_relative_bound(r, out_floor, 4.0);
     for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
         assert!(
@@ -2315,7 +2335,7 @@ fn assert_geglu_parity_f32(cuda: &Device, rows: usize, intermediate: usize, wv: 
         rows * 2 * intermediate,
         "geglu GPU dwi_out length mismatch"
     );
-    let dwi_floor = measured_near_zero_floor(&dwi_cpu);
+    let dwi_floor = max_abs(wv);
     let dwi_bound = |r: f32| f32_relative_bound(r, dwi_floor, 4.0);
     for (i, (c, g)) in dwi_cpu.iter().zip(dwi_gpu.iter()).enumerate() {
         assert!(
@@ -2626,7 +2646,7 @@ fn assert_scaled_cast_add_parity_f32_f32(
     );
     // `k = 4`: `base + lora*scaling` is a single fmad-class op, no
     // reduction.
-    let out_floor = measured_near_zero_floor(&out_cpu_v);
+    let out_floor = max_abs(basev).max(max_abs(loraev));
     let out_bound = |r: f32| f32_relative_bound(r, out_floor, 4.0);
     for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
         assert!(
@@ -2685,7 +2705,7 @@ fn assert_scaled_cast_add_parity_f32_f32(
     assert_eq!(d_base_gpu.len(), n, "d_base GPU length mismatch");
     assert_eq!(d_lora_cpu.len(), n);
     assert_eq!(d_lora_gpu.len(), n, "d_lora GPU length mismatch");
-    let d_base_floor = measured_near_zero_floor(&d_base_cpu);
+    let d_base_floor = max_abs(basev).max(max_abs(loraev));
     let d_base_bound = |r: f32| f32_relative_bound(r, d_base_floor, 4.0);
     for (i, (c, g)) in d_base_cpu.iter().zip(d_base_gpu.iter()).enumerate() {
         assert!(
@@ -2700,7 +2720,7 @@ fn assert_scaled_cast_add_parity_f32_f32(
         f32_ulp,
         "scaled_cast_add f32 d_base",
     );
-    let d_lora_floor = measured_near_zero_floor(&d_lora_cpu);
+    let d_lora_floor = max_abs(basev).max(max_abs(loraev));
     let d_lora_bound = |r: f32| f32_relative_bound(r, d_lora_floor, 4.0);
     for (i, (c, g)) in d_lora_cpu.iter().zip(d_lora_gpu.iter()).enumerate() {
         assert!(
@@ -4017,7 +4037,13 @@ fn lora_linear_parity_bf16_base_backward_production_width() {
         dweight_needed: false,
     };
     let out_gpu = lora_linear(x_gpu.as_tensor(), &w_gpu, &ab_gpu, params).unwrap();
-    let dy_gpu = Tensor::from_slice(&dyv_shared, (rows, outf), &cuda).unwrap();
+    // `out_gpu` is this op's real `bf16` output (the base GEMM's own
+    // storage dtype) — `dy_gpu` must match it dtype-for-dtype for the
+    // elementwise multiply below, unlike `dy_cpu` above (matches
+    // `out_cpu`'s `f32` eager-reference dtype). Same underlying values,
+    // just bf16-rounded once.
+    let dyb_shared: Vec<bf16> = dyv_shared.iter().map(|&v| bf16::from_f32(v)).collect();
+    let dy_gpu = Tensor::from_slice(&dyb_shared, (rows, outf), &cuda).unwrap();
     let grads_gpu = (&out_gpu * &dy_gpu)
         .unwrap()
         .sum_all()
@@ -5250,7 +5276,7 @@ fn assert_attention_block_parity_f32(
     // shape this file exercises, so it drives the Higham-shaped
     // reduction-depth allowance (same rationale as `assert_ln_parity_f32`'s
     // `dx` bound).
-    let out_floor = measured_near_zero_floor(&out_cpu_v);
+    let out_floor = max_abs(qkv_v);
     let out_bound = |r: f32| f32_relative_bound(r, out_floor, 2.0 * seq as f32);
     for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
         assert!(
@@ -5289,7 +5315,7 @@ fn assert_attention_block_parity_f32(
         n,
         "attention_block GPU dqkv length mismatch"
     );
-    let dqkv_floor = measured_near_zero_floor(&dqkv_cpu);
+    let dqkv_floor = max_abs(qkv_v);
     let dqkv_bound = |r: f32| f32_relative_bound(r, dqkv_floor, 2.0 * seq as f32);
     for (i, (c, g)) in dqkv_cpu.iter().zip(dqkv_gpu.iter()).enumerate() {
         assert!(

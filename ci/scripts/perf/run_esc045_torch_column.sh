@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # The tracked producer for the esc-045 "torch column" measurement (ledger
 # rows 258/260): the missing TORCH leg of the jammi weight-gradient cosine
-# oracle, at BOTH a fresh `LoraInitMode::Gaussian` operating point and a
-# "post-one-real-AdamW-step" operating point (the #383 audit addendum: a
-# fresh `Gaussian(0, 0.02)` init on BOTH `A` and `B` is a state real
-# training never occupies). A manual, GPU-required pod-lane script (no CI
-# lane has a GPU — `docs/maintainer/cuda-kernel-guide.md` §5), run by hand
+# oracle, at BOTH a fresh `--lora-init gaussian` operating point and a
+# `--lora-init peft-step1` "post-one-real-AdamW-step" operating point (the
+# #383 audit addendum: a fresh `Gaussian(0, 0.02)` init on BOTH `A` and `B`
+# is a state real training never occupies) — `peft-step1` mirrors jammi's
+# own `GradOracleLoraInit::PeftStep1` and `torch_grad_oracle.py`'s own
+# `--lora-init peft-step1` flag EXACTLY: PEFT's own init, one real `AdamW`
+# step at the reference lr, gradients measured on step 2. A manual,
+# GPU-required pod-lane script (no CI lane has a GPU —
+# `docs/maintainer/cuda-kernel-guide.md` §5), run by hand
 # on a rented CUDA box against a real checkpoint, producing raw
 # `jammi-bench grad-oracle`/`torch_grad_oracle.py` JSON dumps that
 # `analyze_esc045_torch_column.py` (the numpy-first comparator, run
@@ -87,7 +91,6 @@ TORCH_ORACLE="$REPO_ROOT/crates/jammi-bench/reference/torch_grad_oracle.py"
 LORA_RANK=16
 LORA_ALPHA=32
 TARGET_MODULES="Wqkv,Wo,Wi"
-WARMUP_LR=2e-4
 
 for leg in "$@"; do
   label="${leg%%:*}"
@@ -137,26 +140,22 @@ for leg in "$@"; do
     --out "$RAW_DIR/${label}__gaussian__torch_f32_truth.json"
 
   # ---- operating point 2: PEFT-style init (A kaiming-uniform, B zeros), -
-  # ---- then ONE real AdamW step at the reference lr on the same data ----
-  fresh_init="$RAW_DIR/${label}__poststep__fresh_init.safetensors"
-  "$BIN" grad-oracle --model-dir "$MODEL_DIR" \
-    --batch "$batch" --seq "$seq" --seed "$seed" \
-    --lora-rank "$LORA_RANK" --lora-alpha "$LORA_ALPHA" --target-modules "$TARGET_MODULES" \
-    --backbone-dtype f32 --cuda 0 --lora-init zeros-b \
-    --lora-weights-out "$fresh_init" \
-    --out "$RAW_DIR/${label}__poststep__fresh_init_dummy.json"
-
+  # ---- then ONE real AdamW step at the reference lr on the same data, ---
+  # ---- gradients measured on step 2 (`--lora-init peft-step1` — jammi's --
+  # ---- own `GradOracleLoraInit::PeftStep1`) ------------------------------
   # This run's OWN measured (step-2) forward+backward doubles as the
   # jammi-f32-truth arm for this operating point — no separate f32-truth
   # invocation needed (mirrors op-point 1's convention: the F32 arm never
-  # needs `--warmup-steps` re-applied, only the shared post-warmup weights).
+  # needs `--lora-init` re-applied, only the shared post-step weights).
+  # `peft_step1_weights` (the Rust side's own internal procedure) draws the
+  # fresh init AND takes the one real step in a SINGLE call — no separate
+  # "dummy" fresh-init run needed the way the earlier zeros-b+warmup-steps
+  # design required.
   shared_poststep="$RAW_DIR/${label}__poststep__shared.safetensors"
   "$BIN" grad-oracle --model-dir "$MODEL_DIR" \
     --batch "$batch" --seq "$seq" --seed "$seed" \
     --lora-rank "$LORA_RANK" --lora-alpha "$LORA_ALPHA" --target-modules "$TARGET_MODULES" \
-    --backbone-dtype f32 --cuda 0 \
-    --lora-weights-in "$fresh_init" \
-    --warmup-steps 1 --warmup-lr "$WARMUP_LR" \
+    --backbone-dtype f32 --cuda 0 --lora-init peft-step1 \
     --lora-weights-out "$shared_poststep" \
     --out "$RAW_DIR/${label}__poststep__jammi_f32_truth.json"
 

@@ -49,26 +49,30 @@ trainable-parameter count before writing anything.
 
 STRUCTURAL LIMITATION — a single fresh-init call tests ONLY `dL/dB`:
 `LoraLinear`'s forward is `base(x) + scaling * dropout(x @ A^T @ B^T)`
-(`lora_linear.rs`'s own doc). At `LoraInitMode::ZerosB` (both `grad_oracle.rs`
-and this script use it — see `run()`'s `lora_args`/`lora.init_mode` above),
-`B` starts at the exact zero matrix, so `dL/dA` — which the chain rule
-routes through `B^T @ dL/d(output)` — is the EXACT zero vector for ANY
-value of `A`, on BOTH stacks, REGARDLESS of whether either stack's
-backward arithmetic is correct. Confirmed empirically on the one live run
-described above: every `lora_a` tensor's gradient measured EXACTLY `0.0`
-on both dumps. This means a single forward+backward at a fresh init
-provides ZERO evidence about whether jammi's and torch's `dL/dA`
-computations agree — a real defect specific to the `dL/dA` path (a
+(`lora_linear.rs`'s own doc). At the DEFAULT `--lora-init zeros-b` (both
+`grad_oracle.rs` and this script use it — see `run()`'s `lora_args`/
+`lora.init_mode` above), `B` starts at the exact zero matrix, so `dL/dA` —
+which the chain rule routes through `B^T @ dL/d(output)` — is the EXACT
+zero vector for ANY value of `A`, on BOTH stacks, REGARDLESS of whether
+either stack's backward arithmetic is correct. Confirmed empirically on
+the one live run described above: every `lora_a` tensor's gradient
+measured EXACTLY `0.0` on both dumps. This means a single forward+backward
+at a fresh init provides ZERO evidence about whether jammi's and torch's
+`dL/dA` computations agree — a real defect specific to the `dL/dA` path (a
 transposed axis, a dropped scale factor) could NOT be caught this way; it
 would print an uninformative, structurally-guaranteed cosine of `0.0` on
 both an agreeing and a disagreeing implementation alike.
 `compare_grad_oracle.py`'s `is_vacuous_pair`/`vacuous_tensor_count`
 classify and surface exactly this case rather than let it masquerade as
 either a pass or a fail signal. Catching a real `dL/dA` defect requires AT
-LEAST one optimizer step first (moving `B` away from zero) — the
-N-step teacher-forced extension `grad_oracle.rs`'s own module doc scopes
-under "What this tier does NOT do" is what would close this gap; not
-implemented this round.
+LEAST one optimizer step first (moving `B` away from zero) — `--lora-init
+peft-step1` closes exactly this gap (mirrors `grad_oracle.rs`'s own
+`GradOracleLoraInit::PeftStep1`: PEFT's own init, one real `AdamW` step at
+the reference lr, gradients measured on step 2), and is the RECOMMENDED
+mode for a cross-framework comparison that needs every gradient live; it
+is NOT this script's default (`zeros-b` is, for backward compatibility
+with every existing committed dump/invocation) — a caller must opt in
+explicitly.
 
 NAME TRANSLATION — the crux this script owns (jammi's own
 `grad_oracle.rs` does ZERO translation; the shared weight-interchange file
@@ -151,6 +155,13 @@ class _ModelArgs:
     `lora_args` passed to `wrap_lora`) can construct one.
     """
 
+
+# The `AdamW` learning rate `--lora-init peft-step1` runs its one real step
+# at -- `2e-4`, the SAME reference value `finetune_step.rs`'s own
+# `build_fixture` hardcodes AND the SAME name+value
+# `grad_oracle.rs::PEFT_STEP1_REFERENCE_LR` uses, not a new number invented
+# for this script.
+PEFT_STEP1_REFERENCE_LR = 2e-4
 
 PEFT_NAME_RE = re.compile(
     r"^base_model\.model\.layers\.(?P<layer>\d+)\.(?P<mid>attn|mlp)\.(?P<site>Wqkv|Wo|Wi)"
@@ -465,26 +476,35 @@ def _run_with_model(
             a, p, n = (tfs.pool_and_normalize(tfs.forward_hidden(model, blk, mask), mask) for blk in blocks)
         return tfs.triplet_loss(a, p, n, margin=0.3)
 
-    # `args.warmup_steps` REAL forward+backward+`AdamW.step()` iterations, at
-    # `args.warmup_lr`, on the SAME `blocks`/`mask` the measured forward
-    # below reuses ("on the same data" — mirrors `grad_oracle.rs`'s own
-    # `warmup_steps`/`warmup_lr` fields and their doc). `weight_decay=0.01`
-    # is the SAME value `finetune_step.rs`'s own `build_fixture` hardcodes
-    # (and the jammi-side `ParamsAdamW` warmup loop this mirrors) — kept
-    # identical so the two stacks' first-step update formula matches term
-    # for term, not just in `lr`. Runs BEFORE `--lora-weights-out` (moved
-    # below, past this loop) so a caller's shared-weights file captures the
-    # POST-warmup state, mirroring `grad_oracle.rs::run`'s own comment at its
-    # `lora_weights_out` save call site.
-    if args.warmup_steps > 0:
+    # `peft-step1`: ONE real forward+backward+`AdamW.step()` at
+    # `PEFT_STEP1_REFERENCE_LR`, on the SAME `blocks`/`mask` the measured
+    # forward below reuses ("on the same data, gradients on step 2" —
+    # mirrors `grad_oracle.rs`'s own `GradOracleLoraInit::PeftStep1`/
+    # `peft_step1_weights` and their doc EXACTLY: PEFT's own init (this
+    # script's implicit default — `wrap_lora` above already draws Kaiming-A/
+    # zeros-B, the SAME distribution `jammi_lora::LoraInitMode::ZerosB`
+    # draws), one real `AdamW` step at the reference lr, THEN the measured
+    # forward+backward). Skipped (never silently applied) when
+    # `--lora-weights-in` was ALSO given, mirroring `grad_oracle.rs::run`'s
+    # own precedence: an explicit weights file always wins over a
+    # self-synthesized `peft-step1` state. `weight_decay=0.01` is the SAME
+    # value `finetune_step.rs`'s own `build_fixture` hardcodes (and the
+    # jammi-side `peft_step1_weights`'s own `ParamsAdamW` construction
+    # mirrors) — kept identical so the two stacks' first-step update formula
+    # matches term for term, not just in `lr`. Runs BEFORE
+    # `--lora-weights-out` (below) so a caller's shared-weights file
+    # captures the POST-step state, mirroring `grad_oracle.rs::run`'s own
+    # comment at its `lora_weights_out` save call site (which saves AFTER
+    # `effective_lora_weights_in`'s load).
+    peft_step1_applied = args.lora_init == "peft-step1" and not args.lora_weights_in
+    if peft_step1_applied:
         optimizer = torch.optim.AdamW(
-            [p for _, p in trainable], lr=args.warmup_lr, weight_decay=0.01
+            [p for _, p in trainable], lr=PEFT_STEP1_REFERENCE_LR, weight_decay=0.01
         )
-        for _ in range(args.warmup_steps):
-            optimizer.zero_grad(set_to_none=True)
-            warmup_loss = _forward_loss()
-            warmup_loss.backward()
-            optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        warmup_loss = _forward_loss()
+        warmup_loss.backward()
+        optimizer.step()
 
     if args.lora_weights_out:
         dump_lora_weights_from_model(model, args.lora_weights_out)
@@ -561,10 +581,21 @@ def _run_with_model(
         "batched_forward": args.batched_forward,
         "seed": args.seed,
         "lora_dropout": 0.0,
+        # `"zeros-b"` | `"peft-step1"` -- mirrors `grad_oracle.rs`'s own
+        # `GradOracleLoraInit::as_flag`/`GradOracleReport::lora_init`
+        # spelling EXACTLY (no `"gaussian"` here: this script's fresh init
+        # is always PEFT's own Kaiming-A/zeros-B draw, jammi's `ZerosB`
+        # equivalent -- there is no torch-side `Gaussian` mode).
+        "lora_init": args.lora_init,
+        # Mirrors `grad_oracle.rs`'s own `GradOracleReport::peft_step1_applied`
+        # field EXACTLY: `true` iff THIS run synthesized its own post-step
+        # weights (`lora_init == "peft-step1"` AND no `--lora-weights-in`),
+        # `false` when an explicit weights file was loaded instead (see the
+        # `peft_step1_applied` computation above `_forward_loss`'s warmup
+        # block for the precedence rule this echoes).
+        "peft_step1_applied": peft_step1_applied,
         "lora_weights_in": args.lora_weights_in,
         "lora_weights_out": args.lora_weights_out,
-        "warmup_steps": args.warmup_steps,
-        "warmup_lr": args.warmup_lr,
         "trainable_tensor_count": len(gradients),
         "batch_token_id_sums": batch_token_id_sums,
         "loss": float(loss.detach().float().item()),
@@ -588,22 +619,19 @@ def parse_args(argv=None):
     p.add_argument("--lora-weights-in", type=str, default=None)
     p.add_argument("--lora-weights-out", type=str, default=None)
     p.add_argument(
-        "--warmup-steps",
-        type=int,
-        default=0,
+        "--lora-init",
+        choices=["zeros-b", "peft-step1"],
+        default="zeros-b",
         help=(
-            "0 (default) or the number of real forward+backward+AdamW.step() iterations to run, "
-            "at --warmup-lr, on the SAME batch the measured (no-step) forward reuses, BEFORE that "
-            "measured forward+backward -- mirrors grad_oracle.rs's own --warmup-steps/warmup-lr "
-            "fields; see this script's `_run_with_model` for the exact ordering."
+            "zeros-b (default): this script's own implicit fresh init (PEFT's Kaiming-A/"
+            "zeros-B draw) -- unchanged behaviour. peft-step1: mirrors grad_oracle.rs's own "
+            "GradOracleLoraInit::PeftStep1 EXACTLY -- ONE real forward+backward+AdamW.step() "
+            "at PEFT_STEP1_REFERENCE_LR (2e-4), on THIS call's own synthetic batch, BEFORE the "
+            "measured (no-step) forward+backward -- real training's first live-gradient "
+            "operating point, not a fresh Gaussian(0, 0.02)-style init real training never "
+            "occupies. Skipped (never applied) when --lora-weights-in is also given -- an "
+            "explicit weights file always wins over a self-synthesized peft-step1 state."
         ),
-    )
-    p.add_argument(
-        "--warmup-lr",
-        type=float,
-        default=2e-4,
-        help="The AdamW learning rate --warmup-steps runs at -- 2e-4, the SAME reference value "
-        "finetune_step.rs's own build_fixture hardcodes.",
     )
     p.add_argument(
         "--dry-run",

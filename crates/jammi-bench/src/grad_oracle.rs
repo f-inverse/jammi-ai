@@ -89,40 +89,32 @@
 //!
 //! ## Structural limitation: a single fresh-init call tests ONLY `dL/dB`
 //!
-//! At [`jammi_lora::LoraInitMode::ZerosB`] (this tier's only mode — see
-//! [`GradOracleParams::lora_weights_in`]'s doc), `B` starts at the exact
-//! zero matrix. The LoRA forward is `base(x) + scaling *
-//! dropout(x @ A^T @ B^T)`; the chain rule routes `dL/dA` through `B^T @
-//! dL/d(output)`, which is the ZERO matrix whenever `B == 0`, for ANY value
-//! of `A`, on BOTH stacks, REGARDLESS of whether either stack's backward
-//! arithmetic is actually correct there. Confirmed empirically on a live
-//! A100 run (ModernBERT-large, tip `e62c8a8`): every `lora_a` tensor's
-//! gradient measured EXACTLY `0.0` on both the jammi and the torch dump
-//! (112 of 224 matched tensors that run). A single forward+backward at a
-//! fresh init therefore provides ZERO evidence about whether jammi's and
-//! torch's `dL/dA` computations agree — a real defect specific to that
-//! path (a transposed axis, a dropped scale factor) could NOT be caught
-//! this way; it would read as the same uninformative, structurally
-//! guaranteed cosine of `0.0` whether the two stacks agree or not.
-//! `compare_grad_oracle.py`'s `is_vacuous_pair`/`vacuous_tensor_count`
-//! classify and surface exactly this case rather than let it masquerade as
-//! either a pass or a fail signal. Catching a real `dL/dA` defect needs AT
-//! LEAST one optimizer step first (moving `B` away from zero) — see "What
-//! this tier does NOT do" below for the N-step extension that would close
-//! this gap; not implemented this round.
-//!
-//! ## What this tier does NOT do (design, not shipped, this round)
-//!
-//! Extending to N steps in TEACHER-FORCED form — after each step,
-//! overwrite one side's weights with the other's, so both always take the
-//! next step from identical state, measuring PER-STEP divergence without
-//! chaotic accumulation — is a real, useful extension, and the CLI/report
-//! shape here is deliberately structured (one `GradOracleReport` per call,
-//! `--lora-weights-out` writing the POST-this-forward's weights are NOT
-//! written here since no optimizer step ran — a future step would need an
-//! `AdamW::new`+`.step()` call added and the updated `VarMap` re-dumped)
-//! so that extension is a thin wrapper around repeated single-step calls,
-//! not a rewrite. Not implemented this round.
+//! At [`jammi_lora::LoraInitMode::ZerosB`] (this tier's ORIGINAL, still-
+//! default mode when a caller passes no `--lora-init` — see
+//! [`GradOracleLoraInit`]'s own doc for the two OTHER modes this tier has
+//! since gained), `B` starts at the exact zero matrix. The LoRA forward is
+//! `base(x) + scaling * dropout(x @ A^T @ B^T)`; the chain rule routes
+//! `dL/dA` through `B^T @ dL/d(output)`, which is the ZERO matrix whenever
+//! `B == 0`, for ANY value of `A`, on BOTH stacks, REGARDLESS of whether
+//! either stack's backward arithmetic is actually correct there. Confirmed
+//! empirically on a live A100 run (ModernBERT-large, tip `e62c8a8`): every
+//! `lora_a` tensor's gradient measured EXACTLY `0.0` on both the jammi and
+//! the torch dump (112 of 224 matched tensors that run). A single
+//! forward+backward at a fresh `ZerosB` init therefore provides ZERO
+//! evidence about whether jammi's and torch's `dL/dA` computations agree —
+//! a real defect specific to that path (a transposed axis, a dropped scale
+//! factor) could NOT be caught this way; it would read as the same
+//! uninformative, structurally guaranteed cosine of `0.0` whether the two
+//! stacks agree or not. `compare_grad_oracle.py`'s `is_vacuous_pair`/
+//! `vacuous_tensor_count` classify and surface exactly this case rather
+//! than let it masquerade as either a pass or a fail signal. Catching a
+//! real `dL/dA` defect needs AT LEAST one optimizer step first (moving `B`
+//! away from zero) — [`GradOracleLoraInit::PeftStep1`] closes exactly this
+//! gap on the jammi side (the `--ablate-each-op` default as of the round-7
+//! audit fix on PR #383), and `torch_grad_oracle.py`'s own `--lora-init
+//! peft-step1` flag mirrors it EXACTLY for the cross-framework comparison
+//! this module's own producer feeds (see that script's module doc's own
+//! "STRUCTURAL LIMITATION" section).
 //!
 //! ## Determinant table — every field either producer emits, classified
 //!
@@ -148,24 +140,24 @@
 //!
 //! | field | class | jammi emit site | torch emit site |
 //! |---|---|---|---|
-//! | `seed` | identity | `grad_oracle.rs:GradOracleReport::seed` field, `run()`'s report literal | `"seed": args.seed` (`torch_grad_oracle.py:538`) |
-//! | `batch` | identity | `run()`'s report literal | `"batch": args.batch` (`torch_grad_oracle.py:532`) |
-//! | `seq` | identity | `run()`'s report literal | `"seq": args.seq` (`torch_grad_oracle.py:533`) |
-//! | `lora_rank` | identity | `run()`'s report literal | `"lora_rank": args.lora_rank` (`torch_grad_oracle.py:534`) |
-//! | `lora_alpha` | identity | `run()`'s report literal | `"lora_alpha": args.lora_alpha` (`torch_grad_oracle.py:535`) |
-//! | `target_modules` | identity | `run()`'s report literal | `"target_modules": [t.strip()` (`torch_grad_oracle.py:536`) |
-//! | `batched_forward` | identity | `run()`'s report literal | `"batched_forward": args.batched_forward` (`torch_grad_oracle.py:537`) |
-//! | `backbone_dtype` | identity | `run()`'s report literal (`format!("{:?}", ..).to_lowercase()`) | `translate_dtype_flag_to_jammi_spelling(args.dtype)` (`torch_grad_oracle.py:531`) |
-//! | `checkpoint_config_sha256` | identity | `sha256_and_len(&model_dir.join("config.json"))` — called in `run()` before the forward, via the SAME shared streaming implementation `finetune_step.rs` also uses: `pub(crate) fn sha256_and_len` (`finetune_step.rs:700`) | `checkpoint_identity_fields = checkpoint_identity(args.model_dir)` (`torch_grad_oracle.py:413`) — `checkpoint_identity` is a bare alias for the real, streaming implementation torch_finetune_step.py's own `checkpoint_identity` function provides (see the two field citations directly below) |
+//! | `seed` | identity | `grad_oracle.rs:GradOracleReport::seed` field, `run()`'s report literal | `"seed": args.seed` (`torch_grad_oracle.py:582`) |
+//! | `batch` | identity | `run()`'s report literal | `"batch": args.batch` (`torch_grad_oracle.py:576`) |
+//! | `seq` | identity | `run()`'s report literal | `"seq": args.seq` (`torch_grad_oracle.py:577`) |
+//! | `lora_rank` | identity | `run()`'s report literal | `"lora_rank": args.lora_rank` (`torch_grad_oracle.py:578`) |
+//! | `lora_alpha` | identity | `run()`'s report literal | `"lora_alpha": args.lora_alpha` (`torch_grad_oracle.py:579`) |
+//! | `target_modules` | identity | `run()`'s report literal | `"target_modules": [t.strip()` (`torch_grad_oracle.py:580`) |
+//! | `batched_forward` | identity | `run()`'s report literal | `"batched_forward": args.batched_forward` (`torch_grad_oracle.py:581`) |
+//! | `backbone_dtype` | identity | `run()`'s report literal (`format!("{:?}", ..).to_lowercase()`) | `translate_dtype_flag_to_jammi_spelling(args.dtype)` (`torch_grad_oracle.py:575`) |
+//! | `checkpoint_config_sha256` | identity | `sha256_and_len(&model_dir.join("config.json"))` — called in `run()` before the forward, via the SAME shared streaming implementation `finetune_step.rs` also uses: `pub(crate) fn sha256_and_len` (`finetune_step.rs:700`) | `checkpoint_identity_fields = checkpoint_identity(args.model_dir)` (`torch_grad_oracle.py:424`) — `checkpoint_identity` is a bare alias for the real, streaming implementation torch_finetune_step.py's own `checkpoint_identity` function provides (see the two field citations directly below) |
 //! | `checkpoint_weights_sha256` | identity | `sha256_and_len(&weights)` | `"checkpoint_weights_sha256": weights_sha256` (`torch_finetune_step.py:551`) |
 //! | `checkpoint_weights_size_bytes` | identity | `sha256_and_len`'s byte-length return | `"checkpoint_weights_size_bytes": weights_len` (`torch_finetune_step.py:552`) |
 //! | `lora_weights_in` (presence, not value) | identity (checked separately — `_premise_violations`'s `lora_weights_in` loop, not `RUN_IDENTITY_FIELDS`) | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
 //! | `batch_token_id_sums` | identity (checked separately, `or`-gated presence) | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
 //! | `model_dir` | provenance (human debugging only — a path string is not comparable across two boxes; superseded by the two checksum fields above) | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
-//! | `device` / `device_name` | provenance | `run()`'s report literal (`device_name` reuses `finetune_step::device_name`) | `"provenance": tfs.provenance(device, fast_path_globals)` (`torch_grad_oracle.py:531`) |
+//! | `device` / `device_name` | provenance | `run()`'s report literal (`device_name` reuses `finetune_step::device_name`) | `"provenance": tfs.provenance(device, fast_path_globals)` (`torch_grad_oracle.py:551`) |
 //! | `git_rev` (jammi) / `provenance.git_rev` (torch) | provenance | `tip_sha()`, called in `run()`'s report literal | `torch_finetune_step.py`'s `git_rev()`, via `provenance()` |
 //! | torch/transformers/peft versions | provenance (jammi has no equivalent — no torch/transformers/peft dependency) | n/a | same call site as the `device` row directly above (`torch_grad_oracle.py`'s `provenance` field) |
-//! | `attn_requested` / `attn_implementation` | provenance (jammi has no `--attn` lever; its own analog is the MEASUREMENT dispatch counters below) | n/a | `"attn_requested": args.attn` (`torch_grad_oracle.py:540`), `"attn_implementation": resolved_attn_implementation` (`torch_grad_oracle.py:541`), resolved in `run()` mirroring the identical pattern `torch_finetune_step.py`'s own `run()` already established (see `ab_merge.py`'s determinant table for that file's own citations of this exact pair) |
+//! | `attn_requested` / `attn_implementation` | provenance (jammi has no `--attn` lever; its own analog is the MEASUREMENT dispatch counters below) | n/a | `"attn_requested": args.attn` (`torch_grad_oracle.py:560`), `"attn_implementation": resolved_attn_implementation` (`torch_grad_oracle.py:561`), resolved in `run()` mirroring the identical pattern `torch_finetune_step.py`'s own `run()` already established (see `ab_merge.py`'s determinant table for that file's own citations of this exact pair) |
 //! | `lora_dropout` | identity, but UNCONDITIONALLY forced to `0.0` by both producers so it can never legitimately differ — excluded from `RUN_IDENTITY_FIELDS` on that basis, not compared | `run()`'s report literal (hardcoded `0.0`) | `torch_grad_oracle.py`'s report literal (hardcoded `0.0`) |
 //! | `trainable_tensor_count` | measurement (redundant with the tensor NAME SET, which `compare_reports`'s `only_in_a`/`only_in_b` already checks structurally) | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
 //! | `loss` / `gradients` / per-tensor `weight` | measurement — the oracle's actual output | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
@@ -388,7 +380,10 @@ pub struct GradOracleReport {
     /// `"zeros-b"` | `"gaussian"` | `"peft-step1"` — [`GradOracleLoraInit::as_flag`].
     /// IDENTITY within a same-producer comparison (the ablation
     /// orchestrator's whole premise depends on every arm having used the
-    /// SAME init procedure); no torch-side equivalent.
+    /// SAME init procedure). `torch_grad_oracle.py`'s own `--lora-init`
+    /// flag mirrors the `"zeros-b"`/`"peft-step1"` spellings EXACTLY (its
+    /// own report's `lora_init` field echoes the SAME two strings); there is
+    /// no torch-side `"gaussian"` — that mode has no torch equivalent.
     pub lora_init: String,
     /// `true` iff this run synthesized its OWN LoRA weights via
     /// [`peft_step1_weights`] (i.e. `lora_init == "peft-step1"` AND no

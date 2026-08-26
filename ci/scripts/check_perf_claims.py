@@ -111,57 +111,66 @@ error, never a silent pass):
                  scope, so this is an explicit, closed stand-in, not an
                  author-trusted marker.
 
-ARTIFACT-FIELD PRECEDENCE (P3, C10.3; VALUE-based, round-4 audit rewrite).
-Two prior mechanisms (token-identifier intersection, then token +
-unit-family) were both found live-broken by an adversarial sweep of the
-real tracked tree: the subset test always required the CANDIDATE field to
-be at least as token-specific as the OPERANDS, but a real computed field is
-almost always LESS specific than its operands (`delta_ms` carries no rep
-suffix; the operands that produce it do) — 172 free-bind evasions across 14
-committed fields in the 79 tracked cuda-run JSONs, e.g. a same-rep pair, a
-`run_1`-suffixed ratio field the rep-strip didn't recognize, and — since
-`_unit_family` returned `None` on 27 of 32 real computed leaves — a
-millisecond operand pair silently binding past an unrelated `_pct` field
-because the (inert) family veto never fired. Identity/token reasoning is
-abandoned entirely. The mechanism is now VALUE-based: for a `diff`/`ratio`/
-`pct` tag, evaluate the FREE result (the raw diff/ratio/pct over the
-operands, in their own native unit, before this tag's own `neg`/`as unit`/
-`legacy` wrapping); if all operand leaves share one tracked file, scan the
-WHOLE FILE for every NUMBER leaf whose OWN key matches `delta*`/`ratio*`/
+ARTIFACT-FIELD PRECEDENCE (P3, C10.3; VALUE-based, round-4 audit rewrite,
+round-5 audit fixes). Two token-based mechanisms were both found
+live-broken by an adversarial sweep of the real tracked tree: a
+token-subset test always required the CANDIDATE field to be at least as
+specific as the OPERANDS, but a real computed field is almost always LESS
+specific (`delta_ms` carries no rep suffix; the operands that produce it
+do). Identity/token reasoning is abandoned entirely. The mechanism is
+VALUE-based: for EVERY non-pointer node in a tag's expr tree — round-5
+fix, class A: not only an outermost `diff`/`ratio`/`pct`; a top-level OR
+NESTED `min`/`mean`/`max` is ITSELF a free computation (`mean` is
+literally the estimator-shopping form this module doc has always named)
+and is checked independently at every level, innermost first
+(`_non_pointer_subexprs`) — evaluate that node's own FREE result (its raw
+value over ITS OWN operands, in their native unit, before the OUTERMOST
+tag's `neg`/`as unit`/`legacy` wrapping, which only ever applies to the
+root); if all its operand leaves share one tracked file, scan the WHOLE
+FILE for every NUMBER leaf whose OWN key matches `delta*`/`ratio*`/
 `speedup*`/`*_pct`/`spread*` (`_COMPUTED_FIELD_RE`) and test whether that
 leaf's value equals the free result — same sign, opposite sign, or after a
-`×1000`/`÷1000`/`÷1e9` unit rescale (`s<->ms`, `bytes<->GB`) — within a 5e-4
-RELATIVE tolerance (`_values_match`). ANY match is a FINDING naming the
-matched field's own pointer: the free aggregate is not legal when the
-artifact already states the identical number under a name that says it is
-computed, REGARDLESS of which two leaves produced it or what either leaf is
-called. A coincidental match (two genuinely unrelated quantities landing
-within 5e-4 of each other by chance) is still reported, on purpose — the
-finding names the field so a human decides "point at it" or "ledger this
-cell, it's a coincidence," never a silent mechanical exemption for
-"probably unrelated." Operands spanning more than one tracked file are
-UNDECIDABLE (a FINDING, "precedence undecidable: ...") since the whole-file
-value scan needs one file to search; a same-family STRING-valued field
-(the pre-round-4 mechanism's other hit class) is NOT checked here anymore
-— value equality cannot be tested against free text — and is instead
-caught only if a human names it in review; this is a stated, deliberate
-narrowing (the ONE live case, cast-w1's `delta_gb` range, is already
-ledgered in the guide, C11). If a hit exists, the tag is a FINDING naming
-the field's own pointer, unless the tag's own operand pointers already
-include that exact leaf.
+`×1000`/`÷1000`/`÷1e9`/`×1e9` unit rescale (`s<->ms`, `bytes<->GB` — round-5
+advisory: the prior scale set was asymmetric, missing `×1e9`) — within a
+5e-4 RELATIVE tolerance (`_value_matches_any_scale`/`_values_match`, THE
+PRODUCTION matcher). ANY match is a FINDING naming the matched field's own
+pointer, REGARDLESS of which two leaves produced either number — a
+coincidental match is still reported, on purpose, so a human decides
+"point at it" or "ledger this cell, it's a coincidence," never a silent
+mechanical exemption. Operands spanning more than one tracked file are
+UNDECIDABLE (a FINDING). A STRING-valued same-family field can never be
+value-checked (free text) — round-5 fix, class A: "the ONE live case" was
+false (three exist: cast-w1's two `delta_gb` rows and flash-arm-encoder-
+oracle's), so this is now closed by a CLOSED REGISTRY
+(`STRING_FIELDS_PATH`, `check_string_field_registry` — REDs on any
+unregistered string-valued computed field in the tracked tree, part of
+the bare run) plus a registry-object check inside `same_quantity_field`:
+a free expression whose operands live under a REGISTERED string field's
+own parent object is a finding too, even with no numeric twin to rescue
+it. A zero denominator in `ratio`/`pct` (1,390 zero-valued leaves live in
+the tracked tree) is a `ClaimParseError` naming the offending pointer —
+round-5 advisory — never a raw `decimal.DivisionByZero`.
 
-FREE-BIND-EVASION SWEEP (`--sweep`, wired as a required guard leg). A
-regression oracle over the real tracked tree, independent of any specific
-guide tag: for every dict in every tracked cuda-run JSON that has >=2
-child dicts sharing a common relative leaf sub-path (the exact shape every
-`legs`/`runs`/`shapes`/`summary` container in this tree uses — e.g. two
-sibling `legs.<name>` objects both carrying `s_per_step_p50`), every pair
-of same-sub-path values is tried as `diff`/`ratio`/`pct` operands and
-checked with the SAME value-match function against every computed-family
-leaf in that file. A nonzero count means the runtime precedence check
-would ALSO miss it (it is the identical matcher) — the sweep is a
-completeness check on the CANDIDATE ENUMERATION (whole-file scan) and the
-MATCH FUNCTION, run over real data instead of hand-picked fixtures.
+FREE-BIND-EVASION SWEEP (`--sweep`, required guard leg; round-5 fixes,
+class B). A regression oracle over the real tracked tree, independent of
+any specific guide tag: for every dict in every tracked cuda-run JSON with
+>=2 child containers sharing a common relative leaf sub-path (the exact
+shape every `legs`/`runs`/`shapes`/`summary` container in this tree uses),
+every pair of same-sub-path values is tried as `diff`/`ratio`/`pct`/
+`mean`/`min`/`max` (round-5 fix, class A: aggregates too) operands and
+checked against every computed-family leaf in that file — but with an
+INDEPENDENT reference matcher (`_reference_values_match`, a deliberately
+separate implementation), NEVER the production matcher
+(`_value_matches_any_scale`) — round-5 fix, class B: reusing one matcher
+for both ENUMERATION and VERIFICATION meant a narrowed production matcher
+shrank the reported population right alongside its catch rate, so a
+fully-broken matcher (M2: always `False`) could print "0 candidates, 0
+uncaught" and look clean. `run_real_tree_sweep` re-verifies every
+independently-enumerated candidate through the REAL `evaluate_expr` path;
+`--sweep` fails on EITHER an uncaught match OR a population below
+`EXPECTED_SWEEP_MATCHES` (a pinned floor — catches an enumeration that
+narrowed, which "uncaught == 0" alone cannot see since zero candidates
+trivially yields zero uncaught).
 
 EQUALITY (P3). The token is parsed as `Decimal` at ITS OWN printed
 precision (digits after `.`); the evaluated expression is quantized to that
@@ -260,9 +269,28 @@ EXPECTED_TABLE_COUNTS = {
 }
 EXPECTED_DENOMINATOR = 242
 
+# round-5 audit fix (class B, 2c): a POPULATION FLOOR for `--sweep`'s
+# enumerated candidate count — a matcher mutated to always return False
+# (M2) still enumerates candidates via the INDEPENDENT reference matcher,
+# so `uncaught == 0` alone does not catch it (0 candidates -> 0 uncaught
+# trivially); this floor does. Bump ONLY deliberately, after confirming
+# why the population grew (a new artifact, a new computed field) — a drop
+# below this number is itself a finding.
+EXPECTED_SWEEP_MATCHES = 105
+
 ALLOWLIST_PATH = REPO_ROOT / "ci" / "perf_claims_allowlist.txt"
 CLASSIFICATION_PATH = REPO_ROOT / "ci" / "perf_claims_allowlist_classification.md"
 CLASSIFICATION_REASONS = {"ledger-only", "modeled", "issue-text", "superseded-run"}
+
+# round-5 audit fix (class A): the closed registry of every string-valued
+# computed-family leaf in the tracked tree (delta_gb-shaped hand-written
+# ranges — value equality can never be tested against free text, so these
+# are the one class of computed field the round-4 value rule structurally
+# cannot see). Format: `<path>#<pointer> | <reason>`, one per line.
+# `check_string_field_registry` REDs on any unregistered string-valued
+# computed field (growth) AND on a registered entry that no longer exists
+# (shrinkage without editing the registry) — both directions checked.
+STRING_FIELDS_PATH = REPO_ROOT / "ci" / "perf_claims_string_fields.txt"
 
 POINTER_ROOTS = [
     "crates/jammi-kernels/artifacts/cuda-runs",
@@ -620,10 +648,18 @@ _COMPUTED_FIELD_RE = re.compile(r"^(delta|ratio|speedup).*$|.*_pct$|^spread.*$")
 
 # round-4 audit rewrite: VALUE-based precedence. 5e-4 relative tolerance;
 # a free result is tried at its own scale, x1000/-x1000 (s<->ms), and
-# /=1e9 (bytes<->GB) — both sign directions, since a delta's stored sign
+# /=1e9 / x=1e9 (bytes<->GB — round-5 advisory: the prior set was
+# asymmetric, missing x1e9 for a GB-native free result matching a
+# bytes-native field) — both sign directions, since a delta's stored sign
 # convention need not match a free diff's natural (A-B) sign.
 _VALUE_REL_TOL = Decimal("0.0005")
-_VALUE_SCALE_FACTORS = (Decimal(1), Decimal(1000), Decimal(1) / Decimal(1000), Decimal(1) / Decimal(10**9))
+_VALUE_SCALE_FACTORS = (
+    Decimal(1),
+    Decimal(1000),
+    Decimal(1) / Decimal(1000),
+    Decimal(1) / Decimal(10**9),
+    Decimal(10**9),
+)
 
 
 def _values_match(a: Decimal, b: Decimal, rel_tol: Decimal = _VALUE_REL_TOL) -> bool:
@@ -636,10 +672,50 @@ def _values_match(a: Decimal, b: Decimal, rel_tol: Decimal = _VALUE_REL_TOL) -> 
 
 
 def _value_matches_any_scale(free_value: Decimal, candidate: Decimal) -> bool:
+    """THE PRODUCTION matcher — used by the real runtime precedence check
+    (`Loader.same_quantity_field`) ONLY. round-5 audit fix (class B): the
+    sweep's own candidate ENUMERATION must never call this function — see
+    `_reference_values_match`, a deliberately independent implementation,
+    for that purpose, so a narrowing of THIS function (fewer scale
+    factors, a smaller/zero tolerance, a dropped sign direction) shows up
+    as an UNCAUGHT sweep candidate instead of silently shrinking the
+    enumerated population too."""
     for scale in _VALUE_SCALE_FACTORS:
         scaled = free_value * scale
         if _values_match(scaled, candidate) or _values_match(-scaled, candidate):
             return True
+    return False
+
+
+# round-5 audit fix (class B): a SEPARATE, deliberately simpler reference
+# matcher, used ONLY by `sibling_operand_pairs`/`sweep_free_bind_evasions`
+# to ENUMERATE sweep candidates — verification always goes through the
+# real `evaluate_expr` (which calls `_value_matches_any_scale` above via
+# `Loader.same_quantity_field`), never this function. Reusing one matcher
+# for both enumeration and verification was the exact defect the audit
+# named: a narrowed production matcher would shrink the sweep's reported
+# population right alongside its catch rate, so a fully-broken matcher
+# (e.g. one that always returns False) could still print "0 candidates,
+# 0 uncaught" and look clean.
+_REFERENCE_SCALE_FACTORS = (
+    Decimal(1),
+    Decimal(1000),
+    Decimal(1) / Decimal(1000),
+    Decimal(1) / Decimal(10**9),
+    Decimal(10**9),
+)
+_REFERENCE_REL_TOL = Decimal("0.0005")
+
+
+def _reference_values_match(a: Decimal, b: Decimal) -> bool:
+    for scale in _REFERENCE_SCALE_FACTORS:
+        for sign in (1, -1):
+            scaled = a * scale * sign
+            if scaled == b:
+                return True
+            hi = max(abs(scaled), abs(b))
+            if hi != 0 and abs(scaled - b) <= _REFERENCE_REL_TOL * hi:
+                return True
     return False
 
 
@@ -711,12 +787,17 @@ def sibling_operand_pairs(doc) -> list[tuple[str, Decimal, str, Decimal]]:
 
 def sweep_free_bind_evasions(doc, own_pointers: frozenset[str] = frozenset()) -> list[tuple[str, str, str, str, str]]:
     """For one parsed JSON document: every plausible operand pair
-    (`sibling_operand_pairs`), every one of the three free forms, checked
-    against every computed-family leaf in the SAME document via the exact
-    runtime value-match function (`_value_matches_any_scale`). Returns
-    `(form, op_a_pointer, op_b_pointer, matched_field_pointer,
-    free_value_str)` evasions — a nonzero count means the runtime
-    precedence check (identical matcher) would ALSO miss it."""
+    (`sibling_operand_pairs`), every one of the FIVE free forms —
+    `diff`/`ratio`/`pct` AND `mean`/`min`/`max` (round-5 audit fix, class
+    A: an aggregate is itself a free computation, not exempt just because
+    it isn't a diff/ratio/pct — the real T6 evasion is a bare `mean(...)`)
+    — checked against every computed-family leaf in the SAME document via
+    the INDEPENDENT reference matcher (`_reference_values_match` — NEVER
+    `_value_matches_any_scale`, the production matcher; see that
+    function's own docstring for why). Returns `(form, op_a_pointer,
+    op_b_pointer, matched_field_pointer, free_value_str)` candidates — the
+    POPULATION the real runtime path is verified against by
+    `run_real_tree_sweep`, not itself a pass/fail signal."""
     evasions: list[tuple[str, str, str, str, str]] = []
     pairs = sibling_operand_pairs(doc)
     targets = [
@@ -725,7 +806,12 @@ def sweep_free_bind_evasions(doc, own_pointers: frozenset[str] = frozenset()) ->
         if _COMPUTED_FIELD_RE.match(ptr.rsplit("/", 1)[-1]) and ptr not in own_pointers
     ]
     for pa, va, pb, vb in pairs:
-        forms: list[tuple[str, Decimal | None]] = [("diff", va - vb)]
+        forms: list[tuple[str, Decimal | None]] = [
+            ("diff", va - vb),
+            ("mean", (va + vb) / Decimal(2)),
+            ("min", min(va, vb)),
+            ("max", max(va, vb)),
+        ]
         if vb != 0:
             forms.append(("ratio", va / vb))
             forms.append(("pct", (va / vb - Decimal(1)) * Decimal(100)))
@@ -735,7 +821,7 @@ def sweep_free_bind_evasions(doc, own_pointers: frozenset[str] = frozenset()) ->
             for target_ptr, target_val in targets:
                 if target_ptr in (pa, pb):
                     continue
-                if _value_matches_any_scale(free, target_val):
+                if _reference_values_match(free, target_val):
                     evasions.append((form, pa, pb, target_ptr, str(free)))
     return evasions
 
@@ -778,10 +864,25 @@ class Loader:
     """Resolves `<path>#<pointer>` refs against tracked JSON under
     POINTER_ROOTS, with per-file caching. Injectable for tests."""
 
-    def __init__(self, tracked: set[str] | None = None, base_dir: Path | None = None):
+    def __init__(
+        self,
+        tracked: set[str] | None = None,
+        base_dir: Path | None = None,
+        string_registry: dict[tuple[str, str], str] | None = None,
+    ):
         self._tracked = tracked
         self._base_dir = base_dir or REPO_ROOT
         self._cache: dict[str, object] = {}
+        # `None` means "load STRING_FIELDS_PATH lazily, on first use" — an
+        # explicit `{}` (what `_mem_loader` passes by default) means "no
+        # registry, isolated from the real committed file," so self-test
+        # fixtures never accidentally collide with real registered paths.
+        self._string_registry = string_registry
+
+    def string_field_registry(self) -> dict[tuple[str, str], str]:
+        if self._string_registry is None:
+            self._string_registry = parse_string_fields_registry()
+        return self._string_registry
 
     def _check_path(self, path: str) -> None:
         if not path.endswith(".json"):
@@ -818,9 +919,14 @@ class Loader:
         Scans every NUMBER leaf in the file whose key matches
         `_COMPUTED_FIELD_RE` and returns the first whose value equals
         `free_value` within `_value_matches_any_scale` (5e-4 relative,
-        either sign, or after a x1000/1000/1e9 rescale). Raises
+        either sign, or after a x1000/1000/1e9/1e-9 rescale). Raises
         `PrecedenceUndecidable` — never returns `None` for this case —
-        when the operands span more than one tracked file."""
+        when the operands span more than one tracked file. round-5 audit
+        fix (class A): BEFORE the numeric scan, also checks whether any
+        operand lives under a REGISTERED string-valued computed field's
+        own parent object (`STRING_FIELDS_PATH`) — string leaves can never
+        be value-checked, so this is the only mechanical guard against a
+        free aggregate binding cleanly beside a hand-written range."""
         paths = {r.path for r in refs}
         if len(paths) != 1:
             raise PrecedenceUndecidable(
@@ -830,6 +936,13 @@ class Loader:
         path = next(iter(paths))
         doc = self.doc(path)
         operand_pointers = {r.pointer for r in refs}
+        for (reg_path, reg_ptr) in self.string_field_registry():
+            if reg_path != path:
+                continue
+            parent = reg_ptr.rsplit("/", 1)[0] or "/"
+            parent_prefix = parent.rstrip("/") + "/"
+            if any(p == parent or p.startswith(parent_prefix) for p in operand_pointers):
+                return reg_ptr, Decimal(0)
         for leaf_pointer, leaf_value in _iter_leaves(doc):
             if leaf_pointer in operand_pointers:
                 continue
@@ -853,16 +966,46 @@ def leaves_of(expr_or_ref) -> list[PointerRef]:
     return out
 
 
-def precedence_violation(expr: Expr, raw_value: Decimal, loader: Loader) -> str | None:
-    """None, or the offending field's own json-pointer, for a
-    diff/ratio/pct tag whose free result (`raw_value`, evaluated BEFORE
-    this tag's own neg/unit/legacy wrapping) equals — value-wise — a
-    delta*/ratio*/speedup*/*_pct/spread* field the pointed artifact ALSO
-    states, regardless of which leaves produced either number."""
-    if expr.kind not in ("diff", "ratio", "pct"):
-        return None
-    hit = loader.same_quantity_field(raw_value, leaves_of(expr))
-    return hit[0] if hit is not None else None
+def _non_pointer_subexprs(expr_or_ref):
+    """Every node in the expr tree that is itself a free computation —
+    i.e. every `Expr` whose `kind != 'pointer'` (a bare `PointerRef`, or a
+    `pointer`-kind `Expr` wrapping one, is never a free computation and
+    stays exempt) — innermost first. round-5 audit fix (class A): a
+    top-level OR NESTED `min`/`mean`/`max` is itself a free computation
+    and must be checked independently of any enclosing diff/ratio/pct —
+    the real T6 evasion is a bare `mean(...)` tag, not nested inside
+    anything."""
+    if isinstance(expr_or_ref, PointerRef):
+        return
+    for a in expr_or_ref.args:
+        yield from _non_pointer_subexprs(a)
+    if expr_or_ref.kind != "pointer":
+        yield expr_or_ref
+
+
+def precedence_violation(expr: Expr, loader: Loader) -> str | None:
+    """None, or the offending field's own json-pointer. round-5 audit fix
+    (class A): recursively checks EVERY non-pointer node in the expr tree
+    — not only an outermost diff/ratio/pct, which is what let a top-level
+    `mean(A,B)` bind freely even though its own value reproduced a
+    declared field. For each such node, evaluates its OWN free result
+    (ignoring the outer tag's neg/unit/legacy wrapping, which only ever
+    applies to the outermost node) and asks whether the pointed artifact
+    ALSO states that value elsewhere via a delta*/ratio*/speedup*/*_pct/
+    spread* field or a registered string-valued field's own object,
+    regardless of which leaves produced either number."""
+    for sub in _non_pointer_subexprs(expr):
+        sub_value = eval_value(sub, loader)
+        hit = loader.same_quantity_field(sub_value, leaves_of(sub))
+        if hit is not None:
+            return hit[0]
+    return None
+
+
+def _describe_operand(op) -> str:
+    if isinstance(op, PointerRef):
+        return f"{op.path}#{op.pointer}"
+    return f"{op.kind}(...)"
 
 
 def eval_value(expr_or_ref, loader: Loader) -> Decimal:
@@ -883,26 +1026,37 @@ def eval_value(expr_or_ref, loader: Loader) -> Decimal:
         return eval_value(a, loader) - eval_value(b, loader)
     if e.kind == "ratio":
         a, b = e.args
-        return eval_value(a, loader) / eval_value(b, loader)
+        b_val = eval_value(b, loader)
+        if b_val == 0:
+            # round-5 advisory: a zero denominator previously raised a raw
+            # decimal.DivisionByZero straight out of this function (1,390
+            # zero-valued leaves live in the tracked tree) — converted to
+            # a ClaimParseError naming the offending pointer, so it reads
+            # as an ordinary gate finding, not an unhandled crash.
+            raise ClaimParseError(f"ratio(...) has a zero denominator at {_describe_operand(b)}")
+        return eval_value(a, loader) / b_val
     if e.kind == "pct":
         a, b = e.args
-        return (eval_value(a, loader) / eval_value(b, loader) - 1) * Decimal(100)
+        b_val = eval_value(b, loader)
+        if b_val == 0:
+            raise ClaimParseError(f"pct(...) has a zero denominator at {_describe_operand(b)}")
+        return (eval_value(a, loader) / b_val - 1) * Decimal(100)
     raise ClaimParseError(f"unknown expr kind: {e.kind}")
 
 
 def evaluate_expr(expr: Expr, loader: Loader) -> tuple[Decimal, bool]:
-    """Returns (value, is_legacy). Computes the FREE (raw) result first —
-    precedence (round-4: value-based) needs it — then applies the
-    precedence check, the legacy() allowlist, sign negation, and the unit
-    factor, in that order."""
-    raw_val = eval_value(Expr(expr.kind, expr.args), loader)
-    hit_pointer = precedence_violation(expr, raw_val, loader)
+    """Returns (value, is_legacy). Runs the (now whole-tree) precedence
+    check first, then applies the legacy() allowlist, sign negation, and
+    the unit factor, in that order, to the OUTERMOST node's own free
+    result."""
+    hit_pointer = precedence_violation(expr, loader)
     if hit_pointer is not None:
         field = hit_pointer.rsplit("/", 1)[-1]
         raise ClaimParseError(
-            f"artifact states this value elsewhere at {hit_pointer} ({field}) — free "
-            f"result {raw_val} matches within tolerance; bind directly to it or ledger "
-            "this cell — a free aggregate matching a stated computed field is not legal here"
+            f"artifact states this value elsewhere at {hit_pointer} ({field}) — a free "
+            "expression in this tag (possibly a nested aggregate) matches within tolerance; "
+            "bind directly to it or ledger this cell — a free aggregate matching a stated "
+            "computed field is not legal here"
         )
     if expr.is_legacy:
         for leaf in leaves_of(expr):
@@ -911,7 +1065,7 @@ def evaluate_expr(expr: Expr, loader: Loader) -> tuple[Decimal, bool]:
                     f"legacy(...) is not allowlisted for {leaf.path}{leaf.pointer} "
                     "(LEGACY_POINTER_ALLOWLIST is closed — add the exact cell by hand)"
                 )
-    val = raw_val
+    val = eval_value(Expr(expr.kind, expr.args), loader)
     if expr.is_neg:
         val = -val
     if expr.unit:
@@ -1014,6 +1168,65 @@ def check_classification_file(allowlist: set[tuple[str, str, str, str]]) -> list
     for key in seen:
         if key not in allowlist:
             problems.append(f"classification row for {key} has no matching allowlist entry")
+    return problems
+
+
+def parse_string_fields_registry() -> dict[tuple[str, str], str]:
+    if not STRING_FIELDS_PATH.exists():
+        return {}
+    out: dict[tuple[str, str], str] = {}
+    for line in STRING_FIELDS_PATH.read_text().splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        key_part, sep, reason = stripped.partition("|")
+        if not sep:
+            continue
+        path, sep2, pointer = key_part.strip().partition("#")
+        if not sep2:
+            continue
+        out[(path.strip(), pointer.strip())] = reason.strip()
+    return out
+
+
+def check_string_field_registry() -> list[str]:
+    """round-5 audit fix (class A): every string-valued leaf in the
+    tracked tree whose key matches the computed-family pattern must be
+    registered in STRING_FIELDS_PATH — an unregistered one (growth) is a
+    named problem, since it is exactly the precedence blind spot the
+    round-4 value rule structurally cannot see (value equality cannot be
+    tested against free text). A registered entry that no longer exists
+    as a string leaf (the field was removed, or became numeric) is ALSO a
+    named problem — the registry must track reality, not accumulate."""
+    registry = parse_string_fields_registry()
+    tracked = tracked_files()
+    loader = Loader(tracked=tracked, string_registry=registry)
+    problems: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for rel in sorted(tracked):
+        if not any(rel == r or rel.startswith(r + "/") for r in POINTER_ROOTS):
+            continue
+        if not rel.endswith(".json"):
+            continue
+        try:
+            doc = loader.doc(rel)
+        except ResolutionError:
+            continue
+        for ptr, val in _iter_leaves(doc):
+            last = ptr.rsplit("/", 1)[-1]
+            if _COMPUTED_FIELD_RE.match(last) and isinstance(val, str):
+                seen.add((rel, ptr))
+                if (rel, ptr) not in registry:
+                    problems.append(
+                        f"unregistered string-valued computed field: {rel}#{ptr} — add it to "
+                        f"{STRING_FIELDS_PATH.relative_to(REPO_ROOT)} with a reason"
+                    )
+    for key in registry:
+        if key not in seen:
+            problems.append(
+                f"{STRING_FIELDS_PATH.relative_to(REPO_ROOT)} registers {key[0]}#{key[1]}, "
+                "which no longer exists in the tracked tree as a string leaf"
+            )
     return problems
 
 
@@ -1168,6 +1381,7 @@ def scan_tree() -> tuple[list[TableStats], list[Finding], list[str]]:
                 all_stats.append(stats)
                 all_findings.extend(findings)
     scope_problems.extend(check_classification_file(allowlist))
+    scope_problems.extend(check_string_field_registry())
     denom = token_denominator(all_stats)
     if denom != EXPECTED_DENOMINATOR:
         scope_problems.append(
@@ -1337,8 +1551,11 @@ def check_allowlist_only_shrinks() -> int:
 # --- self-test ---------------------------------------------------------
 
 
-def _mem_loader(doc: dict) -> Loader:
-    loader = Loader(tracked=None)
+def _mem_loader(doc: dict, string_registry: dict[tuple[str, str], str] | None = None) -> Loader:
+    # `string_registry` defaults to `{}` (never `None`, which would lazily
+    # read the REAL committed STRING_FIELDS_PATH) — fixtures stay isolated
+    # from the real file unless a test explicitly opts in.
+    loader = Loader(tracked=None, string_registry=string_registry if string_registry is not None else {})
     loader._check_path = lambda path: None  # type: ignore[method-assign]
     loader._cache["fixture.json"] = doc
     return loader
@@ -1492,12 +1709,17 @@ def self_test() -> int:
         control_val.quantize(Decimal("0.001")) == Decimal("-38.478"),
     )
 
-    # a STRING-valued same-family field (delta_gb as a hand-written range)
-    # is a STATED, deliberate limitation of the round-4 value-based
-    # mechanism (documented in the module doc's PRECEDENCE section) —
-    # value equality cannot be tested against free text, so this case is
-    # NOT caught here; it binds cleanly (the one live guide cell of this
-    # shape is already ledgered, C11).
+    # A string-valued same-family field is NEVER value-checked directly
+    # (value equality cannot be tested against free text) — but round-5
+    # audit fix (class A) closes the resulting blind spot with a
+    # REGISTRY: if the field is registered (STRING_FIELDS_PATH), a free
+    # aggregate whose operands live under its own object IS caught; if it
+    # is genuinely unregistered (this fixture's empty in-memory registry —
+    # `_mem_loader` never reads the real committed file), it binds
+    # cleanly, honestly demonstrating why `check_string_field_registry`
+    # (part of the bare run) must RED on any unregistered string leaf in
+    # the real tree — there is no other guard once a string field exists
+    # unregistered.
     string_field_doc = {
         "peak": {
             "b8_s512": {
@@ -1507,16 +1729,150 @@ def self_test() -> int:
             }
         }
     }
-    loader_string = _mem_loader(string_field_doc)
+    loader_string = _mem_loader(string_field_doc)  # empty registry
     string_field_expr = parse_expr(
         "diff(fixture.json#/peak/b8_s512/fused_r1_gb,fixture.json#/peak/b8_s512/disabled_r1_gb)"
     )
     val_str, _ = evaluate_expr(string_field_expr, loader_string)
     check(
-        "STATED LIMITATION: a string-valued delta_gb field is not value-checked (documented, "
-        "not silently forgotten) — the free diff binds cleanly",
+        "an UNREGISTERED string-valued delta_gb field is not caught (motivates the registry, "
+        "not a silent forever-gap) — the free diff binds cleanly",
         val_str == Decimal("0.3"),
     )
+
+    # --- REQUIRED FIXTURE 5 (round-5 acceptance, class A): the SAME
+    # string field, now REGISTERED — a free diff whose operands live
+    # under the registered field's own parent object is a finding,
+    # regardless of whether any NUMBER also happens to match. Reproduces
+    # the real, live gap the audit re-opened: cast-w1's b8_s128 and
+    # flash-arm-encoder-oracle's delta_gb rows bound freely with no
+    # numeric twin to rescue them. ---
+    loader_string_reg = _mem_loader(
+        string_field_doc, string_registry={("fixture.json", "/peak/b8_s512/delta_gb"): "test fixture"}
+    )
+    try:
+        evaluate_expr(string_field_expr, loader_string_reg)
+        failures.append(
+            "self-test FAILED (REQUIRED FIXTURE 5, registered string field): a free diff "
+            "beside a REGISTERED string field bound cleanly — the registry-object check is dead"
+        )
+    except ClaimParseError as exc:
+        check(
+            "a REGISTERED string field's object blocks a free diff over its siblings, names it",
+            "delta_gb" in str(exc),
+        )
+
+    # --- REQUIRED FIXTURE 6 (round-5 acceptance, class A): a TOP-LEVEL
+    # `mean(...)` tag — not nested inside any diff/ratio/pct — is itself a
+    # free computation and must be checked. Reproduces the real T6
+    # evasion the audit demonstrated end-to-end: mean(ratio_torch_over_
+    # stacked@b8s128, ratio_torch_over_stacked@b8s1024) = 1.07425
+    # reproduces a THIRD shape's own ratio_torch_over_stacked = 1.0737811
+    # within 5e-4 — bound V=1 on 0a1a317 because `precedence_violation`
+    # exempted every kind outside diff/ratio/pct. ---
+    t6_mean_doc = {
+        "shapes": {
+            "b8s128": {"ratio_torch_over_stacked": Decimal("1.0085995163106791")},
+            "b8s1024": {"ratio_torch_over_stacked": Decimal("1.1399039368319384")},
+            "b16s512": {"ratio_torch_over_stacked": Decimal("1.0737811162910524")},
+        }
+    }
+    loader_t6 = _mem_loader(t6_mean_doc)
+    t6_mean_expr = parse_expr(
+        "mean(fixture.json#/shapes/b8s128/ratio_torch_over_stacked,"
+        "fixture.json#/shapes/b8s1024/ratio_torch_over_stacked)"
+    )
+    try:
+        val, _ = evaluate_expr(t6_mean_expr, loader_t6)
+        failures.append(
+            f"self-test FAILED (REQUIRED FIXTURE 6, top-level mean): bound FREELY to {val} — "
+            "the exact live T6 evasion the round-5 audit demonstrated end-to-end"
+        )
+    except ClaimParseError as exc:
+        check(
+            "a top-level mean() aggregate is caught, names the reproduced field",
+            "ratio_torch_over_stacked" in str(exc) and "b16s512" in str(exc),
+        )
+
+    # a mean() NESTED inside a diff() is ALSO checked independently of the
+    # outer diff's own combined value (round-5 fix (1)'s "nested" clause).
+    nested_doc = {
+        "legs": {
+            "a1": {"v": Decimal("1.0085995163106791")},
+            "a2": {"v": Decimal("1.1399039368319384")},
+            "b1": {"v": Decimal("5")},
+            "b2": {"v": Decimal("5")},
+        },
+        "shapes": {"x": {"ratio_torch_over_stacked": Decimal("1.0737811162910524")}},
+    }
+    loader_nested = _mem_loader(nested_doc)
+    nested_expr = parse_expr(
+        "diff(mean(fixture.json#/legs/a1/v,fixture.json#/legs/a2/v),"
+        "mean(fixture.json#/legs/b1/v,fixture.json#/legs/b2/v))"
+    )
+    try:
+        evaluate_expr(nested_expr, loader_nested)
+        failures.append(
+            "self-test FAILED (nested mean inside diff): the inner mean(a1,a2) alone "
+            "reproduces shapes/x/ratio_torch_over_stacked but was not independently checked"
+        )
+    except ClaimParseError as exc:
+        check("a mean() NESTED inside a diff() is independently precedence-checked", "ratio_torch_over_stacked" in str(exc))
+
+    # --- REQUIRED FIXTURE 7 (round-5 acceptance, class B): boundary
+    # pins — opposite sign, a 4.9e-4-relative match (just inside
+    # tolerance, caught), a 6.0e-4 near-miss (just outside, legal), and
+    # each rescale direction including the round-5-added x1e9. ---
+    boundary_doc = {
+        "a": {"x": Decimal("39.565658")},  # ms-scale target
+        "deltas": {"y": {"delta_ms": Decimal("-39.565658")}},  # opposite-sign target
+        "b": {"gb": Decimal("0.302")},  # bytes-scale target (GB)
+        "c": {"bytes_field": Decimal("302000000")},  # x1e9 rescale target
+    }
+    loader_boundary = _mem_loader(boundary_doc)
+    # opposite sign: free result +39.565658, target is -39.565658 — must match.
+    opp_expr = parse_expr("fixture.json#/a/x")
+    opp_val, _ = evaluate_expr(opp_expr, loader_boundary)
+    check(
+        "opposite-sign candidate value is a genuine match under _value_matches_any_scale",
+        _value_matches_any_scale(opp_val, Decimal("-39.565658")),
+    )
+    # 4.9e-4 relative (just inside 5e-4 tolerance) is caught.
+    check(
+        "a 4.9e-4 relative difference IS caught (inside the 5e-4 tolerance)",
+        _value_matches_any_scale(Decimal("1.00049"), Decimal("1.0")),
+    )
+    # 6.0e-4 relative (just outside) is legal.
+    check(
+        "a 6.0e-4 relative difference is NOT caught (outside the 5e-4 tolerance) — a near-miss stays legal",
+        not _value_matches_any_scale(Decimal("1.0006"), Decimal("1.0")),
+    )
+    # each rescale direction, including the round-5-added x1e9 (GB->bytes).
+    check("x1000 rescale (s->ms) matches", _value_matches_any_scale(Decimal("0.039565658"), Decimal("39.565658")))
+    check("/1000 rescale (ms->s) matches", _value_matches_any_scale(Decimal("39.565658"), Decimal("0.039565658")))
+    check("/1e9 rescale (bytes->GB) matches", _value_matches_any_scale(Decimal("302000000"), Decimal("0.302")))
+    check(
+        "x1e9 rescale (GB->bytes, round-5 advisory fix — the prior scale set was asymmetric) matches",
+        _value_matches_any_scale(Decimal("0.302"), Decimal("302000000")),
+    )
+
+    # --- round-5 advisory: a zero denominator is a ClaimParseError naming
+    # the offending pointer, never a raw decimal.DivisionByZero crash
+    # (1,390 zero-valued leaves live in the tracked tree). ---
+    zero_doc = {"a": {"num": Decimal("5")}, "b": {"den": Decimal("0")}}
+    loader_zero = _mem_loader(zero_doc)
+    for form in ("ratio", "pct"):
+        zero_expr = parse_expr(f"{form}(fixture.json#/a/num,fixture.json#/b/den)")
+        try:
+            evaluate_expr(zero_expr, loader_zero)
+            failures.append(f"self-test FAILED (zero denominator, {form}): did not raise at all")
+        except ZeroDivisionError:
+            failures.append(
+                f"self-test FAILED (zero denominator, {form}): raised a raw ZeroDivisionError/"
+                "decimal exception, not a ClaimParseError naming the pointer"
+            )
+        except ClaimParseError as exc:
+            check(f"zero denominator ({form}) raises ClaimParseError naming the pointer", "/b/den" in str(exc))
 
     # operands spanning more than one tracked file are STILL undecidable
     # (round-3 mechanism kept for this one case, per the audit).
@@ -1761,16 +2117,20 @@ def self_test() -> int:
         return 1
 
     print(
-        "check_perf_claims self-test: OK — round-4 VALUE-based precedence (real cast-w1 "
-        "same-rep diff/pct, the real adamw speedup_median_run1 evasion, a numeric bytes pair "
-        "naming delta_gb over an unrelated delta_ms in the same file, a mean-based CONTROL "
-        "that matches nothing and stays legal, the stated string-field limitation, multi-file "
-        "PrecedenceUndecidable, and the real-tree sweep finding zero uncaught matches), "
-        "Decimal/ROUND_HALF_EVEN string equality, the six-form grammar's parse-error refusal, "
-        "uncovered-token findings with file:line:col, the lexical exclusion class (seed/"
-        "section/formula/type-name/product-name, the unified rows-list pattern, and the "
-        "layer/launch-count non-exclusion), the .json.raw/out-of-root/untracked pointer "
-        "refusals, neg()'s sign-preserving compare, legacy()'s closed allowlist, the injective "
+        "check_perf_claims self-test: OK — round-4/5 VALUE-based precedence over the WHOLE "
+        "expr tree (real cast-w1 same-rep diff/pct, the real adamw speedup_median_run1 "
+        "evasion, a numeric bytes pair naming delta_gb over an unrelated delta_ms, a "
+        "mean-based CONTROL that matches nothing and stays legal, a top-level AND a nested "
+        "mean() reproducing the real T6 evasion, a REGISTERED string field blocking its "
+        "sibling operands vs. an unregistered one binding cleanly, boundary/near-miss/"
+        "opposite-sign/all-four-rescale pins, zero-denominator ClaimParseErrors, and "
+        "multi-file PrecedenceUndecidable), the real-tree sweep (independent reference "
+        "matcher, population floor) finding zero uncaught matches, Decimal/ROUND_HALF_EVEN "
+        "string equality, the six-form grammar's parse-error refusal, uncovered-token "
+        "findings with file:line:col, the lexical exclusion class (seed/section/formula/"
+        "type-name/product-name, the unified rows-list pattern, and the layer/launch-count "
+        "non-exclusion), the .json.raw/out-of-root/untracked pointer refusals, neg()'s "
+        "sign-preserving compare, legacy()'s closed allowlist, the injective "
         "file:token:sha1:col allowlist key, the KNOWN_TABLES exactly-one-match invariant "
         "(rename + duplicate), the citation-table header exclusion, and the "
         "classification-file verification all confirmed."
@@ -1780,18 +2140,36 @@ def self_test() -> int:
 
 def sweep_command() -> int:
     """`--sweep`: the free-bind-evasion regression oracle (round-4 audit
-    acceptance (1)) as its own CI leg, independent of `--self-test`'s
-    in-memory fixtures — runs over the REAL tracked cuda-run tree.
-    Prints the match population (informational) and the uncaught count
-    (must be zero); exits non-zero on any uncaught match, naming it."""
+    acceptance (1); round-5 fix, class B) as its own CI leg, independent
+    of `--self-test`'s in-memory fixtures — runs over the REAL tracked
+    cuda-run tree. Prints the match population and the uncaught count;
+    fails on EITHER an uncaught match (the production verify path missed
+    a real, independently-enumerated candidate) OR a population below
+    `EXPECTED_SWEEP_MATCHES` (the enumeration itself narrowed — e.g. a
+    mutated reference matcher — which `uncaught == 0` alone cannot see,
+    since zero candidates trivially yields zero uncaught)."""
     total_matches, uncaught, files_swept = run_real_tree_sweep()
     print(f"check_perf_claims --sweep: {files_swept} tracked cuda-run JSON(s) swept")
-    print(f"  candidate free-bind value-matches found: {total_matches} (population; expected > 0)")
+    print(
+        f"  candidate free-bind value-matches found: {total_matches} "
+        f"(population floor: {EXPECTED_SWEEP_MATCHES})"
+    )
     print(f"  uncaught (must be 0): {len(uncaught)}")
+    failed = False
+    if total_matches < EXPECTED_SWEEP_MATCHES:
+        print(
+            f"check_perf_claims --sweep: FAIL — population {total_matches} < "
+            f"EXPECTED_SWEEP_MATCHES {EXPECTED_SWEEP_MATCHES} (the enumeration itself "
+            "narrowed; bump the constant only after confirming why)",
+            file=sys.stderr,
+        )
+        failed = True
     if uncaught:
-        print("check_perf_claims --sweep: FAIL", file=sys.stderr)
+        print("check_perf_claims --sweep: FAIL — uncaught matches", file=sys.stderr)
         for rel, form, pa, pb, target_ptr in uncaught:
             print(f"  {rel}: {form}({pa}, {pb}) reproduces {target_ptr} UNCAUGHT", file=sys.stderr)
+        failed = True
+    if failed:
         return 1
     print("check_perf_claims --sweep: OK — every free-bind value-match is caught")
     return 0

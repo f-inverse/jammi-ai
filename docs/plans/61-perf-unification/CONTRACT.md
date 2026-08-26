@@ -94,21 +94,38 @@ See `DESIGN-STUDY.md` §1 for the grammar. Implementation notes fixed here:
    operands, in their native unit, before this tag's own `neg`/`as unit`/`legacy` wrapping); if all
    operand leaves share one tracked file, scan the WHOLE file for every NUMBER leaf whose key matches
    `delta*`/`ratio*`/`speedup*`/`*_pct`/`spread*` and test whether ITS VALUE equals the free result —
-   same sign, opposite sign, or after a `×1000`/`÷1000`/`÷1e9` unit rescale (`s<->ms`, `bytes<->GB`) —
-   within a 5e-4 RELATIVE tolerance. ANY match is a finding naming the matched field, regardless of
+   same sign, opposite sign, or after a `×1000`/`÷1000`/`÷1e9`/`×1e9` unit rescale (`s<->ms`,
+   `bytes<->GB` — round-5 advisory: the prior scale set was asymmetric, missing `×1e9`) — within a 5e-4
+   RELATIVE tolerance. This check applies to EVERY non-pointer node in the tag's expr tree, not only an
+   outermost `diff`/`ratio`/`pct` (round-5 fix, class A): a top-level or nested `min`/`mean`/`max` is
+   itself a free computation — `mean` is literally the estimator-shopping form this contract has always
+   named — and a real live evasion was exactly a bare, top-level `mean(...)` tag reproducing an unrelated
+   shape's own `ratio_torch_over_stacked`. ANY match is a finding naming the matched field, regardless of
    which two leaves produced the free result or what either is called — the artifact already states
    this exact number under a name that says it is computed. A coincidental match (two genuinely
    unrelated quantities landing within tolerance by chance) is STILL reported, on purpose: the finding
    names the field so a human decides "point at it" or "ledger this cell, it's a coincidence," never a
-   silent mechanical exemption for "probably unrelated." STRING-valued same-family fields are NOT
-   checked (a stated, deliberate narrowing — value equality cannot be tested against free text; the one
-   live case, cast-w1's `delta_gb` range, stays ledgered as an editorial choice, C11). Operands spanning
+   silent mechanical exemption for "probably unrelated." STRING-valued same-family fields are NEVER
+   value-checked (a stated, deliberate narrowing — value equality cannot be tested against free text).
+   THREE such fields exist in the tracked tree, not one (round-5 fix, class A — an earlier draft's "the
+   one live case" was false): cast-w1's two `delta_gb` rows (`b8_s512`, `b8_s128`) and flash-arm-encoder-
+   oracle's `delta_gb`. All three are in a closed registry (`ci/perf_claims_string_fields.txt`,
+   `check_string_field_registry`, part of the bare run — REDs on any unregistered string-valued computed
+   field in the tracked tree) with a reason each; a free expression whose operands live under a
+   REGISTERED string field's own parent object is a finding too, even with no numeric twin to rescue it
+   — the b8_s512 row stays ledgered as an editorial choice (C11), the other two were previously
+   uncaught free binds with no guard at all, now closed by the registry-object check. Operands spanning
    more than one tracked file are UNDECIDABLE and the tag is a finding naming that explicitly — never a
-   silent pass just because the mechanism could not determine an answer. A regression oracle
+   silent pass just because the mechanism could not determine an answer. A `ratio`/`pct` with a zero
+   denominator (1,390 zero-valued leaves live in the tracked tree) is a finding naming the offending
+   pointer, never a raw decimal exception (round-5 advisory). A regression oracle
    (`check_perf_claims.py --sweep`, required guard leg) enumerates every structurally plausible operand
    pair in the real tracked tree (two sibling containers sharing a leaf sub-path — the exact shape every
-   `legs`/`runs`/`shapes`/`summary` container in this tree uses) and asserts every value-match is
-   actually caught by the real runtime path.
+   `legs`/`runs`/`shapes`/`summary` container in this tree uses), now including `mean`/`min`/`max` forms
+   (round-5 fix), via an INDEPENDENT reference matcher (round-5 fix, class B — never the production
+   matcher, or a narrowed production matcher would shrink the enumerated population right alongside its
+   catch rate and still look clean), and asserts every value-match is actually caught by the real
+   runtime path AND that the population meets a pinned floor (`EXPECTED_SWEEP_MATCHES`).
 4. **Equality.** `Decimal` at the token's own printed precision; `ROUND_HALF_EVEN` quantization;
    STRING comparison. A mismatch prints the evaluated value at full precision.
 5. **Pointer roots.** Tracked `*.json` under `crates/jammi-kernels/artifacts/cuda-runs/**` and

@@ -1951,7 +1951,7 @@ impl<'a, 'b> LoraSite<'a, 'b> {
 mod tests {
     use super::*;
     use candle_core::Var;
-    use half::bf16;
+    use half::{bf16, f16};
 
     /// Serializes every test in THIS module that reads
     /// `ATTENTION_BLOCK_DISPATCH_COUNTERS` (a process-wide, `#[cfg(test)]`-
@@ -2292,6 +2292,99 @@ mod tests {
     fn rope_apply_matches_truth_at_production_shape_seq512() {
         // batch=2, heads=16, seq=512, head_dim=64 (heads*head_dim=1024).
         rope_apply_matches_truth_at_production_shape(2, 16, 512, 64, 0xC0FF_EE12);
+    }
+
+    /// F16 twin of [`scalar_rope_truth_bf16`]: `apply`'s `internal_dtype`
+    /// match (`DType::F16 | DType::BF16 => DType::F32`) takes the SAME
+    /// branch for F16 as for BF16 — this proves that branch is actually
+    /// exercised and rounds correctly for the OTHER dtype it names, not
+    /// just BF16. Only ONE shape/seed is run here (not the full
+    /// seq-128/seq-512 sweep the BF16 oracle covers above): the
+    /// rounding-placement mechanism is dtype-independent (both dtypes hit
+    /// the identical F32-internal code path), so a single fixture is
+    /// sufficient to confirm the F16 arm is reached and correct.
+    fn scalar_rope_truth_f16(
+        x: &[f16],
+        cos: &[f16],
+        sin: &[f16],
+        batch: usize,
+        heads: usize,
+        seq: usize,
+        head_dim: usize,
+    ) -> Vec<f16> {
+        let half = head_dim / 2;
+        let mut out = Vec::with_capacity(batch * heads * seq * head_dim);
+        let mut idx = 0usize;
+        for _b in 0..batch {
+            for _h in 0..heads {
+                for s in 0..seq {
+                    for i in 0..head_dim {
+                        let xi = x[idx].to_f32();
+                        let rot = if i < half {
+                            -x[idx + half].to_f32()
+                        } else {
+                            x[idx - half].to_f32()
+                        };
+                        let c = cos[s * head_dim + i].to_f32();
+                        let sn = sin[s * head_dim + i].to_f32();
+                        out.push(f16::from_f32(xi * c + rot * sn));
+                        idx += 1;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn rope_apply_matches_truth_at_production_shape_f16() {
+        let device = Device::Cpu;
+        // batch=2, heads=16, seq=128, head_dim=64 (heads*head_dim=1024) --
+        // the same production shape as the BF16 seq128 case above.
+        let (batch, heads, seq, head_dim) = (2, 16, 128, 64);
+        let n = batch * heads * seq * head_dim;
+
+        let xf = lcg_fixture(0xF16E_0001, n, 24.0);
+        let x_f16: Vec<f16> = xf.iter().map(|&v| f16::from_f32(v)).collect();
+        assert!(
+            x_f16.iter().all(|v| v.to_f32().is_finite()),
+            "fixture x must be finite before any bit compare"
+        );
+
+        let r = rope(head_dim, seq, 10_000.0, &device);
+        let x = Tensor::from_slice(&x_f16, (batch, heads, seq, head_dim), &device).unwrap();
+
+        let apply_out: Vec<f16> = r
+            .apply(&x)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert!(
+            apply_out.iter().all(|v| v.to_f32().is_finite()),
+            "apply() output must be finite before any bit compare"
+        );
+
+        let (cos_full, sin_full) = r.cached_tables(DType::F16).unwrap();
+        let cos_b = cos_full.narrow(2, 0, seq).unwrap();
+        let sin_b = sin_full.narrow(2, 0, seq).unwrap();
+        let cos: Vec<f16> = cos_b.flatten_all().unwrap().to_vec1().unwrap();
+        let sin: Vec<f16> = sin_b.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(cos.iter().chain(sin.iter()).all(|v| v.to_f32().is_finite()));
+
+        let truth = scalar_rope_truth_f16(&x_f16, &cos, &sin, batch, heads, seq, head_dim);
+        assert!(
+            truth.iter().all(|v| v.to_f32().is_finite()),
+            "truth output must be finite before any bit compare"
+        );
+
+        assert_eq!(
+            apply_out, truth,
+            "RotaryEmbedding::apply's F16 internal_dtype arm must be bit-exact vs the \
+             f32-round-once truth -- same mechanism as the BF16 sweep above, the OTHER \
+             dtype internal_dtype's match handles"
+        );
     }
 
     /// The positive half of the RoPE device clause: CPU must satisfy it.

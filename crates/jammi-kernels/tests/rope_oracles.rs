@@ -290,8 +290,8 @@ fn fused_vs_formula_bf16_fwd_is_bit_exact_after_the_one_rounding_fix() {
     println!("fused_vs_formula_bf16_fwd: measured bit-diffs (post-fix) = {diffs:?}");
     assert_eq!(
         fused_out, formula_out,
-        "fwd must now be bit-exact (measured diffs: {diffs:?}) — the pre-fix defect \
-         (23% of elements diverging, see `RotaryEmbedding::apply`'s doc) is gone"
+        "fwd must now be bit-exact (measured diffs: {diffs:?}) — the pre-fix double-rounding \
+         defect (see `RotaryEmbedding::apply`'s doc) is gone"
     );
 }
 

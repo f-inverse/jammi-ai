@@ -7,41 +7,52 @@ workspace ships every publishable crate at the same
 ## [Unreleased]
 
 ### Fixed
-- **Eager LayerNorm and RoPE now round once, matching torch (`jammi-encoders`).**
+- **Eager LayerNorm and RoPE now round once, matching torch/HF (`jammi-encoders`).**
   `LayerNorm::slow`'s bias-free (and biased, non-fast-path) arm rounded `x̂` to
   the backbone dtype BEFORE multiplying by `gamma` (and, when biased, before
-  adding `bias`) — two-to-three rounding points instead of one. torch's
+  adding `bias`) — two-to-three rounding points instead of one. torch 2.13.0's
   `layer_norm_cuda` (`aten/src/ATen/native/cuda/layer_norm_kernel.cu`'s
   `vectorized_layer_norm_kernel_impl`) keeps the whole affine epilogue in the
   f32 accumulator and rounds once, on store; jammi's own fused CUDA/CPU
   `LayerNormFused` kernel already matched that. `slow()` now does too: mean,
   variance, `x̂`, `gamma`, and `bias` are all computed in `internal_dtype`
   (f32 whenever the input is F16/BF16), with a single cast to the backbone
-  dtype at the very end. Measured on a `[4096, 1024]` bf16 ModernBERT-large-
-  shaped fixture (holding torch's own mean/rstd fixed to isolate the
-  epilogue): the old two-round form differed from an f32-computed, once-
-  rounded reference on 1,088,881 of 4,194,304 elements (26%) and was 35%
-  further from f64 truth. Similarly, `RotaryEmbedding::apply`
-  (`jammi-encoders/src/modernbert.rs`, the eval AND training-eager-fallback
-  RoPE path) multiplied `x` by `cos`/`sin` and summed at the backbone dtype —
-  three rounding points instead of HF's one (`apply_rotary_pos_emb`:
-  `(q.float()*cos) + (rotate_half(q.float())*sin)`, then `.to(original_dtype)`
-  once); jammi's fused `RopeFused` kernel already matched HF. `apply` now
-  upcasts every operand to f32 and rounds once at the end, matching both HF
-  and the fused kernel. Measured on a `[8, 16, 64, 64]` bf16 fixture: the old
-  three-round form differed from the once-rounded reference on 120,632 of
-  524,288 elements (23%). **Served embedding numbers change at the ULP
-  level** for both fixes — every bias-free (ModernBERT) LayerNorm output and
-  every RoPE-applied Q/K tensor computed through these eager paths (eval
-  serving, and training whenever the fused-kernel admission domain is
-  missed) now round the same way torch/HF does, rather than accumulating
-  extra rounding error the fused kernel never had. The fused kernels
-  themselves (`LayerNormFused`, `RopeFused`) are unchanged; the
-  `eager_vs_fused_*` oracles in `jammi-kernels/tests/layer_norm_oracles.rs`
-  and `tests/rope_oracles.rs` now measure the eager and fused arms as
-  bit-exact on their fixtures (previously bounded by a stated ULP
-  tolerance), confirming the eager arm converged toward the fused/torch
-  reference rather than drifting further from it.
+  dtype at the very end; `slow()` also now REFUSES a `weight`/`bias` whose
+  dtype does not match `x`'s (a domain-widening hazard the internal-dtype
+  upcast would otherwise silently paper over — previously a mismatched dtype
+  hit candle's own `broadcast_mul` type-mismatch error instead). Similarly,
+  `RotaryEmbedding::apply` (`jammi-encoders/src/modernbert.rs`, the eval AND
+  training-eager-fallback RoPE path) multiplied `x` by `cos`/`sin` and summed
+  at the backbone dtype — three rounding points instead of `transformers`
+  v5.15.1's one (`apply_rotary_pos_emb`: `(q.float()*cos) +
+  (rotate_half(q.float())*sin)`, then `.to(original_dtype)` once; NOTE
+  `transformers` v4.x rounds at every op instead, matching the pre-fix code —
+  this is a version-pinned citation); jammi's fused `RopeFused` kernel
+  already matched HF. `apply` now upcasts every operand to f32 and rounds
+  once at the end, matching both HF and the fused kernel. **Observable only
+  on an F16/BF16 backbone (the CUDA/reduced-precision training and serving
+  path)** — F32 serving is byte-for-byte unchanged, since every `to_dtype`
+  call the fix adds is a same-dtype no-op there. Every served bias-free
+  (ModernBERT) LayerNorm output and every RoPE-applied Q/K tensor computed
+  through these eager paths at reduced precision now rounds the same way
+  torch/HF does, rather than accumulating extra rounding error the fused
+  kernel never had. Measured, reproducible divergence counts at production
+  shape (`hidden=1024`, `batch=2`, `seq` in `{128, 512}`) are printed and
+  asserted by two NEW committed tests reachable from `jammi-encoders`
+  itself — the only place in the workspace the real `slow()`/`apply()`
+  functions are reachable — calling the real functions against an
+  independently-derived scalar truth: `layer_norm::tests::
+  layer_norm_slow_matches_truth_at_production_shape_seq128`/`_seq512` and
+  `modernbert::tests::rope_apply_matches_truth_at_production_shape_seq128`/
+  `_seq512`. The fused kernels themselves (`LayerNormFused`, `RopeFused`)
+  are unchanged; `jammi-kernels/tests/layer_norm_oracles.rs` and
+  `tests/rope_oracles.rs`' `fused_vs_formula_*` checks (renamed from
+  `eager_vs_fused_*` — that crate is a dependency-free leaf and cannot
+  reach `jammi-encoders`' real functions, so its own in-file `formula()`
+  reproduction was never an eager-PARITY oracle, only a fused-kernel-vs-
+  hand-derived-math check) now measure the fused kernel against that
+  updated formula as bit-exact on their fixtures (previously bounded by a
+  stated ULP tolerance).
 
 ## [0.47.0] - 2026-07-17
 

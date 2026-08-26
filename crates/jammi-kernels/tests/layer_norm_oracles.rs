@@ -6,8 +6,9 @@
 //!
 //!   1. `gradcheck_*` — `bwd` vs. central finite differences (`dx` AND
 //!      `dgamma`).
-//!   2. `eager_vs_fused_*` — fwd+bwd vs. a hand-written composition of
-//!      ordinary candle ops that computes the SAME bias-free LayerNorm
+//!   2. `fused_vs_formula_*` — the fused `LayerNormFused` kernel vs. a
+//!      hand-written FORMULA: a candle-op composition IN THIS FILE that
+//!      computes the SAME bias-free LayerNorm math
 //!      (mean/center/variance/normalize/gamma-in-f32/cast-once — the same
 //!      one-rounding shape `jammi-encoders::layer_norm::slow()`'s
 //!      bias-free arm has since the eager-LN one-rounding fix), f32
@@ -15,21 +16,33 @@
 //!      can still round the last bit differently) and bf16 asserted
 //!      BIT-EXACT (measured on these fixtures; see the bf16 tests' own
 //!      docs for why that is not a structural guarantee at every shape).
-//!      This
+//!      NAMING NOTE (do not read this as an eager-parity claim): this
 //!      crate is a LEAF (no `jammi-*` deps — see its module doc / the
-//!      fused-kernels plan's scope decision 12), so it cannot import
-//!      `slow()` itself; the actual "against the real `slow()`" oracle
-//!      (calling that exact function) lives in `jammi-encoders`'
-//!      `tests/it` suite, where `slow()` is reachable. The composition
-//!      reproduced here is the same math for the SAME reason axpy's
-//!      `eager_fwd` reproduces `affine`+`add` rather than importing
-//!      anything — a leaf-crate-clean "what the eager path computes"
-//!      fixture.
+//!      fused-kernels plan's scope decision 12), so `formula()` below
+//!      cannot import `slow()` and is NOT a call into `slow()` — it is
+//!      an independently-written reproduction of the SAME MATH, updated
+//!      by hand whenever `slow()`'s own rounding placement changes (as
+//!      it did in this same PR), which makes a diff that changes both
+//!      `slow()` and `formula()` together structurally unable to prove
+//!      anything about `slow()`'s OWN correctness — only that this
+//!      file's copy of the math agrees with the fused kernel. The BITING
+//!      oracle that calls the REAL `slow()` (and the REAL
+//!      `LayerNormFused` fused CPU arm, via `apply2`) against an
+//!      independently-derived, non-candle-op scalar truth lives in
+//!      `jammi-encoders`' own `src/layer_norm.rs`
+//!      `#[cfg(test)] mod tests` —
+//!      `layer_norm_slow_matches_truth_at_production_shape_seq128`/
+//!      `_seq512` — the only place in the workspace `slow()` is
+//!      reachable at all. `formula()`'s value here is narrower than that:
+//!      it lets THIS crate's own `LayerNormFused` fwd/bwd oracles run
+//!      hermetically with no `jammi-*` dependency, the same reason
+//!      axpy's `formula_fwd` reproduces `affine`+`add` rather than
+//!      importing anything.
 //!   3. `dgamma_needed_true_through_an_intermediate_*` /
 //!      `dgamma_needed_false_on_a_frozen_leaf_*` — the construction-data
 //!      regression oracle: `dgamma_needed=true` through an INTERMEDIATE
 //!      `x` (an `w.affine` chain, not a raw `Var`) still produces a
-//!      correct `dx` (and `dgamma`) matching the eager composition;
+//!      correct `dx` (and `dgamma`) matching the formula composition;
 //!      `dgamma_needed=false` on a genuinely frozen (non-`Var`) `gamma`
 //!      neither panics nor ever populates a gradient for it.
 //!
@@ -45,7 +58,7 @@ fn fused(eps: f64, dgamma_needed: bool, x: &Tensor, gamma: &Tensor) -> candle_co
     apply2(x, gamma, LayerNormFused::new(eps, dgamma_needed))
 }
 
-/// The bias-free eager composition `jammi-encoders::layer_norm::slow()`
+/// The bias-free formula composition `jammi-encoders::layer_norm::slow()`
 /// runs: f32-internal mean/center/variance/normalize, gamma upcast to
 /// `internal_dtype` and applied THERE (never rounded to `x`'s dtype
 /// first), one cast to `x_dtype` at the very end — reproduced here
@@ -55,7 +68,7 @@ fn fused(eps: f64, dgamma_needed: bool, x: &Tensor, gamma: &Tensor) -> candle_co
 /// "Computation is performed in T_ACC ... result is implicitly cast to
 /// T") and `LayerNormFused`'s own CPU/CUDA arm (`cuda/layer_norm.cu:124`:
 /// `yr[i] = __float2bfloat16(xhat * __bfloat162float(gamma[i]))`).
-fn eager(eps: f64, x: &Tensor, gamma: &Tensor) -> candle_core::Result<Tensor> {
+fn formula(eps: f64, x: &Tensor, gamma: &Tensor) -> candle_core::Result<Tensor> {
     let x_dtype = x.dtype();
     let internal_dtype = match x_dtype {
         DType::F16 | DType::BF16 => DType::F32,
@@ -170,11 +183,11 @@ fn gradcheck_dgamma_f32() {
 }
 
 // ---------------------------------------------------------------------
-// Oracle 2: fused vs. eager (candle composition), fwd AND bwd
+// Oracle 2: fused vs. formula (candle composition), fwd AND bwd
 // ---------------------------------------------------------------------
 
 #[test]
-fn eager_vs_fused_f32_fwd_and_bwd_match_within_stated_tolerance() {
+fn fused_vs_formula_f32_fwd_and_bwd_match_within_stated_tolerance() {
     let device = Device::Cpu;
     let x0: [f32; 8] = [1.0, -2.0, 3.5, -0.25, 0.1, 2.2, -1.1, 0.75];
     let gamma0: [f32; 4] = [1.25, -0.5, 2.0, 0.75];
@@ -188,7 +201,7 @@ fn eager_vs_fused_f32_fwd_and_bwd_match_within_stated_tolerance() {
     let g_e = Var::from_tensor(&Tensor::from_slice(&gamma0, (hidden,), &device).unwrap()).unwrap();
 
     let out_f = fused(eps, true, &x_f, &g_f).unwrap();
-    let out_e = eager(eps, &x_e, &g_e).unwrap();
+    let out_e = formula(eps, &x_e, &g_e).unwrap();
     let vf: Vec<f32> = out_f.flatten_all().unwrap().to_vec1().unwrap();
     let ve: Vec<f32> = out_e.flatten_all().unwrap().to_vec1().unwrap();
     // f32-throughout (no bf16 rounding involved on this fixture): the two
@@ -196,7 +209,7 @@ fn eager_vs_fused_f32_fwd_and_bwd_match_within_stated_tolerance() {
     // (different op sequencing can still round differently at the last
     // bit) — a small stated absolute tolerance.
     for (i, (f, e)) in vf.iter().zip(ve.iter()).enumerate() {
-        assert!((f - e).abs() < 1e-4, "fwd[{i}]: fused {f} vs eager {e}");
+        assert!((f - e).abs() < 1e-4, "fwd[{i}]: fused {f} vs formula {e}");
     }
 
     let grads_f = out_f.backward().unwrap();
@@ -216,23 +229,26 @@ fn eager_vs_fused_f32_fwd_and_bwd_match_within_stated_tolerance() {
         .to_vec1()
         .unwrap();
     for (i, (f, e)) in dxf.iter().zip(dxe.iter()).enumerate() {
-        assert!((f - e).abs() < 1e-3, "dx[{i}]: fused {f} vs eager {e}");
+        assert!((f - e).abs() < 1e-3, "dx[{i}]: fused {f} vs formula {e}");
     }
     let dgf: Vec<f32> = grads_f.get(&g_f).unwrap().to_vec1().unwrap();
     let dge: Vec<f32> = grads_e.get(&g_e).unwrap().to_vec1().unwrap();
     for (i, (f, e)) in dgf.iter().zip(dge.iter()).enumerate() {
-        assert!((f - e).abs() < 1e-3, "dgamma[{i}]: fused {f} vs eager {e}");
+        assert!(
+            (f - e).abs() < 1e-3,
+            "dgamma[{i}]: fused {f} vs formula {e}"
+        );
     }
 }
 
-/// bf16: BEFORE the one-rounding fix, the eager composition rounded
+/// bf16: BEFORE the one-rounding fix, the formula composition rounded
 /// `xhat` to bf16 BEFORE multiplying by `gamma`
 /// (`normalized.to_dtype(x_dtype)?.broadcast_mul(&weight)`, the pre-fix
 /// `slow()`), while the fused kernel multiplied `xhat * gamma` in f32 and
 /// rounded ONCE at the very end — measured on this same fixture, that was
-/// a genuine, non-vacuous divergence. `eager()` above now runs the
+/// a genuine, non-vacuous divergence. `formula()` above now runs the
 /// IDENTICAL one-rounding shape (`gamma` upcast to f32, multiplied,
-/// rounded once), so eager and fused are expected to — and on this
+/// rounded once), so formula and fused are expected to — and on this
 /// fixture, measured to — agree BIT-EXACTLY. `bf16_bit_diff` is kept
 /// (rather than deleted along with the tolerance) because it is still
 /// what prints the measured max in the backward oracle below, and as the
@@ -246,7 +262,7 @@ fn bf16_bit_diff(a: bf16, b: bf16) -> i32 {
 }
 
 #[test]
-fn eager_vs_fused_bf16_fwd_is_bit_exact_after_the_one_rounding_fix() {
+fn fused_vs_formula_bf16_fwd_is_bit_exact_after_the_one_rounding_fix() {
     let device = Device::Cpu;
     // The same fixture the pre-fix divergence oracle used (chosen to make
     // the OLD two-rounding-path mismatch as visible as possible) — kept
@@ -268,7 +284,7 @@ fn eager_vs_fused_bf16_fwd_is_bit_exact_after_the_one_rounding_fix() {
         .unwrap()
         .to_vec1()
         .unwrap();
-    let eager_out: Vec<bf16> = eager(eps, &x, &gamma)
+    let formula_out: Vec<bf16> = formula(eps, &x, &gamma)
         .unwrap()
         .flatten_all()
         .unwrap()
@@ -277,19 +293,19 @@ fn eager_vs_fused_bf16_fwd_is_bit_exact_after_the_one_rounding_fix() {
 
     let diffs: Vec<i32> = fused_out
         .iter()
-        .zip(eager_out.iter())
+        .zip(formula_out.iter())
         .map(|(&f, &e)| bf16_bit_diff(f, e))
         .collect();
-    println!("eager_vs_fused_bf16_fwd: measured bit-diffs (post-fix) = {diffs:?}");
+    println!("fused_vs_formula_bf16_fwd: measured bit-diffs (post-fix) = {diffs:?}");
     assert_eq!(
-        fused_out, eager_out,
+        fused_out, formula_out,
         "fwd must now be bit-exact (measured diffs: {diffs:?}) — the pre-fix defect \
          (26% of elements diverging, see `LayerNorm::slow`'s doc) is gone"
     );
 }
 
 /// The backward analog of the forward divergence oracle above: the SAME
-/// rounding-path mechanism (eager rounds `xhat` to bf16 before
+/// rounding-path mechanism (formula rounds `xhat` to bf16 before
 /// multiplying by `gamma`; fused multiplies in f32 and rounds once) also
 /// makes `dx`/`dgamma` bf16-dtype-specific — an f32-tensor `dx`/`dgamma`
 /// gradcheck (the earlier f32 oracles in this file) cannot bound this,
@@ -299,7 +315,7 @@ fn eager_vs_fused_bf16_fwd_is_bit_exact_after_the_one_rounding_fix() {
 /// forward oracle), with both kept within the stated `BF16_ULP_TOL`.
 ///
 /// `dx` (the analytical Apex/ATen-canonical closed form `LayerNormBwdDx`
-/// computes) and the eager composition's `dx` (candle autograd
+/// computes) and the formula composition's `dx` (candle autograd
 /// differentiating through the composed ops) were already two DIFFERENT
 /// derivations of the same gradient before this fix — the forward
 /// one-rounding fix removes one source of divergence (the forward
@@ -311,7 +327,7 @@ fn eager_vs_fused_bf16_fwd_is_bit_exact_after_the_one_rounding_fix() {
 /// agreement plausible even though it is not a structural guarantee for
 /// an arbitrary shape.
 #[test]
-fn eager_vs_fused_bf16_bwd_is_bit_exact_after_the_one_rounding_fix() {
+fn fused_vs_formula_bf16_bwd_is_bit_exact_after_the_one_rounding_fix() {
     let device = Device::Cpu;
     let x0: [f32; 8] = [-18.5, -18.5, -18.5, -17.75, 3.375, -4.125, 9.0625, -2.5];
     let gamma0: [f32; 4] = [0.1, 1.703125, -2.015625, 2.234375];
@@ -343,7 +359,7 @@ fn eager_vs_fused_bf16_bwd_is_bit_exact_after_the_one_rounding_fix() {
     let w_e = Tensor::from_slice(&wb, (rows, hidden), &device).unwrap();
 
     let out_f = fused(eps, true, &x_f, &g_f).unwrap();
-    let out_e = eager(eps, &x_e, &g_e).unwrap();
+    let out_e = formula(eps, &x_e, &g_e).unwrap();
     let loss_f = (&out_f * &w_f).unwrap().sum_all().unwrap();
     let loss_e = (&out_e * &w_e).unwrap().sum_all().unwrap();
     let grads_f = loss_f.backward().unwrap();
@@ -368,7 +384,7 @@ fn eager_vs_fused_bf16_bwd_is_bit_exact_after_the_one_rounding_fix() {
         .zip(dxe.iter())
         .map(|(&f, &e)| bf16_bit_diff(f, e))
         .collect();
-    println!("eager_vs_fused_bf16_bwd: measured dx bit-diffs (post-fix) = {dx_diffs:?}");
+    println!("fused_vs_formula_bf16_bwd: measured dx bit-diffs (post-fix) = {dx_diffs:?}");
     assert_eq!(
         dxf, dxe,
         "dx must now be bit-exact (measured diffs: {dx_diffs:?})"
@@ -381,7 +397,7 @@ fn eager_vs_fused_bf16_bwd_is_bit_exact_after_the_one_rounding_fix() {
         .zip(dge.iter())
         .map(|(&f, &e)| bf16_bit_diff(f, e))
         .collect();
-    println!("eager_vs_fused_bf16_bwd: measured dgamma bit-diffs (post-fix) = {dg_diffs:?}");
+    println!("fused_vs_formula_bf16_bwd: measured dgamma bit-diffs (post-fix) = {dg_diffs:?}");
     assert_eq!(
         dgf, dge,
         "dgamma must now be bit-exact (measured diffs: {dg_diffs:?})"
@@ -393,13 +409,13 @@ fn eager_vs_fused_bf16_bwd_is_bit_exact_after_the_one_rounding_fix() {
 // ---------------------------------------------------------------------
 
 #[test]
-fn dgamma_needed_true_through_an_intermediate_x_matches_eager() {
+fn dgamma_needed_true_through_an_intermediate_x_matches_formula() {
     // `x` is an INTERMEDIATE (`w.affine(2, 0)`) on a path to a `Var`
     // (`w`) — `is_variable() == false`, exactly the case `Axpy`'s own
     // regression test exercises (see `tests/oracles.rs`). `dx`'s slot
     // must still be populated (LayerNormFused::bwd never gates it on
     // `is_variable()`), and with `dgamma_needed=true`, `gamma`'s slot
-    // (a genuine `Var` here) must also match the eager gradient.
+    // (a genuine `Var` here) must also match the formula gradient.
     let device = Device::Cpu;
     let w0: [f32; 8] = [0.5, -1.0, 2.0, 0.25, -0.5, 1.5, -2.0, 0.75];
     let gamma0: [f32; 4] = [1.0, 2.0, -1.0, 0.5];
@@ -427,12 +443,12 @@ fn dgamma_needed_true_through_an_intermediate_x_matches_eager() {
         .unwrap();
     let dgamma: Vec<f32> = grads.get(&gamma).unwrap().to_vec1().unwrap();
 
-    // Same graph shape, through the eager composition.
+    // Same graph shape, through the formula composition.
     let w2 = Var::from_tensor(&Tensor::from_slice(&w0, (rows, hidden), &device).unwrap()).unwrap();
     let x2 = w2.affine(2.0, 0.0).unwrap();
     let gamma2 =
         Var::from_tensor(&Tensor::from_slice(&gamma0, (hidden,), &device).unwrap()).unwrap();
-    let grads2 = eager(eps, &x2, &gamma2).unwrap().backward().unwrap();
+    let grads2 = formula(eps, &x2, &gamma2).unwrap().backward().unwrap();
     let dw2: Vec<f32> = grads2
         .get(&w2)
         .unwrap()
@@ -443,10 +459,13 @@ fn dgamma_needed_true_through_an_intermediate_x_matches_eager() {
     let dgamma2: Vec<f32> = grads2.get(&gamma2).unwrap().to_vec1().unwrap();
 
     for (i, (a, b)) in dw.iter().zip(dw2.iter()).enumerate() {
-        assert!((a - b).abs() < 1e-3, "dw[{i}]: fused {a} vs eager {b}");
+        assert!((a - b).abs() < 1e-3, "dw[{i}]: fused {a} vs formula {b}");
     }
     for (i, (a, b)) in dgamma.iter().zip(dgamma2.iter()).enumerate() {
-        assert!((a - b).abs() < 1e-3, "dgamma[{i}]: fused {a} vs eager {b}");
+        assert!(
+            (a - b).abs() < 1e-3,
+            "dgamma[{i}]: fused {a} vs formula {b}"
+        );
     }
 }
 

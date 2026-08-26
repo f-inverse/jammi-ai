@@ -1,28 +1,41 @@
-//! CPU-hermetic oracles for `RopeFused` — the fused-vs-eager and
+//! CPU-hermetic oracles for `RopeFused` — the fused-vs-formula and
 //! chain-rule rigor-chain `tests/layer_norm_oracles.rs` establishes,
 //! adapted for RoPE's specific `bwd` mechanism (reusing the SAME
 //! `KernelOp` with `sin` negated, rather than a dedicated second kernel —
 //! see `jammi_kernels::ops::rope`'s module doc).
 //!
 //!   1. `gradcheck_dx_*` — `bwd` vs. central finite differences.
-//!   2. `eager_vs_fused_*` — fwd+bwd vs. a hand-written composition of
-//!      ordinary candle ops that reproduces the EXACT eager RoPE
-//!      composition `RotaryEmbedding::apply` uses in `jammi-encoders`
-//!      (ModernBERT): `narrow`/`neg`/`Tensor::cat`/broadcast-mul/add. This
-//!      crate is a LEAF (no `jammi-*` deps), so it cannot import that
-//!      function itself; the actual "against the real `apply()`" oracle
-//!      lives in `jammi-encoders`'s own test suite, where that function is
-//!      reachable. F32 is asserted BIT-EXACT (`assert_eq!`, not a
-//!      tolerance) — the rounding model predicts it (identical IEEE-754
-//!      op sequence, no `fmad` contraction on the CPU arm) and the
-//!      measured result confirms it; the crate's derive-the-tolerance
-//!      doctrine means a tolerance is stated only where the model
-//!      predicts real divergence, never as a default hedge. BF16 is ALSO
-//!      asserted BIT-EXACT since the RoPE one-rounding fix (`eager()` now
+//!   2. `fused_vs_formula_*` — the fused `RopeFused` kernel vs. a
+//!      hand-written FORMULA: a candle-op composition IN THIS FILE that
+//!      reproduces the SAME math `RotaryEmbedding::apply` runs in
+//!      `jammi-encoders` (ModernBERT): `narrow`/`neg`/`Tensor::cat`/
+//!      broadcast-mul/add. NAMING NOTE (do not read this as an
+//!      eager-parity claim): this crate is a LEAF (no `jammi-*` deps), so
+//!      `formula()` below cannot import `apply()` and is NOT a call into
+//!      it — it is an independently-written reproduction of the SAME
+//!      MATH, updated by hand whenever `apply()`'s own rounding placement
+//!      changes (as it did in this same PR), which makes a diff that
+//!      changes both `apply()` and `formula()` together structurally
+//!      unable to prove anything about `apply()`'s OWN correctness — only
+//!      that this file's copy of the math agrees with the fused kernel.
+//!      The BITING oracle that calls the REAL `apply()` (and the REAL
+//!      `RopeFused` fused CPU arm, via `apply3`) against an
+//!      independently-derived, non-candle-op scalar truth lives in
+//!      `jammi-encoders`' own `src/modernbert.rs`
+//!      `#[cfg(test)] mod tests` —
+//!      `rope_apply_matches_truth_at_production_shape_seq128`/`_seq512` —
+//!      the only place in the workspace `apply()` is reachable at all.
+//!      F32 is asserted BIT-EXACT (`assert_eq!`, not a tolerance) — the
+//!      rounding model predicts it (identical IEEE-754 op sequence, no
+//!      `fmad` contraction on the CPU arm) and the measured result
+//!      confirms it; the crate's derive-the-tolerance doctrine means a
+//!      tolerance is stated only where the model predicts real
+//!      divergence, never as a default hedge. BF16 is ALSO asserted
+//!      BIT-EXACT since the RoPE one-rounding fix (`formula()` now
 //!      upcasts every operand to f32 before the rotation and rounds once
-//!      at the end, the same shape `RopeFused` itself computes) — measured
-//!      on these fixtures; see the bf16 tests' own docs for why that is
-//!      not a structural guarantee at every shape.
+//!      at the end, the same shape `RopeFused` itself computes) —
+//!      measured on these fixtures; see the bf16 tests' own docs for why
+//!      that is not a structural guarantee at every shape.
 //!   3. `chain_rule_through_an_intermediate_x` — the same
 //!      `is_variable() == false` intermediate hazard `Axpy`'s regression
 //!      test exercises, at a 4D (batch/heads/seq/head_dim) shape matching
@@ -45,7 +58,7 @@ fn fused(negate_sin: bool, x: &Tensor, cos: &Tensor, sin: &Tensor) -> candle_cor
     apply3(x, cos, sin, RopeFused::new(negate_sin))
 }
 
-/// The EXACT eager composition `RotaryEmbedding::apply` runs (see
+/// The EXACT formula composition `RotaryEmbedding::apply` runs (see
 /// `jammi-encoders/src/modernbert.rs`): `x` is `[batch, heads, seq,
 /// head_dim]`, `cos`/`sin` are pre-broadcast to `[1, 1, seq, head_dim]`
 /// (this fixture builds them directly in that shape, mirroring the
@@ -59,7 +72,7 @@ fn fused(negate_sin: bool, x: &Tensor, cos: &Tensor, sin: &Tensor) -> candle_cor
 /// computes (`cuda/rope.cu:62`). For F32 inputs `internal_dtype == F32`,
 /// so every cast here is a same-dtype no-op and this degenerates to the
 /// original (already bit-exact) composition.
-fn eager(x: &Tensor, cos_b: &Tensor, sin_b: &Tensor) -> candle_core::Result<Tensor> {
+fn formula(x: &Tensor, cos_b: &Tensor, sin_b: &Tensor) -> candle_core::Result<Tensor> {
     let x_dtype = x.dtype();
     let internal_dtype = match x_dtype {
         DType::F16 | DType::BF16 => DType::F32,
@@ -155,7 +168,7 @@ fn gradcheck_dx_f32_vs_central_finite_differences_4d_shape() {
 }
 
 #[test]
-fn eager_vs_fused_f32_fwd_and_bwd_are_bit_exact() {
+fn fused_vs_formula_f32_fwd_and_bwd_are_bit_exact() {
     let device = Device::Cpu;
     let (batch, heads, seq, hidden) = (2, 3, 4, 8);
     let n = batch * heads * seq * hidden;
@@ -174,7 +187,7 @@ fn eager_vs_fused_f32_fwd_and_bwd_are_bit_exact() {
     let sin = Tensor::from_slice(&sin_v, (1, 1, seq, hidden), &device).unwrap();
 
     let out_f = fused(false, &x_f, &cos, &sin).unwrap();
-    let out_e = eager(&x_e, &cos, &sin).unwrap();
+    let out_e = formula(&x_e, &cos, &sin).unwrap();
     let vf: Vec<f32> = out_f.flatten_all().unwrap().to_vec1().unwrap();
     let ve: Vec<f32> = out_e.flatten_all().unwrap().to_vec1().unwrap();
     // BIT-EXACT, not a tolerance: the rounding model predicts it. Both
@@ -194,7 +207,7 @@ fn eager_vs_fused_f32_fwd_and_bwd_are_bit_exact() {
     // the CPU arm), so there is no other source of divergence. `assert_eq!`
     // is therefore the correct assertion, not a loosely-related tolerance
     // check — a real divergence here would mean the kernel's op grouping
-    // does not actually match the eager composition's, which is exactly
+    // does not actually match the formula composition's, which is exactly
     // the class of bug this oracle exists to catch.
     assert_eq!(vf, ve, "fwd must be bit-exact, not merely close");
 
@@ -217,18 +230,18 @@ fn eager_vs_fused_f32_fwd_and_bwd_are_bit_exact() {
     // Same bit-exactness argument extends to `dx`: the fused kernel's
     // `negate_sin=true` reuse computes each `dx` element via the same two
     // rounded multiplies (`dy[j]*cos[j]`, `dy[j+half]*sin[j]`) as the
-    // eager composition's autograd-derived backward, with only EXACT
+    // formula composition's autograd-derived backward, with only EXACT
     // negations and a commutative final add differing in between.
     assert_eq!(dxf, dxe, "dx must be bit-exact, not merely close");
 }
 
-/// bf16 fwd: BEFORE the one-rounding fix, the eager composition rounded
+/// bf16 fwd: BEFORE the one-rounding fix, the formula composition rounded
 /// intermediate products (`x*cos`, `rotate_half(x)*sin`, the sum) to
 /// bf16 at each op boundary while the fused kernel accumulated the whole
 /// elementwise expression in f32 and rounded ONCE — measured on this
-/// same fixture, that was a genuine, non-vacuous divergence. `eager()`
+/// same fixture, that was a genuine, non-vacuous divergence. `formula()`
 /// above now runs the IDENTICAL one-rounding shape (every operand
-/// upcast to f32, one cast back at the end), so eager and fused are
+/// upcast to f32, one cast back at the end), so formula and fused are
 /// expected to — and on this fixture, measured to — agree BIT-EXACTLY,
 /// the same outcome the LN oracle's identical fix produced. `bf16_bit_diff`
 /// is kept for the same reason `layer_norm_oracles.rs` keeps its own copy:
@@ -240,7 +253,7 @@ fn bf16_bit_diff(a: bf16, b: bf16) -> i32 {
 }
 
 #[test]
-fn eager_vs_fused_bf16_fwd_is_bit_exact_after_the_one_rounding_fix() {
+fn fused_vs_formula_bf16_fwd_is_bit_exact_after_the_one_rounding_fix() {
     let device = Device::Cpu;
     let (batch, heads, seq, hidden) = (1, 2, 4, 8);
     let n = batch * heads * seq * hidden;
@@ -262,7 +275,7 @@ fn eager_vs_fused_bf16_fwd_is_bit_exact_after_the_one_rounding_fix() {
         .unwrap()
         .to_vec1()
         .unwrap();
-    let eager_out: Vec<bf16> = eager(&x, &cos, &sin)
+    let formula_out: Vec<bf16> = formula(&x, &cos, &sin)
         .unwrap()
         .flatten_all()
         .unwrap()
@@ -271,12 +284,12 @@ fn eager_vs_fused_bf16_fwd_is_bit_exact_after_the_one_rounding_fix() {
 
     let diffs: Vec<i32> = fused_out
         .iter()
-        .zip(eager_out.iter())
+        .zip(formula_out.iter())
         .map(|(&f, &e)| bf16_bit_diff(f, e))
         .collect();
-    println!("eager_vs_fused_bf16_fwd: measured bit-diffs (post-fix) = {diffs:?}");
+    println!("fused_vs_formula_bf16_fwd: measured bit-diffs (post-fix) = {diffs:?}");
     assert_eq!(
-        fused_out, eager_out,
+        fused_out, formula_out,
         "fwd must now be bit-exact (measured diffs: {diffs:?}) — the pre-fix defect \
          (23% of elements diverging, see `RotaryEmbedding::apply`'s doc) is gone"
     );
@@ -290,7 +303,7 @@ fn eager_vs_fused_bf16_fwd_is_bit_exact_after_the_one_rounding_fix() {
 /// post-fix, `dx` is bit-exact — see the forward oracle's doc for why
 /// that is not a structural guarantee at every shape.
 #[test]
-fn eager_vs_fused_bf16_bwd_is_bit_exact_after_the_one_rounding_fix() {
+fn fused_vs_formula_bf16_bwd_is_bit_exact_after_the_one_rounding_fix() {
     let device = Device::Cpu;
     let (batch, heads, seq, hidden) = (1, 2, 4, 8);
     let n = batch * heads * seq * hidden;
@@ -318,7 +331,7 @@ fn eager_vs_fused_bf16_bwd_is_bit_exact_after_the_one_rounding_fix() {
     let w_e = Tensor::from_slice(&wb, (batch, heads, seq, hidden), &device).unwrap();
 
     let out_f = fused(false, &x_f, &cos, &sin).unwrap();
-    let out_e = eager(&x_e, &cos, &sin).unwrap();
+    let out_e = formula(&x_e, &cos, &sin).unwrap();
     let loss_f = (&out_f * &w_f).unwrap().sum_all().unwrap();
     let loss_e = (&out_e * &w_e).unwrap().sum_all().unwrap();
     let grads_f = loss_f.backward().unwrap();
@@ -343,7 +356,7 @@ fn eager_vs_fused_bf16_bwd_is_bit_exact_after_the_one_rounding_fix() {
         .zip(dxe.iter())
         .map(|(&f, &e)| bf16_bit_diff(f, e))
         .collect();
-    println!("eager_vs_fused_bf16_bwd: measured dx bit-diffs (post-fix) = {diffs:?}");
+    println!("fused_vs_formula_bf16_bwd: measured dx bit-diffs (post-fix) = {diffs:?}");
     assert_eq!(
         dxf, dxe,
         "dx must now be bit-exact (measured diffs: {diffs:?})"

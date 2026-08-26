@@ -79,6 +79,14 @@ form several times over — while ALSO accepting `see below`/`see table
     `Path.exists()` (which would accept an untracked, gitignored file).
   - `` [producer: <path or fn form>] `` — the same resolution as `see`,
     OR (if the content isn't a `::`-path/identifier shape) a tracked path.
+  - a BARE `` [`<path>`] `` rustdoc link, with NO `see`/`printed by`
+    lead-in at all (round-4 audit fix) — accepted ONLY for this bracketed
+    form; a bare/backtick-only path with no keyword is still NOT a
+    citation (this repo writes far more `` [`Type::method`] `` cross-
+    references that are not citations than ones that are — the bracket
+    form alone is not evidence; it becomes evidence ONLY because its
+    resolved fn, checked the same way as every other form, turns out to
+    be a real `#[test]`).
 
 A resolved fn name is REQUIRED to be a `#[test]`-attributed function
 (including `#[tokio::test]`/any attribute whose text contains "test"), or a
@@ -208,6 +216,18 @@ _MEASURED_BY_KW_RE = re.compile(r"\bmeasured by\s+")
 _PRODUCER_TAG_RE = re.compile(r"\[producer:\s*([^\]]+)\]")
 _ARTIFACT_PATH_RE = re.compile(r"^`?([^\s`,;]+)")
 
+# Round-4 audit fix: a BARE rustdoc intra-link — `` [`fn`] `` with no `see`/
+# `printed by` prefix at all — counts as a citation, but ONLY for the
+# bracketed-link form (never a bare/backtick-only path, which still
+# requires an explicit `see`/`printed by` keyword — this repo writes far
+# too many non-citation `` [`Type::method`] `` cross-references for a bare
+# link alone to mean "this is where the number came from"; the bracket
+# form is reserved for exactly that ambiguity because a doc-comment
+# convention this repo already follows is to link the covering `#[test]`
+# fn directly, e.g. `` (fixture from [`some_test_fn`]) `` with no lead-in
+# word at all).
+_BARE_BRACKET_LINK_RE = re.compile(rf"\[`({_PATH})`\]")
+
 
 def _run(cmd: list[str]) -> str:
     out = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True, check=True)
@@ -298,6 +318,14 @@ def is_block_bound(block_text: str, fn_index: set[str], tracked: set[str]) -> bo
             if target and is_test_fn(_last_segment(target), fn_index):
                 return True
 
+    # A BARE `` [`fn`] `` rustdoc link, with no `see`/`printed by` lead-in —
+    # accepted ONLY for this bracketed form (see `_BARE_BRACKET_LINK_RE`'s
+    # own comment for why the bare/backtick-only forms still require the
+    # keyword).
+    for m in _BARE_BRACKET_LINK_RE.finditer(block_text):
+        if is_test_fn(_last_segment(m.group(1)), fn_index):
+            return True
+
     for m in _MEASURED_BY_KW_RE.finditer(block_text):
         am = _ARTIFACT_PATH_RE.match(block_text[m.end() :])
         if am:
@@ -347,19 +375,40 @@ def is_comment_line(line: str) -> bool:
     return line.lstrip().startswith("//")
 
 
+# A comment line with NOTHING after the `//`/`///`/`//!` marker (only
+# trailing whitespace) — this repo's own paragraph-break convention inside
+# a doc comment. Round-4 audit fix: `compute_blocks` originally treated an
+# ENTIRE module doc (every `//!` line from the top of a file down to the
+# first blank/code line — e.g. all 571 lines of softmax.rs's header) as
+# ONE binding unit, so a single resolving citation anywhere in that doc
+# laundered every number in it; the auditor proved this by injecting a
+# phantom, uncited `5145/16384`/`31.4%`/`0.796123` into the MIDDLE of
+# softmax.rs's module doc and the gate stayed green. A bare separator line
+# is still a comment line (`is_comment_line` stays true for it — it must
+# remain part of the scanned text, never silently dropped), but it now
+# ENDS the current binding block the same way a blank/code line would, so
+# a citation in one paragraph of a module doc no longer reaches a number
+# several paragraphs away.
+_BARE_SEPARATOR_RE = re.compile(r"^\s*(?://!|///|//)\s*$")
+
+
+def is_bare_separator_line(line: str) -> bool:
+    return bool(_BARE_SEPARATOR_RE.match(line))
+
+
 def compute_blocks(lines: list[str]) -> list[int]:
     """`block_of[i]` is the block id line `i` belongs to. Contiguous
-    comment lines (any run of lines starting with `//`, covering `///`,
-    `//!`, and plain `//` — including a bare `//`/`///`/`//!` paragraph
-    separator, which still starts with `//` and so does NOT break the
-    block) share one id; every other line (code, including an
-    `assert!`/`panic!` line) is its own singleton block.
+    non-separator comment lines (any run of lines starting with `//`,
+    covering `///`, `//!`, and plain `//`) share one id; a bare
+    `//`/`///`/`//!` separator line, code (including an `assert!`/
+    `panic!` line), or a blank line each ENDS the current block and starts
+    its own singleton one.
     """
     block_of = [0] * len(lines)
     next_id = 0
     current: int | None = None
     for i, line in enumerate(lines):
-        if is_comment_line(line):
+        if is_comment_line(line) and not is_bare_separator_line(line):
             if current is None:
                 current = next_id
                 next_id += 1
@@ -756,6 +805,26 @@ def self_test() -> int:
 // tracked path (used here only as a stand-in artifact).
 """,
     )
+    clean(
+        "round-4: a BARE [`fn`] rustdoc link, no see/printed-by lead-in at "
+        "all, resolves for the bracketed form (the esc-045 branch's "
+        "reference_call_path_matches_torch_dx_on_torchs_own_f32_y_from_"
+        "fixture shape: a citation embedded as a plain doc link, not "
+        "introduced by a keyword)",
+        f"""
+// (fixture from [`{real_fn}`]) the fused arm measured 5145/16384 elements
+// differing from the eager chain on that same fixture.
+""",
+    )
+    flagged(
+        "round-4: a BARE backtick-only (non-bracketed) path with NO "
+        "see/printed-by lead-in does NOT resolve — the keyword-optional "
+        "carve-out is for the bracketed [`fn`] link form only",
+        f"""
+// (fixture from `{real_fn}`) the fused arm measured 5145/16384 elements
+// differing from the eager chain on that same fixture.
+""",
+    )
 
     # --- (A) citation grammar: must NOT resolve, even if a real fn exists ---
     flagged(
@@ -799,6 +868,23 @@ fn unrelated_marker() {{}}
 
 // measured 87/128 elements differed from the eager chain in a totally
 // separate block with no citation of its own.
+""",
+    )
+    flagged(
+        "round-4 audit fixture: a bare '//!' paragraph separator inside a "
+        "module doc breaks the block, so a citation in paragraph 1 does NOT "
+        "cover a phantom number injected into paragraph 2 (the exact "
+        "reproduction the round-4 audit verified against softmax.rs, where "
+        "a single resolving citation anywhere in the ~570-line module doc "
+        "was previously laundering every number in it)",
+        f"""
+//! Fused masked softmax-last-dim forward + backward — see [`{real_fn}`] for
+//! the harness the whole module doc's claims are anchored to.
+//!
+//! Paragraph two, several sentences after that citation: the fused arm
+//! measured 5145/16384 elements differing from the eager chain, a 31.4%
+//! divergence rate, cosine similarity 0.796123 against the reference —
+//! none of this paragraph's own numbers are cited anywhere near it.
 """,
     )
     clean(
@@ -933,8 +1019,10 @@ fn below() {}
 
     print(
         "doc-numbers-have-producers self-test: OK — citation grammar (rustdoc-link/path/"
-        "bare forms) resolves via a REAL #[test] fn and rejects see-below/table/step; "
-        "block-level binding covers a same-block citation and refuses a different block's; "
+        "bare forms, plus a keyword-optional bracketed link) resolves via a REAL #[test] "
+        "fn and rejects see-below/table/step; a bare '//!' paragraph separator breaks a "
+        "binding block (the softmax.rs module-doc injection reproduction); block-level "
+        "binding covers a same-block citation and refuses a different block's; "
         "no-producer: stays line-scoped; every shape exclusion (M>=64, decimal/chain/"
         "exponent/n=/version) holds without over-firing; the definitional-= and "
         "[`CONST`]-link exclusions are gone; all eight reworded probes caught."

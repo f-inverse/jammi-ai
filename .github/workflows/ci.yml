@@ -372,6 +372,28 @@ jobs:
       - name: Compile-check jammi-encoders --features cuda,flash-attn (nvcc, no GPU)
         run: cargo check -p jammi-encoders --features cuda,flash-attn --tests
 
+      # round-5 audit NF-2 (kernel-oracle-standard): the step immediately
+      # above is the ONLY CI lane that compiles jammi-encoders' `#[cfg(feature
+      # = "cuda")] mod tests` module — but a test whose own attribute reads
+      # `#[cfg(all(feature = "cuda", not(feature = "flash-attn")))]` (the
+      # cuda-only, NOT-flash-attn meta-test verifying `flash_compiled_or_skip`
+      # panics under `JAMMI_REQUIRE_FLASH` when this build was NOT compiled
+      # with `flash-attn`) is, BY ITS OWN CFG, excluded from a `cuda,flash-attn`
+      # build — that lane enables `flash-attn`, so `not(feature = "flash-attn")`
+      # is false there. Without this second lane, that one test is compiled by
+      # ZERO CI jobs (the cfg-blind gap this audit round closed: KO-7's own
+      # gate, which only sees SOURCE TEXT, PASSes a test that no lane actually
+      # builds — a syntax break in it would first surface on a GPU pod run,
+      # not here). Same job/image/toolchain as the step above (no extra setup
+      # cost); `--tests` is required for the same reason noted there (plain
+      # `cargo check` never compiles `#[cfg(test)] mod tests` content at all).
+      # Verified on a100b (numerics owner, cited in this lane's introducing
+      # commit): `cargo test -p jammi-encoders --features cuda --no-run --list`
+      # includes `flash_compiled_or_skip_panics_under_require_flash_when_not_compiled`
+      # under this exact feature set, confirming this lane compiles it.
+      - name: Compile-check jammi-encoders --features cuda (nvcc, no GPU) — covers the NOT(flash-attn) meta-test
+        run: cargo check -p jammi-encoders --features cuda --tests
+
   oss-only-build:
     name: Guard (OSS-only build)
     runs-on: ubuntu-latest
@@ -674,14 +696,22 @@ jobs:
           # real/noise in ci/doc_number_allowlist_classification.md) carries
           # the pre-existing debt on main at the time this gate landed.
           #
-          # ADVISORY, not required (lead ship decision, round-4): the lexical
-          # heuristic's honest noise rate on main is 36/69 = 52.2% (real:
-          # 33/69 = 47.8%; see ci/doc_number_allowlist_classification.md), so
-          # a REQUIRED scan leg would block an honest in-flight branch on its
+          # ADVISORY, not required (lead ship decision, round-4; re-measured
+          # round-5 after KO-4's own "floor"-kind detector — round-4's
+          # depth-tracking statement-boundary fix — surfaced 18 previously-
+          # invisible floor findings the table had never classified, kind
+          # count 0 -> 18; re-measured AGAIN round-6 after classifying the
+          # 23 non-floor findings the flash-attention merge landed that
+          # round 5 left unclassified): the lexical heuristic's honest
+          # noise rate over the CLASSIFIED set is now 58/110 = 52.7% (real:
+          # 52/110 = 47.3%; see ci/doc_number_allowlist_classification.md,
+          # whose header states this is a rate over what has been
+          # hand-reviewed to date, not a full-live-scan precision), so a
+          # REQUIRED scan leg would block an honest in-flight branch on its
           # own noise (the esc-045 branch alone carries 69 unallowlisted
           # findings, roughly half of them noise) rather than only on
           # genuine new violations. The scan leg reports (advisory) until
-          # precision on main reaches >= 80% real.
+          # precision reaches >= 80% real.
           # `continue_on_error: "true"` below (consumed by the shared "Run
           # guard" step's `continue-on-error` expression) marks ONLY this one
           # leg soft; `--self-test` and `--check-allowlist-only-shrinks`
@@ -809,6 +839,21 @@ jobs:
           # misroute) before this fix; was wired into no workflow at all.
           - name: reference torch_grad_oracle name-translation suite
             cmd: python3 crates/jammi-bench/reference/test_torch_grad_oracle_names.py
+          # Kernel-acceptance-oracle standard (v1) — mechanizes KO-7 (every
+          # `#[test]`-body runtime skip in crates/jammi-kernels/tests/*.rs and
+          # crates/jammi-encoders/src/*.rs must be dominated by a call to a
+          # registered require-gate helper, TOTAL over every scanned file
+          # today), and, marker-scoped, KO-2 (a marked oracle-cell's control
+          # fn covers every bound it claims) and KO-5 (a marker's derived-on
+          # and asserted-on seed sets stay disjoint). Reconciles the SHIPPED
+          # admission-key op domain against COVERED/STRUCTURALLY_EXCLUDED/
+          # PENDING the same way check_gpu_parity_matrix.py does for the
+          # device axis — v1 ships with zero markers, so every op is
+          # honestly PENDING; see docs/maintainer/cuda-kernel-guide.md §3.
+          - name: kernel oracle standard
+            cmd: python3 ci/scripts/check_kernel_oracles.py
+          - name: kernel oracle standard suite
+            cmd: python3 ci/scripts/test_check_kernel_oracles.py
     steps:
       - uses: actions/checkout@v4
         with:

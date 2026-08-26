@@ -334,6 +334,16 @@ jobs:
       - name: Compile-check jammi-kernels --features flash-attn (nvcc, no GPU)
         run: cargo check -p jammi-kernels --features flash-attn
 
+      # The encoders `forward_flash_dense_attention` call site (P6 Stage B
+      # B3-dense) is otherwise compiled by no CI job at all — this crate's
+      # ordinary `check`/`clippy` jobs never build with `--features
+      # flash-attn`, so a break in that call site would only surface on the
+      # next GPU pod run. Same image, same job (CUTLASS submodule already
+      # initialised above), same flags/env/target-dir as the kernels step
+      # immediately above.
+      - name: Compile-check jammi-encoders --features flash-attn (nvcc, no GPU)
+        run: cargo check -p jammi-encoders --features flash-attn
+
   oss-only-build:
     name: Guard (OSS-only build)
     runs-on: ubuntu-latest

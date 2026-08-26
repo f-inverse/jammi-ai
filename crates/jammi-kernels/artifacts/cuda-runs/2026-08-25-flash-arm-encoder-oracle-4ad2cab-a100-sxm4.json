@@ -1,0 +1,138 @@
+{
+  "unit": "BLOCK 1/2/3 audit close-out (perf/p6-fa2-dense adversarial audit, numerics agent)",
+  "git_sha": "4ad2cabdcf3dedd6c8199bd691b619c8971428aa",
+  "git_sha7": "4ad2cab",
+  "branch": "perf/p6-fa2-dense",
+  "box": "a100c (NVIDIA A100-SXM4-80GB)",
+  "gate_outcomes_this_session": {
+    "cargo fmt -p jammi-kernels --check": "PASS",
+    "cargo fmt -p jammi-encoders --check": "PASS",
+    "cargo clippy -p jammi-kernels --all-targets -- -D warnings (local, no cuda)": "PASS",
+    "cargo clippy -p jammi-encoders --all-targets -- -D warnings (local, no cuda)": "PASS",
+    "cargo clippy -p jammi-kernels --all-targets --features cuda,flash-attn -- -D warnings (pod)": "PASS",
+    "cargo clippy -p jammi-encoders --all-targets --features cuda,flash-attn -- -D warnings (pod)": "PASS",
+    "cargo test -p jammi-kernels --lib (local, no cuda)": "PASS 274/274",
+    "cargo test -p jammi-encoders --lib (local, no cuda)": "PASS 125/125",
+    "cargo test -p jammi-kernels --features cuda,flash-attn (pod, JAMMI_REQUIRE_CUDA=1)": "PASS 482/482, 2 ignored (isolated_kernel_timing_* -- not run, TIMING_IN_PROGRESS honoured)",
+    "cargo test -p jammi-kernels --features cuda,flash-attn --test cuda_parity": "PASS 82/82, 1 ignored (isolated_kernel_timing_cast_boundary_wave1) -- 76 dense legs (incl. BLOCK 2's new slot-1 K oracle) + 6 cast-boundary legs from origin/main #377",
+    "cargo test -p jammi-encoders --features cuda,flash-attn (pod, JAMMI_REQUIRE_CUDA=1, JAMMI_FLASH_ORACLE_MODEL_DIR=/root/checkpoints/ModernBERT-large)": "PASS 165/165 (131 lib + 34 it)",
+    "RUSTDOCFLAGS=-D warnings cargo doc -p jammi-kernels --no-deps": "PASS",
+    "RUSTDOCFLAGS=-D warnings cargo doc -p jammi-encoders --no-deps": "PASS",
+    "RUSTDOCFLAGS=-D warnings cargo doc --workspace --exclude jammi-python --no-deps": "PASS",
+    "python3 ci/scripts/perf/test_ab_merge.py": "PASS 40/40",
+    "python3 ci/scripts/perf/check_citations.py": "PASS 63 files scanned"
+  },
+  "block2_rope_positions_slot1_k_oracle": {
+    "description": "K-slot (slot 1) bit-identity + sign-flip RED control added to every CPU (4) and CUDA (4) identity leg, plus an independent closed-form dK check in the CUDA bwd test. All GREEN on the real kernel.",
+    "cpu_tests_all_pass": [
+      "bit_identical_to_rope_fused_on_bhsd_b1_s_small",
+      "bit_identical_to_rope_fused_on_bhsd_b8_s_small",
+      "bit_identical_to_rope_fused_on_bhsd_head_dim_matches_production",
+      "bit_identical_single_position_s_one",
+      "total_not_a_multiple_of_seq_is_refused (advisory: rope_positions_dims domain guard)"
+    ],
+    "cuda_tests_all_pass": [
+      "rope_positions_bit_identical_to_rope_fused_bf16_b8_s512_global_theta_cuda",
+      "rope_positions_bit_identical_to_rope_fused_bf16_b8_s512_local_theta_cuda",
+      "rope_positions_bit_identical_to_rope_fused_bf16_b1_s512_cuda",
+      "rope_positions_bit_identical_to_rope_fused_bf16_b8_s128_cuda",
+      "rope_positions_bwd_reaches_qkv_gradient_cuda (K-slot closed-form dK = cos +/- sin oracle)"
+    ]
+  },
+  "block1_flash_arm_encoder_level_oracle": {
+    "description": "cuda-kernel-guide.md SS3.3 three-way oracle (flash-bf16 vs block-bf16 vs f32 reference) on a real ModernBERT-large checkpoint, Gaussian-init LoRA (rank=16, alpha=32, target=Wqkv), seed-keyed synthetic ids, pooled-embedding + step-0 dL/d(layer0 Wqkv LoRA B) gradient.",
+    "bound": "err(flash, f32) <= K * err(block, f32), K = 1.5",
+    "bound_derivation": "Auditor's own hand-run oracle on this checkpoint measured err(flash,f32)=5.71e-2 vs err(block,f32)=9.11e-2 -- flash already closer to truth. K=1.5 keeps 1.5*err(block) well above flash's own measured distance (healthy bf16-noise margin) while still reddening the K-unrotated mutant (auditor: 6.42e-1) and window-dropped mutant (auditor: 4.73e-1) many-fold over the realized bound.",
+    "main_oracle_green_measured": {
+      "b8_s512": {
+        "pooled_err_flash": 0.18823,
+        "pooled_err_block": 0.17482,
+        "pooled_bound": 0.26222,
+        "grad_err_flash": 34924.0,
+        "grad_err_block": 27795.0,
+        "grad_bound": 41692.0,
+        "note": "grad err magnitudes are large in absolute terms because the LoRA-B gradient reference values are themselves near-zero for many elements at this random Gaussian init (relative-L1 blows up); flash and block track each other and the bound holds -- the qualitative comparison (not the raw magnitude) is what the oracle gates on."
+      },
+      "b1_s128": {
+        "pooled_err_flash": 0.16754,
+        "pooled_err_block": 0.15673,
+        "pooled_bound": 0.2351,
+        "grad_err_flash": 69162.0,
+        "grad_err_block": 87764.0,
+        "grad_bound": 131650.0
+      }
+    },
+    "red_controls_measured": {
+      "k_unrotated_b8_s512": {
+        "fault_err": 0.88736,
+        "block_err": 0.057121,
+        "bound": 0.085682,
+        "fault_over_bound_x": 10.36,
+        "note": "matches the auditor's own '8-11x mutants' expectation"
+      },
+      "window_dropped_b8_s512": {
+        "fault_err": 0.41278,
+        "block_err": 0.11168,
+        "bound": 0.16753,
+        "fault_over_bound_x": 2.46
+      },
+      "bad_softmax_scale_b8_s512": {
+        "fault_err": 1.4662,
+        "block_err": 0.10417,
+        "bound": 0.15626,
+        "fault_over_bound_x": 9.39,
+        "note": "class-sweep advisory: softmax_scale wiring quantity, cheap to add given the K-unrotated harness already existed"
+      }
+    }
+  },
+  "block3_vram_attribution": {
+    "reference_numbers_this_branch_already_committed": {
+      "source": "crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-p6-b3-dense-b98f7e1-a100-sxm4.json",
+      "b8_s512_flash_peak_vram_bytes": [
+        18943574016.0,
+        19312672768.0
+      ],
+      "b8_s512_block_peak_vram_bytes": [
+        16997416960.0,
+        16594763776.0
+      ],
+      "delta_gb": "1.8-2.7 GB"
+    },
+    "dq_accum_measured_live_a100c": {
+      "description": "Live-measured (not estimated) via jammi_kernels::flash::{CuSeqlens, dq_accum_splits, VarlenGeometry::dq_accum_len} at deterministic=true -- the ONE flash-only backward allocation this branch's own module doc already names.",
+      "b8_s512_h16": {
+        "splits": 1,
+        "dq_accum_len": 5242880,
+        "bytes": 20971520,
+        "mb": 20.97
+      },
+      "b24_s512_h16_sanity_check_vs_module_doc": {
+        "splits": 1,
+        "dq_accum_len": 15728640,
+        "bytes": 62914560,
+        "mb": 62.91,
+        "module_doc_citation": "~63 MB at B=24,S=512 -- matches to within rounding, confirming the measurement methodology"
+      },
+      "verdict": "dq_accum is real, flash-only, deterministic-backward VRAM, but at ~21 MB it is TWO ORDERS OF MAGNITUDE too small to explain the 1.8-2.7 GB b8-s512 delta. It is a confirmed, precisely-quantified contributor, NOT the dominant one."
+    },
+    "fused_masks_local_band_common_mode_waste": {
+      "description": "Confirmed by reading forward_hidden_with_lengths: fused_masks (FusedAttentionMasks::build, an allocate+broadcast_add+cast at [batch,heads-ish,seq,seq] scale) and local_band are built unconditionally whenever self.training, REGARDLESS of whether the flash decision Holds for every layer -- the flash arm never reads either. This is COMMON-MODE waste (paid by BOTH arms identically), so it cannot explain the flash-vs-block DELTA on its own, but it is real, attributable, wasted allocation on the flash leg specifically.",
+      "elimination_attempted": false,
+      "why_not_attempted_this_round": "Skipping the build requires relaxing TWO separate, currently-unconditional, already-tested contract checks: (1) ModernBertAttention::forward's 'fused_masks required whenever self.training' typed-refusal (doc table + training_attention_forward_without_fused_masks_is_a_typed_refusal), and (2) forward_training_attention's 'is_local && local_band.is_none() -> Err' check, which fires BEFORE the flash-cascade decision is even consulted. A safe relaxation is possible (decide_flash_admission's outcome==Holds, combined with a side-effect-free replica of admission::op_is_disabled via the public disabled_ops_requested() getter, deterministically predicts every layer will dispatch Fused), but implementing and re-verifying it touches a widely-tested invariant this file's own 'KNOWN GAP, NOT FIXED THIS ROUND (P3 fix round 4, B4 -- deferred a THIRD time)' comment already flags as deferred twice by the original authors for the same reason: real (if small) error-path risk without pod-iteration budget to verify safely. Not attempted this round; flagged as an open item for the lead, not silently dropped."
+    }
+  },
+  "schema_version": 1,
+  "box_detail": {
+    "gpu": "NVIDIA A100-SXM4-80GB",
+    "driver_version": "580.126.16",
+    "cuda_toolkit": "12.6.85",
+    "pod": "a100c"
+  },
+  "status": "GREEN",
+  "producer": {
+    "path": "crates/jammi-encoders/src/modernbert.rs",
+    "kind": "cargo-test",
+    "invocation": "cargo test -p jammi-encoders --lib --features cuda,flash-attn -- --exact modernbert::tests::flash_arm_encoder_level_three_way_oracle_dense_cuda_bf16",
+    "gating": "env:JAMMI_FLASH_ORACLE_MODEL_DIR"
+  }
+}

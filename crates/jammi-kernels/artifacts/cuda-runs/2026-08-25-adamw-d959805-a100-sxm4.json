@@ -2,6 +2,8 @@
   "schema_version": 1,
   "unit": "perf-multi-tensor-adamw-r2",
   "git_sha": "d95980597afb5373832f6aabdea7eaafb2574248",
+  "merged_as": "6d07b208e5bf1914597e1247f0e5f731f6de528f",
+  "merged_via_pr": 380,
   "date": "2026-08-26T01:30:41Z",
   "box": "jammi-a100d (NVIDIA A100-SXM4-80GB, driver 580.159.04)",
   "driver": "580.159.04",

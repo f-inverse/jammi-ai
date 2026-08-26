@@ -118,6 +118,8 @@ because it was a small share of runtime. An isolated number alone is not a resul
 * Commit the artifact under `crates/jammi-kernels/artifacts/cuda-runs/<date>-<unit>-<sha7>-<gpu>.json`
   carrying the **git_sha of the tip it measured**. A green artifact whose sha is not an ancestor of
   the branch is evidence about the ORACLE, not the code.
+* After a squash merge of a branch carrying green artifacts, the merger stamps `merged_as`/
+  `merged_via_pr` in the same day — until then every PR fails rule (d).
 
 ## 5. Host and build hazards (they silently invalidate results)
 

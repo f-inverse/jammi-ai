@@ -159,7 +159,11 @@ DRV
   echo "seed-artifact" > "$SEED/release/thing"
   : > "${SEED}.jammi-seed-complete"
   DEST="$SANDBOX/b_dest"
-  bash "$CLONE_SH" "$SEED" "$DEST" > "$SANDBOX/b2.out" 2>&1
+  # REPO_ROOT (this actual jammi-ai checkout) as the tree-dir — a real cargo
+  # workspace for the member-freedom check (round-3 audit N2) to resolve
+  # `cargo metadata` against; the fixture seed/dest carry no jammi-named
+  # artifacts, so the check passes.
+  bash "$CLONE_SH" "$SEED" "$DEST" "$REPO_ROOT" > "$SANDBOX/b2.out" 2>&1
   rc=$?
   if [ "$rc" -eq 0 ] && [ -f "$DEST/release/thing" ] && [ "$(cat "$DEST/release/thing")" = "seed-artifact" ] && [ -f "$SEED/release/thing" ]; then
     ok "(b) pod_target_clone.sh clones content faithfully and leaves the seed intact (no deletion step)"
@@ -168,12 +172,31 @@ DRV
   fi
 
   # Refuses to clone onto an existing destination.
-  bash "$CLONE_SH" "$SEED" "$DEST" >/dev/null 2>"$SANDBOX/b3.err"
+  bash "$CLONE_SH" "$SEED" "$DEST" "$REPO_ROOT" >/dev/null 2>"$SANDBOX/b3.err"
   rc=$?
   if [ "$rc" -eq 2 ]; then
     ok "(b) pod_target_clone.sh refuses to clone over an existing destination"
   else
     bad "(b) expected exit 2 cloning over an existing destination (got rc=$rc)"
+  fi
+
+  # round-3 audit N2: a POISONED seed (a fake .fingerprint entry named after
+  # a REAL workspace member, jammi-bench) must be refused — unconditionally,
+  # never opt-in — at clone time, and the poisoned clone removed rather
+  # than left behind for a caller to discover later.
+  POISON_SEED="$SANDBOX/b_poison_seed"
+  rm -rf "$POISON_SEED"
+  mkdir -p "$POISON_SEED/debug/.fingerprint/jammi-bench-deadbeef"
+  echo x > "$POISON_SEED/debug/.fingerprint/jammi-bench-deadbeef/lib-jammi-bench.json"
+  : > "${POISON_SEED}.jammi-seed-complete"
+  POISON_DEST="$SANDBOX/b_poison_dest"
+  rm -rf "$POISON_DEST"
+  bash "$CLONE_SH" "$POISON_SEED" "$POISON_DEST" "$REPO_ROOT" > "$SANDBOX/b6.out" 2>&1
+  rc=$?
+  if [ "$rc" -ne 0 ] && [ ! -e "$POISON_DEST" ] && grep -q 'jammi-bench-deadbeef' "$SANDBOX/b6.out"; then
+    ok "(b/N2) a clone of a POISONED seed (fake .fingerprint/jammi-bench-deadbeef/) is refused unconditionally and the poisoned clone removed"
+  else
+    bad "(b/N2) expected a poisoned seed's clone to be refused and removed (rc=$rc, dest exists=$([ -e "$POISON_DEST" ] && echo yes || echo no)): $(cat "$SANDBOX/b6.out")"
   fi
 
   # --verify: a log WITHOUT a Fresh jammi-* line passes.
@@ -334,12 +357,20 @@ DRV
       # puts `flock -n -E 75 ...` as the FIRST word of the string handed to
       # `tmux new-session -d -s SESSION "STRING"` — i.e. INSIDE the pane's
       # own command, the correct shape the two legs above just contrasted.
+      # round-3 audit Class B: the ORIGINAL assertion hardcoded a six-space
+      # indent anchor (`^      LAUNCH=`, over-pinned to gpu-dev.sh's CURRENT
+      # nesting depth — any re-indent breaks this test even though nothing
+      # behaviourally changed) AND never checked that `tmux new-session`
+      # actually CONSUMES the LAUNCH variable it just asserted the shape
+      # of — a LAUNCH that starts with "flock..." but is never passed to
+      # tmux would still have passed the old assertion.
       GPU_DEV_SH="$REPO_ROOT/ci/scripts/gpu-dev.sh"
-      launch_line="$(grep -n '^      LAUNCH="flock -n -E 75' "$GPU_DEV_SH")"
-      if [ -n "$launch_line" ] && printf '%s' "$launch_line" | grep -q "flock -n -E 75 /root/.jammi-timing.lock bash"; then
-        ok "(d-neg) gpu-dev.sh's shipped --timing LAUNCH string puts flock INSIDE the pane's own command (not wrapping the launcher)"
+      launch_line="$(grep -E 'LAUNCH="flock -n -E 75 /root/\.jammi-timing\.lock bash' "$GPU_DEV_SH")"
+      tmux_consumes_launch="$(grep -F 'tmux new-session -d -s "${TMUX_SESSION}" "${LAUNCH}"' "$GPU_DEV_SH")"
+      if [ -n "$launch_line" ] && [ -n "$tmux_consumes_launch" ]; then
+        ok "(d-neg) gpu-dev.sh's shipped --timing LAUNCH string puts flock INSIDE the pane's own command AND tmux new-session actually consumes it"
       else
-        bad "(d-neg) gpu-dev.sh's --timing LAUNCH string shape does not match the expected 'flock -n -E 75 ... bash ...' prefix — got: $launch_line"
+        bad "(d-neg) gpu-dev.sh's --timing LAUNCH shape/consumption check failed — launch_line='${launch_line}' tmux_consumes='${tmux_consumes_launch}'"
       fi
     else
       if [ "${JAMMI_REQUIRE_LOCK_TEST:-0}" = "1" ]; then
@@ -663,14 +694,28 @@ DRV
   # filesystem (real pod_target_clone.sh, real rsync, real exclude list —
   # no ssh needed since the mechanism under test is path separation, not
   # SSH plumbing; ssh is never mocked elsewhere in this suite either).
+  #
+  # round-3 audit: this leg used to HAND-BUILD "$POD_ROOT/target-mytree"
+  # and "$POD_ROOT/trees/mytree" directly, so it passed unchanged even
+  # against round-1 code where `target` cloned into the SAME dir `push`
+  # writes to — the naming-scheme assertion above was real, but THIS leg
+  # never actually exercised it. Both paths are now REBASED from the real
+  # rp_target_dir/rp_tree_dir outputs (captured above as target_dir/
+  # tree_dir, which are absolute /root/... paths) onto the sandbox
+  # POD_ROOT, so a change to the real naming scheme changes what this leg
+  # tests too.
   POD_ROOT="$SANDBOX/i_podroot"
   rm -rf "$POD_ROOT"
   mkdir -p "$POD_ROOT/seed/release"
   echo "seed-artifact" > "$POD_ROOT/seed/release/thing"
   : > "$POD_ROOT/seed.jammi-seed-complete"
 
-  CLONE_DEST="$POD_ROOT/target-mytree"
-  bash "$REPO_ROOT/ci/scripts/pod_target_clone.sh" "$POD_ROOT/seed" "$CLONE_DEST" > "$SANDBOX/i_clone.out" 2>&1
+  CLONE_DEST="${POD_ROOT}${target_dir#/root}"
+  # pod_target_clone.sh's own member-freedom check (round-3 audit N2) needs
+  # a REAL cargo workspace to resolve `cargo metadata` against — this repo
+  # itself (REPO_ROOT) is the only one available hermetically; the fixture
+  # seed above carries no actual jammi-* artifacts, so the check passes.
+  bash "$REPO_ROOT/ci/scripts/pod_target_clone.sh" "$POD_ROOT/seed" "$CLONE_DEST" "$REPO_ROOT" > "$SANDBOX/i_clone.out" 2>&1
   clone_rc=$?
 
   SRC_REPO="$SANDBOX/i_src_repo"
@@ -678,19 +723,26 @@ DRV
   ( cd "$SRC_REPO" && git init -q && git config user.email a@b.c && git config user.name t \
       && echo hi > tracked.txt && echo junk > target/junk && git add tracked.txt && git commit -q -m init )
 
-  TREE_DEST="$POD_ROOT/trees/mytree"
+  TREE_DEST="${POD_ROOT}${tree_dir#/root}"
   mkdir -p "$(dirname "$TREE_DEST")"
   EXCLUDE_ARGS=()
   while IFS= read -r pat; do
     [ -n "$pat" ] || continue
     EXCLUDE_ARGS+=(--exclude "$pat")
   done < <(bash "$REPO_ROOT/ci/scripts/pod_push_stamp.sh" excludes)
-  rsync -azc --no-times --delete "${EXCLUDE_ARGS[@]}" "$SRC_REPO/" "$TREE_DEST/" > "$SANDBOX/i_push.out" 2>&1
+  # round-3 audit Class B: the rsync FLAGS themselves (not just the exclude
+  # list) are read from gpu-dev.sh's own real `push` command, never
+  # re-typed here — a drift in gpu-dev.sh's actual flags (e.g. dropping
+  # `-c` or `--no-times`) would otherwise go unnoticed by this leg.
+  rsync_flags_line="$(grep -oE 'rsync -[A-Za-z]+( --[A-Za-z-]+)*' "$REPO_ROOT/ci/scripts/gpu-dev.sh" | grep -- '--delete' | head -1)"
+  [ -n "$rsync_flags_line" ] || { bad "(i) could not extract gpu-dev.sh's own push rsync flags — check the grep pattern still matches"; rsync_flags_line="rsync -azc --no-times --delete"; }
+  # shellcheck disable=SC2086  # intentional word-split: a small, known set of flag tokens
+  rsync ${rsync_flags_line#rsync } "${EXCLUDE_ARGS[@]}" "$SRC_REPO/" "$TREE_DEST/" > "$SANDBOX/i_push.out" 2>&1
   push_rc=$?
 
   if [ "$clone_rc" -eq 0 ] && [ "$push_rc" -eq 0 ] && [ -f "$CLONE_DEST/release/thing" ] \
      && [ "$(cat "$CLONE_DEST/release/thing")" = "seed-artifact" ] && [ -f "$TREE_DEST/tracked.txt" ]; then
-    ok "(i) target-then-push composition: the clone at ${CLONE_DEST} SURVIVES a subsequent push --tree into the disjoint ${TREE_DEST}"
+    ok "(i) target-then-push composition: the clone at ${CLONE_DEST} (derived from rp_target_dir) SURVIVES a subsequent push --tree into the disjoint ${TREE_DEST} (derived from rp_tree_dir)"
   else
     bad "(i) target-then-push composition failed (clone_rc=$clone_rc push_rc=$push_rc); clone: $(cat "$SANDBOX/i_clone.out"); push: $(cat "$SANDBOX/i_push.out")"
   fi
@@ -825,6 +877,289 @@ DRV
     else
       bad "(k) negative control did not reproduce the empty-string rejection (rc=$neg_rc): $neg_out"
     fi
+  fi
+}
+
+# ═════════════════════════════════════════════════════════════════════════
+# (l) round-3 audit N4: pod_seed_check_stdout_subset's cross-check must not
+# be vacuous. Three legs, exactly as the doc comment (round-2) claimed
+# without ever actually existing: an unlisted var -> RED; an EMPTY capture
+# dir -> RED (this is the actual N4 defect: an empty glob previously fell
+# through with bad=0); a conforming capture -> GREEN.
+# ═════════════════════════════════════════════════════════════════════════
+{
+  SEED_TARGET_SH="$REPO_ROOT/ci/scripts/pod_seed_target.sh"
+  MANIFEST="$REPO_ROOT/ci/scripts/pod_seed_key_inputs.toml"
+  N4_DRIVER="$SANDBOX/probe_n4.sh"
+  cat > "$N4_DRIVER" <<DRV
+#!/usr/bin/env bash
+set -uo pipefail
+# shellcheck disable=SC1091
+. "$SEED_TARGET_SH"
+pod_seed_check_stdout_subset "\$1" "$MANIFEST"
+DRV
+  chmod +x "$N4_DRIVER"
+
+  # Leg 1: an unlisted var -> RED.
+  N4_UNLISTED="$SANDBOX/n4_unlisted"
+  mkdir -p "$N4_UNLISTED"
+  printf 'cargo:rerun-if-env-changed=NVCC\ncargo:rerun-if-env-changed=JAMMI_N4_UNLISTED_VAR\n' > "$N4_UNLISTED/release__jammi-kernels-abc.output"
+  out="$(bash "$N4_DRIVER" "$N4_UNLISTED" 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'JAMMI_N4_UNLISTED_VAR'; then
+    ok "(l/N4) an unlisted announced var reddens the cross-check"
+  else
+    bad "(l/N4) expected RED naming JAMMI_N4_UNLISTED_VAR (rc=$rc): $out"
+  fi
+
+  # Leg 2: an EMPTY capture dir -> RED (the actual N4 defect: bash leaves
+  # 'dir/*' unexpanded when nothing matches, `[ -f ]` fails, the loop body
+  # never runs, and bad stayed 0 — a seed whose capture step produced
+  # NOTHING was stamped complete having checked nothing).
+  N4_EMPTY="$SANDBOX/n4_empty"
+  rm -rf "$N4_EMPTY"; mkdir -p "$N4_EMPTY"
+  out="$(bash "$N4_DRIVER" "$N4_EMPTY" 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'capture_count=0'; then
+    ok "(l/N4) an EMPTY capture dir reddens the cross-check (capture_count=0), never a silent pass"
+  else
+    bad "(l/N4) expected RED naming capture_count=0 for an empty capture dir (rc=$rc): $out"
+  fi
+
+  # Leg 3: conforming (real manifest names only) -> GREEN.
+  N4_CONFORM="$SANDBOX/n4_conform"
+  rm -rf "$N4_CONFORM"; mkdir -p "$N4_CONFORM"
+  printf 'cargo:rerun-if-env-changed=NVCC\ncargo:rerun-if-env-changed=CUDA_HOME\n' > "$N4_CONFORM/release__jammi-kernels-abc.output"
+  out="$(bash "$N4_DRIVER" "$N4_CONFORM" 2>&1)"; rc=$?
+  [ "$rc" -eq 0 ] && ok "(l/N4) a conforming capture (real manifest names, non-empty) passes cleanly" \
+    || bad "(l/N4) a conforming capture unexpectedly failed (rc=$rc): $out"
+
+  # Leg 4: a captured-but-EMPTY file (bytes) also reddens — a distinct
+  # defect from an empty DIRECTORY (leg 2).
+  N4_EMPTYFILE="$SANDBOX/n4_emptyfile"
+  rm -rf "$N4_EMPTYFILE"; mkdir -p "$N4_EMPTYFILE"
+  : > "$N4_EMPTYFILE/release__jammi-kernels-abc.output"
+  out="$(bash "$N4_DRIVER" "$N4_EMPTYFILE" 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'EMPTY'; then
+    ok "(l/N4) a captured-but-zero-byte output file reddens the cross-check"
+  else
+    bad "(l/N4) expected RED for a zero-byte captured file (rc=$rc): $out"
+  fi
+}
+
+# ═════════════════════════════════════════════════════════════════════════
+# (m) round-3 audit N1 / item 1b: pod_push_cutlass_matches — the stamp's
+# cutlass_gitlink must be recorded and a mismatch against the actual
+# submodule commit must refuse. This is the SAME script (pod_push_stamp.sh)
+# `target --with-cutlass` invokes remotely, never a second copy.
+# ═════════════════════════════════════════════════════════════════════════
+{
+  PUSH_STAMP_SH="$REPO_ROOT/ci/scripts/pod_push_stamp.sh"
+
+  # pod_push_compute against THIS repo actually records a cutlass_gitlink
+  # (the submodule really is pinned at crates/jammi-kernels/third_party/cutlass).
+  M_STAMP="$SANDBOX/m_stamp.json"
+  bash "$PUSH_STAMP_SH" compute "$REPO_ROOT" m-session > "$M_STAMP" 2>"$SANDBOX/m_compute.err"
+  m_gitlink="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("cutlass_gitlink") or "")' "$M_STAMP" 2>/dev/null)"
+  if [ -n "$m_gitlink" ]; then
+    ok "(m/N1) pod_push_stamp.sh compute records a real cutlass_gitlink (${m_gitlink}) from THIS repo's own submodule pin"
+  else
+    bad "(m/N1) pod_push_stamp.sh compute did not record a cutlass_gitlink against this repo — stamp: $(cat "$M_STAMP" 2>/dev/null); stderr: $(cat "$SANDBOX/m_compute.err")"
+  fi
+
+  # cutlass-check: matching sha -> 0.
+  bash "$PUSH_STAMP_SH" cutlass-check "$M_STAMP" "$m_gitlink" >/dev/null 2>&1
+  [ $? -eq 0 ] && ok "(m/N1) cutlass-check PASSES when the actual sha matches the stamp" \
+    || bad "(m/N1) cutlass-check unexpectedly failed on a matching sha"
+
+  # cutlass-check: mismatched sha -> 1, refusal, both shas printed (the
+  # exact fixture the round-3 brief asks for: "stamp with a different sha
+  # -> RED refusal").
+  m_out="$(bash "$PUSH_STAMP_SH" cutlass-check "$M_STAMP" "0000000000000000000000000000000000000000" 2>&1)"
+  m_rc=$?
+  if [ "$m_rc" -eq 1 ] && printf '%s' "$m_out" | grep -q "$m_gitlink" && printf '%s' "$m_out" | grep -q '0000000000000000000000000000000000000000'; then
+    ok "(m/N1) cutlass-check REFUSES a mismatched sha and names BOTH shas"
+  else
+    bad "(m/N1) expected a refusal naming both shas (rc=$m_rc): $m_out"
+  fi
+
+  # cutlass-check: missing/stale stamp (no cutlass_gitlink field at all) -> 2.
+  M_STALE_STAMP="$SANDBOX/m_stale_stamp.json"
+  printf '{"laptop_head":"abc"}' > "$M_STALE_STAMP"
+  bash "$PUSH_STAMP_SH" cutlass-check "$M_STALE_STAMP" "$m_gitlink" >/dev/null 2>&1
+  [ $? -eq 2 ] && ok "(m/N1) cutlass-check returns 2 (not usable) for a stale pre-N1 stamp with no cutlass_gitlink field" \
+    || bad "(m/N1) expected exit 2 for a stamp with no cutlass_gitlink field"
+
+  # gpu-dev.sh's target --with-cutlass remote block must actually CALL
+  # cutlass-check (never a re-implemented comparison) — a structural check
+  # that the wiring above is used, not merely available (ssh is never
+  # mocked, so the remote invocation itself is not exercised end to end).
+  if grep -q 'pod_push_stamp.sh cutlass-check' "$REPO_ROOT/ci/scripts/gpu-dev.sh"; then
+    ok "(m/N1) gpu-dev.sh's target --with-cutlass invokes pod_push_stamp.sh cutlass-check"
+  else
+    bad "(m/N1) gpu-dev.sh's target --with-cutlass does not call pod_push_stamp.sh cutlass-check"
+  fi
+}
+
+# ═════════════════════════════════════════════════════════════════════════
+# (n) round-2 audit finding 3 / item 3: pod_seed_pkg_has_feature — live
+# detection, never a hardcoded feature path, with the THREE distinct return
+# codes round-3 Class B added (0 declared / 1 genuinely absent / 2 could
+# not determine). This function had ZERO test coverage before round 3.
+# ═════════════════════════════════════════════════════════════════════════
+{
+  N_FIXTURE="$SANDBOX/n_fixture"
+  rm -rf "$N_FIXTURE"; mkdir -p "$N_FIXTURE/src"
+  cat > "$N_FIXTURE/Cargo.toml" <<'EOF'
+[package]
+name = "jammi-n-fixture"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+has-me = []
+EOF
+  echo 'fn main() {}' > "$N_FIXTURE/src/main.rs"
+  ( cd "$N_FIXTURE" && cargo generate-lockfile -q 2>/dev/null )
+
+  N_DRIVER="$SANDBOX/probe_n.sh"
+  cat > "$N_DRIVER" <<DRV
+#!/usr/bin/env bash
+set -uo pipefail
+cd "$N_FIXTURE" || exit 9
+# shellcheck disable=SC1091
+. "$REPO_ROOT/ci/scripts/pod_seed_target.sh"
+pod_seed_pkg_has_feature "\$1" "\$2"
+DRV
+  chmod +x "$N_DRIVER"
+
+  bash "$N_DRIVER" jammi-n-fixture has-me >/dev/null 2>&1
+  [ $? -eq 0 ] && ok "(n) pod_seed_pkg_has_feature returns 0 for a feature that genuinely exists" \
+    || bad "(n) expected 0 for jammi-n-fixture/has-me"
+
+  bash "$N_DRIVER" jammi-n-fixture no-such-feature >/dev/null 2>&1
+  [ $? -eq 1 ] && ok "(n) pod_seed_pkg_has_feature returns 1 (genuinely absent) for a feature that does not exist on a FOUND package" \
+    || bad "(n) expected 1 for jammi-n-fixture/no-such-feature"
+
+  bash "$N_DRIVER" no-such-package anything >/dev/null 2>&1
+  [ $? -eq 2 ] && ok "(n) pod_seed_pkg_has_feature returns 2 (could not determine) for a package not in the graph — distinct from 1 (round-3 Class B)" \
+    || bad "(n) expected 2 for an unknown package"
+
+  # Metadata-query failure (no Cargo.toml at all) -> 2, not 1 — the exact
+  # conflation round-3 Class B fixed.
+  N_NOPROJECT="$SANDBOX/n_noproject"
+  rm -rf "$N_NOPROJECT"; mkdir -p "$N_NOPROJECT"
+  N_DRIVER2="$SANDBOX/probe_n2.sh"
+  cat > "$N_DRIVER2" <<DRV
+#!/usr/bin/env bash
+set -uo pipefail
+cd "$N_NOPROJECT" || exit 9
+# shellcheck disable=SC1091
+. "$REPO_ROOT/ci/scripts/pod_seed_target.sh"
+pod_seed_pkg_has_feature anything anything
+DRV
+  chmod +x "$N_DRIVER2"
+  bash "$N_DRIVER2" >/dev/null 2>&1
+  [ $? -eq 2 ] && ok "(n) pod_seed_pkg_has_feature returns 2 when the metadata query itself fails (no Cargo.toml) — never 1 ('genuinely absent' would be a false claim)" \
+    || bad "(n) expected 2 when cargo metadata itself has nothing to query"
+
+  # T1b's own dispatch differentiates the two messages (round-3 Class B).
+  if grep -q 'could not determine whether jammi-kernels declares flash-attn' "$REPO_ROOT/ci/scripts/pod_seed_target.sh"; then
+    ok "(n) T1b's dispatch has a DISTINCT message for 'could not determine' vs 'genuinely absent'"
+  else
+    bad "(n) T1b's dispatch does not distinguish a metadata-query failure from a genuine feature absence"
+  fi
+}
+
+# ═════════════════════════════════════════════════════════════════════════
+# (o) round-2 item 7 (timings under lock) live witness, and round-3 N3
+# (FA2-overwrite ordering) structural proof. Neither is exercisable end to
+# end without a real CUDA toolchain; both are checked as precisely as a
+# hermetic suite can: the LIVE-WITNESS mechanism directly (function-level),
+# and N3's ORDERING as a static, line-position assertion on the real
+# script (a real cargo/nvcc run is A2's own job on a live pod).
+# ═════════════════════════════════════════════════════════════════════════
+{
+  PBT_SH="$REPO_ROOT/ci/scripts/perf/pod_build_timings.sh"
+
+  # LOCK_HELD reads the ACTUAL holder file, not a hardcoded constant
+  # (round-2 item 7 / round-3 Class B). Fixture: a holder file that does
+  # NOT name "pod_build_timings" must yield LOCK_HELD=false.
+  O_LOCK="$SANDBOX/o.lock"
+  printf 'holder=someone-else\n' > "${O_LOCK}.holder"
+  o_out="$(JAMMI_TIMING_LOCK="$O_LOCK" bash -c '
+    _LOCK_FILE="${JAMMI_TIMING_LOCK:-/root/.jammi-timing.lock}"
+    if [ -f "${_LOCK_FILE}.holder" ] && grep -q "^holder=pod_build_timings\$" "${_LOCK_FILE}.holder" 2>/dev/null; then
+      echo true
+    else
+      echo false
+    fi
+  ')"
+  [ "$o_out" = "false" ] && ok "(o) LOCK_HELD reads false when the holder file does not name pod_build_timings (a live witness, not a hardcoded true)" \
+    || bad "(o) LOCK_HELD should have read false for a mismatched holder — got: $o_out"
+
+  printf 'holder=pod_build_timings\n' > "${O_LOCK}.holder"
+  o_out2="$(JAMMI_TIMING_LOCK="$O_LOCK" bash -c '
+    _LOCK_FILE="${JAMMI_TIMING_LOCK:-/root/.jammi-timing.lock}"
+    if [ -f "${_LOCK_FILE}.holder" ] && grep -q "^holder=pod_build_timings\$" "${_LOCK_FILE}.holder" 2>/dev/null; then
+      echo true
+    else
+      echo false
+    fi
+  ')"
+  [ "$o_out2" = "true" ] && ok "(o) LOCK_HELD reads true when the holder file genuinely names pod_build_timings" \
+    || bad "(o) LOCK_HELD should have read true for a matching holder — got: $o_out2"
+
+  # pod_build_timings.sh itself uses this exact live-witness shape, not a
+  # hardcoded LOCK_HELD=true.
+  if grep -q 'grep -q .\^holder=pod_build_timings\$.' "$PBT_SH"; then
+    ok "(o) pod_build_timings.sh reads LOCK_HELD from the holder file (live witness), not a hardcoded constant"
+  else
+    bad "(o) pod_build_timings.sh does not appear to read LOCK_HELD from the holder file"
+  fi
+  if grep -qE '^LOCK_HELD=true$' "$PBT_SH"; then
+    bad "(o) pod_build_timings.sh still has an unconditional 'LOCK_HELD=true' — the round-2 constant was not actually removed"
+  else
+    ok "(o) pod_build_timings.sh has no unconditional 'LOCK_HELD=true' left"
+  fi
+
+  # N3 ordering: clone_hashes/recompiled must be captured BEFORE the FA2
+  # leg's own code (line-position check on the real script — the two
+  # markers below are unique substrings this round's own diff introduced).
+  snap_line="$(grep -n 'clone_hashes="\$(snapshot_hashes "\$CLONE_DIR")"' "$PBT_SH" | head -1 | cut -d: -f1)"
+  fa2_line="$(grep -n 'CLONE_FA2_DIR="/root/.jammi-clone-fa2-a2"' "$PBT_SH" | head -1 | cut -d: -f1)"
+  if [ -n "$snap_line" ] && [ -n "$fa2_line" ] && [ "$snap_line" -lt "$fa2_line" ]; then
+    ok "(o/N3) clone_hashes is snapshotted (line ${snap_line}) BEFORE the FA2 leg's own clone dir is even created (line ${fa2_line})"
+  else
+    bad "(o/N3) expected the clone_hashes snapshot to precede the FA2 leg's own clone dir in source order (snap=${snap_line:-?} fa2=${fa2_line:-?})"
+  fi
+  # The FA2 leg builds into its OWN clone dir, never CLONE_DIR.
+  if grep -q 'CARGO_TARGET_DIR="\$CLONE_FA2_DIR"' "$PBT_SH"; then
+    ok "(o/N3) the FA2 leg builds into its own CLONE_FA2_DIR, never the T1 CLONE_DIR"
+  else
+    bad "(o/N3) the FA2 leg does not appear to use a separate CARGO_TARGET_DIR"
+  fi
+  # clone_features/cold_features are recorded and asserted equal.
+  if grep -q 'clone_features == cold_features' "$PBT_SH"; then
+    ok "(o/N3) the JSON assembly asserts clone_features == cold_features (the comparison is meaningful)"
+  else
+    bad "(o/N3) no clone_features/cold_features equality assertion found"
+  fi
+
+  # round-2 item 8: the cold leg builds from a GENUINELY empty directory —
+  # this had ZERO suite coverage before round 3 (the audit's own "stands"
+  # finding: fixed in source, but nothing in the suite would notice a
+  # revert). Structural, since a real cold build needs a CUDA toolchain:
+  # the cold-leg block must `rm -rf`+`mkdir -p` COLD_DIR and must NOT
+  # `cp -a` the clone into it anywhere in the same script.
+  if grep -qE 'rm -rf "\$COLD_DIR"' "$PBT_SH" && grep -qE 'mkdir -p "\$COLD_DIR"' "$PBT_SH"; then
+    ok "(o/item8) the cold leg does rm -rf + mkdir -p on COLD_DIR (starts from nothing)"
+  else
+    bad "(o/item8) the cold leg does not appear to rm -rf + mkdir -p COLD_DIR"
+  fi
+  if grep -qE 'cp -a "\$CLONE_DIR" "\$COLD_DIR"' "$PBT_SH"; then
+    bad "(o/item8) found 'cp -a \$CLONE_DIR \$COLD_DIR' — the cold leg is copying the clone again, defeating the whole point of a cold comparison"
+  else
+    ok "(o/item8) no 'cp -a \$CLONE_DIR \$COLD_DIR' anywhere — the cold leg never reuses the clone's own artifacts"
   fi
 }
 

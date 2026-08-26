@@ -9,14 +9,29 @@
 # writing through a hardlinked path mutates the seed's own copy), so this
 # never hardlinks.
 #
-# Usage: pod_target_clone.sh <seed-dir> <dest-dir> [--verify]
+# Usage: pod_target_clone.sh <seed-dir> <dest-dir> [tree-dir] [--verify]
 #   --verify: after the caller's own first build against <dest-dir>, pass a
 #     `cargo build -v` LOG on stdin; this asserts it names NO `Fresh jammi-*`
 #     unit line — a member-free seed means every member unit must actually
-#     compile (Compiling, not Fresh) on the clone's first build.
+#     compile (Compiling, not Fresh) on the clone's first build. This is an
+#     ADDITIONAL, OPT-IN form a human runs after a real build — it is not a
+#     substitute for the UNCONDITIONAL filesystem-level check below (round-3
+#     audit N2): --verify only ever runs when a caller remembers to run it
+#     and only ever catches member units that were Fresh on ONE specific
+#     build; the filesystem check runs on every single clone regardless and
+#     catches a leftover artifact whether or not anyone ever rebuilds.
+#   [tree-dir]: where `cargo metadata` resolves the workspace member list
+#     from for the member-freedom check (default /root/jammi-ai — the
+#     bootstrap checkout, always present, whose workspace member LIST is
+#     what "member-free" is checked against regardless of which tree the
+#     clone itself belongs to).
 set -uo pipefail
 
-usage() { echo "usage: $(basename "$0") <seed-dir> <dest-dir> [--verify]" >&2; exit 2; }
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+. "$DIR/pod_seed_target.sh"
+
+usage() { echo "usage: $(basename "$0") <seed-dir> <dest-dir> [tree-dir] [--verify]" >&2; exit 2; }
 
 VERIFY=0
 ARGS=()
@@ -29,6 +44,7 @@ done
 [ "${#ARGS[@]}" -ge 2 ] || usage
 SEED_DIR="${ARGS[0]}"
 DEST_DIR="${ARGS[1]}"
+TREE_DIR_FOR_METADATA="${ARGS[2]:-/root/jammi-ai}"
 
 if [ "$VERIFY" = "1" ]; then
   # Reads a `cargo build -v` log from stdin (the caller already ran the
@@ -78,4 +94,15 @@ rc=$?
 du_default="$(du -sh "$DEST_DIR" 2>/dev/null | awk '{print $1}')"
 du_apparent="$(du -sh --apparent-size "$DEST_DIR" 2>/dev/null | awk '{print $1}')"
 echo "clone at ${DEST_DIR}: du=${du_default:-?} du(apparent-size)=${du_apparent:-?}"
+
+# UNCONDITIONAL, round-3 audit N2: every clone is checked, not just the ones
+# a human remembers to --verify after a build. A seed that was NOT actually
+# member-free (the failure --verify alone can never catch until someone
+# rebuilds against it) is caught the instant it is cloned.
+if ! pod_seed_assert_member_free "$DEST_DIR" "$TREE_DIR_FOR_METADATA"; then
+  echo "::error::clone at ${DEST_DIR} is NOT member-free — the seed it came from is poisoned; removing the clone" >&2
+  rm -rf "$DEST_DIR"
+  exit 1
+fi
+
 echo "=== clone complete: ${DEST_DIR} ==="

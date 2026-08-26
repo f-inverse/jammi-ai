@@ -389,7 +389,18 @@ esac
 # like a `run` job does.
 rp_login_cmd() { # $1 = "job" to join a live tmux job, $2 = tree dir, $3 = tmux session
   local tree_dir="${2:?rp_login_cmd needs a tree dir}" tmux_sess="${3:?rp_login_cmd needs a tmux session name}"
-  local pre; pre="[ -f /root/.jammi_env ] && . /root/.jammi_env; export CARGO_TARGET_DIR='${TARGET_DIR}'; cd '${tree_dir}' 2>/dev/null;"
+  # Built from the SAME rp_job_wrapper_lines `run`'s own job wrapper uses
+  # (round-3 audit Class B) — never a second hand-rolled copy of the
+  # source-env/CARGO_TARGET_DIR/cd sequence that could silently drift from
+  # it. The no-op job line (":") is dropped (an interactive shell has no
+  # job to run); `cd` gets its own `2>/dev/null` so a not-yet-provisioned
+  # tree lands an interactive login shell in cwd rather than aborting the
+  # whole SSH session outright — a `run` job, by contrast, should hard-fail
+  # on a missing tree, which is why the shared function itself has no such
+  # suppression.
+  local -a wlines=()
+  while IFS= read -r wline; do wlines+=("$wline"); done < <(rp_job_wrapper_lines "$tree_dir" "$TARGET_DIR" ":")
+  local pre="${wlines[0]}; ${wlines[1]}; ${wlines[2]} 2>/dev/null;"
   if [ "${1:-}" = "job" ]; then
     # Ctrl-C inside the job's pane signals the job itself, so say so before
     # handing over the keyboard — this is a terminal that can destroy work.
@@ -621,9 +632,11 @@ EOF
     # build output — target/ is host-arch and would poison the pod's. The
     # exclude set is defined ONCE, in pod_push_stamp.sh, so the real rsync
     # and the stamp's own manifest hash below can never drift apart. cutlass
-    # (a submodule) is excluded here too — it is provisioned by
-    # `target`/`push --with-cutlass`, never pushed as plain files (an
-    # rsync --delete of it would otherwise delete the pod's own checkout).
+    # (a submodule) is excluded here too — it is provisioned by `target
+    # --with-cutlass` (never `push` — round-3 audit Class B: an earlier
+    # comment here invented a `push --with-cutlass` flag that has never
+    # existed), never pushed as plain files (an rsync --delete of it would
+    # otherwise delete the pod's own checkout).
     EXCLUDE_ARGS=()
     while IFS= read -r pat; do
       [ -n "$pat" ] || continue
@@ -689,13 +702,40 @@ EOF
       # there fails with "not a git repository" on every tree except the
       # default bootstrap checkout. /root/jammi-ai IS always a real git
       # clone (rp_bootstrap's own, untouched by push), so its submodule is
-      # initialised there once and the resulting tree copied verbatim into
-      # whichever tree needs it — a plain file copy works regardless of
-      # whether the destination tree has a `.git` of its own.
+      # initialised there once — but round-3 audit N1: /root/jammi-ai's
+      # CURRENT gitlink is not necessarily the commit the DESTINATION
+      # tree's own ref actually needs (the gitlink has already moved once,
+      # 0ee65de) — a tree on an FA2 branch pinning a DIFFERENT cutlass
+      # commit than whatever /root/jammi-ai (usually main) happens to have
+      # checked out would silently receive the WRONG headers. The tree's
+      # own push stamp (pod_push_stamp.sh's cutlass_gitlink field, written
+      # at push time from THAT tree's actual HEAD) is the source of truth:
+      # verified via pod_push_cutlass_matches (the SAME script this
+      # invocation's own hermetic tests exercise, never a second copy of
+      # the comparison logic) against /root/jammi-ai's submodule AFTER
+      # `submodule update`; on a mismatch, fetch+checkout the STAMPED
+      # commit into /root/jammi-ai's own submodule (network — fails loudly
+      # if unreachable) and re-verify before copying; refuses the copy on
+      # any remaining mismatch, naming both shas.
       rp_run_remote <<EOF
 set -uo pipefail
 git -C /root/jammi-ai submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass
 [ -d '${NAME_SOURCE_TREE_DIR}' ] || { echo "::error::tree source dir '${NAME_SOURCE_TREE_DIR}' does not exist — push to it first (target --with-cutlass provisions cutlass INTO an existing tree, it does not create one)"; exit 1; }
+STAMP='${NAME_SOURCE_TREE_DIR}/.jammi-push-stamp.json'
+ACTUAL_SHA="\$(git -C /root/jammi-ai rev-parse HEAD:crates/jammi-kernels/third_party/cutlass)"
+bash /root/jammi-ai/ci/scripts/pod_push_stamp.sh cutlass-check "\$STAMP" "\$ACTUAL_SHA"
+CHECK_RC=\$?
+if [ "\$CHECK_RC" -eq 1 ]; then
+  STAMP_SHA="\$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("cutlass_gitlink") or "")' "\$STAMP")"
+  echo "attempting to fetch+checkout the stamp's pinned cutlass commit \$STAMP_SHA into /root/jammi-ai's own submodule..."
+  git -C /root/jammi-ai/crates/jammi-kernels/third_party/cutlass fetch --depth 1 origin "\$STAMP_SHA" \
+    && git -C /root/jammi-ai/crates/jammi-kernels/third_party/cutlass checkout --quiet "\$STAMP_SHA" \
+    || { echo "::error::could not fetch/checkout cutlass \$STAMP_SHA (network unreachable?) — refusing the copy"; exit 1; }
+  ACTUAL_SHA="\$(git -C /root/jammi-ai rev-parse HEAD:crates/jammi-kernels/third_party/cutlass)"
+  bash /root/jammi-ai/ci/scripts/pod_push_stamp.sh cutlass-check "\$STAMP" "\$ACTUAL_SHA" || { echo "::error::even after fetch+checkout, the gitlink still does not match the stamp — refusing the copy"; exit 1; }
+elif [ "\$CHECK_RC" -ne 0 ]; then
+  exit 1
+fi
 mkdir -p '${NAME_SOURCE_TREE_DIR}/crates/jammi-kernels/third_party'
 rm -rf '${NAME_SOURCE_TREE_DIR}/crates/jammi-kernels/third_party/cutlass'
 cp -a /root/jammi-ai/crates/jammi-kernels/third_party/cutlass '${NAME_SOURCE_TREE_DIR}/crates/jammi-kernels/third_party/cutlass'

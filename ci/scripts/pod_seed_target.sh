@@ -136,21 +136,40 @@ PY
 
 # RED test (iii): the seed's own runtime cross-check. $1=dir containing
 # captured `<profile>__<pkg-dirname>.output` files (see capture_build_output
-# below; the hermetic test in test_pod_substrate.sh points this at a
-# fixture). Every `cargo:rerun-if-env-changed=<NAME>` line actually announced
-# by a real build-script run must be in the manifest. Prints unlisted names.
+# below; test_pod_substrate.sh's own (n4) block points this at fixtures).
+# Every `cargo:rerun-if-env-changed=<NAME>` line actually announced by a
+# real build-script run must be in the manifest. Prints unlisted names.
+#
+# round-3 audit N4: an EMPTY capture dir (glob matches nothing — bash
+# leaves the literal `dir/*` pattern unexpanded, `[ -f "$f" ]` on that
+# literal fails, `continue` skips every iteration) previously fell straight
+# through the loop with bad=0 — a seed whose capture step produced nothing
+# was stamped complete having checked NOTHING. `capture_count` — real files
+# actually iterated — must be >= 1, and every one of them non-empty (a
+# captured-but-truly-empty output file means the capture ran at the wrong
+# moment relative to the real build, not that the build script announced
+# nothing worth tracking).
 pod_seed_check_stdout_subset() { # $1=capture-dir $2=manifest-toml
-  local capture_dir="$1" manifest="$2" names_file f name bad=0
+  local capture_dir="$1" manifest="$2" names_file f name bad=0 capture_count=0
   names_file="$(mktemp)"
   pod_seed_manifest_names "$manifest" > "$names_file"
   [ -d "$capture_dir" ] || { echo "::error::no build-output capture dir at ${capture_dir}" >&2; rm -f "$names_file"; return 1; }
   for f in "$capture_dir"/*; do
     [ -f "$f" ] || continue
+    capture_count=$((capture_count + 1))
+    if [ ! -s "$f" ]; then
+      echo "::error::captured build-script output file is EMPTY: $f (captured at the wrong moment, or the build script genuinely never ran)" >&2
+      bad=1
+    fi
     while IFS= read -r name; do
       [ -n "$name" ] || continue
       pod_seed_name_allowed "$name" "$names_file" || { echo "$name (from $(basename "$f"))"; bad=1; }
     done < <(grep -o 'cargo:rerun-if-env-changed=[A-Za-z_][A-Za-z0-9_]*' "$f" | sed 's/^cargo:rerun-if-env-changed=//')
   done
+  if [ "$capture_count" -eq 0 ]; then
+    echo "::error::cross-check saw no build-script output at all (capture_count=0) — the seed's own capture step produced nothing to check; this must never read as a pass" >&2
+    bad=1
+  fi
   rm -f "$names_file"
   return "$bad"
 }
@@ -185,9 +204,14 @@ pod_seed_capture_build_output() { # $1=seed target dir $2=dest capture dir $3=pr
 # it) — a hardcoded feature PATH string is exactly the kind of assumption
 # that silently rots when a feature moves crates; detecting it converts that
 # rot into "T1b skipped" instead of "the default pod's seed always fails".
-# Returns 0 (declared) / 1 (not declared, or the metadata query itself
-# failed — fail CLOSED to "skip the optional leg", never to "assume it's
-# there and hard-fail the whole seed").
+# Returns 0 (declared) / 1 (package found, feature genuinely NOT declared)
+# / 2 (could not determine at all — the metadata query failed, or the
+# package itself was not found in the graph). round-3 audit Class B: codes
+# 1 and 2 used to be the SAME code, so a caller could not distinguish "this
+# feature really doesn't exist" from "I have no idea, the query broke" —
+# both silently read as "skip the optional leg", which is the right ACTION
+# either way, but the WRONG message ("declares no flash-attn feature" is a
+# false claim when the truth is "could not ask").
 pod_seed_pkg_has_feature() { # $1=pkg $2=feature
   cargo metadata --frozen --format-version 1 2>/dev/null | python3 -c '
 import sys, json
@@ -195,12 +219,84 @@ pkg, feat = sys.argv[1], sys.argv[2]
 try:
     d = json.load(sys.stdin)
 except Exception:
-    sys.exit(1)
+    sys.exit(2)
 for p in d.get("packages", []):
     if p["name"] == pkg:
         sys.exit(0 if feat in (p.get("features") or {}) else 1)
-sys.exit(1)
+sys.exit(2)
 ' "$1" "$2"
+}
+
+# FILESYSTEM-LEVEL member-freedom check (round-3 audit N2). pod_seed_target.sh
+# always documented "member-free seed" but never actually verified it at the
+# one place that matters — the target dir's own contents. The metadata-only
+# check elsewhere in this file (no non-member path/patch PACKAGE — a
+# Cargo.lock/[patch] hygiene question) is the OPPOSITE direction and cannot
+# catch a member's own compiled artifact surviving a clean; the incremental/
+# emptiness check covers exactly one subdirectory cargo's own cleaner is
+# already known to miss (this file's own module doc, above). This is the
+# ONE mechanical, always-on definition: after ANY clean or clone, no
+# `{debug,release}/{.fingerprint,deps,build,incremental}` entry may be named
+# after a WORKSPACE MEMBER, where "workspace member" is read from `cargo
+# metadata`'s own `workspace_members` — never a "jammi-*" glob/prefix guess,
+# so a member crate that happened not to start with "jammi-" would still be
+# caught. Both cargo's hyphenated form (.fingerprint/build directory names,
+# e.g. `jammi-kernels-<hash>`) and its underscored form (deps/ compiled
+# artifact names, e.g. `jammi_kernels-<hash>.rlib`) are checked, verified
+# against a real cargo build/clean cycle (not merely a naming-convention
+# guess). $1=target_dir (a CARGO_TARGET_DIR — debug/ and release/ scanned)
+# $2=tree_dir (where `cargo metadata` resolves the workspace; default cwd).
+# Prints every violating path and fails loudly; never opt-in, run
+# UNCONDITIONALLY from pod_seed_target.sh (before the completion stamp),
+# pod_target_clone.sh (right after every clone), and pod_build_timings.sh
+# (before T1) — pod_target_clone.sh's old `--verify` (a `cargo build -v` log
+# grep) stays as an ADDITIONAL, opt-in form a human can still run after a
+# real build; it is not replaced, since it catches a DIFFERENT thing (the
+# clone's OWN first build actually recompiling, not merely "no leftover
+# artifact from the seed").
+pod_seed_assert_member_free() { # $1=target_dir $2=tree_dir (optional; default .)
+  local target_dir="$1" tree_dir="${2:-.}" meta
+  [ -d "$target_dir" ] || { echo "::error::pod_seed_assert_member_free: no such target_dir: ${target_dir}" >&2; return 2; }
+  meta="$(cd "$tree_dir" && cargo metadata --frozen --format-version 1 2>/dev/null)"
+  if [ -z "$meta" ]; then
+    echo "::error::pod_seed_assert_member_free: cargo metadata produced no output from ${tree_dir} — registry not fetched?" >&2
+    return 2
+  fi
+  printf '%s' "$meta" | python3 -c '
+import sys, json, os, re
+target_dir = sys.argv[1]
+d = json.load(sys.stdin)
+members_by_id = {p["id"]: p["name"] for p in d["packages"]}
+member_names = set()
+for mid in d["workspace_members"]:
+    name = members_by_id.get(mid)
+    if name:
+        member_names.add(name)
+        member_names.add(name.replace("-", "_"))
+if not member_names:
+    print("::error::pod_seed_assert_member_free: cargo metadata reported ZERO workspace members — refusing to run a vacuous check", file=sys.stderr)
+    sys.exit(2)
+# A directory ENTRY is member-named if its basename starts with
+# "<member>-" (cargo always separates a crate name from its fingerprint
+# hash/suffix with exactly one hyphen) — a boundary check, so member
+# "jammi-kernels" does not false-positive-match an unrelated
+# "jammi-kernels-utils" entry that merely shares the prefix.
+pat = re.compile(r"^(" + "|".join(re.escape(n) for n in sorted(member_names, key=len, reverse=True)) + r")-")
+bad = []
+for profile in ("debug", "release"):
+    for sub in (".fingerprint", "deps", "build", "incremental"):
+        d2 = os.path.join(target_dir, profile, sub)
+        if not os.path.isdir(d2):
+            continue
+        for entry in os.listdir(d2):
+            if pat.match(entry):
+                bad.append(os.path.join(d2, entry))
+if bad:
+    print("::error::member-named artifact(s) survived — NOT member-free:", file=sys.stderr)
+    for b in sorted(bad):
+        print("  " + b, file=sys.stderr)
+    sys.exit(1)
+' "$target_dir"
 }
 
 # RED tests (i)/(ii), FULL scope (round-2 audit finding 5): every package
@@ -309,10 +405,16 @@ pod_seed_target_main() {
     # expands to zero words, exactly "no argument" when reseed=0.
     local -a reseed_args=()
     [ "$reseed" = "1" ] && reseed_args=(--reseed)
+    # round-3 audit Class B: `"${reseed_args[@]}"` on a DECLARED-BUT-EMPTY
+    # array under `set -u` is an unbound-variable error on bash < 4.4
+    # (macOS's shipped /bin/bash is 3.2 — a GPLv3-licensing artifact, not a
+    # hypothetical). `"${arr[@]+"${arr[@]}"}"` is the portable "expand if
+    # set, else nothing" idiom that has always worked correctly under
+    # nounset, on every bash this tooling might run under (laptop or pod).
     JAMMI_TIMING_LABEL="seed" JAMMI_TIMING_JOB="seed" \
       exec "$DIR/pod_timing_lock.sh" acquire -w "$JAMMI_SEED_LOCK_WAIT_SECS" -- \
         env JAMMI_SEED_DIR="$JAMMI_SEED_DIR" JAMMI_TREE_DIR="$JAMMI_TREE_DIR" \
-        "$DIR/pod_seed_target.sh" --no-lock "${reseed_args[@]}"
+        "$DIR/pod_seed_target.sh" --no-lock "${reseed_args[@]+"${reseed_args[@]}"}"
   fi
 
   # A dry run parses args + (when --no-lock is absent) re-execs through the
@@ -366,11 +468,17 @@ pod_seed_target_main() {
 
     echo "=== T1: release -p jammi-bench --features cuda ==="
     cargo build --release -p jammi-bench --features cuda || exit 1
-    if [ "$ref" = "main" ] && pod_seed_pkg_has_feature jammi-kernels flash-attn; then
-      echo "=== T1b (main only): release -p jammi-bench --features cuda,jammi-kernels/flash-attn ==="
-      cargo build --release -p jammi-bench --features cuda,jammi-kernels/flash-attn || exit 1
-    elif [ "$ref" = "main" ]; then
-      echo "=== T1b skipped: jammi-kernels declares no flash-attn feature (cargo metadata) ==="
+    if [ "$ref" = "main" ]; then
+      feat_rc=0
+      pod_seed_pkg_has_feature jammi-kernels flash-attn || feat_rc=$?
+      if [ "$feat_rc" -eq 0 ]; then
+        echo "=== T1b (main only): release -p jammi-bench --features cuda,jammi-kernels/flash-attn ==="
+        cargo build --release -p jammi-bench --features cuda,jammi-kernels/flash-attn || exit 1
+      elif [ "$feat_rc" -eq 1 ]; then
+        echo "=== T1b skipped: jammi-kernels declares no flash-attn feature (cargo metadata) ==="
+      else
+        echo "=== T1b skipped: could not determine whether jammi-kernels declares flash-attn (cargo metadata query failed or the package was not found) — treating as absent, not as confirmed absent ==="
+      fi
     fi
 
     echo "=== T2: cargo test --no-run for runpod_gpu_prove.sh's own suites ==="
@@ -407,6 +515,9 @@ if bad:
     print("::error::non-member path/patch package(s) with source=null: %s" % bad)
     sys.exit(1)
 ' || exit 1
+
+    echo "=== asserting the seed is member-free at the filesystem level (round-3 audit N2) ==="
+    pod_seed_assert_member_free "$JAMMI_SEED_DIR" "$JAMMI_TREE_DIR" || exit 1
 
     echo "=== cross-checking the announced env surface against the manifest ==="
     pod_seed_check_stdout_subset "$capture" "$MANIFEST" || {

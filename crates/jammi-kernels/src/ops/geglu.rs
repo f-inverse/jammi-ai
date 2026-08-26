@@ -218,15 +218,27 @@
 //! bf16 BEFORE multiplying by `gelu_erf'(gate)` for `d_gate` (matching
 //! `mul`'s backward output being a real bf16 tensor before `gelu_backward`
 //! ever runs) — two kernel-shaped roundings, not one f32-accumulate-then-
-//! round-once shortcut. The magnitude on real ModernBERT-large layer-18
-//! activations (`max|gate|` 27.5, `max|up|` 20.5): the discarded shortcut
-//! put `d_up` `~1.8e-3` relative-sum away from a real candle `Var`+
-//! `backward()` autodiff of the eager two-op composition on those same
-//! inputs; this fix halves that to `~1.2e-3` (`geglu_recheck.py`, esc-045
-//! investigation notes) — real, not the whole 28-layer training defect on
-//! its own (see [`crate::ops::geglu`]'s crate-level oracle and esc-045's
-//! own accounting for why a single-call divergence this size compounds
-//! rather than explains outright).
+//! round-once shortcut. This fix's justification is SOURCE PARITY, not a
+//! measured error-reduction number: HF ModernBERT's MLP tail
+//! (`ModernBertMLP.forward = Wo(drop(act(input) * gate))`,
+//! `modeling_modernbert.py:90-91`, `hidden_activation: "gelu"` selecting
+//! the erf variant) is genuinely TWO torch ops (`gelu` then `mul`), so
+//! torch's autograd genuinely walks two independently-rounded bf16 kernels
+//! — the discarded "round once at the end" shortcut computed an
+//! algebraically-equivalent but rounding-PLACEMENT-wrong result regardless
+//! of how large or small its measured delta from candle-eager happened to
+//! be on any one fixture. (A prior revision of this note cited a specific
+//! `~1.8e-3` → `~1.2e-3` relative-sum improvement from an uncommitted
+//! `geglu_recheck.py` script; that script was never committed to this
+//! repository and the number is unverifiable, so it has been removed
+//! rather than repeated.) This fix does NOT, by itself, move esc-045's own
+//! headline metric: the audited full-stack bf16 backward cosine similarity
+//! against the torch grad oracle measured `0.275528` before this fix and
+//! `0.275481` after it — a fluctuation, not an improvement, confirming
+//! esc-045's own accounting (see [`crate::ops::geglu`]'s crate-level
+//! oracle) that no single-call divergence this size explains the whole
+//! 28-layer training defect on its own; the fix is retained because it is
+//! the source-correct behavior, not because it moved that number.
 //!
 //! `tests/geglu_oracles.rs`'s
 //! `eager_vs_fused_bf16_bwd_diverges_and_stays_within_the_stated_
@@ -813,6 +825,74 @@ mod tests {
         let wi = Tensor::from_slice(&[1.0f32, 2.0, 3.0], (1, 3), &device).unwrap();
         let err = fused(GeluVariant::Erf, &wi).expect_err("odd last dim must be refused");
         assert!(matches!(err, Error::Msg(_)));
+    }
+
+    /// Multi-row, row-varying-`dy` discriminating oracle directly on
+    /// `geglu_bwd_f32` (closes a row-slicing-arithmetic mutant — e.g. the
+    /// row-start-index multiply mutated to a divide, at the earlier
+    /// `:639-640` citation from `geglu_bwd_f32`'s own indexing math): a
+    /// SINGLE-row fixture (every other f32 backward oracle in this file and
+    /// `tests/geglu_oracles.rs`) cannot distinguish "read row `r`'s own
+    /// slice" from "read row 0's slice for every `r`", since there is only
+    /// one row to read. This fixture uses THREE distinct rows with
+    /// per-row-DIFFERENT `gate`/`up` values AND per-row-DIFFERENT `dy`
+    /// (uniform `dy` across rows would let a wrong-row read coincidentally
+    /// match), and asserts each row of `geglu_bwd_f32`'s batched output
+    /// equals what `geglu_bwd_row_f32` computes when called on THAT row's
+    /// own slice in isolation — the row-slicing arithmetic is the only
+    /// thing under test here, not the per-element math (already covered by
+    /// `cpu_fwd_matches_eager_narrow_gelu_erf_mul_composition` and the
+    /// gradcheck oracles).
+    #[test]
+    fn multi_row_bwd_f32_reads_each_rows_own_slice_not_a_fixed_row() {
+        let rows = 3usize;
+        let intermediate = 4usize;
+        // Distinct gate/up values per row so a wrong-row read produces a
+        // DIFFERENT (not coincidentally equal) result.
+        let wi_out: Vec<f32> = vec![
+            // row 0: gate = [-2.0,-1.0,0.0,1.0], up = [0.5,1.5,2.5,3.5]
+            -2.0, -1.0, 0.0, 1.0, 0.5, 1.5, 2.5,
+            3.5, // row 1: gate = [2.0,3.0,-0.5,0.25], up =
+            // [-1.0,4.0,0.1,-3.0]
+            2.0, 3.0, -0.5, 0.25, -1.0, 4.0, 0.1, -3.0,
+            // row 2: gate = [0.75,-2.5,1.25,-0.1], up = [2.0,-0.5,3.0,0.6]
+            0.75, -2.5, 1.25, -0.1, 2.0, -0.5, 3.0, 0.6,
+        ];
+        // Deliberately row-varying `dy` — see doc above.
+        let dy: Vec<f32> = vec![
+            1.0, -1.0, 2.0, 0.5, // row 0
+            -3.0, 0.25, 1.5, -2.0, // row 1
+            0.1, 4.0, -0.75, 3.0, // row 2
+        ];
+
+        let batched = geglu_bwd_f32(&wi_out, &dy, rows, intermediate);
+        assert_eq!(batched.len(), rows * 2 * intermediate);
+
+        for r in 0..rows {
+            let row = &wi_out[r * 2 * intermediate..(r + 1) * 2 * intermediate];
+            let dyr = &dy[r * intermediate..(r + 1) * intermediate];
+            let mut expected = vec![0f32; 2 * intermediate];
+            geglu_bwd_row_f32(row, dyr, intermediate, &mut expected);
+            let actual = &batched[r * 2 * intermediate..(r + 1) * 2 * intermediate];
+            assert_eq!(
+                actual,
+                expected.as_slice(),
+                "row {r}: geglu_bwd_f32's batched output does not match \
+                 geglu_bwd_row_f32 applied to that row's OWN slice — the \
+                 row-slicing arithmetic read the wrong row"
+            );
+        }
+
+        // Non-vacuity: rows must actually differ from each other (proves
+        // the fixture's per-row values are genuinely distinguishing, not
+        // accidentally uniform).
+        let row0 = &batched[0..2 * intermediate];
+        let row1 = &batched[2 * intermediate..4 * intermediate];
+        assert!(
+            row0.iter().zip(row1).any(|(a, b)| (a - b).abs() > 1e-3),
+            "fixture rows 0 and 1 must produce DIFFERENT dwi_out — otherwise a wrong-row \
+             read could coincidentally pass: {row0:?} vs {row1:?}"
+        );
     }
 
     #[test]

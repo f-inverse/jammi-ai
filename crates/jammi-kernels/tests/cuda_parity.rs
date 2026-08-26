@@ -2140,6 +2140,178 @@ fn geglu_parity_empty_last_dim() {
     assert!(out_gpu.is_empty());
 }
 
+/// Deterministic, in-file xorshift64 PRNG (family L: no untracked external
+/// generator) — genuinely RANDOM per-element `dy`, unlike the sine-based
+/// [`fixture`] every other leg in this file uses and unlike `.backward()`'s
+/// own implicit `ones_like` seed [`assert_geglu_parity_bf16`]/
+/// `assert_scaled_cast_add_parity_bf16_base` rely on elsewhere in this
+/// file — a uniform (or `dy=1`) seed makes several rounding-PLACEMENT
+/// formulas coincide by construction (esc-045 phase-4 audit finding A2).
+struct XorShift64(u64);
+
+impl XorShift64 {
+    fn new(seed: u64) -> Self {
+        Self(seed | 1)
+    }
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+    /// Uniform in `[-1, 1)`.
+    fn next_signed_unit(&mut self) -> f32 {
+        2.0 * ((self.next_u64() >> 11) as f32 / (1u64 << 53) as f32) - 1.0
+    }
+}
+
+/// `1/sqrt(2)` — ATen's `kAlpha`, independently reimplemented here (never
+/// through `jammi_kernels::ops::geglu`'s private constants, which this
+/// integration test cannot even name).
+const GELU_ALPHA_F32_REF2: f32 = std::f32::consts::FRAC_1_SQRT_2;
+/// `1/sqrt(2*pi)` — ATen's `kBeta`, independently reimplemented.
+const GELU_BETA_F32_REF2: f32 =
+    std::f32::consts::FRAC_2_SQRT_PI * std::f32::consts::FRAC_1_SQRT_2 * 0.5;
+
+/// `(gelu_erf(x), gelu_erf'(x))`, computed straight from `libm::erff` — the
+/// SAME formula `tests/geglu_torch_bwd_rounding.rs`'s own independent
+/// reference uses, never through the crate's private implementation.
+fn gelu_erf_and_grad_f32_ref(x: f32) -> (f32, f32) {
+    let cdf = (libm::erff(x * GELU_ALPHA_F32_REF2) + 1.0) * 0.5;
+    let pdf = GELU_BETA_F32_REF2 * (-0.5 * x * x).exp();
+    (x * cdf, cdf + x * pdf)
+}
+
+/// esc-045 phase-4 audit (A2): a RANDOM production-amplitude `dy` (not
+/// `.backward()`'s implicit `ones_like` seed) proves `GegluBwdDWiOut`'s
+/// CUDA arm is BIT-EXACT (`to_bits`, not a tolerance) against the CPU
+/// arm's `dwi_out` — covering BOTH halves (`d_gate` at
+/// `[0..intermediate)`, `d_up` at `[intermediate..2*intermediate)`) in one
+/// assertion, since both arms compute the SAME formula
+/// `jammi_kernels::ops::geglu`'s module doc pins (esc-045 round 2's two-kernel
+/// rounding fix). The RED control below hand-computes the DISCARDED
+/// pre-fix formula (f32-accumulate `d_gate`/`d_up` throughout, round each
+/// ONCE at the very end — the module doc's "PREVIOUS version" the round-2
+/// fix replaced) on this SAME fixture and shows it diverges from the CPU
+/// arm's real output on a non-vacuous count of elements — proving this
+/// fixture is discriminating, not merely that CPU and CUDA happen to
+/// agree on a formula neither of them actually runs.
+#[test]
+fn geglu_bwd_random_dy_bit_exact_cpu_vs_cuda_with_red_control() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let cpu = Device::Cpu;
+    let rows = 4usize;
+    // ModernBERT-large's real `intermediate_size`.
+    let intermediate = 2624usize;
+    let mut rng = XorShift64::new(0xD1B5_4A32_D192_ED03);
+
+    // Production amplitude: `ops/geglu.rs`'s own doc cites a REAL captured
+    // `max|gate|` 27.5, `max|up|` 20.5 on ModernBERT-large layer 18.
+    let wi_v: Vec<bf16> = (0..rows * 2 * intermediate)
+        .map(|_| bf16::from_f32(rng.next_signed_unit() * 28.0))
+        .collect();
+    // Deliberately non-uniform `dy`, amplitude sampled independently per
+    // row and cubed within the row (skews toward small values with
+    // occasional large ones) — a uniform `dy` would make `d_up`/`d_gate`
+    // trivially proportional to a constant and mask exactly this class of
+    // rounding-placement bug (see `tests/geglu_torch_bwd_rounding.rs`'s
+    // identical note).
+    let mut dy_v: Vec<bf16> = Vec::with_capacity(rows * intermediate);
+    for _ in 0..rows {
+        let dy_amp = 0.01 + 4.99 * (rng.next_signed_unit().abs());
+        for _ in 0..intermediate {
+            let u = rng.next_signed_unit();
+            dy_v.push(bf16::from_f32(dy_amp * u * u.abs()));
+        }
+    }
+
+    let wi_cpu =
+        Var::from_tensor(&Tensor::from_slice(&wi_v, (rows, 2 * intermediate), &cpu).unwrap())
+            .unwrap();
+    let dy_cpu = Tensor::from_slice(&dy_v, (rows, intermediate), &cpu).unwrap();
+    let out_cpu = geglu(&wi_cpu).unwrap();
+    let loss_cpu = (&out_cpu * &dy_cpu).unwrap().sum_all().unwrap();
+    let grads_cpu = loss_cpu.backward().unwrap();
+    let dwi_cpu: Vec<bf16> = grads_cpu
+        .get(&wi_cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    let wi_gpu =
+        Var::from_tensor(&Tensor::from_slice(&wi_v, (rows, 2 * intermediate), &cuda).unwrap())
+            .unwrap();
+    let dy_gpu = Tensor::from_slice(&dy_v, (rows, intermediate), &cuda).unwrap();
+    let out_gpu = geglu(&wi_gpu).unwrap();
+    let loss_gpu = (&out_gpu * &dy_gpu).unwrap().sum_all().unwrap();
+    let grads_gpu = loss_gpu.backward().unwrap();
+    let dwi_gpu: Vec<bf16> = grads_gpu
+        .get(&wi_gpu)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    let n = rows * 2 * intermediate;
+    assert_eq!(dwi_cpu.len(), n);
+    assert_eq!(dwi_gpu.len(), n, "CUDA dwi_out length mismatch");
+
+    // RED control: the discarded pre-fix formula, computed independently
+    // from the SAME `wi_v`/`dy_v` fixture.
+    let mut pre_fix = vec![bf16::ZERO; n];
+    for r in 0..rows {
+        let row = &wi_v[r * 2 * intermediate..(r + 1) * 2 * intermediate];
+        let dyr = &dy_v[r * intermediate..(r + 1) * intermediate];
+        let out_row = &mut pre_fix[r * 2 * intermediate..(r + 1) * 2 * intermediate];
+        for i in 0..intermediate {
+            let gate = row[i].to_f32();
+            let up = row[intermediate + i].to_f32();
+            let dyi = dyr[i].to_f32();
+            let (gelu_val, gelu_deriv) = gelu_erf_and_grad_f32_ref(gate);
+            out_row[i] = bf16::from_f32(dyi * up * gelu_deriv); // d_gate, round once
+            out_row[intermediate + i] = bf16::from_f32(dyi * gelu_val); // d_up, round once
+        }
+    }
+    let red_mismatches = (0..n)
+        .filter(|&i| pre_fix[i].to_bits() != dwi_cpu[i].to_bits())
+        .count();
+    assert!(
+        red_mismatches > 0,
+        "RED control is vacuous on this fixture: the pre-fix (round-once) formula agrees \
+         with the CPU arm's real (round-twice) dwi_out everywhere — the fixture below would \
+         prove nothing (guide §3.7/§3.8 non-vacuity)"
+    );
+    eprintln!(
+        "geglu_bwd_random_dy_bit_exact_cpu_vs_cuda_with_red_control: RED control diverges on \
+         {red_mismatches}/{n} elements"
+    );
+
+    let mut mismatches = 0usize;
+    let mut first: Option<(usize, u16, u16)> = None;
+    for i in 0..n {
+        if dwi_cpu[i].to_bits() != dwi_gpu[i].to_bits() {
+            mismatches += 1;
+            if first.is_none() {
+                first = Some((i, dwi_cpu[i].to_bits(), dwi_gpu[i].to_bits()));
+            }
+        }
+    }
+    assert_eq!(
+        mismatches, 0,
+        "GegluBwdDWiOut CUDA arm NOT bit-exact vs CPU at random production-amplitude dy: \
+         {mismatches}/{n} mismatches, first={first:?}"
+    );
+}
+
 // =======================================================================
 // ScaledCastAdd CPU<->CUDA parity: fwd + BOTH backward outputs (d_base,
 // d_lora), at the two dtype combinations `jammi-lora`'s admission
@@ -2405,6 +2577,101 @@ fn scaled_cast_add_parity_multi_block_not_a_multiple_of_block_size() {
     let lora = fixture(2000, 8.0);
     assert_scaled_cast_add_parity_f32_f32(&cuda, -2.25, &base, &lora);
     assert_scaled_cast_add_parity_bf16_base(&cuda, -2.25, &base, &lora);
+}
+
+/// esc-045 phase-4 audit (A2): a RANDOM production-amplitude `base`/`lora`
+/// pair (not the smooth sine-based [`fixture`] every other leg above
+/// uses) proves `ScaledCastAdd`'s `(BF16, F32)` CUDA arm is BIT-EXACT
+/// (`to_bits`, not a ULP tolerance) against the CPU arm's own output — the
+/// same "f32-accumulate, round-once" formula `scaled_cast_add_bf16_f32`
+/// (`ops/scaled_cast_add.rs`) pins, matching that op's own module doc's
+/// "Lead-measured pre-fix divergence" amplitude citation (`base~N(0,100²)`
+/// bf16, `lora~N(0,3²)` f32). The RED control below hand-computes the
+/// DISCARDED pre-esc-046 formula (round the scaled delta to `base`'s
+/// dtype FIRST, then add — TWO round points, the module doc's "an EARLIER
+/// revision of this doc claimed" shape) on this SAME fixture and shows it
+/// diverges from the CPU arm's real (one-round-point) output on a
+/// non-vacuous count of elements.
+#[test]
+fn scaled_cast_add_bf16_f32_random_amplitude_bit_exact_cpu_vs_cuda_with_red_control() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let cpu = Device::Cpu;
+    let n = 65_536usize;
+    let scaling = 1.75f64;
+    let mut rng = XorShift64::new(0x9E37_79B9_7F4A_7C15);
+
+    // `base ~ N(0, 100^2)`-scale (this op's own doc's measured amplitude),
+    // approximated by a wide uniform sweep rather than a real Gaussian —
+    // sufficient to populate bf16's ULP-1 boundary densely, which is what
+    // this bit-exactness claim actually needs.
+    let base_v: Vec<bf16> = (0..n)
+        .map(|_| bf16::from_f32(rng.next_signed_unit() * 300.0))
+        .collect();
+    // `lora ~ N(0, 3^2)`-scale, deliberately NOT proportional to `base`
+    // (a `dy`-like independent signal — see `XorShift64`'s own doc for why
+    // this matters).
+    let lora_v: Vec<f32> = (0..n).map(|_| rng.next_signed_unit() * 9.0).collect();
+
+    let base_cpu = Tensor::from_slice(&base_v, (n,), &cpu).unwrap();
+    let lora_cpu = Tensor::from_slice(&lora_v, (n,), &cpu).unwrap();
+    let out_cpu: Vec<bf16> = scaled_cast_add(scaling, &base_cpu, &lora_cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    let base_gpu = Tensor::from_slice(&base_v, (n,), &cuda).unwrap();
+    let lora_gpu = Tensor::from_slice(&lora_v, (n,), &cuda).unwrap();
+    let out_gpu: Vec<bf16> = scaled_cast_add(scaling, &base_gpu, &lora_gpu)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    assert_eq!(out_cpu.len(), n);
+    assert_eq!(out_gpu.len(), n, "CUDA fwd length mismatch");
+
+    // RED control: the discarded pre-esc-046 two-round-point formula.
+    let scaling_f32 = scaling as f32;
+    let pre_fix: Vec<bf16> = base_v
+        .iter()
+        .zip(lora_v.iter())
+        .map(|(&b, &l)| {
+            let delta_rounded = bf16::from_f32(l * scaling_f32); // round FIRST
+            bf16::from_f32(b.to_f32() + delta_rounded.to_f32()) // then add, round AGAIN
+        })
+        .collect();
+    let red_mismatches = (0..n)
+        .filter(|&i| pre_fix[i].to_bits() != out_cpu[i].to_bits())
+        .count();
+    assert!(
+        red_mismatches > 0,
+        "RED control is vacuous on this fixture: the pre-esc-046 (round-twice) formula \
+         agrees with the CPU arm's real (round-once) output everywhere — the fixture below \
+         would prove nothing (guide §3.7/§3.8 non-vacuity)"
+    );
+    eprintln!(
+        "scaled_cast_add_bf16_f32_random_amplitude_bit_exact_cpu_vs_cuda_with_red_control: \
+         RED control diverges on {red_mismatches}/{n} elements"
+    );
+
+    let mut mismatches = 0usize;
+    let mut first: Option<(usize, u16, u16)> = None;
+    for i in 0..n {
+        if out_cpu[i].to_bits() != out_gpu[i].to_bits() {
+            mismatches += 1;
+            if first.is_none() {
+                first = Some((i, out_cpu[i].to_bits(), out_gpu[i].to_bits()));
+            }
+        }
+    }
+    assert_eq!(
+        mismatches, 0,
+        "ScaledCastAdd (BF16, F32) CUDA arm NOT bit-exact vs CPU at random production \
+         amplitude: {mismatches}/{n} mismatches, first={first:?}"
+    );
 }
 
 // =======================================================================

@@ -441,6 +441,29 @@
 //! all (this op's CPU domain is F32-only); the CUDA arm's `BF16` rounding
 //! points are exactly [`super::RopeFused`]'s and
 //! [`super::SoftmaxLastDimFused`]'s own documented ones, reused unchanged.
+//!
+//! ### esc-045: this op's own `BF16`-native softmax is the mechanism, not
+//! a rounding-placement bug (GH#374)
+//!
+//! This op's CUDA "block arm" reuses `super::SoftmaxLastDimFused`'s
+//! `BF16`-native kernel directly: `BF16` logits in, `BF16` probabilities
+//! out, with `F32` accumulation only INTERNAL to that kernel's own
+//! max/sum passes (see that op's module doc). The reference model this
+//! crate targets never does this: HF ModernBERT's eager attention
+//! (`modeling_modernbert.py:180`) calls `nn.functional.softmax(...,
+//! dtype=torch.float32).to(query.dtype)`, an explicit upcast that runs the
+//! ENTIRE softmax (forward AND backward) in `F32` and rounds to `BF16`
+//! only once, at the very boundary — see `ops::softmax`'s module doc's
+//! "esc-045 round 4" section for the full ATen-dispatcher derivation. This
+//! op's `BF16`-native block arm is therefore a genuine, deliberate
+//! divergence from the reference call path — it is the esc-045 mechanism
+//! itself (`.jammi/escapes.jsonl`'s
+//! `esc-045-bf16-fused-backward-diverges-from-f32-truth`), not something
+//! `ops::softmax`'s rounding-placement fix (round 4) resolves by itself.
+//! The actual fix is either routing production attention through the
+//! FA2/SDPA dense arm (which keeps softmax in `F32` registers end to end)
+//! or adding a genuinely new `F32`-softmax variant of this block arm for
+//! the padded case — NOT attempted in this round.
 
 use candle_core::backend::BackendStorage;
 use candle_core::{CpuStorage, CustomOp3, Error, Layout, Result, Shape, Tensor, D};

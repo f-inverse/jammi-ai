@@ -452,28 +452,90 @@
 //! itself is UNCHANGED by the `scale` field: it always computes `d(y)/d(pre_softmax)`,
 //! never `d(y)/d(scores)` directly.
 //!
-//! ### esc-045 round 3 (GH#374): `BF16` rounds the `dy·y` product TWICE,
-//! matching ATen, not once
+//! ### esc-045 round 4 (GH#374): the reference is the MODEL's call path,
+//! not an ATen kernel read in isolation — `BF16` rounds `dy·y` ONCE, not
+//! twice
 //!
-//! An earlier revision of `dscores_row_bf16`/`softmax_bwd_dscores_bf16`
-//! accumulated `dot = Σ f32(dy_i) * f32(y_i)` directly in a float register —
-//! MORE precise per term than torch, but not what the reference this crate
-//! targets actually does. `aten/src/ATen/native/cuda/SoftMax.cu`'s
-//! `softmax_backward_cuda_out` (v2.13.0) computes `Tensor tmp = grad *
-//! output;` as a SEPARATE elementwise kernel FIRST — `mul_kernel_cuda`
-//! computes in `opmath_t` (`float`) and casts to `BFloat16` ONCE per
-//! element when it stores `tmp` — so the per-element product is genuinely
-//! BF16-quantized BEFORE the row reduction ever runs; the reduction then
-//! sums THAT already-rounded `tmp` (not the raw product), and the epilogue
-//! (`SoftMaxBackwardEpilogue::operator()`) reads `tmp_i` (not `dy_i`,
-//! per the kernel's own "gradOutput that we get here is really gradOutput *
-//! output" comment) to compute the final, second rounding. `dscores_row_bf16`
-//! now reproduces exactly this: a real, materialized `tmp` array, rounded
-//! once, summed in f32, then subtracted-and-rounded again — see that
-//! function's own doc for the full derivation and
-//! `tests/softmax_bwd_dscores_aten_rounding.rs` for the op-level oracle
-//! (RED before this fix on every discriminating row at production width
-//! `last = 512`).
+//! Round 3 rounded the `dy·y` product to `BF16` TWICE (materializing a
+//! `tmp = round_bf16(dy·y)` intermediate BEFORE the row reduction, then
+//! rounding a second time in the epilogue), citing
+//! `aten/src/ATen/native/cuda/SoftMax.cu`'s `softmax_backward_cuda_out` in
+//! isolation. That reads the WRONG code path for this crate's actual
+//! reference. HF ModernBERT's eager attention
+//! (`modeling_modernbert.py:180`, `transformers` 5.15.1) calls:
+//!
+//! ```text
+//! attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+//! ```
+//!
+//! — an explicit `dtype=torch.float32` argument. ATen's dispatcher for
+//! `softmax(..., dtype)` (`aten/src/ATen/native/SoftMax.cpp`, `Tensor
+//! softmax(...)`) is:
+//!
+//! ```text
+//! if ((input_.is_cuda() || input_.is_xpu()) && input_.scalar_type() == ScalarType::Half && dtype == ScalarType::Float){
+//!     return at::_softmax(input_, dim_, true);
+//! } else {
+//!     Tensor converted = dtype.has_value() ? input_.toType(dtype.value()) : input_;
+//!     return at::_softmax(converted, dim_, false);
+//! }
+//! ```
+//!
+//! The fast `half_to_float=true` fused kernel is gated on
+//! `ScalarType::Half` — it EXCLUDES `BFloat16`. ModernBERT's attention
+//! weights are `BF16`, so this call takes the `else` branch: an explicit
+//! `Tensor converted = input_.toType(Float)` (a separate upcast op, with
+//! its own `ToCopyBackward` autograd node) followed by a PLAIN
+//! `_softmax(converted, dim, /*half_to_float=*/false)` that never sees a
+//! `BF16` tensor at all — both its input and its output are already `F32`.
+//! Backward for that plain-`F32` softmax call also runs with
+//! `half_to_float = (grad.scalar_type() != input_dtype)` FALSE (both sides
+//! are `F32`), so `softmax_backward_cuda_out`'s `Tensor tmp = grad *
+//! output;` is an `F32 * F32 -> F32` product — genuinely NO `BF16`
+//! rounding happens inside `softmax_backward` for this call at all. The
+//! ONE `BF16` rounding in the whole chain happens OUTSIDE
+//! `softmax_backward`, at the backward of the initial `.toType(Float)`
+//! upcast (`ToCopyBackward`), which downcasts the final `F32` `grad_input`
+//! to `BF16` exactly once, after the entire `dy·y` reduction has already
+//! run in `F32`. (The SDPA/FlashAttention-2 fast paths this crate's `bwd`
+//! also targets accumulate their softmax statistics and `P@V` product in
+//! `F32` registers regardless of `Q`/`K`/`V` dtype — see the
+//! FlashAttention paper's own numerics discussion — so they agree with
+//! this "F32 throughout, one final round" structure too, not with round
+//! 3's two-rounding one.)
+//!
+//! `dscores_row_bf16`/`softmax_bwd_dscores_bf16` therefore accumulate the
+//! UNROUNDED product `dot = Σ f32(dy_i) * f32(y_i)` directly in an F32
+//! register (never materializing a separate `BF16`-width `tmp`) and round
+//! to `BF16` exactly ONCE, at the very end — matching this crate's usual
+//! "f32-accumulate, round-once" convention AND the reference model's real
+//! call path, not round 3's ATen-kernel-in-isolation reading. See that
+//! function's own doc for the derivation and
+//! `tests/softmax_bwd_dscores_matches_reference_call_path.rs` for the
+//! op-level oracle.
+//!
+//! ### This op's own `BF16`-native softmax is a SEPARATE, known divergence
+//! from the model's call path — not fixed by the rounding-placement above
+//!
+//! The correction above only fixes WHERE `bwd` rounds `dy·y`; it does not
+//! change WHAT dtype `y` (the forward softmax probabilities) is computed
+//! and stored at. This op's forward (`softmax_row_bf16`/
+//! `softmax_fwd_bf16_kernel`, `BF16` logits in, `BF16` probabilities out,
+//! `F32` accumulation only INTERNAL to the max/sum passes) never upcasts
+//! to `F32` the way `modeling_modernbert.py:180`'s explicit
+//! `dtype=torch.float32` argument does — so `y` itself is already a
+//! `BF16`-rounded quantity `bwd` receives, one full rounding step earlier
+//! than the reference model's softmax ever produces. `super::attention_block`'s
+//! fused `CustomOp3` (the "block arm") reuses this exact `BF16`-native
+//! kernel on its CUDA path (see that module's "Rounding" section) — THAT
+//! is the esc-045 mechanism itself (GH#374,
+//! `.jammi/escapes.jsonl`'s `esc-045-bf16-fused-backward-diverges-from-f32-truth`),
+//! not a rounding-placement bug this file can fix by itself. The actual
+//! fix is either routing production attention through the FA2/SDPA dense
+//! arm (which keeps softmax in `F32` registers end to end, matching the
+//! reference) or adding a genuinely NEW `F32`-softmax variant of the block
+//! arm for the padded case — NOT attempted in this round; this doc only
+//! names the mechanism so the next round does not re-discover it.
 //!
 //! `pre_softmax = scale * scores + mask` (see the module doc's "scale
 //! semantics" section), so by the chain rule `d(y)/d(scores)` equals
@@ -1297,49 +1359,47 @@ fn dscores_f32(y: &[f32], dy: &[f32], rows: usize, last: usize) -> Vec<f32> {
     out
 }
 
-/// esc-045 (GH#374 round 3): matches ATen's own bf16 softmax backward
-/// rounding placement, quoted at source in
-/// `tests/softmax_bwd_dscores_aten_rounding.rs`'s module doc —
-/// `aten/src/ATen/native/transformers/cuda/attention_backward.cu`'s math
-/// path differentiates through `at::softmax`, whose CUDA backward
-/// (`softmax_backward_cuda_out`, `aten/src/ATen/native/cuda/SoftMax.cu`)
-/// computes `Tensor tmp = grad * output;` — a SEPARATE elementwise kernel
-/// that BF16-rounds `dy_i * y_i` ONCE, materializing it, BEFORE the row
-/// reduction ever runs (`mul_kernel_cuda`'s `opmath_t = float`, cast to the
-/// output dtype exactly once per element). `host_softmax_backward` then
-/// sums THAT already-rounded `tmp` in f32 and its epilogue subtracts
-/// `output * sum` from `tmp` (not from the raw, unrounded `dy`), rounding
-/// once more for the final store. So torch's `dS` rounds the per-element
-/// product `dy·y` TWICE overall — once as `tmp`, once as `dS` itself — with
-/// the SUM computed over the first, already-BF16-quantized set of values.
-/// A prior revision of this function accumulated the UNROUNDED product
-/// directly (`dot += dy*y` in f32, no intermediate BF16 width) — MORE
-/// precise per term than torch, but a genuine rounding-PLACEMENT divergence
-/// from the reference this crate targets (family D: matching the
-/// reference's own domain/rounding behavior, not merely "more accurate" —
-/// the same principle esc-045's round-2 GeGLU fix already established at
-/// ATen source, `ops/geglu.rs`'s "esc-045 fix" section). Fixed fold order
-/// (family J) preserved throughout: both passes below walk the row in
-/// ascending index order, exactly as before.
+/// esc-045 round 4 (GH#374): matches the REFERENCE MODEL's actual call
+/// path, not an ATen kernel read in isolation. See the module doc's
+/// "esc-045 round 4" section for the full derivation, quoted at source:
+/// HF ModernBERT's eager attention (`modeling_modernbert.py:180`, this
+/// project's pinned `transformers` 5.15.1) calls `nn.functional.softmax(
+/// attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)` — an
+/// explicit `dtype=torch.float32` argument. `BFloat16` inputs to ATen's
+/// `softmax(..., dtype)` dispatcher (`aten/src/ATen/native/SoftMax.cpp`)
+/// do NOT take the fused `half_to_float=true` kernel (that fast path is
+/// gated on `ScalarType::Half`, excluding `BFloat16`); they take an
+/// explicit `Tensor converted = input_.toType(Float)` upcast followed by
+/// a plain `F32` `_softmax(converted, dim, /*half_to_float=*/false)` that
+/// never touches `BF16` at all. Backward for that call therefore runs
+/// `softmax_backward_cuda_out` with BOTH `grad` and `output` already
+/// `F32` (`half_to_float = (grad.scalar_type() != input_dtype)` is FALSE
+/// here), so `Tensor tmp = grad * output;` is an `F32 * F32 -> F32`
+/// product with NO `BF16` rounding inside `softmax_backward` at all — the
+/// entire `dy·y` reduction runs in `F32`, and the ONLY `BF16` rounding in
+/// the whole chain happens OUTSIDE this op, at the backward of the
+/// initial `.toType(Float)` upcast, which downcasts the final `F32`
+/// `grad_input` to `BF16` exactly once. A prior revision of this function
+/// (esc-045 round 3) instead materialized a separate `BF16`-width `tmp =
+/// round_bf16(dy*y)` and rounded a SECOND time in the epilogue, quoting
+/// `softmax_backward_cuda_out` as if `half_to_float=false`'s `BF16`-native
+/// case (the one ATen actually takes when the CALLER passes raw `BF16`
+/// grad/output with no `dtype` upcast) were what this reference model's
+/// `dtype=torch.float32` call path reaches — it is not; that fast/native
+/// `BF16` code path is UNREACHABLE from `modeling_modernbert.py:180`'s
+/// actual call. Fixed fold order (family J) preserved throughout: the
+/// accumulation below walks the row in ascending index order, matching
+/// [`dscores_row_f32`]'s identical structure (this function is that one's
+/// `BF16` counterpart, differing only in the boundary rounding of the
+/// output, exactly as the module doc's "f32-accumulate, round-once"
+/// convention requires).
 fn dscores_row_bf16(y: &[bf16], dy: &[bf16], out: &mut [bf16]) {
-    // `tmp_i = round_bf16(dy_i * y_i)` — ATen's `Tensor tmp = grad *
-    // output;`, a genuine, separate BF16-width intermediate.
-    let mut tmp = vec![bf16::ZERO; y.len()];
+    let mut dot = 0f32;
     for i in 0..y.len() {
-        tmp[i] = bf16::from_f32(dy[i].to_f32() * y[i].to_f32());
+        dot += dy[i].to_f32() * y[i].to_f32();
     }
-    // `sum_k = Σ f32(tmp_i)` — f32 accumulation of the ALREADY-rounded
-    // products, matching `cunn_SoftMaxBackward`'s `ilpReduce<AddFloat>`
-    // over `tmp` (not over the raw product).
-    let mut sum_k = 0f32;
-    for &t in &tmp {
-        sum_k += t.to_f32();
-    }
-    // `dS_i = round_bf16(tmp_i - y_i * sum_k)` — the epilogue
-    // (`SoftMaxBackwardEpilogue::operator()`), which reads `tmp_i` (not
-    // `dy_i`) as its `gradOutput` argument per the kernel's own comment.
     for i in 0..y.len() {
-        out[i] = bf16::from_f32(tmp[i].to_f32() - y[i].to_f32() * sum_k);
+        out[i] = bf16::from_f32((dy[i].to_f32() - dot) * y[i].to_f32());
     }
 }
 

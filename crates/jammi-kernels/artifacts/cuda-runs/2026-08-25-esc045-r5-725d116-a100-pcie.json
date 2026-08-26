@@ -1,23 +1,38 @@
 {
+  "schema_version": 1,
   "unit": "esc-045 round 5 (GH #374)",
   "box": "jammi-a100 (PCIe)",
   "gpu": "NVIDIA A100 80GB PCIe",
   "driver_version": "580.159.04",
   "nvcc_version": "12.6.85 (V12.6.85, cuda_12.6.r12.6/compiler.35059454_0)",
   "rustc_version": "1.94.0 (4a4ef493e 2026-03-02)",
+  "status": "PENDING_PHASE4_RERUN: this file is being updated by the numerics phase-4 audit fix (write-owner round) -- E1 stands unchanged (CPU-hermetic, unaffected by this round's code); E2 is being RE-RUN on this round's own tip against the round5_maybe_upcast_scores producer this round restored (see producer.round4_round5_dump below) and round4_localize.py, replacing the round-5 unreachable-tree numbers; E3/E4 status unchanged from round 5 (E3 partial proxy, E4 not run -- see below).",
   "deliverable_branch": "fix/esc-045-bf16-fused-backward-r4",
-  "deliverable_git_sha": "725d116",
-  "deliverable_git_sha_full": "725d1164da2b95f60ea7cd0aca10ecbde7fb4a8e",
-  "note_on_e2_tree": "E2/E3's flash-arm run required jammi_kernels::ops::flash_attention_varlen and the P6-dense FA2 wiring in forward_training_attention, which are NOT on this round's deliverable branch (out of esc-045's scope; owned by the P6 perf initiative). That run used a SEPARATE, unpushed-to-main measurement tree: `git merge origin/perf/p6-fa2-dense@5886c6b` into this round's 268ebda (commit `bb57a23`), then `git cherry-pick 725d116` (commit `25452b8`) to bring in the shared-LoRA-weights seeding tool. Pushed as `origin/scratch/esc045-r5-e2-fa2-measure` (bb57a23) purely as a measurement record -- not a deliverable, not merged into any release branch. E1 (the decisive H1-vs-H2 test) needed no such tree and ran directly on 725d116.",
-  "e2_measurement_tree": {
+  "git_sha": "PLACEHOLDER_UPDATED_AFTER_FINAL_COMMIT",
+  "producer": {
+    "path": "crates/jammi-kernels/tests/rope_oracles.rs",
+    "kind": "cargo-test",
+    "invocation": "cargo test -p jammi-kernels --test rope_oracles -- --exact eager_vs_fused_bf16_fwd_and_bwd_at_production_amplitude_vs_independent_f64_truth",
+    "gating": "none",
+    "_comment": "E1's producer -- the one CPU-hermetic, always-runs test this schema's single top-level `producer` field can name statically. This artifact bundles THREE further measurements (E2/E3) with their OWN producers, documented per-section below (not statically verified by check_cuda_run_artifacts.py's schema, which validates only this top-level field) -- see E2_attention_logit_precision_mechanism.producer and E3_inherent_to_bf16_vs_jammi_defect.producer."
+  },
+  "note_on_e2_tree": "Round 5's original E2 run used a SEPARATE, unpushed-to-main measurement tree (`origin/scratch/esc045-r5-e2-fa2-measure`, merging `perf/p6-fa2-dense@5886c6b`'s FA2 wiring, which is out of esc-045's scope and not on this branch) because the `flash` arm needed `jammi_kernels::ops::flash_attention_varlen`. The numerics phase-4 audit round (this update) restores a COMMITTED producer for the `shared_upcast` arm's own mechanism (`round5_maybe_upcast_scores`, `crates/jammi-encoders/src/modernbert.rs`, `#[cfg(test)]`-only, env-gated) and a committed 84-row comparator (`ci/scripts/perf/round4_localize.py`) reachable from THIS branch -- so this round's own E2 numbers below are regenerated on THIS branch's tip (fused/eager/shared/shared_upcast arms; `flash` is still out of reach from this branch and is OMITTED, not fabricated). The historical `cherry_pick_25452b8`/`scratch/esc045-r5-e2-fa2-measure` reference is retained below for provenance ONLY -- it is NOT this artifact's current evidence.",
+  "e2_measurement_tree_HISTORICAL_round5_only_not_current_evidence": {
     "base_268ebda": "test(kernels,encoders): esc-045 round 5 -- production-amplitude RoPE oracle rules out H1",
     "merged_5886c6b": "perf(kernels): THE NUMBER -- P6 Stage B B3-dense finetune-step, flash vs block arm, a100c SXM4",
     "merge_commit_bb57a23": "Merge remote-tracking branch 'origin/perf/p6-fa2-dense' into scratch-e2-fa2-merge",
     "cherry_pick_25452b8": "test(encoders): esc-045 round 5 -- seed-and-save the shared LoRA weights round 4/5 arms load",
-    "pushed_ref": "origin/scratch/esc045-r5-e2-fa2-measure"
+    "pushed_ref": "origin/scratch/esc045-r5-e2-fa2-measure",
+    "status_note": "This tree includes the flash arm (P6 FA2-dense) and is NOT an ancestor of this branch's tip -- kept for historical provenance only, per the phase-4 audit's finding that this reference was unreachable."
   },
   "E1_rope_oracle_production_amplitude": {
-    "description": "jammi-kernels/tests/rope_oracles.rs::eager_vs_fused_bf16_fwd_and_bwd_at_production_amplitude_vs_independent_f64_truth, run on 725d116, CPU-hermetic (no GPU needed)",
+    "description": "jammi-kernels/tests/rope_oracles.rs::eager_vs_fused_bf16_fwd_and_bwd_at_production_amplitude_vs_independent_f64_truth, CPU-hermetic (no GPU needed) -- UNCHANGED by the phase-4 audit round (RopeFused's own source was not touched this round).",
+    "producer": {
+      "path": "crates/jammi-kernels/tests/rope_oracles.rs",
+      "kind": "cargo-test",
+      "invocation": "cargo test -p jammi-kernels --test rope_oracles -- --exact eager_vs_fused_bf16_fwd_and_bwd_at_production_amplitude_vs_independent_f64_truth",
+      "gating": "none"
+    },
     "fixture": "hidden=64, seq=128, heads=4, two coupled massive-activation channel pairs (cols 5/37, 21/53) forced to |x|~6688, matching round 4's measured max|qkv|~6688 at the layer-18 onset; independent closed-form f64 truth (not a call through fused/eager at any dtype)",
     "measured": {
       "fwd_relerr_fused": 1.888971e-3,
@@ -33,36 +48,38 @@
     "red_control": "Negating the rotate-half sign convention in rope_fwd_row_bf16 (reverted after the check) drove fwd relerr to 4.183690e-1 -- confirms the oracle discriminates a real defect, not a vacuous pass."
   },
   "E2_attention_logit_precision_mechanism": {
-    "description": "esc045_round4_per_layer_activation_gradient_dump (jammi-encoders), real ModernBERT-large checkpoint, b4-s128, seed 42, shared LoRA weights (rank16/alpha32/target=[Wqkv,Wo,Wi]/ZerosB) seeded once and loaded by every arm. cos(arm, f32_truth) per captured tensor (28 boundary + 28 qkv + 28 mlp_input = 84), and the L2 relerr of the full 84-tensor concatenated vector.",
+    "description": "esc045_round4_per_layer_activation_gradient_dump (jammi-encoders), real ModernBERT-large checkpoint, b4-s128, seed 42, shared LoRA weights (rank16/alpha32/target=[Wqkv,Wo,Wi]/ZerosB) seeded once and loaded by every arm. cos(arm, f32_truth) per captured tensor (28 boundary + 28 qkv + 28 mlp_input = 84), and the L2 relerr of the full 84-tensor concatenated vector -- REGENERATED this round on this branch's own tip via round4_localize.py (see PLACEHOLDER_E2_RERUN below for the actual numbers, filled in after the pod run).",
+    "producer": {
+      "dump_path": "crates/jammi-encoders/src/modernbert.rs",
+      "dump_kind": "cargo-test",
+      "dump_invocation": "cargo test -p jammi-encoders --features cuda --release -- --exact modernbert::tests::esc045_round4_per_layer_activation_gradient_dump --ignored",
+      "dump_gating": "required-features (cuda) AND env:JAMMI_ROUND4_MODEL_DIR (mirrors JAMMI_REQUIRE_CUDA's skip-vs-fail gate via round4_env_or_skip/JAMMI_REQUIRE_ESC045_ORACLES -- see that fn's own doc)",
+      "shared_upcast_mechanism_path": "crates/jammi-encoders/src/modernbert.rs",
+      "shared_upcast_mechanism_fn": "round5_maybe_upcast_scores (#[cfg(test)]-only; env-gated via JAMMI_ROUND5_UPCAST_SCORES at the esc045_round4_per_layer_activation_gradient_dump call site) -- restored this round as this arm's FIRST committed producer, closing the phase-4 audit's A3 finding",
+      "comparator_path": "ci/scripts/perf/round4_localize.py",
+      "comparator_kind": "script",
+      "comparator_invocation": "python3 ci/scripts/perf/round4_localize.py --truth f32_truth.safetensors --arm fused=fused.safetensors --arm eager=eager.safetensors --arm shared=shared.safetensors --arm shared_upcast=shared_upcast.safetensors --band-split 18",
+      "comparator_gating": "none",
+      "comparator_self_test": "python3 ci/scripts/perf/test_round4_localize.py -- committed this round, closing the phase-4 audit's A3 finding (the 84-row comparator previously had no committed producer or self-test)"
+    },
     "arms": {
       "fused": "attention_block_flash disabled; attention_block_fused admits (jammi's production bf16 training path)",
       "eager": "attention_block_flash, attention_block_fused, rope_fused, softmax_last_dim_fused all disabled (full candle-op decomposition, all bf16-native)",
       "shared": "attention_block_flash, attention_block_fused, softmax_last_dim_fused disabled; rope_fused stays admitted (round 4's 'band persists' isolation point)",
-      "shared_upcast": "same DISABLE list as shared, plus JAMMI_ROUND5_UPCAST_SCORES=1 (this round's E2 diagnostic: q/k upcast to F32 for the scores GEMM + softmax, probs cast back to bf16 for P@V)",
-      "flash": "nothing disabled; attention_block_flash admits (the REAL, vendored FlashAttention-2 dense arm from perf/p6-fa2-dense, which keeps the scores/softmax in F32 accumulator registers throughout, per FA2's softmax.h)",
-      "f32_truth": "backbone dtype F32 throughout, no bf16 anywhere -- the anchor every cos()/relerr() above is measured against"
+      "shared_upcast": "same DISABLE list as shared, plus JAMMI_ROUND5_UPCAST_SCORES=1 (this round's E2 diagnostic: q/k upcast to F32 for the scores GEMM + softmax, probs cast back to bf16 for P@V) -- restored this round via round5_maybe_upcast_scores",
+      "flash": "NOT reachable from this branch (perf/p6-fa2-dense is a separate initiative) -- omitted from this round's re-run, not fabricated. The historical round-5 flash numbers are retained ONLY in e2_full_table_HISTORICAL_round5_only.txt for reference."
     },
-    "dispatch_confirmation": "flash arm run under JAMMI_KERNELS_STRICT=1 with nothing disabled produced the IDENTICAL loss (470070.7) as the default run -- Strict mode errors loudly on any failed predicate anywhere in the cascade, so this rules out a silent K2 fallback (guide 3.5, zero-dispatch-is-RED). Independently, disabling ONLY attention_block_fused (never reached in the flash cascade) reproduced the SAME loss with disabled_fired=[], confirming attention_block_flash preempted it.",
-    "summary_boundary_1_to_18_cos_mean": {
-      "fused": 0.6359, "eager": 0.3028, "shared": 0.3536, "shared_upcast": 0.5920, "flash": 0.7496
-    },
-    "summary_boundary_19_to_28_cos_mean": {
-      "fused": 0.9189, "eager": 0.9663, "shared": 0.9626, "shared_upcast": 0.9579, "flash": 0.9568
-    },
-    "summary_qkv_0_to_18_cos_mean": {
-      "fused": 0.7362, "eager": 0.4480, "shared": 0.4063, "shared_upcast": 0.7103, "flash": 0.8523
-    },
-    "summary_qkv_19_to_27_cos_mean": {
-      "fused": 0.7798, "eager": 0.9714, "shared": 0.9244, "shared_upcast": 0.9732, "flash": 0.9211
-    },
-    "summary_all_84_relerr": {
-      "fused": 0.6871, "eager": 1.1761, "shared": 1.3427, "shared_upcast": 0.7732, "flash": 0.6128
-    },
-    "verdict": "H2 CONFIRMED, both bands: the SAME decomposed eager-attention path (rope fused, softmax/scores bf16-native) differing ONLY in JAMMI_ROUND5_UPCAST_SCORES improves boundary[1-18].cos 0.354->0.592 and qkv[0-18].cos 0.406->0.710 (the pervasive shared-arm divergence) AND qkv[19-27].cos 0.924->0.973 (round 4's originally-localized band). The REAL FlashAttention-2 arm (flash) does even better on the pervasive band (boundary[1-18].cos=0.7496, qkv[0-18].cos=0.8523, best of every arm tested including jammi's own production fused arm) and has the LOWEST all-84 relerr (0.6128) of any bf16 arm. Keeping attention logits/softmax in F32 -- not RopeFused's own math -- is the mechanism.",
-    "full_84_row_table_file": "e2_full_table.txt (this artifact directory)"
+    "PLACEHOLDER_E2_RERUN": "Filled in with this branch's tip numbers after the pod run -- see round4_localize.py's --out report and this file's own re-run instructions above.",
+    "full_84_row_table_file_HISTORICAL_round5_only": "e2_full_table.txt (this artifact directory) -- the round-5 table INCLUDING the unreachable flash arm, kept for provenance; the current re-run's own table (fused/eager/shared/shared_upcast only) is at e2_full_table_phase4_rerun.txt"
   },
   "E3_inherent_to_bf16_vs_jammi_defect": {
-    "description": "Aggregate proxy (full per-layer register_full_backward_hook torch table NOT built within this round's time budget -- see 'incomplete' below). torch's OWN bf16-vs-f32 ceiling, computed from ALREADY-VALIDATED torch reference runs (torch_finetune_step.py / torch_grad_oracle.py legs at /root/go5 on jammi-a100, independent of any jammi code; b4-s128, seed 42, rank16/alpha32/target=[Wqkv,Wo,Wi]), cosine of the FULL concatenated trainable LoRA-gradient vector (7,196,672 params).",
+    "description": "Aggregate proxy (full per-layer register_full_backward_hook torch table NOT built -- unchanged from round 5, see 'incomplete' below). torch's OWN bf16-vs-f32 ceiling, computed from ALREADY-VALIDATED torch reference runs, cosine of the FULL concatenated trainable LoRA-gradient vector (7,196,672 params). UNCHANGED this round (no torch-side code touched).",
+    "producer": {
+      "path": "crates/jammi-bench/reference/torch_grad_oracle.py",
+      "kind": "script",
+      "invocation": "python3 crates/jammi-bench/reference/torch_grad_oracle.py --model-dir <ModernBERT-large checkpoint dir> --lora-weights-in <shared LoRA weights> --backbone-dtype bf16 --attn-impl sdpa --batch 4 --seq 128 --seed 42 --out torch_bf16_sdpa.json (and the f32/eager-attn-impl counterparts) -- crates/jammi-bench/reference is now merged to main (GH#372, 8724115), closing the phase-4 audit's A3 label-as-torch-side-evidence finding",
+      "gating": "none"
+    },
     "measured": {
       "torch_bf16_sdpa_vs_torch_f32_cos": 0.8171906194981081,
       "torch_bf16_eager_vs_torch_f32_cos": 0.9156351843284645,
@@ -71,18 +88,18 @@
       "loss_bf16_eager": 0.279296875
     },
     "caveat": "torch's go5 legs and this round's jammi round5_out legs load DIFFERENT shared LoRA weight files (different seeding runs) and measure a DIFFERENT metric (full trainable-gradient cosine vs per-layer activation-gradient cosine) -- not directly cross-comparable point-for-point. This is a proxy answer, not the full E3 table the dispatch specified.",
-    "reasoning": "torch's own production bf16 attention path (SDPA -> FlashAttention-2 on sm80, per sdp_utils.cpp's priority_order) reaches only cos=0.817 vs its own F32 truth -- NOT 0.99+. jammi's flash arm (E2, same underlying FA2 mechanism, real vendored kernel) lands in a comparable range (boundary[1-18].cos=0.75, qkv[0-18].cos=0.85). This suggests the RESIDUAL divergence after fixing the F32-logits mechanism is substantially INHERENT to bf16 LoRA fine-tuning at this checkpoint/scale, not a further jammi defect -- while the GAP BETWEEN jammi's non-FA2 arms (fused/shared, cos 0.35-0.74 in the same zone) and jammi's FA2 arm / torch's own bf16 ceiling (cos 0.75-0.92) IS jammi-specific and IS what the F32-logits mechanism (E2) closes.",
-    "incomplete": "The full 28-layer torch register_full_backward_hook boundary/qkv table (torch bf16-sdpa and torch f32, same checkpoint/LoRA/seed/batch as E2's jammi legs, for a row-by-row comparison against the E2 table) was NOT built -- deprioritized against E2/E1 given the round's time budget. Flagged as remaining work."
+    "reasoning": "torch's own production bf16 attention path (SDPA -> FlashAttention-2 on sm80, per sdp_utils.cpp's priority_order) reaches only cos=0.817 vs its own F32 truth -- NOT 0.99+. jammi's flash arm (round 5's E2, same underlying FA2 mechanism, real vendored kernel) lands in a comparable range (boundary[1-18].cos=0.75, qkv[0-18].cos=0.85). This suggests the RESIDUAL divergence after fixing the F32-logits mechanism is substantially INHERENT to bf16 LoRA fine-tuning at this checkpoint/scale, not a further jammi defect -- while the GAP BETWEEN jammi's non-FA2 arms (fused/shared, cos 0.35-0.74 in the same zone) and jammi's FA2 arm / torch's own bf16 ceiling (cos 0.75-0.92) IS jammi-specific and IS what the F32-logits mechanism (E2) closes.",
+    "incomplete": "The full 28-layer torch register_full_backward_hook boundary/qkv table (torch bf16-sdpa and torch f32, same checkpoint/LoRA/seed/batch as E2's jammi legs, for a row-by-row comparison against the E2 table) was NOT built -- deprioritized against E2/E1 given round 5's time budget. Still flagged as remaining work; unchanged this round."
   },
   "deliverable_branch_pod_gates": {
-    "tree": "725d116 (this round's deliverable tip, no P6/bench-r3 merge)",
-    "cargo_fmt_p_jammi_kernels_check": "exit 0",
-    "cargo_clippy_p_jammi_kernels_all_targets_features_cuda_D_warnings": "exit 0, zero warnings",
-    "cargo_test_p_jammi_kernels_features_cuda_release": "exit 0; cuda_parity.rs 70/70 passed; rope_oracles.rs 8/8 passed (including eager_vs_fused_bf16_fwd_and_bwd_at_production_amplitude_vs_independent_f64_truth); 13 test binaries total, 0 FAILED across the whole run"
+    "tree": "PLACEHOLDER_UPDATED_AFTER_FINAL_COMMIT (this round's phase-4-audit-fix tip)",
+    "cargo_fmt_p_jammi_kernels_check": "PLACEHOLDER",
+    "cargo_clippy_p_jammi_kernels_all_targets_features_cuda_D_warnings": "PLACEHOLDER",
+    "cargo_test_p_jammi_kernels_features_cuda_release": "PLACEHOLDER"
   },
   "E4_headline_gradient_oracle": {
-    "status": "NOT RUN this round",
-    "reason": "The #372 jammi-vs-torch gradient-oracle CLI (grad_oracle.rs, torch_grad_oracle.py) lives on origin/bench/loss-trajectory-r3@56e2637, not yet merged to main. A merge attempt into this round's tree hit real, substantive conflicts in crates/jammi-kernels/src/admission.rs (300+ lines, both branches independently extended cascade admission) and crates/jammi-bench/src/finetune_step.rs (1100+ lines) -- resolving these by hand under this round's time budget risked silently corrupting dispatch logic that every measurement in this artifact depends on, so the attempt was aborted rather than rushed. E4 is unmeasured this round; the closest available evidence is E3's torch bf16-vs-f32 aggregate cosine (0.817/0.916) and E2's jammi per-layer cosine improvements, both above.",
+    "status": "NOT RUN this round (unchanged from round 5's own status) -- crates/jammi-bench's grad_oracle.rs/torch_grad_oracle.py IS now merged to main (GH#372, 8724115), so the CLI itself exists on this branch, but running the full jammi-vs-torch headline comparison end to end was out of this phase-4 audit round's scope (A1-A4 + advisories only).",
+    "reason": "See round 5's original note: a merge attempt into round 5's tree hit substantive admission.rs/finetune_step.rs conflicts. #372 is merged now, so a future round CAN run E4 directly on main -- this remains flagged as the next round's work, not attempted here.",
     "round3_baseline_for_reference": 0.2447
   }
 }

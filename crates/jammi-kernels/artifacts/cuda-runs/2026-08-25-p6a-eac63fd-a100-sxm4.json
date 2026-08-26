@@ -1,12 +1,20 @@
 {
+  "schema_version": 1,
   "unit": "P6-stage-A",
   "git_sha": "eac63fdb83bfabb5f6e6bcb9811ddf55e822c59c",
   "date": "2026-08-25T11:53:13Z",
   "gpu": "NVIDIA A100-SXM4-80GB, 580.126.16",
   "nvcc": "Cuda compilation tools, release 12.6, V12.6.85",
   "features": "cuda,flash-attn",
+  "box": "a100-sxm4 (hostname not recorded — legacy artifact predates the box field)",
   "env": {
     "JAMMI_REQUIRE_CUDA": "1"
+  },
+  "producer": {
+    "path": null,
+    "kind": "none",
+    "invocation": null,
+    "gating": "none"
   },
   "status": "GREEN",
   "exit_code": 0,

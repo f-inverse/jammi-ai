@@ -67,6 +67,15 @@ fn default_local_attention() -> usize {
 fn default_global_attn_every_n_layers() -> usize {
     DEFAULT_GLOBAL_ATTN_EVERY_N_LAYERS
 }
+/// HuggingFace ModernBERT's own default for `hidden_activation`
+/// (`modeling_modernbert.py`'s `ModernBertConfig.__init__`,
+/// `hidden_activation="gelu"`) — the erf-based GELU, matching
+/// `jammi_kernels::ops::GeluVariant::Erf`, the only variant this port's
+/// `GegluFused` implements (see [`ModernBertBuilder::build`]'s refusal
+/// below).
+fn default_hidden_activation() -> String {
+    "gelu".to_string()
+}
 fn default_attention_dropout() -> f64 {
     0.0
 }
@@ -105,6 +114,18 @@ pub struct ModernBertConfig {
     /// own upstream default and the only value this port supports.
     #[serde(default = "default_attention_dropout")]
     pub attention_dropout: f64,
+    /// HuggingFace's `hidden_activation` — parsed (previously silently
+    /// dropped: neither this field nor a check against it existed, so a
+    /// checkpoint naming any OTHER activation would have silently gotten
+    /// this module's MLP call site's hardcoded
+    /// [`jammi_kernels::ops::GeluVariant::Erf`] regardless — a
+    /// confidently-wrong-function risk, not merely a confidently-wrong-
+    /// NUMBER one). Refused if it names anything other than `"gelu"` at
+    /// [`ModernBertBuilder::build`] — this port's MLP implements no other
+    /// GELU variant (`GeluVariant::Tanh` is itself a typed refusal inside
+    /// `jammi-kernels`, see that enum's own doc).
+    #[serde(default = "default_hidden_activation")]
+    pub hidden_activation: String,
 }
 
 impl ModernBertConfig {
@@ -1045,7 +1066,31 @@ impl ModernBertAttention {
                 }
                 (false, _) => extended_mask,
             };
-            softmax_apply_training(&raw_scores, &mask, scale)?
+
+            // esc-045 round 5 (GH#374) `shared_upcast` diagnostic — see
+            // `round5_maybe_upcast_scores`'s own doc, below in this file.
+            // `#[cfg(test)]`-only: a release build never compiles the
+            // helper calls or the `JAMMI_ROUND5_UPCAST_SCORES` env read in
+            // at all.
+            #[cfg(test)]
+            let (raw_scores_for_softmax, mask, round5_upcast) = round5_maybe_upcast_scores(
+                round5_upcast_scores_env_is_set(),
+                &q,
+                &k,
+                raw_scores,
+                mask,
+            )?;
+            #[cfg(not(test))]
+            let raw_scores_for_softmax = raw_scores;
+
+            let attn = softmax_apply_training(&raw_scores_for_softmax, &mask, scale)?;
+            #[cfg(test)]
+            let attn = if round5_upcast {
+                attn.to_dtype(v.dtype())?
+            } else {
+                attn
+            };
+            attn
         } else {
             // Eval's UNCHANGED code path, bit-identical to before this
             // commit: divides by `scale` exactly as before (the ONE `Op::Affine`
@@ -1092,6 +1137,84 @@ impl ModernBertAttention {
             self.rope.apply(x)
         }
     }
+}
+
+/// esc-045 round 5 (GH#374) `shared_upcast` diagnostic arm — restores the
+/// mechanism `crates/jammi-kernels/artifacts/cuda-runs/
+/// 2026-08-25-esc045-r5-725d116-a100-pcie.json`'s `E2_attention_logit_
+/// precision_mechanism.arms.shared_upcast` describes (that round's
+/// measurement ran on a separate, unreachable tree — this is its FIRST
+/// committed producer, so a future re-run has real code to point at
+/// instead of an ephemeral, discarded script). `#[cfg(test)]`-only — the
+/// ONLY call site (`forward_eager_training_attention_composition`'s
+/// `self.training` branch) is itself behind `#[cfg(test)]`, so a release
+/// build compiles NEITHER this function, NOR its caller
+/// [`round5_upcast_scores_env_is_set`], NOR the
+/// `JAMMI_ROUND5_UPCAST_SCORES` env read in at all; the var has zero
+/// effect on production regardless of whether it happens to be set in the
+/// process environment.
+///
+/// The env-var READ is deliberately split into its own one-line function
+/// ([`round5_upcast_scores_env_is_set`]) so THIS function — the actual
+/// numeric mechanism — takes a plain `bool` and needs no
+/// `std::env::set_var` in its own tests: mutating process-global env vars
+/// from a `#[test]` racing other threads that ALSO exercise
+/// `forward_eager_training_attention_composition` concurrently (this
+/// crate's default parallel `cargo test` runs many such tests at once) is
+/// exactly the kind of test-isolation hazard this split avoids — the
+/// numeric mechanism itself is fully covered without it.
+///
+/// When `upcast` is `false`, returns `(raw_scores, mask, false)`
+/// UNCHANGED — no recomputation, no cast, the exact same tensors the
+/// caller already built — pinning byte-identical behavior; see
+/// `tests::round5_maybe_upcast_scores_no_op_when_upcast_is_false`.
+///
+/// When `upcast` is `true`: re-issues the scores GEMM with `q`/`k` upcast
+/// to `F32` FIRST (not a post-hoc cast of the already-BF16-rounded
+/// `raw_scores` — a genuinely more precise product, matching what
+/// `modeling_modernbert.py:180`'s own `dtype=torch.float32` softmax
+/// upcast achieves for the logits themselves, one layer up from
+/// `ops::softmax`'s own rounding-placement fix), casts `mask` to `F32` to
+/// match (see below for why this recovers full precision despite the
+/// caller's `mask` argument already having gone through one `BF16`
+/// round-trip), and returns `(raw_scores_f32, mask_f32, true)` so the
+/// caller's softmax call runs in genuine `F32` end to end — the caller
+/// (see the call site's own comment) then downcasts the resulting
+/// probabilities back to `V`'s dtype before `P @ V`, matching the
+/// diagnostic's own description ("q/k upcast to F32 for the scores GEMM +
+/// softmax, probs cast back to bf16 for P@V"). See
+/// `tests::round5_maybe_upcast_scores_upcasts_q_k_before_the_gemm_when_upcast_is_true`.
+///
+/// `mask`'s only two values are `0.0` (real) and `crate::mask::
+/// MASKED_LOGIT` (`-10_000.0`, padding) — both exactly representable in
+/// `BF16`, which is why upcasting the caller's already-`BF16`-rounded
+/// `mask` back to `F32` here recovers its full original precision rather
+/// than merely widening an already-lossy value.
+#[cfg(test)]
+fn round5_maybe_upcast_scores(
+    upcast: bool,
+    q: &Tensor,
+    k: &Tensor,
+    raw_scores: Tensor,
+    mask: Tensor,
+) -> Result<(Tensor, Tensor, bool), EncoderError> {
+    if upcast {
+        let q32 = q.to_dtype(DType::F32)?;
+        let k32 = k.to_dtype(DType::F32)?;
+        let raw_scores32 = crate::contiguous_matmul(&q32, &k32.transpose(D::Minus1, D::Minus2)?)?;
+        let mask32 = mask.to_dtype(DType::F32)?;
+        Ok((raw_scores32, mask32, true))
+    } else {
+        Ok((raw_scores, mask, false))
+    }
+}
+
+/// The env-var read [`round5_maybe_upcast_scores`]'s doc explains keeping
+/// separate from the numeric mechanism. `#[cfg(test)]`-only, same as that
+/// function.
+#[cfg(test)]
+fn round5_upcast_scores_env_is_set() -> bool {
+    std::env::var_os("JAMMI_ROUND5_UPCAST_SCORES").is_some()
 }
 
 /// Only ever called from `ModernBertAttention::forward`'s `self.training`
@@ -1720,6 +1843,18 @@ impl<'a> ModernBertBuilder<'a> {
                 config.attention_dropout
             )));
         }
+        // This port's MLP hardcodes `GeluVariant::Erf` at its `GegluFused`
+        // call site — a checkpoint whose `hidden_activation` names any
+        // OTHER activation must be refused loudly here, not silently run
+        // through the wrong GELU variant (family D: matching the
+        // checkpoint's own declared numerics, not merely "an activation").
+        if config.hidden_activation != "gelu" {
+            return Err(EncoderError::Config(format!(
+                "hidden_activation must be \"gelu\" (this port's MLP hardcodes the erf-based \
+                 GeluVariant::Erf and implements no other activation), got {:?}",
+                config.hidden_activation
+            )));
+        }
 
         let frozen_vb = unsafe {
             VarBuilder::from_mmaped_safetensors(weights_paths, self.backbone_dtype, device)?
@@ -1938,15 +2073,37 @@ impl<'a, 'b> LoraSite<'a, 'b> {
 /// reason: `track_grad == false` there, so it is never popped at all).
 ///
 /// The fix mirrors PyTorch's `register_hook`: insert an IDENTITY custom op
-/// (`GradTap`) at the capture point. Its `cpu_fwd`/`cuda_fwd` are a value-
-/// and layout-exact storage clone (`BackendStorage::try_clone`, the same
-/// primitive `Tensor::copy` itself uses) — bit-identical downstream, same
-/// contiguity, so no admission predicate anywhere sees a different tensor
-/// than it would have. Its `bwd` is a side-effecting PASSTHROUGH: it
-/// records a clone of `grad_res` into this thread's sink, then returns
-/// `Some(grad_res.clone())` UNCHANGED, so the real gradient keeps flowing
-/// exactly as it would with no tap present — the tap is observed, never
-/// altered.
+/// (`GradTap`) at the capture point. Its `cpu_fwd`/`cuda_fwd` require the
+/// input to be CONTIGUOUS at offset `0` (asserted, a typed refusal
+/// otherwise — see below), then clone the storage
+/// (`BackendStorage::try_clone`, the same primitive `Tensor::copy` itself
+/// uses) — bit-identical downstream, same contiguity, so no admission
+/// predicate anywhere sees a different tensor than it would have. Its
+/// `bwd` is a side-effecting PASSTHROUGH: it records a clone of `grad_res`
+/// into this thread's sink, then returns `Some(grad_res.clone())`
+/// UNCHANGED, so the real gradient keeps flowing exactly as it would with
+/// no tap present — the tap is observed, never altered.
+///
+/// ### Why the contiguous-offset-0 assertion (family D)
+///
+/// `BackendStorage::try_clone(&self, _layout: &Layout)` (candle-core
+/// 0.11.0, `cpu_backend/mod.rs`) IGNORES the `Layout` argument entirely —
+/// it clones the raw underlying buffer (`self.clone()`), not the logical
+/// VIEW `l` describes. `Tensor::apply_op1`'s own machinery then pairs that
+/// cloned buffer with a FRESH, contiguous, offset-`0` `Layout` for
+/// `cpu_fwd`'s returned `Shape` — so if the ORIGINAL input `l` were a
+/// narrowed or transposed view (nonzero `start_offset`, or non-C-contiguous
+/// strides), the output tensor would read the SAME raw bytes at the WRONG
+/// positions: a confidently-wrong gradient capture, not an error. Every
+/// call site today (`tap_boundary`/`tap_qkv`/`tap_mlp_input`, all applied
+/// to a fresh matmul/LayerNorm/attention-block output) happens to be
+/// contiguous at offset `0` already, so this defect is LATENT, not
+/// observed — but "happens to be" is not a domain guarantee, and this is
+/// test-only diagnostic tooling whose whole job is trustworthy numbers.
+/// `cpu_fwd`/`cuda_fwd` now check `Layout::contiguous_offsets() ==
+/// Some((0, len))` and return a typed `candle_core::Error` (never silently
+/// misread) if a future call site ever taps a non-contiguous or
+/// nonzero-offset tensor.
 #[cfg(test)]
 pub(crate) mod activation_capture {
     use candle_core::backend::BackendStorage;
@@ -1990,6 +2147,28 @@ pub(crate) mod activation_capture {
         SINK.with(|s| s.borrow_mut().take())
     }
 
+    /// `try_clone` ignores `Layout` (see [`GradTap`]'s module doc's "why
+    /// the contiguous-offset-0 assertion" section) — the ONLY layout this
+    /// op's storage-level clone is actually correct for is one that is
+    /// already contiguous at offset `0` (so the raw buffer's own row-major
+    /// order already IS the tensor's logical order and `l.shape()` alone
+    /// is sufficient to reinterpret it correctly). A typed refusal, never
+    /// a silently misread capture.
+    fn check_contiguous_zero_offset(l: &Layout, op: &'static str) -> candle_core::Result<()> {
+        let elem_count = l.shape().elem_count();
+        match l.contiguous_offsets() {
+            Some((0, end)) if end == elem_count => Ok(()),
+            _ => Err(candle_core::Error::Msg(format!(
+                "{op}: GradTap requires a contiguous, zero-offset input (try_clone ignores \
+                 Layout, so a narrowed/transposed view would silently capture the WRONG bytes) \
+                 — got start_offset={}, contiguous={}, shape={:?}",
+                l.start_offset(),
+                l.is_contiguous(),
+                l.shape()
+            ))),
+        }
+    }
+
     struct GradTap {
         key: String,
     }
@@ -2000,6 +2179,7 @@ pub(crate) mod activation_capture {
         }
 
         fn cpu_fwd(&self, s: &CpuStorage, l: &Layout) -> candle_core::Result<(CpuStorage, Shape)> {
+            check_contiguous_zero_offset(l, self.name())?;
             Ok((s.try_clone(l)?, l.shape().clone()))
         }
 
@@ -2008,6 +2188,7 @@ pub(crate) mod activation_capture {
             s: &CudaStorage,
             l: &Layout,
         ) -> candle_core::Result<(CudaStorage, Shape)> {
+            check_contiguous_zero_offset(l, self.name())?;
             Ok((s.try_clone(l)?, l.shape().clone()))
         }
 
@@ -2071,6 +2252,76 @@ pub(crate) mod activation_capture {
 
     pub(super) fn tap_mlp_input(t: Tensor) -> candle_core::Result<Tensor> {
         tap(t, "mlp_input")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use candle_core::Device;
+
+        /// The domain check this module's own doc derives: a contiguous,
+        /// zero-offset input passes through `GradTap` unchanged (the
+        /// common case every real call site hits today).
+        #[test]
+        fn contiguous_zero_offset_input_passes() {
+            let device = Device::Cpu;
+            let t = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0], (2, 2), &device).unwrap();
+            assert!(t.is_contiguous());
+            let out = t
+                .clone()
+                .apply_op1(GradTap {
+                    key: "test".to_string(),
+                })
+                .unwrap();
+            assert_eq!(
+                out.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                t.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+            );
+        }
+
+        /// A non-contiguous view (`try_clone` ignores `Layout` — see this
+        /// module's doc) must be a typed refusal, not a silently-misread
+        /// capture.
+        #[test]
+        fn non_contiguous_input_is_a_typed_refusal_not_a_silent_misread() {
+            let device = Device::Cpu;
+            let t = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], (2, 3), &device)
+                .unwrap()
+                .t()
+                .unwrap();
+            assert!(!t.is_contiguous());
+            let err = t
+                .apply_op1(GradTap {
+                    key: "test".to_string(),
+                })
+                .expect_err("a non-contiguous input must be refused, not silently misread");
+            assert!(matches!(err, candle_core::Error::Msg(_)), "{err:?}");
+        }
+
+        /// A nonzero-`start_offset` CONTIGUOUS view (a narrow that keeps
+        /// contiguity but starts partway into the buffer) must ALSO be
+        /// refused — `try_clone` clones the WHOLE underlying buffer, so a
+        /// nonzero offset alone (independent of contiguity) is enough to
+        /// misread.
+        #[test]
+        fn nonzero_offset_contiguous_input_is_a_typed_refusal() {
+            let device = Device::Cpu;
+            let t = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], (6,), &device)
+                .unwrap()
+                .narrow(0, 2, 3)
+                .unwrap();
+            assert!(
+                t.is_contiguous(),
+                "a narrow along the flat axis stays contiguous"
+            );
+            assert!(t.layout().start_offset() > 0);
+            let err = t
+                .apply_op1(GradTap {
+                    key: "test".to_string(),
+                })
+                .expect_err("a nonzero-offset input must be refused even if contiguous");
+            assert!(matches!(err, candle_core::Error::Msg(_)), "{err:?}");
+        }
     }
 }
 
@@ -3346,6 +3597,114 @@ mod tests {
         }
     }
 
+    /// esc-045 round 5 (GH#374): `round5_maybe_upcast_scores(false, ...)`
+    /// returns the caller's `raw_scores`/`mask` UNCHANGED — no
+    /// recomputation, no cast — pinning "production path byte-identical
+    /// when the var is unset" at the pure-function level (see that
+    /// function's own doc for why the env-var read is tested separately,
+    /// with no `std::env::set_var` anywhere in this test binary).
+    #[test]
+    fn round5_maybe_upcast_scores_no_op_when_upcast_is_false() {
+        let device = Device::Cpu;
+        let q = Tensor::from_slice(&[bf16::from_f32(1.0), bf16::from_f32(2.0)], (1, 2), &device)
+            .unwrap();
+        let k = Tensor::from_slice(&[bf16::from_f32(3.0), bf16::from_f32(4.0)], (1, 2), &device)
+            .unwrap();
+        let raw_scores_v = [bf16::from_f32(5.5), bf16::from_f32(-2.25)];
+        let raw_scores = Tensor::from_slice(&raw_scores_v, (2,), &device).unwrap();
+        let mask_v = [bf16::from_f32(0.0), bf16::from_f32(-10_000.0)];
+        let mask = Tensor::from_slice(&mask_v, (2,), &device).unwrap();
+
+        let (out_scores, out_mask, upcast) =
+            round5_maybe_upcast_scores(false, &q, &k, raw_scores, mask).unwrap();
+        assert!(!upcast);
+        assert_eq!(
+            out_scores.dtype(),
+            DType::BF16,
+            "no-op must not change dtype"
+        );
+        assert_eq!(out_mask.dtype(), DType::BF16, "no-op must not change dtype");
+        let out_scores_v: Vec<bf16> = out_scores.flatten_all().unwrap().to_vec1().unwrap();
+        let out_mask_v: Vec<bf16> = out_mask.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(out_scores_v, raw_scores_v, "no-op must not change values");
+        assert_eq!(out_mask_v, mask_v, "no-op must not change values");
+    }
+
+    /// esc-045 round 5 (GH#374): `round5_maybe_upcast_scores(true, ...)`
+    /// re-issues the scores GEMM with `q`/`k` upcast to `F32` FIRST — a
+    /// genuinely different (more precise) computation from the caller's
+    /// discarded bf16-native `raw_scores`, not a dtype relabel of the same
+    /// bits. Values are deliberately non-power-of-two so the two formulas
+    /// disagree (a trivial fixture would not discriminate the mechanism
+    /// from a no-op).
+    #[test]
+    fn round5_maybe_upcast_scores_upcasts_q_k_before_the_gemm_when_upcast_is_true() {
+        let device = Device::Cpu;
+        let q_v = [bf16::from_f32(1.2345), bf16::from_f32(-0.6789)];
+        let k_v = [bf16::from_f32(2.3456), bf16::from_f32(0.9876)];
+        let q = Tensor::from_slice(&q_v, (1, 2), &device).unwrap();
+        let k = Tensor::from_slice(&k_v, (1, 2), &device).unwrap();
+        // A plausible stand-in for the caller's bf16-native `raw_scores`
+        // (candle-core 0.11's CPU backend has no BF16 `MatMul` impl at
+        // all — the same pre-existing limitation
+        // `LowRankResidualLinear`'s module doc discloses — so this test
+        // cannot run a REAL bf16 GEMM on CPU; production only ever reaches
+        // this function on a CUDA bf16 tensor). Hand-rounded once at bf16
+        // width, matching the "f32-accumulate, round-once" shape a real
+        // GEMM would take: this value must be DISCARDED, not reused, when
+        // upcast fires — that discard is exactly what this test proves.
+        let raw_scores_bf16 = Tensor::from_slice(
+            &[bf16::from_f32(
+                q_v[0].to_f32() * k_v[0].to_f32() + q_v[1].to_f32() * k_v[1].to_f32(),
+            )],
+            (1,),
+            &device,
+        )
+        .unwrap();
+        let mask = Tensor::from_slice(&[bf16::from_f32(0.0)], (1, 1), &device).unwrap();
+
+        let (out_scores, out_mask, upcast) =
+            round5_maybe_upcast_scores(true, &q, &k, raw_scores_bf16.clone(), mask).unwrap();
+        assert!(upcast);
+        assert_eq!(
+            out_scores.dtype(),
+            DType::F32,
+            "upcast path must produce F32 scores"
+        );
+        assert_eq!(
+            out_mask.dtype(),
+            DType::F32,
+            "upcast path must produce F32 mask"
+        );
+
+        // Independent f64 reference for q.k^T — the SAME real-number dot
+        // product the upcast F32 GEMM should closely reproduce, computed
+        // from q/k's own bf16-rounded VALUES (upcasting q/k to F32 does
+        // not recover precision q/k never had — only the GEMM's OWN
+        // internal rounding, which this test isolates) — a numpy-first-
+        // oracle-style independent computation (family F), at f64 since
+        // numpy isn't available in Rust.
+        let expected_f64 = q_v[0].to_f64() * k_v[0].to_f64() + q_v[1].to_f64() * k_v[1].to_f64();
+        let out_scores_v: Vec<f32> = out_scores.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(
+            (out_scores_v[0] as f64 - expected_f64).abs() < 1e-5,
+            "upcast scores must match the F32-precision product: got {}, want {}",
+            out_scores_v[0],
+            expected_f64
+        );
+
+        // Non-vacuity: the upcast result must actually DIFFER from the
+        // caller's discarded bf16-native raw_scores.
+        let bf16_v: Vec<bf16> = raw_scores_bf16.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(
+            (out_scores_v[0] - bf16_v[0].to_f32()).abs() > 1e-4,
+            "upcast result must differ from the bf16-native GEMM it replaces \
+             (fixture is not discriminating otherwise): f32={} bf16={}",
+            out_scores_v[0],
+            bf16_v[0]
+        );
+    }
+
     /// Local-attention (window) arm: same comparison, with a real sliding
     /// window band supplied to both arms.
     #[test]
@@ -3789,6 +4148,57 @@ mod tests {
             after2.fused, before2.fused,
             "set_training(false) restores eval"
         );
+    }
+
+    /// `ModernBertConfig::hidden_activation`'s domain (family D): a
+    /// checkpoint naming any activation other than `"gelu"` must be
+    /// refused loudly at [`ModernBertBuilder::build`], not silently routed
+    /// through this port's hardcoded `GeluVariant::Erf`. The config check
+    /// runs BEFORE any weight file is opened (see `build`'s own ordering),
+    /// so a nonexistent weights path is sufficient to prove the refusal
+    /// fires early, not merely that SOME later step failed.
+    #[test]
+    fn hidden_activation_other_than_gelu_is_a_typed_refusal() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/tiny_modernbert_head64");
+        let mut config: ModernBertConfig =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            config.hidden_activation, "gelu",
+            "fixture must default to \"gelu\" via serde's own default before this test mutates it"
+        );
+        config.hidden_activation = "gelu_new".to_string();
+        let device = Device::Cpu;
+        let varmap = candle_nn::VarMap::new();
+        let bogus_weights = dir.join("does-not-exist.safetensors");
+        let result =
+            ModernBert::builder().build(&[bogus_weights.as_path()], &config, &device, &varmap);
+        let err = match result {
+            Ok(_) => {
+                panic!("hidden_activation != \"gelu\" must be refused before any weight is opened")
+            }
+            Err(e) => e,
+        };
+        assert!(matches!(err, EncoderError::Config(_)), "{err:?}");
+    }
+
+    /// The default (a `config.json` that OMITS `hidden_activation`
+    /// entirely, matching every real fixture in this crate today) must
+    /// parse as `"gelu"` — HF ModernBERT's own default
+    /// (`modeling_modernbert.py`'s `ModernBertConfig.__init__`) — not an
+    /// empty string or a parse failure.
+    #[test]
+    fn hidden_activation_defaults_to_gelu_when_absent_from_config_json() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/tiny_modernbert_head64");
+        let raw = std::fs::read_to_string(dir.join("config.json")).unwrap();
+        assert!(
+            !raw.contains("hidden_activation"),
+            "this fixture must omit hidden_activation for this test to prove the DEFAULT works"
+        );
+        let config: ModernBertConfig = serde_json::from_str(&raw).unwrap();
+        assert_eq!(config.hidden_activation, "gelu");
     }
 
     /// A CPU/F32 fused-vs-eager comparison at PRODUCTION `heads=16`/
@@ -4251,6 +4661,38 @@ mod tests {
         ));
     }
 
+    /// Mirrors `tests/cuda_parity.rs`'s `cuda_device()`/`JAMMI_REQUIRE_CUDA`
+    /// skip-vs-fail gate for this crate's own esc-045 round-4/round-5
+    /// oracles: a missing prerequisite env var is normally a SKIP (no
+    /// ModernBERT-large checkpoint ships with this repo, so a plain
+    /// `cargo test -p jammi-encoders` — this crate's ordinary acceptance
+    /// gate — must stay green) — UNLESS `JAMMI_REQUIRE_ESC045_ORACLES` is
+    /// set, in which case a missing var PANICS instead of silently
+    /// reading as "skipped". Without this distinction, a broken pod
+    /// invocation (a typo'd env var name, a step that failed to export
+    /// one) would read as N SKIPPED tests rather than N FAILED ones —
+    /// exactly the "fell back/skipped everywhere and it read as green"
+    /// failure mode this crate's own `admission::AdmissionMode::Strict`
+    /// exists to prevent, reproduced here for the landing-proof tests that
+    /// gate esc-045's own round-4/round-5 evidence.
+    #[cfg(feature = "cuda")]
+    fn round4_env_or_skip(var: &str, test_name: &str) -> Option<String> {
+        match std::env::var(var) {
+            Ok(v) => Some(v),
+            Err(_) => {
+                if std::env::var_os("JAMMI_REQUIRE_ESC045_ORACLES").is_some() {
+                    panic!(
+                        "{test_name}: JAMMI_REQUIRE_ESC045_ORACLES is set but {var} is not — \
+                         this is an esc-045 round-4/round-5 landing proof, a silent skip here \
+                         is not acceptable"
+                    );
+                }
+                eprintln!("{test_name}: skipping — {var} not set");
+                None
+            }
+        }
+    }
+
     /// A tiny SplitMix64-derived generator for a synthetic token-id batch,
     /// self-contained (no cross-crate dependency on `jammi-bench`'s own
     /// `synthetic_ids` — family L: generic/synthetic fixtures only) —
@@ -4290,18 +4732,11 @@ mod tests {
     #[test]
     #[cfg(feature = "cuda")]
     fn esc045_round5_seed_shared_lora_weights() {
-        let Ok(model_dir) = std::env::var("JAMMI_ROUND4_MODEL_DIR") else {
-            eprintln!(
-                "esc045_round5_seed_shared_lora_weights: skipping — JAMMI_ROUND4_MODEL_DIR not \
-                 set"
-            );
+        const NAME: &str = "esc045_round5_seed_shared_lora_weights";
+        let Some(model_dir) = round4_env_or_skip("JAMMI_ROUND4_MODEL_DIR", NAME) else {
             return;
         };
-        let Ok(out_path) = std::env::var("JAMMI_ROUND5_SEED_LORA_WEIGHTS_OUT") else {
-            eprintln!(
-                "esc045_round5_seed_shared_lora_weights: skipping — \
-                 JAMMI_ROUND5_SEED_LORA_WEIGHTS_OUT not set"
-            );
+        let Some(out_path) = round4_env_or_skip("JAMMI_ROUND5_SEED_LORA_WEIGHTS_OUT", NAME) else {
             return;
         };
         let seed: u64 = std::env::var("JAMMI_ROUND4_SEED")
@@ -4371,15 +4806,16 @@ mod tests {
     /// normal `cargo test -p jammi-encoders` run (this crate's
     /// acceptance gate) stays green; the pod-only invocation sets the
     /// env var explicitly, mirroring `growth_oracle_cuda_device`'s skip
-    /// convention above.
+    /// convention above. When `JAMMI_REQUIRE_ESC045_ORACLES` is ALSO set
+    /// (the landing-proof invocation), a missing `JAMMI_ROUND4_MODEL_DIR`
+    /// PANICS instead of skipping — see [`round4_env_or_skip`].
     #[test]
     #[cfg(feature = "cuda")]
     fn esc045_round4_per_layer_activation_gradient_dump() {
-        let Ok(model_dir) = std::env::var("JAMMI_ROUND4_MODEL_DIR") else {
-            eprintln!(
-                "esc045_round4_per_layer_activation_gradient_dump: skipping — \
-                 JAMMI_ROUND4_MODEL_DIR not set"
-            );
+        let Some(model_dir) = round4_env_or_skip(
+            "JAMMI_ROUND4_MODEL_DIR",
+            "esc045_round4_per_layer_activation_gradient_dump",
+        ) else {
             return;
         };
         let out_path = std::env::var("JAMMI_ROUND4_OUT")

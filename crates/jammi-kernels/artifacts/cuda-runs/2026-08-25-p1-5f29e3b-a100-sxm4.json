@@ -1,13 +1,21 @@
 {
+  "schema_version": 1,
   "artifact": "cuda-run",
   "tag": "p1",
   "git_sha": "5f29e3b87ba2305533e83d21223343a73100cb64",
+  "box": "4a4f23a83793 (A100-SXM4-80GB, 81920 MiB)",
   "env": {
     "gpu": "NVIDIA A100-SXM4-80GB, 580.126.16, 81920 MiB",
     "nvcc": "Cuda compilation tools, release 12.6, V12.6.85",
     "rustc": "rustc 1.94.0 (4a4ef493e 2026-03-02)",
     "hostname": "4a4f23a83793",
     "generated_at_utc": "2026-08-25T01:24:20Z"
+  },
+  "producer": {
+    "path": null,
+    "kind": "none",
+    "invocation": null,
+    "gating": "none"
   },
   "gates": "clippy=0 parity=0 tests=0",
   "cuda_parity": {

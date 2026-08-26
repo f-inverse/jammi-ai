@@ -364,6 +364,69 @@ mod tests {
         assert!(matches!(err, Error::UnsupportedDTypeForOp(..)));
     }
 
+    /// Mixed-dtype discriminating oracle (closes a `cpu_fwd`'s fallback-arm
+    /// mutant, `:139`): a MIXED case where `base` is unsupported and `lora`
+    /// IS supported must name `base`'s dtype specifically, not merely
+    /// return `Error::UnsupportedDTypeForOp` with any payload — a mutant
+    /// that swapped `s1`/`s2` in the `Err(..)` construction, or that always
+    /// reports `s1`'s dtype regardless of which side is actually
+    /// unsupported, would still pass a test that only checks the error
+    /// VARIANT (as `unsupported_dtype_is_refused_with_a_typed_error` above
+    /// does).
+    #[test]
+    fn unsupported_dtype_on_base_names_base_not_lora() {
+        let device = Device::Cpu;
+        let base = Tensor::from_slice(&[1u32, 2], (2,), &device).unwrap(); // unsupported
+        let lora = Tensor::from_slice(&[1.0f32, 2.0], (2,), &device).unwrap(); // supported
+        let err = scaled_cast_add(1.0, &base, &lora)
+            .expect_err("U32 `base` paired with F32 `lora` must still be refused");
+        match err {
+            Error::UnsupportedDTypeForOp(dtype, op) => {
+                assert_eq!(
+                    dtype,
+                    DType::U32,
+                    "must name the UNSUPPORTED operand (`base`, U32), not `lora` (F32)"
+                );
+                assert_eq!(op, "scaled_cast_add");
+            }
+            other => panic!("expected UnsupportedDTypeForOp, got {other:?}"),
+        }
+    }
+
+    /// The mirror of the test above: `base` supported, `lora` unsupported —
+    /// must name `lora`'s dtype, not `base`'s. Together the two prove
+    /// `cpu_fwd`'s fallback arm reports whichever operand is ACTUALLY
+    /// unsupported, not a fixed slot.
+    #[test]
+    fn unsupported_dtype_on_lora_names_lora_not_base() {
+        let device = Device::Cpu;
+        let base = Tensor::from_slice(&[1.0f32, 2.0], (2,), &device).unwrap(); // supported
+        let lora = Tensor::from_slice(&[1u32, 2], (2,), &device).unwrap(); // unsupported
+        let err = scaled_cast_add(1.0, &base, &lora)
+            .expect_err("F32 `base` paired with U32 `lora` must still be refused");
+        match err {
+            Error::UnsupportedDTypeForOp(dtype, op) => {
+                assert_eq!(
+                    dtype,
+                    DType::U32,
+                    "must name the UNSUPPORTED operand (`lora`, U32), not `base` (F32)"
+                );
+                assert_eq!(op, "scaled_cast_add");
+            }
+            other => panic!("expected UnsupportedDTypeForOp, got {other:?}"),
+        }
+    }
+
+    /// Pins `CustomOp2::name()`'s exact string (closes a `:104` mutant that
+    /// could otherwise rename it without any test noticing — every
+    /// `UnsupportedDTypeForOp`/`ShapeMismatchBinaryOp` error carries this
+    /// value verbatim, so a silent rename would corrupt every error
+    /// message this op produces).
+    #[test]
+    fn name_is_pinned() {
+        assert_eq!(ScaledCastAdd::new(1.0).name(), "scaled_cast_add");
+    }
+
     #[test]
     fn non_contiguous_view_is_still_correct_on_cpu() {
         let device = Device::Cpu;

@@ -1688,8 +1688,11 @@ pub struct FinetuneStepTier {
     /// (`nvidia-smi --query-gpu=memory.used`) is a DRIVER-level allocator
     /// POOL high-water mark, not live-allocated bytes: once the pool grows
     /// to admit a tensor it does not shrink back down between steps (the
-    /// same convention `baselines/p1_softmax_scale_fold_ab.json` reasons
-    /// about in 32 MiB pool blocks). A baseline read AFTER the pre-step
+    /// same convention `crates/jammi-kernels/artifacts/cuda-runs/2026-08-24-
+    /// p1-softmax-fold-bf8e807-a100-sxm4.json` (unification contract C8: this
+    /// RECORD moved here from its original pre-schema location under
+    /// `crates/jammi-bench/`) reasons about in 32 MiB pool blocks). A
+    /// baseline read AFTER the pre-step
     /// would already sit at (or near) the run's own high-water mark, and
     /// the peak-minus-baseline subtraction would then floor at (or near)
     /// zero regardless of how much the run actually allocates. So this is

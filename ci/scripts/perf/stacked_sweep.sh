@@ -61,6 +61,20 @@
 #                           (if fabricated-empty) files. Never touches the
 #                           lock, the GPU, or the network; never claims a
 #                           real number.
+#   SWEEP_FAKE_BIN_SHA      unification contract C5.2: under SWEEP_DRY_RUN=1
+#                           ONLY, injects a fake `jammi-bench provenance`
+#                           build_sha so the provenance-mismatch refusal
+#                           path is exercisable without a GPU or a real
+#                           build. Inert otherwise: set it with
+#                           SWEEP_DRY_RUN unset or 0 and the script refuses
+#                           outright, before touching MODEL_DIR/the lock/the
+#                           GPU/the build -- a real run can never launder a
+#                           fabricated provenance answer through this knob.
+#   SWEEP_BOX               physical/pod box tag (e.g. `a100c`) stamped
+#                           mechanically into every raw leg's `box` field
+#                           (unification contract C5.3's `stamp_leg()`) and
+#                           into env.json. Required unless SWEEP_DRY_RUN=1
+#                           (then defaults to a `dry-run-box` placeholder).
 #
 # Stale-build note: unlike finetune_ab.sh (which switches git refs WITHIN
 # its own run and therefore must force a `cargo clean -p jammi-kernels`
@@ -179,6 +193,19 @@ SWEEP_LOCK="${SWEEP_LOCK:-/root/TIMING_IN_PROGRESS}"
 CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$WORKTREE/target}"
 TORCH_PY="${TORCH_PY:-$(cd "$WORKTREE/.." && pwd)/.venv-torch-ref/bin/python3}"
 
+# --- SWEEP_FAKE_BIN_SHA is a DRY-RUN-ONLY test knob (contract C5.2): it
+# exists to exercise the provenance-mismatch refusal path below without a
+# GPU or a real build, never to let a REAL run supply its own answer to the
+# question that check exists to ask. Checked here, before ANY other
+# precondition, so a real invocation with the knob set can never reach the
+# build/GPU/lock stages on the strength of a fabricated provenance value --
+# inert unless SWEEP_DRY_RUN=1, and a real run with it set REFUSES outright
+# rather than silently ignoring it.
+if [ -n "${SWEEP_FAKE_BIN_SHA:-}" ] && [ "$SWEEP_DRY_RUN" != "1" ]; then
+  echo "::error::SWEEP_FAKE_BIN_SHA is set but SWEEP_DRY_RUN != 1 -- this is a dry-run-only test knob (contract C5.2) for exercising the '\$BIN provenance' mismatch refusal without a real binary; a REAL run may never inject its own provenance answer. Refusing." >&2
+  exit 2
+fi
+
 # --- refuse unless the worktree is already checked out at exactly <sha> ---
 # Checked BEFORE any other precondition (MODEL_DIR, the lock, the GPU) --
 # the sha mismatch is the one thing that means "this run would not measure
@@ -199,6 +226,15 @@ if [ -z "${MODEL_DIR:-}" ]; then
     echo "::warning::SWEEP_DRY_RUN=1 and MODEL_DIR unset -- printed commands use a placeholder path; nothing is read from it."
   else
     echo "::error::MODEL_DIR must name a checkpoint directory" >&2
+    exit 2
+  fi
+fi
+
+if [ -z "${SWEEP_BOX:-}" ]; then
+  if [ "$SWEEP_DRY_RUN" = "1" ]; then
+    SWEEP_BOX="dry-run-box"
+  else
+    echo "::error::SWEEP_BOX must name the physical/pod box this run measures on (stamped into every raw leg mechanically, contract C5.3)" >&2
     exit 2
   fi
 fi
@@ -301,11 +337,45 @@ if [ "$SWEEP_DRY_RUN" != "1" ]; then
   fi
 fi
 
+# --- provenance cross-check (unification contract C5.1): refuse BEFORE any
+# leg runs if the binary's own baked identity does not match the sha this
+# invocation claims to prove. `unknown`/a `-dirty` suffix can never equal a
+# 40-hex `$SHA` (already validated above), so a single string-equality
+# check catches mismatch/unknown/dirty uniformly -- never a leg silently
+# marked GREEN off a binary that was not built cleanly at $SHA. In REAL mode
+# this ALWAYS queries the real binary -- SWEEP_FAKE_BIN_SHA was already
+# refused above if set outside SWEEP_DRY_RUN=1, so there is no real-mode
+# path that can inject a fake answer here. Under SWEEP_DRY_RUN=1 with no
+# injected SWEEP_FAKE_BIN_SHA there is no real binary to query
+# (SWEEP_SKIP_BUILD may also be set) -- the refusal path is instead
+# exercised via SWEEP_FAKE_BIN_SHA (contract C5.2), so the check is skipped
+# only in that one dry-run-and-no-fake-sha case.
+BIN_PROV_SHA=""
+if [ "$SWEEP_DRY_RUN" = "1" ]; then
+  if [ -n "${SWEEP_FAKE_BIN_SHA:-}" ]; then
+    BIN_PROV_SHA="$SWEEP_FAKE_BIN_SHA"
+  fi
+else
+  BIN_PROV_JSON="$("$BIN" provenance 2>&1)" || {
+    echo "::error::'$BIN provenance' failed: $BIN_PROV_JSON" >&2
+    exit 1
+  }
+  BIN_PROV_SHA="$(printf '%s' "$BIN_PROV_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["build_sha"])' 2>&1)" || {
+    echo "::error::could not parse build_sha from '$BIN provenance' output: $BIN_PROV_JSON" >&2
+    exit 1
+  }
+fi
+if [ -n "$BIN_PROV_SHA" ] && [ "$BIN_PROV_SHA" != "$SHA" ]; then
+  echo "::error::'$BIN provenance' reports build_sha=$BIN_PROV_SHA, but this run proves sha=$SHA -- refusing before any leg. This single check covers three cases uniformly: a genuine mismatch, build_sha=unknown, and a '-dirty' suffix (none can ever equal the 40-hex \$SHA validated above) -- the binary was not built cleanly at the sha this run claims." >&2
+  exit 1
+fi
+
 # --- env.json: box identity, queried once ---
 echo "=== env $(date -u +%FT%TZ) ==="
 {
   echo "{"
   echo "  \"git_sha\": \"$SHA\","
+  echo "  \"box\": \"$SWEEP_BOX\","
   if [ "$SWEEP_DRY_RUN" = "1" ]; then
     echo "  \"nvidia_smi\": \"[dry-run]\","
     echo "  \"torch_versions\": \"[dry-run]\""
@@ -371,12 +441,47 @@ echo "=== summarize $(date -u +%FT%TZ) ==="
 # files run_leg already wrote (real files even in dry-run, just dry-run
 # stub JSON), it never issues a GPU/network/build command itself, so
 # run_cmd's "print instead of execute" gate does not apply here.
-python3 - "$OUT_DIR" <<'PYEOF'
+python3 - "$OUT_DIR" "$SHA" "$SWEEP_BOX" <<'PYEOF'
 import json, math, sys
 from pathlib import Path
 
 out_dir = Path(sys.argv[1])
+SWEEP_GIT_SHA = sys.argv[2]
+SWEEP_BOX_TAG = sys.argv[3]
 ALLOFF_SORTED = sorted(["attention_block_flash", "adamw_step_fused"])
+
+
+def stamp_leg(full_tag, tier, producer_kind, status):
+    """Unification contract C5.3: mechanically writes the artifact schema
+    (rules (a)-(f): schema_version/git_sha/box/producer/status) PLUS the v2
+    identity stamp (leg_schema_version, identity{tier,producer_kind,
+    leg_shape:"raw"}) into the RAW leg file this summarize stage just
+    folded a number from -- replacing the hand-applied stamp every
+    previously-committed stacked raw leg carried (CV4). A dry-run stub
+    (`{"tool":"dry-run",...}`) or an unparsable/missing raw file is left
+    untouched -- there is nothing real to stamp."""
+    path = out_dir / f"{full_tag}.json"
+    if not path.is_file():
+        return
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return
+    if not isinstance(data, dict) or data.get("tool") == "dry-run":
+        return
+    data["schema_version"] = 2
+    data["leg_schema_version"] = 2
+    data["git_sha"] = SWEEP_GIT_SHA
+    data["box"] = SWEEP_BOX_TAG
+    data["status"] = status
+    data["producer"] = {
+        "path": "ci/scripts/perf/stacked_sweep.sh",
+        "kind": "script",
+        "invocation": "ci/scripts/perf/stacked_sweep.sh <worktree> <sha> <out_dir>",
+        "gating": "none",
+    }
+    data["identity"] = {"tier": tier, "producer_kind": producer_kind, "leg_shape": "raw"}
+    path.write_text(json.dumps(data, indent=2, sort_keys=False))
 
 def _finite(x):
     return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
@@ -507,6 +612,7 @@ for batch, seq in SHAPES:
             leg["adamw_eager_dispatches"] = counter(tier, "adamw_eager_dispatches")
             if leg["status"] == "GREEN" and _finite(leg["s_per_step_p50"]):
                 stacked_p50s.append(leg["s_per_step_p50"])
+        stamp_leg(f"{tag}_stacked.{r}", "finetune_step", "jammi", leg["status"])
         shape_out["legs"][f"stacked_{r}"] = leg
 
     data, err = load(f"{tag}_alloff.r1")
@@ -529,6 +635,7 @@ for batch, seq in SHAPES:
         alloff_leg["kernels_disabled_fired"] = tier.get("kernels_disabled_fired")
         if alloff_leg["status"] == "GREEN" and _finite(alloff_leg["s_per_step_p50"]):
             alloff_p50 = alloff_leg["s_per_step_p50"]
+    stamp_leg(f"{tag}_alloff.r1", "finetune_step", "jammi", alloff_leg["status"])
     shape_out["legs"]["alloff_r1"] = alloff_leg
 
     torch_p50s = []
@@ -547,6 +654,7 @@ for batch, seq in SHAPES:
             leg["s_per_step_p50"] = p50(tier)
             if leg["status"] == "GREEN" and _finite(leg["s_per_step_p50"]):
                 torch_p50s.append(leg["s_per_step_p50"])
+        stamp_leg(f"{tag}_torch.{r}", "finetune_step", "torch", leg["status"])
         shape_out["legs"][f"torch_{r}"] = leg
 
     if stacked_p50s:

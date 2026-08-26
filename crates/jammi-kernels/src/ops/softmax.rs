@@ -27,7 +27,7 @@
 //! measures this directly via `Tensor::sorted_nodes()` (candle's own public
 //! topological-sort-for-backward API): the real VRAM number is the measured
 //! pod A/B in
-//! `crates/jammi-bench/baselines/p1_softmax_scale_fold_ab.json`, but the
+//! `crates/jammi-kernels/artifacts/cuda-runs/2026-08-24-p1-softmax-fold-bf8e807-a100-sxm4.json`, but the
 //! NODE-COUNT reduction this claim rests on is measured here, live, on CPU
 //! — the node count is a proxy for the byte reduction, not a substitute
 //! for measuring it; the JSON record is the actual measurement.

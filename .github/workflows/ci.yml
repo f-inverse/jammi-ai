@@ -858,6 +858,35 @@ jobs:
           - name: CUDA run artifact schema
             cmd: python3 ci/scripts/check_cuda_run_artifacts.py
             fetch_depth: "0"
+          # `check_cuda_run_artifacts.py --self-test` — the RED-case suite
+          # for every rule above ((a)-(g), including the discovery-domain
+          # fix: a mismatched-name `*-raw-runs/` dir and a leg nested under
+          # a per-box subdirectory of a v2 parent), driven against an
+          # ephemeral `git init`'d fixture repo, never this checkout. Was
+          # previously invoked from ZERO workflows (execution provenance
+          # principle: zero-execution is RED, not a skip) — the mechanism
+          # was proven only by hand, never standing.
+          - name: CUDA run artifact schema self-test
+            cmd: python3 ci/scripts/check_cuda_run_artifacts.py --self-test
+            # Same reason as the plain leg above: the GATE_INTRODUCTION_SHA
+            # anchor check (`check_gate_introduction_sha_anchor`) this
+            # suite drives against the REAL checkout's REAL history needs
+            # full history to compute this gate file's own first-
+            # introduction commit -- a shallow (fetch-depth 1) checkout
+            # would read that back as "not found"/"HEAD", a false mismatch
+            # against GATE_INTRODUCTION_SHA. The function itself also
+            # detects and refuses cleanly on a shallow checkout now (belt
+            # and braces, self-test-covered) -- this fetch_depth avoids
+            # ever exercising that refusal path in a REQUIRED CI leg.
+            fetch_depth: "0"
+          # `check_cuda_run_artifacts.py --census` — falsifier F4 (contract
+          # §6): every `s_per_step_p50`-carrying JSON object under a
+          # `schema_version >= 2` top-level artifact's tree must be REACHED
+          # by rule (g)'s v2-leg walk. Trivially PASS today (0 such
+          # artifacts exist), standing for the day one does; also previously
+          # invoked from ZERO workflows.
+          - name: CUDA run artifact census
+            cmd: python3 ci/scripts/check_cuda_run_artifacts.py --census
           # Rule (h): every numeric token in an in-scope pipe table under
           # docs/maintainer/** or docs/plans/61-perf-unification/** must be
           # excluded (a shape label, issue ref, version string, ledger
@@ -954,6 +983,20 @@ jobs:
             cmd: python3 ci/scripts/perf/check_citations.py
           - name: citation resolver suite
             cmd: python3 ci/scripts/perf/test_check_citations.py
+          # Two mechanical, grep-shaped assertions over every producer
+          # script under ci/scripts/perf/ (unification contract C5.1/C5.2,
+          # audit round on perf/unification-p2): (A) any `*FAKE*`-named test
+          # knob (e.g. stacked_sweep.sh's SWEEP_FAKE_BIN_SHA) must be inert
+          # unless a `*DRY_RUN*` variable is 1 — a real run with the knob
+          # set must refuse, not silently launder a fabricated answer
+          # through the `$BIN provenance` cross-check; (B) every producer
+          # naming a jammi-bench BINARY path must carry that cross-check at
+          # all — closes the class where clip_artifact_producer.sh and
+          # stacked_sweep.sh had it but fa2_ab.sh and finetune_ab.sh did not.
+          - name: producer provenance gates
+            cmd: python3 ci/scripts/perf/check_producer_provenance_gates.py
+          - name: producer provenance gates self-test
+            cmd: python3 ci/scripts/perf/check_producer_provenance_gates.py --self-test
           # jammi-vs-torch gradient-oracle comparator's own math/refusal
           # suite (F6, PR #372 audit round): stdlib-only (`unittest`), no
           # torch/numpy required — `compare_grad_oracle.py`'s own module

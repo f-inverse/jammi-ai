@@ -49,6 +49,15 @@ REPO=${REPO:-$(cd "$(dirname "$0")/../../.." && pwd)}
 cd "$REPO" || exit 2
 if [ -d .git ]; then SHA=${SHA:-$(git rev-parse HEAD)}; fi
 : "${SHA:?SHA must be set (40-hex tip) when REPO is not a git checkout}"
+# Same 40-hex validation every other jammi-bench-invoking producer applies
+# (stacked_sweep.sh/fa2_ab.sh/finetune_ab.sh) -- a short/malformed SHA is
+# ambiguous, refusing to guess rather than only checking non-empty.
+SHA_RE='^[0-9a-fA-F]{40}$'
+if ! [[ "$SHA" =~ $SHA_RE ]]; then
+  echo "::error::SHA must be a 40-hex commit, got '$SHA' -- a short sha is ambiguous, refusing to guess" >&2
+  exit 2
+fi
+SHA="$(printf '%s' "$SHA" | tr 'A-F' 'a-f')"
 SHA7=${SHA:0:7}; DATE=$(date -u +%F); TS=$(date -u +%FT%TZ)
 BOX=${BOX:-a100b-pcie}
 MODEL_DIR=${MODEL_DIR:-/root/checkpoints/ModernBERT-large}
@@ -69,7 +78,27 @@ cargo test -p jammi-bench --features cuda -- finetune_step::tests report::tests 
 cargo test -p jammi-ai --features cuda,live-gpu-tests --lib -- --exact "$EXACT" 2>&1 | tee "$L3"
 if [ "${SKIP_FLASH_LEG:-0}" != "1" ]; then
   CARGO_TARGET_DIR=$FLASH_TARGET_DIR cargo build $FLASH_BUILD_FLAG -p jammi-bench --features cuda,jammi-encoders/flash-attn 2>&1 | tail -n 3 | tee "$L4B"
-  JAMMI_KERNELS_STRICT=1 "$FLASH_TARGET_DIR/$FLASH_PROFILE/jammi-bench" finetune-step \
+  BIN="$FLASH_TARGET_DIR/$FLASH_PROFILE/jammi-bench"
+  # --- provenance cross-check (unification contract C5.1), same shape as
+  # stacked_sweep.sh: refuse BEFORE the flash leg runs if the flash binary's
+  # own baked identity does not match the sha this invocation claims to
+  # prove. `unknown`/a `-dirty` suffix can never equal the 40-hex $SHA above,
+  # so a single string-equality check catches mismatch/unknown/dirty
+  # uniformly -- never a clip_on_flash_leg record folded into a GREEN
+  # artifact off a binary that was not built cleanly at $SHA.
+  BIN_PROV_JSON="$("$BIN" provenance 2>&1)" || {
+    echo "::error::'$BIN provenance' failed: $BIN_PROV_JSON" >&2
+    exit 1
+  }
+  BIN_PROV_SHA="$(printf '%s' "$BIN_PROV_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["build_sha"])' 2>&1)" || {
+    echo "::error::could not parse build_sha from '$BIN provenance' output: $BIN_PROV_JSON" >&2
+    exit 1
+  }
+  if [ "$BIN_PROV_SHA" != "$SHA" ]; then
+    echo "::error::'$BIN provenance' reports build_sha=$BIN_PROV_SHA, but this run proves sha=$SHA -- refusing before the flash leg runs. This single check covers three cases uniformly: a genuine mismatch, build_sha=unknown, and a '-dirty' suffix (none can ever equal the 40-hex \$SHA) -- the flash binary was not built cleanly at the sha this run claims." >&2
+    exit 1
+  fi
+  JAMMI_KERNELS_STRICT=1 "$BIN" finetune-step \
     --model-dir "$MODEL_DIR" --batch 4 --seq 256 --steps $STEPS --warmup $WARMUP \
     --lora-rank 16 --lora-alpha 32 --lora-dropout 0 --target-modules "Wqkv,Wo,Wi" \
     --backbone-dtype bf16 --cuda 0 --seed 42 --batched-forward true --max-grad-norm 1.0 \

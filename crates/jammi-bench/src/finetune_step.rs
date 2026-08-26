@@ -606,8 +606,10 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     // (`device_memory_used_bytes` above), which is a DRIVER-level allocator
     // POOL high-water mark, not live-allocated bytes — it does NOT shrink
     // back down between steps (the same convention
-    // `baselines/p1_softmax_scale_fold_ab.json` reasons about in 32 MiB pool
-    // blocks). For a monotone pool high-water, "baseline" means "before any
+    // `crates/jammi-kernels/artifacts/cuda-runs/2026-08-24-p1-softmax-fold-
+    // bf8e807-a100-sxm4.json` (unification contract C8: this RECORD moved
+    // here from its original pre-schema location under `crates/jammi-bench/`)
+    // reasons about in 32 MiB pool blocks). For a monotone pool high-water, "baseline" means "before any
     // of this run's allocation happened" — i.e. right after the model,
     // optimizer, and fixture tensors are built (`build_fixture` above) but
     // before the untimed pre-step drives the pool up. If this baseline were

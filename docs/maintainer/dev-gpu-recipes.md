@@ -51,10 +51,9 @@ A number back means you are set. `{"errors":…}` means the key is wrong.
 That is the whole required setup. `gpu-dev.sh` generates its own SSH key per
 session — nothing to register with RunPod.
 
-The shared compile cache is optional and worth it (a build measured 188s cold vs
-47s warm); see the setup block in [dev-gpu.md](dev-gpu.md). Note it needs a
-*second* credential — an S3 API key, which is not the same thing as the API key
-above.
+Compilation state lives in a per-pod build-substrate seed/clone, not an
+external compile cache — nothing extra to set up here; see
+[dev-gpu.md](dev-gpu.md) for how it works.
 
 ### Picking an arch
 
@@ -85,8 +84,9 @@ ci/scripts/gpu-dev.sh shell a40
 ci/scripts/gpu-dev.sh shell a40 --ref my-branch   # look at a branch, not main
 ```
 
-Lands you in `/root/jammi-ai` with cargo, nvcc and mold on `PATH`. **The pod is
-terminated when you exit.** Nothing survives — this is for looking, not working.
+Lands you in the default tree (`--tree jammi-ai`, the bootstrap checkout) with
+cargo, nvcc and mold on `PATH`. **The pod is terminated when you exit.**
+Nothing survives — this is for looking, not working.
 
 `--ref` takes a branch, a tag or a commit, and defaults to `main`. A branch or
 tag that does not exist is caught by `git ls-remote` *before* anything is rented;
@@ -117,9 +117,15 @@ Two things that surprise people:
   `main`; `--ref` names a different branch, tag or commit. In *this* loop leave
   it on `main` — `push` is what carries your code, and see the note below on why
   the two do not mix.
-- **`push` is `rsync --delete`**, excluding `.git`, `target/` and `.venv`. It
-  makes the pod's tree match yours exactly, so anything you edited *on the pod*
-  is destroyed. Never mix `push` with editing on the pod.
+- **`push` is `rsync -azc --no-times --delete`**, excluding `.git`, `target/`,
+  `.venv*`, `.claude`, `.sccache`, `.gpu-pull`, `scratchpad`, and the vendored
+  CUTLASS submodule (`crates/jammi-kernels/third_party/cutlass` — provisioned
+  separately by `target --with-cutlass`, never rsync'd). It makes the pod's
+  tree match yours exactly, so anything you edited *on the pod* is destroyed.
+  Never mix `push` with editing on the pod. `push` also writes
+  `.jammi-push-stamp.json` into the tree — iteration provenance only; a
+  *committed* artifact still requires a pushed sha (see
+  [dev-gpu.md](dev-gpu.md)).
 
 **Do not combine `--ref` with the push loop.** Because `push` excludes `.git`, a
 pod booted with `--ref X` and then pushed to from branch `Y` reports HEAD on `X`
@@ -217,8 +223,8 @@ ci/scripts/gpu-dev.sh pull a100 target/nextest
 ci/scripts/gpu-dev.sh pull a100 bench-results.json
 ```
 
-Paths are relative to `/root/jammi-ai`. Everything lands in `.gpu-pull/`, which
-is gitignored.
+Paths are relative to the tree acted on (`--tree`; default the bootstrap
+checkout). Everything lands in `.gpu-pull/`, which is gitignored.
 
 Do this **before** `down`. Terminating is immediate and unrecoverable.
 
@@ -237,7 +243,7 @@ That image has no toolchain, so you cannot build in it. It is for reproducing
 runtime behaviour against an artifact you already have.
 
 **It also ships no git, so this pod gets no checkout** — you land in `/root`,
-not in `/root/jammi-ai`. The tool says so before handing you the shell and
+not in a tree. The tool says so before handing you the shell and
 reports the pod as being on no ref rather than naming one that is not there
 (`<none>`, and that is what `ls` shows if you use `up` for this instead of the
 throwaway `shell`). This is the only image where an absent checkout is expected;
@@ -331,7 +337,7 @@ Include ~/.config/runpod/ssh_config
 or point your editor's remote-SSH `configFile` setting at
 `~/.config/runpod/ssh_config`.
 
-Then connect to `jammi-a100` and open `/root/jammi-ai`. A login shell there has
+Then connect to `jammi-a100` and open the default tree. A login shell there has
 cargo, rustc, nvcc and the right `CC`, which is what a remote server and language
 server need.
 
@@ -508,10 +514,15 @@ says `<none>`.
 copy is on a commit that no longer exists upstream. Bootstrap stops rather than
 build it. `down` and `up` again for a clean clone.
 
-**`::warning::sccache could not use the S3 backend`** — the cache is unreachable
-and the pod fell back to a local disk cache. Builds still work, just cold. Check
-`~/.config/runpod/s3`; note the SigV4 region must be the datacenter, and RunPod's
-documented list of S3-capable datacenters is not accurate.
+**`target: no seed at ... — run pod_seed_target.sh first`** (exit 3) — `target`
+refuses to clone without a completed seed. The seed is started automatically,
+detached, right after bootstrap (`up`/`shell`); give it time (`tmux attach -t
+=jammi-seed` on the pod to watch it), or force a fresh one with `up --reseed`.
+
+**`clone verify FAILED — a member unit reported Fresh`** — `target --verify`
+found a `jammi-*` unit that did NOT recompile on the clone's first build,
+meaning the seed was not actually member-free when it was cloned. Re-seed
+(`up --reseed`) and re-`target`.
 
 **A build fails with `-fuse-ld=mold unrecognized`** — you are in a shell that did
 not pick up the container environment. `. /root/.jammi_env` fixes it; report it,

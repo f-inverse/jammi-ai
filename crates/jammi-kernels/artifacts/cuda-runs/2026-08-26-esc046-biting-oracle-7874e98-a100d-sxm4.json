@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "unit": "esc-046-biting-oracle",
+  "git_sha": "7874e98ff3a76f4685bcdc86d115de9ceea7894d",
+  "date": "2026-08-26T17:07:55Z",
+  "box": "jammi-a100d (NVIDIA A100-SXM4-80GB, driver 580.126.16)",
+  "driver": "580.126.16",
+  "gpu": "NVIDIA A100-SXM4-80GB",
+  "features": "cuda",
+  "status": "GREEN",
+  "env": {
+    "JAMMI_REQUIRE_CUDA": "1"
+  },
+  "producer": {
+    "path": "crates/jammi-lora/tests/esc046_epilogue_biting_oracle.rs",
+    "kind": "cargo-test",
+    "invocation": "JAMMI_REQUIRE_CUDA=1 cargo test -p jammi-lora --features cuda --test esc046_epilogue_biting_oracle -- --exact fused_and_eager_arms_both_match_the_peft_reference_at_production_width_esc046 --nocapture --test-threads=1",
+    "gating": "env:JAMMI_REQUIRE_CUDA"
+  },
+  "closes_escape": "esc-046-lora-forward-epilogue-rounds-the-delta-before-the-add-vs-peft",
+  "note": "Execution provenance for esc-046's own closing biting oracle: the real LoraLinear::forward (both the fused arm, through LowRankResidualLinear's real BF16 CUDA GEMM, DispatchCounters-proven, and the eval-mode eager arm) driven at production width against an independently-built PEFT reference (real candle_nn::Linear::forward GEMMs), asserting controls (a) power of the comparison, (b) f32-truth direction, (c) non-vacuity/discriminating fixture, (d) non-finite-as-mismatch, (e) oracle lives in the crate that owns the arm, and (f) both arms asserted separately. CUDA-gated (`#![cfg(feature = \"cuda\")]`) because candle-core's CPU backend has no BF16 matmul arm at all (`Error::UnsupportedDTypeForOp(BF16, \"matmul\")`, cpu_backend/mod.rs) — neither arm's base_out GEMM would even run on CPU, independent of this fix; see the test file's own module doc. `cuda_device()` panics rather than silently skipping when JAMMI_REQUIRE_CUDA is set and no device is found, so this GREEN is proof of dispatch, not device absence. Same session also re-ran the full CUDA gate against this exact commit: `cargo fmt -p jammi-kernels -p jammi-lora --check` (both 0), `cargo clippy -p jammi-kernels --all-targets --features cuda,flash-attn -- -D warnings` (0, after `git submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass` — the submodule was not checked out on this pod's bundle-fetched branch), `cargo clippy -p jammi-lora --all-targets --features cuda -- -D warnings` (0), `JAMMI_REQUIRE_CUDA=1 cargo test -p jammi-kernels --features cuda --test cuda_parity` (91 passed, 0 failed, 1 ignored — including `lora_linear_parity_bf16_exact_integer_fixture_is_bit_exact`, whose own hand-built reference this same commit updates from the pre-esc-046 round-before-add formula to the once-rounded formula the fix ships), `cargo test -p jammi-kernels --features cuda` (304+91+... all green), `cargo test -p jammi-lora --features cuda` (all green). Built on an isolated clone (fetched via a git bundle of just this commit, checked out on a clean `/root/jammi-ai` working tree — the pod's standing checkout was verified idle first) so the git_sha checked out and tested is the exact commit this artifact cites, not a rsync'd approximation.",
+  "legs": [
+    {
+      "name": "esc046_epilogue_biting_oracle::fused_and_eager_arms_both_match_the_peft_reference_at_production_width_esc046",
+      "status": "ok",
+      "passed": 1,
+      "failed": 0,
+      "filtered_out": 0,
+      "duration_s": 1.06
+    },
+    {
+      "name": "cuda_parity::lora_linear_parity_bf16_exact_integer_fixture_is_bit_exact",
+      "status": "ok",
+      "passed": 1,
+      "failed": 0,
+      "filtered_out": 91,
+      "duration_s": 0.99
+    }
+  ]
+}

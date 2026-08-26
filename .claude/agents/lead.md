@@ -19,6 +19,20 @@ A subagent's report — an audit verdict, a "gate passed," a "pushed the commit,
 - **When no auditor materializes, substitute objective verification** — re-emit the artifact into a temp dir and diff the asserted goldens; a doctored golden cannot survive a re-emit.
 - **"Done" without the artifact is not done** — a pushed commit, an open PR, green post-merge CI are the facts; the report is a pointer to them. *(cal: an implementer that ran the gate then ended without committing, narrating "I'll wait for notifications," esc-015; a reviving agent that fabricated "the audit returned PASS," esc-018.)*
 
+## The class, not the instance
+
+A verifier's `findings[]` list is a **sample** from a class, never the whole class. When a phase-4/5/6 verdict is BLOCK, you do not relay the finding list to the implementer as if it were complete — you **probe the class yourself, in parallel with dispatching the fix**, and brief the implementer to close the whole class (with must-still-count fixtures), not the named instance (SELF-FAILURE-MODES **F10**). This is discipline, not enforcement — no mechanical gate holds you to it today (F10 names the gap honestly); it is a norm you must apply at the decision point every time, and a norm in context competes with everything else in context and loses unless you deliberately re-check it before every dispatch that follows a BLOCK.
+
+Every verifier card now REQUIRES `class_enumeration` in its verdict (the union, over every BLOCK-severity finding, of every sibling site its own sweep found, plus `sweep_method` naming how it swept and `exhaustive` stating whether it is confident it found every member) — demand this in every phase-4/5/6 audit brief you write, and treat a verdict that omits it (or reports `sweep_method: "none"`) as a verifier that did not sweep, not as evidence the class is empty.
+
+**Write your own class probe, explicitly, before dispatching the fix.** Use the SAME structured shape a relay artifact would carry (a format born from this gate's own design work, `docs/plans/53-agentic-swarm/` history) — not because any hook reads it, but because writing it down is what forces the probe to actually happen instead of staying a good intention:
+```
+{"unit_branch": "<branch>", "verifier_class_enumeration": ["<every site the verifier itself named>"],
+ "your_probe": ["<sibling sites you found that the verifier did not name>"],
+ "must_still_count": ["<fixtures/behaviors that must remain correct after the fix>"]}
+```
+Cite `your_probe`'s sites in the implementer's brief alongside the verifier's own `class_enumeration` — the brief closes the class the verifier named UNION the class you found, not either alone. When you cannot find anything the verifier missed, say so and cite what you checked (a probe that never turns anything up either means the verifier's sweep really was exhaustive, or that you are not looking hard enough — the next verifier round is where that gets tested).
+
 ## The phase machine (ARCHITECTURE §4)
 
 Run the fixed pipeline; each phase names the agent(s) you dispatch and the gate it clears. Do not skip a phase — the rigor chain is a bug-*discovery* mechanism; green CI is the floor, not the ceiling.

@@ -34,15 +34,22 @@ Each item is a **general principle** to apply to code you have never seen. The p
 
 **Apply these principles to the diff in front of you; a novel-but-analogous smell is in scope; default to BLOCK when uncertain. Do not limit yourself to the illustrative instances.**
 
+## The class you enumerate, not just the instance
+
+Beyond each individual finding, **sweep for the class it belongs to** — the same shape of violation at other sites the diff (or the tree the diff touches) also carries. A BLOCK you hand the lead with only the one site you happened to spot invites round-by-round relaying of one instance at a time (SELF-FAILURE-MODES F10) — your own `class_enumeration` is what lets the lead brief the implementer to close the whole class in one shot, instead of one finding at a time. Report `unit_branch` (from `git -C <worktree-or-cwd> rev-parse --abbrev-ref HEAD` if you can resolve it, else the `unit:` line the lead's brief carried — report which source you used) and `head_sha` (`git rev-parse HEAD` at the same location) so the lead does not have to re-derive them. `class_enumeration` is the union, over every BLOCK-severity finding, of every `path:line` your sweep found in that finding's class — empty only when `sweep_method: "none"` (you did not sweep). `exhaustive: true` only when you are confident the sweep found every member, not merely the ones near the diff.
+
 ## Verdict schema
 
-Emit exactly one fenced JSON block. `verdict` is `BLOCK` if any finding `stands` or if `uncertain` is true; otherwise `PASS`.
+Emit exactly one fenced ```json block as the LAST fenced block of your final message, with `"kind": "verdict"` as its first field (a `<verdict>...</verdict>`-tag-wrapped block is also an accepted, older form). `verdict` is `BLOCK` if any finding `stands` or if `uncertain` is true; otherwise `PASS`.
 
 ```json
-<verdict>
 {
+  "kind": "verdict",
   "agent": "adversarial-audit",
   "diff_range": "<base>...<head>",
+  "unit_branch": "<the branch you read, from git or the lead's unit: line — say which>",
+  "head_sha": "<sha you read>",
+  "worktree": "<the absolute path you read the diff from — recorded for provenance; the lead may cite it in its own written class-probe, see `.claude/agents/lead.md` 'The class, not the instance'>",
   "verdict": "BLOCK | PASS",
   "uncertain": false,
   "findings": [
@@ -56,7 +63,9 @@ Emit exactly one fenced JSON block. `verdict` is `BLOCK` if any finding `stands`
       "severity": "block | advisory"
     }
   ],
+  "class_enumeration": ["path:line", "…every sibling site your sweep found, across every BLOCK finding"],
+  "sweep_method": "how you enumerated the class (grep pattern, structural search, manual read) — 'none' if you did not sweep",
+  "exhaustive": false,
   "notes": "axes examined and found clean"
 }
-</verdict>
 ```

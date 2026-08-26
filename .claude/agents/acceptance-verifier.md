@@ -29,15 +29,22 @@ Each item is a **general principle**; apply it to any feature, novel or familiar
 
 **Apply these principles to the diff in front of you; a novel-but-analogous smell is in scope; default to BLOCK (never `verified`) when uncertain. Do not limit yourself to the illustrative instances.**
 
+## Reporting the unit, not just the diff
+
+Report `unit_branch` (`git -C <worktree> rev-parse --abbrev-ref HEAD` if resolvable, else the `unit:` line the lead's brief carried — say which) and `head_sha` (`git rev-parse HEAD` at the same location). If your verdict is `tautological`/`not-acceptance-faithful`, sweep for other acceptance tests in the same diff carrying the SAME gap shape and list them in `class_enumeration` (same convention as `adversarial-audit`/`fix-verifier`).
+
 ## Verdict schema
 
-Emit exactly one fenced JSON block. `verdict` is `verified` **only** when the acceptance test went RED at the base and GREEN on the branch, the RED was the acceptance assertion failing (not scaffolding), and the test asserts the acceptance criterion. Otherwise `tautological` (passed at the base) or `not-acceptance-faithful` (asserts an impl detail) — both are BLOCK states.
+Emit exactly one fenced ```json block as the LAST fenced block of your final message, with `"kind": "verdict"` as its first field (a `<verdict>...</verdict>`-tag-wrapped block is also an accepted, older form). `verdict` is `verified` **only** when the acceptance test went RED at the base and GREEN on the branch, the RED was the acceptance assertion failing (not scaffolding), and the test asserts the acceptance criterion. Otherwise `tautological` (passed at the base) or `not-acceptance-faithful` (asserts an impl detail) — both are BLOCK states.
 
 ```json
-<verdict>
 {
+  "kind": "verdict",
   "agent": "acceptance-verifier",
   "diff_range": "<base>...<head>",
+  "unit_branch": "<the branch you read, from git or the lead's unit: line — say which>",
+  "head_sha": "<sha you read>",
+  "worktree": "<the absolute path you read the diff from — recorded for provenance; the lead may cite it in its own written class-probe, see `.claude/agents/lead.md` 'The class, not the instance'>",
   "verdict": "verified | tautological | not-acceptance-faithful",
   "acceptance_criterion": "the phase-2 criterion the test must assert",
   "red_green": { "base_commit": "<sha>", "test_command": "…", "at_base": "RED | GREEN | not-run", "on_branch": "RED | GREEN | not-run" },
@@ -46,7 +53,9 @@ Emit exactly one fenced JSON block. `verdict` is `verified` **only** when the ac
   "findings": [
     { "issue": "why the test did not bite / passed at base / asserts an impl detail", "location": "path:line" }
   ],
+  "class_enumeration": ["path:line", "…sibling acceptance tests carrying the same gap shape, if any"],
+  "sweep_method": "how you enumerated the class — 'none' if you did not sweep",
+  "exhaustive": false,
   "notes": "isolation used (worktree + unique CARGO_TARGET_DIR)"
 }
-</verdict>
 ```

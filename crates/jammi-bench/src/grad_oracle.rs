@@ -156,9 +156,9 @@
 //! | `target_modules` | identity | `run()`'s report literal | `"target_modules": [t.strip()` (`torch_grad_oracle.py:536`) |
 //! | `batched_forward` | identity | `run()`'s report literal | `"batched_forward": args.batched_forward` (`torch_grad_oracle.py:537`) |
 //! | `backbone_dtype` | identity | `run()`'s report literal (`format!("{:?}", ..).to_lowercase()`) | `translate_dtype_flag_to_jammi_spelling(args.dtype)` (`torch_grad_oracle.py:531`) |
-//! | `checkpoint_config_sha256` | identity | `sha256_and_len(&model_dir.join("config.json"))` — called in `run()` before the forward, via the SAME shared streaming implementation `finetune_step.rs` also uses: `pub(crate) fn sha256_and_len` (`finetune_step.rs:922`) | `checkpoint_identity_fields = checkpoint_identity(args.model_dir)` (`torch_grad_oracle.py:413`) — `checkpoint_identity` is a bare alias for the real, streaming implementation torch_finetune_step.py's own `checkpoint_identity` function provides (see the two field citations directly below) |
-//! | `checkpoint_weights_sha256` | identity | `sha256_and_len(&weights)` | `"checkpoint_weights_sha256": weights_sha256` (`torch_finetune_step.py:551`) |
-//! | `checkpoint_weights_size_bytes` | identity | `sha256_and_len`'s byte-length return | `"checkpoint_weights_size_bytes": weights_len` (`torch_finetune_step.py:552`) |
+//! | `checkpoint_config_sha256` | identity | `sha256_and_len(&model_dir.join("config.json"))` — called in `run()` before the forward, via the SAME shared streaming implementation `finetune_step.rs` also uses: `pub(crate) fn sha256_and_len` (`finetune_step.rs:933`) | `checkpoint_identity_fields = checkpoint_identity(args.model_dir)` (`torch_grad_oracle.py:413`) — `checkpoint_identity` is a bare alias for the real, streaming implementation torch_finetune_step.py's own `checkpoint_identity` function provides (see the two field citations directly below) |
+//! | `checkpoint_weights_sha256` | identity | `sha256_and_len(&weights)` | `"checkpoint_weights_sha256": weights_sha256` (`torch_finetune_step.py:639`) |
+//! | `checkpoint_weights_size_bytes` | identity | `sha256_and_len`'s byte-length return | `"checkpoint_weights_size_bytes": weights_len` (`torch_finetune_step.py:640`) |
 //! | `lora_weights_in` (presence, not value) | identity (checked separately — `_premise_violations`'s `lora_weights_in` loop, not `RUN_IDENTITY_FIELDS`) | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
 //! | `batch_token_id_sums` | identity (checked separately, `or`-gated presence) | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
 //! | `model_dir` | provenance (human debugging only — a path string is not comparable across two boxes; superseded by the two checksum fields above) | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
@@ -250,10 +250,17 @@ pub struct GradOracleReport {
     /// determinant table). PROVENANCE, never compared: two producers
     /// legitimately run on different device models.
     pub device_name: String,
-    /// Best-effort `git rev-parse HEAD` against this crate's own directory —
-    /// `None` if `git` is unavailable or this binary is running outside a
-    /// git worktree. PROVENANCE, never compared (mirrors
-    /// `torch_finetune_step.py`'s `git_rev`).
+    /// This binary's own baked `build_sha` (`report::Provenance::baked`),
+    /// `None` when that resolved to the literal `"unknown"` — a COMPILE-time
+    /// value now (unification contract C2.4), never a run-time `git
+    /// rev-parse HEAD` (the deleted `tip_sha()` used to shell out to `git`
+    /// on every call; that read raced nothing and was itself correct, but
+    /// duplicated the exact same fact `build.rs` now bakes once for the
+    /// WHOLE binary, including the `-dirty` suffix `tip_sha()` never
+    /// carried). PROVENANCE, never compared (mirrors
+    /// `torch_finetune_step.py`'s own `git_rev`, which stays a genuine
+    /// run-time `git rev-parse HEAD` on the torch side — Python has no
+    /// build-time baking step).
     pub git_rev: Option<String>,
     /// sha256 of `model_dir/config.json`'s raw bytes — half of the base
     /// checkpoint's CONTENT identity (see this module's doc's determinant
@@ -277,6 +284,18 @@ pub struct GradOracleReport {
     pub batched_forward: bool,
     pub seed: u64,
     pub lora_dropout: f64,
+    /// How the LoRA `A`/`B` matrices were initialised — `run()`'s ONE
+    /// hardcoded mode (`jammi_lora::LoraInitMode::ZerosB`, see the call
+    /// site above; this tier has no `--lora-init` flag). Recorded, not
+    /// merely implied, because torch's OWN grad-oracle peer has a
+    /// `--lora-init` knob that is NOT similarly forced — a run comparing
+    /// against a torch dump that used `LoraInitMode::Gaussian` would be
+    /// comparing gradients through DIFFERENT arithmetic at step zero (see
+    /// this module's doc's determinant table for the `ZerosB` `dL/dA ==
+    /// 0` degeneracy this field lets a reader rule out as the cause of an
+    /// unexpected `dL/dA` mismatch). K7-completeness (unification contract
+    /// C3.2): part of [`GradOracleReport::IDENTITY_FIELDS`].
+    pub lora_init: jammi_lora::LoraInitMode,
     pub lora_weights_in: Option<String>,
     pub lora_weights_out: Option<String>,
     pub trainable_tensor_count: usize,
@@ -340,24 +359,47 @@ pub struct GradOracleReport {
     pub gradients: std::collections::BTreeMap<String, GradOracleTensor>,
 }
 
-/// Best-effort `git rev-parse HEAD` run against THIS crate's own directory
-/// (`CARGO_MANIFEST_DIR`) — mirrors `torch_finetune_step.py`'s `git_rev`
-/// exactly (PROVENANCE, never gates anything, never a hard error): `None` if
-/// `git` is not on `PATH`, this binary is running outside a git worktree
-/// (e.g. a packaged/vendored copy), or the command otherwise fails.
-fn tip_sha() -> Option<String> {
-    let out = std::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8(out.stdout)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+impl GradOracleReport {
+    /// K7-completeness: the 11 `compare_grad_oracle.py::RUN_IDENTITY_FIELDS`
+    /// comparison entries (§2 C2; unification contract C4.1 — UNCHANGED,
+    /// growing THAT tuple would invalidate every existing comparison), plus
+    /// two K7-completeness additions the comparison tuple omits by design:
+    /// `lora_init` (this tier's ONE hardcoded mode — see that field's own
+    /// doc) and `device_name` (provenance, never compared cross-producer —
+    /// this module's doc's determinant table). Unlike
+    /// `FinetuneStepTier::IDENTITY_FIELDS`, this report is NOT wrapped in a
+    /// [`crate::report::Report`] (it is its own standalone top-level JSON
+    /// document, written straight to `--out`), so it has no
+    /// `report.provenance` to fall back on for the report-level triple —
+    /// its own `git_rev` field (now sourced from the SAME baked
+    /// `build_sha` `Provenance::baked` computes, unification contract C2.4)
+    /// is its local provenance echo instead.
+    ///
+    /// `ci/scripts/perf/test_identity_fields_subset.py` (contract C4.2)
+    /// asserts `RUN_IDENTITY_FIELDS` ⊆ this list;
+    /// `grad_oracle_identity_fields_are_emitted` (below) asserts every
+    /// field named here is actually present on a real, serialized report.
+    pub const IDENTITY_FIELDS: &'static [(&'static str, crate::report::Nullable)] = &[
+        ("seed", crate::report::Nullable::NonNull),
+        ("batch", crate::report::Nullable::NonNull),
+        ("seq", crate::report::Nullable::NonNull),
+        ("lora_rank", crate::report::Nullable::NonNull),
+        ("lora_alpha", crate::report::Nullable::NonNull),
+        ("target_modules", crate::report::Nullable::NonNull),
+        ("batched_forward", crate::report::Nullable::NonNull),
+        ("backbone_dtype", crate::report::Nullable::NonNull),
+        ("checkpoint_config_sha256", crate::report::Nullable::NonNull),
+        (
+            "checkpoint_weights_sha256",
+            crate::report::Nullable::NonNull,
+        ),
+        (
+            "checkpoint_weights_size_bytes",
+            crate::report::Nullable::NonNull,
+        ),
+        ("lora_init", crate::report::Nullable::NonNull),
+        ("device_name", crate::report::Nullable::NonNull),
+    ];
 }
 
 /// Run the oracle and return its report. NO optimizer step — see this
@@ -553,12 +595,15 @@ pub fn run(params: &GradOracleParams) -> Result<GradOracleReport, Box<dyn std::e
         );
     }
 
-    Ok(GradOracleReport {
+    let report = GradOracleReport {
         tool: "jammi_grad_oracle",
         model_dir: params.model_dir.display().to_string(),
         device: device_label,
         device_name: device_name(params.cuda_device),
-        git_rev: tip_sha(),
+        git_rev: {
+            let provenance = crate::report::Provenance::baked();
+            (provenance.build_sha != "unknown").then(|| provenance.build_sha.to_string())
+        },
         checkpoint_config_sha256,
         checkpoint_weights_sha256,
         checkpoint_weights_size_bytes,
@@ -571,6 +616,7 @@ pub fn run(params: &GradOracleParams) -> Result<GradOracleReport, Box<dyn std::e
         batched_forward: params.batched_forward,
         seed: params.seed,
         lora_dropout: 0.0,
+        lora_init: jammi_lora::LoraInitMode::ZerosB,
         lora_weights_in: path_display(&params.lora_weights_in),
         lora_weights_out: path_display(&params.lora_weights_out),
         trainable_tensor_count: gradients.len(),
@@ -621,7 +667,12 @@ pub fn run(params: &GradOracleParams) -> Result<GradOracleReport, Box<dyn std::e
         kernels_disabled_requested,
         kernels_disabled_fired,
         gradients,
-    })
+    };
+    // K7-completeness, enforced on every real run (unification contract
+    // C3.2) — see `crate::report::assert_identity_fields_present`'s own doc.
+    let value = serde_json::to_value(&report).expect("serialize GradOracleReport for self-check");
+    crate::report::assert_identity_fields_present(&value, GradOracleReport::IDENTITY_FIELDS);
+    Ok(report)
 }
 
 fn path_display(p: &Option<PathBuf>) -> Option<String> {
@@ -995,5 +1046,37 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    /// Unification contract C3.2/C4.2: every field named in
+    /// `GradOracleReport::IDENTITY_FIELDS` must actually be present, and
+    /// non-null where declared `NonNull`, on a REAL report produced by
+    /// `run()` (never a hand-built literal standing in for one — the same
+    /// "measured, not transcribed" discipline `finetune_step_identity_
+    /// fields_are_emitted` (`report.rs`) applies to `FinetuneStepTier`).
+    /// RED at base: `IDENTITY_FIELDS` does not exist on `main`, so this
+    /// fails to COMPILE, not merely to assert.
+    #[test]
+    fn grad_oracle_identity_fields_are_emitted() {
+        let dir = tiny_model_dir();
+        assert!(
+            dir.join("config.json").exists(),
+            "fixture missing: {}",
+            dir.display()
+        );
+        let report = run(&tiny_params()).expect("grad-oracle run");
+        let value = serde_json::to_value(&report).expect("serialize GradOracleReport");
+        let obj = value.as_object().expect("object");
+        for (field, nullable) in GradOracleReport::IDENTITY_FIELDS {
+            let entry = obj
+                .get(*field)
+                .unwrap_or_else(|| panic!("IDENTITY_FIELDS names {field:?}, absent on the report"));
+            if *nullable == crate::report::Nullable::NonNull {
+                assert!(
+                    !entry.is_null(),
+                    "{field:?} is declared NonNull but serialized as null"
+                );
+            }
+        }
     }
 }

@@ -786,7 +786,7 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     let loss_first = *losses.first().expect("losses populated alongside times");
     let loss_last = *losses.last().expect("losses populated alongside times");
 
-    Ok(FinetuneStepTier {
+    let tier = FinetuneStepTier {
         device: device_label,
         device_name: device_name(params.cuda_device),
         seed: params.seed,
@@ -877,6 +877,12 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
             .declined
             .saturating_sub(attention_block_flash_dispatch_before.declined),
         flash_compiled: jammi_kernels::admission::FLASH_COMPILED,
+        // The SAME function `report::Provenance::baked` calls for
+        // `report.provenance.build_features` — never a second,
+        // independently-drifting computation (unification contract C2.2;
+        // see that function's own doc for why this tier ALSO carries its
+        // own echo rather than relying solely on the `Report` wrapper).
+        build_features: crate::report::build_features(),
         kernels_disabled_requested,
         kernels_disabled_fired,
         s_per_step_p50: Measurement::measured(p50, "s"),
@@ -888,7 +894,12 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
             Some(s) => s.finish(vram_baseline),
             None => Measurement::not_yet_measured("bytes"),
         },
-    })
+    };
+    // K7-completeness, enforced on every real run (unification contract
+    // C3.1) — see `report::assert_identity_fields_present`'s own doc.
+    let value = serde_json::to_value(&tier).expect("serialize FinetuneStepTier for self-check");
+    crate::report::assert_identity_fields_present(&value, FinetuneStepTier::IDENTITY_FIELDS);
+    Ok(tier)
 }
 
 /// The concrete device sub-class, so a recorded rate stays interpretable across

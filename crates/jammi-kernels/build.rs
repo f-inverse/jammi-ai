@@ -15,21 +15,37 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 /// Every FILE (recursively) under `dir`, sorted for a deterministic
-/// iteration order — shared by `build_cuda` and `build_flash_attn` so both
-/// walks emit `cargo:rerun-if-changed=<path>` PER FILE. A single
-/// directory-level `cargo:rerun-if-changed=<dir>` line is NOT a reliable
-/// substitute: it tracks the directory entry's OWN mtime (which changes
-/// when a file is added/removed) — an EXISTING file's CONTENT edit (the
-/// `rope_common.cuh`-only case this exists to catch) does not touch the
-/// directory's own mtime on every platform/cargo version this crate
-/// builds on, confirmed live on the reference pod (a header-only edit
-/// left the build "Fresh" — no rebuild — with only a directory-level line;
-/// the per-file walk below is what actually re-triggers `bindgen_cuda`
-/// 0.1.6's `build_ptx()`, both via Cargo's own rerun-if-changed AND via
-/// that function's internal `watch`-based staleness check — see
-/// `build_cuda`'s own comment for the second half of this fix). Gated:
-/// unused (and correctly so — no `.cu` compiles) on the plain, no-CUDA
-/// default build every other workspace crate takes.
+/// iteration order — used for TWO independent purposes `build_cuda`'s own
+/// comment details in full: emitting `cargo:rerun-if-changed=<path>` PER
+/// FILE, and feeding the newest-source-mtime computation that force-deletes
+/// a stale `.ptx` output before `bindgen_cuda`'s `build_ptx()` runs.
+///
+/// Round-3 audit reconciliation: an EARLIER revision of THIS doc comment
+/// attributed the per-file `rerun-if-changed` emission to Cargo's OWN
+/// directory-level `cargo:rerun-if-changed=<dir>` line being unreliable
+/// ("tracks the directory entry's own mtime, which an existing file's
+/// content edit does not touch"). That claim was WRONG about Cargo's own
+/// mechanism specifically: Cargo resolves a directory `rerun-if-changed`
+/// target with a RECURSIVE mtime walk (`paths::mtime_recursive` in Cargo's
+/// own source) that DOES pick up a nested file's content edit or deletion —
+/// independently confirmed both by `crates/jammi-bench/build.rs`'s own
+/// `edited_tracked_file_forces_dirty_on_rebuild` regression test (unit 61
+/// phase 1's round-2 audit) and by that unit's round-3 re-audit reproducing
+/// the directory-watch behavior directly. A single directory-level line
+/// WOULD have correctly re-run THIS SCRIPT on a header-only edit.
+///
+/// The genuinely load-bearing reason `walk_files` is still required is the
+/// SEPARATE mtime computation `build_cuda` uses to force-delete a stale
+/// `.ptx` before calling `build_ptx()`: `bindgen_cuda` 0.1.6's OWN internal
+/// per-kernel skip check (comparing that kernel's `.cu` mtime against its
+/// existing `.ptx` output) runs regardless of whether THIS script just
+/// reran, and never consults its own `watch: Vec<PathBuf>` field when
+/// deciding whether to skip nvcc (only to print more `rerun-if-changed`
+/// lines) — a header-only edit that never touches any kernel's OWN `.cu`
+/// mtime silently serves stale PTX otherwise. See `build_cuda`'s own
+/// comment for the full two-mechanism breakdown and the reference-pod
+/// reproduction. Gated: unused (and correctly so — no `.cu` compiles) on
+/// the plain, no-CUDA default build every other workspace crate takes.
 #[cfg(any(feature = "cuda", feature = "flash-attn"))]
 fn walk_files(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();

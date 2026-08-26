@@ -1,0 +1,38 @@
+{
+  "amplitudes": [
+    0.5,
+    1.0,
+    2.0,
+    4.0,
+    8.0,
+    16.0,
+    32.0,
+    64.0,
+    96.0,
+    150.0,
+    220.0,
+    300.0
+  ],
+  "compute_device": "cuda",
+  "dtype": "bfloat16",
+  "dx_torch_nonzero_elements": 4521,
+  "dx_torch_total_elements": 6144,
+  "fields": {
+    "dx_torch": "torch's real d(loss)/d(x) (bf16) -- the independent ground truth",
+    "dy": "upstream gradient (bf16), deliberately non-uniform/skewed per row",
+    "x": "raw attn_weights (bf16), the leaf tensor softmax runs on",
+    "y_f32_true": "the UNROUNDED f32 intermediate _softmax(x.float(), dim, False) actually produces -- what softmax_backward_data's `output` argument really binds to (retain_grad()-ed before the .to(bf16) cast, never rounded); this is the correct 'same f32 y' to feed an isolated backward-formula check against dx_torch",
+    "y_torch": "torch's real softmax(x) (bf16, downcast from the f32 upcast) -- for reference/debugging only, NOT what softmax_backward_data's own `output` argument binds to"
+  },
+  "generator": "crates/jammi-kernels/tests/fixtures/gen_softmax_bwd_torch_dx.py (esc-045 round 5, GH#374); run with this project's pinned torch/transformers venv, e.g. `.venv-torch-ref/bin/python3 gen_softmax_bwd_torch_dx.py`",
+  "purpose": "Independent torch-produced ground truth for jammi-kernels/tests/softmax_bwd_dscores_matches_reference_call_path.rs -- torch's REAL dx from modeling_modernbert.py:180's exact call path (nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)), not a hand-rederived formula.",
+  "schema_version": 1,
+  "seed_generator_manual_seed": 20260825,
+  "shape": [
+    12,
+    512
+  ],
+  "torch_manual_seed": 0,
+  "torch_version": "2.13.0+cu130",
+  "transformers_version_pinned_reference": "5.15.1"
+}

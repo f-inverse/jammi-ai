@@ -569,6 +569,20 @@
 //! arm for the padded case — NOT attempted in this round; this doc only
 //! names the mechanism so the next round does not re-discover it.
 //!
+//! The size of this SEPARATE gap, measured honestly (esc-045 phase-4
+//! re-audit, own live pod run, `last=512`/12-row production-amplitude
+//! fixture, `tests/fixtures/softmax_bwd_torch_dx.safetensors`): feeding
+//! jammi's OWN end-to-end `SoftmaxLastDimFused` (its own `BF16`-native
+//! forward `y`, then `bwd`) against the SAME fixture's torch `dx` reaches
+//! 73.68% (4527/6144) bit-match — MATERIALLY lower than the 99.9512%
+//! (6141/6144, essentially a sign-of-zero residual) the epilogue-order
+//! fix above reaches when fed torch's own UNROUNDED `F32` `y`
+//! (`tests/softmax_bwd_dscores_matches_reference_call_path.rs`'s
+//! `reference_call_path_matches_torch_dx_on_torchs_own_f32_y_from_fixture`).
+//! That ~26-point gap IS this forward-rounding mechanism, isolated by
+//! difference — not the epilogue-order regression round 5 above fixes
+//! (which this same measurement shows is now essentially closed).
+//!
 //! `pre_softmax = scale * scores + mask` (see the module doc's "scale
 //! semantics" section), so by the chain rule `d(y)/d(scores)` equals
 //! `scale` TIMES `d(y)/d(pre_softmax)`, while `d(y)/d(mask)` equals

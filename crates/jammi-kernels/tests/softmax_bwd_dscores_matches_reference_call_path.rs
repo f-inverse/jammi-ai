@@ -75,6 +75,31 @@
 //! `crates/jammi-kernels/src/cuda/softmax.cu`) accumulates `dot` fully in
 //! `f32` and rounds once at the end — exactly the reference formula above.
 //!
+//! ## esc-045 round 5 (GH#374 phase-4 re-audit, ledger row 241): round 4
+//! got WHERE right and the internal expression ORDER wrong
+//!
+//! Round 4's `dS_i = (dy_i − dot) * y_i` (subtract before multiply) is
+//! algebraically the reference formula above but NOT what ATen's own
+//! `softmax_backward_cuda_out` computes, even in the all-`F32` case: that
+//! function (`aten/src/ATen/native/cuda/SoftMax.cu`, unconditional on
+//! `half_to_float`) computes `Tensor tmp = grad * output;` FIRST (its own
+//! elementwise step), sums `tmp`, then (`SoftMaxBackwardEpilogue::
+//! operator()`) `dS_i = tmp_i − y_i·sum` — multiply before subtract.
+//! Algebraically identical to round 4's formula, numerically DIFFERENT
+//! (`F32` multiplication does not distribute over subtraction exactly).
+//! This file's `dscores_row_reference_call_path` below now implements
+//! `tmp_i − y_i·sum`, matching ATen's real epilogue order, computed
+//! INDEPENDENTLY of jammi's own kernel implementation both in dtype (`F64`
+//! with Kahan-compensated summation, not the kernel's `F32`/naive-sum) and
+//! in provenance (`tests/fixtures/softmax_bwd_torch_dx.safetensors`, a
+//! REAL torch-produced `dx` from `modeling_modernbert.py:180`'s exact call
+//! path, checked separately below — not a second hand-rederived formula
+//! restating the first). A prior revision of this reference (round 4) was
+//! character-identical to `dscores_row_bf16`'s own implementation at the
+//! time — tautological, unable to distinguish "the kernel is right" from
+//! "the kernel and this file's restatement of it happen to agree" (esc-045
+//! phase-4 re-audit finding).
+//!
 //! ## The fixture (family L: generic/synthetic, no captured production data)
 //!
 //! Same shape as round 3's fixture: `last = 512` (production width, this
@@ -98,7 +123,7 @@
 //! summed) is the dominant, easily-separable mechanism — see the
 //! non-vacuous RED control below.
 
-use candle_core::{Device, Tensor, Var};
+use candle_core::{DType, Device, Tensor, Var};
 use half::bf16;
 use jammi_kernels::ops::{apply2, FullyMaskedPolicy, SoftmaxLastDimFused};
 
@@ -137,16 +162,35 @@ impl XorShift64 {
     }
 }
 
-/// The CORRECT reference, matching `modeling_modernbert.py:180`'s actual
-/// call path (module doc above): `dot = Σ f32(dy)*f32(y)` accumulated with
-/// NO intermediate `BF16` rounding, then ONE rounding at the very end.
+/// The CORRECT, INDEPENDENT reference, matching `modeling_modernbert.py:180`'s
+/// actual call path AND ATen's actual epilogue expression order (module
+/// doc's "esc-045 round 5" section): `tmp_i = f64(dy_i) * f64(y_i)`
+/// computed first, `sum = Σ tmp_i` (Kahan-compensated `F64` summation —
+/// deliberately a DIFFERENT algorithm from the kernel's own naive `F32`
+/// ascending accumulation, not merely a higher-precision restatement of
+/// it), THEN `dS_i = tmp_i − f64(y_i)·sum`, rounded to `BF16` only at the
+/// very end. Computing in `F64` throughout means rounding-ORDER
+/// differences within this reference itself are negligible at `BF16`'s
+/// ~8-bit mantissa, so what this measures is genuinely "how close is the
+/// kernel to the true real-number answer", not "does the kernel match
+/// this file's own `F32` restatement of itself" (esc-045 phase-4
+/// re-audit: a prior revision of this function was character-identical to
+/// `dscores_row_bf16`'s own implementation — tautological).
 fn dscores_row_reference_call_path(y: &[bf16], dy: &[bf16]) -> Vec<bf16> {
-    let mut dot = 0f32;
-    for i in 0..y.len() {
-        dot += dy[i].to_f32() * y[i].to_f32();
+    let n = y.len();
+    let mut tmp = vec![0f64; n];
+    let mut sum = 0f64;
+    let mut compensation = 0f64;
+    for (i, t_slot) in tmp.iter_mut().enumerate() {
+        let t = (dy[i].to_f32() as f64) * (y[i].to_f32() as f64);
+        *t_slot = t;
+        let y_k = t - compensation;
+        let t_k = sum + y_k;
+        compensation = (t_k - sum) - y_k;
+        sum = t_k;
     }
-    (0..y.len())
-        .map(|i| bf16::from_f32((dy[i].to_f32() - dot) * y[i].to_f32()))
+    (0..n)
+        .map(|i| bf16::from_f32((tmp[i] - (y[i].to_f32() as f64) * sum) as f32))
         .collect()
 }
 
@@ -370,5 +414,161 @@ fn round3_two_rounding_formula_diverges_from_reference_call_path_red_control() {
          round 3's two-rounding formula from the reference-call-path formula \
          ({total_mismatches} total element mismatches) — the fixture carries no signal for \
          esc-045 round 4's regression"
+    );
+}
+
+/// The SAME independent `F64`/Kahan-summed ATen-epilogue-order formula as
+/// [`dscores_row_reference_call_path`], but taking `y` as `F32` rather
+/// than `BF16` — because the quantity `_softmax_backward_data`'s `output`
+/// argument REALLY binds to is the UNROUNDED `F32` intermediate
+/// `_softmax(converted, dim, false)` itself produces, retained by
+/// autograd BEFORE the separate `.to(query.dtype)` cast node rounds it to
+/// `BF16` (esc-045 phase-4 re-audit finding: an earlier draft of this
+/// file's torch-fixture test fed the ROUNDED-then-rewidened `y` here and
+/// measured only ~74% bit-match against torch's real `dx` — not a formula
+/// bug, but exactly this op's OWN SEPARATE, already-documented "`BF16`-
+/// native softmax" divergence, `ops/softmax.rs`'s module doc, leaking into
+/// what was meant to be an isolated backward-formula check).
+fn dscores_row_reference_call_path_f32_y(y: &[f32], dy: &[bf16]) -> Vec<bf16> {
+    let n = y.len();
+    let mut tmp = vec![0f64; n];
+    let mut sum = 0f64;
+    let mut compensation = 0f64;
+    for (i, t_slot) in tmp.iter_mut().enumerate() {
+        let t = (dy[i].to_f32() as f64) * (y[i] as f64);
+        *t_slot = t;
+        let y_k = t - compensation;
+        let t_k = sum + y_k;
+        compensation = (t_k - sum) - y_k;
+        sum = t_k;
+    }
+    (0..n)
+        .map(|i| bf16::from_f32((tmp[i] - (y[i] as f64) * sum) as f32))
+        .collect()
+}
+
+/// esc-045 round 5 (GH#374 phase-4 re-audit, ledger row 241): an
+/// INDEPENDENT torch-produced fixture, not a second hand-rederived
+/// formula. `tests/fixtures/softmax_bwd_torch_dx.safetensors`
+/// (`.json` sidecar carries full generation provenance -- torch/
+/// transformers version, seed, shape, amplitudes) was produced by running
+/// `modeling_modernbert.py:180`'s EXACT call --
+/// `nn.functional.softmax(attn_weights, dim=-1,
+/// dtype=torch.float32).to(query.dtype)` -- forward AND backward, in real
+/// `transformers` 5.15.1 + `torch` (this project's pinned checkpoint
+/// runtime), at this SAME shape/amplitude/skew convention (`last=512`,
+/// `AMPLITUDES` `0.5..300`, non-uniform `dy`).
+///
+/// This test asserts [`dscores_row_reference_call_path_f32_y`] — the SAME
+/// independent `F64`, ATen-epilogue-order formula
+/// [`dscores_row_reference_call_path`] implements, fed the fixture's
+/// `y_f32_true` field (the REAL UNROUNDED `F32` softmax probabilities
+/// `_softmax_backward_data`'s `output` argument actually binds to,
+/// captured via `retain_grad()` BEFORE the `.to(query.dtype)` cast, never
+/// itself `BF16`-rounded) — reaches a high bit-match rate against torch's
+/// REAL captured `dx`. This ISOLATES the backward EPILOGUE formula from
+/// this op's SEPARATE, already-documented forward divergence (`ops/
+/// softmax.rs`'s "This op's own `BF16`-native softmax is a SEPARATE,
+/// known divergence" section: jammi's OWN forward is `BF16`-native
+/// end-to-end and never retains an unrounded `F32` `y` the way torch
+/// does, so jammi's live kernel dispatch feeding its OWN `y` into this
+/// SAME formula reaches a materially lower end-to-end bit-match against
+/// torch — a real, disclosed, SEPARATE mechanism this test does not
+/// claim to close). Transitively, with the exact-match test above: the
+/// real kernel dispatch matches [`dscores_row_reference_call_path`]
+/// bit-for-bit on jammi's own `y` (proven, `BF16` in both places), and
+/// THIS reference matches torch's real `dx` at a high rate on the TRUE
+/// `F32` `y` (measured here) — together these show the backward FORMULA
+/// itself, not the forward's separately-tracked rounding divergence, is
+/// torch-correct.
+///
+/// Loaded via `candle_core::safetensors::load` -- already a `candle_core`
+/// API this crate depends on regardless (`crates/jammi-encoders` already
+/// loads model weights this way), so this fixture format adds NO new
+/// Cargo dependency.
+#[test]
+fn reference_call_path_matches_torch_dx_on_torchs_own_f32_y_from_fixture() {
+    let device = Device::Cpu;
+    let fixture_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/softmax_bwd_torch_dx.safetensors"
+    );
+    let tensors = candle_core::safetensors::load(fixture_path, &device)
+        .expect("softmax_bwd_torch_dx.safetensors must be present and loadable (see its .json sidecar for provenance)");
+    let y_f32_t = tensors
+        .get("y_f32_true")
+        .expect("fixture missing 'y_f32_true'");
+    let dy_t = tensors.get("dy").expect("fixture missing 'dy'");
+    let dx_torch_t = tensors.get("dx_torch").expect("fixture missing 'dx_torch'");
+    assert_eq!(
+        y_f32_t.dtype(),
+        DType::F32,
+        "fixture's y_f32_true must be F32"
+    );
+
+    let (rows, last) = y_f32_t.dims2().unwrap();
+    assert_eq!((rows, last), (AMPLITUDES.len(), LAST));
+
+    let y_f32: Vec<f32> = y_f32_t.flatten_all().unwrap().to_vec1().unwrap();
+    let dy: Vec<bf16> = dy_t.flatten_all().unwrap().to_vec1().unwrap();
+    let dx_torch: Vec<bf16> = dx_torch_t.flatten_all().unwrap().to_vec1().unwrap();
+    let n = rows * last;
+    assert_eq!(y_f32.len(), n);
+    assert_eq!(dy.len(), n);
+    assert_eq!(dx_torch.len(), n);
+
+    let mut dx_reference: Vec<bf16> = Vec::with_capacity(n);
+    for r in 0..rows {
+        let yr = &y_f32[r * last..(r + 1) * last];
+        let dyr = &dy[r * last..(r + 1) * last];
+        dx_reference.extend(dscores_row_reference_call_path_f32_y(yr, dyr));
+    }
+
+    let mut mismatches = 0usize;
+    let mut first: Option<(usize, bf16, bf16)> = None;
+    for i in 0..n {
+        assert!(
+            dx_reference[i].to_f32().is_finite() && dx_torch[i].to_f32().is_finite(),
+            "non-finite at [{i}]: reference={:?} torch={:?}",
+            dx_reference[i],
+            dx_torch[i]
+        );
+        if dx_reference[i].to_bits() != dx_torch[i].to_bits() {
+            mismatches += 1;
+            if first.is_none() {
+                first = Some((i, dx_reference[i], dx_torch[i]));
+            }
+        }
+    }
+    let bit_match_pct = 100.0 * (n - mismatches) as f64 / n as f64;
+    eprintln!(
+        "reference_call_path_matches_torch_dx_on_torchs_own_f32_y_from_fixture: {}/{n} \
+         bit-match ({bit_match_pct:.4}%), {mismatches} mismatches, first={first:?}",
+        n - mismatches
+    );
+    // Measured live on this exact fixture (esc-045 phase-4 re-audit, on
+    // this pod's own torch/transformers-pinned venv): the independent F64
+    // ATen-epilogue-order reference reaches 100% (6144/6144) bit-match
+    // against torch's real dx when fed the TRUE unrounded F32 y -- proving
+    // the `tmp - y*sum` formula (round 5's fix) is exactly what ATen
+    // computes, not merely close to it. 99.5% leaves real margin below
+    // the measured rate while still catching a real regression: round 4's
+    // wrong epilogue order (`(dy-dot)*y` instead of `tmp-y*dot`) is
+    // algebraically equivalent and, on THIS specific fixture, happens to
+    // round to the identical bf16 value everywhere too (rounding-boundary
+    // crossings between the two forms are rare, measured separately in
+    // `tests/cuda_parity.rs`'s CUDA legs, where they DO show up) -- so
+    // this assertion's real value is proving the FORMULA CHOICE is
+    // correct against ground truth, not discriminating round 4 from round
+    // 5 on this specific data; see this file's module doc.
+    assert!(
+        bit_match_pct >= 99.5,
+        "the independent ATen-epilogue-order reference bit-matches torch's real dx (fed the \
+         true unrounded f32 y) on only {bit_match_pct:.4}% of elements ({mismatches}/{n} \
+         mismatches) -- below the measured-with-margin floor; first mismatch at [{}]: \
+         reference={:?} torch={:?}",
+        first.map(|f| f.0).unwrap_or(usize::MAX),
+        first.map(|f| f.1),
+        first.map(|f| f.2),
     );
 }

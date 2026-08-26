@@ -87,6 +87,14 @@ must carry:
   (f) `producer.kind == "none"` is allowed ONLY for a path in the reviewed,
       in-script `LEGACY_NONE_ALLOWLIST` — a NEW artifact defaulting to
       `"none"` is a hard FAIL.
+  (g) KO-3 (`docs/maintainer/cuda-kernel-guide.md` §3, an instance of §3.8):
+      an OPTIONAL `oracle_separation: {healthy_max_offsample, bound,
+      min_control}` block, attached to ANY leg anywhere in the artifact
+      (found by recursing the whole document, not a fixed top-level key —
+      see `check_oracle_separation`'s own doc), asserts
+      `healthy_max_offsample < bound < min_control` when present. Absent
+      entirely on every artifact committed before this rule existed, so no
+      existing artifact reddens.
 
 Rule (d) needs REAL commit history to mean anything: `git merge-base
 --is-ancestor` on a shallow checkout (`actions/checkout`'s default
@@ -521,6 +529,77 @@ def check_readme_producer(readme_path: Path, repo_root: Path, tracked: set[str])
 # --------------------------------------------------------------------------- #
 # rule (f) — kind == "none" only for the reviewed allow-list
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# rule (g) — KO-3: `oracle_separation` (OPTIONAL per artifact leg)
+# --------------------------------------------------------------------------- #
+# `docs/maintainer/cuda-kernel-guide.md` §3's `KO-3` id (an instance of
+# §3.8's "no absolute ULP floor" discipline): a bound is not evidence of
+# real separation just because it PASSES today — an artifact MAY attach an
+# `oracle_separation: {healthy_max_offsample, bound, min_control}` block to
+# any leg (any nested object anywhere in the artifact JSON, not a fixed
+# top-level key — this repo's artifacts already carry ad hoc named legs,
+# e.g. `cuda_parity_adamw_legs`/`optimizer_phase_wall_time_ms`, so "per
+# leg" means "wherever a leg object chooses to carry it", found by
+# recursing the whole document rather than assuming one fixed shape) to
+# DEMONSTRATE, numerically, that the chosen bound sits strictly between the
+# healthiest off-sample measurement and the smallest value a real control/
+# regression would produce: `healthy_max_offsample < bound < min_control`.
+# OPTIONAL in v1 — absent entirely on every artifact committed before this
+# rule existed, so no existing artifact reddens; where present, it is
+# checked.
+ORACLE_SEPARATION_KEY = "oracle_separation"
+ORACLE_SEPARATION_FIELDS = ("healthy_max_offsample", "bound", "min_control")
+
+
+def _walk_oracle_separation_blocks(data, path: str = "$"):
+    """Yields (json_path, block_dict) for every dict anywhere in `data`
+    (recursing through nested dicts and lists) that itself carries an
+    `oracle_separation` key — the "per leg, wherever a leg carries it"
+    search the module doc above describes.
+    """
+    if isinstance(data, dict):
+        if ORACLE_SEPARATION_KEY in data:
+            yield f"{path}.{ORACLE_SEPARATION_KEY}", data[ORACLE_SEPARATION_KEY]
+        for key, value in data.items():
+            yield from _walk_oracle_separation_blocks(value, f"{path}.{key}")
+    elif isinstance(data, list):
+        for i, item in enumerate(data):
+            yield from _walk_oracle_separation_blocks(item, f"{path}[{i}]")
+
+
+def check_oracle_separation(data: dict) -> list[str]:
+    failures: list[str] = []
+    for json_path, block in _walk_oracle_separation_blocks(data):
+        if not isinstance(block, dict):
+            failures.append(f"{json_path} must be an object, got {block!r}")
+            continue
+        missing = [f for f in ORACLE_SEPARATION_FIELDS if f not in block]
+        if missing:
+            failures.append(f"{json_path} missing required field(s): {', '.join(missing)}")
+            continue
+        values: dict[str, float] = {}
+        bad_type = False
+        for f in ORACLE_SEPARATION_FIELDS:
+            v = block[f]
+            if not isinstance(v, (int, float)) or isinstance(v, bool):
+                failures.append(f"{json_path}.{f} must be a number, got {v!r}")
+                bad_type = True
+            else:
+                values[f] = float(v)
+        if bad_type:
+            continue
+        healthy = values["healthy_max_offsample"]
+        bound = values["bound"]
+        min_control = values["min_control"]
+        if not (healthy < bound < min_control):
+            failures.append(
+                f"{json_path}: healthy_max_offsample ({healthy}) < bound ({bound}) < "
+                f"min_control ({min_control}) does not hold — the bound does not "
+                "demonstrably separate healthy noise from a real control/regression"
+            )
+    return failures
+
+
 def check_none_allowlist(data: dict, relpath: str, allowlist: dict[str, str]) -> list[str]:
     producer = data.get("producer")
     if isinstance(producer, dict) and producer.get("kind") == "none" and relpath not in allowlist:
@@ -1029,6 +1108,7 @@ def validate_artifact(
         failures += check_cargo_test_gating(data, producer, repo_root)
     failures += check_none_allowlist(data, relpath, allowlist)
     failures += check_ancestry(data, repo_root)
+    failures += check_oracle_separation(data)
     return failures
 
 
@@ -1425,6 +1505,41 @@ def self_test() -> int:
         }
         expect_hit(bad, "brand-new-not-allowlisted.json", "not in the reviewed LEGACY_NONE_ALLOWLIST", "rule (f): new file defaulting to none")
 
+        # rule (g) — KO-3 oracle_separation, optional per leg -------------------
+        # GREEN: absent entirely — no existing (pre-rule) artifact reddens.
+        expect_clean(baseline(), "control-no-separation-block.json", "rule (g): oracle_separation absent is clean")
+
+        # GREEN: present, nested under an arbitrary leg name, with real
+        # separation (healthy_max_offsample < bound < min_control).
+        good_sep = baseline()
+        good_sep["some_arbitrary_leg_name"] = {
+            "oracle_separation": {
+                "healthy_max_offsample": 0.01,
+                "bound": 0.05,
+                "min_control": 0.5,
+            }
+        }
+        expect_clean(good_sep, "control-separation-ok.json", "rule (g): a genuinely-separated bound is clean")
+
+        # RED: present but the bound does NOT sit strictly between the two —
+        # no demonstrated separation.
+        bad_sep = baseline()
+        bad_sep["some_arbitrary_leg_name"] = {
+            "oracle_separation": {
+                "healthy_max_offsample": 0.05,
+                "bound": 0.05,
+                "min_control": 0.5,
+            }
+        }
+        expect_hit(bad_sep, "x.json", "does not hold", "rule (g): bound not strictly separated is caught")
+
+        # RED: missing a required field inside the block.
+        bad_sep2 = baseline()
+        bad_sep2["some_arbitrary_leg_name"] = {
+            "oracle_separation": {"healthy_max_offsample": 0.01, "bound": 0.05}
+        }
+        expect_hit(bad_sep2, "x.json", "missing required field", "rule (g): incomplete oracle_separation block is caught")
+
     # rule (g) — v2 leg identity (contract C6) -----------------------------
     # A dedicated, isolated fixture repo per case (never the real checkout),
     # exercised through `run_gate` end-to-end so the discovery walk,
@@ -1767,10 +1882,13 @@ def self_test() -> int:
         "merged_as/merged_via_pr pairing), (b) producer.path existence+tracking, (c) cargo-test "
         "static gating verification (#[ignore]/env:VAR/required-features), (d) ancestry (both the "
         "plain git_sha path and the merged_as squash-landing rescue, and its own non-ancestor RED "
-        "case), (e) README producer tracking, and (f) the none-allowlist closure (including its "
-        "C8.3 first-introduction-predates-the-gate history check) all bite on a throwaway fixture "
-        "repo; GREEN controls (ignore/env/required-features/merged_as-rescue) plus one allow-listed "
-        "none control stay clean; rule (g) v2-leg identity (missing NonNull/NullMeans fields, a "
+        "case), (e) README producer tracking, (f) the none-allowlist closure (including its C8.3 "
+        "first-introduction-predates-the-gate history check), and the OPTIONAL KO-3 "
+        "oracle_separation block (absent is clean; a genuinely-separated bound is clean; a bound "
+        "that is not strictly between healthy_max_offsample and min_control, or an incomplete "
+        "block, is caught) all bite on a throwaway fixture repo; GREEN controls "
+        "(ignore/env/required-features/merged_as-rescue/oracle_separation) plus one allow-listed "
+        "none control stay clean; v2-leg identity (missing NonNull/NullMeans fields, a "
         "present-null NullMeans pass, the build_sha/git_rev cross-check on both mismatch and "
         "unknown/-dirty, the folded-leg-must-carry-no-identity-of-its-own rule, the LEGACY_RAW_NONJSON "
         "closed-list rename-bypass rejection, and a v1 leg's unchanged no-op) all bite too; and a "

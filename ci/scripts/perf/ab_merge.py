@@ -26,22 +26,26 @@ jammi-vs-torch comparator this repo carries:
 
 | field | class | jammi emit site | torch emit site |
 |---|---|---|---|
-| `seed` | identity | `report.rs:FinetuneStepTier::seed` field; `seed: params.seed,` (`finetune_step.rs:595`) | `"seed": args.seed` (`torch_finetune_step.py:1126`) |
-| `batch` | identity | `batch: params.batch,` (`finetune_step.rs:600`) | `"batch": args.batch,` (`torch_finetune_step.py:1143`) |
-| `seq` | identity | `seq: params.seq,` (`finetune_step.rs:601`) | `"seq": args.seq,` (`torch_finetune_step.py:1144`) |
-| `lora_rank` | identity | `lora_rank: params.lora_rank,` (`finetune_step.rs:602`) | `"lora_rank": args.lora_rank,` (`torch_finetune_step.py:1145`) |
-| `lora_alpha` | identity — input was already threaded through `FinetuneStepParams::lora_alpha`, just never emitted before this round | `lora_alpha: params.lora_alpha,` (`finetune_step.rs:603`) | `"lora_alpha": args.lora_alpha,` (`torch_finetune_step.py:1119`) |
-| `lora_dropout` | identity | `lora_dropout: params.lora_dropout` (`finetune_step.rs:604`) | `"lora_dropout": args.lora_dropout,` (`torch_finetune_step.py:1146`) |
-| `margin` | identity, but jammi HARDCODES `0.3` (no `--margin` CLI flag — the call site's own literal, `let loss = triplet_loss(&a, &p, &n, 0.3)?;` (`finetune_step.rs:341`)) | `margin: 0.3,` (`finetune_step.rs:611`) | `"margin": args.margin,` (`torch_finetune_step.py:1128`) — `--margin` default `0.3` |
-| `target_modules` | identity | `target_modules: params.target_modules.clone(),` (`finetune_step.rs:612`) | `"target_modules": [` (`torch_finetune_step.py:1149`) |
-| `batched_forward` | identity | `batched_forward: params.batched_forward,` (`finetune_step.rs:613`) | `"batched_forward": args.batched_forward,` (`torch_finetune_step.py:1152`) |
-| `backbone_dtype` | identity | `backbone_dtype: format!("{:?}", params.backbone_dtype)` (`finetune_step.rs:596`) | `"backbone_dtype": args.dtype,` (`torch_finetune_step.py:1134`) |
-| `steps_measured` | identity — the reachable divergence this table used to miss entirely: two legs measured at a DIFFERENT step count (e.g. a mismatched `--steps`/`--warmup` override) still merged to a "clean" ratio before this field was compared | `steps_measured: times.len(),` (`finetune_step.rs:615`) | `"steps_measured": len(times),` (`torch_finetune_step.py:1154`) |
-| `checkpoint_config_sha256` | identity — same base-checkpoint CONTENT identity `grad_oracle.rs`'s tier already carries, added to THIS tier too | `let (checkpoint_config_sha256, _config_len) =` (`finetune_step.rs:408`), via the SHARED streaming `pub(crate) fn sha256_and_len` (`finetune_step.rs:727`) | `checkpoint_identity_fields = checkpoint_identity(args.model_dir)` (`torch_finetune_step.py:1014`) |
-| `checkpoint_weights_sha256` | identity | `let (checkpoint_weights_sha256, checkpoint_weights_size_bytes) =` (`finetune_step.rs:410`) | `"checkpoint_weights_sha256": weights_sha256,` (`torch_finetune_step.py:639`) |
-| `checkpoint_weights_size_bytes` | identity | `checkpoint_weights_size_bytes) =` (`finetune_step.rs:410`) — same call as the row above, its second return value | `"checkpoint_weights_size_bytes": weights_len,` (`torch_finetune_step.py:640`) |
-| `attn_requested` / `attn_implementation` | provenance — jammi has no `--attn` lever; recorded in `leg_provenance`, never compared (see `grad_oracle.rs`'s own table for the fuller rationale) | n/a | `"attn_requested": args.attn,` just above `"attn_implementation": resolved_attn_implementation,` (`torch_finetune_step.py:1139`) |
-| `kernels_disabled_requested` / `kernels_disabled_fired` | provenance (K-aux, landed on `main` at `c0f0e98`) — torch has no equivalent env var; recorded in `leg_provenance`, never compared | `let kernels_disabled_fired = jammi_kernels::admission::disabled_ops_fired();` (`finetune_step.rs:580`) | n/a |
+| `seed` | identity | `report.rs:FinetuneStepTier::seed` field; `seed: params.seed,` (`finetune_step.rs:792`) | `"seed": args.seed,` (`torch_finetune_step.py:1204`) |
+| `batch` | identity | `batch: params.batch,` (`finetune_step.rs:797`) | `"batch": args.batch,` (`torch_finetune_step.py:1222`) |
+| `seq` | identity | `seq: params.seq,` (`finetune_step.rs:798`) | `"seq": args.seq,` (`torch_finetune_step.py:1223`) |
+| `lora_rank` | identity | `lora_rank: params.lora_rank,` (`finetune_step.rs:799`) | `"lora_rank": args.lora_rank,` (`torch_finetune_step.py:1224`) |
+| `lora_alpha` | identity — input was already threaded through `FinetuneStepParams::lora_alpha`, just never emitted before this round | `lora_alpha: params.lora_alpha,` (`finetune_step.rs:800`) | `"lora_alpha": args.lora_alpha,` (`torch_finetune_step.py:1197`) |
+| `lora_dropout` | identity | `lora_dropout: params.lora_dropout` (`finetune_step.rs:801`) | `"lora_dropout": args.lora_dropout,` (`torch_finetune_step.py:1225`) |
+| `margin` | identity, but jammi HARDCODES `0.3` (no `--margin` CLI flag — the call site's own literal, `let loss = triplet_loss(&a, &p, &n, 0.3)?;` (`finetune_step.rs:469`)) | `margin: 0.3,` (`finetune_step.rs:808`) | `"margin": args.margin,` (`torch_finetune_step.py:1206`) — `--margin` default `0.3` |
+| `target_modules` | identity | `target_modules: params.target_modules.clone(),` (`finetune_step.rs:809`) | `"target_modules": [` (`torch_finetune_step.py:1228`) |
+| `batched_forward` | identity | `batched_forward: params.batched_forward,` (`finetune_step.rs:810`) | `"batched_forward": args.batched_forward,` (`torch_finetune_step.py:1231`) |
+| `backbone_dtype` | identity | `backbone_dtype: format!("{:?}", params.backbone_dtype)` (`finetune_step.rs:793`) | `"backbone_dtype": args.dtype,` (`torch_finetune_step.py:1213`) |
+| `steps_measured` | identity — the reachable divergence this table used to miss entirely: two legs measured at a DIFFERENT step count (e.g. a mismatched `--steps`/`--warmup` override) still merged to a "clean" ratio before this field was compared | `steps_measured: times.len(),` (`finetune_step.rs:814`) | `"steps_measured": len(times),` (`torch_finetune_step.py:1254`) |
+| `checkpoint_config_sha256` | identity — same base-checkpoint CONTENT identity `grad_oracle.rs`'s tier already carries, added to THIS tier too | `let (checkpoint_config_sha256, _config_len) =` (`finetune_step.rs:577`), via the SHARED streaming `pub(crate) fn sha256_and_len` (`finetune_step.rs:933`) | `checkpoint_identity_fields = checkpoint_identity(args.model_dir)` (`torch_finetune_step.py:1084`) |
+| `checkpoint_weights_sha256` | identity | `let (checkpoint_weights_sha256, checkpoint_weights_size_bytes) =` (`finetune_step.rs:579`) | `"checkpoint_weights_sha256": weights_sha256,` (`torch_finetune_step.py:639`) |
+| `checkpoint_weights_size_bytes` | identity | `checkpoint_weights_size_bytes) =` (`finetune_step.rs:579`) — same call as the row above, its second return value | `"checkpoint_weights_size_bytes": weights_len,` (`torch_finetune_step.py:640`) |
+| `max_grad_norm` | identity (PR #381 audit B1) — `null` (clip OFF) or the positive finite bound the PRODUCTION `clip_gradients` ran with; a clip-on leg and a clip-off leg compute a different step. `null` is a VALUE for this field (`identity_fields.FINETUNE_NULL_IS_A_VALUE_FIELDS`), never folded into MISSING | `max_grad_norm: params.max_grad_norm,` (`finetune_step.rs`'s tier literal) | `"max_grad_norm": args.max_grad_norm,` in the `finetune_step` block (`torch_finetune_step.py`) |
+| `attention_arm` | identity (PR #381 audit B1 class probe) — the attention REFERENCE CLASS the leg was ASKED to run, `"eager"` or `"fused"`; jammi's is the operator's `JAMMI_KERNELS_DISABLE` request (an attention base in `kernels_disabled_requested` ⇒ eager), NEVER the counters (a by-design domain decline is a measurement, not a premise) — see `identity_fields.FINETUNE_IDENTITY_FIELDS`'s own entry | `attention_arm: attention_arm(&kernels_disabled_requested).to_string()` (`finetune_step.rs`'s tier literal) | `"attention_arm": attention_arm_of(resolved_attn_implementation)` in the `finetune_step` block (`torch_finetune_step.py`) |
+| `warmup` | identity (PR #381 re-audit) — changes what `clip_invocations` counts (pre-step + warmup + measured) | `warmup: params.warmup,` (`finetune_step.rs`'s tier literal) | `"warmup": args.warmup,` in the `args` block (`torch_finetune_step.py`) — an `_TORCH_ARGS_LEVEL_FIELDS` member |
+| `clip_invocations` | measurement (PR #381 audit B2) — the COUNTED number of times the production clip ran this process (pre-step + warmup + measured, every `step_once`), the fact behind a clip-on row rather than a log line; recorded in `leg_provenance` per leg AND cross-checked against `max_grad_norm` by `clip_fact_violations` (clip requested ⇒ `> 0`; not requested ⇒ `== 0`) | `clip_invocations:` (`finetune_step.rs`'s tier literal, a `CLIP_INVOCATIONS` before/after delta) | `"clip_invocations": clip_counter["clip_invocations"]` (`torch_finetune_step.py`) |
+| `attn_requested` / `attn_implementation` | provenance — the RAW torch attention string (`--attn` as requested, and what HF resolved it to); the CLASS it implies is compared via `attention_arm` above, the raw string itself is recorded in `leg_provenance`, never compared (see `grad_oracle.rs`'s own table for the fuller rationale) | n/a | `"attn_requested": args.attn,` (`torch_finetune_step.py:1202`) in the `args` block; `attn_implementation` is the sibling `"attn_implementation": resolved_attn_implementation` field further down in the `finetune_step` block |
+| `kernels_disabled_requested` / `kernels_disabled_fired` | provenance (K-aux, landed on `main` at `c0f0e98`) — torch has no equivalent env var; recorded in `leg_provenance`, never compared | `let kernels_disabled_fired = jammi_kernels::admission::disabled_ops_fired();` (`finetune_step.rs:777`) | n/a |
 | `ln`/`rope`/`softmax`/`geglu`/`lora_epilogue`/`lora_linear`/`attention_block` `_fused_dispatches`/`_eager_dispatches` (14 fields) | measurement — this IS the fused-dispatch proof `fused_proof`/`dispatch_pairs` gate on, and `leg_provenance` additionally records the raw counters per config | `finetune_step.rs`'s own `*_fused_dispatches`/`*_eager_dispatches` fields | n/a |
 | `attention_block_flash_fused_dispatches` / `attention_block_flash_declined_dispatches` (P6 Stage B FA2 fold-in — a docs-ci co-sign of `origin/perf/p6-fa2-dense` @ `5886c6b`, NOT on `main` as of this table) | measurement — a CASCADE-shaped pair (`CASCADE_BASES`): no `_eager_dispatches` sibling, its fallback counter is named `_declined_dispatches` instead; absorbs `attention_block` (`ABSORBABLE_BY_ATTENTION_BLOCK_FLASH`), which in turn already absorbs `rope`/`softmax` — one chain, not a second mechanism. A report from `main`'s own binary today carries neither key at all; `dispatch_pairs`/`fused_proof` behave byte-for-byte as before such a report | `report.rs`'s `FinetuneStepTier::attention_block_flash_fused_dispatches`/`::attention_block_flash_declined_dispatches` fields on that branch (not yet in this crate's own `finetune_step.rs`) | n/a |
 | `flash_compiled` | provenance — recorded in `leg_provenance` as `jammi_flash_compiled`, never compared; distinguishes "this build cannot run flash at all" from "flash was compiled in but declined/disabled this run", and backs `fused_proof`'s own flash-disable-consistency check (see that function's doc) | `report.rs`'s `FinetuneStepTier::flash_compiled` field, same branch as above | n/a |
@@ -50,9 +54,11 @@ jammi-vs-torch comparator this repo carries:
 | `model_dir` | provenance (a path string, not compared — superseded by the checksum fields above) | `FinetuneStepParams::model_dir` (not itself emitted on the tier) | `torch_finetune_step.py`'s own `args["model_dir"]` |
 | `device` / `device_name` | provenance | `finetune_step.rs`'s own fields | `torch_finetune_step.py`'s own `provenance` block |
 
-`FINETUNE_IDENTITY_FIELDS` (below) is the tuple that actually encodes the
-**identity** rows above — the single source of truth `leg_identity_fields`/
-`leg_premise_violations` iterate.
+`identity_fields.FINETUNE_IDENTITY_FIELDS` (imported below, never redeclared
+here) is the tuple that actually encodes the **identity** rows above — the
+single source of truth `leg_identity_fields`/`leg_premise_violations`
+iterate, and the SAME declaration `report.rs`'s and `test_ab_merge.py`'s
+producer-emit pins read.
 """
 
 from __future__ import annotations
@@ -62,7 +68,11 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from identity_fields import canonicalize_identity_field  # noqa: E402
+from identity_fields import (  # noqa: E402
+    FINETUNE_IDENTITY_FIELDS,
+    FINETUNE_NULL_IS_A_VALUE_FIELDS,
+    canonicalize_identity_field,
+)
 
 LEGS = ["jammi-eager", "jammi-fused", "torch-eager", "torch-sdpa"]
 
@@ -111,22 +121,13 @@ LEGS = ["jammi-eager", "jammi-fused", "torch-eager", "torch-sdpa"]
 # table already covers, now also on the finetune-step tier (both
 # producers), replacing an implicit "the operator passed the same
 # --model-dir path" assumption with a checked record.
-FINETUNE_IDENTITY_FIELDS = (
-    "seed",
-    "batch",
-    "seq",
-    "lora_rank",
-    "lora_alpha",
-    "lora_dropout",
-    "margin",
-    "target_modules",
-    "batched_forward",
-    "backbone_dtype",
-    "steps_measured",
-    "checkpoint_config_sha256",
-    "checkpoint_weights_sha256",
-    "checkpoint_weights_size_bytes",
-)
+#
+# `max_grad_norm` / `attention_arm` (PR #381 audit B1 + the lead's class
+# probe): the tuple this module used to hand-keep here lacked BOTH — see
+# `identity_fields.FINETUNE_IDENTITY_FIELDS`'s own per-field entries. The
+# declaration now lives ONLY there (imported above); this module never
+# redeclares the set, so a field added to the shared tuple is refused here
+# generically the moment either producer fails to emit it.
 
 # torch keeps these fields one level UP from the `finetune_step` sub-block
 # (`report["args"][field]`) rather than inside it — see
@@ -134,7 +135,7 @@ FINETUNE_IDENTITY_FIELDS = (
 # new checkpoint-identity ones, which torch now emits directly inside the
 # `finetune_step` block, matching jammi's own placement) lives at the SAME
 # level `finetune_block` already reads for both producers.
-_TORCH_ARGS_LEVEL_FIELDS = frozenset({"seed", "lora_alpha", "margin"})
+_TORCH_ARGS_LEVEL_FIELDS = frozenset({"seed", "lora_alpha", "margin", "warmup"})
 
 # B2 — the DECLARED classification `fused_proof` checks a dispatch-counter
 # pair against, replacing the old blanket "(fused, eager) == (0, 0) is
@@ -369,16 +370,29 @@ def leg_identity_fields(report, leg):
     `compare_grad_oracle.py`'s own fix this round applies: `serde_json`
     serializes a NaN/inf `f64` as JSON `null`, so a NaN `lora_alpha` on
     jammi's side is reachable, not hypothetical).
+
+    EXCEPT for `identity_fields.FINETUNE_NULL_IS_A_VALUE_FIELDS` members
+    (`max_grad_norm`): there a present `null` IS the premise ("clip OFF") —
+    both producers refuse a non-finite value before running, so NaN can
+    never reach the report and `null` has exactly one meaning. An ABSENT
+    key is still `_MISSING` for those fields (a producer built before the
+    field existed cannot state its premise).
     """
     fs = finetune_block(report, leg)
     fields = {}
     for field in FINETUNE_IDENTITY_FIELDS:
         if field in _TORCH_ARGS_LEVEL_FIELDS and not leg.startswith("jammi"):
             args = report.get("args")
-            value = args.get(field) if isinstance(args, dict) else None
+            block = args if isinstance(args, dict) else {}
         else:
-            value = fs.get(field)
-        fields[field] = _MISSING if value is None else value
+            block = fs
+        if field not in block:
+            fields[field] = _MISSING
+            continue
+        value = block[field]
+        if value is None and field not in FINETUNE_NULL_IS_A_VALUE_FIELDS:
+            value = _MISSING
+        fields[field] = value
     return fields
 
 
@@ -417,6 +431,40 @@ def leg_premise_violations(jammi_fields, torch_fields):
     return violations
 
 
+def clip_fact_violations(report, leg):
+    """Per-leg COUNTED-FACT check for the clip row (PR #381 audit B2): a
+    leg's `max_grad_norm` states what was REQUESTED; its `clip_invocations`
+    is what the producer COUNTED the production clip actually doing
+    (jammi: a `CLIP_INVOCATIONS` before/after delta around `run()`'s
+    pre-step + loop; torch: `clip_counter` bumped at every
+    `clip_grad_norm_` call). The two must agree in kind — requested ⇒
+    counted `> 0`; not requested ⇒ counted `== 0` — or the row is
+    claiming a step it did not run. A leg that carries neither key (a
+    producer built before both existed) is left to `leg_premise_violations`'
+    own MISSING refusal on `max_grad_norm`; a leg that carries
+    `max_grad_norm` but no `clip_invocations` is refused HERE (a clip claim
+    with no counted fact behind it). Returns a list of strings, empty when
+    consistent.
+    """
+    fs = finetune_block(report, leg)
+    if "max_grad_norm" not in fs:
+        return []
+    requested = fs["max_grad_norm"]
+    if "clip_invocations" not in fs or fs["clip_invocations"] is None:
+        return [
+            f"{leg}: max_grad_norm={requested!r} is stated but `clip_invocations` (the counted "
+            "fact behind a clip row) is absent from this leg's record"
+        ]
+    counted = fs["clip_invocations"]
+    if not isinstance(counted, int) or isinstance(counted, bool) or counted < 0:
+        return [f"{leg}: clip_invocations must be a non-negative integer, got {counted!r}"]
+    if requested is not None and counted == 0:
+        return [f"{leg}: max_grad_norm={requested!r} was requested but clip_invocations == 0 (the clip never ran)"]
+    if requested is None and counted > 0:
+        return [f"{leg}: max_grad_norm is null (clip off) but clip_invocations == {counted} (the clip ran anyway)"]
+    return []
+
+
 def leg_provenance(report, leg):
     """PROVENANCE (recorded, never compared — see `grad_oracle.rs`'s module
     doc's determinant table for the same identity/provenance/measurement
@@ -448,6 +496,11 @@ def leg_provenance(report, leg):
             "jammi_kernels_disabled_requested": fs.get("kernels_disabled_requested"),
             "jammi_kernels_disabled_fired": fs.get("kernels_disabled_fired"),
             "jammi_flash_compiled": fs.get("flash_compiled"),
+            # PR #381 audit B2: the counted fact behind the clip row, next
+            # to the dispatch counters it is the sibling of. Cross-checked
+            # against `max_grad_norm` by `clip_fact_violations`.
+            "jammi_clip_invocations": fs.get("clip_invocations"),
+            "torch_clip_invocations": None,
         }
     args = report.get("args") if isinstance(report.get("args"), dict) else {}
     return {
@@ -457,6 +510,8 @@ def leg_provenance(report, leg):
         "jammi_kernels_disabled_requested": None,
         "jammi_kernels_disabled_fired": None,
         "jammi_flash_compiled": None,
+        "jammi_clip_invocations": None,
+        "torch_clip_invocations": fs.get("clip_invocations"),
     }
 
 
@@ -819,11 +874,11 @@ def build_report(raw_dir, steps, warmup, pass_ratio, torch_lora_init="peft"):
         else:
             proof = fused_proof(leg_metrics["jammi-fused"])
 
-        # LEG-PREMISE CHECK (fold-in, this round): compares whichever jammi
-        # leg's record is available (prefer jammi-fused, the one this
-        # sweep's own ratio/proof are computed from; fall back to
-        # jammi-eager) against whichever torch leg's is (prefer torch-sdpa
-        # for the SAME reason; fall back to torch-eager) — the two legs of
+        # LEG-PREMISE CHECK (fold-in, this round): compares the jammi-fused
+        # leg's record (the one this sweep's own ratio/proof are computed
+        # from) against the torch-sdpa leg's. The `jammi-eager`/`torch-eager`
+        # FALLBACKS below are used for PROVENANCE only — see the
+        # `leg_premise_not_comparable` note further down — the two legs of
         # ONE config are supposed to have run under the IDENTICAL
         # seed/batch/seq/dtype/dropout/lora premise (`finetune_ab.sh`'s
         # matched-flags convention), and this is the first place that
@@ -844,10 +899,37 @@ def build_report(raw_dir, steps, warmup, pass_ratio, torch_lora_init="peft"):
             jammi_provenance = leg_provenance(entries[jammi_premise_leg]["report"], jammi_premise_leg)
         if torch_premise_leg is not None:
             torch_provenance = leg_provenance(entries[torch_premise_leg]["report"], torch_premise_leg)
+        # PR #381 re-audit (class-A, face A2): a leg that is only a FALLBACK
+        # (torch-sdpa OOM'd → torch-eager; jammi-fused failed → jammi-eager)
+        # is the OTHER attention reference class, so its `attention_arm`
+        # can never match the preferred leg's — refusing that as an identity
+        # mismatch would turn a documented NON-gating outcome (an OOM row)
+        # into `INVALID` + exit 1. The row is "not comparable" instead: the
+        # identity check is SKIPPED (`leg_premise_violations` stays `None`,
+        # never an empty "checked, clean" list), the reason is recorded
+        # (`leg_premise_not_comparable`), and the ratio/verdict logic below
+        # handles the missing preferred leg exactly as before.
+        leg_premise_not_comparable = None
         if jammi_premise_leg is not None and torch_premise_leg is not None:
-            jammi_id_fields = leg_identity_fields(entries[jammi_premise_leg]["report"], jammi_premise_leg)
-            torch_id_fields = leg_identity_fields(entries[torch_premise_leg]["report"], torch_premise_leg)
-            leg_premise_violations_list = leg_premise_violations(jammi_id_fields, torch_id_fields)
+            fallbacks = [
+                f"{leg} is a fallback for {preferred} ({entries[preferred]['outcome']})"
+                for leg, preferred in ((jammi_premise_leg, "jammi-fused"), (torch_premise_leg, "torch-sdpa"))
+                if leg != preferred
+            ]
+            if fallbacks:
+                leg_premise_not_comparable = (
+                    "identity check skipped — " + "; ".join(fallbacks) + " — the two legs are "
+                    "different attention reference classes by construction, not a premise mismatch"
+                )
+            else:
+                jammi_id_fields = leg_identity_fields(entries[jammi_premise_leg]["report"], jammi_premise_leg)
+                torch_id_fields = leg_identity_fields(entries[torch_premise_leg]["report"], torch_premise_leg)
+                leg_premise_violations_list = leg_premise_violations(jammi_id_fields, torch_id_fields)
+                # PR #381 audit B2: the clip row's stated `max_grad_norm` must
+                # be backed by its own counted `clip_invocations`, per leg, on
+                # the SAME two legs the premise check compared.
+                for leg in (jammi_premise_leg, torch_premise_leg):
+                    leg_premise_violations_list.extend(clip_fact_violations(entries[leg]["report"], leg))
 
         for leg in LEGS:
             err_tail = entries[leg]["err_tail"]
@@ -975,6 +1057,7 @@ def build_report(raw_dir, steps, warmup, pass_ratio, torch_lora_init="peft"):
                 if leg_premise_violations_list is not None
                 else None
             ),
+            "leg_premise_not_comparable": leg_premise_not_comparable,
             "provenance": {"jammi": jammi_provenance, "torch": torch_provenance},
             "ratio_jammi_fused_over_torch_sdpa": ratio,
             "loss_final_ratio_jammi_fused_over_torch_sdpa": loss_ratio,

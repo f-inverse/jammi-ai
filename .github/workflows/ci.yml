@@ -90,6 +90,30 @@ jobs:
       # crate is exercised end-to-end by the `Test (Python)` job below,
       # which also runs `cargo test -p jammi-python` against the venv's
       # interpreter to cover the Rust integration test.
+      #
+      # This MUST run before "Run tests": a bare `git` in a container `run:`
+      # step hits "fatal: detected dubious ownership" (exit 128) — the
+      # checkout is owned by a different user than the container's git, and
+      # the safe.directory `actions/checkout` sets is not visible here (same
+      # trap as `dep-dag.yml`'s dep-DAG freshness step and
+      # `flash-attn-compile`'s submodule init). Unlike those two, the git
+      # call here is not a bare shell invocation but hides INSIDE
+      # `crates/jammi-bench/build.rs`'s own `git rev-parse HEAD` — and that
+      # file fails CLOSED (`git_output`'s `.ok()?` on a non-zero exit) into a
+      # baked `"unknown"` sha WITHOUT ever emitting the `.git/HEAD`/branch-ref
+      # `cargo:rerun-if-changed` watches (the `println!` for each watch is
+      # gated behind the SAME git call succeeding). If `git` is broken on
+      # THIS job's very first build of `jammi-bench` (below), cargo never
+      # learns to watch `.git/HEAD` at all — no LATER commit, however real,
+      # would ever trigger a rebuild, and the "build-sha hermeticity" step
+      # two down would fail for the wrong reason (a stale first-build cache,
+      # not a real hermeticity gap). CI run 32995714545 hit the same trap one
+      # step earlier still: the F3 step's own `git commit` died with this
+      # exact fatal before printing anything, never a genuine `before`/
+      # `after` mismatch.
+      - name: Mark the checkout safe for git (container UID != checkout UID)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - name: Run tests
         run: cargo test --workspace --exclude jammi-python
 
@@ -110,12 +134,33 @@ jobs:
       # dirty_on_rebuild` (an UNCOMMITTED edit must dirty a rebuild) and
       # `runtime_env_and_cwd_are_inert` (an ALREADY-BUILT binary must not
       # react to anything at run time) — this step is the third leg: a REAL
-      # new commit, on a REBUILD, must move the baked sha to match it.
+      # new commit, on a REBUILD, must move the baked sha to match it. This
+      # is ALSO the one place this whole unit exercises a real
+      # `actions/checkout@v4` DETACHED HEAD (`crates/jammi-bench/build.rs`'s
+      # module doc names this state explicitly): the checkout has no branch
+      # ref file to watch, so the commit below rewrites `.git/HEAD` itself —
+      # `provenance_baked.rs::detached_head_commit_moves_baked_sha_and_
+      # forces_rerun` is the same state reproduced as a fast local `#[test]`
+      # (a scratch repo, not this real checkout), so a regression here is
+      # caught long before a real CI run.
+      #
+      # The `sleep 1` between reading `A` and the commit guards state (f)
+      # from the class this step belongs to: cargo's `rerun-if-changed`
+      # staleness check compares the watched file's mtime against its own
+      # fingerprint stamp, and on a coarse (1s-granularity) filesystem an
+      # empty commit landing in the SAME second as the prior build could
+      # leave the watched file's mtime indistinguishable from "unchanged" —
+      # a false NON-hermeticity reading that has nothing to do with whether
+      # `build.rs` tracks HEAD. `sleep 1` forces the commit's mtime bump
+      # (whatever the filesystem's clock granularity) unambiguously past the
+      # first build's own stamp, so a red run here always means the tracking
+      # mechanism itself is broken, never a timing coincidence.
       - name: build-sha hermeticity (contract §6 F3)
         run: |
           set -euo pipefail
           field() { python3 -c 'import json,sys; print(json.load(sys.stdin)["'"$1"'"])'; }
           A="$(cargo run -p jammi-bench --quiet -- provenance | field build_sha)"
+          sleep 1
           git -c user.email=ci@jammi.invalid -c user.name=jammi-ci \
             commit --quiet --allow-empty -m "F3 build-sha hermeticity probe (never pushed)"
           NEW_HEAD="$(git rev-parse HEAD)"
@@ -411,6 +456,28 @@ jobs:
       # `cuda` enabled.
       - name: Compile-check jammi-encoders --features cuda,flash-attn (nvcc, no GPU)
         run: cargo check -p jammi-encoders --features cuda,flash-attn --tests
+
+      # round-5 audit NF-2 (kernel-oracle-standard): the step immediately
+      # above is the ONLY CI lane that compiles jammi-encoders' `#[cfg(feature
+      # = "cuda")] mod tests` module — but a test whose own attribute reads
+      # `#[cfg(all(feature = "cuda", not(feature = "flash-attn")))]` (the
+      # cuda-only, NOT-flash-attn meta-test verifying `flash_compiled_or_skip`
+      # panics under `JAMMI_REQUIRE_FLASH` when this build was NOT compiled
+      # with `flash-attn`) is, BY ITS OWN CFG, excluded from a `cuda,flash-attn`
+      # build — that lane enables `flash-attn`, so `not(feature = "flash-attn")`
+      # is false there. Without this second lane, that one test is compiled by
+      # ZERO CI jobs (the cfg-blind gap this audit round closed: KO-7's own
+      # gate, which only sees SOURCE TEXT, PASSes a test that no lane actually
+      # builds — a syntax break in it would first surface on a GPU pod run,
+      # not here). Same job/image/toolchain as the step above (no extra setup
+      # cost); `--tests` is required for the same reason noted there (plain
+      # `cargo check` never compiles `#[cfg(test)] mod tests` content at all).
+      # Verified on a100b (numerics owner, cited in this lane's introducing
+      # commit): `cargo test -p jammi-encoders --features cuda --no-run --list`
+      # includes `flash_compiled_or_skip_panics_under_require_flash_when_not_compiled`
+      # under this exact feature set, confirming this lane compiles it.
+      - name: Compile-check jammi-encoders --features cuda (nvcc, no GPU) — covers the NOT(flash-attn) meta-test
+        run: cargo check -p jammi-encoders --features cuda --tests
 
   oss-only-build:
     name: Guard (OSS-only build)
@@ -714,14 +781,22 @@ jobs:
           # real/noise in ci/doc_number_allowlist_classification.md) carries
           # the pre-existing debt on main at the time this gate landed.
           #
-          # ADVISORY, not required (lead ship decision, round-4): the lexical
-          # heuristic's honest noise rate on main is 36/69 = 52.2% (real:
-          # 33/69 = 47.8%; see ci/doc_number_allowlist_classification.md), so
-          # a REQUIRED scan leg would block an honest in-flight branch on its
+          # ADVISORY, not required (lead ship decision, round-4; re-measured
+          # round-5 after KO-4's own "floor"-kind detector — round-4's
+          # depth-tracking statement-boundary fix — surfaced 18 previously-
+          # invisible floor findings the table had never classified, kind
+          # count 0 -> 18; re-measured AGAIN round-6 after classifying the
+          # 23 non-floor findings the flash-attention merge landed that
+          # round 5 left unclassified): the lexical heuristic's honest
+          # noise rate over the CLASSIFIED set is now 58/110 = 52.7% (real:
+          # 52/110 = 47.3%; see ci/doc_number_allowlist_classification.md,
+          # whose header states this is a rate over what has been
+          # hand-reviewed to date, not a full-live-scan precision), so a
+          # REQUIRED scan leg would block an honest in-flight branch on its
           # own noise (the esc-045 branch alone carries 69 unallowlisted
           # findings, roughly half of them noise) rather than only on
           # genuine new violations. The scan leg reports (advisory) until
-          # precision on main reaches >= 80% real.
+          # precision reaches >= 80% real.
           # `continue_on_error: "true"` below (consumed by the shared "Run
           # guard" step's `continue-on-error` expression) marks ONLY this one
           # leg soft; `--self-test` and `--check-allowlist-only-shrinks`
@@ -862,6 +937,21 @@ jobs:
           # misroute) before this fix; was wired into no workflow at all.
           - name: reference torch_grad_oracle name-translation suite
             cmd: python3 crates/jammi-bench/reference/test_torch_grad_oracle_names.py
+          # Kernel-acceptance-oracle standard (v1) — mechanizes KO-7 (every
+          # `#[test]`-body runtime skip in crates/jammi-kernels/tests/*.rs and
+          # crates/jammi-encoders/src/*.rs must be dominated by a call to a
+          # registered require-gate helper, TOTAL over every scanned file
+          # today), and, marker-scoped, KO-2 (a marked oracle-cell's control
+          # fn covers every bound it claims) and KO-5 (a marker's derived-on
+          # and asserted-on seed sets stay disjoint). Reconciles the SHIPPED
+          # admission-key op domain against COVERED/STRUCTURALLY_EXCLUDED/
+          # PENDING the same way check_gpu_parity_matrix.py does for the
+          # device axis — v1 ships with zero markers, so every op is
+          # honestly PENDING; see docs/maintainer/cuda-kernel-guide.md §3.
+          - name: kernel oracle standard
+            cmd: python3 ci/scripts/check_kernel_oracles.py
+          - name: kernel oracle standard suite
+            cmd: python3 ci/scripts/test_check_kernel_oracles.py
     steps:
       - uses: actions/checkout@v4
         with:

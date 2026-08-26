@@ -3599,25 +3599,17 @@ mod tests {
     /// even reach this gate). Only meaningful on a build where
     /// `FLASH_COMPILED` is `false` (this crate's own default/no-`flash-attn`
     /// test build): on a `flash-attn`-compiled build `flash_compiled_or_skip`
-    /// returns `true` before ever consulting `JAMMI_REQUIRE_FLASH`, so this
-    /// asserts only the panic MESSAGE shape on that build, not the panic
-    /// itself (setting `JAMMI_REQUIRE_FLASH` there is a no-op by
-    /// construction — a `flash-attn`-compiled build should never skip).
+    /// returns `true` before ever consulting `JAMMI_REQUIRE_FLASH`, so the
+    /// panic pinned here would be unreachable on that build — rather than
+    /// compiling and skipping at runtime, this test does not compile on a
+    /// `flash-attn`-compiled build at all.
     /// Mutates the process-global `JAMMI_REQUIRE_FLASH` env var restored
     /// via a `catch_unwind`/`set_var` pair, run single-threaded by this
     /// crate's own pod convention (`--test-threads=1`) to avoid racing a
     /// real oracle test that reaches the same gate concurrently.
     #[test]
-    #[cfg(feature = "cuda")]
+    #[cfg(all(feature = "cuda", not(feature = "flash-attn")))]
     fn flash_compiled_or_skip_panics_under_require_flash_when_not_compiled() {
-        if jammi_kernels::admission::FLASH_COMPILED {
-            eprintln!(
-                "flash_compiled_or_skip_panics_under_require_flash_when_not_compiled: this \
-                 build has FLASH_COMPILED=true, so flash_compiled_or_skip always returns Ok \
-                 before consulting JAMMI_REQUIRE_FLASH -- nothing to pin on this build"
-            );
-            return;
-        }
         // SAFETY-of-test: single env var, restored before returning either
         // way (including on panic, via the `unwrap`/re-panic pattern
         // below), and this crate's pod lane runs its test suite with

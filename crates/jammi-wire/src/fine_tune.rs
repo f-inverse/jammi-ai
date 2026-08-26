@@ -312,8 +312,13 @@ pub struct FineTuneConfig {
 
     /// Maximum global L2 norm for gradient clipping. `0.0` disables clipping.
     /// Default: 1.0. Matches `train_embedding_model.py` which uses
-    /// `torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)`.
-    #[serde(default = "default_max_grad_norm")]
+    /// `torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)`. Must be
+    /// finite: refused at deserialization (`finite_max_grad_norm`, the
+    /// `deserialize_with` hook) and by [`Self::validate`].
+    #[serde(
+        default = "default_max_grad_norm",
+        deserialize_with = "finite_max_grad_norm"
+    )]
     pub max_grad_norm: f64,
 
     /// GradCache: compute the in-batch-negative loss in two passes so the
@@ -370,6 +375,30 @@ fn default_weight_decay() -> f64 {
 }
 fn default_max_grad_norm() -> f64 {
     1.0
+}
+
+/// Refuse a non-finite `max_grad_norm` at the deserialization edge, before
+/// the value can reach a training loop. `NaN` compares `false` against
+/// everything, so it would fall through the trainer's `max_norm <= 0.0`
+/// "clipping disabled" guard and scale every gradient by a NaN coefficient
+/// (the clip's own boundary refuses it too — this is the config edge, one
+/// layer earlier, so a request carrying it is refused before any model is
+/// loaded). `serde_json` already refuses the only JSON spelling of a
+/// non-finite number (an over-range literal such as `1e999` is "number out
+/// of range"); this guard makes the refusal format-independent for any
+/// other `Deserializer` — and [`FineTuneConfig::validate`] covers a config
+/// built in-process.
+fn finite_max_grad_norm<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = f64::deserialize(deserializer)?;
+    if !v.is_finite() {
+        return Err(serde::de::Error::custom(format!(
+            "max_grad_norm must be finite, got {v}"
+        )));
+    }
+    Ok(v)
 }
 
 impl Default for FineTuneConfig {
@@ -437,6 +466,17 @@ impl FineTuneConfig {
             return Err(JammiError::FineTune(
                 "gradient_accumulation_steps must be > 0".into(),
             ));
+        }
+        // Domain-validity at the edge: a NaN `max_grad_norm` compares `false`
+        // against everything, so it would pass a `<= 0.0` "disabled" check
+        // downstream and scale every gradient by NaN; ±inf is the same class
+        // of non-finite tuning parameter. `0.0` (disable) and any finite
+        // value stay legal.
+        if !self.max_grad_norm.is_finite() {
+            return Err(JammiError::FineTune(format!(
+                "max_grad_norm must be finite, got {}",
+                self.max_grad_norm
+            )));
         }
         if !(0.0..1.0).contains(&self.validation_fraction) {
             return Err(JammiError::FineTune(
@@ -577,5 +617,75 @@ mod validation_tests {
         FineTuneConfig::default()
             .validate()
             .expect("the shipped default must remain valid");
+    }
+
+    /// A non-finite `max_grad_norm` is refused at BOTH edges — `validate`
+    /// (a config built in-process) and deserialization (the
+    /// `deserialize_with` guard, driven through a value deserializer since
+    /// JSON has no spelling for NaN/inf; an over-range JSON literal is
+    /// refused by `serde_json` itself, pinned too). Mutation tried: delete
+    /// the `is_finite` guard in `finite_max_grad_norm` — the deserializer
+    /// half goes red; delete the `validate` clause — the `validate` half
+    /// goes red.
+    #[test]
+    fn nonfinite_max_grad_norm_is_refused_at_the_config_edge() {
+        use serde::de::IntoDeserializer;
+
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let cfg = FineTuneConfig {
+                max_grad_norm: bad,
+                ..Default::default()
+            };
+            let err = cfg
+                .validate()
+                .expect_err("a non-finite max_grad_norm must be refused by validate");
+            assert!(
+                err.to_string().contains("max_grad_norm"),
+                "the error must name the field: {err}"
+            );
+
+            let de: serde::de::value::F64Deserializer<serde::de::value::Error> =
+                bad.into_deserializer();
+            let err = finite_max_grad_norm(de)
+                .expect_err("a non-finite max_grad_norm must be refused at deserialization");
+            assert!(
+                err.to_string().contains("max_grad_norm"),
+                "the error must name the field: {err}"
+            );
+        }
+
+        let over_range = default_json_with_max_grad_norm("1e999");
+        assert!(
+            serde_json::from_str::<FineTuneConfig>(&over_range).is_err(),
+            "an over-range JSON literal must not deserialize"
+        );
+    }
+
+    /// The serialized default config with its `max_grad_norm` value replaced
+    /// by the literal `value` — a complete request body, not a bare field.
+    fn default_json_with_max_grad_norm(value: &str) -> String {
+        let json = serde_json::to_string(&FineTuneConfig::default()).unwrap();
+        assert!(
+            json.contains(r#""max_grad_norm":1.0"#),
+            "default shape: {json}"
+        );
+        json.replace(
+            r#""max_grad_norm":1.0"#,
+            &format!(r#""max_grad_norm":{value}"#),
+        )
+    }
+
+    /// Positive control: the refusal is narrow — the shipped default, an
+    /// explicit disable (`0.0`), and an ordinary finite value all still
+    /// deserialize and validate.
+    #[test]
+    fn finite_max_grad_norm_still_round_trips() {
+        for good in ["1.0", "0.0", "2.5"] {
+            let cfg: FineTuneConfig =
+                serde_json::from_str(&default_json_with_max_grad_norm(good)).unwrap();
+            cfg.validate().unwrap();
+            assert!(cfg.max_grad_norm.is_finite());
+            assert_eq!(cfg.max_grad_norm, good.parse::<f64>().unwrap());
+        }
     }
 }

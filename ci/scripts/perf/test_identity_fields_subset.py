@@ -2,13 +2,19 @@
 """Unification contract C4.2 — Python COMPARISON tuple ⊆ Rust K7-completeness
 const, for both jammi-vs-torch comparators this repo carries.
 
-WHAT THIS CHECKS: `ci/scripts/perf/ab_merge.py`'s `FINETUNE_IDENTITY_FIELDS`
+WHAT THIS CHECKS: `ci/scripts/perf/ab_merge.py`'s (re-exported from
+`ci/scripts/perf/identity_fields.py` as of PR #381) `FINETUNE_IDENTITY_FIELDS`
 and `ci/scripts/perf/compare_grad_oracle.py`'s `RUN_IDENTITY_FIELDS` are the
 two COMPARISON tuples a jammi-vs-torch leg-premise check actually gates on
-(contract C4.1: UNCHANGED by this unit — growing either would invalidate
-every existing merge, since torch never emits the Rust-only K7-completeness
-additions). `crates/jammi-bench/src/report.rs`'s
-`FinetuneStepTier::IDENTITY_FIELDS` and
+(contract C4.1: UNCHANGED BY THIS UNIT — growing either from WITHIN this
+unit's own phase-1 work would invalidate every existing merge, since torch
+never emits the Rust-only K7-completeness additions; it does NOT forbid
+independent upstream work with its own reason to grow a tuple — PR #381
+added `max_grad_norm`/`attention_arm`/`warmup` to `FINETUNE_IDENTITY_FIELDS`
+for its own device-clip feature, landed on `main` before this unit merged,
+and contract C3.4 explicitly names the rebase: "whichever of #381 and this
+phase lands second rebases and adds the entry" — this merge is that rebase).
+`crates/jammi-bench/src/report.rs`'s `FinetuneStepTier::IDENTITY_FIELDS` and
 `crates/jammi-bench/src/grad_oracle.rs`'s `GradOracleReport::IDENTITY_FIELDS`
 are the corresponding Rust consts (contract C3.1/C3.2) — a STRICT SUPERSET
 of the Python tuple, adding provenance/dispatch facts the comparison
@@ -18,11 +24,14 @@ deliberately omits. This suite asserts, mechanically:
      `FinetuneStepTier::IDENTITY_FIELDS`.
   2. Every entry of `RUN_IDENTITY_FIELDS` is named in
      `GradOracleReport::IDENTITY_FIELDS`.
-  3. `FINETUNE_IDENTITY_FIELDS` has EXACTLY 14 entries and
-     `RUN_IDENTITY_FIELDS` has EXACTLY 11 — the "unchanged" half of C4.1 is
-     a NUMBER this suite pins, not a promise left to prose (a silent
-     addition that happened to still satisfy the subset check would pass
-     (1)/(2) above but fail this count).
+  3. `FINETUNE_IDENTITY_FIELDS` has EXACTLY 17 entries (14 from this unit's
+     own phase 1 + `max_grad_norm`/`attention_arm`/`warmup` from PR #381,
+     merged onto this branch) and `RUN_IDENTITY_FIELDS` has EXACTLY 11 —
+     the "unchanged BY THIS UNIT" half of C4.1 is a NUMBER this suite pins,
+     not a promise left to prose (a silent addition from WITHIN this unit
+     that happened to still satisfy the subset check would pass (1)/(2)
+     above but fail this count; the count itself is bumped only in lockstep
+     with a real, externally-landed identity field, as this merge does).
 
 HOW: the two Python tuples are IMPORTED directly (this is exactly what a
 `main()` caller of either module reads, never a re-parsed copy of the
@@ -97,19 +106,23 @@ class FinetuneStepIdentityFieldsSubsetTests(unittest.TestCase):
     def setUp(self):
         self.rust_fields = set(_extract_rust_identity_fields(REPORT_RS))
 
-    def test_finetune_identity_fields_has_exactly_14_entries(self):
+    def test_finetune_identity_fields_has_exactly_17_entries(self):
         self.assertEqual(
             len(ab_merge.FINETUNE_IDENTITY_FIELDS),
-            14,
-            "ab_merge.py::FINETUNE_IDENTITY_FIELDS must stay UNCHANGED at 14 entries "
-            "(contract C4.1) — a silent growth here invalidates every existing merge",
+            17,
+            "ab_merge.py::FINETUNE_IDENTITY_FIELDS must have EXACTLY 17 entries — 14 "
+            "from unit 61 phase 1 + max_grad_norm/attention_arm/warmup from PR #381 "
+            "(contract C3.4's named rebase). A count OTHER than 17 means either this "
+            "unit grew the tuple itself (forbidden, contract C4.1) or PR #381's own "
+            "identity set changed shape after this rebase was written — either way, "
+            "re-derive this number from source, never bump it to make the test pass.",
         )
         # The tuple itself must not carry a duplicate — a dup would let the
-        # subset check below pass trivially without covering 14 distinct
+        # subset check below pass trivially without covering 17 distinct
         # comparison fields.
         self.assertEqual(
             len(set(ab_merge.FINETUNE_IDENTITY_FIELDS)),
-            14,
+            17,
             "FINETUNE_IDENTITY_FIELDS contains a duplicate entry",
         )
 

@@ -39,17 +39,53 @@
 #         source-level, corroboration. test_pod_substrate.sh exercises the
 #         SAME function against a fixture `build/*/output` tree.
 #
-# Scope note (docs-ci, PR ci/pod-build-substrate): the automated scan (i)/(ii)
+# Scope note (docs-ci, PR ci/pod-build-substrate): the STATIC scan (i)/(ii)
 # covers exactly the three sources this file documents by name — the two
 # in-workspace build.rs files plus bindgen_cuda, the one vendored dependency
 # jammi-kernels' `cuda` feature calls directly. It does NOT walk every
 # vendored build.rs in the full dependency graph (~104 packages carry one at
-# default features): most compile C/C++ via the `cc` crate without reading
-# any env var directly in their OWN build.rs (cc does that internally, see
-# [cc_1_2_57]), and the remainder are Cargo.lock-pinned, target-triple-keyed
-# inputs cargo's own fingerprint already tracks — not the "cargo says Fresh
-# while the bytes moved" hazard this manifest exists to close. Extending the
-# scan to that full set is a follow-up, not blocking this PR.
+# default features).
+#
+# round-5 correction (a100c on-pod A2 run at 80c7f59, real seed FAILURE —
+# see .jammi-seed-failed; test_pod_substrate.sh's `(s/manifest)` leg
+# replays the real a100c-observed announcements, verbatim, against this
+# manifest): this note used to claim "most [cc-based packages] compile
+# C/C++ via the `cc` crate without reading any env var directly in
+# their OWN build.rs" — that claim was FALSE. Reproduced against the real
+# vendored sources of every cc-allowlisted package in this workspace's
+# `--features jammi-kernels/cuda` graph (11 packages: blake3, cxx,
+# liblzma-sys, libsqlite3-sys, link-cplusplus, numkong, onig_sys, psm, ring,
+# usearch, zstd-sys): every one of them DOES read package-specific env vars
+# directly in its own build.rs (e.g. zstd-sys reads
+# `env::var_os("ZSTD_SYS_USE_PKG_CONFIG")` at zstd-sys-2.0.16+zstd.1.5.7/
+# build.rs:277 — see [vendored_non_cuda] below for the full, per-package,
+# EMPIRICALLY-READ set). The STATIC scan (i)/(ii) still does not walk these
+# 11 packages' build.rs (pod_seed_scan_all_vendored_buildrs's cc-allowlist
+# skips them — see that function's own citation for why a blanket literal
+# scan of a cc-based package's build.rs is NOT safe to turn on: it also
+# picks up C-preprocessor `#define`/`#[cfg(...)]` names cc's own
+# `.define()` calls forward, e.g. zstd-sys's own build.rs also carries
+# `HAVE_CONFIG_H`/`NDEBUG`/`WORDS_BIGENDIAN`-shaped literals that are NEVER
+# env var reads — a blanket per-package name-shaped-literal scan would
+# false-positive-red on those; distinguishing an `env::var(...)` CALL SITE
+# from a `.define(...)` argument mechanically, file by file, is real,
+# unstarted work, tracked as a follow-up, not attempted in this round).
+#
+# What actually catches this class today is the RUNTIME cross-check (iii):
+# pod_seed_check_stdout_subset reads the SEED's own real captured
+# `cargo:rerun-if-env-changed=` announcements (cargo runs every build
+# script for real; cc emits these for every var it actually reads,
+# regardless of which crate's build.rs called it) and checks that set
+# against this manifest — this is why [cc_1_2_57] below is now REAL
+# wildcard entries (`CC_*`, `AR_*`, ...), not merely prose documenting a
+# "computed_forms" shape that was never wired into `pod_seed_name_allowed`.
+# A REAL POD SEED BUILD is the acceptance oracle the local (hermetic,
+# no-cargo-build) suite only APPROXIMATES: this exact gap — 62 distinct
+# unlisted names from 11 packages — passed every hermetic test in this
+# repo and was caught only by running the real thing on a100c. Treat "run
+# pod_seed_target.sh for real on a live pod" as the ground truth this
+# manifest is checked against; a green hermetic suite is necessary, never
+# sufficient, evidence that the manifest is complete.
 
 [cargo]
 # The reproducibility root: fix these five/six and the rest of the graph
@@ -111,22 +147,57 @@ source = "crates/jammi-wire/build.rs"
 inputs = ["PROTOC"]
 
 [cc_1_2_57]
-# Hand-enumerated — the ONE section the automated scan cannot verify. cc's
-# own env reads execute inside the `cc` CRATE's library source when a
-# DIFFERENT crate's build.rs calls cc::Build::new()...compile(); the literal
-# strings therefore never appear in the DEPENDENT crate's own build.rs (the
-# only files RED tests (i)/(ii) read), and cc itself carries no build.rs of
-# its own (it is a plain library dependency, not a package with a build
-# script — confirmed via `cargo metadata`'s custom-build target list).
-source = "hand-enumerated: cc-1.2.57/src/lib.rs:3898-3905 (getenv_with_target_prefixes) + the cc crate README's \"External configuration via environment variables\" section"
+# Hand-enumerated — the ONE section the automated STATIC scan (i)/(ii)
+# cannot verify (see this file's header "Scope note" for why a blanket
+# per-package literal scan of a cc-based package is unsafe). cc's own env
+# reads execute inside the `cc` CRATE's library source when a DIFFERENT
+# crate's build.rs calls cc::Build::new()...compile(); the literal strings
+# therefore never appear in the DEPENDENT crate's own build.rs, and cc
+# itself carries no build.rs of its own (it is a plain library dependency,
+# not a package with a build script — confirmed via `cargo metadata`'s
+# custom-build target list).
+#
+# round-5 fix (a100c on-pod A2 run at 80c7f59): `computed_forms` below used
+# to be PROSE ONLY — three human-readable shape strings that
+# `pod_seed_name_allowed` (which only understands an exact name or a
+# literal `PREFIX*` wildcard) never actually matched against anything. The
+# real seed build on a100c announced the ACTUAL computed names (e.g.
+# `CC_x86_64_unknown_linux_gnu`, `HOST_CFLAGS`) via
+# `cargo:rerun-if-env-changed=`, all of which were genuinely UNLISTED and
+# aborted the seed. `inputs` below is now the real, matchable set, derived
+# mechanically from cc-1.2.57/src/lib.rs's own `target_envs()` (:3890-3905,
+# vendored at ~/.cargo/registry/src/*/cc-1.2.57/src/lib.rs): for a base var
+# `V` and `kind` = HOST (native) or TARGET (cross-compiling, per
+# `get_is_cross_compile()`), cc probes, in order: `V_<raw-target-triple>`,
+# `V_<target-triple-with-_-for-'-'-and-'.'>`, `<kind>_V`, then bare `V`. The
+# pod is never cross-compiling (kind is always HOST there), but TARGET_* is
+# listed too since it is the SAME mechanically-derived family, not a guess,
+# and costs nothing to allow.
+source = "cc-1.2.57/src/lib.rs:3890-3905 (target_envs/getenv_with_target_prefixes), :3926-3945 (envflags, same target_envs), :1986 (CRATE_CC_NO_DEFAULTS via get_env_boolean), src/command_helpers.rs:48,75 (CC_ENABLE_DEBUG_OUTPUT), :3951 (CC_FORCE_DISABLE via get_env_boolean) + the cc crate README's \"External configuration via environment variables\" section — reproduced live against the real a100c seed capture (scratchpad/a2-timings/80c7f59/a100c-failure/a2c.stdout)"
 inputs = [
   "CC", "CXX", "AR", "RANLIB", "CFLAGS", "CXXFLAGS", "ARFLAGS",
   "OPT_LEVEL", "DEBUG", "SDKROOT", "CRATE_CC_NO_DEFAULTS",
+  "CC_ENABLE_DEBUG_OUTPUT", "CC_FORCE_DISABLE", "CC_SHELL_ESCAPED_FLAGS",
+  "CC_KNOWN_WRAPPER_CUSTOM", "CROSS_COMPILE", "CXXSTDLIB",
+  # target-varying wildcards: `V_<target>` (raw, dash-separated) and
+  # `V_<target_with_underscores>` collapse to the SAME "V_*" prefix wildcard
+  # (pod_seed_name_allowed's "PREFIX*" match is a plain string-prefix test,
+  # so it covers both the dashed and underscored forms with one entry).
+  "CC_*", "CXX_*", "AR_*", "RANLIB_*", "CFLAGS_*", "CXXFLAGS_*",
+  "ARFLAGS_*", "CXXSTDLIB_*",
+  # `<kind>_V` forms, kind = HOST (native pod build) or TARGET
+  # (cross-compiling — not exercised on this pod today, but the SAME
+  # mechanical derivation, kept for completeness rather than re-deriving
+  # this the next time a cross build is attempted).
+  "HOST_CC", "HOST_CXX", "HOST_AR", "HOST_RANLIB", "HOST_CFLAGS",
+  "HOST_CXXFLAGS", "HOST_ARFLAGS", "HOST_CXXSTDLIB", "HOST_OPT_LEVEL",
+  "HOST_DEBUG",
+  "TARGET_CC", "TARGET_CXX", "TARGET_AR", "TARGET_RANLIB",
+  "TARGET_CFLAGS", "TARGET_CXXFLAGS", "TARGET_ARFLAGS",
+  "TARGET_CXXSTDLIB", "TARGET_OPT_LEVEL", "TARGET_DEBUG",
 ]
-computed_forms = ["<VAR>_<target>", "TARGET_<VAR>", "<kind>_<VAR>"]
 notes = [
-  "<kind> is host|target as cc's own Tool resolution distinguishes cross-compilation from native; <VAR> ranges over the base names above.",
-  "This section documents the env surface generically (it applies to every one of the ~15 registry crates that compile C/C++ via cc in this workspace's dependency graph), not per-consuming-crate — see this file's header \"Scope note\".",
+  "This section documents the env surface generically (it applies to every registry crate in this workspace's dependency graph that compiles C/C++ via cc), not per-consuming-crate — see this file's header \"Scope note\" for which mechanism (static scan vs. the seed's own runtime cross-check) actually enforces it.",
 ]
 
 [toolchain_identities]
@@ -226,6 +297,35 @@ icu_normalizer_data_and_icu_properties_data = ["ICU4X_DATA_DIR"]
 # usearch's own CPU SIMD dispatch strategy (numkong backend selection) —
 # unrelated to the CUDA/nvcc toolchain this manifest tracks.
 usearch = ["NK_DYNAMIC_DISPATCH", "NK_NATIVE_BF16", "NK_NATIVE_F16", "USEARCH_USE_NUMKONG", "USEARCH_USE_OPENMP"]
+# round-5 addition (a100c on-pod A2 run at 80c7f59 — real seed FAILURE,
+# 62 distinct unlisted names from 11 cc-allowlisted packages; see this
+# file's header "Scope note" and [cc_1_2_57]'s own citation for why the
+# STATIC scan (i)/(ii) does not walk these packages' own build.rs — the
+# entries below are read straight off the real captured seed announcement,
+# scratchpad/a2-timings/80c7f59/a100c-failure/a2c.stdout, cross-checked
+# against each package's own vendored build.rs source at the pinned
+# version). CARGO_MANIFEST_LINKS (cxx, ring) is a real, distinct var from
+# the already-tracked CARGO_MANIFEST_DIR — cargo's own reflection of a
+# package's `links = "..."` manifest key, read directly by these two
+# packages' build.rs, not itself in [non_key]'s vars list.
+cxx = ["CARGO_MANIFEST_LINKS"]
+liblzma_sys = ["LZMA_API_STATIC", "LZMA_SYS_ENABLE_THREADS"]
+libsqlite3_sys = [
+  "LIBSQLITE3_FLAGS", "LIBSQLITE3_SYS_USE_PKG_CONFIG",
+  "LIBSQLITE3_SYS_BUNDLING",
+  "SQLITE_MAX_COLUMN", "SQLITE_MAX_EXPR_DEPTH", "SQLITE_MAX_VARIABLE_NUMBER",
+]
+onig_sys = [
+  "RUSTONIG_SYSTEM_LIBONIG", "RUSTONIG_STATIC_LIBONIG", "RUSTONIG_DYNAMIC_LIBONIG",
+]
+ring = ["RING_PREGENERATE_ASM", "CARGO_MANIFEST_LINKS"]
+zstd_sys = ["ZSTD_SYS_USE_PKG_CONFIG"]
+# numkong's own CPU-target dispatch build (compiled once per SIMD target it
+# supports, gated by whether the CPU feature is available at build time) —
+# the wildcard covers every NK_TARGET_<ARCH> entry numkong's build.rs emits
+# (blake3/numkong 7.6.0's own target table; a NEW target added upstream is
+# still covered by the prefix, never a per-name addition here).
+numkong = ["NK_MARCH_NATIVE", "NK_TARGET_*", "NK_DYNAMIC_DISPATCH", "NK_NATIVE_BF16", "NK_NATIVE_F16"]
 libm = ["ENSURE_NO_PANIC"]
 wasm_bindgen_shared = ["HEAD"]
 rustversion = ["HOST"]

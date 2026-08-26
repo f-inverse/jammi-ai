@@ -69,19 +69,28 @@ set actually changed ever compiles again.
 
 This replaced an S3-backed sccache cache tried earlier: measured live on a
 real pod (fresh `CARGO_TARGET_DIR` each leg, `cargo build --release -p
-jammi-bench --features cuda`), sccache gave **zero cross-target-dir cache
+jammi-bench --features cuda`; session ledger row 17, producer
+`/root/sccache-remeasure.sh` — `.jammi/ledger/` is gitignored, so the row is
+named here rather than linked), sccache gave **zero cross-target-dir cache
 reuse** for rustc units — every populate-then-reuse pair against a fresh
 target dir re-missed everything sccache had just written — while adding
-**+33% to +38% wall clock** to every build that ran it (344s wrapper-off vs
-457-473s wrapper-on — a single "~+33%" figure previously cited only the
-low end of this range, 344→457s; the high end, 344→473s, is +37.5%). The
-wrapper is now off pod-wide
+**+33% to +37.5% wall clock** to every build that ran it (344s wrapper-off
+vs 457-473s wrapper-on: low end 344→457s is (457-344)/344 = +32.8% ≈ +33%;
+high end 344→473s is (473-344)/344 = +37.5% — a single "~+33%" figure
+previously cited only the low end, and a later revision of this line
+rounded the high end up to "+38%", which does not match the arithmetic
+either; both ends are now stated to the precision the same row actually
+supports).
+The wrapper is now off pod-wide
 (`CARGO_BUILD_RUSTC_WRAPPER=` in `/root/.jammi_env`, every shell sources it).
 
 The cargo **registry** is deliberately not cached either. It looks like the
 expensive part, since the CI image wipes `/usr/local/cargo/registry`, but a
-cold `cargo fetch --locked` measures **9s for 868 crates** on a RunPod host —
-datacenter bandwidth makes it free.
+cold `cargo fetch --locked` measures **9s for 868 crates** on a RunPod host
+(same measurement session as the sccache figures above; the specific ledger
+row for this particular number is not separately pinned in the audit trail
+this doc's other citations draw from — a follow-up, not a claim this line
+retracts) — datacenter bandwidth makes it free.
 
 Disk sizing (`RP_DISK_GB`): `>= 25` (base) `+ S_src + S_seed + N*S_clone`
 (one clone per tree the pod hosts). The exact `S_src`/`S_seed`/`S_clone` byte

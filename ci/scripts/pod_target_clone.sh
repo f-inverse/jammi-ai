@@ -91,8 +91,8 @@ rc=$?
 # `du` (apparent disk usage) vs `du --apparent-size` (logical byte count):
 # printed side by side so a reflink clone's TRUE marginal disk cost is
 # visible even though its logical size equals the seed's.
-du_default="$(du -sh "$DEST_DIR" 2>/dev/null | awk '{print $1}')"
-du_apparent="$(du -sh --apparent-size "$DEST_DIR" 2>/dev/null | awk '{print $1}')"
+du_default="$(du -sh "$DEST_DIR" 2>/dev/null | awk '{print $1}')" # tripwire-ok: best-effort report-only size; the ${du_default:-?} fallback right below prints a visible "?" sentinel, never a silent blank
+du_apparent="$(du -sh --apparent-size "$DEST_DIR" 2>/dev/null | awk '{print $1}')" # tripwire-ok: same as du_default above (also covers hosts whose du lacks --apparent-size)
 echo "clone at ${DEST_DIR}: du=${du_default:-?} du(apparent-size)=${du_apparent:-?}"
 
 # UNCONDITIONAL, round-3 audit N2: every clone is checked, not just the ones

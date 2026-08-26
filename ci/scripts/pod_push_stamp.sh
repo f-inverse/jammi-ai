@@ -87,6 +87,26 @@ pod_push_sha256_of_stdin() {
   fi
 }
 
+# round-5 addendum (round-4 audit addendum "required-tools preflight fails
+# loudly" — PARTIAL: present for pod_seed_target.sh/pod_build_timings.sh,
+# ABSENT here, the one file that ships to and runs ON the pod). Fails
+# loudly, naming every missing tool at once, BEFORE `compute`/`cutlass-
+# check` ever runs — never a silent empty hash discovered only by reading
+# the stamp JSON later (see new_findings[0] of the round-4 audit verdict:
+# a PATH with no sha256sum/shasum previously produced
+# `"manifest_sha256": ""` at rc=0).
+pod_push_assert_required_tools() {
+  local missing="" t
+  for t in git python3 rsync stat awk sort; do
+    command -v "$t" >/dev/null 2>&1 || missing="${missing}${missing:+ }${t}"
+  done
+  command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 || missing="${missing}${missing:+ }sha256sum-or-shasum"
+  if [ -n "$missing" ]; then
+    echo "::error::pod_push_assert_required_tools: missing required tool(s): ${missing}" >&2
+    return 1
+  fi
+}
+
 # The one exclude list. cutlass is excluded from push (and from this
 # manifest) because it is a git submodule OWNED by tree provisioning, never
 # by the working-tree sync — `target --with-cutlass` provisions it (`cp -a`
@@ -109,9 +129,32 @@ crates/jammi-kernels/third_party/cutlass
 EXC
 }
 
+# round-5 fix (a100c on-pod A2 run at 80c7f59, real evidence: two INDEPENDENT
+# `git clone`s of the identical bundle at the SAME commit produced two
+# DIFFERENT manifest_sha256 values — a100c b2cb2d7a..., a100e 448cc436...
+# — while laptop_head/porcelain_sha256/diff_head_sha256/cutlass_gitlink all
+# agreed, see the real stamps at scratchpad/a2-timings/80c7f59/{a100c-
+# failure,a100e}/.jammi-push-stamp.json). Root cause: the final `sort` used
+# whatever COLLATION LOCALE was ambient on each pod — two pods with
+# different locales (or none set at all, falling back to the OS default)
+# order the SAME set of (path, mode, sha) manifest lines DIFFERENTLY, so
+# the CONCATENATION this function hashes differs even though the SET of
+# lines is byte-identical. `LC_ALL=C` forces a fixed, byte-value collation
+# regardless of the host's locale — the manifest's own ORDER is now a
+# pure function of its CONTENT, never of which pod computed it.
 pod_push_manifest_sha256() { # $1=repo-root
-  local repo="$1" empty manifest
+  local repo="$1" empty manifest rel_count fail_marker
   empty="$(mktemp -d)"
+  # A sentinel FILE, not a subshell exit code: the `| while read` loop
+  # below runs in a PIPE subshell, so a bare `exit` inside it only ends
+  # that subshell — under `pipefail` (this script's own `set -uo
+  # pipefail`) the pipeline's reported status would in fact still be
+  # `sort`'s (the rightmost command, which itself always exits 0), masking
+  # the real failure. A file created inside the subshell is visible to
+  # THIS function once the pipeline finishes (subshells share the
+  # filesystem), so it is the reliable way to smuggle a failure out of a
+  # pipe subshell.
+  fail_marker="$(mktemp -u)"
   local -a rsync_excludes=()
   while IFS= read -r pat; do
     [ -n "$pat" ] || continue
@@ -130,21 +173,49 @@ pod_push_manifest_sha256() { # $1=repo-root
         # own paths.
         [ -f "$f" ] || continue
         local mode sha
-        mode="$(stat -f '%Lp' "$f" 2>/dev/null || stat -c '%a' "$f" 2>/dev/null || echo '?')"
-        sha="$(pod_push_sha256_of_file "$f" 2>/dev/null)"
+        mode="$(stat -f '%Lp' "$f" 2>/dev/null || stat -c '%a' "$f" 2>/dev/null || echo '?')" # tripwire-ok: BSD-stat-then-GNU-stat portability probe (same pattern as pod_target_clone.sh's --reflink probe); '?' is a visible, non-empty sentinel, never silent
+        sha="$(pod_push_sha256_of_file "$f")" || { echo "::error::pod_push_manifest_sha256: failed to hash ${f}" >&2; touch "$fail_marker"; continue; }
         printf '%s\t%s\t%s\n' "$rel" "$mode" "$sha"
-      done | sort > "$manifest"
+      done | LC_ALL=C sort > "$manifest"
+  if [ -e "$fail_marker" ]; then
+    rm -f "$fail_marker" "$manifest"; rm -rf "$empty"
+    echo "::error::pod_push_manifest_sha256: one or more files failed to hash — see the ::error:: line(s) above; refusing to compute a manifest digest over a partial file set" >&2
+    return 1
+  fi
+  rel_count="$(wc -l < "$manifest" | tr -d ' ')"
+  # round-5 fix (A4's own class, sibling producer): an EMPTY manifest
+  # (zero non-excluded FILES under repo-root — e.g. a repo-root that does
+  # not exist, or one whose entire content is excluded) previously hashed
+  # sha256("") and returned it as though it were a real, computed manifest
+  # digest — indistinguishable, at the JSON level, from a genuine push.
+  # Loud refusal instead: never let an empty match set read as computed.
+  if [ "${rel_count:-0}" -eq 0 ]; then
+    echo "::error::pod_push_manifest_sha256: empty manifest — rsync's dry-run listing (excludes applied) matched ZERO files under ${repo} — refusing to hash sha256('') as though it were a real manifest digest" >&2
+    rm -rf "$empty" "$manifest"
+    return 1
+  fi
   pod_push_sha256_of_file "$manifest"
   rm -rf "$empty" "$manifest"
 }
 
 pod_push_compute() { # $1=repo-root $2=session
   local repo="$1" session="$2" head porcelain_sha diff_sha manifest_sha cutlass_gitlink ts
-  head="$(git -C "$repo" rev-parse HEAD 2>/dev/null || echo unknown)"
-  porcelain_sha="$(git -C "$repo" status --porcelain 2>/dev/null | pod_push_sha256_of_stdin)"
-  diff_sha="$(git -C "$repo" diff HEAD 2>/dev/null | pod_push_sha256_of_stdin)"
-  manifest_sha="$(pod_push_manifest_sha256 "$repo")"
-  cutlass_gitlink="$(git -C "$repo" rev-parse HEAD:crates/jammi-kernels/third_party/cutlass 2>/dev/null || true)"
+  pod_push_assert_required_tools || return 1
+  head="$(git -C "$repo" rev-parse HEAD 2>/dev/null || echo unknown)" # tripwire-ok: "unknown" is a visible, non-empty sentinel for a non-git repo-root — never a silent empty string
+  porcelain_sha="$(git -C "$repo" status --porcelain 2>/dev/null | pod_push_sha256_of_stdin)" || { echo "::error::pod_push_compute: failed to hash 'git status --porcelain' output" >&2; return 1; } # tripwire-ok: git's own stderr (e.g. "not a git repository") is suppressed deliberately -- a non-git repo-root is a REAL, valid state elsewhere in this function (head reads "unknown"); the pipeline's hashing failure is what `|| return 1` catches and reports, never silently
+  diff_sha="$(git -C "$repo" diff HEAD 2>/dev/null | pod_push_sha256_of_stdin)" || { echo "::error::pod_push_compute: failed to hash 'git diff HEAD' output" >&2; return 1; } # tripwire-ok: same as porcelain_sha above
+  manifest_sha="$(pod_push_manifest_sha256 "$repo")" || { echo "::error::pod_push_compute: pod_push_manifest_sha256 failed — see the ::error:: above; refusing to emit a stamp with a missing/empty manifest_sha256" >&2; return 1; }
+  # round-5 fix (class-shaped tripwire): loud, never-silent-empty is now
+  # required for EVERY hash this stamp carries, not just manifest_sha256 —
+  # porcelain_sha/diff_sha above already `return 1` on a hashing failure;
+  # this asserts none of the THREE hashed fields came back empty (the
+  # shape a missing sha256sum/shasum on PATH produces at every call site
+  # at once, reproduced in scratchpad/audit-pb-r4/push/).
+  if [ -z "$porcelain_sha" ] || [ -z "$diff_sha" ] || [ -z "$manifest_sha" ]; then
+    echo "::error::pod_push_compute: refusing to emit a stamp with an empty hash field (porcelain_sha256='${porcelain_sha}' diff_head_sha256='${diff_sha}' manifest_sha256='${manifest_sha}') — a hashing tool is likely missing from PATH; see pod_push_assert_required_tools above" >&2
+    return 1
+  fi
+  cutlass_gitlink="$(git -C "$repo" rev-parse HEAD:crates/jammi-kernels/third_party/cutlass 2>/dev/null || true)" # tripwire-ok: a non-gitlink path (no cutlass submodule at HEAD) is a REAL, valid state — cutlass_gitlink is documented as nullable (compute's own JSON emits `None` for it); this is not the empty-hash class
   ts="$(date -u +%FT%TZ)"
   python3 -c '
 import json, sys
@@ -176,7 +247,7 @@ try:
 except Exception:
     sys.exit(0)
 print(d.get("cutlass_gitlink") or "")
-' "$stamp" 2>/dev/null)"
+' "$stamp" 2>/dev/null)" # tripwire-ok: the python body already catches the ONLY exception this can raise (malformed JSON) explicitly via try/except -> sys.exit(0) with empty stdout; 2>/dev/null only suppresses python's own already-handled traceback noise, never a real diagnostic — the empty-stdout case is itself checked (stamp_sha empty -> return 2) right below
   if [ -z "$stamp_sha" ]; then
     echo "::error::push stamp at ${stamp} has no cutlass_gitlink field (a stale pre-N1 stamp — push again)" >&2
     return 2

@@ -109,7 +109,7 @@ exec flock "${flock_args[@]}" -E 75 "$LOCK" bash -c '
   { printf "holder=%s\n" "$label"
     printf "pid=%s\n" "$$"
     printf "job=%s\n" "${JAMMI_TIMING_JOB:-}"
-    printf "started=%s\n" "$(date -u +%FT%TZ 2>/dev/null || echo unknown)"
+    printf "started=%s\n" "$(date -u +%FT%TZ 2>/dev/null || echo unknown)" # tripwire-ok: unknown is a visible non-empty sentinel for the holder-file started= field; never a silent empty timestamp
   } > "$tmp" && mv -f "$tmp" "$holder"
   trap "rm -f \"$holder\"" EXIT INT TERM
   "$@"

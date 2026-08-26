@@ -47,7 +47,16 @@
 # not mocked, genuinely exercising the kernel's own lock semantics.
 #
 # Run: bash ci/scripts/test_pod_substrate.sh
-# Hermetic: no network, no GPU, no real RunPod account, no cargo build.
+# Hermetic: no network, no GPU, no real RunPod account. round-5 correction
+# (family O — this line itself used to claim "no cargo build", which was
+# in TENSION with pod_seed_target.sh:352-355's own claim that this suite
+# builds a real library-crate fixture — round-4 audit advisory: "these two
+# must be made to agree, whichever way A2's proof clause is settled"):
+# settled in favour of the real build. The `(q/A2)` leg DOES run a real,
+# tiny, offline `cargo build`/`cargo build --release`/`cargo clean` cycle
+# (a two-member scratch workspace under `mktemp -d`, no network — Cargo
+# resolves nothing beyond std) — everything else in this suite still avoids
+# cargo build/test/clippy entirely (stubbed or structural).
 set -uo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -950,16 +959,51 @@ DRV
   [ "$rc" -eq 0 ] && ok "(l/N4) a conforming capture (real manifest names, non-empty) passes cleanly" \
     || bad "(l/N4) a conforming capture unexpectedly failed (rc=$rc): $out"
 
-  # Leg 4: a captured-but-EMPTY file (bytes) also reddens — a distinct
-  # defect from an empty DIRECTORY (leg 2).
+  # Leg 4: round-5 correction (a100c on-pod A2 run at 80c7f59) — a
+  # captured-but-EMPTY (zero-byte) `output` file is a LEGITIMATE "the
+  # build script announced nothing" state (cargo writes this file for
+  # every build script it runs, REGARDLESS of whether it prints anything),
+  # never a defect on its own. A prior round's fix wrongly flagged every
+  # such file as an error; a real seed build on this workspace's own
+  # `--features jammi-kernels/cuda` graph legitimately captures several
+  # (chrono-tz, rustls, snap, ...) and the OLD form would have aborted
+  # every real seed. This leg now asserts the FIXED, non-false-positive
+  # behavior directly, plus a revert-RED proving the old per-file-empty
+  # check really did fire (so this is a genuine behavior change, not a
+  # vacuous no-op).
   N4_EMPTYFILE="$SANDBOX/n4_emptyfile"
   rm -rf "$N4_EMPTYFILE"; mkdir -p "$N4_EMPTYFILE"
-  : > "$N4_EMPTYFILE/release__jammi-kernels-abc.output"
+  printf 'cargo:rerun-if-env-changed=NVCC\n' > "$N4_EMPTYFILE/release__jammi-kernels-abc.output"
+  : > "$N4_EMPTYFILE/release__chrono-tz-def.output"
   out="$(bash "$N4_DRIVER" "$N4_EMPTYFILE" 2>&1)"; rc=$?
-  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'EMPTY'; then
-    ok "(l/N4) a captured-but-zero-byte output file reddens the cross-check"
+  if [ "$rc" -eq 0 ]; then
+    ok "(l/N4) a legitimately zero-byte captured output file (alongside a real one) passes cleanly — cargo writes this file for every build script regardless of whether it prints anything"
   else
-    bad "(l/N4) expected RED for a zero-byte captured file (rc=$rc): $out"
+    bad "(l/N4) a zero-byte captured output file should NOT redden the cross-check on its own (rc=$rc): $out"
+  fi
+
+  # revert-RED: the OLD per-file "zero bytes -> error" rule, reproduced
+  # against the SAME fixture, to prove this is a genuine behavior change.
+  N4_OLD_CHECK_SCRIPT="$SANDBOX/n4_old_check.sh"
+  cat > "$N4_OLD_CHECK_SCRIPT" <<'DRV'
+#!/usr/bin/env bash
+set -uo pipefail
+bad=0
+for f in "$1"/*; do
+  [ -f "$f" ] || continue
+  if [ ! -s "$f" ]; then
+    echo "OLD-RULE: captured build-script output file is EMPTY: $f"
+    bad=1
+  fi
+done
+exit "$bad"
+DRV
+  chmod +x "$N4_OLD_CHECK_SCRIPT"
+  old_out="$(bash "$N4_OLD_CHECK_SCRIPT" "$N4_EMPTYFILE" 2>&1)"; old_rc=$?
+  if [ "$old_rc" -ne 0 ] && printf '%s' "$old_out" | grep -q 'chrono-tz'; then
+    ok "(l/N4 revert-RED) the OLD per-file empty-is-an-error rule genuinely DOES fire on the SAME zero-byte fixture — confirming the round-5 fix is a real behavior change, not a vacuous no-op"
+  else
+    bad "(l/N4 revert-RED) the old-rule reproduction did not fire as expected (rc=$old_rc): $old_out"
   fi
 }
 
@@ -1006,14 +1050,24 @@ DRV
   [ $? -eq 2 ] && ok "(m/N1) cutlass-check returns 2 (not usable) for a stale pre-N1 stamp with no cutlass_gitlink field" \
     || bad "(m/N1) expected exit 2 for a stamp with no cutlass_gitlink field"
 
-  # gpu-dev.sh's target --with-cutlass remote block must actually CALL
-  # cutlass-check (never a re-implemented comparison) — a structural check
-  # that the wiring above is used, not merely available (ssh is never
-  # mocked, so the remote invocation itself is not exercised end to end).
-  if grep -q 'pod_push_stamp.sh cutlass-check' "$REPO_ROOT/ci/scripts/gpu-dev.sh"; then
-    ok "(m/N1) gpu-dev.sh's target --with-cutlass invokes pod_push_stamp.sh cutlass-check"
+  # gpu-dev.sh's target --with-cutlass remote block must actually DELEGATE
+  # to pod_provision_cutlass.sh (round-5: the logic was extracted out of
+  # gpu-dev.sh's own heredoc — see that file's own module doc for why a
+  # heredoc-embedded copy was the round-4 class this round closes), which
+  # in turn must actually CALL cutlass-check (never a re-implemented
+  # comparison) — a structural check that the wiring is used, not merely
+  # available (ssh is never mocked, so the remote invocation itself is not
+  # exercised end to end here; the REAL mechanism fixture is below).
+  PROVISION_SH="$REPO_ROOT/ci/scripts/pod_provision_cutlass.sh"
+  if grep -q 'pod_provision_cutlass.sh' "$REPO_ROOT/ci/scripts/gpu-dev.sh"; then
+    ok "(m/N1) gpu-dev.sh's target --with-cutlass delegates to pod_provision_cutlass.sh"
   else
-    bad "(m/N1) gpu-dev.sh's target --with-cutlass does not call pod_push_stamp.sh cutlass-check"
+    bad "(m/N1) gpu-dev.sh's target --with-cutlass does not delegate to pod_provision_cutlass.sh"
+  fi
+  if grep -q 'pod_push_stamp.sh cutlass-check' "$PROVISION_SH"; then
+    ok "(m/N1) pod_provision_cutlass.sh invokes pod_push_stamp.sh cutlass-check"
+  else
+    bad "(m/N1) pod_provision_cutlass.sh does not call pod_push_stamp.sh cutlass-check"
   fi
 
   # round-4 addendum: `cp -a` of the cutlass submodule copies its own
@@ -1023,15 +1077,14 @@ DRV
   # remote heredoc only runs on a live pod) for the SOURCE TEXT: the
   # gitlink must be stripped from the destination and its absence asserted,
   # never left in place; EXECUTABLE against a real fixture for the actual
-  # mechanism (extracted from gpu-dev.sh's own heredoc bytes, never a
+  # mechanism (pod_provision_cutlass.sh's own real bytes, never a
   # reimplementation) to prove `cp -a` really does copy `.git` and the
   # strip really does remove it while preserving real content.
-  GD_SH="$REPO_ROOT/ci/scripts/gpu-dev.sh"
-  if grep -q "rm -rf '\${NAME_SOURCE_TREE_DIR}/crates/jammi-kernels/third_party/cutlass/.git'" "$GD_SH" \
-     && grep -q "\[ -e '\${NAME_SOURCE_TREE_DIR}/crates/jammi-kernels/third_party/cutlass/.git' \] &&" "$GD_SH"; then
-    ok "(m/A6) gpu-dev.sh's target --with-cutlass strips the copied .git gitlink and asserts its absence"
+  if grep -q 'rm -rf "\$TREE_SOURCE_DIR/crates/jammi-kernels/third_party/cutlass/.git"' "$PROVISION_SH" \
+     && grep -q '\[ -e "\$TREE_SOURCE_DIR/crates/jammi-kernels/third_party/cutlass/.git" \]' "$PROVISION_SH"; then
+    ok "(m/A6) pod_provision_cutlass.sh strips the copied .git gitlink and asserts its absence"
   else
-    bad "(m/A6) gpu-dev.sh's target --with-cutlass does not strip+assert-absent the copied cutlass/.git"
+    bad "(m/A6) pod_provision_cutlass.sh does not strip+assert-absent the copied cutlass/.git"
   fi
 
   M6_SRC="$SANDBOX/m6_cutlass_src"
@@ -1052,6 +1105,171 @@ DRV
     ok "(m/A6) stripping .git removes the foreign gitlink while preserving real cutlass content"
   else
     bad "(m/A6) strip either left .git behind or damaged real content"
+  fi
+}
+
+# ═════════════════════════════════════════════════════════════════════════
+# (m/A1) round-5 audit A1 (the load-bearing finding): pod_provision_cutlass.sh
+# run for REAL — not a heredoc grep — against a genuine two-commit
+# submodule fixture (the auditor's own reproduction, adopted verbatim: a
+# real upstream cutlass repo with two commits, a real superproject with a
+# real submodule, a real destination tree with a push stamp). Four legs:
+# match -> copy; drift -> remediation fetch+checkout -> re-verify OK ->
+# copy; no submodule registered ("deinit") -> refuse; unreachable stamped
+# sha -> loud fetch-failure refuse. Plus the revert-RED: restoring the
+# bare-command form under `set -e` (the exact round-4 regression) stops at
+# MISMATCH before the remediation arm is ever reached.
+# ═════════════════════════════════════════════════════════════════════════
+{
+  PROVISION_SH="$REPO_ROOT/ci/scripts/pod_provision_cutlass.sh"
+  A1_ROOT="$SANDBOX/a1_cutlass"
+  rm -rf "$A1_ROOT"; mkdir -p "$A1_ROOT"
+
+  a1_git() { git -c protocol.file.allow=always -c init.defaultBranch=main "$@"; }
+
+  # A real upstream cutlass repo with two real commits.
+  A1_UPSTREAM="$A1_ROOT/cutlass-upstream"
+  a1_git init -q "$A1_UPSTREAM"
+  a1_git -C "$A1_UPSTREAM" config user.email t@t; a1_git -C "$A1_UPSTREAM" config user.name t
+  echo v1 > "$A1_UPSTREAM/header.h"
+  a1_git -C "$A1_UPSTREAM" add header.h
+  a1_git -C "$A1_UPSTREAM" commit -q -m v1
+  A1_SHA1="$(a1_git -C "$A1_UPSTREAM" rev-parse HEAD)"
+  echo v2 > "$A1_UPSTREAM/header.h"
+  a1_git -C "$A1_UPSTREAM" commit -q -am v2
+  A1_SHA2="$(a1_git -C "$A1_UPSTREAM" rev-parse HEAD)"
+
+  # a1_make_super <dir> <checked-out-sha>: a superproject (/root/jammi-ai
+  # stand-in) with a real submodule pinned at the given sha.
+  a1_make_super() {
+    local dir="$1" sha="$2"
+    rm -rf "$dir"; a1_git init -q "$dir"
+    a1_git -C "$dir" config user.email t@t; a1_git -C "$dir" config user.name t
+    mkdir -p "$dir/crates/jammi-kernels/third_party"
+    a1_git -C "$dir" submodule add -q "$A1_UPSTREAM" crates/jammi-kernels/third_party/cutlass >/dev/null 2>&1
+    a1_git -C "$dir/crates/jammi-kernels/third_party/cutlass" checkout -q "$sha"
+    a1_git -C "$dir" add crates/jammi-kernels/third_party/cutlass .gitmodules
+    a1_git -C "$dir" commit -q -m "pin cutlass"
+  }
+
+  # a1_make_tree <dir> <stamp-sha-or-empty>: a destination tree with a push
+  # stamp naming the given cutlass_gitlink (JSON written directly — this
+  # test exercises pod_provision_cutlass.sh, not pod_push_stamp.sh compute).
+  a1_make_tree() {
+    local dir="$1" stamp_sha="$2"
+    rm -rf "$dir"; mkdir -p "$dir"
+    printf '{"cutlass_gitlink": "%s"}\n' "$stamp_sha" > "$dir/.jammi-push-stamp.json"
+  }
+
+  # ---- leg 1: MATCH -> copy, no remediation -------------------------------
+  A1_SUPER_MATCH="$A1_ROOT/super_match"
+  a1_make_super "$A1_SUPER_MATCH" "$A1_SHA1"
+  A1_TREE_MATCH="$A1_ROOT/tree_match"
+  a1_make_tree "$A1_TREE_MATCH" "$A1_SHA1"
+  a1_out="$(env GIT_ALLOW_PROTOCOL=file bash "$PROVISION_SH" "$A1_TREE_MATCH" "$A1_SUPER_MATCH" 2>&1)"; a1_rc=$?
+  if [ "$a1_rc" -eq 0 ] && [ -f "$A1_TREE_MATCH/crates/jammi-kernels/third_party/cutlass/header.h" ] \
+     && [ ! -e "$A1_TREE_MATCH/crates/jammi-kernels/third_party/cutlass/.git" ] \
+     && ! printf '%s' "$a1_out" | grep -q 'attempting to fetch'; then
+    ok "(m/A1 match) matching stamp/submodule -> copies straight through, no remediation attempted"
+  else
+    bad "(m/A1 match) expected a clean copy with no remediation (rc=$a1_rc): $a1_out"
+  fi
+
+  # ---- leg 2: DRIFT -> remediation fetch+checkout -> re-verify OK -> copy --
+  A1_SUPER_DRIFT="$A1_ROOT/super_drift"
+  a1_make_super "$A1_SUPER_DRIFT" "$A1_SHA1"
+  A1_TREE_DRIFT="$A1_ROOT/tree_drift"
+  a1_make_tree "$A1_TREE_DRIFT" "$A1_SHA2"
+  a1_out="$(env GIT_ALLOW_PROTOCOL=file bash "$PROVISION_SH" "$A1_TREE_DRIFT" "$A1_SUPER_DRIFT" 2>&1)"; a1_rc=$?
+  if [ "$a1_rc" -eq 0 ] && printf '%s' "$a1_out" | grep -q 'attempting to fetch' \
+     && [ -f "$A1_TREE_DRIFT/crates/jammi-kernels/third_party/cutlass/header.h" ] \
+     && [ "$(cat "$A1_TREE_DRIFT/crates/jammi-kernels/third_party/cutlass/header.h")" = v2 ]; then
+    ok "(m/A1 drift) a genuine mismatch reaches the remediation arm, fetches+checks out the STAMPED commit, re-verifies OK, and copies the CORRECT (v2) content"
+  else
+    bad "(m/A1 drift) expected remediation to run and copy v2 content (rc=$a1_rc): $a1_out"
+  fi
+
+  # ---- leg 3: no submodule registered ("deinit"-shaped) -> refuse --------
+  A1_SUPER_DEINIT="$A1_ROOT/super_deinit"
+  rm -rf "$A1_SUPER_DEINIT"; a1_git init -q "$A1_SUPER_DEINIT"
+  a1_git -C "$A1_SUPER_DEINIT" config user.email t@t; a1_git -C "$A1_SUPER_DEINIT" config user.name t
+  echo x > "$A1_SUPER_DEINIT/README"; a1_git -C "$A1_SUPER_DEINIT" add README; a1_git -C "$A1_SUPER_DEINIT" commit -q -m x
+  A1_TREE_DEINIT="$A1_ROOT/tree_deinit"
+  a1_make_tree "$A1_TREE_DEINIT" "$A1_SHA1"
+  a1_out="$(env GIT_ALLOW_PROTOCOL=file bash "$PROVISION_SH" "$A1_TREE_DEINIT" "$A1_SUPER_DEINIT" 2>&1)"; a1_rc=$?
+  # `set -euo pipefail`'s own FIRST command (`git submodule update --init`)
+  # aborts immediately with git's own "pathspec ... did not match" when NO
+  # submodule is registered at all — the loudest possible refusal, before
+  # this script's own "no .git after submodule update" message (reachable
+  # only when `submodule update --init` itself SUCCEEDS but leaves no
+  # .git, not exercised by this leg) is ever printed. Either message is a
+  # genuine, loud, non-silent refusal — the fixture accepts both.
+  if [ "$a1_rc" -ne 0 ] && { printf '%s' "$a1_out" | grep -q 'no .git after submodule update' \
+     || printf '%s' "$a1_out" | grep -q 'pathspec.*did not match'; } \
+     && [ ! -e "$A1_TREE_DEINIT/crates/jammi-kernels/third_party/cutlass" ]; then
+    ok "(m/A1 deinit) no submodule registered at all -> refuses loudly, nothing copied"
+  else
+    bad "(m/A1 deinit) expected a loud refusal naming the missing .git (rc=$a1_rc): $a1_out"
+  fi
+
+  # ---- leg 4: stamped sha unreachable -> loud fetch-failure refuse -------
+  A1_SUPER_FETCHFAIL="$A1_ROOT/super_fetchfail"
+  a1_make_super "$A1_SUPER_FETCHFAIL" "$A1_SHA1"
+  A1_TREE_FETCHFAIL="$A1_ROOT/tree_fetchfail"
+  a1_make_tree "$A1_TREE_FETCHFAIL" "0000000000000000000000000000000000000000"
+  a1_out="$(env GIT_ALLOW_PROTOCOL=file bash "$PROVISION_SH" "$A1_TREE_FETCHFAIL" "$A1_SUPER_FETCHFAIL" 2>&1)"; a1_rc=$?
+  if [ "$a1_rc" -ne 0 ] && printf '%s' "$a1_out" | grep -q 'could not fetch/checkout' \
+     && [ ! -e "$A1_TREE_FETCHFAIL/crates/jammi-kernels/third_party/cutlass" ]; then
+    ok "(m/A1 fetch-failure) an unreachable stamped sha -> loud refusal, nothing copied"
+  else
+    bad "(m/A1 fetch-failure) expected a loud fetch-failure refusal (rc=$a1_rc): $a1_out"
+  fi
+
+  # ---- revert-RED: the round-4 regression, reproduced and re-fixed -------
+  # Restoring the BARE-command form (no if/else) under `set -e` — exactly
+  # what shipped at 8201dc6 — on the SAME drift fixture: the remote shell
+  # must abort at the MISMATCH error, `CHECK_RC` never read, the
+  # remediation arm (and the copy) never reached.
+  A1_REVERT_DIR="$SANDBOX/a1_revert_dir"
+  rm -rf "$A1_REVERT_DIR"; mkdir -p "$A1_REVERT_DIR"
+  # pod_provision_cutlass.sh computes its own $DIR from its own location and
+  # calls "$DIR/pod_push_stamp.sh" — a REAL copy must sit alongside the
+  # reverted script for that resolution to find it (same technique the
+  # p2/A5 fixture above already uses for pod_seed_target.sh/pod_push_stamp.sh).
+  cp "$REPO_ROOT/ci/scripts/pod_push_stamp.sh" "$A1_REVERT_DIR/pod_push_stamp.sh"
+  A1_REVERTED="$A1_REVERT_DIR/pod_provision_cutlass_reverted.sh"
+  cp "$PROVISION_SH" "$A1_REVERTED"
+  python3 - "$A1_REVERTED" <<'PY'
+import sys
+p = sys.argv[1]
+t = open(p).read()
+old = '''if bash "$DIR/pod_push_stamp.sh" cutlass-check "$STAMP" "$ACTUAL_SHA"; then
+  CHECK_RC=0
+else
+  CHECK_RC=$?
+fi
+'''
+new = '''bash "$DIR/pod_push_stamp.sh" cutlass-check "$STAMP" "$ACTUAL_SHA"
+CHECK_RC=$?
+'''
+assert old in t, "revert fixture: could not locate the if/else block to neuter"
+open(p, "w").write(t.replace(old, new))
+PY
+  if bash -n "$A1_REVERTED"; then
+    A1_SUPER_REVERT="$A1_ROOT/super_revert"
+    a1_make_super "$A1_SUPER_REVERT" "$A1_SHA1"
+    A1_TREE_REVERT="$A1_ROOT/tree_revert"
+    a1_make_tree "$A1_TREE_REVERT" "$A1_SHA2"
+    a1r_out="$(env GIT_ALLOW_PROTOCOL=file bash "$A1_REVERTED" "$A1_TREE_REVERT" "$A1_SUPER_REVERT" 2>&1)"; a1r_rc=$?
+    if [ "$a1r_rc" -ne 0 ] && printf '%s' "$a1r_out" | grep -q 'MISMATCH' \
+       && ! printf '%s' "$a1r_out" | grep -q 'attempting to fetch' \
+       && [ ! -e "$A1_TREE_REVERT/crates/jammi-kernels/third_party/cutlass/header.h" ]; then
+      ok "(m/A1 revert-RED) restoring the bare-command form on the SAME drift fixture stops at MISMATCH under set -e — the remediation arm is genuinely dead code without the if/else, confirming the fix is load-bearing"
+    else
+      bad "(m/A1 revert-RED) expected the reverted (bare-command) form to stop at MISMATCH without reaching remediation (rc=$a1r_rc): $a1r_out"
+    fi
+  else
+    bad "(m/A1 revert-RED) revert fixture has a syntax error"
   fi
 }
 
@@ -1148,16 +1366,104 @@ DRV
     bad "(n/addendum) could not confirm T1b's rc=2 else-branch aborts (start=${N2_T1B_START:-?} else=${N2_T1B_ELSE:-?} fi=${N2_T1B_FI:-?})"
   fi
 
-  # round-4 addendum: pod_build_timings.sh's OWN, separate FA2 *measurement*
-  # leg deliberately still WARNS-and-skips on rc=2 (it decides only whether
-  # to run an ADDITIONAL optional measurement, never whether the seed
-  # itself — validated by its own real pod_seed_target.sh invocation at
-  # step (i), which now aborts — is valid). Confirms the two callers
-  # genuinely diverge, not that the seed's own fix leaked/failed to leak.
-  if grep -q 'FA2 leg skipped: could not determine' "$REPO_ROOT/ci/scripts/perf/pod_build_timings.sh"; then
-    ok "(n/addendum) pod_build_timings.sh's OWN FA2 measurement leg still warns-and-skips on rc=2 (a different call site, a different decision)"
+  # round-5 fix (round-4 audit finding, family O — "trace the mechanism
+  # behind a stated justification"): pod_build_timings.sh's OWN, separate
+  # FA2 *measurement* leg used to WARN-and-skip on rc=2, justified by "the
+  # seed's own real invocation at step (i) already aborts on the same
+  # rc=2" — FALSE whenever a seed already exists (the ORDINARY case: `up`/
+  # `shell` kick off the seed at bootstrap, so step (i)'s own
+  # pod_seed_target.sh --no-lock call short-circuits at "seed already
+  # complete" WITHOUT ever reaching the T1b/rc=2 abort). This leg now
+  # ABORTS on rc=2 too — never silently downgrades "could not determine"
+  # to "absent".
+  if grep -q 'FA2 leg: could not determine whether jammi-kernels declares flash-attn' "$REPO_ROOT/ci/scripts/perf/pod_build_timings.sh"; then
+    ok "(n/addendum) pod_build_timings.sh's OWN FA2 measurement leg now ABORTS on rc=2 (the justification for the old warn-and-skip was refuted; see this leg's own citation)"
   else
     bad "(n/addendum) pod_build_timings.sh's FA2 leg dispatch text changed unexpectedly"
+  fi
+
+  # round-5 EXECUTABLE fixture (Class-A item 4): the REAL FA2-leg bytes
+  # (sed-extracted from pod_build_timings.sh, never a reimplementation),
+  # run on a real git repo checked out on a branch literally named "main",
+  # with `pod_seed_pkg_has_feature` stubbed to return 2 — must ABORT
+  # (never warn-and-skip) and name the real cause.
+  PBT_SH="$REPO_ROOT/ci/scripts/perf/pod_build_timings.sh"
+  FA2_START="$(grep -n '^if \[ "\$(git rev-parse --abbrev-ref HEAD)" = "main" \]; then$' "$PBT_SH" | head -1 | cut -d: -f1)"
+  FA2_END="$(awk -v s="$FA2_START" 'NR>=s && /^echo "::endgroup::"$/{print NR; exit}' "$PBT_SH")"
+  if [ -n "$FA2_START" ] && [ -n "$FA2_END" ]; then
+    FA2_MAINREPO="$SANDBOX/fa2_mainrepo"
+    rm -rf "$FA2_MAINREPO"; git init -q -b main "$FA2_MAINREPO" 2>/dev/null || { git init -q "$FA2_MAINREPO"; git -C "$FA2_MAINREPO" checkout -q -b main 2>/dev/null; }
+    git -C "$FA2_MAINREPO" config user.email t@t; git -C "$FA2_MAINREPO" config user.name t
+    echo x > "$FA2_MAINREPO/f"; git -C "$FA2_MAINREPO" add f; git -C "$FA2_MAINREPO" commit -q -m x
+
+    FA2_DRIVER="$SANDBOX/fa2_driver.sh"
+    {
+      echo '#!/usr/bin/env bash'
+      echo 'set -uo pipefail'
+      echo 'fail() { echo "::error::$*" >&2; exit 1; }'
+      echo 'pod_seed_pkg_has_feature() { return 2; }'
+      echo "cd '$FA2_MAINREPO' || exit 9"
+      sed -n "${FA2_START},${FA2_END}p" "$PBT_SH"
+      echo 'echo FA2_LEG_REACHED_END'
+    } > "$FA2_DRIVER"
+    chmod +x "$FA2_DRIVER"
+    if bash -n "$FA2_DRIVER"; then
+      fa2_abort_out="$(bash "$FA2_DRIVER" 2>&1)"; fa2_abort_rc=$?
+      if [ "$fa2_abort_rc" -ne 0 ] && printf '%s' "$fa2_abort_out" | grep -q 'could not determine whether jammi-kernels declares flash-attn' \
+         && ! printf '%s' "$fa2_abort_out" | grep -q 'FA2_LEG_REACHED_END'; then
+        ok "(n/addendum EXECUTABLE) the real FA2-leg bytes, run with pod_seed_pkg_has_feature stubbed to rc=2 on a real 'main'-branch repo, ABORT (never warn-and-skip) and name the real cause"
+      else
+        bad "(n/addendum EXECUTABLE) expected the real FA2-leg bytes to abort on rc=2 (rc=$fa2_abort_rc): $fa2_abort_out"
+      fi
+    else
+      bad "(n/addendum EXECUTABLE) FA2-leg driver fixture has a syntax error"
+    fi
+  else
+    bad "(n/addendum EXECUTABLE) could not locate the FA2 leg's start/end lines in pod_build_timings.sh (start=${FA2_START:-?} end=${FA2_END:-?})"
+  fi
+
+  # round-5 fixture (Class-A item 4): "a complete seed marker WITHOUT FA2 +
+  # timings -> the timings JSON copies seed_tuples/seed_t1b_flash_attn_*
+  # from the seed's own marker" — exercises the REAL python snippets
+  # pod_build_timings.sh's step (i) block uses to read the marker back
+  # (sed-extracted, never reimplemented), against a real marker JSON
+  # shaped exactly like a real "not on main" seed.
+  FA2_MARKER_PY_START="$(grep -n "^seed_tuples_json=" "$PBT_SH" | head -1 | cut -d: -f1)"
+  FA2_MARKER_PY_END="$(awk -v s="$FA2_MARKER_PY_START" 'NR>=s && /^echo "::endgroup::"$/{print NR; exit}' "$PBT_SH")"
+  if [ -n "$FA2_MARKER_PY_START" ] && [ -n "$FA2_MARKER_PY_END" ]; then
+    FA2_SEED_NOFA2="$SANDBOX/fa2_seed_no_fa2"
+    python3 -c '
+import json
+json.dump({
+  "ref": "ci/pod-build-substrate-r5", "sha": "deadbeef", "date": "2026-01-01T00:00:00Z",
+  "tuples": ["T1", "T2", "T3"], "rustflags": "", "size_bytes": 0,
+  "manifest_sha256": "abc", "seed_source": "built",
+  "t1b_flash_attn_ran": False,
+  "t1b_flash_attn_reason": "ref != main (ref=ci/pod-build-substrate-r5) - T1b is main-only by design",
+}, open("'"$FA2_SEED_NOFA2"'.jammi-seed-complete", "w"))
+'
+    FA2_MARKER_DRIVER="$SANDBOX/fa2_marker_driver.sh"
+    {
+      echo '#!/usr/bin/env bash'
+      echo 'set -uo pipefail'
+      echo "JAMMI_SEED_DIR='$FA2_SEED_NOFA2'"
+      sed -n "${FA2_MARKER_PY_START},${FA2_MARKER_PY_END}p" "$PBT_SH" | grep -v '^echo "::endgroup::"$'
+      echo 'printf "TUPLES=%s RAN=%s REASON=%s\n" "$seed_tuples_json" "$seed_t1b_ran" "$seed_t1b_reason"'
+    } > "$FA2_MARKER_DRIVER"
+    chmod +x "$FA2_MARKER_DRIVER"
+    if bash -n "$FA2_MARKER_DRIVER"; then
+      fa2_marker_out="$(bash "$FA2_MARKER_DRIVER" 2>&1)"
+      if printf '%s' "$fa2_marker_out" | grep -q 'TUPLES=\["T1", "T2", "T3"\] RAN=false REASON=ref != main' \
+         || printf '%s' "$fa2_marker_out" | grep -qE 'TUPLES=\[.T1., .T2., .T3.\] RAN=false REASON=ref != main'; then
+        ok "(n/addendum EXECUTABLE) the real marker-reading python snippets correctly copy seed_tuples (no T1b) / seed_t1b_flash_attn_ran=false / the real reason out of a real seed-complete marker"
+      else
+        bad "(n/addendum EXECUTABLE) expected the marker fields to be copied verbatim: $fa2_marker_out"
+      fi
+    else
+      bad "(n/addendum EXECUTABLE) marker-reader driver fixture has a syntax error"
+    fi
+  else
+    bad "(n/addendum EXECUTABLE) could not locate the marker-reading python snippets in pod_build_timings.sh (start=${FA2_MARKER_PY_START:-?} end=${FA2_MARKER_PY_END:-?})"
   fi
 
   # round-4 addendum: every `--frozen` metadata call site goes through the
@@ -1602,6 +1908,487 @@ DRV
     else
       bad "(p2/A5) could not locate pod_build_timings.sh's own member-free call site in the truncated driver to build the revert-RED fixture"
     fi
+  fi
+}
+
+# ═════════════════════════════════════════════════════════════════════════
+# (q/A2) round-5: pod_seed_target.sh:352-355's own comment claimed "The
+# hermetic test for this function (test_pod_substrate.sh) builds this exact
+# real library-crate fixture itself, rather than asserting from a written
+# claim" — that claim was FALSE for two consecutive rounds (round-4 audit
+# finding, family O). This leg makes it true: a REAL two-member cargo
+# workspace (lib jammi-zzlib + bin jammi-zzbin, the auditor's own a2fix
+# fixture, adopted verbatim), a REAL `cargo build` + `cargo build
+# --release`, the artifact list taken from a REAL `find` (never hand-typed
+# filenames) — every one of those real lib*.rlib/.rmeta/.d/.fingerprint/
+# build entries must trip pod_seed_assert_member_free; after `cargo clean
+# --workspace` (both profiles) + the incremental/ rm this SAME script's
+# member-free-clean step performs, none may. The scratch workspace lives
+# under `mktemp -d` and is removed at the end of this leg regardless of
+# outcome (disk hygiene — a real cargo build/clean cycle leaves real bytes
+# behind).
+# ═════════════════════════════════════════════════════════════════════════
+{
+  Q_ROOT="$(mktemp -d)"
+  q_cleanup() { rm -rf "$Q_ROOT"; }
+
+  mkdir -p "$Q_ROOT/ws/jammi-zzlib/src" "$Q_ROOT/ws/jammi-zzbin/src"
+  cat > "$Q_ROOT/ws/Cargo.toml" <<'EOF'
+[workspace]
+members = ["jammi-zzlib", "jammi-zzbin"]
+resolver = "2"
+EOF
+  cat > "$Q_ROOT/ws/jammi-zzlib/Cargo.toml" <<'EOF'
+[package]
+name = "jammi-zzlib"
+version = "0.1.0"
+edition = "2021"
+EOF
+  echo 'pub fn f() -> i32 { 1 }' > "$Q_ROOT/ws/jammi-zzlib/src/lib.rs"
+  cat > "$Q_ROOT/ws/jammi-zzbin/Cargo.toml" <<'EOF'
+[package]
+name = "jammi-zzbin"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+jammi-zzlib = { path = "../jammi-zzlib" }
+EOF
+  echo 'fn main() { jammi_zzlib::f(); }' > "$Q_ROOT/ws/jammi-zzbin/src/main.rs"
+
+  Q_TGT="$Q_ROOT/tgt"
+  (cd "$Q_ROOT/ws" && CARGO_TARGET_DIR="$Q_TGT" cargo build -q \
+     && CARGO_TARGET_DIR="$Q_TGT" cargo build --release -q) >/dev/null 2>"$Q_ROOT/build.err"
+  q_build_rc=$?
+  if [ "$q_build_rc" -ne 0 ]; then
+    bad "(q/A2) real cargo build of the a2fix fixture workspace failed (rc=$q_build_rc): $(cat "$Q_ROOT/build.err")"
+    q_cleanup
+  else
+    # Real artifact list from `find`, scoped to the SAME four subdirs
+    # pod_seed_assert_member_free itself scans ({.fingerprint,deps,build}
+    # under debug/release; incremental checked separately below) — never a
+    # hand-typed filename.
+    find "$Q_TGT/debug/.fingerprint" "$Q_TGT/debug/deps" "$Q_TGT/debug/build" \
+         "$Q_TGT/release/.fingerprint" "$Q_TGT/release/deps" "$Q_TGT/release/build" \
+         -mindepth 1 -maxdepth 1 -iname '*zzlib*' 2>/dev/null | sort > "$Q_ROOT/expected.txt"
+    q_expected_count="$(wc -l < "$Q_ROOT/expected.txt" | tr -d ' ')"
+
+    Q_DRIVER="$SANDBOX/q_driver.sh"
+    cat > "$Q_DRIVER" <<DRV
+#!/usr/bin/env bash
+set -uo pipefail
+# shellcheck disable=SC1091
+. "$REPO_ROOT/ci/scripts/pod_seed_target.sh"
+pod_seed_assert_member_free "\$1" "\$2"
+DRV
+    chmod +x "$Q_DRIVER"
+
+    bash "$Q_DRIVER" "$Q_TGT" "$Q_ROOT/ws" > "$Q_ROOT/before.out" 2>&1
+    q_before_rc=$?
+    q_missing=0
+    while IFS= read -r expected_path; do
+      [ -n "$expected_path" ] || continue
+      grep -qF "$expected_path" "$Q_ROOT/before.out" || q_missing=$((q_missing + 1))
+    done < "$Q_ROOT/expected.txt"
+    if [ "$q_before_rc" -eq 1 ] && [ "${q_expected_count:-0}" -ge 4 ] && [ "$q_missing" -eq 0 ]; then
+      ok "(q/A2) a REAL cargo build (lib+bin workspace) — every one of ${q_expected_count} real lib*.rlib/.rmeta/.d/.fingerprint/build entries from a real 'find' trips pod_seed_assert_member_free (rc=1)"
+    else
+      bad "(q/A2) expected rc=1 with all ${q_expected_count:-0} real artifacts flagged (rc=$q_before_rc, missing=$q_missing): $(cat "$Q_ROOT/before.out")"
+    fi
+
+    (cd "$Q_ROOT/ws" && CARGO_TARGET_DIR="$Q_TGT" cargo clean --workspace --frozen -q \
+       && CARGO_TARGET_DIR="$Q_TGT" cargo clean --workspace --release --frozen -q) >/dev/null 2>"$Q_ROOT/clean.err"
+    q_clean_rc=$?
+    rm -rf "$Q_TGT"/*/incremental
+
+    bash "$Q_DRIVER" "$Q_TGT" "$Q_ROOT/ws" > "$Q_ROOT/after.out" 2>&1
+    q_after_rc=$?
+    if [ "$q_clean_rc" -eq 0 ] && [ "$q_after_rc" -eq 0 ]; then
+      ok "(q/A2) after 'cargo clean --workspace' (both profiles) + the incremental/ rm, the SAME real target dir trips NOTHING (rc=0)"
+    else
+      bad "(q/A2) expected a clean pass after cargo clean (clean_rc=$q_clean_rc, after_rc=$q_after_rc): $(cat "$Q_ROOT/after.out")"
+    fi
+  fi
+  q_cleanup
+}
+
+# ═════════════════════════════════════════════════════════════════════════
+# (r/A4) round-4 audit finding (zero coverage for two rounds): byte_equal's
+# tri-state (invalid/true/false) in pod_build_timings.sh, exercised against
+# the REAL bytes of the tri-state decision + JSON-assembly block (sed-
+# extracted, never reimplemented) via a minimal harness supplying only the
+# inputs that block reads (clone_hashes/cold_hashes/clone_features/
+# cold_features and the handful of other positional values the real JSON
+# writer takes). Three legs: empty snapshot on either side -> INVALID
+# (rc!=0, byte_equal_state: invalid in the artifact); equal non-empty
+# hashes -> true; differing non-empty hashes -> false. Revert-RED on the
+# `>= 1` floor: reverting to a bare `[ "$clone_hashes" = "$cold_hashes" ]`
+# (no empty-set guard) reads two empty strings as equal — a silent, wrong
+# "true" on the SAME empty-snapshot fixture that correctly reads INVALID
+# today.
+# ═════════════════════════════════════════════════════════════════════════
+{
+  PBT_SH="$REPO_ROOT/ci/scripts/perf/pod_build_timings.sh"
+  R_TRISTATE_START="$(grep -n '^if \[ -z "\$clone_hashes" \] || \[ -z "\$cold_hashes" \]; then$' "$PBT_SH" | head -1 | cut -d: -f1)"
+  R_TRISTATE_END="$(awk -v s="$R_TRISTATE_START" 'NR>=s && /^fi$/{print NR; exit}' "$PBT_SH")"
+
+  r_run_tristate() { # $1=clone_hashes $2=cold_hashes -> prints "byte_equal=<val> diff_nonempty=<yes|no>" on stdout
+    local clone_hashes="$1" cold_hashes="$2"
+    local driver="$SANDBOX/r_tristate_driver.sh"
+    {
+      echo '#!/usr/bin/env bash'
+      echo 'set -uo pipefail'
+      printf 'clone_hashes=%q\n' "$clone_hashes"
+      printf 'cold_hashes=%q\n' "$cold_hashes"
+      sed -n "${R_TRISTATE_START},${R_TRISTATE_END}p" "$PBT_SH"
+      echo 'printf "byte_equal=%s diff_nonempty=%s\n" "$byte_equal" "$([ -n "$byte_equal_diff" ] && echo yes || echo no)"'
+    } > "$driver"
+    bash "$driver"
+  }
+
+  if [ -n "$R_TRISTATE_START" ] && [ -n "$R_TRISTATE_END" ]; then
+    r_out="$(r_run_tristate "" "")"
+    if printf '%s' "$r_out" | grep -q 'byte_equal=invalid diff_nonempty=yes'; then
+      ok "(r/A4) an empty snapshot on BOTH sides -> byte_equal=invalid, with a non-empty explanatory diff"
+    else
+      bad "(r/A4) expected byte_equal=invalid for a doubly-empty snapshot: $r_out"
+    fi
+
+    r_out="$(r_run_tristate "" $'path\tsha')"
+    if printf '%s' "$r_out" | grep -q 'byte_equal=invalid'; then
+      ok "(r/A4) an empty snapshot on ONE side (clone) -> byte_equal=invalid"
+    else
+      bad "(r/A4) expected byte_equal=invalid for a one-sided-empty snapshot: $r_out"
+    fi
+
+    r_out="$(r_run_tristate $'a\tsha1' $'a\tsha1')"
+    if printf '%s' "$r_out" | grep -q 'byte_equal=true diff_nonempty=no'; then
+      ok "(r/A4) equal, non-empty hash sets -> byte_equal=true"
+    else
+      bad "(r/A4) expected byte_equal=true for identical non-empty snapshots: $r_out"
+    fi
+
+    r_out="$(r_run_tristate $'a\tsha1' $'a\tsha2')"
+    if printf '%s' "$r_out" | grep -q 'byte_equal=false diff_nonempty=yes'; then
+      ok "(r/A4) differing, non-empty hash sets -> byte_equal=false, with a real diff"
+    else
+      bad "(r/A4) expected byte_equal=false for differing non-empty snapshots: $r_out"
+    fi
+
+    # revert-RED: the `>= 1` / non-vacuity floor, removed.
+    r_reverted_out="$(
+      driver="$SANDBOX/r_revert_driver.sh"
+      {
+        echo '#!/usr/bin/env bash'
+        echo 'set -uo pipefail'
+        echo 'clone_hashes=""'
+        echo 'cold_hashes=""'
+        echo 'if [ "$clone_hashes" = "$cold_hashes" ]; then byte_equal=true; byte_equal_diff=""; else byte_equal=false; byte_equal_diff="differ"; fi'
+        echo 'printf "byte_equal=%s\n" "$byte_equal"'
+      } > "$driver"
+      bash "$driver"
+    )"
+    if printf '%s' "$r_reverted_out" | grep -q 'byte_equal=true'; then
+      ok "(r/A4 revert-RED) the OLD bare-comparison form (no empty-set guard), on the SAME doubly-empty fixture, reads a silent WRONG 'true' — confirming the invalid-state guard is load-bearing, not vacuous"
+    else
+      bad "(r/A4 revert-RED) expected the reverted form to read a false 'true' on the doubly-empty fixture: $r_reverted_out"
+    fi
+  else
+    bad "(r/A4) could not locate the byte_equal tri-state block in pod_build_timings.sh (start=${R_TRISTATE_START:-?} end=${R_TRISTATE_END:-?})"
+  fi
+
+  # JSON-written-after-the-validity-decision: byte_equal (the tri-state
+  # decision) must be computed BEFORE the JSON assembly step that embeds
+  # it — a structural, line-position check on the real script (the JSON is
+  # a >100-line python heredoc; running it standalone needs a full set of
+  # 17 positional args, out of proportion to what this specific ordering
+  # claim needs).
+  R_DECISION_LINE="$(grep -n '^if \[ -z "\$clone_hashes" \] || \[ -z "\$cold_hashes" \]; then$' "$PBT_SH" | head -1 | cut -d: -f1)"
+  R_JSON_LINE="$(grep -n '^  python3 -' "$PBT_SH" | head -1 | cut -d: -f1)"
+  if [ -n "$R_DECISION_LINE" ] && [ -n "$R_JSON_LINE" ] && [ "$R_DECISION_LINE" -lt "$R_JSON_LINE" ]; then
+    ok "(r/A4) the byte_equal validity decision (line ${R_DECISION_LINE}) runs BEFORE the JSON is assembled (line ${R_JSON_LINE}) — an INVALID run's own byte_equal_state is what lands in the artifact, never computed after the fact"
+  else
+    bad "(r/A4) expected the validity decision to precede JSON assembly (decision=${R_DECISION_LINE:-?} json=${R_JSON_LINE:-?})"
+  fi
+}
+
+# ═════════════════════════════════════════════════════════════════════════
+# (s/manifest) round-5 (a100c on-pod A2 run at 80c7f59, real seed FAILURE):
+# a synthetic-but-REAL-NAMED capture set — the literal
+# `cargo:rerun-if-env-changed=<NAME>` announcements this repo's real
+# `--features jammi-kernels/cuda` graph actually produced on a100c (see
+# pod_seed_key_inputs.toml's own citation), a representative subset across
+# all 11 previously-unlisted packages, never a smaller invented set —
+# replayed through pod_seed_check_stdout_subset against the REAL, CURRENT
+# manifest: must PASS. Revert-RED: the SAME capture set against a manifest
+# copy with the `CC_*` wildcard removed must FAIL, naming the real unlisted
+# names.
+# ═════════════════════════════════════════════════════════════════════════
+{
+  MANIFEST_REAL="$REPO_ROOT/ci/scripts/pod_seed_key_inputs.toml"
+  S_CAPTURE="$SANDBOX/s_manifest_capture"
+  rm -rf "$S_CAPTURE"; mkdir -p "$S_CAPTURE"
+  # Real observed names (a100c, 80c7f59), one file per package, matching
+  # cargo's own `<profile>__<pkg-dirname>.output` capture naming.
+  cat > "$S_CAPTURE/release__zstd-sys-3db14a63a57ab829.output" <<'EOF'
+cargo:rerun-if-env-changed=CC_x86_64_unknown_linux_gnu
+cargo:rerun-if-env-changed=CC_x86_64
+cargo:rerun-if-env-changed=HOST_CC
+cargo:rerun-if-env-changed=CFLAGS_x86_64_unknown_linux_gnu
+cargo:rerun-if-env-changed=CFLAGS_x86_64
+cargo:rerun-if-env-changed=HOST_CFLAGS
+cargo:rerun-if-env-changed=AR_x86_64_unknown_linux_gnu
+cargo:rerun-if-env-changed=AR_x86_64
+cargo:rerun-if-env-changed=HOST_AR
+cargo:rerun-if-env-changed=ARFLAGS_x86_64_unknown_linux_gnu
+cargo:rerun-if-env-changed=ARFLAGS_x86_64
+cargo:rerun-if-env-changed=HOST_ARFLAGS
+cargo:rerun-if-env-changed=CC_ENABLE_DEBUG_OUTPUT
+cargo:rerun-if-env-changed=CC_FORCE_DISABLE
+cargo:rerun-if-env-changed=ZSTD_SYS_USE_PKG_CONFIG
+EOF
+  cat > "$S_CAPTURE/release__cxx-6a8d7f42d5cebcb7.output" <<'EOF'
+cargo:rerun-if-env-changed=CXX_x86_64_unknown_linux_gnu
+cargo:rerun-if-env-changed=CXX_x86_64
+cargo:rerun-if-env-changed=HOST_CXX
+cargo:rerun-if-env-changed=CXXFLAGS_x86_64_unknown_linux_gnu
+cargo:rerun-if-env-changed=CXXFLAGS_x86_64
+cargo:rerun-if-env-changed=HOST_CXXFLAGS
+cargo:rerun-if-env-changed=CARGO_MANIFEST_LINKS
+EOF
+  cat > "$S_CAPTURE/release__link-cplusplus-1ea710f5f6a71693.output" <<'EOF'
+cargo:rerun-if-env-changed=CXXSTDLIB
+cargo:rerun-if-env-changed=CXXSTDLIB_x86_64
+cargo:rerun-if-env-changed=CXXSTDLIB_x86_64_unknown_linux_gnu
+cargo:rerun-if-env-changed=HOST_CXXSTDLIB
+EOF
+  cat > "$S_CAPTURE/release__liblzma-sys-5090553e29feb974.output" <<'EOF'
+cargo:rerun-if-env-changed=LZMA_API_STATIC
+cargo:rerun-if-env-changed=LZMA_SYS_ENABLE_THREADS
+EOF
+  cat > "$S_CAPTURE/release__libsqlite3-sys-87badfb09dabf147.output" <<'EOF'
+cargo:rerun-if-env-changed=LIBSQLITE3_FLAGS
+cargo:rerun-if-env-changed=LIBSQLITE3_SYS_USE_PKG_CONFIG
+cargo:rerun-if-env-changed=SQLITE_MAX_COLUMN
+cargo:rerun-if-env-changed=SQLITE_MAX_EXPR_DEPTH
+cargo:rerun-if-env-changed=SQLITE_MAX_VARIABLE_NUMBER
+EOF
+  cat > "$S_CAPTURE/release__onig_sys-c7636c527bb74bf4.output" <<'EOF'
+cargo:rerun-if-env-changed=RUSTONIG_SYSTEM_LIBONIG
+cargo:rerun-if-env-changed=RUSTONIG_STATIC_LIBONIG
+cargo:rerun-if-env-changed=RUSTONIG_DYNAMIC_LIBONIG
+EOF
+  cat > "$S_CAPTURE/release__ring-c67535eaff4d1542.output" <<'EOF'
+cargo:rerun-if-env-changed=RING_PREGENERATE_ASM
+cargo:rerun-if-env-changed=CARGO_MANIFEST_LINKS
+EOF
+  cat > "$S_CAPTURE/release__numkong-145b6e225b03466d.output" <<'EOF'
+cargo:rerun-if-env-changed=NK_MARCH_NATIVE
+cargo:rerun-if-env-changed=NK_TARGET_ALDER
+cargo:rerun-if-env-changed=NK_TARGET_SAPPHIRE
+EOF
+  cat > "$S_CAPTURE/debug__blake3-7de09f09feda0ae5.output" <<'EOF'
+cargo:rerun-if-env-changed=CC_ENABLE_DEBUG_OUTPUT
+EOF
+  cat > "$S_CAPTURE/debug__psm-ce23a5f52daf72e5.output" <<'EOF'
+cargo:rerun-if-env-changed=AR_x86_64
+cargo:rerun-if-env-changed=CFLAGS_x86_64
+EOF
+  cat > "$S_CAPTURE/debug__usearch-0d714967eb0a6f36.output" <<'EOF'
+cargo:rerun-if-env-changed=CXX_x86_64
+cargo:rerun-if-env-changed=NK_DYNAMIC_DISPATCH
+cargo:rerun-if-env-changed=NK_NATIVE_BF16
+EOF
+
+  S_DRIVER="$SANDBOX/s_manifest_driver.sh"
+  cat > "$S_DRIVER" <<DRV
+#!/usr/bin/env bash
+set -uo pipefail
+# shellcheck disable=SC1091
+. "$REPO_ROOT/ci/scripts/pod_seed_target.sh"
+pod_seed_check_stdout_subset "\$1" "\$2"
+DRV
+  chmod +x "$S_DRIVER"
+
+  s_out="$(bash "$S_DRIVER" "$S_CAPTURE" "$MANIFEST_REAL" 2>&1)"; s_rc=$?
+  if [ "$s_rc" -eq 0 ]; then
+    ok "(s/manifest) the REAL a100c-observed cc-family + package-specific announcements (11 packages, verbatim names), replayed against the CURRENT manifest, pass cleanly"
+  else
+    bad "(s/manifest) expected the current manifest to cover every real observed name (rc=$s_rc): $s_out"
+  fi
+
+  # revert-RED: the SAME capture set against a manifest missing the CC_*
+  # wildcard family.
+  S_MANIFEST_REVERTED="$SANDBOX/s_manifest_reverted.toml"
+  python3 - "$MANIFEST_REAL" "$S_MANIFEST_REVERTED" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+t = open(src).read()
+needle = '"CC_*", "CXX_*", "AR_*", "RANLIB_*", "CFLAGS_*", "CXXFLAGS_*",'
+replacement = '"CXX_*", "AR_*", "RANLIB_*", "CFLAGS_*", "CXXFLAGS_*",'
+assert needle in t, "revert fixture: could not locate the CC_* wildcard entry to remove"
+open(dst, "w").write(t.replace(needle, replacement, 1))
+PY
+  s_revert_out="$(bash "$S_DRIVER" "$S_CAPTURE" "$S_MANIFEST_REVERTED" 2>&1)"; s_revert_rc=$?
+  if [ "$s_revert_rc" -ne 0 ] && printf '%s' "$s_revert_out" | grep -q 'CC_x86_64'; then
+    ok "(s/manifest revert-RED) removing the CC_* wildcard from the SAME manifest makes the SAME real capture set fail, naming the real unlisted CC_x86_64* names — the manifest fix is genuinely load-bearing"
+  else
+    bad "(s/manifest revert-RED) expected removing CC_* to reintroduce a real RED (rc=$s_revert_rc): $s_revert_out"
+  fi
+}
+
+# ═════════════════════════════════════════════════════════════════════════
+# (t) round-5 standing rule — class-shaped tripwire: every `2>/dev/null`,
+# `|| true`, `|| :` site in the touched scripts must carry an in-script
+# `# tripwire-ok: <reason>` allowlist annotation (same line, a contiguous
+# comment block immediately above the site, or above the START of a
+# backslash-continued multi-line statement the site is part of) — never an
+# instance-shaped grep for one known-bad string (round-4 audit advisory:
+# the earlier tripwire in this suite grepped two literal cargo-metadata
+# strings while three OTHER producing commands in the same diff still
+# discarded their stderr unannotated).
+# ═════════════════════════════════════════════════════════════════════════
+{
+  T_SCANNER="$SANDBOX/t_tripwire_scanner.py"
+  cat > "$T_SCANNER" <<'PYEOF'
+import re, sys
+
+pat = re.compile(r'2>/dev/null|\|\|\s*true\b|\|\|\s*:(\s|$)')
+
+def is_annotated(lines, idx):
+    if "tripwire-ok" in lines[idx]:
+        return True
+    j = idx
+    while j > 0 and lines[j - 1].rstrip("\n").rstrip().endswith("\\"):
+        j -= 1
+        if "tripwire-ok" in lines[j]:
+            return True
+    k = j - 1
+    while k >= 0 and lines[k].strip().startswith("#"):
+        if "tripwire-ok" in lines[k]:
+            return True
+        k -= 1
+    return False
+
+bad = []
+for path in sys.argv[1:]:
+    lines = open(path, encoding="utf-8").readlines()
+    for i, line in enumerate(lines):
+        if line.strip().startswith("#"):
+            continue
+        if pat.search(line) and not is_annotated(lines, i):
+            bad.append("%s:%d: %s" % (path, i + 1, line.rstrip()))
+
+if bad:
+    print("UNANNOTATED:")
+    for b in bad:
+        print(b)
+    sys.exit(1)
+print("all sites annotated")
+PYEOF
+
+  T_FILES="$REPO_ROOT/ci/scripts/gpu-dev.sh $REPO_ROOT/ci/scripts/pod_seed_target.sh $REPO_ROOT/ci/scripts/pod_push_stamp.sh $REPO_ROOT/ci/scripts/perf/pod_build_timings.sh $REPO_ROOT/ci/scripts/pod_timing_lock.sh $REPO_ROOT/ci/scripts/pod_target_clone.sh $REPO_ROOT/ci/scripts/pod_provision_cutlass.sh"
+  # shellcheck disable=SC2086
+  t_out="$(python3 "$T_SCANNER" $T_FILES 2>&1)"; t_rc=$?
+  if [ "$t_rc" -eq 0 ]; then
+    ok "(t) every 2>/dev/null / || true / || : site in the touched scripts carries a tripwire-ok allowlist annotation"
+  else
+    bad "(t) unannotated tripwire site(s) found: $t_out"
+  fi
+
+  # revert-RED: strip ONE real annotation the scan above just relied on,
+  # from a scratch COPY, and prove the SAME scanner catches it.
+  T_MUTANT_DIR="$SANDBOX/t_mutant"
+  rm -rf "$T_MUTANT_DIR"; mkdir -p "$T_MUTANT_DIR"
+  T_MUTANT="$T_MUTANT_DIR/pod_push_stamp.sh"
+  cp "$REPO_ROOT/ci/scripts/pod_push_stamp.sh" "$T_MUTANT"
+  python3 - "$T_MUTANT" <<'PY'
+import sys
+p = sys.argv[1]
+lines = open(p).readlines()
+mutated = False
+for i, l in enumerate(lines):
+    if "tripwire-ok" in l and "2>/dev/null" in l:
+        lines[i] = l.split("# tripwire-ok")[0].rstrip() + "\n"
+        mutated = True
+        break
+if not mutated:
+    raise SystemExit("no annotated 2>/dev/null line found to mutate")
+open(p, "w").writelines(lines)
+PY
+  t_mutant_out="$(python3 "$T_SCANNER" "$T_MUTANT" 2>&1)"; t_mutant_rc=$?
+  if [ "$t_mutant_rc" -ne 0 ] && printf '%s' "$t_mutant_out" | grep -q 'UNANNOTATED'; then
+    ok "(t revert-RED) stripping ONE real tripwire-ok annotation from a scratch copy makes the scanner catch it — the scanner is genuinely load-bearing, not vacuous"
+  else
+    bad "(t revert-RED) expected the scanner to catch the stripped annotation (rc=$t_mutant_rc): $t_mutant_out"
+  fi
+}
+
+# ═════════════════════════════════════════════════════════════════════════
+# (u) round-5 standing rule — claim-tripwire: every verification claim this
+# round's own citation convention makes (a backtick-quoted, parenthesised
+# test label — `` `(label)` `` — e.g. `` `(q/A2)` ``, `` `(m/A1 drift)` ``)
+# must name a label that genuinely exists as an `ok "(label)...` assertion
+# in test_pod_substrate.sh — never a citation to a leg that was renamed,
+# never written, or removed out from under the comment claiming it.
+# ═════════════════════════════════════════════════════════════════════════
+{
+  U_SCANNER="$SANDBOX/u_claim_scanner.py"
+  cat > "$U_SCANNER" <<'PYEOF'
+import re, sys
+
+citation_re = re.compile(r'`\(([^)]+)\)`')
+
+def find_labels(path):
+    text = open(path, encoding="utf-8").read()
+    out = []
+    for m in citation_re.finditer(text):
+        label = m.group(1).strip()
+        if not label or not re.match(r'^[a-z]', label):
+            continue
+        line_no = text.count("\n", 0, m.start()) + 1
+        out.append((path, line_no, label))
+    return out
+
+test_suite = sys.argv[1]
+sources = sys.argv[2:]
+suite_text = open(test_suite, encoding="utf-8").read()
+
+bad = []
+for src in sources:
+    for path, line_no, label in find_labels(src):
+        needle = 'ok "(%s)' % label
+        if needle not in suite_text:
+            bad.append("%s:%d: cites `(%s)` -- no such assertion label in %s" % (path, line_no, label, test_suite))
+
+if bad:
+    print("UNRESOLVED CLAIMS:")
+    for b in bad:
+        print(b)
+    sys.exit(1)
+print("every claim resolves to a real test label")
+PYEOF
+
+  U_TEST_SUITE="$REPO_ROOT/ci/scripts/test_pod_substrate.sh"
+  U_SOURCES="$REPO_ROOT/ci/scripts/gpu-dev.sh $REPO_ROOT/ci/scripts/pod_seed_target.sh $REPO_ROOT/ci/scripts/pod_push_stamp.sh $REPO_ROOT/ci/scripts/perf/pod_build_timings.sh $REPO_ROOT/ci/scripts/pod_timing_lock.sh $REPO_ROOT/ci/scripts/pod_target_clone.sh $REPO_ROOT/ci/scripts/pod_provision_cutlass.sh $REPO_ROOT/ci/scripts/pod_seed_key_inputs.toml"
+  # shellcheck disable=SC2086
+  u_out="$(python3 "$U_SCANNER" "$U_TEST_SUITE" $U_SOURCES 2>&1)"; u_rc=$?
+  if [ "$u_rc" -eq 0 ]; then
+    ok "(u) every backtick-quoted test-label citation in the touched sources resolves to a real assertion in test_pod_substrate.sh"
+  else
+    bad "(u) unresolved verification claim(s): $u_out"
+  fi
+
+  # revert-RED: a scratch copy citing a label that does not exist.
+  U_MUTANT_DIR="$SANDBOX/u_mutant"
+  rm -rf "$U_MUTANT_DIR"; mkdir -p "$U_MUTANT_DIR"
+  U_MUTANT="$U_MUTANT_DIR/fake_source.sh"
+  printf '#!/usr/bin/env bash\n# verified against a real fixture -- see test_pod_substrate.sh'"'"'s `(z/DOES_NOT_EXIST)` leg\n' > "$U_MUTANT"
+  u_mutant_out="$(python3 "$U_SCANNER" "$U_TEST_SUITE" "$U_MUTANT" 2>&1)"; u_mutant_rc=$?
+  if [ "$u_mutant_rc" -ne 0 ] && printf '%s' "$u_mutant_out" | grep -q 'z/DOES_NOT_EXIST'; then
+    ok "(u revert-RED) a citation to a label that genuinely does not exist is caught by the SAME scanner — not vacuous"
+  else
+    bad "(u revert-RED) expected the scanner to catch a nonexistent label citation (rc=$u_mutant_rc): $u_mutant_out"
   fi
 }
 

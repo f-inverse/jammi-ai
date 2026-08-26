@@ -68,7 +68,7 @@ set -uo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$DIR/../.." && pwd)"
-export RUNPOD_API_KEY="${RUNPOD_API_KEY:-$(cat "${HOME}/.config/runpod/key" 2>/dev/null || true)}"
+export RUNPOD_API_KEY="${RUNPOD_API_KEY:-$(cat "${HOME}/.config/runpod/key" 2>/dev/null || true)}" # tripwire-ok: an absent key file is a valid, common state (no key configured yet) — the `:?` right below fails loudly and immediately if the result is still empty, never a silent pass
 : "${RUNPOD_API_KEY:?set RUNPOD_API_KEY or write it to ~/.config/runpod/key}"
 
 usage() {
@@ -400,10 +400,13 @@ rp_login_cmd() { # $1 = "job" to join a live tmux job, $2 = tree dir, $3 = tmux 
   # suppression.
   local -a wlines=()
   while IFS= read -r wline; do wlines+=("$wline"); done < <(rp_job_wrapper_lines "$tree_dir" "$TARGET_DIR" ":")
-  local pre="${wlines[0]}; ${wlines[1]}; ${wlines[2]} 2>/dev/null;"
+  local pre="${wlines[0]}; ${wlines[1]}; ${wlines[2]} 2>/dev/null;" # tripwire-ok: builds a REMOTE command-string template; the cd suppression is intentional (see the comment above -- a not-yet-provisioned tree must land an interactive shell, not abort the whole ssh session)
   if [ "${1:-}" = "job" ]; then
     # Ctrl-C inside the job's pane signals the job itself, so say so before
     # handing over the keyboard — this is a terminal that can destroy work.
+    # tripwire-ok (has-session check below): a REMOTE command-string
+    # template fragment -- "no such session" is a real, valid state
+    # (checked explicitly by the if/then), never a silent pass.
     printf '%s %s' "$pre" "if tmux has-session -t \"=${tmux_sess}\" 2>/dev/null; then
       echo \"=== joining the running job. Ctrl-B then D detaches. Ctrl-C KILLS the job. ===\";
       exec tmux attach -t \"=${tmux_sess}\"; fi; exec bash -i"
@@ -456,7 +459,7 @@ start_seed_build() {
   [ "$RESEED" = "1" ] && reseed_flag="--reseed"
   rp_run_remote <<EOF
 set -uo pipefail
-tmux kill-session -t "=jammi-seed" 2>/dev/null
+tmux kill-session -t "=jammi-seed" 2>/dev/null # tripwire-ok: idempotent best-effort cleanup of a session that may legitimately not exist yet (first-ever seed build) — the new-session command right below is what actually matters and is unconditional
 tmux new-session -d -s "jammi-seed" "flock -n -E 75 /root/.jammi-timing.lock bash /root/jammi-ai/ci/scripts/pod_seed_target.sh --no-lock ${reseed_flag} > /root/.jammi-seed.log 2>&1"
 tmux set-option -w -t "=jammi-seed:" remain-on-exit off
 echo "seed build started detached (tmux session jammi-seed; log: /root/.jammi-seed.log)"
@@ -476,7 +479,7 @@ case "$CMD" in
     bootstrap_or_die
     [ -n "$RP_REF" ] && start_seed_build
     echo "=== pod ${RP_POD_ID} on ${RP_HOST}:${RP_PORT} @ ${RP_REF:-<none>} (tree: ${TREE}) — it TERMINATES when you exit ==="
-    ssh "${RP_SSHO[@]}" -t -p "$RP_PORT" "root@${RP_HOST}" "$(rp_login_cmd "" "$TREE_DIR" "$TMUX_SESSION")" || true
+    ssh "${RP_SSHO[@]}" -t -p "$RP_PORT" "root@${RP_HOST}" "$(rp_login_cmd "" "$TREE_DIR" "$TMUX_SESSION")" || true # tripwire-ok: an interactive TTY session's own exit status is meaningless here (a user typing `exit`, a dropped connection, Ctrl-C — none are this command's own success/failure); the trap on the line below always terminates the pod regardless
     echo "=== shell closed — terminating pod (trap) ==="
     ;;
 
@@ -576,7 +579,7 @@ case "$CMD" in
     # means everywhere else. `--shell` forces a plain prompt, for when you want to
     # poke around WHILE a job runs rather than take its keyboard.
     MODE=job; [ "${1:-}" = "--shell" ] && MODE=shell
-    ssh "${RP_SSHO[@]}" -t -p "$RP_PORT" "root@${RP_HOST}" "$(rp_login_cmd "$MODE" "$TREE_DIR" "$TMUX_SESSION")" || true
+    ssh "${RP_SSHO[@]}" -t -p "$RP_PORT" "root@${RP_HOST}" "$(rp_login_cmd "$MODE" "$TREE_DIR" "$TMUX_SESSION")" || true # tripwire-ok: same as the `shell` case above — an interactive TTY session's own exit status is not this command's success/failure signal
     echo "=== detached; pod ${RP_POD_ID} still running (down with: $(basename "$0") down ${SESSION}) ==="
     ;;
 
@@ -613,7 +616,7 @@ set -uo pipefail
 cat > '${TREE_DIR}'/.jammi-job.sh <<'JOBEOF'
 $(rp_job_wrapper_lines "$TREE_DIR" "$TARGET_DIR" "$JOB")
 JOBEOF
-tmux kill-session -t "=${TMUX_SESSION}" 2>/dev/null
+tmux kill-session -t "=${TMUX_SESSION}" 2>/dev/null # tripwire-ok: idempotent best-effort cleanup of a session that may legitimately not exist yet (first `run` for this tree/session) — the new-session command right below is unconditional
 tmux new-session -d -s "${TMUX_SESSION}" "${LAUNCH}"
 tmux set-option -w -t "=${TMUX_SESSION}:" remain-on-exit off
 echo "started (tree=${TREE}, timing-locked=${TIMING}): ${JOB}"
@@ -623,7 +626,7 @@ EOF
 
   logs)
     require_pod; rp_keep
-    ssh "${RP_SSHO[@]}" -t -p "$RP_PORT" "root@${RP_HOST}" "tail -f -n 200 '${TREE_DIR}/.jammi.log'" || true
+    ssh "${RP_SSHO[@]}" -t -p "$RP_PORT" "root@${RP_HOST}" "tail -f -n 200 '${TREE_DIR}/.jammi.log'" || true # tripwire-ok: `logs` is a live-follow (`tail -f`) the user Ctrl-C's out of intentionally — a non-zero exit here is the NORMAL way this command ends, not a failure to surface
     ;;
 
   push)
@@ -695,86 +698,21 @@ bash /root/jammi-ai/ci/scripts/pod_target_clone.sh /root/.jammi-seed '${NAME_TAR
 EOF
     rc=$?
     if [ "$rc" -eq 0 ] && [ "$TARGET_WITH_CUTLASS" = "1" ]; then
-      # `cp -a` from /root/jammi-ai's OWN initialised submodule — never
-      # `git submodule update` INSIDE the tree (round-2 audit finding 1): a
-      # tree populated by `push` (rsync, which excludes `.git` — see
-      # pod_push_stamp.sh) carries no `.git` at all, so `git submodule`
-      # there fails with "not a git repository" on every tree except the
-      # default bootstrap checkout. /root/jammi-ai IS always a real git
-      # clone (rp_bootstrap's own, untouched by push), so its submodule is
-      # initialised there once — but round-3 audit N1: /root/jammi-ai's
-      # CURRENT gitlink is not necessarily the commit the DESTINATION
-      # tree's own ref actually needs (the gitlink has already moved once,
-      # 0ee65de) — a tree on an FA2 branch pinning a DIFFERENT cutlass
-      # commit than whatever /root/jammi-ai (usually main) happens to have
-      # checked out would silently receive the WRONG headers. The tree's
-      # own push stamp (pod_push_stamp.sh's cutlass_gitlink field, written
-      # at push time from THAT tree's actual HEAD) is the source of truth:
-      # verified via pod_push_cutlass_matches (the SAME script this
-      # invocation's own hermetic tests exercise, never a second copy of
-      # the comparison logic) against /root/jammi-ai's submodule AFTER
-      # `submodule update`; on a mismatch, fetch+checkout the STAMPED
-      # commit into /root/jammi-ai's own submodule (network — fails loudly
-      # if unreachable) and re-verify before copying; refuses the copy on
-      # any remaining mismatch, naming both shas.
-      # round-4 audit A1: `git rev-parse HEAD:<gitlink-path>` reads the
-      # SUPERPROJECT's own recorded pin for that path — a property of
-      # /root/jammi-ai's OWN HEAD commit, entirely UNAFFECTED by whether
-      # `submodule update` actually ran, or what the submodule's working
-      # directory is actually checked out to. It is not a proxy for "what
-      # commit does the submodule dir cp -a would copy actually hold" —
-      # `git -C <submodule-dir> rev-parse HEAD` is that. Reproduced (the
-      # auditor's own repro, confirmed against a real two-commit submodule
-      # fixture — see this fix's own hermetic test): the superproject pin
-      # stayed unchanged while the submodule HEAD differed, and `cp -a`
-      # would have copied the WRONG commit's tree. This also means the
-      # OLD remediation arm could never succeed: checking out a different
-      # commit INSIDE the submodule cannot change what `HEAD:path` reports
-      # in the superproject, so the old re-check after fetch+checkout
-      # compared the exact same (always-passing-or-always-failing) pair
-      # every time. `set -euo pipefail` (not `-uo pipefail`) so
-      # `submodule update` failing aborts here rather than silently
-      # continuing into a stale/absent submodule.
+      # round-5 audit A1: this logic used to be inlined as heredoc TEXT
+      # right here — the only coverage for it was two `grep`s against that
+      # text (a proxy never run against a real instance; shellcheck cannot
+      # parse a heredoc body either) — and that shape is exactly what let
+      # a `set -e`-vs-bare-command regression (the mismatch-remediation
+      # arm silently becoming dead code) ship undetected. Extracted into
+      # ci/scripts/pod_provision_cutlass.sh, a real file this checkout's
+      # own hermetic suite sources and runs against a genuine two-commit
+      # submodule fixture — see that file's own module doc for the
+      # mechanism (source of truth: the tree's own push stamp;
+      # provisioning: `cp -a` from /root/jammi-ai's initialised submodule,
+      # never `git submodule` inside the tree).
       rp_run_remote <<EOF
-set -euo pipefail
-git -C /root/jammi-ai submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass
-[ -d '${NAME_SOURCE_TREE_DIR}' ] || { echo "::error::tree source dir '${NAME_SOURCE_TREE_DIR}' does not exist — push to it first (target --with-cutlass provisions cutlass INTO an existing tree, it does not create one)"; exit 1; }
-CUTLASS_DIR=/root/jammi-ai/crates/jammi-kernels/third_party/cutlass
-[ -d "\$CUTLASS_DIR/.git" ] || [ -f "\$CUTLASS_DIR/.git" ] || { echo "::error::\$CUTLASS_DIR has no .git after submodule update — deinitialised or never checked out; refusing the copy"; exit 1; }
-STAMP='${NAME_SOURCE_TREE_DIR}/.jammi-push-stamp.json'
-ACTUAL_SHA="\$(git -C "\$CUTLASS_DIR" rev-parse HEAD)"
-bash /root/jammi-ai/ci/scripts/pod_push_stamp.sh cutlass-check "\$STAMP" "\$ACTUAL_SHA"
-CHECK_RC=\$?
-if [ "\$CHECK_RC" -eq 1 ]; then
-  STAMP_SHA="\$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("cutlass_gitlink") or "")' "\$STAMP")"
-  echo "attempting to fetch+checkout the stamp's pinned cutlass commit \$STAMP_SHA into the submodule at \$CUTLASS_DIR..."
-  git -C "\$CUTLASS_DIR" fetch --depth 1 origin "\$STAMP_SHA" \
-    && git -C "\$CUTLASS_DIR" checkout --quiet "\$STAMP_SHA" \
-    || { echo "::error::could not fetch/checkout cutlass \$STAMP_SHA into \$CUTLASS_DIR (network unreachable?) — refusing the copy"; exit 1; }
-  ACTUAL_SHA="\$(git -C "\$CUTLASS_DIR" rev-parse HEAD)"
-  bash /root/jammi-ai/ci/scripts/pod_push_stamp.sh cutlass-check "\$STAMP" "\$ACTUAL_SHA" || { echo "::error::even after fetch+checkout, the SUBMODULE's own HEAD still does not match the stamp — refusing the copy"; exit 1; }
-elif [ "\$CHECK_RC" -ne 0 ]; then
-  exit 1
-fi
-mkdir -p '${NAME_SOURCE_TREE_DIR}/crates/jammi-kernels/third_party'
-rm -rf '${NAME_SOURCE_TREE_DIR}/crates/jammi-kernels/third_party/cutlass'
-cp -a "\$CUTLASS_DIR" '${NAME_SOURCE_TREE_DIR}/crates/jammi-kernels/third_party/cutlass'
-# round-4 addendum: \$CUTLASS_DIR's own \`.git\` is a SUBMODULE GITLINK
-# pointer file (not a full repo), and \`cp -a\` copies it verbatim into the
-# destination tree — a plain directory tree that is not itself registered
-# as owning that gitlink. \${NAME_SOURCE_TREE_DIR} is itself a real git
-# checkout (rp_bootstrap's default tree, or a pushed tree whose OWN .git
-# already exists); a second, foreign, un-registered .git nested inside it
-# makes \`git status\`/\`git add\` run from that tree's root treat the path
-# as an embedded-repository boundary it cannot resolve, failing fatally.
-# The gitlink file is never needed in the copy (this path is deliberately
-# NOT git-managed inside the destination tree at all — target --with-
-# cutlass provisions it by \`cp -a\`, never by \`git submodule\` inside the
-# tree, exactly because a pushed tree carries no .git of its own to attach
-# a submodule to). Strip it and assert it is gone.
-rm -rf '${NAME_SOURCE_TREE_DIR}/crates/jammi-kernels/third_party/cutlass/.git'
-[ -e '${NAME_SOURCE_TREE_DIR}/crates/jammi-kernels/third_party/cutlass/.git' ] && { echo "::error::cutlass/.git still present in the destination tree after stripping — refusing to leave a foreign gitlink in a git-backed tree"; exit 1; }
-true
+set -uo pipefail
+bash /root/jammi-ai/ci/scripts/pod_provision_cutlass.sh '${NAME_SOURCE_TREE_DIR}' /root/jammi-ai
 EOF
       rc=$?
     fi

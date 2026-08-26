@@ -122,7 +122,10 @@ fi
 # is its direct child, so that wrapper being alive IS this invocation
 # genuinely holding the lock right now).
 _LOCK_FILE="${JAMMI_TIMING_LOCK:-/root/.jammi-timing.lock}"
-_HOLDER_PID="$(grep -o '^pid=[0-9]*$' "${_LOCK_FILE}.holder" 2>/dev/null | cut -d= -f2)"
+_HOLDER_PID="$(grep -o '^pid=[0-9]*$' "${_LOCK_FILE}.holder" 2>/dev/null | cut -d= -f2)" # tripwire-ok: a missing/unreadable holder file is a REAL, valid state (no lock held, or a race with the writer) — _HOLDER_PID coming back empty is checked explicitly right below (LOCK_HELD=false), never silently treated as "held"
+# tripwire-ok (both lines below): a missing/non-matching holder file or a
+# dead pid legitimately means "not held by this label" — the else-branch
+# reports LOCK_HELD=false loudly right below, never silently.
 if [ -f "${_LOCK_FILE}.holder" ] && grep -q '^holder=pod_build_timings$' "${_LOCK_FILE}.holder" 2>/dev/null \
    && [ -n "$_HOLDER_PID" ] && kill -0 "$_HOLDER_PID" 2>/dev/null; then
   LOCK_HELD=true
@@ -133,8 +136,13 @@ fi
 
 # shellcheck disable=SC1091
 . "$CI_SCRIPTS/pod_seed_target.sh"
+# round-5 note: no pod_push_* function is actually called anywhere else in
+# THIS file (grep confirms) — this sourcing is vestigial. Left in place
+# (removing it is a separate, non-behavior-changing cleanup) but the
+# swallow is now named honestly: a source failure here can never affect
+# this script's own correctness, since nothing downstream depends on it.
 # shellcheck disable=SC1091
-. "$CI_SCRIPTS/pod_push_stamp.sh" 2>/dev/null || true
+. "$CI_SCRIPTS/pod_push_stamp.sh" 2>/dev/null || true # tripwire-ok: dead/vestigial sourcing -- no pod_push_* function is called anywhere else in this file, so a failure here is inert by construction, not silently masking a real dependency
 
 cd "$JAMMI_TREE_DIR" || fail "no tree at $JAMMI_TREE_DIR"
 
@@ -152,11 +160,42 @@ echo "::group::(i) seed"
 # member-free, run again HERE (a second, independent witness; the seed's
 # own build already ran it before stamping complete).
 pod_seed_assert_member_free "$JAMMI_SEED_DIR" "$JAMMI_TREE_DIR" || fail "seed at ${JAMMI_SEED_DIR} is NOT member-free"
-S_seed_bytes="$(du -sk "$JAMMI_SEED_DIR" 2>/dev/null | awk '{print $1*1024}')"
+S_seed_bytes="$(du -sk "$JAMMI_SEED_DIR" 2>/dev/null | awk '{print $1*1024}')" # tripwire-ok: best-effort size for the RP_DISK_GB report only, never gates pass/fail; a du failure yields S_seed_bytes="" -> the JSON writer emits null for it (explicit, not a silent zero)
+# round-5 fix (Class-A item 4): the seed's own completion marker now
+# records WHICH tuples it actually built (pod_seed_target.sh's
+# t1b_flash_attn_ran/reason, see that script's own completion-marker
+# writer) — read back here and copied verbatim into THIS producer's own
+# output JSON, so `flash_attn_leg_wall_s` below is interpretable: a reader
+# can tell whether the SEED itself carried FA2 artifacts, independent of
+# whether this run's OWN separate FA2 *measurement* leg (below) also ran.
+seed_tuples_json="$(python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    print("[]"); sys.exit(0)
+print(json.dumps(d.get("tuples", [])))
+' "${JAMMI_SEED_DIR}.jammi-seed-complete")"
+seed_t1b_ran="$(python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    print("false"); sys.exit(0)
+print("true" if d.get("t1b_flash_attn_ran") else "false")
+' "${JAMMI_SEED_DIR}.jammi-seed-complete")"
+seed_t1b_reason="$(python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    print(""); sys.exit(0)
+print(d.get("t1b_flash_attn_reason") or "")
+' "${JAMMI_SEED_DIR}.jammi-seed-complete")"
 echo "::endgroup::"
 
 # ---- source-tree size (for RP_DISK_GB's S_src) --------------------------
-S_src_bytes="$(du -sk --exclude=.git "$JAMMI_TREE_DIR" 2>/dev/null | awk '{print $1*1024}')"
+S_src_bytes="$(du -sk --exclude=.git "$JAMMI_TREE_DIR" 2>/dev/null | awk '{print $1*1024}')" # tripwire-ok: same as S_seed_bytes above -- best-effort report-only size, empty result -> JSON null, never a silent zero
 
 # ---- (ii) clone build at the FA2 tip -------------------------------------
 echo "::group::(ii) clone build @ ${JAMMI_FA2_TIP_REF}"
@@ -174,14 +213,26 @@ git checkout --quiet "$JAMMI_FA2_TIP_REF" || fail "checkout of ${JAMMI_FA2_TIP_R
 # guard required a PRE-EXISTING `.git` before it would even try
 # `--init`, which defeats the entire purpose of `--init` (first-time
 # initialisation) on a fresh pod that has never touched cutlass before.
-if grep -q 'crates/jammi-kernels/third_party/cutlass' .gitmodules 2>/dev/null; then
+if grep -q 'crates/jammi-kernels/third_party/cutlass' .gitmodules 2>/dev/null; then # tripwire-ok: a missing .gitmodules is a REAL, valid state on a ref that never carried the cutlass submodule at all -- the whole cutlass-pin block below is correctly SKIPPED, not silently passed
   git submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass \
     || fail "git submodule update for cutlass failed after checking out ${JAMMI_FA2_TIP_REF}"
   [ -d "crates/jammi-kernels/third_party/cutlass/.git" ] || [ -f "crates/jammi-kernels/third_party/cutlass/.git" ] \
     || fail "crates/jammi-kernels/third_party/cutlass has no .git after submodule update — deinitialised or never checked out"
-  _pinned_sha="$(git rev-parse "HEAD:crates/jammi-kernels/third_party/cutlass" 2>/dev/null || true)"
-  _actual_sha="$(git -C crates/jammi-kernels/third_party/cutlass rev-parse HEAD 2>/dev/null || true)"
-  if [ -n "$_pinned_sha" ] && [ "$_pinned_sha" != "$_actual_sha" ]; then
+  _pinned_sha="$(git rev-parse "HEAD:crates/jammi-kernels/third_party/cutlass" 2>/dev/null || true)" # tripwire-ok: rc discarded deliberately -- an empty result here is a REAL, checked state (see the round-5 fix right below), never silently treated as "no pin to check"
+  _actual_sha="$(git -C crates/jammi-kernels/third_party/cutlass rev-parse HEAD 2>/dev/null || true)" # tripwire-ok: same -- submodule dir's own HEAD read; empty is impossible here (the .git existence check two lines up already guarantees a real checkout), kept symmetric with _pinned_sha's form
+  # round-5 fix (round-4 audit advisory, promoted): the OLD guard only
+  # compared the two shas when BOTH were non-empty (`[ -n "$_pinned_sha" ]
+  # && ...`) — an EMPTY `_pinned_sha` (this ref's own HEAD has NO gitlink
+  # at this path even though .gitmodules — checked just above — DOES
+  # declare it: a gitlink removed at this exact ref while .gitmodules
+  # still lists the path) silently skipped the whole assertion. ".gitmodules
+  # declares the path" is what gated entry into this block in the first
+  # place, so an empty pin here is itself the anomaly to report, never a
+  # silent "nothing to check".
+  if [ -z "$_pinned_sha" ]; then
+    fail ".gitmodules declares crates/jammi-kernels/third_party/cutlass but HEAD has no gitlink there (empty 'git rev-parse HEAD:<path>') — refusing to build against an unpinned cutlass checkout"
+  fi
+  if [ "$_pinned_sha" != "$_actual_sha" ]; then
     fail "cutlass MISMATCH after submodule update: superproject pins ${_pinned_sha}, submodule is actually at ${_actual_sha}"
   fi
 fi
@@ -199,7 +250,7 @@ grep -q 'reflink=auto' /tmp/pod_build_timings.clone.log && reflink_took="attempt
 # loudly rather than letting a missing CLONE_DIR fail obscurely below.
 [ -d "$CLONE_DIR" ] || fail "clone at ${CLONE_DIR} is missing — pod_target_clone.sh's own member-freedom check likely refused it (see the log above)"
 
-sccache_before="$(sccache --show-stats 2>/dev/null || echo 'sccache not running')"
+sccache_before="$(sccache --show-stats 2>/dev/null || echo 'sccache not running')" # tripwire-ok: "sccache not running" is a visible, non-empty sentinel (never a silent empty string) for the ordinary pod-wide state (M3: the wrapper is off) -- leg (iii)'s own delta check reads this value verbatim, so a real absence is reported, not hidden
 export CARGO_TARGET_DIR="$CLONE_DIR"
 export CARGO_INCREMENTAL=0
 export CARGO_BUILD_RUSTC_WRAPPER=
@@ -209,7 +260,7 @@ clone_rc=$?
 clone_t1=$(date +%s)
 clone_wall=$((clone_t1 - clone_t0))
 [ "$clone_rc" -eq 0 ] || fail "clone build (T1) failed (exit $clone_rc) — see /tmp/pod_build_timings.clone_t1.log"
-sccache_after="$(sccache --show-stats 2>/dev/null || echo 'sccache not running')"
+sccache_after="$(sccache --show-stats 2>/dev/null || echo 'sccache not running')" # tripwire-ok: same as sccache_before above
 clone_features="cuda"
 
 # round-3 audit N3: clone_hashes and the T1 recompiled-unit list are
@@ -219,7 +270,7 @@ clone_features="cuda"
 # this snapshot AFTER both had run: on `main` (where FA2 always ran)
 # byte_equal against the T1-only cold leg was GUARANTEED false, and
 # recompiled_units was the union of two different feature builds' logs.
-S_clone_bytes="$(du -sk "$CLONE_DIR" 2>/dev/null | awk '{print $1*1024}')"
+S_clone_bytes="$(du -sk "$CLONE_DIR" 2>/dev/null | awk '{print $1*1024}')" # tripwire-ok: same as S_seed_bytes/S_src_bytes above -- best-effort report-only size, empty -> JSON null
 # round-4 addendum (on-pod incident, a100c A2 run at b3cafda): `shasum` is
 # ABSENT on the pod image — this used to make every hash in this leg
 # SILENTLY empty there, so byte_equal's "equal" was comparing two empty
@@ -273,7 +324,22 @@ if [ "$(git rev-parse --abbrev-ref HEAD)" = "main" ]; then
   elif [ "$feat_rc" -eq 1 ]; then
     echo "FA2 leg skipped: jammi-kernels declares no flash-attn feature (cargo metadata)"
   else
-    echo "::warning::FA2 leg skipped: could not determine whether jammi-kernels declares flash-attn (cargo metadata query failed) — treating as absent" >&2
+    # round-5 fix (round-4 audit finding, family O — "trace the mechanism
+    # behind a stated justification"): this arm used to WARN-and-skip,
+    # justified in-comment by "the seed's own real invocation at step (i)
+    # already aborts on the same rc=2" (pod_seed_target.sh:270-274 at the
+    # time). That justification is FALSE whenever a seed already exists:
+    # `pod_seed_target.sh --no-lock` (called without --reseed at step (i),
+    # just above) short-circuits at "seed already complete — nothing to
+    # do" (pod_seed_target.sh's own COMPLETE_MARKER gate) and returns 0
+    # WITHOUT ever reaching the T1b/rc=2 abort — which is the ORDINARY
+    # state here, since `up`/`shell` already kick off the seed at
+    # bootstrap (dev-gpu-recipes.md). A broken `--frozen` metadata query
+    # at THIS call site must therefore abort on its own terms, exactly
+    # like the seed's own T1b gate does — never silently downgrade to
+    # "absent" (the same on-pod incident class pod_seed_target.sh's own
+    # T1b gate was fixed for in round 4).
+    fail "FA2 leg: could not determine whether jammi-kernels declares flash-attn (cargo metadata query failed or the package was not found) — refusing to guess 'absent'; see pod_seed_pkg_has_feature's own ::error:: above for the real cause"
   fi
 fi
 echo "::endgroup::"
@@ -324,11 +390,16 @@ else
   byte_equal="false"
   byte_equal_diff="$(diff <(echo "$clone_hashes") <(echo "$cold_hashes") | head -50)"
 fi
-# round-3 audit N3: assert the SAME feature string was used on both legs —
-# a self-check that the comparison above is even meaningful (comparing
-# byte-equality across two DIFFERENT feature sets would be a category
-# error, not a finding).
-[ "$clone_features" = "$cold_features" ] || fail "clone_features (${clone_features}) != cold_features (${cold_features}) — byte-equality comparison would be meaningless"
+# round-5 fix (round-4 audit advisory: "a self-check between two constants
+# proves nothing"): the OLD form asserted `clone_features == cold_features`
+# — but BOTH are hardcoded to the literal "cuda" at their own assignment
+# sites above (:244, :335), never derived from either cargo invocation's
+# actual `--features` argument, so the comparison could never fire; it
+# tested the script's own two adjacent string literals against each
+# other, not the real build commands. clone_features/cold_features are
+# still recorded in the output JSON below (informational — a future
+# reader wants to see what was actually built), just without the
+# tautological self-check.
 echo "::endgroup::"
 
 # ---- assemble result JSON (single pass; every value passed explicitly,
@@ -338,11 +409,17 @@ RECOMPILED="$recompiled" SCCACHE_DELTA_NOTE="$sccache_delta_note" \
   python3 - "$BOX" "$(git rev-parse HEAD)" "$JAMMI_FA2_TIP_REF" "$clone_wall" "${fa2_wall:-}" \
   "$copy_wall" "$reflink_took" "$S_src_bytes" "$S_seed_bytes" "$S_clone_bytes" \
   "$byte_equal" "$(date -u +%FT%TZ)" "$cold_wall" "$LOCK_HELD" "$clone_features" "$cold_features" "$fa2_features" \
+  "$seed_tuples_json" "$seed_t1b_ran" "$seed_t1b_reason" \
   > "$JAMMI_BUILD_TIMINGS_OUT" <<'PY'
 import json, sys, os
 (box, sha, tip_ref, clone_wall, fa2_wall, copy_wall, reflink_took,
  s_src, s_seed, s_clone, byte_equal, ts, cold_wall, lock_held,
- clone_features, cold_features, fa2_features) = sys.argv[1:18]
+ clone_features, cold_features, fa2_features,
+ seed_tuples_json, seed_t1b_ran, seed_t1b_reason) = sys.argv[1:21]
+try:
+    seed_tuples = json.loads(seed_tuples_json)
+except Exception:
+    seed_tuples = []
 result = {
   "schema_version": 1,
   "box": box,
@@ -359,7 +436,17 @@ result = {
     "S_src_bytes": int(s_src) if s_src else None,
     "S_seed_bytes": int(s_seed) if s_seed else None,
     "S_clone_bytes": int(s_clone) if s_clone else None,
-    "clone_vs_row1_284s_cold_baseline_delta_s": int(clone_wall) - 284,
+    # round-5 fix (round-4 audit advisory: "a headline delta must be a
+    # same-run, same-box control"): the OLD field hardcoded a 284s
+    # constant from ledger row 1 (a DIFFERENT box, different load;
+    # .jammi/ledger/ is gitignored, so nothing in the repo even PRODUCES
+    # 284) into this artifact's schema, next to `cold_build_wall_s` above
+    # which already measures the SAME-run, same-box cold-build control. A
+    # reader who wants the delta can compute clone_build_wall_s -
+    # cold_build_wall_s (or vs. any other row they choose) FROM the two
+    # real numbers already here — this producer no longer bakes in one
+    # specific, uncommitted, cross-box comparator as if it were part of
+    # the measurement itself.
   },
   # round-3 audit N3: recorded explicitly so a reader (or a future CI check)
   # can independently confirm the byte-equality comparison above compared
@@ -367,6 +454,14 @@ result = {
   "clone_features": clone_features,
   "cold_features": cold_features,
   "fa2_features": fa2_features or None,
+  # round-5 fix (Class-A item 4): which tuples the SEED itself actually
+  # built (pod_seed_target.sh's own completion marker, read back at step
+  # (i) above) — makes `flash_attn_leg_wall_s` interpretable: it is only
+  # meaningful when seed_t1b_flash_attn_ran is also true (this producer's
+  # OWN FA2 leg clones FROM that seed).
+  "seed_tuples": seed_tuples,
+  "seed_t1b_flash_attn_ran": seed_t1b_ran == "true",
+  "seed_t1b_flash_attn_reason": seed_t1b_reason or None,
   "recompiled_units": os.environ.get("RECOMPILED", "").splitlines(),
   # round-4 audit A4: this field used to collapse "invalid" (empty match set
   # on one or both legs — the comparison never actually ran) into the same
@@ -375,13 +470,18 @@ result = {
   # never meaningfully ran". Emit the raw tri-state string so both cases are
   # distinguishable in the artifact; the boolean below is kept for existing
   # consumers that only care about the true/not-true axis.
-  "byte_equal_clone_vs_cold_same_target_dir": byte_equal == "true",
+  #
+  # round-5 fix (round-4 audit advisory: "'same target dir' doc/mechanism
+  # agree"): the module doc (above, "DELIBERATELY two DIFFERENT literal
+  # CARGO_TARGET_DIR paths") was already corrected, but this field's OWN
+  # NAME still asserted the claim the doc retracted. Renamed to describe
+  # what the mechanism actually compares.
+  "byte_equal_clone_vs_cold": byte_equal == "true",
   "byte_equal_state": byte_equal,
   "sccache_note": os.environ.get("SCCACHE_DELTA_NOTE", ""),
   "sccache_before": os.environ.get("SCCACHE_BEFORE", ""),
   "sccache_after": os.environ.get("SCCACHE_AFTER", ""),
 }
-assert clone_features == cold_features, "clone_features/cold_features must match for byte_equal to mean anything"
 print(json.dumps(result, indent=2))
 PY
 

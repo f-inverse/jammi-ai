@@ -1139,7 +1139,6 @@ impl ModernBertAttention {
     /// is provably identical to what this crate shipped before
     /// `AttentionBlockFused` existed — the op contract's "eager fallback ==
     /// today's exact composition" requirement.
-    #[allow(clippy::too_many_arguments)]
     /// esc-045 round 5 (GH #374), E2 diagnostic ONLY -- read once per
     /// call (an uncached `env::var`, exactly like `jammi_kernels`' own
     /// `JAMMI_KERNELS_DISABLE`/`JAMMI_KERNELS_STRICT` K-aux levers this
@@ -1178,6 +1177,7 @@ impl ModernBertAttention {
         std::env::var("JAMMI_ROUND5_UPCAST_SCORES").is_ok()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward_eager_training_attention_composition(
         &self,
         qkv: &Tensor,

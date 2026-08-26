@@ -1,0 +1,290 @@
+{
+  "schema_version": 1,
+  "git_sha": "8924b30ab6052a06b10ae656bb0e26a1fb17c365",
+  "git_sha_short": "8924b30",
+  "branch": "scratch/esc045-r6-localize",
+  "branch_base": "origin/perf/p6-fa2-dense",
+  "box": "jammi-a100b (A100-SXM4-80GB)",
+  "gpu": "NVIDIA A100-SXM4-80GB",
+  "status": "complete -- measurements only, GH #374 round 7 (E7-E10)",
+  "producer": {
+    "jammi_grad_oracle": "crates/jammi-bench/src/grad_oracle.rs via `jammi-bench grad-oracle` (release, --features cuda, no flash-attn -- 'the block binary': target-r6-base, git_rev 8924b30 confirmed embedded in every dump below)",
+    "bisect_driver": "crates/jammi-bench/reference/esc045_r7_bisect_sweep.sh (new this round)",
+    "e8_aggregator": "crates/jammi-bench/reference/esc045_r7_e8_aggregate.py (new this round, reuses compare_grad_oracle.py's own per_tensor cosine -- family F, one oracle not two)",
+    "comparator": "ci/scripts/perf/compare_grad_oracle.py --cosine-floor 0.6 --allow-same-producer (its own derive_cosine_floor is NEGATIVE at ModernBERT-large defaults -- see 'cosine_floor_disclosure' below; pre-existing, not introduced this round)",
+    "flash_boundary_source": "round 6's own crates/jammi-bench/reference/round6_layer_compare.py output, /root/esc045-r6/compare/jammi_dump_flash_vs_f32_all.json (jammi_dump_flash_bf16_b4s128.safetensors vs jammi_dump_f32_b4s128.safetensors) -- reused, not regenerated (code path unaffected by the round5->round6 diff, see shared_config note)",
+    "existing_lora_oracle_suite": "crates/jammi-kernels/tests/lora_linear_oracles.rs (F32/CPU only -- run this round via `cargo test -p jammi-kernels --release --test lora_linear_oracles`, 11/11 pass, unmodified)"
+  },
+  "shared_config": {
+    "checkpoint": "ModernBERT-large (/root/checkpoints/ModernBERT-large)",
+    "num_hidden_layers": 28,
+    "hidden_size": 1024,
+    "lora_rank": 16,
+    "lora_alpha": 32.0,
+    "lora_target_modules": [
+      "Wqkv",
+      "Wo",
+      "Wi"
+    ],
+    "lora_dropout": 0.0,
+    "lora_init": "Gaussian shared weights seeded round 6 (seed 42) -- reused, NOT redrawn: --lora-weights-in shared_gaussian_seed42.safetensors on every leg below, so every leg trains from IDENTICAL A/B values regardless of seed/shape/disable-set",
+    "determinism_check": "baseline (b4-s128, seed 42, all-fused) run twice back to back on the SAME binary: 0 element-level diffs across all 224 gradient tensors, max_abs_delta=0.0 -- bit-for-bit reproducible; the seed43/b8s128 variance reported below is genuine data-dependence, not run-to-run nondeterminism (family J holds)",
+    "cosine_floor_disclosure": "compare_grad_oracle.py's derive_cosine_floor(28, 1024) is NEGATIVE (~-0.40, non-positive) -- an already-disclosed, pre-existing property of this comparator at ModernBERT-large's depth (its own derive_relative_error_bound is not tight at this depth), not introduced or newly discovered this round. Every comparison below therefore passes an explicit --cosine-floor 0.6 rather than letting main() derive-and-refuse."
+  },
+  "cross_stack_validation": {
+    "e7_dispatch_confirmation": "every `JAMMI_KERNELS_DISABLE=<key>` run's kernels_disabled_requested/kernels_disabled_fired checked per-run (recorded in each dump's own JSON, GradOracleReport's unconditional provenance pair -- GradOracle's CLI has no --expect-kernels-disabled flag the way FinetuneStep does, so this round verifies requested==fired by reading the report back rather than via a hard CLI-side assertion): lora_linear_fused, geglu_fused, layer_norm_fused, attention_block_fused, cast_scale_bf16_f32+cast_add_bf16 all show requested==fired (the disable took effect on a live call site). rope_fused, softmax_last_dim_fused, lora_epilogue, lora_dropout show requested != fired (fired=[]) UNDER THIS BASELINE ARM -- EXPECTED, not an error: rope_fused/softmax_last_dim_fused have no live call site while attention_block_fused stays on (their own admit() sites are inside the EAGER attention composition, never reached when the whole block is fused); lora_epilogue/lora_dropout are permanently-dead counters per lora_linear.rs's own doc (superseded by lora_linear_fused's internal accounting)."
+  },
+  "E7_bisect_table": {
+    "description": "Full-224-tensor concatenated trainable-LoRA-gradient cosine vs jammi's own f32 truth, one forward+backward, no optimizer step, at b4-s128 seed42 unless noted. Baseline = every fused kernel ON (the production default). Each row disables ONE key (or the stated set) on the SAME block binary, JAMMI_KERNELS_STRICT=1.",
+    "b4s128_seed42": {
+      "baseline_all_fused": 0.6098268554357086,
+      "lora_linear_fused_disabled": 0.7039233043213515,
+      "geglu_fused_disabled": 0.7912350422112485,
+      "layer_norm_fused_disabled": 0.780742959732835,
+      "attention_block_fused_disabled": 0.6098268554357086,
+      "rope_fused_disabled_dead_path": 0.6098268554357086,
+      "softmax_last_dim_fused_disabled_dead_path": 0.6098268554357086,
+      "cast_scale_and_cast_add_disabled": 0.6098268554357086,
+      "lora_epilogue_disabled_dead_path": 0.6098268554357086,
+      "lora_dropout_disabled_dead_path": 0.6098268554357086,
+      "all_eager_ceiling": 0.8100927710946351
+    },
+    "pairwise_and_triple_combinations_b4s128_seed42": {
+      "geglu_fused_plus_layer_norm_fused": 0.7448852590884276,
+      "geglu_fused_plus_lora_linear_fused": 0.6779226062762407,
+      "layer_norm_fused_plus_lora_linear_fused": 0.6996873655776993,
+      "geglu_fused_plus_layer_norm_fused_plus_lora_linear_fused": 0.8721988292112609,
+      "note": "NON-ADDITIVE and non-monotonic: every pairwise combo scores WORSE than the better of its two single-op legs (e.g. geglu+ln=0.745 < geglu-alone=0.791 AND < ln-alone=0.781); the TRIPLE combo (0.872) exceeds even the all-eager ceiling (0.810). This is inconsistent with 'two independent, additive defects' and consistent with geglu_fused/layer_norm_fused toggling between two DIFFERENT (not strictly better/worse) bf16 rounding realizations whose interaction with the batch's specific direction is non-linear -- see the mechanism paragraph."
+    },
+    "robustness_confirmation_seed43_b4s128": {
+      "baseline_all_fused": 0.25820997897702774,
+      "attention_block_fused_disabled": 0.25820997897702774,
+      "cast_scale_and_cast_add_disabled": 0.25820997897702774,
+      "geglu_fused_disabled": 0.0640119431879333,
+      "layer_norm_fused_disabled": 0.24944977786686348,
+      "lora_linear_fused_disabled": 0.5124673428610873,
+      "all_eager_ceiling": 0.10357504770175764
+    },
+    "robustness_confirmation_b8s128_seed42": {
+      "baseline_all_fused": 0.842976674556436,
+      "attention_block_fused_disabled": 0.842976674556436,
+      "cast_scale_and_cast_add_disabled": 0.842976674556436,
+      "geglu_fused_disabled": -0.25721768155431834,
+      "layer_norm_fused_disabled": 0.8405273157641576,
+      "lora_linear_fused_disabled": 0.9261947887864374,
+      "all_eager_ceiling": 0.7730474935497785
+    },
+    "robustness_finding": "Round 6's own headline ('production block-fused is the WORST bf16 arm vs f32 truth, 0.610 < eager's 0.810') does NOT reproduce at either confirmation config: at seed43/b4-s128 block-fused (0.258) beats all-eager (0.104); at b8-s128/seed42 block-fused (0.843) beats all-eager (0.773). Only the ONE originally-measured cell (seed42, b4-s128) shows block-fused worse than all-eager. attention_block_fused and the cast_scale/cast_add pair are the only two keys whose disable reproduces the baseline cosine to the displayed digit at EVERY one of the three tested configs -- a robust NULL result, ruling them out as contributors on this axis. geglu_fused and layer_norm_fused are large movers at the original cell but FLIP SIGN at the other two (geglu_fused's disable is catastrophically worse, -0.257 vs baseline 0.843, at b8-s128). lora_linear_fused's disable is the ONLY one that is POSITIVE at all three tested configs (+0.094, +0.254, +0.083) -- the single robust, sign-consistent finding this bisection produced."
+  },
+  "E8_per_tensor_characterization": {
+    "description": "esc045_r7_e8_aggregate.py rows for baseline/geglu_fused-disabled/layer_norm_fused-disabled/lora_linear_fused-disabled/all_eager/flash, at b4-s128 seed42, grouped by (module x lora_a/lora_b) and by truth-norm mass.",
+    "module_x_ab_average_cosine_baseline": {
+      "Wi_lora_a": 0.806,
+      "Wi_lora_b": 0.806,
+      "Wo_lora_a": 0.882,
+      "Wo_lora_b": 0.887,
+      "Wqkv_lora_a": 0.873,
+      "Wqkv_lora_b": 0.873,
+      "mlp_Wo_lora_a": 0.86,
+      "mlp_Wo_lora_b": 0.853,
+      "note": "every module-x-A/B average sits in 0.81-0.89 -- individually 'fine' by any ordinary bf16 standard"
+    },
+    "top8_by_f32_truth_norm_mass_baseline": [
+      {
+        "name": "layer.0.Wo.lora_b",
+        "cosine": 0.6461,
+        "norm_ratio": 0.778
+      },
+      {
+        "name": "layer.0.Wqkv.lora_b",
+        "cosine": 0.5582,
+        "norm_ratio": 0.765
+      },
+      {
+        "name": "layer.0.Wqkv.lora_a",
+        "cosine": 0.4912,
+        "norm_ratio": 0.796
+      },
+      {
+        "name": "layer.0.Wo.lora_a",
+        "cosine": 0.6082,
+        "norm_ratio": 0.847
+      },
+      {
+        "name": "layer.1.Wqkv.lora_a",
+        "cosine": 0.5797,
+        "norm_ratio": 0.806
+      },
+      {
+        "name": "layer.1.Wqkv.lora_b",
+        "cosine": 0.5401,
+        "norm_ratio": 0.858
+      },
+      {
+        "name": "layer.1.Wo.lora_b",
+        "cosine": 0.5717,
+        "norm_ratio": 0.862
+      },
+      {
+        "name": "layer.1.Wo.lora_a",
+        "cosine": 0.2886,
+        "norm_ratio": 0.648
+      }
+    ],
+    "weight_gradient_mass_by_layer_f32_truth_basis": {
+      "description": "sum(norm_truth^2) per layer as a fraction of the total across all 224 tensors -- a property of jammi's OWN f32 truth dump, not an artifact of any bf16 arm.",
+      "layer_0": 0.3158,
+      "layer_1": 0.21,
+      "layer_2": 0.1238,
+      "layer_3": 0.1148,
+      "layer_4": 0.0725,
+      "cumulative_layers_0_to_4": 0.8368,
+      "cumulative_layers_0_to_12": 0.9995,
+      "layers_13_to_27_combined": 0.0005
+    },
+    "finding": "The whole-network deficit is LAYER-BANDED and MASS-CONCENTRATED, not module-specific or spread evenly: layers 0-4 alone carry 83.7% of the total f32-truth weight-gradient L2^2 mass, and layers 0-1's own per-tensor cosine (0.29-0.65 at the original cell) is the WORST in the network -- well below the 0.81-0.89 module-wide average. The full-224-tensor concatenated cosine is therefore dominated by a handful of high-mass, high-error early-layer tensors, which explains why a single op's disable can swing the headline metric by +/-0.2-1.1 cosine units depending on how that swap happens to change THOSE FEW tensors' direction for a given batch."
+  },
+  "E9_lora_linear_fused_classification": {
+    "existing_isolated_oracle": "crates/jammi-kernels/tests/lora_linear_oracles.rs -- 11/11 pass on this build (F32, CPU only; no BF16/CUDA test for this op's bwd exists in the crate today), including a BIT-EXACT (tol=0.0) forward leg and `production_width_backward_matches_candle_autograd_of_the_current_composition` (fused bwd vs candle's own Tensor::backward() walk of the unfused graph, tol ~1e-3-scale)",
+    "module_doc_claim": "low_rank_residual_linear.rs's own module doc ('Every rounding point, forward'/'Every rounding point, backward') claims step-for-step BIT-EXACT GEMM issuance parity with the eager composition at every stage -- same cuBLAS/gemm-crate calls, same operand transposes/orientations candle's own Op::Matmul backward would issue for the unfused graph, same single rounding points as the eager composition's own to_dtype/ScaledCastAdd calls.",
+    "quoted_bwd_code": "crates/jammi-kernels/src/ops/low_rank_residual_linear.rs, LowRankResidualLinear::bwd (~L748-772): `let dy_f32 = match admit_cast_boundary(\"cast_scale_bf16_f32\", ...) { Fused => apply1(grad_res, CastScaleBf16F32::new(scale)), Eager => grad_res.to_dtype(F32)?.affine(scale, 0.0)? }; ... let d_b = d_lora_2d.t()?.matmul(&h_2d)?; let g = d_lora_2d.matmul(&b)?; let d_a_t = xd_2d.t()?.matmul(&g)?;` -- these three GEMMs are ALGEBRAICALLY (and, per the module doc, bit-for-bit) the same operand form candle's own autograd differentiation of `after_a = x_lora.matmul(&a.t())`, `lora_out = after_a.matmul(&b.t())` would issue.",
+    "elementwise_check_layer0_Wqkv": {
+      "method": "fused-arm (baseline) dA/dB vs lora_linear_fused-disabled-arm dA/dB for layer.0.Wqkv (the metric's single highest-truth-norm-mass tensor pair), same b4-s128 seed42 batch",
+      "layer_0_Wqkv_lora_a": {
+        "n": 16384,
+        "max_abs_delta": 0.0477,
+        "mean_abs_delta": 0.00334,
+        "frac_same_sign": 0.73,
+        "frac_elems_fused_closer_to_truth": 0.424
+      },
+      "layer_0_Wqkv_lora_b": {
+        "n": 49152,
+        "max_abs_delta": 0.0662,
+        "mean_abs_delta": 0.00147,
+        "frac_same_sign": 0.744,
+        "frac_elems_fused_closer_to_truth": 0.402
+      },
+      "finding": "NOT a few-ulp difference: at the worst element (i=13937 of lora_a), fused=0.000832, near-eager=0.0485, f32-truth=0.0307 -- a >50x spread between the two arms at that single element, both individually far from a bf16-rounding-scale (~2^-8 relative) departure from each other. Eager is closer to truth on ~58-60% of elements (fused wins the minority)."
+    },
+    "growth_oracle_r_L": {
+      "method": "guide S3.2's r(L) = sum|fused-eager| / sum|eager| computed PER LAYER (fused=baseline, eager=lora_linear_fused-disabled), b4-s128 seed42, backward order runs layer27 (freshest gradient signal, first computed in backward) -> layer0 (most backward-compounded)",
+      "r_layer_27": 0.32,
+      "r_layer_20": 0.4094,
+      "r_layer_13": 0.5179,
+      "r_layer_9": 0.6816,
+      "r_layer_4": 0.6006,
+      "r_layer_1": 0.7395,
+      "r_layer_0": 0.7462,
+      "finding": "r(L) roughly DOUBLES from ~0.32 at the last layer (backward order) to ~0.60-0.75 at the earliest 9 layers -- the SAME growth-with-backward-depth signature esc-044's own real defect carried ('a compounding defect is invisible at one call -- key the oracle on GROWTH'), even though the isolated single-call F32 CPU oracle (no compounding across depth) reports this op's bwd as correct within its own derived tolerance."
+    },
+    "classification": "NEITHER pure rounding-placement (the elementwise delta is too large and too structured for that, unlike GeGLU's/LayerNorm's disclosed round-once-vs-cascade divergence) NOR a demonstrated formula/indexing bug at the single-call level (the existing F32/CPU oracle suite passes, and the module doc's GEMM-operand-form derivation checks out algebraically against candle's own Op::Matmul backward rule for both dA^T and dB). The evidence is consistent with an esc-044-CLASS compounding divergence: a small, individually bf16-bound-consistent per-call difference (not caught by the F32/CPU-only oracle, which has no BF16/CUDA leg to catch a BF16-specific rounding difference at all) that accumulates additively through candle's own backward walk across 28 layers, reaching a large, layer-0-dominant magnitude. The exact bit-level origin (which of the internal GEMMs' CUDA-issued form differs from what cuBLAS issues for the eager graph) was NOT isolated within this round's budget -- the concrete next artifact is a BF16/CUDA production-width oracle for LowRankResidualLinear's own bwd against candle's own eager-composition autograd, mirroring geglu_oracles.rs's/layer_norm_oracles.rs's existing BF16 disclosure tests, which do not exist for this op today."
+  },
+  "E10_flash_reconciliation": {
+    "flash_vs_jammi_f32_per_boundary_cosine": {
+      "source": "round 6's own /root/esc045-r6/compare/jammi_dump_flash_vs_f32_all.json, reused unmodified (dumps predate no relevant code diff -- see shared_config)",
+      "boundary_1": {
+        "cosine": -0.3419,
+        "norm_ratio": 7.682
+      },
+      "boundary_2": {
+        "cosine": -0.2716,
+        "norm_ratio": 6.244
+      },
+      "boundary_5": {
+        "cosine": -0.1833,
+        "norm_ratio": 5.612
+      },
+      "boundary_7": {
+        "cosine": 0.1128,
+        "norm_ratio": 2.39
+      },
+      "boundary_8": {
+        "cosine": 0.4738,
+        "norm_ratio": 1.034
+      },
+      "boundary_13": {
+        "cosine": 0.5968,
+        "norm_ratio": 0.871
+      },
+      "boundary_18": {
+        "cosine": 0.632,
+        "norm_ratio": 1.139
+      },
+      "boundary_19": {
+        "cosine": 0.9387,
+        "norm_ratio": 0.966
+      },
+      "boundary_28": {
+        "cosine": 0.9846,
+        "norm_ratio": 0.98
+      }
+    },
+    "flash_own_top8_by_mass_weight_gradient_cosine": [
+      {
+        "name": "layer.0.Wo.lora_b",
+        "cosine": 0.847
+      },
+      {
+        "name": "layer.0.Wqkv.lora_b",
+        "cosine": 0.814
+      },
+      {
+        "name": "layer.0.Wqkv.lora_a",
+        "cosine": 0.795
+      },
+      {
+        "name": "layer.0.Wo.lora_a",
+        "cosine": 0.789
+      },
+      {
+        "name": "layer.1.Wqkv.lora_a",
+        "cosine": 0.778
+      },
+      {
+        "name": "layer.1.Wqkv.lora_b",
+        "cosine": 0.742
+      },
+      {
+        "name": "layer.1.Wo.lora_b",
+        "cosine": 0.765
+      },
+      {
+        "name": "layer.1.Wo.lora_a",
+        "cosine": 0.736
+      }
+    ],
+    "reconciliation": "Round 6's E3 found flash near-orthogonal (or worse -- negative cosine) to jammi's own f32 truth on the ACTIVATION-gradient axis (boundary.1-7, cosine -0.34 to +0.11, gradient norm 2.4x-7.7x too large) at exactly the layers that carry 83.7% of the total WEIGHT-gradient mass (E8's own layer-mass table) -- so this is NOT a 'negligible mass, don't care' region; it is the highest-leverage part of the network. Yet flash's own per-tensor WEIGHT-gradient cosine at those SAME layers' LoRA A/B tensors is good (0.74-0.85, comparable to every other tested arm), which is why E4's full-224-tensor weight-gradient cosine (0.790) never surfaced this defect. The reconciliation: boundary.i = dL/d(output of encoder layer i) is the CUMULATIVE residual-stream gradient -- the sum of every downstream (layer i+1..27) path's contribution flowing back through that one point, so it inherits and compounds whatever numerical divergence flash's own backward introduces at every subsequent layer's attention block. The LoRA weight gradient at layer i, by contrast, is a LOCAL quantity (dA_i/dB_i depend only on that layer's own sublayer's dy and its own local activation, via the two short GEMM chains E9 quotes) that does not itself have to reconstruct the cumulative residual-stream magnitude correctly to stay direction-aligned. E4 does not 'average away' a negligible defect; it measures a genuinely DIFFERENT gradient quantity that is structurally insulated from the specific compounding mechanism the boundary axis exposes."
+  },
+  "one_paragraph_mechanism_reading": "Round 6's headline (production block-fused, 0.610, is the WORST bf16 weight-gradient arm vs jammi's own f32 truth, worse than all-eager's 0.810) does not reproduce at seed43/b4-s128 (0.258 > 0.104) or at b8-s128/seed42 (0.843 > 0.773) -- it is a property of the ONE originally-measured cell, not of the production kernel stack. The full-224-tensor concatenated cosine this whole investigation has used as its headline metric is dominated, at every config, by 4-5 early-layer tensors (layers 0-4 carry 83.7% of the f32-truth gradient's L2^2 mass) whose own cosine is the worst in the network because the BACKWARD pass accumulates the most compounded rounding by the time it reaches layer 0 -- the same 'compounding is invisible at one call, key the oracle on GROWTH' mechanism esc-044 named, generalized from one op's forward to the whole stack's backward. attention_block_fused and the cast_scale/cast_add pair are provably value-neutral (bit-identical baseline cosine across all three configs); geglu_fused and layer_norm_fused are large but SIGN-FLIPPING movers, consistent with their own module docs' disclosed, tested, individually-defensible round-once-vs-cascade bf16 rounding choice rather than a directional defect; lora_linear_fused is the one op whose disable is robustly positive at all three configs despite passing its existing (F32/CPU-only) oracle suite cleanly, and its own fused-vs-near-eager delta at layer 0's dominant-mass Wqkv tensor is large and structured (not few-ulp) with an r(L) that grows from 0.32 at the last layer to 0.60-0.75 at the first nine -- an esc-044-class compounding signature this round could not fully bisect to a single line within budget, for which the missing artifact is a BF16/CUDA production-width oracle this op does not have today. Flash's severe early-layer ACTIVATION-gradient defect (E3, cosine down to -0.34) sits at the same high-mass layers without corrupting the WEIGHT-gradient cosine there (0.74-0.85), because the two gradient quantities are structurally different: one is the cumulative residual-stream signal every downstream layer's error compounds into, the other a local per-layer computation insulated from that specific accumulation.",
+  "ledger_row": "esc-045 round 7 (GH #374): E7 block-binary bisection (11 keys + 4 combos, b4-s128 seed42) finds NO single op explains round 6's 0.610-vs-0.810 headline -- attention_block_fused/cast pair are provably neutral, geglu_fused/layer_norm_fused sign-flip across seed43/b8-s128 (round 6's OWN ranking reverses at both confirmation configs: block-fused beats all-eager at seed43 and at b8-s128), lora_linear_fused is the sole robust (+) mover at all 3 configs with an esc-044-class r(L) growth signature (0.32->0.75) but no isolating BF16/CUDA oracle exists for it yet. E8: the whole metric is dominated by layers 0-4 (83.7% of f32-truth gradient mass). E10: flash's early-layer activation-gradient defect (cos to -0.34) sits at those same high-mass layers without corrupting the weight-gradient cosine there (0.74-0.85) -- a structural decoupling between the cumulative boundary signal and the local LoRA update, not a mass artifact.",
+  "blockers": [
+    "lora_linear_fused's own bit-level defect locus (which internal GEMM's CUDA-issued form diverges from cuBLAS's eager-graph issuance) is NOT isolated -- needs a dedicated BF16/CUDA production-width oracle for LowRankResidualLinear::bwd vs candle's own eager-composition autograd, mirroring geglu_oracles.rs's/layer_norm_oracles.rs's existing BF16 disclosure tests; none exists for this op today.",
+    "Round 6's own E4/E7 headline ranking (block-fused worst) is confirmed NON-reproducible at other seeds/shapes -- any downstream decision that treated 'ship flash or eager over block-fused' as settled from round 6 alone should be revisited against this round's b4-s128-seed43/b8-s128 reversal before acting.",
+    "b8-s512 and the full 8-point sub-layer GradTap (round 6's own carried-forward blocker) still not run this round -- scope stayed on the bisection the lead's brief specified.",
+    "Lead probe (ledger row 254) hypothesized softmax rounding-placement as the E4 culprit off an isolated op-level bit-identity finding; this round tested it end-to-end (arm b: attention_block_fused+softmax_last_dim_fused both disabled) and found only PARTIAL recovery at the original cell (0.610->0.699, not ~0.81) and a CATASTROPHIC reversal at b8-s128 (0.843->0.230) -- see lead_probe_softmax_isolation_ledger_row_254. Do not greenlight a softmax-rounding fix spec off the single-cell number."
+  ],
+  "lead_probe_softmax_isolation_ledger_row_254": {
+    "lead_hypothesis": "an independent op-level probe (a100c) found AttentionBlockFused's own fwd+bwd bit-identical to 'eager composition + fused softmax' at the op level (synthetic fixtures), and inferred SoftmaxLastDimFused's fused-vs-eager rounding choice is the E4 culprit: arm (a)=eager composition+fused softmax should land near block-fused's 0.61, arm (b)=eager composition+eager (candle) softmax should land near all-eager's 0.81.",
+    "arm_a_attention_block_fused_disabled_alone": {
+      "description": "= eager attention composition + FUSED rope + FUSED softmax (softmax_last_dim_fused's own admission is live once attention_block_fused declines, and is NOT itself disabled here) -- exactly the lead's arm (a). Dispatch-confirmed: rope_fused_dispatches=56, softmax_fused_dispatches=28 on this run.",
+      "b4s128_seed42": 0.6098268554357086,
+      "b4s128_seed43": 0.25820997897702774,
+      "b8s128_seed42": 0.842976674556436,
+      "finding": "Bit-identical to the all-fused baseline at EVERY digit shown, at all 3 tested configs -- independently confirms the lead's op-level bit-identity claim end to end, not just in the isolated synthetic-fixture probe. (a) == (c) holds robustly."
+    },
+    "arm_b_attention_block_fused_and_softmax_last_dim_fused_both_disabled": {
+      "description": "= eager attention composition + FUSED rope (untouched) + EAGER (candle_nn::ops::softmax) softmax -- geglu_fused/layer_norm_fused/lora_linear_fused/cast pair all stay FUSED, isolating softmax as the ONLY additional variable vs arm (a). Dispatch-confirmed requested==fired=[attention_block_fused, softmax_last_dim_fused] at all 3 configs; rope_fused_dispatches=56 (unchanged), softmax_eager_dispatches=28 (flipped).",
+      "b4s128_seed42": 0.6989759606438362,
+      "b4s128_seed43": 0.35729901743005604,
+      "b8s128_seed42": 0.22998464761948303,
+      "vs_baseline_delta": {
+        "b4s128_seed42": "+0.089 (baseline 0.610)",
+        "b4s128_seed43": "+0.099 (baseline 0.258)",
+        "b8s128_seed42": "-0.613 (baseline 0.843, CATASTROPHIC reversal)"
+      }
+    },
+    "verdict_on_the_hypothesis": "PARTIALLY confirmed at the ORIGINAL cell only, does NOT generalize: at b4-s128/seed42 arm (b) recovers less than half the 0.610->0.810 gap (0.699, not ~0.81); at seed43 the recovery is similarly partial (0.357, and note all-eager itself is WORSE than baseline at that config, 0.104 < 0.258, so '~0.81' was never the achievable target there); at b8-s128/seed42 arm (b) is CATASTROPHICALLY WORSE than baseline (0.230 vs 0.843), the opposite of the predicted direction. softmax_last_dim_fused belongs to the SAME class as geglu_fused/layer_norm_fused (an F32-accumulate-round-once fused kernel vs a multi-op bf16 cascade eager fallback, per softmax.rs's own module doc, L1151 'BF16 accumulates in f32 ... rounding to bf16 exactly once') and shows the SAME sign-flipping instability across seed/shape those two showed in E7's own sweep -- this is not a NEW, cleaner signal; it is another instance of the already-documented non-robust class.",
+    "rounding_placement_finding": "candle_nn::ops::softmax (jammi's PRODUCTION eager fallback, candle-nn-0.11.0/src/ops.rs:22-29) does NOT upcast to F32 anywhere: max_keepdim/broadcast_sub/exp/sum_keepdim/broadcast_div all execute directly at the input dtype (BF16 here) -- a 5-op BF16 cascade, no f32 accumulator at all. jammi's OWN fused softmax (SoftmaxLastDimFused) already accumulates row-max/exp/row-sum in F32 and rounds to BF16 exactly once (softmax.rs:1151-1153) -- i.e. the FUSED arm is the one closer to torch's own reference discipline (modeling_modernbert.py: F32 softmax, BF16 cast of probs before the PV GEMM), not the eager one. Separately: `raw_scores` itself (BEFORE softmax runs, either arm) is BF16 unless JAMMI_ROUND5_UPCAST_SCORES=1 -- OFF by default in every run here and in every production call site -- upcasts q/k to F32 for the scores GEMM specifically. Round 6's own E6 already measured that exact upcast-to-match-torch diagnostic under this round's Gaussian LoRA init and found it did NOT help (block-eager arm's boundary.1-18 cosine vs jammi f32 truth got WORSE, 0.6618->0.5845, upcast on vs off) -- so 'make eager softmax's scores F32 like torch' is not evidenced as the right fix target either, independent of this round's own softmax-isolation instability finding.",
+    "recommendation": "Do not greenlight a softmax-rounding-placement fix branch off the single originally-measured cell. The full-224-tensor cosine this whole investigation (round 6 AND round 7) has used as its headline number is dominated by 4-5 early-layer tensors (E8: layers 0-4 carry 83.7% of the f32-truth gradient's L2^2 mass) where EVERY tested fused-vs-eager pair (softmax included) shows large, sign-flipping movement across seed/shape rather than a stable, one-directional improvement -- the same instability this round's own E7 table already documents for geglu_fused/layer_norm_fused. Any fix spec built from this metric needs the robustness check (>=1 different seed, >=1 different batch) BEFORE being treated as decided, not after."
+  }
+}

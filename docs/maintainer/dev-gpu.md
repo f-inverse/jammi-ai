@@ -122,6 +122,82 @@ reading.
 again. A `--ref` that names a ref the live pod is **not** on is an error rather
 than a silently ignored flag; naming the ref it is already on is a no-op.
 
+### `up` refuses a session alias that already has a recorded pod
+
+If a session alias already has a recorded pod id — even one that failed to
+answer SSH (reaped, mid-reboot, or a *different* process's `up` on the same
+alias winning a race) — `up` refuses outright (exit 2) rather than silently
+deploying a second pod and overwriting the local record of whichever pod is
+real:
+
+```
+$ ci/scripts/gpu-dev.sh up a100
+::error::session 'a100' already has a recorded pod (…) that did not answer SSH.
+::error::refusing to silently replace it. Inspect it: gpu-dev.sh ls
+::error::once you are sure it should be replaced: gpu-dev.sh up a100 --replace
+```
+
+`--replace` overwrites only the *local* record so a new pod can be deployed
+under the alias; it never terminates the old one — run `down` first if it
+should be. This, together with the check below, is what closed the
+2026-08-25 incident where an agent's `up`/`down` under an existing alias
+terminated an unrelated stale pod.
+
+### `down` verifies before it terminates, and confirms after
+
+`down` never trusts the locally-recorded pod id on its own. Before issuing a
+terminate, it confirms the id is **both** still present in the account's own
+live pod list **and** named like one of this tooling's own pods
+(`<prefix>-ttl<digits>`) — a mismatch refuses rather than acts. On a refusal
+the local session record is deliberately **kept**, not forgotten: this is
+exactly the ambiguous case where a follow-up `up` on the same alias most
+needs to still see a recorded pod and refuse (or ask for `--replace`) rather
+than deploying a third pod on top of the confusion. The pod itself, if it
+still exists under a different session's name, is left running for that
+session to manage. The only manual path out of a refusal is the RunPod
+console.
+
+An id that is **absent from the account entirely** is a different case, not
+a refusal: it is the ordinary shape of "this pod already ended on its own"
+(its own in-pod deadline, or the sweep) — the single most common way a
+session's pod goes away, since `RP_TTL_HOURS`/`RP_DEV_TTL_HOURS` ceilings are
+wall-clock, not idle detection (see the cost-guard section above). There is
+nothing left to release, so `down` says so plainly and forgets the record —
+without this, a session whose pod already self-terminated would sit stuck
+until an operator remembered `up --replace` to clear it.
+
+The **id is authoritative**; the TTL never gates release, and the check does
+not look at it at all. Two earlier attempts to make the TTL part of this
+check were both removed rather than patched further: matching an *exact*
+recorded TTL refused to release a real `jammi-gpu-ttl72` pod when the
+session's meta predated TTL tracking (round-2 audit), and the
+`RP_TTL_HOURS=<H>` override this repo tried next as the recovery path was
+found **inert on every input** — the session meta is always loaded *before*
+any override is read, so it either got clobbered or forced empty regardless
+of what was set on the command line (round-3 audit). RunPod pod ids are
+globally unique, so a name shaped like this tooling's own naming convention,
+on the exact id this session recorded, is already sufficient; the specific
+number never added a real safety margin.
+
+`down` also confirms *after* terminating: `rp_terminate` itself throws its
+response away (it doubles as `rp_cleanup`'s best-effort EXIT-trap teardown,
+where a network hiccup must never turn a normal shell exit into a hard
+failure), so `down` re-queries the account and only forgets the local record
+once the id is confirmed **absent**. A pod still present after the
+terminate call — a rejected mutation, most likely — keeps its local record
+and exits with a message to retry `down`, rather than silently leaking the
+pod while also destroying the only record that pointed at it.
+
+This confirmation (`rp_pod_gone` in `runpod_lib.sh`) assumes a successful
+`podTerminate` removes the pod's id from `myself.pods` promptly — the same
+account-query shape `rp_pod_verify` and `rp_sweep` already read, but not yet
+verified live for this specific before/after transition. Confirmed on first
+live use; if RunPod instead retains a terminated pod in that list for some
+period (e.g. under a different `desiredStatus`), `rp_pod_gone` would read a
+just-succeeded terminate as unconfirmed and `down` would report "not
+confirmed" for a pod that in fact already ended — a false alarm asking for
+an unnecessary retry, not a leak.
+
 ## Reproducing the shipped runtime image
 
 The **runtime** image (e.g. for the uid-65532 JIT-cache case in #305) is not the
@@ -195,10 +271,16 @@ Three guards, in order of when they act:
 
 2. **A deadline armed inside the pod's own entrypoint**, before the container
    does anything else — including its package install, which reaches the network
-   and could hang. Every pod self-terminates after `RP_TTL_HOURS` (default 8; the
-   CI prove lane uses 3). It deliberately is *not* installed over SSH: the gap
-   between "pod rented" and "pod reachable" is minutes long, and that gap is
-   where the orphan above was created.
+   and could hang. Every pod self-terminates after `RP_TTL_HOURS`. The default
+   depends on the caller: `runpod_lib.sh` itself defaults to 8h (`shell`, and
+   any other throwaway pod); the CI prove lane sets its own 3h; `gpu-dev.sh up`
+   alone raises the default to `RP_DEV_TTL_HOURS` (72h) when `RP_TTL_HOURS` is
+   not set explicitly, because a dev session someone is actively using is
+   meant to survive a workday, not die at the throwaway-pod default (an 8h
+   ceiling killed every dev pod overnight on 2026-08-25). An explicit
+   `RP_TTL_HOURS` always wins over either default. It deliberately is *not*
+   installed over SSH: the gap between "pod rented" and "pod reachable" is
+   minutes long, and that gap is where the orphan above was created.
 
    It terminates via `runpodctl remove pod $RUNPOD_POD_ID`. RunPod special-cases
    self-removal, so this succeeds in our custom image with no config file and
@@ -231,6 +313,15 @@ Three guards, in order of when they act:
    unparseable deadline, or a stopped pod is swept. And a sweep that cannot
    *reach* RunPod fails loudly rather than reporting "nothing to clean up".
 
+   **There is no way to pause the sweep for a single pod.** RunPod's pod-edit
+   mutation has no `name` field (and no rename capability at all) — the
+   sweep's only account-visible per-pod signal is the name it was deployed
+   with, which is immutable after deploy, so a "hold this one pod" marker is
+   not something this tooling can implement. A running measurement is
+   protected only by its own TTL: rent with `RP_TTL_HOURS`/`RP_DEV_TTL_HOURS`
+   set to at least the job's expected length up front, rather than relying on
+   pausing the sweep partway through.
+
 Guard 2 needs the network at deadline time; guard 3 needs this repo's CI to be
 running. They fail for unrelated reasons, which is the point of having both.
 
@@ -238,10 +329,12 @@ Guards 2 and 3 are **wall-clock ceilings, not idle detection** — a pod you sto
 using bills until its deadline. Run `down` when you're finished; the guards are
 for the times something kills the process before you can.
 
-Lower the ceiling when you know the work is short:
+Lower the ceiling when you know the work is short, or raise it past `up`'s own
+72h dev default for something that genuinely needs longer:
 
 ```bash
-RP_TTL_HOURS=2 ci/scripts/gpu-dev.sh up a100
+RP_TTL_HOURS=2  ci/scripts/gpu-dev.sh up a100   # a quick check
+RP_TTL_HOURS=96 ci/scripts/gpu-dev.sh up a100   # a longer measurement
 ```
 
 ### `RP_TIMEOUT` is not a fourth guard

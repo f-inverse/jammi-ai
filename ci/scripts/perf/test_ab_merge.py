@@ -745,6 +745,88 @@ class LegPremiseCheckTests(unittest.TestCase):
         self.assertTrue(any("lora_alpha" in v for v in cfg["leg_premise_violations"]))
         self.assertTrue(cfg["verdict"].startswith("INVALID"))
 
+    def test_max_grad_norm_absent_on_both_legs_is_not_a_violation(self):
+        """CONTRAST with `test_identity_field_present_but_null_on_both_legs_
+        is_invalid` above: `max_grad_norm` is NOT a `FINETUNE_IDENTITY_
+        FIELDS` member precisely because `None`/absent on BOTH legs is the
+        EVERYDAY, legitimate premise (neither leg clips) — unlike
+        `lora_alpha`, this must NOT be flagged. Neither fixture sets
+        `max_grad_norm` here, matching `finetune_ab.sh`'s own sweep today
+        (which passes `--max-grad-norm` to neither leg).
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_ok_config(raw_dir, "b8-s128-d0", _CLEAN_YES_DISPATCHES)
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertEqual(
+            [v for v in cfg["leg_premise_violations"] if "clip setting" in v], [],
+            f"leg_premise_violations={cfg['leg_premise_violations']!r}",
+        )
+        self.assertFalse(cfg["verdict"].startswith("INVALID"), cfg["verdict"])
+        self.assertEqual(rc, 0)
+
+    def test_max_grad_norm_matching_on_both_legs_is_not_a_violation(self):
+        """Both legs clip at the SAME `max_grad_norm` (the shipped trainer's
+        own default) — the premise a real `--max-grad-norm 1.0` sweep leg
+        pair is supposed to establish.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_leg(raw_dir, "b8-s128-d0", "jammi-eager", report=jammi_fs({}))
+            write_leg(
+                raw_dir, "b8-s128-d0", "jammi-fused",
+                report=jammi_fs(_CLEAN_YES_DISPATCHES, max_grad_norm=1.0),
+            )
+            write_leg(raw_dir, "b8-s128-d0", "torch-eager", report=torch_fs(attn_implementation="eager"))
+            write_leg(raw_dir, "b8-s128-d0", "torch-sdpa", report=torch_fs(max_grad_norm=1.0))
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertEqual(
+            [v for v in cfg["leg_premise_violations"] if "clip setting" in v], [],
+            f"leg_premise_violations={cfg['leg_premise_violations']!r}",
+        )
+        self.assertFalse(cfg["verdict"].startswith("INVALID"), cfg["verdict"])
+        self.assertEqual(rc, 0)
+
+    def test_jammi_clipped_torch_unclipped_is_invalid(self):
+        """Class-census finding (ledger row 215, addition #3): before
+        `torch_finetune_step.py` had a `--max-grad-norm` flag, this exact
+        premise mismatch — jammi clipping, torch's reference NOT clipping —
+        was UNCATCHABLE (the field did not exist on the torch side at all,
+        so there was nothing to compare against). This is that regression,
+        reproduced and asserted INVALID now that the field exists on both.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_leg(raw_dir, "b8-s128-d0", "jammi-eager", report=jammi_fs({}))
+            write_leg(
+                raw_dir, "b8-s128-d0", "jammi-fused",
+                report=jammi_fs(_CLEAN_YES_DISPATCHES, max_grad_norm=1.0),
+            )
+            write_leg(raw_dir, "b8-s128-d0", "torch-eager", report=torch_fs(attn_implementation="eager"))
+            write_leg(raw_dir, "b8-s128-d0", "torch-sdpa", report=torch_fs())  # max_grad_norm absent -> None
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertTrue(any("clip setting" in v for v in cfg["leg_premise_violations"]))
+        self.assertTrue(cfg["verdict"].startswith("INVALID"))
+        self.assertEqual(rc, 1)
+
+    def test_max_grad_norm_different_values_on_both_legs_is_invalid(self):
+        """Both legs clip, but at DIFFERENT norms — a subtler mismatch than
+        one-clips-one-doesn't, still a different computation on each side.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_leg(raw_dir, "b8-s128-d0", "jammi-eager", report=jammi_fs({}))
+            write_leg(
+                raw_dir, "b8-s128-d0", "jammi-fused",
+                report=jammi_fs(_CLEAN_YES_DISPATCHES, max_grad_norm=1.0),
+            )
+            write_leg(raw_dir, "b8-s128-d0", "torch-eager", report=torch_fs(attn_implementation="eager"))
+            write_leg(raw_dir, "b8-s128-d0", "torch-sdpa", report=torch_fs(max_grad_norm=0.5))
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertTrue(any("clip setting" in v for v in cfg["leg_premise_violations"]))
+        self.assertTrue(cfg["verdict"].startswith("INVALID"))
+        self.assertEqual(rc, 1)
+
 
 class LoraInitProvenanceTests(unittest.TestCase):
     """B4: `--lora-init` is overridable, and the merged report records

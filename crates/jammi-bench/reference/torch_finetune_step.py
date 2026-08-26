@@ -666,7 +666,7 @@ def forward_hidden(model, input_ids, attention_mask):
     return out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
 
 
-def _step_once(model, optimizer, scaler, blocks, mask, args, use_amp, device):
+def _step_once(model, optimizer, scaler, blocks, mask, args, use_amp, device, trainable):
     """One full forward + cosine-margin triplet loss + backward + optimizer
     step — the exact body the timed loop in `run()` executes, factored out
     so the SAME code can also be run once, untimed, before the timed loop
@@ -691,6 +691,18 @@ def _step_once(model, optimizer, scaler, blocks, mask, args, use_amp, device):
     (post-warmup) call, so `finetune_step.losses` here and
     `finetune_step.rs`'s `losses` field share the same per-step placement
     convention and are comparable step-for-step under that convention.
+
+    `trainable`: the SAME list `torch.optim.AdamW` was constructed over
+    (`run()`'s own `trainable = [p for p in model.parameters() if p.
+    requires_grad]`), threaded through rather than re-derived here so the
+    clip below (when `args.max_grad_norm is not None`) is guaranteed to
+    clip exactly the tensors the optimizer steps, never a param set that
+    could silently drift from it. `args.max_grad_norm is None` (the
+    default) skips clipping entirely — mirrors jammi's own `--max-grad-norm`
+    CLI flag (`crates/jammi-bench/src/main.rs`) absent-by-default, and
+    `ci/scripts/perf/ab_merge.py`'s `clip_setting_violation` refuses a
+    jammi/torch A/B row where the two legs' `max_grad_norm` do not match —
+    see that function's own doc.
     """
     import torch
 
@@ -717,10 +729,30 @@ def _step_once(model, optimizer, scaler, blocks, mask, args, use_amp, device):
 
     if use_amp:
         scaler.scale(loss).backward()
+        if args.max_grad_norm is not None:
+            # AMP requires unscaling BEFORE clipping: the gradients backward()
+            # just produced are scaled by GradScaler's loss-scale factor, and
+            # torch.nn.utils.clip_grad_norm_ has no idea that scale exists —
+            # clipping against the SCALED norm would clip to the wrong
+            # threshold (off by the scale factor, silently). `scaler.
+            # unscale_` divides every trainable tensor's `.grad` by the
+            # current scale in place, exactly once, before the clip; calling
+            # it again inside `scaler.step` is a documented no-op (GradScaler
+            # tracks which optimizer has already been unscaled this step).
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
         scaler.step(optimizer)
         scaler.update()
     else:
         loss.backward()
+        if args.max_grad_norm is not None:
+            # Matches jammi's `clip_gradients`/`torch.nn.utils.clip_grad.
+            # _clip_grads_with_norm_`: global L2 norm over every trainable
+            # tensor's gradient, scaled down to `max_grad_norm` when it
+            # exceeds that bound. `trainable` is threaded in from `run()`
+            # (the SAME list `torch.optim.AdamW` was built over), never
+            # re-derived from `model.parameters()` here.
+            torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
         optimizer.step()
 
     # Force completion before returning: CUDA's queue is asynchronous, so
@@ -972,7 +1004,7 @@ def run(args):
         # Not counted in `--warmup`/`--steps`, never reported as a timed
         # sample. Runs regardless of device (CPU included), guarded
         # internally for CUDA-only calls.
-        _step_once(model, optimizer, scaler, blocks, mask, args, use_amp, device)
+        _step_once(model, optimizer, scaler, blocks, mask, args, use_amp, device, trainable)
         reference_compile_after_first_forward = getattr(
             model.config, "reference_compile", "absent"
         )
@@ -1003,7 +1035,9 @@ def run(args):
         losses = []
         for step in range(args.warmup + args.steps):
             t0 = time.perf_counter()
-            loss_val = _step_once(model, optimizer, scaler, blocks, mask, args, use_amp, device)
+            loss_val = _step_once(
+                model, optimizer, scaler, blocks, mask, args, use_amp, device, trainable
+            )
             elapsed = time.perf_counter() - t0
             if step >= args.warmup:
                 times.append(elapsed)
@@ -1038,6 +1072,7 @@ def run(args):
                 "seed": args.seed,
                 "batched_forward": args.batched_forward,
                 "margin": args.margin,
+                "max_grad_norm": args.max_grad_norm,
                 "adamw_foreach": adamw_foreach,
                 "moment_warmup_step_executed": True,
             },
@@ -1062,6 +1097,12 @@ def run(args):
                     t.strip() for t in args.target_modules.split(",") if t.strip()
                 ],
                 "batched_forward": args.batched_forward,
+                # `None` (never omitted) when `--max-grad-norm` was not supplied,
+                # mirroring jammi's own FinetuneStepTier::max_grad_norm field doc
+                # (deliberately not skip_serializing_if=is_none): every report from
+                # this build carries an opinion on clipping. `ci/scripts/perf/
+                # ab_merge.py`'s `clip_setting_violation` reads this field.
+                "max_grad_norm": args.max_grad_norm,
                 "trainable_tensors": len(trainable),
                 "steps_measured": len(times),
                 "losses": losses,
@@ -1204,6 +1245,20 @@ def parse_args(argv=None):
         "its own CLI; the default here matches it.",
     )
     p.add_argument(
+        "--max-grad-norm",
+        type=float,
+        default=None,
+        help="torch.nn.utils.clip_grad_norm_'s max_norm, applied after backward and "
+        "before the optimizer step (AMP: after scaler.unscale_). Mirrors jammi's own "
+        "--max-grad-norm (crates/jammi-bench/src/main.rs), absent by default — omitting "
+        "this flag skips clipping entirely, bit-identical to this script's behaviour "
+        "before this flag existed. Must be finite and > 0.0 when supplied. "
+        "ci/scripts/perf/ab_merge.py's clip_setting_violation refuses an A/B row where "
+        "the jammi and torch legs' max_grad_norm do not match, so a config run with "
+        "jammi's own default (max_grad_norm = 1.0, FineTuneConfig's shipped default) "
+        "must pass --max-grad-norm 1.0 here too.",
+    )
+    p.add_argument(
         "--dry-run",
         action="store_true",
         help="Build a tiny random-init 2-layer ModernBERT, save it to a temp dir, and "
@@ -1233,6 +1288,10 @@ def parse_args(argv=None):
         p.error("--lora-rank must be >= 1")
     if not (0.0 <= args.lora_dropout < 1.0):
         p.error("--lora-dropout must be in [0, 1)")
+    if args.max_grad_norm is not None and not (
+        math.isfinite(args.max_grad_norm) and args.max_grad_norm > 0.0
+    ):
+        p.error("--max-grad-norm must be finite and > 0.0 when supplied")
     return args
 
 

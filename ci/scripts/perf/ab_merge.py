@@ -47,6 +47,7 @@ jammi-vs-torch comparator this repo carries:
 | `s_per_step_p50` / `triplets_per_s` / VRAM fields | measurement — the actual perf numbers this sweep exists to produce | `finetune_step.rs`'s own fields | `torch_finetune_step.py`'s own fields |
 | `model_dir` | provenance (a path string, not compared — superseded by the checksum fields above) | `FinetuneStepParams::model_dir` (not itself emitted on the tier) | `torch_finetune_step.py`'s own `args["model_dir"]` |
 | `device` / `device_name` | provenance | `finetune_step.rs`'s own fields | `torch_finetune_step.py`'s own `provenance` block |
+| `max_grad_norm` | identity, but checked by `clip_setting_violation` (NOT `FINETUNE_IDENTITY_FIELDS`/`leg_premise_violations`) — `None` is a legitimate, common value for this field (clipping off), so the generic null-means-cannot-verify loop would wrongly flag the everyday both-unclipped config; this field needs `None == None` to be a MATCH instead | `max_grad_norm: params.max_grad_norm,` (`finetune_step.rs`, `FinetuneStepTier`) | `"max_grad_norm": args.max_grad_norm,` (`torch_finetune_step.py`'s `finetune_step` block) — class-census fold-in (ledger row 215): before this, torch had NO `--max-grad-norm` flag at all, so a jammi-clipped leg silently compared against an unclippable torch reference |
 
 `FINETUNE_IDENTITY_FIELDS` (below) is the tuple that actually encodes the
 **identity** rows above — the single source of truth `leg_identity_fields`/
@@ -330,6 +331,46 @@ def leg_premise_violations(jammi_fields, torch_fields):
         if va != vb:
             violations.append(f"leg-identity field {field!r} differs: jammi={va!r} torch={vb!r}")
     return violations
+
+
+def clip_setting_violation(jammi_report, jammi_leg, torch_report, torch_leg):
+    """`max_grad_norm` is deliberately NOT a `FINETUNE_IDENTITY_FIELDS`
+    member: unlike every field in that table, `None` is a LEGITIMATE,
+    common value for this one (clipping deliberately off — today's
+    still-common case), so `leg_identity_fields`'s "null == absent ==
+    cannot verify" collapse would flag the everyday both-legs-unclipped
+    config as an unverifiable premise, which it is not. This field instead
+    needs `None == None` to be a MATCH, and any OTHER combination (absent
+    on one side only, or two different clip norms) to be a violation —
+    checked directly against the RAW report (never `leg_identity_fields`'s
+    already-`_MISSING`-collapsed dict).
+
+    Class-census finding (ledger row 215, addition #3): before torch's
+    `--max-grad-norm` flag existed, `torch_finetune_step.py` performed NO
+    clipping at all, so a config that ran jammi WITH clipping
+    (`--max-grad-norm 1.0`, the shipped trainer's own default) against
+    torch's un-clippable reference silently compared a clipped step to an
+    unclipped one — a leg-premise mismatch this table had no way to catch
+    because the field did not exist on either side. This function is that
+    check, once the field exists on both.
+
+    Round-trip note: jammi's `max_grad_norm` is an `Option<f32>`; torch's is
+    a Python `float | None`. `1.0 == 1.0` compares true across that
+    f32-vs-f64 gap for the "nice" values an operator actually types on a
+    CLI (this repo's shipped default, `1.0`); no canonicalizer is
+    registered for this field, the same as `lora_alpha`/`margin`, the other
+    bare numeric identity fields.
+    """
+    jammi_value = finetune_block(jammi_report, jammi_leg).get("max_grad_norm")
+    torch_value = finetune_block(torch_report, torch_leg).get("max_grad_norm")
+    if jammi_value == torch_value:
+        return []
+    return [
+        f"clip setting differs: jammi ({jammi_leg}) max_grad_norm={jammi_value!r}, torch "
+        f"({torch_leg}) max_grad_norm={torch_value!r} -- the jammi and torch legs of this config "
+        "did not clip gradients under the same setting, so their loss/step numbers do not "
+        "describe the same computation"
+    ]
 
 
 def leg_provenance(report, leg):
@@ -644,6 +685,17 @@ def build_report(raw_dir, steps, warmup, pass_ratio, torch_lora_init="peft"):
             jammi_id_fields = leg_identity_fields(entries[jammi_premise_leg]["report"], jammi_premise_leg)
             torch_id_fields = leg_identity_fields(entries[torch_premise_leg]["report"], torch_premise_leg)
             leg_premise_violations_list = leg_premise_violations(jammi_id_fields, torch_id_fields)
+            # `max_grad_norm` is checked SEPARATELY from the FINETUNE_IDENTITY_FIELDS
+            # loop above — see `clip_setting_violation`'s own doc for why its
+            # None-is-a-legitimate-value semantics do not fit that loop's
+            # null-means-cannot-verify convention — but folds into the SAME
+            # violations list, so it gates the SAME INVALID verdict below.
+            leg_premise_violations_list = leg_premise_violations_list + clip_setting_violation(
+                entries[jammi_premise_leg]["report"],
+                jammi_premise_leg,
+                entries[torch_premise_leg]["report"],
+                torch_premise_leg,
+            )
 
         for leg in LEGS:
             err_tail = entries[leg]["err_tail"]

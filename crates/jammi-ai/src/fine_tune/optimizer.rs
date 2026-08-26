@@ -31,6 +31,34 @@
 //! silent — but pays for that check with the one sync [`refuse_nonfinite_norm`]
 //! performs; that function's docs cover the cadence this file (and its
 //! callers) hold that sync to, so it never reappears on every step.
+//!
+//! ## Accumulator precision: an undisclosed change the device rewrite also
+//! made, and why the new value is the correct one to keep
+//!
+//! The pre-rewrite host implementation read EVERY `Var`'s own `f32` squared
+//! sum back with `to_scalar::<f32>()` and accumulated the cross-`Var` fold
+//! in an `f64` HOST scalar (`let mut total_sq = 0.0f64; … total_sq += sq as
+//! f64;`, then `total_sq.sqrt()` — also `f64`). [`clip_gradients`] now folds
+//! that SAME cross-`Var` sum entirely as `f32` device tensors (`Some(acc) =>
+//! (&acc + &sq)…`, `total_sq.sqrt()` on the `f32` tensor) — a genuine
+//! precision change to the fold's accumulator this doc did not previously
+//! call out. It is not a regression to fix, though: PyTorch's OWN reference
+//! implementation never promotes to `f64` either — `torch.linalg.
+//! vector_norm` computes each per-parameter norm AND the outer fold of the
+//! stacked per-parameter norms (`_get_total_norm`, `torch/nn/utils/
+//! clip_grad.py`) entirely in the gradient's own dtype (`f32`, for
+//! full-precision training) — so the pre-rewrite `f64` host accumulation
+//! was an ACCIDENTAL side effect of syncing every `Var` back individually,
+//! never a deliberate higher-precision design choice, and it was already a
+//! (small) DEPARTURE from torch's own `f32`-throughout behavior, not a
+//! closer match to it (family K: parity target is PyTorch, not a candle
+//! implementation detail some earlier revision of this file happened to
+//! have). The device-side `f32` fold this file now performs is the one that
+//! matches torch's own precision, end to end. `production_pre_rewrite_
+//! f64_host_accumulator_vs_device_f32_fold` (below the production-shape
+//! acceptance section) measures and pins the actual magnitude of this
+//! change on the 224-`Var` production config rather than leaving it an
+//! unquantified doc claim.
 
 use candle_core::{backprop::GradStore, DType, Tensor, Var};
 use candle_nn::VarMap;
@@ -113,6 +141,62 @@ pub(crate) fn thread_sync_read_count() -> u64 {
     THREAD_SYNC_READ_COUNT.with(|c| c.get())
 }
 
+/// The outcome of a [`clip_gradients`] call.
+///
+/// Before this split, `clip_gradients` returned `Option<Tensor>` and
+/// collapsed TWO semantically different situations into the SAME `None`:
+/// `max_norm <= 0.0` (a deliberate operator choice — clipping is off) and
+/// "clipping was requested but not one of `trainable_vars` had a gradient
+/// present" (which, whenever `trainable_vars` is non-empty, is AMBIGUOUS —
+/// a bug signal such as a detached graph, an all-frozen adapter, or a
+/// `GradStore` that was never populated, OR a batch whose loss legitimately
+/// never routes through any of these `Var`s by design — see
+/// [`clip_and_step`]'s own doc for that ambiguity's resolution). A caller
+/// downstream of that `None` had no way to tell "I asked for this" apart
+/// from "clipping ran but touched nothing", so [`clip_and_step`] silently
+/// skipped BOTH the clip and the non-finite check in either case.
+#[derive(Debug)]
+pub enum ClipOutcome {
+    /// `max_norm <= 0.0` — clipping was turned off by the caller.
+    Disabled,
+    /// `max_norm > 0.0`, but not one of `trainable_vars` had a gradient
+    /// present in `grads`. Unambiguously benign when `trainable_vars`
+    /// itself was empty (nothing was ever asked to be clipped); AMBIGUOUS
+    /// otherwise — see [`clip_and_step`]'s own handling of this arm.
+    NoGradients,
+    /// Clipping ran; the on-device `total_norm` scalar tensor, for the
+    /// caller to read back — at whatever cadence it chooses — through
+    /// [`refuse_nonfinite_norm`].
+    Clipped(Tensor),
+}
+
+impl ClipOutcome {
+    /// The on-device `total_norm` tensor when clipping actually ran —
+    /// `None` for BOTH `Disabled` and `NoGradients` (a caller that does not
+    /// need to distinguish those two, e.g. to decide whether to read the
+    /// norm back, can use this; a caller that DOES need to distinguish
+    /// them, like [`clip_and_step`]'s own handling, matches on `self`
+    /// directly instead).
+    pub fn total_norm(&self) -> Option<&Tensor> {
+        match self {
+            ClipOutcome::Clipped(t) => Some(t),
+            ClipOutcome::Disabled | ClipOutcome::NoGradients => None,
+        }
+    }
+
+    /// Unwraps the `Clipped` arm's tensor, panicking with the OTHER arm
+    /// named otherwise. Test-only ergonomic sugar for the many fixtures in
+    /// this file that always expect clipping to have run — production code
+    /// must match all three arms explicitly (see [`clip_and_step`]).
+    #[cfg(test)]
+    fn unwrap_clipped(self) -> Tensor {
+        match self {
+            ClipOutcome::Clipped(t) => t,
+            other => panic!("expected ClipOutcome::Clipped, got {other:?}"),
+        }
+    }
+}
+
 /// Clip gradients by global L2 norm in-place, matching
 /// `torch.nn.utils.clip_grad_norm_(params, max_norm)`, entirely on-device.
 ///
@@ -175,12 +259,14 @@ pub(crate) fn thread_sync_read_count() -> u64 {
 /// `tests::below_max_norm_clip_is_bit_identical_to_no_clip` for a `total_norm`
 /// safely inside the `<= max_norm - 1e-6` region, where the forward guarantee
 /// does hold. `max_norm <= 0.0` disables clipping entirely (unchanged from
-/// before — no compute is issued, and this is the ONE remaining place
-/// `clip_gradients` returns `None`).
+/// before — no compute is issued; this is [`ClipOutcome::Disabled`]).
 ///
-/// Returns the on-device `total_norm` scalar tensor (`None` when clipping was
-/// disabled) so a caller can read it back — at whatever cadence it chooses —
-/// through [`refuse_nonfinite_norm`]. `clip_gradients` itself never reads it.
+/// Returns a [`ClipOutcome`] — `Disabled`/`NoGradients`/`Clipped(total_norm)`
+/// — rather than collapsing the first two into the SAME `None` a caller
+/// cannot tell apart (see that enum's own doc for why the distinction
+/// matters). The `Clipped` arm's on-device `total_norm` scalar tensor is for
+/// a caller to read back — at whatever cadence it chooses — through
+/// [`refuse_nonfinite_norm`]. `clip_gradients` itself never reads it.
 ///
 /// Device op count for `n` trainable `Var`s with a gradient present: `n` ×
 /// (`sqr` + `sum_all`) for the per-`Var` squared sums, `n - 1` adds to fold
@@ -200,7 +286,7 @@ pub fn clip_gradients(
     trainable_vars: &[Var],
     grads: &mut GradStore,
     max_norm: f64,
-) -> Result<Option<Tensor>> {
+) -> Result<ClipOutcome> {
     // Domain-validity at the edge (family D): `max_norm.is_nan()` makes
     // `max_norm <= 0.0` below `false` (NaN compares false against
     // everything), so a NaN `max_norm` would otherwise fall THROUGH the
@@ -227,7 +313,7 @@ pub fn clip_gradients(
         )));
     }
     if max_norm <= 0.0 {
-        return Ok(None);
+        return Ok(ClipOutcome::Disabled);
     }
 
     // Fold the per-`Var` squared sums into one device scalar, in
@@ -258,9 +344,13 @@ pub fn clip_gradients(
     }
 
     // No trainable gradient was present this step (e.g. an empty
-    // `trainable_vars`, or none of them appear in `grads`) — nothing to clip.
+    // `trainable_vars`, or none of them appear in `grads`) — nothing to
+    // clip. `ClipOutcome::NoGradients`, NOT `Disabled`: whether this is
+    // benign (an empty `trainable_vars`) or a bug signal (a non-empty one
+    // with nothing present in `grads`) is for the CALLER to decide — see
+    // `clip_and_step`'s own handling of this arm.
     let Some(total_sq) = total_sq else {
-        return Ok(None);
+        return Ok(ClipOutcome::NoGradients);
     };
 
     let total_norm = total_sq
@@ -323,7 +413,7 @@ pub fn clip_gradients(
         }
     }
 
-    Ok(Some(total_norm))
+    Ok(ClipOutcome::Clipped(total_norm))
 }
 
 /// The one deliberate device→host sync this file keeps: read `total_norm`
@@ -389,6 +479,25 @@ pub const DEFAULT_NORM_CHECK_INTERVAL: usize = 50;
 /// whether `step` is the final optimizer step of the whole run — trainer.rs's
 /// callers know this from the LR-schedule horizon they already compute)
 /// catches a bad end even when the run never reaches a full interval.
+///
+/// [`ClipOutcome::NoGradients`] is handled OUTSIDE the cadence gate above —
+/// unconditionally, on every call, off-cadence or not — because it is not a
+/// non-finite-norm finding (there is no norm tensor to even read back).
+/// Whenever `trainable_vars` is non-empty, this is an AMBIGUOUS state this
+/// function cannot resolve on its own (see [`ClipOutcome::NoGradients`]'s
+/// own doc): it could be a genuine bug (a detached graph, an all-frozen
+/// adapter, an unpopulated `GradStore`), or a batch whose loss legitimately
+/// never routes through any of these `Var`s by DESIGN (e.g.
+/// `TrainingBatch::Contrastive`'s `contrastive_loss` scores raw precomputed
+/// embeddings directly, never through a `ProjectionHead`'s LoRA layers — a
+/// real, common shape across this crate's own step-counting/schedule test
+/// oracles, never a bug in those tests). Since a hard refusal here would
+/// break every one of those legitimate call sites, this is a COUNTED FACT
+/// instead — a `tracing::warn!` an operator can grep/alert on — and the
+/// step proceeds (`optimizer.step(grads)` over an empty `GradStore` is a
+/// no-op, unchanged from before `ClipOutcome` existed). An EMPTY
+/// `trainable_vars` is the one UNAMBIGUOUSLY benign reading (nothing was
+/// ever asked to be clipped) and does not warn.
 pub fn clip_and_step(
     optimizer: &mut AdamW,
     trainable_vars: &[Var],
@@ -398,11 +507,42 @@ pub fn clip_and_step(
     step: usize,
     is_last_step: bool,
 ) -> Result<()> {
-    let total_norm = clip_gradients(trainable_vars, grads, max_grad_norm)?;
+    let outcome = clip_gradients(trainable_vars, grads, max_grad_norm)?;
+    if matches!(outcome, ClipOutcome::NoGradients) && !trainable_vars.is_empty() {
+        // A COUNTED FACT (`tracing::warn!`, a structured field a log
+        // pipeline/dashboard can grep and alert on), never a hard refusal:
+        // an earlier revision of this branch returned `Err` here, which
+        // broke every legitimate loss that does not route through EVERY
+        // trainable `Var` for a given batch — e.g. `TrainingBatch::
+        // Contrastive`'s `contrastive_loss` scores raw precomputed
+        // embeddings directly, never through `TrainingTarget::
+        // ProjectionHead`'s LoRA layers, so its trainable Vars carry no
+        // gradient by DESIGN, not by bug (`ft_correctness_sweep.rs`'s
+        // step-counting oracles, `ft_determinism.rs`, and
+        // `encoder_adapters.rs` all exercise exactly this shape). The
+        // AMBIGUITY this branch cannot resolve on its own — "this batch's
+        // loss legitimately never touches these Vars" versus "a detached
+        // graph / an all-frozen adapter / an unpopulated GradStore" — is
+        // real, so refusing outright is not the answer to that ambiguity;
+        // making it OBSERVABLE (searchable in logs, countable by a
+        // dashboard) is. The step proceeds exactly as it did before
+        // `ClipOutcome` existed: `optimizer.step(grads)` over an empty
+        // `GradStore` is a harmless no-op.
+        tracing::warn!(
+            step,
+            trainable_vars = trainable_vars.len(),
+            "GradClip: trainable Var(s) were passed but NONE had a gradient present at this \
+             optimizer step — either this step's loss legitimately does not route through any \
+             of them, or this is a detached graph / an all-frozen adapter / a GradStore that \
+             was never populated. Proceeding (the optimizer step over an empty GradStore is a \
+             no-op); this line is the counted fact an operator investigates if it recurs \
+             unexpectedly."
+        );
+    }
     let on_cadence = check_every_n_steps > 0
         && (step == 1 || step.is_multiple_of(check_every_n_steps) || is_last_step);
     if on_cadence {
-        if let Some(norm) = &total_norm {
+        if let Some(norm) = outcome.total_norm() {
             refuse_nonfinite_norm(norm, step)?;
         }
     }
@@ -581,7 +721,7 @@ mod tests {
         let (w, mut grads, g_before) = one_var_with_grad(0.5, 4);
         let total_norm = clip_gradients(std::slice::from_ref(&w), &mut grads, 10.0)
             .unwrap()
-            .expect("clipping was enabled");
+            .unwrap_clipped();
         let norm_val: f32 = total_norm.to_scalar().unwrap();
         assert!(norm_val <= 10.0, "test setup: norm must be below max_norm");
 
@@ -614,7 +754,7 @@ mod tests {
         let max_norm = 1.0f64;
         let total_norm = clip_gradients(std::slice::from_ref(&w), &mut grads, max_norm)
             .unwrap()
-            .expect("clipping was enabled");
+            .unwrap_clipped();
         let norm_val: f32 = total_norm.to_scalar().unwrap();
         assert_eq!(
             norm_val, 1.0,
@@ -661,7 +801,7 @@ mod tests {
         let max_norm = 1.0f64;
         let total_norm = clip_gradients(std::slice::from_ref(&w), &mut grads, max_norm)
             .unwrap()
-            .expect("clipping was enabled");
+            .unwrap_clipped();
         let norm_val: f32 = total_norm.to_scalar().unwrap();
 
         // Host reference computed from the SAME grads, torch's exact formula
@@ -746,7 +886,7 @@ mod tests {
         let max_norm = 1.0f64;
         let total_norm = clip_gradients(&vars, &mut grads, max_norm)
             .unwrap()
-            .expect("clipping was enabled");
+            .unwrap_clipped();
         let norm_val: f32 = total_norm.to_scalar().unwrap();
 
         // Host reference: torch's formula over the SAME per-element grads,
@@ -812,6 +952,105 @@ mod tests {
         assert_multi_var_clip_matches_host(&Device::Cpu);
     }
 
+    /// A HOST-side Rust scalar replica of [`clip_gradients`]'s EXACT formula
+    /// and op ORDER — `sqr` + `sum_all` per Var (f32), fold across Vars
+    /// (f32), `sqrt`, `affine(1.0, 1e-6)`, `recip`, `affine(max_norm, 0.0)`,
+    /// `minimum(1.0)`, then `broadcast_mul` per element — written in plain
+    /// f32 arithmetic so each step is the SAME single IEEE-754 rounding
+    /// candle's own CPU backend performs (`Affine`'s `v * mul + add`,
+    /// `Recip`'s `1.0 / v`, `Minimum`'s `if v1 > v2 { v2 } else { v1 }` —
+    /// candle-core-0.11.0 `cpu_backend/mod.rs`/`op.rs`). This is the
+    /// "drop-in" oracle for the device-side clip REFACTOR itself (did moving
+    /// the computation onto the device change the answer the "replace 225
+    /// D2H syncs" lever actually needs to be equivalence-preserving?), never
+    /// a torch-parity claim (that is `production_bound_ulp`'s job) — so the
+    /// fixture only needs the SAME formula computed twice through two
+    /// independent implementations, at a scale where every partial sum is
+    /// an exactly-representable integer, so NEITHER implementation's own
+    /// internal reduction order (candle's SIMD-lane `vec_sum` vs this
+    /// function's plain sequential fold) can perturb a single bit — making
+    /// bit-identity an honest claim rather than an accident of a lucky seed.
+    fn host_clip_gradients_f32(before: &[Vec<f32>], max_norm: f64) -> (f32, Vec<Vec<f32>>) {
+        let mut total_sq: Option<f32> = None;
+        for g in before {
+            let sum_i: f32 = g.iter().map(|&x| x * x).fold(0.0f32, |acc, sq| acc + sq);
+            total_sq = Some(match total_sq {
+                None => sum_i,
+                Some(acc) => acc + sum_i,
+            });
+        }
+        let total_sq = total_sq.expect("at least one Var");
+        let total_norm = total_sq.sqrt();
+        let d = total_norm * 1.0f32 + 1e-6f32; // affine(1.0, 1e-6)
+        let r = 1.0f32 / d; // recip
+        let c = r * max_norm as f32; // affine(max_norm, 0.0) -- `+ 0.0` is exact
+        let coef = if c > 1.0 { 1.0f32 } else { c }; // minimum(1.0), candle's own predicate
+        let after = before
+            .iter()
+            .map(|g| g.iter().map(|&x| x * coef).collect())
+            .collect();
+        (total_norm, after)
+    }
+
+    /// The "drop-in" acceptance leg (esc-182 finding item 2 / phase-6
+    /// tautology close-out): [`clip_gradients`]'s device-side tensor-op path
+    /// against [`host_clip_gradients_f32`]'s independent host-scalar replica
+    /// of the IDENTICAL formula, over the SAME four-Var exact-integer
+    /// fixture [`assert_multi_var_clip_matches_host`] uses — `total_norm`
+    /// AND every clipped gradient BIT-IDENTICAL, not merely within a
+    /// tolerance. This is the criterion the "replace 225 D2H syncs"
+    /// optimization itself needs (device compute must reproduce the SAME
+    /// formula, exactly, not merely something close to torch); CUDA is
+    /// covered separately — `production_shape_224_vars_cuda_matches_host_
+    /// within_bound` already holds CUDA to the SAME truth-relative
+    /// `production_bound_ulp` the CPU torch-parity leg uses (see that
+    /// test's own doc for why bit-identity itself is not an honest claim at
+    /// CUDA's parallel-tree reduction order and production element counts).
+    ///
+    /// Mutation tried: `+` → `*` in the fold over per-`Var` squared sums
+    /// (the same mutant `multi_var_clip_matches_host_reference_on_cpu`
+    /// guards) — RED: the host replica (never touched by the mutant) still
+    /// reports `total_sq == 72.0`, while the mutated device path reports
+    /// `2160`, and `sqrt(2160) != sqrt(72)` is very much not bit-identical.
+    #[test]
+    fn clip_gradients_device_and_host_agree_bit_identically_on_cpu() {
+        let (vars, mut grads, before) = four_vars_with_grads(&Device::Cpu);
+        let max_norm = 1.0f64;
+
+        let (host_norm, host_after) = host_clip_gradients_f32(&before, max_norm);
+
+        let device_norm_tensor = clip_gradients(&vars, &mut grads, max_norm)
+            .unwrap()
+            .unwrap_clipped();
+        let device_norm: f32 = device_norm_tensor.to_scalar().unwrap();
+
+        assert_eq!(
+            device_norm.to_bits(),
+            host_norm.to_bits(),
+            "device total_norm {device_norm} (bits {:#010x}) must be BIT-IDENTICAL to the host \
+             replica's {host_norm} (bits {:#010x})",
+            device_norm.to_bits(),
+            host_norm.to_bits()
+        );
+
+        for (i, (w, host_g)) in vars.iter().zip(&host_after).enumerate() {
+            let device_g: Vec<f32> = grads
+                .get(w.as_tensor())
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let device_bits: Vec<u32> = device_g.iter().map(|x| x.to_bits()).collect();
+            let host_bits: Vec<u32> = host_g.iter().map(|x| x.to_bits()).collect();
+            assert_eq!(
+                device_bits, host_bits,
+                "Var {i}: device-clipped gradient must be BIT-IDENTICAL to the host replica's \
+                 (device {device_g:?} vs host {host_g:?})"
+            );
+        }
+    }
+
     /// A gradient that is NOT already `F32` (the AMP path this function's own
     /// doc calls out) must be upconverted before `.sqr()`/`.sum_all()` in the
     /// squared-sum loop AND before `broadcast_mul` in the rescale loop, then
@@ -871,7 +1110,7 @@ mod tests {
         let vars = vec![w_bf16.clone(), w_f32.clone()];
         let total_norm = clip_gradients(&vars, &mut grads, 1.0)
             .unwrap()
-            .expect("clipping enabled");
+            .unwrap_clipped();
         let norm_val: f32 = total_norm.to_scalar().unwrap();
 
         let bf16_sq: f64 = 4.0 * (3.0f64 * 3.0);
@@ -962,7 +1201,9 @@ mod tests {
         // Var's gradient passes through UNCHANGED (bit-identical to before)
         // while `total_norm` is still NaN for the refusal to see.
         let (vars, mut grads, before) = one_nan_var_one_finite_var(&cuda);
-        let total_norm = clip_gradients(&vars, &mut grads, 1.0).unwrap().unwrap();
+        let total_norm = clip_gradients(&vars, &mut grads, 1.0)
+            .unwrap()
+            .unwrap_clipped();
         assert!(total_norm.to_scalar::<f32>().unwrap().is_nan());
         let finite_after: Vec<f32> = grads.get(vars[1].as_tensor()).unwrap().to_vec1().unwrap();
         assert_eq!(
@@ -996,7 +1237,9 @@ mod tests {
     #[test]
     fn nan_gradient_poisons_every_gradient_through_the_cpu_minimum() {
         let (vars, mut grads, _before) = one_nan_var_one_finite_var(&Device::Cpu);
-        let total_norm = clip_gradients(&vars, &mut grads, 1.0).unwrap().unwrap();
+        let total_norm = clip_gradients(&vars, &mut grads, 1.0)
+            .unwrap()
+            .unwrap_clipped();
         assert!(total_norm.to_scalar::<f32>().unwrap().is_nan());
         let finite_after: Vec<f32> = grads.get(vars[1].as_tensor()).unwrap().to_vec1().unwrap();
         assert!(
@@ -1053,6 +1296,64 @@ mod tests {
         );
     }
 
+    /// The CUDA leg of the same structural-proxy claim (esc-182 finding item
+    /// 3 / phase-6 tautology close-out): `SYNC_READ_COUNT` is the only way a
+    /// test can observe "no device→host read happened" on ANY backend — there
+    /// is no CUDA stream a `#[test]` can inspect directly — so this counts
+    /// `to_scalar`/`to_vec` calls through the exact SAME structural proxy
+    /// [`clip_gradients_never_reads_the_norm_back`] uses, on a real CUDA
+    /// device, across the FULL timed path (`clip_and_step`, not a bare
+    /// `clip_gradients`): a bare clip (0 reads), an OFF-cadence `clip_and_
+    /// step` (0 reads — the cadence gate must suppress the read entirely,
+    /// not merely skip acting on it), and an ON-cadence `clip_and_step`
+    /// (EXACTLY 1 read — [`refuse_nonfinite_norm`] is the only permitted
+    /// device→host call on this path, never zero and never more than one
+    /// per cadence-gated step).
+    #[test]
+    #[serial(grad_clip_sync_read_count)]
+    fn clip_gradients_never_reads_the_norm_back_on_cuda() {
+        let Some(cuda) = cuda_device_or_skip("clip_gradients_sync_cuda") else {
+            return;
+        };
+
+        // Bare clip_gradients: 0 reads.
+        let before = sync_read_count();
+        let (vars, mut grads, _before) = four_vars_with_grads(&cuda);
+        clip_gradients(&vars, &mut grads, 1.0).unwrap();
+        assert_eq!(
+            sync_read_count(),
+            before,
+            "CUDA: clip_gradients must not perform any device→host read"
+        );
+
+        // OFF-cadence clip_and_step: still 0 reads, even with a fresh
+        // GradStore and a real AdamW step riding along.
+        let (vars2, mut grads2, _before2) = four_vars_with_grads(&cuda);
+        let mut optimizer = AdamW::new(vars2.clone(), params_adamw(0.1)).unwrap();
+        let before_off = sync_read_count();
+        clip_and_step(&mut optimizer, &vars2, &mut grads2, 1.0, 10, 3, false).unwrap();
+        assert_eq!(
+            sync_read_count(),
+            before_off,
+            "CUDA: an off-cadence clip_and_step must not read the norm back at all"
+        );
+
+        // ON-cadence clip_and_step: EXACTLY 1 read (refuse_nonfinite_norm),
+        // never more.
+        let (vars3, mut grads3, _before3) = four_vars_with_grads(&cuda);
+        let mut optimizer3 = AdamW::new(vars3.clone(), params_adamw(0.1)).unwrap();
+        let before_on = sync_read_count();
+        clip_and_step(&mut optimizer3, &vars3, &mut grads3, 1.0, 10, 10, false).unwrap();
+        assert_eq!(
+            sync_read_count(),
+            before_on + 1,
+            "CUDA: an on-cadence clip_and_step must read the norm back EXACTLY once, through \
+             refuse_nonfinite_norm — never zero (the finite check would be silently skipped) \
+             and never more than one (a second sync would defeat the whole optimization this \
+             module exists for)"
+        );
+    }
+
     /// Build a `Var`/`grads` pair whose gradient is NaN everywhere (mirrors
     /// the setup shared by every cadence test below).
     fn one_var_with_nan_grad() -> (Var, GradStore, AdamW) {
@@ -1094,6 +1395,88 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("non-finite"), "got: {err}");
+    }
+
+    /// `clip_and_step` must WARN (a `tracing::warn!` — a COUNTED FACT, not a
+    /// hard refusal, see `clip_and_step`'s own doc for why a hard `Err` here
+    /// broke every legitimate loss that does not route through every
+    /// trainable `Var` for a given batch) when `trainable_vars` is
+    /// NON-EMPTY but not one of them has a gradient present — the
+    /// AMBIGUOUS `ClipOutcome::NoGradients` case (phase-6 class-census
+    /// addition #2, ledger row 215; and the round-2 pivot on the SAME
+    /// finding once `ft_correctness_sweep.rs`/`ft_determinism.rs`/
+    /// `encoder_adapters.rs` proved a hard refusal there is not viable).
+    /// Before `ClipOutcome` existed, `clip_gradients` returned the SAME
+    /// `None` for this case as it did for `max_grad_norm <= 0.0`, so
+    /// `clip_and_step` silently skipped BOTH the clip AND the non-finite
+    /// check with NO trace of it anywhere — indistinguishable from an
+    /// intentional "clipping is off" configuration AND unobservable. The
+    /// step must still SUCCEED (an `AdamW` step over an empty `GradStore`
+    /// is a harmless no-op) — this is a warning, not a failure. Off-cadence
+    /// OR on-cadence: the warning is not gated by the norm-check cadence at
+    /// all (there is no norm tensor to even read back).
+    #[test]
+    fn clip_and_step_warns_no_gradients_with_nonempty_trainable_vars() {
+        use std::io;
+        use std::sync::Mutex;
+        use tracing::subscriber::DefaultGuard;
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone)]
+        struct BufferWriter(std::sync::Arc<Mutex<Vec<u8>>>);
+        impl io::Write for BufferWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'w> MakeWriter<'w> for BufferWriter {
+            type Writer = BufferWriter;
+            fn make_writer(&'w self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let dev = Device::Cpu;
+        let w = Var::from_tensor(&Tensor::zeros((4,), DType::F32, &dev).unwrap()).unwrap();
+        let mut empty_grads = GradStore::default();
+        let mut optimizer = AdamW::new(vec![w.clone()], params_adamw(0.1)).unwrap();
+
+        let buffer = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(BufferWriter(buffer.clone()))
+            .with_ansi(false)
+            .finish();
+        let _guard: DefaultGuard = tracing::subscriber::set_default(subscriber);
+
+        // Off-cadence (step=3, interval=10): still must warn, and must
+        // still SUCCEED.
+        clip_and_step(&mut optimizer, &[w], &mut empty_grads, 1.0, 10, 3, false)
+            .expect("NoGradients with a non-empty trainable_vars must WARN, never refuse");
+
+        let logs = String::from_utf8(buffer.lock().unwrap().clone()).expect("utf-8 logs");
+        assert!(
+            logs.contains("NONE had a gradient") && logs.contains("WARN"),
+            "expected a WARN-level counted-fact log line, got: {logs}"
+        );
+    }
+
+    /// The counterpart: an EMPTY `trainable_vars` is the UNAMBIGUOUSLY
+    /// benign reading of `NoGradients` (nothing was ever asked to be
+    /// clipped) and `clip_and_step` must not even warn about it — matching
+    /// the pre-esc-182 behavior for this one case (an eval-only /
+    /// all-adapters-frozen-by-design call site).
+    #[test]
+    fn clip_and_step_tolerates_no_gradients_with_empty_trainable_vars() {
+        let dev = Device::Cpu;
+        let w = Var::from_tensor(&Tensor::zeros((4,), DType::F32, &dev).unwrap()).unwrap();
+        let mut grads = GradStore::default();
+        let mut optimizer = AdamW::new(vec![w], params_adamw(0.1)).unwrap();
+        clip_and_step(&mut optimizer, &[], &mut grads, 1.0, 10, 3, false)
+            .expect("an empty trainable_vars must not be refused");
     }
 
     /// Why `step == 1` is its own arm: with the modulo cadence alone
@@ -1171,11 +1554,44 @@ mod tests {
         let (w, mut grads, g_before) = one_var_with_grad(5.0, 4);
         let before = sync_read_count();
         let result = clip_gradients(std::slice::from_ref(&w), &mut grads, 0.0).unwrap();
-        assert!(result.is_none());
+        assert!(
+            matches!(result, ClipOutcome::Disabled),
+            "max_norm <= 0.0 must be the Disabled outcome, never NoGradients (this Var DID have \
+             a gradient present — collapsing the two would re-introduce the ambiguity \
+             ClipOutcome exists to remove), got {result:?}"
+        );
         assert_eq!(sync_read_count(), before, "disabled clipping must not sync");
         let after: Vec<f32> = grads.get(w.as_tensor()).unwrap().to_vec1().unwrap();
         let before_vals: Vec<f32> = g_before.to_vec1().unwrap();
         assert_eq!(before_vals, after);
+    }
+
+    /// The NEW half of the ClipOutcome split (phase-6 class-census addition
+    /// #2, ledger row 215): a NON-EMPTY `trainable_vars` where NOT ONE `Var`
+    /// has a gradient present in `grads` must come back `NoGradients`, never
+    /// silently collapsed into the SAME `None` `Disabled` produces — that
+    /// collapse is exactly what let a detached-graph / all-frozen-adapter
+    /// bug hide behind an "operator turned clipping off" reading.
+    #[test]
+    fn no_gradient_present_is_distinct_from_disabled() {
+        let dev = Device::Cpu;
+        let w = Var::from_tensor(&Tensor::zeros((4,), DType::F32, &dev).unwrap()).unwrap();
+        // A GradStore that was never populated for `w` at all — the
+        // "detached graph" / "forgot to call backward" shape.
+        let mut empty_grads = GradStore::default();
+        let result = clip_gradients(std::slice::from_ref(&w), &mut empty_grads, 1.0).unwrap();
+        assert!(
+            matches!(result, ClipOutcome::NoGradients),
+            "a non-empty trainable_vars with no gradient present must be NoGradients, got \
+             {result:?}"
+        );
+
+        // An EMPTY trainable_vars is the one genuinely benign reading —
+        // still NoGradients (nothing WAS clipped), but `clip_and_step`
+        // treats this arm differently based on emptiness, not on the
+        // ClipOutcome variant alone (see that function's own doc).
+        let result_empty = clip_gradients(&[], &mut empty_grads, 1.0).unwrap();
+        assert!(matches!(result_empty, ClipOutcome::NoGradients));
     }
 
     /// The non-finite `max_norm` cell, NaN: `max_norm.is_nan()` makes
@@ -1262,21 +1678,50 @@ mod tests {
     // acceptance criterion here needs a DIFFERENT (still-derived, never
     // fitted) bound.
     //
-    // Standard numerical-analysis practice (Higham, *Accuracy and Stability
-    // of Numerical Algorithms*, 2nd ed., the probabilistic summation-error
-    // bound of §4.2) treats per-step rounding errors as independent,
-    // zero-mean perturbations when the summands' signs are not
-    // adversarially correlated — true here: every summand is `g_i²` for a
-    // genuinely-random `g_i`, never engineered to round in one direction —
-    // so the accumulated error grows like `sqrt(n) * u`, not `n * u`, with
-    // high probability. `production_bound_ulp` uses THAT bound instead:
-    // `0.5 * (Σ sqrt(n_i - 1) + sqrt(k - 1)) + 2.0` (the intra-Var folds'
-    // probabilistic term, the cross-Var fold's probabilistic term, and the
-    // toy fixture's own fixed `sqrt`/`affine(eps)`/`recip`/`broadcast_mul`
-    // roundings, none of which scale with `n`/`k`) — computed FROM the
-    // fixture's actual measured `n_i`/`k` in code, never a literal. This is
-    // still a DERIVED bound (no absolute floor, nothing fitted to what a run
-    // happened to produce), just the appropriate ONE for this scale.
+    // A first attempt swapped the worst-case additive model for a
+    // probabilistic `sqrt(n)` one (Higham, *Accuracy and Stability of
+    // Numerical Algorithms*, 2nd ed., §4.2) applied the SAME way — summing
+    // EVERY Var's own `sqrt(n_i - 1) * 0.5` term across all `k` Vars. That
+    // was STILL tautological: by Cauchy-Schwarz that sum over-counts the
+    // true combined error by `≈ sqrt(k) ≈ 15` at this scale, landing at
+    // ≈ 19000 ulp — loose enough to pass a `+1e-4` RELATIVE `clip_coef` bug
+    // (≈ 839 ulp) by more than an order of magnitude, which is exactly what
+    // `production_coefficient_parity_rejects_an_injected_coefficient_bug`
+    // below (the RED control that caught this) injects. `production_bound_
+    // ulp`'s own doc now carries the corrected derivation: model the
+    // LARGEST Var's intra-fold error at ITS OWN scale, DILUTE it by that
+    // Var's share of `total_sq` before folding it into `total_sq`'s ulp
+    // count (the other Vars' own diluted contributions are second-order and
+    // are not summed individually — doing so is the over-count this
+    // replaces), add the `k`-term outer fold (no dilution needed — it
+    // already operates at `total_sq`'s own scale), then propagate through
+    // `sqrt` (halves relative error) and the coefficient's own remaining
+    // fixed roundings. At this fixture's real `k`/`n_i` that evaluates to
+    // ≈ 6.1 ulp — still a DERIVED bound (no absolute floor, nothing fitted
+    // to what a run happened to produce), just one that does not silently
+    // accept a coefficient computed from the wrong formula.
+    //
+    // ## Coefficient-level, drop-in, and no-sync legs
+    //
+    // `production_coefficient_parity_rejects_an_injected_coefficient_bug`
+    // isolates `clip_coef` itself (the scalar every downstream number —
+    // `total_norm`, every clipped gradient — is a deterministic function
+    // of) against the SAME `production_bound_ulp`, in both the ACTIVE and
+    // BOUNDARY regimes, with two RED controls: a `+1e-4` relative
+    // perturbation of the coefficient (must exceed the bound) and the
+    // pre-PR no-epsilon formula's OWN deviation at THIS realistic
+    // amplitude (measured and reported, not asserted — see this section's
+    // own honest-disclosure paragraph below for why). `clip_gradients_
+    // device_and_host_agree_bit_identically_on_cpu` is the "drop-in" leg:
+    // the device-side (tensor-op) path and an independent host-scalar
+    // replica of the IDENTICAL formula, at a scale where every partial sum
+    // is an exact integer (so the comparison needs no tolerance at all —
+    // the real property a refactor-equivalence check needs, not a parity
+    // check against torch). `clip_gradients_never_reads_the_norm_back_on_
+    // cuda` extends the existing CPU structural-proxy leg (`clip_gradients_
+    // never_reads_the_norm_back`) to CUDA, still via `SYNC_READ_COUNT` —
+    // there is no way to observe a CUDA stream directly from a test, so
+    // this stays a structural proxy on that device too.
     //
     // ## RED control
     //
@@ -1379,25 +1824,86 @@ mod tests {
         (vars, grads, before)
     }
 
-    /// The scale-appropriate ulp bound for this fixture's ACTUAL measured
-    /// `n_i`/`k` (see this section's leading doc: the toy fixture's
-    /// worst-case `(n-1)*0.5` additive bound is vacuous at `Σn_i` in the
-    /// millions; this uses the standard probabilistic `sqrt(n)`
-    /// summation-error bound instead — still derived from the op sequence,
-    /// never fitted to a measured value).
+    /// The scale-appropriate ulp bound for `clip_coef` (and, transitively,
+    /// `total_norm` and every clipped gradient) at this fixture's ACTUAL
+    /// measured `n_i`/`k`.
+    ///
+    /// ## Why the previous version of this bound was TAUTOLOGICAL
+    ///
+    /// The prior derivation summed EVERY `Var`'s own worst-case
+    /// `sqrt(n_i - 1) * 0.5` intra-fold term ACROSS all `k` `Var`s
+    /// (`n_per_var.iter().map(...).sum()`). By Cauchy-Schwarz, `Σ
+    /// sqrt(n_i) >= sqrt(Σ n_i)`, with equality only at `k == 1` — at
+    /// `k = 224` `Var`s of comparable magnitude that over-counts by
+    /// approximately `sqrt(k) ≈ 15`. Evaluated at this fixture's real
+    /// `k = 224`, `n_max = 83968`, `Σn_i ≈ 7.2M`, that gave ≈ 19000 ulp —
+    /// loose enough that a `+1e-4` RELATIVE coefficient bug (≈ 839 ulp,
+    /// `f64::from(f32::EPSILON)`-scale) PASSED it by a factor of ~23, and in
+    /// the opposite direction the bound was so loose it could not have
+    /// caught almost any coefficient bug smaller than several tens of a
+    /// percent — a bound that wide is not an acceptance criterion, it is a
+    /// tautology. See `production_coefficient_parity_rejects_an_injected_
+    /// coefficient_bug` below for the RED control that surfaced this.
+    ///
+    /// ## Corrected derivation
+    ///
+    /// Model each `Var`'s intra-fold error at ITS OWN scale — `0.5 *
+    /// sqrt(n_i - 1)` ulp OF `sum_i`, that `Var`'s own partial sum of
+    /// squares — then DILUTE it by that `Var`'s share of `total_sq` before
+    /// folding it into `total_sq`'s OWN ulp count: an absolute error of `e`
+    /// in a component worth only a `p` fraction of the aggregate
+    /// contributes `e * p`, not `e`, to the aggregate's relative error, and
+    /// (for gradients drawn from a common per-element distribution)
+    /// `sum_i / total_sq ≈ n_i / Σn_i`. That per-`Var` term grows with `n_i`
+    /// in BOTH factors (`sqrt(n_i)` and the dilution ratio), so the LARGEST
+    /// `Var` alone dominates it; the other `k - 1` `Var`s' own (smaller,
+    /// diluted) contributions are second-order here and are not summed
+    /// individually — doing so is exactly the over-count this replaces.
+    ///
+    /// `total_sq`'s ulp count is then `0.5 * sqrt(n_max - 1) * (n_max /
+    /// Σn_i)` (the largest `Var`'s diluted intra-fold term) `+ 0.5 *
+    /// sqrt(k - 1)` (the outer `k`-term fold across `Var`s, each already at
+    /// `total_sq`'s own scale — no dilution needed there).
+    ///
+    /// `total_norm = sqrt(total_sq)` HALVES relative error (`d(sqrt(x)) /
+    /// sqrt(x) == 0.5 * dx / x`), so `total_sq`'s ulp count above must be
+    /// halved to become `total_norm`'s. In the ACTIVE regime every fixture
+    /// below uses (`total_norm >> 1e-6`), `clip_coef = max_norm /
+    /// (total_norm + 1e-6)` inherits `total_norm`'s relative error to
+    /// leading order (`d(coef)/coef == -d(total_norm)/total_norm` when the
+    /// `+ 1e-6` term is negligible), so that halved ulp count carries
+    /// straight through to `clip_coef` unchanged. `affine(1.0, 1e-6)` and
+    /// `recip` are each one further correctly-rounded op NOT already
+    /// counted above (0.5 ulp each — `affine(max_norm, 0.0)`/`minimum` are
+    /// exact whenever `max_norm == 1.0` and the clip is unclamped, both
+    /// true in every fixture below), and the FINAL `broadcast_mul` that
+    /// actually scales a gradient is one more (0.5 ulp) — folding that in
+    /// too lets ONE bound cover the coefficient-only legs (which stop
+    /// before that op — a half-ulp of unused slack there) and the
+    /// gradient-element legs (which do not) alike.
+    ///
+    /// At `k = 224`, `n_max = 83968`, `Σn_i ≈ 7.2M` this evaluates to ≈ 6.1
+    /// ulp — comfortably clearing the measured healthy-amplitude deviation
+    /// (single digits — see `production_shape_224_vars_matches_torch_
+    /// parity_within_probabilistic_bound`'s own `eprintln!`) while sitting
+    /// nowhere near the ≈ 839 ulp a `+1e-4` relative coefficient bug
+    /// produces. STILL a derived bound (no absolute floor, nothing fitted
+    /// to a run's measured output) — just one that correctly PROPAGATES
+    /// through `sqrt` and DILUTES each `Var`'s own contribution by its
+    /// share of the aggregate, rather than summing every `Var`'s
+    /// worst-case term at ITS OWN scale directly into the aggregate's ulp
+    /// count.
     fn production_bound_ulp(n_per_var: &[usize]) -> f64 {
         let k = n_per_var.len();
-        let intra_var: f64 = n_per_var
-            .iter()
-            .map(|&n| (n.saturating_sub(1) as f64).sqrt() * 0.5)
-            .sum();
-        let cross_var = (k.saturating_sub(1) as f64).sqrt() * 0.5;
-        // `sqrt`, `affine(1.0, eps)`, `recip`, `broadcast_mul`: 4 further
-        // roundings at 0.5 ulp each that do not scale with n/k (see
-        // `clip_gradients`'s own doc's op-count derivation); `affine(max_norm,
-        // 0.0)`/`minimum` are exact here (max_norm == 1.0 or the clamp is not
-        // engaged in either leg below).
-        intra_var + cross_var + 4.0 * 0.5
+        let total: f64 = n_per_var.iter().map(|&n| n as f64).sum::<f64>().max(1.0);
+        let n_max = n_per_var.iter().copied().max().unwrap_or(0);
+        let intra_term = (n_max.saturating_sub(1) as f64).sqrt() * 0.5 * (n_max as f64 / total);
+        let cross_term = (k.saturating_sub(1) as f64).sqrt() * 0.5;
+        let total_sq_ulp = intra_term + cross_term;
+        // Halve for the `sqrt` (total_sq -> total_norm) propagation, then add
+        // the three further FIXED (not n/k-scaled) roundings this bound's own
+        // doc derives: `affine(1.0, 1e-6)`, `recip`, `broadcast_mul`.
+        total_sq_ulp * 0.5 + 3.0 * 0.5
     }
 
     /// ULP distance between a host-truth value `e` and a device-measured
@@ -1452,7 +1958,7 @@ mod tests {
 
         let total_norm = clip_gradients(&vars, &mut grads, max_norm)
             .unwrap()
-            .expect("clipping enabled");
+            .unwrap_clipped();
         let norm_val: f32 = total_norm.to_scalar().unwrap();
 
         let bound = production_bound_ulp(&n_per_var);
@@ -1501,6 +2007,247 @@ mod tests {
         );
     }
 
+    /// Recompute `clip_coef` from a `total_norm` tensor USING THE EXACT SAME
+    /// op chain [`clip_gradients`] issues internally (`affine(1.0, 1e-6)` ->
+    /// `recip` -> `affine(max_norm, 0.0)` -> `minimum(1.0)`) — never an
+    /// independent re-implementation that could silently drift from
+    /// production's own sequence. [`clip_gradients`] itself never returns
+    /// this scalar (materializing it would be exactly the kind of
+    /// device->host temptation its own module doc exists to avoid feeding);
+    /// reconstructing it, in a TEST, from the `total_norm` tensor
+    /// [`clip_gradients`] already returns costs no extra device compute a
+    /// test cannot afford.
+    fn device_clip_coef(total_norm: &Tensor, max_norm: f64) -> Tensor {
+        total_norm
+            .affine(1.0, 1e-6)
+            .and_then(|d| d.recip())
+            .and_then(|r| r.affine(max_norm, 0.0))
+            .and_then(|c| c.minimum(1.0))
+            .unwrap()
+    }
+
+    /// The SAME chain as [`device_clip_coef`], but with `max_norm` perturbed
+    /// by `relative_bug` (and the final `minimum(1.0)` clamp deliberately
+    /// OMITTED — this models a coefficient BUG upstream of the clamp, and
+    /// every fixture below is deep enough in the active regime that the
+    /// unbugged coefficient is not near `1.0` either). This is the verifier's
+    /// own injection technique from the phase-6 tautology finding:
+    /// `r.affine(max_norm * 1.0001, 0)`.
+    fn device_clip_coef_perturbed(total_norm: &Tensor, max_norm: f64, relative_bug: f64) -> Tensor {
+        total_norm
+            .affine(1.0, 1e-6)
+            .and_then(|d| d.recip())
+            .and_then(|r| r.affine(max_norm * (1.0 + relative_bug), 0.0))
+            .unwrap()
+    }
+
+    /// THE coefficient-level torch-parity acceptance leg (phase-6 "tautological
+    /// verdict" close-out on PR #373, ledger row 212). `production_shape_224_
+    /// vars_matches_torch_parity_within_probabilistic_bound` above measures
+    /// `total_norm` and every clipped GRADIENT against truth; this measures
+    /// the single scalar `clip_coef` ITSELF is derived from — every other
+    /// number on the clip path is a deterministic function of it — against
+    /// an independent `f64` reference of torch's exact formula, in both the
+    /// ACTIVE and BOUNDARY regimes, within `production_bound_ulp` (now the
+    /// corrected, non-tautological derivation — see that function's own
+    /// doc). Two RED controls prove the bound is non-vacuous rather than
+    /// re-deriving the same passing number a second way.
+    #[test]
+    fn production_coefficient_parity_rejects_an_injected_coefficient_bug() {
+        let device = Device::Cpu;
+        let max_norm = 1.0f64;
+
+        // ---- ACTIVE regime (total_norm well above max_norm) ----
+        let (vars, mut grads, before) = production_shaped_vars_with_grads(1e-3, 20260825, &device);
+        let n_per_var: Vec<usize> = before.iter().map(|v| v.len()).collect();
+        let bound = production_bound_ulp(&n_per_var);
+
+        let total_sq_host: f64 = before
+            .iter()
+            .flat_map(|g| g.iter())
+            .map(|&x| (x as f64) * (x as f64))
+            .sum();
+        let host_norm = total_sq_host.sqrt();
+        assert!(
+            host_norm > max_norm,
+            "test setup: active regime, got total_norm={host_norm}"
+        );
+        let host_coef = max_norm / (host_norm + 1e-6);
+
+        let total_norm = clip_gradients(&vars, &mut grads, max_norm)
+            .unwrap()
+            .unwrap_clipped();
+        let device_coef: f32 = device_clip_coef(&total_norm, max_norm).to_scalar().unwrap();
+        let active_ulp = ulp_distance(host_coef as f32, device_coef);
+        assert!(
+            active_ulp <= bound,
+            "ACTIVE-regime clip_coef: host {host_coef} vs device {device_coef} — {active_ulp} \
+             ulp exceeds the derived bound {bound} ulp"
+        );
+
+        // ---- BOUNDARY regime (max_norm chosen to sit total_norm right at
+        // the top of the (max_norm - 1e-6, max_norm] band) ----
+        let (boundary_vars, mut boundary_grads, boundary_before) =
+            production_shaped_vars_with_grads(1e-3, 20260827, &device);
+        let boundary_total_sq: f64 = boundary_before
+            .iter()
+            .flat_map(|g| g.iter())
+            .map(|&x| (x as f64) * (x as f64))
+            .sum();
+        let boundary_host_norm = boundary_total_sq.sqrt();
+        let boundary_max_norm = boundary_host_norm; // total_norm == max_norm exactly
+        let boundary_host_coef = boundary_max_norm / (boundary_host_norm + 1e-6);
+        assert!(
+            boundary_host_coef < 1.0,
+            "test setup: boundary coefficient must still be strictly below the 1.0 clamp"
+        );
+
+        let boundary_total_norm =
+            clip_gradients(&boundary_vars, &mut boundary_grads, boundary_max_norm)
+                .unwrap()
+                .unwrap_clipped();
+        let boundary_device_coef: f32 = device_clip_coef(&boundary_total_norm, boundary_max_norm)
+            .to_scalar()
+            .unwrap();
+        let boundary_ulp = ulp_distance(boundary_host_coef as f32, boundary_device_coef);
+        assert!(
+            boundary_ulp <= bound,
+            "BOUNDARY-regime clip_coef: host {boundary_host_coef} vs device \
+             {boundary_device_coef} — {boundary_ulp} ulp exceeds the derived bound {bound} ulp"
+        );
+
+        // ---- RED control (a): a +1e-4 relative injected coefficient bug
+        // must EXCEED the bound — the verifier's own counterexample to the
+        // pre-fix bound (~19000 ulp), which this bug passed by more than an
+        // order of magnitude. ----
+        let bugged_coef: f32 = device_clip_coef_perturbed(&total_norm, max_norm, 1e-4)
+            .to_scalar()
+            .unwrap();
+        let bugged_ulp = ulp_distance(host_coef as f32, bugged_coef);
+        assert!(
+            bugged_ulp > bound,
+            "RED control (a) did not fire: a +1e-4 relative coefficient bug measured only \
+             {bugged_ulp} ulp from truth, which the bound of {bound} ulp did not reject — the \
+             bound is still too loose"
+        );
+
+        // ---- RED control (b): the pre-PR no-epsilon formula's OWN
+        // deviation from truth, at THIS SAME realistic amplitude. Measured
+        // and PINNED (not silently left unasserted), per family K — this is
+        // the honest complement to (a): at the shipped default max_grad_norm
+        // and a realistic per-element gradient magnitude, torch's `+ 1e-6`
+        // term is small enough that its absence is NOT reliably visible
+        // above a bound this tight. That is not a gap in this bound — the
+        // formula-level RED control that DOES fire reliably is
+        // `production_shape_old_formula_fails_the_bound_at_small_total_norm`,
+        // deliberately built at a `total_norm` scale small enough to make
+        // the epsilon term material. The assertion below PINS the "not
+        // reliably visible at realistic amplitude" half of that finding so
+        // a future change to the fixture's amplitude (or to
+        // `production_bound_ulp`) that flips this conclusion is caught,
+        // rather than silently going stale.
+        let old_coef = max_norm / host_norm; // pre-PR formula, no epsilon
+        let old_formula_ulp = ulp_distance(host_coef as f32, old_coef as f32);
+        eprintln!(
+            "production_coefficient_parity: active {active_ulp:.2} ulp, boundary \
+             {boundary_ulp:.2} ulp, RED control (a) [+1e-4 relative bug] {bugged_ulp:.2} ulp, \
+             RED control (b) [pre-PR no-epsilon formula at realistic amplitude] \
+             {old_formula_ulp:.2} ulp, all against a derived bound of {bound:.3} ulp"
+        );
+        assert!(
+            old_formula_ulp <= bound,
+            "esc-182's pre-PR (no-epsilon) formula was expected to stay INVISIBLE (within the \
+             bound) at this realistic amplitude ({old_formula_ulp} ulp vs bound {bound} ulp) — \
+             if this now fails, the epsilon shift has become material at this scale and RED \
+             control (b) should be promoted to a `must exceed` assertion instead of this \
+             documentation pin; `production_shape_old_formula_fails_the_bound_at_small_total_\
+             norm` remains the reliable formula-level discriminator regardless"
+        );
+    }
+
+    /// The PRE-REWRITE host algorithm's cross-`Var` fold, replicated
+    /// EXACTLY — including its own per-`Var` step, which called the SAME
+    /// candle `sqr`/`sum_all` tensor ops [`clip_gradients`] still calls
+    /// today (`git show origin/main:…/optimizer.rs`, before esc-182's
+    /// device rewrite: `sq: f32 = g_f32.sqr()?.sum_all()?.to_scalar::<f32>()
+    /// ?; total_sq += sq as f64;`). Using the REAL tensor ops here (not a
+    /// hand-rolled Rust fold) isolates the ONE thing that actually changed —
+    /// whether the `k`-`Var` outer fold happens in an `f64` HOST scalar or
+    /// an `f32` DEVICE tensor — from a second, unrelated difference a
+    /// hand-rolled per-`Var` sum would introduce: candle's own intra-`Var`
+    /// `sum_all` (a SIMD-lane-grouped accumulation, see `cpu/mod.rs::
+    /// vec_sum`) does NOT fold left-to-right the way a naive Rust
+    /// `.fold(0.0, |acc, x| acc + x)` does, so comparing against a
+    /// hand-rolled per-`Var` sum would have measured "candle's own SIMD
+    /// order vs a naive Rust loop", not the accumulator-precision change
+    /// this pin exists to isolate. `grads` must be read BEFORE
+    /// [`clip_gradients`] mutates it (it `remove`s and re-`insert`s every
+    /// entry), so this takes `vars`/`grads` directly rather than the
+    /// `before: Vec<Vec<f32>>` host snapshot other legs in this section use.
+    fn pre_rewrite_host_f64_total_norm(vars: &[Var], grads: &GradStore) -> f64 {
+        let mut total_sq_f64 = 0.0f64;
+        for var in vars {
+            let t: &Tensor = var;
+            if let Some(g) = grads.get(t) {
+                let g_f32 = if g.dtype() == DType::F32 {
+                    g.clone()
+                } else {
+                    g.to_dtype(DType::F32).unwrap()
+                };
+                let sq: f32 = g_f32.sqr().unwrap().sum_all().unwrap().to_scalar().unwrap();
+                total_sq_f64 += sq as f64;
+            }
+        }
+        total_sq_f64.sqrt()
+    }
+
+    /// Pins the MAGNITUDE of the accumulator-precision change this module's
+    /// top-of-file doc discloses: the pre-rewrite host implementation's `f64`
+    /// cross-`Var` accumulation ([`pre_rewrite_host_f64_total_norm`]) versus
+    /// [`clip_gradients`]'s current all-`f32`-on-device fold, on the SAME
+    /// 224-`Var` production config and realistic amplitude the torch-parity
+    /// legs use. Bound: the two implementations compute IDENTICAL per-`Var`
+    /// squared sums (both call the SAME candle `sqr`/`sum_all`) and differ
+    /// ONLY in how the `k = 224` per-`Var` partial sums are folded together
+    /// — exactly the `production_bound_ulp` derivation's `cross_term`
+    /// (`0.5 * sqrt(k - 1)` ulp of `total_sq`, halved by the `sqrt` into
+    /// `total_norm`), plus one more `f64 -> f32` narrowing rounding for the
+    /// OLD value's own return (this function stays `f64` internally, exactly
+    /// like the pre-rewrite code did, so the narrowing happens once, at the
+    /// comparison below — not inside the accumulation itself).
+    #[test]
+    fn production_pre_rewrite_f64_host_accumulator_vs_device_f32_fold() {
+        let device = Device::Cpu;
+        let (vars, mut grads, _before) = production_shaped_vars_with_grads(1e-3, 20260825, &device);
+        let k = vars.len();
+
+        // Read the pre-rewrite host value BEFORE clip_gradients mutates
+        // `grads` in place.
+        let old_norm_f64 = pre_rewrite_host_f64_total_norm(&vars, &grads);
+        let old_norm_f32 = old_norm_f64 as f32;
+
+        let new_norm_tensor = clip_gradients(&vars, &mut grads, 1.0)
+            .unwrap()
+            .unwrap_clipped();
+        let new_norm_f32: f32 = new_norm_tensor.to_scalar().unwrap();
+
+        let cross_term_totalsq_ulp = (k.saturating_sub(1) as f64).sqrt() * 0.5;
+        let bound = cross_term_totalsq_ulp * 0.5 + 1.0; // halved for sqrt, +1 for the f64->f32 narrowing + headroom
+        let deviation_ulp = ulp_distance(old_norm_f32, new_norm_f32);
+        eprintln!(
+            "accumulator-precision pin: pre-rewrite f64-host total_norm={old_norm_f64:.6} \
+             (as f32 {old_norm_f32}), device f32-fold total_norm={new_norm_f32} — \
+             {deviation_ulp:.2} ulp apart, derived bound {bound:.2} ulp"
+        );
+        assert!(
+            deviation_ulp <= bound,
+            "the f64-host-accumulator vs f32-device-fold total_norm deviation grew beyond the \
+             derived bound ({deviation_ulp} ulp > {bound} ulp) — this is exactly the change \
+             this module's top-of-file doc discloses, but its MAGNITUDE must stay pinned to the \
+             k-Var outer-fold rounding it is derived from, not silently grow"
+        );
+    }
+
     /// CUDA leg for the production-shape acceptance test — bounded against
     /// the SAME independent host `f64` reference, NOT asserted bit-identical
     /// to CPU. Why: the toy fixture's CPU/CUDA bit-identity claim
@@ -1539,7 +2286,7 @@ mod tests {
 
         let total_norm = clip_gradients(&vars, &mut grads, max_norm)
             .unwrap()
-            .expect("clipping enabled");
+            .unwrap_clipped();
         let norm_val: f32 = total_norm.to_scalar().unwrap();
         let bound = production_bound_ulp(&n_per_var);
         let norm_ulp = ulp_distance(host_norm as f32, norm_val);
@@ -1613,7 +2360,7 @@ mod tests {
         // control half of this leg).
         let total_norm = clip_gradients(&vars, &mut grads, max_norm)
             .unwrap()
-            .expect("clipping enabled");
+            .unwrap_clipped();
         let norm_val: f32 = total_norm.to_scalar().unwrap();
         let norm_ulp = ulp_distance(host_norm as f32, norm_val);
         assert!(

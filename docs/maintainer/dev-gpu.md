@@ -84,7 +84,21 @@ property the whole ephemeral-pod design rests on. Expect a smaller ratio on a
 full CUDA build — nvcc output is not rustc output — but the mechanism is what
 matters: the cache survives the machine.
 
-`gpu-dev.sh` generates its own SSH key — nothing to register.
+`gpu-dev.sh` generates its own SSH key — nothing to register. Every SSH
+invocation pins the connection to that key alone (`IdentitiesOnly=yes`): a
+macOS ssh-agent auto-adds each session key it uses, and once it holds more
+than a handful, offering all of them before this one can exhaust the pod's
+`MaxAuthTries` and read a perfectly reachable pod as unreachable.
+
+Deploy fails over across candidates and, for each one, polls for SSH up to
+`RP_SSH_WAIT_SECS` (default 600) — the wall-clock budget the reachability
+poll runs against. A cold host still pulling the multi-GB CUDA image can
+take minutes before sshd is even up; raise this rather than losing a
+healthy pod to the poll's own timeout:
+
+```bash
+RP_SSH_WAIT_SECS=900 ci/scripts/gpu-dev.sh shell a100
+```
 
 ## Interactive debugging
 

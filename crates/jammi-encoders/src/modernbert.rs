@@ -2322,6 +2322,88 @@ pub(crate) mod activation_capture {
                 .expect_err("a nonzero-offset input must be refused even if contiguous");
             assert!(matches!(err, candle_core::Error::Msg(_)), "{err:?}");
         }
+
+        /// Mirrors `tests/cuda_parity.rs`'s own `cuda_device` (`jammi-kernels`)
+        /// and this file's own `growth_oracle_cuda_device`: a machine that
+        /// compiled with the `cuda` feature but has no physical GPU attached
+        /// is "skip", not "fail", UNLESS `JAMMI_REQUIRE_CUDA` is set, in
+        /// which case device-acquisition failure panics rather than
+        /// silently reading as a skip — the landing pod session (this
+        /// module's `#[cfg(feature = "cuda")]` gate means only that lane
+        /// ever compiles or runs these two tests at all) sets it.
+        #[cfg(feature = "cuda")]
+        fn cuda_device() -> Option<Device> {
+            match Device::new_cuda(0) {
+                Ok(d) => Some(d),
+                Err(e) => {
+                    if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
+                        panic!(
+                            "GradTap CUDA refusal tests: JAMMI_REQUIRE_CUDA is set but no CUDA \
+                             device could be acquired: {e}"
+                        );
+                    }
+                    eprintln!(
+                        "GradTap CUDA refusal tests: skipping — no CUDA device available ({e})"
+                    );
+                    None
+                }
+            }
+        }
+
+        /// `GradTap::cuda_fwd`'s own `check_contiguous_zero_offset` call
+        /// (identical to `cpu_fwd`'s) has NO CUDA-side test proving it
+        /// actually runs there — the three tests above are all
+        /// `Device::Cpu`, so a regression that deleted the check from
+        /// `cuda_fwd` alone (leaving `cpu_fwd`'s intact) would pass every
+        /// existing test in this file. Mirrors
+        /// `non_contiguous_input_is_a_typed_refusal_not_a_silent_misread`
+        /// exactly, on CUDA.
+        #[test]
+        #[cfg(feature = "cuda")]
+        fn non_contiguous_input_is_a_typed_refusal_on_cuda_too() {
+            let Some(device) = cuda_device() else {
+                return;
+            };
+            let t = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], (2, 3), &device)
+                .unwrap()
+                .t()
+                .unwrap();
+            assert!(!t.is_contiguous());
+            let err = t
+                .apply_op1(GradTap {
+                    key: "test".to_string(),
+                })
+                .expect_err("a non-contiguous CUDA input must be refused, not silently misread");
+            assert!(matches!(err, candle_core::Error::Msg(_)), "{err:?}");
+        }
+
+        /// Mirrors `nonzero_offset_contiguous_input_is_a_typed_refusal`
+        /// exactly, on CUDA — same rationale as
+        /// `non_contiguous_input_is_a_typed_refusal_on_cuda_too`'s doc: a
+        /// regression scoped to `cuda_fwd` alone needs a CUDA-side
+        /// nonzero-`start_offset` case to ever go RED.
+        #[test]
+        #[cfg(feature = "cuda")]
+        fn nonzero_offset_contiguous_input_is_a_typed_refusal_on_cuda_too() {
+            let Some(device) = cuda_device() else {
+                return;
+            };
+            let t = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], (6,), &device)
+                .unwrap()
+                .narrow(0, 2, 3)
+                .unwrap();
+            assert!(
+                t.is_contiguous(),
+                "a narrow along the flat axis stays contiguous"
+            );
+            assert!(t.layout().start_offset() > 0);
+            let err = t
+                .apply_op1(GradTap {
+                    key: "test".to_string(),
+                })
+                .expect_err("a nonzero-offset CUDA input must be refused even if contiguous");
+            assert!(matches!(err, candle_core::Error::Msg(_)), "{err:?}");
+        }
     }
 }
 

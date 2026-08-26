@@ -8,7 +8,7 @@ not history) and monkeypatches `check_ci_guard_wiring`'s module-level
 at it, so these tests are independent of THIS repo's own current gate/suite
 inventory (which will keep changing) and drive the real `main()` entry point
 against a fixture built to isolate exactly one predicate per test — never
-`workflow_run_text()`/`python_test_suites()` asserted on in isolation with a
+`workflow_run_text()`/`tracked_test_suites()` asserted on in isolation with a
 hand-built list standing in for the real filesystem/git state.
 
 Run directly: `python3 ci/scripts/test_check_ci_guard_wiring.py`
@@ -33,7 +33,7 @@ class GuardWiringFixture(unittest.TestCase):
     """Base class: builds an isolated throwaway repo per test and patches
     the module's path constants onto it. `_run_main` drives the REAL `main()`
     entry point (implementer-acceptance clause 8), never `workflow_run_text()`
-    or `python_test_suites()` called directly and asserted on in isolation.
+    or `tracked_test_suites()` called directly and asserted on in isolation.
     """
 
     def setUp(self):
@@ -153,7 +153,7 @@ class RootGeneralizationTests(GuardWiringFixture):
             ".github/workflows/fake.yml", self._workflow_wiring_all("ci/scripts/perf/test_bar.py")
         )
         self._git_add_all()
-        suites = {p.name for p in cgw.python_test_suites()}
+        suites = {p.name for p in cgw.tracked_test_suites()}
         self.assertIn("test_bar.py", suites)
         code, out, err = self._run_main()
         self.assertEqual(code, 0, f"stdout={out!r} stderr={err!r}")
@@ -170,14 +170,14 @@ class RootGeneralizationTests(GuardWiringFixture):
             self._workflow_wiring_all("crates/widget/reference/test_baz.py"),
         )
         self._git_add_all()
-        suites = {p.name for p in cgw.python_test_suites()}
+        suites = {p.name for p in cgw.tracked_test_suites()}
         self.assertIn("test_baz.py", suites)
 
     def test_top_level_tests_dir_is_found(self):
         self._write("tests/test_qux.py")
         self._write(".github/workflows/fake.yml", self._workflow_wiring_all("tests/test_qux.py"))
         self._git_add_all()
-        suites = {p.name for p in cgw.python_test_suites()}
+        suites = {p.name for p in cgw.tracked_test_suites()}
         self.assertIn("test_qux.py", suites)
 
     def test_crate_tests_dir_not_reference_is_not_a_matching_root(self):
@@ -190,7 +190,7 @@ class RootGeneralizationTests(GuardWiringFixture):
         """
         self._write("crates/widget/tests/test_notcovered.py")
         self._git_add_all()
-        suites = {p.name for p in cgw.python_test_suites()}
+        suites = {p.name for p in cgw.tracked_test_suites()}
         self.assertNotIn("test_notcovered.py", suites)
 
     def test_non_test_prefixed_python_file_is_not_a_suite(self):
@@ -199,7 +199,7 @@ class RootGeneralizationTests(GuardWiringFixture):
         """
         self._write("ci/scripts/perf/helper_not_a_suite.py")
         self._git_add_all()
-        suites = {p.name for p in cgw.python_test_suites()}
+        suites = {p.name for p in cgw.tracked_test_suites()}
         self.assertNotIn("helper_not_a_suite.py", suites)
 
 
@@ -209,7 +209,7 @@ class GateScriptsRecursionTests(GuardWiringFixture):
     only and would have been structurally blind to
     `ci/scripts/perf/check_citations.py` (advisory i, added in this SAME
     round). `gate_scripts()` is now tracked-and-recursive, matching
-    `python_test_suites()`'s own shape — pinned here so a future PR cannot
+    `tracked_test_suites()`'s own shape — pinned here so a future PR cannot
     silently narrow it back to top-level-only without a test noticing.
     """
 
@@ -238,7 +238,7 @@ class GateScriptsRecursionTests(GuardWiringFixture):
         self.assertNotIn("helper_widget.py", found)
 
     def test_check_script_outside_ci_is_not_a_gate(self):
-        """`gate_scripts()` is rooted at `ci/`, same as `python_test_suites()`
+        """`gate_scripts()` is rooted at `ci/`, same as `tracked_test_suites()`
         -- a `check_*.py` living somewhere else entirely (not this repo's
         gate-script convention at all) must not be swept in.
         """
@@ -281,12 +281,12 @@ class AllowlistTests(GuardWiringFixture):
 class NoGitCheckoutSurfacesLoudly(GuardWiringFixture):
     def test_untracked_file_is_invisible_to_the_scan(self):
         """A `test_*.py` under a matching root that was NEVER `git add`-ed
-        must not be picked up — `python_test_suites()` reads `git ls-files`
+        must not be picked up — `tracked_test_suites()` reads `git ls-files`
         (what CI's own checkout contains), not a raw filesystem walk.
         """
         self._write("ci/scripts/test_untracked.py")
         # deliberately no self._git_add_all() here
-        suites = {p.name for p in cgw.python_test_suites()}
+        suites = {p.name for p in cgw.tracked_test_suites()}
         self.assertNotIn("test_untracked.py", suites)
 
 

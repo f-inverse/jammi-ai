@@ -42,7 +42,11 @@
 #                 RP_SESSION_ROOT so a *different* terminal can reattach. Unset =
 #                 throwaway temp dir, wiped on exit.
 #   RP_KEEP       1 = leave the pod running when this process exits.
-#   RP_TTL_HOURS  hard deadline baked into every pod at deploy (default 8).
+#   RP_TTL_HOURS  hard deadline baked into every pod at deploy (default 8 in
+#                 this file). gpu-dev.sh's own `up` raises the default to
+#                 RP_DEV_TTL_HOURS (72h) before sourcing this file, since a
+#                 throwaway-pod default is too short for a dev session someone
+#                 is actively using — an explicit RP_TTL_HOURS always wins.
 #   RP_DISK_GB    container disk size in GB (default 60). Rule of thumb: roughly
 #                 25 GB base + 3 GB per concurrent agent CARGO_TARGET_DIR + 2 GB
 #                 per `cargo mutants -j N` job (COPY MODE makes one full
@@ -108,7 +112,19 @@ else
 fi
 RP_SSH_KEY="$RP_WORK/id_ed25519"
 RP_META="$RP_WORK/meta"
-RP_POD_ID=""; RP_HOST=""; RP_PORT=""; RP_PUBKEY=""; RP_ARCH=""; RP_SSHO=()
+# RP_POD_CREATED is 1 only once THIS invocation's own rp_deploy_live actually
+# rented a pod — set the MOMENT a pod id comes back from the deploy mutation,
+# not at SSH-up (which can be minutes later): a pod bills, and can be leaked
+# by an EXIT trap firing during the reachability wait, from the instant it is
+# rented, not from the instant it becomes reachable. rp_session_load — used
+# by every read-only subcommand (attach/run/logs/push/pull/down) to recognize
+# a pod someone else's invocation already rented — deliberately never sets
+# it. rp_cleanup below gates termination-on-failure on this flag, not merely
+# on "RP_POD_ID is non-empty": before this flag existed, a read-only
+# subcommand against an unreachable session left RP_POD_ID set from the
+# loaded session and exited 1, and the EXIT trap terminated a pod that
+# invocation never rented — the incident this flag closes.
+RP_POD_ID=""; RP_HOST=""; RP_PORT=""; RP_PUBKEY=""; RP_ARCH=""; RP_SSHO=(); RP_POD_CREATED=0
 # The git ref the pod's checkout sits on. Two sites keep it honest, so recorded
 # state never claims a ref the pod is not on: rp_bootstrap sets it only after the
 # checkout succeeded, and rp_deploy_live clears it the moment pod identity
@@ -125,13 +141,139 @@ rp_terminate() { # $1=podId
   rp_gql "{\"query\":\"mutation{ podTerminate(input:{podId:\\\"${1}\\\"}) }\"}" >/dev/null 2>&1
 }
 
+# Confirm a pod id is BOTH present in the account's live pod list AND carries
+# a name shaped like one of THIS TOOLING'S OWN pods ("<prefix>-ttl<digits>")
+# before any caller acts on it irreversibly. Never trusts a locally-recorded
+# id on its own: the id could be stale (the account-side pod is already
+# gone), or — the incident this closes — a DIFFERENT pod could now be
+# recorded under this session's name (two processes racing `up` on the same
+# alias). $1=podId.
+#
+# The id is the AUTHORITATIVE half of this check; the exact TTL never gates
+# release, and this function no longer takes one. Two earlier versions tried
+# anyway, and both were removed rather than patched further:
+#   - v1 matched an EXACT "<prefix>-ttl<H>" against the session's own
+#     recorded TTL. A meta file written before RP_TTL_HOURS was tracked in
+#     the session record has no TTL to check, and verifying against a
+#     guessed default made `down` refuse to release a real
+#     `jammi-gpu-ttl72` pod this tooling itself rented, billing its full 72h
+#     (round-2 audit, PR #387).
+#   - v2 tried an explicit `RP_TTL_HOURS=<H>` override as the recovery path
+#     for exactly that case, documented in every refusal message. It was
+#     found INERT on every input: `rp_session_load`'s meta dot-source always
+#     ran before the override was read, so it either clobbered an explicit
+#     override (when the meta recorded a TTL) or forced it empty (when it
+#     did not) — the promised remedy never once took effect (round-3 audit,
+#     probe d2).
+# RunPod pod ids are globally unique — if the recorded id names a REAL pod
+# in the account, that pod IS the one with that id; there is no id-level
+# ambiguity a TTL number could ever have resolved. The name-shape check
+# alone already establishes "this is one of our own jammi-gpu* pods" (as
+# opposed to some entirely unrelated pod in the account); the specific
+# number never added a real safety margin once the id already matched.
+#
+# Prints the account's name for the id on success. Returns 1 (present, but
+# the name is not this tooling's shape — a REAL ambiguity, "do not act, never
+# assume safe"), 2 (could not query the account at all — same "do not act"),
+# or 3 (id ABSENT from the account entirely). 3 is deliberately its OWN code,
+# not folded into 1: an absent id is NOT an ambiguity to refuse on — it is
+# the ordinary, expected shape of "this pod already ended on its own" (its
+# in-pod deadline, or the sweep), the single most common way a session's
+# pod goes away, and `down`'s caller treats it as a normal cleanup, not a
+# refusal (round-4 audit advisory).
+#
+# Piped input (the account's own pod list) and script source cannot both come
+# from stdin — `python3 -` with a heredoc reads the heredoc AS THE PROGRAM,
+# leaving nothing for the piped JSON to land on (shellcheck SC2259). This
+# therefore uses `python3 -c '<script>' argv...`, the same shape
+# `rp_deploy_live`'s own parser already uses, so the piped JSON reaches
+# `sys.stdin` intact and dynamic values travel as argv, never interpolated
+# into the script source.
+rp_pod_verify() { # $1=podId
+  local id="$1"
+  rp_gql '{"query":"query{ myself{ pods{ id name } } }"}' | python3 -c '
+import sys, json, re
+podid, prefix = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(sys.stdin)
+except Exception as e:
+    print("could not parse RunPod response: %s" % e, file=sys.stderr)
+    sys.exit(2)
+if d.get("errors"):
+    print(json.dumps(d["errors"])[:200], file=sys.stderr)
+    sys.exit(2)
+me = (d.get("data") or {}).get("myself")
+if me is None or me.get("pods") is None:
+    print("response contained no pod list", file=sys.stderr)
+    sys.exit(2)
+shape = re.compile(r"^%s-ttl[0-9]+$" % re.escape(prefix))
+for p in me["pods"]:
+    if p.get("id") == podid:
+        name = p.get("name") or ""
+        if shape.match(name):
+            print(name)
+            sys.exit(0)
+        print("pod %s account name %s is not this tooling shape %s-ttl<digits> -- refusing to act on it" % (podid, name, prefix), file=sys.stderr)
+        sys.exit(1)
+print("pod %s is not in the account pod list" % podid, file=sys.stderr)
+sys.exit(3)
+' "$id" "$RP_POD_PREFIX"
+}
+
+# Confirm a pod id is ABSENT from the account's live pod list — the only
+# signal `down` trusts that a `rp_terminate` mutation actually took. Never
+# assumed from rp_terminate's own return: that call throws its response away
+# (`>/dev/null 2>&1`) by design, since it also runs as rp_cleanup's
+# best-effort EXIT-trap teardown, where a network hiccup must not turn a
+# normal shell exit into a hard failure. `down` is a single, deliberate,
+# foreground action instead, and gets to demand confirmation before it
+# forgets the local record — a rejected `podTerminate` must never both leak
+# the pod AND destroy the only record pointing at it (round-3 audit
+# advisory, PR #387).
+#
+# $1=podId. Returns 0 (confirmed gone — absent from the account's pod list
+# entirely) or 1 (still present, OR the query itself failed — both are "not
+# confirmed", never "must have succeeded anyway").
+rp_pod_gone() { # $1=podId
+  local id="$1"
+  rp_gql '{"query":"query{ myself{ pods{ id } } }"}' | python3 -c '
+import sys, json
+podid = sys.argv[1]
+try:
+    d = json.load(sys.stdin)
+except Exception as e:
+    print("could not parse RunPod response: %s" % e, file=sys.stderr)
+    sys.exit(1)
+if d.get("errors"):
+    print(json.dumps(d["errors"])[:200], file=sys.stderr)
+    sys.exit(1)
+me = (d.get("data") or {}).get("myself")
+if me is None or me.get("pods") is None:
+    print("response contained no pod list", file=sys.stderr)
+    sys.exit(1)
+for p in me["pods"]:
+    if p.get("id") == podid:
+        print("pod %s is still present in the account pod list" % podid, file=sys.stderr)
+        sys.exit(1)
+sys.exit(0)
+' "$id"
+}
+
 rp_cleanup() {
   if [ -n "$RP_POD_ID" ]; then
     if [ "$RP_KEEP" = "1" ]; then
       echo "::notice::pod ${RP_POD_ID} left running (self-terminates in ≤${RP_TTL_HOURS}h)"
-    else
+    elif [ "$RP_POD_CREATED" = "1" ]; then
       rp_terminate "$RP_POD_ID"
       echo "::notice::terminated RunPod pod ${RP_POD_ID}"
+    else
+      # This invocation loaded an EXISTING session's pod (attach/run/logs/
+      # push/pull/down) rather than renting one itself, and is
+      # exiting without having called rp_keep — e.g. require_pod failing
+      # against an unreachable pod. That pod is not this invocation's to
+      # terminate; only its own creator (an `up`/`shell` that actually
+      # deployed it, or an explicit `down`) may end it.
+      echo "::notice::pod ${RP_POD_ID} left running — this invocation did not create it; not terminating"
     fi
   fi
   [ "$RP_WORK_IS_TEMP" = "1" ] && rm -rf "$RP_WORK"
@@ -158,8 +300,14 @@ _rp_work_mkdir() { [ -d "$RP_WORK" ] || { mkdir -p "$RP_WORK" && chmod 700 "$RP_
 rp_session_save() {
   [ -n "$RP_SESSION" ] || return 0
   _rp_work_mkdir
+  # RP_TTL_HOURS travels with the session because it is baked into the pod's
+  # OWN name at deploy ("<prefix>-ttl<H>") and cannot be re-derived from the
+  # caller's current environment later — a `down` run with a different
+  # RP_TTL_HOURS in its own shell must still reason about THIS pod's actual
+  # name, not whatever the current invocation happens to default to.
   { echo "RP_POD_ID=$RP_POD_ID"; echo "RP_HOST=$RP_HOST"; echo "RP_PORT=$RP_PORT"
-    echo "RP_ARCH=$RP_ARCH"; echo "RP_IMAGE=$RP_IMAGE"; echo "RP_REF=$RP_REF"; } > "$RP_META"
+    echo "RP_ARCH=$RP_ARCH"; echo "RP_IMAGE=$RP_IMAGE"; echo "RP_REF=$RP_REF"
+    echo "RP_TTL_HOURS=$RP_TTL_HOURS"; } > "$RP_META"
   chmod 600 "$RP_META"
 }
 
@@ -390,6 +538,16 @@ else:
       esac
     fi
     supply_seen=1
+    # THIS is the moment a pod exists and starts billing — not the SSH-up
+    # point below, which can be minutes later. An EXIT trap firing anywhere
+    # in the ≤4m reachability wait (Ctrl-C, a cancelled CI run's SIGTERM) must
+    # still terminate a pod this invocation just rented, or it leaks for its
+    # full deadline (72h under the `up` dev default) with rp_cleanup reporting
+    # "did not create it; not terminating" — exactly backwards. Stays 1 for
+    # the rest of this call even if this candidate is later torn down for
+    # being unreachable/under-floor: any pod rented after it is equally this
+    # invocation's own.
+    RP_POD_CREATED=1
     echo "  deployed ${RP_POD_ID} on ${cloud} / ${gpu}; waiting for SSH (≤4m)..."
     RP_HOST=""; RP_PORT=""
     for _ in $(seq 1 24); do
@@ -406,7 +564,10 @@ p=(json.load(sys.stdin).get("data",{}).get("pod") or {}).get("runtime") or {}
           "nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1" 2>/dev/null)"
         drv_major="${drv%%.*}"
         if [ -n "$drv_major" ] && [ "$drv_major" -ge "$RP_MIN_DRIVER_MAJOR" ] 2>/dev/null; then
-          echo "  SSH up on ${RP_HOST}:${RP_PORT} (driver ${drv})"; rp_session_save; return 0
+          echo "  SSH up on ${RP_HOST}:${RP_PORT} (driver ${drv})"
+          # RP_POD_CREATED was already set the moment RP_POD_ID was read from
+          # the deploy response, above — not here, which is minutes later.
+          rp_session_save; return 0
         fi
         echo "  pod ${RP_POD_ID} driver '${drv:-unknown}' is below the r${RP_MIN_DRIVER_MAJOR} floor; terminating and trying next candidate"
         rp_terminate "$RP_POD_ID"
@@ -480,6 +641,14 @@ rp_sweep() { # $1=optional override age in hours
     case "$override" in
       ''|*[!0-9]*) echo "::error::reap: hours must be a positive integer (got '${override}')"; return 2 ;;
     esac
+    # "0" and "00" are all-digit (no non-digit character), so they pass the
+    # shape check above untouched, and the python override BELOW treats any
+    # non-empty override STRING as truthy — `if override:` is true for "0"
+    # just as it is for "8" — giving `limit = 0`, under which every RUNNING
+    # pod's age is "past-deadline-0s": `reap 0` mass-terminates the whole
+    # account's jammi-gpu* fleet instead of refusing. Mirrors the
+    # RP_DEV_TTL_HOURS >0 check in gpu-dev.sh.
+    [ "$override" -gt 0 ] || { echo "::error::reap: hours must be > 0"; return 2; }
   fi
   out="$(rp_gql '{"query":"query{ myself{ pods{ id name desiredStatus createdAt runtime{ uptimeInSeconds } } } }"}' \
     | python3 -c "

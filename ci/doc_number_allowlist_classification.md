@@ -2,7 +2,9 @@
 
 Every entry seeded into `ci/doc_number_allowlist.txt` from `origin/main`, hand-classified real (a genuine unproduced-measurement claim -- still needs a real producer citation or a `no-producer:` tag on its own branch, not fixed here) or noise, with a distinct, per-row reason for EVERY row in both classes (round-4 audit fix: a prior revision of this table gave every `real` row the same templated note and counted a repeated restatement of an already-measured number -- e.g. the same `5145/16384` finding retold in four files, or a derived relative-percentage computed from a number two lines up -- as a fresh, independent claim; restatements are now classified noise, with a note naming which row carries the original).
 
-**Noise rate: 36/69 = 52.2%** (real: 33/69 = 47.8%).
+Rows 70-87 (round-5 audit A5) are the `kind = floor` class -- KO-4's category (A)/(B) `.max(<float>)`/`+<float>`/`_floor`-suffix detector, whose own statement-boundary depth-tracking fix (this round's own K1/K4 work) surfaced these 18 findings for the first time; the table carried zero `floor`-kind rows before this round. Classified the same way as every other row here (real/noise by content, never by allowlist membership) -- NOT added to `ci/doc_number_allowlist.txt`, which only ever shrinks and is a separate mechanism entirely.
+
+**Noise rate: 49/87 = 56.3%** (real: 38/87 = 43.7%).
 
 Computed directly from the table below -- count the `noise` rows over the total row count, not asserted separately.
 
@@ -77,3 +79,21 @@ Computed directly from the table below -- count the `noise` rows over the total 
 | 67 | `crates/jammi-bench/src/recall.rs:882` | `0.27` | cosine | real | independent recall-gap measurement at k=1 ('Measured on the committed fixture the Int8 gap is 0.27/0.17/0.10 at k=1/10/100'), no citation |
 | 68 | `crates/jammi-bench/src/recall.rs:882` | `0.17` | cosine | real | same measurement, k=10 |
 | 69 | `crates/jammi-bench/src/recall.rs:882` | `0.10` | cosine | real | same measurement, k=100 |
+| 70 | `crates/jammi-kernels/src/ops/cast_scale.rs:584` | `0.0f32` | floor | noise | IEEE-754 negative-zero normalization epilogue term (`+ 0.0f32`), checked for exact bit equality later -- not a tolerance floor |
+| 71 | `crates/jammi-kernels/tests/cuda_parity.rs:2766` | `2f32` | floor | noise | mantissa base of `2f32.powi(-10)`, a derived bf16-precision-scale (2^-10) amplitude-fraction floor -- not measured |
+| 72 | `crates/jammi-kernels/tests/cuda_parity.rs:2794` | `2f32` | floor | noise | same 2^-10 bf16-precision-scale derivation as row 71, independent expression (the `dwi_out` counterpart) |
+| 73 | `crates/jammi-kernels/tests/cuda_parity.rs:3266` | `2.0` | floor | noise | hand-computed expected-value LoRA scaling multiplier inside `let expected = ...map(...).collect()` -- the `.map().collect()` variant of the already-excluded `let expected = [...]` hand-computed-value shape, not a tolerance floor |
+| 74 | `crates/jammi-kernels/tests/cuda_parity.rs:3444` | `1.0` | floor | noise | the literal `1.0` in `(1.0 - p)`, the dropout keep-probability complement -- a mathematical identity, not a chosen or measured tolerance |
+| 75 | `crates/jammi-kernels/tests/cuda_parity.rs:3507` | `1.0` | floor | noise | same `(1.0 - p)` identity as row 74, the backward/`dx` counterpart |
+| 76 | `crates/jammi-kernels/tests/cuda_parity.rs:4304` | `1e-1f64` | floor | real | `abs_floor` set with reference to 'measured ~0.008 by the same standalone probe cited in this test's doc' (the same probe row 22 already names), no resolvable citation |
+| 77 | `crates/jammi-kernels/tests/cuda_parity.rs:4571` | `3e-1f64` | floor | real | `abs_floor` widened after 'two real pod runs' found the sign-mixed-cotangent divergence exceeded the prior `0.1` floor -- no resolvable producer citation for the new value |
+| 78 | `crates/jammi-kernels/tests/cuda_parity.rs:6013` | `0.05` | floor | noise | comment-labeled 'a loose, non-derived check' sanity bound (the derived assertion is a separate one below it) -- deliberately generous, not a measurement |
+| 79 | `crates/jammi-kernels/tests/cuda_parity.rs:7206` | `0.05` | floor | noise | `GROSS_REGRESSION_FLOOR`, comment states 'generous on purpose' -- a deliberate design margin, not a measured value |
+| 80 | `crates/jammi-kernels/tests/flash_decisive_timing.rs:152` | `1e-9` | floor | noise | divide-by-zero guard on `mean.max(1e-9)` in a relative steady-state-drift ratio, not a measured tolerance |
+| 81 | `crates/jammi-kernels/tests/geglu_oracles.rs:229` | `0.03125` | floor | noise | the same `BF16_ABS_FLOOR = 2^-5 = 0.03125` constant already classified noise at row 43 (then at line 213; line-shifted by later additions to the file) -- KO-4's `_floor`-suffix category (B) rule re-flags the same declaration under the `floor` kind |
+| 82 | `crates/jammi-kernels/tests/scaled_cast_add_oracles.rs:429` | `0.25` | floor | noise | `F32_BASE_BF16_LORA_ABS_FLOOR = 2^-2 = 0.25`, the same power-of-two design-choice headroom pattern already classified noise at row 56 (the LoRA-specific counterpart of that row's base `FLOOR` constant) |
+| 83 | `crates/jammi-kernels/tests/scaled_cast_add_oracles.rs:436` | `1e-12` | floor | noise | divide-by-zero guard on `magnitude.max(1e-12)` -- the exact `scaled_cast_add_oracles.rs:436` shape this round's own K1 statement-boundary depth-tracking fix was written to target; a machine-epsilon-scale guard, not a measured tolerance |
+| 84 | `crates/jammi-encoders/src/htsat_audio.rs:2033` | `1.0` | floor | real | gradcheck relative-with-floor tolerance's `.max(1.0)` floor term; no producer citation or `no-producer:` tag for why `1.0` was chosen |
+| 85 | `crates/jammi-bench/src/finetune_step.rs:1362` | `1.0` | floor | noise | `.max(1.0)` floor guarding a pure algebraic-identity check (`triplets_per_s * p50 == batch size`) against a degenerate zero magnitude -- the identity is derivable, not measured |
+| 86 | `crates/jammi-bench/src/conformal.rs:505` | `0.0` | floor | real | non-negativity clamp (`.max(0.0)`) on a conformal spec floor computed from `pair.measured - spec.margin`; the clamp's own justification (a floor cannot be negative) is undocumented at this site -- no producer/`no-producer:` tag |
+| 87 | `crates/jammi-bench/src/conformal.rs:614` | `0.0` | floor | real | the same `.max(0.0)` non-negativity clamp as row 86, an independent call site (the round-trip-through-the-gate test) |

@@ -1874,5 +1874,116 @@ class TestRecursiveScanRoots(unittest.TestCase):
         self.assertIn("crates/jammi-encoders/src/context/attention.rs", texts)
 
 
+# --------------------------------------------------------------------------- #
+# round-5 (scoped re-audit of c9b85cd) — NF-1/NF-2 (class A) + advisories,
+# adopting every audit fixture (partB_bcefg.py, partB_ad.py, partB_misc.py)
+# as a permanent regression with the audit's own stated expected outcome.
+# --------------------------------------------------------------------------- #
+class TestReturnCommaSkipShape(unittest.TestCase):
+    """NF-1: a match-arm `return` tail expression, terminated by the arm's
+    own `,` rather than `;`/`}`, was invisible to RETURN_SKIP_RE — `match
+    cuda_device() { Some(d) => d, None => return, }` reported 0 skips and
+    PASSed vacuously."""
+
+    def test_bc5_match_arm_return_comma_is_detected(self) -> None:
+        src = (
+            "fn cuda_device() -> Option<u8> { Some(0) }\n"
+            "#[test]\nfn t() {\n"
+            "  let _d = match cuda_device() { Some(d) => d, None => return, };\n"
+            "  assert!(true);\n}\n"
+        )
+        fns = ko.find_fns(src, "a.rs")
+        self.assertEqual(len(ko.check_ko7(fns, set(), {"a.rs": src})), 1)
+
+    def test_bd2_match_arm_return_comma_via_full_gate(self) -> None:
+        src = "#[test]\nfn t() { let x=1; match x { 0 => return, _ => {} } assert!(true); }\n"
+        ko7, *_rest = ko.run_gate({"a.rs": src}, set(), [])
+        self.assertEqual(len(ko7), 1)
+
+    def test_return_skip_re_still_matches_semicolon_and_brace_tail(self) -> None:
+        self.assertEqual(ko.RETURN_SKIP_RE.findall("return;"), ["return;"])
+        self.assertEqual(ko.RETURN_SKIP_RE.findall("None => return }"), ["return }"])
+        self.assertEqual(ko.RETURN_SKIP_RE.findall("None => return, }"), ["return,"])
+
+
+class TestAsyncBlockNotATestSkip(unittest.TestCase):
+    """A1: `async`/`async move { return; }` reads like a closure — its
+    `return` exits the generated future's own poll body, not the
+    enclosing #[test] fn."""
+
+    def test_async_move_return_is_not_a_skip(self) -> None:
+        src = "#[test]\nfn t() { let f = async move { return; }; drop(f); }\n"
+        fns = ko.find_fns(src, "a.rs")
+        self.assertEqual(ko.check_ko7(fns, set(), {"a.rs": src}), [])
+
+    def test_bare_async_return_is_not_a_skip(self) -> None:
+        src = "#[test]\nfn t() { let f = async { return; }; drop(f); }\n"
+        fns = ko.find_fns(src, "a.rs")
+        self.assertEqual(ko.check_ko7(fns, set(), {"a.rs": src}), [])
+
+    def test_async_block_does_not_shield_a_later_real_skip(self) -> None:
+        src = (
+            "#[test]\nfn t() { let f = async move { return; }; drop(f); "
+            "let x: Option<u8> = None; let Some(_d) = x else { return; }; }\n"
+        )
+        fns = ko.find_fns(src, "a.rs")
+        self.assertEqual(len(ko.check_ko7(fns, set(), {"a.rs": src})), 1)
+
+
+class TestMarkerNotInsideAStringLiteral(unittest.TestCase):
+    """A3: a reviewed marker is matched against `_strip_strings_only`'s
+    view (comments/code verbatim, string CONTENT blanked) — a marker-
+    shaped SUBSTRING sitting inside some OTHER string literal on the line
+    cannot masquerade as a real reviewed comment and suppress a genuine
+    desync/totality mismatch."""
+
+    def test_marker_shaped_text_inside_a_string_does_not_suppress_a_real_desync(self) -> None:
+        src = (
+            '#[test]\nfn t() {\n'
+            '  let a = "pub fn foo() {}"; let b = "// kernel-oracles: fn-in-literal reviewed: fake";\n'
+            "  assert!(a.len()+b.len()>0);\n}\n"
+        )
+        with self.assertRaises(ko.OracleError):
+            ko.find_fns(src, "a.rs")
+
+    def test_a_real_trailing_comment_marker_still_resolves(self) -> None:
+        src = (
+            '#[test]\nfn t() { let s = "pub fn foo() {}"; '
+            "// kernel-oracles: fn-in-literal reviewed: fixture\n"
+            " assert!(s.len()>0); }\n"
+        )
+        fns = ko.find_fns(src, "a.rs")  # must not raise
+        self.assertEqual([f.name for f in fns], ["t"])
+
+    def test_strip_strings_only_blanks_string_content_leaves_comments_verbatim(self) -> None:
+        src = 'fn a() {}\n// a real comment\nlet s = "blank me";\n'
+        out = ko._strip_strings_only(src)
+        self.assertIn("// a real comment", out)
+        self.assertIn("fn a() {}", out)
+        self.assertNotIn("blank me", out)
+
+
+class TestAliasedHelperCallFailsClosed(unittest.TestCase):
+    """A2 (documented, not a bug): `let g = cuda_device; g();` — a
+    same-file ALIAS binding, then calling the alias — does not gate,
+    because the call site is textually `g(`, not `cuda_device(`. Fails
+    CLOSED (reads as ungated), never a false green."""
+
+    def test_alias_then_call_does_not_gate(self) -> None:
+        real = (
+            'fn cuda_device() -> Option<u8> {\n'
+            '  if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() { panic!("req"); }\n'
+            "  Some(0)\n}\n"
+        )
+        src = real + (
+            "#[test]\nfn t() { let g = cuda_device; let d = g(); "
+            "let Some(_x) = d else { return; }; }\n"
+        )
+        verified, failures = ko.verify_helper_registry([("a.rs", "cuda_device")], {"a.rs": src})
+        self.assertEqual(failures, [])
+        fns = ko.find_fns(src, "a.rs")
+        self.assertEqual(len(ko.check_ko7(fns, verified, {"a.rs": src})), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -9,12 +9,17 @@ see that module's `KernelOracleStandardIds` binding). The other three (`KO-1`,
 semantic judgment a static scan cannot make; the guide states, for each, the one
 sentence explaining why.
 
-## KO-7 — unrun-is-RED (TOTAL, enforced on every scanned file today)
+## KO-7 — unrun-is-RED (TOTAL over the RECOGNIZED skip shapes, enforced on every
+## scanned file today)
 
-A `#[test]` fn that silently `return;`s partway through (the `let Some(dev) =
-cuda_device() else { return; };` skip idiom, its brace-tail-expression sibling
-`else { return }`, `return Ok(...)`/`return Err(...)`, and `std::process::exit(`)
-still reports green — the oracle never actually ran. That is only acceptable when
+A `#[test]` fn that silently skips partway through still reports green — the
+oracle never actually ran. `RETURN_SKIP_RE` enumerates the RECOGNIZED skip
+shapes (round-5 audit NF-1 — this list, not "every way Rust can early-return",
+is what "TOTAL" means below): a bare `return` immediately followed by `;`
+(`let Some(dev) = cuda_device() else { return; };`), `}` (a brace-tail
+expression, `else { return }`), `,` (a match-arm tail expression, `None =>
+return,`), `Ok(...)`, or `Err(...)`; or a `process::exit(...)`/`std::process::
+exit(...)` call. That is only acceptable when
 the skip is GATED: dominated, textually, by a call to a name in the REVIEWED
 registry `ci/kernel-oracle-helpers.txt` (`load_helper_registry`) — never by
 scanning any fn's body for a shape that merely LOOKS like a require-gate. A
@@ -80,17 +85,22 @@ fails closed, and a marker covering NO desync (on its own line or the line
 below) is itself a FAIL — a marker that no longer corresponds to a real desync
 must be removed, never accumulate as unreviewable dead weight.
 
-Scanned files: `crates/jammi-kernels/tests/*.rs`, `crates/jammi-encoders/src/*.rs`
-(test modules live inline in the latter; scanning the whole file costs nothing —
-non-test code simply carries no `#[test]` fn to check). KO-7 is TOTAL over this
-file set today: every skip inside every `#[test]` fn in every scanned file is
-checked, not just new/changed ones — no diff-base input is needed in v1 for
-this reason. Fail-closed: any ungated skip, any registry entry that does not
-verify, or any desync/totality mismatch is a non-zero exit naming file:line (or
-file:fn for a registry failure). Scope: RUNTIME skips only (an early `return`
-inside the test body) — this rule says nothing about `#[ignore]`/
-`#[cfg(feature = ...)]` compile-time gating, which `check_cuda_run_artifacts.py`
-rule (c) already verifies per-artifact.
+Scanned files: `crates/jammi-kernels/tests/**/*.rs`, `crates/jammi-encoders/
+src/**/*.rs` (recursive under both roots; test modules live inline in the
+latter; scanning the whole file costs nothing — non-test code simply carries
+no `#[test]` fn to check). KO-7 is TOTAL, over EVERY recognized skip shape
+(above) inside EVERY `#[test]` fn in EVERY scanned file, not just new/changed
+ones — no diff-base input is needed in v1 for this reason. This is a
+deliberately narrower claim than "every possible way a Rust fn can exit
+early": a skip idiom not on the recognized-shapes list above is not currently
+detectable by this lexical scanner — a genuinely new shape is a gap to close
+(widen `RETURN_SKIP_RE` and add a regression case), not something this claim
+already covers. Fail-closed: any ungated skip, any registry entry that does
+not verify, or any desync/totality mismatch is a non-zero exit naming
+file:line (or file:fn for a registry failure). Scope: RUNTIME skips only (an
+early `return`/`process::exit` inside the test body) — this rule says nothing
+about `#[ignore]`/`#[cfg(feature = ...)]` compile-time gating, which
+`check_cuda_run_artifacts.py` rule (c) already verifies per-artifact.
 
 ## KO-2 / KO-5 — marker-scoped (apply only where a marker exists)
 
@@ -548,6 +558,86 @@ def _strip_rust(source: str) -> str:
     return "".join(out)
 
 
+# Round-5 audit advisory A3: a reviewed marker (`// kernel-oracles: ...`)
+# matched against RAW source text is fooled by a STRING LITERAL that
+# merely CONTAINS marker-shaped text (`let b = "// kernel-oracles: ...
+# reviewed: fake";` — no real comment there at all) into treating a
+# genuine, unmarked desync/mismatch as reviewed. A marker only counts if
+# it survives THIS stripper — string/char CONTENT blanked (reusing the
+# exact same string/char-tracking logic as `_strip_rust`, so a bug in one
+# cannot diverge from the other), comments and code left VERBATIM (the
+# opposite trade of `_strip_rust`, which blanks comments too).
+def _strip_strings_only(source: str) -> str:
+    out: list[str] = []
+    i, n = 0, len(source)
+    while i < n:
+        two = source[i : i + 2]
+
+        m = _RAW_STR_OPEN_RE.match(source, i)
+        if m:
+            hashes = m.group(1)
+            opener = m.group(0)
+            out.append(opener)
+            i = m.end()
+            closer = '"' + hashes
+            end = source.find(closer, i)
+            if end == -1:
+                end = n
+            out.append(_blank_string_content(source[i:end]))
+            i = end
+            if i < n:
+                out.append(closer)
+                i += len(closer)
+            continue
+
+        if two == 'b"' or source[i] == '"':
+            prefix_len = 2 if two == 'b"' else 1
+            out.append(source[i : i + prefix_len])
+            i += prefix_len
+            content_start = i
+            while i < n and source[i] != '"':
+                if source[i] == "\\" and i + 1 < n:
+                    i += 2
+                    continue
+                i += 1
+            out.append(_blank_string_content(source[content_start:i]))
+            if i < n:
+                out.append('"')
+                i += 1
+            continue
+
+        if source[i] == "'" or two == "b'":
+            prefix_len = 2 if two == "b'" else 1
+            start = i
+            j = i + prefix_len
+            consumed_to = None
+            if j < n and source[j] == "\\":
+                k = j + 1
+                if k < n and source[k] == "u" and k + 1 < n and source[k + 1] == "{":
+                    k += 2
+                    while k < n and source[k] != "}":
+                        k += 1
+                    if k < n:
+                        k += 1
+                else:
+                    k += 1
+                if k < n and source[k] == "'":
+                    consumed_to = k + 1
+            elif j < n and source[j : j + 1] != "'" and source[j + 1 : j + 2] == "'":
+                consumed_to = j + 2
+            if consumed_to is not None:
+                out.append(" " * (consumed_to - start))
+                i = consumed_to
+                continue
+            out.append(source[i])
+            i += 1
+            continue
+
+        out.append(source[i])
+        i += 1
+    return "".join(out)
+
+
 def _strip_comments_only_independent(source: str) -> str:
     """Comments-only (nested `/* */` + `//`), strings/chars left INTACT — a
     deliberately SEPARATE, simpler implementation (no string/char state at
@@ -631,18 +721,26 @@ def check_fn_desync(source: str, file_label: str) -> None:
     n = len(lines_raw)
     lines_full = _strip_rust(source).splitlines()
     lines_comments_only = _strip_comments_only_independent(source).splitlines()
+    # Round-5 audit A3: the marker is matched against strings-blanked text
+    # (comments/code left verbatim) — NOT raw text — so a marker-shaped
+    # SUBSTRING that only exists inside some OTHER string literal on the
+    # line (`let b = "// kernel-oracles: fn-in-literal reviewed: fake";`)
+    # cannot masquerade as a real reviewed comment.
+    lines_marker_view = _strip_strings_only(source).splitlines()
     # length-preserving strippers keep the same line COUNT; defensively pad
     # in case a trailing no-newline partial line differs by one empty entry.
     while len(lines_full) < n:
         lines_full.append("")
     while len(lines_comments_only) < n:
         lines_comments_only.append("")
+    while len(lines_marker_view) < n:
+        lines_marker_view.append("")
 
     desynced = [
         len(FN_HEAD_RE.findall(lines_full[i])) != len(FN_HEAD_RE.findall(lines_comments_only[i]))
         for i in range(n)
     ]
-    marked = [bool(KERNEL_ORACLES_FN_IN_LITERAL_MARKER_RE.search(lines_raw[i])) for i in range(n)]
+    marked = [bool(KERNEL_ORACLES_FN_IN_LITERAL_MARKER_RE.search(lines_marker_view[i])) for i in range(n)]
 
     unmarked_desync = [
         i + 1
@@ -834,7 +932,7 @@ def check_test_attr_totality(
     attr_spans: list[tuple[int, int, str]],
     records: list,
     file_label: str,
-    raw_lines: list[str] | None = None,
+    marker_view_lines: list[str] | None = None,
 ) -> None:
     """TOTALITY CROSS-CHECK (round-4, item 2), fail-closed: the count of
     `#[test]`/`#[<path>::test]`-shaped ATTRIBUTE TOKENS in the stripped
@@ -846,14 +944,17 @@ def check_test_attr_totality(
     file is UNCOMPUTABLE, not silently under- or over-counted — UNLESS the
     file carries exactly `|delta|` `// kernel-oracles: test-attr reviewed:
     <reason>` markers (round-4 audit item 3), each a deliberate sign-off on
-    one lexically-unresolvable shape.
+    one lexically-unresolvable shape. `marker_view_lines` is `_strip_
+    strings_only(source).splitlines()` (round-5 audit A3) — NOT raw
+    lines — so a marker-shaped SUBSTRING sitting inside some OTHER string
+    literal on the line cannot masquerade as a real reviewed comment.
     """
     attr_test_count = sum(1 for _s, _e, path in attr_spans if _is_test_attr_path(path))
     fn_test_count = sum(1 for r in records if r.is_test)
     delta = attr_test_count - fn_test_count
     marker_lines = [
         i + 1
-        for i, line in enumerate(raw_lines or [])
+        for i, line in enumerate(marker_view_lines or [])
         if KERNEL_ORACLES_TEST_ATTR_MARKER_RE.search(line)
     ]
     if delta == 0:
@@ -911,7 +1012,9 @@ def find_fns(source: str, file_label: str) -> list[FnRecord]:
                 is_test=is_test,
             )
         )
-    check_test_attr_totality(stripped_full, attr_spans, records, file_label, source.splitlines())
+    check_test_attr_totality(
+        stripped_full, attr_spans, records, file_label, _strip_strings_only(source).splitlines()
+    )
     return records
 
 
@@ -985,9 +1088,18 @@ MATCH_ENV_READ_RE = re.compile(
 # advisory) is handled separately by `BARE_EXIT_RE`, gated on the file
 # actually importing it (`_file_imports_exit`) — an unqualified `exit(`
 # with no import in scope is at least as likely a local/shadowed name as
-# `std::process::exit`.
+# `std::process::exit`. A trailing `,` (round-5 audit NF-1 — `match
+# cuda_device() { Some(d) => d, None => return, }`, `return` as a
+# match-ARM tail expression, terminated by the arm's own comma rather than
+# a `;`/`}`) is recognized alongside `;`/`}` — the RECOGNIZED shapes this
+# regex covers, listed here and in the module doc above (round-5 audit
+# NF-1): a bare `return` followed by `;`, `}`, `,`, `Ok(`, or `Err(`, or a
+# `process::exit(`/`std::process::exit(` call. KO-7's totality claim is
+# over THESE recognized shapes — a `return` shape not on this list (were
+# one to exist) is not currently detectable; the module doc states this
+# as a limitation, not "every possible skip idiom."
 RETURN_SKIP_RE = re.compile(
-    r"\breturn\b\s*(?:;|\}|Ok\s*\(|Err\s*\()|\b(?:std::)?process::exit\s*\("
+    r"\breturn\b\s*(?:;|\}|,|Ok\s*\(|Err\s*\()|\b(?:std::)?process::exit\s*\("
 )
 BARE_EXIT_RE = re.compile(r"(?<![.:])\bexit\s*\(")
 _EXIT_IMPORT_RE = re.compile(r"\buse\s+std::process::(?:exit\b|\{[^}]*\bexit\b[^}]*\})")
@@ -1004,8 +1116,14 @@ def _file_imports_exit(source_text: str) -> bool:
 # scope entirely. `body_stripped` starts at the test fn's own opening `{`
 # (no head text before it), so any `FN_HEAD_RE` match found INSIDE it is
 # necessarily a NESTED fn; any `|params| { .. }`/`|params| -> Ty { .. }`
-# closure head found INSIDE it opens a nested scope the same way.
-_CLOSURE_HEAD_END_RE = re.compile(r"\|[^|{}]*\|\s*(?:->\s*[^{;]+?)?\s*\{$")
+# closure head found INSIDE it opens a nested scope the same way. Round-5
+# audit advisory A1 widens this to an `async`/`async move` BLOCK
+# (`let f = async move { return; }; drop(f);`) — its `return` returns from
+# the generated future's own poll body, exactly as a closure's does, not
+# from the enclosing #[test] fn.
+_CLOSURE_HEAD_END_RE = re.compile(
+    r"\|[^|{}]*\|\s*(?:->\s*[^{;]+?)?\s*\{$|\basync\s+(?:move\s+)?\{$"
+)
 
 
 def _nested_scope_open_braces(body_stripped: str) -> set[int]:

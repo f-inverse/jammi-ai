@@ -3735,7 +3735,7 @@ mod tests {
     /// own primitive (guide §3.3, "agreement is not accuracy": anchored
     /// against F32, never bf16-vs-bf16 agreement alone).
     #[cfg(feature = "cuda")]
-    fn flash_oracle_pooled(model: &ModernBert, hidden: &Tensor, mask: &Tensor) -> Vec<f32> {
+    fn flash_oracle_pooled(hidden: &Tensor, mask: &Tensor) -> Vec<f32> {
         pool_and_normalize(hidden, mask, Pooling::Mean)
             .unwrap()
             .to_dtype(DType::F32)
@@ -3943,18 +3943,18 @@ mod tests {
 
             let other_model = other_build(seed);
             let other_hidden = other_forward(&other_model, &ids, &mask).unwrap();
-            let pooled_other = flash_oracle_pooled(&other_model, &other_hidden, &mask);
+            let pooled_other = flash_oracle_pooled(&other_hidden, &mask);
 
             let block_model =
                 flash_oracle_build_model(config, weights, DType::BF16, seed, cuda, true);
             let block_hidden =
                 forward_hidden_forcing_flash(&block_model, &ids, &mask, true).unwrap();
-            let pooled_block = flash_oracle_pooled(&block_model, &block_hidden, &mask);
+            let pooled_block = flash_oracle_pooled(&block_hidden, &mask);
 
             let f32_model =
                 flash_oracle_build_model(config, weights, DType::F32, seed, cuda, false);
             let f32_hidden = f32_model.forward_hidden(&ids, &mask).unwrap();
-            let pooled_f32 = flash_oracle_pooled(&f32_model, &f32_hidden, &mask);
+            let pooled_f32 = flash_oracle_pooled(&f32_hidden, &mask);
 
             let other_err = relative_l1_error(&pooled_other, &pooled_f32);
             let block_err = relative_l1_error(&pooled_block, &pooled_f32);

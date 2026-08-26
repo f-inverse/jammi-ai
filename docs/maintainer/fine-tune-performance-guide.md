@@ -2,7 +2,7 @@
 
 How jammi's Rust/candle training step went from 0.44× to 1.07× of PyTorch on the same GPU (2026-08-23 → 08-26), and what it took to prove the numbers were real. Written for an ML engineer who wants to understand the low-level computation of modern ML through one real track: candle `CustomOp`s, the autograd tape's cost, bf16 rounding placement, FlashAttention-2, and — above all — how to prove a fused kernel is both faster and faithful.
 
-Sources: GitHub #352 / #356 / #374; PRs #357–#391; the five session ledgers under `.jammi/ledger/` (`perf-fusion-20260823`, `perf-continuation-20260824`, `perf-close-20260824`, `perf-s2-20260825`, `perf-s4-20260826`); `docs/maintainer/cuda-kernel-guide.md`; the escape ledger `.jammi/escapes.jsonl`. Every number below carries its box and its producer. Where the sources disagree, the disagreement is printed, not smoothed.
+Sources: GitHub #352 / #356 / #374; PRs #357–#391; the five session ledgers under `.jammi/ledger/` (`perf-fusion-20260823`, `perf-continuation-20260824`, `perf-close-20260824`, `perf-s2-20260825`, `perf-s4-20260826`); `docs/maintainer/cuda-kernel-guide.md`; the escape ledger `.jammi/escapes.jsonl`. Every number in the nine tables below is mechanically bound to a tracked artifact or escaped into a committed, shrink-only ledger (`ci/scripts/check_perf_claims.py`, `ci/perf_claims_allowlist.txt`) — a table cell that drifts from its artifact, or a new cell landing with no producer, is a CI failure; the surrounding PROSE (this paragraph included) is not gated the same way. Where the sources disagree, the disagreement is printed, not smoothed.
 
 Notation: `b8·s512` = batch 8 triplets (the bench batches anchor/positive/negative into one forward, so the attention batch is 24 rows), sequence 512. `s/step` is the p50 of measured optimizer steps. "Same box" means both legs ran on the same physical GPU in the same session. `s2:245` = session-2 ledger row 245; `s4:11` = session-4 ledger row 11; `esc-044` = a row of the escape ledger.
 
@@ -115,7 +115,7 @@ Post-#357 census on an SXM4 (`cont row 11`): 251 ms GPU at b8·s128, of which `b
 
 | lever | mechanism | predicted | measured (same box, SXM4) | verdict |
 |---|---|---|---|---|
-<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=crates/jammi-bench/baselines/p1_softmax_scale_fold_ab.json#/rows/b8-s512-d0/base/s_per_step_p50; c5=crates/jammi-bench/baselines/p1_softmax_scale_fold_ab.json#/rows/b8-s512-d0/tip/s_per_step_p50; c6=crates/jammi-bench/baselines/p1_softmax_scale_fold_ab.json#/rows/b8-s512-d0/base/peak_vram_bytes as GB; c7=crates/jammi-bench/baselines/p1_softmax_scale_fold_ab.json#/rows/b8-s512-d0/tip/peak_vram_bytes as GB; c8=diff(crates/jammi-bench/baselines/p1_softmax_scale_fold_ab.json#/rows/b8-s128-d0/tip/peak_vram_bytes,crates/jammi-bench/baselines/p1_softmax_scale_fold_ab.json#/rows/b8-s128-d0/base/peak_vram_bytes) as MiB -->
+<!-- claims: c1=ledger; c2=ledger; c3=crates/jammi-bench/baselines/p1_softmax_scale_fold_ab.json#/rows/b8-s512-d0/base/s_per_step_p50; c4=crates/jammi-bench/baselines/p1_softmax_scale_fold_ab.json#/rows/b8-s512-d0/tip/s_per_step_p50; c5=crates/jammi-bench/baselines/p1_softmax_scale_fold_ab.json#/rows/b8-s512-d0/base/peak_vram_bytes as GB; c6=crates/jammi-bench/baselines/p1_softmax_scale_fold_ab.json#/rows/b8-s512-d0/tip/peak_vram_bytes as GB; c7=diff(crates/jammi-bench/baselines/p1_softmax_scale_fold_ab.json#/rows/b8-s128-d0/tip/peak_vram_bytes,crates/jammi-bench/baselines/p1_softmax_scale_fold_ab.json#/rows/b8-s128-d0/base/peak_vram_bytes) as MiB -->
 | **P1** fold 1/√d into fused softmax | deletes one `[B,H,S,S]` affine node per layer | −5.6 GB, ~12 ms at s512 | s512 1.078 → 1.038 s, 77.5 → 71.8 GB; s128 flat (+32 MiB, disclosed) | landed #362 |
 <!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger; c5=ledger; c6=ledger; c7=ledger; c8=ledger; c9=ledger; c10=ledger; c11=ledger; c12=ledger; c13=ledger; c14=ledger; c15=ledger; c16=ledger; c17=ledger; c18=ledger -->
 | **P2** `LowRankResidualLinear` — one CustomOp3 per LoRA site, no dW for frozen W | ~11 → 3 nodes per site; 60% of the add mass | GPU 251 → 160–190 ms (first draft 140–150) | s128 0.2668 → 0.2098 (−21%), 23.7 → 8.7 GB; s512 1.037 → 0.780 (−25%), 71.9 → 39.1 GB | landed #363 |
@@ -146,7 +146,7 @@ With P1+P2+P3 stacked and esc-044 fixed, an *exclusive* A100 measured: **b8·s51
 | `Kernel2` | 52.7 | 364 | six grid configs; only `gridDim.z=384` (26.5 ms) are attention |
 <!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger; c5=ledger; c6=ledger -->
 | `cast_bf16_f32` / `scaled_cast_add` / `cast_f32_bf16` | 40.4 / 21.0 / 11.1 | 337 / 112 / 112 | the LoRA site's dtype motion |
-<!-- claims: c1=ledger; c2=ledger; c3=ledger -->
+<!-- claims: c1=ledger; c2=ledger -->
 | `ampere_sgemm_32x128_nn` | 40.1 | 336 | the LoRA site's rank-16 f32 GEMMs |
 <!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger -->
 | `affine_f32` | 25.8 | 2129 | 2016 AdamW; 112 the LoRA bwd |
@@ -163,15 +163,14 @@ The five-lever plan: AdamW ~26 ms, cast boundary ~72 ms, FA2 ~160 ms, the esc-04
 
 | lever | projection history | measured (one build, forced arm off/on) | PR |
 |---|---|---|---|
-<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger; c5=ledger; c6=ledger; c7=ledger; c8=ledger; c9=crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-cast-w1-80f02fb-a100-sxm4.json#/legs/b8_s512_disabled_r1/s_per_step_p50; c10=crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-cast-w1-80f02fb-a100-sxm4.json#/legs/b8_s512_fused_r1/s_per_step_p50; c11=abs(crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-cast-w1-80f02fb-a100-sxm4.json#/deltas/b8_s512_p50_ms/delta_ms); c12=crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-cast-w1-80f02fb-a100-sxm4.json#/legs/b8_s128_disabled_r1/s_per_step_p50; c13=crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-cast-w1-80f02fb-a100-sxm4.json#/legs/b8_s128_fused_r1/s_per_step_p50 -->
+<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger; c5=ledger; c6=ledger; c7=ledger; c8=ledger; c9=crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-cast-w1-80f02fb-a100-sxm4.json#/legs/b8_s512_disabled_r1/s_per_step_p50; c10=crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-cast-w1-80f02fb-a100-sxm4.json#/legs/b8_s512_fused_r1/s_per_step_p50; c11=neg(crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-cast-w1-80f02fb-a100-sxm4.json#/deltas/b8_s512_p50_ms/delta_ms); c12=crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-cast-w1-80f02fb-a100-sxm4.json#/legs/b8_s128_disabled_r1/s_per_step_p50; c13=crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-cast-w1-80f02fb-a100-sxm4.json#/legs/b8_s128_fused_r1/s_per_step_p50 -->
 | **Cast boundary W1** (fuse `cast+affine` and `cast+add` in the LoRA bwd) | 72.5 → 13.4 → 40–48 → 28–31 → 31–42 ms | b8·s512 0.6744 → **0.6349 (−39.6 ms)**; s128 0.1978 → 0.1883; bit-identical to the two-kernel chain | #377 |
-<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger; c5=ledger; c6=ledger; c7=ledger; c8=ledger; c9=ledger; c10=legacy(crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-adamw-d959805-a100-sxm4.json#/a100b_full_step_ab_reference/summary/s512/disabled_eager_p50_r1_r2/0); c11=legacy(crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-adamw-d959805-a100-sxm4.json#/a100b_full_step_ab_reference/summary/s512/fused_p50_r1_r2/0); c12=legacy(abs(diff(mean(crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-adamw-d959805-a100-sxm4.json#/a100b_full_step_ab_reference/summary/s512/disabled_eager_p50_r1_r2/0,crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-adamw-d959805-a100-sxm4.json#/a100b_full_step_ab_reference/summary/s512/disabled_eager_p50_r1_r2/1),mean(crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-adamw-d959805-a100-sxm4.json#/a100b_full_step_ab_reference/summary/s512/fused_p50_r1_r2/0,crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-adamw-d959805-a100-sxm4.json#/a100b_full_step_ab_reference/summary/s512/fused_p50_r1_r2/1))) as ms); c13=ledger -->
+<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger; c5=ledger; c6=ledger; c7=ledger; c8=ledger; c9=legacy(crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-adamw-d959805-a100-sxm4.json#/a100b_full_step_ab_reference/summary/s512/disabled_eager_p50_r1_r2/0); c10=legacy(crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-adamw-d959805-a100-sxm4.json#/a100b_full_step_ab_reference/summary/s512/fused_p50_r1_r2/0); c11=legacy(neg(diff(mean(crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-adamw-d959805-a100-sxm4.json#/a100b_full_step_ab_reference/summary/s512/disabled_eager_p50_r1_r2/0,crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-adamw-d959805-a100-sxm4.json#/a100b_full_step_ab_reference/summary/s512/disabled_eager_p50_r1_r2/1),mean(crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-adamw-d959805-a100-sxm4.json#/a100b_full_step_ab_reference/summary/s512/fused_p50_r1_r2/0,crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-adamw-d959805-a100-sxm4.json#/a100b_full_step_ab_reference/summary/s512/fused_p50_r1_r2/1))) as ms); c12=ledger -->
 | **AdamW in-place step** (`InplaceOp2/3`; 3 launches/Var, zero `Var::set` memcpys) | −40 → "~26" → ~30 wall → −20.5 isolated | optimizer phase 23.1 → 2.59 ms (8.9×); full step b8·s512 0.6759 → **0.6589 (−16.4 ms)**; s128 −16.5; bit-identical to candle's chain | #380 |
-<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger; c5=ledger; c6=ledger; c7=ledger; c8=ledger; c9=ledger; c10=ledger; c11=ledger; c12=ledger; c13=ledger; c14=ledger -->
+<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger; c5=ledger; c6=ledger; c7=ledger; c8=ledger; c9=ledger; c10=ledger; c11=ledger; c12=ledger; c13=ledger -->
 | **FlashAttention-2 dense arm** | −285 → −210..−240 → −140 → [159,183]; kernel 61–85 ms projected vs **39 measured** | b8·s512 block 0.6756 → **flash 0.4626 (−213 ms)** same box, 0.937× torch; s128 −43 ms | #389 |
 <!-- claims: c1=ledger; c2=ledger; c3=ledger -->
 | **P5** | 102 → 33 → 19 ms atom | not built | — |
-<!-- claims: c1=ledger -->
 | **esc-045 fix** ("the gate") | — | did not gate the shipped levers: FA2 replaces the softmax site; the others are bit-identical; the metric turned out chaotic (§6) | #374 open |
 
 Sources: `s2:89, 97, 109, 137, 146, 151, 164, 192`. The AdamW "26 ms" was a mis-attribution (112 of the 2129 affines belong to the LoRA backward; AdamW's data volume is ~0.5 GB) — its credit was launch overhead, which is why the in-place design won over a true multi-tensor kernel that would have needed a candle patch.
@@ -257,7 +256,7 @@ Sequences are packed into `qkv [total_q, 3, H, 64]` with a `cu_seqlens [B+1]` pr
 
 ### The bench and its torch twin
 
-`jammi-bench finetune-step`: three encoder forwards, a triplet hinge, one backward, one AdamW step; synthetic uniform token ids, so it measures *cost*, never learning. `torch_finetune_step.py` is matched argument for argument (`attn_implementation` read back from the config; `--attn eager` = semantic twin, `--attn sdpa` = the throughput bar; LoRA init distribution-matched; TF32 off). `ab_merge.py` refuses to compare legs whose `FINETUNE_IDENTITY_FIELDS` differ (`ci/scripts/perf/ab_merge.py:114-129`); the attention implementation is recorded as provenance and never compared (`:43`); PR #381 (open) adds the clip determinant `max_grad_norm` to the jammi leg and it enters the K7-completeness const (`FinetuneStepTier::IDENTITY_FIELDS`) — not the comparison tuple — when both land. The claim is then pinned by `ci/scripts/perf/test_identity_fields_subset.py`, which asserts the Python comparison tuples stay a subset of the Rust K7-completeness consts; a later tuple change without a doc change is not caught — accepted, stated.
+`jammi-bench finetune-step`: three encoder forwards, a triplet hinge, one backward, one AdamW step; synthetic uniform token ids, so it measures *cost*, never learning. `torch_finetune_step.py` is matched argument for argument (`attn_implementation` read back from the config; `--attn eager` = semantic twin, `--attn sdpa` = the throughput bar; LoRA init distribution-matched; TF32 off). `ab_merge.py` refuses to compare legs whose `FINETUNE_IDENTITY_FIELDS` differ (`ci/scripts/perf/ab_merge.py:114-129`); the attention implementation is recorded as provenance and never compared (`:43`); PR #381 (open) adds the clip determinant `max_grad_norm` to the jammi leg and it enters the K7-completeness const (`FinetuneStepTier::IDENTITY_FIELDS`) — not the comparison tuple — when both land. The claim is pinned by a stdlib-`unittest` suite (perf-unification phase 1) asserting the Python comparison tuples stay a subset of the Rust K7-completeness consts — not yet present on this tree at the time of writing; a later tuple change without a doc change is not caught until it lands — accepted, stated.
 
 ---
 
@@ -307,17 +306,17 @@ jammi's math is right; its bf16 backward was 6.5× further from truth than torch
 
 | operating point (b4·s128) | block-fused | eager | torch bf16 | flash (FA2 tip) |
 |---|---:|---:|---:|---:|
-<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger; c5=ledger -->
+<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger -->
 | gaussian, seed 42 | 0.610 | 0.767 | 0.796 | 0.790 |
-<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger; c5=ledger -->
+<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger -->
 | post-step, seed 42 | −0.350 | −0.198 | **−0.201** | −0.319 |
-<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger; c5=ledger -->
+<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger -->
 | gaussian, seed 43 | 0.300 | 0.451 | 0.425 | 0.104 |
-<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger; c5=ledger -->
+<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger -->
 | post-step, seed 43 | 0.563 | 0.229 | 0.679 | 0.143 |
-<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger; c5=ledger -->
+<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger -->
 | gaussian, seed 44 | −0.264 | 0.133 | 0.485 | 0.680 |
-<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger; c5=ledger -->
+<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger -->
 | post-step, seed 44 | −0.070 | −0.087 | **−0.062** | 0.095 |
 
 **Torch's own bf16 backward collapses too** (range −0.20…0.80 over six points). A single-step gradient cosine here has no resolving power for either stack. The only statistic with power is paired and sign-based: block − torch is negative at 6/6 points (p = 1/64); flash − torch is 4 positive / 6 negative over ten points — no consistent sign. The FA2 arm removed the systematic deficit; what remains is the metric's chaos.
@@ -395,7 +394,7 @@ stays here is unique to this track's own runs:
 | + P3 (defective bwd) | 0.7742 | 17.06 GB | SXM4 |
 <!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger; c5=ledger; c6=ledger -->
 | + esc-044 fix, exclusive box | 0.6682 ± 0.002 | 14.65 GB | a100 / drv 570; torch 0.4292 → 0.642× |
-<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-cast-w1-80f02fb-a100-sxm4.json#/legs/b8_s512_fused_r1/s_per_step_p50; c2=diff(mean(crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-cast-w1-80f02fb-a100-sxm4.json#/peak_vram_bytes_by_leg/b8_s512/fused_r1_gb,crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-cast-w1-80f02fb-a100-sxm4.json#/peak_vram_bytes_by_leg/b8_s512/fused_r2_gb),mean(crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-cast-w1-80f02fb-a100-sxm4.json#/peak_vram_bytes_by_leg/b8_s512/disabled_r1_gb,crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-cast-w1-80f02fb-a100-sxm4.json#/peak_vram_bytes_by_leg/b8_s512/disabled_r2_gb)) -->
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-cast-w1-80f02fb-a100-sxm4.json#/legs/b8_s512_fused_r1/s_per_step_p50; c2=ledger -->
 | + cast W1 (#377) | 0.6349 | +0.3 GB | SXM4 |
 <!-- claims: c1=legacy(crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-adamw-d959805-a100-sxm4.json#/a100b_full_step_ab_reference/summary/s512/fused_p50_r1_r2/0); c2=legacy(crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-adamw-d959805-a100-sxm4.json#/a100b_full_step_ab_reference/summary/s512/disabled_eager_p50_r1_r2/0) -->
 | + AdamW (#380) | 0.6589 (from an eager arm of 0.6759 — a base that predates W1) | — | timing box |

@@ -66,9 +66,19 @@ only what it says.
 
 ## What this means for phase 3 specifically
 
-Phase 3 (rule (h) + the ledger + the guide) does not depend on phases 1–2 having landed first: its
-pointer roots (`crates/jammi-kernels/artifacts/cuda-runs/**`, `crates/jammi-bench/baselines/*.json`)
-already exist and are already provenanced under rules (a)–(f), independent of rule (g)'s v2 schema.
-The `legacy(...)` marker in the grammar is phase 3's explicit, auditable stand-in for what rule (g)
-would otherwise classify automatically once it lands — used only for the two cells `CONTRACT.md` C12.2
-names by hand, not inferred.
+Phase 3 (rule (h) + the ledger + the guide) does not depend on phases 1–2 having landed first to OPEN
+its own PR: its pointer roots (`crates/jammi-kernels/artifacts/cuda-runs/**`, `crates/jammi-bench/
+baselines/*.json`) already exist and are already provenanced under rules (a)–(f), independent of rule
+(g)'s v2 schema. The `legacy(...)` marker in the grammar is phase 3's explicit, auditable stand-in for
+what rule (g) would otherwise classify automatically once it lands — used only for the two cells
+`CONTRACT.md` C12.2 names by hand, not inferred.
+
+**Round-2 audit finding (P2-move simulation).** Independence to OPEN a PR is not independence at MERGE
+time. A `git mv` simulation of phase 2's baseline move (`crates/jammi-bench/baselines/{finetune_step_
+reference,p1_softmax_scale_fold_ab}.json` → `crates/jammi-kernels/artifacts/cuda-runs/`) against phase
+3's actual tags REDs 7 of them (T3's P1 row: 5 entries; T3's P3 row: 2 entries — both reuse the P1
+baseline's own `base` fields). `POINTER_ROOTS` listing both the pre- and post-move directories as
+allowed roots does NOT make a tag survive a rename: `Loader` resolves each pointer against exact `git
+ls-files` membership at the path the tag names, and a `git mv` removes the old path from that set. An
+earlier draft of `README.md` stated the opposite ("no re-pointing is required either way") — corrected;
+whichever of phase 2 and phase 3 merges second re-points those 7 tags in the same PR.

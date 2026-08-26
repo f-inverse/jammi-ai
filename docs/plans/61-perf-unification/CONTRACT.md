@@ -174,6 +174,29 @@ default reports TRAIN loss as `final_loss`), a non-hinge objective or a measured
 bench's hinge saturates to `loss_last == 0.0` on both arms at the shapes tried), and a calibration run
 before any acceptance gate may be built.
 
+## §6 — F1, the bind-rate floor (amended; lead decision, audit round 2 / A4)
+
+The original phase-3 acceptance text ("≥ 50 V cells and ≥ 3 fully-bound tables") is NOT met by the
+real artifacts this unit has to bind against, and the shortfall is not a defect to fix by tagging
+harder: `check_perf_claims.py --report` shows exactly ONE fully-bound table (T6, the stacked-sweep
+result — every one of its 33 cells is a live pointer into a single committed artifact). The other
+eight tables are, by construction, ledger-derived: T1/T2/T7/T8 summarize GitHub-issue or session-ledger
+numbers with no committed JSON producer at all; T3/T4/T5/T9 mix a handful of artifact-backed cells
+(P1's baseline, the two P2/P3 §10 rows, the cast-w1 and AdamW cells) with projection-history and
+census numbers that were never meant to be reproducible from a tracked artifact. Making a SECOND or
+THIRD table fully bind would require re-running the underlying measurements against the current
+tracked artifact set (e.g. producing a real p2/p3-shaped artifact for T3's own P2/P3 row, or a real
+nsys-census artifact for T4) — a separate unit of GPU work, out of scope for a phase whose own standing
+clause is "no GPU spend anywhere in phases 1–3."
+
+**The amended acceptance bar is: `>= 1 fully-bound table AND V >= 50 AND the ledger may only shrink`.**
+This is a STANDING RATCHET, not a PR-body number: `check_perf_claims.py --report --min-fully-bound=1
+--min-v=50` is wired as a REQUIRED fourth `guard` leg beside the bare/self-test/allowlist-only-shrinks
+legs (`ci.yml`), so a future PR that retags a bound cell to `ledger` without a compensating new bind
+elsewhere — silently eroding V below 50, or un-binding T6's own cells below full coverage — REDs, the
+same way `--check-allowlist-only-shrinks` REDs a ledger that grows. At the time of this amendment: V =
+54, V-legacy = 5, one fully-bound table (T6), both floors cleared with headroom.
+
 ## Standing clauses
 
 Every number in a doc cites its derivation; gates run blocking with real exit codes; SHAs not branch

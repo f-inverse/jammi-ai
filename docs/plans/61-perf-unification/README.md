@@ -33,9 +33,18 @@ what actually ran.
 | 2 — leg identity + producers | rule (g): `check_cuda_run_artifacts.py` gains a schema-v2 discriminator (`leg_schema_version >= 2`) that requires every v2 leg to carry a self-declaring identity tuple and a `build_sha` matching its artifact's own `git_sha`; every shell producer cross-checks the binary before it writes a leg; the two hand-carried baselines move under `crates/jammi-kernels/artifacts/cuda-runs/`; the swarm gate glob widens to cover a gate script under a subdirectory | docs-ci (+ numerics, bench per file) | `ci/scripts/check_cuda_run_artifacts.py`, `ci/scripts/perf/*.sh`, `.github/workflows/swarm.yml` |
 | 3 — claim grammar + guide | rule (h): `ci/scripts/check_perf_claims.py`, a bounded six-form claim grammar that binds every numeric token in the guide's nine tables to a tracked artifact value at Decimal/`ROUND_HALF_EVEN` string equality, or escapes it into a committed, shrink-only ledger; the guide's own §7/§8 become citation tables into `cuda-kernel-guide.md` | docs-ci | `ci/scripts/check_perf_claims.py`, `ci/perf_claims_allowlist.txt`, `docs/maintainer/fine-tune-performance-guide.md` |
 
-The lead's phase order is **1 → 2 → 3**, which reverses an earlier draft's "grammar first" — the
-baselines move (phase 2) lands before any `claims:` tag is written (phase 3), so no tag is ever
-re-pointed at a moved path.
+The lead's phase order is **1 → 2 → 3**, which reverses an earlier draft's "grammar first" — IN THAT
+ORDER, the baselines move (phase 2) lands before any `claims:` tag is written (phase 3), so a tag
+authored against the post-move guide would never need re-pointing. Phase 3 was, in practice, built as
+its own branch off `main` before phase 2 merged (a real scheduling deviation from the idealized order,
+not a hypothetical one), so its `claims:` tags point at the two baselines' PRE-move path
+(`crates/jammi-bench/baselines/{finetune_step_reference,p1_softmax_scale_fold_ab}.json`) — 7 tags,
+concretely, across the guide's T3 P1 and P3 rows. Whichever of phase 2 and phase 3 merges second must
+re-point those 7 tags to the post-move path under `crates/jammi-kernels/artifacts/cuda-runs/` in the
+SAME PR that rebases — `check_perf_claims.py`'s `Loader` resolves a pointer against `git ls-files`
+membership at the exact path given, so a `git mv`'d file silently reds every tag still pointing at its
+old location; a P2-move simulation against this phase's own tags confirms exactly this (see
+`PRESSURE.md`).
 
 ## What the mechanism actually closes
 
@@ -69,8 +78,10 @@ each their own atomic PR (B6); phase 3 touches only `ci/scripts/check_perf_claim
 ledger files, `.github/workflows/ci.yml`'s `guard` matrix, and `docs/maintainer/**` plus this plan
 directory. Phase 3's own pointer roots (`crates/jammi-kernels/artifacts/cuda-runs/**` and
 `crates/jammi-bench/baselines/*.json`) already exist on `main` independent of phases 1–2 landing, so
-phase 3 does not block on either — the only phase-2 dependency is that phase 3's tags must be
-re-pointed if phase 2's baseline move lands with different paths than assumed here (both files moved
-under `cuda-runs/` per `CONTRACT.md` C8, phase 3's tags use the pre-move `crates/jammi-bench/
-baselines/*.json` paths, which C10.5 keeps as a standing pointer root regardless of the move — no
-re-pointing is required either way).
+phase 3 does not block on EITHER phase to open its own PR — but it DOES have one real, concrete
+dependency at merge time: phase 3's tags for the two moved baselines (T3's P1 and P3 rows, 7 tags) are
+written against their PRE-move path, since phase 3 was built before phase 2 merged. `POINTER_ROOTS`
+listing BOTH `crates/jammi-kernels/artifacts/cuda-runs` and `crates/jammi-bench/baselines` as allowed
+roots does NOT make a tag survive the move — `Loader` resolves a pointer against exact `git ls-files`
+membership, and a `git mv` removes the old path from that set. Whichever of phase 2 and phase 3 merges
+second re-points those 7 tags in the same PR (see the phase table above).

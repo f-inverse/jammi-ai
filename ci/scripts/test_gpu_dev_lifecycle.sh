@@ -324,34 +324,94 @@ unset MOCK_DEPLOY_RESPONSE
 # ═════════════════════════════════════════════════════════════════════════
 # Group 1c — CLI-level: `shell` must force RP_SESSION="" before sourcing
 # runpod_lib.sh, even when the caller's own shell already has RP_SESSION
-# exported (e.g. left over from an earlier `RP_SESSION=a100 gpu-dev.sh attach
-# a100` in the SAME terminal). An inherited RP_SESSION would point `shell`'s
+# EXPORTED (e.g. `export RP_SESSION=a100` earlier in the SAME terminal — a
+# one-off `RP_SESSION=a100 gpu-dev.sh attach a100` command-prefix assignment
+# does NOT persist past that single invocation, so it is not what this
+# fixture reproduces). An inherited RP_SESSION would point `shell`'s
 # throwaway RP_WORK at the LIVE session's own directory instead of a fresh
 # temp dir, and `rp_init` (called before anything is rented) writes into
-# RP_WORK unconditionally — proof this test can observe hermetically, with
-# no reachable SSH needed: the deploy is mocked as SUPPLY_CONSTRAINT on every
-# candidate, so `shell` exits fast (75) right after `rp_init`, never reaching
-# rp_session_save. If RP_WORK were the live session's own directory, rp_init
-# would still have dropped a NEW keypair into it before the deploy call —
-# the live session's directory must contain ONLY its original "meta" file,
-# untouched, both before and after.
+# RP_WORK unconditionally.
+#
+# Strengthened (round-2 audit on #388): a100's session dir is PRE-SEEDED
+# with its own real keypair below, exactly like a genuine `up`/`attach`
+# session already would have. Without this, rp_init's own
+# `[ -f "$RP_SSH_KEY" ] || ssh-keygen ...` would REUSE an already-missing-
+# turned-present key path only on the SECOND run — on an EMPTY a100 dir (the
+# original version of this fixture) `ssh-keygen` would run whether or not
+# the bug reproduced, so "a new file appeared" was not actually pinned to
+# the bug. Pre-seeding removes that false-negative risk: any key material
+# written into a100's dir by THIS run can only be an overwrite.
+#
+# The direct, positive signal for "RP_WORK resolved to a temp dir" comes
+# from TMPDIR: runpod_lib.sh's own `mktemp -d "${TMPDIR:-/tmp}/jammi-gpu-dev.XXXXXX"`
+# (see its own comment) builds its throwaway path from $TMPDIR explicitly —
+# portable across GNU and BSD `mktemp`, unlike a bare `mktemp -d` — so
+# overriding TMPDIR to an otherwise-empty watch directory for this one
+# invocation makes a NEWLY generated keypair appearing under it direct,
+# unambiguous proof that `rp_init` wrote into a FRESH temp directory, never
+# a100's own (which already has its own pre-seeded key and would need no
+# `ssh-keygen` call at all).
+#
+# The deploy itself is mocked as a SUCCESS (`podFindAndDeployOnDemand`
+# returns a real id, same shape as finding 1's own fixture above) rather
+# than a no-capacity refusal, so this exercises the actual pod-rental path,
+# not merely the pre-flight one — and since no fixture in this suite mocks
+# a reachable SSH server (see this file's own header doc), the invocation is
+# SIGTERM'd once the deploy call lands, exactly like finding 1's fixture.
 # ═════════════════════════════════════════════════════════════════════════
 SESSION_LIVE_A100="a100"
 write_meta "$SESSION_LIVE_A100" "pod-live-a100" "72"
+ssh-keygen -t ed25519 -N '' -f "$RP_SESSION_ROOT/$SESSION_LIVE_A100/id_ed25519" -q
 before_listing="$(ls -A "$RP_SESSION_ROOT/$SESSION_LIVE_A100")"
 before_meta_sum="$(cat "$RP_SESSION_ROOT/$SESSION_LIVE_A100/meta")"
-echo '{"errors":[{"extensions":{"code":"SUPPLY_CONSTRAINT"},"message":"no capacity"}]}' > "$SANDBOX/deploy-shell-isolation.json"
+before_key_sum="$(cat "$RP_SESSION_ROOT/$SESSION_LIVE_A100/id_ed25519")"
+
+TMPWATCH="$SANDBOX/tmpwatch-shell-isolation"
+mkdir -p "$TMPWATCH"
+
+echo '{"data":{"podFindAndDeployOnDemand":{"id":"pod-shell-isolation"}}}' > "$SANDBOX/deploy-shell-isolation.json"
 export MOCK_DEPLOY_RESPONSE="$SANDBOX/deploy-shell-isolation.json"
 reset_log
-RP_SESSION="$SESSION_LIVE_A100" bash "$DIR/gpu-dev.sh" shell a100 --ref abcdef1234567890 \
-  >"$SANDBOX/out-shell-isolation.log" 2>&1
-rc=$?
+TMPDIR="$TMPWATCH" RP_SESSION="$SESSION_LIVE_A100" bash "$DIR/gpu-dev.sh" shell a100 --ref abcdef1234567890 \
+  >"$SANDBOX/out-shell-isolation.log" 2>&1 &
+ISO_PID=$!
+deadline=$((SECONDS + 20))
+while ! log_has "podFindAndDeployOnDemand" && [ "$SECONDS" -lt "$deadline" ]; do sleep 0.1; done
+
+# rp_init (which resolves RP_WORK and generates its keypair if one is not
+# already there) always runs BEFORE rp_deploy_arch is ever called, so by the
+# time the deploy call has landed in the log, any keypair rp_init generated
+# already exists on disk. Checked HERE, before the SIGTERM below, and NOT
+# after the process has exited: rp_cleanup's own EXIT trap `rm -rf`s a
+# throwaway RP_WORK on the way out (correct behaviour for a real throwaway
+# pod), so inspecting the watch dir post-exit would always find it already
+# deleted regardless of whether the fix actually took effect — the earlier
+# version of this assertion did exactly that and failed even against the
+# FIXED code.
+if find "$TMPWATCH" -name 'id_ed25519' 2>/dev/null | grep -q .; then
+  ok "finding(shell-session-isolation): RP_WORK resolved to a fresh \$TMPDIR temp dir (a new keypair was generated there)"
+else
+  bad "finding(shell-session-isolation): expected a NEW keypair under \$TMPDIR (RP_WORK never resolved to a throwaway temp dir); watch dir contents: $(ls -A "$TMPWATCH" 2>/dev/null)"
+fi
+
+sleep 0.5
+kill -TERM "$ISO_PID" 2>/dev/null
+wait_deadline=$((SECONDS + 15))
+while kill -0 "$ISO_PID" 2>/dev/null && [ "$SECONDS" -lt "$wait_deadline" ]; do sleep 0.2; done
+kill -0 "$ISO_PID" 2>/dev/null && kill -KILL "$ISO_PID" 2>/dev/null
+wait "$ISO_PID" 2>/dev/null
+
 after_listing="$(ls -A "$RP_SESSION_ROOT/$SESSION_LIVE_A100")"
 after_meta_sum="$(cat "$RP_SESSION_ROOT/$SESSION_LIVE_A100/meta")"
-[ "$rc" -eq 75 ] && ok "finding(shell-session-isolation): shell reaches the mocked no-capacity deploy path (rc=75)" \
-  || bad "finding(shell-session-isolation): expected rc=75 once it reaches the (mocked, no-capacity) deploy path (got $rc); $(cat "$SANDBOX/out-shell-isolation.log")"
+after_key_sum="$(cat "$RP_SESSION_ROOT/$SESSION_LIVE_A100/id_ed25519")"
+
+if log_has "podTerminate.*pod-shell-isolation"; then
+  ok "finding(shell-session-isolation): the freshly rented throwaway pod was terminated on SIGTERM"
+else
+  bad "finding(shell-session-isolation): expected a podTerminate for pod-shell-isolation after SIGTERM; output: $(cat "$SANDBOX/out-shell-isolation.log")"
+fi
 if [ "$before_listing" = "$after_listing" ]; then
-  ok "finding(shell-session-isolation): the live a100 session dir gained no new file (no leaked ssh key)"
+  ok "finding(shell-session-isolation): the live a100 session dir's listing is unchanged (pre-seeded keypair, no new/overwritten file)"
 else
   bad "finding(shell-session-isolation): the live a100 session dir's listing changed (before=[$before_listing] after=[$after_listing]) — an inherited exported RP_SESSION leaked into shell's throwaway RP_WORK"
 fi
@@ -359,6 +419,11 @@ if [ "$before_meta_sum" = "$after_meta_sum" ]; then
   ok "finding(shell-session-isolation): the live a100 session's meta content is byte-identical after shell exits"
 else
   bad "finding(shell-session-isolation): the live a100 session's meta content changed (regression!)"
+fi
+if [ "$before_key_sum" = "$after_key_sum" ]; then
+  ok "finding(shell-session-isolation): the live a100 session's pre-seeded keypair is byte-identical after shell exits"
+else
+  bad "finding(shell-session-isolation): the live a100 session's pre-seeded keypair changed (regression!)"
 fi
 unset MOCK_DEPLOY_RESPONSE
 
@@ -709,6 +774,110 @@ if grep -q -- "RP_TTL_HOURS=<H>" "$SANDBOX/out-down-unshaped.log" "$SANDBOX/out-
 else
   ok "finding: down's refusal does not promise the removed RP_TTL_HOURS=<H> override"
 fi
+
+# ═════════════════════════════════════════════════════════════════════════
+# Group 3c — CLI-level: an exported RP_SESSION must never silently OUTRANK
+# an explicit positional session argument for down/attach/run/logs/push/pull
+# (round-2 audit on #388, reproduced: `RP_SESSION=a100 gpu-dev.sh down l40s`
+# terminated pod-a100 and forgot ITS record, never touching l40s — the
+# positional the caller actually typed was discarded outright). Two live
+# sessions are recorded so a wrong pick is directly observable (the WRONG
+# one's pod would be terminated, not merely "a" pod).
+# ═════════════════════════════════════════════════════════════════════════
+SESSION_CONFLICT_A="a100"
+SESSION_CONFLICT_L="l40s"
+write_meta "$SESSION_CONFLICT_A" "pod-conflict-a100" "8"
+write_meta "$SESSION_CONFLICT_L" "pod-conflict-l40s" "8"
+
+# A differing exported RP_SESSION and positional: refuse (exit 2), issue NO
+# account query at all (the ambiguity is resolved BEFORE anything is rented
+# or acted on), terminate nothing, and keep BOTH local records intact.
+reset_log; reset_account_seq
+RP_SESSION="$SESSION_CONFLICT_A" bash "$DIR/gpu-dev.sh" down "$SESSION_CONFLICT_L" \
+  >"$SANDBOX/out-conflict-refuse.log" 2>&1
+rc=$?
+[ "$rc" -eq 2 ] && ok "finding(session-conflict): a differing positional vs exported RP_SESSION exits 2" \
+  || bad "finding(session-conflict): expected exit 2 for a differing positional vs RP_SESSION (got $rc); $(cat "$SANDBOX/out-conflict-refuse.log")"
+grep -q "conflicting session" "$SANDBOX/out-conflict-refuse.log" \
+  && ok "finding(session-conflict): the refusal names itself, not a generic usage error" \
+  || bad "finding(session-conflict): expected a 'conflicting session' message ($(cat "$SANDBOX/out-conflict-refuse.log"))"
+grep -q -- "'${SESSION_CONFLICT_L}'" "$SANDBOX/out-conflict-refuse.log" \
+  && grep -q -- "RP_SESSION='${SESSION_CONFLICT_A}'" "$SANDBOX/out-conflict-refuse.log" \
+  && ok "finding(session-conflict): the refusal names BOTH the positional and the exported RP_SESSION" \
+  || bad "finding(session-conflict): expected both '${SESSION_CONFLICT_L}' and RP_SESSION='${SESSION_CONFLICT_A}' named ($(cat "$SANDBOX/out-conflict-refuse.log"))"
+if log_has "podTerminate"; then
+  bad "finding(session-conflict): a conflicting session must issue NO podTerminate (regression!)"
+else
+  ok "finding(session-conflict): a conflicting session issues no podTerminate"
+fi
+if log_has "myself{"; then
+  bad "finding(session-conflict): a conflicting session must issue NO account query at all — resolved before anything is rented (regression!)"
+else
+  ok "finding(session-conflict): a conflicting session issues no account query"
+fi
+[ -f "$RP_SESSION_ROOT/$SESSION_CONFLICT_A/meta" ] && [ -f "$RP_SESSION_ROOT/$SESSION_CONFLICT_L/meta" ] \
+  && ok "finding(session-conflict): BOTH local records survive the refusal" \
+  || bad "finding(session-conflict): both records must survive the refusal (regression!)"
+
+# The SAME positional and exported RP_SESSION (no conflict): acts on it
+# normally, exactly like the pre-existing down tests above.
+echo '{"data":{"myself":{"pods":[{"id":"pod-conflict-a100","name":"jammi-gpu-ttl8"}]}}}' \
+  > "$SANDBOX/acct-conflict-match-1.json"
+echo '{"data":{"myself":{"pods":[]}}}' > "$SANDBOX/acct-conflict-match-2.json"
+reset_log; reset_account_seq
+export MOCK_ACCOUNT_RESPONSE_1="$SANDBOX/acct-conflict-match-1.json"
+export MOCK_ACCOUNT_RESPONSE_2="$SANDBOX/acct-conflict-match-2.json"
+RP_SESSION="$SESSION_CONFLICT_A" bash "$DIR/gpu-dev.sh" down "$SESSION_CONFLICT_A" \
+  >"$SANDBOX/out-conflict-match.log" 2>&1
+rc=$?
+term_count_match="$(grep -c "podTerminate.*pod-conflict-a100" "$CALL_LOG")"
+[ "$term_count_match" = "1" ] && [ "$rc" -eq 0 ] \
+  && ok "finding(session-conflict): a MATCHING positional and RP_SESSION acts normally (terminates pod-conflict-a100)" \
+  || bad "finding(session-conflict): expected exactly one confirmed terminate for a matching positional/RP_SESSION (got count=${term_count_match} rc=${rc}); $(cat "$SANDBOX/out-conflict-match.log")"
+if log_has "podTerminate.*pod-conflict-l40s"; then
+  bad "finding(session-conflict): a matching down on a100 must never touch l40s's pod (regression!)"
+else
+  ok "finding(session-conflict): a matching down on a100 never touches l40s's pod"
+fi
+[ -f "$RP_SESSION_ROOT/$SESSION_CONFLICT_L/meta" ] \
+  && ok "finding(session-conflict): l40s's record is untouched by a matching down on a100" \
+  || bad "finding(session-conflict): l40s's record must survive a matching down on a100 (regression!)"
+
+# ═════════════════════════════════════════════════════════════════════════
+# Group 3d — CLI-level: RP_SESSION is validated as a single path segment
+# ([A-Za-z0-9_-]+) at the point RP_WORK is derived from it (round-2 audit
+# on #388) — a traversing value must be refused BEFORE rp_cleanup's or
+# rp_session_forget's unconditional `rm -rf "$RP_WORK"` could ever act on
+# it. `ls` is used as the driving subcommand: it is the cheapest command
+# that still sources runpod_lib.sh unconditionally, and the validation
+# lives in runpod_lib.sh itself, so every subcommand is equally covered.
+# ═════════════════════════════════════════════════════════════════════════
+TRAVERSAL_TARGET="$SANDBOX/must-not-be-touched"
+mkdir -p "$TRAVERSAL_TARGET"
+echo "sentinel" > "$TRAVERSAL_TARGET/sentinel.txt"
+RP_SESSION="../$(basename "$TRAVERSAL_TARGET")" bash "$DIR/gpu-dev.sh" ls \
+  >"$SANDBOX/out-traversal.log" 2>&1
+rc=$?
+[ "$rc" -eq 2 ] && ok "finding(RP_SESSION-traversal): a '..'-containing RP_SESSION exits 2" \
+  || bad "finding(RP_SESSION-traversal): expected exit 2 for a traversing RP_SESSION (got $rc); $(cat "$SANDBOX/out-traversal.log")"
+grep -q "RP_SESSION may contain only" "$SANDBOX/out-traversal.log" \
+  && ok "finding(RP_SESSION-traversal): the refusal names the single-path-segment rule" \
+  || bad "finding(RP_SESSION-traversal): expected the '[A-Za-z0-9_-]' refusal text ($(cat "$SANDBOX/out-traversal.log"))"
+[ -f "$TRAVERSAL_TARGET/sentinel.txt" ] \
+  && ok "finding(RP_SESSION-traversal): the out-of-root target directory is untouched" \
+  || bad "finding(RP_SESSION-traversal): the out-of-root target must survive (regression — rm -rf escaped RP_SESSION_ROOT!)"
+# A slash alone (no traversal, but still not a single path segment) must
+# refuse too — the rule is "single segment", not merely "no dot-dot".
+RP_SESSION="a100/evil" bash "$DIR/gpu-dev.sh" ls >"$SANDBOX/out-slash.log" 2>&1
+[ $? -eq 2 ] && ok "finding(RP_SESSION-traversal): an embedded '/' (no '..') also exits 2" \
+  || bad "finding(RP_SESSION-traversal): expected exit 2 for an embedded '/' ($(cat "$SANDBOX/out-slash.log"))"
+# An ordinary session name (letters, digits, hyphen, underscore) is
+# unaffected — every OTHER test in this suite already exercises this
+# path, but pinned directly here so a future over-tightening of the
+# pattern is caught in the same place as the traversal fix itself.
+RP_SESSION="a100-2" bash "$DIR/gpu-dev.sh" ls >"$SANDBOX/out-ordinary.log" 2>&1
+[ $? -eq 0 ] && ok "finding(RP_SESSION-traversal): an ordinary [A-Za-z0-9_-] session name is still accepted" \
+  || bad "finding(RP_SESSION-traversal): an ordinary session name must still work ($(cat "$SANDBOX/out-ordinary.log"))"
 
 # ═════════════════════════════════════════════════════════════════════════
 # Group 4 — rp_sweep's age-based judgement (function-level). Age math is

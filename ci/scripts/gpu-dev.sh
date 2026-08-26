@@ -173,21 +173,41 @@ case "$CMD" in
     ;;
   *)
     ARG="${1:-}"; [ $# -gt 0 ] && shift
-    SESSION="${RP_SESSION:-${ARG:-a100}}"; ARCH=""
+    # Unlike shell|up above (where ARCH and RP_SESSION are genuinely
+    # different axes — RP_SESSION deliberately overrides the session ALIAS
+    # for a second pod of the same arch, per this file's own header doc),
+    # here the positional IS the session name: `down`/`attach`/`run`/`logs`/
+    # `push`/`pull` all take `[session]` directly. `${RP_SESSION:-${ARG:-a100}}`
+    # let an exported RP_SESSION silently WIN over an explicit positional —
+    # `RP_SESSION=a100 gpu-dev.sh down l40s` terminated pod-a100 and forgot
+    # ITS record, never touching l40s at all, discarding the one argument
+    # the caller typed on the command line. An explicit positional is never
+    # discarded: when it conflicts with a differing exported RP_SESSION,
+    # that is a real ambiguity (which one did the caller mean?) and this
+    # refuses rather than silently picking either; when only one is set, it
+    # wins; when neither is, the a100 default applies exactly as before.
+    if [ -n "$ARG" ] && [ -n "${RP_SESSION:-}" ] && [ "$ARG" != "$RP_SESSION" ]; then
+      echo "::error::conflicting session: positional argument '${ARG}' vs exported RP_SESSION='${RP_SESSION}' — they name different sessions"
+      echo "::error::pick one: unset RP_SESSION to act on '${ARG}', or drop the positional to act on RP_SESSION='${RP_SESSION}'"
+      exit 2
+    fi
+    SESSION="${ARG:-${RP_SESSION:-a100}}"; ARCH=""
     ;;
 esac
 
 # `shell` is throwaway: no named session, so the EXIT trap wipes
 # the temp dir and terminates the pod. RP_SESSION is force-cleared here, not
-# merely left unset, because an inherited EXPORTED RP_SESSION (e.g. a
-# terminal that ran `RP_SESSION=a100 gpu-dev.sh attach a100` earlier in the
-# same shell) survives into this invocation's environment untouched
-# otherwise — runpod_lib.sh's own default is only "${RP_SESSION:-}", which
-# keeps whatever is already set. A `shell` that silently inherited a live
-# session's name would then write the throwaway pod's coordinates over that
-# session's own meta file (rp_session_save keys off RP_SESSION alone) and,
-# on exit, terminate the throwaway pod under RP_POD_CREATED — leaving the
-# REAL, still-running pod behind with no record pointing at it at all.
+# merely left unset, because an EXPORTED RP_SESSION set earlier in the SAME
+# shell (`export RP_SESSION=a100` — a one-off command-prefix assignment like
+# `RP_SESSION=a100 gpu-dev.sh attach a100` does NOT persist past that single
+# invocation, so it is not the precondition here) survives into this
+# invocation's environment untouched otherwise — runpod_lib.sh's own default
+# is only "${RP_SESSION:-}", which keeps whatever is already set. A `shell`
+# that silently inherited a live session's name would then write the
+# throwaway pod's coordinates over that session's own meta file
+# (rp_session_save keys off RP_SESSION alone) and, on exit, terminate the
+# throwaway pod under RP_POD_CREATED — leaving the REAL, still-running pod
+# behind with no record pointing at it at all.
 case "$CMD" in
   shell) RP_SESSION="" ;;
   *) export RP_SESSION="$SESSION" ;;

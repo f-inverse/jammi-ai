@@ -100,6 +100,25 @@ RP_S3_CONF="${RP_S3_CONF:-${HOME}/.config/runpod/s3}"
 RP_SSH_CONFIG="${RP_SSH_CONFIG:-${HOME}/.config/runpod/ssh_config}"
 RP_REPO_URL="${RP_REPO_URL:-https://github.com/f-inverse/jammi-ai}"
 
+# A named session becomes a directory under RP_SESSION_ROOT and, in
+# rp_cleanup/rp_session_forget below, the target of an UNCONDITIONAL
+# `rm -rf "$RP_WORK"`. RP_SESSION reaches here from gpu-dev.sh's own SESSION
+# resolution (an arch name, a caller-supplied alias, or an exported
+# environment variable) with no sanitization upstream, so a value containing
+# a path separator or a `..`/`.` segment could point RP_WORK — and therefore
+# that `rm -rf` — OUTSIDE RP_SESSION_ROOT entirely (`RP_SESSION=../../etc`,
+# or an absolute-looking value). Validated here, at the one place RP_WORK is
+# derived from it, as a single path segment: `[A-Za-z0-9_-]+` admits no `/`
+# and no `.` (which also rules out `.`/`..` themselves, since neither
+# character is in the allowed set), so RP_WORK can never resolve outside
+# RP_SESSION_ROOT.
+case "$RP_SESSION" in
+  '') : ;;
+  *[!A-Za-z0-9_-]*)
+    echo "::error::RP_SESSION may contain only [A-Za-z0-9_-] (got '${RP_SESSION}')" >&2
+    exit 2 ;;
+esac
+
 # A named session must outlive the process; an anonymous one must not leak. The
 # session dir is created lazily by the first writer, so read-only commands
 # against a session that does not exist leave nothing behind.
@@ -107,7 +126,20 @@ if [ -n "$RP_SESSION" ]; then
   RP_WORK="${RP_SESSION_ROOT}/${RP_SESSION}"
   RP_WORK_IS_TEMP=0
 else
-  RP_WORK="$(mktemp -d)"
+  # An explicit path TEMPLATE ("$dir/prefix.XXXXXX"), not a bare `mktemp -d`,
+  # so the base directory is resolved the SAME way on every `mktemp`
+  # implementation this tooling runs under: GNU `mktemp -d` (Linux CI) reads
+  # $TMPDIR itself, but BSD `mktemp -d` (macOS, a maintainer's own laptop)
+  # does NOT — it ignores $TMPDIR entirely for a bare `-d` with no template
+  # and always resolves under its own darwin temp root, so a bare call would
+  # behave differently across the two platforms this tooling actually runs
+  # on. Building the base path ourselves from "${TMPDIR:-/tmp}" removes that
+  # divergence, defaults identically to the previous bare call (`/tmp` when
+  # $TMPDIR is unset, which is the common case), and is what makes the
+  # temp-dir-isolation regression test in test_gpu_dev_lifecycle.sh able to
+  # observe which root a throwaway `shell` invocation's RP_WORK actually
+  # resolved under.
+  RP_WORK="$(mktemp -d "${TMPDIR:-/tmp}/jammi-gpu-dev.XXXXXX")"
   RP_WORK_IS_TEMP=1
 fi
 RP_SSH_KEY="$RP_WORK/id_ed25519"
@@ -262,8 +294,19 @@ sys.exit(3)
 # `rp_pod_verify`'s code-3 would need to change together, since they read
 # the account's pod list the same way for the same reason.
 rp_pod_gone() { # $1=podId
-  local id="$1"
-  rp_gql '{"query":"query{ myself{ pods{ id } } }"}' | python3 -c '
+  local id="$1" body
+  # Same capture-then-parse shape as rp_pod_verify's own fix (see its doc): a
+  # direct `rp_gql | python3` pipe would report curl's own exit code under
+  # `set -o pipefail` whenever curl fails, even if the body it still
+  # delivered was complete. This function only has two return codes (0
+  # confirmed-gone, 1 everything else), so a curl failure landing on 1 was
+  # already the correct answer either way — there was no code-3-shaped
+  # collision to alias with, unlike rp_pod_verify. Applied anyway so this
+  # function does not depend on pipefail's own last-failing-command rule to
+  # get the right answer by coincidence, and so both functions read the
+  # account the same way for the same reason.
+  body="$(rp_gql '{"query":"query{ myself{ pods{ id } } }"}')" || return 1
+  printf '%s' "$body" | python3 -c '
 import sys, json
 podid = sys.argv[1]
 try:
@@ -663,7 +706,7 @@ rp_run_remote() {
 # cannot reason about is far more likely to be a leak than healthy work, and the
 # cost of a wrong sweep is one re-run; the cost of a wrong spare is $187.
 rp_sweep() { # $1=optional override age in hours
-  local override="${1:-}" out rc id age why n=0
+  local override="${1:-}" body out rc id age why n=0
   if [ -n "$override" ]; then
     case "$override" in
       ''|*[!0-9]*) echo "::error::reap: hours must be a positive integer (got '${override}')"; return 2 ;;
@@ -697,8 +740,19 @@ rp_sweep() { # $1=optional override age in hours
     # differently-valued input.
     [ "$override" -gt 0 ] || { echo "::error::reap: hours must be > 0"; return 2; }
   fi
-  out="$(rp_gql '{"query":"query{ myself{ pods{ id name desiredStatus createdAt runtime{ uptimeInSeconds } } } }"}' \
-    | python3 -c "
+  # Captured before parsing — the same capture-then-parse shape as
+  # rp_pod_verify's own fix (see its doc): under `set -o pipefail`, a direct
+  # `rp_gql | python3 ...` pipe reports CURL's own exit code whenever curl
+  # fails, even if python still received (and successfully parsed) a
+  # complete body. This function's own "rc -ne 0" check below already
+  # treats every nonzero rc uniformly (return 1, "could not enumerate
+  # pods"), so there was no distinct-code aliasing bug here the way there
+  # was in rp_pod_verify's 0/1/2/3 codes — applied anyway so this function's
+  # correctness does not depend on pipefail's last-failing-command rule
+  # working out by coincidence.
+  body="$(rp_gql '{"query":"query{ myself{ pods{ id name desiredStatus createdAt runtime{ uptimeInSeconds } } } }"}')" \
+    || { echo "::error::sweep could NOT enumerate pods; orphans may exist unseen: RunPod query failed"; return 1; }
+  out="$(printf '%s' "$body" | python3 -c "
 import sys, json, datetime
 override = '''$override'''.strip()
 prefix = '$RP_POD_PREFIX'

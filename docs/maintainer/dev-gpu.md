@@ -72,8 +72,10 @@ real pod (fresh `CARGO_TARGET_DIR` each leg, `cargo build --release -p
 jammi-bench --features cuda`), sccache gave **zero cross-target-dir cache
 reuse** for rustc units — every populate-then-reuse pair against a fresh
 target dir re-missed everything sccache had just written — while adding
-**~+33% wall clock** to every build that ran it (344s wrapper-off vs
-457-473s wrapper-on). The wrapper is now off pod-wide
+**+33% to +38% wall clock** to every build that ran it (344s wrapper-off vs
+457-473s wrapper-on — a single "~+33%" figure previously cited only the
+low end of this range, 344→457s; the high end, 344→473s, is +37.5%). The
+wrapper is now off pod-wide
 (`CARGO_BUILD_RUSTC_WRAPPER=` in `/root/.jammi_env`, every shell sources it).
 
 The cargo **registry** is deliberately not cached either. It looks like the

@@ -635,8 +635,24 @@ jobs:
           # only-shrinks allowlist (ci/doc_number_allowlist.txt, classified
           # real/noise in ci/doc_number_allowlist_classification.md) carries
           # the pre-existing debt on main at the time this gate landed.
+          #
+          # ADVISORY, not required (lead ship decision, round-4): the lexical
+          # heuristic's honest noise rate on main is 36/69 = 52.2% (real:
+          # 33/69 = 47.8%; see ci/doc_number_allowlist_classification.md), so
+          # a REQUIRED scan leg would block an honest in-flight branch on its
+          # own noise (the esc-045 branch alone carries 69 unallowlisted
+          # findings, roughly half of them noise) rather than only on
+          # genuine new violations. The scan leg reports (advisory) until
+          # precision on main reaches >= 80% real.
+          # `continue_on_error: "true"` below (consumed by the shared "Run
+          # guard" step's `continue-on-error` expression) marks ONLY this one
+          # leg soft; `--self-test` and `--check-allowlist-only-shrinks`
+          # stay REQUIRED — the mechanism itself and the allowlist's
+          # only-shrinks invariant are both still fail-closed, only the
+          # noisy scan output is advisory.
           - name: doc numbers have producers
             cmd: python3 ci/scripts/check_doc_numbers_have_producers.py
+            continue_on_error: "true"
           - name: doc numbers have producers self-test
             cmd: python3 ci/scripts/check_doc_numbers_have_producers.py --self-test
           # ci/doc_number_allowlist.txt is only-shrinks, mechanically: fetches
@@ -748,6 +764,11 @@ jobs:
           # so a bare `0` here would make `||` silently discard it.
           fetch-depth: ${{ matrix.fetch_depth || '1' }}
       - name: Run guard
+        # `continue_on_error` is unset ('') for every leg except "doc
+        # numbers have producers" (matrix.continue_on_error: "true" there) —
+        # this expression is false for every other leg, so this stays a
+        # no-op change for the required guards.
+        continue-on-error: ${{ matrix.continue_on_error == 'true' }}
         run: ${{ matrix.cmd }}
 
   # ── Single rolled-up gate ──────────────────────────────────────────────────

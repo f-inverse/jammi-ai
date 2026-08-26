@@ -115,7 +115,10 @@ must be able to re-derive or re-locate it: cite the real producer inline, `see <
 tracked file), or tag it `no-producer: <reason>` when the number is genuinely *derived*, not
 measured (e.g. `2^-7` bf16 ULP). `ci/scripts/check_doc_numbers_have_producers.py` enforces this
 over `crates/jammi-kernels/{src,tests}`, `crates/jammi-encoders/src`, `crates/jammi-lora/src`, and
-`crates/jammi-bench/src`, fail-closed with file:line and the offending number.
+`crates/jammi-bench/src`, fail-closed with file:line and the offending number. The scan leg reports
+(advisory) until precision on main reaches >= 80% real; the self-test and only-shrinks legs are
+required — currently 33/69 = 47.8% real, 36/69 = 52.2% noise (see
+`ci/doc_number_allowlist_classification.md`).
 
 ## 4. Benchmarking
 

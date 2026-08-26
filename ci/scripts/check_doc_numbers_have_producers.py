@@ -117,6 +117,12 @@ legitimate bootstrap (this PR is the one introducing the file) rather than
 conflating it with "the ref didn't resolve" — the message states which
 case fired.
 
+The bare scan (no flags) is ADVISORY in CI (`continue-on-error: true`) and
+reports until this lexical heuristic's precision on main reaches >= 80%
+real — currently 33/69 = 47.8% real (36/69 = 52.2% noise; see
+`ci/doc_number_allowlist_classification.md`) — while `--self-test` and
+`--check-allowlist-only-shrinks` stay REQUIRED.
+
 Run: `python3 ci/scripts/check_doc_numbers_have_producers.py`
 Self-test: `python3 ci/scripts/check_doc_numbers_have_producers.py --self-test`
 Allowlist-only-shrinks leg (network: fetches `origin/main`):
@@ -157,8 +163,8 @@ ADJACENT_WORD_ALTS = [
     r"ceiling",
     r"bit-match\w*",
     r"diverg\w*",
-    r"measured",
-    r"observed",
+    r"measure[sd]",  # "measured" (past) or "measures" (present) — round-5 ship fix
+    r"observe[sd]",  # "observed" (past) or "observes" (present) — same fix
     r"differ(?:s|ed)?",
     r"disagree\w*",
     r"values",
@@ -1007,6 +1013,13 @@ fn below() {}
 // line.
 // no-producer: this reasoning applies to a DIFFERENT number, not this one.
 """,
+        "probe 9: present-tense 'measures'/'observes' trigger (round-5 ship "
+        "fix — the exact geglu_oracles.rs:218 gap: a narrower block no "
+        "longer reaches a DIFFERENT paragraph's past-tense 'measured' by "
+        "accident, so the present-tense form must be its own trigger)": """
+// the residual relative requirement, maximized over every element in the
+// sweep, measures 1.06% and observes no case above it, uncited.
+""",
     }
     for name, text in probes.items():
         flagged(name, text)
@@ -1025,7 +1038,8 @@ fn below() {}
         "binding covers a same-block citation and refuses a different block's; "
         "no-producer: stays line-scoped; every shape exclusion (M>=64, decimal/chain/"
         "exponent/n=/version) holds without over-firing; the definitional-= and "
-        "[`CONST`]-link exclusions are gone; all eight reworded probes caught."
+        "[`CONST`]-link exclusions are gone; all nine reworded probes caught "
+        "(including present-tense measures/observes)."
     )
     return 0
 

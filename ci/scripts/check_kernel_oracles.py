@@ -344,31 +344,162 @@ def parse_markers(text: str, file_label: str) -> list[OracleCellMarker]:
 
 
 # --------------------------------------------------------------------------- #
-# comment/string laundering (round-2 audit item 1) — every KO-7/KO-2 scan
-# below runs over this function's OUTPUT, never raw source. Extends the
-# line-comment-only stripping convention `check_doc_parity.py`'s
-# `_strip_rust_comments` already established (and `check_gpu_parity_matrix.py`
-# independently copies, per this repo's "no cross-script import" gate
-# convention) with block comments and string-literal CONTENTS, since a
-# helper name mentioned only in prose, or a `panic!`/`JAMMI_REQUIRE_*` token
-# sitting only inside an assertion MESSAGE string, must never be mistaken for
-# real control flow. Output is the SAME LENGTH as the input (every stripped
-# character becomes a space, newlines kept as newlines) so every downstream
-# offset/line-number computation is unaffected.
-#
-# `strip_strings=False` keeps string CONTENTS intact while still consuming
-# comments (and skipping over a string body so a `//`/`/*` sequence INSIDE a
-# string literal is never mistaken for the start of a real comment) — needed
-# by helper REGISTRATION (`find_require_gate_helpers`), which must read the
-# literal `"JAMMI_REQUIRE_..."` argument text as DATA, not blank it; blanking
-# it would make helper registration structurally impossible; the comment-only
-# leg still satisfies this round's own test ("a helper whose panic!(/
-# JAMMI_REQUIRE_* occur only in COMMENTS is not registered").
+# ONE canonical stripper (round-3 audit fix — "change the approach, not just
+# the cases"): every downstream pass (fn discovery, fn-body brace counting,
+# KO-7, KO-2) reads ONLY this function's output, applied ONCE per file.
+# Handles, all by depth/state tracking rather than a naive quote-toggle:
+#   - `//` line comments
+#   - `/* ... */` block comments, NESTED (a `/* /* */ */` doesn't end at the
+#     first `*/`)
+#   - string literals `"..."`, byte strings `b"..."`, raw strings
+#     `r"..."`/`r#"..."#`/..., raw byte strings `br"..."`/`br#"..."#`/...
+#   - char literals `'x'`, `'\''`, `'"'`, `'\\'`, `'\u{...}'`, byte-char
+#     literals `b'x'` — WITHOUT this, `'"'` (a char literal whose content
+#     is a literal double-quote) is indistinguishable from the START of a
+#     new string to a naive scanner, which silently desyncs quote-tracking
+#     for the REST of the file (the live instance this round's audit found:
+#     `feature_table.rs:45`'s `.trim_matches('"')` blinded everything after
+#     it — the gate printed `0 runtime skip(s), 0 ungated` for a file that
+#     actually has real, ungated skips). A bare `'a` LIFETIME is left alone
+#     (not consumed as an unterminated char literal): only `'<escape-or-one-
+#     char>'` shapes are recognized as char literals at all.
+#   - a `JAMMI_REQUIRE_[A-Z0-9_]*` run INSIDE a string literal's content is
+#     the ONE exception kept VISIBLE (not blanked) — this is DATA the
+#     registration mechanism must read (the env-var name IS the string
+#     argument), not prose; every other character of every string's content
+#     is still blanked, so an assertion MESSAGE or doc string cannot launder
+#     a `panic!`/helper-name mention. This is why ONE stripper, used
+#     everywhere, is enough — no second "comments-only" variant is needed
+#     anymore.
+# Output is the SAME LENGTH as the input (every stripped character becomes a
+# space, newlines kept as newlines) so every downstream offset/line-number
+# computation is unaffected.
 # --------------------------------------------------------------------------- #
-_RAW_STRING_OPEN_RE = re.compile(r'r(#*)"')
+_RAW_STR_OPEN_RE = re.compile(r'b?r(#*)"')
+_JAMMI_REQUIRE_RUN_RE = re.compile(r"JAMMI_REQUIRE_[A-Z0-9_]*")
 
 
-def _strip_comments_and_strings(source: str, strip_strings: bool = True) -> str:
+def _blank_string_content(content: str) -> str:
+    """Blanks `content` (a string literal's interior) EXCEPT any
+    `JAMMI_REQUIRE_[A-Z0-9_]*` run, which survives verbatim — see the
+    module comment above. Length-preserving.
+    """
+    out: list[str] = []
+    pos = 0
+    for m in _JAMMI_REQUIRE_RUN_RE.finditer(content):
+        out.append("".join("\n" if c == "\n" else " " for c in content[pos : m.start()]))
+        out.append(m.group(0))
+        pos = m.end()
+    out.append("".join("\n" if c == "\n" else " " for c in content[pos:]))
+    return "".join(out)
+
+
+def _strip_rust(source: str) -> str:
+    out: list[str] = []
+    i, n = 0, len(source)
+    while i < n:
+        two = source[i : i + 2]
+
+        if two == "//":
+            while i < n and source[i] != "\n":
+                out.append(" ")
+                i += 1
+            continue
+
+        if two == "/*":
+            depth = 1
+            out.append("  ")
+            i += 2
+            while i < n and depth > 0:
+                if source[i : i + 2] == "/*":
+                    depth += 1
+                    out.append("  ")
+                    i += 2
+                    continue
+                if source[i : i + 2] == "*/":
+                    depth -= 1
+                    out.append("  ")
+                    i += 2
+                    continue
+                out.append("\n" if source[i] == "\n" else " ")
+                i += 1
+            continue
+
+        m = _RAW_STR_OPEN_RE.match(source, i)
+        if m:
+            hashes = m.group(1)
+            opener = m.group(0)
+            out.append(opener)  # delimiter chars (b/r/#/") kept VERBATIM
+            i = m.end()
+            closer = '"' + hashes
+            end = source.find(closer, i)
+            if end == -1:
+                end = n
+            out.append(_blank_string_content(source[i:end]))
+            i = end
+            if i < n:
+                out.append(closer)
+                i += len(closer)
+            continue
+
+        if two == 'b"' or source[i] == '"':
+            prefix_len = 2 if two == 'b"' else 1
+            out.append(source[i : i + prefix_len])  # b/" delimiter kept VERBATIM
+            i += prefix_len
+            content_start = i
+            while i < n and source[i] != '"':
+                if source[i] == "\\" and i + 1 < n:
+                    i += 2
+                    continue
+                i += 1
+            out.append(_blank_string_content(source[content_start:i]))
+            if i < n:
+                out.append('"')  # closing quote kept VERBATIM
+                i += 1
+            continue
+
+        # char / byte-char literal, OR a lifetime (`'a`, `'static`) — only a
+        # genuine `'<escaped-or-one-char>'` shape is consumed as a literal;
+        # anything else (a lifetime) leaves just the quote character alone.
+        if source[i] == "'" or two == "b'":
+            prefix_len = 2 if two == "b'" else 1
+            start = i
+            j = i + prefix_len
+            consumed_to = None
+            if j < n and source[j] == "\\":
+                k = j + 1
+                if k < n and source[k] == "u" and k + 1 < n and source[k + 1] == "{":
+                    k += 2
+                    while k < n and source[k] != "}":
+                        k += 1
+                    if k < n:
+                        k += 1
+                else:
+                    k += 1
+                if k < n and source[k] == "'":
+                    consumed_to = k + 1
+            elif j < n and source[j : j + 1] != "'" and source[j + 1 : j + 2] == "'":
+                consumed_to = j + 2
+            if consumed_to is not None:
+                out.append(" " * (consumed_to - start))
+                i = consumed_to
+                continue
+            out.append(source[i])
+            i += 1
+            continue
+
+        out.append(source[i])
+        i += 1
+    return "".join(out)
+
+
+def _strip_comments_only_independent(source: str) -> str:
+    """Comments-only (nested `/* */` + `//`), strings/chars left INTACT — a
+    deliberately SEPARATE, simpler implementation (no string/char state at
+    all) from `_strip_rust`, used ONLY by the desync check below so a bug
+    specific to `_strip_rust`'s string/char tracking cannot also be present
+    in its cross-reference.
+    """
     out: list[str] = []
     i, n = 0, len(source)
     while i < n:
@@ -379,47 +510,21 @@ def _strip_comments_and_strings(source: str, strip_strings: bool = True) -> str:
                 i += 1
             continue
         if two == "/*":
+            depth = 1
             out.append("  ")
             i += 2
-            while i < n and source[i : i + 2] != "*/":
-                out.append("\n" if source[i] == "\n" else " ")
-                i += 1
-            if i < n:
-                out.append("  ")
-                i += 2
-            continue
-        m = _RAW_STRING_OPEN_RE.match(source, i)
-        if m:
-            hashes = m.group(1)
-            opener = m.group(0)
-            out.append(opener if not strip_strings else " " * len(opener))
-            i = m.end()
-            closer = '"' + hashes
-            end = source.find(closer, i)
-            if end == -1:
-                end = n
-            body = source[i:end]
-            out.append(body if not strip_strings else "".join("\n" if c == "\n" else " " for c in body))
-            i = end
-            if i < n:
-                out.append(closer)
-                i += len(closer)
-            continue
-        if source[i] == '"':
-            out.append('"' if not strip_strings else " ")
-            i += 1
-            while i < n and source[i] != '"':
-                if source[i] == "\\" and i + 1 < n:
-                    out.append(source[i : i + 2] if not strip_strings else "  ")
+            while i < n and depth > 0:
+                if source[i : i + 2] == "/*":
+                    depth += 1
+                    out.append("  ")
                     i += 2
                     continue
-                if strip_strings:
-                    out.append("\n" if source[i] == "\n" else " ")
-                else:
-                    out.append(source[i])
-                i += 1
-            if i < n:
-                out.append('"' if not strip_strings else " ")
+                if source[i : i + 2] == "*/":
+                    depth -= 1
+                    out.append("  ")
+                    i += 2
+                    continue
+                out.append("\n" if source[i] == "\n" else " ")
                 i += 1
             continue
         out.append(source[i])
@@ -427,51 +532,56 @@ def _strip_comments_and_strings(source: str, strip_strings: bool = True) -> str:
     return "".join(out)
 
 
-def _strip_comments_only(source: str) -> str:
-    """`_strip_comments_and_strings` with string CONTENTS preserved — the
-    registration-mechanism variant (see the module-level comment above).
-    """
-    return _strip_comments_and_strings(source, strip_strings=False)
-
-
-# --------------------------------------------------------------------------- #
-# brace-balanced fn-body extraction — shared by KO-2's control-fn lookup and
-# KO-7's #[test]-fn / require-gate-helper scan.
-# --------------------------------------------------------------------------- #
 FN_HEAD_RE = re.compile(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)\s*[(<]")
 _ATTR_LINE_RE = re.compile(r"^\s*#!?\[")
 
 
-def _extract_fn_body(source: str, fn_kw_start: int) -> tuple[str, int, int]:
-    """Returns (body_text_including_braces, brace_open_idx, brace_close_idx).
-    Operates on RAW source (not stripped) so the `{`/`}` count is never
-    thrown off by a stray brace character the stripper already neutralizes
-    to a space — a space can never be mistaken for a real brace either way,
-    so this is safe over either input; kept on raw source to keep
-    `body_start_idx` meaningful for both `fn.body` (raw, used for
-    `_extract_fn_body`-style nested lookups) and `fn.body_stripped`.
+def check_fn_desync(source: str, file_label: str) -> None:
+    """Fail-closed tripwire (round-3 audit): the count of `fn ` keyword
+    matches in the FULL stripper's output must equal the count in the
+    independent comments-only stripper's output. These legitimately
+    disagree only if a string/char literal contains a `fn <name>(`-shaped
+    substring (rare — `_strip_rust` blanks it, `_strip_comments_only_
+    independent` does not, since it never touches strings at all) — in
+    that case a human must look, same as any other uncomputable input this
+    module raises `OracleError` for; this is also the tripwire that would
+    have caught the feature_table.rs desync BEFORE it silently produced
+    `0 runtime skip(s), 0 ungated` for a file with real skips.
     """
-    brace_start = source.find("{", fn_kw_start)
-    if brace_start == -1:
-        return "", -1, -1
+    full = len(FN_HEAD_RE.findall(_strip_rust(source)))
+    comments_only = len(FN_HEAD_RE.findall(_strip_comments_only_independent(source)))
+    if full != comments_only:
+        raise OracleError(
+            f"{file_label}: fn-keyword desync — {full} `fn` keyword(s) visible in the "
+            f"fully-stripped text vs {comments_only} in the comments-only-stripped text. "
+            "Either a string/char literal in this file contains a fn-shaped substring "
+            "(needs manual review) or the stripper has a state-tracking bug — this fails "
+            "closed rather than silently trusting either count."
+        )
+
+
+def _extract_balanced_block(text: str, open_brace_idx: int) -> tuple[str, int, int]:
+    """Returns (block_text_including_braces, open_idx, close_idx) — brace-
+    balanced from `open_brace_idx` (which MUST point at a `{`). Generic:
+    used for both fn bodies and `if`-block bodies.
+    """
     depth = 0
-    for i in range(brace_start, len(source)):
-        if source[i] == "{":
+    for i in range(open_brace_idx, len(text)):
+        if text[i] == "{":
             depth += 1
-        elif source[i] == "}":
+        elif text[i] == "}":
             depth -= 1
             if depth == 0:
-                return source[brace_start : i + 1], brace_start, i
-    return source[brace_start:], brace_start, len(source) - 1
+                return text[open_brace_idx : i + 1], open_brace_idx, i
+    return text[open_brace_idx:], open_brace_idx, len(text) - 1
 
 
 @dataclass(frozen=True)
 class FnRecord:
     name: str
     file: str
-    body: str  # raw (comments/strings intact)
-    body_stripped: str  # SAME LENGTH as `body`; comments AND strings blanked
-    body_comments_stripped: str  # SAME LENGTH; comments blanked, strings intact
+    body: str  # RAW slice (same offsets as body_stripped; comments/strings intact)
+    body_stripped: str  # the ONE canonical stripped body (same length as `body`)
     body_start_idx: int  # offset of the fn's own `{` within `source`
     is_test: bool
 
@@ -486,42 +596,25 @@ def _has_test_attr(lines: list[str], fn_line_idx: int) -> bool:
 
 
 def find_fns(source: str, file_label: str) -> list[FnRecord]:
-    """Every `fn <name>(...) { ... }` in `source`, brace-balanced, tagged
-    with whether its contiguous attribute block above the `fn` line contains
-    any attribute whose text mentions "test" (covers `#[test]`,
-    `#[tokio::test]`, ... — same convention as `check_doc_numbers_have_
-    producers.py`'s `build_test_fn_index`). `FN_HEAD_RE` matches "fn
-    <name>(" as a contiguous token regardless of how many lines the REST of
-    the signature spans before the body's opening `{` — multi-line
-    signatures are already handled here (this is the fn-boundary detector;
-    the multi-line-signature GAP the round-2 audit found is specific to
-    `check_doc_numbers_have_producers.py`'s single-line `FN_SIG_RE`, a
-    different, name-keyed heuristic that file no longer uses for this
-    reason — see that file's own module doc).
-
-    `FN_HEAD_RE` is matched against the COMMENT/STRING-STRIPPED source
-    (round-2 audit fix, folded into this same item-1 pass): a `fn foo(...)
-    { ... }` signature merely QUOTED in a `//` comment or a string literal
-    (e.g. `// fn fake_helper() { std::env::var_os(...); panic!(...); }`)
-    must never be discovered as a real function — the STRIPPED source's `fn`
-    keyword is blanked to spaces there, so `\bfn\b` cannot match it at all.
-    `_strip_comments_and_strings` is LENGTH-PRESERVING, so every match
-    position found in the stripped text is a valid position in the RAW
-    `source` too — the actual fn body is still extracted from RAW `source`
-    (via `_extract_fn_body`) so its own internal comments/strings survive
-    for `body`/`body_stripped`/`body_comments_stripped` to be computed from.
+    """Every `fn <name>(...) { ... }` in `source`. `check_fn_desync` runs
+    FIRST (fail-closed, once per file). Both fn-BOUNDARY detection
+    (`FN_HEAD_RE`) and fn-BODY brace counting now run entirely on the ONE
+    stripped text (round-3 audit item 2 — a `}` character sitting merely
+    inside a string literal, e.g. `println!("brace }} }} literal")`, can no
+    longer truncate a fn body early, which previously swallowed every
+    subsequent fn in the file into one bogus mega-body). `body`/`body_
+    stripped` are sliced from the SAME [start, end) range out of `source`
+    and the stripped text respectively — valid because stripping is
+    length-preserving.
     """
-    stripped_full = _strip_comments_and_strings(source)
+    check_fn_desync(source, file_label)
+    stripped_full = _strip_rust(source)
     lines = source.splitlines(keepends=True)
-    # Precompute the character offset each line starts at, so a regex match
-    # position in `source` maps back to a line index.
     offsets = [0]
     for line in lines:
         offsets.append(offsets[-1] + len(line))
 
     def line_idx_of(pos: int) -> int:
-        # binary-search-free linear scan is fine at this file size; kept
-        # simple over premature optimisation.
         lo, hi = 0, len(offsets) - 1
         while lo < hi:
             mid = (lo + hi + 1) // 2
@@ -537,16 +630,17 @@ def find_fns(source: str, file_label: str) -> list[FnRecord]:
         name = m.group(1)
         fn_line_idx = line_idx_of(m.start())
         is_test = _has_test_attr(plain_lines, fn_line_idx)
-        body, body_start, _ = _extract_fn_body(source, m.end())
-        if not body:
+        brace_start = stripped_full.find("{", m.end())
+        if brace_start == -1:
             continue
+        body_stripped, body_start, body_end = _extract_balanced_block(stripped_full, brace_start)
+        body_raw = source[body_start : body_end + 1]
         records.append(
             FnRecord(
                 name=name,
                 file=file_label,
-                body=body,
-                body_stripped=_strip_comments_and_strings(body),
-                body_comments_stripped=_strip_comments_only(body),
+                body=body_raw,
+                body_stripped=body_stripped,
                 body_start_idx=body_start,
                 is_test=is_test,
             )
@@ -557,43 +651,43 @@ def find_fns(source: str, file_label: str) -> list[FnRecord]:
 # --------------------------------------------------------------------------- #
 # KO-7 — unrun-is-RED
 # --------------------------------------------------------------------------- #
-ENV_READ_RE = re.compile(
-    r'\b(?:std::env::var_os|env::var_os|std::env::var|env::var|option_env!)\s*\(\s*"(JAMMI_REQUIRE_[A-Z0-9_]*)"'
+# Round-3 audit item 6: registration requires the panic to be on the ENV
+# READ'S OWN CONTROL PATH — only an `if <cond containing the env-read> {
+# ... panic!/unreachable!/.expect( ... }` shape registers, checked entirely
+# on the ONE stripped text (the env-var literal survives stripping — see
+# `_blank_string_content`'s `JAMMI_REQUIRE_` exception above). This closes
+# the class where an env-read result is DISCARDED (`let _ = option_env!
+# (...)`, never read at all) or read but not on any panic's own path (`if
+# ... { eprintln!(...); }` followed by an UNRELATED `.expect(` elsewhere in
+# the fn) — neither shape is a real require-gate.
+IF_ENV_READ_RE = re.compile(
+    r"\bif\b[^{]*?\b(?:std::env::var_os|env::var_os|std::env::var|env::var|option_env!)"
+    r'\s*\(\s*"(JAMMI_REQUIRE_[A-Z0-9_]*)"[^{]*\{'
 )
 PANIC_REACHABLE_RE = re.compile(r"\b(?:panic!|unreachable!)\s*\(|\.expect\s*\(")
-# `return;` / brace-tail `return}`, plus (round-2 audit item 6) `return
-# Ok(...)`/`return Err(...)` — a #[test] fn returning `Result<(), E>` that
-# early-exits via either shape is just as much a silent skip as a bare
-# `return;`. Only the START of the statement is matched (sufficient for
-# textual ordering/windowing below); the rest of a multi-token `Ok(...)`
-# expression is not consumed.
+# `return;` / brace-tail `return}`, plus `return Ok(...)`/`return Err(...)`
+# — a #[test] fn returning `Result<(), E>` that early-exits via either
+# shape is just as much a silent skip as a bare `return;`. Only the START
+# of the statement is matched (sufficient for textual ordering/windowing
+# below); the rest of a multi-token `Ok(...)` expression is not consumed.
 RETURN_SKIP_RE = re.compile(r"\breturn\b\s*(?:;|\}|Ok\s*\(|Err\s*\()")
 
 
 def find_require_gate_helpers(all_fns: list[FnRecord]) -> set[str]:
-    """A fn is a REGISTERED require-gate helper iff its COMMENTS-stripped
-    body (comments blanked, string CONTENTS intact — see
-    `_strip_comments_only`'s doc for why the env-var argument string must
-    stay readable) contains BOTH a real env-read call (`std::env::var(`/
-    `env::var(`/`std::env::var_os(`/`env::var_os(`/`option_env!(`) whose
-    string-literal argument starts with `JAMMI_REQUIRE_`, AND a reachable
-    `panic!(`/`unreachable!(`/`.expect(` — discovered by shape, never a
-    hardcoded name list (see module doc). The env-read half is checked
-    against `body_comments_stripped` (comments blanked, string CONTENTS
-    intact — the env-var name IS the string argument, so it cannot be
-    blanked). The panic-reachability half is checked against `body_stripped`
-    (comments AND strings both blanked) instead — that check never needs
-    string content, so this additionally guards against a `panic!(`/
-    `.expect(`-shaped SUBSTRING sitting merely inside an unrelated string
-    literal (e.g. a message describing the mechanism in prose) being
-    mistaken for a real, reachable panic call. A helper name/env-read/panic
-    mentioned only inside a COMMENT is blanked in both variants and
-    correctly does not register.
+    """A fn is a REGISTERED require-gate helper iff its stripped body
+    contains an `if <env-read-of-JAMMI_REQUIRE_...> { ... }` shape whose
+    OWN block body (brace-balanced, extracted from that SAME `if`'s `{`)
+    contains a reachable `panic!(`/`unreachable!(`/`.expect(` — discovered
+    by shape, never a hardcoded name list (see module doc).
     """
     helpers: set[str] = set()
     for fn in all_fns:
-        if ENV_READ_RE.search(fn.body_comments_stripped) and PANIC_REACHABLE_RE.search(fn.body_stripped):
-            helpers.add(fn.name)
+        for m in IF_ENV_READ_RE.finditer(fn.body_stripped):
+            brace_idx = m.end() - 1
+            if_block, _, _ = _extract_balanced_block(fn.body_stripped, brace_idx)
+            if PANIC_REACHABLE_RE.search(if_block):
+                helpers.add(fn.name)
+                break
     return helpers
 
 
@@ -607,13 +701,12 @@ class UngatedSkip:
 def check_ko7(all_fns: list[FnRecord], helper_names: set[str], source_texts: dict[str, str]) -> list[UngatedSkip]:
     """Every `return;`/`return}`/`return Ok(`/`return Err(` inside every
     `#[test]` fn's STRIPPED body must be textually dominated by a call to a
-    name in `helper_names` — PER SKIP (round-2 audit item 6): the dominance
-    window for a given `return` is `[end of the PREVIOUS skip (or fn
-    start), this skip's start)`, so an early helper call gates only the
-    skip(s) immediately downstream of it, never every later skip in the
-    same fn unconditionally — a gated CUDA-device check followed by an
-    UNRELATED, ungated `if !FLASH_COMPILED { return; }` further down the
-    same fn still reds.
+    name in `helper_names` — PER SKIP: the dominance window for a given
+    `return` is `[end of the PREVIOUS skip (or fn start), this skip's
+    start)`, so an early helper call gates only the skip(s) immediately
+    downstream of it, never every later skip in the same fn unconditionally
+    — a gated CUDA-device check followed by an UNRELATED, ungated
+    `if !FLASH_COMPILED { return; }` further down the same fn still reds.
     """
     helper_call_res = {name: re.compile(rf"\b{re.escape(name)}\s*\(") for name in helper_names}
     findings: list[UngatedSkip] = []
@@ -640,7 +733,7 @@ def check_ko7(all_fns: list[FnRecord], helper_names: set[str], source_texts: dic
 
 
 # --------------------------------------------------------------------------- #
-# KO-2 — bound coverage parity (marker-scoped, round-2 audit item 4)
+# KO-2 — bound coverage parity (marker-scoped)
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class Ko2Finding:
@@ -652,7 +745,13 @@ class Ko2Finding:
 ASSERT_MACRO_RE = re.compile(
     r"\b(?:assert|assert_eq|assert_ne|debug_assert|debug_assert_eq|debug_assert_ne)!\s*\("
 )
-_COMPARISON_OP_RE_KO2 = re.compile(r"<=|>=|<|>")
+# Round-3 audit item 7: a bare `<`/`>` in Rust is FAR more often a generic
+# bracket (`Vec<f32>`, `foo::<f32>(...)`) than a comparison — those never
+# carry surrounding whitespace, while a real comparison (this repo's own
+# rustfmt convention) does. `<=`/`>=`/`==` are unambiguous either way (no
+# valid generic-bracket shape produces them), so only the bare-`<`/`>` forms
+# require the space padding.
+_COMPARISON_OP_RE_KO2 = re.compile(r"<=|>=|==| < | > ")
 
 
 def _extract_paren_balanced(text: str, open_paren_idx: int) -> str:
@@ -669,10 +768,13 @@ def _extract_paren_balanced(text: str, open_paren_idx: int) -> str:
 
 def _bound_in_assertion_context(body_stripped: str, bound_name: str) -> bool:
     """`bound_name` (an identifier) appears EITHER inside an assert!-family
-    macro call's argument list, OR on a statement (split on `;`/`{`/`}`)
-    that ALSO carries a comparison operator — never a bare declaration or
-    passing mention (a comment or a string, both already stripped upstream,
-    cannot satisfy this either).
+    macro call's argument list, OR DIRECTLY ADJACENT to a comparison
+    operator (immediately before or after it, only whitespace in between) —
+    round-3 audit fix: "same statement chunk contains both, anywhere" was
+    too permissive (`let f = compute(TOL) as u32 > 0;` — TOL feeds a value
+    that is later compared, but TOL itself is never an operand of that
+    comparison — must MISS); direct adjacency requires TOL to be one of the
+    comparison's own two sides.
     """
     name_re = re.compile(rf"\b{re.escape(bound_name)}\b")
 
@@ -681,9 +783,10 @@ def _bound_in_assertion_context(body_stripped: str, bound_name: str) -> bool:
         if name_re.search(args):
             return True
 
-    for stmt in re.split(r"[;{}]", body_stripped):
-        if name_re.search(stmt) and _COMPARISON_OP_RE_KO2.search(stmt):
-            return True
+    name_before_op_re = re.compile(rf"\b{re.escape(bound_name)}\b\s*(?:<=|>=|==| < | > )")
+    op_before_name_re = re.compile(rf"(?:<=|>=|==| < | > )\s*{re.escape(bound_name)}\b")
+    if name_before_op_re.search(body_stripped) or op_before_name_re.search(body_stripped):
+        return True
 
     return False
 

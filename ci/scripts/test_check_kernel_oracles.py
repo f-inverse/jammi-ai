@@ -901,5 +901,188 @@ class TestKo5SeedNormalization(unittest.TestCase):
         self.assertEqual(ko.check_ko5([m]), [m])
 
 
+# --------------------------------------------------------------------------- #
+# round-3 (scoped re-audit of 8041c09) fixes — the ONE-stripper redesign
+# --------------------------------------------------------------------------- #
+HELPER_SRC = (
+    'fn cuda_device() -> Option<u32> { if std::env::var("JAMMI_REQUIRE_CUDA")'
+    '.is_ok() { panic!("x"); } None }\n'
+)
+
+
+class TestStripperCharAndNestedComments(unittest.TestCase):
+    """The live instance: a char literal containing a double quote
+    (`feature_table.rs:45`'s `.trim_matches('"')`) must not desync the
+    stripper's quote-tracking for the rest of the file.
+    """
+
+    def test_char_literal_containing_a_double_quote_does_not_desync(self) -> None:
+        src = HELPER_SRC + """
+#[test]
+fn t() {
+    let q = '"';
+    if q == 'x' { return; }
+    assert!(false);
+}
+"""
+        # must not raise, and must find the ungated skip past the char literal.
+        fns = ko.find_fns(src, "f.rs")
+        helpers = ko.find_require_gate_helpers(fns)
+        findings = ko.check_ko7(fns, helpers, {"f.rs": src})
+        self.assertEqual(len(findings), 1)
+
+    def test_char_literal_with_escaped_quote_and_backslash_do_not_desync(self) -> None:
+        src = """
+fn t() {
+    let a = '\\'';
+    let b = '\\\\';
+    let c = 'x';
+    assert!(a != b && b != c);
+}
+"""
+        # must not raise the desync tripwire.
+        ko.check_fn_desync(src, "f.rs")
+
+    def test_lifetime_is_left_alone_not_consumed_as_a_char_literal(self) -> None:
+        src = """
+fn t<'a>(x: &'a str) -> &'a str {
+    x
+}
+"""
+        ko.check_fn_desync(src, "f.rs")
+        fns = ko.find_fns(src, "f.rs")
+        self.assertEqual([f.name for f in fns], ["t"])
+
+    def test_nested_block_comment_hides_a_fake_helper_and_fn(self) -> None:
+        src = """
+/* outer /* inner */
+fn fake_gate() -> Option<u32> { if std::env::var("JAMMI_REQUIRE_CUDA").is_ok() { panic!("x"); } None }
+*/
+#[test]
+fn t() { let Some(d) = fake_gate() else { return; }; assert!(d>0); }
+"""
+        fns = ko.find_fns(src, "f.rs")
+        self.assertEqual([f.name for f in fns], ["t"])
+        helpers = ko.find_require_gate_helpers(fns)
+        self.assertEqual(helpers, set())
+        findings = ko.check_ko7(fns, helpers, {"f.rs": src})
+        self.assertEqual(len(findings), 1)
+
+
+class TestFnBodyBraceCountingOnStrippedText(unittest.TestCase):
+    def test_unbalanced_braces_inside_a_string_do_not_truncate_the_fn_body(self) -> None:
+        src = HELPER_SRC + """
+#[test]
+fn t() {
+    println!("brace }} }} literal");
+    if 1 > 0 { return; }
+    assert!(false);
+}
+fn tail() { }
+"""
+        fns = ko.find_fns(src, "f.rs")
+        names = [f.name for f in fns]
+        self.assertIn("t", names)
+        self.assertIn("tail", names)
+        t_fn = [f for f in fns if f.name == "t"][0]
+        self.assertIn("assert!(false)", t_fn.body)
+        helpers = ko.find_require_gate_helpers(fns)
+        findings = ko.check_ko7(fns, helpers, {"f.rs": src})
+        self.assertEqual(len(findings), 1)
+
+
+class TestFnKeywordDesyncCheck(unittest.TestCase):
+    def test_clean_file_does_not_raise(self) -> None:
+        ko.check_fn_desync(HELPER_SRC + "#[test]\nfn t() { assert!(true); }\n", "f.rs")
+
+    def test_fn_shaped_text_inside_a_raw_string_raises(self) -> None:
+        src = (
+            'const SRC: &str = r#"fn rawgate() -> Option<u32> '
+            '{ if std::env::var("JAMMI_REQUIRE_CUDA").is_ok() { panic!("x"); } None }"#;\n'
+            "#[test]\n"
+            "fn t() { let Some(d) = rawgate() else { return; }; assert!(d>0); }\n"
+        )
+        with self.assertRaises(ko.OracleError):
+            ko.check_fn_desync(src, "f.rs")
+
+    def test_fn_shaped_text_inside_a_plain_string_raises(self) -> None:
+        src = 'fn t() { let s = "fn phantom() {}"; assert!(s.len() > 0); }\n'
+        with self.assertRaises(ko.OracleError):
+            ko.check_fn_desync(src, "f.rs")
+
+
+class TestHelperRegistrationIfShape(unittest.TestCase):
+    """Registration requires the panic to be on the ENV READ'S OWN CONTROL
+    PATH: an `if <env-read> { ... panic!/.expect(/unreachable! ... }` shape.
+    """
+
+    def test_discarded_option_env_result_with_unrelated_expect_does_not_register(self) -> None:
+        src = """
+fn launder() -> Option<u32> {
+    let _ = option_env!("JAMMI_REQUIRE_CUDA");
+    let d = make().expect("device");
+    Some(d)
+}
+"""
+        fns = ko.find_fns(src, "f.rs")
+        self.assertEqual(ko.find_require_gate_helpers(fns), set())
+
+    def test_env_read_gates_an_unrelated_eprintln_not_a_panic_does_not_register(self) -> None:
+        src = """
+fn launder2() -> Option<u32> {
+    if std::env::var("JAMMI_REQUIRE_CUDA").is_ok() { eprintln!("noted"); }
+    let d = make().expect("device");
+    Some(d)
+}
+"""
+        fns = ko.find_fns(src, "f.rs")
+        self.assertEqual(ko.find_require_gate_helpers(fns), set())
+
+    def test_real_if_env_read_panic_shape_registers(self) -> None:
+        fns = ko.find_fns(HELPER_SRC, "f.rs")
+        self.assertEqual(ko.find_require_gate_helpers(fns), {"cuda_device"})
+
+    def test_expect_inside_the_if_block_also_registers(self) -> None:
+        src = """
+fn helper() -> Option<u32> {
+    if std::env::var("JAMMI_REQUIRE_CUDA").is_ok() {
+        let d = make().expect("no device");
+        return Some(d);
+    }
+    None
+}
+"""
+        fns = ko.find_fns(src, "f.rs")
+        self.assertEqual(ko.find_require_gate_helpers(fns), {"helper"})
+
+
+class TestKo2GenericExclusionDirectAdjacency(unittest.TestCase):
+    def _covered(self, ctl_body: str, bounds: str = "TOL") -> bool:
+        src = (
+            f"//! oracle-cell: op=rope_fused leg=l dtype=f32 bounds={bounds} "
+            f"control=ctl derived-on=1 asserted-on=2\n{ctl_body}"
+        )
+        fns = ko.find_fns(src, "f.rs")
+        markers = ko.parse_markers(src, "f.rs")
+        return ko.check_ko2(markers, fns) == []
+
+    def test_direct_comparison_covers(self) -> None:
+        self.assertTrue(self._covered('fn ctl() { if x.max(y) < TOL { panic!("bad"); } }'))
+
+    def test_bare_declaration_misses(self) -> None:
+        self.assertFalse(self._covered("fn ctl() { let x = TOL; use_it(x); }"))
+
+    def test_turbofish_generic_mention_misses(self) -> None:
+        self.assertFalse(self._covered("fn ctl() { let v = foo::<f32>(TOL); consume(v); }"))
+
+    def test_type_ascription_generic_misses(self) -> None:
+        self.assertFalse(self._covered("fn ctl() { let v: Vec<f32> = vec![TOL]; consume(v); }"))
+
+    def test_bound_feeding_an_unrelated_later_comparison_misses(self) -> None:
+        # TOL is an ARGUMENT to compute(), not itself an operand of the `>`
+        # comparison — must not count as coverage.
+        self.assertFalse(self._covered("fn ctl() { let f = compute(TOL) as u32 > 0; }"))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -497,7 +497,7 @@ def find_number_hits(line: str) -> list[NumberHit]:
     return hits
 
 
-# --- KO-4: floor terms (round-6, kernel-acceptance-oracle standard) -----
+# --- KO-4: floor terms (kernel-acceptance-oracle standard) -----------------
 #
 # A FLOOR is a literal numeric constant added to a bound to keep a
 # discriminating assertion from charging a near-zero-magnitude element the
@@ -508,15 +508,30 @@ def find_number_hits(line: str) -> list[NumberHit]:
 #       insensitive — covers `_FLOOR`, `_ABS_FLOOR` (both END in `_floor`),
 #       and the lowercase `abs_floor` local-variable idiom this repo's own
 #       oracles use (`abs_floor` itself ends in `_floor`), all with ONE
-#       suffix check.
-#   (A) a `.max(<numeric literal>)` or `+ <numeric literal>` (the latter
-#       only on a line that ALSO carries a comparison operator, `<=`/`>=` —
-#       otherwise too many ordinary arithmetic `+`s would fire) inside a fn
-#       whose SIGNATURE (name or return type) reads as comparison-feeding:
-#       returns `bool`, or its name contains `bound`/`close`/`tol`/`floor`/
-#       `threshold`/`within`. Conservative on purpose — this shape's
-#       precision is unproven at scale, so it rides the SAME advisory bare-
-#       scan leg every other shape here does; it never gates on its own.
+#       suffix check. Unrestricted in file scope (its precision comes from
+#       the naming convention, not from context).
+#   (A) a `.max(<float literal>)` or `+ <float literal>` inside a fn, where
+#       the literal FEEDS a comparison or an `assert!`-family call — either
+#       directly (INLINE rule) or via a local binding used later in one
+#       (LOCAL-BINDING rule). Scope-restricted (round-3 audit item 5): only
+#       `crates/*/tests/**/*.rs`, `crates/*/src/**/*_oracles.rs`, and — for
+#       every OTHER file — text inside a `#[cfg(test)] mod tests { ... }`
+#       block, since a floor-as-a-bound only means something in an
+#       oracle/test context; production numerics code has legitimate
+#       `.max()`/`+` uses this concept does not apply to. `.max(<int>)`
+#       with NO decimal point/exponent/f32/f64 suffix is REJECTED outright
+#       (a numeric floor in a bound is always a float; a bare integer
+#       argument is `Tensor::max(dim)` or `Ord::max`, never a tolerance).
+#       A `let expected = [ ... ]`-shaped binding (a hand-computed
+#       EXPECTED-VALUE array for a bit-exact test) is excluded entirely —
+#       its arithmetic computes a truth value, not a floor.
+#
+# ONE stripper (round-3 audit item 3, "change the approach, not just the
+# cases"): fn discovery, fn-body brace counting, and BOTH category (A)
+# rules all run on `_blank_comments_and_strings_ko4`'s output — a
+# `.max()`/`+ <num>` SHAPED substring sitting merely inside an assert!
+# MESSAGE string (`assert_eq!(x, y, "correct must be +0.0")`) can no
+# longer be mistaken for a real floor literal.
 #
 # CITATION SCOPE for a floor line is narrower than a doc-comment number's:
 # a `const`/`let` line is CODE, so `compute_blocks` gives it its own
@@ -539,28 +554,6 @@ FLOOR_DECL_RE = re.compile(
 FLOOR_NAME_SUFFIX_RE = re.compile(r"(?i)_floor$")
 FLOOR_LITERAL_RE = re.compile(r"-?\d[\d_]*(?:\.\d+)?(?:[eE]-?\d+)?(?:f32|f64)?")
 
-# Round-6 audit fix: the ORIGINAL category (A) design keyed comparison-
-# feeding-ness off the ENCLOSING fn's OWN name/return type, via a
-# single-line-only `FN_SIG_RE` — both were real gaps found against
-# `cuda_parity.rs`'s actual `.max(1.0)` floor sites: (i) `assert_ln_parity_
-# bf16`/`assert_softmax_scale_parity_bf16` (lines 476/1515) span their
-# signature across multiple lines, so the single-line anchor never matched
-# at all and every floor inside those fns was invisible; (ii) the floor
-# usually lives in a LOCAL BINDING (`let bf16_bound = |c, g| ... .max(1.0);`)
-# whose enclosing fn is a generic `assert_*_parity_*` helper with no
-# "bound"/"tol"/"floor" in ITS OWN name — the comparison-feeding-ness lives
-# on the LOCAL NAME (`bf16_bound`), not the fn. The redesign below fixes
-# both: fn boundaries are found via brace-balanced extraction over the
-# WHOLE FILE (any signature shape, any number of lines — mirrors
-# `check_kernel_oracles.py`'s `find_fns`, kept as an independent copy per
-# this repo's no-cross-script-import gate convention), and comparison-
-# feeding-ness is decided per STATEMENT: a `let <name> = <rhs>;` whose RHS
-# carries a floor literal is a hit iff `<name>` is later used, in the SAME
-# fn body, inside an `assert!`-family macro call or a `<=`/`>=`-bearing
-# statement (the LOCAL-BINDING rule); a floor literal with NO enclosing
-# `let` is a hit iff ITS OWN statement already satisfies that same
-# assert/comparison test (the INLINE rule, e.g. `magnitude.max(1e-12)`
-# used directly inside `... <= REL`).
 FN_HEAD_RE_KO4 = re.compile(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)\s*[(<]")
 LET_BINDING_RE = re.compile(r"\blet\s+(?:mut\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=]+)?=")
 ASSERT_MACRO_RE_KO4 = re.compile(
@@ -571,18 +564,33 @@ FLOOR_MAX_RE = re.compile(
 )
 FLOOR_ADD_RE = re.compile(r"\+\s*(-?\d[\d_]*\.\d+(?:[eE]-?\d+)?(?:f32|f64)?)\b")
 _COMPARISON_OP_RE = re.compile(r"<=|>=")
+_TEST_DIR_RE = re.compile(r"(?:^|/)tests/")
+_ORACLES_FILE_RE = re.compile(r"_oracles\.rs$")
+_CFG_TEST_MOD_RE = re.compile(r"#\[cfg\(test\)\]\s*mod\s+tests\b")
+
+
+def _is_float_shaped_literal(literal: str) -> bool:
+    """A numeric floor is always a FLOAT — a bare integer argument
+    (`tensor.max(0)`, a dim index; `Ord::max(a, b)`-style receivers) is
+    rejected. Decimal point, scientific-notation exponent, or an explicit
+    `f32`/`f64` suffix all count as float-shaped.
+    """
+    low = literal.lower()
+    return "." in literal or "e" in low or low.endswith("f32") or low.endswith("f64")
 
 
 def _blank_comments_and_strings_ko4(text: str) -> str:
-    """Length-preserving `//`-comment and `"..."`-string-content blanker,
-    used ONLY to find real `fn` keyword POSITIONS (never to build the body
-    text itself, which is still extracted from RAW `text` at those verified
-    positions) — a `fn foo(...)  { ... }` shape merely quoted in a comment
-    or a string literal (e.g. an example in a doc comment) must not be
-    discovered as a real function. Block comments and raw strings are not
-    this repo's kernel-test convention and are left unhandled; imprecision
-    here only risks UNDER-stripping, which fails toward scanning MORE text
-    on this advisory-leg shape, never less.
+    """Length-preserving `//`/nested-`/* */`-comment and `"..."`-string-
+    content blanker, used for BOTH real `fn`/`{`/`}` POSITION-finding
+    (round-3 audit item 2: a `}` character sitting merely inside a string,
+    e.g. `println!("brace }} }} literal")`, can no longer truncate a fn
+    body early) and the category (A) `.max()`/`+ <num>` scan itself (item
+    3: a floor-shaped substring inside an assert! MESSAGE string, e.g.
+    `"correct must be +0.0"`, can no longer be mistaken for a real floor).
+    Raw strings and char literals are NOT this repo's kernel-numerics
+    convention outside test fixtures and are left unhandled beyond the
+    plain-string/comment cases below; imprecision here only risks UNDER-
+    stripping on this advisory-leg shape, never less.
     """
     out: list[str] = []
     i, n = 0, len(text)
@@ -605,6 +613,24 @@ def _blank_comments_and_strings_ko4(text: str) -> str:
         if text[i : i + 2] == "//":
             while i < n and text[i] != "\n":
                 out.append(" ")
+                i += 1
+            continue
+        if text[i : i + 2] == "/*":
+            depth = 1
+            out.append("  ")
+            i += 2
+            while i < n and depth > 0:
+                if text[i : i + 2] == "/*":
+                    depth += 1
+                    out.append("  ")
+                    i += 2
+                    continue
+                if text[i : i + 2] == "*/":
+                    depth -= 1
+                    out.append("  ")
+                    i += 2
+                    continue
+                out.append("\n" if text[i] == "\n" else " ")
                 i += 1
             continue
         if c == '"':
@@ -633,17 +659,10 @@ def _extract_fn_body_ko4(text: str, fn_kw_end: int) -> tuple[str, int, int]:
 
 
 def _find_stmt_terminator(text: str, start: int) -> int:
-    """Index just PAST the depth-balanced `;` that terminates the `let`
-    statement beginning at `start` (right after its own `let name =`) — a
-    `let` is always `;`-terminated in valid Rust, regardless of what
-    surrounds it (a `for`/`if`/`match` block with NO trailing `;` of its
-    own, which is why a general "split the whole fn body into top-level
-    `;`-terminated statements" pass is the WRONG tool here: a block
-    expression used as a statement needs no `;`, so naive `;`-splitting
-    silently merges everything after it into one giant tail statement —
-    the round-6 bug this function replaces. Scanning forward from the
-    KNOWN start of a specific `let`'s RHS sidesteps that entirely: it never
-    needs to know where any OTHER statement begins or ends.
+    """Index just PAST the depth-balanced `;` that terminates the
+    statement beginning at `start`, OR the position of the first
+    depth-0 CLOSING bracket (an ENCLOSING scope's own `}`/`)`/`]`) if no
+    such `;` exists — the tail-expression case (no trailing `;`).
     """
     depth = 0
     i, n = start, len(text)
@@ -653,12 +672,37 @@ def _find_stmt_terminator(text: str, start: int) -> int:
             depth += 1
         elif c in ")]}":
             if depth == 0:
-                return i  # closing bracket of an ENCLOSING scope — bail
+                return i
             depth -= 1
         elif c == ";" and depth == 0:
             return i + 1
         i += 1
     return n
+
+
+def _find_stmt_start(text: str, pos: int) -> int:
+    """Index just PAST the depth-balanced `;`/`{` that PRECEDES the
+    statement containing `pos` — the round-3 audit item 4 fix
+    ("STATEMENT-scoped, not same-line"): a comparison operator or an
+    assert!-family call on a DIFFERENT LINE than a `.max()`/`+ <num>`
+    literal, but in the SAME statement, must still be found (the
+    `scaled_cast_add_oracles.rs:436` shape: `.max(1e-12)` on one line,
+    its `<= REL` comparison on the next).
+    """
+    depth = 0
+    i = pos - 1
+    while i >= 0:
+        c = text[i]
+        if c in ")]}":
+            depth += 1
+        elif c in "([{":
+            if depth == 0:
+                return i + 1
+            depth -= 1
+        elif c == ";" and depth == 0:
+            return i + 1
+        i -= 1
+    return 0
 
 
 def _extract_paren_balanced_ko4(text: str, open_paren_idx: int) -> str:
@@ -684,14 +728,40 @@ def _text_has_assert_or_comparison_usage(text: str, name_re: re.Pattern) -> bool
     return False
 
 
-def _first_floor_literal(text: str) -> str | None:
-    m = FLOOR_MAX_RE.search(text)
-    if m:
-        return m.group(1)
-    m = FLOOR_ADD_RE.search(text)
-    if m:
-        return m.group(1)
+def _first_float_floor_literal(text: str) -> str | None:
+    for regex in (FLOOR_MAX_RE, FLOOR_ADD_RE):
+        m = regex.search(text)
+        if m and _is_float_shaped_literal(m.group(1)):
+            return m.group(1)
     return None
+
+
+def _category_a_eligible_spans(stripped_text: str, file_label: str) -> list[tuple[int, int]] | None:
+    """Returns the [(start, end), ...] character spans of `stripped_text`
+    where category (A) may fire, or `None` for "the whole file" (an
+    oracle/test-directory file). A production `src/` file (not `*_oracles
+    .rs`) is restricted to its `#[cfg(test)] mod tests { ... }` block(s),
+    if any — production numerics code outside a test module is out of
+    scope entirely.
+    """
+    if _TEST_DIR_RE.search(file_label) or _ORACLES_FILE_RE.search(file_label):
+        return None
+    spans: list[tuple[int, int]] = []
+    for m in _CFG_TEST_MOD_RE.finditer(stripped_text):
+        brace_start = stripped_text.find("{", m.end())
+        if brace_start == -1:
+            continue
+        _body, start, end = _extract_fn_body_ko4(stripped_text, m.end())
+        if start == -1:
+            continue
+        spans.append((start, end + 1))
+    return spans
+
+
+def _pos_in_spans(pos: int, spans: list[tuple[int, int]] | None) -> bool:
+    if spans is None:
+        return True
+    return any(s <= pos < e for s, e in spans)
 
 
 @dataclass(frozen=True)
@@ -707,30 +777,33 @@ class FloorHit:
     fn_sig_line_idx: int | None = None
 
 
-def find_floor_hits(lines: list[str]) -> list[FloorHit]:
+def find_floor_hits(lines: list[str], file_label: str = "") -> list[FloorHit]:
     """Category (B) declaration scan (whole-file, name-suffix driven) plus
-    category (A) fn-scoped `.max(<num>)`/`+ <num>` scan — fn boundaries via
-    brace-balanced extraction over the WHOLE FILE (any signature shape,
-    multi-line included). Within each fn body:
+    category (A) fn-scoped `.max(<float>)`/`+ <float>` scan, both eligible-
+    scope-restricted (see module comment). Fn boundaries via brace-balanced
+    extraction over the ONE stripped text (any signature shape, multi-line
+    included). Within each fn body:
 
-      - LOCAL-BINDING rule: for every `let <name> = <rhs>;` (found by
-        `re.finditer`, its OWN terminating `;` found by scanning FORWARD
-        from that specific match via `_find_stmt_terminator` — never by
-        splitting the whole fn body into top-level statements first, which
-        silently merges everything after a semicolon-less block expression
-        like `for {...}`/`if {...}` into one giant tail statement; that WAS
-        this function's round-6 bug, reproduced and fixed in the same
-        round), a floor literal in the RHS hits iff `<name>` is later used,
-        anywhere in the REST of the fn body, inside an `assert!`-family
-        call or a `<=`/`>=`-bearing statement.
-      - INLINE rule: a floor literal with no owning `let` (not already
-        claimed by the rule above) hits iff it sits inside an `assert!`-
-        family call's own argument list, OR on a line that also carries a
-        `<=`/`>=` comparison operator.
+      - LOCAL-BINDING rule: for every `let <name> = <rhs>;` (its OWN
+        terminating `;` found by scanning FORWARD via `_find_stmt_
+        terminator` — never by splitting the whole fn body into top-level
+        statements first, which silently merges everything after a
+        semicolon-less block expression like `for {...}`/`if {...}` into
+        one giant tail statement), a float-shaped floor literal in the RHS
+        hits iff `<name>` is later used, anywhere in the REST of the fn
+        body, inside an `assert!`-family call or a `<=`/`>=`-bearing
+        statement. A `let expected = [ ... ]` binding (array-literal RHS,
+        or the name `expected` itself) is excluded outright.
+      - INLINE rule: a float-shaped floor literal with no owning `let`
+        (not already claimed by the rule above) hits iff its OWN
+        STATEMENT (found via `_find_stmt_start`/`_find_stmt_terminator`,
+        not merely its own LINE) sits inside an `assert!`-family call's
+        own argument list, OR contains a `<=`/`>=` comparison operator
+        anywhere in that statement (possibly on a different line).
     """
     hits: list[FloorHit] = []
 
-    # (B) — declaration name ends `_floor`.
+    # (B) — declaration name ends `_floor`. Unrestricted file scope.
     for i, line in enumerate(lines):
         m = FLOOR_DECL_RE.match(line)
         if not m:
@@ -741,28 +814,35 @@ def find_floor_hits(lines: list[str]) -> list[FloorHit]:
         if lit:
             hits.append(FloorHit(i, lit.group(0)))
 
-    # (A) — local-binding / inline, fn-scoped.
+    # (A) — local-binding / inline, fn-scoped, eligible-scope-restricted.
     text = "\n".join(lines)
-    stripped_for_fn_detection = _blank_comments_and_strings_ko4(text)
-    for fm in FN_HEAD_RE_KO4.finditer(stripped_for_fn_detection):
-        body, body_start, _body_end = _extract_fn_body_ko4(text, fm.end())
+    stripped = _blank_comments_and_strings_ko4(text)
+    eligible_spans = _category_a_eligible_spans(stripped, file_label)
+    if eligible_spans is not None and not eligible_spans:
+        return hits  # a src/ file with no #[cfg(test)] mod tests block at all
+
+    for fm in FN_HEAD_RE_KO4.finditer(stripped):
+        body, body_start, _body_end = _extract_fn_body_ko4(stripped, fm.end())
         if not body:
+            continue
+        if not _pos_in_spans(body_start, eligible_spans):
             continue
         fn_sig_line_idx = text.count("\n", 0, fm.start())
 
+        claimed_positions: set[int] = set()
+
+        # assert!-family call argument spans, WHOLE-FN-BODY level — needed
+        # separately from the statement-boundary functions below because a
+        # backward statement-boundary scan starting INSIDE `assert!(...)`'s
+        # own parens stops right at that `(` (an enclosing-scope boundary),
+        # excluding the literal `assert!(` token itself from the computed
+        # span — so "is pos inside an assert! call" is checked by direct
+        # paren-span containment, never by re-deriving it from `_find_stmt_
+        # start`.
         assert_spans: list[tuple[int, int]] = []
         for am in ASSERT_MACRO_RE_KO4.finditer(body):
             args = _extract_paren_balanced_ko4(body, am.end() - 1)
             assert_spans.append((am.end() - 1, am.end() - 1 + len(args)))
-
-        def _same_line(pos: int, _body: str = body) -> str:
-            ls = _body.rfind("\n", 0, pos) + 1
-            le = _body.find("\n", pos)
-            if le == -1:
-                le = len(_body)
-            return _body[ls:le]
-
-        claimed_positions: set[int] = set()
 
         # LOCAL-BINDING rule.
         for let_m in LET_BINDING_RE.finditer(body):
@@ -770,8 +850,10 @@ def find_floor_hits(lines: list[str]) -> list[FloorHit]:
             rhs_start = let_m.end()
             rhs_end = _find_stmt_terminator(body, rhs_start)
             rhs = body[rhs_start:rhs_end]
-            lit_m = FLOOR_MAX_RE.search(rhs) or FLOOR_ADD_RE.search(rhs)
-            if lit_m is None:
+            if name == "expected" or rhs.lstrip().startswith("["):
+                continue
+            lit = _first_float_floor_literal(rhs)
+            if lit is None:
                 continue
             name_re = re.compile(rf"\b{re.escape(name)}\b")
             later_text = body[rhs_end:]
@@ -779,21 +861,32 @@ def find_floor_hits(lines: list[str]) -> list[FloorHit]:
                 continue
             abs_pos = body_start + let_m.start()
             line_idx = text.count("\n", 0, abs_pos)
-            hits.append(FloorHit(line_idx, lit_m.group(1), fn_sig_line_idx))
-            claimed_positions.add(rhs_start + lit_m.start())
+            hits.append(FloorHit(line_idx, lit, fn_sig_line_idx))
+            for regex in (FLOOR_MAX_RE, FLOOR_ADD_RE):
+                m2 = regex.search(rhs)
+                if m2 and m2.group(1) == lit:
+                    claimed_positions.add(rhs_start + m2.start())
+                    break
 
-        # INLINE rule — never re-claims a position the LOCAL-BINDING rule
-        # already reported (its own `let` RHS naturally also matches this
-        # loop's regexes; double-counting the SAME literal twice is a
-        # duplicate finding, not a second genuine instance).
+        # INLINE rule — STATEMENT-scoped (round-3 audit item 4: not merely
+        # same-line — a `.max(<num>)` on one line and its `<=`/`>=` on the
+        # NEXT line, still inside the same statement/expression, must
+        # still be caught: the `scaled_cast_add_oracles.rs:436` shape).
+        # Never re-claims a position the LOCAL-BINDING rule already
+        # reported.
         for fre in (FLOOR_MAX_RE, FLOOR_ADD_RE):
             for m in fre.finditer(body):
                 pos = m.start()
                 if pos in claimed_positions:
                     continue
-                in_assert = any(a <= pos < b for a, b in assert_spans)
-                if not (in_assert or _COMPARISON_OP_RE.search(_same_line(pos))):
+                if not _is_float_shaped_literal(m.group(1)):
                     continue
+                in_assert = any(a <= pos < b for a, b in assert_spans)
+                if not in_assert:
+                    stmt_start = _find_stmt_start(body, pos)
+                    stmt_end = _find_stmt_terminator(body, pos)
+                    if not _COMPARISON_OP_RE.search(body[stmt_start:stmt_end]):
+                        continue
                 abs_pos = body_start + pos
                 line_idx = text.count("\n", 0, abs_pos)
                 hits.append(FloorHit(line_idx, m.group(1), fn_sig_line_idx))
@@ -868,7 +961,7 @@ def scan_lines(
             return clean_text(block_of[j])
         return ""
 
-    for fh in find_floor_hits(lines):
+    for fh in find_floor_hits(lines, file_label):
         i = fh.line_idx
         if NO_PRODUCER_RE.search(lines[i]):
             continue
@@ -1111,13 +1204,20 @@ def self_test() -> int:
     tracked = tracked_files()
     real_fn = _pick_real_test_fn(fn_index)
 
-    def flagged(name: str, text: str) -> None:
-        hits = _scan_fragment(text, f"<self-test: {name}>", fn_index, tracked)
+    # `tests/` prefix so KO-4 category (A)'s file-scope restriction (round-3
+    # audit item 5 — only crates/*/tests/**/*.rs, crates/*/src/**/*_oracles.rs,
+    # or a #[cfg(test)] mod tests block) treats every self-test fragment as an
+    # oracle/test file; none of these synthetic fixtures is a production
+    # src/ file this restriction is meant to exclude.
+    def flagged(name: str, text: str, label: str | None = None) -> None:
+        file_label = label if label is not None else f"tests/<self-test: {name}>"
+        hits = _scan_fragment(text, file_label, fn_index, tracked)
         if not hits:
             failures.append(f"self-test FAILED ({name}): expected a finding, got none")
 
-    def clean(name: str, text: str) -> None:
-        hits = _scan_fragment(text, f"<self-test: {name}>", fn_index, tracked)
+    def clean(name: str, text: str, label: str | None = None) -> None:
+        file_label = label if label is not None else f"tests/<self-test: {name}>"
+        hits = _scan_fragment(text, file_label, fn_index, tracked)
         if hits:
             failures.append(f"self-test FAILED ({name}): expected no finding, got {hits}")
 
@@ -1385,6 +1485,85 @@ fn assert_ln_parity_bf16(
 const SOME_ABS_FLOOR: f64 = 0.25;
 // no-producer: this opt-out is written on the wrong line on purpose.
 """,
+    )
+
+    # --- round-3 audit fixes (scoped re-audit of 8041c09) ------------------
+    clean(
+        "round-3 item 3: a floor-shaped '+0.0' PROSE inside an assert! MESSAGE "
+        "string is not a real floor (the actual code has no floor at all here)",
+        """
+fn t() {
+    assert_eq!(a.to_bits(), b.to_bits(), "correct must be +0.0");
+}
+""",
+    )
+    clean(
+        "round-3 item 3: a floor-shaped '+ 0.05' PROSE inside a // COMMENT on "
+        "an assert-bearing line is not a real floor",
+        """
+fn t() {
+    // the tolerance is diff + 0.05 in the old design
+    assert!(a <= b);
+}
+""",
+    )
+    flagged(
+        "round-3 item 4: STATEMENT-scoped comparison detection (not same-line) "
+        "— the scaled_cast_add_oracles.rs:436 shape: .max(1e-12) on one line, "
+        "its <= on the NEXT line, same statement/expression",
+        """
+fn within_bound(diff: f64, magnitude: f64) -> bool {
+    diff <= FLOOR
+        || (diff - FLOOR) / magnitude.max(1e-12)
+            <= REL
+}
+""",
+    )
+    clean(
+        "round-3 item 5: Tensor::max(dim)-shaped .max(<int>) with NO decimal "
+        "point/exponent/f32/f64 suffix is rejected outright (a numeric floor "
+        "in a bound is always a float)",
+        """
+fn t() {
+    let idx = tensor.max(0).unwrap();
+    assert!(idx < rows);
+}
+""",
+    )
+    clean(
+        "round-3 item 5: a `let expected = [ ... ]`-shaped hand-computed "
+        "EXPECTED VALUE array (axpy.rs:200 shape) is excluded — its "
+        "arithmetic computes a truth value, not a floor",
+        """
+fn t() {
+    let expected = [f(2.0 * 1.5 + 0.25)];
+    assert_eq!(out, expected);
+}
+""",
+    )
+    clean(
+        "round-3 item 5: KO-4 category (A) is scope-restricted — a production "
+        "src/ file (not *_oracles.rs, no #[cfg(test)] mod tests wrapper) is "
+        "out of scope even for a genuine-shaped floor",
+        """
+fn within_bound(diff: f64, magnitude: f64) -> bool {
+    diff <= FLOOR || (diff - FLOOR) / magnitude.max(1e-12) <= REL
+}
+""",
+        label="crates/jammi-kernels/src/ops/cast_scale.rs",
+    )
+    flagged(
+        "round-3 item 5: the SAME src/ file's floor IS in scope once wrapped "
+        "in a #[cfg(test)] mod tests block",
+        """
+#[cfg(test)]
+mod tests {
+    fn within_bound(diff: f64, magnitude: f64) -> bool {
+        diff <= FLOOR || (diff - FLOOR) / magnitude.max(1e-12) <= REL
+    }
+}
+""",
+        label="crates/jammi-kernels/src/ops/cast_scale.rs",
     )
 
     # --- (C) number shapes ---

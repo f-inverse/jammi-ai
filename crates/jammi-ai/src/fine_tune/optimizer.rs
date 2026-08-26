@@ -1846,7 +1846,7 @@ mod tests {
         }
     }
 
-    /// The rounding-COUNT fix ([`clip_gradients`]'s doc: `denom.div(&max_norm_t)`
+    /// The rounding-COUNT fix ([`clip_gradients`]'s doc: `max_norm_t.div(&denom)`
     /// replacing an earlier `recip().affine(max_norm, 0.0)`) is INVISIBLE at
     /// `max_norm == 1.0` — the shipped default (`jammi_wire::fine_tune::
     /// FineTuneConfig::default().max_grad_norm`) — because `x * 1.0` is an

@@ -4821,19 +4821,54 @@ mod last_step_horizon_run_oracles {
     /// exactly the "early stopping" arm `total_optimizer_steps`'s own
     /// lattice doc in `run` already documents as NOT reflected in `total_
     /// steps` (an early-stopped run's actual last step is whatever `global_
-    /// step` reached before the `break`). A whole EPOCH's worth of steps on
-    /// the regression sweep's own config (`batch_size: 8` over 18 train
-    /// rows → 3 batches/epoch) is exactly 3 steps — the observed 249 − 246
-    /// == 3 delta is consistent with exactly ONE seed (of 12) running one
-    /// extra epoch before its patience-3 window exhausted, not with a
-    /// systematic per-seed drift.
+    /// step` reached before the `break`).
     ///
-    /// Mutation tried: change `total_steps`'s `div_ceil(grad_accum.max(1))`
-    /// to a plain `/` (floor division) — RED (`total_steps` becomes `11`,
-    /// off by the trailing partial-window step this fixture's `8 pairs /
-    /// batch_size 2` doesn't even exercise, so the mismatch shows up as
-    /// `clip_call_count != total_steps` here regardless of which side the
-    /// bug is on).
+    /// MEASURED, not reasoned (an env-gated `eprintln!` counting `clip_
+    /// gradients` invocations per seed, on both main and this branch,
+    /// reverted after the count was captured — never committed; per-seed
+    /// `clip_gradients`-call count equals that seed's own `global_step` at
+    /// the moment its `patience: 3` window exhausted, confirming the clip
+    /// path and the trainer path count the SAME thing per seed too, not
+    /// only in aggregate). Seed order `[1,2,3,4,5,6,7,8,9,10,11,42]`:
+    ///
+    /// | seed | main | branch | Δ (steps) | Δ (epochs, 3 steps/epoch) |
+    /// |---|---|---|---|---|
+    /// | 1  | 45 | 42 | −3 | −1 |
+    /// | 2  | 15 | 15 |  0 |  0 |
+    /// | 3  | 21 | 21 |  0 |  0 |
+    /// | 4  | 21 | 12 | −9 | −3 |
+    /// | 5  | 21 | 39 | +18 | +6 |
+    /// | 6  | 15 | 15 |  0 |  0 |
+    /// | 7  | 24 | 24 |  0 |  0 |
+    /// | 8  | 12 | 12 |  0 |  0 |
+    /// | 9  | 15 | 12 | −3 | −1 |
+    /// | 10 | 12 | 12 |  0 |  0 |
+    /// | 11 | 12 | 12 |  0 |  0 |
+    /// | 42 | 33 | 33 |  0 |  0 |
+    /// | **sum** | **246** | **249** | **+3** | **+1** |
+    ///
+    /// FOUR seeds moved (1, 4, 5, 9), not one — two ran FEWER epochs on the
+    /// branch (seed 1: −1, seed 4: −3), one ran MORE (seed 5: +6), one ran
+    /// fewer again (seed 9: −1). The net `+3` steps (`249 − 246`) is a
+    /// CANCELLATION of a −1, a −3, a +6, and a −1, not one seed's uniform
+    /// extra epoch — the mechanism (chaotic `monitor_loss` values feeding
+    /// an unchanged patience-3 comparison, per the paragraph above) predicts
+    /// exactly this kind of two-directional per-seed shift, not a
+    /// single-seed one; a prior draft of this doc claimed the latter without
+    /// measuring it and was wrong.
+    ///
+    /// Mutation tried: duplicate `clip_and_step`'s own call to `clip_
+    /// gradients` (`let outcome = clip_gradients(...)?; let _x =
+    /// clip_gradients(...)?;`) — RED, this fixture's own assertion:
+    /// `assertion `left == right` failed: clip_gradients must be invoked
+    /// exactly once per optimizer step: 24 clip-path calls vs 12
+    /// trainer-path steps for this fixed (n_pairs=8, batch_size=2,
+    /// epochs=3) config` (`left: 24, right: 12`). (A previously-drafted
+    /// `div_ceil(grad_accum.max(1))` → `/` mutant here was MEASURED to NOT
+    /// kill this test — `train_batches_per_epoch == 4` and `grad_accum ==
+    /// 1` make `4.div_ceil(1) == 4 / 1 == 4` bit-for-bit for this exact
+    /// fixture, so that claim was reasoned, not measured, and false; this
+    /// paragraph replaces it with a mutant that was actually run.)
     #[test]
     fn clip_call_count_matches_total_optimizer_steps_for_a_fixed_config() {
         let config = FineTuneConfig {

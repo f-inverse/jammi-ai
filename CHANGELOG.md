@@ -52,7 +52,23 @@ workspace ships every publishable crate at the same
   `QUANTILE_SEP_UNTRAINED_POSITIVE_BAR`, which gave an IDENTICAL verdict
   across five independent runs (main and this branch, clip formula before
   and after the rounding-count fix, the 1-ULP mutant on and off, plus one
-  CI run) despite the same magnitude swings.
+  CI run) despite the same magnitude swings. Stated honestly, not hidden:
+  this trade has a known limit — the new arm was proven robust against
+  ULP-scale rounding noise (above) but was NOT shown to have power against
+  a GRADED degradation of the trained head; measured (throwaway, reverted)
+  overrides on the same fixture still clear the bar at `learning_rate:
+  1e-5` (`positive_count = 8`, aggregate collapses ~215× to `0.0222`) and
+  at `epochs: 1` (`positive_count = 8`, aggregate `2.5824`) — an ORDINAL
+  (sign-count) arm cannot see a MAGNITUDE collapse that does not also flip
+  enough seeds' signs. A future arm wanting that coverage needs to be
+  magnitude-sensitive AND chaos-robust by construction (see the test's own
+  doc on `QUANTILE_SEP_UNTRAINED_POSITIVE_BAR`), not an extension of this
+  one. Separately, pre-existing and unrelated to this round: Arm 1's
+  `mutant_zero_band` (`max(3 × std(zeroed_seps), 1e-3)`) has been measured
+  `0.0` for `std(zeroed_seps)` on every run to date (a zeroed head's
+  separation is exactly `0.0` per seed, by construction), so it reduces to
+  its `1e-3` floor in practice rather than a live data-dependent band —
+  documented in the test itself, not widened in scope by this round.
 - **The trainer's gradient-clip fold order is now reproducible across process
   invocations of the same seed (`jammi-ai`).** `TrainingLoop::run` and
   `parallel_train::train_loop` snapshotted their trainable `Var`s via

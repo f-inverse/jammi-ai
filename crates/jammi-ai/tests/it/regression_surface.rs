@@ -176,6 +176,31 @@ const QUANTILE_SEP_POSITIVE_BAR: usize = 9;
 /// measurements (`9`), mirroring [`QUANTILE_SEP_POSITIVE_BAR`]'s own
 /// "2-3 seeds of headroom" convention — not fitted to make one specific
 /// run pass.
+///
+/// **Known limit, stated rather than hidden: this arm has SPECIFICITY
+/// against an ULP-scale rounding change (proven above), but was NOT shown
+/// to have SENSITIVITY against a GRADED degradation of the trained head.**
+/// Measured (throwaway diagnostic, env/config overrides on this exact
+/// fixture, reverted, never committed): `learning_rate: 1e-5` (four orders
+/// of magnitude below the shipped `1e-1`, a head that barely moves off its
+/// zero init) still clears the bar — `positive_count = 8` (`>= 7`), `real_
+/// tm` collapses from `4.7780` (healthy) to `0.0222`, a ~215× shrink in the
+/// aggregate's own MAGNITUDE that this ORDINAL arm cannot see at all;
+/// `epochs: 1` (in place of `120`) also clears it — `positive_count = 8`,
+/// `real_tm = 2.5824`. A head trained for one epoch, or at 1e-5 the
+/// intended learning rate, is not "the trained head this test's own claim
+/// describes" by any reasonable reading, yet this arm cannot distinguish
+/// either from a healthy run. This is the flip side of trading a
+/// magnitude-sensitive-but-chaos-fragile margin for a
+/// chaos-robust-but-magnitude-blind sign count: it was never evaluated for,
+/// and should not be assumed to have, power against a training-strength
+/// regression (a lr/epochs/optimizer bug that degrades the head without
+/// flipping enough seeds' signs) — only against the specific rounding-scale
+/// noise measured above. A future round wanting that coverage needs a
+/// magnitude-sensitive arm built to be chaos-robust by construction (e.g.
+/// judged against a self-normalizing band derived from a graded-degradation
+/// sweep's own spread, the way Arm 1 already is for the zeroed leg), not
+/// this one stretched to cover a claim it was not built or measured for.
 const QUANTILE_SEP_UNTRAINED_POSITIVE_BAR: usize = 7;
 
 /// The `trim_frac`-trimmed mean of `values` (mirrors
@@ -796,6 +821,19 @@ async fn untrained_quantile_head_collapses_to_mu_no_separation() {
     // Arm 1: self-normalizing "indistinguishable from zero" band for the
     // MUTANT, computed from the MUTANT's OWN measured per-seed spread over
     // THIS run — no stream-dependent literal.
+    //
+    // Pre-existing, documented rather than widened in scope here: `mutant_
+    // spread` (== `std_dev(&zeroed_seps)`) is measured `0.0` on every run
+    // that has been observed (the per-seed structural check just above
+    // this loop already proves `zeroed_seps` is a vector of exact zeros —
+    // a zeroed head's constant-`μ_y` output makes `mean(b) - mean(a)`
+    // literally `0.0` for every seed, not merely close to it), so
+    // `mutant_zero_band` reduces to its `1e-3` floor on every run — this
+    // "self-normalizing" band is, in practice, the `1e-3` literal it was
+    // built to avoid being. Not a regression this round introduced or a
+    // gap this round is closing (audited pre-existing behavior); noted so
+    // a future reader does not mistake the `3.0 * mutant_spread` term for
+    // a live, data-dependent computation.
     let mutant_zero_band = (3.0 * mutant_spread).max(1e-3);
     assert!(
         mutant_tm.abs() <= mutant_zero_band,

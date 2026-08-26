@@ -1,0 +1,595 @@
+{
+  "schema_version": 1,
+  "artifact": "cuda-run",
+  "tag": "grad-ablation",
+  "git_sha": "9e2b1f6d9cad8bab13c3fbbec064f87f3d08458d",
+  "box": "jammi-a100b (A100 80GB PCIe, driver 570)",
+  "env": {
+    "gpu": "NVIDIA A100 80GB PCIe, 570.172.08, 81920 MiB",
+    "nvcc": "Cuda compilation tools, release 12.6, V12.6.85",
+    "rustc": "rustc 1.94.0 (4a4ef493e 2026-03-02)",
+    "hostname": "83787767a49b",
+    "generated_at_utc": "2026-08-26T08:52:50Z"
+  },
+  "producer": {
+    "path": "ci/scripts/perf/run_grad_oracle_ablation.sh",
+    "kind": "script",
+    "invocation": "MODEL_DIR=/root/checkpoints/ModernBERT-large ci/scripts/perf/run_grad_oracle_ablation.sh /root/proof-out/grad-ablation b4-s128-peft-step1:4:128:peft-step1 b8-s128-peft-step1:8:128:peft-step1 b4-s128-gaussian:4:128:gaussian b8-s128-gaussian:8:128:gaussian",
+    "gating": "none"
+  },
+  "status": "round-7 fix (--seeds 42,43,44, median/min/max, per-op budget = 3x all_fused's own seed spread per shape) rerun on both operating points: PeftStep1 (default -- real training's init) and gaussian (diagnostic, dL/dA and the LoRA epilogue's own gradient term are live). check_fused_op_gradient_parity.py PASSES for BOTH lora_init pairs (b4-s128 + b8-s128) at this per-shape derived budget -- no op's own ablation moves the cosine past its shape's noise-derived budget at either operating point. This budget is derived from the SAME seed-to-seed noise it is being compared against (3x the spread already visible in all_fused's own median/min/max at this fixture depth), so a PASS here means the per-op gradient-contribution signal is not resolvable above that noise floor at ModernBERT-large depth / batch<=8 / seq=128 -- it does not mean the ops are gradient-parity-clean at a tighter, better-powered budget. Contrast with the superseded d290b2b artifact's single-seed, fixed-threshold-0.02 FAIL for geglu_fused / layer_norm_fused / lora_linear_fused.",
+  "legs": [
+    {
+      "label": "b4-s128-peft-step1",
+      "batch": 4,
+      "seq": 128,
+      "seeds": [
+        42,
+        43,
+        44
+      ],
+      "lora_rank": 16,
+      "lora_alpha": 32.0,
+      "target_modules": [
+        "Wqkv",
+        "Wo",
+        "Wi"
+      ],
+      "backbone_dtype": "bf16",
+      "lora_init": "peft-step1",
+      "ablated_op_keys": [
+        "attention_block_fused",
+        "cast_add_bf16",
+        "cast_scale_bf16_f32",
+        "geglu_fused",
+        "layer_norm_fused",
+        "lora_linear_fused"
+      ],
+      "untestable_op_keys_subsumed": [
+        "lora_epilogue",
+        "rope_fused",
+        "softmax_last_dim_fused"
+      ],
+      "checkpoint_config_sha256": "55dca68059e98f0debf8eb63ab355c451c65b1f5d90fdca4754113fdaadd2cca",
+      "checkpoint_weights_sha256": "44510fec5d3a81a1877f225637b869495f18e55f6f23a09abb9be0acc030295f",
+      "checkpoint_weights_size_bytes": 1583544840,
+      "cosine_floor": 0.7,
+      "derived_per_op_budget": 3.794918270381125,
+      "table": [
+        {
+          "arm": "all_fused",
+          "op_key": null,
+          "classification": "reference",
+          "full_tensor_cosine_vs_f32_truth": {
+            "median": 0.015919538702118926,
+            "min": -0.5767127260731771,
+            "max": 0.6882600307205311
+          },
+          "delta_vs_all_fused_median": 0.0
+        },
+        {
+          "arm": "f32_truth",
+          "op_key": null,
+          "classification": "truth",
+          "full_tensor_cosine_vs_f32_truth": {
+            "median": 1.0,
+            "min": 0.9999999999999999,
+            "max": 1.0000000000000002
+          },
+          "delta_vs_all_fused_median": 0.9840804612978811
+        },
+        {
+          "arm": "ablate:attention_block_fused",
+          "op_key": "attention_block_fused",
+          "classification": "neutral",
+          "full_tensor_cosine_vs_f32_truth": {
+            "median": 0.015919538702118926,
+            "min": -0.5767127260731771,
+            "max": 0.6882600307205311
+          },
+          "delta_vs_all_fused_median": 0.0
+        },
+        {
+          "arm": "ablate:cast_add_bf16",
+          "op_key": "cast_add_bf16",
+          "classification": "neutral",
+          "full_tensor_cosine_vs_f32_truth": {
+            "median": 0.015919538702118926,
+            "min": -0.5767127260731771,
+            "max": 0.6882600307205311
+          },
+          "delta_vs_all_fused_median": 0.0
+        },
+        {
+          "arm": "ablate:cast_scale_bf16_f32",
+          "op_key": "cast_scale_bf16_f32",
+          "classification": "neutral",
+          "full_tensor_cosine_vs_f32_truth": {
+            "median": 0.015919538702118926,
+            "min": -0.5767127260731771,
+            "max": 0.6882600307205311
+          },
+          "delta_vs_all_fused_median": 0.0
+        },
+        {
+          "arm": "ablate:geglu_fused",
+          "op_key": "geglu_fused",
+          "classification": "neutral",
+          "full_tensor_cosine_vs_f32_truth": {
+            "median": 0.00408312827617839,
+            "min": -0.5992689860065409,
+            "max": 0.4426997059627725
+          },
+          "delta_vs_all_fused_median": -0.011836410425940535
+        },
+        {
+          "arm": "ablate:layer_norm_fused",
+          "op_key": "layer_norm_fused",
+          "classification": "neutral",
+          "full_tensor_cosine_vs_f32_truth": {
+            "median": -0.1928783957188951,
+            "min": -0.6070632181403726,
+            "max": 0.8147017228673765
+          },
+          "delta_vs_all_fused_median": -0.20879793442101402
+        },
+        {
+          "arm": "ablate:lora_linear_fused",
+          "op_key": "lora_linear_fused",
+          "classification": "neutral",
+          "full_tensor_cosine_vs_f32_truth": {
+            "median": -0.04421758578162702,
+            "min": -0.6019454353275869,
+            "max": 0.6948529222821836
+          },
+          "delta_vs_all_fused_median": -0.060137124483745946
+        },
+        {
+          "arm": "all_off",
+          "op_key": null,
+          "classification": "control",
+          "full_tensor_cosine_vs_f32_truth": {
+            "median": 0.1850461385749915,
+            "min": -0.6274499644022293,
+            "max": 0.7680701176771317
+          },
+          "delta_vs_all_fused_median": 0.16912659987287257
+        }
+      ]
+    },
+    {
+      "label": "b8-s128-peft-step1",
+      "batch": 8,
+      "seq": 128,
+      "seeds": [
+        42,
+        43,
+        44
+      ],
+      "lora_rank": 16,
+      "lora_alpha": 32.0,
+      "target_modules": [
+        "Wqkv",
+        "Wo",
+        "Wi"
+      ],
+      "backbone_dtype": "bf16",
+      "lora_init": "peft-step1",
+      "ablated_op_keys": [
+        "attention_block_fused",
+        "cast_add_bf16",
+        "cast_scale_bf16_f32",
+        "geglu_fused",
+        "layer_norm_fused",
+        "lora_linear_fused"
+      ],
+      "untestable_op_keys_subsumed": [
+        "lora_epilogue",
+        "rope_fused",
+        "softmax_last_dim_fused"
+      ],
+      "checkpoint_config_sha256": "55dca68059e98f0debf8eb63ab355c451c65b1f5d90fdca4754113fdaadd2cca",
+      "checkpoint_weights_sha256": "44510fec5d3a81a1877f225637b869495f18e55f6f23a09abb9be0acc030295f",
+      "checkpoint_weights_size_bytes": 1583544840,
+      "cosine_floor": 0.7,
+      "derived_per_op_budget": 1.5128926941146912,
+      "table": [
+        {
+          "arm": "all_fused",
+          "op_key": null,
+          "classification": "reference",
+          "full_tensor_cosine_vs_f32_truth": {
+            "median": 0.38239264812414003,
+            "min": -0.08995117798137069,
+            "max": 0.4143463867235264
+          },
+          "delta_vs_all_fused_median": 0.0
+        },
+        {
+          "arm": "f32_truth",
+          "op_key": null,
+          "classification": "truth",
+          "full_tensor_cosine_vs_f32_truth": {
+            "median": 1.0,
+            "min": 1.0,
+            "max": 1.0000000000000002
+          },
+          "delta_vs_all_fused_median": 0.61760735187586
+        },
+        {
+          "arm": "ablate:attention_block_fused",
+          "op_key": "attention_block_fused",
+          "classification": "neutral",
+          "full_tensor_cosine_vs_f32_truth": {
+            "median": 0.38239264812414003,
+            "min": -0.08995117798137069,
+            "max": 0.4143463867235264
+          },
+          "delta_vs_all_fused_median": 0.0
+        },
+        {
+          "arm": "ablate:cast_add_bf16",
+          "op_key": "cast_add_bf16",
+          "classification": "neutral",
+          "full_tensor_cosine_vs_f32_truth": {
+            "median": 0.38239264812414003,
+            "min": -0.08995117798137069,
+            "max": 0.4143463867235264
+          },
+          "delta_vs_all_fused_median": 0.0
+        },
+        {
+          "arm": "ablate:cast_scale_bf16_f32",
+          "op_key": "cast_scale_bf16_f32",
+          "classification": "neutral",
+          "full_tensor_cosine_vs_f32_truth": {
+            "median": 0.38239264812414003,
+            "min": -0.08995117798137069,
+            "max": 0.4143463867235264
+          },
+          "delta_vs_all_fused_median": 0.0
+        },
+        {
+          "arm": "ablate:geglu_fused",
+          "op_key": "geglu_fused",
+          "classification": "neutral",
+          "full_tensor_cosine_vs_f32_truth": {
+            "median": 0.033899865815843644,
+            "min": -0.18981741721383755,
+            "max": 0.4285321698321313
+          },
+          "delta_vs_all_fused_median": -0.3484927823082964
+        },
+        {
+          "arm": "ablate:layer_norm_fused",
+          "op_key": "layer_norm_fused",
+          "classification": "neutral",
+          "full_tensor_cosine_vs_f32_truth": {
+            "median": 0.04279127832488076,
+            "min": -0.18649066288549368,
+            "max": 0.4241834907516178
+          },
+          "delta_vs_all_fused_median": -0.33960136979925926
+        },
+        {
+          "arm": "ablate:lora_linear_fused",
+          "op_key": "lora_linear_fused",
+          "classification": "neutral",
+          "full_tensor_cosine_vs_f32_truth": {
+            "median": 0.3821757753377921,
+            "min": -0.09054111590260683,
+            "max": 0.41528112751300506
+          },
+          "delta_vs_all_fused_median": -0.0002168727863479103
+        },
+        {
+          "arm": "all_off",
+          "op_key": null,
+          "classification": "control",
+          "full_tensor_cosine_vs_f32_truth": {
+            "median": 0.02952003247342841,
+            "min": -0.24314180743951147,
+            "max": 0.20534285512415615
+          },
+          "delta_vs_all_fused_median": -0.3528726156507116
+        }
+      ]
+    },
+    {
+      "label": "b4-s128-gaussian",
+      "batch": 4,
+      "seq": 128,
+      "seeds": [
+        42,
+        43,
+        44
+      ],
+      "lora_rank": 16,
+      "lora_alpha": 32.0,
+      "target_modules": [
+        "Wqkv",
+        "Wo",
+        "Wi"
+      ],
+      "backbone_dtype": "bf16",
+      "lora_init": "gaussian",
+      "ablated_op_keys": [
+        "attention_block_fused",
+        "cast_add_bf16",
+        "cast_scale_bf16_f32",
+        "geglu_fused",
+        "layer_norm_fused",
+        "lora_linear_fused"
+      ],
+      "untestable_op_keys_subsumed": [
+        "lora_epilogue",
+        "rope_fused",
+        "softmax_last_dim_fused"
+      ],
+      "checkpoint_config_sha256": "55dca68059e98f0debf8eb63ab355c451c65b1f5d90fdca4754113fdaadd2cca",
+      "checkpoint_weights_sha256": "44510fec5d3a81a1877f225637b869495f18e55f6f23a09abb9be0acc030295f",
+      "checkpoint_weights_size_bytes": 1583544840,
+      "cosine_floor": 0.7,
+      "derived_per_op_budget": 2.6225131144161242,
+      "table": [
+        {
+          "arm": "all_fused",
+          "op_key": null,
+          "classification": "reference",
+          "full_tensor_cosine_vs_f32_truth": {
+            "median": 0.29992732827471896,
+            "min": -0.26434418270661686,
+            "max": 0.6098268554320911
+          },
+          "delta_vs_all_fused_median": 0.0
+        },
+        {
+          "arm": "f32_truth",
+          "op_key": null,
+          "classification": "truth",
+          "full_tensor_cosine_vs_f32_truth": {
+            "median": 1.0,
+            "min": 0.9999999999999998,
+            "max": 1.0
+          },
+          "delta_vs_all_fused_median": 0.700072671725281
+        },
+        {
+          "arm": "ablate:attention_block_fused",
+          "op_key": "attention_block_fused",
+          "classification": "neutral",
+          "full_tensor_cosine_vs_f32_truth": {
+            "median": 0.29992732827471896,
+            "min": -0.26434418270661686,
+            "max": 0.6098268554320911
+          },
+          "delta_vs_all_fused_median": 0.0
+        },
+        {
+          "arm": "ablate:cast_add_bf16",
+          "op_key": "cast_add_bf16",
+          "classification": "neutral",
+          "full_tensor_cosine_vs_f32_truth": {
+            "median": 0.29992732827471896,
+            "min": -0.26434418270661686,
+            "max": 0.6098268554320911
+          },
+          "delta_vs_all_fused_median": 0.0
+        },
+        {
+          "arm": "ablate:cast_scale_bf16_f32",
+          "op_key": "cast_scale_bf16_f32",
+          "classification": "neutral",
+          "full_tensor_cosine_vs_f32_truth": {
+            "median": 0.29992732827471896,
+            "min": -0.26434418270661686,
+            "max": 0.6098268554320911
+          },
+          "delta_vs_all_fused_median": 0.0
+        },
+        {
+          "arm": "ablate:geglu_fused",
+          "op_key": "geglu_fused",
+          "classification": "neutral",
+          "full_tensor_cosine_vs_f32_truth": {
+            "median": 0.3900864861383819,
+            "min": -0.12209544210155708,
+            "max": 0.791235042244014
+          },
+          "delta_vs_all_fused_median": 0.09015915786366296
+        },
+        {
+          "arm": "ablate:layer_norm_fused",
+          "op_key": "layer_norm_fused",
+          "classification": "neutral",
+          "full_tensor_cosine_vs_f32_truth": {
+            "median": 0.409205786363008,
+            "min": 0.2977817123484597,
+            "max": 0.5483598700309534
+          },
+          "delta_vs_all_fused_median": 0.10927845808828901
+        },
+        {
+          "arm": "ablate:lora_linear_fused",
+          "op_key": "lora_linear_fused",
+          "classification": "neutral",
+          "full_tensor_cosine_vs_f32_truth": {
+            "median": 0.5653801466017936,
+            "min": -0.2857553363282882,
+            "max": 0.7039233043260612
+          },
+          "delta_vs_all_fused_median": 0.2654528183270746
+        },
+        {
+          "arm": "all_off",
+          "op_key": null,
+          "classification": "control",
+          "full_tensor_cosine_vs_f32_truth": {
+            "median": 0.45064983907297124,
+            "min": 0.13334156974438355,
+            "max": 0.766743733551042
+          },
+          "delta_vs_all_fused_median": 0.15072251079825227
+        }
+      ]
+    },
+    {
+      "label": "b8-s128-gaussian",
+      "batch": 8,
+      "seq": 128,
+      "seeds": [
+        42,
+        43,
+        44
+      ],
+      "lora_rank": 16,
+      "lora_alpha": 32.0,
+      "target_modules": [
+        "Wqkv",
+        "Wo",
+        "Wi"
+      ],
+      "backbone_dtype": "bf16",
+      "lora_init": "gaussian",
+      "ablated_op_keys": [
+        "attention_block_fused",
+        "cast_add_bf16",
+        "cast_scale_bf16_f32",
+        "geglu_fused",
+        "layer_norm_fused",
+        "lora_linear_fused"
+      ],
+      "untestable_op_keys_subsumed": [
+        "lora_epilogue",
+        "rope_fused",
+        "softmax_last_dim_fused"
+      ],
+      "checkpoint_config_sha256": "55dca68059e98f0debf8eb63ab355c451c65b1f5d90fdca4754113fdaadd2cca",
+      "checkpoint_weights_sha256": "44510fec5d3a81a1877f225637b869495f18e55f6f23a09abb9be0acc030295f",
+      "checkpoint_weights_size_bytes": 1583544840,
+      "cosine_floor": 0.7,
+      "derived_per_op_budget": 2.4925224125094187,
+      "table": [
+        {
+          "arm": "all_fused",
+          "op_key": null,
+          "classification": "reference",
+          "full_tensor_cosine_vs_f32_truth": {
+            "median": 0.46651563953170366,
+            "min": 0.01213587041221835,
+            "max": 0.8429766745820246
+          },
+          "delta_vs_all_fused_median": 0.0
+        },
+        {
+          "arm": "f32_truth",
+          "op_key": null,
+          "classification": "truth",
+          "full_tensor_cosine_vs_f32_truth": {
+            "median": 1.0,
+            "min": 1.0,
+            "max": 1.0
+          },
+          "delta_vs_all_fused_median": 0.5334843604682964
+        },
+        {
+          "arm": "ablate:attention_block_fused",
+          "op_key": "attention_block_fused",
+          "classification": "neutral",
+          "full_tensor_cosine_vs_f32_truth": {
+            "median": 0.46651563953170366,
+            "min": 0.01213587041221835,
+            "max": 0.8429766745820246
+          },
+          "delta_vs_all_fused_median": 0.0
+        },
+        {
+          "arm": "ablate:cast_add_bf16",
+          "op_key": "cast_add_bf16",
+          "classification": "neutral",
+          "full_tensor_cosine_vs_f32_truth": {
+            "median": 0.46651563953170366,
+            "min": 0.01213587041221835,
+            "max": 0.8429766745820246
+          },
+          "delta_vs_all_fused_median": 0.0
+        },
+        {
+          "arm": "ablate:cast_scale_bf16_f32",
+          "op_key": "cast_scale_bf16_f32",
+          "classification": "neutral",
+          "full_tensor_cosine_vs_f32_truth": {
+            "median": 0.46651563953170366,
+            "min": 0.01213587041221835,
+            "max": 0.8429766745820246
+          },
+          "delta_vs_all_fused_median": 0.0
+        },
+        {
+          "arm": "ablate:geglu_fused",
+          "op_key": "geglu_fused",
+          "classification": "neutral",
+          "full_tensor_cosine_vs_f32_truth": {
+            "median": 0.3366403434246858,
+            "min": -0.25721768159278313,
+            "max": 0.7305035655555101
+          },
+          "delta_vs_all_fused_median": -0.12987529610701787
+        },
+        {
+          "arm": "ablate:layer_norm_fused",
+          "op_key": "layer_norm_fused",
+          "classification": "neutral",
+          "full_tensor_cosine_vs_f32_truth": {
+            "median": 0.7257442372314374,
+            "min": 0.5867877130307625,
+            "max": 0.8731095261447078
+          },
+          "delta_vs_all_fused_median": 0.2592285976997338
+        },
+        {
+          "arm": "ablate:lora_linear_fused",
+          "op_key": "lora_linear_fused",
+          "classification": "neutral",
+          "full_tensor_cosine_vs_f32_truth": {
+            "median": 0.7966931510213888,
+            "min": 0.5011843419188625,
+            "max": 0.9261947888574702
+          },
+          "delta_vs_all_fused_median": 0.33017751148968516
+        },
+        {
+          "arm": "all_off",
+          "op_key": null,
+          "classification": "control",
+          "full_tensor_cosine_vs_f32_truth": {
+            "median": 0.7682894741254039,
+            "min": 0.6891699414424902,
+            "max": 0.8448838610256241
+          },
+          "delta_vs_all_fused_median": 0.3017738345937003
+        }
+      ]
+    }
+  ],
+  "gates": [
+    {
+      "lora_init": "peft-step1",
+      "legs": [
+        "b4-s128-peft-step1",
+        "b8-s128-peft-step1"
+      ],
+      "result": "PASS",
+      "exit_code": 0
+    },
+    {
+      "lora_init": "gaussian",
+      "legs": [
+        "b4-s128-gaussian",
+        "b8-s128-gaussian"
+      ],
+      "result": "PASS",
+      "exit_code": 0
+    }
+  ]
+}

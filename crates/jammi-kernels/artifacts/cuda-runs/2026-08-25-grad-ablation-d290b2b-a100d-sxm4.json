@@ -17,7 +17,7 @@
     "invocation": "MODEL_DIR=/root/checkpoints/ModernBERT-large ci/scripts/perf/run_grad_oracle_ablation.sh /root/proof-out/grad-ablation b4-s128-seed42:4:128:42 b8-s128:8:128:42",
     "gating": "none"
   },
-  "status": "grad-oracle --ablate-each-op ran to completion on both legs; the fused-op gradient parity gate FAILS both (pre-existing esc-045 defect on main's tip, not introduced by this PR -- this PR builds the ablation TOOL that surfaces it, and does not fix the underlying kernel defect).",
+  "status": "SUPERSEDED by crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-grad-ablation-9e2b1f6-a100b-pcie.json (round-7 fix: --seeds 42,43,44 with median/min/max, per-op budget = 3x all_fused's own seed spread per shape, PeftStep1 default + gaussian diagnostic). This file's single-seed, fixed-threshold-0.02 gate result below is retained for history only -- do not cite it as the current gate outcome. Original status: grad-oracle --ablate-each-op ran to completion on both legs; the fused-op gradient parity gate FAILS both (pre-existing esc-045 defect on main's tip, not introduced by this PR -- this PR builds the ablation TOOL that surfaces it, and does not fix the underlying kernel defect).",
   "legs": [
     {
       "label": "b4-s128-seed42",

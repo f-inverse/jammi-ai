@@ -31,15 +31,22 @@ Each item is a **general principle** to apply to a design you have never seen. T
 
 **Apply these principles to the diff in front of you; a novel-but-analogous smell is in scope; default to BLOCK when uncertain. Do not limit yourself to the illustrative instances.** (Here the diff is the would-be diff the plan describes, and BLOCK is `KILL`/`REFINE` in this card's verdict vocabulary.)
 
+## Reporting the unit, not just the plan
+
+Report `unit_branch` (`git -C <worktree> rev-parse --abbrev-ref HEAD` if resolvable, else the `unit:` line the lead's brief carried — say which) and `head_sha` (`git rev-parse HEAD` at the same location). Report `class_enumeration` when a REFINE/KILL finding has siblings worth naming (other plan sections carrying the same wrong-abstraction/band-aid shape); `sweep_method: "none"` when you did not sweep.
+
 ## Verdict schema
 
-Emit exactly one fenced JSON block. `PROCEED` = the design survives; `REFINE` = it can proceed only with named changes; `KILL` = the design is wrong at its root. Any unrefuted `block`-severity finding forces at least `REFINE`; a root-level design error forces `KILL`. Default to `REFINE`/`KILL` under uncertainty.
+Emit exactly one fenced ```json block as the LAST fenced block of your final message, with `"kind": "verdict"` as its first field (a `<verdict>...</verdict>`-tag-wrapped block is also an accepted, older form). `PROCEED` = the design survives; `REFINE` = it can proceed only with named changes; `KILL` = the design is wrong at its root. Any unrefuted `block`-severity finding forces at least `REFINE`; a root-level design error forces `KILL`. Default to `REFINE`/`KILL` under uncertainty.
 
 ```json
-<verdict>
 {
+  "kind": "verdict",
   "agent": "pressure-tester",
   "target": "the plan / contract under test",
+  "unit_branch": "<the branch you read, from git or the lead's unit: line — say which>",
+  "head_sha": "<sha you read>",
+  "worktree": "<the absolute path you read the diff from — recorded for provenance; the lead may cite it in its own written class-probe, see `.claude/agents/lead.md` 'The class, not the instance'>",
   "verdict": "PROCEED | REFINE | KILL",
   "uncertain": false,
   "premises_reproduced": [
@@ -54,7 +61,9 @@ Emit exactly one fenced JSON block. `PROCEED` = the design survives; `REFINE` = 
       "stands": true
     }
   ],
+  "class_enumeration": ["path:line or plan section", "…sibling sites carrying the same design flaw, if any"],
+  "sweep_method": "how you enumerated the class — 'none' if you did not sweep",
+  "exhaustive": false,
   "notes": "what the design got right"
 }
-</verdict>
 ```

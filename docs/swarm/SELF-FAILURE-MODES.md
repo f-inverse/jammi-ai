@@ -153,13 +153,48 @@ cannot (`AGENTIC-PLAYBOOK.md` §1). Everything below is a specific way that spin
   conformal did not restore coverage under a location shift. (`AGENTIC-PLAYBOOK.md` §7;
   `CASE-STUDIES.md` §3a; constitution B5, K2.)
 
+## F10 · Lead passivity — relaying verifier findings round-by-round
+
+- **Trigger.** A verifier (`adversarial-audit`/`fix-verifier`/etc.) returns BLOCK on a unit.
+  The lead has a standing instruction ("on every BLOCK, the auditor's findings are a SAMPLE
+  from a class — probe the class yourself, in parallel with the fix, before dispatching") in
+  three places: memory, `CLAUDE.md`, and this agent's own card.
+- **Symptom.** The lead forwards the verifier's finding list to the implementer verbatim,
+  round after round, without probing for sibling/class members the verifier's own sweep did
+  not name. The instruction sat in context and lost at the decision point every time.
+- **Root cause.** A norm in context competes with everything else in context (the diff, the
+  verdict, the phase machine, the user's last message) and loses — prose the lead "should"
+  remember is not infrastructure. This is the general failure the whole swarm exists to fix
+  (`ARCHITECTURE.md §1`), caught here in its most expensive instance: the audit-round loop.
+- **Prevention.** Two parts, today. (1) Every verifier card now REQUIRES a `class_enumeration`
+  field in its verdict (the union of every sibling site its own sweep found for each
+  BLOCK-severity finding, or an explicit `sweep_method: "none"` when it did not sweep) — the
+  verifier no longer hands the lead one instance and calls it done; it enumerates the class it
+  found, by default. (2) The lead's own brief to an implementer states the class in one
+  sentence and cites every member it is briefing against (`lead.md` "The class, not the
+  instance"), so the omission is visible in the artifact the lead writes, not just in its own
+  head. **There is no mechanical gate yet** — nothing currently blocks a dispatch that skips
+  this; a hook-based gate that makes the round-by-round relay hard to satisfy by rewording a
+  prompt was designed and built across three audit rounds but is not yet merged (see #402,
+  held in draft on outstanding review findings). Until #402 lands, this is discipline, not
+  enforcement — named honestly, not overclaimed.
+- **Incident.** One session: ~43 audit/BLOCK rows across three units (`check_kernel_oracles.py`
+  7 rounds, `check_perf_claims.py` 5 rounds, the pod-build substrate 6 rounds) against 3 lead
+  probe rows total. When the lead finally probed, it found unnamed class members within
+  minutes on every unit it checked (a sibling of a named finding in the same file; a
+  745-instance unit-wrapper class the audit itself later independently found; 3 of 4 unpinned
+  CUDA kernels when the audit named one) — the class was findable the whole time; it was never
+  looked for. A prior session showed the same ratio (11 BLOCK rows, 0 probes).
+
 ---
 
 ## Using this catalog
 
-At phase 0 the lead names which of F1–F9 the brief is exposed to and pins the gate that
+At phase 0 the lead names which of F1–F10 the brief is exposed to and pins the gate that
 catches each (F1→phase 1, F2→phase 4, F3/F4→phase 7, F5→build-env hook, F6→citation-checker,
-F7→fix-verifier, F8→pressure-test, F9→audit + honesty gate). A defect that slips every gate
-and is caught later is logged to the escape ledger (`.jammi/escapes.jsonl`) and clustered by
-the retrospective loop into a new gate — so each failure mode compounds into infrastructure
-instead of re-teaching itself every session.
+F7→fix-verifier, F8→pressure-test, F9→audit + honesty gate, F10→no mechanical gate yet; see
+#402 — today, the verifier-card `class_enumeration` requirement and the lead's own audit-brief
+practice are discipline, not enforcement). A defect that slips every gate and is caught later
+is logged to the escape ledger (`.jammi/escapes.jsonl`) and clustered by the retrospective loop
+into a new gate — so each failure mode compounds into infrastructure instead of re-teaching
+itself every session.

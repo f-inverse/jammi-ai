@@ -31,15 +31,22 @@ Each item is a **general principle** applied to a surface you have never seen. T
 
 **Apply these principles to the diff in front of you; a novel-but-analogous smell is in scope; default to BLOCK when uncertain. Do not limit yourself to the illustrative instances.**
 
+## Reporting the unit, not just the diff
+
+Report `unit_branch` (`git -C <worktree> rev-parse --abbrev-ref HEAD` if resolvable, else the `unit:` line the lead's brief carried — say which) and `head_sha` (`git rev-parse HEAD` at the same location). Report `class_enumeration` when a discipline-test finding has siblings (the same governance verb or consumer-shaped surface appearing at other sites the diff touches); `sweep_method: "none"` when you did not sweep.
+
 ## Verdict schema
 
-Emit exactly one fenced JSON block. Any unrefuted `block`-severity finding, or uncertainty about whether a surface passes the discipline test, forces `BLOCK`.
+Emit exactly one fenced ```json block as the LAST fenced block of your final message, with `"kind": "verdict"` as its first field (a `<verdict>...</verdict>`-tag-wrapped block is also an accepted, older form). Any unrefuted `block`-severity finding, or uncertainty about whether a surface passes the discipline test, forces `BLOCK`.
 
 ```json
-<verdict>
 {
+  "kind": "verdict",
   "agent": "discipline-test-auditor",
   "diff_range": "<base>...<head>",
+  "unit_branch": "<the branch you read, from git or the lead's unit: line — say which>",
+  "head_sha": "<sha you read>",
+  "worktree": "<the absolute path you read the diff from — recorded for provenance; the lead may cite it in its own written class-probe, see `.claude/agents/lead.md` 'The class, not the instance'>",
   "verdict": "BLOCK | PASS",
   "uncertain": false,
   "mechanical_gate": "check_no_consumer_names.py: green | red | not-run",
@@ -53,7 +60,9 @@ Emit exactly one fenced JSON block. Any unrefuted `block`-severity finding, or u
       "stands": true
     }
   ],
+  "class_enumeration": ["path:line", "…sibling surfaces carrying the same discipline-test failure, if any"],
+  "sweep_method": "how you enumerated the class — 'none' if you did not sweep",
+  "exhaustive": false,
   "notes": "surfaces examined and found generic"
 }
-</verdict>
 ```

@@ -32,27 +32,47 @@ use crate::layout_walk::StridedOffsets;
 /// supports the same four combinations and additionally requires
 /// contiguous storage.
 ///
-/// ## The bf16 rounding model: round-before-add, not accumulate-then-round
+/// ## The bf16 rounding model: f32-accumulate, round ONCE (esc-046 fix)
 ///
-/// This is the ONE place this op's rounding model deliberately does NOT
-/// follow [`Axpy`](super::Axpy)'s "f32-accumulate, round once" precedent.
-/// `Axpy` chose single-rounding as a documented DIVERGENCE from candle's
-/// own multi-step bf16 arithmetic. Here the target is different: `PEFT`'s
-/// reference implementation (`peft/tuners/lora/layer.py`, `Linear.forward`)
-/// computes the delta as `lora_B(lora_A(dropout(x)))` times `scaling`, with
-/// `x` cast UP to `lora_A.weight.dtype` and the delta's product cast back
-/// DOWN to the base result's dtype BEFORE the add — i.e. `torch` itself
-/// rounds the scaled delta to the base dtype, then adds two same-dtype
-/// tensors (which `torch`/`candle` both compute by promoting to `f32`,
-/// adding, and rounding back once). That is TWO round points, not one:
-/// first the cast on the scaled delta, then the add's own single rounding.
-/// This op reproduces that model exactly — round the scaled delta to
-/// `base`'s dtype, then add and round once more — which is why, unlike
-/// `Axpy`, the CPU (`F32`,`F32`)/(`BF16`,`F32`) combinations that
-/// `jammi-lora`'s admission predicate actually reaches are BIT-EXACT
-/// against the eager `[mul, cast, add]` composition (see
-/// `tests/scaled_cast_add_oracles.rs`), not merely within a stated ULP
-/// tolerance.
+/// This now follows [`Axpy`](super::Axpy)'s "f32-accumulate, round once"
+/// precedent after all — an EARLIER revision of this doc claimed PEFT
+/// rounds the scaled delta to the base dtype BEFORE the add (two round
+/// points) and cited that as the reason this op deliberately diverged from
+/// `Axpy`. That claim was never checked at PEFT source and is FALSE
+/// (esc-046, GH#374): `peft/tuners/lora/layer.py`'s `Linear.forward`
+/// (`peft==0.20.0`, lines 1044-1069, re-read at source on pod a100e
+/// 2026-08-26) computes
+/// `result = result + lora_B(lora_A(dropout(x))) * scaling` (line 1058,
+/// inside the per-adapter loop) — torch's `+` PROMOTES the bf16 `result`
+/// to the delta's `f32` dtype (standard type promotion, no rounding lost
+/// on `result`'s side), adds in `f32`, and only THEN does
+/// `result = result.to(torch_result_dtype)` (line 1069, AFTER the loop)
+/// cast back down — ONE round point, at the very end, not two. This op
+/// now reproduces THAT model: widen `base` to `f32` (lossless), add the
+/// already-`f32` scaled `lora`, round the sum to `base`'s own dtype once.
+/// The CPU (`F32`,`F32`)/(`BF16`,`F32`) combinations `jammi-lora`'s
+/// admission predicate actually reaches stay BIT-EXACT against the eager
+/// `[mul, add]` composition (see `tests/scaled_cast_add_oracles.rs`), not
+/// merely within a stated ULP tolerance — the composition itself lost its
+/// separate `cast` step for the same reason (see `jammi-lora`'s
+/// `eager_epilogue`, corrected in the same round).
+///
+/// Confirmed with a live torch experiment (torch 2.11.0+cu128, peft
+/// 0.20.0, A100, 2026-08-26): `base~N(0,100²)` bf16, `delta~N(0,3²)` f32,
+/// `n=4096` → 176/4096 elements differ between the once-rounded
+/// (`(base.float()+delta).to(bf16)`) and round-then-add
+/// (`base.float()+delta.to(bf16).float()).to(bf16)`) formulas, max
+/// `|diff| = 1.0` (one bf16 ULP at `|base|~100`; at ModernBERT-large's own
+/// layer-18 residual magnitude, `-6688` (esc-045), one ULP there is `32` —
+/// the extra rounding point this fix removes sat directly on the residual
+/// stream every subsequent layer's forward AND recomputed-backward reads).
+/// The same amplitude and discriminating-fixture claim is reproduced
+/// in-tree, with its own independently-seeded fixture — see
+/// `bf16_epilogue_matches_peft_rounding_not_the_round_delta_first_formula`
+/// in `tests/scaled_cast_add_peft_rounding.rs` (a plain backtick span, not
+/// an intra-doc link: that test lives in a separate integration-test
+/// crate rustdoc cannot resolve into — an `[`...`]` link form here would
+/// fail `cargo doc`'s `-D warnings` gate).
 ///
 /// ## The other two combinations are NOT bit-exact — disclosed, not assumed
 ///
@@ -217,11 +237,13 @@ fn scaled_cast_add_f32_bf16(
 }
 
 /// The reachable production combination (`BF16` backbone, `F32` LoRA
-/// adapter): rounds the scaled delta to `bf16` FIRST (matching eager's
-/// explicit `.to_dtype(base_out.dtype())`), then adds via the same
-/// promote-compute-round-once semantics candle's own bf16 arithmetic uses
-/// for a single binary op — two round points total, reproducing eager
-/// bit-for-bit (see this op's own module doc and
+/// adapter): esc-046 fix (GH#374) — widens `base` to `f32` (lossless),
+/// adds the already-`f32` scaled `lora` (no intermediate bf16-rounded
+/// `delta`), and rounds the sum to `bf16` ONCE. Matches PEFT's
+/// `Linear.forward` (`result + lora_out*scaling` under torch's own bf16->
+/// f32 promotion, THEN one `.to(torch_result_dtype)` cast — see this op's
+/// own module doc) bit-for-bit on the CPU (`F32`,`F32`)/(`BF16`,`F32`)
+/// combinations `jammi-lora`'s admission predicate actually reaches (see
 /// `tests/scaled_cast_add_oracles.rs`).
 fn scaled_cast_add_bf16_f32(
     scaling: f64,
@@ -233,10 +255,7 @@ fn scaled_cast_add_bf16_f32(
     let scaling = scaling as f32;
     StridedOffsets::from_layout(lb)
         .zip(StridedOffsets::from_layout(ll))
-        .map(|(ib, il)| {
-            let delta = bf16::from_f32(lora[il] * scaling);
-            bf16::from_f32(base[ib].to_f32() + delta.to_f32())
-        })
+        .map(|(ib, il)| bf16::from_f32(base[ib].to_f32() + lora[il] * scaling))
         .collect()
 }
 
@@ -250,10 +269,7 @@ fn scaled_cast_add_bf16_bf16(
     let scaling = scaling as f32;
     StridedOffsets::from_layout(lb)
         .zip(StridedOffsets::from_layout(ll))
-        .map(|(ib, il)| {
-            let delta = bf16::from_f32(lora[il].to_f32() * scaling);
-            bf16::from_f32(base[ib].to_f32() + delta.to_f32())
-        })
+        .map(|(ib, il)| bf16::from_f32(base[ib].to_f32() + lora[il].to_f32() * scaling))
         .collect()
 }
 

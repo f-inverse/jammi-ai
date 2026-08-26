@@ -750,6 +750,86 @@ mod tests {
         assert_eq!(got, [4.0, -8.0]);
     }
 
+    /// esc-046 (GH#374) control (g) SCOPE FENCE: the FORWARD fix
+    /// (`ScaledCastAdd`'s epilogue rounding order, `ops/scaled_cast_add.rs`)
+    /// touches a DIFFERENT op entirely — this file (`cast_scale.rs`) has no
+    /// diff in that change at all. This is the biting pin that makes that
+    /// claim checkable rather than merely asserted: `CastAddBf16::bwd`'s
+    /// `dx` path (`d_base = grad_res` identity, `d_f32val =
+    /// cast_to(f32val.dtype())(grad_res)`) is re-derived independently here
+    /// (elementwise, from the two small-`n` fixtures above's OWN documented
+    /// formula, not by importing this file's `bwd` and trusting it) and
+    /// pinned bit-for-bit at PRODUCTION width (`n = 4096`, matching
+    /// esc-046's own forward-side production-width fixture in
+    /// `tests/scaled_cast_add_peft_rounding.rs`) — a future change to this
+    /// op's rounding placement (e.g. mistakenly "fixing" it to match
+    /// `ScaledCastAdd`'s new round-once forward model) would move this test
+    /// off its own hand formula and fail here, not silently pass because
+    /// only a 2-element fixture was ever checked at scale.
+    #[test]
+    fn cast_add_bwd_dx_path_bit_identical_to_hand_formula_at_production_width_esc046_control_g() {
+        let device = Device::Cpu;
+        let n = 4096usize;
+        // `base` unused by `bwd` (the op's own `d_base = grad_res` identity
+        // does not read it at all — see `bwd`'s signature, `_base`), kept
+        // as a real tensor only so the real `CustomOp2::bwd` call shape
+        // matches production. `f32val`'s only role in `bwd` is its OWN
+        // `dtype()` (deciding whether `d_f32val` needs a cast at all) —
+        // its VALUES are irrelevant to `bwd`, unlike `cpu_fwd`.
+        let base_v: Vec<bf16> = (0..n)
+            .map(|i| bf16::from_f32(((i as f32 * 0.013).cos()) * 6700.0))
+            .collect();
+        let f32_v: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.029).sin()) * 3.7).collect();
+        // The upstream gradient (`grad_res`) is F32 — the shape a real
+        // `LowRankResidualLinear::bwd` call threads through this op today
+        // (`res`'s own dtype is BF16, but `bwd`'s `grad_res` argument here
+        // is exercised directly, white-box, at F32 — the branch this op's
+        // own doc states as the "chain rule through the round" case,
+        // mirroring `cast_add_bwd_is_identity_when_grad_res_already_matches_f32val_dtype`'s
+        // F32/F32 pairing, just at production width instead of `n = 2`).
+        let grad_res_v: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.041).cos()) * 512.0).collect();
+
+        let base = Tensor::from_slice(&base_v, (n,), &device).unwrap();
+        let f32val = Tensor::from_slice(&f32_v, (n,), &device).unwrap();
+        let res = base.clone();
+        let grad_res = Tensor::from_slice(&grad_res_v, (n,), &device).unwrap();
+
+        let op = CastAddBf16::new();
+        let (d_base, d_f32val) = CustomOp2::bwd(&op, &base, &f32val, &res, &grad_res).unwrap();
+        let d_base = d_base.expect("d_base must be Some");
+        let d_f32val = d_f32val.expect("d_f32val must be Some");
+
+        // Independent hand formula: `d_base` is `grad_res` UNCHANGED
+        // (identity — no cast, no dtype change), `d_f32val` is `grad_res`
+        // cast to `f32val`'s own dtype (`F32`, a same-dtype no-op cast
+        // here — `grad_res` is already `F32`).
+        assert_eq!(d_base.dtype(), DType::F32, "d_base is grad_res, unchanged");
+        assert_eq!(d_f32val.dtype(), DType::F32);
+
+        let got_base: Vec<f32> = d_base.to_vec1().unwrap();
+        let got_f32val: Vec<f32> = d_f32val.to_vec1().unwrap();
+
+        for i in 0..n {
+            assert!(
+                got_base[i].is_finite() && got_f32val[i].is_finite() && grad_res_v[i].is_finite(),
+                "index {i}: a non-finite value slipped through (base={} f32val={} grad={})",
+                got_base[i],
+                got_f32val[i],
+                grad_res_v[i]
+            );
+            assert_eq!(
+                got_base[i].to_bits(),
+                grad_res_v[i].to_bits(),
+                "index {i}: d_base must be bit-identical to grad_res (identity)"
+            );
+            assert_eq!(
+                got_f32val[i].to_bits(),
+                grad_res_v[i].to_bits(),
+                "index {i}: d_f32val must be bit-identical to grad_res (same-dtype no-op cast)"
+            );
+        }
+    }
+
     #[test]
     fn cast_add_dtype_error_reports_the_actual_offending_argument() {
         // Discriminates the `s1.dtype() != DType::BF16` branch (the `!=`

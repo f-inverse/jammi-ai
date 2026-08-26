@@ -75,19 +75,97 @@ pub fn lora_epilogue_dispatch_snapshot() -> DispatchSnapshot {
     lora_epilogue_counters().snapshot()
 }
 
-/// The eager `[mul, cast, add]` composition the fused epilogue replaces:
-/// `base_out + cast_to(base_out.dtype())(lora_out * scaling)`. Kept as its
-/// own function so both the eval-mode path (which always uses it — see
-/// `forward`'s doc) and the training-mode fallback (when the fused
-/// kernel's domain does not hold) share exactly one implementation.
+/// The eager `[mul, add, cast]` composition the fused epilogue replaces:
+/// widen `base_out` and the scaled `lora_out` delta to the WIDER of the
+/// two dtypes (torch's own promotion rule — never narrow the wider
+/// operand toward the narrower one), add in that dtype, and cast the SUM
+/// to `base_out`'s ORIGINAL dtype ONCE — esc-046 fix (GH#374), matching
+/// PEFT's `Linear.forward` (`peft/tuners/lora/layer.py` 1044-1069,
+/// `v0.20.0`, re-read at source on pod a100e 2026-08-26): torch's `+`
+/// promotes to the WIDER dtype of its two operands (never toward the
+/// narrower one), adds once, and only THEN casts back to
+/// `torch_result_dtype` (`result`'s OWN original dtype) once via
+/// `.to(torch_result_dtype)`.
+///
+/// **Round 2 fix (esc-046 audit finding 1, `lora_linear.rs:103`):** an
+/// earlier revision of this function promoted `base_out` to `scaled`'s
+/// OWN dtype unconditionally (`base_out.to_dtype(scaled.dtype())`) rather
+/// than to the wider of the two — correct for the (`BF16` base, `F32`
+/// lora) pair this fix was written against (the wider dtype IS `scaled`'s
+/// there), but for the reachable inverse pair (`F32` base, `BF16` lora —
+/// reachable via [`LoraLinear::from_loaded`], whose `lora_a`/`lora_b` are
+/// raw, dtype-unconstrained `Tensor`s, and via eval-mode `forward`, which
+/// calls this function unconditionally) it NARROWED the `f32` base down
+/// to `bf16` before the add, silently destroying the base signal's own
+/// precision — measured 4095/4096 elements diverging from torch's actual
+/// promotion by up to `7.23e-1` (vs torch's own `3.81e-6`) on a
+/// `n=4096`, `|base|~100` fixture. [`wider_float_dtype`] below is the
+/// single source of truth for "which dtype must the add happen in",
+/// shared by every cell of the dtype lattice this function's own tests
+/// (`eager_epilogue_tests`) exercise.
+///
+/// **The `(BF16, BF16)` cell is NOT computed as a native `bf16` add**,
+/// even though `bf16` is trivially "the wider of two equal dtypes" —
+/// [`wider_float_dtype`] floors the compute dtype at `F32` for any
+/// half-precision input, matching torch's own bf16-arithmetic convention
+/// (bf16 ops compute in `f32` internally, never natively) AND sidestepping
+/// a measured candle anomaly: candle-core 0.11.0's CPU `BF16` `Tensor`
+/// `Add` is SIZE-DEPENDENT (the NEON-vectorized path narrows via a bare
+/// truncation, not round-to-nearest-even, for `n` past its `STEP = 32`
+/// lane width — the same anomaly `cast_scale.rs`'s own module doc
+/// documents for `CastAddBf16`'s CPU arm) — `bf16(8.625) + bf16(2.859375)`
+/// measured `11.5` at `n = 8` but `11.4375` at `n = 4096` on this
+/// codebase's own dev/CI arm64 hosts. Routing every add through `F32`
+/// unconditionally means this function never reaches that op at all.
+///
+/// Kept as its own function so both the eval-mode path (which always uses
+/// it — see `forward`'s doc) and the training-mode fallback (when the
+/// fused kernel's domain does not hold) share exactly one implementation.
 fn eager_epilogue(base_out: &Tensor, lora_out: &Tensor, scaling: f64) -> Result<Tensor, LoraError> {
     let scaled = (lora_out * scaling)?;
-    let scaled_cast = if scaled.dtype() != base_out.dtype() {
-        scaled.to_dtype(base_out.dtype())?
+    let base_dtype = base_out.dtype();
+    let compute_dtype = wider_float_dtype(base_dtype, scaled.dtype())?;
+    let base_wide = if base_dtype == compute_dtype {
+        base_out.clone()
     } else {
-        scaled
+        base_out.to_dtype(compute_dtype)?
     };
-    Ok((base_out + &scaled_cast)?)
+    let scaled_wide = if scaled.dtype() == compute_dtype {
+        scaled
+    } else {
+        scaled.to_dtype(compute_dtype)?
+    };
+    let sum = (&base_wide + &scaled_wide)?;
+    Ok(if sum.dtype() == base_dtype {
+        sum
+    } else {
+        sum.to_dtype(base_dtype)?
+    })
+}
+
+/// The single source of truth for "which dtype must an `eager_epilogue`
+/// add happen in", torch's own floating-point promotion rule (family D:
+/// the domain is floating dtypes only — an integer dtype here is a typed
+/// refusal, never a silent reinterpretation): `F64` if either operand is
+/// `F64`, else `F32` unconditionally — `F16`/`BF16` NEVER win (both are
+/// floored at `F32`, matching torch's own "half-precision ops compute in
+/// f32" convention, not merely "wider of the two REPRESENTED widths");
+/// `F32` vs `F32` (or `F16`/`BF16` vs `F16`/`BF16`) stays `F32`. See
+/// `eager_epilogue`'s own doc for the measured regression this closes and
+/// the candle CPU `BF16` `Tensor::add` anomaly this floor sidesteps.
+fn wider_float_dtype(a: DType, b: DType) -> Result<DType, LoraError> {
+    let is_float = |d: DType| matches!(d, DType::F64 | DType::F32 | DType::F16 | DType::BF16);
+    if !is_float(a) || !is_float(b) {
+        return Err(LoraError::Config(format!(
+            "eager_epilogue: unsupported dtype pair ({a:?}, {b:?}) — both operands must be a \
+             floating dtype (F64/F32/F16/BF16)"
+        )));
+    }
+    Ok(if a == DType::F64 || b == DType::F64 {
+        DType::F64
+    } else {
+        DType::F32
+    })
 }
 
 /// Per-op fused/eager dispatch counts for the fused LoRA SITE
@@ -850,5 +928,375 @@ mod lora_scaling_tests {
     fn non_finite_alpha_propagates_visibly_not_silently() {
         let got = lora_scaling(f64::NAN, 4, false).unwrap();
         assert!(got.is_nan(), "NaN alpha must yield a visible NaN scaling");
+    }
+}
+
+/// esc-046 (GH#374) — `eager_epilogue` itself, CPU-hermetic, exercised
+/// directly (not through `LoraLinear::forward`'s dispatch — the
+/// production-width, real-dispatch biting oracle with `DispatchCounters`
+/// live in `crates/jammi-lora/tests/esc046_epilogue_biting_oracle.rs`,
+/// this crate's own integration-test tier). Both tests here compare
+/// against a truth built from candle's own (trusted, generic) `Tensor`
+/// arithmetic and `to_dtype` cast — NEVER a re-implementation of
+/// `eager_epilogue`'s own logic — so a regression to the pre-fix
+/// round-before-add model would fail these, not silently agree with a
+/// copy of itself.
+#[cfg(test)]
+mod eager_epilogue_tests {
+    use super::eager_epilogue;
+    use candle_core::{DType, Device, Tensor};
+
+    /// Widening a `BF16` tensor to `F32` (`Tensor::to_dtype`) is EXACT —
+    /// `bf16` has strictly fewer significand bits than `f32`, so every
+    /// `bf16` value is exactly representable in `f32` and the widen
+    /// introduces no rounding at all (only narrowing, the other
+    /// direction, rounds). Comparing the widened `f32` values for
+    /// equality is therefore equivalent to comparing the underlying
+    /// `bf16` bit patterns directly, without this crate needing its own
+    /// dependency on the `half` crate (a candle-free workaround; `Cargo.toml`
+    /// is the lead/docs-ci shared-declaration class, not freely editable
+    /// here).
+    fn widen_to_f32(t: &Tensor) -> Vec<f32> {
+        t.to_dtype(DType::F32).unwrap().to_vec1().unwrap()
+    }
+
+    /// Hand-verified small fixture, the same "opposite sides of a bf16
+    /// rounding boundary" discipline
+    /// `scaled_cast_add_oracles.rs`'s `fused_vs_eager_bf16_base_f32_lora_fwd_and_bwd_are_bit_exact_on_a_divergent_fixture`
+    /// uses: `base = 1.0078125` (exactly bf16-representable), `delta_f32
+    /// = 2.2508249282836914` (`22.508249282836914 * 0.1`, the SAME f32
+    /// bit pattern that test hand-verifies). Round-before-add would round
+    /// `delta_f32` to bf16 (`2.25`) FIRST, landing the sum EXACTLY halfway
+    /// between two bf16 grid points (`3.2578125`, resolved by
+    /// round-to-even to `3.25`); f32-accumulate sums first
+    /// (`3.2586374282836914`) and rounds once to `3.265625` — the two
+    /// models disagree by exactly one bf16 ULP on this element.
+    // `22.508249282836914` is the exact decimal expansion of one specific
+    // f32 bit pattern, verified against `scaled_cast_add_oracles.rs`'s own
+    // hand computation — kept at full precision rather than clippy's own
+    // suggested truncation (`22.508_25`) so nothing here risks silently
+    // landing on a DIFFERENT f32 value than the one this test's documented
+    // hand computation is actually about.
+    #[allow(clippy::excessive_precision)]
+    #[test]
+    fn eager_epilogue_matches_hand_computed_peft_rounding_on_a_divergent_fixture() {
+        let device = Device::Cpu;
+        let base = Tensor::from_slice(&[1.0078125_f32], (1,), &device)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        // `lora_out = 22.508249282836914`, `scaling = 0.1` — matches
+        // `eager_epilogue`'s own `lora_out * scaling` step, isolating the
+        // multiply from the add-then-round the fixture targets.
+        let lora_out = Tensor::from_slice(&[22.508249282836914_f32], (1,), &device).unwrap();
+
+        let got = eager_epilogue(&base, &lora_out, 0.1).unwrap();
+        assert_eq!(got.dtype(), DType::BF16);
+        let got_v = widen_to_f32(&got);
+        assert_eq!(
+            got_v[0], 3.265625,
+            "eager_epilogue must match the once-rounded (PEFT) model's hand-computed value"
+        );
+        assert_ne!(
+            got_v[0], 3.25,
+            "eager_epilogue must NOT match the rejected round-before-add model's value \
+             (a regression back to it would silently pass without this assertion)"
+        );
+    }
+
+    /// Production-width (`n = 4096`) sweep — the same amplitude regime
+    /// esc-046's own lead-measured reproduction and
+    /// `tests/scaled_cast_add_peft_rounding.rs` use (`base` amplitude
+    /// ~100 — a bf16-rounded GEMM-output scale — `delta` amplitude ~3, a
+    /// scaled LoRA contribution). Deterministic trig fixture (the same
+    /// idiom `cast_scale.rs`'s own production-amplitude tests use, e.g.
+    /// `cast_add_bit_identical_to_the_eager_two_kernel_chain_at_production_amplitude`)
+    /// rather than a from-scratch PRNG — family L: no untracked external
+    /// generator, and no need to re-derive Box-Muller when a closed form
+    /// already covers "wide, non-tidy" values.
+    #[test]
+    fn eager_epilogue_matches_peft_rounding_at_production_width() {
+        const N: usize = 4096;
+        let device = Device::Cpu;
+        let base_v: Vec<f32> = (0..N)
+            .map(|i| ((i as f32 * 0.0173).sin()) * 100.0)
+            .collect();
+        let delta_v: Vec<f32> = (0..N).map(|i| ((i as f32 * 0.0611).cos()) * 3.0).collect();
+
+        let base_f32 = Tensor::from_slice(&base_v, (N,), &device).unwrap();
+        let base_bf16 = base_f32.to_dtype(DType::BF16).unwrap();
+        let delta_f32 = Tensor::from_slice(&delta_v, (N,), &device).unwrap();
+
+        // The real function under test. `scaling = 1.0` so `lora_out *
+        // scaling == delta_f32` unchanged, isolating the epilogue's own
+        // add-then-round from the (separately tested) multiply.
+        let got = eager_epilogue(&base_bf16, &delta_f32, 1.0).unwrap();
+
+        // PEFT-ordered truth, built from candle's own `Tensor` arithmetic
+        // and `to_dtype` cast directly (never `eager_epilogue`'s own
+        // code): widen `base` to `f32` (lossless), add the `f32` delta,
+        // round to `bf16` ONCE.
+        let peft_truth = (base_bf16.to_dtype(DType::F32).unwrap() + &delta_f32)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+
+        // The REJECTED, pre-esc-046 formula: round the delta to `bf16`
+        // FIRST, then add-and-round again.
+        let delta_rounded_first = delta_f32
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap();
+        let mis_ordered = (base_bf16.to_dtype(DType::F32).unwrap() + &delta_rounded_first)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+
+        // `base_bf16`'s OWN (already-rounded) value — widening it back to
+        // `f32` is exact — is the real additive target `eager_epilogue`
+        // rounds against, NOT the pre-bf16-rounding synthetic `base_v[i]`
+        // (which is not itself bf16-representable in general): control
+        // (b)'s `truth_f64` must be built from what the function under
+        // test actually received, or the comparison is measuring the
+        // wrong quantity.
+        let base_bf16_v = widen_to_f32(&base_bf16);
+        let got_v = widen_to_f32(&got);
+        let truth_v = widen_to_f32(&peft_truth);
+        let mis_v = widen_to_f32(&mis_ordered);
+
+        // Non-finite counts as a mismatch, written affirmatively, BEFORE
+        // any comparison (family F).
+        for i in 0..N {
+            assert!(
+                base_v[i].is_finite()
+                    && delta_v[i].is_finite()
+                    && got_v[i].is_finite()
+                    && truth_v[i].is_finite()
+                    && mis_v[i].is_finite(),
+                "index {i}: a non-finite value slipped through"
+            );
+        }
+
+        // NON-VACUITY: the fixture must actually separate the two
+        // candidate formulas — computed from the two hand/candle-derived
+        // reference formulas alone, independent of what `eager_epilogue`
+        // itself returns.
+        let discriminating = (0..N).filter(|&i| truth_v[i] != mis_v[i]).count();
+        assert!(
+            discriminating >= 20,
+            "fixture is not discriminating: only {discriminating}/{N} elements separate the \
+             once-rounded formula from the round-then-add one — this fixture would read GREEN \
+             on a broken build regardless of eager_epilogue's own logic"
+        );
+
+        // DEFECT (post-fix: GREEN). Raw value equality on the lossless
+        // bf16-widened-to-f32 representation, never a tolerance.
+        let mismatches: Vec<usize> = (0..N).filter(|&i| got_v[i] != truth_v[i]).collect();
+        assert!(
+            mismatches.is_empty(),
+            "eager_epilogue does NOT match PEFT's rounding order on {}/{N} elements (esc-046) \
+             — first mismatch idx={} base={} delta={} got={:?} peft_truth={:?}",
+            mismatches.len(),
+            mismatches[0],
+            base_v[mismatches[0]],
+            delta_v[mismatches[0]],
+            got_v[mismatches[0]],
+            truth_v[mismatches[0]],
+        );
+
+        // Control (a) POWER OF THE COMPARISON: the rejected model must
+        // itself genuinely diverge from the real function's output on the
+        // differing elements (re-derived here from `got`, not merely from
+        // the two reference formulas above) — otherwise a RED reading
+        // pre-fix could be an artifact of fold-order noise, not rounding
+        // placement.
+        let got_vs_mis = (0..N).filter(|&i| got_v[i] != mis_v[i]).count();
+        assert!(
+            got_vs_mis >= 20,
+            "control (a) void: eager_epilogue's real output and the rejected round-before-add \
+             model must diverge on >= 20 elements for a RED-on-old-code reading to mean \
+             anything; measured {got_vs_mis}"
+        );
+
+        // Control (b) F32-TRUTH DIRECTION: on exactly the elements where
+        // the two candidate formulas disagree, the once-rounded
+        // (produced) value must be no farther from f64 truth than the
+        // round-then-add (rejected) value is, strict on at least one.
+        let mut strict_improvements = 0usize;
+        let mut violations = 0usize;
+        for i in 0..N {
+            if truth_v[i] == mis_v[i] {
+                continue;
+            }
+            let truth_f64 = f64::from(base_bf16_v[i]) + f64::from(delta_v[i]);
+            let once_err = (f64::from(got_v[i]) - truth_f64).abs();
+            let old_err = (f64::from(mis_v[i]) - truth_f64).abs();
+            if once_err > old_err + 1e-9 {
+                violations += 1;
+            }
+            if once_err + 1e-9 < old_err {
+                strict_improvements += 1;
+            }
+        }
+        assert_eq!(
+            violations, 0,
+            "control (b) violated: on {violations} differing elements the once-rounded value \
+             is FARTHER from f64 truth than the round-then-add value"
+        );
+        assert!(
+            strict_improvements >= 1,
+            "control (b) is vacuous: the once-rounded value must be STRICTLY closer to f64 \
+             truth than the round-then-add value on at least one differing element"
+        );
+    }
+
+    /// Independent reference for `eager_epilogue`'s dtype-promotion rule —
+    /// built directly from candle `Tensor` ops, ALWAYS explicitly widening
+    /// to `f32` (hardcoded here, never derived from
+    /// `wider_float_dtype`/`eager_epilogue` itself, and never candle's
+    /// native `bf16` `Tensor::add` — see `eager_epilogue`'s own doc for
+    /// why). `scaled = lora_out * scaling` is left in `lora_out`'s OWN
+    /// dtype (torch's "weak Python-scalar" tensor-scalar promotion rule:
+    /// `bf16_tensor * python_float` stays `bf16`) before being widened for
+    /// the add, matching what `eager_epilogue` itself does.
+    fn reference_eager_epilogue(
+        base: &Tensor,
+        lora_out: &Tensor,
+        scaling: f64,
+        base_dtype: DType,
+    ) -> Vec<f32> {
+        let scaled = (lora_out * scaling).unwrap();
+        let base_f32 = base.to_dtype(DType::F32).unwrap();
+        let scaled_f32 = scaled.to_dtype(DType::F32).unwrap();
+        let sum_f32 = (&base_f32 + &scaled_f32).unwrap();
+        sum_f32
+            .to_dtype(base_dtype)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1()
+            .unwrap()
+    }
+
+    /// esc-046 audit round 2, finding 1 (`lora_linear.rs:103`): every cell
+    /// of the base/lora dtype lattice, each checked bit-for-bit against
+    /// [`reference_eager_epilogue`] at production width (`n = 4096`). The
+    /// `(F32 base, BF16 lora)` cell is the one the audit found NARROWED
+    /// the base to `bf16` before the add (a regression this test would
+    /// catch — see the companion non-vacuity test below for the RED
+    /// proof). The `(BF16, BF16)` cell is included to confirm this
+    /// function never reaches candle's native (size-dependent) `bf16`
+    /// `Tensor::add`.
+    #[test]
+    fn eager_epilogue_matches_the_wider_dtype_reference_across_the_full_dtype_lattice() {
+        const N: usize = 4096;
+        let device = Device::Cpu;
+        let base_v: Vec<f32> = (0..N)
+            .map(|i| ((i as f32 * 0.0173).sin()) * 100.0)
+            .collect();
+        let delta_v: Vec<f32> = (0..N).map(|i| ((i as f32 * 0.0611).cos()) * 3.0).collect();
+
+        for &(base_dtype, lora_dtype) in &[
+            (DType::BF16, DType::F32), // the esc-046 pair
+            (DType::F32, DType::BF16), // audit finding 1's narrowing bug
+            (DType::F32, DType::F32),
+            (DType::BF16, DType::BF16),
+        ] {
+            let base_f32 = Tensor::from_slice(&base_v, (N,), &device).unwrap();
+            let base = base_f32.to_dtype(base_dtype).unwrap();
+            let lora_f32 = Tensor::from_slice(&delta_v, (N,), &device).unwrap();
+            let lora_out = lora_f32.to_dtype(lora_dtype).unwrap();
+
+            let got = eager_epilogue(&base, &lora_out, 1.0).unwrap();
+            assert_eq!(
+                got.dtype(),
+                base_dtype,
+                "{base_dtype:?}/{lora_dtype:?}: output must be base's own dtype"
+            );
+            let got_v: Vec<f32> = got.to_dtype(DType::F32).unwrap().to_vec1().unwrap();
+            let expected_v = reference_eager_epilogue(&base, &lora_out, 1.0, base_dtype);
+
+            for i in 0..N {
+                assert!(
+                    got_v[i].is_finite() && expected_v[i].is_finite(),
+                    "{base_dtype:?}/{lora_dtype:?} index {i}: a non-finite value slipped through \
+                     (got={} expected={})",
+                    got_v[i],
+                    expected_v[i]
+                );
+            }
+            assert_eq!(
+                got_v, expected_v,
+                "{base_dtype:?}/{lora_dtype:?}: eager_epilogue must match the wider-dtype \
+                 reference bit-for-bit"
+            );
+        }
+    }
+
+    /// Non-vacuity companion to the lattice test above, for the specific
+    /// `(F32 base, BF16 lora)` pair the audit's finding 1 targeted: the
+    /// REJECTED, narrow-first formula (`base.to_dtype(scaled.dtype())`
+    /// before the add — the audit's own `lora_linear.rs:103`, the exact
+    /// pre-round-2 production code) must diverge substantially from the
+    /// wider-dtype reference on this fixture, proving the lattice test
+    /// above is non-vacuous for this cell: a regression back to
+    /// narrowing-first would fail it, not silently pass.
+    #[test]
+    fn eager_epilogue_f32_base_bf16_lora_would_diverge_under_the_narrow_first_regression() {
+        const N: usize = 4096;
+        let device = Device::Cpu;
+        let base_v: Vec<f32> = (0..N)
+            .map(|i| ((i as f32 * 0.0173).sin()) * 100.0)
+            .collect();
+        let delta_v: Vec<f32> = (0..N).map(|i| ((i as f32 * 0.0611).cos()) * 3.0).collect();
+
+        let base = Tensor::from_slice(&base_v, (N,), &device).unwrap(); // F32
+        let lora_f32 = Tensor::from_slice(&delta_v, (N,), &device).unwrap();
+        let lora_out = lora_f32.to_dtype(DType::BF16).unwrap();
+
+        let scaled = (&lora_out * 1.0).unwrap();
+        // The REJECTED, audit-flagged formula: promote base to `scaled`'s
+        // OWN dtype (narrowing f32 -> bf16) instead of the wider of the
+        // two.
+        let narrowed_sum = (&base.to_dtype(scaled.dtype()).unwrap() + &scaled).unwrap();
+        let narrow_first_v: Vec<f32> = narrowed_sum
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        let expected_v = reference_eager_epilogue(&base, &lora_out, 1.0, DType::F32);
+
+        let discriminating = (0..N)
+            .filter(|&i| narrow_first_v[i] != expected_v[i])
+            .count();
+        assert!(
+            discriminating >= N * 9 / 10,
+            "fixture is not discriminating enough for the narrow-first regression: only \
+             {discriminating}/{N} elements would separate it from the wider-dtype reference"
+        );
+        let max_err = (0..N)
+            .map(|i| (f64::from(narrow_first_v[i]) - f64::from(expected_v[i])).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_err > 0.1,
+            "fixture's narrow-first divergence is too small to be a meaningful regression \
+             proof: {max_err}"
+        );
+
+        // GREEN: the REAL eager_epilogue must NOT reproduce the
+        // narrow-first formula — it must match the reference instead
+        // (re-asserted here, self-contained, not just via the lattice
+        // test above).
+        let got = eager_epilogue(&base, &lora_out, 1.0).unwrap();
+        let got_v: Vec<f32> = got.to_dtype(DType::F32).unwrap().to_vec1().unwrap();
+        assert_eq!(got_v, expected_v);
+        let mismatches_vs_narrow = (0..N).filter(|&i| got_v[i] != narrow_first_v[i]).count();
+        assert!(
+            mismatches_vs_narrow >= N * 9 / 10,
+            "the real eager_epilogue must diverge from the narrow-first (rejected) formula on \
+             most elements; measured {mismatches_vs_narrow}/{N}"
+        );
     }
 }

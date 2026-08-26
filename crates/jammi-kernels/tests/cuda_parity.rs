@@ -5956,6 +5956,7 @@ fn attention_block_bf16_three_way_vs_f32_reference_b1_and_b8_cuda() {
 /// `window` (the healthy oracle); the RED control below passes a
 /// DIFFERENT value on the flash leg only (an off-by-one radius), while the
 /// reference/eager side keeps the real `window`.
+#[derive(Debug)]
 struct FlashUpstreamMeasurement {
     out_fused_max: f64,
     out_eager_max: f64,
@@ -6233,7 +6234,8 @@ fn flash_upstream_acceptance_form_red_control_window_dropped_cuda() {
     let Some(cuda) = cuda_device() else {
         return;
     };
-    let m = measure_flash_upstream_form(&cuda, 8, 512, 16, 64, Some(64), None, 74.0, 12.0);
+    let m = measure_flash_upstream_form(&cuda, 8, 512, 16, 64, Some(64), Some(0), 74.0, 12.0);
+    eprintln!("DIAG window=Some(64) flash_window=Some(0): {m:?}");
     assert!(
         !m.out_ok() || !m.dqkv_ok(),
         "flash window dropped (Some(64) -> None) must VIOLATE the upstream bound on at least one \

@@ -22,6 +22,33 @@
 // point never present in the PEFT reference); `Axpy`'s "f32-accumulate,
 // round once" precedent is the one this op now follows too, not an
 // exception to it.
+//
+// esc-046 audit round 2 (finding 2): PEFT computes the scaled delta
+// (`lora_B(...) * scaling`) as its OWN separate kernel launch (one f32
+// rounding, stored), then `result + delta` as a SECOND separate launch
+// (another f32 rounding) — two separately-rounded f32 operations, never
+// fused. `build.rs`'s own PINNED FLAGS comment states nvcc's `--fmad=true`
+// default (on regardless of `-use_fast_math`, never globally disabled
+// here) may contract an expression shaped like `base + lora * scaling`
+// into a single hardware `fma.rn.f32` — ONE rounding of the true product
+// before the add, not two — and prescribes exactly the fix for a kernel
+// that needs bit-exact parity on one specific expression: explicitly
+// rounded intrinsics (`__fmul_rn` / `__fadd_rn`), not a global
+// `--fmad=false`. An earlier revision of this file used plain `+`/`*`
+// operators here; nvcc 12.6.85 (`--ptx -arch=compute_80`, this crate's
+// pinned target) contracted `bv + lora[i] * scaling` into `fma.rn.f32` in
+// the bf16_f32 kernel specifically (confirmed by compiling this file to
+// PTX and reading the emitted SASS-adjacent PTX directly) — measured to
+// diverge from the separately-rounded (PEFT-faithful) reference on
+// 1/131072 elements at a NON-DYADIC scaling (`sqrt(3)`; every dyadic
+// scaling tested, including this op's own committed fixtures, is 0/131072
+// because a power-of-two scaling factor makes the product exact in f32
+// regardless of fusion, so it has ZERO power to detect this class). All
+// four kernels below share the identical `base + lora * scaling` shape
+// (the f32-output kernels included — torch's f32 add-of-a-scaled-delta
+// path is ALSO mul-round-then-add-round, two separate launches, never
+// fused), so all four are pinned here with `__fmul_rn`/`__fadd_rn`, not
+// just the one the audit's probe happened to compile.
 #include <cuda_bf16.h>
 #include <cstddef>
 
@@ -34,7 +61,7 @@ extern "C" __global__ void scaled_cast_add_f32_f32(
 ) {
     size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < n) {
-        out[i] = base[i] + lora[i] * scaling;
+        out[i] = __fadd_rn(base[i], __fmul_rn(lora[i], scaling));
     }
 }
 
@@ -48,7 +75,7 @@ extern "C" __global__ void scaled_cast_add_f32_bf16(
     size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < n) {
         float lv = __bfloat162float(lora[i]);
-        out[i] = base[i] + lv * scaling;
+        out[i] = __fadd_rn(base[i], __fmul_rn(lv, scaling));
     }
 }
 
@@ -63,9 +90,12 @@ extern "C" __global__ void scaled_cast_add_bf16_f32(
     if (i < n) {
         // ONE round point (esc-046): `base` widens to f32, adds the
         // already-f32-scaled `lora`, rounds once on store — no
-        // intermediate bf16-rounded `delta`.
+        // intermediate bf16-rounded `delta`. `__fmul_rn`/`__fadd_rn`
+        // (round 2 fix) keep the multiply and the add as two SEPARATELY
+        // rounded f32 operations, matching PEFT's own two-launch
+        // execution instead of letting nvcc fuse them into one `fma.rn.f32`.
         float bv = __bfloat162float(base[i]);
-        out[i] = __float2bfloat16(bv + lora[i] * scaling);
+        out[i] = __float2bfloat16(__fadd_rn(bv, __fmul_rn(lora[i], scaling)));
     }
 }
 
@@ -80,6 +110,6 @@ extern "C" __global__ void scaled_cast_add_bf16_bf16(
     if (i < n) {
         float bv = __bfloat162float(base[i]);
         float lv = __bfloat162float(lora[i]);
-        out[i] = __float2bfloat16(bv + lv * scaling);
+        out[i] = __float2bfloat16(__fadd_rn(bv, __fmul_rn(lv, scaling)));
     }
 }

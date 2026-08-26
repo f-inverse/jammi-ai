@@ -50,13 +50,37 @@ fn fused_fwd(scaling: f64, base: &Tensor, lora: &Tensor) -> candle_core::Result<
 /// PEFT's `Linear.forward` promote-add-cast-once order, not the
 /// round-the-delta-first model this helper used before esc-046.
 fn eager_fwd(scaling: f64, base: &Tensor, lora: &Tensor) -> candle_core::Result<Tensor> {
+    // esc-046 audit round 2, finding 1: promote to the WIDER of the two
+    // dtypes (torch's own rule), never narrow base toward lora's dtype —
+    // mirrors jammi_lora::lora_linear::wider_float_dtype exactly (kept as
+    // a literal duplicate here, not an import, since this crate has no
+    // dependency on jammi-lora; family L/oracle-independence: this helper
+    // exists to check FUSED-vs-EAGER wiring parity, not to independently
+    // verify eager_epilogue's own correctness, which
+    // scaled_cast_add_peft_rounding.rs and jammi-lora's own
+    // eager_epilogue_tests do against a truly independent reference).
+    // F16/BF16 always compute at least in F32 (never native bf16
+    // arithmetic — candle's own CPU BF16 Tensor::add is measurably
+    // size-dependent), F32 stays F32, F64 wins if present.
     let scaled = (lora * scaling)?;
     let base_dtype = base.dtype();
-    let sum = if base_dtype == scaled.dtype() {
-        (base + &scaled)?
+    let is_f64 = |d: DType| d == DType::F64;
+    let compute_dtype = if is_f64(base_dtype) || is_f64(scaled.dtype()) {
+        DType::F64
     } else {
-        (&base.to_dtype(scaled.dtype())? + &scaled)?
+        DType::F32
     };
+    let base_wide = if base_dtype == compute_dtype {
+        base.clone()
+    } else {
+        base.to_dtype(compute_dtype)?
+    };
+    let scaled_wide = if scaled.dtype() == compute_dtype {
+        scaled
+    } else {
+        scaled.to_dtype(compute_dtype)?
+    };
+    let sum = (&base_wide + &scaled_wide)?;
     if sum.dtype() == base_dtype {
         Ok(sum)
     } else {

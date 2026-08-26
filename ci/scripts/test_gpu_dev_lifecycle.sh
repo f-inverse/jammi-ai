@@ -428,6 +428,31 @@ fi
 unset MOCK_DEPLOY_RESPONSE
 
 # ═════════════════════════════════════════════════════════════════════════
+# Group 1d — CLI-level: a failed `mktemp -d` (round-3 audit advisory) must
+# abort the invocation outright, not fall through with RP_WORK unset/empty
+# — every later use (the ssh key path, the meta path, the pod deploy
+# itself) would then operate on a garbage or empty path instead of failing
+# loudly at the one place the real cause is known. TMPDIR pointed at a
+# nonexistent directory reproduces a real `mktemp` failure with zero mocked
+# network state required: `shell` must exit 2 before `rp_init` even reaches
+# ssh-keygen, so no deploy call is ever issued.
+# ═════════════════════════════════════════════════════════════════════════
+reset_log
+TMPDIR="$SANDBOX/no-such-tmpdir-$$" bash "$DIR/gpu-dev.sh" shell a100 --ref abcdef1234567890 \
+  >"$SANDBOX/out-mktemp-fail.log" 2>&1
+rc=$?
+[ "$rc" -eq 2 ] && ok "finding(mktemp-failure): an unwritable/nonexistent \$TMPDIR exits 2" \
+  || bad "finding(mktemp-failure): expected exit 2 for an unwritable \$TMPDIR (got $rc); $(cat "$SANDBOX/out-mktemp-fail.log")"
+grep -q "could not create a temp work dir" "$SANDBOX/out-mktemp-fail.log" \
+  && ok "finding(mktemp-failure): the refusal names the real cause (could not create a temp work dir)" \
+  || bad "finding(mktemp-failure): expected a 'could not create a temp work dir' message ($(cat "$SANDBOX/out-mktemp-fail.log"))"
+if log_has "podFindAndDeployOnDemand"; then
+  bad "finding(mktemp-failure): a failed mktemp must issue NO deploy call (regression!)"
+else
+  ok "finding(mktemp-failure): a failed mktemp issues no deploy call"
+fi
+
+# ═════════════════════════════════════════════════════════════════════════
 # Group 2 — rp_pod_verify semantics (function-level): id + this tooling's
 # own "<prefix>-ttl<digits>" NAME SHAPE, never an exact TTL number.
 # ═════════════════════════════════════════════════════════════════════════
@@ -844,40 +869,117 @@ fi
   || bad "finding(session-conflict): l40s's record must survive a matching down on a100 (regression!)"
 
 # ═════════════════════════════════════════════════════════════════════════
-# Group 3d — CLI-level: RP_SESSION is validated as a single path segment
-# ([A-Za-z0-9_-]+) at the point RP_WORK is derived from it (round-2 audit
-# on #388) — a traversing value must be refused BEFORE rp_cleanup's or
-# rp_session_forget's unconditional `rm -rf "$RP_WORK"` could ever act on
-# it. `ls` is used as the driving subcommand: it is the cheapest command
-# that still sources runpod_lib.sh unconditionally, and the validation
-# lives in runpod_lib.sh itself, so every subcommand is equally covered.
+# Group 3d — CLI-level: RP_SESSION is validated as a CONTAINMENT blacklist
+# (empty/'.'/'..' /a '/' anywhere / a leading '-'), not a character
+# whitelist, at the point RP_WORK is derived from it — a traversing value
+# must be refused BEFORE rp_cleanup's or rp_session_forget's unconditional
+# `rm -rf "$RP_WORK"` could ever act on it (round-2 audit on #388). `down`
+# (with NO positional, so RP_SESSION alone resolves SESSION) is the driving
+# subcommand here — a NAMED-session verb, unlike `ls`/`reap`, which never
+# apply this check at all (see Group 3e below).
+#
+# Round-3 audit on #388: the ORIGINAL fix used a `[A-Za-z0-9_-]+` character
+# WHITELIST, which rejected every session name containing a `.` —
+# including `bench.1`, a shape gpu-dev.sh's own dispatch is happy to
+# create (`RP_SESSION=bench.1 gpu-dev.sh up`) — so a live pod under a
+# dotted session name became unreachable by EVERY verb, stranded for its
+# full deadline. The fix below is a blacklist of the shapes that are
+# actually dangerous; a dot anywhere but as the whole name is accepted.
 # ═════════════════════════════════════════════════════════════════════════
 TRAVERSAL_TARGET="$SANDBOX/must-not-be-touched"
 mkdir -p "$TRAVERSAL_TARGET"
 echo "sentinel" > "$TRAVERSAL_TARGET/sentinel.txt"
-RP_SESSION="../$(basename "$TRAVERSAL_TARGET")" bash "$DIR/gpu-dev.sh" ls \
+RP_SESSION="../$(basename "$TRAVERSAL_TARGET")" bash "$DIR/gpu-dev.sh" down \
   >"$SANDBOX/out-traversal.log" 2>&1
 rc=$?
-[ "$rc" -eq 2 ] && ok "finding(RP_SESSION-traversal): a '..'-containing RP_SESSION exits 2" \
-  || bad "finding(RP_SESSION-traversal): expected exit 2 for a traversing RP_SESSION (got $rc); $(cat "$SANDBOX/out-traversal.log")"
-grep -q "RP_SESSION may contain only" "$SANDBOX/out-traversal.log" \
-  && ok "finding(RP_SESSION-traversal): the refusal names the single-path-segment rule" \
-  || bad "finding(RP_SESSION-traversal): expected the '[A-Za-z0-9_-]' refusal text ($(cat "$SANDBOX/out-traversal.log"))"
+[ "$rc" -eq 2 ] && ok "finding(RP_SESSION-blacklist): a '..'-containing RP_SESSION exits 2" \
+  || bad "finding(RP_SESSION-blacklist): expected exit 2 for a traversing RP_SESSION (got $rc); $(cat "$SANDBOX/out-traversal.log")"
+grep -q "RP_SESSION may" "$SANDBOX/out-traversal.log" \
+  && ok "finding(RP_SESSION-blacklist): the refusal names the session-name rule" \
+  || bad "finding(RP_SESSION-blacklist): expected an 'RP_SESSION may ...' refusal text ($(cat "$SANDBOX/out-traversal.log"))"
 [ -f "$TRAVERSAL_TARGET/sentinel.txt" ] \
-  && ok "finding(RP_SESSION-traversal): the out-of-root target directory is untouched" \
-  || bad "finding(RP_SESSION-traversal): the out-of-root target must survive (regression — rm -rf escaped RP_SESSION_ROOT!)"
-# A slash alone (no traversal, but still not a single path segment) must
-# refuse too — the rule is "single segment", not merely "no dot-dot".
-RP_SESSION="a100/evil" bash "$DIR/gpu-dev.sh" ls >"$SANDBOX/out-slash.log" 2>&1
-[ $? -eq 2 ] && ok "finding(RP_SESSION-traversal): an embedded '/' (no '..') also exits 2" \
-  || bad "finding(RP_SESSION-traversal): expected exit 2 for an embedded '/' ($(cat "$SANDBOX/out-slash.log"))"
+  && ok "finding(RP_SESSION-blacklist): the out-of-root target directory is untouched" \
+  || bad "finding(RP_SESSION-blacklist): the out-of-root target must survive (regression — rm -rf escaped RP_SESSION_ROOT!)"
+# A bare '..' (no leading slash) must refuse the same way.
+RP_SESSION=".." bash "$DIR/gpu-dev.sh" down >"$SANDBOX/out-dotdot.log" 2>&1
+[ $? -eq 2 ] && ok "finding(RP_SESSION-blacklist): a bare '..' exits 2" \
+  || bad "finding(RP_SESSION-blacklist): expected exit 2 for a bare '..' ($(cat "$SANDBOX/out-dotdot.log"))"
+# A slash anywhere (no traversal, but still a multi-segment path) refuses.
+RP_SESSION="a100/evil" bash "$DIR/gpu-dev.sh" down >"$SANDBOX/out-slash.log" 2>&1
+[ $? -eq 2 ] && ok "finding(RP_SESSION-blacklist): an embedded '/' (no '..') also exits 2" \
+  || bad "finding(RP_SESSION-blacklist): expected exit 2 for an embedded '/' ($(cat "$SANDBOX/out-slash.log"))"
+# A leading '-' refuses (reads as an option to any tool it is later passed
+# to positionally).
+RP_SESSION="-x" bash "$DIR/gpu-dev.sh" down >"$SANDBOX/out-dash.log" 2>&1
+[ $? -eq 2 ] && ok "finding(RP_SESSION-blacklist): a leading '-' exits 2" \
+  || bad "finding(RP_SESSION-blacklist): expected exit 2 for a leading '-' ($(cat "$SANDBOX/out-dash.log"))"
+# THE round-3 regression itself: a DOTTED session name (not the whole name
+# being '.'/'..') is accepted, not refused. No recorded pod for it, so
+# `down` simply reports that and exits 0 -- the point is that it reaches
+# THAT far at all, rather than refusing at the RP_SESSION gate.
+RP_SESSION="a100.2" bash "$DIR/gpu-dev.sh" down >"$SANDBOX/out-dotted.log" 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && ok "finding(RP_SESSION-blacklist): a dotted session name ('a100.2') is accepted, not refused" \
+  || bad "finding(RP_SESSION-blacklist): a dotted session name must be accepted (got rc=$rc); $(cat "$SANDBOX/out-dotted.log")"
+grep -q "RP_SESSION may" "$SANDBOX/out-dotted.log" \
+  && bad "finding(RP_SESSION-blacklist): a dotted session name must NOT trigger the RP_SESSION refusal (regression to the whitelist!)" \
+  || ok "finding(RP_SESSION-blacklist): a dotted session name triggers no RP_SESSION refusal"
 # An ordinary session name (letters, digits, hyphen, underscore) is
-# unaffected — every OTHER test in this suite already exercises this
-# path, but pinned directly here so a future over-tightening of the
-# pattern is caught in the same place as the traversal fix itself.
-RP_SESSION="a100-2" bash "$DIR/gpu-dev.sh" ls >"$SANDBOX/out-ordinary.log" 2>&1
-[ $? -eq 0 ] && ok "finding(RP_SESSION-traversal): an ordinary [A-Za-z0-9_-] session name is still accepted" \
-  || bad "finding(RP_SESSION-traversal): an ordinary session name must still work ($(cat "$SANDBOX/out-ordinary.log"))"
+# unaffected — pinned directly here alongside the blacklist shapes.
+RP_SESSION="a100-2" bash "$DIR/gpu-dev.sh" down >"$SANDBOX/out-ordinary.log" 2>&1
+[ $? -eq 0 ] && ok "finding(RP_SESSION-blacklist): an ordinary [A-Za-z0-9_-] session name is still accepted" \
+  || bad "finding(RP_SESSION-blacklist): an ordinary session name must still work ($(cat "$SANDBOX/out-ordinary.log"))"
+
+# ═════════════════════════════════════════════════════════════════════════
+# Group 3e — CLI-level: a dotted session name works END TO END, not merely
+# past the RP_SESSION gate — `down bench.1` actually releases ITS pod
+# (round-3 audit's own reproduction: a live pod under a dotted session name
+# was stranded for its full deadline because every verb refused against
+# it). Same pattern as the pre-existing "down-ok" fixture above, just with
+# a dotted session name.
+# ═════════════════════════════════════════════════════════════════════════
+SESSION_DOTTED="bench.1"
+write_meta_legacy "$SESSION_DOTTED" "pod-bench-1"
+echo '{"data":{"myself":{"pods":[{"id":"pod-bench-1","name":"jammi-gpu-ttl8"}]}}}' > "$SANDBOX/acct-dotted-1.json"
+echo '{"data":{"myself":{"pods":[]}}}' > "$SANDBOX/acct-dotted-2.json"
+reset_log; reset_account_seq
+export MOCK_ACCOUNT_RESPONSE_1="$SANDBOX/acct-dotted-1.json"
+export MOCK_ACCOUNT_RESPONSE_2="$SANDBOX/acct-dotted-2.json"
+bash "$DIR/gpu-dev.sh" down "$SESSION_DOTTED" >"$SANDBOX/out-down-dotted.log" 2>&1
+rc=$?
+term_count_dotted="$(grep -c "podTerminate.*pod-bench-1" "$CALL_LOG")"
+[ "$term_count_dotted" = "1" ] && [ "$rc" -eq 0 ] \
+  && ok "finding(dotted-session-e2e): 'down bench.1' releases its pod end to end" \
+  || bad "finding(dotted-session-e2e): expected exactly one confirmed terminate for pod-bench-1 (got count=${term_count_dotted} rc=${rc}); $(cat "$SANDBOX/out-down-dotted.log")"
+[ -f "$RP_SESSION_ROOT/$SESSION_DOTTED/meta" ] \
+  && bad "finding(dotted-session-e2e): bench.1's local record should be forgotten after a confirmed terminate" \
+  || ok "finding(dotted-session-e2e): bench.1's local record is forgotten after a confirmed terminate"
+
+# ═════════════════════════════════════════════════════════════════════════
+# Group 3f — CLI-level: the RP_SESSION gate never applies to `ls`/`reap`
+# (account-level verbs; they never read RP_SESSION at all). An exported
+# RP_SESSION that would refuse under a NAMED-session verb — dotted, or even
+# a traversal shape — must leave both `ls` and `reap` completely unaffected.
+# ═════════════════════════════════════════════════════════════════════════
+RP_SESSION="a100.2" bash "$DIR/gpu-dev.sh" ls >"$SANDBOX/out-ls-dotted.log" 2>&1
+[ $? -eq 0 ] && ok "finding(ls-reap-exempt): 'ls' works under RP_SESSION=a100.2" \
+  || bad "finding(ls-reap-exempt): 'ls' must work under RP_SESSION=a100.2 ($(cat "$SANDBOX/out-ls-dotted.log"))"
+RP_SESSION="../evil" bash "$DIR/gpu-dev.sh" ls >"$SANDBOX/out-ls-traversal.log" 2>&1
+[ $? -eq 0 ] && ok "finding(ls-reap-exempt): 'ls' is unaffected even by a traversal-shaped RP_SESSION" \
+  || bad "finding(ls-reap-exempt): 'ls' must be unaffected by a traversal-shaped RP_SESSION ($(cat "$SANDBOX/out-ls-traversal.log"))"
+
+echo '{"data":{"myself":{"pods":[]}}}' > "$SANDBOX/acct-reap-dotted.json"
+reset_log; reset_account_seq
+export MOCK_ACCOUNT_RESPONSE_1="$SANDBOX/acct-reap-dotted.json"
+RP_SESSION="a100.2" bash "$DIR/gpu-dev.sh" reap >"$SANDBOX/out-reap-dotted.log" 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && ok "finding(ls-reap-exempt): 'reap' works under RP_SESSION=a100.2" \
+  || bad "finding(ls-reap-exempt): 'reap' must work under RP_SESSION=a100.2 (got rc=$rc); $(cat "$SANDBOX/out-reap-dotted.log")"
+if log_has "podTerminate"; then
+  bad "finding(ls-reap-exempt): 'reap' against an empty account must terminate nothing (regression!)"
+else
+  ok "finding(ls-reap-exempt): 'reap' against an empty account terminates nothing"
+fi
 
 # ═════════════════════════════════════════════════════════════════════════
 # Group 4 — rp_sweep's age-based judgement (function-level). Age math is

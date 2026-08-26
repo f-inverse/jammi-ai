@@ -94,7 +94,12 @@ arch: a100 (default) | l40s | h100 | a40 | l4
          deploying a second pod under the same alias. --replace overwrites only
          the LOCAL record; it never terminates the old pod itself — `down` it
          first if it should be.
-Sessions are named after the arch; RP_SESSION overrides.
+Sessions are named after the arch; RP_SESSION names one explicitly. On
+down/attach/run/logs/push/pull, RP_SESSION and an explicit positional session
+must AGREE — a differing pair REFUSES (exit 2, naming both) rather than
+silently picking one. A session name may contain letters, digits, _, -, and .
+anywhere but as the whole name (so bench.1 is fine; ., .., a name containing
+/, or one starting with - are refused).
 Env: RUNPOD_API_KEY (or ~/.config/runpod/key), RP_IMAGE,
      RP_TTL_HOURS (default 8; explicit always wins), RP_DEV_TTL_HOURS (default
      72 — what `up` alone falls back to when RP_TTL_HOURS is not set),
@@ -208,9 +213,17 @@ esac
 # (rp_session_save keys off RP_SESSION alone) and, on exit, terminate the
 # throwaway pod under RP_POD_CREATED — leaving the REAL, still-running pod
 # behind with no record pointing at it at all.
+# RP_SESSION_VALIDATE_SESSION tells runpod_lib.sh's own rp_session_name_check
+# gate (see its doc) that THIS invocation resolved a real, named session and
+# must have it validated before RP_WORK is derived from it. Set only here —
+# never for `shell` (deliberately anonymous) and never reached at all by
+# `ls`/`reap` (account-level, they source runpod_lib.sh from their own early
+# dispatch branch above, before this line ever runs) — so an unrelated
+# exported RP_SESSION sitting in the caller's shell for some other purpose
+# can never block a verb that was never going to consume it.
 case "$CMD" in
   shell) RP_SESSION="" ;;
-  *) export RP_SESSION="$SESSION" ;;
+  *) export RP_SESSION="$SESSION"; RP_SESSION_VALIDATE_SESSION=1 ;;
 esac
 
 # `up` sessions persist past the terminal and are the ones the 2026-08-25

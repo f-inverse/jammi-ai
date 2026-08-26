@@ -105,19 +105,48 @@ RP_REPO_URL="${RP_REPO_URL:-https://github.com/f-inverse/jammi-ai}"
 # `rm -rf "$RP_WORK"`. RP_SESSION reaches here from gpu-dev.sh's own SESSION
 # resolution (an arch name, a caller-supplied alias, or an exported
 # environment variable) with no sanitization upstream, so a value containing
-# a path separator or a `..`/`.` segment could point RP_WORK — and therefore
-# that `rm -rf` — OUTSIDE RP_SESSION_ROOT entirely (`RP_SESSION=../../etc`,
-# or an absolute-looking value). Validated here, at the one place RP_WORK is
-# derived from it, as a single path segment: `[A-Za-z0-9_-]+` admits no `/`
-# and no `.` (which also rules out `.`/`..` themselves, since neither
-# character is in the allowed set), so RP_WORK can never resolve outside
-# RP_SESSION_ROOT.
-case "$RP_SESSION" in
-  '') : ;;
-  *[!A-Za-z0-9_-]*)
-    echo "::error::RP_SESSION may contain only [A-Za-z0-9_-] (got '${RP_SESSION}')" >&2
-    exit 2 ;;
-esac
+# a path separator or a `.`/`..` segment could point RP_WORK — and therefore
+# that `rm -rf` — OUTSIDE RP_SESSION_ROOT entirely (`RP_SESSION=../../etc`).
+#
+# A CONTAINMENT blacklist, not a character WHITELIST (round-3 audit on
+# #388): the previous `[A-Za-z0-9_-]+` whitelist rejected every session
+# name containing a `.` — including one gpu-dev.sh's OWN dispatch is happy
+# to create, e.g. `RP_SESSION=bench.1 gpu-dev.sh up` — so EVERY verb
+# refused against a session that had already rented a real pod, stranding
+# it for its full deadline with no `down` able to reach it. Only the shapes
+# that actually let RP_SESSION resolve outside RP_SESSION_ROOT are refused:
+# empty, `.`, or `..` (this function only ever runs for a NAMED session —
+# see the RP_SESSION_VALIDATE_SESSION gate below — so an empty value here
+# is a caller bug, never `shell`'s own genuinely anonymous RP_SESSION="",
+# which never reaches this check at all); anything containing a `/` (a
+# multi-segment path); and a leading `-` (reads as an option to any tool
+# RP_SESSION is later passed to positionally). Every OTHER shape — a dot
+# anywhere but as the WHOLE name included — is a legitimate session name.
+rp_session_name_check() {
+  case "$RP_SESSION" in
+    ''|.|..)
+      echo "::error::RP_SESSION may not be empty, '.', or '..' (got '${RP_SESSION}')" >&2
+      return 2 ;;
+    */*)
+      echo "::error::RP_SESSION may not contain '/' (got '${RP_SESSION}')" >&2
+      return 2 ;;
+    -*)
+      echo "::error::RP_SESSION may not start with '-' (got '${RP_SESSION}')" >&2
+      return 2 ;;
+  esac
+}
+# Gated on RP_SESSION_VALIDATE_SESSION, set by gpu-dev.sh only for the verbs
+# that actually RESOLVE a named session (up/attach/run/logs/push/pull/down)
+# — never `ls`/`reap` (account-level; they never read RP_SESSION at all,
+# and source this file from their OWN early dispatch branch before this
+# variable would ever be set) and never `shell` (deliberately anonymous,
+# RP_SESSION force-cleared to "" before sourcing). Without this gate, an
+# UNRELATED exported RP_SESSION sitting in a maintainer's own shell for
+# some other purpose made `ls`/`reap` refuse outright even though neither
+# verb was ever going to consume it (round-3 audit finding, mechanism 2).
+if [ "${RP_SESSION_VALIDATE_SESSION:-0}" = "1" ]; then
+  rp_session_name_check || exit $?
+fi
 
 # A named session must outlive the process; an anonymous one must not leak. The
 # session dir is created lazily by the first writer, so read-only commands
@@ -139,7 +168,14 @@ else
   # temp-dir-isolation regression test in test_gpu_dev_lifecycle.sh able to
   # observe which root a throwaway `shell` invocation's RP_WORK actually
   # resolved under.
-  RP_WORK="$(mktemp -d "${TMPDIR:-/tmp}/jammi-gpu-dev.XXXXXX")"
+  #
+  # A failed `mktemp` (e.g. a nonexistent/unwritable $TMPDIR) must abort
+  # here, not fall through with RP_WORK unset/empty: every later use of
+  # RP_WORK (the ssh key path, the meta path, and eventually the pod
+  # deploy) would then operate on a garbage or empty path instead of
+  # failing loudly at the one place the real cause is known.
+  RP_WORK="$(mktemp -d "${TMPDIR:-/tmp}/jammi-gpu-dev.XXXXXX")" \
+    || { echo "::error::could not create a temp work dir under ${TMPDIR:-/tmp}" >&2; exit 2; }
   RP_WORK_IS_TEMP=1
 fi
 RP_SSH_KEY="$RP_WORK/id_ed25519"

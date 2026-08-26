@@ -196,9 +196,17 @@ other verb takes a *session*. Each session is its own pod with its own SSH key,
 its own `jammi-<session>` block in the generated ssh config, and its own bill;
 `ls` shows them all regardless of which one you are pointed at.
 
-Set it inline on the one command that needs it, never in your shell profile: an
-exported `RP_SESSION` **overrides the positional session argument** everywhere,
-so `RP_SESSION=bench … down a100` terminates `bench` and says so.
+Set it inline on the one command that needs it, never in your shell profile: on
+`down`/`attach`/`run`/`logs`/`push`/`pull`, an exported `RP_SESSION` that
+**disagrees with an explicit positional session argument refuses** (exit 2,
+naming both) rather than silently picking one — `RP_SESSION=bench … down a100`
+refuses outright instead of guessing which one you meant. Either alone still
+resolves exactly as you would expect: drop the positional to act on
+`RP_SESSION`, or leave `RP_SESSION` unset to act on the positional.
+
+A session name may contain letters, digits, `_`, `-`, and `.` anywhere but as
+the *whole* name (so `bench.1` is a fine session name, but `.` and `..` are
+refused, along with any name containing `/` or starting with `-`).
 
 ---
 

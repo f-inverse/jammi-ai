@@ -1,0 +1,141 @@
+# Pod build-substrate key manifest.
+#
+# What this enumerates: every input that can change the BYTES a pod's build
+# scripts / toolchain emit for jammi-kernels and jammi-wire (the two crates
+# with a build.rs in this workspace) without cargo's OWN fingerprint noticing
+# — either because the reading build.rs never declared it via
+# `cargo:rerun-if-env-changed=`, or because it lives entirely outside Cargo's
+# dependency graph (nvcc/cc/mold/rustc identity). A SEED built with one set of
+# these values and a CLONE (or any other pod) built with a DIFFERENT set can
+# silently diverge in emitted bytes while cargo still reports every unit
+# "Fresh" — that is the exact failure class this manifest and the RED tests
+# in test_pod_substrate.sh (mechanism (i)-(iii) below) exist to catch.
+#
+# Every entry cites the READER that owns the fact — never hand-guessed. An
+# addition requires (a) a citation to the reading source (file:line, or a
+# vendored crate name+version), and (b) test_pod_substrate.sh's RED tests
+# (i)/(ii)/(iii) to still pass against the real sources.
+#
+# RED tests (test_pod_substrate.sh), each against the REAL sources, never a
+# fixture:
+#   (i)   every name-shaped string literal (regex [A-Z][A-Z0-9_]{2,}) in
+#         crates/jammi-kernels/build.rs, crates/jammi-wire/build.rs, and the
+#         vendored bindgen_cuda 0.1.6 source resolved from $CARGO_HOME's
+#         registry is either listed under [cargo]/a crate section below, or
+#         in [non_key].vars (CARGO_FEATURE_* is a prefix match), or in
+#         [cc_1_2_57]'s hand-enumerated set (the ONE section this scan cannot
+#         verify mechanically — cc's own env reads live inside the `cc`
+#         crate's library source, executed from a THIRD crate's build.rs
+#         that calls `cc::Build::new()...compile()`, never as a literal
+#         string in the build.rs files this scan reads; see [cc_1_2_57]'s own
+#         citation).
+#   (ii)  every `cargo:rerun-if-env-changed=<NAME>` literal in those same
+#         three sources is in the same union.
+#   (iii) pod_seed_target.sh's own seed-time cross-check: the announced env
+#         set from the SEED's captured `build/<pkg>-*/output` stdout (every
+#         `cargo:rerun-if-env-changed=` line cargo itself printed while
+#         actually running the build scripts, captured BEFORE the member-free
+#         clean) is a subset of this manifest — a live, not merely
+#         source-level, corroboration. test_pod_substrate.sh exercises the
+#         SAME function against a fixture `build/*/output` tree.
+#
+# Scope note (docs-ci, PR ci/pod-build-substrate): the automated scan (i)/(ii)
+# covers exactly the three sources this file documents by name — the two
+# in-workspace build.rs files plus bindgen_cuda, the one vendored dependency
+# jammi-kernels' `cuda` feature calls directly. It does NOT walk every
+# vendored build.rs in the full dependency graph (~104 packages carry one at
+# default features): most compile C/C++ via the `cc` crate without reading
+# any env var directly in their OWN build.rs (cc does that internally, see
+# [cc_1_2_57]), and the remainder are Cargo.lock-pinned, target-triple-keyed
+# inputs cargo's own fingerprint already tracks — not the "cargo says Fresh
+# while the bytes moved" hazard this manifest exists to close. Extending the
+# scan to that full set is a follow-up, not blocking this PR.
+
+[cargo]
+# The reproducibility root: fix these five/six and the rest of the graph
+# follows deterministically (Cargo.lock resolves every dependency; the two
+# incremental-build knobs are the ones the seed's own construction depends on
+# — see pod_seed_target.sh and runpod_lib.sh's rp_bootstrap, which appends
+# CARGO_INCREMENTAL=0 and CARGO_BUILD_RUSTC_WRAPPER= to every pod's
+# /root/.jammi_env).
+inputs = [
+  "Cargo.lock",
+  "Cargo.toml",                 # every workspace member's own manifest
+  ".cargo/config.toml",
+  "rust-toolchain.toml",
+  "RUSTFLAGS",
+  "CARGO_BUILD_RUSTFLAGS",
+  "CARGO_INCREMENTAL",
+  "CARGO_BUILD_RUSTC_WRAPPER",
+]
+
+[jammi_kernels_build_rs]
+source = "crates/jammi-kernels/build.rs"
+inputs = [
+  "NVCC",
+  "CUDA_HOME",
+  "CUDA_PATH",
+  "AR",
+  "CUDA_COMPUTE_CAP",
+]
+notes = [
+  "CUDA_COMPUTE_CAP is PINNED, not read from the pod's ambient env: build_cuda() calls env::set_var(\"CUDA_COMPUTE_CAP\", \"80\") at build.rs:73 before constructing the bindgen_cuda Builder, specifically so bindgen_cuda's own compute_cap() (see [bindgen_cuda_0_1_6]) never falls through to an nvidia-smi probe. Recorded here as a CONSTANT (80), not a variable value.",
+  "cutlass gitlink: crates/jammi-kernels/third_party/cutlass (git submodule pin) is a key input to the flash-attn feature's build_flash_attn() (build.rs:172-414) but is NOT env-shaped — it is a checked-in gitlink, tracked by the submodule commit, not by this manifest's env scan.",
+  "find_nvcc() resolution ORDER (build.rs:368-387): $NVCC, then $CUDA_HOME/bin/nvcc, then $CUDA_PATH/bin/nvcc, then `nvcc` on PATH, then /usr/local/cuda/bin/nvcc — the first that answers `--version`. The ORDER is part of this crate's key surface: two pods with different toolchains on PATH but the SAME NVCC/CUDA_HOME can still resolve a different nvcc if only PATH differs and neither env var is set.",
+]
+
+[bindgen_cuda_0_1_6]
+source = "vendored (registry) bindgen_cuda-0.1.6/src/lib.rs — cuda_include_dir() (unannounced: no cargo:rerun-if-env-changed emitted for any of these four) and compute_cap()/kernel-build helpers (RAYON_NUM_THREADS, NVCC_CCBIN)"
+inputs = [
+  "CUDA_PATH",
+  "CUDA_ROOT",
+  "CUDA_TOOLKIT_ROOT_DIR",
+  "CUDNN_LIB",
+  "NVCC_CCBIN",
+  "RAYON_NUM_THREADS",
+]
+notes = [
+  "CUDA_PATH/CUDA_ROOT/CUDA_TOOLKIT_ROOT_DIR/CUDNN_LIB are read via `[\"CUDA_PATH\",\"CUDA_ROOT\",\"CUDA_TOOLKIT_ROOT_DIR\",\"CUDNN_LIB\"].into_iter().map(std::env::var)` (lib.rs, cuda_include_dir()) — an ARRAY+LOOP read, not a literal `env::var(\"X\")` call, and one a naive env::var(\"...\") literal scan misses entirely (round-5 pressure-test finding). This is exactly why RED tests (i)/(ii) scan every name-shaped STRING LITERAL in the source rather than only `env::var(...)` call sites.",
+]
+
+[jammi_wire_build_rs]
+source = "crates/jammi-wire/build.rs"
+inputs = ["PROTOC"]
+
+[cc_1_2_57]
+# Hand-enumerated — the ONE section the automated scan cannot verify. cc's
+# own env reads execute inside the `cc` CRATE's library source when a
+# DIFFERENT crate's build.rs calls cc::Build::new()...compile(); the literal
+# strings therefore never appear in the DEPENDENT crate's own build.rs (the
+# only files RED tests (i)/(ii) read), and cc itself carries no build.rs of
+# its own (it is a plain library dependency, not a package with a build
+# script — confirmed via `cargo metadata`'s custom-build target list).
+source = "hand-enumerated: cc-1.2.57/src/lib.rs:3898-3905 (getenv_with_target_prefixes) + the cc crate README's \"External configuration via environment variables\" section"
+inputs = [
+  "CC", "CXX", "AR", "RANLIB", "CFLAGS", "CXXFLAGS", "ARFLAGS",
+  "OPT_LEVEL", "DEBUG", "SDKROOT", "CRATE_CC_NO_DEFAULTS",
+]
+computed_forms = ["<VAR>_<target>", "TARGET_<VAR>", "<kind>_<VAR>"]
+notes = [
+  "<kind> is host|target as cc's own Tool resolution distinguishes cross-compilation from native; <VAR> ranges over the base names above.",
+  "This section documents the env surface generically (it applies to every one of the ~15 registry crates that compile C/C++ via cc in this workspace's dependency graph), not per-consuming-crate — see this file's header \"Scope note\".",
+]
+
+[toolchain_identities]
+commands = [
+  "rustc -vV",
+  "cargo -V",
+  "nvcc --version (resolved via BOTH jammi-kernels build.rs's find_nvcc() order AND bindgen_cuda's cuda_include_dir() order — both recorded, since they can disagree)",
+  "cc --version",
+  "mold --version",
+  "ldd --version",
+  "uname -m",
+]
+assertion = "no `-C target-cpu=native` anywhere in the resolved RUSTFLAGS/CARGO_BUILD_RUSTFLAGS — a native-tuned artifact from the SEED's own build host is not portable seed -> clone across a different pod's CPU."
+
+[non_key]
+# Cargo sets these itself, per invocation, from information the seed/clone
+# distinction cannot change (paths and cardinality derived from the crate
+# graph and cargo's own build plan, not a human-set toggle). A scanner hit on
+# one of these is not a missing manifest entry.
+vars = ["OUT_DIR", "CARGO_MANIFEST_DIR", "CARGO_FEATURE_*", "TARGET", "HOST", "PROFILE", "NUM_JOBS"]

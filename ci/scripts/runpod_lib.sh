@@ -17,11 +17,17 @@
 # on hardware. It still needs the network at deadline time, so rp_sweep is
 # load-bearing rather than belt-and-braces.
 #   * state    — the pod is always disposable (volumeInGb 0). Durable state lives
-#                in an S3-compatible object store that rp_bootstrap rehydrates.
-#                A RunPod network volume is deliberately NEVER attached: an
-#                attached volume is Secure-Cloud-only and pinned to a single
-#                datacenter, which would delete both failover dimensions below —
-#                and intermittent A100 supply is precisely why they exist.
+#                in git (your working tree, via `push`/`--ref`); build-time
+#                COMPILATION state — the expensive part — lives in a per-pod
+#                seed/clone build substrate instead of an S3-backed compile
+#                cache (see pod_seed_target.sh, pod_target_clone.sh and
+#                docs/maintainer/dev-gpu.md — a measured S3-backed sccache gave
+#                ZERO cross-target-dir reuse on this image and cost ~+33% wall,
+#                ledger row 17). A RunPod network volume is deliberately NEVER
+#                attached: an attached volume is Secure-Cloud-only and pinned to
+#                a single datacenter, which would delete both failover
+#                dimensions below — and intermittent A100 supply is precisely
+#                why they exist.
 #
 # Deploys a live GPU pod with two failover dimensions (capacity + liveness), runs
 # a remote job on it importing the container's real ENV, and terminates the pod
@@ -47,13 +53,23 @@
 #                 RP_DEV_TTL_HOURS (72h) before sourcing this file, since a
 #                 throwaway-pod default is too short for a dev session someone
 #                 is actively using — an explicit RP_TTL_HOURS always wins.
-#   RP_DISK_GB    container disk size in GB (default 60). Rule of thumb: roughly
-#                 25 GB base + 3 GB per concurrent agent CARGO_TARGET_DIR + 2 GB
-#                 per `cargo mutants -j N` job (COPY MODE makes one full
-#                 workspace+target copy per job — standing clause 1 REQUIRES
-#                 COPY MODE, never `--in-place`, so a shared target dir does not
-#                 report mutated sources as "Fresh"). A mutation-testing session
-#                 wants >= 120 GB.
+#   RP_DISK_GB    container disk size in GB (default 60). Rule of thumb once the
+#                 seed/clone build substrate is in use (see pod_seed_target.sh):
+#                 RP_DISK_GB >= 25 (base) + S_src (one `git` source tree) +
+#                 S_seed (one seed CARGO_TARGET_DIR) + N * S_clone (one clone
+#                 per concurrent tree this pod hosts); add 1.2 * S_seed staging
+#                 headroom once M7 (the cross-pod seed cache, phase 2, blocked
+#                 on a user action — see docs/maintainer/dev-gpu.md) lands. The
+#                 S_src/S_seed/S_clone byte counts are MEASURED, not guessed —
+#                 see ci/scripts/perf/pod_build_timings.sh (A2) for the
+#                 producer; until that has run and committed its JSON, this
+#                 formula's S values are "pending" (cite ledger rows 1/17 for
+#                 wall-clock context only). Add 3 GB per OTHER concurrent agent
+#                 CARGO_TARGET_DIR sharing this pod and 2 GB per `cargo mutants
+#                 -j N` job (COPY MODE makes one full workspace+target copy per
+#                 job — standing clause 1 REQUIRES COPY MODE, never
+#                 `--in-place`, so a shared target dir does not report mutated
+#                 sources as "Fresh"). A mutation-testing session wants >= 120 GB.
 #   RP_VOLUME_GB  attached volume size in GB (default 0). The pod is deliberately
 #                 disposable (see "state" above) — leave this 0 unless a caller
 #                 has a specific reason to attach one.
@@ -126,7 +142,6 @@ esac
 RP_SSH_WAIT_SECS=$((10#$RP_SSH_WAIT_SECS))
 [ "$RP_SSH_WAIT_SECS" -gt 0 ] || { echo "::error::RP_SSH_WAIT_SECS must be > 0" >&2; exit 2; }
 RP_SESSION_ROOT="${RP_SESSION_ROOT:-${HOME}/.config/runpod/sessions}"
-RP_S3_CONF="${RP_S3_CONF:-${HOME}/.config/runpod/s3}"
 # An ssh config this tooling owns outright, so ~/.ssh/config is never rewritten.
 RP_SSH_CONFIG="${RP_SSH_CONFIG:-${HOME}/.config/runpod/ssh_config}"
 RP_REPO_URL="${RP_REPO_URL:-https://github.com/f-inverse/jammi-ai}"
@@ -555,28 +570,20 @@ rp_session_forget() {
   [ -n "$RP_SESSION" ] && [ -d "$RP_WORK" ] && rm -rf "$RP_WORK"
 }
 
-# Load the object-store config used for the build-substrate cache. Returns 1 when
-# unconfigured — every caller treats that as "run cold", never as an error: the
-# cache is an optimisation and correctness must not depend on it.
-rp_s3_load() {
-  [ -f "$RP_S3_CONF" ] || return 1
-  # shellcheck disable=SC1090  # user-provided config outside the repo
-  . "$RP_S3_CONF"
-  [ -n "${RP_S3_ENDPOINT:-}" ] && [ -n "${RP_S3_BUCKET:-}" ] \
-    && [ -n "${RP_S3_ACCESS_KEY_ID:-}" ] && [ -n "${RP_S3_SECRET_ACCESS_KEY:-}" ] || return 1
-  # RunPod signs SigV4 against the datacenter as the region and rejects "auto"
-  # outright ("the region 'auto' is wrong; expecting 'us-ne-1'"), which bricks
-  # every cargo command on the pod since sccache wraps rustc globally. Derive it
-  # from the endpoint so there is one source of truth; a non-RunPod endpoint
-  # (R2 and friends) keeps "auto" unless the config states otherwise.
-  if [ -z "${RP_S3_REGION:-}" ]; then
-    case "$RP_S3_ENDPOINT" in
-      *s3api-*.runpod.io*)
-        RP_S3_REGION="${RP_S3_ENDPOINT#*s3api-}"
-        RP_S3_REGION="${RP_S3_REGION%%.runpod.io*}" ;;
-      *) RP_S3_REGION=auto ;;
-    esac
-  fi
+# Tree name -> plain checkout directory on the pod. "jammi-ai" is the ONE
+# default: the historical single-checkout location every existing doc/script
+# still names directly (rp_bootstrap's own clone destination, below, is the
+# other of the exactly two "/root/jammi-ai" literal sites this tooling
+# permits — see test_pod_substrate.sh's grep gate). Any OTHER name is a
+# caller-chosen additional tree — a plain directory under /root/trees, never
+# a git worktree (a worktree add fails on the checked-out ref, and a shared
+# .git couples trees that must be able to diverge — round-1 pressure-test
+# finding) and never git-cloned itself (see pod_target_clone.sh: a tree is
+# populated by copying the pod's OWN seed target dir plus a rsync'd source
+# tree, never a fresh `git clone`).
+rp_tree_dir() { # $1=tree name (optional; default "jammi-ai")
+  local t="${1:-jammi-ai}"
+  if [ "$t" = "jammi-ai" ]; then echo "/root/jammi-ai"; else echo "/root/trees/${t}"; fi
 }
 
 _rp_deploy_payload() { # $1=cloudType $2=gpuTypeId
@@ -979,7 +986,7 @@ rp_ref_precheck() { # $1=ref
 }
 
 # Make the pod ready to build jammi: import the container ENV (already done by
-# rp_run_remote), point sccache at the object store, and place the repo at $1
+# rp_run_remote), turn the compile-wrapper off, and place the repo at $1
 # (default: main).
 #
 # The cargo REGISTRY is deliberately not cached. It looks expensive — the CI image
@@ -987,7 +994,19 @@ rp_ref_precheck() { # $1=ref
 # arrow/datafusion/candle tree — but measured on a RunPod host that fetch is 9s
 # for 868 crates, because datacenter bandwidth makes it free. Restoring a 285MB
 # tarball was slower than just fetching. The real cold cost is COMPILATION, which
-# is what sccache addresses.
+# the pod-build-substrate (seed + clone; see docs/maintainer/dev-gpu.md) addresses.
+#
+# There is deliberately no S3-backed sccache here any more. Measured on a live
+# pod (ledger row 17): sccache gave ZERO cross-target-dir cache reuse for rustc
+# units on this image (every populate-then-reuse pair against a FRESH
+# CARGO_TARGET_DIR re-missed everything sccache had just written) while adding
+# ~+33% wall clock to every build that ran it — row 1's earlier read of a "4x
+# cache hit" was against a cache that was never actually warm for the
+# `--release` profile under test (row 9's correction). `CARGO_BUILD_RUSTC_WRAPPER=`
+# below turns the wrapper off outright; `.cargo/config.toml`'s repo-wide
+# `rustc-wrapper = "sccache"` default is untouched (a pod-local override, not a
+# repo edit) and every OTHER (non-pod) build keeps using it.
+#
 # An omitted ref means main; an empty one is a caller bug, not a default. The
 # distinction is made on argument COUNT, because `${1:-main}` collapses the two
 # and turns "the ref I computed is empty" into a silent, successful boot on main.
@@ -996,10 +1015,9 @@ rp_ref_precheck() { # $1=ref
 # no git, so the pod is on NO ref and RP_REF stays empty), or the remote script's
 # code for a real failure.
 rp_bootstrap() { # $1=git ref (optional; default main)
-  local ref=main s3=0 rc
+  local ref=main rc
   [ $# -gt 0 ] && ref="$1"
   rp_ref_check "$ref" || return 2
-  rp_s3_load && s3=1
   rp_run_remote <<EOF
 set -uo pipefail
 export CARGO_HOME="\${CARGO_HOME:-/usr/local/cargo}"
@@ -1026,42 +1044,15 @@ echo '[ -f /root/.jammi_env ] && . /root/.jammi_env' > /etc/profile.d/jammi-env.
 grep -q jammi_env /root/.bashrc 2>/dev/null \
   || echo '[ -f /root/.jammi_env ] && . /root/.jammi_env' >> /root/.bashrc
 
-if [ "${s3}" = "1" ]; then
-  export AWS_ACCESS_KEY_ID='${RP_S3_ACCESS_KEY_ID:-}'
-  export AWS_SECRET_ACCESS_KEY='${RP_S3_SECRET_ACCESS_KEY:-}'
-  export S3_ENDPOINT='${RP_S3_ENDPOINT:-}'
-  export S3_BUCKET='${RP_S3_BUCKET:-}'
-
-  # sccache reads the compile cache straight from the object store, so a pod in
-  # any datacenter warms up. Wrapper is already set repo-wide in .cargo/config.toml.
-  export SCCACHE_BUCKET="\$S3_BUCKET"
-  export SCCACHE_ENDPOINT="\$S3_ENDPOINT"
-  export SCCACHE_REGION='${RP_S3_REGION:-auto}'
-  export SCCACHE_S3_USE_SSL=true
-  export SCCACHE_S3_KEY_PREFIX=sccache
-
-  # sccache wraps rustc for EVERY cargo invocation, so an object store it cannot
-  # reach does not degrade the build — it stops the build dead, and the pod is
-  # useless for anything. Prove the server starts against this bucket; if it does
-  # not, drop the S3 backend and let sccache fall back to its local disk cache.
-  # A cold pod that works beats a warm one that cannot compile.
-  sccache --stop-server >/dev/null 2>&1
-  if sccache --start-server >/dev/null 2>&1 && sccache --show-stats >/dev/null 2>&1; then
-    { echo "export AWS_ACCESS_KEY_ID=\$(printf %q "\$AWS_ACCESS_KEY_ID")"
-      echo "export AWS_SECRET_ACCESS_KEY=\$(printf %q "\$AWS_SECRET_ACCESS_KEY")"
-      echo "export SCCACHE_BUCKET=\$(printf %q "\$SCCACHE_BUCKET")"
-      echo "export SCCACHE_ENDPOINT=\$(printf %q "\$SCCACHE_ENDPOINT")"
-      echo "export SCCACHE_REGION=\$(printf %q "\$SCCACHE_REGION")"
-      echo "export SCCACHE_S3_USE_SSL=true"
-      echo "export SCCACHE_S3_KEY_PREFIX=sccache"; } >> /root/.jammi_env
-    echo "sccache: S3 backend live (region \$SCCACHE_REGION)"
-  else
-    echo "::warning::sccache could not use the S3 backend; falling back to local disk cache"
-    sccache --stop-server >/dev/null 2>&1
-    unset SCCACHE_BUCKET SCCACHE_ENDPOINT SCCACHE_REGION SCCACHE_S3_USE_SSL SCCACHE_S3_KEY_PREFIX
-    sccache --start-server >/dev/null 2>&1
-  fi
-fi
+# Wrapper-off (row 17; M3 of the pod-build-substrate contract). Every shell
+# that sources /root/.jammi_env — interactive, \`run\`'s detached tmux job, the
+# seed build, a clone build — gets CARGO_BUILD_RUSTC_WRAPPER= (empty, which
+# overrides \`.cargo/config.toml\`'s repo-wide \`rustc-wrapper = "sccache"\` for
+# THIS shell only) and CARGO_INCREMENTAL=0 (the member-free seed's own
+# precondition: an incremental dir surviving \`cargo clean\` is exactly the
+# drift class that seed cleaning exists to remove — see pod_seed_target.sh).
+{ echo 'export CARGO_BUILD_RUSTC_WRAPPER='
+  echo 'export CARGO_INCREMENTAL=0'; } >> /root/.jammi_env
 
 # "This image CANNOT hold a checkout" and "the checkout failed" are different
 # facts and only the second is a broken pod. Reproducing the shipped RUNTIME
@@ -1074,10 +1065,18 @@ if ! command -v git >/dev/null 2>&1; then
   exit 3
 fi
 
-if [ ! -d /root/jammi-ai/.git ]; then
-  git clone --filter=blob:none "${RP_REPO_URL}" /root/jammi-ai || exit 1
+# One literal, one variable — bootstrap ALWAYS targets this exact path
+# regardless of any --tree the caller later selects (it is the checkout
+# every tree's own /root/.jammi-seed is eventually built FROM), so this is
+# the tooling's second (of exactly two) "/root/jammi-ai" literal site rather
+# than a call through rp_tree_dir: the value here can never legitimately
+# change with a tree name, so routing it through that function would be
+# indirection with no real degree of freedom behind it.
+jammi_dir=/root/jammi-ai
+if [ ! -d "\${jammi_dir}/.git" ]; then
+  git clone --filter=blob:none "${RP_REPO_URL}" "\${jammi_dir}" || exit 1
 fi
-cd /root/jammi-ai || exit 1
+cd "\${jammi_dir}" || exit 1
 
 # Every step below is checked. A pod that reports "bootstrap complete" while
 # sitting on an older commit is worse than one that failed: the build, the test

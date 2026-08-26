@@ -723,6 +723,19 @@ jobs:
           # ci/scripts/test_gpu_dev_lifecycle.sh's own module doc.
           - name: gpu-dev lifecycle safety
             cmd: bash ci/scripts/test_gpu_dev_lifecycle.sh
+          # Pod-build-substrate mechanisms (M1-M6, contract
+          # ci/pod-build-substrate): wrapper-off + no S3/sccache in
+          # .jammi_env; pod_target_clone.sh's marker refusal, cp -a clone,
+          # and --verify Fresh-unit check on a fixture log; the key-manifest
+          # RED tests (i)/(ii) against the real jammi-kernels/jammi-wire/
+          # bindgen_cuda sources; flock exclusivity + holder-file semantics
+          # (Linux/CI only — see JAMMI_REQUIRE_LOCK_TEST in the suite's own
+          # doc); push excludes identical between rsync and the stamp; no
+          # unanchored/unquoted `-t jammi` in gpu-dev.sh; exactly two
+          # "/root/jammi-ai" literal sites. See
+          # ci/scripts/test_pod_substrate.sh's own module doc.
+          - name: pod build substrate
+            cmd: JAMMI_REQUIRE_LOCK_TEST=1 bash ci/scripts/test_pod_substrate.sh
           # Completeness tripwire for this very guard class: every
           # ci/scripts/check_*.py|.sh gate script must be referenced by at
           # least one workflow (this file included), so a new check script

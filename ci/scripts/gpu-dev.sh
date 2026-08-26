@@ -9,26 +9,39 @@
 # Every pod carries an RP_TTL_HOURS deadline in its own entrypoint regardless of
 # lifetime, and `reap` sweeps anything that outlives it.
 #
-# The pod itself is disposable (volumeInGb 0). The only thing that persists is
-# the sccache compile cache in an S3-compatible object store — the cargo registry
-# is deliberately NOT cached; fetching it measures 9s on a RunPod host.
-# See `docs/maintainer/dev-gpu.md`.
+# The pod itself is disposable (volumeInGb 0). Compilation state lives in a
+# per-pod seed/clone build substrate (`target`, below) rather than an
+# S3-backed compile cache — the cargo registry is deliberately NOT cached;
+# fetching it measures 9s on a RunPod host. See `docs/maintainer/dev-gpu.md`.
+#
+# A pod can host more than one checkout — a "tree", a plain directory, never
+# a git worktree (a worktree add fails on the checked-out ref, and a shared
+# .git couples trees that must be able to diverge independently). `--tree
+# <name>` selects one on run/push/pull/attach/logs/target; the default tree
+# ("jammi-ai") is the historical single checkout at /root/jammi-ai that every
+# session already has from bootstrap.
 #
 # Usage:
-#   gpu-dev.sh shell   [arch] [--ref R]     throwaway shell; pod dies on exit
-#   gpu-dev.sh up      [arch] [--ref R]     start a surviving session (name = arch)
-#                      [--replace]          replace an alias's existing record
-#   gpu-dev.sh attach  [session]            shell into a surviving session
-#   gpu-dev.sh run     [session] <cmd...>   run <cmd> detached under tmux
-#   gpu-dev.sh logs    [session]            tail the detached job's output
-#   gpu-dev.sh push    [session]            rsync your working tree TO the pod
-#   gpu-dev.sh pull    [session] <path>     rsync <path> back FROM the pod
-#   gpu-dev.sh down    [session]            terminate the pod, forget the session
-#   gpu-dev.sh ls                           list sessions
+#   gpu-dev.sh shell   [arch] [--ref R] [--tree T]   throwaway shell; pod dies on exit
+#   gpu-dev.sh up      [arch] [--ref R]              start a surviving session (name = arch)
+#                      [--replace]                   replace an alias's existing record
+#   gpu-dev.sh target  [session] <name>              clone the pod's build-substrate seed
+#                      [--verify] [--with-cutlass]    into a new tree (`/root/trees/<name>`)
+#   gpu-dev.sh attach  [session] [--tree T]           shell into a surviving session
+#   gpu-dev.sh run     [session] [--tree T] <cmd...>  run <cmd> detached under tmux
+#   gpu-dev.sh logs    [session] [--tree T]           tail the detached job's output
+#   gpu-dev.sh push    [session] [--tree T]           rsync your working tree TO the pod
+#   gpu-dev.sh pull    [session] [--tree T] <path>    rsync <path> back FROM the pod
+#   gpu-dev.sh down    [session]                       terminate the pod, forget the session
+#   gpu-dev.sh ls                                      list sessions
 #
 # arch: a100 (default) | l40s | h100 | a40 | l4
 # --ref: branch, tag or commit the pod's checkout is placed on (default main).
 #        Verified against the remote BEFORE a pod is rented.
+# --tree: the checkout/tree a run/push/pull/attach/logs/target command acts
+#        on (default "jammi-ai" — the bootstrap checkout at /root/jammi-ai).
+#        Any other name is a plain directory at /root/trees/<name>, created
+#        by `target` (see pod_target_clone.sh) — never git-cloned itself.
 # --replace: `up` normally REFUSES to touch a session alias that already has a
 #        recorded pod id — even one that failed to answer SSH — rather than
 #        silently deploying a second pod under the same alias (that is how an
@@ -62,19 +75,21 @@ usage() {
   cat <<'USAGE'
 gpu-dev.sh — GPU development on RunPod
 
-  shell   [arch] [--ref R]    throwaway shell; the pod dies when you exit
-  up      [arch] [--ref R]    start a session whose pod SURVIVES disconnect
-          [--replace]         (default TTL 72h — see RP_DEV_TTL_HOURS below)
-                              refuses if the alias already has a recorded pod
-                              unless --replace is given (see --replace below)
-  attach  [session]           join a surviving session's running job
-                              (--shell for a plain prompt instead)
-  run     [session] <cmd...>  run <cmd> detached under tmux
-  logs    [session]           tail the detached job's output
-  push    [session]           rsync your working tree TO the pod
-  pull    [session] <path>    rsync <path> back FROM the pod
-  down    [session]           terminate the pod, forget the session
-  ls                          list sessions
+  shell   [arch] [--ref R] [--tree T]     throwaway shell; the pod dies when you exit
+  up      [arch] [--ref R]                start a session whose pod SURVIVES disconnect
+          [--replace]                     (default TTL 72h — see RP_DEV_TTL_HOURS below)
+                                          refuses if the alias already has a recorded pod
+                                          unless --replace is given (see --replace below)
+  target  [session] <name>                clone the pod's build-substrate seed into a
+          [--verify] [--with-cutlass]     new tree /root/trees/<name> (pod_target_clone.sh)
+  attach  [session] [--tree T]            join a surviving session's running job
+                                          (--shell for a plain prompt instead)
+  run     [session] [--tree T] <cmd...>   run <cmd> detached under tmux, in <tree>
+  logs    [session] [--tree T]            tail the detached job's output
+  push    [session] [--tree T]            rsync your working tree TO the pod's <tree>
+  pull    [session] [--tree T] <path>     rsync <path> back FROM the pod's <tree>
+  down    [session]                       terminate the pod, forget the session
+  ls                                      list sessions
   reap    [hours]             ACCOUNT-WIDE: terminate every orphaned jammi-gpu*
                               pod past its own deadline, not just one session's
                               ([hours] force-reaps EVERY such pod older than
@@ -89,24 +104,41 @@ arch: a100 (default) | l40s | h100 | a40 | l4
 --ref R: branch, tag or commit for the pod's checkout (default main), checked
          against the remote before anything is rented. `up` does not move a live
          pod: `down` it first.
+--tree T: which checkout on the pod a run/push/pull/attach/logs/target command
+         acts on (default "jammi-ai", the bootstrap checkout at
+         /root/jammi-ai). Any other name is a plain directory at
+         /root/trees/<name> populated only by `target` — never a git worktree
+         (a shared .git would couple trees that must diverge independently)
+         and never git-cloned itself.
 --replace: `up` normally REFUSES (exit 2) a session alias that already has a
          recorded pod id, even an unreachable one, rather than silently
          deploying a second pod under the same alias. --replace overwrites only
          the LOCAL record; it never terminates the old pod itself — `down` it
          first if it should be.
+--verify (target only): after `target` clones and you have built once against
+         the new tree, re-run with --verify and a `cargo build -v` log on
+         stdin to assert no member unit reported Fresh (see pod_target_clone.sh).
+--with-cutlass (target only): also provisions the CUTLASS submodule into the
+         new tree (`git submodule update --init --depth 1`) — needed only for
+         a tree that will build the `flash-attn` feature.
 Sessions are named after the arch; RP_SESSION names one explicitly. On
-down/attach/run/logs/push/pull, RP_SESSION and an explicit positional session
-must AGREE — a differing pair REFUSES (exit 2, naming both) rather than
-silently picking one. A session name may contain letters, digits, _, -, and .
-anywhere but as the whole name (so bench.1 is fine; ., .., a name containing
-/, or one starting with - are refused).
+down/attach/run/logs/push/pull/target, RP_SESSION and an explicit positional
+session must AGREE — a differing pair REFUSES (exit 2, naming both) rather
+than silently picking one. A session name may contain letters, digits, _, -,
+and . anywhere but as the whole name (so bench.1 is fine; ., .., a name
+containing /, or one starting with - are refused).
 Env: RUNPOD_API_KEY (or ~/.config/runpod/key), RP_IMAGE,
      RP_TTL_HOURS (default 8; explicit always wins), RP_DEV_TTL_HOURS (default
      72 — what `up` alone falls back to when RP_TTL_HOURS is not set),
      RP_DISK_GB (default 60), RP_VOLUME_GB (default 0).
-     Disk sizing rule of thumb: roughly 25 GB base + 3 GB per concurrent agent
-     target dir + 2 GB per `cargo mutants` job — a mutation-testing session
-     wants >= 120 GB (RP_DISK_GB=150).
+     Disk sizing once the seed/clone substrate is in use: RP_DISK_GB >= 25
+     (base) + S_src + S_seed + N*S_clone (one clone per tree this pod hosts);
+     the S_src/S_seed/S_clone byte counts are MEASURED by
+     ci/scripts/perf/pod_build_timings.sh (A2), not guessed — see
+     docs/maintainer/dev-gpu.md, which marks them "pending" until that has
+     run and its JSON is committed. Add 3 GB per OTHER concurrent agent target
+     dir + 2 GB per `cargo mutants` job — a mutation-testing session wants
+     >= 120 GB (RP_DISK_GB=150).
 USAGE
   exit "${1:-2}"
 }
@@ -143,6 +175,11 @@ esac
 REF=main
 REF_EXPLICIT=0
 REPLACE=0
+RESEED=0
+TREE=jammi-ai
+TARGET_NAME=""
+TARGET_VERIFY=0
+TARGET_WITH_CUTLASS=0
 case "$CMD" in
   shell|up)
     ARCH=""
@@ -155,6 +192,17 @@ case "$CMD" in
           REF="$2"; REF_EXPLICIT=1; shift 2 ;;
         --ref=*)
           REF="${1#--ref=}"; REF_EXPLICIT=1; shift ;;
+        # `--tree` only means something for `shell` (an interactive session
+        # in a non-default checkout); `up` establishes the SESSION/pod itself
+        # — trees are directories WITHIN an already-up pod, selected on the
+        # verbs that act inside one (attach/run/logs/push/pull/target).
+        --tree)
+          [ "$CMD" = "shell" ] || { echo "::error::--tree applies only to 'shell'/attach/run/logs/push/pull/target, not '${CMD}'"; exit 2; }
+          [ $# -ge 2 ] || { echo "::error::--tree needs a value"; exit 2; }
+          TREE="$2"; shift 2 ;;
+        --tree=*)
+          [ "$CMD" = "shell" ] || { echo "::error::--tree applies only to 'shell'/attach/run/logs/push/pull/target, not '${CMD}'"; exit 2; }
+          TREE="${1#--tree=}"; shift ;;
         # `--replace` only means something for `up` (it overwrites a session's
         # LOCAL record — see the `up` case below); `shell` has no session to
         # overwrite, so accepting it silently there would look like it did
@@ -162,6 +210,10 @@ case "$CMD" in
         --replace)
           [ "$CMD" = "up" ] || { echo "::error::--replace applies only to 'up' ($CMD has no session to replace)"; exit 2; }
           REPLACE=1; shift ;;
+        # Forces the seed build to rerun even if .jammi-seed-complete already
+        # exists (pod_seed_target.sh's own default is otherwise a no-op —
+        # see M1).
+        --reseed) RESEED=1; shift ;;
         # Asking for help is not an error, and `up -h` is where someone reaches
         # when they have forgotten the flag they came to look up.
         -h|--help) usage 0 ;;
@@ -176,8 +228,39 @@ case "$CMD" in
     done
     ARCH="${ARCH:-a100}"; SESSION="${RP_SESSION:-$ARCH}"
     ;;
+  target)
+    # target [session] <name> [--verify] [--with-cutlass]
+    # `<name>` is the TREE being created/verified, never `--tree` — there is
+    # nothing to select yet; this verb is what CREATES a tree.
+    ARG=""
+    case "${1:-}" in
+      -*) : ;;
+      *) [ $# -gt 0 ] && { ARG="$1"; shift; } ;;
+    esac
+    if [ -n "$ARG" ] && [ -n "${RP_SESSION:-}" ] && [ "$ARG" != "$RP_SESSION" ]; then
+      echo "::error::conflicting session: positional argument '${ARG}' vs exported RP_SESSION='${RP_SESSION}' — they name different sessions"
+      exit 2
+    fi
+    SESSION="${ARG:-${RP_SESSION:-a100}}"; ARCH=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --verify) TARGET_VERIFY=1; shift ;;
+        --with-cutlass) TARGET_WITH_CUTLASS=1; shift ;;
+        -h|--help) usage 0 ;;
+        -*) echo "::error::unknown option '$1' for target"; usage 2 ;;
+        *)
+          [ -z "$TARGET_NAME" ] || { echo "::error::target: unexpected argument '$1'"; usage 2; }
+          TARGET_NAME="$1"; shift ;;
+      esac
+    done
+    [ -n "$TARGET_NAME" ] || [ "$TARGET_VERIFY" = "1" ] || { echo "::error::target: need a tree name (or --verify against an existing one)"; usage 2; }
+    ;;
   *)
-    ARG="${1:-}"; [ $# -gt 0 ] && shift
+    ARG=""
+    case "${1:-}" in
+      -*) : ;;
+      *) [ $# -gt 0 ] && { ARG="$1"; shift; } ;;
+    esac
     # Unlike shell|up above (where ARCH and RP_SESSION are genuinely
     # different axes — RP_SESSION deliberately overrides the session ALIAS
     # for a second pod of the same arch, per this file's own header doc),
@@ -197,6 +280,22 @@ case "$CMD" in
       exit 2
     fi
     SESSION="${ARG:-${RP_SESSION:-a100}}"; ARCH=""
+    # `--tree`, when present, is a LEADING flag right after the (optional)
+    # session positional — before `run`'s own command tail, which this loop
+    # must never touch (`cargo test -- --tree-of-life` is someone's ACTUAL
+    # command, not a flag for this script). Only attach/run/logs/push/pull
+    # take it; `down` acts on the pod, not a tree within it.
+    case "$CMD" in
+      attach|run|logs|push|pull)
+        case "${1:-}" in
+          --tree)
+            [ $# -ge 2 ] || { echo "::error::--tree needs a value"; exit 2; }
+            TREE="$2"; shift 2 ;;
+          --tree=*)
+            TREE="${1#--tree=}"; shift ;;
+        esac
+        ;;
+    esac
     ;;
 esac
 
@@ -257,6 +356,17 @@ fi
 # shellcheck source=ci/scripts/runpod_lib.sh
 source "$DIR/runpod_lib.sh"
 
+# Resolved once, here, so every verb below (attach/run/logs/push/pull/target)
+# reads the SAME directory for the SAME --tree value — the one place
+# TREE -> path resolution happens on the laptop side (rp_tree_dir also runs
+# on the pod, inside the remote heredocs below, computed identically since
+# both sides apply the exact same "jammi-ai" -> /root/jammi-ai special case).
+TREE_DIR="$(rp_tree_dir "$TREE")"
+# `=`-anchored so a tmux SESSION lookup never prefix-matches another tree's
+# session (`jammi-ai` would otherwise match a session literally named
+# `jammi-ai-2`) — the fix for the shipped unanchored `-t jammi` bug (M6).
+TMUX_SESSION="jammi-${TREE}"
+
 # The ref rules live with the code that sends the ref to the pod, so they are
 # applied here as soon as that code is available — before anything is rented.
 case "$CMD" in
@@ -265,14 +375,17 @@ esac
 
 # Interactive remote command: correct env, then either the running job's terminal
 # or a plain shell in the checkout. Pass "job" to prefer the job when one exists.
-rp_login_cmd() { # $1 = "job" to join a live tmux job
-  local pre='[ -f /root/.jammi_env ] && . /root/.jammi_env; cd /root/jammi-ai 2>/dev/null;'
+# $2 = tree dir, $3 = tmux session name (both required; no bare defaults here
+# so a caller can never silently land on the WRONG tree's job).
+rp_login_cmd() { # $1 = "job" to join a live tmux job, $2 = tree dir, $3 = tmux session
+  local tree_dir="${2:?rp_login_cmd needs a tree dir}" tmux_sess="${3:?rp_login_cmd needs a tmux session name}"
+  local pre; pre="[ -f /root/.jammi_env ] && . /root/.jammi_env; cd '${tree_dir}' 2>/dev/null;"
   if [ "${1:-}" = "job" ]; then
     # Ctrl-C inside the job's pane signals the job itself, so say so before
     # handing over the keyboard — this is a terminal that can destroy work.
-    printf '%s %s' "$pre" 'if tmux has-session -t jammi 2>/dev/null; then
-      echo "=== joining the running job. Ctrl-B then D detaches. Ctrl-C KILLS the job. ===";
-      exec tmux attach -t jammi; fi; exec bash -i'
+    printf '%s %s' "$pre" "if tmux has-session -t \"=${tmux_sess}\" 2>/dev/null; then
+      echo \"=== joining the running job. Ctrl-B then D detaches. Ctrl-C KILLS the job. ===\";
+      exec tmux attach -t \"=${tmux_sess}\"; fi; exec bash -i"
   else
     printf '%s %s' "$pre" 'exec bash -i'
   fi
@@ -310,6 +423,25 @@ bootstrap_or_die() {
   esac
 }
 
+# Kicks off the pod's build-substrate seed, DETACHED — never blocks
+# `shell`/`up` (a cold seed is real compile minutes). Idempotent:
+# pod_seed_target.sh itself no-ops when .jammi-seed-complete already exists
+# (unless --reseed). Runs under the SAME lock-in-pane pattern as `run
+# --timing` (M6): the flock acquisition is the FIRST thing the detached
+# pane's own command does, so the lock's lifetime is the seed job's
+# lifetime, not this short-lived launcher's.
+start_seed_build() {
+  local reseed_flag=""
+  [ "$RESEED" = "1" ] && reseed_flag="--reseed"
+  rp_run_remote <<EOF
+set -uo pipefail
+tmux kill-session -t "=jammi-seed" 2>/dev/null
+tmux new-session -d -s "jammi-seed" "flock -n -E 75 /root/.jammi-timing.lock bash /root/jammi-ai/ci/scripts/pod_seed_target.sh --no-lock ${reseed_flag} > /root/.jammi-seed.log 2>&1"
+tmux set-option -w -t "=jammi-seed:" remain-on-exit off
+echo "seed build started detached (tmux session jammi-seed; log: /root/.jammi-seed.log)"
+EOF
+}
+
 case "$CMD" in
 
   shell)
@@ -321,8 +453,9 @@ case "$CMD" in
     rp_deploy_arch "$ARCH" || exit $?
     echo "=== bootstrapping ==="
     bootstrap_or_die
-    echo "=== pod ${RP_POD_ID} on ${RP_HOST}:${RP_PORT} @ ${RP_REF:-<none>} — it TERMINATES when you exit ==="
-    ssh "${RP_SSHO[@]}" -t -p "$RP_PORT" "root@${RP_HOST}" "$(rp_login_cmd)" || true
+    [ -n "$RP_REF" ] && start_seed_build
+    echo "=== pod ${RP_POD_ID} on ${RP_HOST}:${RP_PORT} @ ${RP_REF:-<none>} (tree: ${TREE}) — it TERMINATES when you exit ==="
+    ssh "${RP_SSHO[@]}" -t -p "$RP_PORT" "root@${RP_HOST}" "$(rp_login_cmd "" "$TREE_DIR" "$TMUX_SESSION")" || true
     echo "=== shell closed — terminating pod (trap) ==="
     ;;
 
@@ -404,6 +537,7 @@ case "$CMD" in
     # pod's entrypoint at deploy, so it is already running.
     echo "=== bootstrapping ==="
     bootstrap_or_die
+    [ -n "$RP_REF" ] && start_seed_build
     rp_keep
     rp_ssh_config_sync
     echo
@@ -421,41 +555,85 @@ case "$CMD" in
     # means everywhere else. `--shell` forces a plain prompt, for when you want to
     # poke around WHILE a job runs rather than take its keyboard.
     MODE=job; [ "${1:-}" = "--shell" ] && MODE=shell
-    ssh "${RP_SSHO[@]}" -t -p "$RP_PORT" "root@${RP_HOST}" "$(rp_login_cmd "$MODE")" || true
+    ssh "${RP_SSHO[@]}" -t -p "$RP_PORT" "root@${RP_HOST}" "$(rp_login_cmd "$MODE" "$TREE_DIR" "$TMUX_SESSION")" || true
     echo "=== detached; pod ${RP_POD_ID} still running (down with: $(basename "$0") down ${SESSION}) ==="
     ;;
 
   run)
+    TIMING=0
+    case "${1:-}" in --timing) TIMING=1; shift ;; esac
     [ $# -gt 0 ] || { echo "run: need a command"; exit 2; }
     require_pod; rp_keep
     JOB="$*"
+    # Per-tree job script/log (round-4/5 finding: a global /root/job.sh +
+    # /root/jammi.log meant `run --tree b` clobbered tree a's still-running
+    # job) — `=`-anchored tmux target (M6), `remain-on-exit off` so a job
+    # that exits leaves its output visible in `logs`/`attach` rather than the
+    # pane vanishing before either can read it.
+    #
+    # `--timing`: the launcher's OWN command line acquires the shared timing
+    # lock BEFORE the job script runs, INSIDE the detached pane (M6) — never
+    # in the (short-lived) ssh invocation that starts tmux and returns
+    # immediately, which would release the lock the instant IT exits, not
+    # when the real job does. `-n -E 75`: refuse instantly rather than queue,
+    # since a human `run --timing` conflicting with another timing-sensitive
+    # run should be told NOW, not block silently.
+    if [ "$TIMING" = "1" ]; then
+      # Redirection (`>`), not a `| tee` pipe: a pipe would make the PANE's
+      # own exit status `tee`'s (near-always 0), masking flock's own exit 75
+      # refusal from anything reading the pane/log afterward. Output still
+      # lands in .jammi.log; it is simply not tailed live via tee.
+      LAUNCH="flock -n -E 75 /root/.jammi-timing.lock bash '${TREE_DIR}'/.jammi-job.sh > '${TREE_DIR}'/.jammi.log 2>&1"
+    else
+      LAUNCH="bash '${TREE_DIR}'/.jammi-job.sh 2>&1 | tee '${TREE_DIR}'/.jammi.log"
+    fi
     rp_run_remote <<EOF
 set -uo pipefail
-cat > /root/job.sh <<'JOBEOF'
+cat > '${TREE_DIR}'/.jammi-job.sh <<'JOBEOF'
 [ -f /root/.jammi_env ] && . /root/.jammi_env
-cd /root/jammi-ai
+cd '${TREE_DIR}'
 ${JOB}
 JOBEOF
-tmux kill-session -t jammi 2>/dev/null
-tmux new-session -d -s jammi "bash /root/job.sh 2>&1 | tee /root/jammi.log"
-echo "started: ${JOB}"
+tmux kill-session -t "=${TMUX_SESSION}" 2>/dev/null
+tmux new-session -d -s "${TMUX_SESSION}" "${LAUNCH}"
+tmux set-option -w -t "=${TMUX_SESSION}:" remain-on-exit off
+echo "started (tree=${TREE}, timing-locked=${TIMING}): ${JOB}"
 EOF
-    echo "=== detached. follow with: $(basename "$0") logs ${SESSION} ==="
+    echo "=== detached. follow with: $(basename "$0") logs ${SESSION} --tree ${TREE} ==="
     ;;
 
   logs)
     require_pod; rp_keep
-    ssh "${RP_SSHO[@]}" -t -p "$RP_PORT" "root@${RP_HOST}" "tail -f -n 200 /root/jammi.log" || true
+    ssh "${RP_SSHO[@]}" -t -p "$RP_PORT" "root@${RP_HOST}" "tail -f -n 200 '${TREE_DIR}/.jammi.log'" || true
     ;;
 
   push)
     require_pod; rp_keep
     # Ship the working tree, including uncommitted work, but never the local
-    # build output — target/ is host-arch and would poison the pod's.
-    rsync -az --delete --exclude '.git' --exclude 'target' --exclude '.venv' \
+    # build output — target/ is host-arch and would poison the pod's. The
+    # exclude set is defined ONCE, in pod_push_stamp.sh, so the real rsync
+    # and the stamp's own manifest hash below can never drift apart. cutlass
+    # (a submodule) is excluded here too — it is provisioned by
+    # `target`/`push --with-cutlass`, never pushed as plain files (an
+    # rsync --delete of it would otherwise delete the pod's own checkout).
+    EXCLUDE_ARGS=()
+    while IFS= read -r pat; do
+      [ -n "$pat" ] || continue
+      EXCLUDE_ARGS+=(--exclude "$pat")
+    done < <("$DIR/pod_push_stamp.sh" excludes)
+    rsync -azc --no-times --delete "${EXCLUDE_ARGS[@]}" \
       -e "ssh ${RP_SSHO[*]} -p ${RP_PORT}" \
-      "${REPO_ROOT}/" "root@${RP_HOST}:/root/jammi-ai/" \
-      && echo "=== pushed $(basename "$REPO_ROOT") → pod ==="
+      "${REPO_ROOT}/" "root@${RP_HOST}:${TREE_DIR}/" \
+      && echo "=== pushed $(basename "$REPO_ROOT") → pod (tree: ${TREE}) ==="
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      STAMP="$(mktemp)"
+      "$DIR/pod_push_stamp.sh" compute "$REPO_ROOT" "$SESSION" > "$STAMP" \
+        && rsync -az -e "ssh ${RP_SSHO[*]} -p ${RP_PORT}" \
+             "$STAMP" "root@${RP_HOST}:${TREE_DIR}/.jammi-push-stamp.json" \
+        && echo "=== push-stamp written to ${TREE_DIR}/.jammi-push-stamp.json (iteration provenance only — a COMMITTED artifact still requires a pushed sha) ==="
+      rm -f "$STAMP"
+    fi
     ;;
 
   pull)
@@ -464,8 +642,38 @@ EOF
     [ -n "$REMOTE" ] || { echo "pull: need a remote path (e.g. pull ${SESSION} target/nextest)"; exit 2; }
     mkdir -p "${REPO_ROOT}/.gpu-pull"
     rsync -az -e "ssh ${RP_SSHO[*]} -p ${RP_PORT}" \
-      "root@${RP_HOST}:/root/jammi-ai/${REMOTE}" "${REPO_ROOT}/.gpu-pull/" \
-      && echo "=== pulled ${REMOTE} → .gpu-pull/ ==="
+      "root@${RP_HOST}:${TREE_DIR}/${REMOTE}" "${REPO_ROOT}/.gpu-pull/" \
+      && echo "=== pulled ${REMOTE} (tree: ${TREE}) → .gpu-pull/ ==="
+    ;;
+
+  target)
+    require_pod; rp_keep
+    NAME_TREE_DIR="$(rp_tree_dir "$TARGET_NAME")"
+    if [ "$TARGET_VERIFY" = "1" ]; then
+      # Reads a `cargo build -v` log piped in on THIS invocation's own stdin
+      # and forwards it to pod_target_clone.sh --verify running remotely —
+      # ssh is never mocked in this tooling's own test suite, so the
+      # hermetic coverage for --verify's actual PASS/FAIL logic lives in
+      # test_pod_substrate.sh against the standalone script, not against
+      # this remote invocation.
+      cat | ssh "${RP_SSHO[@]}" -p "$RP_PORT" "root@${RP_HOST}" \
+        "bash /root/jammi-ai/ci/scripts/pod_target_clone.sh '' '${NAME_TREE_DIR}' --verify"
+      exit $?
+    fi
+    [ -n "$TARGET_NAME" ] || { echo "target: need a tree name"; exit 2; }
+    rp_run_remote <<EOF
+set -uo pipefail
+bash /root/jammi-ai/ci/scripts/pod_target_clone.sh /root/.jammi-seed '${NAME_TREE_DIR}'
+EOF
+    rc=$?
+    if [ "$rc" -eq 0 ] && [ "$TARGET_WITH_CUTLASS" = "1" ]; then
+      rp_run_remote <<EOF
+set -uo pipefail
+git -C '${NAME_TREE_DIR}' submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass
+EOF
+    fi
+    echo "=== target '${TARGET_NAME}' at ${NAME_TREE_DIR}: exit ${rc} ==="
+    exit "$rc"
     ;;
 
   down)

@@ -6,9 +6,9 @@
   "driver_version": "580.159.04",
   "nvcc_version": "12.6.85 (V12.6.85, cuda_12.6.r12.6/compiler.35059454_0)",
   "rustc_version": "1.94.0 (4a4ef493e 2026-03-02)",
-  "status": "PENDING_PHASE4_RERUN: this file is being updated by the numerics phase-4 audit fix (write-owner round) -- E1 stands unchanged (CPU-hermetic, unaffected by this round's code); E2 is being RE-RUN on this round's own tip against the round5_maybe_upcast_scores producer this round restored (see producer.round4_round5_dump below) and round4_localize.py, replacing the round-5 unreachable-tree numbers; E3/E4 status unchanged from round 5 (E3 partial proxy, E4 not run -- see below).",
+  "status": "PARTIAL: E1/E2 complete on this branch's own tip (E2 fused/eager/shared/shared_upcast arms; flash omitted, out of reach); E3 unchanged proxy-only; E4 not run.",
   "deliverable_branch": "fix/esc-045-bf16-fused-backward-r4",
-  "git_sha": "PLACEHOLDER_UPDATED_AFTER_FINAL_COMMIT",
+  "git_sha": "4023ad07f652d13faef369b4e9f9adf403ad4db6",
   "producer": {
     "path": "crates/jammi-kernels/tests/rope_oracles.rs",
     "kind": "cargo-test",
@@ -69,8 +69,33 @@
       "shared_upcast": "same DISABLE list as shared, plus JAMMI_ROUND5_UPCAST_SCORES=1 (this round's E2 diagnostic: q/k upcast to F32 for the scores GEMM + softmax, probs cast back to bf16 for P@V) -- restored this round via round5_maybe_upcast_scores",
       "flash": "NOT reachable from this branch (perf/p6-fa2-dense is a separate initiative) -- omitted from this round's re-run, not fabricated. The historical round-5 flash numbers are retained ONLY in e2_full_table_HISTORICAL_round5_only.txt for reference."
     },
-    "PLACEHOLDER_E2_RERUN": "Filled in with this branch's tip numbers after the pod run -- see round4_localize.py's --out report and this file's own re-run instructions above.",
-    "full_84_row_table_file_HISTORICAL_round5_only": "e2_full_table.txt (this artifact directory) -- the round-5 table INCLUDING the unreachable flash arm, kept for provenance; the current re-run's own table (fused/eager/shared/shared_upcast only) is at e2_full_table_phase4_rerun.txt"
+    "phase4_rerun_git_sha": "4023ad07f652d13faef369b4e9f9adf403ad4db6",
+    "phase4_rerun_summary_boundary_low_1_to_17_cos_mean": {
+      "eager": 0.2948, "fused": 0.6392, "shared": 0.3392, "shared_upcast": 0.5937
+    },
+    "phase4_rerun_summary_boundary_high_18_to_28_cos_mean": {
+      "eager": 0.9183, "fused": 0.8904, "shared": 0.9295, "shared_upcast": 0.9220
+    },
+    "phase4_rerun_summary_qkv_low_0_to_17_cos_mean": {
+      "eager": 0.4370, "fused": 0.7327, "shared": 0.3893, "shared_upcast": 0.7058
+    },
+    "phase4_rerun_summary_qkv_high_18_to_27_cos_mean": {
+      "eager": 0.9389, "fused": 0.7813, "shared": 0.9033, "shared_upcast": 0.9549
+    },
+    "phase4_rerun_summary_mlp_input_low_0_to_17_cos_mean": {
+      "eager": 0.3067, "fused": 0.6307, "shared": 0.3134, "shared_upcast": 0.5820
+    },
+    "phase4_rerun_summary_mlp_input_high_18_to_27_cos_mean": {
+      "eager": 0.9076, "fused": 0.8939, "shared": 0.9235, "shared_upcast": 0.9133
+    },
+    "phase4_rerun_summary_all_84_relerr": {
+      "eager": 1.1761, "fused": 0.6848, "shared": 1.3427, "shared_upcast": 0.7732
+    },
+    "phase4_rerun_note_on_band_split": "This re-run's bands split at layer index 18 uniformly across boundary/qkv/mlp_input (round4_localize.py's --band-split, low = idx < 18, high = idx >= 18) -- a slightly different (and simpler) convention than round 5's own per-category off-by-one split (boundary 1-18 vs 19-28, qkv 0-18 vs 19-27); the NUMBERS are freshly measured on this branch's tip, not copied from round 5, and the pattern (shared_upcast improves substantially on shared in the low band, on every one of the three categories, closely reproducing round 5's own finding) replicates.",
+    "phase4_rerun_verdict": "H2 CONFIRMED again on this branch's own tip, independent of round 5's now-unreachable measurement tree: shared_upcast's low-band cos improves over shared's on all three categories (boundary 0.339->0.594, qkv 0.389->0.706, mlp_input 0.313->0.582) and shared_upcast's all-84 relerr (0.773) is close to fused's (0.685) and far better than shared's (1.343) -- the F32-logits mechanism this round's round5_maybe_upcast_scores restores as a committed producer is confirmed, not merely asserted.",
+    "phase4_rerun_dispatch_confirmation": "Each arm's dump logged its own disabled_requested/disabled_fired lists (see the raw stdout captured by this round's pod session) -- fused=[]/[], eager=[attention_block_fused,rope_fused,softmax_last_dim_fused] (all fired), shared/shared_upcast=[attention_block_fused,softmax_last_dim_fused] (both fired), f32_truth=[]/[] at backbone_dtype=F32 -- confirming every arm dispatched exactly the cascade its own row in `arms` above claims, not merely assumed from the env vars set.",
+    "full_84_row_table_file_HISTORICAL_round5_only": "e2_full_table.txt (this artifact directory) -- the round-5 table INCLUDING the unreachable flash arm, kept for provenance",
+    "full_84_row_table_file_phase4_rerun": "e2_full_table_phase4_rerun.txt (this artifact directory) -- this round's own re-run table (fused/eager/shared/shared_upcast only, no flash), produced by `python3 ci/scripts/perf/round4_localize.py --truth f32_truth.safetensors --arm fused=fused.safetensors --arm eager=eager.safetensors --arm shared=shared.safetensors --arm shared_upcast=shared_upcast.safetensors --band-split 18` against the five safetensors dumps this round's pod session produced under JAMMI_ROUND4_MODEL_DIR=/root/checkpoints/ModernBERT-large, JAMMI_ROUND4_LORA_WEIGHTS_IN pointing at a freshly seeded shared LoRA weights file (esc045_round5_seed_shared_lora_weights, seed 42), b4-s128"
   },
   "E3_inherent_to_bf16_vs_jammi_defect": {
     "description": "Aggregate proxy (full per-layer register_full_backward_hook torch table NOT built -- unchanged from round 5, see 'incomplete' below). torch's OWN bf16-vs-f32 ceiling, computed from ALREADY-VALIDATED torch reference runs, cosine of the FULL concatenated trainable LoRA-gradient vector (7,196,672 params). UNCHANGED this round (no torch-side code touched).",
@@ -92,10 +117,17 @@
     "incomplete": "The full 28-layer torch register_full_backward_hook boundary/qkv table (torch bf16-sdpa and torch f32, same checkpoint/LoRA/seed/batch as E2's jammi legs, for a row-by-row comparison against the E2 table) was NOT built -- deprioritized against E2/E1 given round 5's time budget. Still flagged as remaining work; unchanged this round."
   },
   "deliverable_branch_pod_gates": {
-    "tree": "PLACEHOLDER_UPDATED_AFTER_FINAL_COMMIT (this round's phase-4-audit-fix tip)",
-    "cargo_fmt_p_jammi_kernels_check": "PLACEHOLDER",
-    "cargo_clippy_p_jammi_kernels_all_targets_features_cuda_D_warnings": "PLACEHOLDER",
-    "cargo_test_p_jammi_kernels_features_cuda_release": "PLACEHOLDER"
+    "tree": "4023ad07f652d13faef369b4e9f9adf403ad4db6 (phase-4 audit fix tip; the cuda_parity.rs geglu tolerance fix applied on top was pod-verified before this commit, see cuda_parity_test_exit)",
+    "cargo_fmt_p_jammi_kernels_check": "exit 0",
+    "cargo_clippy_p_jammi_kernels_all_targets_features_cuda_D_warnings": "exit 0, zero warnings",
+    "cargo_test_p_jammi_kernels_features_cuda_release": "exit 0, 0 FAILED across the whole run (including tests/cuda_parity.rs's new geglu_bwd_random_dy_matches_cpu_within_tolerance_on_cuda_with_red_control and scaled_cast_add_bf16_f32_random_amplitude_bit_exact_cpu_vs_cuda_with_red_control legs, A2)",
+    "cuda_parity_test_exit": "exit 0; 78 passed, 0 failed, 1 ignored (isolated_kernel_timing_cast_boundary_wave1, an unrelated pre-existing #[ignore]); RED control counts: geglu 4658/20992 elements, scaled_cast_add 3455/65536 elements (both non-vacuous)",
+    "cargo_fmt_p_jammi_lora_check": "exit 0",
+    "cargo_clippy_p_jammi_lora_all_targets_features_cuda_D_warnings": "exit 0, zero warnings",
+    "cargo_test_p_jammi_lora_features_cuda_release": "exit 0, 18 passed 0 failed (JAMMI_KERNELS_STRICT=1 is the WRONG invocation for this crate's own suite -- several of its tests deliberately exercise the eager-fallback path by name, e.g. training_mode_on_an_unsupported_dtype_falls_back_and_is_counted, which Strict mode correctly turns into a hard error; that is Strict mode working as designed, not a defect -- confirmed by re-running without JAMMI_KERNELS_STRICT, which is green)",
+    "cargo_fmt_p_jammi_encoders_check": "exit 0",
+    "cargo_clippy_p_jammi_encoders_all_targets_features_cuda_D_warnings": "exit 0, zero warnings",
+    "cargo_test_p_jammi_encoders_features_cuda_release": "exit 0, 0 FAILED across the whole run, including the new hidden_activation_*/round5_maybe_upcast_scores_*/activation_capture::tests::* legs (advisories a/b) and esc045_round5_seed_shared_lora_weights/esc045_round4_per_layer_activation_gradient_dump SKIPping cleanly (ok, not failed) when JAMMI_ROUND4_MODEL_DIR is unset"
   },
   "E4_headline_gradient_oracle": {
     "status": "NOT RUN this round (unchanged from round 5's own status) -- crates/jammi-bench's grad_oracle.rs/torch_grad_oracle.py IS now merged to main (GH#372, 8724115), so the CLI itself exists on this branch, but running the full jammi-vs-torch headline comparison end to end was out of this phase-4 audit round's scope (A1-A4 + advisories only).",

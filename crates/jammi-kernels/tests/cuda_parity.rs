@@ -2186,20 +2186,27 @@ fn gelu_erf_and_grad_f32_ref(x: f32) -> (f32, f32) {
 
 /// esc-045 phase-4 audit (A2): a RANDOM production-amplitude `dy` (not
 /// `.backward()`'s implicit `ones_like` seed) proves `GegluBwdDWiOut`'s
-/// CUDA arm is BIT-EXACT (`to_bits`, not a tolerance) against the CPU
-/// arm's `dwi_out` — covering BOTH halves (`d_gate` at
-/// `[0..intermediate)`, `d_up` at `[intermediate..2*intermediate)`) in one
-/// assertion, since both arms compute the SAME formula
-/// `jammi_kernels::ops::geglu`'s module doc pins (esc-045 round 2's two-kernel
-/// rounding fix). The RED control below hand-computes the DISCARDED
-/// pre-fix formula (f32-accumulate `d_gate`/`d_up` throughout, round each
-/// ONCE at the very end — the module doc's "PREVIOUS version" the round-2
-/// fix replaced) on this SAME fixture and shows it diverges from the CPU
-/// arm's real output on a non-vacuous count of elements — proving this
-/// fixture is discriminating, not merely that CPU and CUDA happen to
-/// agree on a formula neither of them actually runs.
+/// CUDA arm matches the CPU arm's `dwi_out` within this file's own stated
+/// bf16 tolerance (`assert_geglu_parity_bf16`'s `REL = 2*2^-7` bound —
+/// NOT bit-exact: measured live on this leg's own pod run, CPU `libm::erff`
+/// and CUDA's device `erff` disagree by up to 1 bf16 ULP on ~0.4% of
+/// elements, exactly the cross-platform libm gap `geglu.cu`'s own comment
+/// discloses, unrelated to any rounding-PLACEMENT question) — covering
+/// BOTH halves (`d_gate` at `[0..intermediate)`, `d_up` at
+/// `[intermediate..2*intermediate)`) in one assertion, since both arms
+/// compute the SAME formula `jammi_kernels::ops::geglu`'s module doc pins
+/// (esc-045 round 2's two-kernel rounding fix). The RED control below
+/// hand-computes the DISCARDED pre-fix formula (f32-accumulate
+/// `d_gate`/`d_up` throughout, round each ONCE at the very end — the
+/// module doc's "PREVIOUS version" the round-2 fix replaced) on this SAME
+/// fixture and shows it diverges from the CPU arm's real output, BIT-
+/// EXACTLY (no erf-library ambiguity: both sides of THIS comparison are
+/// CPU-computed from the identical `libm::erff` call), on a non-vacuous
+/// count of elements — proving this fixture is discriminating, not merely
+/// that CPU and CUDA happen to agree on a formula neither of them
+/// actually runs.
 #[test]
-fn geglu_bwd_random_dy_bit_exact_cpu_vs_cuda_with_red_control() {
+fn geglu_bwd_random_dy_matches_cpu_within_tolerance_on_cuda_with_red_control() {
     let Some(cuda) = cuda_device() else {
         return;
     };
@@ -2291,24 +2298,38 @@ fn geglu_bwd_random_dy_bit_exact_cpu_vs_cuda_with_red_control() {
          prove nothing (guide §3.7/§3.8 non-vacuity)"
     );
     eprintln!(
-        "geglu_bwd_random_dy_bit_exact_cpu_vs_cuda_with_red_control: RED control diverges on \
+        "geglu_bwd_random_dy_matches_cpu_within_tolerance_on_cuda_with_red_control: RED control diverges on \
          {red_mismatches}/{n} elements"
     );
 
+    // NOT bit-exact, disclosed and measured live (guide §3.7/§3.8): CUDA's
+    // `erff`/`expf` (`geglu.cu`'s own comment) match the CPU arm's
+    // `libm::erff`-based formula only "to within ordinary cross-platform
+    // libm ULP" — a REAL, pre-existing, documented gap this transcendental
+    // function's two different math-library implementations carry,
+    // independent of any rounding-PLACEMENT question this leg's RED
+    // control isolates. The SAME relative-with-floor-at-1.0 bound
+    // `assert_geglu_parity_bf16` above already uses for exactly this
+    // reason (`REL = 2*2^-7`, floored at magnitude `1.0`) — this leg adds
+    // RANDOM production-amplitude `dy` and the RED control on TOP of that
+    // existing tolerance, it does not claim a tighter one.
+    let bf16_bound = |c: f32, g: f32| 2.0 * 2.0f32.powi(-7) * c.abs().max(g).max(1.0);
     let mut mismatches = 0usize;
-    let mut first: Option<(usize, u16, u16)> = None;
+    let mut first: Option<(usize, f32, f32)> = None;
     for i in 0..n {
-        if dwi_cpu[i].to_bits() != dwi_gpu[i].to_bits() {
+        let c = dwi_cpu[i].to_f32();
+        let g = dwi_gpu[i].to_f32();
+        if (c - g).abs() > bf16_bound(c, g) {
             mismatches += 1;
             if first.is_none() {
-                first = Some((i, dwi_cpu[i].to_bits(), dwi_gpu[i].to_bits()));
+                first = Some((i, c, g));
             }
         }
     }
     assert_eq!(
         mismatches, 0,
-        "GegluBwdDWiOut CUDA arm NOT bit-exact vs CPU at random production-amplitude dy: \
-         {mismatches}/{n} mismatches, first={first:?}"
+        "GegluBwdDWiOut CUDA arm outside the stated bf16 tolerance vs CPU at random \
+         production-amplitude dy: {mismatches}/{n} mismatches, first={first:?}"
     );
 }
 

@@ -483,6 +483,69 @@ def provenance(device, fast_path_globals):
     return info
 
 
+# Unification contract C3.5 — this producer's own K7-completeness identity
+# list: the SAME shape `FinetuneStepTier::IDENTITY_FIELDS` /
+# `GradOracleReport::IDENTITY_FIELDS` carry on the Rust side
+# (`crates/jammi-bench/src/report.rs`, `grad_oracle.rs`), for THIS producer.
+# The 14 entries `ab_merge.py`'s own `FINETUNE_IDENTITY_FIELDS` compares
+# (`ab_merge.py:114-129`) — present here at whichever placement this
+# producer's own report actually uses (`report["args"][field]` for the three
+# named in `ab_merge.py`'s `_TORCH_ARGS_LEVEL_FIELDS`, `report["finetune_step"]
+# [field]` for the rest — see that module's own doc) — plus 14
+# K7-completeness additions this producer alone carries: five environment/
+# version facts (`torch_version`, `torch_cuda_version`, `transformers_version`,
+# `peft_version`, `python_version`), the attention/compile/LoRA-init
+# determinants this producer's own `--attn`/`--lora-init` CLI flags resolve
+# (`attn_implementation`, `sdpa_backend_probe`, `reference_compile_resolved`,
+# `lora_init`), `adamw_foreach` (torch's own multi-tensor-vs-loop optimizer
+# fast path, the torch peer of jammi's `adamw_fused_dispatches`), and three
+# provenance fields this function (`provenance`, above) itself fills:
+# `fast_path_globals`, `device_name`, `git_rev`.
+#
+# `nvidia_driver_version` is the ONE nullable entry (`TORCH_IDENTITY_FIELDS_
+# NULL_MEANS` below): `null` on this producer means "this run had no CUDA
+# device" (`provenance`'s own `if device.type == "cuda":` guard, immediately
+# above), never "this producer predates the field" — every other entry here
+# is `NonNull`.
+TORCH_IDENTITY_FIELDS = (
+    "seed",
+    "batch",
+    "seq",
+    "lora_rank",
+    "lora_alpha",
+    "lora_dropout",
+    "margin",
+    "target_modules",
+    "batched_forward",
+    "backbone_dtype",
+    "steps_measured",
+    "checkpoint_config_sha256",
+    "checkpoint_weights_sha256",
+    "checkpoint_weights_size_bytes",
+    "torch_version",
+    "torch_cuda_version",
+    "transformers_version",
+    "peft_version",
+    "python_version",
+    "attn_implementation",
+    "sdpa_backend_probe",
+    "reference_compile_resolved",
+    "lora_init",
+    "adamw_foreach",
+    "fast_path_globals",
+    "device_name",
+    "nvidia_driver_version",
+    "git_rev",
+)
+
+# Field -> what a `null`/absent reading on THIS producer means. Every
+# `TORCH_IDENTITY_FIELDS` entry not listed here is `NonNull` (a null/absent
+# reading is itself a finding, mirroring the Rust `Nullable::NonNull` class).
+TORCH_IDENTITY_FIELDS_NULL_MEANS = {
+    "nvidia_driver_version": "no CUDA",
+}
+
+
 def build_dry_run_checkpoint(tmp_dir: str) -> str:
     """Materialize a tiny random-init 2-layer ModernBERT to `tmp_dir` via
     `save_pretrained`, so the `--dry-run` path can reload it through the

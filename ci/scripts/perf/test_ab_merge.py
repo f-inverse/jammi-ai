@@ -1092,5 +1092,130 @@ class EmptyRawDirTests(unittest.TestCase):
         self.assertEqual(rc, 1)
 
 
+class TorchIdentityFieldsAgainstADryRunDumpTests(unittest.TestCase):
+    """Unification contract C3.5: `torch_finetune_step.py::TORCH_IDENTITY_FIELDS`
+    must actually be present somewhere in the JSON this producer emits.
+
+    Two legs, chosen so this suite stays runnable in EITHER environment:
+
+    - `test_static_source_covers_every_declared_field` (ALWAYS runs,
+      stdlib-only): parses `torch_finetune_step.py`'s own AST and collects
+      every string dict-literal KEY anywhere in the module (`provenance()`'s
+      `info = {...}`, `run()`'s `report["args"]`/`report["finetune_step"]`
+      blocks), then asserts every `TORCH_IDENTITY_FIELDS` entry is one of
+      them. This is the leg that actually executes in THIS environment (no
+      `torch`/`transformers` install available here — `import torch` fails
+      at the top of this very check), and is what makes this suite catch a
+      typo'd field name in `TORCH_IDENTITY_FIELDS` mechanically rather than
+      by eye.
+    - `test_real_dry_run_dump_names_every_field` (SKIPPED unless `torch` +
+      `transformers` + `peft` import cleanly): actually spawns
+      `torch_finetune_step.py --dry-run` (`build_dry_run_checkpoint`'s own
+      random-init tiny checkpoint, no real weights needed — see that
+      function's doc) and asserts every `TORCH_IDENTITY_FIELDS` entry
+      resolves to a non-`_MISSING` value in the REAL emitted JSON — the
+      literal "checks it against a dry-run dump" contract C3.5 names. Runs
+      for real on a box that has the torch/transformers/peft stack (a GPU
+      prove pod, a maintainer's dev box); skipped, never silently passed,
+      everywhere else.
+    """
+
+    TORCH_SCRIPT = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "crates", "jammi-bench",
+        "reference", "torch_finetune_step.py",
+    )
+
+    def _module_source(self) -> str:
+        path = os.path.abspath(self.TORCH_SCRIPT)
+        self.assertTrue(os.path.isfile(path), f"missing: {path}")
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_static_source_covers_every_declared_field(self):
+        import ast
+
+        tree = ast.parse(self._module_source())
+        declared = None
+        dict_keys = set()
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == "TORCH_IDENTITY_FIELDS"
+            ):
+                declared = [elt.value for elt in node.value.elts]
+            if isinstance(node, ast.Dict):
+                for key in node.keys:
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                        dict_keys.add(key.value)
+            # `report["finetune_step"][field] = value` / subscript-assign
+            # shapes (used for a couple of fields set conditionally after
+            # the dict literal, e.g. `lora_a_tensors_reinitialized`) also
+            # count as "this producer emits this key".
+            if (
+                isinstance(node, ast.Subscript)
+                and isinstance(node.slice, ast.Constant)
+                and isinstance(node.slice.value, str)
+            ):
+                dict_keys.add(node.slice.value)
+
+        self.assertIsNotNone(
+            declared, "TORCH_IDENTITY_FIELDS not found in torch_finetune_step.py — RED at base"
+        )
+        self.assertEqual(len(declared), len(set(declared)), "TORCH_IDENTITY_FIELDS has a duplicate")
+        missing = sorted(set(declared) - dict_keys)
+        self.assertFalse(
+            missing,
+            f"TORCH_IDENTITY_FIELDS names field(s) that never appear as a dict-literal key "
+            f"anywhere in torch_finetune_step.py: {missing}",
+        )
+
+    def test_real_dry_run_dump_names_every_field(self):
+        try:
+            import torch  # noqa: F401
+            import transformers  # noqa: F401
+            import peft  # noqa: F401
+        except ImportError:
+            self.skipTest("torch/transformers/peft not installed in this environment")
+
+        sys.path.insert(0, os.path.dirname(os.path.abspath(self.TORCH_SCRIPT)))
+        import torch_finetune_step as tfs  # noqa: E402
+
+        with tempfile.TemporaryDirectory() as tmp_dir, tempfile.TemporaryDirectory() as out_dir:
+            out_path = os.path.join(out_dir, "dry_run.json")
+            rc = tfs.main(
+                [
+                    "--dry-run",
+                    "--batch",
+                    "2",
+                    "--seq",
+                    "6",
+                    "--steps",
+                    "1",
+                    "--warmup",
+                    "0",
+                    "--out",
+                    out_path,
+                ]
+            )
+            self.assertEqual(rc, 0)
+            with open(out_path) as fh:
+                dump = json.load(fh)
+
+        def _resolve(field):
+            for block_name in ("provenance", "args", "finetune_step"):
+                block = dump.get(block_name, {})
+                if isinstance(block, dict) and field in block:
+                    return True
+            return False
+
+        missing = [f for f in tfs.TORCH_IDENTITY_FIELDS if not _resolve(f)]
+        self.assertFalse(
+            missing,
+            f"TORCH_IDENTITY_FIELDS entries absent from a real --dry-run dump: {missing}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

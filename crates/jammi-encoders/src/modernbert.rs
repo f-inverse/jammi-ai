@@ -6604,9 +6604,19 @@ mod tests {
         Tensor::from_vec(ids, (batch, seq), device).expect("build synthetic token-id batch")
     }
 
-    /// esc-045 round 5 (GH #374): seeds ONE shared LoRA weights file (rank
-    /// 16 / alpha 32 / `target_modules=[Wqkv,Wo,Wi]` / `ZerosB` init, seed
-    /// `JAMMI_ROUND4_SEED` or `42`) and saves it via `VarMap::save`, so
+    /// esc-045 round 5 (GH #374), amended round 6 (GH #374 esc-045-r6):
+    /// seeds ONE shared LoRA weights file (rank 16 / alpha 32 /
+    /// `target_modules=[Wqkv,Wo,Wi]` / `Gaussian` init — NOT `ZerosB`:
+    /// round 4/5 used `ZerosB`, under which `B` starts at the exact zero
+    /// matrix, so `dL/dA` is IDENTICALLY zero at a fresh forward
+    /// (`grad_oracle.rs`'s own module doc, "Structural limitation"
+    /// section) AND the LoRA epilogue's forward contribution
+    /// (`scaling * dropout(x @ A^T) @ B^T`) is the exact zero tensor, so
+    /// the fused epilogue kernel is only ever asked to add zero — round 6
+    /// switches to `Gaussian` (both `A` and `B` drawn `Normal(0, 0.02)`)
+    /// so the epilogue actually adds a nonzero delta and `dL/dA` is live,
+    /// not structurally zero — seed `JAMMI_ROUND4_SEED` or `42`) and saves
+    /// it via `VarMap::save`, so
     /// every round-4/round-5 arm invocation below loads the SAME LoRA
     /// starting point via `JAMMI_ROUND4_LORA_WEIGHTS_IN` (isolating each
     /// arm's arithmetic as the only variable, exactly like round 4's own
@@ -6654,7 +6664,8 @@ mod tests {
             use_rslora: false,
             lora_dropout: None,
             rank_pattern: &rank_pattern,
-            init_mode: jammi_lora::LoraInitMode::ZerosB,
+            // esc-045 round 6: Gaussian, not ZerosB — see this fn's doc.
+            init_mode: jammi_lora::LoraInitMode::Gaussian,
             seed,
         };
         let _model = ModernBert::builder()

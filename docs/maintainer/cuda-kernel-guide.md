@@ -186,6 +186,17 @@ because it was a small share of runtime. An isolated number alone is not a resul
   the branch is evidence about the ORACLE, not the code.
 * After a squash merge of a branch carrying green artifacts, the merger stamps `merged_as`/
   `merged_via_pr` in the same day — until then every PR fails rule (d).
+* **Exclusive box, timing lock.** A shared GPU under concurrent agent builds moves a timing number by
+  several times the exclusive-box noise band; rent the box exclusively and hold a timing lock for the
+  duration of the measured legs, or the number is not comparable to anything.
+* **Ratios travel across boxes; milliseconds do not.** A same-box `jammi ÷ torch` (or `torch ÷ jammi`)
+  ratio is meaningful across a GPU/driver/torch-wheel change because both arms moved together; a raw
+  millisecond number from one box says nothing about another box's — always re-derive the torch
+  denominator on the box you measure jammi on, never carry a torch number in from a different session.
+* **Attribute a kernel-time delta by GRID, not by launch count.** Averaging launch counts across
+  unequal-size dispatches misattributes time to the wrong kernel family; attribute by element mass
+  times the removed family's own bandwidth, and read the grid dimensions (not just the kernel name)
+  off the profile before naming what a kernel does.
 
 ## 5. Host and build hazards (they silently invalidate results)
 

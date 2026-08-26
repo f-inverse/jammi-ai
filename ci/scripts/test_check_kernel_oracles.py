@@ -11,6 +11,9 @@ Run: `python3 ci/scripts/test_check_kernel_oracles.py`
 
 from __future__ import annotations
 
+import hashlib
+import os
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -18,6 +21,90 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import check_kernel_oracles as ko  # noqa: E402
+
+# The frozen tokenizer-invariant fixture corpus (esc: kernel-oracle-golden-
+# fixture) — see `_load_tokenizer_fixture_corpus` and
+# `TestTokenizerCommentStringInvariant` below for why this exists
+# separately from `ko.scan_files()`'s LIVE tree scan.
+_TOKENIZER_FIXTURE_DIR = Path(__file__).resolve().parents[2] / "ci" / "fixtures" / "kernel-oracle-tokenizer"
+
+
+def _load_tokenizer_fixture_corpus() -> dict[str, str]:
+    """Every `.rs` file under the committed, FROZEN tokenizer fixture
+    corpus (`ci/fixtures/kernel-oracle-tokenizer/`), keyed by its path
+    relative to that directory (stable regardless of where the repo is
+    checked out). Raises if the corpus directory is missing or empty —
+    an uncomputable golden must fail closed, never silently pass on zero
+    files.
+    """
+    if not _TOKENIZER_FIXTURE_DIR.is_dir():
+        raise FileNotFoundError(f"tokenizer fixture corpus not found: {_TOKENIZER_FIXTURE_DIR}")
+    texts: dict[str, str] = {}
+    for path in sorted(_TOKENIZER_FIXTURE_DIR.rglob("*.rs")):
+        rel = str(path.relative_to(_TOKENIZER_FIXTURE_DIR))
+        texts[rel] = path.read_text(encoding="utf-8")
+    if not texts:
+        raise FileNotFoundError(f"tokenizer fixture corpus is empty: {_TOKENIZER_FIXTURE_DIR}")
+    return texts
+
+
+def _strip_rust_golden_hash(texts: dict[str, str]) -> str:
+    """SHA256 over every `label`'s `ko._strip_rust` output, sorted by
+    label, `\\0`-separated — the ONE golden-hashing recipe shared by the
+    fixture-corpus golden test and `--regenerate-tokenizer-golden` below,
+    so the two can never compute the hash two different ways.
+    """
+    h = hashlib.sha256()
+    for label in sorted(texts):
+        h.update(label.encode())
+        h.update(b"\0")
+        h.update(ko._strip_rust(texts[label]).encode())
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def _regenerate_tokenizer_golden() -> int:
+    """Recompute `_STRIP_RUST_GOLDEN_HASH`/`_STRIP_RUST_GOLDEN_FILE_COUNT`
+    over the committed fixture corpus and rewrite this file's own two
+    constants in place. Run: `python3 ci/scripts/test_check_kernel_oracles.py
+    --regenerate-tokenizer-golden`, then inspect the resulting diff and
+    commit it DELIBERATELY (a reviewed PR diff) — never to silence a
+    failure. Refuses under CI (`CI` env var set): a golden that can
+    silently regenerate itself in CI can never fail, defeating the point
+    of pinning it at all.
+    """
+    if os.environ.get("CI"):
+        print(
+            "test_check_kernel_oracles.py: refusing --regenerate-tokenizer-golden under CI "
+            "— run this locally and commit the resulting diff",
+            file=sys.stderr,
+        )
+        return 2
+    texts = _load_tokenizer_fixture_corpus()
+    new_hash = _strip_rust_golden_hash(texts)
+    new_count = len(texts)
+    self_path = Path(__file__).resolve()
+    src = self_path.read_text(encoding="utf-8")
+    src, n_hash = re.subn(
+        r'_STRIP_RUST_GOLDEN_HASH = "[0-9a-f]+"',
+        f'_STRIP_RUST_GOLDEN_HASH = "{new_hash}"',
+        src,
+    )
+    src, n_count = re.subn(
+        r"_STRIP_RUST_GOLDEN_FILE_COUNT = \d+",
+        f"_STRIP_RUST_GOLDEN_FILE_COUNT = {new_count}",
+        src,
+    )
+    if n_hash != 1 or n_count != 1:
+        print(
+            f"test_check_kernel_oracles.py: expected exactly one occurrence each of the golden "
+            f"constants, found {n_hash} hash / {n_count} count occurrence(s) — refusing to write",
+            file=sys.stderr,
+        )
+        return 2
+    self_path.write_text(src, encoding="utf-8")
+    print(f"wrote _STRIP_RUST_GOLDEN_HASH={new_hash!r} _STRIP_RUST_GOLDEN_FILE_COUNT={new_count}")
+    return 0
 
 
 def _helpers_for(source_map: dict[str, str], entries: list[tuple[str, str]]) -> set[str]:
@@ -2119,26 +2206,61 @@ class TestTokenizerCommentStringInvariant(unittest.TestCase):
     # length/newline-count preservation, which a WRONG (but still
     # length-preserving) blanking bug would pass trivially. A real golden:
     # SHA256 over every scanned file's own `_strip_rust` output (sorted by
-    # label, `\0`-separated) — any change to `_strip_rust`'s ACTUAL
-    # blanked/kept content on the real tree, not just its shape, moves this
-    # hash. Update `_STRIP_RUST_GOLDEN_HASH`/`_STRIP_RUST_GOLDEN_FILE_COUNT`
-    # DELIBERATELY (a reviewed PR diff) when `_strip_rust`'s real behavior
-    # is meant to change — never to silence a failure.
-    _STRIP_RUST_GOLDEN_HASH = "47a0b46335197c0e4a9080ac855fbd9dc1a7867c442a2bf489d318dd43a01f34"
-    _STRIP_RUST_GOLDEN_FILE_COUNT = 36
+    # label, `\0`-separated). This used to run over `ko.scan_files()` — the
+    # LIVE `crates/jammi-kernels/tests/` + `crates/jammi-encoders/src/`
+    # tree — which pinned the TREE'S CONTENTS, not the tokenizer's
+    # behaviour: adding an oracle test file (#398, 37 != 36) or editing one
+    # doc comment under either scanned root (#396, `modernbert.rs`'s
+    # citation line) moved the hash for a reason that had nothing to do
+    # with `_strip_rust` itself, reddening every unrelated PR that touched
+    # those roots. The golden now runs over the COMMITTED, FROZEN fixture
+    # corpus at `ci/fixtures/kernel-oracle-tokenizer/` (every comment/
+    # string form the tokenizer handles: block/line/doc comments, nested
+    # block comments, raw/byte strings, strings containing `//`/`/*`,
+    # `#[cfg(...)]` attribute strings, char/byte-char literals including
+    # quote characters, and a lifetime that is deliberately NOT a char
+    # literal) instead — a change to `_strip_rust`'s ACTUAL blanked/kept
+    # content still moves this hash (that power is unchanged), but the
+    # live tree's file count/contents no longer can. Update
+    # `_STRIP_RUST_GOLDEN_HASH`/`_STRIP_RUST_GOLDEN_FILE_COUNT`
+    # DELIBERATELY (a reviewed PR diff) — via `python3 ci/scripts/
+    # test_check_kernel_oracles.py --regenerate-tokenizer-golden`, which
+    # refuses under CI — when `_strip_rust`'s real behavior on the corpus
+    # is meant to change, or the corpus itself gains/loses a fixture file;
+    # never to silence an unrelated failure.
+    _STRIP_RUST_GOLDEN_HASH = "e7272dfd6939f9aede59c14db2be1706d98c6d36e9c3cc4a4f8e4b2a69fd6d6d"
+    _STRIP_RUST_GOLDEN_FILE_COUNT = 3
 
-    def test_strip_rust_output_matches_the_golden_hash_on_real_tree(self) -> None:
-        import hashlib
+    # The live-tree file count observed on `main` at the time this floor
+    # was set — NOT a pin. `test_real_tree_scan_meets_floor_and_every_
+    # file_tokenizes_without_error` below only asserts `>=` this, so it
+    # grows freely as files are added and never reddens on that alone.
+    _REAL_TREE_MIN_FILE_COUNT = 36
 
-        texts = ko.scan_files()
+    def test_strip_rust_output_matches_the_golden_hash_on_fixture_corpus(self) -> None:
+        texts = _load_tokenizer_fixture_corpus()
         self.assertEqual(len(texts), self._STRIP_RUST_GOLDEN_FILE_COUNT)
-        h = hashlib.sha256()
-        for label in sorted(texts):
-            h.update(label.encode())
-            h.update(b"\0")
-            h.update(ko._strip_rust(texts[label]).encode())
-            h.update(b"\0")
-        self.assertEqual(h.hexdigest(), self._STRIP_RUST_GOLDEN_HASH)
+        self.assertEqual(_strip_rust_golden_hash(texts), self._STRIP_RUST_GOLDEN_HASH)
+
+    def test_real_tree_scan_meets_floor_and_every_file_tokenizes_without_error(self) -> None:
+        """Companion, NON-golden assertion (kept alongside the fixture-
+        corpus golden above, never merged into it): the live-tree scan
+        keeps being OBSERVED — at least `_REAL_TREE_MIN_FILE_COUNT` files,
+        and every one of them tokenizes without raising and reconstructs
+        EXACTLY byte-for-byte from `_tokenize_rust`'s own token spans (the
+        tokenizer covers the whole source contiguously, with no gap or
+        overlap) — without PINNING the live tree's byte content. Adding an
+        oracle test file only grows the observed count (never reddens
+        this); an unrelated doc-comment edit changes no assertion here at
+        all, since nothing about this test depends on any file's exact
+        text.
+        """
+        texts = ko.scan_files()
+        self.assertGreaterEqual(len(texts), self._REAL_TREE_MIN_FILE_COUNT)
+        for label, src in texts.items():
+            tokens = ko._tokenize_rust(src)
+            reconstructed = "".join(src[start:end] for _kind, start, end, _cs, _ce in tokens)
+            self.assertEqual(reconstructed, src, f"{label}: tokenizer did not cover the source contiguously")
 
     def test_tokenize_rust_distinguishes_comment_from_string(self) -> None:
         src = 'fn a() {}\n// a real comment\nlet s = "blank me";\n'
@@ -2155,4 +2277,6 @@ class TestTokenizerCommentStringInvariant(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    if "--regenerate-tokenizer-golden" in sys.argv:
+        sys.exit(_regenerate_tokenizer_golden())
     unittest.main()

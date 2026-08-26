@@ -148,10 +148,13 @@ terminated an unrelated stale pod.
 `down` never trusts the locally-recorded pod id on its own. Before issuing a
 terminate, it confirms the id is **both** still present in the account's own
 live pod list **and** still carries this session's own name (its
-`<prefix>-ttl<H>`, held or not) — a mismatch refuses rather than acts, and the
-local session record is forgotten either way (the pod itself, if it still
+`<prefix>-ttl<H>`) — a mismatch refuses rather than acts. On a refusal the
+local session record is deliberately **kept**, not forgotten: this is exactly
+the ambiguous case where a follow-up `up` on the same alias most needs to
+still see a recorded pod and refuse (or ask for `--replace`) rather than
+deploying a third pod on top of the confusion. The pod itself, if it still
 exists under a different session's name, is left running for that session to
-manage).
+manage.
 
 ## Reproducing the shipped runtime image
 
@@ -268,26 +271,14 @@ Three guards, in order of when they act:
    unparseable deadline, or a stopped pod is swept. And a sweep that cannot
    *reach* RunPod fails loudly rather than reporting "nothing to clean up".
 
-   **Pausing the sweep for a specific pod** — a measurement you need to keep
-   running past its own deadline's *sweep window* without disabling the sweep
-   for everyone else:
-
-   ```bash
-   ci/scripts/gpu-dev.sh hold a100      # sweep skips this pod
-   ci/scripts/gpu-dev.sh unhold a100    # sweep judges it again
-   ```
-
-   `hold` renames the pod on RunPod's own side to append `-hold` — the only
-   account-visible field a *stateless* cron sweep, with no access to this
-   machine's session directory, can actually see. `reap` skips any pod whose
-   name carries that marker, with a `::warning::` so a held pod is never
-   silently invisible in the sweep's own log.
-
-   **`hold` does not touch `RP_TTL_HOURS` or the in-pod watchdog.** The
-   deadline baked into the pod's entrypoint at deploy time fires on schedule
-   regardless — a held pod left forever still bills only until *that*
-   deadline, never past it. `hold` pauses the *external* sweep backstop, not
-   the pod's own self-termination.
+   **There is no way to pause the sweep for a single pod.** RunPod's pod-edit
+   mutation has no `name` field (and no rename capability at all) — the
+   sweep's only account-visible per-pod signal is the name it was deployed
+   with, which is immutable after deploy, so a "hold this one pod" marker is
+   not something this tooling can implement. A running measurement is
+   protected only by its own TTL: rent with `RP_TTL_HOURS`/`RP_DEV_TTL_HOURS`
+   set to at least the job's expected length up front, rather than relying on
+   pausing the sweep partway through.
 
 Guard 2 needs the network at deadline time; guard 3 needs this repo's CI to be
 running. They fail for unrelated reasons, which is the point of having both.

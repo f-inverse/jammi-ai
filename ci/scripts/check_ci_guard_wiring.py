@@ -149,18 +149,29 @@ def gate_scripts() -> list[Path]:
 
 
 def python_test_suites() -> list[Path]:
-    """Every TRACKED `test_*.py` python test suite under one of the three
-    prefix roots this module's doc names — the general, root-driven
+    """Every TRACKED `test_*.py` OR `test_*.sh` test suite under one of the
+    three prefix roots this module's doc names — the general, root-driven
     replacement for F6's two hand-picked `Path.rglob`/`Path.glob` roots (see
     this module's own doc for why hand-picking a root reproduces the exact
     blind spot it was meant to close, one directory over).
+
+    Widened to `.sh` (audit round on PR #387): `ci/scripts/test_gpu_dev_lifecycle.sh`
+    landed as a hermetic `test_*.sh` regression suite and was structurally
+    INVISIBLE to this function's original `.py`-only filter — the exact F6/F7
+    blind-spot shape, one extension over, catchable only because this suite
+    happened to also be hand-wired into `ci.yml`'s Guard matrix already. The
+    function keeps its `python_test_suites` name (every existing call site —
+    `main()` below and `test_check_ci_guard_wiring.py`'s own pinned suite —
+    already references it) even though it is no longer python-exclusive,
+    rather than rippling a rename through a file this change does not
+    otherwise need to touch.
     """
     suites: list[Path] = []
     for rel in _tracked_files():
-        if not rel.endswith(".py"):
-            continue
         name = rel.rsplit("/", 1)[-1]
-        if not (name.startswith("test_") and name.endswith(".py")):
+        if not name.startswith("test_"):
+            continue
+        if not (name.endswith(".py") or name.endswith(".sh")):
             continue
         if rel.startswith("ci/") or rel.startswith("tests/") or _CRATES_REFERENCE_RE.match(rel):
             suites.append(REPO_ROOT / rel)
@@ -204,7 +215,7 @@ def main() -> int:
     scripts = gate_scripts() + python_test_suites()
     if not scripts:
         print(
-            "ci-guard-wiring: FAIL — no check_*.py/check_*.sh gate scripts or test_*.py suites found",
+            "ci-guard-wiring: FAIL — no check_*.py/check_*.sh gate scripts or test_*.py/test_*.sh suites found",
             file=sys.stderr,
         )
         return 1

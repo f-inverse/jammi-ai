@@ -651,13 +651,17 @@ jobs:
             cmd: python3 ci/scripts/check_cuda_run_artifacts.py
             fetch_depth: "0"
           # Mocks-only, no-network regression suite for the 2026-08-25
-          # gpu-dev pod-lifecycle incident (ledger rows 279-289): a read-only
-          # subcommand's require_pod failure must never issue podTerminate,
+          # gpu-dev pod-lifecycle incident (ledger rows 279-289) and the
+          # mechanism defects an audit round found in this suite's own first
+          # pass: an EXIT trap firing during the SSH-readiness wait must
+          # still terminate a pod this invocation just rented; a read-only
+          # subcommand's require_pod failure must never issue podTerminate;
           # `up` refuses a session alias that already has a recorded pod
-          # unless --replace, `down` only terminates a pod that verifies
-          # against the account's own live pod list, and rp_sweep honours a
-          # `-hold` marker. See ci/scripts/test_gpu_dev_lifecycle.sh's own
-          # module doc.
+          # unless --replace, and --replace must not inherit a dead
+          # session's own RP_TTL_HOURS/RP_IMAGE; `down` only terminates a
+          # pod that verifies against the account's own live pod list, and
+          # keeps the local record on a refusal. See
+          # ci/scripts/test_gpu_dev_lifecycle.sh's own module doc.
           - name: gpu-dev lifecycle safety
             cmd: bash ci/scripts/test_gpu_dev_lifecycle.sh
           # Completeness tripwire for this very guard class: every

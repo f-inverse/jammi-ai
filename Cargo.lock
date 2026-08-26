@@ -4118,6 +4118,7 @@ dependencies = [
  "image",
  "jammi-db",
  "jammi-encoders",
+ "jammi-kernels",
  "jammi-lora",
  "jammi-numerics",
  "jammi-test-utils",

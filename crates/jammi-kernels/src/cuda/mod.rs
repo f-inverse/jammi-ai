@@ -7,6 +7,7 @@ use candle_core::cuda_backend::cudarc::driver::LaunchConfig;
 use candle_core::{CudaDevice, CudaStorage, DType, Error, Result};
 use half::bf16;
 
+pub(crate) mod adamw_step;
 pub(crate) mod attention_block;
 pub(crate) mod axpy;
 pub(crate) mod cast_scale;
@@ -18,6 +19,7 @@ pub(crate) mod rope;
 pub(crate) mod scaled_cast_add;
 pub(crate) mod softmax;
 
+pub(crate) const PTX_ADAMW_STEP: &str = include_str!(concat!(env!("OUT_DIR"), "/adamw_step.ptx"));
 pub(crate) const PTX_AXPY: &str = include_str!(concat!(env!("OUT_DIR"), "/axpy.ptx"));
 pub(crate) const PTX_CAST_SCALE: &str = include_str!(concat!(env!("OUT_DIR"), "/cast_scale.ptx"));
 pub(crate) const PTX_DROPOUT: &str = include_str!(concat!(env!("OUT_DIR"), "/dropout.ptx"));

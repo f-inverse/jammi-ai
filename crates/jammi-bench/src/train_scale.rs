@@ -285,7 +285,12 @@ fn fresh_head(shape: Shape) -> Result<(LoraModel, Vec<Var>), Box<dyn std::error:
     for (_, layer) in &mut head.layers {
         layer.set_training(false);
     }
-    let vars = varmap.all_vars();
+    // Name-sorted, never `VarMap::all_vars()`'s per-process-randomised
+    // `HashMap` order (PR #381 audit B3, the esc-182 class): every bench
+    // fold over trainable vars goes through `sorted_trainable_vars`, so the
+    // order these `Var`s are accumulated/stepped in is a function of the
+    // fixture, not of the hasher seed this process happened to draw.
+    let vars = jammi_ai::fine_tune::optimizer::sorted_trainable_vars(&varmap);
     Ok((head, vars))
 }
 

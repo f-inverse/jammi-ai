@@ -247,6 +247,17 @@ jobs:
       - name: Assert no consumer's feature closure reaches jammi-kernels/flash-attn
         run: python3 ci/scripts/check_flash_attn_closure.py
 
+      # The mechanism-proving leg, same shape as `check_doc_numbers_have_
+      # producers.py --self-test` a few jobs over (`ci.yml`'s `Guard` matrix,
+      # "doc numbers have producers self-test"): runs the walker over
+      # synthetic metadata fixtures — including a leak reachable only via a
+      # workspace member's OWN `cuda` feature selection, not `default` or the
+      # release lane's set — and asserts it is still caught. Required (no
+      # `continue-on-error`), like its sibling: a self-test that only runs by
+      # hand proves nothing about what CI actually exercises on every PR.
+      - name: Self-test the flash-attn closure guard
+        run: python3 ci/scripts/check_flash_attn_closure.py --self-test
+
   # This is a COMPILE lane, not a correctness lane: it proves the vendored
   # FlashAttention-2 tree, the torch-free C wrapper, the shim headers, and
   # `build.rs::build_flash_attn` still produce a valid `nvcc` build (a
@@ -333,6 +344,33 @@ jobs:
 
       - name: Compile-check jammi-kernels --features flash-attn (nvcc, no GPU)
         run: cargo check -p jammi-kernels --features flash-attn
+
+      # The encoders `forward_flash_dense_attention` call site (P6 Stage B
+      # B3-dense) is otherwise compiled by no CI job at all — this crate's
+      # ordinary `check`/`clippy` jobs never build with `--features
+      # flash-attn`, so a break in that call site would only surface on the
+      # next GPU pod run. Same image, same job (CUTLASS submodule already
+      # initialised above), same flags/env/target-dir as the kernels step
+      # immediately above.
+      #
+      # `--features cuda,flash-attn`, not `flash-attn` alone: this crate's
+      # `flash-attn` feature only forwards `jammi-kernels/flash-attn` — the
+      # three-way flash-vs-block-vs-f32 oracle, its K-unrotated/window-
+      # dropped/bad-softmax-scale RED controls, the fault harness, and the
+      # VRAM probe in `modernbert.rs` (`FLASH_ORACLE_SWEEP_SEEDS`,
+      # `run_flash_oracle_shape_sweep`, `flash_oracle_wqkv_lora_b`, …) are
+      # ALL `#[cfg(feature = "cuda")]` inside `mod tests`, so `flash-attn`
+      # alone compiled only the production call site, never the harness
+      # that actually proves it. `cuda` here means "compile with the CUDA
+      # feature chain enabled" (`build_cuda`'s PTX build via `nvcc`, the
+      # same as the kernels step immediately above) — it does NOT need a
+      # live GPU at compile time, only the toolkit this job's image already
+      # ships. `--tests` is required too: plain `cargo check` never
+      # compiles `#[cfg(test)] mod tests` content at all, feature-gated or
+      # not, so without it this step would stay silently green even with
+      # `cuda` enabled.
+      - name: Compile-check jammi-encoders --features cuda,flash-attn (nvcc, no GPU)
+        run: cargo check -p jammi-encoders --features cuda,flash-attn --tests
 
   oss-only-build:
     name: Guard (OSS-only build)

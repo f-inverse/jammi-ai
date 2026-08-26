@@ -1,0 +1,123 @@
+{
+  "engine_version": "0.47.0",
+  "host": {
+    "logical_cpus": 26,
+    "total_ram_mib": 967474
+  },
+  "subcommand": "finetune-step",
+  "tiers": {
+    "finetune_step": {
+      "device": "cuda:0",
+      "device_name": "NVIDIA A100 80GB PCIe",
+      "backbone_dtype": "bf16",
+      "checkpoint_config_sha256": "55dca68059e98f0debf8eb63ab355c451c65b1f5d90fdca4754113fdaadd2cca",
+      "checkpoint_weights_sha256": "44510fec5d3a81a1877f225637b869495f18e55f6f23a09abb9be0acc030295f",
+      "checkpoint_weights_size_bytes": 1583544840,
+      "seed": 42,
+      "batch": 1,
+      "seq": 512,
+      "lora_rank": 16,
+      "lora_alpha": 32.0,
+      "lora_dropout": 0.0,
+      "margin": 0.3,
+      "target_modules": [
+        "Wqkv",
+        "Wo",
+        "Wi"
+      ],
+      "batched_forward": true,
+      "trainable_tensors": 224,
+      "steps_measured": 25,
+      "losses": [
+        0.265625,
+        0.30078125,
+        0.26953125,
+        0.34765625,
+        0.30859375,
+        0.30859375,
+        0.30078125,
+        0.30078125,
+        0.3046875,
+        0.30078125,
+        0.29296875,
+        0.30078125,
+        0.30078125,
+        0.30859375,
+        0.30078125,
+        0.30859375,
+        0.30859375,
+        0.31640625,
+        0.30859375,
+        0.30078125,
+        0.2890625,
+        0.29296875,
+        0.2890625,
+        0.296875,
+        0.29296875
+      ],
+      "loss_first": 0.265625,
+      "loss_last": 0.29296875,
+      "ln_fused_dispatches": 1710,
+      "ln_eager_dispatches": 0,
+      "rope_fused_dispatches": 0,
+      "rope_eager_dispatches": 0,
+      "softmax_fused_dispatches": 0,
+      "softmax_eager_dispatches": 0,
+      "geglu_fused_dispatches": 840,
+      "geglu_eager_dispatches": 0,
+      "lora_epilogue_fused_dispatches": 0,
+      "lora_epilogue_eager_dispatches": 0,
+      "lora_linear_fused_dispatches": 3360,
+      "lora_linear_eager_dispatches": 0,
+      "attention_block_fused_dispatches": 840,
+      "attention_block_eager_dispatches": 0,
+      "adamw_fused_dispatches": 0,
+      "adamw_eager_dispatches": 6720,
+      "attention_block_flash_fused_dispatches": 0,
+      "attention_block_flash_declined_dispatches": 840,
+      "flash_compiled": true,
+      "kernels_disabled_requested": [
+        "adamw_step_fused",
+        "attention_block_flash"
+      ],
+      "kernels_disabled_fired": [
+        "adamw_step_fused",
+        "attention_block_flash"
+      ],
+      "s_per_step_p50": {
+        "value": 0.115743881,
+        "unit": "s"
+      },
+      "s_per_step_mean": {
+        "value": 0.11668170879999998,
+        "unit": "s"
+      },
+      "steps_per_s": {
+        "value": 8.639765587262449,
+        "unit": "steps/s"
+      },
+      "triplets_per_s": {
+        "value": 8.639765587262449,
+        "unit": "triplets/s"
+      },
+      "peak_rss_bytes": {
+        "value": 1870430208.0,
+        "unit": "bytes"
+      },
+      "peak_vram_bytes": {
+        "value": 1897922560.0,
+        "unit": "bytes"
+      }
+    }
+  },
+  "schema_version": 1,
+  "git_sha": "eee7e6a91b25221de7d72df30e42fdc7412ab42d",
+  "box": "a100c",
+  "status": "GREEN",
+  "producer": {
+    "path": "crates/jammi-bench/src/finetune_step.rs",
+    "kind": "script",
+    "invocation": "jammi-bench finetune-step --model-dir /root/checkpoints/ModernBERT-large --steps 25 --warmup 5 --lora-rank 16 --lora-alpha 32 --lora-dropout 0 --target-modules Wqkv,Wo,Wi --backbone-dtype bf16 --cuda 0 --seed 42 --batched-forward true --batch <B> --seq <S> [--expect-kernels-disabled attention_block_flash,adamw_step_fused on the alloff leg only] (JAMMI_KERNELS_STRICT=1)",
+    "gating": "none"
+  }
+}

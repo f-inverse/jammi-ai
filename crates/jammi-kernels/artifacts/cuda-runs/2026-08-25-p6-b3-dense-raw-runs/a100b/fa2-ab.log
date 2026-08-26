@@ -1,0 +1,14 @@
+HEAD=5886c6b627c7a943df384a8aaadb7c3d6714e79c
+=== SECTION build 2026-08-25T22:03:36Z ===
+    Finished `release` profile [optimized] target(s) in 0.42s
+BUILD_RC=0
+NVIDIA A100-SXM4-80GB, 580.126.16
+FA2AB b8s512 flash-r1 p50 0.4626 {'attention_block_fused_dispatches': 0, 'attention_block_eager_dispatches': 0, 'attention_block_flash_fused_dispatches': 840, 'attention_block_flash_declined_dispatches': 0, 'flash_compiled': True} req [] fired []
+FA2AB b8s512 flash-r2 p50 0.4638 {'attention_block_fused_dispatches': 0, 'attention_block_eager_dispatches': 0, 'attention_block_flash_fused_dispatches': 840, 'attention_block_flash_declined_dispatches': 0, 'flash_compiled': True} req [] fired []
+FA2AB b8s512 block-r1 p50 0.6756 {'attention_block_fused_dispatches': 840, 'attention_block_eager_dispatches': 0, 'attention_block_flash_fused_dispatches': 0, 'attention_block_flash_declined_dispatches': 840, 'flash_compiled': True} req ['attention_block_flash'] fired ['attention_block_flash']
+FA2AB b8s512 block-r2 p50 0.6764 {'attention_block_fused_dispatches': 840, 'attention_block_eager_dispatches': 0, 'attention_block_flash_fused_dispatches': 0, 'attention_block_flash_declined_dispatches': 840, 'flash_compiled': True} req ['attention_block_flash'] fired ['attention_block_flash']
+FA2AB b8s128 flash-r1 p50 0.1559 {'attention_block_fused_dispatches': 0, 'attention_block_eager_dispatches': 0, 'attention_block_flash_fused_dispatches': 840, 'attention_block_flash_declined_dispatches': 0, 'flash_compiled': True} req [] fired []
+FA2AB b8s128 flash-r2 p50 0.1557 {'attention_block_fused_dispatches': 0, 'attention_block_eager_dispatches': 0, 'attention_block_flash_fused_dispatches': 840, 'attention_block_flash_declined_dispatches': 0, 'flash_compiled': True} req [] fired []
+FA2AB b8s128 block-r1 p50 0.1992 {'attention_block_fused_dispatches': 840, 'attention_block_eager_dispatches': 0, 'attention_block_flash_fused_dispatches': 0, 'attention_block_flash_declined_dispatches': 840, 'flash_compiled': True} req ['attention_block_flash'] fired ['attention_block_flash']
+FA2AB b8s128 block-r2 p50 0.1987 {'attention_block_fused_dispatches': 840, 'attention_block_eager_dispatches': 0, 'attention_block_flash_fused_dispatches': 0, 'attention_block_flash_declined_dispatches': 840, 'flash_compiled': True} req ['attention_block_flash'] fired ['attention_block_flash']
+FA2AB_EXIT=0 2026-08-25T22:05:21Z

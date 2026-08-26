@@ -500,6 +500,13 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     // report doc for how that forced-eager run is validated end-to-end).
     let adamw_dispatch_before =
         jammi_kernels::admission::counters_for("adamw_step_fused").snapshot();
+    // Same mechanism, for the FlashAttention-2 dense cascade (P6 Stage B
+    // B3-dense) — a THREE-outcome snapshot (`fused`/`eager`/`declined`,
+    // `jammi_kernels::admission::CascadeDispatchSnapshot`), not the
+    // two-outcome shape the ops above use — see
+    // `jammi_encoders::attention_block_flash_dispatch_snapshot`'s own doc.
+    let attention_block_flash_dispatch_before =
+        jammi_encoders::attention_block_flash_dispatch_snapshot();
 
     let mut times = Vec::with_capacity(params.steps);
     let mut losses = Vec::with_capacity(params.steps);
@@ -531,6 +538,8 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     let attention_block_dispatch_after = jammi_encoders::attention_block_dispatch_snapshot();
     let adamw_dispatch_after =
         jammi_kernels::admission::counters_for("adamw_step_fused").snapshot();
+    let attention_block_flash_dispatch_after =
+        jammi_encoders::attention_block_flash_dispatch_snapshot();
 
     // `JAMMI_KERNELS_DISABLE` safety property (contract K-aux): a
     // disable-list entry that never actually disabled a live `admit` call
@@ -655,6 +664,13 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
         adamw_eager_dispatches: adamw_dispatch_after
             .eager
             .saturating_sub(adamw_dispatch_before.eager),
+        attention_block_flash_fused_dispatches: attention_block_flash_dispatch_after
+            .fused
+            .saturating_sub(attention_block_flash_dispatch_before.fused),
+        attention_block_flash_declined_dispatches: attention_block_flash_dispatch_after
+            .declined
+            .saturating_sub(attention_block_flash_dispatch_before.declined),
+        flash_compiled: jammi_kernels::admission::FLASH_COMPILED,
         kernels_disabled_requested,
         kernels_disabled_fired,
         s_per_step_p50: Measurement::measured(p50, "s"),

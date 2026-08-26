@@ -65,6 +65,31 @@ CUDA_LANE = ["cuda", "jetstream-broker", "storage-cloud"]
 # Positive control: this feature MUST be reachable from the cuda lane.
 CONTROL_FEATURE = "cuda"
 
+# Workspace members permitted to reach TARGET_PKG/FORBIDDEN_FEATURE under
+# their OWN `--all-features` selection ONLY (P6 Stage B, `jammi-encoders`'s
+# `crate::modernbert` flash-cascade admission needs a declared forwarding
+# path for `flash_attention_varlen`/`CuSeqlens` — a `#[cfg(feature =
+# "flash-attn")]` call site, never a bare `cfg!()` runtime check around a
+# `jammi_kernels::flash` type reference, which would fail to compile with
+# the feature off; see the call site's own doc). The value is the EXACT
+# feature-spec list the member's own `flash-attn` entry must equal for the
+# exemption to apply — a verified 1:1 passthrough, not "any leak from this
+# crate is fine": if a future edit adds a second spec (e.g. also pulling in
+# a heavier dependency), the exemption stops matching and this script goes
+# back to FAILing on it.
+#
+# `--all-features` is a synthetic "build everything" selection no release
+# lane uses; an opt-in feature `--all-features` could never reach would be
+# untestable dead weight, so exempting it here does not weaken the
+# property this script actually guards. That property — the CUDA release
+# lane AND any plain `cuda`/`default` build of the exempted member stay
+# CUTLASS-free — is enforced separately below, per exempted member, by
+# re-running ITS OWN `default` and `cuda` selections (if it declares them)
+# and still FAILing if either reaches `FORBIDDEN_FEATURE`.
+ALL_FEATURES_FLASH_EXEMPT: dict[str, list[str]] = {
+    "jammi-encoders": [f"{TARGET_PKG}/{FORBIDDEN_FEATURE}"],
+}
+
 
 def load_metadata() -> dict:
     try:
@@ -232,11 +257,46 @@ def verdict(graph: Graph, verbose: bool = True) -> int:
         if verbose:
             print(f"{pkg} [--all-features] -> {TARGET_PKG} features: {kernels}")
         if FORBIDDEN_FEATURE in kernels:
+            own_spec = graph.pkgs[pkg]["features"].get(FORBIDDEN_FEATURE)
+            exempt_spec = ALL_FEATURES_FLASH_EXEMPT.get(pkg)
+            if exempt_spec is not None and own_spec == exempt_spec:
+                if verbose:
+                    print(
+                        f"EXEMPT: {pkg} [--all-features] reaches {TARGET_PKG}/{FORBIDDEN_FEATURE} "
+                        f"only via its own by-name `{FORBIDDEN_FEATURE} = {own_spec}` passthrough "
+                        f"— checking {pkg}'s own default/cuda selections instead"
+                    )
+                rc |= _check_exempt_member_real_lanes(graph, pkg, verbose)
+                continue
             if verbose:
                 print(
                     f"FAIL: {pkg} [--all-features] reaches {TARGET_PKG}/{FORBIDDEN_FEATURE} — "
                     f"a workspace member other than {ROOT} would compile the vendored "
                     f"FlashAttention-2 kernels",
+                    file=sys.stderr,
+                )
+            rc = 1
+    return rc
+
+
+def _check_exempt_member_real_lanes(graph: Graph, pkg: str, verbose: bool) -> int:
+    """The real property the exemption above must not weaken: an exempted
+    member's OWN `default` and `cuda` selections (the selections a real
+    build lane actually uses) must still exclude `FORBIDDEN_FEATURE`."""
+    rc = 0
+    for label in ("default", "cuda"):
+        if label not in graph.pkgs[pkg]["features"]:
+            continue
+        deferred.clear()
+        enabled = graph.closure(pkg, [label])
+        kernels = sorted(enabled.get(TARGET_PKG, set()))
+        if verbose:
+            print(f"{pkg} [{label}] -> {TARGET_PKG} features: {kernels}")
+        if FORBIDDEN_FEATURE in kernels:
+            if verbose:
+                print(
+                    f"FAIL: {pkg} [{label}] reaches {TARGET_PKG}/{FORBIDDEN_FEATURE} — the "
+                    f"exemption only covers --all-features, not a real build lane",
                     file=sys.stderr,
                 )
             rc = 1
@@ -319,6 +379,55 @@ def self_test() -> int:
         "the widened per-member --all-features loop must catch the leak "
         "jammi-server's own selections cannot see"
     )
+
+    # The ALL_FEATURES_FLASH_EXEMPT mechanism (P6 Stage B): a member that
+    # declares its OWN by-name `flash-attn` passthrough must pass under
+    # `--all-features` (the exemption fires) but still FAIL if the SAME
+    # feature leaks through a real lane (`cuda`/`default`), and must NOT
+    # be exempted if its `flash-attn` spec doesn't match exactly.
+    saved_exempt = dict(ALL_FEATURES_FLASH_EXEMPT)
+    try:
+        ALL_FEATURES_FLASH_EXEMPT.clear()
+        ALL_FEATURES_FLASH_EXEMPT["jammi-ai"] = [f"{TARGET_PKG}/{FORBIDDEN_FEATURE}"]
+
+        # Exempt member, clean cuda/default: --all-features leaks only via
+        # the declared passthrough -> overall verdict must be clean.
+        meta = _synthetic(["jammi-kernels/cuda"])
+        meta["packages"][1]["features"]["flash-attn"] = [f"{TARGET_PKG}/{FORBIDDEN_FEATURE}"]
+        g = Graph(meta)
+        assert verdict(g, verbose=False) == 0, (
+            "a member with a verified 1:1 flash-attn passthrough must pass "
+            "once exempted, provided its own cuda/default selections stay clean"
+        )
+
+        # Same exempt member, but `cuda` ALSO reaches flash-attn directly —
+        # the exemption must not launder a leak through a REAL build lane.
+        meta = _synthetic(["jammi-kernels/cuda", f"{TARGET_PKG}/{FORBIDDEN_FEATURE}"])
+        meta["packages"][1]["features"]["flash-attn"] = [f"{TARGET_PKG}/{FORBIDDEN_FEATURE}"]
+        g = Graph(meta)
+        assert verdict(g, verbose=False) == 1, (
+            "the exemption covers --all-features only; a leak via the member's "
+            "own cuda selection must still fail"
+        )
+
+        # Same exempt member, but its `flash-attn` feature pulls something
+        # EXTRA beyond the declared 1:1 passthrough — the spec no longer
+        # matches ALL_FEATURES_FLASH_EXEMPT's value, so it must NOT be
+        # silently exempted (a broader leak must read as an ordinary FAIL).
+        meta = _synthetic(["jammi-kernels/cuda"])
+        meta["packages"][1]["features"]["flash-attn"] = [
+            f"{TARGET_PKG}/{FORBIDDEN_FEATURE}",
+            "some-other-feature",
+        ]
+        g = Graph(meta)
+        assert verdict(g, verbose=False) == 1, (
+            "a flash-attn spec that does not match the exemption exactly "
+            "must not be silently exempted"
+        )
+    finally:
+        ALL_FEATURES_FLASH_EXEMPT.clear()
+        ALL_FEATURES_FLASH_EXEMPT.update(saved_exempt)
+
     print("self-test: ok")
     return 0
 

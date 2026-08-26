@@ -11,6 +11,42 @@
 //! early-return the single, auditable gate a reviewer can point at.
 
 use std::env;
+#[cfg(any(feature = "cuda", feature = "flash-attn"))]
+use std::path::{Path, PathBuf};
+
+/// Every FILE (recursively) under `dir`, sorted for a deterministic
+/// iteration order — shared by `build_cuda` and `build_flash_attn` so both
+/// walks emit `cargo:rerun-if-changed=<path>` PER FILE. A single
+/// directory-level `cargo:rerun-if-changed=<dir>` line is NOT a reliable
+/// substitute: it tracks the directory entry's OWN mtime (which changes
+/// when a file is added/removed) — an EXISTING file's CONTENT edit (the
+/// `rope_common.cuh`-only case this exists to catch) does not touch the
+/// directory's own mtime on every platform/cargo version this crate
+/// builds on, confirmed live on the reference pod (a header-only edit
+/// left the build "Fresh" — no rebuild — with only a directory-level line;
+/// the per-file walk below is what actually re-triggers `bindgen_cuda`
+/// 0.1.6's `build_ptx()`, both via Cargo's own rerun-if-changed AND via
+/// that function's internal `watch`-based staleness check — see
+/// `build_cuda`'s own comment for the second half of this fix). Gated:
+/// unused (and correctly so — no `.cu` compiles) on the plain, no-CUDA
+/// default build every other workspace crate takes.
+#[cfg(any(feature = "cuda", feature = "flash-attn"))]
+fn walk_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    let mut entries: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            out.extend(walk_files(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out
+}
 
 fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CUDA");
@@ -41,15 +77,25 @@ fn main() {
 fn build_cuda() {
     use bindgen_cuda::Builder;
 
-    // NOTE on rerun-if-changed: we do NOT emit our own line for
-    // `src/cuda/*.cu` here — `Builder::build_ptx()` already emits
-    // `cargo:rerun-if-changed=<path>` for every kernel path the glob below
-    // actually resolves to (bindgen_cuda 0.1.6, `build_ptx`'s
-    // `kernel_paths.par_iter()` loop), so it is automatically
-    // glob-consistent: a new `src/cuda/whatever.cu` added later is
-    // rerun-tracked with no edit needed here. A hardcoded
-    // `rerun-if-changed=src/cuda/axpy.cu` line (this file's previous
-    // version) would silently stop covering a second kernel file.
+    // rerun-if-changed, PER FILE under `src/cuda` (see `walk_files`'s own
+    // doc for why a single directory-level line is not reliable here):
+    // `Builder::build_ptx()` itself emits `cargo:rerun-if-changed=<path>`
+    // for every KERNEL (`.cu`) path the glob below resolves to
+    // (bindgen_cuda 0.1.6, `build_ptx`'s `kernel_paths.par_iter()` loop),
+    // but that does NOT cover a shared HEADER (`.cuh`) a kernel
+    // `#include`s — bindgen_cuda 0.1.6 does not parse `.cu`/`.cuh`
+    // dependencies, so `src/cuda/rope_common.cuh` (shared by `rope.cu` AND
+    // `rope_positions.cu`) editing it alone would neither re-run this
+    // build script NOR (see `.watch` below) re-invoke nvcc for either
+    // kernel that includes it — a stale-PTX build silently serving the
+    // OLD kernel body (confirmed live on the reference pod before this
+    // fix: a header-only edit needed two manual `touch`es to force a
+    // rebuild). Walking `src/cuda` ourselves and emitting one line per
+    // file closes the Cargo-rerun half; `.watch` below closes the second,
+    // independent half (`build_ptx()`'s OWN internal staleness check).
+    for path in walk_files(Path::new("src/cuda")) {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
 
     // `Builder::default()` itself needs nvcc/nvidia-smi info BEFORE we get
     // a chance to call `.compute_cap(80)` below. Its internal `compute_cap()`
@@ -102,6 +148,66 @@ fn build_cuda() {
     //     that with explicitly-rounded intrinsics in the expression itself
     //     (`__fmul_rn` / `__fadd_rn` / `__fmaf_rn`), not with a global
     //     `--fmad=false`.
+    // Force nvcc to actually RE-RUN for a kernel whenever ANY file under
+    // `src/cuda` (that kernel's own `.cu`, OR a header like
+    // `rope_common.cuh` it `#include`s) is newer than that kernel's
+    // EXISTING `.ptx` output — closing a gap that survived two earlier
+    // (insufficient) fix attempts, both confirmed live on the reference
+    // pod with a touch-free header-only edit:
+    //   1. A `cargo:rerun-if-changed` line per file under `src/cuda`
+    //      (still needed, kept above) makes CARGO re-run this whole build
+    //      script on a header edit — necessary but not sufficient.
+    //   2. `bindgen_cuda` 0.1.6's `Builder::build_ptx()` (below) has its
+    //      OWN, SEPARATE per-kernel skip check
+    //      (`out_modified.duration_since(in_modified)` on the OUT_DIR PTX
+    //      vs THAT KERNEL'S OWN `.cu` mtime — read directly from
+    //      `bindgen_cuda`'s source) that runs regardless of whether this
+    //      build script just re-ran. It has a `watch: Vec<PathBuf>`
+    //      field, but `build_ptx()` (unlike its sibling `build_lib()`,
+    //      which DOES fold `watch_modified` into its own skip decision)
+    //      only ever uses `self.watch` to emit MORE `cargo:rerun-if-changed`
+    //      lines — never consults it when deciding whether to skip nvcc.
+    //      So even after step 1 re-runs this script, `build_ptx()` still
+    //      sees `rope.cu`/`rope_positions.cu`'s OWN (unchanged) mtimes and
+    //      skips nvcc for both — a header-only edit silently served STALE
+    //      PTX for every kernel that includes it.
+    // The fix bindgen_cuda 0.1.6 leaves available: make its skip check
+    // itself see a MISSING output (which its `else { false }` branch
+    // always treats as "not ignored," i.e. compile) by deleting a
+    // kernel's existing `.ptx` whenever the source tree has a file newer
+    // than it. This is a coarse, SAFE over-approximation (it does not try
+    // to track which kernel includes which header — any kernel could,
+    // and the crate is small enough that recompiling all of them on any
+    // `src/cuda` change costs seconds, not minutes), and it is exactly
+    // what makes nvcc actually re-run — confirmed live: a touch-free
+    // `rope_common.cuh` edit now produces a FRESH `rope.ptx`/
+    // `rope_positions.ptx` mtime, where both prior attempts still served
+    // the stale file.
+    let out_dir = std::path::PathBuf::from(
+        env::var("OUT_DIR").expect("OUT_DIR must be set inside a build script"),
+    );
+    let cuda_sources = walk_files(Path::new("src/cuda"));
+    if let Some(newest_source) = cuda_sources
+        .iter()
+        .filter_map(|p| p.metadata().ok()?.modified().ok())
+        .max()
+    {
+        for cu in cuda_sources
+            .iter()
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("cu"))
+        {
+            let stem = cu.file_stem().expect("kernel path must have a filename");
+            let ptx = out_dir.join(stem).with_extension("ptx");
+            let ptx_is_stale = ptx
+                .metadata()
+                .and_then(|m| m.modified())
+                .is_ok_and(|ptx_modified| newest_source > ptx_modified);
+            if ptx_is_stale {
+                let _ = std::fs::remove_file(&ptx);
+            }
+        }
+    }
+
     let builder = Builder::default()
         .kernel_paths_glob("src/cuda/*.cu")
         .compute_cap(80);
@@ -171,7 +277,6 @@ fn build_cuda() {
 /// `src/`. The wrapper TU also sees `jammi/`.
 #[cfg(feature = "flash-attn")]
 fn build_flash_attn() {
-    use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::time::Instant;
 
@@ -221,12 +326,34 @@ fn build_flash_attn() {
         fa_dir.join("VENDORED.md").display()
     );
 
+    // ---- The ONE `-gencode` literal (see the doc comment above): sm_80
+    // cubin only, no PTX. `JAMMI_FLASH_GENCODE_SM` below is derived FROM
+    // this literal (parsed, not independently retyped) so the two can
+    // never drift apart — `crate::flash::check_arch` (`flash/mod.rs`)
+    // reads it via `env!("JAMMI_FLASH_GENCODE_SM")` and refuses any device
+    // whose compute capability major.minor does not EXACTLY match (P6
+    // Stage B contract §3.4: `meets_minimum()` is right for the PTX lane,
+    // wrong for a cubin-only build with no forward-compat JIT path).
+    const GENCODE_ARCH: &str = "arch=compute_80,code=sm_80";
+    let gencode_sm = GENCODE_ARCH
+        .rsplit("sm_")
+        .next()
+        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+        .unwrap_or_else(|| {
+            panic!(
+                "jammi-kernels build.rs: GENCODE_ARCH {GENCODE_ARCH:?} does not end in \
+                 \"sm_<digits>\" — the code=sm_XX suffix `JAMMI_FLASH_GENCODE_SM` derives from \
+                 is missing or malformed"
+            )
+        });
+    println!("cargo:rustc-env=JAMMI_FLASH_GENCODE_SM={gencode_sm}");
+
     // ---- The flag group (see the doc comment above).
     let common_flags: Vec<String> = [
         "-O3",
         "-std=c++17",
         "-gencode",
-        "arch=compute_80,code=sm_80",
+        GENCODE_ARCH,
         "--expt-relaxed-constexpr",
         "--expt-extended-lambda",
         "--use_fast_math",
@@ -344,23 +471,6 @@ fn build_flash_attn() {
     }
     println!("cargo:rustc-link-lib=dylib=cudart");
     println!("cargo:rustc-link-lib=dylib=stdc++");
-
-    fn walk_files(dir: &Path) -> Vec<PathBuf> {
-        let mut out = Vec::new();
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return out;
-        };
-        let mut entries: Vec<_> = entries.flatten().map(|e| e.path()).collect();
-        entries.sort();
-        for path in entries {
-            if path.is_dir() {
-                out.extend(walk_files(&path));
-            } else {
-                out.push(path);
-            }
-        }
-        out
-    }
 
     /// `$NVCC`, then `$CUDA_HOME/bin/nvcc`, `$CUDA_PATH/bin/nvcc`, then
     /// `nvcc` on PATH, then `/usr/local/cuda/bin/nvcc` — the first one that

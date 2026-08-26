@@ -28,6 +28,8 @@
   "purpose": "Independent torch-produced ground truth for jammi-kernels/tests/softmax_bwd_dscores_matches_reference_call_path.rs -- torch's REAL dx from modeling_modernbert.py:180's exact call path (nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)), not a hand-rederived formula.",
   "schema_version": 1,
   "seed_generator_manual_seed": 20260825,
+  "sha256": "7239406d21224330c2f0fed2e1bff6122e9bcfe0eca679d55a9d2200cf2fbe1e",
+  "sha256_note": "sha256 of the sibling .safetensors binary (not this .json), asserted by tests/softmax_bwd_dscores_matches_reference_call_path.rs's own loader test. This fixture is GPU-produced (gen_softmax_bwd_torch_dx.py run on a CUDA device against this project's pinned torch/transformers venv, per compute_device above) and is NOT CPU-reproducible byte-for-byte -- torch's CUDA softmax/softmax_backward kernels are not guaranteed bit-identical to a CPU-device run of the same script, so this sha pins the COMMITTED binary as the fixture of record, not a value anyone should expect to regenerate independently on a CPU-only box.",
   "shape": [
     12,
     512

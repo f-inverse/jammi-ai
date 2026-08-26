@@ -559,15 +559,20 @@
 //! `BF16`-rounded quantity `bwd` receives, one full rounding step earlier
 //! than the reference model's softmax ever produces. `super::attention_block`'s
 //! fused `CustomOp3` (the "block arm") reuses this exact `BF16`-native
-//! kernel on its CUDA path (see that module's "Rounding" section) — THAT
-//! is the esc-045 mechanism itself (GH#374,
-//! `.jammi/escapes.jsonl`'s `esc-045-bf16-fused-backward-diverges-from-f32-truth`),
-//! not a rounding-placement bug this file can fix by itself. The actual
-//! fix is either routing production attention through the FA2/SDPA dense
-//! arm (which keeps softmax in `F32` registers end to end, matching the
-//! reference) or adding a genuinely NEW `F32`-softmax variant of the block
-//! arm for the padded case — NOT attempted in this round; this doc only
-//! names the mechanism so the next round does not re-discover it.
+//! kernel on its CUDA path (see that module's "Rounding" section) — that
+//! reuse is SOURCE PARITY with this op's own kernel at the call line, a
+//! fact about what code runs, not a claim about which mechanism dominates
+//! esc-045's headline metric (GH#374, `.jammi/escapes.jsonl`'s
+//! `esc-045-bf16-fused-backward-diverges-from-f32-truth`). An earlier
+//! revision of this doc asserted this reuse WAS "the esc-045 mechanism
+//! itself" and named a specific fix as "the actual fix" — that assertion
+//! is retracted: round 7 (ledger row 260) measured that the block-vs-eager
+//! weight-gradient headline REVERSES at seed 43 and b8·s128, which a
+//! single-mechanism story cannot explain. This doc therefore does not
+//! claim to move esc-045's headline by any measured amount, and names no
+//! fix as "the" fix; a future round would need to re-derive which
+//! mechanism, if any, dominates at a given shape/seed before proposing
+//! one.
 //!
 //! The size of this SEPARATE gap, measured honestly (esc-045 phase-4
 //! re-audit, own live pod run, `last=512`/12-row production-amplitude
@@ -1381,16 +1386,29 @@ fn softmax_fwd_bf16(
     out
 }
 
-/// `dscores_row = (dy - dot(dy, y)) * y` — the standard softmax backward
-/// identity, needing only `y` and `dy`. Fixed fold order (family J):
-/// `dot` accumulates over the row in ascending index order.
+/// esc-045 round 5 (GH#374): matches [`dscores_row_bf16`]'s corrected
+/// epilogue order, not the algebraically-equivalent-but-numerically-
+/// different `(dy-dot)*y` a prior revision of this function computed.
+/// ATen's `softmax_backward_cuda_out` (`aten/src/ATen/native/cuda/
+/// SoftMax.cu`) is UNCONDITIONAL on dtype — `Tensor tmp = grad * output;`
+/// then `dS_i = tmp_i − y_i·sum` (multiply before subtract) — so the `F32`
+/// arm must round the SAME way the `BF16` arm already does, per
+/// [`dscores_row_bf16`]'s own doc for the full derivation. Fixed fold
+/// order (family J): `dot` accumulates over the row in ascending index
+/// order; `tmp_i` is recomputed in the second pass rather than stored from
+/// the first (one redundant `F32` multiply per element, not a second
+/// rounding boundary — `F32` has no intermediate rounding point to
+/// duplicate the way `BF16` does, but the EXPRESSION order still matters
+/// bit-for-bit).
 fn dscores_row_f32(y: &[f32], dy: &[f32], out: &mut [f32]) {
     let mut dot = 0f32;
     for i in 0..y.len() {
         dot += dy[i] * y[i];
     }
     for i in 0..y.len() {
-        out[i] = (dy[i] - dot) * y[i];
+        let yv = y[i];
+        let tmp = dy[i] * yv;
+        out[i] = tmp - yv * dot;
     }
 }
 

@@ -442,8 +442,8 @@
 //! points are exactly [`super::RopeFused`]'s and
 //! [`super::SoftmaxLastDimFused`]'s own documented ones, reused unchanged.
 //!
-//! ### esc-045: this op's own `BF16`-native softmax is the mechanism, not
-//! a rounding-placement bug (GH#374)
+//! ### esc-045: this op's own `BF16`-native softmax (GH#374) — SOURCE
+//! PARITY, not a headline-metric claim
 //!
 //! This op's CUDA "block arm" reuses `super::SoftmaxLastDimFused`'s
 //! `BF16`-native kernel directly: `BF16` logits in, `BF16` probabilities
@@ -455,15 +455,18 @@
 //! ENTIRE softmax (forward AND backward) in `F32` and rounds to `BF16`
 //! only once, at the very boundary — see `ops::softmax`'s module doc's
 //! "esc-045 round 4" section for the full ATen-dispatcher derivation. This
-//! op's `BF16`-native block arm is therefore a genuine, deliberate
-//! divergence from the reference call path — it is the esc-045 mechanism
-//! itself (`.jammi/escapes.jsonl`'s
-//! `esc-045-bf16-fused-backward-diverges-from-f32-truth`), not something
-//! `ops::softmax`'s rounding-placement fix (round 4) resolves by itself.
-//! The actual fix is either routing production attention through the
-//! FA2/SDPA dense arm (which keeps softmax in `F32` registers end to end)
-//! or adding a genuinely new `F32`-softmax variant of this block arm for
-//! the padded case — NOT attempted in this round.
+//! op's `BF16`-native block arm reusing that kernel is SOURCE PARITY with
+//! `ops::softmax` at the call line — a fact about which code runs, not a
+//! claim about which mechanism dominates esc-045's headline metric. An
+//! earlier revision of this doc asserted this reuse WAS "the esc-045
+//! mechanism itself" and named a specific fix as "the actual fix" — that
+//! assertion is retracted: round 7 (ledger row 260) measured that the
+//! block-vs-eager weight-gradient headline REVERSES at seed 43 and
+//! b8·s128, which a single-mechanism story cannot explain. This doc
+//! therefore does not claim to move esc-045's headline by any measured
+//! amount, and names no fix as "the" fix; a future round would need to
+//! re-derive which mechanism, if any, dominates at a given shape/seed
+//! before proposing one.
 
 use candle_core::backend::BackendStorage;
 use candle_core::{CpuStorage, CustomOp3, Error, Layout, Result, Shape, Tensor, D};

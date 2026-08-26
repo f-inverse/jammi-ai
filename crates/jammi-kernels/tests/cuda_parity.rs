@@ -1229,19 +1229,32 @@ fn assert_softmax_parity_f32(cuda: &Device, rows: usize, last: usize, sv: &[f32]
 /// leg below) — CPU and CUDA are bit-IDENTICAL here on this box, matching
 /// this file's other zero-tolerance legs (`cast_add_bit_identical_...`,
 /// `scaled_cast_add_bf16_f32_random_amplitude_bit_exact_...`). A
-/// revert-and-check drill (patching `../src/cuda/softmax.cu`'s
-/// `softmax_bwd_dscores_bf16` on this same pod, restored before commit —
-/// not part of this tree) confirms `0.0` DISCRIMINATES both historical
-/// regressions this leg exists to catch: round 4's wrong epilogue order
-/// (`(dy-dot)*y`) diverges from the corrected form on 1/6144 elements on
-/// the production-amplitude fixture below — small, but strictly greater
-/// than the measured zero baseline, so a `0.0` ceiling (not a `1.0%` one,
-/// which this 1/6144 = 0.016% case would pass right through) is what
-/// catches it; round 3's two-rounding formula diverges far more (15-23%
-/// across this file's existing fixtures) and is caught by an enormous
-/// margin regardless of ceiling. A nonzero ceiling here would have hidden
-/// the round-4 regression exactly the way this crate's phase-4 re-audit
-/// showed the OLD relative-with-floor bound did.
+/// [`round4_epilogue_diverges_from_round5_epilogue_on_production_amplitude_fixture`]
+/// below — a COMMITTED, CPU-only comparison of round 4's wrong epilogue
+/// order against round 5's corrected one, `dot` computed by the identical
+/// loop for both forms, not an uncommitted revert-and-check drill —
+/// confirms `0.0` DISCRIMINATES both historical regressions this leg
+/// exists to catch: round 4's wrong epilogue order (`(dy-dot)*y`) diverges
+/// from the corrected `tmp-y*dot` form on 474/6144 elements (7.71%) on
+/// that exact fixture (that test's own `eprintln!` prints this count), and
+/// on 364/6144 elements (5.92%) on the independent torch-`y_f32_true`
+/// fixture measured by
+/// `tests/softmax_bwd_dscores_matches_reference_call_path.rs`'s
+/// `round4_epilogue_fails_the_bit_match_floor_against_torch_dx_red_control`
+/// — both far above the measured zero baseline this file's other
+/// zero-tolerance legs (`cast_add_bit_identical_...`,
+/// `scaled_cast_add_bf16_f32_random_amplitude_bit_exact_...`) also read, so
+/// a `0.0` ceiling (not a `1.0%`-or-looser one, which either count would
+/// pass right through) is what catches it; round 3's two-rounding formula
+/// diverges far more (15-23% across this file's existing fixtures) and is
+/// caught by an enormous margin regardless of ceiling. A nonzero ceiling
+/// here would have hidden the round-4 regression exactly the way this
+/// crate's phase-4 re-audit showed the OLD relative-with-floor bound did.
+/// (An earlier revision of this doc claimed round 4 diverges on "1/6144"
+/// elements, sourced from an uncommitted revert-and-check drill's
+/// remembered count, not a printed test; that number was never this
+/// crate's own measurement and has been replaced with the committed test's
+/// printed counts above.)
 const SOFTMAX_CROSS_PLATFORM_CEILING: f64 = 0.0;
 
 fn assert_softmax_parity_bf16(cuda: &Device, rows: usize, last: usize, sv: &[f32]) {
@@ -1942,33 +1955,47 @@ fn softmax_scale_bf16_small_additive_mask_bit_exact_same_device_head_dim_128() {
 /// skewed-non-uniform-`dy` construction that file's module doc explains
 /// is REQUIRED to discriminate this class of rounding-placement bug (a
 /// uniform/smooth `dy` makes `dS` trivially proportional to a constant).
-/// Even at this strengthened fixture, round 4's form only diverges from
-/// round 5's on 1/6144 elements (0.016%) — algebraically equivalent
-/// formulas differ only at rounding-boundary crossings, which are rare —
-/// so [`SOFTMAX_CROSS_PLATFORM_CEILING`] is `0.0` (strict bit-exact, not
+/// At this strengthened fixture, round 4's form diverges from round 5's on
+/// 474/6144 elements (7.71%) — measured by, and printed live by, the
+/// COMMITTED
+/// [`round4_epilogue_diverges_from_round5_epilogue_on_production_amplitude_fixture`]
+/// test below (`dot` held identical between the two forms, so the only
+/// difference measured is the internal `F32` expression order), not the
+/// "1/6144 (0.016%)" figure an earlier revision of this doc quoted from an
+/// uncommitted revert-and-check drill. That earlier figure was wrong; this
+/// one is the printed output of a named test in this file. So
+/// [`SOFTMAX_CROSS_PLATFORM_CEILING`] is `0.0` (strict bit-exact, not
 /// merely tightened): the measured baseline is ALSO exactly zero on every
 /// shape tried, so zero tolerance is achievable on the correct kernel and
-/// still catches a 1-element regression a nonzero ceiling would swallow.
+/// still catches this regression (well over 0.016% — a loose `1.0%`
+/// ceiling would still catch this particular one, but not the smaller
+/// rounding-boundary divergences a different fixture could produce; `0.0`
+/// is the ceiling that catches ALL of them, not merely this fixture's).
 /// Runs the SAME live `SoftmaxLastDimFused` dispatch on CPU and CUDA and
 /// BIT-EXACT compares `dscores` (guide §3.7/§3.8 — see
 /// [`assert_bf16_bitmatch_with_ceiling`]'s doc for why a magnitude bound
 /// cannot discriminate this class of regression).
-#[test]
-fn softmax_bwd_random_dy_matches_cpu_within_tolerance_on_cuda_with_red_control() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
-    let cpu = Device::Cpu;
-    let last = 512usize; // production width, matches the CPU-only oracle's fixture
-    const AMPLITUDES: &[f32] = &[
-        0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 96.0, 150.0, 220.0, 300.0,
-    ];
-    let rows = AMPLITUDES.len();
+/// Production width (matches `tests/softmax_bwd_dscores_matches_reference_call_path.rs`'s
+/// own fixture) and the shared amplitude sweep for the `dy`-random softmax
+/// backward fixture used both by the CUDA parity test below AND by
+/// [`round4_epilogue_vs_round5_epilogue_divergence_on_production_amplitude_fixture`]
+/// — factored into one function so "that exact fixture" in either test's
+/// doc unambiguously means the SAME generated bytes, not two independently
+/// retyped copies of the same RNG call sequence that could silently drift
+/// apart.
+const SOFTMAX_BWD_RANDOM_DY_LAST: usize = 512;
+const SOFTMAX_BWD_RANDOM_DY_AMPLITUDES: &[f32] = &[
+    0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 96.0, 150.0, 220.0, 300.0,
+];
+
+fn softmax_bwd_random_dy_fixture() -> (usize, usize, Vec<bf16>, Vec<bf16>) {
+    let last = SOFTMAX_BWD_RANDOM_DY_LAST;
+    let rows = SOFTMAX_BWD_RANDOM_DY_AMPLITUDES.len();
     let mut rng = XorShift64::new(0x2545_F491_4F6C_DD1D);
 
     let mut scores_v: Vec<f32> = Vec::with_capacity(rows * last);
     let mut dy_v: Vec<f32> = Vec::with_capacity(rows * last);
-    for &amp in AMPLITUDES {
+    for &amp in SOFTMAX_BWD_RANDOM_DY_AMPLITUDES {
         for _ in 0..last {
             scores_v.push(amp * rng.next_signed_unit());
         }
@@ -1983,6 +2010,16 @@ fn softmax_bwd_random_dy_matches_cpu_within_tolerance_on_cuda_with_red_control()
     }
     let scores_b: Vec<bf16> = scores_v.iter().map(|&v| bf16::from_f32(v)).collect();
     let dy_b: Vec<bf16> = dy_v.iter().map(|&v| bf16::from_f32(v)).collect();
+    (rows, last, scores_b, dy_b)
+}
+
+#[test]
+fn softmax_bwd_random_dy_matches_cpu_within_tolerance_on_cuda_with_red_control() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let cpu = Device::Cpu;
+    let (rows, last, scores_b, dy_b) = softmax_bwd_random_dy_fixture();
     let mask_b: Vec<bf16> = vec![bf16::ZERO; rows * last]; // fully unmasked
 
     let s_cpu =
@@ -2039,6 +2076,317 @@ fn softmax_bwd_random_dy_matches_cpu_within_tolerance_on_cuda_with_red_control()
         &dscores_gpu,
         SOFTMAX_CROSS_PLATFORM_CEILING,
         "SoftmaxBwdDScores CUDA arm vs CPU at random production-amplitude dy",
+    );
+}
+
+/// Round 4's `(dy - dot) * y` epilogue vs round 5's corrected `tmp -
+/// y*dot` epilogue, `dot` computed by the IDENTICAL loop for both forms
+/// (copy-pasted, not merely "should be the same value") so the only
+/// difference measured is the internal `F32` expression order, never a
+/// difference in what gets summed. Runs on
+/// [`softmax_bwd_random_dy_fixture`] -- "that exact fixture" the doc on
+/// [`SOFTMAX_CROSS_PLATFORM_CEILING`] cites -- and needs no CUDA device
+/// (a pure-`F32`/`BF16` comparison of two hand-written epilogue
+/// formulas, not a kernel dispatch), so it runs on every CI box
+/// including one with no GPU. This is the measurement the
+/// `SOFTMAX_CROSS_PLATFORM_CEILING` doc's "round 4's wrong epilogue
+/// order diverges from the corrected form" claim is now grounded to, in
+/// place of an uncommitted revert-and-check drill's remembered count.
+#[test]
+fn round4_epilogue_diverges_from_round5_epilogue_on_production_amplitude_fixture() {
+    let cpu = Device::Cpu;
+    let (rows, last, scores_b, dy_b) = softmax_bwd_random_dy_fixture();
+    let mask_b: Vec<bf16> = vec![bf16::ZERO; rows * last];
+
+    let s_cpu =
+        Var::from_tensor(&Tensor::from_slice(&scores_b, (rows, last), &cpu).unwrap()).unwrap();
+    let m_cpu = Tensor::from_slice(&mask_b, (rows, last), &cpu).unwrap();
+    let y_cpu = softmax(&s_cpu, &m_cpu).unwrap();
+    let y_bf16: Vec<bf16> = y_cpu.flatten_all().unwrap().to_vec1().unwrap();
+
+    fn round4_row(y: &[bf16], dy: &[bf16]) -> Vec<bf16> {
+        let mut dot = 0f32;
+        for i in 0..y.len() {
+            dot += dy[i].to_f32() * y[i].to_f32();
+        }
+        (0..y.len())
+            .map(|i| bf16::from_f32((dy[i].to_f32() - dot) * y[i].to_f32()))
+            .collect()
+    }
+    fn round5_row(y: &[bf16], dy: &[bf16]) -> Vec<bf16> {
+        let mut dot = 0f32;
+        for i in 0..y.len() {
+            dot += dy[i].to_f32() * y[i].to_f32();
+        }
+        (0..y.len())
+            .map(|i| {
+                let yv = y[i].to_f32();
+                let tmp = dy[i].to_f32() * yv;
+                bf16::from_f32(tmp - yv * dot)
+            })
+            .collect()
+    }
+
+    let mut mismatches = 0usize;
+    let mut first: Option<(usize, bf16, bf16)> = None;
+    for r in 0..rows {
+        let yr = &y_bf16[r * last..(r + 1) * last];
+        let dyr = &dy_b[r * last..(r + 1) * last];
+        let round4 = round4_row(yr, dyr);
+        let round5 = round5_row(yr, dyr);
+        for i in 0..last {
+            if round4[i].to_bits() != round5[i].to_bits() {
+                mismatches += 1;
+                if first.is_none() {
+                    first = Some((r * last + i, round4[i], round5[i]));
+                }
+            }
+        }
+    }
+    let n = rows * last;
+    let pct = 100.0 * mismatches as f64 / n as f64;
+    eprintln!(
+        "round4_epilogue_diverges_from_round5_epilogue_on_production_amplitude_fixture: \
+         {mismatches}/{n} elements diverge ({pct:.4}%) between round 4's (dy-dot)*y and round \
+         5's tmp-y*dot epilogue, dot held identical between both forms; first={first:?}"
+    );
+    assert!(
+        mismatches > 0,
+        "round 4's and round 5's epilogues never diverge on this fixture -- \
+         SOFTMAX_CROSS_PLATFORM_CEILING's 0.0-vs-nonzero rationale would be discriminating \
+         nothing; strengthen the fixture before trusting that doc's claim"
+    );
+}
+
+// =======================================================================
+// esc-045 fix-verifier finding (9de5e89 audit round): the ONE-seed CUDA
+// leg above (`softmax_bwd_random_dy_matches_cpu_within_tolerance_on_cuda_with_red_control`)
+// catches the CUDA kernel reverted to round 4's epilogue only with its own
+// committed seed -- the fix-verifier tried 10 alternate seeds and found
+// only 2/10 discriminate (8/10 read 0/6144, a vacuous pass for those
+// seeds). A single seed is not a robust CUDA-arm oracle for a rounding-
+// BOUNDARY-crossing regression. This section replaces that single-instance
+// claim with an aggregate one, mirroring
+// `tests/softmax_bwd_dscores_matches_reference_call_path.rs`'s own
+// `round4_epilogue_diverges_from_round5_across_seed_and_shape_sweep_with_measured_ceiling`
+// (SAME seeds, SAME 4 shapes) for the CUDA arm specifically.
+// =======================================================================
+
+/// The SAME 12 seeds as
+/// `tests/softmax_bwd_dscores_matches_reference_call_path.rs`'s
+/// `DISCRIMINATING_SWEEP_SEEDS` (kept identical so both files' sweeps are
+/// directly comparable; duplicated rather than shared because `tests/*.rs`
+/// files are separate compilation units in this crate, matching this
+/// file's existing convention of each test file owning its own fixture
+/// code, family L).
+const CUDA_DISCRIMINATING_SWEEP_SEEDS: &[u64] = &[
+    0x9E37_79B9_7F4A_7C15,
+    0x1234_5678_9ABC_DEF1,
+    0xC0FF_EE12_3456_789B,
+    0xDEAD_BEEF_CAFE_F00E,
+    0x0F0F_0F0F_F0F0_F0F1,
+    0x1357_9BDF_2468_ACE1,
+    0xA5A5_A5A5_5A5A_5A5B,
+    0x1111_2222_3333_4445,
+    0x5555_6666_7777_8889,
+    0x9999_AAAA_BBBB_CCCD,
+    0xFEDC_BA98_7654_3211,
+    0x0123_4567_89AB_CDF0,
+];
+
+/// The SAME 4 `(rows, last)` shapes this file's OWN existing softmax
+/// parity tests already use individually (`softmax_parity_contiguous_small`'s
+/// `(4, 8)`, `softmax_parity_non_power_of_two_last_dim`'s `(3, 300)`,
+/// `softmax_parity_long_row_seq_512_class`'s `(2, 512)`, and the
+/// production-amplitude fixture's `(12, 512)`) -- `n=32/900/1024/6144`,
+/// matching `SOFTMAX_CROSS_PLATFORM_CEILING`'s own doc citation.
+const CUDA_DISCRIMINATING_SWEEP_SHAPES: &[(usize, usize)] =
+    &[(4, 8), (3, 300), (2, 512), (12, 512)];
+
+/// `rows` rows of width `last`, row `r`'s amplitude cycling through
+/// [`SOFTMAX_BWD_RANDOM_DY_AMPLITUDES`] (same convention as
+/// `tests/softmax_bwd_dscores_matches_reference_call_path.rs`'s
+/// `build_sweep_fixture` -- a single random amplitude shared by every row
+/// was tried first and measured to push softmax near-one-hot across an
+/// entire fixture when the draw landed high, inflating unrelated
+/// underflow noise; cycling through a FIXED spread avoids that).
+fn cuda_sweep_fixture(seed: u64, rows: usize, last: usize) -> (Vec<bf16>, Vec<bf16>) {
+    let mut rng = XorShift64::new(seed);
+    let n = rows * last;
+    let mut scores_v: Vec<f32> = Vec::with_capacity(n);
+    for r in 0..rows {
+        let amp = SOFTMAX_BWD_RANDOM_DY_AMPLITUDES[r % SOFTMAX_BWD_RANDOM_DY_AMPLITUDES.len()];
+        for _ in 0..last {
+            scores_v.push(amp * rng.next_signed_unit());
+        }
+    }
+    let mut dy_v: Vec<f32> = Vec::with_capacity(n);
+    for _ in 0..rows {
+        let dy_amp = 0.01 + 4.99 * rng.next_signed_unit().abs();
+        for _ in 0..last {
+            let u = rng.next_signed_unit();
+            dy_v.push(dy_amp * u * u.abs());
+        }
+    }
+    let scores_b: Vec<bf16> = scores_v.iter().map(|&v| bf16::from_f32(v)).collect();
+    let dy_b: Vec<bf16> = dy_v.iter().map(|&v| bf16::from_f32(v)).collect();
+    (scores_b, dy_b)
+}
+
+/// Bit-exact except signed zero (`+0.0`/`-0.0` compare equal -- the SAME
+/// real number under IEEE-754's own `==`). See the identically-named
+/// helper's doc in `tests/softmax_bwd_dscores_matches_reference_call_path.rs`
+/// for the direct measurement motivating this: comparing a live kernel
+/// dispatch against an independently-computed same-formula value across a
+/// compilation-unit boundary showed EVERY raw `to_bits()` mismatch was a
+/// `+0.0`/`-0.0` pair at this sweep's wide amplitude range, not a genuine
+/// value disagreement.
+fn cuda_bf16_differ(a: bf16, b: bf16) -> bool {
+    if a.to_f32() == 0.0 && b.to_f32() == 0.0 {
+        return false;
+    }
+    a.to_bits() != b.to_bits()
+}
+
+/// The CUDA-arm discriminating oracle, aggregated over
+/// [`CUDA_DISCRIMINATING_SWEEP_SEEDS`] x [`CUDA_DISCRIMINATING_SWEEP_SHAPES`]
+/// (48 combinations, 97,200 total elements).
+///
+/// CEILING: CPU-vs-CUDA `dscores` bit-exact agreement (STRICT `to_bits()`,
+/// matching [`SOFTMAX_CROSS_PLATFORM_CEILING`]'s own convention exactly),
+/// re-measured HERE across this whole sweep rather than assumed from the
+/// single-fixture legs elsewhere in this file -- prints the real count.
+///
+/// RED CONTROL: the REAL CUDA dispatch's `dscores` vs a `F32`,
+/// same-`dot`-accumulation-algorithm shadow computing round 4's WRONG
+/// epilogue (`(dy-dot)*y`) from the SAME `y`/`dy` -- [`cuda_bf16_differ`]'s
+/// signed-zero tolerance applied (this crosses BOTH a compilation-unit
+/// boundary AND a CPU/CUDA language boundary, where the same artifact
+/// class this file's CPU-arm sibling test measured is at least as
+/// plausible). This is a proxy for literally reverting
+/// `softmax_bwd_dscores_bf16` (`../src/cuda/softmax.cu`) to round 4's
+/// form and re-running THIS test, which a revert-and-check drill (see the
+/// numerics agent's own dispatch record for the printed counts from that
+/// drill, run on `jammi-a100`, restored before commit -- not part of this
+/// tree) confirms goes solidly RED at every seed in this sweep, not merely
+/// this proxy's measured gap.
+#[test]
+fn round4_shadow_diverges_from_cuda_arm_across_seed_and_shape_sweep_with_measured_ceiling() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let cpu = Device::Cpu;
+    let mut cpu_vs_cuda_mismatches = 0usize; // the CEILING
+    let mut cuda_vs_round4_shadow_mismatches = 0usize; // the RED control
+    let mut total_elements = 0usize;
+    let mut any_nonzero_signal = false;
+    // Per-seed breakdown (summed across all 4 shapes for that seed) --
+    // printed ONLY as a revert-drill diagnostic: proves the CUDA arm's
+    // discriminating power (against round 4's shadow) holds at EVERY
+    // individual seed, not merely in the grand total.
+    let mut per_seed_cpu_vs_cuda: Vec<(u64, usize)> = Vec::new();
+    let mut per_seed_cuda_vs_round4: Vec<(u64, usize)> = Vec::new();
+
+    for &seed in CUDA_DISCRIMINATING_SWEEP_SEEDS {
+        let mut seed_cpu_vs_cuda = 0usize;
+        let mut seed_cuda_vs_round4 = 0usize;
+        for &(rows, last) in CUDA_DISCRIMINATING_SWEEP_SHAPES {
+            let (scores_b, dy_b) = cuda_sweep_fixture(seed, rows, last);
+            let mask_b: Vec<bf16> = vec![bf16::ZERO; rows * last];
+
+            let s_cpu =
+                Var::from_tensor(&Tensor::from_slice(&scores_b, (rows, last), &cpu).unwrap())
+                    .unwrap();
+            let m_cpu = Tensor::from_slice(&mask_b, (rows, last), &cpu).unwrap();
+            let dy_cpu = Tensor::from_slice(&dy_b, (rows, last), &cpu).unwrap();
+            let out_cpu = softmax(&s_cpu, &m_cpu).unwrap();
+            let loss_cpu = (&out_cpu * &dy_cpu).unwrap().sum_all().unwrap();
+            let grads_cpu = loss_cpu.backward().unwrap();
+            let dscores_cpu: Vec<bf16> = grads_cpu
+                .get(&s_cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let y_cpu: Vec<bf16> = out_cpu.flatten_all().unwrap().to_vec1().unwrap();
+
+            let s_gpu =
+                Var::from_tensor(&Tensor::from_slice(&scores_b, (rows, last), &cuda).unwrap())
+                    .unwrap();
+            let m_gpu = Tensor::from_slice(&mask_b, (rows, last), &cuda).unwrap();
+            let dy_gpu = Tensor::from_slice(&dy_b, (rows, last), &cuda).unwrap();
+            let out_gpu = softmax(&s_gpu, &m_gpu).unwrap();
+            let loss_gpu = (&out_gpu * &dy_gpu).unwrap().sum_all().unwrap();
+            let grads_gpu = loss_gpu.backward().unwrap();
+            let dscores_gpu: Vec<bf16> = grads_gpu
+                .get(&s_gpu)
+                .unwrap()
+                .to_device(&cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+
+            for r in 0..rows {
+                let yr = &y_cpu[r * last..(r + 1) * last];
+                let dyr = &dy_b[r * last..(r + 1) * last];
+                let mut dot = 0f32;
+                for i in 0..last {
+                    dot += dyr[i].to_f32() * yr[i].to_f32();
+                }
+                let round4_shadow: Vec<bf16> = (0..last)
+                    .map(|i| bf16::from_f32((dyr[i].to_f32() - dot) * yr[i].to_f32()))
+                    .collect();
+
+                for i in 0..last {
+                    let idx = r * last + i;
+                    if dscores_gpu[idx].to_f32() != 0.0 {
+                        any_nonzero_signal = true;
+                    }
+                    if dscores_cpu[idx].to_bits() != dscores_gpu[idx].to_bits() {
+                        cpu_vs_cuda_mismatches += 1;
+                        seed_cpu_vs_cuda += 1;
+                    }
+                    if cuda_bf16_differ(dscores_gpu[idx], round4_shadow[i]) {
+                        cuda_vs_round4_shadow_mismatches += 1;
+                        seed_cuda_vs_round4 += 1;
+                    }
+                }
+            }
+            total_elements += rows * last;
+        }
+        per_seed_cpu_vs_cuda.push((seed, seed_cpu_vs_cuda));
+        per_seed_cuda_vs_round4.push((seed, seed_cuda_vs_round4));
+    }
+
+    eprintln!(
+        "round4_shadow_diverges_from_cuda_arm_across_seed_and_shape_sweep_with_measured_ceiling: \
+         {} seeds x {} shapes = {total_elements} total elements; \
+         [asserted] CPU-vs-CUDA (measured ceiling)={cpu_vs_cuda_mismatches}, \
+         CUDA-vs-round4-shadow (RED control, signed-zero-tolerant)={cuda_vs_round4_shadow_mismatches}",
+        CUDA_DISCRIMINATING_SWEEP_SEEDS.len(),
+        CUDA_DISCRIMINATING_SWEEP_SHAPES.len()
+    );
+    eprintln!("  per-seed CPU-vs-CUDA (~0 on the fix, revert-drill diagnostic if the CUDA kernel is reverted): {per_seed_cpu_vs_cuda:?}");
+    eprintln!("  per-seed CUDA-vs-round4-shadow (proves the RED control's grand total is not carried by one dominant seed): {per_seed_cuda_vs_round4:?}");
+    assert!(
+        any_nonzero_signal,
+        "every CUDA dscores element read exactly zero across the whole sweep -- vacuous fixture"
+    );
+    assert_eq!(
+        cpu_vs_cuda_mismatches, 0,
+        "CPU-vs-CUDA dscores disagree on {cpu_vs_cuda_mismatches}/{total_elements} elements \
+         across this seed x shape sweep -- SOFTMAX_CROSS_PLATFORM_CEILING's 0.0 no longer holds \
+         at this sweep's shapes/seeds"
+    );
+    assert!(
+        (cuda_vs_round4_shadow_mismatches as f64) >= 10.0 * (cpu_vs_cuda_mismatches as f64).max(1.0),
+        "the CUDA arm's real dscores does not diverge from round 4's shadow by >= 10x the \
+         measured CPU-vs-CUDA ceiling across this seed x shape sweep (ceiling={cpu_vs_cuda_mismatches}, \
+         round4_shadow_mismatches={cuda_vs_round4_shadow_mismatches}) -- the sweep is not \
+         robustly discriminating round 4 from the CUDA arm's actual (round 5) output"
     );
 }
 
@@ -2137,15 +2485,21 @@ const GEGLU_FWD_CROSS_PLATFORM_CEILING: f64 = 0.025;
 /// Ceiling fraction for [`assert_bf16_bitmatch_with_ceiling`]'s use in
 /// geglu's BACKWARD (`dwi_out`) CUDA parity legs — measured live on THIS
 /// pod build: ordinary cross-platform `erff` libm ULP drift disagrees on
-/// 0%/0.67%/0.38% of elements at `n=64/1800/20992` (never above ~0.7%,
-/// see `geglu_bwd_random_dy_matches_cpu_within_tolerance_on_cuda_with_red_control`'s
-/// doc for the `n=20992` production-amplitude figure specifically). The
-/// SAME revert-and-check drill this file's own commit history documents
-/// (`../src/cuda/geglu.cu`'s `geglu_bwd_dwi_out_bf16` patched to the
-/// pre-round-2 single-rounding formula, on this same pod, restored before
-/// commit) disagreed on 5.96% of elements at `n=20992` — a >8x separation
-/// from the measured baseline there. `1.5%` sits with real margin above
-/// the measured baseline (>2x the highest observed 0.67%) and with real
+/// 0%/0.67%/0.38% of elements at `n=64/1800/20992` (see
+/// `geglu_bwd_random_dy_matches_cpu_within_tolerance_on_cuda_with_red_control`'s
+/// doc for the `n=20992` production-amplitude figure specifically), AND on
+/// 98/10496 (0.934%) at `geglu_parity_production_width_modernbert_large`'s
+/// own `dwi_out` leg (`assert_geglu_parity_bf16`'s `"geglu bf16 dwi_out"`
+/// context, printed by [`assert_bf16_bitmatch_with_ceiling`] itself) — an
+/// earlier revision of this doc omitted that leg and claimed "never above
+/// ~0.7%"; the TRUE highest observed across every leg this ceiling gates
+/// is 0.934%, not 0.67%. The SAME revert-and-check drill this file's own
+/// commit history documents (`../src/cuda/geglu.cu`'s `geglu_bwd_dwi_out_bf16`
+/// patched to the pre-round-2 single-rounding formula, on this same pod,
+/// restored before commit) disagreed on 5.96% of elements at `n=20992` —
+/// still a real separation from every measured baseline leg. `1.5%` sits
+/// with a real 1.6x margin above the TRUE highest observed baseline
+/// (0.934%, not the previously-claimed >2x-over-0.67%) and with real
 /// margin below the measured regression (>3.9x below the observed 5.96%).
 const GEGLU_BWD_CROSS_PLATFORM_CEILING: f64 = 0.015;
 
@@ -2689,9 +3043,11 @@ fn assert_scaled_cast_add_parity_bf16_base(
         "bf16-base GPU forward output length mismatch (got {}, expected {n})",
         out_gpu.len()
     );
-    // Same accumulation semantics on both devices (round-to-bf16-then-add,
-    // per this op's module doc) — fmad-class ~1-ULP-at-bf16 differences
-    // are the only expected source of divergence between CPU and CUDA.
+    // Same accumulation semantics on both devices (rounds ONCE, out =
+    // bf16(f32(base) + lora*scaling) — the PEFT-ordered epilogue esc-046
+    // fixed, per this op's module doc) — fmad-class ~1-ULP-at-bf16
+    // differences are the only expected source of divergence between CPU
+    // and CUDA.
     for (i, (c, g)) in out_cpu.iter().zip(out_gpu.iter()).enumerate() {
         let ulp = 2.0f32.powi(-7) * c.abs().max(*g).max(1.0);
         assert!(

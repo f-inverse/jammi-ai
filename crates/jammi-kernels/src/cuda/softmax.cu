@@ -292,10 +292,25 @@ extern "C" __global__ void softmax_fwd_bf16(
 }
 
 // ---------------------------------------------------------------------
-// Backward: dscores = (dy - dot(dy, y)) * y — output-only, no mask/scores
+// Backward: dscores = tmp - y*dot(dy, y), tmp = dy*y (ATen's own
+// multiply-before-subtract epilogue order, see softmax_bwd_dscores_bf16's
+// own comment below for the derivation) — output-only, no mask/scores
 // input, no broadcast index. One block per row, one reduction pass.
 // ---------------------------------------------------------------------
 
+// esc-045 round 5 (GH#374): the F32 arm must round the SAME way the BF16
+// arm below does -- ATen's softmax_backward_cuda_out
+// (aten/src/ATen/native/cuda/SoftMax.cu) is UNCONDITIONAL on dtype:
+// `Tensor tmp = grad * output;` computed FIRST, summed, then
+// (SoftMaxBackwardEpilogue::operator()) `dS_i = tmp_i - y_i*sum` --
+// multiply before subtract, not `(dy_i - sum) * y_i` (subtract before
+// multiply, round 4's wrong form a prior revision of this kernel used). A
+// prior revision fixed only the BF16 arm below and left this F32 arm on
+// round 4's wrong order -- inconsistent with the same file's own BF16 arm
+// computing the ATen-correct form, and with ops/softmax.rs's
+// `dscores_row_f32` (CPU) already fixed to match. `tmp` is recomputed in
+// the epilogue pass below rather than stored from the reduction pass (no
+// extra shared memory for a `last`-wide array).
 extern "C" __global__ void softmax_bwd_dscores_f32(
     const float* y, const float* dy, float* dscores, const unsigned int last
 ) {
@@ -312,7 +327,9 @@ extern "C" __global__ void softmax_bwd_dscores_f32(
     dot = block_reduce_sum(dot, scratch);
 
     for (unsigned int i = threadIdx.x; i < last; i += blockDim.x) {
-        dsr[i] = (dyr[i] - dot) * yr[i];
+        float yv = yr[i];
+        float tmp = dyr[i] * yv;
+        dsr[i] = tmp - yv * dot;
     }
 }
 

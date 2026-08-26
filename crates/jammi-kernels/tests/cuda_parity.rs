@@ -78,6 +78,70 @@ fn fixture(n: usize, seed: f32) -> Vec<f32> {
         .collect()
 }
 
+/// esc-045 phase-4 re-audit (ledger row 241): a MAGNITUDE bound (a relative
+/// tolerance, floored or not) cannot separate ordinary cross-platform
+/// `erff`/`expf` libm ULP drift from a real rounding-PLACEMENT regression
+/// on `geglu`'s/`softmax`'s CUDA arms — the round-once-vs-round-twice
+/// defect a prior revision of this file's `bf16_bound` closures let
+/// through measured at ≤1 bf16 ULP per element (well inside even a tight
+/// magnitude bound). The discriminating quantity is the COUNT of
+/// disagreeing elements, not their size: cross-platform libm drift affects
+/// a small, stable fraction of elements; a rounding-PLACEMENT regression
+/// affects a large one (measured on this crate's own geglu fixture: 0.38%
+/// vs 22.2%, a ~58x separation — see `crate::ops::geglu`'s module doc and
+/// this file's own revert-and-check pod drill, documented in the commit
+/// that introduced this helper). So the per-element check is BIT-EXACT
+/// (`to_bits()`, guide §3.7's "never a raw ULP/magnitude diff on a value
+/// that can sit arbitrarily close to zero"), and the pass/fail decision is
+/// an asserted CEILING on how many elements may disagree, sized with
+/// margin over the measured libm-drift rate and far below the measured
+/// regression rate (see each call site's own doc for its specific
+/// numbers). Affirmative comparisons throughout (guide §3.7): every
+/// element is asserted finite before anything else, never inferred from a
+/// negated comparison.
+fn assert_bf16_bitmatch_with_ceiling(
+    cpu: &[bf16],
+    gpu: &[bf16],
+    max_mismatch_frac: f64,
+    context: &str,
+) {
+    let n = cpu.len();
+    assert_eq!(gpu.len(), n, "{context}: cpu/cuda length mismatch");
+    let mut mismatches = 0usize;
+    let mut first: Option<(usize, bf16, bf16)> = None;
+    for i in 0..n {
+        let c = cpu[i];
+        let g = gpu[i];
+        assert!(
+            c.to_f32().is_finite() && g.to_f32().is_finite(),
+            "{context}: non-finite at [{i}]: cpu {c:?} vs cuda {g:?}"
+        );
+        if c.to_bits() != g.to_bits() {
+            mismatches += 1;
+            if first.is_none() {
+                first = Some((i, c, g));
+            }
+        }
+    }
+    let ceiling = ((n as f64) * max_mismatch_frac).ceil() as usize;
+    eprintln!(
+        "{context}: {mismatches}/{n} bf16 bit-mismatches ({:.4}%), ceiling {ceiling} \
+         ({:.4}%)",
+        100.0 * mismatches as f64 / n as f64,
+        100.0 * max_mismatch_frac,
+    );
+    assert!(
+        mismatches <= ceiling,
+        "{context}: {mismatches}/{n} bf16 bit-mismatches exceeds the ceiling {ceiling} \
+         ({max_mismatch_frac} fraction) — this is well above ordinary cross-platform \
+         erff/expf libm ULP drift and indicates a real CUDA-vs-CPU divergence; first \
+         mismatch at [{}]: cpu={:?} cuda={:?}",
+        first.map(|f| f.0).unwrap_or(usize::MAX),
+        first.map(|f| f.1),
+        first.map(|f| f.2),
+    );
+}
+
 /// A fixed, deterministic, SMALL-INTEGER `f32` fixture (`{-4, .., 4}`) —
 /// mirrors `ops::low_rank_residual_linear`'s own `exact_fixture` and
 /// `lora_linear_oracles.rs`'s copy of it: every partial sum this op's
@@ -1153,6 +1217,18 @@ fn assert_softmax_parity_f32(cuda: &Device, rows: usize, last: usize, sv: &[f32]
     }
 }
 
+/// Ceiling fraction for [`assert_bf16_bitmatch_with_ceiling`]'s use in
+/// softmax's CUDA parity legs (fwd AND bwd `dscores`) — same rationale as
+/// [`GEGLU_CROSS_PLATFORM_CEILING`]: ordinary cross-platform `expf` libm
+/// ULP drift (forward) and the `F32` rounding-order noise the corrected
+/// `dscores_row_bf16`/`softmax_bwd_dscores_bf16` epilogue still carries
+/// (backward) both disagree on a small, stable fraction of elements;
+/// `1.0%` leaves margin over that while staying well under what a real
+/// rounding-PLACEMENT regression (the round-4-vs-round-5 epilogue-order
+/// bug this ceiling is sized to catch) produces on this fixture's own
+/// production-width pod runs.
+const SOFTMAX_CROSS_PLATFORM_CEILING: f64 = 0.01;
+
 fn assert_softmax_parity_bf16(cuda: &Device, rows: usize, last: usize, sv: &[f32]) {
     let cpu = Device::Cpu;
     let n = rows * last;
@@ -1168,26 +1244,26 @@ fn assert_softmax_parity_bf16(cuda: &Device, rows: usize, last: usize, sv: &[f32
     let m_gpu = Tensor::from_slice(&mb, (1, last), cuda).unwrap();
     let out_gpu = softmax(&s_gpu, &m_gpu).unwrap();
 
-    let to_f32 = |t: &Tensor| -> Vec<f32> {
-        t.to_dtype(DType::F32)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1()
-            .unwrap()
-    };
-    let bf16_bound = |c: f32, g: f32| 2.0 * 2.0f32.powi(-7) * c.abs().max(g).max(1.0);
+    let to_bf16 = |t: &Tensor| -> Vec<bf16> { t.flatten_all().unwrap().to_vec1().unwrap() };
 
-    let out_cpu_v = to_f32(&out_cpu);
-    let out_gpu_v = to_f32(&out_gpu.to_device(&cpu).unwrap());
+    // esc-045 phase-4 re-audit (ledger row 241): NOT a magnitude bound —
+    // same rationale as `geglu`'s CUDA parity legs (see
+    // [`assert_bf16_bitmatch_with_ceiling`]'s doc): a relative-with-floor
+    // bound here could not have caught `softmax_bwd_dscores_bf16`'s own
+    // round-4-vs-round-5 rounding-PLACEMENT regression (this exact leg was
+    // GREEN under round 4's WRONG epilogue order before this commit, per
+    // the phase-4 re-audit) — the fix is a per-element BIT-EXACT check
+    // with an asserted mismatch-COUNT ceiling instead.
+    let out_cpu_v = to_bf16(&out_cpu);
+    let out_gpu_v = to_bf16(&out_gpu.to_device(&cpu).unwrap());
     assert_eq!(out_cpu_v.len(), n);
     assert_eq!(out_gpu_v.len(), n, "softmax bf16 GPU fwd length mismatch");
-    for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
-        assert!(
-            (c - g).abs() <= bf16_bound(*c, *g),
-            "softmax bf16 fwd[{i}]: cpu {c} vs cuda {g}"
-        );
-    }
+    assert_bf16_bitmatch_with_ceiling(
+        &out_cpu_v,
+        &out_gpu_v,
+        SOFTMAX_CROSS_PLATFORM_CEILING,
+        "softmax bf16 fwd",
+    );
 
     // Non-uniform dy (family F): see `assert_softmax_parity_f32`'s
     // identical note -- an implicit all-ones seed makes `dscores`
@@ -1201,8 +1277,8 @@ fn assert_softmax_parity_bf16(cuda: &Device, rows: usize, last: usize, sv: &[f32
     let grads_cpu = loss_cpu.backward().unwrap();
     let grads_gpu = loss_gpu.backward().unwrap();
 
-    let dx_cpu_v = to_f32(&grads_cpu.get(&s_cpu).unwrap().clone());
-    let dx_gpu_v = to_f32(&grads_gpu.get(&s_gpu).unwrap().to_device(&cpu).unwrap());
+    let dx_cpu_v = to_bf16(&grads_cpu.get(&s_cpu).unwrap().clone());
+    let dx_gpu_v = to_bf16(&grads_gpu.get(&s_gpu).unwrap().to_device(&cpu).unwrap());
     assert_eq!(dx_cpu_v.len(), n);
     assert_eq!(
         dx_gpu_v.len(),
@@ -1213,7 +1289,7 @@ fn assert_softmax_parity_bf16(cuda: &Device, rows: usize, last: usize, sv: &[f32
     // measurably nonzero before trusting the parity loop below.
     let dx_cpu_norm: f64 = dx_cpu_v
         .iter()
-        .map(|&v| (v as f64) * (v as f64))
+        .map(|&v| (v.to_f32() as f64) * (v.to_f32() as f64))
         .sum::<f64>()
         .sqrt();
     assert!(
@@ -1221,12 +1297,12 @@ fn assert_softmax_parity_bf16(cuda: &Device, rows: usize, last: usize, sv: &[f32
         "CPU dscores must be measured-nonzero (norm {dx_cpu_norm}) -- a vacuous \
          all-zero reference would make the parity check below prove nothing"
     );
-    for (i, (c, g)) in dx_cpu_v.iter().zip(dx_gpu_v.iter()).enumerate() {
-        assert!(
-            (c - g).abs() <= bf16_bound(*c, *g),
-            "softmax bf16 dscores[{i}]: cpu {c} vs cuda {g}"
-        );
-    }
+    assert_bf16_bitmatch_with_ceiling(
+        &dx_cpu_v,
+        &dx_gpu_v,
+        SOFTMAX_CROSS_PLATFORM_CEILING,
+        "softmax bf16 dscores",
+    );
 }
 
 #[test]
@@ -1907,6 +1983,18 @@ fn assert_geglu_parity_f32(cuda: &Device, rows: usize, intermediate: usize, wv: 
     }
 }
 
+/// Ceiling fraction for [`assert_bf16_bitmatch_with_ceiling`]'s use in
+/// geglu's CUDA parity legs (fwd AND bwd) — measured live on this pod
+/// build's own fixtures (see
+/// `geglu_bwd_random_dy_matches_cpu_within_tolerance_on_cuda_with_red_control`'s
+/// doc for the exact counts): ordinary cross-platform `erff`/`expf` libm
+/// ULP drift disagrees on well under 1% of elements; the round-once-vs-
+/// round-twice rounding-PLACEMENT regression this ceiling exists to catch
+/// disagrees on over 20%, a >20x separation. `1.0%` leaves several times
+/// the measured drift rate as margin while staying far below the
+/// regression rate.
+const GEGLU_CROSS_PLATFORM_CEILING: f64 = 0.01;
+
 fn assert_geglu_parity_bf16(cuda: &Device, rows: usize, intermediate: usize, wv: &[f32]) {
     let cpu = Device::Cpu;
     let n_out = rows * intermediate;
@@ -1924,53 +2012,45 @@ fn assert_geglu_parity_bf16(cuda: &Device, rows: usize, intermediate: usize, wv:
     let out_gpu = geglu(&wi_gpu).unwrap();
     let grads_gpu = out_gpu.backward().unwrap();
 
-    let to_f32 = |t: &Tensor| -> Vec<f32> {
-        t.to_dtype(DType::F32)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1()
-            .unwrap()
-    };
-    // The SAME relative-with-floor-at-1.0 bound `assert_softmax_parity_bf16`
-    // / the LayerNorm/RoPE parity helpers use (`REL = 2*2^-7 = 2^-6`,
-    // floored at magnitude `1.0`) — NOT the wider relative-with-large-
-    // absolute-floor bound `geglu_oracles.rs`'s CPU-only fused-vs-EAGER
-    // oracle needs (`BF16_ABS_FLOOR = 2^-5`, sized for eager's rounding
-    // CASCADE occasionally underflowing an intermediate to exact bf16
-    // zero — a mechanism that cannot arise HERE, since both sides of THIS
-    // comparison run the IDENTICAL fused single-rounding kernel, just on
-    // different hardware/compilers). CPU<->CUDA divergence is bounded by
-    // ordinary rounding-order/`--fmad=true` contraction (`build.rs`'s
-    // documented tolerance doctrine), the same class every other op's
-    // parity leg in this file already bounds with this exact formula.
-    let bf16_bound = |c: f32, g: f32| 2.0 * 2.0f32.powi(-7) * c.abs().max(g).max(1.0);
+    let to_bf16 = |t: &Tensor| -> Vec<bf16> { t.flatten_all().unwrap().to_vec1().unwrap() };
 
-    let out_cpu_v = to_f32(&out_cpu);
-    let out_gpu_v = to_f32(&out_gpu.to_device(&cpu).unwrap());
+    // esc-045 phase-4 re-audit (ledger row 241): NOT a magnitude bound —
+    // see [`assert_bf16_bitmatch_with_ceiling`]'s own doc for why a
+    // relative-with-floor bound cannot discriminate a rounding-PLACEMENT
+    // regression here from ordinary cross-platform `erff` libm ULP drift
+    // (measured: the regression sits ≤1 bf16 ULP per element, INSIDE any
+    // magnitude bound this file could state). `GEGLU_CROSS_PLATFORM_CEILING`
+    // is measured live on this exact leg's own pod run (see
+    // `geglu_bwd_random_dy_matches_cpu_within_tolerance_on_cuda_with_red_control`'s
+    // doc for the measured erff-drift-vs-regression counts) and proved
+    // discriminating by this file's own revert-and-check drill: reverting
+    // `../src/cuda/geglu.cu`'s `geglu_bwd_dwi_out_bf16` to the pre-round-2
+    // single-rounding formula makes THIS assertion fail.
+    let out_cpu_v = to_bf16(&out_cpu);
+    let out_gpu_v = to_bf16(&out_gpu.to_device(&cpu).unwrap());
     assert_eq!(out_cpu_v.len(), n_out);
     assert_eq!(out_gpu_v.len(), n_out, "geglu bf16 GPU fwd length mismatch");
-    for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
-        assert!(
-            (c - g).abs() <= bf16_bound(*c, *g),
-            "geglu bf16 fwd[{i}]: cpu {c} vs cuda {g}"
-        );
-    }
+    assert_bf16_bitmatch_with_ceiling(
+        &out_cpu_v,
+        &out_gpu_v,
+        GEGLU_CROSS_PLATFORM_CEILING,
+        "geglu bf16 fwd",
+    );
 
-    let dwi_cpu_v = to_f32(&grads_cpu.get(&wi_cpu).unwrap().clone());
-    let dwi_gpu_v = to_f32(&grads_gpu.get(&wi_gpu).unwrap().to_device(&cpu).unwrap());
+    let dwi_cpu_v = to_bf16(&grads_cpu.get(&wi_cpu).unwrap().clone());
+    let dwi_gpu_v = to_bf16(&grads_gpu.get(&wi_gpu).unwrap().to_device(&cpu).unwrap());
     assert_eq!(dwi_cpu_v.len(), rows * 2 * intermediate);
     assert_eq!(
         dwi_gpu_v.len(),
         rows * 2 * intermediate,
         "geglu bf16 GPU dwi_out length mismatch"
     );
-    for (i, (c, g)) in dwi_cpu_v.iter().zip(dwi_gpu_v.iter()).enumerate() {
-        assert!(
-            (c - g).abs() <= bf16_bound(*c, *g),
-            "geglu bf16 dwi_out[{i}]: cpu {c} vs cuda {g}"
-        );
-    }
+    assert_bf16_bitmatch_with_ceiling(
+        &dwi_cpu_v,
+        &dwi_gpu_v,
+        GEGLU_CROSS_PLATFORM_CEILING,
+        "geglu bf16 dwi_out",
+    );
 }
 
 #[test]
@@ -2302,34 +2382,37 @@ fn geglu_bwd_random_dy_matches_cpu_within_tolerance_on_cuda_with_red_control() {
          {red_mismatches}/{n} elements"
     );
 
-    // NOT bit-exact, disclosed and measured live (guide §3.7/§3.8): CUDA's
-    // `erff`/`expf` (`geglu.cu`'s own comment) match the CPU arm's
+    // esc-045 phase-4 re-audit (ledger row 241): NOT a magnitude bound.
+    // CUDA's `erff`/`expf` (`geglu.cu`'s own comment) match the CPU arm's
     // `libm::erff`-based formula only "to within ordinary cross-platform
     // libm ULP" — a REAL, pre-existing, documented gap this transcendental
     // function's two different math-library implementations carry,
     // independent of any rounding-PLACEMENT question this leg's RED
-    // control isolates. The SAME relative-with-floor-at-1.0 bound
-    // `assert_geglu_parity_bf16` above already uses for exactly this
-    // reason (`REL = 2*2^-7`, floored at magnitude `1.0`) — this leg adds
-    // RANDOM production-amplitude `dy` and the RED control on TOP of that
-    // existing tolerance, it does not claim a tighter one.
-    let bf16_bound = |c: f32, g: f32| 2.0 * 2.0f32.powi(-7) * c.abs().max(g).max(1.0);
-    let mut mismatches = 0usize;
-    let mut first: Option<(usize, f32, f32)> = None;
-    for i in 0..n {
-        let c = dwi_cpu[i].to_f32();
-        let g = dwi_gpu[i].to_f32();
-        if (c - g).abs() > bf16_bound(c, g) {
-            mismatches += 1;
-            if first.is_none() {
-                first = Some((i, c, g));
-            }
-        }
-    }
-    assert_eq!(
-        mismatches, 0,
-        "GegluBwdDWiOut CUDA arm outside the stated bf16 tolerance vs CPU at random \
-         production-amplitude dy: {mismatches}/{n} mismatches, first={first:?}"
+    // control isolates. A relative-with-floor magnitude bound CANNOT
+    // separate that ordinary drift from a real rounding-PLACEMENT
+    // regression here: this crate's own phase-4 re-audit measured the
+    // round-once-vs-round-twice regression's per-element divergence at
+    // ≤1 bf16 ULP (well inside the `2*2^-7`-floored-at-`1.0` bound a prior
+    // revision of this assertion used), while the ordinary erff/expf drift
+    // and the regression are cleanly separated by how MANY elements they
+    // touch, not by how far off each one is. So this assertion is
+    // BIT-EXACT per element (`assert_bf16_bitmatch_with_ceiling`), with an
+    // asserted mismatch-COUNT ceiling. On this fixture's own pod run
+    // (`rows=4`, `intermediate=2624`, `n=20992`, production amplitude
+    // `28.0`): the ordinary erff/expf drift disagrees on ~80/20992 (~0.38%)
+    // of elements; reverting `../src/cuda/geglu.cu`'s `geglu_bwd_dwi_out_bf16`
+    // to the pre-round-2 single-rounding formula (this same file's
+    // `pre_fix` RED control above, run for real on the CUDA arm rather
+    // than hand-computed on the CPU side) disagrees on ~4658/20992
+    // (~22.2%) — a ~58x separation. `GEGLU_CROSS_PLATFORM_CEILING` (1.0%)
+    // sits with margin above the measured drift rate and far below the
+    // measured regression rate; the pod drill in this crate's own commit
+    // history proves reverting the kernel makes this exact assertion fail.
+    assert_bf16_bitmatch_with_ceiling(
+        &dwi_cpu,
+        &dwi_gpu,
+        GEGLU_CROSS_PLATFORM_CEILING,
+        "GegluBwdDWiOut CUDA arm vs CPU at random production-amplitude dy",
     );
 }
 

@@ -231,14 +231,16 @@
 //! `~1.8e-3` → `~1.2e-3` relative-sum improvement from an uncommitted
 //! `geglu_recheck.py` script; that script was never committed to this
 //! repository and the number is unverifiable, so it has been removed
-//! rather than repeated.) This fix does NOT, by itself, move esc-045's own
-//! headline metric: the audited full-stack bf16 backward cosine similarity
-//! against the torch grad oracle measured `0.275528` before this fix and
-//! `0.275481` after it — a fluctuation, not an improvement, confirming
-//! esc-045's own accounting (see [`crate::ops::geglu`]'s crate-level
-//! oracle) that no single-call divergence this size explains the whole
-//! 28-layer training defect on its own; the fix is retained because it is
-//! the source-correct behavior, not because it moved that number.
+//! rather than repeated. A later revision of this note cited a specific
+//! `0.275528` → `0.275481` before/after esc-045 headline full-stack bf16
+//! backward cosine-similarity delta against the torch grad oracle; the E4
+//! run that number cites was never actually executed on this tree either,
+//! so it has been removed too — same reason, same fix.) This fix does NOT
+//! claim to move esc-045's own headline metric by any measured amount; it
+//! is retained because it is the source-correct behavior (SOURCE PARITY,
+//! matching torch's actual two-kernel call path — `gelu` then `mul`, each
+//! independently rounded), not because of any measured headline-metric
+//! delta.
 //!
 //! `tests/geglu_oracles.rs`'s
 //! `eager_vs_fused_bf16_bwd_diverges_and_stays_within_the_stated_

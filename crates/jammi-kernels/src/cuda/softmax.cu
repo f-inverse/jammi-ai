@@ -335,11 +335,27 @@ extern "C" __global__ void softmax_bwd_dscores_f32(
 // round_bf16(dy*y)` and rounded a second time in the epilogue, matching
 // `softmax_backward_cuda_out`'s BF16-native (`half_to_float=false` with a
 // raw BF16 caller) case -- a code path `modeling_modernbert.py:180`'s
-// `dtype=torch.float32` call never reaches. See `../ops/softmax.rs`'s
-// module doc ("esc-045 round 4") and `dscores_row_bf16` doc for the full
-// derivation and
+// `dtype=torch.float32` call never reaches.
+//
+// esc-045 round 5 (GH#374): round 4's rounding-BOUNDARY finding above is
+// unchanged, but its `(dy - dot) * y` epilogue does not match what
+// `softmax_backward_cuda_out` actually computes -- that function's own
+// body (SAME file upstream, unconditional on `half_to_float`):
+//   Tensor tmp = grad * output;
+//   host_softmax_backward<SoftMaxBackwardEpilogue, false>(tmp, output, dim, half_to_float, grad_input);
+// computes `tmp_i = dy_i * y_i` FIRST, sums it, then
+// (`SoftMaxBackwardEpilogue::operator()`) `dS_i = tmp_i - y_i*sum` --
+// multiply BEFORE subtract, not `(dy_i - sum) * y_i` (subtract before
+// multiply, round 4's form). Algebraically identical, numerically
+// different (F32 multiplication does not distribute over subtraction
+// exactly) -- measured live against a torch-produced fixture, see
+// `../ops/softmax.rs`'s module doc ("esc-045 round 5") and
+// `dscores_row_bf16` doc for the derivation and
 // `tests/softmax_bwd_dscores_matches_reference_call_path.rs` for the
-// op-level oracle.
+// op-level oracle. `tmp` is recomputed in the epilogue pass below rather
+// than stored from the reduction pass (no extra shared memory for a
+// `last`-wide array) -- one redundant multiply per element, not a second
+// rounding boundary.
 extern "C" __global__ void softmax_bwd_dscores_bf16(
     const __nv_bfloat16* y, const __nv_bfloat16* dy, __nv_bfloat16* dscores,
     const unsigned int last
@@ -359,6 +375,7 @@ extern "C" __global__ void softmax_bwd_dscores_bf16(
     for (unsigned int i = threadIdx.x; i < last; i += blockDim.x) {
         float yv = __bfloat162float(yr[i]);
         float dyv = __bfloat162float(dyr[i]);
-        dsr[i] = __float2bfloat16((dyv - dot) * yv);
+        float tmp = dyv * yv;
+        dsr[i] = __float2bfloat16(tmp - yv * dot);
     }
 }

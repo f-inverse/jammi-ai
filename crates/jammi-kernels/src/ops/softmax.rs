@@ -509,10 +509,42 @@
 //! register (never materializing a separate `BF16`-width `tmp`) and round
 //! to `BF16` exactly ONCE, at the very end — matching this crate's usual
 //! "f32-accumulate, round-once" convention AND the reference model's real
-//! call path, not round 3's ATen-kernel-in-isolation reading. See that
+//! call path, not round 3's ATen-kernel-in-isolation reading.
+//!
+//! ### esc-045 round 5 (GH#374): round 4 got WHERE right and the internal
+//! expression ORDER wrong
+//!
+//! Round 4's rounding-BOUNDARY finding above is unchanged, but its
+//! `dS_i = (dy_i − dot) * y_i` formula does not match what
+//! `softmax_backward_cuda_out` actually computes even in the F32-throughout
+//! case — that function's OWN body (still `aten/src/ATen/native/cuda/
+//! SoftMax.cu`, unconditional on `half_to_float`, quoted at source):
+//!
+//! ```text
+//! Tensor tmp = grad * output;
+//! host_softmax_backward<SoftMaxBackwardEpilogue, false>(tmp, output, dim, half_to_float, grad_input);
+//! ```
+//!
+//! computes `tmp_i = dy_i * y_i` as its own elementwise step FIRST, sums
+//! `sum = Σ tmp_i`, then (`SoftMaxBackwardEpilogue::operator()`, same file)
+//! `dS_i = tmp_i − y_i·sum` — multiply BEFORE subtract. Round 4 instead
+//! subtracted before multiplying: `(dy_i − sum)·y_i`. Algebraically the
+//! two are the same (`dy_i·y_i − sum·y_i == tmp_i − y_i·sum`); numerically
+//! they are not, since `F32` multiplication does not distribute over
+//! subtraction exactly. Measured live against a torch-produced fixture
+//! (`tests/softmax_bwd_dscores_matches_reference_call_path.rs`'s module
+//! doc carries the exact bit-match counts): the `tmp_i − y_i·sum` form
+//! reaches a materially higher bit-match rate against torch's own `dx`
+//! than round 4's `(dy_i − dot)·y_i` form does, at the same production
+//! shape/amplitude. `dscores_row_bf16`/`softmax_bwd_dscores_bf16` now
+//! compute `tmp_i − y_i·sum` (recomputing `tmp_i` in the output pass
+//! rather than storing it from the accumulation pass — one redundant `F32`
+//! multiply per element, not a second rounding boundary). See that
 //! function's own doc for the derivation and
 //! `tests/softmax_bwd_dscores_matches_reference_call_path.rs` for the
-//! op-level oracle.
+//! op-level oracle (now anchored to an independent f64 reference AND a
+//! torch-produced fixture, not a reference implementation that is
+//! character-identical to the kernel it is meant to check).
 //!
 //! ### This op's own `BF16`-native softmax is a SEPARATE, known divergence
 //! from the model's call path — not fixed by the rounding-placement above
@@ -1359,47 +1391,61 @@ fn dscores_f32(y: &[f32], dy: &[f32], rows: usize, last: usize) -> Vec<f32> {
     out
 }
 
-/// esc-045 round 4 (GH#374): matches the REFERENCE MODEL's actual call
-/// path, not an ATen kernel read in isolation. See the module doc's
-/// "esc-045 round 4" section for the full derivation, quoted at source:
-/// HF ModernBERT's eager attention (`modeling_modernbert.py:180`, this
-/// project's pinned `transformers` 5.15.1) calls `nn.functional.softmax(
-/// attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)` — an
-/// explicit `dtype=torch.float32` argument. `BFloat16` inputs to ATen's
-/// `softmax(..., dtype)` dispatcher (`aten/src/ATen/native/SoftMax.cpp`)
-/// do NOT take the fused `half_to_float=true` kernel (that fast path is
-/// gated on `ScalarType::Half`, excluding `BFloat16`); they take an
-/// explicit `Tensor converted = input_.toType(Float)` upcast followed by
-/// a plain `F32` `_softmax(converted, dim, /*half_to_float=*/false)` that
-/// never touches `BF16` at all. Backward for that call therefore runs
-/// `softmax_backward_cuda_out` with BOTH `grad` and `output` already
-/// `F32` (`half_to_float = (grad.scalar_type() != input_dtype)` is FALSE
-/// here), so `Tensor tmp = grad * output;` is an `F32 * F32 -> F32`
-/// product with NO `BF16` rounding inside `softmax_backward` at all — the
-/// entire `dy·y` reduction runs in `F32`, and the ONLY `BF16` rounding in
-/// the whole chain happens OUTSIDE this op, at the backward of the
-/// initial `.toType(Float)` upcast, which downcasts the final `F32`
-/// `grad_input` to `BF16` exactly once. A prior revision of this function
-/// (esc-045 round 3) instead materialized a separate `BF16`-width `tmp =
-/// round_bf16(dy*y)` and rounded a SECOND time in the epilogue, quoting
-/// `softmax_backward_cuda_out` as if `half_to_float=false`'s `BF16`-native
-/// case (the one ATen actually takes when the CALLER passes raw `BF16`
-/// grad/output with no `dtype` upcast) were what this reference model's
-/// `dtype=torch.float32` call path reaches — it is not; that fast/native
-/// `BF16` code path is UNREACHABLE from `modeling_modernbert.py:180`'s
-/// actual call. Fixed fold order (family J) preserved throughout: the
-/// accumulation below walks the row in ascending index order, matching
-/// [`dscores_row_f32`]'s identical structure (this function is that one's
-/// `BF16` counterpart, differing only in the boundary rounding of the
-/// output, exactly as the module doc's "f32-accumulate, round-once"
-/// convention requires).
+/// esc-045 round 5 (GH#374): round 4 (see the module doc's "esc-045 round
+/// 4" section, its WHERE-does-BF16-round-once finding UNCHANGED by this
+/// round) correctly located the ONE `BF16` rounding boundary — the model's
+/// `dtype=torch.float32` softmax call runs the ENTIRE `dy·y` reduction in
+/// `F32`, rounding to `BF16` only once, outside `softmax_backward`, at the
+/// `.toType(Float)` upcast's own backward — but got the internal `F32`
+/// EXPRESSION ORDER wrong. `aten/src/ATen/native/cuda/SoftMax.cu`'s
+/// `TORCH_IMPL_FUNC(softmax_backward_cuda_out)` is the ONE function every
+/// dtype combination funnels through (`half_to_float` only gates a
+/// `TORCH_CHECK`, never which code runs), quoted at source:
+///
+/// ```text
+/// Tensor tmp = grad * output;
+/// host_softmax_backward<SoftMaxBackwardEpilogue, false>(tmp, output, dim, half_to_float, grad_input);
+/// ```
+///
+/// and `SoftMaxBackwardEpilogue::operator()` (same file):
+///
+/// ```text
+/// // XXX: gradOutput that we get here is really gradOutput * output
+/// // Look for cmul in SoftMax_updateGradInput
+/// T operator()(OutT gradOutput, OutT output) const {
+///     return static_cast<T>(gradOutput - output * sum);
+/// }
+/// ```
+///
+/// So ATen computes `tmp_i = dy_i * y_i` as its OWN elementwise step FIRST
+/// (in whatever dtype `grad`/`output` already carry — `F32` here, per
+/// round 4's derivation, so this changes no rounding BOUNDARY, only the
+/// internal `F32` op order), sums `sum = Σ tmp_i`, THEN computes `dS_i =
+/// tmp_i − y_i·sum` (multiply before subtract). Round 4's formula computed
+/// `(dy_i − sum)·y_i` instead (subtract before multiply) — algebraically
+/// identical to ATen's form (`dy_i·y_i − sum·y_i == tmp_i − y_i·sum`) but
+/// numerically DIFFERENT, since `F32` multiplication does not distribute
+/// over subtraction exactly. Measured live against a torch-produced
+/// fixture (`tests/softmax_bwd_dscores_matches_reference_call_path.rs`'s
+/// module doc carries the numbers): round 4's `(dy−dot)·y` form bit-
+/// matches torch's real `dx` on a materially smaller fraction of elements
+/// than this `tmp−y·dot` form does, at the SAME production shape/
+/// amplitude. Fixed fold order (family J) preserved: `dot` still
+/// accumulates over the row in ascending index order (unchanged from round
+/// 4/[`dscores_row_f32`]'s identical accumulation structure); `tmp_i` is
+/// recomputed in the second pass rather than stored from the first —
+/// algebraically the same value contributed to `dot`'s sum, so this costs
+/// one redundant `F32` multiply per element, not a second rounding
+/// boundary.
 fn dscores_row_bf16(y: &[bf16], dy: &[bf16], out: &mut [bf16]) {
     let mut dot = 0f32;
     for i in 0..y.len() {
         dot += dy[i].to_f32() * y[i].to_f32();
     }
     for i in 0..y.len() {
-        out[i] = bf16::from_f32((dy[i].to_f32() - dot) * y[i].to_f32());
+        let yv = y[i].to_f32();
+        let tmp = dy[i].to_f32() * yv;
+        out[i] = bf16::from_f32(tmp - yv * dot);
     }
 }
 

@@ -35,6 +35,103 @@ workspace ships every publishable crate at the same
   use the new `optimizer::sorted_trainable_vars` (name-sorted), closing that
   gap the same way `AdamW`'s resume-from-checkpoint moment restoration
   already had to (by name, never by this unstable position).
+- **Eager LayerNorm and RoPE now round once, matching torch/HF (`jammi-encoders`).**
+  `LayerNorm::slow`'s bias-free (and biased, non-fast-path) arm rounded `x̂` to
+  the backbone dtype BEFORE multiplying by `gamma` (and, when biased, before
+  adding `bias`) — two-to-three rounding points instead of one. torch 2.13.0's
+  `layer_norm_cuda` (`aten/src/ATen/native/cuda/layer_norm_kernel.cu`'s
+  `vectorized_layer_norm_kernel_impl`) keeps the whole affine epilogue in the
+  f32 accumulator and rounds once, on store; jammi's own fused CUDA/CPU
+  `LayerNormFused` kernel already matched that. `slow()` now does too: mean,
+  variance, `x̂`, `gamma`, and `bias` are all computed in `internal_dtype`
+  (f32 whenever the input is F16/BF16), with a single cast to the backbone
+  dtype at the very end; `slow()` also now REFUSES a `weight`/`bias` whose
+  dtype does not match `x`'s (a domain-widening hazard the internal-dtype
+  upcast would otherwise silently paper over — previously a mismatched dtype
+  hit candle's own `broadcast_mul` type-mismatch error instead). Similarly,
+  `RotaryEmbedding::apply` (`jammi-encoders/src/modernbert.rs`, the eval AND
+  training-eager-fallback RoPE path) multiplied `x` by `cos`/`sin` and summed
+  at the backbone dtype — three rounding points instead of `transformers`
+  v5.15.1's one (`apply_rotary_pos_emb`: `(q.float()*cos) +
+  (rotate_half(q.float())*sin)`, then `.to(original_dtype)` once; NOTE
+  `transformers` v4.x rounds at every op instead, matching the pre-fix code —
+  this is a version-pinned citation); jammi's fused `RopeFused` kernel
+  already matched HF. `apply` now upcasts every operand to f32 and rounds
+  once at the end, matching both HF and the fused kernel. **This
+  double-rounding fix is observable only on an F16/BF16 backbone (the
+  CUDA/reduced-precision training and serving path)** — F32 serving is
+  byte-for-byte unchanged BY THIS FIX, since every `to_dtype` call it adds
+  is a same-dtype no-op there. Bias-free EVAL reaches `slow()` too, not
+  only the training paths: `LayerNorm::forward`'s only two named match
+  arms are the biased-eval fast path (`candle_nn::ops::layer_norm`) and
+  the bias-free training arm (which itself falls back to `slow()` outside
+  the fused kernel's admission domain) — every other `(bias, training)`
+  combination, including bias-free EVAL, falls through the catch-all `_
+  => self.slow(x)`; since `ModernBertConfig` has no `norm_bias` field,
+  every ModernBERT LayerNorm is bias-free, so ModernBERT's own eval/
+  serving forward pass reaches `slow()` through that catch-all. Every
+  served bias-free (ModernBERT) LayerNorm output and every RoPE-applied
+  Q/K tensor computed through these eager paths at reduced precision —
+  training AND eval/serving alike — now rounds the same way torch/HF
+  does, rather than accumulating extra rounding error the fused kernel
+  never had. Measured, reproducible divergence counts at production shape
+  (`hidden=1024`, `batch=2`, `seq` in `{128, 512}`) are printed and
+  asserted by two NEW committed tests reachable from `jammi-encoders`
+  itself — the only place in the workspace the real `slow()`/`apply()`
+  functions are reachable — calling the real functions against an
+  independently-derived scalar truth: `layer_norm::tests::
+  layer_norm_slow_matches_truth_at_production_shape_seq128`/`_seq512` and
+  `modernbert::tests::rope_apply_matches_truth_at_production_shape_seq128`/
+  `_seq512`. The fused kernels themselves (`LayerNormFused`, `RopeFused`)
+  are unchanged; `jammi-kernels/tests/layer_norm_oracles.rs` and
+  `tests/rope_oracles.rs`' `fused_vs_formula_*` checks (renamed from
+  `eager_vs_fused_*` — that crate is a dependency-free leaf and cannot
+  reach `jammi-encoders`' real functions, so its own in-file `formula()`
+  reproduction was never an eager-PARITY oracle, only a fused-kernel-vs-
+  hand-derived-math check) now measure the fused kernel against that
+  updated formula as bit-exact on their fixtures (previously bounded by a
+  stated ULP tolerance). `closes_escape: esc-047-eager-ln-rope-double-rounds-at-bf16-boundary`
+  (`.jammi/escapes.jsonl`).
+- **`LayerNorm::slow` takes `rstd`'s reciprocal before multiplying, matching
+  torch's placement, instead of dividing (`jammi-encoders`).** Orthogonal to
+  the double-rounding fix above: `slow()` previously computed
+  `centered.broadcast_div(&sqrt(variance + eps))`, where torch's
+  `layer_norm_kernel.cu`/`layer_norm_kernel.cpp` (`rstd = rsqrt(var+eps)`,
+  then multiply) and jammi's own fused CUDA/CPU kernel both take the
+  RECIPROCAL first and multiply. Division and multiply-by-reciprocal are
+  not bit-identical (the reciprocal is itself a rounded value), and —
+  UNLIKE the double-rounding fix — this placement is NOT gated on
+  `internal_dtype != x_dtype`: it changes `slow()`'s output at EVERY dtype,
+  **F32 and F64 included**. On the production-shape F32 fixture
+  `layer_norm::tests::slow_f32_reciprocal_form_is_bit_exact_and_diverges_from_division`
+  measures live (`rows=256, hidden=1024`), the division and reciprocal
+  forms disagree on `74734/262144` elements (28.5%) — not a stray ULP.
+  This exact count is HOST-FOLD-SPECIFIC: candle's `sum_keepdim` CPU
+  backend takes a SIMD-lane partial-sum reduction on `neon`/`avx2`/
+  `simd128` targets and a plain scalar fold otherwise (`candle-core-0.11.0`
+  `cpu/mod.rs::vec_sum`), a genuinely different (still IEEE-754-correct)
+  fold order per host architecture — on an x86-64 baseline (scalar fold),
+  the round-5 auditor measured `70795/262144` instead, in a `linux/amd64`
+  container; still a large, non-ULP divergence, just a different exact
+  count from a different host fold. Bias-free EVAL — the ModernBERT
+  serving path — reaches `slow()` (see
+  the double-rounding fix above for why), so this is F32 ModernBERT's
+  actual served embedding output changing on `74734/262144` elements at
+  this production shape, TOWARD torch's reciprocal-then-multiply
+  placement, away from the division form this line replaces.
+  `slow()`'s F32 output is now checked BIT-EXACT against a same-fold-order
+  (candle `sum_keepdim`) reciprocal-multiply reference; the bf16/f16 arms
+  above see a much smaller effect from this same line —
+  `layer_norm::tests::layer_norm_slow_matches_truth_at_production_shape_seq128`/
+  `_seq512` print BOTH `slow()`'s real reciprocal-form output AND a
+  same-candle-fold (`sum_keepdim`) division-form comparator, each diffed
+  against the same scalar truth reference, and assert the reciprocal form
+  is not worse (`reciprocal-count <= division-count`) — sharing `slow()`'s
+  own reduction fold is what makes the two counts commensurable, unlike a
+  hand-rolled scalar-loop division form, which would conflate the
+  placement effect with fold-order noise — which is why a dedicated F32
+  oracle (bit-exact, no fold-order ambiguity at all) exists rather than
+  relying on the bf16 comparison alone to catch a regression here.
 
 ## [0.47.0] - 2026-07-17
 

@@ -30,15 +30,22 @@ Each item is a **general principle**; apply it to any citation, in any artifact.
 
 **Apply these principles to the diff in front of you; a novel-but-analogous smell is in scope; default to BLOCK when uncertain. Do not limit yourself to the illustrative instances.** (Here the diff is the verdict/plan/doc under review and its citations.)
 
+## Reporting the unit, not just the artifact
+
+Report `unit_branch` (`git -C <worktree> rev-parse --abbrev-ref HEAD` if resolvable, else the `unit:` line the lead's brief carried — say which) and `head_sha` (`git rev-parse HEAD` at the same location). Report `class_enumeration` when a `stale`/`fabricated` citation has siblings (the same author's other citations in the artifact, checked the same way); `sweep_method: "none"` when you checked only the ones flagged.
+
 ## Verdict schema
 
-Emit exactly one fenced JSON block. Any `fabricated` or `stale` citation forces `BLOCK`.
+Emit exactly one fenced ```json block as the LAST fenced block of your final message, with `"kind": "verdict"` as its first field (a `<verdict>...</verdict>`-tag-wrapped block is also an accepted, older form). Any `fabricated` or `stale` citation forces `BLOCK`.
 
 ```json
-<verdict>
 {
+  "kind": "verdict",
   "agent": "citation-checker",
   "artifact": "what was checked (verdict / plan / doc)",
+  "unit_branch": "<the branch you read, from git or the lead's unit: line — say which>",
+  "head_sha": "<sha you read>",
+  "worktree": "<the absolute path you read the artifact from — recorded for provenance; the lead may cite it in its own written class-probe, see `.claude/agents/lead.md` 'The class, not the instance'>",
   "verdict": "BLOCK | PASS",
   "citations": [
     {
@@ -48,7 +55,9 @@ Emit exactly one fenced JSON block. Any `fabricated` or `stale` citation forces 
       "actual": "what the location actually contains (if divergent)"
     }
   ],
+  "class_enumeration": ["path:line", "…sibling stale/fabricated citations, if any"],
+  "sweep_method": "how you enumerated the class — 'none' if you checked only the flagged citations",
+  "exhaustive": false,
   "notes": "count resolved / stale / fabricated"
 }
-</verdict>
 ```

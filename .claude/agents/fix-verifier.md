@@ -30,15 +30,22 @@ Each item is a **general principle**; apply it to any fix, novel or familiar.
 
 **Apply these principles to the diff in front of you; a novel-but-analogous smell is in scope; default to BLOCK when uncertain. Do not limit yourself to the illustrative instances.**
 
+## Reporting the unit, not just the diff
+
+Report `unit_branch` (`git -C <worktree> rev-parse --abbrev-ref HEAD` if resolvable, else the `unit:` line the lead's brief carried — say which) and `head_sha` (`git rev-parse HEAD` at the same location). If your verdict is `tautological`/`not-symptom-faithful`, sweep for other sites carrying the SAME shape of gap (a red-green claim that doesn't bite, a control that's vacuous the same way) and list them in `class_enumeration` — a BLOCK on one test's vacuity often has siblings in the same PR (`sweep_method`/`exhaustive`, same convention as `adversarial-audit`).
+
 ## Verdict schema
 
-Emit exactly one fenced JSON block. `verdict` is `verified` only when the test went RED-then-GREEN, the control is non-vacuous, and a resolving `closes_escape` id is present. Otherwise `tautological` or `not-symptom-faithful` — both are BLOCK states.
+Emit exactly one fenced ```json block as the LAST fenced block of your final message, with `"kind": "verdict"` as its first field (a `<verdict>...</verdict>`-tag-wrapped block is also an accepted, older form). `verdict` is `verified` only when the test went RED-then-GREEN, the control is non-vacuous, and a resolving `closes_escape` id is present. Otherwise `tautological` or `not-symptom-faithful` — both are BLOCK states.
 
 ```json
-<verdict>
 {
+  "kind": "verdict",
   "agent": "fix-verifier",
   "diff_range": "<base>...<head>",
+  "unit_branch": "<the branch you read, from git or the lead's unit: line — say which>",
+  "head_sha": "<sha you read>",
+  "worktree": "<the absolute path you read the diff from — recorded for provenance; the lead may cite it in its own written class-probe, see `.claude/agents/lead.md` 'The class, not the instance'>",
   "verdict": "verified | tautological | not-symptom-faithful",
   "red_green": { "reverted_prod": "test-command", "pre_fix": "RED | GREEN | not-run", "post_fix": "RED | GREEN | not-run" },
   "control_non_vacuous": true,
@@ -47,7 +54,9 @@ Emit exactly one fenced JSON block. `verdict` is `verified` only when the test w
   "findings": [
     { "issue": "why the test does not bite / control is vacuous / not symptom-faithful", "location": "path:line" }
   ],
+  "class_enumeration": ["path:line", "…sibling sites carrying the same tautological/vacuous shape, if any"],
+  "sweep_method": "how you enumerated the class — 'none' if you did not sweep",
+  "exhaustive": false,
   "notes": "isolation used (worktree + unique CARGO_TARGET_DIR)"
 }
-</verdict>
 ```

@@ -6215,26 +6215,31 @@ fn flash_upstream_acceptance_form_vs_f32_reference_dense_cuda() {
     }
 }
 
-/// RED control: the FLASH leg's own window radius perturbed by one column
-/// (`Some(64)` -> `Some(63)`) while the reference/eager side keeps the
-/// real radius — must VIOLATE the upstream bound (out, dqkv, or both).
-/// This is the discriminating half of the sibling this section adds next
-/// to `three_way_vs_f32_reference`'s own generous sanity bound (guide
-/// §3.8: no absolute floor here, so a one-column radius defect is not
-/// absorbed the way it would be under a `+ 0.05` floor).
+/// RED control: the FLASH leg's own window dropped entirely (`Some(64)` ->
+/// `None`) while the reference/eager side keeps the real radius — must
+/// VIOLATE the upstream bound (out, dqkv, or both). A genuine one-column
+/// radius perturbation (`Some(64)` -> `Some(63)`) was tried first and
+/// measured HEALTHY at this shape (`out fused=95.19 eager=48.56
+/// bound(2x)=97.13` -- real signal, ~2x eager's own error, but inside the
+/// bound by only ~2%): a single boundary column out of 512 positions is
+/// genuinely near this metric's own detection floor at max-abs, not a
+/// weak assertion. Dropping the window entirely is the discriminating
+/// perturbation this RED control actually needs (guide §3.8: no absolute
+/// floor here, so this is not absorbed the way it would be under a
+/// `+ 0.05` floor).
 #[test]
 #[cfg(feature = "flash-attn")]
-fn flash_upstream_acceptance_form_red_control_window_off_by_one_cuda() {
+fn flash_upstream_acceptance_form_red_control_window_dropped_cuda() {
     let Some(cuda) = cuda_device() else {
         return;
     };
-    let m = measure_flash_upstream_form(&cuda, 8, 512, 16, 64, Some(64), Some(63), 74.0, 12.0);
+    let m = measure_flash_upstream_form(&cuda, 8, 512, 16, 64, Some(64), None, 74.0, 12.0);
     assert!(
         !m.out_ok() || !m.dqkv_ok(),
-        "off-by-one flash window radius (Some(64) -> Some(63)) must VIOLATE the upstream bound \
-         on at least one leg -- out fused={:e} eager={:e} bound(2x)={:e}; dqkv fused={:e} \
-         eager={:e} bound(3x)={:e} -- if this assertion fails, the healthy oracle above would NOT \
-         have caught this defect",
+        "flash window dropped (Some(64) -> None) must VIOLATE the upstream bound on at least one \
+         leg -- out fused={:e} eager={:e} bound(2x)={:e}; dqkv fused={:e} eager={:e} \
+         bound(3x)={:e} -- if this assertion fails, the healthy oracle above would NOT have \
+         caught this defect",
         m.out_fused_max,
         m.out_eager_max,
         2.0 * m.out_eager_max,

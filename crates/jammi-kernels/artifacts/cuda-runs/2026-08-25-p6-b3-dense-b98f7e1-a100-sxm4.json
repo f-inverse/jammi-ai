@@ -213,5 +213,116 @@
       "step_time_reduction_fraction": 0.21374472943386014,
       "flash_over_block_ratio": 0.7862552705661399
     }
+  },
+  "additional_boxes": {
+    "a100b": {
+      "provenance": "box jammi-a100b, NVIDIA A100-SXM4-80GB, driver 580.126.16. Script scratchpad/pod/fa2-ab.sh (main checkout, not committed to this repo -- an ad hoc A/B driver, not jammi-bench's own CLI harness script). Tip 5886c6b627c7a943df384a8aaadb7c3d6714e79c ('HEAD=' line in the raw log). That tip predates this repo's --expect-kernels-disabled convention, so there is no CLI-level assertion the disable actually fired on this run -- provenance for 'the block leg really ran the block arm' is the JSON's OWN dispatch counters (attention_block_fused_dispatches=840 vs attention_block_flash_fused_dispatches=840 on the flash leg, kernels_disabled_fired=['attention_block_flash'] on the block leg), read directly off each raw run below, not asserted by the harness itself. cli_common differs from the a100c box above: lora_rank=16, lora_alpha unset in the raw dump, lora_dropout=0.0 (the a100c box's own recipe is lora_rank=8/alpha=16.0/dropout=0.05) -- cited AS MEASURED, not normalized to match, since the two boxes' numbers are compared only within their OWN box, never against each other.",
+      "raw_runs_dir": "2026-08-25-p6-b3-dense-raw-runs/a100b/",
+      "legs": {
+        "b8-s512-flash-on": {
+          "seq": 512,
+          "runs": [
+            {
+              "file": "a100b/b8_s512_flash.r1.json",
+              "s_per_step_p50": 0.462583587,
+              "peak_vram_bytes": 18071158784.0,
+              "attention_block_flash_fused_dispatches": 840,
+              "attention_block_fused_dispatches": 0,
+              "kernels_disabled_fired": []
+            },
+            {
+              "file": "a100b/b8_s512_flash.r2.json",
+              "s_per_step_p50": 0.463807082,
+              "peak_vram_bytes": 18406703104.0,
+              "attention_block_flash_fused_dispatches": 840,
+              "attention_block_fused_dispatches": 0,
+              "kernels_disabled_fired": []
+            }
+          ]
+        },
+        "b8-s512-flash-off-block-baseline": {
+          "seq": 512,
+          "runs": [
+            {
+              "file": "a100b/b8_s512_block.r1.json",
+              "s_per_step_p50": 0.675579948,
+              "peak_vram_bytes": 16426991616.0,
+              "attention_block_flash_fused_dispatches": 0,
+              "attention_block_fused_dispatches": 840,
+              "kernels_disabled_fired": ["attention_block_flash"]
+            },
+            {
+              "file": "a100b/b8_s512_block.r2.json",
+              "s_per_step_p50": 0.676374388,
+              "peak_vram_bytes": 16292773888.0,
+              "attention_block_flash_fused_dispatches": 0,
+              "attention_block_fused_dispatches": 840,
+              "kernels_disabled_fired": ["attention_block_flash"]
+            }
+          ]
+        },
+        "b8-s128-flash-on": {
+          "seq": 128,
+          "runs": [
+            {
+              "file": "a100b/b8_s128_flash.r1.json",
+              "s_per_step_p50": 0.155943773,
+              "peak_vram_bytes": 4682940416.0,
+              "attention_block_flash_fused_dispatches": 840,
+              "attention_block_fused_dispatches": 0,
+              "kernels_disabled_fired": []
+            },
+            {
+              "file": "a100b/b8_s128_flash.r2.json",
+              "s_per_step_p50": 0.155664893,
+              "peak_vram_bytes": 4817158144.0,
+              "attention_block_flash_fused_dispatches": 840,
+              "attention_block_fused_dispatches": 0,
+              "kernels_disabled_fired": []
+            }
+          ]
+        },
+        "b8-s128-flash-off-block-baseline": {
+          "seq": 128,
+          "runs": [
+            {
+              "file": "a100b/b8_s128_block.r1.json",
+              "s_per_step_p50": 0.199214109,
+              "peak_vram_bytes": 3944742912.0,
+              "attention_block_flash_fused_dispatches": 0,
+              "attention_block_fused_dispatches": 840,
+              "kernels_disabled_fired": ["attention_block_flash"]
+            },
+            {
+              "file": "a100b/b8_s128_block.r2.json",
+              "s_per_step_p50": 0.198701114,
+              "peak_vram_bytes": 3978297344.0,
+              "attention_block_flash_fused_dispatches": 0,
+              "attention_block_fused_dispatches": 840,
+              "kernels_disabled_fired": ["attention_block_flash"]
+            }
+          ]
+        }
+      },
+      "summary": {
+        "b8-s512": {
+          "block_arm_p50_mean_of_2_s": 0.675977168,
+          "flash_arm_p50_mean_of_2_s": 0.4631953345,
+          "step_time_reduction_fraction": 0.3147766575157461,
+          "flash_over_block_ratio": 0.6852233424842539,
+          "block_arm_peak_vram_bytes": [16426991616.0, 16292773888.0],
+          "flash_arm_peak_vram_bytes": [18071158784.0, 18406703104.0],
+          "note": "the SAME anomaly the a100c box's own numbers show: flash's peak_vram exceeds block's, opposite the theoretical direction (flash should retain LESS, not more) -- see this round's own fix artifact, 2026-08-25-p6-fa2-vram-attrib-<sha7>-a100-sxm4.json, for the attribution and the same-build before/after that closes it (measured on a100c; this a100b capture predates the fix and is cited here as further confirming evidence the regression was not a100c-specific)."
+        },
+        "b8-s128": {
+          "block_arm_p50_mean_of_2_s": 0.1989576115,
+          "flash_arm_p50_mean_of_2_s": 0.155804333,
+          "step_time_reduction_fraction": 0.21689684639182552,
+          "flash_over_block_ratio": 0.7831031536081745,
+          "block_arm_peak_vram_bytes": [3944742912.0, 3978297344.0],
+          "flash_arm_peak_vram_bytes": [4682940416.0, 4817158144.0]
+        }
+      }
+    }
   }
 }

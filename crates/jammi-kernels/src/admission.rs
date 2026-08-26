@@ -1057,6 +1057,17 @@ pub fn device_is_supported(d: &Device) -> bool {
 /// graph, the same value regardless of which downstream crate is asking.
 pub const FLASH_COMPILED: bool = cfg!(feature = "flash-attn");
 
+/// Whether THIS crate (`jammi-kernels`) was compiled with the `cuda`
+/// feature — a plain `const`, unconditionally compiled (never behind
+/// `#[cfg(feature = "cuda")]` itself), for exactly the reason
+/// [`FLASH_COMPILED`] is: a downstream crate (or a process-identity report
+/// a build-features identity field feeds) can read the real answer without
+/// forwarding the feature through its own `Cargo.toml`. `flash-attn`
+/// DEPENDS on `cuda` (`Cargo.toml`'s `flash-attn = ["cuda"]`), so
+/// `FLASH_COMPILED` implies `CUDA_COMPILED` — never the reverse — for every
+/// build this crate can produce.
+pub const CUDA_COMPILED: bool = cfg!(feature = "cuda");
+
 /// The op-keyed dispatch-counter registry: one process-wide table from an
 /// op's name to its `DispatchCounters`. See the module doc's "op-keyed
 /// dispatch-counter registry" section for why this exists alongside (not
@@ -1268,6 +1279,51 @@ mod tests {
     #[test]
     fn flash_compiled_matches_the_flash_attn_feature_this_binary_was_built_with() {
         assert_eq!(FLASH_COMPILED, cfg!(feature = "flash-attn"));
+    }
+
+    #[test]
+    fn cuda_compiled_matches_the_cuda_feature_this_binary_was_built_with() {
+        assert_eq!(CUDA_COMPILED, cfg!(feature = "cuda"));
+    }
+
+    #[test]
+    // `#[cfg(not(feature = "cuda"))]`-gated: on a `--features cuda` build
+    // (the GPU prove lane, `ci/scripts/runpod_gpu_prove.sh`)
+    // `CUDA_COMPILED` is `true`, so this assertion would fail
+    // deterministically there — the twin below
+    // (`cuda_compiled_is_true_on_a_cuda_build`) pins that arm instead.
+    #[cfg(not(feature = "cuda"))]
+    // Compile-time-known `false` for THIS (non-cuda) test target; that is
+    // precisely the value being pinned, so `assertions_on_constants` is
+    // suppressed here rather than obscured behind a non-`assert!` rewrite.
+    #[allow(clippy::assertions_on_constants)]
+    fn cuda_compiled_is_false_on_a_non_cuda_build() {
+        // This test target is built by a plain `cargo test -p jammi-kernels`
+        // (no `--features cuda`), so this pins the value a downstream
+        // identity field reads on that default build path, not merely that
+        // it round-trips `cfg!`.
+        assert!(!CUDA_COMPILED);
+    }
+
+    #[test]
+    // Twin of `cuda_compiled_is_false_on_a_non_cuda_build`, gated the other
+    // way: only compiled (and only true) under `--features cuda`.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::assertions_on_constants)]
+    fn cuda_compiled_is_true_on_a_cuda_build() {
+        assert!(CUDA_COMPILED);
+    }
+
+    #[test]
+    // Valid under both feature sets (an implication, not a fixed value), so
+    // this one carries no `#[cfg(...)]` gate — it runs, and holds, on both
+    // the CPU lane and the GPU prove lane.
+    #[allow(clippy::assertions_on_constants)]
+    fn flash_compiled_implies_cuda_compiled() {
+        // `flash-attn = ["cuda"]` in `Cargo.toml`: every build that turns on
+        // `flash-attn` also turns on `cuda`, so `FLASH_COMPILED` can never
+        // be true while `CUDA_COMPILED` is false.
+        assert!(!FLASH_COMPILED || CUDA_COMPILED);
     }
 
     #[test]

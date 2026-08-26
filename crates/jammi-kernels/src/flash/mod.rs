@@ -61,6 +61,7 @@
 //! | a buffer's element count `!=` the shape's | `FlashError::Geometry` |
 //! | `dq_accum` split count `!=` `dq_accum_splits` | `FlashError::Geometry` |
 //! | args struct size `!=` the C struct's | `FlashError::Refused(Abi)` |
+//! | device compute capability `!=` EXACTLY the build's (`check_arch`, P6 Stage B §3.4) | `FlashError::Arch` |
 //! | a sequence length `== 0`, or the batch is empty (`CuSeqlens::from_lengths`) | `FlashError::Geometry` |
 //! | `total_q`/per-length `> i32::MAX` (`CuSeqlens::from_lengths`) | `FlashError::Geometry` |
 //!
@@ -345,6 +346,26 @@ pub enum FlashError {
     /// A Rust-side domain refusal: geometry, config, or buffer length.
     #[error("flash-attn: {0}")]
     Geometry(String),
+    /// The device's compute capability does not EXACTLY match the one
+    /// `build.rs` compiled this crate's cubin for (`check_arch`, P6 Stage
+    /// B contract §3.4). Deliberately a distinct variant from `Geometry`
+    /// (an architecture mismatch is a capability question, not a shape
+    /// one) and distinct from `FlashStatus::ComputeCapability` (the C
+    /// wrapper's own `cc_major < 8` guard, `flash_api_jammi.cu:151-156`
+    /// — major-only, so it would NOT catch an sm_90 device on an sm_80-only
+    /// cubin; this Rust-side check is exact-equality and runs first).
+    #[error(
+        "flash-attn: device compute capability {device:?} does not exactly match the \
+         (major, minor) this crate's cubin was built for {built_for:?} — this build embeds \
+         ONLY a sm_{built_for_sm} cubin (no PTX), so a newer device cannot JIT a different, \
+         unvalidated kernel variant; it would either fail to load the module or (if the C \
+         wrapper's own major-only guard also missed it) silently run an unverified code path"
+    )]
+    Arch {
+        built_for: (u32, u32),
+        built_for_sm: String,
+        device: (usize, usize),
+    },
     /// A cudarc driver call (context binding) failed.
     #[error("flash-attn: CUDA driver error: {0}")]
     Driver(#[from] DriverError),
@@ -429,6 +450,84 @@ fn check_abi() -> Result<()> {
                 message: format!("{} ({detail})", strerror(code)),
             })
         }
+    }
+}
+
+/// `build.rs`'s ONE `-gencode` literal, parsed from the `JAMMI_FLASH_GENCODE_SM`
+/// env var it emits beside that literal (`cargo:rustc-env=JAMMI_FLASH_GENCODE_SM=<sm>`,
+/// e.g. `"80"`) — never independently retyped, so this and the actual
+/// compiled cubin cannot drift apart. Two-digit `sm_XX` codes split as
+/// (all digits but the last, last digit) = (major, minor) — true of every
+/// NVIDIA compute capability this crate could plausibly target (`sm_80`,
+/// `sm_86`, `sm_89`, `sm_90`); a future 3-digit code (e.g. a hypothetical
+/// `sm_100`) would need `parse_gencode_sm` to change, which
+/// `gencode_sm_parses_the_pinned_build_value` below would catch (it pins
+/// the exact CURRENT value, not just "parses without erroring").
+fn parse_gencode_sm(sm: &str) -> Result<(u32, u32)> {
+    if sm.len() < 2 || !sm.chars().all(|c| c.is_ascii_digit()) {
+        return Err(FlashError::Geometry(format!(
+            "JAMMI_FLASH_GENCODE_SM = {sm:?}: expected at least two ASCII digits"
+        )));
+    }
+    let split = sm.len() - 1;
+    let (major_s, minor_s) = sm.split_at(split);
+    let major: u32 = major_s.parse().map_err(|_| {
+        FlashError::Geometry(format!(
+            "JAMMI_FLASH_GENCODE_SM = {sm:?}: major digits {major_s:?} do not parse as u32"
+        ))
+    })?;
+    let minor: u32 = minor_s.parse().map_err(|_| {
+        FlashError::Geometry(format!(
+            "JAMMI_FLASH_GENCODE_SM = {sm:?}: minor digit {minor_s:?} does not parse as u32"
+        ))
+    })?;
+    Ok((major, minor))
+}
+
+/// The compute capability this build's cubin was compiled for, from
+/// `build.rs`'s `JAMMI_FLASH_GENCODE_SM`.
+fn built_for_compute_cap() -> Result<(u32, u32)> {
+    parse_gencode_sm(env!("JAMMI_FLASH_GENCODE_SM"))
+}
+
+/// Pure core of [`check_arch`]: `None` iff `device` exactly matches
+/// `built_for`. Separated out so the mismatch cell is unit-testable
+/// without a device — the same `abi_mismatch`/`check_abi` split this
+/// module already uses.
+fn arch_mismatch(
+    built_for: (u32, u32),
+    built_for_sm: &str,
+    device: (usize, usize),
+) -> Option<FlashError> {
+    if (device.0 as u32, device.1 as u32) == built_for {
+        return None;
+    }
+    Some(FlashError::Arch {
+        built_for,
+        built_for_sm: built_for_sm.to_string(),
+        device,
+    })
+}
+
+/// Refuses a device whose compute capability is not EXACTLY the one this
+/// crate's cubin was built for (see [`FlashError::Arch`]'s doc for why
+/// exact, not "at least"). Checked beside [`check_abi`] at every launch
+/// (`flash_varlen_fwd_into`, `flash_varlen_bwd_into`) — a cheap driver
+/// query, not a hot-path cost.
+fn check_arch(dev: &CudaDevice) -> Result<()> {
+    let built_for = built_for_compute_cap()?;
+    // `compute_capability()` returns signed ints (cudarc mirrors the raw
+    // CUDA driver attribute query, `cudaDeviceAttr`, which is `i32`);
+    // `.max(0)` before the `usize` cast mirrors `admission.rs`'s own
+    // `probe_cuda_compute_capability` — a negative value is not a real
+    // capability, and clamping (not erroring) matches that precedent
+    // exactly rather than introducing a second convention for the same
+    // driver call.
+    let (major, minor) = dev.cuda_stream().context().compute_capability()?;
+    let device = (major.max(0) as usize, minor.max(0) as usize);
+    match arch_mismatch(built_for, env!("JAMMI_FLASH_GENCODE_SM"), device) {
+        None => Ok(()),
+        Some(e) => Err(e),
     }
 }
 
@@ -696,6 +795,27 @@ impl CuSeqlens {
         g.validate()?;
         Ok(g)
     }
+
+    /// A deep, OWNED copy of this batch's device array. `CudaSlice<T>`'s
+    /// own `Clone` impl (`cudarc` 0.17.8 `core.rs:619`) is a real
+    /// device-to-device `memcpy` (`self.stream.clone_dtod(self)`, via the
+    /// PANICKING `Clone::clone` — `try_clone().unwrap()`), not a refcount
+    /// bump, so `CuSeqlens` cannot be cheaply `Arc`-shared by wrapping it
+    /// directly; this crate-private, FALLIBLE method (never panics) is how
+    /// [`crate::ops::flash_attention`]'s stateful op gives itself a
+    /// `'static`, independently-owned handle that outlives the `&CuSeqlens`
+    /// borrow its public entry point receives. The array itself is tiny
+    /// (`batch + 1` `i32`s — single digits to low hundreds in practice), so
+    /// the `memcpy` this performs is not a perf concern the way cloning
+    /// `qkv`/`d_qkv` (megabytes) would be.
+    pub(crate) fn try_duplicate(&self) -> Result<Self> {
+        Ok(Self {
+            cu: self.cu.try_clone()?,
+            total_q: self.total_q,
+            batch: self.batch,
+            max_seqlen: self.max_seqlen,
+        })
+    }
 }
 
 /// Per-call configuration. There is deliberately NO dropout field: the
@@ -856,6 +976,7 @@ pub fn flash_varlen_fwd_into(
     let (window_size_left, window_size_right) = cfg.window_sizes()?;
     bind(dev)?;
     check_abi()?;
+    check_arch(dev)?;
 
     let stream = dev.cuda_stream();
     let cu_seqlens = cu.as_view();
@@ -973,6 +1094,7 @@ pub fn flash_varlen_bwd_into(
     let (window_size_left, window_size_right) = cfg.window_sizes()?;
     bind(dev)?;
     check_abi()?;
+    check_arch(dev)?;
 
     let stream = dev.cuda_stream();
     // `dq_accum` MUST be all-zero on entry when `cfg.deterministic`
@@ -1083,6 +1205,57 @@ pub fn flash_varlen_bwd(
 mod tests {
     //! The pure cells of the refusal lattice (no device needed).
     use super::*;
+
+    #[test]
+    fn gencode_sm_parses_the_pinned_build_value() {
+        // Pins the CURRENT `build.rs` literal exactly (`arch=compute_80,
+        // code=sm_80`) — a change to that literal without updating this
+        // test is exactly the drift `built_for_compute_cap` exists to
+        // prevent silently; this asserts the derivation, not just "it
+        // parses something".
+        assert_eq!(parse_gencode_sm("80").unwrap(), (8, 0));
+        assert_eq!(built_for_compute_cap().unwrap(), (8, 0));
+    }
+
+    #[test]
+    fn gencode_sm_parses_every_two_digit_ampere_hopper_code() {
+        for (sm, want) in [
+            ("80", (8, 0)),
+            ("86", (8, 6)),
+            ("89", (8, 9)),
+            ("90", (9, 0)),
+        ] {
+            assert_eq!(parse_gencode_sm(sm).unwrap(), want, "sm_{sm}");
+        }
+    }
+
+    #[test]
+    fn gencode_sm_refuses_malformed_values() {
+        for bad in ["", "8", "8a", "-80", "sm80", " 80"] {
+            let e = parse_gencode_sm(bad).unwrap_err();
+            assert!(matches!(e, FlashError::Geometry(_)), "{bad:?}: {e}");
+        }
+    }
+
+    #[test]
+    fn arch_mismatch_cells() {
+        // Exact match: no error.
+        assert!(arch_mismatch((8, 0), "80", (8, 0)).is_none());
+        // Boundary the C wrapper's own major-only guard (`cc_major < 8`)
+        // MISSES but this Rust-side check must catch: a newer device on
+        // the same major (sm_86, still major 8).
+        let e = arch_mismatch((8, 0), "80", (8, 6)).unwrap();
+        assert!(matches!(e, FlashError::Arch { .. }), "{e}");
+        // A different major (sm_90) — also caught.
+        let e = arch_mismatch((8, 0), "80", (9, 0)).unwrap();
+        assert!(matches!(e, FlashError::Arch { .. }), "{e}");
+        // An OLDER device (sm_70) — the C wrapper WOULD catch this
+        // (major < 8), but the Rust-side exact check catches it first
+        // either way, with a message naming both capabilities.
+        let e = arch_mismatch((8, 0), "80", (7, 0)).unwrap();
+        let msg = e.to_string();
+        assert!(msg.contains("(8, 0)") && msg.contains("(7, 0)"), "{msg}");
+    }
 
     fn geom() -> VarlenGeometry {
         VarlenGeometry {

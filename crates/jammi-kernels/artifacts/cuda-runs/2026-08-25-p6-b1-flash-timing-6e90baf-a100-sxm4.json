@@ -1,0 +1,192 @@
+{
+  "tip_sha": "6e90baf110e78f3063fe26627e23068d9db8f4f1",
+  "box": "a100b",
+  "gpu": "NVIDIA A100-SXM4-80GB",
+  "driver": "580.126.16",
+  "compute_capability": [
+    8,
+    0
+  ],
+  "warmup": 20,
+  "iters": 200,
+  "runs": 2,
+  "amplitude_note": "bf16 random fill in [-18, 18], production amplitude, deterministic irrational-multiplier fractional sequence (not an RNG dependency)",
+  "method": "kernel_ms: flash_varlen_{fwd,bwd}_into on buffers preallocated ONCE outside the timed loop (zero device allocation in the timed region; bwd's internal dq_accum zero-fill, unconditional when deterministic, remains inside kernel_ms \u2014 not eliminable without an unsafe raw-FFI bypass). wrapper_ms: the public flash_varlen_{fwd,bwd}, which allocates fresh outputs every call (the real per-call public-API cost, never compared against kernel_ms or an external nsys kernel-only number). sync_method: per-iteration BackendDevice::synchronize() after every launch (no CUDA-event timer available at this crate's cudarc binding). warmup=20, iters=200 per bracket, run twice (RUNS=2, both included below) to demonstrate reproducibility. steady-state: |median-mean|/mean <= 5%, computed for every bracket and stored as \"steady_state\" in each stats block. ENFORCED (panics, refuses to write the artifact) for kernel_ms \u2014 a preallocated, zero-allocation region has no legitimate reason to be bimodal. RECORDED ONLY for wrapper_ms, never enforced: two independent runs on a100b found the wrapper bracket genuinely and reproducibly bimodal (fresh device allocation every call has real allocator-pool-growth variance) \u2014 a property of the PUBLIC API itself, not a measurement defect, so it is reported honestly rather than hidden by loosening the tolerance or blocking the artifact on something outside the kernel's own control; see this file's module doc. non-deterministic bwd is DROPPED (not measured): it is unreachable from the only production entry point (ops::flash_attention_varlen pins deterministic=true at every real call site) and 10b1f3b's artifact found it bimodal with no root cause \u2014 publishing an unexplained number was rejected in favour of dropping the leg; see this file's module doc.",
+  "measurements": [
+    {
+      "run": 0,
+      "legs": [
+        {
+          "leg": "b8_s512_dense",
+          "batch": 8,
+          "total_q": 4096,
+          "num_heads": 16,
+          "head_dim": 64,
+          "fwd_kernel_ms": {
+            "mean_ms": 0.09171,
+            "median_ms": 0.09156,
+            "min_ms": 0.09019,
+            "max_ms": 0.09862,
+            "n": 200,
+            "steady_state": true
+          },
+          "fwd_wrapper_ms": {
+            "mean_ms": 0.09684,
+            "median_ms": 0.0964,
+            "min_ms": 0.09497,
+            "max_ms": 0.10208,
+            "n": 200,
+            "steady_state": true
+          },
+          "bwd_deterministic_kernel_ms": {
+            "mean_ms": 0.35555,
+            "median_ms": 0.3553,
+            "min_ms": 0.35287,
+            "max_ms": 0.36052,
+            "n": 200,
+            "steady_state": true
+          },
+          "bwd_deterministic_wrapper_ms": {
+            "mean_ms": 0.88217,
+            "median_ms": 0.58129,
+            "min_ms": 0.42878,
+            "max_ms": 2.37579,
+            "n": 200,
+            "steady_state": false
+          }
+        },
+        {
+          "leg": "b1_s512",
+          "batch": 1,
+          "total_q": 512,
+          "num_heads": 16,
+          "head_dim": 64,
+          "fwd_kernel_ms": {
+            "mean_ms": 0.02994,
+            "median_ms": 0.02943,
+            "min_ms": 0.02883,
+            "max_ms": 0.05443,
+            "n": 200,
+            "steady_state": true
+          },
+          "fwd_wrapper_ms": {
+            "mean_ms": 0.03776,
+            "median_ms": 0.03336,
+            "min_ms": 0.03281,
+            "max_ms": 0.90102,
+            "n": 200,
+            "steady_state": false
+          },
+          "bwd_deterministic_kernel_ms": {
+            "mean_ms": 0.07526,
+            "median_ms": 0.07518,
+            "min_ms": 0.07447,
+            "max_ms": 0.07838,
+            "n": 200,
+            "steady_state": true
+          },
+          "bwd_deterministic_wrapper_ms": {
+            "mean_ms": 0.09499,
+            "median_ms": 0.09035,
+            "min_ms": 0.08895,
+            "max_ms": 1.01793,
+            "n": 200,
+            "steady_state": true
+          }
+        }
+      ]
+    },
+    {
+      "run": 1,
+      "legs": [
+        {
+          "leg": "b8_s512_dense",
+          "batch": 8,
+          "total_q": 4096,
+          "num_heads": 16,
+          "head_dim": 64,
+          "fwd_kernel_ms": {
+            "mean_ms": 0.07727,
+            "median_ms": 0.07729,
+            "min_ms": 0.07587,
+            "max_ms": 0.0818,
+            "n": 200,
+            "steady_state": true
+          },
+          "fwd_wrapper_ms": {
+            "mean_ms": 0.08197,
+            "median_ms": 0.0818,
+            "min_ms": 0.08076,
+            "max_ms": 0.09406,
+            "n": 200,
+            "steady_state": true
+          },
+          "bwd_deterministic_kernel_ms": {
+            "mean_ms": 0.30156,
+            "median_ms": 0.30067,
+            "min_ms": 0.29862,
+            "max_ms": 0.47316,
+            "n": 200,
+            "steady_state": true
+          },
+          "bwd_deterministic_wrapper_ms": {
+            "mean_ms": 0.81122,
+            "median_ms": 1.14363,
+            "min_ms": 0.43272,
+            "max_ms": 1.94266,
+            "n": 200,
+            "steady_state": false
+          }
+        },
+        {
+          "leg": "b1_s512",
+          "batch": 1,
+          "total_q": 512,
+          "num_heads": 16,
+          "head_dim": 64,
+          "fwd_kernel_ms": {
+            "mean_ms": 0.02939,
+            "median_ms": 0.02926,
+            "min_ms": 0.02895,
+            "max_ms": 0.03532,
+            "n": 200,
+            "steady_state": true
+          },
+          "fwd_wrapper_ms": {
+            "mean_ms": 0.03791,
+            "median_ms": 0.03353,
+            "min_ms": 0.03296,
+            "max_ms": 0.8996,
+            "n": 200,
+            "steady_state": false
+          },
+          "bwd_deterministic_kernel_ms": {
+            "mean_ms": 0.07528,
+            "median_ms": 0.07516,
+            "min_ms": 0.07399,
+            "max_ms": 0.08098,
+            "n": 200,
+            "steady_state": true
+          },
+          "bwd_deterministic_wrapper_ms": {
+            "mean_ms": 0.0943,
+            "median_ms": 0.08993,
+            "min_ms": 0.08858,
+            "max_ms": 0.94811,
+            "n": 200,
+            "steady_state": true
+          }
+        }
+      ]
+    }
+  ],
+  "schema_version": 1,
+  "git_sha": "6e90baf110e78f3063fe26627e23068d9db8f4f1",
+  "status": "GREEN",
+  "producer": {
+    "path": "crates/jammi-kernels/tests/flash_decisive_timing.rs",
+    "kind": "cargo-test",
+    "invocation": "cargo test -p jammi-kernels --release --features flash-attn --test flash_decisive_timing -- --ignored --exact decisive_timing_measurement",
+    "gating": "#[ignore]"
+  }
+}

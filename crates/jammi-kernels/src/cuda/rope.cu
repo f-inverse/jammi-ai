@@ -19,6 +19,7 @@
 // ceiling, not a hardware one).
 #include <cuda_bf16.h>
 #include <cstddef>
+#include "rope_common.cuh"
 
 extern "C" __global__ void rope_fwd_f32(
     const float* x, const float* cos_t, const float* sin_t, float* out,
@@ -37,7 +38,7 @@ extern "C" __global__ void rope_fwd_f32(
         float rh = (col < half) ? -x[row_base + col + half] : x[row_base + col - half];
         float c = cos_t[table_base + col];
         float s = sin_t[table_base + col];
-        out[i] = xv * c + rh * s * sign;
+        out[i] = rope_rotate(xv, rh, c, s, sign);
     }
 }
 
@@ -59,6 +60,6 @@ extern "C" __global__ void rope_fwd_bf16(
                                  : __bfloat162float(x[row_base + col - half]);
         float c = __bfloat162float(cos_t[table_base + col]);
         float s = __bfloat162float(sin_t[table_base + col]);
-        out[i] = __float2bfloat16(xv * c + rh * s * sign);
+        out[i] = __float2bfloat16(rope_rotate(xv, rh, c, s, sign));
     }
 }

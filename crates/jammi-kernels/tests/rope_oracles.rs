@@ -643,7 +643,7 @@ fn eager_vs_fused_bf16_fwd_and_bwd_at_production_amplitude_vs_independent_f64_tr
     let sin_bf = Tensor::from_slice(&sb, (1, 1, seq, hidden), &device).unwrap();
 
     let out_fused = fused(false, &x_fused, &cos_bf, &sin_bf).unwrap();
-    let out_eager = eager(&x_eager, &cos_bf, &sin_bf).unwrap();
+    let out_eager = formula(&x_eager, &cos_bf, &sin_bf).unwrap();
     let fwd_fused: Vec<bf16> = out_fused.flatten_all().unwrap().to_vec1().unwrap();
     let fwd_eager: Vec<bf16> = out_eager.flatten_all().unwrap().to_vec1().unwrap();
 

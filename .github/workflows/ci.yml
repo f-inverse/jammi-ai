@@ -858,6 +858,49 @@ jobs:
           - name: CUDA run artifact schema
             cmd: python3 ci/scripts/check_cuda_run_artifacts.py
             fetch_depth: "0"
+          # Rule (h): every numeric token in an in-scope pipe table under
+          # docs/maintainer/** or docs/plans/61-perf-unification/** must be
+          # excluded (a shape label, issue ref, version string, ledger
+          # cite, or date — never a plain measurement), bound by a
+          # `<!-- claims: c1=<expr>; ... -->` tag resolving to a tracked
+          # cuda-run/baseline artifact at Decimal/ROUND_HALF_EVEN string
+          # equality, or escaped via the bare `ledger` marker plus a
+          # committed ci/perf_claims_allowlist.txt entry. Hermetic: reads
+          # tracked files only, shells out only to `git ls-files` — the
+          # normal shallow checkout suffices, matching the sibling
+          # `check_citations.py` leg's own comment on this point.
+          - name: perf claims
+            cmd: python3 ci/scripts/check_perf_claims.py
+          - name: perf claims self-test
+            cmd: python3 ci/scripts/check_perf_claims.py --self-test
+          # ci/perf_claims_allowlist.txt is only-shrinks, mechanically —
+          # the exact `check_doc_numbers_have_producers.py` ratchet shape
+          # (ac2c5cb) reused verbatim in behaviour: fetches origin/main
+          # (fails CLOSED on a failed fetch or an unresolvable ref) and
+          # fails on any entry this branch ADDS relative to it. Bootstrap
+          # (no allowlist file on origin/main yet) is the one PR
+          # introducing it.
+          - name: perf claims allowlist only shrinks
+            cmd: python3 ci/scripts/check_perf_claims.py --check-allowlist-only-shrinks
+          # F1, amended (audit A4; docs/plans/61-perf-unification/CONTRACT.md
+          # §6): the bind-rate floor is a STANDING RATCHET, not a PR-body
+          # number — "'>= 1 fully-bound table AND V >= 50 AND the ledger may
+          # only shrink' (the shrink half is the leg above)". This leg fails
+          # the moment either floor is missed, e.g. a retag that moves a
+          # bound cell to `ledger` without a compensating new bind elsewhere.
+          - name: perf claims bind-rate floor (F1)
+            cmd: python3 ci/scripts/check_perf_claims.py --report --min-fully-bound=1 --min-v=50
+          # Round-4 audit acceptance (1): the free-bind-evasion regression
+          # oracle over the REAL tracked cuda-run tree (not just the nine
+          # guide tables) — every structurally plausible diff/ratio/pct
+          # operand pair (two sibling containers sharing a leaf sub-path)
+          # whose free VALUE reproduces a declared delta*/ratio*/speedup*/
+          # *_pct/spread* field must be caught by the real evaluate_expr
+          # path. Reproduces and closes the class an adversarial sweep
+          # found 172 live instances of under the prior identity-based
+          # mechanism (rounds 2-3).
+          - name: perf claims sweep
+            cmd: python3 ci/scripts/check_perf_claims.py --sweep
           # Mocks-only, no-network regression suite for the 2026-08-25
           # gpu-dev pod-lifecycle incident (ledger rows 279-289) and the
           # mechanism defects three follow-up audit rounds found in this

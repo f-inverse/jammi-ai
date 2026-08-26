@@ -1,0 +1,84 @@
+{
+  "engine_version": "0.47.0",
+  "host": {
+    "logical_cpus": 15,
+    "total_ram_mib": 2051942
+  },
+  "subcommand": "finetune-step",
+  "tiers": {
+    "finetune_step": {
+      "device": "cuda:0",
+      "device_name": "NVIDIA A100-SXM4-80GB",
+      "backbone_dtype": "bf16",
+      "batch": 8,
+      "seq": 512,
+      "lora_rank": 16,
+      "lora_dropout": 0.0,
+      "target_modules": [
+        "Wqkv",
+        "Wo",
+        "Wi"
+      ],
+      "batched_forward": true,
+      "trainable_tensors": 224,
+      "steps_measured": 25,
+      "ln_fused_dispatches": 1710,
+      "ln_eager_dispatches": 0,
+      "rope_fused_dispatches": 0,
+      "rope_eager_dispatches": 0,
+      "softmax_fused_dispatches": 0,
+      "softmax_eager_dispatches": 0,
+      "geglu_fused_dispatches": 840,
+      "geglu_eager_dispatches": 0,
+      "lora_epilogue_fused_dispatches": 0,
+      "lora_epilogue_eager_dispatches": 0,
+      "lora_linear_fused_dispatches": 3360,
+      "lora_linear_eager_dispatches": 0,
+      "attention_block_fused_dispatches": 840,
+      "attention_block_eager_dispatches": 0,
+      "attention_block_flash_fused_dispatches": 0,
+      "attention_block_flash_declined_dispatches": 840,
+      "flash_compiled": true,
+      "kernels_disabled_requested": [
+        "attention_block_flash"
+      ],
+      "kernels_disabled_fired": [
+        "attention_block_flash"
+      ],
+      "s_per_step_p50": {
+        "value": 0.676374388,
+        "unit": "s"
+      },
+      "s_per_step_mean": {
+        "value": 0.6764986669599999,
+        "unit": "s"
+      },
+      "steps_per_s": {
+        "value": 1.4784711215292201,
+        "unit": "steps/s"
+      },
+      "triplets_per_s": {
+        "value": 11.827768972233761,
+        "unit": "triplets/s"
+      },
+      "peak_rss_bytes": {
+        "value": 1884659712.0,
+        "unit": "bytes"
+      },
+      "peak_vram_bytes": {
+        "value": 16292773888.0,
+        "unit": "bytes"
+      }
+    }
+  },
+  "schema_version": 1,
+  "git_sha": "b98f7e1de35b5cfcac00325089fd5eeaf7c6259a",
+  "box": "a100b",
+  "status": "GREEN",
+  "producer": {
+    "path": "crates/jammi-bench/src/finetune_step.rs",
+    "kind": "script",
+    "invocation": "jammi-bench finetune-step --model-dir /root/checkpoints/ModernBERT-large --batch 8 --steps 25 --warmup 5 --backbone-dtype bf16 --cuda 0 --seed 42 --batched-forward --target-modules Wqkv,Wo,Wi --lora-rank 8 --lora-alpha 16.0 --lora-dropout 0.05 (JAMMI_KERNELS_STRICT=1)",
+    "gating": "none"
+  }
+}

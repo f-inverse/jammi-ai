@@ -2,7 +2,7 @@
 
 Binding order: `README.md` (lead resolutions) → `DESIGN-STUDY.md` → `PRESSURE.md`. Phase 4
 (`ServerInfo` static-build-identity fields) and phase 5 (a held-out-loss acceptance statistic) are
-NOT in this unit; this contract records their front-door preconditions (C16, C17) only.
+NOT in this unit; this contract records their front-door preconditions (C15, C16) only.
 
 ## Frame
 

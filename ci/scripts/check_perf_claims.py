@@ -133,7 +133,9 @@ leaf's value equals the free result — same sign, opposite sign, or after a
 `×1000`/`÷1000`/`÷1e9`/`×1e9` unit rescale (`s<->ms`, `bytes<->GB` — round-5
 advisory: the prior scale set was asymmetric, missing `×1e9`) — within a
 5e-4 RELATIVE tolerance (`_value_matches_any_scale`/`_values_match`, THE
-PRODUCTION matcher). ANY match is a FINDING naming the matched field's own
+PRODUCTION matcher) — EXCLUDING the operand leaves themselves (`same_quantity_field`'s
+own `operand_pointers` check), so a bare pointer's tag can never flag itself as a
+'match' against its own value. ANY match is a FINDING naming the matched field's own
 pointer, REGARDLESS of which two leaves produced either number — a
 coincidental match is still reported, on purpose, so a human decides
 "point at it" or "ledger this cell, it's a coincidence," never a silent
@@ -275,8 +277,15 @@ EXPECTED_DENOMINATOR = 242
 # so `uncaught == 0` alone does not catch it (0 candidates -> 0 uncaught
 # trivially); this floor does. Bump ONLY deliberately, after confirming
 # why the population grew (a new artifact, a new computed field) — a drop
-# below this number is itself a finding.
-EXPECTED_SWEEP_MATCHES = 105
+# below this number is itself a finding. round-6 audit fix: the real
+# measured population (`--sweep` over the current tracked tree, after the
+# class-A scale-factor fix) is 416 — this floor is set BELOW that
+# (round-5's own "zero margin" floor = measured was itself flagged as
+# brittle) so ordinary, expected run-to-run noise in which SPECIFIC
+# coincidental matches land inside 5e-4 tolerance does not itself red the
+# gate; a real regression (a mutated/narrowed matcher) drops the count far
+# below this margin, not by one or two.
+EXPECTED_SWEEP_MATCHES = 400
 
 ALLOWLIST_PATH = REPO_ROOT / "ci" / "perf_claims_allowlist.txt"
 CLASSIFICATION_PATH = REPO_ROOT / "ci" / "perf_claims_allowlist_classification.md"
@@ -646,20 +655,35 @@ def _rfc6901_walk(doc, pointer: str):
 
 _COMPUTED_FIELD_RE = re.compile(r"^(delta|ratio|speedup).*$|.*_pct$|^spread.*$")
 
-# round-4 audit rewrite: VALUE-based precedence. 5e-4 relative tolerance;
-# a free result is tried at its own scale, x1000/-x1000 (s<->ms), and
-# /=1e9 / x=1e9 (bytes<->GB — round-5 advisory: the prior set was
-# asymmetric, missing x1e9 for a GB-native free result matching a
-# bytes-native field) — both sign directions, since a delta's stored sign
-# convention need not match a free diff's natural (A-B) sign.
+# round-6 audit fix (class A): the scale set MUST be derived from the
+# grammar's OWN unit factors (`_UNIT_FACTORS` — ms/s/GB/GiB/MiB/%), not a
+# hand-picked subset — an earlier set covered only s<->ms and bytes<->GB,
+# so `ratio(...) as %` (or `as GiB`/`as MiB`) could evade precedence
+# entirely: the PRE-unit raw value (e.g. a raw fraction ~0.0623) never
+# gets compared against a stored `_pct` field (e.g. 6.232) unless x100 is
+# among the tried scales. 745 live uncaught free binds on the tracked
+# tree (686 `%`, 32 GiB, 27 MiB) before this fix. Every direct unit
+# factor, its reciprocal, and every PAIRWISE ratio between two unit
+# factors is included, so "raw is in unit A's native scale, candidate is
+# stated in unit B" is covered for every (A, B) pair the grammar can
+# express — not only the pairs a previous round happened to think of.
 _VALUE_REL_TOL = Decimal("0.0005")
-_VALUE_SCALE_FACTORS = (
-    Decimal(1),
-    Decimal(1000),
-    Decimal(1) / Decimal(1000),
-    Decimal(1) / Decimal(10**9),
-    Decimal(10**9),
-)
+
+
+def _derive_value_scale_factors(base_values: tuple[Decimal, ...]) -> tuple[Decimal, ...]:
+    factors: set[Decimal] = {Decimal(1)}
+    for f in base_values:
+        factors.add(f)
+        if f != 0:
+            factors.add(Decimal(1) / f)
+    for f1 in base_values:
+        for f2 in base_values:
+            if f2 != 0:
+                factors.add(f1 / f2)
+    return tuple(sorted(factors))
+
+
+_VALUE_SCALE_FACTORS = _derive_value_scale_factors(tuple(_UNIT_FACTORS.values()))
 
 
 def _values_match(a: Decimal, b: Decimal, rel_tol: Decimal = _VALUE_REL_TOL) -> bool:
@@ -697,13 +721,35 @@ def _value_matches_any_scale(free_value: Decimal, candidate: Decimal) -> bool:
 # population right alongside its catch rate, so a fully-broken matcher
 # (e.g. one that always returns False) could still print "0 candidates,
 # 0 uncaught" and look clean.
-_REFERENCE_SCALE_FACTORS = (
-    Decimal(1),
-    Decimal(1000),
-    Decimal(1) / Decimal(1000),
-    Decimal(1) / Decimal(10**9),
-    Decimal(10**9),
+# round-6 audit fix (class A): a SEPARATE derivation function (never
+# calling `_derive_value_scale_factors`, and never importing
+# `_UNIT_FACTORS` — its own independently-typed-out base values below),
+# covering the SAME mathematical set: every direct unit factor, its
+# reciprocal, and every pairwise cross-unit ratio.
+_REFERENCE_BASE_UNIT_VALUES = (
+    Decimal(1000),  # ms
+    Decimal(1),  # s
+    Decimal(1) / Decimal(10**9),  # GB
+    Decimal(1) / Decimal(2**30),  # GiB
+    Decimal(1) / Decimal(2**20),  # MiB
+    Decimal(100),  # %
 )
+
+
+def _build_reference_scale_factors() -> tuple[Decimal, ...]:
+    out: set[Decimal] = {Decimal(1)}
+    for f in _REFERENCE_BASE_UNIT_VALUES:
+        out.add(f)
+        if f != 0:
+            out.add(Decimal(1) / f)
+    for f1 in _REFERENCE_BASE_UNIT_VALUES:
+        for f2 in _REFERENCE_BASE_UNIT_VALUES:
+            if f2 != 0:
+                out.add(f1 / f2)
+    return tuple(sorted(out))
+
+
+_REFERENCE_SCALE_FACTORS = _build_reference_scale_factors()
 _REFERENCE_REL_TOL = Decimal("0.0005")
 
 
@@ -1189,7 +1235,9 @@ def parse_string_fields_registry() -> dict[tuple[str, str], str]:
     return out
 
 
-def check_string_field_registry() -> list[str]:
+def check_string_field_registry(
+    tracked: set[str] | None = None, loader: "Loader | None" = None
+) -> list[str]:
     """round-5 audit fix (class A): every string-valued leaf in the
     tracked tree whose key matches the computed-family pattern must be
     registered in STRING_FIELDS_PATH — an unregistered one (growth) is a
@@ -1197,10 +1245,20 @@ def check_string_field_registry() -> list[str]:
     round-4 value rule structurally cannot see (value equality cannot be
     tested against free text). A registered entry that no longer exists
     as a string leaf (the field was removed, or became numeric) is ALSO a
-    named problem — the registry must track reality, not accumulate."""
-    registry = parse_string_fields_registry()
-    tracked = tracked_files()
-    loader = Loader(tracked=tracked, string_registry=registry)
+    named problem — the registry must track reality, not accumulate.
+    round-6 audit fix (class B): `tracked`/`loader` are injectable (never
+    used by production, which always passes neither) so `--self-test` can
+    plant a fixture string leaf on a fake tracked-path WITHOUT touching
+    the real committed registry or filesystem — this function had NO
+    oracle at all before round 6: unwiring its call from `scan_tree`, or
+    mutating its body to `return []`, left every gate green."""
+    if tracked is None:
+        tracked = tracked_files()
+    if loader is None:
+        registry = parse_string_fields_registry()
+        loader = Loader(tracked=tracked, string_registry=registry)
+    else:
+        registry = loader.string_field_registry()
     problems: list[str] = []
     seen: set[tuple[str, str]] = set()
     for rel in sorted(tracked):
@@ -1856,6 +1914,53 @@ def self_test() -> int:
         _value_matches_any_scale(Decimal("0.302"), Decimal("302000000")),
     )
 
+    # --- REQUIRED FIXTURE 8 (round-6 acceptance, class A): the REAL
+    # `as %` evasion the audit drove through the real scan_table --
+    # `ratio(...delta_ms, ...fused_r1) as %` binds V=1, findings=0 while
+    # reproducing that object's own delta_pct to 14 digits, because the
+    # PRE-unit raw ratio (~0.0623) was never rescaled by x100 before being
+    # compared. Uses the real cast-w1 numbers. 745 live uncaught free
+    # binds on the tracked tree before this fix (% 686, GiB 32, MiB 27). ---
+    as_pct_doc = {
+        "deltas": {
+            "b8_s512_p50_ms": {
+                "delta_ms": Decimal("39.565658"),
+                "delta_pct": Decimal("6.232281178157861"),
+            }
+        },
+        "legs": {"b8_s512_fused_r1": {"s_per_step_p50": Decimal("0.634850336")}},
+    }
+    loader_as_pct = _mem_loader(as_pct_doc)
+    as_pct_expr = parse_expr(
+        "ratio(fixture.json#/deltas/b8_s512_p50_ms/delta_ms,"
+        "fixture.json#/legs/b8_s512_fused_r1/s_per_step_p50) as %"
+    )
+    try:
+        val, _ = evaluate_expr(as_pct_expr, loader_as_pct)
+        failures.append(
+            f"self-test FAILED (REQUIRED FIXTURE 8, as %% evasion): bound FREELY to {val} "
+            "— the real live class-A evasion the round-6 audit drove through scan_table"
+        )
+    except ClaimParseError as exc:
+        check(
+            "ratio(...) as %% is caught by the whole-expr-tree value rule, names delta_pct",
+            "delta_pct" in str(exc),
+        )
+    # a GiB-wrapped free result is caught too (same class, same fix): the
+    # RAW free result is in bytes; the declared field is stated in GiB.
+    as_gib_doc = {
+        "a": {"peak_bytes": Decimal("324398043136")},
+        "b": {"peak_bytes": Decimal("0")},
+        "spread_peak_gib": Decimal("302.0"),
+    }
+    loader_as_gib = _mem_loader(as_gib_doc)
+    as_gib_expr = parse_expr("diff(fixture.json#/a/peak_bytes,fixture.json#/b/peak_bytes) as GiB")
+    try:
+        evaluate_expr(as_gib_expr, loader_as_gib)
+        failures.append("self-test FAILED (as GiB evasion): bound freely, not caught")
+    except ClaimParseError as exc:
+        check("diff(...) as GiB is caught by the whole-expr-tree value rule", "spread_peak_gib" in str(exc))
+
     # --- round-5 advisory: a zero denominator is a ClaimParseError naming
     # the offending pointer, never a raw decimal.DivisionByZero crash
     # (1,390 zero-valued leaves live in the tracked tree). ---
@@ -2108,6 +2213,40 @@ def self_test() -> int:
     check(
         "an allowlist entry missing its classification row is a named problem",
         any("has no classification row" in p for p in problems_cls),
+    )
+
+    # --- round-6 audit fix (class B): check_string_field_registry had NO
+    # oracle at all — M12 (unwiring its call from scan_tree) and M13
+    # (mutating it to `return []`) both left every gate green. Two
+    # fixtures: (i) the FUNCTION's own correctness, on a planted fixture
+    # leaf under a fake but POINTER_ROOTS-shaped tracked path, injected
+    # via the loader/tracked params (never touching the real committed
+    # registry or filesystem); (ii) that scan_tree ACTUALLY CALLS it
+    # (wiring), verified by substituting the module-level function with a
+    # sentinel and confirming scan_tree's own scope_problems propagate it. ---
+    fake_string_path = "crates/jammi-kernels/artifacts/cuda-runs/__self_test_string_field_fixture__.json"
+    fake_string_doc = {"some": {"delta_gb": "1.0-2.0 GB (unregistered on purpose)"}}
+    fake_string_loader = Loader(tracked={fake_string_path}, string_registry={})
+    fake_string_loader._check_path = lambda path: None  # type: ignore[method-assign]
+    fake_string_loader._cache[fake_string_path] = fake_string_doc
+    problems_string = check_string_field_registry(tracked={fake_string_path}, loader=fake_string_loader)
+    check(
+        "an UNREGISTERED string-valued computed field on a tracked-path fixture is one "
+        "named problem (M13 regression: mutating the function to `return []` misses this)",
+        len(problems_string) == 1 and fake_string_path in problems_string[0] and "delta_gb" in problems_string[0],
+    )
+
+    _module = sys.modules[__name__]
+    _original_check_string_field_registry = _module.check_string_field_registry
+    _module.check_string_field_registry = lambda: ["__ROUND6_WIRING_SENTINEL__"]
+    try:
+        _, _, wiring_scope_problems = scan_tree()
+    finally:
+        _module.check_string_field_registry = _original_check_string_field_registry
+    check(
+        "check_string_field_registry is WIRED into scan_tree's scope_problems (M12 "
+        "regression: unwiring the call leaves the sentinel — and any real problem — invisible)",
+        "__ROUND6_WIRING_SENTINEL__" in wiring_scope_problems,
     )
 
     if failures:

@@ -103,6 +103,199 @@ fn exact_fixture(n: usize, phase: i64) -> Vec<f32> {
         .collect()
 }
 
+// =========================================================================
+// Discriminating-backward toolkit (test/cuda-parity-discriminating-backward).
+//
+// Every `assert_*_parity_bf16`/`assert_*_parity_f32` leg below used to seed
+// `.backward()` either directly on a non-scalar root or via `sum_all()`
+// (both are the SAME implicit all-ones cotangent `Tensor::backward()`
+// assigns a non-scalar root). Under `dy == 1`, `round(dy * x)` collapses to
+// `round(x)`, hiding a rounding-PLACEMENT defect (round-the-product vs
+// round-the-factor — esc-045 rounds 2/3, GH#374, commits 16a1699/50ef2ae);
+// worse, for an op whose backward formula involves centering (LayerNorm's
+// `dy - mean(dy) - xhat*mean(dy*xhat)`), `dy == 1` makes the WHOLE gradient
+// analytically zero (`mean(1) == 1`, `mean(1*xhat) == mean(xhat) == 0`), so
+// the parity check compares `0.0` to `0.0` and proves nothing regardless of
+// what the kernel computes (family F: a non-vacuous control). Every leg
+// below instead seeds with [`cotangent_fixture`] — fixed, sign-mixed,
+// production-amplitude — via `(&out * &dy).sum_all().backward()`.
+//
+// Bounds moved from an absolute-with-hardcoded-floor
+// (`k * ulp * c.abs().max(g).max(1.0)`, guide §3.8: a max-keyed floor
+// charges every element the largest's allowance) to a strictly PER-ELEMENT
+// relative bound keyed to that element's own reference magnitude, floored
+// (only for near-zero references) at a value MEASURED from this run's own
+// data, never a constant.
+
+/// A small, fixed-seed xorshift64 PRNG (Marsaglia 2003) — deterministic and
+/// platform-independent (integer-only, no libm), so this file owns and can
+/// re-seed its own cotangent fixtures bit-for-bit (family J) rather than
+/// depending on an external crate's algorithm version.
+struct XorShift64(u64);
+
+impl XorShift64 {
+    fn new(seed: u64) -> Self {
+        // xorshift64 requires a nonzero state; a fixed nonzero constant
+        // keeps `seed == 0` a valid, still-deterministic call.
+        Self(if seed == 0 {
+            0x9E37_79B9_7F4A_7C15
+        } else {
+            seed
+        })
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    /// A deterministic `f32` uniform in `[-amplitude, amplitude]` — sign-
+    /// mixed BY CONSTRUCTION (drawn uniformly over the signed range, not
+    /// `abs()`'d and negated by index parity, which would correlate sign
+    /// with position and let a sign-flip defect hide behind an even/odd
+    /// pattern).
+    fn next_f32_signed(&mut self, amplitude: f32) -> f32 {
+        let unit = ((self.next_u64() >> 40) as f32) / (1u64 << 24) as f32;
+        (unit * 2.0 - 1.0) * amplitude
+    }
+}
+
+/// A fixed-seed, sign-mixed, production-amplitude backward cotangent — see
+/// this section's header doc for why it replaces every implicit-ones
+/// `.backward()`/`sum_all().backward()` seed below.
+fn cotangent_fixture(n: usize, seed: u64, amplitude: f32) -> Vec<f32> {
+    let mut rng = XorShift64::new(seed);
+    (0..n).map(|_| rng.next_f32_signed(amplitude)).collect()
+}
+
+/// The smallest STRICTLY POSITIVE `|reference|` this run's own comparison
+/// array produced, or (if every element measured as exact zero) the
+/// smallest representable positive `bf16` magnitude — a same-run MEASURED
+/// floor (guide §3.2), never a hardcoded tolerance constant. Used only to
+/// keep a near-zero reference's `ulp`-based allowance from underflowing to
+/// an unreasonably tight bound; every nonzero-reference element still gets
+/// its OWN magnitude's allowance (guide §3.8 — a max-keyed floor charges
+/// every element the largest's allowance and hides the divergence being
+/// hunted).
+fn measured_near_zero_floor(reference: &[f32]) -> f32 {
+    let smallest_nonzero = reference
+        .iter()
+        .map(|v| v.abs())
+        .filter(|v| *v > 0.0)
+        .fold(f32::INFINITY, f32::min);
+    if smallest_nonzero.is_finite() {
+        smallest_nonzero
+    } else {
+        bf16::from_bits(1).to_f32()
+    }
+}
+
+/// `k` bf16 ULPs of `reference`'s own magnitude (floored at `floor` for a
+/// near-zero reference) — the shared bound every `assert_*_parity_bf16` leg
+/// in this file calls, per element (never `k * ulp(max)`; see [`bf16_ulp`]
+/// and guide §3.8). `k = 1` for a leg whose op composes as a single
+/// f32-accumulate-then-round-once (bit-exact-expected past ordinary fmad-
+/// contraction noise); `k = 2` where a documented cross-platform libm call
+/// or an extra chained rounding sits in the composition (cited at the call
+/// site).
+fn bf16_relative_bound(reference: f32, floor: f32, k: f32) -> f32 {
+    k * bf16_ulp(reference.abs().max(floor))
+}
+
+/// One f32 ULP at `|x|` (`2^(e - 23)`, f32's 23 explicit mantissa bits),
+/// floored at f32's smallest subnormal at exact zero — the f32 analogue of
+/// [`bf16_ulp`].
+fn f32_ulp(x: f32) -> f32 {
+    let x = x.abs();
+    if x == 0.0 || !x.is_finite() {
+        return f32::from_bits(1);
+    }
+    let e = ((x.to_bits() >> 23) & 0xff) as i32 - 127;
+    2f32.powi((e - 23).max(-149))
+}
+
+/// `k` f32 ULPs of `reference`'s own magnitude (floored, same rationale as
+/// [`bf16_relative_bound`]) — nvcc's `--fmad=true` may contract `a*b+c`
+/// into one hardware-rounded FMA on the GPU where the CPU performs two
+/// separately-rounded operations, differing by up to ~1 ULP (see
+/// [`F32_TOL`]'s doc); `k` absorbs that plus the op's own reduction depth,
+/// never a hardcoded absolute constant.
+fn f32_relative_bound(reference: f32, floor: f32, k: f32) -> f32 {
+    k * f32_ulp(reference.abs().max(floor))
+}
+
+/// Counts elements where `|reference - actual|` exceeds `bound_fn`'s
+/// per-element allowance, OR `actual` is non-finite (guide §3.7: a
+/// non-finite actual must count as a violation, never silently pass a
+/// naive `>` comparison).
+fn count_bound_violations(
+    reference: &[f32],
+    actual: &[f32],
+    bound_fn: impl Fn(f32) -> f32,
+) -> usize {
+    reference
+        .iter()
+        .zip(actual.iter())
+        .filter(|(c, g)| !(g.is_finite() && (**c - **g).abs() <= bound_fn(**c)))
+        .count()
+}
+
+/// The shared discriminating-oracle tail every rewritten leg below calls
+/// right after its own affirmative per-element pass loop: first prove the
+/// unperturbed comparison is clean (a discriminating proof against an
+/// already-red leg means nothing), then push the reference's LARGEST-
+/// magnitude element's paired actual value to exactly `bound_fn(reference)
+/// + one ULP` beyond `reference` and prove the SAME bound this leg just
+/// used now flags exactly that one element.
+///
+/// This is NOT "flip the actual value's own least-significant bit and
+/// hope": this leg's clean run may already sit anywhere in
+/// `[0, bound_fn(reference))` (ordinary fmad/rounding-order noise), so a
+/// single literal one-ULP bit-flip on top of an unknown existing residual
+/// is not guaranteed to cross the bound (e.g. a residual at `0.5 *
+/// bound_fn` plus a one-ULP nudge can still land under `bound_fn`) — a
+/// FALSE negative that would make this proof flaky rather than
+/// deterministic. Pushing to `bound_fn(reference) + margin` instead is
+/// robust to whatever the clean residual actually measured, while
+/// `margin` (`bf16_ulp`/`f32_ulp` at this leg's own dtype) still keys the
+/// "how far past the edge" amount to one ULP, not an arbitrary constant.
+fn assert_bound_discriminates(
+    reference: &[f32],
+    actual: &[f32],
+    bound_fn: impl Fn(f32) -> f32,
+    margin_fn: impl Fn(f32) -> f32,
+    label: &str,
+) {
+    let clean = count_bound_violations(reference, actual, &bound_fn);
+    assert_eq!(
+        clean, 0,
+        "{label}: the clean (unperturbed) comparison must be GREEN before a discriminating \
+         proof against it means anything (found {clean} violations)"
+    );
+    let idx = reference
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.abs().total_cmp(&b.abs()))
+        .map(|(i, _)| i)
+        .unwrap_or_else(|| panic!("{label}: reference must be nonempty"));
+    let mut poisoned = actual.to_vec();
+    let r = reference[idx];
+    let push = bound_fn(r) + margin_fn(r);
+    poisoned[idx] = if actual[idx] >= r { r + push } else { r - push };
+    let red = count_bound_violations(reference, &poisoned, &bound_fn);
+    assert_eq!(
+        red, 1,
+        "{label}: an actual value pushed to `bound + 1ulp` beyond reference at index {idx} \
+         (the largest-magnitude reference element, value {r}) must be caught by this leg's own \
+         bound — the bound is not actually enforced (found {red} violations, expected exactly \
+         1)"
+    );
+}
+
 fn assert_parity_f32(cuda: &Device, alpha: f64, xv: &[f32], yv: &[f32]) {
     let cpu = Device::Cpu;
     let n = xv.len();
@@ -406,12 +599,10 @@ fn assert_ln_parity_f32(
     let x_cpu = Var::from_tensor(&Tensor::from_slice(xv, (rows, hidden), &cpu).unwrap()).unwrap();
     let g_cpu = Var::from_tensor(&Tensor::from_slice(gv, (hidden,), &cpu).unwrap()).unwrap();
     let out_cpu = ln_forward(eps, true, &x_cpu, &g_cpu).unwrap();
-    let grads_cpu = out_cpu.backward().unwrap();
 
     let x_gpu = Var::from_tensor(&Tensor::from_slice(xv, (rows, hidden), cuda).unwrap()).unwrap();
     let g_gpu = Var::from_tensor(&Tensor::from_slice(gv, (hidden,), cuda).unwrap()).unwrap();
     let out_gpu = ln_forward(eps, true, &x_gpu, &g_gpu).unwrap();
-    let grads_gpu = out_gpu.backward().unwrap();
 
     let out_cpu_v: Vec<f32> = out_cpu.flatten_all().unwrap().to_vec1().unwrap();
     let out_gpu_v: Vec<f32> = out_gpu
@@ -423,12 +614,40 @@ fn assert_ln_parity_f32(
         .unwrap();
     assert_eq!(out_cpu_v.len(), n);
     assert_eq!(out_gpu_v.len(), n, "LN GPU fwd length mismatch");
+    // `k = 2 * hidden`: `mean`/`var` both reduce over `hidden`, same
+    // Higham-shaped, amplitude-scaled rationale as `dx`'s bound below.
+    let out_floor = measured_near_zero_floor(&out_cpu_v);
+    let out_bound = |r: f32| f32_relative_bound(r, out_floor, 2.0 * hidden as f32);
     for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
         assert!(
-            ((*c - *g).abs() as f64) <= F32_TOL,
+            g.is_finite() && (*c - *g).abs() <= out_bound(*c),
             "ln fwd[{i}]: cpu {c} vs cuda {g} (rows={rows}, hidden={hidden})"
         );
     }
+    assert_bound_discriminates(&out_cpu_v, &out_gpu_v, out_bound, f32_ulp, "ln f32 fwd");
+
+    // Sign-mixed, production-amplitude cotangent, never the implicit ones
+    // `.backward()` assigns a non-scalar root — under `dy == 1`, LN's own
+    // backward formula (`dy - mean(dy) - xhat*mean(dy*xhat)`) is
+    // ANALYTICALLY ZERO (`mean(1) == 1`, `mean(xhat) == 0`), so a naive
+    // `out.backward()` here compares `0.0` to `0.0` and proves nothing
+    // about `bwd` regardless of what the kernel computes (family F). See
+    // this file's discriminating-backward toolkit header doc.
+    let dyv = cotangent_fixture(n, 0xDA57_1D5E_2000_0001, 3.0);
+    let dy_cpu = Tensor::from_slice(&dyv, (rows, hidden), &cpu).unwrap();
+    let dy_gpu = Tensor::from_slice(&dyv, (rows, hidden), cuda).unwrap();
+    let grads_cpu = (&out_cpu * &dy_cpu)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .backward()
+        .unwrap();
+    let grads_gpu = (&out_gpu * &dy_gpu)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .backward()
+        .unwrap();
 
     let dx_cpu: Vec<f32> = grads_cpu
         .get(&x_cpu)
@@ -448,12 +667,31 @@ fn assert_ln_parity_f32(
         .unwrap();
     assert_eq!(dx_cpu.len(), n);
     assert_eq!(dx_gpu.len(), n, "LN GPU dx length mismatch");
+    let dx_norm: f64 = dx_cpu.iter().map(|&v| (v as f64) * (v as f64)).sum();
+    assert!(
+        dx_norm.sqrt() > 1e-3,
+        "CPU dx must be measured-nonzero (norm {}) — a vacuous all-zero reference would make \
+         the parity loop below prove nothing",
+        dx_norm.sqrt()
+    );
+    // `k = 2 * hidden`: `dx` reduces `mean(dy*gamma)` and `mean(dy*gamma*xhat)`
+    // over `hidden` (Higham Thm 4.2 shape, `lora_linear_parity_tolerance`'s
+    // own citation) PLUS the `rsqrtf()` vs `1.0/sqrt()` divergence this
+    // function's bf16 sibling documents — an n-scaled ULP allowance, never
+    // a hardcoded absolute constant. Still, at this file's amplitudes,
+    // orders of magnitude tighter than the `1e-4` absolute bound it
+    // replaces (`ulp(1.0) * 2 * 1024 ~= 2.4e-4`... at hidden=1024 comparable,
+    // but SCALES DOWN with hidden, unlike a flat constant, and the
+    // discriminating proof below confirms it still catches a single ULP).
+    let dx_floor = measured_near_zero_floor(&dx_cpu);
+    let dx_bound = |r: f32| f32_relative_bound(r, dx_floor, 2.0 * hidden as f32);
     for (i, (c, g)) in dx_cpu.iter().zip(dx_gpu.iter()).enumerate() {
         assert!(
-            ((*c - *g).abs() as f64) <= F32_TOL,
+            g.is_finite() && (*c - *g).abs() <= dx_bound(*c),
             "ln dx[{i}]: cpu {c} vs cuda {g}"
         );
     }
+    assert_bound_discriminates(&dx_cpu, &dx_gpu, dx_bound, f32_ulp, "ln f32 dx");
 
     let dg_cpu: Vec<f32> = grads_cpu.get(&g_cpu).unwrap().to_vec1().unwrap();
     let dg_gpu: Vec<f32> = grads_gpu
@@ -465,12 +703,16 @@ fn assert_ln_parity_f32(
         .unwrap();
     assert_eq!(dg_cpu.len(), hidden);
     assert_eq!(dg_gpu.len(), hidden, "LN GPU dgamma length mismatch");
+    // `dgamma` reduces over `rows`, not `hidden`.
+    let dg_floor = measured_near_zero_floor(&dg_cpu);
+    let dg_bound = |r: f32| f32_relative_bound(r, dg_floor, 2.0 * rows as f32);
     for (i, (c, g)) in dg_cpu.iter().zip(dg_gpu.iter()).enumerate() {
         assert!(
-            ((*c - *g).abs() as f64) <= F32_TOL,
+            g.is_finite() && (*c - *g).abs() <= dg_bound(*c),
             "ln dgamma[{i}]: cpu {c} vs cuda {g}"
         );
     }
+    assert_bound_discriminates(&dg_cpu, &dg_gpu, dg_bound, f32_ulp, "ln f32 dgamma");
 }
 
 fn assert_ln_parity_bf16(
@@ -485,16 +727,29 @@ fn assert_ln_parity_bf16(
     let n = rows * hidden;
     let xb: Vec<bf16> = xv.iter().map(|&v| bf16::from_f32(v)).collect();
     let gb: Vec<bf16> = gv.iter().map(|&v| bf16::from_f32(v)).collect();
+    // Sign-mixed, production-amplitude cotangent — see `assert_ln_parity_f32`'s
+    // identical note: `dy == 1` makes LN's own backward formula analytically
+    // zero, a vacuous control regardless of dtype.
+    //
+    // `k = 2` below (not `1`): the CPU op computes `invvar` as
+    // `1.0 / (var + eps).sqrt()` (`ops/layer_norm.rs:507` — two
+    // separately-rounded IEEE operations), while the CUDA kernel calls
+    // `rsqrtf()` (`src/cuda/layer_norm.cu:90` — one hardware fused
+    // reciprocal-sqrt intrinsic with its own, looser accuracy contract)
+    // — a real cross-device numerical-function divergence, not merely
+    // fmad contraction.
+    let dyv_f = cotangent_fixture(n, 0xDA57_1D5E_2000_0002, 3.0);
+    let dyb: Vec<bf16> = dyv_f.iter().map(|&v| bf16::from_f32(v)).collect();
 
     let x_cpu = Var::from_tensor(&Tensor::from_slice(&xb, (rows, hidden), &cpu).unwrap()).unwrap();
     let g_cpu = Var::from_tensor(&Tensor::from_slice(&gb, (hidden,), &cpu).unwrap()).unwrap();
+    let dy_cpu = Tensor::from_slice(&dyb, (rows, hidden), &cpu).unwrap();
     let out_cpu = ln_forward(eps, true, &x_cpu, &g_cpu).unwrap();
-    let grads_cpu = out_cpu.backward().unwrap();
 
     let x_gpu = Var::from_tensor(&Tensor::from_slice(&xb, (rows, hidden), cuda).unwrap()).unwrap();
     let g_gpu = Var::from_tensor(&Tensor::from_slice(&gb, (hidden,), cuda).unwrap()).unwrap();
+    let dy_gpu = Tensor::from_slice(&dyb, (rows, hidden), cuda).unwrap();
     let out_gpu = ln_forward(eps, true, &x_gpu, &g_gpu).unwrap();
-    let grads_gpu = out_gpu.backward().unwrap();
 
     let to_f32 = |t: &Tensor| -> Vec<f32> {
         t.to_dtype(DType::F32)
@@ -504,43 +759,83 @@ fn assert_ln_parity_bf16(
             .to_vec1()
             .unwrap()
     };
-    // Same accumulation semantics on both devices (f32-accumulate, round
-    // to bf16 once) — an fmad-class ~1-ULP-at-bf16 bound, same rationale
-    // as `assert_parity_bf16` above.
-    let bf16_bound = |c: f32, g: f32| 2.0 * 2.0f32.powi(-7) * c.abs().max(g).max(1.0);
 
     let out_cpu_v = to_f32(&out_cpu);
     let out_gpu_v = to_f32(&out_gpu.to_device(&cpu).unwrap());
     assert_eq!(out_cpu_v.len(), n);
     assert_eq!(out_gpu_v.len(), n, "LN bf16 GPU fwd length mismatch");
+    let out_floor = measured_near_zero_floor(&out_cpu_v);
     for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
         assert!(
-            (c - g).abs() <= bf16_bound(*c, *g),
+            g.is_finite() && (c - g).abs() <= bf16_relative_bound(*c, out_floor, 2.0),
             "ln bf16 fwd[{i}]: cpu {c} vs cuda {g}"
         );
     }
+    assert_bound_discriminates(
+        &out_cpu_v,
+        &out_gpu_v,
+        |r| bf16_relative_bound(r, out_floor, 2.0),
+        bf16_ulp,
+        "ln bf16 fwd",
+    );
+
+    let grads_cpu = (&out_cpu * &dy_cpu)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .backward()
+        .unwrap();
+    let grads_gpu = (&out_gpu * &dy_gpu)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .backward()
+        .unwrap();
 
     let dx_cpu_v = to_f32(&grads_cpu.get(&x_cpu).unwrap().clone());
     let dx_gpu_v = to_f32(&grads_gpu.get(&x_gpu).unwrap().to_device(&cpu).unwrap());
     assert_eq!(dx_cpu_v.len(), n);
     assert_eq!(dx_gpu_v.len(), n, "LN bf16 GPU dx length mismatch");
+    let dx_norm: f64 = dx_cpu_v.iter().map(|&v| (v as f64) * (v as f64)).sum();
+    assert!(
+        dx_norm.sqrt() > 1e-3,
+        "CPU bf16 dx must be measured-nonzero (norm {}) — a vacuous all-zero reference would \
+         make the parity loop below prove nothing",
+        dx_norm.sqrt()
+    );
+    let dx_floor = measured_near_zero_floor(&dx_cpu_v);
     for (i, (c, g)) in dx_cpu_v.iter().zip(dx_gpu_v.iter()).enumerate() {
         assert!(
-            (c - g).abs() <= bf16_bound(*c, *g),
+            g.is_finite() && (c - g).abs() <= bf16_relative_bound(*c, dx_floor, 2.0),
             "ln bf16 dx[{i}]: cpu {c} vs cuda {g}"
         );
     }
+    assert_bound_discriminates(
+        &dx_cpu_v,
+        &dx_gpu_v,
+        |r| bf16_relative_bound(r, dx_floor, 2.0),
+        bf16_ulp,
+        "ln bf16 dx",
+    );
 
     let dg_cpu_v = to_f32(&grads_cpu.get(&g_cpu).unwrap().clone());
     let dg_gpu_v = to_f32(&grads_gpu.get(&g_gpu).unwrap().to_device(&cpu).unwrap());
     assert_eq!(dg_cpu_v.len(), hidden);
     assert_eq!(dg_gpu_v.len(), hidden, "LN bf16 GPU dgamma length mismatch");
+    let dg_floor = measured_near_zero_floor(&dg_cpu_v);
     for (i, (c, g)) in dg_cpu_v.iter().zip(dg_gpu_v.iter()).enumerate() {
         assert!(
-            (c - g).abs() <= bf16_bound(*c, *g),
+            g.is_finite() && (c - g).abs() <= bf16_relative_bound(*c, dg_floor, 2.0),
             "ln bf16 dgamma[{i}]: cpu {c} vs cuda {g}"
         );
     }
+    assert_bound_discriminates(
+        &dg_cpu_v,
+        &dg_gpu_v,
+        |r| bf16_relative_bound(r, dg_floor, 2.0),
+        bf16_ulp,
+        "ln bf16 dgamma",
+    );
 }
 
 #[test]
@@ -737,14 +1032,12 @@ fn assert_rope_parity_f32(cuda: &Device, batch: usize, seq: usize, hidden: usize
     let cos_cpu = Tensor::from_slice(&cos_v, (1, 1, seq, hidden), &cpu).unwrap();
     let sin_cpu = Tensor::from_slice(&sin_v, (1, 1, seq, hidden), &cpu).unwrap();
     let out_cpu = rope(false, &x_cpu, &cos_cpu, &sin_cpu).unwrap();
-    let grads_cpu = out_cpu.backward().unwrap();
 
     let x_gpu =
         Var::from_tensor(&Tensor::from_slice(xv, (batch, 1, seq, hidden), cuda).unwrap()).unwrap();
     let cos_gpu = Tensor::from_slice(&cos_v, (1, 1, seq, hidden), cuda).unwrap();
     let sin_gpu = Tensor::from_slice(&sin_v, (1, 1, seq, hidden), cuda).unwrap();
     let out_gpu = rope(false, &x_gpu, &cos_gpu, &sin_gpu).unwrap();
-    let grads_gpu = out_gpu.backward().unwrap();
 
     let out_cpu_v: Vec<f32> = out_cpu.flatten_all().unwrap().to_vec1().unwrap();
     let out_gpu_v: Vec<f32> = out_gpu
@@ -756,12 +1049,40 @@ fn assert_rope_parity_f32(cuda: &Device, batch: usize, seq: usize, hidden: usize
         .unwrap();
     assert_eq!(out_cpu_v.len(), n);
     assert_eq!(out_gpu_v.len(), n, "rope GPU fwd length mismatch");
+    // `k = 4`: RoPE is purely elementwise (one rotation per (x, x_rot)
+    // pair, no cross-element reduction) — a small chain-of-two-products
+    // fmad allowance, never scaled by `seq`/`hidden`.
+    let out_floor = measured_near_zero_floor(&out_cpu_v);
+    let out_bound = |r: f32| f32_relative_bound(r, out_floor, 4.0);
     for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
         assert!(
-            ((*c - *g).abs() as f64) <= F32_TOL,
+            g.is_finite() && (*c - *g).abs() <= out_bound(*c),
             "rope fwd[{i}]: cpu {c} vs cuda {g} (batch={batch}, seq={seq}, hidden={hidden})"
         );
     }
+    assert_bound_discriminates(&out_cpu_v, &out_gpu_v, out_bound, f32_ulp, "rope f32 fwd");
+
+    // Sign-mixed, production-amplitude cotangent — never the implicit
+    // ones `.backward()` assigns a non-scalar root (this file's
+    // discriminating-backward toolkit header doc): under `dy == 1`,
+    // `round(dy * cos)`/`round(dy * sin)` collapse to `round(cos)`/
+    // `round(sin)`, hiding a rounding-placement defect in the adjoint
+    // rotation.
+    let dyv = cotangent_fixture(n, 0x20BE_1D5E_2000_0001, 3.0);
+    let dy_cpu = Tensor::from_slice(&dyv, (batch, 1, seq, hidden), &cpu).unwrap();
+    let dy_gpu = Tensor::from_slice(&dyv, (batch, 1, seq, hidden), cuda).unwrap();
+    let grads_cpu = (&out_cpu * &dy_cpu)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .backward()
+        .unwrap();
+    let grads_gpu = (&out_gpu * &dy_gpu)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .backward()
+        .unwrap();
 
     let dx_cpu: Vec<f32> = grads_cpu
         .get(&x_cpu)
@@ -781,12 +1102,15 @@ fn assert_rope_parity_f32(cuda: &Device, batch: usize, seq: usize, hidden: usize
         .unwrap();
     assert_eq!(dx_cpu.len(), n);
     assert_eq!(dx_gpu.len(), n, "rope GPU dx length mismatch");
+    let dx_floor = measured_near_zero_floor(&dx_cpu);
+    let dx_bound = |r: f32| f32_relative_bound(r, dx_floor, 4.0);
     for (i, (c, g)) in dx_cpu.iter().zip(dx_gpu.iter()).enumerate() {
         assert!(
-            ((*c - *g).abs() as f64) <= F32_TOL,
+            g.is_finite() && (*c - *g).abs() <= dx_bound(*c),
             "rope dx[{i}]: cpu {c} vs cuda {g}"
         );
     }
+    assert_bound_discriminates(&dx_cpu, &dx_gpu, dx_bound, f32_ulp, "rope f32 dx");
 }
 
 fn assert_rope_parity_bf16(cuda: &Device, batch: usize, seq: usize, hidden: usize, xv: &[f32]) {
@@ -797,20 +1121,22 @@ fn assert_rope_parity_bf16(cuda: &Device, batch: usize, seq: usize, hidden: usiz
     let xb: Vec<bf16> = xv.iter().map(|&v| bf16::from_f32(v)).collect();
     let cb: Vec<bf16> = cos_v.iter().map(|&v| bf16::from_f32(v)).collect();
     let sb: Vec<bf16> = sin_v.iter().map(|&v| bf16::from_f32(v)).collect();
+    let dyv_f = cotangent_fixture(n, 0x20BE_1D5E_2000_0002, 3.0);
+    let dyb: Vec<bf16> = dyv_f.iter().map(|&v| bf16::from_f32(v)).collect();
 
     let x_cpu =
         Var::from_tensor(&Tensor::from_slice(&xb, (batch, 1, seq, hidden), &cpu).unwrap()).unwrap();
     let cos_cpu = Tensor::from_slice(&cb, (1, 1, seq, hidden), &cpu).unwrap();
     let sin_cpu = Tensor::from_slice(&sb, (1, 1, seq, hidden), &cpu).unwrap();
+    let dy_cpu = Tensor::from_slice(&dyb, (batch, 1, seq, hidden), &cpu).unwrap();
     let out_cpu = rope(false, &x_cpu, &cos_cpu, &sin_cpu).unwrap();
-    let grads_cpu = out_cpu.backward().unwrap();
 
     let x_gpu =
         Var::from_tensor(&Tensor::from_slice(&xb, (batch, 1, seq, hidden), cuda).unwrap()).unwrap();
     let cos_gpu = Tensor::from_slice(&cb, (1, 1, seq, hidden), cuda).unwrap();
     let sin_gpu = Tensor::from_slice(&sb, (1, 1, seq, hidden), cuda).unwrap();
+    let dy_gpu = Tensor::from_slice(&dyb, (batch, 1, seq, hidden), cuda).unwrap();
     let out_gpu = rope(false, &x_gpu, &cos_gpu, &sin_gpu).unwrap();
-    let grads_gpu = out_gpu.backward().unwrap();
 
     let to_f32 = |t: &Tensor| -> Vec<f32> {
         t.to_dtype(DType::F32)
@@ -820,29 +1146,47 @@ fn assert_rope_parity_bf16(cuda: &Device, batch: usize, seq: usize, hidden: usiz
             .to_vec1()
             .unwrap()
     };
-    let bf16_bound = |c: f32, g: f32| 2.0 * 2.0f32.powi(-7) * c.abs().max(g).max(1.0);
 
     let out_cpu_v = to_f32(&out_cpu);
     let out_gpu_v = to_f32(&out_gpu.to_device(&cpu).unwrap());
     assert_eq!(out_cpu_v.len(), n);
     assert_eq!(out_gpu_v.len(), n, "rope bf16 GPU fwd length mismatch");
+    let out_floor = measured_near_zero_floor(&out_cpu_v);
+    let out_bound = |r: f32| bf16_relative_bound(r, out_floor, 1.0);
     for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
         assert!(
-            (c - g).abs() <= bf16_bound(*c, *g),
+            g.is_finite() && (c - g).abs() <= out_bound(*c),
             "rope bf16 fwd[{i}]: cpu {c} vs cuda {g}"
         );
     }
+    assert_bound_discriminates(&out_cpu_v, &out_gpu_v, out_bound, bf16_ulp, "rope bf16 fwd");
+
+    let grads_cpu = (&out_cpu * &dy_cpu)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .backward()
+        .unwrap();
+    let grads_gpu = (&out_gpu * &dy_gpu)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .backward()
+        .unwrap();
 
     let dx_cpu_v = to_f32(&grads_cpu.get(&x_cpu).unwrap().clone());
     let dx_gpu_v = to_f32(&grads_gpu.get(&x_gpu).unwrap().to_device(&cpu).unwrap());
     assert_eq!(dx_cpu_v.len(), n);
     assert_eq!(dx_gpu_v.len(), n, "rope bf16 GPU dx length mismatch");
+    let dx_floor = measured_near_zero_floor(&dx_cpu_v);
+    let dx_bound = |r: f32| bf16_relative_bound(r, dx_floor, 1.0);
     for (i, (c, g)) in dx_cpu_v.iter().zip(dx_gpu_v.iter()).enumerate() {
         assert!(
-            (c - g).abs() <= bf16_bound(*c, *g),
+            g.is_finite() && (c - g).abs() <= dx_bound(*c),
             "rope bf16 dx[{i}]: cpu {c} vs cuda {g}"
         );
     }
+    assert_bound_discriminates(&dx_cpu_v, &dx_gpu_v, dx_bound, bf16_ulp, "rope bf16 dx");
 }
 
 #[test]
@@ -1178,18 +1522,33 @@ fn assert_softmax_parity_bf16(cuda: &Device, rows: usize, last: usize, sv: &[f32
             .to_vec1()
             .unwrap()
     };
-    let bf16_bound = |c: f32, g: f32| 2.0 * 2.0f32.powi(-7) * c.abs().max(g).max(1.0);
-
+    // `k = 2` (NOT scaled by `last`): the kernel accumulates the
+    // max/exp-sum reduction at `f32` precision and rounds to `bf16` ONCE
+    // at the output — an `f32`-level reduction-order error over `last`
+    // terms (`~last * 2^-24`) is orders of magnitude smaller than one
+    // `bf16` ULP (`2^-7`) even at `last` in the thousands, so the
+    // dominant, expected divergence is the single final rounding step
+    // (plus both devices computing `exp()`/`expf()` independently,
+    // unlike RoPE's host-precomputed table) — never `last`-scaled.
     let out_cpu_v = to_f32(&out_cpu);
     let out_gpu_v = to_f32(&out_gpu.to_device(&cpu).unwrap());
     assert_eq!(out_cpu_v.len(), n);
     assert_eq!(out_gpu_v.len(), n, "softmax bf16 GPU fwd length mismatch");
+    let out_floor = measured_near_zero_floor(&out_cpu_v);
+    let out_bound = |r: f32| bf16_relative_bound(r, out_floor, 2.0);
     for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
         assert!(
-            (c - g).abs() <= bf16_bound(*c, *g),
+            g.is_finite() && (c - g).abs() <= out_bound(*c),
             "softmax bf16 fwd[{i}]: cpu {c} vs cuda {g}"
         );
     }
+    assert_bound_discriminates(
+        &out_cpu_v,
+        &out_gpu_v,
+        out_bound,
+        bf16_ulp,
+        "softmax bf16 fwd",
+    );
 
     // Non-uniform dy (family F): see `assert_softmax_parity_f32`'s
     // identical note -- an implicit all-ones seed makes `dscores`
@@ -1223,12 +1582,21 @@ fn assert_softmax_parity_bf16(cuda: &Device, rows: usize, last: usize, sv: &[f32
         "CPU dscores must be measured-nonzero (norm {dx_cpu_norm}) -- a vacuous \
          all-zero reference would make the parity check below prove nothing"
     );
+    let dx_floor = measured_near_zero_floor(&dx_cpu_v);
+    let dx_bound = |r: f32| bf16_relative_bound(r, dx_floor, 2.0);
     for (i, (c, g)) in dx_cpu_v.iter().zip(dx_gpu_v.iter()).enumerate() {
         assert!(
-            (c - g).abs() <= bf16_bound(*c, *g),
+            g.is_finite() && (c - g).abs() <= dx_bound(*c),
             "softmax bf16 dscores[{i}]: cpu {c} vs cuda {g}"
         );
     }
+    assert_bound_discriminates(
+        &dx_cpu_v,
+        &dx_gpu_v,
+        dx_bound,
+        bf16_ulp,
+        "softmax bf16 dscores",
+    );
 }
 
 #[test]
@@ -1541,8 +1909,11 @@ fn assert_softmax_scale_parity_bf16(
             .to_vec1()
             .unwrap()
     };
-    let bf16_bound = |c: f32, g: f32| 2.0 * 2.0f32.powi(-7) * c.abs().max(g).max(1.0);
-
+    // `k = 2` (not scaled by `last`) — see `assert_softmax_parity_bf16`'s
+    // identical note: the `f32`-accumulated reduction's own noise is
+    // orders of magnitude below one `bf16` ULP even at `last` in the
+    // thousands, so the dominant divergence is the single final rounding
+    // step plus each device's own `exp()`/`expf()`.
     let out_cpu_v = to_f32(&out_cpu);
     let out_gpu_v = to_f32(&out_gpu.to_device(&cpu).unwrap());
     assert_eq!(out_cpu_v.len(), n);
@@ -1551,12 +1922,21 @@ fn assert_softmax_scale_parity_bf16(
         n,
         "softmax scale bf16 GPU fwd length mismatch"
     );
+    let out_floor = measured_near_zero_floor(&out_cpu_v);
+    let out_bound = |r: f32| bf16_relative_bound(r, out_floor, 2.0);
     for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
         assert!(
-            (c - g).abs() <= bf16_bound(*c, *g),
+            g.is_finite() && (c - g).abs() <= out_bound(*c),
             "softmax scale bf16 fwd[{i}]: cpu {c} vs cuda {g}"
         );
     }
+    assert_bound_discriminates(
+        &out_cpu_v,
+        &out_gpu_v,
+        out_bound,
+        bf16_ulp,
+        "softmax scale bf16 fwd",
+    );
 
     // Non-uniform dy (family F): see `assert_softmax_scale_parity_f32`'s
     // identical note -- this exercises `SoftmaxBwdDScores`'s forward-y
@@ -1593,12 +1973,21 @@ fn assert_softmax_scale_parity_bf16(
         "CPU dscores must be measured-nonzero (norm {dx_cpu_norm}) -- a vacuous \
          all-zero reference would make the parity check below prove nothing"
     );
+    let dx_floor = measured_near_zero_floor(&dx_cpu_v);
+    let dx_bound = |r: f32| bf16_relative_bound(r, dx_floor, 2.0);
     for (i, (c, g)) in dx_cpu_v.iter().zip(dx_gpu_v.iter()).enumerate() {
         assert!(
-            (c - g).abs() <= bf16_bound(*c, *g),
+            g.is_finite() && (c - g).abs() <= dx_bound(*c),
             "softmax scale bf16 dscores[{i}]: cpu {c} vs cuda {g}"
         );
     }
+    assert_bound_discriminates(
+        &dx_cpu_v,
+        &dx_gpu_v,
+        dx_bound,
+        bf16_ulp,
+        "softmax scale bf16 dscores",
+    );
 }
 
 #[test]
@@ -1855,12 +2244,10 @@ fn assert_geglu_parity_f32(cuda: &Device, rows: usize, intermediate: usize, wv: 
     let wi_cpu =
         Var::from_tensor(&Tensor::from_slice(wv, (rows, 2 * intermediate), &cpu).unwrap()).unwrap();
     let out_cpu = geglu(&wi_cpu).unwrap();
-    let grads_cpu = out_cpu.backward().unwrap();
 
     let wi_gpu =
         Var::from_tensor(&Tensor::from_slice(wv, (rows, 2 * intermediate), cuda).unwrap()).unwrap();
     let out_gpu = geglu(&wi_gpu).unwrap();
-    let grads_gpu = out_gpu.backward().unwrap();
 
     let out_cpu_v: Vec<f32> = out_cpu.flatten_all().unwrap().to_vec1().unwrap();
     let out_gpu_v: Vec<f32> = out_gpu
@@ -1872,12 +2259,39 @@ fn assert_geglu_parity_f32(cuda: &Device, rows: usize, intermediate: usize, wv: 
         .unwrap();
     assert_eq!(out_cpu_v.len(), n_out);
     assert_eq!(out_gpu_v.len(), n_out, "geglu GPU fwd length mismatch");
+    // `k = 4`: GeGLU is purely elementwise (`gelu(x1) * x2`, no
+    // cross-element reduction) — a small chain-of-two-ops fmad allowance,
+    // never scaled by `rows`/`intermediate`.
+    let out_floor = measured_near_zero_floor(&out_cpu_v);
+    let out_bound = |r: f32| f32_relative_bound(r, out_floor, 4.0);
     for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
         assert!(
-            ((*c - *g).abs() as f64) <= F32_TOL,
+            g.is_finite() && (*c - *g).abs() <= out_bound(*c),
             "geglu fwd[{i}]: cpu {c} vs cuda {g} (rows={rows}, intermediate={intermediate})"
         );
     }
+    assert_bound_discriminates(&out_cpu_v, &out_gpu_v, out_bound, f32_ulp, "geglu f32 fwd");
+
+    // Sign-mixed, production-amplitude cotangent — never the implicit
+    // ones `.backward()` assigns a non-scalar root: `round(dy * x)`
+    // collapses to `round(x)` under `dy == 1`, hiding the exact
+    // round-the-product-vs-round-the-factor defect esc-045 round 2 fixed
+    // (commit 16a1699, GH#374).
+    let dyv = cotangent_fixture(n_out, 0x6E61_1D5E_2000_0001, 3.0);
+    let dy_cpu = Tensor::from_slice(&dyv, (rows, intermediate), &cpu).unwrap();
+    let dy_gpu = Tensor::from_slice(&dyv, (rows, intermediate), cuda).unwrap();
+    let grads_cpu = (&out_cpu * &dy_cpu)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .backward()
+        .unwrap();
+    let grads_gpu = (&out_gpu * &dy_gpu)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .backward()
+        .unwrap();
 
     let dwi_cpu: Vec<f32> = grads_cpu
         .get(&wi_cpu)
@@ -1901,30 +2315,35 @@ fn assert_geglu_parity_f32(cuda: &Device, rows: usize, intermediate: usize, wv: 
         rows * 2 * intermediate,
         "geglu GPU dwi_out length mismatch"
     );
+    let dwi_floor = measured_near_zero_floor(&dwi_cpu);
+    let dwi_bound = |r: f32| f32_relative_bound(r, dwi_floor, 4.0);
     for (i, (c, g)) in dwi_cpu.iter().zip(dwi_gpu.iter()).enumerate() {
         assert!(
-            ((*c - *g).abs() as f64) <= F32_TOL,
+            g.is_finite() && (*c - *g).abs() <= dwi_bound(*c),
             "geglu dwi_out[{i}]: cpu {c} vs cuda {g}"
         );
     }
+    assert_bound_discriminates(&dwi_cpu, &dwi_gpu, dwi_bound, f32_ulp, "geglu f32 dwi_out");
 }
 
 fn assert_geglu_parity_bf16(cuda: &Device, rows: usize, intermediate: usize, wv: &[f32]) {
     let cpu = Device::Cpu;
     let n_out = rows * intermediate;
     let wb: Vec<bf16> = wv.iter().map(|&v| bf16::from_f32(v)).collect();
+    let dyv_f = cotangent_fixture(n_out, 0x6E61_1D5E_2000_0002, 3.0);
+    let dyb: Vec<bf16> = dyv_f.iter().map(|&v| bf16::from_f32(v)).collect();
 
     let wi_cpu =
         Var::from_tensor(&Tensor::from_slice(&wb, (rows, 2 * intermediate), &cpu).unwrap())
             .unwrap();
+    let dy_cpu = Tensor::from_slice(&dyb, (rows, intermediate), &cpu).unwrap();
     let out_cpu = geglu(&wi_cpu).unwrap();
-    let grads_cpu = out_cpu.backward().unwrap();
 
     let wi_gpu =
         Var::from_tensor(&Tensor::from_slice(&wb, (rows, 2 * intermediate), cuda).unwrap())
             .unwrap();
+    let dy_gpu = Tensor::from_slice(&dyb, (rows, intermediate), cuda).unwrap();
     let out_gpu = geglu(&wi_gpu).unwrap();
-    let grads_gpu = out_gpu.backward().unwrap();
 
     let to_f32 = |t: &Tensor| -> Vec<f32> {
         t.to_dtype(DType::F32)
@@ -1934,30 +2353,46 @@ fn assert_geglu_parity_bf16(cuda: &Device, rows: usize, intermediate: usize, wv:
             .to_vec1()
             .unwrap()
     };
-    // The SAME relative-with-floor-at-1.0 bound `assert_softmax_parity_bf16`
-    // / the LayerNorm/RoPE parity helpers use (`REL = 2*2^-7 = 2^-6`,
-    // floored at magnitude `1.0`) — NOT the wider relative-with-large-
-    // absolute-floor bound `geglu_oracles.rs`'s CPU-only fused-vs-EAGER
-    // oracle needs (`BF16_ABS_FLOOR = 2^-5`, sized for eager's rounding
-    // CASCADE occasionally underflowing an intermediate to exact bf16
-    // zero — a mechanism that cannot arise HERE, since both sides of THIS
-    // comparison run the IDENTICAL fused single-rounding kernel, just on
-    // different hardware/compilers). CPU<->CUDA divergence is bounded by
-    // ordinary rounding-order/`--fmad=true` contraction (`build.rs`'s
-    // documented tolerance doctrine), the same class every other op's
-    // parity leg in this file already bounds with this exact formula.
-    let bf16_bound = |c: f32, g: f32| 2.0 * 2.0f32.powi(-7) * c.abs().max(g).max(1.0);
-
+    // `k = 2`: both sides of THIS comparison run the identical fused
+    // single-rounding kernel on different hardware/compilers — ordinary
+    // rounding-order/`--fmad=true` contraction, the same class every
+    // other op's parity leg in this file bounds this way. (Not
+    // `geglu_oracles.rs`'s wider fused-vs-EAGER absolute floor — that
+    // one covers eager's rounding CASCADE occasionally underflowing an
+    // intermediate to exact bf16 zero, a mechanism that cannot arise
+    // here.)
     let out_cpu_v = to_f32(&out_cpu);
     let out_gpu_v = to_f32(&out_gpu.to_device(&cpu).unwrap());
     assert_eq!(out_cpu_v.len(), n_out);
     assert_eq!(out_gpu_v.len(), n_out, "geglu bf16 GPU fwd length mismatch");
+    let out_floor = measured_near_zero_floor(&out_cpu_v);
+    let out_bound = |r: f32| bf16_relative_bound(r, out_floor, 2.0);
     for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
         assert!(
-            (c - g).abs() <= bf16_bound(*c, *g),
+            g.is_finite() && (c - g).abs() <= out_bound(*c),
             "geglu bf16 fwd[{i}]: cpu {c} vs cuda {g}"
         );
     }
+    assert_bound_discriminates(
+        &out_cpu_v,
+        &out_gpu_v,
+        out_bound,
+        bf16_ulp,
+        "geglu bf16 fwd",
+    );
+
+    let grads_cpu = (&out_cpu * &dy_cpu)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .backward()
+        .unwrap();
+    let grads_gpu = (&out_gpu * &dy_gpu)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .backward()
+        .unwrap();
 
     let dwi_cpu_v = to_f32(&grads_cpu.get(&wi_cpu).unwrap().clone());
     let dwi_gpu_v = to_f32(&grads_gpu.get(&wi_gpu).unwrap().to_device(&cpu).unwrap());
@@ -1967,12 +2402,21 @@ fn assert_geglu_parity_bf16(cuda: &Device, rows: usize, intermediate: usize, wv:
         rows * 2 * intermediate,
         "geglu bf16 GPU dwi_out length mismatch"
     );
+    let dwi_floor = measured_near_zero_floor(&dwi_cpu_v);
+    let dwi_bound = |r: f32| bf16_relative_bound(r, dwi_floor, 2.0);
     for (i, (c, g)) in dwi_cpu_v.iter().zip(dwi_gpu_v.iter()).enumerate() {
         assert!(
-            (c - g).abs() <= bf16_bound(*c, *g),
+            g.is_finite() && (c - g).abs() <= dwi_bound(*c),
             "geglu bf16 dwi_out[{i}]: cpu {c} vs cuda {g}"
         );
     }
+    assert_bound_discriminates(
+        &dwi_cpu_v,
+        &dwi_gpu_v,
+        dwi_bound,
+        bf16_ulp,
+        "geglu bf16 dwi_out",
+    );
 }
 
 #[test]
@@ -2166,12 +2610,10 @@ fn assert_scaled_cast_add_parity_f32_f32(
     let base_cpu = Var::from_tensor(&Tensor::from_slice(basev, (n,), &cpu).unwrap()).unwrap();
     let lora_cpu = Var::from_tensor(&Tensor::from_slice(loraev, (n,), &cpu).unwrap()).unwrap();
     let out_cpu = scaled_cast_add(scaling, &base_cpu, &lora_cpu).unwrap();
-    let grads_cpu = out_cpu.backward().unwrap();
 
     let base_gpu = Var::from_tensor(&Tensor::from_slice(basev, (n,), cuda).unwrap()).unwrap();
     let lora_gpu = Var::from_tensor(&Tensor::from_slice(loraev, (n,), cuda).unwrap()).unwrap();
     let out_gpu = scaled_cast_add(scaling, &base_gpu, &lora_gpu).unwrap();
-    let grads_gpu = out_gpu.backward().unwrap();
 
     let out_cpu_v: Vec<f32> = out_cpu.to_vec1().unwrap();
     let out_gpu_v: Vec<f32> = out_gpu.to_device(&cpu).unwrap().to_vec1().unwrap();
@@ -2182,12 +2624,46 @@ fn assert_scaled_cast_add_parity_f32_f32(
         "GPU forward output length mismatch (got {}, expected {n})",
         out_gpu_v.len()
     );
+    // `k = 4`: `base + lora*scaling` is a single fmad-class op, no
+    // reduction.
+    let out_floor = measured_near_zero_floor(&out_cpu_v);
+    let out_bound = |r: f32| f32_relative_bound(r, out_floor, 4.0);
     for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
         assert!(
-            ((*c - *g).abs() as f64) <= F32_TOL,
+            g.is_finite() && (*c - *g).abs() <= out_bound(*c),
             "fwd[{i}]: cpu {c} vs cuda {g} (scaling={scaling}, n={n})"
         );
     }
+    assert_bound_discriminates(
+        &out_cpu_v,
+        &out_gpu_v,
+        out_bound,
+        f32_ulp,
+        "scaled_cast_add f32 fwd",
+    );
+
+    // Sign-mixed, INDEX-VARYING cotangent — never the implicit ones
+    // `.backward()` assigns a non-scalar root: under `dy == 1`,
+    // `d_base == 1.0` and `d_lora == scaling` are the SAME constant at
+    // every index, so a misindexed/shuffled read (e.g. `d_base[i]` reads
+    // `dy[j]` for `j != i`) would still equal `1.0` everywhere and pass
+    // undetected — a vacuous control for exactly the offset-bug class
+    // this file's own doc (top of file) says it exists to catch.
+    let dyv = cotangent_fixture(n, 0xCA57_1D5E_2000_0001, 3.0);
+    let dy_cpu = Tensor::from_slice(&dyv, (n,), &cpu).unwrap();
+    let dy_gpu = Tensor::from_slice(&dyv, (n,), cuda).unwrap();
+    let grads_cpu = (&out_cpu * &dy_cpu)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .backward()
+        .unwrap();
+    let grads_gpu = (&out_gpu * &dy_gpu)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .backward()
+        .unwrap();
 
     let d_base_cpu: Vec<f32> = grads_cpu.get(&base_cpu).unwrap().to_vec1().unwrap();
     let d_base_gpu: Vec<f32> = grads_gpu
@@ -2209,18 +2685,36 @@ fn assert_scaled_cast_add_parity_f32_f32(
     assert_eq!(d_base_gpu.len(), n, "d_base GPU length mismatch");
     assert_eq!(d_lora_cpu.len(), n);
     assert_eq!(d_lora_gpu.len(), n, "d_lora GPU length mismatch");
+    let d_base_floor = measured_near_zero_floor(&d_base_cpu);
+    let d_base_bound = |r: f32| f32_relative_bound(r, d_base_floor, 4.0);
     for (i, (c, g)) in d_base_cpu.iter().zip(d_base_gpu.iter()).enumerate() {
         assert!(
-            ((*c - *g).abs() as f64) <= F32_TOL,
+            g.is_finite() && (*c - *g).abs() <= d_base_bound(*c),
             "d_base[{i}]: cpu {c} vs cuda {g}"
         );
     }
+    assert_bound_discriminates(
+        &d_base_cpu,
+        &d_base_gpu,
+        d_base_bound,
+        f32_ulp,
+        "scaled_cast_add f32 d_base",
+    );
+    let d_lora_floor = measured_near_zero_floor(&d_lora_cpu);
+    let d_lora_bound = |r: f32| f32_relative_bound(r, d_lora_floor, 4.0);
     for (i, (c, g)) in d_lora_cpu.iter().zip(d_lora_gpu.iter()).enumerate() {
         assert!(
-            ((*c - *g).abs() as f64) <= F32_TOL,
+            g.is_finite() && (*c - *g).abs() <= d_lora_bound(*c),
             "d_lora[{i}]: cpu {c} vs cuda {g}"
         );
     }
+    assert_bound_discriminates(
+        &d_lora_cpu,
+        &d_lora_gpu,
+        d_lora_bound,
+        f32_ulp,
+        "scaled_cast_add f32 d_lora",
+    );
 }
 
 /// The `BF16` base / `F32` lora combination — the one the fine-tune bench
@@ -2265,13 +2759,21 @@ fn assert_scaled_cast_add_parity_bf16_base(
     // Same accumulation semantics on both devices (round-to-bf16-then-add,
     // per this op's module doc) — fmad-class ~1-ULP-at-bf16 differences
     // are the only expected source of divergence between CPU and CUDA.
+    let out_floor = measured_near_zero_floor(&out_cpu);
+    let out_bound = |r: f32| bf16_relative_bound(r, out_floor, 2.0);
     for (i, (c, g)) in out_cpu.iter().zip(out_gpu.iter()).enumerate() {
-        let ulp = 2.0f32.powi(-7) * c.abs().max(*g).max(1.0);
         assert!(
-            (c - g).abs() <= 2.0 * ulp,
+            g.is_finite() && (c - g).abs() <= out_bound(*c),
             "bf16-base fwd[{i}]: cpu {c} vs cuda {g}"
         );
     }
+    assert_bound_discriminates(
+        &out_cpu,
+        &out_gpu,
+        out_bound,
+        bf16_ulp,
+        "scaled_cast_add bf16-base fwd",
+    );
 }
 
 #[test]
@@ -2773,8 +3275,10 @@ fn lora_linear_parity_tolerance(rows: usize, inf: usize, outf: usize, values: &[
 /// DIFFERENTLY-SCALED operands: `da`'s is `d(after_a)` (an already-reduced
 /// intermediate, amplitude ~27 at this test's production width) against
 /// `x` (amplitude ~10); `db`'s is `d(lora_out)` (== `dy * scale`, amplitude
-/// == `scale` exactly, since `dy` is `sum_all().backward()`'s all-ones
-/// seed) against `after_a` (amplitude ~51000). Squaring ONE shared
+/// AT MOST `scale` — the call site's `dy` is a sign-mixed cotangent built
+/// at amplitude `1.0`, so `|dy| <= 1.0` and this remains a valid, if
+/// slightly conservative, upper bound rather than an exact equality)
+/// against `after_a` (amplitude ~51000). Squaring ONE shared
 /// amplitude — what the vacuous predecessor of this function's call site
 /// did by reusing [`lora_linear_parity_tolerance`] with the raw `x`/`w`/`a`/
 /// `b` fixture slices — assumes both operands sit at the fixture's own
@@ -2862,7 +3366,6 @@ fn assert_lora_linear_parity_f32(
         },
     )
     .unwrap();
-    let grads_cpu = out_cpu.sum_all().unwrap().backward().unwrap();
 
     let x_gpu = Var::from_tensor(&Tensor::from_slice(xv, (rows, inf), cuda).unwrap()).unwrap();
     let w_gpu = Var::from_tensor(&Tensor::from_slice(wv, (outf, inf), cuda).unwrap()).unwrap();
@@ -2883,7 +3386,32 @@ fn assert_lora_linear_parity_f32(
         },
     )
     .unwrap();
-    let grads_gpu = out_gpu.sum_all().unwrap().backward().unwrap();
+
+    // Sign-mixed, INDEX-VARYING, unit-amplitude cotangent — never the
+    // implicit ones `sum_all().backward()` assigns: under `dy == 1`
+    // (uniform), a misindexed/shuffled backward read cannot be told apart
+    // from a correct one at any index whose true gradient happens to
+    // match another index's (this op's `dx`/`dw`/`da`/`db` all reduce
+    // over an axis, so this is a real risk, not just LN's collapse).
+    // Amplitude `1.0` (not this file's usual `3.0`) deliberately matches
+    // the retired all-ones seed's own magnitude, so `lora_linear_parity_
+    // tolerance`'s existing Higham derivation (which assumed `|dy| <= 1`)
+    // stays valid without re-deriving it.
+    let dyv = cotangent_fixture(rows * outf, 0x10A0_1D5E_2000_0001, 1.0);
+    let dy_cpu = Tensor::from_slice(&dyv, (rows, outf), &cpu).unwrap();
+    let dy_gpu = Tensor::from_slice(&dyv, (rows, outf), cuda).unwrap();
+    let grads_cpu = (&out_cpu * &dy_cpu)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .backward()
+        .unwrap();
+    let grads_gpu = (&out_gpu * &dy_gpu)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .backward()
+        .unwrap();
 
     // A single DERIVED (Higham Thm 4.2, see `lora_linear_parity_tolerance`'s
     // own doc) tolerance covers `fwd` and every backward output below: all
@@ -3384,7 +3912,24 @@ fn lora_linear_parity_bf16_base_backward_production_width() {
         .affine(f64::from(scale), 0.0)
         .unwrap();
     let out_cpu = (base_cpu + delta_cpu).unwrap();
-    let grads_cpu = out_cpu.sum_all().unwrap().backward().unwrap();
+
+    // Sign-mixed, INDEX-VARYING, unit-amplitude cotangent — never the
+    // implicit ones `sum_all().backward()` assigns (this file's
+    // discriminating-backward toolkit header doc; same rationale as
+    // `assert_lora_linear_parity_f32`'s identical note). Amplitude `1.0`
+    // (not this file's usual `3.0`) so `|dy| <= 1.0` always, keeping every
+    // downstream `f64::from(scale)`-keyed bound below (which assumed
+    // `|dy| <= 1` under the retired all-ones seed) a valid — if now
+    // slightly conservative rather than exact — upper bound, with no
+    // re-derivation needed.
+    let dyv_shared = cotangent_fixture(rows * outf, 0xB16E_1D5E_2000_0001, 1.0);
+    let dy_cpu = Tensor::from_slice(&dyv_shared, (rows, outf), &cpu).unwrap();
+    let grads_cpu = (&out_cpu * &dy_cpu)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .backward()
+        .unwrap();
 
     let dx_cpu: Vec<f32> = grads_cpu
         .get(&x_cpu)
@@ -3411,8 +3956,9 @@ fn lora_linear_parity_bf16_base_backward_production_width() {
     // The `dx_base`/`d_x_lora` pieces `dx_cpu` sums, kept SEPARATE
     // (mirroring the forward test's `base_only_cpu`/`delta_scaled_cpu` split) so
     // the bound below can be sized to EACH bf16 rounding point's own
-    // magnitude. `dy` is `sum_all().backward()`'s upstream seed: ones.
-    let dy_cpu = Tensor::ones((rows, outf), DType::F32, &cpu).unwrap();
+    // magnitude. `dy_cpu` is this test's own sign-mixed cotangent (see
+    // its construction above), not `sum_all().backward()`'s retired
+    // implicit ones seed.
     let dx_base_cpu: Vec<f32> = dy_cpu
         .matmul(&w_cpu)
         .unwrap()
@@ -3471,7 +4017,13 @@ fn lora_linear_parity_bf16_base_backward_production_width() {
         dweight_needed: false,
     };
     let out_gpu = lora_linear(x_gpu.as_tensor(), &w_gpu, &ab_gpu, params).unwrap();
-    let grads_gpu = out_gpu.sum_all().unwrap().backward().unwrap();
+    let dy_gpu = Tensor::from_slice(&dyv_shared, (rows, outf), &cuda).unwrap();
+    let grads_gpu = (&out_gpu * &dy_gpu)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .backward()
+        .unwrap();
 
     let dx_gpu: Vec<f32> = grads_gpu
         .get(&x_gpu)
@@ -4693,13 +5245,27 @@ fn assert_attention_block_parity_f32(
         out_cpu_v.len(),
         "attention_block GPU fwd length mismatch"
     );
+    // `k = 2 * seq`: attention reduces over `head_dim` (QK^T) then over
+    // `seq` (softmax + AV) — `seq` is the larger of the two at every
+    // shape this file exercises, so it drives the Higham-shaped
+    // reduction-depth allowance (same rationale as `assert_ln_parity_f32`'s
+    // `dx` bound).
+    let out_floor = measured_near_zero_floor(&out_cpu_v);
+    let out_bound = |r: f32| f32_relative_bound(r, out_floor, 2.0 * seq as f32);
     for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
         assert!(
-            ((*c - *g).abs() as f64) <= F32_TOL,
+            g.is_finite() && (*c - *g).abs() <= out_bound(*c),
             "attention_block fwd[{i}]: cpu {c} vs cuda {g} (batch={batch}, seq={seq}, \
              heads={heads}, head_dim={head_dim}, window={window:?})"
         );
     }
+    assert_bound_discriminates(
+        &out_cpu_v,
+        &out_gpu_v,
+        out_bound,
+        f32_ulp,
+        "attention_block f32 fwd",
+    );
 
     let dqkv_cpu: Vec<f32> = grads_cpu
         .get(&qkv_cpu)
@@ -4723,12 +5289,21 @@ fn assert_attention_block_parity_f32(
         n,
         "attention_block GPU dqkv length mismatch"
     );
+    let dqkv_floor = measured_near_zero_floor(&dqkv_cpu);
+    let dqkv_bound = |r: f32| f32_relative_bound(r, dqkv_floor, 2.0 * seq as f32);
     for (i, (c, g)) in dqkv_cpu.iter().zip(dqkv_gpu.iter()).enumerate() {
         assert!(
-            ((*c - *g).abs() as f64) <= F32_TOL,
+            g.is_finite() && (*c - *g).abs() <= dqkv_bound(*c),
             "attention_block dqkv[{i}]: cpu {c} vs cuda {g}"
         );
     }
+    assert_bound_discriminates(
+        &dqkv_cpu,
+        &dqkv_gpu,
+        dqkv_bound,
+        f32_ulp,
+        "attention_block f32 dqkv",
+    );
 }
 
 #[test]

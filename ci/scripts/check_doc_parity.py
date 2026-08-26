@@ -95,6 +95,21 @@ class Binding:
     # format* (Rust enum vs. a Python list constant) is a variable, not a
     # second reconciliation mechanism.
     variant_source: str = "rust_enum"
+    # Extra python-list constants (same `enum_file`, `variant_source ==
+    # "python_list"` only) whose elements are UNIONED into the code-side
+    # set alongside `enum_name` — lets a binding's code side be the union of
+    # several named lists (e.g. `MECHANICAL_HERE_IDS` + `MECHANICAL_
+    # ELSEWHERE_IDS`) without concatenating them into a derived constant a
+    # future edit could let drift from its own sources.
+    extra_enum_names: tuple[str, ...] = ()
+    # When set, `parse_guide_variants` only counts a marked-block LINE whose
+    # text contains this substring (case-insensitive) — the guide's per-id
+    # "(mechanical; ...)"/"(auditor-only; ...)" labels partition the SAME
+    # `KERNEL-ORACLE-STANDARD-IDS` block `KernelOracleStandardIds` binds in
+    # full; this is that block read a SECOND time, filtered by label,
+    # reusing the identical set-equality/BEGIN-END-marker mechanism rather
+    # than a bespoke label-aware parser.
+    label_filter: str | None = None
 
     @property
     def has_replay_parity(self) -> bool:
@@ -138,7 +153,36 @@ KERNEL_ORACLE_STANDARD_IDS = Binding(
     variant_source="python_list",
 )
 
-BINDINGS = [PRODUCING_DESCRIPTOR, STORAGE_PRECISION, KERNEL_ORACLE_STANDARD_IDS]
+KERNEL_ORACLE_MECHANICAL_IDS = Binding(
+    name="KernelOracleMechanicalIds",
+    enum_name="MECHANICAL_HERE_IDS",
+    extra_enum_names=("MECHANICAL_ELSEWHERE_IDS",),
+    enum_file=KERNEL_ORACLES_SCRIPT,
+    guide_begin="<!-- BEGIN KERNEL-ORACLE-STANDARD-IDS -->",
+    guide_end="<!-- END KERNEL-ORACLE-STANDARD-IDS -->",
+    guide_file=CUDA_KERNEL_GUIDE,
+    variant_source="python_list",
+    label_filter="mechanical",
+)
+
+KERNEL_ORACLE_AUDITOR_ONLY_IDS = Binding(
+    name="KernelOracleAuditorOnlyIds",
+    enum_name="AUDITOR_ONLY_IDS",
+    enum_file=KERNEL_ORACLES_SCRIPT,
+    guide_begin="<!-- BEGIN KERNEL-ORACLE-STANDARD-IDS -->",
+    guide_end="<!-- END KERNEL-ORACLE-STANDARD-IDS -->",
+    guide_file=CUDA_KERNEL_GUIDE,
+    variant_source="python_list",
+    label_filter="auditor-only",
+)
+
+BINDINGS = [
+    PRODUCING_DESCRIPTOR,
+    STORAGE_PRECISION,
+    KERNEL_ORACLE_STANDARD_IDS,
+    KERNEL_ORACLE_MECHANICAL_IDS,
+    KERNEL_ORACLE_AUDITOR_ONLY_IDS,
+]
 
 
 def _strip_rust_comments(text: str) -> str:
@@ -276,6 +320,8 @@ def parse_guide_variants(
     for line in block.splitlines():
         if not line.strip():
             continue
+        if binding.label_filter is not None and binding.label_filter.lower() not in line.lower():
+            continue
         ident = re.search(r"`([A-Za-z_][A-Za-z0-9_-]*)`", line)
         if ident is None:
             continue
@@ -360,6 +406,8 @@ def check_binding(binding: Binding) -> list[str]:
 
     if binding.variant_source == "python_list":
         code_variants = set(parse_python_list_variants(enum_src, binding.enum_name))
+        for extra_name in binding.extra_enum_names:
+            code_variants |= set(parse_python_list_variants(enum_src, extra_name))
     elif binding.variant_source == "rust_enum":
         code_variants = set(parse_enum_variants(enum_src, binding.enum_name))
     else:

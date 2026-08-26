@@ -83,7 +83,7 @@ same discipline read two ways, not two disciplines.
 - `KO-1` — producer-injected controls (auditor-only; generalizes 3.6)
 - `KO-2` — bound coverage parity (mechanical; instances 3.7)
 - `KO-3` — separation in the artifact (mechanical, optional per artifact leg; instances 3.8)
-- `KO-4` — floors cite a producer (mechanical; instances 3.9)
+- `KO-4` — floors cite a producer (mechanical, advisory leg — the bare scan is `continue_on_error` in ci.yml; instances 3.9)
 - `KO-5` — off-sample bounds (mechanical, marker-scoped; instances 3.2)
 - `KO-6` — live signal (auditor-only; generalizes 3.5)
 - `KO-7` — unrun-is-RED (mechanical, total over every scanned file; instances 3.5)

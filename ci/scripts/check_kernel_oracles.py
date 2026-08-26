@@ -63,16 +63,22 @@ the file, near the relevant control fn:
     against.
 
 **KO-2 (bound coverage parity).** When `control` names a real fn, that fn's
-body (found anywhere in the scanned tree, brace-balanced) must contain EVERY
-identifier listed in `bounds` as a token — a marker cannot claim a bound its own
-control never touches. `control=none:<reason>` opts a cell out of KO-2 entirely
-(reported, never silently passed).
+body (resolved in the marker's OWN file only, brace-balanced) must contain
+EVERY identifier listed in `bounds` used INSIDE an assertion or comparison — an
+`assert!`-family macro argument list, or a statement carrying a comparison
+operator (`<`, `<=`, `>`, `>=`) — either directly in the control fn, or (one
+level of indirection) in a same-file fn the control calls. A bare declaration
+or passing mention does not count. `control=none:<reason>` opts a cell out of
+KO-2 entirely — it becomes DECLARED_UNCONTROLLED (see reconciliation below),
+never silently passed.
 
 **KO-5 (off-sample bounds).** When BOTH `derived-on` and `asserted-on` are real
-seed lists (neither is the literal `none`), their intersection must be EMPTY — a
-bound calibrated on seed 42 and then "validated" by asserting against seed 42
-again is circular, not evidence (the pressure-test design rule in the guide:
-a bound's noise floor must be measured independently of where it is enforced).
+seed lists (neither is the literal `none`), their intersection — after
+normalizing every token to an integer (`42` == `042` == `0x2a`; a non-numeric
+token compares as its raw string) — must be EMPTY: a bound calibrated on seed
+42 and then "validated" by asserting against seed 42 again is circular, not
+evidence (the pressure-test design rule in the guide: a bound's noise floor
+must be measured independently of where it is enforced).
 
 Both rules are MARKER-SCOPED: an unmarked oracle file is reported PENDING in the
 reconciliation, never silently passed OR silently failed. **v1 ships with ZERO
@@ -108,11 +114,47 @@ fixture names that are not real admission keys).
     a non-zero exit naming the marker's file:line.
   - Any marker naming an `op` outside the SHIPPED set, or a malformed marker
     line, is a non-zero exit (mirrors `check_gpu_parity_matrix.py`).
-  - Any op claimed by more than one of COVERED / STRUCTURALLY_EXCLUDED is a
-    non-zero exit (PENDING is computed as the complement, so it cannot
-    conflict with the other two by construction).
+  - Any op claimed by more than one of COVERED / STRUCTURALLY_EXCLUDED /
+    DECLARED_UNCONTROLLED is a non-zero exit (PENDING is computed as the
+    complement, so it cannot conflict with the other three by construction).
   - A parse failure (missing scan root, uncomputable op domain) is a non-zero
     exit naming what could not be resolved.
+
+## Round-2 (adversarial-audit) fixes
+
+  - **Comment/string laundering.** Every scan (KO-7's skip/helper-call search,
+    KO-2's bound-in-assertion search) runs over `_strip_comments_and_strings`
+    output, never raw source — a helper name mentioned only in a `//` comment,
+    or a `panic!`/`JAMMI_REQUIRE_*` token sitting only inside a string literal
+    (an assertion MESSAGE, not real control flow), must never register a
+    fn as a require-gate helper or launder an ungated skip.
+  - **Helper registration by mechanism, not vibes.** A fn registers as a
+    require-gate helper only when its stripped body contains BOTH a real env
+    READ (`std::env::var(`/`env::var(`/`std::env::var_os(`/`env::var_os(`/
+    `option_env!(`) whose string-literal argument starts with
+    `JAMMI_REQUIRE_`, AND a reachable `panic!(`/`unreachable!(`/`.expect(` —
+    a fn that merely returns `Option`/`bool` without ever being able to
+    panic is not a require-GATE at all.
+  - **KO-7 per-skip windowed domination.** An EARLIER helper call in a
+    `#[test]` fn no longer launders every LATER skip in the same fn — each
+    `return` is checked against only the window since the PREVIOUS skip (or
+    fn start), so a gated CUDA-device check followed by an unrelated,
+    ungated `if !FLASH_COMPILED { return; }` further down the same fn still
+    reds. `RETURN_SKIP_RE` also matches `return Ok(...)`/`return Err(...)`.
+  - **KO-2 is file-scoped and assertion-context-aware.** A marker's
+    `control` fn is resolved ONLY within the marker's OWN file (never a
+    same-named fn elsewhere in the tree); a bound must appear inside an
+    `assert!`-family macro call or a comparison-operator-bearing statement
+    IN that control fn, or (one level of indirection) in a same-file helper
+    fn the control calls — a bare declaration or a passing mention no
+    longer counts as coverage.
+  - **A `control=none:<reason>` marker is DECLARED_UNCONTROLLED**, a FOURTH
+    reconciliation category, printed with its reason — it can never move an
+    op into COVERED. `PENDING = SHIPPED − COVERED − STRUCTURALLY_EXCLUDED −
+    DECLARED_UNCONTROLLED`.
+  - **KO-5 seed tokens are normalized to integers** (`42` == `042` ==
+    `0x2a`) before the disjointness check — a non-numeric token still
+    compares as its raw string.
 
 Run: `python3 ci/scripts/check_kernel_oracles.py`
 Suite: `python3 ci/scripts/test_check_kernel_oracles.py`
@@ -154,7 +196,11 @@ STABLE_IDS: tuple[str, ...] = (
 # `check_cuda_run_artifacts.py` (the `oracle_separation` artifact block) and
 # `KO-4` lives in `check_doc_numbers_have_producers.py` (the floor-cites-a-
 # producer trigger) — both documented here for completeness, neither
-# re-implemented in this file (one definition per rule).
+# re-implemented in this file (one definition per rule). Bound to the guide's
+# per-id "mechanical"/"auditor-only" labels by `check_doc_parity.py`'s
+# `KernelOracleMechanicalIds`/`KernelOracleAuditorOnlyIds` bindings (round-2
+# audit item 7) — these constants are not dead weight; a stale label drift
+# between this file and the guide's prose now reds the doc-parity gate.
 MECHANICAL_HERE_IDS = ("KO-2", "KO-5", "KO-7")
 MECHANICAL_ELSEWHERE_IDS = ("KO-3", "KO-4")
 AUDITOR_ONLY_IDS = ("KO-1", "KO-6", "KO-8")
@@ -298,6 +344,97 @@ def parse_markers(text: str, file_label: str) -> list[OracleCellMarker]:
 
 
 # --------------------------------------------------------------------------- #
+# comment/string laundering (round-2 audit item 1) — every KO-7/KO-2 scan
+# below runs over this function's OUTPUT, never raw source. Extends the
+# line-comment-only stripping convention `check_doc_parity.py`'s
+# `_strip_rust_comments` already established (and `check_gpu_parity_matrix.py`
+# independently copies, per this repo's "no cross-script import" gate
+# convention) with block comments and string-literal CONTENTS, since a
+# helper name mentioned only in prose, or a `panic!`/`JAMMI_REQUIRE_*` token
+# sitting only inside an assertion MESSAGE string, must never be mistaken for
+# real control flow. Output is the SAME LENGTH as the input (every stripped
+# character becomes a space, newlines kept as newlines) so every downstream
+# offset/line-number computation is unaffected.
+#
+# `strip_strings=False` keeps string CONTENTS intact while still consuming
+# comments (and skipping over a string body so a `//`/`/*` sequence INSIDE a
+# string literal is never mistaken for the start of a real comment) — needed
+# by helper REGISTRATION (`find_require_gate_helpers`), which must read the
+# literal `"JAMMI_REQUIRE_..."` argument text as DATA, not blank it; blanking
+# it would make helper registration structurally impossible; the comment-only
+# leg still satisfies this round's own test ("a helper whose panic!(/
+# JAMMI_REQUIRE_* occur only in COMMENTS is not registered").
+# --------------------------------------------------------------------------- #
+_RAW_STRING_OPEN_RE = re.compile(r'r(#*)"')
+
+
+def _strip_comments_and_strings(source: str, strip_strings: bool = True) -> str:
+    out: list[str] = []
+    i, n = 0, len(source)
+    while i < n:
+        two = source[i : i + 2]
+        if two == "//":
+            while i < n and source[i] != "\n":
+                out.append(" ")
+                i += 1
+            continue
+        if two == "/*":
+            out.append("  ")
+            i += 2
+            while i < n and source[i : i + 2] != "*/":
+                out.append("\n" if source[i] == "\n" else " ")
+                i += 1
+            if i < n:
+                out.append("  ")
+                i += 2
+            continue
+        m = _RAW_STRING_OPEN_RE.match(source, i)
+        if m:
+            hashes = m.group(1)
+            opener = m.group(0)
+            out.append(opener if not strip_strings else " " * len(opener))
+            i = m.end()
+            closer = '"' + hashes
+            end = source.find(closer, i)
+            if end == -1:
+                end = n
+            body = source[i:end]
+            out.append(body if not strip_strings else "".join("\n" if c == "\n" else " " for c in body))
+            i = end
+            if i < n:
+                out.append(closer)
+                i += len(closer)
+            continue
+        if source[i] == '"':
+            out.append('"' if not strip_strings else " ")
+            i += 1
+            while i < n and source[i] != '"':
+                if source[i] == "\\" and i + 1 < n:
+                    out.append(source[i : i + 2] if not strip_strings else "  ")
+                    i += 2
+                    continue
+                if strip_strings:
+                    out.append("\n" if source[i] == "\n" else " ")
+                else:
+                    out.append(source[i])
+                i += 1
+            if i < n:
+                out.append('"' if not strip_strings else " ")
+                i += 1
+            continue
+        out.append(source[i])
+        i += 1
+    return "".join(out)
+
+
+def _strip_comments_only(source: str) -> str:
+    """`_strip_comments_and_strings` with string CONTENTS preserved — the
+    registration-mechanism variant (see the module-level comment above).
+    """
+    return _strip_comments_and_strings(source, strip_strings=False)
+
+
+# --------------------------------------------------------------------------- #
 # brace-balanced fn-body extraction — shared by KO-2's control-fn lookup and
 # KO-7's #[test]-fn / require-gate-helper scan.
 # --------------------------------------------------------------------------- #
@@ -306,7 +443,14 @@ _ATTR_LINE_RE = re.compile(r"^\s*#!?\[")
 
 
 def _extract_fn_body(source: str, fn_kw_start: int) -> tuple[str, int, int]:
-    """Returns (body_text_including_braces, brace_open_idx, brace_close_idx)."""
+    """Returns (body_text_including_braces, brace_open_idx, brace_close_idx).
+    Operates on RAW source (not stripped) so the `{`/`}` count is never
+    thrown off by a stray brace character the stripper already neutralizes
+    to a space — a space can never be mistaken for a real brace either way,
+    so this is safe over either input; kept on raw source to keep
+    `body_start_idx` meaningful for both `fn.body` (raw, used for
+    `_extract_fn_body`-style nested lookups) and `fn.body_stripped`.
+    """
     brace_start = source.find("{", fn_kw_start)
     if brace_start == -1:
         return "", -1, -1
@@ -325,7 +469,9 @@ def _extract_fn_body(source: str, fn_kw_start: int) -> tuple[str, int, int]:
 class FnRecord:
     name: str
     file: str
-    body: str
+    body: str  # raw (comments/strings intact)
+    body_stripped: str  # SAME LENGTH as `body`; comments AND strings blanked
+    body_comments_stripped: str  # SAME LENGTH; comments blanked, strings intact
     body_start_idx: int  # offset of the fn's own `{` within `source`
     is_test: bool
 
@@ -344,8 +490,28 @@ def find_fns(source: str, file_label: str) -> list[FnRecord]:
     with whether its contiguous attribute block above the `fn` line contains
     any attribute whose text mentions "test" (covers `#[test]`,
     `#[tokio::test]`, ... — same convention as `check_doc_numbers_have_
-    producers.py`'s `build_test_fn_index`).
+    producers.py`'s `build_test_fn_index`). `FN_HEAD_RE` matches "fn
+    <name>(" as a contiguous token regardless of how many lines the REST of
+    the signature spans before the body's opening `{` — multi-line
+    signatures are already handled here (this is the fn-boundary detector;
+    the multi-line-signature GAP the round-2 audit found is specific to
+    `check_doc_numbers_have_producers.py`'s single-line `FN_SIG_RE`, a
+    different, name-keyed heuristic that file no longer uses for this
+    reason — see that file's own module doc).
+
+    `FN_HEAD_RE` is matched against the COMMENT/STRING-STRIPPED source
+    (round-2 audit fix, folded into this same item-1 pass): a `fn foo(...)
+    { ... }` signature merely QUOTED in a `//` comment or a string literal
+    (e.g. `// fn fake_helper() { std::env::var_os(...); panic!(...); }`)
+    must never be discovered as a real function — the STRIPPED source's `fn`
+    keyword is blanked to spaces there, so `\bfn\b` cannot match it at all.
+    `_strip_comments_and_strings` is LENGTH-PRESERVING, so every match
+    position found in the stripped text is a valid position in the RAW
+    `source` too — the actual fn body is still extracted from RAW `source`
+    (via `_extract_fn_body`) so its own internal comments/strings survive
+    for `body`/`body_stripped`/`body_comments_stripped` to be computed from.
     """
+    stripped_full = _strip_comments_and_strings(source)
     lines = source.splitlines(keepends=True)
     # Precompute the character offset each line starts at, so a regex match
     # position in `source` maps back to a line index.
@@ -367,33 +533,66 @@ def find_fns(source: str, file_label: str) -> list[FnRecord]:
 
     records: list[FnRecord] = []
     plain_lines = [line.rstrip("\n") for line in lines]
-    for m in FN_HEAD_RE.finditer(source):
+    for m in FN_HEAD_RE.finditer(stripped_full):
         name = m.group(1)
         fn_line_idx = line_idx_of(m.start())
         is_test = _has_test_attr(plain_lines, fn_line_idx)
         body, body_start, _ = _extract_fn_body(source, m.end())
         if not body:
             continue
-        records.append(FnRecord(name=name, file=file_label, body=body, body_start_idx=body_start, is_test=is_test))
+        records.append(
+            FnRecord(
+                name=name,
+                file=file_label,
+                body=body,
+                body_stripped=_strip_comments_and_strings(body),
+                body_comments_stripped=_strip_comments_only(body),
+                body_start_idx=body_start,
+                is_test=is_test,
+            )
+        )
     return records
 
 
 # --------------------------------------------------------------------------- #
 # KO-7 — unrun-is-RED
 # --------------------------------------------------------------------------- #
-REQUIRE_ENV_RE = re.compile(r"\bJAMMI_REQUIRE_[A-Z0-9_]*\b")
-PANIC_CALL_RE = re.compile(r"\bpanic!\s*\(")
-RETURN_SKIP_RE = re.compile(r"\breturn\b\s*[;}]")
+ENV_READ_RE = re.compile(
+    r'\b(?:std::env::var_os|env::var_os|std::env::var|env::var|option_env!)\s*\(\s*"(JAMMI_REQUIRE_[A-Z0-9_]*)"'
+)
+PANIC_REACHABLE_RE = re.compile(r"\b(?:panic!|unreachable!)\s*\(|\.expect\s*\(")
+# `return;` / brace-tail `return}`, plus (round-2 audit item 6) `return
+# Ok(...)`/`return Err(...)` — a #[test] fn returning `Result<(), E>` that
+# early-exits via either shape is just as much a silent skip as a bare
+# `return;`. Only the START of the statement is matched (sufficient for
+# textual ordering/windowing below); the rest of a multi-token `Ok(...)`
+# expression is not consumed.
+RETURN_SKIP_RE = re.compile(r"\breturn\b\s*(?:;|\}|Ok\s*\(|Err\s*\()")
 
 
 def find_require_gate_helpers(all_fns: list[FnRecord]) -> set[str]:
-    """A fn is a REGISTERED require-gate helper iff its body reads a
-    `JAMMI_REQUIRE_*` env var AND calls `panic!` — discovered by shape,
-    never a hardcoded name list (see module doc).
+    """A fn is a REGISTERED require-gate helper iff its COMMENTS-stripped
+    body (comments blanked, string CONTENTS intact — see
+    `_strip_comments_only`'s doc for why the env-var argument string must
+    stay readable) contains BOTH a real env-read call (`std::env::var(`/
+    `env::var(`/`std::env::var_os(`/`env::var_os(`/`option_env!(`) whose
+    string-literal argument starts with `JAMMI_REQUIRE_`, AND a reachable
+    `panic!(`/`unreachable!(`/`.expect(` — discovered by shape, never a
+    hardcoded name list (see module doc). The env-read half is checked
+    against `body_comments_stripped` (comments blanked, string CONTENTS
+    intact — the env-var name IS the string argument, so it cannot be
+    blanked). The panic-reachability half is checked against `body_stripped`
+    (comments AND strings both blanked) instead — that check never needs
+    string content, so this additionally guards against a `panic!(`/
+    `.expect(`-shaped SUBSTRING sitting merely inside an unrelated string
+    literal (e.g. a message describing the mechanism in prose) being
+    mistaken for a real, reachable panic call. A helper name/env-read/panic
+    mentioned only inside a COMMENT is blanked in both variants and
+    correctly does not register.
     """
     helpers: set[str] = set()
     for fn in all_fns:
-        if REQUIRE_ENV_RE.search(fn.body) and PANIC_CALL_RE.search(fn.body):
+        if ENV_READ_RE.search(fn.body_comments_stripped) and PANIC_REACHABLE_RE.search(fn.body_stripped):
             helpers.add(fn.name)
     return helpers
 
@@ -405,40 +604,43 @@ class UngatedSkip:
     line_no: int
 
 
-def _line_no_within(body: str, pos: int, body_start_line: int) -> int:
-    return body_start_line + body.count("\n", 0, pos)
-
-
 def check_ko7(all_fns: list[FnRecord], helper_names: set[str], source_texts: dict[str, str]) -> list[UngatedSkip]:
-    """Every `return;`/`return}` inside every `#[test]` fn body must be
-    textually dominated (an earlier position in the SAME fn body) by a call
-    to a name in `helper_names`. `source_texts` is `{file_label: full_text}`
-    — used only to translate a body-relative offset into a 1-indexed file
-    line number for reporting.
+    """Every `return;`/`return}`/`return Ok(`/`return Err(` inside every
+    `#[test]` fn's STRIPPED body must be textually dominated by a call to a
+    name in `helper_names` — PER SKIP (round-2 audit item 6): the dominance
+    window for a given `return` is `[end of the PREVIOUS skip (or fn
+    start), this skip's start)`, so an early helper call gates only the
+    skip(s) immediately downstream of it, never every later skip in the
+    same fn unconditionally — a gated CUDA-device check followed by an
+    UNRELATED, ungated `if !FLASH_COMPILED { return; }` further down the
+    same fn still reds.
     """
     helper_call_res = {name: re.compile(rf"\b{re.escape(name)}\s*\(") for name in helper_names}
     findings: list[UngatedSkip] = []
     for fn in all_fns:
         if not fn.is_test:
             continue
-        skip_positions = [m.start() for m in RETURN_SKIP_RE.finditer(fn.body)]
-        if not skip_positions:
+        skip_matches = sorted(RETURN_SKIP_RE.finditer(fn.body_stripped), key=lambda m: m.start())
+        if not skip_matches:
             continue
-        helper_positions: list[int] = []
-        for name, cre in helper_call_res.items():
-            helper_positions.extend(m.start() for m in cre.finditer(fn.body))
-        for pos in skip_positions:
-            if not any(hp < pos for hp in helper_positions):
-                # translate `pos` (offset within fn.body) back to a file line
+        helper_positions = sorted(
+            m.start() for cre in helper_call_res.values() for m in cre.finditer(fn.body_stripped)
+        )
+        window_start = 0
+        for m in skip_matches:
+            pos = m.start()
+            gated = any(window_start <= hp < pos for hp in helper_positions)
+            if not gated:
                 full = source_texts[fn.file]
                 abs_pos = fn.body_start_idx + pos
                 line_no = full.count("\n", 0, abs_pos) + 1
                 findings.append(UngatedSkip(file=fn.file, fn_name=fn.name, line_no=line_no))
+            window_start = m.end()
     return findings
 
 
 # --------------------------------------------------------------------------- #
-# KO-2 — bound coverage parity (marker-scoped)
+# KO-2 — bound coverage parity (marker-scoped, round-2 audit item 4)
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class Ko2Finding:
@@ -447,46 +649,125 @@ class Ko2Finding:
     control_not_found: bool = False
 
 
+ASSERT_MACRO_RE = re.compile(
+    r"\b(?:assert|assert_eq|assert_ne|debug_assert|debug_assert_eq|debug_assert_ne)!\s*\("
+)
+_COMPARISON_OP_RE_KO2 = re.compile(r"<=|>=|<|>")
+
+
+def _extract_paren_balanced(text: str, open_paren_idx: int) -> str:
+    depth = 0
+    for i in range(open_paren_idx, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_paren_idx : i + 1]
+    return text[open_paren_idx:]
+
+
+def _bound_in_assertion_context(body_stripped: str, bound_name: str) -> bool:
+    """`bound_name` (an identifier) appears EITHER inside an assert!-family
+    macro call's argument list, OR on a statement (split on `;`/`{`/`}`)
+    that ALSO carries a comparison operator — never a bare declaration or
+    passing mention (a comment or a string, both already stripped upstream,
+    cannot satisfy this either).
+    """
+    name_re = re.compile(rf"\b{re.escape(bound_name)}\b")
+
+    for m in ASSERT_MACRO_RE.finditer(body_stripped):
+        args = _extract_paren_balanced(body_stripped, m.end() - 1)
+        if name_re.search(args):
+            return True
+
+    for stmt in re.split(r"[;{}]", body_stripped):
+        if name_re.search(stmt) and _COMPARISON_OP_RE_KO2.search(stmt):
+            return True
+
+    return False
+
+
 def check_ko2(markers: list[OracleCellMarker], all_fns: list[FnRecord]) -> list[Ko2Finding]:
-    by_name: dict[str, list[FnRecord]] = {}
+    """The `control` fn is resolved ONLY within the marker's OWN FILE — a
+    same-named fn elsewhere in the scanned tree is never consulted. A bound
+    is covered iff `_bound_in_assertion_context` holds directly on the
+    control fn, or (one level of indirection) on a SAME-FILE fn the control
+    calls.
+    """
+    by_file_name: dict[str, dict[str, list[FnRecord]]] = {}
     for fn in all_fns:
-        by_name.setdefault(fn.name, []).append(fn)
+        by_file_name.setdefault(fn.file, {}).setdefault(fn.name, []).append(fn)
 
     findings: list[Ko2Finding] = []
     for marker in markers:
         if marker.is_control_none:
             continue
-        candidates = by_name.get(marker.control)
+        same_file_fns = by_file_name.get(marker.file, {})
+        candidates = same_file_fns.get(marker.control)
         if not candidates:
             findings.append(Ko2Finding(marker=marker, control_not_found=True))
             continue
-        combined_body = "\n".join(c.body for c in candidates)
-        missing = tuple(
-            b for b in marker.bounds if not re.search(rf"\b{re.escape(b)}\b", combined_body)
-        )
+
+        missing: list[str] = []
+        for bound in marker.bounds:
+            if any(_bound_in_assertion_context(c.body_stripped, bound) for c in candidates):
+                continue
+            via_helper = False
+            for c in candidates:
+                for callee_name, callee_fns in same_file_fns.items():
+                    if callee_name == marker.control:
+                        continue
+                    if not re.search(rf"\b{re.escape(callee_name)}\s*\(", c.body_stripped):
+                        continue
+                    if any(_bound_in_assertion_context(cf.body_stripped, bound) for cf in callee_fns):
+                        via_helper = True
+                        break
+                if via_helper:
+                    break
+            if not via_helper:
+                missing.append(bound)
         if missing:
-            findings.append(Ko2Finding(marker=marker, missing_bounds=missing))
+            findings.append(Ko2Finding(marker=marker, missing_bounds=tuple(missing)))
     return findings
 
 
 # --------------------------------------------------------------------------- #
-# KO-5 — off-sample bounds (marker-scoped)
+# KO-5 — off-sample bounds (marker-scoped, round-2 audit item 8)
 # --------------------------------------------------------------------------- #
+def _normalize_seed_token(tok: str) -> int | str:
+    """`42` == `042` == `0x2a` — a seed is compared as its VALUE, not its
+    spelling. A non-numeric token (a named seed like `seedA`) falls back to
+    comparing as its raw string.
+    """
+    t = tok.strip()
+    try:
+        if t.lower().startswith("0x"):
+            return int(t, 16)
+        return int(t, 10)
+    except ValueError:
+        return t
+
+
 def check_ko5(markers: list[OracleCellMarker]) -> list[OracleCellMarker]:
     """Markers whose `derived-on` and `asserted-on` seed sets are BOTH real
-    lists (neither the literal `none`) and intersect — circular calibration.
+    lists (neither the literal `none`) and intersect, AFTER normalizing
+    every token to an integer where possible — circular calibration.
     """
     findings: list[OracleCellMarker] = []
     for marker in markers:
         if marker.derived_on is None or marker.asserted_on is None:
             continue
-        if set(marker.derived_on) & set(marker.asserted_on):
+        derived_norm = {_normalize_seed_token(s) for s in marker.derived_on}
+        asserted_norm = {_normalize_seed_token(s) for s in marker.asserted_on}
+        if derived_norm & asserted_norm:
             findings.append(marker)
     return findings
 
 
 # --------------------------------------------------------------------------- #
-# reconciliation — op domain × marker coverage
+# reconciliation — op domain × marker coverage (round-2 audit item 3 adds
+# DECLARED_UNCONTROLLED as a fourth category)
 # --------------------------------------------------------------------------- #
 # Reviewed, in-script. Empty in v1 — no op has been reviewed off the op
 # domain yet; kept as a dict (not omitted) so a future round has somewhere
@@ -494,12 +775,21 @@ def check_ko5(markers: list[OracleCellMarker]) -> list[OracleCellMarker]:
 STRUCTURALLY_EXCLUDED_OPS: dict[str, str] = {}
 
 
-def reconcile_ops(shipped: set[str], covered: dict[str, list[OracleCellMarker]], excluded: dict[str, str]) -> tuple[dict[str, str], list[str]]:
+def reconcile_ops(
+    shipped: set[str],
+    covered: dict[str, list[OracleCellMarker]],
+    excluded: dict[str, str],
+    declared_uncontrolled: dict[str, list[OracleCellMarker]],
+) -> tuple[dict[str, str], list[str]]:
     """Returns (pending_with_reason, failures). PENDING is COMPUTED (the
-    complement of COVERED ∪ EXCLUDED within SHIPPED), never hand-curated —
-    v1 has no markers, so every un-excluded op is honestly PENDING; a
-    reviewer only ever ADDS to `STRUCTURALLY_EXCLUDED_OPS` or lands a real
-    marker, never edits a PENDING dict directly.
+    complement of COVERED ∪ EXCLUDED ∪ DECLARED_UNCONTROLLED within
+    SHIPPED), never hand-curated — v1 has no CONTROLLED markers, so every
+    un-excluded, un-declared op is honestly PENDING; a reviewer only ever
+    ADDS to `STRUCTURALLY_EXCLUDED_OPS`, lands a real controlled marker, or
+    declares `control=none:<reason>`, never edits a PENDING dict directly.
+    A `control=none:<reason>` marker can NEVER move its op into COVERED —
+    `covered` here is pre-filtered by the caller (`run_gate`) to markers
+    with a REAL control only.
     """
     failures: list[str] = []
 
@@ -509,35 +799,56 @@ def reconcile_ops(shipped: set[str], covered: dict[str, list[OracleCellMarker]],
     for op in excluded:
         if op not in shipped:
             failures.append(f"STRUCTURALLY_EXCLUDED_OPS entry `{op}` references unknown op — not in the SHIPPED admission-key set")
+    for op in declared_uncontrolled:
+        if op not in shipped:
+            failures.append(f"DECLARED_UNCONTROLLED entry `{op}` references unknown op — not in the SHIPPED admission-key set")
 
-    overlap = set(covered) & set(excluded)
-    for op in sorted(overlap):
-        failures.append(f"op `{op}` is claimed both COVERED and STRUCTURALLY_EXCLUDED — remove one")
+    pairs = [
+        (set(covered), set(excluded), "COVERED and STRUCTURALLY_EXCLUDED"),
+        (set(covered), set(declared_uncontrolled), "COVERED and DECLARED_UNCONTROLLED"),
+        (set(excluded), set(declared_uncontrolled), "STRUCTURALLY_EXCLUDED and DECLARED_UNCONTROLLED"),
+    ]
+    for left, right, label in pairs:
+        for op in sorted(left & right):
+            failures.append(f"op `{op}` is claimed both {label} — remove one")
 
     pending_reason = (
-        "shipped admission key with no `oracle-cell` marker yet — v1 scope excludes every "
-        "numerics-owned file (crates/jammi-kernels, crates/jammi-encoders); tracked debt, "
+        "shipped admission key with no CONTROLLED `oracle-cell` marker yet — v1 scope excludes "
+        "every numerics-owned file (crates/jammi-kernels, crates/jammi-encoders); tracked debt, "
         "see docs/maintainer/cuda-kernel-guide.md §3's kernel-acceptance-oracle standard."
     )
-    pending = {op: pending_reason for op in sorted(shipped - set(covered) - set(excluded))}
+    accounted = set(covered) | set(excluded) | set(declared_uncontrolled)
+    pending = {op: pending_reason for op in sorted(shipped - accounted)}
     return pending, failures
 
 
-def print_reconciliation(shipped: set[str], covered: dict[str, list[OracleCellMarker]], excluded: dict[str, str], pending: dict[str, str]) -> None:
+def print_reconciliation(
+    shipped: set[str],
+    covered: dict[str, list[OracleCellMarker]],
+    excluded: dict[str, str],
+    declared_uncontrolled: dict[str, list[OracleCellMarker]],
+    pending: dict[str, str],
+) -> None:
     print("kernel-oracle op reconciliation:")
     for op in sorted(shipped):
         if op in covered:
             legs = ", ".join(f"{m.file}:{m.line_no}" for m in covered[op])
-            print(f"    COVERED             {op}  <- {legs}")
+            print(f"    COVERED                {op}  <- {legs}")
         elif op in excluded:
-            print(f"    STRUCTURALLY_EXCL   {op}  — {excluded[op]}")
+            print(f"    STRUCTURALLY_EXCL      {op}  — {excluded[op]}")
+        elif op in declared_uncontrolled:
+            reasons = sorted(
+                {m.control.split(":", 1)[1] if ":" in m.control else m.control for m in declared_uncontrolled[op]}
+            )
+            print(f"    DECLARED_UNCONTROLLED  {op}  — {', '.join(reasons)}")
         elif op in pending:
-            print(f"    PENDING             {op}")
+            print(f"    PENDING                {op}")
         else:
-            print(f"    !!!! UNACCOUNTED !!!! {op}")
+            print(f"    !!!! UNACCOUNTED !!!!  {op}")
     print(
         f"\nSummary: {len(covered)} COVERED, {len(excluded)} STRUCTURALLY_EXCLUDED, "
-        f"{len(pending)} PENDING out of {len(shipped)} SHIPPED admission keys."
+        f"{len(declared_uncontrolled)} DECLARED_UNCONTROLLED, {len(pending)} PENDING "
+        f"out of {len(shipped)} SHIPPED admission keys."
     )
 
 
@@ -559,10 +870,18 @@ def scan_files() -> dict[str, str]:
     return texts
 
 
-def run_gate(source_texts: dict[str, str], shipped_ops: set[str]) -> tuple[list[UngatedSkip], list[Ko2Finding], list[OracleCellMarker], dict[str, list[OracleCellMarker]], dict[str, str], list[str]]:
+def run_gate(source_texts: dict[str, str], shipped_ops: set[str]) -> tuple[
+    list[UngatedSkip],
+    list[Ko2Finding],
+    list[OracleCellMarker],
+    dict[str, list[OracleCellMarker]],
+    dict[str, list[OracleCellMarker]],
+    dict[str, str],
+    list[str],
+]:
     """Pure orchestration over `{file: text}` + the SHIPPED op set — the
     self-test seam. Returns (ko7_findings, ko2_findings, ko5_findings,
-    covered, pending, reconciliation_failures).
+    covered, declared_uncontrolled, pending, reconciliation_failures).
     """
     all_fns: list[FnRecord] = []
     all_markers: list[OracleCellMarker] = []
@@ -575,45 +894,59 @@ def run_gate(source_texts: dict[str, str], shipped_ops: set[str]) -> tuple[list[
     ko2 = check_ko2(all_markers, all_fns)
     ko5 = check_ko5(all_markers)
 
-    covered: dict[str, list[OracleCellMarker]] = {}
+    markers_by_op: dict[str, list[OracleCellMarker]] = {}
     for marker in all_markers:
-        covered.setdefault(marker.op, []).append(marker)
+        markers_by_op.setdefault(marker.op, []).append(marker)
 
-    pending, recon_failures = reconcile_ops(shipped_ops, covered, STRUCTURALLY_EXCLUDED_OPS)
+    covered: dict[str, list[OracleCellMarker]] = {}
+    declared_uncontrolled: dict[str, list[OracleCellMarker]] = {}
+    for op, markers_for_op in markers_by_op.items():
+        controlled = [m for m in markers_for_op if not m.is_control_none]
+        if controlled:
+            covered[op] = controlled
+        else:
+            declared_uncontrolled[op] = markers_for_op
 
-    return ko7, ko2, ko5, covered, pending, recon_failures
+    pending, recon_failures = reconcile_ops(shipped_ops, covered, STRUCTURALLY_EXCLUDED_OPS, declared_uncontrolled)
+
+    return ko7, ko2, ko5, covered, declared_uncontrolled, pending, recon_failures
 
 
 def main() -> int:
     try:
         source_texts = scan_files()
         shipped_ops = load_shipped_ops()
-        ko7, ko2, ko5, covered, pending, recon_failures = run_gate(source_texts, shipped_ops)
+        ko7, ko2, ko5, covered, declared_uncontrolled, pending, recon_failures = run_gate(source_texts, shipped_ops)
     except OracleError as exc:
         print(f"kernel-oracles: FAIL (uncomputable) — {exc}", file=sys.stderr)
         return 1
 
-    print_reconciliation(shipped_ops, covered, STRUCTURALLY_EXCLUDED_OPS, pending)
+    print_reconciliation(shipped_ops, covered, STRUCTURALLY_EXCLUDED_OPS, declared_uncontrolled, pending)
 
     ko7_by_file: dict[str, list[UngatedSkip]] = {}
     for f in ko7:
         ko7_by_file.setdefault(f.file, []).append(f)
     print("\nKO-7 (unrun-is-RED) per scanned file:")
     for file_label, text in source_texts.items():
-        n_skips = sum(1 for fn in find_fns(text, file_label) if fn.is_test for _ in RETURN_SKIP_RE.finditer(fn.body))
+        fns_in_file = find_fns(text, file_label)
+        n_skips = sum(
+            len(RETURN_SKIP_RE.findall(fn.body_stripped)) for fn in fns_in_file if fn.is_test
+        )
         n_ungated = len(ko7_by_file.get(file_label, []))
         print(f"    {file_label}: {n_skips} runtime skip(s), {n_ungated} ungated")
 
     failures: list[str] = list(recon_failures)
     for f in ko7:
-        failures.append(f"KO-7: {f.file}:{f.line_no} — ungated runtime skip in `#[test] fn {f.fn_name}` (no registered require-gate helper called before this return)")
+        failures.append(f"KO-7: {f.file}:{f.line_no} — ungated runtime skip in `#[test] fn {f.fn_name}` (no registered require-gate helper called in the window since the previous skip)")
     for f in ko2:
         if f.control_not_found:
-            failures.append(f"KO-2: {f.marker.file}:{f.marker.line_no} — oracle-cell control fn `{f.marker.control}` not found in any scanned file")
+            failures.append(f"KO-2: {f.marker.file}:{f.marker.line_no} — oracle-cell control fn `{f.marker.control}` not found in the marker's own file")
         else:
-            failures.append(f"KO-2: {f.marker.file}:{f.marker.line_no} — control fn `{f.marker.control}` does not assert against bound(s) {', '.join(f.missing_bounds)}")
+            failures.append(f"KO-2: {f.marker.file}:{f.marker.line_no} — control fn `{f.marker.control}` does not assert against bound(s) {', '.join(f.missing_bounds)} inside an assertion/comparison")
     for f in ko5:
-        overlap = sorted(set(f.derived_on or ()) & set(f.asserted_on or ()))
+        derived_norm = {_normalize_seed_token(s) for s in (f.derived_on or ())}
+        asserted_norm = {_normalize_seed_token(s) for s in (f.asserted_on or ())}
+        overlap = sorted(str(s) for s in (derived_norm & asserted_norm))
         failures.append(f"KO-5: {f.file}:{f.line_no} — derived-on/asserted-on share seed(s) {', '.join(overlap)} (circular calibration)")
 
     if failures:
@@ -624,10 +957,11 @@ def main() -> int:
         return 1
 
     print(
-        "\nkernel-oracles: PASS — every scanned #[test] runtime skip is gated (KO-7); "
-        "every marked oracle-cell's bounds are covered by its control (KO-2) and "
-        "derived/asserted on disjoint seeds (KO-5); reconciliation is fully accounted "
-        "(v1: 0 markers, every SHIPPED op honestly PENDING)."
+        "\nkernel-oracles: PASS — every scanned #[test] runtime skip is gated per-skip (KO-7); "
+        "every marked oracle-cell's bounds are asserted/compared by its file-scoped control (KO-2) "
+        "and derived/asserted on disjoint (integer-normalized) seeds (KO-5); reconciliation is "
+        "fully accounted across all four categories (v1: 0 controlled markers, every SHIPPED op "
+        "honestly PENDING or DECLARED_UNCONTROLLED)."
     )
     return 0
 

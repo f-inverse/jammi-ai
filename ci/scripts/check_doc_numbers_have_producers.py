@@ -539,18 +539,159 @@ FLOOR_DECL_RE = re.compile(
 FLOOR_NAME_SUFFIX_RE = re.compile(r"(?i)_floor$")
 FLOOR_LITERAL_RE = re.compile(r"-?\d[\d_]*(?:\.\d+)?(?:[eE]-?\d+)?(?:f32|f64)?")
 
-FN_SIG_RE = re.compile(
-    r"^\s*(?:pub(?:\([^)]*\))?\s+)?fn\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\([^)]*\)"
-    r"\s*(?:->\s*(?P<ret>[A-Za-z_][A-Za-z0-9_:<>&' ]*))?\s*\{?\s*$"
-)
-_COMPARISON_FEEDING_NAME_RE = re.compile(
-    r"(?i)\b(?:bound|close|tol|floor|threshold|within)"
+# Round-6 audit fix: the ORIGINAL category (A) design keyed comparison-
+# feeding-ness off the ENCLOSING fn's OWN name/return type, via a
+# single-line-only `FN_SIG_RE` — both were real gaps found against
+# `cuda_parity.rs`'s actual `.max(1.0)` floor sites: (i) `assert_ln_parity_
+# bf16`/`assert_softmax_scale_parity_bf16` (lines 476/1515) span their
+# signature across multiple lines, so the single-line anchor never matched
+# at all and every floor inside those fns was invisible; (ii) the floor
+# usually lives in a LOCAL BINDING (`let bf16_bound = |c, g| ... .max(1.0);`)
+# whose enclosing fn is a generic `assert_*_parity_*` helper with no
+# "bound"/"tol"/"floor" in ITS OWN name — the comparison-feeding-ness lives
+# on the LOCAL NAME (`bf16_bound`), not the fn. The redesign below fixes
+# both: fn boundaries are found via brace-balanced extraction over the
+# WHOLE FILE (any signature shape, any number of lines — mirrors
+# `check_kernel_oracles.py`'s `find_fns`, kept as an independent copy per
+# this repo's no-cross-script-import gate convention), and comparison-
+# feeding-ness is decided per STATEMENT: a `let <name> = <rhs>;` whose RHS
+# carries a floor literal is a hit iff `<name>` is later used, in the SAME
+# fn body, inside an `assert!`-family macro call or a `<=`/`>=`-bearing
+# statement (the LOCAL-BINDING rule); a floor literal with NO enclosing
+# `let` is a hit iff ITS OWN statement already satisfies that same
+# assert/comparison test (the INLINE rule, e.g. `magnitude.max(1e-12)`
+# used directly inside `... <= REL`).
+FN_HEAD_RE_KO4 = re.compile(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)\s*[(<]")
+LET_BINDING_RE = re.compile(r"\blet\s+(?:mut\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=]+)?=")
+ASSERT_MACRO_RE_KO4 = re.compile(
+    r"\b(?:assert|assert_eq|assert_ne|debug_assert|debug_assert_eq|debug_assert_ne)!\s*\("
 )
 FLOOR_MAX_RE = re.compile(
     r"\.max\(\s*(-?\d[\d_]*(?:\.\d+)?(?:[eE]-?\d+)?(?:f32|f64)?)\s*\)"
 )
 FLOOR_ADD_RE = re.compile(r"\+\s*(-?\d[\d_]*\.\d+(?:[eE]-?\d+)?(?:f32|f64)?)\b")
 _COMPARISON_OP_RE = re.compile(r"<=|>=")
+
+
+def _blank_comments_and_strings_ko4(text: str) -> str:
+    """Length-preserving `//`-comment and `"..."`-string-content blanker,
+    used ONLY to find real `fn` keyword POSITIONS (never to build the body
+    text itself, which is still extracted from RAW `text` at those verified
+    positions) — a `fn foo(...)  { ... }` shape merely quoted in a comment
+    or a string literal (e.g. an example in a doc comment) must not be
+    discovered as a real function. Block comments and raw strings are not
+    this repo's kernel-test convention and are left unhandled; imprecision
+    here only risks UNDER-stripping, which fails toward scanning MORE text
+    on this advisory-leg shape, never less.
+    """
+    out: list[str] = []
+    i, n = 0, len(text)
+    in_string = False
+    while i < n:
+        c = text[i]
+        if in_string:
+            if c == "\\" and i + 1 < n:
+                out.append("  ")
+                i += 2
+                continue
+            if c == '"':
+                in_string = False
+                out.append(" ")
+                i += 1
+                continue
+            out.append("\n" if c == "\n" else " ")
+            i += 1
+            continue
+        if text[i : i + 2] == "//":
+            while i < n and text[i] != "\n":
+                out.append(" ")
+                i += 1
+            continue
+        if c == '"':
+            in_string = True
+            out.append(" ")
+            i += 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _extract_fn_body_ko4(text: str, fn_kw_end: int) -> tuple[str, int, int]:
+    brace_start = text.find("{", fn_kw_end)
+    if brace_start == -1:
+        return "", -1, -1
+    depth = 0
+    for i in range(brace_start, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[brace_start : i + 1], brace_start, i
+    return text[brace_start:], brace_start, len(text) - 1
+
+
+def _find_stmt_terminator(text: str, start: int) -> int:
+    """Index just PAST the depth-balanced `;` that terminates the `let`
+    statement beginning at `start` (right after its own `let name =`) — a
+    `let` is always `;`-terminated in valid Rust, regardless of what
+    surrounds it (a `for`/`if`/`match` block with NO trailing `;` of its
+    own, which is why a general "split the whole fn body into top-level
+    `;`-terminated statements" pass is the WRONG tool here: a block
+    expression used as a statement needs no `;`, so naive `;`-splitting
+    silently merges everything after it into one giant tail statement —
+    the round-6 bug this function replaces. Scanning forward from the
+    KNOWN start of a specific `let`'s RHS sidesteps that entirely: it never
+    needs to know where any OTHER statement begins or ends.
+    """
+    depth = 0
+    i, n = start, len(text)
+    while i < n:
+        c = text[i]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            if depth == 0:
+                return i  # closing bracket of an ENCLOSING scope — bail
+            depth -= 1
+        elif c == ";" and depth == 0:
+            return i + 1
+        i += 1
+    return n
+
+
+def _extract_paren_balanced_ko4(text: str, open_paren_idx: int) -> str:
+    depth = 0
+    for i in range(open_paren_idx, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_paren_idx : i + 1]
+    return text[open_paren_idx:]
+
+
+def _text_has_assert_or_comparison_usage(text: str, name_re: re.Pattern) -> bool:
+    for m in ASSERT_MACRO_RE_KO4.finditer(text):
+        args = _extract_paren_balanced_ko4(text, m.end() - 1)
+        if name_re.search(args):
+            return True
+    for stmt in re.split(r"[;{}]", text):
+        if name_re.search(stmt) and _COMPARISON_OP_RE.search(stmt):
+            return True
+    return False
+
+
+def _first_floor_literal(text: str) -> str | None:
+    m = FLOOR_MAX_RE.search(text)
+    if m:
+        return m.group(1)
+    m = FLOOR_ADD_RE.search(text)
+    if m:
+        return m.group(1)
+    return None
 
 
 @dataclass(frozen=True)
@@ -568,11 +709,24 @@ class FloorHit:
 
 def find_floor_hits(lines: list[str]) -> list[FloorHit]:
     """Category (B) declaration scan (whole-file, name-suffix driven) plus
-    category (A) fn-scoped `.max(<num>)`/`+ <num>` scan (brace-depth
-    tracked via a plain per-line `{`/`}` count — the same textual
-    approximation `compute_blocks` already uses elsewhere in this file;
-    exact for code with no string/char literal containing an unmatched
-    brace, which this repo's fn bodies do not).
+    category (A) fn-scoped `.max(<num>)`/`+ <num>` scan — fn boundaries via
+    brace-balanced extraction over the WHOLE FILE (any signature shape,
+    multi-line included). Within each fn body:
+
+      - LOCAL-BINDING rule: for every `let <name> = <rhs>;` (found by
+        `re.finditer`, its OWN terminating `;` found by scanning FORWARD
+        from that specific match via `_find_stmt_terminator` — never by
+        splitting the whole fn body into top-level statements first, which
+        silently merges everything after a semicolon-less block expression
+        like `for {...}`/`if {...}` into one giant tail statement; that WAS
+        this function's round-6 bug, reproduced and fixed in the same
+        round), a floor literal in the RHS hits iff `<name>` is later used,
+        anywhere in the REST of the fn body, inside an `assert!`-family
+        call or a `<=`/`>=`-bearing statement.
+      - INLINE rule: a floor literal with no owning `let` (not already
+        claimed by the rule above) hits iff it sits inside an `assert!`-
+        family call's own argument list, OR on a line that also carries a
+        `<=`/`>=` comparison operator.
     """
     hits: list[FloorHit] = []
 
@@ -587,33 +741,62 @@ def find_floor_hits(lines: list[str]) -> list[FloorHit]:
         if lit:
             hits.append(FloorHit(i, lit.group(0)))
 
-    # (A) — `.max(<num>)` / `+ <num>` inside a comparison-feeding fn.
-    depth = 0
-    in_fn = False
-    fn_is_comparison_feeding = False
-    fn_base_depth = 0
-    fn_sig_line_idx = 0
-    for i, line in enumerate(lines):
-        if not in_fn:
-            sig = FN_SIG_RE.match(line)
-            if sig:
-                in_fn = True
-                fn_base_depth = depth
-                fn_sig_line_idx = i
-                name_hit = bool(_COMPARISON_FEEDING_NAME_RE.search(sig.group("name")))
-                ret = sig.group("ret") or ""
-                ret_hit = ret.strip() == "bool"
-                fn_is_comparison_feeding = name_hit or ret_hit
-        if in_fn and fn_is_comparison_feeding:
-            for m in FLOOR_MAX_RE.finditer(line):
-                hits.append(FloorHit(i, m.group(1), fn_sig_line_idx))
-            if _COMPARISON_OP_RE.search(line):
-                for m in FLOOR_ADD_RE.finditer(line):
-                    hits.append(FloorHit(i, m.group(1), fn_sig_line_idx))
-        depth += line.count("{") - line.count("}")
-        if in_fn and depth <= fn_base_depth:
-            in_fn = False
-            fn_is_comparison_feeding = False
+    # (A) — local-binding / inline, fn-scoped.
+    text = "\n".join(lines)
+    stripped_for_fn_detection = _blank_comments_and_strings_ko4(text)
+    for fm in FN_HEAD_RE_KO4.finditer(stripped_for_fn_detection):
+        body, body_start, _body_end = _extract_fn_body_ko4(text, fm.end())
+        if not body:
+            continue
+        fn_sig_line_idx = text.count("\n", 0, fm.start())
+
+        assert_spans: list[tuple[int, int]] = []
+        for am in ASSERT_MACRO_RE_KO4.finditer(body):
+            args = _extract_paren_balanced_ko4(body, am.end() - 1)
+            assert_spans.append((am.end() - 1, am.end() - 1 + len(args)))
+
+        def _same_line(pos: int, _body: str = body) -> str:
+            ls = _body.rfind("\n", 0, pos) + 1
+            le = _body.find("\n", pos)
+            if le == -1:
+                le = len(_body)
+            return _body[ls:le]
+
+        claimed_positions: set[int] = set()
+
+        # LOCAL-BINDING rule.
+        for let_m in LET_BINDING_RE.finditer(body):
+            name = let_m.group(1)
+            rhs_start = let_m.end()
+            rhs_end = _find_stmt_terminator(body, rhs_start)
+            rhs = body[rhs_start:rhs_end]
+            lit_m = FLOOR_MAX_RE.search(rhs) or FLOOR_ADD_RE.search(rhs)
+            if lit_m is None:
+                continue
+            name_re = re.compile(rf"\b{re.escape(name)}\b")
+            later_text = body[rhs_end:]
+            if not _text_has_assert_or_comparison_usage(later_text, name_re):
+                continue
+            abs_pos = body_start + let_m.start()
+            line_idx = text.count("\n", 0, abs_pos)
+            hits.append(FloorHit(line_idx, lit_m.group(1), fn_sig_line_idx))
+            claimed_positions.add(rhs_start + lit_m.start())
+
+        # INLINE rule — never re-claims a position the LOCAL-BINDING rule
+        # already reported (its own `let` RHS naturally also matches this
+        # loop's regexes; double-counting the SAME literal twice is a
+        # duplicate finding, not a second genuine instance).
+        for fre in (FLOOR_MAX_RE, FLOOR_ADD_RE):
+            for m in fre.finditer(body):
+                pos = m.start()
+                if pos in claimed_positions:
+                    continue
+                in_assert = any(a <= pos < b for a, b in assert_spans)
+                if not (in_assert or _COMPARISON_OP_RE.search(_same_line(pos))):
+                    continue
+                abs_pos = body_start + pos
+                line_idx = text.count("\n", 0, abs_pos)
+                hits.append(FloorHit(line_idx, m.group(1), fn_sig_line_idx))
 
     return hits
 
@@ -1118,14 +1301,80 @@ fn within_some_bound(diff: f64, magnitude: f64) -> bool {
 }
 """,
     )
-    clean(
-        "category (A) `+ <num>` floor requires a comparison operator on the SAME "
-        "line to trigger at all — an ordinary uncited arithmetic `+` inside a "
-        "comparison-feeding fn, with no `<=`/`>=` on its own line, is NOT a floor hit",
+    flagged(
+        "round-6 audit fix: category (A) LOCAL-BINDING rule — a `+ <num>` floor "
+        "assigned to a local name (not on the same line as any comparison) still "
+        "hits when that name is used in a comparison LATER in the fn body, uncited",
         """
 fn within_some_bound(diff: f64, magnitude: f64) -> bool {
     let padded = diff + 0.05;
     padded <= magnitude
+}
+""",
+    )
+    clean(
+        "category (A) `+ <num>` assigned to a local name that is NEVER used in a "
+        "comparison or assert! anywhere in the fn is genuinely ordinary arithmetic "
+        "— not a floor hit",
+        """
+fn compute_something(diff: f64) -> f64 {
+    let padded = diff + 0.05;
+    padded * 2.0
+}
+""",
+    )
+
+    # --- KO-4's seven motivating instances (round-6 audit item 5) ---------
+    # cuda_parity.rs (pre-#386, origin/main e77805f) carries seven uncited
+    # `.max(1.0)` floor sites: 227/2269 are the "let ulp = ...; assert!(...
+    # <= ulp, ...)" inline-let shape; 510/823/1181/1544/1949 are the "let
+    # bf16_bound = |c, g| ... .max(1.0); assert!(... <= bf16_bound(*c, *g),
+    # ...)" closure-call shape. Both shapes reproduced here (not the file
+    # itself) — the ORIGINAL fn-name-keyed design missed both classes
+    # entirely (the enclosing `assert_*_parity_*` helper fns carry none of
+    # bound/tol/floor/threshold/within in their OWN names, and two of the
+    # seven sit inside multi-line-signature fns the old single-line
+    # `FN_SIG_RE` could not even see).
+    flagged(
+        "KO-4 motivating instance (cuda_parity.rs:227/2269 shape): an inline "
+        "`let ulp = ... .max(1.0); assert!(... <= ulp, ...)` inside a fn whose "
+        "OWN name carries no bound/tol/floor keyword at all",
+        """
+fn assert_parity_f32(cuda: &Device, alpha: f64, xv: &[f32], yv: &[f32]) {
+    for (i, (c, g)) in out_cpu.iter().zip(out_gpu.iter()).enumerate() {
+        let ulp = 2.0f32.powi(-7) * c.abs().max(*g).max(1.0);
+        assert!(
+            (c - g).abs() <= 2.0 * ulp,
+            "mismatch at {i}: cpu {c} vs cuda {g}"
+        );
+    }
+}
+""",
+    )
+    flagged(
+        "KO-4 motivating instance (cuda_parity.rs:510/823/1181/1544/1949 shape): "
+        "a `let bf16_bound = |c, g| ... .max(1.0);` closure whose enclosing fn "
+        "signature spans MULTIPLE LINES (the old single-line FN_SIG_RE could not "
+        "see this fn at all) and whose OWN name carries no bound/tol/floor "
+        "keyword; bf16_bound is called only much later, inside assert!",
+        """
+fn assert_ln_parity_bf16(
+    cuda: &Device,
+    eps: f64,
+    rows: usize,
+    hidden: usize,
+    xv: &[f32],
+    gv: &[f32],
+) {
+    let bf16_bound = |c: f32, g: f32| 2.0 * 2.0f32.powi(-7) * c.abs().max(g).max(1.0);
+
+    let out_cpu_v = to_f32(&out_cpu);
+    for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
+        assert!(
+            (c - g).abs() <= bf16_bound(*c, *g),
+            "ln bf16 fwd[{i}]: cpu {c} vs cuda {g}"
+        );
+    }
 }
 """,
     )

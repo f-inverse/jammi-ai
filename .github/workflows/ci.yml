@@ -632,14 +632,24 @@ jobs:
           # no-longer-reachable tip (docs/maintainer/cuda-kernel-guide.md §4).
           # Needs REAL commit history (git merge-base --is-ancestor), unlike
           # every other leg in this matrix — the shared checkout step below
-          # reads this entry's own `fetch_depth: 0` (full history; this
-          # repo's `.git` is tens of MB, negligible next to the Rust build
-          # jobs) and defaults every other leg to the normal shallow
-          # `actions/checkout` clone (`fetch_depth` unset -> `1`), so only
-          # this one runner instance pays the deeper-clone cost.
+          # reads this entry's own `fetch_depth: "0"` (full history; GitHub
+          # reports this repo's on-disk size as ~94 MB, negligible next to
+          # the Rust build jobs) and defaults every other leg to the normal
+          # shallow `actions/checkout` clone (`fetch_depth` unset -> `'1'`),
+          # so only this one runner instance pays the deeper-clone cost.
+          # QUOTED as a STRING, not the bare number 0: GitHub Actions
+          # expressions treat the NUMBER 0 as falsy, so a bare `fetch_depth:
+          # 0` makes `matrix.fetch_depth || '1'` below silently discard it
+          # and fall through to the shallow default — this exact bug shipped
+          # once already and made even a genuinely-ancestor git_sha FAIL in
+          # CI (`git fetch --depth=1` in the job log, not `--depth=0`/full).
+          # The string `"0"` is non-empty, hence truthy, so `||` leaves it
+          # alone; `actions/checkout`'s `fetch-depth` input is read as a
+          # string either way, so this changes nothing about what the action
+          # itself does with the value.
           - name: CUDA run artifact schema
             cmd: python3 ci/scripts/check_cuda_run_artifacts.py
-            fetch_depth: 0
+            fetch_depth: "0"
           # Completeness tripwire for this very guard class: every
           # ci/scripts/check_*.py|.sh gate script must be referenced by at
           # least one workflow (this file included), so a new check script
@@ -693,8 +703,11 @@ jobs:
         with:
           # Every leg but "CUDA run artifact schema" leaves this at the
           # normal shallow default (`fetch_depth` unset in its matrix entry
-          # -> `1`); that one leg's ancestry check needs real history.
-          fetch-depth: ${{ matrix.fetch_depth || 1 }}
+          # -> `'1'`); that one leg's ancestry check needs real history. Both
+          # sides of `||` are STRINGS (`'1'`, and the matrix entry's own
+          # `"0"`) — the number `0` is falsy in GitHub Actions expressions,
+          # so a bare `0` here would make `||` silently discard it.
+          fetch-depth: ${{ matrix.fetch_depth || '1' }}
       - name: Run guard
         run: ${{ matrix.cmd }}
 

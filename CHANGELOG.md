@@ -78,7 +78,15 @@ workspace ships every publishable crate at the same
   `layer_norm::tests::slow_f32_reciprocal_form_is_bit_exact_and_diverges_from_division`
   measures live (`rows=256, hidden=1024`), the division and reciprocal
   forms disagree on `74734/262144` elements (28.5%) — not a stray ULP.
-  Bias-free EVAL — the ModernBERT serving path — reaches `slow()` (see
+  This exact count is HOST-FOLD-SPECIFIC: candle's `sum_keepdim` CPU
+  backend takes a SIMD-lane partial-sum reduction on `neon`/`avx2`/
+  `simd128` targets and a plain scalar fold otherwise (`candle-core-0.11.0`
+  `cpu/mod.rs::vec_sum`), a genuinely different (still IEEE-754-correct)
+  fold order per host architecture — on an x86-64 baseline (scalar fold),
+  the round-5 auditor measured `70795/262144` instead, in a `linux/amd64`
+  container; still a large, non-ULP divergence, just a different exact
+  count from a different host fold. Bias-free EVAL — the ModernBERT
+  serving path — reaches `slow()` (see
   the double-rounding fix above for why), so this is F32 ModernBERT's
   actual served embedding output changing on `74734/262144` elements at
   this production shape, TOWARD torch's reciprocal-then-multiply
@@ -87,12 +95,15 @@ workspace ships every publishable crate at the same
   (candle `sum_keepdim`) reciprocal-multiply reference; the bf16/f16 arms
   above see a much smaller effect from this same line —
   `layer_norm::tests::layer_norm_slow_matches_truth_at_production_shape_seq128`/
-  `_seq512` print BOTH the division-form and the reciprocal-form (`slow()`'s
-  real output) mismatch count against the same truth reference on every
-  run, both comfortably inside `REDUCTION_ORDER_BUDGET_FRACTION`'s budget
-  either way (see that constant's own doc for the derivation) — which is
-  why a dedicated F32 oracle exists rather than relying on the bf16
-  budget to catch a regression here.
+  `_seq512` print BOTH `slow()`'s real reciprocal-form output AND a
+  same-candle-fold (`sum_keepdim`) division-form comparator, each diffed
+  against the same scalar truth reference, and assert the reciprocal form
+  is not worse (`reciprocal-count <= division-count`) — sharing `slow()`'s
+  own reduction fold is what makes the two counts commensurable, unlike a
+  hand-rolled scalar-loop division form, which would conflate the
+  placement effect with fold-order noise — which is why a dedicated F32
+  oracle (bit-exact, no fold-order ambiguity at all) exists rather than
+  relying on the bf16 comparison alone to catch a regression here.
 
 ## [0.47.0] - 2026-07-17
 

@@ -31,10 +31,18 @@
 //! Eval (`training == false`) NEVER reaches the fused arm regardless of
 //! `bias` — the match below only adds a NEW arm for `(None, true)`; every
 //! other `(bias, training)` combination is byte-for-byte the same code
-//! path this file had before the fused kernel existed. Eval/serving
-//! numerics are therefore bit-identical before/after this change (see
-//! this module's own
+//! PATH this file had before the fused kernel existed. Eval/serving
+//! numerics are therefore bit-identical before/after THIS ARM'S ADDITION
+//! (see this module's own
 //! `tests::eval_mode_forward_is_bit_identical_regardless_of_fused_eligibility`).
+//! This is NOT the same claim as "eval/serving output is unaffected by
+//! every change in this file": eval structurally falls through to
+//! `slow()` unchanged in call SHAPE, but `slow()`'s own internals are not
+//! frozen by this doc section — the round-once and reciprocal-vs-division
+//! fixes documented at [`LayerNorm::slow`]'s own doc (below) DO change
+//! eval/serving's bitwise output, on reduced-precision (BF16/F16)
+//! backbones and at F32 respectively, precisely BECAUSE eval reaches the
+//! same (changed) `slow()` code path, not in spite of it.
 //!
 //! `dgamma_needed` is `self.weight.is_variable()`, evaluated fresh on
 //! every fused-path call — NOT a hardcoded `false`. `is_variable()` is
@@ -279,8 +287,7 @@ impl LayerNorm {
     /// fixture `tests::slow_f32_reciprocal_form_is_bit_exact_and_diverges_from_division`
     /// measures live (`rows=256, hidden=1024`, `n=262144`), the division
     /// form disagrees with the reciprocal form on `74734/262144`
-    /// elements — see that test's own printed count (no number is
-    /// hardcoded here; the committed test is the producer). Since
+    /// elements — see that test's own printed count. Since
     /// bias-free eval (the ModernBERT serving path) reaches `slow()`
     /// through the catch-all named above, this is F32 ModernBERT's SERVED
     /// EMBEDDING output changing bitwise on `74734/262144` elements at
@@ -289,14 +296,19 @@ impl LayerNorm {
     /// bf16/f16 arms, where `internal_dtype == F32` regardless of this
     /// fix, this SAME placement change is a much smaller, budget-visible
     /// effect: `tests::layer_norm_slow_matches_truth_at_production_shape_seq128`/
-    /// `_seq512` (`REDUCTION_ORDER_BUDGET_FRACTION`'s doc) print BOTH the
-    /// division-form and the reciprocal-form (`slow()`'s real output)
-    /// mismatch count against the same truth reference on every run — see
-    /// those tests' own printed pair for the live figures (no number is
-    /// hardcoded here either); both are comfortably inside that budget
-    /// either way, so no bf16/f16 test alone would catch a regression
-    /// here — the F32 test above is what actually discriminates this
-    /// placement.
+    /// `_seq512` (`REDUCTION_ORDER_BUDGET_FRACTION`'s doc) print BOTH
+    /// `slow()`'s real reciprocal-form output AND a same-candle-fold
+    /// (`sum_keepdim`) division-form comparator against the same scalar
+    /// truth on every run, and assert the reciprocal form is NOT WORSE
+    /// than that division form (`reciprocal-count <= division-count`) —
+    /// see those tests' own printed pair for the live figures. Sharing
+    /// `slow()`'s own reduction (rather than a hand-rolled scalar-loop
+    /// division form) is what makes the two counts commensurable: any
+    /// residual difference between them is attributable to the
+    /// reciprocal-vs-division placement alone, not to a fold-order
+    /// mismatch between a scalar loop and candle's SIMD-lane reduction —
+    /// the F32 test above remains what actually discriminates this
+    /// placement bit-exactly.
     ///
     /// Domain check (K2): `weight`'s (and, when biased, `bias`'s) dtype
     /// must match `x`'s own dtype — mirroring only the MATCHING half of
@@ -763,47 +775,42 @@ mod tests {
         out
     }
 
-    /// The DIVISION-form twin of [`scalar_layer_norm_truth_bf16`] — the
-    /// SAME f32-accumulated, ascending-index fold, differing ONLY in
-    /// `centered / std` (this function, the pre-round-3 `slow()`
-    /// placement) vs `centered * (1.0 / std)`
-    /// ([`scalar_layer_norm_truth_bf16`], today's placement). Kept ONLY so
-    /// [`layer_norm_slow_matches_truth_at_production_shape`] can measure
-    /// and print the bf16 reciprocal-vs-division residual live, against
-    /// the SAME truth reference, from the SAME committed test run —
-    /// `slow()`'s own doc cites THIS test's printed pair (not a
-    /// hand-computed or eyeballed figure) for how much smaller this
-    /// placement's effect is on the bf16 arm than its F32 counterpart (see
-    /// `tests::slow_f32_reciprocal_form_is_bit_exact_and_diverges_from_division`).
-    fn scalar_layer_norm_truth_bf16_division_form(
-        x: &[bf16],
-        gamma: &[bf16],
-        hidden: usize,
-        eps: f64,
-    ) -> Vec<bf16> {
-        let rows = x.len() / hidden;
-        let eps = eps as f32;
-        let mut out = Vec::with_capacity(x.len());
-        for r in 0..rows {
-            let row = &x[r * hidden..(r + 1) * hidden];
-            let mut sum = 0f32;
-            for v in row {
-                sum += v.to_f32();
-            }
-            let mean = sum / hidden as f32;
-            let mut sumsq = 0f32;
-            for v in row {
-                let d = v.to_f32() - mean;
-                sumsq += d * d;
-            }
-            let variance = sumsq / hidden as f32;
-            let std = (variance + eps).sqrt();
-            for i in 0..hidden {
-                let xhat = (row[i].to_f32() - mean) / std;
-                out.push(bf16::from_f32(xhat * gamma[i].to_f32()));
-            }
-        }
-        out
+    /// The CANDLE-FOLD division-form comparator
+    /// [`layer_norm_slow_matches_truth_at_production_shape`] measures
+    /// against `slow()`'s own real reciprocal-form output. Composed from
+    /// the SAME candle tensor ops `slow()` itself calls (`to_dtype`,
+    /// `sum_keepdim`, `broadcast_sub`, `sqr`, `broadcast_mul`), and
+    /// therefore the SAME reduction fold `slow()`'s own `sum_keepdim`
+    /// calls take on whatever host runs this test (see
+    /// [`scalar_layer_norm_truth_bf16`]'s own doc on why that fold is not
+    /// portable across hosts) — differing from `slow()` ONLY in
+    /// `centered.broadcast_div(&std)`, where `slow()` takes the
+    /// reciprocal first and multiplies (the pre-round-3 `slow()`
+    /// placement this function reproduces).
+    ///
+    /// This is what makes the comparison in
+    /// [`layer_norm_slow_matches_truth_at_production_shape`] COMMENSURABLE:
+    /// a hand-rolled scalar-loop division form (as this file previously
+    /// used here) shares NEITHER `slow()`'s reduction fold nor its op
+    /// sequence, so any residual difference between it and `slow()`'s real
+    /// output would be a mix of placement AND fold-order noise, not
+    /// placement alone. Sharing the fold isolates the placement effect
+    /// exactly the way [`f32_div_truth`]/[`f32_rstd_multiply_truth`]
+    /// already do at F32 below — this is that pair's bf16 analog, added
+    /// only to make the bf16 A/B fair; production `slow()` itself is
+    /// untouched.
+    fn candle_fold_division_form_bf16(x: &Tensor, gamma: &Tensor, eps: f64) -> Tensor {
+        let hidden = x.dim(D::Minus1).unwrap();
+        let x_f32 = x.to_dtype(DType::F32).unwrap();
+        let mean = (x_f32.sum_keepdim(D::Minus1).unwrap() / hidden as f64).unwrap();
+        let centered = x_f32.broadcast_sub(&mean).unwrap();
+        let variance =
+            (centered.sqr().unwrap().sum_keepdim(D::Minus1).unwrap() / hidden as f64).unwrap();
+        let std = (variance + eps).unwrap().sqrt().unwrap();
+        let normalized = centered.broadcast_div(&std).unwrap();
+        let gamma_f32 = gamma.to_dtype(DType::F32).unwrap();
+        let scaled = normalized.broadcast_mul(&gamma_f32).unwrap();
+        scaled.to_dtype(DType::BF16).unwrap()
     }
 
     /// The PRE-FIX formula this commit removes: round `xhat` to bf16
@@ -1095,16 +1102,26 @@ mod tests {
         );
 
         // Reciprocal-vs-division placement effect on THIS bf16 fixture,
-        // measured against the SAME truth reference as `mismatch_vs_truth`
-        // above (orthogonal to the double-rounding RED control below):
-        // `slow()`'s own doc cites this printed pair, live, rather than a
-        // hand-computed or hardcoded figure, for how much smaller this
-        // placement's effect is at bf16 (where `internal_dtype == F32`
-        // regardless of `x_dtype`) than at F32 itself (where it is the
-        // ONLY source of divergence — see
+        // measured COMMENSURABLY (orthogonal to the double-rounding RED
+        // control below): `division_form` shares `slow()`'s own candle
+        // `sum_keepdim` fold (built by `candle_fold_division_form_bf16`,
+        // the SAME op sequence `slow()` uses except for the `rstd` line
+        // itself), so any residual difference between it and
+        // `mismatch_vs_truth` above (both diffed against the SAME scalar
+        // truth reference) is attributable to the reciprocal-vs-division
+        // placement alone, not to a fold-order mismatch between a scalar
+        // loop and a SIMD-lane reduction — unlike a hand-rolled
+        // scalar-loop division form, which would conflate the two.
+        // `slow()`'s own doc cites this printed pair, live, for how much
+        // smaller this placement's effect is at bf16 (where
+        // `internal_dtype == F32` regardless of `x_dtype`) than at F32
+        // itself (where it is the ONLY source of divergence — see
         // `slow_f32_reciprocal_form_is_bit_exact_and_diverges_from_division`).
-        let division_form =
-            scalar_layer_norm_truth_bf16_division_form(&x_bf16, &g_bf16, hidden, eps);
+        let division_form: Vec<bf16> = candle_fold_division_form_bf16(&x, &weight, eps)
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
         assert!(
             division_form.iter().all(|v| v.to_f32().is_finite()),
             "division-form residual reference output must be finite before any bit compare"
@@ -1116,8 +1133,19 @@ mod tests {
             .count();
         println!(
             "layer_norm_slow_matches_truth_at_production_shape(rows={rows}, hidden={hidden}): \
-             division-form vs truth mismatches = {mismatch_division_form}/{n} (reciprocal-form \
-             slow() vs truth mismatches = {mismatch_vs_truth}/{n})"
+             division-form slow() vs truth = {mismatch_division_form}/{n}"
+        );
+        println!(
+            "layer_norm_slow_matches_truth_at_production_shape(rows={rows}, hidden={hidden}): \
+             reciprocal-form slow() vs truth = {mismatch_vs_truth}/{n}"
+        );
+        assert!(
+            mismatch_vs_truth <= mismatch_division_form,
+            "reciprocal-form slow() ({mismatch_vs_truth}/{n}) must not be WORSE than the \
+             same-candle-fold division-form comparator ({mismatch_division_form}/{n}) against \
+             the same scalar truth — both share slow()'s own sum_keepdim fold, so this A/B is \
+             commensurable, and a regression here would mean the reciprocal placement made bf16 \
+             output strictly worse, not merely different"
         );
 
         // RED CONTROL (non-vacuity): the pre-fix double-rounding formula

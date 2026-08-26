@@ -2381,11 +2381,26 @@ fn assert_geglu_parity_bf16(cuda: &Device, rows: usize, intermediate: usize, wv:
     // one covers eager's rounding CASCADE occasionally underflowing an
     // intermediate to exact bf16 zero, a mechanism that cannot arise
     // here.)
+    //
+    // Floor at a SMALL FRACTION of `wv`'s own amplitude (`2^-10`), not
+    // [`measured_near_zero_floor`] of the output array: a real pod run
+    // found `gelu(x1)` near its root produces an output orders of
+    // magnitude smaller than `wv`'s own scale (cancellation, not a
+    // defect — see this file's `f32` floor design note above
+    // `measured_near_zero_floor`), and flooring at THAT tiny output's
+    // own magnitude gave it an unreasonably tight bf16 allowance
+    // (observed: cpu `-3.19e-6` vs cuda `-1.59e-6`, exactly the kind of
+    // divergence a coarse bf16 step at that magnitude produces). Unlike
+    // the `f32` legs' floor, this is a FRACTION of the input amplitude,
+    // not the full amplitude — `bf16`'s much coarser mantissa would
+    // otherwise make every normal-magnitude element's bound as loose as
+    // the input's own (guide §3.8), so this only protects genuinely
+    // near-zero outputs.
     let out_cpu_v = to_f32(&out_cpu);
     let out_gpu_v = to_f32(&out_gpu.to_device(&cpu).unwrap());
     assert_eq!(out_cpu_v.len(), n_out);
     assert_eq!(out_gpu_v.len(), n_out, "geglu bf16 GPU fwd length mismatch");
-    let out_floor = measured_near_zero_floor(&out_cpu_v);
+    let out_floor = max_abs(wv) * 2f32.powi(-10);
     let out_bound = |r: f32| bf16_relative_bound(r, out_floor, 2.0);
     for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
         assert!(
@@ -2422,7 +2437,8 @@ fn assert_geglu_parity_bf16(cuda: &Device, rows: usize, intermediate: usize, wv:
         rows * 2 * intermediate,
         "geglu bf16 GPU dwi_out length mismatch"
     );
-    let dwi_floor = measured_near_zero_floor(&dwi_cpu_v);
+    // Same input-amplitude-fraction floor rationale as `out_bound` above.
+    let dwi_floor = max_abs(wv) * 2f32.powi(-10);
     let dwi_bound = |r: f32| bf16_relative_bound(r, dwi_floor, 2.0);
     for (i, (c, g)) in dwi_cpu_v.iter().zip(dwi_gpu_v.iter()).enumerate() {
         assert!(
@@ -4086,9 +4102,20 @@ fn lora_linear_parity_bf16_base_backward_production_width() {
     assert_eq!(db_gpu.len(), outf * r, "GPU db length mismatch");
 
     // A small floor covers the `f32`-only summation-order noise both
-    // branches carry regardless of dtype (measured negligible by the
-    // forward test's own standalone probe, cited in its doc).
-    let abs_floor = 1e-1f64;
+    // branches carry regardless of dtype. Re-measured at `0.3` (not the
+    // sibling forward test's `0.1`) after this test's own cotangent
+    // moved from `sum_all().backward()`'s all-ones seed to a sign-mixed
+    // one (this file's discriminating-backward toolkit): `dx_base` and
+    // `d_x_lora` can now land much closer to canceling at a given index
+    // (e.g. a real pod run measured `dx_base ~= -11.6`, `d_x_lora ~=
+    // 10.1`, summing to `dx ~= -1.57`, a ~9x reduction from either
+    // term's own magnitude) than the uniform ones seed produced, and the
+    // observed divergence at that index (`0.305`) exceeded the `0.1`
+    // floor's total bound (`0.282`) by a small margin — `0.3` restores
+    // headroom without loosening the dominant `bf16_round_bound` terms
+    // above, which still scale with `dx_base`/`d_x_lora`'s own (large)
+    // magnitudes and do the real discriminating work.
+    let abs_floor = 3e-1f64;
     for (i, (c, g)) in dx_cpu.iter().zip(dx_gpu.iter()).enumerate() {
         let bound = bf16_round_bound(f64::from(dx_base_cpu[i]))
             + bf16_round_bound(f64::from(d_x_lora_cpu[i]))

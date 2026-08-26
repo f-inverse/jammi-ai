@@ -154,7 +154,7 @@ pub use cast_scale::{cast_add_bf16_into, cast_scale_bf16_f32_into};
 pub use cast_scale::{CastAddBf16, CastScaleBf16F32};
 pub use dropout::{DropoutFused, PhiloxKatProbe};
 #[cfg(feature = "flash-attn")]
-pub use flash_attention::flash_attention_varlen;
+pub use flash_attention::{flash_attention_varlen, flash_attention_varlen_with_rope};
 pub use geglu::{GegluFused, GeluVariant};
 pub use layer_norm::{LayerNormFused, MAX_HIDDEN};
 pub use low_rank_residual_linear::{DropoutKey, LowRankResidualLinear};

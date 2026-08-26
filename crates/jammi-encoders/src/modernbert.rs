@@ -786,7 +786,7 @@ impl ModernBertAttention {
         extended_mask: &Tensor,
         local_band: Option<&Tensor>,
         fused_masks: Option<&FusedAttentionMasks>,
-        flash: Option<&FlashForwardDecision>,
+        flash: Option<&FlashDecision>,
     ) -> Result<Tensor, EncoderError> {
         let normed = match &self.attn_norm {
             Some(ln) => ln.forward(hidden)?,
@@ -936,7 +936,7 @@ impl ModernBertAttention {
         h: usize,
         d: usize,
         masks: TrainingMaskInputs<'_>,
-        flash: &FlashForwardDecision,
+        flash: &FlashDecision,
     ) -> Result<Tensor, EncoderError> {
         if self.is_local && masks.local_band.is_none() {
             return Err(EncoderError::Config(
@@ -953,20 +953,31 @@ impl ModernBertAttention {
         let flash_dispatch = admit_cascade(
             admission_mode(),
             "attention_block_flash",
-            flash.reason,
-            flash.outcome,
+            flash.reason(),
+            flash.outcome(),
             true,
             cascade_counters_for("attention_block_flash"),
         )?;
         if flash_dispatch == CascadeOutcome::Fused {
-            let admission = flash.admission.as_ref().ok_or_else(|| {
-                EncoderError::Config(
-                    "attention_block_flash dispatched Fused without a CompactedBatch -- \
-                     decide_flash_admission only pins PredicateOutcome::Holds when it also \
-                     built one"
-                        .into(),
-                )
-            })?;
+            // `FlashDecision::Fused` ALWAYS carries a `CompactedBatch` — by
+            // construction, not by a runtime `Option` check (see that
+            // type's own doc): `build_flash_forward_decision` has no path
+            // that produces `Fused` without one. The `Declined` arm below
+            // is therefore reachable only if `admit_cascade` and
+            // `flash.outcome()` ever disagreed about what `flash` itself
+            // is, which would be an admission-layer bug, not a missing
+            // field — a typed refusal either way, never a silent wrong
+            // dispatch.
+            let admission = match flash {
+                FlashDecision::Fused(batch) => batch,
+                FlashDecision::Declined { outcome, reason } => {
+                    return Err(EncoderError::Config(format!(
+                        "attention_block_flash dispatched Fused but flash itself is \
+                         Declined(outcome={outcome:?}, reason={reason}) -- admit_cascade and \
+                         FlashDecision disagree"
+                    )))
+                }
+            };
             return self.forward_flash_dense_attention(qkv, batch, seq, h, d, admission);
         }
 
@@ -1051,14 +1062,23 @@ impl ModernBertAttention {
         admission: &CompactedBatch,
     ) -> Result<Tensor, EncoderError> {
         use jammi_kernels::flash::{CuSeqlens, VarlenConfig};
-        use jammi_kernels::ops::{flash_attention_varlen, RopePositionsFused};
+        use jammi_kernels::ops::flash_attention_varlen_with_rope;
 
         let total = batch * seq;
         let qkv5 = qkv.reshape((total, 3, h, d))?;
         let (cos_full, sin_full) = self.rope.cached_tables(qkv5.dtype())?;
         let cos = cos_full.narrow(2, 0, seq)?;
         let sin = sin_full.narrow(2, 0, seq)?;
-        let qkv_rot = apply3(&qkv5, &cos, &sin, RopePositionsFused::new(seq, false))?;
+        // `flash_attention_varlen_with_rope` fuses the RoPE rotation INSIDE
+        // its own `CustomOp3` node rather than rotating `qkv5` here first
+        // (contrast the pre-fix composition: `apply3(&qkv5, &cos, &sin,
+        // RopePositionsFused::new(seq, false))` then
+        // `flash_attention_varlen(&qkv_rot, ...)`) — that two-op shape left
+        // a SECOND `[total, 3, h, d]` bf16 buffer (`qkv_rot`) retained by
+        // candle's tape for the whole backward pass, on top of the
+        // pre-rotation `qkv` the `Wqkv` linear's own backward already needs
+        // alive; see `flash_attention_varlen_with_rope`'s own doc for the
+        // measured per-layer cost this closes.
 
         let cuda_device = match qkv.device() {
             Device::Cuda(dev) => dev,
@@ -1078,7 +1098,7 @@ impl ModernBertAttention {
             window: self.half_window.map(|w| w as u32),
             deterministic: true,
         };
-        let o = flash_attention_varlen(&qkv_rot, &cu_seqlens, &cfg)
+        let o = flash_attention_varlen_with_rope(&qkv5, &cos, &sin, seq, &cu_seqlens, &cfg)
             .map_err(|e| EncoderError::Config(format!("attention_block_flash: {e}")))?;
         Ok(o.reshape((batch, seq, h * d))?)
     }
@@ -1556,18 +1576,71 @@ struct CompactedBatch {
     total: usize,
 }
 
-/// The full once-per-forward flash-cascade decision: [`CompactedBatch`]
-/// when eligible, plus the [`PredicateOutcome`] and reason string every
-/// LAYER's own [`admit_cascade`] call reports (contract v4 §3.2: "the
-/// counters are per-dispatch, not per-forward" — this struct is what makes
-/// that per-layer call cheap: no layer re-derives the reason).
-struct FlashForwardDecision {
-    // Consumed by `forward_training_attention` (Fused arm) under the
-    // `flash-attn` feature; read by this module's own tests either way.
-    #[allow(dead_code)]
-    admission: Option<CompactedBatch>,
-    outcome: PredicateOutcome,
-    reason: &'static str,
+/// The full once-per-forward flash-cascade decision, decided ONCE in
+/// [`ModernBert::forward_hidden`] (mirroring [`FusedAttentionMasks`]) and
+/// threaded per layer — every LAYER's own [`admit_cascade`] call reports
+/// against it (contract v4 §3.2: "the counters are per-dispatch, not
+/// per-forward" — this type is what makes that per-layer call cheap: no
+/// layer re-derives the outcome/reason).
+///
+/// Two variants, not a `CompactedBatch`/`outcome`/`reason` struct with the
+/// first field optional: the prior shape let `outcome == Holds` and
+/// `admission == None` be constructed simultaneously — an invalid state
+/// [`ModernBertAttention::forward_training_attention`]'s own dispatch code
+/// had to guard with a RUNTIME `ok_or_else` (a string-message fallback for
+/// a state the type itself should have refused to represent). This enum
+/// makes that state a COMPILE ERROR instead: [`Self::Fused`] always
+/// carries its [`CompactedBatch`], [`Self::Declined`] never does — no
+/// runtime check stands between "the cascade decided Fused" and "a
+/// `CompactedBatch` exists".
+///
+/// [`Self::outcome`]/[`Self::reason`] recover the [`PredicateOutcome`] /
+/// reason string every `admit_cascade` call site still needs (`Fused`
+/// always reports `(Holds, "domain_ok_dense")` — [`build_flash_forward_decision`]'s
+/// only path to that variant), so callers built around the old struct's
+/// two bare fields keep exactly the same call shape.
+enum FlashDecision {
+    /// The batch is DENSE and flash-eligible — `attention_block_flash`
+    /// dispatches `Fused` and
+    /// [`ModernBertAttention::forward_flash_dense_attention`] runs on this
+    /// `CompactedBatch`.
+    Fused(CompactedBatch),
+    /// The cascade declines — `outcome`/`reason` are whatever
+    /// [`flash_admission_predicate`] (or the dense/padded split in
+    /// [`build_flash_forward_decision`]) determined. NEVER carries a
+    /// `CompactedBatch`, even in the "was `Holds`, downgraded for being
+    /// padded" case (`reason == "flash_padded_not_yet_wired"`): that batch
+    /// is out of THIS decision's scope once declined — a future
+    /// B3-padded consumer building its own compacted batch does so from
+    /// `mask`/`lengths` directly, not by fishing one out of a declined
+    /// `FlashDecision`.
+    Declined {
+        outcome: PredicateOutcome,
+        reason: &'static str,
+    },
+}
+
+impl FlashDecision {
+    /// The [`PredicateOutcome`] every `admit_cascade` call site reports —
+    /// `Holds` for [`Self::Fused`] (the only outcome that variant can mean),
+    /// whatever [`Self::Declined`] itself carries otherwise.
+    fn outcome(&self) -> PredicateOutcome {
+        match self {
+            FlashDecision::Fused(_) => PredicateOutcome::Holds,
+            FlashDecision::Declined { outcome, .. } => *outcome,
+        }
+    }
+
+    /// The reason string every `admit_cascade` call site reports —
+    /// `"domain_ok_dense"` for [`Self::Fused`] ([`build_flash_forward_decision`]'s
+    /// only path to that variant), whatever [`Self::Declined`] itself
+    /// carries otherwise.
+    fn reason(&self) -> &'static str {
+        match self {
+            FlashDecision::Fused(_) => "domain_ok_dense",
+            FlashDecision::Declined { reason, .. } => reason,
+        }
+    }
 }
 
 /// Row indices of every REAL (non-pad) row of a `[batch, seq, ..]` tensor,
@@ -1854,7 +1927,7 @@ fn decide_flash_admission(
     head_dim: usize,
     mask: &Tensor,
     trusted_lengths: Option<&[usize]>,
-) -> Result<FlashForwardDecision, EncoderError> {
+) -> Result<FlashDecision, EncoderError> {
     let (outcome, reason, eligible) =
         flash_admission_predicate(device, dtype, head_dim, mask, trusted_lengths)?;
     build_flash_forward_decision(outcome, reason, eligible, device)
@@ -1871,7 +1944,7 @@ fn build_flash_forward_decision(
     reason: &'static str,
     eligible: Option<(Vec<usize>, usize)>,
     device: &Device,
-) -> Result<FlashForwardDecision, EncoderError> {
+) -> Result<FlashDecision, EncoderError> {
     match (outcome, eligible) {
         (PredicateOutcome::Holds, Some((lengths, seq))) => {
             let gather_indices = unpad_gather_indices(&lengths, seq, device)?;
@@ -1883,28 +1956,24 @@ fn build_flash_forward_decision(
                 total,
             };
             if is_dense {
-                Ok(FlashForwardDecision {
-                    admission: Some(compacted),
-                    outcome: PredicateOutcome::Holds,
-                    reason: "domain_ok_dense",
-                })
+                Ok(FlashDecision::Fused(compacted))
             } else {
                 // Real padding: the unpad/repad transport is out of this
-                // commit's scope (B3-padded) -- decline, keep the
-                // CompactedBatch around only for this module's own tests
-                // that inspect it (contract v4's original disclosure).
-                Ok(FlashForwardDecision {
-                    admission: Some(compacted),
+                // commit's scope (B3-padded) -- decline. `compacted` is
+                // built (proving the construction succeeds on a padded
+                // batch too — `unpad_gather_indices` still runs its own
+                // domain checks above) and then DROPPED: `FlashDecision::
+                // Declined` never carries a `CompactedBatch` (see that
+                // type's own doc) — a future B3-padded consumer builds its
+                // own from `mask`/`lengths` directly.
+                let _ = compacted;
+                Ok(FlashDecision::Declined {
                     outcome: PredicateOutcome::CapabilityMiss,
                     reason: "flash_padded_not_yet_wired",
                 })
             }
         }
-        _ => Ok(FlashForwardDecision {
-            admission: None,
-            outcome,
-            reason,
-        }),
+        _ => Ok(FlashDecision::Declined { outcome, reason }),
     }
 }
 
@@ -1922,7 +1991,7 @@ impl ModernBertLayer {
         extended_mask: &Tensor,
         local_band: Option<&Tensor>,
         fused_masks: Option<&FusedAttentionMasks>,
-        flash: Option<&FlashForwardDecision>,
+        flash: Option<&FlashDecision>,
     ) -> Result<Tensor, EncoderError> {
         let after_attn =
             self.attention
@@ -2574,9 +2643,8 @@ mod tests {
     /// doc): `attention_block_flash` has no real op to dispatch to yet
     /// (B1), so no test-constructed decision in this module is ever
     /// `PredicateOutcome::Holds`.
-    fn declined_flash() -> FlashForwardDecision {
-        FlashForwardDecision {
-            admission: None,
+    fn declined_flash() -> FlashDecision {
+        FlashDecision::Declined {
             outcome: PredicateOutcome::CapabilityMiss,
             reason: "test_stub_flash_declined",
         }
@@ -2929,12 +2997,14 @@ mod tests {
 
     /// [`build_flash_forward_decision`]'s PADDED downgrade rule, tested
     /// directly (no CUDA device needed to reach `Holds`): a `Holds`
-    /// outcome on a batch with REAL padding (a length `< seq`) still gets
-    /// `CompactedBatch` built CORRECTLY (lengths, gather indices, total),
-    /// but the RETURNED outcome/reason are pinned to
-    /// `CapabilityMiss("flash_padded_not_yet_wired")` — the padded regime
-    /// is out of P6 Stage B B3-dense's scope, see this module's
-    /// `decide_flash_admission` doc. NOTE: `lengths=[3,0,2]` mixes a
+    /// outcome on a batch with REAL padding (a length `< seq`) is DECLINED
+    /// (`CapabilityMiss("flash_padded_not_yet_wired")`) — the padded
+    /// regime is out of P6 Stage B B3-dense's scope, see this module's
+    /// `decide_flash_admission` doc — and [`FlashDecision::Declined`]
+    /// never carries a `CompactedBatch` (that type's own doc), so this
+    /// test checks `CompactedBatch` CONSTRUCTION separately, via
+    /// `unpad_gather_indices` directly on the SAME `lengths`, rather than
+    /// through the (declined) decision. NOTE: `lengths=[3,0,2]` mixes a
     /// zero-length row with real padding purely to exercise
     /// `unpad_gather_indices`' own zero-length handling in one fixture —
     /// `flash_admission_predicate` would separately DomainMiss a
@@ -2942,7 +3012,8 @@ mod tests {
     /// call path (L4); this unit test bypasses that predicate on purpose
     /// to test `build_flash_forward_decision` in isolation.
     #[test]
-    fn build_flash_forward_decision_downgrades_holds_padded_but_still_builds_the_compacted_batch() {
+    fn build_flash_forward_decision_downgrades_holds_padded_to_declined_without_a_compacted_batch()
+    {
         let device = Device::Cpu;
         let lengths = vec![3usize, 0usize, 2usize];
         let decision = build_flash_forward_decision(
@@ -2952,28 +3023,30 @@ mod tests {
             &device,
         )
         .unwrap();
-        assert_eq!(decision.outcome, PredicateOutcome::CapabilityMiss);
-        assert_eq!(decision.reason, "flash_padded_not_yet_wired");
-        let batch = decision
-            .admission
-            .expect("a Holds predicate must still build the compacted batch");
-        assert_eq!(batch.lengths, lengths);
-        assert_eq!(batch.total, 5);
-        let idx: Vec<u32> = batch.gather_indices.to_vec1().unwrap();
-        assert_eq!(
-            idx,
-            unpad_gather_indices(&lengths, 4, &device)
-                .unwrap()
-                .to_vec1::<u32>()
-                .unwrap()
-        );
+        match decision {
+            FlashDecision::Declined { outcome, reason } => {
+                assert_eq!(outcome, PredicateOutcome::CapabilityMiss);
+                assert_eq!(reason, "flash_padded_not_yet_wired");
+            }
+            FlashDecision::Fused(_) => panic!("a padded batch must decline, never fuse"),
+        }
+        // CompactedBatch construction (lengths/gather-indices/total) is a
+        // property of `unpad_gather_indices` itself, checked directly —
+        // this decision no longer carries one to inspect once declined.
+        let total: usize = lengths.iter().sum();
+        let idx: Vec<u32> = unpad_gather_indices(&lengths, 4, &device)
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(idx.len(), total);
     }
 
     /// The DENSE counterpart (P6 Stage B B3-dense): a `Holds` outcome
     /// whose lengths are ALL `== seq` (uniform, no padding) keeps the
     /// REAL `Holds` outcome (`reason = "domain_ok_dense"`) — this is what
     /// makes `attention_block_flash` actually dispatch `Fused` for a
-    /// dense batch.
+    /// dense batch, and [`FlashDecision::Fused`] carries the
+    /// `CompactedBatch` by construction (no separate `Option` to unwrap).
     #[test]
     fn build_flash_forward_decision_keeps_holds_when_dense() {
         let device = Device::Cpu;
@@ -2985,11 +3058,14 @@ mod tests {
             &device,
         )
         .unwrap();
-        assert_eq!(decision.outcome, PredicateOutcome::Holds);
-        assert_eq!(decision.reason, "domain_ok_dense");
-        let batch = decision
-            .admission
-            .expect("a dense Holds predicate must build the compacted batch");
+        assert_eq!(decision.outcome(), PredicateOutcome::Holds);
+        assert_eq!(decision.reason(), "domain_ok_dense");
+        let batch = match decision {
+            FlashDecision::Fused(batch) => batch,
+            FlashDecision::Declined { outcome, reason } => {
+                panic!("a dense Holds predicate must fuse, got Declined({outcome:?}, {reason})")
+            }
+        };
         assert_eq!(batch.lengths, lengths);
         assert_eq!(batch.total, 12);
     }
@@ -3004,8 +3080,13 @@ mod tests {
             &device,
         )
         .unwrap();
-        assert!(decision.admission.is_none());
-        assert_eq!(decision.outcome, PredicateOutcome::DomainMiss);
+        match decision {
+            FlashDecision::Declined { outcome, reason } => {
+                assert_eq!(outcome, PredicateOutcome::DomainMiss);
+                assert_eq!(reason, "mask_is_prefix_every_row");
+            }
+            FlashDecision::Fused(_) => panic!("a DomainMiss predicate must never fuse"),
+        }
     }
 
     /// The end-to-end proof: on the SAME `tests/fixtures/tiny_modernbert_head64`
@@ -3429,17 +3510,13 @@ mod tests {
             .map(|l| l.attention.head_dim)
             .unwrap_or(0);
         let decision = decide_flash_admission(device, hidden.dtype(), head_dim, mask, None)?;
-        assert_eq!(
-            decision.outcome,
-            PredicateOutcome::Holds,
-            "flash oracle fault harness requires flash to actually be eligible on this batch \
-             (reason={})",
-            decision.reason
-        );
-        let admission = decision.admission.as_ref().expect(
-            "PredicateOutcome::Holds always pairs with a CompactedBatch -- \
-             decide_flash_admission's own contract",
-        );
+        let admission = match &decision {
+            FlashDecision::Fused(batch) => batch,
+            FlashDecision::Declined { outcome, reason } => panic!(
+                "flash oracle fault harness requires flash to actually be eligible on this \
+                 batch (outcome={outcome:?}, reason={reason})"
+            ),
+        };
         let cuda_device = match device {
             Device::Cuda(dev) => dev,
             _ => panic!("flash oracle fault harness requires a CUDA device"),
@@ -3658,6 +3735,201 @@ mod tests {
             "[{label}] LoRA gradient (layer 0 Wqkv B): flash err {err_flash_grad:.4e} exceeds \
              {FLASH_ORACLE_K} * block err {err_block_grad:.4e}"
         );
+    }
+
+    /// `cuMemGetInfo` (via `candle_core::cuda_backend::cudarc::driver::
+    /// result::mem_get_info`) after a device sync -- the SAME driver-level
+    /// "free bytes right now" reading `jammi-bench`'s `peak_vram_bytes`
+    /// sampler polls through `nvidia-smi`, just called in-process so it can
+    /// be interleaved with individual layer forwards rather than only
+    /// sampled on a background thread. Returns free memory in MiB.
+    #[cfg(feature = "cuda")]
+    fn cuda_free_mib(device: &Device) -> f64 {
+        device
+            .synchronize()
+            .expect("device sync before mem_get_info");
+        let (free, _total) = candle_core::cuda_backend::cudarc::driver::result::mem_get_info()
+            .expect("cuMemGetInfo_v2 failed");
+        free as f64 / (1024.0 * 1024.0)
+    }
+
+    /// Per-layer VRAM attribution probe (numerics write-owner round closing
+    /// the flash-arm peak-VRAM BLOCK): mirrors
+    /// [`forward_hidden_forcing_flash`]'s body EXACTLY (same per-forward
+    /// setup, same per-layer loop, same arm-selection mechanism), with one
+    /// addition -- a [`cuda_free_mib`] reading after each layer's forward,
+    /// printed as a delta against the PRIOR reading. `label` names the arm
+    /// in the printed table (`"flash"` / `"block"`) purely for a human
+    /// reading `--nocapture` output; this function asserts nothing -- it is
+    /// a diagnostic tool, not an oracle (the calling test's own dispatch
+    /// count assertion is the oracle that the intended arm actually ran).
+    #[cfg(feature = "cuda")]
+    fn forward_hidden_forcing_flash_vram_probe(
+        model: &ModernBert,
+        input_ids: &Tensor,
+        mask: &Tensor,
+        force_decline: bool,
+        label: &str,
+    ) -> Tensor {
+        let device = input_ids.device().clone();
+        let mut prev = cuda_free_mib(&device);
+        println!("[vram-probe {label}] start free={prev:.2} MiB");
+        let (_batch, seq) = input_ids.dims2().unwrap();
+        let word_emb = model.word_embeddings.forward(input_ids).unwrap();
+        let mut hidden = model.emb_norm.forward(&word_emb).unwrap();
+        let extended = extended_attention_mask(mask).unwrap();
+        let local_band = model
+            .local_half_window
+            .map(|half| model.sliding_band(seq, half, &device).unwrap());
+        let fused_masks = if model.training {
+            Some(
+                FusedAttentionMasks::build(&extended, local_band.as_ref(), hidden.dtype()).unwrap(),
+            )
+        } else {
+            None
+        };
+        let flash_admission = if model.training {
+            if force_decline {
+                Some(declined_flash())
+            } else {
+                let head_dim = model
+                    .layers
+                    .first()
+                    .map(|l| l.attention.head_dim)
+                    .unwrap_or(0);
+                Some(decide_flash_admission(&device, hidden.dtype(), head_dim, mask, None).unwrap())
+            }
+        } else {
+            None
+        };
+        let now = cuda_free_mib(&device);
+        println!(
+            "[vram-probe {label}] after-setup free={now:.2} MiB delta={:.2} MiB",
+            prev - now
+        );
+        prev = now;
+        for (i, layer) in model.layers.iter().enumerate() {
+            hidden = layer
+                .forward(
+                    &hidden,
+                    &extended,
+                    local_band.as_ref(),
+                    fused_masks.as_ref(),
+                    flash_admission.as_ref(),
+                )
+                .unwrap();
+            let now = cuda_free_mib(&device);
+            println!(
+                "[vram-probe {label}] layer {i:02} free={now:.2} MiB delta={:.2} MiB",
+                prev - now
+            );
+            prev = now;
+        }
+        let out = model.final_norm.forward(&hidden).unwrap();
+        let now = cuda_free_mib(&device);
+        println!(
+            "[vram-probe {label}] after-final-norm free={now:.2} MiB delta={:.2} MiB",
+            prev - now
+        );
+        out
+    }
+
+    /// Drives [`forward_hidden_forcing_flash_vram_probe`] for BOTH arms, in
+    /// ONE process, from the SAME loaded checkpoint -- the method the
+    /// numerics write-owner dispatch asked for: per-layer `Device` memory
+    /// queries after each layer's forward, plus one more after backward,
+    /// for both arms, so the per-layer delta table can be read off
+    /// `--nocapture` output directly rather than reconstructed from two
+    /// separate log files. Skips (does not fail) unless
+    /// `JAMMI_FLASH_ORACLE_MODEL_DIR` is set, mirroring every other
+    /// real-checkpoint-gated test in this file. A fresh model (fresh
+    /// `VarMap`) per arm, exactly [`run_flash_oracle_shape`]'s own
+    /// precedent, so one arm's retained graph cannot skew the other's
+    /// baseline.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn flash_vs_block_per_layer_vram_attribution_probe_cuda() {
+        let Ok(model_dir) = std::env::var("JAMMI_FLASH_ORACLE_MODEL_DIR") else {
+            eprintln!(
+                "flash_vs_block_per_layer_vram_attribution_probe_cuda: skipping — \
+                 JAMMI_FLASH_ORACLE_MODEL_DIR not set"
+            );
+            return;
+        };
+        let Some(cuda) = growth_oracle_cuda_device() else {
+            return;
+        };
+        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _d2h_guard = FLASH_D2H_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !jammi_kernels::admission::FLASH_COMPILED {
+            eprintln!(
+                "flash_vs_block_per_layer_vram_attribution_probe_cuda: skipping — built without \
+                 the flash-attn feature (FLASH_COMPILED=false); this probe needs a real flash \
+                 arm to attribute against"
+            );
+            return;
+        }
+
+        let dir = std::path::PathBuf::from(&model_dir);
+        let config: ModernBertConfig =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                .unwrap();
+        let weights = dir.join("model.safetensors");
+        let (batch, seq, seed) = (8usize, 512usize, 42u64);
+        let ids = flash_oracle_synthetic_ids(batch, seq, config.vocab_size, seed, &cuda);
+        let mask = Tensor::ones((batch, seq), DType::U32, &cuda).unwrap();
+
+        for (force_decline, label) in [(false, "flash"), (true, "block")] {
+            let bf16_model =
+                flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda, true);
+            let counter_before = cascade_counters_for("attention_block_flash").snapshot();
+            let hidden = forward_hidden_forcing_flash_vram_probe(
+                &bf16_model,
+                &ids,
+                &mask,
+                force_decline,
+                label,
+            );
+            let counter_after = cascade_counters_for("attention_block_flash").snapshot();
+            if force_decline {
+                assert_eq!(
+                    counter_after.fused - counter_before.fused,
+                    0,
+                    "[{label}] the block arm must not have dispatched attention_block_flash"
+                );
+            } else {
+                assert_eq!(
+                    counter_after.fused - counter_before.fused,
+                    config.num_hidden_layers as u64,
+                    "[vram-probe {label}] zero dispatch is RED (guide §3.5) -- every layer must \
+                     have actually dispatched Fused on this dense batch"
+                );
+            }
+            let pooled = pool_and_normalize(&hidden, &mask, Pooling::Mean).unwrap();
+            let loss = pooled
+                .to_dtype(DType::F32)
+                .unwrap()
+                .sqr()
+                .unwrap()
+                .sum_all()
+                .unwrap();
+            let before_bwd = cuda_free_mib(&cuda);
+            let grads = loss.backward().unwrap();
+            let after_bwd = cuda_free_mib(&cuda);
+            println!(
+                "[vram-probe {label}] after-backward free={after_bwd:.2} MiB delta={:.2} MiB",
+                before_bwd - after_bwd
+            );
+            drop(grads);
+            drop(hidden);
+            drop(bf16_model);
+            let after_drop = cuda_free_mib(&cuda);
+            println!("[vram-probe {label}] after-drop free={after_drop:.2} MiB");
+        }
     }
 
     /// Skips (does not fail) unless `JAMMI_FLASH_ORACLE_MODEL_DIR` is set --

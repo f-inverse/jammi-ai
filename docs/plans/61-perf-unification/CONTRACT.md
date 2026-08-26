@@ -1,0 +1,183 @@
+# CONTRACT — perf-unification, phases 1–3
+
+Binding order: `README.md` (lead resolutions) → `DESIGN-STUDY.md` → `PRESSURE.md`. Phase 4
+(`ServerInfo` static-build-identity fields) and phase 5 (a held-out-loss acceptance statistic) are
+NOT in this unit; this contract records their front-door preconditions (C16, C17) only.
+
+## Frame
+
+Single source of truth: the `jammi-bench` binary's own baked identity (`build_sha`, `target`,
+`profile`, `build_features`) plus the runtime kernel facts `jammi_kernels::admission` owns
+(`FLASH_COMPILED`, `disabled_ops_requested`, `disabled_ops_fired`), emitted through the existing
+`Report` container. Three readers under `ci/` make disagreement a CI failure: rule (g) inside
+`check_cuda_run_artifacts.py`, rule (h) as `check_perf_claims.py`, and a Python-⊆-Rust identity
+subset suite. Every gate script under `ci/scripts/**/check_*.py` / `check_*.sh` is inside the
+`SWARM_GATE_TOUCHED` glob and human-merged.
+
+Phase order: **1 = bench provenance; 2 = rule (g) + producers + the two baselines move + swarm glob;
+3 = rule (h) + the ledger + the guide.** The baselines move (phase 2) lands before any `claims:` tag
+is written (phase 3), so no tag is ever re-pointed.
+
+## C1 — Provenance is baked at build time (phase 1)
+
+A new `crates/jammi-bench/build.rs`. Precedence: `JAMMI_BUILD_SHA` env (accepted only if
+`^[0-9a-f]{40}$`, anything else — including a non-hex placeholder — rejected and falls through) → git
+at build time → `"unknown"`. The git branch resolves HEAD via `git rev-parse --git-path HEAD` (never
+the literal `<workspace>/.git/HEAD`, absent in a worktree) and emits `cargo:rerun-if-changed` for that
+path and the ref it points at. Dirtiness is `git status --porcelain --untracked-files=no` restricted
+to tracked paths. Output is `<sha>` or `<sha>-dirty`. A sha produced inside a `pull_request` CI
+checkout resolves the MERGE ref and must never be accepted as provenance — no CI job in this unit
+emits a leg, and rule (g) cross-checks `provenance.build_sha == parent.git_sha` so a merge-ref sha can
+only ever land INVALID. Test shape: never assert 40-hex, never assert not-`unknown` (a dirty dev tree
+is GREEN); assert run-time inertness (re-running with a different `JAMMI_BUILD_SHA` in the environment
+yields a byte-identical `provenance` object).
+
+## C2 — `Report::new` and the `Provenance` struct (phase 1)
+
+`Provenance { build_sha, target, profile, build_features: Vec<&'static str>,
+report_schema_version: u32 }` on `Report`; one constructor `Report::new(subcommand, tiers)` replaces
+every literal `Report {` construction site. `build_features` are linked-crate constants —
+`jammi_kernels::admission::FLASH_COMPILED` → `"flash-attn"`; a sibling `CUDA_COMPILED` const added
+beside it → `"cuda"`; `cfg!(feature = "cuda")` of `jammi-bench` itself → `"bench-cuda"` — sorted,
+deduplicated, never `CARGO_FEATURE_*` (a build-script-only value). A `jammi-bench provenance`
+subcommand prints the struct so a shell producer can read it before any leg. The pre-existing
+run-time `tip_sha()` (`git rev-parse HEAD` at RUN time) is deleted; the equivalent field is filled
+from the baked `build_sha`.
+
+## C3 — K7 identity consts (phase 1)
+
+Per-`(tier, producer_kind, leg_shape)` `IDENTITY_FIELDS` consts, each a list of `(name, Nullable)`
+pairs — `max_grad_norm` and (on the torch side) `nvidia_driver_version` are *present, may be null with
+a declared meaning*; every other entry is non-null. A `#[test]` serializes a sample tier and asserts
+every listed key is present.
+
+## C4 — Python ⊆ Rust; the comparison tuple is UNCHANGED (phase 1)
+
+The Python COMPARISON tuples (`ab_merge.py`'s `FINETUNE_IDENTITY_FIELDS`,
+`compare_grad_oracle.py`'s `RUN_IDENTITY_FIELDS`) do not change in this unit — only the Rust
+K7-completeness consts grow. A new stdlib-`unittest` suite asserts Python ⊆ Rust for each pair, and
+that the two Python tuples keep their known cardinality (14, 11) — "unchanged" is a number, not a
+promise.
+
+## C5–C9 — Rule (g), producers, the two baselines move, the swarm glob (phase 2)
+
+`check_cuda_run_artifacts.py` gains a v2-schema discriminator (`leg_schema_version >= 2`), covering
+any file extension under a `-raw-runs/` directory (a closed, non-growing `LEGACY_RAW_NONJSON` list
+exempts ten pre-existing `.json.raw` legs from the parse-as-JSON requirement). Every shell/Python
+producer cross-checks `$BIN provenance`'s `build_sha` against the sha it is about to stamp before
+writing a GREEN leg. `crates/jammi-bench/baselines/{finetune_step_reference.json,
+p1_softmax_scale_fold_ab.json}` move under `crates/jammi-kernels/artifacts/cuda-runs/` with rules
+(a)–(f) fields backfilled (the p1 record needs `merged_as`/`merged_via_pr` since its own `tip_ref` is
+not an ancestor of `HEAD`). `swarm.yml`'s gate glob widens from `ci/scripts/check_*.py` to
+`ci/scripts/**/check_*.py` (and the `.sh` twin) so a gate script under a subdirectory is covered too.
+
+## C10 — Rule (h): `ci/scripts/check_perf_claims.py` (phase 3)
+
+See `DESIGN-STUDY.md` §1 for the grammar. Implementation notes fixed here:
+
+1. **Tokenizer.** Scope = pipe tables under `docs/maintainer/**` and
+   `docs/plans/61-perf-unification/**` whose header row contains one of `s/step`, `VRAM`, `ratio`,
+   `cosine`, `×`, `ms`, `GB`, `launches`. A numeric token is a maximal match of
+   `[−\-+]?\d+(?:[.,]\d+)*` not immediately preceded by a word character or `.`.
+2. **Lexical exclusion class**, applied before binding: shape labels (`b8s512`, `s512`, `b8`, `d0`/
+   `d0.05`), issue/PR refs (`#377`) and the escape-ledger's own `esc-NNN` row id, version strings
+   (`2.13.0+cu126`, `cu126`), ledger cites (`s2:89`, `row 5`, `cont row 11`, `fusion rows 30, 36`),
+   dates (`2026-08-23`). A layer/tensor/launch count (`563 launches`) is explicitly NOT excluded.
+3. **Artifact-field precedence**, mechanical: for a `diff`/`ratio`/`pct` tag, if the operands' common
+   ancestor JSON object carries its own numeric `delta*`/`ratio*`/`speedup*`/`*_pct`/`spread*` field,
+   the tag is a finding unless it points at that field directly. A same-named STRING field (a
+   hand-written range) does not block a free aggregate — it cannot be pointed to as a number either.
+4. **Equality.** `Decimal` at the token's own printed precision; `ROUND_HALF_EVEN` quantization;
+   STRING comparison. A mismatch prints the evaluated value at full precision.
+5. **Pointer roots.** Tracked `*.json` under `crates/jammi-kernels/artifacts/cuda-runs/**` and
+   `crates/jammi-bench/baselines/*.json` only. A pointer into a non-`.json` payload, an untracked
+   file, or a path outside these roots is a finding ("unprovenanced producer").
+6. **The escape.** A token with no producer is marked `ledger` (a bare word — never an inline
+   reason string) and MUST have a matching entry in `ci/perf_claims_allowlist.txt`, keyed
+   `file:token:sha1(normalized line)` exactly as `check_doc_numbers_have_producers.py`. Every entry
+   has one row in `ci/perf_claims_allowlist_classification.md` with a closed reason (`ledger-only |
+   modeled | issue-text | superseded-run`) and a distinct note. `--check-allowlist-only-shrinks`
+   fetches `origin/main` (fails CLOSED on a failed fetch or an unresolvable ref) and fails on any
+   entry this branch ADDS; bootstrap (no allowlist file on `origin/main` yet) passes only on the
+   introducing PR.
+7. **`legacy(<form>)`** is the explicit, auditable marker for a pointer bind reported as `V-legacy`
+   rather than `V` — used only for the two AdamW summary-block cells this contract names (below),
+   standing in for what rule (g)'s v2-schema classification would infer automatically once it lands.
+
+## C11 — Named cells
+
+- T5 `s128 −16.5`: `ledger`, reason `ledger-only`, note stating the three candidates the
+  `a100b_full_step_ab_reference` summary yields (r1 diff 16.408, mean diff 16.566, r2 diff 16.725 ms)
+  and that none rounds to 16.5 — the guide is NOT silently corrected to −16.6 or −16.4.
+- The AdamW `0.6759`/`0.6589`/`−16.4 ms` cells: `legacy(...)`, bound to
+  `a100b_full_step_ab_reference/summary/s512/{disabled_eager_p50_r1_r2,fused_p50_r1_r2}` — reported
+  `V-legacy` since the summary's raw legs are `.json.raw`, outside the provenance gate.
+- `23.1 → 2.59 ms (8.9×)`: `ledger`, reason `ledger-only` — the artifact's own
+  `optimizer_phase_wall_time_ms` fields print 23.8592/24.7481/24.7765 and 2.6004/2.6881/2.7097 (etc.);
+  no pair prints 23.1 or 2.59 under any form.
+- T5's FA2 row (`0.6756 → 0.4626`, `0.937×`, `−213 ms`, `39 measured`) and the equivalent T9 esc-044
+  row: `ledger`, reason `ledger-only`, note naming the committed artifact whose own numbers differ
+  (the b3-dense artifact reads block 0.7096 / flash 0.4992 at a different, uncommitted tip).
+- T3's P2/P3 measured cells: `ledger`, note naming the committed p2/p3 artifacts and their own,
+  different values (`b8_s512_d0` reads 0.7817 s / 39.58 GB, not the row's printed 0.780 s / 39.1 GB —
+  a different session).
+- Cast-w1's `−38.5 ms` cell is corrected to `−39.6 ms`, bound via `abs(P)` directly to the artifact's
+  own `delta_ms` field (39.565658) — precedence (C10.3) forbids a free `diff(mean,mean)` here since
+  that computed field exists.
+- T8 (the torch-column table) is entirely `ledger`, reason `superseded-run`: its artifact lives on an
+  unmerged branch until the sha is an ancestor of `HEAD` or carries `merged_as`/`merged_via_pr`.
+
+## C12 — Guide edits, coexist
+
+All nine tables are tagged per C10 (one HTML comment per row, one entry per non-excluded token,
+left to right). §7 ("How to prove a fused kernel") becomes a citation table: rule →
+`cuda-kernel-guide.md` §3.x → the mechanical oracle-standard check (`pending
+check_kernel_oracles.py` until `ci/kernel-oracle-standard` lands) → the escape that paid for it — the
+escape column is the guide's unique content and stays. §8 ("Measuring honestly"): the three facts
+`cuda-kernel-guide.md` §4 lacked (exclusive box + timing lock; ratios travel across boxes, ms do not;
+attribute by grid) move there; §8 keeps its track-specific bullets plus a pointer to §4. The `:226`
+sentence about `ab_merge.py`'s identity refusal is rewritten to name the real file:line and to state
+that the comparison tuple stays unchanged (C4) — pinned by the Python ⊆ Rust subset suite, not by
+this doc alone. Journey framing at the guide's opening line is a recorded exception (`README.md`).
+`check_doc_numbers_have_producers.py` is NOT widened to markdown in this unit; rule (h) is the
+markdown gate and reuses only the ledger's SHAPE (C10.6).
+
+## C13 — esc-045 torch-column artifact is not committed (all phases)
+
+The torch-column artifact and its two producer scripts stay on their own branch until either the sha
+is an ancestor of `HEAD` or a `merged_as`/`merged_via_pr` exists — `check_ancestry` would fail it
+otherwise. T8 stays `ledger` (`superseded-run`) until then.
+
+## C14 — Flash-attn is unreachable through a served build
+
+Stated in every phase-3 PR body: no workspace member's closure reaches `jammi-kernels/flash-attn`
+except through the feature itself, and the `cuda` lane stays CUTLASS-free — a served engine can never
+report `flash-attn` among its compiled kernel features, so any future book-side attribution covers the
+AdamW/LN/GeGLU arms only, never the FA2 lever.
+
+## C15 — Phase 4 (`ServerInfo`) — NOT in this unit
+
+Recorded for the follow-up's own front door: only genuinely static-per-process fields may be appended
+to `ServerInfo` (`build_sha`, `build_target`, `kernel_features`, `device_name`, `driver_version`,
+`kernels_disabled_requested`); `dispatch_counters` and `kernels_disabled_fired` NEVER go on the wire —
+both are process-global, per-request-mutated state, so exposing either would falsify the tenant-
+isolation allowlist's own written reason ("tenant-independent") while the structural test still
+passes. Three fill sites exist, not two, one of which calls the storage-layer type directly.
+
+## C16 — Phase 5 (how-well) — NOT in this unit
+
+The result of the design study is the follow-up's precondition: no feasible how-well statistic exists
+on the repo's data today. `recall@10` has no dynamic range (the fine-tune itself moves it by
+0.002–0.0105 over a base of 0.538, tolerance 0.03). Held-out loss needs a new public per-pair
+evaluation seam (`Trainer::evaluate` is private today), a non-default early-stopping metric (the
+default reports TRAIN loss as `final_loss`), a non-hinge objective or a measured tie fraction (the
+bench's hinge saturates to `loss_last == 0.0` on both arms at the shapes tried), and a calibration run
+before any acceptance gate may be built.
+
+## Standing clauses
+
+Every number in a doc cites its derivation; gates run blocking with real exit codes; SHAs not branch
+names; own worktree/target per agent; gate edits (`ci/scripts/**/check_*.py`, `swarm.yml`) are
+human-merged; no GPU spend anywhere in phases 1–3; the esc-045 artifact is not committed (C13); the
+Python comparison tuples do not change (C4); the `no-producer:` inline escape does not exist in rule
+(h) — the ONLY escape spelling is the bare `ledger` marker plus a committed allowlist entry (C10.6).

@@ -743,6 +743,30 @@ jobs:
           - name: CUDA run artifact schema
             cmd: python3 ci/scripts/check_cuda_run_artifacts.py
             fetch_depth: "0"
+          # Rule (h): every numeric token in an in-scope pipe table under
+          # docs/maintainer/** or docs/plans/61-perf-unification/** must be
+          # excluded (a shape label, issue ref, version string, ledger
+          # cite, or date — never a plain measurement), bound by a
+          # `<!-- claims: c1=<expr>; ... -->` tag resolving to a tracked
+          # cuda-run/baseline artifact at Decimal/ROUND_HALF_EVEN string
+          # equality, or escaped via the bare `ledger` marker plus a
+          # committed ci/perf_claims_allowlist.txt entry. Hermetic: reads
+          # tracked files only, shells out only to `git ls-files` — the
+          # normal shallow checkout suffices, matching the sibling
+          # `check_citations.py` leg's own comment on this point.
+          - name: perf claims
+            cmd: python3 ci/scripts/check_perf_claims.py
+          - name: perf claims self-test
+            cmd: python3 ci/scripts/check_perf_claims.py --self-test
+          # ci/perf_claims_allowlist.txt is only-shrinks, mechanically —
+          # the exact `check_doc_numbers_have_producers.py` ratchet shape
+          # (ac2c5cb) reused verbatim in behaviour: fetches origin/main
+          # (fails CLOSED on a failed fetch or an unresolvable ref) and
+          # fails on any entry this branch ADDS relative to it. Bootstrap
+          # (no allowlist file on origin/main yet) is the one PR
+          # introducing it.
+          - name: perf claims allowlist only shrinks
+            cmd: python3 ci/scripts/check_perf_claims.py --check-allowlist-only-shrinks
           # Mocks-only, no-network regression suite for the 2026-08-25
           # gpu-dev pod-lifecycle incident (ledger rows 279-289) and the
           # mechanism defects three follow-up audit rounds found in this

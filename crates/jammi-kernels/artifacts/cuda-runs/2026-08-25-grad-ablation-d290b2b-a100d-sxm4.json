@@ -1,0 +1,204 @@
+{
+  "schema_version": 1,
+  "artifact": "cuda-run",
+  "tag": "grad-ablation",
+  "git_sha": "d290b2b148eae99996d23d79b61ba3bd5761fac3",
+  "box": "24edd63b2063 (A100-SXM4-80GB, 81920 MiB)",
+  "env": {
+    "gpu": "NVIDIA A100-SXM4-80GB, 580.159.04, 81920 MiB",
+    "nvcc": "Cuda compilation tools, release 12.6, V12.6.85",
+    "rustc": "rustc 1.94.0 (4a4ef493e 2026-03-02)",
+    "hostname": "24edd63b2063",
+    "generated_at_utc": "2026-08-26T03:35:59Z"
+  },
+  "producer": {
+    "path": "ci/scripts/perf/run_grad_oracle_ablation.sh",
+    "kind": "script",
+    "invocation": "MODEL_DIR=/root/checkpoints/ModernBERT-large ci/scripts/perf/run_grad_oracle_ablation.sh /root/proof-out/grad-ablation b4-s128-seed42:4:128:42 b8-s128:8:128:42",
+    "gating": "none"
+  },
+  "status": "grad-oracle --ablate-each-op ran to completion on both legs; the fused-op gradient parity gate FAILS both (pre-existing esc-045 defect on main's tip, not introduced by this PR -- this PR builds the ablation TOOL that surfaces it, and does not fix the underlying kernel defect).",
+  "legs": [
+    {
+      "label": "b4-s128-seed42",
+      "batch": 4,
+      "seq": 128,
+      "seed": 42,
+      "lora_rank": 16,
+      "lora_alpha": 32.0,
+      "target_modules": [
+        "Wqkv",
+        "Wo",
+        "Wi"
+      ],
+      "backbone_dtype": "bf16",
+      "lora_init": "gaussian",
+      "ablated_op_keys": [
+        "attention_block_fused",
+        "cast_add_bf16",
+        "cast_scale_bf16_f32",
+        "geglu_fused",
+        "layer_norm_fused",
+        "lora_linear_fused"
+      ],
+      "checkpoint_config_sha256": "55dca68059e98f0debf8eb63ab355c451c65b1f5d90fdca4754113fdaadd2cca",
+      "checkpoint_weights_sha256": "44510fec5d3a81a1877f225637b869495f18e55f6f23a09abb9be0acc030295f",
+      "checkpoint_weights_size_bytes": 1583544840,
+      "table": [
+        {
+          "arm": "all_fused",
+          "op_key": null,
+          "cosine_vs_f32_truth": 0.6098268554320911,
+          "delta_vs_all_fused": 0.0
+        },
+        {
+          "arm": "f32_truth",
+          "op_key": null,
+          "cosine_vs_f32_truth": 1.0,
+          "delta_vs_all_fused": 0.39017314456790886
+        },
+        {
+          "arm": "ablate:attention_block_fused",
+          "op_key": "attention_block_fused",
+          "cosine_vs_f32_truth": 0.6098268554320911,
+          "delta_vs_all_fused": 0.0
+        },
+        {
+          "arm": "ablate:cast_add_bf16",
+          "op_key": "cast_add_bf16",
+          "cosine_vs_f32_truth": 0.6098268554320911,
+          "delta_vs_all_fused": 0.0
+        },
+        {
+          "arm": "ablate:cast_scale_bf16_f32",
+          "op_key": "cast_scale_bf16_f32",
+          "cosine_vs_f32_truth": 0.6098268554320911,
+          "delta_vs_all_fused": 0.0
+        },
+        {
+          "arm": "ablate:geglu_fused",
+          "op_key": "geglu_fused",
+          "cosine_vs_f32_truth": 0.791235042244014,
+          "delta_vs_all_fused": 0.18140818681192283
+        },
+        {
+          "arm": "ablate:layer_norm_fused",
+          "op_key": "layer_norm_fused",
+          "cosine_vs_f32_truth": 0.7807429596677427,
+          "delta_vs_all_fused": 0.1709161042356515
+        },
+        {
+          "arm": "ablate:lora_linear_fused",
+          "op_key": "lora_linear_fused",
+          "cosine_vs_f32_truth": 0.7039233043260612,
+          "delta_vs_all_fused": 0.09409644889397006
+        },
+        {
+          "arm": "all_off",
+          "op_key": null,
+          "cosine_vs_f32_truth": 0.8100927711202282,
+          "delta_vs_all_fused": 0.200265915688137
+        }
+      ],
+      "fused_op_gradient_parity_gate": {
+        "threshold": 0.02,
+        "passed": false,
+        "problems": [
+          "ablate:geglu_fused: |cosine_vs_f32_truth - all_fused_cosine| = 0.181408 exceeds the per-op threshold 0.02 (all_fused=0.609827, ablate:geglu_fused=0.791235) -- this single op's own gradient contribution moved the direction more than the derived per-op budget allows",
+          "ablate:layer_norm_fused: |cosine_vs_f32_truth - all_fused_cosine| = 0.170916 exceeds the per-op threshold 0.02 (all_fused=0.609827, ablate:layer_norm_fused=0.780743) -- this single op's own gradient contribution moved the direction more than the derived per-op budget allows",
+          "ablate:lora_linear_fused: |cosine_vs_f32_truth - all_fused_cosine| = 0.094096 exceeds the per-op threshold 0.02 (all_fused=0.609827, ablate:lora_linear_fused=0.703923) -- this single op's own gradient contribution moved the direction more than the derived per-op budget allows"
+        ]
+      }
+    },
+    {
+      "label": "b8-s128",
+      "batch": 8,
+      "seq": 128,
+      "seed": 42,
+      "lora_rank": 16,
+      "lora_alpha": 32.0,
+      "target_modules": [
+        "Wqkv",
+        "Wo",
+        "Wi"
+      ],
+      "backbone_dtype": "bf16",
+      "lora_init": "gaussian",
+      "ablated_op_keys": [
+        "attention_block_fused",
+        "cast_add_bf16",
+        "cast_scale_bf16_f32",
+        "geglu_fused",
+        "layer_norm_fused",
+        "lora_linear_fused"
+      ],
+      "checkpoint_config_sha256": "55dca68059e98f0debf8eb63ab355c451c65b1f5d90fdca4754113fdaadd2cca",
+      "checkpoint_weights_sha256": "44510fec5d3a81a1877f225637b869495f18e55f6f23a09abb9be0acc030295f",
+      "checkpoint_weights_size_bytes": 1583544840,
+      "table": [
+        {
+          "arm": "all_fused",
+          "op_key": null,
+          "cosine_vs_f32_truth": 0.8429766745820246,
+          "delta_vs_all_fused": 0.0
+        },
+        {
+          "arm": "f32_truth",
+          "op_key": null,
+          "cosine_vs_f32_truth": 1.0,
+          "delta_vs_all_fused": 0.15702332541797537
+        },
+        {
+          "arm": "ablate:attention_block_fused",
+          "op_key": "attention_block_fused",
+          "cosine_vs_f32_truth": 0.8429766745820246,
+          "delta_vs_all_fused": 0.0
+        },
+        {
+          "arm": "ablate:cast_add_bf16",
+          "op_key": "cast_add_bf16",
+          "cosine_vs_f32_truth": 0.8429766745820246,
+          "delta_vs_all_fused": 0.0
+        },
+        {
+          "arm": "ablate:cast_scale_bf16_f32",
+          "op_key": "cast_scale_bf16_f32",
+          "cosine_vs_f32_truth": 0.8429766745820246,
+          "delta_vs_all_fused": 0.0
+        },
+        {
+          "arm": "ablate:geglu_fused",
+          "op_key": "geglu_fused",
+          "cosine_vs_f32_truth": -0.25721768159278313,
+          "delta_vs_all_fused": -1.1001943561748078
+        },
+        {
+          "arm": "ablate:layer_norm_fused",
+          "op_key": "layer_norm_fused",
+          "cosine_vs_f32_truth": 0.8405273158058824,
+          "delta_vs_all_fused": -0.002449358776142274
+        },
+        {
+          "arm": "ablate:lora_linear_fused",
+          "op_key": "lora_linear_fused",
+          "cosine_vs_f32_truth": 0.9261947888574702,
+          "delta_vs_all_fused": 0.08321811427544556
+        },
+        {
+          "arm": "all_off",
+          "op_key": null,
+          "cosine_vs_f32_truth": 0.7730474935483173,
+          "delta_vs_all_fused": -0.06992918103370738
+        }
+      ],
+      "fused_op_gradient_parity_gate": {
+        "threshold": 0.02,
+        "passed": false,
+        "problems": [
+          "ablate:geglu_fused: |cosine_vs_f32_truth - all_fused_cosine| = 1.100194 exceeds the per-op threshold 0.02 (all_fused=0.842977, ablate:geglu_fused=-0.257218) -- this single op's own gradient contribution moved the direction more than the derived per-op budget allows",
+          "ablate:lora_linear_fused: |cosine_vs_f32_truth - all_fused_cosine| = 0.083218 exceeds the per-op threshold 0.02 (all_fused=0.842977, ablate:lora_linear_fused=0.926195) -- this single op's own gradient contribution moved the direction more than the derived per-op budget allows"
+        ]
+      }
+    }
+  ]
+}

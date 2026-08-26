@@ -435,14 +435,22 @@ fn assert_parity_bf16(cuda: &Device, alpha: f64, xv: &[f32], yv: &[f32]) {
     // bf16 bound (`tests/oracles.rs`), which compares two DIFFERENT
     // rounding paths; here both paths are the same kernel semantics on
     // different hardware, so fmad-class ~1-ULP-at-bf16 differences are
-    // the only expected source of divergence.
+    // the only expected source of divergence. `bf16_relative_bound` keys
+    // each element's allowance to ITS OWN reference magnitude (floored
+    // only for a near-zero reference, at a value measured from this run's
+    // own data) — never a `max(1.0)`-keyed absolute floor that charges
+    // every element the largest reference's allowance (guide §3.8; this
+    // was the last surviving `k * ulp * c.abs().max(g).max(1.0)` leg in
+    // this file — esc-045 class 2 round-3 audit).
+    let out_floor = measured_near_zero_floor(&out_cpu);
+    let out_bound = |r: f32| bf16_relative_bound(r, out_floor, 2.0);
     for (i, (c, g)) in out_cpu.iter().zip(out_gpu.iter()).enumerate() {
-        let ulp = 2.0f32.powi(-7) * c.abs().max(*g).max(1.0);
         assert!(
-            (c - g).abs() <= 2.0 * ulp,
+            g.is_finite() && (c - g).abs() <= out_bound(*c),
             "bf16 fwd[{i}]: cpu {c} vs cuda {g}"
         );
     }
+    assert_bound_discriminates(&out_cpu, &out_gpu, out_bound, bf16_ulp, "axpy bf16 fwd");
 }
 
 #[test]

@@ -202,8 +202,21 @@ pod_push_compute() { # $1=repo-root $2=session
   local repo="$1" session="$2" head porcelain_sha diff_sha manifest_sha cutlass_gitlink ts
   pod_push_assert_required_tools || return 1
   head="$(git -C "$repo" rev-parse HEAD 2>/dev/null || echo unknown)" # tripwire-ok: "unknown" is a visible, non-empty sentinel for a non-git repo-root — never a silent empty string
-  porcelain_sha="$(git -C "$repo" status --porcelain 2>/dev/null | pod_push_sha256_of_stdin)" || { echo "::error::pod_push_compute: failed to hash 'git status --porcelain' output" >&2; return 1; } # tripwire-ok: git's own stderr (e.g. "not a git repository") is suppressed deliberately -- a non-git repo-root is a REAL, valid state elsewhere in this function (head reads "unknown"); the pipeline's hashing failure is what `|| return 1` catches and reports, never silently
-  diff_sha="$(git -C "$repo" diff HEAD 2>/dev/null | pod_push_sha256_of_stdin)" || { echo "::error::pod_push_compute: failed to hash 'git diff HEAD' output" >&2; return 1; } # tripwire-ok: same as porcelain_sha above
+  # round-5 fix (self-caught regression): git status/diff on a non-git
+  # repo-root FAILS ("fatal: not a git repository") -- a REAL, tolerated
+  # state this function has ALWAYS accepted (head reads "unknown" right
+  # above for exactly this case). Under this script's own `pipefail`, that
+  # git failure -- NOT a hashing failure -- would propagate as the whole
+  # pipeline's exit status; a strict `|| return 1` here was reproduced to
+  # wrongly abort compute on every non-git repo-root, before the manifest
+  # check ever ran. pod_push_assert_required_tools (called at this
+  # function's own top) already guarantees a hashing tool exists before
+  # this line runs, so the remaining, genuine "empty hash" backstop is the
+  # explicit check right below (porcelain_sha/diff_sha/manifest_sha all
+  # non-empty) -- never silent, just not conflated with git's own,
+  # separately-tolerated non-zero exit.
+  porcelain_sha="$(git -C "$repo" status --porcelain 2>/dev/null | pod_push_sha256_of_stdin)" # tripwire-ok: see the comment block above -- git's own non-git-repo failure is tolerated here; the empty-hash backstop right below is the real, non-silent check
+  diff_sha="$(git -C "$repo" diff HEAD 2>/dev/null | pod_push_sha256_of_stdin)" # tripwire-ok: same as porcelain_sha above
   manifest_sha="$(pod_push_manifest_sha256 "$repo")" || { echo "::error::pod_push_compute: pod_push_manifest_sha256 failed — see the ::error:: above; refusing to emit a stamp with a missing/empty manifest_sha256" >&2; return 1; }
   # round-5 fix (class-shaped tripwire): loud, never-silent-empty is now
   # required for EVERY hash this stamp carries, not just manifest_sha256 —

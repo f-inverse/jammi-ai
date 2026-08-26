@@ -2392,6 +2392,167 @@ PYEOF
   fi
 }
 
+# ═════════════════════════════════════════════════════════════════════════
+# (v/push) round-5 addendum (coordinator, post-63bf905): pod_push_stamp.sh
+# had ZERO fixture coverage before this leg — round-4 BLOCKed on exactly
+# this shape once already. Adopts the auditor's own
+# scratchpad/audit-pb-r4/push/ harness (a notools bin/, an emptyrepo/, a
+# real repo2/) verbatim: (1) PATH without sha256sum/shasum -> compute FAILS
+# rc!=0 naming the tool, empty stdout (no stamp, poisoned or otherwise, is
+# ever written); (2) a zero-file directory -> FAILS naming "empty
+# manifest", never sha256(''); (3) determinism across two INDEPENDENT
+# clones + an LC_ALL toggle -> byte-equal manifest_sha256, a one-byte
+# content change flips it, and a revert-RED removing LC_ALL=C from the
+# sort reproduces the real cross-locale divergence this fix closes (on
+# this box: LC_ALL=C vs LC_ALL=en_US.UTF-8 verifiably sort
+# Banana.txt/apple.txt/Cherry.txt/banana.txt differently).
+# ═════════════════════════════════════════════════════════════════════════
+{
+  PUSH_SH_REAL="$REPO_ROOT/ci/scripts/pod_push_stamp.sh"
+  V_REAL_BASH="$(command -v bash)"
+
+  # ---- leg 1: PATH without sha256sum/shasum ------------------------------
+  V_NOTOOLS_BIN="$SANDBOX/v_notools_bin"
+  rm -rf "$V_NOTOOLS_BIN"; mkdir -p "$V_NOTOOLS_BIN"
+  for t in awk basename cat date dirname git mktemp python3 rm rsync sort stat; do
+    V_REAL_TOOL="$(command -v "$t" 2>/dev/null || true)"
+    [ -n "$V_REAL_TOOL" ] && ln -sf "$V_REAL_TOOL" "$V_NOTOOLS_BIN/$t"
+  done
+
+  V_REPO1="$SANDBOX/v_repo1"
+  rm -rf "$V_REPO1"; mkdir -p "$V_REPO1"
+  git init -q "$V_REPO1"
+  git -C "$V_REPO1" config user.email t@t; git -C "$V_REPO1" config user.name t
+  echo hello > "$V_REPO1/a.txt"
+  git -C "$V_REPO1" add a.txt
+  git -C "$V_REPO1" commit -q -m x
+
+  V_NOTOOLS_STDOUT="$SANDBOX/v_notools_stdout.txt"
+  V_NOTOOLS_STDERR="$SANDBOX/v_notools_stderr.txt"
+  PATH="$V_NOTOOLS_BIN" "$V_REAL_BASH" "$PUSH_SH_REAL" compute "$V_REPO1" testsession > "$V_NOTOOLS_STDOUT" 2>"$V_NOTOOLS_STDERR"
+  v_notools_rc=$?
+  if [ "$v_notools_rc" -ne 0 ] && [ ! -s "$V_NOTOOLS_STDOUT" ] && grep -q 'sha256sum-or-shasum' "$V_NOTOOLS_STDERR"; then
+    ok "(v/push notools) compute FAILS (rc=$v_notools_rc) naming the missing sha256sum-or-shasum tool, with EMPTY stdout — no stamp (poisoned or otherwise) is ever written"
+  else
+    bad "(v/push notools) expected a loud, empty-stdout refusal naming the missing tool (rc=$v_notools_rc, stdout_bytes=$(wc -c < "$V_NOTOOLS_STDOUT" | tr -d ' ')): $(cat "$V_NOTOOLS_STDERR")"
+  fi
+
+  # ---- leg 2: a zero-file directory ---------------------------------------
+  V_EMPTYREPO="$SANDBOX/v_emptyrepo"
+  rm -rf "$V_EMPTYREPO"; mkdir -p "$V_EMPTYREPO"
+  V_EMPTY_STDOUT="$SANDBOX/v_empty_stdout.txt"
+  V_EMPTY_STDERR="$SANDBOX/v_empty_stderr.txt"
+  bash "$PUSH_SH_REAL" compute "$V_EMPTYREPO" testsession > "$V_EMPTY_STDOUT" 2>"$V_EMPTY_STDERR"
+  v_empty_rc=$?
+  if [ "$v_empty_rc" -ne 0 ] && grep -q 'empty manifest' "$V_EMPTY_STDERR" && [ ! -s "$V_EMPTY_STDOUT" ]; then
+    ok "(v/push empty-dir) a zero-file repo-root FAILS naming 'empty manifest' — never sha256('') read as a computed digest"
+  else
+    bad "(v/push empty-dir) expected a loud 'empty manifest' refusal (rc=$v_empty_rc): $(cat "$V_EMPTY_STDERR")"
+  fi
+
+  # ---- leg 3: determinism across two independent clones + LC_ALL toggle --
+  V_SRC_REPO="$SANDBOX/v_src_repo"
+  rm -rf "$V_SRC_REPO"; mkdir -p "$V_SRC_REPO"
+  git init -q "$V_SRC_REPO"
+  git -C "$V_SRC_REPO" config user.email t@t; git -C "$V_SRC_REPO" config user.name t
+  # Filenames deliberately chosen to sort DIFFERENTLY under LC_ALL=C vs a
+  # real locale's collation (case-mixing) — a fixture that sorts the same
+  # either way would prove nothing about the actual fix.
+  printf 'a\n' > "$V_SRC_REPO/Banana.txt"
+  printf 'b\n' > "$V_SRC_REPO/apple.txt"
+  printf 'c\n' > "$V_SRC_REPO/Cherry.txt"
+  printf 'd\n' > "$V_SRC_REPO/banana.txt"
+  git -C "$V_SRC_REPO" add -A
+  git -C "$V_SRC_REPO" commit -q -m seed
+
+  V_CLONE1="$SANDBOX/v_clone1"; V_CLONE2="$SANDBOX/v_clone2"
+  rm -rf "$V_CLONE1" "$V_CLONE2"
+  git clone -q "$V_SRC_REPO" "$V_CLONE1"
+  git clone -q "$V_SRC_REPO" "$V_CLONE2"
+
+  V_MANIFEST_DRIVER="$SANDBOX/v_manifest_driver.sh"
+  cat > "$V_MANIFEST_DRIVER" <<DRV
+#!/usr/bin/env bash
+set -uo pipefail
+# shellcheck disable=SC1091
+. "$PUSH_SH_REAL"
+pod_push_manifest_sha256 "\$1"
+DRV
+  chmod +x "$V_MANIFEST_DRIVER"
+
+  # V_LOCALES is captured via a command substitution (never piped straight
+  # into `grep -q`, whose early exit-on-first-match can SIGPIPE the
+  # producer and, under this script's own set -o pipefail, read as a
+  # false "not found" even when the match genuinely exists -- reproduced
+  # once while writing this leg).
+  V_LOCALES="$(locale -a 2>/dev/null)"
+  V_LOCALE_AVAILABLE=0
+  case "$V_LOCALES" in
+    *en_US.UTF-8*) V_LOCALE_AVAILABLE=1 ;;
+  esac
+
+  V_SHA_C="$(LC_ALL=C bash "$V_MANIFEST_DRIVER" "$V_CLONE1" 2>/dev/null)"
+  if [ "$V_LOCALE_AVAILABLE" -eq 1 ]; then
+    V_SHA_OTHER="$(LC_ALL=en_US.UTF-8 bash "$V_MANIFEST_DRIVER" "$V_CLONE2" 2>/dev/null)"
+  else
+    V_SHA_OTHER="$(bash "$V_MANIFEST_DRIVER" "$V_CLONE2" 2>/dev/null)"
+  fi
+  if [ -n "$V_SHA_C" ] && [ "$V_SHA_C" = "$V_SHA_OTHER" ]; then
+    ok "(v/push determinism) two INDEPENDENT clones (different paths) of the same content, hashed under DIFFERENT caller LC_ALL settings, produce the byte-equal manifest_sha256 (${V_SHA_C})"
+  else
+    bad "(v/push determinism) expected byte-equal manifest_sha256 across independent clones/locales (C=${V_SHA_C} other=${V_SHA_OTHER})"
+  fi
+
+  # A one-byte content change must flip the hash.
+  printf 'CHANGED\n' > "$V_CLONE1/apple.txt"
+  V_SHA_CHANGED="$(LC_ALL=C bash "$V_MANIFEST_DRIVER" "$V_CLONE1" 2>/dev/null)"
+  if [ -n "$V_SHA_CHANGED" ] && [ "$V_SHA_CHANGED" != "$V_SHA_C" ]; then
+    ok "(v/push determinism) a one-byte content change in ONE clone flips manifest_sha256"
+  else
+    bad "(v/push determinism) expected a content change to flip the manifest sha (before=${V_SHA_C} after=${V_SHA_CHANGED})"
+  fi
+
+  # revert-RED: LC_ALL=C removed from the sort, on a scratch copy.
+  V_PUSH_REVERTED_DIR="$SANDBOX/v_push_reverted"
+  rm -rf "$V_PUSH_REVERTED_DIR"; mkdir -p "$V_PUSH_REVERTED_DIR"
+  V_PUSH_REVERTED="$V_PUSH_REVERTED_DIR/pod_push_stamp_reverted.sh"
+  python3 - "$PUSH_SH_REAL" "$V_PUSH_REVERTED" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+t = open(src).read()
+needle = '| LC_ALL=C sort > "$manifest"'
+replacement = '| sort > "$manifest"'
+assert needle in t, "revert fixture: could not locate the LC_ALL=C sort call to neuter"
+open(dst, "w").write(t.replace(needle, replacement, 1))
+PY
+  if bash -n "$V_PUSH_REVERTED"; then
+    V_REVERT_DRIVER="$SANDBOX/v_manifest_revert_driver.sh"
+    cat > "$V_REVERT_DRIVER" <<DRV
+#!/usr/bin/env bash
+set -uo pipefail
+# shellcheck disable=SC1091
+. "$V_PUSH_REVERTED"
+pod_push_manifest_sha256 "\$1"
+DRV
+    chmod +x "$V_REVERT_DRIVER"
+    if [ "$V_LOCALE_AVAILABLE" -eq 1 ]; then
+      V_REVERT_SHA_C="$(LC_ALL=C bash "$V_REVERT_DRIVER" "$V_CLONE2" 2>/dev/null)"
+      V_REVERT_SHA_OTHER="$(LC_ALL=en_US.UTF-8 bash "$V_REVERT_DRIVER" "$V_CLONE2" 2>/dev/null)"
+      if [ -n "$V_REVERT_SHA_C" ] && [ "$V_REVERT_SHA_C" != "$V_REVERT_SHA_OTHER" ]; then
+        ok "(v/push revert-RED) removing LC_ALL=C from the sort makes the SAME clone hash DIFFERENTLY under LC_ALL=C vs en_US.UTF-8 (${V_REVERT_SHA_C} != ${V_REVERT_SHA_OTHER}) — the fix is genuinely load-bearing on this box's own locale data, not vacuous"
+      else
+        skip "(v/push revert-RED) this box's locales sort the fixture identically (C=${V_REVERT_SHA_C} other=${V_REVERT_SHA_OTHER}) — the two determinism legs above still prove determinism across independent clone paths; this leg is a locale-divergence proof only, and is environment-dependent"
+      fi
+    else
+      skip "(v/push revert-RED) en_US.UTF-8 not installed on this host — the locale-divergence half of this leg cannot run; the two determinism legs above still prove determinism across independent clone paths"
+    fi
+  else
+    bad "(v/push revert-RED) reverted pod_push_stamp.sh has a syntax error"
+  fi
+
+  rm -rf "$V_NOTOOLS_BIN" "$V_REPO1" "$V_EMPTYREPO" "$V_SRC_REPO" "$V_CLONE1" "$V_CLONE2" "$V_PUSH_REVERTED_DIR"
+}
+
 echo
 echo "test_pod_substrate: ${PASS} passed, ${FAIL} failed, ${SKIP} skipped"
 [ "$FAIL" -eq 0 ]

@@ -203,6 +203,43 @@ class RootGeneralizationTests(GuardWiringFixture):
         self.assertNotIn("helper_not_a_suite.py", suites)
 
 
+class ShSuiteWideningTests(GuardWiringFixture):
+    """Round-2 audit on PR #387: `tracked_test_suites()` widened from
+    `.py`-only to also match `test_*.sh` (`ci/scripts/test_gpu_dev_lifecycle.sh`
+    landed as a hermetic bash regression suite and was structurally invisible
+    to the original `.py`-only filter — the same F6/F7 blind-spot shape, one
+    extension over). Pinned here so a future PR cannot silently narrow the
+    filter back to `.py`-only without a test noticing, and so a non-`test_`-
+    prefixed `.sh` file (a helper, not a suite) stays correctly excluded.
+    """
+
+    def test_tracked_test_sh_under_a_scanned_root_is_a_suite(self):
+        self._write("ci/scripts/test_widget.sh", "#!/usr/bin/env bash\ntrue\n")
+        self._write(
+            ".github/workflows/fake.yml",
+            "name: fake\njobs:\n  guard:\n    steps:\n      - run: bash ci/scripts/test_widget.sh\n",
+        )
+        self._git_add_all()
+
+        suites = {p.name for p in cgw.tracked_test_suites()}
+        self.assertIn("test_widget.sh", suites)
+
+        code, out, err = self._run_main()
+        self.assertEqual(code, 0, f"stdout={out!r} stderr={err!r}")
+        self.assertIn("test_widget.sh]: OK", out)
+
+    def test_non_test_prefixed_sh_file_is_not_a_suite(self):
+        """A `.sh` file under a matching root that does NOT start with
+        `test_` (e.g. a helper script sourced by a suite) must not be swept
+        in — mirrors `test_non_test_prefixed_python_file_is_not_a_suite`
+        for the `.sh` extension.
+        """
+        self._write("ci/scripts/helper_not_a_suite.sh", "#!/usr/bin/env bash\ntrue\n")
+        self._git_add_all()
+        suites = {p.name for p in cgw.tracked_test_suites()}
+        self.assertNotIn("helper_not_a_suite.sh", suites)
+
+
 class GateScriptsRecursionTests(GuardWiringFixture):
     """F7 (this round's own self-inflicted regression, see
     `gate_scripts`'s own doc): the ORIGINAL `gate_scripts()` was top-level-

@@ -178,9 +178,18 @@ case "$CMD" in
 esac
 
 # `shell` is throwaway: no named session, so the EXIT trap wipes
-# the temp dir and terminates the pod.
+# the temp dir and terminates the pod. RP_SESSION is force-cleared here, not
+# merely left unset, because an inherited EXPORTED RP_SESSION (e.g. a
+# terminal that ran `RP_SESSION=a100 gpu-dev.sh attach a100` earlier in the
+# same shell) survives into this invocation's environment untouched
+# otherwise — runpod_lib.sh's own default is only "${RP_SESSION:-}", which
+# keeps whatever is already set. A `shell` that silently inherited a live
+# session's name would then write the throwaway pod's coordinates over that
+# session's own meta file (rp_session_save keys off RP_SESSION alone) and,
+# on exit, terminate the throwaway pod under RP_POD_CREATED — leaving the
+# REAL, still-running pod behind with no record pointing at it at all.
 case "$CMD" in
-  shell) : ;;
+  shell) RP_SESSION="" ;;
   *) export RP_SESSION="$SESSION" ;;
 esac
 
@@ -467,6 +476,13 @@ EOF
         # Nothing is left to release, so this is cleanup, not a refusal:
         # forget the record and say so plainly, rather than leaving it
         # stuck until an operator remembers `up --replace`.
+        #
+        # This shares rp_pod_verify's underlying assumption (see
+        # rp_pod_gone's own doc in runpod_lib.sh, which states it directly):
+        # the account's `myself{ pods{...} } }` response is COMPLETE, never
+        # paginated. "Absent from the returned list" is only "absent from
+        # the account" under that assumption, verified live on first use —
+        # not merely inferred from the schema.
         echo "recorded pod ${RP_POD_ID} is gone from the account (deadline/sweep) — forgetting the record"
         RP_POD_ID=""   # already gone; keep the EXIT trap from acting on it again
         rp_session_forget

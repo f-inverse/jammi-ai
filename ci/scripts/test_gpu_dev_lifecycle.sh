@@ -46,6 +46,20 @@
 #       the sweep), the single most common way a session's pod goes away.
 #       `down` forgets the record and exits 0, rather than getting stuck
 #       refusing forever until an operator remembers `up --replace`.
+#   (9) `rp_pod_verify` captures the account query's body BEFORE parsing it,
+#       rather than piping `rp_gql | python3` directly — under `set -o
+#       pipefail` (every caller of this file) a direct pipe's exit status is
+#       the LAST command to fail non-zero, so a `curl` exit that happens to
+#       equal 3 would alias with this function's own semantic code 3 ("id
+#       ABSENT — down forgets the record") even when the body curl still
+#       delivered showed the pod genuinely present and correctly shaped.
+#  (10) `shell` force-clears RP_SESSION to "" before sourcing runpod_lib.sh,
+#       rather than merely leaving it unset — an EXPORTED RP_SESSION
+#       inherited from an earlier `up`/`attach` in the same terminal would
+#       otherwise point `shell`'s throwaway RP_WORK at that LIVE session's
+#       own directory, and `rp_init` (called before anything is rented)
+#       writes into RP_WORK regardless of whether a pod is ever actually
+#       deployed.
 #
 # There is deliberately no "pause the sweep for one pod" feature (an earlier
 # version of this branch shipped `hold`/`unhold`, backed by a `podEditJob`
@@ -308,6 +322,47 @@ fi
 unset MOCK_DEPLOY_RESPONSE
 
 # ═════════════════════════════════════════════════════════════════════════
+# Group 1c — CLI-level: `shell` must force RP_SESSION="" before sourcing
+# runpod_lib.sh, even when the caller's own shell already has RP_SESSION
+# exported (e.g. left over from an earlier `RP_SESSION=a100 gpu-dev.sh attach
+# a100` in the SAME terminal). An inherited RP_SESSION would point `shell`'s
+# throwaway RP_WORK at the LIVE session's own directory instead of a fresh
+# temp dir, and `rp_init` (called before anything is rented) writes into
+# RP_WORK unconditionally — proof this test can observe hermetically, with
+# no reachable SSH needed: the deploy is mocked as SUPPLY_CONSTRAINT on every
+# candidate, so `shell` exits fast (75) right after `rp_init`, never reaching
+# rp_session_save. If RP_WORK were the live session's own directory, rp_init
+# would still have dropped a NEW keypair into it before the deploy call —
+# the live session's directory must contain ONLY its original "meta" file,
+# untouched, both before and after.
+# ═════════════════════════════════════════════════════════════════════════
+SESSION_LIVE_A100="a100"
+write_meta "$SESSION_LIVE_A100" "pod-live-a100" "72"
+before_listing="$(ls -A "$RP_SESSION_ROOT/$SESSION_LIVE_A100")"
+before_meta_sum="$(cat "$RP_SESSION_ROOT/$SESSION_LIVE_A100/meta")"
+echo '{"errors":[{"extensions":{"code":"SUPPLY_CONSTRAINT"},"message":"no capacity"}]}' > "$SANDBOX/deploy-shell-isolation.json"
+export MOCK_DEPLOY_RESPONSE="$SANDBOX/deploy-shell-isolation.json"
+reset_log
+RP_SESSION="$SESSION_LIVE_A100" bash "$DIR/gpu-dev.sh" shell a100 --ref abcdef1234567890 \
+  >"$SANDBOX/out-shell-isolation.log" 2>&1
+rc=$?
+after_listing="$(ls -A "$RP_SESSION_ROOT/$SESSION_LIVE_A100")"
+after_meta_sum="$(cat "$RP_SESSION_ROOT/$SESSION_LIVE_A100/meta")"
+[ "$rc" -eq 75 ] && ok "finding(shell-session-isolation): shell reaches the mocked no-capacity deploy path (rc=75)" \
+  || bad "finding(shell-session-isolation): expected rc=75 once it reaches the (mocked, no-capacity) deploy path (got $rc); $(cat "$SANDBOX/out-shell-isolation.log")"
+if [ "$before_listing" = "$after_listing" ]; then
+  ok "finding(shell-session-isolation): the live a100 session dir gained no new file (no leaked ssh key)"
+else
+  bad "finding(shell-session-isolation): the live a100 session dir's listing changed (before=[$before_listing] after=[$after_listing]) — an inherited exported RP_SESSION leaked into shell's throwaway RP_WORK"
+fi
+if [ "$before_meta_sum" = "$after_meta_sum" ]; then
+  ok "finding(shell-session-isolation): the live a100 session's meta content is byte-identical after shell exits"
+else
+  bad "finding(shell-session-isolation): the live a100 session's meta content changed (regression!)"
+fi
+unset MOCK_DEPLOY_RESPONSE
+
+# ═════════════════════════════════════════════════════════════════════════
 # Group 2 — rp_pod_verify semantics (function-level): id + this tooling's
 # own "<prefix>-ttl<digits>" NAME SHAPE, never an exact TTL number.
 # ═════════════════════════════════════════════════════════════════════════
@@ -345,6 +400,26 @@ unset MOCK_DEPLOY_RESPONSE
   MOCK_RESPONSE_FILE="$SANDBOX/acct4.json"
   rp_pod_verify "pod-x" >/dev/null 2>&1
   [ $? -eq 2 ] && record PASS "group2-verify-query-failure-refused" || record FAIL "group2-verify-query-failure-refused"
+
+  # THE pipeline-status fix's own reproduction: rp_gql (curl) itself exits 3
+  # while STILL printing a COMPLETE body that lists the pod (a network
+  # hiccup after the response was already fully received, or any transport
+  # that reports a non-zero exit alongside a good body). This suite runs
+  # under `set -uo pipefail` (inherited from the top of this file), so
+  # BEFORE the fix — `rp_gql ... | python3 -c ...` piped directly — the
+  # pipeline's own exit status would be curl's 3 regardless of what python
+  # found, aliasing with rp_pod_verify's OWN semantic code 3 ("id ABSENT,
+  # down forgets the record") even though the body actually shows the pod
+  # PRESENT and correctly shaped. Must return 2 ("could not query"), never
+  # 3 — the fixed function captures the body with its own `||` gate before
+  # ever handing it to the parser, so a curl failure can never reach python
+  # at all, regardless of what curl printed alongside it.
+  rp_gql() { cat "$MOCK_RESPONSE_FILE"; return 3; }
+  echo '{"data":{"myself":{"pods":[{"id":"pod-x","name":"jammi-gpu-ttl72"}]}}}' > "$SANDBOX/acct5.json"
+  MOCK_RESPONSE_FILE="$SANDBOX/acct5.json"
+  rp_pod_verify "pod-x" >/dev/null 2>&1
+  [ $? -eq 2 ] && record PASS "group2-verify-curl-exit3-with-complete-body-returns-2-never-3" \
+    || record FAIL "group2-verify-curl-exit3-with-complete-body-returns-2-never-3"
 )
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -566,6 +641,31 @@ fi
 [ -f "$RP_SESSION_ROOT/$SESSION_DOWN_UNSHAPED/meta" ] \
   && ok "finding-5(down): the local record is KEPT after a non-shaped-name refusal" \
   || bad "finding-5(down): the local record must survive a non-shaped-name refusal (regression!)"
+
+# The account query ITSELF fails (a GraphQL `errors` body — e.g. rate
+# limiting), never reaching a pod list at all: rp_pod_verify's own code 2
+# ("could not query the account"). This is the follow-up fixture for the
+# curl/python pipeline-status split above rp_pod_verify's own definition in
+# runpod_lib.sh — a query failure must refuse (never terminate) and keep the
+# local record, exactly like the non-shaped-name refusal, never aliasing with
+# the ABSENT-id forget arm (verify_rc 3).
+SESSION_DOWN_QUERY_FAIL="down-query-fail"
+write_meta "$SESSION_DOWN_QUERY_FAIL" "pod-query-fail" "8"
+echo '{"errors":[{"message":"rate limited"}]}' > "$SANDBOX/acct-down-query-fail-1.json"
+reset_log; reset_account_seq
+export MOCK_ACCOUNT_RESPONSE_1="$SANDBOX/acct-down-query-fail-1.json"
+bash "$DIR/gpu-dev.sh" down "$SESSION_DOWN_QUERY_FAIL" >"$SANDBOX/out-down-query-fail.log" 2>&1
+rc=$?
+[ "$rc" -eq 1 ] && ok "finding(query-failure, down): a failed account query exits 1 (refuses)" \
+  || bad "finding(query-failure, down): expected exit 1 for a failed account query (got $rc)"
+if log_has "podTerminate"; then
+  bad "finding(query-failure, down): a failed account query must never issue podTerminate (regression!)"
+else
+  ok "finding(query-failure, down): a failed account query issues no podTerminate"
+fi
+[ -f "$RP_SESSION_ROOT/$SESSION_DOWN_QUERY_FAIL/meta" ] \
+  && ok "finding(query-failure, down): the local record is KEPT after a query-failure refusal" \
+  || bad "finding(query-failure, down): the local record must survive a query-failure refusal (regression!)"
 
 # Verified (id + shape match), but the SECOND account query — the
 # post-terminate confirmation — still shows the pod present: the terminate

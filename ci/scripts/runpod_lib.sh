@@ -189,9 +189,27 @@ rp_terminate() { # $1=podId
 # `rp_deploy_live`'s own parser already uses, so the piped JSON reaches
 # `sys.stdin` intact and dynamic values travel as argv, never interpolated
 # into the script source.
+#
+# The query is captured into `body` FIRST, with its own `||` gate, rather
+# than piped straight into the parser (`rp_gql ... | python3 -c ...`). Every
+# caller of this file runs under `set -o pipefail`, where a pipeline's exit
+# status is the LAST command to fail non-zero — so a direct pipe would report
+# rp_gql's (curl's) own exit code whenever curl itself failed, EVEN IF curl
+# still delivered a complete, parseable body and the python parser reached a
+# real verdict. That collides with this function's own return codes, which
+# are not all equivalent: code 3 means "id confirmed ABSENT — ordinary
+# cleanup, `down` forgets the record", not "could not query". A curl exit
+# that happens to also be 3 would then read as a confirmed absence and make
+# `down` forget a session record for a pod the account list still actually
+# shows present — the opposite of "do not act, never assume safe" this
+# function exists to enforce. Splitting the capture from the parse removes
+# the collision entirely: a curl failure returns 2 ("could not query")
+# unconditionally, and only a successful query ever reaches the parser, whose
+# own exit code is then this function's exit code with nothing to alias.
 rp_pod_verify() { # $1=podId
-  local id="$1"
-  rp_gql '{"query":"query{ myself{ pods{ id name } } }"}' | python3 -c '
+  local id="$1" body
+  body="$(rp_gql '{"query":"query{ myself{ pods{ id name } } }"}')" || return 2
+  printf '%s' "$body" | python3 -c '
 import sys, json, re
 podid, prefix = sys.argv[1], sys.argv[2]
 try:
@@ -234,6 +252,15 @@ sys.exit(3)
 # $1=podId. Returns 0 (confirmed gone — absent from the account's pod list
 # entirely) or 1 (still present, OR the query itself failed — both are "not
 # confirmed", never "must have succeeded anyway").
+#
+# Assumes `myself{ pods{...} } }` returns the account's COMPLETE pod list in
+# one response — RunPod's schema documents no pagination on this field, and
+# it was verified live against a real account on first use (this tooling has
+# never observed a truncated list). "Absent from the returned list" and
+# "absent from the account" are the same fact only under that assumption; if
+# RunPod ever pages this field, both this function's code-0 and
+# `rp_pod_verify`'s code-3 would need to change together, since they read
+# the account's pod list the same way for the same reason.
 rp_pod_gone() { # $1=podId
   local id="$1"
   rp_gql '{"query":"query{ myself{ pods{ id } } }"}' | python3 -c '
@@ -648,6 +675,26 @@ rp_sweep() { # $1=optional override age in hours
     # pod's age is "past-deadline-0s": `reap 0` mass-terminates the whole
     # account's jammi-gpu* fleet instead of refusing. Mirrors the
     # RP_DEV_TTL_HOURS >0 check in gpu-dev.sh.
+    #
+    # An all-digit override too large for `[ -gt ]`'s arithmetic (e.g. forty
+    # 9s) still refuses — but not with a message naming the real cause. The
+    # `test` builtin errors out on it ("integer expected" / "value too large
+    # for defined data type", bash-version-dependent) with a non-zero status,
+    # which `||` catches the same as an ordinary `false`, so the operator
+    # sees this function's own "hours must be > 0" text layered under bash's
+    # raw builtin error — accurate in effect (refused, exit 2) but not in
+    # wording (an overflow is not "not greater than 0"). Left as-is rather
+    # than special-cased: the shape check above already bounds the digit
+    # count in every REALISTIC input (an operator fat-fingering a TTL), and
+    # a wrong wording on a refusal is not the failure mode this guard exists
+    # to prevent — a wrong wording on an ACCEPTED input would be.
+    #
+    # A leading zero ("08") is deliberately NOT a shape-check rejection: it
+    # is all-digit like any other override, `[ "08" -gt 0 ]` compares it as
+    # decimal (the `test` builtin never applies bash's `$(( ))` octal-prefix
+    # rule), and Python's `int("08")` likewise reads it as decimal 8 — so
+    # `reap 08` sweeps exactly like `reap 8`, never like a rejected or
+    # differently-valued input.
     [ "$override" -gt 0 ] || { echo "::error::reap: hours must be > 0"; return 2; }
   fi
   out="$(rp_gql '{"query":"query{ myself{ pods{ id name desiredStatus createdAt runtime{ uptimeInSeconds } } } }"}' \

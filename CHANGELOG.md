@@ -29,15 +29,16 @@ workspace ships every publishable crate at the same
   `transformers` v4.x rounds at every op instead, matching the pre-fix code —
   this is a version-pinned citation); jammi's fused `RopeFused` kernel
   already matched HF. `apply` now upcasts every operand to f32 and rounds
-  once at the end, matching both HF and the fused kernel. **Observable only
-  on an F16/BF16 backbone (the CUDA/reduced-precision training and serving
-  path)** — F32 serving is byte-for-byte unchanged, since every `to_dtype`
-  call the fix adds is a same-dtype no-op there. Every served bias-free
-  (ModernBERT) LayerNorm output and every RoPE-applied Q/K tensor computed
-  through these eager paths at reduced precision now rounds the same way
-  torch/HF does, rather than accumulating extra rounding error the fused
-  kernel never had. Measured, reproducible divergence counts at production
-  shape (`hidden=1024`, `batch=2`, `seq` in `{128, 512}`) are printed and
+  once at the end, matching both HF and the fused kernel. **This
+  double-rounding fix is observable only on an F16/BF16 backbone (the
+  CUDA/reduced-precision training and serving path)** — F32 serving is
+  byte-for-byte unchanged BY THIS FIX, since every `to_dtype` call it adds
+  is a same-dtype no-op there. Every served bias-free (ModernBERT)
+  LayerNorm output and every RoPE-applied Q/K tensor computed through
+  these eager paths at reduced precision now rounds the same way torch/HF
+  does, rather than accumulating extra rounding error the fused kernel
+  never had. Measured, reproducible divergence counts at production shape
+  (`hidden=1024`, `batch=2`, `seq` in `{128, 512}`) are printed and
   asserted by two NEW committed tests reachable from `jammi-encoders`
   itself — the only place in the workspace the real `slow()`/`apply()`
   functions are reachable — calling the real functions against an
@@ -54,6 +55,28 @@ workspace ships every publishable crate at the same
   updated formula as bit-exact on their fixtures (previously bounded by a
   stated ULP tolerance). `closes_escape: esc-047-eager-ln-rope-double-rounds-at-bf16-boundary`
   (`.jammi/escapes.jsonl`).
+- **`LayerNorm::slow` takes `rstd`'s reciprocal before multiplying, matching
+  torch's placement, instead of dividing (`jammi-encoders`).** Orthogonal to
+  the double-rounding fix above: `slow()` previously computed
+  `centered.broadcast_div(&sqrt(variance + eps))`, where torch's
+  `layer_norm_kernel.cu`/`layer_norm_kernel.cpp` (`rstd = rsqrt(var+eps)`,
+  then multiply) and jammi's own fused CUDA/CPU kernel both take the
+  RECIPROCAL first and multiply. Division and multiply-by-reciprocal are
+  not bit-identical (the reciprocal is itself a rounded value), and —
+  UNLIKE the double-rounding fix — this placement is NOT gated on
+  `internal_dtype != x_dtype`: it changes `slow()`'s output at EVERY dtype,
+  **F32 and F64 included**. On the production-shape F32 fixture
+  `layer_norm::tests::slow_f32_reciprocal_form_is_bit_exact_and_diverges_from_division`
+  measures live (`rows=256, hidden=1024`), the division and reciprocal
+  forms disagree on `74734/262144` elements (28.5%) — not a stray ULP.
+  `slow()`'s F32 output is now checked BIT-EXACT against a same-fold-order
+  (candle `sum_keepdim`) reciprocal-multiply reference, with a tracked
+  FNV-1a hash of the real output as a second, fixture-independent anchor;
+  the bf16/f16 arms above see a much smaller effect from this same line
+  (moves their already-budgeted residual by ±1 element at production
+  shape — see `REDUCTION_ORDER_BUDGET_FRACTION`'s doc), which is why a
+  dedicated F32 oracle exists rather than relying on the bf16 budget to
+  catch a regression here.
 
 ## [0.47.0] - 2026-07-17
 

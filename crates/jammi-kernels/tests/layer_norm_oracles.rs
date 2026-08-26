@@ -68,6 +68,20 @@ fn fused(eps: f64, dgamma_needed: bool, x: &Tensor, gamma: &Tensor) -> candle_co
 /// "Computation is performed in T_ACC ... result is implicitly cast to
 /// T") and `LayerNormFused`'s own CPU/CUDA arm (`cuda/layer_norm.cu:124`:
 /// `yr[i] = __float2bfloat16(xhat * __bfloat162float(gamma[i]))`).
+///
+/// `rstd` is computed as a RECIPROCAL followed by a multiply, not a
+/// division, matching torch's `rsqrt(var+eps)` placement
+/// (`aten/src/ATen/native/cuda/layer_norm_kernel.cu:278`;
+/// `aten/src/ATen/native/cpu/layer_norm_kernel.cpp` likewise on the CPU
+/// arm) and `jammi-encoders::layer_norm::slow()`'s own `rstd` line (see
+/// that function's doc for the full citation and the F32-precision
+/// discriminator that proves the placement is load-bearing). Division and
+/// multiply-by-reciprocal are not bit-identical in floating point (the
+/// reciprocal is itself a rounded value), so a division-form `formula()`
+/// would silently diverge from both `LayerNormFused`'s actual arm and the
+/// real `slow()` this leaf crate cannot import — the bf16 bit-exact
+/// checks below only mean anything because this reproduction takes the
+/// same path.
 fn formula(eps: f64, x: &Tensor, gamma: &Tensor) -> candle_core::Result<Tensor> {
     let x_dtype = x.dtype();
     let internal_dtype = match x_dtype {
@@ -79,7 +93,8 @@ fn formula(eps: f64, x: &Tensor, gamma: &Tensor) -> candle_core::Result<Tensor> 
     let mean = (x_internal.sum_keepdim(D::Minus1)? / hidden as f64)?;
     let centered = x_internal.broadcast_sub(&mean)?;
     let variance = (centered.sqr()?.sum_keepdim(D::Minus1)? / hidden as f64)?;
-    let normalized = centered.broadcast_div(&(variance + eps)?.sqrt()?)?;
+    let rstd = (variance + eps)?.sqrt()?.recip()?;
+    let normalized = centered.broadcast_mul(&rstd)?;
     let gamma_internal = gamma.to_dtype(internal_dtype)?;
     let scaled_internal = normalized.broadcast_mul(&gamma_internal)?;
     scaled_internal.to_dtype(x_dtype)

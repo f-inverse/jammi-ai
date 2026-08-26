@@ -790,9 +790,17 @@ struct ModernBertAttention {
     /// Whether the fused RoPE kernel may be attempted on Q/K (still gated
     /// by its own domain check — see [`RotaryEmbedding::apply_training`]).
     /// `false` (eval/serving) always calls [`RotaryEmbedding::apply`]
-    /// directly, with output VALUES bit-identical to before this field
-    /// existed (see `RotaryEmbedding`'s struct doc for the one disclosed,
-    /// non-numeric change — a table-cache lock — `apply` itself gained);
+    /// directly; the mere EXISTENCE of this field changed nothing about
+    /// what eval computes — `apply` gained only a table-cache lock from
+    /// table hoisting, a disclosed, non-numeric change (see
+    /// `RotaryEmbedding`'s struct doc). That is a narrower claim than
+    /// "`apply`'s output values never changed": `apply`'s OWN body was
+    /// separately rewritten in the same PR that introduced this field's
+    /// sibling training-mode dispatch, to round its bf16/f16 rotation
+    /// once instead of three times (see `RotaryEmbedding::apply`'s own
+    /// doc for the citation and measured divergence) — that change is
+    /// real and orthogonal to this field, not something this field's
+    /// existence caused or could have prevented.
     /// `true` (training) is the ONLY state that ever reaches
     /// `apply_training`. Propagated by [`ModernBert::set_training`], the
     /// same mechanism `LayerNorm::set_training` uses.
@@ -1129,11 +1137,17 @@ impl ModernBertAttention {
     /// Dispatches to [`RotaryEmbedding::apply_training`] (fused-when-
     /// possible) in training mode, else [`RotaryEmbedding::apply`]
     /// directly — eval never even calls the training-mode method, so
-    /// its OUTPUT VALUES are bit-identical to before the fused kernel
-    /// existed regardless of that method's own admission logic (`apply`
-    /// itself gained a table-cache lock from table hoisting — see
-    /// `RotaryEmbedding`'s struct doc — which is a real, disclosed
-    /// change to what eval does, not a numeric one).
+    /// eval's ROUTING is unaffected by that method's own admission logic
+    /// existing at all (`apply` itself gained a table-cache lock from
+    /// table hoisting — see `RotaryEmbedding`'s struct doc — which is a
+    /// real, disclosed change to what eval does, not a numeric one). This
+    /// is a claim about ROUTING, not about `apply`'s numeric output:
+    /// `apply`'s bf16/f16 output VALUES did change in this PR (the
+    /// round-once rounding-placement fix — see `RotaryEmbedding::apply`'s
+    /// own doc for the citation and measured divergence), and eval calls
+    /// the SAME `apply`, so eval's bf16/f16 RoPE output changed too. F32
+    /// eval is unaffected by that fix specifically (`internal_dtype ==
+    /// x_dtype` there).
     fn rope_apply(&self, x: &Tensor) -> Result<Tensor, EncoderError> {
         if self.training {
             self.rope.apply_training(x)
@@ -1590,14 +1604,20 @@ impl ModernBert {
     /// dispatches to the fused CUDA/CPU LayerNorm kernel when that
     /// kernel's own domain holds (dtype, contiguity, device, hidden
     /// size), falling back to the slow path otherwise — see
-    /// `crate::layer_norm`'s module doc. RoPE follows the SAME doctrine:
-    /// eval always calls `RotaryEmbedding::apply` directly (OUTPUT VALUES
-    /// bit-identical before/after the fused kernel; `apply` itself now
-    /// also takes a table-cache lock from table hoisting, an uncontended,
-    /// non-numeric change disclosed on `RotaryEmbedding`'s own doc),
-    /// training calls `RotaryEmbedding::apply_training` (fused kernel
-    /// when its own domain holds, else the identical eager `apply`) — see
-    /// `ModernBertAttention::rope_apply`. Propagating the flag keeps the
+    /// `crate::layer_norm`'s module doc. RoPE follows the SAME doctrine
+    /// for ROUTING: eval always calls `RotaryEmbedding::apply` directly,
+    /// and the fused-RoPE machinery's mere existence changes nothing
+    /// about which function eval calls (`apply` itself now also takes a
+    /// table-cache lock from table hoisting, an uncontended, non-numeric
+    /// change disclosed on `RotaryEmbedding`'s own doc); training calls
+    /// `RotaryEmbedding::apply_training` (fused kernel when its own
+    /// domain holds, else the identical eager `apply`) — see
+    /// `ModernBertAttention::rope_apply`. This routing claim does NOT
+    /// mean `apply`'s own output values are unchanged: `apply`'s bf16/f16
+    /// rotation now rounds once instead of three times (this PR's
+    /// round-once fix — see `RotaryEmbedding::apply`'s own doc), which
+    /// eval observes too, since eval calls the same `apply`; F32 eval is
+    /// unaffected by that specific fix. Propagating the flag keeps the
     /// surface consistent with [`crate::Bert`] and [`crate::DistilBert`].
     pub fn set_training(&mut self, training: bool) {
         self.training = training;

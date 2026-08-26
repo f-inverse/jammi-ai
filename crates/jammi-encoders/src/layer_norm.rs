@@ -231,15 +231,18 @@ impl LayerNorm {
     /// LayerNorm output on an F16/BF16 backbone — training-eager fallback
     /// AND (through this same function) any `training=true` call that
     /// misses the fused kernel's admission domain — therefore changes at
-    /// the ULP level; F32-backbone serving is UNCHANGED
-    /// (`internal_dtype == x_dtype` there, so every `to_dtype` call below
-    /// is a same-dtype no-op). eval (`training == false`) is UNCHANGED by
-    /// this fix in call SHAPE (still routes to `candle_nn::ops::layer_norm`
-    /// for the biased fast path, never `slow()`, when biased+eval+contiguous),
-    /// but the biased eval fast path itself was never affected by this
-    /// defect (candle's fused `layer_norm` already rounds once) — this
-    /// fix changes ONLY `slow()`'s own output, i.e. the bias-free
-    /// training-mode paths and any biased non-fast-path call.
+    /// the ULP level; F32-backbone serving is UNCHANGED BY THIS SPECIFIC
+    /// DEFECT (`internal_dtype == x_dtype` there, so every `to_dtype` call
+    /// below is a same-dtype no-op) — but see the SECOND, orthogonal
+    /// divergence below, which is NOT dtype-scoped this way and DOES
+    /// change F32 (and F64) output. eval (`training == false`) is
+    /// UNCHANGED by this fix in call SHAPE (still routes to
+    /// `candle_nn::ops::layer_norm` for the biased fast path, never
+    /// `slow()`, when biased+eval+contiguous), but the biased eval fast
+    /// path itself was never affected by this defect (candle's fused
+    /// `layer_norm` already rounds once) — this fix changes ONLY
+    /// `slow()`'s own output, i.e. the bias-free training-mode paths and
+    /// any biased non-fast-path call.
     ///
     /// A SECOND rounding-placement divergence, orthogonal to the one
     /// above: this function previously computed `centered.broadcast_div(&
@@ -250,11 +253,32 @@ impl LayerNorm {
     /// in floating point (the reciprocal is itself a rounded value, so
     /// `a / b` and `a * (1/b)` can round differently). This function now
     /// computes `(variance + eps).sqrt().recip()` and multiplies, matching
-    /// every other placement's form; see
-    /// `REDUCTION_ORDER_BUDGET_FRACTION`'s doc for the measured effect of
-    /// this specific fix (moved the residual mismatch count DOWN, since it
-    /// was a second, small source of true divergence stacked on top of the
-    /// reduction-order noise that budget already accounts for).
+    /// every other placement's form.
+    ///
+    /// UNLIKE the double-rounding defect above, this placement change is
+    /// NOT gated on `internal_dtype != x_dtype`: the `rstd` line runs
+    /// identically regardless of dtype, so it changes output at EVERY
+    /// dtype `slow()` supports, F32 and F64 included — the "F32-backbone
+    /// serving is UNCHANGED" claim two paragraphs up applies ONLY to the
+    /// double-rounding fix, not to this one. At F32, where
+    /// `internal_dtype == x_dtype` makes every OTHER change in this
+    /// function a same-dtype no-op, this `rstd` line is consequently the
+    /// ONLY source of `slow()`'s F32 output changing at all — and the
+    /// effect is large, not a stray ULP: on the same production-shape
+    /// fixture `tests::slow_f32_reciprocal_form_is_bit_exact_and_diverges_from_division`
+    /// measures live (`rows=256, hidden=1024`, `n=262144`), the division
+    /// form disagrees with the reciprocal form on `74734/262144`
+    /// elements — see that test's own printed count (no number is
+    /// hardcoded here; the committed test is the producer) and its
+    /// tracked FNV-1a hash of `slow()`'s real F32 output for a
+    /// bit-repro anchor. On the bf16/f16 arms, where `internal_dtype ==
+    /// F32` regardless of this fix, this SAME placement change is a much
+    /// smaller, budget-visible effect (`REDUCTION_ORDER_BUDGET_FRACTION`'s
+    /// doc: the bias-free residual moves `6 → 5` at seq128 and `38 → 37`
+    /// at seq512 when this line is present vs. reverted to division —
+    /// both DOWN, and both comfortably inside that budget either way, so
+    /// no bf16/f16 test alone would catch a regression here; the F32 test
+    /// above is what actually discriminates this placement).
     ///
     /// Domain check (K2): `weight`'s (and, when biased, `bias`'s) dtype
     /// must match `x`'s own dtype — mirroring only the MATCHING half of
@@ -819,6 +843,23 @@ mod tests {
     /// straddling a bf16 rounding boundary for a handful of elements —
     /// not a rounding-PLACEMENT bug.
     ///
+    /// Used ONLY by the BIAS-FREE arm's two tests
+    /// (`layer_norm_slow_matches_truth_at_production_shape_seq128`/
+    /// `_seq512`) — the biased and F16 arms each derive their OWN budget
+    /// constant below ([`BIASED_REDUCTION_ORDER_BUDGET_FRACTION`],
+    /// [`F16_REDUCTION_ORDER_BUDGET_FRACTION`]), from their own measured
+    /// residuals, rather than reusing this one. A single shared constant
+    /// derived only from the bias-free arms previously gave the OTHER
+    /// three consuming arms far less headroom than the 10×-over-
+    /// measurement this doc claims: at the values measured on this
+    /// branch, this constant's `93`/`371` budgets left the biased arm
+    /// only `93/34 ≈ 2.7×` / `371/148 ≈ 2.5×` headroom and the F16 arm
+    /// only `93/59 ≈ 1.58×` — nowhere near the `10×` this doc's own
+    /// derivation promises, and tight enough that a shift in libm/SIMD
+    /// behavior on a different CI runner could flake those three arms
+    /// even though the constant's OWN derivation (below) was sound for
+    /// the two arms it was measured from.
+    ///
     /// Derivation (not a value tightened to zero, and not a loose
     /// round-number guess): `layer_norm_slow_matches_truth_at_production_shape`
     /// prints the measured `slow()`-vs-truth mismatch count at both
@@ -848,6 +889,42 @@ mod tests {
     /// all), not to pin an exact headroom multiple that would go stale
     /// on its own.
     const REDUCTION_ORDER_BUDGET_FRACTION: f64 = 3.529e-4;
+
+    /// The BIASED arm's own reduction-order budget — the full torch form
+    /// `slow()`'s doc quotes (`gamma` AND `beta` both in the epilogue).
+    /// Derived the SAME way [`REDUCTION_ORDER_BUDGET_FRACTION`] is, but
+    /// from the biased arm's OWN measured residuals rather than the
+    /// bias-free arm's, since the two arms exercise a DIFFERENT candle-op
+    /// sequence (the biased arm has an extra `broadcast_add` for `beta`)
+    /// and there is no structural reason their reduction-order noise
+    /// floors should coincide:
+    ///
+    /// * `rows=256, hidden=1024` (seq 128): `34/262144` = `1.297e-4`
+    /// * `rows=1024, hidden=1024` (seq 512): `148/1048576` = `1.412e-4`
+    ///
+    /// `10×` the larger of those (`10 * 1.412e-4 = 1.412e-3`, rounded up
+    /// slightly for the same reason `REDUCTION_ORDER_BUDGET_FRACTION` is)
+    /// resolves to element budgets of `ceil(262144 * 1.412e-3) = 371`
+    /// (seq 128, `10.9×` headroom over the measured 34) and
+    /// `ceil(1048576 * 1.412e-3) = 1481` (seq 512, `10.0×` headroom over
+    /// the measured 148) — both printed and re-checked live by
+    /// `layer_norm_slow_matches_truth_at_production_shape_biased_seq128`/
+    /// `_seq512`, not assumed.
+    const BIASED_REDUCTION_ORDER_BUDGET_FRACTION: f64 = 1.412e-3;
+
+    /// The F16 arm's own reduction-order budget. Only ONE production
+    /// shape is exercised for F16 (`layer_norm_slow_matches_truth_at_production_shape_f16`,
+    /// seq 128 only — see that test's own doc for why a single fixture is
+    /// sufficient), so this constant is `10×` that single measured
+    /// fraction directly, not the larger of two:
+    ///
+    /// * `rows=256, hidden=1024` (seq 128): `59/262144` = `2.2507e-4`
+    ///
+    /// `10 * 2.2507e-4 = 2.2507e-3`, rounded up slightly, resolves to an
+    /// element budget of `ceil(262144 * 2.251e-3) = 591` — `10.0×`
+    /// headroom over the measured 59, printed and re-checked live by that
+    /// test, not assumed.
+    const F16_REDUCTION_ORDER_BUDGET_FRACTION: f64 = 2.251e-3;
 
     /// Biting oracle (family F: measured live against an independently-
     /// derived reference, not a same-code tautology) at PRODUCTION
@@ -1018,6 +1095,206 @@ mod tests {
         layer_norm_slow_matches_truth_at_production_shape(2 * 512, 1024, 0xC0FF_EE02);
     }
 
+    /// Deterministic FNV-1a over an f32 slice's raw bit patterns (family
+    /// J: a tracked expected value is checked against the SAME bytes every
+    /// run, not eyeballed from a printed float) — hashes `to_bits()` of
+    /// every element in slice order, so a single flipped ULP anywhere in
+    /// the fixture changes the hash. Used only by the F32
+    /// reciprocal-vs-division discriminator below, as a second, redundant
+    /// check that does not depend on recomputing the reference formula (a
+    /// future edit that changes `slow()` and its truth reference in
+    /// lock-step, keeping them mutually consistent but jointly wrong,
+    /// would still trip this fixed constant).
+    fn fnv1a_f32(values: &[f32]) -> u64 {
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0100_0000_01b3;
+        let mut hash = FNV_OFFSET;
+        for v in values {
+            for byte in v.to_bits().to_le_bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(FNV_PRIME);
+            }
+        }
+        hash
+    }
+
+    /// An F32 reference for `slow()`'s bias-free epilogue that reuses
+    /// candle's OWN `Tensor::sum_keepdim` for both mean and variance —
+    /// the exact same reduction `slow()` performs internally — rather
+    /// than the hand-rolled ascending-index scalar loop
+    /// [`scalar_layer_norm_truth_bf16`] uses. Sharing the fold order this
+    /// way (family J: a fixed, explicit fold order is what makes a
+    /// numeric claim checkable at all) removes reduction-order as a free
+    /// variable entirely: at F32, `internal_dtype == x_dtype`, so every
+    /// `to_dtype` call `slow()` makes is a same-dtype no-op, and the ONLY
+    /// remaining degree of freedom between this function and `slow()` is
+    /// whether `rstd` is computed as a reciprocal-then-multiply (this
+    /// function, matching `slow()`'s current form) or a division (see
+    /// [`f32_div_truth`] below). That makes this an exact, zero-tolerance
+    /// oracle — not a budgeted one like the bf16/f16 arms above, which
+    /// tolerate real SIMD-lane reduction-order noise from a DIFFERENT
+    /// fold order.
+    fn f32_rstd_multiply_truth(x: &Tensor, gamma: &Tensor, eps: f64) -> Tensor {
+        let hidden = x.dim(D::Minus1).unwrap();
+        let mean = (x.sum_keepdim(D::Minus1).unwrap() / hidden as f64).unwrap();
+        let centered = x.broadcast_sub(&mean).unwrap();
+        let variance =
+            (centered.sqr().unwrap().sum_keepdim(D::Minus1).unwrap() / hidden as f64).unwrap();
+        let rstd = (variance + eps).unwrap().sqrt().unwrap().recip().unwrap();
+        let normalized = centered.broadcast_mul(&rstd).unwrap();
+        normalized.broadcast_mul(gamma).unwrap()
+    }
+
+    /// The division-form TWIN of [`f32_rstd_multiply_truth`] — identical
+    /// in every other respect (same `sum_keepdim` calls, same fold order)
+    /// except `centered.broadcast_div(&std)` where the function above
+    /// takes the reciprocal first and multiplies. This is the PRE-ROUND-3
+    /// formula `slow()`'s `rstd` line replaced (see that line's own doc).
+    /// Kept ONLY as this oracle's RED, non-vacuity control: division and
+    /// multiply-by-reciprocal are not bit-identical in floating point (the
+    /// reciprocal is itself a rounded value), so this must diverge from
+    /// [`f32_rstd_multiply_truth`] — proving the fixture actually
+    /// distinguishes the two placements at F32, where the bf16/f16
+    /// double-rounding fix's own oracles are silent (that fix is a
+    /// same-dtype no-op at F32; this one is not).
+    fn f32_div_truth(x: &Tensor, gamma: &Tensor, eps: f64) -> Tensor {
+        let hidden = x.dim(D::Minus1).unwrap();
+        let mean = (x.sum_keepdim(D::Minus1).unwrap() / hidden as f64).unwrap();
+        let centered = x.broadcast_sub(&mean).unwrap();
+        let variance =
+            (centered.sqr().unwrap().sum_keepdim(D::Minus1).unwrap() / hidden as f64).unwrap();
+        let std = (variance + eps).unwrap().sqrt().unwrap();
+        let normalized = centered.broadcast_div(&std).unwrap();
+        normalized.broadcast_mul(gamma).unwrap()
+    }
+
+    /// Tracked expected value (family J: a seeded/bit-repro oracle) for
+    /// `slow()`'s real F32 output on the production-shape fixture below
+    /// (`rows=256, hidden=1024`, seed `0xF32B_EED1`/`0xF32B_EED2`) —
+    /// [`fnv1a_f32`] of the flattened output, printed and asserted by
+    /// [`slow_f32_reciprocal_form_is_bit_exact_and_diverges_from_division`].
+    /// A future accidental edit to BOTH `slow()` and
+    /// [`f32_rstd_multiply_truth`] that keeps them mutually consistent but
+    /// jointly wrong would still trip this fixed constant, since it does
+    /// not depend on recomputing the reference at all.
+    const EXPECTED_SLOW_F32_FNV1A: u64 = 0xa5bd_533d_3c3f_9c5b;
+
+    /// The F32 discriminator for the reciprocal-vs-division rounding-
+    /// PLACEMENT fix at `slow()`'s `rstd` line (family D/F/J): proves,
+    /// against a same-fold-order reference and a tracked bit hash, that
+    /// `slow()`'s F32 output actually depends on taking the reciprocal
+    /// first rather than dividing — closing the mutation survivor found
+    /// on `3b3dbde` (reverting the `rstd` line back to
+    /// `centered.broadcast_div(&(variance + self.eps)?.sqrt()?)?` left
+    /// every existing bf16/f16 test green, since their reduction-order
+    /// BUDGET was loose enough to absorb the extra divergence — see
+    /// `REDUCTION_ORDER_BUDGET_FRACTION`'s doc). F32 has no such budget to
+    /// hide behind: `internal_dtype == x_dtype` there, so the ONLY
+    /// difference between `slow()`'s real output and
+    /// [`f32_rstd_multiply_truth`]'s same-fold-order reference is the
+    /// `rstd` line itself, making an exact (not budgeted) bit-compare
+    /// possible, and reverting that one line turns the whole tensor's
+    /// output — not a stray 1-in-93 rounding-boundary element — into the
+    /// division form's numbers instead.
+    #[test]
+    fn slow_f32_reciprocal_form_is_bit_exact_and_diverges_from_division() {
+        let device = Device::Cpu;
+        let eps = 1e-5f64;
+        // batch=2, seq=128, hidden=1024 -> rows=256 -- the same production
+        // shape as the bf16 seq128 oracle above.
+        let (rows, hidden) = (2 * 128, 1024);
+        let n = rows * hidden;
+
+        let xf = lcg_fixture(0xF32B_EED1, n, 24.0);
+        let gf = lcg_fixture(0xF32B_EED2, hidden, 2.0);
+        assert!(xf.iter().all(|v| v.is_finite()), "fixture x must be finite");
+        assert!(
+            gf.iter().all(|v| v.is_finite()),
+            "fixture gamma must be finite"
+        );
+
+        let x = Tensor::from_slice(&xf, (rows, hidden), &device).unwrap();
+        let weight = Tensor::from_slice(&gf, (hidden,), &device).unwrap();
+        let ln = bias_free_ln(weight.clone(), eps, true);
+
+        let slow_out: Vec<f32> = ln
+            .slow(&x)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert!(
+            slow_out.iter().all(|v| v.is_finite()),
+            "slow() output must be finite before any bit compare"
+        );
+
+        let truth_out: Vec<f32> = f32_rstd_multiply_truth(&x, &weight, eps)
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert!(
+            truth_out.iter().all(|v| v.is_finite()),
+            "truth output must be finite before any bit compare"
+        );
+        assert_eq!(
+            slow_out, truth_out,
+            "slow()'s F32 output must be BIT-EXACT vs a same-fold-order (candle \
+             sum_keepdim) reciprocal-multiply reference -- no reduction-order budget \
+             applies at F32, since internal_dtype == x_dtype makes every to_dtype call \
+             a same-dtype no-op"
+        );
+
+        // RED CONTROL (non-vacuity): the pre-round-3 division form must
+        // diverge from the reciprocal-multiply truth on a stated,
+        // ASSERTED-POSITIVE count, at F32, where the bf16/f16 oracles
+        // above have no visibility into this specific placement at all.
+        let div_out: Vec<f32> = f32_div_truth(&x, &weight, eps)
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert!(
+            div_out.iter().all(|v| v.is_finite()),
+            "division-form control output must be finite before any bit compare"
+        );
+        let mismatch_div_vs_recip = slow_out
+            .iter()
+            .zip(div_out.iter())
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        println!(
+            "slow_f32_reciprocal_form_is_bit_exact_and_diverges_from_division: \
+             division-form vs slow() (reciprocal form) mismatches = {mismatch_div_vs_recip}/{n}"
+        );
+        assert!(
+            mismatch_div_vs_recip > 0,
+            "RED control is vacuous: the division form matched slow()'s reciprocal-form \
+             output on every element -- this fixture does not exercise the \
+             reciprocal-vs-division placement difference at F32 at all"
+        );
+
+        let hash_slow = fnv1a_f32(&slow_out);
+        let hash_div = fnv1a_f32(&div_out);
+        println!(
+            "slow_f32_reciprocal_form_is_bit_exact_and_diverges_from_division: \
+             slow() output fnv1a = {hash_slow:#018x}, division-form (RED control) \
+             fnv1a = {hash_div:#018x}"
+        );
+        assert_eq!(
+            hash_slow, EXPECTED_SLOW_F32_FNV1A,
+            "slow()'s tracked F32 output hash drifted from the committed expected value \
+             ({hash_slow:#018x} vs {EXPECTED_SLOW_F32_FNV1A:#018x}) -- either the fixture, \
+             `slow()`, or the reciprocal placement changed"
+        );
+        assert_ne!(
+            hash_div, EXPECTED_SLOW_F32_FNV1A,
+            "the division-form control must NOT match the tracked reciprocal-form hash, \
+             or this hash is not actually distinguishing the two placements"
+        );
+    }
+
     /// Biased twin of [`scalar_layer_norm_truth_bf16`]: the SAME
     /// f32-accumulated, ascending-index, round-once-at-the-end reference,
     /// extended with the affine bias term (`out = gamma * (rstd * (x -
@@ -1166,7 +1443,7 @@ mod tests {
             .zip(truth.iter())
             .filter(|(a, b)| a.to_bits() != b.to_bits())
             .count();
-        let budget = ((n as f64) * REDUCTION_ORDER_BUDGET_FRACTION).ceil() as usize;
+        let budget = ((n as f64) * BIASED_REDUCTION_ORDER_BUDGET_FRACTION).ceil() as usize;
         println!(
             "layer_norm_slow_matches_truth_at_production_shape_biased(rows={rows}, \
              hidden={hidden}): slow() vs truth mismatches = {mismatch_vs_truth}/{n} \
@@ -1307,12 +1584,11 @@ mod tests {
             .zip(truth.iter())
             .filter(|(a, b)| a.to_bits() != b.to_bits())
             .count();
-        // F16's finer ULP spacing than bf16 (10 mantissa bits vs 7) makes
-        // the SAME reduction-order mechanism land on a rounding boundary
-        // less often; reuse the bf16 budget as a (looser, still
-        // meaningful) ceiling rather than deriving a separate constant
-        // from a single fixture.
-        let budget = ((n as f64) * REDUCTION_ORDER_BUDGET_FRACTION).ceil() as usize;
+        // F16's own measured residual at this shape is 59/262144
+        // (2.2507e-4) -- see [`F16_REDUCTION_ORDER_BUDGET_FRACTION`]'s
+        // doc for the derivation; this is what is measured, not a claim
+        // about WHY it differs from the bf16 arms' own residuals.
+        let budget = ((n as f64) * F16_REDUCTION_ORDER_BUDGET_FRACTION).ceil() as usize;
         println!(
             "layer_norm_slow_matches_truth_at_production_shape_f16: slow() vs truth \
              mismatches = {mismatch_vs_truth}/{n} (budget {budget})"

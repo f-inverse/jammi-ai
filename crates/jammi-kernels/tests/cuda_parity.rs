@@ -6616,6 +6616,288 @@ fn flash_upstream_acceptance_form_red_control_k_unrotated_cuda() {
     );
 }
 
+/// Runs the flash op with a DIFFERENT `VarlenConfig.window` on the FORWARD
+/// launch than the BACKWARD launch, via
+/// `flash_attention_varlen_with_rope_test_only_bwd_window_override` (a
+/// TEST-SUPPORT-ONLY entry point, never reachable from
+/// `flash_attention_varlen_with_rope` or any production/admission path --
+/// see that function's own doc). `window` is the FORWARD radius (fed to
+/// BOTH the flash op's forward launch and the reference/eager side, which
+/// only ever sees one radius since eager's backward is exact autodiff of
+/// its own forward); `bwd_window` is fed to the flash op's BACKWARD launch
+/// ONLY. Otherwise identical to `flash_bwd_fused` (same fixture/cast/loss
+/// construction).
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "flash-attn")]
+fn flash_bwd_fused_mismatched_fwd_bwd_window(
+    cuda: &Device,
+    qkv_v: &[f32],
+    rope_v: &[f32],
+    dy_v: &[f32],
+    batch: usize,
+    seq: usize,
+    heads: usize,
+    head_dim: usize,
+    scale: f32,
+    window: Option<usize>,
+    bwd_window: Option<usize>,
+) -> (Vec<f32>, Vec<f32>) {
+    use jammi_kernels::flash::{CuSeqlens, VarlenConfig};
+    use jammi_kernels::ops::flash_attention_varlen_with_rope_test_only_bwd_window_override;
+
+    let cuda_dev = match cuda {
+        Device::Cuda(dev) => dev,
+        _ => panic!("flash_bwd_fused_mismatched_fwd_bwd_window requires a CUDA device"),
+    };
+    let cast = |t: Tensor| -> Tensor { t.to_dtype(DType::BF16).unwrap() };
+    let qkv = Var::from_tensor(&cast(
+        Tensor::from_slice(qkv_v, (batch * seq, 3, heads, head_dim), cuda).unwrap(),
+    ))
+    .unwrap();
+    let rope_pack = cast(Tensor::from_slice(rope_v, (2, 1, 1, seq, head_dim), cuda).unwrap());
+    let cos = rope_pack.narrow(0, 0, 1).unwrap();
+    let sin = rope_pack.narrow(0, 1, 1).unwrap();
+    let dy = cast(Tensor::from_slice(dy_v, (batch, seq, heads * head_dim), cuda).unwrap());
+
+    let lengths = vec![seq; batch];
+    let cu_seqlens = CuSeqlens::from_lengths(&lengths, cuda_dev).unwrap();
+    let fwd_cfg = VarlenConfig {
+        softmax_scale: scale,
+        window: window.map(|w| w as u32),
+        deterministic: true,
+    };
+    let bwd_cfg = VarlenConfig {
+        softmax_scale: scale,
+        window: bwd_window.map(|w| w as u32),
+        deterministic: true,
+    };
+    let o = flash_attention_varlen_with_rope_test_only_bwd_window_override(
+        qkv.as_tensor(),
+        &cos,
+        &sin,
+        seq,
+        &cu_seqlens,
+        &fwd_cfg,
+        &bwd_cfg,
+    )
+    .unwrap();
+    let out = o.reshape((batch, seq, heads * head_dim)).unwrap();
+    let loss = (&out * &dy).unwrap().sum_all().unwrap();
+    let grads = loss.backward().unwrap();
+    let dqkv = grads
+        .get(qkv.as_tensor())
+        .expect("flash_bwd_fused_mismatched_fwd_bwd_window: qkv must have a gradient")
+        .to_dtype(DType::F32)
+        .unwrap();
+
+    let out_v: Vec<f32> = out
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_device(&Device::Cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let dqkv_v: Vec<f32> = dqkv
+        .to_device(&Device::Cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    (out_v, dqkv_v)
+}
+
+/// Same four-number measurement `measure_flash_upstream_form` builds, but
+/// through `flash_bwd_fused_mismatched_fwd_bwd_window` instead of
+/// `flash_bwd_fused` -- see that function's own doc for the fwd/bwd window
+/// split.
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "flash-attn")]
+fn measure_flash_upstream_form_bwd_window_dropped(
+    cuda: &Device,
+    batch: usize,
+    seq: usize,
+    heads: usize,
+    head_dim: usize,
+    window: Option<usize>,
+    bwd_window: Option<usize>,
+    seed: u64,
+    fixture_kind: FlashFixtureKind,
+) -> FlashUpstreamMeasurement {
+    let (qkv_v, dy_v): (Vec<f32>, Vec<f32>) = match fixture_kind {
+        FlashFixtureKind::SmoothAmplitude(amplitude) => (
+            qkv_fixture(batch, seq, heads, head_dim, seed as f32)
+                .into_iter()
+                .map(|v| v * amplitude)
+                .collect(),
+            attention_dy_fixture(batch * seq * heads * head_dim, seed as f32 + 100.0),
+        ),
+        FlashFixtureKind::Gaussian => (
+            gaussian_fixture(batch * seq * 3 * heads * head_dim, seed, 1.0),
+            gaussian_fixture(
+                batch * seq * heads * head_dim,
+                seed ^ 0xC0FF_EE00_D15E_A5E5,
+                (1e-3f32).sqrt(),
+            ),
+        ),
+    };
+    let rope_v = attention_rope_pack(seq, head_dim);
+    let mask_base = vec![0f32; batch * seq];
+    let mask_v: Vec<f32> = match window {
+        None => mask_base,
+        Some(hw) => {
+            let combined = combined_attention_mask(cuda, batch, seq, &mask_base, Some(hw));
+            combined.flatten_all().unwrap().to_vec1().unwrap()
+        }
+    };
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    let (out_fused, dqkv_fused) = flash_bwd_fused_mismatched_fwd_bwd_window(
+        cuda, &qkv_v, &rope_v, &dy_v, batch, seq, heads, head_dim, scale, window, bwd_window,
+    );
+    let (out_eager, dqkv_eager) = attention_block_bwd_production_eager_reference(
+        cuda,
+        DType::BF16,
+        &qkv_v,
+        &rope_v,
+        &mask_v,
+        &dy_v,
+        batch,
+        seq,
+        heads,
+        head_dim,
+        scale,
+    );
+    let (out_ref, dqkv_ref) = attention_block_bwd_production_eager_reference(
+        cuda,
+        DType::F32,
+        &qkv_v,
+        &rope_v,
+        &mask_v,
+        &dy_v,
+        batch,
+        seq,
+        heads,
+        head_dim,
+        scale,
+    );
+
+    let label = format!(
+        "shape=({batch},{seq},{heads},{head_dim}) window={window:?} bwd_window={bwd_window:?}"
+    );
+    let m = FlashUpstreamMeasurement {
+        out_fused_max: max_abs_diff_finite_first(
+            &format!("out fused-vs-ref {label}"),
+            &out_fused,
+            &out_ref,
+        ),
+        out_eager_max: max_abs_diff_finite_first(
+            &format!("out eager-vs-ref {label}"),
+            &out_eager,
+            &out_ref,
+        ),
+        dqkv_fused_max: max_abs_diff_finite_first(
+            &format!("dqkv fused-vs-ref {label}"),
+            &dqkv_fused,
+            &dqkv_ref,
+        ),
+        dqkv_eager_max: max_abs_diff_finite_first(
+            &format!("dqkv eager-vs-ref {label}"),
+            &dqkv_eager,
+            &dqkv_ref,
+        ),
+    };
+    eprintln!(
+        "FLASH_UPSTREAM {label}: out fused={:e} eager={:e} bound(2x)={:e}; dqkv fused={:e} \
+         eager={:e} bound(3x)={:e}",
+        m.out_fused_max,
+        m.out_eager_max,
+        2.0 * m.out_eager_max,
+        m.dqkv_fused_max,
+        m.dqkv_eager_max,
+        3.0 * m.dqkv_eager_max,
+    );
+    m
+}
+
+/// RED control: the flash op's FORWARD launch uses the real window
+/// (`Some(64)`) but its BACKWARD launch is fed a DROPPED window (`None`,
+/// full attention) -- reachable ONLY through
+/// `flash_attention_varlen_with_rope_test_only_bwd_window_override` (see
+/// that function's own doc) -- while the reference/eager side keeps the
+/// real radius on both legs (eager's backward is exact autodiff of its own
+/// forward, so its two legs can never disagree). Must leave OUT WITHIN
+/// bound (forward is untouched by this defect) and VIOLATE the dqkv bound.
+///
+/// FIXTURE: `FlashFixtureKind::Gaussian`, NOT `SmoothAmplitude` (the other
+/// two op-level controls' own fixture) -- measured this round on a100b: at
+/// `SmoothAmplitude(12.0)` (production-checkpoint-magnitude `qkv`), NEITHER
+/// `bwd_window = None` NOR the more extreme `Some(0)` (self-only backward
+/// attention) discriminates at this bound (dqkv ratio-to-bound 0.02-0.16
+/// across a 5-seed sweep at both `b1_s128` and `b8_s512` -- widening or
+/// zeroing the backward-only window changes the SCALE of the already-large
+/// eager/bf16 noise floor at this amplitude, not its SIGN, so a bounded
+/// multiple of it stays bounded). `Gaussian`'s own tiny cotangent
+/// (`N(0, 1e-3)`) gives the eager reference a genuinely small dqkv noise
+/// floor, against which this defect's OWN magnitude (independent of the
+/// cotangent's scale, since it comes from attending to the WRONG key set)
+/// stands out: dqkv ratio-to-bound 23-184x over bound across the SAME
+/// 5-seed sweep, EVERY seed, BOTH shapes, BOTH `bwd_window` values --
+/// `None` chosen over `Some(0)` as the simpler value (full-attention
+/// backward, no extra `window=0` special case) since both discriminate
+/// equally well under this fixture.
+///
+/// This closes a blind spot the encoder-level three-way oracle's gradient
+/// leg has: that oracle's only backward-exercising fixture
+/// (`jammi_encoders::modernbert::flash_oracle_wqkv_lora_b`) sits on the
+/// LAST layer's `Wqkv` LoRA `B`, a GLOBAL (no-window) layer -- a
+/// backward-only window defect confined to the 18 LOCAL (windowed) layers
+/// is invisible to it. This op-level control exercises the window as a
+/// per-call parameter directly, independent of which layer (global or
+/// local) would carry the defect in production.
+///
+/// Asserted CONJUNCTIVELY (`out_ok() && !dqkv_ok()`), not the OR the other
+/// two op-level controls above use: `out_ok()` must hold because this
+/// defect never touches the forward launch, so a control that let `out`
+/// fail too would not be proving anything about the GRADIENT arm
+/// specifically -- and the `k_unrotated` control's own dqkv leg (7.36e2,
+/// inside its 3x bound of 2.904e3, measured this round on a100b) shows the
+/// dqkv arm of the `!out_ok() || !dqkv_ok()` form had NEVER actually fired
+/// on any committed control before this one.
+#[test]
+#[cfg(feature = "flash-attn")]
+fn flash_upstream_acceptance_form_red_control_bwd_only_window_dropped_cuda() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let m = measure_flash_upstream_form_bwd_window_dropped(
+        &cuda,
+        8,
+        512,
+        16,
+        64,
+        Some(64),
+        None,
+        76,
+        FlashFixtureKind::Gaussian,
+    );
+    assert!(
+        m.out_ok() && !m.dqkv_ok(),
+        "flash backward-only window dropped must leave OUT within bound (forward is untouched \
+         by this defect) but VIOLATE the dqkv bound -- out fused={:e} eager={:e} bound(2x)={:e}; \
+         dqkv fused={:e} eager={:e} bound(3x)={:e} -- if this assertion fails, the healthy \
+         oracle above would NOT have caught this defect on the gradient leg",
+        m.out_fused_max,
+        m.out_eager_max,
+        2.0 * m.out_eager_max,
+        m.dqkv_fused_max,
+        m.dqkv_eager_max,
+        3.0 * m.dqkv_eager_max,
+    );
+}
+
 // =======================================================================
 // RopePositionsFused CPU<->CUDA parity + THE B3-dense identity oracle
 // (P6 Stage B B3-dense, contract v5 §3.6): `rope_positions_fused` on the

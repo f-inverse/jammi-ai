@@ -587,6 +587,79 @@ mod tests {
         bit_identity_case(2, 4, 9, 64);
     }
 
+    /// Direct assertion of the module doc's `bwd` claim ("the same
+    /// sign-flip reuse `RopeFused` already established"): `bwd` for BOTH
+    /// [`RopePositionsFused`] (`rope_positions.rs:350-377`) and
+    /// [`super::super::rope::RopeFused`] (`rope.rs:348-368`) delegate to
+    /// their OWN forward with `negate_sin` flipped — that makes bit-
+    /// identity of the two ops' `bwd` outputs a CONSEQUENCE of the
+    /// already-proven forward bit-identity (`bit_identity_case`, above)
+    /// PLUS identical cotangents, but it was not itself asserted anywhere
+    /// before this test. Drives BOTH ops through candle's real
+    /// `Tensor::backward()` (not a hand-replication of the `negate_sin`
+    /// mechanism) so this exercises the actual `CustomOp3::bwd` trait
+    /// method on each op, on the SAME non-uniform cotangent (a real
+    /// backward pass through `sum_all` gives a uniform all-ones cotangent,
+    /// which would not distinguish a `bwd` that silently returns the
+    /// WRONG per-element gradient shape/permutation from a correct one as
+    /// sharply as a non-uniform weight does).
+    fn bwd_bit_identity_case(b: usize, h: usize, s: usize, d: usize) {
+        use candle_core::Var;
+        let device = Device::Cpu;
+        let n = b * h * s * d;
+        let xv: Vec<f32> = (0..n).map(|k| (k as f32 * 0.037).sin() * 3.0).collect();
+        let x_bhsd = Tensor::from_vec(xv, (b, h, s, d), &device).unwrap();
+        let fv: Vec<f32> = (0..n)
+            .map(|k| (k as f32 * 0.091 + 1.0).cos() * 2.0)
+            .collect();
+        let filler_bhsd = Tensor::from_vec(fv, (b, h, s, d), &device).unwrap();
+        // The cotangent: distinct, non-uniform per-element weights (never
+        // all-ones like a bare `sum_all().backward()` would produce).
+        let wv: Vec<f32> = (0..n).map(|k| (k as f32 * 0.017 + 0.5).cos()).collect();
+        let weight_bhsd = Tensor::from_vec(wv, (b, h, s, d), &device).unwrap();
+        let zeros_bhsd = Tensor::zeros((b, h, s, d), DType::F32, &device).unwrap();
+        let (cos, sin) = rope_table(s, d, 10_000.0);
+
+        // Reference: RopeFused's own real backward, on [b,h,s,d].
+        let x_var_ref = Var::from_tensor(&x_bhsd).unwrap();
+        let y_ref =
+            super::super::apply3(x_var_ref.as_tensor(), &cos, &sin, RopeFused::new(false)).unwrap();
+        let loss_ref = (&y_ref * &weight_bhsd).unwrap().sum_all().unwrap();
+        let grads_ref = loss_ref.backward().unwrap();
+        let dx_ref = grads_ref
+            .get(x_var_ref.as_tensor())
+            .expect("RopeFused: x must have a gradient");
+
+        for slot in [0usize, 1usize] {
+            let qkv = pack_bhsd_into_qkv(&x_bhsd, &filler_bhsd, slot);
+            let qkv_var = Var::from_tensor(&qkv).unwrap();
+            let weight_packed = pack_bhsd_into_qkv(&weight_bhsd, &zeros_bhsd, slot);
+            let y = fused(s, false, qkv_var.as_tensor(), &cos, &sin).unwrap();
+            let loss = (&y * &weight_packed).unwrap().sum_all().unwrap();
+            let grads = loss.backward().unwrap();
+            let dqkv = grads
+                .get(qkv_var.as_tensor())
+                .expect("RopePositionsFused: qkv must have a gradient");
+            let dx = unpack_qkv_slot(dqkv, slot, b, s);
+            assert_eq!(
+                to_bits(&dx),
+                to_bits(dx_ref),
+                "RopePositionsFused's real backward (slot {slot}) must be bit-identical to \
+                 RopeFused's real backward on the SAME cotangent, b={b} h={h} s={s} d={d}"
+            );
+        }
+    }
+
+    #[test]
+    fn bwd_bit_identical_to_rope_fused_bwd_on_bhsd_b1_head_dim_matches_production() {
+        bwd_bit_identity_case(1, 4, 9, 64);
+    }
+
+    #[test]
+    fn bwd_bit_identical_to_rope_fused_bwd_on_bhsd_b8_head_dim_matches_production() {
+        bwd_bit_identity_case(8, 4, 9, 64);
+    }
+
     #[test]
     fn degenerate_d_zero_is_empty_not_a_panic() {
         let device = Device::Cpu;

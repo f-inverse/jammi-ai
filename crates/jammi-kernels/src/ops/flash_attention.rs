@@ -452,7 +452,19 @@ pub(crate) struct FlashVarlenAttentionFusedRope {
     seq: usize,
     cu_seqlens: CuSeqlens,
     num_heads: usize,
+    /// The config `cuda_fwd` ALWAYS launches with.
     cfg: VarlenConfig,
+    /// TEST-ONLY: when `Some`, `bwd` launches [`FlashVarlenBwdHelper`] with
+    /// THIS config instead of `cfg` — forward is UNAFFECTED either way, it
+    /// always reads `cfg`. `None` for every production call site
+    /// ([`flash_attention_varlen_with_rope`], the only public constructor
+    /// besides the test-only one below), so production behaviour is
+    /// completely unchanged by this field's existence: `bwd` then reads
+    /// `cfg` exactly as it did before this field was added. See
+    /// [`flash_attention_varlen_with_rope_test_only_bwd_window_override`]'s
+    /// own doc for why a mismatched fwd/bwd config needs a real op-level
+    /// seam rather than a crafted input tensor.
+    bwd_cfg_override: Option<VarlenConfig>,
     lse: Saved<CudaSlice<f32>>,
 }
 
@@ -592,11 +604,14 @@ impl CustomOp3 for FlashVarlenAttentionFusedRope {
         // The flash-side gradient: UNCHANGED `FlashVarlenBwdHelper`, the
         // SAME type/logic `FlashVarlenAttention::bwd` uses, constructed
         // identically (this op's own stashed `lse` moved into the helper's
-        // OWN `Saved` slot, exactly that method's own pattern).
+        // OWN `Saved` slot, exactly that method's own pattern) — EXCEPT the
+        // config: `bwd_cfg_override`, when set, overrides `cfg` here ONLY
+        // (see that field's own doc; every production call site leaves it
+        // `None`, so `unwrap_or(self.cfg)` is a no-op there).
         let helper = FlashVarlenBwdHelper {
             cu_seqlens: self.cu_seqlens.try_duplicate().map_err(flash_err)?,
             num_heads: self.num_heads,
-            cfg: self.cfg,
+            cfg: self.bwd_cfg_override.unwrap_or(self.cfg),
             lse: Saved::empty(),
         };
         helper
@@ -634,12 +649,69 @@ pub fn flash_attention_varlen_with_rope(
     cfg: &VarlenConfig,
 ) -> Result<Tensor> {
     let (_total_q, num_heads) = check_qkv_domain(qkv.dims(), qkv.dtype())?;
+    // `RopePositionsFused`'s own dense-only scope (`ops::rope_positions`'s
+    // module doc): `position = token % seq` is only valid when `cu_seqlens`
+    // is dense/uniform at exactly `seq` — `rope_positions_dims` alone
+    // cannot see that (it only checks `total % seq == 0`, which a
+    // non-uniform batch summing to `batch*seq` also satisfies), so this op
+    // — the ONLY caller that pairs `cu_seqlens` with a `seq` — checks it
+    // here instead.
+    cu_seqlens.check_dense_uniform(seq).map_err(flash_err)?;
     let cu_seqlens = cu_seqlens.try_duplicate().map_err(flash_err)?;
     let op = FlashVarlenAttentionFusedRope {
         seq,
         cu_seqlens,
         num_heads,
         cfg: *cfg,
+        bwd_cfg_override: None,
+        lse: Saved::empty(),
+    };
+    super::apply_stateful3(qkv, cos, sin, op)
+}
+
+/// TEST-SUPPORT ONLY — never wired into [`flash_attention_varlen_with_rope`]
+/// or any production/admission/dispatch path (production always calls the
+/// function above, which leaves `bwd_cfg_override` `None`). Identical to
+/// [`flash_attention_varlen_with_rope`] except the FORWARD launch uses
+/// `fwd_cfg` and the BACKWARD launch uses a DIFFERENT config, `bwd_cfg` —
+/// [`FlashVarlenAttentionFusedRope`]'s own `bwd_cfg_override` field, which
+/// production construction never sets. This exists because a
+/// backward-only defect in the window radius (or any other `VarlenConfig`
+/// field) cannot be modelled by crafting a different INPUT tensor the way
+/// [`crate::flash`]'s FFI-level RED controls elsewhere model a K-unrotated
+/// defect (`tests/cuda_parity.rs`'s `k_unrotated` control) — the window is
+/// a per-call CONFIG parameter each of `flash_varlen_fwd_into`/
+/// `flash_varlen_bwd_into` takes independently, not something a tensor
+/// value can encode — so the only honest way to exercise "forward correct,
+/// backward wrong" is a real seam letting the two calls disagree. See
+/// `tests/cuda_parity.rs`'s
+/// `flash_upstream_acceptance_form_red_control_bwd_only_window_dropped_cuda`
+/// (this crate's own op-level acceptance-form suite) for the RED control
+/// built on top of this function, and
+/// `jammi-encoders`' `modernbert::flash_oracle_wqkv_lora_b`'s own doc
+/// for why that encoder-level oracle's gradient leg cannot see this defect
+/// class on its own (it sits on a global, unwindowed layer) and defers to
+/// this op-level control instead.
+pub fn flash_attention_varlen_with_rope_test_only_bwd_window_override(
+    qkv: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    seq: usize,
+    cu_seqlens: &CuSeqlens,
+    fwd_cfg: &VarlenConfig,
+    bwd_cfg: &VarlenConfig,
+) -> Result<Tensor> {
+    let (_total_q, num_heads) = check_qkv_domain(qkv.dims(), qkv.dtype())?;
+    // Same dense/uniform requirement as `flash_attention_varlen_with_rope`
+    // — see that function's own call site for why.
+    cu_seqlens.check_dense_uniform(seq).map_err(flash_err)?;
+    let cu_seqlens = cu_seqlens.try_duplicate().map_err(flash_err)?;
+    let op = FlashVarlenAttentionFusedRope {
+        seq,
+        cu_seqlens,
+        num_heads,
+        cfg: *fwd_cfg,
+        bwd_cfg_override: Some(*bwd_cfg),
         lse: Saved::empty(),
     };
     super::apply_stateful3(qkv, cos, sin, op)

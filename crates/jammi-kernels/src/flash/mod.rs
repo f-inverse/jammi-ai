@@ -780,6 +780,28 @@ impl CuSeqlens {
         self.cu.as_view()
     }
 
+    /// Refuses unless this batch is DENSE and UNIFORM at exactly `seq`:
+    /// every one of its `batch` sequences has length exactly `seq` (`ops::
+    /// rope_positions`'s own dense-only scope, module doc: "`cu_seqlens`
+    /// uniform, every sequence length `== seq`" — the closed form
+    /// `position = token % seq` `rope_positions_dims` compiles down to is
+    /// only VALID under that premise). A HOST-only check — `total_q ==
+    /// batch * seq` and `max_seqlen == seq` together are both NECESSARY
+    /// and SUFFICIENT for "every length == seq": if the batch's `batch`
+    /// non-negative integer lengths sum to `batch * seq` (their mean is
+    /// exactly `seq`) but are not all equal to `seq`, at least one must
+    /// exceed `seq` (a pigeonhole argument on integers below/at/above the
+    /// mean), so `max_seqlen > seq` catches every non-uniform batch this
+    /// sum-matches check alone would miss (e.g. `lengths = [3, 5], seq =
+    /// 4`: `total_q = 8 = 2*4` passes the sum check alone, but
+    /// `max_seqlen = 5 != 4` is refused here) — no device read of the
+    /// per-sequence lengths (`cu`'s own array) is needed to prove it,
+    /// consistent with this module's "nothing here reads device memory on
+    /// the host" rule (module doc, "Synchronisation").
+    pub(crate) fn check_dense_uniform(&self, seq: usize) -> Result<()> {
+        check_dense_uniform_geometry(self.total_q, self.batch, self.max_seqlen, seq)
+    }
+
     /// The batch's [`VarlenGeometry`] for `num_heads` attention heads —
     /// the ONLY way to construct one, so it can never disagree with `self`.
     /// Validates the num_heads-dependent cells (the int32 offset budget for
@@ -856,6 +878,27 @@ impl VarlenConfig {
         }
         self.window_sizes().map(|_| ())
     }
+}
+
+/// The pure geometry core of [`CuSeqlens::check_dense_uniform`] — HOST-only
+/// integers in, no device access — so it is directly CPU-testable without
+/// building a real `CuSeqlens` (which needs a `CudaDevice`). See that
+/// method's own doc for the necessary-and-sufficient argument.
+fn check_dense_uniform_geometry(
+    total_q: usize,
+    batch: usize,
+    max_seqlen: usize,
+    seq: usize,
+) -> Result<()> {
+    if total_q != batch * seq || max_seqlen != seq {
+        return Err(FlashError::Geometry(format!(
+            "cu_seqlens is not dense/uniform at seq={seq}: total_q={total_q}, batch={batch}, \
+             max_seqlen={max_seqlen} -- expected total_q == batch*seq and max_seqlen == seq \
+             (every sequence length exactly seq); a non-uniform batch would silently misindex \
+             RopePositionsFused's dense-only position = token % seq"
+        )));
+    }
+    Ok(())
 }
 
 fn check_len(name: &str, got: usize, expected: usize) -> Result<()> {
@@ -1307,6 +1350,28 @@ mod tests {
         assert_eq!(total_q, 42);
         assert_eq!(batch, 1);
         assert_eq!(max_seqlen, 42);
+    }
+
+    /// [`check_dense_uniform_geometry`] — CPU-only, no `CudaDevice` needed
+    /// (unlike a real `CuSeqlens`): `lengths = [3, 5], seq = 4` sums to
+    /// `total_q = 8 = batch(2) * seq(4)` (the sum-matches check ALONE would
+    /// pass this non-uniform batch) but `max_seqlen = 5 != seq = 4`, so it
+    /// must be refused; `lengths = [4, 4], seq = 4` is genuinely dense and
+    /// must pass.
+    #[test]
+    fn check_dense_uniform_geometry_refuses_non_uniform_and_accepts_dense() {
+        let (_cu, total_q, batch, max_seqlen) = cu_seqlens_from_lengths(&[3, 5]).unwrap();
+        assert_eq!((total_q, batch, max_seqlen), (8, 2, 5));
+        let e = check_dense_uniform_geometry(total_q, batch, max_seqlen, 4).unwrap_err();
+        assert!(
+            matches!(e, FlashError::Geometry(_)),
+            "lengths=[3,5], seq=4 must be refused as non-uniform: {e}"
+        );
+
+        let (_cu, total_q, batch, max_seqlen) = cu_seqlens_from_lengths(&[4, 4]).unwrap();
+        assert_eq!((total_q, batch, max_seqlen), (8, 2, 4));
+        check_dense_uniform_geometry(total_q, batch, max_seqlen, 4)
+            .expect("lengths=[4,4], seq=4 is genuinely dense/uniform and must be accepted");
     }
 
     /// `total_q`/`max_seqlen` are ALWAYS derived from the device array's own

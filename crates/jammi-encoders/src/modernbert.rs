@@ -1569,43 +1569,43 @@ impl ModernBertMlp {
 const FLASH_HEAD_DIM: usize = 64;
 
 /// The exact CUDA compute capability the flash cascade admits — sm_80
-/// ONLY (contract v4 §3.4/F6: `>=` would admit sm_86/89/90 and crash at
-/// launch, since the vendored kernel is compiled for sm_80 alone). A stub
-/// this crate OWNS until B1 lands its own build-time `FLASH_COMPUTE_CAP`
-/// constant (`crates/jammi-kernels/build.rs`'s planned
-/// `JAMMI_FLASH_GENCODE_SM`, contract §3.4); this function is the seam
-/// B1's real `check_arch`-equivalent plugs into. Uses the SAME
-/// [`probe_cuda_compute_capability`] every other admission predicate in
-/// this crate/`jammi-kernels` reads (`None` — non-CUDA, or `cuda` feature
-/// off, or a query failure — degrades to `false`, never a panic or a
-/// silently-wrong "yes").
+/// ONLY: an EXACT match, never `>=`, because the vendored kernel is
+/// compiled for sm_80 alone, so admitting sm_86/89/90 as well would crash
+/// at launch rather than run. A stub this crate OWNS until B1 lands its
+/// own build-time `FLASH_COMPUTE_CAP` constant
+/// (`crates/jammi-kernels/build.rs`'s planned `JAMMI_FLASH_GENCODE_SM`);
+/// this function is the seam B1's real `check_arch`-equivalent plugs into.
+/// Uses the SAME [`probe_cuda_compute_capability`] every other admission
+/// predicate in this crate/`jammi-kernels` reads (`None` — non-CUDA, or
+/// `cuda` feature off, or a query failure — degrades to `false`, never a
+/// panic or a silently-wrong "yes").
 fn flash_arch_ok(device: &Device) -> bool {
     probe_cuda_compute_capability(device) == Some(ComputeCapability::new(8, 0))
 }
 
 /// How many times this process has paid the flash cascade's device-side
-/// mask reduction + host sync (contract v4 §3.7, path F, as corrected by
-/// the lead: row LENGTHS alone cannot decide "prefix" — a mask
-/// `[1,0,1,0]` sums to `2`, the same length a genuine prefix `[1,1,0,0]`
-/// reports — so lengths AND the whole-batch prefix predicate are computed
-/// on the device in ONE reduction and read back in ONE sync, not `b`
-/// separate transfers). See [`compute_lengths_and_prefix`]. A durable run
-/// record is expected to read this exactly `steps` (or
-/// `forwards_per_step * steps` — batched vs unbatched vs GradCache-chunked,
-/// contract v4's item-2 correction) on an FA2-ELIGIBLE leg (the sync only
-/// runs once the cheap, sync-free gates below already passed) and `0` on
-/// every block leg, including every CPU / non-`flash-attn`-feature build
-/// this crate's own test suite runs under today.
+/// mask reduction + host sync, path F: row LENGTHS alone cannot decide
+/// "prefix" — a mask `[1,0,1,0]` sums to `2`, the same length a genuine
+/// prefix `[1,1,0,0]` reports — so lengths AND the whole-batch prefix
+/// predicate are computed on the device in ONE reduction and read back in
+/// ONE sync, not `b` separate transfers. See [`compute_lengths_and_prefix`].
+/// A durable run record is expected to read this exactly `steps` (or
+/// `forwards_per_step * steps` for a batched/unbatched/GradCache-chunked
+/// run) on an FA2-ELIGIBLE leg (the sync only runs once the cheap,
+/// sync-free gates below already passed) and `0` on every block leg,
+/// including every CPU / non-`flash-attn`-feature build this crate's own
+/// test suite runs under today.
 static FLASH_D2H_SYNCS: AtomicU64 = AtomicU64::new(0);
 
-/// Read API for [`FLASH_D2H_SYNCS`] — `pub(crate)` today (no external
-/// consumer yet); a durable job record reads it the same way it reads
-/// `crate::attention_block_dispatch_snapshot()`. `#[allow(dead_code)]`:
-/// exercised directly by this module's own tests (`#[cfg(test)]`, a
-/// SEPARATE compilation from the plain lib target `clippy --all-targets`
-/// also checks) but not yet called from non-test production code — no
-/// durable-artifact caller has been wired up to read it yet.
-#[allow(dead_code)]
+/// Read API for [`FLASH_D2H_SYNCS`]. `#[cfg(test)]`: every caller in this
+/// crate today is this module's own `#[cfg(test)] mod tests` (`before`/
+/// `after` counters bracketing a forward) — no durable-artifact reader has
+/// been wired up yet, so this is honestly test-only rather than a `pub`/
+/// `pub(crate)` production API carrying a permanent `#[allow(dead_code)]`.
+/// When a durable job record DOES read this counter (the same way it reads
+/// `crate::attention_block_dispatch_snapshot()`), drop this `#[cfg(test)]`
+/// and wire that caller in the SAME commit — never re-add the allow.
+#[cfg(test)]
 pub(crate) fn flash_d2h_syncs() -> u64 {
     FLASH_D2H_SYNCS.load(Ordering::Relaxed)
 }
@@ -1674,7 +1674,7 @@ enum FlashDecision {
     /// [`flash_admission_predicate`] (or the dense/padded split in
     /// [`build_flash_forward_decision`]) determined. NEVER carries a
     /// `CompactedBatch`, even in the "was `Holds`, downgraded for being
-    /// padded" case (`reason == "flash_padded_not_yet_wired"`): that batch
+    /// padded" case (`reason == "padded_batch_unsupported"`): that batch
     /// is out of THIS decision's scope once declined — a future
     /// B3-padded consumer building its own compacted batch does so from
     /// `mask`/`lengths` directly, not by fishing one out of a declined
@@ -1981,7 +1981,7 @@ fn resolve_lengths_and_prefix(
 /// uniform), the real `Holds` is kept — `attention_block_flash` dispatches
 /// `Fused` and [`ModernBertAttention::forward_flash_dense_attention`]
 /// runs. A batch with REAL padding (some row length `< seq`) still
-/// downgrades to `PredicateOutcome::CapabilityMiss("flash_padded_not_yet_wired")`
+/// downgrades to `PredicateOutcome::CapabilityMiss("padded_batch_unsupported")`
 /// — the unpad/repad transport this arm would need is explicitly the
 /// PADDED regime, out of this commit's scope (a separate B3-padded unit);
 /// `tests::flash_cascade_never_changes_the_block_arm_dispatch_or_output`
@@ -2034,7 +2034,7 @@ fn build_flash_forward_decision(
                 let _ = compacted;
                 Ok(FlashDecision::Declined {
                     outcome: PredicateOutcome::CapabilityMiss,
-                    reason: "flash_padded_not_yet_wired",
+                    reason: "padded_batch_unsupported",
                 })
             }
         }
@@ -3069,7 +3069,7 @@ mod tests {
     /// [`build_flash_forward_decision`]'s PADDED downgrade rule, tested
     /// directly (no CUDA device needed to reach `Holds`): a `Holds`
     /// outcome on a batch with REAL padding (a length `< seq`) is DECLINED
-    /// (`CapabilityMiss("flash_padded_not_yet_wired")`) — the padded
+    /// (`CapabilityMiss("padded_batch_unsupported")`) — the padded
     /// regime is out of P6 Stage B B3-dense's scope, see this module's
     /// `decide_flash_admission` doc — and [`FlashDecision::Declined`]
     /// never carries a `CompactedBatch` (that type's own doc), so this
@@ -3097,7 +3097,7 @@ mod tests {
         match decision {
             FlashDecision::Declined { outcome, reason } => {
                 assert_eq!(outcome, PredicateOutcome::CapabilityMiss);
-                assert_eq!(reason, "flash_padded_not_yet_wired");
+                assert_eq!(reason, "padded_batch_unsupported");
             }
             FlashDecision::Fused(_) => panic!("a padded batch must decline, never fuse"),
         }
@@ -3396,14 +3396,19 @@ mod tests {
     //    seed this section used to cite suggested. Fixed:
     //    [`FLASH_ORACLE_SWEEP_SEEDS`] fixes EIGHT seeds, reused IDENTICALLY
     //    across the healthy oracle and every RED control below, at every
-    //    shape; every oracle/control below asserts both the MEAN ratio
-    //    over those 8 seeds and the MAX per-seed ratio against
-    //    [`FLASH_ORACLE_K_MEAN_POOLED`] / [`FLASH_ORACLE_K_MAX_POOLED`] /
-    //    [`FLASH_ORACLE_K_MEAN_GRAD`] / [`FLASH_ORACLE_K_MAX_GRAD`] -- see
-    //    those constants' own doc comments for the measured healthy and
-    //    mutant distributions this round derived them from (per-seed
-    //    tables also live in the committed
-    //    `2026-08-25-flash-arm-encoder-oracle-*.json` artifact).
+    //    shape; every oracle/control below asserts the MEAN ratio over
+    //    those 8 seeds against [`FLASH_ORACLE_K_MEAN_POOLED`] /
+    //    [`FLASH_ORACLE_K_MEAN_GRAD`] -- see those constants' own doc
+    //    comments for the measured healthy and mutant distributions this
+    //    round derived them from (per-seed tables also live in the
+    //    committed `2026-08-25-flash-arm-encoder-oracle-*.json` artifact).
+    //    A per-seed MAX bound existed alongside these mean bounds in an
+    //    earlier revision and was DELETED (see
+    //    [`FLASH_ORACLE_K_MEAN_GRAD`]'s own doc): it was fitted only to
+    //    these 8 seeds and produced a false-RED on unmodified code at fresh
+    //    seeds (ledger perf-s2 row 245), and the RED-control harness
+    //    (`assert_red_control_violates_bound`) never asserted it in the
+    //    first place, so no control depended on it.
     //
     // 3. THE STALE SIGN CLAIM. A previous revision of this comment said
     //    "the auditor's hand-run oracle measured err(flash,f32)=5.71e-2 vs
@@ -3417,9 +3422,9 @@ mod tests {
     //    [`FLASH_ORACLE_K_MEAN_POOLED`]'s own doc). Guide §3.3's own
     //    acceptance line is "accept only if the fused arm is no further
     //    than eager" -- read literally, this arm does not clear that bar
-    //    on the pooled leg. What [`FLASH_ORACLE_K_MEAN_POOLED`] /
-    //    [`FLASH_ORACLE_K_MAX_POOLED`] actually gate on is narrower and
-    //    stated honestly: flash's distance from f32 stays within a modest,
+    //    on the pooled leg. What [`FLASH_ORACLE_K_MEAN_POOLED`] actually
+    //    gates on is narrower and stated honestly: flash's distance from
+    //    f32 stays within a modest,
     //    BOUNDED multiple of the block arm's own distance (ordinary
     //    fused-RoPE-kernel bf16 rounding, ordinary run-to-run noise), never
     //    "closer than". Every injected wiring fault below clears that same
@@ -3514,15 +3519,6 @@ mod tests {
     #[cfg(feature = "cuda")]
     const FLASH_ORACLE_K_MEAN_POOLED: f64 = 1.6;
 
-    /// Max-per-seed-ratio bound, pooled-embedding leg. Measured healthy
-    /// per-seed maximum this round: 1.8675 (b8_s512, seed 206) / 1.5193
-    /// (b1_s128, seed 206) -- see the artifact cited on
-    /// [`FLASH_ORACLE_K_MEAN_POOLED`]. `2.3` gives ~1.23x margin over the
-    /// worse of those two, while sitting below the WEAKEST individual
-    /// mutant seed measured this round (window-dropped seed 202, 2.9691).
-    #[cfg(feature = "cuda")]
-    const FLASH_ORACLE_K_MAX_POOLED: f64 = 2.3;
-
     /// Mean-ratio bound, LoRA-gradient leg (last layer `Wqkv` LoRA `B`,
     /// step-0, fixed-cotangent loss -- defect 1 above -- [`cosine_distance`]
     /// ratio, NOT [`relative_l1_error`] -- see that function's own doc for
@@ -3532,15 +3528,21 @@ mod tests {
     /// ~3x below the WEAKEST measured mutant mean on this leg
     /// (window-dropped, 13.6483; K-unrotated 26.6004; bad-softmax-scale
     /// 125.3883).
+    ///
+    /// NO max-per-seed bound exists alongside this mean bound (a prior
+    /// revision had one, `FLASH_ORACLE_K_MAX_POOLED`/`FLASH_ORACLE_K_MAX_GRAD`
+    /// -- both DELETED, ledger perf-s2 row 245): fitted only to
+    /// [`FLASH_ORACLE_SWEEP_SEEDS`] (201-208), fresh seeds 301-308 measured a
+    /// healthy grad max of 7.18 and 401-408 measured 16.08 -- false-RED on
+    /// UNMODIFIED code -- while the k-unrotated mutant's own max (6.62) sat
+    /// INSIDE the old 7.0 bound on at least one seed draw, so the max leg
+    /// was never seed-stable in either direction. [`assert_red_control_
+    /// violates_bound`] already asserted only the MEAN legs (never the max),
+    /// so no control ever exercised the deleted max asserts either -- this
+    /// is a straight deletion of dead, seed-unstable gates, not a
+    /// re-derivation of a new bound.
     #[cfg(feature = "cuda")]
     const FLASH_ORACLE_K_MEAN_GRAD: f64 = 4.5;
-
-    /// Max-per-seed-ratio bound, LoRA-gradient leg. Measured healthy
-    /// per-seed maximum this round: 4.8987 (b8_s512, seed 206) / 1.5425
-    /// (b1_s128, seed 204). `7.0` gives ~1.43x margin over the worse of
-    /// those two.
-    #[cfg(feature = "cuda")]
-    const FLASH_ORACLE_K_MAX_GRAD: f64 = 7.0;
 
     /// Panics instead of skipping when `JAMMI_REQUIRE_FLASH_ORACLE` is set
     /// -- mirrors [`growth_oracle_cuda_device`]'s own `JAMMI_REQUIRE_CUDA`
@@ -3855,6 +3857,13 @@ mod tests {
     /// minimal ACCUMULATED noise while still proving gradients reach a
     /// LoRA-wrapped parameter (the property this leg exists to check --
     /// nothing about that property is specific to layer 0).
+    ///
+    /// Blind spot: the last layer is GLOBAL attention (no sliding window),
+    /// so a BACKWARD-ONLY window defect confined to the 18 LOCAL (windowed)
+    /// layers is invisible to this gradient leg -- that class is instead
+    /// covered at the op level, where the window is a per-call parameter,
+    /// by `jammi-kernels`' own
+    /// `tests/cuda_parity.rs::flash_upstream_acceptance_form_red_control_bwd_only_window_dropped_cuda`.
     #[cfg(feature = "cuda")]
     fn flash_oracle_wqkv_lora_b(model: &ModernBert) -> &Tensor {
         let last = model
@@ -4165,9 +4174,11 @@ mod tests {
     /// The main oracle: flash-bf16 vs block-bf16 vs f32, on the pooled
     /// embedding AND the step-0 `dL/dWqkv-LoRA` gradient, over
     /// [`FLASH_ORACLE_SWEEP_SEEDS`], for ONE shape. Prints the per-seed
-    /// table and asserts MEAN and MAX ratios against
-    /// [`FLASH_ORACLE_K_MEAN_POOLED`]/[`FLASH_ORACLE_K_MAX_POOLED`]/
-    /// [`FLASH_ORACLE_K_MEAN_GRAD`]/[`FLASH_ORACLE_K_MAX_GRAD`].
+    /// table (including the per-seed max, for diagnostics) and asserts the
+    /// MEAN ratio against [`FLASH_ORACLE_K_MEAN_POOLED`]/
+    /// [`FLASH_ORACLE_K_MEAN_GRAD`] -- there is no per-seed MAX assertion
+    /// (see [`FLASH_ORACLE_K_MEAN_GRAD`]'s own doc for why one existed
+    /// before and was deleted).
     #[cfg(feature = "cuda")]
     fn run_flash_oracle_shape_sweep(
         config: &ModernBertConfig,
@@ -4208,9 +4219,9 @@ mod tests {
 
         eprintln!(
             "flash_oracle[{label}] OVER {} SEEDS: pooled ratio mean={pooled_mean:.4} \
-             max={pooled_max:.4} (bounds mean<={FLASH_ORACLE_K_MEAN_POOLED} \
-             max<={FLASH_ORACLE_K_MAX_POOLED}); grad ratio mean={grad_mean:.4} max={grad_max:.4} \
-             (bounds mean<={FLASH_ORACLE_K_MEAN_GRAD} max<={FLASH_ORACLE_K_MAX_GRAD})",
+             max={pooled_max:.4} (bound mean<={FLASH_ORACLE_K_MEAN_POOLED}, max UNASSERTED -- \
+             diagnostic only); grad ratio mean={grad_mean:.4} max={grad_max:.4} (bound \
+             mean<={FLASH_ORACLE_K_MEAN_GRAD}, max UNASSERTED -- diagnostic only)",
             FLASH_ORACLE_SWEEP_SEEDS.len(),
         );
 
@@ -4221,20 +4232,10 @@ mod tests {
             FLASH_ORACLE_SWEEP_SEEDS.len(),
         );
         assert!(
-            pooled_max.is_finite() && pooled_max <= FLASH_ORACLE_K_MAX_POOLED,
-            "[{label}] pooled embedding: max per-seed ratio {pooled_max:.4} exceeds \
-             FLASH_ORACLE_K_MAX_POOLED={FLASH_ORACLE_K_MAX_POOLED}"
-        );
-        assert!(
             grad_mean.is_finite() && grad_mean <= FLASH_ORACLE_K_MEAN_GRAD,
             "[{label}] LoRA gradient (last layer Wqkv B): mean ratio {grad_mean:.4} over {} seeds \
              exceeds FLASH_ORACLE_K_MEAN_GRAD={FLASH_ORACLE_K_MEAN_GRAD}",
             FLASH_ORACLE_SWEEP_SEEDS.len(),
-        );
-        assert!(
-            grad_max.is_finite() && grad_max <= FLASH_ORACLE_K_MAX_GRAD,
-            "[{label}] LoRA gradient (last layer Wqkv B): max per-seed ratio {grad_max:.4} exceeds \
-             FLASH_ORACLE_K_MAX_GRAD={FLASH_ORACLE_K_MAX_GRAD}"
         );
     }
 

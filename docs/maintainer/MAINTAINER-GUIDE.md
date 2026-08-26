@@ -64,7 +64,7 @@ edges, by design — not a discrepancy.
 <!-- BEGIN GENERATED: dep-dag -->
 ```
 jammi-admin -> jammi-db, jammi-wire
-jammi-ai -> jammi-db, jammi-encoders, jammi-lora, jammi-numerics, jammi-test-utils, jammi-wire
+jammi-ai -> jammi-db, jammi-encoders, jammi-kernels, jammi-lora, jammi-numerics, jammi-test-utils, jammi-wire
 jammi-bench -> jammi-ai, jammi-db, jammi-encoders, jammi-kernels, jammi-lora, jammi-numerics
 jammi-cli -> jammi-admin, jammi-db
 jammi-client -> jammi-admin, jammi-db, jammi-wire
@@ -101,7 +101,8 @@ jammi-client ──► jammi-wire, jammi-admin, jammi-db               [data-pla
    │  (jammi-cli ──► jammi-admin, jammi-db  — control-plane only, NO jammi-ai)
    │
 jammi-ai ──► jammi-db, jammi-numerics, jammi-lora, jammi-wire,   [EMBEDDED ENGINE]
-             jammi-encoders(opt, `local`), candle(opt, `local`)
+             jammi-encoders(opt, `local`), jammi-kernels(opt, `cuda`),
+             candle(opt, `local`)
    ▲   ▲
 jammi-server ──► jammi-wire, jammi-ai, jammi-db, jammi-numerics  [serves the wire over the engine]
    │

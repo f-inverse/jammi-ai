@@ -5876,7 +5876,7 @@ mod tests {
     /// win in proportion to its own size, but this test does not, and
     /// cannot, measure bytes. The actual byte measurement is the committed
     /// pod A/B record,
-    /// `crates/jammi-bench/baselines/p1_softmax_scale_fold_ab.json`, which
+    /// `crates/jammi-kernels/artifacts/cuda-runs/2026-08-24-p1-softmax-fold-bf8e807-a100-sxm4.json`, which
     /// discloses ALL THREE measured rows, not just the favorable one:
     /// `seq = 512` (`b8`) shows the predicted-size win (`77.46 GB -> 71.76
     /// GB`, within one allocator pool block of the retained-tensor-size

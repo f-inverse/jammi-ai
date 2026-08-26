@@ -1,0 +1,47 @@
+# Reviewed require-gate helpers for check_kernel_oracles.py's KO-7 rule
+# (docs/maintainer/cuda-kernel-guide.md §3). A #[test] fn's runtime skip
+# (`let Some(d) = <helper>() else { return; };` and its siblings — see
+# check_kernel_oracles.py's own module doc) is GATED only if its skip
+# window contains a call to a NAME listed here — never by scanning any
+# fn's body for a shape that merely LOOKS like a gate (three straight
+# rounds of audit found a new way to fake that shape: an unrelated
+# `.expect(` inside the if-block, an uncalled closure's `panic!`, a
+# conforming gate written as `match` instead of `if`).
+#
+# Each entry is verified at gate time to have the CANONICAL shape: a real
+# RUNTIME env-read (std::env::var_os/var — option_env! is a COMPILE-TIME
+# read and is never accepted) of a JAMMI_REQUIRE_* name, via `if` or
+# `match` (an `if` condition must be exactly `<read>.is_some()`/`.is_ok()`
+# — no trailing/leading condition; a `match` arm must be unguarded), whose
+# taken-when-set branch is EXACTLY ONE panic!/unreachable! statement — no
+# .expect(, no closures, nothing else. Verification is (file, fn)-SCOPED:
+# an entry only reviews the fn named `fn_name` DEFINED IN `file` itself
+# (never a same-named fn elsewhere), and fails if that file defines more
+# than one fn with that name (ambiguous — this scanner does not track
+# `mod` boundaries). A line that fails is a registry FAIL naming the
+# file:line and why. An exact duplicate `<file>::<fn_name>` line fails too.
+#
+# Adding a line here is a reviewed PR diff, same discipline as a citation
+# or a `no-producer:` opt-out — the registry may only grow by entries the
+# shape-check accepts. A file that wants to call a SHARED helper it does
+# not itself define registers its own thin local wrapper of the same
+# canonical shape (gating is never cross-file by name alone).
+#
+# Known, deliberate, fail-CLOSED limitation (round-5 audit A2): gating
+# looks for a literal, BARE call to the registered NAME — `let g =
+# cuda_device; g();` (a same-file ALIAS binding, then calling the alias)
+# does not gate, because the call site is textually `g(`, not
+# `cuda_device(`. This fails closed (an aliased skip reads as UNGATED,
+# never as a false green), so it is a documented limitation, not a bug to
+# route around — the remedy is to call the registered name directly
+# (`cuda_device()`), never assign it to a local first.
+#
+# Format: one `<file-relative-to-repo-root>::<fn_name>` per line.
+
+crates/jammi-kernels/tests/cuda_parity.rs::cuda_device
+crates/jammi-kernels/tests/flash_smoke.rs::cuda_device
+crates/jammi-kernels/tests/flash_op_oracles.rs::cuda_device
+crates/jammi-kernels/tests/flash_torch_parity.rs::cuda_device
+crates/jammi-encoders/src/modernbert.rs::growth_oracle_cuda_device
+crates/jammi-encoders/src/modernbert.rs::flash_oracle_require_gate
+crates/jammi-encoders/src/modernbert.rs::flash_compiled_or_skip

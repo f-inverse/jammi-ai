@@ -1,0 +1,330 @@
+{
+ "schema_version": 1,
+ "unit": "perf/device-clip-narrow (PR #381): device-side gradient clip, clip-on-flash",
+ "git_sha": "08b7001a1daec775514b3c9d59442e04e8519cdc",
+ "date": "2026-08-26T12:35:01Z",
+ "box": "jammi-a100b-pcie (NVIDIA A100 80GB PCIe, 570.172.08)",
+ "gpu": "NVIDIA A100 80GB PCIe",
+ "driver": "570.172.08",
+ "nvcc": "Cuda compilation tools, release 12.6, V12.6.85",
+ "rustc": "rustc 1.94.0 (4a4ef493e 2026-03-02)",
+ "features": "cuda,live-gpu-tests (tests); cuda,jammi-encoders/flash-attn (clip-on-flash leg)",
+ "status": "GREEN",
+ "producer": {
+  "path": "crates/jammi-ai/src/fine_tune/optimizer.rs",
+  "kind": "cargo-test",
+  "invocation": "JAMMI_REQUIRE_CUDA=1 cargo test -p jammi-ai --features cuda,live-gpu-tests --lib -- --exact fine_tune::optimizer::tests::multi_var_clip_matches_host_reference_on_cuda_and_is_bit_identical_to_cpu",
+  "gating": "env:JAMMI_REQUIRE_CUDA"
+ },
+ "producer_script": "ci/scripts/perf/clip_artifact_producer.sh",
+ "note": "Execution provenance for PR #381's device-side clip at this tip: jammi-ai fine_tune::optimizer CUDA legs, jammi-bench finetune_step::tests + report::tests (clip active arm vs host reference, cross-process bit-identical clip-on losses, counted clip_invocations, attention_arm, shared identity pin, on-GPU peak_vram_bytes arm), the --exact producer test, and one real clip-on-flash finetune-step leg whose flash and clip counters are recorded under clip_on_flash_leg. Zero parsed tests or any failed counter predicate => INVALID, never green.",
+ "jammi_ai_optimizer_cuda": {
+  "log": "/root/proof-out/clip_08b7001_optimizer.log",
+  "summary": {
+   "result": "ok",
+   "passed": 24,
+   "failed": 0,
+   "targets": 1
+  },
+  "tests": [
+   {
+    "name": "fine_tune::optimizer::tests::at_max_norm_boundary_coef_is_not_bit_identical_to_no_clip",
+    "status": "ok"
+   },
+   {
+    "name": "fine_tune::optimizer::tests::below_max_norm_clip_is_bit_identical_to_no_clip",
+    "status": "ok"
+   },
+   {
+    "name": "fine_tune::optimizer::tests::clip_and_step_always_checks_step_one_regardless_of_cadence",
+    "status": "ok"
+   },
+   {
+    "name": "fine_tune::optimizer::tests::clip_and_step_checks_the_last_step_of_a_short_run",
+    "status": "ok"
+   },
+   {
+    "name": "fine_tune::optimizer::tests::clip_and_step_refuses_a_nonfinite_norm_on_cadence",
+    "status": "ok"
+   },
+   {
+    "name": "fine_tune::optimizer::tests::clip_and_step_skips_the_check_off_cadence",
+    "status": "ok"
+   },
+   {
+    "name": "fine_tune::optimizer::tests::clip_and_step_tolerates_no_gradients_with_empty_trainable_vars",
+    "status": "ok"
+   },
+   {
+    "name": "fine_tune::optimizer::tests::clip_and_step_warns_no_gradients_with_nonempty_trainable_vars",
+    "status": "ok"
+   },
+   {
+    "name": "fine_tune::optimizer::tests::clip_does_not_entangle_the_var_in_a_new_backward_graph",
+    "status": "ok"
+   },
+   {
+    "name": "fine_tune::optimizer::tests::clip_gradients_device_and_host_agree_bit_identically_on_cpu",
+    "status": "ok"
+   },
+   {
+    "name": "fine_tune::optimizer::tests::clip_gradients_never_reads_the_norm_back",
+    "status": "ok"
+   },
+   {
+    "name": "fine_tune::optimizer::tests::clip_gradients_never_reads_the_norm_back_on_cuda",
+    "status": "ok"
+   },
+   {
+    "name": "fine_tune::optimizer::tests::clip_gradients_refuses_infinite_max_norm",
+    "status": "ok"
+   },
+   {
+    "name": "fine_tune::optimizer::tests::clip_gradients_refuses_nan_max_norm",
+    "status": "ok"
+   },
+   {
+    "name": "fine_tune::optimizer::tests::clipping_batch_matches_host_reference_within_f32_ulps",
+    "status": "ok"
+   },
+   {
+    "name": "fine_tune::optimizer::tests::max_norm_le_zero_disables_clipping_and_returns_none",
+    "status": "ok"
+   },
+   {
+    "name": "fine_tune::optimizer::tests::multi_var_clip_matches_host_reference_on_cpu",
+    "status": "ok"
+   },
+   {
+    "name": "fine_tune::optimizer::tests::multi_var_clip_matches_host_reference_on_cuda_and_is_bit_identical_to_cpu",
+    "status": "ok"
+   },
+   {
+    "name": "fine_tune::optimizer::tests::nan_gradient_poisons_every_gradient_through_the_cpu_minimum",
+    "status": "ok"
+   },
+   {
+    "name": "fine_tune::optimizer::tests::no_gradient_present_is_distinct_from_disabled",
+    "status": "ok"
+   },
+   {
+    "name": "fine_tune::optimizer::tests::non_f32_gradient_is_upconverted_before_the_fold",
+    "status": "ok"
+   },
+   {
+    "name": "fine_tune::optimizer::tests::old_no_epsilon_formula_diverges_from_device_at_near_zero_norm",
+    "status": "ok"
+   },
+   {
+    "name": "fine_tune::optimizer::tests::refuse_nonfinite_norm_is_red_when_the_check_is_removed",
+    "status": "ok"
+   },
+   {
+    "name": "fine_tune::optimizer::tests::sorted_trainable_vars_is_independent_of_varmap_insertion_order",
+    "status": "ok"
+   }
+  ]
+ },
+ "jammi_bench_cuda": {
+  "log": "/root/proof-out/clip_08b7001_bench.log",
+  "summary": {
+   "result": "ok",
+   "passed": 32,
+   "failed": 0,
+   "targets": 2
+  },
+  "tests": [
+   {
+    "name": "finetune_step::tests::absent_max_grad_norm_is_deterministic_across_runs",
+    "status": "ok"
+   },
+   {
+    "name": "finetune_step::tests::active_clip_matches_host_reference_at_coefficient_below_one",
+    "status": "ok"
+   },
+   {
+    "name": "finetune_step::tests::attention_arm_is_the_operators_request_not_the_predicates_verdict",
+    "status": "ok"
+   },
+   {
+    "name": "finetune_step::tests::clip_gradients_invocation_count_equals_measured_steps",
+    "status": "ok"
+   },
+   {
+    "name": "finetune_step::tests::clip_gradients_invocation_count_includes_warmup_iterations",
+    "status": "ok"
+   },
+   {
+    "name": "finetune_step::tests::clip_gradients_never_invoked_when_max_grad_norm_absent",
+    "status": "ok"
+   },
+   {
+    "name": "finetune_step::tests::clip_on_losses_are_bit_identical_across_processes",
+    "status": "ok"
+   },
+   {
+    "name": "finetune_step::tests::finetune_step_batched_and_unbatched_forward_agree",
+    "status": "ok"
+   },
+   {
+    "name": "finetune_step::tests::finetune_step_counters_are_a_snapshot_delta_not_a_running_total",
+    "status": "ok"
+   },
+   {
+    "name": "finetune_step::tests::finetune_step_derived_rates_satisfy_their_defining_identity",
+    "status": "ok"
+   },
+   {
+    "name": "finetune_step::tests::finetune_step_device_name_is_cpu_off_cuda",
+    "status": "ok"
+   },
+   {
+    "name": "finetune_step::tests::finetune_step_loss_first_is_the_post_pre_step_update",
+    "status": "ok"
+   },
+   {
+    "name": "finetune_step::tests::finetune_step_losses_track_measured_steps_and_are_finite",
+    "status": "ok"
+   },
+   {
+    "name": "finetune_step::tests::finetune_step_mean_never_exceeds_p50",
+    "status": "ok"
+   },
+   {
+    "name": "finetune_step::tests::finetune_step_one_step_moves_lora_b_by_approximately_lr",
+    "status": "ok"
+   },
+   {
+    "name": "finetune_step::tests::finetune_step_peak_vram_bytes_is_measured_on_a_box_with_nvidia_smi",
+    "status": "ok"
+   },
+   {
+    "name": "finetune_step::tests::finetune_step_peak_vram_bytes_is_not_yet_measured_off_gpu",
+    "status": "ok"
+   },
+   {
+    "name": "finetune_step::tests::finetune_step_positive_lora_dropout_actually_changes_the_computation",
+    "status": "ok"
+   },
+   {
+    "name": "finetune_step::tests::finetune_step_synthetic_batch_offset_is_seed_plus_group_index_not_seed_times_group_index",
+    "status": "ok"
+   },
+   {
+    "name": "finetune_step::tests::huge_max_grad_norm_matches_absent_on_host",
+    "status": "ok"
+   },
+   {
+    "name": "finetune_step::tests::max_grad_norm_rejects_infinite",
+    "status": "ok"
+   },
+   {
+    "name": "finetune_step::tests::max_grad_norm_rejects_nan",
+    "status": "ok"
+   },
+   {
+    "name": "finetune_step::tests::max_grad_norm_rejects_negative",
+    "status": "ok"
+   },
+   {
+    "name": "finetune_step::tests::max_grad_norm_rejects_zero",
+    "status": "ok"
+   },
+   {
+    "name": "finetune_step::tests::synthetic_ids_matches_hand_computed_lcg_sequence",
+    "status": "ok"
+   },
+   {
+    "name": "finetune_step::tests::tier_emits_counted_clip_invocations_and_a_single_attention_arm",
+    "status": "ok"
+   },
+   {
+    "name": "finetune_step::tests::triplet_loss_matches_hand_computed_value",
+    "status": "ok"
+   },
+   {
+    "name": "finetune_step::tests::vram_sampler_finish_reports_true_delta_not_floored_by_a_baseline_at_the_peak",
+    "status": "ok"
+   },
+   {
+    "name": "report::tests::finetune_step_tier_emits_every_shared_identity_field",
+    "status": "ok"
+   },
+   {
+    "name": "report::tests::finetune_step_tier_emits_the_full_pinned_key_set",
+    "status": "ok"
+   },
+   {
+    "name": "report::tests::finetune_step_tier_serializes_null_not_omitted_for_absent_max_grad_norm",
+    "status": "ok"
+   },
+   {
+    "name": "report::tests::finetune_step_tier_serializes_number_for_present_max_grad_norm",
+    "status": "ok"
+   }
+  ]
+ },
+ "producer_exact_run": {
+  "log": "/root/proof-out/clip_08b7001_exact.log",
+  "summary": {
+   "result": "ok",
+   "passed": 1,
+   "failed": 0,
+   "targets": 1
+  },
+  "tests": [
+   {
+    "name": "fine_tune::optimizer::tests::multi_var_clip_matches_host_reference_on_cuda_and_is_bit_identical_to_cpu",
+    "status": "ok"
+   }
+  ]
+ },
+ "clip_on_flash_leg": {
+  "status": "GREEN",
+  "predicates": {
+   "flash_fused_gt_0": true,
+   "flash_declined_eq_0": true,
+   "clip_invocations_eq_steps_plus_warmup_plus_1": true,
+   "attention_arm_fused": true,
+   "max_grad_norm_1": true,
+   "flash_compiled": true,
+   "nothing_disabled": true
+  },
+  "record": {
+   "max_grad_norm": 1.0,
+   "clip_invocations": 8,
+   "attention_arm": "fused",
+   "warmup": 2,
+   "steps_measured": 5,
+   "attention_block_flash_fused_dispatches": 196,
+   "attention_block_flash_declined_dispatches": 0,
+   "attention_block_fused_dispatches": 0,
+   "attention_block_eager_dispatches": 0,
+   "flash_compiled": true,
+   "kernels_disabled_requested": [],
+   "kernels_disabled_fired": [],
+   "backbone_dtype": "bf16",
+   "batch": 4,
+   "seq": 256,
+   "loss_first": 0.095703125,
+   "loss_last": 0.029296875,
+   "s_per_step_p50": {
+    "value": 0.14262224,
+    "unit": "s"
+   },
+   "triplets_per_s": {
+    "value": 28.04611679076138,
+    "unit": "triplets/s"
+   },
+   "peak_vram_bytes": {
+    "value": 3642753024.0,
+    "unit": "bytes"
+   },
+   "device_name": "NVIDIA A100 80GB PCIe",
+   "checkpoint_weights_sha256": "44510fec5d3a81a1877f225637b869495f18e55f6f23a09abb9be0acc030295f"
+  },
+  "model_dir": "/root/checkpoints/ModernBERT-large",
+  "profile": "debug",
+  "invocation": "JAMMI_KERNELS_STRICT=1 jammi-bench finetune-step --batch 4 --seq 256 --steps 5 --warmup 2 --lora-rank 16 --lora-alpha 32 --lora-dropout 0 --target-modules Wqkv,Wo,Wi --backbone-dtype bf16 --cuda 0 --seed 42 --batched-forward true --max-grad-norm 1.0 (debug build, --features cuda,jammi-encoders/flash-attn)"
+ }
+}

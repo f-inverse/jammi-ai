@@ -1,6 +1,6 @@
 ---
 name: ai-core
-description: Write-owner for the jammi-ai crate (embeddings, inference, search, fine-tune, eval, the recompute pipeline, evidence channels, GPU concurrency). Trigger — the lead's Contract phase dispatches ai-core for any change whose files_in_scope land under crates/jammi-ai. Runs in a worktree under the ai-core domain mutex; returns an <eval-verdict>.
+description: Write-owner for the jammi-ai crate (embeddings, inference, search, fine-tune, eval, the recompute pipeline, evidence channels, GPU concurrency). Trigger — the lead's Contract phase dispatches ai-core for any change whose files_in_scope land under crates/jammi-ai. Runs in its own worktree; returns an <eval-verdict>.
 tools: [Read, Grep, Glob, Edit, Write, Bash]
 model: sonnet
 isolation: worktree
@@ -28,9 +28,8 @@ You are a subagent. Every "user" message is your caller (the lead). The lead see
 
 ## Pre-flight
 
-1. Take the domain mutex: create `.jammi/locks/ai-core.lock` (fail if held).
-2. Work in your isolated worktree with a **unique** `CARGO_TARGET_DIR` (e.g. `target/wt-ai-core-$$`). Do **not** override `RUSTC_WRAPPER`/`RUSTFLAGS`. Never `git checkout -b` in a shared checkout.
-3. Load the constitution invariants the contract crosses.
+1. Work in your isolated worktree with a **unique** `CARGO_TARGET_DIR` (e.g. `target/wt-ai-core-$$`). Do **not** override `RUSTC_WRAPPER`/`RUSTFLAGS`. Never `git checkout -b` in a shared checkout.
+2. Load the constitution invariants the contract crosses.
 
 ## Acceptance
 
@@ -55,4 +54,4 @@ Run CI's exact full gate, capturing `$?` per step (no pipe-masking): `cargo fmt 
 }
 </eval-verdict>
 ```
-Release `.jammi/locks/ai-core.lock` on exit. Report real exit codes — the lead re-verifies every "gate passed" claim.
+Report real exit codes — the lead re-verifies every "gate passed" claim.

@@ -442,9 +442,6 @@ def _run_with_model(
                 "against a mixed fresh-init/loaded-weights state."
             )
 
-    if args.lora_weights_out:
-        dump_lora_weights_from_model(model, args.lora_weights_out)
-
     mask = torch.ones(args.batch, args.seq, dtype=torch.long, device=device)
     blocks = [tfs.synthetic_ids(args.batch, args.seq, config.vocab_size, args.seed + i).to(device) for i in range(3)]
     # Same digest jammi's `grad_oracle.rs` reports as `batch_token_id_sums`
@@ -456,17 +453,44 @@ def _run_with_model(
     # two stacks for the same `(seed, vocab)`.
     batch_token_id_sums = [int(b.sum().item()) for b in blocks]
 
-    if args.batched_forward:
-        joined_ids = torch.cat(blocks, dim=0)
-        joined_mask = mask.repeat(3, 1)
-        hidden = tfs.forward_hidden(model, joined_ids, joined_mask)
-        pooled = tfs.pool_and_normalize(hidden, joined_mask)
-        b = args.batch
-        a, p, n = pooled[:b], pooled[b : 2 * b], pooled[2 * b : 3 * b]
-    else:
-        a, p, n = (tfs.pool_and_normalize(tfs.forward_hidden(model, blk, mask), mask) for blk in blocks)
-    loss = tfs.triplet_loss(a, p, n, margin=0.3)
-    loss.backward()  # NO optimizer.step() -- see grad_oracle.rs's module doc for why.
+    def _forward_loss():
+        if args.batched_forward:
+            joined_ids = torch.cat(blocks, dim=0)
+            joined_mask = mask.repeat(3, 1)
+            hidden = tfs.forward_hidden(model, joined_ids, joined_mask)
+            pooled = tfs.pool_and_normalize(hidden, joined_mask)
+            b = args.batch
+            a, p, n = pooled[:b], pooled[b : 2 * b], pooled[2 * b : 3 * b]
+        else:
+            a, p, n = (tfs.pool_and_normalize(tfs.forward_hidden(model, blk, mask), mask) for blk in blocks)
+        return tfs.triplet_loss(a, p, n, margin=0.3)
+
+    # `args.warmup_steps` REAL forward+backward+`AdamW.step()` iterations, at
+    # `args.warmup_lr`, on the SAME `blocks`/`mask` the measured forward
+    # below reuses ("on the same data" — mirrors `grad_oracle.rs`'s own
+    # `warmup_steps`/`warmup_lr` fields and their doc). `weight_decay=0.01`
+    # is the SAME value `finetune_step.rs`'s own `build_fixture` hardcodes
+    # (and the jammi-side `ParamsAdamW` warmup loop this mirrors) — kept
+    # identical so the two stacks' first-step update formula matches term
+    # for term, not just in `lr`. Runs BEFORE `--lora-weights-out` (moved
+    # below, past this loop) so a caller's shared-weights file captures the
+    # POST-warmup state, mirroring `grad_oracle.rs::run`'s own comment at its
+    # `lora_weights_out` save call site.
+    if args.warmup_steps > 0:
+        optimizer = torch.optim.AdamW(
+            [p for _, p in trainable], lr=args.warmup_lr, weight_decay=0.01
+        )
+        for _ in range(args.warmup_steps):
+            optimizer.zero_grad(set_to_none=True)
+            warmup_loss = _forward_loss()
+            warmup_loss.backward()
+            optimizer.step()
+
+    if args.lora_weights_out:
+        dump_lora_weights_from_model(model, args.lora_weights_out)
+
+    loss = _forward_loss()
+    loss.backward()  # NO optimizer.step() on the MEASURED forward -- see grad_oracle.rs's module doc for why.
 
     gradients = {}
     for name, param in trainable:
@@ -539,6 +563,8 @@ def _run_with_model(
         "lora_dropout": 0.0,
         "lora_weights_in": args.lora_weights_in,
         "lora_weights_out": args.lora_weights_out,
+        "warmup_steps": args.warmup_steps,
+        "warmup_lr": args.warmup_lr,
         "trainable_tensor_count": len(gradients),
         "batch_token_id_sums": batch_token_id_sums,
         "loss": float(loss.detach().float().item()),
@@ -561,6 +587,24 @@ def parse_args(argv=None):
     p.add_argument("--batched-forward", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--lora-weights-in", type=str, default=None)
     p.add_argument("--lora-weights-out", type=str, default=None)
+    p.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=0,
+        help=(
+            "0 (default) or the number of real forward+backward+AdamW.step() iterations to run, "
+            "at --warmup-lr, on the SAME batch the measured (no-step) forward reuses, BEFORE that "
+            "measured forward+backward -- mirrors grad_oracle.rs's own --warmup-steps/warmup-lr "
+            "fields; see this script's `_run_with_model` for the exact ordering."
+        ),
+    )
+    p.add_argument(
+        "--warmup-lr",
+        type=float,
+        default=2e-4,
+        help="The AdamW learning rate --warmup-steps runs at -- 2e-4, the SAME reference value "
+        "finetune_step.rs's own build_fixture hardcodes.",
+    )
     p.add_argument(
         "--dry-run",
         action="store_true",

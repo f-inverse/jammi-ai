@@ -162,10 +162,10 @@
 //! | `lora_weights_in` (presence, not value) | identity (checked separately — `_premise_violations`'s `lora_weights_in` loop, not `RUN_IDENTITY_FIELDS`) | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
 //! | `batch_token_id_sums` | identity (checked separately, `or`-gated presence) | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
 //! | `model_dir` | provenance (human debugging only — a path string is not comparable across two boxes; superseded by the two checksum fields above) | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
-//! | `device` / `device_name` | provenance | `run()`'s report literal (`device_name` reuses `finetune_step::device_name`) | `"provenance": tfs.provenance(device, fast_path_globals)` (`torch_grad_oracle.py:507`) |
+//! | `device` / `device_name` | provenance | `run()`'s report literal (`device_name` reuses `finetune_step::device_name`) | `"provenance": tfs.provenance(device, fast_path_globals)` (`torch_grad_oracle.py:531`) |
 //! | `git_rev` (jammi) / `provenance.git_rev` (torch) | provenance | `tip_sha()`, called in `run()`'s report literal | `torch_finetune_step.py`'s `git_rev()`, via `provenance()` |
 //! | torch/transformers/peft versions | provenance (jammi has no equivalent — no torch/transformers/peft dependency) | n/a | same call site as the `device` row directly above (`torch_grad_oracle.py`'s `provenance` field) |
-//! | `attn_requested` / `attn_implementation` | provenance (jammi has no `--attn` lever; its own analog is the MEASUREMENT dispatch counters below) | n/a | `"attn_requested": args.attn` (`torch_grad_oracle.py:516`), `"attn_implementation": resolved_attn_implementation` (`torch_grad_oracle.py:517`), resolved in `run()` mirroring the identical pattern `torch_finetune_step.py`'s own `run()` already established (see `ab_merge.py`'s determinant table for that file's own citations of this exact pair) |
+//! | `attn_requested` / `attn_implementation` | provenance (jammi has no `--attn` lever; its own analog is the MEASUREMENT dispatch counters below) | n/a | `"attn_requested": args.attn` (`torch_grad_oracle.py:540`), `"attn_implementation": resolved_attn_implementation` (`torch_grad_oracle.py:541`), resolved in `run()` mirroring the identical pattern `torch_finetune_step.py`'s own `run()` already established (see `ab_merge.py`'s determinant table for that file's own citations of this exact pair) |
 //! | `lora_dropout` | identity, but UNCONDITIONALLY forced to `0.0` by both producers so it can never legitimately differ — excluded from `RUN_IDENTITY_FIELDS` on that basis, not compared | `run()`'s report literal (hardcoded `0.0`) | `torch_grad_oracle.py`'s report literal (hardcoded `0.0`) |
 //! | `trainable_tensor_count` | measurement (redundant with the tensor NAME SET, which `compare_reports`'s `only_in_a`/`only_in_b` already checks structurally) | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
 //! | `loss` / `gradients` / per-tensor `weight` | measurement — the oracle's actual output | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
@@ -749,10 +749,6 @@ pub fn run(params: &GradOracleParams) -> Result<GradOracleReport, Box<dyn std::e
         names
     };
 
-    if let Some(path) = &params.lora_weights_out {
-        varmap.save(path)?;
-    }
-
     let mask = Tensor::ones((params.batch, params.seq), DType::U32, &device)?;
     let blocks: Vec<Tensor> = (0..3)
         .map(|i| {
@@ -775,6 +771,10 @@ pub fn run(params: &GradOracleParams) -> Result<GradOracleReport, Box<dyn std::e
     for (i, block) in blocks.iter().enumerate() {
         let ids = block.flatten_all()?.to_vec1::<u32>()?;
         batch_token_id_sums[i] = ids.iter().map(|&x| x as u64).sum();
+    }
+
+    if let Some(path) = &params.lora_weights_out {
+        varmap.save(path)?;
     }
 
     // Dispatch-counter "before" snapshots, taken immediately around this
@@ -1178,6 +1178,106 @@ mod tests {
              looks like the forward+backward ran against the PRE-load seeded draw instead of the \
              loaded values (dL/dB is A-dependent even under LoraInitMode::ZerosB, see this test's \
              doc)"
+        );
+
+        let _ = std::fs::remove_file(&weights_path);
+    }
+
+    /// `PeftStep1` non-vacuous control (family F): a fresh `ZerosB` init
+    /// starts `lora_b` at EXACTLY `0.0` (asserted below, same premise
+    /// `finetune_step.rs`'s own `finetune_step_one_step_moves_lora_b_by_
+    /// approximately_lr` test uses), so `peft_step1_weights`'s ONE real
+    /// `AdamW::step` at `PEFT_STEP1_REFERENCE_LR` must move it to a
+    /// magnitude `≈PEFT_STEP1_REFERENCE_LR` per the SAME closed-form
+    /// first-step property that test's own doc derives (`weight_decay`'s
+    /// `theta*(1-lr*wd)` term is `0*anything == 0` on step 1 since `theta ==
+    /// 0`, so `next_theta ≈ -lr*sign(grad)`) — an oracle independent of this
+    /// test's own arithmetic, not a mutation blind spot like a bare
+    /// "changed" assertion would be.
+    #[test]
+    fn grad_oracle_peft_step1_moves_lora_b_by_approximately_reference_lr() {
+        let mut params = tiny_params();
+        params.lora_init = GradOracleLoraInit::ZerosB;
+        let before = run(&params).expect("zeros-b baseline run");
+        let lora_b_name = before
+            .gradients
+            .keys()
+            .find(|k| k.ends_with("lora_b"))
+            .expect("at least one lora_b tensor")
+            .clone();
+        let before_weight = &before.gradients[&lora_b_name].weight;
+        assert!(
+            before_weight.iter().all(|&w| w == 0.0),
+            "lora_b must start at EXACTLY zero under GradOracleLoraInit::ZerosB -- {before_weight:?}"
+        );
+
+        let mut warmed_params = tiny_params();
+        warmed_params.lora_init = GradOracleLoraInit::PeftStep1;
+        let warmed = run(&warmed_params).expect("peft-step1 run");
+        let after_weight = &warmed.gradients[&lora_b_name].weight;
+        assert!(
+            after_weight.iter().any(|&w| w != 0.0),
+            "lora_b did not move at all after PeftStep1's one real AdamW step -- the reference \
+             lr silently zero, or peft_step1_weights never ran?"
+        );
+        let max_abs_after = after_weight.iter().fold(0.0f32, |acc, &w| acc.max(w.abs()));
+        let relative_diff =
+            ((max_abs_after as f64) - PEFT_STEP1_REFERENCE_LR).abs() / PEFT_STEP1_REFERENCE_LR;
+        assert!(
+            relative_diff < 0.05,
+            "max(|lora_b|) after PeftStep1's one real AdamW step = {max_abs_after}, expected \
+             ~{PEFT_STEP1_REFERENCE_LR} -- relative diff {relative_diff} exceeds 5%; looks like \
+             the reference lr silently changed (e.g. to ParamsAdamW::default()'s 0.001, 5x \
+             larger)"
+        );
+    }
+
+    /// Ordering control: `lora_weights_out` under `PeftStep1` must capture
+    /// the POST-step weights, never the pre-step init (see `run()`'s own
+    /// `effective_lora_weights_in` load, which happens BEFORE the
+    /// `lora_weights_out` save call site). Detects a regression that moves
+    /// the save above that load -- that mutation would silently write the
+    /// PRE-step (all-zero `lora_b`) state to the shared file while every
+    /// OTHER assertion in this module keeps passing (`peft_step1_weights`
+    /// itself still runs; only the FILE would be stale).
+    #[test]
+    fn grad_oracle_lora_weights_out_captures_post_peft_step1_state() {
+        let dir = tempdir();
+        let weights_path = dir.join("post_peft_step1.safetensors");
+
+        let mut params = tiny_params();
+        params.lora_init = GradOracleLoraInit::PeftStep1;
+        params.lora_weights_out = Some(weights_path.clone());
+        let warmed = run(&params).expect("peft-step1 run with lora_weights_out");
+
+        let mut loaded_params = tiny_params();
+        loaded_params.lora_weights_in = Some(weights_path.clone());
+        let loaded = run(&loaded_params).expect("load the dumped post-peft-step1 file");
+
+        let any_name = warmed
+            .gradients
+            .keys()
+            .next()
+            .expect("at least one tensor")
+            .clone();
+        assert_eq!(
+            warmed.gradients[&any_name].weight, loaded.gradients[&any_name].weight,
+            "lora_weights_out did not capture the POST-peft-step1 weight -- the dumped file's \
+             own round-trip must reproduce exactly what the warmed run itself used"
+        );
+        let lora_b_name = warmed
+            .gradients
+            .keys()
+            .find(|k| k.ends_with("lora_b"))
+            .expect("at least one lora_b tensor")
+            .clone();
+        assert!(
+            warmed.gradients[&lora_b_name]
+                .weight
+                .iter()
+                .any(|&w| w != 0.0),
+            "the dumped file's own lora_b must be POST-peft-step1 (nonzero), not the pre-step \
+             ZerosB init -- lora_weights_out was saved before peft_step1_weights's own step ran"
         );
 
         let _ = std::fs::remove_file(&weights_path);

@@ -389,6 +389,42 @@ checkout_and_build() {
     || { echo "::error::cargo clean -p jammi-kernels failed"; exit 1; }
   run_cmd cargo build --release -p jammi-bench --features cuda --manifest-path "$REPO_ROOT/Cargo.toml" \
     || { echo "::error::cargo build -p jammi-bench --features cuda failed"; exit 1; }
+  check_bin_provenance "$JAMMI_BIN"
+}
+
+# --- provenance cross-check (unification contract C5.1), same shape as
+# stacked_sweep.sh/clip_artifact_producer.sh/fa2_ab.sh: called from
+# checkout_and_build() AFTER EACH rebuild (this script switches git refs
+# mid-run -- phase A's fused-tip checkout, phase B's eager-base checkout,
+# phase C's restore -- three rebuilds, three calls), BEFORE any leg that
+# follows runs. Refuses if the jammi-bench binary's own baked identity does
+# not match the sha ACTUALLY checked out -- resolved fresh via `git rev-
+# parse HEAD` right after this checkout, never the caller's `ref` argument
+# literally (that can be a branch name, e.g. phase C's ORIGINAL_REF, not a
+# 40-hex sha). `unknown`/a `-dirty` suffix can never equal a resolved
+# 40-hex sha, so a single string-equality check catches mismatch/unknown/
+# dirty uniformly; an empty reading is ALSO a refusal, never silently
+# skipped -- never a leg silently marked GREEN off a binary that was not
+# rebuilt cleanly at the ref this phase just switched to.
+check_bin_provenance() {
+  local bin="$1"
+  if [ "$AB_DRY_RUN" = "1" ]; then
+    return 0
+  fi
+  local sha sha_re='^[0-9a-fA-F]{40}$'
+  sha="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+  if ! [[ "$sha" =~ $sha_re ]]; then
+    echo "::error::post-checkout HEAD did not resolve to a 40-hex commit ('$sha') -- refusing" >&2
+    exit 1
+  fi
+  local bin_prov_json bin_prov_sha
+  bin_prov_json="$("$bin" provenance 2>&1)" || { echo "::error::'$bin provenance' failed: $bin_prov_json" >&2; exit 1; }
+  bin_prov_sha="$(printf '%s' "$bin_prov_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["build_sha"])' 2>&1)" \
+    || { echo "::error::could not parse build_sha from '$bin provenance' output: $bin_prov_json" >&2; exit 1; }
+  if [ -z "$bin_prov_sha" ] || [ "$bin_prov_sha" != "$sha" ]; then
+    echo "::error::'$bin provenance' reports build_sha=$bin_prov_sha, but this checkout is at sha=$sha -- refusing before any leg runs off this binary." >&2
+    exit 1
+  fi
 }
 
 # ---------------------------------------------------------------------- #

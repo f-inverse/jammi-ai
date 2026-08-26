@@ -49,6 +49,15 @@ REPO=${REPO:-$(cd "$(dirname "$0")/../../.." && pwd)}
 cd "$REPO" || exit 2
 if [ -d .git ]; then SHA=${SHA:-$(git rev-parse HEAD)}; fi
 : "${SHA:?SHA must be set (40-hex tip) when REPO is not a git checkout}"
+# Same 40-hex validation every other jammi-bench-invoking producer applies
+# (stacked_sweep.sh/fa2_ab.sh/finetune_ab.sh) -- a short/malformed SHA is
+# ambiguous, refusing to guess rather than only checking non-empty.
+SHA_RE='^[0-9a-fA-F]{40}$'
+if ! [[ "$SHA" =~ $SHA_RE ]]; then
+  echo "::error::SHA must be a 40-hex commit, got '$SHA' -- a short sha is ambiguous, refusing to guess" >&2
+  exit 2
+fi
+SHA="$(printf '%s' "$SHA" | tr 'A-F' 'a-f')"
 SHA7=${SHA:0:7}; DATE=$(date -u +%F); TS=$(date -u +%FT%TZ)
 BOX=${BOX:-a100b-pcie}
 MODEL_DIR=${MODEL_DIR:-/root/checkpoints/ModernBERT-large}

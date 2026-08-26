@@ -61,10 +61,15 @@
 #                           (if fabricated-empty) files. Never touches the
 #                           lock, the GPU, or the network; never claims a
 #                           real number.
-#   SWEEP_FAKE_BIN_SHA      unification contract C5.2: under SWEEP_DRY_RUN=1,
-#                           injects a fake `jammi-bench provenance` build_sha
-#                           so the provenance-mismatch refusal path is
-#                           exercisable without a GPU or a real build.
+#   SWEEP_FAKE_BIN_SHA      unification contract C5.2: under SWEEP_DRY_RUN=1
+#                           ONLY, injects a fake `jammi-bench provenance`
+#                           build_sha so the provenance-mismatch refusal
+#                           path is exercisable without a GPU or a real
+#                           build. Inert otherwise: set it with
+#                           SWEEP_DRY_RUN unset or 0 and the script refuses
+#                           outright, before touching MODEL_DIR/the lock/the
+#                           GPU/the build -- a real run can never launder a
+#                           fabricated provenance answer through this knob.
 #   SWEEP_BOX               physical/pod box tag (e.g. `a100c`) stamped
 #                           mechanically into every raw leg's `box` field
 #                           (unification contract C5.3's `stamp_leg()`) and
@@ -187,6 +192,19 @@ SWEEP_CUDA_ORDINAL="${SWEEP_CUDA_ORDINAL:-0}"
 SWEEP_LOCK="${SWEEP_LOCK:-/root/TIMING_IN_PROGRESS}"
 CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$WORKTREE/target}"
 TORCH_PY="${TORCH_PY:-$(cd "$WORKTREE/.." && pwd)/.venv-torch-ref/bin/python3}"
+
+# --- SWEEP_FAKE_BIN_SHA is a DRY-RUN-ONLY test knob (contract C5.2): it
+# exists to exercise the provenance-mismatch refusal path below without a
+# GPU or a real build, never to let a REAL run supply its own answer to the
+# question that check exists to ask. Checked here, before ANY other
+# precondition, so a real invocation with the knob set can never reach the
+# build/GPU/lock stages on the strength of a fabricated provenance value --
+# inert unless SWEEP_DRY_RUN=1, and a real run with it set REFUSES outright
+# rather than silently ignoring it.
+if [ -n "${SWEEP_FAKE_BIN_SHA:-}" ] && [ "$SWEEP_DRY_RUN" != "1" ]; then
+  echo "::error::SWEEP_FAKE_BIN_SHA is set but SWEEP_DRY_RUN != 1 -- this is a dry-run-only test knob (contract C5.2) for exercising the '\$BIN provenance' mismatch refusal without a real binary; a REAL run may never inject its own provenance answer. Refusing." >&2
+  exit 2
+fi
 
 # --- refuse unless the worktree is already checked out at exactly <sha> ---
 # Checked BEFORE any other precondition (MODEL_DIR, the lock, the GPU) --
@@ -324,15 +342,20 @@ fi
 # invocation claims to prove. `unknown`/a `-dirty` suffix can never equal a
 # 40-hex `$SHA` (already validated above), so a single string-equality
 # check catches mismatch/unknown/dirty uniformly -- never a leg silently
-# marked GREEN off a binary that was not built cleanly at $SHA. Under
-# SWEEP_DRY_RUN=1 with no injected SWEEP_FAKE_BIN_SHA there is no real
-# binary to query (SWEEP_SKIP_BUILD may also be set) -- the refusal path is
-# instead exercised via SWEEP_FAKE_BIN_SHA (contract C5.2), so the check is
-# skipped only in that one dry-run-and-no-fake-sha case.
+# marked GREEN off a binary that was not built cleanly at $SHA. In REAL mode
+# this ALWAYS queries the real binary -- SWEEP_FAKE_BIN_SHA was already
+# refused above if set outside SWEEP_DRY_RUN=1, so there is no real-mode
+# path that can inject a fake answer here. Under SWEEP_DRY_RUN=1 with no
+# injected SWEEP_FAKE_BIN_SHA there is no real binary to query
+# (SWEEP_SKIP_BUILD may also be set) -- the refusal path is instead
+# exercised via SWEEP_FAKE_BIN_SHA (contract C5.2), so the check is skipped
+# only in that one dry-run-and-no-fake-sha case.
 BIN_PROV_SHA=""
-if [ -n "${SWEEP_FAKE_BIN_SHA:-}" ]; then
-  BIN_PROV_SHA="$SWEEP_FAKE_BIN_SHA"
-elif [ "$SWEEP_DRY_RUN" != "1" ]; then
+if [ "$SWEEP_DRY_RUN" = "1" ]; then
+  if [ -n "${SWEEP_FAKE_BIN_SHA:-}" ]; then
+    BIN_PROV_SHA="$SWEEP_FAKE_BIN_SHA"
+  fi
+else
   BIN_PROV_JSON="$("$BIN" provenance 2>&1)" || {
     echo "::error::'$BIN provenance' failed: $BIN_PROV_JSON" >&2
     exit 1

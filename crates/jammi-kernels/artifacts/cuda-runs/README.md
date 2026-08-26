@@ -42,12 +42,17 @@ leg rather than the top-level artifact). Required top-level fields:
 - **`merged_as`** (40 lowercase hex chars, OPTIONAL) + **`merged_via_pr`** (int, OPTIONAL, only
   valid together with `merged_as`) — a branch tip a measurement ran on can be squash-merged, so
   `git_sha` is then legitimately never an ancestor of anything again. `merged_as` names the squash
-  commit the SAME content landed on `main` as (verified by checking that squash commit's own diff
-  literally introduces this artifact's own file, carrying `git_sha` unchanged inside it — not by
-  title/branch-name matching alone); `merged_via_pr` is the PR number that merged it. Rule (d)
-  PASSES if EITHER `git_sha` is an ancestor of `HEAD`, OR `merged_as` is. `git_sha` is always kept
-  verbatim (the tip that was actually measured) — `merged_as` only ever supplements it, never
-  replaces it, and requires a resolved `git_sha` (never valid alongside `git_sha_unresolved`).
+  commit the SAME content landed on `main` as; `merged_via_pr` is the PR number that merged it.
+  Rule (d) (`check_ancestry`) PASSES if EITHER `git_sha` is an ancestor of `HEAD`, OR `merged_as`
+  is — `merged_as` is verified ONLY by `git merge-base --is-ancestor merged_as HEAD` (the same
+  ancestry check `git_sha` itself gets), never by inspecting the squash commit's own diff. A record
+  whose `merged_as` names a squash commit that introduced the artifact under a DIFFERENT path than
+  it lives at today (e.g. a `git mv`'d baseline — this directory's own `p1-softmax-fold` and
+  `finetune-step-reference` entries, moved here from `crates/jammi-bench/baselines/`) is legitimate
+  and still passes: ancestry, not path/content reproduction, is the property this rule pins.
+  `git_sha` is always kept verbatim (the tip that was actually measured) — `merged_as` only ever
+  supplements it, never replaces it, and requires a resolved `git_sha` (never valid alongside
+  `git_sha_unresolved`).
 
 Run the gate: `python3 ci/scripts/check_cuda_run_artifacts.py`. Self-test (RED cases for every
 rule, on a throwaway fixture repo — never this checkout):

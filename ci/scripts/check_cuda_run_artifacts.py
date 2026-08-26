@@ -96,6 +96,18 @@ must carry:
       entirely on every artifact committed before this rule existed, so no
       existing artifact reddens.
 
+      NOTE: a SECOND, UNRELATED rule below (`check_v2_leg`/`find_v2_legs`,
+      unification contract C6 — v2 leg identity) is ALSO commented "rule
+      (g)" in this file. Both landed calling themselves "(g)" independently
+      (KO-3 first; C6 second, without checking). Deliberately left
+      un-renumbered rather than risk a mechanical rename introducing a typo
+      across two unrelated mechanisms: the letter is read by NO gate,
+      allowlist, or error message anywhere in this file or its self-test
+      (`git grep` confirms) — it is comment/self-test-label prose only, so
+      the collision is cosmetic, never a correctness hazard. If a future
+      change makes some gate or doc actually READ the letter (e.g. an error
+      message citing "rule (g)"), split them into distinct letters then.
+
 Rule (d) needs REAL commit history to mean anything: `git merge-base
 --is-ancestor` on a shallow checkout (`actions/checkout`'s default
 `fetch-depth: 1`) reads back EVERY `git_sha` as a false non-ancestor —
@@ -610,20 +622,65 @@ def check_none_allowlist(data: dict, relpath: str, allowlist: dict[str, str]) ->
     return []
 
 
-def _first_introduction_sha(relpath: str, cuda_runs_dir: Path, repo_root: Path) -> str | None:
+def _first_introduction_sha_for_path(path: Path, repo_root: Path) -> str | None:
     """The oldest commit that `git log --follow --diff-filter=A` reports for
-    `<cuda_runs_dir>/<relpath>` — the commit that FIRST added this exact file
-    path (following renames). `None` if git found no such commit (the file
-    was never added under this name, or the repo has no history for it)."""
+    `path` — the commit that FIRST added this exact file path (following
+    renames). `None` if `path` does not resolve to somewhere inside
+    `repo_root`, or git found no such commit (the file was never added
+    under this name, or the repo has no history for it)."""
     try:
-        full_path = (cuda_runs_dir / relpath).resolve().relative_to(repo_root.resolve())
+        rel = path.resolve().relative_to(repo_root.resolve())
     except ValueError:
         return None
-    proc = _run(["git", "log", "--follow", "--diff-filter=A", "--format=%H", "--", str(full_path)], repo_root)
+    proc = _run(["git", "log", "--follow", "--diff-filter=A", "--format=%H", "--", str(rel)], repo_root)
     if proc.returncode != 0:
         return None
     lines = [line for line in proc.stdout.splitlines() if line.strip()]
     return lines[-1] if lines else None
+
+
+def _first_introduction_sha(relpath: str, cuda_runs_dir: Path, repo_root: Path) -> str | None:
+    """`_first_introduction_sha_for_path` for a `LEGACY_NONE_ALLOWLIST`
+    entry, resolved relative to `cuda_runs_dir` rather than `repo_root`
+    directly."""
+    return _first_introduction_sha_for_path(cuda_runs_dir / relpath, repo_root)
+
+
+def check_gate_introduction_sha_anchor(
+    repo_root: Path = REPO_ROOT,
+    gate_file: Path | None = None,
+    gate_introduction_sha: str = GATE_INTRODUCTION_SHA,
+) -> list[str]:
+    """C8.3's own anchor, otherwise unverified: `GATE_INTRODUCTION_SHA` is a
+    hand-typed constant that every `LEGACY_NONE_ALLOWLIST` entry's history
+    check (`check_none_allowlist_history`) is pinned to — "this entry's
+    first-introduction commit must be an ancestor of GATE_INTRODUCTION_SHA".
+    If that constant is silently repointed FORWARD (to a commit strictly
+    AFTER this gate's real introduction), that check quietly widens what
+    "predates the gate" means and a genuinely NEW allowlist entry could
+    start satisfying it. This function is the anchor: it asserts
+    `GATE_INTRODUCTION_SHA` equals THIS GATE FILE's OWN first-introduction
+    commit (`_first_introduction_sha_for_path`, the same `git log --follow
+    --diff-filter=A` machinery `check_none_allowlist_history` already
+    trusts) — never a second, independently-drifting source of truth.
+    Editing `GATE_INTRODUCTION_SHA` at all is a `ci/scripts/check_cuda_run_
+    artifacts.py` edit, i.e. SWARM_GATE_TOUCHED by construction, same as
+    every other change to this file's own rules."""
+    gate_file = gate_file if gate_file is not None else Path(__file__).resolve()
+    actual = _first_introduction_sha_for_path(gate_file, repo_root)
+    if actual is None:
+        return [
+            f"GATE_INTRODUCTION_SHA anchor: could not determine {gate_file}'s own first-introduction "
+            "commit via `git log --follow --diff-filter=A` — cannot verify GATE_INTRODUCTION_SHA"
+        ]
+    if actual != gate_introduction_sha:
+        return [
+            f"GATE_INTRODUCTION_SHA = {gate_introduction_sha} does not match this gate file's own "
+            f"first-introduction commit ({actual}) — every LEGACY_NONE_ALLOWLIST entry's history "
+            "check is anchored to this constant; a value that is not the gate's own real "
+            "introduction silently changes what 'predates the gate' means"
+        ]
+    return []
 
 
 def check_none_allowlist_history(
@@ -660,7 +717,12 @@ def check_none_allowlist_history(
 
 # --------------------------------------------------------------------------- #
 # rule (g) — leg identity on self-declaring v2 legs (unification contract C6,
-# phase 2). A v2 leg is ANY JSON object, anywhere in a `cuda-runs/**` tree,
+# phase 2). NOTE: this is a SEPARATE, unrelated mechanism from the OTHER
+# "rule (g)" above (KO-3 `oracle_separation`) — see that rule's own note for
+# why the collision is left as-is (cosmetic; the letter is read by no gate,
+# allowlist, or error message).
+#
+# A v2 leg is ANY JSON object, anywhere in a `cuda-runs/**` tree,
 # carrying `leg_schema_version >= 2` — a key with ZERO occurrences anywhere
 # in this repo at the time this rule was written, so no pre-existing (v1)
 # leg can satisfy it by accident. A leg WITHOUT the key is v1 and is
@@ -983,7 +1045,78 @@ def find_v2_legs(data, path_prefix: str = "") -> list[tuple[str, dict]]:
 
 
 def _raw_runs_dir_for(artifact_path: Path) -> Path:
+    """A single NAMING GUESS (`<stem>-raw-runs`) — a fallback default only,
+    used where no directory has actually been discovered to belong to
+    `artifact_path` (so a nonexistent guessed path is harmless: `.is_dir()`/
+    `.is_file()` on it reads False). This function is NEVER the authority
+    for "does a raw-runs directory exist" or "which directories must be
+    walked" — a committed directory can be named after a shorter "unit"
+    prefix instead of the full stem (`2026-08-25-p6-b3-dense-raw-runs/`
+    next to `2026-08-25-p6-b3-dense-b98f7e1-a100-sxm4.json`), so a rule that
+    derives its ONE candidate path this way and stops cannot see a
+    directory whose name diverges. `_find_raw_runs_dirs` below is that
+    authority; `_artifact_for_raw_runs_dir` is the ownership lookup a v2
+    rule needs on top of it."""
     return artifact_path.parent / (artifact_path.stem + RAW_RUNS_DIR_SUFFIX)
+
+
+def _find_raw_runs_dirs(cuda_runs_dir: Path) -> list[Path]:
+    """Every directory anywhere under `cuda_runs_dir` whose name ends with
+    `-raw-runs` — discovered by NAME PATTERN across the whole tree (an
+    `rglob`, not a `glob`, so a raw-runs directory nested more than one
+    level down is still found), never by deriving one candidate sibling
+    path from a particular artifact's stem. This is the ONE list every rule
+    that reasons about raw legs — non-json-payload coverage, the v2-leg-
+    required-under-a-v2-parent rule, the `--census` falsifier — walks; none
+    of them may instead loop over top-level artifacts and guess a sibling
+    path per artifact, because that guess has a known committed
+    counterexample (see `_raw_runs_dir_for`'s docstring)."""
+    return sorted(p for p in cuda_runs_dir.rglob("*" + RAW_RUNS_DIR_SUFFIX) if p.is_dir())
+
+
+def _artifact_for_raw_runs_dir(raw_runs_dir: Path, cuda_runs_dir: Path) -> Path | None:
+    """The top-level `*.json` artifact that OWNS `raw_runs_dir`, for the one
+    thing that still needs ownership: does the owning artifact's
+    `schema_version` require the legs under this directory to be v2. Prefers
+    an EXACT stem match (`<stem>-raw-runs`, the common case: adamw, the
+    fa2-vram-attrib artifact, the p6-stacked-sweep artifact all name their
+    raw-runs directory after their own full stem); falls back to the unique
+    top-level artifact whose stem starts with `<unit-stem>-` (the
+    mismatched-name case: `2026-08-25-p6-b3-dense-raw-runs/` owned by
+    `2026-08-25-p6-b3-dense-b98f7e1-a100-sxm4.json`, whose stem drops the
+    raw-runs directory's own sha7/gpu suffix). Returns `None` on no match or
+    an AMBIGUOUS match (more than one candidate) — a raw-runs directory
+    whose ownership cannot be pinned down is still discovered and coverage-
+    checked by `_find_raw_runs_dirs` callers; it is simply not yet tied to
+    a v2 requirement, which fails toward MORE scrutiny elsewhere, never
+    toward silently skipping the directory outright."""
+    unit_stem = raw_runs_dir.name[: -len(RAW_RUNS_DIR_SUFFIX)]
+    exact = cuda_runs_dir / f"{unit_stem}.json"
+    if exact.is_file():
+        return exact
+    candidates = [
+        p
+        for p in cuda_runs_dir.glob("*.json")
+        if p.stem == unit_stem or p.stem.startswith(unit_stem + "-")
+    ]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _containing_raw_runs_dir(f: Path, cuda_runs_dir: Path) -> Path | None:
+    """The raw-runs directory `f` sits under, however many levels deep — the
+    NEAREST ancestor of `f` whose name ends with `-raw-runs`, never `f`'s
+    own immediate `.parent`. A leg nested in a per-box subdirectory (e.g.
+    `<...>-raw-runs/a100c/leg.json`, the shape `stacked_sweep.sh`'s
+    `stamp_leg()` actually writes — all 40 committed stacked legs and 8 of
+    16 p6-b3-dense-a100b legs sit this way) belongs to the `-raw-runs`
+    ancestor two levels up, not to `a100c/`; a rule keying on `f.parent`
+    alone silently never reaches it."""
+    for parent in f.parents:
+        if parent == cuda_runs_dir:
+            return None
+        if parent.name.endswith(RAW_RUNS_DIR_SUFFIX):
+            return parent
+    return None
 
 
 def find_objects_with_key(data, key: str, path_prefix: str = "") -> list[str]:
@@ -1010,8 +1143,17 @@ def census_unreached_measurement_objects(cuda_runs_dir: Path) -> list[str]:
     `*-raw-runs/` directory — that carries `s_per_step_p50` must be
     REACHABLE as (or nested inside) a v2 leg rule (g) actually validated.
     Trivially empty today (zero `schema_version >= 2` top-level artifacts
-    exist yet) — the falsifier is standing for the day one does."""
+    exist yet) — the falsifier is standing for the day one does. Reaches
+    exactly the same raw-runs directories `check_raw_runs_nonjson_coverage`
+    does: discovered by `_find_raw_runs_dirs`'s name pattern plus
+    `_artifact_for_raw_runs_dir`'s ownership lookup, never a per-artifact
+    `<stem>-raw-runs` guess."""
     unreached: list[str] = []
+    dir_for_artifact: dict[Path, Path] = {}
+    for raw_runs_dir in _find_raw_runs_dirs(cuda_runs_dir):
+        owner = _artifact_for_raw_runs_dir(raw_runs_dir, cuda_runs_dir)
+        if owner is not None:
+            dir_for_artifact[owner] = raw_runs_dir
     for f in sorted(cuda_runs_dir.glob("*.json")):
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
@@ -1023,8 +1165,8 @@ def census_unreached_measurement_objects(cuda_runs_dir: Path) -> list[str]:
         for measure_path in find_objects_with_key(data, "s_per_step_p50"):
             if not _covered_by(measure_path, reached):
                 unreached.append(f"{f.name}#{measure_path}")
-        raw_runs_dir = _raw_runs_dir_for(f)
-        if raw_runs_dir.is_dir():
+        raw_runs_dir = dir_for_artifact.get(f)
+        if raw_runs_dir is not None and raw_runs_dir.is_dir():
             for rf in sorted(raw_runs_dir.rglob("*.json")):
                 try:
                     rdata = json.loads(rf.read_text(encoding="utf-8"))
@@ -1052,14 +1194,15 @@ def check_legacy_raw_nonjson_files_exist(cuda_runs_dir: Path) -> list[str]:
 
 def check_raw_runs_nonjson_coverage(cuda_runs_dir: Path) -> list[str]:
     """Every non-`.json` payload (excluding `.md`/`.log`) under ANY `*-raw-
-    runs/` directory must be in the closed `LEGACY_RAW_NONJSON` list — the
-    `.json.raw` rename bypass (contract C6.2, pressure-v2 NF8) a NEW leg may
-    never reuse."""
+    runs/` directory, at ANY depth, must be in the closed `LEGACY_RAW_NONJSON`
+    list — the `.json.raw` rename bypass (contract C6.2, pressure-v2 NF8) a
+    NEW leg may never reuse. Walks `_find_raw_runs_dirs`'s full, name-
+    pattern-based discovery — never a per-artifact `<stem>-raw-runs` guess,
+    which has a committed counterexample that does not match any artifact's
+    stem (`2026-08-25-p6-b3-dense-raw-runs/`) and would otherwise never be
+    visited at all."""
     failures: list[str] = []
-    for artifact_path in sorted(cuda_runs_dir.glob("*.json")):
-        raw_runs_dir = _raw_runs_dir_for(artifact_path)
-        if not raw_runs_dir.is_dir():
-            continue
+    for raw_runs_dir in _find_raw_runs_dirs(cuda_runs_dir):
         for p in sorted(raw_runs_dir.rglob("*")):
             if p.is_dir() or p.suffix in (".md", ".log", ".json"):
                 continue
@@ -1073,13 +1216,22 @@ def check_raw_runs_nonjson_coverage(cuda_runs_dir: Path) -> list[str]:
     return failures
 
 
-def check_raw_runs_require_v2(data: dict, f: Path, schema_v2_raw_runs_dirs: set[Path]) -> list[str]:
+def check_raw_runs_require_v2(
+    data: dict, f: Path, cuda_runs_dir: Path, schema_v2_raw_runs_dirs: set[Path]
+) -> list[str]:
     """Contract C6.2's last sentence: under a parent artifact with
     `schema_version >= 2`, every `*.json` payload under its `*-raw-runs/`
     sibling MUST carry `leg_schema_version >= 2` (else RED) — a v1-shaped
     raw leg silently coexisting under an already-v2 parent is exactly the
-    kind of container drift rule (g) exists to catch."""
-    if f.parent not in schema_v2_raw_runs_dirs:
+    kind of container drift rule (g) exists to catch. Keys on the raw-runs
+    directory `f` actually sits under (`_containing_raw_runs_dir`, which
+    walks ancestors to any depth), never on `f.parent` — a leg nested one
+    level further down (`<...>-raw-runs/<box>/leg.json`, the shape every
+    committed stacked-sweep and p6-b3-dense-a100b leg actually has) has
+    `f.parent` equal to the per-box subdirectory, not to the raw-runs
+    directory itself, and would otherwise silently escape this rule."""
+    containing = _containing_raw_runs_dir(f, cuda_runs_dir)
+    if containing is None or containing not in schema_v2_raw_runs_dirs:
         return []
     if _is_v2(data.get(LEG_SCHEMA_VERSION_KEY)):
         return []
@@ -1134,17 +1286,25 @@ def run_gate(
     if not files:
         raise ArtifactError(f"no *.json artifacts found under {cuda_runs_dir}")
 
-    # rule (g) precompute: which `*-raw-runs/` directories sit under a
-    # top-level artifact whose OWN schema_version is already >= 2 (C6.2's
-    # "MUST carry leg_schema_version >= 2" mandate is conditional on this).
+    # rule (g) precompute: EVERY `*-raw-runs/` directory in the tree
+    # (`_find_raw_runs_dirs` — name-pattern discovery, not a per-artifact
+    # guess), which top-level artifact owns each one, and which of those
+    # owners is already schema_version >= 2 (C6.2's "MUST carry
+    # leg_schema_version >= 2" mandate is conditional on that).
+    raw_runs_dirs = _find_raw_runs_dirs(cuda_runs_dir)
+    dir_for_artifact: dict[Path, Path] = {}
+    for raw_runs_dir in raw_runs_dirs:
+        owner = _artifact_for_raw_runs_dir(raw_runs_dir, cuda_runs_dir)
+        if owner is not None:
+            dir_for_artifact[owner] = raw_runs_dir
     schema_v2_raw_runs_dirs: set[Path] = set()
-    for tf in sorted(cuda_runs_dir.glob("*.json")):
+    for owner, owned_dir in dir_for_artifact.items():
         try:
-            tdata = json.loads(tf.read_text(encoding="utf-8"))
+            odata = json.loads(owner.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             continue
-        if isinstance(tdata, dict) and _is_v2(tdata.get("schema_version")):
-            schema_v2_raw_runs_dirs.add(_raw_runs_dir_for(tf))
+        if isinstance(odata, dict) and _is_v2(odata.get("schema_version")):
+            schema_v2_raw_runs_dirs.add(owned_dir)
 
     all_failures: list[str] = []
     for f in files:
@@ -1163,14 +1323,15 @@ def run_gate(
         # rule (g): every v2-leg-shaped object anywhere in THIS document
         # (the document itself, at "<root>", or nested inside it).
         parent_git_sha = data.get("git_sha") if isinstance(data.get("git_sha"), str) else None
-        raw_runs_dir = _raw_runs_dir_for(f)
+        raw_runs_dir = dir_for_artifact.get(f, _raw_runs_dir_for(f))
         for subpath, leg in find_v2_legs(data):
             label = f"{relpath}#{subpath}" if subpath else relpath
             all_failures.extend(
                 f"{msg}" for msg in check_v2_leg(leg, label, parent_git_sha, raw_runs_dir, cuda_runs_dir)
             )
         all_failures.extend(
-            f"{relpath}: {msg}" for msg in check_raw_runs_require_v2(data, f, schema_v2_raw_runs_dirs)
+            f"{relpath}: {msg}"
+            for msg in check_raw_runs_require_v2(data, f, cuda_runs_dir, schema_v2_raw_runs_dirs)
         )
 
     all_failures.extend(check_raw_runs_nonjson_coverage(cuda_runs_dir))
@@ -1206,6 +1367,11 @@ def main() -> int:
     # this runs here, never inside `run_gate` (which `--self-test` also
     # drives against synthetic fixture repos that do not carry these files).
     failures = failures + check_legacy_raw_nonjson_files_exist(CUDA_RUNS_DIR)
+
+    # GATE_INTRODUCTION_SHA's own anchor — same reasoning: only meaningful
+    # against THIS gate script's real, committed history, never a
+    # `--self-test` fixture repo (which never contains this file at all).
+    failures = failures + check_gate_introduction_sha_anchor()
 
     if failures:
         print("cuda-run-artifacts: FAIL", file=sys.stderr)
@@ -1740,6 +1906,79 @@ def self_test() -> int:
         if not any("not in the closed LEGACY_RAW_NONJSON list" in g for g in got):
             failures.append(f"self-test FAILED: rule (g) i/ii: a non-allowlisted .json.raw payload was not caught: {got}")
 
+    # (ix) discovery domain — a `*-raw-runs/` directory whose name does NOT
+    # match `<any-artifact-stem>-raw-runs` (the committed counterexample:
+    # `2026-08-25-p6-b3-dense-raw-runs/` sits next to
+    # `2026-08-25-p6-b3-dense-b98f7e1-a100-sxm4.json`, a stem that drops the
+    # sha7/gpu suffix) must still be discovered and coverage-checked. Two
+    # legs here: one under the DIR ITSELF (flat) and one nested a level
+    # further down (`.../subdir/leg.json.raw`, any depth) — both must be
+    # caught; a rule that only derives ONE candidate sibling path per
+    # artifact stem sees neither.
+    with tempfile.TemporaryDirectory() as tmp_ix:
+        cr, root = _rule_g_fixture(Path(tmp_ix))
+        owner = {
+            "schema_version": 1, "git_sha": root, "box": "a100-fixture",
+            "producer": {
+                "path": "ci/scripts/perf/proof_artifact.py", "kind": "script",
+                "invocation": "python3 ci/scripts/perf/proof_artifact.py <out> <tag>", "gating": "none",
+            },
+            "status": "GREEN",
+        }
+        # The owning artifact's stem carries a suffix the raw-runs dir name
+        # drops entirely — same shape as the real p6-b3-dense mismatch.
+        (cr / "rg-ix-unit-deadbeef-a100-sxm4.json").write_text(json.dumps(owner))
+        mismatched_dir = cr / "rg-ix-unit-raw-runs"  # NOT "<stem>-raw-runs"
+        (mismatched_dir / "subdir").mkdir(parents=True)
+        (mismatched_dir / "flat.json.raw").write_text(json.dumps({"engine_version": "0.0.0"}))
+        (mismatched_dir / "subdir" / "nested.json.raw").write_text(json.dumps({"engine_version": "0.0.0"}))
+        got = run_gate(cr, Path(tmp_ix), {})
+        if not any("rg-ix-unit-raw-runs/flat.json.raw" in g and "not in the closed LEGACY_RAW_NONJSON list" in g for g in got):
+            failures.append(f"self-test FAILED: rule (g) ix: a mismatched-name raw-runs dir's FLAT non-json payload was not caught: {got}")
+        if not any("rg-ix-unit-raw-runs/subdir/nested.json.raw" in g and "not in the closed LEGACY_RAW_NONJSON list" in g for g in got):
+            failures.append(f"self-test FAILED: rule (g) ix: a mismatched-name raw-runs dir's NESTED non-json payload was not caught: {got}")
+
+    # (x) leg identity keys on the raw-runs dir a leg belongs to, not its
+    # immediate parent: a v1 leg (no `leg_schema_version`) nested ONE level
+    # below a schema_version >= 2 parent's raw-runs dir
+    # (`<...>-raw-runs/<box>/leg.json`, the shape stacked_sweep.sh's
+    # `stamp_leg()` actually writes for every committed leg) must still be
+    # caught -> RED. A compliant v2 leg at the SAME depth must stay clean.
+    with tempfile.TemporaryDirectory() as tmp_x:
+        cr, root = _rule_g_fixture(Path(tmp_x))
+        parent = {
+            "schema_version": 2, "git_sha": root, "box": "a100-fixture",
+            "producer": {
+                "path": "ci/scripts/perf/proof_artifact.py", "kind": "script",
+                "invocation": "python3 ci/scripts/perf/proof_artifact.py <out> <tag>", "gating": "none",
+            },
+            "status": "GREEN",
+        }
+        (cr / "rg-x-parent.json").write_text(json.dumps(parent))
+        raw_dir = cr / "rg-x-parent-raw-runs"
+        box_dir = raw_dir / "a100c"
+        box_dir.mkdir(parents=True)
+        v1_leg_nested = {
+            "tiers": {"finetune_step": {"seed": 1}},
+            "schema_version": 1, "git_sha": root, "box": "a100-fixture",
+            "producer": {
+                "path": "ci/scripts/perf/proof_artifact.py", "kind": "script",
+                "invocation": "python3 ci/scripts/perf/proof_artifact.py <out> <tag>", "gating": "none",
+            },
+            "status": "GREEN",
+        }
+        (box_dir / "v1-leg.json").write_text(json.dumps(v1_leg_nested))
+        compliant_v2_leg = _full_leg_fixture("jammi", root, outer_sha=root)
+        (box_dir / "v2-leg.json").write_text(json.dumps(compliant_v2_leg))
+        got = run_gate(cr, Path(tmp_x), {})
+        if not any(
+            "rg-x-parent-raw-runs/a100c/v1-leg.json" in g and "MUST carry leg_schema_version >= 2" in g
+            for g in got
+        ):
+            failures.append(f"self-test FAILED: rule (g) x: a v1 leg nested under a per-box subdir of a v2 parent's raw-runs dir was not caught: {got}")
+        if any("v2-leg.json" in g for g in got):
+            failures.append(f"self-test FAILED: rule (g) x control: a compliant v2 leg nested under a per-box subdir was flagged: {got}")
+
     # (vii) a v1 leg (no `leg_schema_version` at all) under a schema_version:
     # 1 parent -> unchanged behaviour: rule (g) finds nothing, only rules
     # (a)-(f) apply, exactly as before this rule existed.
@@ -1806,6 +2045,28 @@ def self_test() -> int:
     real_missing = check_legacy_raw_nonjson_files_exist(CUDA_RUNS_DIR)
     if real_missing:
         failures.append(f"self-test FAILED: LEGACY_RAW_NONJSON lists a relpath that does not exist on disk: {real_missing}")
+
+    # GATE_INTRODUCTION_SHA anchor — only meaningful against THIS gate
+    # script's own REAL, committed history (a `--self-test` fixture repo
+    # never contains this file). GREEN control: the real constant, checked
+    # against this file's own real first-introduction commit, is clean.
+    # RED (M-H repro): repointing the constant FORWARD to any commit that
+    # is NOT this gate's own first-introduction commit must be caught —
+    # e3d8cb7cb12d641e1a0bd64c4d1f663a052b9def is a real, later commit on
+    # this repo's history, confirmed NOT an ancestor of the gate's actual
+    # introduction.
+    real_gate_file = Path(__file__).resolve()
+    got_anchor_control = check_gate_introduction_sha_anchor(
+        REPO_ROOT, real_gate_file, GATE_INTRODUCTION_SHA
+    )
+    if got_anchor_control:
+        failures.append(f"self-test FAILED: GATE_INTRODUCTION_SHA anchor GREEN control: the real constant was flagged: {got_anchor_control}")
+
+    got_anchor_red = check_gate_introduction_sha_anchor(
+        REPO_ROOT, real_gate_file, "e3d8cb7cb12d641e1a0bd64c4d1f663a052b9def"
+    )
+    if not any("does not match this gate file's own first-introduction commit" in g for g in got_anchor_red):
+        failures.append(f"self-test FAILED: GATE_INTRODUCTION_SHA anchor: a forward-repointed constant was not caught: {got_anchor_red}")
 
     # Shallow-checkout detection — a GENUINE `git clone --depth 1` (not a
     # simulated flag), proving `is_shallow_repository` tells a shallow

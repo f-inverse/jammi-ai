@@ -2124,8 +2124,29 @@ class TestTokenizerCommentStringInvariant(unittest.TestCase):
     # hash. Update `_STRIP_RUST_GOLDEN_HASH`/`_STRIP_RUST_GOLDEN_FILE_COUNT`
     # DELIBERATELY (a reviewed PR diff) when `_strip_rust`'s real behavior
     # is meant to change — never to silence a failure.
-    _STRIP_RUST_GOLDEN_HASH = "47a0b46335197c0e4a9080ac855fbd9dc1a7867c442a2bf489d318dd43a01f34"
-    _STRIP_RUST_GOLDEN_FILE_COUNT = 36
+    #
+    # TREE-POPULATION TRIPWIRE: `_STRIP_RUST_GOLDEN_FILE_COUNT` is exactly
+    # `ko.scan_files()`'s file count — every `*.rs` file added to or removed
+    # from `crates/jammi-kernels/tests/` or `crates/jammi-encoders/src/`
+    # (both scanned recursively, see `scan_files()`) moves it, and any PR
+    # that adds a new oracle test file under either root MUST re-derive
+    # BOTH constants with this exact producer (run from the repo root,
+    # against the PR's own merged tree — never hand-edit these numbers):
+    #
+    #   python3 -c "
+    #   import sys, hashlib
+    #   sys.path.insert(0, 'ci/scripts')
+    #   import check_kernel_oracles as ko
+    #   texts = ko.scan_files()
+    #   print('count:', len(texts))
+    #   h = hashlib.sha256()
+    #   for label in sorted(texts):
+    #       h.update(label.encode()); h.update(b'\0')
+    #       h.update(ko._strip_rust(texts[label]).encode()); h.update(b'\0')
+    #   print('hash:', h.hexdigest())
+    #   "
+    _STRIP_RUST_GOLDEN_HASH = "5e00c7c883bc3d3e0c6d3268a1f8a7f4e0096efd5b13ec2ae0eb5291986edfd1"
+    _STRIP_RUST_GOLDEN_FILE_COUNT = 37
 
     def test_strip_rust_output_matches_the_golden_hash_on_real_tree(self) -> None:
         import hashlib

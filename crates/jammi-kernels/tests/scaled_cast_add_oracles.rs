@@ -7,14 +7,16 @@
 //!      `ScaledCastAdd`'s CPU forward implements F32/BF16 storage only (no
 //!      F64 arm — the op's whole reason to exist is bf16-boundary
 //!      rounding, which F64 cannot exercise), unlike `Axpy`'s f64 leg.
-//!   2. `fused_vs_eager_*` — fwd AND bwd vs. the eager `[mul, cast, add]`
-//!      composition `LoraLinear::forward` actually runs today. `F32`/`F32`
-//!      and `BF16`(base)/`F32`(lora) — the two dtype combinations
-//!      `jammi-lora`'s admission predicate actually reaches — are asserted
-//!      BIT-EXACT (`assert_eq!`), not merely within a tolerance: see this
-//!      op's own module doc for why its rounding model was chosen to
-//!      reproduce eager's round-before-add sequence rather than diverge
-//!      from it the way `Axpy` deliberately does.
+//!   2. `fused_vs_eager_*` — fwd AND bwd vs. the eager `[mul, add, cast]`
+//!      composition `LoraLinear::forward` actually runs today (esc-046 fix,
+//!      GH#374: `base` promotes to `f32`, adds the `f32`-scaled `lora`,
+//!      rounds ONCE at the end — matching PEFT's `Linear.forward` source,
+//!      not the round-the-delta-first model an earlier revision of this op
+//!      used). `F32`/`F32` and `BF16`(base)/`F32`(lora) — the two dtype
+//!      combinations `jammi-lora`'s admission predicate actually reaches —
+//!      are asserted BIT-EXACT (`assert_eq!`), not merely within a
+//!      tolerance: this op now follows `Axpy`'s "f32-accumulate, round
+//!      once" precedent rather than diverging from it.
 //!   3. `bwd_chains_through_an_intermediate_*` — the chain-rule oracle
 //!      through an intermediate (non-`Var`) input, mirroring `Axpy`'s
 //!      `oracles.rs`.
@@ -40,18 +42,50 @@ fn fused_fwd(scaling: f64, base: &Tensor, lora: &Tensor) -> candle_core::Result<
     apply2(base, lora, ScaledCastAdd::new(scaling))
 }
 
-/// The eager `[mul, cast, add]` composition `LoraLinear::forward` actually
-/// runs (see `crates/jammi-lora/src/lora_linear.rs`): `scaled = lora *
-/// scaling` (in `lora`'s own dtype), cast to `base`'s dtype IF DIFFERENT,
-/// then add.
+/// The eager `[mul, add, cast]` composition `LoraLinear::forward` actually
+/// runs (see `crates/jammi-lora/src/lora_linear.rs`'s `eager_epilogue`,
+/// esc-046 fix, GH#374): `scaled = lora * scaling` (in `lora`'s own — `f32`
+/// — dtype), `base` widens to `scaled`'s dtype IF DIFFERENT (lossless),
+/// add, then the SUM casts down to `base`'s ORIGINAL dtype once — matching
+/// PEFT's `Linear.forward` promote-add-cast-once order, not the
+/// round-the-delta-first model this helper used before esc-046.
 fn eager_fwd(scaling: f64, base: &Tensor, lora: &Tensor) -> candle_core::Result<Tensor> {
+    // esc-046 audit round 2, finding 1: promote to the WIDER of the two
+    // dtypes (torch's own rule), never narrow base toward lora's dtype —
+    // mirrors jammi_lora::lora_linear::wider_float_dtype exactly (kept as
+    // a literal duplicate here, not an import, since this crate has no
+    // dependency on jammi-lora; family L/oracle-independence: this helper
+    // exists to check FUSED-vs-EAGER wiring parity, not to independently
+    // verify eager_epilogue's own correctness, which
+    // scaled_cast_add_peft_rounding.rs and jammi-lora's own
+    // eager_epilogue_tests do against a truly independent reference).
+    // F16/BF16 always compute at least in F32 (never native bf16
+    // arithmetic — candle's own CPU BF16 Tensor::add is measurably
+    // size-dependent), F32 stays F32, F64 wins if present.
     let scaled = (lora * scaling)?;
-    let scaled_cast = if scaled.dtype() != base.dtype() {
-        scaled.to_dtype(base.dtype())?
+    let base_dtype = base.dtype();
+    let is_f64 = |d: DType| d == DType::F64;
+    let compute_dtype = if is_f64(base_dtype) || is_f64(scaled.dtype()) {
+        DType::F64
     } else {
-        scaled
+        DType::F32
     };
-    base + scaled_cast
+    let base_wide = if base_dtype == compute_dtype {
+        base.clone()
+    } else {
+        base.to_dtype(compute_dtype)?
+    };
+    let scaled_wide = if scaled.dtype() == compute_dtype {
+        scaled
+    } else {
+        scaled.to_dtype(compute_dtype)?
+    };
+    let sum = (&base_wide + &scaled_wide)?;
+    if sum.dtype() == base_dtype {
+        Ok(sum)
+    } else {
+        sum.to_dtype(base_dtype)
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -159,14 +193,22 @@ fn fused_vs_eager_f32_f32_fwd_and_bwd_are_bit_exact() {
     );
 }
 
-/// The REJECTED alternative rounding model this op's module doc argues
-/// against: accumulate the whole expression in `f32` and round ONCE at the
-/// end (`Axpy`'s own precedent), rather than rounding the scaled delta to
-/// `base`'s dtype FIRST and only then adding-and-rounding (what this op
-/// actually implements). Used ONLY by the discrimination proof below, to
-/// show a fixture exists where the two models produce DIFFERENT bf16
-/// results — i.e. a regression from round-before-add to f32-accumulate
-/// would be caught, not silently passed.
+/// The REJECTED, pre-esc-046 alternative rounding model: round the scaled
+/// delta to `base`'s dtype FIRST, then add-and-round again — an extra
+/// round point PEFT's own source (`peft/tuners/lora/layer.py`
+/// `Linear.forward`, `v0.20.0`, lines 1044-1069) never takes (esc-046,
+/// GH#374). Used ONLY by the discrimination proof below, to show a fixture
+/// exists where the two models produce DIFFERENT bf16 results — i.e. a
+/// regression BACK to round-before-add would be caught, not silently
+/// passed.
+fn round_before_add(base: f32, lora: f32, scaling: f32) -> bf16 {
+    let delta = bf16::from_f32(lora * scaling);
+    bf16::from_f32(base + delta.to_f32())
+}
+
+/// This op's ACTUAL model since esc-046: accumulate the whole expression in
+/// `f32` and round ONCE at the end (`Axpy`'s own precedent) — matches
+/// PEFT's `Linear.forward` source exactly (see this op's own module doc).
 fn f32_accumulate_round_once(base: f32, lora: f32, scaling: f32) -> bf16 {
     bf16::from_f32(base + lora * scaling)
 }
@@ -188,18 +230,20 @@ fn f32_accumulate_round_once(base: f32, lora: f32, scaling: f32) -> bf16 {
 ///
 /// Hand-verified model values for element 5, at `f32`/`f64` precision:
 /// `delta_f32 = 22.508249282836914 * 0.1 = 2.2508249282836914`.
-/// Round-before-add (this op's actual model): round `delta_f32` to bf16
-/// FIRST — `2.2508249282836914` is closest to the bf16 grid point `2.25`
-/// (ULP `2^-6 = 0.015625` at this magnitude) — then add
+/// Round-before-add (the REJECTED, pre-esc-046 model): round `delta_f32`
+/// to bf16 FIRST — `2.2508249282836914` is closest to the bf16 grid point
+/// `2.25` (ULP `2^-6 = 0.015625` at this magnitude) — then add
 /// `1.0078125 + 2.25 = 3.2578125` and round THAT sum to bf16: `3.2578125`
 /// sits EXACTLY halfway between the grid points `3.25` and `3.265625`, so
 /// round-to-nearest-even picks `3.25` (`208 * 2^-6`, even). Result: `3.25`.
-/// f32-accumulate (the rejected model): sum first in `f32` —
+/// f32-accumulate (this op's ACTUAL model since esc-046, matching PEFT
+/// source): sum first in `f32` —
 /// `1.0078125 + 2.2508249282836914 = 3.2586374282836914` — then round
 /// ONCE: this is closer to `3.265625` (`209 * 2^-6`) than to `3.25`.
 /// Result: `3.265625`. The two models disagree by exactly one bf16 ULP —
-/// asserted below via [`f32_accumulate_round_once`], not merely argued in
-/// this comment.
+/// asserted below via [`f32_accumulate_round_once`]/[`round_before_add`],
+/// not merely argued in this comment; see
+/// [`fused_vs_eager_bf16_base_f32_lora_fwd_and_bwd_are_bit_exact_on_a_divergent_fixture`].
 // `22.508249282836914` is the exact decimal expansion of one specific f32
 // bit pattern, verified by hand against candle's actual rounding (see the
 // discrimination proof below) — kept at full precision rather than
@@ -241,32 +285,49 @@ fn fused_vs_eager_bf16_base_f32_lora_fwd_and_bwd_are_bit_exact_on_a_divergent_fi
 
     // The discrimination proof: this fixture is chosen so element 5's
     // rounding error crosses a bf16 rounding boundary, making the
-    // assertion below non-vacuous — a regression to f32-accumulate would
-    // fail it, not silently pass. Element 5's fused/eager result must
-    // equal the round-before-add model's hand-computed value (`3.25`) and
-    // must DIFFER from the rejected f32-accumulate model's value
-    // (`3.265625`).
+    // assertion below non-vacuous — a regression BACK to round-before-add
+    // (esc-046's rejected, pre-fix model) would fail it, not silently
+    // pass. Element 5's fused/eager result must equal the f32-accumulate
+    // model's hand-computed value (`3.265625`, this op's ACTUAL model
+    // since esc-046) and must DIFFER from the rejected round-before-add
+    // model's value (`3.25`).
     let discriminating_idx = 5;
-    let round_before_add = fused_v[discriminating_idx];
+    let kernel_out = fused_v[discriminating_idx];
     let round_once = f32_accumulate_round_once(
         bv[discriminating_idx].to_f32(),
         lv[discriminating_idx],
         scaling as f32,
     );
+    let rejected = round_before_add(
+        bv[discriminating_idx].to_f32(),
+        lv[discriminating_idx],
+        scaling as f32,
+    );
     assert_eq!(
-        round_before_add,
-        bf16::from_f32(3.25),
-        "round-before-add (this op's actual model) must equal the hand-computed 3.25"
+        kernel_out,
+        bf16::from_f32(3.265625),
+        "f32-accumulate (this op's ACTUAL model since esc-046) must equal the hand-computed \
+         3.265625"
     );
     assert_eq!(
         round_once,
         bf16::from_f32(3.265625),
-        "f32-accumulate (the rejected model) must equal the hand-computed 3.265625"
+        "the hand-computed f32-accumulate reference must itself equal 3.265625"
+    );
+    assert_eq!(
+        rejected,
+        bf16::from_f32(3.25),
+        "the hand-computed round-before-add (rejected) reference must itself equal 3.25"
+    );
+    assert_eq!(
+        kernel_out, round_once,
+        "the real kernel dispatch must match the hand-computed f32-accumulate reference"
     );
     assert_ne!(
-        round_before_add, round_once,
-        "the fixture must be genuinely discriminating: a regression from round-before-add \
-         to f32-accumulate must change element {discriminating_idx}'s result, not agree with it"
+        kernel_out, rejected,
+        "the fixture must be genuinely discriminating: a regression from f32-accumulate BACK \
+         to round-before-add (esc-046's rejected, pre-fix model) must change element \
+         {discriminating_idx}'s result, not agree with it"
     );
 
     let grads_fused = out_fused.backward().unwrap();
@@ -401,32 +462,35 @@ fn f32_base_bf16_lora_diffs(scaling: f64, basev: &[f32], lorav: &[f32]) -> Vec<(
 /// that class separately from the relative term, which covers ordinary
 /// non-trivial-magnitude divergence.
 ///
-/// Verified directly (not just argued): swept 5 non-bf16-exact `scaling`
-/// values (`0.1`, `1.3/16`, `8/3`, `-2.2522`, `0.0265625`) against 2000
-/// deterministic synthetic `(base, lora)` pairs each (10,000 points,
-/// `base` amplitude ~50, `lora` amplitude ~30 — comparable magnitudes, so
-/// the delta is never negligible relative to the sum the way the C6 audit
-/// found the ORIGINAL version of this file's bit-exactness fixture to be
-/// vacuous). Two divergence classes measured:
+/// RE-MEASURED for esc-046 (GH#374): `eager_fwd`'s rounding order changed
+/// (round-once, not round-before-add — see that function's own doc), which
+/// moves this UNREACHABLE combination's divergence from eager too. Same
+/// sweep as before (5 non-bf16-exact `scaling` values against 2000
+/// deterministic synthetic `(base, lora)` pairs each, 10,000 points, `base`
+/// amplitude ~50, `lora` amplitude ~30):
 ///
-/// - Ordinary (large-magnitude) divergence: worst observed `0.333` at
-///   `scaling = 8/3` (not exactly representable in bf16), magnitude
-///   `~83-129` — `0.333/83 ~= 0.4%` relative.
-/// - Near-zero-crossing divergence (small magnitude, `scaling = -2.2522`):
-///   worst observed absolute diff `0.174` at magnitude `0.82` (`~21%`
-///   relative — exactly the case a pure relative bound cannot cover: the
-///   scaling constant's own bf16 rounding, root-caused above, shifts
-///   WHICH SIDE of zero a small element lands on).
+/// - Ordinary (`magnitude >= 5`) divergence: worst observed absolute diff
+///   `0.752` at magnitude `~67` (`~1.1%` relative, computed WITHOUT
+///   subtracting any floor — a conservative over-estimate of the residual
+///   after a floor, never an under-estimate). Re-measured on every test
+///   run — see
+///   [`f32_base_bf16_lora_diverges_and_stays_within_the_measured_relative_tolerance`]
+///   and
+///   [`bf16_base_bf16_lora_diverges_and_stays_within_the_measured_relative_tolerance`].
+/// - Near-zero-crossing divergence (`magnitude < 5`): worst observed
+///   absolute diff `0.285`, same two tests.
 ///
-/// `FLOOR = 2^-2 = 0.25` covers every near-zero-crossing element measured
-/// (worst `0.174`, `~1.4x` headroom) with room to spare below the worst
-/// ordinary-divergence element (`0.333`) too. For elements whose diff
-/// exceeds the floor, the RESIDUAL relative requirement — `(diff -
-/// FLOOR) / magnitude`, maximized over every such element in the sweep —
-/// measures `0.52%`; `REL = 2^-6 = 1.5625%` keeps `~3x` headroom over
-/// that.
-const F32_BASE_BF16_LORA_REL_TOL: f64 = 0.015625; // 2^-6
-const F32_BASE_BF16_LORA_ABS_FLOOR: f64 = 0.25; // 2^-2
+/// `FLOOR = 1.0` covers every near-zero-crossing element measured (worst
+/// `0.285`, `~3.5x` headroom) AND the single worst ordinary-divergence
+/// element on its own (`0.752 < 1.0`) — the REL clause is not even
+/// exercised on this specific fixture, kept anyway as a documented margin
+/// for a fixture this test does not itself construct. `REL = 0.1` (`10%`)
+/// keeps `~9x` headroom over the measured `~1.1%` ordinary-divergence
+/// relative figure, generously covering points slightly outside this
+/// specific sweep — both figures re-measured on every run, see
+/// [`f32_base_bf16_lora_diverges_and_stays_within_the_measured_relative_tolerance`].
+const F32_BASE_BF16_LORA_REL_TOL: f64 = 0.1;
+const F32_BASE_BF16_LORA_ABS_FLOOR: f64 = 1.0;
 
 /// `true` iff `(diff, magnitude)` is within the stated relative-with-floor
 /// bound: `diff <= FLOOR` (near-zero-crossing class, floor alone) OR

@@ -2,7 +2,7 @@
 
 How jammi's Rust/candle training step went from 0.44× to 1.07× of PyTorch on the same GPU (2026-08-23 → 08-26), and what it took to prove the numbers were real. Written for an ML engineer who wants to understand the low-level computation of modern ML through one real track: candle `CustomOp`s, the autograd tape's cost, bf16 rounding placement, FlashAttention-2, and — above all — how to prove a fused kernel is both faster and faithful.
 
-Sources: GitHub #352 / #356 / #374; PRs #357–#391; the five session ledgers under `.jammi/ledger/` (`perf-fusion-20260823`, `perf-continuation-20260824`, `perf-close-20260824`, `perf-s2-20260825`, `perf-s4-20260826`); `docs/maintainer/cuda-kernel-guide.md`; the escape ledger `.jammi/escapes.jsonl`. Every number below carries its box and its producer. Where the sources disagree, the disagreement is printed, not smoothed.
+Sources: GitHub #352 / #356 / #374; PRs #357–#391; the five session ledgers under `.jammi/ledger/` (`perf-fusion-20260823`, `perf-continuation-20260824`, `perf-close-20260824`, `perf-s2-20260825`, `perf-s4-20260826`); `docs/maintainer/cuda-kernel-guide.md`; the escape ledger `.jammi/escapes.jsonl`. Every number in the nine tables below is mechanically bound to a tracked artifact or escaped into a committed, shrink-only ledger (`ci/scripts/check_perf_claims.py`, `ci/perf_claims_allowlist.txt`) — a table cell that drifts from its artifact, or a new cell landing with no producer, is a CI failure; the surrounding PROSE (this paragraph included) is not gated the same way. Where the sources disagree, the disagreement is printed, not smoothed.
 
 Notation: `b8·s512` = batch 8 triplets (the bench batches anchor/positive/negative into one forward, so the attention batch is 24 rows), sequence 512. `s/step` is the p50 of measured optimizer steps. "Same box" means both legs ran on the same physical GPU in the same session. `s2:245` = session-2 ledger row 245; `s4:11` = session-4 ledger row 11; `esc-044` = a row of the escape ledger.
 
@@ -24,7 +24,9 @@ What makes the track worth a guide is not the result but the path: two thirds of
 
 | stack | s/step | triplets/s | peak VRAM | GPU util | mem-ctrl util |
 |---|---:|---:|---:|---:|---:|
+<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger; c5=ledger; c6=ledger -->
 | PyTorch + PEFT (2024-era wheel) | 0.331 | 24.07 | 5.76 GB | 43% | 0% |
+<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger; c5=ledger -->
 | jammi (eager candle) | 0.593 | 13.50 | 35.8 GB | 100% | 25% |
 
 The issue states an A100-SXM4; the ledger's reproduction of the same 0.592 s/step records an A100 80GB PCIe (`fusion row 1`). The issue gives eager VRAM three ways (35.8 / 57.9 / 40.0 GB) for the same config. Both discrepancies are typical of the track and are why every later number carries its box.
@@ -86,12 +88,19 @@ Fuse the chains the profile named — LayerNorm (C2), RoPE (C3), masked softmax 
 
 | tip (b8·s128, PCIe, 15 steps) | s/step | Δ | modeled |
 |---|---:|---:|---:|
+<!-- claims: c1=ledger -->
 | eager | 0.5915 | — | — |
+<!-- claims: c1=ledger; c2=ledger; c3=ledger -->
 | C2 LayerNorm | 0.5089 | −82.6 ms | ~90 |
+<!-- claims: c1=ledger; c2=ledger; c3=ledger -->
 | C3 RoPE | 0.4410 | −67.9 ms | ~84 |
+<!-- claims: c1=ledger; c2=ledger; c3=ledger -->
 | C4 softmax+mask | 0.3701 | −70.9 ms | ~79 |
+<!-- claims: c1=ledger; c2=ledger; c3=ledger -->
 | C5 GeGLU | 0.3097 | −60.4 ms | ~118 (whole MLP cluster; GEMMs never in scope) |
+<!-- claims: c1=ledger; c2=ledger; c3=ledger -->
 | C6 LoRA epilogue | 0.2750 | −34.7 ms | ~50 |
+<!-- claims: c1=ledger; c2=ledger; c3=ledger -->
 | C7 Philox dropout (d0) | 0.2695 | VRAM 33.5 → 22.4 GB | — |
 
 `fusion rows 30, 36, 50`. Dropout 0.05: host mask path 1.364 s / 39.6 GB → device Philox 0.284 s / 19.7 GB.
@@ -106,11 +115,17 @@ Post-#357 census on an SXM4 (`cont row 11`): 251 ms GPU at b8·s128, of which `b
 
 | lever | mechanism | predicted | measured (same box, SXM4) | verdict |
 |---|---|---|---|---|
+<!-- claims: c1=ledger; c2=ledger; c3=crates/jammi-bench/baselines/p1_softmax_scale_fold_ab.json#/rows/b8-s512-d0/base/s_per_step_p50; c4=crates/jammi-bench/baselines/p1_softmax_scale_fold_ab.json#/rows/b8-s512-d0/tip/s_per_step_p50; c5=crates/jammi-bench/baselines/p1_softmax_scale_fold_ab.json#/rows/b8-s512-d0/base/peak_vram_bytes as GB; c6=crates/jammi-bench/baselines/p1_softmax_scale_fold_ab.json#/rows/b8-s512-d0/tip/peak_vram_bytes as GB; c7=diff(crates/jammi-bench/baselines/p1_softmax_scale_fold_ab.json#/rows/b8-s128-d0/tip/peak_vram_bytes,crates/jammi-bench/baselines/p1_softmax_scale_fold_ab.json#/rows/b8-s128-d0/base/peak_vram_bytes) as MiB -->
 | **P1** fold 1/√d into fused softmax | deletes one `[B,H,S,S]` affine node per layer | −5.6 GB, ~12 ms at s512 | s512 1.078 → 1.038 s, 77.5 → 71.8 GB; s128 flat (+32 MiB, disclosed) | landed #362 |
+<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger; c5=ledger; c6=ledger; c7=ledger; c8=ledger; c9=ledger; c10=ledger; c11=ledger; c12=ledger; c13=ledger; c14=ledger; c15=ledger; c16=ledger; c17=ledger; c18=ledger -->
 | **P2** `LowRankResidualLinear` — one CustomOp3 per LoRA site, no dW for frozen W | ~11 → 3 nodes per site; 60% of the add mass | GPU 251 → 160–190 ms (first draft 140–150) | s128 0.2668 → 0.2098 (−21%), 23.7 → 8.7 GB; s512 1.037 → 0.780 (−25%), 71.9 → 39.1 GB | landed #363 |
+<!-- claims: c1=ledger; c2=ledger; c3=crates/jammi-bench/baselines/p1_softmax_scale_fold_ab.json#/rows/b8-s512-d0/base/s_per_step_p50; c4=ledger; c5=crates/jammi-bench/baselines/p1_softmax_scale_fold_ab.json#/rows/b8-s512-d0/base/peak_vram_bytes as GB; c6=ledger; c7=ledger; c8=ledger; c9=ledger -->
 | **P3** `AttentionBlockFused` — RoPE + QKᵀ + softmax + PV in one node, P recomputed in bwd | drop three retained `[B,H,S,S]` per layer | −16.6 GB at s512, +27 ms | s512 1.078 → 1.039 s, 77.5 → 60.85 GB (−16.65); then the esc-044 fix alone: 0.772 → 0.658 s | landed #368 |
+<!-- claims: c1=ledger; c2=ledger -->
 | **P4** CUDA-graph capture | hide launch gaps | ≤0.5–6.7% (GPU busy ≈ wall) | — | killed at pressure-test |
+<!-- claims: c1=ledger; c2=ledger; c3=ledger -->
 | **P4b** device-side gradient clip (225 host syncs) | the product step always clips; the bench never did | −3.9% at s128 | clip on: +12.7 ms (s512) over the no-clip bench step — a baseline correction, not a saving | #373 cut → #381 |
+<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger; c5=ledger; c6=ledger; c7=ledger; c8=ledger -->
 | **P5** jammi-owned explicit backward | remove GradStore adds wholesale | 400+ → 155 → 100 → 62–93 → 33 → 19 ms | never built (six design rounds) | parked at the 19 ms atom |
 
 Sources: `cont rows 12, 17, 34, 60, 63, 77; close rows 38, 54; s2:57–155`.
@@ -121,14 +136,23 @@ With P1+P2+P3 stacked and esc-044 fixed, an *exclusive* A100 measured: **b8·s51
 
 | kernel | ms/step | launches | what it is |
 |---|---:|---:|---|
+<!-- claims: c1=ledger; c2=ledger; c3=ledger -->
 | `badd_bf16` | 116.1 | 563 | 496 are GradStore accumulation |
+<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger -->
 | `softmax_fwd_bf16` | 105.6 | 56 | attention; 2/layer because the block bwd recomputes P; ~3.5% of roofline |
+<!-- claims: c1=ledger; c2=ledger; c3=ledger -->
 | `ucopy_bf16` | 83.9 | 364 | 100% inside the attention block |
+<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger -->
 | `Kernel2` | 52.7 | 364 | six grid configs; only `gridDim.z=384` (26.5 ms) are attention |
+<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger; c5=ledger; c6=ledger -->
 | `cast_bf16_f32` / `scaled_cast_add` / `cast_f32_bf16` | 40.4 / 21.0 / 11.1 | 337 / 112 / 112 | the LoRA site's dtype motion |
+<!-- claims: c1=ledger; c2=ledger -->
 | `ampere_sgemm_32x128_nn` | 40.1 | 336 | the LoRA site's rank-16 f32 GEMMs |
+<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger -->
 | `affine_f32` | 25.8 | 2129 | 2016 AdamW; 112 the LoRA bwd |
+<!-- claims: c1=ledger; c2=ledger; c3=ledger -->
 | bf16 GEMMs (z=1) | 53.7 | 140 | *projection* GEMMs (Wqkv, Wi) — not attention |
+<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger; c5=ledger; c6=ledger -->
 | `rope_fwd` / `softmax_bwd` / `layer_norm_bwd_dx` | 19.3 / 18.8 / 9.0 | 168 / 28 / 56 | |
 
 `s2:51, 70`. Total 673.0 ms GPU, 7,796 launches, 1,401 memcpys; torch-sdpa: ~422 ms, 5,672 launches, 7 memcpys. GEMMs matched torch kernel-for-kernel.
@@ -139,9 +163,13 @@ The five-lever plan: AdamW ~26 ms, cast boundary ~72 ms, FA2 ~160 ms, the esc-04
 
 | lever | projection history | measured (one build, forced arm off/on) | PR |
 |---|---|---|---|
-| **Cast boundary W1** (fuse `cast+affine` and `cast+add` in the LoRA bwd) | 72.5 → 13.4 → 40–48 → 28–31 → 31–42 ms | b8·s512 0.6744 → **0.6349 (−38.5 ms)**; s128 0.1978 → 0.1883; bit-identical to the two-kernel chain | #377 |
+<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger; c5=ledger; c6=ledger; c7=ledger; c8=ledger; c9=crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-cast-w1-80f02fb-a100-sxm4.json#/legs/b8_s512_disabled_r1/s_per_step_p50; c10=crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-cast-w1-80f02fb-a100-sxm4.json#/legs/b8_s512_fused_r1/s_per_step_p50; c11=neg(crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-cast-w1-80f02fb-a100-sxm4.json#/deltas/b8_s512_p50_ms/delta_ms); c12=crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-cast-w1-80f02fb-a100-sxm4.json#/legs/b8_s128_disabled_r1/s_per_step_p50; c13=crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-cast-w1-80f02fb-a100-sxm4.json#/legs/b8_s128_fused_r1/s_per_step_p50 -->
+| **Cast boundary W1** (fuse `cast+affine` and `cast+add` in the LoRA bwd) | 72.5 → 13.4 → 40–48 → 28–31 → 31–42 ms | b8·s512 0.6744 → **0.6349 (−39.6 ms)**; s128 0.1978 → 0.1883; bit-identical to the two-kernel chain | #377 |
+<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger; c5=ledger; c6=ledger; c7=ledger; c8=ledger; c9=legacy(crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-adamw-d959805-a100-sxm4.json#/a100b_full_step_ab_reference/summary/s512/disabled_eager_p50_r1_r2/0); c10=legacy(crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-adamw-d959805-a100-sxm4.json#/a100b_full_step_ab_reference/summary/s512/fused_p50_r1_r2/0); c11=legacy(neg(diff(mean(crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-adamw-d959805-a100-sxm4.json#/a100b_full_step_ab_reference/summary/s512/disabled_eager_p50_r1_r2/0,crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-adamw-d959805-a100-sxm4.json#/a100b_full_step_ab_reference/summary/s512/disabled_eager_p50_r1_r2/1),mean(crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-adamw-d959805-a100-sxm4.json#/a100b_full_step_ab_reference/summary/s512/fused_p50_r1_r2/0,crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-adamw-d959805-a100-sxm4.json#/a100b_full_step_ab_reference/summary/s512/fused_p50_r1_r2/1))) as ms); c12=ledger -->
 | **AdamW in-place step** (`InplaceOp2/3`; 3 launches/Var, zero `Var::set` memcpys) | −40 → "~26" → ~30 wall → −20.5 isolated | optimizer phase 23.1 → 2.59 ms (8.9×); full step b8·s512 0.6759 → **0.6589 (−16.4 ms)**; s128 −16.5; bit-identical to candle's chain | #380 |
+<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger; c5=ledger; c6=ledger; c7=ledger; c8=ledger; c9=ledger; c10=ledger; c11=ledger; c12=ledger; c13=ledger -->
 | **FlashAttention-2 dense arm** | −285 → −210..−240 → −140 → [159,183]; kernel 61–85 ms projected vs **39 measured** | b8·s512 block 0.6756 → **flash 0.4626 (−213 ms)** same box, 0.937× torch; s128 −43 ms | #389 |
+<!-- claims: c1=ledger; c2=ledger; c3=ledger -->
 | **P5** | 102 → 33 → 19 ms atom | not built | — |
 | **esc-045 fix** ("the gate") | — | did not gate the shipped levers: FA2 replaces the softmax site; the others are bit-identical; the metric turned out chaotic (§6) | #374 open |
 
@@ -151,10 +179,15 @@ Sources: `s2:89, 97, 109, 137, 146, 151, 164, 192`. The AdamW "26 ms" was a mis-
 
 | shape | jammi stacked s/step | torch-sdpa | jammi all-off | torch ÷ jammi |
 |---|---:|---:|---:|---:|
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json#/shapes/b8s512/stacked_p50_min_s; c2=crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json#/shapes/b8s512/torch_p50_min_s; c3=crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json#/shapes/b8s512/alloff_p50_s; c4=crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json#/shapes/b8s512/ratio_torch_over_stacked -->
 | b8·s512 | **0.4212** | 0.4512 | 0.6554 | **1.071×** |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json#/shapes/b8s128/stacked_p50_min_s; c2=crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json#/shapes/b8s128/torch_p50_min_s; c3=pct(crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json#/shapes/b8s128/legs/torch_r1/s_per_step_p50,crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json#/shapes/b8s128/legs/torch_r2/s_per_step_p50); c4=crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json#/shapes/b8s128/alloff_p50_s; c5=crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json#/shapes/b8s128/ratio_torch_over_stacked -->
 | b8·s128 | 0.1307 | 0.1319 (r1/r2 spread 8.3%) | 0.1892 | 1.009× |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json#/shapes/b1s128/stacked_p50_min_s; c2=crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json#/shapes/b1s512/stacked_p50_min_s; c3=crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json#/shapes/b1s128/torch_p50_min_s; c4=crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json#/shapes/b1s512/torch_p50_min_s; c5=crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json#/shapes/b1s128/alloff_p50_s; c6=crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json#/shapes/b1s512/alloff_p50_s; c7=crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json#/shapes/b1s128/ratio_torch_over_stacked; c8=crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json#/shapes/b1s512/ratio_torch_over_stacked -->
 | b1·s128 / b1·s512 | 0.0401 / 0.0738 | 0.1260 / 0.1216 | 0.0648 / 0.1157 | 3.14× / 1.65× |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json#/shapes/b16s128/stacked_p50_min_s; c2=crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json#/shapes/b8s256/stacked_p50_min_s; c3=crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json#/shapes/b16s128/torch_p50_min_s; c4=crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json#/shapes/b8s256/torch_p50_min_s; c5=crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json#/shapes/b16s128/alloff_p50_s; c6=crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json#/shapes/b8s256/alloff_p50_s; c7=crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json#/shapes/b16s128/ratio_torch_over_stacked; c8=crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json#/shapes/b8s256/ratio_torch_over_stacked -->
 | b16·s128 / b8·s256 | 0.2178 / 0.2206 | 0.2243 / 0.2273 | 0.3129 / 0.3219 | 1.030× / 1.030× |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json#/shapes/b16s512/stacked_p50_min_s; c2=crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json#/shapes/b8s1024/stacked_p50_min_s; c3=crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json#/shapes/b16s512/torch_p50_min_s; c4=crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json#/shapes/b8s1024/torch_p50_min_s; c5=crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json#/shapes/b16s512/alloff_p50_s; c6=crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json#/shapes/b8s1024/alloff_p50_s; c7=crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json#/shapes/b16s512/ratio_torch_over_stacked; c8=crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json#/shapes/b8s1024/ratio_torch_over_stacked -->
 | b16·s512 / b8·s1024 | 0.8186 / 0.8300 | 0.8790 / 0.9461 | 1.2650 / 1.4781 | 1.074× / 1.140× |
 
 Artifact `crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json` + 40 raw runs; a100c A100 80GB PCIe, driver 570.172.08, torch 2.13.0+cu126 / transformers 5.15.1 / peft 0.20.0 (`s4:25`). Counters on every stacked leg: flash 840 fused / 0 declined, AdamW 6720 fused / 0 eager. Caveats the artifact prints: the b8·s128 torch leg's own spread exceeds the margin at that shape (an earlier run read 0.950×); the all-off leg disabled the flash and AdamW arms only; the ratio uses the min of two torch runs — the estimator least favourable to jammi.
@@ -223,7 +256,7 @@ Sequences are packed into `qkv [total_q, 3, H, 64]` with a `cu_seqlens [B+1]` pr
 
 ### The bench and its torch twin
 
-`jammi-bench finetune-step`: three encoder forwards, a triplet hinge, one backward, one AdamW step; synthetic uniform token ids, so it measures *cost*, never learning. `torch_finetune_step.py` is matched argument for argument (`attn_implementation` read back from the config; `--attn eager` = semantic twin, `--attn sdpa` = the throughput bar; LoRA init distribution-matched; TF32 off). `ab_merge.py` refuses to compare legs whose identity fields differ; #381 extended that set to the clip setting and the attention implementation after a clip-on jammi leg could merge against a clip-off torch leg.
+`jammi-bench finetune-step`: three encoder forwards, a triplet hinge, one backward, one AdamW step; synthetic uniform token ids, so it measures *cost*, never learning. `torch_finetune_step.py` is matched argument for argument (`attn_implementation` read back from the config; `--attn eager` = semantic twin, `--attn sdpa` = the throughput bar; LoRA init distribution-matched; TF32 off). `ab_merge.py` refuses to compare legs whose `FINETUNE_IDENTITY_FIELDS` differ (`ci/scripts/perf/ab_merge.py:114-129`); the attention implementation is recorded as provenance and never compared (`:43`); PR #381 (open) adds the clip determinant `max_grad_norm` to the jammi leg and it enters the K7-completeness const (`FinetuneStepTier::IDENTITY_FIELDS`) — not the comparison tuple — when both land. The claim is pinned by a stdlib-`unittest` suite (perf-unification phase 1) asserting the Python comparison tuples stay a subset of the Rust K7-completeness consts — not yet present on this tree at the time of writing; a later tuple change without a doc change is not caught until it lands — accepted, stated.
 
 ---
 
@@ -260,20 +293,30 @@ On 2026-08-25 the jammi-vs-torch gradient oracle (#372's `torch_grad_oracle.py`:
 
 | pair | mean cosine | notes |
 |---|---:|---|
+<!-- claims: c1=ledger; c2=ledger -->
 | jammi f32 vs torch f32 | 0.9999998 | per-layer ‖g‖ identical to 4 sig figs |
+<!-- claims: c1=ledger; c2=ledger -->
 | torch bf16 vs torch f32 | 0.932 | 0 negative tensors |
+<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger; c5=ledger -->
 | jammi bf16 vs jammi f32 | **0.337** | 31 negative; ‖g‖ ratio 2–13× from layer 18 down |
+<!-- claims: c1=ledger -->
 | torch bf16-eager vs bf16-sdpa (noise floor) | 0.825 | |
 
 jammi's math is right; its bf16 backward was 6.5× further from truth than torch's. Seven rounds followed. The bisection said any *one* of LayerNorm, GeGLU or softmax going eager restored ~0.9 ("three independent rounding errors do not compose that way"); the block and LoRA ops were bit-identical to their eager arms. Stream races and allocator garbage were refuted. The first compute-sanitizer "0 errors" had instrumented `env`, a process that ran no CUDA. Round 3's source-validated softmax fix pointed the wrong way (§5). Round 5 confirmed a mechanism (bf16 logits before softmax) that round 6 — the first run with a *live* LoRA init instead of ZerosB — retracted. Round 7 re-measured round 6's ranking at seed 43 and b8·s128, and it *reversed both times*. Then the torch column ran (`s4:11`, `s4:42`):
 
 | operating point (b4·s128) | block-fused | eager | torch bf16 | flash (FA2 tip) |
 |---|---:|---:|---:|---:|
+<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger -->
 | gaussian, seed 42 | 0.610 | 0.767 | 0.796 | 0.790 |
+<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger -->
 | post-step, seed 42 | −0.350 | −0.198 | **−0.201** | −0.319 |
+<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger -->
 | gaussian, seed 43 | 0.300 | 0.451 | 0.425 | 0.104 |
+<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger -->
 | post-step, seed 43 | 0.563 | 0.229 | 0.679 | 0.143 |
+<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger -->
 | gaussian, seed 44 | −0.264 | 0.133 | 0.485 | 0.680 |
+<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger -->
 | post-step, seed 44 | −0.070 | −0.087 | **−0.062** | 0.095 |
 
 **Torch's own bf16 backward collapses too** (range −0.20…0.80 over six points). A single-step gradient cosine here has no resolving power for either stack. The only statistic with power is paired and sign-based: block − torch is negative at 6/6 points (p = 1/64); flash − torch is 4 positive / 6 negative over ten points — no consistent sign. The FA2 arm removed the systematic deficit; what remains is the metric's chaos.
@@ -284,20 +327,26 @@ jammi's math is right; its bf16 backward was 6.5× further from truth than torch
 
 ## 7. How to prove a fused kernel
 
-Each rule carries the escape that paid for it.
+Each rule cites the `cuda-kernel-guide.md` §3 discipline it is an instance of, the mechanical
+oracle-standard check that verifies conformance to it, and the escape that paid for it. `KO` is
+`pending check_kernel_oracles.py` until `ci/kernel-oracle-standard` lands on main; a rule with no
+close §3 analog (2, 12 — this guide's own additions, not yet folded into the kernel guide) prints
+`—`.
 
-1. **Two references; never mixed.** Semantic/rounding parity targets torch/HF with `attn_implementation="eager"` — the model's call path — and PEFT for the LoRA epilogue. The throughput bar is torch-sdpa. FA2 op parity is torch's vendored FA2 kernel. Eager scores 0.916 vs f32 truth and sdpa 0.817; declaring sdpa "the reference" would have invalidated every rounding decision. *Agreement is not accuracy*: jammi-eager is never a reference for jammi-fused unless it was pinned to torch-eager at that site.
-2. **The oracle lives in the crate that owns the arm.** `jammi-kernels` is a leaf; its "eager parity" tests compare a kernel to an in-test reimplementation updated in the same diff — reverting production left them green (#382's first oracles were tautological). The biting tests call the real `LayerNorm::slow` and `RotaryEmbedding::apply` in `jammi-encoders`.
-3. **Same-build forced-arm A/B, elementwise, across a shape sweep including batch 1.** Compare loss *sequences* elementwise; a loss *value* is chaotic. This caught esc-044 at b8·s512 (b8·s128 hid it) and a second defect at b1·s512. Its limit is esc-046: both arms carrying the same deviation.
-4. **RED controls per leg, conjunctive, with a printed magnitude.** Every leg calls `assert_forced_defect_exceeds_bound` with a *real semantic mutant* reached through the op's public surface — never by editing the test's own copy of the array (what the 26-site helper it replaced did). A control must assert on *its* leg: the FA2 controls were `!out_ok || !dqkv_ok` and the gradient arm had never fired. The fix asserts `out_ok && !dqkv_ok` on a backward-only window drop: dqkv 0.360 vs bound 0.00196, ~183× RED, GREEN with the injection off. Controls must be *measured on hardware*: a dropped-scale control was inside its bound on a real GPU ("a magnitude bound cannot see a semantic scale defect whose output stays a bounded convex combination of V").
-5. **No absolute floors.** The pre-#386 bf16 legs bounded with `2·2⁻⁷·max(|c|, |g|, 1.0)` — a floor of 0.0156 for every element below 1.0. esc-044's signature fit inside a `7·ulp(max)` floor. Bounds are now per element and relative, with any near-zero floor *measured* from the same run.
-6. **Bounds hold off-sample.** The FA2 encoder oracle's max bounds (2.3 / 7.0) were fitted to seeds 201–208; fresh seeds gave 7.18 and 16.08 (false RED) and overlapped the mutants. Deleted, not re-fitted; the 8-seed mean bounds remain, mutants clearing them 4.6–125×.
-7. **Live signal.** A gradient leg used a loss that was identically the batch size (`dL/dθ ≡ 0`); a real mutant *improved* and passed. Fixed with a seed-keyed random cotangent and Σ|reference| > 0. ZerosB LoRA init is the same class at the fixture level.
-8. **Unrun is RED.** CUDA tests skip on a GPU-less host — unless `JAMMI_REQUIRE_CUDA` / `JAMMI_REQUIRE_FLASH` is set, in which case a missing device panics. The pod lane sets it. Zero dispatch is RED.
-9. **Producers for every number.** A doc comment with a precise number must cite the test or artifact that produced it (`check_doc_numbers_have_producers.py`, #384). A cuda-run artifact must carry `git_sha`, box, producer invocation and per-test results, with the SHA an ancestor of the branch (`check_cuda_run_artifacts.py`, #379): the repo's only committed b8·s512 artifact at one point was a green, provenanced record of the *defective* pre-esc-044 build.
-10. **The two-term Higham bound, per leg.** `bound = k_rel·ulp(|r|) + k_abs·ulp(operand amplitude)`; the absolute term sits at the operands' scale because an n-term reduction's error is bounded by its operands regardless of how small the cancelled sum lands. `k_abs` per leg by term count (3 elementwise, 8 GeGLU/erff, 24 LayerNorm reductions); one shared value dominated the elementwise legs 6:1.
-11. **Cotangent fixtures.** Under `dy = 1`, `round(dy·x)` collapses to `round(x)` — and LayerNorm's centered backward is identically zero, so the leg compared 0.0 to 0.0. Every backward leg seeds a fixed, sign-mixed, production-amplitude cotangent.
-12. **Mutation testing on touched files.** A crate-wide `cargo mutants` at the P2 tip found 99 survivors five audit rounds had missed. Copy mode, `CARGO_TARGET_DIR` unset.
+| # | rule | `cuda-kernel-guide.md` | KO | the escape that paid for it |
+|---|---|---|---|---|
+| 1 | Two references; never mixed — semantic/rounding parity targets torch/HF `eager` (the model's call path) and PEFT for the LoRA epilogue; the throughput bar is torch-sdpa; FA2 op parity is torch's vendored FA2 kernel | §3.3 agreement is not accuracy | pending check_kernel_oracles.py | declaring sdpa "the reference" would have invalidated every rounding decision; jammi-eager is never a reference for jammi-fused unless pinned to torch-eager at that site |
+| 2 | The oracle lives in the crate that owns the arm | — | pending check_kernel_oracles.py | #382's first oracles compared a kernel to an in-test reimplementation updated in the same diff — reverting production left them green; the biting tests call the real `LayerNorm::slow` / `RotaryEmbedding::apply` in `jammi-encoders` |
+| 3 | Same-build forced-arm A/B, elementwise, across a shape sweep including batch 1 — compare loss *sequences*, never a loss *value* | §3.6 the learning gate | pending check_kernel_oracles.py | caught esc-044 at b8·s512 (b8·s128 hid it) and a second defect at b1·s512; its limit is esc-046, where both arms carry the same deviation |
+| 4 | RED controls per leg, conjunctive, with a printed magnitude — a *real semantic mutant* through the op's public surface, never an edit to the test's own copy of the array; a control must assert on *its own* leg, measured on hardware | §3.7 write comparisons affirmatively | pending check_kernel_oracles.py | the FA2 controls were `!out_ok \|\| !dqkv_ok` and the gradient arm had never fired; the fix asserts `out_ok && !dqkv_ok` on a backward-only window drop, GREEN with the injection off; a dropped-scale control was inside its bound on real hardware |
+| 5 | No absolute floors — bounds are per element and relative, with any near-zero floor *measured* from the same run | §3.8 no absolute ULP floor | pending check_kernel_oracles.py | the pre-#386 bf16 legs bounded with a fixed floor for every element below 1.0; esc-044's signature fit inside it |
+| 6 | Bounds hold off-sample, not fitted to the seeds on hand | §3.2 key the oracle on growth against the same run's own r(1), never a fitted constant | pending check_kernel_oracles.py | the FA2 encoder oracle's seed-fitted bounds gave false RED on fresh seeds and overlapped the mutants; deleted, not re-fitted |
+| 7 | Live signal — the fixture's own cotangent/gradient must be nonzero before a mutant can be seen | §3.5 zero dispatch is RED (same failure shape one level up: a leg that cannot register a defect) | pending check_kernel_oracles.py | a gradient leg's loss was identically the batch size; a real mutant *improved* and passed; fixed with a seed-keyed random cotangent and a nonzero reference sum |
+| 8 | Unrun is RED — a GPU-less host must never silently pass as green | §3.5 zero dispatch is RED | pending check_kernel_oracles.py | CUDA tests skip on a GPU-less host unless `JAMMI_REQUIRE_CUDA`/`JAMMI_REQUIRE_FLASH` is set, in which case a missing device panics instead of reading green |
+| 9 | Producers for every number — a doc comment or artifact must cite what produced it | §3.9 no number without a producer | pending check_kernel_oracles.py | the repo's only committed b8·s512 artifact once provenanced the *defective* pre-esc-044 build |
+| 10 | The two-term Higham bound, per leg — a relative term plus an absolute term at the operands' own scale | §3.8 no absolute ULP floor (the two-term form is how the floor is derived, not assumed) | pending check_kernel_oracles.py | one shared absolute term dominated the elementwise legs until split by reduction term count |
+| 11 | Cotangent fixtures — fixed, sign-mixed, production-amplitude, never `dy = 1` | §3.4 test at production shape and amplitude | pending check_kernel_oracles.py | under `dy = 1`, LayerNorm's centered backward is identically zero and the leg compared 0.0 to 0.0 |
+| 12 | Mutation testing on touched files | — | pending check_kernel_oracles.py | a crate-wide `cargo mutants` at the P2 tip found survivors five audit rounds had missed |
 
 > **The principle under all of it.** An acceptance oracle is a claim that a defect would be caught, not that a number was computed. Before it may gate, it must be shown to be in a state where the defect it excludes could register. Every apparatus failure above — constant loss, bound wider than the metric's range, seed-fitted bound, a leg the defect does not reach, a control perturbing the test rather than the producer, a control vacuous on hardware, a skip that reads green — is that one bug. The FA2 kernel was verified once and its oracle rebuilt six times; the gate that ends that loop is a checklist the auditor verifies conformance to (`s4:22`; the mechanical subset is landing as `check_kernel_oracles.py`).
 
@@ -307,10 +356,12 @@ Each rule carries the escape that paid for it.
 
 ## 8. Measuring honestly
 
-- **Exclusive box, timing lock.** Concurrent agent builds moved the b8·s512 number by 10–12 ms (three times the exclusive-box band of 0.58%).
-- **Ratios travel across boxes; milliseconds do not.** The 0.937× headline (SXM4, torch cu130) and the 1.071× sweep (PCIe, torch cu126) are different GPUs and torch builds; each is same-box against its own torch re-run. The alias "a100b" named three physical pods across sessions.
+Three of the disciplines below are general (they apply to any fused-kernel benchmark, not just this
+track) and now live in `cuda-kernel-guide.md` §4: exclusive box + timing lock; ratios travel across
+boxes while milliseconds do not; attribute a kernel-time delta by grid, not by launch count. What
+stays here is unique to this track's own runs:
+
 - **VRAM is per box** (14.65 GB on driver 570 vs 16.36 GB on driver 595 for the same build). Torch 2.11 vs 2.13 changes nothing same-box (0.642 vs 0.643). A cu130 wheel on a driver-570 box silently runs on CPU.
-- **Attribute by grid, not launch count**; element mass × the removed family's own bandwidth. Launch-count averages across unequal shapes were wrong every time.
 - **Micro-benchmarks:** nothing allocated in the timed region (a 151 MB allocation read 5% of roofline where the kernel ran at 53–65%); per-iteration sync; ≥20 warmups, ≥200 iterations; min and median; run twice. Always end-to-end beside isolated.
 - **Flag spreads, never smooth them.** The committed sweep prints the b8·s128 torch spread and the earlier 0.950× reading.
 - **The product step is heavier than the bench step:** the trainer always clips (+12.7 ms at s512); every headline ratio is the unclipped bench step. Recorded, not hidden.
@@ -335,12 +386,19 @@ Each rule carries the escape that paid for it.
 | b8·s512, dropout 0 | s/step | VRAM | box |
 |---|---:|---:|---|
 | eager, 2026-08-23 | OOM | — | PCIe |
+<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger -->
 | C-series end | 1.083–1.096 | 77.5–78.8 GB | PCIe |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-p2-5932520-a100-sxm4.json#/bench_legs/4/s_per_step_p50; c2=crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-p2-5932520-a100-sxm4.json#/bench_legs/4/peak_vram_bytes as GB -->
 | P1 + P2 | 0.7817 | 39.58 GB | SXM4 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-p3-e32ed90-a100-sxm4.json#/bench_legs/5/s_per_step_p50; c2=crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-p3-e32ed90-a100-sxm4.json#/bench_legs/5/peak_vram_bytes as GB -->
 | + P3 (defective bwd) | 0.7742 | 17.06 GB | SXM4 |
+<!-- claims: c1=ledger; c2=ledger; c3=ledger; c4=ledger; c5=ledger; c6=ledger -->
 | + esc-044 fix, exclusive box | 0.6682 ± 0.002 | 14.65 GB | a100 / drv 570; torch 0.4292 → 0.642× |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-cast-w1-80f02fb-a100-sxm4.json#/legs/b8_s512_fused_r1/s_per_step_p50; c2=ledger -->
 | + cast W1 (#377) | 0.6349 | +0.3 GB | SXM4 |
+<!-- claims: c1=legacy(crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-adamw-d959805-a100-sxm4.json#/a100b_full_step_ab_reference/summary/s512/fused_p50_r1_r2/0); c2=legacy(crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-adamw-d959805-a100-sxm4.json#/a100b_full_step_ab_reference/summary/s512/disabled_eager_p50_r1_r2/0) -->
 | + AdamW (#380) | 0.6589 (from an eager arm of 0.6759 — a base that predates W1) | — | timing box |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json#/shapes/b8s512/stacked_p50_min_s; c2=crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json#/shapes/b8s512/legs/stacked_r1/peak_vram_bytes as GB; c3=crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json#/shapes/b8s512/torch_p50_min_s; c4=crates/jammi-kernels/artifacts/cuda-runs/2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie.json#/shapes/b8s512/ratio_torch_over_stacked -->
 | + FA2, stacked (#389) | **0.4212** | 14.55 GB | a100c PCIe; torch 0.4512 → **1.071×** |
 
 Rows are not one same-box chain; each row's comparison is in its box column.

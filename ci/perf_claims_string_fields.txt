@@ -1,0 +1,13 @@
+# Closed registry of string-valued computed-family leaves in the tracked
+# cuda-run tree (ci/scripts/check_perf_claims.py's round-4 value rule
+# structurally cannot value-check a free-text field — this registry is
+# the only mechanical guard against a free aggregate binding cleanly
+# beside a hand-written range). Format: `<path>#<pointer> | <reason>`.
+# check_string_field_registry() (part of the bare `check_perf_claims.py`
+# run) REDs on any string-valued delta*/ratio*/speedup*/*_pct/spread*
+# leaf in the tracked tree that is NOT listed here, and on any listed
+# entry that no longer exists as a string leaf. Growing this file is a
+# gate-adjacent, human-reviewed change (ci/scripts/check_*.py glob).
+crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-cast-w1-80f02fb-a100-sxm4.json#/peak_vram_bytes_by_leg/b8_s512/delta_gb | hand-written range "fused - disabled = +0.235 to +0.369 GB (fused higher both reps)" -- two measured reps, no single bindable number.
+crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-cast-w1-80f02fb-a100-sxm4.json#/peak_vram_bytes_by_leg/b8_s128/delta_gb | hand-written range "~0, within run-to-run noise (fused LOWER in r1, essentially equal in r2)" -- no consistent direction at this shape, no single bindable number.
+crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-flash-arm-encoder-oracle-4ad2cab-a100-sxm4.json#/block3_vram_attribution/reference_numbers_this_branch_already_committed/delta_gb | hand-written range "1.8-2.7 GB" over the flash-vs-block VRAM attribution across two runs, no single bindable number.

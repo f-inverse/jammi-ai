@@ -454,6 +454,30 @@ class TestMarkerParsing(unittest.TestCase):
         with self.assertRaises(ko.OracleError):
             ko.parse_marker_line(line, "fixture.rs", 1)
 
+    def test_marker_forged_inside_a_raw_string_does_not_parse(self) -> None:
+        """Round-7 audit advisory (a): `parse_markers` scans `_strip_
+        strings_only`'s view, not raw text — a `//! oracle-cell:
+        ... control=none:fake` FORGED inside a raw string's CONTENT (never
+        a real doc comment at all) must not be able to declare a real op
+        DECLARED_UNCONTROLLED via a fabricated `control=none` opt-out.
+        """
+        src = (
+            'const S: &str = r#"//! oracle-cell: op=rope_fused leg=fwd '
+            "dtype=f32 bounds=TOL control=none:fake derived-on=none "
+            'asserted-on=none"#;\n'
+        )
+        markers = ko.parse_markers(src, "fixture.rs")
+        self.assertEqual(markers, [])
+
+    def test_real_marker_still_parses_through_strip_strings_only(self) -> None:
+        src = (
+            "//! oracle-cell: op=rope_fused leg=fwd dtype=f32 bounds=TOL "
+            "control=none:documentation_only derived-on=none asserted-on=none\n"
+        )
+        markers = ko.parse_markers(src, "fixture.rs")
+        self.assertEqual(len(markers), 1)
+        self.assertEqual(markers[0].op, "rope_fused")
+
 
 class TestKo2(unittest.TestCase):
     def test_control_covering_every_bound_is_clean(self) -> None:
@@ -2057,26 +2081,64 @@ class TestTokenizerCommentStringInvariant(unittest.TestCase):
         with self.assertRaises(ko.OracleError):
             ko.find_fns(src, "a.rs")
 
-    def test_every_comment_token_is_verbatim_in_strip_strings_only_on_real_tree(self) -> None:
+    def test_string_content_stays_blanked_in_strip_strings_only_independently_verified(self) -> None:
+        """Round-7 audit item (c): the PRIOR version of this test iterated
+        `_tokenize_rust`'s OWN token classification and checked
+        `_render_tokens` obeyed it — tautological (the auditor's M1
+        mutant: the plain-string branch in `_tokenize_rust` emitting
+        `_TOK_COMMENT` instead of `_TOK_STRING` changes what tokens EXIST,
+        so a loop driven by that same classification never visits the
+        broken span and still passes). This version identifies STRING
+        positions via TWO sources that never touch `_tokenize_rust`:
+        `_strip_rust` (blanks comments AND strings) and `_strip_comments_
+        only_independent` (a deliberately SEPARATE, simpler scanner with
+        NO string/char state at all, blanking ONLY comments) — a position
+        blanked by the first but NOT the second is, independently, inside
+        a STRING (or char literal). M1 fails this: a plain string wrongly
+        tagged `_TOK_COMMENT` is rendered VERBATIM by `_strip_strings_
+        only` (comments are kept there), leaking its content through at
+        exactly these positions.
+        """
         texts = ko.scan_files()
-        mismatches = []
+        leaks = []
         for label, src in texts.items():
+            rust_stripped = ko._strip_rust(src)
+            comments_only = ko._strip_comments_only_independent(src)
             keep = ko._strip_strings_only(src)
-            for kind, start, end, _cs, _ce in ko._tokenize_rust(src):
-                if kind == ko._TOK_COMMENT and keep[start:end] != src[start:end]:
-                    mismatches.append((label, src.count("\n", 0, start) + 1))
-        self.assertEqual(mismatches, [], f"{len(mismatches)} comment token(s) not byte-identical")
+            n = min(len(rust_stripped), len(comments_only), len(keep), len(src))
+            for i in range(n):
+                c = src[i]
+                if c in " \t\n":
+                    continue
+                is_string_pos = rust_stripped[i] != c and comments_only[i] == c
+                if is_string_pos and keep[i] == c:
+                    leaks.append((label, src.count("\n", 0, i) + 1, c))
+        self.assertEqual(leaks[:5], [], f"{len(leaks)} string-content position(s) leaked verbatim")
 
-    def test_strip_rust_still_byte_identical_to_pre_refactor_shape_on_real_tree(self) -> None:
-        # The tokenizer refactor must not change `_strip_rust`'s own
-        # output at all — only `_strip_strings_only`'s comment handling
-        # changes. Spot-checks the same length/line-count/fn-count
-        # invariants `find_fns` itself depends on, on the real tree.
+    # Round-7 audit item (b): the prior version of this test only checked
+    # length/newline-count preservation, which a WRONG (but still
+    # length-preserving) blanking bug would pass trivially. A real golden:
+    # SHA256 over every scanned file's own `_strip_rust` output (sorted by
+    # label, `\0`-separated) — any change to `_strip_rust`'s ACTUAL
+    # blanked/kept content on the real tree, not just its shape, moves this
+    # hash. Update `_STRIP_RUST_GOLDEN_HASH`/`_STRIP_RUST_GOLDEN_FILE_COUNT`
+    # DELIBERATELY (a reviewed PR diff) when `_strip_rust`'s real behavior
+    # is meant to change — never to silence a failure.
+    _STRIP_RUST_GOLDEN_HASH = "47a0b46335197c0e4a9080ac855fbd9dc1a7867c442a2bf489d318dd43a01f34"
+    _STRIP_RUST_GOLDEN_FILE_COUNT = 36
+
+    def test_strip_rust_output_matches_the_golden_hash_on_real_tree(self) -> None:
+        import hashlib
+
         texts = ko.scan_files()
-        for label, src in texts.items():
-            stripped = ko._strip_rust(src)
-            self.assertEqual(len(stripped), len(src), label)
-            self.assertEqual(stripped.count("\n"), src.count("\n"), label)
+        self.assertEqual(len(texts), self._STRIP_RUST_GOLDEN_FILE_COUNT)
+        h = hashlib.sha256()
+        for label in sorted(texts):
+            h.update(label.encode())
+            h.update(b"\0")
+            h.update(ko._strip_rust(texts[label]).encode())
+            h.update(b"\0")
+        self.assertEqual(h.hexdigest(), self._STRIP_RUST_GOLDEN_HASH)
 
     def test_tokenize_rust_distinguishes_comment_from_string(self) -> None:
         src = 'fn a() {}\n// a real comment\nlet s = "blank me";\n'

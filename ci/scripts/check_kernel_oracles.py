@@ -420,8 +420,21 @@ def parse_marker_line(line: str, file_label: str, line_no: int) -> OracleCellMar
 
 
 def parse_markers(text: str, file_label: str) -> list[OracleCellMarker]:
+    """Round-7 audit advisory (a): scans `_strip_strings_only(text)` — NOT
+    raw text — so an `oracle-cell:` marker FORGED inside a raw string's
+    content (`let s = r#"//! oracle-cell: op=x leg=y ... control=none:
+    fake"#;`) cannot declare a real op DECLARED_UNCONTROLLED (KO-5/
+    reconciliation would then silently accept a fabricated control=none
+    opt-out that was never a real doc comment). A genuine `//!`/`///`
+    marker is itself a COMMENT, which `_strip_strings_only` leaves
+    verbatim (only string/char-literal CONTENT is blanked), so it still
+    parses. Line numbers/text used for parsing come from this view, not
+    raw text — the two are byte-identical everywhere except blanked
+    string interiors, so a real marker's own line text is unaffected.
+    """
+    stripped = _strip_strings_only(text)
     markers: list[OracleCellMarker] = []
-    for i, line in enumerate(text.splitlines(), start=1):
+    for i, line in enumerate(stripped.splitlines(), start=1):
         if "oracle-cell:" in line:
             markers.append(parse_marker_line(line, file_label, i))
     return markers

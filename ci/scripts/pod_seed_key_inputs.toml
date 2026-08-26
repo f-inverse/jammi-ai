@@ -148,6 +148,21 @@ notes = [
 source = "crates/jammi-wire/build.rs"
 inputs = ["PROTOC"]
 
+[jammi_bench_build_rs]
+# Added post-#394 merge (perf-unification phase 1, build-time provenance):
+# the FULL vendored-package scan (e-full-i)/(e-full-ii) — not the narrow
+# (i)/(ii) scan this file's header "Scope note" describes, which stays
+# limited to jammi-kernels/jammi-wire/bindgen_cuda by name — walks EVERY
+# package in the resolved graph with a custom-build target (see
+# pod_seed_scan_all_vendored_buildrs's own citation), so jammi-bench's own
+# build.rs is in scope automatically the moment it exists; this section is
+# what makes that scan's one genuine literal resolve.
+source = "crates/jammi-bench/build.rs"
+inputs = ["JAMMI_BUILD_SHA"]
+notes = [
+  "build.rs:265,284 — the ONLY env::var() read in this file; an already-set JAMMI_BUILD_SHA is accepted verbatim iff it is exactly 40 lowercase hex chars, else this build script falls back to a live `git rev-parse HEAD` + `git status` read (not itself env-shaped) and finally the literal \"unknown\". TARGET/PROFILE (build.rs:293,297) are cargo-standard build-script env vars already covered by [non_key].vars, not this crate's own input.",
+]
+
 [cc_1_2_57]
 # Hand-enumerated — the ONE section the automated STATIC scan (i)/(ii)
 # cannot verify (see this file's header "Scope note" for why a blanket

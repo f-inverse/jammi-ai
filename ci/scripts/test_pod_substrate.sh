@@ -56,7 +56,14 @@
 # tiny, offline `cargo build`/`cargo build --release`/`cargo clean` cycle
 # (a two-member scratch workspace under `mktemp -d`, no network — Cargo
 # resolves nothing beyond std) — everything else in this suite still avoids
-# cargo build/test/clippy entirely (stubbed or structural).
+# cargo build/test/clippy entirely (stubbed or structural). That cycle also
+# unsets RUSTFLAGS/CARGO_ENCODED_RUSTFLAGS/CARGO_BUILD_RUSTFLAGS before
+# invoking cargo: those are process env vars, not directory-scoped like
+# .cargo/config.toml, so the fixture would otherwise inherit whatever
+# linker/warnings posture the CALLING job exports (e.g. a bare
+# ubuntu-latest guard runner's own -fuse-ld=mold RUSTFLAGS, which fails to
+# link when mold is not on that runner's PATH — mold only ships inside the
+# jammi-ai-ci container image other jobs build in).
 set -uo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -2114,7 +2121,28 @@ EOF
   echo 'fn main() { jammi_zzlib::f(); }' > "$Q_ROOT/ws/jammi-zzbin/src/main.rs"
 
   Q_TGT="$Q_ROOT/tgt"
-  (cd "$Q_ROOT/ws" && CARGO_TARGET_DIR="$Q_TGT" cargo build -q \
+  # This fixture build must be hermetic to the CALLER's linker/warnings
+  # posture: `RUSTFLAGS` (unlike `.cargo/config.toml`) is a process env var,
+  # not directory-scoped, so a `cargo build` under this throwaway
+  # `mktemp -d` workspace still inherits whatever the invoking shell
+  # exports — including this guard leg's own job-scoped `RUSTFLAGS` (see
+  # .github/actions/setup-rust-ci's "-D warnings -C link-arg=-fuse-ld=mold"
+  # default, exported via $GITHUB_ENV for the whole "pod build substrate"
+  # job). That default is correct INSIDE the `jammi-ai-ci` container image
+  # (which bakes in mold — see this repo's own Dockerfile builder-stage
+  # comment) but this guard leg runs on a bare `ubuntu-latest` runner with
+  # no `container:` (the ONE guard leg that needs a real toolchain at all —
+  # see the "Rust toolchain (pod build substrate only)" step), so `mold` is
+  # not guaranteed to be on PATH there and `cc -fuse-ld=mold` fails
+  # ("collect2: fatal error: cannot find 'ld'") even though the exact same
+  # fixture links fine locally/on a pod with mold installed. This leg tests
+  # pod_seed_assert_member_free's artifact-detection logic, not the
+  # project's own reproducible-build posture, so it must not depend on
+  # optional host tooling — unset the inherited flags and let `cc` pick
+  # its own default linker.
+  (cd "$Q_ROOT/ws" \
+     && unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS \
+     && CARGO_TARGET_DIR="$Q_TGT" cargo build -q \
      && CARGO_TARGET_DIR="$Q_TGT" cargo build --release -q) >/dev/null 2>"$Q_ROOT/build.err"
   q_build_rc=$?
   if [ "$q_build_rc" -ne 0 ]; then
@@ -2153,7 +2181,12 @@ DRV
       bad "(q/A2) expected rc=1 with all ${q_expected_count:-0} real artifacts flagged (rc=$q_before_rc, missing=$q_missing): $(cat "$Q_ROOT/before.out")"
     fi
 
-    (cd "$Q_ROOT/ws" && CARGO_TARGET_DIR="$Q_TGT" cargo clean --workspace --frozen -q \
+    # `cargo clean` never invokes the linker, but stays symmetric with the
+    # build above (unset, not just left alone) so a future addition to this
+    # block can't silently reintroduce the inherited-RUSTFLAGS class here.
+    (cd "$Q_ROOT/ws" \
+       && unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS \
+       && CARGO_TARGET_DIR="$Q_TGT" cargo clean --workspace --frozen -q \
        && CARGO_TARGET_DIR="$Q_TGT" cargo clean --workspace --release --frozen -q) >/dev/null 2>"$Q_ROOT/clean.err"
     q_clean_rc=$?
     rm -rf "$Q_TGT"/*/incremental

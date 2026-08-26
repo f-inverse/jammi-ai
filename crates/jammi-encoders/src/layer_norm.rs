@@ -227,22 +227,33 @@ impl LayerNorm {
     /// `tests::layer_norm_slow_matches_truth_at_production_shape_seq128`/
     /// `_seq512` — see those tests' own printed mismatch counts for a
     /// reproducible figure (no number is hardcoded here; the committed
-    /// test is the producer). Every served bias-free (ModernBERT)
-    /// LayerNorm output on an F16/BF16 backbone — training-eager fallback
-    /// AND (through this same function) any `training=true` call that
-    /// misses the fused kernel's admission domain — therefore changes at
-    /// the ULP level; F32-backbone serving is UNCHANGED BY THIS SPECIFIC
-    /// DEFECT (`internal_dtype == x_dtype` there, so every `to_dtype` call
-    /// below is a same-dtype no-op) — but see the SECOND, orthogonal
-    /// divergence below, which is NOT dtype-scoped this way and DOES
-    /// change F32 (and F64) output. eval (`training == false`) is
-    /// UNCHANGED by this fix in call SHAPE (still routes to
-    /// `candle_nn::ops::layer_norm` for the biased fast path, never
-    /// `slow()`, when biased+eval+contiguous), but the biased eval fast
-    /// path itself was never affected by this defect (candle's fused
-    /// `layer_norm` already rounds once) — this fix changes ONLY
-    /// `slow()`'s own output, i.e. the bias-free training-mode paths and
-    /// any biased non-fast-path call.
+    /// test is the producer). This divergence is only OBSERVABLE where
+    /// `internal_dtype != x_dtype` (an F16/BF16 backbone; F32/F64 make
+    /// every `to_dtype` call below a same-dtype no-op) — but that is a
+    /// DTYPE gate, not a training-vs-eval one. `forward` (above) names
+    /// only two arms explicitly: `(Some(bias), false) if
+    /// x.is_contiguous()` (candle's fused biased-eval fast path,
+    /// `candle_nn::ops::layer_norm`, which already rounded once and so was
+    /// never affected by this defect) and `(None, true)` (the fused-kernel
+    /// training arm, which itself falls back to THIS function outside the
+    /// fused domain). EVERY OTHER `(bias, training)` combination —
+    /// `(None, false)`, bias-free EVAL, included — falls through the
+    /// catch-all `_ => self.slow(x)`. Every ModernBERT LayerNorm is
+    /// bias-free (`ModernBertConfig` has no `norm_bias` field), so
+    /// ModernBERT's own eval/serving forward pass reaches `slow()` too,
+    /// not only its training paths. Every served bias-free (ModernBERT)
+    /// LayerNorm output on an F16/BF16 backbone — training-eager fallback,
+    /// any `training=true` call that misses the fused kernel's admission
+    /// domain, AND eval/serving itself (through this same catch-all) —
+    /// therefore changes at the ULP level; F32-backbone serving is
+    /// UNCHANGED BY THIS SPECIFIC DEFECT (`internal_dtype == x_dtype`
+    /// there, so every `to_dtype` call below is a same-dtype no-op) — but
+    /// see the SECOND, orthogonal divergence below, which is NOT
+    /// dtype-scoped this way and DOES change F32 (and F64) output, on
+    /// every path that reaches `slow()`, eval/serving included. The ONLY
+    /// case this fix changes neither in call SHAPE nor in numerics is the
+    /// biased, contiguous, eval fast path — but no ModernBERT LayerNorm is
+    /// ever biased, so that carve-out never covers ModernBERT.
     ///
     /// A SECOND rounding-placement divergence, orthogonal to the one
     /// above: this function previously computed `centered.broadcast_div(&
@@ -269,16 +280,23 @@ impl LayerNorm {
     /// measures live (`rows=256, hidden=1024`, `n=262144`), the division
     /// form disagrees with the reciprocal form on `74734/262144`
     /// elements — see that test's own printed count (no number is
-    /// hardcoded here; the committed test is the producer) and its
-    /// tracked FNV-1a hash of `slow()`'s real F32 output for a
-    /// bit-repro anchor. On the bf16/f16 arms, where `internal_dtype ==
-    /// F32` regardless of this fix, this SAME placement change is a much
-    /// smaller, budget-visible effect (`REDUCTION_ORDER_BUDGET_FRACTION`'s
-    /// doc: the bias-free residual moves `6 → 5` at seq128 and `38 → 37`
-    /// at seq512 when this line is present vs. reverted to division —
-    /// both DOWN, and both comfortably inside that budget either way, so
-    /// no bf16/f16 test alone would catch a regression here; the F32 test
-    /// above is what actually discriminates this placement).
+    /// hardcoded here; the committed test is the producer). Since
+    /// bias-free eval (the ModernBERT serving path) reaches `slow()`
+    /// through the catch-all named above, this is F32 ModernBERT's SERVED
+    /// EMBEDDING output changing bitwise on `74734/262144` elements at
+    /// this production shape — TOWARD torch's own reciprocal-then-multiply
+    /// placement, away from the division form this line replaces. On the
+    /// bf16/f16 arms, where `internal_dtype == F32` regardless of this
+    /// fix, this SAME placement change is a much smaller, budget-visible
+    /// effect: `tests::layer_norm_slow_matches_truth_at_production_shape_seq128`/
+    /// `_seq512` (`REDUCTION_ORDER_BUDGET_FRACTION`'s doc) print BOTH the
+    /// division-form and the reciprocal-form (`slow()`'s real output)
+    /// mismatch count against the same truth reference on every run — see
+    /// those tests' own printed pair for the live figures (no number is
+    /// hardcoded here either); both are comfortably inside that budget
+    /// either way, so no bf16/f16 test alone would catch a regression
+    /// here — the F32 test above is what actually discriminates this
+    /// placement.
     ///
     /// Domain check (K2): `weight`'s (and, when biased, `bias`'s) dtype
     /// must match `x`'s own dtype — mirroring only the MATCHING half of
@@ -745,6 +763,49 @@ mod tests {
         out
     }
 
+    /// The DIVISION-form twin of [`scalar_layer_norm_truth_bf16`] — the
+    /// SAME f32-accumulated, ascending-index fold, differing ONLY in
+    /// `centered / std` (this function, the pre-round-3 `slow()`
+    /// placement) vs `centered * (1.0 / std)`
+    /// ([`scalar_layer_norm_truth_bf16`], today's placement). Kept ONLY so
+    /// [`layer_norm_slow_matches_truth_at_production_shape`] can measure
+    /// and print the bf16 reciprocal-vs-division residual live, against
+    /// the SAME truth reference, from the SAME committed test run —
+    /// `slow()`'s own doc cites THIS test's printed pair (not a
+    /// hand-computed or eyeballed figure) for how much smaller this
+    /// placement's effect is on the bf16 arm than its F32 counterpart (see
+    /// `tests::slow_f32_reciprocal_form_is_bit_exact_and_diverges_from_division`).
+    fn scalar_layer_norm_truth_bf16_division_form(
+        x: &[bf16],
+        gamma: &[bf16],
+        hidden: usize,
+        eps: f64,
+    ) -> Vec<bf16> {
+        let rows = x.len() / hidden;
+        let eps = eps as f32;
+        let mut out = Vec::with_capacity(x.len());
+        for r in 0..rows {
+            let row = &x[r * hidden..(r + 1) * hidden];
+            let mut sum = 0f32;
+            for v in row {
+                sum += v.to_f32();
+            }
+            let mean = sum / hidden as f32;
+            let mut sumsq = 0f32;
+            for v in row {
+                let d = v.to_f32() - mean;
+                sumsq += d * d;
+            }
+            let variance = sumsq / hidden as f32;
+            let std = (variance + eps).sqrt();
+            for i in 0..hidden {
+                let xhat = (row[i].to_f32() - mean) / std;
+                out.push(bf16::from_f32(xhat * gamma[i].to_f32()));
+            }
+        }
+        out
+    }
+
     /// The PRE-FIX formula this commit removes: round `xhat` to bf16
     /// BEFORE multiplying by `gamma` — `bf16(bf16(xhat) * gamma)`, two
     /// rounding points instead of one. A deliberately WRONG
@@ -888,6 +949,21 @@ mod tests {
     /// non-vacuity (the fixture exercises the rounding-placement bug at
     /// all), not to pin an exact headroom multiple that would go stale
     /// on its own.
+    ///
+    /// The measured counts quoted above (`5`, `37`, and every other
+    /// mismatch figure this doc or `slow()`'s own doc cites) are
+    /// HOST-FOLD-SPECIFIC: they come from candle's `Tensor::sum_keepdim`,
+    /// whose CPU backend takes a SIMD-lane partial-sum reduction on
+    /// `neon`/`avx2`/`simd128` targets and a plain scalar fold otherwise
+    /// (`candle-core-0.11.0` `cpu/mod.rs::vec_sum`) — a genuinely
+    /// different (still IEEE-754-correct) fold order per host
+    /// architecture, not just a different compiler. None of these figures
+    /// are asserted as fixed constants anywhere in this file for exactly
+    /// that reason (a fixed cross-architecture hash of a SIMD-fold value
+    /// is not portable — see the F32 discriminator test's own history);
+    /// the `10×` headroom this budget is built from is what absorbs that
+    /// host-to-host drift, not an assumption that the exact counts are
+    /// architecture-invariant.
     const REDUCTION_ORDER_BUDGET_FRACTION: f64 = 3.529e-4;
 
     /// The BIASED arm's own reduction-order budget — the full torch form
@@ -1018,6 +1094,32 @@ mod tests {
              rounding-PLACEMENT regression the fix restores, not reduction-order noise"
         );
 
+        // Reciprocal-vs-division placement effect on THIS bf16 fixture,
+        // measured against the SAME truth reference as `mismatch_vs_truth`
+        // above (orthogonal to the double-rounding RED control below):
+        // `slow()`'s own doc cites this printed pair, live, rather than a
+        // hand-computed or hardcoded figure, for how much smaller this
+        // placement's effect is at bf16 (where `internal_dtype == F32`
+        // regardless of `x_dtype`) than at F32 itself (where it is the
+        // ONLY source of divergence — see
+        // `slow_f32_reciprocal_form_is_bit_exact_and_diverges_from_division`).
+        let division_form =
+            scalar_layer_norm_truth_bf16_division_form(&x_bf16, &g_bf16, hidden, eps);
+        assert!(
+            division_form.iter().all(|v| v.to_f32().is_finite()),
+            "division-form residual reference output must be finite before any bit compare"
+        );
+        let mismatch_division_form = division_form
+            .iter()
+            .zip(truth.iter())
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        println!(
+            "layer_norm_slow_matches_truth_at_production_shape(rows={rows}, hidden={hidden}): \
+             division-form vs truth mismatches = {mismatch_division_form}/{n} (reciprocal-form \
+             slow() vs truth mismatches = {mismatch_vs_truth}/{n})"
+        );
+
         // RED CONTROL (non-vacuity): the pre-fix double-rounding formula
         // must differ from truth on a stated, ASSERTED-POSITIVE count —
         // proving the fixture actually exercises the rounding-placement
@@ -1095,29 +1197,6 @@ mod tests {
         layer_norm_slow_matches_truth_at_production_shape(2 * 512, 1024, 0xC0FF_EE02);
     }
 
-    /// Deterministic FNV-1a over an f32 slice's raw bit patterns (family
-    /// J: a tracked expected value is checked against the SAME bytes every
-    /// run, not eyeballed from a printed float) — hashes `to_bits()` of
-    /// every element in slice order, so a single flipped ULP anywhere in
-    /// the fixture changes the hash. Used only by the F32
-    /// reciprocal-vs-division discriminator below, as a second, redundant
-    /// check that does not depend on recomputing the reference formula (a
-    /// future edit that changes `slow()` and its truth reference in
-    /// lock-step, keeping them mutually consistent but jointly wrong,
-    /// would still trip this fixed constant).
-    fn fnv1a_f32(values: &[f32]) -> u64 {
-        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-        const FNV_PRIME: u64 = 0x0100_0000_01b3;
-        let mut hash = FNV_OFFSET;
-        for v in values {
-            for byte in v.to_bits().to_le_bytes() {
-                hash ^= u64::from(byte);
-                hash = hash.wrapping_mul(FNV_PRIME);
-            }
-        }
-        hash
-    }
-
     /// An F32 reference for `slow()`'s bias-free epilogue that reuses
     /// candle's OWN `Tensor::sum_keepdim` for both mean and variance —
     /// the exact same reduction `slow()` performs internally — rather
@@ -1168,21 +1247,10 @@ mod tests {
         normalized.broadcast_mul(gamma).unwrap()
     }
 
-    /// Tracked expected value (family J: a seeded/bit-repro oracle) for
-    /// `slow()`'s real F32 output on the production-shape fixture below
-    /// (`rows=256, hidden=1024`, seed `0xF32B_EED1`/`0xF32B_EED2`) —
-    /// [`fnv1a_f32`] of the flattened output, printed and asserted by
-    /// [`slow_f32_reciprocal_form_is_bit_exact_and_diverges_from_division`].
-    /// A future accidental edit to BOTH `slow()` and
-    /// [`f32_rstd_multiply_truth`] that keeps them mutually consistent but
-    /// jointly wrong would still trip this fixed constant, since it does
-    /// not depend on recomputing the reference at all.
-    const EXPECTED_SLOW_F32_FNV1A: u64 = 0xa5bd_533d_3c3f_9c5b;
-
     /// The F32 discriminator for the reciprocal-vs-division rounding-
     /// PLACEMENT fix at `slow()`'s `rstd` line (family D/F/J): proves,
-    /// against a same-fold-order reference and a tracked bit hash, that
-    /// `slow()`'s F32 output actually depends on taking the reciprocal
+    /// against a same-fold-order reference, that `slow()`'s F32 output
+    /// actually depends on taking the reciprocal
     /// first rather than dividing — closing the mutation survivor found
     /// on `3b3dbde` (reverting the `rstd` line back to
     /// `centered.broadcast_div(&(variance + self.eps)?.sqrt()?)?` left
@@ -1273,25 +1341,6 @@ mod tests {
             "RED control is vacuous: the division form matched slow()'s reciprocal-form \
              output on every element -- this fixture does not exercise the \
              reciprocal-vs-division placement difference at F32 at all"
-        );
-
-        let hash_slow = fnv1a_f32(&slow_out);
-        let hash_div = fnv1a_f32(&div_out);
-        println!(
-            "slow_f32_reciprocal_form_is_bit_exact_and_diverges_from_division: \
-             slow() output fnv1a = {hash_slow:#018x}, division-form (RED control) \
-             fnv1a = {hash_div:#018x}"
-        );
-        assert_eq!(
-            hash_slow, EXPECTED_SLOW_F32_FNV1A,
-            "slow()'s tracked F32 output hash drifted from the committed expected value \
-             ({hash_slow:#018x} vs {EXPECTED_SLOW_F32_FNV1A:#018x}) -- either the fixture, \
-             `slow()`, or the reciprocal placement changed"
-        );
-        assert_ne!(
-            hash_div, EXPECTED_SLOW_F32_FNV1A,
-            "the division-form control must NOT match the tracked reciprocal-form hash, \
-             or this hash is not actually distinguishing the two placements"
         );
     }
 

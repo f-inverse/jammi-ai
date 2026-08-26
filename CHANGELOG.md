@@ -33,9 +33,18 @@ workspace ships every publishable crate at the same
   double-rounding fix is observable only on an F16/BF16 backbone (the
   CUDA/reduced-precision training and serving path)** — F32 serving is
   byte-for-byte unchanged BY THIS FIX, since every `to_dtype` call it adds
-  is a same-dtype no-op there. Every served bias-free (ModernBERT)
-  LayerNorm output and every RoPE-applied Q/K tensor computed through
-  these eager paths at reduced precision now rounds the same way torch/HF
+  is a same-dtype no-op there. Bias-free EVAL reaches `slow()` too, not
+  only the training paths: `LayerNorm::forward`'s only two named match
+  arms are the biased-eval fast path (`candle_nn::ops::layer_norm`) and
+  the bias-free training arm (which itself falls back to `slow()` outside
+  the fused kernel's admission domain) — every other `(bias, training)`
+  combination, including bias-free EVAL, falls through the catch-all `_
+  => self.slow(x)`; since `ModernBertConfig` has no `norm_bias` field,
+  every ModernBERT LayerNorm is bias-free, so ModernBERT's own eval/
+  serving forward pass reaches `slow()` through that catch-all. Every
+  served bias-free (ModernBERT) LayerNorm output and every RoPE-applied
+  Q/K tensor computed through these eager paths at reduced precision —
+  training AND eval/serving alike — now rounds the same way torch/HF
   does, rather than accumulating extra rounding error the fused kernel
   never had. Measured, reproducible divergence counts at production shape
   (`hidden=1024`, `batch=2`, `seq` in `{128, 512}`) are printed and
@@ -69,14 +78,21 @@ workspace ships every publishable crate at the same
   `layer_norm::tests::slow_f32_reciprocal_form_is_bit_exact_and_diverges_from_division`
   measures live (`rows=256, hidden=1024`), the division and reciprocal
   forms disagree on `74734/262144` elements (28.5%) — not a stray ULP.
+  Bias-free EVAL — the ModernBERT serving path — reaches `slow()` (see
+  the double-rounding fix above for why), so this is F32 ModernBERT's
+  actual served embedding output changing on `74734/262144` elements at
+  this production shape, TOWARD torch's reciprocal-then-multiply
+  placement, away from the division form this line replaces.
   `slow()`'s F32 output is now checked BIT-EXACT against a same-fold-order
-  (candle `sum_keepdim`) reciprocal-multiply reference, with a tracked
-  FNV-1a hash of the real output as a second, fixture-independent anchor;
-  the bf16/f16 arms above see a much smaller effect from this same line
-  (moves their already-budgeted residual by ±1 element at production
-  shape — see `REDUCTION_ORDER_BUDGET_FRACTION`'s doc), which is why a
-  dedicated F32 oracle exists rather than relying on the bf16 budget to
-  catch a regression here.
+  (candle `sum_keepdim`) reciprocal-multiply reference; the bf16/f16 arms
+  above see a much smaller effect from this same line —
+  `layer_norm::tests::layer_norm_slow_matches_truth_at_production_shape_seq128`/
+  `_seq512` print BOTH the division-form and the reciprocal-form (`slow()`'s
+  real output) mismatch count against the same truth reference on every
+  run, both comfortably inside `REDUCTION_ORDER_BUDGET_FRACTION`'s budget
+  either way (see that constant's own doc for the derivation) — which is
+  why a dedicated F32 oracle exists rather than relying on the bf16
+  budget to catch a regression here.
 
 ## [0.47.0] - 2026-07-17
 

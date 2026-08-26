@@ -868,6 +868,17 @@ jobs:
           # was proven only by hand, never standing.
           - name: CUDA run artifact schema self-test
             cmd: python3 ci/scripts/check_cuda_run_artifacts.py --self-test
+            # Same reason as the plain leg above: the GATE_INTRODUCTION_SHA
+            # anchor check (`check_gate_introduction_sha_anchor`) this
+            # suite drives against the REAL checkout's REAL history needs
+            # full history to compute this gate file's own first-
+            # introduction commit -- a shallow (fetch-depth 1) checkout
+            # would read that back as "not found"/"HEAD", a false mismatch
+            # against GATE_INTRODUCTION_SHA. The function itself also
+            # detects and refuses cleanly on a shallow checkout now (belt
+            # and braces, self-test-covered) -- this fetch_depth avoids
+            # ever exercising that refusal path in a REQUIRED CI leg.
+            fetch_depth: "0"
           # `check_cuda_run_artifacts.py --census` — falsifier F4 (contract
           # §6): every `s_per_step_p50`-carrying JSON object under a
           # `schema_version >= 2` top-level artifact's tree must be REACHED

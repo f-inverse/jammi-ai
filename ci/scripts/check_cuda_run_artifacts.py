@@ -665,8 +665,24 @@ def check_gate_introduction_sha_anchor(
     trusts) — never a second, independently-drifting source of truth.
     Editing `GATE_INTRODUCTION_SHA` at all is a `ci/scripts/check_cuda_run_
     artifacts.py` edit, i.e. SWARM_GATE_TOUCHED by construction, same as
-    every other change to this file's own rules."""
+    every other change to this file's own rules.
+
+    Checked BEFORE any `git log --follow` work, same discipline as
+    `run_gate`'s own shallow guard: a shallow checkout (`actions/checkout`'s
+    default `fetch-depth: 1`, or any `--depth 1` clone) makes `git log
+    --follow --diff-filter=A` read back only the single fetched commit —
+    on THIS gate file that commit is whatever HEAD happens to be, which is
+    never `GATE_INTRODUCTION_SHA` (a much older commit), so an unguarded
+    shallow call here would always misreport a false "does not match"
+    finding, indistinguishable from a genuine repoint without checking
+    first. `--self-test` calls this against the REAL checkout (never a
+    fixture repo — this gate file itself is not tracked inside a `--self-
+    test` fixture), so it needs this guard even though `run_gate`'s own
+    (plain-mode) shallow check never reaches this function at all (it
+    raises `ArtifactError` first)."""
     gate_file = gate_file if gate_file is not None else Path(__file__).resolve()
+    if is_shallow_repository(repo_root):
+        return [SHALLOW_CHECKOUT_MESSAGE]
     actual = _first_introduction_sha_for_path(gate_file, repo_root)
     if actual is None:
         return [
@@ -2132,6 +2148,26 @@ def self_test() -> int:
                     failures.append(
                         f"self-test FAILED: shallow-checkout ArtifactError had the wrong message: {exc}"
                     )
+
+            # `check_gate_introduction_sha_anchor` gets the SAME shallow
+            # guard, tested directly (never inferred from `run_gate`'s own
+            # check, which this function does not go through under
+            # `--self-test` — it is called standalone against the REAL
+            # checkout, see below). `gate_file` need not resolve to
+            # anything real here: the shallow check fires before it is
+            # ever touched. Reproduces the exact false-positive a real CI
+            # run hit: an unguarded call reported "does not match this
+            # gate file's own first-introduction commit" under a shallow
+            # clone instead of the named shallow-checkout reason.
+            got_anchor_shallow = check_gate_introduction_sha_anchor(
+                shallow_clone, shallow_clone / "check_cuda_run_artifacts.py", "0" * 40
+            )
+            if got_anchor_shallow != [SHALLOW_CHECKOUT_MESSAGE]:
+                failures.append(
+                    f"self-test FAILED: GATE_INTRODUCTION_SHA anchor under a shallow clone did not "
+                    f"return the named shallow-checkout reason (got a false 'does not match' instead "
+                    f"of refusing to evaluate): {got_anchor_shallow}"
+                )
 
     if failures:
         for f in failures:

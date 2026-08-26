@@ -9,17 +9,30 @@
 # conforming gate written as `match` instead of `if`).
 #
 # Each entry is verified at gate time to have the CANONICAL shape: a real
-# env-read (std::env::var_os/var/option_env!) of a JAMMI_REQUIRE_* name,
-# via `if` or `match`, whose taken-when-set branch is EXACTLY ONE
-# panic!/unreachable! statement — no .expect(, no closures, nothing else.
-# A line that fails that check is a registry FAIL naming the file/fn.
+# RUNTIME env-read (std::env::var_os/var — option_env! is a COMPILE-TIME
+# read and is never accepted) of a JAMMI_REQUIRE_* name, via `if` or
+# `match` (an `if` condition must be exactly `<read>.is_some()`/`.is_ok()`
+# — no trailing/leading condition; a `match` arm must be unguarded), whose
+# taken-when-set branch is EXACTLY ONE panic!/unreachable! statement — no
+# .expect(, no closures, nothing else. Verification is (file, fn)-SCOPED:
+# an entry only reviews the fn named `fn_name` DEFINED IN `file` itself
+# (never a same-named fn elsewhere), and fails if that file defines more
+# than one fn with that name (ambiguous — this scanner does not track
+# `mod` boundaries). A line that fails is a registry FAIL naming the
+# file:line and why. An exact duplicate `<file>::<fn_name>` line fails too.
 #
 # Adding a line here is a reviewed PR diff, same discipline as a citation
 # or a `no-producer:` opt-out — the registry may only grow by entries the
-# shape-check accepts.
+# shape-check accepts. A file that wants to call a SHARED helper it does
+# not itself define registers its own thin local wrapper of the same
+# canonical shape (gating is never cross-file by name alone).
 #
 # Format: one `<file-relative-to-repo-root>::<fn_name>` per line.
 
 crates/jammi-kernels/tests/cuda_parity.rs::cuda_device
 crates/jammi-kernels/tests/flash_smoke.rs::cuda_device
+crates/jammi-kernels/tests/flash_op_oracles.rs::cuda_device
+crates/jammi-kernels/tests/flash_torch_parity.rs::cuda_device
 crates/jammi-encoders/src/modernbert.rs::growth_oracle_cuda_device
+crates/jammi-encoders/src/modernbert.rs::flash_oracle_require_gate
+crates/jammi-encoders/src/modernbert.rs::flash_compiled_or_skip

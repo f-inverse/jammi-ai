@@ -1,0 +1,607 @@
+{
+  "unit": "P6 Stage B stacked throughput sweep (FA2 dense attention arm + fused AdamW step, admitted together under JAMMI_KERNELS_STRICT=1) vs all-off eager baseline vs PyTorch/PEFT sdpa reference, 8 batch/seq shapes",
+  "git_sha": "eee7e6a91b25221de7d72df30e42fdc7412ab42d",
+  "git_sha7": "eee7e6a",
+  "branch": "perf/p6-fa2-dense",
+  "box": "a100c (A100 80GB PCIe, exclusive during timing)",
+  "harness": "jammi-bench finetune-step (stacked / all-off legs) + crates/jammi-bench/reference/torch_finetune_step.py --attn sdpa (torch legs)",
+  "cli_common": {
+    "model_dir": "/root/checkpoints/ModernBERT-large",
+    "steps": 25,
+    "warmup": 5,
+    "seed": 42,
+    "lora_rank": 16,
+    "lora_alpha": 32,
+    "lora_dropout": 0,
+    "target_modules": "Wqkv,Wo,Wi",
+    "backbone_dtype": "bf16",
+    "JAMMI_KERNELS_STRICT": "1 (stacked + all-off legs)"
+  },
+  "build_features": "cuda,jammi-encoders/flash-attn (release profile)",
+  "alloff_disable_set": "attention_block_flash,adamw_step_fused",
+  "alloff_disable_set_note": "this branch's other documented disable names (cast_scale_bf16_f32, cast_add_bf16 -- crates/jammi-kernels/src/ops/low_rank_residual_linear.rs, real dispatch sites) are deliberately excluded: crates/jammi-bench/src/report.rs's FinetuneStepTier carries no counter fields for either name, so requesting their disable would be unverifiable noise, not a checkable all-off leg -- see ci/scripts/perf/stacked_sweep.sh's own header for the full rationale.",
+  "env": {
+    "git_sha": "eee7e6a91b25221de7d72df30e42fdc7412ab42d",
+    "nvidia_smi": "NVIDIA A100 80GB PCIe, 570.172.08",
+    "torch_versions": "2.13.0+cu126 5.15.1 0.20.0"
+  },
+  "shapes": {
+    "b8s512": {
+      "batch": 8,
+      "seq": 512,
+      "legs": {
+        "stacked_r1": {
+          "file": "b8s512_stacked.r1.json",
+          "status": "GREEN",
+          "s_per_step_p50": 0.421238428,
+          "peak_vram_bytes": 14547943424.0,
+          "attention_block_flash_fused_dispatches": 840,
+          "attention_block_flash_declined_dispatches": 0,
+          "adamw_fused_dispatches": 6720,
+          "adamw_eager_dispatches": 0
+        },
+        "stacked_r2": {
+          "file": "b8s512_stacked.r2.json",
+          "status": "GREEN",
+          "s_per_step_p50": 0.421910261,
+          "peak_vram_bytes": 14547943424.0,
+          "attention_block_flash_fused_dispatches": 840,
+          "attention_block_flash_declined_dispatches": 0,
+          "adamw_fused_dispatches": 6720,
+          "adamw_eager_dispatches": 0
+        },
+        "alloff_r1": {
+          "file": "b8s512_alloff.r1.json",
+          "status": "GREEN",
+          "s_per_step_p50": 0.65544031,
+          "peak_vram_bytes": 14413725696.0,
+          "attention_block_flash_declined_dispatches": 840,
+          "adamw_eager_dispatches": 6720,
+          "kernels_disabled_requested": [
+            "adamw_step_fused",
+            "attention_block_flash"
+          ],
+          "kernels_disabled_fired": [
+            "adamw_step_fused",
+            "attention_block_flash"
+          ]
+        },
+        "torch_r1": {
+          "file": "b8s512_torch.r1.json",
+          "status": "GREEN",
+          "s_per_step_p50": 0.46009278018027544
+        },
+        "torch_r2": {
+          "file": "b8s512_torch.r2.json",
+          "status": "GREEN",
+          "s_per_step_p50": 0.45121646765619516
+        }
+      },
+      "stacked_p50_min_s": 0.421238428,
+      "torch_p50_min_s": 0.45121646765619516,
+      "alloff_p50_s": 0.65544031,
+      "ratio_torch_over_stacked": 1.0711664408172066,
+      "ratio_alloff_over_stacked": 1.555984132577762
+    },
+    "b8s128": {
+      "batch": 8,
+      "seq": 128,
+      "legs": {
+        "stacked_r1": {
+          "file": "b8s128_stacked.r1.json",
+          "status": "GREEN",
+          "s_per_step_p50": 0.130739966,
+          "peak_vram_bytes": 3609198592.0,
+          "attention_block_flash_fused_dispatches": 840,
+          "attention_block_flash_declined_dispatches": 0,
+          "adamw_fused_dispatches": 6720,
+          "adamw_eager_dispatches": 0
+        },
+        "stacked_r2": {
+          "file": "b8s128_stacked.r2.json",
+          "status": "GREEN",
+          "s_per_step_p50": 0.130776666,
+          "peak_vram_bytes": 3609198592.0,
+          "attention_block_flash_fused_dispatches": 840,
+          "attention_block_flash_declined_dispatches": 0,
+          "adamw_fused_dispatches": 6720,
+          "adamw_eager_dispatches": 0
+        },
+        "alloff_r1": {
+          "file": "b8s128_alloff.r1.json",
+          "status": "GREEN",
+          "s_per_step_p50": 0.189156514,
+          "peak_vram_bytes": 3642753024.0,
+          "attention_block_flash_declined_dispatches": 840,
+          "adamw_eager_dispatches": 6720,
+          "kernels_disabled_requested": [
+            "adamw_step_fused",
+            "attention_block_flash"
+          ],
+          "kernels_disabled_fired": [
+            "adamw_step_fused",
+            "attention_block_flash"
+          ]
+        },
+        "torch_r1": {
+          "file": "b8s128_torch.r1.json",
+          "status": "GREEN",
+          "s_per_step_p50": 0.14277820382267237
+        },
+        "torch_r2": {
+          "file": "b8s128_torch.r2.json",
+          "status": "GREEN",
+          "s_per_step_p50": 0.13186426647007465
+        }
+      },
+      "stacked_p50_min_s": 0.130739966,
+      "torch_p50_min_s": 0.13186426647007465,
+      "alloff_p50_s": 0.189156514,
+      "ratio_torch_over_stacked": 1.0085995163106791,
+      "ratio_alloff_over_stacked": 1.4468147712383526
+    },
+    "b1s128": {
+      "batch": 1,
+      "seq": 128,
+      "legs": {
+        "stacked_r1": {
+          "file": "b1s128_stacked.r1.json",
+          "status": "GREEN",
+          "s_per_step_p50": 0.041733846,
+          "peak_vram_bytes": 589299712.0,
+          "attention_block_flash_fused_dispatches": 840,
+          "attention_block_flash_declined_dispatches": 0,
+          "adamw_fused_dispatches": 6720,
+          "adamw_eager_dispatches": 0
+        },
+        "stacked_r2": {
+          "file": "b1s128_stacked.r2.json",
+          "status": "GREEN",
+          "s_per_step_p50": 0.040127158,
+          "peak_vram_bytes": 589299712.0,
+          "attention_block_flash_fused_dispatches": 840,
+          "attention_block_flash_declined_dispatches": 0,
+          "adamw_fused_dispatches": 6720,
+          "adamw_eager_dispatches": 0
+        },
+        "alloff_r1": {
+          "file": "b1s128_alloff.r1.json",
+          "status": "GREEN",
+          "s_per_step_p50": 0.064843304,
+          "peak_vram_bytes": 589299712.0,
+          "attention_block_flash_declined_dispatches": 840,
+          "adamw_eager_dispatches": 6720,
+          "kernels_disabled_requested": [
+            "adamw_step_fused",
+            "attention_block_flash"
+          ],
+          "kernels_disabled_fired": [
+            "adamw_step_fused",
+            "attention_block_flash"
+          ]
+        },
+        "torch_r1": {
+          "file": "b1s128_torch.r1.json",
+          "status": "GREEN",
+          "s_per_step_p50": 0.12911036610603333
+        },
+        "torch_r2": {
+          "file": "b1s128_torch.r2.json",
+          "status": "GREEN",
+          "s_per_step_p50": 0.12598772533237934
+        }
+      },
+      "stacked_p50_min_s": 0.040127158,
+      "torch_p50_min_s": 0.12598772533237934,
+      "alloff_p50_s": 0.064843304,
+      "ratio_torch_over_stacked": 3.139712145384912,
+      "ratio_alloff_over_stacked": 1.6159455897674089
+    },
+    "b1s512": {
+      "batch": 1,
+      "seq": 512,
+      "legs": {
+        "stacked_r1": {
+          "file": "b1s512_stacked.r1.json",
+          "status": "GREEN",
+          "s_per_step_p50": 0.073811389,
+          "peak_vram_bytes": 1864368128.0,
+          "attention_block_flash_fused_dispatches": 840,
+          "attention_block_flash_declined_dispatches": 0,
+          "adamw_fused_dispatches": 6720,
+          "adamw_eager_dispatches": 0
+        },
+        "stacked_r2": {
+          "file": "b1s512_stacked.r2.json",
+          "status": "GREEN",
+          "s_per_step_p50": 0.073886913,
+          "peak_vram_bytes": 1864368128.0,
+          "attention_block_flash_fused_dispatches": 840,
+          "attention_block_flash_declined_dispatches": 0,
+          "adamw_fused_dispatches": 6720,
+          "adamw_eager_dispatches": 0
+        },
+        "alloff_r1": {
+          "file": "b1s512_alloff.r1.json",
+          "status": "GREEN",
+          "s_per_step_p50": 0.115743881,
+          "peak_vram_bytes": 1897922560.0,
+          "attention_block_flash_declined_dispatches": 840,
+          "adamw_eager_dispatches": 6720,
+          "kernels_disabled_requested": [
+            "adamw_step_fused",
+            "attention_block_flash"
+          ],
+          "kernels_disabled_fired": [
+            "adamw_step_fused",
+            "attention_block_flash"
+          ]
+        },
+        "torch_r1": {
+          "file": "b1s512_torch.r1.json",
+          "status": "GREEN",
+          "s_per_step_p50": 0.12160556484013796
+        },
+        "torch_r2": {
+          "file": "b1s512_torch.r2.json",
+          "status": "GREEN",
+          "s_per_step_p50": 0.13236513826996088
+        }
+      },
+      "stacked_p50_min_s": 0.073811389,
+      "torch_p50_min_s": 0.12160556484013796,
+      "alloff_p50_s": 0.115743881,
+      "ratio_torch_over_stacked": 1.6475176322740377,
+      "ratio_alloff_over_stacked": 1.568103277395308
+    },
+    "b16s128": {
+      "batch": 16,
+      "seq": 128,
+      "legs": {
+        "stacked_r1": {
+          "file": "b16s128_stacked.r1.json",
+          "status": "GREEN",
+          "s_per_step_p50": 0.217799727,
+          "peak_vram_bytes": 7132413952.0,
+          "attention_block_flash_fused_dispatches": 840,
+          "attention_block_flash_declined_dispatches": 0,
+          "adamw_fused_dispatches": 6720,
+          "adamw_eager_dispatches": 0
+        },
+        "stacked_r2": {
+          "file": "b16s128_stacked.r2.json",
+          "status": "GREEN",
+          "s_per_step_p50": 0.218403592,
+          "peak_vram_bytes": 7132413952.0,
+          "attention_block_flash_fused_dispatches": 840,
+          "attention_block_flash_declined_dispatches": 0,
+          "adamw_fused_dispatches": 6720,
+          "adamw_eager_dispatches": 0
+        },
+        "alloff_r1": {
+          "file": "b16s128_alloff.r1.json",
+          "status": "GREEN",
+          "s_per_step_p50": 0.312919881,
+          "peak_vram_bytes": 7130316800.0,
+          "attention_block_flash_declined_dispatches": 840,
+          "adamw_eager_dispatches": 6720,
+          "kernels_disabled_requested": [
+            "adamw_step_fused",
+            "attention_block_flash"
+          ],
+          "kernels_disabled_fired": [
+            "adamw_step_fused",
+            "attention_block_flash"
+          ]
+        },
+        "torch_r1": {
+          "file": "b16s128_torch.r1.json",
+          "status": "GREEN",
+          "s_per_step_p50": 0.22427639830857515
+        },
+        "torch_r2": {
+          "file": "b16s128_torch.r2.json",
+          "status": "GREEN",
+          "s_per_step_p50": 0.22519328631460667
+        }
+      },
+      "stacked_p50_min_s": 0.217799727,
+      "torch_p50_min_s": 0.22427639830857515,
+      "alloff_p50_s": 0.312919881,
+      "ratio_torch_over_stacked": 1.0297368201410793,
+      "ratio_alloff_over_stacked": 1.4367322003117111
+    },
+    "b8s256": {
+      "batch": 8,
+      "seq": 256,
+      "legs": {
+        "stacked_r1": {
+          "file": "b8s256_stacked.r1.json",
+          "status": "GREEN",
+          "s_per_step_p50": 0.221215523,
+          "peak_vram_bytes": 7165968384.0,
+          "attention_block_flash_fused_dispatches": 840,
+          "attention_block_flash_declined_dispatches": 0,
+          "adamw_fused_dispatches": 6720,
+          "adamw_eager_dispatches": 0
+        },
+        "stacked_r2": {
+          "file": "b8s256_stacked.r2.json",
+          "status": "GREEN",
+          "s_per_step_p50": 0.22056486,
+          "peak_vram_bytes": 7165968384.0,
+          "attention_block_flash_fused_dispatches": 840,
+          "attention_block_flash_declined_dispatches": 0,
+          "adamw_fused_dispatches": 6720,
+          "adamw_eager_dispatches": 0
+        },
+        "alloff_r1": {
+          "file": "b8s256_alloff.r1.json",
+          "status": "GREEN",
+          "s_per_step_p50": 0.321907173,
+          "peak_vram_bytes": 7165968384.0,
+          "attention_block_flash_declined_dispatches": 840,
+          "adamw_eager_dispatches": 6720,
+          "kernels_disabled_requested": [
+            "adamw_step_fused",
+            "attention_block_flash"
+          ],
+          "kernels_disabled_fired": [
+            "adamw_step_fused",
+            "attention_block_flash"
+          ]
+        },
+        "torch_r1": {
+          "file": "b8s256_torch.r1.json",
+          "status": "GREEN",
+          "s_per_step_p50": 0.22765814140439034
+        },
+        "torch_r2": {
+          "file": "b8s256_torch.r2.json",
+          "status": "GREEN",
+          "s_per_step_p50": 0.2272772779688239
+        }
+      },
+      "stacked_p50_min_s": 0.22056486,
+      "torch_p50_min_s": 0.2272772779688239,
+      "alloff_p50_s": 0.321907173,
+      "ratio_torch_over_stacked": 1.0304328530339053,
+      "ratio_alloff_over_stacked": 1.4594671744175387
+    },
+    "b16s512": {
+      "batch": 16,
+      "seq": 512,
+      "legs": {
+        "stacked_r1": {
+          "file": "b16s512_stacked.r1.json",
+          "status": "GREEN",
+          "s_per_step_p50": 0.818590663,
+          "peak_vram_bytes": 28506587136.0,
+          "attention_block_flash_fused_dispatches": 840,
+          "attention_block_flash_declined_dispatches": 0,
+          "adamw_fused_dispatches": 6720,
+          "adamw_eager_dispatches": 0
+        },
+        "stacked_r2": {
+          "file": "b16s512_stacked.r2.json",
+          "status": "GREEN",
+          "s_per_step_p50": 0.822485118,
+          "peak_vram_bytes": 28506587136.0,
+          "attention_block_flash_fused_dispatches": 840,
+          "attention_block_flash_declined_dispatches": 0,
+          "adamw_fused_dispatches": 6720,
+          "adamw_eager_dispatches": 0
+        },
+        "alloff_r1": {
+          "file": "b16s512_alloff.r1.json",
+          "status": "GREEN",
+          "s_per_step_p50": 1.265021164,
+          "peak_vram_bytes": 28976349184.0,
+          "attention_block_flash_declined_dispatches": 840,
+          "adamw_eager_dispatches": 6720,
+          "kernels_disabled_requested": [
+            "adamw_step_fused",
+            "attention_block_flash"
+          ],
+          "kernels_disabled_fired": [
+            "adamw_step_fused",
+            "attention_block_flash"
+          ]
+        },
+        "torch_r1": {
+          "file": "b16s512_torch.r1.json",
+          "status": "GREEN",
+          "s_per_step_p50": 0.8866505669429898
+        },
+        "torch_r2": {
+          "file": "b16s512_torch.r2.json",
+          "status": "GREEN",
+          "s_per_step_p50": 0.8789871959015727
+        }
+      },
+      "stacked_p50_min_s": 0.818590663,
+      "torch_p50_min_s": 0.8789871959015727,
+      "alloff_p50_s": 1.265021164,
+      "ratio_torch_over_stacked": 1.0737811162910524,
+      "ratio_alloff_over_stacked": 1.545364760653274
+    },
+    "b8s1024": {
+      "batch": 8,
+      "seq": 1024,
+      "legs": {
+        "stacked_r1": {
+          "file": "b8s1024_stacked.r1.json",
+          "status": "GREEN",
+          "s_per_step_p50": 0.829981011,
+          "peak_vram_bytes": 28747759616.0,
+          "attention_block_flash_fused_dispatches": 840,
+          "attention_block_flash_declined_dispatches": 0,
+          "adamw_fused_dispatches": 6720,
+          "adamw_eager_dispatches": 0
+        },
+        "stacked_r2": {
+          "file": "b8s1024_stacked.r2.json",
+          "status": "GREEN",
+          "s_per_step_p50": 0.83050817,
+          "peak_vram_bytes": 28305260544.0,
+          "attention_block_flash_fused_dispatches": 840,
+          "attention_block_flash_declined_dispatches": 0,
+          "adamw_fused_dispatches": 6720,
+          "adamw_eager_dispatches": 0
+        },
+        "alloff_r1": {
+          "file": "b8s1024_alloff.r1.json",
+          "status": "GREEN",
+          "s_per_step_p50": 1.478134636,
+          "peak_vram_bytes": 31090278400.0,
+          "attention_block_flash_declined_dispatches": 840,
+          "adamw_eager_dispatches": 6720,
+          "kernels_disabled_requested": [
+            "adamw_step_fused",
+            "attention_block_flash"
+          ],
+          "kernels_disabled_fired": [
+            "adamw_step_fused",
+            "attention_block_flash"
+          ]
+        },
+        "torch_r1": {
+          "file": "b8s1024_torch.r1.json",
+          "status": "GREEN",
+          "s_per_step_p50": 0.953877822495997
+        },
+        "torch_r2": {
+          "file": "b8s1024_torch.r2.json",
+          "status": "GREEN",
+          "s_per_step_p50": 0.9460986219346523
+        }
+      },
+      "stacked_p50_min_s": 0.829981011,
+      "torch_p50_min_s": 0.9460986219346523,
+      "alloff_p50_s": 1.478134636,
+      "ratio_torch_over_stacked": 1.1399039368319384,
+      "ratio_alloff_over_stacked": 1.7809258481938932
+    }
+  },
+  "shapes_order": [
+    "b8s512",
+    "b8s128",
+    "b1s128",
+    "b1s512",
+    "b16s128",
+    "b8s256",
+    "b16s512",
+    "b8s1024"
+  ],
+  "ledger_row5_comparison": {
+    "note": "comparison against .jammi/ledger/perf-s4-20260826.jsonl row 5 -- 'FA2 stacked sweep (perf/p6-fa2-dense @10846dd, pre-control-fix tip; kernel/dispatch code identical to the PR tip)', an uncommitted hand-run pre-check of this same sweep shape at an earlier tip on this branch, quoted verbatim as LEDGER_REF above. Not a producer citation (that row's own producer field says 'NOT yet a committed producer' -- THIS artifact is the committed re-derivation the ledger row itself calls for), only a same-shape sanity comparison.",
+    "per_shape": {
+      "b8s512": {
+        "measured_stacked_p50_min_s": 0.421238428,
+        "measured_torch_p50_min_s": 0.45121646765619516,
+        "measured_ratio_torch_over_stacked": 1.0711664408172066,
+        "ledger_row5_pre_control_fix_10846dd_stacked_p50_min_s": 0.422,
+        "ledger_row5_pre_control_fix_10846dd_torch_p50_min_s": 0.4579,
+        "ledger_row5_pre_control_fix_10846dd_ratio_torch_over_stacked": 1.085,
+        "stacked_delta_fraction": -0.0018046729857819626,
+        "torch_delta_fraction": -0.014596052290466937,
+        "ratio_delta_fraction": -0.012749824131606809
+      },
+      "b8s128": {
+        "measured_stacked_p50_min_s": 0.130739966,
+        "measured_torch_p50_min_s": 0.13186426647007465,
+        "measured_ratio_torch_over_stacked": 1.0085995163106791,
+        "ledger_row5_pre_control_fix_10846dd_stacked_p50_min_s": 0.1307,
+        "ledger_row5_pre_control_fix_10846dd_torch_p50_min_s": 0.1241,
+        "ledger_row5_pre_control_fix_10846dd_ratio_torch_over_stacked": 0.95,
+        "stacked_delta_fraction": 0.00030578423871463185,
+        "torch_delta_fraction": 0.06256459685797464,
+        "ratio_delta_fraction": 0.06168370137966228
+      },
+      "b1s128": {
+        "measured_stacked_p50_min_s": 0.040127158,
+        "measured_torch_p50_min_s": 0.12598772533237934,
+        "measured_ratio_torch_over_stacked": 3.139712145384912,
+        "ledger_row5_pre_control_fix_10846dd_stacked_p50_min_s": 0.0396,
+        "ledger_row5_pre_control_fix_10846dd_torch_p50_min_s": 0.1256,
+        "ledger_row5_pre_control_fix_10846dd_ratio_torch_over_stacked": 3.17,
+        "stacked_delta_fraction": 0.013312070707070701,
+        "torch_delta_fraction": 0.0030869851304088512,
+        "ratio_delta_fraction": -0.009554528269743843
+      },
+      "b1s512": {
+        "measured_stacked_p50_min_s": 0.073811389,
+        "measured_torch_p50_min_s": 0.12160556484013796,
+        "measured_ratio_torch_over_stacked": 1.6475176322740377,
+        "ledger_row5_pre_control_fix_10846dd_stacked_p50_min_s": 0.0738,
+        "ledger_row5_pre_control_fix_10846dd_torch_p50_min_s": 0.1269,
+        "ledger_row5_pre_control_fix_10846dd_ratio_torch_over_stacked": 1.72,
+        "stacked_delta_fraction": 0.00015432249322493952,
+        "torch_delta_fraction": -0.04172131725659617,
+        "ratio_delta_fraction": -0.042140911468582724
+      },
+      "b16s128": {
+        "measured_stacked_p50_min_s": 0.217799727,
+        "measured_torch_p50_min_s": 0.22427639830857515,
+        "measured_ratio_torch_over_stacked": 1.0297368201410793,
+        "ledger_row5_pre_control_fix_10846dd_stacked_p50_min_s": 0.2177,
+        "ledger_row5_pre_control_fix_10846dd_torch_p50_min_s": 0.2218,
+        "ledger_row5_pre_control_fix_10846dd_ratio_torch_over_stacked": 1.019,
+        "stacked_delta_fraction": 0.00045809370693612267,
+        "torch_delta_fraction": 0.011165005899797818,
+        "ratio_delta_fraction": 0.010536624279763838
+      },
+      "b8s256": {
+        "measured_stacked_p50_min_s": 0.22056486,
+        "measured_torch_p50_min_s": 0.2272772779688239,
+        "measured_ratio_torch_over_stacked": 1.0304328530339053,
+        "ledger_row5_pre_control_fix_10846dd_stacked_p50_min_s": 0.2202,
+        "ledger_row5_pre_control_fix_10846dd_torch_p50_min_s": 0.2267,
+        "ledger_row5_pre_control_fix_10846dd_ratio_torch_over_stacked": 1.03,
+        "stacked_delta_fraction": 0.0016569482288828093,
+        "torch_delta_fraction": 0.002546440091856626,
+        "ratio_delta_fraction": 0.00042024566398570705
+      },
+      "b16s512": {
+        "measured_stacked_p50_min_s": 0.818590663,
+        "measured_torch_p50_min_s": 0.8789871959015727,
+        "measured_ratio_torch_over_stacked": 1.0737811162910524,
+        "ledger_row5_pre_control_fix_10846dd_stacked_p50_min_s": 0.8175,
+        "ledger_row5_pre_control_fix_10846dd_torch_p50_min_s": 0.8644,
+        "ledger_row5_pre_control_fix_10846dd_ratio_torch_over_stacked": 1.057,
+        "stacked_delta_fraction": 0.001334144342507703,
+        "torch_delta_fraction": 0.016875515850963394,
+        "ratio_delta_fraction": 0.015876174352935195
+      },
+      "b8s1024": {
+        "measured_stacked_p50_min_s": 0.829981011,
+        "measured_torch_p50_min_s": 0.9460986219346523,
+        "measured_ratio_torch_over_stacked": 1.1399039368319384,
+        "ledger_row5_pre_control_fix_10846dd_stacked_p50_min_s": 0.8312,
+        "ledger_row5_pre_control_fix_10846dd_torch_p50_min_s": 0.9512,
+        "ledger_row5_pre_control_fix_10846dd_ratio_torch_over_stacked": 1.144,
+        "stacked_delta_fraction": -0.0014665411453321211,
+        "torch_delta_fraction": -0.005363097209154454,
+        "ratio_delta_fraction": -0.003580474797256598
+      }
+    },
+    "flagged": {
+      "b8s128": "torch p50 moved +6.27% vs the ledger row (0.13186 measured vs 0.1241 ledger), flipping ratio_torch_over_stacked from 0.950 (torch faster) to 1.0086 (near-parity, jammi-stacked marginally faster) -- NOT smoothed over. Root cause traced to torch's OWN r1/r2 run-to-run spread at this shape (0.14278s / 0.13186s, an 8.3% spread within this single pair -- see this shape's torch_r1/torch_r2 legs above), much wider than every other shape/leg's r1/r2 spread in this sweep (typically <1%, e.g. b8s512 stacked_r1/r2: 0.421238/0.421910, 0.16%). The jammi-stacked side is unaffected and tight (stacked_r1/r2: 0.130740/0.130777, 0.03% spread) and matches the ledger row almost exactly (0.130740 vs 0.1307). Read as torch-side measurement noise at this small/fast shape (25 measured + 5 warmup steps at ~0.13s/step is only ~4s of GPU work per leg, more exposed to first-run cudnn/kernel-cache effects than the larger shapes), not a jammi kernel or dispatch regression -- but reported here per instruction rather than silently reconciled."
+    }
+  },
+  "expected_dispatch_identity": "attention_block_flash.fused == 28 * forwards_per_step(1, batched) * (warmup+steps=30) == 840 and adamw.fused == 6720 on every stacked leg, declined/eager == 0; attention_block_flash.declined == 840 and adamw.eager == 6720 on every all-off leg, fused == 0, kernels_disabled_requested == kernels_disabled_fired == ['adamw_step_fused', 'attention_block_flash'] (sorted) -- checked directly off each leg's own dispatch counters by ci/scripts/perf/stacked_sweep.sh's own non-vacuous positive/negative control (check_stacked/check_alloff in its embedded summarize() stage; a leg failing either check is written INVALID, not silently accepted). All 40 legs (8 shapes x 5 legs) in this sweep read GREEN with this identity holding exactly -- zero INVALID legs.",
+  "schema_version": 1,
+  "box_detail": {
+    "gpu": "NVIDIA A100 80GB PCIe",
+    "driver_version": "570.172.08",
+    "pod": "a100c (exclusive during timing, verified idle via nvidia-smi --query-compute-apps before starting)"
+  },
+  "status": "GREEN",
+  "producer": {
+    "path": "ci/scripts/perf/stacked_sweep.sh",
+    "kind": "script",
+    "invocation": "MODEL_DIR=/root/checkpoints/ModernBERT-large TORCH_PY=/root/jammi-ai/.venv-torch-ref/bin/python3 CARGO_TARGET_DIR=/root/target-fa2 ci/scripts/perf/stacked_sweep.sh /root/wt-fa2 eee7e6a91b25221de7d72df30e42fdc7412ab42d /root/stacked-sweep-eee7e6a-out",
+    "gating": "none"
+  },
+  "raw_runs_dir": "2026-08-26-p6-stacked-sweep-eee7e6a-a100c-pcie-raw-runs/a100c/"
+}

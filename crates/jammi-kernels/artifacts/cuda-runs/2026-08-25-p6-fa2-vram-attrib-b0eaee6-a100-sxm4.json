@@ -1,0 +1,153 @@
+{
+  "unit": "P6 flash-vram-attribution (numerics write-owner close-out of the BLOCK 1/2/3 audit's peak-VRAM regression finding)",
+  "before_git_sha": "5f48839caa8fda8cb3e7d18afd7ec5793d654de4",
+  "before_git_sha7": "5f48839",
+  "after_git_sha": "b0eaee6710c979c6eb074c18c3d2b5d12ddd2de7",
+  "after_git_sha7": "b0eaee6",
+  "branch": "fix/p6-fa2-dense-vram-attrib (based on origin/perf/p6-fa2-dense @ 5f48839)",
+  "box": "a100c (exclusive during timing) (NVIDIA A100-SXM4-80GB)",
+  "harness": "jammi-bench finetune-step",
+  "cli_common": {
+    "model_dir": "/root/checkpoints/ModernBERT-large",
+    "batch": 8,
+    "seq": 512,
+    "steps": 25,
+    "warmup": 5,
+    "backbone_dtype": "bf16",
+    "cuda": 0,
+    "seed": 42,
+    "batched_forward": true,
+    "target_modules": "Wqkv,Wo,Wi",
+    "lora_rank": 8,
+    "lora_alpha": 16.0,
+    "lora_dropout": 0.05,
+    "JAMMI_KERNELS_STRICT": "1 (every leg)"
+  },
+  "build_features": "cuda,jammi-encoders/flash-attn (release profile)",
+  "method": "Attribution: crates/jammi-encoders/src/modernbert.rs's modernbert::tests::flash_vs_block_per_layer_vram_attribution_probe_cuda -- cudarc::driver::result::mem_get_info() after each layer's forward and after backward, both arms, one process, same loaded checkpoint (batch=8, seq=512, seed=42, bf16). Found: the two-op flash composition (RopePositionsFused producing a rotated qkv Tensor, then flash_attention_varlen consuming it) retains a SECOND [total,3,H,64] bf16 buffer per layer (~24-28 MiB observed, ~24.0 MiB (25.17 MB) predicted from shape) that the block arm never pays -- candle's BackpropOp::new1 (op.rs) clones flash_attention_varlen's own `arg` (the ALREADY-rotated qkv) into its Op node unconditionally, and that rotated buffer is a fresh allocation distinct from the pre-rotation qkv the Wqkv linear's own backward needs anyway (which both arms retain equally). The block arm (AttentionBlockFused) avoids this because it fuses RoPE INSIDE its own CustomOp3 and recomputes the rotation from the pre-rotation qkv in a DETACHED bwd, never materializing a separately-retained rotated buffer. dq_accum (20.97 MB, FlashVarlenBwdHelper's own backward scratch) is CONFIRMED NOT the cause -- it is freed within the same backward call, not sustained.\n\nFix: FlashVarlenAttentionFusedRope (crates/jammi-kernels/src/ops/flash_attention.rs), a new CustomOp3 over (qkv, cos, sin) fusing RopePositionsFused's row math with flash_attention_varlen's own FFI calls inside ONE op -- forward calls the exact same underlying functions (crate::cuda::rope_positions::cuda_fwd then flash::flash_varlen_fwd_into) the two-op composition calls, in the same order; bwd recomputes the rotation from the (already-alive, detached) pre-rotation qkv via RopePositionsFused directly, mirroring AttentionBlockFused's own 'recompute in a DETACHED bwd' idiom, instead of letting candle's tape retain a rotated buffer for the whole backward pass. Proven bit-identical to the two-op composition it replaces, forward AND backward, in ops::flash_attention::fused_rope_matches_two_op_composition::fused_rope_matches_two_op_composition_bit_identical_fwd_and_bwd_cuda.",
+  "per_layer_vram_probe": {
+    "note": "modernbert::tests::flash_vs_block_per_layer_vram_attribution_probe_cuda's own --nocapture output, attention+MLP layers only (no optimizer, no LoRA epilogue outside the layer stack) -- a SUBSET of a full finetune-step, isolating the attention arm as the sole source of any difference (MLP is identical code on both arms). Absolute free-memory readings via cuMemGetInfo_v2 after a device sync; 'total consumed' = start free - after-backward free, within ONE run (controls for cross-run allocator drift -- see the flash/block gap column, which is comparable across the two runs below even though each run's own absolute numbers are not, because of exactly that drift).",
+    "before_fix_run": {
+      "flash_forward_total_mib": 4816.0,
+      "flash_backward_delta_mib": 3584.0,
+      "flash_total_consumed_mib": 8400.0,
+      "block_forward_total_mib": 4032.0,
+      "block_backward_delta_mib": 3584.0,
+      "block_total_consumed_mib": 7424.0,
+      "flash_minus_block_gap_mib": 976.0
+    },
+    "after_fix_run": {
+      "flash_forward_total_mib": 4240.0,
+      "flash_backward_delta_mib": 3872.0,
+      "flash_total_consumed_mib": 8112.0,
+      "block_forward_total_mib": 4032.0,
+      "block_backward_delta_mib": 3584.0,
+      "block_total_consumed_mib": 7616.0,
+      "flash_minus_block_gap_mib": 496.0
+    },
+    "gap_reduction_mib": 480.0,
+    "gap_reduction_fraction": 0.4918032786885246,
+    "reconciliation_note": "flash_minus_block_gap_mib and gap_reduction_mib/gap_reduction_fraction above were corrected from the originally-published 978/530/448/0.4580777096114519 -- those did not reconcile with this SAME entry's own flash_total_consumed_mib - block_total_consumed_mib (8400.0-7424.0=976.0, 8112.0-7616.0=496.0, 976.0-496.0=480.0). Adversarial audit finding on eee7e6a; corrected here rather than smoothed -- the sibling total_consumed_mib fields are unchanged, only this derived subtraction is.",
+    "caveat": "the block arm's own absolute numbers drift ~192 MiB between the two runs (unchanged code, same seed) -- ordinary cudarc/CUDA-allocator fragmentation noise at this granularity (candidate (4) in the dispatch, confirmed present but small relative to the ~2.5 GB full-step regression this closes). The flash/block GAP (not the absolute numbers) is the controlled comparison."
+  },
+  "same_build_before_after_full_finetune_step": {
+    "b8-s512": {
+      "flash_arm": {
+        "runs_before": [
+          {
+            "file": "2026-08-25-p6-fa2-vram-attrib-b0eaee6-a100-sxm4-raw-runs/before_flash_r1.json",
+            "s_per_step_p50": 0.460953305,
+            "peak_vram_bytes": 18910019584.0
+          },
+          {
+            "file": "2026-08-25-p6-fa2-vram-attrib-b0eaee6-a100-sxm4-raw-runs/before_flash_r2.json",
+            "s_per_step_p50": 0.460006606,
+            "peak_vram_bytes": 18910019584.0
+          }
+        ],
+        "runs_after": [
+          {
+            "file": "2026-08-25-p6-fa2-vram-attrib-b0eaee6-a100-sxm4-raw-runs/after_flash_r1.json",
+            "s_per_step_p50": 0.45983508,
+            "peak_vram_bytes": 16393437184.0
+          },
+          {
+            "file": "2026-08-25-p6-fa2-vram-attrib-b0eaee6-a100-sxm4-raw-runs/after_flash_r2.json",
+            "s_per_step_p50": 0.459441973,
+            "peak_vram_bytes": 16460546048.0
+          }
+        ],
+        "peak_vram_mean_before_bytes": 18910019584.0,
+        "peak_vram_mean_after_bytes": 16426991616.0,
+        "peak_vram_reduction_bytes": 2483027968.0,
+        "peak_vram_reduction_gb": 2.483027968,
+        "peak_vram_reduction_fraction": 0.13130753022069425,
+        "s_per_step_p50_mean_before_s": 0.4604799555,
+        "s_per_step_p50_mean_after_s": 0.459638527,
+        "s_per_step_note": "no meaningful change (expected -- this fix changes RETENTION, not the compute this op issues; the difference is within ordinary run-to-run noise)."
+      },
+      "block_arm_baseline_unchanged_code": {
+        "runs_before": [
+          {
+            "file": "2026-08-25-p6-fa2-vram-attrib-b0eaee6-a100-sxm4-raw-runs/before_block_r1.json",
+            "s_per_step_p50": 0.67179871,
+            "peak_vram_bytes": 16594763776.0
+          },
+          {
+            "file": "2026-08-25-p6-fa2-vram-attrib-b0eaee6-a100-sxm4-raw-runs/before_block_r2.json",
+            "s_per_step_p50": 0.671717567,
+            "peak_vram_bytes": 16426991616.0
+          }
+        ],
+        "runs_after": [
+          {
+            "file": "2026-08-25-p6-fa2-vram-attrib-b0eaee6-a100-sxm4-raw-runs/after_block_r1.json",
+            "s_per_step_p50": 0.670999572,
+            "peak_vram_bytes": 16594763776.0
+          },
+          {
+            "file": "2026-08-25-p6-fa2-vram-attrib-b0eaee6-a100-sxm4-raw-runs/after_block_r2.json",
+            "s_per_step_p50": 0.6723565,
+            "peak_vram_bytes": 16661872640.0
+          }
+        ],
+        "peak_vram_mean_before_bytes": 16510877696.0,
+        "peak_vram_mean_after_bytes": 16628318208.0,
+        "note": "unchanged code path (JAMMI_KERNELS_DISABLE=attention_block_flash forces the block arm on both builds) -- the +0.7% drift between before/after means is the SAME allocator-fragmentation noise the per-layer probe's own caveat names, not a code effect."
+      },
+      "flash_minus_block_gap": {
+        "before_bytes": 2399141888.0,
+        "before_gb": 2.399141888,
+        "after_bytes": -201326592.0,
+        "after_gb": -0.201326592,
+        "interpretation": "BEFORE: flash's peak VRAM exceeded the block arm's by 2.40 GB -- the anomaly this round closes (the lead's own arithmetic: flash SHOULD save MORE than block, since flash never materializes the block arm's [b,h,s,s] bf16 probability tensor, ~67 MB/layer). AFTER: flash's peak VRAM mean is 0.20 GB (192 MiB) below the block arm's mean -- but the block arm's OWN four unchanged-code runs recorded in THIS file (runs_before r1/r2, runs_after r1/r2: 16594763776 / 16426991616 / 16594763776 / 16661872640 bytes) spread 224 MiB run-to-run on unchanged code and the same seed -- WIDER than the claimed 192 MiB advantage -- and flash's after-fix mean (16426991616 bytes) equals the block arm's OWN before_r2 sample byte-for-byte. The flash-vs-block SIGN after the fix is therefore UNDETERMINED within this run's own noise floor -- adversarial audit finding on eee7e6a, corrected here rather than smoothed. What survives as a real, reproducible finding is only the regression removal itself: flash's peak VRAM mean fell from 18.910 GB (before-fix) to 16.427 GB (after-fix), a 2.483 GB reduction (peak_vram_reduction_gb above), independent of how it now compares to the block arm."
+      }
+    }
+  },
+  "expected_dispatch_identity": "attention_block_flash.fused == 28 * forwards_per_step(1, batched) * (warmup+steps=30) == 840 on every flash-on leg; attention_block_flash.declined == 840 and attention_block_fused == 840 on every flash-off (DISABLE) leg -- checked directly off each raw run's own dispatch counters, all 8 runs above match this identity.",
+  "gate_outcomes_this_session": {
+    "cargo fmt -p jammi-kernels -p jammi-encoders -- --check (local, default features)": "PASS",
+    "cargo clippy -p jammi-kernels -p jammi-encoders --all-targets -- -D warnings (local, default features)": "PASS",
+    "cargo test -p jammi-kernels -p jammi-encoders --lib (local, default features)": "PASS 274 + 125",
+    "RUSTDOCFLAGS=-D warnings cargo doc -p jammi-kernels -p jammi-encoders --no-deps (local, default features)": "PASS",
+    "cargo fmt -p jammi-kernels -p jammi-encoders -- --check (pod, cuda+flash-attn)": "PASS",
+    "cargo clippy -p jammi-kernels -p jammi-encoders --all-targets --features cuda,flash-attn -- -D warnings (pod)": "PASS",
+    "cargo test -p jammi-kernels -p jammi-encoders --features cuda,flash-attn --lib -- --test-threads=1 (pod, JAMMI_FLASH_ORACLE_MODEL_DIR set)": "PASS 308 + 132, incl. fused_rope_matches_two_op_composition_bit_identical_fwd_and_bwd_cuda, flash_vs_block_per_layer_vram_attribution_probe_cuda, flash_arm_encoder_level_three_way_oracle_dense_cuda_bf16, and all three RED controls (flash_arm_encoder_level_oracle_red_control_{bad_softmax_scale,k_unrotated,window_dropped})",
+    "cargo test -p jammi-kernels --features cuda,flash-attn --test cuda_parity (pod, JAMMI_REQUIRE_CUDA=1)": "PASS 82 passed, 1 ignored, 0 failed",
+    "RUSTDOCFLAGS=-D warnings cargo doc -p jammi-kernels -p jammi-encoders --no-deps --features cuda,flash-attn (pod)": "PASS (one round: a public-fn doc comment linked a crate-private type and an out-of-scope bare bracket link -- fixed by converting to a backtick code span / a fully-qualified super:: link, never a doc-hidden bypass, per 7fd457e's precedent)"
+  },
+  "what_remains": "the FusedAttentionMasks::build reordering (build only when the block arm will actually run, flash decision first) is NOT done this round -- disclosed as deferred in the fix commit, not silently dropped. Its VRAM cost is small (a few MB, built once per forward) relative to the ~2.5 GB this round closes. The residual after-fix flash/block gap (-0.20 GB / -192 MiB by mean) sits INSIDE the block arm's own 224 MiB run-to-run noise floor measured in this same file (see flash_minus_block_gap.interpretation above) -- the sign relative to the block arm is undetermined, not confirmed correct, and was not further decomposed between dq_accum's backward scratch and ordinary allocator fragmentation; both remain named candidates in the dispatch, neither is jammi's own wiring.",
+  "schema_version": 1,
+  "box_detail": {
+    "gpu": "NVIDIA A100-SXM4-80GB",
+    "pod": "a100c (exclusive during timing)"
+  },
+  "git_sha": "b0eaee6710c979c6eb074c18c3d2b5d12ddd2de7",
+  "status": "GREEN",
+  "producer": {
+    "path": "crates/jammi-encoders/src/modernbert.rs",
+    "kind": "cargo-test",
+    "invocation": "cargo test -p jammi-encoders --lib --features cuda,flash-attn -- --exact modernbert::tests::flash_vs_block_per_layer_vram_attribution_probe_cuda",
+    "gating": "env:JAMMI_FLASH_ORACLE_MODEL_DIR"
+  }
+}

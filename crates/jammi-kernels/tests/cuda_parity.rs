@@ -4139,9 +4139,9 @@ fn lora_linear_parity_bf16_base_backward_production_width() {
     // its OWN three per-term contributions by an extra `2.0x` locally
     // (comfortable headroom over the measured `1.34x` gap) rather than
     // loosening every caller of the shared helper.
-    let scale = 2.0f64;
+    let dx_bound_margin = 2.0f64;
     for (i, (c, g)) in dx_cpu.iter().zip(dx_gpu.iter()).enumerate() {
-        let bound = scale
+        let bound = dx_bound_margin
             * (bf16_round_bound(f64::from(dx_base_cpu[i]))
                 + bf16_round_bound(f64::from(d_x_lora_cpu[i]))
                 + bf16_round_bound(f64::from(*c)))

@@ -121,8 +121,10 @@ inputs = [
   "CUDA_PATH",
   "AR",
   "CUDA_COMPUTE_CAP",
+  "JAMMI_FLASH_GENCODE_SM",
 ]
 notes = [
+  "JAMMI_FLASH_GENCODE_SM (round-6, post-#393 merge) is a COMPUTED OUTPUT, not an ambient-env input: build.rs:349 `println!(\"cargo:rustc-env=JAMMI_FLASH_GENCODE_SM={gencode_sm}\")` derives it from CUDA_COMPUTE_CAP (above) and EMITS it forward to rustc via `env!(\"JAMMI_FLASH_GENCODE_SM\")` at compile time; it is never read FROM the environment by anything, so it cannot itself diverge between a seed and a clone independent of CUDA_COMPUTE_CAP (already tracked). Listed here only so the RED scan's own literal match resolves — never a real environment input.",
   "CUDA_COMPUTE_CAP is PINNED, not read from the pod's ambient env: build_cuda() calls env::set_var(\"CUDA_COMPUTE_CAP\", \"80\") at build.rs:73 before constructing the bindgen_cuda Builder, specifically so bindgen_cuda's own compute_cap() (see [bindgen_cuda_0_1_6]) never falls through to an nvidia-smi probe. Recorded here as a CONSTANT (80), not a variable value.",
   "cutlass gitlink: crates/jammi-kernels/third_party/cutlass (git submodule pin) is a key input to the flash-attn feature's build_flash_attn() (build.rs:172-414) but is NOT env-shaped — it is a checked-in gitlink, tracked by the submodule commit, not by this manifest's env scan.",
   "find_nvcc() resolution ORDER (build.rs:368-387): $NVCC, then $CUDA_HOME/bin/nvcc, then $CUDA_PATH/bin/nvcc, then `nvcc` on PATH, then /usr/local/cuda/bin/nvcc — the first that answers `--version`. The ORDER is part of this crate's key surface: two pods with different toolchains on PATH but the SAME NVCC/CUDA_HOME can still resolve a different nvcc if only PATH differs and neither env var is set.",

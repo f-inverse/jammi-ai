@@ -34,7 +34,7 @@
       "block_forward_total_mib": 4032.0,
       "block_backward_delta_mib": 3584.0,
       "block_total_consumed_mib": 7424.0,
-      "flash_minus_block_gap_mib": 978.0
+      "flash_minus_block_gap_mib": 976.0
     },
     "after_fix_run": {
       "flash_forward_total_mib": 4240.0,
@@ -43,10 +43,11 @@
       "block_forward_total_mib": 4032.0,
       "block_backward_delta_mib": 3584.0,
       "block_total_consumed_mib": 7616.0,
-      "flash_minus_block_gap_mib": 530.0
+      "flash_minus_block_gap_mib": 496.0
     },
-    "gap_reduction_mib": 448.0,
-    "gap_reduction_fraction": 0.4580777096114519,
+    "gap_reduction_mib": 480.0,
+    "gap_reduction_fraction": 0.4918032786885246,
+    "reconciliation_note": "flash_minus_block_gap_mib and gap_reduction_mib/gap_reduction_fraction above were corrected from the originally-published 978/530/448/0.4580777096114519 -- those did not reconcile with this SAME entry's own flash_total_consumed_mib - block_total_consumed_mib (8400.0-7424.0=976.0, 8112.0-7616.0=496.0, 976.0-496.0=480.0). Adversarial audit finding on eee7e6a; corrected here rather than smoothed -- the sibling total_consumed_mib fields are unchanged, only this derived subtraction is.",
     "caveat": "the block arm's own absolute numbers drift ~192 MiB between the two runs (unchanged code, same seed) -- ordinary cudarc/CUDA-allocator fragmentation noise at this granularity (candidate (4) in the dispatch, confirmed present but small relative to the ~2.5 GB full-step regression this closes). The flash/block GAP (not the absolute numbers) is the controlled comparison."
   },
   "same_build_before_after_full_finetune_step": {
@@ -119,7 +120,7 @@
         "before_gb": 2.399141888,
         "after_bytes": -201326592.0,
         "after_gb": -0.201326592,
-        "interpretation": "BEFORE: flash's peak VRAM exceeded the block arm's by 2.40 GB -- the anomaly this round closes (the lead's own arithmetic: flash SHOULD save MORE than block, since flash never materializes the block arm's [b,h,s,s] bf16 probability tensor, ~67 MB/layer). AFTER: flash's peak VRAM is 0.20 GB BELOW the block arm's -- the sign has flipped to the theoretically-expected direction. The gap is not fully eliminated to the full ~1.8 GB theoretical block-arm-probability-tensor saving (dq_accum's 20.97 MB backward scratch and ordinary allocator fragmentation, both confirmed present and both un-owned-by-jammi, account for the remainder plausibly, but were not further decomposed this round -- see 'what remains' below)."
+        "interpretation": "BEFORE: flash's peak VRAM exceeded the block arm's by 2.40 GB -- the anomaly this round closes (the lead's own arithmetic: flash SHOULD save MORE than block, since flash never materializes the block arm's [b,h,s,s] bf16 probability tensor, ~67 MB/layer). AFTER: flash's peak VRAM mean is 0.20 GB (192 MiB) below the block arm's mean -- but the block arm's OWN four unchanged-code runs recorded in THIS file (runs_before r1/r2, runs_after r1/r2: 16594763776 / 16426991616 / 16594763776 / 16661872640 bytes) spread 224 MiB run-to-run on unchanged code and the same seed -- WIDER than the claimed 192 MiB advantage -- and flash's after-fix mean (16426991616 bytes) equals the block arm's OWN before_r2 sample byte-for-byte. The flash-vs-block SIGN after the fix is therefore UNDETERMINED within this run's own noise floor -- adversarial audit finding on eee7e6a, corrected here rather than smoothed. What survives as a real, reproducible finding is only the regression removal itself: flash's peak VRAM mean fell from 18.910 GB (before-fix) to 16.427 GB (after-fix), a 2.483 GB reduction (peak_vram_reduction_gb above), independent of how it now compares to the block arm."
       }
     }
   },
@@ -135,7 +136,7 @@
     "cargo test -p jammi-kernels --features cuda,flash-attn --test cuda_parity (pod, JAMMI_REQUIRE_CUDA=1)": "PASS 82 passed, 1 ignored, 0 failed",
     "RUSTDOCFLAGS=-D warnings cargo doc -p jammi-kernels -p jammi-encoders --no-deps --features cuda,flash-attn (pod)": "PASS (one round: a public-fn doc comment linked a crate-private type and an out-of-scope bare bracket link -- fixed by converting to a backtick code span / a fully-qualified super:: link, never a doc-hidden bypass, per 7fd457e's precedent)"
   },
-  "what_remains": "the FusedAttentionMasks::build reordering (build only when the block arm will actually run, flash decision first) is NOT done this round -- disclosed as deferred in the fix commit, not silently dropped. Its VRAM cost is small (a few MB, built once per forward) relative to the ~2.5 GB this round closes. The residual after-fix flash/block gap (-0.20 GB, i.e. flash now slightly BELOW block, not the full ~1.8 GB theoretical saving) was not further decomposed between dq_accum's backward scratch and ordinary allocator fragmentation -- both are named candidates in the dispatch, neither is jammi's own wiring, and the SIGN is now correct.",
+  "what_remains": "the FusedAttentionMasks::build reordering (build only when the block arm will actually run, flash decision first) is NOT done this round -- disclosed as deferred in the fix commit, not silently dropped. Its VRAM cost is small (a few MB, built once per forward) relative to the ~2.5 GB this round closes. The residual after-fix flash/block gap (-0.20 GB / -192 MiB by mean) sits INSIDE the block arm's own 224 MiB run-to-run noise floor measured in this same file (see flash_minus_block_gap.interpretation above) -- the sign relative to the block arm is undetermined, not confirmed correct, and was not further decomposed between dq_accum's backward scratch and ordinary allocator fragmentation; both remain named candidates in the dispatch, neither is jammi's own wiring.",
   "schema_version": 1,
   "box_detail": {
     "gpu": "NVIDIA A100-SXM4-80GB",

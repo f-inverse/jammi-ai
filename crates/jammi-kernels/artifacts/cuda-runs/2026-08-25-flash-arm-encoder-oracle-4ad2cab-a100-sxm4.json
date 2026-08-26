@@ -128,7 +128,7 @@
     "cuda_toolkit": "12.6.85",
     "pod": "a100c"
   },
-  "status": "GREEN",
+  "status": "SUPERSEDED",
   "producer": {
     "path": "crates/jammi-encoders/src/modernbert.rs",
     "kind": "cargo-test",

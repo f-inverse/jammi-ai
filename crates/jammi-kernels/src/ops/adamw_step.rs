@@ -373,7 +373,7 @@ impl InplaceOp3 for AdamThetaUpdate {
         s3: &candle_core::CudaStorage,
         l3: &Layout,
     ) -> Result<()> {
-        crate::cuda::adamw_step::theta_update_cuda_fwd(*self, s1, l1, s2, l2, s3, l3)
+        crate::cuda::adamw_step::theta_update_cuda_fwd(*self, (s1, l1), (s2, l2), (s3, l3))
     }
 }
 

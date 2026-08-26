@@ -150,17 +150,21 @@ pub(crate) fn moment_update_fma_contracted_red_control_cuda_fwd(
 
 /// `theta[i] = theta[i]*one_minus_lr_lambda - lr*m_hat[i]/(sqrt(v_hat[i])+eps)`,
 /// in place. Mirrors `ops::AdamThetaUpdate::cpu_fwd`'s CPU arm exactly.
-#[allow(clippy::too_many_arguments)]
+/// `theta`/`m`/`v` bundle each tensor's `(storage, layout)` pair — the same
+/// grouping [`require_contiguous_f32`] already takes as a slice — which is
+/// what collapses this function's argument count under
+/// `clippy::too_many_arguments`' threshold without changing the domain
+/// checks or kernel launch below at all.
 pub(crate) fn theta_update_cuda_fwd(
     op: crate::ops::AdamThetaUpdate,
-    s1: &mut CudaStorage,
-    l1: &Layout,
-    s2: &CudaStorage,
-    l2: &Layout,
-    s3: &CudaStorage,
-    l3: &Layout,
+    theta: (&mut CudaStorage, &Layout),
+    m: (&CudaStorage, &Layout),
+    v: (&CudaStorage, &Layout),
 ) -> Result<()> {
     const OP: &str = "adamw_theta_update";
+    let (s1, l1) = theta;
+    let (s2, l2) = m;
+    let (s3, l3) = v;
     if l1.dims() != l2.dims() {
         return Err(Error::ShapeMismatchBinaryOp {
             lhs: l1.shape().clone(),

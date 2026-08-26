@@ -92,7 +92,11 @@ struct AdamVar {
 /// included) — the shared bookkeeping [`AdamW::advance_step_scales`]
 /// computes once, so [`AdamW::step`] and the `#[cfg(test)]`-only
 /// [`AdamW::step_forced`] cannot silently diverge on how `t`,
-/// `scale_m`/`scale_v`, or `lr_lambda` are derived.
+/// `scale_m`/`scale_v`, or `lr_lambda` are derived. `Copy` (all fields are
+/// plain `f64`): [`step_eager_one`] takes this by value instead of six
+/// separate scalar parameters, which is also what collapses that function's
+/// argument count under `clippy::too_many_arguments`' default threshold.
+#[derive(Clone, Copy)]
 struct StepScales {
     beta1: f64,
     beta2: f64,
@@ -179,28 +183,23 @@ impl AdamW {
     /// TEST-ONLY: identical to [`Self::step`] except it bypasses
     /// `fused_admission_predicate`/`admit` entirely and unconditionally
     /// runs one named arm for every `Var` this step. This is the RED-oracle
-    /// "force" mechanism this crate uses in place of
+    /// "force" mechanism `dispatch_arms` uses in place of
     /// `JAMMI_KERNELS_DISABLE=<op key>` (K-aux, `feat/kernels-admission-
-    /// disable` @ e602d7a, not merged onto `perf/multi-tensor-adamw` at the
-    /// base this file was wired against) — see `dispatch_arms`'s module
-    /// doc for the scope-amendment note. `#[cfg(test)]`: not part of the
-    /// production API surface, compiled only for `cargo test`, so it can
+    /// disable` @ e602d7a — merged onto this branch's `main` base, so the
+    /// env-var switch itself IS available here; `step_forced` predates that
+    /// merge and is kept as the dispatch's oracle mechanism unchanged rather
+    /// than reshaped into an env-var-driven test — see `dispatch_arms`'s
+    /// module doc for the scope-amendment note). `#[cfg(test)]`: not part of
+    /// the production API surface, compiled only for `cargo test`, so it can
     /// never be reached in a real training run regardless of admission mode.
     #[cfg(test)]
     fn step_forced(&mut self, grads: &GradStore, force_fused: bool) -> Result<()> {
-        let StepScales {
-            beta1,
-            beta2,
-            scale_m,
-            scale_v,
-            lr,
-            lr_lambda,
-        } = self.advance_step_scales();
+        let scales = self.advance_step_scales();
         let t = self.step_t;
         let fused_params = AdamWParams {
-            beta1,
-            beta2,
-            lr,
+            beta1: scales.beta1,
+            beta2: scales.beta2,
+            lr: scales.lr,
             weight_decay: self.params.weight_decay,
             eps: self.params.eps,
         };
@@ -212,19 +211,7 @@ impl AdamW {
                 if force_fused {
                     step_fused_one(theta, m, v, g, t, fused_params)?;
                 } else {
-                    step_eager_one(
-                        theta,
-                        m,
-                        v,
-                        g,
-                        beta1,
-                        beta2,
-                        scale_m,
-                        scale_v,
-                        lr,
-                        lr_lambda,
-                        self.params.eps,
-                    )?;
+                    step_eager_one(theta, m, v, g, scales, self.params.eps)?;
                 }
             }
         }
@@ -242,19 +229,12 @@ impl AdamW {
     /// contiguous) LoRA `Var`. A `Var` with no `GradStore` entry this step
     /// is skipped exactly as before — the guard is unchanged either way.
     pub fn step(&mut self, grads: &GradStore) -> Result<()> {
-        let StepScales {
-            beta1,
-            beta2,
-            scale_m,
-            scale_v,
-            lr,
-            lr_lambda,
-        } = self.advance_step_scales();
+        let scales = self.advance_step_scales();
         let t = self.step_t;
         let fused_params = AdamWParams {
-            beta1,
-            beta2,
-            lr,
+            beta1: scales.beta1,
+            beta2: scales.beta2,
+            lr: scales.lr,
             weight_decay: self.params.weight_decay,
             eps: self.params.eps,
         };
@@ -302,19 +282,9 @@ impl AdamW {
                     // pass — see `dispatch_arms::an_aliased_var_is_refused_
                     // and_leaves_state_untouched` for the oracle.
                     DispatchOutcome::Fused => step_fused_one(theta, m, v, g, t, fused_params)?,
-                    DispatchOutcome::Eager => step_eager_one(
-                        theta,
-                        m,
-                        v,
-                        g,
-                        beta1,
-                        beta2,
-                        scale_m,
-                        scale_v,
-                        lr,
-                        lr_lambda,
-                        self.params.eps,
-                    )?,
+                    DispatchOutcome::Eager => {
+                        step_eager_one(theta, m, v, g, scales, self.params.eps)?
+                    }
                 }
             }
         }
@@ -385,20 +355,26 @@ impl AdamW {
 /// [`AdamW::step`] can pick it per-`Var` via `admit`, and so a test can call
 /// it directly to force the eager arm — see the `dispatch_arms` test module
 /// below for why this is the RED-oracle's "force" mechanism on this branch).
-#[allow(clippy::too_many_arguments)]
+/// `scales` bundles `beta1`/`beta2`/`scale_m`/`scale_v`/`lr`/`lr_lambda` —
+/// see [`StepScales`]'s own doc for why this collapses the argument count
+/// under `clippy::too_many_arguments`' threshold without changing the
+/// arithmetic below at all.
 fn step_eager_one(
     theta: &Var,
     m: &Var,
     v: &Var,
     g: &Tensor,
-    beta1: f64,
-    beta2: f64,
-    scale_m: f64,
-    scale_v: f64,
-    lr: f64,
-    lr_lambda: f64,
+    scales: StepScales,
     eps: f64,
 ) -> Result<()> {
+    let StepScales {
+        beta1,
+        beta2,
+        scale_m,
+        scale_v,
+        lr,
+        lr_lambda,
+    } = scales;
     let next_m = ((m.as_tensor() * beta1)? + (g * (1.0 - beta1))?)?;
     let next_v = ((v.as_tensor() * beta2)? + (g.sqr()? * (1.0 - beta2))?)?;
     let m_hat = (&next_m * scale_m)?;
@@ -851,21 +827,28 @@ mod admission_predicate {
 ///
 /// **Forcing mechanism, and why it differs from the dispatch's literal
 /// `JAMMI_KERNELS_DISABLE=<op key>` clause (scope amendment):** K-aux
-/// (`feat/kernels-admission-disable` @ e602d7a) is not merged onto
-/// `perf/multi-tensor-adamw`'s base — `crate::admission` has no
-/// environment-variable disable switch on this branch (confirmed by
-/// reading `crates/jammi-kernels/src/admission.rs`: only
-/// `JAMMI_KERNELS_STRICT` exists, which turns a FAILED predicate into an
-/// error rather than selecting an arm). [`AdamW::step_forced`]
-/// (`#[cfg(test)]`-only, not part of the production API) is the "test-only
-/// predicate override" the dispatch's fallback instruction names: it
-/// bypasses `fused_admission_predicate`/`admit` entirely and calls
-/// [`step_fused_one`]/[`step_eager_one`] directly, sharing the exact same
-/// `step_t`/bias-correction bookkeeping as production `step`
-/// ([`AdamW::advance_step_scales`]) so the two arms differ ONLY in which
-/// update function runs — the same "same-build forced-arm A/B" shape as
-/// every other fused op's oracle in this workspace, adapted to the one
-/// concrete mechanism actually available on this branch.
+/// (`feat/kernels-admission-disable` @ e602d7a) IS merged onto this branch's
+/// `main` base — `crate::admission` does carry the env-var disable switch
+/// here (`jammi_kernels::admission::admit` honours `JAMMI_KERNELS_DISABLE`;
+/// see `crates/jammi-kernels/src/admission.rs`'s own module doc). This
+/// commit (`feat(ai): wire AdamW::step to the fused multi-tensor AdamW
+/// kernel`) was authored against an earlier base that predated K-aux and is
+/// carried onto this branch VERBATIM (byte-identical to
+/// `perf/multi-tensor-adamw`'s own commit, per the lead's cherry-pick
+/// authorization), so [`AdamW::step_forced`]
+/// (`#[cfg(test)]`-only, not part of the production API) remains this RED
+/// oracle's forcing mechanism rather than being reshaped into an
+/// env-var-driven test: it bypasses `fused_admission_predicate`/`admit`
+/// entirely and calls [`step_fused_one`]/[`step_eager_one`] directly,
+/// sharing the exact same `step_t`/bias-correction bookkeeping as
+/// production `step` ([`AdamW::advance_step_scales`]) so the two arms
+/// differ ONLY in which update function runs — the same "same-build
+/// forced-arm A/B" shape as every other fused op's oracle in this
+/// workspace. The gate's own pod leg exercises the SAME production
+/// dispatch through the real `JAMMI_KERNELS_DISABLE=adamw_step_fused`
+/// env-var switch end-to-end (`crates/jammi-bench`'s `finetune-step`
+/// tier), so the env-var path this doc once claimed was unavailable is
+/// independently proven live, not merely asserted.
 #[cfg(test)]
 mod dispatch_arms {
     use super::*;
@@ -993,7 +976,9 @@ mod dispatch_arms {
         }
 
         let lrs = [1e-3, 5e-4, 2e-3];
-        let skip = [None, Some(3), None]; // middle step: Var 3 gets no grad.
+        // Middle step: the `Var` at `PROD_SHAPES[3]` (0-indexed, the fused-QKV
+        // `lora_b`, `[5248,16]` — see `PROD_SHAPES`'s own doc) gets no grad.
+        let skip = [None, Some(3), None];
         for (step, (&lr, &skip_idx)) in lrs.iter().zip(&skip).enumerate() {
             fused_opt.set_learning_rate(lr);
             eager_opt.set_learning_rate(lr);

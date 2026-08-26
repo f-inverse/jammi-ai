@@ -219,6 +219,41 @@ pub struct GradOracleParams {
     /// invocation seed the shared file a second, independent invocation
     /// then loads via `lora_weights_in`.
     pub lora_weights_out: Option<PathBuf>,
+    /// How the LoRA `A`/`B` matrices are drawn on a FRESH (no
+    /// `lora_weights_in`) call — `jammi_lora::LoraInitMode::ZerosB` (this
+    /// tier's ORIGINAL, only mode) or `Gaussian`. See this module's doc's
+    /// "Structural limitation: a single fresh-init call tests ONLY dL/dA"
+    /// section: under `ZerosB`, `B` starts at the exact zero matrix, so
+    /// `dL/dA` is IDENTICALLY zero on every `lora_a` tensor regardless of
+    /// whether either stack's backward arithmetic is correct there — a
+    /// single forward+backward at that init is STRUCTURALLY BLIND to a
+    /// `dL/dA` defect. `Gaussian` (both `A` and `B` drawn from `Normal(0,
+    /// 0.02)`, `jammi_lora::LoraInitMode::Gaussian`'s own doc) starts BOTH
+    /// factors nonzero, so `dL/dA` and the LoRA epilogue's own gradient term
+    /// are live from a single call — this is what
+    /// [`GradOracleReport::vacuous_tensor_count`] exists to certify: a
+    /// caller that needs every gradient live (the ablation orchestrator
+    /// below) asserts `vacuous_tensor_count == 0` on a `Gaussian` run and
+    /// refuses to proceed otherwise, never silently accepting a
+    /// structurally-blind fixture as if it were a real oracle.
+    pub lora_init: jammi_lora::LoraInitMode,
+}
+
+/// Below this L2 norm, a gradient vector is treated as (numerically) the
+/// zero vector — mirrors `compare_grad_oracle.py`'s own `NORM_FLOOR`
+/// constant (`1e-12`) EXACTLY, so a tensor this crate calls "vacuous" and a
+/// tensor the Python comparator calls "vacuous" are the SAME classification,
+/// never two independently-drifting floors that could disagree on a
+/// borderline tensor.
+const VACUOUS_NORM_FLOOR: f64 = 1e-12;
+
+/// `true` iff `grad`'s L2 norm is below [`VACUOUS_NORM_FLOOR`] — computed in
+/// `f64` (never `f32`) so a long `f32` gradient vector's own summation
+/// rounding cannot itself manufacture a false "vacuous" reading at this
+/// floor.
+fn grad_is_vacuous(grad: &[f32]) -> bool {
+    let sum_sq: f64 = grad.iter().map(|&g| (g as f64) * (g as f64)).sum();
+    sum_sq.sqrt() < VACUOUS_NORM_FLOOR
 }
 
 /// One trainable tensor's dumped gradient (and, for the non-vacuous check
@@ -226,7 +261,7 @@ pub struct GradOracleParams {
 /// actually used) — `f32` regardless of `backbone_dtype`: the D2H read
 /// widens STORAGE, it does not add mantissa bits the compute dtype lacked
 /// (same convention `finetune_step.rs`'s `losses` field doc states).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct GradOracleTensor {
     pub shape: Vec<usize>,
     pub grad: Vec<f32>,
@@ -235,9 +270,18 @@ pub struct GradOracleTensor {
 
 /// The oracle's full dump. See this module's doc for the placement/format
 /// contract every field below carries.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, serde::Deserialize)]
 pub struct GradOracleReport {
-    pub tool: &'static str,
+    // `String`, not `&'static str`: a round-tripped `Deserialize` (see
+    // `grad_oracle_ablation::spawn_arm`, which reads a child arm's dump
+    // back into an owned `GradOracleReport`) cannot borrow a `&'static
+    // str` out of a local, non-`'static` JSON text buffer — `serde_json::
+    // from_str`'s zero-copy borrowed-deserialize path for a `&'a str`
+    // field ties that borrow to the INPUT buffer's own lifetime, which a
+    // temporary `String` read from disk never satisfies. The wire format
+    // is unaffected (`serde_json` serializes `String` and `&str`
+    // identically); only the in-memory representation changed.
+    pub tool: String,
     /// Human-readable, for debugging only — NOT a comparator identity field
     /// (a path string is not comparable across two boxes/producers; see this
     /// module's doc's determinant table). `checkpoint_config_sha256`/
@@ -334,6 +378,41 @@ pub struct GradOracleReport {
     /// oracle's own CLI has no equivalent flag for) — recorded unconditionally,
     /// same posture as the 14 dispatch counters above.
     pub kernels_disabled_fired: Vec<String>,
+    /// Every `jammi_kernels::admission` op key that dispatched FUSED at
+    /// least once during this call's forward+backward (a snapshot-delta
+    /// read of `jammi_kernels::admission::snapshot_all()`, taken around the
+    /// same forward+backward the 14 explicit dispatch-counter fields above
+    /// bracket), sorted. This is the "registered admit key" enumeration
+    /// [`crate::grad_oracle_ablation`]'s `--ablate-each-op` orchestrator
+    /// drives its per-op ablation loop off of, in place of a hand-maintained
+    /// literal key list: `jammi_kernels::admission`'s own module doc
+    /// documents that not every op key in the crate's call graph reaches
+    /// `admit` on every run (a `"lora_epilogue"`/`"lora_dropout"`-style
+    /// registered-but-permanently-dead name, or a SUBSUMED key like
+    /// `"rope_fused"`/`"softmax_last_dim_fused"` that never fires while
+    /// `"attention_block_fused"` admits) — reading the keys that ACTUALLY
+    /// fired FUSED on this exact checkpoint/config, rather than assuming a
+    /// fixed set, is what keeps the ablation loop from wasting a run on an
+    /// op key `unmatched_disables()` would reject as an invalid leg.
+    /// PROVENANCE (a fact about which kernels this run reached, not a value
+    /// either producer's gradient math depends on).
+    pub live_admit_keys: Vec<String>,
+    /// How many of [`Self::gradients`]' tensors are [`grad_is_vacuous`] —
+    /// the fixture's own non-vacuous-control self-check (family F): under
+    /// `LoraInitMode::Gaussian` this must be `0` (both `dL/dA` and `dL/dB`
+    /// are live from a single fresh forward+backward — see
+    /// [`GradOracleParams::lora_init`]'s doc); under the legacy `ZerosB`
+    /// mode every `lora_a` tensor is STRUCTURALLY vacuous by construction,
+    /// so this is expected to be nonzero there. RECORDED, never gated by
+    /// `run()` itself (the same "records, does not gate" posture every
+    /// field on this report takes) — a caller with a non-vacuous premise to
+    /// certify (`grad_oracle_ablation::run`) is the one that asserts `== 0`
+    /// and refuses to proceed otherwise.
+    pub vacuous_tensor_count: usize,
+    /// The tensor names counted in [`Self::vacuous_tensor_count`], sorted —
+    /// so a caller's refusal message can name exactly which tensor(s) carry
+    /// no gradient signal, rather than only the count.
+    pub vacuous_tensor_names: Vec<String>,
     /// Keyed by jammi's internal `VarBuilder`-path tensor name (e.g.
     /// `layer.3.Wqkv.lora_a`), sorted for determinism (a `BTreeMap`
     /// serializes in key order; a `HashMap` would not).
@@ -399,7 +478,7 @@ pub fn run(params: &GradOracleParams) -> Result<GradOracleReport, Box<dyn std::e
         // purpose.
         lora_dropout: None,
         rank_pattern: &empty_ranks,
-        init_mode: jammi_lora::LoraInitMode::ZerosB,
+        init_mode: params.lora_init,
         seed: params.seed,
     };
 
@@ -491,6 +570,13 @@ pub fn run(params: &GradOracleParams) -> Result<GradOracleReport, Box<dyn std::e
     let lora_epilogue_dispatch_before = jammi_lora::lora_epilogue_dispatch_snapshot();
     let lora_linear_fused_dispatch_before = jammi_lora::lora_linear_fused_dispatch_snapshot();
     let attention_block_dispatch_before = jammi_encoders::attention_block_dispatch_snapshot();
+    // Every op-keyed counter currently registered (see
+    // `GradOracleReport::live_admit_keys`'s own doc) — a snapshot delta
+    // taken around the SAME forward+backward the 14 explicit fields above
+    // bracket, so `--ablate-each-op` can discover the real
+    // `JAMMI_KERNELS_DISABLE` key set this exact run reached, instead of a
+    // hand-maintained literal list.
+    let admit_snapshot_before = jammi_kernels::admission::snapshot_all();
 
     let (a, p, n) = if params.batched_forward {
         let joined = Tensor::cat(&[&blocks[0], &blocks[1], &blocks[2]], 0)?;
@@ -520,6 +606,16 @@ pub fn run(params: &GradOracleParams) -> Result<GradOracleReport, Box<dyn std::e
     let lora_epilogue_dispatch_after = jammi_lora::lora_epilogue_dispatch_snapshot();
     let lora_linear_fused_dispatch_after = jammi_lora::lora_linear_fused_dispatch_snapshot();
     let attention_block_dispatch_after = jammi_encoders::attention_block_dispatch_snapshot();
+    let admit_snapshot_after = jammi_kernels::admission::snapshot_all();
+    let mut live_admit_keys: Vec<String> = admit_snapshot_after
+        .iter()
+        .filter(|(op, after)| {
+            let before_fused = admit_snapshot_before.get(*op).map(|s| s.fused).unwrap_or(0);
+            after.fused.saturating_sub(before_fused) > 0
+        })
+        .map(|(op, _)| (*op).to_string())
+        .collect();
+    live_admit_keys.sort();
 
     // The RESOLVED `JAMMI_KERNELS_DISABLE` state (contract K-aux, now on
     // `main`) — see `GradOracleReport::kernels_disabled_requested`'s own
@@ -553,8 +649,15 @@ pub fn run(params: &GradOracleParams) -> Result<GradOracleReport, Box<dyn std::e
         );
     }
 
+    let vacuous_tensor_names: Vec<String> = gradients
+        .iter()
+        .filter(|(_, t)| grad_is_vacuous(&t.grad))
+        .map(|(name, _)| name.clone())
+        .collect();
+    let vacuous_tensor_count = vacuous_tensor_names.len();
+
     Ok(GradOracleReport {
-        tool: "jammi_grad_oracle",
+        tool: "jammi_grad_oracle".to_string(),
         model_dir: params.model_dir.display().to_string(),
         device: device_label,
         device_name: device_name(params.cuda_device),
@@ -620,6 +723,9 @@ pub fn run(params: &GradOracleParams) -> Result<GradOracleReport, Box<dyn std::e
             .saturating_sub(attention_block_dispatch_before.eager),
         kernels_disabled_requested,
         kernels_disabled_fired,
+        live_admit_keys,
+        vacuous_tensor_count,
+        vacuous_tensor_names,
         gradients,
     })
 }
@@ -659,6 +765,13 @@ mod tests {
             batched_forward: true,
             lora_weights_in: None,
             lora_weights_out: None,
+            // Existing tests below assert exact ZerosB semantics (`dL/dA
+            // IDENTICALLY zero`, etc.) — keep this fixture's DEFAULT on the
+            // legacy mode so every pre-existing test's behaviour is
+            // unchanged by this field's addition; the new
+            // `LoraInitMode::Gaussian`-specific tests below override it
+            // explicitly.
+            lora_init: jammi_lora::LoraInitMode::ZerosB,
         }
     }
 
@@ -965,6 +1078,114 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&weights_path);
+    }
+
+    /// Unit-level pin on [`grad_is_vacuous`]'s own floor, independent of any
+    /// full `run()` call: exactly at [`VACUOUS_NORM_FLOOR`] classifies as
+    /// vacuous (`<`, not `<=` — a vector whose norm lands EXACTLY on the
+    /// floor is still "below or at" in this classifier's own intent, and a
+    /// mutation flipping `<` to `<=` at this one boundary value would
+    /// otherwise be undetectable), while a norm one order of magnitude
+    /// above it does not.
+    #[test]
+    fn grad_is_vacuous_floor_boundary() {
+        assert!(grad_is_vacuous(&[0.0, 0.0, 0.0]));
+        // sqrt(3) * 1e-13 ~= 1.7e-13, well below VACUOUS_NORM_FLOOR (1e-12).
+        assert!(grad_is_vacuous(&[1e-13, 1e-13, 1e-13]));
+        // A single element at 1e-11 alone has norm 1e-11, one order of
+        // magnitude ABOVE the floor -- must NOT classify as vacuous.
+        assert!(!grad_is_vacuous(&[1e-11]));
+        assert!(!grad_is_vacuous(&[1.0, 0.0, 0.0]));
+    }
+
+    /// Cross-checks [`GradOracleReport::vacuous_tensor_count`]/
+    /// `vacuous_tensor_names` against `run()`'s own `gradients` map,
+    /// recomputed INDEPENDENTLY here (never by trusting the report's own
+    /// count) -- and pins the STRUCTURAL note this module's doc and
+    /// `LoraInitMode::ZerosB`'s field doc both make: under the legacy
+    /// `ZerosB` init, every vacuous tensor is a `lora_a`-suffixed one (`B ==
+    /// 0` makes `dL/dA` identically zero for ANY `A`), never a `lora_b`.
+    #[test]
+    fn grad_oracle_zeros_b_init_leaves_lora_a_structurally_vacuous() {
+        let report = run(&tiny_params()).expect("grad-oracle run (ZerosB, tiny_params default)");
+
+        let expected_names: Vec<String> = report
+            .gradients
+            .iter()
+            .filter(|(_, t)| grad_is_vacuous(&t.grad))
+            .map(|(name, _)| name.clone())
+            .collect();
+        assert_eq!(
+            report.vacuous_tensor_names, expected_names,
+            "report.vacuous_tensor_names must match an independent recomputation off \
+             report.gradients"
+        );
+        assert_eq!(report.vacuous_tensor_count, expected_names.len());
+        assert!(
+            report.vacuous_tensor_count > 0,
+            "ZerosB's own structural limitation (this module's doc) means at least the lora_a \
+             tensors must be vacuous at a fresh init -- a count of 0 here would mean either the \
+             fixture stopped using ZerosB or grad_is_vacuous stopped detecting the known-zero case"
+        );
+        for name in &report.vacuous_tensor_names {
+            assert!(
+                name.ends_with("lora_a"),
+                "{name}: a vacuous tensor under ZerosB must be a lora_a tensor -- dL/dB is \
+                 A-dependent even at B == 0 (see grad_oracle_lora_weights_in_actually_overrides_the_fresh_init's \
+                 own doc), so a vacuous lora_b entry here would be a genuine backward-path defect"
+            );
+        }
+    }
+
+    /// THE oracle this feature (ledger row 240) exists to make possible:
+    /// `LoraInitMode::Gaussian` starts BOTH `A` and `B` nonzero, so a
+    /// SINGLE fresh forward+backward must make EVERY trainable tensor's
+    /// gradient live -- `vacuous_tensor_count == 0`. This is the exact
+    /// assertion `grad_oracle_ablation::run` gates its own refusal on;
+    /// pinned here directly against `run()`, independent of that
+    /// orchestrator, so a regression in `Gaussian`'s own liveness
+    /// property is caught at this layer even if the ablation orchestrator
+    /// were never invoked.
+    #[test]
+    fn grad_oracle_gaussian_init_makes_every_gradient_live() {
+        let mut params = tiny_params();
+        params.lora_init = jammi_lora::LoraInitMode::Gaussian;
+        let report = run(&params).expect("grad-oracle run (Gaussian)");
+
+        assert_eq!(
+            report.vacuous_tensor_count, 0,
+            "Gaussian init must make every trainable tensor's gradient live -- a nonzero count \
+             here means dL/dA (or, less expectedly, dL/dB) collapsed to zero despite a nonzero B, \
+             which should not happen for this fixture's shapes/seed"
+        );
+        assert!(report.vacuous_tensor_names.is_empty());
+        // Independent recomputation, same discipline as the ZerosB test
+        // above -- never trust the report's own count without rechecking
+        // it against the raw gradients.
+        for (name, t) in &report.gradients {
+            assert!(
+                !grad_is_vacuous(&t.grad),
+                "{name}: report claims vacuous_tensor_count == 0 but this tensor's own gradient \
+                 is (numerically) the zero vector"
+            );
+        }
+    }
+
+    /// [`GradOracleReport::live_admit_keys`] is a SET rendered as a sorted
+    /// `Vec` (family J: no duplicate op key, ascending order) -- the
+    /// invariant `grad_oracle_ablation`'s per-op loop depends on (iterating
+    /// it directly as the ablation key list, never re-sorting/re-deduping
+    /// itself).
+    #[test]
+    fn grad_oracle_live_admit_keys_is_sorted_and_deduplicated() {
+        let report = run(&tiny_params()).expect("grad-oracle run");
+        let mut sorted_deduped = report.live_admit_keys.clone();
+        sorted_deduped.sort();
+        sorted_deduped.dedup();
+        assert_eq!(
+            report.live_admit_keys, sorted_deduped,
+            "live_admit_keys must already be sorted with no duplicate entries"
+        );
     }
 
     /// A process-unique temp directory (never `/tmp` directly, and never

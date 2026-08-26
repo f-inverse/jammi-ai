@@ -1037,10 +1037,149 @@ def floor_domain_violation(cosine_floor: float) -> str | None:
     return None
 
 
+def _ablation_provenance_problems(report: dict) -> list[str]:
+    """Every arm's provenance must be SELF-DESCRIBING before this mode
+    prints anything resembling a verdict: `unmatched_disables` empty (the
+    arm's OWN recorded `kernels_disabled_requested`/`kernels_disabled_fired`
+    pair, already diffed by `grad_oracle_ablation.rs::unmatched` — re-checked
+    here independently, never trusted verbatim) and `vacuous_tensor_count ==
+    0` (family F: this tool's whole premise is a `--lora-init gaussian`
+    fixture where EVERY gradient is live — see
+    `grad_oracle.rs::GradOracleReport::vacuous_tensor_count`'s own doc).
+    Returns one message per violation found (empty list means clean).
+    """
+    problems: list[str] = []
+    arms = report.get("arms")
+    if not isinstance(arms, list) or not arms:
+        return ["ablation report has no non-empty 'arms' list"]
+    for arm in arms:
+        label = arm.get("arm", "<unnamed arm>")
+        requested = set(arm.get("kernels_disabled_requested") or [])
+        fired = set(arm.get("kernels_disabled_fired") or [])
+        unmatched = sorted(requested - fired)
+        if unmatched:
+            problems.append(
+                f"arm {label!r}: kernels_disabled_requested not fully fired (unmatched="
+                f"{unmatched}) -- this arm's JAMMI_KERNELS_DISABLE provenance is not "
+                "self-describing"
+            )
+        # Independent re-derivation, not a re-print of the field already
+        # reported by the same arm's own `unmatched_disables` (Rust-computed
+        # off the SAME two lists) -- both must agree; a disagreement would
+        # mean the two computations of the identical set-difference drifted.
+        reported_unmatched = arm.get("unmatched_disables")
+        if reported_unmatched is not None and sorted(reported_unmatched) != unmatched:
+            problems.append(
+                f"arm {label!r}: this comparator's own unmatched-disables recomputation "
+                f"({unmatched}) disagrees with the report's own unmatched_disables field "
+                f"({sorted(reported_unmatched)})"
+            )
+        vacuous = arm.get("vacuous_tensor_count")
+        if vacuous is None or vacuous != 0:
+            problems.append(
+                f"arm {label!r}: vacuous_tensor_count={vacuous!r} -- every gradient must be "
+                "live for this comparison to carry evidence (see is_vacuous_pair's own doc for "
+                "the ZerosB structural blind spot this --lora-init gaussian fixture exists to "
+                "close)"
+            )
+        cosine = arm.get("overall_cosine_vs_f32_truth")
+        if not isinstance(cosine, (int, float)) or not math.isfinite(cosine):
+            problems.append(f"arm {label!r}: overall_cosine_vs_f32_truth is not a finite number: {cosine!r}")
+    return problems
+
+
+def main_ablation(args) -> int:
+    """`--ablation ABLATION_REPORT_JSON`: read a `jammi-bench grad-oracle
+    --ablate-each-op` `AblationReport` (`grad_oracle_ablation.rs`'s own
+    schema — a list of arms, each already carrying a Rust-computed
+    `overall_cosine_vs_f32_truth`), print the arm -> cosine table with each
+    arm's delta against the `all_fused` reference arm, and REFUSE (non-zero
+    exit, never print anything resembling PASS) if ANY arm's provenance is
+    not self-describing (`_ablation_provenance_problems`, above) — this
+    mode never re-derives the per-arm cosine itself (see
+    `grad_oracle_ablation.rs`'s own module doc, "Design: which side computes
+    the cosine", for why that split is deliberate here); it verifies the
+    MECHANISM (dispatch bookkeeping, non-vacuous premise) around a
+    Rust-computed number instead.
+
+    `--cosine-floor`: per this module's own `derive_cosine_floor`/
+    `floor_domain_violation` (reused verbatim, not reimplemented), a
+    DERIVED floor at ModernBERT-large's own depth/width is non-positive
+    (ledger row 240; `test_derive_cosine_floor_is_non_positive_at_modernbert_large_defaults`)
+    -- so at the DEFAULT `--num-layers 28 --hidden-size 1024`, this mode
+    REFUSES exactly like `main()`'s own two-positional path does, printing
+    WHY via `format_empirical_band`, unless an explicit `--cosine-floor`
+    (inside the valid `(0.0, 1.0]` domain) is supplied. This mode does not
+    itself PASS/FAIL an arm against the floor (that is
+    `ci/scripts/perf/check_fused_op_gradient_parity.py`'s job — a per-op
+    THRESHOLD against the `all_fused` arm, not an absolute floor against
+    `f32_truth`); the floor is required and printed here purely so the
+    table is shown next to the same empirical band `main()`'s own
+    two-positional path anchors against, never a silent, unexplained
+    number.
+    """
+    with open(args.ablation) as fh:
+        report = json.load(fh)
+
+    cosine_floor = (
+        args.cosine_floor
+        if args.cosine_floor is not None
+        else derive_cosine_floor(args.num_layers, args.hidden_size)
+    )
+    print(format_empirical_band(cosine_floor))
+    violation = floor_domain_violation(cosine_floor)
+    if violation is not None:
+        source = "an explicit --cosine-floor" if args.cosine_floor is not None else (
+            f"the DERIVED floor at --num-layers {args.num_layers} --hidden-size {args.hidden_size}"
+        )
+        print(
+            f"REFUSED: cosine_floor = {cosine_floor}, from {source}, is OUTSIDE the valid domain "
+            f"(0.0, 1.0]: {violation}. Pass an explicit --cosine-floor inside (0.0, 1.0] (see the "
+            "empirical band printed above).",
+            file=sys.stderr,
+        )
+        return EXIT_REFUSED
+
+    problems = _ablation_provenance_problems(report)
+    if problems:
+        for msg in problems:
+            print(f"PROVENANCE VIOLATION: {msg}", file=sys.stderr)
+        print("REFUSED")
+        return EXIT_REFUSED
+
+    arms = report["arms"]
+    reference = next((a for a in arms if a.get("arm") == "all_fused"), None)
+    if reference is None:
+        print("REFUSED: ablation report has no 'all_fused' reference arm", file=sys.stderr)
+        return EXIT_REFUSED
+    ref_cosine = reference["overall_cosine_vs_f32_truth"]
+
+    print(f"{'arm':<40} {'cosine_vs_f32_truth':>20} {'delta_vs_all_fused':>20}")
+    table = []
+    for arm in arms:
+        c = arm["overall_cosine_vs_f32_truth"]
+        delta = c - ref_cosine
+        label = arm.get("arm", "<unnamed>")
+        print(f"{label:<40} {c:>20.6f} {delta:>20.6f}")
+        table.append({"arm": label, "op_key": arm.get("op_key"), "cosine_vs_f32_truth": c, "delta_vs_all_fused": delta})
+
+    if args.out:
+        with open(args.out, "w") as fh:
+            json.dump({"cosine_floor": cosine_floor, "all_fused_cosine": ref_cosine, "table": table}, fh, indent=2)
+
+    print("OK")
+    return EXIT_PASS
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("report_a")
-    p.add_argument("report_b")
+    # `nargs="?"`, not required: `--ablation` is a SEPARATE entrypoint
+    # (`main_ablation`, below) that takes neither positional — see that
+    # function's own doc. `main()` itself enforces that exactly one of
+    # "--ablation" or "both positionals" is in play (never a third,
+    # partially-specified combination) before doing anything else.
+    p.add_argument("report_a", nargs="?")
+    p.add_argument("report_b", nargs="?")
     p.add_argument("--cosine-floor", type=float, default=None)
     p.add_argument("--num-layers", type=int, default=28, help="default: ModernBERT-large")
     p.add_argument("--hidden-size", type=int, default=1024, help="default: ModernBERT-large")
@@ -1056,7 +1195,34 @@ def main(argv=None):
             "jammi-vs-torch comparison."
         ),
     )
+    p.add_argument(
+        "--ablation",
+        type=str,
+        default=None,
+        metavar="ABLATION_REPORT_JSON",
+        help=(
+            "Read a `jammi-bench grad-oracle --ablate-each-op` AblationReport instead of the "
+            "two-positional cross-producer comparison — see main_ablation's own doc. Mutually "
+            "exclusive with report_a/report_b."
+        ),
+    )
     args = p.parse_args(argv)
+
+    if args.ablation is not None:
+        if args.report_a is not None or args.report_b is not None:
+            print(
+                "REFUSED: --ablation is mutually exclusive with report_a/report_b -- pass ONE of "
+                "the two entrypoints, never both",
+                file=sys.stderr,
+            )
+            return EXIT_REFUSED
+        return main_ablation(args)
+    if args.report_a is None or args.report_b is None:
+        print(
+            "REFUSED: report_a and report_b are both required unless --ablation is given",
+            file=sys.stderr,
+        )
+        return EXIT_REFUSED
 
     cosine_floor = (
         args.cosine_floor

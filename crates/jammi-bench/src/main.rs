@@ -63,6 +63,7 @@ mod finetune_step;
 mod fixture;
 mod gpu_inference;
 mod grad_oracle;
+mod grad_oracle_ablation;
 mod graph_train;
 mod model_inference;
 mod operator_mirror;
@@ -467,9 +468,33 @@ enum Command {
         /// this safetensors file.
         #[arg(long)]
         lora_weights_out: Option<PathBuf>,
-        /// Write the gradient/loss dump (JSON) here.
+        /// Write the gradient/loss dump (JSON) here — or, with
+        /// `--ablate-each-op`, the compact ablation-summary report (see
+        /// `grad_oracle_ablation.rs`'s module doc).
         #[arg(long)]
         out: PathBuf,
+        /// How a FRESH (no `--lora-weights-in`) call draws LoRA `A`/`B`:
+        /// `gaussian` (both nonzero, default — see `GradOracleParams::lora_init`'s
+        /// doc for why this is what makes every gradient LIVE) or
+        /// `zeros-b` (the legacy mode; `dL/dA` is structurally zero at a
+        /// fresh init under this mode).
+        #[arg(long, default_value = "gaussian")]
+        lora_init: String,
+        /// Run the full per-op ablation instead of a single dump: `all_fused`
+        /// (STRICT) → `f32_truth` → one arm per live admit key with
+        /// `JAMMI_KERNELS_DISABLE=<key>` → `all_off`, each at IDENTICAL LoRA
+        /// weights, all compared by cosine against the `f32_truth` arm. See
+        /// `grad_oracle_ablation.rs`'s module doc. `--out` then receives the
+        /// compact `AblationReport`, never a single-arm `GradOracleReport`.
+        #[arg(long, default_value_t = false)]
+        ablate_each_op: bool,
+        /// With `--ablate-each-op`: also copy every arm's RAW (full
+        /// per-element gradient) dump into this directory as
+        /// `<arm-slug>.json`, for an independent numpy-side re-derivation
+        /// of the cosine this command already computed. Omit to keep only
+        /// the compact `--out` report (the default).
+        #[arg(long)]
+        keep_arm_dumps: Option<PathBuf>,
     },
     /// The CPU-hermetic cache-hit SLO tier: drives the engine's opt-in producer
     /// memoization (`CachePolicy::Use`) on a cacheable producer (the
@@ -610,36 +635,72 @@ async fn main() -> std::process::ExitCode {
             lora_weights_in,
             lora_weights_out,
             out,
-        } => run_grad_oracle(
-            grad_oracle::GradOracleParams {
-                model_dir,
-                batch,
-                seq,
-                lora_rank,
-                lora_alpha,
-                target_modules: target_modules
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-                    .collect(),
-                backbone_dtype: match backbone_dtype.as_str() {
-                    "f32" => jammi_numerics::ComputePrecision::F32,
-                    "f16" => jammi_numerics::ComputePrecision::F16,
-                    "bf16" => jammi_numerics::ComputePrecision::BF16,
-                    other => {
-                        eprintln!("unknown backbone_dtype {other:?}; expected f32, f16, or bf16");
-                        return std::process::ExitCode::FAILURE;
-                    }
-                },
-                cuda_device: cuda,
-                seed,
-                batched_forward,
-                lora_weights_in,
-                lora_weights_out,
-            },
-            &out,
-        ),
+            lora_init,
+            ablate_each_op,
+            keep_arm_dumps,
+        } => {
+            let target_modules: Vec<String> = target_modules
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+            let backbone_dtype = match backbone_dtype.as_str() {
+                "f32" => jammi_numerics::ComputePrecision::F32,
+                "f16" => jammi_numerics::ComputePrecision::F16,
+                "bf16" => jammi_numerics::ComputePrecision::BF16,
+                other => {
+                    eprintln!("unknown backbone_dtype {other:?}; expected f32, f16, or bf16");
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
+            let lora_init = match lora_init.as_str() {
+                "gaussian" => jammi_lora::LoraInitMode::Gaussian,
+                "zeros-b" => jammi_lora::LoraInitMode::ZerosB,
+                other => {
+                    eprintln!("unknown lora_init {other:?}; expected gaussian or zeros-b");
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
+            if ablate_each_op {
+                run_grad_oracle_ablation(
+                    grad_oracle_ablation::AblationParams {
+                        model_dir,
+                        batch,
+                        seq,
+                        lora_rank,
+                        lora_alpha,
+                        target_modules,
+                        backbone_dtype,
+                        cuda_device: cuda,
+                        seed,
+                        batched_forward,
+                        lora_init,
+                        keep_arm_dumps,
+                    },
+                    &out,
+                )
+            } else {
+                run_grad_oracle(
+                    grad_oracle::GradOracleParams {
+                        model_dir,
+                        batch,
+                        seq,
+                        lora_rank,
+                        lora_alpha,
+                        target_modules,
+                        backbone_dtype,
+                        cuda_device: cuda,
+                        seed,
+                        batched_forward,
+                        lora_weights_in,
+                        lora_weights_out,
+                        lora_init,
+                    },
+                    &out,
+                )
+            }
+        }
         Command::CacheSloScale => run_cache_slo_scale().await,
         Command::RecomputeScale => run_recompute_scale().await,
     }
@@ -675,6 +736,28 @@ fn run_grad_oracle(
         return std::process::ExitCode::FAILURE;
     }
     std::process::ExitCode::SUCCESS
+}
+
+/// The `grad-oracle --ablate-each-op` path: see
+/// `grad_oracle_ablation.rs`'s module doc. Writes the compact
+/// `AblationReport` to `out` itself (`grad_oracle_ablation::run` already
+/// does this on success); this wrapper only translates `Err` into a
+/// nonzero exit, the same "records, does not gate" posture `run_grad_oracle`
+/// takes — except a REFUSAL (non-vacuous premise violated, or an arm's
+/// provenance not self-describing) is itself the gate here: `run` returns
+/// `Err` rather than writing `out` at all in that case, so a caller can
+/// never mistake "the file exists" for "the comparison is trustworthy".
+fn run_grad_oracle_ablation(
+    params: grad_oracle_ablation::AblationParams,
+    out: &std::path::Path,
+) -> std::process::ExitCode {
+    match grad_oracle_ablation::run(&params, out) {
+        Ok(_) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("grad-oracle --ablate-each-op failed: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
 }
 
 /// The `finetune-step` subcommand: run the tier and emit the report. Records;

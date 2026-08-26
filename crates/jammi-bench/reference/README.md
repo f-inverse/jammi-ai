@@ -457,3 +457,75 @@ torch-sdpa 0.825; torch-bf16 vs torch-f32 0.924; jammi-f32 vs torch-f32
 0.30-0.53) are the empirical anchor for picking a real `--cosine-floor`,
 not the derived bound. See `ci/scripts/perf/test_compare_grad_oracle.py`
 for its (numpy-optional) test suite.
+
+## `--ablate-each-op` — the per-op gradient-ablation gate (pod lane)
+
+**Every fused-op PR (a new/changed `CustomOp1|2|3` under
+`crates/jammi-kernels/src/ops/`, or a new admission call site) must attach
+an ablation report to its PR description.** This is the gate that finally
+exposed a real defect (ledger row 240) that every earlier fused-vs-eager
+oracle in this repo stayed green on — see
+`crates/jammi-bench/src/grad_oracle_ablation.rs`'s own module doc for why:
+a `LoraInitMode::ZerosB`-init `grad-oracle` run (this repo's ORIGINAL
+`grad-oracle` mode, still the default `finetune_step.rs`/`torch_grad_oracle.py`
+build off) makes `dL/dA` and the LoRA epilogue's own gradient term
+STRUCTURALLY zero on both sides, whatever the arithmetic feeding them —
+`--lora-init gaussian` (this feature's new default) is what makes the
+comparison non-vacuous.
+
+### What to run (on a CUDA pod — no CI lane has a GPU)
+
+```
+cargo run -p jammi-bench --release --features cuda -- grad-oracle \
+    --model-dir /path/to/ModernBERT-large \
+    --batch 4 --seq 128 --seed 42 \
+    --lora-rank 16 --lora-alpha 32 --target-modules Wqkv,Wo,Wi \
+    --backbone-dtype bf16 --cuda 0 \
+    --ablate-each-op \
+    --out grad-ablation-b4-s128.json
+```
+(`JAMMI_KERNELS_STRICT`/`JAMMI_KERNELS_DISABLE` are set PER ARM internally by
+the orchestrator — a caller of `--ablate-each-op` does not set either
+itself; see `grad_oracle_ablation.rs`'s module doc for the exact per-arm
+env-var table.) This spawns: `all_fused` (STRICT, seeds the shared LoRA
+weight file) → `f32_truth` (an f32-precision higher-precision reference,
+`docs/maintainer/cuda-kernel-guide.md` §3.3) → one `ablate:<op_key>` arm per
+op key that actually dispatched FUSED on `all_fused`'s own run (never a
+hand-maintained list — `GradOracleReport::live_admit_keys`) → `all_off`
+(`JAMMI_KERNELS_DISABLE=all`). Every arm loads the IDENTICAL LoRA weights
+(`--lora-weights-out`/`--lora-weights-in` round trip, unchanged from the
+single-run `grad-oracle` mode). The command REFUSES (nonzero exit, no `--out`
+file written) if the fixture is not actually non-vacuous
+(`vacuous_tensor_count != 0` on any arm) or if any arm's
+`JAMMI_KERNELS_DISABLE` provenance is not self-describing
+(`unmatched_disables` non-empty) — a written report is always a trustworthy
+one, never merely "the command exited 0".
+
+### Attach to the PR
+
+1. The `--out` JSON itself (or a link to the committed artifact, if this is
+   the kind of PR that commits one under
+   `crates/jammi-kernels/artifacts/cuda-runs/` —
+   `python3 ci/scripts/check_cuda_run_artifacts.py` gates that path's
+   schema).
+2. `python3 ci/scripts/perf/check_fused_op_gradient_parity.py
+   grad-ablation-b4-s128.json` — the CI-shaped per-op threshold gate
+   (`FUSED_OP_COSINE_DELTA_THRESHOLD`, derived from ledger row 240's
+   measured 0.20 all-fused-to-all-eager whole-composition gap; see that
+   script's own module doc for the full derivation). PASTE its stdout (the
+   `threshold:`/`PASS`|`FAIL` lines and any `PROBLEM:` lines on stderr) into
+   the PR description — this is the number a reviewer checks, not an
+   eyeballed diff of the raw JSON.
+3. Optionally, `python3 ci/scripts/perf/compare_grad_oracle.py --ablation
+   grad-ablation-b4-s128.json --cosine-floor <F>` for the human-readable
+   arm → cosine → Δ-vs-all_fused table (see that mode's own doc for why an
+   explicit `--cosine-floor` is REQUIRED at ModernBERT-large's own
+   depth/width — the derived floor is non-positive there, ledger row 240).
+
+`check_fused_op_gradient_parity.py --self-test` is the ONLY leg of this
+gate wired into `ci.yml` (`.github/workflows/ci.yml`'s `guard` matrix,
+"fused-op gradient parity gate self-test") — it proves the gate's own
+RED/GREEN logic against synthetic reports, never a real GPU run. The real
+invocation against a live ablation report is manual, pod-lane work, the
+same "no CI lane has a GPU" posture every other GPU-dependent measurement in
+this repo takes (`docs/maintainer/cuda-kernel-guide.md` §5).

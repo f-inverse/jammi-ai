@@ -698,6 +698,19 @@ jobs:
           # misroute) before this fix; was wired into no workflow at all.
           - name: reference torch_grad_oracle name-translation suite
             cmd: python3 crates/jammi-bench/reference/test_torch_grad_oracle_names.py
+          # The fused-op-gradient-parity gate's OWN self-test (RED/GREEN
+          # cases against synthetic AblationReport fixtures, never a real
+          # GPU run — `check_fused_op_gradient_parity.py`'s own module doc).
+          # This gate's REAL invocation (a real
+          # `jammi-bench grad-oracle --ablate-each-op` report, checked
+          # against the per-op cosine-delta threshold derived from ledger
+          # row 240) needs a live CUDA box and is a MANUAL pod-lane step
+          # (`docs/maintainer/cuda-kernel-guide.md` §5: no CI lane has a
+          # GPU) — this leg only proves the gate's own logic is sound, the
+          # same "hermetic self-test wired, GPU-dependent real run manual"
+          # split `check_cuda_run_artifacts.py`'s schema checks take.
+          - name: fused-op gradient parity gate self-test
+            cmd: python3 ci/scripts/perf/check_fused_op_gradient_parity.py --self-test
     steps:
       - uses: actions/checkout@v4
         with:

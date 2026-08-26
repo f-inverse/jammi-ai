@@ -6216,30 +6216,33 @@ fn flash_upstream_acceptance_form_vs_f32_reference_dense_cuda() {
     }
 }
 
-/// RED control: the FLASH leg's own window dropped entirely (`Some(64)` ->
-/// `None`) while the reference/eager side keeps the real radius — must
-/// VIOLATE the upstream bound (out, dqkv, or both). A genuine one-column
-/// radius perturbation (`Some(64)` -> `Some(63)`) was tried first and
-/// measured HEALTHY at this shape (`out fused=95.19 eager=48.56
-/// bound(2x)=97.13` -- real signal, ~2x eager's own error, but inside the
-/// bound by only ~2%): a single boundary column out of 512 positions is
-/// genuinely near this metric's own detection floor at max-abs, not a
-/// weak assertion. Dropping the window entirely is the discriminating
-/// perturbation this RED control actually needs (guide §3.8: no absolute
-/// floor here, so this is not absorbed the way it would be under a
-/// `+ 0.05` floor).
+/// RED control: the FLASH leg's own window radius collapsed to `Some(0)`
+/// (self-only attention) while the reference/eager side keeps the real
+/// radius (64) — must VIOLATE the upstream bound (out, dqkv, or both).
+/// Two WEAKER perturbations were measured first and found NOT
+/// discriminating at this shape/fixture/amplitude (`qkv_fixture`'s smooth,
+/// deterministic sinusoid + RoPE decays fast enough that this fixture's
+/// own attention mass concentrates well inside a 63-token radius, so
+/// widening or removing the window past that point changes nothing this
+/// metric can see): a one-column radius perturbation (`Some(64)` ->
+/// `Some(63)`, `out fused=95.19 eager=48.56 bound(2x)=97.13`) and dropping
+/// the window entirely (`Some(64)` -> `None`) both measured BIT-IDENTICAL
+/// to the healthy `Some(64)` result (`out fused=95.19` in all three
+/// cases). `Some(0)` measured `out fused=236.38` — 2.4x over the 2x
+/// bound — the discriminating perturbation this RED control actually
+/// needs (guide §3.8: no absolute floor here, so this is not absorbed the
+/// way it would be under a `+ 0.05` floor).
 #[test]
 #[cfg(feature = "flash-attn")]
-fn flash_upstream_acceptance_form_red_control_window_dropped_cuda() {
+fn flash_upstream_acceptance_form_red_control_window_radius_zero_cuda() {
     let Some(cuda) = cuda_device() else {
         return;
     };
     let m = measure_flash_upstream_form(&cuda, 8, 512, 16, 64, Some(64), Some(0), 74.0, 12.0);
-    eprintln!("DIAG window=Some(64) flash_window=Some(0): {m:?}");
     assert!(
         !m.out_ok() || !m.dqkv_ok(),
-        "flash window dropped (Some(64) -> None) must VIOLATE the upstream bound on at least one \
-         leg -- out fused={:e} eager={:e} bound(2x)={:e}; dqkv fused={:e} eager={:e} \
+        "flash window radius collapsed to Some(0) must VIOLATE the upstream bound on at least \
+         one leg -- out fused={:e} eager={:e} bound(2x)={:e}; dqkv fused={:e} eager={:e} \
          bound(3x)={:e} -- if this assertion fails, the healthy oracle above would NOT have \
          caught this defect",
         m.out_fused_max,

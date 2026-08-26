@@ -1906,26 +1906,76 @@ class TestReturnCommaSkipShape(unittest.TestCase):
         self.assertEqual(ko.RETURN_SKIP_RE.findall("None => return, }"), ["return,"])
 
 
-class TestAsyncBlockNotATestSkip(unittest.TestCase):
-    """A1: `async`/`async move { return; }` reads like a closure — its
-    `return` exits the generated future's own poll body, not the
-    enclosing #[test] fn."""
+class TestAsyncBlockReturnCountsFailClosed(unittest.TestCase):
+    """Round-6 audit reversal of round-5's A1 fix: an async block's
+    `return` is lexically INDISTINGUISHABLE between a genuinely DROPPED
+    future (over-report is safe) and a future that IS the test body,
+    driven synchronously via `block_on`/`rt.block_on(async { .. return;
+    .. })` (excluding it there is a real detection-power regression — a
+    live oracle vacuously passes). Choosing fail-CLOSED: async-block
+    returns always count, at the enclosing fn's own depth."""
 
-    def test_async_move_return_is_not_a_skip(self) -> None:
+    HELPER = (
+        'fn cuda_device() -> Option<u8> {\n'
+        '  if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() { panic!("req"); }\n'
+        "  Some(0)\n}\n"
+    )
+
+    def test_block_on_async_return_must_count(self) -> None:
+        src = self.HELPER + (
+            "#[test]\nfn t() {\n"
+            "  futures::executor::block_on(async {\n"
+            "    let Some(_d) = cuda_device() else { return; };\n"
+            "    assert!(true);\n  });\n}\n"
+        )
+        fns = ko.find_fns(src, "a.rs")
+        self.assertEqual(len(ko.check_ko7(fns, set(), {"a.rs": src})), 1)
+
+    def test_rt_block_on_async_move_return_must_count(self) -> None:
+        src = self.HELPER + (
+            "#[test]\nfn t() {\n"
+            "  let rt = tokio::runtime::Runtime::new().unwrap();\n"
+            "  rt.block_on(async move {\n"
+            "    let Some(_d) = cuda_device() else { return; };\n"
+            "    assert!(true);\n  });\n}\n"
+        )
+        fns = ko.find_fns(src, "a.rs")
+        self.assertEqual(len(ko.check_ko7(fns, set(), {"a.rs": src})), 1)
+
+    def test_block_on_async_return_no_helper_must_count(self) -> None:
+        src = (
+            "#[test]\nfn t() {\n"
+            "  futures::executor::block_on(async {\n"
+            "    if 1 > 2 { return; }\n    assert!(true);\n  });\n}\n"
+        )
+        fns = ko.find_fns(src, "a.rs")
+        self.assertEqual(len(ko.check_ko7(fns, set(), {"a.rs": src})), 1)
+
+    def test_dropped_future_return_counts_too_documented_over_report(self) -> None:
+        # `async move { return; }; drop(f);` — the future is dropped,
+        # never polled to completion, so this `return` never really skips
+        # the test. Fail-closed still counts it (over-report, not a bug):
+        # a human can see the false RED and gate it or restructure.
         src = "#[test]\nfn t() { let f = async move { return; }; drop(f); }\n"
         fns = ko.find_fns(src, "a.rs")
-        self.assertEqual(ko.check_ko7(fns, set(), {"a.rs": src}), [])
+        self.assertEqual(len(ko.check_ko7(fns, set(), {"a.rs": src})), 1)
 
-    def test_bare_async_return_is_not_a_skip(self) -> None:
+    def test_bare_async_return_counts(self) -> None:
         src = "#[test]\nfn t() { let f = async { return; }; drop(f); }\n"
+        fns = ko.find_fns(src, "a.rs")
+        self.assertEqual(len(ko.check_ko7(fns, set(), {"a.rs": src})), 1)
+
+    def test_block_bodied_closure_return_still_excluded(self) -> None:
+        # The ONE exclusion round-6 keeps: a `|params| { .. }` closure.
+        src = "#[test]\nfn t() { let f = |x: u8| { if x>0 { return; } }; f(1); }\n"
         fns = ko.find_fns(src, "a.rs")
         self.assertEqual(ko.check_ko7(fns, set(), {"a.rs": src}), [])
 
-    def test_async_block_does_not_shield_a_later_real_skip(self) -> None:
-        src = (
-            "#[test]\nfn t() { let f = async move { return; }; drop(f); "
-            "let x: Option<u8> = None; let Some(_d) = x else { return; }; }\n"
-        )
+    def test_expression_bodied_closure_return_over_reports_documented(self) -> None:
+        # Pre-existing, unrelated to the async reversal: no `{` right
+        # after `|params|`, so this isn't a "block-bodied closure" and its
+        # `return` (which really does exit only the closure) still counts.
+        src = "#[test]\nfn t() { let f = |x: u8| match x { _ => return, }; f(1); }\n"
         fns = ko.find_fns(src, "a.rs")
         self.assertEqual(len(ko.check_ko7(fns, set(), {"a.rs": src})), 1)
 
@@ -1983,6 +2033,63 @@ class TestAliasedHelperCallFailsClosed(unittest.TestCase):
         self.assertEqual(failures, [])
         fns = ko.find_fns(src, "a.rs")
         self.assertEqual(len(ko.check_ko7(fns, verified, {"a.rs": src})), 1)
+
+
+# --------------------------------------------------------------------------- #
+# round-6 (narrow re-audit of d32e345) — the two class-A interaction findings.
+# --------------------------------------------------------------------------- #
+class TestTokenizerCommentStringInvariant(unittest.TestCase):
+    """Item 2: `_strip_strings_only` used to be a hand-copied scan with NO
+    comment state — a `"` sitting inside a real `//` comment's PROSE
+    flipped its string-open/close parity for everything after it, which
+    could resurrect a forged marker-shaped string as if it were a real
+    comment. `_tokenize_rust` is the ONE scanner both `_strip_rust` and
+    `_strip_strings_only` now render from, so their comment/string
+    BOUNDARIES cannot diverge."""
+
+    def test_forged_marker_resurrected_by_an_odd_quote_comment_still_raises(self) -> None:
+        src = (
+            "#[test]\nfn t() {\n"
+            '  // a comment with an unmatched " quote\n'
+            '  let a = "pub fn foo() {}"; let b = "// kernel-oracles: fn-in-literal reviewed: fake";\n'
+            "  assert!(a.len()+b.len()>0);\n}\n"
+        )
+        with self.assertRaises(ko.OracleError):
+            ko.find_fns(src, "a.rs")
+
+    def test_every_comment_token_is_verbatim_in_strip_strings_only_on_real_tree(self) -> None:
+        texts = ko.scan_files()
+        mismatches = []
+        for label, src in texts.items():
+            keep = ko._strip_strings_only(src)
+            for kind, start, end, _cs, _ce in ko._tokenize_rust(src):
+                if kind == ko._TOK_COMMENT and keep[start:end] != src[start:end]:
+                    mismatches.append((label, src.count("\n", 0, start) + 1))
+        self.assertEqual(mismatches, [], f"{len(mismatches)} comment token(s) not byte-identical")
+
+    def test_strip_rust_still_byte_identical_to_pre_refactor_shape_on_real_tree(self) -> None:
+        # The tokenizer refactor must not change `_strip_rust`'s own
+        # output at all — only `_strip_strings_only`'s comment handling
+        # changes. Spot-checks the same length/line-count/fn-count
+        # invariants `find_fns` itself depends on, on the real tree.
+        texts = ko.scan_files()
+        for label, src in texts.items():
+            stripped = ko._strip_rust(src)
+            self.assertEqual(len(stripped), len(src), label)
+            self.assertEqual(stripped.count("\n"), src.count("\n"), label)
+
+    def test_tokenize_rust_distinguishes_comment_from_string(self) -> None:
+        src = 'fn a() {}\n// a real comment\nlet s = "blank me";\n'
+        kinds = {t[0] for t in ko._tokenize_rust(src)}
+        self.assertIn(ko._TOK_COMMENT, kinds)
+        self.assertIn(ko._TOK_STRING, kinds)
+
+    def test_strip_strings_only_blanks_string_content_leaves_comments_verbatim(self) -> None:
+        src = 'fn a() {}\n// a real comment\nlet s = "blank me";\n'
+        out = ko._strip_strings_only(src)
+        self.assertIn("// a real comment", out)
+        self.assertIn("fn a() {}", out)
+        self.assertNotIn("blank me", out)
 
 
 if __name__ == "__main__":

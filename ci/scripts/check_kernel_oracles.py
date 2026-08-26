@@ -52,6 +52,25 @@ limitation, not a bug this gate closes): within the SAME `#[test]` fn body, each
 skip(s) immediately downstream of it, never every later skip in the same fn
 unconditionally.
 
+A `return`/`process::exit` inside a BLOCK-BODIED closure (`|params| { .. }`,
+`|params| -> Ty { .. }`) or a nested `fn` ITEM defined inside the test body is
+excluded — a different control-flow scope, not a TEST skip. An `async`/`async
+move` BLOCK is deliberately NOT excluded (round-6 audit reversal of a round-5
+regression): this scanner cannot lexically tell a genuinely DROPPED future
+(`spawn(async move { .. return; .. });`, whose `return` exits a future nobody
+ever polls to completion) from a future that IS the test body, driven
+synchronously via `block_on`/`rt.block_on(async { .. return; .. })`, where the
+`return` is exactly as real a skip as any other. Fail-CLOSED wins the
+tradeoff: every async-block `return` counts as a skip at the enclosing fn's
+own depth, which correctly catches the `block_on` shape at the cost of
+OVER-reporting a genuinely-dropped future's `return` as an ungated skip (a
+false RED a human can see and gate or restructure, never a false GREEN). The
+SAME over-report applies, pre-existing and unrelated to the closure exclusion
+above, to an EXPRESSION-BODIED closure (`|x| match x { _ => return, }`, `|x|
+if c { return; }` — no `{` immediately follows the `|params|`, so it is not a
+"block-bodied closure" by the shape above and its `return` is counted, even
+though it does exit only the closure's own body, not the test fn).
+
 Fn discovery (`find_fns`) and `is_test` classification both run over the ONE
 canonical stripped text (`_strip_rust` — comments, including NESTED block
 comments, and string/char-literal CONTENTS all blanked; a `JAMMI_REQUIRE_*` run
@@ -459,73 +478,106 @@ def _blank_string_content(content: str) -> str:
     return "".join(out)
 
 
-def _strip_rust(source: str) -> str:
-    out: list[str] = []
+# Round-6 audit item 2 (class A): ONE tokenizer for comment/string/char/code
+# classification. `_strip_strings_only` used to be a SEPARATE, hand-copied
+# scan that reused the string/char branches but simply OMITTED the comment
+# branches (its own comment claimed it "reuses the exact same ... logic as
+# `_strip_rust`" — false; it never tracked `//`/`/* */` at all). Since it had
+# no comment state, a `"` sitting inside a real comment's PROSE (e.g.
+# `// happen to compile"`) flipped its string-open/close parity for
+# everything after it — including a LATER, genuinely-forged marker-shaped
+# string, which the parity flip could then swallow as "still inside the
+# first string" and never re-recognize as its own separate string at all,
+# defeating the very check `_strip_strings_only` exists for. `_tokenize_rust`
+# is the ONE scan (identical state machine to the OLD `_strip_rust`, since
+# that implementation's comment/string/char tracking was always correct);
+# `_strip_rust` and `_strip_strings_only` are thin renderers over its token
+# stream, so their comment/string/char BOUNDARIES can never diverge again —
+# only what each renderer does with a given token kind (blank vs. keep) can
+# differ.
+_TOK_CODE = "code"
+_TOK_COMMENT = "comment"
+_TOK_STRING = "string"
+_TOK_CHAR = "char"
+
+
+def _tokenize_rust(source: str) -> list[tuple[str, int, int, int, int]]:
+    """ONE walk over `source`. Yields `(kind, start, end, content_start,
+    content_end)` — half-open spans, contiguous, covering the WHOLE source.
+    For `_TOK_STRING`, `[content_start:content_end)` is the interior (the
+    part `_blank_string_content` blanks; delimiters are `[start:content_
+    start)` and `[content_end:end)`); every other kind has `content_start
+    == start` and `content_end == end` (unused). Handles nested `/* */`,
+    raw/byte/plain strings, char/byte-char literals vs. a bare lifetime
+    (`'a`, left as ordinary code, never consumed as an unterminated char
+    literal) — see the module comment above `_blank_string_content` for
+    why each of these matters.
+    """
+    tokens: list[tuple[str, int, int, int, int]] = []
     i, n = 0, len(source)
     while i < n:
         two = source[i : i + 2]
 
         if two == "//":
+            start = i
             while i < n and source[i] != "\n":
-                out.append(" ")
                 i += 1
+            tokens.append((_TOK_COMMENT, start, i, start, i))
             continue
 
         if two == "/*":
+            start = i
             depth = 1
-            out.append("  ")
             i += 2
             while i < n and depth > 0:
                 if source[i : i + 2] == "/*":
                     depth += 1
-                    out.append("  ")
                     i += 2
                     continue
                 if source[i : i + 2] == "*/":
                     depth -= 1
-                    out.append("  ")
                     i += 2
                     continue
-                out.append("\n" if source[i] == "\n" else " ")
                 i += 1
+            tokens.append((_TOK_COMMENT, start, i, start, i))
             continue
 
         m = _RAW_STR_OPEN_RE.match(source, i)
         if m:
+            start = i
             hashes = m.group(1)
-            opener = m.group(0)
-            out.append(opener)  # delimiter chars (b/r/#/") kept VERBATIM
-            i = m.end()
+            opener_end = m.end()
             closer = '"' + hashes
-            end = source.find(closer, i)
-            if end == -1:
+            close_pos = source.find(closer, opener_end)
+            if close_pos == -1:
                 end = n
-            out.append(_blank_string_content(source[i:end]))
+                content_end = n
+            else:
+                end = close_pos + len(closer)
+                content_end = close_pos
+            tokens.append((_TOK_STRING, start, end, opener_end, content_end))
             i = end
-            if i < n:
-                out.append(closer)
-                i += len(closer)
             continue
 
         if two == 'b"' or source[i] == '"':
+            start = i
             prefix_len = 2 if two == 'b"' else 1
-            out.append(source[i : i + prefix_len])  # b/" delimiter kept VERBATIM
-            i += prefix_len
-            content_start = i
-            while i < n and source[i] != '"':
-                if source[i] == "\\" and i + 1 < n:
-                    i += 2
+            j = i + prefix_len
+            while j < n and source[j] != '"':
+                if source[j] == "\\" and j + 1 < n:
+                    j += 2
                     continue
-                i += 1
-            out.append(_blank_string_content(source[content_start:i]))
-            if i < n:
-                out.append('"')  # closing quote kept VERBATIM
-                i += 1
+                j += 1
+            content_end = j
+            end = j + 1 if j < n else j
+            tokens.append((_TOK_STRING, start, end, start + prefix_len, content_end))
+            i = end
             continue
 
         # char / byte-char literal, OR a lifetime (`'a`, `'static`) — only a
         # genuine `'<escaped-or-one-char>'` shape is consumed as a literal;
-        # anything else (a lifetime) leaves just the quote character alone.
+        # anything else (a lifetime) leaves just the quote character alone,
+        # as ordinary CODE.
         if source[i] == "'" or two == "b'":
             prefix_len = 2 if two == "b'" else 1
             start = i
@@ -546,96 +598,65 @@ def _strip_rust(source: str) -> str:
             elif j < n and source[j : j + 1] != "'" and source[j + 1 : j + 2] == "'":
                 consumed_to = j + 2
             if consumed_to is not None:
-                out.append(" " * (consumed_to - start))
+                tokens.append((_TOK_CHAR, start, consumed_to, start, consumed_to))
                 i = consumed_to
                 continue
-            out.append(source[i])
+            tokens.append((_TOK_CODE, i, i + 1, i, i + 1))
             i += 1
             continue
 
-        out.append(source[i])
+        if tokens and tokens[-1][0] == _TOK_CODE and tokens[-1][2] == i:
+            _k, s0, _e0, cs0, _ce0 = tokens[-1]
+            tokens[-1] = (_TOK_CODE, s0, i + 1, cs0, i + 1)
+        else:
+            tokens.append((_TOK_CODE, i, i + 1, i, i + 1))
         i += 1
-    return "".join(out)
+    return tokens
 
 
-# Round-5 audit advisory A3: a reviewed marker (`// kernel-oracles: ...`)
-# matched against RAW source text is fooled by a STRING LITERAL that
-# merely CONTAINS marker-shaped text (`let b = "// kernel-oracles: ...
-# reviewed: fake";` — no real comment there at all) into treating a
-# genuine, unmarked desync/mismatch as reviewed. A marker only counts if
-# it survives THIS stripper — string/char CONTENT blanked (reusing the
-# exact same string/char-tracking logic as `_strip_rust`, so a bug in one
-# cannot diverge from the other), comments and code left VERBATIM (the
-# opposite trade of `_strip_rust`, which blanks comments too).
-def _strip_strings_only(source: str) -> str:
+def _render_tokens(
+    source: str, tokens: list[tuple[str, int, int, int, int]], *, blank_comments: bool, blank_strings: bool
+) -> str:
     out: list[str] = []
-    i, n = 0, len(source)
-    while i < n:
-        two = source[i : i + 2]
-
-        m = _RAW_STR_OPEN_RE.match(source, i)
-        if m:
-            hashes = m.group(1)
-            opener = m.group(0)
-            out.append(opener)
-            i = m.end()
-            closer = '"' + hashes
-            end = source.find(closer, i)
-            if end == -1:
-                end = n
-            out.append(_blank_string_content(source[i:end]))
-            i = end
-            if i < n:
-                out.append(closer)
-                i += len(closer)
-            continue
-
-        if two == 'b"' or source[i] == '"':
-            prefix_len = 2 if two == 'b"' else 1
-            out.append(source[i : i + prefix_len])
-            i += prefix_len
-            content_start = i
-            while i < n and source[i] != '"':
-                if source[i] == "\\" and i + 1 < n:
-                    i += 2
-                    continue
-                i += 1
-            out.append(_blank_string_content(source[content_start:i]))
-            if i < n:
-                out.append('"')
-                i += 1
-            continue
-
-        if source[i] == "'" or two == "b'":
-            prefix_len = 2 if two == "b'" else 1
-            start = i
-            j = i + prefix_len
-            consumed_to = None
-            if j < n and source[j] == "\\":
-                k = j + 1
-                if k < n and source[k] == "u" and k + 1 < n and source[k + 1] == "{":
-                    k += 2
-                    while k < n and source[k] != "}":
-                        k += 1
-                    if k < n:
-                        k += 1
-                else:
-                    k += 1
-                if k < n and source[k] == "'":
-                    consumed_to = k + 1
-            elif j < n and source[j : j + 1] != "'" and source[j + 1 : j + 2] == "'":
-                consumed_to = j + 2
-            if consumed_to is not None:
-                out.append(" " * (consumed_to - start))
-                i = consumed_to
-                continue
-            out.append(source[i])
-            i += 1
-            continue
-
-        out.append(source[i])
-        i += 1
+    for kind, start, end, content_start, content_end in tokens:
+        text = source[start:end]
+        if kind == _TOK_CODE:
+            out.append(text)
+        elif kind == _TOK_COMMENT:
+            out.append("".join("\n" if c == "\n" else " " for c in text) if blank_comments else text)
+        elif kind == _TOK_CHAR:
+            out.append(" " * len(text) if blank_strings else text)
+        else:  # _TOK_STRING
+            if blank_strings:
+                out.append(
+                    source[start:content_start]
+                    + _blank_string_content(source[content_start:content_end])
+                    + source[content_end:end]
+                )
+            else:
+                out.append(text)
     return "".join(out)
+
+
+def _strip_rust(source: str) -> str:
+    """strip_all mode: comments AND string/char-literal CONTENT blanked
+    (delimiters, and any `JAMMI_REQUIRE_*` run inside a string, kept
+    VERBATIM — see the module comment above); code kept verbatim.
+    Length-preserving.
+    """
+    return _render_tokens(source, _tokenize_rust(source), blank_comments=True, blank_strings=True)
+
+
+def _strip_strings_only(source: str) -> str:
+    """blank_strings_keep_comments mode (round-5/6 audit A3): string/char-
+    literal CONTENT blanked, comments and code kept VERBATIM — used ONLY by
+    the reviewed-marker checks, so a marker-shaped substring sitting inside
+    a STRING can never be mistaken for a real comment. Shares `_tokenize_
+    rust`'s ONE comment/string/char boundary scan with `_strip_rust` (round-6
+    audit item 2) — the two views can no longer diverge on WHERE a comment
+    or string starts and ends, only on whether a given kind is blanked.
+    """
+    return _render_tokens(source, _tokenize_rust(source), blank_comments=False, blank_strings=True)
 
 
 def _strip_comments_only_independent(source: str) -> str:
@@ -708,14 +729,19 @@ def check_fn_desync(source: str, file_label: str) -> None:
     the independent comments-only stripper's output. A line where they
     disagree (a string/char literal on that line contains a `fn <name>(`-
     shaped substring) must carry a `// kernel-oracles: fn-in-literal
-    reviewed: <reason>` marker on ITS OWN raw text or the line DIRECTLY
-    ABOVE it (raw text, since the marker is itself a `//` comment both
-    strippers would otherwise blank) — an unmarked desync line still fails
-    closed exactly as before. A marker present on a line that covers NO
-    desync (neither its own line nor the line below) is itself a FAIL —
-    mirrors the doc-number allowlist's "only shrinks" discipline: a marker
-    that no longer corresponds to a real desync must be REMOVED, never
-    accumulate as dead weight nobody can tell is still load-bearing.
+    reviewed: <reason>` marker on ITS OWN line or the line DIRECTLY ABOVE
+    it — an unmarked desync line still fails closed exactly as before. A
+    marker present on a line that covers NO desync (neither its own line
+    nor the line below) is itself a FAIL — mirrors the doc-number
+    allowlist's "only shrinks" discipline: a marker that no longer
+    corresponds to a real desync must be REMOVED, never accumulate as
+    dead weight nobody can tell is still load-bearing. The marker is
+    matched against `_strip_strings_only`'s view (round-5/6 audit A3) —
+    NOT raw text — so a marker-shaped SUBSTRING that only exists inside
+    some OTHER string literal on the line cannot masquerade as a real
+    reviewed comment (a real marker IS itself a `//` comment, which this
+    view — unlike `_strip_rust`'s — leaves verbatim, so a genuine one
+    still matches).
     """
     lines_raw = source.splitlines()
     n = len(lines_raw)
@@ -1116,14 +1142,28 @@ def _file_imports_exit(source_text: str) -> bool:
 # scope entirely. `body_stripped` starts at the test fn's own opening `{`
 # (no head text before it), so any `FN_HEAD_RE` match found INSIDE it is
 # necessarily a NESTED fn; any `|params| { .. }`/`|params| -> Ty { .. }`
-# closure head found INSIDE it opens a nested scope the same way. Round-5
-# audit advisory A1 widens this to an `async`/`async move` BLOCK
-# (`let f = async move { return; }; drop(f);`) — its `return` returns from
-# the generated future's own poll body, exactly as a closure's does, not
-# from the enclosing #[test] fn.
-_CLOSURE_HEAD_END_RE = re.compile(
-    r"\|[^|{}]*\|\s*(?:->\s*[^{;]+?)?\s*\{$|\basync\s+(?:move\s+)?\{$"
-)
+# closure head found INSIDE it opens a nested scope the same way.
+#
+# Round-5 audit advisory A1 widened this to also exclude an `async`/
+# `async move` BLOCK — round-6 audit REVERTED that: an async block's
+# `return` is lexically INDISTINGUISHABLE, by this scanner, between two
+# opposite-consequence shapes — a genuinely DROPPED future (`spawn(async
+# move { .. return; .. });`, `let f = async move { return; }; drop(f);`,
+# where the return exits a future nobody ever polls to completion inside
+# THIS test — a real exclusion) and a future that IS THE TEST BODY, driven
+# synchronously via `block_on`/`rt.block_on(async { .. let Some(_d) =
+# cuda_device() else { return; }; .. })` — where the `return` is exactly
+# as real a test skip as any other, and excluding it makes KO-7
+# vacuously green on a real async oracle. Choosing fail-OPEN here (treat
+# every async-block return as excluded, as round-5 did) silently loses
+# detection power on the block_on shape; choosing fail-CLOSED (treat
+# every async-block return as a real skip, counted at the enclosing fn's
+# own depth) at worst OVER-reports a genuinely-dropped future's return as
+# an ungated skip — a false RED a human reviewer can see and register a
+# helper call for (or the code can restructure), never a false GREEN. So
+# an `async`/`async move` block is NOT a nested-scope opener — only a
+# `|params| { .. }`/`|params| -> Ty { .. }` closure head is.
+_CLOSURE_HEAD_END_RE = re.compile(r"\|[^|{}]*\|\s*(?:->\s*[^{;]+?)?\s*\{$")
 
 
 def _nested_scope_open_braces(body_stripped: str) -> set[int]:

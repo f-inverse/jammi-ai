@@ -700,14 +700,18 @@ jobs:
           # round-5 after KO-4's own "floor"-kind detector — round-4's
           # depth-tracking statement-boundary fix — surfaced 18 previously-
           # invisible floor findings the table had never classified, kind
-          # count 0 -> 18): the lexical heuristic's honest noise rate is now
-          # 49/87 = 56.3% (real: 38/87 = 43.7%; see
-          # ci/doc_number_allowlist_classification.md), so a REQUIRED scan
-          # leg would block an honest in-flight branch on its own noise (the
-          # esc-045 branch alone carries 69 unallowlisted findings, roughly
-          # half of them noise) rather than only on genuine new violations.
-          # The scan leg reports (advisory) until precision reaches >= 80%
-          # real.
+          # count 0 -> 18; re-measured AGAIN round-6 after classifying the
+          # 23 non-floor findings the flash-attention merge landed that
+          # round 5 left unclassified): the lexical heuristic's honest
+          # noise rate over the CLASSIFIED set is now 58/110 = 52.7% (real:
+          # 52/110 = 47.3%; see ci/doc_number_allowlist_classification.md,
+          # whose header states this is a rate over what has been
+          # hand-reviewed to date, not a full-live-scan precision), so a
+          # REQUIRED scan leg would block an honest in-flight branch on its
+          # own noise (the esc-045 branch alone carries 69 unallowlisted
+          # findings, roughly half of them noise) rather than only on
+          # genuine new violations. The scan leg reports (advisory) until
+          # precision reaches >= 80% real.
           # `continue_on_error: "true"` below (consumed by the shared "Run
           # guard" step's `continue-on-error` expression) marks ONLY this one
           # leg soft; `--self-test` and `--check-allowlist-only-shrinks`

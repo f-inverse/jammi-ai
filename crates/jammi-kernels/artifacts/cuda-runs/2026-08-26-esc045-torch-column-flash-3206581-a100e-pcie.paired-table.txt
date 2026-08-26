@@ -1,0 +1,16 @@
+config           op         torch_bf16     flash     eager  block(row11) |  flash-torch  block-torch(row11)  eager-torch
+------------------------------------------------------------------------------------------------------------------------
+b4-s128-seed42   gaussian     0.795654  0.789986  0.766744      0.610000 |    -0.005668           -0.186000    -0.028910
+b4-s128-seed42   poststep    -0.201373 -0.319293 -0.198350     -0.350000 |    -0.117920           -0.149000    +0.003023
+b4-s128-seed43   gaussian     0.424511  0.103876  0.450650      0.300000 |    -0.320635           -0.125000    +0.026139
+b4-s128-seed43   poststep     0.679105  0.143029  0.228812      0.563000 |    -0.536076           -0.116000    -0.450293
+b4-s128-seed44   gaussian     0.485179  0.680092  0.133342     -0.264000 |    +0.194912           -0.749000    -0.351838
+b4-s128-seed44   poststep    -0.061879  0.095307 -0.086842     -0.070000 |    +0.157186           -0.008000    -0.024964
+b8-s128-seed42   gaussian     0.826962  0.930951  0.844884           n/a |    +0.103989                 n/a    +0.017922
+b8-s128-seed42   poststep     0.226523  0.112062  0.220022           n/a |    -0.114461                 n/a    -0.006501
+b8-s512-seed42   gaussian     0.677846 -0.112313  OOM(n/a)           n/a |    -0.790159                 n/a          n/a
+b8-s512-seed42   poststep    -0.524552 -0.125345  OOM(n/a)           n/a |    +0.399207                 n/a          n/a
+
+sign counts, (flash - torch_bf16) across all 10 operating points: 4 positive / 6 negative / 0 zero (n=10)
+sign counts, (block - torch_bf16, row11) across the 6 b4-s128 operating points row11 covers: 0 positive / 6 negative / 0 zero (n=6)
+sign counts, (eager - torch_bf16) across the 8 operating points where jammi's eager arm did not OOM: 3 positive / 5 negative / 0 zero (n=8)

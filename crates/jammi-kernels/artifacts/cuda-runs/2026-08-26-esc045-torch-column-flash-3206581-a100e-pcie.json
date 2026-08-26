@@ -1,0 +1,996 @@
+{
+  "schema_version": 1,
+  "unit": "esc-045 torch column + FLASH arm: the same b4-s128 seeds 42/43/44 trio measured for ledger row 11 (bench/esc045-torch-column@29cd6f9), plus the two b8 legs the analyzer's own CONFIGS list also covers (b8-s128-seed42, b8-s512-seed42), re-run against a jammi-bench build at the FA2 (FlashAttention-2) tip perf/p6-fa2-dense@eee7e6a with --features cuda,jammi-encoders/flash-attn, so jammi_bf16_fused IS the flash arm on these dense, unpadded batches (not the block arm row 11 measured) -- gaussian and post-AdamW-step (peft-step1) operating points, full/median/mass-weighted-per-tensor cosine of dL/dB vs both jammi_f32_truth and torch_f32_truth, computed by the UNMODIFIED numpy-first comparator (ci/scripts/perf/analyze_esc045_torch_column.py @29cd6f9's own compare_arm_vs_truth/_cosine functions, imported and called leg-by-leg -- see 'analyzer_invocation' below for why).",
+  "git_sha": "32065818a75530a94d145cb27026bcace9b51c2d",
+  "git_sha7": "3206581",
+  "branch": "bench/esc045-torch-column-flash",
+  "merge_provenance": {
+    "note": "eee7e6a (perf/p6-fa2-dense tip, the flash arm) merged LOCALLY into bench/esc045-torch-column@29cd6f9 (the --lora-init/torch-column apparatus) -- NOT pushed to origin. This was necessary, not merely convenient: eee7e6a's own grad_oracle.rs has no --lora-init flag at all (46abf91, which adds it, is not an ancestor of eee7e6a), so run_esc045_torch_column.sh cannot run against the bare FA2 tip -- confirmed by trying (`error: unexpected argument '--lora-init' found`) before merging. The merge itself touched exactly one file (crates/jammi-bench/src/grad_oracle.rs); the sole conflict was two citation-line-number edits to the SAME doc-table row (both branches had independently shifted torch_grad_oracle.py/finetune_step.rs line numbers elsewhere) -- resolved by keeping the esc045 branch's citations and re-deriving the one finetune_step.rs line number (sha256_and_len) that actually moved post-merge (verified by grep, not guessed). Every other file auto-merged clean.",
+    "base": {
+      "ref": "origin/bench/esc045-torch-column",
+      "sha": "29cd6f9b32ed13490b0afdb50e7322938a42d639"
+    },
+    "merged_in": {
+      "ref": "origin/perf/p6-fa2-dense",
+      "sha": "eee7e6a91b25221de7d72df30e42fdc7412ab42d"
+    }
+  },
+  "box": "a100e",
+  "status": "measured",
+  "producer": {
+    "path": "ci/scripts/perf/run_esc045_torch_column.sh + ci/scripts/perf/analyze_esc045_torch_column.py",
+    "kind": "manual pod-lane shell script + python comparator (no CI lane has a GPU)",
+    "script_git_ref": "29cd6f9 (ci/scripts/perf/run_esc045_torch_column.sh, ci/scripts/perf/analyze_esc045_torch_column.py -- logic byte-identical to that commit; only two operational lines patched in the POD-SIDE COPY, never committed: REPO_ROOT hardcoded to the pod's worktree path instead of relying on $BASH_SOURCE dirname magic (the copy lives outside its usual ci/scripts/perf/ tree location), and the script's own unconditional `cargo build ... --features cuda` line replaced with a no-op echo -- the FA2 binary was built separately, ONE TIME, with --features cuda,jammi-encoders/flash-attn; letting the runner's own cargo build fire on top of it would have silently REBUILT jammi-bench WITHOUT the flash-attn feature and clobbered the flash-enabled binary at the same $CARGO_TARGET_DIR before the b4-s128-seed42 leg even ran)",
+    "binary": "cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn (CARGO_TARGET_DIR=/root/target-fa2), built from git_sha 32065818a75530a94d145cb27026bcace9b51c2d",
+    "invocation_per_leg": "MODEL_DIR=/root/checkpoints/ModernBERT-large TORCH_PY=/root/jammi-ai/.venv-torch-ref/bin/python3 CARGO_TARGET_DIR=/root/target-fa2 bash run_esc045_torch_column.sh OUT_DIR <label>:<batch>:<seq>:<seed>",
+    "legs_run": [
+      "b4-s128-seed42:4:128:42",
+      "b4-s128-seed43:4:128:43",
+      "b4-s128-seed44:4:128:44",
+      "b8-s128-seed42:8:128:42",
+      "b8-s512-seed42:8:512:42 (jammi_bf16_eager arm OOM'd on both op points; the other four arms/truths for this config were completed by direct equivalent invocations of the same two binaries after the eager OOM -- see 'known_limitations')"
+    ],
+    "analyzer_invocation": "analyze_esc045_torch_column.py's own analyze()/compare_arm_vs_truth/format_table functions, UNMODIFIED, imported by a thin per-leg driver (not analyze.py's own CLI main()) and called once per completed leg with configs=[<that one leg's tuple>], immediately followed by deleting that leg's raw JSON dumps (keeping the shared LoRA safetensors) -- required because the pod's disk (60GB, ~26GB free after prep) was under the dispatch's 30GB threshold, and five legs' raw dumps run ~3.7GB each (~19GB total) if kept simultaneously. The five per-leg reports were concatenated (configs list extended, reordered to the analyzer's own CONFIGS order) into this artifact's 'combined_report' below -- the per-leg cosines themselves are each individually the analyzer's own unmodified output, never hand-edited."
+  },
+  "box_identity": {
+    "gpu": "NVIDIA A100 80GB PCIe",
+    "driver_version": "570.211.01",
+    "cuda_toolkit_nvcc": "12.6.85"
+  },
+  "torch_reference_venv": {
+    "path": "/root/jammi-ai/.venv-torch-ref",
+    "torch_version": "2.11.0+cu128",
+    "torch_cuda_version": "12.8",
+    "transformers_version": "5.15.1",
+    "peft_version": "0.20.0"
+  },
+  "checkpoint_identity": {
+    "model_dir": "/root/checkpoints/ModernBERT-large (answerdotai/ModernBERT-large, public HF)",
+    "checkpoint_config_sha256": "55dca68059e98f0debf8eb63ab355c451c65b1f5d90fdca4754113fdaadd2cca",
+    "checkpoint_weights_sha256": "44510fec5d3a81a1877f225637b869495f18e55f6f23a09abb9be0acc030295f",
+    "checkpoint_weights_size_bytes": 1583544840
+  },
+  "flash_dispatch_counter_evidence": {
+    "mechanism": "crates/jammi-encoders/src/modernbert.rs's ModernBertAttention::forward_training_attention (at git_sha above): admit_cascade(admission_mode(), \"attention_block_flash\", flash.reason(), flash.outcome(), true, cascade_counters_for(\"attention_block_flash\")) is evaluated FIRST, per layer; on CascadeOutcome::Fused it returns EARLY via forward_flash_dense_attention -- the admit(..., \"attention_block_fused\", ...) call (whose own counters are attention_block_fused_dispatches / attention_block_eager_dispatches, the ONLY attention counters crates/jammi-bench/src/grad_oracle.rs itself reads -- it never calls jammi_encoders::attention_block_flash_dispatch_snapshot(), which was added only to finetune_step.rs/report.rs's FinetuneStepTier) is never reached at all on a fully-flash-eligible run. So on this build, a grad-oracle fused-arm dump reading attention_block_fused_dispatches==0 AND attention_block_eager_dispatches==0 for every layer is exactly what flash firing on every layer looks like from grad-oracle's own JSON -- confirmed directly below, and corroborated by a finetune-step smoke test on the SAME binary/checkpoint/dtype/LoRA config, which DOES expose the flash cascade's own counters.",
+    "grad_oracle_direct_evidence": {
+      "source": "b4-s128-seed42__gaussian__jammi_bf16_fused.json raw dump (admit_key_dispatches), inspected before deletion",
+      "attention_block_fused_dispatches": 0,
+      "attention_block_eager_dispatches": 0,
+      "rope_fused_dispatches": 0,
+      "softmax_fused_dispatches": 0,
+      "note": "rope_fused/softmax_fused also read 0 -- consistent with flash_attention_varlen_with_rope fusing RoPE INSIDE the flash op (forward_flash_dense_attention's own doc), so neither the block arm's admit nor the standalone RoPE/softmax fused ops are ever reached either."
+    },
+    "finetune_step_corroborating_smoke_test": {
+      "invocation": "jammi-bench finetune-step --model-dir /root/checkpoints/ModernBERT-large --batch 4 --seq 128 --steps 3 --warmup 1 --lora-rank 16 --lora-alpha 32 --target-modules Wqkv,Wo,Wi --backbone-dtype bf16 --cuda 0 --seed 42 (same binary, same checkpoint, same LoRA config as the grad-oracle legs)",
+      "attention_block_flash_fused_dispatches": 112,
+      "attention_block_flash_declined_dispatches": 0,
+      "flash_compiled": true,
+      "attention_block_fused_dispatches": 0,
+      "attention_block_eager_dispatches": 0,
+      "full_report_saved_at": "/root/torchcol/flash_smoke_finetune_step.json (pod-local; not committed -- values quoted here verbatim)"
+    }
+  },
+  "combined_report": {
+    "configs": [
+      {
+        "label": "b4-s128-seed42",
+        "batch": 4,
+        "seq": 128,
+        "seed": 42,
+        "op_points": {
+          "gaussian": {
+            "jammi_f32_truth_vs_torch_f32_truth": {
+              "full_tensor_cosine": 0.9999999350079775,
+              "median_per_tensor_cosine": 0.9999999945873419,
+              "mass_weighted_mean_cosine": 0.9999999370697202,
+              "matched_tensor_count": 224
+            },
+            "arms": {
+              "jammi_bf16_fused": {
+                "vs": {
+                  "jammi_f32_truth": {
+                    "full_tensor_cosine": 0.7899859367510595,
+                    "median_per_tensor_cosine": 0.8495788193237204,
+                    "mass_weighted_mean_cosine": 0.7960030203891527,
+                    "matched_tensor_count": 224
+                  },
+                  "torch_f32_truth": {
+                    "full_tensor_cosine": 0.7899165867339862,
+                    "median_per_tensor_cosine": 0.8495553125613756,
+                    "mass_weighted_mean_cosine": 0.7959296526254501,
+                    "matched_tensor_count": 224
+                  }
+                },
+                "kernels_disabled": {
+                  "requested": [],
+                  "fired": [],
+                  "requested_count": 0,
+                  "fired_count": 0,
+                  "equal": true
+                }
+              },
+              "jammi_bf16_eager": {
+                "vs": {
+                  "jammi_f32_truth": {
+                    "full_tensor_cosine": 0.7667437335446831,
+                    "median_per_tensor_cosine": 0.8206570011268117,
+                    "mass_weighted_mean_cosine": 0.7550152608918894,
+                    "matched_tensor_count": 224
+                  },
+                  "torch_f32_truth": {
+                    "full_tensor_cosine": 0.7666718557030964,
+                    "median_per_tensor_cosine": 0.8206262453667037,
+                    "mass_weighted_mean_cosine": 0.7549476503554239,
+                    "matched_tensor_count": 224
+                  }
+                },
+                "kernels_disabled": {
+                  "requested": [
+                    "all"
+                  ],
+                  "fired": [
+                    "all"
+                  ],
+                  "requested_count": 1,
+                  "fired_count": 1,
+                  "equal": true
+                }
+              },
+              "torch_bf16": {
+                "vs": {
+                  "jammi_f32_truth": {
+                    "full_tensor_cosine": 0.7956541320953513,
+                    "median_per_tensor_cosine": 0.939203769445012,
+                    "mass_weighted_mean_cosine": 0.7976105622550276,
+                    "matched_tensor_count": 224
+                  },
+                  "torch_f32_truth": {
+                    "full_tensor_cosine": 0.7956434684407397,
+                    "median_per_tensor_cosine": 0.9391900839115187,
+                    "mass_weighted_mean_cosine": 0.7975993104588727,
+                    "matched_tensor_count": 224
+                  }
+                }
+              }
+            }
+          },
+          "poststep": {
+            "jammi_f32_truth_vs_torch_f32_truth": {
+              "full_tensor_cosine": 0.9999999762490995,
+              "median_per_tensor_cosine": 0.9999999858745378,
+              "mass_weighted_mean_cosine": 0.9999999770227079,
+              "matched_tensor_count": 224
+            },
+            "arms": {
+              "jammi_bf16_fused": {
+                "vs": {
+                  "jammi_f32_truth": {
+                    "full_tensor_cosine": -0.31929310048002035,
+                    "median_per_tensor_cosine": 0.6449477482464351,
+                    "mass_weighted_mean_cosine": -0.3486487966280342,
+                    "matched_tensor_count": 224
+                  },
+                  "torch_f32_truth": {
+                    "full_tensor_cosine": -0.3191635788178399,
+                    "median_per_tensor_cosine": 0.6449617131321238,
+                    "mass_weighted_mean_cosine": -0.3485259373410548,
+                    "matched_tensor_count": 224
+                  }
+                },
+                "kernels_disabled": {
+                  "requested": [],
+                  "fired": [],
+                  "requested_count": 0,
+                  "fired_count": 0,
+                  "equal": true
+                }
+              },
+              "jammi_bf16_eager": {
+                "vs": {
+                  "jammi_f32_truth": {
+                    "full_tensor_cosine": -0.19834983469369724,
+                    "median_per_tensor_cosine": 0.5911133496249988,
+                    "mass_weighted_mean_cosine": -0.2346688227921994,
+                    "matched_tensor_count": 224
+                  },
+                  "torch_f32_truth": {
+                    "full_tensor_cosine": -0.19820998620079602,
+                    "median_per_tensor_cosine": 0.5910737037370664,
+                    "mass_weighted_mean_cosine": -0.23453710708010383,
+                    "matched_tensor_count": 224
+                  }
+                },
+                "kernels_disabled": {
+                  "requested": [
+                    "all"
+                  ],
+                  "fired": [
+                    "all"
+                  ],
+                  "requested_count": 1,
+                  "fired_count": 1,
+                  "equal": true
+                }
+              },
+              "torch_bf16": {
+                "vs": {
+                  "jammi_f32_truth": {
+                    "full_tensor_cosine": -0.20137275117605685,
+                    "median_per_tensor_cosine": 0.612091891391456,
+                    "mass_weighted_mean_cosine": -0.21904149471055023,
+                    "matched_tensor_count": 224
+                  },
+                  "torch_f32_truth": {
+                    "full_tensor_cosine": -0.20125801136543686,
+                    "median_per_tensor_cosine": 0.6121214729881463,
+                    "mass_weighted_mean_cosine": -0.21892947441302862,
+                    "matched_tensor_count": 224
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "label": "b4-s128-seed43",
+        "batch": 4,
+        "seq": 128,
+        "seed": 43,
+        "op_points": {
+          "gaussian": {
+            "jammi_f32_truth_vs_torch_f32_truth": {
+              "full_tensor_cosine": 0.9999937757158198,
+              "median_per_tensor_cosine": 0.9999991787095284,
+              "mass_weighted_mean_cosine": 0.9999945997272266,
+              "matched_tensor_count": 224
+            },
+            "arms": {
+              "jammi_bf16_fused": {
+                "vs": {
+                  "jammi_f32_truth": {
+                    "full_tensor_cosine": 0.10387642880119101,
+                    "median_per_tensor_cosine": 0.2718467688130211,
+                    "mass_weighted_mean_cosine": 0.05752884154409228,
+                    "matched_tensor_count": 224
+                  },
+                  "torch_f32_truth": {
+                    "full_tensor_cosine": 0.10272440172364958,
+                    "median_per_tensor_cosine": 0.2717582321299209,
+                    "mass_weighted_mean_cosine": 0.05614150611390984,
+                    "matched_tensor_count": 224
+                  }
+                },
+                "kernels_disabled": {
+                  "requested": [],
+                  "fired": [],
+                  "requested_count": 0,
+                  "fired_count": 0,
+                  "equal": true
+                }
+              },
+              "jammi_bf16_eager": {
+                "vs": {
+                  "jammi_f32_truth": {
+                    "full_tensor_cosine": 0.4506498389570649,
+                    "median_per_tensor_cosine": 0.49779494347916464,
+                    "mass_weighted_mean_cosine": 0.4603588097151067,
+                    "matched_tensor_count": 224
+                  },
+                  "torch_f32_truth": {
+                    "full_tensor_cosine": 0.45023190520850237,
+                    "median_per_tensor_cosine": 0.4986554501805749,
+                    "mass_weighted_mean_cosine": 0.4600154089855701,
+                    "matched_tensor_count": 224
+                  }
+                },
+                "kernels_disabled": {
+                  "requested": [
+                    "all"
+                  ],
+                  "fired": [
+                    "all"
+                  ],
+                  "requested_count": 1,
+                  "fired_count": 1,
+                  "equal": true
+                }
+              },
+              "torch_bf16": {
+                "vs": {
+                  "jammi_f32_truth": {
+                    "full_tensor_cosine": 0.42451132711029976,
+                    "median_per_tensor_cosine": 0.43200856099757173,
+                    "mass_weighted_mean_cosine": 0.4256455247984443,
+                    "matched_tensor_count": 224
+                  },
+                  "torch_f32_truth": {
+                    "full_tensor_cosine": 0.4250750997704022,
+                    "median_per_tensor_cosine": 0.43253680389676485,
+                    "mass_weighted_mean_cosine": 0.4262826755400347,
+                    "matched_tensor_count": 224
+                  }
+                }
+              }
+            }
+          },
+          "poststep": {
+            "jammi_f32_truth_vs_torch_f32_truth": {
+              "full_tensor_cosine": 0.9999999846935227,
+              "median_per_tensor_cosine": 0.99999998357803,
+              "mass_weighted_mean_cosine": 0.9999999855705634,
+              "matched_tensor_count": 224
+            },
+            "arms": {
+              "jammi_bf16_fused": {
+                "vs": {
+                  "jammi_f32_truth": {
+                    "full_tensor_cosine": 0.143028759928535,
+                    "median_per_tensor_cosine": 0.8557313498993171,
+                    "mass_weighted_mean_cosine": 0.125241690564413,
+                    "matched_tensor_count": 224
+                  },
+                  "torch_f32_truth": {
+                    "full_tensor_cosine": 0.14302498928962712,
+                    "median_per_tensor_cosine": 0.8556825370781012,
+                    "mass_weighted_mean_cosine": 0.12523722027667444,
+                    "matched_tensor_count": 224
+                  }
+                },
+                "kernels_disabled": {
+                  "requested": [],
+                  "fired": [],
+                  "requested_count": 0,
+                  "fired_count": 0,
+                  "equal": true
+                }
+              },
+              "jammi_bf16_eager": {
+                "vs": {
+                  "jammi_f32_truth": {
+                    "full_tensor_cosine": 0.2288117605077576,
+                    "median_per_tensor_cosine": 0.8895204060632598,
+                    "mass_weighted_mean_cosine": 0.24579110872473636,
+                    "matched_tensor_count": 224
+                  },
+                  "torch_f32_truth": {
+                    "full_tensor_cosine": 0.22884272961099988,
+                    "median_per_tensor_cosine": 0.889443962740089,
+                    "mass_weighted_mean_cosine": 0.2458257772098373,
+                    "matched_tensor_count": 224
+                  }
+                },
+                "kernels_disabled": {
+                  "requested": [
+                    "all"
+                  ],
+                  "fired": [
+                    "all"
+                  ],
+                  "requested_count": 1,
+                  "fired_count": 1,
+                  "equal": true
+                }
+              },
+              "torch_bf16": {
+                "vs": {
+                  "jammi_f32_truth": {
+                    "full_tensor_cosine": 0.6791048342885293,
+                    "median_per_tensor_cosine": 0.8273914212222858,
+                    "mass_weighted_mean_cosine": 0.6965415496620817,
+                    "matched_tensor_count": 224
+                  },
+                  "torch_f32_truth": {
+                    "full_tensor_cosine": 0.6790749383188429,
+                    "median_per_tensor_cosine": 0.8273768262455137,
+                    "mass_weighted_mean_cosine": 0.6965161473630185,
+                    "matched_tensor_count": 224
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "label": "b4-s128-seed44",
+        "batch": 4,
+        "seq": 128,
+        "seed": 44,
+        "op_points": {
+          "gaussian": {
+            "jammi_f32_truth_vs_torch_f32_truth": {
+              "full_tensor_cosine": 0.9999999760085273,
+              "median_per_tensor_cosine": 0.9999999981888171,
+              "mass_weighted_mean_cosine": 0.9999999785290848,
+              "matched_tensor_count": 224
+            },
+            "arms": {
+              "jammi_bf16_fused": {
+                "vs": {
+                  "jammi_f32_truth": {
+                    "full_tensor_cosine": 0.6800917073341256,
+                    "median_per_tensor_cosine": 0.7380546276788505,
+                    "mass_weighted_mean_cosine": 0.701348069266212,
+                    "matched_tensor_count": 224
+                  },
+                  "torch_f32_truth": {
+                    "full_tensor_cosine": 0.680125256726615,
+                    "median_per_tensor_cosine": 0.7380554406846338,
+                    "mass_weighted_mean_cosine": 0.70136999403483,
+                    "matched_tensor_count": 224
+                  }
+                },
+                "kernels_disabled": {
+                  "requested": [],
+                  "fired": [],
+                  "requested_count": 0,
+                  "fired_count": 0,
+                  "equal": true
+                }
+              },
+              "jammi_bf16_eager": {
+                "vs": {
+                  "jammi_f32_truth": {
+                    "full_tensor_cosine": 0.13334156997638053,
+                    "median_per_tensor_cosine": 0.5248269214461432,
+                    "mass_weighted_mean_cosine": 0.15707646912132328,
+                    "matched_tensor_count": 224
+                  },
+                  "torch_f32_truth": {
+                    "full_tensor_cosine": 0.13330589953326807,
+                    "median_per_tensor_cosine": 0.5248118339473553,
+                    "mass_weighted_mean_cosine": 0.15702521449182852,
+                    "matched_tensor_count": 224
+                  }
+                },
+                "kernels_disabled": {
+                  "requested": [
+                    "all"
+                  ],
+                  "fired": [
+                    "all"
+                  ],
+                  "requested_count": 1,
+                  "fired_count": 1,
+                  "equal": true
+                }
+              },
+              "torch_bf16": {
+                "vs": {
+                  "jammi_f32_truth": {
+                    "full_tensor_cosine": 0.48517930509616986,
+                    "median_per_tensor_cosine": 0.7358546478163751,
+                    "mass_weighted_mean_cosine": 0.5003414987649764,
+                    "matched_tensor_count": 224
+                  },
+                  "torch_f32_truth": {
+                    "full_tensor_cosine": 0.48508433727950956,
+                    "median_per_tensor_cosine": 0.7358350934620723,
+                    "mass_weighted_mean_cosine": 0.500232379347006,
+                    "matched_tensor_count": 224
+                  }
+                }
+              }
+            }
+          },
+          "poststep": {
+            "jammi_f32_truth_vs_torch_f32_truth": {
+              "full_tensor_cosine": 0.9999999716078515,
+              "median_per_tensor_cosine": 0.999999923740292,
+              "mass_weighted_mean_cosine": 0.9999999747587919,
+              "matched_tensor_count": 224
+            },
+            "arms": {
+              "jammi_bf16_fused": {
+                "vs": {
+                  "jammi_f32_truth": {
+                    "full_tensor_cosine": 0.09530707783128202,
+                    "median_per_tensor_cosine": 0.23970580645688622,
+                    "mass_weighted_mean_cosine": 0.10160102477805337,
+                    "matched_tensor_count": 224
+                  },
+                  "torch_f32_truth": {
+                    "full_tensor_cosine": 0.09532901305745026,
+                    "median_per_tensor_cosine": 0.23973094533073994,
+                    "mass_weighted_mean_cosine": 0.10162965162146254,
+                    "matched_tensor_count": 224
+                  }
+                },
+                "kernels_disabled": {
+                  "requested": [],
+                  "fired": [],
+                  "requested_count": 0,
+                  "fired_count": 0,
+                  "equal": true
+                }
+              },
+              "jammi_bf16_eager": {
+                "vs": {
+                  "jammi_f32_truth": {
+                    "full_tensor_cosine": -0.08684238131334489,
+                    "median_per_tensor_cosine": 0.25899277919546504,
+                    "mass_weighted_mean_cosine": -0.07436828420471135,
+                    "matched_tensor_count": 224
+                  },
+                  "torch_f32_truth": {
+                    "full_tensor_cosine": -0.08681656383909812,
+                    "median_per_tensor_cosine": 0.2590815359062024,
+                    "mass_weighted_mean_cosine": -0.07432780202110388,
+                    "matched_tensor_count": 224
+                  }
+                },
+                "kernels_disabled": {
+                  "requested": [
+                    "all"
+                  ],
+                  "fired": [
+                    "all"
+                  ],
+                  "requested_count": 1,
+                  "fired_count": 1,
+                  "equal": true
+                }
+              },
+              "torch_bf16": {
+                "vs": {
+                  "jammi_f32_truth": {
+                    "full_tensor_cosine": -0.06187870939394835,
+                    "median_per_tensor_cosine": -0.024798483089756303,
+                    "mass_weighted_mean_cosine": -0.05744490562619001,
+                    "matched_tensor_count": 224
+                  },
+                  "torch_f32_truth": {
+                    "full_tensor_cosine": -0.06192879338989014,
+                    "median_per_tensor_cosine": -0.024809115018516854,
+                    "mass_weighted_mean_cosine": -0.0574938366471821,
+                    "matched_tensor_count": 224
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "label": "b8-s128-seed42",
+        "batch": 8,
+        "seq": 128,
+        "seed": 42,
+        "op_points": {
+          "gaussian": {
+            "jammi_f32_truth_vs_torch_f32_truth": {
+              "full_tensor_cosine": 0.9999999272450496,
+              "median_per_tensor_cosine": 0.9999999664663721,
+              "mass_weighted_mean_cosine": 0.9999999310099175,
+              "matched_tensor_count": 224
+            },
+            "arms": {
+              "jammi_bf16_fused": {
+                "vs": {
+                  "jammi_f32_truth": {
+                    "full_tensor_cosine": 0.9309505452027423,
+                    "median_per_tensor_cosine": 0.9243755178392967,
+                    "mass_weighted_mean_cosine": 0.9323370094992917,
+                    "matched_tensor_count": 224
+                  },
+                  "torch_f32_truth": {
+                    "full_tensor_cosine": 0.9309214986784506,
+                    "median_per_tensor_cosine": 0.9243932376449335,
+                    "mass_weighted_mean_cosine": 0.932310853904571,
+                    "matched_tensor_count": 224
+                  }
+                },
+                "kernels_disabled": {
+                  "requested": [],
+                  "fired": [],
+                  "requested_count": 0,
+                  "fired_count": 0,
+                  "equal": true
+                }
+              },
+              "jammi_bf16_eager": {
+                "vs": {
+                  "jammi_f32_truth": {
+                    "full_tensor_cosine": 0.844883860998581,
+                    "median_per_tensor_cosine": 0.867810233182407,
+                    "mass_weighted_mean_cosine": 0.8500923402703274,
+                    "matched_tensor_count": 224
+                  },
+                  "torch_f32_truth": {
+                    "full_tensor_cosine": 0.8449584749634761,
+                    "median_per_tensor_cosine": 0.8678707933364742,
+                    "mass_weighted_mean_cosine": 0.8501649240227256,
+                    "matched_tensor_count": 224
+                  }
+                },
+                "kernels_disabled": {
+                  "requested": [
+                    "all"
+                  ],
+                  "fired": [
+                    "all"
+                  ],
+                  "requested_count": 1,
+                  "fired_count": 1,
+                  "equal": true
+                }
+              },
+              "torch_bf16": {
+                "vs": {
+                  "jammi_f32_truth": {
+                    "full_tensor_cosine": 0.8269616856526928,
+                    "median_per_tensor_cosine": 0.8503029072794778,
+                    "mass_weighted_mean_cosine": 0.8327992479804568,
+                    "matched_tensor_count": 224
+                  },
+                  "torch_f32_truth": {
+                    "full_tensor_cosine": 0.8270250661009038,
+                    "median_per_tensor_cosine": 0.8503537385791639,
+                    "mass_weighted_mean_cosine": 0.8328607983380121,
+                    "matched_tensor_count": 224
+                  }
+                }
+              }
+            }
+          },
+          "poststep": {
+            "jammi_f32_truth_vs_torch_f32_truth": {
+              "full_tensor_cosine": 0.999999976844685,
+              "median_per_tensor_cosine": 0.9999999980882459,
+              "mass_weighted_mean_cosine": 0.9999999779146883,
+              "matched_tensor_count": 224
+            },
+            "arms": {
+              "jammi_bf16_fused": {
+                "vs": {
+                  "jammi_f32_truth": {
+                    "full_tensor_cosine": 0.11206235093841102,
+                    "median_per_tensor_cosine": 0.5866661486425861,
+                    "mass_weighted_mean_cosine": 0.14619147206914584,
+                    "matched_tensor_count": 224
+                  },
+                  "torch_f32_truth": {
+                    "full_tensor_cosine": 0.112070618467748,
+                    "median_per_tensor_cosine": 0.5866824535283786,
+                    "mass_weighted_mean_cosine": 0.14620461109829175,
+                    "matched_tensor_count": 224
+                  }
+                },
+                "kernels_disabled": {
+                  "requested": [],
+                  "fired": [],
+                  "requested_count": 0,
+                  "fired_count": 0,
+                  "equal": true
+                }
+              },
+              "jammi_bf16_eager": {
+                "vs": {
+                  "jammi_f32_truth": {
+                    "full_tensor_cosine": 0.22002198387188554,
+                    "median_per_tensor_cosine": 0.6628348712573565,
+                    "mass_weighted_mean_cosine": 0.24838043564986773,
+                    "matched_tensor_count": 224
+                  },
+                  "torch_f32_truth": {
+                    "full_tensor_cosine": 0.22006025571286966,
+                    "median_per_tensor_cosine": 0.6628374724828971,
+                    "mass_weighted_mean_cosine": 0.2484210330992271,
+                    "matched_tensor_count": 224
+                  }
+                },
+                "kernels_disabled": {
+                  "requested": [
+                    "all"
+                  ],
+                  "fired": [
+                    "all"
+                  ],
+                  "requested_count": 1,
+                  "fired_count": 1,
+                  "equal": true
+                }
+              },
+              "torch_bf16": {
+                "vs": {
+                  "jammi_f32_truth": {
+                    "full_tensor_cosine": 0.22652332068421652,
+                    "median_per_tensor_cosine": 0.6127499231161366,
+                    "mass_weighted_mean_cosine": 0.26133814182221565,
+                    "matched_tensor_count": 224
+                  },
+                  "torch_f32_truth": {
+                    "full_tensor_cosine": 0.2265587646604423,
+                    "median_per_tensor_cosine": 0.6127659844677875,
+                    "mass_weighted_mean_cosine": 0.2613750810164844,
+                    "matched_tensor_count": 224
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "label": "b8-s512-seed42",
+        "batch": 8,
+        "seq": 512,
+        "seed": 42,
+        "op_points": {
+          "gaussian": {
+            "jammi_f32_truth_vs_torch_f32_truth": {
+              "full_tensor_cosine": 0.9999969723341864,
+              "median_per_tensor_cosine": 0.9999913121769909,
+              "mass_weighted_mean_cosine": 0.9999972358834973,
+              "matched_tensor_count": 224
+            },
+            "arms": {
+              "jammi_bf16_fused": {
+                "vs": {
+                  "jammi_f32_truth": {
+                    "full_tensor_cosine": -0.11231295353829843,
+                    "median_per_tensor_cosine": 0.1775620831215871,
+                    "mass_weighted_mean_cosine": -0.1580965798802362,
+                    "matched_tensor_count": 224
+                  },
+                  "torch_f32_truth": {
+                    "full_tensor_cosine": -0.11192190911612224,
+                    "median_per_tensor_cosine": 0.17946123140923292,
+                    "mass_weighted_mean_cosine": -0.15781913076998982,
+                    "matched_tensor_count": 224
+                  }
+                },
+                "kernels_disabled": {
+                  "requested": [],
+                  "fired": [],
+                  "requested_count": 0,
+                  "fired_count": 0,
+                  "equal": true
+                }
+              },
+              "jammi_bf16_eager": {
+                "vs": null,
+                "unavailable": true,
+                "reason": "CUDA_ERROR_OUT_OF_MEMORY: jammi grad-oracle's eager (JAMMI_KERNELS_DISABLE=all) attention composition OOM'd on an 80GB A100 PCIe at this shape (batch=8, seq=512, batched_forward triplet -> effective batch 24), reproduced 3/3 attempts (gaussian op-point via run.sh, gaussian op-point direct invocation, poststep op-point direct invocation), each attempt starting from a fresh process with 0 MiB / 81154 MiB used on the device beforehand (nvidia-smi checked immediately before each attempt) -- not a transient/fragmentation artifact. torch's OWN eager attention (--attn eager) at the IDENTICAL shape/dtype succeeded on the same box (see torch_bf16 arm below), so this is jammi's eager composition specifically, not a hardware ceiling every eager implementation hits."
+              },
+              "torch_bf16": {
+                "vs": {
+                  "jammi_f32_truth": {
+                    "full_tensor_cosine": 0.6778462099732746,
+                    "median_per_tensor_cosine": 0.32669565672395995,
+                    "mass_weighted_mean_cosine": 0.7064245345245627,
+                    "matched_tensor_count": 224
+                  },
+                  "torch_f32_truth": {
+                    "full_tensor_cosine": 0.6775807583864489,
+                    "median_per_tensor_cosine": 0.3273937692637191,
+                    "mass_weighted_mean_cosine": 0.706240000522436,
+                    "matched_tensor_count": 224
+                  }
+                }
+              }
+            }
+          },
+          "poststep": {
+            "jammi_f32_truth_vs_torch_f32_truth": {
+              "full_tensor_cosine": 0.9999998573999955,
+              "median_per_tensor_cosine": 0.9999998824196797,
+              "mass_weighted_mean_cosine": 0.9999998635412113,
+              "matched_tensor_count": 224
+            },
+            "arms": {
+              "jammi_bf16_fused": {
+                "vs": {
+                  "jammi_f32_truth": {
+                    "full_tensor_cosine": -0.1253446984583321,
+                    "median_per_tensor_cosine": 0.9338039425576923,
+                    "mass_weighted_mean_cosine": -0.17207103570762708,
+                    "matched_tensor_count": 224
+                  },
+                  "torch_f32_truth": {
+                    "full_tensor_cosine": -0.12511943823600935,
+                    "median_per_tensor_cosine": 0.933854035223025,
+                    "mass_weighted_mean_cosine": -0.17183419806311553,
+                    "matched_tensor_count": 224
+                  }
+                },
+                "kernels_disabled": {
+                  "requested": [],
+                  "fired": [],
+                  "requested_count": 0,
+                  "fired_count": 0,
+                  "equal": true
+                }
+              },
+              "jammi_bf16_eager": {
+                "vs": null,
+                "unavailable": true,
+                "reason": "CUDA_ERROR_OUT_OF_MEMORY: jammi grad-oracle's eager (JAMMI_KERNELS_DISABLE=all) attention composition OOM'd on an 80GB A100 PCIe at this shape (batch=8, seq=512, batched_forward triplet -> effective batch 24), reproduced 3/3 attempts (gaussian op-point via run.sh, gaussian op-point direct invocation, poststep op-point direct invocation), each attempt starting from a fresh process with 0 MiB / 81154 MiB used on the device beforehand (nvidia-smi checked immediately before each attempt) -- not a transient/fragmentation artifact. torch's OWN eager attention (--attn eager) at the IDENTICAL shape/dtype succeeded on the same box (see torch_bf16 arm below), so this is jammi's eager composition specifically, not a hardware ceiling every eager implementation hits."
+              },
+              "torch_bf16": {
+                "vs": {
+                  "jammi_f32_truth": {
+                    "full_tensor_cosine": -0.524551663924645,
+                    "median_per_tensor_cosine": 0.9020624480931541,
+                    "mass_weighted_mean_cosine": -0.5242761849587757,
+                    "matched_tensor_count": 224
+                  },
+                  "torch_f32_truth": {
+                    "full_tensor_cosine": -0.5244675374251712,
+                    "median_per_tensor_cosine": 0.9018374554815767,
+                    "mass_weighted_mean_cosine": -0.5241742244972069,
+                    "matched_tensor_count": 224
+                  }
+                }
+              }
+            }
+          }
+        },
+        "notes": {}
+      }
+    ]
+  },
+  "paired_table": {
+    "description": "Per operating point (config x gaussian/poststep), the full-tensor cosine of dL/dB vs jammi_f32_truth for each arm, and three paired differences against torch_bf16: (flash - torch_bf16) [this artifact's own measurement], (block - torch_bf16) [row 11's own numbers, b4-s128 legs only -- row 11 never measured a b8 leg], and (eager - torch_bf16) [this artifact's own measurement; n/a where jammi's eager arm OOM'd]. NO VERDICT is computed or asserted here -- sign counts are a descriptive summary of this artifact's own numbers, not a claim about esc-045's disposition.",
+    "table_text": "config           op         torch_bf16     flash     eager  block(row11) |  flash-torch  block-torch(row11)  eager-torch\n------------------------------------------------------------------------------------------------------------------------\nb4-s128-seed42   gaussian     0.795654  0.789986  0.766744      0.610000 |    -0.005668           -0.186000    -0.028910\nb4-s128-seed42   poststep    -0.201373 -0.319293 -0.198350     -0.350000 |    -0.117920           -0.149000    +0.003023\nb4-s128-seed43   gaussian     0.424511  0.103876  0.450650      0.300000 |    -0.320635           -0.125000    +0.026139\nb4-s128-seed43   poststep     0.679105  0.143029  0.228812      0.563000 |    -0.536076           -0.116000    -0.450293\nb4-s128-seed44   gaussian     0.485179  0.680092  0.133342     -0.264000 |    +0.194912           -0.749000    -0.351838\nb4-s128-seed44   poststep    -0.061879  0.095307 -0.086842     -0.070000 |    +0.157186           -0.008000    -0.024964\nb8-s128-seed42   gaussian     0.826962  0.930951  0.844884           n/a |    +0.103989                 n/a    +0.017922\nb8-s128-seed42   poststep     0.226523  0.112062  0.220022           n/a |    -0.114461                 n/a    -0.006501\nb8-s512-seed42   gaussian     0.677846 -0.112313  OOM(n/a)           n/a |    -0.790159                 n/a          n/a\nb8-s512-seed42   poststep    -0.524552 -0.125345  OOM(n/a)           n/a |    +0.399207                 n/a          n/a\n\nsign counts, (flash - torch_bf16) across all 10 operating points: 4 positive / 6 negative / 0 zero (n=10)\nsign counts, (block - torch_bf16, row11) across the 6 b4-s128 operating points row11 covers: 0 positive / 6 negative / 0 zero (n=6)\nsign counts, (eager - torch_bf16) across the 8 operating points where jammi's eager arm did not OOM: 3 positive / 5 negative / 0 zero (n=8)\n",
+    "rows": [
+      {
+        "config": "b4-s128-seed42",
+        "op_point": "gaussian",
+        "torch_bf16": 0.7956541320953513,
+        "flash": 0.7899859367510595,
+        "eager": 0.7667437335446831,
+        "block_row11": 0.61,
+        "row11_torch_bf16": 0.796,
+        "row11_eager": 0.767,
+        "flash_minus_torch": -0.005668195344291749,
+        "block_minus_torch_row11": -0.18600000000000005,
+        "eager_minus_torch": -0.028910398550668237
+      },
+      {
+        "config": "b4-s128-seed42",
+        "op_point": "poststep",
+        "torch_bf16": -0.20137275117605685,
+        "flash": -0.31929310048002035,
+        "eager": -0.19834983469369724,
+        "block_row11": -0.35,
+        "row11_torch_bf16": -0.201,
+        "row11_eager": -0.198,
+        "flash_minus_torch": -0.1179203493039635,
+        "block_minus_torch_row11": -0.14899999999999997,
+        "eager_minus_torch": 0.003022916482359611
+      },
+      {
+        "config": "b4-s128-seed43",
+        "op_point": "gaussian",
+        "torch_bf16": 0.42451132711029976,
+        "flash": 0.10387642880119101,
+        "eager": 0.4506498389570649,
+        "block_row11": 0.3,
+        "row11_torch_bf16": 0.425,
+        "row11_eager": 0.451,
+        "flash_minus_torch": -0.32063489830910874,
+        "block_minus_torch_row11": -0.125,
+        "eager_minus_torch": 0.026138511846765133
+      },
+      {
+        "config": "b4-s128-seed43",
+        "op_point": "poststep",
+        "torch_bf16": 0.6791048342885293,
+        "flash": 0.143028759928535,
+        "eager": 0.2288117605077576,
+        "block_row11": 0.563,
+        "row11_torch_bf16": 0.679,
+        "row11_eager": 0.229,
+        "flash_minus_torch": -0.5360760743599943,
+        "block_minus_torch_row11": -0.1160000000000001,
+        "eager_minus_torch": -0.4502930737807717
+      },
+      {
+        "config": "b4-s128-seed44",
+        "op_point": "gaussian",
+        "torch_bf16": 0.48517930509616986,
+        "flash": 0.6800917073341256,
+        "eager": 0.13334156997638053,
+        "block_row11": -0.264,
+        "row11_torch_bf16": 0.485,
+        "row11_eager": 0.133,
+        "flash_minus_torch": 0.19491240223795575,
+        "block_minus_torch_row11": -0.749,
+        "eager_minus_torch": -0.35183773511978933
+      },
+      {
+        "config": "b4-s128-seed44",
+        "op_point": "poststep",
+        "torch_bf16": -0.06187870939394835,
+        "flash": 0.09530707783128202,
+        "eager": -0.08684238131334489,
+        "block_row11": -0.07,
+        "row11_torch_bf16": -0.062,
+        "row11_eager": -0.087,
+        "flash_minus_torch": 0.15718578722523036,
+        "block_minus_torch_row11": -0.008000000000000007,
+        "eager_minus_torch": -0.024963671919396538
+      },
+      {
+        "config": "b8-s128-seed42",
+        "op_point": "gaussian",
+        "torch_bf16": 0.8269616856526928,
+        "flash": 0.9309505452027423,
+        "eager": 0.844883860998581,
+        "block_row11": null,
+        "row11_torch_bf16": null,
+        "row11_eager": null,
+        "flash_minus_torch": 0.10398885955004955,
+        "block_minus_torch_row11": null,
+        "eager_minus_torch": 0.017922175345888247
+      },
+      {
+        "config": "b8-s128-seed42",
+        "op_point": "poststep",
+        "torch_bf16": 0.22652332068421652,
+        "flash": 0.11206235093841102,
+        "eager": 0.22002198387188554,
+        "block_row11": null,
+        "row11_torch_bf16": null,
+        "row11_eager": null,
+        "flash_minus_torch": -0.1144609697458055,
+        "block_minus_torch_row11": null,
+        "eager_minus_torch": -0.006501336812330977
+      },
+      {
+        "config": "b8-s512-seed42",
+        "op_point": "gaussian",
+        "torch_bf16": 0.6778462099732746,
+        "flash": -0.11231295353829843,
+        "eager": null,
+        "block_row11": null,
+        "row11_torch_bf16": null,
+        "row11_eager": null,
+        "flash_minus_torch": -0.790159163511573,
+        "block_minus_torch_row11": null,
+        "eager_minus_torch": null
+      },
+      {
+        "config": "b8-s512-seed42",
+        "op_point": "poststep",
+        "torch_bf16": -0.524551663924645,
+        "flash": -0.1253446984583321,
+        "eager": null,
+        "block_row11": null,
+        "row11_torch_bf16": null,
+        "row11_eager": null,
+        "flash_minus_torch": 0.39920696546631296,
+        "block_minus_torch_row11": null,
+        "eager_minus_torch": null
+      }
+    ],
+    "sign_counts": {
+      "flash_minus_torch": {
+        "positive": 4,
+        "negative": 6,
+        "zero": 0,
+        "n": 10
+      },
+      "block_minus_torch_row11": {
+        "positive": 0,
+        "negative": 6,
+        "zero": 0,
+        "n": 6
+      },
+      "eager_minus_torch": {
+        "positive": 3,
+        "negative": 5,
+        "zero": 0,
+        "n": 8
+      }
+    }
+  },
+  "known_limitations": [
+    {
+      "id": "b8-s512-jammi-eager-oom",
+      "description": "jammi's eager (JAMMI_KERNELS_DISABLE=all) attention composition OOM'd (CUDA_ERROR_OUT_OF_MEMORY) at batch=8, seq=512 (batched_forward triplet -> effective batch 24) on this 80GB A100 PCIe box, at BOTH operating points (gaussian, poststep), reproduced 3/3 attempts total (gaussian via run_esc045_torch_column.sh, gaussian via a direct equivalent invocation, poststep via a direct equivalent invocation) -- each attempt started from a fresh process with nvidia-smi reporting 0 MiB / 81154 MiB used on the device immediately before, so this is not fragmentation carried over from a prior run. torch's OWN eager attention (--attn eager) at the IDENTICAL shape/dtype succeeded on the same box in the same session (see the torch_bf16 arm's numbers for this config) -- so this is jammi's own eager composition specifically at this shape, not a hardware ceiling every eager implementation hits here. The other four arms/truths for this config (jammi_bf16_fused/flash, jammi_f32_truth, torch_bf16, torch_f32_truth, at both operating points) completed normally and are included in combined_report/paired_table; only the jammi_bf16_eager cells are marked unavailable. Root-causing or fixing this is out of this dispatch's scope (jammi-bench/jammi-test-utils measurement, not jammi-encoders/jammi-kernels memory behavior) -- flagged here as a measured, reproducible fact for whichever domain agent owns that code to pick up."
+    }
+  ]
+}

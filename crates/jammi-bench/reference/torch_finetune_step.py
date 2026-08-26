@@ -510,8 +510,20 @@ def provenance(device, fast_path_globals):
 # the installed torch package itself was compiled). All three are nullable
 # entries (`TORCH_IDENTITY_FIELDS_NULL_MEANS` below): `null` on any of them
 # means "this run had no CUDA device" / "this torch install has no CUDA
-# support", never "this producer predates the field" — every other entry
-# here is `NonNull`.
+# support", never "this producer predates the field".
+#
+# Round-3 audit (advisory 1): three MORE fields are independently nullable,
+# each governed by its OWN separate guard (not the CUDA one above) — `git_rev`
+# (:441-452, `None` when `git` is not on `PATH`, this file is not inside a
+# git worktree, or the subprocess times out — mirrors `grad_oracle.rs`'s own
+# `git_rev` field, which is likewise `None` when the baked `build_sha`
+# resolved to `"unknown"`), `transformers_version` / `peft_version` (:472-473,
+# `getattr(transformers/peft, "__version__", None)` — `None` when that
+# OPTIONAL package (imported inside a `try`/`except ImportError` a few lines
+# above `info = {...}`) is not installed at all, never "this producer
+# predates the field"). See `TORCH_IDENTITY_FIELDS_NULL_MEANS`, immediately
+# below, for the full six-entry nullable set and each one's declared meaning
+# — every `TORCH_IDENTITY_FIELDS` entry NOT listed there is `NonNull`.
 TORCH_IDENTITY_FIELDS = (
     "seed",
     "batch",
@@ -546,10 +558,16 @@ TORCH_IDENTITY_FIELDS = (
 # Field -> what a `null`/absent reading on THIS producer means. Every
 # `TORCH_IDENTITY_FIELDS` entry not listed here is `NonNull` (a null/absent
 # reading is itself a finding, mirroring the Rust `Nullable::NonNull` class).
+# Round-3 audit (advisory 1): `git_rev`/`transformers_version`/`peft_version`
+# joined the CUDA-guard trio below — each has its OWN independent reason to
+# read `null` (see the doc paragraph directly above `TORCH_IDENTITY_FIELDS`).
 TORCH_IDENTITY_FIELDS_NULL_MEANS = {
     "nvidia_driver_version": "no CUDA",
     "device_name": "no CUDA",
     "torch_cuda_version": "no CUDA (this torch install has no CUDA support)",
+    "git_rev": "git unavailable (not on PATH, not a git worktree, or the subprocess timed out)",
+    "transformers_version": "transformers not installed",
+    "peft_version": "peft not installed",
 }
 
 

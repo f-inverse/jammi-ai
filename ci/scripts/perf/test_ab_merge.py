@@ -1289,19 +1289,44 @@ class TorchIdentityFieldsAgainstADryRunDumpTests(unittest.TestCase):
                 dump = json.load(fh)
 
         def _resolve(field):
+            """Round-3 audit (advisory 4): the OLD form stopped at the
+            FIRST block (`provenance`/`args`/`finetune_step`, in that
+            order) that merely CONTAINED `field` — a `NonNull` field that
+            read `null` in an EARLIER block (or absent) masked a genuine
+            non-null value sitting in a LATER block this function never
+            looked at, and "absent from every block" collapsed onto the
+            exact same return value as "present-but-null in the one block
+            that has it" (both `False`, no diagnostic). This version
+            checks ALL THREE blocks and returns a per-block status dict
+            (`"absent"` / `"null"` / `"present"`) alongside the verdict, so
+            a failure names exactly where the field stood in EACH block.
+            """
+            per_block = {}
+            satisfied = False
             for block_name in ("provenance", "args", "finetune_step"):
                 block = dump.get(block_name, {})
-                if isinstance(block, dict) and field in block:
-                    if field in tfs.TORCH_IDENTITY_FIELDS_NULL_MEANS:
-                        return True  # presence is enough; null is the declared state
-                    return block[field] is not None
-            return False
+                if not isinstance(block, dict) or field not in block:
+                    per_block[block_name] = "absent"
+                    continue
+                if block[field] is None:
+                    per_block[block_name] = "null"
+                else:
+                    per_block[block_name] = "present"
+                    satisfied = True
+            if not satisfied and field in tfs.TORCH_IDENTITY_FIELDS_NULL_MEANS:
+                # A NullMeans field is satisfied by PRESENCE alone (even a
+                # null value) in at least one block — null is the declared
+                # state, not a finding.
+                satisfied = any(status != "absent" for status in per_block.values())
+            return satisfied, per_block
 
-        missing = [f for f in tfs.TORCH_IDENTITY_FIELDS if not _resolve(f)]
+        results = {f: _resolve(f) for f in tfs.TORCH_IDENTITY_FIELDS}
+        missing = {f: blocks for f, (ok, blocks) in results.items() if not ok}
         self.assertFalse(
             missing,
-            f"TORCH_IDENTITY_FIELDS entries absent, or null despite being NonNull, in a real "
-            f"--dry-run dump: {missing}",
+            f"TORCH_IDENTITY_FIELDS entries unsatisfied in a real --dry-run dump — per-field, "
+            f"per-block status (absent/null/present) across provenance/args/finetune_step: "
+            f"{missing}",
         )
 
 

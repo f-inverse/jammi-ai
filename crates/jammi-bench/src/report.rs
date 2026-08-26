@@ -89,6 +89,20 @@ pub fn assert_identity_fields_present(value: &serde_json::Value, fields: &[(&str
                 !entry.is_null(),
                 "{field:?} is declared NonNull but serialized as null"
             );
+            // Round-3 audit (advisory 5): an empty STRING is not JSON
+            // `null`, so the check above alone let a NonNull field through
+            // with no real content (`build.rs`'s own advisory A3 bug —
+            // `TARGET`/`PROFILE` baking `""` — was closed at the SOURCE in
+            // round 2, but nothing here would have caught a regression
+            // back to that shape). A non-string NonNull field (a number,
+            // bool, array, object) is unaffected — this check only fires
+            // on the string variant.
+            if let Some(s) = entry.as_str() {
+                assert!(
+                    !s.is_empty(),
+                    "{field:?} is declared NonNull but serialized as an empty string"
+                );
+            }
         }
     }
 }
@@ -102,16 +116,25 @@ pub fn assert_identity_fields_present(value: &serde_json::Value, fields: &[(&str
 ///
 /// One instance per process, shared by every emitted [`Report`] (at
 /// `report.provenance`) AND by the standalone `jammi-bench provenance`
-/// subcommand (`main.rs`'s `run_provenance`), so a shell producer
-/// (`stacked_sweep.sh`, `proof_artifact.py`) can cross-check `build_sha`
-/// against its own resolved sha BEFORE spending any wall-clock on a leg,
-/// rather than discovering a stale binary only after the fact.
+/// subcommand (`main.rs`'s `run_provenance`), so a shell producer can read
+/// this binary's identity BEFORE spending any wall-clock on a leg, rather
+/// than discovering a stale binary only after the fact. Round-3 audit fix:
+/// `stacked_sweep.sh`/`proof_artifact.py` do NOT read this today — the
+/// producer-side cross-check (`provenance.build_sha == $SHA`, contract
+/// C5.1) is phase 2, not built in this unit; this subcommand exists NOW so
+/// that phase 2 has something to call.
 ///
 /// The three fields [`REPORT_IDENTITY_FIELDS`] names — `build_sha`,
-/// `target`, `profile` — are what let a downstream K7-completeness reader
-/// (`ab_merge.py`'s leg-premise check, `check_cuda_run_artifacts.py`'s rule
-/// (g)) tell "these two legs ran the same code on the same target" apart
-/// from "these two legs merely both filled in the same COMPARISON tuple";
+/// `target`, `profile` — are what will let a downstream K7-completeness
+/// reader (`ab_merge.py`'s leg-premise check, `check_cuda_run_artifacts.py`'s
+/// rule (g)) tell "these two legs ran the same code on the same target"
+/// apart from "these two legs merely both filled in the same COMPARISON
+/// tuple", ONCE that reader consumes them — round-3 audit fix: `ab_merge.py`'s
+/// leg-premise check compares `FINETUNE_IDENTITY_FIELDS` only (contract
+/// C4.1's 14-field tuple, which does NOT include `build_sha`/`target`/
+/// `profile` at all — those are Rust-only K7-completeness additions, not
+/// part of the comparison tuple), and rule (g) is phase 2 (C6.3), not built
+/// in this unit; NEITHER consumer reads `REPORT_IDENTITY_FIELDS` today.
 /// `build_features` is measurement/provenance context (what this binary
 /// COULD dispatch), not part of that identity triple.
 #[derive(Debug, Serialize)]
@@ -2060,5 +2083,52 @@ mod tests {
             result.is_err(),
             "a field absent from the object entirely must panic — it did not"
         );
+
+        // Round-3 audit (advisory 5): the two lattice cells the round-2
+        // test above didn't cover — NullMeans×absent and NullMeans×present.
+        // `Nullable` only ever discriminates NULL-vs-non-null; it says
+        // NOTHING about whether the KEY may be omitted entirely — a
+        // NullMeans field absent from the object is the SAME finding an
+        // absent NonNull field is (contract C6.3's "presence for all"
+        // half applies to every declared field regardless of nullability;
+        // only the "non-null only for NonNull" half is nullability-gated).
+        let nullmeans_fields: &[(&str, Nullable)] =
+            &[("widget", Nullable::NullMeans("no widget configured"))];
+        let result = std::panic::catch_unwind(|| {
+            let value = serde_json::json!({ "other": "value" });
+            assert_identity_fields_present(&value, nullmeans_fields);
+        });
+        assert!(
+            result.is_err(),
+            "a NullMeans field absent from the object entirely must STILL panic (presence is \
+             required regardless of nullability) — it did not"
+        );
+
+        // NullMeans×present: a NullMeans field that is present AND
+        // genuinely non-null (the `nvidia_driver_version` reading on a real
+        // CUDA box, say) must pass cleanly — NullMeans widens what is
+        // ACCEPTED, it never forbids a real value.
+        let value = serde_json::json!({ "widget": "a real value, not null" });
+        assert_identity_fields_present(&value, nullmeans_fields); // must not panic
+
+        // Round-3 audit (advisory 5): an empty STRING on a NonNull field
+        // must panic — `""` is not JSON `null`, so the null-only check
+        // alone would have let this through (the exact shape `build.rs`'s
+        // round-2 advisory A3 bug baked before it was fixed at the
+        // source: `TARGET`/`PROFILE` defaulting to `""`).
+        let nonnull_string_fields: &[(&str, Nullable)] = &[("widget", Nullable::NonNull)];
+        let result = std::panic::catch_unwind(|| {
+            let value = serde_json::json!({ "widget": "" });
+            assert_identity_fields_present(&value, nonnull_string_fields);
+        });
+        assert!(
+            result.is_err(),
+            "a NonNull field serialized as an empty string must panic — it did not"
+        );
+        // Control: a non-string NonNull field (e.g. a number `0`) is NOT
+        // caught by the empty-string check — `0` is a legitimate NonNull
+        // value, never confused with `""`.
+        let value = serde_json::json!({ "widget": 0 });
+        assert_identity_fields_present(&value, nonnull_string_fields); // must not panic
     }
 }

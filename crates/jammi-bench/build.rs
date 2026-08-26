@@ -78,18 +78,28 @@
 //! resolves a directory `rerun-if-changed` target by walking it for the
 //! most-recently-modified file — an mtime `stat()` walk, not a content
 //! read, so the cost is proportional to file COUNT, not byte size) plus
-//! `Cargo.lock`/`Cargo.toml` at the workspace root. This is deliberately a
-//! SUPERSET of "files jammi-bench's own dependency graph reaches": `git
-//! status --porcelain` (no pathspec) reports dirtiness against the WHOLE
-//! repository, so the baked flag has to react to the same scope — a
-//! false-positive `-dirty` (an edit to an unrelated crate this binary
-//! doesn't depend on triggers a rebuild+rerun that finds the SAME clean
-//! git state and rebakes the SAME clean sha, at worst a wasted build-script
-//! invocation) is the safe direction; a false-negative (this bug) is not.
-//! `workspace_root()` derives the watch root from `CARGO_MANIFEST_DIR`'s
-//! own filesystem position (`<root>/crates/<name>`) rather than a `git`
-//! call, so the watch is emitted unconditionally, even in the git-less
-//! tarball case where `git_build_sha` itself returns `None`.
+//! `Cargo.lock`/`Cargo.toml` at the workspace root. `workspace_root()`
+//! derives the watch root from `CARGO_MANIFEST_DIR`'s own filesystem
+//! position (`<root>/crates/<name>`) rather than a `git` call, so the
+//! watch is emitted unconditionally, even in the git-less tarball case
+//! where `git_build_sha` itself returns `None`.
+//!
+//! **What `-dirty` means, exactly (round-3 audit advisory 2).** The
+//! dirtiness QUERY (`git_build_sha`'s own `git status`) is pathspec-
+//! restricted to `:/crates`, `:/Cargo.lock`, `:/Cargo.toml` — the SAME
+//! three targets the watch above names, not the whole repository. The two
+//! scopes are kept identical DELIBERATELY: if the query covered more than
+//! the watch (the whole repo, as an earlier revision of this file did), a
+//! dirty file OUTSIDE the watched set (a `docs/` edit, say) would bake
+//! `-dirty` on THAT build, but committing that same edit later touches
+//! nothing the watch covers — no rerun happens, and the now-STALE
+//! `-dirty` marker survives past the point the tree actually went clean
+//! (the SAME staleness SHAPE the retrigger bug above has, just running in
+//! the opposite direction: falsely dirty instead of falsely clean). So:
+//! `-dirty` means "this binary's own build-relevant tree — `crates/`,
+//! `Cargo.lock`, `Cargo.toml` — has an uncommitted change to a TRACKED
+//! file", never "the whole monorepo checkout is dirty" and never "an
+//! UNTRACKED file exists anywhere" (`--untracked-files=no`).
 //!
 //! `provenance_baked.rs`'s `edited_tracked_file_forces_dirty_on_rebuild`
 //! test is the regression proof: a scratch probe crate is built once
@@ -194,8 +204,33 @@ fn git_build_sha(manifest_dir: &str) -> Option<String> {
     // status propagates `None` all the way out to `"unknown"` instead of
     // being silently read as clean, the same fail-closed posture the sha
     // resolution above already takes.
+    //
+    // Round-3 audit (advisory 2): the QUERY is pathspec-restricted to
+    // EXACTLY what `main()`'s `rerun-if-changed` WATCHES — `:/crates`,
+    // `:/Cargo.lock`, `:/Cargo.toml` (the `:/` magic pathspec means "from
+    // the top of the working tree", so this resolves correctly regardless
+    // of `cwd` = `manifest_dir`, a nested subdirectory). Before this fix
+    // the query covered the WHOLE repo (no pathspec) while the watch
+    // covered only this narrower set — the two scopes disagreeing is
+    // itself a staleness hazard in the OTHER direction from B2: a dirty
+    // file OUTSIDE `crates/`/`Cargo.lock`/`Cargo.toml` (a `docs/` edit,
+    // say) would bake `-dirty` on ITS OWN build, but committing that same
+    // edit later would never trigger a rerun (nothing the watch covers
+    // changed), leaving a now-STALE `-dirty` baked past the point the tree
+    // actually went clean. Restricting the query to the watch's own scope
+    // makes the two facts move together by construction: any tree state
+    // that flips this query's answer is, by definition, a tree state that
+    // also would have re-run this script.
     let status_ran = Command::new("git")
-        .args(["status", "--porcelain", "--untracked-files=no"])
+        .args([
+            "status",
+            "--porcelain",
+            "--untracked-files=no",
+            "--",
+            ":/crates",
+            ":/Cargo.lock",
+            ":/Cargo.toml",
+        ])
         .current_dir(manifest_dir)
         .output()
         .ok()?;

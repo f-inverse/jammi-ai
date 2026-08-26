@@ -100,9 +100,12 @@ jobs:
       # process would be the wrong layer for it). Runs directly in THIS
       # job's own ephemeral `actions/checkout@v4` clone — never pushed,
       # discarded when the job ends, so an empty commit here is harmless;
-      # `cargo build -p jammi-bench` above already warmed the target dir, so
-      # the rebuild below only re-runs `build.rs` + relinks jammi-bench's own
-      # binary, not a full workspace recompile. Complements (never
+      # round-3 audit fix: the preceding step is named "Run tests"
+      # (`cargo test --workspace --exclude jammi-python`, :93-94), which
+      # already built `jammi-bench` as part of that workspace test run and
+      # warmed this job's target dir, so the rebuild below only re-runs
+      # `build.rs` + relinks jammi-bench's own binary, not a full workspace
+      # recompile. Complements (never
       # duplicates) `provenance_baked.rs`'s `edited_tracked_file_forces_
       # dirty_on_rebuild` (an UNCOMMITTED edit must dirty a rebuild) and
       # `runtime_env_and_cwd_are_inert` (an ALREADY-BUILT binary must not

@@ -1,3 +1,4 @@
+NULL A -- run-to-run process nondeterminism (identical CLI invocation, twice):
 config           op           torch repA    torch repB       diff sign      eager repA    eager repB       diff sign
 --------------------------------------------------------------------------------------------------------------------
 b4-s128-seed42   gaussian    0.795654132   0.795654132  +0.000000    0     0.766743734   0.766743734  +0.000000    0
@@ -12,3 +13,19 @@ jammi_bf16_eager: signs=['0', '0', '0', '0', '0', '0'] -> 0 positive / 0 negativ
 
 block-torch (row11) deficit magnitudes over the same 6 points: min=0.008 max=0.749 (values: ['-0.186', '-0.149', '-0.125', '-0.116', '-0.749', '-0.008'])
 null band (both arms, run-to-run nondeterminism only) = EXACTLY 0.000000000 at every one of the 6 points -- narrower than every block-torch deficit above (0.008 .. 0.749).
+
+NULL B -- torch --attn eager vs --attn sdpa (same torch stack, same weights/batch/dtype, only the attention kernel implementation differs):
+config           op          cos eager    cos sdpa  d(sdpa-eager) sign    d(block-eager,row11) sign
+---------------------------------------------------------------------------------------------------
+b4-s128-seed42   gaussian     0.795654    0.719698      -0.075957    -                  -0.186    -
+b4-s128-seed42   poststep    -0.201373   -0.309521      -0.108149    -                  -0.149    -
+b4-s128-seed43   gaussian     0.424511    0.486658      +0.062147    +                  -0.125    -
+b4-s128-seed43   poststep     0.679105    0.457126      -0.221979    -                  -0.116    -
+b4-s128-seed44   gaussian     0.485179    0.380176      -0.105003    -                  -0.749    -
+b4-s128-seed44   poststep    -0.061879   -0.110665      -0.048786    -                  -0.008    -
+
+sdpa-vs-eager (NULL B) sign counts: 1 positive / 5 negative / 0 zero (n=6) -- signs=['-', '-', '+', '-', '-', '-']
+block-vs-eager (row11) sign counts over the SAME 6 points: 0 positive / 6 negative (n=6) -- signs=['-', '-', '-', '-', '-', '-']
+|d_sdpa_vs_eager| range: 0.049 .. 0.222
+|d_block_vs_eager| range: 0.008 .. 0.749
+5 of 6 block-vs-eager deficit magnitudes sit AT OR BELOW the max magnitude NULL B's own within-torch attention-implementation swap produced (0.222) -- i.e. not distinguishable in SIZE from ordinary attention-kernel-choice variance within a single, well-tested framework.

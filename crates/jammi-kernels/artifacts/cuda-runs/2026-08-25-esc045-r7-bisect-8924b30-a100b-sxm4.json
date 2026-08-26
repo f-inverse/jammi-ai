@@ -286,5 +286,55 @@
     "verdict_on_the_hypothesis": "PARTIALLY confirmed at the ORIGINAL cell only, does NOT generalize: at b4-s128/seed42 arm (b) recovers less than half the 0.610->0.810 gap (0.699, not ~0.81); at seed43 the recovery is similarly partial (0.357, and note all-eager itself is WORSE than baseline at that config, 0.104 < 0.258, so '~0.81' was never the achievable target there); at b8-s128/seed42 arm (b) is CATASTROPHICALLY WORSE than baseline (0.230 vs 0.843), the opposite of the predicted direction. softmax_last_dim_fused belongs to the SAME class as geglu_fused/layer_norm_fused (an F32-accumulate-round-once fused kernel vs a multi-op bf16 cascade eager fallback, per softmax.rs's own module doc, L1151 'BF16 accumulates in f32 ... rounding to bf16 exactly once') and shows the SAME sign-flipping instability across seed/shape those two showed in E7's own sweep -- this is not a NEW, cleaner signal; it is another instance of the already-documented non-robust class.",
     "rounding_placement_finding": "candle_nn::ops::softmax (jammi's PRODUCTION eager fallback, candle-nn-0.11.0/src/ops.rs:22-29) does NOT upcast to F32 anywhere: max_keepdim/broadcast_sub/exp/sum_keepdim/broadcast_div all execute directly at the input dtype (BF16 here) -- a 5-op BF16 cascade, no f32 accumulator at all. jammi's OWN fused softmax (SoftmaxLastDimFused) already accumulates row-max/exp/row-sum in F32 and rounds to BF16 exactly once (softmax.rs:1151-1153) -- i.e. the FUSED arm is the one closer to torch's own reference discipline (modeling_modernbert.py: F32 softmax, BF16 cast of probs before the PV GEMM), not the eager one. Separately: `raw_scores` itself (BEFORE softmax runs, either arm) is BF16 unless JAMMI_ROUND5_UPCAST_SCORES=1 -- OFF by default in every run here and in every production call site -- upcasts q/k to F32 for the scores GEMM specifically. Round 6's own E6 already measured that exact upcast-to-match-torch diagnostic under this round's Gaussian LoRA init and found it did NOT help (block-eager arm's boundary.1-18 cosine vs jammi f32 truth got WORSE, 0.6618->0.5845, upcast on vs off) -- so 'make eager softmax's scores F32 like torch' is not evidenced as the right fix target either, independent of this round's own softmax-isolation instability finding.",
     "recommendation": "Do not greenlight a softmax-rounding-placement fix branch off the single originally-measured cell. The full-224-tensor cosine this whole investigation (round 6 AND round 7) has used as its headline number is dominated by 4-5 early-layer tensors (E8: layers 0-4 carry 83.7% of the f32-truth gradient's L2^2 mass) where EVERY tested fused-vs-eager pair (softmax included) shows large, sign-flipping movement across seed/shape rather than a stable, one-directional improvement -- the same instability this round's own E7 table already documents for geglu_fused/layer_norm_fused. Any fix spec built from this metric needs the robustness check (>=1 different seed, >=1 different batch) BEFORE being treated as decided, not after."
+  },
+  "lead_probe_2_H1_H2_ledger_row_258": {
+    "context": "Lead's independent tool (jammi-bench grad-oracle --ablate-each-op, origin/bench/grad-oracle-ablate-each-op@42a0f2f, a100d) reported b4-s128 seed42 cosines: all_fused 0.6098, ablate attention_block_fused 0.6098, ablate cast_add 0.6098, ablate cast_scale 0.6098, ablate geglu_fused 0.7912, ablate layer_norm_fused 0.7807, ablate lora_linear_fused 0.7039, all_off 0.8101 -- these match THIS round's E7_bisect_table digit-for-digit (baseline_all_fused=0.6098268554357086, geglu_fused_disabled=0.7912350422112485, layer_norm_fused_disabled=0.780742959732835, lora_linear_fused_disabled=0.7039233043213515, attention_block_fused_disabled=0.6098268554357086, all_eager_ceiling=0.8100927710946351), an independent cross-tool confirmation of the same measurement surface (JAMMI_KERNELS_DISABLE env-var forcing vs a dedicated --ablate-each-op subprocess-isolated CLI). Answered entirely from data already collected this round -- no new binary build was needed; see each sub-answer's own citation.",
+    "H2_additivity_answer": "ALREADY MEASURED -- E7_bisect_table's own pairwise_and_triple_combinations_b4s128_seed42: geglu+ln=0.7449, geglu+lora=0.6779, ln+lora=0.6997, triple=0.8722. This is NEITHER of the lead's two stated H2 signatures: pairs are NOT approx 0.81 (they are all LOWER than the WORSE of their own two single legs -- geglu+ln=0.745 is below BOTH geglu-alone=0.791 AND ln-alone=0.781), and the triple (0.872) EXCEEDS the all_off ceiling (0.810) rather than matching it. This rules out simple coupling (pairs recovering to ~all_off) and simple additivity alike; it is a genuinely non-monotonic interaction, consistent with each toggle swapping between two DIFFERENT bf16 rounding realizations (not a shared magnitude-blowup source three ops all sit on) whose combined effect on a small number of dominant early-layer tensors does not compose linearly.",
+    "H1_magnitude_ratio_by_layer": {
+      "method": "per-layer average norm_ratio (= ||g_arm|| / ||g_f32_truth||, averaged over that layer's 8 LoRA tensors) for all_fused (baseline) vs each of the three single-op ablations, from esc045_r7_e8_aggregate.py's own already-emitted per-tensor rows (baseline.json/geglu.json/ln.json/lora.json under e8/) -- no new dump needed.",
+      "baseline_all_fused_ratio_by_layer_selected": {
+        "0": 0.792,
+        "1": 0.808,
+        "4": 1.063,
+        "5": 0.93,
+        "9": 0.869,
+        "13": 0.966,
+        "18": 0.959,
+        "27": 1.033
+      },
+      "geglu_fused_disabled_ratio_by_layer_selected": {
+        "0": 0.612,
+        "1": 0.589,
+        "4": 0.691,
+        "5": 0.748,
+        "9": 0.825,
+        "13": 0.933,
+        "18": 0.984,
+        "27": 1.041
+      },
+      "layer_norm_fused_disabled_ratio_by_layer_selected": {
+        "0": 0.755,
+        "1": 0.835,
+        "4": 0.786,
+        "5": 0.92,
+        "9": 0.737,
+        "13": 0.874,
+        "18": 0.977,
+        "27": 1.022
+      },
+      "lora_linear_fused_disabled_ratio_by_layer_selected": {
+        "0": 0.917,
+        "1": 0.983,
+        "4": 1.396,
+        "5": 1.163,
+        "9": 1.268,
+        "13": 1.211,
+        "18": 1.047,
+        "27": 1.041
+      },
+      "finding": "H1, as stated (a single ablation collapses the magnitude ratio toward 1 at the same layers the cosine improves), is NOT supported by this axis. First: baseline's OWN ratio is never more than ~25% off unity anywhere in this table (0.79-1.07) -- nothing resembling the cited 5-13x jammi-vs-torch blow-up appears on the jammi-bf16-vs-jammi-f32-truth axis at this config; that earlier 5-13x/layers-5-18/31-sign-flip finding was very likely measured jammi-vs-TORCH (a cross-framework comparison this round has not repeated) rather than jammi-vs-its-own-f32-truth, and should not be assumed to be the same quantity. Second: none of the three ablations 'collapses toward 1' at the layers where ITS OWN cosine improved most: geglu_fused-disabled's ratio at layers 0-4 (0.61-0.69) is FURTHER from 1 than baseline's (0.79-1.06) at those same layers, even though geglu_fused's disable was the single largest cosine mover there; layer_norm_fused-disabled's ratio is comparable to baseline's, not closer to 1; lora_linear_fused-disabled's ratio moves AWAY from 1 in the OPPOSITE direction (over-shoots to 1.2-1.4x at layers 2-13) even though it was the one robustly cosine-positive ablation. The magnitude axis and the direction (cosine) axis are moving somewhat independently here -- a fused-vs-eager toggle that fixes DIRECTION does not, in this data, correspondingly fix MAGNITUDE; H1's proposed single shared magnitude-blowup mechanism is not what these three ablations' own \u2016g\u2016 ratios show."
+    },
+    "softmax_arm_off_vs_on": "ALREADY MEASURED in lead_probe_softmax_isolation_ledger_row_254 (the FIRST lead probe, same round): arm_a (attention_block_fused disabled, softmax_last_dim_fused left FUSED/on) = 0.6098268554357086; arm_b (attention_block_fused AND softmax_last_dim_fused both disabled, softmax OFF) = 0.6989759606438362 at b4-s128 seed42 (+0.089 vs arm_a/baseline), with the seed43/b8-s128 confirmation showing the SAME non-robust, sign-flipping pattern the other ops show (b8-s128: 0.230, a catastrophic reversal). requested==fired confirmed both arms (attention_block_fused; attention_block_fused+softmax_last_dim_fused respectively).",
+    "overall_answer_to_lead": "H1 (shared bf16 magnitude-blowup mechanism) is not supported by the ||g|| ratio data: none of the three ops' ablations pulls the ratio toward 1 at the layers its own cosine improves, and baseline's own ratio was never dramatically blown up on this axis to begin with (nothing like 5-13x) -- the cited 5-13x finding likely reflects a different comparison (jammi vs torch) than jammi-vs-its-own-f32-truth. H2 (additivity/coupling) is answered by data already in this artifact: neither hypothesis's predicted pattern (pairs~=0.81, or singles+pairs summing linearly) matches -- pairs are LOWER than either constituent single, and the triple EXCEEDS all_off. The softmax-standalone arm was already measured (part of the first lead probe) and shows the same seed/shape-fragile pattern geglu_fused/layer_norm_fused show, not a cleaner isolated signal. No new binary build was required to answer any of this -- all three answers come from data this round already collected on the block binary (target-r6-base, git_rev 8924b30), cross-validated digit-for-digit against the lead's independently-built --ablate-each-op tool on a100d."
   }
 }

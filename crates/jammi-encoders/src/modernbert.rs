@@ -295,9 +295,16 @@ struct CastCache {
 /// [`Self::apply_training`] is the ONLY call site that may dispatch to
 /// [`jammi_kernels::ops::RopeFused`]; [`Self::apply`] never does, so
 /// eval's OUTPUT VALUES (which always come from `apply`, see
-/// `ModernBertAttention::forward`) are bit-identical before and after
-/// this commit — table hoisting's lock is the only thing eval's call
-/// shape gains. `apply_training` itself still falls back to `apply`
+/// `ModernBertAttention::forward`) are governed entirely by `apply`'s
+/// own rounding placement (see that function's doc for the one-rounding
+/// fix, which DOES change eval's output at the ULP level on an F16/BF16
+/// backbone — table hoisting is a SEPARATE claim from that). Table
+/// hoisting itself, the subject of this doc section, contributes no
+/// rounding of its own: it removes redundant `to_dtype`/`unsqueeze`
+/// recomputation and adds a lock/unlock pair, nothing else — the
+/// "bit-neutral" claim
+/// `tests::table_hoisting_is_bit_neutral_with_the_uncached_computation`
+/// actually asserts. `apply_training` itself still falls back to `apply`
 /// whenever the fused kernel's domain check fails (K2 admission) — the
 /// training path is therefore "fused when possible, otherwise identical
 /// to eval's own path", never a third distinct numeric path.
@@ -386,27 +393,71 @@ impl RotaryEmbedding {
     }
 
     /// Apply RoPE to a `[batch, num_heads, seq, head_dim]` tensor — the
-    /// eager composition, whose OUTPUT VALUES are unchanged from before
-    /// table hoisting existed (see the struct doc's disclosure: this call
-    /// now also takes `cast_cache`'s lock once, which is new). Used
-    /// directly in eval and as [`Self::apply_training`]'s fallback.
+    /// eager composition. Used directly in eval and as
+    /// [`Self::apply_training`]'s fallback.
+    ///
+    /// Matches HF's reference, PINNED to the `transformers` v5.15.1 /
+    /// torch v2.13.0 pairing (`modeling_modernbert.py`'s
+    /// `apply_rotary_pos_emb`): `cos`/`sin` are read from
+    /// [`Self::cached_tables`] already rounded to `x_dtype` (mirroring
+    /// upstream's `RotaryEmbedding.forward` returning
+    /// `cos.to(dtype=x.dtype)` — the TABLE itself is bf16-rounded, same
+    /// as before this fix), but the elementwise rotation — `q_embed =
+    /// (q.float() * cos) + (rotate_half(q.float()) * sin)` — is computed
+    /// with every operand upcast to `internal_dtype` (f32 whenever
+    /// `x_dtype` is F16/BF16, matching torch's implicit type promotion
+    /// when an f32 tensor multiplies a bf16 one), and the result is cast
+    /// to `x_dtype` exactly once at the end (`.to(original_dtype)`),
+    /// matching jammi's own fused CUDA kernel (`cuda/rope.cu:62`:
+    /// `out[i] = __float2bfloat16(xv * c + rh * s * sign)`, `c`/`s`/`xv`
+    /// all read via `__bfloat162float` then combined in float, one
+    /// `__float2bfloat16` at the very end). By contrast, the
+    /// `transformers` v4.x line's own `apply_rotary_pos_emb` multiplies
+    /// and adds at the INPUT dtype instead — the three-round form this
+    /// fix removes — so the citation above is version-pinned, not "HF
+    /// always does X".
+    ///
+    /// Previously `x.broadcast_mul(&cos)` and `rot_half.broadcast_mul(&sin)`
+    /// ran directly at `x_dtype` (bf16) and were then added at `x_dtype`
+    /// too — three rounding points instead of one. A measured,
+    /// non-vacuous divergence at production shape (`heads=16,
+    /// head_dim=64, batch=2, seq in {128, 512}`) is the RED control in
+    /// `tests::rope_apply_matches_truth_at_production_shape_seq128`/
+    /// `_seq512` — see those tests' own printed mismatch counts for a
+    /// reproducible figure (no number is hardcoded here; the committed
+    /// test is the producer).
+    /// Every served RoPE output on an F16/BF16 backbone — eval AND the
+    /// training-eager fallback — changes at the ULP level; this is the
+    /// same disclosed consequence `crate::layer_norm::LayerNorm::slow`'s
+    /// doc states for the LN fix. F32-backbone serving is UNCHANGED
+    /// (`internal_dtype == x_dtype` there, so every `to_dtype` call above
+    /// is a same-dtype no-op). This upcast also means `apply` now
+    /// allocates transient F32 copies of `x`/`cos`/`sin` on every call
+    /// when the backbone is F16/BF16 (no throughput measurement is
+    /// claimed here — only that the allocation exists).
     fn apply(&self, x: &Tensor) -> Result<Tensor, EncoderError> {
         let (_batch, _heads, seq, head_dim) = x.dims4()?;
         let half = head_dim / 2;
         let x_dtype = x.dtype();
+        let internal_dtype = match x_dtype {
+            DType::F16 | DType::BF16 => DType::F32,
+            d => d,
+        };
 
         let (cos_full, sin_full) = self.cached_tables(x_dtype)?;
-        let cos = cos_full.narrow(2, 0, seq)?;
-        let sin = sin_full.narrow(2, 0, seq)?;
+        let cos = cos_full.narrow(2, 0, seq)?.to_dtype(internal_dtype)?;
+        let sin = sin_full.narrow(2, 0, seq)?.to_dtype(internal_dtype)?;
 
-        let x1 = x.narrow(D::Minus1, 0, half)?;
-        let x2 = x.narrow(D::Minus1, half, half)?;
+        let x_internal = x.to_dtype(internal_dtype)?;
+        let x1 = x_internal.narrow(D::Minus1, 0, half)?;
+        let x2 = x_internal.narrow(D::Minus1, half, half)?;
         let neg_x2 = (x2 * -1.0f64)?;
         let rot_half = Tensor::cat(&[&neg_x2, &x1], D::Minus1)?;
 
-        let cos_part = x.broadcast_mul(&cos)?;
+        let cos_part = x_internal.broadcast_mul(&cos)?;
         let sin_part = rot_half.broadcast_mul(&sin)?;
-        Ok((cos_part + sin_part)?)
+        let out_internal = (cos_part + sin_part)?;
+        Ok(out_internal.to_dtype(x_dtype)?)
     }
 
     /// `[2, 1, 1, max_seq_len, head_dim]` — [`Self::cached_tables`]'s own
@@ -752,9 +803,17 @@ struct ModernBertAttention {
     /// Whether the fused RoPE kernel may be attempted on Q/K (still gated
     /// by its own domain check — see [`RotaryEmbedding::apply_training`]).
     /// `false` (eval/serving) always calls [`RotaryEmbedding::apply`]
-    /// directly, with output VALUES bit-identical to before this field
-    /// existed (see `RotaryEmbedding`'s struct doc for the one disclosed,
-    /// non-numeric change — a table-cache lock — `apply` itself gained);
+    /// directly; the mere EXISTENCE of this field changed nothing about
+    /// what eval computes — `apply` gained only a table-cache lock from
+    /// table hoisting, a disclosed, non-numeric change (see
+    /// `RotaryEmbedding`'s struct doc). That is a narrower claim than
+    /// "`apply`'s output values never changed": `apply`'s OWN body was
+    /// separately rewritten in the same PR that introduced this field's
+    /// sibling training-mode dispatch, to round its bf16/f16 rotation
+    /// once instead of three times (see `RotaryEmbedding::apply`'s own
+    /// doc for the citation and measured divergence) — that change is
+    /// real and orthogonal to this field, not something this field's
+    /// existence caused or could have prevented.
     /// `true` (training) is the ONLY state that ever reaches
     /// `apply_training`. Propagated by [`ModernBert::set_training`], the
     /// same mechanism `LayerNorm::set_training` uses.
@@ -1236,11 +1295,17 @@ impl ModernBertAttention {
     /// Dispatches to [`RotaryEmbedding::apply_training`] (fused-when-
     /// possible) in training mode, else [`RotaryEmbedding::apply`]
     /// directly — eval never even calls the training-mode method, so
-    /// its OUTPUT VALUES are bit-identical to before the fused kernel
-    /// existed regardless of that method's own admission logic (`apply`
-    /// itself gained a table-cache lock from table hoisting — see
-    /// `RotaryEmbedding`'s struct doc — which is a real, disclosed
-    /// change to what eval does, not a numeric one).
+    /// eval's ROUTING is unaffected by that method's own admission logic
+    /// existing at all (`apply` itself gained a table-cache lock from
+    /// table hoisting — see `RotaryEmbedding`'s struct doc — which is a
+    /// real, disclosed change to what eval does, not a numeric one). This
+    /// is a claim about ROUTING, not about `apply`'s numeric output:
+    /// `apply`'s bf16/f16 output VALUES did change in this PR (the
+    /// round-once rounding-placement fix — see `RotaryEmbedding::apply`'s
+    /// own doc for the citation and measured divergence), and eval calls
+    /// the SAME `apply`, so eval's bf16/f16 RoPE output changed too. F32
+    /// eval is unaffected by that fix specifically (`internal_dtype ==
+    /// x_dtype` there).
     fn rope_apply(&self, x: &Tensor) -> Result<Tensor, EncoderError> {
         if self.training {
             self.rope.apply_training(x)
@@ -2258,14 +2323,20 @@ impl ModernBert {
     /// dispatches to the fused CUDA/CPU LayerNorm kernel when that
     /// kernel's own domain holds (dtype, contiguity, device, hidden
     /// size), falling back to the slow path otherwise — see
-    /// `crate::layer_norm`'s module doc. RoPE follows the SAME doctrine:
-    /// eval always calls `RotaryEmbedding::apply` directly (OUTPUT VALUES
-    /// bit-identical before/after the fused kernel; `apply` itself now
-    /// also takes a table-cache lock from table hoisting, an uncontended,
-    /// non-numeric change disclosed on `RotaryEmbedding`'s own doc),
-    /// training calls `RotaryEmbedding::apply_training` (fused kernel
-    /// when its own domain holds, else the identical eager `apply`) — see
-    /// `ModernBertAttention::rope_apply`. Propagating the flag keeps the
+    /// `crate::layer_norm`'s module doc. RoPE follows the SAME doctrine
+    /// for ROUTING: eval always calls `RotaryEmbedding::apply` directly,
+    /// and the fused-RoPE machinery's mere existence changes nothing
+    /// about which function eval calls (`apply` itself now also takes a
+    /// table-cache lock from table hoisting, an uncontended, non-numeric
+    /// change disclosed on `RotaryEmbedding`'s own doc); training calls
+    /// `RotaryEmbedding::apply_training` (fused kernel when its own
+    /// domain holds, else the identical eager `apply`) — see
+    /// `ModernBertAttention::rope_apply`. This routing claim does NOT
+    /// mean `apply`'s own output values are unchanged: `apply`'s bf16/f16
+    /// rotation now rounds once instead of three times (this PR's
+    /// round-once fix — see `RotaryEmbedding::apply`'s own doc), which
+    /// eval observes too, since eval calls the same `apply`; F32 eval is
+    /// unaffected by that specific fix. Propagating the flag keeps the
     /// surface consistent with [`crate::Bert`] and [`crate::DistilBert`].
     pub fn set_training(&mut self, training: bool) {
         self.training = training;
@@ -2620,7 +2691,7 @@ impl<'a, 'b> LoraSite<'a, 'b> {
 mod tests {
     use super::*;
     use candle_core::Var;
-    use half::bf16;
+    use half::{bf16, f16};
 
     /// Serializes every test in THIS module that reads
     /// `ATTENTION_BLOCK_DISPATCH_COUNTERS` (a process-wide, `#[cfg(test)]`-
@@ -4771,12 +4842,22 @@ mod tests {
             .unwrap()
             .unsqueeze(0)
             .unwrap();
-        let x1 = x.narrow(D::Minus1, 0, half).unwrap();
-        let x2 = x.narrow(D::Minus1, half, half).unwrap();
+        // `apply` upcasts the (bf16-rounded) table AND `x` to f32 for the
+        // actual rotation, matching `Self::apply`'s own doc — this
+        // reference must upcast the same way, not multiply at bf16, or it
+        // would be pinning the pre-fix three-round formula instead of the
+        // one this function now runs.
+        let cos = cos.to_dtype(DType::F32).unwrap();
+        let sin = sin.to_dtype(DType::F32).unwrap();
+        let x_internal = x.to_dtype(DType::F32).unwrap();
+        let x1 = x_internal.narrow(D::Minus1, 0, half).unwrap();
+        let x2 = x_internal.narrow(D::Minus1, half, half).unwrap();
         let neg_x2 = (x2 * -1.0f64).unwrap();
         let rot_half = Tensor::cat(&[&neg_x2, &x1], D::Minus1).unwrap();
-        let uncached: Vec<bf16> = (x.broadcast_mul(&cos).unwrap()
+        let uncached: Vec<bf16> = (x_internal.broadcast_mul(&cos).unwrap()
             + rot_half.broadcast_mul(&sin).unwrap())
+        .unwrap()
+        .to_dtype(DType::BF16)
         .unwrap()
         .flatten_all()
         .unwrap()
@@ -4785,6 +4866,333 @@ mod tests {
         assert_eq!(
             out_first, uncached,
             "the cached path must match a from-scratch to_dtype/unsqueeze computation"
+        );
+    }
+
+    /// Deterministic LCG walk producing PRODUCTION-AMPLITUDE f32 values in
+    /// `[-half_width, half_width)`, tracked by its literal seed/multiplier/
+    /// increment (not RNG-crate state) — the same convention
+    /// `crate::test_support::deterministic_fill_varmap` uses at a
+    /// narrower range, widened here so the bf16-rounded fixture spans
+    /// several bf16 ULP steps and actually exercises a rounding-placement
+    /// difference rather than a range where every rounding decision lands
+    /// the same way regardless of where the cast sits.
+    fn lcg_fixture(mut state: u32, n: usize, half_width: f32) -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                let unit = (state >> 8) as f32 / (1u32 << 24) as f32; // [0, 1)
+                (unit - 0.5) * 2.0 * half_width
+            })
+            .collect()
+    }
+
+    /// A from-scratch (no candle tensor ops) f32 reference for RoPE's
+    /// rotation, rounded to bf16 EXACTLY ONCE at the end — HF's placement
+    /// pinned to `transformers` v5.15.1 / torch 2.13.0
+    /// (`modeling_modernbert.py::apply_rotary_pos_emb`: `q_embed =
+    /// (q.float() * cos) + (rotate_half(q.float()) * sin)`, then
+    /// `.to(original_dtype)` once). `transformers` v4.x's
+    /// `apply_rotary_pos_emb` instead multiplies/adds at the INPUT
+    /// dtype — the three-round form this fix removes — so this citation
+    /// is version-pinned, not "HF always does X". RoPE's rotation is
+    /// purely elementwise (`rotate_half` is an index permutation, no
+    /// reduction), so — unlike a LayerNorm mean/variance reduction —
+    /// there is no SIMD-reduction-order escape hatch here: this truth is
+    /// expected to, and is measured to, match both the real
+    /// `RotaryEmbedding::apply` and `RopeFused`'s fused CPU arm
+    /// BIT-EXACTLY at every shape.
+    fn scalar_rope_truth_bf16(
+        x: &[bf16],
+        cos: &[bf16],
+        sin: &[bf16],
+        batch: usize,
+        heads: usize,
+        seq: usize,
+        head_dim: usize,
+    ) -> Vec<bf16> {
+        let half = head_dim / 2;
+        let mut out = Vec::with_capacity(batch * heads * seq * head_dim);
+        let mut idx = 0usize;
+        for _b in 0..batch {
+            for _h in 0..heads {
+                for s in 0..seq {
+                    for i in 0..head_dim {
+                        let xi = x[idx].to_f32();
+                        let rot = if i < half {
+                            -x[idx + half].to_f32()
+                        } else {
+                            x[idx - half].to_f32()
+                        };
+                        let c = cos[s * head_dim + i].to_f32();
+                        let sn = sin[s * head_dim + i].to_f32();
+                        out.push(bf16::from_f32(xi * c + rot * sn));
+                        idx += 1;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The PRE-FIX formula this commit removes: `x*cos`, `rotate_half(x)*sin`,
+    /// and their sum EACH independently rounded to bf16 — three rounding
+    /// points instead of one. A deliberately WRONG reimplementation kept
+    /// ONLY as this oracle's non-vacuity control: proves the fixture
+    /// actually exercises the rounding-placement difference (mismatches
+    /// against the truth on a stated, asserted-positive count), not a
+    /// fixture that happens to round the same way regardless of
+    /// placement.
+    fn scalar_rope_triple_round_bf16(
+        x: &[bf16],
+        cos: &[bf16],
+        sin: &[bf16],
+        batch: usize,
+        heads: usize,
+        seq: usize,
+        head_dim: usize,
+    ) -> Vec<bf16> {
+        let half = head_dim / 2;
+        let mut out = Vec::with_capacity(batch * heads * seq * head_dim);
+        let mut idx = 0usize;
+        for _b in 0..batch {
+            for _h in 0..heads {
+                for s in 0..seq {
+                    for i in 0..head_dim {
+                        let xi = x[idx].to_f32();
+                        let rot = if i < half {
+                            -x[idx + half].to_f32()
+                        } else {
+                            x[idx - half].to_f32()
+                        };
+                        let c = cos[s * head_dim + i].to_f32();
+                        let sn = sin[s * head_dim + i].to_f32();
+                        // ROUND #1: x*cos at bf16.
+                        let cos_part = bf16::from_f32(xi * c);
+                        // ROUND #2: rotate_half(x)*sin at bf16.
+                        let sin_part = bf16::from_f32(rot * sn);
+                        // ROUND #3: the sum, at bf16.
+                        out.push(bf16::from_f32(cos_part.to_f32() + sin_part.to_f32()));
+                        idx += 1;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Biting oracle (family F: measured live against an independently-
+    /// derived reference, not a same-code tautology) at PRODUCTION shape —
+    /// `head_dim=64`, `heads=16` (`heads * head_dim = 1024`, ModernBERT-
+    /// large's hidden size), `batch=2`, `seq` in `{128, 512}` — calling
+    /// the REAL [`RotaryEmbedding::apply`] (not a reimplementation of
+    /// it): `jammi-kernels` is a leaf crate and cannot reach this
+    /// function at all (see that crate's `tests/rope_oracles.rs` module
+    /// doc), so THIS is the only place in the workspace that can
+    /// exercise `apply`'s actual dispatch against an independent numeric
+    /// truth.
+    ///
+    /// Reverting this file's production `apply` hunk (restoring the
+    /// pre-fix `x.broadcast_mul(&cos)` / `rot_half.broadcast_mul(&sin)`
+    /// three-round form) turns this test RED: `apply`'s output then
+    /// matches [`scalar_rope_triple_round_bf16`] instead of the truth
+    /// reference, and the `assert_eq!(apply_out, truth, ...)` call below
+    /// fails.
+    fn rope_apply_matches_truth_at_production_shape(
+        batch: usize,
+        heads: usize,
+        seq: usize,
+        head_dim: usize,
+        seed: u32,
+    ) {
+        let device = Device::Cpu;
+        let n = batch * heads * seq * head_dim;
+
+        let xf = lcg_fixture(seed, n, 24.0);
+        let x_bf16: Vec<bf16> = xf.iter().map(|&v| bf16::from_f32(v)).collect();
+        assert!(
+            x_bf16.iter().all(|v| v.to_f32().is_finite()),
+            "fixture x must be finite before any bit compare"
+        );
+
+        let r = rope(head_dim, seq, 10_000.0, &device);
+        let x = Tensor::from_slice(&x_bf16, (batch, heads, seq, head_dim), &device).unwrap();
+
+        let apply_out: Vec<bf16> = r
+            .apply(&x)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert!(
+            apply_out.iter().all(|v| v.to_f32().is_finite()),
+            "apply() output must be finite before any bit compare"
+        );
+
+        // The SAME cos/sin table bytes `apply()` itself reads/narrows —
+        // the table's OWN bf16 rounding is `cached_tables`'s documented,
+        // unchanged behavior; this oracle is about the ROTATION's
+        // rounding placement, not the table.
+        let (cos_full, sin_full) = r.cached_tables(DType::BF16).unwrap();
+        let cos_b = cos_full.narrow(2, 0, seq).unwrap();
+        let sin_b = sin_full.narrow(2, 0, seq).unwrap();
+        let cos: Vec<bf16> = cos_b.flatten_all().unwrap().to_vec1().unwrap();
+        let sin: Vec<bf16> = sin_b.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(cos.iter().chain(sin.iter()).all(|v| v.to_f32().is_finite()));
+
+        let truth = scalar_rope_truth_bf16(&x_bf16, &cos, &sin, batch, heads, seq, head_dim);
+        assert!(
+            truth.iter().all(|v| v.to_f32().is_finite()),
+            "truth output must be finite before any bit compare"
+        );
+
+        assert_eq!(
+            apply_out, truth,
+            "RotaryEmbedding::apply must be bit-exact vs the f32-round-once truth \
+             (RoPE's rotation is elementwise -- no reduction-order escape hatch)"
+        );
+
+        let fused_out: Vec<bf16> = apply3(&x, &cos_b, &sin_b, RopeFused::new(false))
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert!(
+            fused_out.iter().all(|v| v.to_f32().is_finite()),
+            "fused output must be finite before any bit compare"
+        );
+        assert_eq!(
+            fused_out, truth,
+            "RopeFused's fused CPU arm must be bit-exact vs the same truth"
+        );
+
+        // RED CONTROL (non-vacuity): the pre-fix triple-rounding formula
+        // must differ from truth on a stated, asserted-positive count.
+        let triple_round =
+            scalar_rope_triple_round_bf16(&x_bf16, &cos, &sin, batch, heads, seq, head_dim);
+        assert!(triple_round.iter().all(|v| v.to_f32().is_finite()));
+        let mismatch = triple_round
+            .iter()
+            .zip(truth.iter())
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        println!(
+            "rope_apply_matches_truth_at_production_shape(batch={batch}, heads={heads}, \
+             seq={seq}, head_dim={head_dim}): triple-round control vs truth mismatches = \
+             {mismatch}/{n}"
+        );
+        assert!(
+            mismatch > 0,
+            "RED control is vacuous: the pre-fix triple-rounding formula matched the truth \
+             on every element (mismatch count 0) -- this fixture does not exercise the \
+             rounding-placement difference at all"
+        );
+    }
+
+    #[test]
+    fn rope_apply_matches_truth_at_production_shape_seq128() {
+        // batch=2, heads=16, seq=128, head_dim=64 (heads*head_dim=1024).
+        rope_apply_matches_truth_at_production_shape(2, 16, 128, 64, 0xC0FF_EE11);
+    }
+
+    #[test]
+    fn rope_apply_matches_truth_at_production_shape_seq512() {
+        // batch=2, heads=16, seq=512, head_dim=64 (heads*head_dim=1024).
+        rope_apply_matches_truth_at_production_shape(2, 16, 512, 64, 0xC0FF_EE12);
+    }
+
+    /// F16 twin of [`scalar_rope_truth_bf16`]: `apply`'s `internal_dtype`
+    /// match (`DType::F16 | DType::BF16 => DType::F32`) takes the SAME
+    /// branch for F16 as for BF16 — this proves that branch is actually
+    /// exercised and rounds correctly for the OTHER dtype it names, not
+    /// just BF16. Only ONE shape/seed is run here (not the full
+    /// seq-128/seq-512 sweep the BF16 oracle covers above): the
+    /// rounding-placement mechanism is dtype-independent (both dtypes hit
+    /// the identical F32-internal code path), so a single fixture is
+    /// sufficient to confirm the F16 arm is reached and correct.
+    fn scalar_rope_truth_f16(
+        x: &[f16],
+        cos: &[f16],
+        sin: &[f16],
+        batch: usize,
+        heads: usize,
+        seq: usize,
+        head_dim: usize,
+    ) -> Vec<f16> {
+        let half = head_dim / 2;
+        let mut out = Vec::with_capacity(batch * heads * seq * head_dim);
+        let mut idx = 0usize;
+        for _b in 0..batch {
+            for _h in 0..heads {
+                for s in 0..seq {
+                    for i in 0..head_dim {
+                        let xi = x[idx].to_f32();
+                        let rot = if i < half {
+                            -x[idx + half].to_f32()
+                        } else {
+                            x[idx - half].to_f32()
+                        };
+                        let c = cos[s * head_dim + i].to_f32();
+                        let sn = sin[s * head_dim + i].to_f32();
+                        out.push(f16::from_f32(xi * c + rot * sn));
+                        idx += 1;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn rope_apply_matches_truth_at_production_shape_f16() {
+        let device = Device::Cpu;
+        // batch=2, heads=16, seq=128, head_dim=64 (heads*head_dim=1024) --
+        // the same production shape as the BF16 seq128 case above.
+        let (batch, heads, seq, head_dim) = (2, 16, 128, 64);
+        let n = batch * heads * seq * head_dim;
+
+        let xf = lcg_fixture(0xF16E_0001, n, 24.0);
+        let x_f16: Vec<f16> = xf.iter().map(|&v| f16::from_f32(v)).collect();
+        assert!(
+            x_f16.iter().all(|v| v.to_f32().is_finite()),
+            "fixture x must be finite before any bit compare"
+        );
+
+        let r = rope(head_dim, seq, 10_000.0, &device);
+        let x = Tensor::from_slice(&x_f16, (batch, heads, seq, head_dim), &device).unwrap();
+
+        let apply_out: Vec<f16> = r
+            .apply(&x)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert!(
+            apply_out.iter().all(|v| v.to_f32().is_finite()),
+            "apply() output must be finite before any bit compare"
+        );
+
+        let (cos_full, sin_full) = r.cached_tables(DType::F16).unwrap();
+        let cos_b = cos_full.narrow(2, 0, seq).unwrap();
+        let sin_b = sin_full.narrow(2, 0, seq).unwrap();
+        let cos: Vec<f16> = cos_b.flatten_all().unwrap().to_vec1().unwrap();
+        let sin: Vec<f16> = sin_b.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(cos.iter().chain(sin.iter()).all(|v| v.to_f32().is_finite()));
+
+        let truth = scalar_rope_truth_f16(&x_f16, &cos, &sin, batch, heads, seq, head_dim);
+        assert!(
+            truth.iter().all(|v| v.to_f32().is_finite()),
+            "truth output must be finite before any bit compare"
+        );
+
+        assert_eq!(
+            apply_out, truth,
+            "RotaryEmbedding::apply's F16 internal_dtype arm must be bit-exact vs the \
+             f32-round-once truth -- same mechanism as the BF16 sweep above, the OTHER \
+             dtype internal_dtype's match handles"
         );
     }
 

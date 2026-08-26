@@ -93,6 +93,43 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --exclude jammi-python
 
+      # Unification contract §6 F3 (round-2 audit B5): the designated
+      # build-sha HERMETICITY falsifier, as a real CI step (never a
+      # `#[test]` — C1.6's own text: this needs a REAL commit, and mutating
+      # the actual checkout from inside `cargo test -p jammi-bench`'s own
+      # process would be the wrong layer for it). Runs directly in THIS
+      # job's own ephemeral `actions/checkout@v4` clone — never pushed,
+      # discarded when the job ends, so an empty commit here is harmless;
+      # `cargo build -p jammi-bench` above already warmed the target dir, so
+      # the rebuild below only re-runs `build.rs` + relinks jammi-bench's own
+      # binary, not a full workspace recompile. Complements (never
+      # duplicates) `provenance_baked.rs`'s `edited_tracked_file_forces_
+      # dirty_on_rebuild` (an UNCOMMITTED edit must dirty a rebuild) and
+      # `runtime_env_and_cwd_are_inert` (an ALREADY-BUILT binary must not
+      # react to anything at run time) — this step is the third leg: a REAL
+      # new commit, on a REBUILD, must move the baked sha to match it.
+      - name: build-sha hermeticity (contract §6 F3)
+        run: |
+          set -euo pipefail
+          field() { python3 -c 'import json,sys; print(json.load(sys.stdin)["'"$1"'"])'; }
+          A="$(cargo run -p jammi-bench --quiet -- provenance | field build_sha)"
+          git -c user.email=ci@jammi.invalid -c user.name=jammi-ci \
+            commit --quiet --allow-empty -m "F3 build-sha hermeticity probe (never pushed)"
+          NEW_HEAD="$(git rev-parse HEAD)"
+          B="$(cargo run -p jammi-bench --quiet -- provenance | field build_sha)"
+          echo "before=$A after=$B new_head=$NEW_HEAD"
+          if [ "$A" = "$B" ]; then
+            echo "::error::build-sha hermeticity FAILED — baked build_sha did not change after a real commit + rebuild (before=$A after=$B)"
+            exit 1
+          fi
+          case "$B" in
+            "$NEW_HEAD" | "$NEW_HEAD"-dirty) ;;
+            *)
+              echo "::error::build-sha hermeticity FAILED — rebuilt sha ($B) does not track the new commit ($NEW_HEAD)"
+              exit 1
+              ;;
+          esac
+
   # The gated-lane compile-checks live in their OWN job, not in `test` above.
   # Each `--no-run` builds a full-workspace test-binary graph; accumulating all
   # of them plus the run-tests graph in one job's `target/` exhausted the

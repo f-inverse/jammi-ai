@@ -2003,4 +2003,62 @@ mod tests {
             }
         }
     }
+
+    /// Round-2 audit (advisory A4): neither `IDENTITY_FIELDS` const has a
+    /// field typed `Option` today, so the `NonNull`-declared-but-null
+    /// PANIC branch inside `assert_identity_fields_present` was reachable
+    /// in principle but never actually exercised by any existing test —
+    /// and `Nullable::NullMeans` is genuinely unconstructed on this branch
+    /// (contract C3.4: `max_grad_norm` enters only once PR #381 lands).
+    /// `assert_identity_fields_present` is generic over `serde_json::Value`
+    /// precisely so BOTH lattice arms can be exercised against a synthetic
+    /// fixture object, without needing a real struct field typed `Option`
+    /// (report.rs's own `device_name: String` — the field the round-2
+    /// brief's literal "device_name None" suggestion named — is NOT
+    /// constructible as `None`; this synthetic-`Value` fixture is what
+    /// makes the branch testable without changing that field's type).
+    #[test]
+    fn assert_identity_fields_present_covers_both_nullable_arms() {
+        // Arm 1: a NonNull-declared field that serialized as JSON `null`
+        // MUST panic — this is the class B2/B4 exist to prevent (a field
+        // that silently reads null with no declared meaning).
+        let null_nonnull_fields: &[(&str, Nullable)] = &[("widget", Nullable::NonNull)];
+        let result = std::panic::catch_unwind(|| {
+            let value = serde_json::json!({ "widget": null });
+            assert_identity_fields_present(&value, null_nonnull_fields);
+        });
+        assert!(
+            result.is_err(),
+            "a NonNull field serialized as null must panic — it did not"
+        );
+
+        // Arm 2: a NullMeans-declared field that serialized as JSON `null`
+        // must NOT panic — this is the exact shape `max_grad_norm: null`
+        // ("no clip") will take once PR #381 lands.
+        let null_nullmeans_fields: &[(&str, Nullable)] =
+            &[("widget", Nullable::NullMeans("no widget configured"))];
+        let value = serde_json::json!({ "widget": null });
+        assert_identity_fields_present(&value, null_nullmeans_fields); // must not panic
+
+        // Control: a NonNull field that is genuinely present and non-null
+        // passes cleanly (the "both fields present" baseline every other
+        // call site in this module relies on).
+        let present_fields: &[(&str, Nullable)] = &[("widget", Nullable::NonNull)];
+        let value = serde_json::json!({ "widget": "present" });
+        assert_identity_fields_present(&value, present_fields); // must not panic
+
+        // Negative control on the assertion mechanism itself: an ABSENT
+        // field (never even the key `null`) must ALSO panic, distinctly
+        // from the null-but-present case above — `unwrap_or_else` in
+        // `assert_identity_fields_present`'s own body is what fires here.
+        let missing_field_fields: &[(&str, Nullable)] = &[("absent_field", Nullable::NonNull)];
+        let result = std::panic::catch_unwind(|| {
+            let value = serde_json::json!({ "other": "value" });
+            assert_identity_fields_present(&value, missing_field_fields);
+        });
+        assert!(
+            result.is_err(),
+            "a field absent from the object entirely must panic — it did not"
+        );
+    }
 }

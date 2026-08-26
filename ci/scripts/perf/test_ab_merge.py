@@ -1094,30 +1094,52 @@ class EmptyRawDirTests(unittest.TestCase):
 
 class TorchIdentityFieldsAgainstADryRunDumpTests(unittest.TestCase):
     """Unification contract C3.5: `torch_finetune_step.py::TORCH_IDENTITY_FIELDS`
-    must actually be present somewhere in the JSON this producer emits.
+    must actually be present, and non-null where NOT declared nullable, in the
+    JSON this producer emits.
 
-    Two legs, chosen so this suite stays runnable in EITHER environment:
+    ONE REQUIRED leg + one best-effort leg — deliberately NOT symmetric,
+    because `torch_finetune_step.py`'s own module doc already states this
+    script is "never invoked from CI" (a human/CI *operator* runs it BY HAND
+    on a rented GPU pod, next to `jammi-bench finetune-step`); wiring a real
+    `--dry-run` execution into automated CI would reverse that pre-existing,
+    deliberate design decision, not merely wire a test in. So:
 
-    - `test_static_source_covers_every_declared_field` (ALWAYS runs,
-      stdlib-only): parses `torch_finetune_step.py`'s own AST and collects
-      every string dict-literal KEY anywhere in the module (`provenance()`'s
-      `info = {...}`, `run()`'s `report["args"]`/`report["finetune_step"]`
-      blocks), then asserts every `TORCH_IDENTITY_FIELDS` entry is one of
-      them. This is the leg that actually executes in THIS environment (no
-      `torch`/`transformers` install available here — `import torch` fails
-      at the top of this very check), and is what makes this suite catch a
-      typo'd field name in `TORCH_IDENTITY_FIELDS` mechanically rather than
-      by eye.
-    - `test_real_dry_run_dump_names_every_field` (SKIPPED unless `torch` +
-      `transformers` + `peft` import cleanly): actually spawns
-      `torch_finetune_step.py --dry-run` (`build_dry_run_checkpoint`'s own
-      random-init tiny checkpoint, no real weights needed — see that
-      function's doc) and asserts every `TORCH_IDENTITY_FIELDS` entry
-      resolves to a non-`_MISSING` value in the REAL emitted JSON — the
-      literal "checks it against a dry-run dump" contract C3.5 names. Runs
-      for real on a box that has the torch/transformers/peft stack (a GPU
-      prove pod, a maintainer's dev box); skipped, never silently passed,
-      everywhere else.
+    - `test_static_source_covers_every_declared_field` is the REQUIRED,
+      ALWAYS-RUNNING oracle (stdlib-only `ast`, no torch needed — this is
+      what actually executes in the `guard` matrix leg, a plain shallow
+      checkout with no Python ML stack). It is scoped to exactly the THREE
+      places this producer actually assembles emitted JSON —
+      `provenance()`'s own `info = {...}` dict, `checkpoint_identity()`'s own
+      return dict (the `**checkpoint_identity_fields` unpack inside the
+      `finetune_step` block — an unpack is not a literal string key `ast.Dict.
+      keys` sees, so its SOURCE function is walked directly instead), and the
+      ONE `report = {...}` literal inside `run()` (identified structurally,
+      by the dict literal that carries BOTH a `"finetune_step"` AND a
+      `"provenance"` key, so a future rename cannot silently re-target the
+      wrong dict) — never every `ast.Dict` in the module. Round-2 audit (B3)
+      caught the vacuous
+      shape this replaces: collecting keys from EVERY dict in the module
+      also swept in `TORCH_IDENTITY_FIELDS_NULL_MEANS` (the classification
+      table declared two lines below `TORCH_IDENTITY_FIELDS` itself, whose
+      keys are the SAME field names) — a field declared in
+      `TORCH_IDENTITY_FIELDS` and named ONLY in `NULL_MEANS`, never actually
+      assigned anywhere the producer emits, still passed. Mutation check:
+      add `"max_grad_norm"` to `TORCH_IDENTITY_FIELDS` and to
+      `TORCH_IDENTITY_FIELDS_NULL_MEANS` ONLY (never to `provenance()`'s or
+      `run()`'s own dict literals) — this leg now goes RED, where the
+      pre-fix version stayed green.
+    - `test_real_dry_run_dump_names_every_field` is a best-effort SUPPLEMENT,
+      not the enforcement mechanism: it actually spawns
+      `torch_finetune_step.py --dry-run` and checks every `NonNull` entry is
+      `is not None` (never mere presence) and every `TORCH_IDENTITY_FIELDS_
+      NULL_MEANS` entry is at least present — but it SKIPS, never RED,
+      when `torch`/`transformers`/`peft` are not importable (this
+      environment, and the plain `guard` matrix leg, never have them). This
+      is intentional, not a zero-execution violation of the "zero-execution
+      is RED, not a skip" convention (`.github/workflows/ci.yml` guard
+      matrix's own doc): that convention governs REQUIRED gates: this leg
+      was never wired as one — the static leg above is, and it has no skip
+      path at all.
     """
 
     TORCH_SCRIPT = os.path.join(
@@ -1131,12 +1153,9 @@ class TorchIdentityFieldsAgainstADryRunDumpTests(unittest.TestCase):
         with open(path, encoding="utf-8") as fh:
             return fh.read()
 
-    def test_static_source_covers_every_declared_field(self):
+    def _declared_fields(self, tree):
         import ast
 
-        tree = ast.parse(self._module_source())
-        declared = None
-        dict_keys = set()
         for node in ast.walk(tree):
             if (
                 isinstance(node, ast.Assign)
@@ -1144,31 +1163,92 @@ class TorchIdentityFieldsAgainstADryRunDumpTests(unittest.TestCase):
                 and isinstance(node.targets[0], ast.Name)
                 and node.targets[0].id == "TORCH_IDENTITY_FIELDS"
             ):
-                declared = [elt.value for elt in node.value.elts]
-            if isinstance(node, ast.Dict):
-                for key in node.keys:
-                    if isinstance(key, ast.Constant) and isinstance(key.value, str):
-                        dict_keys.add(key.value)
-            # `report["finetune_step"][field] = value` / subscript-assign
-            # shapes (used for a couple of fields set conditionally after
-            # the dict literal, e.g. `lora_a_tensors_reinitialized`) also
-            # count as "this producer emits this key".
-            if (
-                isinstance(node, ast.Subscript)
-                and isinstance(node.slice, ast.Constant)
-                and isinstance(node.slice.value, str)
-            ):
-                dict_keys.add(node.slice.value)
+                return [elt.value for elt in node.value.elts]
+        return None
 
+    def _string_dict_keys(self, node):
+        import ast
+
+        keys = set()
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Dict):
+                for key in sub.keys:
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                        keys.add(key.value)
+        return keys
+
+    def _emitted_keys(self, tree):
+        """Keys this producer's report literals ACTUALLY carry — scoped to
+        `provenance()`'s own dict and the ONE `report = {...}` literal
+        inside `run()` (identified by structure — see the class doc). Never
+        every `ast.Dict` in the module."""
+        import ast
+
+        keys = set()
+        provenance_fn = next(
+            (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "provenance"),
+            None,
+        )
+        self.assertIsNotNone(provenance_fn, "torch_finetune_step.py's provenance() not found — RED at base")
+        keys |= self._string_dict_keys(provenance_fn)
+
+        # `run()`'s report["finetune_step"] block does `**checkpoint_identity_
+        # fields,` (a dict-UNPACK, not a literal string key `ast.Dict.keys`
+        # can see) — those three fields (checkpoint_config_sha256/
+        # checkpoint_weights_sha256/checkpoint_weights_size_bytes) arrive from
+        # `checkpoint_identity()`'s own return dict, so that function's keys
+        # are ALSO part of what this producer emits.
+        checkpoint_identity_fn = next(
+            (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "checkpoint_identity"),
+            None,
+        )
+        self.assertIsNotNone(
+            checkpoint_identity_fn, "torch_finetune_step.py's checkpoint_identity() not found — RED at base"
+        )
+        keys |= self._string_dict_keys(checkpoint_identity_fn)
+
+        run_fn = next(
+            (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "run"), None
+        )
+        self.assertIsNotNone(run_fn, "torch_finetune_step.py's run() not found — RED at base")
+
+        report_dict = None
+        for sub in ast.walk(run_fn):
+            if isinstance(sub, ast.Dict):
+                str_keys = {
+                    k.value
+                    for k in sub.keys
+                    if isinstance(k, ast.Constant) and isinstance(k.value, str)
+                }
+                if "finetune_step" in str_keys and "provenance" in str_keys:
+                    report_dict = sub
+                    break
+        self.assertIsNotNone(
+            report_dict,
+            "no dict literal carrying both 'provenance' and 'finetune_step' keys found inside "
+            "run() — the report = {...} literal this leg targets was not found (structure changed, "
+            "or this scoping needs updating for a genuine reformat)",
+        )
+        keys |= self._string_dict_keys(report_dict)
+        return keys
+
+    def test_static_source_covers_every_declared_field(self):
+        import ast
+
+        tree = ast.parse(self._module_source())
+        declared = self._declared_fields(tree)
         self.assertIsNotNone(
             declared, "TORCH_IDENTITY_FIELDS not found in torch_finetune_step.py — RED at base"
         )
         self.assertEqual(len(declared), len(set(declared)), "TORCH_IDENTITY_FIELDS has a duplicate")
-        missing = sorted(set(declared) - dict_keys)
+
+        emitted = self._emitted_keys(tree)
+        missing = sorted(set(declared) - emitted)
         self.assertFalse(
             missing,
-            f"TORCH_IDENTITY_FIELDS names field(s) that never appear as a dict-literal key "
-            f"anywhere in torch_finetune_step.py: {missing}",
+            f"TORCH_IDENTITY_FIELDS names field(s) that never appear as a key in provenance()'s own "
+            f"dict or the report={{...}} literal inside run(): {missing} — declaring a field in "
+            f"TORCH_IDENTITY_FIELDS_NULL_MEANS does NOT count as emitting it",
         )
 
     def test_real_dry_run_dump_names_every_field(self):
@@ -1177,7 +1257,12 @@ class TorchIdentityFieldsAgainstADryRunDumpTests(unittest.TestCase):
             import transformers  # noqa: F401
             import peft  # noqa: F401
         except ImportError:
-            self.skipTest("torch/transformers/peft not installed in this environment")
+            self.skipTest(
+                "torch/transformers/peft not installed in this environment — best-effort "
+                "supplement, never the enforcement mechanism (see class doc); "
+                "test_static_source_covers_every_declared_field is the REQUIRED oracle and does "
+                "not skip"
+            )
 
         sys.path.insert(0, os.path.dirname(os.path.abspath(self.TORCH_SCRIPT)))
         import torch_finetune_step as tfs  # noqa: E402
@@ -1207,13 +1292,16 @@ class TorchIdentityFieldsAgainstADryRunDumpTests(unittest.TestCase):
             for block_name in ("provenance", "args", "finetune_step"):
                 block = dump.get(block_name, {})
                 if isinstance(block, dict) and field in block:
-                    return True
+                    if field in tfs.TORCH_IDENTITY_FIELDS_NULL_MEANS:
+                        return True  # presence is enough; null is the declared state
+                    return block[field] is not None
             return False
 
         missing = [f for f in tfs.TORCH_IDENTITY_FIELDS if not _resolve(f)]
         self.assertFalse(
             missing,
-            f"TORCH_IDENTITY_FIELDS entries absent from a real --dry-run dump: {missing}",
+            f"TORCH_IDENTITY_FIELDS entries absent, or null despite being NonNull, in a real "
+            f"--dry-run dump: {missing}",
         )
 
 

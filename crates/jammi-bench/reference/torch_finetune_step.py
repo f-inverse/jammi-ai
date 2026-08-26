@@ -502,11 +502,16 @@ def provenance(device, fast_path_globals):
 # provenance fields this function (`provenance`, above) itself fills:
 # `fast_path_globals`, `device_name`, `git_rev`.
 #
-# `nvidia_driver_version` is the ONE nullable entry (`TORCH_IDENTITY_FIELDS_
-# NULL_MEANS` below): `null` on this producer means "this run had no CUDA
-# device" (`provenance`'s own `if device.type == "cuda":` guard, immediately
-# above), never "this producer predates the field" — every other entry here
-# is `NonNull`.
+# `provenance`'s own `if device.type == "cuda":` guard (immediately above)
+# governs THREE fields, not one — round-2 audit (B4) caught the other two:
+# `device_name` (:476, initialised `None`, filled only under that guard) and
+# `torch_cuda_version` (:471, `torch.version.cuda` — `None` on a CPU-only
+# torch build regardless of THIS run's `--cuda` flag, since it reflects how
+# the installed torch package itself was compiled). All three are nullable
+# entries (`TORCH_IDENTITY_FIELDS_NULL_MEANS` below): `null` on any of them
+# means "this run had no CUDA device" / "this torch install has no CUDA
+# support", never "this producer predates the field" — every other entry
+# here is `NonNull`.
 TORCH_IDENTITY_FIELDS = (
     "seed",
     "batch",
@@ -543,6 +548,8 @@ TORCH_IDENTITY_FIELDS = (
 # reading is itself a finding, mirroring the Rust `Nullable::NonNull` class).
 TORCH_IDENTITY_FIELDS_NULL_MEANS = {
     "nvidia_driver_version": "no CUDA",
+    "device_name": "no CUDA",
+    "torch_cuda_version": "no CUDA (this torch install has no CUDA support)",
 }
 
 

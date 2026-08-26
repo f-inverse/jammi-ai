@@ -613,6 +613,61 @@ jobs:
           # the single `ci-summary` gate covers it.
           - name: doc↔enum parity
             cmd: python3 ci/scripts/check_doc_parity.py
+          # Every measurement-shaped number (an N/M element count with M >= 64,
+          # an X%/X.Y%, or a bare 2-6-decimal cosine) with a trigger word
+          # ANYWHERE in its enclosing doc-comment BLOCK, in a kernel/test doc
+          # comment or assert! message under
+          # crates/jammi-{kernels,encoders,lora,bench}, must cite what
+          # produced it — `see [`fn`]` / `see mod::path::fn` / `see fn`,
+          # `printed by <same forms>`, `measured by <tracked path>`, or
+          # `[producer: <same forms>]` — ANYWHERE in that same block (the
+          # citation and the number need not be on the same line, or even
+          # adjacent lines — round-2 audit: a 12-line window both missed and
+          # over-reached; round-3 audit: binding is the comment block a
+          # citation and a number both live in). The resolved fn must be a
+          # #[test] function or a pub fn under tests/ — not any fn with a
+          # matching name, which is what let `see below` resolve against an
+          # unrelated non-test fn. `no-producer: <reason>` stays LINE-scoped
+          # (an explicit opt-out for a genuinely derived constant). Closes
+          # the class where a precise-looking number reads as evidence but
+          # nothing in the tree actually computes it (see
+          # docs/maintainer/cuda-kernel-guide.md §3.9). A committed,
+          # only-shrinks allowlist (ci/doc_number_allowlist.txt, classified
+          # real/noise in ci/doc_number_allowlist_classification.md) carries
+          # the pre-existing debt on main at the time this gate landed.
+          #
+          # ADVISORY, not required (lead ship decision, round-4): the lexical
+          # heuristic's honest noise rate on main is 36/69 = 52.2% (real:
+          # 33/69 = 47.8%; see ci/doc_number_allowlist_classification.md), so
+          # a REQUIRED scan leg would block an honest in-flight branch on its
+          # own noise (the esc-045 branch alone carries 69 unallowlisted
+          # findings, roughly half of them noise) rather than only on
+          # genuine new violations. The scan leg reports (advisory) until
+          # precision on main reaches >= 80% real.
+          # `continue_on_error: "true"` below (consumed by the shared "Run
+          # guard" step's `continue-on-error` expression) marks ONLY this one
+          # leg soft; `--self-test` and `--check-allowlist-only-shrinks`
+          # stay REQUIRED — the mechanism itself and the allowlist's
+          # only-shrinks invariant are both still fail-closed, only the
+          # noisy scan output is advisory.
+          - name: doc numbers have producers
+            cmd: python3 ci/scripts/check_doc_numbers_have_producers.py
+            continue_on_error: "true"
+          - name: doc numbers have producers self-test
+            cmd: python3 ci/scripts/check_doc_numbers_have_producers.py --self-test
+          # ci/doc_number_allowlist.txt is only-shrinks, mechanically: fetches
+          # origin/main (fails CLOSED if the fetch itself fails, or if
+          # origin/main does not resolve at all — never silently proceeds on
+          # stale/absent data) and fails on any entry this branch ADDS
+          # relative to it (never on one it removes). The one leg of this
+          # gate that is not otherwise hermetic (a single `git fetch origin
+          # main`), matching swarm.yml's own TOUCHED-guard precedent for
+          # comparing a branch against its merge base. Trivially passes
+          # (bootstrap) ONLY when origin/main resolves but has no allowlist
+          # file yet — the one PR introducing the file for the first time,
+          # since there is no baseline yet to have grown past.
+          - name: doc numbers allowlist only shrinks
+            cmd: python3 ci/scripts/check_doc_numbers_have_producers.py --check-allowlist-only-shrinks
           # GPU-parity coverage-completeness guard — the device-axis analog of
           # the required Postgres/SQLite backend it-matrix. It enumerates every
           # SHIPPED (encoder architecture × GPU-dispatching ModelTask verb)
@@ -727,6 +782,11 @@ jobs:
           # so a bare `0` here would make `||` silently discard it.
           fetch-depth: ${{ matrix.fetch_depth || '1' }}
       - name: Run guard
+        # `continue_on_error` is unset ('') for every leg except "doc
+        # numbers have producers" (matrix.continue_on_error: "true" there) —
+        # this expression is false for every other leg, so this stays a
+        # no-op change for the required guards.
+        continue-on-error: ${{ matrix.continue_on_error == 'true' }}
         run: ${{ matrix.cmd }}
 
   # ── Single rolled-up gate ──────────────────────────────────────────────────

@@ -3076,6 +3076,13 @@ graphs don't exhaust runner disk) → `test-clients` (clients + the **two candle
   backend-specific SQL tokens (SQLite-only `rowid`/`AUTOINCREMENT`/`PRAGMA`/`strftime(`/`glob(`;
   Postgres-only `ctid`). A syntactic first-pass tripwire only — it stops the obvious cheap
   regression; `test-pg` above is what actually enforces backend-behavioral parity.
+- **`ci/scripts/check_cuda_run_artifacts.py`** enforces a schema over every `*.json` under
+  `crates/jammi-kernels/artifacts/cuda-runs/` (see that directory's own `README.md` for the field
+  list, and `docs/maintainer/cuda-kernel-guide.md` §4): a well-typed `schema_version` / `git_sha`
+  / `box` / `producer` / `status`, `git_sha` an ancestor of `HEAD` (`git merge-base
+  --is-ancestor`), and a `producer` that is either statically verifiable (a real `#[test] fn`
+  found under its stated `#[ignore]`/`env:<VAR>`/`required-features` gating attribute) or a
+  reviewed legacy `kind: "none"` entry in the script's own closed allow-list.
 
 **Postgres coverage note (heuristic, not a certified gap list).** A name-based grep of
 `crates/jammi-db/tests/it/` for the following `jammi-db` catalog/store functions found zero direct

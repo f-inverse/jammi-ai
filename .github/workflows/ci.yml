@@ -621,6 +621,17 @@ jobs:
           # (closes esc-028).
           - name: GPU parity matrix
             cmd: python3 ci/scripts/check_gpu_parity_matrix.py
+          # CUDA-run-artifact schema + provenance guard: every `*.json` under
+          # `crates/jammi-kernels/artifacts/cuda-runs/` (recursing into any
+          # `*-raw-runs/` leg dir) must carry a well-typed `schema_version` /
+          # `git_sha` / `box` / `producer` / `status`, a `git_sha` that is an
+          # ancestor of `HEAD`, and a `producer` that is either statically
+          # verifiable (a real `#[test] fn` under its stated gating
+          # attribute) or a reviewed legacy `kind: "none"` entry — closes the
+          # class where a green artifact quietly proved a squash-merged,
+          # no-longer-reachable tip (docs/maintainer/cuda-kernel-guide.md §4).
+          - name: CUDA run artifact schema
+            cmd: python3 ci/scripts/check_cuda_run_artifacts.py
           # Completeness tripwire for this very guard class: every
           # ci/scripts/check_*.py|.sh gate script must be referenced by at
           # least one workflow (this file included), so a new check script

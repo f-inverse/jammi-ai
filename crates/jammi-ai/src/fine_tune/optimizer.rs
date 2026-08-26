@@ -65,10 +65,16 @@
 //! have). The device-side `f32` fold this file now performs is the one that
 //! matches torch's own accumulator precision for `f32` gradients. It is NOT
 //! bit-identical to torch, and this doc does not claim it: (1) the
-//! coefficient is `(total_norm + 1e-6).recip() * max_norm` — TWO roundings
-//! (a reciprocal, then a multiply) where torch's `max_norm / (total_norm +
-//! 1e-6)` is ONE division — so the two coefficients can differ by ~1 ULP of
-//! `f32`, and every rescaled gradient inherits that ULP; (2) the fold shape
+//! coefficient is now computed with torch's own rounding COUNT — `denom =
+//! total_norm.affine(1.0, 1e-6)` (one add) then `max_norm_t.div(&denom)`
+//! (one division, candle's `Div` kernel, `v1 / v2` — not `recip()` then a
+//! second `affine`-multiply, an earlier revision of this function used,
+//! which cost a SECOND `f32` rounding torch's own `max_norm / (total_norm +
+//! 1e-6)` never pays; see [`clip_gradients`]'s own doc for the derivation)
+//! — so this fold's ONLY remaining source of drift from torch's coefficient
+//! is the `f32` values `total_norm`/`max_norm` themselves being the result
+//! of a differently-shaped reduction, not an extra rounding in the
+//! coefficient's own arithmetic; (2) the fold shape
 //! differs (`sqrt(Σ_i Σ g_i²)` here vs torch's norm-of-per-parameter-norms,
 //! bounded in [`clip_gradients`]'s doc); and (3) for a NON-`f32` gradient
 //! (bf16 LoRA training) torch keeps the whole computation in the gradient's
@@ -174,6 +180,28 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn thread_sync_read_count() -> u64 {
     THREAD_SYNC_READ_COUNT.with(|c| c.get())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only counter of calls to [`clip_gradients`] itself (not just its
+    /// on-cadence `refuse_nonfinite_norm` sub-call): incremented once at the
+    /// top of every invocation, regardless of which [`ClipOutcome`] arm it
+    /// returns (`Disabled`/`NoGradients`/`Clipped`). `clip_and_step` calls
+    /// `clip_gradients` exactly once per optimizer step, so this counter is
+    /// a direct proxy for "how many optimizer steps ran" on the clip side of
+    /// the clip→step seam — the pin `trainer.rs`'s `last_step_horizon_run_
+    /// oracles` module uses to prove a fixed `(n_pairs, batch_size, epochs)`
+    /// config's `result.total_steps` and its clip-call count agree exactly,
+    /// i.e. that step counting is not a second, independently-drifting
+    /// count.
+    static THREAD_CLIP_CALL_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Snapshot [`THREAD_CLIP_CALL_COUNT`] for the calling thread. Test-only.
+#[cfg(test)]
+pub(crate) fn thread_clip_call_count() -> u64 {
+    THREAD_CLIP_CALL_COUNT.with(|c| c.get())
 }
 
 /// The outcome of a [`clip_gradients`] call.
@@ -308,10 +336,15 @@ impl ClipOutcome {
 ///
 /// Device op count for `n` trainable `Var`s with a gradient present: `n` ×
 /// (`sqr` + `sum_all`) for the per-`Var` squared sums, `n - 1` adds to fold
-/// them into one scalar, then `sqrt` + `affine` (+ eps) + `recip` + `affine`
-/// (× `max_norm`) + `minimum` (the ≤ 1.0 clamp) = 5 fixed ops for the
-/// coefficient, and `n` × `broadcast_mul` to rescale every gradient — `4n + 4`
-/// device ops total, zero of them a host read. (A gradient that is not
+/// them into one scalar, then `sqrt` + `affine` (+ eps) + `full` (materialize
+/// `max_norm` as a same-shape device scalar — no scalar-numerator `div` exists
+/// to skip this, see [`clip_gradients`]'s own doc) + `div` (torch's exact
+/// coefficient, one rounding, not `recip` + a second `affine`) + `minimum`
+/// (the ≤ 1.0 clamp) = 5 fixed ops for the coefficient (the SAME count the
+/// prior `recip`-then-`affine` sequence used — `full` replaces one `affine`
+/// rather than adding a sixth op), and `n` × `broadcast_mul` to rescale every
+/// gradient — `4n + 4` device ops total, zero of them a host read. (A
+/// gradient that is not
 /// already `F32` pays one extra `to_dtype` in the squared-sum loop AND one
 /// more in the rescale loop, not counted above — `coef` is always `F32`
 /// [`total_sq`'s dtype, from the per-`Var` upconvert above], so a non-`F32`
@@ -325,6 +358,9 @@ pub fn clip_gradients(
     grads: &mut GradStore,
     max_norm: f64,
 ) -> Result<ClipOutcome> {
+    #[cfg(test)]
+    THREAD_CLIP_CALL_COUNT.with(|c| c.set(c.get() + 1));
+
     // Domain-validity at the edge (family D): `max_norm.is_nan()` makes
     // `max_norm <= 0.0` below `false` (NaN compares false against
     // everything), so a NaN `max_norm` would otherwise fall THROUGH the
@@ -396,31 +432,61 @@ pub fn clip_gradients(
         .map_err(|e| JammiError::FineTune(format!("GradClip sqrt: {e}")))?;
 
     // clip_coef = max_norm / (total_norm + 1e-6), clamped to at most 1.0 —
-    // torch's epsilon and clamp (`torch/nn/utils/clip_grad.py`, see the
-    // module doc's citation), but NOT torch's rounding: this computes
-    // `(total_norm + 1e-6).recip() * max_norm` — a reciprocal then a
-    // multiply, two `f32` roundings — where torch performs one division,
-    // so the coefficient can differ from torch's by ~1 ULP (bounded, never
-    // claimed exact; see the module doc's "Accumulator precision" section
-    // for the full list of where this file and torch part ways). Candle
-    // has no scalar-numerator `div` op that keeps `max_norm` a host
-    // constant without an extra tensor upload. `affine`/`recip` bake their
-    // constants as kernel-launch scalars (no tensor upload); only `minimum`'s
-    // `1.0` is materialized as a tensor — one small H2D upload per call. That
-    // upload is NOT cached: nothing in this crate holds candle's
-    // `CUDA_GRAPH_HTOD_CACHE` for the run (see [`crate::fine_tune::trainer`]'s
-    // doc on why an unbounded, never-evicted, run-lifetime cache is the wrong
-    // trade). Below, `broadcast_mul` has the same shape on the CUDA backend:
-    // `coef` is a stride-0 scalar broadcast against every gradient, which
-    // candle routes through its general strided-binary-op kernel (a fresh
-    // per-call dims/strides upload) rather than `Tensor::affine`'s
-    // host-`f64`-constant fast path — kept as `broadcast_mul` rather than
-    // rewritten to a `CustomOp`, with that extra upload's cost meant to be
-    // measured on device (not assumed) before it is optimized away.
-    let clip_coef = total_norm
+    // torch's EXACT op sequence, rounding count included (`torch/nn/utils/
+    // clip_grad.py`, `_clip_grads_with_norm_`; see the module doc's
+    // citation): `clip_coef = max_norm / (total_norm + 1e-6)` is Python
+    // `float / Tensor`, ATen's binary `div` kernel — ONE add (the `+ 1e-6`)
+    // then ONE division, never a reciprocal. An earlier revision of this
+    // function computed `(total_norm + 1e-6).recip() * max_norm` — a
+    // reciprocal then a multiply, TWO `f32` roundings where torch performs
+    // one — which could differ from torch's coefficient by ~1 ULP for
+    // `max_norm != 1.0` (at the shipped default `max_norm == 1.0`, `x * 1.0
+    // == x` exactly, so that revision's extra rounding was invisible at the
+    // production default specifically, not fixed by it). This computes the
+    // same op sequence, and the same rounding COUNT, as torch:
+    //  1. `denom = total_norm.affine(1.0, 1e-6)` — `total_norm * 1.0` is
+    //     exact (multiplying any finite `f32` by `1.0` introduces no
+    //     rounding), so this is ONE rounding, matching torch's `total_norm +
+    //     1e-6`.
+    //  2. `max_norm_t.div(&denom)` — candle has no scalar-numerator `div`
+    //     that keeps `max_norm` a host constant the way `affine`/`recip`
+    //     bake their constants as kernel-launch scalars (`Tensor::div`/
+    //     `broadcast_div` are both `binary_op!(div, Div)` — same-shape
+    //     TENSOR/TENSOR only, `candle-core-0.11.0` `tensor.rs`; there is no
+    //     `TensorOrScalar`-accepting `div` the way `minimum`/`maximum` get
+    //     one through `binary_op_scalar!`) — so `max_norm` is materialized
+    //     as a same-shape device scalar via `Tensor::full` (a device-side
+    //     fill, `alloc_uninit` + `const_set` — no host array upload, the
+    //     same class of small op as `minimum`'s own scalar-to-tensor
+    //     promotion below) and divided by `denom` through candle's `Div`
+    //     kernel — `bin_op!(Div, div, |v1, v2| v1 / v2)` (`op.rs`) — a
+    //     genuine single-rounding division, NOT `Recip`'s `v.recip()`
+    //     (`== 1.0 / v` in Rust's own `f32::recip`, still one rounding on
+    //     its own, but paired with the second `affine`-multiply rounding
+    //     the old sequence needed to fold in `max_norm`). ONE rounding here,
+    //     matching torch's ONE division.
+    // Total: two roundings before the clamp (the add, the division) —
+    // identical to torch's rounding count. `minimum`'s own `1.0` is a
+    // third small device scalar (materialized the same way, via
+    // `binary_op_scalar!`'s own `TensorOrScalar` promotion) — one small
+    // H2D-adjacent op per call, same as before this change; not cached
+    // (nothing in this crate holds candle's `CUDA_GRAPH_HTOD_CACHE` for the
+    // run — see [`crate::fine_tune::trainer`]'s doc on why an unbounded,
+    // never-evicted, run-lifetime cache is the wrong trade). Below,
+    // `broadcast_mul` has the same shape on the CUDA backend: `coef` is a
+    // stride-0 scalar broadcast against every gradient, which candle routes
+    // through its general strided-binary-op kernel (a fresh per-call
+    // dims/strides upload) rather than `Tensor::affine`'s host-`f64`-constant
+    // fast path — kept as `broadcast_mul` rather than rewritten to a
+    // `CustomOp`, with that extra upload's cost meant to be measured on
+    // device (not assumed) before it is optimized away.
+    let denom = total_norm
         .affine(1.0, 1e-6)
-        .and_then(|d| d.recip())
-        .and_then(|r| r.affine(max_norm, 0.0))
+        .map_err(|e| JammiError::FineTune(format!("GradClip denom: {e}")))?;
+    let max_norm_t = Tensor::full(max_norm as f32, denom.shape(), denom.device())
+        .map_err(|e| JammiError::FineTune(format!("GradClip max_norm const: {e}")))?;
+    let clip_coef = max_norm_t
+        .div(&denom)
         .map_err(|e| JammiError::FineTune(format!("GradClip coef: {e}")))?;
     let coef = clip_coef
         .minimum(1.0)
@@ -806,10 +872,17 @@ mod tests {
             "test setup: total_norm must equal max_norm exactly to be on the boundary"
         );
 
-        // The host-computed coefficient, same op sequence `clip_gradients`
-        // uses (`(total_norm + eps).recip() * max_norm`), pinned to its exact
-        // bits — independent corroboration of the doc's closed form above.
-        let host_coef: f32 = (1.0f32 / (norm_val + 1e-6)) * max_norm as f32;
+        // The host-computed coefficient, `max_norm / (total_norm + eps)` —
+        // `clip_gradients`'s current op sequence (one add, one division) —
+        // pinned to its exact bits — independent corroboration of the doc's
+        // closed form above. At `max_norm == 1.0` specifically this is
+        // bit-identical to the PRIOR `(total_norm + eps).recip() * max_norm`
+        // sequence too: `recip(d) == 1.0 / d` (Rust's own `f32::recip`), and
+        // multiplying that by `max_norm == 1.0` is an exact no-op — so this
+        // fixture cannot by itself distinguish the two op sequences; see
+        // `clip_gradients`'s own doc for a `max_norm != 1.0` case where they
+        // differ.
+        let host_coef: f32 = max_norm as f32 / (norm_val + 1e-6);
         assert_eq!(
             host_coef.to_bits(),
             0x3f7f_fff0,
@@ -858,14 +931,17 @@ mod tests {
         let expected: Vec<f32> = before.iter().map(|x| x * host_coef).collect();
         let after: Vec<f32> = grads.get(w.as_tensor()).unwrap().to_vec1().unwrap();
 
-        // Tolerance: the device path computes the coefficient through one
-        // extra `recip` + two `affine`s versus the host's single division —
-        // each elementary f32 op can round by up to 0.5 ULP, so up to ~2 ULP
-        // of drift in the coefficient is expected from the different op
-        // sequence, not from a bug; propagated through one more multiply
-        // against `before`, 4 ULP absolute-relative tolerance covers it with
-        // headroom. This is *reasoned* from the op-count difference, not
-        // fitted to what the test happened to observe.
+        // Tolerance: the device path now computes the coefficient with the
+        // SAME rounding count as this host reference — one `f32` add (the
+        // `+ 1e-6`), one `f32` division — but the two are still independent
+        // implementations of that sequence (candle's `Affine`/`Div` kernels
+        // vs this file's own `f64`-then-round-to-`f32` arithmetic), each
+        // rounding by up to 0.5 ULP; up to ~1 ULP of drift in the coefficient
+        // is expected from that, not from a bug; propagated through one more
+        // multiply against `before`, 4 ULP absolute-relative tolerance covers
+        // it with headroom (a looser bound than the ~1 ULP this specific op
+        // sequence needs, kept as a round, documented ceiling rather than
+        // fitted to what the test happened to observe).
         for (e, a) in expected.iter().zip(after.iter()) {
             let ulp = f32::EPSILON * e.abs().max(f32::MIN_POSITIVE);
             assert!(
@@ -916,16 +992,16 @@ mod tests {
     ///  - `sqrt(72)`: correctly rounded, 0.5 ulp;
     ///  - `affine(1.0, 1e-6)` (`x * 1.0 + 1e-6`): `x * 1.0` is exact, one
     ///    rounding, 0.5 ulp;
-    ///  - `recip`: 0.5 ulp;
-    ///  - `affine(max_norm, 0.0)` with `max_norm == 1.0`: exact, 0 ulp;
+    ///  - `div` (`max_norm / denom`, torch's own rounding count — see
+    ///    [`clip_gradients`]'s own doc): 0.5 ulp;
     ///  - `minimum(1.0)`: exact (no rounding), 0 ulp;
     ///  - `broadcast_mul`: one rounding per element, 0.5 ulp.
     ///
     /// The host reference computes the same chain in f64 (error ≪ 1 f32 ulp)
-    /// and rounds to f32 once (0.5 ulp). Total: ≤ 2.5 ulp device + 0.5 ulp
-    /// host = 3 ulp of the result; asserted at 4 ulp (one ulp of headroom for
-    /// the ulp-of-result vs ulp-of-intermediate mismatch at exponent
-    /// boundaries — not a fitted number).
+    /// and rounds to f32 once (0.5 ulp). Total: ≤ 2 ulp device + 0.5 ulp
+    /// host = 2.5 ulp of the result; asserted at 4 ulp (headroom for the
+    /// ulp-of-result vs ulp-of-intermediate mismatch at exponent boundaries —
+    /// not a fitted number).
     fn assert_multi_var_clip_matches_host(device: &Device) -> Vec<Vec<f32>> {
         let (vars, mut grads, before) = four_vars_with_grads(device);
         let max_norm = 1.0f64;
@@ -999,12 +1075,13 @@ mod tests {
 
     /// A HOST-side Rust scalar replica of [`clip_gradients`]'s EXACT formula
     /// and op ORDER — `sqr` + `sum_all` per Var (f32), fold across Vars
-    /// (f32), `sqrt`, `affine(1.0, 1e-6)`, `recip`, `affine(max_norm, 0.0)`,
-    /// `minimum(1.0)`, then `broadcast_mul` per element — written in plain
-    /// f32 arithmetic so each step is the SAME single IEEE-754 rounding
-    /// candle's own CPU backend performs (`Affine`'s `v * mul + add`,
-    /// `Recip`'s `1.0 / v`, `Minimum`'s `if v1 > v2 { v2 } else { v1 }` —
-    /// candle-core-0.11.0 `cpu_backend/mod.rs`/`op.rs`). This is the
+    /// (f32), `sqrt`, `affine(1.0, 1e-6)`, `div` (`max_norm / denom`,
+    /// torch's own rounding count), `minimum(1.0)`, then `broadcast_mul` per
+    /// element — written in plain f32 arithmetic so each step is the SAME
+    /// single IEEE-754 rounding candle's own CPU backend performs
+    /// (`Affine`'s `v * mul + add`, `Div`'s `v1 / v2`, `Minimum`'s `if v1 >
+    /// v2 { v2 } else { v1 }` — candle-core-0.11.0 `cpu_backend/mod.rs`/
+    /// `op.rs`). This is the
     /// "drop-in" oracle for the device-side clip REFACTOR itself (did moving
     /// the computation onto the device change the answer the "replace 225
     /// D2H syncs" lever actually needs to be equivalence-preserving?), never
@@ -1029,8 +1106,7 @@ mod tests {
         let total_sq = total_sq.expect("at least one Var");
         let total_norm = total_sq.sqrt();
         let d = total_norm * 1.0f32 + 1e-6f32; // affine(1.0, 1e-6)
-        let r = 1.0f32 / d; // recip
-        let c = r * max_norm as f32; // affine(max_norm, 0.0) -- `+ 0.0` is exact
+        let c = max_norm as f32 / d; // div: max_norm / denom, torch's own rounding count
         let coef = if c > 1.0 { 1.0f32 } else { c }; // minimum(1.0), candle's own predicate
         let after = before
             .iter()
@@ -1206,13 +1282,14 @@ mod tests {
     /// expectation and not a tolerance: every partial sum in the fixture is
     /// an exactly-representable integer, so the per-`Var` `sum_all` and the
     /// fold are exact on both backends regardless of their reduction order;
-    /// `sqrt`/`recip` are correctly rounded on both (nvcc's default
+    /// `sqrt`/`div` are correctly rounded on both (nvcc's default
     /// `-prec-sqrt=true`/`-prec-div=true`; candle-kernels does not build with
     /// `-use_fast_math`); `affine(1.0, 1e-6)` is `x * 1.0 + 1e-6`, where
     /// `x * 1.0` is exact, so an FMA contraction on the GPU rounds once to
-    /// the same value the CPU's two ops produce; `affine(max_norm, 0.0)`
-    /// with `max_norm == 1.0` and `minimum(1.0)` are exact; and the final
-    /// `broadcast_mul` is one rounding per element on both.
+    /// the same value the CPU's two ops produce; `Tensor::full` materializing
+    /// `max_norm` is a pure memory fill (`const_set`, no arithmetic — the
+    /// SAME bit pattern on both backends) and `minimum(1.0)` are exact; and
+    /// the final `broadcast_mul` is one rounding per element on both.
     ///
     /// The NaN cell is a DELIBERATE CPU≠CUDA divergence, not covered by the
     /// identity assertion: candle-core-0.11.0 `src/op.rs:460` implements
@@ -1767,5 +1844,94 @@ mod tests {
                  total_norm, not the pre-PR formula it replaced"
             );
         }
+    }
+
+    /// The rounding-COUNT fix ([`clip_gradients`]'s doc: `denom.div(&max_norm_t)`
+    /// replacing an earlier `recip().affine(max_norm, 0.0)`) is INVISIBLE at
+    /// `max_norm == 1.0` — the shipped default (`jammi_wire::fine_tune::
+    /// FineTuneConfig::default().max_grad_norm`) — because `x * 1.0` is an
+    /// exact no-op in `f32`: `recip(d) * 1.0 == recip(d) == 1.0 / d ==
+    /// max_norm / d` bit-for-bit whenever `max_norm == 1.0`, so every
+    /// `max_norm == 1.0` fixture in this file (`below_max_norm_clip_is_bit_
+    /// identical_to_no_clip`, `at_max_norm_boundary_coef_is_not_bit_
+    /// identical_to_no_clip`, `clipping_batch_matches_host_reference_within_
+    /// f32_ulps`, `multi_var_clip_matches_host_reference_on_cpu`,
+    /// `clip_gradients_device_and_host_agree_bit_identically_on_cpu`) passes
+    /// UNCHANGED before and after the fix — none of them can be cited as
+    /// evidence the rounding-count fix does anything. This fixture picks a
+    /// `max_norm != 1.0` (`7.5`) and a `total_norm` (found by an offline
+    /// search, `1799.50146484375`, chosen so `sqr` + `sum_all` + `sqrt`
+    /// round-trips to itself exactly — no per-element rounding to reason
+    /// through) where the OLD `recip`-then-`affine` sequence and the NEW
+    /// single `div` genuinely disagree: the coefficient differs by exactly 1
+    /// ULP (`0x3af8894e` vs `0x3af8894d`), and — unlike most such 1-ULP
+    /// coefficient differences, which the final `broadcast_mul`'s own
+    /// rounding absorbs — this one SURVIVES into the clipped gradient itself
+    /// (`7.500000476837158` vs `7.499999523162842`, bits `0x40f00001` vs
+    /// `0x40efffff`). Pinned to exact bits, not a tolerance: this is
+    /// deterministic `f32` arithmetic with no data-dependent rounding.
+    ///
+    /// Mutation tried: revert `clip_gradients`'s `div` back to `recip()` +
+    /// `affine(max_norm, 0.0)` — RED (the device path lands on the OLD
+    /// bits, not the NEW ones this test pins).
+    #[test]
+    fn rounding_count_fix_changes_the_result_only_when_max_norm_is_not_one() {
+        let grad_value = 1_799.501_5_f32; // == 1799.50146484375 exactly (see doc)
+        let (w, mut grads, _g_before) = one_var_with_grad(grad_value, 1);
+        let max_norm = 7.5f64;
+
+        let total_norm = clip_gradients(std::slice::from_ref(&w), &mut grads, max_norm)
+            .unwrap()
+            .unwrap_clipped();
+        let norm_val: f32 = total_norm.to_scalar().unwrap();
+        assert_eq!(
+            norm_val.to_bits(),
+            grad_value.to_bits(),
+            "test setup: a single-element gradient's total_norm must round-trip to the \
+             gradient's own value exactly"
+        );
+
+        // Host replicas of both op sequences, over the SAME total_norm/max_norm.
+        let d = norm_val.mul_add(1.0, 1e-6); // affine(1.0, 1e-6) -- `x * 1.0` exact, one rounding
+        let old_coef = (1.0f32 / d) * max_norm as f32; // recip() then affine(max_norm, 0.0)
+        let new_coef = max_norm as f32 / d; // div: max_norm / denom
+        assert_ne!(
+            old_coef.to_bits(),
+            new_coef.to_bits(),
+            "test setup: at max_norm = 7.5 (!= 1.0) the two op sequences must disagree by \
+             construction — old {old_coef} (bits {:#010x}) vs new {new_coef} (bits {:#010x})",
+            old_coef.to_bits(),
+            new_coef.to_bits()
+        );
+        assert!(
+            old_coef < 1.0 && new_coef < 1.0,
+            "test setup: below the clamp"
+        );
+
+        let expected_new = grad_value * new_coef;
+        let expected_old = grad_value * old_coef;
+        assert_ne!(
+            expected_old.to_bits(),
+            expected_new.to_bits(),
+            "test setup: the 1-ULP coefficient difference must survive the final multiply \
+             here — old {expected_old} (bits {:#010x}) vs new {expected_new} (bits {:#010x})",
+            expected_old.to_bits(),
+            expected_new.to_bits()
+        );
+
+        let after: Vec<f32> = grads.get(w.as_tensor()).unwrap().to_vec1().unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(
+            after[0].to_bits(),
+            expected_new.to_bits(),
+            "clip_gradients must match the NEW (single-division, torch-rounding-count) \
+             formula's exact bits {expected_new} (bits {:#010x}), got {} (bits {:#010x}) — the \
+             OLD (recip-then-multiply) formula would have given {expected_old} (bits \
+             {:#010x})",
+            expected_new.to_bits(),
+            after[0],
+            after[0].to_bits(),
+            expected_old.to_bits()
+        );
     }
 }

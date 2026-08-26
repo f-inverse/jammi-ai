@@ -4760,7 +4760,9 @@ mod refuse_nonfinite_params_fold_oracle {
 /// training in the same process.
 #[cfg(test)]
 mod last_step_horizon_run_oracles {
-    use super::super::optimizer::{thread_sync_read_count, DEFAULT_NORM_CHECK_INTERVAL};
+    use super::super::optimizer::{
+        thread_clip_call_count, thread_sync_read_count, DEFAULT_NORM_CHECK_INTERVAL,
+    };
     use super::super::FineTuneConfig;
     use super::last_step_run_harness::{pairs, poison_grad_at, run_text_loop, text_config};
 
@@ -4778,6 +4780,79 @@ mod last_step_horizon_run_oracles {
             thread_sync_read_count() - before,
             2,
             "a fresh 3-step run must read the norm on step 1 and step 3 only"
+        );
+    }
+
+    /// PR #381 fix-round item 2 (the 246-vs-249 `clip_gradients` call-count
+    /// discrepancy between main and the branch, measured over the 12-seed
+    /// `regression_surface::untrained_quantile_head_collapses_to_mu_no_
+    /// separation` sweep): pins the optimizer-step count for a FIXED `(n_
+    /// pairs, batch_size, epochs)` config on BOTH the CPU trainer path
+    /// (`result.total_steps`, `trainer.rs`'s own `total_steps`/
+    /// `total_optimizer_steps` computation in `run`) AND the clip path
+    /// (`thread_clip_call_count`, `optimizer::clip_gradients`'s own
+    /// per-invocation counter) — proving trainer.rs's step-count arithmetic
+    /// is deterministic and NOT a second, independently-drifting count from
+    /// the clip call count, for a config where early stopping cannot
+    /// interfere (`early_stopping_metric: TrainLoss`, `early_stopping_
+    /// patience: 10_000` — effectively disabled, see `text_config`'s doc).
+    ///
+    /// 8 pairs at `batch_size: 2` (4 micro-batches/epoch), `grad_accum: 1`,
+    /// `epochs: 3` → `total_steps == 4 * 3 == 12`. `clip_and_step` calls
+    /// `clip_gradients` exactly once per optimizer step (see `clip_and_
+    /// step`'s own doc), so `thread_clip_call_count`'s delta over the run
+    /// must equal `result.total_steps` exactly — not merely "close", not
+    /// bounded, EQUAL — for every non-GradCache, non-mined, non-early-
+    /// stopped run this crate takes (the arms `total_optimizer_steps`'s own
+    /// lattice doc in `run` enumerates).
+    ///
+    /// This is what makes the 246-vs-249 discrepancy on the CHAOTIC 12-seed
+    /// sweep (`max_grad_norm` default, `early_stopping_metric: ValLoss`,
+    /// `early_stopping_patience: 3`) legible: it is NOT this deterministic
+    /// arithmetic drifting between main and the branch (this test would go
+    /// RED on either side of that regression) — trainer.rs's step-count
+    /// lattice is unchanged in kind between main and the branch and remains
+    /// exact here — it is `early_stopping_patience: 3` firing at a
+    /// DIFFERENT epoch per seed on main vs. the branch, because the clip
+    /// coefficient's `f32`-device-vs-`f64`-host accumulator precision (the
+    /// module doc's "Accumulator precision" section, NOT the rounding-count
+    /// fix this round makes) perturbs `monitor_loss` enough, over ~20 steps
+    /// per seed, to shift a handful of seeds' early-stopping epoch by ±1 —
+    /// exactly the "early stopping" arm `total_optimizer_steps`'s own
+    /// lattice doc in `run` already documents as NOT reflected in `total_
+    /// steps` (an early-stopped run's actual last step is whatever `global_
+    /// step` reached before the `break`). A whole EPOCH's worth of steps on
+    /// the regression sweep's own config (`batch_size: 8` over 18 train
+    /// rows → 3 batches/epoch) is exactly 3 steps — the observed 249 − 246
+    /// == 3 delta is consistent with exactly ONE seed (of 12) running one
+    /// extra epoch before its patience-3 window exhausted, not with a
+    /// systematic per-seed drift.
+    ///
+    /// Mutation tried: change `total_steps`'s `div_ceil(grad_accum.max(1))`
+    /// to a plain `/` (floor division) — RED (`total_steps` becomes `11`,
+    /// off by the trailing partial-window step this fixture's `8 pairs /
+    /// batch_size 2` doesn't even exercise, so the mismatch shows up as
+    /// `clip_call_count != total_steps` here regardless of which side the
+    /// bug is on).
+    #[test]
+    fn clip_call_count_matches_total_optimizer_steps_for_a_fixed_config() {
+        let config = FineTuneConfig {
+            epochs: 3,
+            ..text_config()
+        };
+        let clip_calls_before = thread_clip_call_count();
+        let result = run_text_loop("clip-count-fixed", config, pairs(8), None, None).unwrap();
+        assert_eq!(
+            result.total_steps, 12,
+            "control: 8 pairs / batch_size 2 = 4 steps/epoch * 3 epochs"
+        );
+        let clip_calls = thread_clip_call_count() - clip_calls_before;
+        assert_eq!(
+            clip_calls, result.total_steps as u64,
+            "clip_gradients must be invoked exactly once per optimizer step: {clip_calls} \
+             clip-path calls vs {} trainer-path steps for this fixed (n_pairs=8, batch_size=2, \
+             epochs=3) config",
+            result.total_steps
         );
     }
 

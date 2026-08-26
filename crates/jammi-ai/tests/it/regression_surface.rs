@@ -145,6 +145,39 @@ const QUANTILE_SEP_AGG_MIN: f32 = 3.0;
 /// the weakest measured level.
 const QUANTILE_SEP_POSITIVE_BAR: usize = 9;
 
+/// PER-SEED sign-count arm for
+/// [`untrained_quantile_head_collapses_to_mu_no_separation`]'s Arm 3 — the
+/// #383-class fix: a trimmed-mean MARGIN over this test's 12-seed sweep
+/// (120 epochs, `lr=1e-1`, `max_grad_norm` clipping active on ~99% of
+/// steps) is not a resolving oracle at this operating point. Proved by
+/// injecting a forced 1-ULP-of-`f32` perturbation of the clip coefficient
+/// (env-gated, through `clip_gradients`'s public surface — a throwaway
+/// diagnostic, never committed) and re-running this exact sweep: the
+/// trimmed mean swung 12-30% from that single, unavoidable, minimal
+/// floating-point perturbation alone (main: `3.9417 -> 3.4609`; this
+/// branch, same fixture: `4.7780 -> 4.2866`), with individual seeds'
+/// separations moving by up to 6 raw units and one seed sign-flipping
+/// (seed 7, main: `-3.51 -> +1.71`) — see the fix-round's own commit
+/// message for the full per-seed tables. A margin built on raw separation
+/// MAGNITUDE cannot tell "the code changed" from "an unavoidable ULP of
+/// rounding landed differently" at this operating point.
+///
+/// The ORDINAL claim instead ("did this seed's trained head separate the
+/// groups in the right direction at all", not "by how much") is measured
+/// as a per-seed sign count — since a zeroed head's separation is EXACTLY
+/// `0.0` for every seed (the structural per-seed check in that test),
+/// "trained_sep\[i\] > zeroed_sep\[i\]" reduces to "trained_sep\[i\] >
+/// 0.0". MEASURED positive-count across FIVE independent runs of the exact
+/// sweep (2 on main, 2 on this branch, 1 from CI — spanning the pre-fix
+/// and post-fix clip formula AND the forced 1-ULP mutant, on and off):
+/// `9, 10, 10, 11, 11` out of 12 — IDENTICAL VERDICT (all clear this bar)
+/// despite the same ULP-scale perturbation that swings the trimmed mean by
+/// double-digit percent. `7` sits 2 seeds below the weakest of those five
+/// measurements (`9`), mirroring [`QUANTILE_SEP_POSITIVE_BAR`]'s own
+/// "2-3 seeds of headroom" convention — not fitted to make one specific
+/// run pass.
+const QUANTILE_SEP_UNTRAINED_POSITIVE_BAR: usize = 7;
+
 /// The `trim_frac`-trimmed mean of `values` (mirrors
 /// `fine_tune::trainer::trimmed_mean`): sorts a copy, drops the top/bottom
 /// `round(trim_frac·n)` entries, averages the rest.
@@ -672,12 +705,15 @@ async fn untrained_regression_head_collapses_to_mu_no_separation() {
 ///      indistinguishable from zero) — proves `mutant_zero_band` is not so
 ///      wide a genuinely-separating head could sneak through it as
 ///      "collapsed", i.e. the control is non-vacuous.
-///   3. `margin = max(std(trained_seps), 1e-3)`: the trained aggregate must
-///      clear the zeroed aggregate by more than the TRAINED distribution's
-///      own measured spread — a second, independent arm derived from BOTH
-///      distributions (the real one this time), so a construction that
-///      happened to satisfy arm 1/2 by chance still has to clear a
-///      distribution-derived gap, not a borrowed literal.
+///   3. A PAIRED SIGN-COUNT arm (`QUANTILE_SEP_UNTRAINED_POSITIVE_BAR`, see
+///      its own doc for the derivation and the 1-ULP-mutant proof that
+///      replaced a raw-magnitude trimmed-mean margin here): the trained
+///      aggregate must show POSITIVE separation (`trained_sep\[i\] >
+///      zeroed_sep\[i\]`, i.e. `> 0.0`) on at least
+///      [`QUANTILE_SEP_UNTRAINED_POSITIVE_BAR`] of the 12 pinned seeds — an
+///      ORDINAL claim (did this seed separate at all, not by how much)
+///      immune to the ULP-scale magnitude swings the ex-margin arm could
+///      not tell apart from a genuine regression.
 #[tokio::test(flavor = "multi_thread")]
 async fn untrained_quantile_head_collapses_to_mu_no_separation() {
     let levels = vec![0.1, 0.5, 0.9];
@@ -755,7 +791,6 @@ async fn untrained_quantile_head_collapses_to_mu_no_separation() {
 
     let real_tm = trimmed_mean(&trained_seps, 0.15);
     let mutant_tm = trimmed_mean(&zeroed_seps, 0.15);
-    let real_spread = std_dev(&trained_seps);
     let mutant_spread = std_dev(&zeroed_seps);
 
     // Arm 1: self-normalizing "indistinguishable from zero" band for the
@@ -786,26 +821,28 @@ async fn untrained_quantile_head_collapses_to_mu_no_separation() {
          making arm 1 vacuous. per-seed trained separations: {trained_seps:?}"
     );
 
-    // Arm 3: the trained aggregate must clear the zeroed aggregate by more
-    // than the TRAINED distribution's own measured standard ERROR (spread /
-    // sqrt(n), not raw per-seed spread) — a second, independent margin
-    // derived from both distributions (this one from the real signal),
-    // self-normalizing against how PRECISELY the sweep pins down the
-    // aggregate rather than raw seed-to-seed scatter (level-0.1 separations
-    // are noisy enough — measured sample std ~5 raw units against a ~4-10
-    // raw-unit trimmed mean, on either stream — that gating on raw spread
-    // instead of its standard error made this arm fail on genuinely-good
-    // signal). `2x` the standard error is a conventional "clearly outside
-    // noise" multiplier without hard-coding an absolute raw-unit literal.
-    let margin = (2.0 * real_spread / (QUANTILE_SEP_SEEDS.len() as f32).sqrt()).max(1e-3);
+    // Arm 3 (PAIRED SIGN-COUNT — see `QUANTILE_SEP_UNTRAINED_POSITIVE_BAR`'s
+    // own doc for the 1-ULP-mutant proof this replaced a raw-magnitude
+    // trimmed-mean margin with): an ORDINAL claim, not a cardinal one —
+    // "did this seed's trained head separate the groups in the right
+    // direction at all" rather than "by how much". A zeroed head's
+    // separation is EXACTLY 0.0 for every seed (the structural per-seed
+    // check above), so "trained_sep > zeroed_sep" reduces to
+    // "trained_sep > 0.0" — but it is written as the pairwise comparison,
+    // not the reduced form, so this arm still holds if that structural
+    // guarantee were ever weakened (e.g. a future zeroed-head construction
+    // that is not EXACTLY 0.0 on every seed).
+    let positive_count = trained_seps
+        .iter()
+        .zip(&zeroed_seps)
+        .filter(|(t, z)| *t > *z)
+        .count();
     assert!(
-        real_tm - mutant_tm > margin,
-        "the trained aggregate ({real_tm:.4}) must clear the zeroed \
-         aggregate ({mutant_tm:.4}) by more than 2x the trained \
-         distribution's own measured standard error ({margin:.4}, from \
-         sample std {real_spread:.4} over the {}-seed sweep) — otherwise the \
-         trained sweep's separation is not reliably distinguishable from an \
-         untrained head's. trained per-seed: {trained_seps:?}; zeroed \
+        positive_count >= QUANTILE_SEP_UNTRAINED_POSITIVE_BAR,
+        "the trained head must separate the groups in the correct direction \
+         (trained_sep > zeroed_sep on that seed) on at least \
+         {QUANTILE_SEP_UNTRAINED_POSITIVE_BAR}/{} of the pinned seeds — only \
+         {positive_count} did. trained per-seed: {trained_seps:?}; zeroed \
          per-seed: {zeroed_seps:?}",
         QUANTILE_SEP_SEEDS.len()
     );

@@ -17,14 +17,12 @@
 //!      op sequence, no `fmad` contraction on the CPU arm) and the
 //!      measured result confirms it; the crate's derive-the-tolerance
 //!      doctrine means a tolerance is stated only where the model
-//!      predicts real divergence, never as a default hedge. BF16 is
-//!      measured-nonzero within `BF16_ULP_TOL` — a deliberately
-//!      conservative CEILING (the measured max on these fixtures is
-//!      printed, and is smaller than the stated bound; see the constant's
-//!      own doc), inherited from `LayerNormFused`'s identical bf16
-//!      oracle for the same reason: bf16's own two-rounding-path
-//!      divergence (see `eager()`'s doc) is real and worth a headroom
-//!      margin, not a number to shrink to the observed minimum.
+//!      predicts real divergence, never as a default hedge. BF16 is ALSO
+//!      asserted BIT-EXACT since the RoPE one-rounding fix (`eager()` now
+//!      upcasts every operand to f32 before the rotation and rounds once
+//!      at the end, the same shape `RopeFused` itself computes) — measured
+//!      on these fixtures; see the bf16 tests' own docs for why that is
+//!      not a structural guarantee at every shape.
 //!   3. `chain_rule_through_an_intermediate_x` — the same
 //!      `is_variable() == false` intermediate hazard `Axpy`'s regression
 //!      test exercises, at a 4D (batch/heads/seq/head_dim) shape matching
@@ -39,7 +37,7 @@
 //! `tests/cuda_parity.rs`, gated the same way `Axpy`'s/`LayerNormFused`'s
 //! are.
 
-use candle_core::{Device, Tensor, Var, D};
+use candle_core::{DType, Device, Tensor, Var, D};
 use half::bf16;
 use jammi_kernels::ops::{apply3, RopeFused};
 
@@ -52,17 +50,34 @@ fn fused(negate_sin: bool, x: &Tensor, cos: &Tensor, sin: &Tensor) -> candle_cor
 /// head_dim]`, `cos`/`sin` are pre-broadcast to `[1, 1, seq, head_dim]`
 /// (this fixture builds them directly in that shape, mirroring the
 /// call site's cached/unsqueezed tables — table hoisting does not change
-/// this math, only where the cast/unsqueeze happen once).
+/// this math, only where the cast/unsqueeze happen once). Matches HF's
+/// `apply_rotary_pos_emb` (`q.float() * cos + rotate_half(q.float()) *
+/// sin`, then `.to(original_dtype)` once): every operand is upcast to
+/// `internal_dtype` (f32 whenever the input dtype is F16/BF16) before the
+/// multiply/add, and the result is cast to the input dtype exactly once
+/// at the end — the same one-rounding shape `RopeFused` itself already
+/// computes (`cuda/rope.cu:62`). For F32 inputs `internal_dtype == F32`,
+/// so every cast here is a same-dtype no-op and this degenerates to the
+/// original (already bit-exact) composition.
 fn eager(x: &Tensor, cos_b: &Tensor, sin_b: &Tensor) -> candle_core::Result<Tensor> {
+    let x_dtype = x.dtype();
+    let internal_dtype = match x_dtype {
+        DType::F16 | DType::BF16 => DType::F32,
+        d => d,
+    };
     let head_dim = x.dim(D::Minus1)?;
     let half = head_dim / 2;
-    let x1 = x.narrow(D::Minus1, 0, half)?;
-    let x2 = x.narrow(D::Minus1, half, half)?;
+    let x_internal = x.to_dtype(internal_dtype)?;
+    let cos_internal = cos_b.to_dtype(internal_dtype)?;
+    let sin_internal = sin_b.to_dtype(internal_dtype)?;
+    let x1 = x_internal.narrow(D::Minus1, 0, half)?;
+    let x2 = x_internal.narrow(D::Minus1, half, half)?;
     let neg_x2 = (x2 * -1.0f64)?;
     let rot_half = Tensor::cat(&[&neg_x2, &x1], D::Minus1)?;
-    let cos_part = x.broadcast_mul(cos_b)?;
-    let sin_part = rot_half.broadcast_mul(sin_b)?;
-    (cos_part + sin_part)?.contiguous()
+    let cos_part = x_internal.broadcast_mul(&cos_internal)?;
+    let sin_part = rot_half.broadcast_mul(&sin_internal)?;
+    let out_internal = (cos_part + sin_part)?;
+    out_internal.to_dtype(x_dtype)?.contiguous()
 }
 
 /// Builds a deterministic `[period, hidden]` table pair from a fixed seed
@@ -207,31 +222,25 @@ fn eager_vs_fused_f32_fwd_and_bwd_are_bit_exact() {
     assert_eq!(dxf, dxe, "dx must be bit-exact, not merely close");
 }
 
-/// bf16 fwd: the eager composition rounds intermediate products
-/// (`x*cos`, `rotate_half(x)*sin`, the sum) to bf16 at each op boundary;
-/// the fused kernel accumulates the whole elementwise expression in f32
-/// and rounds ONCE. A measured, non-vacuous divergence — NOT the f32
-/// case above, where the rounding model predicts (and the measurement
-/// confirms) bit-exactness; bf16's own per-op rounding genuinely differs
-/// between the two paths, so a tolerance is the honest assertion here.
-///
-/// `BF16_ULP_TOL = 4` is an INHERITED-CONSERVATIVE ceiling (the same
-/// value and the same status `LayerNormFused`'s identical constant has,
-/// not independently re-derived here): both fwd and bwd tests below
-/// PRINT their own measured maximum unconditionally (`println!`), and on
-/// these fixtures that measured max is smaller than `4` — the constant is
-/// a deliberate headroom margin over the measured value, sized to
-/// tolerate a worse fixture or a different libm's rounding on another
-/// platform without flaking, not a number tightened to today's
-/// measurement.
-const BF16_ULP_TOL: i32 = 4;
-
+/// bf16 fwd: BEFORE the one-rounding fix, the eager composition rounded
+/// intermediate products (`x*cos`, `rotate_half(x)*sin`, the sum) to
+/// bf16 at each op boundary while the fused kernel accumulated the whole
+/// elementwise expression in f32 and rounded ONCE — measured on this
+/// same fixture, that was a genuine, non-vacuous divergence. `eager()`
+/// above now runs the IDENTICAL one-rounding shape (every operand
+/// upcast to f32, one cast back at the end), so eager and fused are
+/// expected to — and on this fixture, measured to — agree BIT-EXACTLY,
+/// the same outcome the LN oracle's identical fix produced. `bf16_bit_diff`
+/// is kept for the same reason `layer_norm_oracles.rs` keeps its own copy:
+/// it is the tool a future regression (e.g. a production-`head_dim`-sized
+/// fixture exposing a reduction-order difference) would use to re-derive
+/// a tolerance.
 fn bf16_bit_diff(a: bf16, b: bf16) -> i32 {
     a.to_bits() as i32 - b.to_bits() as i32
 }
 
 #[test]
-fn eager_vs_fused_bf16_fwd_diverges_and_stays_within_the_stated_ulp_tolerance() {
+fn eager_vs_fused_bf16_fwd_is_bit_exact_after_the_one_rounding_fix() {
     let device = Device::Cpu;
     let (batch, heads, seq, hidden) = (1, 2, 4, 8);
     let n = batch * heads * seq * hidden;
@@ -265,28 +274,23 @@ fn eager_vs_fused_bf16_fwd_diverges_and_stays_within_the_stated_ulp_tolerance() 
         .zip(eager_out.iter())
         .map(|(&f, &e)| bf16_bit_diff(f, e))
         .collect();
-    let max_diff = diffs.iter().map(|d| d.abs()).max().unwrap_or(0);
-    println!("eager_vs_fused_bf16_fwd: measured max |bit-diff| = {max_diff}");
-    assert!(
-        diffs.iter().any(|&d| d != 0),
-        "expected fixture to diverge (measured diffs: {diffs:?}) — the \
-         tolerance is not being exercised"
+    println!("eager_vs_fused_bf16_fwd: measured bit-diffs (post-fix) = {diffs:?}");
+    assert_eq!(
+        fused_out, eager_out,
+        "fwd must now be bit-exact (measured diffs: {diffs:?}) — the pre-fix defect \
+         (23% of elements diverging, see `RotaryEmbedding::apply`'s doc) is gone"
     );
-    for (i, d) in diffs.iter().enumerate() {
-        assert!(
-            d.abs() <= BF16_ULP_TOL,
-            "element {i}: bit diff {d} exceeds the stated {BF16_ULP_TOL}-ULP tolerance"
-        );
-    }
 }
 
 /// Backward analog: `Tensor::backward()`'s ones-seed cancels bf16
 /// rounding divergence (per the fused-kernels plan's C2 lesson — `1.0 *
 /// anything` rounds identically regardless of dtype), so this weights the
 /// output with a non-uniform, bf16-awkward vector before summing, making
-/// the effective `dy` genuinely non-trivial.
+/// the effective `dy` genuinely non-trivial. Measured on this fixture,
+/// post-fix, `dx` is bit-exact — see the forward oracle's doc for why
+/// that is not a structural guarantee at every shape.
 #[test]
-fn eager_vs_fused_bf16_bwd_diverges_and_stays_within_the_stated_ulp_tolerance() {
+fn eager_vs_fused_bf16_bwd_is_bit_exact_after_the_one_rounding_fix() {
     let device = Device::Cpu;
     let (batch, heads, seq, hidden) = (1, 2, 4, 8);
     let n = batch * heads * seq * hidden;
@@ -339,19 +343,11 @@ fn eager_vs_fused_bf16_bwd_diverges_and_stays_within_the_stated_ulp_tolerance() 
         .zip(dxe.iter())
         .map(|(&f, &e)| bf16_bit_diff(f, e))
         .collect();
-    let max_diff = diffs.iter().map(|d| d.abs()).max().unwrap_or(0);
-    println!("eager_vs_fused_bf16_bwd: measured max |dx bit-diff| = {max_diff}");
-    assert!(
-        diffs.iter().any(|&d| d != 0),
-        "expected dx fixture to diverge (measured diffs: {diffs:?}) — the \
-         tolerance is not being exercised"
+    println!("eager_vs_fused_bf16_bwd: measured dx bit-diffs (post-fix) = {diffs:?}");
+    assert_eq!(
+        dxf, dxe,
+        "dx must now be bit-exact (measured diffs: {diffs:?})"
     );
-    for (i, d) in diffs.iter().enumerate() {
-        assert!(
-            d.abs() <= BF16_ULP_TOL,
-            "dx element {i}: bit diff {d} exceeds the stated {BF16_ULP_TOL}-ULP tolerance"
-        );
-    }
 }
 
 /// Chain-rule oracle: `x` is an INTERMEDIATE (`w.affine(2, 0)`) on a path

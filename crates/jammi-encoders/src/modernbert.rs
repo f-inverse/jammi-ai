@@ -383,27 +383,57 @@ impl RotaryEmbedding {
     }
 
     /// Apply RoPE to a `[batch, num_heads, seq, head_dim]` tensor — the
-    /// eager composition, whose OUTPUT VALUES are unchanged from before
-    /// table hoisting existed (see the struct doc's disclosure: this call
-    /// now also takes `cast_cache`'s lock once, which is new). Used
-    /// directly in eval and as [`Self::apply_training`]'s fallback.
+    /// eager composition. Used directly in eval and as
+    /// [`Self::apply_training`]'s fallback.
+    ///
+    /// Matches HF's reference (`modeling_modernbert.py`'s
+    /// `apply_rotary_pos_emb`): `cos`/`sin` are read from
+    /// [`Self::cached_tables`] already rounded to `x_dtype` (mirroring
+    /// upstream's `RotaryEmbedding.forward` returning `cos.to(dtype=x.dtype)`
+    /// — the TABLE itself is bf16-rounded, same as before this fix), but
+    /// the elementwise rotation — `q_embed = (q.float() * cos) +
+    /// (rotate_half(q.float()) * sin)` — is computed with every operand
+    /// upcast to `internal_dtype` (f32 whenever `x_dtype` is F16/BF16,
+    /// matching torch's implicit type promotion when an f32 tensor
+    /// multiplies a bf16 one), and the result is cast to `x_dtype` exactly
+    /// once at the end (`.to(original_dtype)`), matching jammi's own fused
+    /// CUDA kernel (`cuda/rope.cu:62`: `out[i] = __float2bfloat16(xv * c +
+    /// rh * s * sign)`, `c`/`s`/`xv` all read via `__bfloat162float` then
+    /// combined in float, one `__float2bfloat16` at the very end).
+    ///
+    /// Previously `x.broadcast_mul(&cos)` and `rot_half.broadcast_mul(&sin)`
+    /// ran directly at `x_dtype` (bf16) and were then added at `x_dtype`
+    /// too — three rounding points instead of one. Measured on a
+    /// ModernBERT-large-shaped fixture (`[8, 16, 64, 64]` bf16 — batch 8,
+    /// `num_attention_heads` 16, `head_dim` 64): the old three-round form
+    /// differed from an f32-computed, once-rounded reference on 120,632 of
+    /// 524,288 elements (23%). Every served RoPE
+    /// output — eval AND the training-eager fallback — therefore changes
+    /// at the ULP level; this is the same disclosed consequence
+    /// `crate::layer_norm::LayerNorm::slow`'s doc states for the LN fix.
     fn apply(&self, x: &Tensor) -> Result<Tensor, EncoderError> {
         let (_batch, _heads, seq, head_dim) = x.dims4()?;
         let half = head_dim / 2;
         let x_dtype = x.dtype();
+        let internal_dtype = match x_dtype {
+            DType::F16 | DType::BF16 => DType::F32,
+            d => d,
+        };
 
         let (cos_full, sin_full) = self.cached_tables(x_dtype)?;
-        let cos = cos_full.narrow(2, 0, seq)?;
-        let sin = sin_full.narrow(2, 0, seq)?;
+        let cos = cos_full.narrow(2, 0, seq)?.to_dtype(internal_dtype)?;
+        let sin = sin_full.narrow(2, 0, seq)?.to_dtype(internal_dtype)?;
 
-        let x1 = x.narrow(D::Minus1, 0, half)?;
-        let x2 = x.narrow(D::Minus1, half, half)?;
+        let x_internal = x.to_dtype(internal_dtype)?;
+        let x1 = x_internal.narrow(D::Minus1, 0, half)?;
+        let x2 = x_internal.narrow(D::Minus1, half, half)?;
         let neg_x2 = (x2 * -1.0f64)?;
         let rot_half = Tensor::cat(&[&neg_x2, &x1], D::Minus1)?;
 
-        let cos_part = x.broadcast_mul(&cos)?;
+        let cos_part = x_internal.broadcast_mul(&cos)?;
         let sin_part = rot_half.broadcast_mul(&sin)?;
-        Ok((cos_part + sin_part)?)
+        let out_internal = (cos_part + sin_part)?;
+        Ok(out_internal.to_dtype(x_dtype)?)
     }
 
     /// `[2, 1, 1, max_seq_len, head_dim]` — [`Self::cached_tables`]'s own
@@ -1982,12 +2012,22 @@ mod tests {
             .unwrap()
             .unsqueeze(0)
             .unwrap();
-        let x1 = x.narrow(D::Minus1, 0, half).unwrap();
-        let x2 = x.narrow(D::Minus1, half, half).unwrap();
+        // `apply` upcasts the (bf16-rounded) table AND `x` to f32 for the
+        // actual rotation, matching `Self::apply`'s own doc — this
+        // reference must upcast the same way, not multiply at bf16, or it
+        // would be pinning the pre-fix three-round formula instead of the
+        // one this function now runs.
+        let cos = cos.to_dtype(DType::F32).unwrap();
+        let sin = sin.to_dtype(DType::F32).unwrap();
+        let x_internal = x.to_dtype(DType::F32).unwrap();
+        let x1 = x_internal.narrow(D::Minus1, 0, half).unwrap();
+        let x2 = x_internal.narrow(D::Minus1, half, half).unwrap();
         let neg_x2 = (x2 * -1.0f64).unwrap();
         let rot_half = Tensor::cat(&[&neg_x2, &x1], D::Minus1).unwrap();
-        let uncached: Vec<bf16> = (x.broadcast_mul(&cos).unwrap()
+        let uncached: Vec<bf16> = (x_internal.broadcast_mul(&cos).unwrap()
             + rot_half.broadcast_mul(&sin).unwrap())
+        .unwrap()
+        .to_dtype(DType::BF16)
         .unwrap()
         .flatten_all()
         .unwrap()

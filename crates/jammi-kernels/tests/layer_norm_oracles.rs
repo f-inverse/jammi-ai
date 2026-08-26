@@ -8,9 +8,14 @@
 //!      `dgamma`).
 //!   2. `eager_vs_fused_*` — fwd+bwd vs. a hand-written composition of
 //!      ordinary candle ops that computes the SAME bias-free LayerNorm
-//!      (mean/center/variance/normalize/cast-back/scale — the same shape
-//!      `jammi-encoders::layer_norm::slow()`'s bias-free arm has), stated
-//!      tolerance derived from the f32-accumulation rounding model. This
+//!      (mean/center/variance/normalize/gamma-in-f32/cast-once — the same
+//!      one-rounding shape `jammi-encoders::layer_norm::slow()`'s
+//!      bias-free arm has since the eager-LN one-rounding fix), f32
+//!      asserted with a small stated tolerance (different op sequencing
+//!      can still round the last bit differently) and bf16 asserted
+//!      BIT-EXACT (measured on these fixtures; see the bf16 tests' own
+//!      docs for why that is not a structural guarantee at every shape).
+//!      This
 //!      crate is a LEAF (no `jammi-*` deps — see its module doc / the
 //!      fused-kernels plan's scope decision 12), so it cannot import
 //!      `slow()` itself; the actual "against the real `slow()`" oracle
@@ -41,11 +46,15 @@ fn fused(eps: f64, dgamma_needed: bool, x: &Tensor, gamma: &Tensor) -> candle_co
 }
 
 /// The bias-free eager composition `jammi-encoders::layer_norm::slow()`
-/// runs when `bias.is_none()`: f32-internal mean/center/variance/
-/// normalize, cast BACK to `x`'s own dtype, THEN multiply by `gamma` (in
-/// `x`'s dtype, not f32) — reproduced here candle-op-for-candle-op so the
-/// comparison is against the actual composition, not a re-derived
-/// closed form.
+/// runs: f32-internal mean/center/variance/normalize, gamma upcast to
+/// `internal_dtype` and applied THERE (never rounded to `x`'s dtype
+/// first), one cast to `x_dtype` at the very end — reproduced here
+/// candle-op-for-candle-op so the comparison is against the actual
+/// composition, not a re-derived closed form. Matches torch's
+/// `layer_norm_cuda` epilogue (`vectorized_layer_norm_kernel_impl`:
+/// "Computation is performed in T_ACC ... result is implicitly cast to
+/// T") and `LayerNormFused`'s own CPU/CUDA arm (`cuda/layer_norm.cu:124`:
+/// `yr[i] = __float2bfloat16(xhat * __bfloat162float(gamma[i]))`).
 fn eager(eps: f64, x: &Tensor, gamma: &Tensor) -> candle_core::Result<Tensor> {
     let x_dtype = x.dtype();
     let internal_dtype = match x_dtype {
@@ -58,7 +67,9 @@ fn eager(eps: f64, x: &Tensor, gamma: &Tensor) -> candle_core::Result<Tensor> {
     let centered = x_internal.broadcast_sub(&mean)?;
     let variance = (centered.sqr()?.sum_keepdim(D::Minus1)? / hidden as f64)?;
     let normalized = centered.broadcast_div(&(variance + eps)?.sqrt()?)?;
-    normalized.to_dtype(x_dtype)?.broadcast_mul(gamma)
+    let gamma_internal = gamma.to_dtype(internal_dtype)?;
+    let scaled_internal = normalized.broadcast_mul(&gamma_internal)?;
+    scaled_internal.to_dtype(x_dtype)
 }
 
 // ---------------------------------------------------------------------
@@ -214,24 +225,32 @@ fn eager_vs_fused_f32_fwd_and_bwd_match_within_stated_tolerance() {
     }
 }
 
-/// bf16: the eager composition rounds `xhat` to bf16 BEFORE multiplying
-/// by `gamma` (`normalized.to_dtype(x_dtype)?.broadcast_mul(&weight)` in
-/// `slow()`); the fused kernel multiplies `xhat * gamma` in f32 and
-/// rounds ONCE at the very end. These are genuinely different rounding
-/// paths — a measured, non-vacuous divergence, not a laziness-driven
-/// tolerance. `BF16_ULP_TOL` mirrors `tests/oracles.rs`'s axpy constant.
-const BF16_ULP_TOL: i32 = 4;
-
+/// bf16: BEFORE the one-rounding fix, the eager composition rounded
+/// `xhat` to bf16 BEFORE multiplying by `gamma`
+/// (`normalized.to_dtype(x_dtype)?.broadcast_mul(&weight)`, the pre-fix
+/// `slow()`), while the fused kernel multiplied `xhat * gamma` in f32 and
+/// rounded ONCE at the very end — measured on this same fixture, that was
+/// a genuine, non-vacuous divergence. `eager()` above now runs the
+/// IDENTICAL one-rounding shape (`gamma` upcast to f32, multiplied,
+/// rounded once), so eager and fused are expected to — and on this
+/// fixture, measured to — agree BIT-EXACTLY. `bf16_bit_diff` is kept
+/// (rather than deleted along with the tolerance) because it is still
+/// what prints the measured max in the backward oracle below, and as the
+/// tool a future regression would use to re-derive a tolerance if a
+/// production-`hidden`-sized fixture ever exposed a reduction-order
+/// difference between candle's `sum_keepdim` and the fused kernel's
+/// ascending-index scalar fold (neither this small fixture nor the
+/// f32 oracle above needed one).
 fn bf16_bit_diff(a: bf16, b: bf16) -> i32 {
     a.to_bits() as i32 - b.to_bits() as i32
 }
 
 #[test]
-fn eager_vs_fused_bf16_fwd_diverges_and_stays_within_the_stated_ulp_tolerance() {
+fn eager_vs_fused_bf16_fwd_is_bit_exact_after_the_one_rounding_fix() {
     let device = Device::Cpu;
-    // Chosen so the two bf16 rounding paths (round-xhat-then-multiply vs.
-    // multiply-in-f32-then-round-once) genuinely disagree, not just a
-    // fixture that happens to land exactly either way.
+    // The same fixture the pre-fix divergence oracle used (chosen to make
+    // the OLD two-rounding-path mismatch as visible as possible) — kept
+    // unchanged so the before/after comparison is apples to apples.
     let x0: [f32; 8] = [-18.5, -18.5, -18.5, -17.75, 3.375, -4.125, 9.0625, -2.5];
     let gamma0: [f32; 4] = [0.1, 1.703125, -2.015625, 2.234375];
     let eps = 1e-5;
@@ -261,17 +280,12 @@ fn eager_vs_fused_bf16_fwd_diverges_and_stays_within_the_stated_ulp_tolerance() 
         .zip(eager_out.iter())
         .map(|(&f, &e)| bf16_bit_diff(f, e))
         .collect();
-    assert!(
-        diffs.iter().any(|&d| d != 0),
-        "expected fixture to diverge (measured diffs: {diffs:?}) — the \
-         tolerance is not being exercised"
+    println!("eager_vs_fused_bf16_fwd: measured bit-diffs (post-fix) = {diffs:?}");
+    assert_eq!(
+        fused_out, eager_out,
+        "fwd must now be bit-exact (measured diffs: {diffs:?}) — the pre-fix defect \
+         (26% of elements diverging, see `LayerNorm::slow`'s doc) is gone"
     );
-    for (i, d) in diffs.iter().enumerate() {
-        assert!(
-            d.abs() <= BF16_ULP_TOL,
-            "element {i}: bit diff {d} exceeds the stated {BF16_ULP_TOL}-ULP tolerance"
-        );
-    }
 }
 
 /// The backward analog of the forward divergence oracle above: the SAME
@@ -284,21 +298,20 @@ fn eager_vs_fused_bf16_fwd_diverges_and_stays_within_the_stated_ulp_tolerance() 
 /// (each asserted `any(!= 0)`, the same non-vacuous-control shape as the
 /// forward oracle), with both kept within the stated `BF16_ULP_TOL`.
 ///
-/// On `BF16_ULP_TOL` (shared with the forward oracle above): backward
-/// does strictly more bf16-sensitive arithmetic per element than forward
-/// (two per-row reductions — `mean_row(t)` and `mean_row(t*xhat)` — plus
-/// the final `(t - mean_t - xhat*mean_t_xhat) * invvar` multiply-add,
-/// versus forward's single `xhat * gamma`), so a 2x-forward's-budget
-/// allowance is the a priori argument for a wider bound here. The
-/// MEASURED max on this fixture (printed below) is only 1 ULP for both
-/// `dx` and `dgamma` — the same as the forward oracle's own measured max
-/// on its fixture — so `BF16_ULP_TOL = 4` is a deliberately conservative
-/// ceiling on top of that, not a tight derivation from either argument;
-/// it is sized to tolerate a worse fixture or a different libm's
-/// rounding on another platform without flaking, and the measured value
-/// is what actually establishes how tight it is today.
+/// `dx` (the analytical Apex/ATen-canonical closed form `LayerNormBwdDx`
+/// computes) and the eager composition's `dx` (candle autograd
+/// differentiating through the composed ops) were already two DIFFERENT
+/// derivations of the same gradient before this fix — the forward
+/// one-rounding fix removes one source of divergence (the forward
+/// rounding-order mismatch feeding into both graphs' `xhat`), not
+/// necessarily every source (the two `dx` derivations remain distinct op
+/// sequences in principle). Measured on this fixture, post-fix, both `dx`
+/// and `dgamma` are bit-exact (`diffs` printed below are all `0`) — see
+/// the forward oracle's doc for why a small `hidden` (here 4) makes exact
+/// agreement plausible even though it is not a structural guarantee for
+/// an arbitrary shape.
 #[test]
-fn eager_vs_fused_bf16_bwd_diverges_and_stays_within_the_stated_ulp_tolerance() {
+fn eager_vs_fused_bf16_bwd_is_bit_exact_after_the_one_rounding_fix() {
     let device = Device::Cpu;
     let x0: [f32; 8] = [-18.5, -18.5, -18.5, -17.75, 3.375, -4.125, 9.0625, -2.5];
     let gamma0: [f32; 4] = [0.1, 1.703125, -2.015625, 2.234375];
@@ -355,19 +368,11 @@ fn eager_vs_fused_bf16_bwd_diverges_and_stays_within_the_stated_ulp_tolerance() 
         .zip(dxe.iter())
         .map(|(&f, &e)| bf16_bit_diff(f, e))
         .collect();
-    assert!(
-        dx_diffs.iter().any(|&d| d != 0),
-        "expected dx fixture to diverge (measured diffs: {dx_diffs:?}) — the \
-         tolerance is not being exercised"
+    println!("eager_vs_fused_bf16_bwd: measured dx bit-diffs (post-fix) = {dx_diffs:?}");
+    assert_eq!(
+        dxf, dxe,
+        "dx must now be bit-exact (measured diffs: {dx_diffs:?})"
     );
-    let dx_max = dx_diffs.iter().map(|d| d.abs()).max().unwrap_or(0);
-    println!("eager_vs_fused_bf16_bwd: measured max |dx bit-diff| = {dx_max}");
-    for (i, d) in dx_diffs.iter().enumerate() {
-        assert!(
-            d.abs() <= BF16_ULP_TOL,
-            "dx element {i}: bit diff {d} exceeds the stated {BF16_ULP_TOL}-ULP tolerance"
-        );
-    }
 
     let dgf: Vec<bf16> = grads_f.get(&g_f).unwrap().to_vec1().unwrap();
     let dge: Vec<bf16> = grads_e.get(&g_e).unwrap().to_vec1().unwrap();
@@ -376,22 +381,11 @@ fn eager_vs_fused_bf16_bwd_diverges_and_stays_within_the_stated_ulp_tolerance() 
         .zip(dge.iter())
         .map(|(&f, &e)| bf16_bit_diff(f, e))
         .collect();
-    // Same non-vacuity control as dx above (and the forward oracle): a
-    // fixture that never actually exercised the tolerance would make the
-    // bound below an unfalsifiable no-op.
-    assert!(
-        dg_diffs.iter().any(|&d| d != 0),
-        "expected dgamma fixture to diverge (measured diffs: {dg_diffs:?}) — \
-         the tolerance is not being exercised"
+    println!("eager_vs_fused_bf16_bwd: measured dgamma bit-diffs (post-fix) = {dg_diffs:?}");
+    assert_eq!(
+        dgf, dge,
+        "dgamma must now be bit-exact (measured diffs: {dg_diffs:?})"
     );
-    let dg_max = dg_diffs.iter().map(|d| d.abs()).max().unwrap_or(0);
-    println!("eager_vs_fused_bf16_bwd: measured max |dgamma bit-diff| = {dg_max}");
-    for (i, d) in dg_diffs.iter().enumerate() {
-        assert!(
-            d.abs() <= BF16_ULP_TOL,
-            "dgamma element {i}: bit diff {d} exceeds the stated {BF16_ULP_TOL}-ULP tolerance"
-        );
-    }
 }
 
 // ---------------------------------------------------------------------

@@ -203,6 +203,39 @@ impl LayerNorm {
         }
     }
 
+    /// `y = xhat * gamma [+ beta]`, matching torch's `layer_norm_cuda`
+    /// (`aten/src/ATen/native/cuda/layer_norm_kernel.cu`'s
+    /// `vectorized_layer_norm_kernel_impl`: "Computation is performed in
+    /// T_ACC, X is cast to T_ACC and result is implicitly cast to T" —
+    /// `out = gamma * (rstd * (x - mean)) + beta`, gamma AND beta both
+    /// applied in the f32 accumulator before the SINGLE implicit cast to
+    /// the output dtype) and jammi's own fused CUDA kernel
+    /// (`cuda/layer_norm.cu:124`: `yr[i] =
+    /// __float2bfloat16(xhat * __bfloat162float(gamma[i]))`, one
+    /// `__float2bfloat16` call, at the end). `mean`/`variance`/`xhat`/the
+    /// affine are ALL computed in `internal_dtype` (f32 whenever `x_dtype`
+    /// is F16/BF16); `weight`/`bias` are upcast to `internal_dtype` for the
+    /// affine rather than mixing dtypes, and the whole result is cast to
+    /// `x_dtype` exactly once, at the very end.
+    ///
+    /// Previously this rounded `xhat` to `x_dtype` BEFORE multiplying by
+    /// `weight` (and, when biased, added `bias` as a further `x_dtype`
+    /// op) — two-to-three rounding points instead of one. Measured on a
+    /// ModernBERT-large-shaped fixture (`[4096, 1024]` bf16, `mean`/`rstd`
+    /// held fixed to isolate the affine-epilogue rounding): the old
+    /// two-round form differed from an f32-computed, once-rounded
+    /// reference on 1,088,881 of 4,194,304 elements (26%) and was 35%
+    /// further from the f64 truth than the one-round form. Every served
+    /// bias-free (ModernBERT) LayerNorm output — training-eager fallback
+    /// AND (through this same function) any `training=true` call that
+    /// misses the fused kernel's admission domain — therefore changes at
+    /// the ULP level; eval (`training == false`) is UNCHANGED by this fix
+    /// in call SHAPE (still routes to `candle_nn::ops::layer_norm` for the
+    /// biased fast path, never `slow()`, when biased+eval+contiguous), but
+    /// the biased eval fast path itself was never affected by this defect
+    /// (candle's fused `layer_norm` already rounds once) — this fix
+    /// changes ONLY `slow()`'s own output, i.e. the bias-free
+    /// training-mode paths and any biased non-fast-path call.
     fn slow(&self, x: &Tensor) -> Result<Tensor, EncoderError> {
         let x_dtype = x.dtype();
         let internal_dtype = match x_dtype {
@@ -215,11 +248,13 @@ impl LayerNorm {
         let centered = x_internal.broadcast_sub(&mean)?;
         let variance = (centered.sqr()?.sum_keepdim(D::Minus1)? / hidden as f64)?;
         let normalized = centered.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
-        let scaled = normalized.to_dtype(x_dtype)?.broadcast_mul(&self.weight)?;
-        Ok(match &self.bias {
-            None => scaled,
-            Some(b) => scaled.broadcast_add(b)?,
-        })
+        let weight_internal = self.weight.to_dtype(internal_dtype)?;
+        let scaled_internal = normalized.broadcast_mul(&weight_internal)?;
+        let out_internal = match &self.bias {
+            None => scaled_internal,
+            Some(b) => scaled_internal.broadcast_add(&b.to_dtype(internal_dtype)?)?,
+        };
+        Ok(out_internal.to_dtype(x_dtype)?)
     }
 }
 

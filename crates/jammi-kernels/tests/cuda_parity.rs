@@ -5310,10 +5310,18 @@ fn assert_lora_linear_parity_f32_bit_exact(
 /// rounding point this leg cannot eliminate: the final store of that exact
 /// sum down to `bf16`. The expected reference is built with that SAME
 /// single rounding (`bf16::from_f32(exact_sum)`), and the epilogue's own
-/// two rounding points (`ScaledCastAdd`'s "round delta to `bf16` first,
-/// then add-and-round-once" — see `ops::scaled_cast_add`'s module doc) are
+/// ONE rounding point (`ScaledCastAdd`'s "widen base to `f32`, add the
+/// `f32`-scaled delta, round ONCE" — esc-046 fix, GH#374, matching PEFT's
+/// own `Linear.forward` order; see `ops::scaled_cast_add`'s module doc) is
 /// reproduced by hand with the exact same formula
-/// `scaled_cast_add_bf16_f32` uses. This is BIT-EXACT (not a tolerance
+/// `scaled_cast_add_bf16_f32` uses. An earlier revision of this reference
+/// (pre-esc-046) rounded the delta to `bf16` FIRST, then added and rounded
+/// AGAIN — matching the kernel's OWN pre-fix rounding order, so this test
+/// stayed green while a real defect (esc-046, GH#374) shipped: the
+/// reference tracked the kernel's rounding PLACEMENT rather than PEFT's,
+/// so a regression in placement would have agreed with this reference
+/// instead of catching it. Updated in the same change that fixed the
+/// kernel, to the once-rounded formula both now share. This is BIT-EXACT (not a tolerance
 /// leg): a half-term drop, a wrong row, or a transposed operand would
 /// almost certainly miss this exact reference, unlike the loose
 /// term-magnitude bound `lora_linear_parity_bf16_base_production_width`
@@ -5363,10 +5371,10 @@ fn lora_linear_parity_bf16_exact_integer_fixture_is_bit_exact() {
         .iter()
         .zip(delta_f32_exact.iter())
         .map(|(&base, &delta)| {
-            // Mirrors `scaled_cast_add_bf16_f32` exactly (round delta to
-            // bf16 first, then add-and-round-once).
-            let delta_bf16 = bf16::from_f32(delta * scale);
-            bf16::from_f32(base.to_f32() + delta_bf16.to_f32())
+            // Mirrors `scaled_cast_add_bf16_f32` exactly (esc-046 fix:
+            // widen base to f32, add the f32-scaled delta, round ONCE —
+            // no intermediate bf16-rounded delta).
+            bf16::from_f32(base.to_f32() + delta * scale)
         })
         .collect();
 

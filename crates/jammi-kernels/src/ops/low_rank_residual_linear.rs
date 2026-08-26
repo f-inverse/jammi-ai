@@ -76,11 +76,14 @@
 //!    `.transpose(0, 1)` VIEW (`[rank, out]`, column-contiguous) — a
 //!    zero-copy reinterpretation `gemm_config`'s `CUBLAS_OP_T` branch
 //!    accepts directly (same citation below).
-//! 6. `out = base + cast_to(base.dtype())(delta * scale)` — reuses
-//!    [`super::ScaledCastAdd`]'s `cpu_fwd`/`cuda_fwd` DIRECTLY (same
-//!    round-before-add model, same two rounding points its own module doc
-//!    enumerates: PEFT's `Linear.forward` casts the scaled delta down to
-//!    the base result's dtype BEFORE the add).
+//! 6. `out = round_once(cast_to(f32)(base) + delta * scale)` — reuses
+//!    [`super::ScaledCastAdd`]'s `cpu_fwd`/`cuda_fwd` DIRECTLY (esc-046 fix,
+//!    GH#374: `base` widens to `f32`, adds the already-`f32`-scaled
+//!    `delta`, rounds to `base`'s dtype ONCE — matching PEFT's
+//!    `Linear.forward`'s own promote-add-cast-once order, not the
+//!    round-the-delta-first model an earlier revision of this doc and
+//!    [`super::ScaledCastAdd`]'s module doc both claimed without checking
+//!    PEFT source).
 //!
 //! ## Every rounding point, backward
 //!

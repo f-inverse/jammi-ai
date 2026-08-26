@@ -2340,7 +2340,7 @@ fn round4_shadow_diverges_from_cuda_arm_across_seed_and_shape_sweep_with_measure
                     .map(|i| bf16::from_f32((dyr[i].to_f32() - dot) * yr[i].to_f32()))
                     .collect();
 
-                for i in 0..last {
+                for (i, r4) in round4_shadow.iter().enumerate() {
                     let idx = r * last + i;
                     if dscores_gpu[idx].to_f32() != 0.0 {
                         any_nonzero_signal = true;
@@ -2349,7 +2349,7 @@ fn round4_shadow_diverges_from_cuda_arm_across_seed_and_shape_sweep_with_measure
                         cpu_vs_cuda_mismatches += 1;
                         seed_cpu_vs_cuda += 1;
                     }
-                    if cuda_bf16_differ(dscores_gpu[idx], round4_shadow[i]) {
+                    if cuda_bf16_differ(dscores_gpu[idx], *r4) {
                         cuda_vs_round4_shadow_mismatches += 1;
                         seed_cuda_vs_round4 += 1;
                     }

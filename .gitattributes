@@ -11,3 +11,10 @@
 cookbook/book/artifacts/**/*.parquet  filter=lfs diff=lfs merge=lfs -text
 cookbook/book/artifacts/**/*.usearch  filter=lfs diff=lfs merge=lfs -text
 cookbook/book/artifacts/**/*.rowmap   filter=lfs diff=lfs merge=lfs -text
+
+# P6 Stage B (jammi-kernels) FA2 O0(a) parity fixtures (10b1f3b fix round):
+# production shape (H=16) reference (torch FA2) + truth (f64 eager
+# attention) tensors, 5 per leg x 8 legs, f32 on disk — routed through LFS
+# for the same reason as the book's tiers above (a large, rarely-changing
+# binary blob the test suite reads but does not diff).
+crates/jammi-kernels/tests/fixtures/flash_reference/*.npy  filter=lfs diff=lfs merge=lfs -text

@@ -1,0 +1,100 @@
+{
+  "tip_sha": "bb400c8",
+  "box": "a100b",
+  "gpu": "NVIDIA A100-SXM4-80GB",
+  "driver": "580.126.16",
+  "compute_capability": [
+    8,
+    0
+  ],
+  "warmup": 5,
+  "iters": 25,
+  "amplitude_note": "bf16 random fill in [-18, 18], production amplitude, deterministic irrational-multiplier fractional sequence (not an RNG dependency, values numerically irrelevant to wall time)",
+  "legs": [
+    {
+      "leg": "b8_s512_dense",
+      "batch": 8,
+      "total_q": 4096,
+      "num_heads": 16,
+      "head_dim": 64,
+      "fwd": {
+        "mean_ms": 0.1383,
+        "p50_ms": 0.0956,
+        "min_ms": 0.0944,
+        "max_ms": 1.1623,
+        "n": 25
+      },
+      "bwd": [
+        {
+          "deterministic": true,
+          "splits": 1,
+          "stats": {
+            "mean_ms": 0.4243,
+            "p50_ms": 0.3733,
+            "min_ms": 0.3711,
+            "max_ms": 1.4121,
+            "n": 25
+          }
+        },
+        {
+          "deterministic": false,
+          "splits": 1,
+          "stats": {
+            "mean_ms": 0.6061,
+            "p50_ms": 0.3759,
+            "min_ms": 0.2599,
+            "max_ms": 1.3074,
+            "n": 25
+          }
+        }
+      ]
+    },
+    {
+      "leg": "b1_s512",
+      "batch": 1,
+      "total_q": 512,
+      "num_heads": 16,
+      "head_dim": 64,
+      "fwd": {
+        "mean_ms": 0.0773,
+        "p50_ms": 0.0389,
+        "min_ms": 0.0384,
+        "max_ms": 0.9946,
+        "n": 25
+      },
+      "bwd": [
+        {
+          "deterministic": true,
+          "splits": 7,
+          "stats": {
+            "mean_ms": 0.1064,
+            "p50_ms": 0.1063,
+            "min_ms": 0.1051,
+            "max_ms": 0.1076,
+            "n": 25
+          }
+        },
+        {
+          "deterministic": false,
+          "splits": 1,
+          "stats": {
+            "mean_ms": 0.0695,
+            "p50_ms": 0.0692,
+            "min_ms": 0.0687,
+            "max_ms": 0.0735,
+            "n": 25
+          }
+        }
+      ]
+    }
+  ],
+  "schema_version": 1,
+  "git_sha": "bb400c89261bb33979082bb0ea92e9d4d62db702",
+  "status": "SUPERSEDED",
+  "producer": {
+    "path": "crates/jammi-kernels/tests/flash_decisive_timing.rs",
+    "kind": "cargo-test",
+    "invocation": "cargo test -p jammi-kernels --release --features flash-attn --test flash_decisive_timing -- --ignored --exact decisive_timing_measurement",
+    "gating": "#[ignore]"
+  }
+}

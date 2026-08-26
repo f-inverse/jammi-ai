@@ -3561,6 +3561,95 @@ mod tests {
         eprintln!("{test_name}: skipping — JAMMI_FLASH_ORACLE_MODEL_DIR not set");
     }
 
+    /// Mirrors [`growth_oracle_cuda_device`]'s own `JAMMI_REQUIRE_CUDA` gate
+    /// AND [`flash_oracle_require_gate`]'s own `JAMMI_REQUIRE_FLASH_ORACLE`
+    /// gate, for the THIRD gate every flash-arm-vs-block-arm oracle in this
+    /// module checks before it can run: `jammi_kernels::admission::
+    /// FLASH_COMPILED` (was this build's `jammi-kernels` compiled with
+    /// `flash-attn`?). Without this, a build that compiled without the
+    /// feature reads every one of these oracles/RED-controls GREEN with no
+    /// escape hatch -- the exact "fell back/skipped everywhere and it read
+    /// as green" failure mode `AdmissionMode::Strict` exists to prevent,
+    /// just at the FEATURE-COMPILATION layer instead of the admission
+    /// layer. Returns `true` (caller proceeds) iff `FLASH_COMPILED`;
+    /// otherwise panics when `JAMMI_REQUIRE_FLASH` is set (the pod lane
+    /// exports it) or prints the skip message and returns `false`.
+    #[cfg(feature = "cuda")]
+    fn flash_compiled_or_skip(test_name: &str) -> bool {
+        if jammi_kernels::admission::FLASH_COMPILED {
+            return true;
+        }
+        if std::env::var_os("JAMMI_REQUIRE_FLASH").is_some() {
+            panic!(
+                "{test_name}: JAMMI_REQUIRE_FLASH is set but this build's jammi-kernels was \
+                 compiled without the flash-attn feature (FLASH_COMPILED=false) -- this lane \
+                 must run the real flash arm, not skip it"
+            );
+        }
+        eprintln!(
+            "{test_name}: skipping — built without the flash-attn feature \
+             (FLASH_COMPILED=false); this test needs a real flash arm to compare against"
+        );
+        false
+    }
+
+    /// The panic arm of [`flash_compiled_or_skip`], pinned directly (not
+    /// only exercised transitively by the five real oracle call sites,
+    /// every one of which ALSO requires `JAMMI_FLASH_ORACLE_MODEL_DIR` to
+    /// even reach this gate). Only meaningful on a build where
+    /// `FLASH_COMPILED` is `false` (this crate's own default/no-`flash-attn`
+    /// test build): on a `flash-attn`-compiled build `flash_compiled_or_skip`
+    /// returns `true` before ever consulting `JAMMI_REQUIRE_FLASH`, so this
+    /// asserts only the panic MESSAGE shape on that build, not the panic
+    /// itself (setting `JAMMI_REQUIRE_FLASH` there is a no-op by
+    /// construction — a `flash-attn`-compiled build should never skip).
+    /// Mutates the process-global `JAMMI_REQUIRE_FLASH` env var restored
+    /// via a `catch_unwind`/`set_var` pair, run single-threaded by this
+    /// crate's own pod convention (`--test-threads=1`) to avoid racing a
+    /// real oracle test that reaches the same gate concurrently.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn flash_compiled_or_skip_panics_under_require_flash_when_not_compiled() {
+        if jammi_kernels::admission::FLASH_COMPILED {
+            eprintln!(
+                "flash_compiled_or_skip_panics_under_require_flash_when_not_compiled: this \
+                 build has FLASH_COMPILED=true, so flash_compiled_or_skip always returns Ok \
+                 before consulting JAMMI_REQUIRE_FLASH -- nothing to pin on this build"
+            );
+            return;
+        }
+        // SAFETY-of-test: single env var, restored before returning either
+        // way (including on panic, via the `unwrap`/re-panic pattern
+        // below), and this crate's pod lane runs its test suite with
+        // `--test-threads=1`.
+        std::env::set_var("JAMMI_REQUIRE_FLASH", "1");
+        let result = std::panic::catch_unwind(|| {
+            flash_compiled_or_skip(
+                "flash_compiled_or_skip_panics_under_require_flash_when_not_compiled",
+            )
+        });
+        std::env::remove_var("JAMMI_REQUIRE_FLASH");
+        let err = result.expect_err(
+            "flash_compiled_or_skip must panic when JAMMI_REQUIRE_FLASH is set and \
+             FLASH_COMPILED is false",
+        );
+        let msg = err
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(
+            msg.contains("JAMMI_REQUIRE_FLASH") && msg.contains("flash-attn"),
+            "panic message must name the env var and the missing feature: {msg}"
+        );
+
+        // No env var set: must skip (return false), not panic.
+        std::env::remove_var("JAMMI_REQUIRE_FLASH");
+        assert!(!flash_compiled_or_skip(
+            "flash_compiled_or_skip_panics_under_require_flash_when_not_compiled"
+        ));
+    }
+
     /// A deterministic (SplitMix64-derived) token-id batch, `vocab`-bounded
     /// and `seed`-keyed -- every arm below is driven by the exact SAME
     /// `input_ids` for a given `(batch, seq, seed)`.
@@ -4365,12 +4454,7 @@ mod tests {
         let _d2h_guard = FLASH_D2H_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if !jammi_kernels::admission::FLASH_COMPILED {
-            eprintln!(
-                "flash_vs_block_per_layer_vram_attribution_probe_cuda: skipping — built without \
-                 the flash-attn feature (FLASH_COMPILED=false); this probe needs a real flash \
-                 arm to attribute against"
-            );
+        if !flash_compiled_or_skip("flash_vs_block_per_layer_vram_attribution_probe_cuda") {
             return;
         }
 
@@ -4455,12 +4539,7 @@ mod tests {
         let _d2h_guard = FLASH_D2H_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if !jammi_kernels::admission::FLASH_COMPILED {
-            eprintln!(
-                "flash_arm_encoder_level_three_way_oracle_dense_cuda_bf16: skipping — built \
-                 without the flash-attn feature (FLASH_COMPILED=false); this oracle needs a \
-                 real flash arm to compare against"
-            );
+        if !flash_compiled_or_skip("flash_arm_encoder_level_three_way_oracle_dense_cuda_bf16") {
             return;
         }
 
@@ -4501,11 +4580,9 @@ mod tests {
         let _d2h_guard = FLASH_D2H_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if !jammi_kernels::admission::FLASH_COMPILED {
-            eprintln!(
-                "flash_arm_fault_harness_nofault_matches_production_bit_identical: skipping — \
-                 built without the flash-attn feature"
-            );
+        if !flash_compiled_or_skip(
+            "flash_arm_fault_harness_nofault_matches_production_bit_identical",
+        ) {
             return;
         }
 
@@ -4566,11 +4643,7 @@ mod tests {
         let _d2h_guard = FLASH_D2H_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if !jammi_kernels::admission::FLASH_COMPILED {
-            eprintln!(
-                "flash_arm_encoder_level_oracle_red_control_window_dropped: skipping — built \
-                 without the flash-attn feature"
-            );
+        if !flash_compiled_or_skip("flash_arm_encoder_level_oracle_red_control_window_dropped") {
             return;
         }
 
@@ -4651,8 +4724,7 @@ mod tests {
         let _d2h_guard = FLASH_D2H_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if !jammi_kernels::admission::FLASH_COMPILED {
-            eprintln!("{label}: skipping — built without the flash-attn feature");
+        if !flash_compiled_or_skip(label) {
             return;
         }
 

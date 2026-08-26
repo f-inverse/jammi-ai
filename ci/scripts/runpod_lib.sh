@@ -570,20 +570,58 @@ rp_session_forget() {
   [ -n "$RP_SESSION" ] && [ -d "$RP_WORK" ] && rm -rf "$RP_WORK"
 }
 
-# Tree name -> plain checkout directory on the pod. "jammi-ai" is the ONE
-# default: the historical single-checkout location every existing doc/script
-# still names directly (rp_bootstrap's own clone destination, below, is the
-# other of the exactly two "/root/jammi-ai" literal sites this tooling
-# permits — see test_pod_substrate.sh's grep gate). Any OTHER name is a
-# caller-chosen additional tree — a plain directory under /root/trees, never
-# a git worktree (a worktree add fails on the checked-out ref, and a shared
-# .git couples trees that must be able to diverge — round-1 pressure-test
-# finding) and never git-cloned itself (see pod_target_clone.sh: a tree is
-# populated by copying the pod's OWN seed target dir plus a rsync'd source
-# tree, never a fresh `git clone`).
+# Tree name -> plain SOURCE checkout directory on the pod. "jammi-ai" is the
+# ONE default: the historical single-checkout location every existing
+# doc/script still names directly (rp_bootstrap's own clone destination,
+# below, is the other of the exactly two "/root/jammi-ai" literal sites this
+# tooling permits — see test_pod_substrate.sh's grep gate). Any OTHER name
+# is a caller-chosen additional tree — a plain directory under /root/trees,
+# never a git worktree (a worktree add fails on the checked-out ref, and a
+# shared .git couples trees that must be able to diverge — round-1
+# pressure-test finding). A tree is populated by `push` (rsync, excludes
+# `.git`) — NEVER by cloning the build-substrate seed: the seed is a
+# CARGO_TARGET_DIR (build OUTPUT), a wholly different directory namespace
+# from a tree (SOURCE) — see rp_target_dir, immediately below. Conflating
+# the two made `target`'s own clone destination collide with `push --tree`'s
+# rsync destination, so the first push after a `target` deleted the clone it
+# had just made (round-2 audit finding 1).
 rp_tree_dir() { # $1=tree name (optional; default "jammi-ai")
   local t="${1:-jammi-ai}"
   if [ "$t" = "jammi-ai" ]; then echo "/root/jammi-ai"; else echo "/root/trees/${t}"; fi
+}
+
+# Tree name -> the CARGO_TARGET_DIR a `target` clone for that tree lives at
+# — a build OUTPUT namespace (/root/target-<name>), deliberately disjoint
+# from rp_tree_dir's SOURCE namespace (/root/trees/<name> or
+# /root/jammi-ai) so `push --tree <name>`'s `rsync --delete` (which mirrors
+# the SOURCE tree only) can never reach it, and `target`'s own clone can
+# never be mistaken for — or overwritten by — a checkout. Applies the SAME
+# "jammi-ai" naming convention as rp_tree_dir purely for symmetry (there is
+# no special-cased literal here, unlike rp_tree_dir's default branch: every
+# name, including "jammi-ai", maps the same way).
+rp_target_dir() { # $1=tree name (optional; default "jammi-ai")
+  local t="${1:-jammi-ai}"
+  echo "/root/target-${t}"
+}
+
+# Builds the per-tree job wrapper script body (`<tree>/.jammi-job.sh`,
+# written by gpu-dev.sh's `run`): source the container env, pin
+# CARGO_TARGET_DIR to THIS tree's own build-substrate clone (rp_target_dir)
+# so a build in the tree actually uses the pre-warmed dependency artifacts
+# instead of a cold default target dir under the tree itself (round-2 audit
+# finding 1 — the substrate was cloned but nothing ever pointed a build at
+# it), cd into the tree, then the caller's command. A plain function, not
+# inlined into the remote heredoc, so it is directly testable (source this
+# file, call it with fixture args) without a live pod. $1=tree_dir
+# $2=target_dir $3=job command.
+rp_job_wrapper_lines() {
+  local tree_dir="${1:?rp_job_wrapper_lines needs a tree dir}" \
+        target_dir="${2:?rp_job_wrapper_lines needs a target dir}" \
+        job="${3:?rp_job_wrapper_lines needs a job command}"
+  printf '[ -f /root/.jammi_env ] && . /root/.jammi_env\n'
+  printf "export CARGO_TARGET_DIR='%s'\n" "$target_dir"
+  printf "cd '%s'\n" "$tree_dir"
+  printf '%s\n' "$job"
 }
 
 _rp_deploy_payload() { # $1=cloudType $2=gpuTypeId

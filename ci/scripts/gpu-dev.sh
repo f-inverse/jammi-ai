@@ -357,11 +357,17 @@ fi
 source "$DIR/runpod_lib.sh"
 
 # Resolved once, here, so every verb below (attach/run/logs/push/pull/target)
-# reads the SAME directory for the SAME --tree value — the one place
-# TREE -> path resolution happens on the laptop side (rp_tree_dir also runs
-# on the pod, inside the remote heredocs below, computed identically since
-# both sides apply the exact same "jammi-ai" -> /root/jammi-ai special case).
+# reads the SAME directories for the SAME --tree value — the one place
+# TREE -> path resolution happens on the laptop side (rp_tree_dir/
+# rp_target_dir also run on the pod, inside the remote heredocs below,
+# computed identically since both sides apply the exact same function).
+# TREE_DIR is the SOURCE checkout (rsync'd by push); TARGET_DIR is the
+# build-substrate CLONE's own CARGO_TARGET_DIR — a deliberately DISJOINT
+# directory (round-2 audit finding 1: conflating the two made `target`'s
+# clone destination collide with `push --tree`'s rsync destination, so the
+# first push after a `target` deleted the clone it had just made).
 TREE_DIR="$(rp_tree_dir "$TREE")"
+TARGET_DIR="$(rp_target_dir "$TREE")"
 # `=`-anchored so a tmux SESSION lookup never prefix-matches another tree's
 # session (`jammi-ai` would otherwise match a session literally named
 # `jammi-ai-2`) — the fix for the shipped unanchored `-t jammi` bug (M6).
@@ -376,10 +382,14 @@ esac
 # Interactive remote command: correct env, then either the running job's terminal
 # or a plain shell in the checkout. Pass "job" to prefer the job when one exists.
 # $2 = tree dir, $3 = tmux session name (both required; no bare defaults here
-# so a caller can never silently land on the WRONG tree's job).
+# so a caller can never silently land on the WRONG tree's job). Exports
+# CARGO_TARGET_DIR at THIS tree's own build-substrate clone too (TARGET_DIR,
+# resolved above), the same wiring `run`'s job wrapper uses (rp_job_wrapper_lines)
+# — an interactive `cargo build` in a tree gets the seed's benefit exactly
+# like a `run` job does.
 rp_login_cmd() { # $1 = "job" to join a live tmux job, $2 = tree dir, $3 = tmux session
   local tree_dir="${2:?rp_login_cmd needs a tree dir}" tmux_sess="${3:?rp_login_cmd needs a tmux session name}"
-  local pre; pre="[ -f /root/.jammi_env ] && . /root/.jammi_env; cd '${tree_dir}' 2>/dev/null;"
+  local pre; pre="[ -f /root/.jammi_env ] && . /root/.jammi_env; export CARGO_TARGET_DIR='${TARGET_DIR}'; cd '${tree_dir}' 2>/dev/null;"
   if [ "${1:-}" = "job" ]; then
     # Ctrl-C inside the job's pane signals the job itself, so say so before
     # handing over the keyboard — this is a terminal that can destroy work.
@@ -590,9 +600,7 @@ case "$CMD" in
     rp_run_remote <<EOF
 set -uo pipefail
 cat > '${TREE_DIR}'/.jammi-job.sh <<'JOBEOF'
-[ -f /root/.jammi_env ] && . /root/.jammi_env
-cd '${TREE_DIR}'
-${JOB}
+$(rp_job_wrapper_lines "$TREE_DIR" "$TARGET_DIR" "$JOB")
 JOBEOF
 tmux kill-session -t "=${TMUX_SESSION}" 2>/dev/null
 tmux new-session -d -s "${TMUX_SESSION}" "${LAUNCH}"
@@ -648,7 +656,14 @@ EOF
 
   target)
     require_pod; rp_keep
-    NAME_TREE_DIR="$(rp_tree_dir "$TARGET_NAME")"
+    # NAME_TARGET_DIR is the CLONE destination (a CARGO_TARGET_DIR — build
+    # OUTPUT), NAME_SOURCE_TREE_DIR is the tree's own SOURCE checkout — two
+    # deliberately DIFFERENT directories (round-2 audit finding 1; see
+    # rp_target_dir's own doc in runpod_lib.sh). `target` clones INTO the
+    # former; cutlass (below) is provisioned into the LATTER, since it is
+    # C++ source consumed by build.rs, not a build artifact.
+    NAME_TARGET_DIR="$(rp_target_dir "$TARGET_NAME")"
+    NAME_SOURCE_TREE_DIR="$(rp_tree_dir "$TARGET_NAME")"
     if [ "$TARGET_VERIFY" = "1" ]; then
       # Reads a `cargo build -v` log piped in on THIS invocation's own stdin
       # and forwards it to pod_target_clone.sh --verify running remotely —
@@ -657,22 +672,37 @@ EOF
       # test_pod_substrate.sh against the standalone script, not against
       # this remote invocation.
       cat | ssh "${RP_SSHO[@]}" -p "$RP_PORT" "root@${RP_HOST}" \
-        "bash /root/jammi-ai/ci/scripts/pod_target_clone.sh '' '${NAME_TREE_DIR}' --verify"
+        "bash /root/jammi-ai/ci/scripts/pod_target_clone.sh '' '${NAME_TARGET_DIR}' --verify"
       exit $?
     fi
     [ -n "$TARGET_NAME" ] || { echo "target: need a tree name"; exit 2; }
     rp_run_remote <<EOF
 set -uo pipefail
-bash /root/jammi-ai/ci/scripts/pod_target_clone.sh /root/.jammi-seed '${NAME_TREE_DIR}'
+bash /root/jammi-ai/ci/scripts/pod_target_clone.sh /root/.jammi-seed '${NAME_TARGET_DIR}'
 EOF
     rc=$?
     if [ "$rc" -eq 0 ] && [ "$TARGET_WITH_CUTLASS" = "1" ]; then
+      # `cp -a` from /root/jammi-ai's OWN initialised submodule — never
+      # `git submodule update` INSIDE the tree (round-2 audit finding 1): a
+      # tree populated by `push` (rsync, which excludes `.git` — see
+      # pod_push_stamp.sh) carries no `.git` at all, so `git submodule`
+      # there fails with "not a git repository" on every tree except the
+      # default bootstrap checkout. /root/jammi-ai IS always a real git
+      # clone (rp_bootstrap's own, untouched by push), so its submodule is
+      # initialised there once and the resulting tree copied verbatim into
+      # whichever tree needs it — a plain file copy works regardless of
+      # whether the destination tree has a `.git` of its own.
       rp_run_remote <<EOF
 set -uo pipefail
-git -C '${NAME_TREE_DIR}' submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass
+git -C /root/jammi-ai submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass
+[ -d '${NAME_SOURCE_TREE_DIR}' ] || { echo "::error::tree source dir '${NAME_SOURCE_TREE_DIR}' does not exist — push to it first (target --with-cutlass provisions cutlass INTO an existing tree, it does not create one)"; exit 1; }
+mkdir -p '${NAME_SOURCE_TREE_DIR}/crates/jammi-kernels/third_party'
+rm -rf '${NAME_SOURCE_TREE_DIR}/crates/jammi-kernels/third_party/cutlass'
+cp -a /root/jammi-ai/crates/jammi-kernels/third_party/cutlass '${NAME_SOURCE_TREE_DIR}/crates/jammi-kernels/third_party/cutlass'
 EOF
+      rc=$?
     fi
-    echo "=== target '${TARGET_NAME}' at ${NAME_TREE_DIR}: exit ${rc} ==="
+    echo "=== target '${TARGET_NAME}' — clone at ${NAME_TARGET_DIR}, cutlass ${TARGET_WITH_CUTLASS}: exit ${rc} ==="
     exit "$rc"
     ;;
 

@@ -794,6 +794,20 @@ jobs:
           # `"0"`) — the number `0` is falsy in GitHub Actions expressions,
           # so a bare `0` here would make `||` silently discard it.
           fetch-depth: ${{ matrix.fetch_depth || '1' }}
+      # This shared job is deliberately "no toolchain, no container, no GPU"
+      # for every OTHER leg (see the module doc above) — a bare runner keeps
+      # every guard here instant. The "pod build substrate" leg is the one
+      # exception: its RED tests (i)/(ii) enumerate every build-script
+      # package from a REAL `cargo metadata` and read real vendored
+      # build.rs sources under $CARGO_HOME/registry (round-2 audit finding
+      # 6), which needs an actual toolchain + a fetched registry — gated
+      # behind `if:` so no OTHER leg pays this cost.
+      - name: Rust toolchain (pod build substrate only)
+        if: matrix.name == 'pod build substrate'
+        uses: ./.github/actions/setup-rust-ci
+      - name: Fetch the registry (pod build substrate only)
+        if: matrix.name == 'pod build substrate'
+        run: cargo fetch --locked
       - name: Run guard
         # `continue_on_error` is unset ('') for every leg except "doc
         # numbers have producers" (matrix.continue_on_error: "true" there) —

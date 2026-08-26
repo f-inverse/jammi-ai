@@ -65,6 +65,14 @@ inputs = [
   "rust-toolchain.toml",
   "RUSTFLAGS",
   "CARGO_BUILD_RUSTFLAGS",
+  # CARGO_TARGET_<TRIPLE>_RUSTFLAGS — the per-target-triple RUSTFLAGS
+  # override; the SAME rustflags family as the two above, scoped to one
+  # triple, and independently capable of differing seed-vs-clone. The
+  # scanner's own name-shaped-literal regex truncates this computed name at
+  # the literal prefix (portable-atomic's build.rs builds it via
+  # `format!("cargo:rerun-if-env-changed=CARGO_TARGET_{}_RUSTFLAGS", ...)`),
+  # so the wildcard entry is the truncated prefix itself.
+  "CARGO_TARGET_*",
   "CARGO_INCREMENTAL",
   "CARGO_BUILD_RUSTC_WRAPPER",
 ]
@@ -133,9 +141,110 @@ commands = [
 ]
 assertion = "no `-C target-cpu=native` anywhere in the resolved RUSTFLAGS/CARGO_BUILD_RUSTFLAGS — a native-tuned artifact from the SEED's own build host is not portable seed -> clone across a different pod's CPU."
 
+[cudarc]
+# cudarc (a CUDA-runtime binding crate reachable once jammi-kernels' `cuda`
+# feature is on — `cargo metadata --features jammi-kernels/cuda` is what
+# surfaces it) carries its OWN build.rs, entirely independent of
+# bindgen_cuda's — round-2 audit finding 5's full-enumeration scan is what
+# actually found this; the original 3-file scan (jammi-kernels/jammi-wire/
+# bindgen_cuda only) missed it outright, which is exactly the class this
+# manifest exists to close (a real, previously-unlisted CUDA-toolchain
+# input, not a cosmetic gap).
+source = "vendored (registry) cudarc's own build.rs — two versions are pinned in Cargo.lock (0.17.8, 0.19.8; a diamond dependency), scanned separately since 0.19.8 declares a larger env surface than 0.17.8"
+inputs = [
+  "CUDA_HOME", "CUDA_PATH", "CUDA_ROOT", "CUDA_TOOLKIT_ROOT_DIR", "CUDNN_LIB",
+  "CUDARC_CUDA_VERSION", "CONDA_PREFIX",
+  "CUDNN_MAJOR", "CUDNN_MINOR", "CUDNN_PATH",
+  "CUTENSOR_MAJOR", "CUTENSOR_MINOR", "CUTENSOR_PATH",
+  "NCCL_MAJOR", "NCCL_MINOR",
+]
+
 [non_key]
 # Cargo sets these itself, per invocation, from information the seed/clone
 # distinction cannot change (paths and cardinality derived from the crate
 # graph and cargo's own build plan, not a human-set toggle). A scanner hit on
 # one of these is not a missing manifest entry.
-vars = ["OUT_DIR", "CARGO_MANIFEST_DIR", "CARGO_FEATURE_*", "TARGET", "HOST", "PROFILE", "NUM_JOBS"]
+#
+# The CARGO_CFG_*/CARGO_PKG_* families are wildcards, not enumerated one by
+# one: CARGO_CFG_* reflects `#[cfg(...)]`-shaped state derived entirely from
+# the target triple + RUSTFLAGS/CARGO_BUILD_RUSTFLAGS (already tracked in
+# [cargo]) — a build can only see a DIFFERENT CARGO_CFG_* value if RUSTFLAGS
+# or the triple itself changed, both independently caught. CARGO_PKG_* is
+# Cargo.toml/Cargo.lock-derived package identity (name/version), already
+# tracked via [cargo]'s own Cargo.lock/Cargo.toml inputs. DEP_* is cargo's
+# own `links`-key propagation, deterministic from the (already-tracked)
+# resolved dependency graph, never a human-set toggle.
+#
+# RUSTC/RUSTC_BOOTSTRAP/RUSTC_STAGE/RUSTC_WORKSPACE_WRAPPER/RUSTC_WRAPPER are
+# cargo-internal build-plan variables cargo itself sets when invoking a
+# build script/rustc — RUSTC_WRAPPER specifically is cargo's OWN resolved
+# view of the wrapper setting (whatever [cargo]'s CARGO_BUILD_RUSTC_WRAPPER
+# input already produced), read back by some build scripts for logging —
+# not an independent toggle. CARGO_ENCODED_RUSTFLAGS is RUSTFLAGS itself,
+# shell-encoded by cargo — the SAME already-tracked [cargo] input, not a
+# second one. The exact rustc BINARY identity is separately tracked via
+# [toolchain_identities]'s `rustc -vV`.
+vars = [
+  "OUT_DIR", "CARGO_MANIFEST_DIR", "CARGO_FEATURE_*", "TARGET", "HOST",
+  "PROFILE", "NUM_JOBS", "CARGO_CFG_*", "CARGO_PKG_*", "DEP_*",
+  "CARGO_ENCODED_RUSTFLAGS", "RUSTC", "RUSTC_BOOTSTRAP", "RUSTC_STAGE",
+  "RUSTC_WORKSPACE_WRAPPER", "RUSTC_WRAPPER",
+]
+
+[vendored_non_cuda]
+# Round-2 audit finding 5's full-enumeration scan (every build-script
+# package from `cargo metadata`, not the original 3-file subset) surfaces
+# package-SPECIFIC opt-in customisation toggles for vendored crates that
+# have nothing to do with jammi's CUDA/GPU compilation — none of these can
+# plausibly cause the "cargo says Fresh but the bytes moved" GPU-toolchain
+# hazard this manifest exists to close (they never touch nvcc/CUDA_*/AR/CC
+# paths), so they are accounted for here, by package, rather than pretended
+# individually critical. A NEW literal in one of these packages' build.rs
+# still reddens the scan (this list is closed, not a wildcard) — it is
+# reviewed and added here (or moved to a real key section, if it genuinely
+# turns out to affect toolchain output) on the same terms as any other
+# manifest change.
+bigdecimal = [
+  "RUST_BIGDECIMAL_DEFAULT_PRECISION", "RUST_BIGDECIMAL_DEFAULT_ROUNDING_MODE",
+  "RUST_BIGDECIMAL_FMT_EXPONENTIAL_LOWER_THRESHOLD",
+  "RUST_BIGDECIMAL_FMT_EXPONENTIAL_UPPER_THRESHOLD",
+  "RUST_BIGDECIMAL_FMT_MAX_INTEGER_PADDING", "RUST_BIGDECIMAL_SERDE_SCALE_LIMIT",
+]
+libc = [
+  "RUST_LIBC_UNSTABLE_FREEBSD_VERSION", "RUST_LIBC_UNSTABLE_GNU_FILE_OFFSET_BITS",
+  "RUST_LIBC_UNSTABLE_GNU_TIME_BITS", "RUST_LIBC_UNSTABLE_LINUX_TIME_BITS64",
+  "RUST_LIBC_UNSTABLE_MUSL_V1_2_3", "LIBC_CI", "WIND_RELEASE_ID",
+]
+pyo3_ffi = [
+  "PYO3_PRINT_CONFIG", "PYO3_USE_ABI3_FORWARD_COMPATIBILITY",
+  "UNSAFE_PYO3_SKIP_VERSION_CHECK",
+]
+# Windows-only stub crates — every one of these is inert on the pod's Linux
+# target; the vars gate optional-bundled-library linking on Windows only.
+winapi = ["WINAPI_NO_BUNDLED_LIBRARIES", "WINAPI_STATIC_NOBUNDLE"]
+icu_normalizer_data_and_icu_properties_data = ["ICU4X_DATA_DIR"]
+# usearch's own CPU SIMD dispatch strategy (numkong backend selection) —
+# unrelated to the CUDA/nvcc toolchain this manifest tracks.
+usearch = ["NK_DYNAMIC_DISPATCH", "NK_NATIVE_BF16", "NK_NATIVE_F16", "USEARCH_USE_NUMKONG", "USEARCH_USE_OPENMP"]
+libm = ["ENSURE_NO_PANIC"]
+wasm_bindgen_shared = ["HEAD"]
+rustversion = ["HOST"]
+# A developer escape hatch that forces regenerating substrait's own
+# committed protobuf bindings — unrelated to CUDA/GPU compilation.
+substrait = ["FORCE_REBUILD"]
+# portable-atomic's OWN opt-in "deny warnings" toggle for its build script;
+# unrelated to CUDA/GPU compilation. (Its CARGO_TARGET_*_RUSTFLAGS read is
+# tracked generically in [cargo] instead — a real RUSTFLAGS-family input,
+# not package-specific.)
+portable_atomic_and_portable_atomic_util = ["PORTABLE_ATOMIC_DENY_WARNINGS"]
+
+# Known gap, not silently worked around: the RED-test scan regex is this
+# file's own header spec, `[A-Z][A-Z0-9_]{2,}` (>= 3 total characters) —
+# verbatim what the pod-build-substrate contract states. A 2-CHARACTER env
+# var name (e.g. "AR", read at crates/jammi-kernels/build.rs:208 and :326,
+# and already hand-listed in [jammi_kernels_build_rs] and [cc_1_2_57] above)
+# is therefore INVISIBLE to the automated scan: it can never trigger an
+# "unlisted literal" RED, so a FUTURE 2-character-named env read added
+# without a manifest entry would not be caught by tests (i)/(ii). AR itself
+# is correctly listed today (by hand); this is a scan-coverage gap for names
+# that short, not a known-missing entry.

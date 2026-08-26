@@ -291,6 +291,56 @@ DRV
         ok "(d) a tmux-detached job holds the lock against an outsider for its lifetime"
       fi
       tmux kill-session -t "=${TSESS}" 2>/dev/null
+
+      # Negative control (round-2 audit advisory, ledger row 34's fact): a
+      # LAUNCHER-held flock does NOT protect a tmux job. `tmux new-session
+      # -d` hands the pane's command off to the tmux SERVER, which forks
+      # ITS OWN child to run it — the flock-wrapped LAUNCHER (the client
+      # invocation of `tmux new-session -d ...` itself) is a completely
+      # separate process tree that exits almost immediately once the
+      # server acknowledges the new session, releasing the lock long
+      # before the detached job (still running) is done. This is exactly
+      # why M6 requires the acquisition to happen INSIDE the pane's own
+      # command line (the correct shape, proven above), never by wrapping
+      # the launcher that merely REQUESTS the session.
+      rm -f "$LOCKFILE"
+      TSESS2="jammi-pod-substrate-negtest-$$"
+      tmux kill-session -t "=${TSESS2}" 2>/dev/null
+      # A tmux SERVER must already be running before this leg's own `tmux
+      # new-session -d` client call: with NO server up, that client call
+      # itself FORKS a fresh server as a side effect, and fork() duplicates
+      # the launcher's already-open flock fd into that (long-lived) server
+      # process too — an entirely separate, accidental way the lock could
+      # end up held, unrelated to the mechanism this negative control means
+      # to isolate. A throwaway keepalive session guarantees a warm server,
+      # so the launcher client below is a "thin" client (message an
+      # existing server, exit) with nothing left to inherit its fd.
+      KEEPALIVE="jammi-pod-substrate-keepalive-$$"
+      tmux kill-session -t "=${KEEPALIVE}" 2>/dev/null
+      tmux new-session -d -s "$KEEPALIVE" "sleep 10"
+      sleep 0.3
+      JAMMI_TIMING_LOCK="$LOCKFILE" bash "$LOCK_SH" acquire -n -- \
+        tmux new-session -d -s "$TSESS2" "sleep 5" >/dev/null 2>&1
+      sleep 0.5
+      if JAMMI_TIMING_LOCK="$LOCKFILE" bash "$LOCK_SH" acquire -n -- bash -c 'exit 0' >/dev/null 2>&1; then
+        ok "(d-neg) a LAUNCHER-held flock (wrapping 'tmux new-session -d' itself, not the pane's own command) does NOT protect the detached job — an outsider acquires the lock while the job is still running, confirming the launcher released it the instant the client returned"
+      else
+        bad "(d-neg) expected the launcher-held lock to have ALREADY released (the launcher client returns almost instantly) — an outsider should have acquired it"
+      fi
+      tmux kill-session -t "=${TSESS2}" 2>/dev/null
+      tmux kill-session -t "=${KEEPALIVE}" 2>/dev/null
+
+      # Assert the SHIPPED LAUNCH string shape: gpu-dev.sh's `run --timing`
+      # puts `flock -n -E 75 ...` as the FIRST word of the string handed to
+      # `tmux new-session -d -s SESSION "STRING"` — i.e. INSIDE the pane's
+      # own command, the correct shape the two legs above just contrasted.
+      GPU_DEV_SH="$REPO_ROOT/ci/scripts/gpu-dev.sh"
+      launch_line="$(grep -n '^      LAUNCH="flock -n -E 75' "$GPU_DEV_SH")"
+      if [ -n "$launch_line" ] && printf '%s' "$launch_line" | grep -q "flock -n -E 75 /root/.jammi-timing.lock bash"; then
+        ok "(d-neg) gpu-dev.sh's shipped --timing LAUNCH string puts flock INSIDE the pane's own command (not wrapping the launcher)"
+      else
+        bad "(d-neg) gpu-dev.sh's --timing LAUNCH string shape does not match the expected 'flock -n -E 75 ... bash ...' prefix — got: $launch_line"
+      fi
     else
       if [ "${JAMMI_REQUIRE_LOCK_TEST:-0}" = "1" ]; then
         bad "(d) tmux not found and JAMMI_REQUIRE_LOCK_TEST=1 — a skip here is a RED, not a pass"
@@ -371,6 +421,67 @@ FAKESRC
   unlisted="$(bash "$DRIVER" rerun_only "$FAKE")"
   [ "$unlisted" = "JAMMI_TOTALLY_NEW_VAR" ] && ok "(e-ii) negative control: the rerun-only scanner catches a genuinely unlisted announced var" \
     || bad "(e-ii) negative control FAILED — expected exactly 'JAMMI_TOTALLY_NEW_VAR', got: $unlisted"
+
+  # (e-full) round-2 audit finding 5: the RED test scope is not a
+  # hand-picked 3-file subset — every package with a build script in the
+  # RESOLVED dependency graph (`cargo metadata --features jammi-kernels/cuda`),
+  # cc-dependents allowlisted at the package level (derived from the SAME
+  # metadata graph, never a hardcoded name list). This is what actually
+  # found cudarc — a real, previously-unlisted CUDA-toolchain build.rs the
+  # original 3-file scan never looked at.
+  FULL_DRIVER="$SANDBOX/probe_full_scan.sh"
+  cat > "$FULL_DRIVER" <<DRV
+#!/usr/bin/env bash
+set -uo pipefail
+# shellcheck disable=SC1091
+. "$SEED_TARGET_SH"
+pod_seed_scan_all_vendored_buildrs "$MANIFEST" "\$1"
+DRV
+  chmod +x "$FULL_DRIVER"
+
+  full_out="$(bash "$FULL_DRIVER" all 2>"$SANDBOX/e_full_all.stderr")"
+  full_rc=$?
+  full_summary="$(cat "$SANDBOX/e_full_all.stderr")"
+  if [ "$full_rc" -eq 0 ]; then
+    ok "(e-full-i) every name-shaped literal in EVERY build-script package from cargo metadata is manifest-accounted — ${full_summary#*: }"
+  else
+    bad "(e-full-i) unlisted literal(s) across the full vendored-package enumeration: $full_out ($full_summary)"
+  fi
+
+  full_out="$(bash "$FULL_DRIVER" rerun_only 2>"$SANDBOX/e_full_rerun.stderr")"
+  full_rc=$?
+  full_summary="$(cat "$SANDBOX/e_full_rerun.stderr")"
+  if [ "$full_rc" -eq 0 ]; then
+    ok "(e-full-ii) every rerun-if-env-changed literal across the full vendored-package enumeration is manifest-accounted — ${full_summary#*: }"
+  else
+    bad "(e-full-ii) unlisted rerun-if-env-changed literal(s) across the full vendored-package enumeration: $full_out ($full_summary)"
+  fi
+
+  # Negative control for the FULL scan too: prove it is not vacuously green
+  # because cc-allowlisting (or the enumeration itself) swallows everything.
+  FAKE_PKG_DIR="$SANDBOX/e_fake_pkg"
+  mkdir -p "$FAKE_PKG_DIR"
+  cat > "$FAKE_PKG_DIR/build.rs" <<'FAKESRC'
+fn main() {
+    let _ = std::env::var("SOME_OTHER_UNLISTED_VENDORED_THING");
+}
+FAKESRC
+  FULL_NEG_DRIVER="$SANDBOX/probe_full_scan_neg.sh"
+  cat > "$FULL_NEG_DRIVER" <<DRV
+#!/usr/bin/env bash
+set -uo pipefail
+# shellcheck disable=SC1091
+. "$SEED_TARGET_SH"
+NAMES="\$(mktemp)"
+pod_seed_manifest_names "$MANIFEST" > "\$NAMES"
+pod_seed_scan_source "$FAKE_PKG_DIR/build.rs" "\$NAMES" all
+rm -f "\$NAMES"
+DRV
+  chmod +x "$FULL_NEG_DRIVER"
+  neg_out="$(bash "$FULL_NEG_DRIVER")"
+  [ "$neg_out" = "SOME_OTHER_UNLISTED_VENDORED_THING" ] \
+    && ok "(e-full) negative control: a genuinely unlisted literal in a synthetic vendored-shaped package is still caught (not swallowed by cc-allowlisting/enumeration)" \
+    || bad "(e-full) negative control FAILED — expected exactly 'SOME_OTHER_UNLISTED_VENDORED_THING', got: $neg_out"
 }
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -486,6 +597,234 @@ PY
     ok "(h) zero '/root/jammi-ai' literal sites in dev-gpu-recipes.md"
   else
     bad "(h) expected zero '/root/jammi-ai' sites in dev-gpu-recipes.md, got ${count_recipes}"
+  fi
+}
+
+# ═════════════════════════════════════════════════════════════════════════
+# (i) round-2 audit finding 1: the build-substrate clone (a CARGO_TARGET_DIR)
+# and a tree's own source checkout are DISJOINT directories, so `push --tree`
+# can never delete a `target` clone; the job wrapper wires CARGO_TARGET_DIR
+# to the clone.
+# ═════════════════════════════════════════════════════════════════════════
+{
+  RUNPOD_LIB_SH="$REPO_ROOT/ci/scripts/runpod_lib.sh"
+  RUNPOD_DRIVER="$SANDBOX/probe_runpod_lib.sh"
+  cat > "$RUNPOD_DRIVER" <<DRV
+#!/usr/bin/env bash
+set -uo pipefail
+export RUNPOD_API_KEY=test-dummy-key
+export RP_SESSION_ROOT="$SANDBOX/i_sessions"
+export RP_SSH_CONFIG="$SANDBOX/i_ssh_config"
+mkdir -p "\$RP_SESSION_ROOT"
+# shellcheck disable=SC1091
+. "$RUNPOD_LIB_SH"
+"\$@"
+DRV
+  chmod +x "$RUNPOD_DRIVER"
+
+  tree_dir="$(bash "$RUNPOD_DRIVER" rp_tree_dir mytree)"
+  target_dir="$(bash "$RUNPOD_DRIVER" rp_target_dir mytree)"
+  if [ "$tree_dir" != "$target_dir" ] && [ -n "$tree_dir" ] && [ -n "$target_dir" ]; then
+    ok "(i) rp_tree_dir('mytree')=${tree_dir} and rp_target_dir('mytree')=${target_dir} are disjoint directories"
+  else
+    bad "(i) rp_tree_dir/rp_target_dir did not resolve to disjoint paths (tree=${tree_dir} target=${target_dir})"
+  fi
+  case "$target_dir" in
+    "$tree_dir"/*|"$tree_dir")
+      bad "(i) target_dir (${target_dir}) is nested under tree_dir (${tree_dir}) — a push --delete of the tree would still reach it" ;;
+    *) ok "(i) target_dir is not nested under tree_dir (push --tree's rsync --delete cannot reach it)" ;;
+  esac
+
+  # rp_job_wrapper_lines carries the CARGO_TARGET_DIR export (round-2 audit
+  # finding 1's job-wrapper wiring fix).
+  wrapper_text="$(bash "$RUNPOD_DRIVER" rp_job_wrapper_lines "/root/trees/mytree" "/root/target-mytree" "cargo test")"
+  if printf '%s\n' "$wrapper_text" | grep -qF "export CARGO_TARGET_DIR='/root/target-mytree'"; then
+    ok "(i) rp_job_wrapper_lines emits the CARGO_TARGET_DIR export pointing at the tree's own clone"
+  else
+    bad "(i) rp_job_wrapper_lines did not emit the expected CARGO_TARGET_DIR export — got: $wrapper_text"
+  fi
+  printf '%s\n' "$wrapper_text" | grep -qF "cd '/root/trees/mytree'" \
+    && ok "(i) rp_job_wrapper_lines still cd's into the tree (source), not the target dir" \
+    || bad "(i) rp_job_wrapper_lines did not cd into the tree dir — got: $wrapper_text"
+  printf '%s\n' "$wrapper_text" | grep -qF "cargo test" \
+    && ok "(i) rp_job_wrapper_lines carries the caller's job command verbatim" \
+    || bad "(i) rp_job_wrapper_lines dropped the job command — got: $wrapper_text"
+
+  # gpu-dev.sh's `run` case must build the job wrapper via rp_job_wrapper_lines
+  # (single source, never re-inlined) — a structural check that the wiring
+  # above is actually USED, not merely available.
+  if grep -q 'rp_job_wrapper_lines "\$TREE_DIR" "\$TARGET_DIR" "\$JOB"' "$REPO_ROOT/ci/scripts/gpu-dev.sh"; then
+    ok "(i) gpu-dev.sh's run case builds its job wrapper via rp_job_wrapper_lines"
+  else
+    bad "(i) gpu-dev.sh's run case does not call rp_job_wrapper_lines with (TREE_DIR, TARGET_DIR, JOB)"
+  fi
+
+  # target-then-push composition, end to end, on a LOCAL fixture pod
+  # filesystem (real pod_target_clone.sh, real rsync, real exclude list —
+  # no ssh needed since the mechanism under test is path separation, not
+  # SSH plumbing; ssh is never mocked elsewhere in this suite either).
+  POD_ROOT="$SANDBOX/i_podroot"
+  rm -rf "$POD_ROOT"
+  mkdir -p "$POD_ROOT/seed/release"
+  echo "seed-artifact" > "$POD_ROOT/seed/release/thing"
+  : > "$POD_ROOT/seed.jammi-seed-complete"
+
+  CLONE_DEST="$POD_ROOT/target-mytree"
+  bash "$REPO_ROOT/ci/scripts/pod_target_clone.sh" "$POD_ROOT/seed" "$CLONE_DEST" > "$SANDBOX/i_clone.out" 2>&1
+  clone_rc=$?
+
+  SRC_REPO="$SANDBOX/i_src_repo"
+  rm -rf "$SRC_REPO"; mkdir -p "$SRC_REPO/target"
+  ( cd "$SRC_REPO" && git init -q && git config user.email a@b.c && git config user.name t \
+      && echo hi > tracked.txt && echo junk > target/junk && git add tracked.txt && git commit -q -m init )
+
+  TREE_DEST="$POD_ROOT/trees/mytree"
+  mkdir -p "$(dirname "$TREE_DEST")"
+  EXCLUDE_ARGS=()
+  while IFS= read -r pat; do
+    [ -n "$pat" ] || continue
+    EXCLUDE_ARGS+=(--exclude "$pat")
+  done < <(bash "$REPO_ROOT/ci/scripts/pod_push_stamp.sh" excludes)
+  rsync -azc --no-times --delete "${EXCLUDE_ARGS[@]}" "$SRC_REPO/" "$TREE_DEST/" > "$SANDBOX/i_push.out" 2>&1
+  push_rc=$?
+
+  if [ "$clone_rc" -eq 0 ] && [ "$push_rc" -eq 0 ] && [ -f "$CLONE_DEST/release/thing" ] \
+     && [ "$(cat "$CLONE_DEST/release/thing")" = "seed-artifact" ] && [ -f "$TREE_DEST/tracked.txt" ]; then
+    ok "(i) target-then-push composition: the clone at ${CLONE_DEST} SURVIVES a subsequent push --tree into the disjoint ${TREE_DEST}"
+  else
+    bad "(i) target-then-push composition failed (clone_rc=$clone_rc push_rc=$push_rc); clone: $(cat "$SANDBOX/i_clone.out"); push: $(cat "$SANDBOX/i_push.out")"
+  fi
+}
+
+# ═════════════════════════════════════════════════════════════════════════
+# (j) round-2 audit finding 2: pod_seed_target.sh's failure arm — a REAL
+# subshell (not a `{ }` group whose internal `exit` kills the whole
+# script), the FAILED marker + log tail, and EITHER-marker gating.
+# ═════════════════════════════════════════════════════════════════════════
+{
+  SEED_SANDBOX="$SANDBOX/j_seed"
+  rm -rf "$SEED_SANDBOX"
+  mkdir -p "$SEED_SANDBOX/tree"
+  ( cd "$SEED_SANDBOX/tree" && git init -q -b main && git config user.email a@b.c && git config user.name t \
+      && echo x > f.txt && git add f.txt && git commit -q -m init )
+
+  FAIL_STUBBIN="$SANDBOX/j_bin_fail"
+  mkdir -p "$FAIL_STUBBIN"
+  CARGO_CALLS="$SANDBOX/j_cargo_calls"
+  : > "$CARGO_CALLS"
+  cat > "$FAIL_STUBBIN/cargo" <<CARGOSTUB
+#!/usr/bin/env bash
+echo "\$*" >> "$CARGO_CALLS"
+echo "simulated T1 failure" >&2
+exit 1
+CARGOSTUB
+  chmod +x "$FAIL_STUBBIN/cargo"
+
+  JDRIVER="$SANDBOX/probe_seed_fail.sh"
+  cat > "$JDRIVER" <<DRV
+#!/usr/bin/env bash
+set -uo pipefail
+export PATH="$FAIL_STUBBIN:\$PATH"
+export JAMMI_SEED_DIR="$SEED_SANDBOX/seed"
+export JAMMI_TREE_DIR="$SEED_SANDBOX/tree"
+export JAMMI_SEED_MANIFEST="$REPO_ROOT/ci/scripts/pod_seed_key_inputs.toml"
+# shellcheck disable=SC1091
+. "$REPO_ROOT/ci/scripts/pod_seed_target.sh"
+pod_seed_target_main --no-lock "\$@"
+DRV
+  chmod +x "$JDRIVER"
+
+  out1="$(bash "$JDRIVER" 2>&1)"
+  rc1=$?
+  FAILED_MARKER_PATH="${SEED_SANDBOX}/seed.jammi-seed-failed"
+  if [ "$rc1" -ne 0 ]; then
+    ok "(j) a T1 failure returns non-zero (rc=$rc1) — the failure arm is REACHABLE, not dead code behind a killed script"
+  else
+    bad "(j) expected non-zero exit on a simulated T1 failure, got rc=$rc1"
+  fi
+  if [ -f "$FAILED_MARKER_PATH" ] && grep -q "seed build FAILED" "$FAILED_MARKER_PATH"; then
+    ok "(j) .jammi-seed-failed marker is written with a log tail after the failure"
+  else
+    bad "(j) .jammi-seed-failed marker missing or malformed after the failure"
+  fi
+  printf '%s' "$out1" | grep -q "seed build FAILED" \
+    && ok "(j) the failure's log tail is printed to stdout" \
+    || bad "(j) the failure's log tail was not printed to stdout — got: $out1"
+
+  calls_after_first="$(wc -l < "$CARGO_CALLS" | tr -d ' ')"
+  out2="$(bash "$JDRIVER" 2>&1)"
+  rc2=$?
+  calls_after_second="$(wc -l < "$CARGO_CALLS" | tr -d ' ')"
+  if [ "$rc2" -ne 0 ] && [ "$calls_after_second" = "$calls_after_first" ]; then
+    ok "(j) a second invocation WITHOUT --reseed refuses (rc=$rc2) and does not re-invoke cargo (gated on EITHER marker, not just COMPLETE)"
+  else
+    bad "(j) second invocation should have refused without retrying cargo (rc=$rc2, cargo calls ${calls_after_first}->${calls_after_second})"
+  fi
+  printf '%s' "$out2" | grep -qi "previously FAILED" \
+    && ok "(j) the refusal names the prior failure, not a generic error" \
+    || bad "(j) the refusal did not name the prior failure — got: $out2"
+}
+
+# ═════════════════════════════════════════════════════════════════════════
+# (k) round-2 audit finding 4: the --no-lock re-exec passes an ARRAY, never
+# a quoted conditional-empty-string — the documented default invocation (no
+# --reseed) must not die on "unknown argument ''". Requires real flock
+# (same gate as (d)); JAMMI_SEED_DRY_RUN short-circuits before any git/cargo
+# work so this is still hermetic and fast.
+# ═════════════════════════════════════════════════════════════════════════
+{
+  if ! command -v flock >/dev/null 2>&1; then
+    if [ "${JAMMI_REQUIRE_LOCK_TEST:-0}" = "1" ]; then
+      bad "(k) flock not found and JAMMI_REQUIRE_LOCK_TEST=1 — a skip here is a RED, not a pass"
+    else
+      skip "(k) flock not found on this host — the re-exec dry-run test is skipped"
+    fi
+  else
+    KDRIVER="$SANDBOX/probe_seed_dryrun.sh"
+    cat > "$KDRIVER" <<DRV
+#!/usr/bin/env bash
+set -uo pipefail
+export JAMMI_TIMING_LOCK="$SANDBOX/k.lock"
+export JAMMI_SEED_DIR="$SANDBOX/k_seed"
+export JAMMI_TREE_DIR="$SANDBOX/k_tree"
+export JAMMI_SEED_DRY_RUN=1
+export JAMMI_SEED_LOCK_WAIT_SECS=5
+# shellcheck disable=SC1091
+. "$REPO_ROOT/ci/scripts/pod_seed_target.sh"
+pod_seed_target_main
+DRV
+    chmod +x "$KDRIVER"
+    rm -f "$SANDBOX/k.lock"
+    out="$(bash "$KDRIVER" 2>&1)"
+    rc=$?
+    if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "dry-run: args parsed OK"; then
+      ok "(k) the documented default invocation (no args) re-execs through pod_timing_lock.sh and reaches the inner script with no argument-parsing error"
+    else
+      bad "(k) the default (no-args) re-exec path failed (rc=$rc): $out"
+    fi
+
+    # Negative control: pod_seed_target.sh's own arg loop genuinely REJECTS
+    # an empty-string argument (`*) echo "::error::unknown argument..."`) —
+    # confirming why the OLD `"$(cond && echo --reseed)"` shape (which
+    # passes exactly one empty-string arg when cond is false) was fatal on
+    # the documented default invocation, and that the array fix above
+    # removed a REAL failure mode, not a hypothetical one.
+    NEG_DRIVER="$SANDBOX/probe_seed_argloop_neg.sh"
+    cat > "$NEG_DRIVER" <<DRV
+#!/usr/bin/env bash
+set -uo pipefail
+# shellcheck disable=SC1091
+. "$REPO_ROOT/ci/scripts/pod_seed_target.sh"
+pod_seed_target_main --no-lock ""
+DRV
+    chmod +x "$NEG_DRIVER"
+    neg_out="$(bash "$NEG_DRIVER" 2>&1)"
+    neg_rc=$?
+    if [ "$neg_rc" -eq 2 ] && printf '%s' "$neg_out" | grep -q "unknown argument ''"; then
+      ok "(k) negative control: passing a literal empty-string argument (what the OLD quoted shape produced) is genuinely rejected by the arg loop — the array fix removes a real failure mode"
+    else
+      bad "(k) negative control did not reproduce the empty-string rejection (rc=$neg_rc): $neg_out"
+    fi
   fi
 }
 

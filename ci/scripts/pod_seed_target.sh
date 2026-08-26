@@ -16,10 +16,13 @@
 # third-party artifacts, and every workspace-member artifact from building
 # them is then swept by the member-free clean below):
 #   T1  cargo build --release -p jammi-bench --features cuda
-#       (+ --features cuda,jammi-encoders/flash-attn once, ONLY when the pod's
-#        checkout is on `main` — flash-attn additionally compiles the vendored
-#        FlashAttention-2 CUTLASS kernels, real nvcc minutes, so it is not
-#        paid on every branch's seed)
+#       (+ --features cuda,jammi-kernels/flash-attn once, ONLY when the pod's
+#        checkout is on `main` AND jammi-kernels actually declares a
+#        flash-attn feature (detected live via `cargo metadata`, never
+#        hand-asserted — see pod_seed_pkg_has_feature) — flash-attn
+#        additionally compiles the vendored FlashAttention-2 CUTLASS
+#        kernels, real nvcc minutes, so it is not paid on every branch's
+#        seed)
 #   T2  cargo test --no-run for the exact crates/features
 #       runpod_gpu_prove.sh's own suites use (kept in lockstep with that
 #       script by naming the same -p/--features/--test here)
@@ -154,15 +157,135 @@ pod_seed_check_stdout_subset() { # $1=capture-dir $2=manifest-toml
 
 # Copy every build script's captured stdout out of the seed BEFORE cleaning —
 # cargo's own cleaner removes `build/<pkg>-*/output` along with the rest of
-# `build/`, so this is the only chance to read it.
-pod_seed_capture_build_output() { # $1=seed target dir $2=dest capture dir $3=profile label
+# `build/`, so this is the only chance to read it. $3 is the ACTUAL profile
+# subdirectory name (debug|release) — the glob is scoped to exactly that
+# subtree, never a `*` at that position: an unscoped `*/build/*/output`
+# glob matches BOTH debug/ and release/ regardless of which profile_label
+# the caller passed, so two calls (one per profile) would each capture the
+# SAME full (debug+release) file set under two differently-labelled copies
+# — duplicated content, never a genuine per-profile split. Caught by
+# inspection (audit-round 2 advisory), not by a fixture that only ever saw
+# one profile's build directory.
+pod_seed_capture_build_output() { # $1=seed target dir $2=dest capture dir $3=profile subdir (debug|release)
   local seed="$1" dest="$2" profile_label="$3" d base
   mkdir -p "$dest"
-  for d in "$seed"/*/build/*/output; do
+  for d in "$seed/$profile_label"/build/*/output; do
     [ -f "$d" ] || continue
     base="$(basename "$(dirname "$d")")"
     cp "$d" "$dest/${profile_label}__${base}.output"
   done
+}
+
+# Detects, rather than assumes, whether <pkg> declares a feature named
+# <feature> — read live from `cargo metadata`, never hand-asserted. This is
+# what T1b's flash-attn leg (below) and pod_build_timings.sh's own FA2 leg
+# both gate on: `--features cuda,jammi-encoders/flash-attn` was wrong on its
+# face (jammi-encoders declares no such feature; flash-attn lives on
+# jammi-kernels, forwarded through jammi-bench's own direct dependency on
+# it) — a hardcoded feature PATH string is exactly the kind of assumption
+# that silently rots when a feature moves crates; detecting it converts that
+# rot into "T1b skipped" instead of "the default pod's seed always fails".
+# Returns 0 (declared) / 1 (not declared, or the metadata query itself
+# failed — fail CLOSED to "skip the optional leg", never to "assume it's
+# there and hard-fail the whole seed").
+pod_seed_pkg_has_feature() { # $1=pkg $2=feature
+  cargo metadata --frozen --format-version 1 2>/dev/null | python3 -c '
+import sys, json
+pkg, feat = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+for p in d.get("packages", []):
+    if p["name"] == pkg:
+        sys.exit(0 if feat in (p.get("features") or {}) else 1)
+sys.exit(1)
+' "$1" "$2"
+}
+
+# RED tests (i)/(ii), FULL scope (round-2 audit finding 5): every package
+# with a build script in the RESOLVED dependency graph — not a hand-picked
+# subset of three files. `--features jammi-kernels/cuda` brings bindgen_cuda
+# (a build-DEPENDENCY consumed from inside jammi-kernels' own build.rs, so
+# it carries no `custom-build` target of its own and is scanned separately,
+# see the caller) and cudarc (which DOES carry its own build.rs, and reads
+# CUDA_HOME/CUDA_PATH/CUDA_ROOT/CUDA_TOOLKIT_ROOT_DIR/CUDNN_LIB/
+# CUDARC_CUDA_VERSION/CONDA_PREFIX — a real, previously-unlisted CUDA-toolchain
+# input this full enumeration is what actually catches) into the graph.
+#
+# A package is "cc-allowlisted" — its OWN build.rs literals are skipped,
+# never individually scanned — IFF it depends on the `cc` crate, checked
+# from THIS SAME metadata graph (never a hardcoded package-name list, so a
+# newly-added cc-based dependency is covered automatically): such a
+# package's build.rs typically just calls `cc::Build::new()...compile()`,
+# and its literals are C preprocessor macro / `#[cfg(...)]` names `cc`
+# itself consumes (`Build::define()`), not env reads — cc's OWN env surface
+# is [cc_1_2_57] in the manifest, hand-enumerated separately (see that
+# section's own citation for why it cannot be scanned mechanically).
+#
+# Prints "<name> (from <pkg>)" per unlisted literal, and a one-line
+# "<N> package(s) individually scanned, <M> cc-allowlisted" summary to
+# stderr (what a RED test reports as its scanned count).
+pod_seed_scan_all_vendored_buildrs() { # $1=manifest-toml $2=mode(all|rerun_only)
+  local manifest="$1" mode="$2" names_file bad=0 scanned=0 allowlisted=0
+  names_file="$(mktemp)"
+  pod_seed_manifest_names "$manifest" > "$names_file"
+
+  local meta; meta="$(cargo metadata --frozen --format-version 1 --features jammi-kernels/cuda 2>/dev/null)"
+  if [ -z "$meta" ]; then
+    # Self-heal once (round-2 audit finding 6): a bare/fresh checkout with
+    # no registry fetch yet is the ordinary shape on a maintainer's machine
+    # or a CI runner that skipped the fetch step — `cargo fetch --locked`
+    # is offline-safe to attempt (it only pulls what Cargo.lock already
+    # pins) and cheap when already warm. Fail loudly, naming the real cause,
+    # only if the retry ALSO comes up empty.
+    echo "cargo metadata produced no output — attempting 'cargo fetch --locked' once, then retrying" >&2
+    cargo fetch --locked >&2 2>&1
+    meta="$(cargo metadata --frozen --format-version 1 --features jammi-kernels/cuda 2>/dev/null)"
+  fi
+  if [ -z "$meta" ]; then
+    echo "::error::cargo metadata produced no output even after 'cargo fetch --locked' — is a Rust toolchain on PATH?" >&2
+    rm -f "$names_file"
+    return 2
+  fi
+
+  while IFS=$'\t' read -r pkg src_path is_cc; do
+    [ -n "$pkg" ] || continue
+    case "$pkg" in jammi-kernels|jammi-wire) continue ;; esac
+    if [ "$is_cc" = "1" ]; then
+      allowlisted=$((allowlisted + 1))
+      continue
+    fi
+    scanned=$((scanned + 1))
+    if [ ! -f "$src_path" ]; then
+      echo "::error::build.rs for ${pkg} not found at ${src_path}" >&2
+      bad=1
+      continue
+    fi
+    while IFS= read -r unlisted; do
+      [ -n "$unlisted" ] || continue
+      echo "${unlisted} (from ${pkg})"
+      bad=1
+    done < <(pod_seed_scan_source "$src_path" "$names_file" "$mode")
+  done < <(printf '%s' "$meta" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+# Keyed by src_path (not bare name): Cargo.lock can legitimately pin TWO
+# different versions of the same crate (a diamond dependency) with
+# DIFFERENT build.rs content (cudarc 0.17.8 vs 0.19.8 in this graph carry
+# different env surfaces) — a name-keyed dict silently drops every version
+# but the last one iterated, scanning less than the real graph.
+seen = {}
+for p in d["packages"]:
+    for t in p.get("targets", []):
+        if t.get("kind") == ["custom-build"]:
+            seen[t["src_path"]] = (p["name"], set(dd["name"] for dd in p.get("dependencies", [])))
+for src, (name, deps) in sorted(seen.items()):
+    print("%s\t%s\t%s" % (name, src, "1" if "cc" in deps else "0"))
+')
+  echo "vendored scan (mode=${mode}): ${scanned} package(s) individually scanned, ${allowlisted} cc-allowlisted" >&2
+  rm -f "$names_file"
+  return "$bad"
 }
 
 # ── the real seed build (main) ──────────────────────────────────────────────
@@ -177,24 +300,65 @@ pod_seed_target_main() {
   done
 
   if [ "$no_lock" != "1" ]; then
+    # An ARRAY, never a quoted `"$(cond && echo --reseed)"` — the quoted
+    # form passes an EMPTY-STRING argument (not "no argument") whenever
+    # reseed=0, and pod_seed_target.sh's own arg loop then rejects it as
+    # "unknown argument ''" — dead code on the documented default
+    # invocation (no --reseed) AND on the -w lock path, since that IS the
+    # re-exec (round-2 audit finding 4). An array with nothing pushed
+    # expands to zero words, exactly "no argument" when reseed=0.
+    local -a reseed_args=()
+    [ "$reseed" = "1" ] && reseed_args=(--reseed)
     JAMMI_TIMING_LABEL="seed" JAMMI_TIMING_JOB="seed" \
       exec "$DIR/pod_timing_lock.sh" acquire -w "$JAMMI_SEED_LOCK_WAIT_SECS" -- \
         env JAMMI_SEED_DIR="$JAMMI_SEED_DIR" JAMMI_TREE_DIR="$JAMMI_TREE_DIR" \
-        "$DIR/pod_seed_target.sh" --no-lock "$([ "$reseed" = 1 ] && echo --reseed)"
+        "$DIR/pod_seed_target.sh" --no-lock "${reseed_args[@]}"
   fi
 
+  # A dry run parses args + (when --no-lock is absent) re-execs through the
+  # lock exactly like a real invocation, then stops here — before touching
+  # git/cargo — so the re-exec's own argv shape (the fix above) is testable
+  # hermetically without a real build. Never set in production.
+  if [ "${JAMMI_SEED_DRY_RUN:-0}" = "1" ]; then
+    echo "dry-run: args parsed OK (reseed=${reseed} no_lock=${no_lock}) — real build skipped"
+    return 0
+  fi
+
+  # Gate on EITHER marker (contract: `--reseed` overrides). A FAILED marker
+  # left un-checked here let `shell`/`up` silently RETRY a known-broken seed
+  # build on every single invocation (start_seed_build runs unconditionally
+  # after bootstrap) — burning real compile minutes each time instead of
+  # surfacing "this needs a human to look at it, or --reseed" once.
   if [ "$reseed" != "1" ] && [ -f "$COMPLETE_MARKER" ]; then
     echo "seed already complete ($COMPLETE_MARKER) — nothing to do (--reseed to force)"
     return 0
   fi
+  if [ "$reseed" != "1" ] && [ -f "$FAILED_MARKER" ]; then
+    echo "seed previously FAILED ($FAILED_MARKER) — not retrying automatically (--reseed to force); log tail:"
+    tail -20 "$FAILED_MARKER"
+    return 1
+  fi
   rm -f "$FAILED_MARKER"
 
-  local log; log="$(mktemp)"
-  {
-    set -uo pipefail
+  local log rc
+  log="$(mktemp)"
+  # A REAL SUBSHELL `( )`, never a `{ }` group: a group runs in THIS SAME
+  # process, so `exit 1` inside it (every build step below) would kill the
+  # WHOLE SCRIPT immediately — skipping `rc=$?`, the FAILED_MARKER writer,
+  # and the log-tail print entirely (the failure arm was dead code; round-2
+  # audit finding 2). A subshell's `exit` only ends the subshell, leaving
+  # its exit status in `$?` for the line right after `)` to read. `rc` is
+  # declared `local` BEFORE the subshell runs (not combined with the
+  # capture, and nothing else executes between the subshell and `rc=$?`) —
+  # `local rc=$?` on one line, or `local rc` immediately after the group,
+  # both read `$?` from the WRONG command (the `local` builtin's own always-
+  # 0 success, not the build's real status) — the exact defect this
+  # shape avoids.
+  (
+    set -euo pipefail
     cd "$JAMMI_TREE_DIR" || { echo "no tree at $JAMMI_TREE_DIR"; exit 1; }
-    local sha ref; sha="$(git rev-parse HEAD)"; ref="$(git rev-parse --abbrev-ref HEAD)"
-    local capture; capture="$(mktemp -d)"
+    sha="$(git rev-parse HEAD)"; ref="$(git rev-parse --abbrev-ref HEAD)"
+    capture="$(mktemp -d)"
 
     export CARGO_TARGET_DIR="$JAMMI_SEED_DIR"
     export CARGO_INCREMENTAL=0
@@ -202,9 +366,11 @@ pod_seed_target_main() {
 
     echo "=== T1: release -p jammi-bench --features cuda ==="
     cargo build --release -p jammi-bench --features cuda || exit 1
-    if [ "$ref" = "main" ]; then
-      echo "=== T1b (main only): release -p jammi-bench --features cuda,jammi-encoders/flash-attn ==="
-      cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn || exit 1
+    if [ "$ref" = "main" ] && pod_seed_pkg_has_feature jammi-kernels flash-attn; then
+      echo "=== T1b (main only): release -p jammi-bench --features cuda,jammi-kernels/flash-attn ==="
+      cargo build --release -p jammi-bench --features cuda,jammi-kernels/flash-attn || exit 1
+    elif [ "$ref" = "main" ]; then
+      echo "=== T1b skipped: jammi-kernels declares no flash-attn feature (cargo metadata) ==="
     fi
 
     echo "=== T2: cargo test --no-run for runpod_gpu_prove.sh's own suites ==="
@@ -261,12 +427,17 @@ print(json.dumps({
 ' "$ref" "$sha" "$(date -u +%FT%TZ)" "${RUSTFLAGS:-}" "${size_bytes:-0}" "${manifest_sha256:-}" \
       > "$COMPLETE_MARKER"
     echo "=== seed complete: $COMPLETE_MARKER ==="
-  } > "$log" 2>&1
-  local rc
+  ) > "$log" 2>&1
   rc=$?
   if [ "$rc" != 0 ]; then
     { echo "seed build FAILED (exit $rc) — log tail:"; tail -100 "$log"; } > "$FAILED_MARKER"
     cat "$log"
+    # The marker's own "seed build FAILED" framing is ALSO echoed to stdout
+    # (not just the raw captured build log above) — a human or CI log
+    # watching this in real time sees the failure verdict immediately,
+    # rather than having to notice the last compiler line never said
+    # "complete".
+    echo "seed build FAILED (exit $rc) — see $FAILED_MARKER for the full tail"
     rm -f "$log"
     return "$rc"
   fi

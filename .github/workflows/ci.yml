@@ -613,6 +613,21 @@ jobs:
           # the single `ci-summary` gate covers it.
           - name: doc↔enum parity
             cmd: python3 ci/scripts/check_doc_parity.py
+          # Every measurement-shaped number (an N/M element count, an X%/X.Y%,
+          # a bare cosine adjacent to {cosine, mismatch, elements, ceiling,
+          # bit-match, diverg}) in a kernel/test doc comment or assert!
+          # message under crates/jammi-{kernels,encoders,lora,bench} must cite
+          # what produced it (`see <fn>` / `printed by <fn>` / `measured by
+          # <path>`, or an explicit `no-producer:` opt-out for a genuinely
+          # derived constant) — closes the class where a precise-looking
+          # number reads as evidence but nothing in the tree actually computes
+          # it (see docs/maintainer/cuda-kernel-guide.md §3.9). A committed,
+          # only-shrinks allowlist (ci/doc_number_allowlist.txt) carries the
+          # pre-existing debt on main at the time this gate landed.
+          - name: doc numbers have producers
+            cmd: python3 ci/scripts/check_doc_numbers_have_producers.py
+          - name: doc numbers have producers self-test
+            cmd: python3 ci/scripts/check_doc_numbers_have_producers.py --self-test
           # GPU-parity coverage-completeness guard — the device-axis analog of
           # the required Postgres/SQLite backend it-matrix. It enumerates every
           # SHIPPED (encoder architecture × GPU-dispatching ModelTask verb)

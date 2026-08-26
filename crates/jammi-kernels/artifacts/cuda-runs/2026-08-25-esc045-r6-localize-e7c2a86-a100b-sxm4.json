@@ -1,0 +1,150 @@
+{
+  "schema_version": 1,
+  "unit": "esc-045 round 6 -- localization (E3/E4/E5/E6), GH #374",
+  "git_sha": "e7c2a86944ba9c6eced8e436e866713733c72f69",
+  "git_sha_short": "e7c2a86",
+  "branch": "scratch/esc045-r6-localize",
+  "branch_base": "origin/perf/p6-fa2-dense@0f1a31a3189e96794d7bacc90154a56794ca0acb",
+  "cherry_picks": [
+    {"sha": "725d116", "full": "725d1164da2b95f60ea7cd0aca10ecbde7fb4a8e", "title": "test(encoders): esc-045 round 5 -- seed-and-save the shared LoRA weights round 4/5 arms load"},
+    {"sha": "5d3716a", "title": "test(encoders): esc-045 round 4 -- per-layer activation-gradient localization for the bf16 fused-backward defect"}
+  ],
+  "round6_commits_on_top": [
+    {"sha": "5996438", "title": "test(encoders): esc-045 round 6 -- seed-and-save uses Gaussian LoRA init, not ZerosB"},
+    {"sha": "e7c2a86", "title": "fix(encoders),test(bench): esc-045 round 6 -- restore E2 f32-logit upcast diagnostic; torch-side per-layer/sub-layer dump + numpy comparator"}
+  ],
+  "box": "jammi-a100b (SXM4)",
+  "gpu": "NVIDIA A100-SXM4-80GB",
+  "driver_version": "580.126.16",
+  "nvcc_version": "12.6.85 (cuda_12.6.r12.6/compiler.35059454_0)",
+  "rustc_version": "1.94.0 (4a4ef493e 2026-03-02)",
+  "torch_venv": "/root/jammi-ai/.venv-torch-ref: torch 2.13.0+cu130, transformers 5.15.1, peft 0.20.0",
+  "status": "PARTIAL -- b4-s128 complete and cross-validated end to end; b8-s512 NOT run this round (time budget; see blockers). E5 sub-layer bisect complete on the TORCH side (8 points x 28 layers, both bf16-eager and f32); jammi-side sub-layer bisect only at the 2 points the EXISTING round-4 GradTap already exposes (qkv = after Wqkv, mlp_input = after the mid-layer residual add) -- extending jammi's own GradTap to the remaining 6 sub-layer points (after attn_norm, after attention/Wo, after mlp_norm, after Wi, after GeGLU, after Wo) was not built this round.",
+  "producer": {
+    "jammi_grad_oracle": "crates/jammi-bench/src/grad_oracle.rs via `jammi-bench grad-oracle` (release, --features cuda[,jammi-encoders/flash-attn])",
+    "jammi_layer_dump": "crates/jammi-encoders/src/modernbert.rs::tests::esc045_round4_per_layer_activation_gradient_dump (release --features cuda[,flash-attn])",
+    "jammi_lora_seed": "crates/jammi-encoders/src/modernbert.rs::tests::esc045_round5_seed_shared_lora_weights, patched round 6 to LoraInitMode::Gaussian (not ZerosB)",
+    "torch_grad_oracle": "crates/jammi-bench/reference/torch_grad_oracle.py",
+    "torch_layer_dump": "crates/jammi-bench/reference/torch_round6_layer_dump.py (new this round)",
+    "comparator_e4": "ci/scripts/perf/compare_grad_oracle.py --cosine-floor 0.6 --num-layers 28 --hidden-size 1024",
+    "comparator_e3_e5": "crates/jammi-bench/reference/round6_layer_compare.py (new this round, numpy-first, family F)"
+  },
+  "shared_config": {
+    "checkpoint": "ModernBERT-large (/root/checkpoints/ModernBERT-large)",
+    "num_hidden_layers": 28,
+    "hidden_size": 1024,
+    "num_attention_heads": 16,
+    "intermediate_size": 2624,
+    "lora_rank": 16,
+    "lora_alpha": 32.0,
+    "lora_target_modules": ["Wqkv", "Wo", "Wi"],
+    "lora_dropout": 0.0,
+    "lora_init": "Gaussian (A and B both drawn Normal(0, 0.02)) -- NOT ZerosB. ZerosB makes dL/dA identically zero at a fresh forward (grad_oracle.rs's own 'Structural limitation' doc) and makes the LoRA epilogue's forward contribution the exact zero tensor; round 6 needs both A and B gradients live and a nonzero epilogue addition.",
+    "shared_lora_weights_file": "seeded once via esc045_round5_seed_shared_lora_weights (seed 42, Gaussian), loaded by every arm below via --lora-weights-in / JAMMI_ROUND4_LORA_WEIGHTS_IN so every arm trains from IDENTICAL LoRA A/B values",
+    "seed": 42,
+    "shape_b4s128": {"batch": 4, "seq": 128},
+    "shape_b8s512": "NOT RUN this round -- see status"
+  },
+  "cross_stack_validation": {
+    "description": "Before trusting any comparison, jammi and torch were run at F32 (no bf16 anywhere) on the IDENTICAL synthetic tokens (jammi's round4_synthetic_ids, a SplitMix64/PCG generator, bit-ported to Python in torch_round6_layer_dump.py -- NOT torch_finetune_step.synthetic_ids, a different LCG) and the IDENTICAL shared Gaussian LoRA weights. Two independent stacks (candle vs torch) computing the same forward+backward should agree to f32 rounding.",
+    "smoke_b1s8_f32_loss": {"jammi": 8157.9307, "torch": 8157.9296875},
+    "production_b4s128_f32_loss_L2_sum_hidden_sq": {"jammi": 473200.6, "torch": 473200.875},
+    "production_b4s128_f32_triplet_hinge_loss": {"jammi": 0.2944929, "torch": 0.2944929003715515},
+    "E4_jammi_f32_vs_torch_f32_full_gradient_cosine": 0.9999999350079746,
+    "E3_jammi_f32_vs_torch_f32_boundary_cosine_1_18_mean": 0.9999999476459362,
+    "E3_jammi_f32_vs_torch_f32_boundary_cosine_19_28_mean": 0.9999999985818725,
+    "verdict": "Harness validated: matches to 7 significant figures at both smoke and production shape, on two independent gradient axes (full trainable-weight vector AND per-layer activation-gradient boundary). Every comparison below rests on this validated base."
+  },
+  "E4_headline_full_trainable_gradient_cosine_matrix": {
+    "description": "cosine of the FULL 224-tensor (7,196,672-param) concatenated trainable LoRA-gradient vector (dL/dA, dL/dB for every layer x {Wqkv,Wo,Wi,mlp.Wo}), one forward+backward, NO optimizer step. vacuous_tensor_count=0 in every comparison below (Gaussian init keeps dL/dA live, unlike round 4/5's ZerosB legs).",
+    "jammi_arms_x_torch_arms": {
+      "jammi_block_fused_bf16": {"vs_torch_eager_bf16": 0.7905992316631609, "vs_torch_sdpa_bf16": 0.7264124708319494, "vs_torch_f32": 0.6099098117117528},
+      "jammi_flash_bf16":       {"vs_torch_eager_bf16": 0.7480534690969856, "vs_torch_sdpa_bf16": 0.8029325758163556, "vs_torch_f32": 0.7899165867339843},
+      "jammi_block_eager_bf16": {"vs_torch_eager_bf16": 0.8951033172498074, "vs_torch_sdpa_bf16": 0.8389739927964004, "vs_torch_f32": 0.8100459329986882},
+      "jammi_f32":              {"vs_torch_eager_bf16": 0.7956541320953485, "vs_torch_sdpa_bf16": 0.7196976093218701, "vs_torch_f32": 0.9999999350079746}
+    },
+    "jammi_arms_vs_jammi_f32_truth": {
+      "jammi_block_fused_bf16": 0.6098268554357086,
+      "jammi_flash_bf16": 0.7899859367510587,
+      "jammi_block_eager_bf16": 0.8100927710946351
+    },
+    "torch_arms_vs_torch_f32_truth": {
+      "torch_eager_bf16": 0.7956434684407352,
+      "torch_sdpa_bf16": 0.7196513859057813
+    },
+    "loss_values_b4s128": {
+      "jammi_block_fused_bf16": 0.29296875,
+      "jammi_block_eager_bf16": 0.31640625,
+      "jammi_flash_bf16": 0.28515625,
+      "jammi_f32": 0.2944929,
+      "torch_eager_bf16": 0.294921875,
+      "torch_sdpa_bf16": 0.29296875,
+      "torch_f32": 0.2944929003715515
+    },
+    "dispatch_confirmation": {
+      "block_fused_run": "attention_block_fused_dispatches=28, attention_block_eager_dispatches=0",
+      "block_eager_run": "every *_fused_dispatches=0, every *_eager_dispatches nonzero (ln=57, rope=56, softmax=28, geglu=28, lora_linear=112, attention_block=28)",
+      "flash_run": "run under JAMMI_KERNELS_STRICT=1, nothing disabled; guide 3.5 zero-dispatch-is-RED confirmation: disabling ONLY attention_block_fused under the SAME flash binary reproduced the IDENTICAL loss (0.28515625) with kernels_disabled_fired=[] -- attention_block_fused was never reached, so attention_block_flash is what dispatched for all 28 layers"
+    },
+    "headline_finding": "On the metric that actually drives the optimizer update (the WEIGHT-gradient direction), jammi's PRODUCTION DEFAULT bf16 arm (block-fused) has the WORST agreement with jammi's own f32 truth (cos=0.610) of the three bf16 arms measured -- worse than jammi's flash arm (0.790, almost exactly at torch's own inherent bf16 noise ceiling of 0.796) and worse than jammi's fully-decomposed eager arm (0.810, which slightly exceeds torch's own bf16 ceiling). jammi_f32 vs torch_f32 = 0.9999999 confirms jammi_f32 and torch_f32 are the SAME ground truth to within f32 rounding, so torch_eager_vs_torch_f32 (0.796) is a valid, independent calibration of 'ordinary bf16 noise at this scale' -- block-fused sits clearly BELOW that calibration; flash and eager sit AT or slightly ABOVE it."
+  },
+  "E3_per_layer_activation_gradient_boundary_table": {
+    "description": "boundary.{1..28} = dL/d(output of encoder layer i), captured via jammi's GradTap (activation_capture::tap_boundary, existing round-4 instrumentation) and via torch's register_full_backward_hook on model.base_model.model.layers[i-1] (torch_round6_layer_dump.py, new this round). Noise calibration = torch_eager_bf16 vs torch_f32 at the SAME boundary (torch's own inherent bf16 ceiling, independent of jammi entirely).",
+    "band_means_vs_jammi_f32_truth": {
+      "jammi_block_fused":  {"boundary_1_18": 0.4448, "boundary_19_28": 0.9544, "qkv_0_17": 0.5600, "qkv_18_27": 0.9419, "mlp_input_0_17": 0.4299, "mlp_input_18_27": 0.8953},
+      "jammi_block_eager":  {"boundary_1_18": 0.6618, "boundary_19_28": 0.9657, "qkv_0_17": 0.7815, "qkv_18_27": 0.9715, "mlp_input_0_17": 0.6412, "mlp_input_18_27": 0.9476},
+      "jammi_flash":        {"boundary_1_18": 0.3077, "boundary_19_28": 0.9551, "qkv_0_17": 0.3762, "qkv_18_27": 0.9571, "mlp_input_0_17": 0.2488, "mlp_input_18_27": 0.9177}
+    },
+    "note_on_reversal_from_round5": "Round 5's E2 (ZerosB init, dL/dA structurally zero) found fused BEST (0.636) and flash BEST OF ALL (0.750) on this same boundary[1-18] metric, eager WORST (0.303). Round 6 (Gaussian init, both A and B live) finds the OPPOSITE ranking: eager BEST (0.662), fused WORSE (0.445), flash WORST (0.308). This reversal is itself a measurement, not noise -- re-confirmed via the dispatch-counter check above (flash's fired path did not change) and is consistent across boundary/qkv/mlp_input alike. The LoRA init regime materially changes which arm looks best on the per-layer ACTIVATION-gradient axis.",
+    "band_means_vs_torch_eager_bf16_direct": {
+      "jammi_block_fused": {"boundary_1_18": 0.7873, "boundary_19_28": 0.9718},
+      "jammi_block_eager": {"boundary_1_18": 0.5760, "boundary_19_28": 0.9578},
+      "jammi_flash":       {"boundary_1_18": 0.4018, "boundary_19_28": 0.9715}
+    },
+    "noise_floor_torch_eager_vs_torch_f32": {"boundary_1_18": 0.5483, "boundary_19_28": 0.9599},
+    "per_index_table_boundary_backward_order": "layer, noise_floor, fused_vs_torcheager, eager_vs_torcheager, flash_vs_torcheager: 28,0.9869,0.9914,0.9856,0.9904 | 27,0.9782,0.9830,0.9758,0.9826 | 26,0.9739,0.9818,0.9697,0.9808 | 25,0.9659,0.9761,0.9599,0.9750 | 24,0.9583,0.9696,0.9553,0.9665 | 23,0.9542,0.9674,0.9522,0.9650 | 22,0.9455,0.9612,0.9434,0.9609 | 21,0.9521,0.9649,0.9508,0.9665 | 20,0.9449,0.9624,0.9449,0.9644 | 19,0.9396,0.9605,0.9408,0.9630 | 18,0.6506,0.8532,0.6645,0.8340 | 17,0.7063,0.8461,0.7292,0.8308 | 16,0.7151,0.8473,0.7363,0.8338 | 15,0.7332,0.8465,0.7565,0.8293 | 14,0.6052,0.7920,0.5934,0.6478 | 13,0.5798,0.7627,0.5524,0.5527 | 12,0.5213,0.7587,0.4884,0.4865 | 11,0.5019,0.7555,0.4878,0.4720 | 10,0.5340,0.7568,0.5120,0.4867 | 9,0.5298,0.7594,0.5182,0.4827 | 8,0.5309,0.7580,0.5205,0.4253 | 7,0.5018,0.7537,0.5126,0.1729 | 6,0.4743,0.7545,0.5116,0.1021 | 5,0.4334,0.7631,0.5105,0.0476 | 4,0.4656,0.7935,0.5613,0.0140 | 3,0.4714,0.7937,0.5781,0.0116 | 2,0.4608,0.7954,0.5756,0.0052 | 1,0.4536,0.7806,0.5593,-0.0020",
+    "first_departing_layer_backward_order": {
+      "flash": "boundary.13 (backward order, first CLEAR/sustained crossing below the same-layer torch noise floor: flash=0.5527 vs floor=0.5798; the gap then widens monotonically -- boundary.8 flash=0.425 vs floor=0.531, boundary.1-7 flash effectively UNCORRELATED with torch-eager, cos in [-0.002, 0.17])",
+      "block_eager": "no large, sustained departure -- tracks the noise floor within a few hundredths at every layer (sometimes marginally above, sometimes marginally below); the fully-decomposed candle_nn::ops::softmax path (all-native-bf16, no F32 anywhere) diverges from torch-eager no more than torch's OWN bf16 diverges from ITS OWN f32 truth",
+      "block_fused": "never departs below the noise floor at any layer -- stays 0.15-0.35 ABOVE the calibration at every single boundary. Read as a measurement, not a virtue: this is HIGHER agreement with torch-eager-bf16 than torch's own bf16 arm has with ITS OWN f32 truth, which is the signature of a SHARED, CORRELATED rounding pattern between jammi-fused and torch-eager (both bf16, both diverging from f32 truth in a similar direction) rather than evidence that jammi-fused's ACTIVATION gradients are more correct -- E4's weight-gradient axis shows fused is the worst arm vs f32 truth, so 'agrees more with torch-eager on activation gradients' and 'agrees with f32 truth on weight gradients' are NOT the same claim."
+    }
+  },
+  "E5_sublayer_bisect": {
+    "description": "8 sub-layer points per HF ModernBertEncoderLayer.forward's actual structure (transformers 5.15.1, read on this box): attn_norm -> attn(Wqkv->RoPE->scores->softmax->PV->Wo) -> resid1 -> mlp_norm -> Wi -> GeGLU(act(input)*gate) -> Wo -> resid2. Captured on torch (both eager-bf16 and f32) via a monkeypatched ModernBertEncoderLayer.forward/ModernBertMLP.forward (torch_round6_layer_dump.py --sublayer) that calls tensor.register_hook on each intermediate; self-consistency-checked against the module-level register_full_backward_hook capture (sublayer.i.resid2 vs boundary.i, exact bit match, max|delta|=0.0, at layers 1/2/28).",
+    "jammi_side_coverage": "PARTIAL -- only 2 of 8 points map onto jammi's EXISTING round-4 GradTap: qkv.i = dL/d(Wqkv output), i.e. BEFORE RoPE/attention entirely (no exact torch sublayer analog captured this round); mlp_input.i = dL/d(resid1) -- an EXACT match to torch's sublayer.{i+1}.resid1. Extending jammi's own GradTap to the remaining 6 points (attn_norm, attn_out, mlp_norm, wi, geglu, wo) was NOT built this round -- see blockers.",
+    "jammi_mlp_input_vs_torch_resid1_direct_comparison_block_fused": "cos in [0.72, 0.86] for layers 0-18 (0-indexed jammi / 1-28 torch), rising to [0.96, 0.99] for layers 19-27 -- same shape and magnitude as the boundary table's fused-vs-torch-eager row, confirming the boundary-level finding is not an artifact of that one specific tap.",
+    "torch_own_within_layer_noise_signature_bf16_vs_f32": {
+      "description": "torch's OWN bf16-vs-f32 gradient cosine at each of the 8 sub-layer sites, per layer -- pure torch noise calibration, no jammi involved. Selected layers (grad, i.e. backward-execution order runs resid2 -> wo -> geglu -> wi -> mlp_norm -> resid1 -> attn_out -> attn_norm within a layer):",
+      "layer_1":  {"attn_out_resid1": 0.4400, "mlp_norm": 0.4082, "wi": 0.4317, "geglu": 0.4466, "wo_resid2": 0.4536},
+      "layer_10": {"attn_norm": 0.6527, "attn_out_resid1": 0.5183, "mlp_norm": 0.5215, "wi": 0.5257, "geglu": 0.5329, "wo_resid2": 0.5340},
+      "layer_18": {"attn_norm": 0.9184, "attn_out_resid1": 0.6926, "mlp_norm": 0.6110, "wi": 0.6170, "geglu": 0.6206, "wo_resid2": 0.6506},
+      "layer_28": {"attn_norm": 0.9706, "attn_out_resid1": 0.9819, "mlp_norm": 0.9720, "wi": 0.9594, "geglu": 0.9832, "wo_resid2": 0.9869},
+      "observation": "at every deep layer checked (14, 18, 20, 28), attn_norm's OWN gradient cosine (requiring backward to have propagated through the WHOLE attention submodule -- Wo, PV, softmax, scores, RoPE, Wqkv) is consistently the HIGHEST of the 8 sites, not the lowest -- more backward propagation through this residual-heavy submodule does not monotonically add noise. The MLP sub-path (mlp_norm/wi/geglu, no residual of its own) is consistently the noisiest of the 8 sites at every layer checked. Stated as a measurement: within-layer noise accumulation is NOT simply 'more ops = more noise' at this checkpoint."
+    },
+    "attn_probs_dump": "captured (output_attentions=True, --attn eager only) for a smoke-scale run; NOT yet compared against a jammi-side probability dump this round (jammi has no equivalent debug hook to extract post-softmax probabilities at a chosen layer without new instrumentation) -- see blockers."
+  },
+  "E6_knob_checks": {
+    "upcast_scores_diagnostic": {
+      "restored": "JAMMI_ROUND5_UPCAST_SCORES, ported byte-for-byte from origin/scratch/esc045-r5-e2-fa2-measure (bb57a23) onto this branch's forward_eager_training_attention_composition, commit e7c2a86",
+      "knob_is_live": "loss changes under the knob (block-eager arm, b4-s128): 471218.88 (off) -> 471834.3 (on) -- not a no-op",
+      "block_eager_arm_boundary_1_18_vs_jammi_f32": {"upcast_off": 0.6618, "upcast_on": 0.5845},
+      "block_eager_arm_boundary_1_18_vs_torch_eager": {"upcast_off": 0.5760, "upcast_on": 0.5548},
+      "finding": "Under round 6's Gaussian LoRA weights, the SAME upcast-scores knob that improved round 5's ZerosB-init 'shared' arm (0.354->0.592 vs jammi f32 truth) makes jammi's block-eager arm SLIGHTLY WORSE (0.662->0.585 vs jammi f32 truth; 0.576->0.555 vs torch-eager) at this shape/seed. The knob's effect is NOT robustly beneficial across init regimes -- round 5's finding was measured entirely under ZerosB (dL/dA structurally zero), and does not reproduce once dL/dA is live. This is exactly the 'diagnose the structure, do not trust one measurement regime' lesson: the ZerosB legs answered a narrower question (dL/dB agreement only) than they were read as answering."
+    },
+    "disable_attention_block_fused_at_the_departing_site": {
+      "arm": "flash binary, JAMMI_KERNELS_STRICT=1, JAMMI_KERNELS_DISABLE=attention_block_fused",
+      "result": "loss unchanged (0.28515625 == 0.28515625), kernels_disabled_fired=[] -- confirms attention_block_fused was never on the flash arm's live path (attention_block_flash preempted it), so this knob has NO effect on the flash arm by construction"
+    },
+    "flash_removes_the_departure": {
+      "finding": "On the WEIGHT-gradient axis (E4), flash (0.790 vs jammi f32) is close to torch's own bf16 ceiling (0.796) and clearly better than block-fused (0.610) -- flash removes MOST of block-fused's weight-gradient deficit. On the ACTIVATION-gradient axis (E3 boundary table), flash is the WORST-departing arm at early/mid layers (near-zero correlation with torch-eager for boundary.1-7), the opposite ranking. Flash does not uniformly 'fix' the divergence; it trades one axis for the other."
+    }
+  },
+  "one_paragraph_mechanism_reading": "As a measurement, not a theory: jammi's PRODUCTION default bf16 training arm (block-fused) is the WORST of jammi's three bf16 arms on the metric that drives learning (dL/d(LoRA weight) cosine vs f32 truth, E4: 0.610, vs flash's 0.790 and eager's 0.810, both close to or above torch's OWN inherent bf16 ceiling of 0.796) -- this is round 6's headline, and it inverts round 5's per-layer ACTIVATION-gradient finding (measured under a ZerosB init that made dL/dA structurally zero) that fused and flash were the BEST arms. On the ACTIVATION-gradient axis measured this round (Gaussian init, dL/dA live), flash is instead the outlier: its boundary-gradient cosine to torch-eager is indistinguishable from zero for the first several layers walking backward from layer 13, while block-fused's activation gradients agree with torch-eager MORE than torch's own bf16 arm agrees with its own f32 truth (a correlated-rounding signature, not evidence of higher fidelity, since the same arm is worst on E4). The round-5 f32-logit-upcast diagnostic, which improved the ZerosB-init 'shared' arm, does not reproduce that improvement under Gaussian init -- it makes block-eager marginally worse. Two different gradient objects (weight gradients vs per-layer activation gradients) and two different LoRA-init regimes (ZerosB vs Gaussian) produce three mutually inconsistent rankings of 'which bf16 arm is closest to truth' across rounds 5 and 6; the one ranking that matters for esc-045's actual question -- does block-fused, the shipped default, learn the way torch does -- says clearly, on the metric that gates the optimizer step, that it does not, and neither flash nor plain eager share block-fused's specific deficit there.",
+  "ledger_row": "esc-045 round 6 (a100b SXM4, e7c2a86): E4 (headline, first time run) -- jammi block-fused's WEIGHT-gradient cosine vs f32 truth is 0.610, worse than flash (0.790, ~torch's own 0.796 bf16 ceiling) and eager (0.810); E3 boundary table (Gaussian init, inverting round 5's ZerosB-init ranking) instead finds FLASH the outlier on ACTIVATION gradients (near-zero cos to torch-eager for boundary.1-7, first departing at boundary.13 backward); E6: round-5's upcast-scores fix does not reproduce under Gaussian init. b8-s512 and jammi-side full 8-point sub-layer GradTap not run this round -- flagged as remaining work.",
+  "blockers": [
+    "b8-s512 shape not run this round -- only b4-s128 (all of E3/E4/E5/E6 above are b4-s128 only)",
+    "jammi-side GradTap extended to only 2 of E5's 8 requested sub-layer points (qkv=after Wqkv, mlp_input=after resid1) via the EXISTING round-4 instrumentation; the other 6 points (after attn_norm, after attention/Wo pre-residual, after mlp_norm, after Wi, after GeGLU, after Wo pre-residual2) require new Rust GradTap call sites not added this round",
+    "attn_probs dump captured on torch side only (--attn-probs-layer, output_attentions=True); no jammi-side attention-probability extraction hook exists to compare against -- would need new instrumentation in the eager/shared attention composition",
+    "compare_grad_oracle.py's derive_cosine_floor is non-positive at ModernBERT-large's own depth/width (documented, pre-existing) -- every E4 run above used an explicit --cosine-floor 0.6 (a reasoned midpoint between the empirical noise band ~0.72-0.93 and the empirical real-defect band 0.30-0.53 cited in its own module doc), not the tool's derived default; PASS/FAIL verdicts from those runs should be read with that floor choice in mind, the raw cosine numbers reported here are what matters"
+  ]
+}

@@ -1,0 +1,367 @@
+# Pod build-substrate key manifest.
+#
+# What this enumerates: every input that can change the BYTES a pod's build
+# scripts / toolchain emit for jammi-kernels and jammi-wire (the two crates
+# with a build.rs in this workspace) without cargo's OWN fingerprint noticing
+# — either because the reading build.rs never declared it via
+# `cargo:rerun-if-env-changed=`, or because it lives entirely outside Cargo's
+# dependency graph (nvcc/cc/mold/rustc identity). A SEED built with one set of
+# these values and a CLONE (or any other pod) built with a DIFFERENT set can
+# silently diverge in emitted bytes while cargo still reports every unit
+# "Fresh" — that is the exact failure class this manifest and the RED tests
+# in test_pod_substrate.sh (mechanism (i)-(iii) below) exist to catch.
+#
+# Every entry cites the READER that owns the fact — never hand-guessed. An
+# addition requires (a) a citation to the reading source (file:line, or a
+# vendored crate name+version), and (b) test_pod_substrate.sh's RED tests
+# (i)/(ii)/(iii) to still pass against the real sources.
+#
+# RED tests (test_pod_substrate.sh), each against the REAL sources, never a
+# fixture:
+#   (i)   every name-shaped string literal (regex [A-Z][A-Z0-9_]{2,}) in
+#         crates/jammi-kernels/build.rs, crates/jammi-wire/build.rs, and the
+#         vendored bindgen_cuda 0.1.6 source resolved from $CARGO_HOME's
+#         registry is either listed under [cargo]/a crate section below, or
+#         in [non_key].vars (CARGO_FEATURE_* is a prefix match), or in
+#         [cc_1_2_57]'s hand-enumerated set (the ONE section this scan cannot
+#         verify mechanically — cc's own env reads live inside the `cc`
+#         crate's library source, executed from a THIRD crate's build.rs
+#         that calls `cc::Build::new()...compile()`, never as a literal
+#         string in the build.rs files this scan reads; see [cc_1_2_57]'s own
+#         citation).
+#   (ii)  every `cargo:rerun-if-env-changed=<NAME>` literal in those same
+#         three sources is in the same union.
+#   (iii) pod_seed_target.sh's own seed-time cross-check: the announced env
+#         set from the SEED's captured `build/<pkg>-*/output` stdout (every
+#         `cargo:rerun-if-env-changed=` line cargo itself printed while
+#         actually running the build scripts, captured BEFORE the member-free
+#         clean) is a subset of this manifest — a live, not merely
+#         source-level, corroboration. test_pod_substrate.sh exercises the
+#         SAME function against a fixture `build/*/output` tree.
+#
+# Scope note (docs-ci, PR ci/pod-build-substrate): the STATIC scan (i)/(ii)
+# covers exactly the three sources this file documents by name — the two
+# in-workspace build.rs files plus bindgen_cuda, the one vendored dependency
+# jammi-kernels' `cuda` feature calls directly. It does NOT walk every
+# vendored build.rs in the full dependency graph (~104 packages carry one at
+# default features).
+#
+# round-5 correction (a100c on-pod A2 run at 80c7f59, real seed FAILURE —
+# see .jammi-seed-failed; test_pod_substrate.sh's `(s/manifest)` leg
+# replays the real a100c-observed announcements, verbatim, against this
+# manifest): this note used to claim "most [cc-based packages] compile
+# C/C++ via the `cc` crate without reading any env var directly in
+# their OWN build.rs" — that claim was FALSE. Reproduced against the real
+# vendored sources of every cc-allowlisted package in this workspace's
+# `--features jammi-kernels/cuda` graph (11 packages: blake3, cxx,
+# liblzma-sys, libsqlite3-sys, link-cplusplus, numkong, onig_sys, psm, ring,
+# usearch, zstd-sys): every one of them DOES read package-specific env vars
+# directly in its own build.rs (e.g. zstd-sys reads
+# `env::var_os("ZSTD_SYS_USE_PKG_CONFIG")` at zstd-sys-2.0.16+zstd.1.5.7/
+# build.rs:277 — see [vendored_non_cuda] below for the full, per-package,
+# EMPIRICALLY-READ set). The STATIC scan (i)/(ii) still does not walk these
+# 11 packages' build.rs (pod_seed_scan_all_vendored_buildrs's cc-allowlist
+# skips them — see that function's own citation for why a blanket literal
+# scan of a cc-based package's build.rs is NOT safe to turn on: it also
+# picks up C-preprocessor `#define`/`#[cfg(...)]` names cc's own
+# `.define()` calls forward, e.g. zstd-sys's own build.rs also carries
+# `HAVE_CONFIG_H`/`NDEBUG`/`WORDS_BIGENDIAN`-shaped literals that are NEVER
+# env var reads — a blanket per-package name-shaped-literal scan would
+# false-positive-red on those; distinguishing an `env::var(...)` CALL SITE
+# from a `.define(...)` argument mechanically, file by file, is real,
+# unstarted work, tracked as a follow-up, not attempted in this round).
+#
+# What actually catches this class today is the RUNTIME cross-check (iii):
+# pod_seed_check_stdout_subset reads the SEED's own real captured
+# `cargo:rerun-if-env-changed=` announcements (cargo runs every build
+# script for real; cc emits these for every var it actually reads,
+# regardless of which crate's build.rs called it) and checks that set
+# against this manifest — this is why [cc_1_2_57] below is now REAL
+# wildcard entries (`CC_*`, `AR_*`, ...), not merely prose documenting a
+# "computed_forms" shape that was never wired into `pod_seed_name_allowed`.
+# A REAL POD SEED BUILD is the acceptance oracle the local (hermetic,
+# no-cargo-build) suite only APPROXIMATES: this exact gap — 62 distinct
+# unlisted names from 11 packages — passed every hermetic test in this
+# repo and was caught only by running the real thing on a100c. Treat "run
+# pod_seed_target.sh for real on a live pod" as the ground truth this
+# manifest is checked against; a green hermetic suite is necessary, never
+# sufficient, evidence that the manifest is complete.
+
+[cargo]
+# The reproducibility root: fix these five/six and the rest of the graph
+# follows deterministically (Cargo.lock resolves every dependency; the two
+# incremental-build knobs are the ones the seed's own construction depends on
+# — see pod_seed_target.sh and runpod_lib.sh's rp_bootstrap, which appends
+# CARGO_INCREMENTAL=0 and CARGO_BUILD_RUSTC_WRAPPER= to every pod's
+# /root/.jammi_env).
+inputs = [
+  "Cargo.lock",
+  "Cargo.toml",                 # every workspace member's own manifest
+  ".cargo/config.toml",
+  "rust-toolchain.toml",
+  "RUSTFLAGS",
+  "CARGO_BUILD_RUSTFLAGS",
+  # CARGO_TARGET_<TRIPLE>_RUSTFLAGS — the per-target-triple RUSTFLAGS
+  # override; the SAME rustflags family as the two above, scoped to one
+  # triple, and independently capable of differing seed-vs-clone. The
+  # scanner's own name-shaped-literal regex truncates this computed name at
+  # the literal prefix (portable-atomic's build.rs builds it via
+  # `format!("cargo:rerun-if-env-changed=CARGO_TARGET_{}_RUSTFLAGS", ...)`),
+  # so the wildcard entry is the truncated prefix itself.
+  "CARGO_TARGET_*",
+  "CARGO_INCREMENTAL",
+  "CARGO_BUILD_RUSTC_WRAPPER",
+]
+
+[jammi_kernels_build_rs]
+source = "crates/jammi-kernels/build.rs"
+inputs = [
+  "NVCC",
+  "CUDA_HOME",
+  "CUDA_PATH",
+  "AR",
+  "CUDA_COMPUTE_CAP",
+  "JAMMI_FLASH_GENCODE_SM",
+]
+notes = [
+  "JAMMI_FLASH_GENCODE_SM (round-6, post-#393 merge) is a COMPUTED OUTPUT, not an ambient-env input: build.rs:349 `println!(\"cargo:rustc-env=JAMMI_FLASH_GENCODE_SM={gencode_sm}\")` derives it from CUDA_COMPUTE_CAP (above) and EMITS it forward to rustc via `env!(\"JAMMI_FLASH_GENCODE_SM\")` at compile time; it is never read FROM the environment by anything, so it cannot itself diverge between a seed and a clone independent of CUDA_COMPUTE_CAP (already tracked). Listed here only so the RED scan's own literal match resolves — never a real environment input.",
+  "CUDA_COMPUTE_CAP is PINNED, not read from the pod's ambient env: build_cuda() calls env::set_var(\"CUDA_COMPUTE_CAP\", \"80\") at build.rs:73 before constructing the bindgen_cuda Builder, specifically so bindgen_cuda's own compute_cap() (see [bindgen_cuda_0_1_6]) never falls through to an nvidia-smi probe. Recorded here as a CONSTANT (80), not a variable value.",
+  "cutlass gitlink: crates/jammi-kernels/third_party/cutlass (git submodule pin) is a key input to the flash-attn feature's build_flash_attn() (build.rs:172-414) but is NOT env-shaped — it is a checked-in gitlink, tracked by the submodule commit, not by this manifest's env scan.",
+  "find_nvcc() resolution ORDER (build.rs:368-387): $NVCC, then $CUDA_HOME/bin/nvcc, then $CUDA_PATH/bin/nvcc, then `nvcc` on PATH, then /usr/local/cuda/bin/nvcc — the first that answers `--version`. The ORDER is part of this crate's key surface: two pods with different toolchains on PATH but the SAME NVCC/CUDA_HOME can still resolve a different nvcc if only PATH differs and neither env var is set.",
+]
+
+[bindgen_cuda_0_1_6]
+source = "vendored (registry) bindgen_cuda-0.1.6/src/lib.rs — cuda_include_dir() (unannounced: no cargo:rerun-if-env-changed emitted for any of these four) and compute_cap()/kernel-build helpers (RAYON_NUM_THREADS, NVCC_CCBIN)"
+inputs = [
+  "CUDA_PATH",
+  "CUDA_ROOT",
+  "CUDA_TOOLKIT_ROOT_DIR",
+  "CUDNN_LIB",
+  "NVCC_CCBIN",
+  "RAYON_NUM_THREADS",
+]
+notes = [
+  "CUDA_PATH/CUDA_ROOT/CUDA_TOOLKIT_ROOT_DIR/CUDNN_LIB are read via `[\"CUDA_PATH\",\"CUDA_ROOT\",\"CUDA_TOOLKIT_ROOT_DIR\",\"CUDNN_LIB\"].into_iter().map(std::env::var)` (lib.rs, cuda_include_dir()) — an ARRAY+LOOP read, not a literal `env::var(\"X\")` call, and one a naive env::var(\"...\") literal scan misses entirely (round-5 pressure-test finding). This is exactly why RED tests (i)/(ii) scan every name-shaped STRING LITERAL in the source rather than only `env::var(...)` call sites.",
+]
+
+[jammi_wire_build_rs]
+source = "crates/jammi-wire/build.rs"
+inputs = ["PROTOC"]
+
+[jammi_bench_build_rs]
+# Added post-#394 merge (perf-unification phase 1, build-time provenance):
+# the FULL vendored-package scan (e-full-i)/(e-full-ii) — not the narrow
+# (i)/(ii) scan this file's header "Scope note" describes, which stays
+# limited to jammi-kernels/jammi-wire/bindgen_cuda by name — walks EVERY
+# package in the resolved graph with a custom-build target (see
+# pod_seed_scan_all_vendored_buildrs's own citation), so jammi-bench's own
+# build.rs is in scope automatically the moment it exists; this section is
+# what makes that scan's one genuine literal resolve.
+source = "crates/jammi-bench/build.rs"
+inputs = ["JAMMI_BUILD_SHA"]
+notes = [
+  "build.rs:265,284 — the ONLY env::var() read in this file; an already-set JAMMI_BUILD_SHA is accepted verbatim iff it is exactly 40 lowercase hex chars, else this build script falls back to a live `git rev-parse HEAD` + `git status` read (not itself env-shaped) and finally the literal \"unknown\". TARGET/PROFILE (build.rs:293,297) are cargo-standard build-script env vars already covered by [non_key].vars, not this crate's own input.",
+]
+
+[cc_1_2_57]
+# Hand-enumerated — the ONE section the automated STATIC scan (i)/(ii)
+# cannot verify (see this file's header "Scope note" for why a blanket
+# per-package literal scan of a cc-based package is unsafe). cc's own env
+# reads execute inside the `cc` CRATE's library source when a DIFFERENT
+# crate's build.rs calls cc::Build::new()...compile(); the literal strings
+# therefore never appear in the DEPENDENT crate's own build.rs, and cc
+# itself carries no build.rs of its own (it is a plain library dependency,
+# not a package with a build script — confirmed via `cargo metadata`'s
+# custom-build target list).
+#
+# round-5 fix (a100c on-pod A2 run at 80c7f59): `computed_forms` below used
+# to be PROSE ONLY — three human-readable shape strings that
+# `pod_seed_name_allowed` (which only understands an exact name or a
+# literal `PREFIX*` wildcard) never actually matched against anything. The
+# real seed build on a100c announced the ACTUAL computed names (e.g.
+# `CC_x86_64_unknown_linux_gnu`, `HOST_CFLAGS`) via
+# `cargo:rerun-if-env-changed=`, all of which were genuinely UNLISTED and
+# aborted the seed. `inputs` below is now the real, matchable set, derived
+# mechanically from cc-1.2.57/src/lib.rs's own `target_envs()` (:3890-3905,
+# vendored at ~/.cargo/registry/src/*/cc-1.2.57/src/lib.rs): for a base var
+# `V` and `kind` = HOST (native) or TARGET (cross-compiling, per
+# `get_is_cross_compile()`), cc probes, in order: `V_<raw-target-triple>`,
+# `V_<target-triple-with-_-for-'-'-and-'.'>`, `<kind>_V`, then bare `V`. The
+# pod is never cross-compiling (kind is always HOST there), but TARGET_* is
+# listed too since it is the SAME mechanically-derived family, not a guess,
+# and costs nothing to allow.
+source = "cc-1.2.57/src/lib.rs:3890-3905 (target_envs/getenv_with_target_prefixes), :3926-3945 (envflags, same target_envs), :1986 (CRATE_CC_NO_DEFAULTS via get_env_boolean), src/command_helpers.rs:48,75 (CC_ENABLE_DEBUG_OUTPUT), :3951 (CC_FORCE_DISABLE via get_env_boolean) + the cc crate README's \"External configuration via environment variables\" section — reproduced live against the real a100c seed capture (scratchpad/a2-timings/80c7f59/a100c-failure/a2c.stdout)"
+inputs = [
+  "CC", "CXX", "AR", "RANLIB", "CFLAGS", "CXXFLAGS", "ARFLAGS",
+  "OPT_LEVEL", "DEBUG", "SDKROOT", "CRATE_CC_NO_DEFAULTS",
+  "CC_ENABLE_DEBUG_OUTPUT", "CC_FORCE_DISABLE", "CC_SHELL_ESCAPED_FLAGS",
+  "CC_KNOWN_WRAPPER_CUSTOM", "CROSS_COMPILE", "CXXSTDLIB",
+  # target-varying wildcards: `V_<target>` (raw, dash-separated) and
+  # `V_<target_with_underscores>` collapse to the SAME "V_*" prefix wildcard
+  # (pod_seed_name_allowed's "PREFIX*" match is a plain string-prefix test,
+  # so it covers both the dashed and underscored forms with one entry).
+  "CC_*", "CXX_*", "AR_*", "RANLIB_*", "CFLAGS_*", "CXXFLAGS_*",
+  "ARFLAGS_*", "CXXSTDLIB_*",
+  # `<kind>_V` forms, kind = HOST (native pod build) or TARGET
+  # (cross-compiling — not exercised on this pod today, but the SAME
+  # mechanical derivation, kept for completeness rather than re-deriving
+  # this the next time a cross build is attempted).
+  "HOST_CC", "HOST_CXX", "HOST_AR", "HOST_RANLIB", "HOST_CFLAGS",
+  "HOST_CXXFLAGS", "HOST_ARFLAGS", "HOST_CXXSTDLIB", "HOST_OPT_LEVEL",
+  "HOST_DEBUG",
+  "TARGET_CC", "TARGET_CXX", "TARGET_AR", "TARGET_RANLIB",
+  "TARGET_CFLAGS", "TARGET_CXXFLAGS", "TARGET_ARFLAGS",
+  "TARGET_CXXSTDLIB", "TARGET_OPT_LEVEL", "TARGET_DEBUG",
+]
+notes = [
+  "This section documents the env surface generically (it applies to every registry crate in this workspace's dependency graph that compiles C/C++ via cc), not per-consuming-crate — see this file's header \"Scope note\" for which mechanism (static scan vs. the seed's own runtime cross-check) actually enforces it.",
+]
+
+[toolchain_identities]
+commands = [
+  "rustc -vV",
+  "cargo -V",
+  "nvcc --version (resolved via BOTH jammi-kernels build.rs's find_nvcc() order AND bindgen_cuda's cuda_include_dir() order — both recorded, since they can disagree)",
+  "cc --version",
+  "mold --version",
+  "ldd --version",
+  "uname -m",
+]
+assertion = "no `-C target-cpu=native` anywhere in the resolved RUSTFLAGS/CARGO_BUILD_RUSTFLAGS — a native-tuned artifact from the SEED's own build host is not portable seed -> clone across a different pod's CPU."
+
+[cudarc]
+# cudarc (a CUDA-runtime binding crate reachable once jammi-kernels' `cuda`
+# feature is on — `cargo metadata --features jammi-kernels/cuda` is what
+# surfaces it) carries its OWN build.rs, entirely independent of
+# bindgen_cuda's — round-2 audit finding 5's full-enumeration scan is what
+# actually found this; the original 3-file scan (jammi-kernels/jammi-wire/
+# bindgen_cuda only) missed it outright, which is exactly the class this
+# manifest exists to close (a real, previously-unlisted CUDA-toolchain
+# input, not a cosmetic gap).
+source = "vendored (registry) cudarc's own build.rs — two versions are pinned in Cargo.lock (0.17.8, 0.19.8; a diamond dependency), scanned separately since 0.19.8 declares a larger env surface than 0.17.8"
+inputs = [
+  "CUDA_HOME", "CUDA_PATH", "CUDA_ROOT", "CUDA_TOOLKIT_ROOT_DIR", "CUDNN_LIB",
+  "CUDARC_CUDA_VERSION", "CONDA_PREFIX",
+  "CUDNN_MAJOR", "CUDNN_MINOR", "CUDNN_PATH",
+  "CUTENSOR_MAJOR", "CUTENSOR_MINOR", "CUTENSOR_PATH",
+  "NCCL_MAJOR", "NCCL_MINOR",
+]
+
+[non_key]
+# Cargo sets these itself, per invocation, from information the seed/clone
+# distinction cannot change (paths and cardinality derived from the crate
+# graph and cargo's own build plan, not a human-set toggle). A scanner hit on
+# one of these is not a missing manifest entry.
+#
+# The CARGO_CFG_*/CARGO_PKG_* families are wildcards, not enumerated one by
+# one: CARGO_CFG_* reflects `#[cfg(...)]`-shaped state derived entirely from
+# the target triple + RUSTFLAGS/CARGO_BUILD_RUSTFLAGS (already tracked in
+# [cargo]) — a build can only see a DIFFERENT CARGO_CFG_* value if RUSTFLAGS
+# or the triple itself changed, both independently caught. CARGO_PKG_* is
+# Cargo.toml/Cargo.lock-derived package identity (name/version), already
+# tracked via [cargo]'s own Cargo.lock/Cargo.toml inputs. DEP_* is cargo's
+# own `links`-key propagation, deterministic from the (already-tracked)
+# resolved dependency graph, never a human-set toggle.
+#
+# RUSTC/RUSTC_BOOTSTRAP/RUSTC_STAGE/RUSTC_WORKSPACE_WRAPPER/RUSTC_WRAPPER are
+# cargo-internal build-plan variables cargo itself sets when invoking a
+# build script/rustc — RUSTC_WRAPPER specifically is cargo's OWN resolved
+# view of the wrapper setting (whatever [cargo]'s CARGO_BUILD_RUSTC_WRAPPER
+# input already produced), read back by some build scripts for logging —
+# not an independent toggle. CARGO_ENCODED_RUSTFLAGS is RUSTFLAGS itself,
+# shell-encoded by cargo — the SAME already-tracked [cargo] input, not a
+# second one. The exact rustc BINARY identity is separately tracked via
+# [toolchain_identities]'s `rustc -vV`.
+vars = [
+  "OUT_DIR", "CARGO_MANIFEST_DIR", "CARGO_FEATURE_*", "TARGET", "HOST",
+  "PROFILE", "NUM_JOBS", "CARGO_CFG_*", "CARGO_PKG_*", "DEP_*",
+  "CARGO_ENCODED_RUSTFLAGS", "RUSTC", "RUSTC_BOOTSTRAP", "RUSTC_STAGE",
+  "RUSTC_WORKSPACE_WRAPPER", "RUSTC_WRAPPER",
+]
+
+[vendored_non_cuda]
+# Round-2 audit finding 5's full-enumeration scan (every build-script
+# package from `cargo metadata`, not the original 3-file subset) surfaces
+# package-SPECIFIC opt-in customisation toggles for vendored crates that
+# have nothing to do with jammi's CUDA/GPU compilation — none of these can
+# plausibly cause the "cargo says Fresh but the bytes moved" GPU-toolchain
+# hazard this manifest exists to close (they never touch nvcc/CUDA_*/AR/CC
+# paths), so they are accounted for here, by package, rather than pretended
+# individually critical. A NEW literal in one of these packages' build.rs
+# still reddens the scan (this list is closed, not a wildcard) — it is
+# reviewed and added here (or moved to a real key section, if it genuinely
+# turns out to affect toolchain output) on the same terms as any other
+# manifest change.
+bigdecimal = [
+  "RUST_BIGDECIMAL_DEFAULT_PRECISION", "RUST_BIGDECIMAL_DEFAULT_ROUNDING_MODE",
+  "RUST_BIGDECIMAL_FMT_EXPONENTIAL_LOWER_THRESHOLD",
+  "RUST_BIGDECIMAL_FMT_EXPONENTIAL_UPPER_THRESHOLD",
+  "RUST_BIGDECIMAL_FMT_MAX_INTEGER_PADDING", "RUST_BIGDECIMAL_SERDE_SCALE_LIMIT",
+]
+libc = [
+  "RUST_LIBC_UNSTABLE_FREEBSD_VERSION", "RUST_LIBC_UNSTABLE_GNU_FILE_OFFSET_BITS",
+  "RUST_LIBC_UNSTABLE_GNU_TIME_BITS", "RUST_LIBC_UNSTABLE_LINUX_TIME_BITS64",
+  "RUST_LIBC_UNSTABLE_MUSL_V1_2_3", "LIBC_CI", "WIND_RELEASE_ID",
+]
+pyo3_ffi = [
+  "PYO3_PRINT_CONFIG", "PYO3_USE_ABI3_FORWARD_COMPATIBILITY",
+  "UNSAFE_PYO3_SKIP_VERSION_CHECK",
+]
+# Windows-only stub crates — every one of these is inert on the pod's Linux
+# target; the vars gate optional-bundled-library linking on Windows only.
+winapi = ["WINAPI_NO_BUNDLED_LIBRARIES", "WINAPI_STATIC_NOBUNDLE"]
+icu_normalizer_data_and_icu_properties_data = ["ICU4X_DATA_DIR"]
+# usearch's own CPU SIMD dispatch strategy (numkong backend selection) —
+# unrelated to the CUDA/nvcc toolchain this manifest tracks.
+usearch = ["NK_DYNAMIC_DISPATCH", "NK_NATIVE_BF16", "NK_NATIVE_F16", "USEARCH_USE_NUMKONG", "USEARCH_USE_OPENMP"]
+# round-5 addition (a100c on-pod A2 run at 80c7f59 — real seed FAILURE,
+# 62 distinct unlisted names from 11 cc-allowlisted packages; see this
+# file's header "Scope note" and [cc_1_2_57]'s own citation for why the
+# STATIC scan (i)/(ii) does not walk these packages' own build.rs — the
+# entries below are read straight off the real captured seed announcement,
+# scratchpad/a2-timings/80c7f59/a100c-failure/a2c.stdout, cross-checked
+# against each package's own vendored build.rs source at the pinned
+# version). CARGO_MANIFEST_LINKS (cxx, ring) is a real, distinct var from
+# the already-tracked CARGO_MANIFEST_DIR — cargo's own reflection of a
+# package's `links = "..."` manifest key, read directly by these two
+# packages' build.rs, not itself in [non_key]'s vars list.
+cxx = ["CARGO_MANIFEST_LINKS"]
+liblzma_sys = ["LZMA_API_STATIC", "LZMA_SYS_ENABLE_THREADS"]
+libsqlite3_sys = [
+  "LIBSQLITE3_FLAGS", "LIBSQLITE3_SYS_USE_PKG_CONFIG",
+  "LIBSQLITE3_SYS_BUNDLING",
+  "SQLITE_MAX_COLUMN", "SQLITE_MAX_EXPR_DEPTH", "SQLITE_MAX_VARIABLE_NUMBER",
+]
+onig_sys = [
+  "RUSTONIG_SYSTEM_LIBONIG", "RUSTONIG_STATIC_LIBONIG", "RUSTONIG_DYNAMIC_LIBONIG",
+]
+ring = ["RING_PREGENERATE_ASM", "CARGO_MANIFEST_LINKS"]
+zstd_sys = ["ZSTD_SYS_USE_PKG_CONFIG"]
+# numkong's own CPU-target dispatch build (compiled once per SIMD target it
+# supports, gated by whether the CPU feature is available at build time) —
+# the wildcard covers every NK_TARGET_<ARCH> entry numkong's build.rs emits
+# (blake3/numkong 7.6.0's own target table; a NEW target added upstream is
+# still covered by the prefix, never a per-name addition here).
+numkong = ["NK_MARCH_NATIVE", "NK_TARGET_*", "NK_DYNAMIC_DISPATCH", "NK_NATIVE_BF16", "NK_NATIVE_F16"]
+libm = ["ENSURE_NO_PANIC"]
+wasm_bindgen_shared = ["HEAD"]
+rustversion = ["HOST"]
+# A developer escape hatch that forces regenerating substrait's own
+# committed protobuf bindings — unrelated to CUDA/GPU compilation.
+substrait = ["FORCE_REBUILD"]
+# portable-atomic's OWN opt-in "deny warnings" toggle for its build script;
+# unrelated to CUDA/GPU compilation. (Its CARGO_TARGET_*_RUSTFLAGS read is
+# tracked generically in [cargo] instead — a real RUSTFLAGS-family input,
+# not package-specific.)
+portable_atomic_and_portable_atomic_util = ["PORTABLE_ATOMIC_DENY_WARNINGS"]
+
+# Known gap, not silently worked around: the RED-test scan regex is this
+# file's own header spec, `[A-Z][A-Z0-9_]{2,}` (>= 3 total characters) —
+# verbatim what the pod-build-substrate contract states. A 2-CHARACTER env
+# var name (e.g. "AR", read at crates/jammi-kernels/build.rs:208 and :326,
+# and already hand-listed in [jammi_kernels_build_rs] and [cc_1_2_57] above)
+# is therefore INVISIBLE to the automated scan: it can never trigger an
+# "unlisted literal" RED, so a FUTURE 2-character-named env read added
+# without a manifest entry would not be caught by tests (i)/(ii). AR itself
+# is correctly listed today (by hand); this is a scan-coverage gap for names
+# that short, not a known-missing entry.

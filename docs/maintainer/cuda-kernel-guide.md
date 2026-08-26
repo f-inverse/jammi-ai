@@ -201,11 +201,17 @@ because it was a small share of runtime. An isolated number alone is not a resul
 ## 5. Host and build hazards (they silently invalidate results)
 
 * `cargo` is not on PATH in non-interactive shells — `export PATH="$HOME/.cargo/bin:$PATH"`.
-* Give every worktree a UNIQUE `CARGO_TARGET_DIR`; a shared one serves stale artifacts.
+* Give every worktree a UNIQUE `CARGO_TARGET_DIR`; a shared one serves stale artifacts. On a
+  RunPod pod this is what `gpu-dev.sh target <session> <name>` gives each **tree**: a fresh,
+  per-tree clone of the pod's build-substrate seed (`docs/maintainer/dev-gpu.md`) — the seed
+  itself is member-free (zero `jammi-*` artifacts) precisely so a clone can never serve one back
+  stale; only third-party dependency artifacts are shared.
 * For `cargo mutants`: COPY mode, and `CARGO_TARGET_DIR` **unset**. A shared target dir makes cargo
   report "Fresh" for MUTATED sources and scores every mutant against unmutated artifacts — a whole
   run was invalidated that way.
-* Copy mode duplicates the workspace + target per job. Budget `~25 GB + 3 GB/agent + 2 GB/mutants
+* Copy mode duplicates the workspace + target per job. Budget `~25 GB + S_src + S_seed +
+  N*S_clone` once the build-substrate seed/clone is in use (S values pending —
+  `ci/scripts/perf/pod_build_timings.sh` is the producer) `+ 3 GB/other agent + 2 GB/mutants
   job`; a mutation session wants a pod ≥ 120 GB (`RP_DISK_GB=... ci/scripts/gpu-dev.sh up`).
 * `tests/cuda_parity.rs` is `required-features = ["cuda"]`, so no CPU-only gate compiles it. Whatever
   you put there is checked by the pod lane alone — say so rather than implying local green covers it.

@@ -31,6 +31,7 @@ rp_deploy_live_a100 || exit $?
 echo "=== running GPU prove suites on ${RP_HOST}:${RP_PORT} ==="
 rp_run_remote <<REMOTE
 export CARGO_TERM_COLOR=never
+export CARGO_BUILD_RUSTC_WRAPPER=  # wrapper-off (ledger row 17: no cross-target-dir reuse, ~+33% wall on this image)
 echo "::group::device"; nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv; echo "CUDA_COMPUTE_CAP=\${CUDA_COMPUTE_CAP:-<unset>}"; echo "::endgroup::"
 cd /root && rm -rf jammi-ai
 git clone --depth 1 -b "${GIT_REF}" "${GIT_REPO}" jammi-ai 2>&1 | tail -1

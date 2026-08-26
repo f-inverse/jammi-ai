@@ -12,9 +12,14 @@ A pod has two independent axes:
 - **lifetime** — `shell` gives a throwaway pod that dies when you exit. `up`
   starts a named session whose pod *survives* disconnect, so a fine-tune, eval or
   bench keeps running after you close the terminal.
-- **state** — the pod itself is always disposable. Anything worth keeping lives
-  either in git (your working tree) or in an S3-compatible object store (the
-  build substrate). Nothing durable is ever stored on the pod.
+- **state** — the pod itself is always disposable. The only thing worth keeping
+  lives in git (your working tree, via `push`/`--ref`). Build-time COMPILATION
+  state — the expensive part — lives in a per-pod **seed/clone build
+  substrate** instead (below): a full-registry `CARGO_TARGET_DIR` (the
+  "seed") built once per pod and cheaply `cp -a`-cloned into one throwaway
+  `CARGO_TARGET_DIR` per tree (`target`, below) — never shared across pods, and
+  never backed by an external object store. Nothing durable is ever stored on
+  the pod itself.
 
 ## Why no network volume is attached
 
@@ -24,10 +29,9 @@ dimensions in `runpod_lib.sh` — cloud tier and PCIe/SXM variant — and those 
 precisely because A100 supply is intermittent. Pinning the pod to one datacenter
 trades away availability for persistence we can get more cheaply.
 
-So the pod stays free to land anywhere, and durable state is made
-location-independent instead. A network volume is still the natural *backing
-store* for that object storage, reached over its S3 endpoint — it is simply never
-mounted on a pod.
+So the pod stays free to land anywhere, and every mechanism below (the
+seed/clone substrate, `push`) is per-pod and self-contained rather than
+depending on shared, location-pinned storage.
 
 ## One-time setup
 
@@ -39,50 +43,61 @@ mkdir -p ~/.config/runpod && printf '%s' 'YOUR_KEY' > ~/.config/runpod/key && ch
 
 (CI reads the same key from the `RUNPOD_API_KEY` GitHub Actions secret.)
 
-The shared **sccache** compile cache is optional — without it everything still
-works, just cold. To enable it, create a network volume plus an S3 API key
-(RunPod → Settings → S3 API Keys) and write:
+Nothing else to configure — the build-substrate cache below is entirely
+per-pod, no second credential needed.
 
-```bash
-cat > ~/.config/runpod/s3 <<'EOF'
-RP_S3_ENDPOINT=https://s3api-us-ne-1.runpod.io
-RP_S3_BUCKET=<network-volume-id>
-RP_S3_ACCESS_KEY_ID=user_...
-RP_S3_SECRET_ACCESS_KEY=rps_...
-EOF
-chmod 600 ~/.config/runpod/s3
-```
+## The build substrate — seed and clone
 
-The volume is never attached to a pod, so its datacenter only has to serve the
-S3 API — and **RunPod's documented list of S3 datacenters is not accurate**.
-Probe before choosing one; a live endpoint answers `401`, a dead one `530` or
-nothing:
+Compilation is the real cost on a fresh pod, and `gpu-dev.sh` no longer pays
+it more than once per pod. Right after bootstrap, `up`/`shell` kick off a
+**seed** build, detached (`tmux attach -t =jammi-seed` on the pod to watch
+it): a `CARGO_TARGET_DIR` with every third-party dependency fully compiled,
+then made **member-free** — `cargo clean --workspace` (both profiles used) plus
+an explicit `rm -rf */incremental` (cargo's own cleaner does not remove
+`incremental/build_script_build-*`) strip every `jammi-*` artifact back out,
+so the seed is pure registry output with nothing of jammi's own code baked in.
 
-```bash
-curl -s -o /dev/null -w '%{http_code}\n' https://s3api-us-ne-1.runpod.io/
-```
+`gpu-dev.sh target <session> <name>` then `cp -a` (reflink where the
+filesystem supports it) clones that seed into a fresh `CARGO_TARGET_DIR` for a
+**tree** (`--tree <name>`, default the bootstrap checkout at
+`/root/jammi-ai`). Because the seed is member-free, a clone is a **pure
+copy** — no deletion step, no drift window — and every `jammi-*` unit
+genuinely recompiles on the clone's first build (`target --verify` proves it:
+no `Fresh jammi-*` line). Every third-party dependency, meanwhile, is already
+built: only jammi's own code and whatever the tree's own `Cargo.lock`/feature
+set actually changed ever compiles again.
 
-`RP_S3_REGION` is derived from the endpoint. RunPod signs SigV4 against the
-datacenter and rejects `auto` outright, which — because `rustc-wrapper` is
-sccache repo-wide — would otherwise stop every cargo command on the pod dead.
-Bootstrap proves the sccache server starts against the bucket and falls back to
-a local disk cache if it cannot.
+This replaced an S3-backed sccache cache tried earlier: measured live on a
+real pod (fresh `CARGO_TARGET_DIR` each leg, `cargo build --release -p
+jammi-bench --features cuda`; session ledger row 17, producer
+`/root/sccache-remeasure.sh` — `.jammi/ledger/` is gitignored, so the row is
+named here rather than linked), sccache gave **zero cross-target-dir cache
+reuse** for rustc units — every populate-then-reuse pair against a fresh
+target dir re-missed everything sccache had just written — while adding
+**+33% to +37.5% wall clock** to every build that ran it (344s wrapper-off
+vs 457-473s wrapper-on: low end 344→457s is (457-344)/344 = +32.8% ≈ +33%;
+high end 344→473s is (473-344)/344 = +37.5% — a single "~+33%" figure
+previously cited only the low end, and a later revision of this line
+rounded the high end up to "+38%", which does not match the arithmetic
+either; both ends are now stated to the precision the same row actually
+supports).
+The wrapper is now off pod-wide
+(`CARGO_BUILD_RUSTC_WRAPPER=` in `/root/.jammi_env`, every shell sources it).
 
-The cargo **registry** is deliberately not cached. It looks like the expensive
-part, since the CI image wipes `/usr/local/cargo/registry`, but a cold
-`cargo fetch --locked` measures **9s for 868 crates** on a RunPod host —
-datacenter bandwidth makes it free. Compilation is the real cost, and that is
-what sccache holds. Measured on two separate A40 pods, `cargo build -p jammi-db`:
+The cargo **registry** is deliberately not cached either. It looks like the
+expensive part, since the CI image wipes `/usr/local/cargo/registry`, but a
+cold `cargo fetch --locked` measures **9s for 868 crates** on a RunPod host
+(same measurement session as the sccache figures above; the specific ledger
+row for this particular number is not separately pinned in the audit trail
+this doc's other citations draw from — a follow-up, not a claim this line
+retracts) — datacenter bandwidth makes it free.
 
-| pod | wall | cache hits | misses |
-|-----|------|-----------|--------|
-| 1 — cold, populating | 188s | 0 | 504 |
-| 2 — reading pod 1's cache | 47s | 504 | 0 |
-
-A 4× cut with a 100% hit rate across two pods that never met, which is the
-property the whole ephemeral-pod design rests on. Expect a smaller ratio on a
-full CUDA build — nvcc output is not rustc output — but the mechanism is what
-matters: the cache survives the machine.
+Disk sizing (`RP_DISK_GB`): `>= 25` (base) `+ S_src + S_seed + N*S_clone`
+(one clone per tree the pod hosts). The exact `S_src`/`S_seed`/`S_clone` byte
+counts are **pending** — `ci/scripts/perf/pod_build_timings.sh` is this
+formula's producer; its measured JSON, once committed under
+`ci/artifacts/pod-build-timings/`, is what future numbers here will cite.
+Until then, size generously and watch `du`.
 
 `gpu-dev.sh` generates its own SSH key — nothing to register. Every SSH
 invocation pins the connection to that key alone (`IdentitiesOnly=yes`): a
@@ -244,9 +259,11 @@ ci/scripts/gpu-dev.sh reap                        # kill anything orphaned
 ```
 
 `run` launches under tmux and returns immediately, so the job outlives both the
-command and your SSH connection. There is exactly one job per pod: `run` kills
-the `jammi` tmux session before starting the next one, so a long-lived job — a
-server, say — occupies the pod's only slot until something displaces it.
+command and your SSH connection. There is exactly one job per **tree** (see
+below), not per pod: `run` kills that tree's own `jammi-<tree>` tmux session
+before starting the next one, so a long-lived job — a server, say — occupies
+that tree's slot until something displaces it. A different tree's job is
+untouched.
 
 Sessions are named after the arch. `RP_SESSION` names one explicitly, and is
 needed only on `up` and `shell`, the two verbs that take an *arch* where the rest
@@ -256,17 +273,68 @@ silently picking one — worth knowing before you export it in a shell you keep
 around, rather than inline on the one command that needs it. The worked form is
 in [dev-gpu-recipes.md](dev-gpu-recipes.md).
 
+### Trees — more than one checkout per pod
+
+A pod can host more than one checkout: `--tree <name>` on
+`attach`/`run`/`logs`/`push`/`pull`/`target` selects a plain directory
+(`/root/trees/<name>`; the default `--tree jammi-ai` is the bootstrap checkout
+at `/root/jammi-ai`), never a git worktree — a worktree add fails on the
+checked-out ref, and a shared `.git` couples trees that must be able to
+diverge independently. `gpu-dev.sh target <session> <name>` creates one by
+cloning the pod's own build-substrate seed (above); `--with-cutlass`
+additionally provisions the CUTLASS submodule for a tree that will build the
+`flash-attn` feature. Each tree gets its own job script/log
+(`<tree>/.jammi-job.sh`, `<tree>/.jammi.log`) and its own tmux session
+(`jammi-<tree>`), so two trees' `run` jobs never collide.
+
 `push` deliberately excludes `target/` — your host build output is the wrong
-architecture and would poison the pod's.
+architecture and would poison the pod's — along with `.git`, `.venv*`,
+`.claude`, `.sccache`, `.gpu-pull`, `scratchpad`, and the CUTLASS submodule
+(provisioned separately, never rsync'd; see `target --with-cutlass` above).
 
 **`--ref` and `push` are alternatives, not partners.** `push` is
-`rsync --delete` excluding `.git`, so it overwrites the working tree while
-leaving the pod's git metadata pointing at whatever was checked out: the pod then
-reports HEAD on one ref while holding the contents of another, and every git
-command on the pod answers about the wrong thing. Use `--ref` for the modes that
-do not push — a shell on a branch, an editor session, a job run straight from a
-pushed branch — and leave the pod on `main` when the push loop is what moves your
-code.
+`rsync -azc --no-times --delete` (the excludes above), so it overwrites the
+working tree while leaving the pod's git metadata pointing at whatever was
+checked out: the pod then reports HEAD on one ref while holding the contents
+of another, and every git command on the pod answers about the wrong thing.
+Use `--ref` for the modes that do not push — a shell on a branch, an editor
+session, a job run straight from a pushed branch — and leave the pod on
+`main` when the push loop is what moves your code.
+
+`push` also writes `<tree>/.jammi-push-stamp.json` — the laptop's HEAD, a
+sha256 of `git status --porcelain`, a sha256 of `git diff HEAD`, and a
+sha256 over the sorted (path, mode, content-sha256) manifest of exactly what
+the SAME exclude set would push (computed locally against an empty temp
+directory, so it is deterministic regardless of the pod's current state).
+This is **iteration provenance only** — a human debugging a live session can
+tell what a pod actually received. It changes nothing about
+`check_cuda_run_artifacts.py`'s `git_sha` rule: a **committed** artifact
+still requires a pushed sha (a commit reachable from a remote branch), never
+a push stamp.
+
+### The timing lock — one exclusive build slot per pod
+
+`run --timing` and the automatic seed build both acquire a single
+pod-wide `flock` (`/root/.jammi-timing.lock`) INSIDE their own detached tmux
+pane — the flock's lifetime is then the job's lifetime, not the short-lived
+SSH invocation that launched tmux and returned immediately. A conflicting
+`run --timing` (or another timing-sensitive producer, e.g.
+`ci/scripts/perf/pod_build_timings.sh`) refuses immediately with exit `75`
+rather than queuing silently, naming the current holder from the lock's own
+holder file. The lock is **kernel-owned**: it dies the instant its holding
+process exits or is killed, so there is no stale-lock state to clean up and
+nothing to "steal" — an earlier rename-based scheme this replaced could be
+raced into a double-acquire under a scheduling gap; `flock` removes the gap
+entirely. Note the flip side, verified directly: `flock file command` forks
+to run `command`, and a POSIX `flock()` lock is bound to the OPEN FILE
+DESCRIPTION, which `fork()` shares — so killing ONLY the `flock` process
+itself, leaving its child running, does **not** free the lock (the child
+still holds the inherited fd). The realistic "holder dies" shape this
+tooling relies on is `tmux kill-session`, which SIGHUPs the whole pane
+**process group** at once (`run` does exactly this before starting the next
+job) — killing the full tree frees the lock; killing just the wrapper does
+not. Do not `nohup`/`&` a daemon out from under a lock-guarded job expecting
+the lock to release while that daemon keeps running.
 
 ## Cost guard
 
@@ -409,6 +477,15 @@ The `gpu-prove` workflow (`_gpu-prove-gate.yml`) runs `grpc_embedding_gpu` +
 (`ci/scripts/runpod_lib.sh`), gating every CUDA release (build → prove →
 promote). Trigger it per-PR with the `run-gpu` label, or it runs nightly. CI pods
 are always throwaway and always terminate.
+
+### Cross-pod seed cache — not yet built
+
+The seed/clone substrate above is per-pod: a second pod builds its own seed
+from scratch. A cross-pod cache (a laptop-minted presigned PUT of a seed
+tarball to a read-only object-store bucket, so a NEW pod can rehydrate rather
+than rebuild) is **phase 2 of this unit, not in this PR**, and is blocked on
+a user action: creating the bucket (`jammi-seed-cache`) and a read-only
+access token. Nothing in this tooling reads or writes that bucket today.
 
 ## Notes
 

@@ -33,6 +33,12 @@ jammi-wire.workspace = true
 jammi-encoders = { workspace = true, optional = true }
 candle-core = { workspace = true, optional = true }
 candle-nn = { workspace = true, optional = true }
+# The fused, in-place multi-tensor AdamW step (`crates/jammi-kernels/src/ops/adamw_step.rs`)
+# that `fine_tune::adamw::AdamW::step` dispatches to behind `jammi_kernels::admission::admit` —
+# same leaf crate `jammi-encoders`/`jammi-lora` already depend on for their own fused ops.
+# Optional/`local`-gated for the same reason `candle-core` is: it is only reachable through
+# the embedded engine's candle-backed fine-tune path.
+jammi-kernels = { workspace = true, optional = true }
 hf-hub = { workspace = true, optional = true }
 tokenizers = { workspace = true, optional = true }
 # Lexical (BM25) retrieval sidecar — the tantivy inverted index, peer of the
@@ -117,6 +123,7 @@ local = [
     "dep:jammi-encoders",
     "dep:candle-core",
     "dep:candle-nn",
+    "dep:jammi-kernels",
     "dep:hf-hub",
     "dep:tokenizers",
     "dep:tantivy",
@@ -163,13 +170,17 @@ live-gpu-tests = ["local"]
 # LoRA-epilogue commit) forwards the same way, through `jammi-lora`'s own
 # `cuda = ["jammi-kernels/cuda"]` feature — `jammi-lora` and `jammi-encoders`
 # both depend on the same leaf `jammi-kernels` crate, not on each other, so
-# each needs its own forwarding entry in this list.
+# each needs its own forwarding entry in this list. `jammi-kernels/cuda`
+# itself is now a direct entry too: `fine_tune::adamw::AdamW::step` depends
+# on `jammi-kernels` directly (the fused multi-tensor AdamW step), not only
+# transitively through `jammi-encoders`/`jammi-lora`.
 cuda = [
     "local",
     "candle-core/cuda",
     "candle-nn/cuda",
     "jammi-encoders/cuda",
     "jammi-lora/cuda",
+    "jammi-kernels/cuda",
 ]
 metal = ["local", "candle-core/metal", "candle-nn/metal"]
 

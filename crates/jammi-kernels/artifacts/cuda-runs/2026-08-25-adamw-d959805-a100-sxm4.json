@@ -1,0 +1,124 @@
+{
+  "schema_version": 1,
+  "unit": "perf-multi-tensor-adamw-r2",
+  "git_sha": "d95980597afb5373832f6aabdea7eaafb2574248",
+  "merged_as": "6d07b208e5bf1914597e1247f0e5f731f6de528f",
+  "merged_via_pr": 380,
+  "date": "2026-08-26T01:30:41Z",
+  "box": "jammi-a100d (NVIDIA A100-SXM4-80GB, driver 580.159.04)",
+  "driver": "580.159.04",
+  "gpu": "NVIDIA A100-SXM4-80GB",
+  "nvcc": "Cuda compilation tools, release 12.6, V12.6.85",
+  "features": "cuda,live-gpu-tests",
+  "status": "GREEN",
+  "producer": {
+    "path": "crates/jammi-kernels/tests/cuda_parity.rs",
+    "kind": "cargo-test",
+    "invocation": "JAMMI_REQUIRE_CUDA=1 cargo test -p jammi-kernels --features cuda --test cuda_parity --release -- --exact adamw_step_changing_lr_over_five_steps_bit_identical",
+    "gating": "required-features"
+  },
+  "note": "Execution provenance for perf/multi-tensor-adamw-r2's OWN tip — closes the ledger's finding (row 215 class) that this branch's AdamW kernel/op/cuda_parity content, and its jammi-ai wiring, shipped with zero artifact naming its own tip: the AdamW-specific commits cherry-picked here from perf/multi-tensor-adamw were previously covered only by that OTHER branch's artifacts (crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-p1-5f29e3b-a100-sxm4.json etc.), three of which name SHAs that are ancestors of no ref on THIS branch (squash-merged, unreachable from perf/multi-tensor-adamw-r2's history) and none of which this branch's own tip is reachable from either. `git_sha` above is the commit immediately BEFORE this artifact's own commit (this file is committed as the last commit on the branch), so it names its own parent, not itself.",
+  "gates_run_on_this_worktree_tip": {
+    "cargo_fmt": "cargo fmt -p jammi-kernels -p jammi-ai -p jammi-bench --check -- PASS (local, non-pod)",
+    "cargo_clippy_cuda": "cargo clippy -p jammi-kernels --all-targets --features cuda -- -D warnings -- PASS (this pod)",
+    "cargo_test_kernels_lib": "cargo test -p jammi-kernels -- PASS, 276 lib + 46 integration passed (local, non-pod)",
+    "cargo_test_ai": "cargo test -p jammi-ai -- PASS, 296 passed (local, non-pod)",
+    "cargo_test_bench": "cargo test -p jammi-bench -- PASS, 92 passed (local, non-pod)",
+    "rustdoc_ai": "RUSTDOCFLAGS=\"-D warnings\" cargo doc -p jammi-ai --no-deps -- PASS (local, non-pod)",
+    "rustdoc_kernels": "RUSTDOCFLAGS=\"-D warnings\" cargo doc -p jammi-kernels --no-deps -- PASS (local, non-pod)",
+    "rustdoc_workspace": "RUSTDOCFLAGS=\"-D warnings\" cargo doc --workspace --exclude jammi-python --no-deps -- PASS (local, non-pod; run because Cargo.toml is shared-declaration class)"
+  },
+  "cuda_parity_adamw_legs": {
+    "invocation": "JAMMI_REQUIRE_CUDA=1 cargo test -p jammi-kernels --features cuda --test cuda_parity --release -- adamw",
+    "passed": 8,
+    "failed": 0,
+    "filtered_out": 78,
+    "tests": [
+      { "name": "adamw_step_empty_tensor_on_cuda_is_a_no_op_not_a_crash", "status": "ok" },
+      { "name": "adamw_step_fma_contracted_red_control_diverges_from_eager_cuda", "status": "ok" },
+      { "name": "adamw_step_cpu_cuda_bit_identical_lora_b_wo_shape", "status": "ok" },
+      { "name": "adamw_step_zero_weight_decay_bit_identical", "status": "ok" },
+      { "name": "adamw_step_cpu_cuda_bit_identical_lora_a_shape", "status": "ok" },
+      { "name": "adamw_step_cpu_cuda_bit_identical_lora_b_wqkv_shape", "status": "ok" },
+      { "name": "adamw_step_cpu_cuda_bit_identical_lora_b_wi_shape", "status": "ok" },
+      { "name": "adamw_step_changing_lr_over_five_steps_bit_identical", "status": "ok" }
+    ]
+  },
+  "jammi_ai_adamw_lib_tests_cuda": {
+    "invocation": "JAMMI_REQUIRE_CUDA=1 cargo test -p jammi-ai --features cuda,live-gpu-tests --lib fine_tune::adamw",
+    "passed": 25,
+    "failed": 0,
+    "filtered_out": 236,
+    "note": "25, not 22 — the 3 device-mismatch admission_predicate tests (second_moment/first_moment/grad_on_a_different_device_is_refused_with_the_exact_reason) are only reachable with a second CUDA device visible; they run and pass here, matching #98fc314's own mutation-testing note that these 2-3 clauses are cuda-only-reachable."
+  },
+  "optimizer_phase_wall_time_ms": {
+    "method": "TEMPORARY, uncommitted diagnostic (crates/jammi-ai/tests/tmp_adamw_optimizer_phase_timing.rs, not part of this commit) — 20 warmup iterations then 200 timed iterations per run, dev.synchronize() after every timed AdamW::step call, no allocation inside the timed loop beyond what AdamW::step itself performs (the fixture Vars/GradStore are built once, outside the loop). Run twice per arm. 224 Vars over the 6 production LoRA shapes tiled across 28 layers, matching the dispatch_arms production-shape census.",
+    "eager_arm": {
+      "how_forced": "JAMMI_KERNELS_DISABLE=adamw_step_fused (the real production admission switch, not a test-only bypass)",
+      "run_1": { "min_ms": 23.8592, "median_ms": 24.7481, "mean_ms": 24.7765 },
+      "run_2": { "min_ms": 24.1893, "median_ms": 25.1467, "mean_ms": 25.1199 }
+    },
+    "fused_arm": {
+      "how_forced": "default admission (no JAMMI_KERNELS_DISABLE)",
+      "run_1": { "min_ms": 2.6004, "median_ms": 2.6881, "mean_ms": 2.7097 },
+      "run_2": { "min_ms": 2.6053, "median_ms": 2.6705, "mean_ms": 2.6740 }
+    },
+    "speedup_median_run1": 9.2065,
+    "speedup_median_run2": 9.4165,
+    "cross_check": "matches #98fc314's own commit-message THE NUMBER (eager 24.01-24.19 ms/step, fused 2.53-2.87 ms/step, ~8.8-9.2x) within run-to-run pod variance."
+  },
+  "finetune_step_forced_arm_ab": {
+    "params": {
+      "model_dir": "/root/checkpoints/ModernBERT-large",
+      "lora_rank": 16,
+      "lora_alpha": 32,
+      "target_modules": ["Wqkv", "Wo", "Wi"],
+      "backbone_dtype": "bf16",
+      "batch": 8,
+      "seq": 128,
+      "steps": 25,
+      "warmup": 5,
+      "trainable_tensors": 224
+    },
+    "fused": {
+      "invocation": "JAMMI_KERNELS_STRICT=1 jammi-bench finetune-step --model-dir /root/checkpoints/ModernBERT-large --lora-rank 16 --lora-alpha 32 --target-modules Wqkv,Wo,Wi --backbone-dtype bf16 --cuda 0 --seed 42 --batched-forward true --steps 25 --warmup 5 --batch 8 --seq 128 --lora-dropout 0",
+      "raw_run_file": "2026-08-25-adamw-d959805-a100-sxm4-raw-runs/r2/b8_s128_fused.json.raw",
+      "s_per_step_p50": 0.172881866,
+      "adamw_fused_dispatches": 6720,
+      "adamw_eager_dispatches": 0,
+      "kernels_disabled_requested": [],
+      "kernels_disabled_fired": []
+    },
+    "disabled": {
+      "invocation": "JAMMI_KERNELS_STRICT=1 JAMMI_KERNELS_DISABLE=adamw_step_fused jammi-bench finetune-step --model-dir /root/checkpoints/ModernBERT-large --lora-rank 16 --lora-alpha 32 --target-modules Wqkv,Wo,Wi --backbone-dtype bf16 --cuda 0 --seed 42 --batched-forward true --steps 25 --warmup 5 --batch 8 --seq 128 --lora-dropout 0 --expect-kernels-disabled adamw_step_fused",
+      "raw_run_file": "2026-08-25-adamw-d959805-a100-sxm4-raw-runs/r2/b8_s128_disabled.json.raw",
+      "s_per_step_p50": 0.189886206,
+      "adamw_fused_dispatches": 0,
+      "adamw_eager_dispatches": 6720,
+      "kernels_disabled_requested": ["adamw_step_fused"],
+      "kernels_disabled_fired": ["adamw_step_fused"]
+    },
+    "counter_lines": [
+      "fused: 6720/0 (adamw_fused_dispatches/adamw_eager_dispatches), requested==fired==[]",
+      "disabled (JAMMI_KERNELS_DISABLE=adamw_step_fused): 0/6720, requested==fired==[\"adamw_step_fused\"]"
+    ]
+  },
+  "a100b_full_step_ab_reference": {
+    "box": "a100b (lead's exclusive box — different from this artifact's own jammi-a100d box)",
+    "raw_runs_dir": "2026-08-25-adamw-d959805-a100-sxm4-raw-runs/a100b/",
+    "provenance_note": "2026-08-25-adamw-d959805-a100-sxm4-raw-runs/a100b/PROVENANCE.md — git_sha for these runs is NOT resolvable against this worktree's ancestry (a different, clip-including branch state); files kept as .json.raw, outside the schema gate's *.json glob, rather than fabricating a git_sha.",
+    "params": { "batch": 8, "backbone_dtype": "bf16", "target_modules": ["Wqkv", "Wo", "Wi"], "lora_rank": 16 },
+    "summary": {
+      "s512": {
+        "disabled_eager_p50_r1_r2": [0.675926908, 0.675146455],
+        "fused_p50_r1_r2": [0.658921588, 0.65935999],
+        "adamw_dispatches_disabled_vs_fused": "0/6720 vs 6720/0 on every run"
+      },
+      "s128": {
+        "disabled_eager_p50_r1_r2": [0.198615414, 0.199047347],
+        "fused_p50_r1_r2": [0.182207528, 0.182322336],
+        "adamw_dispatches_disabled_vs_fused": "0/6720 vs 6720/0 on every run"
+      }
+    }
+  }
+}

@@ -44,10 +44,20 @@
 use std::time::Instant;
 
 use candle_core::{DType, Device, Tensor};
-use candle_nn::{Optimizer, VarMap};
+use candle_nn::VarMap;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+
+// The Jammi-owned, fused-kernel-wired AdamW (`jammi_ai::fine_tune::adamw::AdamW`),
+// not `candle_nn::AdamW`: this tier measures the step the shipped trainer
+// actually runs (`fine_tune::trainer::TrainingLoop` builds its optimizer via
+// THIS type — see that module), and the fused/eager dispatch split
+// (`adamw_fused_dispatches`/`adamw_eager_dispatches` on `FinetuneStepTier`)
+// is only a real, non-vacuous signal if the step loop dispatches through the
+// SAME `admit`-gated path production does, not a foreign optimizer that
+// never touches `jammi_kernels::admission`'s registry at all.
+use jammi_ai::fine_tune::adamw::AdamW;
 
 use crate::report::{FinetuneStepTier, Measurement};
 
@@ -216,7 +226,7 @@ fn build_fixture(
 ) -> Result<
     (
         jammi_encoders::ModernBert,
-        candle_nn::AdamW,
+        AdamW,
         usize,
         Vec<Tensor>,
         Tensor,
@@ -261,7 +271,7 @@ fn build_fixture(
         return Err("no trainable LoRA tensors — target_modules matched nothing".into());
     }
     let trainable_count = trainable.len();
-    let opt = candle_nn::AdamW::new(
+    let opt = AdamW::new(
         trainable,
         candle_nn::ParamsAdamW {
             lr: 2e-4,
@@ -304,7 +314,7 @@ fn build_fixture(
 /// reason, so the two stacks share this placement convention.
 fn step_once(
     encoder: &mut jammi_encoders::ModernBert,
-    opt: &mut candle_nn::AdamW,
+    opt: &mut AdamW,
     blocks: &[Tensor],
     mask: &Tensor,
     batch: usize,
@@ -483,6 +493,13 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     let lora_linear_fused_dispatch_before = jammi_lora::lora_linear_fused_dispatch_snapshot();
     // Same mechanism, for the fused whole-attention-block kernel.
     let attention_block_dispatch_before = jammi_encoders::attention_block_dispatch_snapshot();
+    // Same mechanism, for the fused multi-tensor AdamW step kernel
+    // (`jammi_ai::fine_tune::adamw::AdamW::step`, registry key
+    // `"adamw_step_fused"` — the same key a caller names in
+    // `JAMMI_KERNELS_DISABLE` to force the eager arm; see this tier's own
+    // report doc for how that forced-eager run is validated end-to-end).
+    let adamw_dispatch_before =
+        jammi_kernels::admission::counters_for("adamw_step_fused").snapshot();
 
     let mut times = Vec::with_capacity(params.steps);
     let mut losses = Vec::with_capacity(params.steps);
@@ -512,6 +529,8 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     let lora_epilogue_dispatch_after = jammi_lora::lora_epilogue_dispatch_snapshot();
     let lora_linear_fused_dispatch_after = jammi_lora::lora_linear_fused_dispatch_snapshot();
     let attention_block_dispatch_after = jammi_encoders::attention_block_dispatch_snapshot();
+    let adamw_dispatch_after =
+        jammi_kernels::admission::counters_for("adamw_step_fused").snapshot();
 
     // `JAMMI_KERNELS_DISABLE` safety property (contract K-aux): a
     // disable-list entry that never actually disabled a live `admit` call
@@ -630,6 +649,12 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
         attention_block_eager_dispatches: attention_block_dispatch_after
             .eager
             .saturating_sub(attention_block_dispatch_before.eager),
+        adamw_fused_dispatches: adamw_dispatch_after
+            .fused
+            .saturating_sub(adamw_dispatch_before.fused),
+        adamw_eager_dispatches: adamw_dispatch_after
+            .eager
+            .saturating_sub(adamw_dispatch_before.eager),
         kernels_disabled_requested,
         kernels_disabled_fired,
         s_per_step_p50: Measurement::measured(p50, "s"),
@@ -831,6 +856,12 @@ mod tests {
         let attention_block_total = |t: &FinetuneStepTier| {
             t.attention_block_fused_dispatches + t.attention_block_eager_dispatches
         };
+        // AdamW-side counter: every measured step (plus the untimed
+        // pre-step, which is outside this test's before/after window) runs
+        // one `AdamW::step` over every trainable `Var`, so this total is
+        // non-zero on any run with at least one trainable tensor.
+        let adamw_total =
+            |t: &FinetuneStepTier| t.adamw_fused_dispatches + t.adamw_eager_dispatches;
 
         for (name, total_of) in [
             ("ln", ln_total as fn(&FinetuneStepTier) -> u64),
@@ -838,6 +869,7 @@ mod tests {
             ("softmax", softmax_total),
             ("geglu", geglu_total),
             ("attention_block", attention_block_total),
+            ("adamw", adamw_total),
         ] {
             let base = total_of(&baseline);
             let after = total_of(&after_inflation);
@@ -1028,8 +1060,10 @@ mod tests {
     /// near margin" bound loose enough not to notice a 5x rate change.
     ///
     /// AdamW's own well-known first-step property is the oracle:
-    /// `candle_nn::AdamW::step`'s formula (`next_theta = theta*(1-lr*wd) -
-    /// lr*(m_hat/(sqrt(v_hat)+eps))`, `optim.rs`) reduces, at `step_t ==
+    /// [`jammi_ai::fine_tune::adamw::AdamW::step`]'s formula (`next_theta =
+    /// theta*(1-lr*wd) - lr*(m_hat/(sqrt(v_hat)+eps))`, numerically
+    /// identical to `candle_nn::AdamW::step`'s own — see that type's module
+    /// doc) reduces, at `step_t ==
     /// 1`, to `m_hat == grad` and `v_hat == grad^2` exactly (bias
     /// correction cancels the `(1-beta1)`/`(1-beta2)` EMA blend on the
     /// very first update), so `m_hat/(sqrt(v_hat)+eps) == grad/(|grad| +
@@ -1410,7 +1444,7 @@ mod tests {
 
     /// F1 REGRESSION (audit finding on PR #372): `peak_vram_bytes` is
     /// `VramSampler::finish`'s `peak.saturating_sub(baseline)`
-    /// (`finetune_step.rs:114` at the time of writing). `saturating_sub`
+    /// (`finetune_step.rs:124` at the time of writing). `saturating_sub`
     /// FLOORS at zero rather than wrapping — so if `baseline` is ever
     /// captured AT (or above) the run's own high-water mark, the reported
     /// delta collapses to zero even though the run legitimately allocated

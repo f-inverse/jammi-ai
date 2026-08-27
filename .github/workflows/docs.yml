@@ -114,7 +114,10 @@ jobs:
   deploy:
     name: Deploy
     needs: build
-    if: github.event_name != 'pull_request'
+    # The production Pages site deploys only from the default branch (push,
+    # or a recovery dispatch run on main) — a branch dispatch builds the
+    # site artifact without repointing the live docs at a feature branch.
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment:
       name: github-pages

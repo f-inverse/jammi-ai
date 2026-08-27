@@ -59,10 +59,15 @@ jobs:
           images: ghcr.io/${{ github.repository }}-${{ inputs.image_suffix }}
           # `latest` is what every consumer's `vars.JAMMI_CI_IMAGE[_CUDA] ||
           # 'ghcr.io/...:latest'` expression resolves to, and what the repo
-          # variables are set to. `type=sha,format=long` is published alongside
-          # it as an immutable handle for pinning a build by hand.
+          # variables are set to — the toolchain layer the crates.io publish
+          # and the release lanes build inside. It therefore only moves from
+          # the DEFAULT branch (`enable={{is_default_branch}}`): a dispatch on
+          # a feature branch publishes the immutable `sha-<sha>` handle only,
+          # never repoints the channel every release lane consumes.
+          # `type=sha,format=long` is published alongside as an immutable
+          # handle for pinning a build by hand.
           tags: |
-            type=raw,value=latest
+            type=raw,value=latest,enable={{is_default_branch}}
             type=sha,format=long
 
       # rust-toolchain.toml is the single source of truth for the pin. The build

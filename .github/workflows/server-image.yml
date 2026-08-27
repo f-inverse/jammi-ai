@@ -56,11 +56,17 @@ env:
   IMAGE_NAME_CU12: ${{ github.repository_owner }}/jammi-ai-server-cu12
 
 jobs:
-  # CPU image: tag- and dispatch-triggered push. Never runs on pull_request
-  # (PRs must not push to GHCR); the CPU image already builds on every CI run
-  # via the workspace's regular pipeline, so no PR build-only job is needed here.
+  # CPU image: pushed from `v*` tag refs (semver tags) and from the default
+  # branch (`latest` + sha) — a tag push, or a recovery dispatch run on the
+  # tag or on main. A feature-branch dispatch pushes nothing: the
+  # `latest`/semver scheme is a promotion channel, the same rationale the
+  # CUDA job below states, minus the A100 gate (the CPU path is exercised by
+  # the workspace's regular CI on every merge). Never runs on pull_request
+  # (PRs must not push to GHCR).
   build-and-push:
-    if: github.event_name != 'pull_request'
+    if: >-
+      github.event_name != 'pull_request' &&
+      (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     permissions:
       contents: read

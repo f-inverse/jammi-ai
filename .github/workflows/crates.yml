@@ -3,15 +3,15 @@ name: Crates
 on:
   push:
     tags: ["v*"]
-  # Manual re-run to finish a release whose publish step was interrupted (e.g. a
-  # runner ran out of disk mid-publish). Pass the version to (re)publish; the
-  # per-crate "already on crates.io" guard skips whatever already landed.
+  # Manual re-run to finish a release whose publish step was interrupted (e.g.
+  # a runner ran out of disk mid-publish): run the dispatch ON the `v*` tag —
+  # the publish job is tag-guarded, the version derives from the tag ref, and
+  # the per-crate "already on crates.io" guard skips whatever already landed.
+  # No `version` input: `cargo publish` ships the checked-out workspace, so an
+  # input could only key the idempotence probes on a different quantity than
+  # what publishes (publish_crates.sh cross-checks and would refuse anyway).
+  # A branch dispatch runs validate + perf-gate as a dry run and stops there.
   workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to (re)publish, e.g. 0.13.0. Defaults to the pushed tag."
-        required: false
-        type: string
 
 concurrency:
   group: release
@@ -201,19 +201,20 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
           # The script derives the version from the tag ref (v0.13.0 ->
-          # 0.13.0; this job only runs on `v*` tag refs) and a dispatch may
-          # state it explicitly — either way the script cross-checks the
-          # result against the workspace Cargo.toml and refuses on mismatch,
-          # so a stale input can never probe-and-skip the wrong version.
-          INPUT_VERSION: ${{ github.event.inputs.version }}
+          # 0.13.0; this job only runs on `v*` tag refs) and cross-checks it
+          # against the workspace Cargo.toml, refusing on mismatch — the
+          # idempotence probes can never be keyed on a version other than
+          # the one `cargo publish` would ship.
         run: bash ci/scripts/publish_crates.sh
 
   github-release:
     name: GitHub Release
     needs: publish
-    # Only on a tag push — a manual dispatch (used to finish an interrupted
-    # publish) has no tag ref to create a release from.
-    if: github.event_name == 'push'
+    # Any `v*` tag ref — `publish` above is tag-guarded, so a recovery
+    # dispatch run on the tag reaches here with the same tag ref a push has,
+    # and the recovery creates the release too instead of publishing crates
+    # while leaving the release missing.
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write

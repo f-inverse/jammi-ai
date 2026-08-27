@@ -110,17 +110,15 @@ retry_transient() {
   done
 }
 
-# On a tag push, derive the version from the tag (v0.13.0 -> 0.13.0);
-# on a manual dispatch, take it from the input (INPUT_VERSION, set by the
-# workflow step's env from the dispatch input).
-VERSION="${INPUT_VERSION:-}"
-VERSION="${VERSION:-${GITHUB_REF_NAME#v}}"
+# Derive the version from the tag ref (v0.13.0 -> 0.13.0) — the publish job
+# only runs on `v*` tag refs, push or dispatch-on-tag alike.
+VERSION="${GITHUB_REF_NAME#v}"
 
 # VERSION drives the presence probes and index waits below, but `cargo
 # publish` publishes whatever the checked-out workspace says — so a VERSION
 # that disagrees with the workspace would key every idempotence probe on the
-# wrong quantity (a stale dispatch input could read "already published" and
-# skip real work, green). Refuse the mismatch instead.
+# wrong quantity (reading "already published" and skipping real work,
+# green). A tag that drifted from the workspace version is refused here.
 workspace_version="$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')"
 if [ -z "$workspace_version" ] || [ "$VERSION" != "$workspace_version" ]; then
   echo "::error::VERSION '${VERSION}' (from the dispatch input or tag ref) does not match the workspace version '${workspace_version}' this checkout would publish — refusing" >&2

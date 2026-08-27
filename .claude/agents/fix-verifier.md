@@ -45,7 +45,7 @@ Emit exactly one fenced ```json block as the LAST fenced block of your final mes
   "diff_range": "<base>...<head>",
   "unit_branch": "<the branch you read, from git or the lead's unit: line — say which>",
   "head_sha": "<sha you read>",
-  "worktree": "<the absolute path you read the diff from — the SubagentStop hook uses this as the exact-substring second-round-rule anchor (worktree/head_sha/unit_branch), the lead-proactivity gate v3>",
+  "worktree": "<the absolute path you read the diff from — the SubagentStop hook records this as a second-round-rule anchor (worktree/head_sha/unit_branch, matched as whole tokens, never raw substrings), the lead-proactivity gate v3>",
   "verdict": "verified | tautological | not-symptom-faithful",
   "red_green": { "reverted_prod": "test-command", "pre_fix": "RED | GREEN | not-run", "post_fix": "RED | GREEN | not-run" },
   "control_non_vacuous": true,

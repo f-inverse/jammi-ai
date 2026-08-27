@@ -32,9 +32,19 @@ Required fixtures (RED when the corresponding hook arm is removed):
   G12 a SAME-agent_type PASS clears its own BLOCK
   G13 a fix-verifier PASS clears an OLDER adversarial-audit BLOCK only when
       that BLOCK's relay artifact was accepted (not when it wasn't)
+  G14 an UNPARSEABLE latest row gates exactly like a BLOCK (`is_open`
+      covers both values — audit-r3 finding 5's surviving mutant)
+  G15 anchors bind as WHOLE TOKENS, never raw substrings (audit-r3 finding
+      1): an open BLOCK on `ci/gpu` does NOT gate `ci/gpu-dev`, `<worktree>2`
+      and a 7-char-lookalike hex token do NOT gate; a path UNDER the
+      recorded worktree and a TRUE >=7-char sha prefix still DO
   L1  closed-world agent-type lattice: unrecognized type -> deny
   L2  every `.claude/agents/*.md` card (+ harness built-ins) is classified;
       NEVER_GATED members carry no Edit/Write/MultiEdit in `tools:`
+  L3  the agent-type field is read under every known spelling
+      (`agent_type` works like `subagent_type`); a dispatch payload with NO
+      agent-type field at all is a DISTINCT deny arm with its own remedy,
+      never the unknown-type arm (audit-r3 finding 4)
   V1  a schema-template block quoted after a real one -> UNPARSEABLE(template)
   V2  a truncated fenced ```json block (no closing brace) -> UNPARSEABLE
       row IS written, never silently dropped
@@ -47,10 +57,16 @@ Required fixtures (RED when the corresponding hook arm is removed):
       binding, never a shared UNBOUND bucket, when a binding exists
   V9  a fenced ```json block with `kind` != "verdict" is UNPARSEABLE (does
       NOT fall back to the tag walk when a fenced block IS present)
+  V10 the OPENING-marker scan is string-aware (audit-r3 finding 2): a PASS
+      whose `notes` STRING mentions the ```json marker is recorded as PASS,
+      not UNPARSEABLE
   E1  non-UTF-8 payload -> exit 2 (never 1)
   E2  python3 absent from PATH -> exit 2 (never 1)
   E3  a python3 that exits non-zero for an unrelated reason -> the wrapper
       still maps it to exit 2, never propagates the raw code
+  E4  a UTF-8-valid but JSON-invalid payload (and a JSON non-object) ->
+      `pre` exits 2, never coerced to `{}` and allowed (audit-r3 finding
+      3); `stop` stays a best-effort writer and exits 0
   N6  no open BLOCK anywhere -> nothing gated
   N7  wall time < 1s per invocation
   R10 wiring: SubagentStart/SubagentStop/PreToolUse(Agent|Task) present,
@@ -348,6 +364,57 @@ def fixture_g13_verifier_pass_clears_audited_block_only_with_relay() -> None:
     # silently claimed covered.
 
 
+def fixture_g14_unparseable_row_gates_like_block() -> None:
+    """audit-r3 finding 5: mutating `is_open` so UNPARSEABLE no longer
+    gates left the whole self-test green. This arm dies with that mutant:
+    a unit whose ONLY row is UNPARSEABLE (no BLOCK row anywhere) must gate
+    a same-type second dispatch that names its unit_branch."""
+    root = _fresh_root()
+    p = _run("lead-gate-start.sh", {"agent_id": "g14", "agent_type": "adversarial-audit",
+                                     "prompt": "unit: feat/g14\naudit please"}, root)
+    _assert(p.returncode == 0, "G14 setup", "start must exit 0")
+    p = _run("lead-gate-stop.sh", {"agent_id": "g14", "agent_type": "adversarial-audit",
+                                    "last_assistant_message": "ran out of context, no verdict"}, root)
+    _assert(p.returncode == 0, "G14 setup", "stop must exit 0")
+    row = _read_only_row(root, "feat_g14")
+    _assert(row["verdict"] == "UNPARSEABLE", "G14 setup", f"expected UNPARSEABLE, got {row['verdict']!r}")
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/g14 now"}}, root)
+    _assert(p.returncode == 2, "G14",
+            f"an UNPARSEABLE latest row must gate exactly like a BLOCK, got {p.returncode}: {p.stderr}")
+
+
+def fixture_g15_whole_token_anchors_never_raw_substrings() -> None:
+    """audit-r3 finding 1: `ub in text` was a raw substring match, so an
+    open BLOCK on `ci/gpu` denied the FIRST audit of `ci/gpu-dev`. Anchors
+    bind as whole tokens: near-miss longer tokens ALLOW; a path UNDER the
+    recorded worktree and a TRUE >=7-char sha prefix still DENY."""
+    root = _fresh_root()
+    row = _write_block_row(root, "ci/gpu", "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
+
+    # Near misses — every one of these was a false DENY under substring matching.
+    for label, prompt in (
+        ("unit-prefix", "unit: ci/gpu-dev\nFIRST audit of the gpu-dev unit"),
+        ("worktree-prefix", f"FIRST audit at {row['worktree']}2"),
+        ("sha-lookalike", f"FIRST audit of commit {row['head_sha'][:7]}9 (a different commit)"),
+    ):
+        p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+            "subagent_type": "adversarial-audit", "prompt": prompt}}, root)
+        _assert(p.returncode == 0, "G15",
+                f"[{label}] a longer token merely CONTAINING the anchor must allow, got {p.returncode}: {p.stderr}")
+
+    # True references — still denied.
+    for label, prompt in (
+        ("path-under-worktree", f"re-audit the diff at {row['worktree']}/crates/x"),
+        ("8-char-sha-prefix", f"re-audit commit {row['head_sha'][:8]} please"),
+        ("exact-unit", "re-audit unit: ci/gpu now"),
+    ):
+        p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+            "subagent_type": "adversarial-audit", "prompt": prompt}}, root)
+        _assert(p.returncode == 2, "G15",
+                f"[{label}] a true whole-token reference must still deny, got {p.returncode}: {p.stderr}")
+
+
 # ==========================================================================
 # L1 / L2 — the closed-world agent-type lattice
 # ==========================================================================
@@ -400,8 +467,34 @@ def fixture_l2_agent_card_lattice_cross_check() -> None:
                     f"NEVER_GATED {name!r} declares write tool(s) {leaked} in its tools: frontmatter")
 
 
+def fixture_l3_subtype_key_spellings_and_distinct_absent_arm() -> None:
+    """audit-r3 finding 4: a payload without `subagent_type` (or spelling
+    the field differently) collapsed into deny-unknown with the
+    unrepresentable remedy "add '' to GATED_TYPES". The field is read under
+    every known spelling, and the absent-field case is its own deny arm
+    with its own remedy."""
+    root = _fresh_root()
+    # Alternate spelling behaves exactly like `subagent_type` (allow path).
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "agent_type": "adversarial-audit", "prompt": "unit: feat/l3\nfirst audit"}}, root)
+    _assert(p.returncode == 0, "L3", f"'agent_type' spelling must be read, got {p.returncode}: {p.stderr}")
+    # Alternate spelling behaves exactly like `subagent_type` (deny-unknown path).
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "agent_type": "lead", "prompt": "unit: feat/l3\nx"}}, root)
+    _assert(p.returncode == 2, "L3", f"an unknown type under an alternate spelling must deny, got {p.returncode}")
+    _assert("unknown agent type" in p.stderr, "L3", f"reason must be the unknown-type arm: {p.stderr!r}")
+    # NO agent-type field at all: a DISTINCT deny arm, never the unknown-type arm.
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "prompt": "unit: feat/l3\nx"}}, root)
+    _assert(p.returncode == 2, "L3", f"a payload with no agent-type field must deny, got {p.returncode}")
+    _assert("no agent-type field" in p.stderr, "L3",
+            f"absent-field deny must be its own arm with its own remedy: {p.stderr!r}")
+    _assert("unknown agent type" not in p.stderr, "L3",
+            f"absent-field deny must NOT collapse into the unknown-type arm: {p.stderr!r}")
+
+
 # ==========================================================================
-# V1-V9 — verdict parsing / row validity
+# V1-V10 — verdict parsing / row validity
 # ==========================================================================
 
 def _stop_and_read(root: Path, msg: str, agent_type: str = "adversarial-audit",
@@ -509,8 +602,25 @@ def fixture_v9_wrong_kind_is_unparseable() -> None:
             f"a fenced block with the wrong kind must be UNPARSEABLE (no fallback to the tag walk), got {row['verdict']!r}")
 
 
+def fixture_v10_marker_inside_notes_string_is_ignored() -> None:
+    """audit-r3 finding 2: the OPENING fence-marker scan was not
+    string-aware, so a PASS whose `notes` mentioned the marker was recorded
+    UNPARSEABLE and gated the unit closed. The scan jumps past every parsed
+    object before looking for a later marker."""
+    root = _fresh_root()
+    v = {"kind": "verdict", "verdict": "PASS", "unit_branch": "feat/v10",
+         "class_enumeration": [], "findings": [],
+         "notes": "the card's own ```json fence template was followed exactly"}
+    msg = "All clear.\n```json\n" + json.dumps(v) + "\n```\nDone."
+    row = _stop_and_read(root, msg)
+    _assert(row is not None, "V10", "expected a row")
+    _assert(row["verdict"] == "PASS", "V10",
+            f"a marker inside the verdict's own notes STRING must not corrupt the parse, got {row['verdict']!r}")
+    _assert(row["unit_branch"] == "feat/v10", "V10", f"got unit_branch={row.get('unit_branch')!r}")
+
+
 # ==========================================================================
-# E1-E3 — exit lattice
+# E1-E4 — exit lattice
 # ==========================================================================
 
 def fixture_e1_non_utf8_payload() -> None:
@@ -526,6 +636,22 @@ def fixture_e2_missing_python3() -> None:
     p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {}}, root,
              env_overrides={"PATH": str(empty_bin)})
     _assert(p.returncode == 2, "E2", f"a missing python3 must exit 2 (never 1), got {p.returncode}")
+
+
+def fixture_e4_json_invalid_payload_fails_closed() -> None:
+    """audit-r3 finding 3: a UTF-8-valid but JSON-invalid payload was
+    caught into `{}` and ALLOWED (only the decode-error sibling exited 2).
+    `pre` must exit 2 on a JSON-invalid payload AND on a JSON non-object;
+    `stop` stays a best-effort writer (exit 0, no row)."""
+    root = _fresh_root()
+    p = _run("lead-gate-pre.sh", b'{"tool_name": "Agent", "tool_input": {broken', root)
+    _assert(p.returncode == 2, "E4", f"a JSON-invalid payload must exit 2 (never allow), got {p.returncode}")
+    p = _run("lead-gate-pre.sh", b'[1, 2, 3]', root)
+    _assert(p.returncode == 2, "E4", f"a JSON non-object payload must exit 2, got {p.returncode}")
+    p = _run("lead-gate-pre.sh", b'', root)
+    _assert(p.returncode == 2, "E4", f"an empty payload must exit 2, got {p.returncode}")
+    p = _run("lead-gate-stop.sh", b'{"broken', root)
+    _assert(p.returncode == 0, "E4", f"stop is a best-effort writer, must exit 0, got {p.returncode}")
 
 
 def fixture_e3_broken_python3_on_path() -> None:
@@ -599,8 +725,11 @@ FIXTURES = [
     ("G11", fixture_g11_cross_type_non_interference),
     ("G12", fixture_g12_same_type_pass_clears),
     ("G13", fixture_g13_verifier_pass_clears_audited_block_only_with_relay),
+    ("G14", fixture_g14_unparseable_row_gates_like_block),
+    ("G15", fixture_g15_whole_token_anchors_never_raw_substrings),
     ("L1", fixture_l1_unknown_type_denied),
     ("L2", fixture_l2_agent_card_lattice_cross_check),
+    ("L3", fixture_l3_subtype_key_spellings_and_distinct_absent_arm),
     ("V1", fixture_v1_template_after_real_is_unparseable),
     ("V2", fixture_v2_truncated_writes_unparseable_row),
     ("V3", fixture_v3_unrecognized_value_diagnosable),
@@ -608,9 +737,11 @@ FIXTURES = [
     ("V7", fixture_v7_tag_inside_notes_string_does_not_corrupt),
     ("V8", fixture_v8_unparseable_filed_under_start_binding),
     ("V9", fixture_v9_wrong_kind_is_unparseable),
+    ("V10", fixture_v10_marker_inside_notes_string_is_ignored),
     ("E1", fixture_e1_non_utf8_payload),
     ("E2", fixture_e2_missing_python3),
     ("E3", fixture_e3_broken_python3_on_path),
+    ("E4", fixture_e4_json_invalid_payload_fails_closed),
     ("N6", fixture_n6_nothing_gated_when_no_block_anywhere),
     ("R10", fixture_r10_wiring),
 ]

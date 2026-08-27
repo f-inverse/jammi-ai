@@ -33,7 +33,7 @@ Each item is a **general principle** applied to a surface you have never seen. T
 
 ## Reporting the unit, not just the diff
 
-Report `unit_branch` (`git -C <worktree> rev-parse --abbrev-ref HEAD` if resolvable, else the `unit:` line the lead's brief carried — say which) and `head_sha` (`git rev-parse HEAD` at the same location). `discipline-test-auditor` sits outside `hooks/lead-gate-pre.sh`'s `GATED`/`NEVER_GATED` fresh-dispatch lists (it is neither a relay target nor a class the second-round rule names) — still report `class_enumeration` when a discipline-test finding has siblings (the same governance verb or consumer-shaped surface appearing at other sites the diff touches); `sweep_method: "none"` when you did not sweep.
+Report `unit_branch` (`git -C <worktree> rev-parse --abbrev-ref HEAD` if resolvable, else the `unit:` line the lead's brief carried — say which) and `head_sha` (`git rev-parse HEAD` at the same location). `discipline-test-auditor` is a never-gated agent type in `hooks/lead-gate-pre.sh`'s closed-world lattice (it is neither a relay target nor a class the second-round rule names, so it can never itself be denied) — still report `class_enumeration` when a discipline-test finding has siblings (the same governance verb or consumer-shaped surface appearing at other sites the diff touches); `sweep_method: "none"` when you did not sweep.
 
 ## Verdict schema
 
@@ -46,7 +46,7 @@ Emit exactly one fenced ```json block as the LAST fenced block of your final mes
   "diff_range": "<base>...<head>",
   "unit_branch": "<the branch you read, from git or the lead's unit: line — say which>",
   "head_sha": "<sha you read>",
-  "worktree": "<the absolute path you read the diff from — the SubagentStop hook uses this as the exact-substring second-round-rule anchor (worktree/head_sha/unit_branch), the lead-proactivity gate v3>",
+  "worktree": "<the absolute path you read the diff from — the SubagentStop hook records this as a second-round-rule anchor (worktree/head_sha/unit_branch, matched as whole tokens, never raw substrings), the lead-proactivity gate v3>",
   "verdict": "BLOCK | PASS",
   "uncertain": false,
   "mechanical_gate": "check_no_consumer_names.py: green | red | not-run",

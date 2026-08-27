@@ -45,7 +45,7 @@ Emit exactly one fenced ```json block as the LAST fenced block of your final mes
   "artifact": "what was checked (verdict / plan / doc)",
   "unit_branch": "<the branch you read, from git or the lead's unit: line — say which>",
   "head_sha": "<sha you read>",
-  "worktree": "<the absolute path you read the artifact from — the SubagentStop hook uses this as the exact-substring second-round-rule anchor (worktree/head_sha/unit_branch), the lead-proactivity gate v3>",
+  "worktree": "<the absolute path you read the artifact from — the SubagentStop hook records this as a second-round-rule anchor (worktree/head_sha/unit_branch, matched as whole tokens, never raw substrings), the lead-proactivity gate v3>",
   "verdict": "BLOCK | PASS",
   "citations": [
     {

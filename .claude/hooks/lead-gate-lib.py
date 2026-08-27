@@ -11,9 +11,11 @@ usage-limit constraint — see the commit message for what was dropped and
 why the remaining design still closes the expensive loop, F10):
 
   THE ONE GATE (§3): a same-`agent_type` VERIFIER `Agent` dispatch whose
-  prompt contains, as an EXACT SUBSTRING, an open BLOCK's recorded
-  `worktree`, `head_sha` (full or its first 7 characters — this repo's
-  short-sha convention), or exact `unit_branch` is DENIED unless an
+  prompt names, as a WHOLE TOKEN (never a raw substring — audit-r3 finding
+  1: `ci/gpu` must not gate `ci/gpu-dev`), an open BLOCK's recorded
+  `worktree` (or a path under it), `head_sha` (full, or any >=7-char prefix
+  — this repo's short-sha convention), or exact `unit_branch` is DENIED
+  unless an
   ACCEPTED RELAY ARTIFACT exists for that (unit, agent_type, block_ts). A
   first dispatch of any agent_type is never gated (no prior row exists to
   match). The relay artifact (`.jammi/gate-state/<slug>.relay.<agent_type>.
@@ -55,8 +57,10 @@ Two entry points still write state:
           gate them.
 
 Fail-closed doctrine: never exit 1. Every internal error in `pre` exits 2
-with a reason (`sys.stdin.buffer.read()` + decode is INSIDE the try/except
-boundary, no `errors="replace"` fallback). `start`/`stop` are best-effort
+with a reason (`sys.stdin.buffer.read()` + decode + JSON parse are ALL
+inside the try/except boundary — a UTF-8-valid but JSON-invalid payload, an
+empty payload, and a non-object payload each deny, never coerce to `{}` and
+allow; no `errors="replace"` fallback). `start`/`stop` are best-effort
 writers that never block a subagent lifecycle event and always exit 0.
 
 No git subprocess anywhere in this module (hot-path speed).
@@ -114,30 +118,48 @@ _TEMPLATE_UNIT_BRANCH = "_branch_"
 # the SAME JSON-string-aware object extractor starting right after the
 # marker; neither ever searches for a closing marker, so a `</verdict>` or
 # a stray `}` sitting inside a quoted string can never end the region
-# early (round-2 finding 6).
+# early (round-2 finding 6). The OPENING-marker scan is string-aware too
+# (audit-r3 finding 2): a marker occurrence INSIDE a successfully parsed
+# object's own quoted strings (e.g. a PASS whose `notes` mentions the
+# marker) never counts as a later opening marker — the scan jumps past
+# every object it parses (via the same brace walker) before looking again.
 _FENCE_JSON_RE = re.compile(r"```json\s*", re.IGNORECASE)
 _VERDICT_TAG_RE = re.compile(r"\\?<verdict\\?>")
 _UNIT_LINE_RE = re.compile(r"^[ \t]*unit:[ \t]*(\S+)", re.MULTILINE)
 
 
-def _last_match_end(pattern: re.Pattern, text: str) -> int | None:
-    end = None
-    for m in pattern.finditer(text):
-        end = m.end()
-    return end
+def _last_marker_end_string_aware(pattern: re.Pattern, text: str) -> int | None:
+    """The end offset of the LAST opening marker that is NOT inside a
+    successfully parsed JSON object begun at an earlier marker. After each
+    marker whose following object parses, the scan resumes AFTER that
+    object's closing brace, so markers quoted inside the object's own
+    strings are never counted (audit-r3 finding 2). After a marker whose
+    object does NOT parse, the scan resumes right after the marker (there
+    is no object to skip)."""
+    last = None
+    pos = 0
+    while True:
+        m = pattern.search(text, pos)
+        if m is None:
+            return last
+        last = m.end()
+        obj, obj_end = _extract_json_object_span(text, m.end())
+        pos = obj_end if (obj is not None and obj_end is not None and obj_end > m.end()) else m.end()
 
 
-def _extract_first_json_object(s: str, start: int = 0) -> dict | None:
+def _extract_json_object_span(s: str, start: int = 0) -> tuple[dict | None, int | None]:
     """Find the first `{` in `s` at or after `start` and its JSON-string-
     aware MATCHING `}` (braces and angle brackets inside a quoted JSON
     string never count, an escaped `\\"` never ends a string early), parse
     exactly that substring, and tolerate trailing noise (a stray ``` fence,
     a `</verdict>` tag, more prose) between the object's closing brace and
     the end of `s`. There is no "find the closing marker" step — content
-    inside a quoted field can never trick this into truncating early."""
+    inside a quoted field can never trick this into truncating early.
+    Returns `(object, end_offset_just_past_the_closing_brace)`; `(None,
+    None)` when no complete object parses."""
     brace = s.find("{", start)
     if brace == -1:
-        return None
+        return None, None
     depth = 0
     in_string = False
     escape = False
@@ -161,9 +183,13 @@ def _extract_first_json_object(s: str, start: int = 0) -> dict | None:
                 try:
                     obj = json.loads(s[brace:i + 1])
                 except Exception:
-                    return None
-                return obj if isinstance(obj, dict) else None
-    return None
+                    return None, None
+                return (obj, i + 1) if isinstance(obj, dict) else (None, None)
+    return None, None
+
+
+def _extract_first_json_object(s: str, start: int = 0) -> dict | None:
+    return _extract_json_object_span(s, start)[0]
 
 
 def _looks_like_template(data: dict) -> bool:
@@ -189,7 +215,7 @@ def extract_verdict_json(last_assistant_message: str) -> tuple[dict | None, str 
         return None, "unparseable"
     text = last_assistant_message
 
-    fence_end = _last_match_end(_FENCE_JSON_RE, text)
+    fence_end = _last_marker_end_string_aware(_FENCE_JSON_RE, text)
     if fence_end is not None:
         data = _extract_first_json_object(text, fence_end)
         if data is None:
@@ -201,7 +227,7 @@ def extract_verdict_json(last_assistant_message: str) -> tuple[dict | None, str 
         return data, None
 
     # One-release legacy fallback: no fenced ```json block found at all.
-    tag_end = _last_match_end(_VERDICT_TAG_RE, text)
+    tag_end = _last_marker_end_string_aware(_VERDICT_TAG_RE, text)
     if tag_end is not None:
         data = _extract_first_json_object(text, tag_end)
         if data is None:
@@ -480,31 +506,67 @@ def _diagnose_row(row: dict) -> str:
 
 
 # --------------------------------------------------------------------------
-# THE ONE GATE. EXACT-SUBSTRING binding only; no free-text parsing.
+# THE ONE GATE. WHOLE-TOKEN binding only; no free-text parsing.
 # --------------------------------------------------------------------------
 
+# The character class a branch name / worktree path / sha token is drawn
+# from. An anchor "names" a BLOCK only when it appears in the prompt as a
+# WHOLE token over this class — never as a raw substring of a longer token
+# (audit-r3 finding 1: an open BLOCK on `ci/gpu` must not deny the FIRST
+# audit of `ci/gpu-dev`; `feat/x` vs `feat/x2`; a unit named `main` vs the
+# word "domain"). `.` stays inside the class so `release-1` can never match
+# inside `release-1.2`; the cost (a sha butted against a sentence-final `.`
+# is not recognized) fails toward ALLOW, the same direction as the
+# documented DODGE-5 residual, never toward a false DENY.
+_TOKEN_CHARS = "A-Za-z0-9._/\\-"
+
+
+def _whole_token_present(anchor: str, text: str, *, allow_path_under: bool = False) -> bool:
+    """True iff `anchor` occurs in `text` delimited by non-token characters
+    (or string edges) on both sides. With `allow_path_under`, a `/` may
+    follow the anchor (a path UNDER the recorded worktree still names it)."""
+    if not anchor:
+        return False
+    tail = rf"(?:(?=/)|(?![{_TOKEN_CHARS}]))" if allow_path_under else rf"(?![{_TOKEN_CHARS}])"
+    pat = rf"(?<![{_TOKEN_CHARS}]){re.escape(anchor)}{tail}"
+    return re.search(pat, text) is not None
+
+
+def _sha_named(sha: str, text: str) -> bool:
+    """True iff `text` carries, as a whole token, the full `sha` or any
+    prefix of it that is at least 7 characters (this repo's short-sha
+    convention). A hex token that merely STARTS with the 7-char prefix but
+    is not itself a prefix of the recorded sha (e.g. a different commit
+    sharing 7 leading characters) does not match."""
+    if len(sha) < 7:
+        return _whole_token_present(sha, text)
+    pat = rf"(?<![{_TOKEN_CHARS}]){re.escape(sha[:7])}[0-9a-fA-F]*(?![{_TOKEN_CHARS}])"
+    for m in re.finditer(pat, text):
+        if sha.startswith(m.group(0)):
+            return True
+    return False
+
+
 def _block_named_in_text(text: str, row: dict) -> bool:
-    """EXACT-SUBSTRING binding on strings the VERIFIER ITSELF emitted —
-    the recorded `worktree`, the recorded `head_sha` (full or its first 7
-    characters, this repo's short-sha convention), or the exact
-    `unit_branch`. No path/site/message parsing at all."""
+    """WHOLE-TOKEN binding on strings the VERIFIER ITSELF emitted — the
+    recorded `worktree` (or a path under it), the recorded `head_sha`
+    (full, or a >=7-char prefix of it — this repo's short-sha convention),
+    or the exact `unit_branch`. No path/site/message parsing at all; never
+    a raw-substring match (audit-r3 finding 1)."""
     wt = row.get("worktree")
-    if isinstance(wt, str) and wt and wt in text:
+    if isinstance(wt, str) and wt and _whole_token_present(wt.rstrip("/"), text, allow_path_under=True):
         return True
     sha = row.get("head_sha")
-    if isinstance(sha, str) and sha:
-        if sha in text:
-            return True
-        if len(sha) >= 7 and sha[:7] in text:
-            return True
+    if isinstance(sha, str) and sha and _sha_named(sha, text):
+        return True
     ub = row.get("unit_branch")
-    if isinstance(ub, str) and ub and ub in text:
+    if isinstance(ub, str) and ub and _whole_token_present(ub, text):
         return True
     return False
 
 
 def _decide_verifier_dispatch(subtype: str, prompt: str, sdir: Path) -> tuple[bool, str]:
-    """Denied iff the prompt exact-substring-names an open BLOCK of the
+    """Denied iff the prompt whole-token-names an open BLOCK of the
     SAME agent_type (by worktree/head_sha/unit_branch) with no accepted
     relay artifact for that (unit, agent_type, block_ts). A first dispatch
     of this type is structurally never gated (no prior row exists to
@@ -531,8 +593,27 @@ def _decide_verifier_dispatch(subtype: str, prompt: str, sdir: Path) -> tuple[bo
     return True, f"every named {subtype} BLOCK has an accepted relay artifact — allowed"
 
 
+# The dispatch payload's agent-type field, by every name it is known to (or
+# may plausibly) travel under. The real harness schema is settled by the
+# fresh-session acceptance log (`ci/hook-acceptance/README.md`); until then
+# every spelling is checked, and a payload carrying NONE of them is a
+# DISTINCT deny arm with its own remedy — never collapsed into the
+# unknown-agent-type arm (audit-r3 finding 4, whose remedy "add '' to
+# GATED_TYPES" was unrepresentable).
+_SUBTYPE_KEYS = ("subagent_type", "agent_type", "subagentType", "agentType")
+
+
 def _decide_dispatch(tool_input: dict, sdir: Path) -> tuple[bool, str]:
-    subtype = _first_str(tool_input, ("subagent_type",)) or ""
+    subtype = _first_str(tool_input, _SUBTYPE_KEYS)
+    if subtype is None:
+        return False, (
+            "dispatch payload carries no agent-type field (checked "
+            f"{'/'.join(_SUBTYPE_KEYS)}; tool_input keys: {sorted(tool_input.keys())!r}) "
+            "— failing closed. If the harness's real payload schema spells the field "
+            "differently, add that spelling to _SUBTYPE_KEYS in lead-gate-lib.py; the "
+            "fresh-session acceptance run (ci/hook-acceptance/README.md) settles the "
+            "real schema"
+        )
     if subtype in NEVER_GATED_TYPES:
         return True, f"never-gated agent type {subtype!r}"
     if subtype not in GATED_TYPES:
@@ -671,12 +752,17 @@ def main(argv: list[str]) -> int:
     try:
         raw = sys.stdin.buffer.read()
         text = raw.decode("utf-8")
-        try:
-            payload = json.loads(text) if text.strip() else {}
-            if not isinstance(payload, dict):
-                payload = {}
-        except Exception:
-            payload = {}
+        # A payload that is not a JSON object RAISES into the fail-closed
+        # boundary below — `pre` exits 2, `start`/`stop` exit 0 (best-effort
+        # writers). Never silently coerced to `{}`: a UTF-8-valid but
+        # JSON-invalid payload used to collapse to `{}` and ALLOW, the
+        # decode-error sibling's fail-open twin (audit-r3 finding 3).
+        if not text.strip():
+            raise ValueError("empty hook payload on stdin")
+        payload = json.loads(text)
+        if not isinstance(payload, dict):
+            raise ValueError(
+                f"hook payload is JSON {type(payload).__name__}, not an object")
 
         tool_name = _first_str(payload, ("tool_name",)) or ""
         agent_type = _first_str(payload, ("agent_type", "subagent_type")) or ""

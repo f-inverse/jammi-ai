@@ -228,8 +228,9 @@ manifest, not a prose sketch.
   is a mechanism change, not a third patch, narrowed under a usage-limit scope
   cut mid-round to **one choke point**: a fresh `Agent`/`Task` dispatch of a
   verifier-exit type (`adversarial-audit`/`fix-verifier`/`acceptance-verifier`)
-  is denied iff its prompt contains, as an EXACT SUBSTRING, an open BLOCK's
-  recorded `worktree`, `head_sha` (full or 7-char), or `unit_branch` of the SAME
+  is denied iff its prompt names, as a WHOLE TOKEN (never a raw substring —
+  `ci/gpu` does not gate `ci/gpu-dev`), an open BLOCK's recorded `worktree` (or a
+  path under it), `head_sha` (full or a >=7-char prefix), or `unit_branch` of the SAME
   `agent_type`, AND no **accepted relay artifact**
   (`.jammi/gate-state/<slug>.relay.<agent_type>.<block_ts>.json`, written by the
   lead directly — never scanned from message prose — whose `sites` keys are an

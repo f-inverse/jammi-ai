@@ -179,8 +179,9 @@ cannot (`AGENTIC-PLAYBOOK.md` §1). Everything below is a specific way that spin
   dodged by a rewording (round 1: 9 findings, round 2: 9 MORE findings, each a live sibling
   of an r1 instance the patch had only closed one-for-one). v3 is a mechanism change, not a
   third patch: it stopped reading free text entirely and narrowed to ONE choke point — a
-  second dispatch of the SAME verifier type, exact-substring-bound (worktree/head_sha/
-  unit_branch, strings the VERIFIER itself emitted) to an open BLOCK, is denied unless an
+  second dispatch of the SAME verifier type, whole-token-bound (worktree/head_sha/
+  unit_branch, strings the VERIFIER itself emitted, matched as whole tokens, never raw
+  substrings) to an open BLOCK, is denied unless an
   ACCEPTED RELAY ARTIFACT exists — a structured file the lead writes explicitly
   (`.jammi/gate-state/<slug>.relay.<agent_type>.<block_ts>.json`, exact-string set inclusion
   of the verifier's own `class_enumeration`), never scanned from message prose. Under a

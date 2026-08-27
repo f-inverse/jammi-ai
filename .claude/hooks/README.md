@@ -37,9 +37,11 @@ is DENIED (closed-world lattice, deny-unknown; `ci/scripts/check_lead_gate.py`'s
 fixture cross-checks every `.claude/agents/*.md` card's `tools:` frontmatter against
 it). Beyond that: a fresh `Agent`/`Task` dispatch whose `subagent_type` is one of the
 THREE verifier-exit types (`adversarial-audit`/`fix-verifier`/`acceptance-verifier`)
-is denied iff its prompt contains, as an EXACT SUBSTRING, an open BLOCK's recorded
-`worktree`, its recorded `head_sha` (full or the first 7 characters — this repo's
-short-sha convention), or its exact `unit_branch`, of the SAME `agent_type`, AND no
+is denied iff its prompt names, as a WHOLE TOKEN (never a raw substring — an open
+BLOCK on `ci/gpu` does not gate `ci/gpu-dev`), an open BLOCK's recorded `worktree`
+(or a path under it), its recorded `head_sha` (full, or any prefix of at least 7
+characters — this repo's short-sha convention), or its exact `unit_branch`, of the
+SAME `agent_type`, AND no
 **accepted relay artifact** exists for that `(unit, agent_type, block_ts)`. A first
 dispatch of any agent_type is structurally never gated (no prior row to match). No
 other `Agent`/`Task` dispatch, and no `SendMessage`/`Bash` call, is decided by this
@@ -96,7 +98,7 @@ reads and missing real writes past a separator) — the mechanical control is
 `.claude/settings.json`, unchanged and still active.
 
 **What is mechanical vs. visible-only (stated exactly, not overclaimed).** Mechanical:
-a second dispatch of the SAME verifier type, exact-substring-bound to an open BLOCK,
+a second dispatch of the SAME verifier type, whole-token-bound to an open BLOCK,
 is denied without an accepted relay artifact; an unrecognized `subagent_type` is
 denied; `permissions.deny` blocks an agent-initiated Edit/Write/MultiEdit on the hook
 files. Visible-only, each with the SAME runtime tell (the next verdict row on that

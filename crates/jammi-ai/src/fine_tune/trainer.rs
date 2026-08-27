@@ -2127,7 +2127,35 @@ impl TrainingLoop {
             .map_err(|e| JammiError::FineTune(format!("Cross-entropy loss: {e}")))
     }
 
-    /// Token-level cross-entropy loss for NER, ignoring positions with label -100.
+    /// Token-level cross-entropy loss for NER with `ignore_index=-100`
+    /// semantics: positions whose original label is `-100` contribute
+    /// **nothing** to the loss value or the gradient, and the mean is taken
+    /// over the non-ignored positions only (not `batch * seq_len`). This
+    /// matches PyTorch's `torch.nn.CrossEntropyLoss(ignore_index=-100)`
+    /// under the default `reduction="mean"`, whose docs specify that the
+    /// mean divides by the count of targets that are *not* `ignore_index`
+    /// (<https://docs.pytorch.org/docs/stable/generated/torch.nn.CrossEntropyLoss.html>).
+    ///
+    /// Candle's `cross_entropy` has no `ignore_index` argument, so this
+    /// gathers the non-ignored rows with [`Tensor::index_select`] *before*
+    /// calling it, rather than clamping `-100` to a valid class and masking
+    /// the loss value afterwards. That distinction matters for the
+    /// gradient, not just the value: because the ignored rows never enter
+    /// the cross-entropy computation graph, candle's `index_select`
+    /// backward (`grads.or_insert` zero-fills the full-shape gradient, then
+    /// `index_add`s only into the selected rows — see
+    /// `candle_core::backprop`) leaves the ignored rows' gradient at an
+    /// *exact* `0.0`. A "compute-then-multiply-by-zero-mask" formulation
+    /// would only get a value of `0.0` for those rows in the forward pass;
+    /// the backward pass would still evaluate (and could still overflow to
+    /// `inf`/`NaN`) the per-row cross-entropy term before the zero multiply,
+    /// which is not exactness, only smallness.
+    ///
+    /// If every position in the batch is ignored, this returns a `0.0`
+    /// scalar loss (no rows to select, hence no gradient contribution),
+    /// matching PyTorch's handling of an all-`ignore_index` batch under
+    /// `reduction="mean"` (returning `0` rather than propagating a `0/0`
+    /// `NaN`).
     fn ner_loss(&self, logits: &Tensor, labels: &Tensor) -> Result<Tensor> {
         let (batch, seq_len, num_labels) = logits
             .dims3()
@@ -2141,17 +2169,46 @@ impl TrainingLoop {
             .reshape(batch * seq_len)
             .map_err(|e| JammiError::FineTune(format!("NER flatten labels: {e}")))?;
 
-        // Replace -100 with 0 for safe indexing (masked out below)
-        let safe_labels = flat_labels
-            .clamp(0i64, (num_labels - 1) as i64)
-            .map_err(|e| JammiError::FineTune(format!("NER clamp labels: {e}")))?
-            .to_dtype(candle_core::DType::U32)
-            .map_err(|e| JammiError::FineTune(format!("NER labels u32: {e}")))?;
+        // Read labels to the host to build the keep-list: -100 marks a
+        // position to exclude entirely, per ignore_index=-100 semantics.
+        let label_values = flat_labels
+            .to_dtype(candle_core::DType::I64)
+            .map_err(|e| JammiError::FineTune(format!("NER labels i64: {e}")))?
+            .to_vec1::<i64>()
+            .map_err(|e| JammiError::FineTune(format!("NER labels to_vec1: {e}")))?;
 
-        // Cross-entropy on all positions (candle returns mean over elements).
-        // Positions with original label -100 are clamped to 0 and contribute noise,
-        // but this is a reasonable approximation until masked CE is available.
-        candle_nn::loss::cross_entropy(&flat_logits, &safe_labels)
+        let mut keep_indices: Vec<u32> = Vec::with_capacity(label_values.len());
+        let mut keep_labels: Vec<u32> = Vec::with_capacity(label_values.len());
+        for (idx, &label) in label_values.iter().enumerate() {
+            if label != -100 {
+                keep_indices.push(idx as u32);
+                keep_labels.push(label as u32);
+            }
+        }
+
+        if keep_indices.is_empty() {
+            // Every position ignored: match PyTorch's CrossEntropyLoss
+            // (reduction="mean") returning 0.0 rather than a NaN 0/0 mean.
+            return Tensor::zeros((), logits.dtype(), logits.device())
+                .map_err(|e| JammiError::FineTune(format!("NER all-ignored zero loss: {e}")));
+        }
+
+        let n_keep = keep_indices.len();
+        let device = flat_logits.device();
+        let index_tensor = Tensor::from_vec(keep_indices, n_keep, device)
+            .map_err(|e| JammiError::FineTune(format!("NER keep indices: {e}")))?;
+        let label_tensor = Tensor::from_vec(keep_labels, n_keep, device)
+            .map_err(|e| JammiError::FineTune(format!("NER keep labels: {e}")))?;
+
+        // Gather only the non-ignored rows before computing cross-entropy so
+        // the ignored rows never enter the graph (see the doc comment above
+        // for why this, not a zero-mask multiply, makes their gradient
+        // exactly 0.0).
+        let selected_logits = flat_logits
+            .index_select(&index_tensor, 0)
+            .map_err(|e| JammiError::FineTune(format!("NER index_select logits: {e}")))?;
+
+        candle_nn::loss::cross_entropy(&selected_logits, &label_tensor)
             .map_err(|e| JammiError::FineTune(format!("NER cross-entropy: {e}")))
     }
 
@@ -4167,6 +4224,249 @@ mod host_read_discipline {
             clip_before + 1,
             "clip_and_step's cadence-gated grad-norm read (optimizer::SYNC_READ_COUNT) must \
              also fire exactly once for this call"
+        );
+    }
+}
+
+/// esc-052: `ner_loss`'s own doc comment claimed `ignore_index=-100`
+/// semantics (positions labelled `-100` excluded from the loss) while its
+/// body clamped `-100 -> 0` and ran UNMASKED `cross_entropy` over every
+/// `batch*seq_len` position. Latent — nothing in-repo constructs a
+/// `TrainingBatch::Ner` (`encode_chunk` refuses `TextChunk::Ner`), but the
+/// path is publicly reachable via `TrainingDataLoader::from_precomputed`,
+/// which is what these tests drive it through, exactly as a caller who
+/// bypasses `encode_chunk` and hand-builds a `TrainingBatch::Ner` batch
+/// would.
+#[cfg(test)]
+mod ner_loss_ignore_index {
+    use candle_core::{DType, Device, Tensor, Var};
+    use candle_nn::VarBuilder;
+    use candle_nn::VarMap;
+
+    use super::super::data::{TextChunk, TrainingBatch, TrainingDataLoader};
+    use super::super::lora::build_distribution_head;
+    use super::super::target::TrainingTarget;
+    use super::super::FineTuneConfig;
+    use super::TrainingLoopBuilder;
+    use jammi_db::error::JammiError;
+
+    const HIDDEN: usize = 4;
+
+    /// A minimal real [`super::TrainingLoop`], mirroring
+    /// `host_read_discipline::minimal_loop`: `ner_loss`/`compute_loss`
+    /// never touch the catalog, so an empty, unclaimed-by-anything-else
+    /// catalog registered under its own tag is enough.
+    async fn minimal_loop(device: &Device) -> super::TrainingLoop {
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
+        let config = FineTuneConfig::default();
+        let head = build_distribution_head(HIDDEN, 2, &config, &varmap, &vb).unwrap();
+        let (catalog, dir) = super::test_fixtures::claimed_job("ner-loss-ignore-index").await;
+        TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+            .device(device.clone())
+            .job_id("ner-loss-ignore-index".into())
+            .worker_id("ner-loss-ignore-index-worker".into())
+            .catalog(catalog)
+            .artifact_dir(dir.path().to_path_buf())
+            .build()
+            .unwrap()
+    }
+
+    /// Build a `(1, 2, 3)` logits `Var` whose position-1 (the ignored row,
+    /// label `-100`) is `pos1`, and whose position-0 (label `0`) is fixed
+    /// across callers so batches only ever differ at the ignored row.
+    fn logits_var(device: &Device, pos1: [f32; 3]) -> Var {
+        Var::from_tensor(&Tensor::new(&[[[0.0f32, 0.0, 0.0], pos1]], device).unwrap()).unwrap()
+    }
+
+    fn ner_labels(device: &Device) -> Tensor {
+        // label 0 at position 0, ignore_index -100 at position 1.
+        Tensor::new(&[[0i64, -100i64]], device).unwrap()
+    }
+
+    /// Round-trip a `TrainingBatch::Ner` through the PUBLIC
+    /// `TrainingDataLoader::from_precomputed` / `batches()` API (rather than
+    /// calling `compute_loss` on a hand-held batch directly), so the fix is
+    /// verified through the same public surface an out-of-tree caller who
+    /// hand-builds a `TrainingBatch::Ner` batch would use.
+    fn round_trip_through_precomputed(batch: TrainingBatch) -> TrainingBatch {
+        let loader = TrainingDataLoader::from_precomputed(vec![batch]);
+        let mut batches = loader.batches(1).unwrap();
+        assert_eq!(batches.len(), 1);
+        batches.remove(0).unwrap()
+    }
+
+    /// THE EVAL (esc-052 triage symptom_spec, verbatim): two `Ner` batches
+    /// identical except at the ignored (label `-100`) position must produce
+    /// bit-identical losses AND an exactly-zero, finite gradient at that
+    /// position's logits.
+    ///
+    /// RED (pre-fix — verified by reverting the fix hunk in `ner_loss` and
+    /// re-running this test): the old body clamped `-100 -> 0` and ran
+    /// UNMASKED cross-entropy over all positions, so batch A's
+    /// (`pos1 = [0,0,0]`) and batch B's (`pos1 = [0,0,8]`, a confident wrong
+    /// prediction against the clamped label `0`) losses differ by *far* more
+    /// than 0.1 — the ignored row's huge cross-entropy term leaks straight
+    /// into the mean. GREEN (post-fix, asserted below): masking the ignored
+    /// row out before `cross_entropy` runs makes the two losses depend only
+    /// on the (identical) position-0 row, so they are bit-identical, and
+    /// `index_select`'s backward gives the ignored row's gradient an exact
+    /// `0.0` (see `ner_loss`'s doc comment for why that is exact, not
+    /// merely small).
+    #[test]
+    fn ignored_position_does_not_move_the_loss_or_the_gradient() {
+        let device = Device::Cpu;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let loop_ = rt.block_on(minimal_loop(&device));
+
+        let labels = ner_labels(&device);
+        let var_a = logits_var(&device, [0.0, 0.0, 0.0]);
+        let var_b = logits_var(&device, [0.0, 0.0, 8.0]);
+
+        let batch_a = round_trip_through_precomputed(TrainingBatch::Ner {
+            hidden_states: var_a.as_tensor().clone(),
+            labels: labels.clone(),
+        });
+        let batch_b = round_trip_through_precomputed(TrainingBatch::Ner {
+            hidden_states: var_b.as_tensor().clone(),
+            labels: labels.clone(),
+        });
+
+        let loss_a = loop_.compute_loss(&batch_a).unwrap();
+        let loss_b = loop_.compute_loss(&batch_b).unwrap();
+        let loss_a_val: f32 = loss_a.to_scalar().unwrap();
+        let loss_b_val: f32 = loss_b.to_scalar().unwrap();
+
+        // CONTROL 1 (finite-guard FIRST): a NaN must fail this control
+        // outright, before any comparison — never fake either color.
+        assert!(
+            loss_a_val.is_finite() && loss_b_val.is_finite(),
+            "loss_a={loss_a_val} loss_b={loss_b_val} must both be finite before comparing them"
+        );
+
+        // GREEN: bit-identical scalars, checked via the raw bit pattern
+        // (not merely `abs(a - b) < eps`) — the ignored row must contribute
+        // NOTHING, not just something small.
+        assert_eq!(
+            loss_a_val.to_bits(),
+            loss_b_val.to_bits(),
+            "loss_a={loss_a_val} loss_b={loss_b_val} must be bit-identical: they differ only at \
+             the ignore_index=-100 position, which must not move the loss at all"
+        );
+
+        // GREEN: the ignored row's gradient is EXACTLY 0.0 and finite.
+        let grads = loss_a.backward().unwrap();
+        let grad_a = grads.get(&var_a).expect("logits var must have a gradient");
+        let grad_rows = grad_a.to_vec3::<f32>().unwrap();
+        let ignored_row = grad_rows[0][1].clone();
+        assert!(
+            ignored_row.iter().all(|g| g.is_finite()),
+            "ignored row's gradient must be finite: {ignored_row:?}"
+        );
+        assert_eq!(
+            ignored_row.as_slice(),
+            [0.0f32, 0.0, 0.0],
+            "ignored (label=-100) row's gradient must be EXACTLY zero, got {ignored_row:?}"
+        );
+    }
+
+    /// POSITIVE CONTROL against an over-broad fix: with no `-100` label at
+    /// all (`labels = [0, 1]`), the masked path must select every row and
+    /// therefore agree with plain unmasked `cross_entropy` to bit-equality
+    /// — a fix that (say) always dropped the last position, or scaled the
+    /// mean by the wrong denominator, would show up here even though
+    /// nothing is actually ignored.
+    #[test]
+    fn no_ignored_positions_matches_unmasked_cross_entropy_bit_exactly() {
+        let device = Device::Cpu;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let loop_ = rt.block_on(minimal_loop(&device));
+
+        let logits = Tensor::new(&[[[1.0f32, 0.2, -0.5], [0.1, 2.0, 0.3]]], &device).unwrap();
+        let labels = Tensor::new(&[[0i64, 1i64]], &device).unwrap();
+        let batch = round_trip_through_precomputed(TrainingBatch::Ner {
+            hidden_states: logits.clone(),
+            labels,
+        });
+
+        let masked_loss = loop_.compute_loss(&batch).unwrap();
+        let masked_val: f32 = masked_loss.to_scalar().unwrap();
+
+        let flat_logits = logits.reshape((2, 3)).unwrap();
+        let flat_labels = Tensor::new(&[0u32, 1u32], &device).unwrap();
+        let unmasked_loss = candle_nn::loss::cross_entropy(&flat_logits, &flat_labels).unwrap();
+        let unmasked_val: f32 = unmasked_loss.to_scalar().unwrap();
+
+        // CONTROL 1 (finite-guard FIRST).
+        assert!(
+            masked_val.is_finite() && unmasked_val.is_finite(),
+            "masked={masked_val} unmasked={unmasked_val} must both be finite before comparing"
+        );
+
+        assert_eq!(
+            masked_val.to_bits(),
+            unmasked_val.to_bits(),
+            "with no ignore_index=-100 labels, the masked path (selects every row) must match \
+             plain cross_entropy bit-for-bit: masked={masked_val} unmasked={unmasked_val}"
+        );
+    }
+
+    /// All-ignored batch: PyTorch's `CrossEntropyLoss(reduction="mean")`
+    /// returns `0.0` (not a `0/0` NaN) when every target equals
+    /// `ignore_index`; `ner_loss` must match that rather than propagating a
+    /// NaN into training.
+    #[test]
+    fn all_ignored_batch_returns_zero_not_nan() {
+        let device = Device::Cpu;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let loop_ = rt.block_on(minimal_loop(&device));
+
+        let logits = Tensor::new(&[[[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]], &device).unwrap();
+        let labels = Tensor::new(&[[-100i64, -100i64]], &device).unwrap();
+        let batch = round_trip_through_precomputed(TrainingBatch::Ner {
+            hidden_states: logits,
+            labels,
+        });
+
+        let loss = loop_.compute_loss(&batch).unwrap();
+        let val: f32 = loss.to_scalar().unwrap();
+        assert!(
+            val.is_finite(),
+            "all-ignored loss must be finite, got {val}"
+        );
+        assert_eq!(val, 0.0, "all-ignored loss must be exactly 0.0, got {val}");
+    }
+
+    /// NON-BUG GOLDEN: fixing `ner_loss`'s masking must not be mistaken for
+    /// enabling end-to-end NER training. `encode_chunk` still refuses
+    /// `TextChunk::Ner` with its typed error — the only in-repo way to
+    /// reach `TrainingBatch::Ner` remains the precomputed test seam.
+    #[test]
+    fn encode_chunk_still_refuses_text_chunk_ner() {
+        let device = Device::Cpu;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let loop_ = rt.block_on(minimal_loop(&device));
+
+        let chunk = TextChunk::Ner {
+            texts: vec!["Alice works at Acme.".into()],
+            entities_json: vec!["[]".into()],
+        };
+        let err = loop_.encode_chunk(&chunk).err().unwrap();
+        assert!(
+            matches!(err, JammiError::FineTune(ref m) if m.contains("NER fine-tuning is not yet available")),
+            "encode_chunk must still refuse TextChunk::Ner with its typed error, got {err:?}"
         );
     }
 }

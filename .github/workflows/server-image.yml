@@ -45,6 +45,11 @@ concurrency:
   group: server-image-${{ github.ref }}
   cancel-in-progress: false
 
+# Least privilege at the workflow level; the push jobs widen to
+# `packages: write` (GHCR) per job.
+permissions:
+  contents: read
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository_owner }}/jammi-ai-server

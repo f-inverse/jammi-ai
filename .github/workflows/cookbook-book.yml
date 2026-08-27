@@ -20,6 +20,10 @@ concurrency:
   group: cookbook-book-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege: this lane only reads the checkout; nothing publishes.
+permissions:
+  contents: read
+
 env:
   # The determinism regime (K0 §3): jammi_cookbook also sets these on import, but
   # pinning them in the job env covers anything that reads them first.
@@ -44,25 +48,15 @@ jobs:
         with:
           rustflags: "-C link-arg=-fuse-ld=mold"
 
+      # The book runs against two lockstep dists — the base client `jammi-ai`
+      # (import `jammi`) and the compiled `jammi-ai-native` wheel, built fresh
+      # and force-reinstalled (mode: wheel — a fresh wheel, never a copy) so
+      # the book runs the engine built from THIS commit. The shared
+      # setup-jammi-py action owns the venv/maturin mechanics.
       - name: Build + install the HEAD wheels
-        # The CI base image ships maturin + a system python3; venv-isolate so
-        # `python` resolves to the venv interpreter for the book gate. The book
-        # runs against two lockstep dists, neither on PyPI for an unreleased
-        # commit: install the base client `jammi-ai` (import `jammi`) from in-repo
-        # source (the dev extra carries the pinned grpcio-tools generator),
-        # generate stubs, then build the compiled `jammi-ai-native` wheel (maturin,
-        # from `packaging/native`) and force-reinstall it (a fresh wheel, never a
-        # copy) so the book runs the engine built from THIS commit.
-        run: |
-          python3 -m venv .venv
-          . .venv/bin/activate
-          pip install --upgrade pip
-          pip install maturin
-          pip install -e 'clients/python[dev]'
-          make -C clients/python generate
-          ( cd packaging/native && maturin build --release --out "$GITHUB_WORKSPACE/target/wheels" )
-          pip install --force-reinstall --no-deps \
-            target/wheels/jammi_ai_native-*.whl
+        uses: ./.github/actions/setup-jammi-py
+        with:
+          mode: wheel
 
       - name: Install the book (against the HEAD wheel)
         run: |

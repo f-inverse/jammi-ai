@@ -15,7 +15,22 @@ name: PyPI (jammi-ai)
 on:
   push:
     tags: ["py-v*"]
+  # Manual re-run to finish a release whose publish was interrupted. Dispatch
+  # from the release commit at the release version; PyPI rejects a re-upload
+  # of an existing version, so a dispatch publish is idempotent — the same
+  # recovery semantics as the lockstep `pypi.yml` / `_pypi-server.yml` lanes.
   workflow_dispatch:
+
+# Serialize per ref, never cancel: a publish in flight must finish (PyPI
+# uploads are not resumable), matching the other release lanes.
+concurrency:
+  group: pypi-client-${{ github.ref }}
+  cancel-in-progress: false
+
+# Least privilege at the workflow level; the publish job widens to
+# `id-token: write` (PyPI trusted publishing) per job.
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -56,8 +71,9 @@ jobs:
 
   publish:
     name: Publish to PyPI
-    # Tag push only — a workflow_dispatch is an artifact-only dry run.
-    if: github.event_name == 'push'
+    # Tag push AND workflow_dispatch both publish: PyPI rejects a re-upload of
+    # an existing version, so a dispatch re-publish is idempotent recovery —
+    # the same contract as `pypi.yml` on this lockstep `py-v*` surface.
     needs: build
     runs-on: ubuntu-latest
     environment: pypi
@@ -69,6 +85,6 @@ jobs:
           name: client-dist
           path: dist
 
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2 (release/v1)
         with:
           packages-dir: dist

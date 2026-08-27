@@ -14,6 +14,10 @@ concurrency:
   group: cookbook-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege: this lane only reads the checkout; nothing publishes.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -29,24 +33,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust-ci
 
+      # `jammi.connect` needs both lockstep dists — the base client `jammi-ai`
+      # (import `jammi`) and the compiled `jammi-ai-native` engine (`maturin
+      # develop`, importable as `jammi_native`), which the base discovers as
+      # its `file://` backend. The shared setup-jammi-py action owns the
+      # venv/maturin mechanics.
       - name: Build wheel + venv
-        # The CI base image ships maturin + a system python3; venv-isolate to
-        # avoid polluting site-packages and to make `python` resolve to the
-        # venv's interpreter for the smoke runner. `jammi.connect` needs both
-        # lockstep dists: `jammi-ai` (the base client, import `jammi` — not on
-        # PyPI for an unreleased commit, so install from in-repo source with the
-        # dev extra's pinned `grpcio-tools`, then generate stubs) and the compiled
-        # `jammi-ai-native` engine (`maturin develop` on `packaging/native`,
-        # importable as `jammi_native`), which the base discovers as its `file://`
-        # backend.
-        run: |
-          python3 -m venv .venv
-          . .venv/bin/activate
-          pip install --upgrade pip
-          pip install maturin
-          pip install -e 'clients/python[dev]'
-          make -C clients/python generate
-          ( cd packaging/native && maturin develop --release )
+        uses: ./.github/actions/setup-jammi-py
 
       - name: Run cookbook smoke
         run: |
@@ -63,23 +56,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust-ci
 
+      # `flight_sql` shells out to `target/release/jammi-server`; build it
+      # (`build-server`) before invoking the smoke runner. `jammi.connect`
+      # needs both lockstep dists — the base client `jammi-ai` and the
+      # compiled `jammi-ai-native` engine (`maturin develop`, importable as
+      # `jammi_native`). The shared setup-jammi-py action owns the
+      # venv/maturin mechanics.
       - name: Build wheel + jammi-server binary
-        # `flight_sql` shells out to `target/release/jammi-server`; build it
-        # before invoking the smoke runner. `jammi.connect` needs both lockstep
-        # dists: `jammi-ai` (the base client, import `jammi` — not on PyPI for an
-        # unreleased commit, so install from in-repo source with the dev extra's
-        # pinned `grpcio-tools`, then generate stubs) and the compiled
-        # `jammi-ai-native` engine (`maturin develop` on `packaging/native`,
-        # importable as `jammi_native`).
-        run: |
-          python3 -m venv .venv
-          . .venv/bin/activate
-          pip install --upgrade pip
-          pip install maturin
-          pip install -e 'clients/python[dev]'
-          make -C clients/python generate
-          ( cd packaging/native && maturin develop --release )
-          cargo build --release -p jammi-server
+        uses: ./.github/actions/setup-jammi-py
+        with:
+          build-server: "true"
 
       - name: Run cookbook smoke (all recipes)
         env:

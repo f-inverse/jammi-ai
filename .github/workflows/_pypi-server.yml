@@ -57,6 +57,12 @@ on:
         required: false
         default: false
 
+# Least privilege at the workflow level; the publish job widens to
+# `id-token: write` (PyPI trusted publishing) per job. Callers must grant
+# `id-token: write` on their calling job for that to be available here.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -134,9 +140,12 @@ jobs:
 
   gpu-prove:
     name: GPU prove-gate (A100)
-    # Tag push only — prove the release commit on a real A100 before promotion.
-    # A no-op (skipped) leg when the caller doesn't request the gate (CPU).
-    if: inputs.run_gpu_prove && github.event_name == 'push'
+    # Tag push or dispatch — prove the exact commit on a real A100 before
+    # promotion, on the recovery path too (a dispatch publishes below, so it
+    # is gated the same as a tag push; build -> prove -> promote never has an
+    # unproven arm). A PR is build-only and never proves. A no-op (skipped)
+    # leg when the caller doesn't request the gate (CPU).
+    if: inputs.run_gpu_prove && github.event_name != 'pull_request'
     needs: build-wheel
     uses: ./.github/workflows/_gpu-prove-gate.yml
     with:
@@ -145,7 +154,10 @@ jobs:
 
   publish:
     name: Publish to PyPI
-    # Tag push only — a workflow_dispatch or PR is an artifact-only dry run.
+    # Tag push AND workflow_dispatch both publish — PyPI rejects a re-upload
+    # of an existing version, so a dispatch re-publish is idempotent recovery,
+    # the same contract as `pypi.yml` on this lockstep `py-v*` surface. A PR
+    # is an artifact-only dry run.
     # `always()` opts out of the implicit success()-wrap so an intentionally
     # skipped gpu-prove (the ungated CPU leg) doesn't itself skip publish; the
     # explicit checks below reproduce build -> prove -> promote exactly: an
@@ -154,7 +166,7 @@ jobs:
     if: >-
       always() &&
       needs.build-wheel.result == 'success' &&
-      github.event_name == 'push' &&
+      github.event_name != 'pull_request' &&
       (inputs.run_gpu_prove == false || needs.gpu-prove.result == 'success')
     needs: [build-wheel, gpu-prove]
     runs-on: ubuntu-latest
@@ -167,6 +179,6 @@ jobs:
           name: ${{ inputs.artifact_prefix }}-dist
           path: dist
 
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2 (release/v1)
         with:
           packages-dir: dist

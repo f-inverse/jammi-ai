@@ -21,9 +21,24 @@ on:
       - ".github/workflows/_pypi-server.yml"
       - "crates/jammi-server/**"
 
+# Serialize per ref, never cancel: a publish in flight must finish (PyPI
+# uploads are not resumable), matching the other release lanes.
+concurrency:
+  group: pypi-server-${{ github.ref }}
+  cancel-in-progress: false
+
+# Least privilege at the workflow level; the calling job widens to
+# `id-token: write` so the reusable's publish job can use PyPI trusted
+# publishing (a called workflow can hold at most what its caller grants).
+permissions:
+  contents: read
+
 jobs:
   server-cpu:
     name: jammi-server (CPU)
+    permissions:
+      contents: read
+      id-token: write
     uses: ./.github/workflows/_pypi-server.yml
     with:
       container_image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}

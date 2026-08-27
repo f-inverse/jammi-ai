@@ -1,0 +1,94 @@
+name: setup-jammi-py
+description: >
+  Shared "build + install the HEAD Python surface" setup: creates `.venv` at
+  the workspace root, installs the base client `jammi-ai` (import `jammi`)
+  from in-repo source with the dev extra (which carries the pinned
+  `grpcio-tools` generator and the client's real grpcio/protobuf floors),
+  generates its proto stubs, then builds the compiled `jammi-ai-native`
+  engine (`import jammi_native`, from `packaging/native`) into the venv —
+  either `maturin develop` (mode: develop) or a wheel built to
+  `target/wheels` and force-reinstalled (mode: wheel), so the consumer runs
+  the engine built from THIS commit. Neither dist is on PyPI for an
+  unreleased commit, which is why both install from source. Later steps
+  re-activate the venv themselves (`. .venv/bin/activate`). Runs in the CI
+  base image (ships maturin + a system python3); venv-isolation avoids
+  polluting site-packages and makes `python` resolve to the venv interpreter.
+  Must run AFTER `actions/checkout@v4` (local-path composite; the checkout
+  step has to have already materialized it, same constraint as
+  `setup-rust-ci`).
+
+inputs:
+  mode:
+    description: >
+      "develop" installs the native engine via `maturin develop --release`;
+      "wheel" builds the native wheel to target/wheels and force-reinstalls it
+      (a fresh wheel, never a copy).
+    required: false
+    default: "develop"
+  build-client-wheel:
+    description: >
+      "true" (wheel mode) additionally builds the pure `jammi-ai` client wheel
+      (`python -m build`, which is pip-installed here for it) and
+      force-reinstalls it alongside the native wheel.
+    required: false
+    default: "false"
+  build-server:
+    description: >
+      "true" also builds the release `jammi-server` binary (for consumers
+      whose recipes/chapters shell out to target/release/jammi-server).
+    required: false
+    default: "false"
+  extra-pip-packages:
+    description: >
+      Extra pip packages installed into the venv alongside maturin
+      (space-separated), e.g. "pytest" for a consumer that runs pytest from
+      this venv.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Build + install the HEAD wheels
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        BUILD_CLIENT_WHEEL: ${{ inputs.build-client-wheel }}
+        BUILD_SERVER: ${{ inputs.build-server }}
+        EXTRA_PIP: ${{ inputs.extra-pip-packages }}
+      run: |
+        set -euo pipefail
+        python3 -m venv .venv
+        . .venv/bin/activate
+        pip install --upgrade pip
+        # $EXTRA_PIP is deliberately unquoted: a space-separated package list.
+        pip install maturin $EXTRA_PIP
+        if [ "$BUILD_CLIENT_WHEEL" = "true" ]; then
+          pip install build
+        fi
+        pip install -e 'clients/python[dev]'
+        make -C clients/python generate
+        case "$MODE" in
+          develop)
+            ( cd packaging/native && maturin develop --release )
+            ;;
+          wheel)
+            ( cd packaging/native && maturin build --release --out "$GITHUB_WORKSPACE/target/wheels" )
+            if [ "$BUILD_CLIENT_WHEEL" = "true" ]; then
+              ( cd clients/python && python -m build --wheel --outdir "$GITHUB_WORKSPACE/target/wheels" )
+              pip install --force-reinstall --no-deps \
+                target/wheels/jammi_ai_native-*.whl \
+                target/wheels/jammi_ai-*.whl
+            else
+              pip install --force-reinstall --no-deps \
+                target/wheels/jammi_ai_native-*.whl
+            fi
+            ;;
+          *)
+            echo "::error::setup-jammi-py: unknown mode '$MODE' (expected develop|wheel)"
+            exit 1
+            ;;
+        esac
+        if [ "$BUILD_SERVER" = "true" ]; then
+          cargo build --release -p jammi-server
+        fi

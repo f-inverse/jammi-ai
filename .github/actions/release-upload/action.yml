@@ -1,0 +1,83 @@
+name: release-upload
+description: >
+  Shared release-asset promotion for release-binaries.yml's build legs. On a
+  tag push, or on a dispatch naming an existing release via `release-tag`, it
+  attaches the packaged asset to that GitHub release — creating the release
+  idempotently if missing (tolerating concurrent creation by other legs and
+  crates.yml), with a bounded retry on the upload. On a no-tag dispatch
+  (branch exercise) it uploads the asset as a workflow artifact instead — no
+  release is touched. Which path runs is decided here (event + release-tag),
+  so no leg carries per-leg `if:` logic; the pinned `gh` version is stated
+  once here. Must run AFTER `actions/checkout@v4` (local-path composite; the
+  checkout step has to have already materialized it, same constraint as
+  `setup-rust-ci`).
+
+inputs:
+  asset:
+    description: "The packaged asset filename (in the workspace root) to promote."
+    required: true
+  release-tag:
+    description: >
+      The workflow's `release_tag` dispatch input — empty on a tag push and on
+      an artifact-only dispatch.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    # Attach the asset to the GitHub release on a tag push, or on a dispatch
+    # that names an existing release via `release-tag`. The release is created
+    # here if missing (idempotently, tolerating concurrent creation by other
+    # legs and `crates.yml`), so no leg depends on another job creating it
+    # first. `--clobber` makes the upload idempotent on re-run.
+    - name: Upload to release
+      if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.release-tag != '')
+      shell: bash
+      env:
+        # Composite actions cannot read the `secrets` context; `github.token`
+        # is the same value as `secrets.GITHUB_TOKEN`, exposed via the
+        # `github` context instead.
+        GH_TOKEN: ${{ github.token }}
+        REL_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.release-tag }}
+        ASSET: ${{ inputs.asset }}
+      run: |
+        set -euo pipefail
+        # The Linux/server jobs run in the manylinux CI container, which has no
+        # `gh` CLI; install it on demand (no-op on the native macOS runner).
+        if ! command -v gh >/dev/null 2>&1; then
+          GH_VER=2.63.2
+          curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VER}/gh_${GH_VER}_linux_amd64.tar.gz" | tar -xz -C /tmp
+          install "/tmp/gh_${GH_VER}_linux_amd64/bin/gh" /usr/local/bin/gh
+        fi
+        # `gh release upload` shells out to git to detect the repo; the container
+        # checkout is owned by a different uid, so mark it safe first.
+        git config --global --add safe.directory "$GITHUB_WORKSPACE"
+        # Be self-sufficient: create the release if it does not exist yet, rather
+        # than waiting on `crates.yml`'s `github-release` job (which only runs
+        # after the crates.io publish, minutes later). Concurrent legs and that
+        # job all tolerate an existing release via `|| true`, so whoever runs
+        # first creates it and the rest no-op. `--verify-tag` guards against
+        # creating a release for a tag that does not exist.
+        gh release create "$REL_TAG" --generate-notes --verify-tag || true
+        # Backstop for transient API hiccups: retry the upload briefly.
+        for attempt in 1 2 3 4 5; do
+          if gh release upload "$REL_TAG" "$ASSET" --clobber; then
+            break
+          fi
+          if [ "$attempt" -eq 5 ]; then
+            echo "release upload failed after $attempt attempts" >&2
+            exit 1
+          fi
+          echo "release $REL_TAG not ready (attempt $attempt); retrying in 15s" >&2
+          sleep 15
+        done
+
+    # A no-tag manual dispatch (branch exercise) publishes the built artifact to
+    # the workflow run instead — no release is touched.
+    - name: Upload artifact (dispatch)
+      if: github.event_name == 'workflow_dispatch' && inputs.release-tag == ''
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.asset }}
+        path: ${{ inputs.asset }}

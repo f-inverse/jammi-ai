@@ -20,6 +20,11 @@ concurrency:
   group: release-npm
   cancel-in-progress: false
 
+# Least privilege at the workflow level; the publish job widens to
+# `id-token: write` (npm OIDC trusted publishing) per job.
+permissions:
+  contents: read
+
 jobs:
   publish:
     name: Publish to npm

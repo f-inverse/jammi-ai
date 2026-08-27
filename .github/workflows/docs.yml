@@ -73,7 +73,7 @@ jobs:
         # workspace deps under target/debug/deps. Pin the doctest compiler to the
         # workspace channel (read from rust-toolchain.toml) so they always agree.
         run: |
-          RUSTUP_TOOLCHAIN="$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' rust-toolchain.toml)"
+          RUSTUP_TOOLCHAIN="$(bash ci/scripts/rust_pin.sh)"
           export RUSTUP_TOOLCHAIN
           mdbook test docs/guide -L target/debug/deps
 

@@ -16,8 +16,23 @@ on:
       - "rust-toolchain.toml"
   workflow_dispatch:
 
+# Serialize per ref, never cancel: an image push in flight must finish,
+# matching the other release/publish lanes.
+concurrency:
+  group: image-cuda-${{ github.ref }}
+  cancel-in-progress: false
+
+# Least privilege at the workflow level; the calling job widens to
+# `packages: write` so the reusable can push to GHCR (a called workflow can
+# hold at most what its caller grants).
+permissions:
+  contents: read
+
 jobs:
   build:
+    permissions:
+      contents: read
+      packages: write
     uses: ./.github/workflows/_ci-base-image.yml
     with:
       image_suffix: ci-cuda

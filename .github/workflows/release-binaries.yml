@@ -47,12 +47,20 @@ concurrency:
   group: release-binaries-${{ github.ref }}
   cancel-in-progress: false
 
+# Least privilege at the workflow level; the build legs widen to
+# `contents: write` per job — they create the release and attach assets.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build:
     name: Build ${{ matrix.target }}
+    permissions:
+      # `gh release create` / `gh release upload` (the release-upload action).
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -101,13 +109,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          channel="$(sed -n 's/^ *channel *= *"\([^"]*\)".*/\1/p' rust-toolchain.toml)"
-          test -n "$channel" || { echo "could not parse channel from rust-toolchain.toml"; exit 1; }
+          channel="$(bash ci/scripts/rust_pin.sh)"
           echo "channel=$channel" >> "$GITHUB_OUTPUT"
 
+      # SHA-pinned (release lane); the branch name in the ref is inert — the
+      # toolchain actually installed is the explicit `toolchain:` input below.
       - name: Install Rust toolchain (macOS)
         if: runner.os == 'macOS'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           toolchain: ${{ steps.rust-pin.outputs.channel }}
           targets: ${{ matrix.target }}
@@ -118,64 +127,15 @@ jobs:
       - name: Package
         id: package
         shell: bash
-        run: |
-          set -euo pipefail
-          version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-          asset="jammi-${version}-${{ matrix.target }}.tar.gz"
-          strip target/release/jammi
-          tar -C target/release -czf "$asset" jammi
-          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+        run: bash ci/scripts/package_release_bin.sh jammi "${{ matrix.target }}"
 
-      # Attach the asset to the GitHub release on a tag push, or on a dispatch
-      # that names an existing release via `release_tag`. The release is created
-      # here if missing (idempotently, tolerating concurrent creation by other
-      # legs and `crates.yml`), so this leg never depends on another job creating
-      # it first. `--clobber` makes the upload idempotent on re-run.
-      - name: Upload to release
-        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REL_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.release_tag }}
-        run: |
-          set -euo pipefail
-          # The Linux/server jobs run in the manylinux CI container, which has no
-          # `gh` CLI; install it on demand (no-op on the native macOS runner).
-          if ! command -v gh >/dev/null 2>&1; then
-            GH_VER=2.63.2
-            curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VER}/gh_${GH_VER}_linux_amd64.tar.gz" | tar -xz -C /tmp
-            install "/tmp/gh_${GH_VER}_linux_amd64/bin/gh" /usr/local/bin/gh
-          fi
-          # `gh release upload` shells out to git to detect the repo; the container
-          # checkout is owned by a different uid, so mark it safe first.
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          # Be self-sufficient: create the release if it does not exist yet, rather
-          # than waiting on `crates.yml`'s `github-release` job (which only runs
-          # after the crates.io publish, minutes later). Concurrent legs and that
-          # job all tolerate an existing release via `|| true`, so whoever runs
-          # first creates it and the rest no-op. `--verify-tag` guards against
-          # creating a release for a tag that does not exist.
-          gh release create "$REL_TAG" --generate-notes --verify-tag || true
-          # Backstop for transient API hiccups: retry the upload briefly.
-          for attempt in 1 2 3 4 5; do
-            if gh release upload "$REL_TAG" "${{ steps.package.outputs.asset }}" --clobber; then
-              break
-            fi
-            if [ "$attempt" -eq 5 ]; then
-              echo "release upload failed after $attempt attempts" >&2
-              exit 1
-            fi
-            echo "release $REL_TAG not ready (attempt $attempt); retrying in 15s" >&2
-            sleep 15
-          done
-
-      # A no-tag manual dispatch (branch exercise) publishes the built artifact to
-      # the workflow run instead — no release is touched.
-      - name: Upload artifact (dispatch)
-        if: github.event_name == 'workflow_dispatch' && inputs.release_tag == ''
-        uses: actions/upload-artifact@v4
+      # Release attach (tag push / dispatch-with-tag) or workflow-artifact
+      # upload (no-tag dispatch) — the shared release-upload action decides
+      # which, and owns the idempotent `gh release create` + bounded retry.
+      - uses: ./.github/actions/release-upload
         with:
-          name: ${{ steps.package.outputs.asset }}
-          path: ${{ steps.package.outputs.asset }}
+          asset: ${{ steps.package.outputs.asset }}
+          release-tag: ${{ inputs.release_tag }}
 
   # ---- CPU jammi-server tarball ----
   # Mirrors the CPU `jammi` CLI job above: x86_64-linux, built in the CI base
@@ -185,6 +145,9 @@ jobs:
     name: Build jammi-server (CPU)
     runs-on: ubuntu-latest
     container: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
+    permissions:
+      # `gh release create` / `gh release upload` (the release-upload action).
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust-ci
@@ -199,57 +162,15 @@ jobs:
       - name: Package
         id: package
         shell: bash
-        run: |
-          set -euo pipefail
-          version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-          asset="jammi-server-${version}-x86_64-unknown-linux-gnu.tar.gz"
-          strip target/release/jammi-server
-          tar -C target/release -czf "$asset" jammi-server
-          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+        run: bash ci/scripts/package_release_bin.sh jammi-server x86_64-unknown-linux-gnu
 
-      - name: Upload to release
-        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REL_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.release_tag }}
-        run: |
-          set -euo pipefail
-          # The Linux/server jobs run in the manylinux CI container, which has no
-          # `gh` CLI; install it on demand (no-op on the native macOS runner).
-          if ! command -v gh >/dev/null 2>&1; then
-            GH_VER=2.63.2
-            curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VER}/gh_${GH_VER}_linux_amd64.tar.gz" | tar -xz -C /tmp
-            install "/tmp/gh_${GH_VER}_linux_amd64/bin/gh" /usr/local/bin/gh
-          fi
-          # `gh release upload` shells out to git to detect the repo; the container
-          # checkout is owned by a different uid, so mark it safe first.
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          # Be self-sufficient: create the release if it does not exist yet, rather
-          # than waiting on `crates.yml`'s `github-release` job (which only runs
-          # after the crates.io publish, minutes later). Concurrent legs and that
-          # job all tolerate an existing release via `|| true`, so whoever runs
-          # first creates it and the rest no-op. `--verify-tag` guards against
-          # creating a release for a tag that does not exist.
-          gh release create "$REL_TAG" --generate-notes --verify-tag || true
-          # Backstop for transient API hiccups: retry the upload briefly.
-          for attempt in 1 2 3 4 5; do
-            if gh release upload "$REL_TAG" "${{ steps.package.outputs.asset }}" --clobber; then
-              break
-            fi
-            if [ "$attempt" -eq 5 ]; then
-              echo "release upload failed after $attempt attempts" >&2
-              exit 1
-            fi
-            echo "release $REL_TAG not ready (attempt $attempt); retrying in 15s" >&2
-            sleep 15
-          done
-
-      - name: Upload artifact (dispatch)
-        if: github.event_name == 'workflow_dispatch' && inputs.release_tag == ''
-        uses: actions/upload-artifact@v4
+      # Release attach (tag push / dispatch-with-tag) or workflow-artifact
+      # upload (no-tag dispatch) — the shared release-upload action decides
+      # which, and owns the idempotent `gh release create` + bounded retry.
+      - uses: ./.github/actions/release-upload
         with:
-          name: ${{ steps.package.outputs.asset }}
-          path: ${{ steps.package.outputs.asset }}
+          asset: ${{ steps.package.outputs.asset }}
+          release-tag: ${{ inputs.release_tag }}
 
   # ---- CUDA jammi-server tarball ----
   # Built in the CUDA CI base image (CUDA 12.6 toolkit). The tarball is
@@ -278,6 +199,9 @@ jobs:
     if: always() && (github.event_name != 'push' || needs.gpu-prove-cu12.result == 'success')
     runs-on: ubuntu-latest
     container: ${{ vars.JAMMI_CI_IMAGE_CUDA || 'ghcr.io/f-inverse/jammi-ai-ci-cuda:latest' }}
+    permissions:
+      # `gh release create` / `gh release upload` (the release-upload action).
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust-ci
@@ -331,46 +255,10 @@ jobs:
           tar -czf "$asset" "$stage"
           echo "asset=$asset" >> "$GITHUB_OUTPUT"
 
-      - name: Upload to release
-        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REL_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.release_tag }}
-        run: |
-          set -euo pipefail
-          # The Linux/server jobs run in the manylinux CI container, which has no
-          # `gh` CLI; install it on demand (no-op on the native macOS runner).
-          if ! command -v gh >/dev/null 2>&1; then
-            GH_VER=2.63.2
-            curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VER}/gh_${GH_VER}_linux_amd64.tar.gz" | tar -xz -C /tmp
-            install "/tmp/gh_${GH_VER}_linux_amd64/bin/gh" /usr/local/bin/gh
-          fi
-          # `gh release upload` shells out to git to detect the repo; the container
-          # checkout is owned by a different uid, so mark it safe first.
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          # Be self-sufficient: create the release if it does not exist yet, rather
-          # than waiting on `crates.yml`'s `github-release` job (which only runs
-          # after the crates.io publish, minutes later). Concurrent legs and that
-          # job all tolerate an existing release via `|| true`, so whoever runs
-          # first creates it and the rest no-op. `--verify-tag` guards against
-          # creating a release for a tag that does not exist.
-          gh release create "$REL_TAG" --generate-notes --verify-tag || true
-          # Backstop for transient API hiccups: retry the upload briefly.
-          for attempt in 1 2 3 4 5; do
-            if gh release upload "$REL_TAG" "${{ steps.package.outputs.asset }}" --clobber; then
-              break
-            fi
-            if [ "$attempt" -eq 5 ]; then
-              echo "release upload failed after $attempt attempts" >&2
-              exit 1
-            fi
-            echo "release $REL_TAG not ready (attempt $attempt); retrying in 15s" >&2
-            sleep 15
-          done
-
-      - name: Upload artifact (dispatch)
-        if: github.event_name == 'workflow_dispatch' && inputs.release_tag == ''
-        uses: actions/upload-artifact@v4
+      # Release attach (tag push / dispatch-with-tag) or workflow-artifact
+      # upload (no-tag dispatch) — the shared release-upload action decides
+      # which, and owns the idempotent `gh release create` + bounded retry.
+      - uses: ./.github/actions/release-upload
         with:
-          name: ${{ steps.package.outputs.asset }}
-          path: ${{ steps.package.outputs.asset }}
+          asset: ${{ steps.package.outputs.asset }}
+          release-tag: ${{ inputs.release_tag }}

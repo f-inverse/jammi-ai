@@ -2030,7 +2030,7 @@ mod tests {
             let fd = (loss_value(&plus) - loss_value(&minus)) / (2.0 * eps);
 
             let diff = (analytic[i] - fd).abs();
-            let tol = 1e-4 * fd.abs().max(1.0); // relative-with-floor.
+            let tol = 1e-4 * fd.abs().max(1.0); // relative-with-floor — no-producer: the floor guards the fd ~ 0 regime, a chosen margin, not a measurement.
             assert!(
                 diff <= tol,
                 "element {i}: analytic grad {} vs central-difference {fd} differ by {diff} \

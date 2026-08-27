@@ -19,6 +19,11 @@ concurrency:
   group: cookbook-render-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege: this lane reads the checkout and saves an actions cache
+# (the cache API needs no `contents` scope); nothing publishes.
+permissions:
+  contents: read
+
 env:
   # The determinism regime (K0 §3): jammi_cookbook also sets these on import, but
   # pinning them in the job env covers anything that reads them first.
@@ -41,25 +46,18 @@ jobs:
         with:
           rustflags: "-C link-arg=-fuse-ld=mold"
 
+      # The grpc:// / live-server chapters shell out to jammi-server; build it
+      # (`build-server`) alongside the HEAD wheels. `jammi` is the pure-Python
+      # front-end over two lockstep dists: the compiled `jammi-ai-native`
+      # wheel (mode: wheel) and the pure `jammi-ai` wheel
+      # (`build-client-wheel`), both force-reinstalled. The shared
+      # setup-jammi-py action owns the venv/maturin mechanics.
       - name: Build the HEAD wheels + jammi-server binary
-        # The grpc:// / live-server chapters shell out to jammi-server; build it
-        # alongside the HEAD wheels. `jammi` is the pure-Python front-end over
-        # two lockstep dists: build the compiled `jammi-ai-native` wheel (maturin,
-        # from `packaging/native`) and the pure `jammi-ai` wheel (`python -m
-        # build`), then force-reinstall both.
-        run: |
-          python3 -m venv .venv
-          . .venv/bin/activate
-          pip install --upgrade pip
-          pip install maturin build
-          pip install -e 'clients/python[dev]'
-          make -C clients/python generate
-          ( cd packaging/native && maturin build --release --out "$GITHUB_WORKSPACE/target/wheels" )
-          ( cd clients/python && python -m build --wheel --outdir "$GITHUB_WORKSPACE/target/wheels" )
-          pip install --force-reinstall --no-deps \
-            target/wheels/jammi_ai_native-*.whl \
-            target/wheels/jammi_ai-*.whl
-          cargo build --release -p jammi-server
+        uses: ./.github/actions/setup-jammi-py
+        with:
+          mode: wheel
+          build-client-wheel: "true"
+          build-server: "true"
 
       - name: Install the book (against the HEAD wheel)
         run: |

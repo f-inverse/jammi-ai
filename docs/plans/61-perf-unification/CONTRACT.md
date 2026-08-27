@@ -9,12 +9,12 @@ NOT in this unit; this contract records their front-door preconditions (C15, C16
 Single source of truth: the `jammi-bench` binary's own baked identity (`build_sha`, `target`,
 `profile`, `build_features`) plus the runtime kernel facts `jammi_kernels::admission` owns
 (`FLASH_COMPILED`, `disabled_ops_requested`, `disabled_ops_fired`), emitted through the existing
-`Report` container. Three readers under `ci/` make disagreement a CI failure: rule (g) inside
+`Report` container. Three readers under `ci/` make disagreement a CI failure: rule (i) inside
 `check_cuda_run_artifacts.py`, rule (h) as `check_perf_claims.py`, and a Python-⊆-Rust identity
 subset suite. Every gate script under `ci/scripts/**/check_*.py` / `check_*.sh` is inside the
 `SWARM_GATE_TOUCHED` glob and human-merged.
 
-Phase order: **1 = bench provenance; 2 = rule (g) + producers + the two baselines move + swarm glob;
+Phase order: **1 = bench provenance; 2 = rule (i) + producers + the two baselines move + swarm glob;
 3 = rule (h) + the ledger + the guide.** The baselines move (phase 2) lands before any `claims:` tag
 is written (phase 3), so no tag is ever re-pointed.
 
@@ -27,7 +27,7 @@ the literal `<workspace>/.git/HEAD`, absent in a worktree) and emits `cargo:reru
 path and the ref it points at. Dirtiness is `git status --porcelain --untracked-files=no` restricted
 to tracked paths. Output is `<sha>` or `<sha>-dirty`. A sha produced inside a `pull_request` CI
 checkout resolves the MERGE ref and must never be accepted as provenance — no CI job in this unit
-emits a leg, and rule (g) cross-checks `provenance.build_sha == parent.git_sha` so a merge-ref sha can
+emits a leg, and rule (i) cross-checks `provenance.build_sha == parent.git_sha` so a merge-ref sha can
 only ever land INVALID. Test shape: never assert 40-hex, never assert not-`unknown` (a dirty dev tree
 is GREEN); assert run-time inertness (re-running with a different `JAMMI_BUILD_SHA` in the environment
 yields a byte-identical `provenance` object).
@@ -57,9 +57,11 @@ The Python COMPARISON tuples (`ab_merge.py`'s `FINETUNE_IDENTITY_FIELDS`,
 `compare_grad_oracle.py`'s `RUN_IDENTITY_FIELDS`) do not change in this unit — only the Rust
 K7-completeness consts grow. A new stdlib-`unittest` suite asserts Python ⊆ Rust for each pair, and
 that the two Python tuples keep their known cardinality (14, 11) — "unchanged" is a number, not a
-promise.
+promise. (Current state: the FINETUNE tuple has since grown to 17 — #381's `max_grad_norm` and the
+`attention_arm` class field among them — and the suite's pinned cardinality moved with it:
+`test_identity_fields_subset.py` asserts (17, 11) today.)
 
-## C5–C9 — Rule (g), producers, the two baselines move, the swarm glob (phase 2)
+## C5–C9 — Rule (i), producers, the two baselines move, the swarm glob (phase 2)
 
 `check_cuda_run_artifacts.py` gains a v2-schema discriminator (`leg_schema_version >= 2`), covering
 any file extension under a `-raw-runs/` directory (a closed, non-growing `LEGACY_RAW_NONJSON` list
@@ -70,6 +72,10 @@ p1_softmax_scale_fold_ab.json}` move under `crates/jammi-kernels/artifacts/cuda-
 (a)–(f) fields backfilled (the p1 record needs `merged_as`/`merged_via_pr` since its own `tip_ref` is
 not an ancestor of `HEAD`). `swarm.yml`'s gate glob widens from `ci/scripts/check_*.py` to
 `ci/scripts/**/check_*.py` (and the `.sh` twin) so a gate script under a subdirectory is covered too.
+
+Current state: C5.3 (raw-leg persistence in `ci/scripts/perf/proof_artifact.py` — the folder
+writing its per-leg raw inputs out alongside the folded artifact) is **not implemented** — a
+structural producer change, untestable without GPU data; everything else in C5–C9 is.
 
 ## C10 — Rule (h): `ci/scripts/check_perf_claims.py` (phase 3)
 
@@ -83,7 +89,7 @@ See `DESIGN-STUDY.md` §1 for the grammar. Implementation notes fixed here:
    `d0.05`), issue/PR refs (`#377`) and the escape-ledger's own `esc-NNN` row id, version strings
    (`2.13.0+cu126`, `cu126`), ledger cites (`s2:89`, `row 5`, `cont row 11`, `fusion rows 30, 36`),
    dates (`2026-08-23`). A layer/tensor/launch count (`563 launches`) is explicitly NOT excluded.
-3. **Artifact-field precedence**, VALUE-based (round-4 audit rewrite — this item went through two prior
+3. **Artifact-field precedence**, VALUE-based (this item went through two prior
    mechanisms, common-ancestor-subtree identity then whole-file identifier-token + unit-family, and an
    adversarial sweep of the real tracked tree found BOTH live-broken: the candidate field is almost
    always LESS token-specific than its operands, e.g. `delta_ms` carries no replicate suffix while the
@@ -151,7 +157,7 @@ See `DESIGN-STUDY.md` §1 for the grammar. Implementation notes fixed here:
    distinguish "editorial reword" from "new debt" mechanically, so a human states which one this is.
 7. **`legacy(<form>)`** is the explicit, auditable marker for a pointer bind reported as `V-legacy`
    rather than `V` — used only for the two AdamW summary-block cells this contract names (below),
-   standing in for what rule (g)'s v2-schema classification would infer automatically once it lands.
+   standing in for what rule (i)'s v2-schema classification would infer automatically once it lands.
 
 ## C11 — Named cells
 

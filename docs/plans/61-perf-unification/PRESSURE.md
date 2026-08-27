@@ -41,7 +41,7 @@ only what it says.
   `.git` is a FILE, not a directory, and the literal path does not exist.
 - **Dirty-tree detection must exclude untracked files.** `git status --porcelain` alone includes
   untracked scratch; a build script that treats a dirty tree as invalidating a `-dirty` suffix (and
-  rule (g) treats `-dirty` as always-INVALID) must scope the check to tracked paths only, or benign
+  rule (i) treats `-dirty` as always-INVALID) must scope the check to tracked paths only, or benign
   local scratch invalidates every leg.
 - **A `pull_request` checkout resolves the MERGE ref**, never a commit any post-merge history
   contains — a CI-baked `build_sha` is provenance about the CI job, never about a shippable artifact,
@@ -52,7 +52,7 @@ only what it says.
   identity fields) — only the Rust-side completeness const grows; the comparison tuple is unchanged,
   and a subset test pins the direction.
 
-## Container census (rule (g))
+## Container census (rule (i), lettered (g) at design time)
 
 - The container census undercounted: a hand-folded `additional_boxes.<box>.legs.<leg>.runs[]`
   container and a temporary, uncommitted `optimizer_phase_wall_time_ms` diagnostic were both missed on
@@ -70,7 +70,7 @@ Phase 3 (rule (h) + the ledger + the guide) does not depend on phases 1–2 havi
 its own PR: its pointer roots (`crates/jammi-kernels/artifacts/cuda-runs/**`, `crates/jammi-bench/
 baselines/*.json`) already exist and are already provenanced under rules (a)–(f), independent of rule
 (g)'s v2 schema. The `legacy(...)` marker in the grammar is phase 3's explicit, auditable stand-in for
-what rule (g) would otherwise classify automatically once it lands — used only for the two cells
+what rule (i) would otherwise classify automatically once it lands — used only for the two cells
 `CONTRACT.md` C12.2 names by hand, not inferred.
 
 **Round-2 audit finding (P2-move simulation).** Independence to OPEN a PR is not independence at MERGE

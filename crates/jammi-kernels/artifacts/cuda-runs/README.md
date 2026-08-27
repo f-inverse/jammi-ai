@@ -15,6 +15,20 @@ captured cargo logs; a run that parsed zero parity tests is written as `INVALID`
 Naming: `<date>-<unit>-<sha7>-<gpu>.json`. Append-only: a re-proof of the same tip on another box
 is a new file, never an overwrite.
 
+**Superseded artifacts.** When an audit finds a committed artifact's numbers unusable (a vacuous
+leg, a wrapper-cost bracket presented as kernel time), the artifact is kept as-is per the
+append-only rule — never edited or deleted — and a sibling `<same stem>.SUPERSEDED.md` marker is
+committed beside it. The marker states what was wrong, cites the finding, and names the
+replacement artifact in this directory. A `.SUPERSEDED.md` file is prose, not a leg: it carries no
+schema fields and the gate does not parse it (only `*.json` files are schema-checked).
+
+**Raw-runs evidence exemption.** `.md` and `.log` files under any `*-raw-runs/` directory are
+schema-exempt evidence (a nsys summary, a captured log, a provenance note): the gate's raw-runs
+coverage walk skips `.md`/`.log` suffixes explicitly, and rule (a)'s glob only ever matched
+`*.json`. Every OTHER non-`.json` payload under a `*-raw-runs/` directory must be in the closed
+`LEGACY_RAW_NONJSON` list (below) — a new raw leg is named `*.json` and schema-checked, never
+renamed to dodge the glob.
+
 ## Schema
 
 `ci/scripts/check_cuda_run_artifacts.py` enforces this on every `*.json` under this directory
@@ -59,12 +73,14 @@ rule, on a throwaway fixture repo — never this checkout):
 `python3 ci/scripts/check_cuda_run_artifacts.py --self-test`. Falsifier for container drift:
 `python3 ci/scripts/check_cuda_run_artifacts.py --census`.
 
-## Schema v2 — rule (g), leg identity
+## Schema v2 — rule (i), leg identity
 
 Rules (a)-(f) above answer "who produced this file, at what sha, ancestor of `HEAD`" for every
 `*.json` under this directory — but say nothing about whether one PARTICULAR number inside a
-folded artifact carries a complete, machine-checkable identity (seed/shape/dtype/arm). Rule (g)
-answers that, for any JSON object anywhere in the tree that opts in.
+folded artifact carries a complete, machine-checkable identity (seed/shape/dtype/arm). Rule (i)
+answers that, for any JSON object anywhere in the tree that opts in. (Rule (g) is the gate's
+KO-3 `oracle_separation` check; rule (h) is `ci/scripts/check_perf_claims.py`'s claim-value
+binding — hence (i) for leg identity.)
 
 **Discriminator.** An object carrying `"leg_schema_version": 2` (or higher) is a v2 **leg** — found
 by a recursive walk of every top-level artifact, plus every payload under its sibling
@@ -109,13 +125,13 @@ and its v2 decision:
 | 8 | `measurements[].legs[]` / `legs[]` | p6-b1-flash-timing ×2 | v1, a different tier (`flash_kernel_timing`) |
 | 9 | `legs[]` (test outcomes) | esc044-growth-oracle | not a bench leg |
 | 10 | `healthy_oracle_measured`, `red_controls_measured` | flash-arm-encoder-oracle ×2 | not a bench leg |
-| 11 | `clip_on_flash_leg.record` | #381 branch (device-clip-narrow) | v2 when it lands with `leg_schema_version: 2` |
+| 11 | `clip_on_flash_leg.record` | clip (#381) | v1 — landed without the `leg_schema_version` key, so validated by rules (a)-(f) only |
 | 12 | `combined_report.configs[]`, `paired_table.rows[]` | esc-045 branch | not committed (branch unmerged) |
 | 13 | `additional_boxes.<box>.legs.<leg>.runs[]` | p6-b3-dense | v1, hand-folded (producer: an untracked pod script) |
 | 14 | `optimizer_phase_wall_time_ms.{eager_arm,fused_arm}.run_N.{min_ms,median_ms,mean_ms}` | adamw | v1, a temporary uncommitted diagnostic |
 
 **`LEGACY_RAW_NONJSON`** (closed, 10 entries) — bare pre-schema `Report` dumps committed as
-`*.json.raw` (never `*.json`, so they predate rule (g)'s any-extension coverage AND rule (a)'s own
+`*.json.raw` (never `*.json`, so they predate rule (i)'s any-extension coverage AND rule (a)'s own
 `*.json` glob), exempted from BOTH by relpath, one reason each, in the gate script itself. A
 deletion must shrink this list in the same commit (`--self-test` proves every listed relpath
 exists); growth is a gate edit, i.e. SWARM_GATE_TOUCHED by construction — this list cannot silently

@@ -40,10 +40,12 @@
 // the bf16_f32 kernel specifically (confirmed by compiling this file to
 // PTX and reading the emitted SASS-adjacent PTX directly) — measured to
 // diverge from the separately-rounded (PEFT-faithful) reference on
-// 1/131072 elements at a NON-DYADIC scaling (`sqrt(3)`; every dyadic
-// scaling tested, including this op's own committed fixtures, is 0/131072
-// because a power-of-two scaling factor makes the product exact in f32
-// regardless of fusion, so it has ZERO power to detect this class). All
+// 1/131072 elements (no-producer: the audit's one-off probe, uncommitted)
+// at a NON-DYADIC scaling (`sqrt(3)`; every dyadic scaling tested,
+// including this op's own committed fixtures, is 0/131072 (no-producer:
+// derived, not measured — a power-of-two scaling factor makes the product
+// exact in f32 regardless of fusion), so a dyadic scaling has ZERO power
+// to detect this class). All
 // four kernels below share the identical `base + lora * scaling` shape
 // (the f32-output kernels included — torch's f32 add-of-a-scaled-delta
 // path is ALSO mul-round-then-add-round, two separate launches, never

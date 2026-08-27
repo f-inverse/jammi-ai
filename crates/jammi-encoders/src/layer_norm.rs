@@ -284,8 +284,8 @@ impl LayerNorm {
     /// function a same-dtype no-op, this `rstd` line is consequently the
     /// ONLY source of `slow()`'s F32 output changing at all — and the
     /// effect is large, not a stray ULP: on the same production-shape
-    /// fixture `tests::slow_f32_reciprocal_form_is_bit_exact_and_diverges_from_division`
-    /// measures live (`rows=256, hidden=1024`, `n=262144`), the division
+    /// fixture — see `tests::slow_f32_reciprocal_form_is_bit_exact_and_diverges_from_division`,
+    /// which measures live (`rows=256, hidden=1024`, `n=262144`), the division
     /// form disagrees with the reciprocal form on `74734/262144`
     /// elements — see that test's own printed count. Since
     /// bias-free eval (the ModernBERT serving path) reaches `slow()`
@@ -920,7 +920,11 @@ mod tests {
     /// derived only from the bias-free arms previously gave the OTHER
     /// three consuming arms far less headroom than the 10×-over-
     /// measurement this doc claims: at the values measured on this
-    /// branch, this constant's `93`/`371` budgets left the biased arm
+    /// branch (residuals printed by
+    /// [`layer_norm_slow_matches_truth_at_production_shape_biased_seq128`],
+    /// [`layer_norm_slow_matches_truth_at_production_shape_biased_seq512`],
+    /// and [`layer_norm_slow_matches_truth_at_production_shape_f16`]),
+    /// this constant's `93`/`371` budgets left the biased arm
     /// only `93/34 ≈ 2.7×` / `371/148 ≈ 2.5×` headroom and the F16 arm
     /// only `93/59 ≈ 1.58×` — nowhere near the `10×` this doc's own
     /// derivation promises, and tight enough that a shift in libm/SIMD
@@ -949,7 +953,10 @@ mod tests {
     /// it (this same test's partial-double-round control double-rounds
     /// only `floor(rows * 0.01)` rows and ASSERTS its own mismatch count
     /// exceeds this budget — 526 vs 93 at seq 128, 2576 vs 371 at seq
-    /// 512, both measured, printed, and re-checked live, not assumed).
+    /// 512, both measured, printed, and re-checked live on every run
+    /// (printed by [`layer_norm_slow_matches_truth_at_production_shape_seq128`]
+    /// and [`layer_norm_slow_matches_truth_at_production_shape_seq512`]),
+    /// not assumed).
     /// The whole-tensor double-rounding control (every row, not just
     /// ~1%) is checked against a separate, looser `budget * 5` bound
     /// only — see that assertion's own text for why: it exists to prove
@@ -1662,7 +1669,9 @@ mod tests {
             .filter(|(a, b)| a.to_bits() != b.to_bits())
             .count();
         // F16's own measured residual at this shape is 59/262144
-        // (2.2507e-4) -- see [`F16_REDUCTION_ORDER_BUDGET_FRACTION`]'s
+        // (2.2507e-4), printed on every run by this test
+        // ([`layer_norm_slow_matches_truth_at_production_shape_f16`]) --
+        // see [`F16_REDUCTION_ORDER_BUDGET_FRACTION`]'s
         // doc for the derivation; this is what is measured, not a claim
         // about WHY it differs from the bf16 arms' own residuals.
         let budget = ((n as f64) * F16_REDUCTION_ORDER_BUDGET_FRACTION).ceil() as usize;

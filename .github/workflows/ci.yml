@@ -10,6 +10,10 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege: every job here only reads the checkout; nothing publishes.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -256,14 +260,11 @@ jobs:
       # `local` on via jammi-server / jammi-python, so `cargo tree` would falsely
       # flag candle; the real per-package build set is what `cargo build -p X`
       # compiles, so the guard inspects the compiler-artifact stream of the
-      # actual isolated build.
+      # actual isolated build. The script checks cargo's own exit code before
+      # any grep runs — a bare build-into-grep pipeline (no pipefail) would let
+      # a FAILED build report this boundary green.
       - name: Assert the client substrate pulls no ML deps
-        run: |
-          cargo build -p jammi-wire -p jammi-admin -p jammi-client --message-format=json \
-            | grep '"reason":"compiler-artifact"' \
-            | grep -iE '"name":"(candle[^"]*|hf-hub|hf_hub|symphonia|tokenizers)"' \
-            && { echo "::error::the client substrate compiled an embedded-engine ML dep — the candle-free boundary regressed"; exit 1; } \
-            || echo "wire / admin / client build set is candle-free"
+        run: bash ci/scripts/check_client_deps.sh substrate
 
       # The `jammi` CLI is a strict control-plane client: it depends on
       # `jammi-admin`, NOT `jammi-ai`, so it must stay candle-free AND carry no
@@ -273,16 +274,7 @@ jobs:
       # of the engine into the CLI would compile everywhere else and regress only
       # here.
       - name: Assert the standalone CLI build pulls no ML deps and no jammi-ai
-        run: |
-          ARTIFACTS=$(cargo build -p jammi-cli --message-format=json \
-            | grep '"reason":"compiler-artifact"' \
-            | grep -oE '"name":"[^"]*"')
-          echo "$ARTIFACTS" | grep -iE '"name":"(candle[^"]*|hf-hub|hf_hub|symphonia|tokenizers)"' \
-            && { echo "::error::the jammi CLI compiled an embedded-engine ML dep — the strict-client boundary regressed"; exit 1; } \
-            || echo "jammi-cli build set is candle-free"
-          echo "$ARTIFACTS" | grep -iE '"name":"jammi[-_]ai"' \
-            && { echo "::error::the jammi CLI compiled jammi-ai — the strict-client boundary regressed"; exit 1; } \
-            || echo "jammi-cli build set carries no jammi-ai edge"
+        run: bash ci/scripts/check_client_deps.sh cli
 
   # The hermetic script-guard class (plain ubuntu + checkout + run one
   # hermetic script, no toolchain/container) lives as ONE matrix job below —
@@ -648,32 +640,18 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust-ci
 
+      # The pytest suite drives two dists that ship in lockstep — the base
+      # client `jammi-ai` (import `jammi`) and the compiled `jammi-ai-native`
+      # engine (`import jammi_native`), which the base discovers as its
+      # `file://` backend. That is what makes the conformance test
+      # (`jammi.connect`'s remote IS `jammi.RemoteDatabase`, its `file://` arm
+      # the native engine) runnable in this lane. The shared setup-jammi-py
+      # action owns the venv/maturin mechanics; pytest is this lane's own
+      # extra.
       - name: Install the base client + native engine
-        # The CI base image ships maturin + a python3 toolchain; use a
-        # venv to avoid polluting the system site-packages and to make
-        # `python` resolve to the venv's interpreter for pytest.
-        #
-        # The pytest suite drives two dists that ship in lockstep:
-        #   * `jammi-ai` (import `jammi`) — the base client; install from in-repo
-        #     source (`-e` with the dev extra, which carries the pinned
-        #     `grpcio-tools` generator and the client's real grpcio/protobuf
-        #     floors) then generate its proto stubs, since it is not on PyPI for
-        #     an unreleased commit.
-        #   * `jammi-ai-native` — the compiled engine (`import jammi_native`);
-        #     `maturin develop` on `packaging/native/pyproject.toml` builds it
-        #     into the venv, and the base client discovers it as its `file://`
-        #     backend.
-        # This is what makes the conformance test (`jammi.connect`'s remote IS
-        # `jammi.RemoteDatabase`, its `file://` arm the native engine) runnable
-        # in this lane.
-        run: |
-          python3 -m venv .venv
-          . .venv/bin/activate
-          pip install --upgrade pip
-          pip install maturin pytest
-          pip install -e 'clients/python[dev]'
-          make -C clients/python generate
-          ( cd packaging/native && maturin develop --release )
+        uses: ./.github/actions/setup-jammi-py
+        with:
+          extra-pip-packages: pytest
 
       - name: Run pytest
         run: |
@@ -882,7 +860,7 @@ jobs:
           # `check_cuda_run_artifacts.py --census` — falsifier F4 (contract
           # §6): every `s_per_step_p50`-carrying JSON object under a
           # `schema_version >= 2` top-level artifact's tree must be REACHED
-          # by rule (g)'s v2-leg walk. Trivially PASS today (0 such
+          # by rule (i)'s v2-leg walk. Trivially PASS today (0 such
           # artifacts exist), standing for the day one does; also previously
           # invoked from ZERO workflows.
           - name: CUDA run artifact census

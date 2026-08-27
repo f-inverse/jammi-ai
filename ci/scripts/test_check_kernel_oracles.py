@@ -22,8 +22,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import check_kernel_oracles as ko  # noqa: E402
 
-# The frozen tokenizer-invariant fixture corpus (esc: kernel-oracle-golden-
-# fixture) — see `_load_tokenizer_fixture_corpus` and
+# The frozen tokenizer-invariant fixture corpus (ledger row
+# esc-049-kernel-oracle-golden-fixture) — see `_load_tokenizer_fixture_corpus` and
 # `TestTokenizerCommentStringInvariant` below for why this exists
 # separately from `ko.scan_files()`'s LIVE tree scan.
 _TOKENIZER_FIXTURE_DIR = Path(__file__).resolve().parents[2] / "ci" / "fixtures" / "kernel-oracle-tokenizer"
@@ -1364,8 +1364,9 @@ class TestKo2GenericExclusionDirectAdjacency(unittest.TestCase):
 
 # --------------------------------------------------------------------------- #
 # round-4 (lead probe of the class) — attribute-to-item ASSOCIATION (N1/item
-# 2), adopted directly from scratchpad/audit-r3/rs/G1-G7 (paraphrased, not
-# copied).
+# 2), adopted directly from scratchpad/audit-r3/rs/G1-G7 (session-local audit
+# fixtures, untracked; paraphrased, not copied — the tests below are the
+# tracked record).
 # --------------------------------------------------------------------------- #
 class TestAttributeAssociation(unittest.TestCase):
     HELPER = (
@@ -1525,8 +1526,9 @@ class TestReturnSkipProcessExit(unittest.TestCase):
 
 class TestConformanceFixtures(unittest.TestCase):
     """Round-4 audit item 5: the remaining scratchpad/audit-r3/rs/F*.rs
-    fixtures not already exercised above (paraphrased, not copied),
-    adopted with the audit's stated expected outcome.
+    fixtures not already exercised above (session-local audit fixtures,
+    untracked; paraphrased, not copied — these tests are the tracked
+    record), adopted with the audit's stated expected outcome.
     """
 
     def test_f3b_bare_assert_form_is_not_a_conforming_shape_stays_ungated(self) -> None:

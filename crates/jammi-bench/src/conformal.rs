@@ -502,7 +502,7 @@ mod tests {
         assert!(!spec.points.is_empty(), "spec must carry at least one size");
         for sp in &spec.points {
             for pair in [&sp.classification, &sp.absolute_residual, &sp.cqr] {
-                let expected = (pair.measured - spec.margin).max(0.0);
+                let expected = (pair.measured - spec.margin).max(0.0); // no-producer: non-negativity clamp — a floor cannot be negative.
                 assert!(
                     (pair.floor - expected).abs() < 1e-12,
                     "floor {} is not measured {} − margin {}",
@@ -611,6 +611,10 @@ mod tests {
             rebuild_spec(spec.alpha, spec.n_classes, spec.test_rows, &sizes).expect("rebuild runs");
         for sp in &rebuilt.points {
             for pair in [&sp.classification, &sp.absolute_residual, &sp.cqr] {
+                // The clamp is the definitional non-negativity clamp (a
+                // floor cannot be negative) — the same `measured − margin`
+                // construction the committed spec is held to, see
+                // [`committed_spec_floors_are_measured_minus_margin`].
                 assert_eq!(pair.floor, (pair.measured - rebuilt.margin).max(0.0));
             }
         }

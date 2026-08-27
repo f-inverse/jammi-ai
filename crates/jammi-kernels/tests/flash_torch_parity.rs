@@ -23,9 +23,13 @@
 //! an ABSOLUTE floor (`docs/maintainer/cuda-kernel-guide.md` §3.8
 //! explicitly forbids this shape: "a `k · ulp(max)` floor charges every
 //! element the allowance of the largest and hides exactly the divergence
-//! you are hunting"). The auditor showed it was 50-100x wider than the
-//! REAL divergence (measured by hand with numpy: on `b1_s512_win64`,
-//! `|f64_truth - ref_o|max = 0.0036`, `|f64_truth - ref_lse|max = 7.7e-7`),
+//! you are hunting"). The auditor measured the real truth-vs-reference
+//! divergence by hand (a one-off numpy probe, against a fixture corpus
+//! since regenerated — neither its figures nor any magnitude derived from
+//! them are retained here, because they no longer describe the committed
+//! fixtures; the bound below re-measures truth live every run instead)
+//! and showed the old bound could not bite — the live-backed demonstration
+//! is below: a deliberate scale injection passed every tensor under it —
 //! and that `lse` (an `f32` TENSOR — never rounded to bf16 anywhere in this
 //! op's pipeline) was being bounded by a bf16 ULP fraction, a category
 //! error the guide's family-D "pin the mathematical object" principle

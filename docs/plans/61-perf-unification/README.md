@@ -9,7 +9,7 @@
 >
 > **Status:** phases 1–3 are this unit; phase 4 (`ServerInfo` static-build-identity fields) and phase
 > 5 (a held-out-loss acceptance statistic for the fine-tune arms) are descoped to their own follow-up
-> units — each records its front-door precondition in `CONTRACT.md` (C16, C17) rather than being built
+> units — each records its front-door precondition in `CONTRACT.md` (C15, C16) rather than being built
 > here.
 
 ## Why this unit exists
@@ -30,7 +30,7 @@ what actually ran.
 | phase | what it builds | owner | file |
 |---|---|---|---|
 | 1 — bench provenance | `jammi-bench`'s own baked identity (`build_sha`/`target`/`profile`/`build_features`), the `Provenance` struct on `Report`, and the K7-completeness identity consts per `(tier, producer_kind, leg_shape)` | bench (+ numerics for one `admission.rs` const) | `crates/jammi-bench/build.rs`, `report.rs` |
-| 2 — leg identity + producers | rule (g): `check_cuda_run_artifacts.py` gains a schema-v2 discriminator (`leg_schema_version >= 2`) that requires every v2 leg to carry a self-declaring identity tuple and a `build_sha` matching its artifact's own `git_sha`; every shell producer cross-checks the binary before it writes a leg; the two hand-carried baselines move under `crates/jammi-kernels/artifacts/cuda-runs/`; the swarm gate glob widens to cover a gate script under a subdirectory | docs-ci (+ numerics, bench per file) | `ci/scripts/check_cuda_run_artifacts.py`, `ci/scripts/perf/*.sh`, `.github/workflows/swarm.yml` |
+| 2 — leg identity + producers | rule (i): `check_cuda_run_artifacts.py` gains a schema-v2 discriminator (`leg_schema_version >= 2`) that requires every v2 leg to carry a self-declaring identity tuple and a `build_sha` matching its artifact's own `git_sha`; every shell producer cross-checks the binary before it writes a leg; the two hand-carried baselines move under `crates/jammi-kernels/artifacts/cuda-runs/`; the swarm gate glob widens to cover a gate script under a subdirectory | docs-ci (+ numerics, bench per file) | `ci/scripts/check_cuda_run_artifacts.py`, `ci/scripts/perf/*.sh`, `.github/workflows/swarm.yml` |
 | 3 — claim grammar + guide | rule (h): `ci/scripts/check_perf_claims.py`, a bounded six-form claim grammar that binds every numeric token in the guide's nine tables to a tracked artifact value at Decimal/`ROUND_HALF_EVEN` string equality, or escapes it into a committed, shrink-only ledger; the guide's own §7/§8 become citation tables into `cuda-kernel-guide.md` | docs-ci | `ci/scripts/check_perf_claims.py`, `ci/perf_claims_allowlist.txt`, `docs/maintainer/fine-tune-performance-guide.md` |
 
 The lead's phase order is **1 → 2 → 3**, which reverses an earlier draft's "grammar first" — IN THAT

@@ -26,7 +26,7 @@
 //!   against nsys/kernel-only numbers elsewhere in this repo).
 //! - `>= 20` warmup iterations, `>= 200` measured iterations.
 //! - Reports **both min and median** (not just mean/p50). The **KERNEL**
-//!   bracket is REQUIRED to be steady-state (median within 5% of mean) and
+//!   bracket is REQUIRED to be steady-state (median within 5% of mean — no-producer: restates the `STEADY_STATE_REL_TOL` design threshold below) and
 //!   REFUSES (panics) rather than publishing a bimodal/outlier-dominated
 //!   sample. The **WRAPPER** bracket's steady-state flag is RECORDED, not
 //!   enforced — two independent runs on this box (`a100b`) found the
@@ -149,7 +149,7 @@ fn stats(mut samples: Vec<f64>) -> Stats {
     } else {
         samples[n / 2]
     };
-    let rel = (median - mean).abs() / mean.max(1e-9);
+    let rel = (median - mean).abs() / mean.max(1e-9); // no-producer: divide-by-zero guard, not a tolerance.
     Stats {
         mean_ms: mean,
         min_ms: samples[0],

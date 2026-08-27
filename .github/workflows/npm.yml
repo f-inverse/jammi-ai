@@ -7,18 +7,25 @@ name: npm
 on:
   push:
     tags: ["v*"]
-  # Manual re-run to finish a release whose publish step was interrupted. The
-  # `npm publish` below is a no-op (skipped) if the version is already on npm.
+  # Manual re-run to finish a release whose publish step was interrupted: run
+  # the dispatch ON the `v*` tag (the publish step is tag-guarded; it also
+  # no-ops if the version is already on npm). A branch dispatch is a
+  # build-and-test dry run.
+  # No `version` input: `npm publish` publishes whatever package.json says,
+  # so an input could only key the idempotence probe on a DIFFERENT version
+  # than the one being published — a stale input would read "already on npm"
+  # and skip the real publish, green. The probe below is keyed on
+  # package.json directly; the tag-vs-package.json verify step pins the rest.
   workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to (re)publish, e.g. 0.13.0. Defaults to the pushed tag."
-        required: false
-        type: string
 
 concurrency:
   group: release-npm
   cancel-in-progress: false
+
+# Least privilege at the workflow level; the publish job widens to
+# `id-token: write` (npm OIDC trusted publishing) per job.
+permissions:
+  contents: read
 
 jobs:
   publish:
@@ -57,7 +64,10 @@ jobs:
         run: npm install -g npm@11.18.0
 
       - name: Verify tag matches package version
-        if: github.event_name == 'push'
+        # Any `v*` tag ref — a tag push, or a recovery dispatch run on the
+        # tag — must pass this; only a branch dispatch (build-only dry run)
+        # skips it.
+        if: startsWith(github.ref, 'refs/tags/v')
         run: |
           set -euo pipefail
           tag="${GITHUB_REF#refs/tags/v}"
@@ -85,12 +95,18 @@ jobs:
       # provenance automatically. Requires the npm package to register this repo
       # + workflow as a trusted publisher.
       - name: Publish
+        # Publishes ONLY from a `v*` tag ref (tag push, or a recovery
+        # dispatch run on the tag). The already-on-npm check below makes the
+        # re-run idempotent; the tag guard is what keeps "recovery
+        # re-publish" and "first publish of an untagged build" distinct
+        # states — a branch dispatch builds and tests but never publishes.
+        if: startsWith(github.ref, 'refs/tags/v')
         run: |
           set -euo pipefail
-          # On a tag push, derive the version from the tag (v0.13.0 -> 0.13.0);
-          # on a manual dispatch, take it from the input.
-          VERSION="${{ github.event.inputs.version }}"
-          VERSION="${VERSION:-${GITHUB_REF_NAME#v}}"
+          # Key the idempotence probe on the SAME quantity `npm publish`
+          # publishes — package.json's version (the verify step above pins
+          # it to the tag). Any other key could skip a real publish green.
+          VERSION="$(node -p "require('./package.json').version")"
           # Skip if this version is already on npm (idempotent re-run); `npm view`
           # exits non-zero when the exact version does not exist yet.
           if npm view "@f-inverse/jammi-client@${VERSION}" version >/dev/null 2>&1; then

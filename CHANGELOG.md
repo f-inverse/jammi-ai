@@ -7,6 +7,22 @@ workspace ships every publishable crate at the same
 ## [Unreleased]
 
 ### Fixed
+- **The LoRA-site forward epilogue rounds ONCE at the wider dtype, matching
+  PEFT (`jammi-lora`, `jammi-kernels`).** Both arms previously rounded the
+  scaled delta to the backbone dtype *before* the add — two bf16 round
+  points where PEFT's `Linear.forward` performs one (an f32 sum, then a
+  single cast back; peft 0.20.0 `layer.py:1044-1069`, re-read at source).
+  Because the fused (`ScaledCastAdd` CPU + CUDA bf16 arms, reused by
+  `LowRankResidualLinear`) and eager (`LoraLinear`'s epilogue) paths shared
+  the convention, a same-build forced-arm A/B read zero differences and was
+  blind by construction; at production width (n = 4096) and amplitude
+  (|base| ~ 100) the double rounding moved 176/4096 elements by one bf16
+  ULP each versus the PEFT-semantics reference. Now: widen the base to f32,
+  add the f32-scaled delta, round once; and all four `scaled_cast_add`
+  CUDA kernels keep the multiply and the add as two separately rounded f32
+  operations via explicitly rounded intrinsics (`__fmul_rn`/`__fadd_rn`),
+  matching PEFT's two-launch execution — nvcc's default `--fmad=true`
+  cannot contract them into a single `fma.rn.f32`. (esc-046)
 - **Gradient clipping now follows `torch.nn.utils.clip_grad_norm_`'s
   semantics (`jammi-ai`) — not bit-exact: two remaining divergences.** The
   device-side global-L2 gradient clip computes `clip_coef = min(1, max_norm /

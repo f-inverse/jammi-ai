@@ -62,7 +62,7 @@ leg must carry its `(tier, producer_kind, leg_shape)` identity tuple, present an
 declared nullable with a stated meaning (`max_grad_norm: null` = no clip), and its own
 `provenance.build_sha` must equal the parent artifact's `git_sha` — a leg with `unknown` or `-dirty`
 can never be GREEN. This is what phase 3's `V` (as opposed to `V-legacy`) classification would key off
-once it lands; phase 3 alone, without rule (g) live, treats every pointer bind as unclassified by v1/
+once it lands; phase 3 alone, without rule (i) live, treats every pointer bind as unclassified by v1/
 v2 shape except the two cells this contract calls out by hand (`legacy(...)`, C12.2).
 
 ## 4. Honest bound on what closes

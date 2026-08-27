@@ -26,6 +26,10 @@ No pod-local absolute path is required: `PROOF_SRC` (default `/root/
 proof-out`, override-able) is the only path this script reads from besides
 `OUT_DIR`, and both are caller-supplied, never hard-coded to a specific pod's
 filesystem layout.
+
+Not implemented: raw-leg persistence (unification contract C5.3 — writing the
+per-leg raw inputs out alongside the folded artifact); this script emits only
+the folded JSON today.
 """
 from __future__ import annotations
 

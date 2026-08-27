@@ -202,7 +202,8 @@ PY
 # CAPTURE DIR, never a valid pass).
 #
 # round-5 correction (a100c on-pod A2 run at 80c7f59, real evidence at
-# scratchpad/a2-timings/80c7f59/a100c-failure/a2c.stdout): a PRIOR round's
+# scratchpad/a2-timings/80c7f59/a100c-failure/a2c.stdout — a session-local
+# capture, untracked): a PRIOR round's
 # fix additionally flagged every INDIVIDUAL zero-byte captured `output`
 # file as an error ("captured at the wrong moment"). That assumption was
 # FALSE: cargo creates a `build/<pkg>-*/output` file for every build
@@ -585,7 +586,8 @@ pod_seed_write_failure_marker() {
   local dedup; dedup="$(mktemp)"
   # round-5 addendum (a100c on-pod A2 run at 80c7f59, real failure marker
   # at scratchpad/a2-timings/80c7f59/a100c-failure/.jammi-seed.jammi-seed-
-  # failed): the env-surface cross-check (pod_seed_check_stdout_subset)
+  # failed — a session-local capture, untracked): the env-surface
+  # cross-check (pod_seed_check_stdout_subset)
   # repeats the SAME "<NAME> (from <file>)" line once per unlisted
   # literal occurrence — the real incident's own tail was 30 copies of the
   # same handful of lines, crowding out the SINGLE real

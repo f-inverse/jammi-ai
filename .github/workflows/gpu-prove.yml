@@ -20,6 +20,11 @@ on:
     # Nightly at 03:47 UTC — off-peak, offset from the other crons.
     - cron: "47 3 * * *"
 
+# Least privilege: this lane only reads the checkout; the RunPod side is
+# driven by the RUNPOD_API_KEY secret, not the GitHub token.
+permissions:
+  contents: read
+
 jobs:
   gpu-prove:
     name: GPU prove on RunPod A100 (sm_80)
@@ -58,9 +63,12 @@ jobs:
       # the output, and terminates the pod on exit — best-effort, via an EXIT
       # trap a SIGKILLed runner never reaches. The real guarantee is the deadline
       # armed inside the pod's own entrypoint, plus the gpu-reap sweep. A `75`
-      # exit means no
-      # A100 capacity (SUPPLY_CONSTRAINT) — surfaced as a neutral skip, not a
-      # red, since it is a provider-capacity condition, not a code failure.
+      # exit means no A100 capacity (SUPPLY_CONSTRAINT); the step re-exits with
+      # that code, so a capacity night FAILS the workflow red — fail-closed, a
+      # night with no capacity is a night with no proof, never a silent green.
+      # The `::warning::` step below annotates that red as a provider-capacity
+      # condition (not a code regression); operator recovery is a re-run once
+      # capacity returns.
       - name: Prove GPU suites on a real A100
         id: prove
         env:
@@ -74,6 +82,6 @@ jobs:
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
           exit $rc
 
-      - name: Note capacity skip
+      - name: Annotate a capacity failure
         if: always() && steps.prove.outputs.rc == '75'
-        run: echo "::warning::GPU prove skipped — no A100 capacity on RunPod (SUPPLY_CONSTRAINT). Re-run when capacity returns."
+        run: echo "::warning::GPU prove FAILED for capacity — no A100 on RunPod (SUPPLY_CONSTRAINT), not a code regression. The run stays red (nothing was proven); re-run once capacity returns."

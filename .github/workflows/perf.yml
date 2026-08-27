@@ -34,6 +34,10 @@ concurrency:
   group: perf-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege: this lane only reads the checkout; nothing publishes.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -60,22 +64,12 @@ jobs:
 
       # Each `*-scale` tier emits its JSON report to stdout and maps its gate
       # verdict to the process exit code: a throughput below the committed floor
-      # (or a determinism-digest drift) exits non-zero. Running each as its own
-      # step means a red surfaces which tier regressed by name in the job log.
-      - name: train-scale (fine-tune throughput + OOM control)
-        run: ./target/release/jammi-bench train-scale
-
-      - name: graph-train-scale (graph sampler throughput + digest)
-        run: ./target/release/jammi-bench graph-train-scale
-
-      - name: context-predictor-scale (predictor train throughput + predict digest)
-        run: ./target/release/jammi-bench context-predictor-scale
-
-      - name: model-inference-scale (serving throughput + output digests)
-        run: ./target/release/jammi-bench model-inference-scale
-
-      - name: arxiv (held-out ANN-vs-exact recall over the committed corpus)
-        run: ./target/release/jammi-bench arxiv
+      # (or a determinism-digest drift) exits non-zero. The tier list is stated
+      # once, in the shared script (also the release-blocking gate's list —
+      # crates.yml's perf-gate job); a red names the regressed tier via its
+      # ::group:: header in the log.
+      - name: Run the CPU-hermetic scale tiers (measured-rate gate)
+        run: bash ci/scripts/perf/run_scale_tiers.sh
 
       - name: Prove the gate bites (teeth-proof — must exit non-zero)
         # The lane above is only meaningful if a regression actually reds it.
@@ -97,14 +91,7 @@ jobs:
           # actions/checkout sets isn't visible here. The ephemeral checkout is
           # discarded with the runner anyway; this keeps the perturbation local.
           cp "$baseline" "$baseline.orig"
-          python3 - "$baseline" <<'PY'
-          import json, sys
-          p = sys.argv[1]
-          d = json.load(open(p))
-          d["baseline_pairs_per_s"] *= 100
-          json.dump(d, open(p, "w"), indent=2)
-          print(f"inflated baseline_pairs_per_s to {d['baseline_pairs_per_s']} (floor now unreachable)")
-          PY
+          python3 ci/scripts/perf/inflate_baseline.py "$baseline"
           if ./target/release/jammi-bench graph-train-scale; then
             mv -f "$baseline.orig" "$baseline"
             echo "::error::teeth-proof FAILED — graph-train-scale exited 0 against a 100x-inflated baseline; the workflow rate gate is decorative"

@@ -2182,7 +2182,7 @@ mod tests {
         let triplets_identity = triplets_per_s * p50;
         let expected = params.batch as f64;
         assert!(
-            (triplets_identity - expected).abs() < 1e-6 * expected.max(1.0),
+            (triplets_identity - expected).abs() < 1e-6 * expected.max(1.0), // no-producer: degenerate-zero guard on an algebraic identity, not a tolerance.
             "triplets_per_s ({triplets_per_s}) * p50 ({p50}) = {triplets_identity}, expected \
              ~batch ({expected}) -- looks like `batch / p50` was replaced with a non-division \
              op"

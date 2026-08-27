@@ -28,6 +28,6 @@ dominate any real signal), and an 8-fixed-seed sweep (`FLASH_ORACLE_SWEEP_SEEDS`
 by the healthy oracle and every RED control, replacing the single-seed `K = 1.5` bound with
 seed-derived `FLASH_ORACLE_K_MEAN_POOLED` / `FLASH_ORACLE_K_MAX_POOLED` /
 `FLASH_ORACLE_K_MEAN_GRAD` / `FLASH_ORACLE_K_MAX_GRAD` constants — is
-`2026-08-25-flash-arm-encoder-oracle-2aa1551-a100-sxm4.json`, produced by the SAME test
-(`modernbert::tests::flash_arm_encoder_level_three_way_oracle_dense_cuda_bf16`) after this round's
-fix, and is what `crates/jammi-encoders/src/modernbert.rs` currently implements on this branch.
+`2026-08-25-flash-arm-encoder-oracle-2aa1551-a100-sxm4.json` in this directory, produced by the
+SAME test (`modernbert::tests::flash_arm_encoder_level_three_way_oracle_dense_cuda_bf16`), and is
+what `crates/jammi-encoders/src/modernbert.rs` implements today.

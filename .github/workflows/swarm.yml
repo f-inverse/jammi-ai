@@ -17,6 +17,10 @@ concurrency:
   group: swarm-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege: every gate here only reads the checkout; nothing publishes.
+permissions:
+  contents: read
+
 jobs:
   swarm-gates:
     name: Guard (swarm constitution + boundary)

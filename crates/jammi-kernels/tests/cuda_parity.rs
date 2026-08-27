@@ -2763,7 +2763,7 @@ fn assert_geglu_parity_bf16(cuda: &Device, rows: usize, intermediate: usize, wv:
     let out_gpu_v = to_f32(&out_gpu.to_device(&cpu).unwrap());
     assert_eq!(out_cpu_v.len(), n_out);
     assert_eq!(out_gpu_v.len(), n_out, "geglu bf16 GPU fwd length mismatch");
-    let out_floor = max_abs(wv) * 2f32.powi(-10);
+    let out_floor = max_abs(wv) * 2f32.powi(-10); // no-producer: 2^-10 is bf16's ulp fraction at normal magnitude, derived not measured.
     let out_bound = |r: f32| bf16_relative_bound(r, out_floor, 2.0);
     assert_relative_bound("geglu bf16 fwd", &out_cpu_v, &out_gpu_v, out_bound);
     let out_defect = geglu_identity_activation_defect(wv, rows, intermediate);
@@ -2791,7 +2791,7 @@ fn assert_geglu_parity_bf16(cuda: &Device, rows: usize, intermediate: usize, wv:
         "geglu bf16 GPU dwi_out length mismatch"
     );
     // Same input-amplitude-fraction floor rationale as `out_bound` above.
-    let dwi_floor = max_abs(wv) * 2f32.powi(-10);
+    let dwi_floor = max_abs(wv) * 2f32.powi(-10); // no-producer: same derived 2^-10 bf16 ulp fraction as `out_floor` above.
     let dwi_bound = |r: f32| bf16_relative_bound(r, dwi_floor, 2.0);
     assert_relative_bound("geglu bf16 dwi_out", &dwi_cpu_v, &dwi_gpu_v, dwi_bound);
     let dwi_defect = geglu_identity_activation_dwi_defect(wv, &dyv_f, rows, intermediate);
@@ -3263,7 +3263,7 @@ fn scaled_cast_add_parity_narrowed_with_nonzero_offset() {
     let expected: Vec<f32> = base_all[8..16]
         .iter()
         .zip(lora_all[8..16].iter())
-        .map(|(&b, &l)| b + 2.0 * l)
+        .map(|(&b, &l)| b + 2.0 * l) // no-producer: hand-computed expected value; 2.0 is the fixture's own scaling, not a tolerance.
         .collect();
     for (i, (g, e)) in out_gpu.iter().zip(expected.iter()).enumerate() {
         assert!(
@@ -3441,7 +3441,7 @@ fn assert_dropout_parity_f32(
             "dropout fwd[{i}]: KEEP/DROP decision disagrees, cpu {c} vs cuda {g}"
         );
     }
-    let out_floor = max_abs(xv) / (1.0 - p).max(f32::MIN_POSITIVE);
+    let out_floor = max_abs(xv) / (1.0 - p).max(f32::MIN_POSITIVE); // no-producer: `1.0 - p` is the keep-probability complement, an identity, not a tolerance.
     let out_bound = |r: f32| {
         f32_two_term_bound(
             r,
@@ -3504,7 +3504,7 @@ fn assert_dropout_parity_f32(
              cpu {c} vs cuda {g}"
         );
     }
-    let dx_floor = max_abs(xv).max(max_abs(&dyv)) / (1.0 - p).max(f32::MIN_POSITIVE);
+    let dx_floor = max_abs(xv).max(max_abs(&dyv)) / (1.0 - p).max(f32::MIN_POSITIVE); // no-producer: same `1.0 - p` keep-probability identity as `out_floor` above.
     let dx_bound = |r: f32| {
         f32_two_term_bound(
             r,
@@ -4301,7 +4301,7 @@ fn lora_linear_parity_bf16_base_production_width() {
     // LoRA GEMMs themselves, and the base GEMM's own negligible `f32`
     // summation-order noise — measured ~0.008 by the same standalone probe
     // cited in this test's doc).
-    let abs_floor = 1e-1f64;
+    let abs_floor = 1e-1f64; // no-producer: chosen ~12x headroom over an uncommitted standalone-probe estimate — a design margin, not a committed measurement.
     for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
         let bound = bf16_round_bound(f64::from(base_only_cpu[i]))
             + bf16_round_bound(f64::from(delta_scaled_cpu[i]))
@@ -4568,7 +4568,8 @@ fn lora_linear_parity_bf16_base_backward_production_width() {
     // `d_x_lora` can now land much closer to canceling at a given index
     // than the uniform ones seed produced, and the observed divergence
     // there exceeded the `0.1` floor's total bound by a small margin.
-    let abs_floor = 3e-1f64;
+    let abs_floor = 3e-1f64; // no-producer: sized from two uncommitted pod runs — a chosen design margin, not a committed measurement.
+
     // A second, SCALED re-measurement: two real pod runs after the
     // sign-mixed cotangent found the per-term `bf16_round_bound`s
     // themselves (not just the flat floor above) too tight at production
@@ -6018,7 +6019,7 @@ fn attention_block_parity_bf16_cuda_vs_f32_cpu_reference() {
     assert_eq!(out_cpu.len(), out_emulated.len());
     for (i, (c, e)) in out_cpu.iter().zip(out_emulated.iter()).enumerate() {
         assert!(
-            (c - e).abs() <= 0.1 * c.abs().max(e.abs()).max(0.05),
+            (c - e).abs() <= 0.1 * c.abs().max(e.abs()).max(0.05), // no-producer: the loose, non-derived sanity margin the comment above states.
             "emulated reference diverged from the f32 forward at [{i}]: {c} vs {e}"
         );
     }
@@ -7211,7 +7212,7 @@ fn three_way_vs_f32_reference(
     // transpose, K left unrotated) that would blow past ordinary bf16
     // noise even at a single step — generous on purpose.
     const GROSS_REGRESSION_MULTIPLE: f64 = 8.0;
-    const GROSS_REGRESSION_FLOOR: f64 = 0.05;
+    const GROSS_REGRESSION_FLOOR: f64 = 0.05; // no-producer: generous-on-purpose design margin (see the comment above), not a measurement.
     for (name, fused_rel, eager_rel) in [
         ("out", out_fused_rel, out_eager_rel),
         ("dqkv", dqkv_fused_rel, dqkv_eager_rel),
@@ -7670,7 +7671,8 @@ fn flash_upstream_acceptance_form_vs_f32_reference_dense_cuda() {
 /// changed nothing that (now-superseded) reference could see — `Some(0)`
 /// was the discriminating perturbation that round found (guide §3.8: no
 /// absolute floor here, so this is not absorbed the way it would be under
-/// a `+ 0.05` floor). The numbers cited in that finding were measured
+/// a `+ 0.05` floor — no-producer: a hypothetical contrast value, not a
+/// bound this test asserts). The numbers cited in that finding were measured
 /// against `attention_block_bwd_eager_reference` (superseded above by
 /// `attention_block_bwd_production_eager_reference`); this test now
 /// re-measures against the production-faithful reference — see the
@@ -7978,7 +7980,7 @@ fn measure_flash_upstream_form_bwd_window_dropped(
 /// two op-level controls' own fixture) -- measured this round on a100b: at
 /// `SmoothAmplitude(12.0)` (production-checkpoint-magnitude `qkv`), NEITHER
 /// `bwd_window = None` NOR the more extreme `Some(0)` (self-only backward
-/// attention) discriminates at this bound (dqkv ratio-to-bound 0.02-0.16
+/// attention) discriminates at this bound (no-producer: a rejected, uncommitted trial sweep — dqkv ratio-to-bound 0.02-0.16
 /// across a 5-seed sweep at both `b1_s128` and `b8_s512` -- widening or
 /// zeroing the backward-only window changes the SCALE of the already-large
 /// eager/bf16 noise floor at this amplitude, not its SIGN, so a bounded

@@ -316,16 +316,24 @@ ssh -F ~/.config/runpod/ssh_config jammi-a100 \
 a lock-held tmux pane — see §6). Common failure classes and their meaning
 are in §8.
 
-**Time budget.** Full seed build wall-clock (T1+T1b+T2+T3+clean+checks) is
-what `ci/scripts/perf/pod_build_timings.sh`'s leg (i) measures. **No
-committed producer JSON exists in this tree as of this writing** — the
-script's own module doc states it runs on a live pod only, never in CI, and
-its output is written to `JAMMI_BUILD_TIMINGS_OUT` for the lead to commit
-under `ci/artifacts/pod-build-timings/` afterward
-(`ci/scripts/perf/pod_build_timings.sh:1-9`). Until that file exists, no
-wall-clock number for the seed is stated here; budget generously (tens of
-minutes for a fresh Ampere pod pulling and compiling the full cuda feature
-graph) and watch the log.
+**Time budget.** The committed producer JSON is
+`ci/artifacts/pod-build-timings/20260827T183928Z-bc27e75.json`
+(`ci/scripts/perf/pod_build_timings.sh` run on a live A100-SXM4 pod at
+`bc27e75`; the script never runs in CI — its module doc,
+`ci/scripts/perf/pod_build_timings.sh:1-9`). It pins the per-job walls:
+seed→clone copy 2 s, member-only clone build 69 s, cold build from an
+empty target dir 243 s, FA2 leg 122 s, plus the `S_src`/`S_seed`/`S_clone`
+byte counts the `RP_DISK_GB` formula cites (see dev-gpu.md). The **full
+seed wall itself** (T1+T1b+T2+T3+clean+checks, from nothing) is not a
+field in that artifact's schema — the run's seed pre-existed, so leg (i)
+was a marker/member-free verification, not a timed build; budget tens of
+minutes for a fresh Ampere pod compiling the full cuda+FA2 graph (both
+live seeds of 2026-08-27 landed in that band) and watch the log until a
+producer run with a cold seed commits that number. The artifact also
+records `byte_equal_clone_vs_cold: false` for the member rlib/rmeta set
+across the two (deliberately different) target-dir paths, with the full
+per-file diff — an open question (path-embedding vs real
+nondeterminism), stated rather than dropped.
 
 ---
 

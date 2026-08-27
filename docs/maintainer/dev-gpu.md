@@ -93,11 +93,17 @@ this doc's other citations draw from — a follow-up, not a claim this line
 retracts) — datacenter bandwidth makes it free.
 
 Disk sizing (`RP_DISK_GB`): `>= 25` (base) `+ S_src + S_seed + N*S_clone`
-(one clone per tree the pod hosts). The exact `S_src`/`S_seed`/`S_clone` byte
-counts are **pending** — `ci/scripts/perf/pod_build_timings.sh` is this
-formula's producer; its measured JSON, once committed under
-`ci/artifacts/pod-build-timings/`, is what future numbers here will cite.
-Until then, size generously and watch `du`.
+(one clone per tree the pod hosts). Measured by this formula's producer,
+`ci/scripts/perf/pod_build_timings.sh` (committed JSON:
+`ci/artifacts/pod-build-timings/20260827T183928Z-bc27e75.json`, an
+A100-SXM4 secure-cloud pod at `bc27e75`): `S_src` ≈ 3.6 GB (the checkout,
+`.git` included), `S_seed` ≈ 7.8 GB, `S_clone` ≈ 8.2 GB — so the default
+`RP_DISK_GB=60` fits base + src + seed + ~3 clones with little slack; a
+pod hosting more trees should size up per the formula. The same artifact
+carries the substrate's core walls on that box: seed→clone copy 2 s
+(reflink), member-only build in a fresh clone 69 s vs 243 s from a
+genuinely empty target dir, and the FA2 (`cuda,jammi-kernels/flash-attn`)
+leg at 122 s over the clone.
 
 `gpu-dev.sh` generates its own SSH key — nothing to register. Every SSH
 invocation pins the connection to that key alone (`IdentitiesOnly=yes`): a

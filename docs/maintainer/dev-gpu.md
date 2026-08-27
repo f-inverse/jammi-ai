@@ -96,14 +96,21 @@ Disk sizing (`RP_DISK_GB`): `>= 25` (base) `+ S_src + S_seed + N*S_clone`
 (one clone per tree the pod hosts). Measured by this formula's producer,
 `ci/scripts/perf/pod_build_timings.sh` (committed JSON:
 `ci/artifacts/pod-build-timings/20260827T183928Z-bc27e75.json`, an
-A100-SXM4 secure-cloud pod at `bc27e75`): `S_src` ≈ 3.6 GB (the checkout,
-`.git` included), `S_seed` ≈ 7.8 GB, `S_clone` ≈ 8.2 GB — so the default
-`RP_DISK_GB=60` fits base + src + seed + ~3 clones with little slack; a
-pod hosting more trees should size up per the formula. The same artifact
-carries the substrate's core walls on that box: seed→clone copy 2 s
-(reflink), member-only build in a fresh clone 69 s vs 243 s from a
-genuinely empty target dir, and the FA2 (`cuda,jammi-kernels/flash-attn`)
-leg at 122 s over the clone.
+A100-SXM4 secure-cloud pod at `bc27e75`; all values decimal GB from the
+artifact's exact byte fields): `S_src` ≈ 3.6 GB (the checkout, `.git`
+included), `S_seed` ≈ 7.8 GB, `S_clone` ≈ 8.1 GB. By the formula, the
+default `RP_DISK_GB=60` covers base + src + seed + **two** clones
+(≈ 52.7 GB); a third tree computes to ≈ 60.9 GB — over the default — so a
+pod hosting 3+ trees sizes up (`RP_DISK_GB=70`+). `N*S_clone` is the
+conservative bound on purpose: the copy runs `cp --reflink=auto`, and the
+artifact records only that reflink was *attempted* (`"reflink":
+"attempted (auto; may have fallen back …)"` — the producer greps the flag,
+it does not verify the filesystem reflinked), so real usage may be lower
+when reflink takes, but sizing must assume it did not. The same artifact
+carries the substrate's core walls on that box: seed→clone copy 2 s,
+member-only build in a fresh clone 69 s vs 243 s from a genuinely empty
+target dir, and the FA2 (`cuda,jammi-kernels/flash-attn`) leg at 122 s
+over the clone.
 
 `gpu-dev.sh` generates its own SSH key — nothing to register. Every SSH
 invocation pins the connection to that key alone (`IdentitiesOnly=yes`): a

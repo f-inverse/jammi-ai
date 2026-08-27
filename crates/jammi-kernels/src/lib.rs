@@ -10,7 +10,9 @@
 //! `third_party/flash-attention/` is Dao-AILab's FlashAttention-2 source,
 //! vendored verbatim under its own BSD-3-Clause license (its `LICENSE` and
 //! `AUTHORS` ship in the published tarball; see that directory's
-//! `VENDORED.md` for provenance and the exact pinned upstream version). [`ops::Axpy`] is the proof op
+//! `VENDORED.md` for provenance and the exact pinned upstream version).
+//!
+//! [`ops::Axpy`] is the proof op
 //! establishing the pattern every later fused op copies (real CPU fwd/bwd, a
 //! feature-gated CUDA fwd loaded from build-time PTX, statelessness enforced
 //! structurally — every op is required to be `Copy`, see `ops`'s module

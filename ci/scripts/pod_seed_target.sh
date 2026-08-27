@@ -797,11 +797,17 @@ pod_seed_target_main() {
         # /root/jammi-ai) carries the GITLINK but not the checkout, so a
         # fresh pod's auto-seed on main would always die in T1b — provision
         # it here, before spending compile time (network, like the metadata
-        # priming above; a tree that already has include/ skips this). A
-        # non-git tree missing include/ still fails loudly in build.rs
+        # priming above; a tree whose checkout is complete skips this). A
+        # non-git tree missing the header still fails loudly in build.rs
         # exactly as before — never a silent T1b skip.
         cutlass_inc="crates/jammi-kernels/third_party/cutlass/include"
-        if [ ! -d "$cutlass_inc" ] && git rev-parse --git-dir >/dev/null 2>&1; then # tripwire-ok: the probe's EXIT CODE is the branch condition ("is this tree a git repo at all"); a non-git tree is a legitimate state whose only correct handling is the else-path (build.rs fails loudly on a genuinely missing include/), and git's "not a git repository" stderr would be pure noise on that ordinary path
+        # The guard's predicate is BUILD.RS'S predicate — the same file
+        # (include/cutlass/cutlass.h, crates/jammi-kernels/build.rs:311),
+        # never a coarser dir-exists check: an include/ dir whose
+        # cutlass/cutlass.h is gone (interrupted checkout, partial copy)
+        # must count as unprovisioned, or the seed skips provisioning and
+        # T1b dies with the exact panic this arm exists to eliminate.
+        if [ ! -f "$cutlass_inc/cutlass/cutlass.h" ] && git rev-parse --git-dir >/dev/null 2>&1; then # tripwire-ok: the probe's EXIT CODE is the branch condition ("is this tree a git repo at all"); a non-git tree is a legitimate state whose only correct handling is the else-path (build.rs fails loudly on a genuinely missing include/), and git's "not a git repository" stderr would be pure noise on that ordinary path
           echo "=== T1b prerequisite: provisioning the CUTLASS submodule (git submodule update --init --force --checkout --depth 1) ==="
           # --force --checkout: this arm only runs when include/ is MISSING,
           # i.e. the checkout is already broken — a half-deleted worktree

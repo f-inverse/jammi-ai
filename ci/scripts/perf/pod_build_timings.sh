@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # A2 producer (pod-build-substrate acceptance, contract v6) — runs ON A LIVE
-# POD, never in CI. Not run by this PR; the lead runs it on a100d after this
-# commit lands and commits the JSON it writes (to JAMMI_BUILD_TIMINGS_OUT,
-# never stdout — see Usage below) under
-# ci/artifacts/pod-build-timings/. Until that JSON exists, no doc in this
-# repo may cite a number from it (see docs/maintainer/dev-gpu.md, which cites
-# ledger rows 1/17 only and marks the RP_DISK_GB formula's S values
-# "pending").
+# POD, never in CI. The lead runs it on a live pod and commits the JSON it
+# writes (to JAMMI_BUILD_TIMINGS_OUT, never stdout — see Usage below) under
+# ci/artifacts/pod-build-timings/; the first committed run is
+# 20260827T183928Z-bc27e75.json. No doc in this repo may cite a number this
+# producer measures except from a committed JSON (docs/maintainer/dev-gpu.md
+# and pod-build-guide.md §4 cite that file).
 #
 # Measures, in order (contract v6 acceptance A2):
 #   (i)   seed + marker + manifest cross-check (iii) — builds the seed via

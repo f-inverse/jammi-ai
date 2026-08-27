@@ -32,15 +32,15 @@ build = "build.rs"
 # own BSD-3 license needs the same treatment as the flash-attention
 # subtree's.
 include = [
-    "src/**",
-    "build.rs",
-    "README.md",
-    "third_party/flash-attention/src/**",
-    "third_party/flash-attention/jammi/**",
-    "third_party/flash-attention/shim/**",
-    "third_party/flash-attention/LICENSE",
-    "third_party/flash-attention/AUTHORS",
-    "third_party/flash-attention/VENDORED.md",
+    "/src/**",
+    "/build.rs",
+    "/README.md",
+    "/third_party/flash-attention/src/**",
+    "/third_party/flash-attention/jammi/**",
+    "/third_party/flash-attention/shim/**",
+    "/third_party/flash-attention/LICENSE",
+    "/third_party/flash-attention/AUTHORS",
+    "/third_party/flash-attention/VENDORED.md",
 ]
 
 [dependencies]

@@ -2793,7 +2793,13 @@ DRV
 # submodule initialized, then worktree contents removed while the metadata
 # still claims the pinned commit — plain `git submodule update --init
 # --depth 1` exits 0 leaving include/ absent (proving --force --checkout
-# is load-bearing), while the fixed hunk restores it.
+# is load-bearing), while the fixed hunk restores it. Audit round-2
+# extensions: the predicate-mismatch state (include/ present, cutlass.h
+# absent — the file-level guard re-provisions, the old dir-exists guard
+# skips), the guard lattice's two remaining arms (idempotence on a
+# provisioned tree; non-git skip), and the tarball golden from the row's
+# notes (cargo package --list: no cutlass, no artifacts/, license trio
+# present).
 {
   SEED_TARGET_SH="$REPO_ROOT/ci/scripts/pod_seed_target.sh"
   W_ROOT="$SANDBOX/w_esc050"
@@ -2899,6 +2905,15 @@ DRV
     fi
 
     # ---- revert-RED: the hunk with the update command neutered ------------
+    # ANCHOR COUPLING (fix-verifier advisory): a FULL `git apply -R` of the
+    # fix commit removes the whole hunk INCLUDING the `cutlass_inc=`
+    # extraction anchor, so this leg's fixture collapses to INVALID (the
+    # (w/esc-050 fixture) assertion catches the failed extraction and
+    # aborts) rather than red-ing the green leg. A maintainer doing a
+    # literal revert should use the surgical single-line neuter below (what
+    # this internal revert-RED does) to see the DISCRIMINATING failure —
+    # either way the suite goes red, but only the surgical form shows the
+    # include/-left-absent behavior itself.
     W_REVERT_DIR="$SANDBOX/w_revert"
     rm -rf "$W_REVERT_DIR"; mkdir -p "$W_REVERT_DIR"
     W_REVERTED="$W_REVERT_DIR/pod_seed_target_reverted.sh"
@@ -2953,6 +2968,127 @@ PY
       ok "(w/esc-050 half-deleted green) the fixed hunk (--force --checkout) restores include/ on the SAME half-deleted state the plain update just no-opped on"
     else
       bad "(w/esc-050 half-deleted green) expected the fixed hunk to restore include/ (rc=$w3_rc): $w3_out"
+    fi
+
+    # ---- predicate mismatch (audit BLOCK): the guard is BUILD.RS'S OWN
+    # predicate (include/cutlass/cutlass.h, a FILE), never the coarser
+    # dir-exists check — the state the two differ on: include/ EXISTS but
+    # cutlass/cutlass.h is gone (interrupted checkout, partial copy). The
+    # fixed hunk must RE-provision; the old `[ ! -d ]` guard skips. --------
+    W_CLONE4="$W_ROOT/clone_predicate"
+    w_fresh_clone "$W_CLONE4"
+    W_DRIVER4="$(w_build_driver "$SEED_TARGET_SH" "$W_CLONE4")" || W_DRIVER4=""
+    w4_setup_out="$(bash "$W_DRIVER4" 2>&1)"; w4_setup_rc=$?
+    rm -rf "$W_CLONE4/$W_INC_REL/cutlass"
+    if [ "$w4_setup_rc" -eq 0 ] && [ -d "$W_CLONE4/$W_INC_REL" ] \
+       && [ ! -f "$W_CLONE4/$W_INC_REL/cutlass/cutlass.h" ]; then
+      ok "(w/esc-050 predicate fixture) include/ EXISTS while include/cutlass/cutlass.h is absent — the state a dir-exists guard cannot distinguish from provisioned"
+    else
+      bad "(w/esc-050 predicate fixture) could not construct the include-present/header-absent state (setup_rc=$w4_setup_rc): $w4_setup_out"
+    fi
+    w4_out="$(bash "$W_DRIVER4" 2>&1)"; w4_rc=$?
+    if [ "$w4_rc" -eq 0 ] && [ -f "$W_CLONE4/$W_INC_REL/cutlass/cutlass.h" ] \
+       && printf '%s' "$w4_out" | grep -q 'T1b prerequisite: provisioning the CUTLASS submodule'; then
+      ok "(w/esc-050 predicate green) the file-level guard fires on the include-present/header-absent state and RE-provisions — cutlass.h restored"
+    else
+      bad "(w/esc-050 predicate green) expected the fixed hunk to re-provision cutlass.h (rc=$w4_rc): $w4_out"
+    fi
+    # revert-RED: the guard mutated BACK to the old dir-exists form in a
+    # scratch copy skips the SAME state — the file-level predicate is
+    # load-bearing, not cosmetic.
+    W_GUARD_REVERTED="$W_REVERT_DIR/pod_seed_target_dirguard.sh"
+    cp "$SEED_TARGET_SH" "$W_GUARD_REVERTED"
+    python3 - "$W_GUARD_REVERTED" <<'PY'
+import sys
+p = sys.argv[1]
+t = open(p).read()
+old = '[ ! -f "$cutlass_inc/cutlass/cutlass.h" ]'
+new = '[ ! -d "$cutlass_inc" ]'
+assert old in t, "guard-revert fixture: could not locate the file-level guard to coarsen"
+open(p, "w").write(t.replace(old, new, 1))
+PY
+    rm -rf "$W_CLONE4/$W_INC_REL/cutlass"
+    W_DRIVER4R="$(w_build_driver "$W_GUARD_REVERTED" "$W_CLONE4")" || W_DRIVER4R=""
+    if [ -n "$W_DRIVER4R" ] && bash -n "$W_DRIVER4R"; then
+      w4r_out="$(bash "$W_DRIVER4R" 2>&1)"; w4r_rc=$?
+      if [ "$w4r_rc" -eq 0 ] && [ ! -f "$W_CLONE4/$W_INC_REL/cutlass/cutlass.h" ] \
+         && ! printf '%s' "$w4r_out" | grep -q 'T1b prerequisite: provisioning the CUTLASS submodule'; then
+        ok "(w/esc-050 predicate revert-RED) the OLD dir-exists guard, restored in a scratch copy, SKIPS the same include-present/header-absent state (no provisioning banner, cutlass.h stays absent) — the file-level predicate is load-bearing"
+      else
+        bad "(w/esc-050 predicate revert-RED) expected the coarsened guard to skip (rc=$w4r_rc, header_absent=$([ ! -f "$W_CLONE4/$W_INC_REL/cutlass/cutlass.h" ] && echo yes || echo no)): $w4r_out"
+      fi
+    else
+      bad "(w/esc-050 predicate revert-RED) guard-reverted scratch fixture is broken (driver='${W_DRIVER4R:-EXTRACTION FAILED}')"
+    fi
+
+    # ---- lattice completion: the two remaining guard arms -----------------
+    # (a) idempotence: clone1 is fully provisioned by the green leg above —
+    # a second run must SKIP (no banner), rc=0, content and pinned sha
+    # intact.
+    w5_out="$(bash "$W_DRIVER1" 2>&1)"; w5_rc=$?
+    # tripwire-ok: same post-state query as the green leg's — an empty sha
+    # already fails the assertion loudly below.
+    w5_sub_head="$(w_git -C "$W_CLONE1/$W_SUB_REL" rev-parse HEAD 2>/dev/null)"
+    if [ "$w5_rc" -eq 0 ] && [ -f "$W_CLONE1/$W_INC_REL/cutlass/cutlass.h" ] \
+       && [ "$w5_sub_head" = "$W_PIN_SHA" ] \
+       && ! printf '%s' "$w5_out" | grep -q 'T1b prerequisite: provisioning the CUTLASS submodule'; then
+      ok "(w/esc-050 idempotence) a second run on the fully-provisioned clone SKIPS (no provisioning banner), rc=0, cutlass.h present, submodule still at the pinned sha"
+    else
+      bad "(w/esc-050 idempotence) expected a clean skip on an already-provisioned clone (rc=$w5_rc, sub_head=${w5_sub_head:-none}): $w5_out"
+    fi
+    # (b) non-git skip: a plain directory (no .git anywhere up-tree —
+    # $SANDBOX lives under mktemp) with the cutlass path but no include/ —
+    # the hunk must SKIP with rc=0 and leave include/ absent (the loud
+    # failure on this arm is build.rs's own panic, out of a no-cargo
+    # suite's scope; only the skip is asserted).
+    W_PLAIN="$W_ROOT/plain_nongit"
+    rm -rf "$W_PLAIN"; mkdir -p "$W_PLAIN/$W_SUB_REL"
+    W_DRIVER6="$(w_build_driver "$SEED_TARGET_SH" "$W_PLAIN")" || W_DRIVER6=""
+    if [ -n "$W_DRIVER6" ] && bash -n "$W_DRIVER6"; then
+      w6_out="$(bash "$W_DRIVER6" 2>&1)"; w6_rc=$?
+      if [ "$w6_rc" -eq 0 ] && [ ! -d "$W_PLAIN/$W_INC_REL" ] \
+         && ! printf '%s' "$w6_out" | grep -q 'T1b prerequisite: provisioning the CUTLASS submodule'; then
+        ok "(w/esc-050 non-git skip) a plain non-git tree with include/ absent is SKIPPED (rc=0, no banner, include/ still absent) — build.rs, not the hunk, owns the loud failure on that arm"
+      else
+        bad "(w/esc-050 non-git skip) expected the hunk to skip a non-git tree (rc=$w6_rc, include_absent=$([ ! -d "$W_PLAIN/$W_INC_REL" ] && echo yes || echo no)): $w6_out"
+      fi
+    else
+      bad "(w/esc-050 non-git skip) non-git driver fixture is broken (driver='${W_DRIVER6:-EXTRACTION FAILED}')"
+    fi
+  fi
+
+  # ---- tarball golden (esc-050 notes, THIRD SURFACE of the same class):
+  # the crates.io jammi-kernels tarball must ship WITHOUT CUTLASS (a
+  # publish checkout has no submodules — a registry consumer enabling
+  # flash-attn hits build.rs's refusal, resolved as documentation +
+  # Cargo.toml include list) and WITHOUT the committed cuda-runs evidence
+  # artifacts, while the vendored flash-attention subtree's
+  # license/provenance trio IS present. `cargo package --list` resolves
+  # from the warm local registry (no build, no network on a fetched
+  # workspace); a genuinely network-needing failure skips LOUDLY with the
+  # named reason, never silently. Not gated on W_FIXTURE_VALID — this
+  # surface is independent of the sandbox git fixture.
+  W_PKG_LIST="$SANDBOX/w_pkg_list.txt"
+  W_PKG_ERR="$SANDBOX/w_pkg_err.txt"
+  ( cd "$REPO_ROOT" && cargo package --list -p jammi-kernels --allow-dirty ) > "$W_PKG_LIST" 2>"$W_PKG_ERR"
+  w_pkg_rc=$?
+  if [ "$w_pkg_rc" -ne 0 ] && grep -qiE 'network|download|dns|could not connect|failed to fetch|updating.*index|update.*registry' "$W_PKG_ERR"; then
+    skip "(w/esc-050 tarball-golden) cargo package --list needs network in this environment (rc=$w_pkg_rc: $(head -1 "$W_PKG_ERR")) — the golden runs wherever the registry index is warm; skipping LOUDLY, never silently"
+  elif [ "$w_pkg_rc" -ne 0 ]; then
+    bad "(w/esc-050 tarball-golden) cargo package --list failed for a NON-network reason (rc=$w_pkg_rc): $(cat "$W_PKG_ERR")"
+  elif [ ! -s "$W_PKG_LIST" ]; then
+    bad "(w/esc-050 tarball-golden) cargo package --list produced EMPTY output — an empty tarball listing is a FAIL, never a vacuous pass"
+  else
+    w_pkg_paths="$(wc -l < "$W_PKG_LIST" | tr -d ' ')"
+    w_cutlass_count="$(grep -c '^third_party/cutlass/' "$W_PKG_LIST")"
+    w_artifacts_count="$(grep -c '^artifacts/' "$W_PKG_LIST")"
+    if [ "$w_cutlass_count" -eq 0 ] && [ "$w_artifacts_count" -eq 0 ] \
+       && grep -qx 'third_party/flash-attention/LICENSE' "$W_PKG_LIST" \
+       && grep -qx 'third_party/flash-attention/AUTHORS' "$W_PKG_LIST" \
+       && grep -qx 'third_party/flash-attention/VENDORED.md' "$W_PKG_LIST"; then
+      ok "(w/esc-050 tarball-golden) cargo package --list (${w_pkg_paths} paths): zero third_party/cutlass/ paths, zero artifacts/ paths, and the flash-attention LICENSE/AUTHORS/VENDORED.md trio present"
+    else
+      bad "(w/esc-050 tarball-golden) tarball contents drifted (paths=${w_pkg_paths}, cutlass=${w_cutlass_count}, artifacts=${w_artifacts_count}, trio=$(grep -cxE 'third_party/flash-attention/(LICENSE|AUTHORS|VENDORED\.md)' "$W_PKG_LIST")/3)"
     fi
   fi
 }

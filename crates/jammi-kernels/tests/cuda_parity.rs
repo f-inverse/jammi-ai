@@ -7296,6 +7296,7 @@ fn attention_block_bf16_three_way_vs_f32_reference_b1_and_b8_cuda() {
 /// `window` (the healthy oracle); the RED control below passes a
 /// DIFFERENT value on the flash leg only (an off-by-one radius), while the
 /// reference/eager side keeps the real `window`.
+#[cfg(feature = "flash-attn")]
 #[derive(Debug)]
 struct FlashUpstreamMeasurement {
     out_fused_max: f64,
@@ -7304,6 +7305,7 @@ struct FlashUpstreamMeasurement {
     dqkv_eager_max: f64,
 }
 
+#[cfg(feature = "flash-attn")]
 impl FlashUpstreamMeasurement {
     /// `max|out_fused - ref| <= 2 * max|out_eager_bf16 - ref|` — upstream's
     /// own `out` multiple.
@@ -7323,6 +7325,10 @@ impl FlashUpstreamMeasurement {
 
 /// Affirmative-finite-first (guide §3.7) `max|a_i - b_i|`, over `f64` —
 /// NEVER a silent `NaN`-dropping fold (family J: `f64::max` is NaN-blind).
+/// `#[cfg(feature = "flash-attn")]`: every caller is the FA2 upstream
+/// oracle below — a cuda-only build (the seed's own T3 clippy leg) would
+/// otherwise see it as dead code under `-D warnings`.
+#[cfg(feature = "flash-attn")]
 fn max_abs_diff_finite_first(label: &str, a: &[f32], b: &[f32]) -> f64 {
     assert_eq!(a.len(), b.len(), "{label}: length mismatch");
     let non_finite = a.iter().chain(b.iter()).filter(|v| !v.is_finite()).count();
@@ -7447,6 +7453,8 @@ fn flash_bwd_fused(
 /// upstream acceptance form sweeps (lead course-correction): a smooth
 /// deterministic fixture alone cannot rule out a defect only a genuinely
 /// random operand distribution exercises.
+/// `#[cfg(feature = "flash-attn")]` for the same reason as its consumers.
+#[cfg(feature = "flash-attn")]
 #[derive(Clone, Copy, Debug)]
 enum FlashFixtureKind {
     /// `qkv_fixture`'s smooth deterministic sinusoid scaled to

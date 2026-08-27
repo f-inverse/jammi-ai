@@ -791,6 +791,27 @@ pod_seed_target_main() {
       feat_rc=0
       pod_seed_pkg_has_feature jammi-kernels flash-attn || feat_rc=$?
       if [ "$feat_rc" -eq 0 ]; then
+        # T1b compiles the vendored FA2 CUTLASS kernels, and jammi-kernels'
+        # build.rs hard-fails when the cutlass submodule is not checked out.
+        # A `git clone`-shaped tree (gpu-dev.sh's own bootstrap of
+        # /root/jammi-ai) carries the GITLINK but not the checkout, so a
+        # fresh pod's auto-seed on main would always die in T1b — provision
+        # it here, before spending compile time (network, like the metadata
+        # priming above; a tree that already has include/ skips this). A
+        # non-git tree missing include/ still fails loudly in build.rs
+        # exactly as before — never a silent T1b skip.
+        cutlass_inc="crates/jammi-kernels/third_party/cutlass/include"
+        if [ ! -d "$cutlass_inc" ] && git rev-parse --git-dir >/dev/null 2>&1; then # tripwire-ok: the probe's EXIT CODE is the branch condition ("is this tree a git repo at all"); a non-git tree is a legitimate state whose only correct handling is the else-path (build.rs fails loudly on a genuinely missing include/), and git's "not a git repository" stderr would be pure noise on that ordinary path
+          echo "=== T1b prerequisite: provisioning the CUTLASS submodule (git submodule update --init --force --checkout --depth 1) ==="
+          # --force --checkout: this arm only runs when include/ is MISSING,
+          # i.e. the checkout is already broken — a half-deleted worktree
+          # whose git metadata still claims the pinned commit would make a
+          # plain `update` a silent no-op (observed live on a100.2).
+          git submodule update --init --force --checkout --depth 1 crates/jammi-kernels/third_party/cutlass || {
+            echo "::error::CUTLASS submodule provisioning failed — T1b (flash-attn) cannot build; see git's own stderr above" >&2
+            exit 1
+          }
+        fi
         echo "=== T1b (main only): release -p jammi-bench --features cuda,jammi-kernels/flash-attn ==="
         cargo build --release -p jammi-bench --features cuda,jammi-kernels/flash-attn || exit 1
         t1b_ran="true"

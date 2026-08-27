@@ -33,11 +33,11 @@ Each item is a **general principle** to apply to a design you have never seen. T
 
 ## Reporting the unit, not just the plan
 
-Report `unit_branch` (`git -C <worktree> rev-parse --abbrev-ref HEAD` if resolvable, else the `unit:` line the lead's brief carried — say which) and `head_sha` (`git rev-parse HEAD` at the same location). Report `class_enumeration` when a REFINE/KILL finding has siblings worth naming (other plan sections carrying the same wrong-abstraction/band-aid shape); `sweep_method: "none"` when you did not sweep.
+Report `unit_branch` (`git -C <worktree> rev-parse --abbrev-ref HEAD` if resolvable, else the `unit:` line the lead's brief carried — say which) and `head_sha` (`git rev-parse HEAD` at the same location). `pressure-tester` is never gated by `hooks/lead-gate-pre.sh` (a design attack precedes any diff, so there is nothing yet to relay), but the state carrier reads its verdict row like every other verifier's — report `class_enumeration` when a REFINE/KILL finding has siblings worth naming (other plan sections carrying the same wrong-abstraction/band-aid shape); `sweep_method: "none"` when you did not sweep.
 
 ## Verdict schema
 
-Emit exactly one fenced ```json block as the LAST fenced block of your final message, with `"kind": "verdict"` as its first field (a `<verdict>...</verdict>`-tag-wrapped block is also an accepted, older form). `PROCEED` = the design survives; `REFINE` = it can proceed only with named changes; `KILL` = the design is wrong at its root. Any unrefuted `block`-severity finding forces at least `REFINE`; a root-level design error forces `KILL`. Default to `REFINE`/`KILL` under uncertainty.
+Emit exactly one fenced ```json block as the LAST fenced block of your final message, with `"kind": "verdict"` as its first field (a `<verdict>...</verdict>`-tag-wrapped block is also an accepted, older form) — exactly the shape the SubagentStop hook parses: the LAST fenced ```json block, `"kind": "verdict"` required, the tag form accepted only when no fenced block exists. `PROCEED` = the design survives; `REFINE` = it can proceed only with named changes; `KILL` = the design is wrong at its root. Any unrefuted `block`-severity finding forces at least `REFINE`; a root-level design error forces `KILL`. Default to `REFINE`/`KILL` under uncertainty.
 
 ```json
 {
@@ -46,7 +46,7 @@ Emit exactly one fenced ```json block as the LAST fenced block of your final mes
   "target": "the plan / contract under test",
   "unit_branch": "<the branch you read, from git or the lead's unit: line — say which>",
   "head_sha": "<sha you read>",
-  "worktree": "<the absolute path you read the diff from — recorded for provenance; the lead may cite it in its own written class-probe, see `.claude/agents/lead.md` 'The class, not the instance'>",
+  "worktree": "<the absolute path you read the diff from — the SubagentStop hook records this as a second-round-rule anchor (worktree/head_sha/unit_branch, matched as whole tokens, never raw substrings), the lead-proactivity gate v3>",
   "verdict": "PROCEED | REFINE | KILL",
   "uncertain": false,
   "premises_reproduced": [

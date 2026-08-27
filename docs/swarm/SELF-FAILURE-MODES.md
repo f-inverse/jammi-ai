@@ -86,7 +86,9 @@ cannot (`AGENTIC-PLAYBOOK.md` §1). Everything below is a specific way that spin
 - **Prevention.** Give every agent/worktree a **unique** `CARGO_TARGET_DIR=/mnt/…/ct-<uid>`;
   **never** override `RUSTC_WRAPPER`/`RUSTFLAGS`; if an agent goes rogue, `TaskStop` it and
   kill its stray `cargo`/`rustc`. This is the highest-leverage build-env hook
-  (`hooks/build-env-guard.sh`, advisory).
+  (`hooks/build-env-guard.sh`, advisory — stays advisory by design; a build-env hazard is a
+  recoverable nudge, unlike F10 below, whose hook (`hooks/lead-gate-pre.sh`) is fail-closed
+  because a norm is dodgeable by rewording and a denied dispatch is not).
 - **Incident.** A stuck agent spawned `cargo test` into the coordinator's target dir → the
   build lock serialised them → the gate crawled; separately, an `RUSTC_WRAPPER`/`RUSTFLAGS`
   override once turned a gate into **~100 min** of redundant compiles.
@@ -166,25 +168,47 @@ cannot (`AGENTIC-PLAYBOOK.md` §1). Everything below is a specific way that spin
   verdict, the phase machine, the user's last message) and loses — prose the lead "should"
   remember is not infrastructure. This is the general failure the whole swarm exists to fix
   (`ARCHITECTURE.md §1`), caught here in its most expensive instance: the audit-round loop.
-- **Prevention.** Two parts, today. (1) Every verifier card now REQUIRES a `class_enumeration`
+- **Prevention.** Two layers. (1) Every verifier card REQUIRES a `class_enumeration`
   field in its verdict (the union of every sibling site its own sweep found for each
-  BLOCK-severity finding, or an explicit `sweep_method: "none"` when it did not sweep) — the
-  verifier no longer hands the lead one instance and calls it done; it enumerates the class it
-  found, by default. (2) The lead's own brief to an implementer states the class in one
-  sentence and cites every member it is briefing against (`lead.md` "The class, not the
-  instance"), so the omission is visible in the artifact the lead writes, not just in its own
-  head. **There is no mechanical gate yet** — nothing currently blocks a dispatch that skips
-  this; a hook-based gate that makes the round-by-round relay hard to satisfy by rewording a
-  prompt was designed and built across three audit rounds but is not yet merged (see #402,
-  held in draft on outstanding review findings). Until #402 lands, this is discipline, not
-  enforcement — named honestly, not overclaimed.
+  BLOCK-severity finding, or an explicit `sweep_method: "none"` when it did not sweep) —
+  the verifier enumerates the class it found, by default. (2) The mechanical gate:
+  `hooks/lead-gate-{start,stop,pre}.sh` — a `PreToolUse` hook, fail-closed by design. Two rounds of adversarial audit against the first two designs both found the SAME
+  shape of bug: a predicate over FREE TEXT (a `unit:`/`intent:` label in v1; site regexes,
+  worktree/sha token scans, write-verb walks, and tag scans in v2) whose input domain is
+  unbounded, so every fix moved the squeeze between jamming legitimate traffic and being
+  dodged by a rewording (round 1: 9 findings, round 2: 9 MORE findings, each a live sibling
+  of an r1 instance the patch had only closed one-for-one). v3 is a mechanism change, not a
+  third patch: it stopped reading free text entirely and narrowed to ONE choke point — a
+  second dispatch of the SAME verifier type, whole-token-bound (worktree/head_sha/
+  unit_branch, strings the VERIFIER itself emitted, matched as whole tokens, never raw
+  substrings) to an open BLOCK, is denied unless an
+  ACCEPTED RELAY ARTIFACT exists — a structured file the lead writes explicitly
+  (`.jammi/gate-state/<slug>.relay.<agent_type>.<block_ts>.json`, exact-string set inclusion
+  of the verifier's own `class_enumeration`), never scanned from message prose. Under a
+  usage-limit scope cut mid-round-3, `SendMessage` gating, implementer-dispatch binding, and
+  the Bash backstop were DROPPED ENTIRELY (not log-only) rather than patched a third time —
+  round 1 and 2 both proved free-text detection on those channels is undecidable without
+  jamming legitimate freeze/status/stand-down/hygiene/advisory-fold traffic or ordinary
+  compound Bash reads. Three documented, visible residuals remain (relaying by `SendMessage`,
+  an unlabeled same-type verifier re-dispatch, `disableAllHooks`), each with the SAME runtime
+  tell (the next verdict row with no accepted relay artifact between it and the prior BLOCK).
+  See `.claude/agents/lead.md` "The class, not the instance" and
+  `.claude/hooks/README.md`'s "mechanical vs. visible-only" paragraph for the exact statement.
 - **Incident.** One session: ~43 audit/BLOCK rows across three units (`check_kernel_oracles.py`
   7 rounds, `check_perf_claims.py` 5 rounds, the pod-build substrate 6 rounds) against 3 lead
   probe rows total. When the lead finally probed, it found unnamed class members within
-  minutes on every unit it checked (a sibling of a named finding in the same file; a
-  745-instance unit-wrapper class the audit itself later independently found; 3 of 4 unpinned
-  CUDA kernels when the audit named one) — the class was findable the whole time; it was never
-  looked for. A prior session showed the same ratio (11 BLOCK rows, 0 probes).
+  minutes on every unit it checked (`pod_seed_target.sh:711`/`:770` at
+  `ci/pod-build-substrate-r5@63bf905`, sibling of a named finding; a 745-instance `as %`/
+  unit-wrapper class the audit itself later independently found; 3 of 4 unpinned CUDA
+  kernels when the audit named one) — the class was findable the whole time; it was never
+  looked for. A prior session showed the same ratio (11 BLOCK rows, 0 probes). TWO further
+  rounds of this same failure shape hit the gate's OWN implementation: round-1 audit found 9
+  BLOCK-severity findings (a label-keyed predicate or an operator applied outside its
+  domain); round-2 audit, against the round-1 fix, found 9 MORE — every "closed" instance had
+  a live sibling (a jam where a dodge had been closed, or vice versa) — because a free-text
+  predicate's input domain is never actually bounded by patching the instances found so far.
+  The mechanism meant to close F10 needed F10's own lesson (the class, not the instance)
+  applied to ITSELF twice before it stopped trying to read free text at all.
 
 ---
 
@@ -192,9 +216,8 @@ cannot (`AGENTIC-PLAYBOOK.md` §1). Everything below is a specific way that spin
 
 At phase 0 the lead names which of F1–F10 the brief is exposed to and pins the gate that
 catches each (F1→phase 1, F2→phase 4, F3/F4→phase 7, F5→build-env hook, F6→citation-checker,
-F7→fix-verifier, F8→pressure-test, F9→audit + honesty gate, F10→no mechanical gate yet; see
-#402 — today, the verifier-card `class_enumeration` requirement and the lead's own audit-brief
-practice are discipline, not enforcement). A defect that slips every gate and is caught later
-is logged to the escape ledger (`.jammi/escapes.jsonl`) and clustered by the retrospective loop
-into a new gate — so each failure mode compounds into infrastructure instead of re-teaching
-itself every session.
+F7→fix-verifier, F8→pressure-test, F9→audit + honesty gate, F10→`hooks/lead-gate-pre.sh`, the
+fail-closed dispatch/relay gate). A defect that slips every gate and is caught later is logged
+to the escape ledger (`.jammi/escapes.jsonl`) and clustered by the retrospective loop into a
+new gate — so each failure mode compounds into infrastructure instead of re-teaching itself
+every session.

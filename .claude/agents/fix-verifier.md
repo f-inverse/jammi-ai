@@ -36,7 +36,7 @@ Report `unit_branch` (`git -C <worktree> rev-parse --abbrev-ref HEAD` if resolva
 
 ## Verdict schema
 
-Emit exactly one fenced ```json block as the LAST fenced block of your final message, with `"kind": "verdict"` as its first field (a `<verdict>...</verdict>`-tag-wrapped block is also an accepted, older form). `verdict` is `verified` only when the test went RED-then-GREEN, the control is non-vacuous, and a resolving `closes_escape` id is present. Otherwise `tautological` or `not-symptom-faithful` — both are BLOCK states.
+Emit exactly one fenced ```json block as the LAST fenced block of your final message, with `"kind": "verdict"` as its first field (a `<verdict>...</verdict>`-tag-wrapped block is also an accepted, older form) — exactly the shape the SubagentStop hook parses: the LAST fenced ```json block, `"kind": "verdict"` required, the tag form accepted only when no fenced block exists. `verdict` is `verified` only when the test went RED-then-GREEN, the control is non-vacuous, and a resolving `closes_escape` id is present. Otherwise `tautological` or `not-symptom-faithful` — both are BLOCK states.
 
 ```json
 {
@@ -45,7 +45,7 @@ Emit exactly one fenced ```json block as the LAST fenced block of your final mes
   "diff_range": "<base>...<head>",
   "unit_branch": "<the branch you read, from git or the lead's unit: line — say which>",
   "head_sha": "<sha you read>",
-  "worktree": "<the absolute path you read the diff from — recorded for provenance; the lead may cite it in its own written class-probe, see `.claude/agents/lead.md` 'The class, not the instance'>",
+  "worktree": "<the absolute path you read the diff from — the SubagentStop hook records this as a second-round-rule anchor (worktree/head_sha/unit_branch, matched as whole tokens, never raw substrings), the lead-proactivity gate v3>",
   "verdict": "verified | tautological | not-symptom-faithful",
   "red_green": { "reverted_prod": "test-command", "pre_fix": "RED | GREEN | not-run", "post_fix": "RED | GREEN | not-run" },
   "control_non_vacuous": true,

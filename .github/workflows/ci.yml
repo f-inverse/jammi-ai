@@ -824,13 +824,14 @@ jobs:
           # attribute) or a reviewed legacy `kind: "none"` entry — closes the
           # class where a green artifact quietly proved a squash-merged,
           # no-longer-reachable tip (docs/maintainer/cuda-kernel-guide.md §4).
-          # Needs REAL commit history (git merge-base --is-ancestor), unlike
-          # every other leg in this matrix — the shared checkout step below
-          # reads this entry's own `fetch_depth: "0"` (full history; GitHub
-          # reports this repo's on-disk size as ~94 MB, negligible next to
-          # the Rust build jobs) and defaults every other leg to the normal
-          # shallow `actions/checkout` clone (`fetch_depth` unset -> `'1'`),
-          # so only this one runner instance pays the deeper-clone cost.
+          # Needs REAL commit history (git merge-base --is-ancestor) — the
+          # shared checkout step below reads this entry's own `fetch_depth:
+          # "0"` (full history; GitHub reports this repo's on-disk size as
+          # ~94 MB, negligible next to the Rust build jobs) and defaults
+          # every other leg to the normal shallow `actions/checkout` clone
+          # (`fetch_depth` unset -> `'1'`), so only the ancestry-checking
+          # legs (this one, its self-test, and "pod build timings" below)
+          # pay the deeper-clone cost.
           # QUOTED as a STRING, not the bare number 0: GitHub Actions
           # expressions treat the NUMBER 0 as falsy, so a bare `fetch_depth:
           # 0` makes `matrix.fetch_depth || '1'` below silently discard it
@@ -956,6 +957,18 @@ jobs:
           # this one artifact family. See that script's own module doc.
           - name: pod build timings
             cmd: python3 ci/scripts/check_pod_build_timings.py
+            # Same reason as "CUDA run artifact schema" above: the ancestry
+            # rule (git merge-base --is-ancestor) needs REAL history, and the
+            # gate fails closed on a shallow checkout by design — so this
+            # entry must opt out of the matrix's shallow default exactly the
+            # way that leg does (string "0", see the truthiness note there).
+            # Omitting this line IS the gate's shallow-refusal firing in CI:
+            # that exact red shipped once (PR #409's first push).
+            fetch_depth: "0"
+          # No fetch_depth here: the self-test drives every rule, ancestry
+          # included, against an ephemeral `git init`'d fixture repo — it
+          # never reads this checkout's history, so the shallow default is
+          # fine (and its CI green on the shallow runner proves it).
           - name: pod build timings self-test
             cmd: python3 ci/scripts/check_pod_build_timings.py --self-test
           # Completeness tripwire for this very guard class: every
@@ -1051,9 +1064,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # Every leg but "CUDA run artifact schema" leaves this at the
-          # normal shallow default (`fetch_depth` unset in its matrix entry
-          # -> `'1'`); that one leg's ancestry check needs real history. Both
+          # Legs leave this at the normal shallow default (`fetch_depth`
+          # unset in the matrix entry -> `'1'`) unless their entry declares
+          # `fetch_depth: "0"` — the ancestry-checking guards, which need
+          # real history and fail closed on a shallow checkout. Both
           # sides of `||` are STRINGS (`'1'`, and the matrix entry's own
           # `"0"`) — the number `0` is falsy in GitHub Actions expressions,
           # so a bare `0` here would make `||` silently discard it.

@@ -80,22 +80,38 @@
 //!
 //! `cos`/`sin` are true external constant tables in every call site this
 //! crate ships (`Tensor::from_vec` at construction, never wrapped in
-//! `Var`) — `dcos`/`dsin` are therefore `None` in practice. Per the
-//! fused-kernels plan's `is_variable()` rule (sound here for the SAME
-//! reason it is sound for `LayerNormFused`'s `gamma`: `cos`/`sin` are
-//! genuine leaf construction data with no upstream op, never an
-//! intermediate on a path to a `Var`, so `is_variable() == true` is a
-//! SUFFICIENT signal for "needs a gradient"), `bwd` checks
-//! `cos.is_variable()`/`sin.is_variable()` directly (no extra
-//! construction-data flag needed — unlike `dgamma_needed`, `bwd` already
-//! receives `cos`/`sin` themselves as arguments, so there is nothing to
-//! freeze ahead of time) and computes a REAL gradient — via ordinary
-//! `Tensor` composition, not a further fused kernel, since this path is
-//! provably dead in every call site today (the same "correctness over
-//! micro-optimization" choice `Axpy::bwd` documents) — rather than
-//! hardcoding `None` forever and risking the exact silent-missing-
-//! gradient landmine `LayerNormFused`'s doc warns a hardcoded
-//! `dgamma_needed = false` would have been.
+//! `Var`) — `dcos`/`dsin` are therefore `None` in practice. `bwd` checks
+//! `cos.track_op()`/`sin.track_op()` directly (no extra construction-data
+//! flag needed — unlike `dgamma_needed`, `bwd` already receives `cos`/
+//! `sin` themselves as arguments, so there is nothing to freeze ahead of
+//! time) and computes a REAL gradient — via ordinary `Tensor` composition,
+//! not a further fused kernel, since this path is provably dead in every
+//! call site today (the same "correctness over micro-optimization" choice
+//! `Axpy::bwd` documents) — rather than hardcoding `None` forever and
+//! risking the exact silent-missing-gradient landmine `LayerNormFused`'s
+//! doc warns a hardcoded `dgamma_needed = false` would have been.
+//! `track_op()`, NOT `is_variable()` alone: an earlier version of this
+//! check used `is_variable()`, reasoning that `cos`/`sin` are "genuine
+//! leaf construction data with no upstream op, never an intermediate on a
+//! path to a `Var`" — sound for every call site's LITERAL `cos`/`sin`
+//! handle, but NOT for a caller who derives its own table from a `Var`
+//! through an intermediate op (e.g. `crate::ops::rope_positions`'s ragged
+//! arm gathers a per-row table via `Tensor::index_select` before ever
+//! calling a fused op) and hands the RESULT here: that result has
+//! `is_variable() == false` (it is not itself a `Var`) but `track_op() ==
+//! true` (it carries an `Op`, and — since candle's own `sorted_nodes`
+//! walk, `backprop.rs`, recurses through `Op::IndexSelect`'s left operand
+//! — that `Op` chain DOES reach a `Var`), so the old `is_variable()`-only
+//! check silently returned `None` for a slot candle's own backward walk
+//! still expected an entry for, panicking downstream at `backprop.rs:175`
+//! ("grad not populated") instead of computing the real gradient this
+//! `bwd` is fully able to produce. `rope_grad_table` (below) never reads
+//! `table`'s VALUES — only its `elem_count()`/`shape()` — so widening the
+//! gate to `track_op()` costs nothing and is correct regardless of
+//! whether `arg2`/`arg3` is itself a `Var` or a tracked intermediate on a
+//! path to one; this is the SAME predicate-hole class
+//! `low_rank_residual_linear.rs`'s and `jammi-lora`'s `frozen_weight_gate`
+//! already fixed for their own `w`/`weight` slots.
 //!
 //! ## Domain (family D)
 //!
@@ -341,9 +357,11 @@ impl CustomOp3 for RopeFused {
     /// `dx` is ALWAYS `Some` (same rule as `LayerNormFused`'s `dx` slot —
     /// `x` may be an intermediate on a path to a `Var`, see `Axpy`'s doc on
     /// this exact hazard) — computed by reusing THIS op with `sin`
-    /// negated (module doc). `dcos`/`dsin` check `is_variable()` directly
-    /// on the actual `cos`/`sin` arguments `bwd` already receives (module
-    /// doc's rationale for why that is sound here, and why no separate
+    /// negated (module doc). `dcos`/`dsin` check `track_op()` (NOT
+    /// `is_variable()` alone — module doc's "`bwd`: RoPE with the sign of
+    /// `sin` flipped" section explains why the narrower check is a real
+    /// predicate hole, not just a stylistic difference) directly on the
+    /// actual `cos`/`sin` arguments `bwd` already receives (no separate
     /// construction-data flag is needed the way `dgamma_needed` is).
     fn bwd(
         &self,
@@ -362,12 +380,12 @@ impl CustomOp3 for RopeFused {
             },
         )?;
         let sign = if self.negate_sin { -1.0 } else { 1.0 };
-        let dcos = if arg2.is_variable() {
+        let dcos = if arg2.track_op() {
             Some(rope_grad_table(arg1, grad_res, arg2, false, 1.0)?)
         } else {
             None
         };
-        let dsin = if arg3.is_variable() {
+        let dsin = if arg3.track_op() {
             Some(rope_grad_table(arg1, grad_res, arg3, true, sign)?)
         } else {
             None
@@ -876,5 +894,90 @@ mod tests {
         for (a, b) in dsin.iter().zip(expected_dsin.iter()) {
             assert!((a - b).abs() < 1e-4, "dsin: {a} vs {b}");
         }
+    }
+
+    /// The `track_op()` class fix (audit): `cos`/`sin` derived from a
+    /// `Var` through an intermediate op (`* 1.0`, the SAME tracked-but-
+    /// not-a-`Var` construction `low_rank_residual_linear.rs`'s own
+    /// regression test uses) have `is_variable() == false` but
+    /// `track_op() == true` -- an `is_variable()`-only gate at `bwd` would
+    /// return `dcos`/`dsin = None` here while candle's OWN `sorted_nodes`
+    /// walk (`backprop.rs`) still expects a gradient entry for these
+    /// tracked nodes, PANICKING at `backprop.rs:175` ("grad not
+    /// populated") instead of this test's clean `Ok` with a real, correct
+    /// gradient. Reached through the PUBLIC `RopeFused`/`apply3` surface
+    /// (`jammi_kernels::ops::{apply3, RopeFused}`), a real
+    /// `Tensor::backward()` call.
+    #[test]
+    fn cos_sin_gradients_are_populated_when_tracked_but_not_variables() {
+        let device = Device::Cpu;
+        let x0: [f32; 8] = [1.0, -1.0, 2.0, 0.5, -0.3, 1.7, 0.2, -2.1];
+        let cos0 = [0.8f32, 0.6, 0.8, 0.6];
+        let sin0 = [0.6f32, 0.8, 0.6, 0.8];
+        let x = Tensor::from_slice(&x0, (2, 4), &device).unwrap();
+        let cos_var =
+            Var::from_tensor(&Tensor::from_slice(&cos0, (1, 4), &device).unwrap()).unwrap();
+        let sin_var =
+            Var::from_tensor(&Tensor::from_slice(&sin0, (1, 4), &device).unwrap()).unwrap();
+        // Tracked (has an Op::Affine) but NOT itself a Var -- the exact
+        // cell the panic lived in.
+        let cos = (cos_var.as_tensor() * 1.0).unwrap();
+        let sin = (sin_var.as_tensor() * 1.0).unwrap();
+        assert!(!cos.is_variable() && cos.track_op());
+        assert!(!sin.is_variable() && sin.track_op());
+
+        let out = fused(false, &x, &cos, &sin).unwrap();
+        let grads = out
+            .backward()
+            .expect("tracked-non-Var cos/sin must populate real gradients, never panic");
+        let dcos: Vec<f32> = grads
+            .get(cos_var.as_tensor())
+            .expect("the gradient must reach cos_var, the tracked-non-Var cos's own ancestor")
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let dsin: Vec<f32> = grads
+            .get(sin_var.as_tensor())
+            .expect("the gradient must reach sin_var, the tracked-non-Var sin's own ancestor")
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        // Reference: the SAME literal-Var case `cos_sin_gradients_are_
+        // populated_when_variables` already proves correct -- the
+        // tracked-non-Var path must produce the IDENTICAL numeric
+        // gradient (the `* 1.0` intermediate is algebraically a no-op).
+        let cos_ref =
+            Var::from_tensor(&Tensor::from_slice(&cos0, (1, 4), &device).unwrap()).unwrap();
+        let sin_ref =
+            Var::from_tensor(&Tensor::from_slice(&sin0, (1, 4), &device).unwrap()).unwrap();
+        let out_ref = fused(false, &x, &cos_ref, &sin_ref).unwrap();
+        let grads_ref = out_ref.backward().unwrap();
+        let dcos_ref: Vec<f32> = grads_ref
+            .get(&cos_ref)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let dsin_ref: Vec<f32> = grads_ref
+            .get(&sin_ref)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(
+            dcos, dcos_ref,
+            "a tracked-non-Var cos's gradient must be bit-identical to the literal-Var case's \
+             own gradient (the `* 1.0` intermediate is a no-op)"
+        );
+        assert_eq!(
+            dsin, dsin_ref,
+            "a tracked-non-Var sin's gradient must be bit-identical to the literal-Var case's \
+             own gradient (the `* 1.0` intermediate is a no-op)"
+        );
     }
 }

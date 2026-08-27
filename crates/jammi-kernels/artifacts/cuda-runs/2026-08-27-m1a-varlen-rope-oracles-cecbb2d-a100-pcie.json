@@ -1,0 +1,83 @@
+{
+ "schema_version": 1,
+ "unit": "m1a-varlen-rope-positions",
+ "git_sha": "cecbb2d11a1a6f643357dd9691b41f70c42ef5d6",
+ "date": "2026-08-27T21:41:00Z",
+ "box": "jammi-a100 (NVIDIA A100 80GB PCIe, driver 570.133.20)",
+ "driver": "570.133.20",
+ "gpu": "NVIDIA A100 80GB PCIe",
+ "features": "flash-attn",
+ "status": "GREEN",
+ "env": {
+  "JAMMI_REQUIRE_CUDA": "1"
+ },
+ "producer": {
+  "path": "crates/jammi-kernels/tests/cuda_parity.rs",
+  "kind": "cargo-test",
+  "invocation": "JAMMI_REQUIRE_CUDA=1 cargo test -p jammi-kernels --features flash-attn --test cuda_parity -- --exact fused_rope_ragged_matches_two_op_composition_bit_identical_fwd_and_bwd_cuda --nocapture",
+  "gating": "env:JAMMI_REQUIRE_CUDA"
+ },
+ "note": "Execution provenance for M1a's CUDA-gated oracles at the exact branch tip cecbb2d (a clean checkout of the pushed sha at /root/jammi-ai, CARGO_TARGET_DIR = the pod's member-free seed clone; CUTLASS provisioned via the documented submodule-update command, since the branch seed's main-only T1b correctly skips on a non-main resolved sha). The same detached job first ran cargo clippy -p jammi-kernels --all-targets --features flash-attn -- -D warnings to completion (CLIPPY-GREEN in the retained log) -- the full type/borrow-check of the ragged-arm code that the nvcc-less dev host could only syntax-parse. fused_rope_ragged legs: values-parity of the ragged fused-rope op vs the two-op composition (bit-identical fwd+bwd at non-uniform lengths), dense-invariance at uniform lengths (bit-identical to the dense entry, fwd+bwd), and the zero-length-segment refusal. rope_positions legs: the pre-existing dense parity suite, untouched-green (the dense-arm invariance fence). The CPU-hermetic truth oracle (per-segment RopeFused reference), the guard tests, and the track_op() class tests (esc-053) run in the merge-blocking lane (cargo test -p jammi-kernels, 321 tests). PROVENANCE DISCIPLINE: this artifact cites a branch sha; the PR must land as a MERGE COMMIT (the #389/#406 precedent) so cecbb2d remains an ancestor of main. Suite counts below are verbatim from the job log. The producer invocation names the PRIMARY discriminating oracle with --exact per the schema; the job actually ran the two filter groups covering all ten legs listed below (fused_rope_ragged: 4 passed / 0 failed, 6.97s; rope_positions: 6 passed / 0 failed, 1.05s \u2014 suite lines verbatim in the retained log).",
+ "legs": [
+  {
+   "name": "cuda_parity::fused_rope_ragged_refuses_a_non_cuda_qkv",
+   "status": "ok",
+   "passed": 1,
+   "failed": 0
+  },
+  {
+   "name": "cuda_parity::fused_rope_ragged_refuses_a_zero_length_segment_cuda",
+   "status": "ok",
+   "passed": 1,
+   "failed": 0
+  },
+  {
+   "name": "cuda_parity::fused_rope_ragged_matches_two_op_composition_bit_identical_fwd_and_bwd_cuda",
+   "status": "ok",
+   "passed": 1,
+   "failed": 0
+  },
+  {
+   "name": "cuda_parity::fused_rope_ragged_matches_dense_entry_at_uniform_lengths_bit_identical_fwd_and_bwd_cuda",
+   "status": "ok",
+   "passed": 1,
+   "failed": 0
+  },
+  {
+   "name": "cuda_parity::rope_positions_parity_f32_contiguous_head_dim_64_cuda",
+   "status": "ok",
+   "passed": 1,
+   "failed": 0
+  },
+  {
+   "name": "cuda_parity::rope_positions_bwd_reaches_qkv_gradient_cuda",
+   "status": "ok",
+   "passed": 1,
+   "failed": 0
+  },
+  {
+   "name": "cuda_parity::rope_positions_bit_identical_to_rope_fused_bf16_b1_s512_cuda",
+   "status": "ok",
+   "passed": 1,
+   "failed": 0
+  },
+  {
+   "name": "cuda_parity::rope_positions_bit_identical_to_rope_fused_bf16_b8_s128_cuda",
+   "status": "ok",
+   "passed": 1,
+   "failed": 0
+  },
+  {
+   "name": "cuda_parity::rope_positions_bit_identical_to_rope_fused_bf16_b8_s512_global_theta_cuda",
+   "status": "ok",
+   "passed": 1,
+   "failed": 0
+  },
+  {
+   "name": "cuda_parity::rope_positions_bit_identical_to_rope_fused_bf16_b8_s512_local_theta_cuda",
+   "status": "ok",
+   "passed": 1,
+   "failed": 0
+  }
+ ]
+}

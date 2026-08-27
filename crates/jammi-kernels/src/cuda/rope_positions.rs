@@ -4,7 +4,7 @@ use candle_core::{CudaStorage, DType, Error, Layout, Result, Shape};
 use half::bf16;
 
 use super::PTX_ROPE_POSITIONS;
-use crate::ops::rope_positions::rope_positions_dims;
+use crate::ops::rope_positions::{rope_positions_dims, PositionArm};
 use crate::ops::MAX_HEAD_DIM;
 
 /// See `../axpy.rs`'s identical constant for the module-name rationale.
@@ -28,6 +28,7 @@ fn check_cuda_domain(op: &'static str, n: usize, d: usize) -> Result<()> {
 pub(crate) fn cuda_fwd(
     seq: usize,
     negate_sin: bool,
+    arm: PositionArm,
     s1: &CudaStorage,
     l1: &Layout,
     s2: &CudaStorage,
@@ -36,7 +37,7 @@ pub(crate) fn cuda_fwd(
     l3: &Layout,
 ) -> Result<(CudaStorage, Shape)> {
     const OP: &str = "rope_positions_fused";
-    let (total, h, d) = rope_positions_dims(l1, l2, l3, seq)?;
+    let (total, h, d) = rope_positions_dims(l1, l2, l3, seq, arm)?;
     let shape = l1.shape().clone();
     let device = s1.device().clone();
     let n = l1.shape().elem_count();

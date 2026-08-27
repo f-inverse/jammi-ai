@@ -48,8 +48,11 @@ session start) with the hooks actually wired via `.claude/settings.json`.
    - at least one line has `"event": "SubagentStop"` with non-empty
      `payload_keys`;
    - at least one line has `"event": "PreToolUse"` whose `tool_name` matches what
-     `.claude/settings.json`'s `PreToolUse` matcher expects (`Agent`/`Task`/
-     `SendMessage`) — if it does NOT (e.g. the harness sends some other value),
+     `.claude/settings.json`'s `PreToolUse` matcher expects (`Agent`/`Task` —
+     `SendMessage` is deliberately NOT wired: message-relay gating is out of
+     scope per the v3 core cut, `lead-gate-pre.sh:10` / `lead-gate-lib.py:27`,
+     so a real `SendMessage` producing no `PreToolUse` line is correct, not a
+     dead route) — if it does NOT (e.g. the harness sends some other value),
      that is itself the finding: the matcher needs re-homing in a follow-up PR,
      and this log is the evidence, not a guess.
 5. Copy the relevant `hook.log` lines (not the whole operational log — trim to the

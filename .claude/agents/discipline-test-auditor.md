@@ -33,11 +33,11 @@ Each item is a **general principle** applied to a surface you have never seen. T
 
 ## Reporting the unit, not just the diff
 
-Report `unit_branch` (`git -C <worktree> rev-parse --abbrev-ref HEAD` if resolvable, else the `unit:` line the lead's brief carried — say which) and `head_sha` (`git rev-parse HEAD` at the same location). Report `class_enumeration` when a discipline-test finding has siblings (the same governance verb or consumer-shaped surface appearing at other sites the diff touches); `sweep_method: "none"` when you did not sweep.
+Report `unit_branch` (`git -C <worktree> rev-parse --abbrev-ref HEAD` if resolvable, else the `unit:` line the lead's brief carried — say which) and `head_sha` (`git rev-parse HEAD` at the same location). `discipline-test-auditor` sits outside `hooks/lead-gate-pre.sh`'s `GATED`/`NEVER_GATED` fresh-dispatch lists (it is neither a relay target nor a class the second-round rule names) — still report `class_enumeration` when a discipline-test finding has siblings (the same governance verb or consumer-shaped surface appearing at other sites the diff touches); `sweep_method: "none"` when you did not sweep.
 
 ## Verdict schema
 
-Emit exactly one fenced ```json block as the LAST fenced block of your final message, with `"kind": "verdict"` as its first field (a `<verdict>...</verdict>`-tag-wrapped block is also an accepted, older form). Any unrefuted `block`-severity finding, or uncertainty about whether a surface passes the discipline test, forces `BLOCK`.
+Emit exactly one fenced ```json block as the LAST fenced block of your final message, with `"kind": "verdict"` as its first field (a `<verdict>...</verdict>`-tag-wrapped block is also an accepted, older form) — exactly the shape the SubagentStop hook parses: the LAST fenced ```json block, `"kind": "verdict"` required, the tag form accepted only when no fenced block exists. Any unrefuted `block`-severity finding, or uncertainty about whether a surface passes the discipline test, forces `BLOCK`.
 
 ```json
 {
@@ -46,7 +46,7 @@ Emit exactly one fenced ```json block as the LAST fenced block of your final mes
   "diff_range": "<base>...<head>",
   "unit_branch": "<the branch you read, from git or the lead's unit: line — say which>",
   "head_sha": "<sha you read>",
-  "worktree": "<the absolute path you read the diff from — recorded for provenance; the lead may cite it in its own written class-probe, see `.claude/agents/lead.md` 'The class, not the instance'>",
+  "worktree": "<the absolute path you read the diff from — the SubagentStop hook uses this as the exact-substring second-round-rule anchor (worktree/head_sha/unit_branch), the lead-proactivity gate v3>",
   "verdict": "BLOCK | PASS",
   "uncertain": false,
   "mechanical_gate": "check_no_consumer_names.py: green | red | not-run",

@@ -35,7 +35,7 @@ Report `unit_branch` (`git -C <worktree> rev-parse --abbrev-ref HEAD` if resolva
 
 ## Verdict schema
 
-Emit exactly one fenced ```json block as the LAST fenced block of your final message, with `"kind": "verdict"` as its first field (a `<verdict>...</verdict>`-tag-wrapped block is also an accepted, older form). `verdict` is `verified` **only** when the acceptance test went RED at the base and GREEN on the branch, the RED was the acceptance assertion failing (not scaffolding), and the test asserts the acceptance criterion. Otherwise `tautological` (passed at the base) or `not-acceptance-faithful` (asserts an impl detail) — both are BLOCK states.
+Emit exactly one fenced ```json block as the LAST fenced block of your final message, with `"kind": "verdict"` as its first field (a `<verdict>...</verdict>`-tag-wrapped block is also an accepted, older form) — exactly the shape the SubagentStop hook parses: the LAST fenced ```json block, `"kind": "verdict"` required, the tag form accepted only when no fenced block exists. `verdict` is `verified` **only** when the acceptance test went RED at the base and GREEN on the branch, the RED was the acceptance assertion failing (not scaffolding), and the test asserts the acceptance criterion. Otherwise `tautological` (passed at the base) or `not-acceptance-faithful` (asserts an impl detail) — both are BLOCK states.
 
 ```json
 {
@@ -44,7 +44,7 @@ Emit exactly one fenced ```json block as the LAST fenced block of your final mes
   "diff_range": "<base>...<head>",
   "unit_branch": "<the branch you read, from git or the lead's unit: line — say which>",
   "head_sha": "<sha you read>",
-  "worktree": "<the absolute path you read the diff from — recorded for provenance; the lead may cite it in its own written class-probe, see `.claude/agents/lead.md` 'The class, not the instance'>",
+  "worktree": "<the absolute path you read the diff from — the SubagentStop hook uses this as the exact-substring second-round-rule anchor (worktree/head_sha/unit_branch), the lead-proactivity gate v3>",
   "verdict": "verified | tautological | not-acceptance-faithful",
   "acceptance_criterion": "the phase-2 criterion the test must assert",
   "red_green": { "base_commit": "<sha>", "test_command": "…", "at_base": "RED | GREEN | not-run", "on_branch": "RED | GREEN | not-run" },

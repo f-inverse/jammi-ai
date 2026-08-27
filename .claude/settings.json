@@ -2,17 +2,54 @@
   "permissions": {
     "deny": [
       "Edit(docs/swarm/CONSTITUTION.md)",
-      "Write(docs/swarm/CONSTITUTION.md)"
+      "Write(docs/swarm/CONSTITUTION.md)",
+      "Edit(.claude/hooks/**)",
+      "Write(.claude/hooks/**)",
+      "MultiEdit(.claude/hooks/**)",
+      "Edit(.claude/settings.json)",
+      "Write(.claude/settings.json)",
+      "MultiEdit(.claude/settings.json)"
     ]
   },
   "hooks": {
+    "SubagentStart": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/lead-gate-start.sh"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "adversarial-audit|fix-verifier|acceptance-verifier|pressure-tester|oracle|citation-checker|discipline-test-auditor",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/lead-gate-stop.sh"
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
-        "matcher": "Task",
+        "matcher": "Agent|Task",
         "hooks": [
           {
             "type": "command",
             "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/agent-routing-gate.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Agent|Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/lead-gate-pre.sh"
           }
         ]
       }

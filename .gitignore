@@ -68,9 +68,13 @@ packaging/*/build/
 !.claude/settings.json
 !.claude/AGENTS.md
 # Swarm runtime state: the escape ledger (.jammi/escapes.jsonl) is tracked; the
-# per-session facts ledger and domain mutex locks are ephemeral, never committed.
+# per-session facts ledger, domain mutex locks, and the lead-proactivity gate's
+# own hook-written state (bindings + per-unit verdict rows; branch-keyed, local
+# to one machine — cross-machine loss is accepted and documented) are
+# ephemeral, never committed.
 .jammi/ledger/
 .jammi/locks/
+.jammi/gate-state/
 CLAUDE.md
 docs/plans/*
 # Maintainer roadmap / journey docs are tracked despite the docs/plans/ rule.

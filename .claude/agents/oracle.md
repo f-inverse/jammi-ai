@@ -33,11 +33,11 @@ Each item is a **general principle**; apply it to any surface the diff touches, 
 
 ## Reporting the unit, not just the diff
 
-Report `unit_branch` (`git -C <worktree> rev-parse --abbrev-ref HEAD` if resolvable, else the `unit:` line the lead's brief carried — say which) and `head_sha` (`git rev-parse HEAD` at the same location). A `HARD_BLOCK` is never relayed round-by-round the way an ordinary BLOCK is (it is not consensus-overridable) — still report `class_enumeration` when a hard-block check has siblings (another RPC missing the same tenant-denial case, another migration breaking the same append-only rule); `sweep_method: "none"` when you did not sweep beyond what the mechanical gates already enumerated.
+Report `unit_branch` (`git -C <worktree> rev-parse --abbrev-ref HEAD` if resolvable, else the `unit:` line the lead's brief carried — say which) and `head_sha` (`git rev-parse HEAD` at the same location). A `HARD_BLOCK` is never relayed round-by-round the way an ordinary BLOCK is (it is not consensus-overridable — there is no "relay" to gate), but the state carrier still reads your verdict row like every other verifier's, so report `class_enumeration` when a hard-block check has siblings (another RPC missing the same tenant-denial case, another migration breaking the same append-only rule); `sweep_method: "none"` when you did not sweep beyond what the mechanical gates already enumerated.
 
 ## Verdict schema
 
-Emit exactly one fenced ```json block as the LAST fenced block of your final message, with `"kind": "verdict"` as its first field (a `<verdict>...</verdict>`-tag-wrapped block is also an accepted, older form). Any `hard_block: true` check forces `verdict: HARD_BLOCK`; this verdict is not consensus-overridable.
+Emit exactly one fenced ```json block as the LAST fenced block of your final message, with `"kind": "verdict"` as its first field (a `<verdict>...</verdict>`-tag-wrapped block is also an accepted, older form) — exactly the shape the SubagentStop hook parses: the LAST fenced ```json block, `"kind": "verdict"` required, the tag form accepted only when no fenced block exists. Any `hard_block: true` check forces `verdict: HARD_BLOCK`; this verdict is not consensus-overridable.
 
 ```json
 {
@@ -46,7 +46,7 @@ Emit exactly one fenced ```json block as the LAST fenced block of your final mes
   "diff_range": "<base>...<head>",
   "unit_branch": "<the branch you read, from git or the lead's unit: line — say which>",
   "head_sha": "<sha you read>",
-  "worktree": "<the absolute path you read the diff from — recorded for provenance; the lead may cite it in its own written class-probe, see `.claude/agents/lead.md` 'The class, not the instance'>",
+  "worktree": "<the absolute path you read the diff from — the SubagentStop hook uses this as the exact-substring second-round-rule anchor (worktree/head_sha/unit_branch), the lead-proactivity gate v3>",
   "verdict": "PASS | HARD_BLOCK",
   "overridable": false,
   "checks": [

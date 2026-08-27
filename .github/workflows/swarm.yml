@@ -49,6 +49,19 @@ jobs:
           GITHUB_BASE_REF: ${{ github.base_ref }}
         run: python3 ci/scripts/check_no_consumer_names.py
 
+      # The lead-proactivity gate's own CI leg: runs the REAL hook scripts
+      # (lead-gate-{start,stop,pre}.sh) against fixture payloads in a temp
+      # state dir — R1-R10 + S1 required-RED fixtures, N1-N7 must-still-count
+      # negative-space fixtures, and R10's wiring assertion (settings.json
+      # carries both events + every script, scripts executable).
+      - name: Assert the lead-proactivity gate's hooks fire correctly on fixtures
+        if: ${{ !cancelled() }}
+        run: python3 ci/scripts/check_lead_gate.py --self-test
+
+      - name: Run check_lead_gate.py's own test suite
+        if: ${{ !cancelled() }}
+        run: python3 ci/scripts/test_check_lead_gate.py
+
       # --- Human-amend-only guards (git-diff-scoped; PRs only) ----------------
       # Each detects its touched set inside the job and exits green when untouched,
       # red (admin-merge required) when touched. Every constitution/gate edit —

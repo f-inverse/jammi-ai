@@ -32,11 +32,11 @@ Each item is a **general principle**; apply it to any citation, in any artifact.
 
 ## Reporting the unit, not just the artifact
 
-Report `unit_branch` (`git -C <worktree> rev-parse --abbrev-ref HEAD` if resolvable, else the `unit:` line the lead's brief carried — say which) and `head_sha` (`git rev-parse HEAD` at the same location). Report `class_enumeration` when a `stale`/`fabricated` citation has siblings (the same author's other citations in the artifact, checked the same way); `sweep_method: "none"` when you checked only the ones flagged.
+Report `unit_branch` (`git -C <worktree> rev-parse --abbrev-ref HEAD` if resolvable, else the `unit:` line the lead's brief carried — say which) and `head_sha` (`git rev-parse HEAD` at the same location). `citation-checker` is a never-gated agent type in `hooks/lead-gate-pre.sh` (a citation re-check is the tool a probe needs, so it can never itself be blocked by the gate it feeds) — still report `class_enumeration` when a `stale`/`fabricated` citation has siblings (the same author's other citations in the artifact, checked the same way); `sweep_method: "none"` when you checked only the ones flagged.
 
 ## Verdict schema
 
-Emit exactly one fenced ```json block as the LAST fenced block of your final message, with `"kind": "verdict"` as its first field (a `<verdict>...</verdict>`-tag-wrapped block is also an accepted, older form). Any `fabricated` or `stale` citation forces `BLOCK`.
+Emit exactly one fenced ```json block as the LAST fenced block of your final message, with `"kind": "verdict"` as its first field (a `<verdict>...</verdict>`-tag-wrapped block is also an accepted, older form) — exactly the shape the SubagentStop hook parses: the LAST fenced ```json block, `"kind": "verdict"` required, the tag form accepted only when no fenced block exists. Any `fabricated` or `stale` citation forces `BLOCK`.
 
 ```json
 {
@@ -45,7 +45,7 @@ Emit exactly one fenced ```json block as the LAST fenced block of your final mes
   "artifact": "what was checked (verdict / plan / doc)",
   "unit_branch": "<the branch you read, from git or the lead's unit: line — say which>",
   "head_sha": "<sha you read>",
-  "worktree": "<the absolute path you read the artifact from — recorded for provenance; the lead may cite it in its own written class-probe, see `.claude/agents/lead.md` 'The class, not the instance'>",
+  "worktree": "<the absolute path you read the artifact from — the SubagentStop hook uses this as the exact-substring second-round-rule anchor (worktree/head_sha/unit_branch), the lead-proactivity gate v3>",
   "verdict": "BLOCK | PASS",
   "citations": [
     {

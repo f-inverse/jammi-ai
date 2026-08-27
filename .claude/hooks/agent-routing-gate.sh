@@ -1,8 +1,22 @@
 #!/bin/sh
-# agent-routing-gate.sh — PreToolUse(Task) advisory routing nudge.
+# agent-routing-gate.sh — PreToolUse(Agent|Task) advisory routing nudge.
+#
+# Re-matched from `Task`-only to `Agent|Task` (lead-proactivity-gate PR).
+# Two SEPARATE claims, not one: (1) the pressure-test's census of this
+# session's own transcripts (2026-08-26) found the MODEL-side dispatch tool
+# named `Agent` 475 times and `Task` 0 times — this is what motivates the
+# re-match. (2) Whether the HOOK PAYLOAD's own `tool_name` field arrives as
+# `Agent` is a DIFFERENT, still-UNCONFIRMED claim — the census is a
+# transcript read, not an observation of what Claude Code's harness puts in
+# the PreToolUse payload. Only the fresh-session log required by
+# `ci/hook-acceptance/README.md` settles (2); until it exists, this hook's
+# original `case "$TOOL" in Task|"")` matcher being silently dead the whole
+# time it was wired is a strong inference from (1), not a proven fact from
+# (2) (see `.claude/hooks/README.md` and `ARCHITECTURE.md §7` for the same
+# two-claims split). It still degrades to a no-op on any other tool_name.
 #
 # Family O/P (LESSONS.md): the rigor chain's phases each clear a NAMED gate agent.
-# When a dispatched Task reads as a phase step (audit, pressure-test, fix-verify,
+# When a dispatched Agent/Task reads as a phase step (audit, pressure-test, fix-verify,
 # cookbook re-emit, discipline/boundary check) but is NOT routed to the matching
 # gate agent, this nudges toward the right one. It WARNS only — always exit 0. The
 # real capability boundary is each agent's native `tools:`, not this hook.
@@ -37,7 +51,7 @@ except Exception:
 
 TOOL="$(json_field tool_name)"
 case "$TOOL" in
-  Task|"") : ;;
+  Agent|Task|"") : ;;
   *) exit 0 ;;
 esac
 

@@ -298,6 +298,10 @@ its own signal (`nvidia-smi`, not a JSON log); re-verify a memory's cited artifa
 **Mechanism.** `hooks/build-env-guard.sh` (PreToolUse Bash, fail-open) warns on RUSTFLAGS/wrapper
 override, non-unique target dir, and disk pressure; domain agents are worktree-isolated with a
 unique dir; `SELF-FAILURE-MODES.md` host-traps. → **hook + domain-agent-invariant + self-failure-mode**
+(this hook stays fail-open by design — build-env hazards are recoverable nudges, not a class the
+gate needs to be un-dodgeable on; contrast `hooks/lead-gate-pre.sh` under family F10, which IS
+fail-closed because a lead can reword its way past a norm but not past denied state, §Per-mechanism
+below.)
 
 ### T · The swarm obeys its own rules; the consumer swarm mirrors its shape
 **Principle.** The swarm may *propose* to tighten itself via a human-merged PR but never
@@ -399,6 +403,14 @@ historical instance only as calibration.
 ### `hooks/build-env-guard.sh` (PreToolUse Bash, advisory / fail-open)
 - Warn on any `RUSTFLAGS` / `RUSTC_WRAPPER` override, any non-unique `CARGO_TARGET_DIR`, and NVMe
   disk pressure — the class of "the build env silently invalidated correctness" (family S).
+
+### `hooks/lead-gate-{start,stop,pre}.sh` (SubagentStart/SubagentStop/PreToolUse, FAIL-CLOSED)
+- The lead-proactivity gate (family F10, below): the ONE hook in this repo whose decider DENIES
+  on internal error rather than allowing (contrast every hook above, which is advisory / fail-open
+  by design — a build-env or routing NUDGE costs nothing to miss; a lead that dodges a probe
+  requirement by rewording its prompt does not). State is written by the harness from a verifier's
+  own `<verdict>` JSON, never the lead's prose; a relay is allowed only if it names every site the
+  verifier's `class_enumeration` enumerated.
 
 ### `SELF-FAILURE-MODES.md` (trigger → prevention)
 - Fabricated certification, "done" as a claim, subset/masked-exit local gate → verify the artifact

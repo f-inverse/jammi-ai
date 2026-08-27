@@ -32,11 +32,16 @@ committed, CI-enforced infrastructure so it executes by construction, and it is
    unpassable). Shared declaration files (`lib.rs`, `Cargo.toml`, `error.rs`) are a
    `shared`/lead-owned class, exempt from the domain mutex.
 3. **Enforcement is honest, and a gate is soft until wired.** The only hard teeth
-   are (a) native per-agent `tools:` and (b) fail-closed CI gates — **and a CI gate
+   are (a) native per-agent `tools:`, (b) fail-closed CI gates — **and a CI gate
    only blocks once it is added to branch-protection required-checks, a manual admin
-   step that is not in any PR.** Committing `swarm.yml` ≠ committing enforcement.
-   The design labels every "gate" as advisory-until-required. Everything else
-   (routing nudges, file-scope allowlists, hooks) is discipline, labeled as such.
+   step that is not in any PR** — and (c) one named exception: the lead-proactivity
+   gate (`hooks/lead-gate-{start,stop,pre}.sh`, §7) is a fail-closed `PreToolUse`
+   hook, armed by default, whose decider DENIES on internal error rather than
+   allowing (F10, `SELF-FAILURE-MODES.md`). Committing `swarm.yml` ≠ committing
+   enforcement. The design labels every "gate" as advisory-until-required.
+   Everything else (routing nudges, file-scope allowlists, the *other* hooks) is
+   discipline, labeled as such — a single named hard hook does not relabel the
+   *default* posture, it is the documented exception to it.
 4. **DRY across the swarm's own knowledge.** A fact lives in one place. The
    constitution does not re-copy `philosophy.md`; it indexes citable invariants.
    Across repos, the repo-agnostic shape is not mirrored (mirroring drifts with no
@@ -214,16 +219,69 @@ manifest, not a prose sketch.
   path set *inside* the job via `git diff <base>...<head>`, exiting green when
   untouched. A path-filtered required check hangs unrelated PRs.
 
+**Hard, hook-shaped (the one named exception to "hooks are advisory"):**
+- `hooks/lead-gate-{start,stop,pre}.sh` (the lead-proactivity gate, v3 —
+  `CONTRACT-v3.md` after round-1 AND round-2 audits both found every prior arm was
+  a predicate over FREE TEXT with an unbounded input domain: site regexes,
+  worktree/sha/token scans, write-verb walks, tag scans — every fix moved the
+  squeeze between jamming legitimate traffic and being dodged by a rewording. v3
+  is a mechanism change, not a third patch, narrowed under a usage-limit scope
+  cut mid-round to **one choke point**: a fresh `Agent`/`Task` dispatch of a
+  verifier-exit type (`adversarial-audit`/`fix-verifier`/`acceptance-verifier`)
+  is denied iff its prompt names, as a WHOLE TOKEN (never a raw substring —
+  `ci/gpu` does not gate `ci/gpu-dev`), an open BLOCK's recorded `worktree` (or a
+  path under it), `head_sha` (full or a >=7-char prefix), or `unit_branch` of the SAME
+  `agent_type`, AND no **accepted relay artifact**
+  (`.jammi/gate-state/<slug>.relay.<agent_type>.<block_ts>.json`, written by the
+  lead directly — never scanned from message prose — whose `sites` keys are an
+  exact-string superset of the verifier's `class_enumeration`) exists for that
+  `(unit, agent_type, block_ts)`. A first dispatch of any type is structurally
+  never gated. `SendMessage` gating, implementer-dispatch binding, and the Bash
+  backstop are DROPPED ENTIRELY (not log-only): round 1 and round 2 both proved
+  free-text relay/write detection is undecidable without jamming legitimate
+  freeze/status/stand-down/hygiene/advisory-fold traffic or ordinary compound
+  Bash reads; the mechanical control for hook-file protection is
+  `permissions.deny` on Edit/Write/MultiEdit, unchanged. The agent-type lattice
+  is closed-world (an unrecognized `subagent_type` is DENIED, not allowed). The
+  deciding state is written by `SubagentStart`/`SubagentStop` from the verifier's
+  OWN reported verdict, never by the lead's prose — `SubagentStop` takes the LAST
+  fenced ` ```json ` block with `"kind": "verdict"` (a one-release `<verdict>`
+  tag fallback when none exists), both paths JSON-string-aware from right after
+  the opening marker so a `</verdict>`/`}` inside a quoted `notes` string can
+  never truncate the region early. A same-type PASS clears its own BLOCK; a
+  fix-/acceptance-verifier PASS also clears an older `adversarial-audit` BLOCK
+  when that BLOCK's own relay was accepted. The `PreToolUse` decider FAILS
+  CLOSED on the two-value `{0,2}` lattice: an internal error, missing `python3`,
+  unreadable state, or any other non-zero interpreter exit all DENY, never exit
+  1 — proven by `ci/scripts/check_lead_gate.py --self-test` and a one-time
+  fresh-session execution-provenance log (`ci/hook-acceptance/`). Motivated by
+  F10 (`SELF-FAILURE-MODES.md`). Three documented, visible residuals remain
+  (relaying by `SendMessage`, an unlabeled same-agent_type re-dispatch,
+  `disableAllHooks`) — not claimed closed; see `hooks/README.md` for the exact
+  mechanical-vs-visible-only statement and each residual's runtime tell.
+  Operator escape hatch: `rm .jammi/gate-state/<slug>.*`.
+
 **Soft (discipline, advisory, fail-open — labeled as such):**
-- `hooks/build-env-guard.sh` (PreToolUse Bash) — warns on `RUSTFLAGS`/`RUSTC_WRAPPER`
-  override (the ~100-min cache-miss), non-unique `CARGO_TARGET_DIR` (build-lock
-  contention), NVMe disk pressure, and maturin cross-worktree `PYTHONPATH` shadowing.
+- `hooks/build-env-guard.sh` (PreToolUse Bash, opt-in) — warns on
+  `RUSTFLAGS`/`RUSTC_WRAPPER` override (the ~100-min cache-miss), non-unique
+  `CARGO_TARGET_DIR` (build-lock contention), NVMe disk pressure, and maturin
+  cross-worktree `PYTHONPATH` shadowing.
 - `hooks/stop-gate.sh` (opt-in) — P0 static checks on a dirty tree at Stop.
-- `hooks/agent-routing-gate.sh` (advisory) — nudges a phase-shaped Task to its gate
-  agent; fails open.
+- `hooks/agent-routing-gate.sh` (PreToolUse `Agent|Task`, advisory, armed by
+  default) — nudges a phase-shaped dispatch to its gate agent; fails open.
+  Re-matched from `Task`-only to `Agent|Task` in the lead-proactivity-gate PR: the
+  pressure-test's census of this session's own transcripts found the MODEL-side
+  dispatch tool named `Agent` 475 times and `Task` 0 times, so the original
+  matcher had almost certainly been silently dead the entire time it was wired —
+  the hook PAYLOAD's own `tool_name` field is a separate claim, confirmed only by
+  the fresh-session log (`ci/hook-acceptance/`).
 
 Native per-agent `tools:` are the real capability boundary (a verifier has no
-`Edit`). No ported permission/deny lists — Jammi runs auto-mode, lighter than Lace.
+`Edit`). **No ported permission/deny lists** beyond the two narrow,
+self-protection-scoped `permissions.deny` entries above (the CONSTITUTION.md
+edit-deny, and the `.claude/hooks/**`/`settings.json` edit-deny) — Jammi runs
+auto-mode, lighter than Lace, and does not port Lace's broader permission
+deny-list machinery.
 
 ## 8. The constitution + typed anchors
 
@@ -275,15 +333,19 @@ generalization test (§2.8). Layered like the engine's own test tiers:
 ```
 .claude/
   agents/   lead + 6 verifiers + 9 domain agents + doc-currency(4) + cookbook
-  hooks/    build-env-guard.sh, stop-gate.sh, agent-routing-gate.sh, README.md
+  hooks/    build-env-guard.sh, stop-gate.sh, agent-routing-gate.sh (advisory);
+            lead-gate-{start,stop,pre}.sh + lead-gate-lib.py (fail-closed,
+            armed by default); README.md
   evals/    static/ (gates) , golden/ (escape-derived) , README.md
-  settings.json   minimal; wire the advisory hook; deny edits to CONSTITUTION.md
+  settings.json   wires the advisory routing nudge + the lead-gate hook family
+                  (SubagentStart/SubagentStop/PreToolUse); deny edits to
+                  CONSTITUTION.md and to hooks/**+settings.json themselves
   AGENTS.md       operating-model overview
 docs/swarm/  CONSTITUTION.md , SELF-FAILURE-MODES.md
 ci/scripts/  new: check_swarm_bijection.py, check_constitution_anchors.py,
-             check_no_consumer_names.py ; existing gates
+             check_no_consumer_names.py, check_lead_gate.py ; existing gates
 .github/workflows/  swarm.yml (always-run gates + git-diff-scoped TOUCHED guards)
-.jammi/      escapes.jsonl (tracked) , ledger/ (gitignored)
+.jammi/      escapes.jsonl (tracked) , ledger/ (gitignored) , gate-state/ (gitignored)
 docs/plans/53-agentic-swarm/  README, ARCHITECTURE (this), LESSONS
 ```
 

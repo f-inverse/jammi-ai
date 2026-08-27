@@ -581,7 +581,7 @@ mod tests {
         // above is not vacuously true regardless of the `+ 0.0` term.
         let scale = 3.0_f32;
         let neg_zero = bf16::from_f32(-0.0);
-        let correct = neg_zero.to_f32() * scale + 0.0f32;
+        let correct = neg_zero.to_f32() * scale + 0.0f32; // no-producer: IEEE-754 identity (`-0.0 + 0.0 == +0.0`), not a tolerance floor.
         let wrong = neg_zero.to_f32() * scale; // the RED control expression
         assert_eq!(correct.to_bits(), 0f32.to_bits(), "correct must be +0.0");
         assert_eq!(

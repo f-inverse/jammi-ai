@@ -215,8 +215,8 @@ fn bf16_bit_diff(a: bf16, b: bf16) -> i32 {
 /// `REL = 2^-6` alone is jointly sufficient with `FLOOR = 2^-5` for every
 /// element in the production-width fixture (verified directly, not just
 /// argued): the maximum `(|diff| - FLOOR) / magnitude` needed across every
-/// nonzero-magnitude element, GIVEN `FLOOR = 2^-5`, measures `1.06%` —
-/// under `REL`'s `1.5625%` with real margin.
+/// nonzero-magnitude element, GIVEN `FLOOR = 2^-5`, measures `1.06%` (no-producer: a one-off full-scan probe of the deterministic fixture, uncommitted) —
+/// under `REL`'s `1.5625%` (no-producer: restates `2^-6`, a definition) with real margin.
 const BF16_REL_TOL: f32 = 0.015625; // 2^-6
 
 /// See `BF16_REL_TOL`'s doc, mechanism 2: exists for elements where
@@ -226,7 +226,7 @@ const BF16_REL_TOL: f32 = 0.015625; // 2^-6
 /// relative bound cannot describe at all. Also comfortably covers the
 /// forward oracle's own (much smaller) near-zero-tail divergence
 /// (measured max `~9.54e-7`, i.e. `2^-20`).
-const BF16_ABS_FLOOR: f32 = 0.03125; // 2^-5
+const BF16_ABS_FLOOR: f32 = 0.03125; // 2^-5 — no-producer: definitional power-of-two floor choice, not a measurement.
 
 /// The shared bf16 comparison both oracles below assert against. See
 /// `BF16_REL_TOL`'s doc for the derivation.

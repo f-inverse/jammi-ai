@@ -3400,8 +3400,9 @@ mod tests {
     //    those 8 seeds against [`FLASH_ORACLE_K_MEAN_POOLED`] /
     //    [`FLASH_ORACLE_K_MEAN_GRAD`] -- see those constants' own doc
     //    comments for the measured healthy and mutant distributions this
-    //    round derived them from (per-seed tables also live in the
-    //    committed `2026-08-25-flash-arm-encoder-oracle-*.json` artifact).
+    //    round derived them from (per-seed tables, and the auditor's 8-seed
+    //    sweep, measured by
+    //    `crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-flash-arm-encoder-oracle-2aa1551-a100-sxm4.json`).
     //    A per-seed MAX bound existed alongside these mean bounds in an
     //    earlier revision and was DELETED (see
     //    [`FLASH_ORACLE_K_MEAN_GRAD`]'s own doc): it was fitted only to
@@ -3417,7 +3418,9 @@ mod tests {
     //    under the OLD (single-seed) code already showed the opposite sign
     //    on the pooled leg (`0.18823 > 0.17482` at b8_s512, `0.16754 >
     //    0.15673` at b1_s128 -- flash FURTHER from the f32 reference, not
-    //    closer), and this round's 8-seed sweep confirms it quantitatively
+    //    closer; that GREEN run's values measured by
+    //    `crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-flash-arm-encoder-oracle-2aa1551-a100-sxm4.json`),
+    //    and this round's 8-seed sweep confirms it quantitatively
     //    (mean pooled ratio and per-seed sign reported by
     //    [`FLASH_ORACLE_K_MEAN_POOLED`]'s own doc). Guide §3.3's own
     //    acceptance line is "accept only if the fused arm is no further
@@ -3466,7 +3469,7 @@ mod tests {
     // margin -- the K-unrotated, window-dropped, and bad-softmax-scale
     // controls are the NARROW, hard-to-catch defects this oracle exists to
     // prove it catches; a reshape defect is not in that class. A NARROWER
-    // `softmax_scale * 1.02` (0.1275 vs the production 0.125) class-sweep
+    // `softmax_scale * 1.02` (0.1275 vs the production 0.125 -- no-producer: an uncommitted diagnostic perturbation of the design constant) class-sweep
     // probe was run this round as a diagnostic (not committed, to avoid a
     // flaky assertion on a near-bound perturbation): over the SAME 8
     // seeds, mean pooled ratio = 1.3364 (stays BELOW
@@ -3506,9 +3509,10 @@ mod tests {
     /// Mean-ratio bound, pooled-embedding leg (`err(other,f32) /
     /// err(block,f32)`, [`relative_l1_error`], averaged over
     /// [`FLASH_ORACLE_SWEEP_SEEDS`]). Measured healthy (this round,
-    /// `perf/p6-fa2-dense` @ `0f1a31a`, pod `a100c`, full per-seed table in
-    /// the committed `2026-08-25-flash-arm-encoder-oracle-*.json`
-    /// artifact): mean ratio = 1.0798 (b8_s512) / 1.0250 (b1_s128), i.e.
+    /// `perf/p6-fa2-dense` @ `0f1a31a`, pod `a100c`, full per-seed table
+    /// measured by
+    /// `crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-flash-arm-encoder-oracle-2aa1551-a100-sxm4.json`):
+    /// mean ratio = 1.0798 (b8_s512) / 1.0250 (b1_s128), i.e.
     /// flash is on average ~4-8% FURTHER from the f32 reference than the
     /// block arm is on THIS leg -- not closer (a stale earlier revision of
     /// this section's block comment claimed the opposite; deleted, see
@@ -3928,7 +3932,9 @@ mod tests {
     /// ORDINARY bf16 rounding noise exactly as it does to a real defect --
     /// by layer 0 the block arm's OWN gradient (known-correct, extensively
     /// tested elsewhere) already has cosine distance from the f32
-    /// reference ranging 0.23-1.04 across seeds (i.e. sometimes NEAR
+    /// reference ranging 0.23-1.04 across seeds (measured by
+    /// `crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-flash-arm-encoder-oracle-2aa1551-a100-sxm4.json`;
+    /// i.e. sometimes NEAR
     /// ORTHOGONAL to truth), a noise floor comparable to or larger than
     /// the K-unrotated/window-dropped mutants' OWN signal at that same
     /// depth -- neither `relative_l1_error` nor `cosine_distance` can

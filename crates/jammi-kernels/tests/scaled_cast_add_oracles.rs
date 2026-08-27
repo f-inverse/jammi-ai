@@ -490,14 +490,14 @@ fn f32_base_bf16_lora_diffs(scaling: f64, basev: &[f32], lorav: &[f32]) -> Vec<(
 /// specific sweep — both figures re-measured on every run, see
 /// [`f32_base_bf16_lora_diverges_and_stays_within_the_measured_relative_tolerance`].
 const F32_BASE_BF16_LORA_REL_TOL: f64 = 0.1;
-const F32_BASE_BF16_LORA_ABS_FLOOR: f64 = 1.0;
+const F32_BASE_BF16_LORA_ABS_FLOOR: f64 = 1.0; // re-measured on every run — see [`f32_base_bf16_lora_diverges_and_stays_within_the_measured_relative_tolerance`].
 
 /// `true` iff `(diff, magnitude)` is within the stated relative-with-floor
 /// bound: `diff <= FLOOR` (near-zero-crossing class, floor alone) OR
 /// `(diff - FLOOR) / magnitude <= REL` (ordinary class, floor-then-relative).
 fn within_f32_base_bf16_lora_bound(diff: f64, magnitude: f64) -> bool {
     diff <= F32_BASE_BF16_LORA_ABS_FLOOR
-        || (diff - F32_BASE_BF16_LORA_ABS_FLOOR) / magnitude.max(1e-12)
+        || (diff - F32_BASE_BF16_LORA_ABS_FLOOR) / magnitude.max(1e-12) // no-producer: divide-by-zero guard, not a tolerance.
             <= F32_BASE_BF16_LORA_REL_TOL
 }
 

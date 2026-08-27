@@ -25,7 +25,7 @@
 //! element the allowance of the largest and hides exactly the divergence
 //! you are hunting"). The auditor showed it was 50-100x wider than the
 //! REAL divergence (measured by hand with numpy: on `b1_s512_win64`,
-//! `|f64_truth - ref_o|max = 0.0036`, `|f64_truth - ref_lse|max = 7.7e-7`),
+//! `|f64_truth - ref_o|max = 0.0036`, `|f64_truth - ref_lse|max = 7.7e-7` — no-producer: that audit round's one-off hand probe, uncommitted),
 //! and that `lse` (an `f32` TENSOR — never rounded to bf16 anywhere in this
 //! op's pipeline) was being bounded by a bf16 ULP fraction, a category
 //! error the guide's family-D "pin the mathematical object" principle

@@ -99,7 +99,9 @@ pub fn lora_epilogue_dispatch_snapshot() -> DispatchSnapshot {
 /// to `bf16` before the add, silently destroying the base signal's own
 /// precision — measured 4095/4096 elements diverging from torch's actual
 /// promotion by up to `7.23e-1` (vs torch's own `3.81e-6`) on a
-/// `n=4096`, `|base|~100` fixture. [`wider_float_dtype`] below is the
+/// `n=4096`, `|base|~100` fixture; the same divergence class is
+/// re-measured on every run — see
+/// `eager_epilogue_f32_base_bf16_lora_would_diverge_under_the_narrow_first_regression`. [`wider_float_dtype`] below is the
 /// single source of truth for "which dtype must the add happen in",
 /// shared by every cell of the dtype lattice this function's own tests
 /// (`eager_epilogue_tests`) exercise.

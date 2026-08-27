@@ -65,11 +65,13 @@
 use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::cudarc::driver::CudaSlice;
 use candle_core::{
-    CpuStorage, CudaStorage, CustomOp1, CustomOp3, DType, Error, Layout, Result, Shape, Tensor,
+    CpuStorage, CudaStorage, CustomOp1, CustomOp3, DType, Device, Error, Layout, Result, Shape,
+    Tensor,
 };
 use half::bf16;
 
 use crate::flash::{self, CuSeqlens, VarlenConfig, HEAD_DIM};
+use crate::ops::rope_positions::PositionArm;
 use crate::ops::saved::Saved;
 
 const OP_NAME: &str = "flash_attention_varlen";
@@ -465,6 +467,15 @@ pub(crate) struct FlashVarlenAttentionFusedRope {
     /// own doc for why a mismatched fwd/bwd config needs a real op-level
     /// seam rather than a crafted input tensor.
     bwd_cfg_override: Option<VarlenConfig>,
+    /// Which [`super::RopePositionsFused`] domain `seq` means — `Dense`
+    /// (`position = token % seq`, [`flash_attention_varlen_with_rope`]'s
+    /// arm) or `Ragged` (`seq` holds the gathered table's own row-total,
+    /// `position` degenerates to the row index,
+    /// [`flash_attention_varlen_with_rope_ragged`]'s arm — M1a). BOTH
+    /// `cuda_fwd` and `bwd`'s recompute read this field so the rotation
+    /// `bwd` recomputes is provably the SAME one `fwd` applied — see
+    /// [`super::rope_positions`]'s module doc, "The ragged arm" section.
+    arm: PositionArm,
     lse: Saved<CudaSlice<f32>>,
 }
 
@@ -519,8 +530,9 @@ impl CustomOp3 for FlashVarlenAttentionFusedRope {
         // rope_positions::cuda_fwd`'s own contract, same as every other CUDA
         // kernel launcher in this crate) — `Layout::contiguous` reconstructs
         // exactly that, never a layout re-derived from anything else.
-        let (rot_storage, rot_shape) =
-            crate::cuda::rope_positions::cuda_fwd(self.seq, false, s1, l1, s2, l2, s3, l3)?;
+        let (rot_storage, rot_shape) = crate::cuda::rope_positions::cuda_fwd(
+            self.seq, false, self.arm, s1, l1, s2, l2, s3, l3,
+        )?;
         let rot_layout = Layout::contiguous(rot_shape);
         let (rx1, rx2) = rot_layout
             .contiguous_offsets()
@@ -598,7 +610,7 @@ impl CustomOp3 for FlashVarlenAttentionFusedRope {
             &qkv_d,
             &cos_d,
             &sin_d,
-            super::RopePositionsFused::new(self.seq, false),
+            super::RopePositionsFused::new_with_arm(self.seq, false, self.arm),
         )?;
 
         // The flash-side gradient: UNCHANGED `FlashVarlenBwdHelper`, the
@@ -626,7 +638,7 @@ impl CustomOp3 for FlashVarlenAttentionFusedRope {
             &d_qkv_rot,
             &cos_d,
             &sin_d,
-            super::RopePositionsFused::new(self.seq, true),
+            super::RopePositionsFused::new_with_arm(self.seq, true, self.arm),
         )?;
         Ok((Some(dqkv), None, None))
     }
@@ -664,9 +676,63 @@ pub fn flash_attention_varlen_with_rope(
         num_heads,
         cfg: *cfg,
         bwd_cfg_override: None,
+        arm: PositionArm::Dense,
         lse: Saved::empty(),
     };
     super::apply_stateful3(qkv, cos, sin, op)
+}
+
+/// Ragged counterpart of [`flash_attention_varlen_with_rope`] (M1a —
+/// varlen positions): `qkv`'s `total_q` rows are the CONCATENATION of
+/// `lengths.len()` variable-length segments (no padding), never a padded
+/// `[batch, seq]` grid. `cu_seqlens` (the FFI's own varlen geometry) and
+/// the per-row rotation table are BOTH derived from this ONE `lengths`
+/// slice — see [`crate::ops::rope_positions`]'s module doc, "The ragged
+/// arm" section, for why that makes a table/segmentation mismatch (the
+/// two-op composition's own hazard this type's doc names) structurally
+/// unconstructible: there is exactly one source of truth for both.
+///
+/// `cos_base`/`sin_base`: the SAME base-table convention
+/// [`super::RopePositionsFused::new`]'s dense arm accepts (`[period_base,
+/// d]`, any leading dims of size 1) — gathered INTERNALLY, via
+/// [`crate::ops::rope_positions::gather_ragged_tables`], into the `[total,
+/// d]` tables this op's own `CustomOp3` node is actually built over —
+/// exactly what [`crate::ops::rope_positions::rope_positions_fused_ragged`]
+/// (the CPU/eager entry) does, so the two entries share ONE gathering
+/// implementation rather than two.
+///
+/// The bwd recompute reuses the SAME gathered `cos_r`/`sin_r`: candle
+/// hands `bwd` the exact `cos`/`sin` tensors THIS function passed to
+/// `apply_stateful3` (`FlashVarlenAttentionFusedRope::bwd`'s `cos`/`sin`
+/// parameters), so the rotation `bwd` recomputes is provably the SAME one
+/// `fwd` applied — never re-derived from `lengths` a second time.
+pub fn flash_attention_varlen_with_rope_ragged(
+    qkv: &Tensor,
+    cos_base: &Tensor,
+    sin_base: &Tensor,
+    lengths: &[usize],
+    cfg: &VarlenConfig,
+) -> Result<Tensor> {
+    let (_total_q, num_heads) = check_qkv_domain(qkv.dims(), qkv.dtype())?;
+    let Device::Cuda(device) = qkv.device() else {
+        return Err(Error::Msg(format!(
+            "{FUSED_ROPE_OP_NAME}: ragged entry requires a CUDA qkv tensor -- this op has no \
+             CPU arm, see {OP_NAME}'s own doc"
+        )));
+    };
+    let cu_seqlens = CuSeqlens::from_lengths(lengths, device).map_err(flash_err)?;
+    let (total, cos_r, sin_r) =
+        crate::ops::rope_positions::gather_ragged_tables(cos_base, sin_base, lengths)?;
+    let op = FlashVarlenAttentionFusedRope {
+        seq: total,
+        cu_seqlens,
+        num_heads,
+        cfg: *cfg,
+        bwd_cfg_override: None,
+        arm: PositionArm::Ragged,
+        lse: Saved::empty(),
+    };
+    super::apply_stateful3(qkv, &cos_r, &sin_r, op)
 }
 
 /// TEST-SUPPORT ONLY — never wired into [`flash_attention_varlen_with_rope`]
@@ -712,6 +778,7 @@ pub fn flash_attention_varlen_with_rope_test_only_bwd_window_override(
         num_heads,
         cfg: *fwd_cfg,
         bwd_cfg_override: Some(*bwd_cfg),
+        arm: PositionArm::Dense,
         lse: Saved::empty(),
     };
     super::apply_stateful3(qkv, cos, sin, op)
@@ -914,6 +981,302 @@ mod fused_rope_matches_two_op_composition {
             dqkv_a_v, dqkv_b_v,
             "flash_attention_varlen_with_rope's dqkv must be bit-identical to the two-op \
              composition's own dqkv"
+        );
+    }
+}
+
+/// M1a — varlen positions: [`flash_attention_varlen_with_rope_ragged`]'s
+/// own oracles. See [`crate::ops::rope_positions`]'s module doc, "The
+/// ragged arm" section, for the representation this relies on. CUDA-only
+/// (every path under test is CUDA-only); each test either soft-skips
+/// (mirroring this file's own [`fused_rope_matches_two_op_composition`]
+/// convention) or, when `JAMMI_REQUIRE_CUDA` is set, PANICS rather than
+/// silently skipping — the SAME canonical shape
+/// `ci/kernel-oracle-helpers.txt`'s `tests/cuda_parity.rs::cuda_device`
+/// entry uses, reproduced locally here since this module lives under
+/// `src/` (outside that registry's own scan scope, which covers
+/// `crates/jammi-kernels/tests/**` and `crates/jammi-encoders/src/**`)
+/// but the discipline — "a landing-proof run must fail loud, not read as
+/// 3 skipped tests" — is the same.
+#[cfg(test)]
+mod fused_rope_ragged_oracles {
+    use super::*;
+    use candle_core::{DType, Var};
+
+    fn cuda_device_or_skip(label: &str) -> Option<Device> {
+        match Device::new_cuda(0) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
+                    panic!(
+                        "{label}: JAMMI_REQUIRE_CUDA is set but no CUDA device could be \
+                         acquired -- this is a landing-proof leg, a silent skip here is not \
+                         acceptable: {e}"
+                    );
+                }
+                eprintln!("{label}: skipping — no CUDA device available ({e})");
+                None
+            }
+        }
+    }
+
+    /// A real (non-trivial-angle) BASE rotary table, `[period_base,
+    /// hidden]`, bf16 -- the SAME convention
+    /// [`fused_rope_matches_two_op_composition`]'s own `rope_table` uses
+    /// (that one is private to its own module, so this is a standalone
+    /// copy of the same maths rather than a cross-module reach).
+    fn rope_base_table(period_base: usize, hidden: usize, device: &Device) -> (Tensor, Tensor) {
+        let half = hidden / 2;
+        let mut cos = vec![0f32; period_base * hidden];
+        let mut sin = vec![0f32; period_base * hidden];
+        for pos in 0..period_base {
+            for i in 0..half {
+                let theta = 10_000f64.powf(-2.0 * (i as f64) / (hidden as f64));
+                let angle = pos as f64 * theta;
+                let (s, c) = angle.sin_cos();
+                cos[pos * hidden + i] = c as f32;
+                cos[pos * hidden + i + half] = c as f32;
+                sin[pos * hidden + i] = s as f32;
+                sin[pos * hidden + i + half] = s as f32;
+            }
+        }
+        let cos = Tensor::from_vec(cos, (period_base, hidden), device)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let sin = Tensor::from_vec(sin, (period_base, hidden), device)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        (cos, sin)
+    }
+
+    fn to_f32_vec(t: &Tensor) -> Vec<f32> {
+        t.flatten_all()
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1()
+            .unwrap()
+    }
+
+    /// RETENTION oracle (contract oracle inventory item 2): the ragged
+    /// fused-rope op vs the two-op composition it replaces --
+    /// [`crate::ops::rope_positions::rope_positions_fused_ragged`]
+    /// (ragged `RopePositionsFused` apply) followed by
+    /// [`flash_attention_varlen`] on the already-rotated buffer, with an
+    /// INDEPENDENTLY built `CuSeqlens` (from the SAME `lengths`, never
+    /// derived from the other path's own gather) -- values bit-identical
+    /// fwd AND bwd on a genuinely NON-uniform `lengths` (the ragged case's
+    /// whole point), only retention differs. Mirrors
+    /// [`fused_rope_matches_two_op_composition`]'s own (dense) oracle one
+    /// arm up.
+    #[test]
+    fn fused_rope_ragged_matches_two_op_composition_bit_identical_fwd_and_bwd_cuda() {
+        let Some(cuda) = cuda_device_or_skip(
+            "fused_rope_ragged_matches_two_op_composition_bit_identical_fwd_and_bwd_cuda",
+        ) else {
+            return;
+        };
+        let dev = cuda.as_cuda_device().unwrap().clone();
+        let lengths = vec![3usize, 7, 2, 5]; // non-uniform -- the ragged case's whole point
+        let total: usize = lengths.iter().sum();
+        let (h, d) = (2usize, HEAD_DIM);
+        let n = total * 3 * h * d;
+        let xv: Vec<f32> = (0..n).map(|k| (k as f32 * 0.037).sin() * 3.0).collect();
+        let qkv_bf16 = Tensor::from_vec(xv, (total, 3, h, d), &cuda)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let qkv_var = Var::from_tensor(&qkv_bf16).unwrap();
+        let period_base = *lengths.iter().max().unwrap();
+        let (cos_base, sin_base) = rope_base_table(period_base, d, &cuda);
+        let cfg = VarlenConfig {
+            softmax_scale: 1.0 / (d as f32).sqrt(),
+            window: None,
+            deterministic: true,
+        };
+
+        let qkv_rot_a = crate::ops::rope_positions::rope_positions_fused_ragged(
+            qkv_var.as_tensor(),
+            &cos_base,
+            &sin_base,
+            &lengths,
+            false,
+        )
+        .unwrap();
+        let cu_seqlens_a = CuSeqlens::from_lengths(&lengths, &dev).unwrap();
+        let o_a = flash_attention_varlen(&qkv_rot_a, &cu_seqlens_a, &cfg).unwrap();
+
+        let o_b = flash_attention_varlen_with_rope_ragged(
+            qkv_var.as_tensor(),
+            &cos_base,
+            &sin_base,
+            &lengths,
+            &cfg,
+        )
+        .unwrap();
+
+        let o_a_v = to_f32_vec(&o_a);
+        let o_b_v = to_f32_vec(&o_b);
+        assert!(
+            o_a_v.iter().chain(o_b_v.iter()).all(|v| v.is_finite()),
+            "forward outputs must be finite before comparing"
+        );
+        assert_eq!(
+            o_a_v, o_b_v,
+            "flash_attention_varlen_with_rope_ragged's forward output must be bit-identical to \
+             the two-op composition it replaces, lengths={lengths:?}"
+        );
+
+        let loss_a = o_a
+            .to_dtype(DType::F32)
+            .unwrap()
+            .sqr()
+            .unwrap()
+            .sum_all()
+            .unwrap();
+        let loss_b = o_b
+            .to_dtype(DType::F32)
+            .unwrap()
+            .sqr()
+            .unwrap()
+            .sum_all()
+            .unwrap();
+        let grads_a = loss_a.backward().unwrap();
+        let grads_b = loss_b.backward().unwrap();
+        let dqkv_a = grads_a
+            .get(qkv_var.as_tensor())
+            .expect("path A: qkv must have a gradient");
+        let dqkv_b = grads_b
+            .get(qkv_var.as_tensor())
+            .expect("path B: qkv must have a gradient");
+        let dqkv_a_v = to_f32_vec(dqkv_a);
+        let dqkv_b_v = to_f32_vec(dqkv_b);
+        assert!(
+            dqkv_a_v
+                .iter()
+                .chain(dqkv_b_v.iter())
+                .all(|v| v.is_finite()),
+            "gradients must be finite before comparing"
+        );
+        assert_eq!(
+            dqkv_a_v, dqkv_b_v,
+            "flash_attention_varlen_with_rope_ragged's dqkv must be bit-identical to the \
+             two-op composition's own dqkv, lengths={lengths:?}"
+        );
+    }
+
+    /// DENSE INVARIANCE at the flash level (contract oracle inventory item
+    /// 3, one level up from [`crate::ops::rope_positions`]'s own): the
+    /// ragged entry at UNIFORM lengths must be bit-identical to the
+    /// existing dense entry ([`flash_attention_varlen_with_rope`]), fwd
+    /// AND bwd -- the ragged arm is a strict generalization of the
+    /// already-shipped dense flash path, not a parallel, possibly-
+    /// diverging one.
+    #[test]
+    fn fused_rope_ragged_matches_dense_entry_at_uniform_lengths_bit_identical_fwd_and_bwd_cuda() {
+        let Some(cuda) = cuda_device_or_skip(
+            "fused_rope_ragged_matches_dense_entry_at_uniform_lengths_bit_identical_fwd_and_bwd_cuda",
+        ) else {
+            return;
+        };
+        let dev = cuda.as_cuda_device().unwrap().clone();
+        let (batch, seq, h, d) = (3usize, 6usize, 2usize, HEAD_DIM);
+        let lengths = vec![seq; batch];
+        let total = batch * seq;
+        let n = total * 3 * h * d;
+        let xv: Vec<f32> = (0..n).map(|k| (k as f32 * 0.037).sin() * 3.0).collect();
+        let qkv_bf16 = Tensor::from_vec(xv, (total, 3, h, d), &cuda)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let qkv_var_dense = Var::from_tensor(&qkv_bf16).unwrap();
+        let qkv_var_ragged = Var::from_tensor(&qkv_bf16).unwrap();
+        let (cos_base, sin_base) = rope_base_table(seq, d, &cuda);
+        let cfg = VarlenConfig {
+            softmax_scale: 1.0 / (d as f32).sqrt(),
+            window: None,
+            deterministic: true,
+        };
+
+        let cu_seqlens_dense = CuSeqlens::from_lengths(&lengths, &dev).unwrap();
+        let o_dense = flash_attention_varlen_with_rope(
+            qkv_var_dense.as_tensor(),
+            &cos_base,
+            &sin_base,
+            seq,
+            &cu_seqlens_dense,
+            &cfg,
+        )
+        .unwrap();
+        let o_ragged = flash_attention_varlen_with_rope_ragged(
+            qkv_var_ragged.as_tensor(),
+            &cos_base,
+            &sin_base,
+            &lengths,
+            &cfg,
+        )
+        .unwrap();
+
+        assert_eq!(
+            to_f32_vec(&o_dense),
+            to_f32_vec(&o_ragged),
+            "the ragged entry at uniform lengths must be bit-identical to the dense entry, \
+             lengths={lengths:?}"
+        );
+
+        let loss_dense = o_dense
+            .to_dtype(DType::F32)
+            .unwrap()
+            .sqr()
+            .unwrap()
+            .sum_all()
+            .unwrap();
+        let loss_ragged = o_ragged
+            .to_dtype(DType::F32)
+            .unwrap()
+            .sqr()
+            .unwrap()
+            .sum_all()
+            .unwrap();
+        let grads_dense = loss_dense.backward().unwrap();
+        let grads_ragged = loss_ragged.backward().unwrap();
+        let dqkv_dense = grads_dense
+            .get(qkv_var_dense.as_tensor())
+            .expect("dense: qkv must have a gradient");
+        let dqkv_ragged = grads_ragged
+            .get(qkv_var_ragged.as_tensor())
+            .expect("ragged: qkv must have a gradient");
+        assert_eq!(
+            to_f32_vec(dqkv_dense),
+            to_f32_vec(dqkv_ragged),
+            "the ragged entry's dqkv at uniform lengths must be bit-identical to the dense \
+             entry's own dqkv"
+        );
+    }
+
+    /// GUARD: the ragged entry has no CPU arm -- a non-CUDA `qkv` is
+    /// refused with a typed error, not a panic or an FFI call. Runs
+    /// WITHOUT a CUDA device (the whole point of this test); still
+    /// requires the `flash-attn` feature (hence nvcc) to COMPILE, like
+    /// every test in this file.
+    #[test]
+    fn fused_rope_ragged_refuses_a_non_cuda_qkv() {
+        let cpu = Device::Cpu;
+        let (h, d) = (2usize, HEAD_DIM);
+        let qkv = Tensor::zeros((5, 3, h, d), DType::BF16, &cpu).unwrap();
+        let (cos_base, sin_base) = rope_base_table(4, d, &cpu);
+        let cfg = VarlenConfig {
+            softmax_scale: 1.0 / (d as f32).sqrt(),
+            window: None,
+            deterministic: true,
+        };
+        let err = flash_attention_varlen_with_rope_ragged(&qkv, &cos_base, &sin_base, &[5], &cfg)
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("requires a CUDA qkv tensor"),
+            "expected the no-CPU-arm guard's message, got: {err}"
         );
     }
 }

@@ -65,8 +65,13 @@ Every `*.json` directly under `ci/artifacts/pod-build-timings/` must carry:
       shallow checkout, never N misleading per-file findings.
 
 Run: `python3 ci/scripts/check_pod_build_timings.py`
-Self-test (RED cases for every rule above, on a throwaway `git init`'d
-fixture repo — never the real checkout):
+Self-test (RED cases for every rule above — every required field's own
+typing, both halves of the null/documented-null split, the four-value
+byte_equal_state vocabulary, a top-level-non-object payload, a JSON parse
+error, an unreadable/non-UTF-8 file, ancestry against a REAL non-ancestor
+commit plus a merge-reachable-only positive control, and the shallow-
+checkout guard — on a throwaway `git init`'d fixture repo with an actual
+branch/merge history, never the real checkout):
 `python3 ci/scripts/check_pod_build_timings.py --self-test`
 Hermetic: reads the working tree (or an ephemeral tempdir git repo under
 `--self-test`) and shells out only to `git`; no network, no cargo, no GPU.
@@ -253,7 +258,17 @@ def run_gate(timings_dir: Path, repo_root: Path) -> list[str]:
     for f in files:
         relpath = f.relative_to(timings_dir).as_posix()
         try:
-            data = json.loads(f.read_text(encoding="utf-8"))
+            text = f.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as e:
+            # A NAMED finding, never an uncaught traceback: a file that
+            # cannot even be READ (permissions, a binary/non-UTF-8 byte
+            # sequence) is exactly as fail-closed as a JSON parse error
+            # below — this gate's whole job is to never let an uncomputable
+            # artifact read as "nothing to report".
+            all_failures.append(f"{relpath}: could not read file: {e}")
+            continue
+        try:
+            data = json.loads(text)
         except json.JSONDecodeError as e:
             all_failures.append(f"{relpath}: JSON parse error: {e}")
             continue
@@ -317,15 +332,58 @@ GOOD_ARTIFACT: dict = {
 }
 
 
-def _write_fixture_repo(tmp: Path) -> str:
-    _run(["git", "init", "-q"], tmp)
+def _write_ancestry_fixture_repo(tmp: Path) -> dict[str, str]:
+    """A richer fixture than a single linear commit, so the ancestry rule's
+    own RED/GREEN legs exercise REAL git objects rather than a fabricated
+    sha (advisory: a nonexistent 40-hex sha proves only "unknown object",
+    never "a real commit that genuinely is not an ancestor"). Builds:
+
+        c1 (root) -- c2 (main) -------- m1 (HEAD, merge commit)
+          \\                            /
+           side (s1, NEVER merged)   feature (f1)
+
+    `m1` (HEAD) has two parents: `c2` and `f1`. `s1` is a real, valid
+    commit object that is NOT reachable from `m1` at all (a genuine
+    non-ancestor, never merged into anything) — the RED case. `f1` is
+    reachable from `m1` ONLY through the merge's second parent, never
+    through a linear walk of `main` alone — the merge-commit-reachable-only
+    POSITIVE control, proving `git merge-base --is-ancestor` (and therefore
+    this gate) correctly credits ancestry through a merge, not just a
+    straight line.
+    """
+    # `-b main`: pins the initial branch name explicitly rather than relying
+    # on the host's own `init.defaultBranch` (which is "main" on some
+    # installs, "master" on older/unconfigured ones) — this fixture's later
+    # `git checkout -q main` needs the name to be deterministic.
+    _run(["git", "init", "-q", "-b", "main"], tmp)
     _run(["git", "config", "user.email", "test@example.com"], tmp)
     _run(["git", "config", "user.name", "Test"], tmp)
-    (tmp / "README.md").write_text("fixture\n", encoding="utf-8")
+    (tmp / "README.md").write_text("root\n", encoding="utf-8")
     _run(["git", "add", "README.md"], tmp)
-    _run(["git", "commit", "-q", "-m", "init"], tmp)
-    sha = _run(["git", "rev-parse", "HEAD"], tmp).stdout.strip()
-    return sha
+    _run(["git", "commit", "-q", "-m", "c1 (root)"], tmp)
+
+    _run(["git", "checkout", "-q", "-b", "side"], tmp)
+    (tmp / "side.txt").write_text("side\n", encoding="utf-8")
+    _run(["git", "add", "side.txt"], tmp)
+    _run(["git", "commit", "-q", "-m", "s1 (side, never merged)"], tmp)
+    side_sha = _run(["git", "rev-parse", "HEAD"], tmp).stdout.strip()
+
+    _run(["git", "checkout", "-q", "main"], tmp)
+    (tmp / "main2.txt").write_text("main2\n", encoding="utf-8")
+    _run(["git", "add", "main2.txt"], tmp)
+    _run(["git", "commit", "-q", "-m", "c2 (main)"], tmp)
+
+    _run(["git", "checkout", "-q", "-b", "feature"], tmp)
+    (tmp / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _run(["git", "add", "feature.txt"], tmp)
+    _run(["git", "commit", "-q", "-m", "f1 (feature)"], tmp)
+    feature_sha = _run(["git", "rev-parse", "HEAD"], tmp).stdout.strip()
+
+    _run(["git", "checkout", "-q", "main"], tmp)
+    _run(["git", "merge", "-q", "--no-ff", "-m", "m1 (merge feature into main)", "feature"], tmp)
+    head_sha = _run(["git", "rev-parse", "HEAD"], tmp).stdout.strip()
+
+    return {"head": head_sha, "non_ancestor": side_sha, "merge_reachable_only": feature_sha}
 
 
 def self_test() -> int:
@@ -333,7 +391,7 @@ def self_test() -> int:
 
     with tempfile.TemporaryDirectory() as td:
         repo_root = Path(td)
-        real_sha = _write_fixture_repo(repo_root)
+        shas = _write_ancestry_fixture_repo(repo_root)
         timings_dir = repo_root / "ci" / "artifacts" / "pod-build-timings"
         timings_dir.mkdir(parents=True)
 
@@ -342,7 +400,7 @@ def self_test() -> int:
 
         def good() -> dict:
             d = json.loads(json.dumps(GOOD_ARTIFACT))
-            d["git_sha"] = real_sha
+            d["git_sha"] = shas["head"]
             return d
 
         # --- control: the good fixture itself must pass clean -------------
@@ -361,6 +419,28 @@ def self_test() -> int:
             failures.append(f"self-test FAILED: missing `box` field not caught: {got}")
         (timings_dir / "missing-field.json").unlink()
 
+        # --- top-level JSON value is not an object --------------------------
+        (timings_dir / "not-an-object.json").write_text(json.dumps([1, 2, 3]), encoding="utf-8")
+        got = run_gate(timings_dir, repo_root)
+        if not any("not-an-object.json" in g and "not an object" in g for g in got):
+            failures.append(f"self-test FAILED: a top-level JSON array (not an object) not caught: {got}")
+        (timings_dir / "not-an-object.json").unlink()
+
+        # --- JSON parse error -------------------------------------------------
+        (timings_dir / "bad-json.json").write_text("{not valid json", encoding="utf-8")
+        got = run_gate(timings_dir, repo_root)
+        if not any("bad-json.json" in g and "JSON parse error" in g for g in got):
+            failures.append(f"self-test FAILED: a JSON parse error not caught: {got}")
+        (timings_dir / "bad-json.json").unlink()
+
+        # --- could not read file (invalid UTF-8) — a NAMED finding, never an
+        # uncaught traceback (advisory) --------------------------------------
+        (timings_dir / "bad-encoding.json").write_bytes(b"\xff\xfe\x00not utf-8")
+        got = run_gate(timings_dir, repo_root)
+        if not any("bad-encoding.json" in g and "could not read file" in g for g in got):
+            failures.append(f"self-test FAILED: an unreadable/non-UTF-8 file did not produce a named finding: {got}")
+        (timings_dir / "bad-encoding.json").unlink()
+
         # --- bad git_sha (malformed) ----------------------------------------
         d = good()
         d["git_sha"] = "not-a-real-sha"
@@ -370,14 +450,85 @@ def self_test() -> int:
             failures.append(f"self-test FAILED: malformed git_sha not caught: {got}")
         (timings_dir / "bad-sha-shape.json").unlink()
 
-        # --- bad git_sha (well-formed but not an ancestor) -------------------
+        # --- bad git_sha (a REAL commit that genuinely is not an ancestor) ---
+        # A fabricated 40-hex sha (the OLD form of this leg) only proves
+        # "unknown object" — indistinguishable from a typo. `non_ancestor`
+        # is a real, valid commit object in THIS fixture repo that was
+        # deliberately never merged into anything, so this proves the rule
+        # actually walks history, not merely that `git` rejects a sha it has
+        # never heard of.
         d = good()
-        d["git_sha"] = "a" * 40
+        d["git_sha"] = shas["non_ancestor"]
         write("bad-sha-ancestry.json", d)
         got = run_gate(timings_dir, repo_root)
         if not any("not an ancestor of HEAD" in g for g in got):
-            failures.append(f"self-test FAILED: non-ancestor git_sha not caught: {got}")
+            failures.append(f"self-test FAILED: a REAL non-ancestor git_sha not caught: {got}")
         (timings_dir / "bad-sha-ancestry.json").unlink()
+
+        # --- positive control: a sha reachable ONLY through a merge --------
+        # `merge_reachable_only` is not on `main`'s own first-parent line at
+        # all — it is `feature`'s tip, reachable from HEAD only via the
+        # merge commit's SECOND parent. Must PASS, proving ancestry credit
+        # flows through a merge and this gate is not silently linear-only.
+        d = good()
+        d["git_sha"] = shas["merge_reachable_only"]
+        write("merge-reachable-control.json", d)
+        got = run_gate(timings_dir, repo_root)
+        if got:
+            failures.append(
+                f"self-test FAILED: a sha reachable ONLY through a merge commit was flagged as a "
+                f"non-ancestor (ancestry-through-merge is broken): {got}"
+            )
+        (timings_dir / "merge-reachable-control.json").unlink()
+
+        # --- unknown schema_version (well-typed int, not in KNOWN_SCHEMA_VERSIONS) --
+        d = good()
+        d["schema_version"] = 999
+        write("unknown-schema-version.json", d)
+        got = run_gate(timings_dir, repo_root)
+        if not any("schema_version" in g and "not a known version" in g for g in got):
+            failures.append(f"self-test FAILED: an unknown schema_version not caught: {got}")
+        (timings_dir / "unknown-schema-version.json").unlink()
+
+        # --- seed_tuples not a list -------------------------------------------
+        d = good()
+        d["seed_tuples"] = "T1,T2"
+        write("seed-tuples-not-list.json", d)
+        got = run_gate(timings_dir, repo_root)
+        if not any("seed_tuples" in g and "must be a list" in g for g in got):
+            failures.append(f"self-test FAILED: seed_tuples not a list not caught: {got}")
+        (timings_dir / "seed-tuples-not-list.json").unlink()
+
+        # --- measurements not an object ---------------------------------------
+        d = good()
+        d["measurements"] = "not an object"
+        write("measurements-not-object.json", d)
+        got = run_gate(timings_dir, repo_root)
+        if not any("measurements" in g and "must be an object" in g for g in got):
+            failures.append(f"self-test FAILED: measurements not an object not caught: {got}")
+        (timings_dir / "measurements-not-object.json").unlink()
+
+        # --- fa2_ran / fa2_reason typing ---------------------------------------
+        d = good()
+        d["measurements"]["fa2_ran"] = "yes"  # must be a bool
+        d["measurements"]["fa2_reason"] = ""  # must be non-empty
+        write("fa2-typing.json", d)
+        got = run_gate(timings_dir, repo_root)
+        if not (
+            any("fa2_ran" in g and "must be a bool" in g for g in got)
+            and any("fa2_reason" in g and "non-empty" in g for g in got)
+        ):
+            failures.append(f"self-test FAILED: fa2_ran/fa2_reason typing not caught: {got}")
+        (timings_dir / "fa2-typing.json").unlink()
+
+        # --- a bool where an int is required (bool IS an int in Python) --------
+        d = good()
+        d["measurements"]["copy_wall_s"] = True
+        write("wall-field-is-bool.json", d)
+        got = run_gate(timings_dir, repo_root)
+        if not any("copy_wall_s" in g and "non-negative int" in g for g in got):
+            failures.append(f"self-test FAILED: a bool value on a wall field (isinstance(True, int) is True in Python) not caught: {got}")
+        (timings_dir / "wall-field-is-bool.json").unlink()
 
         # --- negative wall value ---------------------------------------------
         d = good()
@@ -471,8 +622,13 @@ def self_test() -> int:
             print(f"  - {f}", file=sys.stderr)
         return 1
     print(
-        "pod-build-timings self-test: OK — schema/typing (incl. documented-null), byte_equal_state "
-        "vocabulary, lock_held, ts shape, ancestry, and the shallow-checkout guard all bite."
+        "pod-build-timings self-test: OK — every rule bites: schema_version (incl. an unknown-but-"
+        "well-typed version), box/git_sha-shape/ts-shape, lock_held, seed_tuples-not-a-list, "
+        "measurements-not-an-object, fa2_ran/fa2_reason typing, a bool on a wall field, "
+        "documented/undocumented null, byte_equal_state vocabulary, top-level-not-an-object, a JSON "
+        "parse error, an unreadable/non-UTF-8 file (a named finding, never a traceback), ancestry "
+        "against a REAL non-ancestor commit plus a merge-reachable-only positive control, and the "
+        "shallow-checkout guard."
     )
     return 0
 

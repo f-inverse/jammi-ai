@@ -481,6 +481,12 @@ fi
 # shellcheck source=ci/scripts/runpod_lib.sh
 source "$DIR/runpod_lib.sh"
 
+# Validated BEFORE any path derives from it or any remote heredoc could
+# embed it (round-N audit: the injection class `wait-job`'s own new heredoc
+# site joins — see rp_tree_name_check's own doc). The default "jammi-ai"
+# passes trivially; only a caller-supplied --tree can fail this.
+RP_TREE_CHECK_VALUE="$TREE" rp_tree_name_check || exit 2
+
 # Resolved once, here, so every verb below (attach/run/logs/push/pull/target)
 # reads the SAME directories for the SAME --tree value — the one place
 # TREE -> path resolution happens on the laptop side (rp_tree_dir/
@@ -714,39 +720,50 @@ case "$CMD" in
     [ $# -gt 0 ] || { echo "run: need a command"; exit 2; }
     require_pod; rp_keep
     JOB="$*"
+    # A per-run token, generated HERE (locally, before anything is sent to
+    # the pod) — carried into the completion marker purely for a human
+    # reading it directly; wait-job's own correctness never depends on
+    # matching it (see rp_job_wrapper_with_marker_lines's own doc for why
+    # the remove-then-rewrite-under-session-liveness discipline already
+    # suffices). `$$` + `$RANDOM` alongside the timestamp keeps two `run`s
+    # issued in the same wall-clock second from sharing a token.
+    RUN_TOKEN="$(date -u +%Y%m%dT%H%M%SZ)-$$-${RANDOM}"
     # Per-tree job script/log (round-4/5 finding: a global /root/job.sh +
     # /root/jammi.log meant `run --tree b` clobbered tree a's still-running
     # job) — `=`-anchored tmux target (M6), `remain-on-exit off` so a job
     # that exits leaves its output visible in `logs`/`attach` rather than the
     # pane vanishing before either can read it.
     #
-    # `--timing`: the launcher's OWN command line acquires the shared timing
-    # lock BEFORE the job script runs, INSIDE the detached pane (M6) — never
-    # in the (short-lived) ssh invocation that starts tmux and returns
-    # immediately, which would release the lock the instant IT exits, not
-    # when the real job does. `-n -E 75`: refuse instantly rather than queue,
-    # since a human `run --timing` conflicting with another timing-sensitive
-    # run should be told NOW, not block silently.
+    # `--timing`'s own flock acquisition now happens INSIDE the generated
+    # `.jammi-job.sh` (rp_job_wrapper_with_marker_lines, runpod_lib.sh) —
+    # still essentially the first thing the detached pane's own script does
+    # (M6's own reasoning: never in the short-lived ssh invocation that
+    # starts tmux and returns immediately, which would release the lock the
+    # instant IT exits, not when the real job does) — rather than split
+    # across an outer `flock -n -E 75 ... bash job.sh` command line, so a
+    # lock refusal and the job's own real exit code can never collide on the
+    # same literal value (round-N audit finding B3). LAUNCH is now the SAME
+    # shape either way: redirection (`>`), not a `| tee` pipe, for BOTH —
+    # the wrapper's own marker write is what wait-job reads now, so there is
+    # no need to preserve `flock`'s outer exit code through the pane's own
+    # command anymore either.
     if [ "$TIMING" = "1" ]; then
-      # Redirection (`>`), not a `| tee` pipe: a pipe would make the PANE's
-      # own exit status `tee`'s (near-always 0), masking flock's own exit 75
-      # refusal from anything reading the pane/log afterward. Output still
-      # lands in .jammi.log; it is simply not tailed live via tee.
-      LAUNCH="flock -n -E 75 /root/.jammi-timing.lock bash '${TREE_DIR}'/.jammi-job.sh > '${TREE_DIR}'/.jammi.log 2>&1"
+      LAUNCH="bash '${TREE_DIR}'/.jammi-job.sh > '${TREE_DIR}'/.jammi.log 2>&1"
     else
       LAUNCH="bash '${TREE_DIR}'/.jammi-job.sh 2>&1 | tee '${TREE_DIR}'/.jammi.log"
     fi
     rp_run_remote <<EOF
 set -uo pipefail
 cat > '${TREE_DIR}'/.jammi-job.sh <<'JOBEOF'
-$(rp_job_wrapper_lines "$TREE_DIR" "$TARGET_DIR" "$JOB")
+$(rp_job_wrapper_with_marker_lines "$TREE_DIR" "$TARGET_DIR" "$JOB" "$RUN_TOKEN" "$TIMING")
 JOBEOF
 tmux kill-session -t "=${TMUX_SESSION}" 2>/dev/null # tripwire-ok: idempotent best-effort cleanup of a session that may legitimately not exist yet (first `run` for this tree/session) — the new-session command right below is unconditional
 tmux new-session -d -s "${TMUX_SESSION}" "${LAUNCH}"
 tmux set-option -w -t "=${TMUX_SESSION}:" remain-on-exit off
-echo "started (tree=${TREE}, timing-locked=${TIMING}): ${JOB}"
+echo "started (tree=${TREE}, timing-locked=${TIMING}, token=${RUN_TOKEN}): ${JOB}"
 EOF
-    echo "=== detached. follow with: $(basename "$0") logs ${SESSION} --tree ${TREE} ==="
+    echo "=== detached. follow with: $(basename "$0") logs ${SESSION} --tree ${TREE}"
+    echo "=== or block for it: $(basename "$0") wait-job ${SESSION} --tree ${TREE} ==="
     ;;
 
   logs)
@@ -762,57 +779,21 @@ EOF
     # own doc in runpod_lib.sh) makes them different signals; this script's
     # only job is to name the three states the seed itself can be in.
     require_pod; rp_keep
-    SEED_WAIT_SCRIPT="$(cat <<'SCRIPT'
-if [ -f /root/.jammi-seed.jammi-seed-complete ]; then
-  echo "seed complete: $(cat /root/.jammi-seed.jammi-seed-complete)"
-  exit 0
-fi
-if [ -f /root/.jammi-seed.jammi-seed-failed ]; then
-  echo "seed FAILED -- tail:"
-  tail -n 20 /root/.jammi-seed.jammi-seed-failed
-  exit 1
-fi
-# tripwire-ok: REMOTE script text -- "no such session" is a real, valid
-# state (checked explicitly by the if/then below), never a silent pass.
-if tmux has-session -t "=jammi-seed" 2>/dev/null; then
-  echo "seed still building (tmux session jammi-seed alive)"
-  exit 2
-fi
-echo "no seed evidence: no completion/failure marker and no running tmux session 'jammi-seed' -- did up/shell ever start one?"
-exit 1
-SCRIPT
-)"
+    SEED_WAIT_SCRIPT="$(rp_seed_wait_script)"
     rp_wait_poll "seed(${SESSION})" "$SEED_WAIT_SCRIPT" "$WAIT_INTERVAL_S" "$WAIT_TIMEOUT_S" "$WAIT_MAX_FAIL"
     exit $?
     ;;
 
   wait-job)
-    # Blocks until <tree>'s detached `run` job ends. `run` has no
-    # cross-invocation exit-code marker of its own (unlike the seed's
-    # completion/failure markers), so "success" here means "the job's tmux
-    # session ended AND the tree's own .jammi.log exists" — real evidence
-    # the job ran to completion; inspect the log (or the exit code the job
-    # itself wrote, if the caller's own command does) for its pass/fail
-    # verdict. A tree with neither a live session nor ANY log is treated as
-    # "no evidence this job ever ran" — a real, named failure, never a
-    # silent indefinite wait.
+    # Blocks until <tree>'s detached `run` job ends, reading the per-run
+    # completion marker `run` itself writes (rp_job_wrapper_with_marker_lines,
+    # runpod_lib.sh) — succeeding only on a real rc=0, naming a real job
+    # failure and a refused-timing-lock (rc=75) distinctly, and reporting
+    # "no evidence this job ever ran" when neither a live session nor a
+    # marker exists (round-N audit finding B3 — see rp_job_wait_script's
+    # own doc for why a bare "does a log file exist" check was not enough).
     require_pod; rp_keep
-    JOB_WAIT_SCRIPT="$(cat <<EOF
-# tripwire-ok: REMOTE script text -- "no such session" is a real, valid
-# state (checked explicitly by the if/then below), never a silent pass.
-if tmux has-session -t "=${TMUX_SESSION}" 2>/dev/null; then
-  echo "job still running (tmux session ${TMUX_SESSION} alive)"
-  exit 2
-fi
-if [ -f "${TREE_DIR}/.jammi.log" ]; then
-  echo "job finished (tmux session ${TMUX_SESSION} ended) -- tail of ${TREE_DIR}/.jammi.log:"
-  tail -n 20 "${TREE_DIR}/.jammi.log"
-  exit 0
-fi
-echo "no job evidence for tree '${TREE}': no live tmux session '${TMUX_SESSION}' and no ${TREE_DIR}/.jammi.log -- run \`gpu-dev.sh run\` first"
-exit 1
-EOF
-)"
+    JOB_WAIT_SCRIPT="$(rp_job_wait_script "$TREE_DIR" "$TMUX_SESSION" "$TREE")"
     rp_wait_poll "job(${SESSION}:${TREE})" "$JOB_WAIT_SCRIPT" "$WAIT_INTERVAL_S" "$WAIT_TIMEOUT_S" "$WAIT_MAX_FAIL"
     exit $?
     ;;

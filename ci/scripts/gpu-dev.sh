@@ -135,8 +135,8 @@ Env: RUNPOD_API_KEY (or ~/.config/runpod/key), RP_IMAGE,
      (base) + S_src + S_seed + N*S_clone (one clone per tree this pod hosts);
      the S_src/S_seed/S_clone byte counts are MEASURED by
      ci/scripts/perf/pod_build_timings.sh (A2), not guessed — see
-     docs/maintainer/dev-gpu.md, which marks them "pending" until that has
-     run and its JSON is committed. Add 3 GB per OTHER concurrent agent target
+     docs/maintainer/dev-gpu.md, which cites the committed JSON under
+     ci/artifacts/pod-build-timings/ (src/seed/clone ≈ 3.6/7.8/8.1 GB). Add 3 GB per OTHER concurrent agent target
      dir + 2 GB per `cargo mutants` job — a mutation-testing session wants
      >= 120 GB (RP_DISK_GB=150).
 USAGE

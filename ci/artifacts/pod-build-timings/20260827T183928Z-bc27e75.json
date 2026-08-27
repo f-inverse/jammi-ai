@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "box": "a100-sxm4 pod 8o3oirn8w6ur05 (A100-SXM4-80GB, driver 570.172.08, secure cloud)",
+  "git_sha": "bc27e75290ce7c6da950c17caf7819db9a13ab6a",
+  "fa2_tip_ref": "bc27e75290ce7c6da950c17caf7819db9a13ab6a",
+  "ts": "2026-08-27T18:39:28Z",
+  "lock_held": true,
+  "measurements": {
+    "clone_build_wall_s": 69,
+    "cold_build_wall_s": 243,
+    "flash_attn_leg_wall_s": 122,
+    "fa2_ran": true,
+    "fa2_reason": "declared (cargo metadata) and built (resolved sha bc27e75290ce7c6da950c17caf7819db9a13ab6a matches JAMMI_MAIN_SHA override)",
+    "copy_wall_s": 2,
+    "reflink": "attempted (auto; may have fallen back \u2014 see du vs du --apparent-size above)",
+    "S_src_bytes": 3552665600,
+    "S_seed_bytes": 7775764480,
+    "S_clone_bytes": 8149614592
+  },
+  "clone_features": "cuda",
+  "cold_features": "cuda",
+  "fa2_features": "cuda,jammi-kernels/flash-attn",
+  "seed_tuples": [
+    "T1",
+    "T2",
+    "T3",
+    "T1b"
+  ],
+  "seed_t1b_flash_attn_ran": true,
+  "seed_t1b_flash_attn_reason": "declared (cargo metadata) and built (resolved sha matches origin/main)",
+  "recompiled_units": [
+    "jammi-ai",
+    "jammi-bench",
+    "jammi-db",
+    "jammi-encoders",
+    "jammi-kernels",
+    "jammi-lora",
+    "jammi-numerics",
+    "jammi-wire"
+  ],
+  "byte_equal_clone_vs_cold": false,
+  "byte_equal_state": "false",
+  "clone_file_count": 35,
+  "cold_file_count": 35,
+  "clone_path_set_sha256": "d6d006460bff79b899b5885b2d6ebc83735995375502c5779fa5c8b81a651fe9",
+  "cold_path_set_sha256": "d6d006460bff79b899b5885b2d6ebc83735995375502c5779fa5c8b81a651fe9",
+  "byte_equal_diff": "22,35c22,35\n< release/deps/libjammi_ai-faf0958936ac5440.rlib\t3aabb2902c28afc855b0c1657ecb35a927b53bf364708628b19c40128b7249c4\n< release/deps/libjammi_ai-faf0958936ac5440.rmeta\td129841de95455e70d087959d238c6a4f47b6cbcddfa2922a9bac43e61c6e405\n< release/deps/libjammi_db-b43cabe6fbbe6e53.rlib\t7686175967dafbab6bc37f0ad56c985a638a53a60961cf799e349b7f7e6ab55b\n< release/deps/libjammi_db-b43cabe6fbbe6e53.rmeta\t3e995097b57254737558ffbffd4d6a90e08e945a6bace1a3f543f1adb85b0124\n< release/deps/libjammi_encoders-ead9b57188fa854f.rlib\t7491e02399c42ade50fad1a1d262a7cd1f7b9c2542a1e50ef389e05075317133\n< release/deps/libjammi_encoders-ead9b57188fa854f.rmeta\t59ac9ffbbf9a1d00894b7243d82c5affda7bd66bc10a7751fe427e88c93c0fb8\n< release/deps/libjammi_kernels-f07797463e8b765b.rlib\td8b636affc2ed1b00133d85461d8e14f777a4f4e263905f7334e2dcd3d2beb61\n< release/deps/libjammi_kernels-f07797463e8b765b.rmeta\t4f140b38e6492c1a0693baaf9ddd59c23d890cd19d28669dccf21594b507c02d\n< release/deps/libjammi_lora-e538e68821a44187.rlib\ta1171ee3fe72ee88a3fae0ae7a1e09f028cec7e6cedb7b84653efe6fd4c994f8\n< release/deps/libjammi_lora-e538e68821a44187.rmeta\t2280d7e622feef617c2a5403f9acc83471fc09912e1a5c9aa571bdd79e97ba34\n< release/deps/libjammi_numerics-6178e340660d6f19.rlib\tafc42b1397070f655701e696fcde1d2119ce3ae252297ddf1e5d9532c221a403\n< release/deps/libjammi_numerics-6178e340660d6f19.rmeta\t3cb4837c6b8497c998acf967aa7366c0adf58f855728888adea8427b644c895a\n< release/deps/libjammi_wire-19a44149b00f9671.rlib\tbfb24d0dcd5bd785682ffc33c027eceafe208abb654befa1dbf95645d02e9580\n< release/deps/libjammi_wire-19a44149b00f9671.rmeta\t6de47a172202f47eaf56f0e171dac1ee1494aed539addf1a078339598ff42c32\n---\n> release/deps/libjammi_ai-faf0958936ac5440.rlib\tb5644491566f5df72ed7cefab715656ac17b38ce69bb209a0104a20db5be8185\n> release/deps/libjammi_ai-faf0958936ac5440.rmeta\t6042f5f288e0d32f990daf56e34969f4c117d4517dbbf125081e08089b485e6b\n> release/deps/libjammi_db-b43cabe6fbbe6e53.rlib\t306940c2752816ae85617d296a3b6177f33abe454db9124e956c4845ec401d23\n> release/deps/libjammi_db-b43cabe6fbbe6e53.rmeta\td636820a50ab8abede6078928088c560873e164c3ed0c448290464e6043aad65\n> release/deps/libjammi_encoders-ead9b57188fa854f.rlib\t95752b358431e073b8fb46c403d6866e31436bdfd8f72095da7aff817aa9f5a1\n> release/deps/libjammi_encoders-ead9b57188fa854f.rmeta\taf7cfcdd276da852a843634dc5b1568dc5920353980624657de9d6904f7b65ac\n> release/deps/libjammi_kernels-f07797463e8b765b.rlib\tb46d185cb7f565b25d5e116569ecfedda0b258f3ac83bf1739a494d6e874e2a9\n> release/deps/libjammi_kernels-f07797463e8b765b.rmeta\tac46704e997068b55fe351423ee829317606597c27b123bbf76efd2aa3787565\n> release/deps/libjammi_lora-e538e68821a44187.rlib\t1fb259c930a1be7906086f5811613ed1097658494d98f0a9b9661c7b846981d3\n> release/deps/libjammi_lora-e538e68821a44187.rmeta\td27d70fc3c5e125bc075ab5a8d3d6de74e31e2248e1a0fb5cd33923be792eae3\n> release/deps/libjammi_numerics-6178e340660d6f19.rlib\tf6a6817f690e7a69da4f87231db601476b6133fad3532c79295a034459732646\n> release/deps/libjammi_numerics-6178e340660d6f19.rmeta\t2581505fcda98a43b8afdb27b2283b9500890397f477f7f86546d04d1e9aa894\n> release/deps/libjammi_wire-19a44149b00f9671.rlib\td3bc649faeab5303c09f2e6348e07a85800c2e682eafdf9b364ff4d34468b5f5\n> release/deps/libjammi_wire-19a44149b00f9671.rmeta\t8e0dc301dc5d5540ef5eac5d52d8b220e7e2b5a98802a1590be9eed07b068f24",
+  "byte_equal_scope": {
+    "compared": [
+      "release/*.ptx",
+      "release/**/libjammi_*.rlib",
+      "release/**/libjammi_*.rmeta"
+    ],
+    "excluded": [
+      "release/jammi-bench: thinlto-local-symbol-nondeterminism (mold 2.35.1 / clang 21 \u2014 differs between two builds of the identical tree on the same box)"
+    ]
+  },
+  "sccache_note": "wrapper is off (CARGO_BUILD_RUSTC_WRAPPER=); sccache --show-stats before/after recorded verbatim below \u2014 expect identical (0 additional requests) since rustc never invoked it",
+  "sccache_before": "Compile requests                      0\nCompile requests executed             0\nCache hits                            0\nCache misses                          0\nCache hits rate                       -\nCache timeouts                        0\nCache read errors                     0\nForced recaches                       0\nCache write errors                    0\nCache errors                          0\nCompilations                          0\nCompilation failures                  0\nNon-cacheable compilations            0\nNon-cacheable calls                   0\nNon-compilation calls                 0\nUnsupported compiler calls            0\nAverage cache write               0.000 s\nAverage compiler                  0.000 s\nAverage cache read hit            0.000 s\nFailed distributed compilations       0\nCache location                  Local disk: \"/root/.cache/sccache\"\nBase directories                (none)\nUse direct/preprocessor mode?   yes\nVersion (client)                0.14.0\nMax cache size                       10 GiB",
+  "sccache_after": "Compile requests                      0\nCompile requests executed             0\nCache hits                            0\nCache misses                          0\nCache hits rate                       -\nCache timeouts                        0\nCache read errors                     0\nForced recaches                       0\nCache write errors                    0\nCache errors                          0\nCompilations                          0\nCompilation failures                  0\nNon-cacheable compilations            0\nNon-cacheable calls                   0\nNon-compilation calls                 0\nUnsupported compiler calls            0\nAverage cache write               0.000 s\nAverage compiler                  0.000 s\nAverage cache read hit            0.000 s\nFailed distributed compilations       0\nCache location                  Local disk: \"/root/.cache/sccache\"\nBase directories                (none)\nUse direct/preprocessor mode?   yes\nVersion (client)                0.14.0\nMax cache size                       10 GiB"
+}

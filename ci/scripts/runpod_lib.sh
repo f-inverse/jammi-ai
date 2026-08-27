@@ -62,9 +62,9 @@
 #                 on a user action — see docs/maintainer/dev-gpu.md) lands. The
 #                 S_src/S_seed/S_clone byte counts are MEASURED, not guessed —
 #                 see ci/scripts/perf/pod_build_timings.sh (A2) for the
-#                 producer; until that has run and committed its JSON, this
-#                 formula's S values are "pending" (cite ledger rows 1/17 for
-#                 wall-clock context only). Add 3 GB per OTHER concurrent agent
+#                 producer; the committed JSON under
+#                 ci/artifacts/pod-build-timings/ is the citable record
+#                 (dev-gpu.md quotes its S values and walls). Add 3 GB per OTHER concurrent agent
 #                 CARGO_TARGET_DIR sharing this pod and 2 GB per `cargo mutants
 #                 -j N` job (COPY MODE makes one full workspace+target copy per
 #                 job — standing clause 1 REQUIRES COPY MODE, never

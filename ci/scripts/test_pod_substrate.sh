@@ -2769,6 +2769,500 @@ DRV
   rm -rf "$V_NOTOOLS_BIN" "$V_REPO1" "$V_EMPTYREPO" "$V_SRC_REPO" "$V_CLONE1" "$V_CLONE2" "$V_PUSH_REVERTED_DIR"
 }
 
+# ═════════════════════════════════════════════════════════════════════════
+# (w/esc-050) escape esc-050-seed-t1b-fresh-main-clone-cutlass-unprovisioned
+# — the tree-provenance fixture class this suite never had: a REAL git
+# clone whose HEAD == its origin/main (the ONLY provenance that runs T1b —
+# rp_bootstrap's `git clone`, which never inits submodules), carrying the
+# crates/jammi-kernels/third_party/cutlass GITLINK with the submodule NOT
+# initialized (include/ absent). Hermetic: local repos only, no network,
+# no cargo. The leg drives ONLY the T1b provisioning hunk's own REAL bytes
+# (pod_seed_target.sh's `cutlass_inc=` block, sed-extracted by anchor —
+# never a re-implementation in the test body, the anti-pattern esc-044
+# recorded). Fixture non-vacuity is asserted BEFORE the run, exactly as the
+# row's control demands (git-repo AND HEAD==origin/main AND include/
+# absent — else the leg aborts INVALID and drives nothing). GREEN: with the
+# fix present the arm runs `git submodule update --init --force --checkout
+# --depth 1` and include/ exists at the pinned commit afterwards.
+# revert-RED: the SAME hunk with the update command neutered in a SCRATCH
+# COPY (the suite's established scratch-copy pattern) leaves include/
+# absent on the same provenance — the fix is load-bearing (pre-fix, T1b
+# then dies in build.rs's 'CUTLASS submodule is not checked out' panic; the
+# cargo half of that chain is the live fix-verifier's job, out of scope for
+# a no-cargo suite). Half-deleted state (the a100.2 live finding):
+# submodule initialized, then worktree contents removed while the metadata
+# still claims the pinned commit — plain `git submodule update --init
+# --depth 1` exits 0 leaving include/ absent (proving --force --checkout
+# is load-bearing), while the fixed hunk restores it. Audit round-2
+# extensions: the predicate-mismatch state (include/ present, cutlass.h
+# absent — the file-level guard re-provisions, the old dir-exists guard
+# skips), the guard lattice's two remaining arms (idempotence on a
+# provisioned tree; non-git skip), and the tarball golden from the row's
+# notes (cargo package --list: no cutlass, no artifacts/, license trio
+# present).
+{
+  SEED_TARGET_SH="$REPO_ROOT/ci/scripts/pod_seed_target.sh"
+  W_ROOT="$SANDBOX/w_esc050"
+  rm -rf "$W_ROOT"; mkdir -p "$W_ROOT"
+  w_git() { git -c protocol.file.allow=always -c init.defaultBranch=main "$@"; }
+
+  # A local "cutlass upstream" with an include/ dir in its tree.
+  W_UPSTREAM="$W_ROOT/cutlass-upstream"
+  w_git init -q "$W_UPSTREAM"
+  w_git -C "$W_UPSTREAM" config user.email t@t; w_git -C "$W_UPSTREAM" config user.name t
+  mkdir -p "$W_UPSTREAM/include/cutlass"
+  echo 'cutlass.h' > "$W_UPSTREAM/include/cutlass/cutlass.h"
+  w_git -C "$W_UPSTREAM" add include
+  w_git -C "$W_UPSTREAM" commit -q -m v1
+  W_PIN_SHA="$(w_git -C "$W_UPSTREAM" rev-parse HEAD)"
+
+  # The superproject pinning the gitlink; then a BARE "origin" and fresh
+  # clones FROM it — so origin/main genuinely RESOLVES in each clone and
+  # HEAD == origin/main by construction (rp_bootstrap's own provenance),
+  # never a repo where origin/main is empty and T1b's gate silently skips.
+  W_SUPER="$W_ROOT/super"
+  w_git init -q "$W_SUPER"
+  w_git -C "$W_SUPER" config user.email t@t; w_git -C "$W_SUPER" config user.name t
+  mkdir -p "$W_SUPER/crates/jammi-kernels/third_party"
+  # tripwire-ok: submodule-add progress chatter only; a genuine add failure
+  # surfaces as a missing gitlink in the non-vacuity assertion below, which
+  # aborts the leg INVALID — never a silent pass.
+  w_git -C "$W_SUPER" submodule add -q "$W_UPSTREAM" crates/jammi-kernels/third_party/cutlass >/dev/null 2>&1
+  w_git -C "$W_SUPER" add .gitmodules crates/jammi-kernels/third_party/cutlass
+  w_git -C "$W_SUPER" commit -q -m "pin cutlass"
+  W_ORIGIN="$W_ROOT/origin.git"
+  w_git clone -q --bare "$W_SUPER" "$W_ORIGIN"
+
+  w_fresh_clone() { # $1=dest — a fresh main clone of the bare origin
+    rm -rf "$1"
+    w_git clone -q "$W_ORIGIN" "$1"
+  }
+
+  W_SUB_REL="crates/jammi-kernels/third_party/cutlass"
+  W_INC_REL="$W_SUB_REL/include"
+
+  # w_build_driver <script> <clone-dir>: sed-extract the REAL provisioning
+  # hunk (anchor: the `cutlass_inc=` assignment, through its closing
+  # 8-space `fi`) into a runnable driver — the same verbatim-extraction
+  # technique the (p2/A5) and (n/addendum EXECUTABLE) legs use.
+  w_build_driver() {
+    local script="$1" clone="$2" driver="$SANDBOX/w_driver_$$_${RANDOM}.sh"
+    local start end
+    start="$(grep -n 'cutlass_inc="crates/jammi-kernels/third_party/cutlass/include"' "$script" | head -1 | cut -d: -f1)"
+    end="$(awk -v s="$start" 'NR>s && /^        fi$/{print NR; exit}' "$script")"
+    [ -n "$start" ] && [ -n "$end" ] || return 1
+    {
+      echo '#!/usr/bin/env bash'
+      echo 'set -uo pipefail'
+      echo '# the fixture submodule is pulled over the local file transport,'
+      echo '# which git >= 2.38 blocks for submodules unless allowed:'
+      echo 'export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=protocol.file.allow GIT_CONFIG_VALUE_0=always'
+      echo "cd '$clone' || exit 9"
+      sed -n "${start},${end}p" "$script"
+      echo 'echo W_HUNK_COMPLETED'
+    } > "$driver"
+    chmod +x "$driver"
+    printf '%s' "$driver"
+  }
+
+  W_CLONE1="$W_ROOT/clone_green"
+  w_fresh_clone "$W_CLONE1"
+  W_DRIVER1="$(w_build_driver "$SEED_TARGET_SH" "$W_CLONE1")" || W_DRIVER1=""
+
+  # Fixture non-vacuity, asserted BEFORE the run (the row's control):
+  # git-repo AND HEAD==origin/main AND gitlink pinned AND include/ absent.
+  W_FIXTURE_VALID=0
+  w_head="$(w_git -C "$W_CLONE1" rev-parse HEAD)"
+  w_omain="$(w_git -C "$W_CLONE1" rev-parse --verify --quiet origin/main)"
+  w_gitlink_entry="$(w_git -C "$W_CLONE1" ls-tree HEAD -- "$W_SUB_REL")"
+  # tripwire-ok: the probe's EXIT CODE is the assertion ("is the clone a git
+  # repo at all"); a failure lands in the else-arm's INVALID abort below.
+  if git -C "$W_CLONE1" rev-parse --git-dir >/dev/null 2>&1 \
+     && [ -n "$w_head" ] && [ "$w_head" = "$w_omain" ] \
+     && printf '%s' "$w_gitlink_entry" | grep -q "^160000 commit $W_PIN_SHA" \
+     && [ ! -d "$W_CLONE1/$W_INC_REL" ] \
+     && [ -n "$W_DRIVER1" ] && bash -n "$W_DRIVER1"; then
+    W_FIXTURE_VALID=1
+    ok "(w/esc-050 fixture) non-vacuity: real git repo, HEAD==origin/main (${w_head}), gitlink pinned at ${W_PIN_SHA}, include/ absent — the exact triggering provenance, and the provisioning-hunk extraction is well-formed"
+  else
+    bad "(w/esc-050 fixture) INVALID — head=${w_head:-?} origin/main=${w_omain:-?} gitlink='${w_gitlink_entry}' include_absent=$([ ! -d "$W_CLONE1/$W_INC_REL" ] && echo yes || echo no) driver='${W_DRIVER1:-EXTRACTION FAILED}'; per the row's control the driven legs are aborted, not run against a vacuous fixture"
+  fi
+
+  if [ "$W_FIXTURE_VALID" = 1 ]; then
+    # ---- GREEN: the real hunk provisions the submodule --------------------
+    w_out="$(bash "$W_DRIVER1" 2>&1)"; w_rc=$?
+    # tripwire-ok: a failed provisioning leaves no submodule repo to query —
+    # the empty result already fails the sha assertion loudly just below.
+    w_sub_head="$(w_git -C "$W_CLONE1/$W_SUB_REL" rev-parse HEAD 2>/dev/null)"
+    if [ "$w_rc" -eq 0 ] \
+       && printf '%s' "$w_out" | grep -q 'T1b prerequisite: provisioning the CUTLASS submodule' \
+       && printf '%s' "$w_out" | grep -q 'W_HUNK_COMPLETED' \
+       && [ -f "$W_CLONE1/$W_INC_REL/cutlass/cutlass.h" ] \
+       && [ "$w_sub_head" = "$W_PIN_SHA" ]; then
+      ok "(w/esc-050 green) the REAL provisioning hunk, driven against the triggering provenance, runs 'git submodule update --init --force --checkout --depth 1' and include/ exists at the pinned commit afterwards"
+    else
+      bad "(w/esc-050 green) expected the hunk to provision include/ at ${W_PIN_SHA} (rc=$w_rc, sub_head=${w_sub_head:-none}): $w_out"
+    fi
+
+    # ---- revert-RED: the hunk with the update command neutered ------------
+    # ANCHOR COUPLING (fix-verifier advisory): a FULL `git apply -R` of the
+    # fix commit removes the whole hunk INCLUDING the `cutlass_inc=`
+    # extraction anchor, so this leg's fixture collapses to INVALID (the
+    # (w/esc-050 fixture) assertion catches the failed extraction and
+    # aborts) rather than red-ing the green leg. A maintainer doing a
+    # literal revert should use the surgical single-line neuter below (what
+    # this internal revert-RED does) to see the DISCRIMINATING failure —
+    # either way the suite goes red, but only the surgical form shows the
+    # include/-left-absent behavior itself.
+    W_REVERT_DIR="$SANDBOX/w_revert"
+    rm -rf "$W_REVERT_DIR"; mkdir -p "$W_REVERT_DIR"
+    W_REVERTED="$W_REVERT_DIR/pod_seed_target_reverted.sh"
+    cp "$SEED_TARGET_SH" "$W_REVERTED"
+    python3 - "$W_REVERTED" <<'PY'
+import sys
+p = sys.argv[1]
+t = open(p).read()
+old = "          git submodule update --init --force --checkout --depth 1 crates/jammi-kernels/third_party/cutlass || {\n"
+new = "          true || {\n"
+assert old in t, "revert fixture: could not locate the provisioning command to neuter"
+open(p, "w").write(t.replace(old, new, 1))
+PY
+    W_CLONE2="$W_ROOT/clone_revert"
+    w_fresh_clone "$W_CLONE2"
+    W_DRIVER2="$(w_build_driver "$W_REVERTED" "$W_CLONE2")" || W_DRIVER2=""
+    if [ -n "$W_DRIVER2" ] && bash -n "$W_DRIVER2" && [ ! -d "$W_CLONE2/$W_INC_REL" ]; then
+      w2_out="$(bash "$W_DRIVER2" 2>&1)"; w2_rc=$?
+      if [ "$w2_rc" -eq 0 ] && [ ! -d "$W_CLONE2/$W_INC_REL" ]; then
+        ok "(w/esc-050 revert-RED) the SAME hunk with the update command neutered in a scratch copy sails through (rc=0) leaving include/ ABSENT on the same provenance — the pre-fix silent state that then panics in build.rs, proving the provisioning fix is load-bearing"
+      else
+        bad "(w/esc-050 revert-RED) expected the neutered hunk to leave include/ absent with rc=0 (rc=$w2_rc, include_absent=$([ ! -d "$W_CLONE2/$W_INC_REL" ] && echo yes || echo no)): $w2_out"
+      fi
+    else
+      bad "(w/esc-050 revert-RED) scratch-copy fixture is broken (driver='${W_DRIVER2:-EXTRACTION FAILED}', include_absent=$([ ! -d "$W_CLONE2/$W_INC_REL" ] && echo yes || echo no))"
+    fi
+
+    # ---- half-deleted state (a100.2): --force --checkout load-bearing -----
+    W_CLONE3="$W_ROOT/clone_halfdel"
+    w_fresh_clone "$W_CLONE3"
+    W_DRIVER3="$(w_build_driver "$SEED_TARGET_SH" "$W_CLONE3")" || W_DRIVER3=""
+    w3_setup_out="$(bash "$W_DRIVER3" 2>&1)"; w3_setup_rc=$?
+    W_SUB3="$W_CLONE3/$W_SUB_REL"
+    find "$W_SUB3" -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+    # tripwire-ok: if the setup provisioning failed there is no submodule
+    # repo to query — the empty sha already fails the fixture check loudly.
+    w3_meta="$(w_git -C "$W_SUB3" rev-parse HEAD 2>/dev/null)"
+    if [ "$w3_setup_rc" -eq 0 ] && [ ! -d "$W_CLONE3/$W_INC_REL" ] \
+       && [ -e "$W_SUB3/.git" ] && [ "$w3_meta" = "$W_PIN_SHA" ]; then
+      ok "(w/esc-050 half-deleted fixture) submodule initialized, worktree contents removed, .git kept — metadata still claims the pinned commit while include/ is absent, the a100.2 live shape"
+    else
+      bad "(w/esc-050 half-deleted fixture) could not construct the half-deleted state (setup_rc=$w3_setup_rc, meta=${w3_meta:-none}): $w3_setup_out"
+    fi
+    w3_old_out="$(w_git -C "$W_CLONE3" submodule update --init --depth 1 "$W_SUB_REL" 2>&1)"; w3_old_rc=$?
+    if [ "$w3_old_rc" -eq 0 ] && [ ! -d "$W_CLONE3/$W_INC_REL" ]; then
+      ok "(w/esc-050 half-deleted RED) plain 'git submodule update --init --depth 1' exits 0 AND leaves include/ absent — a silent no-op on the half-deleted state, proving --force --checkout is load-bearing (the a100.2 live finding)"
+    else
+      bad "(w/esc-050 half-deleted RED) expected the plain update to no-op silently (rc=$w3_old_rc, include_absent=$([ ! -d "$W_CLONE3/$W_INC_REL" ] && echo yes || echo no)): $w3_old_out"
+    fi
+    w3_out="$(bash "$W_DRIVER3" 2>&1)"; w3_rc=$?
+    if [ "$w3_rc" -eq 0 ] && [ -f "$W_CLONE3/$W_INC_REL/cutlass/cutlass.h" ]; then
+      ok "(w/esc-050 half-deleted green) the fixed hunk (--force --checkout) restores include/ on the SAME half-deleted state the plain update just no-opped on"
+    else
+      bad "(w/esc-050 half-deleted green) expected the fixed hunk to restore include/ (rc=$w3_rc): $w3_out"
+    fi
+
+    # ---- predicate mismatch (audit BLOCK): the guard is BUILD.RS'S OWN
+    # predicate (include/cutlass/cutlass.h, a FILE), never the coarser
+    # dir-exists check — the state the two differ on: include/ EXISTS but
+    # cutlass/cutlass.h is gone (interrupted checkout, partial copy). The
+    # fixed hunk must RE-provision; the old `[ ! -d ]` guard skips. --------
+    W_CLONE4="$W_ROOT/clone_predicate"
+    w_fresh_clone "$W_CLONE4"
+    W_DRIVER4="$(w_build_driver "$SEED_TARGET_SH" "$W_CLONE4")" || W_DRIVER4=""
+    w4_setup_out="$(bash "$W_DRIVER4" 2>&1)"; w4_setup_rc=$?
+    rm -rf "$W_CLONE4/$W_INC_REL/cutlass"
+    if [ "$w4_setup_rc" -eq 0 ] && [ -d "$W_CLONE4/$W_INC_REL" ] \
+       && [ ! -f "$W_CLONE4/$W_INC_REL/cutlass/cutlass.h" ]; then
+      ok "(w/esc-050 predicate fixture) include/ EXISTS while include/cutlass/cutlass.h is absent — the state a dir-exists guard cannot distinguish from provisioned"
+    else
+      bad "(w/esc-050 predicate fixture) could not construct the include-present/header-absent state (setup_rc=$w4_setup_rc): $w4_setup_out"
+    fi
+    w4_out="$(bash "$W_DRIVER4" 2>&1)"; w4_rc=$?
+    if [ "$w4_rc" -eq 0 ] && [ -f "$W_CLONE4/$W_INC_REL/cutlass/cutlass.h" ] \
+       && printf '%s' "$w4_out" | grep -q 'T1b prerequisite: provisioning the CUTLASS submodule'; then
+      ok "(w/esc-050 predicate green) the file-level guard fires on the include-present/header-absent state and RE-provisions — cutlass.h restored"
+    else
+      bad "(w/esc-050 predicate green) expected the fixed hunk to re-provision cutlass.h (rc=$w4_rc): $w4_out"
+    fi
+    # revert-RED: the guard mutated BACK to the old dir-exists form in a
+    # scratch copy skips the SAME state — the file-level predicate is
+    # load-bearing, not cosmetic.
+    W_GUARD_REVERTED="$W_REVERT_DIR/pod_seed_target_dirguard.sh"
+    cp "$SEED_TARGET_SH" "$W_GUARD_REVERTED"
+    python3 - "$W_GUARD_REVERTED" <<'PY'
+import sys
+p = sys.argv[1]
+t = open(p).read()
+old = '[ ! -f "$cutlass_inc/cutlass/cutlass.h" ]'
+new = '[ ! -d "$cutlass_inc" ]'
+assert old in t, "guard-revert fixture: could not locate the file-level guard to coarsen"
+open(p, "w").write(t.replace(old, new, 1))
+PY
+    rm -rf "$W_CLONE4/$W_INC_REL/cutlass"
+    W_DRIVER4R="$(w_build_driver "$W_GUARD_REVERTED" "$W_CLONE4")" || W_DRIVER4R=""
+    if [ -n "$W_DRIVER4R" ] && bash -n "$W_DRIVER4R"; then
+      w4r_out="$(bash "$W_DRIVER4R" 2>&1)"; w4r_rc=$?
+      if [ "$w4r_rc" -eq 0 ] && [ ! -f "$W_CLONE4/$W_INC_REL/cutlass/cutlass.h" ] \
+         && ! printf '%s' "$w4r_out" | grep -q 'T1b prerequisite: provisioning the CUTLASS submodule'; then
+        ok "(w/esc-050 predicate revert-RED) the OLD dir-exists guard, restored in a scratch copy, SKIPS the same include-present/header-absent state (no provisioning banner, cutlass.h stays absent) — the file-level predicate is load-bearing"
+      else
+        bad "(w/esc-050 predicate revert-RED) expected the coarsened guard to skip (rc=$w4r_rc, header_absent=$([ ! -f "$W_CLONE4/$W_INC_REL/cutlass/cutlass.h" ] && echo yes || echo no)): $w4r_out"
+      fi
+    else
+      bad "(w/esc-050 predicate revert-RED) guard-reverted scratch fixture is broken (driver='${W_DRIVER4R:-EXTRACTION FAILED}')"
+    fi
+
+    # ---- lattice completion: the two remaining guard arms -----------------
+    # (a) idempotence: clone1 is fully provisioned by the green leg above —
+    # a second run must SKIP (no banner), rc=0, content and pinned sha
+    # intact.
+    w5_out="$(bash "$W_DRIVER1" 2>&1)"; w5_rc=$?
+    # tripwire-ok: same post-state query as the green leg's — an empty sha
+    # already fails the assertion loudly below.
+    w5_sub_head="$(w_git -C "$W_CLONE1/$W_SUB_REL" rev-parse HEAD 2>/dev/null)"
+    if [ "$w5_rc" -eq 0 ] && [ -f "$W_CLONE1/$W_INC_REL/cutlass/cutlass.h" ] \
+       && [ "$w5_sub_head" = "$W_PIN_SHA" ] \
+       && ! printf '%s' "$w5_out" | grep -q 'T1b prerequisite: provisioning the CUTLASS submodule'; then
+      ok "(w/esc-050 idempotence) a second run on the fully-provisioned clone SKIPS (no provisioning banner), rc=0, cutlass.h present, submodule still at the pinned sha"
+    else
+      bad "(w/esc-050 idempotence) expected a clean skip on an already-provisioned clone (rc=$w5_rc, sub_head=${w5_sub_head:-none}): $w5_out"
+    fi
+    # (b) non-git skip: a plain directory (no .git anywhere up-tree —
+    # $SANDBOX lives under mktemp) with the cutlass path but no include/ —
+    # the hunk must SKIP with rc=0 and leave include/ absent (the loud
+    # failure on this arm is build.rs's own panic, out of a no-cargo
+    # suite's scope; only the skip is asserted).
+    W_PLAIN="$W_ROOT/plain_nongit"
+    rm -rf "$W_PLAIN"; mkdir -p "$W_PLAIN/$W_SUB_REL"
+    W_DRIVER6="$(w_build_driver "$SEED_TARGET_SH" "$W_PLAIN")" || W_DRIVER6=""
+    if [ -n "$W_DRIVER6" ] && bash -n "$W_DRIVER6"; then
+      w6_out="$(bash "$W_DRIVER6" 2>&1)"; w6_rc=$?
+      if [ "$w6_rc" -eq 0 ] && [ ! -d "$W_PLAIN/$W_INC_REL" ] \
+         && ! printf '%s' "$w6_out" | grep -q 'T1b prerequisite: provisioning the CUTLASS submodule'; then
+        ok "(w/esc-050 non-git skip) a plain non-git tree with include/ absent is SKIPPED (rc=0, no banner, include/ still absent) — build.rs, not the hunk, owns the loud failure on that arm"
+      else
+        bad "(w/esc-050 non-git skip) expected the hunk to skip a non-git tree (rc=$w6_rc, include_absent=$([ ! -d "$W_PLAIN/$W_INC_REL" ] && echo yes || echo no)): $w6_out"
+      fi
+    else
+      bad "(w/esc-050 non-git skip) non-git driver fixture is broken (driver='${W_DRIVER6:-EXTRACTION FAILED}')"
+    fi
+  fi
+
+  # ---- tarball golden (esc-050 notes, THIRD SURFACE of the same class):
+  # the crates.io jammi-kernels tarball must ship WITHOUT CUTLASS (a
+  # publish checkout has no submodules — a registry consumer enabling
+  # flash-attn hits build.rs's refusal, resolved as documentation +
+  # Cargo.toml include list) and WITHOUT the committed cuda-runs evidence
+  # artifacts, while the vendored flash-attention subtree's
+  # license/provenance trio IS present. `cargo package --list` resolves
+  # from the warm local registry (no build, no network on a fetched
+  # workspace); a genuinely network-needing failure skips LOUDLY with the
+  # named reason, never silently. Not gated on W_FIXTURE_VALID — this
+  # surface is independent of the sandbox git fixture.
+  W_PKG_LIST="$SANDBOX/w_pkg_list.txt"
+  W_PKG_ERR="$SANDBOX/w_pkg_err.txt"
+  ( cd "$REPO_ROOT" && cargo package --list -p jammi-kernels --allow-dirty ) > "$W_PKG_LIST" 2>"$W_PKG_ERR"
+  w_pkg_rc=$?
+  if [ "$w_pkg_rc" -ne 0 ] && grep -qiE 'network|download|dns|could not connect|failed to fetch|updating.*index|update.*registry' "$W_PKG_ERR"; then
+    skip "(w/esc-050 tarball-golden) cargo package --list needs network in this environment (rc=$w_pkg_rc: $(head -1 "$W_PKG_ERR")) — the golden runs wherever the registry index is warm; skipping LOUDLY, never silently"
+  elif [ "$w_pkg_rc" -ne 0 ]; then
+    bad "(w/esc-050 tarball-golden) cargo package --list failed for a NON-network reason (rc=$w_pkg_rc): $(cat "$W_PKG_ERR")"
+  elif [ ! -s "$W_PKG_LIST" ]; then
+    bad "(w/esc-050 tarball-golden) cargo package --list produced EMPTY output — an empty tarball listing is a FAIL, never a vacuous pass"
+  else
+    w_pkg_paths="$(wc -l < "$W_PKG_LIST" | tr -d ' ')"
+    w_cutlass_count="$(grep -c '^third_party/cutlass/' "$W_PKG_LIST")"
+    w_artifacts_count="$(grep -c '^artifacts/' "$W_PKG_LIST")"
+    if [ "$w_cutlass_count" -eq 0 ] && [ "$w_artifacts_count" -eq 0 ] \
+       && grep -qx 'third_party/flash-attention/LICENSE' "$W_PKG_LIST" \
+       && grep -qx 'third_party/flash-attention/AUTHORS' "$W_PKG_LIST" \
+       && grep -qx 'third_party/flash-attention/VENDORED.md' "$W_PKG_LIST"; then
+      ok "(w/esc-050 tarball-golden) cargo package --list (${w_pkg_paths} paths): zero third_party/cutlass/ paths, zero artifacts/ paths, and the flash-attention LICENSE/AUTHORS/VENDORED.md trio present"
+    else
+      bad "(w/esc-050 tarball-golden) tarball contents drifted (paths=${w_pkg_paths}, cutlass=${w_cutlass_count}, artifacts=${w_artifacts_count}, trio=$(grep -cxE 'third_party/flash-attention/(LICENSE|AUTHORS|VENDORED\.md)' "$W_PKG_LIST")/3)"
+    fi
+  fi
+}
+
+# ═════════════════════════════════════════════════════════════════════════
+# (x/esc-051) escape esc-051-seed-t3-clippy-tuple-twin-off-merge-path — the
+# hermetic controls a no-CUDA host can run (the row's own live oracle, the
+# dead_code diagnostic naming all three symbols under `--features cuda`,
+# needs a real CUDA toolchain and is the live fix-verifier's job):
+#   (i)  a STRUCTURAL assertion that the four items in
+#        crates/jammi-kernels/tests/cuda_parity.rs (FlashUpstreamMeasurement
+#        struct AND its impl, max_abs_diff_finite_first, FlashFixtureKind)
+#        each carry an ADJACENT `#[cfg(feature = "flash-attn")]` — walked
+#        up through the contiguous attribute/doc block above each item
+#        definition, never a mere file-wide grep count (which four gates
+#        ANYWHERE in a 8000-line file would satisfy vacuously). An
+#        empty/ambiguous definition match set is itself a FAIL. revert-RED:
+#        stripping ONE gate in a scratch copy is caught by the same scanner.
+#   (ii) the tuple-lockstep spec's SEED-SIDE half: the exact T3 command
+#        line parsed out of pod_seed_target.sh must be character-for-
+#        character `cargo clippy -p jammi-kernels --all-targets --features
+#        cuda -- -D warnings` — RED on zero extracted tuples (empty match
+#        set must fail, per the row), RED on any drift; exact-tuple string
+#        equality, never substring, so `cuda,flash-attn` can never satisfy
+#        `cuda`. Honest residual (the row's other half, NOT covered here):
+#        merge-path REACHABILITY of a blocking twin (ci.yml vs the
+#        gpu-prove.yml-only runpod_gpu_prove.sh:56 twin) is a workflow
+#        property outside this suite's pod-substrate scope.
+{
+  SEED_TARGET_SH="$REPO_ROOT/ci/scripts/pod_seed_target.sh"
+  CUDA_PARITY_RS="$REPO_ROOT/crates/jammi-kernels/tests/cuda_parity.rs"
+
+  # ---- (i) structural cfg-gate scanner ------------------------------------
+  X_SCANNER="$SANDBOX/x_cfg_gate_scanner.py"
+  cat > "$X_SCANNER" <<'PYEOF'
+import re, sys
+
+path = sys.argv[1]
+lines = open(path, encoding="utf-8").read().splitlines()
+
+ITEMS = [
+    ("struct FlashUpstreamMeasurement", re.compile(r'^struct FlashUpstreamMeasurement\b')),
+    ("impl FlashUpstreamMeasurement", re.compile(r'^impl FlashUpstreamMeasurement\b')),
+    ("fn max_abs_diff_finite_first", re.compile(r'^fn max_abs_diff_finite_first\b')),
+    ("enum FlashFixtureKind", re.compile(r'^enum FlashFixtureKind\b')),
+]
+CFG = re.compile(r'^#\[cfg\(feature\s*=\s*"flash-attn"\)\]$')
+
+def gated(idx):
+    # Walk UP through the CONTIGUOUS attribute/doc-comment block immediately
+    # above the item definition: the gate must be ADJACENT to the item.
+    # A blank line or any code line ends the walk — a gate elsewhere in the
+    # file never counts.
+    j = idx - 1
+    while j >= 0:
+        s = lines[j].strip()
+        if CFG.match(s):
+            return True
+        if s.startswith("#[") or s.startswith("//"):
+            j -= 1
+            continue
+        return False
+    return False
+
+bad = []
+for name, pat in ITEMS:
+    hits = [i for i, l in enumerate(lines) if pat.match(l)]
+    if len(hits) != 1:
+        bad.append("%s: expected exactly 1 definition, found %d -- an empty or ambiguous match set is a FAIL, never a pass" % (name, len(hits)))
+        continue
+    if not gated(hits[0]):
+        bad.append('%s (line %d): no ADJACENT #[cfg(feature = "flash-attn")] gate' % (name, hits[0] + 1))
+
+if bad:
+    print("UNGATED:")
+    for b in bad:
+        print(b)
+    sys.exit(1)
+print("all four items carry an adjacent flash-attn cfg gate")
+PYEOF
+
+  x_out="$(python3 "$X_SCANNER" "$CUDA_PARITY_RS" 2>&1)"; x_rc=$?
+  if [ "$x_rc" -eq 0 ]; then
+    ok "(x/esc-051 cfg-gates) all four cuda_parity.rs items (FlashUpstreamMeasurement struct+impl, max_abs_diff_finite_first, FlashFixtureKind) carry an ADJACENT #[cfg(feature = \"flash-attn\")] — structurally matched, not a file-wide grep count"
+  else
+    bad "(x/esc-051 cfg-gates) $x_out"
+  fi
+
+  X_MUTANT_DIR="$SANDBOX/x_mutant"
+  rm -rf "$X_MUTANT_DIR"; mkdir -p "$X_MUTANT_DIR"
+  X_MUTANT="$X_MUTANT_DIR/cuda_parity_stripped.rs"
+  cp "$CUDA_PARITY_RS" "$X_MUTANT"
+  python3 - "$X_MUTANT" <<'PY'
+import re, sys
+p = sys.argv[1]
+lines = open(p).readlines()
+def_idx = next(i for i, l in enumerate(lines) if l.startswith("fn max_abs_diff_finite_first"))
+cfg = re.compile(r'^#\[cfg\(feature\s*=\s*"flash-attn"\)\]\s*$')
+target = None
+j = def_idx - 1
+while j >= 0:
+    s = lines[j].strip()
+    if cfg.match(s):
+        target = j
+        break
+    if s.startswith("#[") or s.startswith("//"):
+        j -= 1
+        continue
+    break
+assert target is not None, "mutation fixture: no adjacent cfg gate found to strip"
+del lines[target]
+open(p, "w").writelines(lines)
+PY
+  x_mut_out="$(python3 "$X_SCANNER" "$X_MUTANT" 2>&1)"; x_mut_rc=$?
+  if [ "$x_mut_rc" -ne 0 ] && printf '%s' "$x_mut_out" | grep -q 'max_abs_diff_finite_first'; then
+    ok "(x/esc-051 cfg-gates revert-RED) stripping ONE gate (max_abs_diff_finite_first's) in a scratch copy is caught by the SAME scanner, naming the item — the scanner is load-bearing, not vacuous"
+  else
+    bad "(x/esc-051 cfg-gates revert-RED) expected the scanner to catch the stripped gate (rc=$x_mut_rc): $x_mut_out"
+  fi
+
+  # ---- (ii) T3 tuple lockstep, seed-side half -----------------------------
+  X_T3_EXPECTED='cargo clippy -p jammi-kernels --all-targets --features cuda -- -D warnings'
+  x_check_t3_lockstep() { # $1=script -> 0 iff >=1 extracted non-comment clippy tuple AND every one is character-for-character the expected tuple
+    local extracted
+    extracted="$(grep -vE '^[[:space:]]*#' "$1" | grep -F 'cargo clippy' | sed -e 's/^[[:space:]]*//' -e 's/ || exit 1$//')"
+    if [ -z "$extracted" ]; then
+      echo "zero extracted clippy tuples (empty match set)"
+      return 1
+    fi
+    local bad_tuple=0 line
+    while IFS= read -r line; do
+      if [ "$line" != "$X_T3_EXPECTED" ]; then
+        echo "tuple drift: extracted '$line' != expected '$X_T3_EXPECTED'"
+        bad_tuple=1
+      fi
+    done <<< "$extracted"
+    return "$bad_tuple"
+  }
+
+  x_t3_out="$(x_check_t3_lockstep "$SEED_TARGET_SH")"; x_t3_rc=$?
+  if [ "$x_t3_rc" -eq 0 ]; then
+    ok "(x/esc-051 t3-lockstep) pod_seed_target.sh's T3 command line is character-for-character '${X_T3_EXPECTED}' — the seed-side half of the tuple-lockstep spec"
+  else
+    bad "(x/esc-051 t3-lockstep) $x_t3_out"
+  fi
+
+  X_NOCLIPPY="$SANDBOX/x_noclippy_fixture.sh"
+  printf '#!/usr/bin/env bash\necho "no clippy invocation anywhere in this file"\n' > "$X_NOCLIPPY"
+  x_empty_out="$(x_check_t3_lockstep "$X_NOCLIPPY")"; x_empty_rc=$?
+  if [ "$x_empty_rc" -ne 0 ] && printf '%s' "$x_empty_out" | grep -q 'empty match set'; then
+    ok "(x/esc-051 t3-lockstep empty-RED) a source with ZERO extractable clippy tuples fails the check (empty-match-set must fail, per the row) — never a vacuous pass"
+  else
+    bad "(x/esc-051 t3-lockstep empty-RED) expected the empty-match-set to fail (rc=$x_empty_rc): $x_empty_out"
+  fi
+
+  X_T3_MUTANT="$X_MUTANT_DIR/pod_seed_target_t3_drift.sh"
+  cp "$SEED_TARGET_SH" "$X_T3_MUTANT"
+  python3 - "$X_T3_MUTANT" <<'PY'
+import sys
+p = sys.argv[1]
+t = open(p).read()
+old = "    cargo clippy -p jammi-kernels --all-targets --features cuda -- -D warnings || exit 1\n"
+new = "    cargo clippy -p jammi-kernels --all-targets --features cuda,flash-attn -- -D warnings || exit 1\n"
+assert old in t, "drift fixture: could not locate the T3 line to mutate"
+open(p, "w").write(t.replace(old, new, 1))
+PY
+  x_drift_out="$(x_check_t3_lockstep "$X_T3_MUTANT")"; x_drift_rc=$?
+  if [ "$x_drift_rc" -ne 0 ] && printf '%s' "$x_drift_out" | grep -q 'cuda,flash-attn'; then
+    ok "(x/esc-051 t3-lockstep drift-RED) mutating the T3 line to '--features cuda,flash-attn' in a scratch copy is caught — exact-tuple match, never substring: cuda,flash-attn does NOT satisfy cuda"
+  else
+    bad "(x/esc-051 t3-lockstep drift-RED) expected the mutated tuple to fail the exact-match check (rc=$x_drift_rc): $x_drift_out"
+  fi
+}
+
 echo
 echo "test_pod_substrate: ${PASS} passed, ${FAIL} failed, ${SKIP} skipped"
 [ "$FAIL" -eq 0 ]

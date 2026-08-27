@@ -4,12 +4,44 @@ description = "Candle CustomOp scaffolding and a feature-gated CUDA build path f
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+# third_party/flash-attention/{src,jammi,shim,LICENSE,AUTHORS,VENDORED.md}
+# is Dao-AILab's BSD-3-Clause code, vendored (not re-licensed); the crate's
+# own code stays Apache-2.0. Cargo has no per-subtree license field, so the
+# mix is surfaced two ways: (1) the crate-level `license` stays Apache-2.0
+# (accurate for the code jammi-ai wrote) and the vendored subtree's own
+# LICENSE/AUTHORS travel WITH it in the published tarball via the `include`
+# list below (never `exclude` them — that would strip attribution while
+# still shipping the kernels built from that source); (2) this note plus
+# the one-line pointer in src/lib.rs's crate doc name the exception for
+# anyone auditing the published crate. See
+# third_party/flash-attention/VENDORED.md for the full provenance.
 license.workspace = true
 repository.workspace = true
 keywords = ["candle", "cuda", "custom-op", "fused-kernel", "autodiff"]
 categories = ["science"]
 readme = "README.md"
 build = "build.rs"
+# Deterministic tarball contents. Without this list, `cargo package` ships
+# whatever happens to be on the publishing checkout's disk — including the
+# CUTLASS submodule when checked out (tens of MB, its own BSD-3 license,
+# and never intended to publish) and the committed cuda-runs evidence
+# artifacts. third_party/cutlass is a git submodule, NOT vendored into the
+# published tarball at all: `flash-attn` is not a publishable-from-crates.io
+# feature today (build.rs refuses, loudly, without the submodule checked
+# out — build from the git repo for FA2); if that ever changes, CUTLASS's
+# own BSD-3 license needs the same treatment as the flash-attention
+# subtree's.
+include = [
+    "/src/**",
+    "/build.rs",
+    "/README.md",
+    "/third_party/flash-attention/src/**",
+    "/third_party/flash-attention/jammi/**",
+    "/third_party/flash-attention/shim/**",
+    "/third_party/flash-attention/LICENSE",
+    "/third_party/flash-attention/AUTHORS",
+    "/third_party/flash-attention/VENDORED.md",
+]
 
 [dependencies]
 candle-core.workspace = true

@@ -11,12 +11,12 @@ on:
   # the dispatch ON the `v*` tag (the publish step is tag-guarded; it also
   # no-ops if the version is already on npm). A branch dispatch is a
   # build-and-test dry run.
+  # No `version` input: `npm publish` publishes whatever package.json says,
+  # so an input could only key the idempotence probe on a DIFFERENT version
+  # than the one being published — a stale input would read "already on npm"
+  # and skip the real publish, green. The probe below is keyed on
+  # package.json directly; the tag-vs-package.json verify step pins the rest.
   workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to (re)publish, e.g. 0.13.0. Defaults to the pushed tag."
-        required: false
-        type: string
 
 concurrency:
   group: release-npm
@@ -103,10 +103,10 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
           set -euo pipefail
-          # Derive the version from the tag (v0.13.0 -> 0.13.0); a dispatch
-          # run on the tag may override via the input.
-          VERSION="${{ github.event.inputs.version }}"
-          VERSION="${VERSION:-${GITHUB_REF_NAME#v}}"
+          # Key the idempotence probe on the SAME quantity `npm publish`
+          # publishes — package.json's version (the verify step above pins
+          # it to the tag). Any other key could skip a real publish green.
+          VERSION="$(node -p "require('./package.json').version")"
           # Skip if this version is already on npm (idempotent re-run); `npm view`
           # exits non-zero when the exact version does not exist yet.
           if npm view "@f-inverse/jammi-client@${VERSION}" version >/dev/null 2>&1; then

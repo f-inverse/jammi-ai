@@ -15,13 +15,15 @@ name: Release Binaries
 # The same GPU build also ships as the `jammi-ai-server-cu12` container image
 # (`server-image.yml`) and the `jammi-server-cu12` PyPI wheel (`pypi-server-cuda.yml`).
 #
-# `workflow_dispatch` has two modes, keyed on the `release_tag` input:
-#   - empty (the default): every job is a no-release branch exercise — assets are
-#     uploaded as workflow artifacts only; no release is touched.
-#   - set to a tag (e.g. `v0.26.1`): every job uploads its asset to that existing
-#     release, identical to a tag push. This recovers a release whose assets are
-#     missing (e.g. a leg that failed its upload) by rebuilding in the same
-#     manylinux/macOS runners and re-attaching, without re-cutting the tag.
+# `workflow_dispatch` has two modes, keyed on the REF the dispatch runs on:
+#   - a branch: every job is a no-release exercise — assets are uploaded as
+#     workflow artifacts only; no release is touched.
+#   - the `v*` tag itself: identical to the tag push — every job rebuilds from
+#     the tag's own commit and re-attaches its asset to that release (the CUDA
+#     leg re-proves on the A100 first). This recovers a release whose assets
+#     are missing without re-cutting the tag, and an asset attached to release
+#     vX is thereby always built from vX's commit — a caller-chosen branch tip
+#     can never be promoted onto a release.
 # On a `v*` tag push the assets always go to the release named by the tag.
 #
 # The release these assets attach to is created idempotently by whichever leg
@@ -36,12 +38,9 @@ name: Release Binaries
 on:
   push:
     tags: ["v*"]
+  # No inputs: run the dispatch ON the `v*` tag to re-attach assets to that
+  # release; run it on a branch for an artifacts-only exercise.
   workflow_dispatch:
-    inputs:
-      release_tag:
-        description: "Existing release tag to upload assets to (e.g. v0.26.1). Leave empty to produce workflow artifacts only."
-        required: false
-        default: ""
 
 concurrency:
   group: release-binaries-${{ github.ref }}
@@ -129,13 +128,12 @@ jobs:
         shell: bash
         run: bash ci/scripts/package_release_bin.sh jammi "${{ matrix.target }}"
 
-      # Release attach (tag push / dispatch-with-tag) or workflow-artifact
-      # upload (no-tag dispatch) — the shared release-upload action decides
-      # which, and owns the idempotent `gh release create` + bounded retry.
+      # Release attach (any `v*` tag ref) or workflow-artifact upload (branch
+      # dispatch) — the shared release-upload action decides which, and owns
+      # the idempotent `gh release create` + bounded retry.
       - uses: ./.github/actions/release-upload
         with:
           asset: ${{ steps.package.outputs.asset }}
-          release-tag: ${{ inputs.release_tag }}
 
   # ---- CPU jammi-server tarball ----
   # Mirrors the CPU `jammi` CLI job above: x86_64-linux, built in the CI base
@@ -164,13 +162,12 @@ jobs:
         shell: bash
         run: bash ci/scripts/package_release_bin.sh jammi-server x86_64-unknown-linux-gnu
 
-      # Release attach (tag push / dispatch-with-tag) or workflow-artifact
-      # upload (no-tag dispatch) — the shared release-upload action decides
-      # which, and owns the idempotent `gh release create` + bounded retry.
+      # Release attach (any `v*` tag ref) or workflow-artifact upload (branch
+      # dispatch) — the shared release-upload action decides which, and owns
+      # the idempotent `gh release create` + bounded retry.
       - uses: ./.github/actions/release-upload
         with:
           asset: ${{ steps.package.outputs.asset }}
-          release-tag: ${{ inputs.release_tag }}
 
   # ---- CUDA jammi-server tarball ----
   # Built in the CUDA CI base image (CUDA 12.6 toolkit). The tarball is
@@ -183,9 +180,12 @@ jobs:
   # driver. A GPU-less runner is fine — nothing runs the binary here.
   gpu-prove-cu12:
     name: GPU prove-gate (A100)
-    # Tag push only — prove the release commit on a real A100 before the CUDA
-    # tarball is uploaded to the release.
-    if: github.event_name == 'push'
+    # Any `v*` TAG ref — a tag push, or a recovery dispatch run on the tag —
+    # proves the release commit on a real A100 before the CUDA tarball is
+    # uploaded to the release. The tag guard (not an event guard) is what
+    # keeps every release-upload arm proven: an event-keyed guard would let a
+    # dispatch promote unproven.
+    if: startsWith(github.ref, 'refs/tags/v')
     uses: ./.github/workflows/_gpu-prove-gate.yml
     with:
       git_ref: ${{ github.ref_name }}
@@ -193,10 +193,12 @@ jobs:
 
   server-cu12:
     name: Build jammi-server (CUDA)
-    # build → prove → promote: on a tag push, upload only after the A100 gate
-    # passes; dispatch/dry-run builds are ungated (prove is skipped).
+    # build → prove → promote: on a `v*` tag ref (push or dispatch-on-tag),
+    # upload only after the A100 gate passes; a branch dispatch is an
+    # artifacts-only exercise (the release-upload action never touches a
+    # release from a non-tag ref) and is ungated.
     needs: [gpu-prove-cu12]
-    if: always() && (github.event_name != 'push' || needs.gpu-prove-cu12.result == 'success')
+    if: always() && (!startsWith(github.ref, 'refs/tags/v') || needs.gpu-prove-cu12.result == 'success')
     runs-on: ubuntu-latest
     container: ${{ vars.JAMMI_CI_IMAGE_CUDA || 'ghcr.io/f-inverse/jammi-ai-ci-cuda:latest' }}
     permissions:
@@ -218,7 +220,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Same parse + shape assert as package_release_bin.sh (sed echoes
+          # the line unchanged on no-substitution — a garbage asset name
+          # would upload silently).
           version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          case "$version" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::could not parse a semver workspace version out of Cargo.toml (got: '${version}')" >&2; exit 1 ;;
+          esac
           asset="jammi-server-cu12-${version}-x86_64-unknown-linux-gnu.tar.gz"
 
           stage="jammi-server-cu12"
@@ -255,10 +264,9 @@ jobs:
           tar -czf "$asset" "$stage"
           echo "asset=$asset" >> "$GITHUB_OUTPUT"
 
-      # Release attach (tag push / dispatch-with-tag) or workflow-artifact
-      # upload (no-tag dispatch) — the shared release-upload action decides
-      # which, and owns the idempotent `gh release create` + bounded retry.
+      # Release attach (any `v*` tag ref) or workflow-artifact upload (branch
+      # dispatch) — the shared release-upload action decides which, and owns
+      # the idempotent `gh release create` + bounded retry.
       - uses: ./.github/actions/release-upload
         with:
           asset: ${{ steps.package.outputs.asset }}
-          release-tag: ${{ inputs.release_tag }}

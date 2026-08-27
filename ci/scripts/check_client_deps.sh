@@ -71,13 +71,14 @@ artifacts="$(grep '"reason":"compiler-artifact"' "$json" | grep -oE '"name":"[^"
   exit 1
 }
 
-# The guard must also have SEEN the packages it is guarding: each requested
-# `-p` package must appear in the artifact stream (hyphen- or
-# underscore-normalized), or the stream is not the build set we asked for.
+# The guard must also have SEEN the packages it is guarding. Matched on
+# `manifest_path` (`…/crates/<pkg>/Cargo.toml`), NOT on target names: a
+# package's targets need not carry its name (jammi-cli's binary target is
+# renamed to `jammi`, so a target-name match would red a clean build and
+# leave the boundary assertions below unreachable).
 for arg in "${packages[@]}"; do
   [ "$arg" = "-p" ] && continue
-  pkg_re="$(printf '%s' "$arg" | sed 's/[-_]/[-_]/g')"
-  if ! printf '%s\n' "$artifacts" | grep -qiE "\"name\":\"${pkg_re}\""; then
+  if ! grep '"reason":"compiler-artifact"' "$json" | grep -qF "/${arg}/Cargo.toml"; then
     echo "::error::requested package ${arg} never appeared in the compiler-artifact stream — the guard did not observe the build it is gating" >&2
     exit 1
   fi

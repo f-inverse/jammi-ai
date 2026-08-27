@@ -103,26 +103,35 @@ jobs:
             RUNTIME_VARIANT=runtime-selfcontained
           push: "true"
 
-  # CUDA image `jammi-ai-server-cu12`: tag- and dispatch-triggered push.
-  # Builds the `runtime-cuda` stage (candle CUDA backend + NVIDIA runtime base)
-  # and pushes the same tag scheme as the CPU image. GPU runtime is not tested
-  # here (no GPU on CI runners) — the `build-cuda-pr` job below proves the
+  # CUDA image `jammi-ai-server-cu12`: pushed from `v*` tag refs only (tag
+  # push, or a recovery dispatch run on the tag), always behind the A100
+  # prove gate. Builds the `runtime-cuda` stage (candle CUDA backend + NVIDIA
+  # runtime base) and pushes the same tag scheme as the CPU image. GPU
+  # runtime is not tested on the CI runner itself — the prove gate runs the
+  # suites on a real A100; the `build-cuda-pr` job below proves the
   # Dockerfile compiles on every PR that touches it, before any tag lands.
   gpu-prove-cu12:
     name: GPU prove-gate (A100)
-    # Tag push only — prove the release commit on a real A100 before the CUDA
-    # image is promoted.
-    if: github.event_name == 'push'
+    # Any `v*` TAG ref — a tag push, or a recovery dispatch run on the tag —
+    # proves the release commit on a real A100 before the CUDA image is
+    # promoted. The tag guard (not an event guard) is what keeps every
+    # promotion arm proven: an event-keyed guard would let a dispatch push
+    # an unproven image.
+    if: startsWith(github.ref, 'refs/tags/v')
     uses: ./.github/workflows/_gpu-prove-gate.yml
     with:
       git_ref: ${{ github.ref_name }}
     secrets: inherit
 
   build-and-push-cu12:
-    # build → prove → promote: on a tag push, push only after the A100 gate
-    # passes; dispatch builds are ungated (prove is skipped).
+    # build → prove → promote: the CUDA image pushes ONLY from a proven `v*`
+    # tag ref (push, or a recovery dispatch run on the tag). A branch
+    # dispatch never pushes this image — the `latest`/semver tag scheme is a
+    # promotion, and an unproven promotion arm is exactly what the prove
+    # gate exists to make unrepresentable. (`build-cuda-pr` below keeps the
+    # Dockerfile compiling on PRs.)
     needs: [gpu-prove-cu12]
-    if: always() && github.event_name != 'pull_request' && (github.event_name != 'push' || needs.gpu-prove-cu12.result == 'success')
+    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.gpu-prove-cu12.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: read

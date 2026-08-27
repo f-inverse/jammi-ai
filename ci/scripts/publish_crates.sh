@@ -116,6 +116,17 @@ retry_transient() {
 VERSION="${INPUT_VERSION:-}"
 VERSION="${VERSION:-${GITHUB_REF_NAME#v}}"
 
+# VERSION drives the presence probes and index waits below, but `cargo
+# publish` publishes whatever the checked-out workspace says — so a VERSION
+# that disagrees with the workspace would key every idempotence probe on the
+# wrong quantity (a stale dispatch input could read "already published" and
+# skip real work, green). Refuse the mismatch instead.
+workspace_version="$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')"
+if [ -z "$workspace_version" ] || [ "$VERSION" != "$workspace_version" ]; then
+  echo "::error::VERSION '${VERSION}' (from the dispatch input or tag ref) does not match the workspace version '${workspace_version}' this checkout would publish — refusing" >&2
+  exit 1
+fi
+
 # The crates.io sparse index lags `cargo publish` by seconds-to-minutes:
 # after publishing crate X, a dependent crate Y's publish reads the index
 # to resolve `X = "=<version>"` and fails if X's new version isn't listed

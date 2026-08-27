@@ -25,10 +25,11 @@
 //! element the allowance of the largest and hides exactly the divergence
 //! you are hunting"). The auditor measured the real truth-vs-reference
 //! divergence by hand (a one-off numpy probe, against a fixture corpus
-//! since regenerated — its figures are not retained here because they no
-//! longer describe the committed fixtures; the bound below re-measures
-//! truth live every run instead) and showed the old bound was 50-100x
-//! wider than it,
+//! since regenerated — its figures, and the wideness ratio derived from
+//! them, are not retained here because they no longer describe the
+//! committed fixtures; the bound below re-measures truth live every run
+//! instead) and showed the old bound was orders of magnitude wider than
+//! the real divergence,
 //! and that `lse` (an `f32` TENSOR — never rounded to bf16 anywhere in this
 //! op's pipeline) was being bounded by a bf16 ULP fraction, a category
 //! error the guide's family-D "pin the mathematical object" principle

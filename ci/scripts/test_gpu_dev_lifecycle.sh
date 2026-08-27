@@ -1172,6 +1172,160 @@ else
 fi
 unset MOCK_DEPLOY_RESPONSE
 
+# ═════════════════════════════════════════════════════════════════════════
+# Group 7 — CLI-level: `wait-seed`/`wait-job` (the fail-open-watcher lesson).
+# `ssh` is deliberately mocked ONLY inside this group, via its own bin dir
+# prepended to PATH for these specific invocations — never added to the
+# shared $STUBBIN every other group's PATH carries, so no earlier/later
+# group's "ssh to 127.0.0.1:1 refuses instantly" assumption is disturbed.
+#
+# The stub answers CALL ORDER, not script content: response #1 always
+# services `require_pod`'s own `rp_session_alive` liveness probe (`ssh ...
+# true`), which rp_wait_poll's own polls run AFTER. Response files are
+# "<rc>\n<output...>"; a call past the last scripted response repeats it
+# (mirrors the curl stub's own _2-falls-back-to-_1 convention above).
+# ═════════════════════════════════════════════════════════════════════════
+WAITBIN="$SANDBOX/waitbin"
+mkdir -p "$WAITBIN"
+cat > "$WAITBIN/ssh" <<'STUB'
+#!/usr/bin/env bash
+cat > /dev/null   # discard the piped poll script -- the stub never reads it
+n=0
+[ -f "${MOCK_SSH_CALL_COUNTER:?MOCK_SSH_CALL_COUNTER unset}" ] && n="$(cat "$MOCK_SSH_CALL_COUNTER")"
+n=$((n + 1))
+echo "$n" > "$MOCK_SSH_CALL_COUNTER"
+dir="${MOCK_SSH_RESPONSES_DIR:?MOCK_SSH_RESPONSES_DIR unset}"
+resp="$dir/$n"
+[ -f "$resp" ] || resp="$dir/$(ls "$dir" | sort -n | tail -1)"
+rc="$(head -n1 "$resp")"
+tail -n +2 "$resp"
+exit "$rc"
+STUB
+chmod +x "$WAITBIN/ssh"
+
+# $1=dir $2=call-number $3=rc $4...=output lines
+write_ssh_resp() {
+  local dir="$1" n="$2" rc="$3"; shift 3
+  { echo "$rc"; printf '%s\n' "$@"; } > "$dir/$n"
+}
+
+# --- 7a: wait-seed SUCCESS -------------------------------------------------
+G7A_SESSION="wsA"; write_meta "$G7A_SESSION" "pod-wsA" "8"
+G7A_DIR="$SANDBOX/g7a-ssh"; mkdir -p "$G7A_DIR"
+write_ssh_resp "$G7A_DIR" 1 0                                    # require_pod liveness
+write_ssh_resp "$G7A_DIR" 2 0 "seed complete: {\"tuples\":[\"T1\"]}"  # first poll: COMPLETE
+rm -f "$SANDBOX/g7a-counter"
+MOCK_SSH_CALL_COUNTER="$SANDBOX/g7a-counter" MOCK_SSH_RESPONSES_DIR="$G7A_DIR" \
+  RP_WAIT_INTERVAL_SECS=1 \
+  PATH="$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" wait-seed "$G7A_SESSION" --timeout 10 \
+  >"$SANDBOX/out-g7a.log" 2>&1
+g7a_rc=$?
+if [ "$g7a_rc" -eq 0 ] && grep -q "SUCCESS" "$SANDBOX/out-g7a.log"; then
+  ok "wait-seed: success path exits 0 and reports SUCCESS"
+else
+  bad "wait-seed: success path expected rc=0 + SUCCESS (got rc=$g7a_rc): $(cat "$SANDBOX/out-g7a.log")"
+fi
+
+# --- 7b: wait-seed FAILURE (failure marker) --------------------------------
+G7B_SESSION="wsB"; write_meta "$G7B_SESSION" "pod-wsB" "8"
+G7B_DIR="$SANDBOX/g7b-ssh"; mkdir -p "$G7B_DIR"
+write_ssh_resp "$G7B_DIR" 1 0                                     # require_pod liveness
+write_ssh_resp "$G7B_DIR" 2 1 "seed FAILED -- nvcc fatal: out of memory"
+rm -f "$SANDBOX/g7b-counter"
+MOCK_SSH_CALL_COUNTER="$SANDBOX/g7b-counter" MOCK_SSH_RESPONSES_DIR="$G7B_DIR" \
+  RP_WAIT_INTERVAL_SECS=1 \
+  PATH="$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" wait-seed "$G7B_SESSION" --timeout 10 \
+  >"$SANDBOX/out-g7b.log" 2>&1
+g7b_rc=$?
+if [ "$g7b_rc" -ne 0 ] && grep -q "FAILURE" "$SANDBOX/out-g7b.log" && grep -q "nvcc fatal" "$SANDBOX/out-g7b.log"; then
+  ok "wait-seed: failure-marker path exits non-zero and names the failure"
+else
+  bad "wait-seed: failure-marker path expected rc!=0 + FAILURE naming nvcc (got rc=$g7b_rc): $(cat "$SANDBOX/out-g7b.log")"
+fi
+
+# --- 7c: wait-seed TRANSPORT FAILURE (the load-bearing case) --------------
+# Three consecutive unreachable polls (rc 255, ssh's own "could not connect"
+# convention) must exit loudly -- NEVER read as "still running", which is
+# exactly the silent-idle failure mode this verb replaces.
+G7C_SESSION="wsC"; write_meta "$G7C_SESSION" "pod-wsC" "8"
+G7C_DIR="$SANDBOX/g7c-ssh"; mkdir -p "$G7C_DIR"
+write_ssh_resp "$G7C_DIR" 1 0                                     # require_pod liveness
+write_ssh_resp "$G7C_DIR" 2 255 "ssh: connect to host 127.0.0.1 port 1: Connection refused"
+write_ssh_resp "$G7C_DIR" 3 255 "ssh: connect to host 127.0.0.1 port 1: Connection refused"
+write_ssh_resp "$G7C_DIR" 4 255 "ssh: connect to host 127.0.0.1 port 1: Connection refused"
+rm -f "$SANDBOX/g7c-counter"
+MOCK_SSH_CALL_COUNTER="$SANDBOX/g7c-counter" MOCK_SSH_RESPONSES_DIR="$G7C_DIR" \
+  RP_WAIT_INTERVAL_SECS=1 \
+  PATH="$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" wait-seed "$G7C_SESSION" --timeout 30 \
+  >"$SANDBOX/out-g7c.log" 2>&1
+g7c_rc=$?
+if [ "$g7c_rc" -eq 2 ] && grep -q "TRANSPORT FAILURE" "$SANDBOX/out-g7c.log" \
+  && grep -q "NOT evidence" "$SANDBOX/out-g7c.log"; then
+  ok "wait-seed: 3 consecutive unreachable polls is a LOUD transport failure (rc=2), never silent 'still running'"
+else
+  bad "wait-seed: expected rc=2 + TRANSPORT FAILURE naming the count (got rc=$g7c_rc): $(cat "$SANDBOX/out-g7c.log")"
+fi
+if [ "$(cat "$SANDBOX/g7c-counter" 2>/dev/null)" = "4" ]; then
+  ok "wait-seed: transport failure gives up after exactly RP_WAIT_MAX_TRANSPORT_FAILS(=3) consecutive misses, not before or after"
+else
+  bad "wait-seed: expected exactly 4 ssh calls (1 liveness + 3 failed polls), got $(cat "$SANDBOX/g7c-counter" 2>/dev/null)"
+fi
+
+# --- 7d: wait-job SUCCESS (tmux session ended, .jammi.log present) --------
+G7D_SESSION="wjD"; write_meta "$G7D_SESSION" "pod-wjD" "8"
+G7D_DIR="$SANDBOX/g7d-ssh"; mkdir -p "$G7D_DIR"
+write_ssh_resp "$G7D_DIR" 1 0                                     # require_pod liveness
+write_ssh_resp "$G7D_DIR" 2 0 "job finished (tmux session jammi-jammi-ai ended) -- tail:" "all tests passed"
+rm -f "$SANDBOX/g7d-counter"
+MOCK_SSH_CALL_COUNTER="$SANDBOX/g7d-counter" MOCK_SSH_RESPONSES_DIR="$G7D_DIR" \
+  RP_WAIT_INTERVAL_SECS=1 \
+  PATH="$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" wait-job "$G7D_SESSION" --timeout 10 \
+  >"$SANDBOX/out-g7d.log" 2>&1
+g7d_rc=$?
+if [ "$g7d_rc" -eq 0 ] && grep -q "SUCCESS" "$SANDBOX/out-g7d.log"; then
+  ok "wait-job: success path (tmux session ended, log present) exits 0"
+else
+  bad "wait-job: success path expected rc=0 + SUCCESS (got rc=$g7d_rc): $(cat "$SANDBOX/out-g7d.log")"
+fi
+
+# --- 7e: wait-job FAILURE (no evidence -- never ran) -----------------------
+G7E_SESSION="wjE"; write_meta "$G7E_SESSION" "pod-wjE" "8"
+G7E_DIR="$SANDBOX/g7e-ssh"; mkdir -p "$G7E_DIR"
+write_ssh_resp "$G7E_DIR" 1 0                                     # require_pod liveness
+write_ssh_resp "$G7E_DIR" 2 1 "no job evidence for tree 'jammi-ai': no live tmux session and no .jammi.log"
+rm -f "$SANDBOX/g7e-counter"
+MOCK_SSH_CALL_COUNTER="$SANDBOX/g7e-counter" MOCK_SSH_RESPONSES_DIR="$G7E_DIR" \
+  RP_WAIT_INTERVAL_SECS=1 \
+  PATH="$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" wait-job "$G7E_SESSION" --timeout 10 \
+  >"$SANDBOX/out-g7e.log" 2>&1
+g7e_rc=$?
+if [ "$g7e_rc" -ne 0 ] && grep -q "no job evidence" "$SANDBOX/out-g7e.log"; then
+  ok "wait-job: no-evidence path (never ran) exits non-zero naming it"
+else
+  bad "wait-job: expected rc!=0 + 'no job evidence' (got rc=$g7e_rc): $(cat "$SANDBOX/out-g7e.log")"
+fi
+
+# --- 7f: wait-seed/wait-job honour the SAME RP_SESSION-vs-positional
+# conflict refusal every other session verb does (never silently pick one).
+G7F_OUT="$SANDBOX/out-g7f.log"
+RP_SESSION="other-session" bash "$DIR/gpu-dev.sh" wait-seed "$G7A_SESSION" >"$G7F_OUT" 2>&1
+g7f_rc=$?
+if [ "$g7f_rc" -eq 2 ] && grep -q "conflicting session" "$G7F_OUT"; then
+  ok "wait-seed: a positional session conflicting with exported RP_SESSION REFUSES (exit 2)"
+else
+  bad "wait-seed: expected exit 2 + 'conflicting session' (got rc=$g7f_rc): $(cat "$G7F_OUT")"
+fi
+
+# --- 7g: --timeout must reject a non-positive-integer value ---------------
+G7G_OUT="$SANDBOX/out-g7g.log"
+bash "$DIR/gpu-dev.sh" wait-seed "$G7A_SESSION" --timeout notanumber >"$G7G_OUT" 2>&1
+g7g_rc=$?
+if [ "$g7g_rc" -eq 2 ] && grep -q "must be a positive integer" "$G7G_OUT"; then
+  ok "wait-seed: a non-integer --timeout is refused (exit 2), never silently defaulted"
+else
+  bad "wait-seed: expected exit 2 for --timeout notanumber (got rc=$g7g_rc): $(cat "$G7G_OUT")"
+fi
+
 # ── tally ────────────────────────────────────────────────────────────────
 while IFS=: read -r status name; do
   [ -n "$status" ] || continue

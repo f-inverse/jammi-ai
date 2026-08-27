@@ -825,6 +825,72 @@ rp_run_remote() {
     | ssh "${RP_SSHO[@]}" -p "$RP_PORT" "root@${RP_HOST}" "timeout ${RP_TIMEOUT:-3000} bash -s"
 }
 
+# Polls a live pod at a fixed interval, via a caller-supplied REMOTE check
+# script (bash source, delivered over stdin exactly like rp_run_remote —
+# never interpolated into the ssh command line, so it can contain quotes
+# freely), until the script reports a verdict or the wall-clock TIMEOUT
+# elapses. The primitive behind gpu-dev.sh's `wait-seed`/`wait-job` verbs.
+#
+# The remote script's OWN exit code is the whole contract, and only three
+# values are legitimate: 0 (success — the thing being waited on finished
+# cleanly), 1 (a NAMED failure — a failure marker, or "no evidence this ever
+# ran"), 2 ("still running, nothing to report yet — keep polling"). Every
+# OTHER exit code — ssh's own 255 on a refused/dropped connection, a timeout
+# wrapper's 124, or literally anything else, since gpu-dev.sh never hands
+# this function a script that exits any other way on purpose — is therefore
+# unambiguous: the poll could not be answered.
+#
+# LOAD-BEARING (the fail-open-watcher lesson this verb exists to close): an
+# unanswerable poll is NEVER treated as rc-2's "still running". The
+# hand-rolled watcher this replaces idled forever precisely because "no
+# evidence yet" and "could not check at all" collapsed into the same silent,
+# keep-waiting branch — a dropped SSH connection read back exactly like a
+# healthy in-progress build, forever. Here the two are different signals:
+# rc 2 resets the transport-failure counter (a real, reachable "not done
+# yet"); anything else increments it, and RP_WAIT_MAX_TRANSPORT_FAILS (a
+# caller-supplied count, never a single blip — a healthy pod can drop one
+# poll) consecutive transport failures exits LOUDLY, naming the transport
+# failure by count and last exit code, rather than continuing to poll a pod
+# that may no longer even exist.
+#
+# $1=label (for messages only) $2=remote check script $3=poll interval
+# (seconds) $4=overall timeout (seconds) $5=max consecutive transport
+# failures before giving up loudly.
+# Returns 0 (success), 1 (named failure — see the remote script's own
+# stdout/stderr for which), 2 (transport failure — too many consecutive
+# unreachable polls), 3 (timed out with no verdict either way).
+rp_wait_poll() {
+  local label="$1" script="$2" interval="$3" timeout="$4" max_fail="$5"
+  local deadline=$((SECONDS + timeout)) consec=0 out rc remaining
+  echo "=== ${label}: polling every ${interval}s, up to ${timeout}s (pod ${RP_HOST:-?}:${RP_PORT:-?}) ==="
+  while :; do
+    # `2>&1`: MERGES, never discards — a transport failure's own stderr (ssh's
+    # "Connection refused"/"Connection timed out") is exactly the evidence
+    # the loud transport-failure message below needs to be more than a bare
+    # exit code.
+    out="$(printf '%s\n' "$script" \
+      | ssh "${RP_SSHO[@]}" -p "$RP_PORT" "root@${RP_HOST}" "timeout 20 bash -s" 2>&1)"
+    rc=$?
+    case "$rc" in
+      0) echo "${out}"; echo "=== ${label}: SUCCESS ==="; return 0 ;;
+      1) echo "::error::${label}: FAILURE — ${out}"; return 1 ;;
+      2) consec=0; echo "${label}: still waiting — ${out}" ;;
+      *)
+        consec=$((consec + 1))
+        echo "::warning::${label}: poll unreachable (ssh/remote exit ${rc}) — ${consec}/${max_fail} consecutive — ${out}"
+        if [ "$consec" -ge "$max_fail" ]; then
+          echo "::error::${label}: TRANSPORT FAILURE — ${consec} consecutive unreachable polls (last exit ${rc})."
+          echo "::error::${label}: this is NOT evidence it is still running — it means the pod could not be reached. Check it directly: gpu-dev.sh ls / ssh / the RunPod console."
+          return 2
+        fi
+        ;;
+    esac
+    [ "$SECONDS" -lt "$deadline" ] || { echo "::error::${label}: timed out after ${timeout}s with no verdict"; return 3; }
+    remaining=$((deadline - SECONDS))
+    sleep "$(( remaining < interval ? remaining : interval ))"
+  done
+}
+
 # Terminate orphaned pods. The in-pod deadline is the primary guard; this is the
 # backstop for a pod whose container never got far enough to arm it, and the only
 # thing that can clean up after a runner killed during the minutes-long gap

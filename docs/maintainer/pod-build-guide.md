@@ -344,10 +344,25 @@ nondeterminism), stated rather than dropped.
 
 ## 5. Runbook C — clone and build a job
 
+**`target` clones the build-substrate SEED into a fresh `CARGO_TARGET_DIR`
+(`/root/target-<name>`) — it never creates or populates the tree/checkout
+itself.** A tree is populated ONLY by `push` (`ci/scripts/runpod_lib.sh:573-591`,
+`rp_tree_dir`'s own doc). `--with-cutlass` provisions cutlass INTO an
+already-pushed tree (`pod_provision_cutlass.sh`); against a tree that has
+never been pushed it REFUSES with the tool's own error text: `tree source dir
+'...' does not exist — push to it first` (`pod_provision_cutlass.sh:106`).
+Push before `target --with-cutlass`:
+
 ```bash
-ci/scripts/gpu-dev.sh target a100 mywork              # default tree jammi-ai
-ci/scripts/gpu-dev.sh target a100 mywork --with-cutlass
+ci/scripts/gpu-dev.sh push a100 --tree mywork         # populates /root/trees/mywork
+ci/scripts/gpu-dev.sh target a100 mywork              # clones the seed into /root/target-mywork
+ci/scripts/gpu-dev.sh target a100 mywork --with-cutlass   # ALSO requires the push above
 ```
+
+(Bare `target` without `--with-cutlass` does not itself touch
+`/root/trees/mywork` and so does not strictly require a prior `push` — but
+every other verb that acts on tree `mywork` (`run`/`attach`/`push`/`pull`)
+does, so pushing first is the ordinary flow in practice.)
 
 Under the hood this is `pod_target_clone.sh <seed-dir> <dest-dir>
 [tree-dir]` (`ci/scripts/gpu-dev.sh:709-712`), which:

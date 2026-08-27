@@ -12,7 +12,12 @@ on:
 
 concurrency:
   group: cookbook-${{ github.ref }}
-  cancel-in-progress: true
+  # Same rationale as ci.yml/swarm.yml's own concurrency blocks: a PR ref
+  # still cancels its own superseded runs, but a run ON MAIN (including the
+  # nightly schedule trigger, whose github.ref is also refs/heads/main) is
+  # evidence a closure can cite and must be allowed to finish rather than
+  # being cancelled by the next merge or the next scheduled tick.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 # Least privilege: this lane only reads the checkout; nothing publishes.
 permissions:

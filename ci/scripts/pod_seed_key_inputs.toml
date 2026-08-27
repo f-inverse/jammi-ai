@@ -190,7 +190,7 @@ notes = [
 # pod is never cross-compiling (kind is always HOST there), but TARGET_* is
 # listed too since it is the SAME mechanically-derived family, not a guess,
 # and costs nothing to allow.
-source = "cc-1.2.57/src/lib.rs:3890-3905 (target_envs/getenv_with_target_prefixes), :3926-3945 (envflags, same target_envs), :1986 (CRATE_CC_NO_DEFAULTS via get_env_boolean), src/command_helpers.rs:48,75 (CC_ENABLE_DEBUG_OUTPUT), :3951 (CC_FORCE_DISABLE via get_env_boolean) + the cc crate README's \"External configuration via environment variables\" section — reproduced live against the real a100c seed capture (scratchpad/a2-timings/80c7f59/a100c-failure/a2c.stdout)"
+source = "cc-1.2.57/src/lib.rs:3890-3905 (target_envs/getenv_with_target_prefixes), :3926-3945 (envflags, same target_envs), :1986 (CRATE_CC_NO_DEFAULTS via get_env_boolean), src/command_helpers.rs:48,75 (CC_ENABLE_DEBUG_OUTPUT), :3951 (CC_FORCE_DISABLE via get_env_boolean) + the cc crate README's \"External configuration via environment variables\" section — reproduced live against the real a100c seed capture (scratchpad/a2-timings/80c7f59/a100c-failure/a2c.stdout, a session-local capture, untracked; the vendored cc source citations are the in-tree-verifiable half)"
 inputs = [
   "CC", "CXX", "AR", "RANLIB", "CFLAGS", "CXXFLAGS", "ARFLAGS",
   "OPT_LEVEL", "DEBUG", "SDKROOT", "CRATE_CC_NO_DEFAULTS",
@@ -319,7 +319,8 @@ usearch = ["NK_DYNAMIC_DISPATCH", "NK_NATIVE_BF16", "NK_NATIVE_F16", "USEARCH_US
 # file's header "Scope note" and [cc_1_2_57]'s own citation for why the
 # STATIC scan (i)/(ii) does not walk these packages' own build.rs — the
 # entries below are read straight off the real captured seed announcement,
-# scratchpad/a2-timings/80c7f59/a100c-failure/a2c.stdout, cross-checked
+# scratchpad/a2-timings/80c7f59/a100c-failure/a2c.stdout (a session-local
+# capture, untracked), cross-checked
 # against each package's own vendored build.rs source at the pinned
 # version). CARGO_MANIFEST_LINKS (cxx, ring) is a real, distinct var from
 # the already-tracked CARGO_MANIFEST_DIR — cargo's own reflection of a

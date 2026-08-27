@@ -178,7 +178,9 @@ EXC
 # DIFFERENT manifest_sha256 values — a100c b2cb2d7a..., a100e 448cc436...
 # — while laptop_head/porcelain_sha256/diff_head_sha256/cutlass_gitlink all
 # agreed, see the real stamps at scratchpad/a2-timings/80c7f59/{a100c-
-# failure,a100e}/.jammi-push-stamp.json). `LC_ALL=C` forces a fixed,
+# failure,a100e}/.jammi-push-stamp.json — session-local captures, untracked;
+# the reproducible tripwire is test_pod_substrate.sh's own locale leg cited
+# below). `LC_ALL=C` forces a fixed,
 # byte-value collation on the final `sort` regardless of the host's
 # ambient locale — a REAL, independently reproduced divergence (two
 # locales genuinely sort a crafted filename set differently on the same
@@ -294,7 +296,8 @@ pod_push_compute() { # $1=repo-root $2=session
   # porcelain_sha/diff_sha above already `return 1` on a hashing failure;
   # this asserts none of the THREE hashed fields came back empty (the
   # shape a missing sha256sum/shasum on PATH produces at every call site
-  # at once, reproduced in scratchpad/audit-pb-r4/push/).
+  # at once, reproduced in scratchpad/audit-pb-r4/push/ — a session-local
+  # capture, untracked).
   if [ -z "$porcelain_sha" ] || [ -z "$diff_sha" ] || [ -z "$manifest_sha" ]; then
     echo "::error::pod_push_compute: refusing to emit a stamp with an empty hash field (porcelain_sha256='${porcelain_sha}' diff_head_sha256='${diff_sha}' manifest_sha256='${manifest_sha}') — a hashing tool is likely missing from PATH; see pod_push_assert_required_tools above" >&2
     return 1

@@ -85,6 +85,12 @@ docs/specs/
 # Artifacts pulled off a GPU pod by `ci/scripts/gpu-dev.sh pull`.
 .gpu-pull/
 
+# Lead-session scratch: working notes/drafts and throwaway git worktrees.
+# Session-local by design, never committed — tracked files that cite a
+# scratchpad/ path must label it session-local evidence.
+/scratchpad/
+/scratch-worktrees/
+
 # The PyTorch/PEFT reference venv `ci/scripts/perf/finetune_ab.sh` provisions
 # on the pod (crates/jammi-bench/reference/README.md's own `.venv-torch-ref`
 # convention) and the A/B sweep's merged report + table it writes.

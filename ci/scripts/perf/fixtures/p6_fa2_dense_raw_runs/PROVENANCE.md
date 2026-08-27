@@ -1,7 +1,7 @@
 # Provenance — `p6_fa2_dense_raw_runs/` fixtures
 
-`s128_flash_on_1.json` and `s128_flash_off_1.json` are byte-for-byte copies
-of the two SMALLEST files (70 and 74 source lines respectively) in the 8
+`s128_flash_on_1.json` and `s128_flash_off_1.json` were copied byte-for-byte
+from the two SMALLEST files (70 and 74 source lines respectively) in the 8
 real, committed `jammi-bench finetune-step` raw-run reports at:
 
 ```
@@ -17,9 +17,15 @@ git show origin/perf/p6-fa2-dense:crates/jammi-kernels/artifacts/cuda-runs/2026-
 git show origin/perf/p6-fa2-dense:crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-p6-b3-dense-raw-runs/s128_flash_off_1.json
 ```
 
-That branch is NOT merged into `main` as of this fixture's own commit —
-`crates/jammi-bench/src/report.rs`/`finetune_step.rs` on `main` carry no
-`flash`-named field at all. These two files are the REAL shape
+These fixtures PREDATE the cuda-runs schema stamp: the committed copies
+under `crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-p6-b3-dense-raw-runs/`
+were later stamped with `schema_version`/`git_sha`/`box`/`status`/`producer`
+fields, so the fixtures are no longer byte-identical to them — the fixtures
+keep the bare pre-stamp `Report` shape as originally copied. The producing
+branch has since merged into `main` (the
+FA2 dense arm, #389, merge commit `6c526f9`), and `main`'s
+`crates/jammi-bench/src/report.rs`/`finetune_step.rs` do carry the
+flash-named dispatch-counter fields today. These two files are the REAL shape
 `ab_merge.py`'s `dispatch_pairs`/`fused_proof` broke on (a docs-ci co-sign
 of that branch found `ci/scripts/perf/ab_merge.py::dispatch_pairs()` raises
 `KeyError` on `attention_block_flash_fused_dispatches`, which has no

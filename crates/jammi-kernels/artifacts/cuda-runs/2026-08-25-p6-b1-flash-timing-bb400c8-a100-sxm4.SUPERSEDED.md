@@ -20,5 +20,5 @@ an overwrite"), this file is kept as-is rather than edited. The fix round's repl
 call) brackets, `>= 20` warmup / `>= 200` iterations, min+median with a steady-state refusal,
 run twice for reproducibility, real (non-"unknown") provenance, and the non-deterministic leg
 DROPPED (unreachable from the only production entry point) rather than republished unexplained —
-is `2026-08-25-p6-b1-flash-timing-<tip_sha7>-a100-sxm4.json`, produced by
-`crates/jammi-kernels/tests/flash_decisive_timing.rs` on `perf/p6-fa2-op`.
+is `2026-08-25-p6-b1-flash-timing-6e90baf-a100-sxm4.json` in this directory, produced by
+`crates/jammi-kernels/tests/flash_decisive_timing.rs`.

@@ -125,16 +125,17 @@ pub fn assert_identity_fields_present(value: &serde_json::Value, fields: &[(&str
 /// that phase 2 has something to call.
 ///
 /// The three fields [`REPORT_IDENTITY_FIELDS`] names — `build_sha`,
-/// `target`, `profile` — are what will let a downstream K7-completeness
-/// reader (`ab_merge.py`'s leg-premise check, `check_cuda_run_artifacts.py`'s
-/// rule (g)) tell "these two legs ran the same code on the same target"
-/// apart from "these two legs merely both filled in the same COMPARISON
-/// tuple", ONCE that reader consumes them — round-3 audit fix: `ab_merge.py`'s
-/// leg-premise check compares `FINETUNE_IDENTITY_FIELDS` only (contract
-/// C4.1's 14-field tuple, which does NOT include `build_sha`/`target`/
-/// `profile` at all — those are Rust-only K7-completeness additions, not
-/// part of the comparison tuple), and rule (g) is phase 2 (C6.3), not built
-/// in this unit; NEITHER consumer reads `REPORT_IDENTITY_FIELDS` today.
+/// `target`, `profile` — are what lets a downstream K7-completeness reader
+/// tell "these two legs ran the same code on the same target" apart from
+/// "these two legs merely both filled in the same COMPARISON tuple".
+/// Consumers: `check_cuda_run_artifacts.py`'s v2-leg identity walk (rule
+/// (i), contract C6.3) parses this const straight out of this source file
+/// (`build_identity_tuples`, "never hand-typed") as the provenance half of
+/// the identity-key roster a v2 leg must carry; `ab_merge.py`'s leg-premise
+/// check compares `FINETUNE_IDENTITY_FIELDS` only (contract C4.1's
+/// comparison tuple, which does NOT include `build_sha`/`target`/`profile`
+/// at all — those are Rust-only K7-completeness additions, not part of the
+/// comparison tuple).
 /// `build_features` is measurement/provenance context (what this binary
 /// COULD dispatch), not part of that identity triple.
 #[derive(Debug, Serialize)]

@@ -199,11 +199,11 @@ The **id is authoritative**; the TTL never gates release, and the check does
 not look at it at all. Two earlier attempts to make the TTL part of this
 check were both removed rather than patched further: matching an *exact*
 recorded TTL refused to release a real `jammi-gpu-ttl72` pod when the
-session's meta predated TTL tracking (round-2 audit), and the
+session's meta predated TTL tracking, and the
 `RP_TTL_HOURS=<H>` override this repo tried next as the recovery path was
 found **inert on every input** — the session meta is always loaded *before*
 any override is read, so it either got clobbered or forced empty regardless
-of what was set on the command line (round-3 audit). RunPod pod ids are
+of what was set on the command line. RunPod pod ids are
 globally unique, so a name shaped like this tooling's own naming convention,
 on the exact id this session recorded, is already sufficient; the specific
 number never added a real safety margin.

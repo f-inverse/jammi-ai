@@ -10,9 +10,13 @@ step deviates. It is written for whoever runs the seed/clone/timing scripts
 directly — a maintainer debugging a slow or failed build, or an agent
 instructed to reproduce one.
 
-Every claim below cites the script and line(s) that make it true
-(`ci/scripts/perf/check_citations.py` re-resolves citations of this shape
-against HEAD — see that script's own module doc). Every number carries its
+Every claim below cites the script and line(s) that make it true. These
+citations are hand-maintained: `ci/scripts/perf/check_citations.py`
+mechanically re-resolves citations only for the four files its
+`_KNOWN_FILES` map names (`finetune_step.rs`, `grad_oracle.rs`,
+`torch_grad_oracle.py`, `torch_finetune_step.py`) and only within its
+`_SEARCH_ROOTS` (`crates/jammi-bench`, `ci/scripts/perf`, the cuda-runs
+artifacts) — it never reads this guide. Every number carries its
 producer; where no committed producer exists, this document says so instead
 of stating the number (`ci/scripts/check_doc_numbers_have_producers.py`'s
 own discipline, adopted here even though that gate does not scan `docs/`).
@@ -451,7 +455,7 @@ FA2 measurement into `/root/.jammi-clone-fa2-a2`
 (`ci/scripts/perf/pod_build_timings.sh:409`), deliberately **never**
 `CLONE_DIR` (`/root/.jammi-clone-a2`, `:271`) — T1's own byte-hash snapshot
 is taken immediately after T1, before the FA2 leg touches anything
-(`:298-304`, round-3 audit N3 in that script's own module doc): reusing one
+(`:298-304`, item N3 in that script's own module doc): reusing one
 clone dir for both would make T1's snapshot include FA2-only artifacts,
 guaranteeing a spurious byte-equality mismatch against the cold leg.
 
@@ -637,9 +641,9 @@ exists) a `test_pod_substrate.sh` leg.
 | # | State assumed | What the tree actually has | Symptom | Pinned by |
 |---|---|---|---|---|
 | 1 | A tree has `.git` | `push` excludes `.git` entirely (`pod_push_stamp.sh:163-174`) — a pushed tree is a plain rsync'd directory | `git submodule`/any git command on a pushed tree fails "not a git repository" | `pod_provision_cutlass.sh:1-17`'s own module doc; `test_pod_substrate.sh` `(m/A1 match)`/`(m/A1 drift)`/`(m/A1 deinit)`/`(m/A1 fetch-failure)`/`(m/A1 revert-RED)` (`:1119`) |
-| 2 | A destination path is either untouched or a real git submodule | It can already hold a **copy-provisioned** cutlass (`cp -a` with `.git` stripped, `pod_provision_cutlass.sh:210-238`) | `git submodule update --init` on that path refuses (non-empty, non-submodule-shaped dir) — a live a100c run wasted 819s before failing | `pod_provision_cutlass.sh:39-61` module doc (round-6 fix); provisioning now `rm -rf` + `cp -a` unconditionally, never asks git to touch the destination |
+| 2 | A destination path is either untouched or a real git submodule | It can already hold a **copy-provisioned** cutlass (`cp -a` with `.git` stripped, `pod_provision_cutlass.sh:210-238`) | `git submodule update --init` on that path refuses (non-empty, non-submodule-shaped dir) — a live a100c run wasted 819s before failing | `pod_provision_cutlass.sh:39-61` module doc; provisioning now `rm -rf` + `cp -a` unconditionally, never asks git to touch the destination |
 | 3 | `git rev-parse --abbrev-ref HEAD == "main"` on a checkout of main | A checkout-by-sha (the ordinary shape for an FA2 PR tip / a resolved seed sha) always leaves a **detached HEAD**, whose abbrev-ref reads the literal `"HEAD"` | T1b/the FA2 leg silently never ran, with no recorded reason — indistinguishable from "correctly determined not-main" | `pod_seed_target.sh:708-736`; `pod_build_timings.sh:371-388`; `test_pod_substrate.sh` `(n/addendum EXECUTABLE b)` (`:1569`) — gated on the *resolved sha*, `t1b_ran`/`t1b_reason` and `fa2_ran`/`fa2_reason` always recorded |
-| 4 | `git status --porcelain`/`git diff HEAD` failing == "no output" == "clean" | A failing git command in a real repo (locked index, corrupted ref) also produces empty stdout, hashing to the identical `sha256("")` a genuinely clean tree would produce | `manifest_sha256`/`porcelain_sha256` reports a byte-identical "clean" hash for a broken repo-root | `pod_push_stamp.sh:254-289` (round-6 fix, discriminated on whether `HEAD` itself resolved) |
+| 4 | `git status --porcelain`/`git diff HEAD` failing == "no output" == "clean" | A failing git command in a real repo (locked index, corrupted ref) also produces empty stdout, hashing to the identical `sha256("")` a genuinely clean tree would produce | `manifest_sha256`/`porcelain_sha256` reports a byte-identical "clean" hash for a broken repo-root | `pod_push_stamp.sh:254-289` (discriminated on whether `HEAD` itself resolved) |
 | 5 | `git rev-parse HEAD:<path>` on a missing path fails with empty output | The **bare** form echoes its own argument text to stdout (rc=128) — `git rev-parse HEAD:no/such/path` literally prints `HEAD:no/such/path` | A bogus literal string becomes `cutlass_gitlink`/an expected pin, read as a real (but wrong) value | `pod_push_stamp.sh:302-318`; `pod_provision_cutlass.sh:63-78` — every call site now uses `--verify --quiet`, silent on a miss |
 | 6 | `stat -f FORMAT` means "use this format string" | On GNU coreutils, `-f` means "display file **system** status" (the opposite of BSD) — the old fallthrough printed a multi-line, live `Free:`-block-bearing status report to stdout before failing | `manifest_sha256` diverged nondeterministically between two hosts building the identical bundle (a100c vs a100e) | `pod_push_stamp.sh:110-152`, `pod_push_stat_mode` — flavour detected once via `stat --version`, memoized |
 | 7 | Pushing files as `root@pod` leaves them root-owned | `rsync -a` preserves owner/group from the **laptop's** own uid (e.g. 501) unless told not to | `git`, run as root inside the pushed tree, refuses "detected dubious ownership" | `ci/scripts/gpu-dev.sh:648-665` — `--no-owner --no-group` |

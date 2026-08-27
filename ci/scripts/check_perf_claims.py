@@ -106,7 +106,7 @@ error, never a silent pass):
                  V-legacy, not V. RESTRICTED (audit advisory) to the exact
                  pointers in `LEGACY_POINTER_ALLOWLIST` — the two named
                  AdamW-summary cells C12.2 calls out — never accepted on an
-                 arbitrary tag; rule (g)'s v2-schema classification, which
+                 arbitrary tag; rule (i)'s v2-schema classification, which
                  would derive V-legacy mechanically, is out of phase-3
                  scope, so this is an explicit, closed stand-in, not an
                  author-trusted marker.

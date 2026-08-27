@@ -140,12 +140,14 @@ jobs:
 
   gpu-prove:
     name: GPU prove-gate (A100)
-    # Tag push or dispatch — prove the exact commit on a real A100 before
-    # promotion, on the recovery path too (a dispatch publishes below, so it
-    # is gated the same as a tag push; build -> prove -> promote never has an
-    # unproven arm). A PR is build-only and never proves. A no-op (skipped)
-    # leg when the caller doesn't request the gate (CPU).
-    if: inputs.run_gpu_prove && github.event_name != 'pull_request'
+    # Only a `py-v*` TAG ref proves-for-promotion — a tag push, or a
+    # workflow_dispatch RUN ON THE TAG (the recovery path). The tag guard is
+    # what makes `git_ref` below an immutable identity: the pod clones the
+    # same commit build-wheel built, never a branch tip that may have moved
+    # (a branch dispatch would prove one sha and publish another). A branch
+    # dispatch or PR is build-only and never proves. A no-op (skipped) leg
+    # when the caller doesn't request the gate (CPU).
+    if: inputs.run_gpu_prove && startsWith(github.ref, 'refs/tags/py-v')
     needs: build-wheel
     uses: ./.github/workflows/_gpu-prove-gate.yml
     with:
@@ -154,10 +156,13 @@ jobs:
 
   publish:
     name: Publish to PyPI
-    # Tag push AND workflow_dispatch both publish — PyPI rejects a re-upload
-    # of an existing version, so a dispatch re-publish is idempotent recovery,
-    # the same contract as `pypi.yml` on this lockstep `py-v*` surface. A PR
-    # is an artifact-only dry run.
+    # Publishes ONLY from a `py-v*` tag ref — a tag push, or a
+    # workflow_dispatch run on the tag (recovery: PyPI rejects a re-upload of
+    # an existing version, so re-running the tag is idempotent). The tag
+    # guard keeps "recovery re-publish of a released version" and "first
+    # publish of an untagged build" distinct states: a branch dispatch or PR
+    # is an artifact-only dry run and can never publish. Same recovery
+    # contract as `pypi.yml`/`pypi-client.yml` on this lockstep surface.
     # `always()` opts out of the implicit success()-wrap so an intentionally
     # skipped gpu-prove (the ungated CPU leg) doesn't itself skip publish; the
     # explicit checks below reproduce build -> prove -> promote exactly: an
@@ -166,7 +171,7 @@ jobs:
     if: >-
       always() &&
       needs.build-wheel.result == 'success' &&
-      github.event_name != 'pull_request' &&
+      startsWith(github.ref, 'refs/tags/py-v') &&
       (inputs.run_gpu_prove == false || needs.gpu-prove.result == 'success')
     needs: [build-wheel, gpu-prove]
     runs-on: ubuntu-latest

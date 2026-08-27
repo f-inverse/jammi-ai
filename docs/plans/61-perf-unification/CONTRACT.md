@@ -57,7 +57,9 @@ The Python COMPARISON tuples (`ab_merge.py`'s `FINETUNE_IDENTITY_FIELDS`,
 `compare_grad_oracle.py`'s `RUN_IDENTITY_FIELDS`) do not change in this unit — only the Rust
 K7-completeness consts grow. A new stdlib-`unittest` suite asserts Python ⊆ Rust for each pair, and
 that the two Python tuples keep their known cardinality (14, 11) — "unchanged" is a number, not a
-promise.
+promise. (Current state: the FINETUNE tuple has since grown to 17 — #381's `max_grad_norm` and the
+`attention_arm` class field among them — and the suite's pinned cardinality moved with it:
+`test_identity_fields_subset.py` asserts (17, 11) today.)
 
 ## C5–C9 — Rule (i), producers, the two baselines move, the swarm glob (phase 2)
 

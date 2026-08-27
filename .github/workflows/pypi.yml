@@ -3,11 +3,13 @@ name: PyPI
 on:
   push:
     tags: ["py-v*"]
-  # Manual re-run to finish a release whose publish was interrupted. The native
-  # wheel version comes from the checked-out source (maturin reads the crate's
-  # `version.workspace` from Cargo.toml). Dispatch from the release commit /
-  # `main` at the release version; PyPI rejects a re-upload of an existing
-  # version, so this is safe.
+  # Manual re-run to finish a release whose publish was interrupted: run the
+  # dispatch ON the `py-v*` tag (the publish job is tag-guarded; PyPI rejects
+  # a re-upload of an existing version, so re-running the tag is idempotent).
+  # The native wheel version comes from the checked-out source (maturin reads
+  # the crate's `version.workspace` from Cargo.toml) — the tag guard is what
+  # pins that source to the released commit; a branch dispatch is a
+  # build-only dry run.
   workflow_dispatch:
 
 # This workflow ships the `jammi-ai-native` dist — the compiled engine (maturin
@@ -106,6 +108,11 @@ jobs:
 
   publish:
     name: Publish to PyPI
+    # Publishes ONLY from a `py-v*` tag ref (tag push, or a dispatch run on
+    # the tag) — see the workflow_dispatch comment above. Without the guard a
+    # branch dispatch could first-publish an untagged, unreleased build,
+    # which PyPI cannot undo.
+    if: startsWith(github.ref, 'refs/tags/py-v')
     needs: [build-native-linux, build-native-macos]
     runs-on: ubuntu-latest
     environment: pypi

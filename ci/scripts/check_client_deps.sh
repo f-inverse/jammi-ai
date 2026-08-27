@@ -29,8 +29,12 @@ set -euo pipefail
 mode="${1:?usage: check_client_deps.sh substrate|cli}"
 
 # The forbidden embedded-engine ML stack, matched against the artifact names
-# of the isolated build.
-ML_DEP_RE='"name":"(candle[^"]*|hf-hub|hf_hub|symphonia|tokenizers)"'
+# of the isolated build. Every family gets the wildcard: artifact names are
+# families, not single crates (candle-core/candle-nn/..., the ten
+# symphonia-* members, tokenizers and any split-off), and cargo may
+# hyphen- or underscore-normalize, so anchor-closing any alternative would
+# hide its sub-crates.
+ML_DEP_RE='"name":"(candle[^"]*|hf[-_]hub[^"]*|symphonia[^"]*|tokenizers[^"]*)"'
 
 case "$mode" in
   substrate)
@@ -57,8 +61,27 @@ trap 'rm -f "$json"' EXIT
 cargo build "${packages[@]}" --message-format=json > "$json"
 
 # Every `"name":"…"` token on the compiler-artifact lines — the per-package
-# build set the isolated build above actually compiled.
-artifacts="$(grep '"reason":"compiler-artifact"' "$json" | grep -oE '"name":"[^"]*"' || true)"
+# build set the isolated build above actually compiled. "Parsed zero
+# artifacts" and "no ML dep found" must never be the same state: an empty
+# stream (a cargo JSON reshape, a wrapper eating stdout) means the guard
+# cannot see the build set, so it refuses rather than reporting the
+# boundary green on evidence it never had.
+artifacts="$(grep '"reason":"compiler-artifact"' "$json" | grep -oE '"name":"[^"]*"')" || {
+  echo "::error::no compiler-artifact lines parsed from the isolated build's JSON stream — the guard cannot see the build set; refusing to report the boundary green" >&2
+  exit 1
+}
+
+# The guard must also have SEEN the packages it is guarding: each requested
+# `-p` package must appear in the artifact stream (hyphen- or
+# underscore-normalized), or the stream is not the build set we asked for.
+for arg in "${packages[@]}"; do
+  [ "$arg" = "-p" ] && continue
+  pkg_re="$(printf '%s' "$arg" | sed 's/[-_]/[-_]/g')"
+  if ! printf '%s\n' "$artifacts" | grep -qiE "\"name\":\"${pkg_re}\""; then
+    echo "::error::requested package ${arg} never appeared in the compiler-artifact stream — the guard did not observe the build it is gating" >&2
+    exit 1
+  fi
+done
 
 if printf '%s\n' "$artifacts" | grep -iE "$ML_DEP_RE"; then
   echo "::error::${ml_error}"

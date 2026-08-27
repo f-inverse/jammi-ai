@@ -22,8 +22,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import check_kernel_oracles as ko  # noqa: E402
 
-# The frozen tokenizer-invariant fixture corpus (esc: kernel-oracle-golden-
-# fixture) — see `_load_tokenizer_fixture_corpus` and
+# The frozen tokenizer-invariant fixture corpus (ledger row
+# esc-049-kernel-oracle-golden-fixture) — see `_load_tokenizer_fixture_corpus` and
 # `TestTokenizerCommentStringInvariant` below for why this exists
 # separately from `ko.scan_files()`'s LIVE tree scan.
 _TOKENIZER_FIXTURE_DIR = Path(__file__).resolve().parents[2] / "ci" / "fixtures" / "kernel-oracle-tokenizer"

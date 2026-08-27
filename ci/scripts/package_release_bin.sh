@@ -14,7 +14,16 @@ set -euo pipefail
 bin="${1:?usage: package_release_bin.sh <binary-name> <target-triple>}"
 triple="${2:?usage: package_release_bin.sh <binary-name> <target-triple>}"
 
+# `sed` echoes the line unchanged on no-substitution, so a shape assert is
+# the difference between failing here and uploading a garbage-named asset.
 version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+case "$version" in
+  [0-9]*.[0-9]*.[0-9]*) ;;
+  *)
+    echo "::error::could not parse a semver workspace version out of Cargo.toml (got: '${version}')" >&2
+    exit 1
+    ;;
+esac
 asset="${bin}-${version}-${triple}.tar.gz"
 strip "target/release/${bin}"
 tar -C target/release -czf "$asset" "$bin"

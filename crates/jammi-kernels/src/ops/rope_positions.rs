@@ -75,25 +75,51 @@
 //! table gets per-row correctness "for free" from the SAME kernel math —
 //! no `.cu` edit, no new device function. The ENTRY POINT that does that
 //! gathering is [`rope_positions_fused_ragged`] (this module) and
-//! [`super::flash_attention::flash_attention_varlen_with_rope_ragged`]:
-//! both take the BASE `cos`/`sin` table plus `lengths: &[usize]` and
-//! derive BOTH the per-row `positions` (via
-//! [`ragged_positions_from_lengths`]) AND the gathered `[total, d]` table
-//! (via [`gather_ragged_tables`]'s `Tensor::index_select` — a stock op on
-//! both CPU and CUDA, so the CPU arm stays "identical by construction")
-//! from that ONE `lengths` slice — a table/segmentation mismatch is
-//! therefore structurally unconstructible: there is exactly one source of
-//! truth for both. No [`crate::flash::CuSeqlens`] type is built or
-//! threaded through this module — `lengths` arrives as a plain `&[usize]`
-//! (this module's documented independence from `crate::flash`'s FFI
-//! boundary, stated above, is preserved even by the ragged arm; a caller
-//! that ALSO needs a real `CuSeqlens` — `flash_attention_varlen_with_rope_ragged`
-//! is the one that does — builds its own, independently, from the SAME
-//! `lengths` slice, never derived FROM this module's `positions`).
+//! `flash_attention::flash_attention_varlen_with_rope_ragged` (a code
+//! span, not a doc link: that item lives in a sibling module gated behind
+//! the `flash-attn` feature, so a link to it is unresolvable — and
+//! therefore silently unrendered, never even checked, per rustdoc's
+//! default of only checking `pub`-reachable item docs — whenever this
+//! crate's docs build without that feature, which is `docs.yml`'s own
+//! `cargo doc --workspace --no-deps` invocation): both take the BASE
+//! `cos`/`sin` table plus `lengths: &[usize]` and derive the per-row
+//! `positions` (via [`ragged_positions_from_lengths`]) and the gathered
+//! `[total, d]` table (via [`gather_ragged_tables`]'s `Tensor::index_select`
+//! — a stock op on both CPU and CUDA, so the CPU arm stays "identical by
+//! construction") from that ONE `lengths` slice.
+//!
+//! **The "structurally unconstructible" fence is scoped to the FLASH
+//! entry, not this module's own.** `flash_attention_varlen_with_rope_ragged`
+//! ALSO derives its own `cu_seqlens` from that SAME `lengths` internally
+//! (never a caller-supplied one), so for THAT function a
+//! table/segmentation mismatch really is structurally unconstructible:
+//! there is exactly one source of truth for both artifacts. THIS module's
+//! own [`rope_positions_fused_ragged`] emits no `cu_seqlens` at all — it
+//! only produces a rotated `qkv` `Tensor` — so the fence does NOT extend
+//! to a caller who composes it by hand: nothing stops a caller from
+//! rotating with `rope_positions_fused_ragged(qkv, cos, sin, &lengths_a,
+//! ..)` and then feeding the result to the crate's plain
+//! `flash_attention_varlen` (the non-fused entry) alongside an
+//! INDEPENDENTLY-built `CuSeqlens` derived from a DIFFERENT `lengths_b` —
+//! that composition reconstructs the exact table/segmentation mismatch
+//! hazard this module's ragged arm exists to close, one level up, outside
+//! this crate's ability to detect it (this op has no visibility into
+//! whatever `CuSeqlens` a caller builds afterwards). Callers who need the
+//! closed fence should use `flash_attention_varlen_with_rope_ragged`
+//! directly rather than composing `rope_positions_fused_ragged` with a
+//! separately-built `CuSeqlens`.
+//!
+//! No `crate::flash::CuSeqlens` type is built or threaded through this
+//! module — `lengths` arrives as a plain `&[usize]` (this module's
+//! documented independence from `crate::flash`'s FFI boundary, stated
+//! above, is preserved even by the ragged arm; a caller that ALSO needs a
+//! real `CuSeqlens` — `flash_attention_varlen_with_rope_ragged` is the one
+//! that does — builds its own, independently, from the SAME `lengths`
+//! slice, never derived FROM this module's `positions`).
 //!
 //! The ragged arm's guards ([`rope_positions_dims`]) are DELIBERATELY
 //! tighter than the dense arm's, replacing (never merely supplementing)
-//! [`crate::flash::CuSeqlens::check_dense_uniform`] for this arm: `total`
+//! `crate::flash::CuSeqlens::check_dense_uniform` for this arm: `total`
 //! (from `qkv`) must EXACTLY equal `seq` (the ragged constructors store
 //! the gathered table's own row-total there, reusing the same field the
 //! dense arm calls `seq`) rather than merely being a multiple of it; the
@@ -103,6 +129,14 @@
 //! `total == 0` is a REFUSAL, never the dense arm's empty-batch
 //! acceptance (a deliberate delta — an empty ragged batch is a caller
 //! bug, e.g. `lengths == []`, not a degenerate-but-meaningful shape here).
+//! Every `lengths` entry must ALSO be `> 0`: a zero-length segment is
+//! refused (see [`ragged_positions_from_lengths`]'s own doc) for the SAME
+//! reason `crate::flash`'s `cu_seqlens_from_lengths` already refuses it on
+//! the flash side (`flash/mod.rs`'s own comment: "a zero-length sequence
+//! has no rows to attend from or to ... refused rather than silently
+//! producing an empty ... slice of the batch") — ONE `lengths` contract,
+//! shared by both entries, rather than the flash entry being stricter than
+//! this module's own for the same input shape.
 
 use candle_core::backend::BackendStorage;
 use candle_core::{CpuStorage, CustomOp3, Error, Layout, Result, Shape, Tensor};
@@ -188,30 +222,6 @@ pub(crate) fn rope_positions_dims(
     let h = dims[2];
     let d = dims[3];
 
-    // Ragged-arm structural fence (module doc's "The ragged arm" section):
-    // checked BEFORE the `d == 0` fast path below, so neither guard can be
-    // bypassed by a degenerate head_dim. `total == 0` is refused
-    // unconditionally (a deliberate delta from the dense arm's own
-    // empty-batch acceptance); `total != seq` catches a caller who built
-    // `qkv` and the gathered table from DIFFERENT `lengths`.
-    if arm == PositionArm::Ragged {
-        if total == 0 {
-            return Err(Error::Msg(format!(
-                "{OP}: ragged arm refuses total=0 (a deliberate delta from the dense arm's \
-                 empty-batch acceptance) -- call the ragged entry point with a nonempty \
-                 `lengths` covering at least one token rather than relying on this op to \
-                 silently degenerate to an empty forward"
-            )));
-        }
-        if total != seq {
-            return Err(Error::Msg(format!(
-                "{OP}: ragged arm requires qkv's total rows (={total}) to exactly equal the \
-                 gathered table's row-total (={seq}) -- both must be derived from the SAME \
-                 `lengths`, or qkv and the position table disagree on segmentation"
-            )));
-        }
-    }
-
     if l_cos.dims() != l_sin.dims() {
         return Err(Error::ShapeMismatchBinaryOp {
             lhs: l_cos.shape().clone(),
@@ -231,6 +241,50 @@ pub(crate) fn rope_positions_dims(
             op: OP,
         });
     }
+
+    // Ragged-arm structural fence (module doc's "The ragged arm" section):
+    // ALL THREE ragged checks below run BEFORE the `d == 0` fast path
+    // further down, uniformly -- none can be bypassed by a degenerate
+    // head_dim. `total == 0` is refused unconditionally (a deliberate
+    // delta from the dense arm's own empty-batch acceptance); `total !=
+    // seq` catches a caller who built `qkv` and the gathered table from
+    // DIFFERENT `lengths`; the mis-sized-table check (`cos_elems != seq *
+    // d`) is the "table must cover EXACTLY `total` rows" guard, written
+    // as a MULTIPLICATION rather than the `period = cos_elems / d`
+    // division the dense arm's own equivalent check uses further down --
+    // deliberately, so it stays well-defined (and reachable) even when
+    // `d == 0`, where a division would be undefined; `total * d` cannot
+    // overflow `usize` for any shape this op's own rank-4 `qkv` domain
+    // check above already bounds (`total`/`d` are each an existing
+    // tensor's own dimension, never independently attacker-controlled).
+    if arm == PositionArm::Ragged {
+        if total == 0 {
+            return Err(Error::Msg(format!(
+                "{OP}: ragged arm refuses total=0 (a deliberate delta from the dense arm's \
+                 empty-batch acceptance) -- call the ragged entry point with a nonempty \
+                 `lengths` covering at least one token rather than relying on this op to \
+                 silently degenerate to an empty forward"
+            )));
+        }
+        if total != seq {
+            return Err(Error::Msg(format!(
+                "{OP}: ragged arm requires qkv's total rows (={total}) to exactly equal the \
+                 gathered table's row-total (={seq}) -- both must be derived from the SAME \
+                 `lengths`, or qkv and the position table disagree on segmentation"
+            )));
+        }
+        let cos_elems = l_cos.shape().elem_count();
+        if cos_elems != seq * d {
+            return Err(Error::Msg(format!(
+                "{OP}: ragged arm requires the pre-gathered table to cover EXACTLY total={seq} \
+                 rows (cos/sin element count {cos_elems}, expected {seq} * head_dim={d} = \
+                 {expected}) -- position degenerates to the row index in this arm, so the \
+                 dense arm's period=1 shared-row allowance does not apply here",
+                expected = seq * d,
+            )));
+        }
+    }
+
     if d == 0 {
         return Ok((total, h, 0));
     }
@@ -279,39 +333,57 @@ pub(crate) fn rope_positions_dims(
             }
         }
         PositionArm::Ragged => {
-            // `total == seq` was already enforced above (before the `d ==
-            // 0` fast path); here `period` must match EXACTLY -- the dense
-            // arm's `period == 1` shared-row convenience does not apply
-            // once `position` degenerates to the row index (a single
-            // shared row would mean every row rotates by the SAME table
-            // entry, never meaningful for a ragged batch).
-            if period != seq {
-                return Err(Error::Msg(format!(
-                    "{OP}: ragged arm requires the pre-gathered table to cover EXACTLY \
-                     total={seq} rows (period={period}) -- position degenerates to the row \
-                     index in this arm, so the dense arm's period=1 shared-row allowance does \
-                     not apply here"
-                )));
-            }
+            // Every ragged check (`total == 0`, `total == seq`, and the
+            // mis-sized-table check via `cos_elems == seq * d`) was
+            // ALREADY enforced above, uniformly BEFORE the `d == 0` fast
+            // path -- nothing left to check here; `period` (computed
+            // above for the dense arm's own use) is redundant with the
+            // multiplication check already performed, by construction.
         }
     }
     Ok((total, h, d))
 }
 
 /// Pure host arithmetic: `positions[r] = r - cu[seg(r)]`, `cu` the
-/// exclusive prefix sum of `lengths` -- no [`crate::flash::CuSeqlens`]
+/// exclusive prefix sum of `lengths` -- no `crate::flash::CuSeqlens`
 /// (device array) is built here, see the module doc's "The ragged arm"
 /// section. A caller that ALSO needs a real `CuSeqlens` builds its own,
 /// independently, from the SAME `lengths` slice this function reads —
 /// one shared input, two independent derivations, never one built FROM
-/// the other. A segment of length 0 contributes zero rows (a legitimate
-/// degenerate "no tokens for this batch element", not an error); an
-/// empty `lengths` therefore yields `total == 0`, which the ragged arm's
-/// own guard above refuses at the op boundary, not here (this function is
-/// pure arithmetic with no domain opinion of its own).
+/// the other.
+///
+/// Every `len` must be `> 0`: a zero-length segment is REFUSED, not a
+/// legitimate degenerate case -- UNIFIED with `crate::flash`'s own
+/// `cu_seqlens_from_lengths`, which already refuses this for the exact
+/// same reason (`flash/mod.rs`: "a zero-length sequence has no rows to
+/// attend from or to ... refused rather than silently producing an empty
+/// ... slice of the batch"). An earlier version of this function accepted
+/// `len == 0` (reasoning it "contributes zero rows, a legitimate
+/// degenerate no-tokens-for-this-batch-element case") while
+/// `flash_attention_varlen_with_rope_ragged`'s OWN `CuSeqlens::from_lengths`
+/// call refused the identical `lengths` slice -- two different answers to
+/// the SAME question depending on which entry point a caller reached
+/// (`rope_positions_fused_ragged` silently succeeded on `lengths=[3, 0,
+/// 5]`; the flash entry on the exact same slice errored). Since this
+/// function is the ONE place both entries derive `positions` from
+/// `lengths`, refusing here makes `rope_positions_fused_ragged` and
+/// `flash_attention_varlen_with_rope_ragged` agree on ONE `lengths`
+/// contract rather than two silently different ones. `lengths.is_empty()`
+/// (the wholly-empty-batch case) is NOT refused here -- it correctly
+/// yields `total == 0`, which the ragged arm's own guard in
+/// `rope_positions_dims` refuses at the op boundary (a distinct check,
+/// see the module doc's "The ragged arm" section), not here.
 pub(crate) fn ragged_positions_from_lengths(lengths: &[usize]) -> Result<Vec<u32>> {
     let mut positions = Vec::new();
-    for &len in lengths {
+    for (i, &len) in lengths.iter().enumerate() {
+        if len == 0 {
+            return Err(Error::Msg(format!(
+                "{OP}: segment {i} has length 0 -- every segment must be non-empty (a \
+                 zero-length segment has no rows to rotate; unified with \
+                 crate::flash::cu_seqlens_from_lengths's identical refusal, see this fn's own \
+                 doc)"
+            )));
+        }
         for r in 0..len {
             let p = u32::try_from(r).map_err(|_| {
                 Error::Msg(format!(
@@ -571,15 +643,32 @@ impl CustomOp3 for RopePositionsFused {
     /// op with `sin` negated -- `RopeFused::bwd`'s exact mechanism,
     /// applies unchanged here (V's identity map is its own transpose).
     /// `dcos`/`dsin`: unlike `RopeFused`, this op does NOT implement a
-    /// real table gradient -- `cos`/`sin` are non-`Var` leaf tables in
+    /// real table gradient -- `cos`/`sin` are non-tracked leaf tables in
     /// every call site this op ships behind (the SAME premise
     /// `RopeFused`'s module doc states for itself), and composing one for
     /// this op's packed-buffer-with-V-passthrough indexing is real,
     /// currently-unexercised work. Rather than silently return `None` for
     /// a hypothetical future trainable table (the exact landmine
     /// `LayerNormFused`'s doc warns a hardcoded `false`/`None` would be),
-    /// a caller that DOES pass a `Var` `cos`/`sin` gets a typed error, not
-    /// a silently-missing gradient.
+    /// a caller that DOES pass a TRACKED `cos`/`sin` gets a typed error,
+    /// not a silently-missing gradient. Gated on `track_op()`, NOT
+    /// `is_variable()` alone: the ragged arm's own entry point
+    /// (`rope_positions_fused_ragged`) gathers a per-row table via
+    /// `Tensor::index_select` BEFORE calling this op, so a caller who
+    /// passes a `Var`-backed BASE table gets a `cos`/`sin` argument here
+    /// that is itself `is_variable() == false` (it is the `index_select`
+    /// RESULT, not the `Var`) but `track_op() == true` (it carries an
+    /// `Op`, and candle's own `sorted_nodes` walk, `backprop.rs`, still
+    /// expects a gradient entry for it once its ancestry reaches a
+    /// `Var`) -- an `is_variable()`-only gate here would silently return
+    /// `Ok` and let `apply3` return `(Some(dx), None, None)`, panicking
+    /// downstream at `backprop.rs:175` ("grad not populated") instead of
+    /// this typed refusal. The SAME predicate-hole class
+    /// `low_rank_residual_linear.rs`'s and `jammi-lora`'s
+    /// `frozen_weight_gate` already fixed for their own `w`/`weight`
+    /// slots; see `crate::ops::rope_positions`'s own test
+    /// `rope_positions_fused_ragged_refuses_a_var_backed_base_table_not_a_panic`
+    /// for the live probe.
     fn bwd(
         &self,
         arg1: &Tensor,
@@ -594,12 +683,14 @@ impl CustomOp3 for RopePositionsFused {
             arg3,
             RopePositionsFused::new_with_arm(self.seq, !self.negate_sin, self.arm),
         )?;
-        if arg2.is_variable() || arg3.is_variable() {
+        if arg2.track_op() || arg3.track_op() {
             return Err(Error::Msg(format!(
                 "{OP}: cos/sin gradient is not implemented -- every call site this op ships \
-                 behind treats cos/sin as non-Var leaf tables (see the module doc); a caller \
-                 that made them trainable would need a real dcos/dsin implementation, not the \
-                 silently-None gradient this error replaces"
+                 behind treats cos/sin as non-tracked leaf tables (see the module doc); a \
+                 caller that made them trainable (a Var, or any tensor carrying an Op that \
+                 traces back to one -- checked via track_op(), not is_variable() alone) would \
+                 need a real dcos/dsin implementation, not the silently-None gradient this \
+                 error replaces"
             )));
         }
         let _ = arg1; // domain-only; `dx` above is the whole gradient wrt qkv.
@@ -967,6 +1058,80 @@ mod tests {
         assert!(format!("{err}").contains("gradient is not implemented"));
     }
 
+    /// PIN (audit's "the dense arm errors correctly" claim, made explicit
+    /// for the `track_op()` class fix): a tracked-but-not-`Var` `cos`
+    /// (`cos_var.as_tensor() * 1.0` -- the SAME construction
+    /// `low_rank_residual_linear.rs`'s own regression test uses) reaching
+    /// the DENSE entry directly must ALSO be a typed refusal, not a panic
+    /// -- the test above only proves the LITERAL-`Var` case (where
+    /// `is_variable()` alone already caught it, before AND after this
+    /// round's fix); this test proves the DENSE arm's `track_op()` gate
+    /// catches the tracked-non-Var case an `is_variable()`-only gate would
+    /// have missed, the same class the ragged arm's own probe (below)
+    /// exercises.
+    #[test]
+    fn cos_sin_tracked_non_variable_gradient_is_a_typed_error_not_silent_none() {
+        use candle_core::Var;
+        let device = Device::Cpu;
+        let (b, h, s, d) = (1usize, 2usize, 3usize, 4usize);
+        let n = b * h * s * d;
+        let xv: Vec<f32> = (0..n).map(|k| k as f32 * 0.1).collect();
+        let x_bhsd = Tensor::from_vec(xv, (b, h, s, d), &device).unwrap();
+        let qkv = pack_bhsd_into_qkv(&x_bhsd, &x_bhsd, 0);
+        let (cos_base, sin) = rope_table(s, d, 10_000.0);
+        let cos_var = Var::from_tensor(&cos_base).unwrap();
+        let cos = (cos_var.as_tensor() * 1.0).unwrap();
+        assert!(
+            !cos.is_variable() && cos.track_op(),
+            "cos must be tracked-but-not-a-Var: the exact cell the panic lived in"
+        );
+        let out = fused(s, false, &qkv, &cos, &sin).unwrap();
+        let loss = out.sum_all().unwrap();
+        let err = loss
+            .backward()
+            .expect_err("a tracked-non-Var cos must be a typed refusal, never a panic");
+        assert!(format!("{err}").contains("gradient is not implemented"));
+    }
+
+    /// THE class fix's own probe (audit): the LIVE hazard a Var-backed
+    /// BASE table reaching the PUBLIC ragged entry point,
+    /// `rope_positions_fused_ragged`, used to trigger -- `gather_ragged_tables`'s
+    /// `index_select` output (`cos_r`) is NEVER `is_variable()` (it is the
+    /// `index_select` RESULT, not the `Var` itself) but ALWAYS `track_op()`
+    /// whenever the caller's own `cos_base` is a `Var`, so an
+    /// `is_variable()`-only gate at `bwd` silently returned `Ok` and let
+    /// `apply3` return `(Some(dx), None, None)` -- candle's OWN
+    /// `sorted_nodes` walk (`backprop.rs`) still expected a gradient entry
+    /// for `cos_r` (its ancestry reaches `cos_base`, the `Var`), so
+    /// `Tensor::backward()` PANICKED at `backprop.rs:175` ("grad not
+    /// populated") instead of returning this test's clean typed `Err`.
+    #[test]
+    fn rope_positions_fused_ragged_refuses_a_var_backed_base_table_not_a_panic() {
+        use candle_core::Var;
+        let device = Device::Cpu;
+        let (h, d) = (2usize, 4usize);
+        let lengths = [3usize, 2];
+        let total: usize = lengths.iter().sum();
+        let n = total * 3 * h * d;
+        let xv: Vec<f32> = (0..n).map(|k| k as f32 * 0.1).collect();
+        let qkv = Tensor::from_vec(xv, (total, 3, h, d), &device).unwrap();
+        let (cos_base, sin_base) = rope_table(4, d, 10_000.0); // period_base=4 >= max(lengths)=3
+        let cos_var = Var::from_tensor(&cos_base).unwrap();
+        assert!(cos_var.as_tensor().is_variable());
+
+        let out =
+            rope_positions_fused_ragged(&qkv, cos_var.as_tensor(), &sin_base, &lengths, false)
+                .expect("forward itself must succeed -- the refusal is a bwd-only concern");
+        let loss = out.sum_all().unwrap();
+        let err = loss
+            .backward()
+            .expect_err("a Var-backed base table must be a typed refusal, never a panic");
+        assert!(
+            format!("{err}").contains("gradient is not implemented"),
+            "expected the typed cos/sin-gradient-not-implemented refusal, got: {err}"
+        );
+    }
+
     // =======================================================================
     // M1a — varlen positions (the ragged arm). See the module doc's "The
     // ragged arm" section. TRUTH oracle, DENSE INVARIANCE, and GUARD
@@ -1258,6 +1423,32 @@ mod tests {
         let (cos, sin) = rope_table(4, 4, 10_000.0);
         let err = rope_positions_fused_ragged(&qkv, &cos, &sin, &[], false).unwrap_err();
         assert!(format!("{err}").contains("ragged arm refuses total=0"));
+    }
+
+    /// UNIFIED `lengths` contract (audit advisory 2): a zero-length
+    /// segment is refused by `rope_positions_fused_ragged`, matching
+    /// `flash_attention_varlen_with_rope_ragged`'s own (pre-existing,
+    /// `CuSeqlens::from_lengths`-derived) refusal of the SAME shape -- an
+    /// earlier version of this function silently accepted `lengths=[3, 0,
+    /// 5]` (treating a zero-length segment as "contributes zero rows"),
+    /// while the flash sibling refused it, giving two different answers
+    /// to the same question depending on which entry point a caller
+    /// reached. `total=8` (3+0+5) is nonempty, so this exercises ONLY the
+    /// per-segment `len == 0` guard, not the separate `total == 0` guard
+    /// the test above covers.
+    #[test]
+    fn rope_positions_fused_ragged_refuses_a_zero_length_segment() {
+        let device = Device::Cpu;
+        let lengths = [3usize, 0, 5];
+        let total: usize = lengths.iter().sum();
+        let (h, d) = (2usize, 4usize);
+        let qkv = Tensor::zeros((total, 3, h, d), DType::F32, &device).unwrap();
+        let (cos, sin) = rope_table(5, d, 10_000.0);
+        let err = rope_positions_fused_ragged(&qkv, &cos, &sin, &lengths, false).unwrap_err();
+        assert!(
+            format!("{err}").contains("has length 0"),
+            "expected the zero-length-segment guard's message, got: {err}"
+        );
     }
 
     /// A derived position exceeding the base table's own period (a

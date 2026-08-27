@@ -479,7 +479,7 @@
 //! itself (see its trailing note) precisely because a genuine second-order
 //! gradient THROUGH this tracked node is unsupported; the node's mere
 //! EXISTENCE on the tape, however, is real, not absent, while `bwd` is
-//! executing. `dmask` (when `mask.is_variable()`)
+//! executing. `dmask` (when `mask.track_op()`)
 //! is computed from the RAW, UNSCALED `d(y)/d(pre_softmax)` via
 //! [`mask_grad`], unaffected by `scale`. When `scale` EQUALS the identity
 //! value (`1.0`, the CPU/CUDA-arm-agnostic default) the multiply is
@@ -491,18 +491,29 @@
 //! `dscores`'s slot is ALWAYS `Some` (the same "may be an intermediate on a
 //! path to a `Var`" rule `LayerNormFused`'s `dx` and `RopeFused`'s `dx`
 //! slots document — `is_variable() == false` does NOT mean "no gradient
-//! needed"). `mask`'s slot uses `mask.is_variable()` directly, exactly like
+//! needed"). `mask`'s slot uses `mask.track_op()` directly, exactly like
 //! `RopeFused`'s `dcos`/`dsin` (no separate construction-data flag is
 //! needed the way `LayerNormFused::dgamma_needed` needs one, because `bwd`
 //! already receives `mask` itself as an argument — nothing to freeze ahead
-//! of time). In every call site this crate ships, `mask` is a true external
-//! constant (built by `broadcast_add`ing `Tensor`s that are never wrapped
-//! in `Var`), so `dmask` is `None` in practice; [`mask_grad`] computes a
-//! REAL gradient via ordinary `Tensor` composition (sum over exactly the
-//! axes `mask` broadcast, then reshape) for the case a future caller DOES
-//! make it trainable — the same "correctness over micro-optimization, this
-//! path is provably dead today" choice `RopeFused::bwd`'s `dcos`/`dsin` and
-//! `Axpy::bwd` both make.
+//! of time): `track_op()`, NOT `is_variable()` alone — a `mask` DERIVED
+//! from a `Var` through an intermediate op (e.g. a `broadcast_as`/
+//! `to_dtype` on a trainable table) has `is_variable() == false` but
+//! `track_op() == true`, and candle's own `sorted_nodes` walk
+//! (`backprop.rs`) still expects a gradient entry for it once its ancestry
+//! reaches a `Var` — an `is_variable()`-only gate here would return `None`
+//! and later panic at `backprop.rs:175` ("grad not populated") instead of
+//! producing the real gradient `mask_grad` is fully able to compute (it
+//! never reads `mask`'s VALUES, only its `shape()`), the SAME predicate-
+//! hole class `low_rank_residual_linear.rs`'s and `jammi-lora`'s
+//! `frozen_weight_gate` already fixed for their own `w`/`weight` slots. In
+//! every call site this crate ships, `mask` is a true external constant
+//! (built by `broadcast_add`ing `Tensor`s that are never wrapped in
+//! `Var`), so `dmask` is `None` in practice; [`mask_grad`] computes a REAL
+//! gradient via ordinary `Tensor` composition (sum over exactly the axes
+//! `mask` broadcast, then reshape) for the case a future caller DOES make
+//! it trainable — the same "correctness over micro-optimization, this
+//! path is provably dead today" choice `RopeFused::bwd`'s `dcos`/`dsin`
+//! and `Axpy::bwd` both make.
 //!
 //! ## esc-037 disposition
 //!
@@ -931,11 +942,13 @@ impl CustomOp2 for SoftmaxLastDimFused {
 
     /// See the module doc's "`bwd`: needs ONLY the output ... PLUS one
     /// scalar multiply by `scale`" section. `dscores`'s slot is ALWAYS
-    /// `Some`; `mask`'s slot follows `mask.is_variable()`. `dscores` is
-    /// `SoftmaxBwdDScores`'s raw `d(y)/d(pre_softmax)` output scaled by
-    /// `self.scale` (chain rule through `pre_softmax = scale * scores +
-    /// mask`); `dmask` uses the RAW, unscaled value (`d(pre_softmax)/d(mask)
-    /// == 1`, not `scale`).
+    /// `Some`; `mask`'s slot follows `mask.track_op()` (NOT
+    /// `is_variable()` alone — see the module doc for why the narrower
+    /// check is a real predicate hole, not a stylistic difference).
+    /// `dscores` is `SoftmaxBwdDScores`'s raw `d(y)/d(pre_softmax)` output
+    /// scaled by `self.scale` (chain rule through `pre_softmax = scale *
+    /// scores + mask`); `dmask` uses the RAW, unscaled value
+    /// (`d(pre_softmax)/d(mask) == 1`, not `scale`).
     fn bwd(
         &self,
         _scores: &Tensor,
@@ -944,7 +957,7 @@ impl CustomOp2 for SoftmaxLastDimFused {
         grad_res: &Tensor,
     ) -> Result<(Option<Tensor>, Option<Tensor>)> {
         let d_pre_softmax = super::apply2(res, grad_res, SoftmaxBwdDScores)?;
-        let dmask = if mask.is_variable() {
+        let dmask = if mask.track_op() {
             Some(mask_grad(&d_pre_softmax, mask.shape())?)
         } else {
             None
@@ -2256,6 +2269,69 @@ mod tests {
         for (i, (f, e)) in dmask.iter().zip(dmask_eager.iter()).enumerate() {
             assert!((f - e).abs() < 1e-3, "dmask[{i}]: fused {f} vs eager {e}");
         }
+    }
+
+    /// The `track_op()` class fix (audit): `mask` derived from a `Var`
+    /// through an intermediate op (`mask_var.as_tensor() * 1.0`, the SAME
+    /// tracked-but-not-a-`Var` construction `low_rank_residual_linear.rs`'s
+    /// own regression test uses) has `is_variable() == false` but
+    /// `track_op() == true` -- an `is_variable()`-only gate at `bwd` would
+    /// return `dmask = None` here while candle's OWN `sorted_nodes` walk
+    /// (`backprop.rs`) still expects a gradient entry for this tracked
+    /// `mask` node, PANICKING at `backprop.rs:175` ("grad not populated")
+    /// instead of this test's clean `Ok` with a real, correct gradient.
+    /// Reached through the PUBLIC `SoftmaxLastDimFused`/`apply2` surface
+    /// (`jammi_kernels::ops::{apply2, SoftmaxLastDimFused}`), a real
+    /// `Tensor::backward()` call (not a direct `bwd()` invocation, which
+    /// would not exercise candle's own traversal at all).
+    #[test]
+    fn mask_gradient_is_populated_and_correct_when_tracked_but_not_a_variable() {
+        let device = Device::Cpu;
+        let sv: [f32; 8] = [1.0, -1.0, 2.0, 0.5, -0.3, 1.7, 0.2, -2.1];
+        let mv: [f32; 4] = [0.1, -0.2, 0.3, -0.1];
+        let scores = Tensor::from_slice(&sv, (2, 4), &device).unwrap();
+        let mask_var =
+            Var::from_tensor(&Tensor::from_slice(&mv, (1, 4), &device).unwrap()).unwrap();
+        // Tracked (has an Op::Affine) but NOT itself a Var -- the exact
+        // cell the panic lived in.
+        let mask = (mask_var.as_tensor() * 1.0).unwrap();
+        assert!(
+            !mask.is_variable() && mask.track_op(),
+            "mask must be tracked-but-not-a-Var: the exact cell the panic lived in"
+        );
+
+        let out = fused(&scores, &mask).unwrap();
+        let grads = out
+            .backward()
+            .expect("a tracked-non-Var mask must populate a real gradient, never panic");
+        let dmask: Vec<f32> = grads
+            .get(mask_var.as_tensor())
+            .expect("the gradient must reach mask_var, the tracked-non-Var mask's own ancestor")
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        // Reference: the SAME literal-Var case `mask_gradient_is_populated_
+        // and_correct_when_a_variable` already proves correct -- the
+        // tracked-non-Var path must produce the IDENTICAL numeric gradient
+        // (the `* 1.0` intermediate is algebraically a no-op).
+        let mask_ref =
+            Var::from_tensor(&Tensor::from_slice(&mv, (1, 4), &device).unwrap()).unwrap();
+        let out_ref = fused(&scores, &mask_ref).unwrap();
+        let grads_ref = out_ref.backward().unwrap();
+        let dmask_ref: Vec<f32> = grads_ref
+            .get(&mask_ref)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(
+            dmask, dmask_ref,
+            "a tracked-non-Var mask's gradient must be bit-identical to the literal-Var case's \
+             own gradient (the `* 1.0` intermediate is a no-op)"
+        );
     }
 
     /// Verifies, rather than merely asserting in the module doc, that a

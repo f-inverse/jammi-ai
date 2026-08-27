@@ -442,15 +442,23 @@ const FUSED_ROPE_BWD_OP_NAME: &str = "flash_attention_varlen_fused_rope_bwd";
 /// # Domain
 ///
 /// Identical to [`FlashVarlenAttention`]'s own (`qkv`: bf16, contiguous,
-/// `[total_q, 3, H, 64]`) PLUS `cos`/`sin`: same convention
-/// [`RopePositionsFused`] accepts (`[period, 64]`, `period == seq` or
-/// `period == 1`) — checked by `rope_positions_dims` internally, on top of
-/// this op's own [`check_qkv_domain`] (the `HEAD_DIM == 64` / bf16 / rank
-/// checks `RopePositionsFused` alone does not make, since IT accepts any
-/// even `head_dim` — see that op's own module doc).
+/// `[total_q, 3, H, 64]`) PLUS `cos`/`sin`: same TWO-ARM convention
+/// [`RopePositionsFused`] accepts (checked by `rope_positions_dims`
+/// internally, arm-selectively — see [`super::rope_positions::PositionArm`]'s
+/// own doc), on top of this op's own [`check_qkv_domain`] (the `HEAD_DIM
+/// == 64` / bf16 / rank checks `RopePositionsFused` alone does not make,
+/// since IT accepts any even `head_dim` — see that op's own module doc):
+/// [`flash_attention_varlen_with_rope`] constructs the DENSE arm (`[period,
+/// 64]`, `period == seq` or `period == 1`); [`flash_attention_varlen_with_rope_ragged`]
+/// constructs the RAGGED arm (`[total, 64]` EXACTLY — the dense arm's
+/// `period == 1` shared-row convenience does NOT apply here, see this
+/// crate's `ops::rope_positions` module doc, "The ragged arm" section).
 pub(crate) struct FlashVarlenAttentionFusedRope {
-    /// Dense sequence length — [`RopePositionsFused::seq`]'s own field,
-    /// same convention (`position = token % seq`).
+    /// Dense sequence length (`Dense` arm) OR the gathered table's own
+    /// row-total (`Ragged` arm) — [`RopePositionsFused::seq`]'s own field,
+    /// same TWO-ARM convention: `position = token % seq`, which
+    /// degenerates to the row index itself when `arm == Ragged` (`seq ==
+    /// total`). See `arm`'s own doc, immediately below.
     seq: usize,
     cu_seqlens: CuSeqlens,
     num_heads: usize,
@@ -586,11 +594,17 @@ impl CustomOp3 for FlashVarlenAttentionFusedRope {
         res: &Tensor,
         grad_res: &Tensor,
     ) -> Result<(Option<Tensor>, Option<Tensor>, Option<Tensor>)> {
-        if cos.is_variable() || sin.is_variable() {
+        if cos.track_op() || sin.track_op() {
             return Err(Error::Msg(format!(
                 "{FUSED_ROPE_OP_NAME}: cos/sin gradient is not implemented — every call site \
-                 this op ships behind treats cos/sin as non-Var leaf tables, mirroring \
-                 RopePositionsFused's own identical refusal (see that op's `bwd`)"
+                 this op ships behind treats cos/sin as non-tracked leaf tables, mirroring \
+                 RopePositionsFused's own identical refusal (see that op's `bwd`). Checked via \
+                 track_op(), not is_variable() alone: the ragged entry \
+                 (flash_attention_varlen_with_rope_ragged) hands this bwd the ALREADY-gathered \
+                 cos_r/sin_r (an index_select RESULT, not the caller's own base table), which \
+                 is is_variable() == false but track_op() == true whenever the base table was \
+                 a Var — the same predicate hole low_rank_residual_linear.rs's and \
+                 jammi-lora's frozen_weight_gate already fixed for their own w/weight slots"
             )));
         }
         let lse = self
@@ -690,7 +704,13 @@ pub fn flash_attention_varlen_with_rope(
 /// slice — see [`crate::ops::rope_positions`]'s module doc, "The ragged
 /// arm" section, for why that makes a table/segmentation mismatch (the
 /// two-op composition's own hazard this type's doc names) structurally
-/// unconstructible: there is exactly one source of truth for both.
+/// unconstructible for THIS function specifically: there is exactly one
+/// source of truth for both. (That module doc's own fence claim is scoped
+/// to THIS function alone — its OWN `rope_positions_fused_ragged` emits no
+/// `cu_seqlens` at all, so composing it by hand with the plain
+/// `flash_attention_varlen` and a separately-derived `CuSeqlens`
+/// reconstructs the hazard one level up; see that module doc for the full
+/// scoping.)
 ///
 /// `cos_base`/`sin_base`: the SAME base-table convention
 /// [`super::RopePositionsFused::new`]'s dense arm accepts (`[period_base,
@@ -699,7 +719,13 @@ pub fn flash_attention_varlen_with_rope(
 /// d]` tables this op's own `CustomOp3` node is actually built over —
 /// exactly what [`crate::ops::rope_positions::rope_positions_fused_ragged`]
 /// (the CPU/eager entry) does, so the two entries share ONE gathering
-/// implementation rather than two.
+/// implementation rather than two. That SAME shared gather is called
+/// BEFORE `CuSeqlens::from_lengths` below (not after) specifically so a
+/// zero-length `lengths` entry is refused by the ONE shared check
+/// (`crate::ops::rope_positions::ragged_positions_from_lengths`) both
+/// entries go through, rather than `CuSeqlens::from_lengths`'s OWN
+/// (functionally identical, but separately-maintained) refusal being the
+/// only thing catching it here.
 ///
 /// The bwd recompute reuses the SAME gathered `cos_r`/`sin_r`: candle
 /// hands `bwd` the exact `cos`/`sin` tensors THIS function passed to
@@ -720,9 +746,9 @@ pub fn flash_attention_varlen_with_rope_ragged(
              CPU arm, see {OP_NAME}'s own doc"
         )));
     };
-    let cu_seqlens = CuSeqlens::from_lengths(lengths, device).map_err(flash_err)?;
     let (total, cos_r, sin_r) =
         crate::ops::rope_positions::gather_ragged_tables(cos_base, sin_base, lengths)?;
+    let cu_seqlens = CuSeqlens::from_lengths(lengths, device).map_err(flash_err)?;
     let op = FlashVarlenAttentionFusedRope {
         seq: total,
         cu_seqlens,

@@ -8053,18 +8053,48 @@ fn flash_upstream_acceptance_form_red_control_bwd_only_window_dropped_cuda() {
 
 // =======================================================================
 // M1a — varlen positions: `flash_attention_varlen_with_rope_ragged`'s own
-// oracles (RETENTION vs the two-op composition, flash-level DENSE
-// INVARIANCE against the existing dense entry, and the no-CPU-arm guard).
-// See `jammi_kernels::ops::rope_positions`'s module doc, "The ragged arm"
-// section, for the representation this relies on. `#[cfg(feature =
-// "flash-attn")]` throughout -- every path under test but the guard is
-// CUDA-only; moved here (from an earlier draft inline in
+// oracles (a VALUES-PARITY oracle vs the two-op composition, flash-level
+// DENSE INVARIANCE against the existing dense entry, and the no-CPU-arm
+// guard). See `jammi_kernels::ops::rope_positions`'s module doc, "The
+// ragged arm" section, for the representation this relies on. `#[cfg(
+// feature = "flash-attn")]` throughout -- every path under test but the
+// guard is CUDA-only; moved here (from an earlier draft inline in
 // `src/ops/flash_attention.rs`) specifically so `cuda_device`'s skip is
 // MECHANICALLY enforced by `check_kernel_oracles.py`'s KO-7 scan (which
 // covers `crates/jammi-kernels/tests/**`, not `crates/jammi-kernels/
 // src/**`) rather than voluntarily mirrored, and so no NEW
 // `ci/kernel-oracle-helpers.txt` entry is needed -- this file's own
 // `cuda_device` (registered there already) is reused directly.
+//
+// NOT a retention oracle (audit correction): the test below measures
+// VALUES ONLY (bit-identical fwd output and dqkv) -- it does not measure
+// VRAM/retention at all, so calling it a "RETENTION oracle" overclaimed
+// what it checks. `FlashVarlenAttentionFusedRope`'s module doc's own
+// motivation (`crates/jammi-kernels/src/ops/flash_attention.rs`, "Measured"
+// section) is retention SAVINGS relative to the two-op composition, from
+// no longer retaining a second `[total, 3, H, 64]` rotated `qkv` buffer;
+// the RAGGED arm partially gives some of that saving back: candle's
+// `BackpropOp::new3` (`op.rs`) retains EVERY tracked argument of a
+// `CustomOp3` node unconditionally, so `FlashVarlenAttentionFusedRope`'s
+// own `cos`/`sin` arguments are ALREADY retained regardless of arm (dense
+// or ragged) -- what differs is their SIZE: the dense arm's `cos`/`sin`
+// are the BASE table, `[seq, d]`; the ragged arm's are the GATHERED
+// per-row table `rope_positions_fused_ragged`'s own entry point produces,
+// `[total, d]` (`total = sum(lengths)`, which can reach `batch * seq` at
+// full packing, e.g. `total=4096` vs `seq=512` at ModernBERT-large's
+// production shape `b=8, s=512, h=16, head_dim=64`). At that pinned
+// shape, bf16, 2 tables (cos+sin): dense retains `2 * 512 * 64 * 2 bytes
+// = 128 KiB`; ragged retains `2 * 4096 * 64 * 2 bytes = 1024 KiB` -- a
+// `~896 KiB ≈ 0.9 MiB` DELTA (no-producer: derived from shape arithmetic
+// at the pinned production shape, not measured) against the
+// `FlashVarlenAttentionFusedRope` module doc's own documented `~28
+// MiB/layer` saving (that doc's "Measured" section, itself a real
+// artifact-backed number) -- roughly `0.9 / 28 ≈ 3%` of the saving given
+// back at full packing, worst case (a partially-packed ragged batch,
+// `total < batch * seq`, gives back LESS). A REAL, stated cost, not
+// zero -- an actual VRAM/retention measurement of this specific delta is
+// deferred to the pod/VRAM legs (this file has no VRAM instrumentation);
+// this doc paragraph is the honest bound this pass can state without one.
 // =======================================================================
 
 /// A real (non-trivial-angle) BASE rotary table, `[period_base, hidden]`,
@@ -8083,13 +8113,15 @@ fn ragged_rope_base_table(period_base: usize, hidden: usize, device: &Device) ->
     (cos, sin)
 }
 
-/// RETENTION oracle: the ragged fused-rope op vs the two-op composition it
-/// replaces -- `rope_positions_fused_ragged` (ragged `RopePositionsFused`
-/// apply) followed by `flash_attention_varlen` on the already-rotated
-/// buffer, with an INDEPENDENTLY built `CuSeqlens` (from the SAME
-/// `lengths`, never derived from the other path's own gather) -- values
-/// bit-identical fwd AND bwd on a genuinely NON-uniform `lengths` (the
-/// ragged case's whole point), only retention differs. Mirrors
+/// VALUES-PARITY oracle (see this section's own banner comment above for
+/// why NOT "RETENTION" -- this test checks values only): the ragged
+/// fused-rope op vs the two-op composition it replaces --
+/// `rope_positions_fused_ragged` (ragged `RopePositionsFused` apply)
+/// followed by `flash_attention_varlen` on the already-rotated buffer,
+/// with an INDEPENDENTLY built `CuSeqlens` (from the SAME `lengths`,
+/// never derived from the other path's own gather) -- values bit-identical
+/// fwd AND bwd on a genuinely NON-uniform `lengths` (the ragged case's
+/// whole point). Mirrors
 /// `fused_rope_matches_two_op_composition_bit_identical_fwd_and_bwd_cuda`
 /// (`src/ops/flash_attention.rs`, the DENSE analogue) one arm up.
 #[test]
@@ -8291,6 +8323,41 @@ fn fused_rope_ragged_refuses_a_non_cuda_qkv() {
     assert!(
         format!("{err}").contains("requires a CUDA qkv tensor"),
         "expected the no-CPU-arm guard's message, got: {err}"
+    );
+}
+
+/// UNIFIED `lengths` contract (audit advisory 2): `flash_attention_varlen_with_rope_ragged`
+/// refuses a zero-length segment via the SAME shared check
+/// `jammi_kernels::ops::rope_positions`'s `ragged_positions_from_lengths`
+/// now enforces for `rope_positions_fused_ragged` too (see that op's own
+/// test, `ops::rope_positions::tests::rope_positions_fused_ragged_refuses_a_zero_length_segment`)
+/// -- ONE `lengths` contract, not two independently-drifting ones. Needs a
+/// real CUDA `qkv` (the no-CPU-arm guard above would otherwise fire
+/// first, testing a DIFFERENT guard).
+#[test]
+#[cfg(feature = "flash-attn")]
+fn fused_rope_ragged_refuses_a_zero_length_segment_cuda() {
+    use jammi_kernels::flash::{VarlenConfig, HEAD_DIM};
+    use jammi_kernels::ops::flash_attention_varlen_with_rope_ragged;
+
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let lengths = [3usize, 0, 5];
+    let total: usize = lengths.iter().sum();
+    let (h, d) = (2usize, HEAD_DIM);
+    let qkv = Tensor::zeros((total, 3, h, d), DType::BF16, &cuda).unwrap();
+    let (cos_base, sin_base) = ragged_rope_base_table(5, d, &cuda);
+    let cfg = VarlenConfig {
+        softmax_scale: 1.0 / (d as f32).sqrt(),
+        window: None,
+        deterministic: true,
+    };
+    let err = flash_attention_varlen_with_rope_ragged(&qkv, &cos_base, &sin_base, &lengths, &cfg)
+        .unwrap_err();
+    assert!(
+        format!("{err}").contains("has length 0"),
+        "expected the zero-length-segment guard's message, got: {err}"
     );
 }
 

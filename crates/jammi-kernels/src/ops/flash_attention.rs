@@ -65,11 +65,13 @@
 use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::cudarc::driver::CudaSlice;
 use candle_core::{
-    CpuStorage, CudaStorage, CustomOp1, CustomOp3, DType, Error, Layout, Result, Shape, Tensor,
+    CpuStorage, CudaStorage, CustomOp1, CustomOp3, DType, Device, Error, Layout, Result, Shape,
+    Tensor,
 };
 use half::bf16;
 
 use crate::flash::{self, CuSeqlens, VarlenConfig, HEAD_DIM};
+use crate::ops::rope_positions::PositionArm;
 use crate::ops::saved::Saved;
 
 const OP_NAME: &str = "flash_attention_varlen";
@@ -440,15 +442,23 @@ const FUSED_ROPE_BWD_OP_NAME: &str = "flash_attention_varlen_fused_rope_bwd";
 /// # Domain
 ///
 /// Identical to [`FlashVarlenAttention`]'s own (`qkv`: bf16, contiguous,
-/// `[total_q, 3, H, 64]`) PLUS `cos`/`sin`: same convention
-/// [`RopePositionsFused`] accepts (`[period, 64]`, `period == seq` or
-/// `period == 1`) — checked by `rope_positions_dims` internally, on top of
-/// this op's own [`check_qkv_domain`] (the `HEAD_DIM == 64` / bf16 / rank
-/// checks `RopePositionsFused` alone does not make, since IT accepts any
-/// even `head_dim` — see that op's own module doc).
+/// `[total_q, 3, H, 64]`) PLUS `cos`/`sin`: same TWO-ARM convention
+/// [`RopePositionsFused`] accepts (checked by `rope_positions_dims`
+/// internally, arm-selectively — see [`super::rope_positions::PositionArm`]'s
+/// own doc), on top of this op's own [`check_qkv_domain`] (the `HEAD_DIM
+/// == 64` / bf16 / rank checks `RopePositionsFused` alone does not make,
+/// since IT accepts any even `head_dim` — see that op's own module doc):
+/// [`flash_attention_varlen_with_rope`] constructs the DENSE arm (`[period,
+/// 64]`, `period == seq` or `period == 1`); [`flash_attention_varlen_with_rope_ragged`]
+/// constructs the RAGGED arm (`[total, 64]` EXACTLY — the dense arm's
+/// `period == 1` shared-row convenience does NOT apply here, see this
+/// crate's `ops::rope_positions` module doc, "The ragged arm" section).
 pub(crate) struct FlashVarlenAttentionFusedRope {
-    /// Dense sequence length — [`RopePositionsFused::seq`]'s own field,
-    /// same convention (`position = token % seq`).
+    /// Dense sequence length (`Dense` arm) OR the gathered table's own
+    /// row-total (`Ragged` arm) — [`RopePositionsFused::seq`]'s own field,
+    /// same TWO-ARM convention: `position = token % seq`, which
+    /// degenerates to the row index itself when `arm == Ragged` (`seq ==
+    /// total`). See `arm`'s own doc, immediately below.
     seq: usize,
     cu_seqlens: CuSeqlens,
     num_heads: usize,
@@ -465,6 +475,15 @@ pub(crate) struct FlashVarlenAttentionFusedRope {
     /// own doc for why a mismatched fwd/bwd config needs a real op-level
     /// seam rather than a crafted input tensor.
     bwd_cfg_override: Option<VarlenConfig>,
+    /// Which [`super::RopePositionsFused`] domain `seq` means — `Dense`
+    /// (`position = token % seq`, [`flash_attention_varlen_with_rope`]'s
+    /// arm) or `Ragged` (`seq` holds the gathered table's own row-total,
+    /// `position` degenerates to the row index,
+    /// [`flash_attention_varlen_with_rope_ragged`]'s arm — M1a). BOTH
+    /// `cuda_fwd` and `bwd`'s recompute read this field so the rotation
+    /// `bwd` recomputes is provably the SAME one `fwd` applied — see
+    /// [`super::rope_positions`]'s module doc, "The ragged arm" section.
+    arm: PositionArm,
     lse: Saved<CudaSlice<f32>>,
 }
 
@@ -519,8 +538,9 @@ impl CustomOp3 for FlashVarlenAttentionFusedRope {
         // rope_positions::cuda_fwd`'s own contract, same as every other CUDA
         // kernel launcher in this crate) — `Layout::contiguous` reconstructs
         // exactly that, never a layout re-derived from anything else.
-        let (rot_storage, rot_shape) =
-            crate::cuda::rope_positions::cuda_fwd(self.seq, false, s1, l1, s2, l2, s3, l3)?;
+        let (rot_storage, rot_shape) = crate::cuda::rope_positions::cuda_fwd(
+            self.seq, false, self.arm, s1, l1, s2, l2, s3, l3,
+        )?;
         let rot_layout = Layout::contiguous(rot_shape);
         let (rx1, rx2) = rot_layout
             .contiguous_offsets()
@@ -574,11 +594,17 @@ impl CustomOp3 for FlashVarlenAttentionFusedRope {
         res: &Tensor,
         grad_res: &Tensor,
     ) -> Result<(Option<Tensor>, Option<Tensor>, Option<Tensor>)> {
-        if cos.is_variable() || sin.is_variable() {
+        if cos.track_op() || sin.track_op() {
             return Err(Error::Msg(format!(
                 "{FUSED_ROPE_OP_NAME}: cos/sin gradient is not implemented — every call site \
-                 this op ships behind treats cos/sin as non-Var leaf tables, mirroring \
-                 RopePositionsFused's own identical refusal (see that op's `bwd`)"
+                 this op ships behind treats cos/sin as non-tracked leaf tables, mirroring \
+                 RopePositionsFused's own identical refusal (see that op's `bwd`). Checked via \
+                 track_op(), not is_variable() alone: the ragged entry \
+                 (flash_attention_varlen_with_rope_ragged) hands this bwd the ALREADY-gathered \
+                 cos_r/sin_r (an index_select RESULT, not the caller's own base table), which \
+                 is is_variable() == false but track_op() == true whenever the base table was \
+                 a Var — the same predicate hole low_rank_residual_linear.rs's and \
+                 jammi-lora's frozen_weight_gate already fixed for their own w/weight slots"
             )));
         }
         let lse = self
@@ -598,7 +624,7 @@ impl CustomOp3 for FlashVarlenAttentionFusedRope {
             &qkv_d,
             &cos_d,
             &sin_d,
-            super::RopePositionsFused::new(self.seq, false),
+            super::RopePositionsFused::new_with_arm(self.seq, false, self.arm),
         )?;
 
         // The flash-side gradient: UNCHANGED `FlashVarlenBwdHelper`, the
@@ -626,7 +652,7 @@ impl CustomOp3 for FlashVarlenAttentionFusedRope {
             &d_qkv_rot,
             &cos_d,
             &sin_d,
-            super::RopePositionsFused::new(self.seq, true),
+            super::RopePositionsFused::new_with_arm(self.seq, true, self.arm),
         )?;
         Ok((Some(dqkv), None, None))
     }
@@ -664,9 +690,75 @@ pub fn flash_attention_varlen_with_rope(
         num_heads,
         cfg: *cfg,
         bwd_cfg_override: None,
+        arm: PositionArm::Dense,
         lse: Saved::empty(),
     };
     super::apply_stateful3(qkv, cos, sin, op)
+}
+
+/// Ragged counterpart of [`flash_attention_varlen_with_rope`] (M1a —
+/// varlen positions): `qkv`'s `total_q` rows are the CONCATENATION of
+/// `lengths.len()` variable-length segments (no padding), never a padded
+/// `[batch, seq]` grid. `cu_seqlens` (the FFI's own varlen geometry) and
+/// the per-row rotation table are BOTH derived from this ONE `lengths`
+/// slice — see [`crate::ops::rope_positions`]'s module doc, "The ragged
+/// arm" section, for why that makes a table/segmentation mismatch (the
+/// two-op composition's own hazard this type's doc names) structurally
+/// unconstructible for THIS function specifically: there is exactly one
+/// source of truth for both. (That module doc's own fence claim is scoped
+/// to THIS function alone — its OWN `rope_positions_fused_ragged` emits no
+/// `cu_seqlens` at all, so composing it by hand with the plain
+/// `flash_attention_varlen` and a separately-derived `CuSeqlens`
+/// reconstructs the hazard one level up; see that module doc for the full
+/// scoping.)
+///
+/// `cos_base`/`sin_base`: the SAME base-table convention
+/// [`super::RopePositionsFused::new`]'s dense arm accepts (`[period_base,
+/// d]`, any leading dims of size 1) — gathered INTERNALLY, via
+/// [`crate::ops::rope_positions::gather_ragged_tables`], into the `[total,
+/// d]` tables this op's own `CustomOp3` node is actually built over —
+/// exactly what [`crate::ops::rope_positions::rope_positions_fused_ragged`]
+/// (the CPU/eager entry) does, so the two entries share ONE gathering
+/// implementation rather than two. That SAME shared gather is called
+/// BEFORE `CuSeqlens::from_lengths` below (not after) specifically so a
+/// zero-length `lengths` entry is refused by the ONE shared check
+/// (`crate::ops::rope_positions::ragged_positions_from_lengths`) both
+/// entries go through, rather than `CuSeqlens::from_lengths`'s OWN
+/// (functionally identical, but separately-maintained) refusal being the
+/// only thing catching it here.
+///
+/// The bwd recompute reuses the SAME gathered `cos_r`/`sin_r`: candle
+/// hands `bwd` the exact `cos`/`sin` tensors THIS function passed to
+/// `apply_stateful3` (`FlashVarlenAttentionFusedRope::bwd`'s `cos`/`sin`
+/// parameters), so the rotation `bwd` recomputes is provably the SAME one
+/// `fwd` applied — never re-derived from `lengths` a second time.
+pub fn flash_attention_varlen_with_rope_ragged(
+    qkv: &Tensor,
+    cos_base: &Tensor,
+    sin_base: &Tensor,
+    lengths: &[usize],
+    cfg: &VarlenConfig,
+) -> Result<Tensor> {
+    let (_total_q, num_heads) = check_qkv_domain(qkv.dims(), qkv.dtype())?;
+    let Device::Cuda(device) = qkv.device() else {
+        return Err(Error::Msg(format!(
+            "{FUSED_ROPE_OP_NAME}: ragged entry requires a CUDA qkv tensor -- this op has no \
+             CPU arm, see {OP_NAME}'s own doc"
+        )));
+    };
+    let (total, cos_r, sin_r) =
+        crate::ops::rope_positions::gather_ragged_tables(cos_base, sin_base, lengths)?;
+    let cu_seqlens = CuSeqlens::from_lengths(lengths, device).map_err(flash_err)?;
+    let op = FlashVarlenAttentionFusedRope {
+        seq: total,
+        cu_seqlens,
+        num_heads,
+        cfg: *cfg,
+        bwd_cfg_override: None,
+        arm: PositionArm::Ragged,
+        lse: Saved::empty(),
+    };
+    super::apply_stateful3(qkv, &cos_r, &sin_r, op)
 }
 
 /// TEST-SUPPORT ONLY — never wired into [`flash_attention_varlen_with_rope`]
@@ -712,6 +804,7 @@ pub fn flash_attention_varlen_with_rope_test_only_bwd_window_override(
         num_heads,
         cfg: *fwd_cfg,
         bwd_cfg_override: Some(*bwd_cfg),
+        arm: PositionArm::Dense,
         lse: Saved::empty(),
     };
     super::apply_stateful3(qkv, cos, sin, op)
@@ -917,6 +1010,20 @@ mod fused_rope_matches_two_op_composition {
         );
     }
 }
+
+// M1a — varlen positions: the CUDA-gated RETENTION oracle, flash-level
+// DENSE INVARIANCE oracle, and no-CPU-arm guard for
+// [`flash_attention_varlen_with_rope_ragged`] moved to
+// `tests/cuda_parity.rs` (`fused_rope_ragged_matches_two_op_composition_
+// bit_identical_fwd_and_bwd_cuda` and its two siblings) so their CUDA
+// skip is MECHANICALLY enforced by `check_kernel_oracles.py`'s KO-7 scan
+// (`crates/jammi-kernels/tests/**`, not `crates/jammi-kernels/src/**`)
+// via that file's already-registered `cuda_device` helper, rather than
+// voluntarily mirrored here with no ci/kernel-oracle-helpers.txt entry to
+// enforce it. The CPU-hermetic TRUTH oracle, `gather_ragged_tables`
+// assertions, GUARDS, and op-level DENSE INVARIANCE for the ragged arm
+// itself remain in `crate::ops::rope_positions`'s own `#[cfg(test)] mod
+// tests` (see that module's own doc, "The ragged arm" section).
 
 #[cfg(test)]
 mod tests {

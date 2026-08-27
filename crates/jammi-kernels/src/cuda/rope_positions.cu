@@ -8,13 +8,27 @@
 // Domain: `qkv` is `[total, 3, h, d]`, row-major contiguous, bf16 or f32
 // (validated by the Rust glue, `../ops/rope_positions.rs`'s
 // `rope_positions_dims`); `cos`/`sin` are `[period, d]` with `period ==
-// seq` (or `period == 1`), `d` even. `seq` is this call's DENSE period:
-// `token = row / (3*h)`; `position = token % seq` — the modulo form
-// stated in the P6 Stage B v5 contract §3.6 ("position = token % s for
-// dense"). The GENERAL varlen form (`positions[r] = r - cu[seq(r)]`, a
-// per-row lookup TABLE rather than one shared `seq`) is explicitly future
-// work (B3-padded) — not implemented here; see this file's Rust glue doc
-// for the scope note.
+// seq` (or `period == 1`, DENSE arm only), `d` even. `seq` is this call's
+// modulo base: `token = row / (3*h)`; `position = token % seq` — the
+// modulo form stated in the P6 Stage B v5 contract §3.6 ("position =
+// token % s for dense").
+//
+// This SAME kernel serves BOTH the DENSE and the RAGGED (M1a — varlen
+// positions) arms without any change here: the GENERAL varlen mechanism,
+// `positions[r] = r - cu[seq(r)]` (a per-row lookup TABLE rather than one
+// shared `seq`), is implemented on the RUST side as a pre-gather —
+// `../ops/rope_positions.rs`'s `gather_ragged_tables` index-selects the
+// caller's base `cos`/`sin` into a per-row `[total, d]` table BEFORE this
+// kernel ever launches, and the launch is made with `seq` set to `total`
+// (the gathered table's own row count). `token % seq` with `seq == total`
+// degenerates to `token % total == token` for every `token < total` — the
+// row index itself — so `position = token % seq`'s closed form, unchanged
+// here, already computes the right answer once the table has been
+// pre-gathered: no per-row lookup TABLE indexing was ever needed INSIDE
+// this kernel. See `../ops/rope_positions.rs`'s module doc, "The ragged
+// arm" section, for the Rust-side arm discriminant (`PositionArm`) that
+// selects which GUARDS apply to a given call — this kernel's own
+// per-element math has no arm-specific branch at all.
 //
 // ONE THREAD PER OUTPUT ELEMENT (`n = total*3*h*d`), grid-stride, no
 // per-row reduction — same shape as `rope.cu`'s own launch.

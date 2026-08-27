@@ -168,12 +168,15 @@ pub use dropout::{DropoutFused, PhiloxKatProbe};
 #[cfg(feature = "flash-attn")]
 pub use flash_attention::flash_attention_varlen_with_rope_test_only_bwd_window_override;
 #[cfg(feature = "flash-attn")]
-pub use flash_attention::{flash_attention_varlen, flash_attention_varlen_with_rope};
+pub use flash_attention::{
+    flash_attention_varlen, flash_attention_varlen_with_rope,
+    flash_attention_varlen_with_rope_ragged,
+};
 pub use geglu::{GegluFused, GeluVariant};
 pub use layer_norm::{LayerNormFused, MAX_HIDDEN};
 pub use low_rank_residual_linear::{DropoutKey, LowRankResidualLinear};
 pub use rope::{RopeFused, MAX_HEAD_DIM};
-pub use rope_positions::RopePositionsFused;
+pub use rope_positions::{rope_positions_fused_ragged, RopePositionsFused};
 pub use saved::{Saved, SavedError};
 pub use scaled_cast_add::ScaledCastAdd;
 pub use softmax::{

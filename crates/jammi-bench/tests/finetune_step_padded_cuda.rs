@@ -34,10 +34,16 @@
 //!    turns `FLASH_COMPILED` on (via `jammi-encoders`'s `flash-attn`
 //!    feature, which forwards to `jammi-kernels/flash-attn` — see that
 //!    crate's `Cargo.toml`).
-//! 3. Compute-capability ARCH — `jammi_kernels::admission::
-//!    probe_cuda_compute_capability(&device).meets_minimum()`, i.e.
-//!    `sm_80`/Ampere or newer (`MIN_CUDA_COMPUTE_CAP`); the flash cascade's
-//!    own domain predicate declines below this regardless of compilation.
+//! 3. Compute-capability ARCH — EXACTLY `sm_80` (compute capability `(8,
+//!    0)`), mirroring `jammi-encoders::modernbert`'s own `flash_arch_ok`
+//!    (`probe_cuda_compute_capability(device) ==
+//!    Some(ComputeCapability::new(8, 0))`) — NOT
+//!    `jammi_kernels::admission::ComputeCapability::meets_minimum` (which
+//!    accepts `sm_80` OR NEWER, e.g. sm89/L40S or sm90/H100). The flash
+//!    cascade's own domain predicate (`flash_arch_ok`'s call site,
+//!    `"arch_is_sm80_exact"`) declines on anything other than exactly `(8,
+//!    0)`, regardless of compilation — a device above sm80 is NOT flash-
+//!    eligible on this codebase today.
 //!
 //! [`a5_padded_block_arm_vram_baseline_leg`] needs ONLY precondition 1: it
 //! disables `attention_block_flash` via the env-var registry, and
@@ -82,11 +88,20 @@ fn cuda_available() -> bool {
 
 /// Precondition 2+3 (module doc): a usable CUDA device AND this build's
 /// `jammi-kernels` compiled with `flash-attn` AND that device's compute
-/// capability meets the flash cascade's own `sm_80` minimum
-/// (`jammi_kernels::admission::MIN_CUDA_COMPUTE_CAP`). Any one of the three
-/// missing means the flash arm is not actually ELIGIBLE to fuse on this
-/// host/build — `false` here, never a panic; the caller decides what to do
-/// with that (see `skip_without_flash_capable_cuda!`, below).
+/// capability is EXACTLY `sm_80` (compute capability `(8, 0)`) — the SAME
+/// equality `jammi-encoders::modernbert`'s own `flash_arch_ok` checks
+/// (`probe_cuda_compute_capability(device) ==
+/// Some(ComputeCapability::new(8, 0))`, admitted with reason
+/// `"arch_is_sm80_exact"`), deliberately NOT
+/// `jammi_kernels::admission::ComputeCapability::meets_minimum` (a `>=`
+/// check) — the flash cascade's own domain predicate admits ONLY exactly
+/// sm80 today, so a `meets_minimum` gate here would read an sm89 (L40S) or
+/// sm90 (H100) host as flash-capable when the predicate it is meant to
+/// mirror would decline it, hard-failing this leg's `fused > 0` assertion
+/// on those hosts. Any one of the three missing means the flash arm is not
+/// actually ELIGIBLE to fuse on this host/build — `false` here, never a
+/// panic; the caller decides what to do with that (see
+/// `skip_without_flash_capable_cuda!`, below).
 ///
 /// Does not itself require [`cuda_available`] to have been checked first —
 /// a missing device makes `Device::new_cuda(0)` fail, which this function
@@ -97,9 +112,10 @@ fn flash_capable_cuda() -> bool {
         return false;
     }
     match candle_core::Device::new_cuda(0) {
-        Ok(device) => jammi_kernels::admission::probe_cuda_compute_capability(&device)
-            .map(|cap| cap.meets_minimum())
-            .unwrap_or(false),
+        Ok(device) => {
+            jammi_kernels::admission::probe_cuda_compute_capability(&device)
+                == Some(jammi_kernels::admission::ComputeCapability::new(8, 0))
+        }
         Err(_) => false,
     }
 }
@@ -128,11 +144,15 @@ macro_rules! skip_without_cuda {
 
 /// Early-return with a loud, stated skip reason when the flash arm is not
 /// actually eligible to fuse on this host/build — CUDA device present but
-/// EITHER `jammi-kernels` was not compiled with `flash-attn` OR the device
-/// is below `sm_80`. A leg gated only on [`skip_without_cuda`] but that
-/// asserts a live flash dispatch (`fused > 0`) would hard-fail here instead
-/// of honestly skipping — see this file's own module doc for why a plain
-/// `#[cfg(feature = "cuda")]` build does not imply flash is compiled.
+/// EITHER `jammi-kernels` was not compiled with `flash-attn` OR the device's
+/// compute capability is not EXACTLY `sm_80` (e.g. sm89/L40S, sm90/H100, or
+/// anything below sm80 all skip alike — the flash cascade's own domain
+/// predicate, `"arch_is_sm80_exact"`, admits only `(8, 0)`). A leg gated
+/// only on [`skip_without_cuda`] but that asserts a live flash dispatch
+/// (`fused > 0`) would hard-fail here instead of honestly skipping — see
+/// this file's own module doc for why a plain `#[cfg(feature = "cuda")]`
+/// build does not imply flash is compiled, and why "sm80 or newer" is not
+/// this predicate's actual domain.
 macro_rules! skip_without_flash_capable_cuda {
     ($test_name:literal) => {
         if !cuda_available() {
@@ -149,8 +169,10 @@ macro_rules! skip_without_flash_capable_cuda {
                  either this build's jammi-kernels was not compiled with the flash-attn \
                  feature (FLASH_COMPILED=false; rebuild with `--features \
                  cuda,jammi-encoders/flash-attn`, the same CLI form stacked_sweep.sh uses), or \
-                 the device's compute capability is below the flash cascade's own sm_80 \
-                 minimum (jammi_kernels::admission::MIN_CUDA_COMPUTE_CAP)",
+                 the device's compute capability is not EXACTLY sm_80 (the flash cascade's own \
+                 domain predicate, jammi_encoders::modernbert's flash_arch_ok / \
+                 \"arch_is_sm80_exact\", admits only compute capability (8, 0) — sm89/L40S and \
+                 sm90/H100 hosts decline here too, not only sub-sm80 ones)",
                 $test_name
             );
             return;
@@ -308,14 +330,34 @@ fn a5_padded_block_arm_vram_baseline_leg() {
 ///     gradient comparison between the two arms would NOT be expected to
 ///     agree on pad-row gradients even in a fully correct implementation —
 ///     never read a divergence there as a bug without checking this first.
-/// (c) The padded fixture's MASK-PATH sync cost (path F, a device
-///     reduction + one D2H sync per forward — see
-///     `jammi_encoders::modernbert`'s own `compute_lengths_and_prefix` doc)
-///     is attributed to the fixture/identity here (`row_lengths` came from
-///     THIS binary's own trusted host-side vector, never re-derived from
-///     the device — `forward_with_lengths`'s path P, contract v4 §3.7 —
-///     so THIS leg pays zero `flash_d2h_syncs`), not folded silently into
-///     either arm's step-time number as an unattributed confound.
+/// (c) ASYMMETRIC PER-FORWARD SYNC COST, attributed here rather than left
+///     as an unstated confound inside either arm's step-time number: this
+///     leg's `flash` arm passes `Some(row_lengths)` into
+///     `forward_with_lengths` (path P), and — since the M1b audit's finding
+///     3 upgrade — path P no longer trusts `is_prefix` on faith. Every time
+///     the flash admission cascade actually reaches
+///     `resolve_lengths_and_prefix` (i.e. every forward on this leg's
+///     `flash` arm, which clears every cheaper capability/domain gate
+///     first), `trusted_lengths_agree_with_mask` pays exactly ONE device
+///     reduction + ONE D2H `to_vec1` sync — the SAME sync class path F's
+///     `compute_lengths_and_prefix` already pays, per that function's own
+///     doc — to prove the host-supplied `row_lengths` really agrees with
+///     the device-side mask before `is_prefix = true` is ever returned.
+///     This leg's `block` arm pays NONE of that: `JAMMI_KERNELS_DISABLE=
+///     attention_block_flash` makes `admit_cascade`'s `op_is_disabled`
+///     check fire FIRST (contract v4 §3.1 item 3), before
+///     `flash_admission_predicate`/`resolve_lengths_and_prefix` is ever
+///     invoked, so the mask-agreement sync is never reached. The two arms'
+///     step-time numbers are therefore NOT sync-symmetric: the `flash` arm
+///     carries one extra device reduction + D2H round-trip per forward that
+///     the `block` arm structurally cannot pay. This is not a benchmark
+///     artifact to subtract out — the validation is part of the flash arm's
+///     real production cost on the public `forward_with_lengths` edge (it
+///     exists to catch a lying `trusted_lengths` before it drives
+///     `unpad_gather_indices`/`repad_rows`) — so it rides inside the flash
+///     arm's measured `s_per_step_p50` by design; a reader comparing the
+///     two arms' step times must account for it explicitly rather than
+///     assume both pay the same mask-path sync cost.
 #[test]
 fn a3_padded_loss_sequence_flash_vs_block_ab() {
     skip_without_flash_capable_cuda!("a3_padded_loss_sequence_flash_vs_block_ab");

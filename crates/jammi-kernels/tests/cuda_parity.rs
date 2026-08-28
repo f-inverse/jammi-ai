@@ -277,8 +277,8 @@ const F32_CANCELLATION_ULPS: f32 = 24.0;
 /// The `k_abs` term for every [`f32_two_term_bound`] call belonging to a
 /// PURELY ELEMENTWISE op with no reduction and therefore no cancellation
 /// to produce a near-zero, ill-conditioned reference: `axpy` (`alpha*x +
-/// y`), `rope` f32 (`x*cos + rotate_half(x)*sin`), `geglu` f32 (`gelu(gate)
-/// * up`), `scaled_cast_add` f32 (`base + lora*scaling`), `dropout` f32
+/// y`), `rope` f32 (`x*cos + rotate_half(x)*sin`), `geglu` f32 (`gelu(gate) *
+/// up`), `scaled_cast_add` f32 (`base + lora*scaling`), `dropout` f32
 /// (`x / (1-p)` at a kept position). Each of these composes at most a
 /// small, fixed number of `f32` roundings/fmad-contractions per output
 /// element (2-3, matching each leg's own `k_rel` citation) — a
@@ -10122,10 +10122,10 @@ fn mem_efficient_cuda_matches_cpu_rope_bf16() {
 /// `half_window=64` (production `local_attention=128`'s own half-width)
 /// with `lengths=[1200, 900, 70]` — every real row length `>= half_window
 /// + 2 = 66` (the M1b window-visibility discipline this crate's own band
-/// tests already establish: a shorter real length would make the
-/// fully-masked-row PREDICATE, not the band predicate, the effective
-/// constraint, hiding what this leg means to exercise) — asserted
-/// in-test, not merely stated in prose (round-6 audit advisory).
+///   tests already establish: a shorter real length would make the
+///   fully-masked-row PREDICATE, not the band predicate, the effective
+///   constraint, hiding what this leg means to exercise) — asserted
+///   in-test, not merely stated in prose (round-6 audit advisory).
 #[test]
 fn mem_efficient_cuda_matches_cpu_band_multi_chunk_f32() {
     let Some(cuda) = cuda_device() else {

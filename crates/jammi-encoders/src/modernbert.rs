@@ -828,17 +828,25 @@ impl ModernBertAttention {
     /// `local_band` is the `[1, 1, seq, seq]` sliding-window mask, supplied
     /// whenever the model has any local layer. A global layer ignores it.
     /// `fused_masks` is the per-forward [`FusedAttentionMasks`] bundle:
-    /// REQUIRED in training mode (a typed `Config` refusal otherwise — the
+    /// REQUIRED in training mode WHENEVER this call reaches the non-
+    /// transport body below (a typed `Config` refusal otherwise — the
     /// fused arm never rebuilds it per layer), ignored in eval (eval never
     /// reads it; passing `Some` or `None` there is byte-identical — see
-    /// `tests::attention_block_eval_output_is_bit_identical_regardless_of_fused_eligibility`).
+    /// `tests::attention_block_eval_output_is_bit_identical_regardless_of_fused_eligibility`),
+    /// and ALSO ignored on the padded-transport branch (`flash` carrying a
+    /// genuinely-padded `FlashDecision::Fused`) — `None` there is not just
+    /// tolerated, it is [`ModernBert::forward_hidden_with_lengths`]'s
+    /// EXPECTED input on that branch (M1b audit A5-confound advisory: the
+    /// caller skips building the `batch·seq²`-class bundle entirely when it
+    /// knows every layer will take this branch instead).
     ///
-    /// | `self.training` | `fused_masks` | outcome |
-    /// |---|---|---|
-    /// | `false` | `None` | eval path |
-    /// | `false` | `Some` | eval path (identical output; the bundle is unread) |
-    /// | `true` | `Some` | training path |
-    /// | `true` | `None` | `EncoderError::Config` (`tests::training_attention_forward_without_fused_masks_is_a_typed_refusal`) |
+    /// | `self.training` | `flash` transports | `fused_masks` | outcome |
+    /// |---|---|---|---|
+    /// | `false` | n/a | `None` | eval path |
+    /// | `false` | n/a | `Some` | eval path (identical output; the bundle is unread) |
+    /// | `true` | no | `Some` | training path |
+    /// | `true` | no | `None` | `EncoderError::Config` (`tests::training_attention_forward_without_fused_masks_is_a_typed_refusal`) |
+    /// | `true` | yes | `None` | padded-transport path (the bundle is unread; this is the caller's normal, expected input) |
     ///
     /// **Shape story (P6 Stage B B3-padded, contract v4 §3.1 item 2):**
     /// `hidden` is `[batch, seq, hidden]` for every row above EXCEPT one —
@@ -1295,7 +1303,6 @@ impl ModernBertAttention {
     /// what keeps this arm's whole call chain rank-2 until
     /// `ModernBert::forward_hidden_with_lengths`'s own `repad_rows` after
     /// the last layer.
-    #[allow(clippy::too_many_arguments)]
     #[cfg(feature = "flash-attn")]
     fn forward_flash_ragged_attention(
         &self,
@@ -1327,7 +1334,6 @@ impl ModernBertAttention {
     /// arm: structurally unreachable at runtime (`decide_flash_admission`
     /// gates `PredicateOutcome::Holds` on `FLASH_COMPILED`), but the call
     /// site must still compile without the `flash-attn` feature.
-    #[allow(clippy::too_many_arguments)]
     #[cfg(not(feature = "flash-attn"))]
     fn forward_flash_ragged_attention(
         &self,
@@ -2098,6 +2104,43 @@ fn flash_capability_gates(
     None
 }
 
+/// Device-side validation for path P's `trusted_lengths` (M1b audit finding
+/// 3): `Ok(true)` iff `mask` is EXACTLY the right-padded prefix mask
+/// `trusted` claims — `mask[b, s] == 1.0` iff `s < trusted[b]`, for every
+/// `(b, s)`. Built the same way [`compute_lengths_and_prefix`] reconstructs
+/// its own prefix check (an `iota` compared against a broadcast length
+/// column), except the length column comes from `trusted` (host-supplied)
+/// rather than a device-side `sum`, since path P's whole point is to avoid
+/// re-deriving `lengths` itself. Pays exactly ONE device reduction (a
+/// `min_all` over the elementwise-equality tensor) + ONE D2H read of a
+/// single `bool` via `to_vec1` — the SAME sync class
+/// [`compute_lengths_and_prefix`] (path F) already pays for its own
+/// `lengths`+`is_prefix` transfer, not a second, independent one.
+///
+/// `batch`/`seq` are passed in (not re-derived from `mask.dims2()`) because
+/// the caller, [`resolve_lengths_and_prefix`], already validated them
+/// against `trusted.len()` before calling this — re-deriving here would
+/// just be a second, redundant `?` on the same `Result`.
+fn trusted_lengths_agree_with_mask(
+    mask: &Tensor,
+    trusted: &[usize],
+    batch: usize,
+    seq: usize,
+) -> Result<bool, EncoderError> {
+    let mask_f32 = mask.to_dtype(DType::F32)?;
+    let trusted_f32: Vec<f32> = trusted.iter().map(|&l| l as f32).collect();
+    let trusted_col = Tensor::from_vec(trusted_f32, (batch, 1), mask.device())?;
+    let iota = Tensor::arange(0u32, seq as u32, mask.device())?
+        .to_dtype(DType::F32)?
+        .reshape((1, seq))?;
+    let reconstructed = iota.broadcast_lt(&trusted_col)?.to_dtype(DType::F32)?;
+    let row_matches = mask_f32.eq(&reconstructed)?.to_dtype(DType::F32)?;
+    let agrees_scalar = row_matches.min_all()?.reshape(1)?;
+    let agrees_host: Vec<f32> = agrees_scalar.to_vec1()?;
+    FLASH_D2H_SYNCS.fetch_add(1, Ordering::Relaxed);
+    Ok(agrees_host[0] != 0.0)
+}
+
 /// The tail of [`flash_admission_predicate`] — everything AFTER the cheap,
 /// device/build capability gates (feature compiled, CUDA, arch) — split out
 /// so path P's `trusted_lengths` branch and path F's device-reduction
@@ -2110,15 +2153,22 @@ fn resolve_lengths_and_prefix(
 ) -> FlashPredicateResult {
     let (lengths, is_prefix) = match trusted_lengths {
         Some(trusted) => {
-            // Path P (contract v4 §3.7, v5 item 3): the caller ALREADY
-            // knows the row lengths (its own tokenizer's output, e.g.
-            // `encode_texts`) and asserts `mask` was built by a
-            // construction that is a right-padded prefix by CONSTRUCTION
-            // (the same `BatchLongest` premise `trainer.rs` relies on) —
-            // trusted, not re-derived from `mask` on the device, which is
-            // the whole point: this path pays ZERO `flash_d2h_syncs`. Only
-            // a cheap, host-only shape check remains (family D: even a
-            // trusted input gets ITS OWN domain check, not blind faith).
+            // Path P (contract v4 §3.7, v5 item 3), UPGRADED by the M1b
+            // audit's finding 3: the caller supplies row lengths from its
+            // own tokenizer output (e.g. `encode_texts`), so `lengths`
+            // itself is never RE-SUMMED from `mask` on the device — but
+            // `is_prefix` is no longer taken on faith. Since P6 Stage B
+            // B3-padded, a lying `trusted_lengths` does not just steer a
+            // flash-eligibility DECISION, it drives `unpad_gather_indices`
+            // (which rows exist) and `repad_rows`' zero-fill (silent
+            // token-dropping on the PUBLIC `forward_with_lengths` edge) —
+            // family D's "even a trusted input gets its own domain check"
+            // now means a DEVICE check, not just the cheap host-only shape
+            // facts below. `trusted_lengths_agree_with_mask` pays exactly
+            // ONE device reduction + ONE D2H `bool` read — the SAME sync
+            // class [`compute_lengths_and_prefix`] (path F) already pays —
+            // to prove `mask` really is the right-padded prefix `trusted`
+            // claims before `is_prefix = true` is ever returned.
             let (batch, seq) = mask.dims2()?;
             if trusted.len() != batch {
                 return Ok((
@@ -2131,6 +2181,13 @@ fn resolve_lengths_and_prefix(
                 return Ok((
                     PredicateOutcome::DomainMiss,
                     "trusted_lengths_within_seq",
+                    None,
+                ));
+            }
+            if !trusted_lengths_agree_with_mask(mask, trusted, batch, seq)? {
+                return Ok((
+                    PredicateOutcome::DomainMiss,
+                    "trusted_lengths_match_mask",
                     None,
                 ));
             }
@@ -2386,18 +2443,29 @@ impl ModernBert {
     /// [`Self::forward_hidden`], but with the batch's row `lengths`
     /// ALREADY known host-side — e.g. from the SAME tokenizer call that
     /// produced `input_ids`/`mask` (`encode_texts`, `trainer.rs`'s
-    /// `BatchLongest` right-padding). `lengths` is a TRUST boundary
-    /// (family D still applies at the edge, but the edge moves to the
-    /// CALLER): this function does NOT re-derive lengths or re-verify the
-    /// prefix structure from `mask` on the device — that is exactly the
-    /// `flash_d2h_syncs` sync path P exists to avoid paying — it only
-    /// checks the cheap, host-only shape facts `flash_admission_predicate`'s
-    /// `trusted_lengths` branch documents (length count matches batch, each
-    /// length `<= seq`). A caller whose `lengths` do NOT actually match
-    /// `mask`'s real padding structure gets a WRONG flash-eligibility
-    /// decision, not a caught error — this is the documented cost of
-    /// skipping the sync, not a silently-tolerated bug. `lengths: None` is
-    /// [`Self::forward_hidden`]'s exact prior behaviour (path F, unchanged).
+    /// `BatchLongest` right-padding). `lengths` is a TRUST boundary only in
+    /// the sense that `lengths` itself is never RE-SUMMED from `mask` on
+    /// the device (that count is exactly what path P exists to avoid
+    /// re-deriving) — `is_prefix` is NOT taken on faith (M1b audit finding
+    /// 3, contract v4 §3.7 upgraded): `resolve_lengths_and_prefix`'s
+    /// `trusted_lengths` branch reconstructs the right-padded prefix mask
+    /// `lengths` claims and compares it, elementwise, against the real
+    /// `mask` on the device (`trusted_lengths_agree_with_mask` — one
+    /// reduction + one D2H `bool` read, the SAME sync class
+    /// `compute_lengths_and_prefix`/path F already pays; this function no
+    /// longer claims path P is zero-sync). The cheap, host-only shape facts
+    /// still run FIRST (length count matches batch, each length `<= seq`),
+    /// but a caller whose `lengths` do NOT actually match `mask`'s real
+    /// padding structure now gets a typed `PredicateOutcome::DomainMiss`
+    /// (`"trusted_lengths_match_mask"`) — flash declines to the eager/block
+    /// arm — never a silently wrong flash-eligibility decision. That
+    /// distinction matters more than it used to: since P6 Stage B
+    /// B3-padded, `lengths`/`is_prefix` also drive `unpad_gather_indices`
+    /// (which rows exist) and `repad_rows`' zero-fill on the transport arm,
+    /// so a lying `lengths` would otherwise silently drop or zero-fill real
+    /// tokens, not just mis-route a flash-eligibility bit. `lengths: None`
+    /// is [`Self::forward_hidden`]'s exact prior behaviour (path F,
+    /// unchanged).
     pub fn forward_hidden_with_lengths(
         &self,
         input_ids: &Tensor,
@@ -2428,7 +2496,7 @@ impl ModernBert {
         lengths: Option<&[usize]>,
         forced_flash: ForcedFlash,
     ) -> Result<Tensor, EncoderError> {
-        let (_batch, seq) = input_ids.dims2()?;
+        let (batch, seq) = input_ids.dims2()?;
         if seq > self.max_position_embeddings {
             return Err(EncoderError::SequenceTooLong {
                 seq,
@@ -2436,52 +2504,40 @@ impl ModernBert {
             });
         }
 
+        // M1b audit finding 4: a cheap, host-side (no device sync) shape
+        // guard at the transport entry. Nothing downstream re-checks
+        // `mask`'s shape against `input_ids`' before it drives
+        // `unpad_gather_indices`/`unpad_rows`/`repad_rows` — those built
+        // `gather_indices` from `mask`'s own `seq` (via
+        // `resolve_lengths_and_prefix`) and then apply it to `hidden`,
+        // which is shaped from `input_ids`' `seq`. When the two disagree
+        // (`mask_seq < seq` in particular), `unpad_rows`' `x.reshape((b *
+        // s, h))` silently uses THE WRONG STRIDE for indices computed under
+        // the other `seq`, so `index_select` gathers the wrong flat rows —
+        // a confident wrong `[batch, seq, hidden]` tensor, not a caught
+        // error (family D: no numeric edge gets to skip its own domain
+        // check just because the removed `extended_mask` read used to make
+        // a mismatch loud incidentally). Refused here, before any of that
+        // machinery runs.
+        let (mask_batch, mask_seq) = mask.dims2()?;
+        if mask_batch != batch || mask_seq != seq {
+            return Err(EncoderError::Config(format!(
+                "mask shape [{mask_batch}, {mask_seq}] does not match input_ids shape \
+                 [{batch}, {seq}] -- a shape mismatch here would otherwise silently gather/\
+                 scatter the wrong rows on the padded-transport arm (unpad_rows/repad_rows) \
+                 and return a confident-wrong [batch, seq, hidden] tensor, never a caught \
+                 error"
+            )));
+        }
+
         let word_emb = self.word_embeddings.forward(input_ids)?;
         let mut hidden = self.emb_norm.forward(&word_emb)?;
 
-        let extended = extended_attention_mask(mask)?;
-        // Built once per forward, not per layer: the band depends only on the
-        // sequence length and the window, so every local layer shares it.
-        let local_band = match self.local_half_window {
-            None => None,
-            Some(half) => Some(self.sliding_band(seq, half, input_ids.device())?),
-        };
-        // The FUSED training arm's masks, built ONCE per forward (at most
-        // 3 launches — see `FusedAttentionMasks`'s doc for the count the
-        // per-layer alternative paid) and shared by every layer; eval
-        // never reads them, so they are not built there.
-        //
-        // KNOWN GAP, NOT FIXED THIS ROUND (P3 fix round 4, B4 — deferred a
-        // THIRD time, honestly, rather than risk a hard regression this
-        // late in the round): this bundle is built whenever `self.training`
-        // is true, regardless of `head_dim`, even though
-        // `AttentionBlockFused` admits ONLY `head_dim ==
-        // ATTENTION_BLOCK_HEAD_DIM` (module doc's "Fixed domain" section)
-        // — a head_dim-16 checkpoint (the cookbook's own
-        // `tiny_modernbert_local` fixture) never dispatches fused and pays
-        // a `batch·seq²` allocate-add-cast every training forward it
-        // cannot use. `ModernBertAttention::forward`'s OWN contract
-        // (this file, `fused_masks: Option<&FusedAttentionMasks>`'s doc
-        // table) makes `fused_masks` REQUIRED whenever `self.training` —
-        // `None` is a typed `Config` refusal, unconditionally, at EVERY
-        // layer, not just a fusable one — so skipping construction here
-        // for a non-fusable model requires first relaxing that contract to
-        // "required only at a layer that can actually dispatch fused",
-        // which is a real (if small) change to error-path behaviour this
-        // round did not have time to make and verify safely.
-        let fused_masks = if self.training {
-            Some(FusedAttentionMasks::build(
-                &extended,
-                local_band.as_ref(),
-                hidden.dtype(),
-            )?)
-        } else {
-            None
-        };
-        // The flash-cascade decision (contract v4 §3.2), decided ONCE per
-        // forward exactly like `fused_masks` above — `None` in eval (the
-        // flash arm is training-only, contract v4 §2 scope: "eval/serving
-        // stays eager"). `mask` (not `extended`, which is already additive
+        // The flash-cascade decision (contract v4 §3.2) is decided ONCE per
+        // forward, and — per the M1b audit's A5-confound advisory — BEFORE
+        // the mask bundle below, not after: `None` in eval (the flash arm
+        // is training-only, contract v4 §2 scope: "eval/serving stays
+        // eager"). `mask` (not `extended`, which is already additive
         // `0`/`MASKED_LOGIT`-valued) is the raw `0.0`/`1.0` padding mask
         // `compute_lengths_and_prefix` needs.
         let flash_admission = if self.training {
@@ -2525,6 +2581,58 @@ impl ModernBert {
             Some(FlashDecision::Fused(admission)) if !admission.is_dense => Some(admission),
             _ => None,
         };
+
+        let extended = extended_attention_mask(mask)?;
+        // Built once per forward, not per layer: the band depends only on the
+        // sequence length and the window, so every local layer shares it.
+        let local_band = match self.local_half_window {
+            None => None,
+            Some(half) => Some(self.sliding_band(seq, half, input_ids.device())?),
+        };
+        // The FUSED training arm's masks, built ONCE per forward (at most
+        // 3 launches — see `FusedAttentionMasks`'s doc for the count the
+        // per-layer alternative paid) and shared by every layer; eval
+        // never reads them, so they are not built there. M1b audit
+        // A5-confound advisory: also skipped when `transport.is_some()` —
+        // `ModernBertAttention::forward`'s own doc table records that the
+        // transport branch returns from `forward_padded_transport_attention`
+        // BEFORE `fused_masks` (or `extended`/`local_band`) is ever read,
+        // and the once-per-forward `flash_admission` above is deterministic
+        // across every layer in this process, so a forward that transports
+        // is GUARANTEED every layer takes that early-return branch — this
+        // is a real `batch·seq²`-class allocate-add-cast this forward would
+        // otherwise pay and never use, sitting unattributed inside a
+        // peak-VRAM measurement.
+        //
+        // KNOWN GAP, NOT FIXED THIS ROUND (P3 fix round 4, B4 — deferred a
+        // THIRD time, honestly, rather than risk a hard regression this
+        // late in the round): this bundle is STILL built whenever
+        // `self.training` and NOT transporting, regardless of `head_dim`,
+        // even though `AttentionBlockFused` admits ONLY `head_dim ==
+        // ATTENTION_BLOCK_HEAD_DIM` (module doc's "Fixed domain" section)
+        // — a head_dim-16 checkpoint (the cookbook's own
+        // `tiny_modernbert_local` fixture) never dispatches fused and pays
+        // a `batch·seq²` allocate-add-cast every non-transporting training
+        // forward it cannot use. `ModernBertAttention::forward`'s OWN
+        // contract (this file, `fused_masks: Option<&FusedAttentionMasks>`'s
+        // doc table) makes `fused_masks` REQUIRED whenever `self.training`
+        // AND not transporting — `None` is a typed `Config` refusal,
+        // unconditionally, at EVERY non-transporting layer, not just a
+        // fusable one — so skipping construction here for a non-fusable
+        // model requires first relaxing that contract to "required only at
+        // a layer that can actually dispatch fused", which is a real (if
+        // small) change to error-path behaviour this round did not have
+        // time to make and verify safely.
+        let fused_masks = if self.training && transport.is_none() {
+            Some(FusedAttentionMasks::build(
+                &extended,
+                local_band.as_ref(),
+                hidden.dtype(),
+            )?)
+        } else {
+            None
+        };
+
         if let Some(admission) = transport {
             hidden = unpad_rows(&hidden, &admission.gather_indices)?;
         }
@@ -3107,29 +3215,73 @@ mod tests {
         assert!(!Device::Cpu.is_cuda());
     }
 
-    /// Path P (contract v4 §3.7, v5 item 3): trusted host-side lengths pay
-    /// ZERO `flash_d2h_syncs` — the whole point of skipping the device
-    /// reduction — and still reach `Holds` with the right `CompactedBatch`
-    /// inputs.
+    /// Path P (contract v4 §3.7, v5 item 3, UPGRADED by M1b audit finding
+    /// 3): trusted host-side lengths that genuinely agree with `mask`'s
+    /// real padding structure still reach `Holds` with the right
+    /// `CompactedBatch` inputs — but now pay exactly ONE `flash_d2h_syncs`
+    /// (the SAME sync class path F/`compute_lengths_and_prefix` already
+    /// pays), not zero: `is_prefix` is a COMPUTED truth, proved against
+    /// `mask` on the device, never fabricated.
     #[test]
-    fn resolve_lengths_and_prefix_trusted_lengths_pays_zero_d2h_syncs() {
+    fn resolve_lengths_and_prefix_trusted_lengths_matching_mask_reaches_holds_paying_one_d2h_sync()
+    {
         let _guard = FLASH_D2H_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let device = Device::Cpu;
-        // The mask's OWN bytes are irrelevant on the trusted-lengths path
-        // (never read for lengths/prefix) — deliberately NOT matching the
-        // trusted lengths here, to prove that.
-        let mask = Tensor::zeros((2, 5), DType::F32, &device).unwrap();
+        // A genuine right-padded prefix mask matching trusted = [3, 5]
+        // exactly: row 0 has 3 real tokens then 2 pad, row 1 is full.
+        let mask = Tensor::from_slice(
+            &[1f32, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+            (2, 5),
+            &device,
+        )
+        .unwrap();
         let before = flash_d2h_syncs();
         let (outcome, reason, eligible) =
             resolve_lengths_and_prefix(&mask, Some(&[3usize, 5usize])).unwrap();
         let after = flash_d2h_syncs();
-        assert_eq!(after, before, "path P must pay ZERO device syncs");
+        assert_eq!(
+            after,
+            before + 1,
+            "path P's validation pays exactly ONE device sync, the same class path F pays"
+        );
         assert_eq!(outcome, PredicateOutcome::Holds, "reason={reason}");
         let (lengths, seq) = eligible.unwrap();
         assert_eq!(lengths, vec![3, 5]);
         assert_eq!(seq, 5);
+    }
+
+    /// M1b audit finding 3's core regression test: `trusted_lengths` that
+    /// UNDER-REPORTS a real row (mask row 0 has 4 real tokens, `trusted`
+    /// claims only 3) must produce a typed `DomainMiss`, never a silently
+    /// fabricated `Holds`/`is_prefix = true` that would go on to feed
+    /// `unpad_gather_indices`/`repad_rows` a wrong row count.
+    #[test]
+    fn resolve_lengths_and_prefix_trusted_lengths_under_reporting_a_row_is_domain_miss() {
+        let _guard = FLASH_D2H_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let device = Device::Cpu;
+        // Row 0 is REALLY 4 real tokens (`[1,1,1,1,0]`); `trusted` lies and
+        // claims only 3.
+        let mask = Tensor::from_slice(
+            &[1f32, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+            (2, 5),
+            &device,
+        )
+        .unwrap();
+        let before = flash_d2h_syncs();
+        let (outcome, reason, eligible) =
+            resolve_lengths_and_prefix(&mask, Some(&[3usize, 5usize])).unwrap();
+        let after = flash_d2h_syncs();
+        assert_eq!(after, before + 1, "the device validation still ran");
+        assert_eq!(outcome, PredicateOutcome::DomainMiss);
+        assert_eq!(reason, "trusted_lengths_match_mask");
+        assert!(
+            eligible.is_none(),
+            "an under-reporting trusted_lengths must never reach Holds"
+        );
     }
 
     #[test]
@@ -6181,6 +6333,73 @@ mod tests {
             a, c,
             "wrong lengths must not change the block arm's output on this build"
         );
+    }
+
+    /// M1b audit finding 4: `mask.dim(1) != input_ids`'s `seq` must be a
+    /// typed refusal at the transport entry, not a silently wrong-shaped
+    /// `[batch, seq, hidden]` tensor built from mis-strided gathers. Covers
+    /// BOTH directions (`mask_seq < seq` and `mask_seq > seq`) and a
+    /// batch-count mismatch too.
+    #[test]
+    fn forward_hidden_mask_shape_mismatch_is_a_typed_refusal() {
+        let device = Device::Cpu;
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/tiny_modernbert_head64");
+        let config: ModernBertConfig =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                .unwrap();
+        let weights = dir.join("model.safetensors");
+        let varmap = candle_nn::VarMap::new();
+        let model = ModernBert::builder()
+            .build(&[weights.as_path()], &config, &device, &varmap)
+            .unwrap();
+        let input_ids =
+            Tensor::new(&[[2u32, 5, 10, 3, 7, 9], [4u32, 8, 1, 6, 0, 0]], &device).unwrap();
+
+        // mask_seq (4) < input_ids seq (6): the silent-wrong-gather case
+        // the finding names explicitly.
+        let short_mask = Tensor::new(&[[1u32, 1, 1, 1], [1u32, 1, 1, 0]], &device).unwrap();
+        let err = model
+            .forward_hidden_with_lengths(&input_ids, &short_mask, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("mask shape") && err.contains("input_ids shape"),
+            "mask_seq < seq must be refused at the transport entry -- got: {err}"
+        );
+
+        // mask_seq (8) > input_ids seq (6): the other direction.
+        let long_mask = Tensor::new(
+            &[[1u32, 1, 1, 1, 1, 1, 1, 1], [1u32, 1, 1, 1, 1, 1, 1, 1]],
+            &device,
+        )
+        .unwrap();
+        let err = model
+            .forward_hidden_with_lengths(&input_ids, &long_mask, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("mask shape") && err.contains("input_ids shape"),
+            "mask_seq > seq must be refused too -- got: {err}"
+        );
+
+        // batch-count mismatch too, not just seq.
+        let wrong_batch_mask = Tensor::new(&[[1u32, 1, 1, 1, 1, 1]], &device).unwrap();
+        let err = model
+            .forward_hidden_with_lengths(&input_ids, &wrong_batch_mask, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("mask shape") && err.contains("input_ids shape"),
+            "a batch-count mismatch must be refused too -- got: {err}"
+        );
+
+        // The agreeing case must still work (not a false positive).
+        let good_mask =
+            Tensor::new(&[[1u32, 1, 1, 1, 1, 1], [1u32, 1, 1, 1, 0, 0]], &device).unwrap();
+        model
+            .forward_hidden_with_lengths(&input_ids, &good_mask, None)
+            .expect("a mask that agrees with input_ids' shape must not be refused");
     }
 
     fn rope(head_dim: usize, max_seq: usize, theta: f64, device: &Device) -> RotaryEmbedding {

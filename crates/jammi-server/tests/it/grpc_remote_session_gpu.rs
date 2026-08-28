@@ -62,8 +62,29 @@
 //! construct and the test returns early with a `tracing::warn` (never a
 //! failure) — a clean skip, not a silent pass: on a CUDA host with a real
 //! parity break this is a hard RED (the whole point of the leg), and only the
-//! device-absent case is a no-op. Mirrors `grpc_embedding_gpu.rs`'s gating
-//! idiom exactly. Live run:
+//! device-absent case is a no-op.
+//!
+//! `JAMMI_REQUIRE_CUDA` is the repo-wide RED-on-demand hatch every other
+//! device-gated suite uses (`jammi-kernels/tests/cuda_parity.rs`,
+//! `jammi-encoders/tests/it/batch_composition_invariance.rs`'s
+//! `cuda_device_or_skip`, `jammi-bench::finetune_step`'s
+//! `vram_probe_present` lattice cells, `jammi-ai::fine_tune::optimizer`):
+//! with it set, EVERY skip/early-return path below — the
+//! `InferenceSession::open` failure inside [`start_gpu_engine_server`] and
+//! both tests' `let Some(server) = … else { return; }` — is a hard panic
+//! carrying the underlying error instead of a silent `None`/return, so a pod
+//! job that meant to prove this leg can never read green having executed
+//! zero assertions. Unset (the dev-box default), the polite skip is
+//! unchanged. Mirrors `grpc_embedding_gpu.rs`'s device-gating idiom, with the
+//! `JAMMI_REQUIRE_CUDA` opt-in-panic layered on top. Live run (pod / CI —
+//! fails loud instead of silently skipping):
+//!
+//! ```text
+//! JAMMI_REQUIRE_CUDA=1 cargo test -p jammi-server --features cuda,live-gpu-tests \
+//!   --test it grpc_remote_session_gpu -- --nocapture --test-threads=1
+//! ```
+//!
+//! Dev-box run (no GPU required, skips politely):
 //!
 //! ```text
 //! cargo test -p jammi-server --features cuda,live-gpu-tests --test it \
@@ -116,9 +137,13 @@ struct GpuEngineServer {
 /// pinned to the first CUDA device. Returns `None` — a clean skip — when no
 /// usable GPU opens, so this suite is a no-op off a CUDA host rather than a
 /// failure (mirrors `grpc_embedding_gpu.rs::start_gpu_embedding_server`
-/// exactly). A returned `Some` guarantees the session was constructed on the
-/// GPU, so every RPC against it (including the Flight SQL reads below) runs
-/// the real CUDA-served path.
+/// exactly), UNLESS `JAMMI_REQUIRE_CUDA` is set, in which case ANY
+/// `InferenceSession::open` failure — not just a device-absent one — is a
+/// hard panic carrying the underlying error, per the repo-wide
+/// `JAMMI_REQUIRE_CUDA` opt-in-panic idiom (see the module doc comment). A
+/// returned `Some` guarantees the session was constructed on the GPU, so
+/// every RPC against it (including the Flight SQL reads below) runs the real
+/// CUDA-served path.
 async fn start_gpu_engine_server() -> Option<GpuEngineServer> {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut cfg = test_config(dir.path());
@@ -131,6 +156,12 @@ async fn start_gpu_engine_server() -> Option<GpuEngineServer> {
     let session = match InferenceSession::open(cfg).await {
         Ok(session) => session,
         Err(err) => {
+            if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
+                panic!(
+                    "grpc_remote_session_gpu: JAMMI_REQUIRE_CUDA is set but \
+                     InferenceSession::open failed — refusing to silently skip: {err}"
+                );
+            }
             tracing::warn!(
                 "SKIP grpc_remote_session_gpu: no usable CUDA device — build with \
                  `--features cuda,live-gpu-tests` on a GPU host to run it ({err})"
@@ -203,6 +234,16 @@ fn keyed_vectors(table_name: &str, batches: &[RecordBatch]) -> Vec<(String, Vec<
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_flight_read_matches_local_readback_bitwise_on_gpu() {
     let Some(server) = start_gpu_engine_server().await else {
+        // `start_gpu_engine_server` already panics under `JAMMI_REQUIRE_CUDA`
+        // on any `open` failure, so a `None` here can only happen with the
+        // flag unset — reasserted for defense in depth (the same idiom
+        // `finetune_step.rs`'s `..._is_measured_on_a_box_with_nvidia_smi`
+        // uses at its own early-return).
+        assert!(
+            std::env::var_os("JAMMI_REQUIRE_CUDA").is_none(),
+            "remote_flight_read_matches_local_readback_bitwise_on_gpu: JAMMI_REQUIRE_CUDA is \
+             set but start_gpu_engine_server returned None — a silent skip is not acceptable"
+        );
         return;
     };
     let remote = remote(&server).await;
@@ -290,6 +331,16 @@ async fn remote_flight_read_matches_local_readback_bitwise_on_gpu() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn encode_query_two_compute_gpu_repeat_determinism_is_recorded_not_gated() {
     let Some(server) = start_gpu_engine_server().await else {
+        // See the sibling test's identical guard: `start_gpu_engine_server`
+        // already panics under `JAMMI_REQUIRE_CUDA` on any `open` failure, so
+        // this reasserts the invariant for defense in depth rather than
+        // trusting the helper alone.
+        assert!(
+            std::env::var_os("JAMMI_REQUIRE_CUDA").is_none(),
+            "encode_query_two_compute_gpu_repeat_determinism_is_recorded_not_gated: \
+             JAMMI_REQUIRE_CUDA is set but start_gpu_engine_server returned None — a silent \
+             skip is not acceptable"
+        );
         return;
     };
     let remote = remote(&server).await;

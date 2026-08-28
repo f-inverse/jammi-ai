@@ -66,12 +66,15 @@ from __future__ import annotations
 
 import json
 import os
+import statistics
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from identity_fields import (  # noqa: E402
     FINETUNE_IDENTITY_FIELDS,
     FINETUNE_NULL_IS_A_VALUE_FIELDS,
+    FINETUNE_RUN_IDENTITY_FIELDS,
+    FINETUNE_RUN_NULL_IS_A_VALUE_FIELDS,
     canonicalize_identity_field,
 )
 
@@ -1201,8 +1204,493 @@ def build_report(raw_dir, steps, warmup, pass_ratio, torch_lora_init="peft"):
     return merged, table
 
 
+# ============================================================================
+# unit 63 H4b — finetune-run A/B merger (docs-ci domain).
+#
+# Merge + sign-test stage for `ci/scripts/perf/finetune_run_ab.sh`'s
+# (seed, arm, repeat) legs -- NOT `finetune_ab.sh`-shaped (no torch reference,
+# no checkout-switching, no throughput ratio): this producer drives ONE
+# jammi binary over `{fused, alloff}` x N pre-registered seeds x `{r1, r2}`
+# same-seed repeats, against the committed `cookbook/fixtures/
+# finetune_heldout/` fixture (CONTRACT H3). The comparison here is
+# LEARNING OUTCOME (held-out example-mean loss), never throughput -- the
+# exact two-sided sign test over `d_i = fused - alloff` per seed is the
+# PRIMARY decision statistic (CONTRACT Frame / C16), computed INTO this
+# merged artifact rather than left to a human to re-derive from raw legs.
+#
+# `sign_test` below is a Python u128-equivalent mirror of
+# `jammi_numerics::stats::sign_test::sign_test` (branch `numerics/
+# 63-sign-test`, not yet on this tool's own base -- mirrored from that
+# module's own doc/tests, since Python's `int` is already arbitrary-
+# precision, no `checked_mul`/overflow-refusal machinery is needed to match
+# its EXACT-INTEGER discipline): the SAME multiplicative binomial-row
+# recurrence (`C(n,i) = C(n,i-1) * (n-i+1) // i`, exact integer division at
+# every step), the SAME `2 * P(X >= max(n_pos, n_neg))` capped at `1.0`,
+# ties excluded from `n` but reported on `SignTestResult.ties`, never
+# silently dropped, and the SAME three typed refusals (n=0 empty input,
+# n=0-via-all-ties with a distinct message, NaN differences) -- see
+# `sign_test`'s own doc for the field-by-field mirror.
+# ============================================================================
+
+FINETUNE_RUN_ARMS = ("fused", "alloff")
+FINETUNE_RUN_REPEATS = ("r1", "r2")
+
+# Premise legs (CONTRACT Frame / H4 / PLAN.md v2 delta 8, conjunctive with
+# the cross-arm identity check below -- ALL must hold for a seed's `d_i` to
+# be trusted):
+#
+#   * admission_is_dense — PRE-REGISTERED `False` (v2 delta 8): the
+#     committed arxiv fixture's variable-length pairs take the PADDED
+#     transport, never the dense branch T6's own 1.55x figure was measured
+#     on; a leg reading `True` is out of the scoped verdict, not merely a
+#     surprising number.
+#   * learning_happened_delta — must clear a strictly-positive floor: the
+#     CONTRACT's own RED control ("lr=0 arm x2 seeds fails learning-
+#     happened") is the falsification target this floor exists to catch --
+#     a leg whose train-side probe shows no observed learning cannot have
+#     its held-out movement attributed to training at all.
+#   * tie_fraction — must stay under a cap: C16's own hinge-saturation
+#     finding ("the bench's hinge saturates to loss_last == 0.0 on both
+#     arms at the shapes tried") is exactly a saturated-ties failure mode;
+#     MNRL (the amendment's default objective) keeps this leg as a cheap,
+#     normally-trivially-clearing invariant rather than a live risk, but the
+#     CONTRACT keeps it conjunctive regardless of which objective a run
+#     selected. 0.5 is chosen deliberately loose (an ordinary held-out
+#     batch's example-level ties are rare for either objective) and
+#     deliberately tight enough to catch the C16 saturation shape
+#     (tie_fraction -> 1.0) long before it reaches that ceiling.
+FINETUNE_RUN_EXPECTED_ADMISSION_IS_DENSE = False
+FINETUNE_RUN_LEARNING_HAPPENED_FLOOR = 0.0
+FINETUNE_RUN_TIE_FRACTION_CAP = 0.5
+
+
+class SignTestError(ValueError):
+    """Raised by `sign_test` for the three typed refusals its Rust twin
+    (`jammi_numerics::stats::sign_test::sign_test`) also raises: n=0 (empty
+    input), n=0-via-all-ties (a distinct message from the empty-input case),
+    and a NaN difference (no sign under IEEE-754). Never raised for
+    ±inf (a well-defined, non-zero, non-tie sign) or for an `n` too large to
+    represent -- Python's `int` is already arbitrary-precision, so the
+    `u128`-overflow refusal the Rust side needs (`n` in the ~125-127 range)
+    has no Python analogue; this mirror never refuses on `n` size.
+    """
+
+
+def sign_test(diffs):
+    """Exact two-sided sign test over paired differences `diffs[i] = a_i -
+    b_i` -- see this module section's own doc for the field-by-field mirror
+    of `jammi_numerics::stats::sign_test::sign_test`. Returns
+    `{"n", "n_pos", "n_neg", "ties", "p_value"}` (the SAME five fields
+    `SignTestResult` carries); raises `SignTestError` for the three typed
+    refusals.
+    """
+    if len(diffs) == 0:
+        raise SignTestError("sign test requires at least one paired difference (n=0)")
+    if any(d != d for d in diffs):  # NaN != NaN under IEEE-754 -- no math.isnan import needed
+        raise SignTestError("sign test requires non-NaN differences (NaN has no sign)")
+
+    n_pos = n_neg = ties = 0
+    # Fixed left-to-right fold order over the caller-supplied sequence,
+    # mirroring the Rust side's own pinned-order doc -- the classification
+    # of any single `d` does not depend on any other, so this does not
+    # affect the resulting counts, but it is pinned explicitly rather than
+    # left to an unspecified builtin partition.
+    for d in diffs:
+        if d == 0.0:
+            ties += 1
+        elif d > 0.0:
+            n_pos += 1
+        else:
+            n_neg += 1
+
+    n = n_pos + n_neg
+    if n == 0:
+        raise SignTestError(
+            f"sign test requires at least one non-tied pair; all {ties} difference(s) were exact ties"
+        )
+
+    t = max(n_pos, n_neg)
+    p_value = _sign_test_exact_two_sided_tail(n, t)
+    return {"n": n, "n_pos": n_pos, "n_neg": n_neg, "ties": ties, "p_value": p_value}
+
+
+def _sign_test_binomial_row(n):
+    """Row `n` of Pascal's triangle via the SAME multiplicative recurrence
+    `C(n,i) = C(n,i-1) * (n-i+1) / i` the Rust `binomial_row` uses -- exact
+    integer division at every step (a standard combinatorial identity: the
+    product is always evenly divisible by `i`), never a float/`lgamma`
+    approximation. Python's `int` needs no `checked_mul`/overflow-refusal
+    machinery here (see `SignTestError`'s own doc).
+    """
+    row = [1]  # C(n, 0)
+    for i in range(1, n + 1):
+        row.append(row[-1] * (n - i + 1) // i)
+    return row
+
+
+def _sign_test_exact_two_sided_tail(n, t):
+    """`2 * P(X >= t)` under `X ~ Binomial(n, 0.5)`, capped at `1.0` --
+    computed as an exact ratio of Python `int`s (the u128-equivalent: both
+    numerator and denominator are exact by construction, division to
+    `float` deferred to the single final step, matching the Rust side's own
+    "division deferred to the very last step" discipline) rather than a
+    floating-point CDF evaluation.
+    """
+    row = _sign_test_binomial_row(n)
+    denom = 1 << n
+    tail_sum = sum(row[t : n + 1])
+    numerator = tail_sum * 2
+    if numerator < denom:
+        return numerator / denom
+    return 1.0
+
+
+def finetune_run_block(report):
+    return report["tiers"]["finetune_run"]
+
+
+def finetune_run_leg_identity(tier):
+    """This leg's `FINETUNE_RUN_IDENTITY_FIELDS` values, reusing the SAME
+    generic premise-refusal core `encode_ab.sh`'s own merge step already
+    builds on (`generic_leg_identity_fields`) -- `margin`/`temperature`/
+    `max_grad_norm`/`warmup`/`row_lengths` fold a present `null` in as the
+    stated VALUE (per `FINETUNE_RUN_NULL_IS_A_VALUE_FIELDS`), every other
+    field folds a present `null` into MISSING.
+    """
+    return generic_leg_identity_fields(tier, FINETUNE_RUN_IDENTITY_FIELDS, FINETUNE_RUN_NULL_IS_A_VALUE_FIELDS)
+
+
+def finetune_run_arm_premise_violations(arm, tier):
+    """Per-arm conjunctive premise legs (CONTRACT Frame / H4 -- see this
+    module section's own doc for each leg's rationale): `admission_is_dense`
+    matches the pre-registered `False`, `learning_happened_delta` clears its
+    floor, `tie_fraction` stays under its cap. Independent of, and IN
+    ADDITION TO, the cross-arm identity check
+    (`generic_leg_premise_violations` over `FINETUNE_RUN_IDENTITY_FIELDS`)
+    -- this checks facts about ONE leg's own report, never a comparison
+    between two legs. Returns a list of strings, empty when every leg
+    clears.
+    """
+    violations = []
+    is_dense = tier.get("admission_is_dense")
+    if is_dense != FINETUNE_RUN_EXPECTED_ADMISSION_IS_DENSE:
+        violations.append(
+            f"{arm}: admission_is_dense={is_dense!r}, expected "
+            f"{FINETUNE_RUN_EXPECTED_ADMISSION_IS_DENSE!r} -- CONTRACT H4/v2 delta 8 "
+            "pre-registers the PADDED transport for the committed arxiv fixture "
+            "(variable-length pairs); a dense leg falls outside the scoped verdict"
+        )
+    delta = tier.get("learning_happened_delta")
+    if (
+        not isinstance(delta, (int, float))
+        or isinstance(delta, bool)
+        or not (delta > FINETUNE_RUN_LEARNING_HAPPENED_FLOOR)
+    ):
+        violations.append(
+            f"{arm}: learning_happened_delta={delta!r} does not clear the floor "
+            f"({FINETUNE_RUN_LEARNING_HAPPENED_FLOOR}) -- the train-side probe shows no "
+            "observed learning, so this leg's held-out movement cannot be attributed to "
+            "training (the CONTRACT's own RED-control precedent: an lr=0 arm fails exactly "
+            "this leg)"
+        )
+    tie = tier.get("tie_fraction")
+    if not isinstance(tie, (int, float)) or isinstance(tie, bool) or not (tie < FINETUNE_RUN_TIE_FRACTION_CAP):
+        violations.append(
+            f"{arm}: tie_fraction={tie!r} is not below the cap ({FINETUNE_RUN_TIE_FRACTION_CAP}) -- "
+            "C16's own hinge-saturation warning (a near-saturated tie fraction means the "
+            "held-out loss is not discriminating between examples)"
+        )
+    return violations
+
+
+def load_finetune_run_leg(raw_dir, seed, arm, repeat):
+    """Read one `finetune_run_ab.sh`-produced `.exit`/`.json`/`.stderr`
+    triple, named `seed{seed}__{arm}__{repeat}` (mirrors `finetune_ab.sh`'s
+    own `{config_slug}__{leg}` naming, with `seed{seed}` as this producer's
+    own config axis). Never raises: a MISSING/FAIL/DRY_RUN leg is a normal
+    row, not a script error -- same discipline as `load_leg` above.
+    """
+    base = os.path.join(raw_dir, f"seed{seed}__{arm}__{repeat}")
+    exit_path, out_path, err_path = base + ".exit", base + ".json", base + ".stderr"
+    if not os.path.exists(exit_path):
+        return {"outcome": "MISSING", "err_tail": "", "report": None}
+
+    with open(exit_path) as fh:
+        exit_code = fh.read().strip()
+    err_tail = ""
+    if os.path.exists(err_path):
+        with open(err_path, errors="replace") as fh:
+            err_lines = fh.read().splitlines()
+        err_tail = "\n".join(err_lines[-5:])
+
+    report = None
+    try:
+        with open(out_path) as fh:
+            report = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        report = None
+
+    if report is not None and (report.get("tool") == "dry-run" or report.get("ab_dry_run") is True):
+        return {"outcome": "DRY_RUN", "err_tail": "", "report": None}
+
+    if exit_code != "0" or report is None:
+        return {"outcome": "FAIL", "err_tail": err_tail, "report": None}
+
+    return {"outcome": "OK", "err_tail": "", "report": report}
+
+
+def build_finetune_run_report(raw_dir, seeds):
+    """The finetune-run merge stage (unit 63 H4b): reads every
+    `(seed, arm, repeat)` leg `finetune_run_ab.sh` wrote under `raw_dir`,
+    computes the exact sign test over `d_i = fused.held_out_example_mean -
+    alloff.held_out_example_mean` (the `r1` legs only -- the primary,
+    un-repeated measurement each seed contributes to the decision; `r2` legs
+    feed the determinism floor below, never the sign test itself), the
+    conjunctive leg-premise refusal (cross-arm identity match via
+    `generic_leg_premise_violations`, PLUS each arm's own
+    `finetune_run_arm_premise_violations`), and the `r1`/`r2` same-seed
+    determinism-floor delta (CONTRACT H4/PLAN.md v2 delta 6: MEASURED AND
+    REPORTED always, RED only if it exceeds the cross-seed spread of `d_i`
+    -- "no CUDA bitwise contract exists -- the measurement must be able to
+    report what it measures").
+
+    A seed with ANY premise violation still has its raw legs, `d_i` (when
+    computable), and violations RECORDED in `per_seed` -- never silently
+    dropped -- but its `d_i` is EXCLUDED from `d_values`/the sign test
+    (an untrusted premise means the measurement itself is not known to
+    describe the same comparison the other seeds' do), and the overall
+    `status` becomes `INVALID` (the same "a correctness-of-measurement
+    problem REPLACES, never merely annotates, the verdict" carve-out
+    `build_report`'s own `INVALID` branch already establishes for
+    `finetune_ab.sh`).
+
+    Returns `(merged, table)`, or `(None, None)` if not one `seed` produced
+    any leg output at all (an empty sweep).
+    """
+    seeds = list(seeds)
+    if not seeds:
+        return None, None
+
+    per_seed = {}
+    determinism_deltas = []  # [(seed, arm, |r1-r2|)] for every OK r1/r2 pair
+    any_leg_found = False
+    any_dry_run_leg = False
+
+    for seed in seeds:
+        entries = {
+            (arm, repeat): load_finetune_run_leg(raw_dir, seed, arm, repeat)
+            for arm in FINETUNE_RUN_ARMS
+            for repeat in FINETUNE_RUN_REPEATS
+        }
+        if any(e["outcome"] != "MISSING" for e in entries.values()):
+            any_leg_found = True
+        if any(e["outcome"] == "DRY_RUN" for e in entries.values()):
+            any_dry_run_leg = True
+
+        seed_out = {
+            "legs": {
+                f"{arm}_{repeat}": entries[(arm, repeat)]["outcome"]
+                for arm in FINETUNE_RUN_ARMS
+                for repeat in FINETUNE_RUN_REPEATS
+            }
+        }
+
+        fused_r1, alloff_r1 = entries[("fused", "r1")], entries[("alloff", "r1")]
+        violations = []
+        d_i = None
+        trajectory = {}
+        if fused_r1["outcome"] == "OK" and alloff_r1["outcome"] == "OK":
+            fused_tier = finetune_run_block(fused_r1["report"])
+            alloff_tier = finetune_run_block(alloff_r1["report"])
+
+            fused_id = finetune_run_leg_identity(fused_tier)
+            alloff_id = finetune_run_leg_identity(alloff_tier)
+            violations += generic_leg_premise_violations(
+                FINETUNE_RUN_IDENTITY_FIELDS, fused_id, alloff_id, "fused", "alloff"
+            )
+            violations += finetune_run_arm_premise_violations("fused", fused_tier)
+            violations += finetune_run_arm_premise_violations("alloff", alloff_tier)
+
+            d_i = fused_tier["held_out_example_mean"] - alloff_tier["held_out_example_mean"]
+            trajectory = {
+                "fused": fused_tier.get("trajectory"),
+                "alloff": alloff_tier.get("trajectory"),
+            }
+        elif fused_r1["outcome"] == "DRY_RUN" or alloff_r1["outcome"] == "DRY_RUN":
+            # A dry-run leg never claims a real number and is never itself
+            # a finding -- see `finetune_run_ab.sh`'s own `*_DRY_RUN`
+            # contract (mirrors `finetune_ab.sh`'s `any_dry_run` carve-out
+            # for its own ratio-based verdict). No violation recorded; this
+            # seed simply contributes no `d_i`.
+            pass
+        else:
+            not_ok = [f"{arm}/r1" for arm, e in (("fused", fused_r1), ("alloff", alloff_r1)) if e["outcome"] != "OK"]
+            violations.append(f"seed {seed}: r1 leg(s) not OK for {not_ok} -- cannot compute d_i or check premise")
+
+        for arm in FINETUNE_RUN_ARMS:
+            r1e, r2e = entries[(arm, "r1")], entries[(arm, "r2")]
+            if r1e["outcome"] == "OK" and r2e["outcome"] == "OK":
+                r1_mean = finetune_run_block(r1e["report"])["held_out_example_mean"]
+                r2_mean = finetune_run_block(r2e["report"])["held_out_example_mean"]
+                delta = abs(r1_mean - r2_mean)
+                determinism_deltas.append((seed, arm, delta))
+                seed_out.setdefault("r1_r2_delta", {})[arm] = delta
+
+        seed_out["leg_premise_violations"] = violations
+        seed_out["d_i"] = d_i
+        seed_out["trajectory"] = trajectory
+        per_seed[seed] = seed_out
+
+    if not any_leg_found:
+        return None, None
+
+    # Cross-seed spread: population stdev of every seed's `d_i` that could
+    # be COMPUTED at all (even one from a premise-violating seed -- the
+    # spread describes how much seeds naturally disagree, which is a fact
+    # about the measurement independent of whether THIS merge trusts it for
+    # the sign test). Falls back to 0.0 with fewer than 2 such seeds
+    # (nothing to spread; the determinism floor then RED's on ANY nonzero
+    # r1/r2 delta, the honest floor of "no spread to compare against").
+    all_d = [per_seed[s]["d_i"] for s in per_seed if per_seed[s]["d_i"] is not None]
+    cross_seed_spread = statistics.pstdev(all_d) if len(all_d) >= 2 else 0.0
+
+    determinism_floor_findings = []
+    max_determinism_delta = 0.0
+    for seed, arm, delta in determinism_deltas:
+        max_determinism_delta = max(max_determinism_delta, delta)
+        if delta > cross_seed_spread:
+            determinism_floor_findings.append(
+                f"seed {seed} {arm}: r1/r2 delta {delta} exceeds the cross-seed spread "
+                f"{cross_seed_spread} (CONTRACT H4/PLAN.md v2 delta 6: reported and RED)"
+            )
+
+    d_values = {s: per_seed[s]["d_i"] for s in per_seed if per_seed[s]["d_i"] is not None and not per_seed[s]["leg_premise_violations"]}
+
+    sign_result = None
+    sign_error = None
+    if d_values:
+        try:
+            sign_result = sign_test(list(d_values.values()))
+        except SignTestError as exc:
+            sign_error = str(exc)
+
+    any_premise_violation = any(per_seed[s]["leg_premise_violations"] for s in per_seed)
+
+    if any_premise_violation or determinism_floor_findings or sign_error:
+        status = "INVALID"
+    elif sign_result is None:
+        # `any_dry_run_leg` (never a premise violation, see the DRY_RUN
+        # branch above) is distinguished from a genuine INCOMPLETE (a real
+        # FAIL/MISSING leg with no violation recorded, e.g. an r1-only
+        # partial run) -- a dry run must never itself fail this merge's own
+        # exit code (finetune_ab.sh's own `any_dry_run` -> "N/A (dry-run)"
+        # carve-out, never INVALID/FAIL), while a genuinely incomplete real
+        # sweep still reads INCOMPLETE.
+        status = "DRY_RUN" if any_dry_run_leg else "INCOMPLETE"
+    else:
+        status = "GREEN"
+
+    merged = {
+        "seeds": seeds,
+        "arms": list(FINETUNE_RUN_ARMS),
+        "per_seed": {str(s): v for s, v in per_seed.items()},
+        "d_values": {str(s): d for s, d in d_values.items()},
+        "cross_seed_spread": cross_seed_spread,
+        "determinism_floor": {
+            "deltas": [{"seed": s, "arm": a, "delta": d} for s, a, d in determinism_deltas],
+            "max_delta": max_determinism_delta,
+            "cross_seed_spread": cross_seed_spread,
+            "findings": determinism_floor_findings,
+            "note": (
+                "r1/r2 same-seed repeat delta MEASURED AND REPORTED as the determinism floor "
+                "-- RED only if it exceeds the cross-seed spread of d_i (CONTRACT H4/PLAN.md "
+                "v2 delta 6: 'no CUDA bitwise contract exists -- the measurement must be able "
+                "to report what it measures')."
+            ),
+        },
+        "sign_test": sign_result,
+        "sign_test_error": sign_error,
+        "status": status,
+    }
+
+    lines = [
+        "# finetune-run A/B -- fused cascade vs ALLOFF, exact two-sided sign test over d_i "
+        "= fused - alloff (CONTRACT Frame / C16)",
+        f"{'seed':<8}{'fused_r1':<10}{'alloff_r1':<10}{'d_i':<14}{'premise':<12}",
+    ]
+    for seed in seeds:
+        so = per_seed[seed]
+        d_i = so["d_i"]
+        d_s = "n/a" if d_i is None else f"{d_i:.6f}"
+        premise_s = "clean" if not so["leg_premise_violations"] else f"VIOLATED ({len(so['leg_premise_violations'])})"
+        lines.append(f"{seed:<8}{so['legs']['fused_r1']:<10}{so['legs']['alloff_r1']:<10}{d_s:<14}{premise_s:<12}")
+    lines.append("")
+    if sign_error is not None:
+        lines.append(f"sign_test: ERROR -- {sign_error}")
+    elif sign_result is not None:
+        lines.append(
+            f"sign_test: n={sign_result['n']} n_pos={sign_result['n_pos']} "
+            f"n_neg={sign_result['n_neg']} ties={sign_result['ties']} "
+            f"p_value={sign_result['p_value']}"
+        )
+    else:
+        lines.append("sign_test: n/a -- no seed produced a premise-clean d_i")
+    lines.append(
+        f"determinism_floor: max_r1_r2_delta={max_determinism_delta} "
+        f"cross_seed_spread={cross_seed_spread} findings={len(determinism_floor_findings)}"
+    )
+    lines.append(f"status: {status}")
+    table = "\n".join(lines)
+    return merged, table
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
+
+    # unit 63 H4b: `finetune_run_ab.sh`'s own invocation shape --
+    # `ab_merge.py finetune-run RAW_DIR OUT_DIR SEED1,SEED2,...` -- kept
+    # entirely distinct from the positional `finetune_ab.sh` contract below
+    # (a leading literal `"finetune-run"` can never collide with that
+    # contract's own first positional arg, `RAW_DIR`, since no real
+    # directory path is spelled exactly that way).
+    if argv and argv[0] == "finetune-run":
+        rest = argv[1:]
+        if len(rest) < 3:
+            print(
+                "usage: ab_merge.py finetune-run RAW_DIR OUT_DIR SEED1,SEED2,...",
+                file=sys.stderr,
+            )
+            return 2
+        fr_raw_dir, fr_out_dir, seeds_s = rest[:3]
+        seeds = [s for s in seeds_s.split(",") if s]
+
+        fr_merged, fr_table = build_finetune_run_report(fr_raw_dir, seeds)
+        if fr_merged is None:
+            print(f"finetune_run_ab: FAIL — no leg output found under {fr_raw_dir}", file=sys.stderr)
+            return 1
+
+        os.makedirs(fr_out_dir, exist_ok=True)
+        with open(os.path.join(fr_out_dir, "finetune_run_ab_report.json"), "w") as fh:
+            json.dump(fr_merged, fh, indent=2)
+        print(fr_table)
+        with open(os.path.join(fr_out_dir, "finetune_run_ab_table.txt"), "w") as fh:
+            fh.write(fr_table + "\n")
+
+        # The SAME carve-out `build_report`'s own `INVALID` branch already
+        # makes for `finetune_ab.sh`: a correctness-of-measurement problem
+        # (a premise violation, a determinism-floor breach, or a sign-test
+        # refusal) is the one thing this merge's own exit code gates on;
+        # `FAIL`/`INCOMPLETE` legs (a leg that did not run at all, e.g. a
+        # dry run) are recorded, not fatal here -- only `INVALID` is.
+        if fr_merged["status"] == "INVALID":
+            print(
+                "finetune_run_ab: FAIL — status=INVALID (a leg-premise violation, a "
+                "determinism-floor breach, or a sign-test refusal — see the table above)",
+                file=sys.stderr,
+            )
+            return 1
+        return 0
+
     if len(argv) < 5:
         print(
             "usage: ab_merge.py RAW_DIR OUT_DIR STEPS WARMUP PASS_RATIO [TORCH_LORA_INIT]",

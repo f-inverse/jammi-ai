@@ -51,9 +51,14 @@
 //! separate from reduction-order noise, so the CPU comparison IS the
 //! f32-truth-anchored comparison, with nothing further to subtract. The
 //! CUDA legs additionally compute an `f32`-CPU truth for the SAME
-//! composition and require each `bf16` arm to track it, so a real
-//! dtype-rounding regression cannot hide inside an alone-vs-batch
-//! agreement that happens to cancel.
+//! composition and ASSERT each `bf16` arm -- alone and batch,
+//! independently -- tracks it within `PROVISIONAL_GPU_TRUTH_DRIFT_BOUND`,
+//! so a real dtype-rounding regression cannot hide inside an
+//! alone-vs-batch agreement that happens to cancel (both arms drifting
+//! IDENTICALLY away from truth would still fail these two asserts even
+//! though the alone-vs-batch `PROVISIONAL_GPU_FLOOR_PLACEHOLDER` check
+//! would pass) -- the truth ratios are not merely printed, they gate the
+//! test.
 //!
 //! **Floor discipline (guide checklist rule 8 / esc-045's own null-band
 //! control (a)): a bound must never be invented, only measured.** The
@@ -401,8 +406,11 @@ fn cuda_device_or_skip(test_name: &str) -> Option<Device> {
 /// ratio whose noise-free value is `0.0` (matching this file's CPU
 /// metric's floor), used for the `bf16` legs where an absolute
 /// `f32::EPSILON`-unit bound has no principled meaning (`bf16` rounding
-/// noise is a relative, not an absolute, quantity).
-#[cfg(feature = "cuda")]
+/// noise is a relative, not an absolute, quantity). NOT `cuda`-gated
+/// (pure numeric logic, no device dependency) so the CPU-hermetic mutant
+/// demonstration below (`identical_bf16_drift_...`) can exercise the same
+/// function the CUDA legs use, rather than a re-implementation that could
+/// drift from it.
 fn relative_l1_error(a: &[f32], b: &[f32]) -> f64 {
     assert_eq!(a.len(), b.len());
     let num: f64 = a
@@ -419,7 +427,9 @@ fn relative_l1_error(a: &[f32], b: &[f32]) -> f64 {
 }
 
 /// PROVISIONAL PLACEHOLDER -- UNMEASURED. Bounds the `bf16`-CUDA
-/// alone-vs-padded-batch [`relative_l1_error`] on real rows. This value
+/// alone-vs-padded-batch [`relative_l1_error`] on real rows -- a
+/// COMPOSITION-INVARIANCE floor (does the SAME dtype/device arm agree
+/// with itself across the alone vs padded-batch composition). This value
 /// is NOT derived from any measurement (no CUDA device was available to
 /// this agent); it exists only so the CPU-hermetic gate can typecheck
 /// this file's structure while feature-gated out. The pod train
@@ -430,35 +440,73 @@ fn relative_l1_error(a: &[f32], b: &[f32]) -> f64 {
 #[cfg(feature = "cuda")]
 const PROVISIONAL_GPU_FLOOR_PLACEHOLDER: f64 = f64::NAN;
 
-/// Refuses to let [`PROVISIONAL_GPU_FLOOR_PLACEHOLDER`] silently gate a
-/// real assertion: `NaN` fails every ordered comparison (`esc-005`'s own
-/// "`NaN > c` is `false`" trap, applied deliberately here in the OTHER
-/// direction), so any CUDA-gated test that reaches this placeholder
-/// panics loudly identifying itself, instead of a `NaN` bound vacuously
-/// admitting an unmeasured leg.
+/// PROVISIONAL PLACEHOLDER -- UNMEASURED. Bounds each `bf16`-CUDA leg's
+/// [`relative_l1_error`] against the independently computed `f32`-CPU
+/// truth (`ratio_alone_vs_truth`, `ratio_batch_vs_truth`) -- a
+/// DTYPE-ROUNDING DRIFT bound, a DIFFERENT quantity from
+/// [`PROVISIONAL_GPU_FLOOR_PLACEHOLDER`]'s composition-invariance floor:
+/// "does bf16 agree with itself across compositions" and "does bf16
+/// agree with f32 truth" can diverge independently -- two bf16 arms can
+/// drift IDENTICALLY away from truth (a real dtype-rounding regression)
+/// while still agreeing with EACH OTHER, which would pass a
+/// composition-invariance-only check vacuously (finding F-6). Both
+/// constants are named separately and BOTH are pod-measured-then-
+/// finalized (contract E4, Step 5) rather than one constant serving both
+/// roles, because a regression that inflates drift-from-truth need not
+/// inflate alone-vs-batch disagreement by the same margin (they are
+/// governed by different noise sources: dtype rounding vs GEMM
+/// reduction-order), so a single shared bound would either be too loose
+/// for one quantity or too tight for the other. This value is NOT
+/// derived from any measurement (no CUDA device was available to this
+/// agent); it exists only so the CPU-hermetic gate can typecheck this
+/// file's structure while feature-gated out. The pod train (contract E4,
+/// Step 5) MUST measure this oracle's real per-row `relative_l1_error`
+/// against f32 truth on hardware and replace this constant before this
+/// leg is allowed to gate anything.
 #[cfg(feature = "cuda")]
-fn require_pod_measured_gpu_floor(test_name: &str) -> ! {
-    panic!(
-        "{test_name}: PROVISIONAL_GPU_FLOOR_PLACEHOLDER is unmeasured (NaN) -- the pod train \
-         (contract docs/plans/62-embedding-surface/CONTRACT.md E4, Step 5) must land a real \
-         measured same-composition bf16 floor here before this CUDA leg can assert anything; \
-         see that constant's own doc"
-    );
+const PROVISIONAL_GPU_TRUTH_DRIFT_BOUND: f64 = f64::NAN;
+
+/// Refuses to let an unmeasured PROVISIONAL floor constant (identified by
+/// `floor_name`) silently gate a real assertion: `NaN` fails every
+/// ordered comparison (`esc-005`'s own "`NaN > c` is `false`" trap,
+/// applied deliberately here in the OTHER direction), so any CUDA-gated
+/// test that reaches an unmeasured placeholder panics loudly identifying
+/// itself and the specific constant, instead of a `NaN` bound vacuously
+/// admitting an unmeasured leg. Shared by both
+/// [`PROVISIONAL_GPU_FLOOR_PLACEHOLDER`] (composition-invariance) and
+/// [`PROVISIONAL_GPU_TRUTH_DRIFT_BOUND`] (dtype-rounding drift) so
+/// neither can be reached vacuously pre-measurement. NOT `cuda`-gated
+/// (pure control-flow logic, no device dependency) so
+/// [`require_pod_measured_floor_panics_on_unmeasured_nan`] below can
+/// exercise this exact function on CPU.
+fn require_pod_measured_floor(test_name: &str, floor_name: &str, floor: f64) {
+    if floor.is_nan() {
+        panic!(
+            "{test_name}: {floor_name} is unmeasured (NaN) -- the pod train \
+             (contract docs/plans/62-embedding-surface/CONTRACT.md E4, Step 5) must land a real \
+             measured value here before this CUDA leg can assert anything; see that constant's \
+             own doc"
+        );
+    }
 }
 
 #[test]
 #[cfg(feature = "cuda")]
 fn pooled_embedding_alone_matches_padded_batch_real_row_bf16_cuda() {
-    let Some(device) =
-        cuda_device_or_skip("pooled_embedding_alone_matches_padded_batch_real_row_bf16_cuda")
-    else {
+    let test_name = "pooled_embedding_alone_matches_padded_batch_real_row_bf16_cuda";
+    let Some(device) = cuda_device_or_skip(test_name) else {
         return;
     };
-    if PROVISIONAL_GPU_FLOOR_PLACEHOLDER.is_nan() {
-        require_pod_measured_gpu_floor(
-            "pooled_embedding_alone_matches_padded_batch_real_row_bf16_cuda",
-        );
-    }
+    require_pod_measured_floor(
+        test_name,
+        "PROVISIONAL_GPU_FLOOR_PLACEHOLDER",
+        PROVISIONAL_GPU_FLOOR_PLACEHOLDER,
+    );
+    require_pod_measured_floor(
+        test_name,
+        "PROVISIONAL_GPU_TRUTH_DRIFT_BOUND",
+        PROVISIONAL_GPU_TRUTH_DRIFT_BOUND,
+    );
     let config = load_config();
     let encoder = build_encoder(&device, DType::BF16, &config);
     let fixture = build_fixture(&device);
@@ -483,7 +531,28 @@ fn pooled_embedding_alone_matches_padded_batch_real_row_bf16_cuda() {
         let ratio_alone_vs_batch = relative_l1_error(&alone_bf16, &pooled_batch[b]);
         eprintln!(
             "row={b} alone_vs_truth={ratio_alone_vs_truth:e} batch_vs_truth={ratio_batch_vs_truth:e} \
-             alone_vs_batch={ratio_alone_vs_batch:e} (bound {PROVISIONAL_GPU_FLOOR_PLACEHOLDER:e})"
+             alone_vs_batch={ratio_alone_vs_batch:e} (composition floor \
+             {PROVISIONAL_GPU_FLOOR_PLACEHOLDER:e}, drift bound {PROVISIONAL_GPU_TRUTH_DRIFT_BOUND:e})"
+        );
+        // Truth-tracking control (finding F-6): each bf16 arm -- alone AND
+        // batch, independently -- must itself stay within
+        // `PROVISIONAL_GPU_TRUTH_DRIFT_BOUND` of the f32-CPU truth. Without
+        // these two asserts, two bf16 arms that drift IDENTICALLY away from
+        // truth would still agree with each other and pass the
+        // alone-vs-batch assertion below, hiding a real dtype-rounding
+        // regression inside a cancelling agreement -- exactly the gap this
+        // file's module doc claims does not exist.
+        assert!(
+            ratio_alone_vs_truth.is_finite()
+                && ratio_alone_vs_truth < PROVISIONAL_GPU_TRUTH_DRIFT_BOUND,
+            "row {b}: bf16 alone-vs-f32-truth relative_l1_error {ratio_alone_vs_truth:e} exceeds \
+             the PROVISIONAL dtype-rounding drift bound {PROVISIONAL_GPU_TRUTH_DRIFT_BOUND:e}"
+        );
+        assert!(
+            ratio_batch_vs_truth.is_finite()
+                && ratio_batch_vs_truth < PROVISIONAL_GPU_TRUTH_DRIFT_BOUND,
+            "row {b}: bf16 batch-vs-f32-truth relative_l1_error {ratio_batch_vs_truth:e} exceeds \
+             the PROVISIONAL dtype-rounding drift bound {PROVISIONAL_GPU_TRUTH_DRIFT_BOUND:e}"
         );
         assert!(
             ratio_alone_vs_batch.is_finite()
@@ -497,16 +566,15 @@ fn pooled_embedding_alone_matches_padded_batch_real_row_bf16_cuda() {
 #[test]
 #[cfg(feature = "cuda")]
 fn pooled_embedding_red_control_row_length_off_by_one_bf16_cuda() {
-    let Some(device) =
-        cuda_device_or_skip("pooled_embedding_red_control_row_length_off_by_one_bf16_cuda")
-    else {
+    let test_name = "pooled_embedding_red_control_row_length_off_by_one_bf16_cuda";
+    let Some(device) = cuda_device_or_skip(test_name) else {
         return;
     };
-    if PROVISIONAL_GPU_FLOOR_PLACEHOLDER.is_nan() {
-        require_pod_measured_gpu_floor(
-            "pooled_embedding_red_control_row_length_off_by_one_bf16_cuda",
-        );
-    }
+    require_pod_measured_floor(
+        test_name,
+        "PROVISIONAL_GPU_FLOOR_PLACEHOLDER",
+        PROVISIONAL_GPU_FLOOR_PLACEHOLDER,
+    );
     let config = load_config();
     let encoder = build_encoder(&device, DType::BF16, &config);
     let fixture = build_fixture(&device);
@@ -541,16 +609,15 @@ fn pooled_embedding_red_control_row_length_off_by_one_bf16_cuda() {
 #[test]
 #[cfg(feature = "cuda")]
 fn pooled_embedding_red_control_window_radius_off_by_one_bf16_cuda() {
-    let Some(device) =
-        cuda_device_or_skip("pooled_embedding_red_control_window_radius_off_by_one_bf16_cuda")
-    else {
+    let test_name = "pooled_embedding_red_control_window_radius_off_by_one_bf16_cuda";
+    let Some(device) = cuda_device_or_skip(test_name) else {
         return;
     };
-    if PROVISIONAL_GPU_FLOOR_PLACEHOLDER.is_nan() {
-        require_pod_measured_gpu_floor(
-            "pooled_embedding_red_control_window_radius_off_by_one_bf16_cuda",
-        );
-    }
+    require_pod_measured_floor(
+        test_name,
+        "PROVISIONAL_GPU_FLOOR_PLACEHOLDER",
+        PROVISIONAL_GPU_FLOOR_PLACEHOLDER,
+    );
     let config = load_config();
     let fixture = build_fixture(&device);
 
@@ -589,4 +656,92 @@ fn pooled_embedding_red_control_window_radius_off_by_one_bf16_cuda() {
          (ratio={ratio:e}, required > {:e})",
         PROVISIONAL_GPU_FLOOR_PLACEHOLDER * 5.0,
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// CPU-hermetic mutant demonstration for finding F-6. No CUDA device is
+// available in this environment, so the CUDA legs above cannot be run
+// here; these two tests instead exercise the EXACT SAME helper functions
+// (`relative_l1_error`, `require_pod_measured_floor`) the CUDA legs call,
+// on synthetic data, to prove by construction that the new truth-tracking
+// asserts (added by this fix) catch a mutant the old alone-vs-batch-only
+// assertion structure would have missed.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// F-6's exact failure mode, reconstructed on CPU: an "identical drift"
+/// bf16 mutant where the alone and batch arms compute EXACTLY the same
+/// (wrong) values -- so `relative_l1_error(alone, batch) == 0.0`, passing
+/// any positive composition-invariance floor -- while BOTH arms have
+/// drifted `1%` away from the independently-known truth (simulating a
+/// dtype-rounding regression that a real GEMM/cast bug could introduce
+/// identically on both the alone and batch code paths). Before this fix,
+/// this file's sole bf16-CUDA assertion was on `ratio_alone_vs_batch`
+/// (see this file's history / finding F-6): that check alone would have
+/// PASSED this mutant, exactly as the auditor found. This test proves the
+/// NEW truth-tracking checks -- `ratio_alone_vs_truth` /
+/// `ratio_batch_vs_truth` each `< ILLUSTRATIVE_DRIFT_BOUND` -- correctly
+/// FAIL it, using the identical [`relative_l1_error`] function the real
+/// CUDA legs call (`ILLUSTRATIVE_DRIFT_BOUND` is a demonstration-only
+/// value, not [`PROVISIONAL_GPU_TRUTH_DRIFT_BOUND`] itself, since that
+/// production constant is still unmeasured (`NaN`) pending the pod train).
+#[test]
+fn identical_bf16_drift_from_truth_passes_composition_check_but_fails_truth_tracking() {
+    const ILLUSTRATIVE_COMPOSITION_FLOOR: f64 = 1e-6;
+    const ILLUSTRATIVE_DRIFT_BOUND: f64 = 1e-3;
+
+    let truth: Vec<f32> = vec![1.0, 2.0, 3.0, -4.0, 5.0];
+    // Both bf16 arms round IDENTICALLY to the same (1% high) mutant
+    // values -- simulating a dtype-rounding regression that hits the
+    // alone and batch code paths the same way.
+    let alone_bf16: Vec<f32> = truth.iter().map(|x| x * 1.01).collect();
+    let batch_bf16 = alone_bf16.clone();
+
+    let ratio_alone_vs_batch = relative_l1_error(&alone_bf16, &batch_bf16);
+    let ratio_alone_vs_truth = relative_l1_error(&alone_bf16, &truth);
+    let ratio_batch_vs_truth = relative_l1_error(&batch_bf16, &truth);
+
+    // The OLD (pre-fix) check: alone-vs-batch agreement. Identical drift
+    // means the two arms agree PERFECTLY with each other, so this check
+    // is exactly the vacuous pass the auditor found.
+    assert_eq!(
+        ratio_alone_vs_batch, 0.0,
+        "the mutant must be constructed so alone and batch agree exactly \
+         (ratio_alone_vs_batch == 0.0), reproducing F-6's cancelling-agreement case"
+    );
+    assert!(
+        ratio_alone_vs_batch.is_finite() && ratio_alone_vs_batch < ILLUSTRATIVE_COMPOSITION_FLOOR,
+        "checked premise: the old alone-vs-batch-only check must PASS this mutant \
+         (ratio={ratio_alone_vs_batch:e}), or this is not reproducing F-6's failure mode"
+    );
+
+    // The NEW checks this fix adds: each arm vs f32 truth, independently.
+    // Both must be FAR enough above the illustrative bound to prove a
+    // real dtype-rounding regression cannot hide here anymore.
+    assert!(
+        ratio_alone_vs_truth.is_finite() && ratio_alone_vs_truth >= ILLUSTRATIVE_DRIFT_BOUND,
+        "the new alone-vs-truth check must CATCH this mutant \
+         (ratio={ratio_alone_vs_truth:e}, bound={ILLUSTRATIVE_DRIFT_BOUND:e}) -- if it does not, \
+         the truth-tracking fix has no discriminating power over this mutant class"
+    );
+    assert!(
+        ratio_batch_vs_truth.is_finite() && ratio_batch_vs_truth >= ILLUSTRATIVE_DRIFT_BOUND,
+        "the new batch-vs-truth check must CATCH this mutant \
+         (ratio={ratio_batch_vs_truth:e}, bound={ILLUSTRATIVE_DRIFT_BOUND:e}) -- if it does not, \
+         the truth-tracking fix has no discriminating power over this mutant class"
+    );
+}
+
+/// [`require_pod_measured_floor`] must panic BEFORE any numeric compare
+/// runs whenever its floor argument is unmeasured (`NaN`) -- the same
+/// panic-before-compare discipline the pre-existing
+/// `PROVISIONAL_GPU_FLOOR_PLACEHOLDER` gate had, now shared by the new
+/// `PROVISIONAL_GPU_TRUTH_DRIFT_BOUND` truth-tracking checks too (finding
+/// F-6's fix requirement: "the NaN placeholder must make these
+/// panic-before-compare exactly like the main assertion"). This test
+/// calls the exact function the CUDA legs call, with a bare `f64::NAN`,
+/// so it needs no CUDA device to prove the mechanism.
+#[test]
+#[should_panic(expected = "is unmeasured (NaN)")]
+fn require_pod_measured_floor_panics_on_unmeasured_nan() {
+    require_pod_measured_floor("demo_test", "DEMO_BOUND", f64::NAN);
 }

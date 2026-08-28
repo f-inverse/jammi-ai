@@ -145,6 +145,38 @@ async fn preprocessor_config_presence_and_mutation_change_the_definition_hash() 
     );
 }
 
+/// (a3) The `config.json` peer of (a): mutating `config.json`'s bytes in
+/// place under a constant `model_id` must change `definition_hash`. Phase-5
+/// oracle fold-in — every OTHER digest slot (`1_Pooling/config.json`,
+/// `preprocessor_config.json`, tokenizer, weights, adapter pair) already has
+/// a dedicated byte-mutation oracle; `config.json` itself did not. The
+/// mutation (a trailing newline appended to the file, identical technique to
+/// `tokenizer_bytes_mutation_changes_the_definition_hash` below) is a
+/// byte-level change that stays valid, parseable JSON, so the model still
+/// loads successfully both times; only the recorded content digest is under
+/// test here.
+#[tokio::test]
+async fn config_json_bytes_mutation_changes_the_definition_hash() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path().join("model");
+    build_local_model_dir(&dir, Some(&mean_pooling_config()));
+
+    let hash_before = definition_hash_for(&dir).await;
+
+    let config_path = dir.join("config.json");
+    let mut bytes = std::fs::read(&config_path).unwrap();
+    bytes.push(b'\n');
+    std::fs::write(&config_path, &bytes).unwrap();
+
+    let hash_after = definition_hash_for(&dir).await;
+
+    assert_ne!(
+        hash_before, hash_after,
+        "mutating config.json bytes in place under a constant model_id must \
+         change definition_hash (esc-057)"
+    );
+}
+
 /// (b) The tokenizer peer of (a): mutating `tokenizer.json`'s bytes in place
 /// under a constant `model_id` must change `definition_hash`. The mutation
 /// (a trailing newline appended to the file) is a byte-level change that

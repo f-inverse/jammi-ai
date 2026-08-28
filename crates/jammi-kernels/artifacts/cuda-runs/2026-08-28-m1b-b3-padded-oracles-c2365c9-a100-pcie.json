@@ -1,0 +1,89 @@
+{
+ "schema_version": 1,
+ "unit": "m1b-b3-padded-encoder-transport",
+ "git_sha": "c2365c9088392438b2f81453bc49b5f00c886295",
+ "date": "2026-08-28T02:05:00Z",
+ "box": "jammi-a100 (NVIDIA A100 80GB PCIe, driver 570.211.01)",
+ "driver": "570.211.01",
+ "gpu": "NVIDIA A100 80GB PCIe",
+ "features": "cuda,flash-attn",
+ "status": "GREEN",
+ "env": {
+  "JAMMI_REQUIRE_CUDA": "1",
+  "JAMMI_REQUIRE_FLASH_ORACLE": "1",
+  "JAMMI_FLASH_ORACLE_MODEL_DIR": "/root/checkpoints/ModernBERT-large"
+ },
+ "producer": {
+  "path": "crates/jammi-encoders/src/modernbert.rs",
+  "kind": "cargo-test",
+  "invocation": "JAMMI_REQUIRE_CUDA=1 JAMMI_REQUIRE_FLASH_ORACLE=1 JAMMI_FLASH_ORACLE_MODEL_DIR=<checkpoint> cargo test -p jammi-encoders --lib --features cuda,flash-attn -- --exact modernbert::tests::flash_arm_padded_matches_block_arm_on_real_rows_cuda",
+  "gating": "env:JAMMI_REQUIRE_CUDA"
+ },
+ "observed": {
+  "flash_arm_padded_real_row_ratio": 0.229503,
+  "provisional_bound_at_run": 3.0,
+  "note": "Printed by the parity oracle under --nocapture at this exact sha: 'real-row ratio=2.29503e-1 (provisional bound 3)'. This is the truth-relative measurement FLASH_ORACLE_PADDED_PROVISIONAL_BOUND must be re-derived from, per the dense arm's k-factor convention -- the tightening commit cites this artifact."
+ },
+ "note": "Execution provenance for the M1b B3-padded unit's CUDA-gated oracles at the branch tip c2365c9 (tree shipped by push-stamp laptop_head c2365c9, clean; CARGO_TARGET_DIR=/root/target-m1b, the pod's member-free seed clone; CUTLASS provisioned by target --with-cutlass against the push-stamp pin). The same detached job first ran cargo clippy for jammi-kernels (--features flash-attn) and jammi-encoders (--features cuda,flash-attn) to completion with -D warnings -- the full type/borrow-check of the cfg-gated code the nvcc-less dev host can only syntax-parse. Padded-oracle legs (all in the encoders lib suite): values parity of the padded/ragged flash arm vs the block arm on real rows (bound-checked, observed ratio recorded above); the lengths off-by-one RED control (cu_seqlens boundary mutant); the w+/-1 window-radius RED control (fwd-visible) and the backward-only config-split w+/-1 RED control probing layer 0's LoRA B gradient -- both non-vacuous at this sha ONLY because the fixture's longest segments (160, 96) clear the derived visibility threshold L >= half_window+2 = 66, an in-test asserted premise (a prior fixture with max segment 64 == half_window was proven structurally blind on this same box and fixed in-unit). Bench legs (finetune_step_padded_cuda, --features cuda,jammi-encoders/flash-attn): the A5 padded block-arm VRAM baseline leg and the A3 padded flash-vs-block loss-sequence A/B (shipping explicit JAMMI_KERNELS_DISABLE op-name form; a GREEN A3 is NOT evidence against open esc-045). The CPU-hermetic suites (146 lib + 34 it locally; transport round-trip, dispatch proofs, trusted-lengths validation, shape-guard refusals) run in the merge-blocking lane. PROVENANCE DISCIPLINE: this artifact cites a branch sha; the PR must land as a MERGE COMMIT (the #389/#406/#408 precedent) so c2365c9 remains an ancestor of main. Suite counts below are verbatim from the retained job logs.",
+ "legs": [
+  {
+   "name": "clippy jammi-kernels --features flash-attn -D warnings",
+   "status": "ok",
+   "passed": null,
+   "failed": 0,
+   "filtered_out": null,
+   "duration_s": 0.4,
+   "note": "lint-clean; Finished dev profile"
+  },
+  {
+   "name": "clippy jammi-encoders --features cuda,flash-attn -D warnings",
+   "status": "ok",
+   "passed": null,
+   "failed": 0,
+   "filtered_out": null,
+   "duration_s": 2.55,
+   "note": "lint-clean; Finished dev profile"
+  },
+  {
+   "name": "cuda_parity (jammi-kernels, dense suites + M1a ragged invariance)",
+   "status": "ok",
+   "passed": 99,
+   "failed": 0,
+   "filtered_out": 0,
+   "duration_s": 42.66,
+   "note": "1 ignored (pre-existing)"
+  },
+  {
+   "name": "jammi-encoders lib suite (cuda,flash-attn; padded parity + lengths-off-by-one + w+/-1 fwd + w+/-1 bwd-only RED controls all individually confirmed ok)",
+   "status": "ok",
+   "passed": 158,
+   "failed": 0,
+   "filtered_out": 0,
+   "duration_s": 157.93
+  },
+  {
+   "name": "jammi-encoders it suite (cuda,flash-attn)",
+   "status": "ok",
+   "passed": 34,
+   "failed": 0,
+   "filtered_out": 0,
+   "duration_s": 4.13
+  },
+  {
+   "name": "finetune_step_padded_cuda (jammi-bench; a5_padded_block_arm_vram_baseline_leg + a3_padded_loss_sequence_flash_vs_block_ab)",
+   "status": "ok",
+   "passed": 2,
+   "failed": 0,
+   "filtered_out": 0,
+   "duration_s": 3.41
+  },
+  {
+   "name": "flash_arm_padded_matches_block_arm_on_real_rows_cuda (--exact, --nocapture harvest of the observed ratio)",
+   "status": "ok",
+   "passed": 1,
+   "failed": 0,
+   "filtered_out": 157,
+   "duration_s": 1.23
+  }
+ ]
+}

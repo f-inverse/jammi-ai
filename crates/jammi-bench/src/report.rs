@@ -2075,6 +2075,23 @@ pub struct EncodeStepTier {
     /// [`Self::IDENTITY_FIELDS`] entry (including [`Self::device_requested`])
     /// agrees. See this struct's own doc for the full identity-vs-provenance
     /// split this field and `device_requested` now form.
+    ///
+    /// This value is trustworthy — never a hardware string attested for a
+    /// run that actually executed on CPU — BECAUSE the silent-CPU-fallback
+    /// state is structurally unrepresentable by the time it is computed
+    /// (unit-62 audit round-4 F-C): `encode_step::run` threads `gpu_device`
+    /// through `model_inference::corpus_session_on_device`, which sets
+    /// `gpu.require_gpu = gpu_device >= 0` on the session's `GpuConfig` — the
+    /// SAME convention `jammi-ai`'s `gpu_capability` harness pins
+    /// (`config_for`: `require_gpu: device >= 0`). A `--cuda N` leg whose
+    /// ordinal the box cannot actually satisfy therefore fails the FIRST
+    /// model load (`CandleBackend::load`'s `select_device(device_config)?`,
+    /// `backend/candle.rs`'s `gpu_unavailable` returning a typed
+    /// `JammiError::Gpu`) inside `run()`'s warmup loop, well before this
+    /// field is ever populated — `run()` returns `Err` and no
+    /// `EncodeStepTier` (hence no report) is produced at all. So on every
+    /// path that reaches this field, the requested ordinal and the actually-
+    /// resolved device are the same device by construction.
     pub device_name: String,
     /// The `JAMMI_KERNELS_DISABLE` op keys this process REQUESTED (sorted;
     /// empty when unset) — `jammi_kernels::admission::disabled_ops_requested`.

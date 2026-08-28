@@ -227,9 +227,24 @@ async fn corpus_session(
 }
 
 /// The device-parameterized corpus session the CPU tier ([`corpus_session`],
-/// `gpu_device = -1`) and the GPU perf-baseline tier (`gpu_device = 0`) share.
-/// `gpu_device` flows straight to the engine's `select_device`, so the same
-/// serving path measures on whichever device the caller names.
+/// `gpu_device = -1`), the GPU perf-baseline tier (`gpu_device = 0`), and
+/// `encode_step`'s `--cuda`-parameterized leg share. `gpu_device` flows
+/// straight to the engine's `select_device`, so the same serving path
+/// measures on whichever device the caller names.
+///
+/// `gpu.require_gpu` is set to `gpu_device >= 0` — the SAME convention
+/// `jammi-ai`'s own `gpu_capability` harness pins
+/// (`tests/gpu_capability/harness.rs::config_for`: `require_gpu: device >= 0`)
+/// — so a requested CUDA ordinal that the box cannot actually satisfy fails
+/// loud with a typed `JammiError::Gpu` at the FIRST model load
+/// (`CandleBackend::load`'s `select_device(device_config)?`), rather than
+/// silently degrading to `Device::Cpu` with only a `tracing::warn!` (unit-62
+/// audit round-4 F-C: a `--cuda N` leg must never be able to publish
+/// `device_requested:"cuda:N"` + a real `device_name` for a run that actually
+/// executed on CPU). The `gpu_device = -1` CPU-hermetic default is untouched
+/// (`require_gpu` computes to `false`, and `select_device` selects
+/// `Device::Cpu` unconditionally for a negative ordinal regardless of the
+/// flag).
 pub(crate) async fn corpus_session_on_device(
     rows: &[Row],
     gpu_device: i32,
@@ -239,6 +254,7 @@ pub(crate) async fn corpus_session_on_device(
         artifact_dir: dir.path().to_path_buf(),
         gpu: GpuConfig {
             device: gpu_device,
+            require_gpu: gpu_device >= 0,
             ..Default::default()
         },
         ..Default::default()

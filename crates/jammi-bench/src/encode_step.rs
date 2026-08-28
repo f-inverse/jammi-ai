@@ -15,9 +15,17 @@
 //! produced by a real call into the engine:
 //!
 //! * `checkpoint_config_sha256`/`checkpoint_weights_sha256`/
-//!   `checkpoint_weights_size_bytes` are `sha256_and_len` over the fixture
-//!   model dir's actual bytes (the SAME helper `finetune_step.rs`/
-//!   `grad_oracle.rs` already use).
+//!   `checkpoint_weights_size_bytes`/`checkpoint_tokenizer_sha256` are
+//!   `sha256_and_len` over the fixture model dir's actual bytes (the SAME
+//!   helper `finetune_step.rs`/`grad_oracle.rs` already use) — the complete
+//!   three-file checkpoint content identity (config + weights + tokenizer),
+//!   never a two-file subset (unit-62 F-5: tokenizer bytes are
+//!   output-affecting on this surface, see [`crate::report::EncodeStepTier::checkpoint_tokenizer_sha256`]'s
+//!   own doc).
+//! * `compute_precision` is read off the LOADED model
+//!   ([`jammi_ai::model::LoadedModel::compute_precision`], via the tier's
+//!   own session model cache) — the precision the serve actually ran at,
+//!   never a derived/default constant.
 //! * `seq`/`row_lengths` are read off a REAL tokenization of the corpus
 //!   text through [`jammi_ai::model::tokenizer::TokenizerWrapper`] — the
 //!   exact wrapper `CandleBackend` loads for a local model — over the
@@ -26,17 +34,21 @@
 //!   the real `generate_text_embeddings` call the `model_inference`/
 //!   `gpu_inference` tiers already drive.
 //!
-//! ## CPU-hermetic default, GPU-shape-parameterized
+//! ## CPU-hermetic default, GPU-device-parameterized
 //!
 //! `gpu_device` flows straight into `corpus_session_on_device` — the SAME
 //! device knob `model_inference`/`gpu_inference` already share (`-1` /
 //! `Device::Cpu` for the CI-hermetic default this tier's own tests run
 //! under, a real CUDA ordinal for the pod producer). No new device-selection
-//! mechanism is introduced.
+//! mechanism is introduced. The `encode-step` CLI subcommand (`main.rs`)
+//! exposes this as `--cuda <ordinal>` (mirroring `finetune-step`/
+//! `grad-oracle`'s own `--cuda: Option<usize>` convention exactly), omitted
+//! for [`CPU_HERMETIC_DEVICE`].
 
 use std::path::Path;
 
 use jammi_ai::model::tokenizer::TokenizerWrapper;
+use jammi_ai::model::{ModelSource, ModelTask};
 
 use crate::finetune_step::sha256_and_len;
 use crate::model_inference::{
@@ -163,6 +175,8 @@ pub async fn run(params: EncodeStepParams) -> Result<EncodeStepTier, Box<dyn std
         sha256_and_len(&model_tmp.path().join("config.json"))?;
     let (checkpoint_weights_sha256, checkpoint_weights_size_bytes) =
         sha256_and_len(&model_tmp.path().join("model.safetensors"))?;
+    let (checkpoint_tokenizer_sha256, _tokenizer_len) =
+        sha256_and_len(&model_tmp.path().join("tokenizer.json"))?;
 
     let (session, _dir) = corpus_session_on_device(&rows, params.gpu_device).await?;
 
@@ -183,15 +197,29 @@ pub async fn run(params: EncodeStepParams) -> Result<EncodeStepTier, Box<dyn std
     };
     let embed_rate = rows_per_s(rows_served, mean_serve_ms);
 
+    // The LOADED model's actual effective precision — a cache HIT (the
+    // model was already loaded by the `serve_embed` calls above), read off
+    // the real `LoadedModel` this tier's own serve drove rather than a
+    // derived/default constant (unit-62 F-5: `ComputePrecision::default()`
+    // is a false determinant in an identity slot).
+    let model_source = ModelSource::parse(&model_id);
+    let model_guard = session
+        .model_cache()
+        .get_or_load(&model_source, ModelTask::TextEmbedding, None)
+        .await?;
+    let compute_precision = model_guard.model.compute_precision().to_string();
+    drop(model_guard);
+
     let tier = EncodeStepTier {
         seed: params.seed,
         batch: rows.len(),
         seq,
         row_lengths,
-        compute_precision: jammi_numerics::ComputePrecision::default().to_string(),
+        compute_precision,
         checkpoint_config_sha256,
         checkpoint_weights_sha256,
         checkpoint_weights_size_bytes,
+        checkpoint_tokenizer_sha256,
         pooling: "mean".to_string(),
         // `jammi_encoders::pool_and_normalize` mandatorily L2-normalizes on
         // every reachable path — see `EncodeStepTier::normalize`'s own doc.
@@ -237,7 +265,7 @@ mod tests {
     };
 
     /// Cardinality pin (unit-62 CONTRACT.md §E3): the EXACT comparison
-    /// identity set — 12 fields, in this exact order — so
+    /// identity set — 13 fields, in this exact order — so
     /// `ci/scripts/perf/identity_fields.py`'s future `ENCODE_IDENTITY_FIELDS`
     /// (unit-62 E6, docs-ci domain) has a fixed, reviewable Rust-side
     /// source to mirror. A field added, removed, or renamed here is a
@@ -251,7 +279,7 @@ mod tests {
             .collect();
         assert_eq!(
             names.len(),
-            12,
+            13,
             "EncodeStepTier::IDENTITY_FIELDS cardinality drifted — update the pinned \
              count together with ci/scripts/perf/identity_fields.py's ENCODE_IDENTITY_FIELDS"
         );
@@ -266,6 +294,7 @@ mod tests {
                 "checkpoint_config_sha256",
                 "checkpoint_weights_sha256",
                 "checkpoint_weights_size_bytes",
+                "checkpoint_tokenizer_sha256",
                 "pooling",
                 "normalize",
                 "warmup",
@@ -373,6 +402,7 @@ mod tests {
         for (digest, name) in [
             (&tier.checkpoint_config_sha256, "config"),
             (&tier.checkpoint_weights_sha256, "weights"),
+            (&tier.checkpoint_tokenizer_sha256, "tokenizer"),
         ] {
             assert_eq!(digest.len(), 64, "{name} sha256 must be 64 hex chars");
             assert!(
@@ -381,6 +411,46 @@ mod tests {
             );
         }
         assert!(tier.checkpoint_weights_size_bytes > 0);
+    }
+
+    /// The teeth for `checkpoint_tokenizer_sha256` (unit-62 F-5): a run
+    /// against a model dir whose `tokenizer.json` bytes differ from the
+    /// fixture's own, with `config.json`/`model.safetensors` held byte-
+    /// identical, must move the recorded tokenizer digest (and ONLY that
+    /// digest) — proving the field is a real content hash of the actual
+    /// tokenizer bytes served, not a copy of `checkpoint_config_sha256` or a
+    /// constant. Perturbs the SAME fixture `build_encode_model_dir`
+    /// produces (rather than driving a second `run()`, which would also be
+    /// legitimate but slower) so the assertion isolates the one changed
+    /// file.
+    #[test]
+    fn checkpoint_tokenizer_sha256_reacts_to_the_actual_tokenizer_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        build_encode_model_dir(dir.path()).expect("build fixture model dir");
+        let (tokenizer_baseline, _) =
+            sha256_and_len(&dir.path().join("tokenizer.json")).expect("hash tokenizer.json");
+        let (config_baseline, _) =
+            sha256_and_len(&dir.path().join("config.json")).expect("hash config.json");
+
+        // Perturb: append a byte to tokenizer.json only; config.json/
+        // model.safetensors are never touched.
+        let mut bytes = std::fs::read(dir.path().join("tokenizer.json")).expect("read tokenizer");
+        bytes.push(b'\n');
+        std::fs::write(dir.path().join("tokenizer.json"), &bytes).expect("write perturbed");
+        let (tokenizer_perturbed, _) =
+            sha256_and_len(&dir.path().join("tokenizer.json")).expect("hash perturbed tokenizer");
+        let (config_after, _) =
+            sha256_and_len(&dir.path().join("config.json")).expect("hash config.json again");
+
+        assert_ne!(
+            tokenizer_baseline, tokenizer_perturbed,
+            "a byte-perturbed tokenizer.json must move its own sha256"
+        );
+        assert_eq!(
+            config_baseline, config_after,
+            "an untouched config.json must keep the same sha256 — the perturbation isolated \
+             to tokenizer.json alone"
+        );
     }
 
     /// The explicit `1_Pooling/config.json` fixture this tier builds

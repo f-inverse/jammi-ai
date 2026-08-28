@@ -372,8 +372,14 @@ enum Command {
     /// JSON report with the `encode_step` tier set; see
     /// `report::EncodeStepTier`'s own doc for the declared
     /// `IDENTITY_FIELDS`/`PROVENANCE_FIELDS` split. CPU-hermetic by default
-    /// (`Device::Cpu`); the pod producer parameterizes the GPU device.
-    EncodeStep,
+    /// (`Device::Cpu`); `--cuda` parameterizes the GPU device for the pod
+    /// producer, the SAME `--cuda: Option<usize>` convention `finetune-step`/
+    /// `grad-oracle` already take.
+    EncodeStep {
+        /// CUDA ordinal; omit for CPU.
+        #[arg(long)]
+        cuda: Option<usize>,
+    },
     /// The encoder fine-tune step tier: time one real LoRA training step —
     /// three encoder forwards live on the tape at once, a cosine-margin triplet
     /// loss, one backward into the adapter tensors, an optional PRODUCTION
@@ -578,7 +584,7 @@ async fn main() -> std::process::ExitCode {
         Command::ModelInferenceScale => run_model_inference_scale().await,
         Command::RebuildModelInferenceSpec => run_rebuild_model_inference_spec().await,
         Command::GpuInferenceScale => run_gpu_inference_scale().await,
-        Command::EncodeStep => run_encode_step().await,
+        Command::EncodeStep { cuda } => run_encode_step(cuda).await,
         Command::FinetuneStep {
             model_dir,
             batch,
@@ -1653,7 +1659,8 @@ async fn run_gpu_inference_scale() -> std::process::ExitCode {
 /// The encode-step corpus/measurement shape: a small, deterministic corpus —
 /// enough rows for the real tokenizer to produce a genuinely varied
 /// `row_lengths` (see `encode_step`'s own teeth test) without making the
-/// CI-hermetic default slow.
+/// CI-hermetic default slow. `gpu_device` here is the CI-hermetic default;
+/// `run_encode_step` overrides it from `--cuda` when the caller supplied one.
 const ENCODE_STEP_PARAMS: encode_step::EncodeStepParams = encode_step::EncodeStepParams {
     row_count: 8,
     seed: 0,
@@ -1667,8 +1674,19 @@ const ENCODE_STEP_PARAMS: encode_step::EncodeStepParams = encode_step::EncodeSte
 /// `generate_text_embeddings` call) — there is no perf pass/fail here; the
 /// identity-completeness self-check (`assert_identity_fields_present`) is
 /// enforced INSIDE `encode_step::run` on every invocation.
-async fn run_encode_step() -> std::process::ExitCode {
-    let tier = match encode_step::run(ENCODE_STEP_PARAMS).await {
+///
+/// `cuda` is `--cuda`'s ordinal (the SAME `Option<usize>` convention
+/// `finetune-step`/`grad-oracle` already take) — `Some(ordinal)` flows into
+/// `EncodeStepParams::gpu_device` as `ordinal as i32`, `None` keeps
+/// [`encode_step::CPU_HERMETIC_DEVICE`], the CI-hermetic default.
+async fn run_encode_step(cuda: Option<usize>) -> std::process::ExitCode {
+    let params = encode_step::EncodeStepParams {
+        gpu_device: cuda
+            .map(|ordinal| ordinal as i32)
+            .unwrap_or(encode_step::CPU_HERMETIC_DEVICE),
+        ..ENCODE_STEP_PARAMS
+    };
+    let tier = match encode_step::run(params).await {
         Ok(t) => t,
         Err(e) => {
             eprintln!("encode-step run failed: {e}");

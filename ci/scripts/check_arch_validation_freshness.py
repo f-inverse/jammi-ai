@@ -78,7 +78,7 @@ compute:
 
     git diff --name-only <that artifact's git_sha>..HEAD -- <flash surface>
 
-The flash surface (`FLASH_SURFACE` below) is deliberately the WHOLE of:
+The flash surface (`FLASH_SURFACE` below) is:
 
   - `crates/jammi-kernels/build.rs` (the `-gencode` set and `VALIDATED_SMS`
     itself — `GENCODE_ARCHES`'s own doc: "adding a `-gencode` pair alone
@@ -88,38 +88,52 @@ The flash surface (`FLASH_SURFACE` below) is deliberately the WHOLE of:
     exists to catch),
   - `crates/jammi-kernels/src/flash/` (the Rust-side flash kernel surface),
   - `crates/jammi-kernels/third_party/flash-attention/` (the vendored FA2
-    sources) — INCLUDING `VENDORED.md` prose. A carve-out for "docs-only"
-    changes under this directory was considered and rejected: `VENDORED.md`
-    is not incidental prose here, it is the sha256-pinned file manifest
-    (`## Files (sha256 of the vendored copy...)`) and the per-arch
-    VALIDATED table this gate's own module doc points at as "the single
-    source to cross-check" — a hand-edit to that table (e.g. someone
-    manually flipping a cell to VALIDATED without a new pod run) is exactly
-    the kind of surface drift this gate must not wave through. Default:
-    include everything under this directory, and let a genuinely docs-only
-    touch demand either a fresh artifact (cheap: nothing about the CUDA
-    surface actually changed, so re-running the suite is a formality) or an
-    explicit Rule-3 waiver.
+    sources),
   - `crates/jammi-kernels/src/admission.rs` (the CUDA-side `flash_validated_
     arches`/`check_arch` fence that actually reads `VALIDATED_SMS` at
-    runtime).
+    runtime),
+
+EXCLUDING pure documentation: any `*.md` file anywhere under the surface
+(concretely, today, only `third_party/flash-attention/VENDORED.md`) is
+filtered out of the diff BEFORE deciding staleness (`_changed_surface_files`
+below strips any changed path ending in `.md`). A doc edit cannot change the
+compiled SASS or the runtime fences — the things a per-arch pod-parity
+artifact actually validated — so demanding a fresh GPU run (or a Rule-3
+waiver) for a prose-only change is a FALSE staleness signal, and a gate that
+cries wolf on its own documentation trains exactly the waiver-fatigue the
+execution-surface-reachability audit already named as a real failure mode
+for this class of gate. This was proven live, not merely argued: the very
+commit that added this gate's own pointer paragraph to `VENDORED.md` turned
+all four `VALIDATED_SMS` entries "stale" under an earlier revision of this
+rule, which is the wrong answer for a change that touched zero bytes of
+compiled or executed code. `VENDORED.md` DOES also carry the sha256-pinned
+file manifest and the per-arch VALIDATED table (not merely incidental
+prose) — but doc HONESTY (that a table cell matches what the code and
+artifacts actually say) is `check_citations.py`/`check_doc_parity.py`'s job,
+not this gate's; and, structurally, a genuine vendored-SOURCE update always
+touches the real non-`.md` `.cu`/`.h` files in the same commit (that is
+what "vendored" means), so THAT change still trips this rule via the
+non-`.md` paths — the `.md` exclusion narrows the TRIGGER, not the actual
+source-of-truth files this gate watches, so no real drift is being waved
+through.
 
 `crates/jammi-encoders/src/modernbert.rs` (the encoder-side flash fence) is
-DELIBERATELY EXCLUDED from the trigger surface. A whole-file trigger on
-that file would fire on every unrelated encoder-side edit (it changes every
-unit, per the M3 hand-off's own framing) with zero signal about the CUDA
-surface. The honest resolution: `modernbert.rs`'s OWN correctness — that it
-calls into `flash_validated_arches`/`check_arch` at all and degrades
-correctly when an arch is not validated — is covered by this crate's own
-hermetic pin tests (`admission.rs`'s `flash_validated_arches_env_var_is_a_
-pinned_subset_of_compiled` and the `modernbert.rs` flash-arm fence tests
-compiled into every CI run), not by re-demanding a GPU pod run on every
-encoder edit. This gate's job is narrower and specific: re-demand evidence
-when the COMPILED KERNEL SURFACE (what actually runs on the GPU) changes,
-not every consumer of its Rust-level admission API. Flagged here per the
-task brief's own request, for a human to confirm or override.
+DELIBERATELY EXCLUDED from the trigger surface for a separate reason. A
+whole-file trigger on that file would fire on every unrelated encoder-side
+edit (it changes every unit, per the M3 hand-off's own framing) with zero
+signal about the CUDA surface. The honest resolution: `modernbert.rs`'s OWN
+correctness — that it calls into `flash_validated_arches`/`check_arch` at
+all and degrades correctly when an arch is not validated — is covered by
+this crate's own hermetic pin tests (`admission.rs`'s `flash_validated_
+arches_env_var_is_a_pinned_subset_of_compiled` and the `modernbert.rs`
+flash-arm fence tests compiled into every CI run), not by re-demanding a GPU
+pod run on every encoder edit. This gate's job is narrower and specific:
+re-demand evidence when the COMPILED KERNEL SURFACE (what actually runs on
+the GPU) changes, not every consumer of its Rust-level admission API.
+Confirmed as the right boundary in review; kept as-is.
 
-A stale entry (non-empty diff) is a hard FAIL unless Rule 3 waives it.
+A stale entry (non-empty, doc-filtered diff) is a hard FAIL unless Rule 3
+waives it.
 
 ## Rule 3 — waiver
 
@@ -130,6 +144,15 @@ allowlist.txt`): one row per line, `<arch><TAB><reviewed_up_to_sha><TAB>
 its evidence was last reviewed as sufficient through `<reviewed_up_to_sha>`,
 for `<reason>`" — the sha range it covers is `<the qualifying artifact's own
 git_sha>..<reviewed_up_to_sha>`.
+
+SCOPE, deliberately: a waiver can suppress ONLY a Rule 2 (freshness)
+finding, NEVER a Rule 1 (evidence) finding. "Deliberate accepted-staleness"
+presupposes evidence that exists but has aged; a total ABSENCE of evidence
+(zero qualifying artifacts for an arch) is a structurally different claim —
+"nothing was ever proven for this arch" — that no reason string can paper
+over. `check_rule3_waivers` only ever consults `stale` (Rule 2's own output)
+and never touches an arch with zero Rule-1 candidates; Rule 1 findings are
+always a hard FAIL. Confirmed as correct in review; kept as-is.
 
 Rot, all hard FAILs:
 
@@ -172,14 +195,17 @@ already use).
 
 ## Expected result on the real repo, today
 
-GREEN: all four `VALIDATED_SMS` entries (`80`/`86`/`89`/`90`) have a GREEN,
-ancestor-`git_sha` artifact at `80a451aa0d5dbaa07a1f0594d94453fa3fe03a29`
-(the four `2026-08-28-m3-arch-set-80a451a-*.json` files), and the flash
-surface is UNCHANGED between that sha and the M2/M3 train tip
-(`git diff --name-only 80a451aa..HEAD -- <flash surface>` is empty — verify
-this yourself against the real checkout before trusting this note; it is a
-statement about the tree at the time this gate was written, not a promise
-this gate itself enforces staying true).
+GREEN, with ZERO Rule-3 waivers — the honest baseline: all four
+`VALIDATED_SMS` entries (`80`/`86`/`89`/`90`) have a GREEN, ancestor-
+`git_sha` artifact at `80a451aa0d5dbaa07a1f0594d94453fa3fe03a29` (the four
+`2026-08-28-m3-arch-set-80a451a-*.json` files), and no NON-`.md` file under
+the flash surface has changed between that sha and the M2/M3 train tip plus
+this gate's own introduction commits (`git diff --name-only 80a451aa..HEAD
+-- <flash surface>` is empty except for this gate's own `VENDORED.md`
+pointer paragraph, which the `.md` exclusion above correctly reads as
+non-triggering — verify this yourself against the real checkout before
+trusting this note; it is a statement about the tree at the time this gate
+was written, not a promise this gate itself enforces staying true).
 
 Expected future interaction: the concurrently-developed `feat/m2-memeff-op`
 family lives on CPU-hermetic ops (`CustomOp3`) OUTSIDE the flash surface, so
@@ -225,12 +251,25 @@ TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 # may be a file or a directory (git's own `--` pathspec matches either);
 # deliberately EXCLUDES crates/jammi-encoders/src/modernbert.rs — see the
 # module doc's own "Why top-level only" / modernbert.rs carve-out section.
+# `_changed_surface_files` below additionally filters any matched `*.md`
+# path OUT of the result — see the module doc's "EXCLUDING pure
+# documentation" paragraph for why a doc-only touch under this surface
+# (concretely, today, only third_party/flash-attention/VENDORED.md) must
+# not itself trip Rule 2.
 FLASH_SURFACE: tuple[str, ...] = (
     "crates/jammi-kernels/build.rs",
     "crates/jammi-kernels/src/flash/",
     "crates/jammi-kernels/third_party/flash-attention/",
     "crates/jammi-kernels/src/admission.rs",
 )
+
+# Extensions treated as "pure documentation" for the purpose of Rule 2's
+# trigger — filtered OUT of `_changed_surface_files`'s result, never out of
+# `FLASH_SURFACE` itself (the underlying files are still watched; only a
+# change confined to files with one of these suffixes is treated as
+# non-triggering). `.md` only, deliberately narrow: a `.rs`/`.cu`/`.h`/`.cuh`
+# file is never "pure documentation" no matter how comment-heavy.
+DOC_SUFFIXES: tuple[str, ...] = (".md",)
 
 SHALLOW_CHECKOUT_MESSAGE = "shallow checkout — ancestry/diff cannot be evaluated; use fetch-depth: 0"
 ANCESTOR_MESSAGE = (
@@ -258,10 +297,21 @@ def _is_ancestor(sha: str, repo_root: Path, target: str = "HEAD") -> bool:
 
 
 def _changed_surface_files(sha: str, repo_root: Path, target: str = "HEAD") -> list[str]:
+    """The flash-surface files that changed between `sha` and `target`,
+    EXCLUDING pure documentation (`DOC_SUFFIXES`) — see FLASH_SURFACE's own
+    comment and the module doc's "EXCLUDING pure documentation" paragraph.
+    A change confined entirely to `.md` files under the surface returns an
+    empty list here (non-triggering); a change touching even one non-`.md`
+    surface file returns the FULL changed list (doc files included, for a
+    complete, honest finding message — only the TRIGGER decision ignores
+    them, not the reporting)."""
     proc = _run(["git", "diff", "--name-only", f"{sha}..{target}", "--", *FLASH_SURFACE], repo_root)
     if proc.returncode != 0:
         raise ArtifactError(f"`git diff --name-only {sha}..{target}` failed: {proc.stderr.strip()}")
-    return [line for line in proc.stdout.splitlines() if line.strip()]
+    changed = [line for line in proc.stdout.splitlines() if line.strip()]
+    if changed and all(f.endswith(DOC_SUFFIXES) for f in changed):
+        return []
+    return changed
 
 
 def _parse_date(value) -> datetime:
@@ -763,6 +813,46 @@ def self_test() -> int:
             f"{got}",
         )
 
+    # --- Rule 2 doc-exclusion mutant pair: a *.md-only surface change must
+    # NOT trip STALE, while a real (non-.md) surface change in the SAME
+    # directory still does — the exact live regression this rule fixes
+    # (the commit adding this gate's own VENDORED.md pointer paragraph
+    # falsely reddened all four VALIDATED_SMS entries under an earlier
+    # revision). Both legs touch third_party/flash-attention/ specifically,
+    # so this is not merely re-testing "an excluded path stays fresh" — it
+    # proves the DISCRIMINATION is by file extension, not by directory.
+    with tempfile.TemporaryDirectory() as td:
+        repo_root = _init_fixture_repo(Path(td), ["80"])
+        head = _git(repo_root, "rev-parse", "HEAD").stdout.strip()
+        _write_artifact(repo_root, "good.json", _good_artifact(head, "8.0"))
+        _commit_all(repo_root, "add good artifact")
+        (
+            repo_root / "crates" / "jammi-kernels" / "third_party" / "flash-attention" / "VENDORED.md"
+        ).write_text("# doc-only edit, no source/build change\n", encoding="utf-8")
+        _commit_all(repo_root, "touch VENDORED.md only (pure documentation)")
+        build_rs, cuda_runs, allowlist = paths(repo_root)
+        got = run_gate(build_rs, cuda_runs, allowlist, repo_root)
+        check(
+            "Rule 2 doc-exclusion: a *.md-only change under the surface does NOT trip STALE",
+            not any("STALE" in g for g in got),
+            f"{got}",
+        )
+        # SAME directory, but now ALSO touch a real (non-.md) vendored source
+        # file in the next commit — the doc exclusion must not mask this.
+        (
+            repo_root / "crates" / "jammi-kernels" / "third_party" / "flash-attention" / "kernel.cu"
+        ).write_text("// a real vendored source change\n", encoding="utf-8")
+        _commit_all(repo_root, "add a real (non-.md) vendored source change")
+        got = run_gate(build_rs, cuda_runs, allowlist, repo_root)
+        check(
+            "Rule 2 doc-exclusion mutant: a non-.md change in the SAME dir still trips STALE",
+            any(
+                "arch 80" in g and "STALE" in g and "third_party/flash-attention/kernel.cu" in g
+                for g in got
+            ),
+            f"{got}",
+        )
+
     # --- Rule 3: valid waiver suppresses a genuine STALE finding -----------
     with tempfile.TemporaryDirectory() as td:
         repo_root = _init_fixture_repo(Path(td), ["80"])
@@ -928,10 +1018,12 @@ def self_test() -> int:
     print(
         "arch-validation-freshness self-test: OK — every rule bites: Rule 1 (zero evidence, "
         "non-GREEN, non-ancestor sha, wrong-arch evidence), Rule 2 (STALE on a real surface change, "
-        "a positive control that an excluded-surface change stays fresh), Rule 3 (valid waiver "
-        "suppression, rot for an unknown arch, a dead waiver, a range that no longer covers HEAD, a "
-        "malformed sha, a malformed row), a missing VALIDATED_SMS literal (named ArtifactError), an "
-        "unparsable artifact JSON (named finding, never a crash), and the shallow-checkout guard."
+        "a positive control that an excluded-surface (modernbert.rs) change stays fresh, and the "
+        "doc-exclusion mutant pair: a *.md-only change under the surface stays fresh while a real "
+        "non-.md change in the SAME directory still trips STALE), Rule 3 (valid waiver suppression, "
+        "rot for an unknown arch, a dead waiver, a range that no longer covers HEAD, a malformed "
+        "sha, a malformed row), a missing VALIDATED_SMS literal (named ArtifactError), an unparsable "
+        "artifact JSON (named finding, never a crash), and the shallow-checkout guard."
     )
     return 0
 

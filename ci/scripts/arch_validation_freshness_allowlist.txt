@@ -18,15 +18,17 @@
 #     waiver's own range no longer covers HEAD — bump `reviewed_up_to_sha`
 #     after re-reviewing, or drop the arch from VALIDATED_SMS instead).
 #
-# --- docs-only VENDORED.md pointer paragraph (c44546e) ---------------------
-# c44546e added one paragraph to VENDORED.md's per-arch table section
-# pointing at THIS gate as the standing-evidence mechanism — no change to
-# any vendored source file's sha256, the per-arch VALIDATED table's own
-# content, build.rs's gencode/VALIDATED_SMS array, or admission.rs. The
-# flash surface is defined to include VENDORED.md wholesale (this gate's own
-# module doc explains why no docs-only carve-out exists), so this touch is
-# waived explicitly rather than silently exempted.
-80	c44546e675e6bbb7138505c2eb34a6b8c3e0c000	docs-only VENDORED.md pointer paragraph (c44546e) — no vendored-source/table/build.rs/admission.rs content change
-86	c44546e675e6bbb7138505c2eb34a6b8c3e0c000	docs-only VENDORED.md pointer paragraph (c44546e) — no vendored-source/table/build.rs/admission.rs content change
-89	c44546e675e6bbb7138505c2eb34a6b8c3e0c000	docs-only VENDORED.md pointer paragraph (c44546e) — no vendored-source/table/build.rs/admission.rs content change
-90	c44546e675e6bbb7138505c2eb34a6b8c3e0c000	docs-only VENDORED.md pointer paragraph (c44546e) — no vendored-source/table/build.rs/admission.rs content change
+# Scoped to Rule 2 (freshness) findings only — never Rule 1 (evidence):
+# see check_arch_validation_freshness.py's own module doc, "SCOPE,
+# deliberately" paragraph under "Rule 3 — waiver".
+#
+# Empty today, deliberately (the honest baseline): every VALIDATED_SMS entry
+# (sm80/86/89/90) has fresh, non-doc evidence at the M2/M3 train tip. An
+# earlier revision of this gate treated `third_party/flash-attention/
+# VENDORED.md` as fully in-surface and carried four waiver rows here for a
+# docs-only pointer-paragraph edit — that was the wrong shape (a doc change
+# cannot move the compiled SASS or the fences a pod run actually validated,
+# so demanding a waiver for it is false staleness that trains waiver-
+# fatigue); the gate itself now excludes pure documentation (`*.md`) from
+# Rule 2's trigger instead, so no waiver was ever needed for that class of
+# change. See the gate's own module doc for the full reasoning.

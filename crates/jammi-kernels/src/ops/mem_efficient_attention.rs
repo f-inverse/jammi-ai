@@ -107,7 +107,15 @@
 //! candle-eager behavior on that row (including a possible `NaN`/uniform
 //! result, exactly as `Propagate` does everywhere else in this crate).
 //!
-//! ## `bwd`'s `lse` channel: [`Saved`] makes this a [`StatefulKernelOp`]
+//! ## `bwd`'s `lse` channel: [`Saved`] makes this `!Copy`
+//!
+//! (Round-4 audit advisory: an earlier heading here — "Saved makes this a
+//! `StatefulKernelOp`" — was the exact category error this section's own
+//! body corrects below: `StatefulKernelOp` is blanket-implemented over
+//! `Sealed + Send + Sync + 'static`, so satisfying it is not what `Saved`
+//! causes or what distinguishes this op; what `Saved` causes is `!Copy`,
+//! which is what actually forces [`super::apply_stateful3`] over
+//! [`super::apply3`] — see the body's own precise statement.)
 //!
 //! `fwd` stores `(out, lse)` — `lse[b,h,q] = m[b,h,q] + ln(l[b,h,q])`, the
 //! row's final running max plus the log of its final running sum-exp, the
@@ -162,63 +170,100 @@
 //!
 //! ## Memory cost: the `[b, h, s, c]` transient, priced both directions
 //!
-//! Round-2 audit (F4), CORRECTED round-3 (F-A, F-B — both stood on
-//! independent re-verification: the round-2 figures undercounted `bwd`'s
-//! peak by one whole buffer and omitted `fwd`'s persistent set entirely).
-//! The per-chunk score-shaped transient is `O(b · h · s · c)`, LINEAR in
-//! `c` — the `MIN_CHUNK` (`512`) launch-count floor therefore inflates it
-//! directly, and this is priced HERE, both directions, with the number
-//! produced rather than assumed, MEASURED with a tracking global
-//! allocator (a scratch `examples/` probe, not committed) rather than
-//! reasoned from `drop`-point inspection alone (round-2's own method,
-//! which is what missed the `[b,h,s,c]`-sized UNNAMED temporary a chained
-//! `.broadcast_sub(..)?` call leaves alive until its enclosing
-//! STATEMENT's end, not merely its last syntactic use). At
-//! `b=1, h=16, s=8192, c=512` (`f32`, `4` bytes/element — the plan's own
-//! A1 shape): one `[b, h, s, c]` buffer is `1·16·8192·512·4 =
-//! 268_435_456` bytes (`≈ 268.4 MB`); one `[b, h, s, d]` buffer (`d=64`,
-//! the shape `q`/`k`/`v`/`acc`/`dqs` are — a DIFFERENT, smaller class,
-//! `c/d = 8×` smaller at this shape) is `1·16·8192·64·4 = 33_554_432`
-//! bytes (`≈ 33.6 MB`).
+//! Round-2 audit (F4), CORRECTED round-3 (F-A, F-B), CORRECTED AGAIN
+//! round-4 (F1, F2, F3 — all three closed the SAME residual gap: a figure
+//! stated as if MEASURED that was actually a DERIVED sum of named-buffer
+//! byte counts, which omitted whatever the derivation's own enumerated
+//! list left out — `m`/`l`/`mask_running_max`, `acc`'s true declaration
+//! point, CPU-GEMM-internal retained scratch, `bwd`'s own persistent
+//! state). **Every figure below states its own basis, MEASURED or
+//! DERIVED, individually — never a blanket claim for a whole section**
+//! (round-3's preamble claimed the section was uniformly measured; it was
+//! not — only the `bwd` `ds_c`/band figures were). MEASURED figures come
+//! from a tracking global allocator (a scratch `examples/` probe, not
+//! committed — this round's figures are the round-3 auditor's own
+//! independent re-measurement, cited verbatim per the hand-off's
+//! instruction not to re-measure absent disagreement); DERIVED figures
+//! are a sum of named-buffer byte counts read directly off the code's own
+//! declared shapes — informative, but not proof against an omitted term,
+//! which is exactly the failure mode round-3 (F-A) and round-4 (F1, F2,
+//! F3) each closed one instance of. At `b=1, h=16, s=8192, c=512` (`f32`,
+//! `4` bytes/element — the plan's own A1 shape): one `[b, h, s, c]` buffer
+//! is `1·16·8192·512·4 = 268_435_456` bytes (`≈ 268.4 MB`); one
+//! `[b, h, s, d]` buffer (`d=64`, the shape `q`/`k`/`v`/`acc`/`dqs` are —
+//! a DIFFERENT, smaller class, `c/d = 8×` smaller at this shape) is
+//! `1·16·8192·64·4 = 33_554_432` bytes (`≈ 33.6 MB`).
 //!
-//! - **`fwd`** (`attention_fwd_memeff_f32`) has TWO distinct components,
-//!   both real, neither priced in the round-2 doc:
-//!   - **Loop-resident** (allocated ONCE, before the chunk loop, held
-//!     until the function returns): `q`, `k`, `v`, `acc` — FOUR
+//! - **`fwd`** (`attention_fwd_memeff_f32`) has several distinct
+//!   components, none priced correctly before round-4:
+//!   - **Loop-resident (DERIVED)**: `q`, `k`, `v`, `acc` — FOUR
 //!     `[b,h,s,d]` Vecs, `4 · 33.6 MB ≈ 134.2 MB`, resident across EVERY
 //!     chunk iteration (round-2's model omitted this term entirely — it
 //!     priced only the per-chunk transient below, as if `q`/`k`/`v`/`acc`
-//!     were free).
-//!   - **Per-chunk transient**: `scores` (one `[b,h,s,c]` buffer) plus
-//!     the smaller `k_chunk`/`v_chunk` (`[b,h,c,d]` each,
+//!     were free). `m`/`l`/`mask_running_max` (declared just after `acc`,
+//!     same lifetime — `1_081_344` bytes `≈ 1.08 MB` combined: `m`/`l` are
+//!     each `bh·s·4` bytes, `mask_running_max` is `b·s·4`) are ALSO
+//!     loop-resident and were omitted from round-3's list too.
+//!   - **Per-chunk transient (DERIVED)**: `scores` (one `[b,h,s,c]`
+//!     buffer) plus the smaller `k_chunk`/`v_chunk` (`[b,h,c,d]` each,
 //!     `1·16·512·64·4 = 2_097_152` bytes `≈ 2.1 MB` apiece) — `≈ 272.6 MB`
 //!     — freed automatically at the end of EACH chunk iteration (these are
 //!     `while`-loop-body-local bindings) and never summed across chunks.
-//!   - **The genuine loop-body peak is therefore their SUM**:
-//!     `134.2 MB + 272.6 MB ≈ 406.8 MB`, not `≈ 272.6 MB` alone (round-2's
-//!     figure — a real undercount, not a rounding difference).
-//!   - **RoPE** (when `self.rope`, before the loop): `qr`/`kr` (two MORE
-//!     `[b,h,s,d]` buffers) are built while the ORIGINAL `q`/`k` are still
-//!     bound (needed as the rotate-half SOURCE) — `+2 · 33.6 MB ≈ 67.1 MB`
-//!     transiently, on top of the already-resident `q`/`k`/`v`/`acc`
-//!     (`≈ 201.6 MB` at that specific window), before `q = qr; k = kr;`
-//!     drops the originals.
-//!   - **Post-loop** (`out_bh`, then the final scatter into `out`): TWO
-//!     more `[b,h,s,d]`/`[b,s,h,d]`-shaped buffers (same element count,
-//!     different layout) while `acc` is still bound (nothing in this
-//!     function explicitly drops it) — `+2 · 33.6 MB ≈ 67.1 MB` on top of
-//!     the persistent set, `≈ 201.6 MB` at that window — LOWER than the
-//!     loop-body peak above, so it does not change the overall maximum.
-//!   - **Overall `fwd` peak**: the loop-body window, `≈ 406.8 MB` — this
-//!     is the number this section states, corrected from round-2's
-//!     `≈ 272.6 MB`.
+//!   - **The genuine loop-body peak, MEASURED (round-4 audit F1)**:
+//!     `460_496_636` bytes (`≈ 460.50 MB`) — NOT round-3's `≈ 406.8 MB`
+//!     (itself only the SUM of the two DERIVED terms above,
+//!     `134.2 + 272.6 = 406.8 MB` — a real number, but a derivation
+//!     round-3 mislabeled as dispositive). The gap (`≈ 53.7 MB`) resolves
+//!     into two DERIVED terms: `m`/`l`/`mask_running_max` (`≈ 1.08 MB`,
+//!     above — round-4's own correction to the loop-resident list) plus
+//!     CPU-GEMM-internal retained scratch (`≈ 52.6 MB`, at the
+//!     `q_storage.matmul(..)` call — the SAME class of term this doc's
+//!     `bwd` section already prices for `matmul_grad_lhs`): summing all
+//!     four, `134.2 MB, 272.6 MB, 1.08 MB, and 52.6 MB`, gives
+//!     `≈ 460.48 MB`, matching the MEASURED `460.50 MB` closely enough
+//!     that no further unpriced term remains.
+//!   - **RoPE (MEASURED)** (when `self.rope`, before the loop): `qr`/`kr`
+//!     (two MORE `[b,h,s,d]` buffers) are built while the ORIGINAL `q`/`k`
+//!     are still bound (needed as the rotate-half SOURCE) — round-4 audit
+//!     correction (F2): `acc` is declared AFTER this block (`acc`'s own
+//!     `let` is downstream of the RoPE `if let`), so it is NOT part of
+//!     this window's resident set — the window is `q`, `k`, `v` (already
+//!     resident) plus `qr`, `kr` (new): FIVE `[b,h,s,d]` buffers, MEASURED
+//!     at `167.8 MB` (not round-3's `≈ 201.6 MB`, which wrongly included
+//!     `acc`), before `q = qr; k = kr;` drops the originals.
+//!   - **Post-loop (DERIVED, cross-checked MEASURED)** (`out_bh`, then the
+//!     final scatter into `out`): TWO more `[b,h,s,d]`/`[b,s,h,d]`-shaped
+//!     buffers (same element count, different layout) while `q`, `k`,
+//!     `v`, `acc` are ALL still bound (nothing in this function explicitly
+//!     drops any of them) — DERIVED: `134.2 + 2 · 33.6 ≈ 201.3 MB`
+//!     (round-3 stated `201.6 MB` here, a rounding slip against its own
+//!     unit — `4 · 33.554432 + 2 · 33.554432 = 201.326592 MB`). `m`/`l`/
+//!     `mask_running_max` are ALSO still resident at this point (nothing
+//!     drops them either) — MEASURED (round-4 audit): `202.9 MB`
+//!     including them, consistent with `201.3 + 1.08 ≈ 202.4 MB` plus a
+//!     small residual — LOWER than the loop-body peak above either way,
+//!     so it does not change the overall maximum.
+//!   - **Overall `fwd` peak, MEASURED**: the loop-body window,
+//!     `≈ 460.50 MB` — this is the number this section states, corrected
+//!     from round-3's DERIVED-but-mislabeled `≈ 406.8 MB` (itself already
+//!     a correction of round-2's `≈ 272.6 MB`).
 //! - **`bwd`**: FIVE `[b,h,s,c]`-shaped intermediates exist per chunk
 //!   iteration (`scores_c`, `masked_c`, `p_c`, `dp_c`, `ds_c` — `dqs_c`/
 //!   `dk_c` are `[b,h,s,d]`/`[b,h,c,d]`-shaped instead, matching `Q`'s or
 //!   `K`'s own chunk size, NOT this class; round-2's own "FIVE" count
-//!   here was already correct — the measured NO-EARLY-DROP peak is SIX
-//!   concurrent buffers, not round-2's stated "up to six" — MEASURED, not
-//!   estimated, in the same probe). A ROUND-2 BUG (F-A): the `ds_c`
+//!   here was already correct — the measured NO-EARLY-DROP peak, FOR
+//!   ROUND-2's OWN pre-hoist code shape specifically, is SIX concurrent
+//!   buffers, not round-2's stated "up to six" — MEASURED, not estimated,
+//!   in the same probe. Round-4 audit advisory: this SIX figure does NOT
+//!   describe current HEAD — the F-A hoist below turns two previously
+//!   UNNAMED temporaries (`masked_c.broadcast_sub(..)`'s and
+//!   `dp_c.broadcast_sub(..)`'s own results) into NAMED bindings
+//!   (`masked_minus_lse`, `dp_minus_delta`); a named binding lives to its
+//!   OWN enclosing scope's end, not merely its statement's, so a
+//!   hypothetical "strip every explicit `drop()` from current HEAD" no-drop
+//!   count is measured at SEVEN, not six — the explicit drops below are
+//!   what keep the hoist a net improvement rather than a regression).
+//!   A ROUND-2 BUG (F-A): the `ds_c`
 //!   statement inlined `p_c.mul(&dp_c.broadcast_sub(&delta)?)?` — Rust
 //!   keeps that call's UNNAMED `broadcast_sub` result alive until the
 //!   WHOLE STATEMENT ends (not its last syntactic use), so `p_c`, `dp_c`,
@@ -251,13 +296,43 @@
 //!     `1/(b·h)` — `0.0625` at this shape (`16_777_216` bytes,
 //!     `≈ 16.8 MB`). MEASURED (same probe): `3.0625` units
 //!     (`822_084_952` bytes, `≈ 822.1 MB`) for this step.
-//!   - **The band-accumulation step, not the `ds_c` region, is `bwd`'s
-//!     TRUE post-fix bottleneck** whenever `half_window.is_some()`
-//!     (`822.1 MB > 805.3 MB`): fixing the `ds_c` region alone does not
-//!     bound the overall `bwd` peak below `≈ 822.1 MB` at this shape —
-//!     stated honestly, not left implied-solved by the `ds_c` fix alone.
-//!     Without a band (`half_window: None`), the `ds_c` region's own
-//!     `805.3 MB` IS the overall peak.
+//!   - **The band-accumulation step, not the `ds_c` region, is the
+//!     transient-class bottleneck** whenever `half_window.is_some()`
+//!     (`822.1 MB > 805.3 MB` — this comparison is scoped to the
+//!     `[b,h,s,c]` transient class alone; it is NOT `bwd`'s overall peak —
+//!     round-3's own "IS the overall peak" claim here was a category
+//!     error, round-4 audit F3: `bwd` ALSO holds real, priced-nowhere-
+//!     until-now persistent state across the WHOLE function, so scoping
+//!     "overall" to the transient class alone silently dropped it, the
+//!     SAME mistake `fwd`'s round-2 model made and F1/F2 above just
+//!     closed there).
+//!   - **`bwd`'s persistent state (DERIVED)**, live from before the chunk
+//!     loop starts to the function's end (declared, never dropped): `v0`,
+//!     `q_rot`, `k_rot`, `q_scaled` — FOUR `[b,h,s,d]` buffers (`q_rot`
+//!     itself is dead after `q_scaled` is built but nothing drops it —
+//!     a real, if wasteful, retention, priced as it actually behaves, not
+//!     as it ideally could) — plus `o`, `dctx` — TWO more — plus `dqs`
+//!     (mutated in place across every chunk) — ONE more: SEVEN
+//!     `[b,h,s,d]` buffers, `7 · 33.554432 MB = 234.881024 MB`
+//!     (`≈ 234.9 MB`), before `dk_chunks`/`dv_chunks` (below) even start
+//!     accumulating.
+//!   - **`bwd`'s TRUE overall peak (MEASURED lower bound + DERIVED upper
+//!     bound, round-4 audit F3 fix — symmetric with `fwd`'s own
+//!     treatment, per the auditor's preferred fix)**: MEASURED, at the
+//!     band-accumulation step, with the auditor's own independent probe:
+//!     `1_045_608_088` bytes (`≈ 1045.61 MB`) — this already includes a
+//!     PARTIAL `dk_chunks`/`dv_chunks` (the probe's own measurement point
+//!     is mid-loop, before those two Vecs finish accumulating their full
+//!     `67.1 MB`), so it is a real LOWER bound on the function's true
+//!     maximum, not the maximum itself. DERIVED upper bound, at the LAST
+//!     chunk iteration (persistent `234.9 MB` + `dk_chunks`/`dv_chunks`
+//!     fully grown, `67.108864 MB` + the band-step transient,
+//!     `822.084952 MB`): `234.881024 + 67.108864 + 822.084952 =
+//!     1_124.074840 MB` (`≈ 1.12 GB`). WITHOUT a band (`half_window:
+//!     None`, no separate measurement available for this exact case —
+//!     stated as DERIVED, not measured): persistent `234.9 MB` +
+//!     `dk_chunks`/`dv_chunks` `67.108864 MB` + the `ds_c`-region
+//!     transient `805.307456 MB` `= 1_107.297344 MB` (`≈ 1.11 GB`).
 //! - **`dk_chunks`/`dv_chunks` retention** (the module doc's "`dQ`
 //!   accumulates ACROSS the chunk loop" section): each pushed tensor is
 //!   `[b,h,clen,d]`-shaped (K/V's own chunk size, never `[.,s,c]`), so the
@@ -269,17 +344,21 @@
 //!   same total, just assembled in one shot instead of incrementally.
 //!
 //! **Both tradeoff directions, stated (v4 delta F3), numbers RE-DERIVED
-//! (round-3):** a LARGER `c` shrinks the launch count (`≈ s/c`
-//! `BackendStorage::matmul` calls per chunk-loop pass — the argument
-//! [`MIN_CHUNK`]'s own doc cites for why `c` has a floor at all) but
-//! GROWS every `[b,h,s,c]`-class transient linearly. At `c=1024`: one
-//! `[b,h,s,c]` buffer is `≈ 536.9 MB`; `bwd`'s post-fix band-inclusive
-//! peak is `≈ (3 + 1/16) · 536.9 MB ≈ 1644.1 MB` (`≈ 1.64 GB`); the
-//! PRE-fix (round-2-committed) `ds_c`-region peak at `c=1024` would have
-//! been `≈ 4 · 536.9 MB ≈ 2147.5 MB` (`≈ 2.15 GB`, matching the auditor's
-//! own cited figure) — NOT round-2's stated `≈ 2.1 GB`/`≈ 1.61 GB` pair
-//! (the `2.1 GB` figure there was ALSO the pre-fix number, silently
-//! attributed to a post-fix claim). A SMALLER `c` shrinks the transient
+//! (round-3), precision corrected (round-4 audit advisory):** a LARGER
+//! `c` shrinks the launch count (`≈ s/c` `BackendStorage::matmul` calls
+//! per chunk-loop pass — the argument [`MIN_CHUNK`]'s own doc cites for
+//! why `c` has a floor at all) but GROWS every `[b,h,s,c]`-class transient
+//! linearly. At `c=1024`: one `[b,h,s,c]` buffer is `536_870_912` bytes
+//! (`≈ 536.9 MB`); `bwd`'s post-fix band-STEP TRANSIENT (the same
+//! `[b,h,s,c]`-class figure the `c=512` section above scopes explicitly
+//! to the transient class, never "overall" — F3's own lesson) is
+//! `3.0625 · 536_870_912 = 1_644_167_168` bytes (`≈ 1644.17 MB`, not
+//! round-3's rounded `≈ 1644.1 MB`); the PRE-fix (round-2-committed)
+//! `ds_c`-region transient at `c=1024` would have been `≈ 4 · 536.9 MB ≈
+//! 2147.5 MB` (`≈ 2.15 GB`, matching the auditor's own cited figure) — NOT
+//! round-2's stated `≈ 2.1 GB`/`≈ 1.61 GB` pair (the `2.1 GB` figure there
+//! was ALSO the pre-fix number, silently attributed to a post-fix claim).
+//! A SMALLER `c` shrinks the transient
 //! but grows the launch count toward the `(s/c)²`-launch-latency regime
 //! the keys-only-chunking design (module doc's "why a `CustomOp3` at all"
 //! section, and the plan's own `c=128` ≈ 7 s pure-launch-latency figure)

@@ -34,12 +34,18 @@
 //! module doc): a `Saved<T>` SPANS two op types here, never a raw field
 //! smuggled between them outside that channel.
 //!
-//! # Why `StatefulKernelOp`, not `KernelOp`, for BOTH op types
+//! # Why `StatefulKernelOp`, not `KernelOp`, for all THREE op types
 //!
-//! Both hold a `Saved` field (interior-mutable), so neither can be `Copy`
-//! — see [`crate::ops::StatefulKernelOp`]'s own doc for why `Clone` is
-//! refused too, and why that makes hoisting either op into a long-lived
-//! field a COMPILE ERROR.
+//! [`FlashVarlenAttention`], [`FlashVarlenBwdHelper`], AND
+//! [`FlashVarlenAttentionFusedRope`] (round-4 audit correction, F4: an
+//! earlier draft of this heading said "BOTH op types", undercounting this
+//! module's own third one — the fused-RoPE forward, "Two op types, one
+//! seam" above still names the pattern by its two SEAM shapes, not a
+//! total type count) each hold a `Saved` field (interior-mutable), so
+//! NONE of the three can be `Copy` — see
+//! [`crate::ops::StatefulKernelOp`]'s own doc for why `Clone` is refused
+//! too, and why that makes hoisting any of them into a long-lived field a
+//! COMPILE ERROR.
 //!
 //! # Domain
 //!

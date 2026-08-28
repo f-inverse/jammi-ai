@@ -288,15 +288,19 @@ pub fn apply_inplace3<T: KernelOp + InplaceOp3>(
 /// Bound: `Send + Sync + 'static + Sealed`, deliberately WITHOUT `Copy`
 /// **or `Clone`** — for every op that ACTUALLY EXISTS in this crate today
 /// AND GENUINELY NEEDS this trait, i.e. carries an owned [`Saved`] field
-/// (`crate::ops::flash_attention::FlashVarlenAttention` and its bwd
-/// helper — a plain code span, not a doc link: that module is
-/// feature-gated behind `flash-attn` and is absent from a default-feature
-/// `cargo doc` build — plus [`crate::ops::MemEfficientAttention`], the
-/// crate's THIRD Saved-bearing op and the FIRST one compiled in every
-/// default build, not merely under `flash-attn`). **Precision matters
-/// here** (round-3 audit correction, F-C — the SAME category error round
-/// 1's "only two `StatefulKernelOp`s" phrasing had, relocated rather than
-/// closed): `StatefulKernelOp` itself is BLANKET-implemented (below) over
+/// (`crate::ops::flash_attention::FlashVarlenAttention`,
+/// `FlashVarlenBwdHelper`, AND `FlashVarlenAttentionFusedRope` — plain
+/// code spans, not doc links: that module is feature-gated behind
+/// `flash-attn` and is absent from a default-feature `cargo doc` build —
+/// plus [`crate::ops::MemEfficientAttention`], the crate's FOURTH
+/// Saved-bearing op (round-4 audit correction, F4: an earlier draft here
+/// said "THIRD", undercounting `flash_attention.rs`'s own three — see
+/// that module's own doc for the enumeration) and the FIRST one compiled
+/// in every default build, not merely under `flash-attn`). **Precision
+/// matters here** (round-3 audit correction, F-C — the SAME category
+/// error round 1's "only two `StatefulKernelOp`s" phrasing had, relocated
+/// rather than closed): `StatefulKernelOp` itself is BLANKET-implemented
+/// (below) over
 /// `Sealed + Send + Sync + 'static`, so every existing `KernelOp` in this
 /// crate — `LayerNormFused`, `RopeFused`, `GegluFused`,
 /// `AttentionBlockFused`, ... — ALSO satisfies `StatefulKernelOp`'s bound

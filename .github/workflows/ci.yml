@@ -985,6 +985,30 @@ jobs:
           # comment-vs-code-line tightening and the root generalization.
           - name: CI guard wiring suite
             cmd: python3 ci/scripts/test_check_ci_guard_wiring.py
+          # Execution-surface reachability guard (esc-050/esc-051 class,
+          # class_id `seed-tuple-unguarded`; supersedes-in-part the "CI guard
+          # wiring" leg above for this class): `check_ci_guard_wiring.py`
+          # only asks whether a script's NAME appears in some workflow's run
+          # body, with no notion of `on:` triggers at all — a tuple wired
+          # only into a dispatch/label/schedule-only workflow (gpu-prove.yml)
+          # satisfies it while nothing on the merge path ever runs it, the
+          # exact esc-050/051 escape shape (`pod_seed_target.sh`'s own
+          # T1/T1b/T2/T3 clippy/build/test tuples went red on a fresh pod's
+          # seed the same day #389 merged green). This gate mechanizes real
+          # reachability: every CUDA/CUTLASS-toolchain-gated `cargo ...`
+          # invocation discovered under `ci/scripts/**` must appear, exact
+          # tuple match (never substring — `cuda,flash-attn` must not
+          # satisfy `cuda`), inside a workflow whose `on:` block genuinely
+          # fires on the merge path, or carry a reasoned, rot-checked row in
+          # `ci/scripts/execution_surface_reachability_allowlist.txt`. See
+          # that script's own module doc for the honest residual this repo
+          # has chosen (every such tuple today needs `gpu-prove.yml`, which
+          # is deliberately never a merge-path trigger — allowlisted, not
+          # silently accepted).
+          - name: execution-surface reachability
+            cmd: python3 ci/scripts/check_execution_surface_reachability.py
+          - name: execution-surface reachability self-test
+            cmd: python3 ci/scripts/check_execution_surface_reachability.py --self-test
           # Re-resolves every finetune_step.rs:<n>/grad_oracle.rs:<n>
           # PATH:LINE citation under crates/jammi-bench/**,
           # ci/scripts/perf/**, and crates/jammi-kernels/artifacts/cuda-runs/

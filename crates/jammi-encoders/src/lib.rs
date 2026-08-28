@@ -129,6 +129,19 @@ pub fn attention_block_flash_dispatch_snapshot() -> jammi_kernels::admission::Ca
     jammi_kernels::admission::cascade_counters_for("attention_block_flash").snapshot()
 }
 
+/// A snapshot of the memory-efficient (chunked) attention cascade's
+/// dispatch counts (`mem_efficient_attention`, M2 — see
+/// `crate::modernbert`'s `mem_efficient_attention_predicate`/
+/// `ModernBertAttention::forward_training_attention` for the `admit_cascade`
+/// call site this counts). Mirrors [`attention_block_flash_dispatch_snapshot`]'s
+/// own read-API shape and rationale exactly (a cascade counter is keyed by
+/// op name in `jammi_kernels::admission`'s process-wide registry, not
+/// stored per-crate).
+pub fn mem_efficient_attention_dispatch_snapshot(
+) -> jammi_kernels::admission::CascadeDispatchSnapshot {
+    jammi_kernels::admission::cascade_counters_for("mem_efficient_attention").snapshot()
+}
+
 /// Contiguity-safe matmul — the single matmul primitive every encoder uses.
 ///
 /// candle's **CUDA** matmul rejects two operand layouts its **CPU** matmul

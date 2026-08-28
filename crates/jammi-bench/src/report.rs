@@ -1749,7 +1749,7 @@ impl FinetuneStepTier {
     /// name here regardless of which side lands first).
     /// The 18 comparison entries, plus five K7-completeness additions the
     /// comparison tuple omits BY DESIGN (provenance never compared
-    /// cross-producer — see `ab_merge.py:43`'s own doc): `device_name`,
+    /// cross-producer — see `ab_merge.py:47-55`'s provenance rows): `device_name`,
     /// `kernels_disabled_requested`, `kernels_disabled_fired`,
     /// `flash_compiled`, `build_features`.
     ///

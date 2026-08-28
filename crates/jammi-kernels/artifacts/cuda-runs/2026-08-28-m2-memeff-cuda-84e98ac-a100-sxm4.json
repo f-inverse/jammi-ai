@@ -14,7 +14,7 @@
  "producer": {
   "path": "crates/jammi-kernels/tests/cuda_parity.rs",
   "kind": "cargo-test",
-  "invocation": "JAMMI_REQUIRE_CUDA=1 cargo test -p jammi-kernels --features cuda --test cuda_parity mem_efficient -- --nocapture",
+  "invocation": "JAMMI_REQUIRE_CUDA=1 cargo test -p jammi-kernels --features cuda --test cuda_parity -- --exact mem_efficient_bwd_cuda_matches_cpu_bf16 --nocapture && JAMMI_REQUIRE_CUDA=1 cargo test -p jammi-kernels --features cuda --test cuda_parity mem_efficient -- --nocapture",
   "gating": "env:JAMMI_REQUIRE_CUDA"
  },
  "observed": {

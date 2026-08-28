@@ -604,7 +604,14 @@ fn sha256_and_len(path: &std::path::Path) -> Result<(String, u64)> {
 /// [`ModelIdentity`](jammi_db::store::manifest::ModelIdentity) determinant
 /// that closes the defect where `model_id` alone did not change when the
 /// referenced directory's `1_Pooling/config.json`, tokenizer, or weights
-/// bytes changed. Called ONCE per model load, from [`CandleBackend::load`].
+/// bytes changed. Called ONCE per model load, from
+/// [`compute_model_identity_facets`] — see that function's doc for the
+/// ordering invariant (audit round 62, F-4''): this MUST run AFTER
+/// [`compute_model_fingerprint`], never before, and never independently
+/// from a production call site. A future edit that reorders the two calls
+/// (or adds a second call site to either) breaks the invariant silently
+/// unless it also edits `compute_model_identity_facets`'s doc — review
+/// should treat any diff touching that ordering as load-bearing.
 ///
 /// **Input set** — every file whose bytes are output-affecting relative to
 /// the bare `model_id` string: `resolved.config_path` (`config.json` or
@@ -658,81 +665,107 @@ fn sha256_and_len(path: &std::path::Path) -> Result<(String, u64)> {
 fn content_digest_entries(resolved: &ResolvedModel) -> Result<Vec<(String, std::path::PathBuf)>> {
     Ok(all_candidate_paths(resolved)?
         .into_iter()
-        .filter(|(_, _, gated)| *gated)
-        .map(|(rel, path, _)| (rel, path))
+        .filter(|c| c.gated)
+        .map(|c| (c.rel, c.path))
         .collect())
 }
 
 /// One entry `all_candidate_paths` walks: a path anchored under `anchor`
-/// (the directory its relative name is computed against), and whether the
+/// (the directory its relative name is computed against), whether the
 /// resolver's own presence check says this candidate is currently
 /// output-affecting for `resolved` (`gated`) — the filter
 /// [`content_digest_entries`] applies to turn the full candidate set into
-/// the digest's present-only input set.
+/// the digest's present-only input set — and whether this candidate SLOT is
+/// inherently optional (audit round 62, F-4': `optional`, orthogonal to
+/// `gated`). `optional` is a property of the candidate's TYPE, fixed at
+/// construction below, never derived from whether it happens to exist right
+/// now: `1_Pooling/config.json` and `preprocessor_config.json` are optional
+/// because the loader has a documented, correctness-preserving fallback for
+/// their absence (mean pooling / no preprocessor geometry); `config.json`,
+/// the tokenizer, every weights path, and the adapter pair (once
+/// `adapter_path` is `Some`) are required because the loader has no such
+/// fallback — their absence makes any reload fail identically. See
+/// [`ModelFingerprint::probe`] for the arm this field selects.
 struct DigestCandidate {
+    rel: String,
     path: std::path::PathBuf,
-    anchor: std::path::PathBuf,
     gated: bool,
+    optional: bool,
 }
 
-/// Enumerate the FULL `(relpath, absolute_path, gated)` candidate set both
-/// [`content_digest_entries`] (hashes the bytes — filtered to `gated` only)
-/// and [`compute_model_fingerprint`] (esc-058 F-4b, `stat`s every candidate
-/// including absent ones so a later APPEARANCE is detectable) walk — the SAME
-/// set, computed by this ONE function, so the two can never drift from each
-/// other. `1_Pooling/config.json` and `preprocessor_config.json` are always
-/// CANDIDATES (regardless of whether the resolver actually read one for
-/// THIS load) precisely so a file that did not exist at load time but
-/// appears later is still tracked; `gated` — not omission from this list —
-/// is what decides whether [`content_digest_entries`] hashes it right now.
-/// See [`compute_model_content_digest`] for exactly which files this is, why,
-/// and the ordering/anchoring guarantee.
-fn all_candidate_paths(
-    resolved: &ResolvedModel,
-) -> Result<Vec<(String, std::path::PathBuf, bool)>> {
+/// Enumerate the FULL candidate set both [`content_digest_entries`] (hashes
+/// the bytes — filtered to `gated` only) and [`compute_model_fingerprint`]
+/// (esc-058 F-4b, `stat`s every candidate including absent ones so a later
+/// APPEARANCE is detectable) walk — the SAME set, computed by this ONE
+/// function, so the two can never drift from each other. `1_Pooling/config.json`
+/// and `preprocessor_config.json` are always CANDIDATES (regardless of
+/// whether the resolver actually read one for THIS load) precisely so a
+/// file that did not exist at load time but appears later is still tracked;
+/// `gated` — not omission from this list — is what decides whether
+/// [`content_digest_entries`] hashes it right now, and `optional` (F-4')
+/// decides how [`ModelFingerprint::probe`] treats a present-at-load,
+/// NotFound-now candidate of this slot. See [`compute_model_content_digest`]
+/// for exactly which files this is, why, and the ordering/anchoring
+/// guarantee.
+fn all_candidate_paths(resolved: &ResolvedModel) -> Result<Vec<DigestCandidate>> {
+    struct RawCandidate {
+        path: std::path::PathBuf,
+        anchor: std::path::PathBuf,
+        gated: bool,
+        optional: bool,
+    }
+
     let model_dir = resolved
         .config_path
         .parent()
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| std::path::PathBuf::from("."));
 
-    let mut candidates: Vec<DigestCandidate> = vec![DigestCandidate {
+    let mut candidates: Vec<RawCandidate> = vec![RawCandidate {
         path: resolved.config_path.clone(),
         anchor: model_dir.clone(),
         gated: true,
+        optional: false,
     }];
 
     // `1_Pooling/config.json`: gated for the digest by whether the resolver
     // actually read one — the identical presence test `pooling_from_config`
     // gates its mean-fallback on — but always a CANDIDATE for the
-    // fingerprint (F-4b: appearance must be detectable).
-    candidates.push(DigestCandidate {
+    // fingerprint (F-4b: appearance must be detectable). `optional: true`
+    // (F-4'): a load-time-present, now-deleted config file here means a
+    // reload legitimately succeeds via the mean-pooling fallback.
+    candidates.push(RawCandidate {
         path: model_dir.join("1_Pooling/config.json"),
         anchor: model_dir.clone(),
         gated: resolved.pooling_config.is_some(),
+        optional: true,
     });
 
     // `preprocessor_config.json` (F-2): same pattern — the CLAP audio
-    // tower's whole feature-extractor geometry lives here.
-    candidates.push(DigestCandidate {
+    // tower's whole feature-extractor geometry lives here. `optional: true`
+    // (F-4') for the identical reason.
+    candidates.push(RawCandidate {
         path: model_dir.join("preprocessor_config.json"),
         anchor: model_dir.clone(),
         gated: resolved.preprocessor_config.is_some(),
+        optional: true,
     });
 
     if let Some(tokenizer) = &resolved.tokenizer {
-        candidates.push(DigestCandidate {
+        candidates.push(RawCandidate {
             path: tokenizer.path().to_path_buf(),
             anchor: model_dir.clone(),
             gated: true,
+            optional: false,
         });
     }
 
     for weights in &resolved.weights_paths {
-        candidates.push(DigestCandidate {
+        candidates.push(RawCandidate {
             path: weights.clone(),
             anchor: model_dir.clone(),
             gated: true,
+            optional: false,
         });
     }
 
@@ -743,24 +776,29 @@ fn all_candidate_paths(
     // `CandleBackend::load` applies (its `saved_adapter` read block, below)
     // before reading them, so
     // this candidate set can never drift from what the loader actually
-    // reads.
+    // reads. `optional: false` — once `adapter_path` is `Some`, the loader
+    // has no unadapted-fallback and refuses outright on either file's
+    // absence (see `candle_backend_load_refuses_some_adapter_path_missing_files`
+    // below), so a reload after either file vanishes fails identically.
     if let Some(adapter_dir) = &resolved.adapter_path {
         let cfg_path = adapter_dir.join("adapter_config.json");
         let weights_path = adapter_dir.join("adapter.safetensors");
         let gated = cfg_path.exists() && weights_path.exists();
-        candidates.push(DigestCandidate {
+        candidates.push(RawCandidate {
             path: cfg_path,
             anchor: adapter_dir.clone(),
             gated,
+            optional: false,
         });
-        candidates.push(DigestCandidate {
+        candidates.push(RawCandidate {
             path: weights_path,
             anchor: adapter_dir.clone(),
             gated,
+            optional: false,
         });
     }
 
-    let mut entries: Vec<(String, std::path::PathBuf, bool)> = Vec::with_capacity(candidates.len());
+    let mut entries: Vec<DigestCandidate> = Vec::with_capacity(candidates.len());
     for candidate in candidates {
         let rel = candidate
             .path
@@ -782,9 +820,14 @@ fn all_candidate_paths(
         } else {
             format!("adapter/{}", rel.to_string_lossy())
         };
-        entries.push((rel_string, candidate.path, candidate.gated));
+        entries.push(DigestCandidate {
+            rel: rel_string,
+            path: candidate.path,
+            gated: candidate.gated,
+            optional: candidate.optional,
+        });
     }
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries.sort_by(|a, b| a.rel.cmp(&b.rel));
     Ok(entries)
 }
 
@@ -825,13 +868,20 @@ fn compute_model_content_digest(resolved: &ResolvedModel) -> Result<ModelContent
 /// decides WHEN a reload is triggered, and does not strengthen the digest's
 /// own guarantee.
 ///
-/// `(relpath, absolute_path, snapshot)` for one [`ModelFingerprint`] entry.
-/// `snapshot` is `Some((len, mtime))` when the candidate existed at load
-/// time, or `None` when it did not (see [`ModelFingerprint`]'s doc, F-4b).
+/// `(relpath, absolute_path, snapshot, optional)` for one
+/// [`ModelFingerprint`] entry. `snapshot` is `Some((len, mtime))` when the
+/// candidate existed at load time, or `None` when it did not (see
+/// [`ModelFingerprint`]'s doc, F-4b). `optional` (audit round 62, F-4') is
+/// [`DigestCandidate::optional`] carried through unchanged — it is what
+/// [`ModelFingerprint::probe`] consults to decide whether a
+/// present-at-load, `NotFound`-now candidate is a STALE (evict + reload,
+/// the reload legitimately succeeds via the loader's own fallback) or a
+/// typed refusal (no fallback exists; a reload would fail identically).
 type FingerprintEntry = (
     String,
     std::path::PathBuf,
     Option<(u64, std::time::SystemTime)>,
+    bool,
 );
 
 /// [`ModelCache::get_or_load`]: super::super::cache::ModelCache::get_or_load
@@ -866,18 +916,41 @@ impl ModelFingerprint {
     ///   time (present candidates have an unchanged `(len, mtime)`; absent
     ///   candidates are still absent): serve the cached model.
     /// - `Ok(false)` — at least one candidate diverged: either a present
-    ///   file's `len`/`mtime` changed, or an ABSENT-at-load-time candidate
-    ///   now EXISTS (F-4b) — the caller must evict and reload, never serve.
-    /// - `Err` — a candidate that was present at load time vanished or
-    ///   became unreadable, or a candidate that was absent at load time is
-    ///   now unreadable for a reason OTHER than still not existing (e.g. a
-    ///   permission error): a typed refusal (K2), never silently treated as
-    ///   fresh (would replay stale weights) or as stale (would mask a real
-    ///   IO failure as an ordinary reload, which would then hit the identical
-    ///   error inside `compute_model_content_digest` anyway — surfacing it
-    ///   here is strictly more informative, naming the probe as the cause).
+    ///   file's `len`/`mtime` changed, an ABSENT-at-load-time candidate now
+    ///   EXISTS (F-4b), or an OPTIONAL, present-at-load candidate is now
+    ///   `NotFound` (F-4', see below) — the caller must evict and reload,
+    ///   never serve.
+    /// - `Err` — a REQUIRED (`optional == false`) candidate that was present
+    ///   at load time vanished or became unreadable, or ANY candidate
+    ///   (required or optional) is unreadable for a reason OTHER than
+    ///   `NotFound` (e.g. a permission error): a typed refusal (K2), never
+    ///   silently treated as fresh (would replay stale weights) or as stale
+    ///   (would mask a real IO failure as an ordinary reload, which would
+    ///   then hit the identical error inside `compute_model_content_digest`
+    ///   anyway — surfacing it here is strictly more informative, naming the
+    ///   probe as the cause).
+    ///
+    /// **The `optional`/`NotFound` lattice (audit round 62, F-4')** — three
+    /// arms over "was this candidate present at load time" ×
+    /// "does it exist now", plus `optional`:
+    ///
+    /// (a) absent-at-load, absent-now: unchanged — `Ok(true)` continues.
+    /// (b) OPTIONAL candidate, present-at-load, `NotFound`-now (e.g.
+    ///     `1_Pooling/config.json` deleted from a live model directory): the
+    ///     loader has a documented fallback for this candidate's absence
+    ///     (mean pooling / no preprocessor geometry) — a fresh reload
+    ///     legitimately SUCCEEDS, with a NEW digest reflecting the fallback.
+    ///     Reported as STALE (`Ok(false)`), not `Err`: the pre-F-4' code
+    ///     collapsed this into `Err` indistinguishably from arm (c),
+    ///     permanently wedging `ModelCache::get_or_load` on a model that a
+    ///     cold reload would serve just fine.
+    /// (c) REQUIRED candidate (`config.json`, the tokenizer, any weights
+    ///     path, or the adapter pair once `adapter_path` is `Some`),
+    ///     present-at-load, `NotFound`-now: the loader has NO fallback — a
+    ///     reload would fail identically — so this remains the typed
+    ///     refusal (`Err`), unchanged from before F-4'.
     pub(crate) fn probe(&self) -> Result<bool> {
-        for (rel, path, snapshot) in &self.entries {
+        for (rel, path, snapshot, optional) in &self.entries {
             match std::fs::metadata(path) {
                 Ok(meta) => {
                     let current_mtime = meta.modified().map_err(|e| JammiError::Model {
@@ -899,8 +972,28 @@ impl ModelFingerprint {
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound && snapshot.is_none() => {
-                    // Still absent, exactly as at load time — fine.
+                    // Arm (a): still absent, exactly as at load time — fine.
                 }
+                // Arm (b), F-4': an OPTIONAL candidate that existed at load
+                // time (`snapshot.is_some()`) is now `NotFound`. The loader
+                // has a documented fallback for this candidate's absence —
+                // a reload legitimately succeeds — so this is STALE, not a
+                // refusal: fall through to the caller's evict-and-reload
+                // path exactly like any other divergence above.
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::NotFound
+                        && snapshot.is_some()
+                        && *optional =>
+                {
+                    return Ok(false);
+                }
+                // Arm (c): a REQUIRED candidate present at load time is now
+                // `NotFound` (no fallback exists — a reload would fail
+                // identically), or any candidate is unreadable for a reason
+                // other than `NotFound` (e.g. a permission error, for which
+                // "optional" carries no meaning — the failure is not "this
+                // file doesn't exist", it is "this file couldn't be
+                // inspected"). Both are typed refusals (K2).
                 Err(e) => {
                     return Err(JammiError::Model {
                         model_id: path.display().to_string(),
@@ -924,10 +1017,24 @@ impl ModelFingerprint {
 /// (F-4b) rather than omitted. Errors are typed refusals (K2) for anything
 /// other than "does not exist", the identical stance
 /// [`compute_model_content_digest`] takes.
+///
+/// **Ordering invariant (audit round 62, F-4'')**: called ONCE per model
+/// load, from [`compute_model_identity_facets`], and MUST run BEFORE
+/// [`compute_model_content_digest`] there — never after, and never from any
+/// other production call site. See that function's doc for why the order
+/// matters (a mutation landing between the two calls must be caught by a
+/// re-hash, never silently stamped as "fresh" against a stale digest
+/// forever).
 fn compute_model_fingerprint(resolved: &ResolvedModel) -> Result<ModelFingerprint> {
     let entries = all_candidate_paths(resolved)?;
     let mut stamped = Vec::with_capacity(entries.len());
-    for (rel, path, _gated) in entries {
+    for candidate in entries {
+        let DigestCandidate {
+            rel,
+            path,
+            gated: _gated,
+            optional,
+        } = candidate;
         match std::fs::metadata(&path) {
             Ok(meta) => {
                 let mtime = meta.modified().map_err(|e| JammiError::Model {
@@ -936,10 +1043,10 @@ fn compute_model_fingerprint(resolved: &ResolvedModel) -> Result<ModelFingerprin
                         "{path:?} has no mtime available for esc-058 load-time fingerprinting: {e}"
                     ),
                 })?;
-                stamped.push((rel, path, Some((meta.len(), mtime))));
+                stamped.push((rel, path, Some((meta.len(), mtime)), optional));
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                stamped.push((rel, path, None));
+                stamped.push((rel, path, None, optional));
             }
             Err(e) => {
                 return Err(JammiError::Model {
@@ -952,6 +1059,43 @@ fn compute_model_fingerprint(resolved: &ResolvedModel) -> Result<ModelFingerprin
         }
     }
     Ok(ModelFingerprint { entries: stamped })
+}
+
+/// Compute BOTH per-load staleness facets — [`ModelFingerprint`] (stat) and
+/// [`ModelContentDigest`] (hash) — in the ONLY safe order: fingerprint
+/// FIRST, digest SECOND. This is the sole caller of either function; every
+/// other call site (the `digest_fingerprint_audit62_tests` / `content_digest`
+/// unit tests below) calls the two directly and independently, which is
+/// exactly what makes those tests order-agnostic — production code must
+/// route through here.
+///
+/// **Ordering invariant (audit round 62, F-4'')**: stamping the fingerprint
+/// AFTER hashing the digest (the pre-fix order) leaves a window, between
+/// the hash read and the stat, in which a concurrent in-place mutation of
+/// the model directory stamps a POST-mutation `(len, mtime)` fingerprint
+/// against a PRE-mutation digest. The warm-path probe
+/// ([`ModelFingerprint::probe`]) then reports "fresh" FOREVER — its stat
+/// matches the fingerprint it was given, even though that fingerprint was
+/// never the one the digest was actually hashed from — so the process keeps
+/// serving the POST-mutation weights under the STALE, PRE-mutation digest
+/// folded into `ModelIdentity`. Stat-then-hash instead: a mutation landing
+/// in the (now much narrower, and in the opposite direction) window between
+/// the two calls is caught by the immediate re-hash the fingerprint no
+/// longer precedes — worst case, one extra reload converges on the correct
+/// digest; the fingerprint can never be silently wrong forever. Composing
+/// both calls in this ONE function (rather than two independent call sites
+/// in [`CandleBackend::load`]) pins the order STRUCTURALLY: a future edit
+/// cannot silently swap the two calls back without editing this function's
+/// two-line body, which review can see and require justification for. Do
+/// not call [`compute_model_fingerprint`] and [`compute_model_content_digest`]
+/// separately from any production path — only from this function, or from a
+/// unit test that is deliberately probing one facet in isolation.
+fn compute_model_identity_facets(
+    resolved: &ResolvedModel,
+) -> Result<(ModelFingerprint, ModelContentDigest)> {
+    let fingerprint = compute_model_fingerprint(resolved)?;
+    let content_digest = compute_model_content_digest(resolved)?;
+    Ok((fingerprint, content_digest))
 }
 
 impl CandleModel {
@@ -1691,16 +1835,14 @@ impl ModelBackend for CandleBackend {
         let device = select_device(device_config)?;
 
         // Computed ONCE per model load, before the (potentially expensive)
-        // weight loading below, so a hashing IO failure (K2: a typed refusal,
-        // never a silent `Unavailable`) surfaces fast rather than after
-        // mmapping several GB of safetensors. See `compute_model_content_digest`
-        // for the exact input set and ordering.
-        let content_digest = compute_model_content_digest(resolved)?;
-        // Same input set as `content_digest`, `stat`-only (esc-058): the
-        // warm-hit staleness tripwire `ModelCache::get_or_load` re-probes on
-        // every fast-path hit. See `ModelFingerprint`'s doc for the exact
-        // guarantee.
-        let fingerprint = compute_model_fingerprint(resolved)?;
+        // weight loading below, so a hashing/stat IO failure (K2: a typed
+        // refusal, never a silent `Unavailable`) surfaces fast rather than
+        // after mmapping several GB of safetensors. Routed through the ONE
+        // composed function — never the two independently — so the
+        // fingerprint-before-digest order (audit round 62, F-4'') is pinned
+        // structurally. See `compute_model_identity_facets`'s doc for the
+        // exact input set, ordering invariant, and why it matters.
+        let (fingerprint, content_digest) = compute_model_identity_facets(resolved)?;
 
         let model_type = resolved
             .model_config
@@ -3601,5 +3743,187 @@ mod digest_fingerprint_audit62_tests {
         let resolved = tiny_bert_resolved(&model_tmp.path().join("model"), None);
         let result = compute_model_content_digest(&resolved);
         assert!(result.is_ok(), "expected success, got {result:?}");
+    }
+
+    // ── F-4' (audit round 62, adversarial round 3): the optional/required \
+    //    lattice at the `ModelFingerprint::probe` level ──
+
+    /// F-4' core, unit level (the peer of `cache_staleness.rs`'s integration
+    /// test): an OPTIONAL candidate (`1_Pooling/config.json`) present at
+    /// fingerprint-capture time and `NotFound` at probe time must report
+    /// STALE (`Ok(false)`), never `Err`. RED pre-F-4': `probe()` collapsed
+    /// this into `Err` regardless of `optional`.
+    #[test]
+    fn probe_optional_candidate_deleted_after_capture_is_stale_not_a_refusal() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let mut resolved = tiny_bert_resolved(&dst, None);
+        std::fs::create_dir_all(dst.join("1_Pooling")).unwrap();
+        let pooling_json = serde_json::json!({"pooling_mode_cls_token": true});
+        std::fs::write(
+            dst.join("1_Pooling/config.json"),
+            serde_json::to_string(&pooling_json).unwrap(),
+        )
+        .unwrap();
+        resolved.pooling_config = Some(pooling_json);
+
+        let fingerprint = compute_model_fingerprint(&resolved).unwrap();
+        assert!(
+            fingerprint.probe().unwrap(),
+            "sanity: fresh immediately after capture"
+        );
+
+        std::fs::remove_file(dst.join("1_Pooling/config.json")).unwrap();
+
+        let result = fingerprint.probe();
+        assert!(
+            matches!(result, Ok(false)),
+            "an OPTIONAL candidate deleted after the fingerprint was captured \
+             must report STALE (Ok(false)) — a reload legitimately succeeds \
+             via the mean-pooling fallback — never Err (F-4'), got {result:?}"
+        );
+    }
+
+    /// F-4' control, unit level: a REQUIRED candidate (`model.safetensors`)
+    /// present at capture time and `NotFound` at probe time must remain the
+    /// typed refusal (`Err`) — unchanged from before F-4', since no fallback
+    /// exists and a reload would fail identically.
+    #[test]
+    fn probe_required_candidate_deleted_after_capture_stays_a_typed_refusal() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = tiny_bert_resolved(&dst, None);
+
+        let fingerprint = compute_model_fingerprint(&resolved).unwrap();
+        std::fs::remove_file(dst.join("model.safetensors")).unwrap();
+
+        let result = fingerprint.probe();
+        assert!(
+            result.is_err(),
+            "a REQUIRED candidate (model.safetensors) deleted after the \
+             fingerprint was captured must remain a typed refusal (F-4') — \
+             a reload would fail identically — got {result:?}"
+        );
+    }
+
+    // ── F-4'' (audit round 62, adversarial round 3): fingerprint-before- \
+    //    digest ordering ──
+    //
+    // A literal concurrent-mutation test racing `compute_model_identity_facets`'s
+    // own two internal calls is not deterministically constructible: that
+    // function is synchronous with no `.await` point to pause at, and is
+    // deliberately NOT parameterised with a `#[cfg(test)]` instrumentation
+    // seam (adding one would itself be a second, harder-to-review place the
+    // order could drift from). Instead, the two tests below reproduce the
+    // auditor's exact defect and its fix directly on the two primitives
+    // `compute_model_identity_facets` composes, called in each order — the
+    // observable CONSEQUENCE of the ordering, which is what actually matters
+    // — while `compute_model_identity_facets`'s doc comment pins WHICH order
+    // production takes, structurally (see that function for why a future
+    // reorder cannot happen silently).
+
+    /// The pre-fix (broken) order: hash first, stat second. A mutation
+    /// racing in the window between the two calls makes the fingerprint
+    /// attest the POST-mutation state while the digest attests the
+    /// PRE-mutation bytes — so `probe()` reports fresh FOREVER (nothing
+    /// changes after the fingerprint was captured) despite the digest being
+    /// stale. This is the F-4'' defect itself, reproduced directly.
+    #[test]
+    fn hash_before_stat_would_mask_a_racing_mutation_forever() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = tiny_bert_resolved(&dst, None);
+
+        // Pre-fix order: hash FIRST.
+        let digest_before = compute_model_content_digest(&resolved).unwrap();
+
+        // A mutation races in the window between the hash and the stat.
+        let weights_path = dst.join("model.safetensors");
+        let mut bytes = std::fs::read(&weights_path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&weights_path, &bytes).unwrap();
+
+        // Fingerprint stamped AFTER the mutation: its (len, mtime) matches
+        // the POST-mutation file exactly.
+        let fingerprint_after = compute_model_fingerprint(&resolved).unwrap();
+        let digest_after_mutation = compute_model_content_digest(&resolved).unwrap();
+        assert_ne!(
+            digest_before, digest_after_mutation,
+            "the mutation must actually change the digest — otherwise this \
+             test cannot distinguish stale from fresh"
+        );
+
+        // THE defect: probe reports fresh forever (nothing changes on disk
+        // after this point), even though a process holding `digest_before`
+        // would keep attesting a digest that no longer matches the bytes on
+        // disk — the "confident wrong number" F-4'' names.
+        assert!(
+            fingerprint_after.probe().unwrap(),
+            "hash-before-stat: the fingerprint captured AFTER the mutation \
+             reports fresh — the exact defect a fingerprint-before-digest \
+             ordering closes"
+        );
+    }
+
+    /// The fixed order — what `compute_model_identity_facets` actually does:
+    /// stat first, hash second. The identical mutation, raced into the
+    /// identical window, is now caught by the VERY NEXT probe: the
+    /// fingerprint captured BEFORE the mutation correctly reports stale,
+    /// converging on a reload rather than silently attesting a digest the
+    /// bytes no longer match.
+    #[test]
+    fn stat_before_hash_converges_after_a_racing_mutation() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = tiny_bert_resolved(&dst, None);
+
+        // Fixed order: stat FIRST.
+        let fingerprint_before = compute_model_fingerprint(&resolved).unwrap();
+        assert!(
+            fingerprint_before.probe().unwrap(),
+            "sanity: fresh immediately after capture"
+        );
+
+        let weights_path = dst.join("model.safetensors");
+        let mut bytes = std::fs::read(&weights_path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&weights_path, &bytes).unwrap();
+
+        let _digest_after = compute_model_content_digest(&resolved).unwrap();
+
+        assert!(
+            !fingerprint_before.probe().unwrap(),
+            "stat-before-hash: a mutation landing after the fingerprint was \
+             captured (but before the digest was hashed) must be caught by \
+             the NEXT probe — this order can never leave a fingerprint \
+             permanently attesting a stale digest (F-4'')"
+        );
+    }
+
+    /// Pins that production actually routes through the composed function
+    /// (never the two primitives independently) and that its return shape
+    /// is `(ModelFingerprint, ModelContentDigest)` — fingerprint first,
+    /// matching the doc'd call order inside it.
+    #[test]
+    fn compute_model_identity_facets_matches_manual_stat_then_hash_calls() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = tiny_bert_resolved(&dst, None);
+
+        let (fingerprint, digest) = compute_model_identity_facets(&resolved).unwrap();
+        let manual_digest = compute_model_content_digest(&resolved).unwrap();
+        assert_eq!(
+            digest, manual_digest,
+            "compute_model_identity_facets's digest must match a manual, \
+             independent compute_model_content_digest call over the same \
+             (unmutated) directory"
+        );
+        assert!(
+            fingerprint.probe().unwrap(),
+            "compute_model_identity_facets's fingerprint must report fresh \
+             over the same (unmutated) directory it was captured from"
+        );
     }
 }

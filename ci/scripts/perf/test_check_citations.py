@@ -504,5 +504,160 @@ class ShallowCheckoutRefusalTests(unittest.TestCase):
         self.assertEqual(code, 1)
 
 
+class LegacyNonAncestorExemptionTests(GitFixture):
+    """Post-#411 CI fix: the discriminator for artifact-citation resolution
+    is ANCESTRY (`git merge-base --is-ancestor`), never local object
+    PRESENCE. The real bug: `bf8e807` (the P1 softmax-fold artifact) is a
+    real, readable commit object on a developer's long-lived local
+    checkout (an old branch's objects never got pruned) but is NOT an
+    ancestor of `main` (squash-merged away) -- so the OLD `git show
+    <sha>:<path>` unconditional resolve read GREEN locally and RED on a
+    CI runner's fresh clone, an environment-dependent green this fix
+    closes. Every fixture here reproduces that EXACT precondition: the
+    cited sha's commit OBJECT is present in the repo (reachable via a
+    side branch), but it is NOT an ancestor of the branch the artifact's
+    citation is actually checked from.
+    """
+
+    def _non_ancestor_sha_with_a_true_citation(self) -> str:
+        """Commits `target.rs` (peak_thing at line 2) on a SIDE branch that
+        is never merged, returns that commit's sha, then advances the
+        main line with UNRELATED commits so the side-branch commit's
+        object stays present in this repo's own object database
+        (reachable via the side branch ref) while never becoming an
+        ancestor of the main line's HEAD -- the real bf8e807 shape.
+        """
+        self._write("root.txt", "root\n")
+        self._commit("root")
+        _run_git(["checkout", "-q", "-b", "trunk"], self.root)
+
+        _run_git(["checkout", "-q", "-b", "stale-side-branch"], self.root)
+        self._write("target.rs", "line one\nlet peak_thing = compute();\nline three\n")
+        stale_sha = self._commit("stale side-branch revision")
+
+        _run_git(["checkout", "-q", "trunk"], self.root)
+        # A DIFFERENT target.rs on the trunk line -- proves a later check
+        # never falls back to reading THIS (HEAD) content for the exempt
+        # citation either.
+        self._write("target.rs", "trunk line one\ntrunk line two -- not peak_thing at all\n")
+        self._commit("advance trunk, unrelated to the side branch")
+
+        cc._KNOWN_FILES = {"target.rs": self.root / "target.rs"}
+        cc._SEARCH_ROOTS = (self.root,)
+        return stale_sha
+
+    def test_non_ancestor_sha_with_object_present_locally_still_exempts_not_resolves(self):
+        """The precondition itself: the stale sha's OBJECT is reachable in
+        this repo (via the side branch) -- proving a later EXEMPT verdict
+        is NOT simply "the sha was never known to git" but genuinely
+        "known, but not an ancestor of this line", the exact bf8e807
+        shape."""
+        stale_sha = self._non_ancestor_sha_with_a_true_citation()
+        cat_file = _run_git(["cat-file", "-t", stale_sha], self.root)
+        self.assertEqual(cat_file.stdout.strip(), "commit", "fixture must keep the object present locally")
+        self.assertFalse(
+            cc._is_ancestor(stale_sha),
+            "fixture sha must NOT be an ancestor of HEAD -- otherwise this is not the bf8e807 shape",
+        )
+
+    def test_non_ancestor_sha_citation_is_a_named_exempt_line_not_a_violation(self):
+        """RED MUTANT (a): a citation whose artifact `git_sha` is NOT an
+        ancestor of HEAD produces a NAMED EXEMPT line -- never a
+        `Violation`, never silent (its presence is asserted directly, not
+        merely "zero violations")."""
+        stale_sha = self._non_ancestor_sha_with_a_true_citation()
+        artifact = self._write(
+            "artifacts/fixture.json",
+            f'{{"git_sha": "{stale_sha}", "_comment": "see `peak_thing`, target.rs:2"}}',
+        )
+        self._commit("add legacy artifact citing the non-ancestor sha")
+
+        violations, exemptions = cc._check_file_impl(artifact)
+        self.assertEqual(violations, [], [str(v) for v in violations])
+        self.assertEqual(len(exemptions), 1)
+        msg = str(exemptions[0])
+        self.assertIn("EXEMPT", msg)
+        self.assertIn(stale_sha, msg)
+        self.assertIn("NOT an ancestor of HEAD", msg)
+        self.assertIn("check_cuda_run_artifacts.py", msg)
+        self.assertIn("LEGACY_NONE_ALLOWLIST", msg)
+        # `check_file` (the thin, unchanged-signature wrapper every
+        # pre-existing test drives) must NEVER surface an Exemption as a
+        # Violation -- an exempt citation is invisible to every caller
+        # that only asked for violations.
+        self.assertEqual(cc.check_file(artifact), [])
+
+    def test_non_ancestor_sha_citation_never_reads_head_or_the_local_object_store(self):
+        """The citation's identifier (`peak_thing`) is genuinely TRUE at
+        the stale sha's own tree, and genuinely FALSE at trunk's HEAD --
+        if resolution silently fell back to either, this test's assertion
+        shape would flip. It must not: EXEMPT regardless, with no
+        violation naming a content mismatch against HEAD either."""
+        stale_sha = self._non_ancestor_sha_with_a_true_citation()
+        # Sanity: the object genuinely IS resolvable via `git show` (so a
+        # would-be-fallback COULD succeed silently, if this fix regressed).
+        show = _run_git(["show", f"{stale_sha}:target.rs"], self.root)
+        self.assertEqual(show.returncode, 0)
+        self.assertIn("peak_thing", show.stdout)
+
+        artifact = self._write(
+            "artifacts/fixture.json",
+            f'{{"git_sha": "{stale_sha}", "_comment": "see `peak_thing`, target.rs:2"}}',
+        )
+        self._commit("add legacy artifact")
+
+        violations, exemptions = cc._check_file_impl(artifact)
+        self.assertEqual(violations, [])
+        self.assertEqual(len(exemptions), 1)
+
+    def test_main_reports_exempt_citations_and_still_exits_zero(self):
+        """Drives the REAL `main()` entry point end-to-end: exempt findings
+        print (never silent) but do not gate CI."""
+        stale_sha = self._non_ancestor_sha_with_a_true_citation()
+        self._write(
+            "artifacts/fixture.json",
+            f'{{"git_sha": "{stale_sha}", "_comment": "see `peak_thing`, target.rs:2"}}',
+        )
+        self._commit("add legacy artifact")
+
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = cc.main()
+        self.assertEqual(code, 0)
+        self.assertIn("EXEMPT", buf.getvalue())
+        self.assertIn(stale_sha, buf.getvalue())
+
+    def test_ancestor_sha_still_resolves_and_a_real_mismatch_still_violates(self):
+        """RED MUTANT (b), explicit direct coverage: an ANCESTOR sha whose
+        content genuinely does not match must still produce a real
+        `Violation` (case 1's content-mismatch arm) -- proving the new
+        `not sha_is_ancestor` branch cannot accidentally swallow a real
+        defect into a false EXEMPT. (The full pre-existing
+        `ArtifactShaRelativeResolutionTests` suite already re-covers every
+        other case-1 arm unmodified; this is the one direct regression
+        check added alongside the new split.)
+        """
+        self._write("target.rs", "line one\nlet peak_thing = compute();\n")
+        good_sha = self._commit("good revision")
+        cc._KNOWN_FILES = {"target.rs": self.root / "target.rs"}
+        cc._SEARCH_ROOTS = (self.root,)
+
+        self.assertTrue(cc._is_ancestor(good_sha), "fixture sha must be an ancestor of its own repo's HEAD")
+
+        artifact = self._write(
+            "artifacts/fixture.json",
+            f'{{"git_sha": "{good_sha}", "_comment": "see `totally_wrong_identifier`, target.rs:2"}}',
+        )
+        self._commit("add artifact with a genuinely wrong citation")
+
+        violations, exemptions = cc._check_file_impl(artifact)
+        self.assertEqual(exemptions, [])
+        self.assertEqual(len(violations), 1)
+        self.assertIn("recorded git_sha", violations[0].message)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -29,7 +29,14 @@ struct CacheEntry {
     ref_count: Arc<AtomicUsize>,
     memory_bytes: usize,
     _residency: ModelResidency,
-    _gpu_permit: GpuPermit,
+    /// Audit round 62, F-3: shared with every outstanding `ModelGuard` handed
+    /// out for this entry (see `ModelGuard::gpu_permit`'s doc). Removing this
+    /// `CacheEntry` from the cache (stale-fingerprint eviction, `evict_one`)
+    /// drops only THIS clone — the reservation is released by `GpuPermit`'s
+    /// `Drop` only once every clone (this one plus any live guard's) is gone,
+    /// so `reserved_memory` is never decremented while a guard still holds
+    /// this model's device tensors resident across a forward pass.
+    gpu_permit: Arc<GpuPermit>,
 }
 
 struct CacheInner {
@@ -85,60 +92,104 @@ impl ModelCache {
         let id = ModelId::from(source);
 
         loop {
-            let mut cache = self.inner.write().await;
+            // Fast-path snapshot: clone the currently cached entry's shared
+            // handles under a short-held READ lock (tokio's `RwLock` admits
+            // concurrent readers), then drop the lock BEFORE the esc-058
+            // staleness probe below. `probe_freshness` runs one blocking
+            // `stat` per fingerprinted candidate (config, weights, tokenizer,
+            // pooling, preprocessor, adapter pair) — audit round 62 advisory:
+            // running that sequence under the cache's single write lock (as
+            // the pre-fix code did) would block every OTHER model's
+            // concurrent `get_or_load` for the duration. The snapshot +
+            // `Arc::ptr_eq` re-validate pattern below accepts a narrow race
+            // instead: if another task evicts/reloads this id while we
+            // probe, we simply retry from the top against whatever is there
+            // now — single-flight below still ensures at most one loader per
+            // id.
+            let snapshot = {
+                let cache = self.inner.read().await;
+                cache.entries.get(&id).map(|entry| {
+                    (
+                        Arc::clone(&entry.model),
+                        Arc::clone(&entry.ref_count),
+                        Arc::clone(&entry.gpu_permit),
+                    )
+                })
+            };
 
-            // Fast path: already loaded — but only after confirming the
-            // on-disk fingerprint captured at load time still matches
-            // (esc-058). `probe_freshness` is `stat`-only (never a re-hash /
-            // re-read), so this stays cheap; the write lock is the same one
-            // the fast path already held for `touch_lru`, not a new or wider
-            // one.
-            if let Some(entry) = cache.entries.get(&id) {
-                match entry.model.probe_freshness() {
+            if let Some((model, ref_count, gpu_permit)) = snapshot {
+                match model.probe_freshness() {
                     Ok(true) => {
-                        entry.ref_count.fetch_add(1, Ordering::Acquire);
-                        let guard = ModelGuard {
-                            model: Arc::clone(&entry.model),
-                            ref_count: Arc::clone(&entry.ref_count),
-                        };
-                        cache.touch_lru(&id);
-                        return Ok(guard);
+                        let mut cache = self.inner.write().await;
+                        let still_current = cache
+                            .entries
+                            .get(&id)
+                            .is_some_and(|e| Arc::ptr_eq(&e.model, &model));
+                        if still_current {
+                            ref_count.fetch_add(1, Ordering::Acquire);
+                            cache.touch_lru(&id);
+                            return Ok(ModelGuard {
+                                model,
+                                ref_count,
+                                _gpu_permit: gpu_permit,
+                            });
+                        }
+                        // The entry changed under us (a concurrent
+                        // evict/reload won the race) — retry against the
+                        // current state.
+                        continue;
                     }
                     Ok(false) => {
-                        // Stale: at least one fingerprinted file's
-                        // (len, mtime) diverged from load time. Evict via
-                        // the SAME removal machinery `evict_one` uses below
-                        // (dropping the `CacheEntry` releases its
-                        // `_gpu_permit` through the existing `Drop` impl —
-                        // this call site does not add a new eviction policy
-                        // or touch GPU memory tracking, it invokes the
-                        // existing one) and fall through to the
-                        // single-flight load below, which re-resolves and
-                        // re-hashes the CURRENT bytes.
+                        // Stale: at least one fingerprinted candidate's
+                        // (len, mtime) diverged from load time, or a
+                        // candidate absent at load time now exists (F-4b).
+                        // Evict — but only the SAME entry we probed; if it
+                        // already changed (another task raced us), leave
+                        // whatever is there now alone and retry.
                         //
-                        // Deliberately unconditional (unlike `evict_one`,
-                        // which only evicts an idle `ref_count == 0` entry
-                        // for memory-pressure reasons): serving stale bytes
-                        // is a correctness bug, not a capacity one, so it
-                        // overrides the idle-only discipline. The realistic
-                        // trigger (`EmbeddingPipeline::run` drops its guard
-                        // immediately after reading `content_digest`, before
-                        // inference runs) has `ref_count == 0` here in
-                        // practice; a stale entry still actively in use by
-                        // another in-flight guard when this fires is a
-                        // narrow, documented residual — no narrower than the
-                        // fingerprint's own same-len/same-mtime blind spot.
-                        cache.entries.remove(&id);
-                        cache.lru_order.retain(|x| x != &id);
+                        // Deliberately unconditional on `ref_count`
+                        // (unlike `evict_one`, which only evicts an idle
+                        // `ref_count == 0` entry for memory-pressure
+                        // reasons): serving stale bytes is a correctness
+                        // bug, not a capacity one, so it overrides the
+                        // idle-only discipline. Removing the `CacheEntry`
+                        // drops only ITS `Arc<GpuPermit>` clone (F-3) — the
+                        // reservation is not released while this
+                        // snapshot's `gpu_permit` (and any live
+                        // `ModelGuard`'s clone, e.g. one still forwarding
+                        // through the pre-mutation model) is outstanding,
+                        // so the accounting never double-books the
+                        // pre-mutation model's still-resident memory.
+                        let mut cache = self.inner.write().await;
+                        if cache
+                            .entries
+                            .get(&id)
+                            .is_some_and(|e| Arc::ptr_eq(&e.model, &model))
+                        {
+                            cache.entries.remove(&id);
+                            cache.lru_order.retain(|x| x != &id);
+                        }
+                        drop(cache);
+                        // Fall through to single-flight/load below, which
+                        // re-resolves and re-hashes the CURRENT bytes.
                     }
                     Err(e) => {
-                        // A fingerprinted file vanished or became unreadable
-                        // between load and this probe: a typed refusal (K2),
-                        // never a silent "treat as fresh" or "treat as
-                        // stale".
+                        // A fingerprinted candidate vanished or became
+                        // unreadable between load and this probe: a typed
+                        // refusal (K2), never a silent "treat as fresh" or
+                        // "treat as stale".
                         return Err(e);
                     }
                 }
+            }
+
+            let mut cache = self.inner.write().await;
+            // Re-check under the write lock: another task may have
+            // inserted this id (via `do_load` below) between our snapshot
+            // (which saw no entry, or a now-evicted one) and here.
+            if cache.entries.contains_key(&id) {
+                drop(cache);
+                continue;
             }
 
             // Single-flight: wait if another task is loading this model
@@ -274,6 +325,10 @@ impl ModelCache {
         let mut cache = self.inner.write().await;
         let ref_count = Arc::new(AtomicUsize::new(1));
         let model = Arc::new(loaded);
+        // F-3: the permit is `Arc`-shared between this `CacheEntry` and the
+        // `ModelGuard` returned below (and every subsequent warm-hit guard) —
+        // see `ModelGuard::gpu_permit`'s doc for why.
+        let gpu_permit = Arc::new(gpu_permit);
         cache.entries.insert(
             id.clone(),
             CacheEntry {
@@ -281,12 +336,16 @@ impl ModelCache {
                 ref_count: Arc::clone(&ref_count),
                 memory_bytes,
                 _residency: ModelResidency::Gpu,
-                _gpu_permit: gpu_permit,
+                gpu_permit: Arc::clone(&gpu_permit),
             },
         );
         cache.lru_order.push_back(id.clone());
 
-        Ok(ModelGuard { model, ref_count })
+        Ok(ModelGuard {
+            model,
+            ref_count,
+            _gpu_permit: gpu_permit,
+        })
     }
 
     /// Preload a model without running inference.

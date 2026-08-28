@@ -134,4 +134,34 @@ mod tests {
              way to tell padding from a window band apart"
         );
     }
+
+    /// [`jammi_kernels::ops::MemEfficientAttention`]'s own SECOND copy of
+    /// the band predicate (M2 plan v3 delta 3, adversarial audit round 3
+    /// advisory: this pin was required and missing) — extends the SAME
+    /// clearance-from-zero argument above to this op's `MEM_EFFICIENT_WINDOW_MASKED_VALUE`.
+    /// Unlike `AttentionBlockFused` (which reads ONE caller-combined mask
+    /// tensor and has no window construction data of its own), memeff
+    /// re-derives its band internally and SUMS it with the caller's own
+    /// `MASKED_LOGIT`-sentinel `key_mask` per chunk
+    /// (`ModernBertAttention::forward_memeff_attention` hands it the raw
+    /// padding-only mask, never a pre-combined one — see that op's module
+    /// doc's "the band is a `Copy` scalar" section). A doubly-masked key
+    /// (padded AND out-of-window) therefore lands at `MASKED_LOGIT +
+    /// MEM_EFFICIENT_WINDOW_MASKED_VALUE` — the SAME sum-of-two-sentinels
+    /// shape `AttentionBlockFused`'s own combined mask produces, so the
+    /// two sentinels must match for the SAME reason: a mismatch would
+    /// leave a doubly-masked memeff key at a DIFFERENT clearance from the
+    /// `0.0`/masked boundary than a singly-masked one, drifting silently
+    /// if either crate's constant were ever edited independently.
+    #[test]
+    fn masked_logit_matches_jammi_kernels_mem_efficient_window_masked_value() {
+        assert_eq!(
+            MASKED_LOGIT,
+            jammi_kernels::ops::MEM_EFFICIENT_WINDOW_MASKED_VALUE,
+            "jammi-encoders::mask::MASKED_LOGIT and \
+             jammi_kernels::ops::MEM_EFFICIENT_WINDOW_MASKED_VALUE must be the exact same \
+             sentinel — MemEfficientAttention sums its own internally-derived band with \
+             whichever key_mask the caller hands it, per chunk"
+        );
+    }
 }

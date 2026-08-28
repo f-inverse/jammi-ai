@@ -138,6 +138,33 @@ pub(crate) trait CandleTextForward: Send + Sync {
     fn resolved_pooling(&self) -> Option<Pooling> {
         None
     }
+
+    /// Whether [`Self::forward_hidden`] returns classification logits
+    /// (`[batch, num_classes]`, softmax already applied — see the three
+    /// `*ClassificationForward` wrappers below) rather than raw per-token
+    /// hidden states (`[batch, seq_len, hidden_size]`). Trait-default
+    /// `false`: every text-embedding/NER wrapper's `forward_hidden` is the
+    /// raw-hidden-states shape.
+    ///
+    /// **R7-F2 (audit round 62, adversarial round 8 advisory fold)**: the
+    /// mirror of R5-F2's `forward_pooled` refusal, in the OTHER mismatch
+    /// direction. [`super::super::cache::ModelCache`]'s warm cache is keyed
+    /// purely on [`crate::model::ModelId`] (no [`ModelTask`]), so a model
+    /// loaded once for `TextEmbedding` or `Ner` and then requested again for
+    /// `Classification` against the SAME id reaches this same warm entry's
+    /// `forward_hidden` — but many BERT-family checkpoints carry an
+    /// `id2label` map in `config.json` (often the architecture's default
+    /// 2-label declaration) even when loaded for a non-classification task,
+    /// so `CandleModel::forward_classification`'s `id2label.is_some()` guard
+    /// alone does not catch this mismatch. Without this signal,
+    /// `forward_classification` reaches `to_vec2::<f32>()` over a 3-D
+    /// `[batch, seq_len, hidden_size]` tensor it expects to be the 2-D
+    /// `[batch, num_classes]` softmax output, and dies with an opaque candle
+    /// rank error instead of a legible typed refusal — see
+    /// `classification_kind_mismatch_refusal`.
+    fn is_classification_head(&self) -> bool {
+        false
+    }
 }
 
 /// Vision architectures produce embeddings from pixel tensors.
@@ -232,6 +259,26 @@ fn classification_pooling_refusal() -> JammiError {
 /// requires of every wrapper that overrides one of this pair.
 fn classification_resolved_pooling() -> Option<Pooling> {
     None
+}
+
+/// The typed refusal `CandleModel::forward_classification` returns when the
+/// warm text wrapper it is dispatched to is NOT one of the three
+/// `*ClassificationForward` wrappers (`CandleTextForward::is_classification_head`
+/// is `false`) — audit round 62, adversarial round 8 advisory fold (R7-F2),
+/// the mirror of [`classification_pooling_refusal`] in the OTHER direction.
+/// Without this, a `Classification` call against a warm entry that was
+/// actually loaded for `TextEmbedding`/`Ner` (reachable whenever that
+/// checkpoint's `config.json` happens to carry an `id2label` map, which
+/// `forward_classification`'s own presence guard alone does not catch —
+/// see `CandleTextForward::is_classification_head`'s doc) would instead
+/// reach `to_vec2::<f32>()` over a raw `[batch, seq_len, hidden_size]`
+/// hidden-states tensor and die with an opaque candle rank error.
+fn classification_kind_mismatch_refusal() -> JammiError {
+    JammiError::Inference(
+        "model was not loaded for classification; this warm entry's text forward pass does not \
+         produce classification logits"
+            .into(),
+    )
 }
 
 /// BERT-family forward pass (bert, roberta, camembert, xlm-roberta). Carries
@@ -413,6 +460,10 @@ impl CandleTextForward for DistilBertClassificationForward {
     fn resolved_pooling(&self) -> Option<Pooling> {
         classification_resolved_pooling()
     }
+
+    fn is_classification_head(&self) -> bool {
+        true
+    }
 }
 
 /// ModernBERT sequence classification forward pass.
@@ -450,6 +501,10 @@ impl CandleTextForward for ModernBertClassificationForward {
 
     fn resolved_pooling(&self) -> Option<Pooling> {
         classification_resolved_pooling()
+    }
+
+    fn is_classification_head(&self) -> bool {
+        true
     }
 }
 
@@ -503,6 +558,10 @@ impl CandleTextForward for BertClassificationForward {
 
     fn resolved_pooling(&self) -> Option<Pooling> {
         classification_resolved_pooling()
+    }
+
+    fn is_classification_head(&self) -> bool {
+        true
     }
 }
 
@@ -872,8 +931,10 @@ struct DigestCandidate {
 /// the bytes — filtered to `gated` only) and [`compute_model_fingerprint`]
 /// (esc-058 F-4b, `stat`s every candidate including absent ones so a later
 /// APPEARANCE is detectable) walk — the SAME set, computed by this ONE
-/// function, so the two can never drift from each other. `1_Pooling/config.json`
-/// and `preprocessor_config.json` are always CANDIDATES (regardless of
+/// function, so the two can never drift from each other. `1_Pooling/config.json`,
+/// `preprocessor_config.json`, and BOTH tokenizer filenames
+/// (`tokenizer.json`, `bpe_simple_vocab_16e6.txt.gz` — audit round 62,
+/// adversarial round 8, R7-F1) are always CANDIDATES (regardless of
 /// whether the resolver actually read one for THIS load) precisely so a
 /// file that did not exist at load time but appears later is still tracked;
 /// `gated` — not omission from this list — is what decides whether
@@ -927,33 +988,70 @@ fn all_candidate_paths(resolved: &ResolvedModel) -> Result<Vec<DigestCandidate>>
         optional: !preprocessor_config_is_required(resolved),
     });
 
-    // The tokenizer (audit round 62, adversarial round 6, R5-F1): NOT
-    // required, despite the pre-fix comment's claim that "the loader has no
-    // fallback" — every resolver path (`discover_local_tokenizer` locally,
-    // the HF Hub `tokenizer.json` / `bpe_simple_vocab_16e6.txt.gz` fallback
-    // chain remotely) already re-derives `tokenizer: None` when the file is
-    // absent instead of erroring, and `CandleBackend::load`'s
-    // `.transpose()?` over that `Option` accepts `None`: the reload
-    // succeeds with `self.tokenizer == None`, matching cold-process
-    // semantics exactly. A text-encoding call fails LATER with that path's
-    // own typed error ("No tokenizer loaded for ... model") at USE time,
-    // not at load time; a CLAP audio model's `forward_audio_embedding`
-    // never reads `self.tokenizer` at all, so it serves unaffected.
-    // `optional: false` here (unconditionally required, regardless of
-    // model class) would permanently wedge `ModelCache::get_or_load` on a
-    // model a cold process serves fine, the moment `tokenizer.json` is
-    // deleted from a live model directory (`ModelFingerprint::probe`'s arm
-    // (c): typed refusal, entry retained, every subsequent call re-probes
-    // and re-refuses forever) — arm (b) (stale, evict + reload) is the
-    // correct classification.
-    if let Some(tokenizer) = &resolved.tokenizer {
-        candidates.push(RawCandidate {
-            path: tokenizer.path().to_path_buf(),
-            anchor: model_dir.clone(),
-            gated: true,
-            optional: true,
-        });
-    }
+    // The tokenizer (audit round 62, adversarial round 6, R5-F1; round 8,
+    // R7-F1): NOT required, despite the pre-R5-F1 comment's claim that "the
+    // loader has no fallback" — every resolver path (`discover_local_tokenizer`
+    // locally, resolver.rs:504-514; the HF Hub `tokenizer.json` /
+    // `bpe_simple_vocab_16e6.txt.gz` fallback chain remotely, resolver.rs:379-387)
+    // already re-derives `tokenizer: None` when NEITHER file is present
+    // instead of erroring, and `CandleBackend::load`'s `.transpose()?` over
+    // that `Option` accepts `None`: the reload succeeds with
+    // `self.tokenizer == None`, matching cold-process semantics exactly. A
+    // text-encoding call fails LATER with that path's own typed error ("No
+    // tokenizer loaded for ... model") at USE time, not at load time; a CLAP
+    // audio model's `forward_audio_embedding` never reads `self.tokenizer`
+    // at all, so it serves unaffected. `optional: true` here for the same
+    // reason as `1_Pooling/config.json` and `preprocessor_config.json`
+    // above.
+    //
+    // R7-F1 (block): the pre-fix version pushed this candidate ONLY when
+    // `resolved.tokenizer.is_some()`. That made the tokenizer the sole
+    // CONDITIONALLY-pushed candidate in this function — every other slot
+    // (`1_Pooling/config.json`, `preprocessor_config.json`) is always a
+    // candidate regardless of whether the resolver actually read one,
+    // precisely so a later APPEARANCE is fingerprinted as a `None`-snapshot
+    // absence and trips `probe`'s arm at line ~1180. The tokenizer broke
+    // that pattern: after the round-6 stale-reload sequence (delete
+    // `tokenizer.json` -> `probe` reports stale via arm (b) -> evict ->
+    // reload with `resolved.tokenizer == None`), the NEW fingerprint carried
+    // NO tokenizer entry whatsoever — restoring `tokenizer.json` on disk
+    // changed nothing that was ever fingerprinted, so `probe` reported fresh
+    // forever and every embedding call kept failing on an entry a cold
+    // process would happily serve.
+    //
+    // Fix: push BOTH filenames the resolver's preference chain considers —
+    // `tokenizer.json` (checked first) and `bpe_simple_vocab_16e6.txt.gz`
+    // (the OpenCLIP fallback) — as UNCONDITIONAL candidates anchored under
+    // `model_dir`, exactly mirroring the `1_Pooling`/`preprocessor` pattern.
+    // `gated` is true for whichever slot `resolved.tokenizer` actually names
+    // (using its own path, so the anchor-mismatch refusal below still fires
+    // if that path is ever outside `model_dir`) and the digest keeps hashing
+    // only the file the loader actually read; the OTHER slot — and BOTH
+    // slots when `resolved.tokenizer` is `None` — is pushed with an
+    // absent-marker path (`model_dir.join(name)`), `gated: false`, so
+    // `compute_model_fingerprint` still records its `None` snapshot and a
+    // later appearance of either file trips `probe`.
+    let tokenizer_json_default = model_dir.join("tokenizer.json");
+    let tokenizer_bpe_default = model_dir.join("bpe_simple_vocab_16e6.txt.gz");
+    let (json_path, json_gated, bpe_path, bpe_gated) = match &resolved.tokenizer {
+        Some(TokenizerSource::HuggingFaceJson(p)) => {
+            (p.clone(), true, tokenizer_bpe_default, false)
+        }
+        Some(TokenizerSource::OpenClipBpe(p)) => (tokenizer_json_default, false, p.clone(), true),
+        None => (tokenizer_json_default, false, tokenizer_bpe_default, false),
+    };
+    candidates.push(RawCandidate {
+        path: json_path,
+        anchor: model_dir.clone(),
+        gated: json_gated,
+        optional: true,
+    });
+    candidates.push(RawCandidate {
+        path: bpe_path,
+        anchor: model_dir.clone(),
+        gated: bpe_gated,
+        optional: true,
+    });
 
     for weights in &resolved.weights_paths {
         candidates.push(RawCandidate {
@@ -1825,6 +1923,22 @@ impl CandleModel {
         let id2label = self.id2label.as_ref().ok_or_else(|| {
             JammiError::Inference("No id2label mapping for classification model".into())
         })?;
+
+        // R7-F2 (audit round 62, adversarial round 8 advisory fold): the
+        // `id2label` presence check above does NOT prove this warm entry was
+        // actually loaded for `Classification` — many BERT-family
+        // checkpoints carry an `id2label` map in `config.json` even when
+        // loaded for `TextEmbedding`/`Ner` (see
+        // `CandleTextForward::is_classification_head`'s doc), and
+        // `ModelCache`'s id-only warm-cache key makes that mismatch
+        // reachable at runtime. A cheap, typed kind-mismatch refusal here —
+        // BEFORE tokenizing anything — mirrors R5-F2's `forward_pooled`
+        // refusal in the other direction, so this call fails legibly instead
+        // of reaching `to_vec2::<f32>()` over the wrong-rank hidden-states
+        // tensor and dying with an opaque candle rank error.
+        if !self.text_forward()?.is_classification_head() {
+            return Err(classification_kind_mismatch_refusal());
+        }
 
         let texts = arrow_to_texts(content)?;
         let num_rows = texts.len();
@@ -4547,6 +4661,100 @@ mod r5_f2_classification_pooling_tests {
                 "the classification wrapper's OWN task must still serve \
                  successfully — the fix refuses the TextEmbedding MISMATCH, \
                  not classification itself. Got Err({e})"
+            ),
+        }
+    }
+
+    /// A `ResolvedModel` for the SAME `tiny_modernbert_classifier` cookbook
+    /// fixture as above (its `config.json` carries `id2label` — a real
+    /// checkpoint's default classification-head declaration), but resolved
+    /// for `ModelTask::TextEmbedding` instead of `Classification` — the
+    /// SAME construction a caller who loads this checkpoint to embed, not
+    /// classify, would produce. `CandleBackend::load`'s `is_classification`
+    /// gate (`resolved.task == ModelTask::Classification && id2label.is_some()`)
+    /// is `false` here, so a plain `ModernBertForward` (not
+    /// `ModernBertClassificationForward`) is built — but `CandleModel::id2label`
+    /// is still populated, since that parse reads `config.json` unconditionally,
+    /// independent of `is_classification`.
+    fn tiny_modernbert_classifier_resolved_for_embedding(dst: &std::path::Path) -> ResolvedModel {
+        let mut resolved = tiny_modernbert_classifier_resolved(dst);
+        resolved.task = ModelTask::TextEmbedding;
+        resolved
+    }
+
+    /// R7-F2 (audit round 62, adversarial round 8 advisory fold): the mirror
+    /// of `classification_loaded_model_refuses_text_embedding_request`
+    /// above, in the OTHER mismatch direction — an embedding-loaded warm
+    /// entry (`ModelTask::TextEmbedding`, `id2label` present in
+    /// `config.json` regardless) requested for `ModelTask::Classification`.
+    ///
+    /// RED pre-fix: `forward_classification`'s only guard was
+    /// `self.id2label.is_some()`, which this scenario satisfies — so the
+    /// call proceeded to `self.text_forward()?.forward_hidden(..)` (the
+    /// PLAIN `ModernBertForward`'s raw per-token hidden states,
+    /// `[batch, seq_len, hidden_size]`) and then `to_vec2::<f32>()` over
+    /// that 3-D tensor, dying with an opaque candle rank error instead of a
+    /// legible typed refusal.
+    ///
+    /// GREEN post-fix: `is_classification_head()` is `false` for the plain
+    /// `ModernBertForward` wrapper, so `forward_classification` refuses
+    /// immediately with `classification_kind_mismatch_refusal`, never
+    /// reaching `to_vec2` at all.
+    #[test]
+    fn embedding_loaded_model_with_id2label_refuses_classification_request() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = tiny_modernbert_classifier_resolved_for_embedding(&dst);
+
+        let backend = CandleBackend;
+        let loaded = backend
+            .load(&resolved, &device_config())
+            .expect("an id2label-bearing checkpoint loaded for TextEmbedding must still succeed");
+
+        let content = two_row_content();
+        let result = loaded.forward(&content, ModelTask::Classification);
+
+        match result {
+            Ok(_) => panic!(
+                "an embedding-loaded model must REFUSE a Classification \
+                 request with a typed error (R7-F2) — never reach \
+                 to_vec2::<f32> over the raw hidden-states tensor and fail \
+                 with an opaque candle rank error"
+            ),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("not loaded for classification"),
+                    "expected the classification-kind-mismatch typed refusal \
+                     (from `classification_kind_mismatch_refusal`), got: {msg}"
+                );
+            }
+        }
+    }
+
+    /// Control (F family: non-vacuous negative control) for R7-F2: the
+    /// IDENTICAL embedding-loaded, `id2label`-bearing model must still serve
+    /// its OWN task (`TextEmbedding`) successfully — the fix refuses the
+    /// MISMATCH specifically, not embedding serving in general.
+    #[test]
+    fn embedding_loaded_model_with_id2label_still_serves_text_embedding_request() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = tiny_modernbert_classifier_resolved_for_embedding(&dst);
+
+        let backend = CandleBackend;
+        let loaded = backend
+            .load(&resolved, &device_config())
+            .expect("an id2label-bearing checkpoint loaded for TextEmbedding must still succeed");
+
+        let content = two_row_content();
+        let result = loaded.forward(&content, ModelTask::TextEmbedding);
+        match result {
+            Ok(_) => {}
+            Err(e) => panic!(
+                "the embedding wrapper's OWN task must still serve \
+                 successfully — the fix refuses the Classification \
+                 MISMATCH, not text-embedding itself. Got Err({e})"
             ),
         }
     }

@@ -1187,4 +1187,114 @@ mod r5_f1_tokenizer_tests {
             );
         }
     }
+
+    /// R7-F1 (block), the full restore cycle end-to-end at
+    /// `ModelCache::get_or_load`: delete `tokenizer.json` -> warm reload
+    /// (tokenizer-less, embedding refuses) -> RESTORE `tokenizer.json` ->
+    /// the NEXT `get_or_load` must detect the staleness that restoration
+    /// creates and reload WITH the tokenizer — embedding serves again.
+    ///
+    /// RED pre-fix: `all_candidate_paths` pushed the tokenizer candidate
+    /// ONLY when `resolved.tokenizer.is_some()` (R5-F1's own fix, which
+    /// correctly stopped the tokenizer-deleted case from wedging, but left
+    /// this hole). After the round-6 stale-reload (this test's steps 1-3,
+    /// identical to `tokenizer_deleted_after_load_stale_reloads_never_wedges`
+    /// above), the freshly-reloaded entry's fingerprint was computed from a
+    /// `resolved.tokenizer == None`, so the tokenizer candidate was dropped
+    /// from the candidate set ENTIRELY — nothing was ever fingerprinted for
+    /// it, present or absent. Restoring `tokenizer.json` on disk (step 4)
+    /// therefore changed nothing any fingerprinted `(rel, path, snapshot)`
+    /// tuple tracked: `probe` reported fresh forever, `get_or_load`'s fast
+    /// path kept serving the tokenizer-less entry, and every embedding call
+    /// kept failing on a directory a cold process would serve fine.
+    ///
+    /// GREEN post-fix: the tokenizer candidate is pushed UNCONDITIONALLY
+    /// (both `tokenizer.json` and `bpe_simple_vocab_16e6.txt.gz`, mirroring
+    /// `1_Pooling`/`preprocessor`), so the tokenizer-less reload's
+    /// fingerprint still records an ABSENT snapshot for `tokenizer.json`.
+    /// Restoring the file flips that candidate from `NotFound` to `Ok`,
+    /// which `ModelFingerprint::probe`'s F-4b arm unconditionally reports as
+    /// stale (`Ok(false)`) regardless of `optional` — the next `get_or_load`
+    /// evicts and reloads, this time resolving `tokenizer: Some(..)` again,
+    /// and the reloaded entry serves embeddings.
+    #[tokio::test]
+    async fn tokenizer_restored_after_stale_reload_is_detected_and_reloads_with_tokenizer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
+        let resolver = ModelResolver::new(Arc::clone(&catalog), test_artifact_store()).unwrap();
+        let scheduler = Arc::new(GpuScheduler::new_unlimited());
+        let cache = ModelCache::new(resolver, device_config(), scheduler);
+
+        let source = tiny_bert_source(tmp.path(), "tokenizer_restore_model");
+        let model_dir = match &source {
+            ModelSource::Local(p) => p.clone(),
+            other => panic!("expected a Local source, got {other:?}"),
+        };
+        let text_content: Vec<arrow::array::ArrayRef> =
+            vec![std::sync::Arc::new(arrow::array::StringArray::from(vec![
+                "a sentence to embed",
+            ]))];
+
+        // (1) Cold load: `tokenizer.json` present, resolves to `Some(..)`.
+        let guard = cache
+            .get_or_load(&source, ModelTask::TextEmbedding, None)
+            .await
+            .expect("initial load with tokenizer.json present must succeed");
+        guard
+            .model
+            .forward(&text_content, ModelTask::TextEmbedding)
+            .expect("the cold-loaded, tokenizer-bearing entry must serve embeddings");
+        drop(guard);
+
+        // (2) Delete `tokenizer.json` from the LIVE model directory.
+        std::fs::remove_file(model_dir.join("tokenizer.json")).unwrap();
+
+        // (3) Stale-reload (R5-F1's own fix): succeeds, `tokenizer: None`.
+        // Its OWN forward call must now refuse — a tokenizer-less entry
+        // cannot serve embeddings — with the typed "no tokenizer" error,
+        // never a panic or a silently-wrong output.
+        let tokenizer_less = cache
+            .get_or_load(&source, ModelTask::TextEmbedding, None)
+            .await
+            .expect("stale-reload after tokenizer.json's deletion must succeed (R5-F1)");
+        match tokenizer_less
+            .model
+            .forward(&text_content, ModelTask::TextEmbedding)
+        {
+            Err(_) => {}
+            Ok(_) => panic!(
+                "a tokenizer-less warm entry must refuse an embedding call, not silently serve"
+            ),
+        }
+        drop(tokenizer_less);
+
+        // (4) RESTORE `tokenizer.json` — the exact scenario R7-F1 names: the
+        // file a cold process would happily use again is back on disk.
+        let fixture = jammi_test_utils::cookbook_fixture("tiny_bert");
+        std::fs::copy(
+            fixture.join("tokenizer.json"),
+            model_dir.join("tokenizer.json"),
+        )
+        .unwrap();
+
+        // (5) The NEXT get_or_load must detect the restoration as staleness
+        // (not report fresh — the R7-F1 bug) and reload WITH the tokenizer.
+        let restored = cache
+            .get_or_load(&source, ModelTask::TextEmbedding, None)
+            .await
+            .expect("get_or_load after tokenizer.json's restoration must succeed");
+
+        // (6) Final serving state: the restored entry serves embeddings
+        // again — the full cycle's actual observable outcome, not merely
+        // "the fingerprint changed".
+        restored
+            .model
+            .forward(&text_content, ModelTask::TextEmbedding)
+            .expect(
+                "the entry reloaded after tokenizer.json's restoration must serve embeddings \
+                 again (R7-F1) — a cold process loading this same, now-restored directory would \
+                 serve it fine",
+            );
+    }
 }

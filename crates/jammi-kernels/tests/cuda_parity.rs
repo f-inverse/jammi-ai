@@ -33,12 +33,12 @@ use candle_core::{DType, Device, Error, Layout, Tensor, Var, D};
 use half::bf16;
 use jammi_kernels::ops::{
     adamw_step_fused_t, apply1, apply2, apply3, apply_inplace2, bwd_gradient_gemm_layouts,
-    cast_add_bf16_into, cast_scale_bf16_f32_into, AdamMomentUpdate,
+    cast_add_bf16_into, cast_scale_bf16_f32_into, mem_efficient_attention, AdamMomentUpdate,
     AdamMomentUpdateFmaContractedRedControl, AdamWParams, AttentionBlockFused, Axpy,
     BwdGemmLayoutsParams, CastAddBf16, CastScaleBf16F32, DropoutFused, DropoutKey,
     FullyMaskedPolicy, GegluFused, GeluVariant, LayerNormFused, LowRankResidualLinear,
-    PhiloxKatProbe, RopeFused, ScaledCastAdd, SoftmaxLastDimFused,
-    ATTENTION_BLOCK_WINDOW_MASKED_VALUE,
+    MemEfficientAttention, PhiloxKatProbe, RopeFused, ScaledCastAdd, SoftmaxLastDimFused,
+    ATTENTION_BLOCK_WINDOW_MASKED_VALUE, MEM_EFFICIENT_WINDOW_MASKED_VALUE,
 };
 
 fn axpy(alpha: f64, x: &Tensor, y: &Tensor) -> candle_core::Result<Tensor> {
@@ -9710,5 +9710,756 @@ fn adamw_step_fma_contracted_red_control_diverges_from_eager_cuda() {
     eprintln!(
         "adamw_step_fma_contracted_red_control_diverges_from_eager_cuda: \
          {red_control_mismatches}/{n} elements differ (RED control, expected > 0)"
+    );
+}
+
+// =========================================================================
+// mem_efficient_attention CUDA parity (M2 part 2 F3, adversarial audit
+// round 3): the CUDA composition landed with ZERO oracle authored — "pod-
+// deferred" covered EXECUTION, never authorship. Every leg below is
+// cuda-gated + require-env (`cuda_device()`, this file's own established
+// pattern) so it compiles into every `--features cuda` test binary and
+// runs (or loudly refuses to silently skip, under `JAMMI_REQUIRE_CUDA`) on
+// the pod that re-smokes this branch.
+//
+// Metric class (plan v4 delta 5, FLASH_ORACLE_PADDED_BOUND's own doc
+// records the fixed defect): BARE `relative_l1_error`
+// (`Σ|arm-reference|/Σ|reference|`), never a ratio-calibrated ULP bound —
+// this op's chunked online-softmax accumulator has no eager call site to
+// bit-match against at depth (module doc's own "reduction-order growth
+// oracle" section), unlike `AttentionBlockFused`'s CUDA arm, which
+// reproduces an EXISTING eager sequence and can therefore afford the
+// tighter two-term ULP bound `assert_attention_block_parity_f32` uses
+// above. Seeds: `MEM_EFFICIENT_SWEEP_SEEDS`, `jammi_encoders::modernbert`'s
+// own `FLASH_ORACLE_SWEEP_SEEDS` convention reproduced here (a SEPARATE
+// integration-test binary — that constant is `#[cfg(test)]`-private inside
+// a different crate, not importable across the boundary): the MEAN is the
+// asserted quantity, every per-seed value printed under `--nocapture`
+// (matching `FLASH_ORACLE_K_MEAN_POOLED`'s "mean, never per-seed max"
+// convention — a max bound is seed-unstable).
+// =========================================================================
+
+/// [`MemEfficientAttention::new`]'s own PRODUCTION `chunk` floor
+/// (`jammi_kernels::ops::MEM_EFFICIENT_MIN_CHUNK`, `512`) — every small-`seq`
+/// leg below uses it directly (degenerating to one mega-chunk at these toy
+/// shapes, module doc's own documented behaviour for `chunk > seq`); only
+/// [`mem_efficient_cuda_matches_cpu_band_multi_chunk_f32`] picks a `seq`
+/// large enough to see more than one. This file has no access to
+/// `MemEfficientAttention::new_test_chunk` (that bypass is `#[cfg(test)]`-
+/// private INSIDE the library crate, unreachable from this separate
+/// integration-test binary) — every leg here goes through the SAME
+/// production constructor real callers use.
+const MEM_EFFICIENT_MIN_CHUNK_FOR_TEST: usize = jammi_kernels::ops::MEM_EFFICIENT_MIN_CHUNK;
+
+/// 8 fixed seeds — "a single seed's draw is not a distribution", the SAME
+/// discipline every dense-arm sweep in this workspace uses.
+const MEM_EFFICIENT_SWEEP_SEEDS: [u64; 8] = [201, 202, 203, 204, 205, 206, 207, 208];
+
+/// `Σ|arm - reference| / Σ|reference|` — bare, no absolute floor, an
+/// affirmative non-finite check FIRST (a `NaN` must never read as a silent
+/// pass). Reproduces `jammi_encoders::modernbert`'s own private
+/// `relative_l1_error` (same formula, same checks) — re-derived here
+/// rather than imported, for the same cross-crate-boundary reason
+/// `MEM_EFFICIENT_SWEEP_SEEDS` is.
+fn mem_efficient_relative_l1_error(arm: &[f32], reference: &[f32]) -> f64 {
+    assert_eq!(
+        arm.len(),
+        reference.len(),
+        "mem_efficient_relative_l1_error: length mismatch"
+    );
+    let non_finite = arm
+        .iter()
+        .chain(reference.iter())
+        .filter(|v| !v.is_finite())
+        .count();
+    assert_eq!(
+        non_finite, 0,
+        "mem_efficient_relative_l1_error: {non_finite} non-finite value(s)"
+    );
+    let mut num = 0.0f64;
+    let mut den = 0.0f64;
+    for (&a, &r) in arm.iter().zip(reference.iter()) {
+        num += (a as f64 - r as f64).abs();
+        den += (r as f64).abs();
+    }
+    assert!(
+        den > 0.0,
+        "mem_efficient_relative_l1_error: reference carries no signal (sum|reference| == 0)"
+    );
+    num / den
+}
+
+/// `[batch, seq]`-flat padding-only additive mask — memeff's OWN domain
+/// (narrower than `attention_block`'s combined-mask class: no query-row
+/// axis, module doc's "the band is a `Copy` scalar" section). `lengths`,
+/// when `Some`, right-pads each row to `seq` with
+/// [`MEM_EFFICIENT_WINDOW_MASKED_VALUE`] (this file's own `mask.rs:127`-
+/// class sibling pin, `jammi_encoders::mask`'s
+/// `masked_logit_matches_jammi_kernels_mem_efficient_window_masked_value`,
+/// proves this is the SAME sentinel a real caller's `MASKED_LOGIT` is).
+fn mem_efficient_key_mask_v(batch: usize, seq: usize, lengths: Option<&[usize]>) -> Vec<f32> {
+    let mut v = vec![0f32; batch * seq];
+    if let Some(lens) = lengths {
+        assert_eq!(
+            lens.len(),
+            batch,
+            "mem_efficient_key_mask_v: lengths.len() != batch"
+        );
+        for (bi, &len) in lens.iter().enumerate() {
+            assert!(
+                len <= seq,
+                "mem_efficient_key_mask_v: length {len} exceeds seq {seq}"
+            );
+            for si in len..seq {
+                v[bi * seq + si] = MEM_EFFICIENT_WINDOW_MASKED_VALUE;
+            }
+        }
+    }
+    v
+}
+
+/// One seed's `(cpu_out, cuda_out)` pair, both flattened to `Vec<f32>` on
+/// the host — `cpu_fwd` (this op's own CPU arm, F32-only, ALREADY
+/// validated CPU-hermetically by this crate's own unit-test suite) is the
+/// reference; `cuda_out` is cast back to `F32` on the host for comparison
+/// regardless of `dtype` (the comparison itself always happens in `f64`
+/// accumulation inside [`mem_efficient_relative_l1_error`]). A FRESH
+/// [`MemEfficientAttention`] instance per device (the crate's own
+/// "one function, fresh op per call" convention — `Saved` state is
+/// per-instance) — never one op reused across both.
+#[allow(clippy::too_many_arguments)]
+fn mem_efficient_fwd_cpu_vs_cuda(
+    cuda: &Device,
+    batch: usize,
+    seq: usize,
+    heads: usize,
+    head_dim: usize,
+    half_window: Option<usize>,
+    rope: bool,
+    policy: FullyMaskedPolicy,
+    dtype: DType,
+    lengths: Option<&[usize]>,
+    chunk: usize,
+    seed: f32,
+) -> (Vec<f32>, Vec<f32>) {
+    let cpu = Device::Cpu;
+    let qkv_v = qkv_fixture(batch, seq, heads, head_dim, seed);
+    let rope_v = attention_rope_pack(seq, head_dim);
+    let mask_v = mem_efficient_key_mask_v(batch, seq, lengths);
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    let qkv_cpu = Tensor::from_slice(&qkv_v, (batch, seq, 3, heads, head_dim), &cpu).unwrap();
+    let rope_cpu = Tensor::from_slice(&rope_v, (2, 1, 1, seq, head_dim), &cpu).unwrap();
+    let mask_cpu = Tensor::from_slice(&mask_v, (batch, 1, 1, seq), &cpu).unwrap();
+    let op_cpu = MemEfficientAttention::new(scale, policy, rope, half_window, chunk).unwrap();
+    let out_cpu = mem_efficient_attention(&qkv_cpu, &rope_cpu, &mask_cpu, op_cpu).unwrap();
+    let out_cpu_v: Vec<f32> = out_cpu.flatten_all().unwrap().to_vec1().unwrap();
+
+    let qkv_gpu = Tensor::from_slice(&qkv_v, (batch, seq, 3, heads, head_dim), cuda)
+        .unwrap()
+        .to_dtype(dtype)
+        .unwrap();
+    let rope_gpu = Tensor::from_slice(&rope_v, (2, 1, 1, seq, head_dim), cuda)
+        .unwrap()
+        .to_dtype(dtype)
+        .unwrap();
+    let mask_gpu = Tensor::from_slice(&mask_v, (batch, 1, 1, seq), cuda)
+        .unwrap()
+        .to_dtype(dtype)
+        .unwrap();
+    let op_gpu = MemEfficientAttention::new(scale, policy, rope, half_window, chunk).unwrap();
+    let out_gpu = mem_efficient_attention(&qkv_gpu, &rope_gpu, &mask_gpu, op_gpu).unwrap();
+    let out_gpu_v: Vec<f32> = out_gpu
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    (out_cpu_v, out_gpu_v)
+}
+
+/// Sweeps [`MEM_EFFICIENT_SWEEP_SEEDS`], asserting the MEAN
+/// [`mem_efficient_relative_l1_error`] against `bound`, printing every
+/// per-seed value under `--nocapture`.
+#[allow(clippy::too_many_arguments)]
+fn assert_mem_efficient_fwd_parity_sweep(
+    label: &str,
+    cuda: &Device,
+    batch: usize,
+    seq: usize,
+    heads: usize,
+    head_dim: usize,
+    half_window: Option<usize>,
+    rope: bool,
+    policy: FullyMaskedPolicy,
+    dtype: DType,
+    lengths: Option<&[usize]>,
+    chunk: usize,
+    bound: f64,
+) {
+    let mut sum = 0.0f64;
+    for &seed in &MEM_EFFICIENT_SWEEP_SEEDS {
+        let (cpu_v, gpu_v) = mem_efficient_fwd_cpu_vs_cuda(
+            cuda,
+            batch,
+            seq,
+            heads,
+            head_dim,
+            half_window,
+            rope,
+            policy,
+            dtype,
+            lengths,
+            chunk,
+            seed as f32 * 0.01,
+        );
+        let err = mem_efficient_relative_l1_error(&gpu_v, &cpu_v);
+        eprintln!("mem_efficient {label} seed={seed}: relative_l1_error={err:e}");
+        sum += err;
+    }
+    let mean = sum / MEM_EFFICIENT_SWEEP_SEEDS.len() as f64;
+    eprintln!("mem_efficient {label}: mean relative_l1_error={mean:e} (bound={bound:e})");
+    assert!(
+        mean <= bound,
+        "mem_efficient {label}: mean relative_l1_error {mean:e} exceeds bound {bound:e}"
+    );
+}
+
+/// **F32 first-pass bound.** `cuBLAS` (CUDA `matmul`) and the CPU `gemm`
+/// crate reduce in a DIFFERENT order than each other (both correct, esc-044's
+/// own lesson) — the SAME jitter class `F32_TOL` (this file's own
+/// `Axpy`-fmad bound) already prices for a single fused op; this op chains
+/// several GEMMs (`QKᵀ`, `PV`) plus an online-softmax recurrence per
+/// chunk, so a somewhat looser floor is a reasoned STARTING point, not a
+/// calibrated one — the pod run this leg is written FOR is what calibrates
+/// it (this crate's own "K_MAX lesson": a bound gets tightened after a
+/// real measurement, never asserted as final before one exists).
+const MEM_EFFICIENT_F32_BOUND: f64 = 1e-3;
+
+/// **BF16 first-pass bound**, wider than F32 for the same reduction-depth
+/// + rounding reason `attention_block`'s own bf16 legs price explicitly
+/// (this file's "Derived bf16 bounds" section, above) — memeff's own
+/// oracle metric class is bare `relative_l1_error`, not that section's
+/// two-term ULP form, so this is a single relative fraction, not a
+/// per-element bound; also a first-pass starting point.
+const MEM_EFFICIENT_BF16_BOUND: f64 = 0.06;
+
+#[test]
+fn mem_efficient_cuda_matches_cpu_plain_f32() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    assert_mem_efficient_fwd_parity_sweep(
+        "plain f32",
+        &cuda,
+        2,
+        9,
+        2,
+        16,
+        None,
+        false,
+        FullyMaskedPolicy::Zeros,
+        DType::F32,
+        None,
+        MEM_EFFICIENT_MIN_CHUNK_FOR_TEST,
+        MEM_EFFICIENT_F32_BOUND,
+    );
+}
+
+#[test]
+fn mem_efficient_cuda_matches_cpu_plain_bf16() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    assert_mem_efficient_fwd_parity_sweep(
+        "plain bf16",
+        &cuda,
+        2,
+        9,
+        2,
+        16,
+        None,
+        false,
+        FullyMaskedPolicy::Zeros,
+        DType::BF16,
+        None,
+        MEM_EFFICIENT_MIN_CHUNK_FOR_TEST,
+        MEM_EFFICIENT_BF16_BOUND,
+    );
+}
+
+#[test]
+fn mem_efficient_cuda_matches_cpu_rope_f32() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    assert_mem_efficient_fwd_parity_sweep(
+        "rope f32",
+        &cuda,
+        2,
+        11,
+        2,
+        16,
+        None,
+        true,
+        FullyMaskedPolicy::Zeros,
+        DType::F32,
+        None,
+        MEM_EFFICIENT_MIN_CHUNK_FOR_TEST,
+        MEM_EFFICIENT_F32_BOUND,
+    );
+}
+
+#[test]
+fn mem_efficient_cuda_matches_cpu_rope_bf16() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    assert_mem_efficient_fwd_parity_sweep(
+        "rope bf16",
+        &cuda,
+        2,
+        11,
+        2,
+        16,
+        None,
+        true,
+        FullyMaskedPolicy::Zeros,
+        DType::BF16,
+        None,
+        MEM_EFFICIENT_MIN_CHUNK_FOR_TEST,
+        MEM_EFFICIENT_BF16_BOUND,
+    );
+}
+
+/// The window+multi-chunk leg: `seq=1200` at the PRODUCTION `chunk=512`
+/// default (`jammi_encoders::modernbert::MEM_EFFICIENT_CHUNK`, mirrored
+/// here as a literal since that constant lives in a downstream crate this
+/// file cannot depend on) gives THREE chunks (`[0,512), [512,1024),
+/// [1024,1200)`), genuinely exercising chunk-boundary correctness on
+/// CUDA — every OTHER leg in this file, at `MIN_CHUNK`-or-above but
+/// `seq`-below-that, degenerates to a single mega-chunk (module doc: "a
+/// caller may pass `chunk > seq`"). `half_window=64` (production
+/// `local_attention=128`'s own half-width) with `lengths=[1200, 900, 70]`
+/// — every real row length `>= half_window + 2 = 66` (the M1b
+/// window-visibility discipline this crate's own band tests already
+/// establish: a shorter real length would make the fully-masked-row
+/// PREDICATE, not the band predicate, the effective constraint, hiding
+/// what this leg means to exercise).
+#[test]
+fn mem_efficient_cuda_matches_cpu_band_multi_chunk_f32() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let lengths = [1200usize, 900, 70];
+    assert_mem_efficient_fwd_parity_sweep(
+        "band multi-chunk f32",
+        &cuda,
+        3,
+        1200,
+        2,
+        16,
+        Some(64),
+        true,
+        FullyMaskedPolicy::Zeros,
+        DType::F32,
+        Some(&lengths),
+        512,
+        MEM_EFFICIENT_F32_BOUND,
+    );
+}
+
+/// **F1's own discriminator, closed on-device.** A batch item that is
+/// ENTIRELY padding (`lengths[1] == 0`) makes every one of its rows fully
+/// masked under EITHER policy's own trigger — but the two policies must
+/// produce OBSERVABLY DIFFERENT outputs on those rows: `Zeros` forces
+/// exact `0.0`; `Propagate` runs the ordinary (finite, since every key's
+/// additive value is the SAME constant here — a genuine tie, not `-inf` —
+/// so softmax is well-defined and uniform) division, landing on the
+/// UNIFORM average of `V` over that batch's own row 0..seq — never all
+/// zeros unless `V` itself is (this fixture's `V` is not). This is the
+/// exact bug F1 found: `cuda_fwd` applied the `Zeros` algebra
+/// UNCONDITIONALLY, so `Propagate` silently became `Zeros` — a fixture
+/// where the two policies would have been INDISTINGUISHABLE (no fully-
+/// masked row at all) could not have caught it; this one can, and does,
+/// on BOTH policies independently matching their OWN `cpu_fwd` reference
+/// (proving the fix, not merely proving SOME divergence exists).
+#[test]
+fn mem_efficient_cuda_fully_masked_zeros_vs_propagate_diverge_observably() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let (batch, seq, heads, head_dim) = (2usize, 6usize, 1usize, 16usize);
+    let lengths = [6usize, 0]; // batch row 1 is ENTIRELY padding.
+    let chunk = MEM_EFFICIENT_MIN_CHUNK_FOR_TEST;
+    let rope = false;
+    let dtype = DType::F32;
+
+    let (cpu_zeros, gpu_zeros) = mem_efficient_fwd_cpu_vs_cuda(
+        &cuda,
+        batch,
+        seq,
+        heads,
+        head_dim,
+        None,
+        rope,
+        FullyMaskedPolicy::Zeros,
+        dtype,
+        Some(&lengths),
+        chunk,
+        11.0,
+    );
+    let (cpu_prop, gpu_prop) = mem_efficient_fwd_cpu_vs_cuda(
+        &cuda,
+        batch,
+        seq,
+        heads,
+        head_dim,
+        None,
+        rope,
+        FullyMaskedPolicy::Propagate,
+        dtype,
+        Some(&lengths),
+        chunk,
+        11.0,
+    );
+
+    // Each policy independently matches ITS OWN cpu_fwd reference — the
+    // real closure of F1 (not merely "the two policies differ from each
+    // other on CUDA", which a policy-blind bug could also produce if BOTH
+    // arms happened to diverge from cpu_fwd in the same wrong direction).
+    let err_zeros = mem_efficient_relative_l1_error(&gpu_zeros, &cpu_zeros);
+    let err_prop = mem_efficient_relative_l1_error(&gpu_prop, &cpu_prop);
+    eprintln!(
+        "mem_efficient fully-masked policy split: Zeros relative_l1_error={err_zeros:e}, \
+         Propagate relative_l1_error={err_prop:e}"
+    );
+    assert!(
+        err_zeros <= MEM_EFFICIENT_F32_BOUND,
+        "Zeros policy vs its own cpu_fwd reference: {err_zeros:e} > {MEM_EFFICIENT_F32_BOUND:e}"
+    );
+    assert!(
+        err_prop <= MEM_EFFICIENT_F32_BOUND,
+        "Propagate policy vs its own cpu_fwd reference: {err_prop:e} > {MEM_EFFICIENT_F32_BOUND:e}"
+    );
+
+    // The masked batch row (index 1) itself: Zeros must be EXACT zero;
+    // Propagate must NOT be (the observable divergence F1 is about).
+    let row_elems = seq * heads * head_dim;
+    let masked_row_gpu_zeros = &gpu_zeros[row_elems..2 * row_elems];
+    let masked_row_gpu_prop = &gpu_prop[row_elems..2 * row_elems];
+    assert!(
+        masked_row_gpu_zeros.iter().all(|&x| x == 0.0),
+        "Zeros-policy CUDA output for the fully-masked batch row must be EXACTLY zero: {:?}",
+        masked_row_gpu_zeros
+    );
+    assert!(
+        masked_row_gpu_prop.iter().any(|&x| x != 0.0),
+        "Propagate-policy CUDA output for the fully-masked batch row must NOT collapse to \
+         zero (the Zeros-applied-unconditionally regression this leg exists to catch): {:?}",
+        masked_row_gpu_prop
+    );
+}
+
+/// A small, independent, UNCHUNKED eager reference — mirrors
+/// `jammi_kernels::ops::mem_efficient_attention`'s own module test's
+/// private `eager_reference` (not importable across the crate/test-binary
+/// boundary: that fn lives inside a `#[cfg(test)] mod tests` in the
+/// library crate itself), reimplemented here so this file's own "vs
+/// eager" leg shares NO code with `cpu_fwd`/`cuda_fwd` at all — a bug
+/// common to both chunked arms (unlikely, given they are independent
+/// implementations, but this is the leg that would catch it) would not
+/// hide behind a shared helper.
+#[allow(clippy::too_many_arguments)]
+fn mem_efficient_eager_reference_v(
+    qkv_v: &[f32],
+    batch: usize,
+    seq: usize,
+    heads: usize,
+    head_dim: usize,
+    rope_v: Option<&[f32]>,
+    mask_v: &[f32],
+    scale: f32,
+    device: &Device,
+) -> Vec<f32> {
+    let qkv = Tensor::from_slice(qkv_v, (batch, seq, 3, heads, head_dim), device).unwrap();
+    let q0 = qkv
+        .narrow(2, 0, 1)
+        .unwrap()
+        .squeeze(2)
+        .unwrap()
+        .transpose(1, 2)
+        .unwrap()
+        .contiguous()
+        .unwrap();
+    let k0 = qkv
+        .narrow(2, 1, 1)
+        .unwrap()
+        .squeeze(2)
+        .unwrap()
+        .transpose(1, 2)
+        .unwrap()
+        .contiguous()
+        .unwrap();
+    let v0 = qkv
+        .narrow(2, 2, 1)
+        .unwrap()
+        .squeeze(2)
+        .unwrap()
+        .transpose(1, 2)
+        .unwrap()
+        .contiguous()
+        .unwrap();
+    let (q, k) = match rope_v {
+        Some(rv) => {
+            let rope_t = Tensor::from_slice(rv, (2, 1, 1, seq, head_dim), device).unwrap();
+            let cos = rope_t.narrow(0, 0, 1).unwrap().squeeze(0).unwrap();
+            let sin = rope_t.narrow(0, 1, 1).unwrap().squeeze(0).unwrap();
+            (
+                apply3(&q0, &cos, &sin, RopeFused::new(false)).unwrap(),
+                apply3(&k0, &cos, &sin, RopeFused::new(false)).unwrap(),
+            )
+        }
+        None => (q0, k0),
+    };
+    let scores = (q.matmul(&k.t().unwrap()).unwrap() * f64::from(scale)).unwrap();
+    let mask = Tensor::from_slice(mask_v, (batch, 1, 1, seq), device).unwrap();
+    let combined = scores.broadcast_add(&mask).unwrap();
+    let max_ = combined.max_keepdim(D::Minus1).unwrap();
+    let exp_ = combined.broadcast_sub(&max_).unwrap().exp().unwrap();
+    let sum_ = exp_.sum_keepdim(D::Minus1).unwrap();
+    let p = exp_.broadcast_div(&sum_).unwrap();
+    let ctx = p.matmul(&v0).unwrap();
+    ctx.transpose(1, 2)
+        .unwrap()
+        .contiguous()
+        .unwrap()
+        .reshape((batch, seq, heads * head_dim))
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap()
+}
+
+/// `cuda_fwd` vs a genuinely independent eager Tensor composition
+/// (mask-free, dense — the ONE shape the eager reference above can
+/// express directly, matching the research anchor's own "torch's
+/// mem-efficient reference is only obtainable at mask-free shapes" note
+/// for the analogous torch-side comparison), NOT merely `cuda_fwd` vs
+/// `cpu_fwd` (which shares the crate's own online-softmax algorithm on
+/// both sides — a bug in that ALGORITHM, as opposed to one arm's
+/// composition of it, would not show up there).
+#[test]
+fn mem_efficient_cuda_matches_independent_eager_reference_f32() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let (batch, seq, heads, head_dim) = (2usize, 13usize, 2usize, 16usize);
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let mut sum = 0.0f64;
+    for &seed in &MEM_EFFICIENT_SWEEP_SEEDS {
+        let qkv_v = qkv_fixture(batch, seq, heads, head_dim, seed as f32 * 0.01);
+        let rope_v = attention_rope_pack(seq, head_dim);
+        let mask_v = mem_efficient_key_mask_v(batch, seq, None);
+
+        let eager_v = mem_efficient_eager_reference_v(
+            &qkv_v,
+            batch,
+            seq,
+            heads,
+            head_dim,
+            Some(&rope_v),
+            &mask_v,
+            scale,
+            &cuda,
+        );
+
+        let qkv_gpu = Tensor::from_slice(&qkv_v, (batch, seq, 3, heads, head_dim), &cuda).unwrap();
+        let rope_gpu = Tensor::from_slice(&rope_v, (2, 1, 1, seq, head_dim), &cuda).unwrap();
+        let mask_gpu = Tensor::from_slice(&mask_v, (batch, 1, 1, seq), &cuda).unwrap();
+        let op = MemEfficientAttention::new(
+            scale,
+            FullyMaskedPolicy::Zeros,
+            true,
+            None,
+            MEM_EFFICIENT_MIN_CHUNK_FOR_TEST,
+        )
+        .unwrap();
+        let out_gpu: Vec<f32> = mem_efficient_attention(&qkv_gpu, &rope_gpu, &mask_gpu, op)
+            .unwrap()
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        let err = mem_efficient_relative_l1_error(&out_gpu, &eager_v);
+        eprintln!(
+            "mem_efficient vs independent eager reference seed={seed}: relative_l1_error={err:e}"
+        );
+        sum += err;
+    }
+    let mean = sum / MEM_EFFICIENT_SWEEP_SEEDS.len() as f64;
+    eprintln!("mem_efficient vs independent eager reference: mean relative_l1_error={mean:e}");
+    assert!(
+        mean <= MEM_EFFICIENT_F32_BOUND,
+        "mem_efficient cuda_fwd vs independent eager reference: mean {mean:e} exceeds bound \
+         {MEM_EFFICIENT_F32_BOUND:e}"
+    );
+}
+
+/// **F3's "bwd cross-check leg on-device."** `dqkv` cpu-vs-cuda, through
+/// ordinary `.backward()` (both `cpu_fwd`'s and `cuda_fwd`'s `bwd` is the
+/// SAME shared `Tensor`-level composition — module doc's "`bwd`: ordinary
+/// composition" — so this leg is also a real end-to-end proof that
+/// `RopeFused::cuda_fwd`, `matmul`, and every broadcast op `bwd` composes
+/// from actually execute correctly TOGETHER on a real device, not merely
+/// that each exists in isolation).
+#[allow(clippy::too_many_arguments)]
+fn assert_mem_efficient_bwd_parity(
+    label: &str,
+    cuda: &Device,
+    batch: usize,
+    seq: usize,
+    heads: usize,
+    head_dim: usize,
+    half_window: Option<usize>,
+    rope: bool,
+    dtype: DType,
+    chunk: usize,
+    bound: f64,
+) {
+    let cpu = Device::Cpu;
+    let mut sum = 0.0f64;
+    for &seed in &MEM_EFFICIENT_SWEEP_SEEDS {
+        let qkv_v = qkv_fixture(batch, seq, heads, head_dim, seed as f32 * 0.01);
+        let rope_v = attention_rope_pack(seq, head_dim);
+        let mask_v = mem_efficient_key_mask_v(batch, seq, None);
+        let dy_v = attention_dy_fixture(batch * seq * heads * head_dim, seed as f32 + 7.0);
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let qkv_cpu = Var::from_tensor(
+            &Tensor::from_slice(&qkv_v, (batch, seq, 3, heads, head_dim), &cpu).unwrap(),
+        )
+        .unwrap();
+        let rope_cpu = Tensor::from_slice(&rope_v, (2, 1, 1, seq, head_dim), &cpu).unwrap();
+        let mask_cpu = Tensor::from_slice(&mask_v, (batch, 1, 1, seq), &cpu).unwrap();
+        let dy_cpu = Tensor::from_slice(&dy_v, (batch, seq, heads * head_dim), &cpu).unwrap();
+        let op_cpu =
+            MemEfficientAttention::new(scale, FullyMaskedPolicy::Zeros, rope, half_window, chunk)
+                .unwrap();
+        let out_cpu =
+            mem_efficient_attention(qkv_cpu.as_tensor(), &rope_cpu, &mask_cpu, op_cpu).unwrap();
+        let grads_cpu = (&out_cpu * &dy_cpu)
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .backward()
+            .unwrap();
+        let dqkv_cpu: Vec<f32> = grads_cpu
+            .get(&qkv_cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        let qkv_gpu = Var::from_tensor(
+            &Tensor::from_slice(&qkv_v, (batch, seq, 3, heads, head_dim), cuda)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap(),
+        )
+        .unwrap();
+        let rope_gpu = Tensor::from_slice(&rope_v, (2, 1, 1, seq, head_dim), cuda)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+        let mask_gpu = Tensor::from_slice(&mask_v, (batch, 1, 1, seq), cuda)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+        let dy_gpu = Tensor::from_slice(&dy_v, (batch, seq, heads * head_dim), cuda)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+        let op_gpu =
+            MemEfficientAttention::new(scale, FullyMaskedPolicy::Zeros, rope, half_window, chunk)
+                .unwrap();
+        let out_gpu =
+            mem_efficient_attention(qkv_gpu.as_tensor(), &rope_gpu, &mask_gpu, op_gpu).unwrap();
+        let grads_gpu = (&out_gpu * &dy_gpu)
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .backward()
+            .unwrap();
+        let dqkv_gpu: Vec<f32> = grads_gpu
+            .get(&qkv_gpu)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_device(&cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        let err = mem_efficient_relative_l1_error(&dqkv_gpu, &dqkv_cpu);
+        eprintln!("mem_efficient bwd {label} seed={seed}: dqkv relative_l1_error={err:e}");
+        sum += err;
+    }
+    let mean = sum / MEM_EFFICIENT_SWEEP_SEEDS.len() as f64;
+    eprintln!("mem_efficient bwd {label}: mean dqkv relative_l1_error={mean:e} (bound={bound:e})");
+    assert!(
+        mean <= bound,
+        "mem_efficient bwd {label}: mean dqkv relative_l1_error {mean:e} exceeds bound {bound:e}"
+    );
+}
+
+#[test]
+fn mem_efficient_bwd_cuda_matches_cpu_f32() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    assert_mem_efficient_bwd_parity(
+        "f32 rope+window",
+        &cuda,
+        2,
+        11,
+        2,
+        16,
+        Some(3),
+        true,
+        DType::F32,
+        MEM_EFFICIENT_MIN_CHUNK_FOR_TEST,
+        MEM_EFFICIENT_F32_BOUND,
+    );
+}
+
+#[test]
+fn mem_efficient_bwd_cuda_matches_cpu_bf16() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    assert_mem_efficient_bwd_parity(
+        "bf16 rope+window",
+        &cuda,
+        2,
+        11,
+        2,
+        16,
+        Some(3),
+        true,
+        DType::BF16,
+        MEM_EFFICIENT_MIN_CHUNK_FOR_TEST,
+        MEM_EFFICIENT_BF16_BOUND,
     );
 }

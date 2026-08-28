@@ -57,17 +57,26 @@ const DEFAULT_LOCAL_ATTENTION: usize = 128;
 const DEFAULT_GLOBAL_ATTN_EVERY_N_LAYERS: usize = 3;
 
 /// The key-chunk width [`ModernBertAttention::forward_memeff_attention`]
-/// hands [`MemEfficientAttention::new`] — a fixed default (M2 plan v1's
-/// "chosen by measurement" point on the launch-count/transient-size curve,
-/// v1 §"Loop shape pinned"), never env-overridden in a measurement path
-/// (M2 plan v2 delta 3/v3 delta 4: `chunk_size` changes reduction order —
-/// it is numerics, family J — so it is jammi-side PROVENANCE
-/// ([`MemEfficientAttention::chunk`], read back by a caller building a
-/// job record), never a tunable this crate exposes at runtime). Above
-/// [`jammi_kernels::ops::MEM_EFFICIENT_MIN_CHUNK`]'s launch-count floor
-/// (`512`); the identity/bench wiring that RECORDS this value per-row is
-/// later work on this train (M2 plan v3 delta 4's NullMeans-class
-/// provenance field) — this constant is the op-side decision alone.
+/// hands [`MemEfficientAttention::new`] — a fixed default, never
+/// env-overridden in a measurement path (M2 plan v2 delta 3/v3 delta 4:
+/// `chunk_size` changes reduction order — it is numerics, family J — so it
+/// is jammi-side PROVENANCE ([`MemEfficientAttention::chunk`], read back by
+/// a caller building a job record), never a tunable this crate exposes at
+/// runtime). NUMBER PRODUCED-OR-ABSENT (adversarial audit round 3
+/// advisory): this is a floor-respecting DEFAULT, chosen to sit comfortably
+/// above [`jammi_kernels::ops::MEM_EFFICIENT_MIN_CHUNK`]'s launch-count
+/// floor (`512`) — NOT a measured crossover point. An earlier revision of
+/// this doc claimed "chosen by measurement" (echoing the plan's own v1
+/// language for a DIFFERENT, not-yet-produced number — the plan's own
+/// "Loop shape pinned" section names `MIN_CHUNK` itself as "the plan's own
+/// chosen point on this curve", not `1024` specifically); no launch-count-
+/// vs-transient-size sweep for THIS value has been run or committed. The
+/// crossover bench leg that would produce that number (M2 plan v1's own
+/// "the crossover bench leg records launch counts alongside wall time") is
+/// still pending; the identity/bench wiring that records `chunk_size`
+/// per-row is later work on this train too (M2 plan v3 delta 4's
+/// NullMeans-class provenance field) — this constant is the op-side
+/// decision alone, pending measurement.
 const MEM_EFFICIENT_CHUNK: usize = 1024;
 
 /// Pins [`MEM_EFFICIENT_CHUNK`] above [`MEM_EFFICIENT_MIN_CHUNK`]'s launch-
@@ -659,12 +668,12 @@ pub(crate) static ATTENTION_BLOCK_DISPATCH_COUNTERS: LazyLock<&'static DispatchC
 
 /// [`jammi_kernels::ops::MemEfficientAttention`]'s own admission predicate
 /// (M2 part 2, contract v4 delta 1 + advisories): a pure function of
-/// `(device, seq, flash)` — ONE definition, called both PER LAYER (inside
-/// `ModernBertAttention::forward_training_attention`, to actually dispatch)
-/// and ONCE per forward (inside `ModernBert::forward_hidden_inner`, to gate
-/// the block/eager mask-bundle build) — never re-derived twice, mirroring
-/// this file's own `flash_admission_predicate`/`decide_flash_admission`
-/// precedent.
+/// `(device, dtype, seq, flash)` — ONE definition, called both PER LAYER
+/// (inside `ModernBertAttention::forward_training_attention`, to actually
+/// dispatch) and ONCE per forward (inside `ModernBert::forward_hidden_inner`,
+/// to gate the block/eager mask-bundle build) — never re-derived twice,
+/// mirroring this file's own `flash_admission_predicate`/
+/// `decide_flash_admission` precedent.
 ///
 /// **Reachable admission set** (M2 plan v3 delta 1, restated): memeff is
 /// the LONG-SEQUENCE arm — `seq > ATTENTION_BLOCK_MAX_SEQ` AND flash
@@ -680,6 +689,29 @@ pub(crate) static ATTENTION_BLOCK_DISPATCH_COUNTERS: LazyLock<&'static DispatchC
 /// plan's OQ ruling, advisories: this op is stock-op composition,
 /// arch-agnostic PTX-forward, not a kernel tuned to one SM target).
 ///
+/// **`dtype` gate, PER-DEVICE-HONEST (adversarial audit round 3, F2 fix):**
+/// the op's own domain is dtype-split by device — `F32`-only on CPU
+/// (`cpu_fwd`'s own module doc, candle-core 0.11's CPU backend has no
+/// `BF16` `MatMul`), `F32` OR `BF16` on CUDA (`cuda_fwd`'s own module doc).
+/// An earlier revision had NO dtype gate here at all — the op's own
+/// `UnsupportedDTypeForOp` refusal was the only thing standing between an
+/// `F16` (or any other unsupported dtype) long-seq forward and a hard
+/// error, and by the time that refusal fired, `ModernBert::
+/// forward_hidden_inner`'s own `memeff_will_fire` suppression (this
+/// predicate's OTHER call site) had ALREADY deleted the block/eager
+/// fallback's `local_band`/`FusedAttentionMasks` bundle — an `F16`
+/// seq>`ATTENTION_BLOCK_MAX_SEQ` forward regressed from
+/// working-via-eager (this op's own baseline, before M2) to an
+/// unconditional `EncoderError::Config`. Folding the dtype domain in HERE,
+/// as a typed `DomainMiss`, repairs both call sites in one move: memeff
+/// correctly declines (never claims `Holds` for a dtype it cannot serve),
+/// so the per-layer cascade falls through to the block/eager arm AND the
+/// once-per-forward suppression never fires, exactly as it did at base.
+/// `device` (not a build-time `#[cfg]`) decides which dtype set applies —
+/// this predicate is called with the tensor's OWN device, so a CPU tensor
+/// on a `cuda`-featured build is still correctly held to the narrower CPU
+/// set.
+///
 /// `JAMMI_KERNELS_DISABLE=mem_efficient_attention` is NOT consulted here —
 /// [`admit_cascade`] itself checks `op_disabled` before ever reading this
 /// predicate's `outcome` (identical precedent: `flash_admission_predicate`
@@ -688,6 +720,7 @@ pub(crate) static ATTENTION_BLOCK_DISPATCH_COUNTERS: LazyLock<&'static DispatchC
 /// transport, which this predicate never does).
 fn mem_efficient_attention_predicate(
     device: &Device,
+    dtype: DType,
     seq: usize,
     flash: &FlashDecision,
 ) -> (PredicateOutcome, &'static str) {
@@ -696,6 +729,21 @@ fn mem_efficient_attention_predicate(
     }
     if !device_is_supported(device) {
         return (PredicateOutcome::CapabilityMiss, "device_is_cpu_or_cuda");
+    }
+    let dtype_ok = if device.is_cuda() {
+        matches!(dtype, DType::F32 | DType::BF16)
+    } else {
+        matches!(dtype, DType::F32)
+    };
+    if !dtype_ok {
+        return (
+            PredicateOutcome::DomainMiss,
+            if device.is_cuda() {
+                "dtype_f32_or_bf16_on_cuda"
+            } else {
+                "dtype_f32_only_on_cpu"
+            },
+        );
     }
     if seq <= ATTENTION_BLOCK_MAX_SEQ {
         return (
@@ -911,26 +959,27 @@ impl ModernBertAttention {
 
     /// `local_band` is the `[1, 1, seq, seq]` sliding-window mask, supplied
     /// whenever the model has any local layer. A global layer ignores it.
-    /// `fused_masks` is the per-forward [`FusedAttentionMasks`] bundle:
-    /// REQUIRED in training mode WHENEVER this call reaches the non-
-    /// transport body below (a typed `Config` refusal otherwise — the
-    /// fused arm never rebuilds it per layer), ignored in eval (eval never
-    /// reads it; passing `Some` or `None` there is byte-identical — see
-    /// `tests::attention_block_eval_output_is_bit_identical_regardless_of_fused_eligibility`),
-    /// and ALSO ignored on the padded-transport branch (`flash` carrying a
-    /// genuinely-padded `FlashDecision::Fused`) — `None` there is not just
-    /// tolerated, it is [`ModernBert::forward_hidden_with_lengths`]'s
-    /// EXPECTED input on that branch (M1b audit A5-confound advisory: the
-    /// caller skips building the `batch·seq²`-class bundle entirely when it
-    /// knows every layer will take this branch instead).
+    /// `fused_masks` is the per-forward [`FusedAttentionMasks`] bundle —
+    /// STALE as of M2 part 2 (adversarial audit round 3 advisory fix):
+    /// `forward` itself no longer unwraps it eagerly. It is passed straight
+    /// through, UNTOUCHED, into [`TrainingMaskInputs::fused`], and
+    /// [`Self::forward_training_attention`] is now the ONE place that
+    /// requires it `Some` — and only on ONE of its own three possible
+    /// outcomes (flash cascade, memeff cascade, block/eager fallthrough):
+    /// `None` is correct and expected whenever memeff will dispatch (it
+    /// needs neither `fused_masks` nor `local_band`, [`MemEfficientAttention`]'s
+    /// own module doc), NOT just on the pre-existing padded-transport
+    /// branch below. Ignored entirely in eval (eval never reads it; passing
+    /// `Some` or `None` there is byte-identical — see
+    /// `tests::attention_block_eval_output_is_bit_identical_regardless_of_fused_eligibility`).
     ///
-    /// | `self.training` | `flash` transports | `fused_masks` | outcome |
-    /// |---|---|---|---|
-    /// | `false` | n/a | `None` | eval path |
-    /// | `false` | n/a | `Some` | eval path (identical output; the bundle is unread) |
-    /// | `true` | no | `Some` | training path |
-    /// | `true` | no | `None` | `EncoderError::Config` (`tests::training_attention_forward_without_fused_masks_is_a_typed_refusal`) |
-    /// | `true` | yes | `None` | padded-transport path (the bundle is unread; this is the caller's normal, expected input) |
+    /// | `self.training` | `flash` transports | memeff dispatches | `fused_masks` | outcome |
+    /// |---|---|---|---|---|
+    /// | `false` | n/a | n/a | any | eval path (fused_masks unread) |
+    /// | `true` | yes | n/a | any | padded-transport path (unread — `ModernBert::forward_hidden_with_lengths`'s EXPECTED `None`, M1b audit A5-confound advisory) |
+    /// | `true` | no | yes | any | memeff path (unread — `ModernBert::forward_hidden_inner`'s `memeff_will_fire` suppression makes `None` the EXPECTED input here too) |
+    /// | `true` | no | no | `Some` | block/eager fallthrough |
+    /// | `true` | no | no | `None` | `EncoderError::Config` (`tests::training_attention_forward_without_fused_masks_is_a_typed_refusal`) |
     ///
     /// **Shape story (P6 Stage B B3-padded, contract v4 §3.1 item 2):**
     /// `hidden` is `[batch, seq, hidden]` for every row above EXCEPT one —
@@ -1160,7 +1209,7 @@ impl ModernBertAttention {
         // not two that could drift" discipline `flash_admission_predicate`/
         // `decide_flash_admission` already established for the flash arm.
         let (memeff_outcome, memeff_reason) =
-            mem_efficient_attention_predicate(qkv.device(), seq, flash);
+            mem_efficient_attention_predicate(qkv.device(), qkv.dtype(), seq, flash);
         let memeff_dispatch = admit_cascade(
             admission_mode(),
             "mem_efficient_attention",
@@ -2801,7 +2850,8 @@ impl ModernBert {
         // per-layer dispatch will still need on the block/eager fallback.
         let memeff_will_fire = flash_admission.as_ref().is_some_and(|flash| {
             !op_disabled("mem_efficient_attention")
-                && mem_efficient_attention_predicate(input_ids.device(), seq, flash).0
+                && mem_efficient_attention_predicate(input_ids.device(), hidden.dtype(), seq, flash)
+                    .0
                     == PredicateOutcome::Holds
         });
 
@@ -8694,23 +8744,163 @@ mod tests {
     fn mem_efficient_attention_predicate_cells() {
         let device = Device::Cpu;
         let fused = fused_flash_for_test(vec![4], 4, &device);
-        let (outcome, reason) =
-            mem_efficient_attention_predicate(&device, ATTENTION_BLOCK_MAX_SEQ + 1, &fused);
+        let (outcome, reason) = mem_efficient_attention_predicate(
+            &device,
+            DType::F32,
+            ATTENTION_BLOCK_MAX_SEQ + 1,
+            &fused,
+        );
         assert_eq!(outcome, PredicateOutcome::DomainMiss);
         assert_eq!(reason, "flash_admission_holds");
 
-        let (outcome, reason) =
-            mem_efficient_attention_predicate(&device, ATTENTION_BLOCK_MAX_SEQ, &declined_flash());
+        let (outcome, reason) = mem_efficient_attention_predicate(
+            &device,
+            DType::F32,
+            ATTENTION_BLOCK_MAX_SEQ,
+            &declined_flash(),
+        );
         assert_eq!(outcome, PredicateOutcome::DomainMiss);
         assert_eq!(reason, "seq_within_attention_block_max_seq");
 
         let (outcome, reason) = mem_efficient_attention_predicate(
             &device,
+            DType::F32,
             ATTENTION_BLOCK_MAX_SEQ + 1,
             &declined_flash(),
         );
         assert_eq!(outcome, PredicateOutcome::Holds);
         assert_eq!(reason, "domain_ok");
+    }
+
+    /// F2 fix (adversarial audit round 3): the dtype gate, per-device
+    /// honest. `F16` (this op's own domain admits neither on any device —
+    /// only `F32`/`BF16`) must `DomainMiss` on BOTH devices this suite can
+    /// construct, with a reason string that names WHICH set applied —
+    /// never silently fall through to `Holds` the way a dtype-blind
+    /// predicate would have (the exact regression this fix closes: see
+    /// `mem_efficient_attention_f16_long_seq_falls_through_to_eager_exactly_as_at_base`
+    /// for the end-to-end proof). `BF16` on CPU is ALSO a `DomainMiss`
+    /// (narrower than CUDA's own set) — `cpu_fwd` has no `BF16` `MatMul`
+    /// on this backend at all (module doc), so the CPU-arm reason names
+    /// `F32`-only explicitly, distinct from CUDA's `F32`-or-`BF16` reason.
+    #[test]
+    fn mem_efficient_attention_predicate_dtype_gate_is_per_device_honest() {
+        let device = Device::Cpu;
+        let long_seq = ATTENTION_BLOCK_MAX_SEQ + 1;
+
+        let (outcome, reason) =
+            mem_efficient_attention_predicate(&device, DType::F16, long_seq, &declined_flash());
+        assert_eq!(outcome, PredicateOutcome::DomainMiss);
+        assert_eq!(reason, "dtype_f32_only_on_cpu");
+
+        let (outcome, reason) =
+            mem_efficient_attention_predicate(&device, DType::BF16, long_seq, &declined_flash());
+        assert_eq!(
+            outcome,
+            PredicateOutcome::DomainMiss,
+            "CPU has no BF16 MatMul on this backend -- must decline, never claim Holds"
+        );
+        assert_eq!(reason, "dtype_f32_only_on_cpu");
+
+        // `F32` on CPU still admits (sanity: the dtype gate must not be
+        // over-broad and refuse the domain-valid case too).
+        let (outcome, _) =
+            mem_efficient_attention_predicate(&device, DType::F32, long_seq, &declined_flash());
+        assert_eq!(outcome, PredicateOutcome::Holds);
+    }
+
+    /// F2's end-to-end proof (adversarial audit round 3): before this
+    /// arm's dtype gate existed, an `F16` long-seq (`seq >
+    /// ATTENTION_BLOCK_MAX_SEQ`) forward regressed from
+    /// working-via-eager (this crate's own pre-M2 baseline — `F16` is a
+    /// documented supported backbone dtype,
+    /// `forward_eager_training_attention_composition`'s own "a F16/BF16
+    /// backbone" comment) to an unconditional `EncoderError::Config`:
+    /// `mem_efficient_attention_predicate` claimed `Holds` for ANY dtype,
+    /// the per-layer cascade dispatched memeff, and the underlying op's
+    /// OWN `UnsupportedDTypeForOp` refusal fired only after
+    /// `ModernBert::forward_hidden_inner`'s `memeff_will_fire` suppression
+    /// had ALREADY deleted the block/eager fallback's mask bundle. Proves
+    /// the fix restores the base behaviour exactly: memeff DECLINES
+    /// (`dtype_f32_only_on_cpu`, counted), the block arm ALSO declines (this
+    /// fixture's `head_dim` is not [`ATTENTION_BLOCK_HEAD_DIM`] anyway —
+    /// unrelated to this fix, a pre-existing block-arm domain edge; this
+    /// test asserts the block arm's OWN counter is unchanged, not which
+    /// reason it declined for), and `forward_training_attention` completes
+    /// via the eager composition with a finite, correctly-shaped output —
+    /// never an error.
+    #[test]
+    fn mem_efficient_attention_f16_long_seq_falls_through_to_eager_exactly_as_at_base() {
+        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let device = Device::Cpu;
+        let (b, s, h, d) = (1usize, ATTENTION_BLOCK_MAX_SEQ + 1, 1usize, 8usize);
+        let attn = memeff_fixture(false, h, d, s, None, &device);
+        let n = b * s * 3 * h * d;
+        let qkv_v: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.0003).sin() * 0.05).collect();
+        let qkv = Tensor::from_vec(qkv_v, (b, s, 3 * h * d), &device)
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap();
+        let extended = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
+        let fused = FusedAttentionMasks::build(&extended, None, DType::F16).unwrap();
+
+        let memeff_before = cascade_counters_for("mem_efficient_attention").snapshot();
+        let block_before = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+        let out = attn
+            .forward_training_attention(
+                &qkv,
+                b,
+                s,
+                h,
+                d,
+                TrainingMaskInputs {
+                    extended: &extended,
+                    local_band: None,
+                    fused: Some(&fused),
+                },
+                &declined_flash(),
+            )
+            .expect(
+                "F16 long-seq must fall through memeff (dtype DomainMiss) and the block arm \
+                 (seq DomainMiss) to the eager composition, never error -- this is the base \
+                 behaviour the dtype gate must restore",
+            );
+        let memeff_after = cascade_counters_for("mem_efficient_attention").snapshot();
+        let block_after = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+
+        assert_eq!(out.dims(), &[b, s, h * d]);
+        assert_eq!(out.dtype(), DType::F16);
+        assert_eq!(
+            memeff_after.fused, memeff_before.fused,
+            "memeff must never dispatch fused for a dtype its own op cannot serve"
+        );
+        // `>=`, not `==` (pod-smoke fix, adversarial audit round 3
+        // follow-up): `forward_training_attention`'s memeff cascade is
+        // consulted on EVERY training-mode call in this shared test
+        // binary, including every pre-existing (unrelated, unlocked) test
+        // elsewhere in this file that reaches it at a short seq — each of
+        // those ALSO increments `declined`
+        // (`seq_within_attention_block_max_seq`), and this process-wide
+        // counter has no way to attribute an increment to the test that
+        // caused it. `ATTENTION_BLOCK_COUNTER_TEST_LOCK` only serializes
+        // THIS file's OWN counter-asserting tests against each other — it
+        // was never meant to (and cannot) silence hundreds of unrelated
+        // pre-existing training-mode tests. The property that matters —
+        // "this call's own decline was recorded" — is exact in spirit;
+        // `>=` is the honest statement of it under real parallelism (the
+        // `.expect` above already proved this call itself fell through).
+        assert!(
+            memeff_after.declined > memeff_before.declined,
+            "the dtype decline must still be recorded"
+        );
+        assert_eq!(
+            block_after.fused, block_before.fused,
+            "the block arm's own domain (F32/BF16, head_dim-fixed) is unrelated to this fix and \
+             must still decline here too -- this forward runs the eager composition, not the \
+             block arm"
+        );
     }
 
     /// A small, arbitrary-`head_dim` [`ModernBertAttention`] fixture for
@@ -8755,6 +8945,185 @@ mod tests {
             half_window,
             training: true,
         }
+    }
+
+    /// A full, synthetic, ONE-global-layer [`ModernBert`] for F5's
+    /// full-forward suppression-seam proof (adversarial audit round 3):
+    /// built entirely in-memory (a throwaway [`VarBuilder::from_varmap`]
+    /// for the embedding table / LayerNorms, direct [`candle_nn::Linear`]
+    /// construction for every attention/MLP weight — mirroring
+    /// [`memeff_fixture`]/[`attention_block_fixture`]'s own seeded-weight
+    /// idiom) rather than [`ModernBert::builder`], which REQUIRES a real
+    /// mmaped safetensors file this test has no need to add just to pick
+    /// its own `max_position_embeddings`. `max_position_embeddings` is
+    /// `ATTENTION_BLOCK_MAX_SEQ + 128` — the ONE property no existing
+    /// fixture file has (`tests/fixtures/tiny_modernbert_head64` caps at
+    /// `64`) and the ONE property this test genuinely needs. Every weight
+    /// is built in `dtype` directly (never F32-then-cast), so an F16
+    /// fixture exercises F16 matmuls throughout, not merely an F16-shaped
+    /// wrapper around F32 compute.
+    fn tiny_full_model_fixture(device: &Device, dtype: DType) -> ModernBert {
+        use candle_nn::Linear;
+        let (h, d) = (1usize, 8usize);
+        let hidden = h * d;
+        let intermediate = 16usize;
+        let vocab = 32usize;
+        let max_pos = ATTENTION_BLOCK_MAX_SEQ + 128;
+
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, dtype, device);
+        let word_embeddings = embedding(vocab, hidden, vb.pp("emb")).unwrap();
+        let emb_norm = LayerNorm::new(hidden, 1e-5, false, vb.pp("emb_norm")).unwrap();
+        let final_norm = LayerNorm::new(hidden, 1e-5, false, vb.pp("final_norm")).unwrap();
+        let mlp_norm = LayerNorm::new(hidden, 1e-5, false, vb.pp("mlp_norm")).unwrap();
+
+        let mk_linear = |rows: usize, cols: usize, seed: f32| -> Linear {
+            let v: Vec<f32> = (0..rows * cols)
+                .map(|i| ((i as f32) * seed).sin() * 0.1)
+                .collect();
+            let t = Tensor::from_vec(v, (rows, cols), device)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            Linear::new(t, None)
+        };
+
+        let attention = ModernBertAttention {
+            wqkv: MaybeLoraLinear::Frozen(mk_linear(3 * hidden, hidden, 0.0131)),
+            wo: MaybeLoraLinear::Frozen(mk_linear(hidden, hidden, 0.0097)),
+            attn_norm: None,
+            rope: Arc::new(rope(d, max_pos, 10_000.0, device)),
+            is_local: false,
+            num_heads: h,
+            head_dim: d,
+            half_window: None,
+            training: true,
+        };
+        let mlp = ModernBertMlp {
+            wi: MaybeLoraLinear::Frozen(mk_linear(2 * intermediate, hidden, 0.0211)),
+            wo: MaybeLoraLinear::Frozen(mk_linear(hidden, intermediate, 0.0173)),
+            mlp_norm,
+            training: true,
+        };
+        let layer = ModernBertLayer { attention, mlp };
+
+        ModernBert {
+            word_embeddings,
+            emb_norm,
+            layers: vec![layer],
+            final_norm,
+            pooling: Pooling::Mean,
+            hidden_size: hidden,
+            max_position_embeddings: max_pos,
+            local_half_window: None,
+            band_cache: Mutex::new(HashMap::new()),
+            training: true,
+        }
+    }
+
+    /// F5 fix (adversarial audit round 3): the "provably unread by any
+    /// layer" suppression claim (`ModernBert::forward_hidden_inner`'s own
+    /// `memeff_will_fire` comment) had NO full-forward test — every
+    /// dispatch test up to this point hand-built `TrainingMaskInputs` and
+    /// called `forward_training_attention` DIRECTLY, never driving
+    /// `forward_hidden_inner` itself (which is where `local_band`/
+    /// `fused_masks` are actually built-or-suppressed). This test drives
+    /// the REAL seam, CPU-hermetic, at `seq > ATTENTION_BLOCK_MAX_SEQ`:
+    /// every layer (one, here) dispatches memeff (`fused` counter
+    /// increments by exactly `num_hidden_layers`), the block arm is NEVER
+    /// consulted (its own counter is unchanged — the strongest available
+    /// proxy for "the bundle was never read": if the block arm never ran,
+    /// nothing downstream ever needed `fused_masks`/`local_band` to be
+    /// `Some`), and the output is finite and correctly shaped.
+    #[test]
+    fn forward_hidden_full_forward_suppresses_the_bundle_and_dispatches_memeff_at_long_seq() {
+        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let device = Device::Cpu;
+        let model = tiny_full_model_fixture(&device, DType::F32);
+        let seq = ATTENTION_BLOCK_MAX_SEQ + 1;
+        let ids: Vec<u32> = (0..seq).map(|i| (i % 32) as u32).collect();
+        let input_ids = Tensor::from_vec(ids, (1, seq), &device).unwrap();
+        let mask = Tensor::ones((1, seq), DType::U32, &device).unwrap();
+
+        let memeff_before = cascade_counters_for("mem_efficient_attention").snapshot();
+        let block_before = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+        let out =
+            forward_hidden_forcing_flash_decision(&model, &input_ids, &mask, declined_flash())
+                .expect("full-forward memeff dispatch at long seq must complete, not error");
+        let memeff_after = cascade_counters_for("mem_efficient_attention").snapshot();
+        let block_after = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+
+        assert_eq!(out.dims(), &[1, seq, model.hidden_size]);
+        let v: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(
+            v.iter().all(|x| x.is_finite()),
+            "every output element must be finite"
+        );
+        assert_eq!(
+            memeff_after.fused - memeff_before.fused,
+            model.layers.len() as u64,
+            "every layer must dispatch memeff exactly once -- the once-per-forward eligibility \
+             decision, consulted per layer, must be deterministic across the whole stack"
+        );
+        assert_eq!(
+            block_after.fused, block_before.fused,
+            "the block arm must NEVER be consulted once the once-per-forward memeff decision \
+             holds -- this is the actual proof the suppressed local_band/fused_masks bundle was \
+             never read, not merely asserted"
+        );
+    }
+
+    /// F5's negative twin, closing the F2 gap directly: at a shape memeff
+    /// declines (an `F16` backbone — this op's own domain admits ONLY
+    /// `F32`/`BF16`, and `F16` is neither), `memeff_will_fire` must NOT
+    /// suppress the mask bundle —
+    /// proving the suppression seam and the dispatch predicate stay in
+    /// lockstep (a suppression bug here is silent: the forward would
+    /// simply error deep inside the block/eager fallback with a
+    /// "fused_masks missing" refusal, which is exactly what F2's
+    /// regression looked like before its fix).
+    #[test]
+    fn forward_hidden_f16_long_seq_does_not_suppress_the_bundle_and_falls_through_to_eager() {
+        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let device = Device::Cpu;
+        let model = tiny_full_model_fixture(&device, DType::F16);
+        let seq = ATTENTION_BLOCK_MAX_SEQ + 1;
+        let ids: Vec<u32> = (0..seq).map(|i| (i % 32) as u32).collect();
+        let input_ids = Tensor::from_vec(ids, (1, seq), &device).unwrap();
+        let mask = Tensor::ones((1, seq), DType::U32, &device).unwrap();
+
+        let memeff_before = cascade_counters_for("mem_efficient_attention").snapshot();
+        let out =
+            forward_hidden_forcing_flash_decision(&model, &input_ids, &mask, declined_flash())
+                .expect(
+                "F16 long-seq must fall through to the eager composition via the (un-suppressed) \
+                 mask bundle, never error",
+            );
+        let memeff_after = cascade_counters_for("mem_efficient_attention").snapshot();
+
+        assert_eq!(out.dims(), &[1, seq, model.hidden_size]);
+        assert_eq!(
+            memeff_after.fused, memeff_before.fused,
+            "memeff must never dispatch fused for F16 -- the bundle-suppression seam must have \
+             correctly declined to suppress"
+        );
+        // `>=`, not `==` (pod-smoke fix, adversarial audit round 3
+        // follow-up — same rationale as the sibling test above): every
+        // OTHER training-mode forward in this shared test binary ALSO
+        // consults (and declines) this predicate, so an exact delta over
+        // this ONE model's `layers.len()` is not a safe claim under real
+        // parallelism; `>=` proves this forward's own per-layer declines
+        // were genuinely recorded without asserting something false about
+        // concurrently-running, unrelated tests.
+        assert!(
+            memeff_after.declined - memeff_before.declined >= model.layers.len() as u64,
+            "every layer's own per-layer predicate call must ALSO decline (dtype), consistent \
+             with the once-per-forward suppression decision"
+        );
     }
 
     /// The core dispatch proof: a global layer at `seq >
@@ -8913,9 +9282,15 @@ mod tests {
         let memeff_after = cascade_counters_for("mem_efficient_attention").snapshot();
         let block_after = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
 
-        assert_eq!(
-            memeff_after.declined,
-            memeff_before.declined + 1,
+        // `>=`, not `==` (pod-smoke fix, adversarial audit round 3
+        // follow-up): every OTHER training-mode short-seq test in this
+        // shared binary ALSO reaches this predicate and declines (the SAME
+        // reason), and none of them coordinate with this ONE fixture's own
+        // lock — `>=` proves THIS call's own decline was recorded, never
+        // a false claim about how many concurrently-running unrelated
+        // tests also declined.
+        assert!(
+            memeff_after.declined > memeff_before.declined,
             "memeff must decline (DomainMiss, seq_within_attention_block_max_seq), never fire"
         );
         assert_eq!(memeff_after.fused, memeff_before.fused);
@@ -8926,31 +9301,29 @@ mod tests {
     }
 
     /// The "distinct typed-error, never a panic" discriminator (the M1b
-    /// pattern applied to this arm): on a NON-CUDA (CPU) build,
-    /// `mem_efficient_attention`'s own `cpu_fwd` is `F32`-only (module
-    /// doc) — `BF16` at a genuinely memeff-eligible (long-seq,
-    /// flash-declined) shape must surface AS a typed
-    /// `UnsupportedDTypeForOp` refusal (via `EncoderError::Config`'s own
-    /// wrapped message), never a panic and never a silently-produced
-    /// wrong tensor. Unlike flash's stub (compiled out entirely without
-    /// `flash-attn`), memeff's `cpu_fwd` is ALWAYS compiled — so THIS is
-    /// the real op's own domain refusal, not a stub message, on every
-    /// build this suite runs (mirrors
-    /// `strict_mode_padded_flash_dispatch_child_process_body`'s own
-    /// feature-conditional-expectations lesson: assert on what THIS build
-    /// actually produces).
+    /// pattern applied to this arm), REVISED post-F2 fix (adversarial
+    /// audit round 3): `mem_efficient_attention_predicate` NOW gates on
+    /// dtype too, so `BF16` on `Device::Cpu` is refused AT THE PREDICATE
+    /// (`DomainMiss`, `"dtype_f32_only_on_cpu"` —
+    /// `mem_efficient_attention_predicate_dtype_gate_is_per_device_honest`
+    /// is that proof) and never even REACHES the op's own `cpu_fwd`
+    /// dtype match anymore in the LATTICE dispatch path — an earlier
+    /// revision of THIS test asserted the OP's own `UnsupportedDTypeForOp`
+    /// refusal via `forward_training_attention`, which the F2 fix made
+    /// vacuous the same way `training_attention_forward_without_fused_masks_is_a_typed_refusal`
+    /// went vacuous after an earlier guard move (same defect CLASS,
+    /// caught here before it shipped): the assertion would have kept
+    /// passing, but for the WRONG reason (the "missing fused masks"
+    /// refusal, since `fused: None` and memeff now correctly declines
+    /// before ever reaching the op). FIX: call
+    /// [`ModernBertAttention::forward_memeff_attention`] DIRECTLY
+    /// (bypassing the predicate/cascade entirely — same crate, private
+    /// method, reachable from this nested `tests` module) to prove the
+    /// OP's OWN typed refusal remains intact as a defense-in-depth layer,
+    /// independent of whether the lattice's own predicate ever routes a
+    /// caller into it.
     #[test]
-    fn mem_efficient_attention_bf16_on_cpu_is_a_typed_refusal_not_a_panic() {
-        // Pod-smoke fix (round 2), same rationale as
-        // `mem_efficient_attention_dispatches_with_a_local_window_and_no_materialized_band`'s
-        // own comment: `mem_efficient_attention_predicate` does not
-        // consult dtype at all, so `admit_cascade` fires `fused` here
-        // BEFORE the op's own `cpu_fwd` refuses `BF16` — this test DOES
-        // touch the shared counter and must serialize against every other
-        // one that does.
-        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+    fn mem_efficient_attention_op_bf16_on_cpu_is_a_typed_refusal_not_a_panic() {
         let device = Device::Cpu;
         let (b, s, h, d) = (1usize, ATTENTION_BLOCK_MAX_SEQ + 1, 1usize, 8usize);
         let attn = memeff_fixture(false, h, d, s, None, &device);
@@ -8963,19 +9336,7 @@ mod tests {
         let extended = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
 
         let err = attn
-            .forward_training_attention(
-                &qkv,
-                b,
-                s,
-                h,
-                d,
-                TrainingMaskInputs {
-                    extended: &extended,
-                    local_band: None,
-                    fused: None,
-                },
-                &declined_flash(),
-            )
+            .forward_memeff_attention(&qkv, b, s, h, d, &extended)
             .expect_err("BF16 on CPU must be a typed refusal, never a silent computation");
         assert!(
             matches!(err, EncoderError::Config(_)),
@@ -8985,6 +9346,78 @@ mod tests {
         assert!(
             err_s.contains("mem_efficient_attention"),
             "the wrapped error must name the op: {err_s}"
+        );
+    }
+
+    /// Sanity: proves the predicate-level decline
+    /// [`mem_efficient_attention_predicate_dtype_gate_is_per_device_honest`]
+    /// pins is what the FULL lattice actually reaches — `declined` (not
+    /// `fused`), never touching the op at all — AND that the rest of the
+    /// forward genuinely completes. Closes the loop between the
+    /// pure-predicate unit test and the op-level defense-in-depth test
+    /// above: both are real, neither is vacuous.
+    ///
+    /// `F16`, not `BF16` (a real correction, caught by this test itself
+    /// failing before this fix): candle-core 0.11's CPU backend has NO
+    /// `BF16` `MatMul` at all (no `gemm-bf16` in this workspace's
+    /// dependency tree — only `gemm-f16`/`gemm-f32`/`gemm-f64`/`gemm-c32`/
+    /// `gemm-c64`), so a `BF16` fixture here would fail downstream inside
+    /// the EAGER composition's own `matmul` too (`Tensor(unsupported dtype
+    /// BF16 for op matmul)`) — not the "falls through and completes"
+    /// scenario this test means to prove. `F16` genuinely has a CPU GEMM
+    /// (`gemm-f16`) and is ALSO outside memeff's own `F32`-only-on-CPU
+    /// domain, so it exercises the SAME predicate-decline path without
+    /// hitting that unrelated, pre-existing CPU-backend limitation.
+    #[test]
+    fn mem_efficient_attention_f16_on_cpu_declines_at_the_predicate_before_reaching_the_op() {
+        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let device = Device::Cpu;
+        let (b, s, h, d) = (1usize, ATTENTION_BLOCK_MAX_SEQ + 1, 1usize, 8usize);
+        let attn = memeff_fixture(false, h, d, s, None, &device);
+        let n = b * s * 3 * h * d;
+        let qkv_v: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.0003).sin() * 0.3).collect();
+        let qkv = Tensor::from_vec(qkv_v, (b, s, 3 * h * d), &device)
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap();
+        let extended = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
+        let fused = FusedAttentionMasks::build(&extended, None, DType::F16).unwrap();
+
+        let memeff_before = cascade_counters_for("mem_efficient_attention").snapshot();
+        let out = attn
+            .forward_training_attention(
+                &qkv,
+                b,
+                s,
+                h,
+                d,
+                TrainingMaskInputs {
+                    extended: &extended,
+                    local_band: None,
+                    fused: Some(&fused),
+                },
+                &declined_flash(),
+            )
+            .expect(
+                "F16 on CPU must fall through memeff to the block/eager arm, not error -- \
+                 block also declines here (head_dim), eager must complete",
+            );
+        let memeff_after = cascade_counters_for("mem_efficient_attention").snapshot();
+
+        assert_eq!(out.dims(), &[b, s, h * d]);
+        assert_eq!(
+            memeff_after.fused, memeff_before.fused,
+            "memeff must never dispatch fused for F16 on CPU"
+        );
+        // `>=`, not `==` — same pod-smoke-fix rationale as this file's
+        // other `mem_efficient_attention` decline-counter assertions
+        // above: `forward_training_attention`'s memeff cascade is
+        // consulted by every training-mode call in this shared binary.
+        assert!(
+            memeff_after.declined > memeff_before.declined,
+            "the dtype decline must still be recorded"
         );
     }
 
@@ -9230,6 +9663,19 @@ mod tests {
     /// a per-layer rebuild of the masks.
     #[test]
     fn training_attention_forward_without_fused_masks_is_a_typed_refusal() {
+        // `flash: Some(&declined_flash())` (fix, adversarial audit round
+        // 3 advisory): an EARLIER revision passed `flash: None` here,
+        // which — since M2's memeff wiring moved the `fused_masks`
+        // unwrap DOWN into `forward_training_attention`, past a new
+        // `let Some(flash) = flash else { .. }` guard `forward` itself
+        // still runs FIRST — made this test vacuous: it started passing
+        // for the WRONG reason (the "missing flash-cascade decision"
+        // refusal, a completely different code path, fires before this
+        // test's own claim is ever reached). `declined_flash()` reaches
+        // PAST that guard and past the memeff cascade (`seq=4`, still
+        // `<= ATTENTION_BLOCK_MAX_SEQ`, so memeff also declines) into the
+        // block/eager fallthrough's OWN `masks.fused.is_none()` refusal —
+        // the one this test's name and doc actually describe.
         let device = Device::Cpu;
         let (b, s, h, d) = (1usize, 4usize, 2usize, ATTENTION_BLOCK_HEAD_DIM);
         let hidden = Tensor::zeros((b, s, h * d), DType::F32, &device).unwrap();
@@ -9237,9 +9683,15 @@ mod tests {
         let mut attn = attention_block_fixture(false, h, s, &device);
         attn.set_training(true);
         let err = attn
-            .forward(&hidden, &mask, None, None, None)
+            .forward(&hidden, &mask, None, None, Some(&declined_flash()))
             .expect_err("training mode without fused masks must be refused");
         assert!(matches!(err, EncoderError::Config(_)), "{err:?}");
+        let err_s = err.to_string();
+        assert!(
+            err_s.contains("fused masks") || err_s.contains("per-forward fused"),
+            "sanity: must be the fused_masks-missing refusal specifically, not the \
+             flash-decision-missing one it used to vacuously exercise: {err_s}"
+        );
     }
 
     /// Global-attention arm: the fused whole-attention-block forward must

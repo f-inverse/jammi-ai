@@ -709,10 +709,38 @@ fn band_additive_value(query_row: usize, key_pos: usize, half_window: usize) -> 
 }
 
 /// Materializes ONE chunk's worth of band (`[1, 1, seq, chunk_len]`) —
-/// `O(seq · chunk_len)`, never `O(seq²)` — for `bwd`'s Tensor-level
-/// composition. `cpu_fwd`'s own raw-storage loop calls
+/// `O(seq · chunk_len)` PER CALL, never `O(seq²)` per call — for `bwd`'s
+/// Tensor-level composition AND, since M2 part 2, `cuda_fwd`'s own
+/// composition too. `cpu_fwd`'s own raw-storage loop calls
 /// [`band_additive_value`] directly, per cell, with no intermediate
-/// allocation at all.
+/// allocation at all — this function exists only for the two Tensor-level
+/// composition call sites.
+///
+/// **KNOWN COST, NOT FIXED THIS ROUND (adversarial audit round 3
+/// advisory, honestly disclosed rather than silently absorbed): a
+/// host-side rebuild, re-uploaded every call.** `Tensor::from_vec` builds
+/// `band` in a plain `Vec` on the HOST (a scalar Rust loop) and — on a
+/// CUDA `device` — uploads it via a fresh PCIe transfer; this function is
+/// called ONCE PER KEY-CHUNK, and both `cuda_fwd` and `bwd` call it inside
+/// their own per-layer chunk loop, so ONE training step pays this
+/// `O(seq · chunk_len)`-per-chunk cost `sum(chunk_len) == seq` times per
+/// call site per layer — `O(seq²)` host CPU work plus `O(seq²)` bytes of
+/// PCIe upload PER LAYER, `O(L · seq²)` summed over an `L`-layer model's
+/// forward+backward, where a cached-once-per-forward device-side band
+/// (built by an `iota`-style device computation, or a host buffer built
+/// once and reused across every layer/chunk that shares the same
+/// `(seq, half_window)`) would pay it once. This mirrors the SAME class of
+/// currently-unpriced host-rebuild cost `ModernBert::sliding_band`'s own
+/// per-length memoisation exists to avoid at the ENCODER layer for
+/// `AttentionBlockFused`'s local mask — this op has no equivalent cache
+/// yet. Not fixed here: no CUDA device in this environment to MEASURE
+/// whether the fix is cheap (a device-side iota comparison, or plumbing a
+/// cache through this op's currently-stateless `cuda_fwd`/`bwd`, both need
+/// a real device to validate are actually faster, not merely fewer
+/// bytes-on-paper) — stating the tradeoff here, honestly, rather than
+/// silently absorbing it into the module doc's existing (device-memory-
+/// only) "memory cost" section, which this host+PCIe class is orthogonal
+/// to.
 fn build_band_chunk_tensor(
     seq: usize,
     chunk_start: usize,
@@ -953,16 +981,37 @@ impl CustomOp3 for MemEfficientAttention {
         )
         .to_dtype(DType::F32)?;
 
+        // F4 fix (adversarial audit round 3): `q0`/`k0` upcast to `f32`
+        // HERE, immediately after gathering — BEFORE RoPE, not after —
+        // exactly mirroring `v0`'s own treatment on the very next line and
+        // `cpu_fwd`'s own f32-native RoPE (`rope_fwd_row_f32`, `super::rope`,
+        // called on already-f32 rows: `cpu_fwd` has no narrower dtype to
+        // rope in, CPU being F32-only). An earlier revision left `q0`/`k0`
+        // in the INPUT dtype through `apply3`'s RoPE call and only upcast
+        // the ROTATED result afterward — on `bf16` (this op's only
+        // production dtype, `rope=true` hardcoded at the call site,
+        // `jammi_encoders::modernbert::forward_memeff_attention`) that
+        // silently ran the rotate-half math in `bf16` and rounded TWICE
+        // (once inside `RopeFused`'s own `bf16` arm, once at the later
+        // `.to_dtype(F32)` this fix removes) — an undisclosed extra
+        // round-trip the module doc's "one round point" claim did not
+        // account for, and a CPU/CUDA divergence source (`cpu_fwd` never
+        // had a `bf16`-RoPE step to begin with). Upcasting here removes
+        // both: RoPE always runs in `f32` on this arm now, matching
+        // `cpu_fwd` exactly, and the module doc's rounding inventory
+        // becomes literally true rather than aspirational.
         let q0 = qkv
             .narrow(2, 0, 1)?
             .squeeze(2)?
             .transpose(1, 2)?
-            .contiguous()?;
+            .contiguous()?
+            .to_dtype(DType::F32)?;
         let k0 = qkv
             .narrow(2, 1, 1)?
             .squeeze(2)?
             .transpose(1, 2)?
-            .contiguous()?;
+            .contiguous()?
+            .to_dtype(DType::F32)?;
         let v0 = qkv
             .narrow(2, 2, 1)?
             .squeeze(2)?
@@ -970,7 +1019,7 @@ impl CustomOp3 for MemEfficientAttention {
             .contiguous()?
             .to_dtype(DType::F32)?;
 
-        let (q_rot, k_rot) = if self.rope {
+        let (q_scaled, k_rot_f32) = if self.rope {
             check_rope_pack(l2, s, d, op)?;
             l2.contiguous_offsets()
                 .ok_or(Error::RequiresContiguous { op })?;
@@ -980,20 +1029,22 @@ impl CustomOp3 for MemEfficientAttention {
                 BackpropOp::none(),
                 false,
             );
+            // `cos`/`sin` upcast to `f32` too (F4): `RopeFused` refuses a
+            // `q0`/`cos`/`sin` dtype mismatch (`rope.rs`'s own
+            // `DTypeMismatchBinaryOp` check) — now that `q0`/`k0` are
+            // `f32`, the table must be too, for exactly the same reason
+            // `cuda_fwd`'s OWN entry-point check requires `rope_pack` to
+            // match `qkv`'s dtype at the (pre-upcast) input boundary.
             let cos_full = rope_pack.narrow(0, 0, 1)?.squeeze(0)?;
             let sin_full = rope_pack.narrow(0, 1, 1)?.squeeze(0)?;
-            let cos = cos_full.narrow(2, 0, s)?;
-            let sin = sin_full.narrow(2, 0, s)?;
+            let cos = cos_full.narrow(2, 0, s)?.to_dtype(DType::F32)?;
+            let sin = sin_full.narrow(2, 0, s)?.to_dtype(DType::F32)?;
             let qr = apply3(&q0, &cos, &sin, RopeFused::new(false))?;
             let kr = apply3(&k0, &cos, &sin, RopeFused::new(false))?;
-            (qr, kr)
+            (qr.affine(f64::from(self.scale), 0.0)?, kr)
         } else {
-            (q0, k0)
+            (q0.affine(f64::from(self.scale), 0.0)?, k0)
         };
-        let q_scaled = q_rot
-            .to_dtype(DType::F32)?
-            .affine(f64::from(self.scale), 0.0)?;
-        let k_rot_f32 = k_rot.to_dtype(DType::F32)?;
 
         let mut m = Tensor::full(f32::NEG_INFINITY, (b, h, s, 1), &device)?;
         let mut l_sum = Tensor::zeros((b, h, s, 1), DType::F32, &device)?;
@@ -1033,25 +1084,47 @@ impl CustomOp3 for MemEfficientAttention {
         }
 
         // `FullyMaskedPolicy::Zeros` trigger (module doc's own section,
-        // above): `mask_running_max` may have stayed `[mask_batch, 1, 1,
+        // above), GATED ON `self.fully_masked` (F1 fix, adversarial audit
+        // round 3): `mask_running_max` may have stayed `[mask_batch, 1, 1,
         // 1]` (no band — the trigger is legitimately query-row-independent
         // then, since the combined mask itself is) or grown to
         // `[mask_batch, 1, s, 1]` (a band present) — `broadcast_as` below
-        // accepts either.
-        let trigger = mask_running_max
-            .broadcast_as((b, 1, s, 1))?
-            .lt(0.0f64)?
-            .to_dtype(DType::F32)?;
-        let keep = trigger.affine(-1.0, 1.0)?;
-        let safe_l_sum = l_sum.broadcast_mul(&keep)?.broadcast_add(&trigger)?;
-        let denom_out = acc.broadcast_div(&safe_l_sum)?;
-        let out_masked = denom_out.broadcast_mul(&keep)?;
+        // accepts either. An earlier revision applied this algebra
+        // UNCONDITIONALLY — every `Propagate`-policy caller (the public
+        // `Default`, per [`super::FullyMaskedPolicy`]'s own doc) silently
+        // got `Zeros` behaviour on CUDA instead, diverging from `cpu_fwd`
+        // (which gates on `policy == FullyMaskedPolicy::Zeros`, this file's
+        // own `attention_fwd_memeff_f32`) and from `bwd`'s own recompute,
+        // which trusts `lse` to encode `Propagate`'s ordinary (possibly
+        // `NaN`/`inf`, by design — see [`super::FullyMaskedPolicy`]'s doc)
+        // division whenever that is the caller's actual policy.
+        // `Propagate`'s own arm below is the SAME plain
+        // `acc / l_sum`, `m + ln(l_sum)` division `cpu_fwd`'s `else` branch
+        // performs — no masking algebra, no sentinel, exactly mirroring
+        // that branch's semantics (including its "may legitimately produce
+        // `NaN`/`inf`" contract, which `Propagate` callers accept by
+        // choosing that policy).
+        let (out_masked, lse) = if self.fully_masked == FullyMaskedPolicy::Zeros {
+            let trigger = mask_running_max
+                .broadcast_as((b, 1, s, 1))?
+                .lt(0.0f64)?
+                .to_dtype(DType::F32)?;
+            let keep = trigger.affine(-1.0, 1.0)?;
+            let safe_l_sum = l_sum.broadcast_mul(&keep)?.broadcast_add(&trigger)?;
+            let denom_out = acc.broadcast_div(&safe_l_sum)?;
+            let out_masked = denom_out.broadcast_mul(&keep)?;
 
-        let lse_raw = m.broadcast_add(&safe_l_sum.log()?)?;
-        let sentinel_term = trigger.affine(f64::from(MASKED_LSE_SENTINEL), 0.0)?;
-        let lse = lse_raw
-            .broadcast_mul(&keep)?
-            .broadcast_add(&sentinel_term)?;
+            let lse_raw = m.broadcast_add(&safe_l_sum.log()?)?;
+            let sentinel_term = trigger.affine(f64::from(MASKED_LSE_SENTINEL), 0.0)?;
+            let lse = lse_raw
+                .broadcast_mul(&keep)?
+                .broadcast_add(&sentinel_term)?;
+            (out_masked, lse)
+        } else {
+            let out_masked = acc.broadcast_div(&l_sum)?;
+            let lse = m.broadcast_add(&l_sum.log()?)?;
+            (out_masked, lse)
+        };
 
         let out_bshd = out_masked.transpose(1, 2)?.contiguous()?;
         let out_final = out_bshd.reshape((b, s, h * d))?.to_dtype(s1.dtype())?;

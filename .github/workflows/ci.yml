@@ -427,23 +427,20 @@ jobs:
 
       - uses: ./.github/actions/setup-rust-ci
 
-      # `JAMMI_FLASH_MEASURE_RSS=1` opts THIS lane into `build.rs::
-      # build_flash_attn`'s `/usr/bin/time -v` wrap around each nvcc TU
-      # invocation (M3 plan v2 delta 5: "the CI flash-attn-compile lane
-      # measures wall AND peak RSS") -- this container is where the
-      # ~4x device-code-section memory cost the M3 gencode widening (four
-      # `-gencode` pairs instead of one) adds is most likely to actually
-      # bite: a shared-runner CI container has far less headroom than the
-      # pod this feature otherwise builds on. Safe to always set here even
-      # if this image's `/usr/bin/time` ever turns out not to exist or not
-      # to be GNU's `-v`-capable variant: `build_flash_attn` gates the wrap
-      # on BOTH this env var AND the binary's own presence on disk, and
-      # `parse_max_rss_kb` degrades to `None` (no RSS line captured, build
-      # still succeeds) rather than failing on an unrecognised report shape
-      # — see that gate's own doc in `build.rs` for the full reasoning.
+      # `JAMMI_FLASH_MEASURE_RSS=1` is deliberately NOT set on this step
+      # (round-2 audit finding B): `build.rs::build_flash_attn` now PANICS
+      # when that var is set but `/usr/bin/time` does not exist on disk (an
+      # explicit request that would otherwise silently measure nothing --
+      # see that gate's own doc), and this crate's own CI image
+      # (`ghcr.io/f-inverse/jammi-ai-ci-cuda`) does not install GNU `time`
+      # today. Installing it is a Dockerfile change, out of THIS crate's
+      # scope. Per-TU wall times are visible in this step's own log
+      # regardless (build.rs prints them to its own stderr
+      # UNCONDITIONALLY now, not gated on this env var, precisely so this
+      # lane gets wall-time visibility without needing RSS measurement at
+      # all) -- a future maintainer who adds `time` to the CI image can
+      # flip this env var on here for real peak-RSS numbers.
       - name: Compile-check jammi-kernels --features flash-attn (nvcc, no GPU)
-        env:
-          JAMMI_FLASH_MEASURE_RSS: "1"
         run: cargo check -p jammi-kernels --features flash-attn
 
       # The encoders `forward_flash_dense_attention` call site (P6 Stage B

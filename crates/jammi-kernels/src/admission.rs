@@ -1121,19 +1121,55 @@ fn parse_gencode_sms(sms: &str) -> Vec<ComputeCapability> {
 /// blind trust in a string that may not correspond to anything this build
 /// actually produced.
 ///
-/// `admitted != compiled` in general (M3 plan D4): an arch appears here
-/// the moment its `-gencode` pair exists in `build.rs`, before any pod
-/// parity leg has run on real hardware of that arch. A caller that needs
-/// "compiled AND VALIDATED" reads `third_party/flash-attention/VENDORED.md`'s
-/// "Supported archs" table for the current per-arch validation status —
-/// this function alone answers "compiled", not "safe to dispatch to
-/// today". `crate::flash::check_arch` and every fence site in
-/// `jammi-encoders`/`jammi-bench` that reads this function are the
-/// enforcement points; this is the single shared SOURCE for what set they
-/// enforce membership in.
+/// `admitted != compiled` in general (M3 plan D4). ROUND-2 AUDIT FINDING
+/// C: an earlier revision of this crate had NO type distinguishing
+/// "compiled" from "validated" at all — `crate::flash::check_arch` and
+/// every fence site in `jammi-encoders`/`jammi-bench` read THIS function
+/// directly as their admission set, so any arch added to `build.rs`'s
+/// `GENCODE_ARCHES` was ADMITTED the moment it compiled, with zero pod
+/// evidence required (the auditor proved this concretely by adding a
+/// hypothetical `sm_100` entry and watching the entire hermetic battery
+/// stay green). This function is now DELIBERATELY not an enforcement
+/// point: it answers ONLY "did `build.rs` compile a cubin for this arch",
+/// which is necessary but not sufficient for admission — no fence site
+/// reads it directly anymore. [`flash_validated_arches`] (below) is the
+/// actual enforcement point every fence reads; it is asserted (by a
+/// hermetic test) to be a SUBSET of what this function returns.
 pub fn flash_built_arches() -> &'static [ComputeCapability] {
     static ARCHES: LazyLock<Vec<ComputeCapability>> =
         LazyLock::new(|| parse_gencode_sms(env!("JAMMI_FLASH_GENCODE_SMS")));
+    if FLASH_COMPILED {
+        ARCHES.as_slice()
+    } else {
+        &[]
+    }
+}
+
+/// The SUBSET of [`flash_built_arches`] with an actual green per-arch pod
+/// parity leg — parsed from `JAMMI_FLASH_VALIDATED_SMS` (`build.rs`'s
+/// `VALIDATED_SMS` const, emitted the SAME unconditional way as
+/// `JAMMI_FLASH_GENCODE_SMS` — see that emission's own doc comment).
+///
+/// **THIS is the actual admission gate** (round-2 audit finding C):
+/// `crate::flash::check_arch`, `jammi-encoders::modernbert`'s
+/// `flash_arch_ok`, and `jammi-bench`'s `flash_capable_cuda` all read
+/// THIS function, not [`flash_built_arches`] — a device outside this set
+/// is refused even if its arch IS compiled (`FlashError::Arch` /
+/// `"arch_in_flash_validated_set"`), because "compiled" alone was proven
+/// (by the round-2 audit's own `sm_100` experiment) to be an insufficient
+/// admission criterion on its own. Same `FLASH_COMPILED`-gated `&[]`
+/// degrade as [`flash_built_arches`], for the same reason (M3 plan v2
+/// delta 3's "truthful in every cfg" contract).
+///
+/// Widening this set is its OWN, separately-reviewable commit — never
+/// bundled with a `GENCODE_ARCHES` addition in the same diff — because
+/// widening it is exactly the step that MUST be gated on a green pod
+/// parity artifact actually landing (`build.rs::VALIDATED_SMS`'s own doc;
+/// `third_party/flash-attention/VENDORED.md`'s "Supported archs" per-arch
+/// table names the evidence for each currently-validated entry).
+pub fn flash_validated_arches() -> &'static [ComputeCapability] {
+    static ARCHES: LazyLock<Vec<ComputeCapability>> =
+        LazyLock::new(|| parse_gencode_sms(env!("JAMMI_FLASH_VALIDATED_SMS")));
     if FLASH_COMPILED {
         ARCHES.as_slice()
     } else {
@@ -1295,6 +1331,61 @@ mod tests {
             got.iter().min().copied(),
             Some(ComputeCapability::new(8, 0)),
             "sm80 is the true floor of the compiled set"
+        );
+    }
+
+    /// Round-2 audit finding C's own hermetic pin: reads
+    /// `env!("JAMMI_FLASH_VALIDATED_SMS")` directly (the value
+    /// `build.rs::VALIDATED_SMS` produces via `main`'s unconditional
+    /// emission — see [`flash_validated_arches`]'s own doc), so this runs,
+    /// and is meaningful, in the default hermetic lane, the same way
+    /// [`gencode_smss_env_var_matches_the_pinned_build_rs_set`] does for
+    /// the compiled set.
+    ///
+    /// THREE properties, all load-bearing:
+    /// 1. Validated is a SUBSET of compiled (`validated ⊆ compiled`) — a
+    ///    validated arch that was somehow never even compiled would be an
+    ///    impossible, self-contradictory state.
+    /// 2. Validated matches its OWN pinned value exactly.
+    /// 3. TODAY's additional invariant: validated == compiled (every
+    ///    currently-compiled arch also has a green pod parity leg, per
+    ///    the lead's own pod-run confirmation for this PR's four arches).
+    ///    This is NOT a permanent guarantee — a future `-gencode` addition
+    ///    to `GENCODE_ARCHES` legitimately breaks it (the arch stays
+    ///    compiled-but-unvalidated until its OWN artifact lands) — but
+    ///    it IS what makes the auditor's own `sm_100` mutant (add a
+    ///    `-gencode` entry, update `GENCODE_ARCHES`'s own pin, but do
+    ///    NOT touch `VALIDATED_SMS`) go RED here: `compiled` grows to 5
+    ///    entries, `validated` stays at 4, and property 3's equality
+    ///    assertion fails — proving admission cannot silently follow a
+    ///    `GENCODE_ARCHES`-only edit anymore. Verified directly against
+    ///    the auditor's exact mutant in a scratch copy (see hand-off).
+    #[test]
+    fn flash_validated_arches_env_var_is_a_pinned_subset_of_compiled() {
+        assert_eq!(env!("JAMMI_FLASH_VALIDATED_SMS"), "80,86,89,90");
+        let validated = parse_gencode_sms(env!("JAMMI_FLASH_VALIDATED_SMS"));
+        let compiled = parse_gencode_sms(env!("JAMMI_FLASH_GENCODE_SMS"));
+        let want = vec![
+            ComputeCapability::new(8, 0),
+            ComputeCapability::new(8, 6),
+            ComputeCapability::new(8, 9),
+            ComputeCapability::new(9, 0),
+        ];
+        assert_eq!(validated, want, "validated set must match its own pin");
+        for v in &validated {
+            assert!(
+                compiled.contains(v),
+                "{v:?} is claimed VALIDATED but is not even in the COMPILED set -- impossible \
+                 state (a validated arch must first be compiled)"
+            );
+        }
+        assert_eq!(
+            compiled, validated,
+            "TODAY's invariant: every currently compiled arch is ALSO validated (per the lead's \
+             own pod-run confirmation for sm80/86/89/90). A compiled arch with no matching \
+             VALIDATED_SMS entry means build.rs::GENCODE_ARCHES grew without its own validation \
+             entry landing in the SAME commit -- see build.rs::VALIDATED_SMS's own doc for the \
+             M3 plan D4 obligation this enforces (round-2 audit finding C)"
         );
     }
 

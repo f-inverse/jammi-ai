@@ -54,6 +54,47 @@ pub(crate) const GENCODE_ARCHES: &[&str] = &[
     "arch=compute_90,code=sm_90",
 ];
 
+/// The SUBSET of [`GENCODE_ARCHES`] with an actual green per-arch pod
+/// parity leg — M3 plan D4's "admitted only if compiled AND validated"
+/// made STRUCTURALLY representable (round-2 audit finding C). An earlier
+/// revision had NO type or const distinguishing "compiled" from
+/// "validated" at all: every fence (`crate::flash::check_arch`,
+/// `jammi-encoders::modernbert::flash_arch_ok`, `jammi-bench`'s
+/// `flash_capable_cuda`) read [`GENCODE_ARCHES`] directly (via
+/// `crate::admission::flash_built_arches()`), so ANY arch added to that
+/// array was ADMITTED the instant it compiled, with zero pod evidence
+/// required. The auditor proved this concretely: adding
+/// `arch=compute_100,code=sm_100` to `GENCODE_ARCHES` and updating this
+/// crate's own literal pins to match left the ENTIRE hermetic battery
+/// green — nothing anywhere asserted "compiled implies proven", only
+/// "compiled implies compiled".
+///
+/// Every fence site now reads `crate::admission::flash_validated_arches()`
+/// (sourced from THIS const, not [`GENCODE_ARCHES`]) — adding a
+/// `-gencode` pair alone leaves that arch compiled-but-REFUSED (a typed
+/// `FlashError::Arch` / `"arch_in_flash_validated_set"` decline) until its
+/// OWN entry lands here, which is the commit where that arch's per-arch
+/// pod parity artifact also lands (see
+/// `third_party/flash-attention/VENDORED.md`'s "Supported archs" per-arch
+/// table for the current status/evidence pointer per entry).
+///
+/// Two-digit `sm_XX` tokens (not full `-gencode` literals like
+/// [`GENCODE_ARCHES`]'s own entries): this list is never fed to nvcc, only
+/// compared against a probed device's compute capability, so it carries
+/// no `arch=compute_XX,code=` prefix to parse away.
+///
+/// Array ORDER is deliberate, not incidental (round-2 audit advisory): the
+/// comma-joined `JAMMI_FLASH_GENCODE_SMS`/`JAMMI_FLASH_VALIDATED_SMS` env
+/// vars these two arrays produce are compared by every hermetic pin test
+/// (`admission.rs`'s own) as `Vec<ComputeCapability>` EQUALITY, which is
+/// order-sensitive — reordering entries here (with no content change)
+/// would still redden those tests. That is the INTENDED behavior, not a
+/// false positive to work around: it keeps every pin an exact,
+/// byte-for-byte statement of "this is the literal array today", so even
+/// a pure reordering is a deliberate, reviewed diff rather than a change
+/// these tests silently absorb.
+pub(crate) const VALIDATED_SMS: &[&str] = &["80", "86", "89", "90"];
+
 /// Parses the `code=sm_<digits>` suffix out of ONE `-gencode` literal — the
 /// same anti-drift pattern the deleted singular `GENCODE_ARCH`/`gencode_sm`
 /// pair used, now applied per entry of [`GENCODE_ARCHES`] so
@@ -124,13 +165,19 @@ pub(crate) fn parse_nvcc_release(version_stdout: &str) -> Option<(u32, u32)> {
 ///
 /// This positive version check (detect the ACTUAL toolkit release, compare
 /// against a stated floor, and name the remedy) replaces this crate's
-/// earlier, now-inaccurate "requires CUDA 12.x with sm_80 support" prose:
-/// [`GENCODE_ARCHES`]'s `sm_90` pair (added the same commit as this
-/// function) needs CUDA >= 11.8, not 12.x — CUDA 11.8's release notes are
-/// the toolkit version that first added `sm_90`/Hopper `-gencode` support;
-/// sm_80/86/89 have been buildable since CUDA 11.1/11.1/11.4 respectively,
-/// so 11.8 is the binding floor for THIS crate's combined gencode set, not
-/// any individual arch's own older floor.
+/// earlier, now-inaccurate "requires CUDA 12.x with sm_80 support" prose.
+///
+/// Per-arch `-gencode` floors (round-2 audit finding D corrected these —
+/// an earlier revision of this doc got two of the three wrong): sm_80
+/// (Ampere) has been buildable since CUDA 11.0 (Ampere's OWN launch
+/// toolkit, not 11.1); sm_86 since CUDA 11.1; sm_89 (Ada) only since CUDA
+/// 11.8 — the SAME toolkit release that added `sm_90`/Hopper support, NOT
+/// CUDA 11.4 as an earlier revision claimed. That correction also flips
+/// which arch actually BINDS this crate's combined floor: BOTH `sm_89`
+/// and `sm_90` are 11.8-floor entries in [`GENCODE_ARCHES`], not `sm_90`
+/// alone — CUDA 11.8 (October 2022) is the release NVIDIA shipped
+/// specifically to add Ada Lovelace (sm_89) and Hopper (sm_90) support
+/// together, per its own release notes.
 ///
 /// `#[allow(dead_code)]`: see [`parse_nvcc_release`]'s doc — same cross-cfg
 /// reachability (only `build_flash_attn`, feature-gated, and the
@@ -145,7 +192,7 @@ pub(crate) fn check_toolkit_floor(
     } else {
         Err(format!(
             "detected CUDA toolkit release {}.{} is below the {}.{} floor this crate's \
-             `flash-attn` feature needs for its sm_90 gencode pair — upgrade the CUDA toolkit \
+             `flash-attn` feature needs for its sm_89/sm_90 gencode pairs — upgrade the CUDA toolkit \
              (nvcc --version must report release >= {}.{}) or drop the sm_90 entry from \
              GENCODE_ARCHES in build.rs if you only need sm_80/86/89",
             detected.0, detected.1, floor.0, floor.1, floor.0, floor.1
@@ -227,6 +274,16 @@ fn walk_files(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// `#[allow(dead_code)]` (round-2 audit advisory — narrowed from a blanket
+/// `#[allow(dead_code)]` on the whole `mod build_script` wrapper
+/// `tests/build_rs_unit.rs`'s `#[path]` seam used to carry): as the REAL
+/// build script's entry point this is never "dead" — `cargo` invokes it
+/// directly as the binary's `main`. It only LOOKS dead from
+/// `tests/build_rs_unit.rs`'s point of view because nesting this file as
+/// `mod build_script { .. }` strips away the compiler's own "this is a
+/// binary crate's entry point" special-casing, and that test file never
+/// calls `main()` itself (only the individual pure functions it calls).
+#[allow(dead_code)]
 fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CUDA");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_FLASH_ATTN");
@@ -248,6 +305,15 @@ fn main() {
     println!(
         "cargo:rustc-env=JAMMI_FLASH_GENCODE_SMS={}",
         gencode_sms.join(",")
+    );
+    // The VALIDATED subset (round-2 audit finding C) — same unconditional
+    // emission discipline as the line above, for the same reason: every
+    // fence site's `env!("JAMMI_FLASH_VALIDATED_SMS")` must compile in
+    // EVERY cfg. See [`VALIDATED_SMS`]'s own doc for what this const means
+    // and why it exists as a SEPARATE array from `GENCODE_ARCHES`.
+    println!(
+        "cargo:rustc-env=JAMMI_FLASH_VALIDATED_SMS={}",
+        VALIDATED_SMS.join(",")
     );
 
     // Default build: no cuda feature, no nvcc, no CUDA toolkit. Nothing
@@ -462,12 +528,24 @@ fn build_cuda() {
 ///   entry (native cubin ONLY per arch, matching upstream `setup.py`'s own
 ///   per-arch `code=sm_XX`-only convention — NOT ALSO `code=compute_XX`/
 ///   embedded PTX for any of them).
-/// - `--threads <N>` (`N` = `$NVCC_THREADS` if set and `> 0`, else `4`) —
-///   nvcc's own internal parallel-compilation flag (CUDA >= 11.5, which
-///   this build's toolkit floor below already exceeds), splitting each of
-///   the three TU compiles across `N` host threads; mitigates the ~4x
-///   device-code-section cost [`GENCODE_ARCHES`]'s four entries add over
-///   the single-arch build this replaced.
+/// - `--threads <N>` — nvcc's own internal flag (added CUDA >= 11.2, not
+///   11.5 as an earlier revision claimed — round-2 audit finding D) that
+///   parallelizes nvcc's PER-ARCHITECTURE compilation STEPS *within* one
+///   TU. This is a WALL-TIME flag, not a memory optimization (round-2
+///   audit finding A: an earlier revision of this doc claimed it
+///   "mitigates" this build's own memory cost — backwards: a flat default
+///   of `4` regardless of how many TUs run concurrently MULTIPLIES peak
+///   front-end memory, since this build ALSO spawns all three TUs as
+///   concurrent processes — 3 TUs × 4 per-TU threads = 12 simultaneous
+///   nvcc front-ends, each with its own footprint (~2.9 GB/TU-arch-thread
+///   recorded on the A100 pod spike) — exactly what OOM'd the 16 GB
+///   `ubuntu-latest` CI runner this crate's own flash-attn-compile lane
+///   uses. `N` now defaults to `available_parallelism() / 3` (this
+///   build's own TU count), bounding TOTAL front-end concurrency to
+///   roughly the machine's own core count rather than a flat multiple of
+///   it; `$NVCC_THREADS`, when set (`> 0`), overrides this entirely — a
+///   caller who has actually measured their own machine's headroom keeps
+///   full control.
 /// - `--expt-relaxed-constexpr --expt-extended-lambda`
 /// - `--use_fast_math` — THE ONE-TU DIVERGENCE from this crate's
 ///   no-fast-math rule (`build_cuda` above pins it off for `src/cuda/*.cu`).
@@ -536,7 +614,7 @@ fn build_flash_attn() {
             "jammi-kernels `flash-attn`: no working `nvcc` found — set `NVCC=<path/to/nvcc>` or \
              `CUDA_HOME=<toolkit root>`, or put the CUDA toolkit's `bin` on PATH (the feature \
              needs a CUDA toolkit whose `nvcc` accepts every arch in GENCODE_ARCHES — currently \
-             CUDA >= 11.8, for the sm_90 gencode pair; checked for real just below)"
+             CUDA >= 11.8, for the sm_89/sm_90 gencode pairs; checked for real just below)"
         )
     });
     println!("cargo:rerun-if-env-changed=NVCC");
@@ -593,7 +671,7 @@ fn build_flash_attn() {
         None => panic!(
             "jammi-kernels `flash-attn`: could not find a \"release <major>.<minor>\" token in \
              `{} --version`'s output:\n{version_stdout}\nThis crate's flash-attn feature needs \
-             CUDA >= {}.{} for its sm_90 gencode pair — verify the toolkit manually",
+             CUDA >= {}.{} for its sm_89/sm_90 gencode pairs — verify the toolkit manually",
             nvcc.display(),
             TOOLKIT_FLOOR.0,
             TOOLKIT_FLOOR.1
@@ -614,17 +692,47 @@ fn build_flash_attn() {
         fa_dir.join("VENDORED.md").display()
     );
 
+    let tus: [(&str, PathBuf); 3] = [
+        (
+            "flash_fwd_hdim64_bf16_sm80",
+            src_dir.join("flash_fwd_hdim64_bf16_sm80.cu"),
+        ),
+        (
+            "flash_bwd_hdim64_bf16_sm80",
+            src_dir.join("flash_bwd_hdim64_bf16_sm80.cu"),
+        ),
+        ("flash_api_jammi", jammi_dir.join("flash_api_jammi.cu")),
+    ];
+
     // ---- `-gencode` flags, one pair per [`GENCODE_ARCHES`] entry (see the
     // doc comment above): the SAME top-level literal array `main()` already
     // parsed to emit `JAMMI_FLASH_GENCODE_SMS`, so the compiled cubin set
     // and the env var `crate::flash::check_arch`/`crate::admission::
-    // flash_built_arches()` read can never drift apart — one array, two
+    // flash_validated_arches()` read can never drift apart — one array, two
     // readers.
+    //
+    // `nvcc_threads` bounds TOTAL front-end concurrency (round-2 audit
+    // finding A — see `--threads`'s own doc comment above for the full
+    // "this is a wall-time flag, not a memory mitigation" correction):
+    // this build spawns `tus.len()` (3) nvcc processes CONCURRENTLY, and
+    // `--threads N` further parallelizes EACH one internally, so the real
+    // simultaneous front-end count is `tus.len() * N`. Defaulting `N` to
+    // `available_parallelism() / tus.len()` keeps that PRODUCT close to
+    // the machine's own core count rather than a flat multiple of it (the
+    // old unconditional default of `4` gave `3 * 4 = 12` simultaneous
+    // front-ends regardless of how few cores/how little RAM the machine
+    // actually had — exactly what OOM'd the CI runner). `.max(1)`: even a
+    // single-core machine still gets ONE thread per TU, never zero.
+    // `$NVCC_THREADS`, when explicitly set to a positive integer, still
+    // overrides this unconditionally.
+    let cpu_parallelism = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
     let nvcc_threads: u32 = env::var("NVCC_THREADS")
         .ok()
         .and_then(|s| s.parse().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(4);
+        .unwrap_or_else(|| (cpu_parallelism / tus.len()).max(1) as u32);
     let common_flags: Vec<String> = ["-O3".to_string(), "-std=c++17".to_string()]
         .into_iter()
         .chain(["--threads".to_string(), nvcc_threads.to_string()])
@@ -662,18 +770,6 @@ fn build_flash_attn() {
         ])
         .collect();
 
-    let tus: [(&str, PathBuf); 3] = [
-        (
-            "flash_fwd_hdim64_bf16_sm80",
-            src_dir.join("flash_fwd_hdim64_bf16_sm80.cu"),
-        ),
-        (
-            "flash_bwd_hdim64_bf16_sm80",
-            src_dir.join("flash_bwd_hdim64_bf16_sm80.cu"),
-        ),
-        ("flash_api_jammi", jammi_dir.join("flash_api_jammi.cu")),
-    ];
-
     // ---- Compile the three TUs concurrently (they are independent; the
     // bwd TU alone is ~70 s on an A100 pod, the fwd ~45 s, the wrapper ~5 s
     // — measured on the OLD single-arch build; four gencodes each cost more
@@ -681,35 +777,58 @@ fn build_flash_attn() {
     // run records it, per the M3 plan's D1 cost note).
     //
     // Peak-RSS instrumentation (M3 plan v2 delta 5) is OPT-IN via
-    // `JAMMI_FLASH_MEASURE_RSS=1` -- SET on the CI flash-attn-compile lane
-    // (`.github/workflows/ci.yml`'s `flash-attn-compile` job, the container
-    // where the ~4x device-code-section memory cost the M3 gencode
-    // widening adds is the one place with genuinely tight RAM, unlike the
-    // pod) -- AND gated a SECOND way, on `/usr/bin/time` actually existing
-    // as a file: the opt-in env var alone is not enough to make wrapping
-    // safe, because unconditionally spawning a binary that might not exist
-    // (e.g. a base-image swap that drops the `time` package, or a
-    // still-macOS/BSD dev machine that sets the var by copy-pasting CI's
-    // env) would turn a missing-binary Cargo `spawn` failure into a hard
-    // build panic. The second, existence-based gate makes the env var a
-    // pure "try to measure if you can" request: if `/usr/bin/time` is
-    // absent, this silently falls back to the unwrapped `nvcc` invocation
-    // (no RSS captured, `parse_max_rss_kb` never even called) rather than
-    // failing the build either way. This crate's own CI image
-    // (`ghcr.io/f-inverse/jammi-ai-ci-cuda`) is the one machine shape this
-    // gate is actually enabled on today (see `ci.yml`'s own comment at that
-    // step) and is expected to ship GNU coreutils/`time`; if some OTHER
-    // `/usr/bin/time` (a non-GNU variant without real `-v` support) is ever
-    // present where this env var is set, its exact spawn/argv-parsing
-    // behavior for an unrecognised `-v` flag is NOT something this build
-    // verifies — the worst case this code path is DESIGNED to tolerate is
-    // "spawns fine, `-v`'s report line is simply absent from stderr", which
-    // `parse_max_rss_kb` already degrades to `None` for (its own
-    // documented best-effort contract); a variant that instead REFUSES to
-    // spawn at all is exactly the failure mode the existence check above
-    // does not protect against and this env var should stay off for.
-    let measure_rss =
-        env::var_os("JAMMI_FLASH_MEASURE_RSS").is_some() && Path::new("/usr/bin/time").is_file();
+    // `JAMMI_FLASH_MEASURE_RSS=1`.
+    //
+    // LIMITATION, stated honestly (round-2 audit finding B): this measures
+    // each TU's OWN per-child peak RSS (GNU `time -v`'s report, scoped to
+    // that ONE nvcc process and its descendants) — it does NOT, and
+    // structurally CANNOT, observe the AGGREGATE memory footprint across
+    // the `tus.len()` concurrently-spawned TUs. If all three TUs peak at
+    // the same instant (plausible — they are launched together), the real
+    // constraint on the host is close to the SUM of their three peaks, not
+    // any one child's own max, and a per-child sampler has no way to see
+    // that. This instrumentation is DIAGNOSTIC ONLY. The actual
+    // aggregate-memory safety mechanism is finding A's own fix above
+    // (bounding `nvcc_threads` so total front-end concurrency tracks the
+    // machine's own core count) — an earlier revision of this comment
+    // wrongly implied the RSS number here was what bounded the CI runner's
+    // memory; it never was.
+    //
+    // FAIL-OPEN, but only in ONE direction now (round-2 audit finding B):
+    // when `JAMMI_FLASH_MEASURE_RSS` is EXPLICITLY set, a missing
+    // `/usr/bin/time` is a LOUD BUILD ERROR below, not a silent skip — an
+    // explicit request to measure that silently measures nothing (because
+    // the image never installed the `time` package) defeats the entire
+    // point of turning this on and would go unnoticed indefinitely
+    // otherwise. Installing GNU `time` into this crate's own CI image is a
+    // Dockerfile change, out of THIS crate's scope; this panic is what
+    // makes that gap visible to whoever owns that image, the first time
+    // someone actually tries to use this flag there, rather than it
+    // silently doing nothing forever. The one case that STILL degrades to
+    // `None` (never panics) is a non-GNU `/usr/bin/time` that spawns
+    // successfully but does not emit `-v`'s report line — this build
+    // cannot distinguish that shape from "ran fine, GNU, this TU
+    // legitimately had nothing interesting to report" ahead of time, and
+    // failing the whole build over a diagnostic-only reading would be its
+    // own regression.
+    //
+    // Per-TU wall time (and RSS, when captured) is ALSO printed to this
+    // build script's own STDERR, unconditionally — never gated on
+    // `JAMMI_FLASH_MEASURE_RSS` — because `jammi_flash_build_times.txt`
+    // (written below too, kept for anyone who wants the raw file) has ZERO
+    // readers in this repo today (`pod_build_timings.sh` deny-lists it;
+    // round-2 audit finding B) and Cargo always forwards a build script's
+    // OWN stderr to the terminal, so this is what actually makes wall
+    // times visible in a CI log without needing `-vv` or any special flag.
+    let measure_rss = env::var_os("JAMMI_FLASH_MEASURE_RSS").is_some();
+    if measure_rss && !Path::new("/usr/bin/time").is_file() {
+        panic!(
+            "jammi-kernels `flash-attn`: JAMMI_FLASH_MEASURE_RSS is set but /usr/bin/time does \
+             not exist on this machine -- an explicit request to measure peak RSS that silently \
+             measures nothing defeats the point of setting it; install the `time` package \
+             (Debian/Ubuntu: `apt-get install time`) or unset JAMMI_FLASH_MEASURE_RSS"
+        );
+    }
     let started = Instant::now();
     let handles: Vec<_> = tus
         .iter()
@@ -761,6 +880,18 @@ fn build_flash_attn() {
     for h in handles {
         let (stem, obj, secs, stderr, peak_rss_kb) = h.join().expect("nvcc worker thread panicked");
         timing.push_str(&format!("{stem}: {secs:.1} s\n"));
+        // Unconditional stderr print (round-2 audit finding B) — a build
+        // script's own stderr is ALWAYS forwarded by Cargo to the
+        // terminal, unlike its stdout (captured/hidden unless the build
+        // fails or `-vv` is passed) or the `jammi_flash_build_times.txt`
+        // file below (zero readers in this repo today).
+        match peak_rss_kb {
+            Some(kb) => eprintln!(
+                "jammi-kernels flash-attn: {stem} wall={secs:.1}s peak_rss_kb={kb} \
+                 (per-child only, not the 3-TU aggregate — see this block's own doc)"
+            ),
+            None => eprintln!("jammi-kernels flash-attn: {stem} wall={secs:.1}s"),
+        }
         if let Some(kb) = peak_rss_kb {
             timing.push_str(&format!("{stem} peak_rss_kb: {kb}\n"));
         }
@@ -769,10 +900,14 @@ fn build_flash_attn() {
         }
         objs.push(obj);
     }
-    timing.push_str(&format!(
-        "wall ({} TUs concurrent, --threads {nvcc_threads}): {:.1} s\n",
+    let wall_s = started.elapsed().as_secs_f64();
+    eprintln!(
+        "jammi-kernels flash-attn: wall ({} TUs concurrent, --threads {nvcc_threads}) = {wall_s:.1}s",
         tus.len(),
-        started.elapsed().as_secs_f64()
+    );
+    timing.push_str(&format!(
+        "wall ({} TUs concurrent, --threads {nvcc_threads}): {wall_s:.1} s\n",
+        tus.len(),
     ));
     std::fs::write(out_dir.join("jammi_flash_build_times.txt"), &timing)
         .expect("write jammi_flash_build_times.txt");

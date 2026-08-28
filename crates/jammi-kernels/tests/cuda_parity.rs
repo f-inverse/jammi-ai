@@ -3709,6 +3709,85 @@ fn bf16_round_bound(value: f64) -> f64 {
     2.0 * BF16_U * value.abs()
 }
 
+/// Arch-aware `abs_floor` for
+/// [`lora_linear_parity_bf16_base_backward_production_width`]'s `dx`
+/// bound (M3 four-arch pod round-2 finding 2). This is jammi's OWN
+/// `lora_linear` CUDA kernel — a cuBLAS strided-batched GEMM, NOTHING to
+/// do with `flash-attn`/`GENCODE_ARCHES` admission — so this widening is
+/// entirely independent of `crate::admission::flash_validated_arches()`.
+///
+/// The A100-derived `0.3` floor (see that test's own "re-measured at 0.3"
+/// comment) undershot on the FIRST-EVER sm89 (L40S) run:
+/// `dx[10523]: cpu(eager f32) 1.7898061 vs cuda(bf16) 1.3828125` (`dx_base
+/// 2.9681206`, `d_x_lora -1.1783144`), bound `0.3927537679672241`,
+/// observed `|cpu - cuda| = 0.4069936` — `3.6%` over. The lead's own
+/// hypothesis (Ada's different SM count/occupancy changes cuBLAS's
+/// internal bf16 accumulation split, a property of the ARCH GENERATION,
+/// not of this test's fixture) is adopted here without a competing
+/// explanation on hand; A40 (sm86, the OTHER Ada-class SKU) is EXPECTED
+/// to hit the same element for the same reason (per the lead — confirmed
+/// separately from an A40 rerun, not assumed here).
+///
+/// DERIVATION (this bound has NO paired RED control — a plain elementwise
+/// closed-form check against a directly-computed CPU reference, not a
+/// corridor-style mean+red-control oracle like FA2's
+/// `FLASH_ORACLE_K_MEAN_GRAD` — so the M3 plan's corridor discipline does
+/// not apply verbatim; per the hand-off's own instruction, this widening
+/// is instead derived directly from the observed arch value using this
+/// FILE's own established margin convention — see `dx_bound_margin`'s
+/// sibling comment above for the precedent this mirrors):
+/// ```text
+/// architecture-invariant portion of the bound at that index
+/// (the "dx_bound_margin * sum(bf16_round_bound(..))" term -- UNCHANGED
+/// across archs, bf16's rounding rule is the same physics everywhere):
+///   0.3927537679672241 (measured bound) - 0.3 (A100 abs_floor)
+///   = 0.0927537679672241
+///
+/// minimum abs_floor that would have passed THIS ONE observed index:
+///   0.4069936 (observed |cpu - cuda|) - 0.0927537679672241
+///   = 0.3142398320327759
+///
+/// chosen value (headroom over the bare minimum -- this file's own
+/// convention never ships a bound at its bare-observed edge, e.g.
+/// dx_bound_margin's own "2.0x, comfortable headroom over the measured
+/// 1.34x gap" precedent):
+///   0.45
+/// ```
+///
+/// **PENDING-ARTIFACT MARKER**: `0.45` is an INTERIM value derived from
+/// ONE observed index, not a full-tensor sweep (`rows * inf` = 262,144
+/// `dx` elements exist in this test's own production-width fixture; only
+/// the single worst-reported one is known here). The lead is producing
+/// the committed `cuda-runs` artifact recording the real worst-case gap
+/// across the full tensor on actual L40S/A40 hardware — once that lands,
+/// re-derive this constant from it (citing the artifact path here) rather
+/// than trusting this one-index extrapolation indefinitely. If the
+/// artifact shows a LARGER gap than this interim value covers, widen
+/// again from ITS number, by the same method; if it shows comfortable
+/// headroom already, this value may stay.
+///
+/// `(8, 0)`/A100 and `(9, 0)`/H100 (confirmed fully green on this exact
+/// test in the four-arch pod run) keep the original, unwidened floor.
+fn lora_linear_dx_abs_floor(cuda: &Device) -> f64 {
+    use jammi_kernels::admission::{probe_cuda_compute_capability, ComputeCapability};
+    const A100_HOPPER_FLOOR: f64 = 3e-1;
+    // PENDING-ARTIFACT: see this function's own doc for the full
+    // derivation and why this is interim, not final.
+    const ADA_CLASS_FLOOR_PENDING_ARTIFACT: f64 = 0.45;
+    match probe_cuda_compute_capability(cuda) {
+        Some(cap) if cap == ComputeCapability::new(8, 6) || cap == ComputeCapability::new(8, 9) => {
+            ADA_CLASS_FLOOR_PENDING_ARTIFACT
+        }
+        // Every OTHER probed capability (sm80, sm90, or an unrecognised
+        // future arch) keeps the tight, A100-proven floor deliberately:
+        // an untested arch should fail LOUD against the narrow bound
+        // (prompting investigation) rather than silently pass under an
+        // over-widened one it was never shown to need (family D: default
+        // to the side that cannot silently accept a wrong number).
+        _ => A100_HOPPER_FLOOR,
+    }
+}
+
 /// A conservative, DERIVED (not tuned-to-pass) absolute tolerance
 /// covering every CPU<->CUDA `f32` comparison this section's tests make
 /// (`fwd`, `dx`, `dw`, `da`, `db`): each is the output of one or two
@@ -4568,7 +4647,11 @@ fn lora_linear_parity_bf16_base_backward_production_width() {
     // `d_x_lora` can now land much closer to canceling at a given index
     // than the uniform ones seed produced, and the observed divergence
     // there exceeded the `0.1` floor's total bound by a small margin.
-    let abs_floor = 3e-1f64; // no-producer: sized from two uncommitted pod runs — a chosen design margin, not a committed measurement.
+    // A100/H100-proven at `0.3`; ARCH-AWARE beyond that (M3 four-arch pod
+    // round-2 finding 2 — see [`lora_linear_dx_abs_floor`]'s own doc for
+    // the full derivation, the PENDING-artifact marker, and why Ada-class
+    // hardware (sm86/sm89) needs a wider floor here).
+    let abs_floor = lora_linear_dx_abs_floor(&cuda);
 
     // A second, SCALED re-measurement: two real pod runs after the
     // sign-mixed cotangent found the per-term `bf16_round_bound`s

@@ -35,7 +35,7 @@ use candle_core::{DType, Device, Module, Tensor, D};
 use candle_nn::{embedding, linear_no_bias, Embedding, VarBuilder, VarMap};
 use jammi_kernels::admission::{
     admission_mode, admit, admit_cascade, cascade_counters_for, counters_for, device_is_supported,
-    flash_built_arches, op_disabled, probe_cuda_compute_capability, CascadeOutcome,
+    flash_validated_arches, op_disabled, probe_cuda_compute_capability, CascadeOutcome,
     ComputeCapability, DispatchCounters, DispatchOutcome, PredicateOutcome,
 };
 use jammi_kernels::ops::{
@@ -1728,17 +1728,23 @@ impl ModernBertMlp {
 const FLASH_HEAD_DIM: usize = 64;
 
 /// The CUDA compute capability set the flash cascade admits — MEMBERSHIP
-/// in [`flash_built_arches`] (`jammi_kernels::admission`'s own reader for
-/// `build.rs`'s compiled `-gencode` set: sm80/86/89/90 today), never `>=`
-/// and never major-compat. Membership is exact and enumerated (M3 plan
-/// D2): admitting a capability outside the compiled set would either fail
-/// the CUDA driver's module load (a genuinely newer major the driver has
-/// no SASS for at all, e.g. a hypothetical sm100 — SASS is NOT
-/// forward-compatible across majors) or, for a minor the driver COULD
+/// in [`flash_validated_arches`] (`jammi_kernels::admission`'s own reader
+/// for `build.rs`'s VALIDATED subset of its compiled `-gencode` set:
+/// sm80/86/89/90 today — round-2 audit finding C: this crate's own fence
+/// reads the validated set, never `flash_built_arches()`'s merely-compiled
+/// one, precisely because "compiled" alone was proven an insufficient
+/// admission criterion — see `flash_validated_arches`'s own doc), never
+/// `>=` and never major-compat. Membership is exact and enumerated (M3
+/// plan D2): admitting a capability outside the validated set would
+/// either fail the CUDA driver's module load (a genuinely newer major the
+/// driver has no SASS for at all, e.g. a hypothetical sm100 — SASS is NOT
+/// forward-compatible across majors), or, for a minor the driver COULD
 /// SASS-forward from (an untested sibling minor within an already-admitted
-/// major), silently run bytes this crate never validated on real hardware
-/// (M3 plan D1's per-arch parity-leg invariant: compiled == admitted only
-/// once a green pod leg exists for that EXACT arch).
+/// major), silently run bytes this crate never validated on real
+/// hardware, or (the case the compiled/validated split now also catches)
+/// dispatch to an arch that DID compile but has no green pod parity leg
+/// yet (M3 plan D1's per-arch parity-leg invariant: compiled == validated
+/// only once that leg exists for that EXACT arch).
 ///
 /// An earlier revision of this doc claimed a device above sm80 "would
 /// crash at launch" unconditionally; that was WRONG in general — SASS
@@ -1756,18 +1762,21 @@ const FLASH_HEAD_DIM: usize = 64;
 /// `cuda` feature off, or a query failure — degrades to `false`, never a
 /// panic or a silently-wrong "yes").
 fn flash_arch_ok(device: &Device) -> bool {
-    arch_admitted(probe_cuda_compute_capability(device), flash_built_arches())
+    arch_admitted(
+        probe_cuda_compute_capability(device),
+        flash_validated_arches(),
+    )
 }
 
 /// Pure core of [`flash_arch_ok`]: `probed` (already resolved by
 /// [`probe_cuda_compute_capability`]) is admitted iff it names a member of
-/// `built` — threaded as a parameter, not read from [`flash_built_arches`]
-/// directly, so this is unit-testable against a literal `built` slice
-/// without a real CUDA device (the same probe/pure-core split
-/// `jammi_kernels::flash::arch_mismatch` uses).
-fn arch_admitted(probed: Option<ComputeCapability>, built: &[ComputeCapability]) -> bool {
+/// `validated` — threaded as a parameter, not read from
+/// [`flash_validated_arches`] directly, so this is unit-testable against a
+/// literal `validated` slice without a real CUDA device (the same
+/// probe/pure-core split `jammi_kernels::flash::arch_mismatch` uses).
+fn arch_admitted(probed: Option<ComputeCapability>, validated: &[ComputeCapability]) -> bool {
     match probed {
-        Some(cap) => built.contains(&cap),
+        Some(cap) => validated.contains(&cap),
         None => false,
     }
 }
@@ -2034,7 +2043,7 @@ fn compute_lengths_and_prefix(mask: &Tensor) -> Result<(Vec<usize>, bool), Encod
 
 /// The flash cascade's own admission predicate (contract v4 §3.2's
 /// consulted terms): device is CUDA and arch is a MEMBER of
-/// `jammi_kernels::admission::flash_built_arches()` ([`flash_arch_ok`]),
+/// `jammi_kernels::admission::flash_validated_arches()` ([`flash_arch_ok`]),
 /// backbone dtype `BF16`, `head_dim ==
 /// `[`FLASH_HEAD_DIM`]``, `flash-attn` compiled (`cfg!` TERM — L10, a
 /// [`PredicateOutcome::CapabilityMiss`], never `#[cfg]` on the call site),
@@ -2122,7 +2131,7 @@ fn flash_capability_gates(
     if !flash_arch_ok(device) {
         return Some((
             PredicateOutcome::CapabilityMiss,
-            "arch_in_flash_compiled_set",
+            "arch_in_flash_validated_set",
             None,
         ));
     }
@@ -3170,31 +3179,31 @@ mod tests {
     }
 
     /// The membership half [`flash_arch_ok_rejects_cpu`] does not cover:
-    /// every capability [`flash_built_arches`] actually reports IS admitted
-    /// (via the pure [`arch_admitted`] core, so this needs no real CUDA
-    /// device — see that function's own doc). On this crate's own default
-    /// test build (`flash-attn` off), `flash_built_arches()` is `&[]`
-    /// (M3 plan v2 delta 3), so the loop below is vacuous here and the
-    /// meaningful assertion is the second half: a capability PROVABLY
-    /// outside today's compiled set (one major below the enumerated floor)
-    /// is never admitted. On a `flash-attn`-compiled build (pod-only), the
-    /// loop exercises the real, non-empty set.
+    /// every capability [`flash_validated_arches`] actually reports IS
+    /// admitted (via the pure [`arch_admitted`] core, so this needs no
+    /// real CUDA device — see that function's own doc). On this crate's
+    /// own default test build (`flash-attn` off), `flash_validated_arches()`
+    /// is `&[]` (M3 plan v2 delta 3), so the loop below is vacuous here
+    /// and the meaningful assertion is the second half: a capability
+    /// PROVABLY outside today's validated set (one major below the
+    /// enumerated floor) is never admitted. On a `flash-attn`-compiled
+    /// build (pod-only), the loop exercises the real, non-empty set.
     #[test]
-    fn flash_arch_ok_admits_every_built_arch() {
-        let built = flash_built_arches();
-        for &cap in built {
+    fn flash_arch_ok_admits_every_validated_arch() {
+        let validated = flash_validated_arches();
+        for &cap in validated {
             assert!(
-                arch_admitted(Some(cap), built),
-                "{cap:?} must be admitted -- it is in flash_built_arches()"
+                arch_admitted(Some(cap), validated),
+                "{cap:?} must be admitted -- it is in flash_validated_arches()"
             );
         }
         let outside = ComputeCapability::new(7, 5);
         assert!(
-            !built.contains(&outside),
-            "fixture value must stay outside today's compiled set"
+            !validated.contains(&outside),
+            "fixture value must stay outside today's validated set"
         );
-        assert!(!arch_admitted(Some(outside), built));
-        assert!(!arch_admitted(None, built));
+        assert!(!arch_admitted(Some(outside), validated));
+        assert!(!arch_admitted(None, validated));
     }
 
     /// L7-equivalent + L10: on this build (no `cuda`/`flash-attn` feature,
@@ -5469,7 +5478,7 @@ mod tests {
     /// `jammi-kernels` compiled with `flash-attn`?) AND (M1b delta re-audit
     /// finding F1-sibling, widened by the M3 plan) `device`'s own compute
     /// capability is a MEMBER of `jammi_kernels::admission::
-    /// flash_built_arches()` ([`flash_arch_ok`]) -- the `flash-attn` build's
+    /// flash_validated_arches()` ([`flash_arch_ok`]) -- the `flash-attn` build's
     /// kernels are compiled for an ENUMERATED arch set (sm80/86/89/90
     /// today, same class the bench gate's own wrong-arch bug was, just
     /// widened from a single exact match to set membership), so a
@@ -5498,11 +5507,11 @@ mod tests {
             if flash_arch_ok(device) {
                 return true;
             }
-            let built = flash_built_arches();
+            let built = flash_validated_arches();
             if std::env::var_os("JAMMI_REQUIRE_FLASH").is_some() {
                 panic!(
                     "{test_name}: JAMMI_REQUIRE_FLASH is set but this device's compute \
-                     capability {:?} is not a member of the flash build's compiled arch set \
+                     capability {:?} is not a member of the flash build's validated arch set \
                      {built:?} (see flash_arch_ok's own doc) -- this lane must run the real \
                      flash arm, not skip it",
                     probe_cuda_compute_capability(device)
@@ -5510,7 +5519,7 @@ mod tests {
             }
             eprintln!(
                 "{test_name}: skipping — device compute capability {:?} is not a member of the \
-                 flash build's compiled arch set {built:?}; see flash_arch_ok's own doc",
+                 flash build's validated arch set {built:?}; see flash_arch_ok's own doc",
                 probe_cuda_compute_capability(device)
             );
             return false;
@@ -5590,7 +5599,7 @@ mod tests {
     /// build to compile (`FLASH_COMPILED` must be `true` to even REACH the
     /// arch check): passing `&Device::Cpu` makes
     /// [`flash_arch_ok`]/`probe_cuda_compute_capability` deterministically
-    /// report "not a member of the compiled arch set" WITHOUT needing real
+    /// report "not a member of the validated arch set" WITHOUT needing real
     /// off-arch hardware (a V100, sm70, or a Jetson Orin, sm87 -- an L40S
     /// or H100 no longer illustrates a mismatch here: the M3 plan's D1
     /// widened the compiled set to include sm89/sm90) to prove the branch
@@ -5613,7 +5622,7 @@ mod tests {
         std::env::remove_var("JAMMI_REQUIRE_FLASH");
         let err = result.expect_err(
             "flash_compiled_or_skip must panic when JAMMI_REQUIRE_FLASH is set and the device \
-             is not a member of the compiled arch set (Device::Cpu deterministically fails \
+             is not a member of the validated arch set (Device::Cpu deterministically fails \
              flash_arch_ok)",
         );
         let msg = err
@@ -6308,6 +6317,94 @@ mod tests {
         free as f64 / (1024.0 * 1024.0)
     }
 
+    /// The SAME `cuMemGetInfo` driver call [`cuda_free_mib`] makes, reading
+    /// the OTHER half of its `(free, total)` pair — this device's TOTAL
+    /// installed memory in MiB, a fixed hardware property (not a
+    /// currently-free reading). [`vram_capable_or_skip`]'s own probe.
+    #[cfg(feature = "cuda")]
+    fn cuda_total_mib(device: &Device) -> f64 {
+        device
+            .synchronize()
+            .expect("device sync before mem_get_info");
+        let (_free, total) = candle_core::cuda_backend::cudarc::driver::result::mem_get_info()
+            .expect("cuMemGetInfo_v2 failed");
+        total as f64 / (1024.0 * 1024.0)
+    }
+
+    /// Pod finding 1 (round-2, lead's own on-hardware evidence): a floor
+    /// on this device's TOTAL memory below which the four 80GB-class
+    /// encoder-level real-checkpoint oracles
+    /// (`flash_arm_encoder_level_three_way_oracle_dense_cuda_bf16` + its
+    /// three RED controls) are structurally unable to run — see
+    /// [`vram_capable_or_skip`]'s own doc for the fixture evidence.
+    ///
+    /// 64 GiB: comfortably above the CONFIRMED-insufficient 48 GiB tier
+    /// (L40S/A40 — both OOM'd at model-load with an otherwise EMPTY
+    /// device, `0` MiB used, no zombie process, even under a SERIALIZED
+    /// `--test-threads=1` solo rerun — a genuine capability ceiling, not a
+    /// concurrency artifact or a leak) and comfortably below the
+    /// CONFIRMED-sufficient 80 GiB tier (A100/H100, fully green on every
+    /// leg including these four). No number tighter than this two-SKU
+    /// bracket has actually been measured (a solo run's own peak VRAM was
+    /// never sampled in isolation — only the pass/fail boundary at these
+    /// two real SKU tiers is known), so this floor is a reasoned midpoint
+    /// between two confirmed data points, not a precisely-derived one; a
+    /// future SKU landing between 48 and 80 GiB would need its own real
+    /// measurement to place this floor more precisely.
+    #[cfg(feature = "cuda")]
+    const FLASH_ORACLE_ENCODER_LEVEL_VRAM_FLOOR_MIB: f64 = 64.0 * 1024.0;
+
+    /// Capability gate for the four 80GB-class encoder-level real-checkpoint
+    /// oracles — NOT an admission-fence concern (this has nothing to do
+    /// with `jammi_kernels::admission::flash_validated_arches()`/arch
+    /// admission; it is a VRAM-CAPACITY requirement on one specific test
+    /// FIXTURE). Round-2 pod finding 1: these four tests ran as four
+    /// CONCURRENT threads and all died with `CUDA_ERROR_OUT_OF_MEMORY` at
+    /// model-load; a SERIALIZED (`--test-threads=1`) solo rerun STILL
+    /// OOM'd on both L40S and A40 with the device otherwise fully empty —
+    /// refuting an earlier concurrency-lock theory. The actual cause is
+    /// already documented on [`flash_oracle_measure_arm`]: "production-scale
+    /// ModernBERT-large (28 layers, hidden=1024) at forward+backward is
+    /// real training-step memory, and holding more than one arm's graph
+    /// alive at once OOM'd on an 80GB A100, confirmed live" — this
+    /// fixture's footprint is 80GB-CLASS BY DESIGN, not a bug; a 48 GiB
+    /// SKU is STRUCTURALLY unable to run it, the same class of limit as a
+    /// device below compute capability 8.0 being unable to run bf16
+    /// tensor-core kernels at all.
+    ///
+    /// Returns `true` (caller proceeds) iff the device's TOTAL memory
+    /// meets [`FLASH_ORACLE_ENCODER_LEVEL_VRAM_FLOOR_MIB`]. FAIL-CLOSED
+    /// semantics, mirroring [`flash_compiled_or_skip`]'s own convention:
+    /// - Below the floor: ALWAYS skips, with a VRAM-specific named reason
+    ///   distinct from `flash_oracle_require_gate`'s model-dir-missing
+    ///   message — this fires REGARDLESS of `JAMMI_REQUIRE_FLASH_ORACLE`.
+    ///   Forcing this onto genuinely incapable hardware would be
+    ///   dishonest, not strict: the require-gate's OWN purpose (catch a
+    ///   lane that silently skipped on hardware that COULD have run it)
+    ///   does not apply to a lane that is structurally incapable — there
+    ///   is no "just try harder" available on a 48 GiB card.
+    /// - At or above the floor: ALWAYS proceeds — this function never
+    ///   itself skips a capable device, so `JAMMI_REQUIRE_FLASH_ORACLE`'s
+    ///   unrun-is-RED force still applies on genuinely 80GB-class lanes
+    ///   (A100, H100) via the caller's OTHER gates
+    ///   (`flash_oracle_require_gate`/`flash_compiled_or_skip`, both
+    ///   already run before this one at every call site).
+    #[cfg(feature = "cuda")]
+    fn vram_capable_or_skip(test_name: &str, device: &Device) -> bool {
+        let total_mib = cuda_total_mib(device);
+        if total_mib >= FLASH_ORACLE_ENCODER_LEVEL_VRAM_FLOOR_MIB {
+            return true;
+        }
+        eprintln!(
+            "{test_name}: skipping — device total memory {total_mib:.0} MiB is below this \
+             fixture's {FLASH_ORACLE_ENCODER_LEVEL_VRAM_FLOOR_MIB:.0} MiB floor; this is an \
+             80GB-class real-checkpoint oracle BY DESIGN (flash_oracle_measure_arm's own doc: \
+             holding one arm's full ModernBERT-large fwd+bwd graph alive needs 80GB-class VRAM) \
+             -- a 48GB-class SKU is structurally unable to run it, not merely slow at it"
+        );
+        false
+    }
+
     /// Per-layer VRAM attribution probe (numerics write-owner round closing
     /// the flash-arm peak-VRAM BLOCK). CORRECTED CLAIM (M1b delta re-audit
     /// finding, advisory): this does NOT mirror
@@ -6424,18 +6521,44 @@ mod tests {
         let Some(cuda) = growth_oracle_cuda_device() else {
             return;
         };
+        // Class-sweep addition (round-2 pod finding 1's own enumeration,
+        // beyond the four tests the fix was originally scoped to): this
+        // test builds a REAL ModernBERT-large model at the SAME (8, 512)
+        // shape as the four gated tests and calls a REAL `.backward()`
+        // (twice — once per `[(false, "flash"), (true, "block")]` arm,
+        // each with its own fresh model) — the identical 80GB-class
+        // fwd+bwd profile `vram_capable_or_skip`'s own doc names, even
+        // though this test does not go through `flash_oracle_measure_arm`
+        // itself. Gated for the same reason, not merely by analogy.
+        //
+        // KO-7 note: combined into ONE `if`/`return` (rather than two
+        // sequential ones) so this single skip point's own text still
+        // contains a call to the REGISTERED `flash_compiled_or_skip`
+        // (`ci/kernel-oracle-helpers.txt`) — `vram_capable_or_skip` itself
+        // is deliberately NOT registrable there (it has no
+        // `JAMMI_REQUIRE_*`-gated panic branch at all: per this finding's
+        // own fail-closed requirement, a capability-incapable device must
+        // NEVER panic under any REQUIRE flag, which is the opposite of
+        // the registry's canonical require-gate shape). `||` short-circuits
+        // left-to-right: `flash_compiled_or_skip` still enforces
+        // `JAMMI_REQUIRE_FLASH` exactly as it always has; `vram_capable_or_skip`
+        // is a genuinely ADDITIONAL, never-forceable gate evaluated only
+        // when the first one passes.
+        if !flash_compiled_or_skip(
+            "flash_vs_block_per_layer_vram_attribution_probe_cuda",
+            &cuda,
+        ) || !vram_capable_or_skip(
+            "flash_vs_block_per_layer_vram_attribution_probe_cuda",
+            &cuda,
+        ) {
+            return;
+        }
         let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _d2h_guard = FLASH_D2H_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if !flash_compiled_or_skip(
-            "flash_vs_block_per_layer_vram_attribution_probe_cuda",
-            &cuda,
-        ) {
-            return;
-        }
 
         let dir = std::path::PathBuf::from(&model_dir);
         let config: ModernBertConfig =
@@ -6512,18 +6635,26 @@ mod tests {
         let Some(cuda) = growth_oracle_cuda_device() else {
             return;
         };
+        // KO-7 note: see `flash_vs_block_per_layer_vram_attribution_probe_cuda`'s
+        // own comment for why this is ONE compound `if`/`return` rather
+        // than two sequential ones (the registered `flash_compiled_or_skip`
+        // call must be textually present in this single skip's own
+        // window; `vram_capable_or_skip` is deliberately unregistrable).
+        if !flash_compiled_or_skip(
+            "flash_arm_encoder_level_three_way_oracle_dense_cuda_bf16",
+            &cuda,
+        ) || !vram_capable_or_skip(
+            "flash_arm_encoder_level_three_way_oracle_dense_cuda_bf16",
+            &cuda,
+        ) {
+            return;
+        }
         let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _d2h_guard = FLASH_D2H_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if !flash_compiled_or_skip(
-            "flash_arm_encoder_level_three_way_oracle_dense_cuda_bf16",
-            &cuda,
-        ) {
-            return;
-        }
 
         let dir = std::path::PathBuf::from(&model_dir);
         let config: ModernBertConfig =
@@ -6620,18 +6751,23 @@ mod tests {
         let Some(cuda) = growth_oracle_cuda_device() else {
             return;
         };
+        // KO-7 note: see `flash_vs_block_per_layer_vram_attribution_probe_cuda`'s
+        // own comment for why this is ONE compound `if`/`return`.
+        if !flash_compiled_or_skip(
+            "flash_arm_encoder_level_oracle_red_control_window_dropped",
+            &cuda,
+        ) || !vram_capable_or_skip(
+            "flash_arm_encoder_level_oracle_red_control_window_dropped",
+            &cuda,
+        ) {
+            return;
+        }
         let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _d2h_guard = FLASH_D2H_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if !flash_compiled_or_skip(
-            "flash_arm_encoder_level_oracle_red_control_window_dropped",
-            &cuda,
-        ) {
-            return;
-        }
 
         let dir = std::path::PathBuf::from(&model_dir);
         let config: ModernBertConfig =
@@ -6704,6 +6840,9 @@ mod tests {
         let Some(cuda) = growth_oracle_cuda_device() else {
             return;
         };
+        if !vram_capable_or_skip(label, &cuda) {
+            return;
+        }
         let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());

@@ -19,7 +19,6 @@
 //! subprocess.
 
 #[path = "../build.rs"]
-#[allow(dead_code)]
 mod build_script;
 
 use build_script::{

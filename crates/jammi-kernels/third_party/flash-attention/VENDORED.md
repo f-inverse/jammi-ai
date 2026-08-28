@@ -173,12 +173,21 @@ admitted arch — M3 plan D1), archived by `ar` into
 -Ishim -I<cutlass>/include -Isrc -Ijammi
 ```
 
-- `--threads <N>` is nvcc's own internal parallel-compilation flag (CUDA
-  >= 11.5; this build's toolkit floor, CUDA >= 11.8 for the `sm_90` pair,
-  already exceeds it), splitting each TU's own compile across `N` host
-  threads to mitigate the ~4× device-code-section cost the four `-gencode`
-  pairs add over the single-arch build this replaced. Overridable via
-  `$NVCC_THREADS` (e.g. a CI lane with fewer vCPUs than the pod default).
+- `--threads <N>` is nvcc's own internal flag (CUDA >= 11.2, corrected —
+  an earlier revision of this line said 11.5; this build's toolkit floor,
+  CUDA >= 11.8 for the `sm_89`/`sm_90` pairs, already exceeds either)
+  that parallelizes nvcc's PER-ARCHITECTURE compilation STEPS *within*
+  one TU. This is a WALL-TIME flag, NOT a memory optimization (round-2
+  audit finding A: an earlier revision of this line claimed it
+  "mitigates" this build's memory cost — backwards: this build ALSO
+  spawns its three TUs as concurrent processes, so a flat default of `4`
+  regardless of TU count gave `3 × 4 = 12` simultaneous nvcc front-ends,
+  each with its own footprint — exactly what OOM'd the 16 GB
+  `ubuntu-latest` CI runner this crate's own flash-attn-compile lane
+  uses). `N` now defaults to `available_parallelism() / 3` (this build's
+  own TU count), bounding TOTAL front-end concurrency to roughly the
+  machine's own core count. Overridable via `$NVCC_THREADS` (a caller who
+  has measured their own headroom keeps full control).
 - `--use_fast_math` is the crate's ONE fast-math translation-unit group.
   `src/cuda/*.cu` (the crate's own PTX kernels) are built without it
   (`build.rs::build_cuda`). Upstream ships every FlashAttention-2 wheel with
@@ -215,12 +224,24 @@ This build compiles NATIVE cubins for the enumerated set
 `(8, 0)`/`(8, 6)`/`(8, 9)`/`(9, 0)`) — one `-gencode
 arch=compute_XX,code=sm_XX` pair per arch, never a bare `code=compute_XX`
 (embedded PTX) entry for any of them. The ABI hard-refuses
-(`JAMMI_FLASH_ERR_COMPUTE_CAPABILITY`) below compute capability 8.0; the
-Rust side (`crate::flash::check_arch`, and every fence site that reads
-`crate::admission::flash_built_arches()` — `jammi-encoders::modernbert`'s
-`flash_arch_ok`, `jammi-bench`'s `flash_capable_cuda`) additionally
-refuses any device OUTSIDE this exact enumerated set — set membership,
-never `>=`, never major-compat (M3 plan D2).
+(`JAMMI_FLASH_ERR_COMPUTE_CAPABILITY`) below compute capability 8.0.
+
+**COMPILED is not ADMITTED (round-2 audit finding C — this distinction is
+now a real type, not prose):** `build.rs` ALSO tracks a separate,
+NARROWER `VALIDATED_SMS` const — the subset of `GENCODE_ARCHES` with an
+actual green per-arch pod parity leg. Every fence site
+(`crate::flash::check_arch`, `jammi-encoders::modernbert`'s
+`flash_arch_ok`, `jammi-bench`'s `flash_capable_cuda`) reads
+`crate::admission::flash_validated_arches()` — the VALIDATED set — never
+`flash_built_arches()`'s merely-compiled one. An EARLIER revision of this
+crate had no such split: `-gencode arch=compute_100,code=sm_100` added to
+`GENCODE_ARCHES` alone (a round-2 audit experiment) was ADMITTED the
+instant it compiled, because every fence read the compiled set directly —
+"compiled implies proven" was never actually asserted anywhere. Adding a
+`-gencode` pair now leaves that arch compiled-but-REFUSED until its OWN
+entry lands in `VALIDATED_SMS`, in the SAME commit as its per-arch pod
+parity artifact (table below). Refusal is set membership against the
+VALIDATED set — never `>=`, never major-compat (M3 plan D2).
 
 **CORRECTED MECHANISM** (an earlier revision of this section claimed a
 device above sm80 "simply cannot load this module at all" — wrong for
@@ -247,13 +268,13 @@ jammi does **not** rely on that forward-compat path, deliberately (M3 plan
 D1): every arch in the compiled set gets its OWN native `-gencode` entry
 and its OWN pod parity leg (table below), rather than admitting 8.6/8.9 on
 the strength of an untested "SASS should still work here" argument. This
-keeps the fence a single equality (device capability ∈ compiled set) that
+keeps the fence a single equality (device capability ∈ VALIDATED set) that
 the Rust check, the encoders/bench fence sites, and this table all read
 the same way, and it means every byte the fleet actually executes has a
 committed values-parity run on that EXACT silicon, not "upstream says this
 should work". Still no `code=compute_XX` PTX anywhere in this build: an
 unknown future arch (e.g. a hypothetical `sm_100`) gets a typed refusal
-(`FlashError::Arch` / `jammi-encoders`'s `"arch_in_flash_compiled_set"`
+(`FlashError::Arch` / `jammi-encoders`'s `"arch_in_flash_validated_set"`
 decline), never unvalidated JIT.
 
 F1 (bwd tile selection — unaffected by the arch-set widening, restated
@@ -270,18 +291,21 @@ forward uses one 128×128, 4-warp config on every arch
 (`src/flash_fwd_launch_template.h:181-198` has no arch branch for the
 no-dropout path this crate's ABI takes).
 
-Per-arch validation status (**compiled ≠ admitted** until a green pod
-parity leg exists on that exact arch — M3 plan D4; this table is the
-single source `check_arch`/`flash_built_arches()`'s callers should be
-cross-checked against when reasoning about what has ACTUALLY been proven,
-as opposed to merely compiled):
+Per-arch validation status (**compiled ≠ validated** until a green pod
+parity leg exists on that exact arch — M3 plan D4; `build.rs::
+VALIDATED_SMS` is the actual admitted set every fence reads, and this
+table is the evidence pointer for each of its entries — the single source
+to cross-check when reasoning about what has ACTUALLY been proven, as
+opposed to merely compiled):
 
 | arch | compute cap | bwd tile path (F1) | pod parity leg | status |
 |---|---|---|---|---|
-| sm80 (A100) | `(8, 0)` | 128×128 | `tests/flash_smoke.rs` + `flash_op_oracles.rs`, A100-SXM4-80GB | PENDING revalidation — the landing proof this cites PREDATES the M3 4-gencode build shape (it ran against the single-`-gencode` build; `--threads`, `-Xptxas -v`, and three sibling device-code sections are all NEW to the object nvcc now emits for this same TU). Per M3 plan step 9(1), the FIRST pod leg after this PR rebuilds with all four gencodes and re-runs this exact suite on A100 before this cell reads VALIDATED again — the sm80 SASS bytes are expected to be unchanged, but that is an expectation to re-prove, not to assume |
-| sm86 (A40) | `(8, 6)` | 64×128 | A40 leg (`runpod_lib.sh`'s `rp_deploy_arch`, cheapest SKU) | PENDING — this agent's own pass is hermetic-only (no pod access); fallback per M3 plan D4/v2-delta-1 if A40 capacity blocks: drop `sm_86` from `GENCODE_ARCHES` (typed refusal) rather than ship an unvalidated cubin |
-| sm89 (L40S) | `(8, 9)` | 64×128 | L40S leg | PENDING — same hand-off note |
-| sm90 (H100) | `(9, 0)` | 128×128 | H100 leg | PENDING — same hand-off note; also proves the `sm_90` gencode loads at all (a genuinely different major, not merely a forward-compat question) |
+| sm80 (A100) | `(8, 0)` | 128×128 | Full four-gencode-build suite, ALL legs (`flash_smoke.rs`, `flash_op_oracles.rs`, the padded 8-seed encoder-level oracle + all three RED controls, `cuda_parity.rs`'s flash-relevant legs, bench legs) | **VALIDATED** — fully green on the rebuilt 4-gencode object, confirmed by a real pod run against this branch's tip (superseding this cell's own earlier PENDING-revalidation placeholder) |
+| sm86 (A40) | `(8, 6)` | 64×128 | `flash_smoke.rs` + `flash_op_oracles.rs` + bench legs + the padded 8-seed encoder-level oracle (all three RED controls) — green. The FOUR 80GB-class encoder-level real-checkpoint tests (`flash_arm_encoder_level_three_way_oracle_dense_cuda_bf16` + its three RED controls) capability-SKIP here (named VRAM-floor reason, `vram_capable_or_skip`) rather than running — that fixture's own doc states its footprint is 80GB-class BY DESIGN (`flash_oracle_measure_arm`'s "holding more than one arm's graph alive at once OOM'd on an 80GB A100, confirmed live"), so a 48GB SKU structurally cannot run it | **VALIDATED for flash-attn admission**, with the coverage caveat above — the 80GB-class legs are proven ONLY on sm80/sm90. `cuda_parity.rs`'s OWN `lora_linear` bf16-backward parity bound needed a separate, arch-aware widening on this tile class (unrelated to flash-attn/`GENCODE_ARCHES` admission — a different jammi kernel entirely) — see that test's own doc and this PR's hand-off for its status; it does NOT gate this cell |
+| sm89 (L40S) | `(8, 9)` | 64×128 | Same leg set/coverage as sm86 (A40) — identical 64×128 tile class | **VALIDATED for flash-attn admission**, same coverage caveat and `lora_linear` cross-reference as sm86 |
+| sm90 (H100) | `(9, 0)` | 128×128 | Full four-gencode-build suite, ALL legs, INCLUDING the 80GB-class encoder-level tests (H100 SKUs used are 80GB-class, so no VRAM-floor skip fires here) | **VALIDATED** — fully green, also proves the `sm_90` gencode loads at all (a genuinely different major, not merely a forward-compat question) |
+
+Note: sm86/sm89's rows above describe the pod's own confirmed-green evidence for the flash-attn arch fence specifically; the VRAM-floor skip (Finding 1) and the `lora_linear` bound (Finding 2) are BOTH fixed in the same commit as this table update but have not yet had a SECOND pod pass confirm them on real sm86/89 hardware — the lead's own next pod loop re-validates both. If that pass finds either fix insufficient, this table (and `VALIDATED_SMS`) is the first thing to revert.
 
 ### `ptxas -v` register/spill counts
 
@@ -334,16 +358,26 @@ throughout — an earlier revision of this line wrongly said "+ compute_80
 PTX", contradicting that rule). `nvcc` emitted 0 warnings.
 
 The build spike (same flags, single-threaded, otherwise idle pod) measured
-fwd TU 44 s / 2.9 GB RSS, bwd TU 70 s, 0 warnings, 0 ptxas spills.
+fwd TU 44 s / 2.9 GB RSS, bwd TU 70 s, 0 warnings, **0 ptxas spills on
+sm_80 ONLY** (this line is the pre-M3, single-`-gencode` build spike's own
+number — round-2 audit advisory: labeled explicitly here to avoid reading
+as evidence for the NEW 4-arch `ptxas -v` table below, which is a
+genuinely separate, still-unmeasured PLACEHOLDER; sm80's spill count
+carries no information about sm86/89/90's own, independently-compiled
+SASS).
 
-**4-arch build (M3, `--threads 4` default): TBD, measured at pod phase.**
+**4-arch build (M3, `--threads` default now `available_parallelism() / 3`,
+not a flat `4` — round-2 audit finding A): TBD, measured at pod phase.**
 D1's cost estimate is ~4× the device-code-section wall above per TU before
-`--threads` mitigation; the pod-phase agent re-runs this table (wall AND,
-when `JAMMI_FLASH_MEASURE_RSS=1` is set for the CI flash-attn-compile
-lane's own re-measurement, peak RSS per TU — see `build.rs::build_flash_attn`'s
-own doc for why that instrumentation is opt-in rather than autodetected)
-and records the new archive size (`libjammi_flash.a` grows with the
-device-code-section count) here.
+`--threads`'s own front-end parallelism absorbs some of it (see
+`--threads`'s own doc above for why it is a WALL-TIME knob, not a memory
+one); the pod-phase agent re-runs this table (wall — printed to
+`build.rs`'s own stderr unconditionally now, see finding B's fix — and,
+when `JAMMI_FLASH_MEASURE_RSS=1` is explicitly set on a machine with GNU
+`time` installed, per-TU peak RSS, which is diagnostic/per-child ONLY, not
+the 3-TU aggregate the pod's own real RAM headroom depends on) and records
+the new archive size (`libjammi_flash.a` grows with the device-code-section
+count) here.
 
 ## Feature isolation
 

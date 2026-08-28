@@ -170,10 +170,10 @@ high-water mark that cannot miss an intra-step spike the way a discrete poll
 can.
 
 jammi's `peak_vram_bytes` is a whole-device `nvidia-smi` poll
-(`device_memory_used_bytes`, finetune_step.rs:167), sampled every 25ms
-(`std::thread::sleep`, finetune_step.rs:202) over the ENTIRE warmup+measured
-loop, then reduced via `peak.saturating_sub(baseline)`, finetune_step.rs:218
-against a baseline snapshot (`vram_baseline`, finetune_step.rs:600) taken
+(`device_memory_used_bytes`, finetune_step.rs:215), sampled every 25ms
+(`std::thread::sleep`, finetune_step.rs:250) over the ENTIRE warmup+measured
+loop, then reduced via `peak.saturating_sub(baseline)`, finetune_step.rs:266
+against a baseline snapshot (`vram_baseline`, finetune_step.rs:767) taken
 once right after the model+optimizer are built (before the loop starts) — at
 which point candle's `AdamW::new` has
 ALREADY allocated the (zero-initialized) first/second moment tensors, since

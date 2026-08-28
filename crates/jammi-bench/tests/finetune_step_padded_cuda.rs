@@ -20,6 +20,43 @@
 //! honest-skip shape in spirit — a stated per-skip reason on stderr, never
 //! a silent pass — rather than the mechanically-enforced one.
 //!
+//! THREE independent preconditions gate the two legs below, not one, and
+//! the two legs need different subsets of them (see each `#[test]`'s own
+//! doc for which):
+//!
+//! 1. CUDA presence — [`cuda_available`], above.
+//! 2. Flash COMPILATION — `jammi_kernels::admission::FLASH_COMPILED`
+//!    (`cfg!(feature = "flash-attn")` on `jammi-kernels`). `jammi-bench`
+//!    declares no `flash-attn` feature of its own; a build that reaches
+//!    this leg via a bare `cargo test -p jammi-bench --features cuda` has
+//!    CUDA but NOT flash — only the CLI-level `--features
+//!    cuda,jammi-encoders/flash-attn` form `stacked_sweep.sh` actually uses
+//!    turns `FLASH_COMPILED` on (via `jammi-encoders`'s `flash-attn`
+//!    feature, which forwards to `jammi-kernels/flash-attn` — see that
+//!    crate's `Cargo.toml`).
+//! 3. Compute-capability ARCH — `jammi_kernels::admission::
+//!    probe_cuda_compute_capability(&device).meets_minimum()`, i.e.
+//!    `sm_80`/Ampere or newer (`MIN_CUDA_COMPUTE_CAP`); the flash cascade's
+//!    own domain predicate declines below this regardless of compilation.
+//!
+//! [`a5_padded_block_arm_vram_baseline_leg`] needs ONLY precondition 1: it
+//! disables `attention_block_flash` via the env-var registry, and
+//! `admit_cascade`'s own `op_is_disabled` check fires FIRST, before any
+//! `FLASH_COMPILED`/arch predicate is even consulted (`decide_flash_
+//! admission`'s own doc) — so the block arm's decline-count assertion holds
+//! on ANY CUDA host, flash-compiled or not, sm80 or not.
+//!
+//! [`a3_padded_loss_sequence_flash_vs_block_ab`] needs ALL THREE: its
+//! `flash` leg asserts `attention_block_flash_fused_dispatches > 0`, which
+//! requires the flash arm to actually be ELIGIBLE to fuse — compiled in AND
+//! running on an sm80+ device — not merely that a CUDA device exists.
+//! [`flash_capable_cuda`] is this file's own precondition-2+3 check,
+//! mirroring how `jammi-encoders::modernbert`'s own `flash_compiled_or_skip`
+//! (used by that crate's sibling flash-vs-block oracles) gates on
+//! `FLASH_COMPILED`, extended here with the arch check that test's own call
+//! sites get for free from a real forward pass declining through the
+//! predicate instead of asserting a raw dispatch count.
+//!
 //! Fixture: the SAME committed `head_dim == 64` checkpoint
 //! `finetune_step_kernel_disable.rs` uses
 //! (`crates/jammi-encoders/tests/fixtures/tiny_modernbert_head64`) —
@@ -43,6 +80,35 @@ fn cuda_available() -> bool {
     false
 }
 
+/// Precondition 2+3 (module doc): a usable CUDA device AND this build's
+/// `jammi-kernels` compiled with `flash-attn` AND that device's compute
+/// capability meets the flash cascade's own `sm_80` minimum
+/// (`jammi_kernels::admission::MIN_CUDA_COMPUTE_CAP`). Any one of the three
+/// missing means the flash arm is not actually ELIGIBLE to fuse on this
+/// host/build — `false` here, never a panic; the caller decides what to do
+/// with that (see `skip_without_flash_capable_cuda!`, below).
+///
+/// Does not itself require [`cuda_available`] to have been checked first —
+/// a missing device makes `Device::new_cuda(0)` fail, which this function
+/// also reads as "not flash-capable", so it is safe to call standalone.
+#[cfg(feature = "cuda")]
+fn flash_capable_cuda() -> bool {
+    if !jammi_kernels::admission::FLASH_COMPILED {
+        return false;
+    }
+    match candle_core::Device::new_cuda(0) {
+        Ok(device) => jammi_kernels::admission::probe_cuda_compute_capability(&device)
+            .map(|cap| cap.meets_minimum())
+            .unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+fn flash_capable_cuda() -> bool {
+    false
+}
+
 /// Early-return with a loud, stated skip reason when no usable CUDA device
 /// is present — never a silent no-op that could be misread as "ran and
 /// found nothing wrong".
@@ -53,6 +119,38 @@ macro_rules! skip_without_cuda {
                 "{}: SKIP — no usable CUDA device (build+run with `--features cuda` on a \
                  CUDA host to exercise this leg; the flash/block padded-transport arms this \
                  leg measures do not exist on CPU)",
+                $test_name
+            );
+            return;
+        }
+    };
+}
+
+/// Early-return with a loud, stated skip reason when the flash arm is not
+/// actually eligible to fuse on this host/build — CUDA device present but
+/// EITHER `jammi-kernels` was not compiled with `flash-attn` OR the device
+/// is below `sm_80`. A leg gated only on [`skip_without_cuda`] but that
+/// asserts a live flash dispatch (`fused > 0`) would hard-fail here instead
+/// of honestly skipping — see this file's own module doc for why a plain
+/// `#[cfg(feature = "cuda")]` build does not imply flash is compiled.
+macro_rules! skip_without_flash_capable_cuda {
+    ($test_name:literal) => {
+        if !cuda_available() {
+            eprintln!(
+                "{}: SKIP — no usable CUDA device (build+run with `--features \
+                 cuda,jammi-encoders/flash-attn` on a CUDA host to exercise this leg)",
+                $test_name
+            );
+            return;
+        }
+        if !flash_capable_cuda() {
+            eprintln!(
+                "{}: SKIP — CUDA device present but the flash arm is not eligible to fuse: \
+                 either this build's jammi-kernels was not compiled with the flash-attn \
+                 feature (FLASH_COMPILED=false; rebuild with `--features \
+                 cuda,jammi-encoders/flash-attn`, the same CLI form stacked_sweep.sh uses), or \
+                 the device's compute capability is below the flash cascade's own sm_80 \
+                 minimum (jammi_kernels::admission::MIN_CUDA_COMPUTE_CAP)",
                 $test_name
             );
             return;
@@ -119,6 +217,12 @@ fn run_report(cmd: &mut Command) -> serde_json::Value {
 /// needs on the OTHER side. This is the leg that gets committed FIRST (the
 /// lead's pod-run ordering): a padded-flash artifact without this baseline
 /// already committed has nothing to compare against.
+///
+/// Gate: precondition 1 (CUDA presence) ONLY — see the module doc. This
+/// leg never asserts a live flash Fused dispatch (it disables the flash
+/// arm and asserts the DECLINE side), so it is honestly runnable on any
+/// CUDA host regardless of whether `jammi-kernels` was compiled with
+/// `flash-attn` or the device meets the flash cascade's `sm_80` minimum.
 #[test]
 fn a5_padded_block_arm_vram_baseline_leg() {
     skip_without_cuda!("a5_padded_block_arm_vram_baseline_leg");
@@ -214,7 +318,7 @@ fn a5_padded_block_arm_vram_baseline_leg() {
 ///     either arm's step-time number as an unattributed confound.
 #[test]
 fn a3_padded_loss_sequence_flash_vs_block_ab() {
-    skip_without_cuda!("a3_padded_loss_sequence_flash_vs_block_ab");
+    skip_without_flash_capable_cuda!("a3_padded_loss_sequence_flash_vs_block_ab");
 
     let dir = model_dir();
 

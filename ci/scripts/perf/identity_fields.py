@@ -249,6 +249,92 @@ IDENTITY_FIELD_CANONICALIZERS = {
 }
 
 
+# THE finetune-run identity set (unit 63, H4/H4a docs-ci mirror) — mirrors
+# `crates/jammi-bench/src/report.rs`'s `FinetuneRunTier::IDENTITY_FIELDS`
+# EXACTLY, verbatim in the SAME order that const's own source lists them
+# (order is not semantically load-bearing for a set-equality check, but
+# keeping it identical makes a side-by-side diff against the Rust const
+# trivial for a human reviewer). Like `ENCODE_IDENTITY_FIELDS` above (unit
+# 62's E3/E6 shape) and UNLIKE `FINETUNE_IDENTITY_FIELDS`'s superset-folding
+# shape, `FinetuneRunTier` keeps its provenance (`arm`, `device_name`,
+# `kernels_disabled_requested`, `kernels_disabled_fired`, `flash_compiled`,
+# `build_features`, `attention_arm`) in its OWN, entirely DISJOINT
+# `PROVENANCE_FIELDS` const — see that struct's own doc for why `arm`/
+# `attention_arm` are provenance here rather than identity (the CALLER'S
+# request / the process-resolved reference class, neither a determinant of
+# what the held-out loss itself computes). `FINETUNE_RUN_IDENTITY_FIELDS` is
+# therefore compared for SET EQUALITY against
+# `FinetuneRunTier::IDENTITY_FIELDS`, never a subset check — see
+# `test_identity_fields_subset.py`'s own `FinetuneRunIdentityFieldsSubsetTests`
+# for the mechanical assertion. This module carries no
+# `FINETUNE_RUN_PROVENANCE_FIELDS` tuple, following `ENCODE_IDENTITY_FIELDS`'s
+# own precedent: the Rust `PROVENANCE_FIELDS` const is extracted directly by
+# the test suite's regex scan rather than duplicated into a second Python
+# list nobody would keep in sync.
+FINETUNE_RUN_IDENTITY_FIELDS = (
+    # FinetuneStepTier's 18, minus attention_arm (17 entries) — carried over
+    # by name, same order as the Rust const's own leading block.
+    "seed",
+    "batch",
+    "seq",
+    "lora_rank",
+    "lora_alpha",
+    "lora_dropout",
+    "margin",
+    "target_modules",
+    "batched_forward",
+    "backbone_dtype",
+    "steps_measured",
+    "checkpoint_config_sha256",
+    "checkpoint_weights_sha256",
+    "checkpoint_weights_size_bytes",
+    "max_grad_norm",
+    "warmup",
+    "row_lengths",
+    # New (18 entries) — CONTRACT H4 v1/v2 + the objective-selection
+    # amendment (embedding_loss/temperature/margin's objective-selected
+    # nullness).
+    "epochs",
+    "lr",
+    "schedule",
+    "warmup_steps",
+    "weight_decay",
+    "grad_accum",
+    "validation_fraction",
+    "split_rule",
+    "split_seed",
+    "dataset_sha256",
+    "heldout_ids_sha256",
+    "heldout_batch_partition_sha256",
+    "embedding_loss",
+    "temperature",
+    "matryoshka_dims",
+    "early_stopping_patience",
+    "early_stopping_metric",
+    "eval_cadence",
+)
+
+# Identity fields for which a JSON `null` is a legitimate VALUE — mirrors
+# `FINETUNE_NULL_IS_A_VALUE_FIELDS`'s own doctrine, but for
+# `FinetuneRunTier::IDENTITY_FIELDS`'s own `Nullable::NullMeans` entries
+# (read verbatim off that const, see `report.rs`):
+#   * `margin`        — NullMeans("objective is mnrl")
+#   * `temperature`   — NullMeans("objective is triplet")
+#   * `max_grad_norm` — NullMeans("no clip")
+#   * `warmup`        — NullMeans("a full run has no discard-before-timing
+#                        convention; see warmup_steps")
+#   * `row_lengths`   — NullMeans("real text is variable-length; no single
+#                        fixed row_lengths applies across a whole
+#                        multi-epoch run")
+# Every OTHER `FINETUNE_RUN_IDENTITY_FIELDS` member is `Nullable::NonNull`
+# on the Rust const, so a present `null` there still folds to MISSING (the
+# same "cannot verify this premise determinant" state `leg_identity_fields`
+# already applies to `FINETUNE_IDENTITY_FIELDS`).
+FINETUNE_RUN_NULL_IS_A_VALUE_FIELDS = frozenset(
+    {"margin", "temperature", "max_grad_norm", "warmup", "row_lengths"}
+)
+
+
 def canonicalize_identity_field(field, value):
     """Apply `field`'s registered canonicalizer (see
     `IDENTITY_FIELD_CANONICALIZERS`'s own table), or return `value`

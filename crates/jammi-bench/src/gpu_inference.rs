@@ -219,7 +219,7 @@ fn require_cuda(device: ComputeDevice) -> Result<u32, Box<dyn Error>> {
 /// handle the session's own CUDA backend already opened, needs no subprocess,
 /// and cannot silently return another host's GPU.
 #[cfg(feature = "cuda")]
-fn cuda_device_name(ordinal: u32) -> Result<String, Box<dyn Error>> {
+pub(crate) fn cuda_device_name(ordinal: u32) -> Result<String, Box<dyn Error>> {
     use candle_core::cuda::cudarc::driver::result as cuda;
     cuda::init()?;
     let device = cuda::device::get(ordinal as i32)?;
@@ -229,9 +229,12 @@ fn cuda_device_name(ordinal: u32) -> Result<String, Box<dyn Error>> {
 /// Non-`cuda`-feature stub: unreachable in practice, since [`require_cuda`]
 /// already fails the tier before this is ever called on a build with no CUDA
 /// backend compiled in. Exists only so the tier compiles in the default
-/// CPU-hermetic build.
+/// CPU-hermetic build. Also reused by `encode_step::resolved_device_name`
+/// (unit-62 round-3 audit: `EncodeStepTier::device_name` now queries the
+/// SAME real hardware string on a `--cuda` leg, never a second,
+/// independently-drifting lookup).
 #[cfg(not(feature = "cuda"))]
-fn cuda_device_name(_ordinal: u32) -> Result<String, Box<dyn Error>> {
+pub(crate) fn cuda_device_name(_ordinal: u32) -> Result<String, Box<dyn Error>> {
     Err("gpu-inference built without the cuda feature; no device to name".into())
 }
 

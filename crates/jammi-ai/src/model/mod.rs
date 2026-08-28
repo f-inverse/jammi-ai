@@ -335,6 +335,23 @@ impl LoadedModel {
         }
     }
 
+    /// The pooling strategy the loaded text-embedding forward path ACTUALLY
+    /// resolved to and applies — the SAME strategy
+    /// `backend::candle::CandleTextForward::forward_pooled` pools with, read
+    /// via `CandleModel::resolved_pooling` (unit-62 F-5': a bench/report
+    /// consumer must read this off the loaded model, never transcribe a
+    /// fixture-declared constant that could silently drift from what actually
+    /// served). `None` when this loaded model has no pooling concept at all
+    /// (a CLAP audio tower, an OpenCLIP text tower whose output is already
+    /// pooled-and-projected, a classification head) or for the ORT backend
+    /// (which does not yet resolve a text-embedding pooling wrapper).
+    pub fn resolved_pooling(&self) -> Option<jammi_encoders::Pooling> {
+        match self {
+            LoadedModel::Candle(m) => m.resolved_pooling(),
+            LoadedModel::Ort(_) => None,
+        }
+    }
+
     /// The model's content digest (esc-057, K7): a SHA-256 fold of the
     /// resolved model directory's config / `1_Pooling/config.json` /
     /// tokenizer / weights bytes, computed once at load time by

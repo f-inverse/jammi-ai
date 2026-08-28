@@ -72,6 +72,23 @@ pub(crate) trait CandleTextForward: Send + Sync {
         let pooled = mean_pool(&hidden, attention_mask)?;
         l2_normalize(&pooled)
     }
+
+    /// The pooling strategy [`Self::forward_pooled`] ACTUALLY applies, if
+    /// pooling is a meaningful concept for this encoder at all — `None` for
+    /// a wrapper whose `forward_pooled` bypasses pooling entirely (e.g. the
+    /// OpenCLIP text tower, already-pooled-and-projected) or that doesn't
+    /// pool at all (a classification head). The three BERT-family wrappers
+    /// (`BertForward`/`ModernBertForward`/`DistilBertForward`) override this
+    /// to report the SAME `pooling: Pooling` field `forward_pooled` reads —
+    /// never a second, independently-resolved value (unit-62 F-5': the
+    /// accessor a caller reads must be wired to the value that actually
+    /// determined the served output, the same discipline
+    /// `LoadedModel::compute_precision` already follows). Trait-default
+    /// `None` so a future wrapper doesn't silently claim a pooling strategy
+    /// it doesn't have.
+    fn resolved_pooling(&self) -> Option<Pooling> {
+        None
+    }
 }
 
 /// Vision architectures produce embeddings from pixel tensors.
@@ -166,6 +183,10 @@ impl CandleTextForward for BertForward {
         let hidden = self.forward_hidden(input_ids, attention_mask, encoding, device)?;
         pool_via(&hidden, attention_mask, self.pooling)
     }
+
+    fn resolved_pooling(&self) -> Option<Pooling> {
+        Some(self.pooling)
+    }
 }
 
 /// ModernBERT forward pass (rotary embeddings, GeGLU, no token_type_ids).
@@ -202,6 +223,10 @@ impl CandleTextForward for ModernBertForward {
     ) -> Result<Tensor> {
         let hidden = self.forward_hidden(input_ids, attention_mask, encoding, device)?;
         pool_via(&hidden, attention_mask, self.pooling)
+    }
+
+    fn resolved_pooling(&self) -> Option<Pooling> {
+        Some(self.pooling)
     }
 }
 
@@ -240,6 +265,10 @@ impl CandleTextForward for DistilBertForward {
     ) -> Result<Tensor> {
         let hidden = self.forward_hidden(input_ids, attention_mask, encoding, device)?;
         pool_via(&hidden, attention_mask, self.pooling)
+    }
+
+    fn resolved_pooling(&self) -> Option<Pooling> {
+        Some(self.pooling)
     }
 }
 
@@ -963,6 +992,18 @@ impl CandleModel {
     /// Convert token ID vectors into a candle Tensor on this model's device.
     pub(crate) fn tokens_to_tensor(&self, vecs: &[Vec<u32>]) -> Result<Tensor> {
         tokens_to_tensor(vecs, &self.device)
+    }
+
+    /// The pooling strategy the text-embedding forward path ACTUALLY resolved
+    /// to (unit-62 F-5'): delegates to [`CandleTextForward::resolved_pooling`]
+    /// on the loaded text wrapper — the SAME `Pooling` value `forward_pooled`
+    /// applies, never a re-derivation from `resolved.pooling_config` (which
+    /// would drift the moment `pooling_from_config`'s own resolution logic
+    /// changed without this accessor changing in lockstep). `None` for a
+    /// model with no text wrapper at all (CLAP audio) or whose text wrapper
+    /// doesn't pool (OpenCLIP text, DistilBERT classification).
+    pub(crate) fn resolved_pooling(&self) -> Option<Pooling> {
+        self.text.as_ref().and_then(|t| t.resolved_pooling())
     }
 
     /// The persisted predictive-distribution form of a reloaded regression head,

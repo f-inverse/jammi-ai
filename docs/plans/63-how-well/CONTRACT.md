@@ -137,3 +137,16 @@ arms — still ~$1):
   MNRL via the (anchor, positive) projection in committed order) — H4a delta.
 - The tie-cap premise leg stays conjunctive regardless of objective (C16's own hinge
   warning; MNRL keeps it as a cheap invariant).
+
+## Amendment 2026-08-28b (lead, from unit-64 scoping): train-text provisioning
+
+The unit-64 gap-analyzer surfaced that H4's "no network" producer discipline and the
+committed fixture are mutually unsatisfiable as written: the fixture commits held-out TEXT
+but only ids+per-pair-sha256 for the 1372 train pairs, so no checkout contains training
+text. RULING: the producer gains a PRE-RUN provisioning step — outside every timed/measured
+leg — that fetches the train text via the fixture's own derive script and VERIFIES every
+pair byte-content against the committed train_ids_sha256.json (content-addressed transport:
+the committed hashes are the trust surface, the network is not); any mismatch is a loud
+refusal before any leg runs. "No network" is thereby narrowed to: no network during
+measured legs, and no unverified content ever. dataset_sha256 remains reconstructable from
+checkout + verified content. The H5 campaign runs the provisioning step once per pod.

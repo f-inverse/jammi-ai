@@ -26,7 +26,8 @@ use jammi_db::error::JammiError;
 use jammi_db::model_task::ModelTask;
 use jammi_db::store::manifest::{
     ArtifactDigest, ComputeDevice, ComputePrecision, DefinitionHash, InputAnchor, Materialization,
-    MaterializationEnv, MaterializationManifest, ModelIdentity, ProducingDescriptor,
+    MaterializationEnv, MaterializationManifest, ModelContentDigest, ModelIdentity,
+    ProducingDescriptor,
 };
 use jammi_db::store::schema::embedding_table_schema;
 use jammi_db::store::{ResultStore, ResultTableInfo, StaleReason, Staleness};
@@ -166,6 +167,7 @@ fn env() -> MaterializationEnv {
             model_id: "test-model".into(),
             backend: "candle".into(),
             compute_precision: ComputePrecision::F32,
+            content_digest: ModelContentDigest::Sha256("it-fixture-digest".into()),
         }],
     )
 }

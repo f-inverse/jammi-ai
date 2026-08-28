@@ -13,7 +13,7 @@ pub use freshness::{
 pub use manifest::{
     AnchorKind, AnchorValue, ArtifactDigest, ComputeDevice, DefinitionHash, InputAnchor,
     ManifestError, MatchVerdict, Materialization, MaterializationEnv, MaterializationManifest,
-    ModelIdentity, ProducingDescriptor,
+    ModelContentDigest, ModelContentDigestUnavailableReason, ModelIdentity, ProducingDescriptor,
 };
 pub use result_schema::ResultTableSchemaProvider;
 

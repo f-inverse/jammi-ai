@@ -28,7 +28,7 @@ use jammi_db::config::AnnIndexConfig;
 use jammi_db::model_task::ModelTask;
 use jammi_db::store::manifest::{
     AnchorKind, ComputeDevice, ComputePrecision, DefinitionHash, InputAnchor, MatchVerdict,
-    MaterializationEnv, ModelIdentity, ProducingDescriptor,
+    MaterializationEnv, ModelContentDigest, ModelIdentity, ProducingDescriptor,
 };
 use jammi_db::store::schema::embedding_table_schema;
 use jammi_db::store::{ResultStore, ResultTableInfo};
@@ -142,6 +142,7 @@ fn env() -> MaterializationEnv {
             model_id: "test-model".into(),
             backend: "candle".into(),
             compute_precision: ComputePrecision::F32,
+            content_digest: ModelContentDigest::Sha256("it-fixture-digest".into()),
         }],
     )
 }

@@ -46,9 +46,12 @@
 //!
 //! `qkv`: rank 5 `[batch, seq, 3, heads, head_dim]`, contiguous, `F32` on
 //! CPU. Unlike [`super::AttentionBlockFused`], `head_dim` is UNCONSTRAINED
-//! (no fixed `64` — this op folds no bit-exactness argument into an exact-
-//! power-of-two scale; it is arch-agnostic stock-op composition, not a
-//! kernel tuned to one width). `seq <= `[`MAX_SEQ`]` — a conservative
+//! EXCEPT EVEN-WHEN-`rope` (no fixed `64` — this op folds no bit-exactness
+//! argument into an exact-power-of-two scale; it is arch-agnostic stock-op
+//! composition, not a kernel tuned to one width — but see
+//! [`check_rope_head_dim`]'s own doc for the one real constraint: an odd
+//! `head_dim` with `rope=true` is refused, symmetrically, at both `cpu_fwd`
+//! and `bwd`'s own entry points). `seq <= `[`MAX_SEQ`]` — a conservative
 //! VALIDATED ceiling, not a hardware limit, mirroring every other `MAX_*`
 //! constant in this crate. `rope_pack` (when `rope == true`): the SAME
 //! `[2, 1, 1, seq_max, head_dim]` pack [`super::AttentionBlockFused`]
@@ -94,10 +97,15 @@
 //! and the trigger is evaluated once, after the last chunk. Under
 //! [`FullyMaskedPolicy::Zeros`] a triggered row's output is forced to
 //! EXACT zeros (never a computed-then-overwritten value); under
-//! `Propagate` the running max is not even computed — ordinary online-
-//! softmax division runs unconditionally, reproducing candle-eager
-//! behavior on that row (including a possible `NaN`/uniform result,
-//! exactly as `Propagate` does everywhere else in this crate).
+//! `Propagate`, `mask_running_max` IS still computed every chunk
+//! (`attention_fwd_memeff_f32`'s update runs unconditionally, regardless
+//! of `policy` — a correction of an earlier "the running max is not even
+//! computed" claim, round-2 audit advisory) — only the TRIGGER that reads
+//! it is gated (`policy == FullyMaskedPolicy::Zeros && mask_running_max[..]
+//! < 0.0`): under `Propagate`, the array is written but never consulted,
+//! so ordinary online-softmax division runs unconditionally, reproducing
+//! candle-eager behavior on that row (including a possible `NaN`/uniform
+//! result, exactly as `Propagate` does everywhere else in this crate).
 //!
 //! ## `bwd`'s `lse` channel: [`Saved`] makes this a [`StatefulKernelOp`]
 //!
@@ -143,6 +151,58 @@
 //! None, None)` — this op computes no gradient for `rope_pack`/`key_mask`
 //! and asserts `!track_op()` on both, loudly, before doing any work (a
 //! typed refusal rather than a silently-missing gradient, family D).
+//!
+//! ## Memory cost: the `[b, h, s, c]` transient, priced both directions
+//!
+//! Round-2 audit (F4): the per-chunk score-shaped transient is `O(b · h ·
+//! s · c)`, LINEAR in `c` — the `MIN_CHUNK` (`512`) launch-count floor
+//! therefore inflates it directly, and this is priced HERE, both
+//! directions, with the number produced rather than assumed. At
+//! `b=1, h=16, s=8192, c=512` (`f32`, `4` bytes/element — the plan's own
+//! A1 shape): one `[b, h, s, c]` buffer is `1·16·8192·512·4 =
+//! 268_435_456` bytes (`≈ 268.4 MB`).
+//!
+//! - **`fwd`** (`attention_fwd_memeff_f32`): `scores` (one such buffer per
+//!   chunk iteration) plus the much smaller `k_chunk`/`v_chunk`
+//!   (`[b,h,c,d]` each, `1·16·512·64·4 = 2_097_152` bytes `≈ 2.1 MB`
+//!   apiece) — momentary peak `≈ 272.6 MB`, freed automatically at the end
+//!   of EACH chunk iteration (these are `while`-loop-body-local bindings —
+//!   candle's own scoping frees them without an explicit `drop`, unlike
+//!   `bwd`'s longer-lived intermediates below) and never summed across
+//!   chunks.
+//! - **`bwd`**: FIVE `[b,h,s,c]`-shaped intermediates exist per chunk
+//!   iteration (`scores_c`, `masked_c`, `p_c`, `dp_c`, `ds_c` — `dqs_c`/
+//!   `dk_c` are `[b,h,s,d]`/`[b,h,c,d]`-shaped instead, matching `Q`'s or
+//!   `K`'s own chunk size, NOT this class). Explicit early `drop`s
+//!   (mirroring [`super::AttentionBlockFused::bwd`]'s own discipline —
+//!   see that op's module doc's "transient scoping" section) hold the
+//!   MOMENTARY peak to THREE concurrent buffers (`p_c` + `dp_c` + `ds_c`,
+//!   right before `ds_c` consumes both) rather than the up-to-six a naive
+//!   no-early-drop version would carry: `3 · 268.4 MB ≈ 805.3 MB`
+//!   momentary peak per chunk iteration at this shape — the number this
+//!   section exists to state, not omit.
+//! - **`dk_chunks`/`dv_chunks` retention** (the module doc's "`dQ`
+//!   accumulates ACROSS the chunk loop" section): each pushed tensor is
+//!   `[b,h,clen,d]`-shaped (K/V's own chunk size, never `[.,s,c]`), so the
+//!   TOTAL retained across the whole loop — by construction, `sum(clen)
+//!   == s` — is `b·h·s·d·4` bytes each: at this shape,
+//!   `1·16·8192·64·4 = 33_554_432` bytes (`≈ 33.6 MB`) apiece, `≈ 67.1 MB`
+//!   combined, held until the post-loop `Tensor::cat`. This is EXACTLY the
+//!   final `dK`/`dV` output size, not an extra cost the chunking loop
+//!   introduces — a correct unchunked implementation would retain the
+//!   same total, just assembled in one shot instead of incrementally.
+//!
+//! **Both tradeoff directions, stated (v4 delta F3):** a LARGER `c`
+//! shrinks the launch count (`≈ s/c` `BackendStorage::matmul` calls per
+//! chunk-loop pass — the argument [`MIN_CHUNK`]'s own doc cites for why
+//! `c` has a floor at all) but GROWS this transient linearly (`c=1024`
+//! at the shape above: `≈ 536.9 MB` per `[b,h,s,c]` buffer, `≈ 1.61 GB`
+//! bwd momentary peak); a SMALLER `c` shrinks the transient but grows the
+//! launch count toward the `(s/c)²`-launch-latency regime the keys-only-
+//! chunking design (module doc's "why a `CustomOp3` at all" section, and
+//! the plan's own `c=128` ≈ 7 s pure-launch-latency figure) exists to
+//! avoid. `MIN_CHUNK` (`512`) is the plan's own chosen point on this
+//! curve; this crate does not re-derive it, only prices its consequence.
 //!
 //! ## Rounding contract (dtype-split — CPU/F32 arm only, this pass)
 //!
@@ -386,6 +446,34 @@ pub(crate) fn mem_eff_attention_dims(
     Ok((b, s, h, d))
 }
 
+/// `head_dim` UNCONSTRAINED except EVEN-when-`rope` (module doc — a
+/// correction of an earlier "head_dim is UNCONSTRAINED" claim, round-2
+/// audit F2): `cpu_fwd`'s own row math ([`rope_fwd_row_f32`], via
+/// `super::rope`) computes `half = head_dim / 2` and splits the row into
+/// two EQUAL halves; an ODD `head_dim` floors `half`, so the function
+/// still returns SOME value rather than refusing — that value reads the
+/// row's own middle element TWICE (once as `x[col]` at `col == half`,
+/// once as the rotation partner `rh` for `col == 0`) and is therefore NOT
+/// a rotation, a confident-wrong-number domain violation (family D), not
+/// merely a validated-coverage gap. `bwd` (via [`super::RopeFused`]'s own
+/// `apply3` call) already REFUSES an odd `head_dim` internally
+/// (`super::rope`'s `rope_dims` check) — so without this guard, `fwd`
+/// would silently accept exactly what `bwd` refuses, an asymmetric
+/// domain. Checked at BOTH `cpu_fwd`'s and `bwd`'s own entry points
+/// (rather than relying on `bwd`'s incidental downstream error) so the
+/// refusal is symmetric, typed, and attributable to THIS op rather than a
+/// `RopeFused` internal.
+fn check_rope_head_dim(rope: bool, d: usize, op: &'static str) -> Result<()> {
+    if rope && !d.is_multiple_of(2) {
+        return Err(Error::Msg(format!(
+            "{op}: head_dim={d} must be even when rope=true (rotate-half splits it into two \
+             equal halves — this op's own cpu_fwd row math, and RopeFused's own domain check, \
+             both depend on it); head_dim is otherwise unconstrained (module doc)"
+        )));
+    }
+    Ok(())
+}
+
 /// Validates `key_mask`'s domain (module doc: padding-only, NARROWER than
 /// [`super::AttentionBlockFused`]'s combined-mask class — no query-row
 /// axis, since the band is separate construction data here). Returns the
@@ -463,6 +551,7 @@ impl CustomOp3 for MemEfficientAttention {
     ) -> Result<(CpuStorage, Shape)> {
         let op = self.name();
         let (b, s, h, d) = mem_eff_attention_dims(l1, op)?;
+        check_rope_head_dim(self.rope, d, op)?;
         let out_shape = Shape::from((b, s, h * d));
         let mask_batch = check_key_mask(l3, b, s, op)?;
         if s1.dtype() != s3.dtype() {
@@ -576,6 +665,14 @@ impl CustomOp3 for MemEfficientAttention {
                  {three}"
             )));
         }
+        // Explicit, typed refusal at `bwd`'s own entry point too (module
+        // doc's "head_dim UNCONSTRAINED except EVEN-when-rope" — see
+        // `check_rope_head_dim`'s own doc): without this, an odd
+        // `head_dim` with `rope=true` would still be refused (RopeFused's
+        // own `apply3` call below refuses it internally), but as an
+        // INCIDENTAL downstream error rather than THIS op's own domain
+        // check — this makes the refusal symmetric with `cpu_fwd`'s.
+        check_rope_head_dim(self.rope, d, op)?;
         // Empty-shape short circuit (module doc): `Tensor::cat(&[], ..)`
         // errors on an empty chunk list, which the general chunk loop
         // below would hit whenever `s == 0` — short-circuit before it,
@@ -647,18 +744,34 @@ impl CustomOp3 for MemEfficientAttention {
                 let band_c = build_band_chunk_tensor(s, c_start, clen, w, qkv.device())?;
                 masked_c = masked_c.broadcast_add(&band_c)?;
             }
+            // `scores_c`'s only use was building `masked_c` (module doc's
+            // "memory cost" section) — drop it now instead of letting it
+            // live to this iteration's own natural end, mirroring
+            // `AttentionBlockFused::bwd`'s own early-drop discipline.
+            drop(scores_c);
             // `p_c = exp(masked_c - lse)`: for a `Zeros`-triggered row,
             // `lse == MASKED_LSE_SENTINEL` (module doc), so this
             // underflows cleanly to `0.0` — no separate branch needed.
             let p_c = masked_c.broadcast_sub(&lse_unsq)?.exp()?;
+            drop(masked_c);
             let dv_c = matmul_grad_rhs(&p_c, &dctx)?;
             let dp_c = matmul_grad_lhs(&dctx, &v_c)?;
+            drop(v_c);
             let ds_c = p_c.mul(&dp_c.broadcast_sub(&delta)?)?;
+            // `p_c`'s last use (its second, after `dv_c`) and `dp_c`'s
+            // only use were both building `ds_c` — drop both now, the
+            // SAME shape `AttentionBlockFused::bwd`'s own
+            // `drop(p); drop(dp);` uses.
+            drop(p_c);
+            drop(dp_c);
             let dqs_c = matmul_grad_lhs(&ds_c, &k_c_t)?;
             dqs = dqs.add(&dqs_c)?;
             let dk_c = matmul_grad_rhs(&q_scaled, &ds_c)?
                 .transpose(D::Minus1, D::Minus2)?
                 .contiguous()?;
+            drop(ds_c);
+            drop(k_c_t);
+            drop(k_c);
             dk_chunks.push(dk_c);
             dv_chunks.push(dv_c);
             c_start += clen;
@@ -956,6 +1069,26 @@ mod tests {
         Tensor::from_vec(vec![0f32; b * s], (b, 1, 1, s), device).unwrap()
     }
 
+    /// [`eager_reference`]'s inputs, bundled into one struct rather than
+    /// passed positionally (round-2 audit advisory: drops the
+    /// `#[allow(clippy::too_many_arguments)]` this fn used to carry, in
+    /// favor of the SAME named-field discipline
+    /// [`MemEffFwdF32Params`]/`AttentionFwdF32Params` already use — nine
+    /// positional arguments, several of the SAME `Option<&Tensor>` type
+    /// adjacent to each other, is exactly the transposition hazard those
+    /// structs exist to remove).
+    struct EagerReferenceParams<'a> {
+        q0: &'a Tensor,
+        k0: &'a Tensor,
+        v0: &'a Tensor,
+        cos: Option<&'a Tensor>,
+        sin: Option<&'a Tensor>,
+        key_mask: &'a Tensor,
+        half_window: Option<usize>,
+        scale: f32,
+        policy: FullyMaskedPolicy,
+    }
+
     /// A small, deliberately UNCHUNKED eager reference built from ordinary
     /// `Tensor` ops (RoPE, scale-fold, `QKᵀ`, mask-add [+ band], softmax,
     /// `PV`) — independent of `MemEfficientAttention`'s own chunked
@@ -966,18 +1099,29 @@ mod tests {
     /// band predicate (not a call into [`band_additive_value`]), so the
     /// production band logic is checked against a genuinely separate
     /// formula, not itself.
-    #[allow(clippy::too_many_arguments)]
-    fn eager_reference(
-        q0: &Tensor,
-        k0: &Tensor,
-        v0: &Tensor,
-        cos: Option<&Tensor>,
-        sin: Option<&Tensor>,
-        key_mask: &Tensor,
-        half_window: Option<usize>,
-        scale: f32,
-        policy: FullyMaskedPolicy,
-    ) -> Result<Tensor> {
+    ///
+    /// **The shared-RoPE limitation (round-2 audit advisory, honestly
+    /// disclosed):** unlike the band term, RoPE here is NOT independently
+    /// reimplemented — `cos`/`sin` are rotated via the SAME [`RopeFused`]
+    /// op (`apply3(q0, cos, sin, RopeFused::new(false))`) production's own
+    /// `bwd` uses. A `RopeFused`-specific bug would therefore escape every
+    /// oracle built on this reference; [`super::rope`]'s OWN test module
+    /// carries `RopeFused`'s independent coverage (bit-exactness vs an
+    /// `f64` closed-form reference), so that gap is covered ELSEWHERE, not
+    /// silently uncovered — but this reference's own "independent"
+    /// framing applies to the BAND term specifically, not to every term.
+    fn eager_reference(params: EagerReferenceParams<'_>) -> Result<Tensor> {
+        let EagerReferenceParams {
+            q0,
+            k0,
+            v0,
+            cos,
+            sin,
+            key_mask,
+            half_window,
+            scale,
+            policy,
+        } = params;
         let (b, h, s, d) = q0.dims4()?;
         let (q, k) = match (cos, sin) {
             (Some(cos), Some(sin)) => (
@@ -1031,6 +1175,26 @@ mod tests {
         band
     }
 
+    /// PER-ELEMENT max-relative-error form (`rel_tol` applied to every
+    /// element independently, in this file `1e-3`/`3e-3` — hand-picked to
+    /// this crate's own small CPU fixtures, e.g.
+    /// `multi_chunk_matches_eager_reference_within_truth_relative_bound`'s
+    /// `s=37`). Round-2 audit advisory, stated (not silently carried as
+    /// permanent): these hand-picked constants are POD-PHASE-
+    /// RECALIBRATION PENDING — once the CUDA arm lands, the 8-seed
+    /// `FLASH_ORACLE_SWEEP_SEEDS` convention (assert the MEAN, print each
+    /// seed under `--nocapture`, ~3× margin over the measured mean, never
+    /// re-fitted — v4 delta F5) is the one this crate's own oracle
+    /// discipline actually prescribes, not a per-element max form: the
+    /// auditor's own measurement is that a per-element max-elementwise
+    /// bound of THIS magnitude (`3e-3`) would NOT hold at a production-
+    /// scale `s=600` fixture (more elements ⇒ a wider max-of-many-draws
+    /// tail, even when the underlying per-element noise distribution is
+    /// unchanged) — the MEAN/`relative_l1_error` form is the one that
+    /// scales, and is the form this crate's real 8-seed convention
+    /// asserts. Kept as a per-element max here, this pass, ONLY because
+    /// this file's own fixtures stay small (`s <= 37`) and CPU-hermetic;
+    /// not a claim this form generalizes.
     fn assert_relative_close(got: &[f32], expected: &[f32], rel_tol: f32, ctx: &str) {
         assert_eq!(got.len(), expected.len(), "{ctx}: length mismatch");
         for (i, (g, e)) in got.iter().zip(expected.iter()).enumerate() {
@@ -1096,6 +1260,148 @@ mod tests {
     }
 
     #[test]
+    fn qkv_key_mask_dtype_mismatch_is_refused_with_a_typed_error() {
+        // Round-2 audit advisory: `cpu_fwd`'s explicit
+        // `s1.dtype() != s3.dtype()` check (`DTypeMismatchBinaryOp`) was
+        // previously unoracled — `bf16_is_refused_on_cpu` covers a MATCHING
+        // (BF16, BF16) pair, never a genuine cross-dtype MISMATCH.
+        use half::bf16;
+        let device = Device::Cpu;
+        let (b, h, s, d) = (1usize, 1usize, 4usize, 4usize);
+        let qkv = Tensor::zeros((b, s, 3, h, d), candle_core::DType::F32, &device).unwrap();
+        let (cos, sin) = rope_tables(s, d, &device);
+        let rope_pack = pack_rope(&cos, &sin).unwrap();
+        // key_mask is BF16 while qkv is F32 — a genuine dtype MISMATCH.
+        let mask =
+            Tensor::from_vec(vec![bf16::from_f32(0.0); b * s], (b, 1, 1, s), &device).unwrap();
+        let op = MemEfficientAttention::new(0.5, FullyMaskedPolicy::Propagate, false, None, 512)
+            .unwrap();
+        let err = apply_stateful3(&qkv, &rope_pack, &mask, op)
+            .expect_err("a qkv/key_mask dtype mismatch must be refused");
+        assert!(
+            matches!(err, Error::DTypeMismatchBinaryOp { .. }),
+            "expected Error::DTypeMismatchBinaryOp, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn mask_broadcasts_over_batch_when_its_leading_axis_is_one() {
+        // Round-2 audit advisory: every other test either uses a mask
+        // whose leading axis already equals `b`, or `b == 1` (where
+        // `mask_batch == 1` and `mask_batch == b` are indistinguishable) —
+        // the genuine `mask_batch == 1 < b` broadcast path (`cpu_fwd`'s
+        // `mrow_base = if mask_batch == 1 { 0 } else { bi * s }`) was
+        // unoracled. Proves it by comparing a `[1,1,1,s]` mask (broadcast
+        // over `b=3` batches) against the SAME mask explicitly tiled to
+        // `[3,1,1,s]` — the two must produce bit-identical output.
+        let device = Device::Cpu;
+        let (b, h, s, d) = (3usize, 2usize, 6usize, 4usize);
+        let mut mask_row = vec![0f32; s];
+        mask_row[s - 1] = -10_000.0;
+        let mask_broadcast = Tensor::from_vec(mask_row.clone(), (1, 1, 1, s), &device).unwrap();
+        let mask_tiled = {
+            let mut tiled = Vec::with_capacity(b * s);
+            for _ in 0..b {
+                tiled.extend_from_slice(&mask_row);
+            }
+            Tensor::from_vec(tiled, (b, 1, 1, s), &device).unwrap()
+        };
+
+        let qkv_v: Vec<f32> = (0..b * s * 3 * h * d)
+            .map(|i| ((i as f32) * 0.041).sin() * 0.3)
+            .collect();
+        let qkv = Tensor::from_vec(qkv_v, (b, s, 3, h, d), &device).unwrap();
+        let (cos, sin) = rope_tables(s, d, &device);
+        let rope_pack = pack_rope(&cos, &sin).unwrap();
+        let scale = 1.0 / (d as f32).sqrt();
+
+        let op_bc =
+            MemEfficientAttention::new(scale, FullyMaskedPolicy::Propagate, true, None, 512)
+                .unwrap();
+        let out_bc = apply_stateful3(&qkv, &rope_pack, &mask_broadcast, op_bc).unwrap();
+        let op_tiled =
+            MemEfficientAttention::new(scale, FullyMaskedPolicy::Propagate, true, None, 512)
+                .unwrap();
+        let out_tiled = apply_stateful3(&qkv, &rope_pack, &mask_tiled, op_tiled).unwrap();
+
+        let v_bc: Vec<f32> = out_bc.flatten_all().unwrap().to_vec1().unwrap();
+        let v_tiled: Vec<f32> = out_tiled.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(
+            v_bc, v_tiled,
+            "a [1,1,1,s] mask must be bit-identical to the same mask explicitly tiled to \
+             [b,1,1,s]"
+        );
+    }
+
+    #[test]
+    fn max_seq_ceiling_is_refused_just_above_and_accepted_at_the_boundary() {
+        // Round-2 audit advisory: MAX_SEQ was previously unoracled. Drives
+        // `mem_eff_attention_dims` DIRECTLY off a bare `Layout` (no
+        // allocation, no compute — `Layout::contiguous` is pure
+        // shape/stride metadata) rather than actually RUNNING the op at
+        // `s == MAX_SEQ`: even at `b=h=d=1`, a single chunk covering the
+        // WHOLE key axis at `s == MAX_SEQ` (`131_072`) would itself
+        // materialize an `O(s²)` score buffer (`131_072² · 4 bytes ≈
+        // 68.7 GB`) — exactly the blowup keys-only chunking exists to
+        // avoid — so "cheap" here means checking the CEILING's own
+        // boundary behavior, not exercising the full chunked forward at
+        // that shape (a real `s=MAX_SEQ` run belongs to a CUDA-arm-scale
+        // artifact, pod-deferred, not a CPU unit test).
+        let op = "max_seq_ceiling_test";
+        let l_over = candle_core::Layout::contiguous((1usize, MAX_SEQ + 1, 3usize, 1usize, 1usize));
+        assert!(
+            mem_eff_attention_dims(&l_over, op).is_err(),
+            "seq == MAX_SEQ + 1 must be refused"
+        );
+        let l_at = candle_core::Layout::contiguous((1usize, MAX_SEQ, 3usize, 1usize, 1usize));
+        assert!(
+            mem_eff_attention_dims(&l_at, op).is_ok(),
+            "seq == MAX_SEQ (the boundary itself) must be accepted"
+        );
+    }
+
+    #[test]
+    fn odd_head_dim_is_refused_only_when_rope_is_true() {
+        // F2 (round-1 audit): fixes the asymmetric domain — `cpu_fwd`'s own
+        // row math (`rope_fwd_row_f32`) would previously accept an odd
+        // `head_dim` and silently compute a NON-rotation, while `bwd`
+        // (routed through `RopeFused`) already refused it internally.
+        // `check_rope_head_dim` now refuses symmetrically at both entry
+        // points, and ONLY when `rope=true` — `rope=false` never touches
+        // RoPE at all, so an odd `head_dim` is still fully in-domain there.
+        let device = Device::Cpu;
+        let (b, h, s, d) = (1usize, 1usize, 4usize, 5usize); // odd head_dim
+        let qkv = Tensor::zeros((b, s, 3, h, d), candle_core::DType::F32, &device).unwrap();
+        // `rope_tables`/`pack_rope` assume an EVEN `d` (mirroring
+        // production's own RoPE table shape); a `[2,1,1,s,d]` zero pack is
+        // a domain-VALID `rope_pack` argument at any `d` (CustomOp3 always
+        // takes 3 tensor args regardless of `self.rope` — module doc), and
+        // its content is provably irrelevant here since `rope=false` never
+        // reads it.
+        let rope_pack = Tensor::zeros((2, 1, 1, s, d), candle_core::DType::F32, &device).unwrap();
+        let mask = zero_key_mask(b, s, &device);
+
+        // rope=true: refused, at the FORWARD call (the `cpu_fwd`-side
+        // guard fires before any row math runs).
+        let op_rope =
+            MemEfficientAttention::new(0.5, FullyMaskedPolicy::Propagate, true, None, 512).unwrap();
+        let err = apply_stateful3(&qkv, &rope_pack, &mask, op_rope)
+            .expect_err("odd head_dim with rope=true must be refused");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("head_dim") && msg.contains("even"),
+            "error must name the head_dim/even constraint, got: {msg}"
+        );
+
+        // rope=false: odd head_dim is in-domain (RoPE never runs).
+        let op_norope =
+            MemEfficientAttention::new(0.5, FullyMaskedPolicy::Propagate, false, None, 512)
+                .unwrap();
+        let out = apply_stateful3(&qkv, &rope_pack, &mask, op_norope).unwrap();
+        assert_eq!(out.dims(), &[b, s, h * d]);
+    }
+
+    #[test]
     fn bf16_is_refused_on_cpu() {
         use half::bf16;
         let device = Device::Cpu;
@@ -1111,7 +1417,19 @@ mod tests {
             Tensor::from_vec(vec![bf16::from_f32(0.0); b * s], (b, 1, 1, s), &device).unwrap();
         let op = MemEfficientAttention::new(0.5, FullyMaskedPolicy::Propagate, false, None, 512)
             .unwrap();
-        assert!(apply_stateful3(&qkv, &rope_pack, &mask, op).is_err());
+        let err =
+            apply_stateful3(&qkv, &rope_pack, &mask, op).expect_err("BF16 must be refused on CPU");
+        // Round-2 audit advisory: assert the actual error VARIANT (a
+        // dtype mismatch elsewhere in `cpu_fwd` would also satisfy a bare
+        // `is_err()`, silently drifting the test's claim away from "no
+        // BF16 MatMul on CPU" toward "something, anything, failed").
+        assert!(
+            matches!(
+                err,
+                Error::UnsupportedDTypeForOp(candle_core::DType::BF16, _)
+            ),
+            "expected Error::UnsupportedDTypeForOp(BF16, _), got {err:?}"
+        );
     }
 
     #[test]
@@ -1140,9 +1458,26 @@ mod tests {
     #[test]
     fn single_chunk_degenerate_matches_eager_reference_tightly() {
         // chunk >= seq: the whole key axis is ONE chunk, so the online-
-        // softmax recurrence degenerates to a plain single-pass softmax —
-        // the SAME reduction order `eager_reference` uses, so this case
-        // can be held to a tight tolerance (not merely a relative bound).
+        // softmax recurrence degenerates to a plain single-pass softmax
+        // over the SAME key summation order `eager_reference`'s own
+        // `matmul` issues (round-2 audit correction: an earlier version of
+        // this comment claimed "the SAME reduction order... so this case
+        // can be held to a tight tolerance" as if that alone explained the
+        // tight bound — it does not, on its own: the op folds `scale` into
+        // `Q` BEFORE `QKᵀ`, while `eager_reference` multiplies `scale`
+        // into the SCORE matrix AFTER `QKᵀ` — `(q*scale).matmul(kᵀ)` and
+        // `q.matmul(kᵀ)*scale` are bit-identical ONLY when `scale` is an
+        // EXACT power of two, per `AttentionBlockFused`'s own "Fixed
+        // domain" argument, which this op does NOT enforce in general —
+        // `scale = 1/sqrt(4) = 0.5` in THIS fixture happens to be exactly
+        // that, which is the REAL reason the tight tolerance below holds,
+        // not "same reduction order" alone). A non-power-of-two `scale`
+        // could show sub-ULP divergence here even at a single chunk,
+        // purely from where the multiply is applied — not exercised by
+        // this fixture; the genuinely reordering-tolerant case is
+        // `multi_chunk_matches_eager_reference_within_truth_relative_bound`
+        // below, which uses a truth-relative bound for exactly this
+        // reason.
         let device = Device::Cpu;
         let (b, h, s, d) = (2usize, 2usize, 5usize, 4usize);
         let n = b * h * s * d;
@@ -1155,17 +1490,17 @@ mod tests {
         let mask = zero_key_mask(b, s, &device);
         let scale = 1.0 / (d as f32).sqrt();
 
-        let expected = eager_reference(
-            &q0,
-            &k0,
-            &v0,
-            None,
-            None,
-            &mask,
-            None,
+        let expected = eager_reference(EagerReferenceParams {
+            q0: &q0,
+            k0: &k0,
+            v0: &v0,
+            cos: None,
+            sin: None,
+            key_mask: &mask,
+            half_window: None,
             scale,
-            FullyMaskedPolicy::Propagate,
-        )
+            policy: FullyMaskedPolicy::Propagate,
+        })
         .unwrap();
 
         let qkv = qkv_from(&q0, &k0, &v0).unwrap();
@@ -1216,17 +1551,17 @@ mod tests {
         let (cos, sin) = rope_tables(s, d, &device);
         let scale = 1.0 / (d as f32).sqrt();
 
-        let expected = eager_reference(
-            &q0,
-            &k0,
-            &v0,
-            Some(&cos),
-            Some(&sin),
-            &mask,
-            Some(half_window),
+        let expected = eager_reference(EagerReferenceParams {
+            q0: &q0,
+            k0: &k0,
+            v0: &v0,
+            cos: Some(&cos),
+            sin: Some(&sin),
+            key_mask: &mask,
+            half_window: Some(half_window),
             scale,
-            FullyMaskedPolicy::Propagate,
-        )
+            policy: FullyMaskedPolicy::Propagate,
+        })
         .unwrap();
 
         let qkv = qkv_from(&q0, &k0, &v0).unwrap();
@@ -1335,6 +1670,106 @@ mod tests {
         }
     }
 
+    // ---- MASKED_LSE_SENTINEL: the ONE oracle covering it (audit F1) ----
+
+    #[test]
+    fn zeros_triggered_rows_have_finite_output_and_exactly_zero_dq_through_real_backward() {
+        // F1 (round-1 audit, the standing finding): before this test,
+        // `MASKED_LSE_SENTINEL` (the constant `bwd`'s `p_c = exp(masked_c -
+        // lse)` relies on to force a `Zeros`-triggered row's softmax
+        // contribution to exactly zero — see the module doc's "`bwd`'s
+        // `lse` channel" section) was asserted NOWHERE: no test in this
+        // file ever called `.backward()` on a fixture that genuinely
+        // Zeros-triggers a row via BAND-plus-mask (not padding alone), so
+        // flipping its sign to `-1.0e30` left all tests green while
+        // silently producing `NaN` gradients on every triggered row in
+        // production (`exp(finite - (-1e30)) == exp(+inf) == inf`, then
+        // `inf * 0` contributions elsewhere resolve to `NaN`). This test
+        // closes that hole directly: `half_window=1` with keys `5..10`
+        // padded makes rows 8 and 9's ENTIRE band-limited window fall
+        // inside the padded region (row 8's window — keys 7,8,9 — spans
+        // the `chunk=4` boundary at key 8: key 7 is in chunk `[4,8)`, keys
+        // 8/9 are in chunk `[8,10)`), while row 0's window (keys 0,1) is
+        // fully real — so the SAME row of `dqkv` is checked in both the
+        // triggered and non-triggered case, through real `Tensor::
+        // backward()`, not a hand-rolled recompute.
+        let device = Device::Cpu;
+        let (b, h, s, d) = (1usize, 1usize, 10usize, 4usize);
+        let half_window = 1usize;
+        let chunk = 4usize; // 3 chunks: [0,4), [4,8), [8,10) — row 8's
+                            // window straddles the last two.
+        let mut mask_v = vec![0f32; b * s];
+        for v in mask_v.iter_mut().take(s).skip(5) {
+            *v = -10_000.0;
+        }
+        let mask = Tensor::from_vec(mask_v, (b, 1, 1, s), &device).unwrap();
+
+        let n = b * s * 3 * h * d;
+        let qkv0: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.019).sin() * 0.4).collect();
+        let qkv =
+            Var::from_tensor(&Tensor::from_vec(qkv0, (b, s, 3, h, d), &device).unwrap()).unwrap();
+        let (cos, sin) = rope_tables(s, d, &device);
+        let rope_pack = pack_rope(&cos, &sin).unwrap();
+        let scale = 1.0 / (d as f32).sqrt();
+        let dy_v: Vec<f32> = (0..(b * s * h * d))
+            .map(|i| ((i as f32) * 0.037).cos() * 0.5 + 0.1)
+            .collect();
+        let dy = Tensor::from_vec(dy_v, (b, s, h * d), &device).unwrap();
+
+        let op = MemEfficientAttention::new_test_chunk(
+            scale,
+            FullyMaskedPolicy::Zeros,
+            true,
+            Some(half_window),
+            chunk,
+        )
+        .unwrap();
+        let out = apply_stateful3(qkv.as_tensor(), &rope_pack, &mask, op).unwrap();
+        let out_v: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
+
+        // Forward-level precondition: rows 8/9 genuinely Zeros-trigger
+        // (band+mask combined, not padding alone); row 0 does not.
+        for qi in [8usize, 9] {
+            let row = &out_v[qi * (h * d)..(qi + 1) * (h * d)];
+            assert!(
+                row.iter().all(|v| *v == 0.0),
+                "precondition failed: row {qi} must Zeros-trigger, got {row:?}"
+            );
+        }
+        assert!(
+            out_v[0..h * d].iter().any(|v| *v != 0.0),
+            "precondition failed: row 0 must NOT Zeros-trigger"
+        );
+
+        let loss = (&out * &dy).unwrap().sum_all().unwrap();
+        let grads = loss.backward().unwrap();
+        let dqkv = grads.get(&qkv).unwrap();
+        let dqkv_v: Vec<f32> = dqkv.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(
+            dqkv_v.iter().all(|v| v.is_finite()),
+            "dqkv must be entirely finite (no NaN/inf from a Zeros-triggered row): {dqkv_v:?}"
+        );
+
+        // dqkv is [b, s, 3, h, d]; at b=1 the Q slot (three=0) for row `qi`
+        // starts at `qi * 3 * h * d`.
+        let stride_per_row = 3 * h * d;
+        for qi in [8usize, 9] {
+            let q_slot = &dqkv_v[qi * stride_per_row..qi * stride_per_row + h * d];
+            assert!(
+                q_slot.iter().all(|v| *v == 0.0),
+                "dQ at Zeros-triggered row {qi} must be EXACTLY zero (the row's output is a \
+                 CONSTANT under Zeros, not a differentiable function of the score — module doc): \
+                 got {q_slot:?}"
+            );
+        }
+        // Not vacuous: a non-triggered row's dQ must be nonzero.
+        let q_slot_0 = &dqkv_v[0..h * d];
+        assert!(
+            q_slot_0.iter().any(|v| *v != 0.0),
+            "dQ at non-triggered row 0 unexpectedly all-zero"
+        );
+    }
+
     // ---- band differential oracle (independent reference, w±1 controls) ----
 
     #[test]
@@ -1372,97 +1807,220 @@ mod tests {
     }
 
     // ---- RED controls: mutants the truth oracle must be able to catch ----
+    //
+    // Round-2 audit (F3): the two controls this section used to carry were
+    // both DISHONEST — `red_control_lse_off_by_one_chunk_diverges_bwd_
+    // recompute` never built its mutant (its final `assert!` was about the
+    // test's own literals, not the op), and `red_control_mask_applied_
+    // post_exp_is_caught_by_the_truth_oracle` drove a disconnected,
+    // UNCHUNKED toy helper — real math, but not this op's algorithm, and
+    // not the truth oracle either (its own name's claim). `running_softmax_
+    // row` below fixes both: it mirrors `attention_fwd_memeff_f32`'s own
+    // per-row recurrence VARIABLE-FOR-VARIABLE (`m`, `l`, `correction`, the
+    // rescale-then-accumulate shape) over a real multi-chunk loop, with
+    // three independently togglable, REAL mutations of that SAME
+    // algorithm — so each RED control below drives an actual instance of
+    // the named bug class through the actual chunked recurrence, not a
+    // toy stand-in. A fourth, independent verification (chunk-boundary
+    // off-by-one introduced directly into `attention_fwd_memeff_f32`
+    // itself, in a scratch copy) is cited in this crate's hand-off rather
+    // than committed as a fourth Rust test — see that control's own doc.
 
-    /// `pre_exp == true`: mask added to the score BEFORE `exp` (correct —
-    /// matches [`softmax_row_f32`]'s own order). `pre_exp == false`: the
-    /// annihilation mutant, mask added AFTER `exp`. Returns `sum_k p[k] *
-    /// k` — a single scalar summary sufficient to distinguish the two.
-    fn softmax_weighted_index_sum(col: &[f32], mask: &[f32], pre_exp: bool) -> f32 {
-        let vals: Vec<f32> = if pre_exp {
-            col.iter().zip(mask).map(|(&c, &m)| c + m).collect()
-        } else {
-            col.to_vec()
-        };
-        let max = vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let exp: Vec<f32> = if pre_exp {
-            vals.iter().map(|v| (v - max).exp()).collect()
-        } else {
-            vals.iter()
-                .zip(mask)
-                .map(|(v, &m)| (v - max).exp() + m)
-                .collect()
-        };
-        let sum: f32 = exp.iter().sum();
-        exp.iter()
-            .enumerate()
-            .map(|(kj, e)| (e / sum) * (kj as f32))
-            .sum()
+    /// Mirrors `attention_fwd_memeff_f32`'s per-row recurrence exactly
+    /// (same `m`/`l`/`correction`/rescale shape, same `c_start += clen`
+    /// advance), single-row so fixtures stay legible. Returns `(m, l,
+    /// weights)` where `weights[k] / l` is exactly the quantity
+    /// `acc_row[d] / denom` computes in production at global key `k`.
+    ///
+    /// Three independent mutation knobs, each a REAL instance of one named
+    /// bug class:
+    /// - `mask_pre_exp`: production always adds the mask BEFORE `exp`
+    ///   (`masked_row_buf[kj] = srow[kj] + combined`) — `false` reproduces
+    ///   the annihilation mutant (mask added AFTER `exp`).
+    /// - `chunk_stride_bug`: added to `clen` at the advance step
+    ///   (production: `c_start += clen`) — `-1` reprocesses a chunk's last
+    ///   key in the next chunk (double-counted), `+1` skips a key entirely
+    ///   (never counted). Clamped to `>= 1` so the loop always terminates.
+    /// - `lse_stops_after_chunks`: `Some(n)` computes `(m, l)` using only
+    ///   the FIRST `n` chunks, ignoring the rest — reproduces the
+    ///   lse-off-by-one-chunk mutant when `n` is smaller than the row's
+    ///   true chunk count.
+    fn running_softmax_row(
+        scores: &[f32],
+        mask: &[f32],
+        chunk: usize,
+        mask_pre_exp: bool,
+        chunk_stride_bug: i64,
+        lse_stops_after_chunks: Option<usize>,
+    ) -> (f32, f32, Vec<f32>) {
+        let s = scores.len();
+        let mut m = f32::NEG_INFINITY;
+        let mut l = 0f32;
+        let mut weights = vec![0f32; s];
+        let mut c_start = 0usize;
+        let mut chunk_idx = 0usize;
+        while c_start < s {
+            if let Some(n) = lse_stops_after_chunks {
+                if chunk_idx >= n {
+                    break;
+                }
+            }
+            let clen = chunk.min(s - c_start);
+            let mut row = vec![0f32; clen];
+            let mut chunk_max = f32::NEG_INFINITY;
+            for kj in 0..clen {
+                let v = if mask_pre_exp {
+                    scores[c_start + kj] + mask[c_start + kj]
+                } else {
+                    scores[c_start + kj] // mask added post-exp, below
+                };
+                row[kj] = v;
+                if v > chunk_max {
+                    chunk_max = v;
+                }
+            }
+            let new_max = m.max(chunk_max);
+            let correction = (m - new_max).exp();
+            for w in weights.iter_mut() {
+                *w *= correction;
+            }
+            let mut p_sum = 0f32;
+            for kj in 0..clen {
+                let mut e = (row[kj] - new_max).exp();
+                if !mask_pre_exp {
+                    e += mask[c_start + kj]; // the annihilation bug
+                }
+                weights[c_start + kj] = e;
+                p_sum += e;
+            }
+            l = l * correction + p_sum;
+            m = new_max;
+            let advance = (clen as i64 + chunk_stride_bug).max(1) as usize;
+            c_start += advance;
+            chunk_idx += 1;
+        }
+        (m, l, weights)
     }
 
     #[test]
-    fn red_control_mask_applied_post_exp_is_caught_by_the_truth_oracle() {
-        // The annihilation mutant: adding the mask AFTER exp (instead of
-        // before) is a materially different function whenever the mask is
-        // non-zero — this proves the truth-relative comparison above is
-        // non-vacuous by constructing the specific wrong computation and
-        // showing it does NOT pass.
-        let s = 6usize;
-        let col: Vec<f32> = (0..s).map(|i| (i as f32) * 0.1).collect();
-        let mut mask_v = vec![0f32; s];
-        mask_v[s - 1] = -10_000.0;
+    fn red_control_mask_applied_post_exp_diverges_from_the_real_chunked_recurrence() {
+        // A REAL instance of the annihilation mutant (F3 fix), driven
+        // through the SAME chunked online-softmax recurrence production
+        // uses (not a disconnected toy): mask added after `exp` instead of
+        // before, at a genuinely multi-chunk shape.
+        let s = 14usize;
+        let chunk = 5usize; // 3 chunks: [0,5),[5,10),[10,14)
+        let scores: Vec<f32> = (0..s).map(|i| ((i as f32) * 0.21).sin()).collect();
+        let mut mask = vec![0f32; s];
+        mask[s - 1] = -10_000.0;
 
-        let correct = softmax_weighted_index_sum(&col, &mask_v, true);
-        let mutant = softmax_weighted_index_sum(&col, &mask_v, false);
+        let (m_ok, l_ok, w_ok) = running_softmax_row(&scores, &mask, chunk, true, 0, None);
+        let (m_bad, l_bad, w_bad) = running_softmax_row(&scores, &mask, chunk, false, 0, None);
+
+        let weighted_index = |m: f32, l: f32, w: &[f32]| -> f32 {
+            let _ = (m, l);
+            w.iter()
+                .enumerate()
+                .map(|(k, e)| (e / l) * (k as f32))
+                .sum::<f32>()
+        };
+        let idx_ok = weighted_index(m_ok, l_ok, &w_ok);
+        let idx_bad = weighted_index(m_bad, l_bad, &w_bad);
         assert!(
-            (correct - mutant).abs() > 1e-3,
-            "the post-exp mutant must diverge from the correct pre-exp computation"
+            (idx_ok - idx_bad).abs() > 1e-2,
+            "post-exp mutant must diverge from the correct pre-exp chunked recurrence: \
+             correct={idx_ok} mutant={idx_bad}"
         );
     }
 
     #[test]
-    fn red_control_lse_off_by_one_chunk_diverges_bwd_recompute() {
-        // A `bwd` that reads the FIRST chunk's own local (max, sum) as if
-        // it were the row's final `lse` (rather than the running total
-        // across every chunk) recomputes a materially different `p_c` on
-        // any later chunk whenever that later chunk contributes non-
-        // negligible mass — this is a value-level demonstration that the
-        // lse-off-by-one-chunk mutant is DETECTABLE, exercised directly
-        // against this op's own real forward+lse computation.
-        let device = Device::Cpu;
-        let (b, h, s, d) = (1usize, 1usize, 12usize, 4usize);
-        let chunk = 6usize; // exactly 2 chunks
-        let n = b * h * s * d;
-        let q0v: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.09).sin()).collect();
-        let k0v: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.11).cos()).collect();
-        let v0v: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.13).sin()).collect();
-        let qkv = qkv_from(
-            &Tensor::from_vec(q0v, (b, h, s, d), &device).unwrap(),
-            &Tensor::from_vec(k0v, (b, h, s, d), &device).unwrap(),
-            &Tensor::from_vec(v0v, (b, h, s, d), &device).unwrap(),
-        )
-        .unwrap();
-        let (cos, sin) = rope_tables(s, d, &device);
-        let rope_pack = pack_rope(&cos, &sin).unwrap();
-        let mask = zero_key_mask(b, s, &device);
-        let scale = 1.0 / (d as f32).sqrt();
-        let op = MemEfficientAttention::new_test_chunk(
-            scale,
-            FullyMaskedPolicy::Propagate,
-            false,
-            None,
-            chunk,
-        )
-        .unwrap();
-        let out = apply_stateful3(&qkv, &rope_pack, &mask, op).unwrap();
-        let lse_real = out.dims(); // sanity: op ran
-        assert_eq!(lse_real, &[b, s, h * d]);
+    fn red_control_lse_off_by_one_chunk_breaks_the_normalization_identity() {
+        // A REAL instance of the lse-off-by-one-chunk mutant (F3 fix):
+        // `bwd`'s own formula is `p_c = exp(masked_c - lse)`
+        // (`mem_efficient_attention.rs`'s `bwd`) — for ANY correct `lse`,
+        // `sum_k exp(score_k - lse) == 1.0` over the row's FULL key range
+        // is a real, necessary identity (not a toy comparison); a `lse`
+        // computed from only the FIRST chunk (ignoring the rest) breaks it
+        // measurably, at a shape where the last row's window genuinely
+        // spans multiple chunks.
+        let s = 12usize;
+        let chunk = 5usize; // 3 chunks: [0,5),[5,10),[10,12)
+        let scores: Vec<f32> = (0..s).map(|i| ((i as f32) * 0.31).sin()).collect();
+        let mask = vec![0f32; s]; // unmasked throughout — isolates the lse bug
 
-        // Build a first-chunk-only "lse" directly (the mutant): local max
-        // and sum over keys [0, chunk) alone, ignoring the second chunk
-        // entirely — this is NOT what the real op stores.
-        // qi=11 (last row) genuinely attends to keys in BOTH chunks, so a
-        // first-chunk-only lse must diverge from the real `p` there.
-        assert!(chunk < s, "test setup must be genuinely multi-chunk");
+        let (m_ok, l_ok, _) = running_softmax_row(&scores, &mask, chunk, true, 0, None);
+        let (m_bad, l_bad, _) = running_softmax_row(
+            &scores,
+            &mask,
+            chunk,
+            true,
+            0,
+            Some(1), /* first chunk only */
+        );
+        let lse_ok = m_ok + l_ok.ln();
+        let lse_bad = m_bad + l_bad.ln();
+
+        let normalization_sum = |lse: f32| -> f32 { scores.iter().map(|v| (v - lse).exp()).sum() };
+        let sum_ok = normalization_sum(lse_ok);
+        let sum_bad = normalization_sum(lse_bad);
+
+        assert!(
+            (sum_ok - 1.0).abs() < 1e-4,
+            "the correct lse must satisfy bwd's own normalization identity: got {sum_ok}"
+        );
+        assert!(
+            (sum_bad - 1.0).abs() > 1e-2,
+            "the lse-off-by-one-chunk mutant must BREAK bwd's normalization identity: got \
+             {sum_bad}"
+        );
+    }
+
+    #[test]
+    fn red_control_chunk_boundary_off_by_one_diverges_from_the_real_chunked_recurrence() {
+        // The third contracted control (F3 fix): a REAL instance of a
+        // chunk-boundary stride bug (`c_start += clen ± 1` instead of
+        // `c_start += clen`), driven through the SAME recurrence. Verified
+        // ADDITIONALLY (round-2 audit response) by introducing this exact
+        // stride bug directly into `attention_fwd_memeff_f32`'s own
+        // `c_start += clen` line in a SCRATCH COPY and re-running
+        // `multi_chunk_matches_eager_reference_within_truth_relative_bound`
+        // — confirmed RED (cited in this crate's hand-off, not committed
+        // as a fifth test here, since that mutation touches production
+        // code and this file must not ship a standing self-mutating test).
+        let s = 17usize;
+        let chunk = 5usize; // 4 chunks: [0,5),[5,10),[10,15),[15,17)
+        let scores: Vec<f32> = (0..s).map(|i| ((i as f32) * 0.17).cos()).collect();
+        let mask = vec![0f32; s];
+
+        let (m_ok, l_ok, w_ok) = running_softmax_row(&scores, &mask, chunk, true, 0, None);
+        // Skip bug: a boundary key vanishes from every chunk after the
+        // first (`+1` advance).
+        let (m_skip, l_skip, w_skip) = running_softmax_row(&scores, &mask, chunk, true, 1, None);
+        // Reprocess bug: a boundary key is double-counted across adjacent
+        // chunks (`-1` advance).
+        let (m_dup, l_dup, w_dup) = running_softmax_row(&scores, &mask, chunk, true, -1, None);
+
+        let weighted_index = |l: f32, w: &[f32]| -> f32 {
+            w.iter()
+                .enumerate()
+                .map(|(k, e)| (e / l) * (k as f32))
+                .sum::<f32>()
+        };
+        let idx_ok = weighted_index(l_ok, &w_ok);
+        let idx_skip = weighted_index(l_skip, &w_skip);
+        let idx_dup = weighted_index(l_dup, &w_dup);
+        let _ = (m_ok, m_skip, m_dup);
+
+        assert!(
+            (idx_ok - idx_skip).abs() > 1e-2,
+            "the skip-a-key chunk-boundary mutant must diverge: correct={idx_ok} \
+             mutant={idx_skip}"
+        );
+        assert!(
+            (idx_ok - idx_dup).abs() > 1e-2,
+            "the reprocess-a-key chunk-boundary mutant must diverge: correct={idx_ok} \
+             mutant={idx_dup}"
+        );
     }
 
     // ---- qkv-gradient RED control: a (None,None,None) bwd mutant ----
@@ -1619,17 +2177,17 @@ mod tests {
             .unwrap()
             .contiguous()
             .unwrap();
-        let out_eager = eager_reference(
-            &q0,
-            &k0,
-            &v0,
-            Some(&cos),
-            Some(&sin),
-            &mask,
-            Some(half_window),
+        let out_eager = eager_reference(EagerReferenceParams {
+            q0: &q0,
+            k0: &k0,
+            v0: &v0,
+            cos: Some(&cos),
+            sin: Some(&sin),
+            key_mask: &mask,
+            half_window: Some(half_window),
             scale,
-            FullyMaskedPolicy::Zeros,
-        )
+            policy: FullyMaskedPolicy::Zeros,
+        })
         .unwrap();
         let loss_eager = (&out_eager * &dy).unwrap().sum_all().unwrap();
         let grads_eager = loss_eager.backward().unwrap();

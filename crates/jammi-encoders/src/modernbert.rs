@@ -4368,22 +4368,38 @@ mod tests {
         }
     }
 
-    /// PROVISIONAL bound for [`flash_arm_padded_matches_block_arm_on_real_rows_cuda`]
-    /// — UNCALIBRATED (contract v4's STOP-and-report discipline, disclosed
-    /// rather than silently asserted as if measured): no A100 artifact
-    /// exists yet for the padded/ragged shape (unlike
-    /// [`FLASH_ORACLE_K_MEAN_POOLED`], which cites a real, committed run).
-    /// Set generously loose (well above the DENSE arm's own measured
-    /// healthy ratio of `1.6`, since the ragged arm's per-row RoPE table
-    /// gather is additional arithmetic the dense arm does not do) so this
-    /// test can still catch a GROSS defect on first real-hardware run
-    /// without false-RED-ing on ordinary bf16 rounding noise it has never
-    /// been calibrated against. A pod run must tighten this the same way
-    /// `FLASH_ORACLE_K_MEAN_POOLED`/`FLASH_ORACLE_K_MEAN_GRAD` were
-    /// tightened from their own first-pass values, citing the resulting
-    /// artifact.
+    /// Bound for [`flash_arm_padded_matches_block_arm_on_real_rows_cuda`],
+    /// tightened from its own first-pass (`3.0`, UNCALIBRATED) value by the
+    /// SAME headroom discipline [`FLASH_ORACLE_K_MEAN_POOLED`]'s own doc
+    /// uses for its `relative_l1_error` leg (the SAME metric this padded
+    /// oracle's own `ratio` is — never [`FLASH_ORACLE_K_MEAN_GRAD`]'s
+    /// `cosine_distance` leg, a different metric on a different quantity):
+    /// measured by
+    /// `crates/jammi-kernels/artifacts/cuda-runs/2026-08-28-m1b-b3-padded-oracles-c2365c9-a100-pcie.json`
+    /// (A100 80GB PCIe, driver 570.211.01, `flash_arm_padded_matches_block_arm_on_real_rows_cuda`
+    /// itself, `--nocapture`, at `c2365c9`): real-row ratio = `0.229503`.
+    /// `0.34` gives `0.34 / 0.229503` ≈ `1.48`x margin over that measured
+    /// value — the SAME `~1.5`x headroom `FLASH_ORACLE_K_MEAN_POOLED`'s own
+    /// `1.6` gives over ITS measured healthy mean (`1.6 / 1.0798` ≈
+    /// `1.48`x) — never a fitted constant (`0.229503` itself, or a bare
+    /// round-up of it, would leave zero margin for ordinary run-to-run bf16
+    /// noise).
+    ///
+    /// KNOWN GAP, honestly disclosed (not silently matched): unlike
+    /// [`FLASH_ORACLE_K_MEAN_POOLED`]'s doc, which ALSO cites how far below
+    /// the WEAKEST measured RED-control mutant mean its bound sits (the
+    /// K-unrotated/window-dropped/bad-softmax-scale means measured on that
+    /// same leg), no equivalent ratio-based mutant measurement exists yet
+    /// for this padded-arm leg — its own RED controls
+    /// ([`flash_arm_padded_red_control_lengths_off_by_one_cuda`] and the
+    /// `w±1` siblings below it) assert bit-inequality (`assert_ne!`), not a
+    /// measured ratio, so there is no "weakest mutant mean" to check this
+    /// bound sits comfortably below yet. Only the headroom-over-healthy
+    /// half of the dense arm's convention is replicated here; a future
+    /// ratio-based padded-arm RED control would let this bound's OTHER half
+    /// be checked too.
     #[cfg(all(feature = "cuda", feature = "flash-attn"))]
-    const FLASH_ORACLE_PADDED_PROVISIONAL_BOUND: f64 = 3.0;
+    const FLASH_ORACLE_PADDED_BOUND: f64 = 0.34;
 
     /// The padded CUDA parity oracle (contract v4 §3.1 item 7): compares
     /// `attention_block_flash`'s PADDED/ragged arm against the pre-existing,
@@ -4394,8 +4410,8 @@ mod tests {
     /// `repad_rows` destination). `relative_l1_error` (the SAME truth-relative
     /// convention [`flash_oracle_sweep`] uses against an f32 reference — here
     /// against the block arm, the closest already-validated reference this
-    /// NEW arm has) against [`FLASH_ORACLE_PADDED_PROVISIONAL_BOUND`] (see
-    /// that constant's own doc for why it is provisional). Also asserts the
+    /// NEW arm has) against [`FLASH_ORACLE_PADDED_BOUND`] (see that
+    /// constant's own doc for its derivation). Also asserts the
     /// pad-rows-exact-zero premise on the flash arm's OWN output directly,
     /// and the dispatch-proof counters (`fused == num_hidden_layers,
     /// declined == 0` — an eligible padded batch is NEVER declined,
@@ -4494,12 +4510,12 @@ mod tests {
         let ratio = relative_l1_error(&flash_real, &block_real);
         eprintln!(
             "flash_arm_padded_matches_block_arm_on_real_rows_cuda: real-row ratio={ratio:.5e} \
-             (provisional bound {FLASH_ORACLE_PADDED_PROVISIONAL_BOUND})"
+             (bound {FLASH_ORACLE_PADDED_BOUND})"
         );
         assert!(
-            ratio < FLASH_ORACLE_PADDED_PROVISIONAL_BOUND,
-            "flash-padded vs block-arm real-row ratio {ratio:.5e} exceeds the provisional bound \
-             {FLASH_ORACLE_PADDED_PROVISIONAL_BOUND} -- see that constant's own doc"
+            ratio < FLASH_ORACLE_PADDED_BOUND,
+            "flash-padded vs block-arm real-row ratio {ratio:.5e} exceeds the bound \
+             {FLASH_ORACLE_PADDED_BOUND} -- see that constant's own doc"
         );
     }
 

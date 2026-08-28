@@ -61,6 +61,21 @@ pub(crate) trait CandleTextForward: Send + Sync {
     /// L2-normalizes it; encoders that need a different or model-declared
     /// strategy (the BERT family) or whose `forward_hidden` is already
     /// pooled (e.g. OpenCLIP text) override this directly.
+    ///
+    /// **Pairing rule with [`Self::resolved_pooling`] (audit round 62
+    /// advisory A1, folded round 4)**: this default performs REAL mean
+    /// pooling — a caller that reads [`Self::resolved_pooling`]'s default
+    /// (`None`) after calling this default would wrongly conclude no
+    /// pooling occurred. If you override ONE of these two methods, override
+    /// BOTH, so `resolved_pooling()` always reports the SAME strategy this
+    /// method actually applies. The three classification wrappers below
+    /// (`*ClassificationForward`) are the one place both defaults are used
+    /// together today, and that pairing is safe ONLY because
+    /// `LoadedModel::forward` never routes `ModelTask::TextEmbedding` (the
+    /// sole caller of `forward_pooled`) to a classification-loaded model —
+    /// this default is dead code for them, never actually invoked over
+    /// their softmax-logit `forward_hidden` output. Do not rely on that
+    /// routing invariant for a NEW wrapper without re-verifying it holds.
     fn forward_pooled(
         &self,
         input_ids: &Tensor,
@@ -86,6 +101,18 @@ pub(crate) trait CandleTextForward: Send + Sync {
     /// `LoadedModel::compute_precision` already follows). Trait-default
     /// `None` so a future wrapper doesn't silently claim a pooling strategy
     /// it doesn't have.
+    ///
+    /// **Pairing rule with [`Self::forward_pooled`] (audit round 62 advisory
+    /// A1, folded round 4)**: `forward_pooled`'s own default is NOT a no-op
+    /// — it mean-pools for real — so this method's `None` default is
+    /// truthful ONLY for a wrapper that never actually reaches
+    /// `forward_pooled`'s default at runtime (see that method's doc for
+    /// which callers/routing that depends on). A wrapper that inherits
+    /// `forward_pooled`'s default AND is reachable via
+    /// `ModelTask::TextEmbedding` must override THIS method to return
+    /// `Some(Pooling::Mean)` — inheriting both defaults together for a
+    /// wrapper that pooling actually applies to is the exact silent
+    /// mismatch this note exists to prevent.
     fn resolved_pooling(&self) -> Option<Pooling> {
         None
     }
@@ -707,13 +734,23 @@ fn content_digest_entries(resolved: &ResolvedModel) -> Result<Vec<(String, std::
 /// the digest's present-only input set — and whether this candidate SLOT is
 /// inherently optional (audit round 62, F-4': `optional`, orthogonal to
 /// `gated`). `optional` is a property of the candidate's TYPE, fixed at
-/// construction below, never derived from whether it happens to exist right
-/// now: `1_Pooling/config.json` and `preprocessor_config.json` are optional
-/// because the loader has a documented, correctness-preserving fallback for
-/// their absence (mean pooling / no preprocessor geometry); `config.json`,
+/// construction below — but NOT a property of the SLOT alone (audit round
+/// 62, F-B): whether a given slot is optional can depend on the resolved
+/// model's CLASS. `1_Pooling/config.json` is unconditionally optional —
+/// every text-embedding wrapper falls back to mean pooling on its absence.
+/// `preprocessor_config.json` is optional ONLY for a model whose loader path
+/// does not require it (every non-CLAP-audio class: BERT-family text
+/// towers, OpenCLIP, classification/NER heads); for an HF-CLAP audio model
+/// (`is_hf_clap_config`, the SAME structural signal
+/// [`CandleBackend::load`]'s own `is_clap`/`audio.is_some()` branch uses to
+/// choose the audio path) it is REQUIRED — that loader path has no
+/// fallback and hard-refuses outright when the file is missing (see
+/// `audio_frontend`'s construction in `CandleBackend::load`). `config.json`,
 /// the tokenizer, every weights path, and the adapter pair (once
-/// `adapter_path` is `Some`) are required because the loader has no such
-/// fallback — their absence makes any reload fail identically. See
+/// `adapter_path` is `Some`) are unconditionally required because the
+/// loader has no fallback for any of them — their absence makes any reload
+/// fail identically regardless of model class. See
+/// [`preprocessor_config_is_required`] for the per-class predicate and
 /// [`ModelFingerprint::probe`] for the arm this field selects.
 struct DigestCandidate {
     rel: String,
@@ -770,14 +807,15 @@ fn all_candidate_paths(resolved: &ResolvedModel) -> Result<Vec<DigestCandidate>>
         optional: true,
     });
 
-    // `preprocessor_config.json` (F-2): same pattern — the CLAP audio
-    // tower's whole feature-extractor geometry lives here. `optional: true`
-    // (F-4') for the identical reason.
+    // `preprocessor_config.json` (F-2): same CANDIDATE pattern as
+    // `1_Pooling/config.json` above, but its `optional`-ness is PER-CLASS,
+    // not fixed (audit round 62, F-B) — see
+    // [`preprocessor_config_is_required`]'s doc.
     candidates.push(RawCandidate {
         path: model_dir.join("preprocessor_config.json"),
         anchor: model_dir.clone(),
         gated: resolved.preprocessor_config.is_some(),
-        optional: true,
+        optional: !preprocessor_config_is_required(resolved),
     });
 
     if let Some(tokenizer) = &resolved.tokenizer {
@@ -965,19 +1003,26 @@ impl ModelFingerprint {
     ///
     /// (a) absent-at-load, absent-now: unchanged — `Ok(true)` continues.
     /// (b) OPTIONAL candidate, present-at-load, `NotFound`-now (e.g.
-    ///     `1_Pooling/config.json` deleted from a live model directory): the
-    ///     loader has a documented fallback for this candidate's absence
-    ///     (mean pooling / no preprocessor geometry) — a fresh reload
-    ///     legitimately SUCCEEDS, with a NEW digest reflecting the fallback.
-    ///     Reported as STALE (`Ok(false)`), not `Err`: the pre-F-4' code
-    ///     collapsed this into `Err` indistinguishably from arm (c),
-    ///     permanently wedging `ModelCache::get_or_load` on a model that a
-    ///     cold reload would serve just fine.
+    ///     `1_Pooling/config.json` deleted from a live model directory, or
+    ///     `preprocessor_config.json` deleted from a live NON-CLAP model):
+    ///     the loader has a documented fallback for this candidate's absence
+    ///     on THIS model's class (mean pooling / no preprocessor geometry) —
+    ///     a fresh reload legitimately SUCCEEDS, with a NEW digest reflecting
+    ///     the fallback. Reported as STALE (`Ok(false)`), not `Err`: the
+    ///     pre-F-4' code collapsed this into `Err` indistinguishably from
+    ///     arm (c), permanently wedging `ModelCache::get_or_load` on a model
+    ///     that a cold reload would serve just fine. `optional` is a
+    ///     per-CLASS property, not a per-slot constant (audit round 62,
+    ///     F-B) — `preprocessor_config.json` deleted from a live HF-CLAP
+    ///     audio model is NOT this arm; see [`preprocessor_config_is_required`]
+    ///     and arm (c) below.
     /// (c) REQUIRED candidate (`config.json`, the tokenizer, any weights
-    ///     path, or the adapter pair once `adapter_path` is `Some`),
-    ///     present-at-load, `NotFound`-now: the loader has NO fallback — a
-    ///     reload would fail identically — so this remains the typed
-    ///     refusal (`Err`), unchanged from before F-4'.
+    ///     path, the adapter pair once `adapter_path` is `Some`, OR
+    ///     `preprocessor_config.json` deleted from a live HF-CLAP audio
+    ///     model — audit round 62, F-B), present-at-load, `NotFound`-now:
+    ///     the loader has NO fallback — a reload would fail identically —
+    ///     so this remains the typed refusal (`Err`), unchanged from before
+    ///     F-4'.
     pub(crate) fn probe(&self) -> Result<bool> {
         for (rel, path, snapshot, optional) in &self.entries {
             match std::fs::metadata(path) {
@@ -2483,6 +2528,34 @@ fn is_hf_clap_config(config: &serde_json::Value) -> bool {
         })
 }
 
+/// Whether `preprocessor_config.json` is a REQUIRED digest candidate for
+/// `resolved`, or an OPTIONAL one with a correctness-preserving fallback
+/// (audit round 62, F-B).
+///
+/// `all_candidate_paths` previously marked this slot `optional: true`
+/// unconditionally, but [`CandleBackend::load`]'s audio branch
+/// (`audio_frontend`'s construction, gated on `audio.is_some()`) hard-refuses
+/// an HF-CLAP audio model with no `preprocessor_config.json` — there is no
+/// fallback on that path. A deleted `preprocessor_config.json` on a live
+/// CLAP model therefore mis-labels [`ModelFingerprint::probe`]'s arm (c)
+/// ("required candidate vanished — typed refusal, no fallback exists") as
+/// arm (b) ("optional candidate vanished — stale, a reload legitimately
+/// succeeds via the fallback"): the probe reports `Ok(false)` (stale), the
+/// cache evicts and reloads, and the reload hits `CandleBackend::load`'s
+/// hard error instead of the honest typed refusal `probe` should have
+/// produced directly.
+///
+/// The fix: derive `optional` from the candidate's OWN loader predicate —
+/// the resolved model's CLASS, using the identical structural signal
+/// [`CandleBackend::load`] itself branches the audio path on
+/// ([`is_hf_clap_config`] on `resolved.model_config`), not a hardcoded
+/// model-name match. Every non-CLAP-audio class (BERT-family text towers,
+/// OpenCLIP, classification/NER heads) keeps the pre-existing
+/// mean/absent-geometry fallback and stays optional.
+fn preprocessor_config_is_required(resolved: &ResolvedModel) -> bool {
+    is_hf_clap_config(&resolved.model_config)
+}
+
 /// Build the CLAP fusion front-end geometry from a HuggingFace
 /// `preprocessor_config.json` (`ClapFeatureExtractor` arguments). Every numeric
 /// the bytes-to-spectrogram transform needs is read from the config — nothing
@@ -3847,6 +3920,113 @@ mod digest_fingerprint_audit62_tests {
         );
     }
 
+    // ── F-B (audit round 62, adversarial round 4): `preprocessor_config.json` \
+    //    is optional PER MODEL CLASS, not per slot ──
+
+    /// [`preprocessor_config_is_required`] unit level: a text-tower class
+    /// (a plain BERT `config.json`, the identical shape `tiny_bert_resolved`
+    /// produces) has no `model_type`/`architectures` signal that
+    /// [`is_hf_clap_config`] recognises, so the slot stays optional — the
+    /// pre-existing mean/absent-geometry fallback still applies.
+    #[test]
+    fn preprocessor_config_is_required_false_for_a_text_tower_class() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let resolved = tiny_bert_resolved(&model_tmp.path().join("model"), None);
+        assert!(
+            !preprocessor_config_is_required(&resolved),
+            "a BERT-family text-tower model_config must classify as \
+             NOT requiring preprocessor_config.json"
+        );
+    }
+
+    /// [`preprocessor_config_is_required`] unit level, the other class: an
+    /// HF-CLAP audio `model_config` (`model_type == \"clap_audio_model\"`,
+    /// the SAME structural signal [`CandleBackend::load`]'s own `is_clap`
+    /// branches the audio path on) has no fallback for a missing
+    /// `preprocessor_config.json` — the slot must classify as required.
+    #[test]
+    fn preprocessor_config_is_required_true_for_a_clap_audio_class() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let mut resolved = tiny_bert_resolved(&model_tmp.path().join("model"), None);
+        resolved.model_config = serde_json::json!({ "model_type": "clap_audio_model" });
+        assert!(
+            preprocessor_config_is_required(&resolved),
+            "an HF-CLAP audio model_config must classify as REQUIRING \
+             preprocessor_config.json — CandleBackend::load's audio branch \
+             hard-refuses without it, with no fallback"
+        );
+
+        // The nested-`audio_config` shape (top-level `ClapConfig`) is the
+        // SAME class by the SAME signal `is_hf_clap_config` recognises.
+        resolved.model_config = serde_json::json!({
+            "audio_config": { "model_type": "clap_audio_model" }
+        });
+        assert!(
+            preprocessor_config_is_required(&resolved),
+            "the nested audio_config CLAP shape must also classify as \
+             requiring preprocessor_config.json"
+        );
+    }
+
+    /// End-to-end (F-B, block): reproduces the auditor's exact scenario at
+    /// the [`ModelFingerprint::probe`] level, not just the classifier
+    /// function in isolation. A CLAP-shaped resolved model has a
+    /// `preprocessor_config.json` present at fingerprint-capture time; it is
+    /// then deleted from the live model directory (as if a caller pruned
+    /// stale artifacts, or the file was overwritten by an in-place update
+    /// that failed partway).
+    ///
+    /// RED pre-fix: `preprocessor_config.json`'s `optional` was fixed
+    /// `true` unconditionally, so this candidate always fell into arm (b)
+    /// — `probe()` returns `Ok(false)` (stale, "a reload will succeed via
+    /// the fallback"). `ModelCache::get_or_load` would evict and reload,
+    /// and the reload hits `CandleBackend::load`'s hard error ("CLAP audio
+    /// model is missing preprocessor_config.json") instead of the honest
+    /// typed refusal `probe` should have surfaced directly.
+    ///
+    /// GREEN post-fix: `preprocessor_config_is_required` classifies this
+    /// resolved model as CLAP audio, so the candidate is `optional: false`
+    /// — arm (c) applies and `probe()` returns `Err` directly, matching
+    /// what a reload would do anyway, without first pretending the model is
+    /// merely stale.
+    #[test]
+    fn probe_clap_preprocessor_config_deleted_after_capture_is_a_typed_refusal_not_stale() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let mut resolved = tiny_bert_resolved(&dst, None);
+        resolved.model_config = serde_json::json!({ "model_type": "clap_audio_model" });
+        let preprocessor_json = serde_json::json!({
+            "sampling_rate": 48000,
+            "hop_length": 480,
+            "max_length_s": 10,
+        });
+        std::fs::write(
+            dst.join("preprocessor_config.json"),
+            serde_json::to_string(&preprocessor_json).unwrap(),
+        )
+        .unwrap();
+        resolved.preprocessor_config = Some(preprocessor_json);
+
+        let fingerprint = compute_model_fingerprint(&resolved).unwrap();
+        assert!(
+            fingerprint.probe().unwrap(),
+            "sanity: fresh immediately after capture"
+        );
+
+        std::fs::remove_file(dst.join("preprocessor_config.json")).unwrap();
+
+        let result = fingerprint.probe();
+        assert!(
+            result.is_err(),
+            "preprocessor_config.json deleted from a live CLAP model must \
+             be a typed refusal (F-B): CandleBackend::load has no fallback \
+             for a CLAP audio tower missing this file, so a reload would \
+             fail identically — reporting STALE (Ok(false)) here would \
+             mis-route the caller into an eviction+reload that cannot \
+             succeed. Got {result:?}"
+        );
+    }
+
     // ── F-4'' (audit round 62, adversarial round 3): fingerprint-before- \
     //    digest ordering ──
     //
@@ -3943,10 +4123,35 @@ mod digest_fingerprint_audit62_tests {
         );
     }
 
-    /// Pins that production actually routes through the composed function
-    /// (never the two primitives independently) and that its return shape
-    /// is `(ModelFingerprint, ModelContentDigest)` — fingerprint first,
-    /// matching the doc'd call order inside it.
+    /// Pins the composed function's OUTPUT correctness — its digest matches
+    /// an independent manual `compute_model_content_digest` call, and its
+    /// fingerprint reports fresh — and its return shape,
+    /// `(ModelFingerprint, ModelContentDigest)`.
+    ///
+    /// **What this test does NOT prove (audit round 62 advisory A1, folded
+    /// round 4)**: over an UNMUTATED directory (the only case exercised
+    /// here), fingerprint-then-digest and digest-then-fingerprint produce
+    /// byte-identical results — there is no racing mutation in this test to
+    /// make the two internal calls' ORDER observable, so this assertion
+    /// stays green even if `compute_model_identity_facets`'s two-line body
+    /// silently swapped `compute_model_fingerprint` and
+    /// `compute_model_content_digest`. This test is NOT what pins that
+    /// order. Making the order itself observable would require racing a
+    /// real mutation into the window between the two internal calls, which
+    /// needs a `#[cfg(test)]` pause seam INSIDE
+    /// `compute_model_identity_facets` — deliberately not added (see that
+    /// function's doc: a second instrumentation seam is itself a second,
+    /// harder-to-review place the order could drift from). The actual
+    /// guarantees against a silent reorder are: (1) STRUCTURAL —
+    /// `compute_model_identity_facets` is the sole production call site
+    /// (this file's only other callers of the two primitives are tests),
+    /// its doc comment calls out the ordering invariant explicitly, and a
+    /// diff touching its two-line body is exactly the size a reviewer can
+    /// actually read and hold to that doc; and (2) BEHAVIORAL —
+    /// `stat_before_hash_converges_after_a_racing_mutation` (above) proves
+    /// WHY stat-first is the safe order, using the two primitives called
+    /// manually with a real racing mutation in between, even though it does
+    /// not call the composed function itself.
     #[test]
     fn compute_model_identity_facets_matches_manual_stat_then_hash_calls() {
         let model_tmp = tempfile::tempdir().unwrap();

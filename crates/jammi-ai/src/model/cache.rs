@@ -211,8 +211,26 @@ impl ModelCache {
             // re-validate branch below — which already holds the WRITE
             // lock and increments `ref_count` in the same critical section
             // — makes the two atomic: `evict_one` (also write-lock-gated)
-            // can only ever observe `ref_count == 0` with NO permit clone
-            // outstanding, so its `true` is always real progress.
+            // never observes `ref_count == 0` with an outstanding permit
+            // clone made by THIS acquire-side snapshot path.
+            //
+            // That closes only the acquire side (F-3'). Audit round 62,
+            // F-A: the release side had a matching hole — `ModelGuard`'s
+            // `Drop` used to decrement `ref_count` in its body while its own
+            // `_gpu_permit` clone dropped only afterward (Rust drops struct
+            // fields after the `Drop` impl body returns), so `ref_count ==
+            // 0` could become visible to a concurrent `evict_one` while that
+            // guard's permit clone was still alive. `ModelGuard::drop` now
+            // releases its permit clone (via `Option::take`) BEFORE the
+            // `fetch_sub`, but `evict_one` no longer trusts `ref_count == 0`
+            // as sufficient PROOF of "no permit clone outstanding" either
+            // way — it is NOT vacuously true just because both known races
+            // are closed; a future caller could reintroduce a third one.
+            // `evict_one` instead checks `Arc::strong_count(&entry.gpu_permit)
+            // == 1` directly at removal time, which is the actual quantity
+            // that determines whether dropping the entry releases the
+            // reservation. That check, not the ordering above, is the real
+            // guarantee behind `evict_one`'s `true`.
             let snapshot = {
                 let cache = self.inner.read().await;
                 cache
@@ -252,11 +270,7 @@ impl ModelCache {
                                     .gpu_permit,
                             );
                             cache.touch_lru(&id);
-                            return Ok(ModelGuard {
-                                model,
-                                ref_count,
-                                _gpu_permit: gpu_permit,
-                            });
+                            return Ok(ModelGuard::new(model, ref_count, gpu_permit));
                         }
                         // The entry changed under us (a concurrent
                         // evict/reload won the race) — retry against the
@@ -503,11 +517,7 @@ impl ModelCache {
         );
         cache.lru_order.push_back(id.clone());
 
-        Ok(ModelGuard {
-            model,
-            ref_count,
-            _gpu_permit: gpu_permit,
-        })
+        Ok(ModelGuard::new(model, ref_count, gpu_permit))
     }
 
     /// Preload a model without running inference.
@@ -531,20 +541,50 @@ impl CacheInner {
         self.lru_order.push_back(id.clone());
     }
 
+    /// Evict the oldest idle entry and report whether real progress was
+    /// made (i.e. a `GpuPermit` reservation was actually released).
+    ///
+    /// Audit round 62, F-A: `ref_count == 0` alone is NOT sufficient to
+    /// promise a caller (`do_load`'s admission loop) that removing this
+    /// entry frees GPU budget. A `ModelGuard`'s `Drop` releases its permit
+    /// clone before decrementing `ref_count` (see `ModelGuard::drop`'s
+    /// doc), so by the time `ref_count` reaches 0 the LAST outstanding
+    /// clone has, in the common case, already gone — but a snapshot taken
+    /// by a concurrent fast-path `get_or_load` between the write-lock
+    /// section that increments `ref_count` and clones the permit (see
+    /// `get_or_load`'s "atomic with the clone below" comment) can, in
+    /// principle, still hold a permit clone this scan cannot see reflected
+    /// in `ref_count` alone. We therefore gate progress on the actual,
+    /// checkable invariant: at removal time, THIS `CacheEntry`'s
+    /// `gpu_permit` clone must be the only clone left
+    /// (`Arc::strong_count == 1`) — only then does dropping it truly
+    /// decrement `GpuScheduler::reserved_memory`. An entry that is
+    /// `ref_count == 0` but whose permit still has outstanding clones is
+    /// not idle in the accounting sense: we skip it (leave it in the cache)
+    /// and keep scanning for another candidate, rather than removing it and
+    /// lying about progress.
     fn evict_one(&mut self) -> bool {
         let evict_id = self
             .lru_order
             .iter()
             .find(|id| {
-                self.entries
-                    .get(*id)
-                    .is_some_and(|e| e.ref_count.load(Ordering::Relaxed) == 0)
+                self.entries.get(*id).is_some_and(|e| {
+                    e.ref_count.load(Ordering::Relaxed) == 0
+                        && Arc::strong_count(&e.gpu_permit) == 1
+                })
             })
             .cloned();
 
         if let Some(id) = evict_id {
             if let Some(entry) = self.entries.remove(&id) {
                 self.lru_order.retain(|x| x != &id);
+                debug_assert_eq!(
+                    Arc::strong_count(&entry.gpu_permit),
+                    1,
+                    "evict_one only removes entries whose permit clone is the last one \
+                     outstanding — dropping `entry` here must be what actually releases \
+                     the GpuScheduler reservation"
+                );
                 tracing::info!(
                     model_id = %id.0,
                     bytes = entry.memory_bytes,
@@ -658,7 +698,9 @@ mod f3_prime_tests {
         let cache = Arc::new(ModelCache::new(resolver, device_config(), scheduler));
 
         // (1) Load A, then drop the guard: A is warm, resident, and IDLE
-        // (`ref_count == 0`) — `evict_one`'s only eligibility condition.
+        // (`ref_count == 0` AND its permit's only remaining clone is the
+        // `CacheEntry`'s own, i.e. `Arc::strong_count(&gpu_permit) == 1`) —
+        // `evict_one`'s eligibility condition (F-A, round 4).
         let guard_a = cache
             .get_or_load(&source_a, ModelTask::TextEmbedding, None)
             .await
@@ -719,6 +761,131 @@ mod f3_prime_tests {
                  race to B's eviction — got Err({e})"
             );
         }
+    }
+
+    /// F-A (audit round 62, adversarial round 4, block): `evict_one` must
+    /// not claim progress for a `ref_count == 0` entry whose `gpu_permit`
+    /// still has an outstanding clone — the exact window
+    /// `ModelGuard::drop`'s pre-fix field-declaration-order drop could
+    /// produce (the body's `fetch_sub` made `ref_count == 0` visible before
+    /// the struct's `_gpu_permit` field itself dropped). Rather than trying
+    /// to reproduce that narrow ordering race through the async cache API,
+    /// this test drives `CacheInner::evict_one` DIRECTLY against a
+    /// hand-built `CacheEntry` whose permit has a second, test-held clone —
+    /// deterministically constructing the exact state the race could leave
+    /// behind, with no timing dependency at all.
+    ///
+    /// Pre-fix (`evict_one` gated only on `ref_count == 0`): this assertion
+    /// is RED — `evict_one` removes the misleading entry, returns `true`,
+    /// and the outstanding clone (`outstanding_clone`) means
+    /// `GpuScheduler::reserved_memory` is NOT actually decremented by that
+    /// removal, exactly reproducing the double-booking `do_load`'s
+    /// admission loop would trust.
+    ///
+    /// Post-fix (`evict_one` also gates on
+    /// `Arc::strong_count(&entry.gpu_permit) == 1`): GREEN — the misleading
+    /// entry is skipped, the genuinely idle one is evicted instead, and once
+    /// the outstanding clone is finally dropped the (now genuinely idle)
+    /// remaining entry is evicted too.
+    #[tokio::test]
+    async fn evict_one_does_not_claim_progress_for_an_entry_whose_permit_has_an_outstanding_clone()
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
+        let resolver = ModelResolver::new(Arc::clone(&catalog), test_artifact_store()).unwrap();
+        let (source, _weights_len) = tiny_bert_source(tmp.path(), "model_x");
+
+        // A real, loaded `Arc<LoadedModel>` — only used as a valid handle
+        // for the hand-built `CacheEntry`s below; the model's own state is
+        // irrelevant to this test.
+        let scheduler = Arc::new(GpuScheduler::new_unlimited());
+        let cache = ModelCache::new(resolver, device_config(), Arc::clone(&scheduler));
+        let guard = cache
+            .get_or_load(&source, ModelTask::TextEmbedding, None)
+            .await
+            .unwrap();
+        let model = Arc::clone(&guard.model);
+        drop(guard);
+
+        // Entry X: `ref_count == 0` (the naive "idle" signal) but its
+        // `gpu_permit` has a SECOND outstanding clone — the F-A window.
+        // `evict_one` must not remove this entry and must not count it as
+        // progress.
+        let permit_x = Arc::new(scheduler.try_acquire(1).unwrap());
+        let outstanding_clone = Arc::clone(&permit_x);
+        let id_x = ModelId("model_x".into());
+
+        // Entry Y: genuinely idle — `ref_count == 0` AND its permit's only
+        // clone is this entry's own.
+        let permit_y = Arc::new(scheduler.try_acquire(1).unwrap());
+        let id_y = ModelId("model_y".into());
+
+        let mut inner = CacheInner {
+            entries: HashMap::new(),
+            lru_order: VecDeque::new(),
+            in_flight: HashMap::new(),
+        };
+        inner.entries.insert(
+            id_x.clone(),
+            CacheEntry {
+                model: Arc::clone(&model),
+                ref_count: Arc::new(AtomicUsize::new(0)),
+                memory_bytes: 1,
+                _residency: ModelResidency::Gpu,
+                gpu_permit: permit_x,
+            },
+        );
+        inner.entries.insert(
+            id_y.clone(),
+            CacheEntry {
+                model,
+                ref_count: Arc::new(AtomicUsize::new(0)),
+                memory_bytes: 1,
+                _residency: ModelResidency::Gpu,
+                gpu_permit: permit_y,
+            },
+        );
+        // X is scanned before Y — the scan must SKIP X and land on Y rather
+        // than stopping at the first misleading candidate.
+        inner.lru_order.push_back(id_x.clone());
+        inner.lru_order.push_back(id_y.clone());
+
+        assert!(
+            inner.evict_one(),
+            "Y is genuinely idle (no outstanding permit clone) — evict_one \
+             must find and remove it, skipping past the misleading X"
+        );
+        assert!(
+            inner.entries.contains_key(&id_x),
+            "X must NOT have been removed: its permit still has an \
+             outstanding clone, so evicting it would not have released \
+             real memory (F-A)"
+        );
+        assert!(
+            !inner.entries.contains_key(&id_y),
+            "Y — the genuinely idle entry — must be the one actually evicted"
+        );
+
+        // Now only the misleading X remains. evict_one must report NO
+        // progress rather than removing X and lying about it.
+        assert!(
+            !inner.evict_one(),
+            "evict_one claimed progress for the sole remaining entry even \
+             though its permit clone is still outstanding — this is the F-A \
+             bug: removing X here would not decrement \
+             GpuScheduler::reserved_memory because `outstanding_clone` is \
+             still alive"
+        );
+        assert!(inner.entries.contains_key(&id_x));
+
+        drop(outstanding_clone);
+        assert!(
+            inner.evict_one(),
+            "once the outstanding clone is gone, X is genuinely idle and \
+             evict_one must now claim (and deliver) real progress"
+        );
+        assert!(!inner.entries.contains_key(&id_x));
     }
 }
 

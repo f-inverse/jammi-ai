@@ -494,22 +494,61 @@ pub struct ModelGuard {
     /// Shared handle to the loaded model.
     pub model: Arc<LoadedModel>,
     ref_count: Arc<AtomicUsize>,
-    /// Audit round 62, F-3: a clone of the SAME `Arc<GpuPermit>` the owning
-    /// `CacheEntry` holds. A `GpuPermit` releases its reservation
-    /// (`GpuScheduler::reserved_memory -= bytes`) only when its LAST `Arc`
-    /// clone drops (`GpuPermit`'s own `Drop`, via `Arc`'s refcounting) — so
-    /// evicting/removing the `CacheEntry` (e.g. `ModelCache::get_or_load`'s
-    /// stale-fingerprint path, or `evict_one`) can never decrement
-    /// `reserved_memory` while a `ModelGuard` still holds this model's device
-    /// tensors resident across a forward pass. The pre-fix `GpuPermit` was
-    /// owned solely by `CacheEntry`, so removing the entry released the
-    /// permit unconditionally regardless of any outstanding guard — freeing
-    /// budget for memory that was, in fact, still occupied (double-booking).
-    _gpu_permit: Arc<crate::concurrency::GpuPermit>,
+    /// Audit round 62, F-3 (reshaped by F-A in round 4): a clone of the SAME
+    /// `Arc<GpuPermit>` the owning `CacheEntry` holds. A `GpuPermit` releases
+    /// its reservation (`GpuScheduler::reserved_memory -= bytes`) only when
+    /// its LAST `Arc` clone drops (`GpuPermit`'s own `Drop`, via `Arc`'s
+    /// refcounting) — so evicting/removing the `CacheEntry` (e.g.
+    /// `ModelCache::get_or_load`'s stale-fingerprint path, or `evict_one`)
+    /// can never decrement `reserved_memory` while a `ModelGuard` still holds
+    /// this model's device tensors resident across a forward pass. The
+    /// pre-F-3 `GpuPermit` was owned solely by `CacheEntry`, so removing the
+    /// entry released the permit unconditionally regardless of any
+    /// outstanding guard — freeing budget for memory that was, in fact,
+    /// still occupied (double-booking).
+    ///
+    /// `Option`-wrapped (F-A, round 4) so `Drop::drop` can release this
+    /// clone — via [`Option::take`] — strictly BEFORE the `ref_count`
+    /// decrement below, rather than relying on Rust's field-declaration-order
+    /// drop (which runs field drops only AFTER the `Drop` impl's body
+    /// returns). Without this reordering, the body's `fetch_sub` could make
+    /// `ref_count == 0` visible to a concurrent `evict_one` while this
+    /// guard's permit clone was still outstanding (the struct field hadn't
+    /// dropped yet) — `evict_one` would then remove the `CacheEntry`, drop
+    /// only ITS clone, and claim `true` (progress) even though the
+    /// reservation was NOT actually released (this clone was still alive).
+    /// Releasing the permit first makes "permit released" happen-before
+    /// "ref_count == 0 is observable", so any `evict_one` that observes
+    /// `ref_count == 0` for this entry is guaranteed the permit clone
+    /// backing this guard is already gone.
+    _gpu_permit: Option<Arc<crate::concurrency::GpuPermit>>,
+}
+
+impl ModelGuard {
+    /// Construct a guard from its shared handles. Centralised so every
+    /// caller gets the `Some(..)`-wrapped permit uniformly (see
+    /// `_gpu_permit`'s doc for why the wrapping exists).
+    pub(crate) fn new(
+        model: Arc<LoadedModel>,
+        ref_count: Arc<AtomicUsize>,
+        gpu_permit: Arc<crate::concurrency::GpuPermit>,
+    ) -> Self {
+        Self {
+            model,
+            ref_count,
+            _gpu_permit: Some(gpu_permit),
+        }
+    }
 }
 
 impl Drop for ModelGuard {
     fn drop(&mut self) {
+        // Release the permit clone BEFORE the ref_count decrement becomes
+        // visible (see `_gpu_permit`'s doc) — this ordering is the actual
+        // fix for F-A: it is not merely presentational, it establishes a
+        // happens-before between "this guard's permit clone is gone" and
+        // "ref_count == 0 may be observed by a concurrent evict_one".
+        drop(self._gpu_permit.take());
         self.ref_count.fetch_sub(1, Ordering::Release);
     }
 }

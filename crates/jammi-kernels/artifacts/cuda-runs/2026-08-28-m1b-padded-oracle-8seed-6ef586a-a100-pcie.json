@@ -1,0 +1,82 @@
+{
+ "schema_version": 1,
+ "unit": "m1b-b3-padded-encoder-transport",
+ "git_sha": "6ef586ac65f40983aca404fdc8865a21111a0cfb",
+ "date": "2026-08-28T03:10:00Z",
+ "box": "jammi-a100 (NVIDIA A100 80GB PCIe, driver 570.211.01)",
+ "driver": "570.211.01",
+ "gpu": "NVIDIA A100 80GB PCIe",
+ "features": "cuda,flash-attn",
+ "status": "GREEN",
+ "env": {
+  "JAMMI_REQUIRE_CUDA": "1",
+  "JAMMI_REQUIRE_FLASH_ORACLE": "1",
+  "JAMMI_FLASH_ORACLE_MODEL_DIR": "/root/checkpoints/ModernBERT-large"
+ },
+ "producer": {
+  "path": "crates/jammi-encoders/src/modernbert.rs",
+  "kind": "cargo-test",
+  "invocation": "JAMMI_REQUIRE_CUDA=1 JAMMI_REQUIRE_FLASH_ORACLE=1 JAMMI_FLASH_ORACLE_MODEL_DIR=<checkpoint> cargo test -p jammi-encoders --lib --features cuda,flash-attn -- --exact modernbert::tests::flash_arm_padded_matches_block_arm_on_real_rows_cuda",
+  "gating": "env:JAMMI_REQUIRE_CUDA"
+ },
+ "observed": {
+  "flash_arm_padded_real_row_ratio_per_seed": {
+   "201": 0.127088,
+   "202": 0.104041,
+   "203": 0.153638,
+   "204": 0.148977,
+   "205": 0.119046,
+   "206": 0.10969,
+   "207": 0.11109,
+   "208": 0.288572
+  },
+  "mean": 0.145268,
+  "max": 0.288572,
+  "bound_at_run": 0.34,
+  "note": "Per-seed bare relative_l1_error(flash_real, block_real) over FLASH_ORACLE_SWEEP_SEEDS (8 fixed seeds) on the WINDOW-BINDING fixture (batch=4, seq=160, lengths=[160,96,40,6]; segments 160/96 clear the derived visibility threshold L >= half_window+2 = 66, 40/6 stay below it -- an in-test asserted premise). Mean is the asserted quantity; max is diagnostic, same convention as FLASH_ORACLE_K_MEAN_POOLED. This distribution SUPERSEDES the single-seed 0.229503 in 2026-08-28-m1b-b3-padded-oracles-c2365c9-a100-pcie.json as FLASH_ORACLE_PADDED_BOUND's derivation source: that measurement was taken on the earlier seq=64 fixture, where every segment sat at or below half_window and all local layers degenerated to full attention -- true for what it measured, but the wrong regime to bound."
+ },
+ "note": "Execution provenance for the M1b B3-padded unit's CUDA oracles at the branch tip (push-stamp laptop_head verified; CARGO_TARGET_DIR=/root/target-m1b). Full encoders suite green under cuda,flash-attn (161 lib + 34 it) including the regime-correct padded parity oracle, all four padded RED controls, the arch-gated flash_compiled_or_skip class (exact sm80), and the path-P structural-discrimination tests; clippy -D warnings clean for both flash-featured crates; bench padded legs (A5 baseline + A3 A/B) green with the exact-sm80 capable gate. PROVENANCE DISCIPLINE: branch sha -- the PR must land as a MERGE COMMIT so this sha stays an ancestor of main. Counts verbatim from the retained job log.",
+ "legs": [
+  {
+   "name": "flash_arm_padded_matches_block_arm_on_real_rows_cuda (8-seed sweep, window-binding fixture, --exact --nocapture)",
+   "status": "ok",
+   "passed": 1,
+   "failed": 0,
+   "filtered_out": 160,
+   "duration_s": 6.1
+  },
+  {
+   "name": "jammi-encoders lib suite (cuda,flash-attn)",
+   "status": "ok",
+   "passed": 161,
+   "failed": 0,
+   "filtered_out": 0,
+   "duration_s": 164.27
+  },
+  {
+   "name": "jammi-encoders it suite (cuda,flash-attn)",
+   "status": "ok",
+   "passed": 34,
+   "failed": 0,
+   "filtered_out": 0,
+   "duration_s": 4.19
+  },
+  {
+   "name": "clippy jammi-encoders --features cuda,flash-attn -D warnings",
+   "status": "ok",
+   "passed": null,
+   "failed": 0,
+   "filtered_out": null,
+   "duration_s": 2.56,
+   "note": "lint-clean; Finished dev profile"
+  },
+  {
+   "name": "finetune_step_padded_cuda (jammi-bench; a5 + a3, exact-sm80 gate)",
+   "status": "ok",
+   "passed": 2,
+   "failed": 0,
+   "filtered_out": 0,
+   "duration_s": 3.09
+  }
+ ]
+}

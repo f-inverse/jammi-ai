@@ -170,10 +170,10 @@ high-water mark that cannot miss an intra-step spike the way a discrete poll
 can.
 
 jammi's `peak_vram_bytes` is a whole-device `nvidia-smi` poll
-(`device_memory_used_bytes`, finetune_step.rs:167), sampled every 25ms
-(`std::thread::sleep`, finetune_step.rs:202) over the ENTIRE warmup+measured
-loop, then reduced via `peak.saturating_sub(baseline)`, finetune_step.rs:218
-against a baseline snapshot (`vram_baseline`, finetune_step.rs:600) taken
+(`device_memory_used_bytes`, finetune_step.rs:215), sampled every 25ms
+(`std::thread::sleep`, finetune_step.rs:250) over the ENTIRE warmup+measured
+loop, then reduced via `peak.saturating_sub(baseline)`, finetune_step.rs:266
+against a baseline snapshot (`vram_baseline`, finetune_step.rs:767) taken
 once right after the model+optimizer are built (before the loop starts) — at
 which point candle's `AdamW::new` has
 ALREADY allocated the (zero-initialized) first/second moment tensors, since
@@ -374,6 +374,47 @@ def triplet_loss(a, p, n, margin: float):
     return raw.relu().mean()
 
 
+def validate_row_lengths(lengths, batch: int, seq: int) -> None:
+    """Literal port of `finetune_step.rs::validate_row_lengths`: refuse a
+    `--row-lengths` whose shape cannot describe a real right-padded
+    `[batch, seq]` batch -- wrong element count, or any entry outside
+    `1..=seq` (`0` is a refusal in the B3-padded arm's own guard inventory;
+    a length above `seq` cannot describe a real row of a `[batch, seq]`
+    mask). Raises `ValueError`, mirroring the Rust side's typed refusal --
+    never silently building a mask that does not mean what the caller
+    intended.
+    """
+    if len(lengths) != batch:
+        raise ValueError(
+            f"--row-lengths named {len(lengths)} length(s) but --batch is {batch} -- one "
+            "length per row is required"
+        )
+    for row, length in enumerate(lengths):
+        if length < 1 or length > seq:
+            raise ValueError(
+                f"row {row}'s length {length} is outside 1..={seq} -- 0 is a refusal in the "
+                "B3-padded arm's own guard inventory (every row needs at least one real "
+                f"token), and a length above --seq {seq} cannot describe a real row of a "
+                "[batch, seq] mask"
+            )
+
+
+def prefix_mask(lengths, seq: int, device):
+    """Literal port of `finetune_step.rs::prefix_mask`: a genuine RIGHT-padded
+    `[batch, seq]` mask built FROM `lengths` -- row `b`'s first `lengths[b]`
+    positions `1`, the rest `0` -- so the mask and the lengths this script
+    reports can never disagree (there is no separate "trust" step the way an
+    external caller's independently-sourced lengths would need).
+    """
+    import torch
+
+    batch = len(lengths)
+    mask = torch.zeros(batch, seq, dtype=torch.long, device=device)
+    for row, length in enumerate(lengths):
+        mask[row, :length] = 1
+    return mask
+
+
 def pick_device(cuda_ordinal):
     import torch
 
@@ -534,6 +575,11 @@ TORCH_IDENTITY_FIELDS = (
     "margin",
     "target_modules",
     "batched_forward",
+    # IDENTITY (contract v4 §1 item 1, K7 audit): always present, dense or
+    # padded -- see this producer's own `report["finetune_step"]["row_lengths"]`
+    # emission site, and jammi's `FinetuneStepTier::row_lengths` doc for the
+    # cross-producer meaning.
+    "row_lengths",
     "backbone_dtype",
     "steps_measured",
     "checkpoint_config_sha256",
@@ -1110,7 +1156,17 @@ def run(args):
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
         vocab = config.vocab_size
-        mask = torch.ones(args.batch, args.seq, dtype=torch.long, device=device)
+        # `--row-lengths` (contract v4 §1 item 1): `None` is this script's
+        # ORIGINAL, unchanged dense behaviour (an all-ones mask); a supplied
+        # value is validated FIRST (mirrors finetune_step.rs's own
+        # `run()`-top validation posture) and the mask is built FROM it
+        # (`prefix_mask`), never derived separately, so the two can never
+        # disagree.
+        if args.row_lengths is not None:
+            validate_row_lengths(args.row_lengths, args.batch, args.seq)
+            mask = prefix_mask(args.row_lengths, args.seq, device)
+        else:
+            mask = torch.ones(args.batch, args.seq, dtype=torch.long, device=device)
         blocks = [
             synthetic_ids(args.batch, args.seq, vocab, args.seed + i).to(device)
             for i in range(3)
@@ -1229,6 +1285,16 @@ def run(args):
                     t.strip() for t in args.target_modules.split(",") if t.strip()
                 ],
                 "batched_forward": args.batched_forward,
+                # IDENTITY (contract v4 §1 item 1, K7 audit: identity_fields.py's
+                # FINETUNE_IDENTITY_FIELDS grows 17 -> 18 with this field): same
+                # placement as jammi's own FinetuneStepTier::row_lengths -- see
+                # that field's own doc. DENSE-LEG VALUE (args.row_lengths is
+                # None, this script's ORIGINAL behaviour): `[seq] * batch`,
+                # matching jammi's own dense-leg convention exactly. NEVER
+                # null -- both producers always emit a concrete vector.
+                "row_lengths": args.row_lengths
+                if args.row_lengths is not None
+                else [args.seq] * args.batch,
                 # `None` (never omitted) when `--max-grad-norm` was not supplied,
                 # mirroring jammi's own FinetuneStepTier::max_grad_norm field doc
                 # (deliberately not skip_serializing_if=is_none): every report from
@@ -1407,6 +1473,19 @@ def parse_args(argv=None):
         "--max-grad-norm 1.0 here too.",
     )
     p.add_argument(
+        "--row-lengths",
+        type=str,
+        default=None,
+        help="Comma-separated per-row REAL (non-pad) lengths for a genuinely "
+        "right-padded batch -- one int per row, --batch entries total, each in "
+        "1..=--seq. Omit for this script's ORIGINAL, unchanged dense behaviour "
+        "(an all-ones mask). row_lengths is a shared identity field "
+        "(ci/scripts/perf/identity_fields.py's FINETUNE_IDENTITY_FIELDS): two "
+        "legs differing here ran a different padding structure over the SAME "
+        "(batch, seq) shape and are not comparable. Mirrors jammi's own "
+        "--row-lengths (crates/jammi-bench/src/main.rs).",
+    )
+    p.add_argument(
         "--dry-run",
         action="store_true",
         help="Build a tiny random-init 2-layer ModernBERT, save it to a temp dir, and "
@@ -1418,6 +1497,13 @@ def parse_args(argv=None):
         "(subject to the amp-fp16-requires-CUDA guard).",
     )
     args = p.parse_args(argv)
+    if args.row_lengths is not None:
+        try:
+            args.row_lengths = [
+                int(t.strip()) for t in args.row_lengths.split(",") if t.strip()
+            ]
+        except ValueError as exc:
+            p.error(f"--row-lengths {args.row_lengths!r} is invalid: {exc}")
     if not args.dry_run and not args.model_dir:
         p.error("--model-dir is required unless --dry-run")
     # Range guards apply UNCONDITIONALLY, including under --dry-run: a

@@ -883,8 +883,10 @@ jobs:
           # equality, or escaped via the bare `ledger` marker plus a
           # committed ci/perf_claims_allowlist.txt entry. Hermetic: reads
           # tracked files only, shells out only to `git ls-files` — the
-          # normal shallow checkout suffices, matching the sibling
-          # `check_citations.py` leg's own comment on this point.
+          # normal shallow checkout suffices (unlike the `citation
+          # resolver` leg below, which needs real history for its
+          # artifact-scoped citations and is given `fetch_depth: "0"` for
+          # exactly that reason).
           - name: perf claims
             cmd: python3 ci/scripts/check_perf_claims.py
           - name: perf claims self-test
@@ -1008,13 +1010,33 @@ jobs:
           - name: execution-surface reachability self-test
             cmd: python3 ci/scripts/check_execution_surface_reachability.py --self-test
           # Re-resolves every finetune_step.rs:<n>/grad_oracle.rs:<n>
-          # PATH:LINE citation under crates/jammi-bench/** and
-          # ci/scripts/perf/** against the file at HEAD (advisory i, PR #372
-          # round 2) -- stdlib-only, hermetic, catches the F7-class
-          # regression (an in-bounds but STALE line number) an eyeballed
-          # diff review missed twice in a row on this same PR.
+          # PATH:LINE citation under crates/jammi-bench/**,
+          # ci/scripts/perf/**, and crates/jammi-kernels/artifacts/cuda-runs/
+          # (advisory i, PR #372 round 2; M1b audit round) -- catches the
+          # F7-class regression (an in-bounds but STALE line number) an
+          # eyeballed diff review missed twice in a row on this same PR.
+          # A citation living inside a committed cuda-run artifact JSON that
+          # declares its own `git_sha` is resolved against THAT sha via `git
+          # show` (append-only evidence describing its own recorded tree,
+          # never re-resolved against HEAD -- the category error a citation
+          # into `finetune_step.rs` from a MUCH earlier `git_sha` would
+          # otherwise hit the moment any later, unrelated commit moved the
+          # cited line); every other citation still resolves against HEAD as
+          # before. `git show <sha>:<path>` needs the sha's commit object
+          # reachable in this checkout's object database, which a shallow
+          # `actions/checkout` (fetch-depth 1) does not have -- same
+          # QUOTED-STRING reasoning as the "CUDA run artifact schema" leg
+          # above (GitHub Actions expressions treat the bare number 0 as
+          # falsy, so `fetch_depth: 0` here would silently fall through to
+          # `matrix.fetch_depth || '1'`'s shallow default).
           - name: citation resolver
             cmd: python3 ci/scripts/perf/check_citations.py
+            fetch_depth: "0"
+          # `test_check_citations.py`'s own artifact-sha fixtures build and
+          # commit into a THROWAWAY `git init`'d temp repo (same discipline
+          # `check_cuda_run_artifacts.py --self-test` uses), so this suite
+          # needs no real history from the CI checkout itself and stays at
+          # the normal shallow default.
           - name: citation resolver suite
             cmd: python3 ci/scripts/perf/test_check_citations.py
           # Two mechanical, grep-shaped assertions over every producer
@@ -1090,11 +1112,14 @@ jobs:
         with:
           # Legs leave this at the normal shallow default (`fetch_depth`
           # unset in the matrix entry -> `'1'`) unless their entry declares
-          # `fetch_depth: "0"` — the ancestry-checking guards, which need
-          # real history and fail closed on a shallow checkout. Both
-          # sides of `||` are STRINGS (`'1'`, and the matrix entry's own
-          # `"0"`) — the number `0` is falsy in GitHub Actions expressions,
-          # so a bare `0` here would make `||` silently discard it.
+          # `fetch_depth: "0"` — the legs needing real commit history:
+          # ancestry checks (`git merge-base --is-ancestor`) and
+          # sha-relative artifact-citation resolution (`git show
+          # <sha>:<path>`), all of which fail closed on a shallow
+          # checkout. Both sides of `||` are STRINGS (`'1'`, and the
+          # matrix entry's own `"0"`) — the number `0` is falsy in GitHub
+          # Actions expressions, so a bare `0` here would make `||`
+          # silently discard it.
           fetch-depth: ${{ matrix.fetch_depth || '1' }}
       # This shared job is deliberately "no toolchain, no container, no GPU"
       # for every OTHER leg (see the module doc above) — a bare runner keeps

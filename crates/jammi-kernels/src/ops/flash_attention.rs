@@ -810,6 +810,54 @@ pub fn flash_attention_varlen_with_rope_test_only_bwd_window_override(
     super::apply_stateful3(qkv, cos, sin, op)
 }
 
+/// TEST-SUPPORT ONLY — the RAGGED counterpart of
+/// [`flash_attention_varlen_with_rope_test_only_bwd_window_override`]: same
+/// fwd/bwd-config-splitting seam (that function's own doc explains why a
+/// crafted TENSOR cannot model a window-only defect and a real op-level
+/// split is needed instead — that argument is unchanged for the ragged
+/// entry point), reusing the SAME [`FlashVarlenAttentionFusedRope::
+/// bwd_cfg_override`] field [`flash_attention_varlen_with_rope_ragged`]
+/// itself always leaves `None`. Never wired into
+/// [`flash_attention_varlen_with_rope_ragged`] or any production/admission/
+/// dispatch path. Identical to [`flash_attention_varlen_with_rope_ragged`]
+/// (same `cos_base`/`sin_base` gather, same `cu_seqlens` derivation, same
+/// `arm: PositionArm::Ragged`) except the FORWARD launch uses `fwd_cfg` and
+/// the BACKWARD launch uses a DIFFERENT config, `bwd_cfg`. See
+/// `jammi-encoders`' `modernbert` module for the encoder-level RED control
+/// built on top of this function (the padded/ragged arm's own counterpart
+/// of `tests/cuda_parity.rs`'s
+/// `flash_upstream_acceptance_form_red_control_bwd_only_window_dropped_cuda`,
+/// which covers only the DENSE entry point).
+pub fn flash_attention_varlen_with_rope_ragged_test_only_bwd_window_override(
+    qkv: &Tensor,
+    cos_base: &Tensor,
+    sin_base: &Tensor,
+    lengths: &[usize],
+    fwd_cfg: &VarlenConfig,
+    bwd_cfg: &VarlenConfig,
+) -> Result<Tensor> {
+    let (_total_q, num_heads) = check_qkv_domain(qkv.dims(), qkv.dtype())?;
+    let Device::Cuda(device) = qkv.device() else {
+        return Err(Error::Msg(format!(
+            "{FUSED_ROPE_OP_NAME}: ragged entry requires a CUDA qkv tensor -- this op has no \
+             CPU arm, see {OP_NAME}'s own doc"
+        )));
+    };
+    let (total, cos_r, sin_r) =
+        crate::ops::rope_positions::gather_ragged_tables(cos_base, sin_base, lengths)?;
+    let cu_seqlens = CuSeqlens::from_lengths(lengths, device).map_err(flash_err)?;
+    let op = FlashVarlenAttentionFusedRope {
+        seq: total,
+        cu_seqlens,
+        num_heads,
+        cfg: *fwd_cfg,
+        bwd_cfg_override: Some(*bwd_cfg),
+        arm: PositionArm::Ragged,
+        lse: Saved::empty(),
+    };
+    super::apply_stateful3(qkv, &cos_r, &sin_r, op)
+}
+
 /// Structural (white-box) proof that [`flash_attention_varlen`] does not
 /// silently pin `cfg.deterministic` — see the module doc's "Domain"
 /// section: "`cfg.deterministic` is whatever the caller passes ... this op

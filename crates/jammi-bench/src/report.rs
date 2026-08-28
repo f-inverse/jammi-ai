@@ -1393,6 +1393,31 @@ pub struct FinetuneStepTier {
     /// (pre-step + warmup + measured), so two legs at different warmups
     /// are not comparable on that fact. torch emits it under `args`.
     pub warmup: usize,
+    /// Per-row REAL (non-pad) lengths this leg fed the encoder -- an
+    /// IDENTITY field (contract v4 §1 item 1, K7 audit: identity_fields.py's
+    /// `FINETUNE_IDENTITY_FIELDS` grows 17 -> 18): two legs differing here
+    /// ran the SAME `(batch, seq)` shape over a DIFFERENT padding structure
+    /// -- a genuinely padded batch dispatches through
+    /// `jammi_encoders::ModernBert::forward_with_lengths`'s trusted-lengths
+    /// path P (the B3-padded transport, contract v4 §3.7), which a dense
+    /// batch never reaches -- so the two rows' throughput/VRAM numbers are
+    /// not comparable at all. `lengths.len() == batch`, each entry in
+    /// `1..=seq`.
+    ///
+    /// DENSE-LEG VALUE (`FinetuneStepParams::row_lengths == None`, this
+    /// tier's ORIGINAL behaviour, unchanged by this field's addition):
+    /// `[seq; batch]` -- every row's real length equals `seq`, the SAME
+    /// discriminator `jammi_encoders`' `CompactedBatch::is_dense` uses
+    /// internally (`lengths.iter().all(|&l| l == seq)`), so a dense leg's
+    /// `row_lengths` value is derivable from `batch`/`seq` alone and never
+    /// disagrees with them.
+    ///
+    /// NEVER `null`: unlike [`max_grad_norm`](Self::max_grad_norm), this
+    /// field carries no absent/off state -- both this producer and
+    /// `torch_finetune_step.py` always emit a concrete vector (dense or
+    /// padded), so it needs no `identity_fields.FINETUNE_NULL_IS_A_VALUE_FIELDS`
+    /// entry.
+    pub row_lengths: Vec<usize>,
     /// Measured steps after warmup.
     pub steps_measured: usize,
     /// Per-measured-step triplet loss, in step order, warmup EXCLUDED — one
@@ -1710,16 +1735,21 @@ impl FinetuneStepTier {
     /// K7-completeness: every field a downstream leg-premise check needs to
     /// establish that two `finetune-step` legs measured the "same" thing —
     /// a STRICT SUPERSET of `ci/scripts/perf/identity_fields.py`'s own
-    /// `FINETUNE_IDENTITY_FIELDS` COMPARISON tuple (17 entries as of PR #381
-    /// landing `max_grad_norm`/`attention_arm`/`warmup`, moved out of
-    /// `ab_merge.py` into the shared `identity_fields.py` module that PR —
-    /// unification contract C4.1: the COMPARISON tuple itself is not grown
+    /// `FINETUNE_IDENTITY_FIELDS` COMPARISON tuple -- 17 entries as of PR
+    /// #381 landing `max_grad_norm`/`attention_arm`/`warmup`, moved out of
+    /// `ab_merge.py` into the shared `identity_fields.py` module that PR
+    /// (unification contract C4.1: the COMPARISON tuple itself is not grown
     /// BY THIS UNIT; #381 is independent upstream work with its own reason
     /// to grow it, and contract C3.4 explicitly names this rebase: "whichever
-    /// of #381 and this phase lands second rebases and adds the entry").
-    /// The 17 comparison entries, plus five K7-completeness additions the
+    /// of #381 and this phase lands second rebases and adds the entry"),
+    /// growing to 18 with this unit's OWN `row_lengths` entry (contract v4
+    /// §1 item 1, K7 audit -- `identity_fields.py`'s own tuple grows to
+    /// match in a companion docs-ci change; this const is the SUPERSET side
+    /// of the subset check either way, so it is correct to carry the 18th
+    /// name here regardless of which side lands first).
+    /// The 18 comparison entries, plus five K7-completeness additions the
     /// comparison tuple omits BY DESIGN (provenance never compared
-    /// cross-producer — see `ab_merge.py:43`'s own doc): `device_name`,
+    /// cross-producer — see `ab_merge.py:47-55`'s provenance rows): `device_name`,
     /// `kernels_disabled_requested`, `kernels_disabled_fired`,
     /// `flash_compiled`, `build_features`.
     ///
@@ -1742,8 +1772,8 @@ impl FinetuneStepTier {
     /// the two Rust-side mechanisms cannot both silently agree on the wrong
     /// thing.
     pub const IDENTITY_FIELDS: &'static [(&'static str, Nullable)] = &[
-        // The 17 entries `identity_fields.py::FINETUNE_IDENTITY_FIELDS`
-        // compares.
+        // The 18 entries `identity_fields.py::FINETUNE_IDENTITY_FIELDS`
+        // compares (17 as of PR #381, plus this unit's `row_lengths`).
         ("seed", Nullable::NonNull),
         ("batch", Nullable::NonNull),
         ("seq", Nullable::NonNull),
@@ -1761,6 +1791,9 @@ impl FinetuneStepTier {
         ("max_grad_norm", Nullable::NullMeans("no clip")),
         ("attention_arm", Nullable::NonNull),
         ("warmup", Nullable::NonNull),
+        // NEVER null (see this field's own doc) -- both producers always
+        // emit a concrete vector, dense or padded.
+        ("row_lengths", Nullable::NonNull),
         // K7-completeness additions beyond the comparison tuple.
         ("device_name", Nullable::NonNull),
         ("kernels_disabled_requested", Nullable::NonNull),
@@ -1946,6 +1979,10 @@ mod tests {
             target_modules: vec!["query".to_string()],
             batched_forward: true,
             max_grad_norm,
+            // Dense-leg value: batch=2, seq=6 above, so `[6, 6]` (every row's
+            // real length equals `seq`) -- see `FinetuneStepTier::row_lengths`'s
+            // own doc.
+            row_lengths: vec![6, 6],
             trainable_tensors: 2,
             warmup: 5,
             steps_measured: 1,
@@ -2077,6 +2114,7 @@ mod tests {
             "peak_vram_bytes",
             "rope_eager_dispatches",
             "rope_fused_dispatches",
+            "row_lengths",
             "s_per_step_mean",
             "s_per_step_p50",
             "seed",

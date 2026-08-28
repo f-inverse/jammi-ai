@@ -166,11 +166,14 @@ pub use cast_scale::{cast_add_bf16_into, cast_scale_bf16_f32_into};
 pub use cast_scale::{CastAddBf16, CastScaleBf16F32};
 pub use dropout::{DropoutFused, PhiloxKatProbe};
 #[cfg(feature = "flash-attn")]
-pub use flash_attention::flash_attention_varlen_with_rope_test_only_bwd_window_override;
-#[cfg(feature = "flash-attn")]
 pub use flash_attention::{
     flash_attention_varlen, flash_attention_varlen_with_rope,
     flash_attention_varlen_with_rope_ragged,
+};
+#[cfg(feature = "flash-attn")]
+pub use flash_attention::{
+    flash_attention_varlen_with_rope_ragged_test_only_bwd_window_override,
+    flash_attention_varlen_with_rope_test_only_bwd_window_override,
 };
 pub use geglu::{GegluFused, GeluVariant};
 pub use layer_norm::{LayerNormFused, MAX_HIDDEN};

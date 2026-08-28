@@ -427,6 +427,17 @@ enum Command {
         /// doc.
         #[arg(long)]
         expect_kernels_disabled: Option<String>,
+        /// Comma-separated per-row REAL (non-pad) lengths for a genuinely
+        /// right-padded batch -- one usize per row, `--batch` entries total,
+        /// each in `1..=--seq`. Omit for this tier's ORIGINAL, unchanged
+        /// dense behaviour (an all-ones mask). When supplied, every forward
+        /// routes through `ModernBert::forward_with_lengths`'s trusted-
+        /// lengths path P (the B3-padded transport), building the mask FROM
+        /// these lengths (row `b`'s first `lengths[b]` positions `1`, the
+        /// rest `0`) so the mask and the lengths can never disagree. See
+        /// `finetune_step::FinetuneStepParams::row_lengths`'s doc.
+        #[arg(long)]
+        row_lengths: Option<String>,
     },
     /// The jammi-vs-torch LEARNING oracle: one forward+backward at
     /// IDENTICAL LoRA weights (never an optimizer step), dumped per
@@ -569,6 +580,7 @@ async fn main() -> std::process::ExitCode {
             batched_forward,
             max_grad_norm,
             expect_kernels_disabled,
+            row_lengths,
         } => run_finetune_step(finetune_step::FinetuneStepParams {
             model_dir,
             batch,
@@ -614,6 +626,25 @@ async fn main() -> std::process::ExitCode {
                 v.sort();
                 v
             }),
+            row_lengths: match row_lengths {
+                None => None,
+                Some(s) => match s
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .map(|t| t.parse::<usize>())
+                    .collect::<Result<Vec<usize>, _>>()
+                {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        eprintln!(
+                            "--row-lengths {s:?} is invalid: {e} (expected a comma-separated \
+                             list of non-negative integers, one per row)"
+                        );
+                        return std::process::ExitCode::FAILURE;
+                    }
+                },
+            },
         }),
         Command::GradOracle {
             model_dir,

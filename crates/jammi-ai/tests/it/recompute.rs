@@ -744,12 +744,23 @@ async fn a_pre_contract_table_is_not_recomputable() {
 /// directory — the first materializes the table and is dropped, the second
 /// (with its own, cold `ModelCache`) performs the recompute — simulating the
 /// realistic cross-process/cross-restart shape a recompute normally runs
-/// under. A single long-lived session's in-memory `ModelCache` is a warm LRU
-/// keyed by `model_id` with no on-disk staleness check at all (by design —
-/// an orthogonal cache-freshness concern, not this unit's K7 identity-
-/// completeness one): reusing ONE session for both halves would silently
-/// serve the pre-mutation `LoadedModel` straight out of that cache on the
-/// second call, proving nothing about the digest fold either way.
+/// under.
+///
+/// A single long-lived session's in-memory `ModelCache` is no longer a warm
+/// LRU with NO on-disk staleness check: esc-058 added a `stat`-only
+/// fingerprint tripwire (`ModelCache::get_or_load`'s `probe_freshness` call,
+/// `cache_staleness.rs`) that would ALSO detect this exact
+/// `model.safetensors` byte-length-changing mutation and force a warm-hit
+/// reload — reusing one session today would likely still turn this
+/// assertion green. Two independent sessions remain the right shape anyway,
+/// for two reasons that survive esc-058: (1) it is the realistic
+/// cross-process/cross-restart deployment recompute normally runs under,
+/// not merely a workaround for a cache that used to have no freshness
+/// check at all; (2) it keeps THIS test's guarantee decoupled from
+/// esc-058's own documented residual (a same-length, same-mtime content
+/// swap is invisible to the fingerprint tripwire) — a definitely-cold
+/// reload proves the digest fold reaches replay regardless of whether the
+/// tripwire would have caught this particular mutation.
 #[tokio::test]
 async fn recompute_after_model_dir_mutation_changes_the_definition_hash() {
     let session_dir = TempDir::new().unwrap();

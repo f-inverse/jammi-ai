@@ -388,7 +388,7 @@ impl LoadedModel {
     /// on disk that could go stale — for either, this vacuously reports
     /// fresh rather than refusing, since "no local files to check" is not a
     /// staleness condition.
-    pub fn probe_freshness(&self) -> Result<bool> {
+    pub(crate) fn probe_freshness(&self) -> Result<bool> {
         match self {
             LoadedModel::Candle(m) => m.fingerprint.probe(),
             LoadedModel::Ort(_) => Ok(true),
@@ -477,6 +477,18 @@ pub struct ModelGuard {
     /// Shared handle to the loaded model.
     pub model: Arc<LoadedModel>,
     ref_count: Arc<AtomicUsize>,
+    /// Audit round 62, F-3: a clone of the SAME `Arc<GpuPermit>` the owning
+    /// `CacheEntry` holds. A `GpuPermit` releases its reservation
+    /// (`GpuScheduler::reserved_memory -= bytes`) only when its LAST `Arc`
+    /// clone drops (`GpuPermit`'s own `Drop`, via `Arc`'s refcounting) — so
+    /// evicting/removing the `CacheEntry` (e.g. `ModelCache::get_or_load`'s
+    /// stale-fingerprint path, or `evict_one`) can never decrement
+    /// `reserved_memory` while a `ModelGuard` still holds this model's device
+    /// tensors resident across a forward pass. The pre-fix `GpuPermit` was
+    /// owned solely by `CacheEntry`, so removing the entry released the
+    /// permit unconditionally regardless of any outstanding guard — freeing
+    /// budget for memory that was, in fact, still occupied (double-booking).
+    _gpu_permit: Arc<crate::concurrency::GpuPermit>,
 }
 
 impl Drop for ModelGuard {

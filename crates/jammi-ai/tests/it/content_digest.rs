@@ -21,8 +21,13 @@
 //! (a)–(c) below RED; the tests themselves are unchanged either way.
 
 use std::path::Path;
+use std::sync::Arc;
 
-use jammi_ai::model::{ModelSource, ModelTask};
+use jammi_ai::model::backend::candle::CandleBackend;
+use jammi_ai::model::backend::{DeviceConfig, ModelBackend};
+use jammi_ai::model::resolver::ModelResolver;
+use jammi_ai::model::{LoadedModel, ModelSource, ModelTask};
+use jammi_db::catalog::Catalog;
 use jammi_db::store::manifest::{
     ComputeDevice, DefinitionHash, MaterializationEnv, MaterializationManifest, ModelIdentity,
     ProducingDescriptor,
@@ -31,7 +36,7 @@ use tempfile::tempdir;
 
 use crate::pooling_config::{
     build_local_model_dir, cls_pooling_config, mean_pooling_config, resolve_and_load,
-    TINY_BERT_FILES,
+    sample_preprocessor_config, write_preprocessor_config, TINY_BERT_FILES,
 };
 
 /// `tiny_bert`'s hidden size (see `pooling_config.rs`'s fixture doc) — the
@@ -100,6 +105,43 @@ async fn pooling_config_bytes_mutation_changes_the_definition_hash() {
         hash_before, hash_after,
         "mutating 1_Pooling/config.json bytes in place under a constant model_id \
          must change definition_hash (esc-057)"
+    );
+}
+
+/// (a2) F-2 peer of (a): `preprocessor_config.json` is absent from the
+/// hermetic `tiny_bert` fixture by default (a plain BERT text model never
+/// reads it), so this test both proves PRESENCE folds into the digest
+/// (adding the file under a constant `model_id` changes the hash) and, via
+/// the byte-mutation half, that its BYTES are output-affecting the same way
+/// `1_Pooling/config.json`'s are. RED before F-2: `content_digest_entries`
+/// deliberately excluded `preprocessor_config.json`.
+#[tokio::test]
+async fn preprocessor_config_presence_and_mutation_change_the_definition_hash() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path().join("model");
+    build_local_model_dir(&dir, Some(&mean_pooling_config()));
+
+    let hash_absent = definition_hash_for(&dir).await;
+
+    write_preprocessor_config(&dir, &sample_preprocessor_config());
+    let hash_present = definition_hash_for(&dir).await;
+
+    assert_ne!(
+        hash_absent, hash_present,
+        "preprocessor_config.json APPEARING under a constant model_id must change \
+         definition_hash (F-2)"
+    );
+
+    // Mutate its bytes in place — same presence, different content.
+    let mut mutated = sample_preprocessor_config();
+    mutated["sampling_rate"] = serde_json::json!(16000);
+    write_preprocessor_config(&dir, &mutated);
+    let hash_mutated = definition_hash_for(&dir).await;
+
+    assert_ne!(
+        hash_present, hash_mutated,
+        "mutating preprocessor_config.json bytes in place under a constant \
+         model_id must change definition_hash (F-2)"
     );
 }
 
@@ -210,5 +252,142 @@ async fn byte_identical_model_dirs_produce_the_identical_content_digest() {
         digest_a, digest_b,
         "byte-identical model directories at different paths must produce the \
          identical content digest (determinism, the non-vacuous control)"
+    );
+}
+
+// ── F-1 (audit round 62): the fine-tune adapter pair folds into the digest ──
+
+/// Write a `ProjectionHead`-flavoured `adapter_config.json` +
+/// `adapter.safetensors` pair at `dir`. The weights carry a single `marker`
+/// tensor — not `projection.lora_a`/`lora_b` — so `CandleBackend::load`
+/// treats the adapter as present-but-inert (no projection/distribution head
+/// keys to wire up) and loads exactly like the unadapted base model
+/// numerically; only the adapter FILES' presence/bytes are under test here,
+/// mirroring `model::backend::candle::digest_fingerprint_audit62_tests`'
+/// `write_projection_adapter` (an independent copy: this crate cannot
+/// construct `jammi_ai::fine_tune::target::ProjectionHeadConfig` directly —
+/// two of its fields are `pub(crate)` to `jammi_ai` — so the adapter's
+/// on-disk JSON shape is reproduced literally instead).
+fn write_projection_adapter(dir: &Path, marker_value: f32) {
+    std::fs::create_dir_all(dir).unwrap();
+    let cfg_json = serde_json::json!({
+        "adapter_type": "projection_head",
+        "lora_rank": 4,
+        "lora_alpha": 8.0,
+        "use_rslora": false,
+        "head_layers": []
+    });
+    std::fs::write(
+        dir.join("adapter_config.json"),
+        serde_json::to_string(&cfg_json).unwrap(),
+    )
+    .unwrap();
+
+    let device = candle_core::Device::Cpu;
+    let mut weights: std::collections::HashMap<String, candle_core::Tensor> =
+        std::collections::HashMap::new();
+    weights.insert(
+        "marker".to_string(),
+        candle_core::Tensor::new(&[marker_value], &device).unwrap(),
+    );
+    candle_core::safetensors::save(&weights, dir.join("adapter.safetensors")).unwrap();
+}
+
+/// The adapter-aware peer of `pooling_config.rs`'s `resolve_and_load`:
+/// resolves `dir` through the SAME live `ModelResolver` path, then
+/// overrides `adapter_path` on the resolved struct before handing it to
+/// `CandleBackend::load` — `ModelResolver`'s local-source path never sets
+/// `adapter_path` itself (only the fine-tuned-model catalog-lookup path
+/// does, which requires a full fine-tune round-trip), and every
+/// `ResolvedModel` field is `pub`, so overriding just this one field after
+/// an otherwise-real resolve is the narrowest way to exercise the adapter
+/// branch through the production `CandleBackend::load` call.
+async fn resolve_and_load_with_adapter(dir: &Path, adapter_dir: &Path) -> LoadedModel {
+    let catalog_dir = tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
+    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
+    let source = ModelSource::local(dir);
+    let mut resolved = resolver
+        .resolve(&source, ModelTask::TextEmbedding, None)
+        .await
+        .unwrap();
+    resolved.adapter_path = Some(adapter_dir.to_path_buf());
+
+    let backend = CandleBackend;
+    let device_config = DeviceConfig {
+        gpu_device: -1,
+        memory_fraction: 1.0,
+        require_gpu: false,
+        compute_precision: jammi_numerics::ComputePrecision::F32,
+    };
+    backend.load(&resolved, &device_config).unwrap()
+}
+
+/// (e) F-1: mutating `adapter.safetensors` bytes in place, under a constant
+/// `model_id` AND a constant `adapter_path`, must change `content_digest()`
+/// — the adapter peer of (c)'s weights mutation. RED before F-1:
+/// `content_digest_entries` never enumerated the adapter pair at all, so
+/// this mutation was invisible to both the digest and `definition_hash`.
+#[tokio::test]
+async fn adapter_weights_byte_mutation_changes_content_digest() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path().join("model");
+    build_local_model_dir(&dir, Some(&mean_pooling_config()));
+    let adapter_dir = tmp.path().join("adapter");
+    write_projection_adapter(&adapter_dir, 1.0);
+
+    let model_before = resolve_and_load_with_adapter(&dir, &adapter_dir).await;
+    let digest_before = model_before.content_digest().unwrap();
+
+    let weights_path = adapter_dir.join("adapter.safetensors");
+    let mut bytes = std::fs::read(&weights_path).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xFF;
+    std::fs::write(&weights_path, &bytes).unwrap();
+
+    let model_after = resolve_and_load_with_adapter(&dir, &adapter_dir).await;
+    let digest_after = model_after.content_digest().unwrap();
+
+    assert_ne!(
+        digest_before, digest_after,
+        "mutating adapter.safetensors bytes in place, under a constant model_id \
+         and adapter_path, must change the content digest (F-1)"
+    );
+}
+
+/// (f) F-1 ruling: an `adapter_path` that is `Some` but whose
+/// `adapter_config.json` / `adapter.safetensors` are missing must refuse to
+/// load — never silently serve the unadapted base model under the
+/// fine-tuned model's own `model_id` (which would misattribute the base
+/// model's output to the fine-tuned identity).
+#[tokio::test]
+async fn missing_adapter_files_under_some_adapter_path_refuses_to_load() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path().join("model");
+    build_local_model_dir(&dir, Some(&mean_pooling_config()));
+    let adapter_dir = tmp.path().join("adapter"); // never populated
+
+    let catalog_dir = tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
+    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
+    let source = ModelSource::local(&dir);
+    let mut resolved = resolver
+        .resolve(&source, ModelTask::TextEmbedding, None)
+        .await
+        .unwrap();
+    resolved.adapter_path = Some(adapter_dir);
+
+    let backend = CandleBackend;
+    let device_config = DeviceConfig {
+        gpu_device: -1,
+        memory_fraction: 1.0,
+        require_gpu: false,
+        compute_precision: jammi_numerics::ComputePrecision::F32,
+    };
+    let result = backend.load(&resolved, &device_config);
+    assert!(
+        result.is_err(),
+        "adapter_path Some with no adapter files present must refuse to load, \
+         never silently serve the unadapted base model (F-1)"
     );
 }

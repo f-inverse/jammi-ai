@@ -895,10 +895,19 @@ fn content_digest_entries(resolved: &ResolvedModel) -> Result<Vec<(String, std::
 /// rel/anchor machinery). `gated` mirrors the pre-reshape `DigestCandidate`'s
 /// per-file flag: whether the resolver actually SELECTED this specific arm
 /// for the CURRENT load — i.e. whether [`content_digest_entries`] hashes it.
-/// At most one arm is gated for the config/tokenizer slots (the resolver's
-/// chain picks exactly one filename); the weights slot MAY gate more than
-/// one arm at once for a sharded HF download (every shard is its own gated
-/// arm, none of them one of the three well-known single-file names).
+/// At most one arm is EVER gated within any given [`DigestSlot`] — every
+/// slot models mutually SUBSTITUTABLE alternates only (the config/tokenizer
+/// slots' resolver chain picks exactly one filename; the weights slot's
+/// three named arms — `model.safetensors` / `open_clip_model.safetensors` /
+/// `model.onnx` — are likewise alternates, never a set the loader needs
+/// jointly). A sharded HF download's shard files are each their OWN
+/// single-arm, always-gated, `absence_tolerated: false` slot (audit round
+/// 62, adversarial round 12) — never additional arms folded into the
+/// weights slot above, because a shard is CONJUNCTIVELY required (every
+/// shard must be present for `VarBuilder::from_mmaped_safetensors` to
+/// succeed) rather than a disjunctive alternate a cold resolve could pick
+/// one of. See [`all_candidate_paths`]'s weights-slot construction for the
+/// full reasoning and the primary-file edge this closes.
 struct SlotArm {
     rel: String,
     path: std::path::PathBuf,
@@ -1092,32 +1101,86 @@ fn all_candidate_paths(resolved: &ResolvedModel) -> Result<Vec<DigestSlot>> {
         absence_tolerated: true,
     });
 
-    // Weights slot (audit round 62, adversarial round 10): the resolver's
-    // OWN `model.safetensors` / `open_clip_model.safetensors` / `model.onnx`
-    // preference chain (`try_catalog_lookup`, resolver.rs:160-162;
-    // `resolve_local`'s `has_onnx`/`has_safetensors` backend
-    // auto-selection, resolver.rs:240/251-255/261-263/273-274;
-    // `download_safetensors`'s two single-name tries, resolver.rs:426-429).
-    // Every known filename is a tracked arm regardless of which one THIS
-    // load actually selected — `model.onnx` APPEARING next to a
-    // currently-loaded `model.safetensors` is exactly the case that flips
-    // the backend a cold resolve would choose (`resolve_local` prefers ORT
-    // the instant `has_onnx` is true), so its appearance must be just as
-    // detectable as its own disappearance. A sharded HF download
-    // (`download_safetensors`'s shard fallback, resolver.rs:432-442) names
-    // files OUTSIDE this fixed three-name set entirely — those are appended
-    // below as their own always-gated extra arms of this SAME slot, exactly
-    // mirroring the pre-reshape per-file behaviour for that case (no
-    // known-name alternate exists for one specific shard; `download_safetensors`
-    // always re-fetches the identical shard set on a cold resolve, so a
-    // shard's own loss makes a cold resolve fail regardless of the three
-    // named arms' state).
+    // Weights ALTERNATES slot (audit round 62, adversarial round 10; reshaped
+    // in round 12 — F-1): the resolver's OWN `model.safetensors` /
+    // `open_clip_model.safetensors` / `model.onnx` preference chain
+    // (`try_catalog_lookup`, resolver.rs:160-162; `resolve_local`'s
+    // `has_onnx`/`has_safetensors` backend auto-selection,
+    // resolver.rs:240/251-255/261-263/273-274; `download_safetensors`'s two
+    // single-name tries, resolver.rs:426-431). Every known filename is a
+    // tracked arm regardless of which one THIS load actually selected —
+    // `model.onnx` APPEARING next to a currently-loaded `model.safetensors`
+    // is exactly the case that flips the backend a cold resolve would choose
+    // (`resolve_local` prefers ORT the instant `has_onnx` is true), so its
+    // appearance must be just as detectable as its own disappearance. This
+    // slot models ONLY these three mutually SUBSTITUTABLE named alternates —
+    // a cold resolve picks exactly one of them — never a sharded download's
+    // extra files (see the per-shard slots pushed separately, immediately
+    // below, and F-1's fix for why folding them in here was wrong).
+    //
+    // **Primary-file edge (round 12)**: `download_safetensors` returns as
+    // soon as EITHER single-name `repo.get` succeeds (resolver.rs:426-431),
+    // WITHOUT ever enumerating shards — so whenever `resolved.weights_paths`
+    // has a single entry matching one of the three names below, that is the
+    // gated arm of THIS slot, exactly as before. The shard-enumeration
+    // branch (resolver.rs:432-442) is reached only once BOTH single-name
+    // tries fail, and HF's sharded convention names shards
+    // `model-NNNNN-of-MMMMM.safetensors` — never literally `model.safetensors`
+    // — so in that state `resolved.weights_paths` names NO known primary at
+    // all: every arm of this slot is honestly `gated: false` (and, on disk,
+    // absent), and every entry becomes its own per-shard slot below instead.
+    // Both states are handled uniformly by the same per-entry name check
+    // (never keyed on the entry's ORDER within `weights_paths`), so a
+    // hypothetical future mixed shape (a named primary alongside extra
+    // shard-like entries) would still be classified honestly rather than by
+    // accident.
+    //
+    // **Honest residual (round 12) — this slot is `backend_hint`-blind.**
+    // `DigestSlot`/`probe` decide arm (b) "stale, a cold resolve would
+    // succeed via the alternate" purely from which named files exist on
+    // disk — they never see the `backend_hint` the ORIGINAL `get_or_load`
+    // call was made with. `resolve_local` (resolver.rs:251-270), when
+    // `backend_hint == Some(Candle)`, pins `backend` to `Candle`
+    // UNCONDITIONALLY and never falls back to `model.onnx` even if it
+    // exists (`resolve_local`'s ORT auto-pick, resolver.rs:251-255, applies
+    // ONLY when `backend_hint` is `None`) — so `model.safetensors` deleted
+    // while an ungated `model.onnx` sits alongside it, under a Candle-pinned
+    // load, is a case where THIS slot still reports arm (b) `Ok(false)`
+    // stale (an arm — `model.onnx` — is present now), even though a cold
+    // `resolve_local` call carrying that SAME `backend_hint` would hit the
+    // typed refusal at resolver.rs:266-270 ("No safetensors weights found
+    // for Candle backend"), not succeed via a different backend. The probe
+    // therefore does not itself refuse here, contrary to arm (c)'s contract
+    // doc above ("no arm can satisfy a cold resolve" -> `Err`) — this is
+    // arm (b) by the slot's own on-disk-only view, whether or not the
+    // RECORDED hint would actually doom the reload.
+    //
+    // This is deliberately left undetected rather than plumbing
+    // `backend_hint` into `ResolvedModel`/`ModelFingerprint` (a
+    // shared-declaration change out of this fix's scope): the reported
+    // "stale" verdict is not a silent wrong-answer — `ModelCache::get_or_load`
+    // (cache.rs) evicts on `Ok(false)` and falls through to `do_load`, which
+    // calls `self.resolver.resolve(source, task, backend_hint)` with the
+    // SAME `backend_hint` this `get_or_load` invocation was itself called
+    // with (the hint is a parameter of the whole retry loop, not something
+    // `probe` re-derives) — so the reload immediately hits the identical
+    // typed refusal a direct probe-time `Err` would have produced, one hop
+    // later, surfaced to the SAME caller as the SAME typed `JammiError`.
+    // The only externally observable difference from a hypothetical
+    // hint-aware `Err` here is that the stale `CacheEntry` is evicted before
+    // the reload's refusal — strictly conservative (never serves the
+    // now-incomplete entry again) and not a correctness gap. A caller that
+    // varies `backend_hint` across calls for the SAME model id (not done by
+    // any call site in this codebase today) could observe a DIFFERENT
+    // backend's reload attempt than the one that built this fingerprint —
+    // that cross-hint interaction predates this fix and is a property of
+    // `get_or_load`'s per-call `backend_hint` parameter, not of this slot.
     let known_weight_names = [
         "model.safetensors",
         "open_clip_model.safetensors",
         "model.onnx",
     ];
-    let mut weight_arms: Vec<RawArm> = known_weight_names
+    let weight_arms: Vec<RawArm> = known_weight_names
         .into_iter()
         .map(|name| {
             let path = model_dir.join(name);
@@ -1129,19 +1192,47 @@ fn all_candidate_paths(resolved: &ResolvedModel) -> Result<Vec<DigestSlot>> {
             }
         })
         .collect();
-    for weights in &resolved.weights_paths {
-        if !weight_arms.iter().any(|arm| &arm.path == weights) {
-            weight_arms.push(RawArm {
-                path: weights.clone(),
-                anchor: model_dir.clone(),
-                gated: true,
-            });
-        }
-    }
     slots.push(RawSlot {
         arms: weight_arms,
         absence_tolerated: false,
     });
+
+    // Per-shard weights slots (audit round 62, adversarial round 12 — F-1,
+    // the fix for the round-10 reshape's own bug): a sharded HF download
+    // (`download_safetensors`'s shard fallback, resolver.rs:432-442) names
+    // files OUTSIDE the fixed three-name set entirely, and — unlike the
+    // three named arms above, which are mutually substitutable — every
+    // shard is CONJUNCTIVELY required: `VarBuilder::from_mmaped_safetensors`
+    // (candle.rs:2382) needs ALL of them, and a cold resolve always
+    // re-fetches the SAME shard set (resolver.rs:432-442 collects every
+    // `.safetensors` sibling deterministically), so any ONE shard's own
+    // loss makes a cold resolve fail regardless of the other shards' — or
+    // the three named arms' — state. Folding a shard into the alternates
+    // slot above (the pre-round-12 shape) modeled it as just another
+    // DISJUNCTIVE arm: deleting one shard while a sibling shard (or a named
+    // arm) happened to still exist made `probe` report merely STALE
+    // (`Ok(false)`) instead of the typed refusal a cold resolve of the SAME
+    // now-incomplete shard set would actually hit. Each shard therefore gets
+    // its OWN single-arm, always-gated, `absence_tolerated: false` slot —
+    // losing it reaches the typed refusal (arm c) exactly the way losing the
+    // sole `model.safetensors` does, never the alternates slot's
+    // (b)-stale/(c)-refuse decision, which is keyed on the WRONG set of
+    // arms for a conjunctive requirement.
+    for weights in &resolved.weights_paths {
+        if known_weight_names
+            .iter()
+            .all(|name| weights != &model_dir.join(name))
+        {
+            slots.push(RawSlot {
+                arms: vec![RawArm {
+                    path: weights.clone(),
+                    anchor: model_dir.clone(),
+                    gated: true,
+                }],
+                absence_tolerated: false,
+            });
+        }
+    }
 
     // The fine-tune adapter's own pair (F-1): two independent required
     // files that are never alternates of each other, so each is its own
@@ -1359,6 +1450,23 @@ impl ModelFingerprint {
     ///     this remains the typed refusal (`Err`), unchanged from before the
     ///     round-10 reshape. The tokenizer slot's `absence_tolerated == true`
     ///     means it NEVER reaches this arm, for any number of vanished arms.
+    ///
+    /// **Honest residual (round 12) — arm (b) is `backend_hint`-blind for the
+    /// weights slot.** "Some arm of this slot present now" is an on-disk-only
+    /// check; it does not know whether the ORIGINAL `get_or_load` call's
+    /// `backend_hint` would make a cold resolve reject that surviving arm
+    /// anyway (e.g. `model.safetensors` deleted while an ungated
+    /// `model.onnx` survives, under a Candle-pinned `backend_hint`:
+    /// `resolve_local` never auto-falls-back to ORT when the hint is `Some`,
+    /// resolver.rs:251-270). Such a load reports arm (b) `Ok(false)` here
+    /// even though a cold resolve carrying that SAME hint would in fact hit
+    /// arm (c)'s typed refusal. This is NOT a silent wrong answer:
+    /// `ModelCache::get_or_load` evicts on `Ok(false)` and immediately
+    /// re-resolves with the SAME `backend_hint` this call was made with, so
+    /// the caller gets the identical typed `JammiError` one hop later
+    /// instead of directly from `probe`. See [`all_candidate_paths`]'s
+    /// weights-alternates-slot doc for the full accounting of why this is
+    /// left undetected rather than plumbing `backend_hint` into this type.
     pub(crate) fn probe(&self) -> Result<bool> {
         for slot in &self.slots {
             let mut changed = false;
@@ -4928,6 +5036,156 @@ mod digest_fingerprint_audit62_tests {
             "deleting model.safetensors with NO alternate weights file present must \
              remain a typed refusal — no arm of the weights slot can satisfy a cold \
              resolve — unchanged from before the round-10 reshape. Got {result:?}"
+        );
+    }
+
+    /// Build a `ResolvedModel` whose weights slot has a PRIMARY arm
+    /// (`model.safetensors`, matching one of the three known names — the
+    /// "primary-file edge" from `all_candidate_paths`' weights-alternates
+    /// doc) PLUS `extra_shard_count` additional CONJUNCTIVELY-required
+    /// shard-named files (`model-NNNNN-of-MMMMM.safetensors`, mirroring HF's
+    /// own sharded naming, resolver.rs:432-442) — every one of them present
+    /// in `weights_paths`, i.e. "all gated". Each shard's bytes are distinct
+    /// (`marker` byte written first) so a per-shard mutation test can target
+    /// exactly one shard unambiguously. Real `download_safetensors` never
+    /// actually produces a named-primary-plus-shards mix (it returns a
+    /// single named file OR the full shard set, never both — see the
+    /// primary-file-edge doc) — this fixture exercises the code path
+    /// generically regardless, since nothing in `all_candidate_paths`'
+    /// per-entry classification depends on that never happening.
+    fn resolved_with_primary_and_shards(
+        dst: &std::path::Path,
+        extra_shard_count: usize,
+    ) -> ResolvedModel {
+        std::fs::create_dir_all(dst).unwrap();
+        let fixture = jammi_test_utils::cookbook_fixture("tiny_bert");
+        for name in ["config.json", "tokenizer.json", "model.safetensors"] {
+            std::fs::copy(fixture.join(name), dst.join(name)).unwrap();
+        }
+        let mut weights_paths = vec![dst.join("model.safetensors")];
+        for i in 0..extra_shard_count {
+            let shard_name = format!("model-{:05}-of-{:05}.safetensors", i + 1, extra_shard_count);
+            let shard_path = dst.join(&shard_name);
+            std::fs::write(&shard_path, [i as u8, 0xAB, 0xCD, 0xEF]).unwrap();
+            weights_paths.push(shard_path);
+        }
+        let model_config: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(dst.join("config.json")).unwrap()).unwrap();
+        ResolvedModel {
+            model_id: crate::model::ModelId(format!("local:{}", dst.display())),
+            backend: crate::model::BackendType::Candle,
+            task: ModelTask::TextEmbedding,
+            config_path: dst.join("config.json"),
+            weights_paths,
+            tokenizer: Some(TokenizerSource::HuggingFaceJson(dst.join("tokenizer.json"))),
+            model_config,
+            preprocessor_config: None,
+            pooling_config: None,
+            base_model_id: None,
+            adapter_path: None,
+            estimated_memory: 0,
+        }
+    }
+
+    /// (a) F-1 core, round 12: deleting ONE shard of a multi-shard weights
+    /// download must be a typed REFUSAL, never merely stale — a shard is
+    /// CONJUNCTIVELY required (`VarBuilder::from_mmaped_safetensors` needs
+    /// ALL of them), so no sibling shard's continued presence can rescue a
+    /// cold resolve of the now-incomplete set.
+    ///
+    /// RED pre-fix (round-10 folded-slot shape, reproduced via the stash
+    /// methodology: reverting `all_candidate_paths`' weights-slot
+    /// construction to append every shard as an extra ALWAYS-GATED arm of
+    /// the SAME disjunctive alternates slot): the deleted shard was just
+    /// one more arm of that slot, and the slot's OTHER arms (the still-intact
+    /// second shard, or the primary) satisfy `any_arm_present_now`, so
+    /// `probe` fell into arm (b) and wrongly reported `Ok(false)` (stale)
+    /// instead of the typed refusal a cold resolve of the now-incomplete
+    /// shard set would actually hit. GREEN post-fix: each shard is its own
+    /// single-arm, `absence_tolerated: false` slot, so losing it is arm (c)
+    /// unconditionally.
+    #[test]
+    fn shard_slot_one_shard_deleted_is_a_typed_refusal_never_stale() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = resolved_with_primary_and_shards(&dst, 2);
+
+        let fingerprint = compute_model_fingerprint(&resolved).unwrap();
+        assert!(
+            fingerprint.probe().unwrap(),
+            "sanity: fresh immediately after capture"
+        );
+
+        // Delete exactly one shard (the second extra shard); the primary
+        // and the OTHER shard remain untouched.
+        std::fs::remove_file(dst.join("model-00002-of-00002.safetensors")).unwrap();
+
+        let result = fingerprint.probe();
+        assert!(
+            result.is_err(),
+            "deleting one shard of a multi-shard weights download must be a typed \
+             refusal (audit round 62, adversarial round 12, F-1) — a shard is \
+             CONJUNCTIVELY required, so the primary file and the OTHER shard still \
+             being present must NOT rescue this into merely stale. Got {result:?}"
+        );
+    }
+
+    /// (b) slot independence: the weights ALTERNATES slot's own arm-(c)
+    /// contract (all three named arms gone -> typed refusal) must still hold
+    /// even when this fixture ALSO has healthy, untouched per-shard slots —
+    /// proving the round-12 reshape did not accidentally let a healthy shard
+    /// slot mask a genuine alternates-slot refusal (each slot is evaluated,
+    /// and can independently refuse, on its own).
+    #[test]
+    fn alternates_slot_all_arms_gone_is_a_typed_refusal_even_with_shards_intact() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = resolved_with_primary_and_shards(&dst, 2);
+        // No open_clip_model.safetensors or model.onnx exists at all, so
+        // deleting the primary leaves EVERY arm of the alternates slot gone.
+
+        let fingerprint = compute_model_fingerprint(&resolved).unwrap();
+        std::fs::remove_file(dst.join("model.safetensors")).unwrap();
+        // The two shard files are left completely untouched.
+
+        let result = fingerprint.probe();
+        assert!(
+            result.is_err(),
+            "deleting the sole named primary, with no open_clip_model.safetensors or \
+             model.onnx alternate present, must remain a typed refusal for the \
+             ALTERNATES slot regardless of the per-shard slots being entirely \
+             untouched and healthy — each slot refuses independently. Got {result:?}"
+        );
+    }
+
+    /// (d) the shard-append reshape must still digest-gate every shard: a
+    /// byte mutation to any ONE shard file must change
+    /// `compute_model_content_digest`'s output, under a constant
+    /// `resolved.weights_paths` — the multi-shard peer of the existing
+    /// single-file `weights_slot_*` digest coverage (the adapter/config/
+    /// tokenizer/pooling mutation family in this module), extended to the
+    /// per-shard-slot shape (round 12).
+    #[test]
+    fn shard_byte_mutation_changes_content_digest() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = resolved_with_primary_and_shards(&dst, 2);
+
+        let digest_before = compute_model_content_digest(&resolved).unwrap();
+
+        let shard_path = dst.join("model-00001-of-00002.safetensors");
+        let mut bytes = std::fs::read(&shard_path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&shard_path, &bytes).unwrap();
+
+        let digest_after = compute_model_content_digest(&resolved).unwrap();
+
+        assert_ne!(
+            digest_before, digest_after,
+            "mutating ONE shard's bytes in place, under a constant `weights_paths`, must \
+             change the content digest — every shard remains its own always-gated slot \
+             after the round-12 reshape, exactly like the pre-reshape flat per-file model"
         );
     }
 }

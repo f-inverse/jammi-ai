@@ -3284,6 +3284,46 @@ mod tests {
         );
     }
 
+    /// M1b delta re-audit finding F5: the sibling test immediately above
+    /// (a SUM mismatch: mask sums to 4 real tokens, `trusted` claims 3)
+    /// is killed by a mutant that replaces
+    /// [`trusted_lengths_agree_with_mask`]'s own elementwise/structural
+    /// check with a bare SUM comparison — a sum-only check would ALSO
+    /// reject that fixture, so that test alone cannot tell "this checks
+    /// structure" from "this checks the sum" apart. This is the
+    /// DISCRIMINATING TWIN [`resolve_lengths_and_prefix_none_falls_back_to_path_f`]'s
+    /// own doc already names ("the same interior-zero-vs-prefix
+    /// distinction... elsewhere in this module" — path F's own version,
+    /// [`compute_lengths_and_prefix_distinguishes_interior_zero_from_a_true_prefix_of_equal_length`],
+    /// existed; path P's did not): `mask = [1, 0, 1, 0]` sums to `2`, the
+    /// EXACT SAME sum a genuine length-`2` prefix (`[1, 1, 0, 0]`) reports
+    /// — `trusted = [2]` therefore SATISFIES a sum-only check, but `mask`
+    /// is NOT the right-padded prefix `trusted` claims (position `1` is
+    /// `0` while `1 < trusted[0]` says it should be `1`) — must still
+    /// produce `trusted_lengths_match_mask`'s `DomainMiss`.
+    #[test]
+    fn resolve_lengths_and_prefix_trusted_lengths_interior_zero_same_sum_is_domain_miss() {
+        let _guard = FLASH_D2H_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let device = Device::Cpu;
+        // Same sum (2) as a genuine length-2 prefix ([1,1,0,0]), but an
+        // interior zero at position 1 — NOT actually a prefix.
+        let mask = Tensor::from_slice(&[1f32, 0.0, 1.0, 0.0], (1, 4), &device).unwrap();
+        let before = flash_d2h_syncs();
+        let (outcome, reason, eligible) =
+            resolve_lengths_and_prefix(&mask, Some(&[2usize])).unwrap();
+        let after = flash_d2h_syncs();
+        assert_eq!(after, before + 1, "the device validation still ran");
+        assert_eq!(outcome, PredicateOutcome::DomainMiss);
+        assert_eq!(reason, "trusted_lengths_match_mask");
+        assert!(
+            eligible.is_none(),
+            "a sum-matching but structurally-wrong (interior-zero) trusted_lengths must never \
+             reach Holds -- a sum-only check would have missed this"
+        );
+    }
+
     #[test]
     fn resolve_lengths_and_prefix_trusted_lengths_wrong_batch_count_is_domain_miss() {
         let device = Device::Cpu;
@@ -3304,6 +3344,32 @@ mod tests {
         assert_eq!(outcome, PredicateOutcome::DomainMiss);
         assert_eq!(reason, "trusted_lengths_within_seq");
         assert!(eligible.is_none());
+    }
+
+    /// M1b delta re-audit advisory: [`trusted_lengths_agree_with_mask`]'s
+    /// own `min_all` reduction has no explicit degenerate-shape refusal --
+    /// on `batch == 0` or `seq == 0` it reduces over a TENSOR WITH ZERO
+    /// ELEMENTS. Confirmed here (not assumed) that candle's own reduce op
+    /// already fails CLOSED on that shape -- a real, typed `Err`
+    /// (`Tensor(empty tensor for reduce)`), never a panic and never a
+    /// silently-wrong `bool` that could read as "agrees" — so this pins
+    /// the EXISTING safe behavior as a checked premise, not a new
+    /// production-code refusal (family D: even an accidental safety
+    /// property should be measured and asserted, not left to keep working
+    /// by chance across a future candle upgrade).
+    #[test]
+    fn resolve_lengths_and_prefix_degenerate_batch_or_seq_zero_is_a_typed_err_not_a_panic() {
+        let device = Device::Cpu;
+        let batch_and_seq_zero = Tensor::zeros((0, 0), DType::F32, &device).unwrap();
+        assert!(
+            resolve_lengths_and_prefix(&batch_and_seq_zero, Some(&[])).is_err(),
+            "batch==0, seq==0 must be a typed Err, not Ok(..) with a fabricated answer"
+        );
+        let seq_zero_only = Tensor::zeros((0, 5), DType::F32, &device).unwrap();
+        assert!(
+            resolve_lengths_and_prefix(&seq_zero_only, Some(&[])).is_err(),
+            "batch==0, seq==5 (still zero ELEMENTS: 0*5=0) must be a typed Err too"
+        );
     }
 
     /// `trusted_lengths = None` reduces `resolve_lengths_and_prefix` to
@@ -4368,95 +4434,105 @@ mod tests {
         }
     }
 
-    /// Bound for [`flash_arm_padded_matches_block_arm_on_real_rows_cuda`],
-    /// tightened from its own first-pass (`3.0`, UNCALIBRATED) value by the
-    /// SAME headroom discipline [`FLASH_ORACLE_K_MEAN_POOLED`]'s own doc
-    /// uses for its `relative_l1_error` leg (the SAME metric this padded
-    /// oracle's own `ratio` is — never [`FLASH_ORACLE_K_MEAN_GRAD`]'s
-    /// `cosine_distance` leg, a different metric on a different quantity):
-    /// measured by
-    /// `crates/jammi-kernels/artifacts/cuda-runs/2026-08-28-m1b-b3-padded-oracles-c2365c9-a100-pcie.json`
-    /// (A100 80GB PCIe, driver 570.211.01, `flash_arm_padded_matches_block_arm_on_real_rows_cuda`
-    /// itself, `--nocapture`, at `c2365c9`): real-row ratio = `0.229503`.
-    /// `0.34` gives `0.34 / 0.229503` ≈ `1.48`x margin over that measured
-    /// value — the SAME `~1.5`x headroom `FLASH_ORACLE_K_MEAN_POOLED`'s own
-    /// `1.6` gives over ITS measured healthy mean (`1.6 / 1.0798` ≈
-    /// `1.48`x) — never a fitted constant (`0.229503` itself, or a bare
-    /// round-up of it, would leave zero margin for ordinary run-to-run bf16
-    /// noise).
+    /// Bound for [`flash_arm_padded_matches_block_arm_on_real_rows_cuda`]
+    /// -- DERIVATION PENDING the regime-correct harvest (M1b delta re-audit
+    /// findings F3/F4; not silently left as before).
     ///
-    /// KNOWN GAP, honestly disclosed (not silently matched): unlike
-    /// [`FLASH_ORACLE_K_MEAN_POOLED`]'s doc, which ALSO cites how far below
-    /// the WEAKEST measured RED-control mutant mean its bound sits (the
-    /// K-unrotated/window-dropped/bad-softmax-scale means measured on that
-    /// same leg), no equivalent ratio-based mutant measurement exists yet
-    /// for this padded-arm leg — its own RED controls
-    /// ([`flash_arm_padded_red_control_lengths_off_by_one_cuda`] and the
-    /// `w±1` siblings below it) assert bit-inequality (`assert_ne!`), not a
-    /// measured ratio, so there is no "weakest mutant mean" to check this
-    /// bound sits comfortably below yet. Only the headroom-over-healthy
-    /// half of the dense arm's convention is replicated here; a future
-    /// ratio-based padded-arm RED control would let this bound's OTHER half
-    /// be checked too.
+    /// F4 (fixture was window-NON-binding): the `0.229503` this constant's
+    /// PRIOR value (`0.34`, still kept as today's CANDIDATE below) was
+    /// derived from was measured by
+    /// `crates/jammi-kernels/artifacts/cuda-runs/2026-08-28-m1b-b3-padded-oracles-c2365c9-a100-pcie.json`
+    /// (A100 80GB PCIe, driver 570.211.01, at `c2365c9`) on a fixture whose
+    /// longest segment (`seq=64`) sat BELOW the window-binding threshold
+    /// [`flash_arm_padded_red_control_window_radius_off_by_one_cuda`]'s own
+    /// "CHECKED PREMISE" doc derives (`L >= half_window + 2 = 66`) --
+    /// `max|q-k| = 63 <= half_window = 64`, so the sliding-window band was
+    /// ALL-ZEROS and every LOCAL layer degenerated to full (unwindowed)
+    /// attention; that measurement never exercised the real windowed
+    /// kernel path this oracle exists to parity-check. The oracle itself
+    /// is now restructured (below) to a window-BINDING fixture (`seq=160`,
+    /// at least one segment `>= 66`), with the SAME checked-premise assert
+    /// the RED controls already carry.
+    ///
+    /// F3 (metric mismatch, the borrowed factor is WITHDRAWN): the prior
+    /// doc revision claimed this constant was derived by "the SAME metric"
+    /// as [`FLASH_ORACLE_K_MEAN_POOLED`] -- FALSE.
+    /// [`FLASH_ORACLE_K_MEAN_POOLED`] bounds a RATIO,
+    /// `err(other,f32) / err(block,f32)` -- its OWN noise-free value is
+    /// `1.0` (both arms bit-identical to the f32 reference). THIS constant
+    /// bounds a BARE [`relative_l1_error`], `relative_l1_error(flash_real,
+    /// block_real)` directly -- its noise-free value is `0.0` (flash and
+    /// block bit-identical on real rows). A multiplicative factor
+    /// calibrated against a metric whose floor is `1.0` has no principled
+    /// meaning applied to a metric whose floor is `0.0` -- these are two
+    /// DIFFERENT quantities that happen to both be called "a ratio bound"
+    /// in prose, not "the same thing at a different scale" (`CLAUDE.md`'s
+    /// own test for when one definition should serve two call sites). The
+    /// prior "`~1.5`x margin, same as `FLASH_ORACLE_K_MEAN_POOLED`'s own
+    /// `1.6`" justification is withdrawn along with it. The oracle is also
+    /// restructured (below) to sweep [`FLASH_ORACLE_SWEEP_SEEDS`] (8 fixed
+    /// seeds -- "a single seed's draw is not a distribution", the SAME
+    /// discipline every dense-arm sweep already uses; the prior single-seed
+    /// (`77`) measurement is retired, not reused), printing every per-seed
+    /// ratio under `--nocapture` and asserting the MEAN (matching
+    /// [`FLASH_ORACLE_K_MEAN_POOLED`]'s own "mean, never per-seed max"
+    /// convention -- see that constant's own doc for why a max bound was
+    /// deleted as seed-unstable).
+    ///
+    /// `0.34` is kept as a CANDIDATE value -- numerically UNCHANGED from
+    /// before, but its justification is NOT: it is not re-derived from
+    /// `0.229503` (measured by
+    /// `crates/jammi-kernels/artifacts/cuda-runs/2026-08-28-m1b-b3-padded-oracles-c2365c9-a100-pcie.json`,
+    /// the number this doc's own F4 section above explains was measured in
+    /// the wrong regime) and not derived by transfer from a different
+    /// metric's own headroom (F3's withdrawn factor). It awaits the pod's
+    /// harvest of THIS (`seq=160`, 8-seed) oracle version -- deliberately NOT called
+    /// PROVISIONAL: that word already named a DIFFERENT, already-resolved
+    /// gap ("no A100 artifact exists at all"); this gap is "derivation
+    /// pending a regime-correct harvest of a real, already-committed
+    /// artifact's successor". Once the lead runs the harvest, the per-seed
+    /// ratios (mean + spread) become the real evidence, and this bound's
+    /// own headroom must be re-derived in [`relative_l1_error`]'s OWN
+    /// terms: how far the measured MEAN sits above `0.0` (the noise-free
+    /// floor), covering (a) seed-to-seed variance across
+    /// [`FLASH_ORACLE_SWEEP_SEEDS`] and (b) the window-binding regime's own
+    /// bf16 rounding noise (per-row RoPE table gather plus REAL windowed
+    /// softmax truncation, arithmetic the prior non-binding fixture never
+    /// exercised) -- never a multiplicative factor borrowed from a
+    /// different metric's own noise floor.
     #[cfg(all(feature = "cuda", feature = "flash-attn"))]
     const FLASH_ORACLE_PADDED_BOUND: f64 = 0.34;
 
-    /// The padded CUDA parity oracle (contract v4 §3.1 item 7): compares
-    /// `attention_block_flash`'s PADDED/ragged arm against the pre-existing,
-    /// extensively-validated block arm, on REAL rows only — never on pad
-    /// rows, which the two arms do not even both produce the same way (the
-    /// block arm computes real numbers there too since it runs on the full
-    /// padded grid; the flash arm's own output is the `Tensor::zeros`
-    /// `repad_rows` destination). `relative_l1_error` (the SAME truth-relative
-    /// convention [`flash_oracle_sweep`] uses against an f32 reference — here
-    /// against the block arm, the closest already-validated reference this
-    /// NEW arm has) against [`FLASH_ORACLE_PADDED_BOUND`] (see that
-    /// constant's own doc for its derivation). Also asserts the
-    /// pad-rows-exact-zero premise on the flash arm's OWN output directly,
-    /// and the dispatch-proof counters (`fused == num_hidden_layers,
-    /// declined == 0` — an eligible padded batch is NEVER declined,
-    /// contract v4 §3.1 item 1's whole point).
-    #[test]
+    /// One seed's real-row `relative_l1_error(flash, block)` measurement
+    /// for [`flash_arm_padded_matches_block_arm_on_real_rows_cuda`] --
+    /// factored out so the test itself sweeps [`FLASH_ORACLE_SWEEP_SEEDS`]
+    /// (M1b delta re-audit finding F3) rather than measuring one seed.
+    /// `lengths` is the SAME window-BINDING fixture at every seed (only
+    /// `ids`/the model's LoRA init vary by seed, [`flash_oracle_synthetic_ids`]'s
+    /// own convention) -- also re-checks the dispatch-proof counters
+    /// (`fused == num_hidden_layers, declined == 0`) and the
+    /// pad-rows-exact-zero premise PER SEED, not just once, since a
+    /// per-seed fresh model/forward is a genuinely independent run.
     #[cfg(all(feature = "cuda", feature = "flash-attn"))]
-    fn flash_arm_padded_matches_block_arm_on_real_rows_cuda() {
-        let Ok(model_dir) = std::env::var("JAMMI_FLASH_ORACLE_MODEL_DIR") else {
-            flash_oracle_require_gate("flash_arm_padded_matches_block_arm_on_real_rows_cuda");
-            return;
-        };
-        let Some(cuda) = growth_oracle_cuda_device() else {
-            return;
-        };
-        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _d2h_guard = FLASH_D2H_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if !flash_compiled_or_skip("flash_arm_padded_matches_block_arm_on_real_rows_cuda") {
-            return;
-        }
-
-        let dir = std::path::PathBuf::from(&model_dir);
-        let config: ModernBertConfig =
-            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
-                .unwrap();
-        let weights = dir.join("model.safetensors");
-        let seed = 77;
-        let (batch, seq) = (4usize, 64usize);
-        let ids = flash_oracle_synthetic_ids(batch, seq, config.vocab_size, seed, &cuda);
-        // Right-padded prefix mask, mixed lengths, INCLUDING one full-length
-        // row (proving this is genuinely padded, not degenerate dense).
-        let lengths = [seq, seq - 8, seq / 2, 5];
-        assert_eq!(lengths.len(), batch);
+    fn flash_padded_real_row_ratio_at_seed(
+        config: &ModernBertConfig,
+        weights: &std::path::Path,
+        cuda: &Device,
+        batch: usize,
+        seq: usize,
+        lengths: &[usize],
+        seed: u64,
+    ) -> f64 {
+        let ids = flash_oracle_synthetic_ids(batch, seq, config.vocab_size, seed, cuda);
         let mut mask_data = vec![0u32; batch * seq];
         for (b, &len) in lengths.iter().enumerate() {
             for s in 0..len {
                 mask_data[b * seq + s] = 1;
             }
         }
-        let mask = Tensor::from_vec(mask_data, (batch, seq), &cuda).unwrap();
+        let mask = Tensor::from_vec(mask_data, (batch, seq), cuda).unwrap();
 
-        let model = flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda, true);
+        let model = flash_oracle_build_model(config, weights, DType::BF16, seed, cuda, true);
 
         let flash_before = cascade_counters_for("attention_block_flash").snapshot();
         let flash_out = model.forward_hidden(&ids, &mask).unwrap();
@@ -4464,12 +4540,13 @@ mod tests {
         assert_eq!(
             flash_after.fused - flash_before.fused,
             config.num_hidden_layers as u64,
-            "every layer must dispatch Fused on a genuinely padded, eligible batch -- \
-             {flash_before:?} -> {flash_after:?}"
+            "seed={seed}: every layer must dispatch Fused on a genuinely padded, eligible \
+             batch -- {flash_before:?} -> {flash_after:?}"
         );
         assert_eq!(
             flash_after.declined, flash_before.declined,
-            "an eligible padded batch must never decline -- contract v4 item 1's whole point"
+            "seed={seed}: an eligible padded batch must never decline -- contract v4 item 1's \
+             whole point"
         );
 
         let block_out = forward_hidden_forcing_flash(&model, &ids, &mask, true).unwrap();
@@ -4502,20 +4579,95 @@ mod tests {
                 let flat = (b * seq + s) * hidden;
                 assert!(
                     flash_v[flat..flat + hidden].iter().all(|&x| x == 0.0),
-                    "pad row (b={b}, s={s}) of the flash arm's OWN output must be EXACTLY zero \
-                     post-scatter (contract v4 delta 4's checked premise)"
+                    "seed={seed}: pad row (b={b}, s={s}) of the flash arm's OWN output must be \
+                     EXACTLY zero post-scatter (contract v4 delta 4's checked premise)"
                 );
             }
         }
         let ratio = relative_l1_error(&flash_real, &block_real);
         eprintln!(
-            "flash_arm_padded_matches_block_arm_on_real_rows_cuda: real-row ratio={ratio:.5e} \
-             (bound {FLASH_ORACLE_PADDED_BOUND})"
+            "flash_arm_padded_matches_block_arm_on_real_rows_cuda[seed={seed}]: real-row \
+             ratio={ratio:.5e}"
+        );
+        ratio
+    }
+
+    /// The padded CUDA parity oracle (contract v4 §3.1 item 7): compares
+    /// `attention_block_flash`'s PADDED/ragged arm against the pre-existing,
+    /// extensively-validated block arm, on REAL rows only — never on pad
+    /// rows, which the two arms do not even both produce the same way (the
+    /// block arm computes real numbers there too since it runs on the full
+    /// padded grid; the flash arm's own output is the `Tensor::zeros`
+    /// `repad_rows` destination). RESTRUCTURED (M1b delta re-audit findings
+    /// F3/F4): sweeps [`FLASH_ORACLE_SWEEP_SEEDS`] via
+    /// [`flash_padded_real_row_ratio_at_seed`] on a window-BINDING fixture,
+    /// asserting the MEAN [`relative_l1_error`] against
+    /// [`FLASH_ORACLE_PADDED_BOUND`] (see that constant's own doc for its
+    /// derivation status).
+    #[test]
+    #[cfg(all(feature = "cuda", feature = "flash-attn"))]
+    fn flash_arm_padded_matches_block_arm_on_real_rows_cuda() {
+        let Ok(model_dir) = std::env::var("JAMMI_FLASH_ORACLE_MODEL_DIR") else {
+            flash_oracle_require_gate("flash_arm_padded_matches_block_arm_on_real_rows_cuda");
+            return;
+        };
+        let Some(cuda) = growth_oracle_cuda_device() else {
+            return;
+        };
+        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _d2h_guard = FLASH_D2H_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !flash_compiled_or_skip(
+            "flash_arm_padded_matches_block_arm_on_real_rows_cuda",
+            &cuda,
+        ) {
+            return;
+        }
+
+        let dir = std::path::PathBuf::from(&model_dir);
+        let config: ModernBertConfig =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                .unwrap();
+        let weights = dir.join("model.safetensors");
+        // Window-BINDING fixture (F4): 160/96 clear the `half_window + 2`
+        // visibility threshold (see the sibling RED controls' own "CHECKED
+        // PREMISE" doc for the derivation); 40/6 stay below it, pinning
+        // the no-truncation regime too. INCLUDES one full-length row
+        // (proving this is genuinely padded, not degenerate dense).
+        let (batch, seq) = (4usize, 160usize);
+        let lengths = [seq, 96, 40, 6];
+        assert_eq!(lengths.len(), batch);
+        let half_window = config.half_window();
+        assert!(
+            lengths.iter().any(|&len| len >= half_window + 2),
+            "checked premise: at least one segment length must reach half_window ({half_window}) \
+             + 2 for the sliding-window band to be anything but all-zeros -- see \
+             FLASH_ORACLE_PADDED_BOUND's own doc, finding F4"
+        );
+
+        let ratios: Vec<f64> = FLASH_ORACLE_SWEEP_SEEDS
+            .iter()
+            .map(|&seed| {
+                flash_padded_real_row_ratio_at_seed(
+                    &config, &weights, &cuda, batch, seq, &lengths, seed,
+                )
+            })
+            .collect();
+        let (mean, max) = mean_max(&ratios);
+        eprintln!(
+            "flash_arm_padded_matches_block_arm_on_real_rows_cuda OVER {} SEEDS: per-seed \
+             ratios={ratios:.5?} mean={mean:.5e} max={max:.5e} (bound {FLASH_ORACLE_PADDED_BOUND}, \
+             max UNASSERTED -- diagnostic only, same convention as FLASH_ORACLE_K_MEAN_POOLED)",
+            FLASH_ORACLE_SWEEP_SEEDS.len(),
         );
         assert!(
-            ratio < FLASH_ORACLE_PADDED_BOUND,
-            "flash-padded vs block-arm real-row ratio {ratio:.5e} exceeds the bound \
-             {FLASH_ORACLE_PADDED_BOUND} -- see that constant's own doc"
+            mean.is_finite() && mean < FLASH_ORACLE_PADDED_BOUND,
+            "flash-padded vs block-arm MEAN real-row ratio {mean:.5e} over {} seeds exceeds the \
+             bound {FLASH_ORACLE_PADDED_BOUND} -- see that constant's own doc",
+            FLASH_ORACLE_SWEEP_SEEDS.len(),
         );
     }
 
@@ -4556,7 +4708,10 @@ mod tests {
         let _d2h_guard = FLASH_D2H_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if !flash_compiled_or_skip("flash_arm_padded_red_control_lengths_off_by_one_cuda") {
+        if !flash_compiled_or_skip(
+            "flash_arm_padded_red_control_lengths_off_by_one_cuda",
+            &cuda,
+        ) {
             return;
         }
 
@@ -4658,7 +4813,10 @@ mod tests {
         let _d2h_guard = FLASH_D2H_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if !flash_compiled_or_skip("flash_arm_padded_red_control_window_radius_off_by_one_cuda") {
+        if !flash_compiled_or_skip(
+            "flash_arm_padded_red_control_window_radius_off_by_one_cuda",
+            &cuda,
+        ) {
             return;
         }
 
@@ -4938,7 +5096,10 @@ mod tests {
         let _d2h_guard = FLASH_D2H_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if !flash_compiled_or_skip("flash_arm_padded_red_control_bwd_only_window_off_by_one_cuda") {
+        if !flash_compiled_or_skip(
+            "flash_arm_padded_red_control_bwd_only_window_off_by_one_cuda",
+            &cuda,
+        ) {
             return;
         }
 
@@ -5225,21 +5386,54 @@ mod tests {
 
     /// Mirrors [`growth_oracle_cuda_device`]'s own `JAMMI_REQUIRE_CUDA` gate
     /// AND [`flash_oracle_require_gate`]'s own `JAMMI_REQUIRE_FLASH_ORACLE`
-    /// gate, for the THIRD gate every flash-arm-vs-block-arm oracle in this
-    /// module checks before it can run: `jammi_kernels::admission::
-    /// FLASH_COMPILED` (was this build's `jammi-kernels` compiled with
-    /// `flash-attn`?). Without this, a build that compiled without the
-    /// feature reads every one of these oracles/RED-controls GREEN with no
-    /// escape hatch -- the exact "fell back/skipped everywhere and it read
-    /// as green" failure mode `AdmissionMode::Strict` exists to prevent,
-    /// just at the FEATURE-COMPILATION layer instead of the admission
-    /// layer. Returns `true` (caller proceeds) iff `FLASH_COMPILED`;
-    /// otherwise panics when `JAMMI_REQUIRE_FLASH` is set (the pod lane
-    /// exports it) or prints the skip message and returns `false`.
+    /// gate, for the THIRD and FOURTH gates every flash-arm-vs-block-arm
+    /// oracle in this module checks before it can run:
+    /// `jammi_kernels::admission::FLASH_COMPILED` (was this build's
+    /// `jammi-kernels` compiled with `flash-attn`?) AND (M1b delta re-audit
+    /// finding F1-sibling) `device`'s own compute capability is EXACTLY
+    /// `(8, 0)` ([`flash_arch_ok`]) -- the `flash-attn` build's kernels are
+    /// HARD-PINNED to sm80 (same class the bench gate's own wrong-arch bug
+    /// was), so a `flash-attn`-compiled BINARY running on a DIFFERENT arch
+    /// (an L40S, 8.9, or an H100, 9.0) must ALSO skip rather than dispatch
+    /// into kernels this build was never generated for -- without this
+    /// check, every one of the nine call sites through this helper would
+    /// hard-FAIL its own live-dispatch-count assertions on such a pod
+    /// (`FLASH_COMPILED == true` alone is not "this device can actually
+    /// run it"). Without EITHER check, a build that compiled without the
+    /// feature, or runs on the wrong arch, reads every one of those nine
+    /// call sites GREEN with no escape hatch -- the exact "fell
+    /// back/skipped everywhere and it read as green" failure mode
+    /// `AdmissionMode::Strict` exists to prevent, just at the
+    /// FEATURE-COMPILATION/ARCH layer instead of the admission layer.
+    /// Returns `true` (caller proceeds) iff BOTH `FLASH_COMPILED` and
+    /// `flash_arch_ok(device)`; otherwise panics when `JAMMI_REQUIRE_FLASH`
+    /// is set (the pod lane exports it -- "must run the real flash arm"
+    /// means BOTH conditions, not compilation alone) or prints a skip
+    /// message NAMING which of the two failed (and the probed arch, on an
+    /// arch mismatch) and returns `false`.
     #[cfg(feature = "cuda")]
-    fn flash_compiled_or_skip(test_name: &str) -> bool {
-        if jammi_kernels::admission::FLASH_COMPILED {
-            return true;
+    fn flash_compiled_or_skip(test_name: &str, device: &Device) -> bool {
+        let compiled = jammi_kernels::admission::FLASH_COMPILED;
+        if compiled {
+            if flash_arch_ok(device) {
+                return true;
+            }
+            if std::env::var_os("JAMMI_REQUIRE_FLASH").is_some() {
+                panic!(
+                    "{test_name}: JAMMI_REQUIRE_FLASH is set but this device's compute \
+                     capability is not EXACTLY (8, 0) (probed {:?}) -- the flash-attn build's \
+                     kernels are hard-pinned to sm80 (see flash_arch_ok's own doc) -- this lane \
+                     must run the real flash arm, not skip it",
+                    probe_cuda_compute_capability(device)
+                );
+            }
+            eprintln!(
+                "{test_name}: skipping — device compute capability is not EXACTLY (8, 0) \
+                 (probed {:?}); the flash-attn build's kernels are hard-pinned to sm80, see \
+                 flash_arch_ok's own doc",
+                probe_cuda_compute_capability(device)
+            );
+            return false;
         }
         if std::env::var_os("JAMMI_REQUIRE_FLASH").is_some() {
             panic!(
@@ -5268,7 +5462,11 @@ mod tests {
     /// Mutates the process-global `JAMMI_REQUIRE_FLASH` env var restored
     /// via a `catch_unwind`/`set_var` pair, run single-threaded by this
     /// crate's own pod convention (`--test-threads=1`) to avoid racing a
-    /// real oracle test that reaches the same gate concurrently.
+    /// real oracle test that reaches the same gate concurrently. Passes
+    /// `&Device::Cpu` for the (F1-sibling audit fix's new) `device`
+    /// parameter -- irrelevant here: `FLASH_COMPILED == false` short-
+    /// circuits `flash_compiled_or_skip` before the arch check is ever
+    /// consulted, on ANY device.
     #[test]
     #[cfg(all(feature = "cuda", not(feature = "flash-attn")))]
     fn flash_compiled_or_skip_panics_under_require_flash_when_not_compiled() {
@@ -5280,6 +5478,7 @@ mod tests {
         let result = std::panic::catch_unwind(|| {
             flash_compiled_or_skip(
                 "flash_compiled_or_skip_panics_under_require_flash_when_not_compiled",
+                &Device::Cpu,
             )
         });
         std::env::remove_var("JAMMI_REQUIRE_FLASH");
@@ -5300,7 +5499,54 @@ mod tests {
         // No env var set: must skip (return false), not panic.
         std::env::remove_var("JAMMI_REQUIRE_FLASH");
         assert!(!flash_compiled_or_skip(
-            "flash_compiled_or_skip_panics_under_require_flash_when_not_compiled"
+            "flash_compiled_or_skip_panics_under_require_flash_when_not_compiled",
+            &Device::Cpu,
+        ));
+    }
+
+    /// M1b delta re-audit finding F1-sibling's OWN regression test: the NEW
+    /// arch-mismatch branch [`flash_compiled_or_skip`] added. Deliberately
+    /// CPU-hermetic-in-EFFECT even though it requires a `flash-attn`
+    /// build to compile (`FLASH_COMPILED` must be `true` to even REACH the
+    /// arch check): passing `&Device::Cpu` makes
+    /// [`flash_arch_ok`]/`probe_cuda_compute_capability` deterministically
+    /// report "not sm80" WITHOUT needing real off-arch hardware (an L40S
+    /// or H100) to prove the branch fires correctly -- mirrors
+    /// [`flash_compiled_or_skip_panics_under_require_flash_when_not_compiled`]'s
+    /// own structure for the SIBLING (not-compiled) branch.
+    #[test]
+    #[cfg(all(feature = "cuda", feature = "flash-attn"))]
+    fn flash_compiled_or_skip_panics_under_require_flash_when_arch_mismatched() {
+        // SAFETY-of-test: same single-env-var/catch_unwind/restore
+        // discipline as the not-compiled sibling above, same pod
+        // `--test-threads=1` convention.
+        std::env::set_var("JAMMI_REQUIRE_FLASH", "1");
+        let result = std::panic::catch_unwind(|| {
+            flash_compiled_or_skip(
+                "flash_compiled_or_skip_panics_under_require_flash_when_arch_mismatched",
+                &Device::Cpu,
+            )
+        });
+        std::env::remove_var("JAMMI_REQUIRE_FLASH");
+        let err = result.expect_err(
+            "flash_compiled_or_skip must panic when JAMMI_REQUIRE_FLASH is set and the device \
+             is not EXACTLY sm80 (Device::Cpu deterministically fails flash_arch_ok)",
+        );
+        let msg = err
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(
+            msg.contains("JAMMI_REQUIRE_FLASH") && msg.contains("compute capability"),
+            "panic message must name the env var and the arch mismatch: {msg}"
+        );
+
+        // No env var set: must skip (return false), not panic.
+        std::env::remove_var("JAMMI_REQUIRE_FLASH");
+        assert!(!flash_compiled_or_skip(
+            "flash_compiled_or_skip_panics_under_require_flash_when_arch_mismatched",
+            &Device::Cpu,
         ));
     }
 
@@ -5979,14 +6225,26 @@ mod tests {
     }
 
     /// Per-layer VRAM attribution probe (numerics write-owner round closing
-    /// the flash-arm peak-VRAM BLOCK): mirrors
-    /// [`forward_hidden_forcing_flash`]'s body EXACTLY (same per-forward
-    /// setup, same per-layer loop, same arm-selection mechanism), with one
-    /// addition -- a [`cuda_free_mib`] reading after each layer's forward,
-    /// printed as a delta against the PRIOR reading. `label` names the arm
-    /// in the printed table (`"flash"` / `"block"`) purely for a human
-    /// reading `--nocapture` output; this function asserts nothing -- it is
-    /// a diagnostic tool, not an oracle (the calling test's own dispatch
+    /// the flash-arm peak-VRAM BLOCK). CORRECTED CLAIM (M1b delta re-audit
+    /// finding, advisory): this does NOT mirror
+    /// [`forward_hidden_forcing_flash`]'s body anymore -- that function is
+    /// now a thin seam over `ModernBert::forward_hidden_inner` (contract
+    /// v4 §3.1 item 5), which includes the padded/ragged encoder-boundary
+    /// transport gate (`unpad_rows` before layer 0, `repad_rows` after);
+    /// THIS probe is the OLD, hand-mirrored per-layer loop (pre-transport),
+    /// with one addition -- a [`cuda_free_mib`] reading after each layer's
+    /// forward, printed as a delta against the PRIOR reading -- and does
+    /// NOT gather/scatter. Its own ONLY call site
+    /// ([`flash_vs_block_per_layer_vram_attribution_probe_cuda`]) always
+    /// passes an ALL-ONES (dense, unpadded) mask, so the missing transport
+    /// gate is currently a NO-OP there (a genuinely padded batch would
+    /// take the `!admission.is_dense` branch `forward_hidden_inner` skips
+    /// this probe entirely) -- but a caller that reused this probe with a
+    /// padded mask would silently get the WRONG (untransported) per-layer
+    /// VRAM profile, not a refusal. `label` names the arm in the printed
+    /// table (`"flash"` / `"block"`) purely for a human reading
+    /// `--nocapture` output; this function asserts nothing -- it is a
+    /// diagnostic tool, not an oracle (the calling test's own dispatch
     /// count assertion is the oracle that the intended arm actually ran).
     #[cfg(feature = "cuda")]
     fn forward_hidden_forcing_flash_vram_probe(
@@ -6088,7 +6346,10 @@ mod tests {
         let _d2h_guard = FLASH_D2H_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if !flash_compiled_or_skip("flash_vs_block_per_layer_vram_attribution_probe_cuda") {
+        if !flash_compiled_or_skip(
+            "flash_vs_block_per_layer_vram_attribution_probe_cuda",
+            &cuda,
+        ) {
             return;
         }
 
@@ -6173,7 +6434,10 @@ mod tests {
         let _d2h_guard = FLASH_D2H_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if !flash_compiled_or_skip("flash_arm_encoder_level_three_way_oracle_dense_cuda_bf16") {
+        if !flash_compiled_or_skip(
+            "flash_arm_encoder_level_three_way_oracle_dense_cuda_bf16",
+            &cuda,
+        ) {
             return;
         }
 
@@ -6216,6 +6480,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         if !flash_compiled_or_skip(
             "flash_arm_fault_harness_nofault_matches_production_bit_identical",
+            &cuda,
         ) {
             return;
         }
@@ -6277,7 +6542,10 @@ mod tests {
         let _d2h_guard = FLASH_D2H_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if !flash_compiled_or_skip("flash_arm_encoder_level_oracle_red_control_window_dropped") {
+        if !flash_compiled_or_skip(
+            "flash_arm_encoder_level_oracle_red_control_window_dropped",
+            &cuda,
+        ) {
             return;
         }
 
@@ -6358,7 +6626,7 @@ mod tests {
         let _d2h_guard = FLASH_D2H_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if !flash_compiled_or_skip(label) {
+        if !flash_compiled_or_skip(label, &cuda) {
             return;
         }
 

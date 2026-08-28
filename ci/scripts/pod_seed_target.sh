@@ -691,7 +691,16 @@ pod_seed_target_main() {
     tail -20 "$FAILED_MARKER"
     return 1
   fi
-  rm -f "$FAILED_MARKER"
+  # `--reseed` forces a rebuild regardless of which marker (if either) is
+  # present, so BOTH must be removed before the build subshell starts below
+  # — not just FAILED_MARKER (round-N audit finding B2). COMPLETE_MARKER is
+  # a SIBLING file, never touched by cleanup elsewhere; before this fix a
+  # `--reseed` left a stale COMPLETE_MARKER on disk for the ENTIRE rebuild's
+  # duration, and every downstream consumer that only checks the marker's
+  # EXISTENCE — pod_target_clone.sh:62's own gate, and gpu-dev.sh's
+  # `wait-seed` — read that as "done", proving nothing about the build
+  # actually in progress underneath it.
+  rm -f "$FAILED_MARKER" "$COMPLETE_MARKER"
 
   local log rc
   log="$(mktemp)"

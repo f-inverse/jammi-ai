@@ -264,6 +264,7 @@ ci/scripts/gpu-dev.sh up a100                     # session survives disconnect
 ci/scripts/gpu-dev.sh push a100                   # send uncommitted work
 ci/scripts/gpu-dev.sh run a100 cargo test -p jammi-ai --features cuda,live-gpu-tests
 ci/scripts/gpu-dev.sh logs a100                   # follow it (Ctrl-C is safe)
+ci/scripts/gpu-dev.sh wait-job a100               # BLOCK until it ends (or --timeout expires)
 ci/scripts/gpu-dev.sh attach a100                 # shell in, from any terminal
 ci/scripts/gpu-dev.sh pull a100 target/nextest    # bring artifacts back
 ci/scripts/gpu-dev.sh down a100                   # terminate
@@ -289,14 +290,19 @@ in [dev-gpu-recipes.md](dev-gpu-recipes.md).
 ### Trees — more than one checkout per pod
 
 A pod can host more than one checkout: `--tree <name>` on
-`attach`/`run`/`logs`/`push`/`pull`/`target` selects a plain directory
-(`/root/trees/<name>`; the default `--tree jammi-ai` is the bootstrap checkout
-at `/root/jammi-ai`), never a git worktree — a worktree add fails on the
-checked-out ref, and a shared `.git` couples trees that must be able to
-diverge independently. `gpu-dev.sh target <session> <name>` creates one by
-cloning the pod's own build-substrate seed (above); `--with-cutlass`
-additionally provisions the CUTLASS submodule for a tree that will build the
-`flash-attn` feature. Each tree gets its own job script/log
+`attach`/`run`/`logs`/`push`/`pull`/`wait-job`/`target` selects a plain
+directory (`/root/trees/<name>`; the default `--tree jammi-ai` is the
+bootstrap checkout at `/root/jammi-ai`), never a git worktree — a worktree
+add fails on the checked-out ref, and a shared `.git` couples trees that must
+be able to diverge independently. **A tree is populated ONLY by `push
+--tree <name>`** (rsync); `gpu-dev.sh target <session> <name>` does NOT
+create or populate the tree — it clones the pod's own build-substrate seed
+into a wholly disjoint `CARGO_TARGET_DIR` (`/root/target-<name>`, a build
+OUTPUT directory), for a tree that must already exist. `--with-cutlass`
+additionally provisions the CUTLASS submodule (a `cp -a` copy from
+`/root/jammi-ai`'s own initialised submodule) into that tree, and REFUSES
+against a tree that has never been pushed ("tree source dir does not exist —
+push to it first"). Each tree gets its own job script/log
 (`<tree>/.jammi-job.sh`, `<tree>/.jammi.log`) and its own tmux session
 (`jammi-<tree>`), so two trees' `run` jobs never collide.
 

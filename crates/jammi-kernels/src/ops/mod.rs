@@ -106,6 +106,13 @@ pub(crate) mod flash_attention;
 pub(crate) mod geglu;
 pub(crate) mod layer_norm;
 pub(crate) mod low_rank_residual_linear;
+// Private, mirroring `flash_attention`'s own `StatefulKernelOp` shape (a
+// `Saved<Tensor>` `lse` field — see that module's doc for why a stateful
+// op cannot be `Copy`/`Clone`): CPU-hermetic only this pass (no `cuda_fwd`
+// yet, no dispatch-lattice wiring — see the module's own doc for the
+// explicit scope line). Only the op type, its constructor's public
+// surface, and the free-function entry point are re-exported below.
+mod mem_efficient_attention;
 pub(crate) mod rope;
 pub(crate) mod rope_positions;
 mod saved;
@@ -178,6 +185,10 @@ pub use flash_attention::{
 pub use geglu::{GegluFused, GeluVariant};
 pub use layer_norm::{LayerNormFused, MAX_HIDDEN};
 pub use low_rank_residual_linear::{DropoutKey, LowRankResidualLinear};
+pub use mem_efficient_attention::{
+    mem_efficient_attention, MemEfficientAttention, MAX_SEQ as MEM_EFFICIENT_MAX_SEQ,
+    MIN_CHUNK as MEM_EFFICIENT_MIN_CHUNK, WINDOW_MASKED_VALUE as MEM_EFFICIENT_WINDOW_MASKED_VALUE,
+};
 pub use rope::{RopeFused, MAX_HEAD_DIM};
 pub use rope_positions::{rope_positions_fused_ragged, RopePositionsFused};
 pub use saved::{Saved, SavedError};

@@ -1933,24 +1933,40 @@ pub struct EncodeStepTier {
     /// (never `[seq; batch]` unless every row happens to tie the widest).
     pub row_lengths: Vec<usize>,
     /// The compute precision (`f32`/`f16`/`bf16`,
-    /// [`jammi_numerics::ComputePrecision`]'s `Display`) this run's
-    /// `GpuConfig` resolved before the serve — the SAME determinant
-    /// `ModelIdentity.compute_precision` folds (`compute_precision.rs`'s
-    /// own materialization-identity contract), output-affecting because a
-    /// lower-precision forward is a different computation, not merely a
-    /// faster one.
+    /// [`jammi_numerics::ComputePrecision`]'s `Display`) the LOADED model
+    /// actually resolved to before the serve — read straight off
+    /// [`jammi_ai::model::LoadedModel::compute_precision`] via the tier's
+    /// own session/model cache (the SAME accessor `InferenceSession::infer`
+    /// reads before folding it into `ModelIdentity.compute_precision`,
+    /// `compute_precision.rs`'s own materialization-identity contract),
+    /// never a derived/default constant — this field previously recorded
+    /// `ComputePrecision::default()` regardless of what the tier's own
+    /// `GpuConfig`/per-model `config.json` override actually resolved,
+    /// which is the exact false-determinant shape this struct's own doc
+    /// forbids (unit-62 F-5). Output-affecting because a lower-precision
+    /// forward is a different computation, not merely a faster one.
     pub compute_precision: String,
-    /// sha256 (hex) of the fixture model dir's `config.json` bytes — half
-    /// of the checkpoint's content identity, the SAME `sha256_and_len`
+    /// sha256 (hex) of the fixture model dir's `config.json` bytes — a
+    /// third of the checkpoint's content identity, the SAME `sha256_and_len`
     /// helper [`crate::finetune_step`]/[`crate::grad_oracle`] already use
     /// (never a second, independently-drifting hashing implementation).
     pub checkpoint_config_sha256: String,
     /// sha256 (hex) of the fixture model dir's `model.safetensors` bytes —
-    /// the other half of the checkpoint's content identity.
+    /// another third of the checkpoint's content identity.
     pub checkpoint_weights_sha256: String,
     /// `model.safetensors`' byte length — a cheap, redundant cross-check
     /// alongside the sha256 above.
     pub checkpoint_weights_size_bytes: u64,
+    /// sha256 (hex) of the fixture model dir's `tokenizer.json` bytes — the
+    /// final third of the checkpoint's content identity. Output-affecting:
+    /// this same unit's own E1/E2 legs prove tokenizer bytes move the
+    /// encode surface's served output (a different vocabulary/merge table
+    /// tokenizes the identical text to different token ids), so a
+    /// tokenizer-bytes change with `checkpoint_config_sha256`/
+    /// `checkpoint_weights_sha256` held fixed must never read as "the same
+    /// leg" (unit-62 F-5). The SAME `sha256_and_len` helper the other two
+    /// checkpoint hashes above use.
+    pub checkpoint_tokenizer_sha256: String,
     /// The pooling strategy the fixture's `1_Pooling/config.json`
     /// EXPLICITLY declares (`"mean"`) — see this struct's own doc for why
     /// the fixture never relies on `candle.rs`'s silent mean-pooling
@@ -2033,7 +2049,7 @@ impl EncodeStepTier {
     /// tier's provenance OUT of identity entirely; see
     /// [`Self::PROVENANCE_FIELDS`]). `ci/scripts/perf/identity_fields.py`'s
     /// future `ENCODE_IDENTITY_FIELDS` mirrors this list EXACTLY (unit-62
-    /// E6, docs-ci domain) — the cardinality (12) and every name here is
+    /// E6, docs-ci domain) — the cardinality (13) and every name here is
     /// the pinned contract that mirror parses against.
     ///
     /// `attention_arm` is NOT a member (see this struct's own doc) — a
@@ -2047,6 +2063,7 @@ impl EncodeStepTier {
         ("checkpoint_config_sha256", Nullable::NonNull),
         ("checkpoint_weights_sha256", Nullable::NonNull),
         ("checkpoint_weights_size_bytes", Nullable::NonNull),
+        ("checkpoint_tokenizer_sha256", Nullable::NonNull),
         ("pooling", Nullable::NonNull),
         ("normalize", Nullable::NonNull),
         ("warmup", Nullable::NonNull),

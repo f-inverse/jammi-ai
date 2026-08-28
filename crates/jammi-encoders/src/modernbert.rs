@@ -41,7 +41,8 @@ use jammi_kernels::admission::{
 use jammi_kernels::ops::{
     apply1, apply2, apply3, mem_efficient_attention, AttentionBlockFused, FullyMaskedPolicy,
     MemEfficientAttention, RopeFused, SoftmaxLastDimFused, ATTENTION_BLOCK_HEAD_DIM,
-    ATTENTION_BLOCK_MAX_SEQ, MAX_HEAD_DIM, MAX_LAST_DIM, MAX_RANK, MEM_EFFICIENT_MIN_CHUNK,
+    ATTENTION_BLOCK_MAX_SEQ, MAX_HEAD_DIM, MAX_LAST_DIM, MAX_RANK, MEM_EFFICIENT_MAX_SEQ,
+    MEM_EFFICIENT_MIN_CHUNK,
 };
 use jammi_lora::{effective_rank, should_apply_lora, LoraBuildConfig, LoraLinear, MaybeLoraLinear};
 
@@ -749,6 +750,25 @@ fn mem_efficient_attention_predicate(
         return (
             PredicateOutcome::DomainMiss,
             "seq_within_attention_block_max_seq",
+        );
+    }
+    // The op's own UPPER seq bound (round-6 audit advisory — the F2
+    // class's last member, on the seq axis rather than dtype): `mem_eff_
+    // attention_dims` refuses `seq > MEM_EFFICIENT_MAX_SEQ` (a conservative,
+    // VALIDATED ceiling, [`jammi_kernels::ops::MemEfficientAttention`]'s own
+    // module doc — `131_072`, not a hardware limit). Without this check
+    // the predicate would claim `Holds` for a `seq` the op itself refuses,
+    // reproducing F2's exact shape one axis over: the per-layer cascade
+    // would dispatch `Fused`, `forward_memeff_attention` would call the
+    // op, and the op's own typed refusal would fire only AFTER
+    // `memeff_will_fire`'s once-per-forward suppression had already
+    // deleted the block/eager fallback's mask bundle — an unreachably
+    // long (but not IMPOSSIBLE to construct) `seq` regressing from a
+    // clean decline to a hard error, exactly like F2's dtype gap did.
+    if seq > MEM_EFFICIENT_MAX_SEQ {
+        return (
+            PredicateOutcome::DomainMiss,
+            "seq_within_mem_efficient_max_seq",
         );
     }
     (PredicateOutcome::Holds, "domain_ok")
@@ -8772,6 +8792,34 @@ mod tests {
         assert_eq!(reason, "domain_ok");
     }
 
+    /// The op's own UPPER seq bound (round-6 audit advisory — the F2
+    /// class's last member, seq axis): a `seq` past
+    /// [`jammi_kernels::ops::MemEfficientAttention`]'s own
+    /// `MEM_EFFICIENT_MAX_SEQ` ceiling must `DomainMiss` here too, never
+    /// silently claim `Holds` for a shape the op itself would refuse.
+    #[test]
+    fn mem_efficient_attention_predicate_refuses_past_the_ops_own_max_seq() {
+        let device = Device::Cpu;
+        let (outcome, reason) = mem_efficient_attention_predicate(
+            &device,
+            DType::F32,
+            MEM_EFFICIENT_MAX_SEQ + 1,
+            &declined_flash(),
+        );
+        assert_eq!(outcome, PredicateOutcome::DomainMiss);
+        assert_eq!(reason, "seq_within_mem_efficient_max_seq");
+
+        // Sanity: the ceiling itself is still in-domain (an off-by-one
+        // guard against an overly eager `>=`).
+        let (outcome, reason) = mem_efficient_attention_predicate(
+            &device,
+            DType::F32,
+            MEM_EFFICIENT_MAX_SEQ,
+            &declined_flash(),
+        );
+        assert_eq!(outcome, PredicateOutcome::Holds, "reason={reason}");
+    }
+
     /// F2 fix (adversarial audit round 3): the dtype gate, per-device
     /// honest. `F16` (this op's own domain admits neither on any device —
     /// only `F32`/`BF16`) must `DomainMiss` on BOTH devices this suite can
@@ -8962,7 +9010,17 @@ mod tests {
     /// is built in `dtype` directly (never F32-then-cast), so an F16
     /// fixture exercises F16 matmuls throughout, not merely an F16-shaped
     /// wrapper around F32 compute.
-    fn tiny_full_model_fixture(device: &Device, dtype: DType) -> ModernBert {
+    /// `is_local`: round-6 audit advisory — an earlier revision hardcoded
+    /// `is_local: false, half_window: None, local_half_window: None`, so
+    /// every F5 full-forward test only ever proved the GLOBAL-layer half
+    /// of the suppression seam (`fused_masks`); `local_band`'s own
+    /// suppression (`ModernBert::forward_hidden_inner`'s `if
+    /// memeff_will_fire { None } else { ... sliding_band ... }`) had NO
+    /// full-forward proof at all. `TINY_LOCAL_HALF_WINDOW` (below) is used
+    /// on both the model's own `local_half_window` and the layer's own
+    /// `half_window` when `is_local` — the SAME quantity a real
+    /// `ModernBertConfig::half_window` derivation keeps in lockstep.
+    fn tiny_full_model_fixture(device: &Device, dtype: DType, is_local: bool) -> ModernBert {
         use candle_nn::Linear;
         let (h, d) = (1usize, 8usize);
         let hidden = h * d;
@@ -8988,15 +9046,16 @@ mod tests {
             Linear::new(t, None)
         };
 
+        let half_window = is_local.then_some(TINY_LOCAL_HALF_WINDOW);
         let attention = ModernBertAttention {
             wqkv: MaybeLoraLinear::Frozen(mk_linear(3 * hidden, hidden, 0.0131)),
             wo: MaybeLoraLinear::Frozen(mk_linear(hidden, hidden, 0.0097)),
             attn_norm: None,
             rope: Arc::new(rope(d, max_pos, 10_000.0, device)),
-            is_local: false,
+            is_local,
             num_heads: h,
             head_dim: d,
-            half_window: None,
+            half_window,
             training: true,
         };
         let mlp = ModernBertMlp {
@@ -9015,11 +9074,19 @@ mod tests {
             pooling: Pooling::Mean,
             hidden_size: hidden,
             max_position_embeddings: max_pos,
-            local_half_window: None,
+            local_half_window: half_window,
             band_cache: Mutex::new(HashMap::new()),
             training: true,
         }
     }
+
+    /// The local-layer twin's own window half-width — well above the
+    /// `half_window + 2` visibility floor this file's own CUDA-side
+    /// sibling tests assert (this fixture's `seq` is always
+    /// `ATTENTION_BLOCK_MAX_SEQ + 1` or more, so any real row is visible
+    /// regardless — stated for consistency with that discipline, not
+    /// because it binds here).
+    const TINY_LOCAL_HALF_WINDOW: usize = 64;
 
     /// F5 fix (adversarial audit round 3): the "provably unread by any
     /// layer" suppression claim (`ModernBert::forward_hidden_inner`'s own
@@ -9041,7 +9108,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let device = Device::Cpu;
-        let model = tiny_full_model_fixture(&device, DType::F32);
+        let model = tiny_full_model_fixture(&device, DType::F32, false);
         let seq = ATTENTION_BLOCK_MAX_SEQ + 1;
         let ids: Vec<u32> = (0..seq).map(|i| (i % 32) as u32).collect();
         let input_ids = Tensor::from_vec(ids, (1, seq), &device).unwrap();
@@ -9090,7 +9157,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let device = Device::Cpu;
-        let model = tiny_full_model_fixture(&device, DType::F16);
+        let model = tiny_full_model_fixture(&device, DType::F16, false);
         let seq = ATTENTION_BLOCK_MAX_SEQ + 1;
         let ids: Vec<u32> = (0..seq).map(|i| (i % 32) as u32).collect();
         let input_ids = Tensor::from_vec(ids, (1, seq), &device).unwrap();
@@ -9123,6 +9190,64 @@ mod tests {
             memeff_after.declined - memeff_before.declined >= model.layers.len() as u64,
             "every layer's own per-layer predicate call must ALSO decline (dtype), consistent \
              with the once-per-forward suppression decision"
+        );
+    }
+
+    /// The LOCAL-layer twin of
+    /// `forward_hidden_full_forward_suppresses_the_bundle_and_dispatches_memeff_at_long_seq`
+    /// (round-6 audit advisory): that test's own model is `is_local:
+    /// false` throughout, so it only ever proved the GLOBAL half of the
+    /// suppression seam (`fused_masks`) — `local_band`'s OWN suppression
+    /// (`forward_hidden_inner`'s `if memeff_will_fire { None } else { ...
+    /// self.sliding_band(...) ... }`) had no full-forward proof at all: a
+    /// bug that suppressed `fused_masks` correctly but left `local_band`
+    /// un-suppressed (or vice versa) would have been INVISIBLE to every
+    /// prior F5 test, since a global-only model never builds `local_band`
+    /// regardless of suppression. `tiny_full_model_fixture(.., true)`
+    /// builds a single LOCAL layer (`is_local: true, half_window:
+    /// Some(TINY_LOCAL_HALF_WINDOW)`, `local_half_window` set to match on
+    /// the model) — the SAME dispatch/counter proof as the global test,
+    /// on the fixture that actually exercises the OTHER half of the seam.
+    #[test]
+    fn forward_hidden_full_forward_local_layer_suppresses_the_bundle_and_dispatches_memeff_at_long_seq(
+    ) {
+        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let device = Device::Cpu;
+        let model = tiny_full_model_fixture(&device, DType::F32, true);
+        let seq = ATTENTION_BLOCK_MAX_SEQ + 1;
+        let ids: Vec<u32> = (0..seq).map(|i| (i % 32) as u32).collect();
+        let input_ids = Tensor::from_vec(ids, (1, seq), &device).unwrap();
+        let mask = Tensor::ones((1, seq), DType::U32, &device).unwrap();
+
+        let memeff_before = cascade_counters_for("mem_efficient_attention").snapshot();
+        let block_before = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+        let out =
+            forward_hidden_forcing_flash_decision(&model, &input_ids, &mask, declined_flash())
+                .expect(
+                    "full-forward memeff dispatch on a LOCAL layer at long seq must complete, \
+                     not error",
+                );
+        let memeff_after = cascade_counters_for("mem_efficient_attention").snapshot();
+        let block_after = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+
+        assert_eq!(out.dims(), &[1, seq, model.hidden_size]);
+        let v: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(
+            v.iter().all(|x| x.is_finite()),
+            "every output element must be finite"
+        );
+        assert_eq!(
+            memeff_after.fused - memeff_before.fused,
+            model.layers.len() as u64,
+            "every layer (the local one included) must dispatch memeff exactly once"
+        );
+        assert_eq!(
+            block_after.fused, block_before.fused,
+            "the block arm must NEVER be consulted -- the strongest available proxy that \
+             local_band (not just fused_masks) was genuinely suppressed and never read: the \
+             block arm is the ONLY consumer of local_band on this forward's own dispatch path"
         );
     }
 

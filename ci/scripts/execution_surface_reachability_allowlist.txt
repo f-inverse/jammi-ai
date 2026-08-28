@@ -23,8 +23,10 @@
 # invoked from TWO places, not one: directly by `gpu-prove.yml`
 # (`workflow_dispatch` / `pull_request: types: [labeled]` / nightly
 # `schedule`), and by the reusable `_gpu-prove-gate.yml` (a release gate
-# `uses:`-called from `_pypi-server.yml` — itself called by
-# `pypi-server-cuda.yml` — `server-image.yml`, and `release-binaries.yml`).
+# `uses:`-called from `_pypi-server.yml` — itself called by BOTH
+# `pypi-server.yml` (`with: run_gpu_prove: false` — never triggers this
+# gate) and `pypi-server-cuda.yml` (`with: run_gpu_prove: true`) — and from
+# `server-image.yml` and `release-binaries.yml`).
 # NEITHER chain is merge-path: `gpu-prove.yml`'s own triggers are label/
 # dispatch/schedule-only; the three `_gpu-prove-gate.yml` callers are each
 # scoped to `push: tags: [...]` and/or `workflow_dispatch` (release lanes),
@@ -79,9 +81,11 @@ cargo build --release -p jammi-bench --features cuda > /tmp/pod_build_timings.co
 # --- ci/scripts/perf/clip_artifact_producer.sh — a perf-unification
 # artifact producer (unification contract C5.1; ci.yml's own "producer
 # provenance gates" guard cross-checks this script's BINARY-PROVENANCE
-# invariant, but never EXECUTES its cargo builds/tests). Invoked from NO
-# workflow at all (grep over .github/workflows/*.yml for this script's own
-# filename confirms zero hits) — an operator/perf-lane tool, not a CI leg. ---
+# invariant, but never EXECUTES its cargo builds/tests). NEVER INVOKED by
+# any workflow: grep over .github/workflows/*.yml for this script's own
+# filename finds ONE hit, ci.yml's own guard-matrix module doc comment
+# (a `#`-prefixed line naming it in prose, never a run:/cmd: step body) —
+# an operator/perf-lane tool, not a CI leg. ---
 cargo test -p jammi-ai --features cuda,live-gpu-tests --lib fine_tune::optimizer -- --test-threads=1 2>&1 | tee "$L1"	clip_artifact_producer.sh's optimizer proof leg — operator-run perf artifact producer, invoked from no workflow.
 cargo test -p jammi-bench --features cuda -- finetune_step::tests report::tests --test-threads=1 2>&1 | tee "$L2"	clip_artifact_producer.sh's bench proof leg — same residual as the row above.
 cargo test -p jammi-ai --features cuda,live-gpu-tests --lib -- --exact "$EXACT" 2>&1 | tee "$L3"	clip_artifact_producer.sh's exact-test proof leg — same residual as the row above.
@@ -89,21 +93,30 @@ cargo build $FLASH_BUILD_FLAG -p jammi-bench --features cuda,jammi-encoders/flas
 
 # --- ci/scripts/perf/finetune_ab.sh — an A/B numerics-comparison driver
 # (unification contract C5.1's `run_cmd` provenance-logging wrapper, same
-# shape as stacked_sweep.sh below). Invoked from NO workflow at all (grep
-# over .github/workflows/*.yml for this script's own filename confirms zero
-# hits) — an operator/perf-lane tool, run by hand on a rented pod. ---
+# shape as stacked_sweep.sh below). NEVER INVOKED by any workflow: grep
+# over .github/workflows/*.yml for this script's own filename finds TWO
+# hits, both `#`-prefixed comment lines in ci.yml's guard-matrix module
+# doc (one naming the script in prose, one naming
+# `test_ab_merge.py`/`ab_merge.py` — the SEPARATE, already-wired stdlib
+# suite that tests this script's own EXTRACTED merge/table-stage Python
+# module, never invokes the bash script itself) — an operator/perf-lane
+# tool, run by hand on a rented pod. ---
 cargo build --release -p jammi-bench --features cuda --manifest-path "$REPO_ROOT/Cargo.toml"	finetune_ab.sh's own build-and-check-out-ref leg (`run_cmd cargo build ...`) — operator-run, invoked from no workflow; needs the CUDA toolchain.
 
 # --- ci/scripts/perf/stacked_sweep.sh — a stacked-optimization timing sweep
 # (unification contract C5.1's `run_cmd` provenance-logging wrapper).
-# Invoked from NO workflow at all (grep over .github/workflows/*.yml for
-# this script's own filename confirms zero hits) — an operator/perf-lane
-# tool, run by hand on a rented pod. ---
+# NEVER INVOKED by any workflow: grep over .github/workflows/*.yml for this
+# script's own filename finds TWO hits, both `#`-prefixed comment lines in
+# ci.yml's own "producer provenance gates" step doc (which STATICALLY
+# greps this script's own source for a cross-check invariant, never
+# EXECUTES it) — an operator/perf-lane tool, run by hand on a rented pod. ---
 cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn --manifest-path "$WORKTREE/Cargo.toml"	stacked_sweep.sh's own flash-attn build leg (`run_cmd cargo build ...`) — operator-run, invoked from no workflow; needs the CUDA toolchain + a provisioned CUTLASS submodule.
 
 # --- ci/scripts/perf/fa2_ab.sh — a one-build FA2 A/B timing driver (its own
-# module comment: "a100b (exclusive timing box)"). Invoked from NO workflow
-# at all (grep over .github/workflows/*.yml for this script's own filename
-# confirms zero hits) — an operator/perf-lane tool, run by hand on a rented,
-# exclusively-reserved pod. ---
+# module comment: "a100b (exclusive timing box)"). NEVER INVOKED by any
+# workflow: grep over .github/workflows/*.yml for this script's own
+# filename finds ONE hit, the same `#`-prefixed "producer provenance
+# gates" comment line stacked_sweep.sh's own row above cites (a static
+# grep over source, never an execution) — an operator/perf-lane tool, run
+# by hand on a rented, exclusively-reserved pod. ---
 cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn 2>&1 | tail -n 1	fa2_ab.sh's own one-shot flash-attn build (`;`-chained after the worktree checkout) — operator-run, invoked from no workflow; needs the CUDA toolchain + a provisioned CUTLASS submodule.

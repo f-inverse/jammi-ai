@@ -28,13 +28,19 @@ behind `gpu-prove.yml`'s label/dispatch/schedule-only trigger — green
 ## Rule 1 — reachability
 
 Every REGISTERED execution-surface tuple (see Rule 2) must be reachable on
-the merge path: its own exact `cargo <subcommand> ...` invocation text (see
-`extract_tuples_from_line`) must appear, CHARACTER FOR CHARACTER, inside a
-JOB+STEP of a workflow whose `on:` block genuinely fires on the merge path
-AND whose path filter (if any) is capable of matching the tuple's own
-origin path AND whose job/step is not conditioned off (see the three
-sub-sections below). "Reachable" is a conjunction of three independent
-honesty checks — a tuple satisfying only one or two is still UNREACHABLE:
+the merge path: its own `cargo <subcommand> ...` invocation, in the SAME
+NORMALIZED form `extract_tuples_from_line` produces on both sides (env-var-
+assignment/wrapper-prefix chain and a fail-loud `||`-tail stripped
+identically — NOT literal source-byte equality; see that function's own
+docstring for the honest consequence: a workflow-side twin wrapped in a
+DIFFERENT env prefix than the registered script still credits, because the
+underlying invocation genuinely is the same command once normalized), must
+appear inside a JOB+STEP of a workflow whose `on:` block genuinely fires on
+the merge path AND whose path filter (if any) is capable of matching the
+tuple's own origin path AND whose job/step is not conditioned off (see the
+three sub-sections below). "Reachable" is a conjunction of three
+independent honesty checks — a tuple satisfying only one or two is still
+UNREACHABLE:
 
 ### 1a — trigger honesty
 
@@ -62,7 +68,7 @@ not per-workflow — `docs.yml` carries DIFFERENT `paths:` lists under its
 specific tuple's origin path (its `ci/scripts/**` source file) before that
 trigger credits anything: a workflow whose `on:` block otherwise fires on
 the merge path but whose `paths:` allowlist can never match a change under
-`ci/scripts/**` (nine such workflows exist today: `docs.yml`, `image.yml`,
+`ci/scripts/**` (eight such workflows exist today: `docs.yml`, `image.yml`,
 `image-cuda.yml`, `dep-dag.yml` — whose one `ci/scripts/` entry is the
 single literal file `ci/scripts/gen_dep_dag.py`, never a glob covering the
 whole directory — `devcontainer-image.yml`, `pypi-server.yml`,
@@ -92,12 +98,50 @@ scan even though nothing there can ever fail a merge.
 
 This repo's own `Guard` job matrix indirection (`cmd: <script>` fields
 under `strategy: matrix: include:`, interpolated into a single shared
-`run: ${{ matrix.cmd }}` step) is honored structurally: a step whose body
-IS that literal interpolation expression pulls its candidate text from each
-matrix `include:` leg instead, and a leg's own `continue_on_error: "true"`
-field excludes THAT leg only (this repo's own per-leg soft-fail
-convention, e.g. the "doc numbers have producers" leg) — a sibling leg
-without that field still credits normally.
+`run: ${{ matrix.cmd }}` step) is honored structurally, and CONJOINED with
+the interpolating step's own blocked-state (B1, round-2 audit — the matrix
+`include:` legs are credited ONLY if some step in the SAME job both
+interpolates `${{ matrix.cmd }}` verbatim AND is itself unblocked; a
+step-level `if:`/`continue-on-error: true` on that step, or the total
+ABSENCE of any interpolating step, now correctly excludes every leg — the
+two loops used to run independently, so a leg could be credited even when
+nothing in the job would ever actually execute its `cmd:` text): a step
+whose body IS that literal interpolation expression pulls its candidate
+text from each matrix `include:` leg instead, and a leg's own
+`continue_on_error: "true"` field excludes THAT leg only (this repo's own
+per-leg soft-fail convention, e.g. the "doc numbers have producers" leg) —
+a sibling leg without that field still credits normally.
+
+A WORKFLOW-side ` || <fallback>` tail that SWALLOWS the real exit status
+(`|| true`, `|| :`, `|| exit 0`, `|| return 0` — the canonical "never fail
+this statement" shell idiom, semantically equivalent to
+`continue-on-error: true`) is refused the same way (B1): the invocation
+before that tail is never credited as reachable, even though the SAME text
+is still a legitimate REGISTRY tuple when the identical `|| true` pattern
+shows up in one of THIS class's own operator-run scripts (registry
+discovery does not refuse it — the subject existing is what matters there,
+not whether it swallows its own failure). A fail-LOUD tail (`|| exit 1`,
+`|| rc=$?`) still credits normally on both sides.
+
+Two related conditional-honesty gaps are DISCLOSED, not modeled (both
+would need meaningfully more machinery than a hermetic text-shape gate
+should carry, and neither is exercised by any real workflow in this repo
+today — verified by inspection at the time of writing): (1) `needs:` SKIP
+PROPAGATION — a job B with no `if:`/`continue-on-error:` of its own, whose
+`needs: [A]` names a job A that IS `if:`-blocked, is credited by THIS gate
+as unblocked, even though GitHub's own default `needs:` semantics would
+likely skip B too (a skipped upstream job does not satisfy the implicit
+`success()` check a plain `needs:` carries, unless B declares its own
+`if: always()`/`if: ${{ !cancelled() }}`-shaped override) — this gate does
+not resolve the job-dependency graph at all; (2) a `run: |` block-scalar
+step that internally does `set +e` followed by an unconditional `exit 0`
+(or similar) makes EVERY cargo invocation inside that SAME step soft-
+failing, with no per-line marker (`if:`, `continue-on-error:`, or a
+per-invocation `|| true`) this gate's line-shaped checks could ever see —
+this gate does not parse a `run: |` block's own internal control flow.
+Both are honest residuals, not silent gaps: a future PR that finds either
+shape live in a real workflow needs to widen this section, exactly like
+every other narrow-by-design boundary in this file.
 
 ### exact-tuple match, never substring
 
@@ -344,6 +388,14 @@ _ENV_ASSIGNMENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|\'[^\']*\'|
 # like every other narrow-by-design constant in this file.
 _KNOWN_WRAPPER_PREFIXES = ("run_cmd",)
 
+# A shell `|| <fallback>` tail that SWALLOWS the real exit status (`|| true`,
+# `|| :`, `|| exit 0`, `|| return 0` — canonically "never fail this
+# statement", semantically equivalent to `continue-on-error: true`), as
+# opposed to a fail-LOUD fallback (`|| exit 1`, `|| rc=$?`) that still
+# propagates failure. See `extract_tuples_from_line`'s
+# `refuse_swallowing_fallback` parameter.
+_SWALLOWING_FALLBACK_RE = re.compile(r"^(?:true|:|exit\s+0|return\s+0)\s*(?:#.*)?$")
+
 
 # --------------------------------------------------------------------------- #
 # tuple extraction — shared by registry discovery (ci/scripts/**) and
@@ -352,14 +404,22 @@ _KNOWN_WRAPPER_PREFIXES = ("run_cmd",)
 # compared as identically-normalized strings, never two different
 # normalizations that could silently agree or disagree by accident.
 # --------------------------------------------------------------------------- #
+_INVOCATION_FIRST_TOKEN_PREFIXES = ("-", "$", '"$', "'$")
+
+
 def _looks_like_real_invocation(head: str) -> bool:
     """See the module doc's Rule 2 section: distinguishes a genuine
     `cargo <subcommand> <flags...>` invocation from PROSE that merely
     starts with the same words. Every real invocation in this repo's own
     scripts/workflows has either NOTHING after the subcommand (a bare
-    `cargo build`) or a flag/variable-shaped first token (`-`/`$`-prefixed,
-    the latter for a shell-variable-held flag like
-    `cargo build $FLASH_BUILD_FLAG -p ...`); prose's first token is an
+    `cargo build`) or a flag/variable-shaped first token: `-`-prefixed (a
+    flag), `$`-prefixed (an unquoted shell-variable-held flag, e.g.
+    `cargo build $FLASH_BUILD_FLAG -p ...`), or `"$`/`'$`-prefixed (a
+    QUOTED variable/array expansion, e.g. `check_client_deps.sh`'s own
+    `cargo build "${packages[@]}" ...` — widened here after A1's own
+    "suspicious unregistered line" report first surfaced it as a false
+    near-miss: a genuine invocation this heuristic was mis-judging as
+    prose, not a defect in the drop itself). Prose's first token is an
     ordinary English word. A heuristic, not a parser — disclosed in the
     module doc, not silently assumed airtight.
     """
@@ -370,7 +430,7 @@ def _looks_like_real_invocation(head: str) -> bool:
     if not rest:
         return True
     first_token = rest.split(None, 1)[0]
-    return first_token.startswith("-") or first_token.startswith("$")
+    return first_token.startswith(_INVOCATION_FIRST_TOKEN_PREFIXES)
 
 
 def _strip_env_and_wrapper_prefixes(segment: str) -> str:
@@ -425,12 +485,23 @@ def _split_on_semicolons(line: str) -> list[str]:
     return [s.strip() for s in segments]
 
 
-def _extract_from_segment(segment: str) -> str | None:
+def _extract_from_segment(segment: str, refuse_swallowing_fallback: bool) -> str | None:
     segment = segment.strip()
     if not segment:
         return None
     segment = _strip_env_and_wrapper_prefixes(segment)
-    head = re.split(r"\s\|\|\s", segment, maxsplit=1)[0].strip()
+    parts = re.split(r"\s\|\|\s", segment, maxsplit=1)
+    head = parts[0].strip()
+    if refuse_swallowing_fallback and len(parts) == 2:
+        # B1 (round-2 audit): a WORKFLOW-side `|| true`/`|| :`/`|| exit 0`/
+        # `|| return 0` tail is the canonical shell idiom for "never fail
+        # this step regardless of exit code" — semantically equivalent to
+        # `continue-on-error: true`, which `_step_is_blocked` already
+        # refuses. Registry (`ci/scripts/**`) discovery does NOT pass this
+        # flag: the SUBJECT tuple existing is what matters there, not
+        # whether its own script happens to swallow its own failure.
+        if _SWALLOWING_FALLBACK_RE.match(parts[1].strip()):
+            return None
     if head.endswith("\\"):
         head = head[:-1].rstrip()
     if not _looks_like_real_invocation(head):
@@ -438,7 +509,7 @@ def _extract_from_segment(segment: str) -> str | None:
     return head
 
 
-def extract_tuples_from_line(raw_line: str) -> list[str]:
+def extract_tuples_from_line(raw_line: str, refuse_swallowing_fallback: bool = False) -> list[str]:
     """Every normalized `cargo ...` invocation a (continuation-joined,
     comment-free) logical line contains — zero, one, or more (a `;`-chained
     compound statement can carry more than one). Drops a leading
@@ -447,15 +518,27 @@ def extract_tuples_from_line(raw_line: str) -> list[str]:
     `cargo clippy ...` normalize identically), then quote-aware-splits on
     `;`, then per segment: strips a leading env-assignment/wrapper-prefix
     chain, drops a trailing ` || <shell fallback>` (e.g. `|| exit 1`,
-    `|| rc=$?`) and a trailing line-continuation backslash (belt-and-braces
-    — `_join_line_continuations` already stitches genuine continuations
-    before this function ever sees the line; this only fires on a stray
-    unterminated trailing backslash, e.g. the last physical line of a
-    file), and finally requires `_looks_like_real_invocation`. A `--
-    -D warnings` or `-- --nocapture` `--` marker is legitimate cargo-
-    argument syntax and must survive untouched — only ` || `, a bare
-    trailing backslash, and (quote-aware) `;` are ever treated as
-    boundaries.
+    `|| rc=$?` — UNLESS `refuse_swallowing_fallback` is set and the tail is
+    a status-swallowing shape, see `_extract_from_segment`) and a trailing
+    line-continuation backslash (belt-and-braces — `_join_line_continuations`
+    already stitches genuine continuations before this function ever sees
+    the line; this only fires on a stray unterminated trailing backslash,
+    e.g. the last physical line of a file), and finally requires
+    `_looks_like_real_invocation`. A `-- -D warnings` or `-- --nocapture`
+    `--` marker is legitimate cargo-argument syntax and must survive
+    untouched — only ` || `, a bare trailing backslash, and (quote-aware)
+    `;` are ever treated as boundaries.
+
+    NORMALIZED-FORM matching, not byte-for-byte: this function's output —
+    used identically on both the registry side (`discover_all_tuples`) and
+    the workflow-corpus side (`_extract_tuples_from_text`) — already
+    discards an env-var-assignment/wrapper-prefix chain and a fail-loud
+    `|| ...` tail before comparison. A workflow-side invocation wrapped in a
+    DIFFERENT env prefix than the registered script (e.g. a hypothetical
+    `CI=1 cargo clippy ...` twin of a registered `cargo clippy ...` tuple)
+    would therefore still credit — intentional (the underlying invocation
+    IS the same), but a real consequence of comparing NORMALIZED strings,
+    not literal source bytes; see the module doc's Rule 1 section.
     """
     stripped = raw_line.strip()
     if not stripped or stripped.startswith("#"):
@@ -467,7 +550,7 @@ def extract_tuples_from_line(raw_line: str) -> list[str]:
         return []
     found: list[str] = []
     for segment in _split_on_semicolons(stripped):
-        t = _extract_from_segment(segment)
+        t = _extract_from_segment(segment, refuse_swallowing_fallback)
         if t is not None:
             found.append(t)
     return found
@@ -523,13 +606,17 @@ def _join_line_continuations(text: str) -> list[tuple[int, str]]:
 
 
 def _extract_tuples_from_text(text: str) -> set[str]:
-    """The reachable-corpus extraction pipeline: blank comments, join
-    continuations, extract per logical line. Origins are not tracked here
-    (only a set of tuple texts) — callers that need origins use
-    `discover_all_tuples`'s own line-numbered walk instead."""
+    """The reachable-corpus (WORKFLOW-side) extraction pipeline: blank
+    comments, join continuations, extract per logical line —
+    `refuse_swallowing_fallback=True` (B1, round-2 audit): a workflow line
+    swallowing its own exit status (`|| true`/`|| :`/`|| exit 0`/
+    `|| return 0`) must never be credited as if it genuinely gates a merge.
+    Origins are not tracked here (only a set of tuple texts) — callers that
+    need origins use `discover_all_tuples`'s own line-numbered walk
+    instead."""
     found: set[str] = set()
     for _lineno, logical_line in _join_line_continuations(_drop_comment_lines(text)):
-        found.update(extract_tuples_from_line(logical_line))
+        found.update(extract_tuples_from_line(logical_line, refuse_swallowing_fallback=True))
     return found
 
 
@@ -586,6 +673,57 @@ def gated_tuples(registry: dict[str, TupleRecord]) -> dict[str, TupleRecord]:
     return {t: rec for t, rec in registry.items() if is_gated(t)}
 
 
+def _is_near_miss(head: str) -> bool:
+    """A line whose subcommand boundary matches `cargo <subcommand>` as a
+    standalone token (the same boundary `_looks_like_real_invocation`
+    itself checks) but whose first following token is neither absent nor
+    flag/variable-shaped — the exact PROSE shape Rule 2's own discovery
+    intentionally drops. A bare `cargo build` (nothing following) is NOT a
+    near-miss — `_looks_like_real_invocation` accepts that shape outright.
+    """
+    m = _CARGO_HEAD_RE.match(head)
+    if not m:
+        return False
+    rest = head[m.end() :].strip()
+    if not rest:
+        return False
+    first_token = rest.split(None, 1)[0]
+    return not first_token.startswith(_INVOCATION_FIRST_TOKEN_PREFIXES)
+
+
+def discover_suspicious_lines(repo_root: Path) -> list[str]:
+    """A1 (round-2 audit advisory): every line under `ci/scripts/**` that
+    is cargo-subcommand-shaped but gets DROPPED by
+    `_looks_like_real_invocation`'s prose discriminator — reported (never
+    a FAILURE; this is intentional-drop pinning, not a defect) so a human
+    reviewing this gate's own output can sanity-check that what got
+    dropped really is prose (a docstring sentence like "cargo build and a
+    real torch install...") and not a real invocation this heuristic
+    mis-judged. Walks the SAME tracked-file set `discover_all_tuples` does
+    (excluding this gate's own two files, same reason)."""
+    found: list[str] = []
+    for rel in _tracked_files(repo_root):
+        if not rel.startswith(SCRIPTS_ROOT) or rel in _DISCOVERY_EXCLUDED_RELPATHS:
+            continue
+        path = repo_root / rel
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for lineno, logical_line in _join_line_continuations(_drop_comment_lines(text)):
+            stripped = logical_line.strip()
+            if not stripped:
+                continue
+            for segment in _split_on_semicolons(stripped):
+                segment = _strip_env_and_wrapper_prefixes(segment.strip())
+                head = re.split(r"\s\|\|\s", segment, maxsplit=1)[0].strip()
+                if head.endswith("\\"):
+                    head = head[:-1].rstrip()
+                if _is_near_miss(head):
+                    found.append(f"{rel}:{lineno}: {head!r}")
+    return found
+
+
 # --------------------------------------------------------------------------- #
 # generic indentation-based block reader — shared by `on:`-block parsing,
 # `jobs:`-block parsing, and step/matrix-leg list-item parsing. Not a
@@ -594,14 +732,36 @@ def gated_tuples(registry: dict[str, TupleRecord]) -> dict[str, TupleRecord]:
 # use (plain block-style mappings and `- ` block lists; no flow-style
 # `{a: b}`/`[a, b]` mapping/list syntax for `on:`/`jobs:`/`steps:`
 # themselves — inline `[a, b]` IS supported for leaf list VALUES like
-# `branches: [main]`, which this repo uses throughout).
+# `branches: [main]`, which this repo uses throughout). A workflow using
+# the flow-style short forms for `on:` ITSELF (bare `on: push`, or
+# `on: [push, pull_request]` — an array of event names carrying no
+# `branches:`/`paths:` config of their own, both valid GitHub Actions
+# syntax; none of this repo's workflows use either today) would be
+# silently dropped from `scan_workflows`'s results the same way an
+# unquoted-only `on:` key spelling used to drop a `"on":`-quoted workflow
+# (B5, round-2 audit — see `_extract_top_level_key_block`'s own docstring
+# for the fix that closed the quoting half of this gap and the residual
+# consequence it names: fail-closed for Rule 1 itself, fail-OPEN for the
+# dead-waiver mirror check, since a stale waiver for a tuple reachable only
+# through a silently-dropped workflow would never be flagged dead). Needs a
+# follow-up PR to widen if this repo ever adopts either short form.
 # --------------------------------------------------------------------------- #
 def _extract_top_level_key_block(text: str, key: str) -> str:
     """The raw body text following a top-level (column-0) `<key>:` line, up
-    to (not including) the next column-0, non-comment, non-blank line."""
+    to (not including) the next column-0, non-comment, non-blank line.
+    Accepts the key spelled bare (`on:`) OR quoted (`"on":`/`'on':`) —
+    YAML 1.1 treats an unquoted `on`/`off`/`yes`/`no` as a boolean, so some
+    workflow authors quote the `on:` trigger key specifically to avoid that
+    ambiguity; GitHub Actions accepts either spelling identically (B5,
+    round-2 audit — an unquoted-only pattern silently dropped a `"on":`
+    workflow from `scan_workflows` entirely: fail-closed for Rule 1 itself
+    (an actually-reachable tuple would read as unreachable, the safe
+    direction), but fail-OPEN for the dead-waiver mirror check, since a
+    stale allowlist row waiving a tuple that IS reachable only through that
+    dropped workflow would never be flagged dead)."""
     lines = text.splitlines()
     start = None
-    pattern = re.compile(rf"^{re.escape(key)}:\s*(#.*)?$")
+    pattern = re.compile(rf"""^(?:"{re.escape(key)}"|'{re.escape(key)}'|{re.escape(key)}):\s*(#.*)?$""")
     for i, line in enumerate(lines):
         if pattern.match(line):
             start = i
@@ -858,12 +1018,36 @@ def is_merge_path(on_dict: dict[str, dict[str, list[str] | None]]) -> tuple[bool
     return False, "no push-to-main and no non-label-only pull_request-to-main trigger"
 
 
+class UnsupportedPathPatternError(Exception):
+    """Raised by `_glob_to_regex` on a `paths:`/`paths-ignore:` pattern this
+    gate does not evaluate: a leading `!` or a `{a,b}` brace-expansion
+    group. Refused rather than silently computed past — guessing wrong
+    here could fail OPEN (credit a lane GitHub's own order-evaluated
+    negation would actually exclude for a specific origin)."""
+
+
 def _glob_to_regex(pattern: str) -> re.Pattern[str]:
     """Translate a GitHub Actions path glob (`**`, `**/`, `*`, `?`, literal
-    segments) into a regex. Not a general glob engine — matches this
-    repo's own observed pattern shapes (no `{a,b}` brace expansion, no
-    `!`-negation — GitHub Actions itself does not support either in a
-    `paths:` list entry)."""
+    segments) into a regex. Not a general glob engine, and NOT a full
+    implementation of GitHub's own path-filter language: GitHub Actions DOES
+    support a leading `!` as an ORDER-EVALUATED negation within a
+    `paths:`/`paths-ignore:` list (a later `!pattern` excludes paths a
+    PRIOR positive pattern matched — GitHub's own filter-pattern cheat
+    sheet documents this) and `{a,b}` brace-expansion groups; NEITHER is
+    implemented here. Raises `UnsupportedPathPatternError` on either rather
+    than silently mis-translating: a `!`-prefixed pattern naively passed
+    through this function's literal-character branch would become a
+    NEVER-MATCHING regex, discarding the negation entirely — if that
+    pattern was meant to NARROW an otherwise-broad `paths:` allowlist, the
+    silent result is an OVER-broad admit (this gate crediting a lane that
+    GitHub's own real semantics would have excluded for a specific origin)
+    — the exact fail-open direction this gate exists to prevent."""
+    if pattern.startswith("!") or "{" in pattern:
+        raise UnsupportedPathPatternError(
+            f"paths:/paths-ignore: pattern {pattern!r} uses syntax this gate does not evaluate "
+            "(a leading `!` order-evaluated negation, or a `{...}` brace-expansion group) — refused, "
+            "never silently computed past"
+        )
     out = ["^"]
     i, n = 0, len(pattern)
     while i < n:
@@ -944,6 +1128,14 @@ def _job_tuples(job_body: str) -> set[str]:
     if _job_is_blocked(entries):
         return set()
     found: set[str] = set()
+    # B1 (round-2 audit): the matrix `include:` legs below are only a real
+    # execution surface if SOME step in THIS job both interpolates
+    # `${{ matrix.cmd }}` AND survives `_step_is_blocked` itself — a step-
+    # level `if:`/`continue-on-error: true` on the interpolating step (or
+    # its total ABSENCE — no step interpolates the matrix at all) means the
+    # legs below never actually run, so they must not be credited. This
+    # flag conjoins the two previously-independent loops.
+    has_unblocked_matrix_cmd_step = False
 
     for item_text in _split_step_items(_list_key_body(entries, "steps")):
         step_entries = _split_block_entries(item_text)
@@ -954,19 +1146,21 @@ def _job_tuples(job_body: str) -> set[str]:
             if body_text is None:
                 continue
             if _MATRIX_CMD_INTERP_RE.match(body_text.strip()):
+                has_unblocked_matrix_cmd_step = True
                 continue  # handled via the matrix include: legs below
             found |= _extract_tuples_from_text(body_text)
 
-    strategy_entries = _sub_entries(entries, "strategy")
-    matrix_entries = _sub_entries(strategy_entries, "matrix")
-    for item_text in _split_step_items(_list_key_body(matrix_entries, "include")):
-        leg_entries = _split_block_entries(item_text)
-        leg_coe = _entry_first_line_value(leg_entries, "continue_on_error")
-        if leg_coe is not None and leg_coe.strip("\"'") == "true":
-            continue
-        cmd_body = _step_body_text(leg_entries, "cmd")
-        if cmd_body is not None:
-            found |= _extract_tuples_from_text(cmd_body)
+    if has_unblocked_matrix_cmd_step:
+        strategy_entries = _sub_entries(entries, "strategy")
+        matrix_entries = _sub_entries(strategy_entries, "matrix")
+        for item_text in _split_step_items(_list_key_body(matrix_entries, "include")):
+            leg_entries = _split_block_entries(item_text)
+            leg_coe = _entry_first_line_value(leg_entries, "continue_on_error")
+            if leg_coe is not None and leg_coe.strip("\"'") == "true":
+                continue
+            cmd_body = _step_body_text(leg_entries, "cmd")
+            if cmd_body is not None:
+                found |= _extract_tuples_from_text(cmd_body)
 
     return found
 
@@ -1082,13 +1276,41 @@ def run_gate(repo_root: Path, allowlist_path: Path) -> tuple[list[str], list[str
     failures.extend(allow_parse_failures)
 
     allowlisted_texts = {row.tuple_text for row in allow_rows}
-    reachable_gated = {t for t in gated if is_tuple_reachable(t, gated[t].origins, scans)}
+
+    # B2 (round-2 audit): an unsupported paths:/paths-ignore: pattern
+    # (leading `!`, or `{a,b}`) is refused, never silently guessed —
+    # per-tuple, so ONE bad pattern in one lane does not abort evaluation
+    # of every other tuple against every other lane. A REFUSED tuple is
+    # never added to `reachable_gated` (fail-closed: it falls through to
+    # Rule 1's normal "needs an allowlist row" path) AND surfaces its own
+    # named finding, so a human sees exactly which pattern needs a human
+    # decision (implement order-evaluated negation, or hand-restructure the
+    # workflow's paths: list to avoid it).
+    reachable_gated: set[str] = set()
+    unsupported_pattern_findings: set[str] = set()
+    for t, rec in gated.items():
+        try:
+            if is_tuple_reachable(t, rec.origins, scans):
+                reachable_gated.add(t)
+        except UnsupportedPathPatternError as exc:
+            unsupported_pattern_findings.add(str(exc))
+    failures.extend(sorted(unsupported_pattern_findings))
 
     info.append(
         f"{len(registry)} cargo invocation(s) discovered under {SCRIPTS_ROOT} "
         f"({len(gated)} gated on {sorted(GATED_FEATURE_TOKENS)}); "
         f"{len(scans)} merge-path workflow(s): {', '.join(s.name for s in scans) or '(none)'}"
     )
+
+    # A1 (round-2 audit advisory): report (never fail on) every
+    # cargo-subcommand-shaped line the prose discriminator dropped, so a
+    # human can spot-check the intentional drop rather than trust it blind.
+    suspicious = discover_suspicious_lines(repo_root)
+    if suspicious:
+        info.append(
+            f"{len(suspicious)} suspicious unregistered line(s) (cargo-subcommand-shaped but dropped "
+            f"as prose — review): " + "; ".join(suspicious)
+        )
 
     # Rule 3 — waiver rot: every allowlist row's tuple must still be a
     # member of the CURRENT (re-discovered this run) full registry.
@@ -1124,10 +1346,16 @@ def run_gate(repo_root: Path, allowlist_path: Path) -> tuple[list[str], list[str
         failures.append(
             "UNREACHABLE gated tuple, no allowlist row: "
             f"{text!r} (origin(s): {', '.join(rec.origins)}) — this cargo invocation needs a real "
-            "CUDA/CUTLASS toolchain and is not invoked, byte-for-byte, by any eligible job/step of a "
-            "workflow whose `on:` trigger and path filter fire on the merge path for this origin. "
-            "Either wire an exact-matching invocation into a merge-path workflow, or add a reasoned "
-            f"row to {allowlist_path.name}."
+            "CUDA/CUTLASS toolchain and no eligible job/step of a workflow whose `on:` trigger and "
+            "path filter fire on the merge path for this origin carries the SAME invocation in its own "
+            "normalized form (see extract_tuples_from_line's own docstring for what 'normalized' "
+            "discards). Do NOT fix this by hand-copying this exact text into a workflow step — a "
+            "second, independently-maintained literal copy is the esc-051 twin-drift shape this gate "
+            "exists to catch. The two honest routes (see this gate's own module doc, 'Honest "
+            "residual'): invoke the SAME script this tuple already lives in from an eligible merge-"
+            "path job/step, promote the CUDA/CUTLASS toolchain lane that already runs it to a required "
+            "merge-path check (GPU_PROVE_PROMOTED_TO_REQUIRED), or add a reasoned row to "
+            f"{allowlist_path.name}."
         )
 
     return failures, info
@@ -1407,6 +1635,156 @@ PROSE_SCRIPT = """#!/usr/bin/env bash
 # a bash comment naming an unrelated thing
 X_EXPECTED='cargo clippy -p demo --all-targets --features cuda -- -D warnings'
 echo "you need a real cargo build and a real torch install to run this"
+cargo build and a real torch install are both required to run this suite
+"""
+
+# --- B1 (round-2 audit): matrix cmd: legs must be gated by the SAME
+# blocked-state as the step that actually interpolates ${{ matrix.cmd }} —
+# never independently of it. -------------------------------------------
+MATRIX_CMD_STEP_IF_WORKFLOW = """name: fixture-matrix-cmd-step-if
+on:
+  pull_request:
+    branches: [main]
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: the-real-one
+            cmd: cargo clippy -p demo --all-targets --features cuda -- -D warnings
+    steps:
+      - if: github.event_name == 'schedule'
+        run: ${{ matrix.cmd }}
+"""
+
+MATRIX_CMD_NO_INTERPOLATING_STEP_WORKFLOW = """name: fixture-matrix-cmd-no-step
+on:
+  pull_request:
+    branches: [main]
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: the-real-one
+            cmd: cargo clippy -p demo --all-targets --features cuda -- -D warnings
+    steps:
+      - run: echo "no step here ever runs matrix.cmd"
+"""
+
+MATRIX_CMD_STEP_CONTINUE_ON_ERROR_WORKFLOW = """name: fixture-matrix-cmd-step-coe
+on:
+  pull_request:
+    branches: [main]
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: the-real-one
+            cmd: cargo clippy -p demo --all-targets --features cuda -- -D warnings
+    steps:
+      - continue-on-error: true
+        run: ${{ matrix.cmd }}
+"""
+
+# --- B1: a WORKFLOW-side `|| true`-style tail swallows the real exit
+# status and must not credit -- the registry side (a script carrying the
+# identical `|| true`) is unaffected. --------------------------------
+SWALLOWING_FALLBACK_WORKFLOW = """name: fixture-swallow
+on:
+  pull_request:
+    branches: [main]
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo clippy -p demo --all-targets --features cuda -- -D warnings || true
+"""
+
+SWALLOWING_FALLBACK_SCRIPT = """#!/usr/bin/env bash
+cargo clippy -p demo --all-targets --features cuda -- -D warnings || true
+"""
+
+# --- B2: an unsupported paths:/paths-ignore: pattern (leading `!`, or
+# `{a,b}`) must be REFUSED, never silently computed past. ----------------
+UNSUPPORTED_NEGATION_PATH_WORKFLOW = """name: fixture-bang-path
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "!ci/scripts/**"
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo clippy -p demo --all-targets --features cuda -- -D warnings
+"""
+
+UNSUPPORTED_BRACE_PATH_WORKFLOW = """name: fixture-brace-path
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "ci/scripts/{a,b}/**"
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo clippy -p demo --all-targets --features cuda -- -D warnings
+"""
+
+# --- B5: a quoted `"on":` key must parse identically to a bare `on:`. ---
+QUOTED_ON_KEY_WORKFLOW = """name: fixture-quoted-on
+"on":
+  pull_request:
+    branches: [main]
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo clippy -p demo --all-targets --features cuda -- -D warnings
+"""
+
+# --- A2: paths-ignore/tags-ignore RED mutants (both arms of each) -------
+PATHS_IGNORE_EXCLUDES_WORKFLOW = """name: fixture-paths-ignore-excludes
+on:
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "ci/scripts/**"
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo clippy -p demo --all-targets --features cuda -- -D warnings
+"""
+
+PATHS_IGNORE_ADMITS_WORKFLOW = """name: fixture-paths-ignore-admits
+on:
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo clippy -p demo --all-targets --features cuda -- -D warnings
+"""
+
+TAGS_IGNORE_ALONE_WORKFLOW = """name: fixture-tags-ignore-alone
+on:
+  push:
+    tags-ignore: ["v*"]
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo clippy -p demo --all-targets --features cuda -- -D warnings
 """
 
 
@@ -1493,6 +1871,37 @@ def self_test() -> int:  # noqa: C901 - a flat sequence of independent RED-mutan
     # --- Rule 1c: a matrix leg's own continue_on_error: "true" excludes
     # JUST that leg (never credited even though the matrix job itself runs) -
     check("matrix leg continue_on_error excludes that leg", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-mcs.yml": MATRIX_CMD_SOFT_FAIL_WORKFLOW}, None, "UNREACHABLE gated tuple")
+
+    # --- B1 (round-2 audit, headline finding): matrix legs must be gated by
+    # the SAME blocked-state as the interpolating step, never independently
+    # of it -- three RED mutants proving the conjoined check. ---------------
+    check("matrix legs excluded when the interpolating step has if:", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-mcsi.yml": MATRIX_CMD_STEP_IF_WORKFLOW}, None, "UNREACHABLE gated tuple")
+    check("matrix legs excluded when NO step interpolates matrix.cmd at all", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-mcns.yml": MATRIX_CMD_NO_INTERPOLATING_STEP_WORKFLOW}, None, "UNREACHABLE gated tuple")
+    check("matrix legs excluded when the interpolating step has continue-on-error: true", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-mcsc.yml": MATRIX_CMD_STEP_CONTINUE_ON_ERROR_WORKFLOW}, None, "UNREACHABLE gated tuple")
+
+    # --- B1: a workflow-side `|| true`-style tail swallows the real exit
+    # status and must not credit; the registry side is unaffected. ---------
+    check("workflow-side `|| true` swallow does not credit", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-swallow.yml": SWALLOWING_FALLBACK_WORKFLOW}, None, "UNREACHABLE gated tuple")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        _write_repo(tmp, {"ci/scripts/swallow.sh": SWALLOWING_FALLBACK_SCRIPT})
+        gated = gated_tuples(discover_all_tuples(tmp))
+        if GATED_TUPLE_TEXT not in gated:
+            failures.append(f"self-test FAILED: a `|| true`-tailed REGISTRY-side tuple was not discovered/gated (the swallow refusal must be workflow-side only): {sorted(gated)}")
+
+    # --- B2: an unsupported paths:/paths-ignore: pattern (leading `!`, or
+    # `{a,b}`) is REFUSED with a named finding, never silently computed
+    # past -- the affected tuple stays UNREACHABLE either way. --------------
+    check("`!`-negation path pattern is refused, not silently computed", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-bang.yml": UNSUPPORTED_NEGATION_PATH_WORKFLOW}, None, "uses syntax this gate does not evaluate")
+    check("`{a,b}`-brace path pattern is refused, not silently computed", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-brace.yml": UNSUPPORTED_BRACE_PATH_WORKFLOW}, None, "uses syntax this gate does not evaluate")
+
+    # --- B5: a quoted `"on":` key parses identically to a bare `on:`. ------
+    check("quoted \"on\": key parses like bare on:", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-quoted-on.yml": QUOTED_ON_KEY_WORKFLOW}, None, None)
+
+    # --- A2: paths-ignore/tags-ignore RED mutants (both arms of each). ------
+    check("paths-ignore excluding ci/scripts refuses credit", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-pie.yml": PATHS_IGNORE_EXCLUDES_WORKFLOW}, None, "UNREACHABLE gated tuple")
+    check("paths-ignore NOT excluding ci/scripts admits it", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-pia.yml": PATHS_IGNORE_ADMITS_WORKFLOW}, None, None)
+    check("tags-ignore alone (no branches key) is not merge-path", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-tia.yml": TAGS_IGNORE_ALONE_WORKFLOW}, None, "UNREACHABLE gated tuple")
 
     # --- Rule 1: comment-only mention does not count ------------------------
     check("comment-only mention", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-co.yml": MERGE_PATH_WORKFLOW_COMMENT_ONLY}, None, "UNREACHABLE gated tuple")
@@ -1610,6 +2019,12 @@ def self_test() -> int:  # noqa: C901 - a flat sequence of independent RED-mutan
             failures.append(f"self-test FAILED: a quoted bash-variable assignment ('cargo clippy ...') was registered as a real tuple: {sorted(registry)}")
         if any(t.startswith("cargo build and") or t.startswith("cargo build a real") for t in registry):
             failures.append(f"self-test FAILED: a prose sentence starting with 'cargo build' was registered as a real tuple: {sorted(registry)}")
+        # A1 (round-2 audit advisory): the SAME dropped prose line must be
+        # visible via discover_suspicious_lines — pinning the intentional
+        # drop, not just its absence from the real registry.
+        suspicious = discover_suspicious_lines(tmp)
+        if not any("cargo build and a real torch install" in s for s in suspicious):
+            failures.append(f"self-test FAILED: discover_suspicious_lines did not report the dropped bare-line prose sentence: {suspicious}")
 
     # --- on: block parsing: workflow_dispatch/schedule alone is never
     # merge-path; a workflow_call-only `on:` block is never merge-path ------
@@ -1641,13 +2056,19 @@ def self_test() -> int:  # noqa: C901 - a flat sequence of independent RED-mutan
         "execution-surface-reachability self-test: OK — every rule bites: registry recursion + "
         "doc-comment exclusion + non-gated exclusion (Rule 2), pull_request/push-to-main reachable, "
         "unreachable/unallowlisted, label-only workflow, tag-only push, branches-ignore (both "
-        "directions), paths-filter capability (both directions), job-level if:/continue-on-error:, "
-        "step-level if:, step-level continue-on-error:, matrix cmd: indirection (both a credited leg "
-        "and a soft-failed leg), comment-only mention, exact-match-never-substring, allowlisted-and-"
-        "live PASS, rotted allowlist row, dead-waiver row, empty-reason row, malformed row (Rule 3), "
-        "env-prefixed/wrapper-prefixed/semicolon-chained/continuation-spanning discovery, multi-"
-        "--features/-F/namespaced-flash-attn gating, prose exclusion, workflow_call-only exclusion, "
-        "and a paths: list surviving a nested comment line."
+        "directions), paths-filter capability (both directions, incl. paths-ignore admit/exclude and "
+        "tags-ignore-alone), job-level if:/continue-on-error:, step-level if:, step-level "
+        "continue-on-error:, matrix cmd: indirection conjoined with its own interpolating step's "
+        "blocked-state (a credited leg, a soft-failed leg, step-if, no-interpolating-step, and "
+        "step-continue-on-error — round-2 audit B1), a workflow-side `|| true`-style swallow refused "
+        "while the identical registry-side line still gates (B1), an unsupported `!`/`{...}` paths "
+        "pattern refused with a named finding (B2), a quoted `\"on\":` key parsing like bare `on:` "
+        "(B5), comment-only mention, exact-match-never-substring, allowlisted-and-live PASS, rotted "
+        "allowlist row, dead-waiver row, empty-reason row, malformed row (Rule 3), env-prefixed/"
+        "wrapper-prefixed/semicolon-chained/continuation-spanning discovery, multi-feature/-F/"
+        "namespaced-flash-attn gating, prose exclusion (both a comment/assignment-wrapped and a bare "
+        "cargo-subcommand-shaped sentence, the latter also pinned via discover_suspicious_lines — A1), "
+        "workflow_call-only exclusion, and a paths: list surviving a nested comment line."
     )
     return 0
 

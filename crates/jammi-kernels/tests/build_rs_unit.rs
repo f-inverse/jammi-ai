@@ -17,6 +17,26 @@
 //! called here — only the pure helpers they call, so this suite never
 //! touches `cargo:rustc-env`/`cargo:rerun-if-changed` output or spawns a
 //! subprocess.
+//!
+//! Whole-file `#![cfg(not(feature = "cuda"))]` (pod-smoke fix, M3-defect
+//! class): `build.rs::build_cuda` is itself `#[cfg(feature = "cuda")]`-gated
+//! and does `use bindgen_cuda::Builder` internally — under the DEFAULT
+//! feature set that whole function (import included) is stripped before
+//! this file's `#[path]` include ever re-parses it, which is the only
+//! reason this suite has ever compiled clean. `bindgen_cuda` is a
+//! `[build-dependencies]` crate: invisible to a `[[test]]` target's own
+//! crate graph regardless of features. Building THIS test target with
+//! `--features cuda` turns `cfg(feature = "cuda")` on for the include too,
+//! so `build_cuda` (and its now-unresolvable `use bindgen_cuda::Builder`,
+//! E0432) gets pulled into a compilation unit that was never meant to see
+//! it — the real build script (a SEPARATE compilation Cargo drives with
+//! `[build-dependencies]` on its own crate graph) is where `build_cuda`
+//! actually needs to exist and compile; this hermetic pin file is not that
+//! compilation unit and has no business re-parsing a cuda-only fn at all.
+//! Skipping the whole file under `--features cuda` keeps the pins exactly
+//! where they run and matter (the default, hermetic lane) and leaves
+//! nothing here for a cuda-feature test compile to trip over.
+#![cfg(not(feature = "cuda"))]
 
 #[path = "../build.rs"]
 mod build_script;

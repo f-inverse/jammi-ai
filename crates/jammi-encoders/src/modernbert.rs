@@ -4435,12 +4435,14 @@ mod tests {
     }
 
     /// Bound for [`flash_arm_padded_matches_block_arm_on_real_rows_cuda`]
-    /// -- DERIVATION PENDING the regime-correct harvest (M1b delta re-audit
-    /// findings F3/F4; not silently left as before).
+    /// -- FINAL, derived from a real 8-seed pod harvest of THIS oracle's
+    /// exact (window-binding, seed-swept) form (M1b delta re-audit
+    /// findings F3/F4, both now CLOSED; history kept below for why the
+    /// oracle itself looks the way it does).
     ///
-    /// F4 (fixture was window-NON-binding): the `0.229503` this constant's
-    /// PRIOR value (`0.34`, still kept as today's CANDIDATE below) was
-    /// derived from was measured by
+    /// F4 (fixture was window-NON-binding, RESOLVED): the `0.229503` this
+    /// constant's PRIOR value (`0.34`) was originally derived from was
+    /// measured by
     /// `crates/jammi-kernels/artifacts/cuda-runs/2026-08-28-m1b-b3-padded-oracles-c2365c9-a100-pcie.json`
     /// (A100 80GB PCIe, driver 570.211.01, at `c2365c9`) on a fixture whose
     /// longest segment (`seq=64`) sat BELOW the window-binding threshold
@@ -4449,14 +4451,14 @@ mod tests {
     /// `max|q-k| = 63 <= half_window = 64`, so the sliding-window band was
     /// ALL-ZEROS and every LOCAL layer degenerated to full (unwindowed)
     /// attention; that measurement never exercised the real windowed
-    /// kernel path this oracle exists to parity-check. The oracle itself
-    /// is now restructured (below) to a window-BINDING fixture (`seq=160`,
-    /// at least one segment `>= 66`), with the SAME checked-premise assert
-    /// the RED controls already carry.
+    /// kernel path this oracle exists to parity-check. FIXED: the oracle
+    /// (below) now runs a window-BINDING fixture (`seq=160`, at least one
+    /// segment `>= 66`), with the SAME checked-premise assert the RED
+    /// controls already carry.
     ///
-    /// F3 (metric mismatch, the borrowed factor is WITHDRAWN): the prior
-    /// doc revision claimed this constant was derived by "the SAME metric"
-    /// as [`FLASH_ORACLE_K_MEAN_POOLED`] -- FALSE.
+    /// F3 (metric mismatch, RESOLVED): a prior doc revision claimed this
+    /// constant was derived by "the SAME metric" as
+    /// [`FLASH_ORACLE_K_MEAN_POOLED`] -- FALSE.
     /// [`FLASH_ORACLE_K_MEAN_POOLED`] bounds a RATIO,
     /// `err(other,f32) / err(block,f32)` -- its OWN noise-free value is
     /// `1.0` (both arms bit-identical to the f32 reference). THIS constant
@@ -4467,41 +4469,52 @@ mod tests {
     /// meaning applied to a metric whose floor is `0.0` -- these are two
     /// DIFFERENT quantities that happen to both be called "a ratio bound"
     /// in prose, not "the same thing at a different scale" (`CLAUDE.md`'s
-    /// own test for when one definition should serve two call sites). The
-    /// prior "`~1.5`x margin, same as `FLASH_ORACLE_K_MEAN_POOLED`'s own
-    /// `1.6`" justification is withdrawn along with it. The oracle is also
-    /// restructured (below) to sweep [`FLASH_ORACLE_SWEEP_SEEDS`] (8 fixed
-    /// seeds -- "a single seed's draw is not a distribution", the SAME
-    /// discipline every dense-arm sweep already uses; the prior single-seed
-    /// (`77`) measurement is retired, not reused), printing every per-seed
-    /// ratio under `--nocapture` and asserting the MEAN (matching
+    /// own test for when one definition should serve two call sites).
+    /// FIXED: that borrowed factor is retired; the oracle (below) now
+    /// sweeps [`FLASH_ORACLE_SWEEP_SEEDS`] (8 fixed seeds -- "a single
+    /// seed's draw is not a distribution", the SAME discipline every
+    /// dense-arm sweep already uses; the prior single-seed (`77`)
+    /// measurement is retired, not reused), printing every per-seed ratio
+    /// under `--nocapture` and asserting the MEAN (matching
     /// [`FLASH_ORACLE_K_MEAN_POOLED`]'s own "mean, never per-seed max"
     /// convention -- see that constant's own doc for why a max bound was
     /// deleted as seed-unstable).
     ///
-    /// `0.34` is kept as a CANDIDATE value -- numerically UNCHANGED from
-    /// before, but its justification is NOT: it is not re-derived from
-    /// `0.229503` (measured by
-    /// `crates/jammi-kernels/artifacts/cuda-runs/2026-08-28-m1b-b3-padded-oracles-c2365c9-a100-pcie.json`,
-    /// the number this doc's own F4 section above explains was measured in
-    /// the wrong regime) and not derived by transfer from a different
-    /// metric's own headroom (F3's withdrawn factor). It awaits the pod's
-    /// harvest of THIS (`seq=160`, 8-seed) oracle version -- deliberately NOT called
-    /// PROVISIONAL: that word already named a DIFFERENT, already-resolved
-    /// gap ("no A100 artifact exists at all"); this gap is "derivation
-    /// pending a regime-correct harvest of a real, already-committed
-    /// artifact's successor". Once the lead runs the harvest, the per-seed
-    /// ratios (mean + spread) become the real evidence, and this bound's
-    /// own headroom must be re-derived in [`relative_l1_error`]'s OWN
-    /// terms: how far the measured MEAN sits above `0.0` (the noise-free
-    /// floor), covering (a) seed-to-seed variance across
-    /// [`FLASH_ORACLE_SWEEP_SEEDS`] and (b) the window-binding regime's own
-    /// bf16 rounding noise (per-row RoPE table gather plus REAL windowed
-    /// softmax truncation, arithmetic the prior non-binding fixture never
-    /// exercised) -- never a multiplicative factor borrowed from a
-    /// different metric's own noise floor.
+    /// FINAL DERIVATION: measured by
+    /// `crates/jammi-kernels/artifacts/cuda-runs/2026-08-28-m1b-padded-oracle-8seed-6ef586a-a100-pcie.json`
+    /// (A100 80GB PCIe, driver 570.211.01, at `6ef586a` -- this artifact's
+    /// own `note` field records that it SUPERSEDES the `c2365c9`
+    /// single-seed, wrong-regime measurement as this constant's derivation
+    /// source), on THIS oracle's exact window-binding/8-seed form:
+    /// per-seed `relative_l1_error(flash_real, block_real)` = `[0.127088,
+    /// 0.104041, 0.153638, 0.148977, 0.119046, 0.109690, 0.111090,
+    /// 0.288572]` (seeds `201..208` respectively) -- mean `0.145268`, max
+    /// `0.288572` (seed `208`; the OTHER 7 seeds alone average `0.124796`,
+    /// so `208` is a genuine single-seed outlier -- `~1.99`x the 8-seed
+    /// mean -- not the distribution's centre). The asserted quantity is
+    /// the MEAN (never the max, matching the convention above); noise-free
+    /// is `0.0`.
+    /// `0.34` (the retired candidate) gives only `0.34 / 0.145268` ≈
+    /// `2.34`x margin over the measured MEAN and `0.34 / 0.288572` ≈
+    /// `1.18`x margin over the single WORST observed seed -- NOT enough:
+    /// seed `208` alone shows one unlucky/box-specific seed can land
+    /// nearly `2`x the mean on THIS SAME box; `1.18`x margin over that one
+    /// data point leaves almost no room for a future run where a
+    /// DIFFERENT seed lands there instead, or where box/driver variation
+    /// (a different A100 SKU, a different driver build) shifts the WHOLE
+    /// distribution up rather than just one seed. Raised to `0.5`:
+    /// `0.5 / 0.145268` ≈ `3.44`x margin over the measured mean (comparable
+    /// to this file's own most generous same-shape precedent,
+    /// [`FLASH_ORACLE_K_MEAN_GRAD`]'s `~3.1`x mean margin) and
+    /// `0.5 / 0.288572` ≈ `1.73`x margin over the single worst OBSERVED
+    /// seed -- i.e. even a future run whose MEAN matched today's single
+    /// worst-case per-seed draw would still clear this bound with real
+    /// room to spare, covering BOTH seed-to-seed variance (the observed
+    /// spread) and box/driver variation (unmeasured here, but a same-class
+    /// unknown this margin is sized to absorb) -- never re-fitted to
+    /// exactly the measured mean or max.
     #[cfg(all(feature = "cuda", feature = "flash-attn"))]
-    const FLASH_ORACLE_PADDED_BOUND: f64 = 0.34;
+    const FLASH_ORACLE_PADDED_BOUND: f64 = 0.5;
 
     /// One seed's real-row `relative_l1_error(flash, block)` measurement
     /// for [`flash_arm_padded_matches_block_arm_on_real_rows_cuda`] --

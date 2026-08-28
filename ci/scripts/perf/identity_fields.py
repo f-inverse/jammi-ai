@@ -175,7 +175,11 @@ FINETUNE_IDENTITY_FIELDS = (
 # `crates/jammi-bench/src/report.rs`'s `EncodeStepTier::IDENTITY_FIELDS`
 # EXACTLY (that const's own doc names this file's `ENCODE_IDENTITY_FIELDS`
 # as its pinned mirror; `test_identity_fields_subset.py` pins the cardinality
-# on BOTH sides and REDs on a drift on either one).
+# on BOTH sides and REDs on a drift on either one). Grown 13 -> 15 (round-3
+# audit F-5'/lead ruling): `checkpoint_pooling_sha256` (NullMeans — "no
+# 1_Pooling/config.json in this model dir") and `device_requested` appended
+# after the original 13, position-stable rather than re-ordered, mirroring
+# the Rust const's own append order exactly.
 #
 # UNLIKE `FINETUNE_IDENTITY_FIELDS` above, this tuple is NOT a subset of a
 # larger Rust const that also folds in provenance/dispatch facts —
@@ -215,6 +219,11 @@ ENCODE_IDENTITY_FIELDS = (
     "normalize",
     "warmup",
     "iters_measured",
+    # Round-3 audit additions (F-5'(b)/lead ruling), appended
+    # position-stable rather than re-ordered into the original 13 — mirrors
+    # `EncodeStepTier::IDENTITY_FIELDS`'s own append order exactly.
+    "checkpoint_pooling_sha256",
+    "device_requested",
 )
 
 

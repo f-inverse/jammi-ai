@@ -1,0 +1,34 @@
+# Arch-validation-freshness waiver allowlist (check_arch_validation_freshness.py)
+#
+# Format: one row per line, `<arch><TAB><reviewed_up_to_sha><TAB><reason>` (a
+# literal TAB character). `#`-prefixed and blank lines are ignored.
+#
+# A row records "arch `<arch>` (a build.rs::VALIDATED_SMS entry) is
+# deliberately accepted as STALE — its per-arch pod-parity evidence was last
+# reviewed as still sufficient through `<reviewed_up_to_sha>`, for
+# `<reason>`". The sha range this waiver covers is `<the qualifying
+# artifact's own git_sha>..<reviewed_up_to_sha>`.
+#
+# Rot, checked mechanically on every run, all hard FAILs:
+#   - `arch` is not in the CURRENT build.rs::VALIDATED_SMS array.
+#   - `reviewed_up_to_sha` is malformed, or not an ancestor of HEAD.
+#   - `arch` is not currently Rule-2-stale at all (a DEAD waiver — delete
+#     the row once a fresh artifact lands or the surface reverts).
+#   - the flash surface changed AGAIN after `reviewed_up_to_sha` (the
+#     waiver's own range no longer covers HEAD — bump `reviewed_up_to_sha`
+#     after re-reviewing, or drop the arch from VALIDATED_SMS instead).
+#
+# Scoped to Rule 2 (freshness) findings only — never Rule 1 (evidence):
+# see check_arch_validation_freshness.py's own module doc, "SCOPE,
+# deliberately" paragraph under "Rule 3 — waiver".
+#
+# Empty today, deliberately (the honest baseline): every VALIDATED_SMS entry
+# (sm80/86/89/90) has fresh, non-doc evidence at the M2/M3 train tip. An
+# earlier revision of this gate treated `third_party/flash-attention/
+# VENDORED.md` as fully in-surface and carried four waiver rows here for a
+# docs-only pointer-paragraph edit — that was the wrong shape (a doc change
+# cannot move the compiled SASS or the fences a pod run actually validated,
+# so demanding a waiver for it is false staleness that trains waiver-
+# fatigue); the gate itself now excludes pure documentation (`*.md`) from
+# Rule 2's trigger instead, so no waiver was ever needed for that class of
+# change. See the gate's own module doc for the full reasoning.

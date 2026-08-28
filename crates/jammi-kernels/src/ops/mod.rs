@@ -106,6 +106,16 @@ pub(crate) mod flash_attention;
 pub(crate) mod geglu;
 pub(crate) mod layer_norm;
 pub(crate) mod low_rank_residual_linear;
+// Private, mirroring `flash_attention`'s own `StatefulKernelOp` shape (a
+// `Saved<Tensor>` `lse` field — see that module's doc for why a stateful
+// op cannot be `Copy`/`Clone`): CPU-hermetic only this pass (no `cuda_fwd`
+// yet, no dispatch-lattice wiring — see the module's own doc for the
+// explicit scope line). Re-exported below: the op type, its constructor's
+// public surface, the free-function entry point, and its three `MAX_SEQ`/
+// `MIN_CHUNK`/`WINDOW_MASKED_VALUE` constants (renamed `MEM_EFFICIENT_*`
+// at the flat `ops::` surface, mirroring `ATTENTION_BLOCK_*`'s own
+// rename-not-nested-path convention).
+mod mem_efficient_attention;
 pub(crate) mod rope;
 pub(crate) mod rope_positions;
 mod saved;
@@ -178,6 +188,10 @@ pub use flash_attention::{
 pub use geglu::{GegluFused, GeluVariant};
 pub use layer_norm::{LayerNormFused, MAX_HIDDEN};
 pub use low_rank_residual_linear::{DropoutKey, LowRankResidualLinear};
+pub use mem_efficient_attention::{
+    mem_efficient_attention, MemEfficientAttention, MAX_SEQ as MEM_EFFICIENT_MAX_SEQ,
+    MIN_CHUNK as MEM_EFFICIENT_MIN_CHUNK, WINDOW_MASKED_VALUE as MEM_EFFICIENT_WINDOW_MASKED_VALUE,
+};
 pub use rope::{RopeFused, MAX_HEAD_DIM};
 pub use rope_positions::{rope_positions_fused_ragged, RopePositionsFused};
 pub use saved::{Saved, SavedError};
@@ -273,12 +287,38 @@ pub fn apply_inplace3<T: KernelOp + InplaceOp3>(
 ///
 /// Bound: `Send + Sync + 'static + Sealed`, deliberately WITHOUT `Copy`
 /// **or `Clone`** — for every op that ACTUALLY EXISTS in this crate today
-/// (`crate::ops::flash_attention::FlashVarlenAttention` and its bwd
-/// helper, the crate's only two `StatefulKernelOp`s — a plain code span,
-/// not a doc link: that module is feature-gated behind `flash-attn` and is
-/// absent from a default-feature `cargo doc` build). This is not merely
-/// "we don't need Clone" for those two types — Clone is actively refused
-/// AT THEIR DEFINITION SITE (neither derives it):
+/// AND GENUINELY NEEDS this trait, i.e. carries an owned [`Saved`] field
+/// (`crate::ops::flash_attention::FlashVarlenAttention`,
+/// `FlashVarlenBwdHelper`, AND `FlashVarlenAttentionFusedRope` — plain
+/// code spans, not doc links: that module is feature-gated behind
+/// `flash-attn` and is absent from a default-feature `cargo doc` build —
+/// plus [`crate::ops::MemEfficientAttention`], the crate's FOURTH
+/// Saved-bearing op (round-4 audit correction, F4: an earlier draft here
+/// said "THIRD", undercounting `flash_attention.rs`'s own three — see
+/// that module's own doc for the enumeration) and the FIRST one compiled
+/// in every default build, not merely under `flash-attn`). **Precision
+/// matters here** (round-3 audit correction, F-C — the SAME category
+/// error round 1's "only two `StatefulKernelOp`s" phrasing had, relocated
+/// rather than closed): `StatefulKernelOp` itself is BLANKET-implemented
+/// (below) over
+/// `Sealed + Send + Sync + 'static`, so every existing `KernelOp` in this
+/// crate — `LayerNormFused`, `RopeFused`, `GegluFused`,
+/// `AttentionBlockFused`, ... — ALSO satisfies `StatefulKernelOp`'s bound
+/// in a default build (see this module's own top doc, "This is NOT mutual
+/// exclusion" — the set of `StatefulKernelOp` implementors is a SUPERSET
+/// of `KernelOp`'s, not a disjoint or narrow one). "The first
+/// `StatefulKernelOp` in a default build" is therefore FALSE by
+/// construction; the honest predicate this section (and
+/// `tests/stateful_op_discipline.rs`, which is what actually enforces the
+/// discipline below) cares about is SAVED-BEARING — a type that
+/// STRUCTURALLY NEEDS this trait because it cannot satisfy `KernelOp`'s
+/// `Copy` bound, not merely a type that happens to satisfy this trait's
+/// own permissive bound. Updated from an earlier "the crate's only two
+/// `StatefulKernelOp`s" claim once `MemEfficientAttention` landed — the
+/// Saved-bearing enumeration grows as real ops are added; this bound's
+/// discipline does not. This is not merely "we don't need Clone" for
+/// these Saved-bearing types — Clone is actively refused AT THEIR
+/// DEFINITION SITE (none of them derives it):
 ///
 /// - Every call site in this crate constructs a fresh instance and passes
 ///   it BY VALUE into [`apply_stateful1`] (mirroring [`apply1`]/[`apply2`]/
@@ -314,11 +354,12 @@ pub fn apply_inplace3<T: KernelOp + InplaceOp3>(
 ///   wrapper). Either change makes the OUTER op struct `Clone`, and
 ///   `.clone()` — unlike a move — can be called through `&self` any number
 ///   of times, reopening the exact aliasing hazard this section otherwise
-///   closes: a compile-time PROOF for the two ops that exist today, and a
-///   REVIEW + regression-test discipline (`tests/stateful_op_discipline.rs`,
-///   which asserts no `Saved`-bearing op struct derives `Clone`/`Copy` or
-///   wraps its `Saved` field in an `Arc`) for whatever the next one looks
-///   like.
+///   closes: a compile-time PROOF for the ops that exist today (flash's
+///   pair, `Copy`/`Clone`-checked the same way `MemEfficientAttention`
+///   below is), and a REVIEW + regression-test discipline
+///   (`tests/stateful_op_discipline.rs`, which asserts no `Saved`-bearing
+///   op struct derives `Clone`/`Copy` or wraps its `Saved` field in an
+///   `Arc`) for whatever the next one looks like.
 ///
 /// `candle_core::Tensor::apply_op1_arc`/`apply_op3_arc` (`custom_op.rs:
 /// 216-234,236-243`) are PUBLIC candle APIs that take an already-
@@ -351,7 +392,9 @@ pub fn apply_inplace3<T: KernelOp + InplaceOp3>(
 /// **What this doctest proves, precisely:** `HoldsSaved` below derives
 /// neither `Copy` nor `Clone`, so moving `self.op` out of `&self` is a
 /// compile error — the exact shape `FlashVarlenAttention`/
-/// `FlashVarlenBwdHelper` are in today. **What it does NOT prove:** that no
+/// `FlashVarlenBwdHelper`, and now `MemEfficientAttention`
+/// (`ops::mem_efficient_attention`, always-compiled — see that module's
+/// own doc), are all in today. **What it does NOT prove:** that no
 /// `StatefulKernelOp`-implementing type could ever be hoisted — a type
 /// deriving `Clone` (directly, or by wrapping its `Saved` field in an
 /// extra `Arc`, see this trait's own doc above) would sidestep this

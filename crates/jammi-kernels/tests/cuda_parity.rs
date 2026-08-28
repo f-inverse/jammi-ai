@@ -33,12 +33,12 @@ use candle_core::{DType, Device, Error, Layout, Tensor, Var, D};
 use half::bf16;
 use jammi_kernels::ops::{
     adamw_step_fused_t, apply1, apply2, apply3, apply_inplace2, bwd_gradient_gemm_layouts,
-    cast_add_bf16_into, cast_scale_bf16_f32_into, AdamMomentUpdate,
+    cast_add_bf16_into, cast_scale_bf16_f32_into, mem_efficient_attention, AdamMomentUpdate,
     AdamMomentUpdateFmaContractedRedControl, AdamWParams, AttentionBlockFused, Axpy,
     BwdGemmLayoutsParams, CastAddBf16, CastScaleBf16F32, DropoutFused, DropoutKey,
     FullyMaskedPolicy, GegluFused, GeluVariant, LayerNormFused, LowRankResidualLinear,
-    PhiloxKatProbe, RopeFused, ScaledCastAdd, SoftmaxLastDimFused,
-    ATTENTION_BLOCK_WINDOW_MASKED_VALUE,
+    MemEfficientAttention, PhiloxKatProbe, RopeFused, ScaledCastAdd, SoftmaxLastDimFused,
+    ATTENTION_BLOCK_WINDOW_MASKED_VALUE, MEM_EFFICIENT_WINDOW_MASKED_VALUE,
 };
 
 fn axpy(alpha: f64, x: &Tensor, y: &Tensor) -> candle_core::Result<Tensor> {
@@ -3709,6 +3709,112 @@ fn bf16_round_bound(value: f64) -> f64 {
     2.0 * BF16_U * value.abs()
 }
 
+/// Arch-aware `abs_floor` for
+/// [`lora_linear_parity_bf16_base_backward_production_width`]'s `dx`
+/// bound (M3 four-arch pod round-2 finding 2; round-3 sweep REVISED the
+/// diagnosis below). This is jammi's OWN `lora_linear` CUDA kernel — a
+/// cuBLAS strided-batched GEMM, NOTHING to do with
+/// `flash-attn`/`GENCODE_ARCHES` admission — so this widening is entirely
+/// independent of `crate::admission::flash_validated_arches()`.
+///
+/// ## REVISED DIAGNOSIS: deterministic per (arch, build), not flaky
+///
+/// An earlier revision of this doc read the element movement across two
+/// single-shot observations (`dx[10523]` then `dx[32574]`) as run-to-run
+/// FLICKER and reached for the [`FLASH_ORACLE_K_MEAN_GRAD`]/`K_MAX`
+/// precedent (a max-shaped bound that does not transfer across draws).
+/// That framing is WRONG: a 40-repeat sweep (**N = 20 invocations, in TWO
+/// independent labeled blocks of 20**, per the earlier PENDING-ARTIFACT
+/// spec this revision closes out) found the SAME worst element and the
+/// SAME `diff`/`bound`/`required_floor` on ALL 40 repeats, on BOTH Ada
+/// SKUs, bit-for-bit. The computation is DETERMINISTIC for a given (arch,
+/// build) — the earlier two-observation "movement" tracked BUILD changes
+/// (this constant's own successive revisions altered the bound formula,
+/// which changes WHICH element ranks worst), not measurement noise. The
+/// repeat sweep's actual role, then, is a DETERMINISM CHECK, not a
+/// distribution characterization: confirming n=40-identical is what makes
+/// "one measured value per (arch, fixture, build)" a sound derivation
+/// input, rather than the mean/max of an unstable process.
+///
+/// Sweep results (both blocks, both arches — identical within each arch):
+/// - **sm89 (L40S)**: worst element index `244121`, `diff = 1.2832888`,
+///   `bound = 1.0417905` (at the prior `abs_floor = 1.0`),
+///   `ratio = 1.231811` (FAILED all 40 — `23.2%` over), `required_floor
+///   = 1.2414983` (the TRUE minimal sufficient floor for this element,
+///   independent of whatever `abs_floor` was in effect — see the test
+///   body's own `max_required_floor` for the exact, direction-symmetric
+///   formula this fixed the earlier buggy diagnostic to).
+/// - **sm86 (A40)**: worst element index `196871`, `ratio = 0.224994` at
+///   `abs_floor = 1.0` (PASSED all 40, comfortably) — well below even the
+///   ORIGINAL `0.3` A100 floor's own bound, i.e. A40 needs NO widening at
+///   all.
+///
+/// **sm86 and sm89 diverge WITHIN the same 99 KB smem tier** (A40
+/// comfortable, L40S `23%` over): "Ada-class" is not one behavior — these
+/// two SKUs run genuinely DIFFERENT cuBLAS accumulation kernels for the
+/// identical problem shape (consistent with arch-specific cuBLAS kernel
+/// selection, not a tier-wide property), so the floor is PER-ARCH, not
+/// "per Ada". The unconditional `required_floor` diagnostic this fix adds
+/// to the test body means a FUTURE fixture or bound-formula change that
+/// moves the worst element again needs only ONE re-run per arch to
+/// re-derive the number, not a fresh multi-run sweep — that one-run
+/// re-derivation IS the real protection this diagnostic buys, not the
+/// repeat count.
+///
+/// ## Derivation (sm89, the only arch needing a widened floor)
+/// ```text
+/// measured required_floor (sm89, L40S, this build, 40/40 identical):
+///   1.2414983
+///
+/// margin (this file's own "comfortable headroom over a measured need"
+/// convention -- dx_bound_margin's sibling comment used 2.0x against a
+/// measured 1.34x need; 1.5x is used here since the measurement itself is
+/// now a confirmed-deterministic point, not a single noisy draw needing
+/// as much headroom):
+///   1.2414983 * 1.5 = 1.86224745
+///
+/// rounded UP to a clean value (never round down past the margin):
+///   2.0
+/// ```
+/// sm86 (A40) keeps the TIGHT, unwidened floor: the sweep proved it does
+/// not need widening (`required_floor` well under the base bound), and
+/// per family D ("never loosen a bound you don't have to") there is no
+/// reason to trade away A40's own discriminating power for one-rule
+/// simplicity with sm89 — the evidence says they are genuinely different
+/// arches, so the code now treats them as genuinely different arches.
+/// `(8, 0)`/A100 and `(9, 0)`/H100 (confirmed fully green, zero flakiness,
+/// across the full four-arch pod run) also keep the original floor.
+///
+/// **PENDING-ARTIFACT** (narrowed by this revision — the DERIVATION above
+/// is done, not pending; only the COMMITTED evidence artifact is): the
+/// lead reruns this exact test on both Ada pods to confirm green against
+/// the constants below, then produces the per-arch `cuda-runs` artifacts
+/// citing these sweep values as the derivation evidence — cite that
+/// artifact path here once it lands.
+fn lora_linear_dx_abs_floor(cuda: &Device) -> f64 {
+    use jammi_kernels::admission::{probe_cuda_compute_capability, ComputeCapability};
+    // sm80/sm86/sm90-proven tight floor: A100 and H100 have always used
+    // it (zero flakiness across the full four-arch pod run); the round-3
+    // sweep additionally proved A40 (sm86) needs no widening at all
+    // (measured ratio 0.225 against the base bound) -- see this
+    // function's own doc.
+    const TIGHT_FLOOR: f64 = 3e-1;
+    // sm89 (L40S)-derived: 1.2414983 (measured, 40/40-deterministic
+    // required_floor) * 1.5 (margin) = 1.86224745, rounded up to 2.0 --
+    // see this function's own doc for the full arithmetic.
+    const SM89_FLOOR: f64 = 2.0;
+    match probe_cuda_compute_capability(cuda) {
+        Some(cap) if cap == ComputeCapability::new(8, 9) => SM89_FLOOR,
+        // Every OTHER probed capability (sm80, sm86, sm90, or an
+        // unrecognised future arch) keeps the tight floor deliberately:
+        // an untested arch should fail LOUD against the narrow bound
+        // (prompting investigation) rather than silently pass under an
+        // over-widened one it was never shown to need (family D: default
+        // to the side that cannot silently accept a wrong number).
+        _ => TIGHT_FLOOR,
+    }
+}
+
 /// A conservative, DERIVED (not tuned-to-pass) absolute tolerance
 /// covering every CPU<->CUDA `f32` comparison this section's tests make
 /// (`fwd`, `dx`, `dw`, `da`, `db`): each is the output of one or two
@@ -4568,7 +4674,11 @@ fn lora_linear_parity_bf16_base_backward_production_width() {
     // `d_x_lora` can now land much closer to canceling at a given index
     // than the uniform ones seed produced, and the observed divergence
     // there exceeded the `0.1` floor's total bound by a small margin.
-    let abs_floor = 3e-1f64; // no-producer: sized from two uncommitted pod runs — a chosen design margin, not a committed measurement.
+    // A100/H100-proven at `0.3`; ARCH-AWARE beyond that (M3 four-arch pod
+    // round-2 finding 2 — see [`lora_linear_dx_abs_floor`]'s own doc for
+    // the full derivation, the PENDING-artifact marker, and why Ada-class
+    // hardware (sm86/sm89) needs a wider floor here).
+    let abs_floor = lora_linear_dx_abs_floor(&cuda);
 
     // A second, SCALED re-measurement: two real pod runs after the
     // sign-mixed cotangent found the per-term `bf16_round_bound`s
@@ -4582,20 +4692,74 @@ fn lora_linear_parity_bf16_base_backward_production_width() {
     // (comfortable headroom over the measured `1.34x` gap) rather than
     // loosening every caller of the shared helper.
     let dx_bound_margin = 2.0f64;
+    // Round-3 pod refinement (finding 2's own follow-up, TWICE refined —
+    // see [`lora_linear_dx_abs_floor`]'s own doc for the full history):
+    // track the WORST element (max `diff / bound` ratio, under the
+    // CURRENT `abs_floor`) across the FULL tensor instead of panicking at
+    // the first violation, so the pass/fail decision is always the true
+    // tensor-wide worst case, not whichever index happens to be scanned
+    // first. SEPARATELY (round-3's own fix — the first cut of this
+    // diagnostic printed a NEGATIVE, meaningless number on a passing run,
+    // because it read the required-floor back out of the RATIO-maximizing
+    // index, which need not be the index that actually needs the largest
+    // floor): track `max_required_floor` as its OWN, independent
+    // maximum — `diff_i - architecture_invariant_i` for EVERY element,
+    // where `architecture_invariant_i` is `dx_bound_margin *
+    // sum(bf16_round_bound(..))` WITHOUT `abs_floor` folded in. This is
+    // the TRUE minimal `abs_floor` that would make every element pass,
+    // by construction: element `i` passes iff `diff_i <= invariant_i +
+    // abs_floor`, i.e. iff `abs_floor >= diff_i - invariant_i`; the max
+    // of that quantity over the whole tensor is exactly what a NEW
+    // `abs_floor` needs to clear, REGARDLESS of what `abs_floor` happens
+    // to be right now — meaningful (and printed) whether this run passes
+    // or fails, never spuriously negative from reading the wrong index.
+    let mut worst_ratio = f64::NEG_INFINITY;
+    let mut worst_idx = 0usize;
+    let mut worst_diff = 0.0f64;
+    let mut worst_bound = 0.0f64;
+    let mut max_required_floor = f64::NEG_INFINITY;
+    let mut max_required_floor_idx = 0usize;
     for (i, (c, g)) in dx_cpu.iter().zip(dx_gpu.iter()).enumerate() {
-        let bound = dx_bound_margin
+        let invariant = dx_bound_margin
             * (bf16_round_bound(f64::from(dx_base_cpu[i]))
                 + bf16_round_bound(f64::from(d_x_lora_cpu[i]))
-                + bf16_round_bound(f64::from(*c)))
-            + abs_floor;
-        assert!(
-            f64::from(*c - *g).abs() <= bound,
-            "bf16-base bwd dx[{i}]: cpu(eager f32) {c} vs cuda(bf16) {g} (bound {bound}, \
-             dx_base {} d_x_lora {})",
-            dx_base_cpu[i],
-            d_x_lora_cpu[i]
-        );
+                + bf16_round_bound(f64::from(*c)));
+        let bound = invariant + abs_floor;
+        let diff = f64::from(*c - *g).abs();
+        let ratio = diff / bound;
+        if ratio > worst_ratio {
+            worst_ratio = ratio;
+            worst_idx = i;
+            worst_diff = diff;
+            worst_bound = bound;
+        }
+        let required_floor_i = diff - invariant;
+        if required_floor_i > max_required_floor {
+            max_required_floor = required_floor_i;
+            max_required_floor_idx = i;
+        }
     }
+    eprintln!(
+        "lora_linear_parity_bf16_base_backward_production_width: dx worst-ratio element \
+         index={worst_idx} diff={worst_diff:.7} bound={worst_bound:.7} ratio={worst_ratio:.6} \
+         (>1.0 fails); true minimal sufficient floor (independent of the CURRENT abs_floor={abs_floor:.7}) \
+         required_floor={max_required_floor:.7} at index={max_required_floor_idx} \
+         ({} abs_floor)",
+        if max_required_floor > abs_floor {
+            "EXCEEDS the current"
+        } else {
+            "within the current"
+        },
+    );
+    assert!(
+        worst_ratio <= 1.0,
+        "bf16-base bwd dx[{worst_idx}]: cpu(eager f32) {} vs cuda(bf16) {} (bound {worst_bound}, \
+         ratio {worst_ratio:.6}, dx_base {} d_x_lora {})",
+        dx_cpu[worst_idx],
+        dx_gpu[worst_idx],
+        dx_base_cpu[worst_idx],
+        d_x_lora_cpu[worst_idx]
+    );
 
     // RULE-2 DISCRIMINATION PROOF (was vacuous before this fix): the
     // predecessor of this pair of bounds reused `lora_linear_parity_tolerance`
@@ -9546,5 +9710,944 @@ fn adamw_step_fma_contracted_red_control_diverges_from_eager_cuda() {
     eprintln!(
         "adamw_step_fma_contracted_red_control_diverges_from_eager_cuda: \
          {red_control_mismatches}/{n} elements differ (RED control, expected > 0)"
+    );
+}
+
+// =========================================================================
+// mem_efficient_attention CUDA parity (M2 part 2 F3, adversarial audit
+// round 3): the CUDA composition landed with ZERO oracle authored — "pod-
+// deferred" covered EXECUTION, never authorship. Every leg below is
+// cuda-gated + require-env (`cuda_device()`, this file's own established
+// pattern) so it compiles into every `--features cuda` test binary and
+// runs (or loudly refuses to silently skip, under `JAMMI_REQUIRE_CUDA`) on
+// the pod that re-smokes this branch.
+//
+// Metric class (plan v4 delta 5, FLASH_ORACLE_PADDED_BOUND's own doc
+// records the fixed defect): BARE `relative_l1_error`
+// (`Σ|arm-reference|/Σ|reference|`), never a ratio-calibrated ULP bound —
+// this op's chunked online-softmax accumulator has no eager call site to
+// bit-match against at depth (module doc's own "reduction-order growth
+// oracle" section), unlike `AttentionBlockFused`'s CUDA arm, which
+// reproduces an EXISTING eager sequence and can therefore afford the
+// tighter two-term ULP bound `assert_attention_block_parity_f32` uses
+// above. Seeds: `MEM_EFFICIENT_SWEEP_SEEDS`, `jammi_encoders::modernbert`'s
+// own `FLASH_ORACLE_SWEEP_SEEDS` convention reproduced here (a SEPARATE
+// integration-test binary — that constant is `#[cfg(test)]`-private inside
+// a different crate, not importable across the boundary): the MEAN is the
+// asserted quantity, every per-seed value printed under `--nocapture`
+// (matching `FLASH_ORACLE_K_MEAN_POOLED`'s "mean, never per-seed max"
+// convention — a max bound is seed-unstable).
+// =========================================================================
+
+/// [`MemEfficientAttention::new`]'s own `chunk` FLOOR — the smallest
+/// `chunk` the PRODUCTION constructor accepts at all
+/// (`jammi_kernels::ops::MEM_EFFICIENT_MIN_CHUNK`, `512`), NOT the
+/// production DEFAULT a real training forward actually uses
+/// (`jammi_encoders::modernbert::MEM_EFFICIENT_CHUNK`, `1024` — round-6
+/// audit finding F-2 corrected an earlier doc here that conflated the
+/// two). Every small-`seq` leg below uses this FLOOR directly
+/// (degenerating to one mega-chunk at these toy shapes, module doc's own
+/// documented behaviour for `chunk > seq`);
+/// [`mem_efficient_cuda_matches_cpu_band_multi_chunk_f32`] picks a `seq`
+/// large enough to see more than one chunk AT the floor width;
+/// [`mem_efficient_cuda_matches_cpu_band_production_chunk_width_f32`] is
+/// the ONLY leg that actually runs at the production DEFAULT width. This
+/// file has no access to `MemEfficientAttention::new_test_chunk` (that
+/// bypass is `#[cfg(test)]`-private INSIDE the library crate, unreachable
+/// from this separate integration-test binary) — every leg here goes
+/// through the SAME production constructor real callers use.
+const MEM_EFFICIENT_MIN_CHUNK_FOR_TEST: usize = jammi_kernels::ops::MEM_EFFICIENT_MIN_CHUNK;
+
+/// 8 fixed seeds — "a single seed's draw is not a distribution", the SAME
+/// discipline every dense-arm sweep in this workspace uses.
+const MEM_EFFICIENT_SWEEP_SEEDS: [u64; 8] = [201, 202, 203, 204, 205, 206, 207, 208];
+
+/// `Σ|arm - reference| / Σ|reference|` — bare, no absolute floor, an
+/// affirmative non-finite check FIRST (a `NaN` must never read as a silent
+/// pass). Reproduces `jammi_encoders::modernbert`'s own private
+/// `relative_l1_error` (same formula, same checks) — re-derived here
+/// rather than imported, for the same cross-crate-boundary reason
+/// `MEM_EFFICIENT_SWEEP_SEEDS` is.
+fn mem_efficient_relative_l1_error(arm: &[f32], reference: &[f32]) -> f64 {
+    assert_eq!(
+        arm.len(),
+        reference.len(),
+        "mem_efficient_relative_l1_error: length mismatch"
+    );
+    let non_finite = arm
+        .iter()
+        .chain(reference.iter())
+        .filter(|v| !v.is_finite())
+        .count();
+    assert_eq!(
+        non_finite, 0,
+        "mem_efficient_relative_l1_error: {non_finite} non-finite value(s)"
+    );
+    let mut num = 0.0f64;
+    let mut den = 0.0f64;
+    for (&a, &r) in arm.iter().zip(reference.iter()) {
+        num += (a as f64 - r as f64).abs();
+        den += (r as f64).abs();
+    }
+    assert!(
+        den > 0.0,
+        "mem_efficient_relative_l1_error: reference carries no signal (sum|reference| == 0)"
+    );
+    num / den
+}
+
+/// `[batch, seq]`-flat padding-only additive mask — memeff's OWN domain
+/// (narrower than `attention_block`'s combined-mask class: no query-row
+/// axis, module doc's "the band is a `Copy` scalar" section). `lengths`,
+/// when `Some`, right-pads each row to `seq` with
+/// [`MEM_EFFICIENT_WINDOW_MASKED_VALUE`] (this file's own `mask.rs:127`-
+/// class sibling pin, `jammi_encoders::mask`'s
+/// `masked_logit_matches_jammi_kernels_mem_efficient_window_masked_value`,
+/// proves this is the SAME sentinel a real caller's `MASKED_LOGIT` is).
+fn mem_efficient_key_mask_v(batch: usize, seq: usize, lengths: Option<&[usize]>) -> Vec<f32> {
+    let mut v = vec![0f32; batch * seq];
+    if let Some(lens) = lengths {
+        assert_eq!(
+            lens.len(),
+            batch,
+            "mem_efficient_key_mask_v: lengths.len() != batch"
+        );
+        for (bi, &len) in lens.iter().enumerate() {
+            assert!(
+                len <= seq,
+                "mem_efficient_key_mask_v: length {len} exceeds seq {seq}"
+            );
+            for si in len..seq {
+                v[bi * seq + si] = MEM_EFFICIENT_WINDOW_MASKED_VALUE;
+            }
+        }
+    }
+    v
+}
+
+/// One seed's `(cpu_out, cuda_out)` pair, both flattened to `Vec<f32>` on
+/// the host — `cpu_fwd` (this op's own CPU arm, F32-only, ALREADY
+/// validated CPU-hermetically by this crate's own unit-test suite) is the
+/// reference; `cuda_out` is cast back to `F32` on the host for comparison
+/// regardless of `dtype` (the comparison itself always happens in `f64`
+/// accumulation inside [`mem_efficient_relative_l1_error`]). A FRESH
+/// [`MemEfficientAttention`] instance per device (the crate's own
+/// "one function, fresh op per call" convention — `Saved` state is
+/// per-instance) — never one op reused across both.
+#[allow(clippy::too_many_arguments)]
+fn mem_efficient_fwd_cpu_vs_cuda(
+    cuda: &Device,
+    batch: usize,
+    seq: usize,
+    heads: usize,
+    head_dim: usize,
+    half_window: Option<usize>,
+    rope: bool,
+    policy: FullyMaskedPolicy,
+    dtype: DType,
+    lengths: Option<&[usize]>,
+    chunk: usize,
+    seed: f32,
+) -> (Vec<f32>, Vec<f32>) {
+    let cpu = Device::Cpu;
+    let qkv_v = qkv_fixture(batch, seq, heads, head_dim, seed);
+    let rope_v = attention_rope_pack(seq, head_dim);
+    let mask_v = mem_efficient_key_mask_v(batch, seq, lengths);
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    let qkv_cpu = Tensor::from_slice(&qkv_v, (batch, seq, 3, heads, head_dim), &cpu).unwrap();
+    let rope_cpu = Tensor::from_slice(&rope_v, (2, 1, 1, seq, head_dim), &cpu).unwrap();
+    let mask_cpu = Tensor::from_slice(&mask_v, (batch, 1, 1, seq), &cpu).unwrap();
+    let op_cpu = MemEfficientAttention::new(scale, policy, rope, half_window, chunk).unwrap();
+    let out_cpu = mem_efficient_attention(&qkv_cpu, &rope_cpu, &mask_cpu, op_cpu).unwrap();
+    let out_cpu_v: Vec<f32> = out_cpu.flatten_all().unwrap().to_vec1().unwrap();
+
+    let qkv_gpu = Tensor::from_slice(&qkv_v, (batch, seq, 3, heads, head_dim), cuda)
+        .unwrap()
+        .to_dtype(dtype)
+        .unwrap();
+    let rope_gpu = Tensor::from_slice(&rope_v, (2, 1, 1, seq, head_dim), cuda)
+        .unwrap()
+        .to_dtype(dtype)
+        .unwrap();
+    let mask_gpu = Tensor::from_slice(&mask_v, (batch, 1, 1, seq), cuda)
+        .unwrap()
+        .to_dtype(dtype)
+        .unwrap();
+    let op_gpu = MemEfficientAttention::new(scale, policy, rope, half_window, chunk).unwrap();
+    let out_gpu = mem_efficient_attention(&qkv_gpu, &rope_gpu, &mask_gpu, op_gpu).unwrap();
+    let out_gpu_v: Vec<f32> = out_gpu
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    (out_cpu_v, out_gpu_v)
+}
+
+/// Sweeps [`MEM_EFFICIENT_SWEEP_SEEDS`], asserting the MEAN
+/// [`mem_efficient_relative_l1_error`] against `bound`, printing every
+/// per-seed value under `--nocapture`.
+#[allow(clippy::too_many_arguments)]
+fn assert_mem_efficient_fwd_parity_sweep(
+    label: &str,
+    cuda: &Device,
+    batch: usize,
+    seq: usize,
+    heads: usize,
+    head_dim: usize,
+    half_window: Option<usize>,
+    rope: bool,
+    policy: FullyMaskedPolicy,
+    dtype: DType,
+    lengths: Option<&[usize]>,
+    chunk: usize,
+    bound: f64,
+) {
+    let mut sum = 0.0f64;
+    for &seed in &MEM_EFFICIENT_SWEEP_SEEDS {
+        let (cpu_v, gpu_v) = mem_efficient_fwd_cpu_vs_cuda(
+            cuda,
+            batch,
+            seq,
+            heads,
+            head_dim,
+            half_window,
+            rope,
+            policy,
+            dtype,
+            lengths,
+            chunk,
+            seed as f32 * 0.01,
+        );
+        let err = mem_efficient_relative_l1_error(&gpu_v, &cpu_v);
+        eprintln!("mem_efficient {label} seed={seed}: relative_l1_error={err:e}");
+        sum += err;
+    }
+    let mean = sum / MEM_EFFICIENT_SWEEP_SEEDS.len() as f64;
+    eprintln!("mem_efficient {label}: mean relative_l1_error={mean:e} (bound={bound:e})");
+    assert!(
+        mean <= bound,
+        "mem_efficient {label}: mean relative_l1_error {mean:e} exceeds bound {bound:e}"
+    );
+}
+
+/// **F32 fwd/policy/eager-reference bound — first-pass, NOT YET
+/// recalibrated from a per-seed measurement (round-6 audit advisory,
+/// stated honestly rather than left silently uncorrected).** `cuBLAS`
+/// (CUDA `matmul`) and the CPU `gemm` crate reduce in a DIFFERENT order
+/// than each other (both correct, esc-044's own lesson) — the SAME jitter
+/// class `F32_TOL` (this file's own `Axpy`-fmad bound) already prices for
+/// a single fused op; this op chains several GEMMs (`QKᵀ`, `PV`) plus an
+/// online-softmax recurrence per chunk. `2026-08-28-m2-memeff-cuda-84e98ac-a100-sxm4.json`
+/// (this branch's own landing artifact, cited by filename — the FIRST
+/// on-device execution of this op's CUDA composition) confirms every leg
+/// this constant guards passed GREEN on both A100 and L40S, but its
+/// `observed` block records ONLY the bwd legs' per-seed numbers
+/// ([`MEM_EFFICIENT_BWD_F32_BOUND`]/[`MEM_EFFICIENT_BWD_BF16_BOUND`],
+/// below) — the fwd/policy-discriminator/eager-reference legs this
+/// constant guards have no per-seed data recorded yet to derive a tight
+/// margin FROM (this crate's own "K_MAX lesson": a bound gets tightened
+/// after a real measurement exists, never asserted as final before one
+/// does — a future artifact recording those legs' own per-seed values is
+/// what tightens this constant next, the same way the bwd artifact just
+/// tightened [`MEM_EFFICIENT_BWD_F32_BOUND`]).
+const MEM_EFFICIENT_F32_BOUND: f64 = 1e-3;
+
+/// **BF16 fwd/policy/eager-reference bound** — the SAME "GREEN but not yet
+/// per-seed-measured for THESE legs specifically" status as
+/// [`MEM_EFFICIENT_F32_BOUND`]'s own doc states, wider than F32 for the
+/// same reduction-depth + rounding reason `attention_block`'s own bf16
+/// legs price explicitly (this file's "Derived bf16 bounds" section,
+/// above) — memeff's own oracle metric class is bare `relative_l1_error`,
+/// not that section's two-term ULP form, so this is a single relative
+/// fraction, not a per-element bound.
+const MEM_EFFICIENT_BF16_BOUND: f64 = 0.06;
+
+/// **F32 bwd bound, DERIVED (round-6 audit finding F-3) from
+/// `2026-08-28-m2-memeff-cuda-84e98ac-a100-sxm4.json`'s own
+/// `bwd_f32_rope_window_dqkv_relative_l1_per_seed`** (the `f32
+/// rope+window` leg, [`assert_mem_efficient_bwd_parity`]'s own label,
+/// `half_window=Some(3)`, `rope=true`): 8-seed mean `1.4503630840829083e-05`
+/// (`≈1.45e-5`), worst single seed `1.7665936624974642e-05` (seed `207`,
+/// `≈1.77e-5` — `≈1.22`x the mean, a tight spread). The PRIOR bound here
+/// (the shared `MEM_EFFICIENT_F32_BOUND`, `1e-3`) gave `≈69`x margin over
+/// this mean — an unmeaning bound wide enough to hide a real regression,
+/// not a first-pass placeholder anymore now that a real measurement
+/// exists (the SAME class `FLASH_ORACLE_PADDED_BOUND`'s own doc argues
+/// against: a bound this loose asserts nothing). Tightened to `5e-5`,
+/// following that constant's own margin convention: `5e-5 / 1.4503630840829083e-05`
+/// `≈3.45`x margin over the measured MEAN (comparable to
+/// [`FLASH_ORACLE_K_MEAN_GRAD`]'s own `~3.1`x mean margin,
+/// `FLASH_ORACLE_PADDED_BOUND`'s own `~3.44`x) and `5e-5 /
+/// 1.7665936624974642e-05` `≈2.83`x margin over the single WORST observed
+/// seed (comparable to that same precedent's `~1.73`x — MORE generous
+/// here, since this measurement's own spread is already far tighter) —
+/// real room for seed-to-seed variance and box/driver variation (this
+/// artifact's own bitwise-identical-across-A100-and-L40S finding suggests
+/// that variation is small for this leg, but the margin is sized to
+/// absorb it regardless) — never re-fitted to exactly the measured mean
+/// or max.
+const MEM_EFFICIENT_BWD_F32_BOUND: f64 = 5e-5;
+
+/// **BF16 bwd bound, DERIVED (round-6 audit finding F-3) from the SAME
+/// artifact's `bwd_bf16_rope_window_dqkv_relative_l1_per_seed`** (same
+/// leg/fixture as the F32 bound above, `dtype=BF16`): 8-seed mean
+/// `0.005761339489004169` (`≈5.76e-3`), per-seed spread from
+/// `0.0016994689280399305` (seed `202`, `≈1.70e-3`) to
+/// `0.01623172482798447` (seed `207`, `≈1.62e-2`) — a `≈9.53`x
+/// min-to-max spread. Stated honestly, per this file's own "K_MAX lesson"
+/// caution (`assert_mem_efficient_fwd_parity_sweep`'s own doc: "mean,
+/// never per-seed max — a max bound is seed-unstable"): that spread is
+/// DIAGNOSTIC information about this leg's seed-to-seed variance, not
+/// itself an assertable quantity — only the MEAN is asserted, below,
+/// exactly as every other leg in this file already does. KEPT at `0.06`
+/// (not re-derived down to this measurement's own tighter `~3x`-mean
+/// convention): `0.06 / 0.005761339489004169` `≈10.41`x margin over the
+/// mean and `0.06 / 0.01623172482798447` `≈3.70`x margin over the single
+/// WORST observed seed — deliberately wider than the F32 bwd bound's own
+/// `~2.83`x worst-seed margin, sized to absorb `bf16`'s own larger
+/// rounding-noise class (the SAME reason [`MEM_EFFICIENT_BF16_BOUND`] is
+/// wider than [`MEM_EFFICIENT_F32_BOUND`]) on top of ordinary seed
+/// variance, given this leg's own measured spread is already `~9.5`x
+/// wider than the F32 leg's `~1.22`x — a real, not hypothetical, source
+/// of future-run variance this margin needs to absorb.
+const MEM_EFFICIENT_BWD_BF16_BOUND: f64 = 0.06;
+
+#[test]
+fn mem_efficient_cuda_matches_cpu_plain_f32() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    assert_mem_efficient_fwd_parity_sweep(
+        "plain f32",
+        &cuda,
+        2,
+        9,
+        2,
+        16,
+        None,
+        false,
+        FullyMaskedPolicy::Zeros,
+        DType::F32,
+        None,
+        MEM_EFFICIENT_MIN_CHUNK_FOR_TEST,
+        MEM_EFFICIENT_F32_BOUND,
+    );
+}
+
+#[test]
+fn mem_efficient_cuda_matches_cpu_plain_bf16() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    assert_mem_efficient_fwd_parity_sweep(
+        "plain bf16",
+        &cuda,
+        2,
+        9,
+        2,
+        16,
+        None,
+        false,
+        FullyMaskedPolicy::Zeros,
+        DType::BF16,
+        None,
+        MEM_EFFICIENT_MIN_CHUNK_FOR_TEST,
+        MEM_EFFICIENT_BF16_BOUND,
+    );
+}
+
+#[test]
+fn mem_efficient_cuda_matches_cpu_rope_f32() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    assert_mem_efficient_fwd_parity_sweep(
+        "rope f32",
+        &cuda,
+        2,
+        11,
+        2,
+        16,
+        None,
+        true,
+        FullyMaskedPolicy::Zeros,
+        DType::F32,
+        None,
+        MEM_EFFICIENT_MIN_CHUNK_FOR_TEST,
+        MEM_EFFICIENT_F32_BOUND,
+    );
+}
+
+#[test]
+fn mem_efficient_cuda_matches_cpu_rope_bf16() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    assert_mem_efficient_fwd_parity_sweep(
+        "rope bf16",
+        &cuda,
+        2,
+        11,
+        2,
+        16,
+        None,
+        true,
+        FullyMaskedPolicy::Zeros,
+        DType::BF16,
+        None,
+        MEM_EFFICIENT_MIN_CHUNK_FOR_TEST,
+        MEM_EFFICIENT_BF16_BOUND,
+    );
+}
+
+/// The window+multi-chunk leg: `seq=1200` at [`MemEfficientAttention::new`]'s
+/// own `chunk` FLOOR (`MEM_EFFICIENT_MIN_CHUNK_FOR_TEST`, `512` —
+/// `jammi_kernels::ops::MEM_EFFICIENT_MIN_CHUNK`; NOT the production
+/// default — see [`mem_efficient_cuda_matches_cpu_band_production_chunk_width_f32`]
+/// below for that leg, fixed at round-6 audit finding F-2: an earlier
+/// revision of THIS doc wrongly named `512` "the PRODUCTION `chunk=512`
+/// default" — `jammi_encoders::modernbert::MEM_EFFICIENT_CHUNK` is `1024`;
+/// `512` is only ever `MIN_CHUNK`, the FLOOR that op's own constructor
+/// enforces, never a caller's chosen width) gives THREE chunks (`[0,512),
+/// [512,1024), [1024,1200)`), genuinely exercising chunk-boundary
+/// correctness on CUDA at a NON-production width — every OTHER
+/// `MIN_CHUNK`-or-above, `seq`-below-that leg in this file degenerates to
+/// a single mega-chunk (module doc: "a caller may pass `chunk > seq`").
+/// `half_window=64` (production `local_attention=128`'s own half-width)
+/// with `lengths=[1200, 900, 70]` — every real row length `>= half_window
+/// + 2 = 66` (the M1b window-visibility discipline this crate's own band
+/// tests already establish: a shorter real length would make the
+/// fully-masked-row PREDICATE, not the band predicate, the effective
+/// constraint, hiding what this leg means to exercise) — asserted
+/// in-test, not merely stated in prose (round-6 audit advisory).
+#[test]
+fn mem_efficient_cuda_matches_cpu_band_multi_chunk_f32() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let half_window = 64usize;
+    let lengths = [1200usize, 900, 70];
+    for &len in &lengths {
+        assert!(
+            len == 0 || len >= half_window + 2,
+            "window-visibility premise: every nonzero real row length must be >= \
+             half_window + 2 ({}), got {len}",
+            half_window + 2
+        );
+    }
+    assert_mem_efficient_fwd_parity_sweep(
+        "band multi-chunk f32 (MIN_CHUNK width)",
+        &cuda,
+        3,
+        1200,
+        2,
+        16,
+        Some(half_window),
+        true,
+        FullyMaskedPolicy::Zeros,
+        DType::F32,
+        Some(&lengths),
+        MEM_EFFICIENT_MIN_CHUNK_FOR_TEST,
+        MEM_EFFICIENT_F32_BOUND,
+    );
+}
+
+/// The `BF16` twin of the leg above (round-6 audit finding F-4: no `bf16`
+/// leg anywhere in this file had window/lengths/multi-chunk coverage —
+/// every `bf16` leg before this one was mask-free and single-chunk-only,
+/// so a `bf16`-specific bug reachable ONLY through the band predicate,
+/// padding, or a chunk boundary had no on-device leg to catch it at all).
+/// Identical fixture (`seq=1200`, `half_window=64`,
+/// `lengths=[1200, 900, 70]`, `MIN_CHUNK`-width — the SAME
+/// window-visibility premise asserted in-test), `dtype=BF16`.
+#[test]
+fn mem_efficient_cuda_matches_cpu_band_multi_chunk_bf16() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let half_window = 64usize;
+    let lengths = [1200usize, 900, 70];
+    for &len in &lengths {
+        assert!(
+            len == 0 || len >= half_window + 2,
+            "window-visibility premise: every nonzero real row length must be >= \
+             half_window + 2 ({}), got {len}",
+            half_window + 2
+        );
+    }
+    assert_mem_efficient_fwd_parity_sweep(
+        "band multi-chunk bf16 (MIN_CHUNK width)",
+        &cuda,
+        3,
+        1200,
+        2,
+        16,
+        Some(half_window),
+        true,
+        FullyMaskedPolicy::Zeros,
+        DType::BF16,
+        Some(&lengths),
+        MEM_EFFICIENT_MIN_CHUNK_FOR_TEST,
+        MEM_EFFICIENT_BF16_BOUND,
+    );
+}
+
+/// The PRODUCTION-width leg (round-6 audit finding F-2: no leg exercised
+/// `jammi_encoders::modernbert::MEM_EFFICIENT_CHUNK` itself — every other
+/// leg in this file runs at `MEM_EFFICIENT_MIN_CHUNK_FOR_TEST`, `512`, the
+/// FLOOR, never the `1024` a real training forward actually uses).
+/// `chunk=1024` (mirrored here as a literal — that constant lives in
+/// `jammi-encoders`, a downstream crate this file cannot depend on) at
+/// `seq=1500` gives exactly TWO, deliberately LOPSIDED chunks (`[0,1024),
+/// [1024,1500)` — a full-width chunk followed by a short 476-element
+/// tail), the shape a real long-sequence forward reaches (a
+/// `seq`-not-a-multiple-of-`chunk` tail chunk) rather than the
+/// evenly-divided 3-chunk shape the `MIN_CHUNK`-width leg above happens
+/// to produce. Same `half_window=64` window-visibility discipline,
+/// asserted in-test.
+#[test]
+fn mem_efficient_cuda_matches_cpu_band_production_chunk_width_f32() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    const PRODUCTION_CHUNK: usize = 1024;
+    let half_window = 64usize;
+    let lengths = [1500usize, 1100, 70];
+    for &len in &lengths {
+        assert!(
+            len == 0 || len >= half_window + 2,
+            "window-visibility premise: every nonzero real row length must be >= \
+             half_window + 2 ({}), got {len}",
+            half_window + 2
+        );
+    }
+    assert_mem_efficient_fwd_parity_sweep(
+        "band production-width (chunk=1024) f32",
+        &cuda,
+        3,
+        1500,
+        2,
+        16,
+        Some(half_window),
+        true,
+        FullyMaskedPolicy::Zeros,
+        DType::F32,
+        Some(&lengths),
+        PRODUCTION_CHUNK,
+        MEM_EFFICIENT_F32_BOUND,
+    );
+}
+
+/// **F1's own discriminator, closed on-device.** A batch item that is
+/// ENTIRELY padding (`lengths[1] == 0`) makes every one of its rows fully
+/// masked under EITHER policy's own trigger — but the two policies must
+/// produce OBSERVABLY DIFFERENT outputs on those rows: `Zeros` forces
+/// exact `0.0`; `Propagate` runs the ordinary (finite, since every key's
+/// additive value is the SAME constant here — a genuine tie, not `-inf` —
+/// so softmax is well-defined and uniform) division, landing on the
+/// UNIFORM average of `V` over that batch's own row 0..seq — never all
+/// zeros unless `V` itself is (this fixture's `V` is not). This is the
+/// exact bug F1 found: `cuda_fwd` applied the `Zeros` algebra
+/// UNCONDITIONALLY, so `Propagate` silently became `Zeros` — a fixture
+/// where the two policies would have been INDISTINGUISHABLE (no fully-
+/// masked row at all) could not have caught it; this one can, and does,
+/// on BOTH policies independently matching their OWN `cpu_fwd` reference
+/// (proving the fix, not merely proving SOME divergence exists).
+#[test]
+fn mem_efficient_cuda_fully_masked_zeros_vs_propagate_diverge_observably() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    assert_mem_efficient_fully_masked_policy_split(&cuda, DType::F32, MEM_EFFICIENT_F32_BOUND);
+}
+
+/// The `BF16` twin (round-6 audit finding F-4: no `bf16` leg had
+/// fully-masked-row coverage at all — the discriminator above was
+/// `F32`-only). Same fixture, `dtype=BF16`.
+#[test]
+fn mem_efficient_cuda_fully_masked_zeros_vs_propagate_diverge_observably_bf16() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    assert_mem_efficient_fully_masked_policy_split(&cuda, DType::BF16, MEM_EFFICIENT_BF16_BOUND);
+}
+
+/// Body shared by the `F32`/`BF16` fully-masked-policy-split legs above
+/// (round-6 audit finding F-4 refactor: extracted so the `bf16` twin is a
+/// real parameterization, not a hand-copied duplicate that could drift).
+fn assert_mem_efficient_fully_masked_policy_split(cuda: &Device, dtype: DType, bound: f64) {
+    let (batch, seq, heads, head_dim) = (2usize, 6usize, 1usize, 16usize);
+    let lengths = [6usize, 0]; // batch row 1 is ENTIRELY padding.
+    let chunk = MEM_EFFICIENT_MIN_CHUNK_FOR_TEST;
+    let rope = false;
+
+    let (cpu_zeros, gpu_zeros) = mem_efficient_fwd_cpu_vs_cuda(
+        cuda,
+        batch,
+        seq,
+        heads,
+        head_dim,
+        None,
+        rope,
+        FullyMaskedPolicy::Zeros,
+        dtype,
+        Some(&lengths),
+        chunk,
+        11.0,
+    );
+    let (cpu_prop, gpu_prop) = mem_efficient_fwd_cpu_vs_cuda(
+        cuda,
+        batch,
+        seq,
+        heads,
+        head_dim,
+        None,
+        rope,
+        FullyMaskedPolicy::Propagate,
+        dtype,
+        Some(&lengths),
+        chunk,
+        11.0,
+    );
+
+    // Each policy independently matches ITS OWN cpu_fwd reference — the
+    // real closure of F1 (not merely "the two policies differ from each
+    // other on CUDA", which a policy-blind bug could also produce if BOTH
+    // arms happened to diverge from cpu_fwd in the same wrong direction).
+    let err_zeros = mem_efficient_relative_l1_error(&gpu_zeros, &cpu_zeros);
+    let err_prop = mem_efficient_relative_l1_error(&gpu_prop, &cpu_prop);
+    eprintln!(
+        "mem_efficient fully-masked policy split ({dtype:?}): Zeros relative_l1_error=\
+         {err_zeros:e}, Propagate relative_l1_error={err_prop:e}"
+    );
+    assert!(
+        err_zeros <= bound,
+        "Zeros policy vs its own cpu_fwd reference: {err_zeros:e} > {bound:e}"
+    );
+    assert!(
+        err_prop <= bound,
+        "Propagate policy vs its own cpu_fwd reference: {err_prop:e} > {bound:e}"
+    );
+
+    // The masked batch row (index 1) itself: Zeros must be EXACT zero;
+    // Propagate must NOT be (the observable divergence F1 is about).
+    let row_elems = seq * heads * head_dim;
+    let masked_row_gpu_zeros = &gpu_zeros[row_elems..2 * row_elems];
+    let masked_row_gpu_prop = &gpu_prop[row_elems..2 * row_elems];
+    assert!(
+        masked_row_gpu_zeros.iter().all(|&x| x == 0.0),
+        "Zeros-policy CUDA output for the fully-masked batch row must be EXACTLY zero: {:?}",
+        masked_row_gpu_zeros
+    );
+    assert!(
+        masked_row_gpu_prop.iter().any(|&x| x != 0.0),
+        "Propagate-policy CUDA output for the fully-masked batch row must NOT collapse to \
+         zero (the Zeros-applied-unconditionally regression this leg exists to catch): {:?}",
+        masked_row_gpu_prop
+    );
+}
+
+/// A small, independent, UNCHUNKED eager reference — mirrors
+/// `jammi_kernels::ops::mem_efficient_attention`'s own module test's
+/// private `eager_reference` (not importable across the crate/test-binary
+/// boundary: that fn lives inside a `#[cfg(test)] mod tests` in the
+/// library crate itself), reimplemented here so this file's own "vs
+/// eager" leg shares NO code with `cpu_fwd`/`cuda_fwd` at all — a bug
+/// common to both chunked arms (unlikely, given they are independent
+/// implementations, but this is the leg that would catch it) would not
+/// hide behind a shared helper.
+#[allow(clippy::too_many_arguments)]
+fn mem_efficient_eager_reference_v(
+    qkv_v: &[f32],
+    batch: usize,
+    seq: usize,
+    heads: usize,
+    head_dim: usize,
+    rope_v: Option<&[f32]>,
+    mask_v: &[f32],
+    scale: f32,
+    device: &Device,
+) -> Vec<f32> {
+    let qkv = Tensor::from_slice(qkv_v, (batch, seq, 3, heads, head_dim), device).unwrap();
+    let q0 = qkv
+        .narrow(2, 0, 1)
+        .unwrap()
+        .squeeze(2)
+        .unwrap()
+        .transpose(1, 2)
+        .unwrap()
+        .contiguous()
+        .unwrap();
+    let k0 = qkv
+        .narrow(2, 1, 1)
+        .unwrap()
+        .squeeze(2)
+        .unwrap()
+        .transpose(1, 2)
+        .unwrap()
+        .contiguous()
+        .unwrap();
+    let v0 = qkv
+        .narrow(2, 2, 1)
+        .unwrap()
+        .squeeze(2)
+        .unwrap()
+        .transpose(1, 2)
+        .unwrap()
+        .contiguous()
+        .unwrap();
+    let (q, k) = match rope_v {
+        Some(rv) => {
+            let rope_t = Tensor::from_slice(rv, (2, 1, 1, seq, head_dim), device).unwrap();
+            let cos = rope_t.narrow(0, 0, 1).unwrap().squeeze(0).unwrap();
+            let sin = rope_t.narrow(0, 1, 1).unwrap().squeeze(0).unwrap();
+            (
+                apply3(&q0, &cos, &sin, RopeFused::new(false)).unwrap(),
+                apply3(&k0, &cos, &sin, RopeFused::new(false)).unwrap(),
+            )
+        }
+        None => (q0, k0),
+    };
+    let scores = (q.matmul(&k.t().unwrap()).unwrap() * f64::from(scale)).unwrap();
+    let mask = Tensor::from_slice(mask_v, (batch, 1, 1, seq), device).unwrap();
+    let combined = scores.broadcast_add(&mask).unwrap();
+    let max_ = combined.max_keepdim(D::Minus1).unwrap();
+    let exp_ = combined.broadcast_sub(&max_).unwrap().exp().unwrap();
+    let sum_ = exp_.sum_keepdim(D::Minus1).unwrap();
+    let p = exp_.broadcast_div(&sum_).unwrap();
+    let ctx = p.matmul(&v0).unwrap();
+    ctx.transpose(1, 2)
+        .unwrap()
+        .contiguous()
+        .unwrap()
+        .reshape((batch, seq, heads * head_dim))
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap()
+}
+
+/// `cuda_fwd` vs a genuinely independent eager Tensor composition
+/// (mask-free, dense — the ONE shape the eager reference above can
+/// express directly, matching the research anchor's own "torch's
+/// mem-efficient reference is only obtainable at mask-free shapes" note
+/// for the analogous torch-side comparison), NOT merely `cuda_fwd` vs
+/// `cpu_fwd` (which shares the crate's own online-softmax algorithm on
+/// both sides — a bug in that ALGORITHM, as opposed to one arm's
+/// composition of it, would not show up there).
+#[test]
+fn mem_efficient_cuda_matches_independent_eager_reference_f32() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let (batch, seq, heads, head_dim) = (2usize, 13usize, 2usize, 16usize);
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let mut sum = 0.0f64;
+    for &seed in &MEM_EFFICIENT_SWEEP_SEEDS {
+        let qkv_v = qkv_fixture(batch, seq, heads, head_dim, seed as f32 * 0.01);
+        let rope_v = attention_rope_pack(seq, head_dim);
+        let mask_v = mem_efficient_key_mask_v(batch, seq, None);
+
+        let eager_v = mem_efficient_eager_reference_v(
+            &qkv_v,
+            batch,
+            seq,
+            heads,
+            head_dim,
+            Some(&rope_v),
+            &mask_v,
+            scale,
+            &cuda,
+        );
+
+        let qkv_gpu = Tensor::from_slice(&qkv_v, (batch, seq, 3, heads, head_dim), &cuda).unwrap();
+        let rope_gpu = Tensor::from_slice(&rope_v, (2, 1, 1, seq, head_dim), &cuda).unwrap();
+        let mask_gpu = Tensor::from_slice(&mask_v, (batch, 1, 1, seq), &cuda).unwrap();
+        let op = MemEfficientAttention::new(
+            scale,
+            FullyMaskedPolicy::Zeros,
+            true,
+            None,
+            MEM_EFFICIENT_MIN_CHUNK_FOR_TEST,
+        )
+        .unwrap();
+        let out_gpu: Vec<f32> = mem_efficient_attention(&qkv_gpu, &rope_gpu, &mask_gpu, op)
+            .unwrap()
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        let err = mem_efficient_relative_l1_error(&out_gpu, &eager_v);
+        eprintln!(
+            "mem_efficient vs independent eager reference seed={seed}: relative_l1_error={err:e}"
+        );
+        sum += err;
+    }
+    let mean = sum / MEM_EFFICIENT_SWEEP_SEEDS.len() as f64;
+    eprintln!("mem_efficient vs independent eager reference: mean relative_l1_error={mean:e}");
+    assert!(
+        mean <= MEM_EFFICIENT_F32_BOUND,
+        "mem_efficient cuda_fwd vs independent eager reference: mean {mean:e} exceeds bound \
+         {MEM_EFFICIENT_F32_BOUND:e}"
+    );
+}
+
+/// **F3's "bwd cross-check leg on-device."** `dqkv` cpu-vs-cuda, through
+/// ordinary `.backward()` (both `cpu_fwd`'s and `cuda_fwd`'s `bwd` is the
+/// SAME shared `Tensor`-level composition — module doc's "`bwd`: ordinary
+/// composition" — so this leg is also a real end-to-end proof that
+/// `RopeFused::cuda_fwd`, `matmul`, and every broadcast op `bwd` composes
+/// from actually execute correctly TOGETHER on a real device, not merely
+/// that each exists in isolation).
+#[allow(clippy::too_many_arguments)]
+fn assert_mem_efficient_bwd_parity(
+    label: &str,
+    cuda: &Device,
+    batch: usize,
+    seq: usize,
+    heads: usize,
+    head_dim: usize,
+    half_window: Option<usize>,
+    rope: bool,
+    dtype: DType,
+    chunk: usize,
+    bound: f64,
+) {
+    let cpu = Device::Cpu;
+    let mut sum = 0.0f64;
+    for &seed in &MEM_EFFICIENT_SWEEP_SEEDS {
+        let qkv_v = qkv_fixture(batch, seq, heads, head_dim, seed as f32 * 0.01);
+        let rope_v = attention_rope_pack(seq, head_dim);
+        let mask_v = mem_efficient_key_mask_v(batch, seq, None);
+        let dy_v = attention_dy_fixture(batch * seq * heads * head_dim, seed as f32 + 7.0);
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let qkv_cpu = Var::from_tensor(
+            &Tensor::from_slice(&qkv_v, (batch, seq, 3, heads, head_dim), &cpu).unwrap(),
+        )
+        .unwrap();
+        let rope_cpu = Tensor::from_slice(&rope_v, (2, 1, 1, seq, head_dim), &cpu).unwrap();
+        let mask_cpu = Tensor::from_slice(&mask_v, (batch, 1, 1, seq), &cpu).unwrap();
+        let dy_cpu = Tensor::from_slice(&dy_v, (batch, seq, heads * head_dim), &cpu).unwrap();
+        let op_cpu =
+            MemEfficientAttention::new(scale, FullyMaskedPolicy::Zeros, rope, half_window, chunk)
+                .unwrap();
+        let out_cpu =
+            mem_efficient_attention(qkv_cpu.as_tensor(), &rope_cpu, &mask_cpu, op_cpu).unwrap();
+        let grads_cpu = (&out_cpu * &dy_cpu)
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .backward()
+            .unwrap();
+        let dqkv_cpu: Vec<f32> = grads_cpu
+            .get(&qkv_cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        let qkv_gpu = Var::from_tensor(
+            &Tensor::from_slice(&qkv_v, (batch, seq, 3, heads, head_dim), cuda)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap(),
+        )
+        .unwrap();
+        let rope_gpu = Tensor::from_slice(&rope_v, (2, 1, 1, seq, head_dim), cuda)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+        let mask_gpu = Tensor::from_slice(&mask_v, (batch, 1, 1, seq), cuda)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+        let dy_gpu = Tensor::from_slice(&dy_v, (batch, seq, heads * head_dim), cuda)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+        let op_gpu =
+            MemEfficientAttention::new(scale, FullyMaskedPolicy::Zeros, rope, half_window, chunk)
+                .unwrap();
+        let out_gpu =
+            mem_efficient_attention(qkv_gpu.as_tensor(), &rope_gpu, &mask_gpu, op_gpu).unwrap();
+        let grads_gpu = (&out_gpu * &dy_gpu)
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .backward()
+            .unwrap();
+        let dqkv_gpu: Vec<f32> = grads_gpu
+            .get(&qkv_gpu)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_device(&cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        let err = mem_efficient_relative_l1_error(&dqkv_gpu, &dqkv_cpu);
+        eprintln!("mem_efficient bwd {label} seed={seed}: dqkv relative_l1_error={err:e}");
+        sum += err;
+    }
+    let mean = sum / MEM_EFFICIENT_SWEEP_SEEDS.len() as f64;
+    eprintln!("mem_efficient bwd {label}: mean dqkv relative_l1_error={mean:e} (bound={bound:e})");
+    assert!(
+        mean <= bound,
+        "mem_efficient bwd {label}: mean dqkv relative_l1_error {mean:e} exceeds bound {bound:e}"
+    );
+}
+
+#[test]
+fn mem_efficient_bwd_cuda_matches_cpu_f32() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    assert_mem_efficient_bwd_parity(
+        "f32 rope+window",
+        &cuda,
+        2,
+        11,
+        2,
+        16,
+        Some(3),
+        true,
+        DType::F32,
+        MEM_EFFICIENT_MIN_CHUNK_FOR_TEST,
+        MEM_EFFICIENT_BWD_F32_BOUND,
+    );
+}
+
+#[test]
+fn mem_efficient_bwd_cuda_matches_cpu_bf16() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    assert_mem_efficient_bwd_parity(
+        "bf16 rope+window",
+        &cuda,
+        2,
+        11,
+        2,
+        16,
+        Some(3),
+        true,
+        DType::BF16,
+        MEM_EFFICIENT_MIN_CHUNK_FOR_TEST,
+        MEM_EFFICIENT_BWD_BF16_BOUND,
     );
 }

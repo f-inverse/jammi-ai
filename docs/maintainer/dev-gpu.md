@@ -128,6 +128,21 @@ healthy pod to the poll's own timeout:
 RP_SSH_WAIT_SECS=900 ci/scripts/gpu-dev.sh shell a100
 ```
 
+### `up` records the session write-ahead, before the reachability wait
+
+A pod bills from the instant the deploy mutation returns an id — not from
+the instant it answers SSH, which can be minutes later. `up` records the
+session (pod id, arch, a host-unknown placeholder for host/port) at that
+first instant, *before* the SSH-reachability wait and the driver-floor check
+below it; the same record is then updated in place with the real host/port
+once the pod is confirmed reachable. A failure during that wait — an
+external kill that bypasses the tooling's own EXIT-trap teardown, or a
+trap-time terminate call that itself silently fails — therefore still
+leaves a session `ls` shows and `down` can terminate, rather than a running,
+billing pod recorded nowhere and caught only by `reap`'s own late sweep.
+`bootstrap_or_die`'s own failure paths print the recorded pod id and the
+exact `down <session>` command to run, never a swallowed exit.
+
 ## Interactive debugging
 
 ```bash
@@ -310,6 +325,23 @@ push to it first"). Each tree gets its own job script/log
 architecture and would poison the pod's — along with `.git`, `.venv*`,
 `.claude`, `.sccache`, `.gpu-pull`, `scratchpad`, and the CUTLASS submodule
 (provisioned separately, never rsync'd; see `target --with-cutlass` above).
+
+`push` provisions its own tree's PARENT directory (`/root/trees` for any
+non-default tree) before it rsyncs — rsync itself creates only the LAST path
+component of its own destination, so the very first push against a name no
+session has ever pushed before would otherwise fail outright on a fresh pod
+(`rsync: mkdir "/root/trees/<name>" failed: No such file or directory`).
+This runs unconditionally, every push, and is a no-op once the parent
+already exists.
+
+**`push`/`run`/`target` act on YOUR OWN checkout, not `$PWD`.** `REPO_ROOT`
+is resolved from the SCRIPT's own on-disk location, never from the caller's
+current directory — on a laptop with more than one checkout of this repo (a
+multi-worktree swarm), always invoke the copy INSIDE the tree you mean to
+act on. These three verbs refuse (exit 2, naming both paths) when the
+current directory's own git toplevel disagrees with that location;
+`RP_ALLOW_ROOT_MISMATCH=1` overrides for deliberate cross-tree use (e.g. one
+tree's helper acting on another tree's already-up pod session on purpose).
 
 **`--ref` and `push` are alternatives, not partners.** `push` is
 `rsync -azc --no-times --delete` (the excludes above), so it overwrites the

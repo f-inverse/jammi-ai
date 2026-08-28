@@ -1,0 +1,69 @@
+{
+ "schema_version": 1,
+ "unit": "m2-part2-memeff-cuda",
+ "git_sha": "b0c161921831f366ce2e44d50f9c921fcaa757e2",
+ "date": "2026-08-28T16:50:00Z",
+ "box": "jammi-a100 (NVIDIA A100-SXM4-80GB, driver 570.172.08, compute_cap 8.0); cross-confirmed bitwise-identical on jammi-l40s (NVIDIA L40S, driver 580.173.02, compute_cap 8.9)",
+ "driver": "570.172.08",
+ "gpu": "NVIDIA A100-SXM4-80GB",
+ "features": "cuda",
+ "status": "GREEN",
+ "env": {
+  "JAMMI_REQUIRE_CUDA": "1"
+ },
+ "producer": {
+  "path": "crates/jammi-kernels/tests/cuda_parity.rs",
+  "kind": "cargo-test",
+  "invocation": "JAMMI_REQUIRE_CUDA=1 cargo test -p jammi-kernels --features cuda --test cuda_parity -- --exact mem_efficient_bwd_cuda_matches_cpu_bf16 --nocapture && JAMMI_REQUIRE_CUDA=1 cargo test -p jammi-kernels --features cuda --test cuda_parity mem_efficient -- --nocapture",
+  "gating": "env:JAMMI_REQUIRE_CUDA"
+ },
+ "observed": {
+  "bwd_f32_rope_window_dqkv_relative_l1_per_seed": {
+   "201": 1.2096526843390133e-05,
+   "202": 1.4714438885328974e-05,
+   "203": 1.533841420091993e-05,
+   "204": 1.348148760742642e-05,
+   "205": 1.7556631429044714e-05,
+   "206": 1.2561721493785778e-05,
+   "207": 1.7665936624974642e-05,
+   "208": 1.2613889641762068e-05
+  },
+  "bwd_f32_mean": 1.4503630840829083e-05,
+  "bwd_f32_bound": 5e-05,
+  "bwd_bf16_rope_window_dqkv_relative_l1_per_seed": {
+   "201": 0.0017935788761085526,
+   "202": 0.0016994689280399305,
+   "203": 0.0022957734447235497,
+   "204": 0.0019425286943871166,
+   "205": 0.0032629215909188904,
+   "206": 0.008105601632039357,
+   "207": 0.01623172482798447,
+   "208": 0.010759117917831485
+  },
+  "bwd_bf16_mean": 0.005761339489004169,
+  "bwd_bf16_bound": 0.06,
+  "note": "Landing run of the COMPLETE memeff on-device oracle (post round-2 audit): 12 legs incl. the production chunk-width leg (chunk=1024, lopsided two-chunk boundary), bf16 band+lengths+multi-chunk parity, the bf16 zero-extent gradient-dtype pin, and the Zeros-vs-Propagate policy discriminator in BOTH dtypes. Tightened MEM_EFFICIENT_BWD_F32_BOUND=5e-5 (derived from the prior artifact's distribution, ~3.45x mean margin) asserted GREEN on hardware. cuda_parity 103 passed / 0 failed; values bitwise-identical across A100 and L40S (per-(arch,build) determinism). Supersedes the 84e98ac6 artifact as the bounds' derivation source."
+ },
+ "note": "Execution provenance for M2 part 2 (memeff dispatch wiring + CUDA composition) at the branch tip (landing run). Also green in the same jobs: the full jammi-kernels cuda suite (344 lib + 100 cuda_parity) and the jammi-encoders cuda,flash-attn suite (177 lib) including the full-forward suppression-seam tests and the F16 fallback regression pin. PROVENANCE: branch sha \u2014 the train PR must land as a MERGE COMMIT.",
+ "legs": [
+  {
+   "name": "jammi-kernels lib suite (cuda)",
+   "status": "ok",
+   "passed": 345,
+   "failed": 0
+  },
+  {
+   "name": "cuda_parity incl. the 12-leg memeff on-device oracle (fwd/bwd, f32+bf16, production chunk width, band/multi-chunk both dtypes, policy discriminators, zero-extent dtype pin)",
+   "status": "ok",
+   "passed": 103,
+   "failed": 0,
+   "note": "1 ignored (pre-existing)"
+  },
+  {
+   "name": "jammi-encoders lib suite (cuda,flash-attn) incl. full-forward suppression tests (global + local-layer fixtures)",
+   "status": "ok",
+   "passed": 179,
+   "failed": 0
+  }
+ ]
+}

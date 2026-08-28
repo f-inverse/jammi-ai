@@ -635,6 +635,35 @@ rp_target_dir() { # $1=tree name (optional; default "jammi-ai")
   echo "/root/target-${t}"
 }
 
+# rsync creates only the LAST path component of its own destination — it
+# never mkdir -p's a whole missing chain. Nothing in the pod bootstrap or
+# the build-substrate seed provisions /root/trees itself (only
+# /root/jammi-ai, the default tree, exists from bootstrap), so the very
+# FIRST `push --tree <name>` against a name no session has ever pushed
+# before failed outright on a fresh pod: `rsync: mkdir "/root/trees/<name>"
+# failed: No such file or directory (2)` (esc-056, observed live on pod
+# u4hfsqyu0i2qwa, 2026-08-28) — a "push first" flow gpu-dev.sh's own header
+# doc and every recipe in dev-gpu-recipes.md document as the FIRST step for
+# a new tree. rp_push_ensure_parent issues a tiny, bounded remote `mkdir
+# -p` on the tree's PARENT directory (derived from tree_dir, never passed
+# separately, so a caller can never name a parent that disagrees with the
+# tree it is about to push into) over the SAME rp_run_remote primitive
+# every other pod-reaching verb in this file uses — idempotent: `mkdir -p`
+# against an already-existing parent (e.g. /root, the default "jammi-ai"
+# tree's own parent, already present from bootstrap) is a silent no-op, so
+# this runs unconditionally on every push, not just a tree's first one.
+# $1=tree_dir (the FULL tree path, e.g. /root/trees/mytree or
+# /root/jammi-ai).
+rp_push_ensure_parent() {
+  local tree_dir="${1:?rp_push_ensure_parent needs a tree dir}"
+  local parent_dir="${tree_dir%/*}"
+  [ -n "$parent_dir" ] || parent_dir="/"
+  rp_run_remote <<EOF
+set -uo pipefail
+mkdir -p '${parent_dir}'
+EOF
+}
+
 # The env-source + CARGO_TARGET_DIR + cd preamble shared by every remote
 # command that must run correctly as if it were an interactive shell in the
 # tree (an SSH login shell does not inherit the container's Dockerfile ENV —
@@ -948,6 +977,25 @@ else:
     RP_POD_CREATED=1
     echo "  deployed ${RP_POD_ID} on ${cloud} / ${gpu}; waiting for SSH (≤${RP_SSH_WAIT_SECS}s)..."
     RP_HOST=""; RP_PORT=""
+    # WRITE-AHEAD (esc-056): record the session — pod id, arch, a
+    # host-unknown placeholder (RP_HOST/RP_PORT are still "" here) — THE
+    # MOMENT the pod exists, before the reachability wait below. The wait can
+    # run for minutes; a failure in that window (an external kill that
+    # bypasses the EXIT trap, or a trap-time `rp_terminate` call that itself
+    # silently fails — rp_cleanup throws that response away by design) must
+    # not leave a running, billing pod recorded NOWHERE — invisible to
+    # `ls`/`down`, caught only by `reap`'s own 72h-late sweep. Observed live:
+    # a four-way parallel `up` left an H100 pod running with no session
+    # record after a post-create failure; a human had to find and terminate
+    # it by hand via the RunPod console. rp_session_save is a no-op for a
+    # `shell` (RP_SESSION is empty there — see gpu-dev.sh), so this only
+    # takes effect for `up`. The identical call below (after SSH is up and
+    # the driver floor is confirmed) then UPDATES this same record with the
+    # real RP_HOST/RP_PORT — this is an update-in-place, not a second,
+    # independent record, and does not change the `up --replace` contract
+    # (that check runs in gpu-dev.sh BEFORE rp_deploy_arch/rp_deploy_live are
+    # ever called, against whatever THIS invocation loaded at startup).
+    rp_session_save
     # A wall-clock deadline, not a fixed iteration count: the old
     # 24-iteration/10s-sleep loop was a HARD-CODED 4-minute budget no caller
     # could raise, and a cold host still pulling the multi-GB CUDA image can
@@ -973,6 +1021,9 @@ p=(json.load(sys.stdin).get("data",{}).get("pod") or {}).get("runtime") or {}
           echo "  SSH up on ${RP_HOST}:${RP_PORT} (driver ${drv})"
           # RP_POD_CREATED was already set the moment RP_POD_ID was read from
           # the deploy response, above — not here, which is minutes later.
+          # This UPDATES the write-ahead record made right after that (see
+          # above): same session file, now with the real RP_HOST/RP_PORT in
+          # place of the host-unknown placeholder — never a second record.
           rp_session_save; return 0
         fi
         echo "  pod ${RP_POD_ID} driver '${drv:-unknown}' is below the r${RP_MIN_DRIVER_MAJOR} floor; terminating and trying next candidate"

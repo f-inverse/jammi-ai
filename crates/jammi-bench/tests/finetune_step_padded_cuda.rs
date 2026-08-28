@@ -34,16 +34,20 @@
 //!    turns `FLASH_COMPILED` on (via `jammi-encoders`'s `flash-attn`
 //!    feature, which forwards to `jammi-kernels/flash-attn` — see that
 //!    crate's `Cargo.toml`).
-//! 3. Compute-capability ARCH — EXACTLY `sm_80` (compute capability `(8,
-//!    0)`), mirroring `jammi-encoders::modernbert`'s own `flash_arch_ok`
-//!    (`probe_cuda_compute_capability(device) ==
-//!    Some(ComputeCapability::new(8, 0))`) — NOT
-//!    `jammi_kernels::admission::ComputeCapability::meets_minimum` (which
-//!    accepts `sm_80` OR NEWER, e.g. sm89/L40S or sm90/H100). The flash
-//!    cascade's own domain predicate (`flash_arch_ok`'s call site,
-//!    `"arch_is_sm80_exact"`) declines on anything other than exactly `(8,
-//!    0)`, regardless of compilation — a device above sm80 is NOT flash-
-//!    eligible on this codebase today.
+//! 3. Compute-capability ARCH — a MEMBER of
+//!    `jammi_kernels::admission::flash_validated_arches()` (the SUBSET of
+//!    `build.rs`'s compiled `-gencode` set with an actual green pod
+//!    parity leg — sm80/86/89/90 today, round-2 audit finding C: this is
+//!    a NARROWER concept than "compiled", never read directly from the
+//!    compiled set), mirroring `jammi-encoders::modernbert`'s own `flash_arch_ok`
+//!    (`flash_validated_arches().contains(&probe_cuda_compute_capability(device))`)
+//!    — NOT `jammi_kernels::admission::ComputeCapability::meets_minimum`
+//!    (a `>=` check, which would ALSO admit a hypothetical future arch
+//!    this build never compiled a cubin for). The flash cascade's own
+//!    domain predicate (`flash_arch_ok`'s call site,
+//!    `"arch_in_flash_validated_set"`) declines on anything outside that
+//!    enumerated set, regardless of compilation — a device this crate has
+//!    no validated cubin for is NOT flash-eligible on this codebase today.
 //!
 //! [`a5_padded_block_arm_vram_baseline_leg`] needs ONLY precondition 1: it
 //! disables `attention_block_flash` via the env-var registry, and
@@ -55,7 +59,8 @@
 //! [`a3_padded_loss_sequence_flash_vs_block_ab`] needs ALL THREE: its
 //! `flash` leg asserts `attention_block_flash_fused_dispatches > 0`, which
 //! requires the flash arm to actually be ELIGIBLE to fuse — compiled in AND
-//! running on an sm80+ device — not merely that a CUDA device exists.
+//! running on a device in the flash build's validated arch set — not merely
+//! that a CUDA device exists.
 //! [`flash_capable_cuda`] is this file's own precondition-2+3 check,
 //! mirroring how `jammi-encoders::modernbert`'s own `flash_compiled_or_skip`
 //! (used by that crate's sibling flash-vs-block oracles) gates on
@@ -88,19 +93,19 @@ fn cuda_available() -> bool {
 
 /// Precondition 2+3 (module doc): a usable CUDA device AND this build's
 /// `jammi-kernels` compiled with `flash-attn` AND that device's compute
-/// capability is EXACTLY `sm_80` (compute capability `(8, 0)`) — the SAME
-/// equality `jammi-encoders::modernbert`'s own `flash_arch_ok` checks
-/// (`probe_cuda_compute_capability(device) ==
-/// Some(ComputeCapability::new(8, 0))`, admitted with reason
-/// `"arch_is_sm80_exact"`), deliberately NOT
+/// capability is a MEMBER of `jammi_kernels::admission::flash_validated_arches()`
+/// — the SAME membership check `jammi-encoders::modernbert`'s own
+/// `flash_arch_ok` performs (`flash_validated_arches().contains(&cap)`,
+/// admitted with reason `"arch_in_flash_validated_set"`), deliberately NOT
 /// `jammi_kernels::admission::ComputeCapability::meets_minimum` (a `>=`
-/// check) — the flash cascade's own domain predicate admits ONLY exactly
-/// sm80 today, so a `meets_minimum` gate here would read an sm89 (L40S) or
-/// sm90 (H100) host as flash-capable when the predicate it is meant to
-/// mirror would decline it, hard-failing this leg's `fused > 0` assertion
-/// on those hosts. Any one of the three missing means the flash arm is not
-/// actually ELIGIBLE to fuse on this host/build — `false` here, never a
-/// panic; the caller decides what to do with that (see
+/// check) — the flash cascade's own domain predicate admits ONLY the
+/// enumerated, compiled set, so a `meets_minimum` gate here would read a
+/// device this build has no validated cubin for (e.g. a hypothetical
+/// future arch) as flash-capable when the predicate it is meant to mirror
+/// would decline it, hard-failing this leg's `fused > 0` assertion on that
+/// host. Any one of the three missing means the flash arm is not actually
+/// ELIGIBLE to fuse on this host/build — `false` here, never a panic; the
+/// caller decides what to do with that (see
 /// `skip_without_flash_capable_cuda!`, below).
 ///
 /// Does not itself require [`cuda_available`] to have been checked first —
@@ -112,10 +117,8 @@ fn flash_capable_cuda() -> bool {
         return false;
     }
     match candle_core::Device::new_cuda(0) {
-        Ok(device) => {
-            jammi_kernels::admission::probe_cuda_compute_capability(&device)
-                == Some(jammi_kernels::admission::ComputeCapability::new(8, 0))
-        }
+        Ok(device) => jammi_kernels::admission::probe_cuda_compute_capability(&device)
+            .is_some_and(|cap| jammi_kernels::admission::flash_validated_arches().contains(&cap)),
         Err(_) => false,
     }
 }
@@ -145,14 +148,16 @@ macro_rules! skip_without_cuda {
 /// Early-return with a loud, stated skip reason when the flash arm is not
 /// actually eligible to fuse on this host/build — CUDA device present but
 /// EITHER `jammi-kernels` was not compiled with `flash-attn` OR the device's
-/// compute capability is not EXACTLY `sm_80` (e.g. sm89/L40S, sm90/H100, or
-/// anything below sm80 all skip alike — the flash cascade's own domain
-/// predicate, `"arch_is_sm80_exact"`, admits only `(8, 0)`). A leg gated
-/// only on [`skip_without_cuda`] but that asserts a live flash dispatch
-/// (`fused > 0`) would hard-fail here instead of honestly skipping — see
-/// this file's own module doc for why a plain `#[cfg(feature = "cuda")]`
-/// build does not imply flash is compiled, and why "sm80 or newer" is not
-/// this predicate's actual domain.
+/// compute capability is not a MEMBER of
+/// `jammi_kernels::admission::flash_validated_arches()` (a device outside that
+/// enumerated set skips alike, regardless of whether it is a newer or
+/// older major/minor than anything in it — the flash cascade's own domain
+/// predicate, `"arch_in_flash_validated_set"`, admits only the validated
+/// set). A leg gated only on [`skip_without_cuda`] but that asserts a live
+/// flash dispatch (`fused > 0`) would hard-fail here instead of honestly
+/// skipping — see this file's own module doc for why a plain
+/// `#[cfg(feature = "cuda")]` build does not imply flash is compiled, and
+/// why "meets the minimum" is not this predicate's actual domain.
 macro_rules! skip_without_flash_capable_cuda {
     ($test_name:literal) => {
         if !cuda_available() {
@@ -169,10 +174,11 @@ macro_rules! skip_without_flash_capable_cuda {
                  either this build's jammi-kernels was not compiled with the flash-attn \
                  feature (FLASH_COMPILED=false; rebuild with `--features \
                  cuda,jammi-encoders/flash-attn`, the same CLI form stacked_sweep.sh uses), or \
-                 the device's compute capability is not EXACTLY sm_80 (the flash cascade's own \
-                 domain predicate, jammi_encoders::modernbert's flash_arch_ok / \
-                 \"arch_is_sm80_exact\", admits only compute capability (8, 0) — sm89/L40S and \
-                 sm90/H100 hosts decline here too, not only sub-sm80 ones)",
+                 the device's compute capability is not a member of the flash build's compiled \
+                 arch set (the flash cascade's own domain predicate, \
+                 jammi_encoders::modernbert's flash_arch_ok / \"arch_in_flash_validated_set\", \
+                 admits only jammi_kernels::admission::flash_validated_arches() -- a host outside \
+                 that enumerated set declines here too, whichever direction it differs)",
                 $test_name
             );
             return;
@@ -244,7 +250,8 @@ fn run_report(cmd: &mut Command) -> serde_json::Value {
 /// leg never asserts a live flash Fused dispatch (it disables the flash
 /// arm and asserts the DECLINE side), so it is honestly runnable on any
 /// CUDA host regardless of whether `jammi-kernels` was compiled with
-/// `flash-attn` or the device meets the flash cascade's `sm_80` minimum.
+/// `flash-attn` or the device's arch is a member of the flash cascade's
+/// compiled set.
 #[test]
 fn a5_padded_block_arm_vram_baseline_leg() {
     skip_without_cuda!("a5_padded_block_arm_vram_baseline_leg");

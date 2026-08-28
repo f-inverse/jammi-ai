@@ -83,6 +83,8 @@ docs/plans/*
 !docs/plans/54-python-ecosystem/
 !docs/plans/55-precision-moat/
 !docs/plans/61-perf-unification/
+!docs/plans/62-embedding-surface/
+!docs/plans/63-how-well/
 docs/superpowers/
 docs/IMPLEMENTATION.md
 docs/specs/

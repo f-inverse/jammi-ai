@@ -21,6 +21,15 @@
 # ("jammi-ai") is the historical single checkout at /root/jammi-ai that every
 # session already has from bootstrap.
 #
+# `push`/`run`/`target` act on YOUR OWN checkout — REPO_ROOT below (what
+# push rsyncs, and the checkout whose gpu-dev.sh copy you must be running)
+# is resolved from THIS SCRIPT's own on-disk location, never from $PWD. On a
+# laptop with more than one checkout of this repo (a multi-worktree swarm),
+# always invoke the copy INSIDE the tree you mean to act on — these three
+# verbs refuse (naming both paths) when $PWD's own git toplevel disagrees
+# with that location; RP_ALLOW_ROOT_MISMATCH=1 overrides for deliberate
+# cross-tree use.
+#
 # Usage:
 #   gpu-dev.sh shell   [arch] [--ref R] [--tree T]   throwaway shell; pod dies on exit
 #   gpu-dev.sh up      [arch] [--ref R]              start a surviving session (name = arch)
@@ -32,7 +41,8 @@
 #   gpu-dev.sh attach  [session] [--tree T]           shell into a surviving session
 #   gpu-dev.sh run     [session] [--tree T] <cmd...>  run <cmd> detached under tmux
 #   gpu-dev.sh logs    [session] [--tree T]           tail the detached job's output
-#   gpu-dev.sh push    [session] [--tree T]           rsync your working tree TO the pod
+#   gpu-dev.sh push    [session] [--tree T]           rsync YOUR OWN checkout (this script's
+#                                                      own on-disk location, never $PWD) TO the pod
 #   gpu-dev.sh pull    [session] [--tree T] <path>    rsync <path> back FROM the pod
 #   gpu-dev.sh wait-seed [session] [--timeout SECS]   block until the pod's own build-substrate
 #                                                      seed completes, fails, or the timeout
@@ -58,6 +68,12 @@
 #        pushed yet (pod_provision_cutlass.sh's own error: "tree source dir
 #        does not exist — push to it first") — it provisions cutlass INTO an
 #        existing tree, it does not create one.
+# push/run/target REFUSE (exit 2, naming both paths) when $PWD's own git
+#        toplevel disagrees with REPO_ROOT (this script's own on-disk
+#        location) — a multi-worktree laptop invoking one tree's script copy
+#        from inside a DIFFERENT tree would otherwise silently act on the
+#        WRONG one. RP_ALLOW_ROOT_MISMATCH=1 overrides for deliberate
+#        cross-tree use.
 # --replace: `up` normally REFUSES to touch a session alias that already has a
 #        recorded pod id — even one that failed to answer SSH — rather than
 #        silently deploying a second pod under the same alias (that is how an
@@ -72,6 +88,7 @@
 #      RP_DISK_GB (60), RP_VOLUME_GB (0). Disk sizing rule of thumb: roughly
 #      25 GB base + 3 GB per concurrent agent target dir + 2 GB per
 #      `cargo mutants` job — a mutation-testing session wants >= 120 GB.
+#      RP_ALLOW_ROOT_MISMATCH (push/run/target only — see above).
 #
 # A running measurement is protected only by its own TTL — there is no way to
 # pause the sweep for one pod without touching every other pod's deadline
@@ -104,7 +121,8 @@ gpu-dev.sh — GPU development on RunPod
                                           (--shell for a plain prompt instead)
   run     [session] [--tree T] <cmd...>   run <cmd> detached under tmux, in <tree>
   logs    [session] [--tree T]            tail the detached job's output
-  push    [session] [--tree T]            rsync your working tree TO the pod's <tree>
+  push    [session] [--tree T]            rsync YOUR OWN checkout (this script's own on-disk
+                                          location, never $PWD) TO the pod's <tree>
   pull    [session] [--tree T] <path>     rsync <path> back FROM the pod's <tree>
   wait-seed [session] [--timeout SECS]    block until the pod's own build-substrate seed
                                           completes/fails/times out (never misreads an
@@ -136,6 +154,13 @@ arch: a100 (default) | l40s | h100 | a40 | l4
          OUTPUT directory, not the tree/checkout itself) — never a git
          worktree (a shared .git would couple trees that must diverge
          independently) and never git-cloned either way.
+push/run/target REFUSE (exit 2, naming both paths) when the current
+         directory's own git toplevel disagrees with REPO_ROOT (this
+         script's own on-disk location — a multi-worktree laptop invoking
+         one tree's script copy from inside a DIFFERENT tree would
+         otherwise silently push/run/target the WRONG one). Invoke that
+         tree's OWN copy of this script instead; RP_ALLOW_ROOT_MISMATCH=1
+         overrides for deliberate cross-tree use.
 --replace: `up` normally REFUSES (exit 2) a session alias that already has a
          recorded pod id, even an unreachable one, rather than silently
          deploying a second pod under the same alias. --replace overwrites only
@@ -192,6 +217,7 @@ Env: RUNPOD_API_KEY (or ~/.config/runpod/key), RP_IMAGE,
      ci/artifacts/pod-build-timings/ (src/seed/clone ≈ 3.6/7.8/8.1 GB). Add 3 GB per OTHER concurrent agent target
      dir + 2 GB per `cargo mutants` job — a mutation-testing session wants
      >= 120 GB (RP_DISK_GB=150).
+     RP_ALLOW_ROOT_MISMATCH (push/run/target only — see above).
 USAGE
   exit "${1:-2}"
 }
@@ -215,6 +241,41 @@ case "$CMD" in
     # Passing RP_TTL_HOURS here would impose THIS shell's limit on every pod.
     rp_sweep "${1:-}"
     exit $?
+    ;;
+esac
+
+# esc-056 (defect 2): REPO_ROOT above is derived from THIS SCRIPT'S OWN
+# on-disk location, never from the caller's $PWD — a laptop with more than
+# one checkout of this repo (a multi-worktree swarm: separate `git
+# worktree` checkouts, each with its own copy of this very script) can
+# invoke ONE tree's copy of gpu-dev.sh from INSIDE a DIFFERENT tree's
+# directory, and push/run/target would then silently act on the SCRIPT's
+# own tree (REPO_ROOT) — never the tree the caller believes they are
+# standing in. Observed live: M1b's pod legs initially validated the WRONG
+# tree via the main checkout's own script copy; the push-stamp's own
+# laptop_head field was the only tell. Fail closed rather than silently
+# doing the wrong thing: refuse when $PWD's own git toplevel names a
+# DIFFERENT root than REPO_ROOT, naming both paths and the fix (invoke that
+# tree's OWN copy of this script) — checked here, before require_pod/rp_init
+# ever contact the pod, exactly like the other usage-shape checks in this
+# file. A $PWD that is not itself a git checkout (git rev-parse fails, e.g.
+# a plain non-worktree "tree" directory on the LAPTOP side) falls back to a
+# raw string comparison against $PWD — still refuses on a genuine mismatch,
+# never silently "passes" for lack of a git answer. RP_ALLOW_ROOT_MISMATCH=1
+# opts into the mismatch deliberately (e.g. one tree's helper acting on
+# another tree's already-up pod session on purpose).
+case "$CMD" in
+  push|run|target)
+    if [ "${RP_ALLOW_ROOT_MISMATCH:-0}" != "1" ]; then
+      CWD_ROOT="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null || true)" # tripwire-ok: a $PWD that is not itself a git checkout is a valid, common state (a plain non-worktree "tree" directory) — the raw-$PWD fallback right below is what actually handles it, never a silent pass
+      CWD_ROOT="${CWD_ROOT:-$PWD}"
+      if [ "$CWD_ROOT" != "$REPO_ROOT" ]; then
+        echo "::error::this script's own location resolves to REPO_ROOT=${REPO_ROOT}, but the current directory resolves to ${CWD_ROOT} — '${CMD}' would silently act on ${REPO_ROOT}, NOT the tree you are standing in."
+        echo "::error::invoke THAT tree's own copy instead: ${CWD_ROOT}/ci/scripts/gpu-dev.sh ${CMD} ..."
+        echo "::error::deliberate cross-tree use: set RP_ALLOW_ROOT_MISMATCH=1 to override"
+        exit 2
+      fi
+    fi
     ;;
 esac
 
@@ -553,6 +614,23 @@ require_pod() {
   exit 1
 }
 
+# esc-056: a bootstrap failure ends this invocation before `rp_keep` is ever
+# called, so the EXIT trap's own best-effort `rp_terminate` (rp_cleanup,
+# runpod_lib.sh) is the ONLY thing standing between this pod and orphaned
+# billing — and that call throws its own response away by design (it also
+# runs on every ordinary exit, where a network hiccup must not turn a normal
+# teardown into a hard failure). Never a swallowed exit: name the pod id and
+# the session it is recorded under (the write-ahead record — see
+# rp_deploy_live's own doc in runpod_lib.sh — already has it on disk the
+# moment the pod exists, well before this can run) so a silently-failed trap
+# termination is still recoverable by hand. `shell` never reaches here with a
+# named session (RP_SESSION is force-cleared for it above), so this is
+# effectively `up`-only.
+report_pod_recorded() {
+  [ -n "${RP_SESSION:-}" ] && [ -n "${RP_POD_ID:-}" ] || return 0
+  echo "::error::pod ${RP_POD_ID} recorded under session '${RP_SESSION}'; run '$(basename "$0") down ${RP_SESSION}' to terminate"
+}
+
 # Bootstrap the pod, and decide what each outcome means. A pod on the wrong code
 # answers the wrong question convincingly, so a failed bootstrap ends the
 # session rather than handing you a shell on it.
@@ -570,11 +648,12 @@ bootstrap_or_die() {
     3) [ "$REF_EXPLICIT" = 0 ] || {
          echo "::error::--ref ${REF} cannot be honoured: ${RP_IMAGE} ships no git"
          echo "::error::terminating pod (trap)"
+         report_pod_recorded
          exit 1
        }
        echo "=== no checkout: this image ships no git, so the pod is on no ref ==="
        return 0 ;;
-    *) echo "::error::bootstrap failed — terminating pod (trap)"; exit 1 ;;
+    *) echo "::error::bootstrap failed — terminating pod (trap)"; report_pod_recorded; exit 1 ;;
   esac
 }
 
@@ -800,6 +879,17 @@ EOF
 
   push)
     require_pod; rp_keep
+    # esc-056: rsync creates only the LAST path component of its own
+    # destination — never a missing PARENT chain. On a fresh pod the very
+    # first `push --tree <name>` for a name that has never been pushed
+    # before failed outright ("mkdir ... No such file or directory") since
+    # nothing else on the pod provisions /root/trees itself. A bounded,
+    # idempotent remote `mkdir -p` on the tree's parent (rp_push_ensure_parent,
+    # runpod_lib.sh — the SAME rp_run_remote primitive every other
+    # pod-reaching verb here uses) runs BEFORE the rsync below, on every
+    # push, not just a tree's first.
+    rp_push_ensure_parent "$TREE_DIR" \
+      || { echo "::error::could not provision ${TREE_DIR%/*} on the pod before pushing"; exit 1; }
     # Ship the working tree, including uncommitted work, but never the local
     # build output — target/ is host-arch and would poison the pod's. The
     # exclude set is defined ONCE, in pod_push_stamp.sh, so the real rsync

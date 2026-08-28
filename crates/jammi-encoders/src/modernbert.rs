@@ -8829,6 +8829,22 @@ mod tests {
     /// block arm's `local_band`/`FusedAttentionMasks::local`.
     #[test]
     fn mem_efficient_attention_dispatches_with_a_local_window_and_no_materialized_band() {
+        // Pod-smoke fix (round 2): this test DISPATCHES fused, incrementing
+        // the process-wide `mem_efficient_attention` cascade counter —
+        // without this lock it can interleave with, and corrupt, ANY
+        // sibling test's own exact-delta assertion on that same counter
+        // (observed on real CUDA hardware, both A100 and L40S: higher
+        // parallelism there made the race land reliably, unlike this
+        // author's own lower-core-count local runs, where it never
+        // reproduced). `ATTENTION_BLOCK_COUNTER_TEST_LOCK` is reused here,
+        // not a new dedicated lock — the SAME "one shared lock guards every
+        // process-wide dispatch/cascade counter assertion in this file"
+        // precedent `padded_flash_decision_fires_the_cascade_fused_counter_before_the_cpu_stub_errors`
+        // already established for `attention_block_flash`'s OWN (distinct)
+        // cascade counter.
+        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let device = Device::Cpu;
         let (b, s, h, d) = (1usize, ATTENTION_BLOCK_MAX_SEQ + 1, 1usize, 8usize);
         let attn = memeff_fixture(true, h, d, s, Some(64), &device);
@@ -8925,6 +8941,16 @@ mod tests {
     /// actually produces).
     #[test]
     fn mem_efficient_attention_bf16_on_cpu_is_a_typed_refusal_not_a_panic() {
+        // Pod-smoke fix (round 2), same rationale as
+        // `mem_efficient_attention_dispatches_with_a_local_window_and_no_materialized_band`'s
+        // own comment: `mem_efficient_attention_predicate` does not
+        // consult dtype at all, so `admit_cascade` fires `fused` here
+        // BEFORE the op's own `cpu_fwd` refuses `BF16` — this test DOES
+        // touch the shared counter and must serialize against every other
+        // one that does.
+        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let device = Device::Cpu;
         let (b, s, h, d) = (1usize, ATTENTION_BLOCK_MAX_SEQ + 1, 1usize, 8usize);
         let attn = memeff_fixture(false, h, d, s, None, &device);
@@ -9007,6 +9033,15 @@ mod tests {
     #[test]
     fn mem_efficient_attention_disabled_child_process_body() {
         if std::env::var_os("MEM_EFFICIENT_DISABLED_CHILD").is_some() {
+            // Defensive, not strictly load-bearing: the spawning test's own
+            // `--exact` filter guarantees this is the ONLY test running in
+            // this fresh child process, so nothing else can race this
+            // counter here — held anyway for consistency with
+            // `op_disabled_padded_batch_child_process_body`'s identical
+            // precedent.
+            let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let device = Device::Cpu;
             let (b, s, h, d) = (1usize, ATTENTION_BLOCK_MAX_SEQ + 1, 1usize, 8usize);
             let attn = memeff_fixture(false, h, d, s, None, &device);

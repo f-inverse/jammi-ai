@@ -458,3 +458,16 @@ historical instance only as calibration.
   that imports nothing new would pass the dep gate. Candidate: a curated allow/deny list of governance
   verb-name stems (promote/retire/register/transition/gate/approve) as a grep tripwire feeding the
   auditor.
+
+## 2026-08-28 — the attention-backends train (M1b/M2/M3), operational lessons
+
+Recorded by the lead for future sessions; each cost at least one real round-trip.
+
+- **Pod-result provenance is a discipline, not a nicety.** `gpu-dev.sh` derives its tree from the SCRIPT's location; a lead invoking the wrong checkout's copy silently validated main instead of the branch — caught only by the push-stamp's `laptop_head`. Rule: read the stamp back after every push, before trusting any leg. (The substrate now refuses cwd/root mismatch — esc-056.)
+- **Never filter inside a pod job.** In-job `| grep`/`| tail` destroyed failure diagnostics three separate times (compile errors, panic text, a 66-line log for a full suite). The `.jammi.log` must hold full output; filter over ssh at read time. Corollary: pipelines swallow exit codes — read the wait-verb's `rc=` verdict line, never a piped RC.
+- **80GB-class oracle legs are a device-capability domain.** The encoder-level flash oracles (production-scale fwd+bwd, one arm ≈ 40-60GB) are structurally impossible on 48GB SKUs — proven by solo-run OOMs on an empty 46GB card after a serialization theory was refuted by its own test. The honest state is a named VRAM capability skip plus a per-arch/per-leg coverage table, not a fixture shrink (the fixture's scale IS what it proves).
+- **CUDA is bitwise deterministic per (arch, build).** 40 repeats, identical worst element, both Ada pods. Cross-run "flicker" of a violating element means the BUILD changed between runs. And sm86 vs sm89 select different cuBLAS accumulation kernels despite the identical smem tier — per-arch bounds derive from per-arch measurements (the K_MAX lesson's real generalization).
+- **Validated ⊆ compiled must be representable or it is not real.** Round-2 proved an unvalidated arch could join the compiled set with every test green; the fix (VALIDATED_SMS as a second single-source array every fence reads, divergence pinned by an env!-reading hermetic test that runs in the DEFAULT lane) is the pattern: an invariant asserted only under cfgs no lane runs is prose.
+- **Auditors should measure, and fixers should re-run the auditor's mutants.** The strongest rounds used tracking allocators and scratch-copy mutants on both sides; "verify by re-running the auditor's exact mutant — RED required" is the acceptance bar that made convergence fast (rounds shrank 5→4→3→1→0 findings). Known gate gap: check_doc_numbers_have_producers' regexes do not match MB/GB tokens — memory-model prose needs inline derivations until a tightening lands.
+- **Verdict hygiene**: the gate parses the LAST fenced json block of an agent's final message; several verdicts landed UNBOUND/UNPARSEABLE from formatting. Verifier dispatch prompts should demand the block last.
+- **Fleet economics**: rent all arches at once (seed wall = max, not sum); keep pods warm across phases with queued work (warmup, not idle dollars, is the cost); the failure case delta-pushes to all pods and reruns affected legs — still parallel.

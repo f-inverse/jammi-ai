@@ -192,6 +192,21 @@ fn requested_device_label(gpu_device: i32) -> String {
 /// driver via `gpu_inference::cuda_device_name` — the SAME in-process
 /// `cudarc` lookup that tier already performs, never a second,
 /// independently-drifting hardware-name query.
+///
+/// Naming `gpu_device` here (the REQUESTED ordinal) rather than re-reading
+/// the session's own resolved device is only honest because the silent-
+/// CPU-fallback state this would otherwise transcribe is UNREPRESENTABLE by
+/// the time this function runs (unit-62 audit round-4 F-C): `run()` threads
+/// `gpu_device` through `corpus_session_on_device`, which sets
+/// `gpu.require_gpu = gpu_device >= 0` on the session's `GpuConfig`; a `-cuda
+/// N` leg whose ordinal the box cannot actually satisfy fails the FIRST
+/// model load (`CandleBackend::load`'s `select_device(device_config)?`,
+/// `backend/candle.rs`'s `gpu_unavailable` returning a typed
+/// `JammiError::Gpu`) inside `run()`'s warmup loop — well before this
+/// function is ever reached. So on every path that DOES reach here,
+/// requested ordinal and actually-resolved device are the same value by
+/// construction: there is no code path left in which `gpu_device` names a
+/// CUDA ordinal the run did not truly execute on.
 fn resolved_device_name(gpu_device: i32) -> Result<String, Box<dyn std::error::Error>> {
     if gpu_device < 0 {
         Ok("cpu".to_string())
@@ -225,6 +240,16 @@ fn checkpoint_pooling_sha256(
 /// tokenize the corpus for real to measure `seq`/`row_lengths`, serve the
 /// embed verb `warmup + iters` times through the real engine path, and
 /// assemble the identity-audited [`EncodeStepTier`].
+///
+/// On a `--cuda N` leg (`params.gpu_device >= 0`) whose ordinal the box
+/// cannot actually satisfy, this returns `Err` — never an `Ok(EncodeStepTier)`
+/// carrying a `device_name` for hardware the run never touched (unit-62 audit
+/// round-4 F-C): [`corpus_session_on_device`] sets `gpu.require_gpu = true`
+/// for that leg, so the FIRST model load inside the warmup loop below fails
+/// with a typed `JammiError::Gpu` instead of `select_device` silently
+/// degrading to `Device::Cpu`. See [`resolved_device_name`]'s own doc for why
+/// this makes `device_name` trustworthy on every path that DOES reach the end
+/// of this function.
 pub async fn run(params: EncodeStepParams) -> Result<EncodeStepTier, Box<dyn std::error::Error>> {
     let scratch = ModelInferenceSpec {
         row_count: params.row_count,
@@ -598,6 +623,60 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
         assert_eq!(value["pooling_mode_mean_tokens"], serde_json::json!(true));
         assert_eq!(value["pooling_mode_cls_token"], serde_json::json!(false));
+    }
+
+    /// unit-62 audit round-4 F-C teeth: a `--cuda N` leg (`gpu_device >= 0`)
+    /// on a box with no usable CUDA device must REFUSE with a typed error
+    /// rather than silently degrading to `Device::Cpu` and publishing
+    /// `device_requested:"cuda:0"` plus a real `device_name` for a run that
+    /// actually executed on CPU (encode_step.rs:195-201's pre-fix shape:
+    /// `resolved_device_name` queried `cuda_device_name` off the REQUESTED
+    /// ordinal alone, with nothing upstream enforcing that the session had
+    /// actually resolved CUDA). This test runs on the CPU-hermetic default
+    /// build (`not(feature = "cuda")`) — a box with no CUDA backend compiled
+    /// in is exactly the "GPU-less box" this refusal must hold on, so it
+    /// exercises the real `require_gpu` failure mode with no mocking.
+    /// `#[cfg(not(feature = "cuda"))]` mirrors `GpuScheduler`'s own
+    /// `for_device_falls_back_to_unlimited_when_probe_fails`: a `cuda`-feature
+    /// build with a real device at ordinal 0 would legitimately succeed here,
+    /// which is a different (valid) case this test is not about.
+    #[cfg(not(feature = "cuda"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cuda_leg_on_a_gpu_less_box_refuses_and_emits_no_report() {
+        let params = EncodeStepParams {
+            gpu_device: 0,
+            ..TEST_PARAMS
+        };
+        let err = run(params).await.expect_err(
+            "a --cuda 0 leg on a box with no usable CUDA device must refuse (typed error), \
+             never silently serve on CPU and emit a report",
+        );
+        // The typed refusal threaded via `corpus_session_on_device`'s
+        // `require_gpu = gpu_device >= 0` (`gpu_unavailable`'s
+        // `JammiError::Gpu`, `#[error("GPU error: {0}")]`, message contains
+        // "GPU required") — not some unrelated failure (a missing fixture, a
+        // tokenizer error) that would also make this test spuriously pass.
+        let message = err.to_string();
+        assert!(
+            message.contains("GPU required"),
+            "expected the typed require_gpu refusal (JammiError::Gpu), got: {message}"
+        );
+    }
+
+    /// The CPU-hermetic default path's own smoke stays green under the same
+    /// `require_gpu` change: `gpu_device < 0` computes `require_gpu = false`
+    /// in `corpus_session_on_device`, so `Device::Cpu` resolves unconditionally
+    /// and `run()` still succeeds end to end — this is the negative control
+    /// for [`cuda_leg_on_a_gpu_less_box_refuses_and_emits_no_report`], proving
+    /// the fail-fast is specific to `gpu_device >= 0` and never fires on the
+    /// default leg.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cpu_hermetic_default_leg_still_succeeds_after_the_require_gpu_fix() {
+        let tier = run(TEST_PARAMS)
+            .await
+            .expect("the CPU-hermetic default (gpu_device = -1) must still succeed");
+        assert_eq!(tier.device_requested, "cpu");
+        assert_eq!(tier.device_name, "cpu");
     }
 
     #[test]

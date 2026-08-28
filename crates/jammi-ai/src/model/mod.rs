@@ -335,6 +335,31 @@ impl LoadedModel {
         }
     }
 
+    /// The model's content digest (esc-057, K7): a SHA-256 fold of the
+    /// resolved model directory's config / `1_Pooling/config.json` /
+    /// tokenizer / weights bytes, computed once at load time by
+    /// `backend::candle::compute_model_content_digest`. Output-affecting
+    /// (two directories that share one `model_id` but differ in any of those
+    /// bytes must never collide on one `DefinitionHash`), so the
+    /// materialization contract folds it into `ModelIdentity.content_digest`
+    /// alongside `backend_kind` / `compute_precision`.
+    ///
+    /// The ORT backend never actually reaches a loaded state today
+    /// (`OrtBackend::load` unconditionally errors — see `forward`'s identical
+    /// stance below) — there is no local-directory digest to report for it,
+    /// and `ModelContentDigest::Unavailable` is reserved for the
+    /// external-producer import path (a categorically different "no local
+    /// files at all" case), so this returns a typed refusal rather than
+    /// misusing that reason.
+    pub fn content_digest(&self) -> Result<jammi_db::store::manifest::ModelContentDigest> {
+        match self {
+            LoadedModel::Candle(m) => Ok(m.content_digest.clone()),
+            LoadedModel::Ort(_) => Err(JammiError::Inference(
+                "ORT content digest not available in this build".into(),
+            )),
+        }
+    }
+
     /// Estimate GPU memory for one inference batch.
     pub fn estimate_batch_memory(&self, batch_size: usize, seq_len: usize) -> usize {
         match self {

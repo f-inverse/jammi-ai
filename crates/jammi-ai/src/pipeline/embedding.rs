@@ -66,6 +66,7 @@ impl<'a> EmbeddingPipeline<'a> {
             .ok_or_else(|| JammiError::Inference("Model does not support embeddings".into()))?;
         let backend_kind = guard.model.backend_kind();
         let compute_precision = guard.model.compute_precision();
+        let content_digest = guard.model.content_digest()?;
         drop(guard);
 
         // The materialization contract is knowable here — the model is loaded
@@ -88,6 +89,7 @@ impl<'a> EmbeddingPipeline<'a> {
                 model_id: canonical_model_id.clone(),
                 backend: backend_kind.to_string(),
                 compute_precision,
+                content_digest,
             }],
         );
         let inputs = vec![jammi_db::store::manifest::InputAnchor::unpinned_at_instant(

@@ -23,14 +23,20 @@ use jammi_db::catalog::Catalog;
 use jammi_encoders::{Bert, BertConfig, Pooling};
 use tempfile::tempdir;
 
-const TINY_BERT_FILES: [&str; 3] = ["config.json", "model.safetensors", "tokenizer.json"];
+// `pub(crate)`: `tests/it/content_digest.rs` (esc-057's fix test, `closes_escape:
+// esc-057`) reuses this exact fixture-copy helper to build/mutate model dirs
+// through the identical live resolve→load path this file already exercises,
+// rather than a second, independently-drifting copy of the same fixture-
+// staging logic.
+pub(crate) const TINY_BERT_FILES: [&str; 3] =
+    ["config.json", "model.safetensors", "tokenizer.json"];
 const TEXT: &str = "the quick brown fox jumps over the lazy dog";
 
 /// Copy the hermetic `tiny_bert` fixture's weights/config/tokenizer into
 /// `dst`, then optionally write a `1_Pooling/config.json` declaring
 /// `pooling_flags`. `None` reproduces a bare BERT repo that ships no
 /// `1_Pooling/` subfolder at all.
-fn build_local_model_dir(dst: &Path, pooling_flags: Option<&serde_json::Value>) {
+pub(crate) fn build_local_model_dir(dst: &Path, pooling_flags: Option<&serde_json::Value>) {
     std::fs::create_dir_all(dst).unwrap();
     let fixture = jammi_test_utils::cookbook_fixture("tiny_bert");
     for name in TINY_BERT_FILES {
@@ -47,7 +53,8 @@ fn build_local_model_dir(dst: &Path, pooling_flags: Option<&serde_json::Value>) 
     }
 }
 
-fn cls_pooling_config() -> serde_json::Value {
+// `pub(crate)`: shared with `tests/it/content_digest.rs` — see `TINY_BERT_FILES`'s doc.
+pub(crate) fn cls_pooling_config() -> serde_json::Value {
     serde_json::json!({
         "pooling_mode_cls_token": true,
         "pooling_mode_mean_tokens": false,
@@ -58,7 +65,8 @@ fn cls_pooling_config() -> serde_json::Value {
     })
 }
 
-fn mean_pooling_config() -> serde_json::Value {
+// `pub(crate)`: shared with `tests/it/content_digest.rs` — see `TINY_BERT_FILES`'s doc.
+pub(crate) fn mean_pooling_config() -> serde_json::Value {
     serde_json::json!({
         "pooling_mode_cls_token": false,
         "pooling_mode_mean_tokens": true,
@@ -70,8 +78,10 @@ fn mean_pooling_config() -> serde_json::Value {
 }
 
 /// Resolve + load `dir` through the live engine path: `ModelResolver::resolve`
-/// (local) → `CandleBackend::load`.
-async fn resolve_and_load(dir: &Path) -> LoadedModel {
+/// (local) → `CandleBackend::load`. `pub(crate)`: shared with
+/// `tests/it/content_digest.rs` (esc-057's fix test) — see `TINY_BERT_FILES`'s
+/// doc.
+pub(crate) async fn resolve_and_load(dir: &Path) -> LoadedModel {
     let catalog_dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
     let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();

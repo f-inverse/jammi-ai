@@ -181,9 +181,10 @@ impl MaterializationEnv {
     }
 }
 
-/// The identity + backend kind + compute precision of a model an environment
-/// invoked. The canonical model id (HF repo or local path string) plus the
-/// backend kind that ran it and the dtype it ran at.
+/// The identity + backend kind + compute precision + content digest of a
+/// model an environment invoked. The canonical model id (HF repo or local
+/// path string) plus the backend kind that ran it, the dtype it ran at, and a
+/// digest of the model's on-disk content.
 ///
 /// `compute_precision` folds in here — the same place `backend` does — rather
 /// than into a single per-descriptor field, so it enters the definition hash
@@ -193,6 +194,17 @@ impl MaterializationEnv {
 /// remember its own precision field. An `F16` run of a model is output-
 /// affecting relative to an `F32` run of the same model over the same input —
 /// two such runs must never collide on one materialization identity.
+///
+/// `content_digest` folds in the SAME way, for the SAME reason (esc-057):
+/// pooling strategy (`1_Pooling/config.json`), tokenizer files, and model
+/// weights are all output-affecting relative to the bare `model_id` string —
+/// two directories that share one HF repo id but differ in any of those bytes
+/// must never collide on one `DefinitionHash`. Folding one combined
+/// [`ModelContentDigest`] here (rather than a bespoke pooling/tokenizer/
+/// weights field on `ProducingDescriptor::Embedding`) keeps the determinant
+/// uniform across every model-producing variant, exactly like
+/// `compute_precision` above — `Inference` would otherwise collide on it
+/// identically.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelIdentity {
     /// Canonical model id as stored in `result_tables.model_id`.
@@ -203,6 +215,56 @@ pub struct ModelIdentity {
     /// `config.json` override, or the global `GpuConfig::compute_precision`
     /// default).
     pub compute_precision: ComputePrecision,
+    /// A digest of the model's on-disk content (config + pooling config +
+    /// tokenizer files + weights), or the typed reason none could be
+    /// computed. See [`ModelContentDigest`] for why this is not a bare
+    /// `Option<String>`.
+    pub content_digest: ModelContentDigest,
+}
+
+/// A model's content digest — the [`ModelIdentity`] determinant that closes
+/// esc-057: a `model_id` string alone does not change when the referenced
+/// directory's `1_Pooling/config.json`, tokenizer files, or weights bytes
+/// change, so two genuinely different models could otherwise collide on one
+/// [`DefinitionHash`]. A loader computes this once per model load — SHA-256
+/// over the model's config, `1_Pooling/config.json`, tokenizer files, and
+/// weights bytes — and threads it into every `ModelIdentity` it builds.
+///
+/// Deliberately **not** a bare `Option<String>`: an external-producer import
+/// (`ProducingDescriptor::External`-adjacent rows built by
+/// `pipeline::import`) has no local model directory to hash, and that
+/// "no digest" state must say WHY, typed, so a reader can tell "genuinely no
+/// content to hash" from "the loader forgot to compute one" — the same
+/// question a bare `Option::None` can never answer once constructed. This is
+/// the digest's complete presence lattice, expressed as one closed sum type
+/// rather than an `Option<T>` field paired with a second, independently
+/// omittable reason field (a "None carries a typed reason, never a silent
+/// default" contract that a companion field could silently violate by being
+/// left `None` itself).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", content = "value", rename_all = "snake_case")]
+pub enum ModelContentDigest {
+    /// SHA-256 hex digest of the model's on-disk content, computed once per
+    /// model load.
+    Sha256(String),
+    /// No digest could be computed for this model invocation, with the
+    /// typed reason why.
+    Unavailable(ModelContentDigestUnavailableReason),
+}
+
+/// Why a [`ModelContentDigest`] is [`ModelContentDigest::Unavailable`] for a
+/// given model invocation. A closed enum (not a free-form string) so a new
+/// reason is a reviewed, compiler-visible addition, and so downstream
+/// matching (e.g. an audit that should only ever see `ExternalImport`) breaks
+/// loudly at compile time if a second reason is ever added without being
+/// handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelContentDigestUnavailableReason {
+    /// The model reached this environment through the external-producer
+    /// import path (`pipeline::import`), which has no local model directory
+    /// — no config, pooling config, tokenizer, or weights files — to hash.
+    ExternalImport,
 }
 
 /// A canonical, deterministically-serialisable description of the verb that
@@ -1040,6 +1102,7 @@ mod tests {
                 model_id: "sentence-transformers/all-MiniLM-L6-v2".into(),
                 backend: "candle".into(),
                 compute_precision: ComputePrecision::F32,
+                content_digest: ModelContentDigest::Sha256("cpu-fixture-digest".into()),
             }],
         )
     }
@@ -1126,6 +1189,7 @@ mod tests {
                     model_id: "sentence-transformers/all-MiniLM-L6-v2".into(),
                     backend: "candle".into(),
                     compute_precision: ComputePrecision::F32,
+                    content_digest: ModelContentDigest::Sha256("cpu-fixture-digest".into()),
                 }],
             ),
         )
@@ -1155,6 +1219,7 @@ mod tests {
                 model_id: "sentence-transformers/all-MiniLM-L12-v2".into(),
                 backend: "candle".into(),
                 compute_precision: ComputePrecision::F32,
+                content_digest: ModelContentDigest::Sha256("cpu-fixture-digest".into()),
             }],
         );
         assert_ne!(base, definition_hash(&d, &other_model).unwrap());
@@ -1183,6 +1248,7 @@ mod tests {
                 model_id: "distilbert-base-uncased-finetuned-sst-2-english".into(),
                 backend: "candle".into(),
                 compute_precision: ComputePrecision::F32,
+                content_digest: ModelContentDigest::Sha256("cpu-fixture-digest".into()),
             }],
         );
         let f16_env = MaterializationEnv::new(
@@ -1191,6 +1257,7 @@ mod tests {
                 model_id: "distilbert-base-uncased-finetuned-sst-2-english".into(),
                 backend: "candle".into(),
                 compute_precision: ComputePrecision::F16,
+                content_digest: ModelContentDigest::Sha256("cpu-fixture-digest".into()),
             }],
         );
         assert_ne!(
@@ -1199,6 +1266,145 @@ mod tests {
             "F32 and F16 runs of the same model over the same Inference descriptor \
              must never collide on one materialization identity"
         );
+    }
+
+    /// K7/esc-057: `content_digest` folds into `ModelIdentity` (part of
+    /// `MaterializationEnv`) the same way `compute_precision` does — two
+    /// identities that differ ONLY in the model's content digest (same
+    /// `model_id`, `backend`, `compute_precision`) must never collide on one
+    /// `DefinitionHash`. This is the regression guard for the live esc-057
+    /// defect: a `model_id` string alone does not change when the referenced
+    /// directory's pooling config / tokenizer / weights bytes change.
+    #[test]
+    fn different_content_digest_changes_the_hash() {
+        let d = embedding_descriptor();
+        let base = definition_hash(&d, &cpu_env()).unwrap();
+
+        let mut other_digest = cpu_env();
+        other_digest.models[0].content_digest =
+            ModelContentDigest::Sha256("a-different-digest".into());
+        assert_ne!(
+            base,
+            definition_hash(&d, &other_digest).unwrap(),
+            "two ModelIdentity values differing only in content_digest must never \
+             collide on one DefinitionHash (esc-057)"
+        );
+    }
+
+    /// None-vs-Some: an `Unavailable` content digest (the external-producer
+    /// import path, which has no local model directory to hash) must hash
+    /// differently from a `Sha256` digest recorded for the identical
+    /// `model_id`/`backend`/`compute_precision` — the typed "no digest"
+    /// reason is itself part of the identity, never a value that silently
+    /// collides with a real digest.
+    #[test]
+    fn unavailable_content_digest_differs_from_present_digest() {
+        let d = embedding_descriptor();
+        let present = definition_hash(&d, &cpu_env()).unwrap();
+
+        let mut unavailable_env = cpu_env();
+        unavailable_env.models[0].content_digest =
+            ModelContentDigest::Unavailable(ModelContentDigestUnavailableReason::ExternalImport);
+        let unavailable = definition_hash(&d, &unavailable_env).unwrap();
+
+        assert_ne!(
+            present, unavailable,
+            "a present content_digest and an Unavailable one must hash differently"
+        );
+    }
+
+    /// Determinism family, extended to the `Unavailable` arm: two runs over
+    /// an environment whose model content digest is `Unavailable` (not just
+    /// the `Sha256`-carrying arm `definition_hash_is_deterministic` already
+    /// covers) must hash identically.
+    #[test]
+    fn definition_hash_is_deterministic_with_unavailable_content_digest() {
+        let d = embedding_descriptor();
+        let mut env = cpu_env();
+        env.models[0].content_digest =
+            ModelContentDigest::Unavailable(ModelContentDigestUnavailableReason::ExternalImport);
+        assert_eq!(
+            definition_hash(&d, &env).unwrap(),
+            definition_hash(&d, &env).unwrap()
+        );
+    }
+
+    /// The `ModelIdentity` fold is exhaustive-by-type: `model_identity_from_fields`
+    /// destructures `ModelIdentityFields` and reconstructs `ModelIdentity` by
+    /// named field, with no `..` elision on either side — a field added to
+    /// either struct without a matching update on the other breaks this
+    /// function's compilation, so the fixture can never silently go stale
+    /// relative to the real type. Every field then gets its own non-default
+    /// mutation asserted to move the hash (the non-vacuity guard the
+    /// NeighborGraph/GraphPropagation/ContextSet families above already use),
+    /// covering `content_digest`'s two states (`Sha256` and `Unavailable`)
+    /// alongside `model_id`/`backend`/`compute_precision`.
+    #[derive(Clone)]
+    struct ModelIdentityFields {
+        model_id: String,
+        backend: String,
+        compute_precision: ComputePrecision,
+        content_digest: ModelContentDigest,
+    }
+
+    fn model_identity_from_fields(p: &ModelIdentityFields) -> ModelIdentity {
+        let ModelIdentityFields {
+            model_id,
+            backend,
+            compute_precision,
+            content_digest,
+        } = p.clone();
+        ModelIdentity {
+            model_id,
+            backend,
+            compute_precision,
+            content_digest,
+        }
+    }
+
+    fn env_with_model(identity: ModelIdentity) -> MaterializationEnv {
+        MaterializationEnv::new(ComputeDevice::Cpu, vec![identity])
+    }
+
+    #[test]
+    fn model_identity_each_field_moves_the_hash() {
+        let base = ModelIdentityFields {
+            model_id: "sentence-transformers/all-MiniLM-L6-v2".into(),
+            backend: "candle".into(),
+            compute_precision: ComputePrecision::F32,
+            content_digest: ModelContentDigest::Sha256("base-digest".into()),
+        };
+        let d = embedding_descriptor();
+        let base_hash =
+            definition_hash(&d, &env_with_model(model_identity_from_fields(&base))).unwrap();
+
+        let cases: &[LabelledMutation<ModelIdentityFields>] = &[
+            ("model_id", |p| {
+                p.model_id = "sentence-transformers/all-MiniLM-L12-v2".into()
+            }),
+            ("backend", |p| p.backend = "ort".into()),
+            ("compute_precision", |p| {
+                p.compute_precision = ComputePrecision::F16
+            }),
+            ("content_digest (different Sha256)", |p| {
+                p.content_digest = ModelContentDigest::Sha256("other-digest".into())
+            }),
+            ("content_digest (Unavailable)", |p| {
+                p.content_digest = ModelContentDigest::Unavailable(
+                    ModelContentDigestUnavailableReason::ExternalImport,
+                )
+            }),
+        ];
+        for (label, mutate) in cases {
+            let mut changed = base.clone();
+            mutate(&mut changed);
+            let changed_hash =
+                definition_hash(&d, &env_with_model(model_identity_from_fields(&changed))).unwrap();
+            assert_ne!(
+                base_hash, changed_hash,
+                "changing ModelIdentity `{label}` must change the definition hash"
+            );
+        }
     }
 
     #[test]

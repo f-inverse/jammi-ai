@@ -178,7 +178,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock, RwLock};
+use std::sync::{LazyLock, Mutex, OnceLock, RwLock};
 
 use candle_core::Device;
 
@@ -1068,6 +1068,79 @@ pub const FLASH_COMPILED: bool = cfg!(feature = "flash-attn");
 /// build this crate can produce.
 pub const CUDA_COMPILED: bool = cfg!(feature = "cuda");
 
+/// Parses a comma-joined `JAMMI_FLASH_GENCODE_SMS`-shaped value (e.g.
+/// `"80,86,89,90"`) into the compute capabilities it names, in the SAME
+/// order the comma list gives them. Panics on a malformed token — mirrors
+/// `crate::flash`'s own per-token parser's "this is compile-time-pinned
+/// `build.rs` output, not untrusted user input" contract: a malformed
+/// value here can only mean `build.rs` and this function have drifted,
+/// which must fail loud, not silently produce an empty or partial set.
+/// Pure and free of any env/feature read — [`flash_built_arches`] is the
+/// only caller, and it is what decides WHETHER to call this at all.
+fn parse_gencode_sms(sms: &str) -> Vec<ComputeCapability> {
+    sms.split(',')
+        .map(|sm| {
+            if sm.len() < 2 || !sm.chars().all(|c| c.is_ascii_digit()) {
+                panic!(
+                    "jammi-kernels admission: JAMMI_FLASH_GENCODE_SMS token {sm:?} is not at \
+                     least two ASCII digits — build.rs and admission.rs have drifted"
+                );
+            }
+            let split = sm.len() - 1;
+            let (major_s, minor_s) = sm.split_at(split);
+            let major: usize = major_s.parse().unwrap_or_else(|_| {
+                panic!(
+                    "jammi-kernels admission: JAMMI_FLASH_GENCODE_SMS token {sm:?}: major \
+                     digits {major_s:?} do not parse as usize"
+                )
+            });
+            let minor: usize = minor_s.parse().unwrap_or_else(|_| {
+                panic!(
+                    "jammi-kernels admission: JAMMI_FLASH_GENCODE_SMS token {sm:?}: minor \
+                     digit {minor_s:?} does not parse as usize"
+                )
+            });
+            ComputeCapability::new(major, minor)
+        })
+        .collect()
+}
+
+/// The full set of compute capabilities `build.rs::build_flash_attn`
+/// compiled native cubins for — parsed from `JAMMI_FLASH_GENCODE_SMS`
+/// (`cargo:rustc-env`, emitted UNCONDITIONALLY by `build.rs::main` in
+/// every feature configuration, so `env!()` always compiles regardless of
+/// this crate's own feature set — see that emission's own doc comment).
+///
+/// Returns `&[]` whenever [`FLASH_COMPILED`] is `false`: even though the
+/// env var is always PRESENT (it is a `build.rs`-time string, never itself
+/// feature-gated), an arch this build never actually compiled a cubin for
+/// is not "built" in any sense a caller should trust — this mirrors
+/// [`FLASH_COMPILED`]'s own "truthful in every cfg" contract (a plain,
+/// unconditionally-compiled accessor whose ANSWER still reflects the real
+/// feature state, M3 plan v2 delta 3) rather than [`CUDA_COMPILED`]-style
+/// blind trust in a string that may not correspond to anything this build
+/// actually produced.
+///
+/// `admitted != compiled` in general (M3 plan D4): an arch appears here
+/// the moment its `-gencode` pair exists in `build.rs`, before any pod
+/// parity leg has run on real hardware of that arch. A caller that needs
+/// "compiled AND VALIDATED" reads `third_party/flash-attention/VENDORED.md`'s
+/// "Supported archs" table for the current per-arch validation status —
+/// this function alone answers "compiled", not "safe to dispatch to
+/// today". `crate::flash::check_arch` and every fence site in
+/// `jammi-encoders`/`jammi-bench` that reads this function are the
+/// enforcement points; this is the single shared SOURCE for what set they
+/// enforce membership in.
+pub fn flash_built_arches() -> &'static [ComputeCapability] {
+    static ARCHES: LazyLock<Vec<ComputeCapability>> =
+        LazyLock::new(|| parse_gencode_sms(env!("JAMMI_FLASH_GENCODE_SMS")));
+    if FLASH_COMPILED {
+        ARCHES.as_slice()
+    } else {
+        &[]
+    }
+}
+
 /// The op-keyed dispatch-counter registry: one process-wide table from an
 /// op's name to its `DispatchCounters`. See the module doc's "op-keyed
 /// dispatch-counter registry" section for why this exists alongside (not
@@ -1134,6 +1207,47 @@ mod tests {
         assert!(ComputeCapability::new(8, 6).meets_minimum());
         assert!(!ComputeCapability::new(7, 5).meets_minimum());
         assert!(!ComputeCapability::new(0, 0).meets_minimum());
+    }
+
+    /// [`flash_built_arches`] pins the CURRENT `build.rs::GENCODE_ARCHES`
+    /// set exactly when `FLASH_COMPILED` (this crate's own default test
+    /// build never sets the `flash-attn` feature, so this branch is the
+    /// one every hermetic CI/laptop run actually exercises), and — under
+    /// EITHER branch — every member that IS present satisfies
+    /// [`MIN_CUDA_COMPUTE_CAP`], with `(8, 0)` as the floor: "sm80 is the
+    /// true floor" is an assertion here, not merely a comment, so a future
+    /// edit that adds a pre-Ampere arch to `GENCODE_ARCHES` (which would
+    /// be a genuine regression — bf16 tensor cores need Ampere or newer)
+    /// fails this test rather than silently widening admission below the
+    /// floor `MIN_CUDA_COMPUTE_CAP` states everywhere else.
+    #[test]
+    fn flash_built_arches_matches_the_pinned_gencode_set_and_meets_the_floor() {
+        let arches = flash_built_arches();
+        if !FLASH_COMPILED {
+            assert!(
+                arches.is_empty(),
+                "flash-attn not compiled: flash_built_arches() must be empty, not {arches:?}"
+            );
+            return;
+        }
+        let want = [
+            ComputeCapability::new(8, 0),
+            ComputeCapability::new(8, 6),
+            ComputeCapability::new(8, 9),
+            ComputeCapability::new(9, 0),
+        ];
+        assert_eq!(arches, want);
+        for arch in arches {
+            assert!(
+                arch.meets_minimum(),
+                "{arch:?} must meet MIN_CUDA_COMPUTE_CAP -- every compiled arch is Ampere-or-newer"
+            );
+        }
+        assert_eq!(
+            arches.iter().min().copied(),
+            Some(ComputeCapability::new(8, 0)),
+            "sm80 is the true floor of the compiled set"
+        );
     }
 
     #[test]

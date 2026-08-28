@@ -35,8 +35,8 @@ use candle_core::{DType, Device, Module, Tensor, D};
 use candle_nn::{embedding, linear_no_bias, Embedding, VarBuilder, VarMap};
 use jammi_kernels::admission::{
     admission_mode, admit, admit_cascade, cascade_counters_for, counters_for, device_is_supported,
-    op_disabled, probe_cuda_compute_capability, CascadeOutcome, ComputeCapability,
-    DispatchCounters, DispatchOutcome, PredicateOutcome,
+    flash_built_arches, op_disabled, probe_cuda_compute_capability, CascadeOutcome,
+    ComputeCapability, DispatchCounters, DispatchOutcome, PredicateOutcome,
 };
 use jammi_kernels::ops::{
     apply1, apply2, apply3, AttentionBlockFused, FullyMaskedPolicy, RopeFused, SoftmaxLastDimFused,
@@ -1727,19 +1727,49 @@ impl ModernBertMlp {
 /// commit threads).
 const FLASH_HEAD_DIM: usize = 64;
 
-/// The exact CUDA compute capability the flash cascade admits — sm_80
-/// ONLY: an EXACT match, never `>=`, because the vendored kernel is
-/// compiled for sm_80 alone, so admitting sm_86/89/90 as well would crash
-/// at launch rather than run. A stub this crate OWNS until B1 lands its
-/// own build-time `FLASH_COMPUTE_CAP` constant
-/// (`crates/jammi-kernels/build.rs`'s planned `JAMMI_FLASH_GENCODE_SM`);
-/// this function is the seam B1's real `check_arch`-equivalent plugs into.
+/// The CUDA compute capability set the flash cascade admits — MEMBERSHIP
+/// in [`flash_built_arches`] (`jammi_kernels::admission`'s own reader for
+/// `build.rs`'s compiled `-gencode` set: sm80/86/89/90 today), never `>=`
+/// and never major-compat. Membership is exact and enumerated (M3 plan
+/// D2): admitting a capability outside the compiled set would either fail
+/// the CUDA driver's module load (a genuinely newer major the driver has
+/// no SASS for at all, e.g. a hypothetical sm100 — SASS is NOT
+/// forward-compatible across majors) or, for a minor the driver COULD
+/// SASS-forward from (an untested sibling minor within an already-admitted
+/// major), silently run bytes this crate never validated on real hardware
+/// (M3 plan D1's per-arch parity-leg invariant: compiled == admitted only
+/// once a green pod leg exists for that EXACT arch).
+///
+/// An earlier revision of this doc claimed a device above sm80 "would
+/// crash at launch" unconditionally; that was WRONG in general — SASS
+/// minor-version forward compatibility is real (upstream FlashAttention-2
+/// wheels routinely serve 8.6/8.9 devices with sm80-only SASS,
+/// `third_party/flash-attention/VENDORED.md`'s "Supported archs" section
+/// has the corrected mechanism note) — but jammi does not lean on that
+/// forward-compat path here: every admitted arch gets its OWN native
+/// compiled cubin and its OWN pod parity leg, so membership stays a
+/// simple, auditable set-equality check rather than a two-rule
+/// (compiled-set OR major-compat) fence.
+///
 /// Uses the SAME [`probe_cuda_compute_capability`] every other admission
 /// predicate in this crate/`jammi-kernels` reads (`None` — non-CUDA, or
 /// `cuda` feature off, or a query failure — degrades to `false`, never a
 /// panic or a silently-wrong "yes").
 fn flash_arch_ok(device: &Device) -> bool {
-    probe_cuda_compute_capability(device) == Some(ComputeCapability::new(8, 0))
+    arch_admitted(probe_cuda_compute_capability(device), flash_built_arches())
+}
+
+/// Pure core of [`flash_arch_ok`]: `probed` (already resolved by
+/// [`probe_cuda_compute_capability`]) is admitted iff it names a member of
+/// `built` — threaded as a parameter, not read from [`flash_built_arches`]
+/// directly, so this is unit-testable against a literal `built` slice
+/// without a real CUDA device (the same probe/pure-core split
+/// `jammi_kernels::flash::arch_mismatch` uses).
+fn arch_admitted(probed: Option<ComputeCapability>, built: &[ComputeCapability]) -> bool {
+    match probed {
+        Some(cap) => built.contains(&cap),
+        None => false,
+    }
 }
 
 /// How many times this process has paid the flash cascade's device-side
@@ -2003,8 +2033,9 @@ fn compute_lengths_and_prefix(mask: &Tensor) -> Result<(Vec<usize>, bool), Encod
 }
 
 /// The flash cascade's own admission predicate (contract v4 §3.2's
-/// consulted terms): device is CUDA and arch EXACTLY `(8, 0)`
-/// ([`flash_arch_ok`]), backbone dtype `BF16`, `head_dim ==
+/// consulted terms): device is CUDA and arch is a MEMBER of
+/// `jammi_kernels::admission::flash_built_arches()` ([`flash_arch_ok`]),
+/// backbone dtype `BF16`, `head_dim ==
 /// `[`FLASH_HEAD_DIM`]``, `flash-attn` compiled (`cfg!` TERM — L10, a
 /// [`PredicateOutcome::CapabilityMiss`], never `#[cfg]` on the call site),
 /// and the batch's mask is a prefix mask with every row length `>= 1`
@@ -2089,7 +2120,11 @@ fn flash_capability_gates(
         return Some((PredicateOutcome::CapabilityMiss, "device_is_cuda", None));
     }
     if !flash_arch_ok(device) {
-        return Some((PredicateOutcome::CapabilityMiss, "arch_is_sm80_exact", None));
+        return Some((
+            PredicateOutcome::CapabilityMiss,
+            "arch_in_flash_compiled_set",
+            None,
+        ));
     }
     if dtype != DType::BF16 {
         return Some((PredicateOutcome::DomainMiss, "dtype_is_bf16", None));
@@ -3134,6 +3169,34 @@ mod tests {
         assert!(!flash_arch_ok(&Device::Cpu));
     }
 
+    /// The membership half [`flash_arch_ok_rejects_cpu`] does not cover:
+    /// every capability [`flash_built_arches`] actually reports IS admitted
+    /// (via the pure [`arch_admitted`] core, so this needs no real CUDA
+    /// device — see that function's own doc). On this crate's own default
+    /// test build (`flash-attn` off), `flash_built_arches()` is `&[]`
+    /// (M3 plan v2 delta 3), so the loop below is vacuous here and the
+    /// meaningful assertion is the second half: a capability PROVABLY
+    /// outside today's compiled set (one major below the enumerated floor)
+    /// is never admitted. On a `flash-attn`-compiled build (pod-only), the
+    /// loop exercises the real, non-empty set.
+    #[test]
+    fn flash_arch_ok_admits_every_built_arch() {
+        let built = flash_built_arches();
+        for &cap in built {
+            assert!(
+                arch_admitted(Some(cap), built),
+                "{cap:?} must be admitted -- it is in flash_built_arches()"
+            );
+        }
+        let outside = ComputeCapability::new(7, 5);
+        assert!(
+            !built.contains(&outside),
+            "fixture value must stay outside today's compiled set"
+        );
+        assert!(!arch_admitted(Some(outside), built));
+        assert!(!arch_admitted(None, built));
+    }
+
     /// L7-equivalent + L10: on this build (no `cuda`/`flash-attn` feature,
     /// and CPU regardless), the CHEAPEST gate declines first —
     /// `flash_admission_predicate` never reaches `compute_lengths_and_prefix`,
@@ -3204,8 +3267,9 @@ mod tests {
     /// (`flash_arch_ok`'s call site, `dtype != DType::BF16`, `head_dim !=
     /// FLASH_HEAD_DIM`) can only be exercised with `device.is_cuda() ==
     /// true`, which requires an actual CUDA device this environment does
-    /// not have. `flash_arch_ok`'s OWN internal `==` comparison IS tested
-    /// directly (`flash_arch_ok_rejects_cpu`) — what remains untestable
+    /// not have. `flash_arch_ok`'s OWN internal set-membership check IS
+    /// tested directly (`flash_arch_ok_rejects_cpu`,
+    /// `flash_arch_ok_admits_every_built_arch`) — what remains untestable
     /// here is only the CALL SITE inside `flash_capability_gates`, and the
     /// two gates after it. A pod run (`JAMMI_REQUIRE_CUDA=1`) closing this
     /// residual class is listed explicitly in this agent's hand-off.
@@ -5403,27 +5467,30 @@ mod tests {
     /// oracle in this module checks before it can run:
     /// `jammi_kernels::admission::FLASH_COMPILED` (was this build's
     /// `jammi-kernels` compiled with `flash-attn`?) AND (M1b delta re-audit
-    /// finding F1-sibling) `device`'s own compute capability is EXACTLY
-    /// `(8, 0)` ([`flash_arch_ok`]) -- the `flash-attn` build's kernels are
-    /// HARD-PINNED to sm80 (same class the bench gate's own wrong-arch bug
-    /// was), so a `flash-attn`-compiled BINARY running on a DIFFERENT arch
-    /// (an L40S, 8.9, or an H100, 9.0) must ALSO skip rather than dispatch
-    /// into kernels this build was never generated for -- without this
-    /// check, every one of the nine call sites through this helper would
-    /// hard-FAIL its own live-dispatch-count assertions on such a pod
-    /// (`FLASH_COMPILED == true` alone is not "this device can actually
-    /// run it"). Without EITHER check, a build that compiled without the
-    /// feature, or runs on the wrong arch, reads every one of those nine
-    /// call sites GREEN with no escape hatch -- the exact "fell
-    /// back/skipped everywhere and it read as green" failure mode
+    /// finding F1-sibling, widened by the M3 plan) `device`'s own compute
+    /// capability is a MEMBER of `jammi_kernels::admission::
+    /// flash_built_arches()` ([`flash_arch_ok`]) -- the `flash-attn` build's
+    /// kernels are compiled for an ENUMERATED arch set (sm80/86/89/90
+    /// today, same class the bench gate's own wrong-arch bug was, just
+    /// widened from a single exact match to set membership), so a
+    /// `flash-attn`-compiled BINARY running on a device OUTSIDE that set
+    /// (a V100, sm70, or a Jetson Orin, sm87) must ALSO skip rather than
+    /// dispatch into kernels this build never generated a cubin for --
+    /// without this check, every one of the nine call sites through this
+    /// helper would hard-FAIL its own live-dispatch-count assertions on
+    /// such a pod (`FLASH_COMPILED == true` alone is not "this device can
+    /// actually run it"). Without EITHER check, a build that compiled
+    /// without the feature, or runs on an unadmitted arch, reads every one
+    /// of those nine call sites GREEN with no escape hatch -- the exact
+    /// "fell back/skipped everywhere and it read as green" failure mode
     /// `AdmissionMode::Strict` exists to prevent, just at the
     /// FEATURE-COMPILATION/ARCH layer instead of the admission layer.
     /// Returns `true` (caller proceeds) iff BOTH `FLASH_COMPILED` and
     /// `flash_arch_ok(device)`; otherwise panics when `JAMMI_REQUIRE_FLASH`
     /// is set (the pod lane exports it -- "must run the real flash arm"
     /// means BOTH conditions, not compilation alone) or prints a skip
-    /// message NAMING which of the two failed (and the probed arch, on an
-    /// arch mismatch) and returns `false`.
+    /// message NAMING which of the two failed (and the probed arch AND the
+    /// compiled set, on an arch mismatch) and returns `false`.
     #[cfg(feature = "cuda")]
     fn flash_compiled_or_skip(test_name: &str, device: &Device) -> bool {
         let compiled = jammi_kernels::admission::FLASH_COMPILED;
@@ -5431,19 +5498,19 @@ mod tests {
             if flash_arch_ok(device) {
                 return true;
             }
+            let built = flash_built_arches();
             if std::env::var_os("JAMMI_REQUIRE_FLASH").is_some() {
                 panic!(
                     "{test_name}: JAMMI_REQUIRE_FLASH is set but this device's compute \
-                     capability is not EXACTLY (8, 0) (probed {:?}) -- the flash-attn build's \
-                     kernels are hard-pinned to sm80 (see flash_arch_ok's own doc) -- this lane \
-                     must run the real flash arm, not skip it",
+                     capability {:?} is not a member of the flash build's compiled arch set \
+                     {built:?} (see flash_arch_ok's own doc) -- this lane must run the real \
+                     flash arm, not skip it",
                     probe_cuda_compute_capability(device)
                 );
             }
             eprintln!(
-                "{test_name}: skipping — device compute capability is not EXACTLY (8, 0) \
-                 (probed {:?}); the flash-attn build's kernels are hard-pinned to sm80, see \
-                 flash_arch_ok's own doc",
+                "{test_name}: skipping — device compute capability {:?} is not a member of the \
+                 flash build's compiled arch set {built:?}; see flash_arch_ok's own doc",
                 probe_cuda_compute_capability(device)
             );
             return false;
@@ -5523,8 +5590,11 @@ mod tests {
     /// build to compile (`FLASH_COMPILED` must be `true` to even REACH the
     /// arch check): passing `&Device::Cpu` makes
     /// [`flash_arch_ok`]/`probe_cuda_compute_capability` deterministically
-    /// report "not sm80" WITHOUT needing real off-arch hardware (an L40S
-    /// or H100) to prove the branch fires correctly -- mirrors
+    /// report "not a member of the compiled arch set" WITHOUT needing real
+    /// off-arch hardware (a V100, sm70, or a Jetson Orin, sm87 -- an L40S
+    /// or H100 no longer illustrates a mismatch here: the M3 plan's D1
+    /// widened the compiled set to include sm89/sm90) to prove the branch
+    /// fires correctly -- mirrors
     /// [`flash_compiled_or_skip_panics_under_require_flash_when_not_compiled`]'s
     /// own structure for the SIBLING (not-compiled) branch.
     #[test]
@@ -5543,7 +5613,8 @@ mod tests {
         std::env::remove_var("JAMMI_REQUIRE_FLASH");
         let err = result.expect_err(
             "flash_compiled_or_skip must panic when JAMMI_REQUIRE_FLASH is set and the device \
-             is not EXACTLY sm80 (Device::Cpu deterministically fails flash_arch_ok)",
+             is not a member of the compiled arch set (Device::Cpu deterministically fails \
+             flash_arch_ok)",
         );
         let msg = err
             .downcast_ref::<String>()

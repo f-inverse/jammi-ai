@@ -94,8 +94,9 @@ a base-class quality claim. Budget: ~$10 A100 class total. Pod discipline per me
 ## H6 — C16 supersession (domain: docs-ci)
 
 Append-dated supersession record (never edit C16's text): each precondition quoted +
-discharged; the parenthetical recorded WRONG-WHEN-WRITTEN (ValLoss default since 3b8c0978
-2026-06-10; C16 landed 2026-08-26); true residuals = final_loss=best_val_loss (min-statistic)
+discharged; the parenthetical recorded WRONG-WHEN-WRITTEN (ValLoss has been the default since
+7deadd4b 2026-04-30 — 3b8c0978 2026-06-10 only relocated the already-defaulted enum to
+jammi-wire; C16 landed 2026-08-26); true residuals = final_loss=best_val_loss (min-statistic)
 and parallel_train.rs:166; recall@10 dead-range finding restated with its producer.
 
 ## Acceptance (phase 6)

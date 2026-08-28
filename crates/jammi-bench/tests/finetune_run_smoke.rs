@@ -63,7 +63,11 @@ fn write_heldout_ids(dir: &Path, n: usize, offset: usize) -> PathBuf {
 /// One `finetune-run` invocation over the tiny synthetic fixture: 4 train
 /// triplets (2 batches at `--batch 2`), 2 held-out triplets (1 batch),
 /// 2 epochs, `--eval-cadence 1` (so both epochs call `evaluate_held_out`).
-fn base_command(work_dir: &Path, fixtures_dir: &Path) -> Command {
+/// `objective` is `"triplet"` or `"mnrl"` (unit 63 H4a-delta, CONTRACT
+/// amendment 2026-08-28): the SAME fixture rows and `--heldout-ids` order
+/// feed either — `mnrl` drops the negative column via the tier's own
+/// `project_to_pairs` projection.
+fn base_command(work_dir: &Path, fixtures_dir: &Path, objective: &str) -> Command {
     let train_jsonl = write_triplets_jsonl(fixtures_dir, "train.jsonl", 4, 0);
     let heldout_jsonl = write_triplets_jsonl(fixtures_dir, "heldout.jsonl", 2, 100);
     let heldout_ids = write_heldout_ids(fixtures_dir, 2, 100);
@@ -105,8 +109,12 @@ fn base_command(work_dir: &Path, fixtures_dir: &Path) -> Command {
             "train_loss",
             "--max-grad-norm",
             "0.0",
+            "--objective",
+            objective,
             "--margin",
             "0.3",
+            "--temperature",
+            "20.0",
             "--lora-rank",
             "2",
             "--lora-alpha",
@@ -129,7 +137,7 @@ fn base_command(work_dir: &Path, fixtures_dir: &Path) -> Command {
 fn finetune_run_smoke_end_to_end_cpu_hermetic() {
     let work_dir = tempfile::tempdir().expect("tempdir");
     let fixtures_dir = tempfile::tempdir().expect("fixtures tempdir");
-    let output = base_command(work_dir.path(), fixtures_dir.path())
+    let output = base_command(work_dir.path(), fixtures_dir.path(), "triplet")
         .output()
         .expect("spawn jammi-bench finetune-run");
     assert!(
@@ -224,4 +232,106 @@ fn finetune_run_smoke_end_to_end_cpu_hermetic() {
 
     // `--arm fused` was declared; the process made no kernel-disable claim.
     assert_eq!(obj["arm"], serde_json::json!("fused"));
+
+    // Identity-value semantics (unit 63 H4a-delta, CONTRACT amendment
+    // 2026-08-28): `--objective triplet` → `embedding_loss: "triplet"`,
+    // `temperature: null`, `margin` non-null (already checked above).
+    assert_eq!(obj["embedding_loss"], serde_json::json!("triplet"));
+    assert!(
+        obj["temperature"].is_null(),
+        "Triplet run must report temperature: null, got {:?}",
+        obj["temperature"]
+    );
+}
+
+/// The MNRL twin of [`finetune_run_smoke_end_to_end_cpu_hermetic`] (unit 63
+/// H4a-delta): the SAME fixture, SAME held-out id order, `--objective mnrl`
+/// instead — proving this tier actually drives the (anchor, positive)
+/// projection through `TrainingLoopBuilder` + `evaluate_held_out` end to
+/// end, across the same 2-epoch resume-cycle.
+#[test]
+fn finetune_run_smoke_mnrl_end_to_end_cpu_hermetic() {
+    let work_dir = tempfile::tempdir().expect("tempdir");
+    let fixtures_dir = tempfile::tempdir().expect("fixtures tempdir");
+    let output = base_command(work_dir.path(), fixtures_dir.path(), "mnrl")
+        .output()
+        .expect("spawn jammi-bench finetune-run");
+    assert!(
+        output.status.success(),
+        "finetune-run --objective mnrl exited non-zero: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse finetune-run report JSON");
+    let tier = report
+        .get("tiers")
+        .and_then(|t| t.get("finetune_run"))
+        .expect("report.tiers.finetune_run present");
+    let obj = tier.as_object().expect("finetune_run tier is an object");
+
+    // Every field this tier declares IDENTITY or PROVENANCE must be
+    // present — `margin` is now the field expected NULL (MNRL selected),
+    // so it is checked separately below rather than in this presence loop.
+    for field in [
+        "seed",
+        "batch",
+        "seq",
+        "lora_rank",
+        "lora_alpha",
+        "lora_dropout",
+        "target_modules",
+        "batched_forward",
+        "backbone_dtype",
+        "steps_measured",
+        "checkpoint_config_sha256",
+        "checkpoint_weights_sha256",
+        "checkpoint_weights_size_bytes",
+        "epochs",
+        "lr",
+        "schedule",
+        "warmup_steps",
+        "weight_decay",
+        "grad_accum",
+        "validation_fraction",
+        "split_rule",
+        "split_seed",
+        "dataset_sha256",
+        "heldout_ids_sha256",
+        "heldout_batch_partition_sha256",
+        "embedding_loss",
+        "temperature",
+        "matryoshka_dims",
+        "early_stopping_patience",
+        "early_stopping_metric",
+        "eval_cadence",
+    ] {
+        let v = obj
+            .get(field)
+            .unwrap_or_else(|| panic!("finetune_run tier missing identity field {field:?}"));
+        assert!(!v.is_null(), "identity field {field:?} is null: {v:?}");
+    }
+
+    // Identity-value semantics (task item 4): MNRL flips the nullness pair —
+    // `margin: null`, `temperature` non-null (already checked above),
+    // `embedding_loss: "mnrl"`.
+    assert!(
+        obj["margin"].is_null(),
+        "MNRL run must report margin: null, got {:?}",
+        obj["margin"]
+    );
+    assert_eq!(obj["embedding_loss"], serde_json::json!("mnrl"));
+
+    // The endpoint fields still hold under MNRL.
+    assert_eq!(obj["final_epoch"], serde_json::json!(1));
+    assert!(obj["held_out_example_mean"].as_f64().is_some());
+    assert_eq!(obj["held_out_count"], serde_json::json!(2));
+
+    let trajectory = obj["trajectory"].as_array().expect("trajectory array");
+    assert_eq!(
+        trajectory.len(),
+        2,
+        "expected one evaluate_held_out point per epoch at eval_cadence=1: {trajectory:?}"
+    );
 }

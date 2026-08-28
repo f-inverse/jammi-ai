@@ -160,9 +160,21 @@ struct FinetuneRunArgs {
     /// `0.0` disables clipping.
     #[arg(long, default_value_t = 1.0)]
     max_grad_norm: f64,
-    /// The Triplet objective's margin.
+    /// `triplet` or `mnrl` — which embedding objective to train over the
+    /// SAME committed fixture (CONTRACT H4 amendment 2026-08-28; `mnrl`
+    /// consumes the (anchor, positive) projection of the same rows in
+    /// committed order, dropping the negative column). See
+    /// `finetune_run::Objective`'s own doc.
+    #[arg(long, default_value = "triplet")]
+    objective: String,
+    /// The Triplet objective's margin — read when `--objective triplet`.
     #[arg(long, default_value_t = 0.3)]
     margin: f64,
+    /// MNRL's similarity-scale knob — read when `--objective mnrl`. `20.0`
+    /// is the standard default (`jammi_wire::fine_tune::EmbeddingLoss::MultipleNegativesRanking`'s
+    /// own doc).
+    #[arg(long, default_value_t = 20.0)]
+    temperature: f64,
     /// Comma-separated Matryoshka prefix dims; empty trains the full
     /// dimension only.
     #[arg(long, default_value = "")]
@@ -786,7 +798,9 @@ async fn main() -> std::process::ExitCode {
                 early_stopping_patience,
                 early_stopping_metric,
                 max_grad_norm,
+                objective,
                 margin,
+                temperature,
                 matryoshka_dims,
                 lora_rank,
                 lora_alpha,
@@ -799,6 +813,13 @@ async fn main() -> std::process::ExitCode {
             } = *args;
             let arm = match arm.parse::<finetune_run::Arm>() {
                 Ok(a) => a,
+                Err(e) => {
+                    eprintln!("finetune-run: {e}");
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
+            let objective = match objective.parse::<finetune_run::Objective>() {
+                Ok(o) => o,
                 Err(e) => {
                     eprintln!("finetune-run: {e}");
                     return std::process::ExitCode::FAILURE;
@@ -865,7 +886,9 @@ async fn main() -> std::process::ExitCode {
                 early_stopping_patience,
                 early_stopping_metric: early_stopping_metric_v,
                 max_grad_norm,
+                objective,
                 margin,
+                temperature,
                 matryoshka_dims: matryoshka_dims
                     .split(',')
                     .map(str::trim)

@@ -167,12 +167,71 @@ fn sendify<E: std::fmt::Display>(e: E) -> Box<dyn std::error::Error + Send + Syn
 /// CONTRACT Frame's `ALLOFF=attention_block_flash,adamw_step_fused` verbatim.
 pub const ALLOFF_KEYS: [&str; 2] = ["attention_block_flash", "adamw_step_fused"];
 
+/// Which embedding objective this run trains — CONTRACT H4's 2026-08-28
+/// amendment ("objective selection under the triplet-shaped fixture"): H4a
+/// found the committed H3 fixture TRIPLET-shaped
+/// (`anchor_id\tpositive_id\tnegative_id`), while the Frame's own
+/// "embedding_loss+temp" phrasing anticipated MNRL. Both families train over
+/// the SAME committed fixture — `Triplet` natively (all three columns),
+/// `Mnrl` via the (anchor, positive) PROJECTION of the identical rows in the
+/// identical committed order (see [`project_to_pairs`]): dropping the mined
+/// negative column and letting the rest of each batch supply in-batch
+/// negatives instead. H5 step 0's dynamic-range probe runs BOTH (one seed
+/// each) and pre-registers which one v1 keeps; this tier does not itself
+/// choose — the CALLER selects via `--objective`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Objective {
+    /// `EmbeddingLoss::Triplet { margin }` — explicit mined negative per row.
+    Triplet,
+    /// `EmbeddingLoss::MultipleNegativesRanking { temperature }` — in-batch
+    /// negatives only, over the fixture's (anchor, positive) projection.
+    Mnrl,
+}
+
+impl Objective {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Objective::Triplet => "triplet",
+            Objective::Mnrl => "mnrl",
+        }
+    }
+}
+
+impl std::str::FromStr for Objective {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "triplet" => Ok(Objective::Triplet),
+            "mnrl" => Ok(Objective::Mnrl),
+            other => Err(format!(
+                "--objective '{other}' is invalid: expected 'triplet' or 'mnrl'"
+            )),
+        }
+    }
+}
+
+/// Project committed [`IdTriplet`] rows to the MNRL (anchor, positive) shape
+/// — the SAME rows, in the SAME committed order, with the mined negative
+/// column DROPPED (CONTRACT amendment: "the fixture's (anchor, positive)
+/// projection serves MNRL losslessly; in-batch negatives replace the mined
+/// negative"). A pure function (no id, no shuffling) so both the train split
+/// and the held-out fixture project identically — [`run`] calls this for
+/// both when [`Objective::Mnrl`] is selected.
+fn project_to_pairs(pairs: &[IdTriplet]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .map(|p| (p.anchor.clone(), p.positive.clone()))
+        .collect()
+}
+
 /// One (anchor, positive, negative) text triplet, keyed by a stable id — the
-/// shape both the train split and the held-out fixture are supplied in.
-/// TRIPLET, not MNRL pairs: the committed held-out fixture
-/// (`cookbook/fixtures/finetune_heldout`, CONTRACT H3) mines an EXPLICIT
-/// negative per row (`heldout_ids.txt`'s `anchor_id\tpositive_id\tnegative_id`
-/// shape), so this tier trains `EmbeddingLoss::Triplet` — see
+/// shape both the train split and the held-out fixture are supplied in,
+/// regardless of which [`Objective`] this run trains. The committed held-out
+/// fixture (`cookbook/fixtures/finetune_heldout`, CONTRACT H3) mines an
+/// EXPLICIT negative per row (`heldout_ids.txt`'s
+/// `anchor_id\tpositive_id\tnegative_id` shape); [`Objective::Triplet`]
+/// consumes all three columns natively, [`Objective::Mnrl`] consumes only
+/// the (anchor, positive) projection ([`project_to_pairs`]) — see
 /// [`crate::report::FinetuneRunTier::margin`]'s doc for the CONTRACT-vs-
 /// fixture naming note.
 #[derive(Debug, Clone)]
@@ -228,9 +287,21 @@ pub struct FinetuneRunParams {
     pub early_stopping_patience: usize,
     pub early_stopping_metric: EarlyStoppingMetric,
     pub max_grad_norm: f64,
-    /// The Triplet objective's margin (see [`IdTriplet`]'s doc for why this
-    /// tier trains Triplet rather than MNRL).
+    /// Which embedding objective this run trains (CONTRACT H4 amendment;
+    /// see [`Objective`]'s own doc).
+    pub objective: Objective,
+    /// The Triplet objective's margin — used to build `EmbeddingLoss::Triplet`
+    /// when `objective == Objective::Triplet`; ignored (but still a valid,
+    /// caller-supplied value) otherwise.
     pub margin: f64,
+    /// The MNRL objective's similarity-scale knob — used to build
+    /// `EmbeddingLoss::MultipleNegativesRanking` when
+    /// `objective == Objective::Mnrl`; ignored otherwise. `20.0` is the
+    /// standard default (`jammi_wire::fine_tune::EmbeddingLoss::MultipleNegativesRanking`'s
+    /// own doc: "temperature is the similarity scale; 20.0 is the standard
+    /// default" — the same value `jammi_ai::fine_tune::trainer::PAIRWISE_SCALE`
+    /// falls back to when no MNRL config is set).
+    pub temperature: f64,
     pub matryoshka_dims: Vec<usize>,
     pub lora_rank: usize,
     pub lora_alpha: f64,
@@ -419,8 +490,13 @@ fn base_config(params: &FinetuneRunParams, epochs: usize) -> FineTuneConfig {
         epochs,
         batch_size: params.batch_size,
         max_seq_length: params.max_seq_length,
-        embedding_loss: Some(EmbeddingLoss::Triplet {
-            margin: params.margin,
+        embedding_loss: Some(match params.objective {
+            Objective::Triplet => EmbeddingLoss::Triplet {
+                margin: params.margin,
+            },
+            Objective::Mnrl => EmbeddingLoss::MultipleNegativesRanking {
+                temperature: params.temperature,
+            },
         }),
         classification_loss: None,
         regression_loss: None,
@@ -581,7 +657,10 @@ pub fn run(
             job_id: &job_id,
             base_model_id: &model_catalog_pk,
             training_source: "jammi-bench finetune-run (unit 63 H4)",
-            loss_type: "multiple_negatives_ranking",
+            loss_type: match params.objective {
+                Objective::Triplet => "triplet",
+                Objective::Mnrl => "multiple_negatives_ranking",
+            },
             hyperparams: "{}",
             kind: "fine_tune",
             training_spec: "{}",
@@ -593,30 +672,49 @@ pub fn run(
         )?
         .ok_or("finetune-run: the just-created training job was not claimable")?;
 
-    let train_rows: Vec<(String, String, String)> = params
-        .train_pairs
-        .iter()
-        .map(|p| (p.anchor.clone(), p.positive.clone(), p.negative.clone()))
-        .collect();
-    let train_loader = TrainingDataLoader::from_triplets(train_rows);
+    // `Objective::Triplet` consumes the fixture's (anchor, positive,
+    // negative) columns natively; `Objective::Mnrl` consumes only the
+    // (anchor, positive) PROJECTION of the SAME rows in the SAME committed
+    // order ([`project_to_pairs`]) — CONTRACT amendment 2026-08-28. Both
+    // loaders below are built from the identical `params.train_pairs` /
+    // `params.heldout_pairs` slices, so the row ORDER (and hence
+    // `heldout_ids`' pairing with the loader's rows) is identical regardless
+    // of which objective this run trains.
+    let train_loader = match params.objective {
+        Objective::Triplet => {
+            let train_rows: Vec<(String, String, String)> = params
+                .train_pairs
+                .iter()
+                .map(|p| (p.anchor.clone(), p.positive.clone(), p.negative.clone()))
+                .collect();
+            TrainingDataLoader::from_triplets(train_rows)
+        }
+        Objective::Mnrl => TrainingDataLoader::from_pairs(project_to_pairs(&params.train_pairs)),
+    };
 
-    let heldout_rows: Vec<(String, String, String)> = params
-        .heldout_pairs
-        .iter()
-        .map(|p| (p.anchor.clone(), p.positive.clone(), p.negative.clone()))
-        .collect();
     let heldout_ids: Vec<String> = params.heldout_pairs.iter().map(|p| p.id.clone()).collect();
-    let heldout_loader = TrainingDataLoader::from_triplets(heldout_rows);
+    let heldout_loader = match params.objective {
+        Objective::Triplet => {
+            let heldout_rows: Vec<(String, String, String)> = params
+                .heldout_pairs
+                .iter()
+                .map(|p| (p.anchor.clone(), p.positive.clone(), p.negative.clone()))
+                .collect();
+            TrainingDataLoader::from_triplets(heldout_rows)
+        }
+        Objective::Mnrl => TrainingDataLoader::from_pairs(project_to_pairs(&params.heldout_pairs)),
+    };
 
     // A fixed, deterministic TRAIN-side probe — one batch's worth of the
     // TRAIN rows (never the held-out fixture), scored through the SAME
     // public seam at epoch 0 and at the final epoch, for the
     // "learning-happened" premise leg (CONTRACT H4: "first-epoch vs
-    // final-epoch train loss delta"). This is honestly a per-example
-    // Triplet loss under `evaluate_held_out`'s own batch-partition
-    // convention, not the trainer's internal batch-mean `avg_train_loss`
-    // (which this tier has no way to read off the public surface — see
-    // this module's doc) — labelled as a "probe", never as
+    // final-epoch train loss delta"). This is honestly a per-example loss
+    // under `evaluate_held_out`'s own batch-partition convention (Triplet's
+    // margin loss, or MNRL's batch-coupled in-batch-negative loss — see
+    // [`Objective`]'s doc), not the trainer's internal batch-mean
+    // `avg_train_loss` (which this tier has no way to read off the public
+    // surface — see this module's doc) — labelled as a "probe", never as
     // `avg_train_loss` itself.
     let probe_len = params.batch_size.min(params.train_pairs.len());
     let probe_pairs = &params.train_pairs[..probe_len];
@@ -630,10 +728,11 @@ pub fn run(
         .into());
     }
     let probe_ids: Vec<String> = probe_pairs.iter().map(|p| p.id.clone()).collect();
-    let probe_rows: Vec<(String, String, String)> = probe_pairs
+    let probe_triplet_rows: Vec<(String, String, String)> = probe_pairs
         .iter()
         .map(|p| (p.anchor.clone(), p.positive.clone(), p.negative.clone()))
         .collect();
+    let probe_pair_rows: Vec<(String, String)> = project_to_pairs(probe_pairs);
 
     let mut trajectory = Trajectory { points: Vec::new() };
     let mut first_probe_mean: Option<f64> = None;
@@ -710,7 +809,10 @@ pub fn run(
         }
 
         if epoch_idx == 0 || is_final {
-            let probe_loader = TrainingDataLoader::from_triplets(probe_rows.clone());
+            let probe_loader = match params.objective {
+                Objective::Triplet => TrainingDataLoader::from_triplets(probe_triplet_rows.clone()),
+                Objective::Mnrl => TrainingDataLoader::from_pairs(probe_pair_rows.clone()),
+            };
             let probe = training_loop.evaluate_held_out(&probe_loader, &probe_ids)?;
             if epoch_idx == 0 {
                 first_probe_mean = Some(probe.mean);
@@ -749,7 +851,10 @@ pub fn run(
         lora_rank: params.lora_rank,
         lora_alpha: params.lora_alpha,
         lora_dropout: params.lora_dropout,
-        margin: Some(params.margin),
+        margin: match params.objective {
+            Objective::Triplet => Some(params.margin),
+            Objective::Mnrl => None,
+        },
         target_modules: params.target_modules.clone(),
         batched_forward: true,
         backbone_dtype: format!("{:?}", params.backbone_dtype).to_lowercase(),
@@ -772,8 +877,11 @@ pub fn run(
         dataset_sha256: params.dataset_sha256.clone(),
         heldout_ids_sha256: params.heldout_ids_sha256.clone(),
         heldout_batch_partition_sha256: held_out.batch_partition_sha256.clone(),
-        embedding_loss: "triplet".to_string(),
-        temperature: None,
+        embedding_loss: params.objective.as_str().to_string(),
+        temperature: match params.objective {
+            Objective::Triplet => None,
+            Objective::Mnrl => Some(params.temperature),
+        },
         matryoshka_dims: params.matryoshka_dims.clone(),
         early_stopping_patience: params.early_stopping_patience,
         early_stopping_metric: match params.early_stopping_metric {
@@ -805,4 +913,83 @@ pub fn run(
     crate::report::assert_identity_fields_present(&value, FinetuneRunTier::IDENTITY_FIELDS);
     crate::report::assert_identity_fields_present(&value, FinetuneRunTier::PROVENANCE_FIELDS);
     Ok(tier)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn objective_from_str_round_trips_both_variants() {
+        assert_eq!("triplet".parse::<Objective>().unwrap(), Objective::Triplet);
+        assert_eq!("mnrl".parse::<Objective>().unwrap(), Objective::Mnrl);
+        assert_eq!(Objective::Triplet.as_str(), "triplet");
+        assert_eq!(Objective::Mnrl.as_str(), "mnrl");
+    }
+
+    #[test]
+    fn objective_from_str_rejects_an_unknown_value() {
+        let err = "cosent".parse::<Objective>().unwrap_err();
+        assert!(err.contains("cosent"), "{err}");
+        assert!(err.contains("triplet") && err.contains("mnrl"), "{err}");
+    }
+
+    /// Projection correctness (unit 63 H4a-delta, task item 4): the MNRL
+    /// loader's (anchor, positive) rows must be EXACTLY the same rows, in
+    /// the SAME committed order, as the source triplets — negative column
+    /// dropped, nothing reordered, nothing dropped or duplicated — against
+    /// a small fixture with known ids.
+    #[test]
+    fn project_to_pairs_keeps_committed_order_and_drops_the_negative_column() {
+        let pairs = vec![
+            IdTriplet {
+                id: "row-0".to_string(),
+                anchor: "anchor 0".to_string(),
+                positive: "positive 0".to_string(),
+                negative: "negative 0".to_string(),
+            },
+            IdTriplet {
+                id: "row-1".to_string(),
+                anchor: "anchor 1".to_string(),
+                positive: "positive 1".to_string(),
+                negative: "negative 1".to_string(),
+            },
+            IdTriplet {
+                id: "row-2".to_string(),
+                anchor: "anchor 2".to_string(),
+                positive: "positive 2".to_string(),
+                negative: "negative 2".to_string(),
+            },
+        ];
+        let projected = project_to_pairs(&pairs);
+        assert_eq!(
+            projected,
+            vec![
+                ("anchor 0".to_string(), "positive 0".to_string()),
+                ("anchor 1".to_string(), "positive 1".to_string()),
+                ("anchor 2".to_string(), "positive 2".to_string()),
+            ],
+            "projection must be the same rows, same order, negative column dropped"
+        );
+    }
+
+    /// Negative control on the projection: an empty input projects to an
+    /// empty output (no fabricated rows), and the projection never reads
+    /// `negative` at all — swapping every `negative` field to a distinct,
+    /// unique sentinel value must not change the projected output, proving
+    /// the negative column truly plays no role.
+    #[test]
+    fn project_to_pairs_output_is_independent_of_the_negative_column() {
+        let mut pairs = vec![IdTriplet {
+            id: "row-0".to_string(),
+            anchor: "anchor 0".to_string(),
+            positive: "positive 0".to_string(),
+            negative: "negative 0".to_string(),
+        }];
+        let before = project_to_pairs(&pairs);
+        pairs[0].negative = "a completely different sentinel negative".to_string();
+        let after = project_to_pairs(&pairs);
+        assert_eq!(before, after);
+        assert!(project_to_pairs(&[]).is_empty());
+    }
 }

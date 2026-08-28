@@ -1876,12 +1876,24 @@ pub struct EpochHeldOut {
 /// and `row_lengths` read a DIFFERENT `NullMeans` reason here than there,
 /// because a full multi-epoch real-text run has no per-tier
 /// "discard-before-timing" convention and no single fixed row-lengths vector
-/// over variable-length real text; `margin` stays `NonNull` on both tiers,
-/// though for a DIFFERENT objective each time — `FinetuneStepTier`'s
-/// hardcoded `0.3` Triplet vs this tier's real, configured Triplet margin;
-/// see each field's own doc below, and [`Self::temperature`]'s doc for the
-/// CONTRACT-vs-fixture naming note on why `temperature`, not `margin`, is
-/// this tier's null slot).
+/// over variable-length real text).
+///
+/// ## `margin`/`temperature`: objective-selected nullness (H4a-delta, CONTRACT
+/// amendment 2026-08-28)
+///
+/// Unlike `FinetuneStepTier` (which always trains a hardcoded-margin Triplet
+/// and so declares `margin` unconditionally `NonNull`), this tier runs
+/// EITHER objective over the SAME committed fixture — H4a found the
+/// committed H3 fixture TRIPLET-shaped, while the Frame's own
+/// "embedding_loss+temp" phrasing anticipated MNRL, and H5 step 0's
+/// dynamic-range probe needs BOTH to choose between them. So `margin` and
+/// `temperature` are BOTH `Option`, and exactly one is `Some` per run,
+/// selected by [`crate::finetune_run::Objective`]: `Objective::Triplet` →
+/// `margin` non-null (the real, configured Triplet margin — never
+/// `FinetuneStepTier`'s hardcoded `0.3`), `temperature` null
+/// (`NullMeans("objective is triplet")`); `Objective::Mnrl` → `temperature`
+/// non-null, `margin` null (`NullMeans("objective is mnrl")`). See each
+/// field's own doc below.
 #[derive(Debug, Serialize)]
 pub struct FinetuneRunTier {
     // ── Identity: FinetuneStepTier's 18 (minus attention_arm — see struct
@@ -1895,13 +1907,12 @@ pub struct FinetuneRunTier {
     pub lora_rank: usize,
     pub lora_alpha: f64,
     pub lora_dropout: f64,
-    /// The margin the Triplet objective trains with — the committed
-    /// held-out fixture (`cookbook/fixtures/finetune_heldout`, CONTRACT H3)
-    /// is TRIPLET-shaped (`anchor_id\tpositive_id\tnegative_id`, an EXPLICIT
-    /// mined negative per row), so this tier trains `EmbeddingLoss::Triplet`
-    /// — never MNRL — and `margin` is always `Some` (unlike
-    /// [`Self::temperature`], MNRL's own scale knob, which is `null` here;
-    /// see that field's own doc for the CONTRACT-vs-fixture naming note).
+    /// The Triplet objective's margin — `Some` only when
+    /// [`crate::finetune_run::Objective::Triplet`] was selected for this
+    /// run; `null` (`NullMeans("objective is mnrl")`) when
+    /// [`crate::finetune_run::Objective::Mnrl`] was selected instead — see
+    /// the struct doc's "objective-selected nullness" section and
+    /// [`Self::temperature`]'s doc for MNRL's own scale knob.
     pub margin: Option<f64>,
     pub target_modules: Vec<String>,
     /// Always `true`: `TrainingLoop::encode_chunk`'s `Pairs`/`Triplet` arms
@@ -1954,16 +1965,18 @@ pub struct FinetuneRunTier {
     /// partition the reported [`Self::held_out_example_mean`] was scored
     /// under (CONTRACT H1 v2 delta 9: a property of `(model, partition)`).
     pub heldout_batch_partition_sha256: String,
+    /// `"triplet"` or `"mnrl"` — [`crate::finetune_run::Objective::as_str`],
+    /// selected by the run's `--objective` flag (CONTRACT amendment
+    /// 2026-08-28). Named in CONTRACT H4 as "embedding_loss+temperature";
+    /// this tier trains BOTH objectives it names (H4a-delta), over the SAME
+    /// committed fixture, so this field is genuinely NonNull either way.
     pub embedding_loss: String,
-    /// `null`: this tier trains the Triplet objective (see [`Self::margin`]'s
-    /// doc) — MNRL's temperature knob does not apply. Named in CONTRACT H4 as
-    /// "embedding_loss+temperature" (the plan's abbreviation anticipated
-    /// MNRL as the fixture's shape when H4 was drafted); the committed H3
-    /// fixture instead mines EXPLICIT triplets, so `margin` — inherited from
-    /// `FinetuneStepTier`'s 18 — is this tier's real objective-scale
-    /// identity field and `temperature` legitimately reads `null` on every
-    /// real run. Kept as a named field (rather than dropped) so the field IS
-    /// present per CONTRACT H4's literal naming, honestly null.
+    /// MNRL's similarity-scale knob — `Some` only when
+    /// [`crate::finetune_run::Objective::Mnrl`] was selected for this run;
+    /// `null` (`NullMeans("objective is triplet")`) when
+    /// [`crate::finetune_run::Objective::Triplet`] was selected instead —
+    /// see the struct doc's "objective-selected nullness" section and
+    /// [`Self::margin`]'s doc for the Triplet objective's own scale knob.
     pub temperature: Option<f64>,
     pub matryoshka_dims: Vec<usize>,
     pub early_stopping_patience: usize,
@@ -2044,7 +2057,12 @@ impl FinetuneRunTier {
         ("lora_rank", Nullable::NonNull),
         ("lora_alpha", Nullable::NonNull),
         ("lora_dropout", Nullable::NonNull),
-        ("margin", Nullable::NonNull),
+        // H4a-delta (CONTRACT amendment 2026-08-28): unlike
+        // `FinetuneStepTier::margin` (always NonNull, hardcoded Triplet),
+        // this tier's `margin` is null exactly when `Objective::Mnrl` was
+        // selected — see the struct doc's "objective-selected nullness"
+        // section.
+        ("margin", Nullable::NullMeans("objective is mnrl")),
         ("target_modules", Nullable::NonNull),
         ("batched_forward", Nullable::NonNull),
         ("backbone_dtype", Nullable::NonNull),
@@ -2080,10 +2098,7 @@ impl FinetuneRunTier {
         ("heldout_ids_sha256", Nullable::NonNull),
         ("heldout_batch_partition_sha256", Nullable::NonNull),
         ("embedding_loss", Nullable::NonNull),
-        (
-            "temperature",
-            Nullable::NullMeans("this tier trains the Triplet objective; see margin"),
-        ),
+        ("temperature", Nullable::NullMeans("objective is triplet")),
         ("matryoshka_dims", Nullable::NonNull),
         ("early_stopping_patience", Nullable::NonNull),
         ("early_stopping_metric", Nullable::NonNull),
@@ -2759,6 +2774,65 @@ mod tests {
                 held_out_batch_partition_sha256: "e".repeat(64),
             }],
         }
+    }
+
+    /// The MNRL twin of [`sample_finetune_run_tier`] (unit 63 H4a-delta,
+    /// CONTRACT amendment 2026-08-28): the SAME sample values, except
+    /// `margin`/`temperature` swap which one is `Some` and
+    /// `embedding_loss` reads `"mnrl"` — exactly the flip
+    /// [`crate::finetune_run::Objective::Mnrl`] produces on a real run.
+    /// `20.0` is `MultipleNegativesRanking`'s standard default temperature
+    /// (`jammi_wire::fine_tune::EmbeddingLoss::MultipleNegativesRanking`'s
+    /// own doc).
+    fn sample_finetune_run_tier_mnrl() -> FinetuneRunTier {
+        FinetuneRunTier {
+            margin: None,
+            embedding_loss: "mnrl".to_string(),
+            temperature: Some(20.0),
+            ..sample_finetune_run_tier()
+        }
+    }
+
+    /// Identity-value semantics per objective (unit 63 H4a-delta, task item
+    /// 4): a Triplet-objective tier reads `margin: Some(_)`, `temperature:
+    /// null`, `embedding_loss: "triplet"`.
+    #[test]
+    fn finetune_run_tier_triplet_objective_has_margin_nonnull_temperature_null() {
+        let tier = sample_finetune_run_tier();
+        assert!(tier.margin.is_some(), "Triplet run must report a margin");
+        assert!(
+            tier.temperature.is_none(),
+            "Triplet run must report temperature: null"
+        );
+        assert_eq!(tier.embedding_loss, "triplet");
+    }
+
+    /// The MNRL mirror of the test above: `margin: null`, `temperature:
+    /// Some(_)`, `embedding_loss: "mnrl"` — the nullness genuinely FLIPS
+    /// between the two objectives, not merely "one of them happens to be
+    /// null on this sample".
+    #[test]
+    fn finetune_run_tier_mnrl_objective_has_temperature_nonnull_margin_null() {
+        let tier = sample_finetune_run_tier_mnrl();
+        assert!(tier.margin.is_none(), "MNRL run must report margin: null");
+        assert!(
+            tier.temperature.is_some(),
+            "MNRL run must report a temperature"
+        );
+        assert_eq!(tier.embedding_loss, "mnrl");
+    }
+
+    /// The MNRL sample must ALSO satisfy `IDENTITY_FIELDS`/`PROVENANCE_FIELDS`
+    /// presence (the same self-check `finetune_run::run` performs before
+    /// returning) — `margin: null` under `Nullable::NullMeans("objective is
+    /// mnrl")` must NOT trip the `NonNull` panic branch now that `margin`'s
+    /// own declared nullability changed (H4a-delta).
+    #[test]
+    fn finetune_run_tier_mnrl_sample_satisfies_identity_and_provenance_presence() {
+        let tier = sample_finetune_run_tier_mnrl();
+        let value = serde_json::to_value(&tier).expect("serialize MNRL FinetuneRunTier");
+        assert_identity_fields_present(&value, FinetuneRunTier::IDENTITY_FIELDS);
+        assert_identity_fields_present(&value, FinetuneRunTier::PROVENANCE_FIELDS);
     }
 
     /// Cardinality pin: `FinetuneStepTier`'s 18 minus `attention_arm` (17)

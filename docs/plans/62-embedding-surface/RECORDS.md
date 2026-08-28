@@ -36,22 +36,24 @@ determinant set (esc-058 is `class_id: cache-coherence-digest-describes-disk`, d
 esc-057's `identity-completeness`).
 
 The fix is landed on this branch (commit `f0712069`, merged at `0ca0b1e6`): `get_or_load`'s warm
-fast path (`crates/jammi-ai/src/model/cache.rs:86-184`) clones the currently cached entry's shared
+fast path (`crates/jammi-ai/src/model/cache.rs:234-324`) clones the currently cached entry's shared
 handles under a short-held READ lock, drops the lock, then `stat`-probes a load-time
-`ModelFingerprint` (`ModelFingerprint::probe`, `crates/jammi-ai/src/model/backend/candle.rs:879-916`,
-computed at load by `compute_model_fingerprint`, `candle.rs:927-955`, called from `CandleBackend::load`
-at `candle.rs:1703`; exposed via `LoadedModel::probe_freshness` (`pub(crate)`),
-`crates/jammi-ai/src/model/mod.rs:391-396`) UNLOCKED, then RE-VALIDATES under a write lock
-(`Arc::ptr_eq` against the current cache entry) before serving the cached `Arc<LoadedModel>` — a
-narrow race (a concurrent evict/reload winning while this task probes) simply retries from the top
-against whatever is there now; the single-flight path below still ensures at most one loader per
-id: `Ok(true)` serves the snapshot if it is still the current entry (`cache.rs:122-141`); `Ok(false)`
-evicts ONLY the same probed entry — unconditional on `ref_count`, deliberately NOT routed through
-the idle-only `evict_one` path, since serving stale bytes is a correctness bug rather than a
-capacity one — and falls through to the same single-flight reload path that re-resolves and
-re-hashes current bytes (`cache.rs:142-175`); `Err` — a fingerprinted file vanished or became
-unreadable — surfaces as a typed refusal (K2), never silently treated as fresh or stale
-(`cache.rs:176-182`). `stat` only, never a re-hash, so the fast path stays cheap. Honest residual,
+`ModelFingerprint` (`ModelFingerprint::probe`, `crates/jammi-ai/src/model/backend/candle.rs:1026-1083`,
+computed at load by `compute_model_fingerprint`, `candle.rs:1102-1136`, invoked — in a pinned
+fingerprint-then-digest order (audit round 62, F-4'') — via `compute_model_identity_facets`
+(`candle.rs:1167-1173`), called from `CandleBackend::load` at `candle.rs:1931`; exposed via
+`LoadedModel::probe_freshness` (`pub(crate)`), `crates/jammi-ai/src/model/mod.rs:408-413`) UNLOCKED,
+then RE-VALIDATES under a write lock (`Arc::ptr_eq` against the current cache entry) before serving
+the cached `Arc<LoadedModel>` — a narrow race (a concurrent evict/reload winning while this task
+probes) simply retries from the top against whatever is there now; the single-flight path below
+still ensures at most one loader per id: `Ok(true)` serves the snapshot if it is still the current
+entry (`cache.rs:252-279`); `Ok(false)` evicts ONLY the same probed entry — unconditional on
+`ref_count`, deliberately NOT routed through the idle-only `evict_one` path, since serving stale
+bytes is a correctness bug rather than a capacity one — and falls through to the same single-flight
+reload path that re-resolves and re-hashes current bytes (`cache.rs:280-315`); `Err` — a
+fingerprinted file vanished or became unreadable — surfaces as a typed refusal (K2), never silently
+treated as fresh or stale (`cache.rs:316-322`). `stat` only, never a re-hash, so the fast path stays
+cheap. Honest residual,
 documented on `ModelFingerprint`: `(len, mtime)` is a staleness TRIPWIRE, not a cryptographic
 guarantee — a same-length, same-mtime content swap is invisible to it; the `ModelContentDigest`
 recomputed on every actual reload remains the sole authoritative attestation.
@@ -62,6 +64,61 @@ Red-green test: `crates/jammi-ai/tests/it/cache_staleness.rs::warm_hit_after_in_
 mutated model fixture directory. Ledger status is `eval_added`, not yet `closed` — per the
 ledger's own lifecycle it promotes to `closed` only after this branch merges and the cited test
 is green on main.
+
+## esc-057 fix — the required release-note advisory (content_digest joins identity)
+
+Folding `content_digest` into `ModelIdentity` (esc-057, above) means every `DefinitionHash`
+computed before this unit shipped was computed WITHOUT that determinant. The moment a
+process upgrades onto a build that carries the fix, the first `verify_materialization` call
+(or replay) against any PRE-EXISTING `ready` table backed by a model-producing descriptor
+re-derives `definition_hash` WITH the new digest folded in, and that hash will not equal the
+one recorded at write time — every such row reports a mismatch, unconditionally, on first
+touch after the upgrade, regardless of whether the underlying model directory actually
+changed. This is not a regression to work around: it is the fail-safe direction by
+construction (stale — or in this case, incompletely-attested — is DETECTED, never silently
+trusted as still valid), and `recompute` is the documented remedy, exactly the same recovery
+path a genuine `esc-057` collision would require. This is the esc-057 fix working as designed,
+not a new defect it introduces.
+
+**REQUIRED RELEASE-NOTE content for the version that ships this fix**: state plainly that
+upgrading past this version invalidates every previously-recorded `DefinitionHash` for a
+model-producing (`Inference`/`Embedding`) `ProducingDescriptor` — the first
+`verify_materialization`/replay against each such table after the upgrade will report a
+mismatch even with an untouched model directory — and that `recompute` is the expected,
+one-time remedy per affected table. Silence on this point would read as a spurious mass
+mismatch report on upgrade day; naming it in the release note turns it into the expected,
+documented consequence of closing a real identity-completeness gap.
+
+## K4 device leg — narrowing the JAMMI_REQUIRE_CUDA scope claim (round-2 advisory, open)
+
+`crates/jammi-server/tests/it/grpc_remote_session_gpu.rs`'s module doc states: "a pod job that
+meant to prove this leg can never read green having executed zero assertions" as the guarantee
+`JAMMI_REQUIRE_CUDA` provides. That statement is overbroad as written: `JAMMI_REQUIRE_CUDA`
+only converts every skip/early-return path INSIDE the module (the `InferenceSession::open`
+failure inside `start_gpu_engine_server`, and both tests' `let Some(server) = … else { return;
+}`) into a hard panic — it says nothing about whether the module was COMPILED IN at all. A
+build invoked without the `live-gpu-tests` cargo feature (the feature gating the `mod` line
+that pulls this file into the `it` test binary in the first place, per the module's own
+"Gating" section) compiles this entire module OUT; no env var, including
+`JAMMI_REQUIRE_CUDA`, runs inside code that was never compiled, so a feature-omitted invocation
+reads green having executed zero assertions from this leg with `JAMMI_REQUIRE_CUDA` set — the
+exact failure mode the module doc claims cannot happen.
+
+This is a reviewed, deliberate scope decision (KO-7 scope pattern: true-but-deliberate, not an
+oversight), not a gap this unit corrects — feature-omission is out of `JAMMI_REQUIRE_CUDA`'s
+reach BY CONSTRUCTION (it is a runtime env var; feature selection is a compile-time `cargo`
+flag), and is covered instead by the recorded pod invocation's explicit `--features
+cuda,live-gpu-tests` (see the module's own "Live run" command block) — the pod-validation
+discipline this repo already follows never invokes a GPU-gated `it` binary without naming its
+required features explicitly. The accurate scope statement: **the leg is
+require-env-hardened GIVEN the `live-gpu-tests` feature is compiled in; feature-omission is a
+separate, already-covered concern, not a hole in `JAMMI_REQUIRE_CUDA`'s own guarantee.**
+
+docs-ci owns `docs/`, not `crates/jammi-server/tests/it/grpc_remote_session_gpu.rs` — this row
+records the accurate scope statement without editing the test file. Flagged for the next
+wire-server-domain touch of this module: narrow the module doc's "can never read green having
+executed zero assertions" sentence to name the `JAMMI_REQUIRE_CUDA`-given-the-feature-compiled-in
+scope explicitly, rather than the current unqualified claim.
 
 ## KO-7 scan-root widening — its own follow-up, not this unit
 

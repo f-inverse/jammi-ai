@@ -90,6 +90,70 @@ resolver` leg is given `fetch_depth: "0"` for exactly this reason (only that
 one leg pays the deeper-clone cost; every other leg in that matrix stays at
 the normal shallow default).
 
+## The discriminator is ANCESTRY, never local object presence (post-#411 CI fix)
+
+The FIRST version of this section resolved every artifact citation via `git
+show <git_sha>:<path>` unconditionally, on the theory that a well-typed
+`git_sha` is enough. It is not: `check_cuda_run_artifacts.py`'s own schema
+(this same repo's ancestry model) already distinguishes a `git_sha` that IS
+an ancestor of `HEAD` from one that legitimately never can be again — a
+tip that was squash-merged (that gate's `merged_as`/`merged_via_pr` pair),
+or, for a handful of pre-schema artifacts, a `git_sha` grandfathered into
+`LEGACY_NONE_ALLOWLIST` with no ancestry claim made about it at all (see
+that file's own module doc). `bf8e807` (the P1 softmax-fold artifact this
+round's own audit traced) is exactly the second shape: it predates this
+repo's merge-commit discipline, was never an ancestor of `main` even the
+day it was recorded, and `check_cuda_run_artifacts.py` accepts it ONLY
+through that reviewed-legacy arm — never by claiming its tree is reachable.
+A fresh, fully-fetched clone (`fetch-depth: 0`, real history, zero shallow
+ambiguity) can still legitimately never contain `bf8e807`'s objects at all,
+because nothing on `main`'s own history line ever points at it. `git show`
+unconditionally attempting to read it anyway does not fail closed on that —
+it fails OPEN, exactly backwards: on a developer's long-lived local
+checkout, an old feature branch (or its reflog) can leave `bf8e807`'s
+objects sitting in the local object store even though `main` never
+reaches it, so the SAME citation reads GREEN on that machine and RED on a
+CI runner's fresh clone. Object presence is an accident of which branches
+happened to touch a given checkout, never a property of the citation's own
+correctness — the exact fail-open, environment-dependent green this gate
+family exists to kill (`check_cuda_run_artifacts.py`'s own rule (d) already
+refuses to let ancestry-adjacent questions turn on anything but `git
+merge-base`).
+
+Every artifact-scoped citation is instead resolved by a DETERMINISTIC
+three-way split, decided by ancestry alone:
+
+  1. **`git_sha` IS an ancestor of `HEAD`** (`git merge-base --is-ancestor
+     <sha> HEAD`) and the file reads at that sha — sha-relative resolve, the
+     behaviour described above, unchanged.
+  2. **Ancestor, but `git show` still fails** (the sha/path genuinely does
+     not resolve even though `merge-base` calls it reachable) — an ordinary
+     `Violation`, same shape as before; this is a real finding about the
+     citation, not an environment question.
+  3. **`git_sha` is NOT an ancestor of `HEAD`** — the artifact is historical
+     evidence whose tree is not on this branch's history line AT ALL, by
+     construction, on every checkout with equal fetch depth. Every citation
+     inside it is reported as a NAMED, non-failing **EXEMPT** line (never
+     silent, never a `Violation`, never gates CI) stating plainly that it is
+     historical prose this script cannot mechanically verify from this
+     repository line, and that the artifact's own acceptance rests on
+     `check_cuda_run_artifacts.py`'s reviewed-legacy arm
+     (`LEGACY_NONE_ALLOWLIST`) instead — never on this citation resolving.
+     This branch NEVER falls back to HEAD resolution and NEVER attempts
+     `git show` at all: doing either would silently reintroduce the exact
+     object-presence dependency this fix closes (a `git show` that happens
+     to succeed on one machine's stale object store and fail on another's
+     clean clone is not more informative than skipping it honestly).
+
+Ancestry itself needs the SAME shallow guard case 1 does — `git merge-base
+--is-ancestor` on a shallow clone reads back every sha as a false
+non-ancestor, indistinguishable from a genuine case 3 without checking
+first (`check_cuda_run_artifacts.py`'s own rule (d) documents this exact
+trap for its ancestry check). `_require_history` therefore runs BEFORE any
+ancestry conclusion is drawn, not just before the case-1 `git show` —
+computed once per artifact file (the same sha decides every citation inside
+it), never per citation.
+
 Run: `python3 ci/scripts/perf/check_citations.py`
 Hermetic for every non-artifact citation (reads only files in the working
 tree; no network, no build). An artifact-scoped citation additionally shells
@@ -184,14 +248,32 @@ def _is_shallow_repository() -> bool:
 
 
 def _require_history() -> None:
-    """Checked before the FIRST `git show` an artifact-scoped citation
-    needs -- one explicit `CitationError` naming the shallow checkout,
-    never N misleading per-citation "does not resolve" findings that would
-    look like real drift (the same discipline `check_cuda_run_
-    artifacts.py`'s `run_gate` already applies to its own ancestry rule).
+    """Checked before the FIRST ancestry conclusion OR `git show` an
+    artifact-scoped citation needs -- one explicit `CitationError` naming
+    the shallow checkout, never N misleading per-citation "does not
+    resolve" findings that would look like real drift (the same discipline
+    `check_cuda_run_artifacts.py`'s `run_gate` already applies to its own
+    ancestry rule). Ancestry needs this EXACT same guard case 1 does: `git
+    merge-base --is-ancestor` on a shallow clone reads back every sha as a
+    false non-ancestor, indistinguishable from a genuine case-3 (non-
+    ancestor, EXEMPT) citation without checking first.
     """
     if _is_shallow_repository():
         raise CitationError(SHALLOW_CHECKOUT_MESSAGE)
+
+
+def _is_ancestor(sha: str, target: str = "HEAD") -> bool:
+    """Whether `sha` is an ancestor of `target` -- the ONE deterministic
+    discriminator for artifact-citation resolution (never local object
+    presence, which differs by checkout history and is exactly the
+    environment-dependent green this function replaces). A non-zero exit
+    covers both "genuinely not an ancestor" and "not a resolvable object at
+    all in this checkout" -- both correctly fall through to case 3 (EXEMPT)
+    rather than attempting a `git show` whose success would depend on
+    which stale branches this particular checkout happens to still hold.
+    """
+    proc = _run_git(["merge-base", "--is-ancestor", sha, target])
+    return proc.returncode == 0
 
 
 def _artifact_git_sha(path: Path) -> str | None:
@@ -344,6 +426,33 @@ class Violation:
         return f"{rel}:{self.line_no}: {self.message}"
 
 
+class Exemption:
+    """Case 3 of the artifact-citation three-way split (see module doc):
+    the citing artifact's own `git_sha` is NOT an ancestor of `HEAD` --
+    historical evidence off this branch's history line, reported NAMED and
+    printed unconditionally (never silent), but NEVER a `Violation` -- it
+    does not gate CI, and no attempt is made to resolve it (against HEAD OR
+    via `git show`, which would reintroduce the exact object-presence
+    dependency this class exists to avoid). Deliberately a SEPARATE class
+    from `Violation` (not a subclass) -- `main()` keeps the two in
+    independent lists throughout, so an `Exemption` can never be
+    accidentally counted toward a FAIL by a future refactor that forgets
+    to filter by type.
+    """
+
+    def __init__(self, source_path: Path, line_no: int, message: str):
+        self.source_path = source_path
+        self.line_no = line_no
+        self.message = message
+
+    def __str__(self) -> str:
+        try:
+            rel = self.source_path.relative_to(REPO_ROOT)
+        except ValueError:
+            rel = self.source_path
+        return f"{rel}:{self.line_no}: {self.message}"
+
+
 def _iter_source_files():
     seen = set()
     for root in _SEARCH_ROOTS:
@@ -360,18 +469,36 @@ def _iter_source_files():
             yield path
 
 
-def check_file(path: Path) -> list[Violation]:
+def _check_file_impl(path: Path) -> tuple[list[Violation], list[Exemption]]:
+    """The real per-file scan: `check_file` (kept, unchanged signature, for
+    every existing caller/test that only wants the failing findings) is a
+    thin wrapper discarding the second element. `main()` calls this
+    directly so it can also print the non-failing EXEMPT lines the
+    three-way split's case 3 produces (see module doc).
+    """
     violations: list[Violation] = []
+    exemptions: list[Exemption] = []
     try:
         text = path.read_text()
     except (UnicodeDecodeError, OSError):
-        return violations
+        return violations, exemptions
 
     # This citing file's own evidence sha, if it is a qualifying artifact --
     # computed ONCE per file (not per citation): every citation inside the
-    # SAME artifact resolves against the SAME tree.
+    # SAME artifact resolves against the SAME tree, by the SAME ancestry
+    # verdict.
     artifact_sha = _artifact_git_sha(path)
     ident_spans = list(_IDENT_RE.finditer(text))
+
+    # Shallow-first ordering (module doc's "The discriminator is ANCESTRY"
+    # section): the ancestry test itself needs the SAME shallow guard case
+    # 1's `git show` does, checked ONCE per file, before any ancestry
+    # conclusion is drawn -- never per citation, never deferred until a
+    # case-1 `git show` is about to run.
+    sha_is_ancestor: bool | None = None
+    if artifact_sha is not None:
+        _require_history()
+        sha_is_ancestor = _is_ancestor(artifact_sha)
 
     for m in _citation_re().finditer(text):
         cited_file = m.group("file")
@@ -380,7 +507,31 @@ def check_file(path: Path) -> list[Violation]:
 
         target_path = _KNOWN_FILES[cited_file]
 
+        if artifact_sha is not None and not sha_is_ancestor:
+            # Case 3: the artifact's own git_sha is NOT an ancestor of
+            # HEAD -- historical evidence off this branch's history line,
+            # by construction, on every checkout with equal fetch depth.
+            # NEVER resolved (not against HEAD, not via `git show`, which
+            # would silently reintroduce the exact object-presence
+            # dependency this split exists to close) -- named, printed,
+            # non-failing.
+            exemptions.append(
+                Exemption(
+                    path, source_line_no,
+                    f"cites {cited_file}:{cited_line} sha-relative to this artifact's own git_sha "
+                    f"{artifact_sha}, which is NOT an ancestor of HEAD -- historical evidence "
+                    "predating this repo's merge-commit discipline (typically squash-merged away), "
+                    "so its tree is not reachable on this branch's history line at all, on any "
+                    "checkout with equal fetch depth. EXEMPT: this citation is historical prose "
+                    "that cannot be mechanically verified from this repository line; the artifact's "
+                    "own acceptance rests on check_cuda_run_artifacts.py's reviewed-legacy arm "
+                    "(LEGACY_NONE_ALLOWLIST), never on this citation resolving.",
+                )
+            )
+            continue
+
         if artifact_sha is not None:
+            # Case 1 (sha_is_ancestor is True here): sha-relative resolve.
             relpath = _git_relpath(target_path)
             if relpath is None:
                 violations.append(
@@ -394,13 +545,16 @@ def check_file(path: Path) -> list[Violation]:
                 continue
             target_lines = _lines_at_sha(artifact_sha, relpath)
             if target_lines is None:
+                # Case 2: an ancestor sha whose `git show` still fails --
+                # a real finding about the citation, not an environment
+                # question (ancestry already ruled that out).
                 violations.append(
                     Violation(
                         path, source_line_no,
                         f"cites {cited_file}:{cited_line} sha-relative to this artifact's own "
-                        f"recorded git_sha {artifact_sha} (committed evidence is append-only -- "
-                        f"never re-resolved against HEAD), but `git show {artifact_sha}:{relpath}` "
-                        "could not read that file at that sha",
+                        f"recorded git_sha {artifact_sha} (an ancestor of HEAD; committed evidence "
+                        "is append-only -- never re-resolved against HEAD), but "
+                        f"`git show {artifact_sha}:{relpath}` could not read that file at that sha",
                     )
                 )
                 continue
@@ -466,19 +620,36 @@ def check_file(path: Path) -> list[Violation]:
                         "since this was written); re-resolve it against the file at HEAD",
                     )
                 )
+    return violations, exemptions
+
+
+def check_file(path: Path) -> list[Violation]:
+    violations, _exemptions = _check_file_impl(path)
     return violations
 
 
 def main() -> int:
     all_violations: list[Violation] = []
+    all_exemptions: list[Exemption] = []
     checked = 0
     try:
         for path in _iter_source_files():
             checked += 1
-            all_violations.extend(check_file(path))
+            v, e = _check_file_impl(path)
+            all_violations.extend(v)
+            all_exemptions.extend(e)
     except CitationError as exc:
         print(f"check-citations: FAIL (uncomputable) — {exc}", file=sys.stderr)
         return 1
+
+    if all_exemptions:
+        print(
+            f"check-citations: {len(all_exemptions)} EXEMPT citation(s) -- historical evidence "
+            "whose git_sha is not an ancestor of HEAD, never mechanically verified from this "
+            "repository line (see check_cuda_run_artifacts.py's reviewed-legacy arm instead):"
+        )
+        for e in all_exemptions:
+            print(f"  - EXEMPT: {e}")
 
     if all_violations:
         print("check-citations: FAIL", file=sys.stderr)
@@ -487,7 +658,8 @@ def main() -> int:
         return 1
 
     print(f"check-citations: {checked} file(s) scanned, all PATH:LINE citations resolve "
-          "(HEAD for living files, each artifact's own recorded git_sha for committed evidence).")
+          "(HEAD for living files, each artifact's own recorded git_sha for committed evidence "
+          f"reachable from HEAD; {len(all_exemptions)} exempt as non-ancestor legacy evidence).")
     return 0
 
 

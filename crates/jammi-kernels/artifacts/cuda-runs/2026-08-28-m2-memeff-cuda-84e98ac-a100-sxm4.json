@@ -1,0 +1,69 @@
+{
+ "schema_version": 1,
+ "unit": "m2-part2-memeff-cuda",
+ "git_sha": "84e98ac68205201defba1888b88809c6c84d3cb8",
+ "date": "2026-08-28T15:40:00Z",
+ "box": "jammi-a100 (NVIDIA A100-SXM4-80GB, driver 570.172.08, compute_cap 8.0); cross-confirmed bitwise-identical on jammi-l40s (NVIDIA L40S, driver 580.173.02, compute_cap 8.9)",
+ "driver": "570.172.08",
+ "gpu": "NVIDIA A100-SXM4-80GB",
+ "features": "cuda",
+ "status": "GREEN",
+ "env": {
+  "JAMMI_REQUIRE_CUDA": "1"
+ },
+ "producer": {
+  "path": "crates/jammi-kernels/tests/cuda_parity.rs",
+  "kind": "cargo-test",
+  "invocation": "JAMMI_REQUIRE_CUDA=1 cargo test -p jammi-kernels --features cuda --test cuda_parity mem_efficient -- --nocapture",
+  "gating": "env:JAMMI_REQUIRE_CUDA"
+ },
+ "observed": {
+  "bwd_f32_rope_window_dqkv_relative_l1_per_seed": {
+   "201": 1.2096526843390133e-05,
+   "202": 1.4714438885328974e-05,
+   "203": 1.533841420091993e-05,
+   "204": 1.348148760742642e-05,
+   "205": 1.7556631429044714e-05,
+   "206": 1.2561721493785778e-05,
+   "207": 1.7665936624974642e-05,
+   "208": 1.2613889641762068e-05
+  },
+  "bwd_f32_mean": 1.4503630840829083e-05,
+  "bwd_f32_bound": 0.001,
+  "bwd_bf16_rope_window_dqkv_relative_l1_per_seed": {
+   "201": 0.0017935788761085526,
+   "202": 0.0016994689280399305,
+   "203": 0.0022957734447235497,
+   "204": 0.0019425286943871166,
+   "205": 0.0032629215909188904,
+   "206": 0.008105601632039357,
+   "207": 0.01623172482798447,
+   "208": 0.010759117917831485
+  },
+  "bwd_bf16_mean": 0.005761339489004169,
+  "bwd_bf16_bound": 0.06,
+  "note": "First on-device execution of MemEfficientAttention's CUDA composition. Full memeff on-device suite green on both boxes: fwd parity (f32+bf16, plain/rope/window fixtures at window-binding lengths), the Zeros-vs-Propagate policy discriminator (the round-3 audit's F1 regression pin), and the bwd cross-checks above. Values bitwise-identical across A100 and L40S (per-(arch,build) determinism, the M3 sweep finding). cuda_parity 100 passed / 0 failed on both."
+ },
+ "note": "Execution provenance for M2 part 2 (memeff dispatch wiring + CUDA composition) at the branch tip. Also green in the same jobs: the full jammi-kernels cuda suite (344 lib + 100 cuda_parity) and the jammi-encoders cuda,flash-attn suite (177 lib) including the full-forward suppression-seam tests and the F16 fallback regression pin. PROVENANCE: branch sha \u2014 the train PR must land as a MERGE COMMIT.",
+ "legs": [
+  {
+   "name": "jammi-kernels lib suite (cuda)",
+   "status": "ok",
+   "passed": 344,
+   "failed": 0
+  },
+  {
+   "name": "cuda_parity incl. 10-leg memeff on-device oracle (fwd/bwd, f32+bf16, policy discriminator)",
+   "status": "ok",
+   "passed": 100,
+   "failed": 0,
+   "note": "1 ignored (pre-existing)"
+  },
+  {
+   "name": "jammi-encoders lib suite (cuda,flash-attn) incl. full-forward memeff dispatch tests",
+   "status": "ok",
+   "passed": 177,
+   "failed": 0
+  }
+ ]
+}

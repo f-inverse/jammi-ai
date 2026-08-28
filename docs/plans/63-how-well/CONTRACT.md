@@ -116,3 +116,23 @@ As unit 62's: own worktree + unique CARGO_TARGET_DIR; exact full gates per-step 
 not branch names; gate/workflow edits human-merged; numbers measured not derived; verifiers
 end with the fenced json verdict block LAST; class_enumeration required in phase-4/5/6
 verdicts; no consumer names; docs reflect current state.
+
+## Amendment 2026-08-28 (lead, post-H4a): objective selection under the triplet-shaped fixture
+
+H4a surfaced that the committed H3 fixture is triplet-shaped (anchor/positive/negative per
+row), while the Frame's "embedding_loss+temp" phrasing anticipated MNRL. The chapter itself
+trains both families; the fixture's (anchor, positive) projection serves MNRL losslessly
+(in-batch negatives replace the mined negative; held-out ids unchanged). PRE-REGISTERED
+RESOLUTION, decided by H5 step 0's dynamic-range probe (both objectives, 1 seed each, both
+arms — still ~$1):
+- Selection rule: choose the objective whose probe shows tie_fraction under the cap AND the
+  larger held-out movement/floor ratio; MNRL is the default on ties or ambiguity. The
+  non-selected objective is dropped from v1 (no second protocol), its probe result recorded
+  in the calibration artifact.
+- Identity semantics per objective: MNRL → temperature non-null, margin null(NullMeans:
+  "objective is mnrl"); Triplet → margin non-null, temperature null(NullMeans: "objective is
+  triplet"). embedding_loss stays in identity either way.
+- The tier must therefore run BOTH objectives over the committed fixture (triplet natively;
+  MNRL via the (anchor, positive) projection in committed order) — H4a delta.
+- The tie-cap premise leg stays conjunctive regardless of objective (C16's own hinge
+  warning; MNRL keeps it as a cheap invariant).

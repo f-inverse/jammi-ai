@@ -68,14 +68,32 @@ pub(crate) trait CandleTextForward: Send + Sync {
     /// (`None`) after calling this default would wrongly conclude no
     /// pooling occurred. If you override ONE of these two methods, override
     /// BOTH, so `resolved_pooling()` always reports the SAME strategy this
-    /// method actually applies. The three classification wrappers below
-    /// (`*ClassificationForward`) are the one place both defaults are used
-    /// together today, and that pairing is safe ONLY because
-    /// `LoadedModel::forward` never routes `ModelTask::TextEmbedding` (the
-    /// sole caller of `forward_pooled`) to a classification-loaded model —
-    /// this default is dead code for them, never actually invoked over
-    /// their softmax-logit `forward_hidden` output. Do not rely on that
-    /// routing invariant for a NEW wrapper without re-verifying it holds.
+    /// method actually applies.
+    ///
+    /// **A2 correction (audit round 62, adversarial round 6, R5-F2)**: this
+    /// doc previously claimed the three classification wrappers below
+    /// (`*ClassificationForward`) were safe inheriting BOTH trait defaults
+    /// together because `LoadedModel::forward` "never routes
+    /// `ModelTask::TextEmbedding` to a classification-loaded model" — that
+    /// was an ASSUMED invariant, not an ENFORCED one, and it does not hold:
+    /// [`super::super::cache::ModelCache`] keys its warm cache purely on
+    /// [`crate::model::ModelId`] (no [`ModelTask`] on a `CacheEntry`), and neither
+    /// `ModelCache::get_or_load`'s warm-hit path nor `EmbeddingPipeline`
+    /// compares the requesting task against the task the entry was
+    /// originally loaded for. A model loaded once for `Classification` and
+    /// then requested again for `TextEmbedding` against the SAME id
+    /// genuinely reaches this trait's default `forward_pooled` over a
+    /// classification wrapper's softmax-logit `forward_hidden` output —
+    /// mean-pooling class probabilities into a shape/width that has nothing
+    /// to do with an embedding. The three classification wrappers now
+    /// override BOTH this method (a typed refusal —
+    /// `classification_pooling_refusal`) and [`Self::resolved_pooling`]
+    /// (`classification_resolved_pooling`, honestly `None`), so the
+    /// mismatch is refused AT THE SURFACE the moment it is reached, rather
+    /// than assumed unreachable by a routing invariant nothing enforced.
+    /// The cache's id-only key is a separate, known, pre-existing design
+    /// point (whether to rekey on task too) — this refusal closes the
+    /// SAFETY hole without touching that key.
     fn forward_pooled(
         &self,
         input_ids: &Tensor,
@@ -106,13 +124,17 @@ pub(crate) trait CandleTextForward: Send + Sync {
     /// A1, folded round 4)**: `forward_pooled`'s own default is NOT a no-op
     /// — it mean-pools for real — so this method's `None` default is
     /// truthful ONLY for a wrapper that never actually reaches
-    /// `forward_pooled`'s default at runtime (see that method's doc for
-    /// which callers/routing that depends on). A wrapper that inherits
+    /// `forward_pooled`'s default at runtime. A wrapper that inherits
     /// `forward_pooled`'s default AND is reachable via
     /// `ModelTask::TextEmbedding` must override THIS method to return
     /// `Some(Pooling::Mean)` — inheriting both defaults together for a
     /// wrapper that pooling actually applies to is the exact silent
-    /// mismatch this note exists to prevent.
+    /// mismatch this note exists to prevent. The three classification
+    /// wrappers instead override BOTH methods to refuse the mismatch
+    /// outright rather than inherit either default — see
+    /// [`Self::forward_pooled`]'s A2 correction (R5-F2) for why the
+    /// underlying routing invariant this pairing rule warned about is not
+    /// merely theoretical.
     fn resolved_pooling(&self) -> Option<Pooling> {
         None
     }
@@ -173,6 +195,43 @@ impl CandleAudioForward for HtsatAudio {
 fn pool_via(hidden: &Tensor, attention_mask: &Tensor, strategy: Pooling) -> Result<Tensor> {
     jammi_encoders::pool_and_normalize(hidden, attention_mask, strategy)
         .map_err(|e| JammiError::Inference(format!("pooling failed: {e}")))
+}
+
+/// The typed refusal every classification wrapper's [`CandleTextForward::forward_pooled`]
+/// override returns (audit round 62, adversarial round 6, R5-F2). `forward_pooled`
+/// is [`ModelTask::TextEmbedding`]'s sole entry point — pooling is not a
+/// meaningful operation over a classification head's softmax-logit
+/// `forward_hidden` output, so this refuses rather than silently running
+/// `CandleTextForward::forward_pooled`'s trait-default mean-pool over it
+/// (which either shape-errors, or — worse — mean-pools softmax
+/// probabilities into a confident-wrong "embedding" of the WRONG width).
+///
+/// This closes the gap the pre-fix A1 doc's routing invariant assumed away:
+/// [`super::super::cache::ModelCache`] keys its cache purely on
+/// [`crate::model::ModelId`], carrying no [`ModelTask`] on a warm entry — a caller requesting
+/// `TextEmbedding` against a model id that was actually loaded (by an
+/// earlier caller, or a different task on the same process) for
+/// `Classification` reaches this same warm entry and this same
+/// `forward_pooled` call. The mismatch must be refused HERE, at the one
+/// seam every such call passes through, rather than assumed unreachable by
+/// a doc comment nothing enforces.
+fn classification_pooling_refusal() -> JammiError {
+    JammiError::Inference(
+        "model was loaded for classification; text-embedding pooling is not defined for it".into(),
+    )
+}
+
+/// The [`CandleTextForward::resolved_pooling`] every classification
+/// wrapper overrides to alongside [`classification_pooling_refusal`]
+/// (audit round 62, adversarial round 6, R5-F2): `None` is honest here —
+/// pooling is not merely "unresolved," it is refused outright by
+/// `forward_pooled` above, so there is no strategy to report. Overriding
+/// this explicitly (rather than relying on the trait's `None` default)
+/// keeps the two methods' pairing visible at each classification wrapper's
+/// own `impl` block, matching the discipline the A1 pairing-rule doc
+/// requires of every wrapper that overrides one of this pair.
+fn classification_resolved_pooling() -> Option<Pooling> {
+    None
 }
 
 /// BERT-family forward pass (bert, roberta, camembert, xlm-roberta). Carries
@@ -340,6 +399,20 @@ impl CandleTextForward for DistilBertClassificationForward {
         candle_nn::ops::softmax(&logits, candle_core::D::Minus1)
             .map_err(|e| JammiError::Inference(format!("Softmax failed: {e}")))
     }
+
+    fn forward_pooled(
+        &self,
+        _input_ids: &Tensor,
+        _attention_mask: &Tensor,
+        _encoding: &BatchEncoding,
+        _device: &Device,
+    ) -> Result<Tensor> {
+        Err(classification_pooling_refusal())
+    }
+
+    fn resolved_pooling(&self) -> Option<Pooling> {
+        classification_resolved_pooling()
+    }
 }
 
 /// ModernBERT sequence classification forward pass.
@@ -363,6 +436,20 @@ impl CandleTextForward for ModernBertClassificationForward {
         })?;
         candle_nn::ops::softmax(&logits, candle_core::D::Minus1)
             .map_err(|e| JammiError::Inference(format!("Softmax failed: {e}")))
+    }
+
+    fn forward_pooled(
+        &self,
+        _input_ids: &Tensor,
+        _attention_mask: &Tensor,
+        _encoding: &BatchEncoding,
+        _device: &Device,
+    ) -> Result<Tensor> {
+        Err(classification_pooling_refusal())
+    }
+
+    fn resolved_pooling(&self) -> Option<Pooling> {
+        classification_resolved_pooling()
     }
 }
 
@@ -402,6 +489,20 @@ impl CandleTextForward for BertClassificationForward {
             .map_err(|e| JammiError::Inference(format!("Classifier forward failed: {e}")))?;
         candle_nn::ops::softmax(&logits, candle_core::D::Minus1)
             .map_err(|e| JammiError::Inference(format!("Softmax failed: {e}")))
+    }
+
+    fn forward_pooled(
+        &self,
+        _input_ids: &Tensor,
+        _attention_mask: &Tensor,
+        _encoding: &BatchEncoding,
+        _device: &Device,
+    ) -> Result<Tensor> {
+        Err(classification_pooling_refusal())
+    }
+
+    fn resolved_pooling(&self) -> Option<Pooling> {
+        classification_resolved_pooling()
     }
 }
 
@@ -745,10 +846,18 @@ fn content_digest_entries(resolved: &ResolvedModel) -> Result<Vec<(String, std::
 /// [`CandleBackend::load`]'s own `is_clap`/`audio.is_some()` branch uses to
 /// choose the audio path) it is REQUIRED — that loader path has no
 /// fallback and hard-refuses outright when the file is missing (see
-/// `audio_frontend`'s construction in `CandleBackend::load`). `config.json`,
-/// the tokenizer, every weights path, and the adapter pair (once
+/// `audio_frontend`'s construction in `CandleBackend::load`). The tokenizer
+/// is ALSO unconditionally optional (audit round 62, adversarial round 6,
+/// R5-F1) — every resolver path (`discover_local_tokenizer` locally, the HF
+/// Hub path's `tokenizer.json`/`bpe_simple_vocab_16e6.txt.gz` fallback chain
+/// remotely) already re-derives `tokenizer: None` when absent instead of
+/// erroring, and [`CandleBackend::load`]'s `.transpose()?` over that
+/// `Option` accepts `None` outright: the reload SUCCEEDS with
+/// `self.tokenizer == None`, exactly mirroring what a cold process loading
+/// the same (tokenizer-less) directory would produce. Only
+/// `config.json`, every weights path, and the adapter pair (once
 /// `adapter_path` is `Some`) are unconditionally required because the
-/// loader has no fallback for any of them — their absence makes any reload
+/// loader has no fallback for any of THOSE — their absence makes any reload
 /// fail identically regardless of model class. See
 /// [`preprocessor_config_is_required`] for the per-class predicate and
 /// [`ModelFingerprint::probe`] for the arm this field selects.
@@ -818,12 +927,31 @@ fn all_candidate_paths(resolved: &ResolvedModel) -> Result<Vec<DigestCandidate>>
         optional: !preprocessor_config_is_required(resolved),
     });
 
+    // The tokenizer (audit round 62, adversarial round 6, R5-F1): NOT
+    // required, despite the pre-fix comment's claim that "the loader has no
+    // fallback" — every resolver path (`discover_local_tokenizer` locally,
+    // the HF Hub `tokenizer.json` / `bpe_simple_vocab_16e6.txt.gz` fallback
+    // chain remotely) already re-derives `tokenizer: None` when the file is
+    // absent instead of erroring, and `CandleBackend::load`'s
+    // `.transpose()?` over that `Option` accepts `None`: the reload
+    // succeeds with `self.tokenizer == None`, matching cold-process
+    // semantics exactly. A text-encoding call fails LATER with that path's
+    // own typed error ("No tokenizer loaded for ... model") at USE time,
+    // not at load time; a CLAP audio model's `forward_audio_embedding`
+    // never reads `self.tokenizer` at all, so it serves unaffected.
+    // `optional: false` here (unconditionally required, regardless of
+    // model class) would permanently wedge `ModelCache::get_or_load` on a
+    // model a cold process serves fine, the moment `tokenizer.json` is
+    // deleted from a live model directory (`ModelFingerprint::probe`'s arm
+    // (c): typed refusal, entry retained, every subsequent call re-probes
+    // and re-refuses forever) — arm (b) (stale, evict + reload) is the
+    // correct classification.
     if let Some(tokenizer) = &resolved.tokenizer {
         candidates.push(RawCandidate {
             path: tokenizer.path().to_path_buf(),
             anchor: model_dir.clone(),
             gated: true,
-            optional: false,
+            optional: true,
         });
     }
 
@@ -1003,25 +1131,32 @@ impl ModelFingerprint {
     ///
     /// (a) absent-at-load, absent-now: unchanged — `Ok(true)` continues.
     /// (b) OPTIONAL candidate, present-at-load, `NotFound`-now (e.g.
-    ///     `1_Pooling/config.json` deleted from a live model directory, or
-    ///     `preprocessor_config.json` deleted from a live NON-CLAP model):
-    ///     the loader has a documented fallback for this candidate's absence
-    ///     on THIS model's class (mean pooling / no preprocessor geometry) —
-    ///     a fresh reload legitimately SUCCEEDS, with a NEW digest reflecting
-    ///     the fallback. Reported as STALE (`Ok(false)`), not `Err`: the
-    ///     pre-F-4' code collapsed this into `Err` indistinguishably from
-    ///     arm (c), permanently wedging `ModelCache::get_or_load` on a model
-    ///     that a cold reload would serve just fine. `optional` is a
-    ///     per-CLASS property, not a per-slot constant (audit round 62,
-    ///     F-B) — `preprocessor_config.json` deleted from a live HF-CLAP
-    ///     audio model is NOT this arm; see [`preprocessor_config_is_required`]
-    ///     and arm (c) below.
-    /// (c) REQUIRED candidate (`config.json`, the tokenizer, any weights
-    ///     path, the adapter pair once `adapter_path` is `Some`, OR
-    ///     `preprocessor_config.json` deleted from a live HF-CLAP audio
-    ///     model — audit round 62, F-B), present-at-load, `NotFound`-now:
-    ///     the loader has NO fallback — a reload would fail identically —
-    ///     so this remains the typed refusal (`Err`), unchanged from before
+    ///     `1_Pooling/config.json` deleted from a live model directory,
+    ///     `preprocessor_config.json` deleted from a live NON-CLAP model, or
+    ///     the tokenizer deleted from ANY live model directory — audit round
+    ///     62, adversarial round 6, R5-F1): the loader has a documented
+    ///     fallback for this candidate's absence on THIS model's class (mean
+    ///     pooling / no preprocessor geometry / `tokenizer: None`, with any
+    ///     text-encoding call refused at USE time by its own typed error
+    ///     instead of at load time — see `all_candidate_paths`' tokenizer
+    ///     candidate doc) — a fresh reload legitimately SUCCEEDS, with a NEW
+    ///     digest reflecting the fallback. Reported as STALE (`Ok(false)`),
+    ///     not `Err`: the pre-F-4' code collapsed this into `Err`
+    ///     indistinguishably from arm (c), permanently wedging
+    ///     `ModelCache::get_or_load` on a model that a cold reload would
+    ///     serve just fine. `optional` is a per-CLASS property, not a
+    ///     per-slot constant (audit round 62, F-B) — `preprocessor_config.json`
+    ///     deleted from a live HF-CLAP audio model is NOT this arm; see
+    ///     [`preprocessor_config_is_required`] and arm (c) below. The
+    ///     tokenizer, by contrast, is UNCONDITIONALLY this arm across every
+    ///     model class, including CLAP audio (whose forward path never reads
+    ///     `self.tokenizer` at all).
+    /// (c) REQUIRED candidate (`config.json`, any weights path, the adapter
+    ///     pair once `adapter_path` is `Some`, OR `preprocessor_config.json`
+    ///     deleted from a live HF-CLAP audio model — audit round 62, F-B),
+    ///     present-at-load, `NotFound`-now: the loader has NO fallback — a
+    ///     reload would fail identically — so this remains the typed
+    ///     refusal (`Err`), unchanged from before
     ///     F-4'.
     pub(crate) fn probe(&self) -> Result<bool> {
         for (rel, path, snapshot, optional) in &self.entries {
@@ -4027,6 +4162,110 @@ mod digest_fingerprint_audit62_tests {
         );
     }
 
+    // ── R5-F1 (audit round 62, adversarial round 6): the tokenizer \
+    //    candidate is unconditionally OPTIONAL, not over-required ──
+
+    /// R5-F1 (block): reproduces the auditor's exact scenario. `tokenizer.json`
+    /// is present at fingerprint-capture time (`tiny_bert_resolved` always
+    /// ships one), then deleted from the live model directory — as if a
+    /// caller pruned stale artifacts.
+    ///
+    /// RED pre-fix: the tokenizer candidate's `optional` was fixed `false`
+    /// unconditionally ("the loader has no fallback"), which is false for
+    /// this slot — every resolver path re-derives `tokenizer: None` on
+    /// absence instead of erroring, and `CandleBackend::load`'s
+    /// `.transpose()?` accepts `None` outright. `probe()` nonetheless fell
+    /// into arm (c) and returned `Err`, and because `ModelCache::get_or_load`
+    /// retains the `CacheEntry` on an `Err` probe (never evicts it), every
+    /// SUBSEQUENT `get_or_load` on the same id would re-probe the same
+    /// vanished file and re-`Err` — permanently wedging a model a cold
+    /// process would serve just fine.
+    ///
+    /// GREEN post-fix: the tokenizer candidate classifies as `optional:
+    /// true` — arm (b) applies, `probe()` reports `Ok(false)` (stale), and
+    /// the caller evicts + reloads instead of wedging forever.
+    #[test]
+    fn probe_tokenizer_deleted_after_capture_is_stale_not_a_refusal() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = tiny_bert_resolved(&dst, None);
+
+        let fingerprint = compute_model_fingerprint(&resolved).unwrap();
+        assert!(
+            fingerprint.probe().unwrap(),
+            "sanity: fresh immediately after capture"
+        );
+
+        std::fs::remove_file(dst.join("tokenizer.json")).unwrap();
+
+        let result = fingerprint.probe();
+        assert!(
+            matches!(result, Ok(false)),
+            "tokenizer.json deleted from a live model directory must report \
+             STALE (Ok(false)) — every resolver path re-derives \
+             `tokenizer: None` on absence and `CandleBackend::load` accepts \
+             it, so a reload legitimately succeeds mirroring cold-process \
+             semantics (R5-F1) — never Err, which would permanently wedge \
+             `ModelCache::get_or_load` on this id. Got {result:?}"
+        );
+    }
+
+    /// R5-F1 peer: two consecutive `probe()` calls after the SAME deletion
+    /// must both report stale (never wedge on the second call either) — the
+    /// exact "permanently wedges" failure mode the auditor named, expressed
+    /// at the fingerprint level (the fingerprint itself is immutable once
+    /// captured, so "two consecutive calls" is "the same fingerprint probed
+    /// twice"; `ModelCache::get_or_load`'s own two-consecutive-calls
+    /// behavior is covered end-to-end in `cache.rs`).
+    #[test]
+    fn probe_tokenizer_deleted_never_wedges_on_repeated_probes() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = tiny_bert_resolved(&dst, None);
+
+        let fingerprint = compute_model_fingerprint(&resolved).unwrap();
+        std::fs::remove_file(dst.join("tokenizer.json")).unwrap();
+
+        for attempt in 0..2 {
+            let result = fingerprint.probe();
+            assert!(
+                matches!(result, Ok(false)),
+                "repeated probe #{attempt} against the same deleted-tokenizer \
+                 fingerprint must keep reporting stale, never wedge into a \
+                 permanent Err — got {result:?}"
+            );
+        }
+    }
+
+    /// R5-F1 (digest side): once `tokenizer.json` is gone and the model is
+    /// reloaded (simulated here by re-resolving with `tokenizer: None`, the
+    /// same shape `discover_local_tokenizer` returns for a tokenizer-less
+    /// directory), the content digest must no longer include a tokenizer
+    /// record — `content_digest_entries` gates each candidate on the
+    /// resolver's own presence signal, so the tokenizer entry leaves the
+    /// fold entirely rather than hashing a vanished path.
+    #[test]
+    fn content_digest_drops_tokenizer_entry_once_resolver_reports_it_absent() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved_with_tokenizer = tiny_bert_resolved(&dst, None);
+        let digest_with_tokenizer = compute_model_content_digest(&resolved_with_tokenizer).unwrap();
+
+        std::fs::remove_file(dst.join("tokenizer.json")).unwrap();
+        let mut resolved_without_tokenizer = resolved_with_tokenizer;
+        resolved_without_tokenizer.tokenizer = None;
+        let digest_without_tokenizer =
+            compute_model_content_digest(&resolved_without_tokenizer).unwrap();
+
+        assert_ne!(
+            digest_with_tokenizer, digest_without_tokenizer,
+            "the content digest must change once the resolver stops \
+             reporting a tokenizer candidate (R5-F1) — the tokenizer record \
+             must leave the fold, not silently keep hashing a path that no \
+             longer exists"
+        );
+    }
+
     // ── F-4'' (audit round 62, adversarial round 3): fingerprint-before- \
     //    digest ordering ──
     //
@@ -4171,5 +4410,144 @@ mod digest_fingerprint_audit62_tests {
             "compute_model_identity_facets's fingerprint must report fresh \
              over the same (unmutated) directory it was captured from"
         );
+    }
+}
+
+// ── R5-F2 (audit round 62, adversarial round 6): a classification-loaded \
+//    model must refuse a TextEmbedding request, not silently mean-pool \
+//    softmax logits ──
+
+#[cfg(test)]
+mod r5_f2_classification_pooling_tests {
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, StringArray};
+
+    use super::*;
+
+    fn device_config() -> DeviceConfig {
+        DeviceConfig {
+            gpu_device: -1,
+            memory_fraction: 1.0,
+            require_gpu: false,
+            compute_precision: jammi_numerics::ComputePrecision::F32,
+        }
+    }
+
+    fn two_row_content() -> Vec<ArrayRef> {
+        vec![Arc::new(StringArray::from(vec!["fine row", "another row"])) as ArrayRef]
+    }
+
+    /// A `ResolvedModel` for the `tiny_modernbert_classifier` cookbook
+    /// fixture (`model_type: "modernbert"`, `id2label` present — the exact
+    /// shape `CandleBackend::load`'s `is_classification` gate requires),
+    /// resolved for `ModelTask::Classification` — the SAME construction a
+    /// real `ModelResolver::resolve` + `ModelCache::get_or_load` call would
+    /// produce for a caller that loaded this model to classify.
+    fn tiny_modernbert_classifier_resolved(dst: &std::path::Path) -> ResolvedModel {
+        std::fs::create_dir_all(dst).unwrap();
+        let fixture = jammi_test_utils::cookbook_fixture("tiny_modernbert_classifier");
+        for name in ["config.json", "model.safetensors", "tokenizer.json"] {
+            std::fs::copy(fixture.join(name), dst.join(name)).unwrap();
+        }
+        let model_config: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(dst.join("config.json")).unwrap()).unwrap();
+        ResolvedModel {
+            model_id: crate::model::ModelId(format!("local:{}", dst.display())),
+            backend: crate::model::BackendType::Candle,
+            task: ModelTask::Classification,
+            config_path: dst.join("config.json"),
+            weights_paths: vec![dst.join("model.safetensors")],
+            tokenizer: Some(TokenizerSource::HuggingFaceJson(dst.join("tokenizer.json"))),
+            model_config,
+            preprocessor_config: None,
+            pooling_config: None,
+            base_model_id: None,
+            adapter_path: None,
+            estimated_memory: 0,
+        }
+    }
+
+    /// R5-F2 (block): reproduces the auditor's exact mismatch at the
+    /// closest constructible seam — `CandleBackend::load` a genuine
+    /// classification-shaped checkpoint (the SAME construction a
+    /// `ModelCache` warm entry loaded for `ModelTask::Classification` would
+    /// hold), then request `ModelTask::TextEmbedding` against that SAME
+    /// `LoadedModel` — exactly what a second caller reaches through
+    /// `ModelCache::get_or_load` today, since the cache keys purely on
+    /// `ModelId` and never compares the originally-loaded task against a
+    /// new request's task.
+    ///
+    /// RED pre-fix: none of the three classification wrappers overrode
+    /// `forward_pooled`, so `LoadedModel::forward(.., TextEmbedding)` →
+    /// `CandleModel::forward_embedding` → `self.text_forward()?.forward_pooled(..)`
+    /// silently fell through to `CandleTextForward`'s trait-default —
+    /// REAL mean-pooling over the classification wrapper's softmax-logit
+    /// `forward_hidden` output (a `[batch, num_classes]` probability
+    /// distribution, not a per-token hidden state sequence) — producing
+    /// either a shape error deep inside candle (opaque, not a typed
+    /// refusal) or, worse, a confident-wrong tensor of the wrong width.
+    ///
+    /// GREEN post-fix: the classification wrapper's `forward_pooled`
+    /// override refuses immediately with a named, typed
+    /// `JammiError::Inference`, never reaching `mean_pool`/`l2_normalize`
+    /// at all.
+    #[test]
+    fn classification_loaded_model_refuses_text_embedding_request() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = tiny_modernbert_classifier_resolved(&dst);
+
+        let backend = CandleBackend;
+        let loaded = backend
+            .load(&resolved, &device_config())
+            .expect("a genuinely classification-shaped checkpoint must load successfully");
+
+        let content = two_row_content();
+        let result = loaded.forward(&content, ModelTask::TextEmbedding);
+
+        match result {
+            Ok(_) => panic!(
+                "a classification-loaded model must REFUSE a TextEmbedding \
+                 request with a typed error (R5-F2) — never silently produce \
+                 a tensor by falling through to forward_pooled's mean-pool \
+                 default over softmax-logit output"
+            ),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("classification") && msg.contains("pooling"),
+                    "expected the classification-pooling-mismatch typed \
+                     refusal (from `classification_pooling_refusal`), got: {msg}"
+                );
+            }
+        }
+    }
+
+    /// Control (F family: non-vacuous negative control): the IDENTICAL
+    /// classification-loaded model must still serve its OWN task
+    /// (`Classification`) successfully — the fix must refuse the MISMATCH
+    /// specifically, not classification serving in general.
+    #[test]
+    fn classification_loaded_model_still_serves_classification_request() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = tiny_modernbert_classifier_resolved(&dst);
+
+        let backend = CandleBackend;
+        let loaded = backend
+            .load(&resolved, &device_config())
+            .expect("a genuinely classification-shaped checkpoint must load successfully");
+
+        let content = two_row_content();
+        let result = loaded.forward(&content, ModelTask::Classification);
+        match result {
+            Ok(_) => {}
+            Err(e) => panic!(
+                "the classification wrapper's OWN task must still serve \
+                 successfully — the fix refuses the TextEmbedding MISMATCH, \
+                 not classification itself. Got Err({e})"
+            ),
+        }
     }
 }

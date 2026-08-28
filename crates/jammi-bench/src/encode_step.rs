@@ -207,6 +207,18 @@ fn requested_device_label(gpu_device: i32) -> String {
 /// requested ordinal and actually-resolved device are the same value by
 /// construction: there is no code path left in which `gpu_device` names a
 /// CUDA ordinal the run did not truly execute on.
+///
+/// **Qualification (audit round 62, adversarial round 6, folded advisory)**:
+/// on a build compiled with `feature = "metal"` but not `"cuda"`,
+/// `select_device` itself can genuinely SUCCEED for a `gpu_device >= 0`
+/// request via its metal branch (real Metal hardware, mislabeled here as a
+/// CUDA ordinal) — the "first model load fails" argument above does not
+/// apply on that build. The guarantee still holds there, but for a
+/// DIFFERENT reason: this function's `cuda_device_name` call unconditionally
+/// errors on any `not(feature = "cuda")` build (see its stub in
+/// `gpu_inference.rs`), aborting `run()` before a mismatched, Metal-resolved
+/// device name could ever populate this field. Both mechanisms are needed to
+/// state the full picture; neither alone covers every build.
 fn resolved_device_name(gpu_device: i32) -> Result<String, Box<dyn std::error::Error>> {
     if gpu_device < 0 {
         Ok("cpu".to_string())

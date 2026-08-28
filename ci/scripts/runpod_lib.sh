@@ -977,6 +977,25 @@ else:
     RP_POD_CREATED=1
     echo "  deployed ${RP_POD_ID} on ${cloud} / ${gpu}; waiting for SSH (≤${RP_SSH_WAIT_SECS}s)..."
     RP_HOST=""; RP_PORT=""
+    # WRITE-AHEAD (esc-056): record the session — pod id, arch, a
+    # host-unknown placeholder (RP_HOST/RP_PORT are still "" here) — THE
+    # MOMENT the pod exists, before the reachability wait below. The wait can
+    # run for minutes; a failure in that window (an external kill that
+    # bypasses the EXIT trap, or a trap-time `rp_terminate` call that itself
+    # silently fails — rp_cleanup throws that response away by design) must
+    # not leave a running, billing pod recorded NOWHERE — invisible to
+    # `ls`/`down`, caught only by `reap`'s own 72h-late sweep. Observed live:
+    # a four-way parallel `up` left an H100 pod running with no session
+    # record after a post-create failure; a human had to find and terminate
+    # it by hand via the RunPod console. rp_session_save is a no-op for a
+    # `shell` (RP_SESSION is empty there — see gpu-dev.sh), so this only
+    # takes effect for `up`. The identical call below (after SSH is up and
+    # the driver floor is confirmed) then UPDATES this same record with the
+    # real RP_HOST/RP_PORT — this is an update-in-place, not a second,
+    # independent record, and does not change the `up --replace` contract
+    # (that check runs in gpu-dev.sh BEFORE rp_deploy_arch/rp_deploy_live are
+    # ever called, against whatever THIS invocation loaded at startup).
+    rp_session_save
     # A wall-clock deadline, not a fixed iteration count: the old
     # 24-iteration/10s-sleep loop was a HARD-CODED 4-minute budget no caller
     # could raise, and a cold host still pulling the multi-GB CUDA image can
@@ -1002,6 +1021,9 @@ p=(json.load(sys.stdin).get("data",{}).get("pod") or {}).get("runtime") or {}
           echo "  SSH up on ${RP_HOST}:${RP_PORT} (driver ${drv})"
           # RP_POD_CREATED was already set the moment RP_POD_ID was read from
           # the deploy response, above — not here, which is minutes later.
+          # This UPDATES the write-ahead record made right after that (see
+          # above): same session file, now with the real RP_HOST/RP_PORT in
+          # place of the host-unknown placeholder — never a second record.
           rp_session_save; return 0
         fi
         echo "  pod ${RP_POD_ID} driver '${drv:-unknown}' is below the r${RP_MIN_DRIVER_MAJOR} floor; terminating and trying next candidate"

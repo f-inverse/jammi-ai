@@ -128,6 +128,21 @@ healthy pod to the poll's own timeout:
 RP_SSH_WAIT_SECS=900 ci/scripts/gpu-dev.sh shell a100
 ```
 
+### `up` records the session write-ahead, before the reachability wait
+
+A pod bills from the instant the deploy mutation returns an id — not from
+the instant it answers SSH, which can be minutes later. `up` records the
+session (pod id, arch, a host-unknown placeholder for host/port) at that
+first instant, *before* the SSH-reachability wait and the driver-floor check
+below it; the same record is then updated in place with the real host/port
+once the pod is confirmed reachable. A failure during that wait — an
+external kill that bypasses the tooling's own EXIT-trap teardown, or a
+trap-time terminate call that itself silently fails — therefore still
+leaves a session `ls` shows and `down` can terminate, rather than a running,
+billing pod recorded nowhere and caught only by `reap`'s own late sweep.
+`bootstrap_or_die`'s own failure paths print the recorded pod id and the
+exact `down <session>` command to run, never a swallowed exit.
+
 ## Interactive debugging
 
 ```bash

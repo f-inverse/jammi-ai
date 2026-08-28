@@ -614,6 +614,23 @@ require_pod() {
   exit 1
 }
 
+# esc-056: a bootstrap failure ends this invocation before `rp_keep` is ever
+# called, so the EXIT trap's own best-effort `rp_terminate` (rp_cleanup,
+# runpod_lib.sh) is the ONLY thing standing between this pod and orphaned
+# billing — and that call throws its own response away by design (it also
+# runs on every ordinary exit, where a network hiccup must not turn a normal
+# teardown into a hard failure). Never a swallowed exit: name the pod id and
+# the session it is recorded under (the write-ahead record — see
+# rp_deploy_live's own doc in runpod_lib.sh — already has it on disk the
+# moment the pod exists, well before this can run) so a silently-failed trap
+# termination is still recoverable by hand. `shell` never reaches here with a
+# named session (RP_SESSION is force-cleared for it above), so this is
+# effectively `up`-only.
+report_pod_recorded() {
+  [ -n "${RP_SESSION:-}" ] && [ -n "${RP_POD_ID:-}" ] || return 0
+  echo "::error::pod ${RP_POD_ID} recorded under session '${RP_SESSION}'; run '$(basename "$0") down ${RP_SESSION}' to terminate"
+}
+
 # Bootstrap the pod, and decide what each outcome means. A pod on the wrong code
 # answers the wrong question convincingly, so a failed bootstrap ends the
 # session rather than handing you a shell on it.
@@ -631,11 +648,12 @@ bootstrap_or_die() {
     3) [ "$REF_EXPLICIT" = 0 ] || {
          echo "::error::--ref ${REF} cannot be honoured: ${RP_IMAGE} ships no git"
          echo "::error::terminating pod (trap)"
+         report_pod_recorded
          exit 1
        }
        echo "=== no checkout: this image ships no git, so the pod is on no ref ==="
        return 0 ;;
-    *) echo "::error::bootstrap failed — terminating pod (trap)"; exit 1 ;;
+    *) echo "::error::bootstrap failed — terminating pod (trap)"; report_pod_recorded; exit 1 ;;
   esac
 }
 

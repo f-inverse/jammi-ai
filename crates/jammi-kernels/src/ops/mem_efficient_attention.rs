@@ -393,22 +393,40 @@
 //! module doc's "Admission" section) is the layer responsible for keeping
 //! this real term bounded in production, not this op's own domain checks.
 //!
-//! ## Rounding contract (dtype-split — CPU/F32 arm only, this pass)
+//! ## Rounding contract (dtype-split; CPU is F32-only, CUDA admits BF16)
 //!
-//! `F32` (this op's only CPU dtype): `f32` accumulation throughout —
-//! `scale` folded into `Q` once (a plain multiply, not scale-then-divide),
-//! the mask add and the online-softmax running-max/sum-exp recurrence all
-//! in `f32`, one round point (there is none — no narrower dtype exists on
-//! this arm). Rust never auto-fuses a multiply-add the way `nvcc`'s
-//! `--fmad` contraction can, so the CUDA build-flag "fmad-accepted-
-//! tolerance" doctrine `softmax.cu`'s own module doc states does not apply
-//! here — stated as N/A, not silently omitted. `BF16` (the CUDA-arm-only
-//! concern, deferred): governed by the SAME `bf16_mul_rounded`/
-//! `bf16_add_rounded` round-back primitives `softmax.cu` documents (accumulate
-//! in `f32`, round to `bf16` once per op, never silently "improve" a
-//! fully-masked row's rounding relative to that contract) — stated here so
-//! a future CUDA arm inherits the decision rather than re-deriving it; NOT
-//! implemented in this pass.
+//! `F32` (this op's only CPU dtype, and `cuda_fwd`'s/`bwd`'s other admitted
+//! dtype): `f32` accumulation throughout — `scale` folded into `Q` once (a
+//! plain multiply, not scale-then-divide), the mask add and the
+//! online-softmax running-max/sum-exp recurrence all in `f32`, one round
+//! point (there is none on the CPU arm — no narrower dtype exists there).
+//! Rust never auto-fuses a multiply-add the way `nvcc`'s `--fmad`
+//! contraction can, so the CUDA build-flag "fmad-accepted-tolerance"
+//! doctrine `softmax.cu`'s own module doc states does not apply here —
+//! stated as N/A, not silently omitted.
+//!
+//! `BF16` (the CUDA-arm-only concern — `cpu_fwd` refuses it, module doc's
+//! "CPU: `F32` only" section): NOT `softmax.cu`'s own per-fused-kernel
+//! `bf16_mul_rounded`/`bf16_add_rounded` round-back granularity (that
+//! primitive pair governs a SINGLE fused kernel's internal rounding
+//! sites; this op is a multi-launch composition with no such kernel to
+//! reproduce the rounding sites OF — `cuda_fwd`'s own doc states this
+//! choice explicitly). Instead: every operand upcasts to `f32` ONCE,
+//! immediately at the op boundary — `cuda_fwd` upcasts `Q`/`K`/`V`/`mask`
+//! right after gathering them (INCLUDING before RoPE, adversarial audit
+//! round 3's F4 fix — an earlier revision roped `Q`/`K` in `bf16` first,
+//! an undisclosed extra round-trip `cpu_fwd` never has); `bwd` upcasts
+//! `qkv`/`rope_pack`/`mask`/`res`/`grad_res` at its own entry (adversarial
+//! audit round 4's fix — an earlier revision left them in the input
+//! dtype, which mixed with `lse` (ALWAYS `f32`, both arms) and
+//! `build_band_chunk_tensor`'s own always-`f32` band at the first
+//! `bf16`-plus-window-plus-CUDA call, a hard `DTypeMismatchBinaryOp`, not
+//! silently wrong math). Every intermediate — the online-softmax
+//! recurrence in `cuda_fwd`, the whole recompute-and-gradient chain in
+//! `bwd` — stays `f32` for its ENTIRE lifetime; the ONLY two round-back
+//! points in the whole op are `cuda_fwd`'s final output cast and `bwd`'s
+//! final `dqkv` cast, each exactly once, matching `cpu_fwd`'s own
+//! "one round point" doctrine generalized to a dtype that actually rounds.
 //!
 //! ## `chunk_size` is provenance, not shared identity (stated, not wired)
 //!
@@ -439,8 +457,8 @@
 
 use candle_core::backend::BackendStorage;
 #[cfg(feature = "cuda")]
-use candle_core::{op::BackpropOp, DType, Storage};
-use candle_core::{CpuStorage, CustomOp3, Device, Error, Layout, Result, Shape, Tensor, D};
+use candle_core::{op::BackpropOp, Storage};
+use candle_core::{CpuStorage, CustomOp3, DType, Device, Error, Layout, Result, Shape, Tensor, D};
 
 use super::attention_block::check_rope_pack;
 use super::rope::rope_fwd_row_f32;
@@ -1176,6 +1194,38 @@ impl CustomOp3 for MemEfficientAttention {
         let grad_res = grad_res.detach();
         let lse = lse.detach();
 
+        // Upcast to `f32` ONCE, here, at `bwd`'s own entry (adversarial
+        // audit round 4 fix, F-bwd-dtype): the SAME "one round point"
+        // convention `cuda_fwd`'s own F4 fix applies to `q0`/`k0`/RoPE —
+        // `bwd`'s recompute loop is ordinary `Tensor` composition SHARED
+        // between the CPU and CUDA arms (this op's own module doc, "`bwd`:
+        // ordinary Tensor composition"), and `lse` (this op's own saved
+        // state) is ALREADY unconditionally `f32` on both arms
+        // (`cpu_fwd`'s raw `Vec<f32>`; `cuda_fwd`'s `m`/`safe_l_sum.log()`
+        // accumulator, F1/F4-fixed) — so a `bf16` `qkv`/`mask`/`res`/
+        // `grad_res` reaching this recompute in ITS OWN dtype mixes with
+        // `f32` at the FIRST site that touches either `lse` (`masked_c -
+        // lse_unsq`) or `build_band_chunk_tensor`'s own always-`f32` band
+        // (`masked_c.broadcast_add(&band_c)`, whenever `half_window` is
+        // `Some`) — a hard `DTypeMismatchBinaryOp`, not silently wrong
+        // math, but reached ONLY on the CUDA+`bf16`+window combination
+        // (CPU never produces `bf16` at all; `bf16`+no-window never
+        // touches `band_c`). Upcasting every operand to `f32` HERE, before
+        // any of that composition runs, removes the mismatch at its root
+        // rather than threading a dtype-aware branch through every add —
+        // `want_dtype` (the ORIGINAL, pre-upcast dtype) is captured now so
+        // the FINAL `dqkv` can round back to it exactly once, matching
+        // `cpu_fwd`'s/`cuda_fwd`'s own "single round point" doctrine
+        // rather than leaving `dqkv` in `f32` (which would silently change
+        // this op's OWN gradient dtype contract — candle's autograd engine
+        // expects a gradient in the SAME dtype as its argument).
+        let want_dtype = qkv.dtype();
+        let qkv = qkv.to_dtype(DType::F32)?;
+        let rope_pack = rope_pack.to_dtype(DType::F32)?;
+        let mask = mask.to_dtype(DType::F32)?;
+        let res = res.to_dtype(DType::F32)?;
+        let grad_res = grad_res.to_dtype(DType::F32)?;
+
         let (b, s, three, h, d) = qkv.dims5()?;
         if three != 3 {
             return Err(Error::Msg(format!(
@@ -1335,6 +1385,13 @@ impl CustomOp3 for MemEfficientAttention {
             &[&to_qkv_slot(&dq0)?, &to_qkv_slot(&dk0)?, &to_qkv_slot(&dv)?],
             2,
         )?;
+        // Round back to `want_dtype` exactly ONCE, here — the single round
+        // point this fix's own entry-comment states (a no-op `.clone()` on
+        // the CPU arm, `want_dtype` already being `f32` there; candle's
+        // autograd engine also requires the returned gradient share its
+        // argument's own dtype, so this is a correctness requirement, not
+        // merely a rounding-doctrine one).
+        let dqkv = dqkv.to_dtype(want_dtype)?;
 
         Ok((Some(dqkv), None, None))
     }

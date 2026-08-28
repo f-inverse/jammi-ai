@@ -31,7 +31,7 @@
 //!
 //! **Per reachable arm, not per fused kernel.** `attention_block_fused`/
 //! `attention_block_flash` dispatch ONLY under `self.training == true`
-//! (contract v4 §2, `modernbert.rs:2543`) -- the encode/serving surface
+//! (contract v4 §2, `modernbert.rs:2801-2808`) -- the encode/serving surface
 //! this oracle exercises never reaches them, and the unit's own Frame
 //! forbids a forced-arm encode A/B (`ForcedFlash` stays private, B1) and
 //! any dispatch-counter assertion here (fused arms are training-only by

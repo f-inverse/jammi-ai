@@ -63,7 +63,7 @@ packaging. Two consequences, flagged to the lead as a shared-declaration
 | CUTLASS submodule | `dc4817921edda44a549197ff3a9dcf5df0636e7b` (the tag's `csrc/cutlass` gitlink), vendored as the git submodule `crates/jammi-kernels/third_party/cutlass` |
 | upstream directory | `csrc/flash_attn/src/` → `src/` here |
 | local edits to upstream files | **none** (see "Shims") |
-| kernels compiled | `run_mha_fwd_<cutlass::bfloat16_t, 64, false>`, `run_mha_bwd_<cutlass::bfloat16_t, 64, false>` (head dim 64, bf16, non-causal, sm80 cubin ONLY — no PTX, see "Supported archs") |
+| kernels compiled | `run_mha_fwd_<cutlass::bfloat16_t, 64, false>`, `run_mha_bwd_<cutlass::bfloat16_t, 64, false>` (head dim 64, bf16, non-causal; native cubins for sm80/86/89/90 — no PTX, see "Supported archs") |
 | wrapper | `jammi/flash_api_jammi.{h,cu}` — jammi's own, torch-free, not upstream |
 
 Why this tag: it is the newest `2.8.x` release at vendoring time and the
@@ -151,21 +151,34 @@ sha256 of the shims: `c10/cuda/CUDAException.h`
 Three translation units — `src/flash_fwd_hdim64_bf16_sm80.cu`,
 `src/flash_bwd_hdim64_bf16_sm80.cu`, `jammi/flash_api_jammi.cu` — compiled
 concurrently by `nvcc` with EXACTLY this flag group (upstream `setup.py`'s
-sm80 group), archived by `ar` into `$OUT_DIR/libjammi_flash.a`, linked with
-`static=jammi_flash`, `dylib=cudart`, `dylib=stdc++`:
+group, widened from a single `-gencode` to one native `-gencode` pair per
+admitted arch — M3 plan D1), archived by `ar` into
+`$OUT_DIR/libjammi_flash.a`, linked with `static=jammi_flash`,
+`dylib=cudart`, `dylib=stdc++`:
 
 ```
 -O3 -std=c++17
+--threads <N>              (N = $NVCC_THREADS if set and > 0, else 4)
 -gencode arch=compute_80,code=sm_80
+-gencode arch=compute_86,code=sm_86
+-gencode arch=compute_89,code=sm_89
+-gencode arch=compute_90,code=sm_90
 --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math
 -U__CUDA_NO_HALF_OPERATORS__ -U__CUDA_NO_HALF_CONVERSIONS__
 -U__CUDA_NO_HALF2_OPERATORS__ -U__CUDA_NO_BFLOAT16_CONVERSIONS__
 -DFLASHATTENTION_DISABLE_DROPOUT -DFLASHATTENTION_DISABLE_ALIBI
 -DFLASHATTENTION_DISABLE_SOFTCAP -DFLASHATTENTION_DISABLE_UNEVEN_K
 -Xcompiler -fPIC
+-Xptxas -v
 -Ishim -I<cutlass>/include -Isrc -Ijammi
 ```
 
+- `--threads <N>` is nvcc's own internal parallel-compilation flag (CUDA
+  >= 11.5; this build's toolkit floor, CUDA >= 11.8 for the `sm_90` pair,
+  already exceeds it), splitting each TU's own compile across `N` host
+  threads to mitigate the ~4× device-code-section cost the four `-gencode`
+  pairs add over the single-arch build this replaced. Overridable via
+  `$NVCC_THREADS` (e.g. a CI lane with fewer vCPUs than the pod default).
 - `--use_fast_math` is the crate's ONE fast-math translation-unit group.
   `src/cuda/*.cu` (the crate's own PTX kernels) are built without it
   (`build.rs::build_cuda`). Upstream ships every FlashAttention-2 wheel with
@@ -177,36 +190,128 @@ sm80 group), archived by `ar` into `$OUT_DIR/libjammi_flash.a`, linked with
   `softcap == 0`, `head_dim == 64` is a multiple of 32) — bit-neutral,
   ~16× fewer instantiations. `FLASHATTENTION_DISABLE_LOCAL` is NOT set:
   the sliding window is the product.
-- `-Xcompiler -fPIC` is the ONE addition to upstream `setup.py`'s sm80
-  group (host-code relocation model only; Rust links PIE executables on
-  Linux). This build does NOT add `-gencode arch=compute_80,code=compute_80`
-  (embedded PTX): upstream's own group appends only `code=sm_80` for the
-  sm80 arch, and embedding the PTX would ship a second, unvalidated code
-  path (see "Supported archs" below).
-- Both traits configs of the backward are instantiated; the launch picks
-  128×128 (8 warps, 144 KB dynamic smem) when the device's opt-in smem
-  allows it (A100/H100), else 64×128 (sm86/sm89, 99 KB)
+- `-Xcompiler -fPIC` is an addition to upstream `setup.py`'s per-arch
+  groups (host-code relocation model only; Rust links PIE executables on
+  Linux). This build does NOT add a bare `code=compute_XX` (embedded PTX)
+  entry for ANY of its four `-gencode` pairs: each one appends only
+  `code=sm_XX`, matching upstream's own per-arch convention — embedding
+  PTX for any arch would ship a second, unvalidated code path an unknown
+  future device could JIT into (see "Supported archs" below).
+- `-Xptxas -v` is the SECOND addition: `ptxas`'s verbose register/spill
+  report, captured into `jammi_flash_build_times.txt` per TU (see "`ptxas
+  -v` register/spill counts" below).
+- Both traits configs of the backward are instantiated in EVERY compiled
+  cubin (a runtime branch, not a build-time choice per arch); the launch
+  picks 128×128 (8 warps, 144 KB dynamic smem) when the device's opt-in
+  smem allows it (sm80/sm90), else 64×128 (sm86/sm89, 99 KB)
   (`src/flash_bwd_launch_template.h:178-190`). The forward uses 128×128,
-  4 warps (`src/flash_fwd_launch_template.h:188`).
+  4 warps, on every arch (`src/flash_fwd_launch_template.h:188` has no
+  arch branch for the no-dropout path this crate's ABI takes).
 
 ### Supported archs
 
-This build emits ONLY an sm_80 cubin (no PTX) — the ABI hard-refuses
-(`JAMMI_FLASH_ERR_COMPUTE_CAPABILITY`) below compute capability 8.0, and a
-device above sm80 (8.6/8.9/9.0) simply cannot LOAD this module at all
-(no PTX to JIT), rather than silently loading the wrong-tile-config kernel.
-This is deliberate: shipping the PTX would let 8.6/8.9/9.0 devices JIT a
-DIFFERENT `Flash_bwd_kernel_traits` branch (the 64×128 config vs. this
-crate's 128×128, `flash_bwd_launch_template.h:178-190`) with ZERO oracles
-run against it — `tests/flash_smoke.rs`'s landing proof runs on an A100
-(sm80) only. If a jammi deployment target needs sm86/89/90, the PTX
-gencode returns together with its own build-and-parity run on that arch,
-recorded here — not silently re-added.
+This build compiles NATIVE cubins for the enumerated set
+`build.rs::GENCODE_ARCHES` names — sm80/86/89/90 (compute capability
+`(8, 0)`/`(8, 6)`/`(8, 9)`/`(9, 0)`) — one `-gencode
+arch=compute_XX,code=sm_XX` pair per arch, never a bare `code=compute_XX`
+(embedded PTX) entry for any of them. The ABI hard-refuses
+(`JAMMI_FLASH_ERR_COMPUTE_CAPABILITY`) below compute capability 8.0; the
+Rust side (`crate::flash::check_arch`, and every fence site that reads
+`crate::admission::flash_built_arches()` — `jammi-encoders::modernbert`'s
+`flash_arch_ok`, `jammi-bench`'s `flash_capable_cuda`) additionally
+refuses any device OUTSIDE this exact enumerated set — set membership,
+never `>=`, never major-compat (M3 plan D2).
+
+**CORRECTED MECHANISM** (an earlier revision of this section claimed a
+device above sm80 "simply cannot load this module at all" — wrong for
+8.6/8.9, right for 9.0): SASS is minor-version FORWARD-COMPATIBLE within a
+major compute-capability generation (CUDA C++ Programming Guide,
+"Application Compatibility"; NVIDIA's CUDA Compatibility guide states the
+same for the driver/runtime pairing) — a device with compute capability
+`(8, 6)` or `(8, 9)` CAN load and run `sm_80` SASS; only a genuinely newer
+MAJOR (`(9, 0)` on an `sm_80`-only build, or vice versa) truly cannot load
+the module. Upstream's own current default build
+(`Dao-AILab/flash-attention`'s `setup.py`, `FORCE_CU_ARCHS`/
+`SUPPORTED_ARCHS`) targets `sm_80;sm_90;sm_100;sm_120` — **NOT** "sm80 +
+sm90 only" as an earlier draft of this section guessed, and notably NOT
+native `sm_86`/`sm_89` entries either: upstream relies on exactly the
+SASS forward-compat path above to serve RTX 30-series (8.6) and RTX
+40-series (8.9) consumer GPUs `sm_80` bytes rather than compiling for
+them natively.
+
+jammi does **not** rely on that forward-compat path, deliberately (M3 plan
+D1): every arch in the compiled set gets its OWN native `-gencode` entry
+and its OWN pod parity leg (table below), rather than admitting 8.6/8.9 on
+the strength of an untested "SASS should still work here" argument. This
+keeps the fence a single equality (device capability ∈ compiled set) that
+the Rust check, the encoders/bench fence sites, and this table all read
+the same way, and it means every byte the fleet actually executes has a
+committed values-parity run on that EXACT silicon, not "upstream says this
+should work". Still no `code=compute_XX` PTX anywhere in this build: an
+unknown future arch (e.g. a hypothetical `sm_100`) gets a typed refusal
+(`FlashError::Arch` / `jammi-encoders`'s `"arch_in_flash_compiled_set"`
+decline), never unvalidated JIT.
+
+F1 (bwd tile selection — unaffected by the arch-set widening, restated
+here for the per-arch table below): both `Flash_bwd_kernel_traits` configs
+are instantiated in EVERY compiled cubin regardless of gencode count — the
+launch picks 128×128 (8 warps, 144 KB dynamic smem) when the device's
+opt-in smem budget allows it (sm80/sm90: ≥144 KB), else 64×128 (sm86/sm89:
+99 KB opt-in budget), `src/flash_bwd_launch_template.h:178-190`. A100 and
+H100 execute IDENTICAL bwd tile configs; L40S and A40 execute the smaller
+64×128 instantiation — the one genuinely different code path across the
+compiled set, and it is a RUNTIME branch inside a single compiled cubin
+(present in every arch's object code), not a build-time choice. The
+forward uses one 128×128, 4-warp config on every arch
+(`src/flash_fwd_launch_template.h:181-198` has no arch branch for the
+no-dropout path this crate's ABI takes).
+
+Per-arch validation status (**compiled ≠ admitted** until a green pod
+parity leg exists on that exact arch — M3 plan D4; this table is the
+single source `check_arch`/`flash_built_arches()`'s callers should be
+cross-checked against when reasoning about what has ACTUALLY been proven,
+as opposed to merely compiled):
+
+| arch | compute cap | bwd tile path (F1) | pod parity leg | status |
+|---|---|---|---|---|
+| sm80 (A100) | `(8, 0)` | 128×128 | `tests/flash_smoke.rs` + `flash_op_oracles.rs`, A100-SXM4-80GB | VALIDATED (pre-M3 landing proof) |
+| sm86 (A40) | `(8, 6)` | 64×128 | A40 leg (`runpod_lib.sh`'s `rp_deploy_arch`, cheapest SKU) | PENDING — this agent's own pass is hermetic-only (no pod access); fallback per M3 plan D4/v2-delta-1 if A40 capacity blocks: drop `sm_86` from `GENCODE_ARCHES` (typed refusal) rather than ship an unvalidated cubin |
+| sm89 (L40S) | `(8, 9)` | 64×128 | L40S leg | PENDING — same hand-off note |
+| sm90 (H100) | `(9, 0)` | 128×128 | H100 leg | PENDING — same hand-off note; also proves the `sm_90` gencode loads at all (a genuinely different major, not merely a forward-compat question) |
+
+### `ptxas -v` register/spill counts
+
+**PLACEHOLDER — measured at pod phase** (M3 plan v2 delta 4). This agent's
+own pass is hermetic-only (no `nvcc`/`ptxas` on the local machine) and does
+not fabricate counts. `build.rs`'s `common_flags` now passes `-Xptxas -v`
+unconditionally (every TU, every arch — see the flag-group table above),
+whose report lands in each TU's own stderr and is already captured
+verbatim into `jammi_flash_build_times.txt` by the existing per-TU timing
+loop — no separate instrumentation pass is needed at pod time, only
+transcribing that file's contents into the table below:
+
+| arch | fwd registers | fwd spill stores/loads | bwd registers | bwd spill stores/loads |
+|---|---|---|---|---|
+| sm80 | TBD | TBD | TBD | TBD |
+| sm86 | TBD | TBD | TBD | TBD |
+| sm89 | TBD | TBD | TBD | TBD |
+| sm90 | TBD | TBD | TBD | TBD |
+
+Stated fallback (D1's condition, v2 delta 4): if any arch's TU reports a
+nonzero spill count, drop that arch's native `-gencode` entry from
+`GENCODE_ARCHES` and admit it (if at all) only via the documented
+sm80/sm90-cubin-plus-SASS-minor-compat shape ("CORRECTED MECHANISM" above
+describes upstream using exactly this for 8.6/8.9) — never ship a
+spilling native cubin silently on the theory that "it still passes values
+parity" (a spill is a real perf/correctness-adjacent regression a values
+oracle cannot see, per the flag's own doc in `build.rs`).
 
 ### Measured compile time
 
-A100-SXM4-80GB pod, CUDA 12.6 (`V12.6.85`), g++ 13.3.1, 128 vCPU shared with
-a concurrent `cargo mutants` run (see the landing commit for the raw
+**A100 single-arch baseline** (pre-M3, one `-gencode` pair; kept for
+comparison — NOT re-measured here, hermetic-only pass), A100-SXM4-80GB
+pod, CUDA 12.6 (`V12.6.85`), g++ 13.3.1, 128 vCPU shared with a concurrent
+`cargo mutants` run (see the landing commit for the raw
 `jammi_flash_build_times.txt`):
 
 | TU | wall |
@@ -222,6 +327,15 @@ kernels' instantiation trees). `nvcc` emitted 0 warnings.
 
 The build spike (same flags, single-threaded, otherwise idle pod) measured
 fwd TU 44 s / 2.9 GB RSS, bwd TU 70 s, 0 warnings, 0 ptxas spills.
+
+**4-arch build (M3, `--threads 4` default): TBD, measured at pod phase.**
+D1's cost estimate is ~4× the device-code-section wall above per TU before
+`--threads` mitigation; the pod-phase agent re-runs this table (wall AND,
+when `JAMMI_FLASH_MEASURE_RSS=1` is set for the CI flash-attn-compile
+lane's own re-measurement, peak RSS per TU — see `build.rs::build_flash_attn`'s
+own doc for why that instrumentation is opt-in rather than autodetected)
+and records the new archive size (`libjammi_flash.a` grows with the
+device-code-section count) here.
 
 ## Feature isolation
 

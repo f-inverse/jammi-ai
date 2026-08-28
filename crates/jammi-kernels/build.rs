@@ -14,6 +14,141 @@ use std::env;
 #[cfg(any(feature = "cuda", feature = "flash-attn"))]
 use std::path::{Path, PathBuf};
 
+/// The full `-gencode` set this crate's vendored FlashAttention-2 build
+/// compiles NATIVE cubins for — sm80 (Ampere baseline) through sm90
+/// (Hopper), one pair per arch this crate admits (M3 plan D1: compile a
+/// real, per-arch cubin for every admitted arch, never a PTX-JIT-forward
+/// entry — `code=sm_XX` only, no bare `code=compute_XX`, on every line).
+/// See `third_party/flash-attention/VENDORED.md`'s "Supported archs"
+/// section for the per-arch VALIDATION status — compiled is necessary,
+/// not sufficient, for admission (`crate::admission::flash_built_arches`'s
+/// own doc has the compiled-vs-admitted distinction).
+///
+/// Top-level (not `#[cfg(feature = "flash-attn")]`-gated): `main()` emits
+/// `JAMMI_FLASH_GENCODE_SMS` from this UNCONDITIONALLY, in every feature
+/// configuration (see `main`'s own comment for why), and this same literal
+/// also feeds `build_flash_attn`'s real `-gencode` flags — one array, two
+/// readers, so they can never drift apart. Also reachable from the
+/// `#[path = "../build.rs"]` unit-test seam (`tests/build_rs_unit.rs`)
+/// without that suite needing the `flash-attn` feature turned on.
+const GENCODE_ARCHES: &[&str] = &[
+    "arch=compute_80,code=sm_80",
+    "arch=compute_86,code=sm_86",
+    "arch=compute_89,code=sm_89",
+    "arch=compute_90,code=sm_90",
+];
+
+/// Parses the `code=sm_<digits>` suffix out of ONE `-gencode` literal — the
+/// same anti-drift pattern the deleted singular `GENCODE_ARCH`/`gencode_sm`
+/// pair used, now applied per entry of [`GENCODE_ARCHES`] so
+/// `JAMMI_FLASH_GENCODE_SMS` (`main`'s emission) and the actual `-gencode`
+/// flags `build_flash_attn` passes to nvcc read the SAME literal array,
+/// never an independently-retyped copy. Panics on a malformed entry — this
+/// is compile-time-pinned build.rs source, not untrusted input, so a
+/// malformed value can only mean a hand-edit broke [`GENCODE_ARCHES`]
+/// itself, which must fail loud rather than silently drop an arch.
+pub(crate) fn gencode_sm(entry: &str) -> &str {
+    entry
+        .rsplit("sm_")
+        .next()
+        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+        .unwrap_or_else(|| {
+            panic!(
+                "jammi-kernels build.rs: gencode entry {entry:?} does not end in \
+                 \"sm_<digits>\" — the code=sm_XX suffix JAMMI_FLASH_GENCODE_SMS derives from \
+                 is missing or malformed"
+            )
+        })
+}
+
+/// Parses the `release <major>.<minor>` token out of `nvcc --version`'s
+/// stdout (e.g. `"Cuda compilation tools, release 11.8, V11.8.89"` ->
+/// `Some((11, 8))`). Pure string parsing — no filesystem, no subprocess —
+/// so it is directly unit-testable against literal fixture strings
+/// (`tests/build_rs_unit.rs`) without a real `nvcc` anywhere on the test
+/// machine; `check_toolkit_floor` (below) is the sibling pure function that
+/// turns the parsed pair into a pass/fail-with-remedy verdict.
+///
+/// `#[allow(dead_code)]`: this function's only call site is inside
+/// `build_flash_attn`, which is `#[cfg(feature = "flash-attn")]`-gated —
+/// under this crate's DEFAULT feature set (no `cuda`/`flash-attn`), that
+/// call site does not exist, so the build script binary itself never
+/// reaches this function and rustc's own dead-code lint is right that it
+/// is unreachable FROM THAT BINARY. It is reachable from two OTHER,
+/// legitimate places: `build_flash_attn` under `--features flash-attn`
+/// (the real production path), and `tests/build_rs_unit.rs`'s `#[path]`
+/// seam (every feature configuration) — the allow documents that this is
+/// an intentional cross-cfg surface, not dead code left behind.
+#[allow(dead_code)]
+pub(crate) fn parse_nvcc_release(version_stdout: &str) -> Option<(u32, u32)> {
+    let after = version_stdout.split("release ").nth(1)?;
+    let token = after.split([',', ' ', '\n', '\r']).next()?;
+    let mut parts = token.split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+/// `Ok(())` iff `detected >= floor` (lexicographic major.minor comparison —
+/// the same ordering CUDA's own release numbering uses), else an `Err`
+/// remedy string naming both versions. Pure — split from
+/// [`parse_nvcc_release`] so both halves are independently unit-testable.
+///
+/// This positive version check (detect the ACTUAL toolkit release, compare
+/// against a stated floor, and name the remedy) replaces this crate's
+/// earlier, now-inaccurate "requires CUDA 12.x with sm_80 support" prose:
+/// [`GENCODE_ARCHES`]'s `sm_90` pair (added the same commit as this
+/// function) needs CUDA >= 11.8, not 12.x — CUDA 11.8's release notes are
+/// the toolkit version that first added `sm_90`/Hopper `-gencode` support;
+/// sm_80/86/89 have been buildable since CUDA 11.1/11.1/11.4 respectively,
+/// so 11.8 is the binding floor for THIS crate's combined gencode set, not
+/// any individual arch's own older floor.
+///
+/// `#[allow(dead_code)]`: see [`parse_nvcc_release`]'s doc — same cross-cfg
+/// reachability (only `build_flash_attn`, feature-gated, and the
+/// `tests/build_rs_unit.rs` seam call this under the default feature set).
+#[allow(dead_code)]
+pub(crate) fn check_toolkit_floor(
+    detected: (u32, u32),
+    floor: (u32, u32),
+) -> std::result::Result<(), String> {
+    if detected >= floor {
+        Ok(())
+    } else {
+        Err(format!(
+            "detected CUDA toolkit release {}.{} is below the {}.{} floor this crate's \
+             `flash-attn` feature needs for its sm_90 gencode pair — upgrade the CUDA toolkit \
+             (nvcc --version must report release >= {}.{}) or drop the sm_90 entry from \
+             GENCODE_ARCHES in build.rs if you only need sm_80/86/89",
+            detected.0, detected.1, floor.0, floor.1, floor.0, floor.1
+        ))
+    }
+}
+
+/// Parses GNU `time -v`'s `"Maximum resident set size (kbytes): N"` line out
+/// of its stderr, when present. `None` when the wrapper's report line is
+/// absent (BSD/macOS `time` has no `-v`, so this is best-effort: expected on
+/// the CI flash-attn-compile lane's Linux container when
+/// `JAMMI_FLASH_MEASURE_RSS` opts in, absent everywhere else — see
+/// `build_flash_attn`'s own comment for why this is opt-in, not
+/// autodetected). Pure, unit-tested against a literal fixture line.
+///
+/// `#[allow(dead_code)]`: see [`parse_nvcc_release`]'s doc — same cross-cfg
+/// reachability (only `build_flash_attn`, feature-gated, and the
+/// `tests/build_rs_unit.rs` seam call this under the default feature set).
+#[allow(dead_code)]
+pub(crate) fn parse_max_rss_kb(gnu_time_stderr: &str) -> Option<u64> {
+    for line in gnu_time_stderr.lines() {
+        if let Some(rest) = line
+            .trim()
+            .strip_prefix("Maximum resident set size (kbytes): ")
+        {
+            return rest.trim().parse().ok();
+        }
+    }
+    None
+}
+
 /// Every FILE (recursively) under `dir`, sorted for a deterministic
 /// iteration order — used for TWO independent purposes `build_cuda`'s own
 /// comment details in full: emitting `cargo:rerun-if-changed=<path>` PER
@@ -67,6 +202,25 @@ fn walk_files(dir: &Path) -> Vec<PathBuf> {
 fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CUDA");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_FLASH_ATTN");
+
+    // Emitted UNCONDITIONALLY — every feature configuration this crate can
+    // be built with, not only inside the `flash-attn` branch below (where
+    // the deleted singular `JAMMI_FLASH_GENCODE_SM` used to live). This is
+    // a pure string-parse over `GENCODE_ARCHES` (no nvcc, no CUTLASS, no
+    // filesystem probe involved), so it costs nothing to run on every
+    // build, and it makes `env!("JAMMI_FLASH_GENCODE_SMS")` compile in
+    // EVERY cfg this crate ships — every stale reader of the deleted
+    // singular name now fails to COMPILE instead of silently resolving to
+    // a value from a different build (M3 plan D2's "loud migration").
+    // `crate::admission::flash_built_arches()` is this crate's own reader
+    // for callers outside `crate::flash` (which stays `#[cfg(feature =
+    // "flash-attn")]`-gated); it gates the ANSWER on `FLASH_COMPILED`, not
+    // on whether this env var exists — see that function's own doc.
+    let gencode_sms: Vec<&str> = GENCODE_ARCHES.iter().map(|g| gencode_sm(g)).collect();
+    println!(
+        "cargo:rustc-env=JAMMI_FLASH_GENCODE_SMS={}",
+        gencode_sms.join(",")
+    );
 
     // Default build: no cuda feature, no nvcc, no CUDA toolkit. Nothing
     // below this line ever runs unless the `cuda` feature set this env var.
@@ -241,31 +395,51 @@ fn build_cuda() {
     );
 }
 
-/// Compiles the vendored FlashAttention-2 hdim64/bf16/sm80 forward +
-/// backward translation units and jammi's torch-free C wrapper into
-/// `$OUT_DIR/libjammi_flash.a` with a hand-rolled `nvcc` invocation, then
-/// links it (plus `cudart` and `stdc++`) into this crate.
+/// Compiles the vendored FlashAttention-2 hdim64/bf16 forward + backward
+/// translation units — ONE native cubin per entry of [`GENCODE_ARCHES`]
+/// embedded in the SAME three object files, `nvcc` fans a `-gencode` list
+/// out into one device-code section per arch within one TU — and jammi's
+/// torch-free C wrapper into `$OUT_DIR/libjammi_flash.a` with a hand-rolled
+/// `nvcc` invocation, then links it (plus `cudart` and `stdc++`) into this
+/// crate.
 ///
 /// Hand-rolled rather than `bindgen_cuda`: the 0.1.6 `Builder` has no
 /// CUTLASS include hook, `build_lib` emits no `-I`, and `.arg` takes
 /// `&'static str` — it cannot express this flag group. The existing PTX
 /// path above is untouched.
 ///
-/// FLAG GROUP — upstream `setup.py`'s nvcc group for sm80, as measured in
-/// the build spike (`third_party/flash-attention/VENDORED.md`):
+/// CUBINS FOR THE ENUMERATED, VALIDATED SET; NO PTX (M3 plan D1/D2): this
+/// build compiles a REAL, native `code=sm_XX` cubin for every arch in
+/// [`GENCODE_ARCHES`] — never a bare `code=compute_XX` PTX entry, on any
+/// line. Embedding PTX would let a device outside the enumerated set JIT
+/// an unvalidated kernel variant at RUNTIME (a genuinely different tile
+/// config on a smaller-smem arch, `flash_bwd_launch_template.h:160-193`) —
+/// a second shipped code path with zero oracles. Adding a NEW arch to this
+/// crate's admitted set is a THREE-part change in one PR: a `-gencode` pair
+/// here, the matching entry in `jammi-encoders`/`jammi-bench`'s fence sites
+/// (which read `crate::admission::flash_built_arches()`, not this file),
+/// and a green pod parity artifact run on THAT exact arch (VENDORED.md's
+/// "Supported archs" table) — never a `-gencode` addition alone, and never
+/// admission via SASS minor-version forward-compat (real, but a compiled-
+/// vs-validated distinction this crate deliberately does not lean on — see
+/// `VENDORED.md`'s "Supported archs" section for the corrected mechanism
+/// note and why jammi validates every arch it ships natively instead).
+///
+/// FLAG GROUP — upstream `setup.py`'s nvcc group, as measured in the build
+/// spike (`third_party/flash-attention/VENDORED.md`), widened from a single
+/// `-gencode` to one pair per [`GENCODE_ARCHES`] entry:
 ///
 /// - `-O3 -std=c++17`
-/// - `-gencode arch=compute_80,code=sm_80` (sm_80 cubin ONLY, matching
-///   upstream `setup.py`, which appends only `code=sm_80` for this arch —
-///   NOT ALSO `code=compute_80`/embedded PTX). Embedding the PTX would let
-///   an 8.6/8.9/9.0 device JIT it at RUNTIME and take a DIFFERENT
-///   `Flash_bwd_kernel_traits` branch (the 64×128 config,
-///   `flash_bwd_launch_template.h:178-190`, vs the 128×128 this crate's
-///   smoke test exercises on the A100) — a second shipped code path with
-///   zero oracles. Every jammi deployment target for this feature is sm80
-///   (A100); if that changes, the PTX gencode returns together with its own
-///   oracle run on the new arch — see `VENDORED.md`'s "Supported archs"
-///   note.
+/// - `-gencode arch=compute_XX,code=sm_XX`, once per [`GENCODE_ARCHES`]
+///   entry (native cubin ONLY per arch, matching upstream `setup.py`'s own
+///   per-arch `code=sm_XX`-only convention — NOT ALSO `code=compute_XX`/
+///   embedded PTX for any of them).
+/// - `--threads <N>` (`N` = `$NVCC_THREADS` if set and `> 0`, else `4`) —
+///   nvcc's own internal parallel-compilation flag (CUDA >= 11.5, which
+///   this build's toolkit floor below already exceeds), splitting each of
+///   the three TU compiles across `N` host threads; mitigates the ~4x
+///   device-code-section cost [`GENCODE_ARCHES`]'s four entries add over
+///   the single-arch build this replaced.
 /// - `--expt-relaxed-constexpr --expt-extended-lambda`
 /// - `--use_fast_math` — THE ONE-TU DIVERGENCE from this crate's
 ///   no-fast-math rule (`build_cuda` above pins it off for `src/cuda/*.cu`).
@@ -287,6 +461,19 @@ fn build_cuda() {
 ///   only: Rust links test binaries as PIE on Linux, and a non-PIC static
 ///   archive fails that link with a relocation error. It changes the host
 ///   object's relocation model, not the device code.
+/// - `-Xptxas -v` — the SECOND addition (M3 plan v2 delta 4): `ptxas`'s
+///   verbose flag, printed to stderr per TU and already captured verbatim
+///   into `jammi_flash_build_times.txt` by the timing loop below (every
+///   TU's stderr is written unconditionally, not only on failure). This is
+///   the one failure mode native per-arch SASS uniquely introduces that
+///   values-parity testing cannot see on its own: a register spill on a
+///   smaller-smem arch (sm86/89's 64×128 bwd tile) is a real perf/
+///   correctness-adjacent regression that still produces numerically
+///   correct output, so a values oracle passing is not evidence against
+///   it. This agent's own hermetic pass has no nvcc to produce real
+///   register/spill counts with — see `VENDORED.md`'s "ptxas -v register/
+///   spill counts" section for the placeholder table a pod-phase run
+///   fills in from this exact stderr capture, never fabricated here.
 ///
 /// Include order: `shim/` FIRST (it provides the `c10/…` and `ATen/…`
 /// headers the unmodified upstream files include), then CUTLASS, then
@@ -320,13 +507,51 @@ fn build_flash_attn() {
         panic!(
             "jammi-kernels `flash-attn`: no working `nvcc` found — set `NVCC=<path/to/nvcc>` or \
              `CUDA_HOME=<toolkit root>`, or put the CUDA toolkit's `bin` on PATH (the feature \
-             requires CUDA 12.x with sm_80 support)"
+             needs a CUDA toolkit whose `nvcc` accepts every arch in GENCODE_ARCHES — currently \
+             CUDA >= 11.8, for the sm_90 gencode pair; checked for real just below)"
         )
     });
     println!("cargo:rerun-if-env-changed=NVCC");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=AR");
+    println!("cargo:rerun-if-env-changed=NVCC_THREADS");
+    println!("cargo:rerun-if-env-changed=JAMMI_FLASH_MEASURE_RSS");
+
+    // ---- Toolkit floor: GENCODE_ARCHES's sm_90 pair needs CUDA >= 11.8
+    // (see `check_toolkit_floor`'s own doc for the version-floor rationale
+    // and why this is a POSITIVE check — detect the real toolkit release,
+    // compare, name the remedy — rather than the crate's old, inaccurate
+    // "requires CUDA 12.x" prose). Checked BEFORE spending a minute in the
+    // real nvcc compiles below, so a too-old toolkit fails in milliseconds
+    // with the exact detected/required versions, not a cryptic nvcc error
+    // three TUs deep.
+    const TOOLKIT_FLOOR: (u32, u32) = (11, 8);
+    let version_output = Command::new(&nvcc)
+        .arg("--version")
+        .output()
+        .unwrap_or_else(|e| {
+            panic!(
+                "jammi-kernels `flash-attn`: failed to run `{} --version`: {e}",
+                nvcc.display()
+            )
+        });
+    let version_stdout = String::from_utf8_lossy(&version_output.stdout).into_owned();
+    match parse_nvcc_release(&version_stdout) {
+        Some(detected) => {
+            if let Err(remedy) = check_toolkit_floor(detected, TOOLKIT_FLOOR) {
+                panic!("jammi-kernels `flash-attn`: {remedy}");
+            }
+        }
+        None => panic!(
+            "jammi-kernels `flash-attn`: could not find a \"release <major>.<minor>\" token in \
+             `{} --version`'s output:\n{version_stdout}\nThis crate's flash-attn feature needs \
+             CUDA >= {}.{} for its sm_90 gencode pair — verify the toolkit manually",
+            nvcc.display(),
+            TOOLKIT_FLOOR.0,
+            TOOLKIT_FLOOR.1
+        ),
+    }
 
     // ---- rerun-if-changed for EVERY vendored file (upstream sources, the
     // shims, the wrapper, the CUTLASS include tree — a directory entry
@@ -342,57 +567,53 @@ fn build_flash_attn() {
         fa_dir.join("VENDORED.md").display()
     );
 
-    // ---- The ONE `-gencode` literal (see the doc comment above): sm_80
-    // cubin only, no PTX. `JAMMI_FLASH_GENCODE_SM` below is derived FROM
-    // this literal (parsed, not independently retyped) so the two can
-    // never drift apart — `crate::flash::check_arch` (`flash/mod.rs`)
-    // reads it via `env!("JAMMI_FLASH_GENCODE_SM")` and refuses any device
-    // whose compute capability major.minor does not EXACTLY match (P6
-    // Stage B contract §3.4: `meets_minimum()` is right for the PTX lane,
-    // wrong for a cubin-only build with no forward-compat JIT path).
-    const GENCODE_ARCH: &str = "arch=compute_80,code=sm_80";
-    let gencode_sm = GENCODE_ARCH
-        .rsplit("sm_")
-        .next()
-        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
-        .unwrap_or_else(|| {
-            panic!(
-                "jammi-kernels build.rs: GENCODE_ARCH {GENCODE_ARCH:?} does not end in \
-                 \"sm_<digits>\" — the code=sm_XX suffix `JAMMI_FLASH_GENCODE_SM` derives from \
-                 is missing or malformed"
-            )
-        });
-    println!("cargo:rustc-env=JAMMI_FLASH_GENCODE_SM={gencode_sm}");
-
-    // ---- The flag group (see the doc comment above).
-    let common_flags: Vec<String> = [
-        "-O3",
-        "-std=c++17",
-        "-gencode",
-        GENCODE_ARCH,
-        "--expt-relaxed-constexpr",
-        "--expt-extended-lambda",
-        "--use_fast_math",
-        "-U__CUDA_NO_HALF_OPERATORS__",
-        "-U__CUDA_NO_HALF_CONVERSIONS__",
-        "-U__CUDA_NO_HALF2_OPERATORS__",
-        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-        "-DFLASHATTENTION_DISABLE_DROPOUT",
-        "-DFLASHATTENTION_DISABLE_ALIBI",
-        "-DFLASHATTENTION_DISABLE_SOFTCAP",
-        "-DFLASHATTENTION_DISABLE_UNEVEN_K",
-        "-Xcompiler",
-        "-fPIC",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .chain([
-        format!("-I{}", shim_dir.display()),
-        format!("-I{}", cutlass_include.display()),
-        format!("-I{}", src_dir.display()),
-        format!("-I{}", jammi_dir.display()),
-    ])
-    .collect();
+    // ---- `-gencode` flags, one pair per [`GENCODE_ARCHES`] entry (see the
+    // doc comment above): the SAME top-level literal array `main()` already
+    // parsed to emit `JAMMI_FLASH_GENCODE_SMS`, so the compiled cubin set
+    // and the env var `crate::flash::check_arch`/`crate::admission::
+    // flash_built_arches()` read can never drift apart — one array, two
+    // readers.
+    let nvcc_threads: u32 = env::var("NVCC_THREADS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(4);
+    let common_flags: Vec<String> = ["-O3".to_string(), "-std=c++17".to_string()]
+        .into_iter()
+        .chain(["--threads".to_string(), nvcc_threads.to_string()])
+        .chain(
+            GENCODE_ARCHES
+                .iter()
+                .flat_map(|g| ["-gencode".to_string(), g.to_string()]),
+        )
+        .chain(
+            [
+                "--expt-relaxed-constexpr",
+                "--expt-extended-lambda",
+                "--use_fast_math",
+                "-U__CUDA_NO_HALF_OPERATORS__",
+                "-U__CUDA_NO_HALF_CONVERSIONS__",
+                "-U__CUDA_NO_HALF2_OPERATORS__",
+                "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                "-DFLASHATTENTION_DISABLE_DROPOUT",
+                "-DFLASHATTENTION_DISABLE_ALIBI",
+                "-DFLASHATTENTION_DISABLE_SOFTCAP",
+                "-DFLASHATTENTION_DISABLE_UNEVEN_K",
+                "-Xcompiler",
+                "-fPIC",
+                "-Xptxas",
+                "-v",
+            ]
+            .iter()
+            .map(|s| s.to_string()),
+        )
+        .chain([
+            format!("-I{}", shim_dir.display()),
+            format!("-I{}", cutlass_include.display()),
+            format!("-I{}", src_dir.display()),
+            format!("-I{}", jammi_dir.display()),
+        ])
+        .collect();
 
     let tus: [(&str, PathBuf); 3] = [
         (
@@ -407,7 +628,24 @@ fn build_flash_attn() {
     ];
 
     // ---- Compile the three TUs concurrently (they are independent; the
-    // bwd TU alone is ~70 s on an A100 pod, the fwd ~45 s, the wrapper ~5 s).
+    // bwd TU alone is ~70 s on an A100 pod, the fwd ~45 s, the wrapper ~5 s
+    // — measured on the OLD single-arch build; four gencodes each cost more
+    // wall, see `VENDORED.md`'s re-measured build-times table once a pod
+    // run records it, per the M3 plan's D1 cost note).
+    //
+    // Peak-RSS instrumentation (M3 plan v2 delta 5) is OPT-IN via
+    // `JAMMI_FLASH_MEASURE_RSS=1`, NOT autodetected from `/usr/bin/time`'s
+    // mere presence: unconditionally wrapping every nvcc invocation with
+    // `time -v` would change how this feature compiles on any machine that
+    // happens to HAVE a `/usr/bin/time` binary without GNU's `-v` support
+    // (BSD/macOS `time` has no `-v` and exits before ever running the
+    // wrapped command — this build has no cheap way to probe that ahead of
+    // spawning it) — that would turn a build that is hermetic-elsewhere
+    // into one that can newly fail on an unrelated machine shape. This PR
+    // does not flip the env var on in `ci.yml`; a maintainer confirms the
+    // CI flash-attn-compile lane's `time -v` behaviour first (see the
+    // hand-off report).
+    let measure_rss = env::var_os("JAMMI_FLASH_MEASURE_RSS").is_some();
     let started = Instant::now();
     let handles: Vec<_> = tus
         .iter()
@@ -419,7 +657,14 @@ fn build_flash_attn() {
             let stem = stem.to_string();
             std::thread::spawn(move || {
                 let t0 = Instant::now();
-                let output = Command::new(&nvcc)
+                let mut cmd = if measure_rss {
+                    let mut c = Command::new("/usr/bin/time");
+                    c.arg("-v").arg(&nvcc);
+                    c
+                } else {
+                    Command::new(&nvcc)
+                };
+                let output = cmd
                     .args(&flags)
                     .arg("-c")
                     .arg(&cu)
@@ -437,27 +682,32 @@ fn build_flash_attn() {
                         String::from_utf8_lossy(&output.stderr)
                     );
                 }
-                (
-                    stem,
-                    obj,
-                    secs,
-                    String::from_utf8_lossy(&output.stderr).into_owned(),
-                )
+                let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                let peak_rss_kb = if measure_rss {
+                    parse_max_rss_kb(&stderr)
+                } else {
+                    None
+                };
+                (stem, obj, secs, stderr, peak_rss_kb)
             })
         })
         .collect();
     let mut objs = Vec::new();
     let mut timing = String::new();
     for h in handles {
-        let (stem, obj, secs, stderr) = h.join().expect("nvcc worker thread panicked");
+        let (stem, obj, secs, stderr, peak_rss_kb) = h.join().expect("nvcc worker thread panicked");
         timing.push_str(&format!("{stem}: {secs:.1} s\n"));
+        if let Some(kb) = peak_rss_kb {
+            timing.push_str(&format!("{stem} peak_rss_kb: {kb}\n"));
+        }
         if !stderr.trim().is_empty() {
             timing.push_str(&format!("{stem} stderr:\n{stderr}\n"));
         }
         objs.push(obj);
     }
     timing.push_str(&format!(
-        "wall (3 TUs concurrent): {:.1} s\n",
+        "wall ({} TUs concurrent, --threads {nvcc_threads}): {:.1} s\n",
+        tus.len(),
         started.elapsed().as_secs_f64()
     ));
     std::fs::write(out_dir.join("jammi_flash_build_times.txt"), &timing)

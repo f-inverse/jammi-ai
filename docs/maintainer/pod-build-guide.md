@@ -686,6 +686,8 @@ exists) a `test_pod_substrate.sh` leg.
 | 8 | `cargo metadata --frozen` "just works" once `Cargo.lock` exists | `cargo metadata` (unlike `cargo build`) resolves the **full cross-platform** graph by default, needing source for platform-conditional crates never otherwise fetched | Seed pipeline died on "failed to download android_system_properties ... --frozen was specified" *after* T1–T3 had already succeeded | `pod_seed_target.sh:743-772` (one-time network-allowed priming call before every `--frozen` call); `:305-316`, `pod_seed_cargo_metadata_frozen` (captures real stderr, never discards it) |
 | 9 | A zero-byte captured `build/<pkg>-*/output` file means "captured at the wrong moment" | Cargo creates that file for **every** build script it runs, regardless of whether the script prints anything — a real no-op script legitimately produces zero bytes | An earlier fix flagged legitimate zero-byte captures (chrono-tz, esaxx-rs, pulldown-cmark, rustls, scratch, snap, stacker, prometheus) as errors, aborting every real seed build | `pod_seed_target.sh:190-241`, `pod_seed_check_stdout_subset`; `test_pod_substrate.sh` `(l/N4)` / `(l/N4 revert-RED)` (`:970`) |
 | 10 | Two builds of the identical tree on the same box produce byte-identical linked binaries | mold 2.35.1 / clang 21's ThinLTO codegen embeds local-symbol suffixes (`anon.<h>.N.llvm.<hash>`) that differ between two builds of the **same** tree | `release/jammi-bench` (467 differing symbols) made the byte-equality leg read `false` even though every deterministic artifact (`*.ptx`, `.rlib`/`.rmeta`) matched | `pod_build_timings.sh:330-344`, `:644-654` (`byte_equal_scope` — the linked binary is explicitly excluded, never silently dropped from the claim) |
+| 11 | `push --tree <name>`'s rsync destination is reachable | rsync creates only the LAST path component of its own destination — nothing in the pod bootstrap or the build-substrate seed provisions `/root/trees` itself | The very FIRST `push` for a name no session has ever pushed before fails outright on a fresh pod: `rsync: mkdir "/root/trees/<name>" failed: No such file or directory (2)` (observed live on pod u4hfsqyu0i2qwa) | `runpod_lib.sh:657-665`, `rp_push_ensure_parent` (a bounded, idempotent remote `mkdir -p` on the parent, called before every push); `test_pod_substrate.sh` `(y/esc-055)` |
+| 12 | `gpu-dev.sh`'s `REPO_ROOT` names the checkout the caller means | It is derived from the SCRIPT's own on-disk location, never `$PWD` — a multi-worktree laptop keeps more than one copy simultaneously | Invoking one tree's script copy from inside a DIFFERENT tree silently `push`/`run`/`target`s the WRONG tree; the push-stamp's own `laptop_head` field was the only tell (M1b) | `gpu-dev.sh:267-279` (push/run/target refuse on a cwd/REPO_ROOT mismatch, `RP_ALLOW_ROOT_MISMATCH=1` overrides); `test_pod_substrate.sh` `(z/esc-055)` |
 
 ---
 
@@ -705,7 +707,7 @@ exists) a `test_pod_substrate.sh` leg.
 **Test suite:**
 
 ```bash
-bash ci/scripts/test_pod_substrate.sh          # every leg (a)-(v), hermetic, no pod
+bash ci/scripts/test_pod_substrate.sh          # every leg (a)-(z), hermetic, no pod
 JAMMI_REQUIRE_LOCK_TEST=1 bash ci/scripts/test_pod_substrate.sh   # additionally requires flock present (Linux-only leg (d))
 bash ci/scripts/test_gpu_dev_lifecycle.sh      # gpu-dev.sh's own dispatch/session lifecycle legs
 ```
@@ -731,7 +733,12 @@ two-member cargo workspace fixture for member-freedom (`:2131`); `(r/A4)`
 byte-equality tri/four-state (`:2258`); `(s/manifest)` real a100c seed
 failure replay (`:2381`); `(t)` class-shaped tripwire convention
 (`:2506`); `(u)` claim-tripwire convention (`:2596`); `(v/push)`
-`pod_push_stamp.sh` determinism + preflight (`:2664`).
+`pod_push_stamp.sh` determinism + preflight (`:2664`); `(w/esc-050)`/
+`(x/esc-051)` the seed-tuple-unguarded class closure (`:2825`, `:3149`);
+`(y/esc-055)` `push` provisions its own tree's parent directory before
+rsyncing, on a fresh pod (`:3319`); `(z/esc-055)` `push`/`run`/`target`
+refuse a cwd/`REPO_ROOT` mismatch, `RP_ALLOW_ROOT_MISMATCH=1` overrides
+(`:3447`).
 
 **The key-inputs manifest** (`ci/scripts/pod_seed_key_inputs.toml`) —
 every input that can change the bytes a build emits without cargo's own

@@ -311,6 +311,23 @@ architecture and would poison the pod's — along with `.git`, `.venv*`,
 `.claude`, `.sccache`, `.gpu-pull`, `scratchpad`, and the CUTLASS submodule
 (provisioned separately, never rsync'd; see `target --with-cutlass` above).
 
+`push` provisions its own tree's PARENT directory (`/root/trees` for any
+non-default tree) before it rsyncs — rsync itself creates only the LAST path
+component of its own destination, so the very first push against a name no
+session has ever pushed before would otherwise fail outright on a fresh pod
+(`rsync: mkdir "/root/trees/<name>" failed: No such file or directory`).
+This runs unconditionally, every push, and is a no-op once the parent
+already exists.
+
+**`push`/`run`/`target` act on YOUR OWN checkout, not `$PWD`.** `REPO_ROOT`
+is resolved from the SCRIPT's own on-disk location, never from the caller's
+current directory — on a laptop with more than one checkout of this repo (a
+multi-worktree swarm), always invoke the copy INSIDE the tree you mean to
+act on. These three verbs refuse (exit 2, naming both paths) when the
+current directory's own git toplevel disagrees with that location;
+`RP_ALLOW_ROOT_MISMATCH=1` overrides for deliberate cross-tree use (e.g. one
+tree's helper acting on another tree's already-up pod session on purpose).
+
 **`--ref` and `push` are alternatives, not partners.** `push` is
 `rsync -azc --no-times --delete` (the excludes above), so it overwrites the
 working tree while leaving the pod's git metadata pointing at whatever was

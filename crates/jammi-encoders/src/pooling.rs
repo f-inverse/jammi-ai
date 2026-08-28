@@ -24,6 +24,24 @@ pub enum Pooling {
     WeightedMean,
 }
 
+impl std::fmt::Display for Pooling {
+    /// The canonical lowercase token a downstream identity/report reader
+    /// records for this strategy (unit-62 F-5', `jammi-bench`'s
+    /// `EncodeStepTier::pooling`) — `"mean"`/`"cls"`/`"max"`/
+    /// `"weighted_mean"`, mirroring the crate's existing lowercase-token
+    /// convention for other resolved-strategy strings (e.g.
+    /// `ComputePrecision`'s own `Display`).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Pooling::Mean => "mean",
+            Pooling::Cls => "cls",
+            Pooling::Max => "max",
+            Pooling::WeightedMean => "weighted_mean",
+        };
+        f.write_str(s)
+    }
+}
+
 /// Apply pooling and L2 normalisation to a `[batch, seq, hidden]` tensor with
 /// a `[batch, seq]` attention mask.
 ///

@@ -28,19 +28,35 @@
 //! attention matrix — exactly Rabe & Staats' own "recompute, don't retain"
 //! backward, expressed at the op boundary.
 //!
-//! ## This pass: CPU-hermetic only (family L / VALIDATION scope)
+//! ## CPU: `F32` only (family L / VALIDATION scope)
 //!
-//! This op ships `cpu_fwd` only. `cuda_fwd` is left at [`CustomOp3`]'s
-//! default (`Err("no cuda implementation")`) — the CUDA composition (and
-//! the dispatch-lattice wiring that would ever route real traffic here) is
-//! POD-DEFERRED, not attempted in this pass; see the crate's own hand-off
-//! notes for the explicit scope line. Every oracle this module ships is
-//! therefore CPU/F32-only, which is also this op's only DOMAIN-VALID CPU
-//! dtype: candle-core 0.11's CPU backend has no `BF16` `MatMul`
-//! implementation (the same pre-existing limitation
-//! [`super::AttentionBlockFused`]'s own module doc discloses) — `BF16` is
-//! refused on CPU with a typed `UnsupportedDTypeForOp`, never a silent
-//! fallback.
+//! `cpu_fwd` is a raw-storage, hand-written online-softmax loop (fixed fold
+//! order — family J). Every oracle for the CPU arm is therefore
+//! CPU/F32-only, which is also this op's only DOMAIN-VALID CPU dtype:
+//! candle-core 0.11's CPU backend has no `BF16` `MatMul` implementation
+//! (the same pre-existing limitation [`super::AttentionBlockFused`]'s own
+//! module doc discloses) — `BF16` is refused on CPU with a typed
+//! `UnsupportedDTypeForOp`, never a silent fallback.
+//!
+//! ## CUDA: `F32` and `BF16`, via `Tensor`-level composition (M2 part 2)
+//!
+//! `cuda_fwd` implements the SAME chunked Rabe-&-Staats recurrence as
+//! `cpu_fwd`, expressed as a composition of stock candle `Tensor` ops
+//! (`Tensor::from_storage` over a `BackendStorage::try_clone`'d copy of
+//! `s1`/`s2`/`s3` — the SAME "composed interior, no new `.cu`" idiom
+//! [`super::AttentionBlockFused`]'s own CUDA glue documents) rather than a
+//! raw pointer loop: a per-thread scalar loop over `seq²` cells is not a
+//! composition candle's CUDA backend can express directly, so the online-
+//! softmax recurrence (`m`/`l`/`acc`/`mask_running_max`) is built from
+//! `matmul`/`broadcast_maximum`/`exp`/`broadcast_add`/`broadcast_div`
+//! instead — the per-op building blocks, not a hand-written `.cu` kernel.
+//! `BF16` is accepted on this arm (unlike CPU): every intermediate
+//! accumulates in `F32` (upcast once, immediately after gathering `Q`/`K`/
+//! `V`), and the result is rounded back to the input dtype exactly ONCE, at
+//! the final output — `cuda_fwd`'s own doc comment states the full
+//! rounding-contract rationale (why this differs from `softmax.cu`'s
+//! per-fused-kernel `bf16_mul_rounded`/`bf16_add_rounded` round-back
+//! granularity) and the `FullyMaskedPolicy::Zeros`-without-`NaN` algebra.
 //!
 //! ## Domain (family D)
 //!
@@ -410,15 +426,20 @@
 //! non-memeff row emits `null` WITH MEANING ("this arm has no chunk
 //! size"), never simply absent.
 //!
-//! ## Admission (stated, not wired this pass)
+//! ## Admission (M2 part 2: wired at the `jammi-encoders` call site)
 //!
-//! This op has no admission-lattice entry yet (dispatch wiring is out of
-//! scope this pass — see the crate's hand-off notes). For the record: the
-//! op's own device gate, when wired, is `device_is_supported`
-//! (CPU-or-CUDA) — never an exact-arch predicate like flash's — since this
-//! is stock-op composition, not a kernel tuned to one SM target.
+//! This op's own device gate is `device_is_supported` (CPU-or-CUDA) —
+//! never an exact-arch predicate like flash's — since this is stock-op
+//! composition, not a kernel tuned to one SM target. The dispatch-lattice
+//! placement (flash → memeff → block → eager, admitted via `admit_cascade`
+//! on `seq > ATTENTION_BLOCK_MAX_SEQ` once flash has declined) lives in
+//! `jammi_encoders::modernbert` — this op itself has no opinion on WHERE
+//! in a caller's own cascade it is consulted, only on what it can and
+//! cannot compute once dispatched.
 
 use candle_core::backend::BackendStorage;
+#[cfg(feature = "cuda")]
+use candle_core::{op::BackpropOp, DType, Storage};
 use candle_core::{CpuStorage, CustomOp3, Device, Error, Layout, Result, Shape, Tensor, D};
 
 use super::attention_block::check_rope_pack;
@@ -708,6 +729,25 @@ fn build_band_chunk_tensor(
     Tensor::from_vec(band, (1, 1, seq, chunk_len), device)
 }
 
+/// Extracts the [`candle_core::CudaStorage`] backing a `Tensor` this file's
+/// own `cuda_fwd` just built via composition — the mirror-image of
+/// `Tensor::from_storage`'s own lift, used to hand `CustomOp3::cuda_fwd`'s
+/// caller the raw storage its trait signature requires. `t` is always a
+/// CUDA tensor here (every `Tensor` `cuda_fwd` builds is derived from a
+/// `Storage::Cuda`-backed one) — the `other` arm is an op-internal-bug
+/// typed refusal, never a reachable caller domain violation.
+#[cfg(feature = "cuda")]
+fn cuda_storage_of(t: &Tensor, op: &'static str) -> Result<candle_core::CudaStorage> {
+    let (storage, layout) = t.storage_and_layout();
+    match &*storage {
+        Storage::Cuda(cs) => cs.try_clone(layout),
+        other => Err(Error::Msg(format!(
+            "{op}: internal CUDA composition produced a non-CUDA storage ({other:?}) — an \
+             op-internal bug, not a caller domain violation"
+        ))),
+    }
+}
+
 impl CustomOp3 for MemEfficientAttention {
     fn name(&self) -> &'static str {
         "mem_efficient_attention"
@@ -789,6 +829,238 @@ impl CustomOp3 for MemEfficientAttention {
             // the explicit `DTypeMismatchBinaryOp` check above.
             (s1, _) => Err(Error::UnsupportedDTypeForOp(s1.dtype(), op)),
         }
+    }
+
+    /// CUDA composition (M2 part 2): the SAME chunked Rabe-&-Staats forward
+    /// `cpu_fwd`'s raw-storage loop implements, expressed instead as a
+    /// composition of stock candle `Tensor` ops. `Tensor::from_storage`
+    /// lifts `s1`/`s2`/`s3` into DETACHED, untracked `Tensor` handles over
+    /// a FRESH, contiguous copy of their own addressed bytes
+    /// (`BackendStorage::try_clone` respects `l1`'s own layout/offset — no
+    /// data is silently re-interpreted; see `crate::cuda::attention_block`'s
+    /// module doc for the sibling "composed interior, no new `.cu`" idiom
+    /// this mirrors, including its own zero-extent-GEMM early return,
+    /// reproduced below). No raw pointer/index math here: candle's own
+    /// generic CUDA storage kernels (`matmul`/`affine`/elementwise
+    /// binary+unary ops) ARE the per-chunk primitives.
+    ///
+    /// ## Rounding (dtype-split, CUDA arm)
+    ///
+    /// `F32` inputs: `f32` throughout, matching `cpu_fwd` exactly (no
+    /// narrower dtype exists on that path either). `BF16` inputs: the
+    /// online-softmax RECURRENCE (`m`/`l_sum`/`acc`/`mask_running_max`) has
+    /// no eager-composition call site to bit-match against — unlike
+    /// `AttentionBlockFused`'s CUDA arm, which reproduces an EXISTING eager
+    /// GEMM/mask-add sequence, this op's chunked accumulator is NEW, and
+    /// its own oracle (the plan's "reduction-order growth oracle")
+    /// explicitly does NOT expect bit-identity to eager at depth. This arm
+    /// therefore upcasts `Q`/`K`/`V`/`mask` to `f32` ONCE, immediately
+    /// after gathering them, accumulates `m`/`l_sum`/`acc` in `f32` for the
+    /// WHOLE loop, and rounds back to the input dtype exactly ONCE, at the
+    /// final output — the SAME "one round point" doctrine `cpu_fwd`'s own
+    /// module doc states for its `F32` arm, generalized to `bf16` rather
+    /// than reproducing `softmax.cu`'s per-fused-kernel
+    /// `bf16_mul_rounded`/`bf16_add_rounded` round-back granularity (that
+    /// primitive pair governs a SINGLE fused kernel's own internal
+    /// rounding sites; this op has no single fused kernel to reproduce the
+    /// rounding sites OF — it is a multi-launch composition). Stated here
+    /// as a documented decision, not a silent gap: pod-validate against
+    /// oracle #1's truth-relative bounds (never a bit-identity claim, per
+    /// the plan's own oracle-metric-class ruling, v4 delta 5).
+    ///
+    /// ## `FullyMaskedPolicy::Zeros` without `NaN`/`inf` (family D)
+    ///
+    /// A triggered row's `l_sum` is never divided into directly: `keep`
+    /// (`0.0` on a triggered row, `1.0` otherwise) and `safe_l_sum`
+    /// (`l_sum` on a kept row, `1.0` — never `0.0` — on a triggered one)
+    /// together avoid `0.0 / 0.0` and `(-inf) * 0.0`, both of which
+    /// evaluate to `NaN` in IEEE 754 and would otherwise silently poison a
+    /// masked row's OWN zero rather than producing it — the same result
+    /// `cpu_fwd`'s per-row `if fully_masked { .. } else { .. }` branch
+    /// reaches directly, reached here algebraically since `Tensor` ops
+    /// have no per-row branch.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_lines)]
+    fn cuda_fwd(
+        &self,
+        s1: &candle_core::CudaStorage,
+        l1: &Layout,
+        s2: &candle_core::CudaStorage,
+        l2: &Layout,
+        s3: &candle_core::CudaStorage,
+        l3: &Layout,
+    ) -> Result<(candle_core::CudaStorage, Shape)> {
+        let op = self.name();
+        let (b, s, h, d) = mem_eff_attention_dims(l1, op)?;
+        check_rope_head_dim(self.rope, d, op)?;
+        let out_shape = Shape::from((b, s, h * d));
+        let mask_batch = check_key_mask(l3, b, s, op)?;
+        let device = Device::Cuda(s1.device().clone());
+
+        if s1.dtype() != s3.dtype() {
+            return Err(Error::DTypeMismatchBinaryOp {
+                lhs: s1.dtype(),
+                rhs: s3.dtype(),
+                op,
+            });
+        }
+        if self.rope && s1.dtype() != s2.dtype() {
+            return Err(Error::DTypeMismatchBinaryOp {
+                lhs: s1.dtype(),
+                rhs: s2.dtype(),
+                op,
+            });
+        }
+        if !matches!(s1.dtype(), DType::F32 | DType::BF16) {
+            return Err(Error::UnsupportedDTypeForOp(s1.dtype(), op));
+        }
+
+        // Mirrors `crate::cuda::attention_block::cuda_fwd`'s own early
+        // return: cuBLAS is never handed a zero-extent strided-batched
+        // GEMM on this arm either (`bh = b*h == 0` would be exactly that,
+        // whenever `s > 0`) — CPU's own general path tolerates it (its
+        // module doc says so explicitly, for the CPU backend specifically);
+        // CUDA's does not, by the same established precedent.
+        if b == 0 || s == 0 || h == 0 {
+            let out = Tensor::zeros((b, s, h * d), s1.dtype(), &device)?;
+            let lse = Tensor::zeros((b, h, s), DType::F32, &device)?;
+            self.lse
+                .set(lse)
+                .map_err(|e| Error::Msg(format!("{op}: {e}")))?;
+            return Ok((cuda_storage_of(&out, op)?, out_shape));
+        }
+
+        l1.contiguous_offsets()
+            .ok_or(Error::RequiresContiguous { op })?;
+        l3.contiguous_offsets()
+            .ok_or(Error::RequiresContiguous { op })?;
+
+        // DETACHED, untracked `Tensor` views over `s1`/`s3`'s own bytes
+        // (module doc): `try_clone` respects `l1`/`l3`'s own layout/offset
+        // — a genuine device-side materializing copy, priced the same as
+        // `attention_block`'s own `gather_bhsd`.
+        let qkv = Tensor::from_storage(
+            Storage::Cuda(s1.try_clone(l1)?),
+            l1.shape().clone(),
+            BackpropOp::none(),
+            false,
+        );
+        let mask = Tensor::from_storage(
+            Storage::Cuda(s3.try_clone(l3)?),
+            l3.shape().clone(),
+            BackpropOp::none(),
+            false,
+        )
+        .to_dtype(DType::F32)?;
+
+        let q0 = qkv
+            .narrow(2, 0, 1)?
+            .squeeze(2)?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let k0 = qkv
+            .narrow(2, 1, 1)?
+            .squeeze(2)?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let v0 = qkv
+            .narrow(2, 2, 1)?
+            .squeeze(2)?
+            .transpose(1, 2)?
+            .contiguous()?
+            .to_dtype(DType::F32)?;
+
+        let (q_rot, k_rot) = if self.rope {
+            check_rope_pack(l2, s, d, op)?;
+            l2.contiguous_offsets()
+                .ok_or(Error::RequiresContiguous { op })?;
+            let rope_pack = Tensor::from_storage(
+                Storage::Cuda(s2.try_clone(l2)?),
+                l2.shape().clone(),
+                BackpropOp::none(),
+                false,
+            );
+            let cos_full = rope_pack.narrow(0, 0, 1)?.squeeze(0)?;
+            let sin_full = rope_pack.narrow(0, 1, 1)?.squeeze(0)?;
+            let cos = cos_full.narrow(2, 0, s)?;
+            let sin = sin_full.narrow(2, 0, s)?;
+            let qr = apply3(&q0, &cos, &sin, RopeFused::new(false))?;
+            let kr = apply3(&k0, &cos, &sin, RopeFused::new(false))?;
+            (qr, kr)
+        } else {
+            (q0, k0)
+        };
+        let q_scaled = q_rot
+            .to_dtype(DType::F32)?
+            .affine(f64::from(self.scale), 0.0)?;
+        let k_rot_f32 = k_rot.to_dtype(DType::F32)?;
+
+        let mut m = Tensor::full(f32::NEG_INFINITY, (b, h, s, 1), &device)?;
+        let mut l_sum = Tensor::zeros((b, h, s, 1), DType::F32, &device)?;
+        let mut acc = Tensor::zeros((b, h, s, d), DType::F32, &device)?;
+        let mut mask_running_max = Tensor::full(f32::NEG_INFINITY, (mask_batch, 1, 1, 1), &device)?;
+
+        let mut c_start = 0usize;
+        while c_start < s {
+            let clen = self.chunk.min(s - c_start);
+            let k_c = k_rot_f32.narrow(2, c_start, clen)?.contiguous()?;
+            let v_c = v0.narrow(2, c_start, clen)?.contiguous()?;
+            let k_c_t = k_c.transpose(D::Minus1, D::Minus2)?;
+            let scores_c = q_scaled.matmul(&k_c_t)?;
+            let mask_c = mask.narrow(3, c_start, clen)?;
+            let combined_mask_c = match self.half_window {
+                Some(w) => {
+                    let band_c = build_band_chunk_tensor(s, c_start, clen, w, &device)?;
+                    mask_c.broadcast_add(&band_c)?
+                }
+                None => mask_c,
+            };
+            let masked_c = scores_c.broadcast_add(&combined_mask_c)?;
+            let chunk_mask_max = combined_mask_c.max_keepdim(D::Minus1)?;
+            mask_running_max = mask_running_max.broadcast_maximum(&chunk_mask_max)?;
+
+            let chunk_max = masked_c.max_keepdim(D::Minus1)?;
+            let new_max = m.broadcast_maximum(&chunk_max)?;
+            let correction = m.broadcast_sub(&new_max)?.exp()?;
+            acc = acc.broadcast_mul(&correction)?;
+            let p_c = masked_c.broadcast_sub(&new_max)?.exp()?;
+            let p_v = p_c.matmul(&v_c)?;
+            acc = acc.broadcast_add(&p_v)?;
+            let p_sum = p_c.sum_keepdim(D::Minus1)?;
+            l_sum = l_sum.broadcast_mul(&correction)?.broadcast_add(&p_sum)?;
+            m = new_max;
+            c_start += clen;
+        }
+
+        // `FullyMaskedPolicy::Zeros` trigger (module doc's own section,
+        // above): `mask_running_max` may have stayed `[mask_batch, 1, 1,
+        // 1]` (no band — the trigger is legitimately query-row-independent
+        // then, since the combined mask itself is) or grown to
+        // `[mask_batch, 1, s, 1]` (a band present) — `broadcast_as` below
+        // accepts either.
+        let trigger = mask_running_max
+            .broadcast_as((b, 1, s, 1))?
+            .lt(0.0f64)?
+            .to_dtype(DType::F32)?;
+        let keep = trigger.affine(-1.0, 1.0)?;
+        let safe_l_sum = l_sum.broadcast_mul(&keep)?.broadcast_add(&trigger)?;
+        let denom_out = acc.broadcast_div(&safe_l_sum)?;
+        let out_masked = denom_out.broadcast_mul(&keep)?;
+
+        let lse_raw = m.broadcast_add(&safe_l_sum.log()?)?;
+        let sentinel_term = trigger.affine(f64::from(MASKED_LSE_SENTINEL), 0.0)?;
+        let lse = lse_raw
+            .broadcast_mul(&keep)?
+            .broadcast_add(&sentinel_term)?;
+
+        let out_bshd = out_masked.transpose(1, 2)?.contiguous()?;
+        let out_final = out_bshd.reshape((b, s, h * d))?.to_dtype(s1.dtype())?;
+        let lse_final = lse.reshape((b, h, s))?;
+        self.lse
+            .set(lse_final)
+            .map_err(|e| Error::Msg(format!("{op}: {e}")))?;
+
+        Ok((cuda_storage_of(&out_final, op)?, out_shape))
     }
 
     /// See the module doc's "`bwd`'s `lse` channel" section for the full

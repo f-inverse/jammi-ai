@@ -1120,6 +1120,38 @@ jobs:
             cmd: python3 ci/scripts/check_kernel_oracles.py
           - name: kernel oracle standard suite
             cmd: python3 ci/scripts/test_check_kernel_oracles.py
+          # Arch-validation FRESHNESS guard (M2/M3 train fold-in): M3 made
+          # per-arch flash-attn validation representable at all
+          # (build.rs::VALIDATED_SMS, each entry backed by a committed
+          # per-arch pod-parity artifact under crates/jammi-kernels/
+          # artifacts/cuda-runs/) but nothing re-demanded that evidence when
+          # the validated SURFACE changed — the esc-050/esc-051 shape
+          # (evidence present, dead against current code) applied to the
+          # arch-validation table specifically. This gate re-demands it:
+          # every VALIDATED_SMS entry must have a GREEN, ancestor-sha
+          # artifact (Rule 1), that artifact's newest qualifying evidence
+          # must predate no change to the flash surface (build.rs,
+          # src/flash/, third_party/flash-attention/, admission.rs — Rule
+          # 2), unless a rot-checked, range-scoped waiver in
+          # ci/scripts/arch_validation_freshness_allowlist.txt covers it
+          # (Rule 3). See that script's own module doc for the full rule
+          # set and the honest modernbert.rs exclusion.
+          - name: arch validation freshness
+            cmd: python3 ci/scripts/check_arch_validation_freshness.py
+            # Same reason as "CUDA run artifact schema" / "pod build
+            # timings" above: both the ancestry check (git merge-base
+            # --is-ancestor) and the surface-diff check (git diff
+            # <sha>..HEAD) need REAL commit history, and the gate fails
+            # closed on a shallow checkout by design — string "0" (see the
+            # truthiness note on the CUDA run artifact schema leg above; a
+            # bare 0 is falsy in GitHub Actions expressions and would be
+            # silently discarded by `matrix.fetch_depth || '1'` below).
+            fetch_depth: "0"
+          # RED-case self-test for every rule above, driven against
+          # ephemeral `git init`'d fixture repos — never this checkout.
+          - name: arch validation freshness self-test
+            cmd: python3 ci/scripts/check_arch_validation_freshness.py --self-test
+            fetch_depth: "0"
     steps:
       - uses: actions/checkout@v4
         with:

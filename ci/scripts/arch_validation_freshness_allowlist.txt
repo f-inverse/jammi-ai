@@ -1,0 +1,23 @@
+# Arch-validation-freshness waiver allowlist (check_arch_validation_freshness.py)
+#
+# Format: one row per line, `<arch><TAB><reviewed_up_to_sha><TAB><reason>` (a
+# literal TAB character). `#`-prefixed and blank lines are ignored.
+#
+# A row records "arch `<arch>` (a build.rs::VALIDATED_SMS entry) is
+# deliberately accepted as STALE — its per-arch pod-parity evidence was last
+# reviewed as still sufficient through `<reviewed_up_to_sha>`, for
+# `<reason>`". The sha range this waiver covers is `<the qualifying
+# artifact's own git_sha>..<reviewed_up_to_sha>`.
+#
+# Rot, checked mechanically on every run, all hard FAILs:
+#   - `arch` is not in the CURRENT build.rs::VALIDATED_SMS array.
+#   - `reviewed_up_to_sha` is malformed, or not an ancestor of HEAD.
+#   - `arch` is not currently Rule-2-stale at all (a DEAD waiver — delete
+#     the row once a fresh artifact lands or the surface reverts).
+#   - the flash surface changed AGAIN after `reviewed_up_to_sha` (the
+#     waiver's own range no longer covers HEAD — bump `reviewed_up_to_sha`
+#     after re-reviewing, or drop the arch from VALIDATED_SMS instead).
+#
+# Empty today: every VALIDATED_SMS entry (sm80/86/89/90) has fresh evidence
+# at the M2/M3 train tip. See check_arch_validation_freshness.py's own
+# module doc for the full rule set.

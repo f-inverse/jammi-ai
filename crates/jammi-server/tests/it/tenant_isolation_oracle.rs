@@ -1629,7 +1629,7 @@ async fn assert_source_resolver_isolated() {
 async fn materialize_table_for_tenant_a() -> (Arc<InferenceSession>, Session, String, TempDir) {
     use jammi_db::store::manifest::{
         ComputeDevice, ComputePrecision, InputAnchor, Materialization, MaterializationEnv,
-        ModelIdentity, ProducingDescriptor,
+        ModelContentDigest, ModelIdentity, ProducingDescriptor,
     };
 
     const DIMS: usize = 4;
@@ -1709,6 +1709,7 @@ async fn materialize_table_for_tenant_a() -> (Arc<InferenceSession>, Session, St
                     model_id: model_id.into(),
                     backend: "candle".into(),
                     compute_precision: ComputePrecision::F32,
+                    content_digest: ModelContentDigest::Sha256("cpu-fixture-digest".into()),
                 }],
             );
             let ctx = SessionContext::new();
@@ -2108,7 +2109,7 @@ async fn assert_result_table_scan_isolated() {
 async fn materialize_embedding_result_table(engine: &InferenceSession, source: &str) -> String {
     use jammi_db::store::manifest::{
         ComputeDevice, ComputePrecision, InputAnchor, Materialization, MaterializationEnv,
-        ModelIdentity, ProducingDescriptor,
+        ModelContentDigest, ModelIdentity, ProducingDescriptor,
     };
 
     const DIMS: usize = 4;
@@ -2168,6 +2169,7 @@ async fn materialize_embedding_result_table(engine: &InferenceSession, source: &
             model_id: model_id.into(),
             backend: "candle".into(),
             compute_precision: ComputePrecision::F32,
+            content_digest: ModelContentDigest::Sha256("cpu-fixture-digest".into()),
         }],
     );
     store

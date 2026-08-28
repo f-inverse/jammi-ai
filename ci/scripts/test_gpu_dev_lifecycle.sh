@@ -99,8 +99,10 @@ record() { echo "$1:$2" >> "$RESULTS"; }
 
 PASS=0
 FAIL=0
+SKIP=0
 ok()  { PASS=$((PASS + 1)); echo "ok   - $*"; }
 bad() { FAIL=$((FAIL + 1)); echo "FAIL - $*"; }
+skip() { SKIP=$((SKIP + 1)); echo "skip - $*"; }
 
 # ── shared fixture plumbing ─────────────────────────────────────────────────
 
@@ -1172,6 +1174,341 @@ else
 fi
 unset MOCK_DEPLOY_RESPONSE
 
+# ═════════════════════════════════════════════════════════════════════════
+# Group 7 — CLI-level: `wait-seed`/`wait-job` (the fail-open-watcher lesson).
+# `ssh` is deliberately mocked ONLY inside this group, via its own bin dir
+# prepended to PATH for these specific invocations — never added to the
+# shared $STUBBIN every other group's PATH carries, so no earlier/later
+# group's "ssh to 127.0.0.1:1 refuses instantly" assumption is disturbed.
+#
+# The stub answers CALL ORDER, not script content: response #1 always
+# services `require_pod`'s own `rp_session_alive` liveness probe (`ssh ...
+# true`), which rp_wait_poll's own polls run AFTER. Response files are
+# "<rc>\n<output...>"; a call past the last scripted response repeats it
+# (mirrors the curl stub's own _2-falls-back-to-_1 convention above).
+# ═════════════════════════════════════════════════════════════════════════
+WAITBIN="$SANDBOX/waitbin"
+mkdir -p "$WAITBIN"
+cat > "$WAITBIN/ssh" <<'STUB'
+#!/usr/bin/env bash
+cat > /dev/null   # discard the piped poll script -- the stub never reads it
+n=0
+[ -f "${MOCK_SSH_CALL_COUNTER:?MOCK_SSH_CALL_COUNTER unset}" ] && n="$(cat "$MOCK_SSH_CALL_COUNTER")"
+n=$((n + 1))
+echo "$n" > "$MOCK_SSH_CALL_COUNTER"
+dir="${MOCK_SSH_RESPONSES_DIR:?MOCK_SSH_RESPONSES_DIR unset}"
+resp="$dir/$n"
+[ -f "$resp" ] || resp="$dir/$(ls "$dir" | sort -n | tail -1)"
+rc="$(head -n1 "$resp")"
+tail -n +2 "$resp"
+exit "$rc"
+STUB
+chmod +x "$WAITBIN/ssh"
+
+# $1=dir $2=call-number $3=rc $4...=output lines
+write_ssh_resp() {
+  local dir="$1" n="$2" rc="$3"; shift 3
+  { echo "$rc"; printf '%s\n' "$@"; } > "$dir/$n"
+}
+
+# --- 7a: wait-seed SUCCESS -------------------------------------------------
+G7A_SESSION="wsA"; write_meta "$G7A_SESSION" "pod-wsA" "8"
+G7A_DIR="$SANDBOX/g7a-ssh"; mkdir -p "$G7A_DIR"
+write_ssh_resp "$G7A_DIR" 1 0                                    # require_pod liveness
+write_ssh_resp "$G7A_DIR" 2 0 "seed complete: {\"tuples\":[\"T1\"]}"  # first poll: COMPLETE
+rm -f "$SANDBOX/g7a-counter"
+MOCK_SSH_CALL_COUNTER="$SANDBOX/g7a-counter" MOCK_SSH_RESPONSES_DIR="$G7A_DIR" \
+  RP_WAIT_INTERVAL_SECS=1 \
+  PATH="$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" wait-seed "$G7A_SESSION" --timeout 10 \
+  >"$SANDBOX/out-g7a.log" 2>&1
+g7a_rc=$?
+if [ "$g7a_rc" -eq 0 ] && grep -q "SUCCESS" "$SANDBOX/out-g7a.log"; then
+  ok "wait-seed: success path exits 0 and reports SUCCESS"
+else
+  bad "wait-seed: success path expected rc=0 + SUCCESS (got rc=$g7a_rc): $(cat "$SANDBOX/out-g7a.log")"
+fi
+
+# --- 7b: wait-seed FAILURE (failure marker) --------------------------------
+G7B_SESSION="wsB"; write_meta "$G7B_SESSION" "pod-wsB" "8"
+G7B_DIR="$SANDBOX/g7b-ssh"; mkdir -p "$G7B_DIR"
+write_ssh_resp "$G7B_DIR" 1 0                                     # require_pod liveness
+write_ssh_resp "$G7B_DIR" 2 1 "seed FAILED -- nvcc fatal: out of memory"
+rm -f "$SANDBOX/g7b-counter"
+MOCK_SSH_CALL_COUNTER="$SANDBOX/g7b-counter" MOCK_SSH_RESPONSES_DIR="$G7B_DIR" \
+  RP_WAIT_INTERVAL_SECS=1 \
+  PATH="$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" wait-seed "$G7B_SESSION" --timeout 10 \
+  >"$SANDBOX/out-g7b.log" 2>&1
+g7b_rc=$?
+if [ "$g7b_rc" -ne 0 ] && grep -q "FAILURE" "$SANDBOX/out-g7b.log" && grep -q "nvcc fatal" "$SANDBOX/out-g7b.log"; then
+  ok "wait-seed: failure-marker path exits non-zero and names the failure"
+else
+  bad "wait-seed: failure-marker path expected rc!=0 + FAILURE naming nvcc (got rc=$g7b_rc): $(cat "$SANDBOX/out-g7b.log")"
+fi
+
+# --- 7c: wait-seed TRANSPORT FAILURE (the load-bearing case) --------------
+# Three consecutive unreachable polls (rc 255, ssh's own "could not connect"
+# convention) must exit loudly -- NEVER read as "still running", which is
+# exactly the silent-idle failure mode this verb replaces.
+G7C_SESSION="wsC"; write_meta "$G7C_SESSION" "pod-wsC" "8"
+G7C_DIR="$SANDBOX/g7c-ssh"; mkdir -p "$G7C_DIR"
+write_ssh_resp "$G7C_DIR" 1 0                                     # require_pod liveness
+write_ssh_resp "$G7C_DIR" 2 255 "ssh: connect to host 127.0.0.1 port 1: Connection refused"
+write_ssh_resp "$G7C_DIR" 3 255 "ssh: connect to host 127.0.0.1 port 1: Connection refused"
+write_ssh_resp "$G7C_DIR" 4 255 "ssh: connect to host 127.0.0.1 port 1: Connection refused"
+rm -f "$SANDBOX/g7c-counter"
+MOCK_SSH_CALL_COUNTER="$SANDBOX/g7c-counter" MOCK_SSH_RESPONSES_DIR="$G7C_DIR" \
+  RP_WAIT_INTERVAL_SECS=1 \
+  PATH="$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" wait-seed "$G7C_SESSION" --timeout 30 \
+  >"$SANDBOX/out-g7c.log" 2>&1
+g7c_rc=$?
+if [ "$g7c_rc" -eq 2 ] && grep -q "TRANSPORT FAILURE" "$SANDBOX/out-g7c.log" \
+  && grep -q "NOT evidence" "$SANDBOX/out-g7c.log"; then
+  ok "wait-seed: 3 consecutive unreachable polls is a LOUD transport failure (rc=2), never silent 'still running'"
+else
+  bad "wait-seed: expected rc=2 + TRANSPORT FAILURE naming the count (got rc=$g7c_rc): $(cat "$SANDBOX/out-g7c.log")"
+fi
+if [ "$(cat "$SANDBOX/g7c-counter" 2>/dev/null)" = "4" ]; then
+  ok "wait-seed: transport failure gives up after exactly RP_WAIT_MAX_TRANSPORT_FAILS(=3) consecutive misses, not before or after"
+else
+  bad "wait-seed: expected exactly 4 ssh calls (1 liveness + 3 failed polls), got $(cat "$SANDBOX/g7c-counter" 2>/dev/null)"
+fi
+
+# --- 7d: wait-job SUCCESS (tmux session ended, .jammi.log present) --------
+G7D_SESSION="wjD"; write_meta "$G7D_SESSION" "pod-wjD" "8"
+G7D_DIR="$SANDBOX/g7d-ssh"; mkdir -p "$G7D_DIR"
+write_ssh_resp "$G7D_DIR" 1 0                                     # require_pod liveness
+write_ssh_resp "$G7D_DIR" 2 0 "job finished (tmux session jammi-jammi-ai ended) -- tail:" "all tests passed"
+rm -f "$SANDBOX/g7d-counter"
+MOCK_SSH_CALL_COUNTER="$SANDBOX/g7d-counter" MOCK_SSH_RESPONSES_DIR="$G7D_DIR" \
+  RP_WAIT_INTERVAL_SECS=1 \
+  PATH="$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" wait-job "$G7D_SESSION" --timeout 10 \
+  >"$SANDBOX/out-g7d.log" 2>&1
+g7d_rc=$?
+if [ "$g7d_rc" -eq 0 ] && grep -q "SUCCESS" "$SANDBOX/out-g7d.log"; then
+  ok "wait-job: success path (tmux session ended, log present) exits 0"
+else
+  bad "wait-job: success path expected rc=0 + SUCCESS (got rc=$g7d_rc): $(cat "$SANDBOX/out-g7d.log")"
+fi
+
+# --- 7e: wait-job FAILURE (no evidence -- never ran) -----------------------
+G7E_SESSION="wjE"; write_meta "$G7E_SESSION" "pod-wjE" "8"
+G7E_DIR="$SANDBOX/g7e-ssh"; mkdir -p "$G7E_DIR"
+write_ssh_resp "$G7E_DIR" 1 0                                     # require_pod liveness
+write_ssh_resp "$G7E_DIR" 2 1 "no job evidence for tree 'jammi-ai': no live tmux session and no .jammi.log"
+rm -f "$SANDBOX/g7e-counter"
+MOCK_SSH_CALL_COUNTER="$SANDBOX/g7e-counter" MOCK_SSH_RESPONSES_DIR="$G7E_DIR" \
+  RP_WAIT_INTERVAL_SECS=1 \
+  PATH="$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" wait-job "$G7E_SESSION" --timeout 10 \
+  >"$SANDBOX/out-g7e.log" 2>&1
+g7e_rc=$?
+if [ "$g7e_rc" -ne 0 ] && grep -q "no job evidence" "$SANDBOX/out-g7e.log"; then
+  ok "wait-job: no-evidence path (never ran) exits non-zero naming it"
+else
+  bad "wait-job: expected rc!=0 + 'no job evidence' (got rc=$g7e_rc): $(cat "$SANDBOX/out-g7e.log")"
+fi
+
+# --- 7f: wait-seed/wait-job honour the SAME RP_SESSION-vs-positional
+# conflict refusal every other session verb does (never silently pick one).
+G7F_OUT="$SANDBOX/out-g7f.log"
+RP_SESSION="other-session" bash "$DIR/gpu-dev.sh" wait-seed "$G7A_SESSION" >"$G7F_OUT" 2>&1
+g7f_rc=$?
+if [ "$g7f_rc" -eq 2 ] && grep -q "conflicting session" "$G7F_OUT"; then
+  ok "wait-seed: a positional session conflicting with exported RP_SESSION REFUSES (exit 2)"
+else
+  bad "wait-seed: expected exit 2 + 'conflicting session' (got rc=$g7f_rc): $(cat "$G7F_OUT")"
+fi
+
+# --- 7g: --timeout must reject a non-positive-integer value ---------------
+G7G_OUT="$SANDBOX/out-g7g.log"
+bash "$DIR/gpu-dev.sh" wait-seed "$G7A_SESSION" --timeout notanumber >"$G7G_OUT" 2>&1
+g7g_rc=$?
+if [ "$g7g_rc" -eq 2 ] && grep -q "must be a positive integer" "$G7G_OUT"; then
+  ok "wait-seed: a non-integer --timeout is refused (exit 2), never silently defaulted"
+else
+  bad "wait-seed: expected exit 2 for --timeout notanumber (got rc=$g7g_rc): $(cat "$G7G_OUT")"
+fi
+
+# ═════════════════════════════════════════════════════════════════════════
+# Group 8 — round-N adversarial-audit findings B1/B2/B3: state-lattice and
+# honesty defects the mocked-ssh Group 7 tests above cannot construct on
+# their own (they drive rp_wait_poll's own rc contract with CANNED
+# responses; they never run the ACTUAL remote-check-script text, or a real
+# hung ssh, end to end).
+# ═════════════════════════════════════════════════════════════════════════
+
+# --- 8a (B1): a HUNG ssh — not rc=255, an ACTUAL sleep past the local
+# bound — must still be a LOUD, counted transport failure, never a silent
+# indefinite wait. This is the load-bearing case: `-oServerAliveInterval`/
+# `-oBatchMode` cannot be exercised by a bare bash stub (it is not real
+# openssh), so this proves `_rp_bounded_capture`'s own local kill is what
+# actually bounds it.
+G8A_SESSION="wsHang"; write_meta "$G8A_SESSION" "pod-wsHang" "8"
+G8A_BIN="$SANDBOX/g8a-bin"; mkdir -p "$G8A_BIN"
+G8A_COUNTER="$SANDBOX/g8a-counter"; rm -f "$G8A_COUNTER"
+cat > "$G8A_BIN/ssh" <<STUB
+#!/usr/bin/env bash
+cat > /dev/null
+n=0
+[ -f "$G8A_COUNTER" ] && n="\$(cat "$G8A_COUNTER")"
+n=\$((n + 1))
+echo "\$n" > "$G8A_COUNTER"
+if [ "\$n" = "1" ]; then
+  exit 0   # require_pod's own liveness probe
+fi
+sleep 9999   # simulate a pod that accepted TCP but never answers again
+STUB
+chmod +x "$G8A_BIN/ssh"
+G8A_START="$SECONDS"
+RP_WAIT_SSH_BOUND_SECS=2 RP_WAIT_INTERVAL_SECS=1 RP_WAIT_MAX_TRANSPORT_FAILS=2 \
+  PATH="$G8A_BIN:$PATH" bash "$DIR/gpu-dev.sh" wait-seed "$G8A_SESSION" --timeout 60 \
+  >"$SANDBOX/out-g8a.log" 2>&1
+g8a_rc=$?
+g8a_elapsed=$((SECONDS - G8A_START))
+if [ "$g8a_rc" -eq 2 ] && grep -q "TRANSPORT FAILURE" "$SANDBOX/out-g8a.log"; then
+  ok "wait-seed(B1): a HUNG ssh (sleeps past the local bound, never returns) is still a loud, counted transport failure — never silent"
+else
+  bad "wait-seed(B1): expected rc=2 + TRANSPORT FAILURE against a hung ssh (got rc=$g8a_rc, ${g8a_elapsed}s elapsed): $(cat "$SANDBOX/out-g8a.log")"
+fi
+# Bounded well under the 9999s sleep: 2 hung polls * (RP_WAIT_SSH_BOUND_SECS
+# + up to 1s TERM->KILL grace) is at most ~6s: proves the hang is actually
+# KILLED, not merely outlasted by the overall --timeout.
+if [ "$g8a_elapsed" -lt 30 ]; then
+  ok "wait-seed(B1): the hung polls were actually bounded/killed locally (${g8a_elapsed}s, not the 9999s the stub sleeps for)"
+else
+  bad "wait-seed(B1): took ${g8a_elapsed}s — the local bound did not actually kill the hung ssh"
+fi
+
+# The remaining Group 8 legs run REAL tmux/flock locally (never over ssh —
+# they drive rp_seed_wait_script/rp_job_wait_script/
+# rp_job_wrapper_with_marker_lines directly, sourcing runpod_lib.sh, exactly
+# like Group 0/5's own function-level tests above) — gated the same way
+# test_pod_substrate.sh's own tmux-dependent leg (d) is, so a host missing
+# either tool degrades to a skip rather than a hard CI failure.
+if command -v tmux >/dev/null 2>&1 && command -v flock >/dev/null 2>&1; then
+  (
+    export RUNPOD_API_KEY="dummy-key"
+    unset RP_SESSION
+    # shellcheck source=ci/scripts/runpod_lib.sh
+    source "$DIR/runpod_lib.sh"
+
+    G8_SANDBOX="$SANDBOX/g8"
+    mkdir -p "$G8_SANDBOX"
+
+    # --- 8b (B2): BOTH markers present at once (no live session) — a
+    # pathological/inconsistent state — must read FAILED, not COMPLETE:
+    # rp_seed_wait_script checks FAILED unconditionally first.
+    PFX="$G8_SANDBOX/seed-both"
+    : > "${PFX}.jammi-seed-complete"
+    : > "${PFX}.jammi-seed-failed"
+    SESS="jammi-g8-none-$$"
+    tmux kill-session -t "=${SESS}" 2>/dev/null
+    script_both="$(rp_seed_wait_script "$PFX" "$SESS")"
+    out_both="$(bash -c "$script_both" 2>&1)"; rc_both=$?
+    if [ "$rc_both" -eq 1 ] && printf '%s' "$out_both" | grep -qi "FAILED"; then
+      record PASS "g8b-both-markers-present-reads-FAILED-not-COMPLETE"
+    else
+      record FAIL "g8b-both-markers-present-reads-FAILED-not-COMPLETE (rc=$rc_both out=$out_both)"
+    fi
+
+    # --- 8c (B2): a COMPLETE marker alongside a LIVE session — the narrow
+    # --reseed race window — must read RUNNING (keep polling), never
+    # SUCCESS.
+    PFX2="$G8_SANDBOX/seed-live"
+    : > "${PFX2}.jammi-seed-complete"
+    SESS2="jammi-g8-live-$$"
+    tmux kill-session -t "=${SESS2}" 2>/dev/null
+    tmux new-session -d -s "$SESS2" "sleep 5"
+    sleep 0.3
+    script_live="$(rp_seed_wait_script "$PFX2" "$SESS2")"
+    out_live="$(bash -c "$script_live" 2>&1)"; rc_live=$?
+    tmux kill-session -t "=${SESS2}" 2>/dev/null
+    if [ "$rc_live" -eq 2 ] && printf '%s' "$out_live" | grep -qi "still building"; then
+      record PASS "g8c-complete-marker-plus-live-session-reads-RUNNING-not-SUCCESS"
+    else
+      record FAIL "g8c-complete-marker-plus-live-session-reads-RUNNING-not-SUCCESS (rc=$rc_live out=$out_live)"
+    fi
+
+    # --- 8d (B3): rc=0 — a real successful job, driven through the ACTUAL
+    # wrapper the way `run` builds it, then read back by rp_job_wait_script.
+    TREED="$G8_SANDBOX/tree-ok"; mkdir -p "$TREED"
+    wrap_ok="$(rp_job_wrapper_with_marker_lines "$TREED" "$TREED/.target" "true" "tokOK" "0")"
+    printf '%s\n' "$wrap_ok" > "$TREED/.jammi-job.sh"
+    bash "$TREED/.jammi-job.sh" > "$TREED/.jammi.log" 2>&1
+    job_ok_rc=$?
+    SESSOK="jammi-g8-ok-$$"; tmux kill-session -t "=${SESSOK}" 2>/dev/null
+    script_ok="$(rp_job_wait_script "$TREED" "$SESSOK" "ok-tree")"
+    out_ok="$(bash -c "$script_ok" 2>&1)"; rc_ok=$?
+    if [ "$job_ok_rc" -eq 0 ] && [ "$rc_ok" -eq 0 ] && printf '%s' "$out_ok" | grep -qi "successfully"; then
+      record PASS "g8d-wrapper-rc0-reads-SUCCESS"
+    else
+      record FAIL "g8d-wrapper-rc0-reads-SUCCESS (job_ok_rc=$job_ok_rc rc_ok=$rc_ok out=$out_ok)"
+    fi
+
+    # --- 8e (B3): rc!=0 — a real failing job.
+    TREEF="$G8_SANDBOX/tree-fail"; mkdir -p "$TREEF"
+    # A bare `exit 3` — deliberately the PATHOLOGICAL job shape (a caller
+    # CAN type `gpu-dev.sh run a100 exit 1`; JOB is `"$*"` verbatim), the
+    # exact case rp_job_wrapper_with_marker_lines's own `( job )` subshell
+    # wrapping exists to contain: an unwrapped bare `exit` would terminate
+    # the WHOLE generated script, skipping the marker write below it.
+    wrap_fail="$(rp_job_wrapper_with_marker_lines "$TREEF" "$TREEF/.target" "exit 3" "tokFAIL" "0")"
+    printf '%s\n' "$wrap_fail" > "$TREEF/.jammi-job.sh"
+    bash "$TREEF/.jammi-job.sh" > "$TREEF/.jammi.log" 2>&1
+    job_fail_rc=$?
+    SESSFAIL="jammi-g8-fail-$$"; tmux kill-session -t "=${SESSFAIL}" 2>/dev/null
+    script_fail="$(rp_job_wait_script "$TREEF" "$SESSFAIL" "fail-tree")"
+    out_fail="$(bash -c "$script_fail" 2>&1)"; rc_fail=$?
+    if [ "$job_fail_rc" -eq 3 ] && [ "$rc_fail" -eq 1 ] && printf '%s' "$out_fail" | grep -q "rc=3"; then
+      record PASS "g8e-wrapper-rc3-reads-FAILED-naming-the-real-rc"
+    else
+      record FAIL "g8e-wrapper-rc3-reads-FAILED-naming-the-real-rc (job_fail_rc=$job_fail_rc rc_fail=$rc_fail out=$out_fail)"
+    fi
+
+    # --- 8f (B3): flock refusal (rc=75) — hold the SAME timing lock
+    # externally (a real, separate flock holder) before running the
+    # timing=1 wrapper, proving the refusal is distinct from a job that
+    # merely happens to exit 75 on its own.
+    TREEL="$G8_SANDBOX/tree-lock"; mkdir -p "$TREEL"
+    LOCKFILE="$G8_SANDBOX/.jammi-timing.lock"
+    tmux kill-session -t "=jammi-g8-lockholder-$$" 2>/dev/null
+    tmux new-session -d -s "jammi-g8-lockholder-$$" "exec 9>'$LOCKFILE'; flock -x 9; sleep 5"
+    sleep 0.3
+    wrap_lock="$(rp_job_wrapper_with_marker_lines "$TREEL" "$TREEL/.target" "true" "tokLOCK" "1")"
+    # The wrapper's own generated text hardcodes /root/.jammi-timing.lock;
+    # substituted here to the SANDBOXED lock file so this test never
+    # touches the real path.
+    wrap_lock="${wrap_lock//\/root\/.jammi-timing.lock/$LOCKFILE}"
+    printf '%s\n' "$wrap_lock" > "$TREEL/.jammi-job.sh"
+    bash "$TREEL/.jammi-job.sh" > "$TREEL/.jammi.log" 2>&1
+    job_lock_rc=$?
+    tmux kill-session -t "=jammi-g8-lockholder-$$" 2>/dev/null
+    SESSLOCK="jammi-g8-lock-$$"; tmux kill-session -t "=${SESSLOCK}" 2>/dev/null
+    script_lock="$(rp_job_wait_script "$TREEL" "$SESSLOCK" "lock-tree")"
+    out_lock="$(bash -c "$script_lock" 2>&1)"; rc_lock=$?
+    if [ "$job_lock_rc" -eq 75 ] && [ "$rc_lock" -eq 1 ] && printf '%s' "$out_lock" | grep -qi "REFUSED"; then
+      record PASS "g8f-wrapper-lock-refused-reads-REFUSED-distinctly-from-a-real-rc75-job"
+    else
+      record FAIL "g8f-wrapper-lock-refused-reads-REFUSED-distinctly-from-a-real-rc75-job (job_lock_rc=$job_lock_rc rc_lock=$rc_lock out=$out_lock)"
+    fi
+
+    # --- 8g (B3): a STALE .jammi.log with NO .jammi.exit marker and no
+    # live session — the exact false-SUCCESS shape the old "does a log file
+    # exist" check had — must read "no evidence", never SUCCESS.
+    TREES="$G8_SANDBOX/tree-stale"; mkdir -p "$TREES"
+    echo "leftover output from some earlier, unrelated run" > "$TREES/.jammi.log"
+    SESSSTALE="jammi-g8-stale-$$"; tmux kill-session -t "=${SESSSTALE}" 2>/dev/null
+    script_stale="$(rp_job_wait_script "$TREES" "$SESSSTALE" "stale-tree")"
+    out_stale="$(bash -c "$script_stale" 2>&1)"; rc_stale=$?
+    if [ "$rc_stale" -eq 1 ] && printf '%s' "$out_stale" | grep -qi "no job evidence"; then
+      record PASS "g8g-stale-log-no-marker-reads-no-evidence-not-SUCCESS"
+    else
+      record FAIL "g8g-stale-log-no-marker-reads-no-evidence-not-SUCCESS (rc=$rc_stale out=$out_stale)"
+    fi
+  )
+else
+  skip "Group 8 (B1/B2/B3 state-lattice legs): tmux and/or flock not found on this host"
+fi
+
 # ── tally ────────────────────────────────────────────────────────────────
 while IFS=: read -r status name; do
   [ -n "$status" ] || continue
@@ -1183,5 +1520,5 @@ while IFS=: read -r status name; do
 done < "$RESULTS"
 
 echo
-echo "gpu-dev-lifecycle: ${PASS} passed, ${FAIL} failed"
+echo "gpu-dev-lifecycle: ${PASS} passed, ${FAIL} failed, ${SKIP} skipped"
 [ "$FAIL" -eq 0 ]

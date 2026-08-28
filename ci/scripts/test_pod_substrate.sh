@@ -387,24 +387,29 @@ DRV
       tmux kill-session -t "=${TSESS2}" 2>/dev/null
       tmux kill-session -t "=${KEEPALIVE}" 2>/dev/null
 
-      # Assert the SHIPPED LAUNCH string shape: gpu-dev.sh's `run --timing`
-      # puts `flock -n -E 75 ...` as the FIRST word of the string handed to
-      # `tmux new-session -d -s SESSION "STRING"` — i.e. INSIDE the pane's
-      # own command, the correct shape the two legs above just contrasted.
-      # round-3 audit Class B: the ORIGINAL assertion hardcoded a six-space
-      # indent anchor (`^      LAUNCH=`, over-pinned to gpu-dev.sh's CURRENT
-      # nesting depth — any re-indent breaks this test even though nothing
-      # behaviourally changed) AND never checked that `tmux new-session`
-      # actually CONSUMES the LAUNCH variable it just asserted the shape
-      # of — a LAUNCH that starts with "flock..." but is never passed to
-      # tmux would still have passed the old assertion.
+      # Assert the SHIPPED shape: gpu-dev.sh's `run --timing` dispatches the
+      # pane's own command DIRECTLY to `.jammi-job.sh` (never a bare `bash
+      # -c "flock ... bash job.sh"` split across two processes), and the
+      # flock acquisition lives INSIDE that same generated script
+      # (rp_job_wrapper_with_marker_lines, runpod_lib.sh) — i.e. INSIDE the
+      # pane's own command, the correct shape the two legs above just
+      # contrasted. round-N audit finding B3 moved the acquisition from the
+      # outer LAUNCH string (`flock -n -E 75 ... bash job.sh`, checked by an
+      # earlier revision of this very leg) into the wrapper script itself,
+      # so a lock refusal and the job's own real exit code can never
+      # collide on the literal value 75 — see that function's own doc for
+      # why. round-3 audit Class B's own discipline is kept: no hardcoded
+      # indent anchor, and `tmux new-session` is confirmed to actually
+      # CONSUME the LAUNCH variable, not merely to exist somewhere nearby.
       GPU_DEV_SH="$REPO_ROOT/ci/scripts/gpu-dev.sh"
-      launch_line="$(grep -E 'LAUNCH="flock -n -E 75 /root/\.jammi-timing\.lock bash' "$GPU_DEV_SH")"
+      RUNPOD_LIB_SH="$REPO_ROOT/ci/scripts/runpod_lib.sh"
+      launch_line="$(grep -F "LAUNCH=\"bash '\${TREE_DIR}'/.jammi-job.sh > '\${TREE_DIR}'/.jammi.log 2>&1\"" "$GPU_DEV_SH")"
       tmux_consumes_launch="$(grep -F 'tmux new-session -d -s "${TMUX_SESSION}" "${LAUNCH}"' "$GPU_DEV_SH")"
-      if [ -n "$launch_line" ] && [ -n "$tmux_consumes_launch" ]; then
-        ok "(d-neg) gpu-dev.sh's shipped --timing LAUNCH string puts flock INSIDE the pane's own command AND tmux new-session actually consumes it"
+      flock_inside_wrapper="$(grep -F 'flock -n 9' "$RUNPOD_LIB_SH")"
+      if [ -n "$launch_line" ] && [ -n "$tmux_consumes_launch" ] && [ -n "$flock_inside_wrapper" ]; then
+        ok "(d-neg) gpu-dev.sh's shipped --timing LAUNCH dispatches directly to .jammi-job.sh, flock lives INSIDE that generated script (runpod_lib.sh), and tmux new-session actually consumes LAUNCH"
       else
-        bad "(d-neg) gpu-dev.sh's --timing LAUNCH shape/consumption check failed — launch_line='${launch_line}' tmux_consumes='${tmux_consumes_launch}'"
+        bad "(d-neg) gpu-dev.sh's --timing LAUNCH shape/consumption check failed — launch_line='${launch_line}' tmux_consumes='${tmux_consumes_launch}' flock_inside_wrapper='${flock_inside_wrapper}'"
       fi
     else
       if [ "${JAMMI_REQUIRE_LOCK_TEST:-0}" = "1" ]; then
@@ -715,14 +720,44 @@ DRV
     && ok "(i) rp_job_wrapper_lines carries the caller's job command verbatim" \
     || bad "(i) rp_job_wrapper_lines dropped the job command — got: $wrapper_text"
 
-  # gpu-dev.sh's `run` case must build the job wrapper via rp_job_wrapper_lines
-  # (single source, never re-inlined) — a structural check that the wiring
-  # above is actually USED, not merely available.
-  if grep -q 'rp_job_wrapper_lines "\$TREE_DIR" "\$TARGET_DIR" "\$JOB"' "$REPO_ROOT/ci/scripts/gpu-dev.sh"; then
-    ok "(i) gpu-dev.sh's run case builds its job wrapper via rp_job_wrapper_lines"
+  # gpu-dev.sh's `run` case must build the job wrapper via
+  # rp_job_wrapper_with_marker_lines (single source, never re-inlined) — a
+  # structural check that the wiring above is actually USED, not merely
+  # available. round-N audit finding B3 replaced the plain
+  # rp_job_wrapper_lines call here with the marker-bearing variant, so
+  # wait-job can tell a job's own real completion apart from a stale log or
+  # a flock-refused invocation.
+  if grep -q 'rp_job_wrapper_with_marker_lines "\$TREE_DIR" "\$TARGET_DIR" "\$JOB" "\$RUN_TOKEN" "\$TIMING"' "$REPO_ROOT/ci/scripts/gpu-dev.sh"; then
+    ok "(i) gpu-dev.sh's run case builds its job wrapper via rp_job_wrapper_with_marker_lines"
   else
-    bad "(i) gpu-dev.sh's run case does not call rp_job_wrapper_lines with (TREE_DIR, TARGET_DIR, JOB)"
+    bad "(i) gpu-dev.sh's run case does not call rp_job_wrapper_with_marker_lines with (TREE_DIR, TARGET_DIR, JOB, RUN_TOKEN, TIMING)"
   fi
+
+  # rp_job_wrapper_with_marker_lines itself (round-N audit finding B3): same
+  # env/cd/job carriage as rp_job_wrapper_lines above, PLUS the completion
+  # marker wait-job actually reads.
+  marker_wrapper_text="$(bash "$RUNPOD_DRIVER" rp_job_wrapper_with_marker_lines "/root/trees/mytree" "/root/target-mytree" "cargo test" "tok123" "0")"
+  if printf '%s\n' "$marker_wrapper_text" | grep -qF "export CARGO_TARGET_DIR='/root/target-mytree'"; then
+    ok "(i/B3) rp_job_wrapper_with_marker_lines still emits the CARGO_TARGET_DIR export"
+  else
+    bad "(i/B3) rp_job_wrapper_with_marker_lines did not emit the expected CARGO_TARGET_DIR export — got: $marker_wrapper_text"
+  fi
+  printf '%s\n' "$marker_wrapper_text" | grep -qF "rm -f '/root/trees/mytree/.jammi.exit'" \
+    && ok "(i/B3) rp_job_wrapper_with_marker_lines removes any stale .jammi.exit at the VERY START" \
+    || bad "(i/B3) rp_job_wrapper_with_marker_lines did not remove .jammi.exit up front — got: $marker_wrapper_text"
+  printf '%s\n' "$marker_wrapper_text" | grep -qF '"token":"tok123"' \
+    && ok "(i/B3) rp_job_wrapper_with_marker_lines carries the caller's own token into the marker" \
+    || bad "(i/B3) rp_job_wrapper_with_marker_lines dropped the caller's token — got: $marker_wrapper_text"
+  printf '%s\n' "$marker_wrapper_text" | grep -q 'flock -n 9' \
+    && bad "(i/B3) timing=0 must NOT emit a flock acquisition — got: $marker_wrapper_text" \
+    || ok "(i/B3) timing=0 emits no flock acquisition"
+  marker_wrapper_timing="$(bash "$RUNPOD_DRIVER" rp_job_wrapper_with_marker_lines "/root/trees/mytree" "/root/target-mytree" "cargo test" "tok123" "1")"
+  printf '%s\n' "$marker_wrapper_timing" | grep -q 'flock -n 9' \
+    && ok "(i/B3) timing=1 emits the fd-based flock acquisition INSIDE the wrapper" \
+    || bad "(i/B3) timing=1 did not emit a flock acquisition — got: $marker_wrapper_timing"
+  printf '%s\n' "$marker_wrapper_timing" | grep -qF '"rc":75,"lock_refused":true' \
+    && ok "(i/B3) timing=1's refusal arm writes an rc=75/lock_refused=true marker before exiting" \
+    || bad "(i/B3) timing=1 did not write the lock-refused marker — got: $marker_wrapper_timing"
 
   # target-then-push composition, end to end, on a LOCAL fixture pod
   # filesystem (real pod_target_clone.sh, real rsync, real exclude list —
@@ -849,6 +884,23 @@ DRV
   printf '%s' "$out2" | grep -qi "previously FAILED" \
     && ok "(j) the refusal names the prior failure, not a generic error" \
     || bad "(j) the refusal did not name the prior failure — got: $out2"
+
+  # round-N audit finding B2(a): `--reseed` must remove a STALE
+  # COMPLETE_MARKER too, not just FAILED_MARKER — a marker left in place
+  # for the whole rebuild reads as "done" to any consumer checking its mere
+  # EXISTENCE (pod_target_clone.sh's own gate, gpu-dev.sh's `wait-seed`).
+  # Simulated by hand-writing a COMPLETE marker from an OLDER, unrelated
+  # successful build, then re-invoking with --reseed against the SAME
+  # always-fails cargo stub: this rebuild attempt fails too (irrelevant to
+  # what is being asserted), but the marker must be gone the instant the
+  # rebuild started, regardless of how it ends.
+  : > "${SEED_SANDBOX}/seed.jammi-seed-complete"
+  bash "$JDRIVER" --reseed >/dev/null 2>&1
+  if [ ! -f "${SEED_SANDBOX}/seed.jammi-seed-complete" ]; then
+    ok "(j/B2a) --reseed removes a stale COMPLETE marker at rebuild start, even though this rebuild attempt itself then fails"
+  else
+    bad "(j/B2a) --reseed left a stale COMPLETE marker in place — a consumer reading marker EXISTENCE alone would read a lie about a PREVIOUS build"
+  fi
 }
 
 # ═════════════════════════════════════════════════════════════════════════

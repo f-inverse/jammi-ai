@@ -26,22 +26,38 @@
 #   gpu-dev.sh up      [arch] [--ref R]              start a surviving session (name = arch)
 #                      [--replace]                   replace an alias's existing record
 #   gpu-dev.sh target  [session] <name>              clone the pod's build-substrate seed
-#                      [--verify] [--with-cutlass]    into a new tree (`/root/trees/<name>`)
+#                      [--verify] [--with-cutlass]    into a fresh CARGO_TARGET_DIR
+#                                                      (`/root/target-<name>`) for a tree that
+#                                                      already exists — `push` to <name> FIRST
 #   gpu-dev.sh attach  [session] [--tree T]           shell into a surviving session
 #   gpu-dev.sh run     [session] [--tree T] <cmd...>  run <cmd> detached under tmux
 #   gpu-dev.sh logs    [session] [--tree T]           tail the detached job's output
 #   gpu-dev.sh push    [session] [--tree T]           rsync your working tree TO the pod
 #   gpu-dev.sh pull    [session] [--tree T] <path>    rsync <path> back FROM the pod
+#   gpu-dev.sh wait-seed [session] [--timeout SECS]   block until the pod's own build-substrate
+#                                                      seed completes, fails, or the timeout
+#                                                      elapses — never silently misreads an
+#                                                      unreachable pod as "still building"
+#   gpu-dev.sh wait-job [session] [--tree T]          block until <tree>'s detached `run` job
+#                       [--timeout SECS]               ends, fails, or the timeout elapses
 #   gpu-dev.sh down    [session]                       terminate the pod, forget the session
 #   gpu-dev.sh ls                                      list sessions
 #
 # arch: a100 (default) | l40s | h100 | a40 | l4
 # --ref: branch, tag or commit the pod's checkout is placed on (default main).
 #        Verified against the remote BEFORE a pod is rented.
-# --tree: the checkout/tree a run/push/pull/attach/logs/target command acts
-#        on (default "jammi-ai" — the bootstrap checkout at /root/jammi-ai).
-#        Any other name is a plain directory at /root/trees/<name>, created
-#        by `target` (see pod_target_clone.sh) — never git-cloned itself.
+# --tree: the checkout/tree a run/push/pull/attach/logs/wait-job/target command
+#        acts on (default "jammi-ai" — the bootstrap checkout at
+#        /root/jammi-ai). Any other name is a plain directory at
+#        /root/trees/<name>, populated ONLY by `push --tree <name>` (rsync) —
+#        NEVER by `target`, which clones the build substrate into a wholly
+#        disjoint CARGO_TARGET_DIR namespace (/root/target-<name>, see
+#        rp_target_dir in runpod_lib.sh and pod_target_clone.sh) rather than
+#        the tree itself, and never git-cloned either way. `target
+#        --with-cutlass` therefore REFUSES against a tree that has not been
+#        pushed yet (pod_provision_cutlass.sh's own error: "tree source dir
+#        does not exist — push to it first") — it provisions cutlass INTO an
+#        existing tree, it does not create one.
 # --replace: `up` normally REFUSES to touch a session alias that already has a
 #        recorded pod id — even one that failed to answer SSH — rather than
 #        silently deploying a second pod under the same alias (that is how an
@@ -80,14 +96,21 @@ gpu-dev.sh — GPU development on RunPod
           [--replace]                     (default TTL 72h — see RP_DEV_TTL_HOURS below)
                                           refuses if the alias already has a recorded pod
                                           unless --replace is given (see --replace below)
-  target  [session] <name>                clone the pod's build-substrate seed into a
-          [--verify] [--with-cutlass]     new tree /root/trees/<name> (pod_target_clone.sh)
+  target  [session] <name>                clone the pod's build-substrate seed into a fresh
+          [--verify] [--with-cutlass]     CARGO_TARGET_DIR (/root/target-<name>) for a tree
+                                          that already exists — push to <name> FIRST
+                                          (pod_target_clone.sh)
   attach  [session] [--tree T]            join a surviving session's running job
                                           (--shell for a plain prompt instead)
   run     [session] [--tree T] <cmd...>   run <cmd> detached under tmux, in <tree>
   logs    [session] [--tree T]            tail the detached job's output
   push    [session] [--tree T]            rsync your working tree TO the pod's <tree>
   pull    [session] [--tree T] <path>     rsync <path> back FROM the pod's <tree>
+  wait-seed [session] [--timeout SECS]    block until the pod's own build-substrate seed
+                                          completes/fails/times out (never misreads an
+                                          unreachable pod as "still building" — see below)
+  wait-job  [session] [--tree T]          block until <tree>'s detached `run` job ends,
+            [--timeout SECS]              fails (no evidence it ever ran), or times out
   down    [session]                       terminate the pod, forget the session
   ls                                      list sessions
   reap    [hours]             ACCOUNT-WIDE: terminate every orphaned jammi-gpu*
@@ -104,12 +127,15 @@ arch: a100 (default) | l40s | h100 | a40 | l4
 --ref R: branch, tag or commit for the pod's checkout (default main), checked
          against the remote before anything is rented. `up` does not move a live
          pod: `down` it first.
---tree T: which checkout on the pod a run/push/pull/attach/logs/target command
-         acts on (default "jammi-ai", the bootstrap checkout at
-         /root/jammi-ai). Any other name is a plain directory at
-         /root/trees/<name> populated only by `target` — never a git worktree
-         (a shared .git would couple trees that must diverge independently)
-         and never git-cloned itself.
+--tree T: which checkout on the pod a run/push/pull/attach/logs/wait-job/
+         target command acts on (default "jammi-ai", the bootstrap checkout
+         at /root/jammi-ai). Any other name is a plain directory at
+         /root/trees/<name>, populated ONLY by `push --tree <name>` (rsync)
+         — NEVER by `target`, which clones the build substrate into a wholly
+         disjoint CARGO_TARGET_DIR namespace (/root/target-<name>, a build
+         OUTPUT directory, not the tree/checkout itself) — never a git
+         worktree (a shared .git would couple trees that must diverge
+         independently) and never git-cloned either way.
 --replace: `up` normally REFUSES (exit 2) a session alias that already has a
          recorded pod id, even an unreachable one, rather than silently
          deploying a second pod under the same alias. --replace overwrites only
@@ -118,19 +144,46 @@ arch: a100 (default) | l40s | h100 | a40 | l4
 --verify (target only): after `target` clones and you have built once against
          the new tree, re-run with --verify and a `cargo build -v` log on
          stdin to assert no member unit reported Fresh (see pod_target_clone.sh).
---with-cutlass (target only): also provisions the CUTLASS submodule into the
-         new tree (`git submodule update --init --depth 1`) — needed only for
-         a tree that will build the `flash-attn` feature.
+--with-cutlass (target only): provisions the CUTLASS submodule into an
+         ALREADY-PUSHED tree (`pod_provision_cutlass.sh`: a `cp -a` copy from
+         /root/jammi-ai's own initialised submodule, never a bare `git
+         submodule update` run inside the tree itself) — needed only for a
+         tree that will build the `flash-attn` feature. `target` does not
+         create the tree — push to <name> FIRST (`gpu-dev.sh push --tree
+         <name>`); against a tree that has never been pushed,
+         pod_provision_cutlass.sh REFUSES with "tree source dir does not
+         exist — push to it first" rather than silently doing nothing.
+--timeout SECS (wait-seed/wait-job only): overall wall-clock budget for the
+         poll loop (default RP_WAIT_TIMEOUT_SECS, else 5400s/90min — the
+         pod-build-guide's own "budget tens of minutes for a fresh Ampere pod
+         compiling the full cuda+FA2 graph" note, with real headroom). An
+         unreachable pod is NEVER read as "still running": RP_WAIT_MAX_
+         TRANSPORT_FAILS (default 3) consecutive unreachable polls exits
+         loudly instead (see wait-seed/wait-job below).
 Sessions are named after the arch; RP_SESSION names one explicitly. On
-down/attach/run/logs/push/pull/target, RP_SESSION and an explicit positional
-session must AGREE — a differing pair REFUSES (exit 2, naming both) rather
-than silently picking one. A session name may contain letters, digits, _, -,
-and . anywhere but as the whole name (so bench.1 is fine; ., .., a name
-containing /, or one starting with - are refused).
+down/attach/run/logs/push/pull/wait-seed/wait-job/target, RP_SESSION and an
+explicit positional session must AGREE — a differing pair REFUSES (exit 2,
+naming both) rather than silently picking one. A session name may contain
+letters, digits, _, -, and . anywhere but as the whole name (so bench.1 is
+fine; ., .., a name containing /, or one starting with - are refused).
+
+wait-seed/wait-job poll the pod at RP_WAIT_INTERVAL_SECS (default 20s) up to
+--timeout, and distinguish three outcomes: SUCCESS (exit 0 — wait-seed's
+/root/.jammi-seed.jammi-seed-complete marker; wait-job's tmux job session has
+ended AND the tree's .jammi.log exists — the job ran to completion, inspect
+the log for its own pass/fail verdict), a NAMED FAILURE (exit 1 —
+wait-seed's .jammi-seed-failed marker, or "no evidence this ever ran": no
+marker/session and, for wait-job, no .jammi.log either), or a TRANSPORT
+FAILURE (exit 2 — RP_WAIT_MAX_TRANSPORT_FAILS consecutive unreachable polls;
+this means the pod could not be reached, never that the job/seed is still
+running). A timeout with no verdict either way exits 3.
 Env: RUNPOD_API_KEY (or ~/.config/runpod/key), RP_IMAGE,
      RP_TTL_HOURS (default 8; explicit always wins), RP_DEV_TTL_HOURS (default
      72 — what `up` alone falls back to when RP_TTL_HOURS is not set),
-     RP_DISK_GB (default 60), RP_VOLUME_GB (default 0).
+     RP_DISK_GB (default 60), RP_VOLUME_GB (default 0),
+     RP_WAIT_TIMEOUT_SECS (wait-seed/wait-job default, 5400 — overridden
+     per-invocation by --timeout), RP_WAIT_INTERVAL_SECS (poll interval,
+     default 20), RP_WAIT_MAX_TRANSPORT_FAILS (default 3).
      Disk sizing once the seed/clone substrate is in use: RP_DISK_GB >= 25
      (base) + S_src + S_seed + N*S_clone (one clone per tree this pod hosts);
      the S_src/S_seed/S_clone byte counts are MEASURED by
@@ -255,6 +308,46 @@ case "$CMD" in
     done
     [ -n "$TARGET_NAME" ] || [ "$TARGET_VERIFY" = "1" ] || { echo "::error::target: need a tree name (or --verify against an existing one)"; usage 2; }
     ;;
+  wait-seed|wait-job)
+    # wait-seed [session] [--timeout SECS]
+    # wait-job  [session] [--tree T] [--timeout SECS]
+    # A dedicated flag loop (like `target` above), not the generic `*)`
+    # branch below: --timeout is a new flag neither `up` nor the plain
+    # session verbs have, and wait-job's own --tree may appear in either
+    # order relative to it, unlike the single-leading-flag convention the
+    # generic branch's own attach/run/logs/push/pull case relies on.
+    ARG=""
+    case "${1:-}" in
+      -*) : ;;
+      *) [ $# -gt 0 ] && { ARG="$1"; shift; } ;;
+    esac
+    if [ -n "$ARG" ] && [ -n "${RP_SESSION:-}" ] && [ "$ARG" != "$RP_SESSION" ]; then
+      echo "::error::conflicting session: positional argument '${ARG}' vs exported RP_SESSION='${RP_SESSION}' — they name different sessions"
+      echo "::error::pick one: unset RP_SESSION to act on '${ARG}', or drop the positional to act on RP_SESSION='${RP_SESSION}'"
+      exit 2
+    fi
+    SESSION="${ARG:-${RP_SESSION:-a100}}"; ARCH=""
+    WAIT_TIMEOUT=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --tree)
+          [ "$CMD" = "wait-job" ] || { echo "::error::--tree applies only to 'wait-job', not '${CMD}'"; exit 2; }
+          [ $# -ge 2 ] || { echo "::error::--tree needs a value"; exit 2; }
+          TREE="$2"; shift 2 ;;
+        --tree=*)
+          [ "$CMD" = "wait-job" ] || { echo "::error::--tree applies only to 'wait-job', not '${CMD}'"; exit 2; }
+          TREE="${1#--tree=}"; shift ;;
+        --timeout)
+          [ $# -ge 2 ] || { echo "::error::--timeout needs a value (seconds)"; exit 2; }
+          WAIT_TIMEOUT="$2"; shift 2 ;;
+        --timeout=*)
+          WAIT_TIMEOUT="${1#--timeout=}"; shift ;;
+        -h|--help) usage 0 ;;
+        -*) echo "::error::unknown option '$1' for ${CMD}"; usage 2 ;;
+        *) echo "::error::${CMD}: unexpected argument '$1'"; usage 2 ;;
+      esac
+    done
+    ;;
   *)
     ARG=""
     case "${1:-}" in
@@ -325,6 +418,38 @@ case "$CMD" in
   *) export RP_SESSION="$SESSION"; RP_SESSION_VALIDATE_SESSION=1 ;;
 esac
 
+# Resolves and validates the three wait-seed/wait-job knobs. $1 = --timeout's
+# value (empty if not given — RP_WAIT_TIMEOUT_SECS, then the 5400s/90min
+# default, apply in that order; 90 minutes budgets a fresh Ampere pod's full
+# cuda+FA2 seed build with real headroom — pod-build-guide.md §4's own
+# "budget tens of minutes" note). Sets WAIT_TIMEOUT_S/WAIT_INTERVAL_S/
+# WAIT_MAX_FAIL as plain (non-`local`) variables, or exits 2 naming the bad
+# value. Called BEFORE anything is rented/contacted (same discipline as the
+# RP_DEV_TTL_HOURS validation above it) — a malformed --timeout is a usage
+# error, not something to discover after require_pod has already run.
+wait_resolve_knobs() {
+  WAIT_TIMEOUT_S="${1:-${RP_WAIT_TIMEOUT_SECS:-5400}}"
+  case "$WAIT_TIMEOUT_S" in
+    ''|*[!0-9]*) echo "::error::--timeout/RP_WAIT_TIMEOUT_SECS must be a positive integer (seconds), got '${WAIT_TIMEOUT_S}'"; exit 2 ;;
+  esac
+  [ "$WAIT_TIMEOUT_S" -gt 0 ] || { echo "::error::--timeout/RP_WAIT_TIMEOUT_SECS must be > 0"; exit 2; }
+
+  WAIT_INTERVAL_S="${RP_WAIT_INTERVAL_SECS:-20}"
+  case "$WAIT_INTERVAL_S" in
+    ''|*[!0-9]*) echo "::error::RP_WAIT_INTERVAL_SECS must be a positive integer (seconds), got '${WAIT_INTERVAL_S}'"; exit 2 ;;
+  esac
+  [ "$WAIT_INTERVAL_S" -gt 0 ] || { echo "::error::RP_WAIT_INTERVAL_SECS must be > 0"; exit 2; }
+
+  WAIT_MAX_FAIL="${RP_WAIT_MAX_TRANSPORT_FAILS:-3}"
+  case "$WAIT_MAX_FAIL" in
+    ''|*[!0-9]*) echo "::error::RP_WAIT_MAX_TRANSPORT_FAILS must be a positive integer, got '${WAIT_MAX_FAIL}'"; exit 2 ;;
+  esac
+  [ "$WAIT_MAX_FAIL" -gt 0 ] || { echo "::error::RP_WAIT_MAX_TRANSPORT_FAILS must be > 0"; exit 2; }
+}
+case "$CMD" in
+  wait-seed|wait-job) wait_resolve_knobs "$WAIT_TIMEOUT" ;;
+esac
+
 # `up` sessions persist past the terminal and are the ones the 2026-08-25
 # incident hit: runpod_lib.sh's own RP_TTL_HOURS default (8h) is sized for a
 # throwaway `shell`/CI pod, not a dev session someone is actively using —
@@ -355,6 +480,12 @@ fi
 
 # shellcheck source=ci/scripts/runpod_lib.sh
 source "$DIR/runpod_lib.sh"
+
+# Validated BEFORE any path derives from it or any remote heredoc could
+# embed it (round-N audit: the injection class `wait-job`'s own new heredoc
+# site joins — see rp_tree_name_check's own doc). The default "jammi-ai"
+# passes trivially; only a caller-supplied --tree can fail this.
+RP_TREE_CHECK_VALUE="$TREE" rp_tree_name_check || exit 2
 
 # Resolved once, here, so every verb below (attach/run/logs/push/pull/target)
 # reads the SAME directories for the SAME --tree value — the one place
@@ -589,44 +720,82 @@ case "$CMD" in
     [ $# -gt 0 ] || { echo "run: need a command"; exit 2; }
     require_pod; rp_keep
     JOB="$*"
+    # A per-run token, generated HERE (locally, before anything is sent to
+    # the pod) — carried into the completion marker purely for a human
+    # reading it directly; wait-job's own correctness never depends on
+    # matching it (see rp_job_wrapper_with_marker_lines's own doc for why
+    # the remove-then-rewrite-under-session-liveness discipline already
+    # suffices). `$$` + `$RANDOM` alongside the timestamp keeps two `run`s
+    # issued in the same wall-clock second from sharing a token.
+    RUN_TOKEN="$(date -u +%Y%m%dT%H%M%SZ)-$$-${RANDOM}"
     # Per-tree job script/log (round-4/5 finding: a global /root/job.sh +
     # /root/jammi.log meant `run --tree b` clobbered tree a's still-running
     # job) — `=`-anchored tmux target (M6), `remain-on-exit off` so a job
     # that exits leaves its output visible in `logs`/`attach` rather than the
     # pane vanishing before either can read it.
     #
-    # `--timing`: the launcher's OWN command line acquires the shared timing
-    # lock BEFORE the job script runs, INSIDE the detached pane (M6) — never
-    # in the (short-lived) ssh invocation that starts tmux and returns
-    # immediately, which would release the lock the instant IT exits, not
-    # when the real job does. `-n -E 75`: refuse instantly rather than queue,
-    # since a human `run --timing` conflicting with another timing-sensitive
-    # run should be told NOW, not block silently.
+    # `--timing`'s own flock acquisition now happens INSIDE the generated
+    # `.jammi-job.sh` (rp_job_wrapper_with_marker_lines, runpod_lib.sh) —
+    # still essentially the first thing the detached pane's own script does
+    # (M6's own reasoning: never in the short-lived ssh invocation that
+    # starts tmux and returns immediately, which would release the lock the
+    # instant IT exits, not when the real job does) — rather than split
+    # across an outer `flock -n -E 75 ... bash job.sh` command line, so a
+    # lock refusal and the job's own real exit code can never collide on the
+    # same literal value (round-N audit finding B3). LAUNCH is now the SAME
+    # shape either way: redirection (`>`), not a `| tee` pipe, for BOTH —
+    # the wrapper's own marker write is what wait-job reads now, so there is
+    # no need to preserve `flock`'s outer exit code through the pane's own
+    # command anymore either.
     if [ "$TIMING" = "1" ]; then
-      # Redirection (`>`), not a `| tee` pipe: a pipe would make the PANE's
-      # own exit status `tee`'s (near-always 0), masking flock's own exit 75
-      # refusal from anything reading the pane/log afterward. Output still
-      # lands in .jammi.log; it is simply not tailed live via tee.
-      LAUNCH="flock -n -E 75 /root/.jammi-timing.lock bash '${TREE_DIR}'/.jammi-job.sh > '${TREE_DIR}'/.jammi.log 2>&1"
+      LAUNCH="bash '${TREE_DIR}'/.jammi-job.sh > '${TREE_DIR}'/.jammi.log 2>&1"
     else
       LAUNCH="bash '${TREE_DIR}'/.jammi-job.sh 2>&1 | tee '${TREE_DIR}'/.jammi.log"
     fi
     rp_run_remote <<EOF
 set -uo pipefail
 cat > '${TREE_DIR}'/.jammi-job.sh <<'JOBEOF'
-$(rp_job_wrapper_lines "$TREE_DIR" "$TARGET_DIR" "$JOB")
+$(rp_job_wrapper_with_marker_lines "$TREE_DIR" "$TARGET_DIR" "$JOB" "$RUN_TOKEN" "$TIMING")
 JOBEOF
 tmux kill-session -t "=${TMUX_SESSION}" 2>/dev/null # tripwire-ok: idempotent best-effort cleanup of a session that may legitimately not exist yet (first `run` for this tree/session) — the new-session command right below is unconditional
 tmux new-session -d -s "${TMUX_SESSION}" "${LAUNCH}"
 tmux set-option -w -t "=${TMUX_SESSION}:" remain-on-exit off
-echo "started (tree=${TREE}, timing-locked=${TIMING}): ${JOB}"
+echo "started (tree=${TREE}, timing-locked=${TIMING}, token=${RUN_TOKEN}): ${JOB}"
 EOF
-    echo "=== detached. follow with: $(basename "$0") logs ${SESSION} --tree ${TREE} ==="
+    echo "=== detached. follow with: $(basename "$0") logs ${SESSION} --tree ${TREE}"
+    echo "=== or block for it: $(basename "$0") wait-job ${SESSION} --tree ${TREE} ==="
     ;;
 
   logs)
     require_pod; rp_keep
     ssh "${RP_SSHO[@]}" -t -p "$RP_PORT" "root@${RP_HOST}" "tail -f -n 200 '${TREE_DIR}/.jammi.log'" || true # tripwire-ok: `logs` is a live-follow (`tail -f`) the user Ctrl-C's out of intentionally — a non-zero exit here is the NORMAL way this command ends, not a failure to surface
+    ;;
+
+  wait-seed)
+    # Blocks until the pod's own build-substrate seed reports a verdict — the
+    # fail-open-watcher lesson: an operator's hand-rolled poll loop silently
+    # idled forever whenever SSH dropped, because "no evidence yet" and
+    # "could not check" read as the SAME thing to it. rp_wait_poll (see its
+    # own doc in runpod_lib.sh) makes them different signals; this script's
+    # only job is to name the three states the seed itself can be in.
+    require_pod; rp_keep
+    SEED_WAIT_SCRIPT="$(rp_seed_wait_script)"
+    rp_wait_poll "seed(${SESSION})" "$SEED_WAIT_SCRIPT" "$WAIT_INTERVAL_S" "$WAIT_TIMEOUT_S" "$WAIT_MAX_FAIL"
+    exit $?
+    ;;
+
+  wait-job)
+    # Blocks until <tree>'s detached `run` job ends, reading the per-run
+    # completion marker `run` itself writes (rp_job_wrapper_with_marker_lines,
+    # runpod_lib.sh) — succeeding only on a real rc=0, naming a real job
+    # failure and a refused-timing-lock (rc=75) distinctly, and reporting
+    # "no evidence this job ever ran" when neither a live session nor a
+    # marker exists (round-N audit finding B3 — see rp_job_wait_script's
+    # own doc for why a bare "does a log file exist" check was not enough).
+    require_pod; rp_keep
+    JOB_WAIT_SCRIPT="$(rp_job_wait_script "$TREE_DIR" "$TMUX_SESSION" "$TREE")"
+    rp_wait_poll "job(${SESSION}:${TREE})" "$JOB_WAIT_SCRIPT" "$WAIT_INTERVAL_S" "$WAIT_TIMEOUT_S" "$WAIT_MAX_FAIL"
+    exit $?
     ;;
 
   push)

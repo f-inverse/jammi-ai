@@ -8,7 +8,15 @@ on:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # A PR ref cancels its own superseded runs (rapid pushes to the same PR
+  # should not queue N stale runs). `main` never does: a run ON MAIN is the
+  # only evidence a ledger row's "green on main since <sha>" closure can
+  # ever cite, and cancel-in-progress on a rapid-merge sequence makes that
+  # evidence structurally unobtainable — two consecutive real merge commits
+  # to main (f1b3952, 290d755) both show conclusion=cancelled here, not
+  # because either run failed, but because the NEXT push cancelled it before
+  # it could finish (retrospective 2026-08-27).
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 # Least privilege: every job here only reads the checkout; nothing publishes.
 permissions:
@@ -816,13 +824,14 @@ jobs:
           # attribute) or a reviewed legacy `kind: "none"` entry — closes the
           # class where a green artifact quietly proved a squash-merged,
           # no-longer-reachable tip (docs/maintainer/cuda-kernel-guide.md §4).
-          # Needs REAL commit history (git merge-base --is-ancestor), unlike
-          # every other leg in this matrix — the shared checkout step below
-          # reads this entry's own `fetch_depth: "0"` (full history; GitHub
-          # reports this repo's on-disk size as ~94 MB, negligible next to
-          # the Rust build jobs) and defaults every other leg to the normal
-          # shallow `actions/checkout` clone (`fetch_depth` unset -> `'1'`),
-          # so only this one runner instance pays the deeper-clone cost.
+          # Needs REAL commit history (git merge-base --is-ancestor) — the
+          # shared checkout step below reads this entry's own `fetch_depth:
+          # "0"` (full history; GitHub reports this repo's on-disk size as
+          # ~94 MB, negligible next to the Rust build jobs) and defaults
+          # every other leg to the normal shallow `actions/checkout` clone
+          # (`fetch_depth` unset -> `'1'`), so only the ancestry-checking
+          # legs (this one, its self-test, and "pod build timings" below)
+          # pay the deeper-clone cost.
           # QUOTED as a STRING, not the bare number 0: GitHub Actions
           # expressions treat the NUMBER 0 as falsy, so a bare `fetch_depth:
           # 0` makes `matrix.fetch_depth || '1'` below silently discard it
@@ -941,6 +950,29 @@ jobs:
           # ci/scripts/test_pod_substrate.sh's own module doc.
           - name: pod build substrate
             cmd: JAMMI_REQUIRE_LOCK_TEST=1 bash ci/scripts/test_pod_substrate.sh
+          # Pod-build-timings artifact schema + provenance guard (the
+          # accepted-debt item the pod-substrate-followups audit named):
+          # every ci/artifacts/pod-build-timings/*.json must carry a
+          # well-typed schema_version/box/git_sha/ts/lock_held/measurements/
+          # seed_tuples/byte_equal_state and a git_sha that is an ancestor of
+          # HEAD — modeled on check_cuda_run_artifacts.py's shape, scoped to
+          # this one artifact family. See that script's own module doc.
+          - name: pod build timings
+            cmd: python3 ci/scripts/check_pod_build_timings.py
+            # Same reason as "CUDA run artifact schema" above: the ancestry
+            # rule (git merge-base --is-ancestor) needs REAL history, and the
+            # gate fails closed on a shallow checkout by design — so this
+            # entry must opt out of the matrix's shallow default exactly the
+            # way that leg does (string "0", see the truthiness note there).
+            # Omitting this line IS the gate's shallow-refusal firing in CI:
+            # that exact red shipped once (PR #409's first push).
+            fetch_depth: "0"
+          # No fetch_depth here: the self-test drives every rule, ancestry
+          # included, against an ephemeral `git init`'d fixture repo — it
+          # never reads this checkout's history, so the shallow default is
+          # fine (and its CI green on the shallow runner proves it).
+          - name: pod build timings self-test
+            cmd: python3 ci/scripts/check_pod_build_timings.py --self-test
           # Completeness tripwire for this very guard class: every
           # ci/scripts/check_*.py|.sh gate script must be referenced by at
           # least one workflow (this file included), so a new check script
@@ -1054,14 +1086,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # Every leg leaves this at the normal shallow default
-          # (`fetch_depth` unset in its matrix entry -> `'1'`) EXCEPT the
-          # few that name their own `fetch_depth: "0"` above ("CUDA run
-          # artifact schema", "CUDA run artifact schema self-test",
-          # "citation resolver") because they need real commit history —
-          # ancestry checks (`git merge-base --is-ancestor`) or
+          # Legs leave this at the normal shallow default (`fetch_depth`
+          # unset in the matrix entry -> `'1'`) unless their entry declares
+          # `fetch_depth: "0"` — the legs needing real commit history:
+          # ancestry checks (`git merge-base --is-ancestor`) and
           # sha-relative artifact-citation resolution (`git show
-          # <sha>:<path>`). Both sides of `||` are STRINGS (`'1'`, and a
+          # <sha>:<path>`), all of which fail closed on a shallow
+          # checkout. Both sides of `||` are STRINGS (`'1'`, and the
           # matrix entry's own `"0"`) — the number `0` is falsy in GitHub
           # Actions expressions, so a bare `0` here would make `||`
           # silently discard it.

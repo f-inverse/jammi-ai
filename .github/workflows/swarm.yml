@@ -15,7 +15,11 @@ on:
 
 concurrency:
   group: swarm-${{ github.ref }}
-  cancel-in-progress: true
+  # Same rationale as ci.yml's own concurrency block: a PR ref cancels its
+  # own superseded runs, but a run on `main` is evidence (the only thing a
+  # ledger closure's "green on main since <sha>" can cite) and must be
+  # allowed to finish rather than being cancelled by the next merge.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 # Least privilege: every gate here only reads the checkout; nothing publishes.
 permissions:

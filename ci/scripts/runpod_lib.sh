@@ -570,6 +570,37 @@ rp_session_forget() {
   [ -n "$RP_SESSION" ] && [ -d "$RP_WORK" ] && rm -rf "$RP_WORK"
 }
 
+# A `--tree` value reaches gpu-dev.sh with no sanitization upstream, and —
+# unlike RP_SESSION, which is used only for LOCAL file paths and ssh config
+# blocks — a tree name (via TREE_DIR/TARGET_DIR/TMUX_SESSION, all derived
+# from it) gets embedded UNQUOTED into several REMOTE heredoc scripts sent
+# over ssh (`run`'s own `.jammi-job.sh` dispatch, `target --with-cutlass`,
+# and now `wait-job`'s own check script, gpu_dev_job_wait_script). A value
+# containing a double-quote, backtick, `$(...)`, or a path separator could
+# break out of that heredoc and inject commands into the remote shell
+# (round-N audit: "closing the class your new heredoc site joins" — the
+# class was already reachable via `run`/`target`, `wait-job` is simply one
+# more instance of it). Mirrors rp_session_name_check's OWN containment
+# blacklist EXACTLY (never a whitelist — see that function's own doc for
+# why): a tree name is a directory-name-shaped string with the identical
+# legal shapes a session name has, so the identical rule applies for the
+# identical reason. Reads `$RP_TREE_CHECK_VALUE` (the same "check a global,
+# not a parameter" shape rp_session_name_check itself uses, so a caller
+# resolves it exactly the same way both times).
+rp_tree_name_check() {
+  case "$RP_TREE_CHECK_VALUE" in
+    ''|.|..)
+      echo "::error::--tree may not be empty, '.', or '..' (got '${RP_TREE_CHECK_VALUE}')" >&2
+      return 2 ;;
+    */*)
+      echo "::error::--tree may not contain '/' (got '${RP_TREE_CHECK_VALUE}')" >&2
+      return 2 ;;
+    -*)
+      echo "::error::--tree may not start with '-' (got '${RP_TREE_CHECK_VALUE}')" >&2
+      return 2 ;;
+  esac
+}
+
 # Tree name -> plain SOURCE checkout directory on the pod. "jammi-ai" is the
 # ONE default: the historical single-checkout location every existing
 # doc/script still names directly (rp_bootstrap's own clone destination,
@@ -604,24 +635,200 @@ rp_target_dir() { # $1=tree name (optional; default "jammi-ai")
   echo "/root/target-${t}"
 }
 
+# The env-source + CARGO_TARGET_DIR + cd preamble shared by every remote
+# command that must run correctly as if it were an interactive shell in the
+# tree (an SSH login shell does not inherit the container's Dockerfile ENV —
+# see RP_ENV_PREAMBLE's own doc). Split out of rp_job_wrapper_lines so a
+# caller that needs its OWN dispatch logic after the preamble
+# (rp_job_wrapper_with_marker_lines, below) does not have to reconstruct it
+# by hand — one definition, two consumers, never a second hand-copy that
+# could drift. $1=tree_dir $2=target_dir.
+rp_job_env_lines() {
+  local tree_dir="${1:?rp_job_env_lines needs a tree dir}" target_dir="${2:?rp_job_env_lines needs a target dir}"
+  printf '[ -f /root/.jammi_env ] && . /root/.jammi_env\n'
+  printf "export CARGO_TARGET_DIR='%s'\n" "$target_dir"
+  printf "cd '%s'\n" "$tree_dir"
+}
+
 # Builds the per-tree job wrapper script body (`<tree>/.jammi-job.sh`,
-# written by gpu-dev.sh's `run`): source the container env, pin
-# CARGO_TARGET_DIR to THIS tree's own build-substrate clone (rp_target_dir)
-# so a build in the tree actually uses the pre-warmed dependency artifacts
-# instead of a cold default target dir under the tree itself (round-2 audit
-# finding 1 — the substrate was cloned but nothing ever pointed a build at
-# it), cd into the tree, then the caller's command. A plain function, not
-# inlined into the remote heredoc, so it is directly testable (source this
-# file, call it with fixture args) without a live pod. $1=tree_dir
-# $2=target_dir $3=job command.
+# written by gpu-dev.sh's `run`): the env/cd preamble (rp_job_env_lines),
+# then the caller's command. A plain function, not inlined into the remote
+# heredoc, so it is directly testable (source this file, call it with
+# fixture args) without a live pod. Used by `rp_login_cmd`'s interactive-job
+# pane too (job=":", a no-op) — this function is deliberately NEVER given
+# the completion-marker bookkeeping rp_job_wrapper_with_marker_lines carries
+# below, since an interactive shell has no "run" for wait-job to identify.
+# $1=tree_dir $2=target_dir $3=job command.
 rp_job_wrapper_lines() {
   local tree_dir="${1:?rp_job_wrapper_lines needs a tree dir}" \
         target_dir="${2:?rp_job_wrapper_lines needs a target dir}" \
         job="${3:?rp_job_wrapper_lines needs a job command}"
-  printf '[ -f /root/.jammi_env ] && . /root/.jammi_env\n'
-  printf "export CARGO_TARGET_DIR='%s'\n" "$target_dir"
-  printf "cd '%s'\n" "$tree_dir"
+  rp_job_env_lines "$tree_dir" "$target_dir"
   printf '%s\n' "$job"
+}
+
+# Wraps the SAME env/cd preamble with per-run completion-marker bookkeeping
+# for gpu-dev.sh's `run`/`wait-job` pair (round-N audit finding B3):
+# wait-job has no other way to know that a "no live session" state belongs
+# to THIS invocation of `run` rather than an ARBITRARY earlier one — a
+# flock-refused `run --timing`, or simply a stale `.jammi.log` left over
+# from two runs ago, both read as false SUCCESS under a check that only
+# asks "does a log file exist". `<tree>/.jammi.exit` is removed at the
+# VERY START of this script (before the flock attempt, before the job ever
+# runs) and written EXACTLY ONCE with the job's own real exit code — so a
+# run that is CURRENTLY in flight (tmux session alive) is guaranteed to
+# have NO marker (its own wrapper already removed it), and a marker that
+# DOES exist once the session has ended can only be the most recent run
+# that actually reached this script, never a stale leftover: no run since
+# it wrote that marker has both started (which would have removed it) and
+# also NOT yet finished (which would mean the session is still alive) —
+# those two states are mutually exclusive by construction. wait-job checks
+# session-liveness FIRST for exactly this reason (same defensive ordering
+# as wait-seed's own tmux-session-before-markers fix for B2).
+#
+# `timing=1` moves the flock acquisition INSIDE this wrapper (fd 9, `flock
+# -n 9`) rather than the outer `flock -n -E 75 ... bash job.sh` form `run
+# --timing` used to build directly into its own LAUNCH string: a plain bash
+# `if`/`else` on the flock CALL's own exit status is unambiguous, where
+# checking the OUTER command's exit code for the literal value 75 could not
+# tell "lock refused" apart from "the job itself happened to exit 75" (a
+# real, if rare, collision the old outer-flock shape could not rule out).
+# The lock is still held for the whole job's lifetime (acquired essentially
+# first — only a harmless `rm -f` precedes it — released only when this
+# whole script/fd closes), the SAME contract `run --timing` already had.
+#
+# $1=tree_dir $2=target_dir $3=job $4=token (caller-generated, unique per
+# `run` invocation — carried in the marker purely for a human reading it
+# directly; wait-job itself never needs to know the expected value, since
+# the remove-then-rewrite-under-session-liveness discipline above already
+# rules out a stale marker on its own) $5=timing (0|1).
+rp_job_wrapper_with_marker_lines() {
+  local tree_dir="${1:?rp_job_wrapper_with_marker_lines needs a tree dir}" \
+        target_dir="${2:?rp_job_wrapper_with_marker_lines needs a target dir}" \
+        job="${3:?rp_job_wrapper_with_marker_lines needs a job command}" \
+        token="${4:?rp_job_wrapper_with_marker_lines needs a token}" \
+        timing="${5:?rp_job_wrapper_with_marker_lines needs a timing flag}"
+  printf "rm -f '%s/.jammi.exit'\n" "$tree_dir"
+  if [ "$timing" = "1" ]; then
+    cat <<FLOCKEOF
+exec 9>/root/.jammi-timing.lock
+if ! flock -n 9; then
+  printf '{"token":"${token}","rc":75,"lock_refused":true}' > '${tree_dir}/.jammi.exit'
+  exit 75
+fi
+FLOCKEOF
+  fi
+  rp_job_env_lines "$tree_dir" "$target_dir"
+  # `( job )` — a SUBSHELL, never the bare job text directly in this script
+  # — so a job command that happens to invoke the shell's own `exit` builtin
+  # at its top level (`gpu-dev.sh run a100 exit 1` is unusual but a caller
+  # CAN type it — JOB is `"$*"` verbatim) terminates only the subshell, not
+  # the WHOLE wrapper script; a bare `exit` here would otherwise skip every
+  # line after it, including the marker write below, reproducing the exact
+  # "no evidence" false state this wrapper exists to prevent. A normal job
+  # (`cargo test ...`) behaves identically either way — it never calls
+  # `exit` itself, it simply returns control with `$?` set.
+  printf '( %s )\n' "$job"
+  cat <<MARKEREOF
+__jammi_job_rc=\$?
+printf '{"token":"${token}","rc":'"\$__jammi_job_rc"',"lock_refused":false}' > '${tree_dir}/.jammi.exit'
+exit "\$__jammi_job_rc"
+MARKEREOF
+}
+
+# Builds wait-seed's remote check script (rp_wait_poll's own doc has the rc
+# contract: 0 success / 1 named failure / 2 keep polling). A plain
+# function, not inlined at gpu-dev.sh's `wait-seed` call site, so a test can
+# call it directly (source this file, no live pod needed) with a SANDBOXED
+# seed_dir_prefix and a throwaway tmux session name, run the returned text
+# locally, and assert its rc against real fixture files — the CLI-level
+# mocked-ssh tests alone cannot construct the state-lattice cases round-N
+# audit finding B2 depends on (both markers present at once; a marker
+# alongside a LIVE session).
+# $1=seed_dir_prefix (default /root/.jammi-seed — the SAME prefix
+# pod_seed_target.sh's own JAMMI_SEED_DIR defaults to) $2=tmux session name
+# for the seed build (default jammi-seed).
+rp_seed_wait_script() {
+  local prefix="${1:-/root/.jammi-seed}" tmux_sess="${2:-jammi-seed}"
+  cat <<SCRIPT
+if [ -f '${prefix}.jammi-seed-failed' ]; then
+  echo "seed FAILED -- tail:"
+  tail -n 20 '${prefix}.jammi-seed-failed'
+  exit 1
+fi
+# tripwire-ok: REMOTE script text -- "no such session" is a real, valid
+# state (checked explicitly by the if/then below), never a silent pass.
+# Session-liveness checked BEFORE the completion marker, not after (B2): a
+# --reseed removes BOTH markers at rebuild start (pod_seed_target.sh), but
+# the narrow window between "the detached tmux session starts" and "the
+# script reaches that removal" can still show a STALE COMPLETE marker from
+# the PREVIOUS build while THIS session is alive -- a live session is
+# authoritative over any marker's content, always, since a marker cannot be
+# trusted while whatever wrote it (or its successor) might still be
+# running.
+if tmux has-session -t "=${tmux_sess}" 2>/dev/null; then
+  if [ -f '${prefix}.jammi-seed-complete' ]; then
+    echo "seed still building (tmux session ${tmux_sess} alive; a COMPLETE marker from a PRIOR build is also present -- a live session always wins, never read as success mid-reseed)"
+  else
+    echo "seed still building (tmux session ${tmux_sess} alive)"
+  fi
+  exit 2
+fi
+if [ -f '${prefix}.jammi-seed-complete' ]; then
+  echo "seed complete: \$(cat '${prefix}.jammi-seed-complete')"
+  exit 0
+fi
+echo "no seed evidence: no completion/failure marker and no running tmux session '${tmux_sess}' -- did up/shell ever start one?"
+exit 1
+SCRIPT
+}
+
+# Builds wait-job's remote check script. Reads <tree>/.jammi.exit, the
+# per-run completion marker rp_job_wrapper_with_marker_lines writes (above)
+# -- NEVER .jammi.log's mere existence (round-N audit finding B3: a
+# flock-refused `run --timing`, or a stale log left from an earlier run,
+# both read as false SUCCESS under a content-free "does a log file exist"
+# check). Session-liveness is checked FIRST, same ordering as
+# rp_seed_wait_script above and for the identical reason: `run` removes
+# .jammi.exit at the VERY START of its own wrapper, so a marker can only be
+# read once the session that would have removed it has ended -- a marker
+# present with no live session can therefore only be the most recent run
+# that actually reached the wrapper, never a stale leftover.
+# $1=tree_dir $2=tmux_session $3=tree_name (for messages only).
+rp_job_wait_script() {
+  local tree_dir="${1:?rp_job_wait_script needs a tree dir}" \
+        tmux_sess="${2:?rp_job_wait_script needs a tmux session}" \
+        tree_name="${3:?rp_job_wait_script needs a tree name}"
+  cat <<SCRIPT
+# tripwire-ok: REMOTE script text -- "no such session" is a real, valid
+# state (checked explicitly by the if/then below), never a silent pass.
+if tmux has-session -t "=${tmux_sess}" 2>/dev/null; then
+  echo "job still running (tmux session ${tmux_sess} alive)"
+  exit 2
+fi
+if [ -f '${tree_dir}/.jammi.exit' ]; then
+  marker="\$(cat '${tree_dir}/.jammi.exit')"
+  rc="\$(printf '%s' "\$marker" | sed -n 's/.*"rc":\([0-9-]*\).*/\1/p')"
+  if [ -z "\$rc" ]; then
+    echo "job completion marker at ${tree_dir}/.jammi.exit is malformed: \$marker"
+    exit 1
+  fi
+  if printf '%s' "\$marker" | grep -q '"lock_refused":true'; then
+    echo "job REFUSED: the shared pod-wide timing lock was already held (rc=75) -- \$marker"
+    exit 1
+  fi
+  if [ "\$rc" = "0" ]; then
+    echo "job finished successfully (rc=0) -- \$marker -- tail of ${tree_dir}/.jammi.log:"
+    tail -n 20 '${tree_dir}/.jammi.log' 2>/dev/null
+    exit 0
+  fi
+  echo "job FAILED (rc=\$rc) -- \$marker -- tail of ${tree_dir}/.jammi.log:"
+  tail -n 20 '${tree_dir}/.jammi.log' 2>/dev/null
+  exit 1
+fi
+echo "no job evidence for tree '${tree_name}': no live tmux session '${tmux_sess}' and no completion marker at ${tree_dir}/.jammi.exit -- run 'gpu-dev.sh run' first"
+exit 1
+SCRIPT
 }
 
 _rp_deploy_payload() { # $1=cloudType $2=gpuTypeId
@@ -823,6 +1030,138 @@ rp_deploy_live_a100() { rp_deploy_arch a100; }
 rp_run_remote() {
   { printf '%s\n' "$RP_ENV_PREAMBLE"; cat; } \
     | ssh "${RP_SSHO[@]}" -p "$RP_PORT" "root@${RP_HOST}" "timeout ${RP_TIMEOUT:-3000} bash -s"
+}
+
+# Runs `$2...` (stdin inherited unchanged — a caller pipes into this
+# function exactly as it would pipe into the command directly) in the
+# BACKGROUND and kills it — TERM, then KILL a second later if TERM did not
+# take — if it is still alive after `$1` seconds; portable pure-bash+kill,
+# never the GNU-coreutils-only `timeout` binary (absent on a BSD host, per
+# `_rp_ls_remote`'s own doc above — the identical constraint applies here).
+# stdout+stderr are captured to a temp file and printed once the command
+# (or the kill) has actually finished, so the caller's own `$(...)`
+# capture sees the SAME merged-stream text either way. Returns the
+# command's own exit code, or 124 (the same convention GNU `timeout` uses)
+# if it had to be killed.
+_rp_bounded_capture() {
+  local bound="$1"; shift
+  local outfile; outfile="$(mktemp)"
+  "$@" > "$outfile" 2>&1 &
+  local pid=$! dl=$((SECONDS + bound))
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$SECONDS" -ge "$dl" ]; then
+      kill -TERM "$pid" 2>/dev/null
+      sleep 1
+      kill -KILL "$pid" 2>/dev/null
+      wait "$pid" 2>/dev/null
+      cat "$outfile"; rm -f "$outfile"
+      return 124
+    fi
+    sleep 0.2
+  done
+  wait "$pid"; local rc=$?
+  cat "$outfile"; rm -f "$outfile"
+  return "$rc"
+}
+
+# Polls a live pod at a fixed interval, via a caller-supplied REMOTE check
+# script (bash source, delivered over stdin exactly like rp_run_remote —
+# never interpolated into the ssh command line, so it can contain quotes
+# freely), until the script reports a verdict or the wall-clock TIMEOUT
+# elapses. The primitive behind gpu-dev.sh's `wait-seed`/`wait-job` verbs.
+#
+# The remote script's OWN exit code is the whole contract, and only three
+# values are legitimate: 0 (success — the thing being waited on finished
+# cleanly), 1 (a NAMED failure — a failure marker, or "no evidence this ever
+# ran"), 2 ("still running, nothing to report yet — keep polling"). Every
+# OTHER exit code — ssh's own 255 on a refused/dropped connection, a timeout
+# wrapper's 124, or literally anything else, since gpu-dev.sh never hands
+# this function a script that exits any other way on purpose — is therefore
+# unambiguous: the poll could not be answered.
+#
+# LOAD-BEARING (the fail-open-watcher lesson this verb exists to close): an
+# unanswerable poll is NEVER treated as rc-2's "still running". The
+# hand-rolled watcher this replaces idled forever precisely because "no
+# evidence yet" and "could not check at all" collapsed into the same silent,
+# keep-waiting branch — a dropped SSH connection read back exactly like a
+# healthy in-progress build, forever. Here the two are different signals:
+# rc 2 resets the transport-failure counter (a real, reachable "not done
+# yet"); anything else increments it, and RP_WAIT_MAX_TRANSPORT_FAILS (a
+# caller-supplied count, never a single blip — a healthy pod can drop one
+# poll) consecutive transport failures exits LOUDLY, naming the transport
+# failure by count and last exit code, rather than continuing to poll a pod
+# that may no longer even exist.
+#
+# $1=label (for messages only) $2=remote check script $3=poll interval
+# (seconds) $4=overall timeout (seconds) $5=max consecutive transport
+# failures before giving up loudly.
+# Returns 0 (success), 1 (named failure — see the remote script's own
+# stdout/stderr for which), 2 (transport failure — too many consecutive
+# unreachable polls), 3 (timed out with no verdict either way).
+rp_wait_poll() {
+  local label="$1" script="$2" interval="$3" timeout="$4" max_fail="$5"
+  local deadline=$((SECONDS + timeout)) consec=0 out rc remaining
+  # RP_SSHO's own ConnectTimeout=10 bounds only the TCP handshake, and the
+  # remote-side `timeout 20 bash -s` below bounds only a shell that has
+  # already STARTED on the pod — neither one bounds the gap between them
+  # (SSH protocol negotiation/auth, or a channel that goes silent after
+  # connecting). A pod that accepts TCP but stops answering — the exact
+  # OOM-thrashing-after-a-CUDA-build case this verb exists to watch for — or
+  # an auth prompt (a passphrase-protected key, a fallback to interactive
+  # password auth) hangs the `ssh` client itself, indefinitely, with `consec`
+  # never incrementing and this loop's own deadline (below) never reached:
+  # the exact silent-idle fail-open the verb claims to close (round-N audit
+  # finding B1). `-oBatchMode=yes` (the SAME pattern `_rp_ls_remote`'s own
+  # GIT_SSH_COMMAND already uses) refuses to prompt at all, failing fast
+  # instead of hanging on one; `-oServerAliveInterval=10
+  # -oServerAliveCountMax=3` makes the CLIENT itself detect a connection
+  # that has gone silent after connecting and give up within ~30s, rather
+  # than waiting on channel data that may never arrive. Scoped to THIS
+  # ssh invocation only (a local array, never folded into the shared
+  # RP_SSHO every OTHER call site also uses) — an interactive `attach`/
+  # `shell` session has a different, deliberately looser liveness contract
+  # this function has no business changing.
+  local -a wait_sshopts=("${RP_SSHO[@]}" -oBatchMode=yes -oServerAliveInterval=10 -oServerAliveCountMax=3)
+  # A SECOND, portable backstop UNDER the ssh-option hardening above (round-N
+  # audit B1's "AND/OR" — this repo applies both): `_rp_bounded_capture`
+  # runs the ssh invocation in the BACKGROUND and kills it if it exceeds
+  # RP_WAIT_SSH_BOUND_SECS (default 60 — comfortably above ConnectTimeout
+  # (10s) + the ServerAlive silence-detection window (~30s) + the remote
+  # `timeout 20`, with real margin), using plain bash job control (`kill -0`
+  # polling + `kill -TERM`/`-KILL`), never the GNU-coreutils-only `timeout`
+  # binary this file's own `_rp_ls_remote` doc already notes is ABSENT on a
+  # BSD host — the same portability constraint applies here. This is what
+  # makes the hang path itself testable against a bare mock `ssh` stub that
+  # simply sleeps (ignoring every ssh option, since it is not real openssh)
+  # — real ssh's ServerAlive settings cannot be exercised by a stub, but
+  # this wrapper's own kill still bounds it regardless of what the stub does.
+  local -a wait_cmd=(ssh "${wait_sshopts[@]}" -p "$RP_PORT" "root@${RP_HOST}" "timeout 20 bash -s")
+  echo "=== ${label}: polling every ${interval}s, up to ${timeout}s (pod ${RP_HOST:-?}:${RP_PORT:-?}) ==="
+  while :; do
+    # `2>&1`: MERGES, never discards — a transport failure's own stderr (ssh's
+    # "Connection refused"/"Connection timed out") is exactly the evidence
+    # the loud transport-failure message below needs to be more than a bare
+    # exit code.
+    out="$(printf '%s\n' "$script" | _rp_bounded_capture "${RP_WAIT_SSH_BOUND_SECS:-60}" "${wait_cmd[@]}" 2>&1)"
+    rc=$?
+    case "$rc" in
+      0) echo "${out}"; echo "=== ${label}: SUCCESS ==="; return 0 ;;
+      1) echo "::error::${label}: FAILURE — ${out}"; return 1 ;;
+      2) consec=0; echo "${label}: still waiting — ${out}" ;;
+      *)
+        consec=$((consec + 1))
+        echo "::warning::${label}: poll unreachable (ssh/remote exit ${rc}) — ${consec}/${max_fail} consecutive — ${out}"
+        if [ "$consec" -ge "$max_fail" ]; then
+          echo "::error::${label}: TRANSPORT FAILURE — ${consec} consecutive unreachable polls (last exit ${rc})."
+          echo "::error::${label}: this is NOT evidence it is still running — it means the pod could not be reached. Check it directly: gpu-dev.sh ls / ssh / the RunPod console."
+          return 2
+        fi
+        ;;
+    esac
+    [ "$SECONDS" -lt "$deadline" ] || { echo "::error::${label}: timed out after ${timeout}s with no verdict"; return 3; }
+    remaining=$((deadline - SECONDS))
+    sleep "$(( remaining < interval ? remaining : interval ))"
+  done
 }
 
 # Terminate orphaned pods. The in-pod deadline is the primary guard; this is the

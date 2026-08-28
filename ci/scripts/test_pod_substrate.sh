@@ -3543,6 +3543,128 @@ PY
   fi
 }
 
+# ═════════════════════════════════════════════════════════════════════════
+# (aa/esc-056) escape esc-056-pod-substrate-assumes-single-fresh-state,
+# member 3 (up-records-session-only-after-post-create-steps): `gpu-dev.sh up`
+# used to call rp_session_save only AFTER the SSH-reachability wait (and the
+# driver-floor check) succeeded — the file `ls`/`down` read was written
+# minutes after the pod started billing. A failure in that window (an
+# external kill that bypasses the EXIT trap, or a trap-time `rp_terminate`
+# that itself silently fails) left a RUNNING, BILLING pod recorded nowhere.
+# Observed live: a four-way parallel rental created H100 pod d3iv3237z0fiy0
+# (10:46:36Z, $2.89/hr, US-KS-2) whose `up` failed post-creation; the session
+# ledger never knew it, and the orphan was found by a human eyeballing the
+# RunPod console and terminated by hand. The fix (runpod_lib.sh's
+# rp_deploy_live) writes the session — pod id, arch, a host-unknown
+# placeholder — the MOMENT the pod id comes back from the deploy mutation,
+# before the reachability wait; the pre-existing post-wait call now UPDATES
+# that same record with the real host/port rather than creating it.
+# ═════════════════════════════════════════════════════════════════════════
+{
+  AA_RUNPOD_LIB="$REPO_ROOT/ci/scripts/runpod_lib.sh"
+
+  # ---- structural: the write-ahead save precedes the reachability wait, ---
+  # which precedes the post-wait UPDATE save — exactly the ordering the fix
+  # depends on (see the leg's own doc above). `^    rp_session_save$` matches
+  # only the bare write-ahead call (4-space indent, no trailing `; return 0`)
+  # so it cannot accidentally match the post-wait update call (10-space
+  # indent, line 1027) or rp_session_save's own definition/other callers.
+  aa_write_ahead_line="$(grep -n '^    rp_session_save$' "$AA_RUNPOD_LIB" | head -1 | cut -d: -f1)"
+  aa_wait_line="$(grep -n 'while \[ "\$SECONDS" -lt "\$_rp_deploy_deadline" \]; do' "$AA_RUNPOD_LIB" | head -1 | cut -d: -f1)"
+  aa_update_line="$(grep -n 'rp_session_save; return 0' "$AA_RUNPOD_LIB" | head -1 | cut -d: -f1)"
+  if [ -n "$aa_write_ahead_line" ] && [ -n "$aa_wait_line" ] && [ -n "$aa_update_line" ] \
+     && [ "$aa_write_ahead_line" -lt "$aa_wait_line" ] && [ "$aa_wait_line" -lt "$aa_update_line" ]; then
+    ok "(aa/esc-056) rp_deploy_live's write-ahead rp_session_save (line ${aa_write_ahead_line}) precedes the reachability wait (line ${aa_wait_line}), which precedes the post-wait update save (line ${aa_update_line})"
+  else
+    bad "(aa/esc-056) expected write-ahead < wait < update ordering (write_ahead=${aa_write_ahead_line:-<none>} wait=${aa_wait_line:-<none>} update=${aa_update_line:-<none>})"
+  fi
+
+  # ---- behavioural: a candidate that never becomes reachable still leaves --
+  # a durable, on-disk session record naming the pod that was created (the
+  # exact live defect: an unreachable/killed post-create window must not
+  # leave the pod recorded NOWHERE). Function-level intercept on rp_gql (this
+  # suite's own established technique — see leg (a)'s module doc): no
+  # network, no real RunPod account. The port-lookup stub returns an empty
+  # `ports` list, so `[ -n "${RP_HOST:-}" ]` short-circuits false and `ssh`
+  # itself is never invoked — the same "never mock ssh" discipline this
+  # suite applies throughout; the driver forces a fast, deterministic
+  # timeout via RP_SSH_WAIT_SECS=1 rather than actually waiting.
+  AA_DRIVER="$SANDBOX/aa_driver.sh"
+  cat > "$AA_DRIVER" <<'DRV'
+#!/usr/bin/env bash
+set -uo pipefail
+export RUNPOD_API_KEY=test-dummy-key
+export RP_SESSION_ROOT="${AA_DRV_SESSIONS}"
+export RP_SSH_CONFIG="${AA_DRV_SSH_CONFIG}"
+export RP_SESSION="${AA_DRV_SESSION}"
+export RP_SSH_WAIT_SECS=1
+mkdir -p "$RP_SESSION_ROOT"
+FAKE_POD_ID="${AA_DRV_POD_ID}"
+# shellcheck disable=SC1090
+. "${AA_DRV_LIB}"
+RP_ARCH=fakearch
+rp_gql() {
+  case "$1" in
+    *podFindAndDeployOnDemand*) printf '{"data":{"podFindAndDeployOnDemand":{"id":"%s"}}}' "$FAKE_POD_ID" ;;
+    *'pod(input:'*) printf '{"data":{"pod":{"runtime":{"ports":[]}}}}' ;;
+    *podTerminate*) printf '{"data":{"podTerminate":true}}' ;;
+    *) printf '{}' ;;
+  esac
+}
+rp_deploy_live "FAKE|FAKE-GPU"
+echo "RC=$?"
+DRV
+  chmod +x "$AA_DRIVER"
+
+  AA_POD_ID="aa-esc056-fake-pod-1234"
+  AA_SESSIONS="$SANDBOX/aa_sessions"
+  AA_SESSION_NAME="aa-writeahead"
+  AA_DRV_LIB="$AA_RUNPOD_LIB" AA_DRV_POD_ID="$AA_POD_ID" AA_DRV_SESSION="$AA_SESSION_NAME" \
+    AA_DRV_SESSIONS="$AA_SESSIONS" AA_DRV_SSH_CONFIG="$SANDBOX/aa_ssh_config" \
+    bash "$AA_DRIVER" > "$SANDBOX/aa_deploy.out" 2>&1
+  AA_META="$AA_SESSIONS/$AA_SESSION_NAME/meta"
+  if grep -qF 'RC=75' "$SANDBOX/aa_deploy.out" ; then
+    ok "(aa/esc-056) the unreachable candidate correctly fails the OVERALL deploy (rc=75, no capacity/reachability) after being terminated in-loop"
+  else
+    bad "(aa/esc-056) expected rp_deploy_live to return 75 on an unreachable candidate: $(cat "$SANDBOX/aa_deploy.out")"
+  fi
+  if [ -f "$AA_META" ] && grep -qF "RP_POD_ID=$AA_POD_ID" "$AA_META"; then
+    ok "(aa/esc-056 fix) the session file was written with the pod id BEFORE the (ultimately failed) reachability wait completed — a killed/unreachable post-create window is still visible to ls/down, not orphaned"
+  else
+    bad "(aa/esc-056 fix) expected the session file to record RP_POD_ID=${AA_POD_ID} despite the deploy ultimately failing (meta: $(cat "$AA_META" 2>/dev/null || echo '<missing>'))"
+  fi
+
+  # ---- revert-RED: the mutant instruction is literal — move the write- ----
+  # ahead record back to AFTER the wait (i.e. remove it, leaving only the
+  # pre-existing post-wait/on-success save) — and this leg's behavioural
+  # assertion above must go RED: an unreachable candidate leaves NO session
+  # file at all, reproducing the original live defect exactly.
+  AA_MUTANT_LIB="$SANDBOX/aa_runpod_lib_mutant.sh"
+  cp "$AA_RUNPOD_LIB" "$AA_MUTANT_LIB"
+  python3 - "$AA_MUTANT_LIB" <<'PY'
+import sys
+p = sys.argv[1]
+t = open(p).read()
+old = "\n    rp_session_save\n    # A wall-clock deadline"
+new = "\n    # A wall-clock deadline"
+assert old in t, "revert fixture: could not locate rp_deploy_live's write-ahead rp_session_save call"
+assert t.count(old) == 1, "revert fixture: expected exactly one write-ahead call site"
+open(p, "w").write(t.replace(old, new, 1))
+PY
+  bash -n "$AA_MUTANT_LIB" || bad "(aa/esc-056 revert-RED) the neutered runpod_lib.sh copy has a syntax error"
+
+  AA_MUTANT_SESSIONS="$SANDBOX/aa_mutant_sessions"
+  AA_DRV_LIB="$AA_MUTANT_LIB" AA_DRV_POD_ID="$AA_POD_ID" AA_DRV_SESSION="$AA_SESSION_NAME" \
+    AA_DRV_SESSIONS="$AA_MUTANT_SESSIONS" AA_DRV_SSH_CONFIG="$SANDBOX/aa_ssh_config_mutant" \
+    bash "$AA_DRIVER" > "$SANDBOX/aa_mutant_deploy.out" 2>&1
+  AA_MUTANT_META="$AA_MUTANT_SESSIONS/$AA_SESSION_NAME/meta"
+  if grep -qF 'RC=75' "$SANDBOX/aa_mutant_deploy.out" && { [ ! -f "$AA_MUTANT_META" ] || ! grep -qF "RP_POD_ID=$AA_POD_ID" "$AA_MUTANT_META"; }; then
+    ok "(aa/esc-056 revert-RED) neutering the write-ahead save on a scratch copy reproduces the ORIGINAL defect — the same unreachable candidate now leaves NO recorded pod id — the fix is genuinely load-bearing"
+  else
+    bad "(aa/esc-056 revert-RED) expected the neutered copy to leave no RP_POD_ID recorded (meta: $(cat "$AA_MUTANT_META" 2>/dev/null || echo '<missing>')): $(cat "$SANDBOX/aa_mutant_deploy.out")"
+  fi
+}
+
 echo
 echo "test_pod_substrate: ${PASS} passed, ${FAIL} failed, ${SKIP} skipped"
 [ "$FAIL" -eq 0 ]

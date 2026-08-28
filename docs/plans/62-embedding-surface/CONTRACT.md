@@ -39,7 +39,7 @@ MANIFEST_VERSION bump (the digest self-announces as a hash mismatch).
 ## E2 — jammi-ai: digest computation + esc-057 red-green (domain: ai-core)
 
 - `files_in_scope`: `crates/jammi-ai/src/model/backend/candle.rs` (load path :34-40 pooling
-  read, :456-511), `crates/jammi-ai/src/model/mod.rs`, `crates/jammi-ai/src/pipeline/import.rs`
+  read, :516-615 `pooling_from_config`), `crates/jammi-ai/src/model/mod.rs`, `crates/jammi-ai/src/pipeline/import.rs`
   (external-producer path → `None` + NullMeans reason), `crates/jammi-ai/src/pipeline/{embedding,recompute}.rs`,
   `crates/jammi-ai/src/session.rs`, `crates/jammi-ai/tests/it/{pooling_config,recompute,compute_precision}.rs`.
 - Compute the digest ONCE per model load: sha256 of config + `1_Pooling/config.json` +

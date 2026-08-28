@@ -168,6 +168,7 @@ FINETUNE_IDENTITY_FIELDS = (
     # counted fact. jammi: `FinetuneStepTier::warmup`; torch: `args.warmup`
     # (an `ab_merge._TORCH_ARGS_LEVEL_FIELDS` member).
     "warmup",
+    "row_lengths",
 )
 
 # Identity fields for which a JSON `null` is a legitimate VALUE (compared as

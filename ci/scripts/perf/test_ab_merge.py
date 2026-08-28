@@ -95,6 +95,7 @@ def jammi_fs(dispatches, **overrides):
         "clip_invocations": 0,
         "attention_arm": "fused",
         "warmup": 5,
+        "row_lengths": [128] * 8,
         "trainable_tensors": 4,
         "steps_measured": 20,
         "losses": [0.3046, 0.3012],
@@ -211,6 +212,7 @@ def torch_fs(seed=42, attn_requested="sdpa", lora_alpha=32.0, margin=0.3, warmup
         # test overrides `attention_arm` itself.
         "max_grad_norm": None,
         "clip_invocations": 0,
+        "row_lengths": [128] * 8,
         "trainable_tensors": 4,
         "steps_measured": 20,
         "losses": [0.31, 0.10],

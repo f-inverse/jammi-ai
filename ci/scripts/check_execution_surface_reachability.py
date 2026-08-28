@@ -79,6 +79,20 @@ sit in its run bodies. `_glob_to_regex` translates a GitHub Actions path
 glob (`**`, `*`, `?`, literal segments) to a regex; `_lane_admits_any_origin`
 requires at least one of the tuple's own recorded origins to match.
 
+Every pattern in every lane of every scanned merge-path workflow is
+validated EAGERLY, in `scan_workflows` itself, unconditionally (F1,
+round-3 audit): `_lane_admits_path`'s own `any()` short-circuits at the
+first matching pattern, so a per-tuple-triggered validation would never
+even LOOK at an unsupported pattern sitting AFTER an earlier one that
+already matched (`paths: ["**", "!ci/scripts/**"]` would credit with zero
+findings — the exact over-broad-admit `_glob_to_regex`'s own docstring
+names — since `**` alone satisfies the `any()` and the loop never reaches
+the `!`-prefixed entry); and a merge-path workflow whose bad pattern sits
+in a lane NO gated tuple ever routes a reachability check through was
+previously validated NEVER at all. `_validate_lane_patterns` closes both:
+it compiles every pattern of every lane the moment `scan_workflows`
+discovers it, independent of match order and independent of any tuple.
+
 ### 1c — job/step conditional honesty
 
 Extraction is restricted to `run:`/`cmd:` bodies of jobs and steps that are
@@ -112,16 +126,41 @@ text from each matrix `include:` leg instead, and a leg's own
 per-leg soft-fail convention, e.g. the "doc numbers have producers" leg) —
 a sibling leg without that field still credits normally.
 
-A WORKFLOW-side ` || <fallback>` tail that SWALLOWS the real exit status
-(`|| true`, `|| :`, `|| exit 0`, `|| return 0` — the canonical "never fail
-this statement" shell idiom, semantically equivalent to
-`continue-on-error: true`) is refused the same way (B1): the invocation
-before that tail is never credited as reachable, even though the SAME text
-is still a legitimate REGISTRY tuple when the identical `|| true` pattern
-shows up in one of THIS class's own operator-run scripts (registry
-discovery does not refuse it — the subject existing is what matters there,
-not whether it swallows its own failure). A fail-LOUD tail (`|| exit 1`,
-`|| rc=$?`) still credits normally on both sides.
+A WORKFLOW-side ` || <fallback>` tail is credited ONLY if it matches a
+KNOWN FAIL-LOUD shape — `_FAIL_LOUD_FALLBACK_RE`: a literal nonzero `exit
+N`/`return N`, a `exit $?`/`return $?` re-propagating the ALREADY-nonzero
+code we are guaranteed to be holding inside the `||` branch, or a bare
+`name=$?` capture (this repo's own `runpod_gpu_prove.sh` convention:
+capture now, `exit "$rc"` later). EVERYTHING ELSE is refused (F2, round-3
+audit — the polarity is deliberately an ALLOWLIST of known-safe shapes,
+never a denylist of known-unsafe ones: an earlier version of this gate
+enumerated only `true`/`:`/`exit 0`/`return 0` as unsafe, so an
+UNENUMERATED zero-exit tail — `|| echo "..."`, `|| /bin/true`,
+`|| test 1 = 1`, `|| { echo oops; exit 0; }` — silently credited, even
+though bash gives every one of those the SAME zero exit status a bare
+`|| true` does, semantically equivalent to `continue-on-error: true`).
+`;`-chaining is NOT part of this class on the WORKFLOW side specifically
+(the only side this refusal applies to) — `_split_on_semicolons` already
+isolates each `;`-separated statement into its own segment before this
+check ever runs, and GitHub Actions' own DEFAULT shell for a `run:` step
+is `bash --noprofile --norc -eo pipefail {0}` (errexit ON unless a
+workflow overrides `shell:`), so a failing LEFT command aborts the whole
+step before a later `;`-joined statement's own exit status could matter —
+`cargo ...; something_that_succeeds` is not a swallow the way an `||`
+tail is, THERE. This does NOT hold for `ci/scripts/**`'s own operator-run
+shell scripts, most of which set `-uo pipefail` WITHOUT `-e` (confirmed by
+inspection) — but registry-side discovery never applies this refusal at
+all, so the distinction is moot for that side. The invocation before a
+refused `||` tail is never credited
+as reachable, even though the SAME text is still a legitimate REGISTRY
+tuple when the identical pattern shows up in one of THIS class's own
+operator-run scripts (registry discovery does not refuse it — the subject
+existing is what matters there, not whether it swallows its own failure).
+Honest residual: `_FAIL_LOUD_FALLBACK_RE`'s enumerated set may itself be
+incomplete — a genuinely status-propagating shape this set does not name
+would be (safely) REFUSED rather than credited, the fail-closed direction;
+widening that set is a follow-up PR's job the day a real fail-loud tail
+this gate cannot yet recognize shows up in a merge-path workflow.
 
 Two related conditional-honesty gaps are DISCLOSED, not modeled (both
 would need meaningfully more machinery than a hermetic text-shape gate
@@ -388,13 +427,28 @@ _ENV_ASSIGNMENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|\'[^\']*\'|
 # like every other narrow-by-design constant in this file.
 _KNOWN_WRAPPER_PREFIXES = ("run_cmd",)
 
-# A shell `|| <fallback>` tail that SWALLOWS the real exit status (`|| true`,
-# `|| :`, `|| exit 0`, `|| return 0` — canonically "never fail this
-# statement", semantically equivalent to `continue-on-error: true`), as
-# opposed to a fail-LOUD fallback (`|| exit 1`, `|| rc=$?`) that still
-# propagates failure. See `extract_tuples_from_line`'s
-# `refuse_swallowing_fallback` parameter.
-_SWALLOWING_FALLBACK_RE = re.compile(r"^(?:true|:|exit\s+0|return\s+0)\s*(?:#.*)?$")
+# F2 (round-3 audit): an ALLOWLIST of KNOWN fail-loud `|| <fallback>` tail
+# shapes, never a denylist of known-swallowing ones — a denylist (the
+# round-2 form this replaces: `true|:|exit 0|return 0`) silently credits
+# every UNENUMERATED zero-exit shape (`|| echo "..."`, `|| /bin/true`,
+# `|| test 1 = 1`, `|| { echo oops; exit 0; }` all give bash the SAME zero
+# exit status `|| true` does). Matches: a literal nonzero `exit N`/
+# `return N`; `exit $?`/`return $?` (re-propagating the exit code we are
+# GUARANTEED to be holding nonzero, since we are inside the `||` branch
+# precisely because the left-hand command failed); or a bare `name=$?`
+# capture (this repo's own `runpod_gpu_prove.sh` convention — capture now,
+# `exit "$rc"` in a later statement). See `extract_tuples_from_line`'s
+# `refuse_swallowing_fallback` parameter and the module doc's own honest-
+# residual note on this enumerated set's own possible incompleteness.
+_FAIL_LOUD_FALLBACK_RE = re.compile(
+    r"^(?:"
+    r"exit\s+[1-9][0-9]*"
+    r"|exit\s+\$\?"
+    r"|return\s+[1-9][0-9]*"
+    r"|return\s+\$\?"
+    r"|[A-Za-z_][A-Za-z0-9_]*=\$\?"
+    r")\s*(?:#.*)?$"
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -493,14 +547,17 @@ def _extract_from_segment(segment: str, refuse_swallowing_fallback: bool) -> str
     parts = re.split(r"\s\|\|\s", segment, maxsplit=1)
     head = parts[0].strip()
     if refuse_swallowing_fallback and len(parts) == 2:
-        # B1 (round-2 audit): a WORKFLOW-side `|| true`/`|| :`/`|| exit 0`/
-        # `|| return 0` tail is the canonical shell idiom for "never fail
-        # this step regardless of exit code" — semantically equivalent to
-        # `continue-on-error: true`, which `_step_is_blocked` already
-        # refuses. Registry (`ci/scripts/**`) discovery does NOT pass this
-        # flag: the SUBJECT tuple existing is what matters there, not
-        # whether its own script happens to swallow its own failure.
-        if _SWALLOWING_FALLBACK_RE.match(parts[1].strip()):
+        # F2 (round-3 audit, inverted from round-2's denylist): a
+        # WORKFLOW-side `||` tail is credited ONLY if it matches the KNOWN
+        # fail-loud allowlist (`_FAIL_LOUD_FALLBACK_RE`) — EVERY other tail
+        # is refused, including unenumerated zero-exit shapes a denylist
+        # would have missed (`|| echo "..."`, `|| /bin/true`, etc. all give
+        # bash the same zero exit status `|| true` does — semantically
+        # equivalent to `continue-on-error: true`, which `_step_is_blocked`
+        # already refuses). Registry (`ci/scripts/**`) discovery does NOT
+        # pass this flag: the SUBJECT tuple existing is what matters there,
+        # not whether its own script happens to swallow its own failure.
+        if not _FAIL_LOUD_FALLBACK_RE.match(parts[1].strip()):
             return None
     if head.endswith("\\"):
         head = head[:-1].rstrip()
@@ -518,8 +575,10 @@ def extract_tuples_from_line(raw_line: str, refuse_swallowing_fallback: bool = F
     `cargo clippy ...` normalize identically), then quote-aware-splits on
     `;`, then per segment: strips a leading env-assignment/wrapper-prefix
     chain, drops a trailing ` || <shell fallback>` (e.g. `|| exit 1`,
-    `|| rc=$?` — UNLESS `refuse_swallowing_fallback` is set and the tail is
-    a status-swallowing shape, see `_extract_from_segment`) and a trailing
+    `|| rc=$?` — and, when `refuse_swallowing_fallback` is set, ONLY a
+    fallback matching the KNOWN fail-loud allowlist `_FAIL_LOUD_FALLBACK_RE`
+    is dropped this way; every OTHER fallback tail refuses the whole
+    segment instead, see `_extract_from_segment`) and a trailing
     line-continuation backslash (belt-and-braces — `_join_line_continuations`
     already stitches genuine continuations before this function ever sees
     the line; this only fires on a stray unterminated trailing backslash,
@@ -559,7 +618,16 @@ def extract_tuples_from_line(raw_line: str, refuse_swallowing_fallback: bool = F
 def is_gated(tuple_text: str) -> bool:
     tokens: set[str] = set()
     for m in _FEATURES_RE.finditer(tuple_text):
-        tokens.update(t.strip() for t in m.group(1).split(","))
+        # `.strip("\"'")` on the WHOLE captured value (round-3 audit
+        # advisory): `--features="cuda"`/`--features='cuda,flash-attn'`
+        # (a quoted `=`-form, `\S+` in `_FEATURES_RE` happily captures the
+        # surrounding quote characters too) would otherwise leave a
+        # feature TOKEN that never equals the bare `"cuda"`/`GATED_FEATURE_
+        # TOKENS` entries — an evasion, not observed in any real script or
+        # workflow today (grep-confirmed), fixed anyway since it costs
+        # nothing and closes the gap before it needs to be found live.
+        value = m.group(1).strip("\"'")
+        tokens.update(t.strip() for t in value.split(","))
     if not tokens:
         return False
     if tokens & GATED_FEATURE_TOKENS:
@@ -608,12 +676,12 @@ def _join_line_continuations(text: str) -> list[tuple[int, str]]:
 def _extract_tuples_from_text(text: str) -> set[str]:
     """The reachable-corpus (WORKFLOW-side) extraction pipeline: blank
     comments, join continuations, extract per logical line —
-    `refuse_swallowing_fallback=True` (B1, round-2 audit): a workflow line
-    swallowing its own exit status (`|| true`/`|| :`/`|| exit 0`/
-    `|| return 0`) must never be credited as if it genuinely gates a merge.
-    Origins are not tracked here (only a set of tuple texts) — callers that
-    need origins use `discover_all_tuples`'s own line-numbered walk
-    instead."""
+    `refuse_swallowing_fallback=True` (B1/F2, round-2+3 audit): a workflow
+    line whose `||` tail is not a KNOWN fail-loud shape
+    (`_FAIL_LOUD_FALLBACK_RE`) must never be credited as if it genuinely
+    gates a merge. Origins are not tracked here (only a set of tuple
+    texts) — callers that need origins use `discover_all_tuples`'s own
+    line-numbered walk instead."""
     found: set[str] = set()
     for _lineno, logical_line in _join_line_continuations(_drop_comment_lines(text)):
         found.update(extract_tuples_from_line(logical_line, refuse_swallowing_fallback=True))
@@ -1091,6 +1159,14 @@ def _lane_admits_any_origin(lane: PathLane, origins: list[str]) -> bool:
 # --------------------------------------------------------------------------- #
 # `jobs:` / step-body extraction (Rule 1c)
 # --------------------------------------------------------------------------- #
+# Matches this repo's OWN exact spelling only (`run: ${{ matrix.cmd }}`,
+# unquoted, single-line) — a quoted (`run: "${{ matrix.cmd }}"`) or
+# block-scalar (`run: |` / `run: >` wrapping the interpolation) spelling
+# would fail this match and be treated as an ordinary (non-matrix-
+# indirection) step body instead, which fails CLOSED (the matrix `include:`
+# legs are then never credited at all, per `has_unblocked_matrix_cmd_step`
+# below) rather than crediting anything wrongly — disclosed, not modeled;
+# no real workflow in this repo uses either spelling today.
 _MATRIX_CMD_INTERP_RE = re.compile(r"^\$\{\{\s*matrix\.cmd\s*\}\}$")
 _MATRIX_CONTINUE_ON_ERROR_EXPR = "${{ matrix.continue_on_error == 'true' }}"
 
@@ -1184,16 +1260,46 @@ class WorkflowScan:
     tuples: set[str]
 
 
-def scan_workflows(repo_root: Path) -> list[WorkflowScan]:
+def _validate_lane_patterns(workflow_name: str, lane: PathLane) -> list[str]:
+    """F1 (round-3 audit): compile EVERY pattern in `lane.paths` AND
+    `lane.paths_ignore`, unconditionally — never short-circuited by an
+    earlier pattern already matching (`_lane_admits_path`'s own `any()`
+    stops at the first match, so `paths: ["**", "!ci/scripts/**"]` would
+    never even LOOK at the second, unsupported pattern under the old
+    per-tuple-triggered validation) and never gated on whether any tuple
+    happens to route through this workflow at all (a merge-path workflow
+    carrying a bad pattern but no gated tuple was previously validated
+    NEVER). Returns one named finding per invalid pattern, empty if all
+    patterns in this lane are supported."""
+    findings: list[str] = []
+    for patterns in (lane.paths, lane.paths_ignore):
+        if patterns is None:
+            continue
+        for p in patterns:
+            try:
+                _glob_to_regex(p)
+            except UnsupportedPathPatternError as exc:
+                findings.append(f"{workflow_name}: {exc}")
+    return findings
+
+
+def scan_workflows(repo_root: Path) -> tuple[list[WorkflowScan], list[str]]:
     """Every workflow with at least one qualifying (Rule 1a) merge-path
     trigger, carrying its own lanes (Rule 1b's per-lane paths filters) and
     its job/step-scoped (Rule 1c) tuple corpus. Globs BOTH `*.yml` and
-    `*.yaml` (see the module doc's disclosed narrowness note)."""
+    `*.yaml` (see the module doc's disclosed narrowness note). Returns
+    `(scans, path_pattern_findings)` — the second list is EVERY unsupported
+    `paths:`/`paths-ignore:` pattern finding, validated eagerly here (F1,
+    round-3 audit) for every lane of every scanned merge-path workflow,
+    independent of match order within a lane and independent of whether
+    any gated tuple ever routes a reachability check through this
+    workflow at all."""
     workflows_dir = repo_root / WORKFLOWS_DIR_REL
     if not workflows_dir.is_dir():
-        return []
+        return [], []
     paths = sorted(set(workflows_dir.glob("*.yml")) | set(workflows_dir.glob("*.yaml")))
     scans: list[WorkflowScan] = []
+    pattern_findings: list[str] = []
     for path in paths:
         try:
             text = path.read_text(encoding="utf-8")
@@ -1203,17 +1309,32 @@ def scan_workflows(repo_root: Path) -> list[WorkflowScan]:
         lanes = merge_path_lanes(on_dict)
         if not lanes:
             continue
+        for lane in lanes:
+            pattern_findings.extend(_validate_lane_patterns(path.name, lane))
         scans.append(WorkflowScan(name=path.name, lanes=lanes, tuples=_workflow_job_tuples(text)))
-    return scans
+    return scans, pattern_findings
 
 
 def is_tuple_reachable(tuple_text: str, origins: list[str], scans: list[WorkflowScan]) -> bool:
+    """Belt-and-braces: `scan_workflows` already validates every lane's
+    patterns EAGERLY (F1, round-3 audit) before this function is ever
+    called, so `UnsupportedPathPatternError` is not expected to fire here
+    — but a lane carrying an invalid pattern is still left in place (never
+    silently pruned), so a defensive catch treats such a lane as NOT
+    admitting (fail-closed) rather than crashing the whole tuple's
+    reachability computation, and keeps checking any OTHER lane/scan that
+    might still legitimately admit the tuple. Never adds a SECOND,
+    differently-formatted finding for the same bad pattern —
+    `scan_workflows`'s own eager pass already reported it once."""
     for scan in scans:
         if tuple_text not in scan.tuples:
             continue
         for lane in scan.lanes:
-            if _lane_admits_any_origin(lane, origins):
-                return True
+            try:
+                if _lane_admits_any_origin(lane, origins):
+                    return True
+            except UnsupportedPathPatternError:
+                continue
     return False
 
 
@@ -1271,30 +1392,24 @@ def run_gate(repo_root: Path, allowlist_path: Path) -> tuple[list[str], list[str
 
     registry = discover_all_tuples(repo_root)
     gated = gated_tuples(registry)
-    scans = scan_workflows(repo_root)
+    scans, path_pattern_findings = scan_workflows(repo_root)
     allow_rows, allow_parse_failures = parse_allowlist(allowlist_path)
     failures.extend(allow_parse_failures)
 
     allowlisted_texts = {row.tuple_text for row in allow_rows}
 
-    # B2 (round-2 audit): an unsupported paths:/paths-ignore: pattern
-    # (leading `!`, or `{a,b}`) is refused, never silently guessed —
-    # per-tuple, so ONE bad pattern in one lane does not abort evaluation
-    # of every other tuple against every other lane. A REFUSED tuple is
-    # never added to `reachable_gated` (fail-closed: it falls through to
-    # Rule 1's normal "needs an allowlist row" path) AND surfaces its own
-    # named finding, so a human sees exactly which pattern needs a human
-    # decision (implement order-evaluated negation, or hand-restructure the
-    # workflow's paths: list to avoid it).
-    reachable_gated: set[str] = set()
-    unsupported_pattern_findings: set[str] = set()
-    for t, rec in gated.items():
-        try:
-            if is_tuple_reachable(t, rec.origins, scans):
-                reachable_gated.add(t)
-        except UnsupportedPathPatternError as exc:
-            unsupported_pattern_findings.add(str(exc))
-    failures.extend(sorted(unsupported_pattern_findings))
+    # B2/F1 (round-2+3 audit): an unsupported paths:/paths-ignore: pattern
+    # (leading `!`, or `{a,b}`) is validated EAGERLY by `scan_workflows`
+    # itself — every pattern of every lane of every merge-path workflow,
+    # unconditionally, never short-circuited by an earlier pattern already
+    # matching and never gated on whether any gated tuple happens to route
+    # through that workflow at all (round-2's per-tuple-triggered check
+    # missed both cases). A tuple that routes through a lane carrying a bad
+    # pattern falls through to Rule 1's normal "needs an allowlist row"
+    # path (`is_tuple_reachable`'s own defensive catch, fail-closed) AND
+    # the pattern itself is named here exactly once.
+    failures.extend(sorted(set(path_pattern_findings)))
+    reachable_gated = {t for t in gated if is_tuple_reachable(t, gated[t].origins, scans)}
 
     info.append(
         f"{len(registry)} cargo invocation(s) discovered under {SCRIPTS_ROOT} "
@@ -1709,6 +1824,77 @@ SWALLOWING_FALLBACK_SCRIPT = """#!/usr/bin/env bash
 cargo clippy -p demo --all-targets --features cuda -- -D warnings || true
 """
 
+# --- F2 (round-3 audit): the DENYLIST round-2 shipped only enumerated
+# true/:/exit 0/return 0 as unsafe -- every UNENUMERATED zero-exit tail
+# below gives bash the SAME zero exit status `|| true` does and must be
+# refused too, now that the polarity is an ALLOWLIST of known-safe shapes.
+SWALLOW_ECHO_WORKFLOW = """name: fixture-swallow-echo
+on:
+  pull_request:
+    branches: [main]
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo clippy -p demo --all-targets --features cuda -- -D warnings || echo "oops"
+"""
+
+SWALLOW_BIN_TRUE_WORKFLOW = """name: fixture-swallow-bin-true
+on:
+  pull_request:
+    branches: [main]
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo clippy -p demo --all-targets --features cuda -- -D warnings || /bin/true
+"""
+
+SWALLOW_TEST_WORKFLOW = """name: fixture-swallow-test
+on:
+  pull_request:
+    branches: [main]
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo clippy -p demo --all-targets --features cuda -- -D warnings || test 1 = 1
+"""
+
+SWALLOW_BRACE_EXIT0_WORKFLOW = """name: fixture-swallow-brace
+on:
+  pull_request:
+    branches: [main]
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo clippy -p demo --all-targets --features cuda -- -D warnings || { echo oops; exit 0; }
+"""
+
+# --- F2 positive controls: a genuinely fail-loud tail must still credit.
+FAIL_LOUD_EXIT_N_WORKFLOW = """name: fixture-fail-loud-exit-n
+on:
+  pull_request:
+    branches: [main]
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo clippy -p demo --all-targets --features cuda -- -D warnings || exit 2
+"""
+
+FAIL_LOUD_RC_CAPTURE_WORKFLOW = """name: fixture-fail-loud-rc-capture
+on:
+  pull_request:
+    branches: [main]
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo clippy -p demo --all-targets --features cuda -- -D warnings || rc=$?
+"""
+
 # --- B2: an unsupported paths:/paths-ignore: pattern (leading `!`, or
 # `{a,b}`) must be REFUSED, never silently computed past. ----------------
 UNSUPPORTED_NEGATION_PATH_WORKFLOW = """name: fixture-bang-path
@@ -1735,6 +1921,39 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: cargo clippy -p demo --all-targets --features cuda -- -D warnings
+"""
+
+# --- F1 (round-3 audit): a `!`-pattern sitting AFTER an earlier pattern
+# that already matches must STILL be validated -- `any()`'s own short-
+# circuit must never hide it. --------------------------------------------
+BANG_AFTER_MATCH_PATH_WORKFLOW = """name: fixture-bang-after-match
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "**"
+      - "!ci/scripts/**"
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo clippy -p demo --all-targets --features cuda -- -D warnings
+"""
+
+# --- F1: a `!`-pattern in a merge-path workflow that carries NO gated
+# tuple at all must STILL be validated -- tuple-routing must never gate
+# whether a bad pattern gets reported. -----------------------------------
+BANG_PATH_NO_GATED_TUPLE_WORKFLOW = """name: fixture-bang-no-tuple
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "!ci/scripts/**"
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "nothing cargo-shaped lives in this workflow at all"
 """
 
 # --- B5: a quoted `"on":` key must parse identically to a bare `on:`. ---
@@ -1889,11 +2108,44 @@ def self_test() -> int:  # noqa: C901 - a flat sequence of independent RED-mutan
         if GATED_TUPLE_TEXT not in gated:
             failures.append(f"self-test FAILED: a `|| true`-tailed REGISTRY-side tuple was not discovered/gated (the swallow refusal must be workflow-side only): {sorted(gated)}")
 
+    # --- F2 (round-3 audit): the ALLOWLIST polarity refuses every
+    # UNENUMERATED zero-exit tail a denylist would have missed. -------------
+    check("`|| echo \"...\"` swallow does not credit", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-swallow-echo.yml": SWALLOW_ECHO_WORKFLOW}, None, "UNREACHABLE gated tuple")
+    check("`|| /bin/true` swallow does not credit", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-swallow-bin-true.yml": SWALLOW_BIN_TRUE_WORKFLOW}, None, "UNREACHABLE gated tuple")
+    check("`|| test 1 = 1` swallow does not credit", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-swallow-test.yml": SWALLOW_TEST_WORKFLOW}, None, "UNREACHABLE gated tuple")
+    check("`|| { echo oops; exit 0; }` swallow does not credit", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-swallow-brace.yml": SWALLOW_BRACE_EXIT0_WORKFLOW}, None, "UNREACHABLE gated tuple")
+    check("`|| exit 2` (fail-loud, nonzero) still credits", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-fail-loud-exit-n.yml": FAIL_LOUD_EXIT_N_WORKFLOW}, None, None)
+    check("`|| rc=$?` (fail-loud capture) still credits", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-fail-loud-rc.yml": FAIL_LOUD_RC_CAPTURE_WORKFLOW}, None, None)
+
     # --- B2: an unsupported paths:/paths-ignore: pattern (leading `!`, or
     # `{a,b}`) is REFUSED with a named finding, never silently computed
     # past -- the affected tuple stays UNREACHABLE either way. --------------
     check("`!`-negation path pattern is refused, not silently computed", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-bang.yml": UNSUPPORTED_NEGATION_PATH_WORKFLOW}, None, "uses syntax this gate does not evaluate")
     check("`{a,b}`-brace path pattern is refused, not silently computed", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-brace.yml": UNSUPPORTED_BRACE_PATH_WORKFLOW}, None, "uses syntax this gate does not evaluate")
+
+    # --- F1 (round-3 audit): eager, order-independent, tuple-independent
+    # pattern validation in scan_workflows itself. ---------------------------
+    check(
+        "a `!`-pattern AFTER an earlier matching pattern is still validated (any() must not short-circuit past it)",
+        {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-bang-after-match.yml": BANG_AFTER_MATCH_PATH_WORKFLOW},
+        None,
+        "uses syntax this gate does not evaluate",
+    )
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        _write_repo(
+            tmp,
+            {
+                "ci/scripts/pod_seed_target.sh": GATED_SCRIPT,
+                ".github/workflows/fixture-bang-no-tuple.yml": BANG_PATH_NO_GATED_TUPLE_WORKFLOW,
+            },
+        )
+        got, _info = _run_gate_in(tmp)
+        if not any("uses syntax this gate does not evaluate" in g for g in got):
+            failures.append(
+                "self-test FAILED (a bad paths: pattern in a merge-path workflow with NO gated tuple "
+                f"at all must still be validated eagerly): {got}"
+            )
 
     # --- B5: a quoted `"on":` key parses identically to a bare `on:`. ------
     check("quoted \"on\": key parses like bare on:", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-quoted-on.yml": QUOTED_ON_KEY_WORKFLOW}, None, None)
@@ -2008,6 +2260,12 @@ def self_test() -> int:  # noqa: C901 - a flat sequence of independent RED-mutan
         failures.append("self-test FAILED: a SECOND --features occurrence was not unioned into gating")
     if is_gated("cargo build -p x --features live-gpu-tests,not-flash-attn-at-all"):
         failures.append("self-test FAILED: a non-gated feature set was misclassified as gated")
+    # Round-3 audit advisory: a quoted `--features="cuda"` spelling (the
+    # `--features=` equals-form with a quoted value) must not evade gating.
+    if not is_gated('cargo build -p x --features="cuda"'):
+        failures.append("self-test FAILED: a quoted --features=\"cuda\" spelling evaded gating")
+    if not is_gated("cargo build -p x --features='cuda,flash-attn'"):
+        failures.append("self-test FAILED: a single-quoted --features='cuda,flash-attn' spelling evaded gating")
 
     # --- Rule 2 (F5): prose that merely STARTS with "cargo build" is never
     # registered, even without a comment/assignment context -----------------
@@ -2060,15 +2318,19 @@ def self_test() -> int:  # noqa: C901 - a flat sequence of independent RED-mutan
         "tags-ignore-alone), job-level if:/continue-on-error:, step-level if:, step-level "
         "continue-on-error:, matrix cmd: indirection conjoined with its own interpolating step's "
         "blocked-state (a credited leg, a soft-failed leg, step-if, no-interpolating-step, and "
-        "step-continue-on-error — round-2 audit B1), a workflow-side `|| true`-style swallow refused "
-        "while the identical registry-side line still gates (B1), an unsupported `!`/`{...}` paths "
-        "pattern refused with a named finding (B2), a quoted `\"on\":` key parsing like bare `on:` "
-        "(B5), comment-only mention, exact-match-never-substring, allowlisted-and-live PASS, rotted "
-        "allowlist row, dead-waiver row, empty-reason row, malformed row (Rule 3), env-prefixed/"
-        "wrapper-prefixed/semicolon-chained/continuation-spanning discovery, multi-feature/-F/"
-        "namespaced-flash-attn gating, prose exclusion (both a comment/assignment-wrapped and a bare "
-        "cargo-subcommand-shaped sentence, the latter also pinned via discover_suspicious_lines — A1), "
-        "workflow_call-only exclusion, and a paths: list surviving a nested comment line."
+        "step-continue-on-error — round-2 audit B1), a workflow-side `||`-tail credited ONLY against a "
+        "known fail-loud allowlist (round-2's `|| true`, plus round-3's unenumerated-swallow mutants — "
+        "`|| echo`, `|| /bin/true`, `|| test`, `|| { ...; exit 0; }` — all refused, `|| exit N`/"
+        "`|| rc=$?` still credited — F2), an unsupported `!`/`{...}` paths pattern refused with a named "
+        "finding EAGERLY (order-independent AND tuple-independent — a bang-after-a-matching-pattern "
+        "and a bad-pattern workflow carrying no gated tuple at all, both round-3 F1 mutants), a quoted "
+        "`\"on\":` key parsing like bare `on:` (B5), comment-only mention, exact-match-never-substring, "
+        "allowlisted-and-live PASS, rotted allowlist row, dead-waiver row, empty-reason row, malformed "
+        "row (Rule 3), env-prefixed/wrapper-prefixed/semicolon-chained/continuation-spanning discovery, "
+        "multi-feature/-F/namespaced-flash-attn gating (incl. quoted --features=\"cuda\"), prose "
+        "exclusion (both a comment/assignment-wrapped and a bare cargo-subcommand-shaped sentence, the "
+        "latter also pinned via discover_suspicious_lines — A1), workflow_call-only exclusion, and a "
+        "paths: list surviving a nested comment line."
     )
     return 0
 

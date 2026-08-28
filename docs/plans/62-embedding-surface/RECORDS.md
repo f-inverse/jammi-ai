@@ -24,19 +24,38 @@ is authored and binding for that follow-up; its H2 (exact two-sided sign test, d
 and H3 (committed held-out fixture under `cookbook/fixtures/`, domains: cookbook + docs-ci) are
 already landed on side branches. C16's preconditions discharge there, not in this unit.
 
-## esc-058 — discovered during E2, triaged valid-defect, fix on a sibling branch
+## esc-058 — warm `ModelCache` staleness, fix landed on this branch
 
-While building E2's content-digest fold, an adjacent-but-distinct defect surfaced: a warm
-`ModelCache` hit serves a pre-mutation digest and pre-mutation vectors after the underlying
-model directory is mutated in place within the same process, because `get_or_load`'s fast path
-(`cache.rs:91-99`) never re-reads disk and `content_digest()` is computed once at load time
-(`candle.rs:404-412,636-648`) and never re-derived from current bytes. This is a distinct class
-from esc-057 (identity-completeness — K7's equal-hash-implies-equal-bytes holds warm): what
-breaks here is the digest's correspondence to the model directory's CURRENT state, not its
-completeness as a determinant set. Recorded as `esc-058-warm-model-cache-serves-stale-digest-and-vectors`,
-status `open`, triaged valid-defect (issue-triage, 2026-08-28, during unit-62 E2). Its fix rides
-this PR train on a sibling branch (`ai/62-esc058-cache-staleness`) and is not part of this docs
-pass.
+An adjacent-but-distinct defect to esc-057 (identity-completeness — K7's equal-hash-implies-
+equal-bytes holds warm): a warm `ModelCache` hit could serve a pre-mutation digest and
+pre-mutation vectors after the underlying model directory was mutated in place within the same
+process, because `get_or_load`'s fast path never re-read disk and `content_digest()` was
+computed once at load time and never re-derived from current bytes. What breaks in this class is
+the digest's correspondence to the model directory's CURRENT state, not its completeness as a
+determinant set (esc-058 is `class_id: cache-coherence-digest-describes-disk`, distinct from
+esc-057's `identity-completeness`).
+
+The fix is landed on this branch (commit `f0712069`, merged at `0ca0b1e6`): `get_or_load`'s warm
+fast path (`crates/jammi-ai/src/model/cache.rs:79-142`) now `stat`-probes a load-time
+`ModelFingerprint` (`ModelFingerprint::probe`, `crates/jammi-ai/src/model/backend/candle.rs:727-780`,
+computed at load by `compute_model_fingerprint`, `candle.rs:790-807`, called from `CandleBackend::load`
+at `candle.rs:1555`; exposed via `LoadedModel::probe_freshness`, `crates/jammi-ai/src/model/mod.rs:391-396`)
+before serving the cached `Arc<LoadedModel>`: `Ok(true)` serves it (`cache.rs:96-106`); `Ok(false)`
+evicts the stale entry through the existing removal machinery and falls through to the same
+single-flight reload path that re-resolves and re-hashes current bytes (`cache.rs:107-133`);
+`Err` — a fingerprinted file vanished or became unreadable — surfaces as a typed refusal (K2),
+never silently treated as fresh or stale (`cache.rs:134-140`). `stat` only, never a re-hash, so
+the fast path stays cheap. Honest residual, documented on `ModelFingerprint`: `(len, mtime)` is a
+staleness TRIPWIRE, not a cryptographic guarantee — a same-length, same-mtime content swap is
+invisible to it; the `ModelContentDigest` recomputed on every actual reload remains the sole
+authoritative attestation.
+
+Red-green test: `crates/jammi-ai/tests/it/cache_staleness.rs::warm_hit_after_in_place_mutation_reloads_fresh_digest_and_vectors`
+(`closes_escape: esc-058`) drives the symptom_spec's exact observable through the real
+`ModelCache::get_or_load` (warm hit) and `ModelCache::load_owned_for_test` (cold control) over a
+mutated model fixture directory. Ledger status is `eval_added`, not yet `closed` — per the
+ledger's own lifecycle it promotes to `closed` only after this branch merges and the cited test
+is green on main.
 
 ## KO-7 scan-root widening — its own follow-up, not this unit
 

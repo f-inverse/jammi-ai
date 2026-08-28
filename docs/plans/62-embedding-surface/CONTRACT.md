@@ -18,8 +18,8 @@ MANIFEST_VERSION bump (the digest self-announces as a hash mismatch).
 
 ## E1 — jammi-db: model-content digest in `ModelIdentity` (domain: db)
 
-- `files_in_scope`: `crates/jammi-db/src/store/manifest.rs` (ModelIdentity :197,
-  ProducingDescriptor :220, definition_hash fold), `crates/jammi-db/tests/it/*` for identity
+- `files_in_scope`: `crates/jammi-db/src/store/manifest.rs` (ModelIdentity :209,
+  ProducingDescriptor :282, definition_hash fold), `crates/jammi-db/tests/it/*` for identity
   tests. Shared-declaration rows (`lib.rs`/`Cargo.toml`/`error.rs`) only if strictly needed.
 - Add a model-content digest determinant to `ModelIdentity` as `Option`-with-NullMeans (the
   external-producer import path has no local files to hash; `None` carries a typed reason,

@@ -29,12 +29,16 @@ behind `gpu-prove.yml`'s label/dispatch/schedule-only trigger — green
 
 Every REGISTERED execution-surface tuple (see Rule 2) must be reachable on
 the merge path: its own `cargo <subcommand> ...` invocation, in the SAME
-NORMALIZED form `extract_tuples_from_line` produces on both sides (env-var-
-assignment/wrapper-prefix chain and a fail-loud `||`-tail stripped
-identically — NOT literal source-byte equality; see that function's own
-docstring for the honest consequence: a workflow-side twin wrapped in a
-DIFFERENT env prefix than the registered script still credits, because the
-underlying invocation genuinely is the same command once normalized), must
+NORMALIZED form `extract_tuples_from_line` produces on both sides (an
+env-var-assignment/wrapper-prefix chain is stripped identically on BOTH
+sides; a trailing `||`-tail is stripped on the REGISTRY side unconditionally
+but only credited-through on the WORKFLOW side when it matches a KNOWN
+fail-loud shape — see `_FAIL_LOUD_FALLBACK_RE` below, otherwise the whole
+segment is refused rather than stripped — NOT literal source-byte
+equality; see that function's own docstring for the honest consequence: a
+workflow-side twin wrapped in a DIFFERENT env prefix than the registered
+script still credits, because the underlying invocation genuinely is the
+same command once normalized), must
 appear inside a JOB+STEP of a workflow whose `on:` block genuinely fires on
 the merge path AND whose path filter (if any) is capable of matching the
 tuple's own origin path AND whose job/step is not conditioned off (see the
@@ -128,11 +132,10 @@ a sibling leg without that field still credits normally.
 
 A WORKFLOW-side ` || <fallback>` tail is credited ONLY if it matches a
 KNOWN FAIL-LOUD shape — `_FAIL_LOUD_FALLBACK_RE`: a literal nonzero `exit
-N`/`return N`, a `exit $?`/`return $?` re-propagating the ALREADY-nonzero
-code we are guaranteed to be holding inside the `||` branch, or a bare
-`name=$?` capture (this repo's own `runpod_gpu_prove.sh` convention:
-capture now, `exit "$rc"` later). EVERYTHING ELSE is refused (F2, round-3
-audit — the polarity is deliberately an ALLOWLIST of known-safe shapes,
+N`/`return N`, or `exit $?`/`return $?` re-propagating the ALREADY-nonzero
+code we are guaranteed to be holding inside the `||` branch. EVERYTHING
+ELSE is refused (F2, round-3 audit — the polarity is deliberately an
+ALLOWLIST of known-safe shapes,
 never a denylist of known-unsafe ones: an earlier version of this gate
 enumerated only `true`/`:`/`exit 0`/`return 0` as unsafe, so an
 UNENUMERATED zero-exit tail — `|| echo "..."`, `|| /bin/true`,
@@ -151,16 +154,43 @@ tail is, THERE. This does NOT hold for `ci/scripts/**`'s own operator-run
 shell scripts, most of which set `-uo pipefail` WITHOUT `-e` (confirmed by
 inspection) — but registry-side discovery never applies this refusal at
 all, so the distinction is moot for that side. The invocation before a
-refused `||` tail is never credited
-as reachable, even though the SAME text is still a legitimate REGISTRY
-tuple when the identical pattern shows up in one of THIS class's own
-operator-run scripts (registry discovery does not refuse it — the subject
-existing is what matters there, not whether it swallows its own failure).
-Honest residual: `_FAIL_LOUD_FALLBACK_RE`'s enumerated set may itself be
-incomplete — a genuinely status-propagating shape this set does not name
-would be (safely) REFUSED rather than credited, the fail-closed direction;
-widening that set is a follow-up PR's job the day a real fail-loud tail
-this gate cannot yet recognize shows up in a merge-path workflow.
+refused `||` tail is never credited as reachable, even though the SAME
+text is still a legitimate REGISTRY tuple when the identical pattern shows
+up in one of THIS class's own operator-run scripts (registry discovery
+does not refuse it — the subject existing is what matters there, not
+whether it swallows its own failure).
+
+A bare `name=$?` capture (this repo's own `runpod_gpu_prove.sh`
+convention: capture now, `exit "$rc"` in a LATER statement) is
+DELIBERATELY NOT in `_FAIL_LOUD_FALLBACK_RE` (round-4 audit finding,
+removed after round-3 had added it): a plain shell assignment ALWAYS
+exits 0 regardless of the value it captures, so `cmd || rc=$?` gives the
+COMPOUND statement itself a zero exit status — under GitHub Actions' own
+default `bash -eo pipefail`, a merge-path step whose entire body is
+`run: <tuple> || rc=$?` reads as a SUCCESS even when `<tuple>` genuinely
+failed, exactly the swallow class this rule exists to refuse. This gate
+sees only the single `||`-tail segment in isolation (no cross-segment
+control-flow analysis — a LATER statement checking `$rc` and exiting
+nonzero is invisible to a line-shaped check), so crediting `name=$?` can
+never be justified from the registry-side convention alone: that
+convention is a MATCHED PAIR (capture, then a later `exit "$rc"`), and
+nothing here verifies the second half exists at all — precisely the
+spelling a maintainer would reach for first to silence an UNREACHABLE
+finding, since it is copied verbatim from a script this gate already
+cites approvingly.
+
+Honest residual: `_FAIL_LOUD_FALLBACK_RE`'s CURRENT enumerated set is
+provably status-propagating — every member re-exits/re-returns a value
+that is GUARANTEED nonzero at the point it runs (a literal `N > 0`, or
+`$?`/`$?` read before anything else could change it) — not merely
+"probably fine, empirically fail-closed"; that stronger bar is exactly
+what `name=$?` failed and why it was removed rather than kept as a
+disclosed gap. A genuinely status-propagating shape this set does not yet
+name would still be (safely) REFUSED rather than credited, the fail-
+closed direction; widening this set is a follow-up PR's job, but each
+addition needs the SAME per-member proof `name=$?` was missing — checked
+standalone, never inherited from whatever multi-statement convention it
+was copied out of.
 
 Two related conditional-honesty gaps are DISCLOSED, not modeled (both
 would need meaningfully more machinery than a hermetic text-shape gate
@@ -432,21 +462,33 @@ _KNOWN_WRAPPER_PREFIXES = ("run_cmd",)
 # round-2 form this replaces: `true|:|exit 0|return 0`) silently credits
 # every UNENUMERATED zero-exit shape (`|| echo "..."`, `|| /bin/true`,
 # `|| test 1 = 1`, `|| { echo oops; exit 0; }` all give bash the SAME zero
-# exit status `|| true` does). Matches: a literal nonzero `exit N`/
-# `return N`; `exit $?`/`return $?` (re-propagating the exit code we are
-# GUARANTEED to be holding nonzero, since we are inside the `||` branch
-# precisely because the left-hand command failed); or a bare `name=$?`
-# capture (this repo's own `runpod_gpu_prove.sh` convention — capture now,
-# `exit "$rc"` in a later statement). See `extract_tuples_from_line`'s
-# `refuse_swallowing_fallback` parameter and the module doc's own honest-
-# residual note on this enumerated set's own possible incompleteness.
+# exit status `|| true` does). Matches ONLY a literal nonzero `exit N`/
+# `return N`, or `exit $?`/`return $?` (re-propagating the exit code we
+# are GUARANTEED to be holding nonzero, since we are inside the `||`
+# branch precisely because the left-hand command failed) — every member
+# here is PROVABLY status-propagating at the point it runs.
+#
+# round-4 audit finding, fixed: a bare `name=$?` capture (this repo's own
+# `runpod_gpu_prove.sh` convention — capture now, `exit "$rc"` in a LATER
+# statement) used to sit in this set. A plain shell assignment ALWAYS
+# exits 0 regardless of the value it captures, so `cmd || rc=$?` gives the
+# COMPOUND statement a zero exit status under GitHub Actions' own default
+# `bash -eo pipefail` — a merge-path step whose whole body was
+# `run: <tuple> || rc=$?` credited as reachable with ZERO findings even
+# though `<tuple>` genuinely failed: the exact swallow class this rule
+# exists to refuse, hiding inside the fix itself. This gate sees only the
+# single `||`-tail segment (no cross-segment control-flow analysis — a
+# LATER statement checking `$rc` is invisible to a line-shaped check), so
+# the registry-side convention (a MATCHED PAIR: capture, then a later
+# `exit "$rc"`) can never justify crediting the capture half alone. See
+# `extract_tuples_from_line`'s `refuse_swallowing_fallback` parameter and
+# the module doc's own honest-residual note on widening this set safely.
 _FAIL_LOUD_FALLBACK_RE = re.compile(
     r"^(?:"
     r"exit\s+[1-9][0-9]*"
     r"|exit\s+\$\?"
     r"|return\s+[1-9][0-9]*"
     r"|return\s+\$\?"
-    r"|[A-Za-z_][A-Za-z0-9_]*=\$\?"
     r")\s*(?:#.*)?$"
 )
 
@@ -574,15 +616,20 @@ def extract_tuples_from_line(raw_line: str, refuse_swallowing_fallback: bool = F
     workflow step `run: cargo clippy ...` and a bare shell-script line
     `cargo clippy ...` normalize identically), then quote-aware-splits on
     `;`, then per segment: strips a leading env-assignment/wrapper-prefix
-    chain, drops a trailing ` || <shell fallback>` (e.g. `|| exit 1`,
-    `|| rc=$?` — and, when `refuse_swallowing_fallback` is set, ONLY a
-    fallback matching the KNOWN fail-loud allowlist `_FAIL_LOUD_FALLBACK_RE`
-    is dropped this way; every OTHER fallback tail refuses the whole
-    segment instead, see `_extract_from_segment`) and a trailing
-    line-continuation backslash (belt-and-braces — `_join_line_continuations`
-    already stitches genuine continuations before this function ever sees
-    the line; this only fires on a stray unterminated trailing backslash,
-    e.g. the last physical line of a file), and finally requires
+    chain, drops a trailing ` || <shell fallback>` (e.g. `|| exit 1` — when
+    `refuse_swallowing_fallback` is UNSET, as it is on the registry side,
+    ANY ` || <fallback>` tail is dropped unconditionally, since the SUBJECT
+    tuple existing is what matters there; when `refuse_swallowing_fallback`
+    IS set, as it is on the workflow-corpus side, ONLY a fallback matching
+    the KNOWN fail-loud allowlist `_FAIL_LOUD_FALLBACK_RE` (e.g. `|| exit 1`
+    — but NOT `|| rc=$?`, a plain assignment that always exits 0 regardless
+    of the value it captures, see that constant's own module-doc note) is
+    dropped this way; every OTHER fallback tail refuses the whole segment
+    instead, see `_extract_from_segment`) and a trailing line-continuation
+    backslash (belt-and-braces — `_join_line_continuations` already
+    stitches genuine continuations before this function ever sees the
+    line; this only fires on a stray unterminated trailing backslash, e.g.
+    the last physical line of a file), and finally requires
     `_looks_like_real_invocation`. A `-- -D warnings` or `-- --nocapture`
     `--` marker is legitimate cargo-argument syntax and must survive
     untouched — only ` || `, a bare trailing backslash, and (quote-aware)
@@ -591,9 +638,11 @@ def extract_tuples_from_line(raw_line: str, refuse_swallowing_fallback: bool = F
     NORMALIZED-FORM matching, not byte-for-byte: this function's output —
     used identically on both the registry side (`discover_all_tuples`) and
     the workflow-corpus side (`_extract_tuples_from_text`) — already
-    discards an env-var-assignment/wrapper-prefix chain and a fail-loud
-    `|| ...` tail before comparison. A workflow-side invocation wrapped in a
-    DIFFERENT env prefix than the registered script (e.g. a hypothetical
+    discards an env-var-assignment/wrapper-prefix chain on BOTH sides, and
+    a `|| ...` tail ASYMMETRICALLY (any tail on the registry side, only a
+    known fail-loud one on the workflow side — see above) before
+    comparison. A workflow-side invocation wrapped in a DIFFERENT env
+    prefix than the registered script (e.g. a hypothetical
     `CI=1 cargo clippy ...` twin of a registered `cargo clippy ...` tuple)
     would therefore still credit — intentional (the underlying invocation
     IS the same), but a real consequence of comparing NORMALIZED strings,
@@ -1872,7 +1921,7 @@ jobs:
       - run: cargo clippy -p demo --all-targets --features cuda -- -D warnings || { echo oops; exit 0; }
 """
 
-# --- F2 positive controls: a genuinely fail-loud tail must still credit.
+# --- F2 positive control: a genuinely fail-loud tail must still credit.
 FAIL_LOUD_EXIT_N_WORKFLOW = """name: fixture-fail-loud-exit-n
 on:
   pull_request:
@@ -1884,7 +1933,16 @@ jobs:
       - run: cargo clippy -p demo --all-targets --features cuda -- -D warnings || exit 2
 """
 
-FAIL_LOUD_RC_CAPTURE_WORKFLOW = """name: fixture-fail-loud-rc-capture
+# --- round-4 audit RED mutant (was a FALSE positive control through
+# round-3): a bare `|| rc=$?` capture, with NO later statement in sight,
+# must be REFUSED -- a plain assignment always exits 0, so this compound
+# statement's own exit status is 0 under GitHub Actions' default
+# `bash -eo pipefail` regardless of whether `<tuple>` failed. This is the
+# exact hole round-3 shipped inside its own fix (name=$? was, wrongly, in
+# the fail-loud allowlist) and the exact spelling copied verbatim from
+# runpod_gpu_prove.sh's own capture-then-exit convention -- which only
+# works as a MATCHED PAIR this gate cannot see the second half of.
+RC_CAPTURE_ALONE_SWALLOWS_WORKFLOW = """name: fixture-rc-capture-alone-swallows
 on:
   pull_request:
     branches: [main]
@@ -2115,7 +2173,12 @@ def self_test() -> int:  # noqa: C901 - a flat sequence of independent RED-mutan
     check("`|| test 1 = 1` swallow does not credit", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-swallow-test.yml": SWALLOW_TEST_WORKFLOW}, None, "UNREACHABLE gated tuple")
     check("`|| { echo oops; exit 0; }` swallow does not credit", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-swallow-brace.yml": SWALLOW_BRACE_EXIT0_WORKFLOW}, None, "UNREACHABLE gated tuple")
     check("`|| exit 2` (fail-loud, nonzero) still credits", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-fail-loud-exit-n.yml": FAIL_LOUD_EXIT_N_WORKFLOW}, None, None)
-    check("`|| rc=$?` (fail-loud capture) still credits", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-fail-loud-rc.yml": FAIL_LOUD_RC_CAPTURE_WORKFLOW}, None, None)
+    check(
+        "`|| rc=$?` ALONE (no later `exit \"$rc\"` in sight) swallows and must refuse (round-4 audit — was a false positive control through round-3)",
+        {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-rc-capture-alone.yml": RC_CAPTURE_ALONE_SWALLOWS_WORKFLOW},
+        None,
+        "UNREACHABLE gated tuple",
+    )
 
     # --- B2: an unsupported paths:/paths-ignore: pattern (leading `!`, or
     # `{a,b}`) is REFUSED with a named finding, never silently computed
@@ -2319,9 +2382,11 @@ def self_test() -> int:  # noqa: C901 - a flat sequence of independent RED-mutan
         "continue-on-error:, matrix cmd: indirection conjoined with its own interpolating step's "
         "blocked-state (a credited leg, a soft-failed leg, step-if, no-interpolating-step, and "
         "step-continue-on-error — round-2 audit B1), a workflow-side `||`-tail credited ONLY against a "
-        "known fail-loud allowlist (round-2's `|| true`, plus round-3's unenumerated-swallow mutants — "
-        "`|| echo`, `|| /bin/true`, `|| test`, `|| { ...; exit 0; }` — all refused, `|| exit N`/"
-        "`|| rc=$?` still credited — F2), an unsupported `!`/`{...}` paths pattern refused with a named "
+        "known fail-loud allowlist (round-2's `|| true`, round-3's unenumerated-swallow mutants — "
+        "`|| echo`, `|| /bin/true`, `|| test`, `|| { ...; exit 0; }` — and round-4's `|| rc=$?` ALONE "
+        "(a plain assignment always exits 0, so this was a false positive control through round-3) — "
+        "all refused, `|| exit N`/`|| exit $?`/`|| return N` still credited — F2), an unsupported "
+        "`!`/`{...}` paths pattern refused with a named "
         "finding EAGERLY (order-independent AND tuple-independent — a bang-after-a-matching-pattern "
         "and a bad-pattern workflow carrying no gated tuple at all, both round-3 F1 mutants), a quoted "
         "`\"on\":` key parsing like bare `on:` (B5), comment-only mention, exact-match-never-substring, "

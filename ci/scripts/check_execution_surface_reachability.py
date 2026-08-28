@@ -6,9 +6,11 @@
 `ci/scripts/pod_seed_target.sh` runs a fixed set of CUDA/CUTLASS-toolchain-
 gated `cargo` invocations (its own T1/T1b/T2/T3 tuples) on every fresh pod's
 auto-seed — a leg reds the WHOLE seed the moment its own tuple regresses.
-`ci/scripts/runpod_gpu_prove.sh` (invoked only by `gpu-prove.yml`, itself
+`ci/scripts/runpod_gpu_prove.sh` (invoked by `gpu-prove.yml`, itself
 `workflow_dispatch` / `pull_request: types: [labeled]` / nightly `schedule`
-— NEVER a trigger that fires on every PR-to-main or push-to-main) carries a
+— NEVER a trigger that fires on every PR-to-main or push-to-main; also
+invoked by the reusable `_gpu-prove-gate.yml`, itself only reachable from
+release-tag-scoped callers, see the allowlist's own notes) carries a
 byte-identical twin of several of those same tuples.
 
 `check_ci_guard_wiring.py` (the gate this one supersedes-in-part for this
@@ -27,39 +29,114 @@ behind `gpu-prove.yml`'s label/dispatch/schedule-only trigger — green
 
 Every REGISTERED execution-surface tuple (see Rule 2) must be reachable on
 the merge path: its own exact `cargo <subcommand> ...` invocation text (see
-`extract_tuple` — normalized by dropping a leading `run:`/`cmd:`/`- cmd:`
-YAML-step prefix and any trailing ` || ...` shell fallback, never anything
-else) must appear, CHARACTER FOR CHARACTER, as its own line inside a
-workflow file whose `on:` block genuinely fires on the merge path: a `push`
-whose `branches` includes `main` (or carries no `branches`/`tags` filter at
-all — fires on every ref push, `main` included), or a `pull_request` whose
-`types` is either unset or intersects the GitHub default PR lifecycle types
-(`opened`/`synchronize`/`reopened`) AND whose `branches` is either unset or
-includes `main`. `workflow_dispatch`, `schedule`, and a `pull_request` whose
-`types` is some OTHER set entirely (`gpu-prove.yml`'s `[labeled]`) do NOT
-count — parsed honestly from each workflow's own `on:` block (`parse_on_block`
-below), never assumed from the workflow's file name or its job names.
+`extract_tuples_from_line`) must appear, CHARACTER FOR CHARACTER, inside a
+JOB+STEP of a workflow whose `on:` block genuinely fires on the merge path
+AND whose path filter (if any) is capable of matching the tuple's own
+origin path AND whose job/step is not conditioned off (see the three
+sub-sections below). "Reachable" is a conjunction of three independent
+honesty checks — a tuple satisfying only one or two is still UNREACHABLE:
 
-Comment-only lines do not count (`ci.yml:217` NAMES
-`` `cargo test -p jammi-ai --features cuda,live-gpu-tests gpu_capability`. ``
-inside a `#` comment one line above a DIFFERENT, non-cuda compile-check step
-— satisfying the OLD wiring gate's name-appears-anywhere scan while never
-actually running the cuda-gated tuple. `_drop_comment_lines` strips every
-line whose stripped content starts with `#` before any tuple is extracted
-from a workflow file, matching `check_ci_guard_wiring.py`'s own
-`workflow_run_text` precedent).
+### 1a — trigger honesty
 
-Exact-tuple match, NEVER substring (esc-051's own control, restated as
-mechanism here): a workflow line reading
+A `push` whose `branches` includes `main` (or carries no `branches`/
+`branches-ignore`/`tags`/`tags-ignore` filter at all — fires on every ref
+push, `main` included), or whose `branches-ignore` does NOT list `main`; or
+a `pull_request` whose `types` is either unset or intersects the GitHub
+default PR lifecycle types (`opened`/`synchronize`/`reopened`) AND whose
+`branches` is either unset or includes `main` (or whose `branches-ignore`
+does not list `main`). `workflow_dispatch`, `schedule`, `workflow_call`
+(reachable only via a caller's OWN `uses:`, not evaluated transitively —
+see the residual note below), a `push` scoped ONLY by `tags`/`tags-ignore`
+(no `branches` key at all — GitHub's own documented semantics: such a
+trigger does not fire for ordinary branch pushes), and a `pull_request`
+whose `types` is some OTHER set entirely (`gpu-prove.yml`'s `[labeled]`) do
+NOT count — parsed honestly from each workflow's own `on:` block
+(`parse_on_block` / `merge_path_lanes` below), never assumed from the
+workflow's file name or its job names.
+
+### 1b — path-filter capability
+
+A merge-path trigger's OWN `paths:`/`paths-ignore:` filter (per-trigger,
+not per-workflow — `docs.yml` carries DIFFERENT `paths:` lists under its
+`push:` and `pull_request:` blocks) must be CAPABLE of matching the
+specific tuple's origin path (its `ci/scripts/**` source file) before that
+trigger credits anything: a workflow whose `on:` block otherwise fires on
+the merge path but whose `paths:` allowlist can never match a change under
+`ci/scripts/**` (nine such workflows exist today: `docs.yml`, `image.yml`,
+`image-cuda.yml`, `dep-dag.yml` — whose one `ci/scripts/` entry is the
+single literal file `ci/scripts/gen_dep_dag.py`, never a glob covering the
+whole directory — `devcontainer-image.yml`, `pypi-server.yml`,
+`pypi-server-cuda.yml`, `server-image.yml`) would never actually RUN in
+response to an edit of `pod_seed_target.sh`/`runpod_gpu_prove.sh`, so
+crediting it as reachability is illusory regardless of what text happens to
+sit in its run bodies. `_glob_to_regex` translates a GitHub Actions path
+glob (`**`, `*`, `?`, literal segments) to a regex; `_lane_admits_any_origin`
+requires at least one of the tuple's own recorded origins to match.
+
+### 1c — job/step conditional honesty
+
+Extraction is restricted to `run:`/`cmd:` bodies of jobs and steps that are
+NOT conditioned off the merge path: a job or step carrying ANY `if:` key is
+excluded WHOLESALE (this gate cannot evaluate arbitrary GitHub Actions
+expression syntax, so ANY condition — even one that looks merge-path-safe
+on inspection — is treated fail-closed as potentially non-merge-path,
+matching this class's own "or refuse credit" discipline), and a job or step
+carrying `continue-on-error: true` (or any continue-on-error EXPRESSION
+other than this repo's own documented `${{ matrix.continue_on_error ==
+'true' }}` per-leg indirection, see below) is excluded too — a failure
+there provably does not gate anything. `ci.yml`'s `test-live` job
+(`if: github.ref == 'refs/heads/main'` + `continue-on-error: true`,
+explicitly excluded from `ci-summary`'s own required set by name) is
+exactly this shape: its run body used to be credited by a whole-file text
+scan even though nothing there can ever fail a merge.
+
+This repo's own `Guard` job matrix indirection (`cmd: <script>` fields
+under `strategy: matrix: include:`, interpolated into a single shared
+`run: ${{ matrix.cmd }}` step) is honored structurally: a step whose body
+IS that literal interpolation expression pulls its candidate text from each
+matrix `include:` leg instead, and a leg's own `continue_on_error: "true"`
+field excludes THAT leg only (this repo's own per-leg soft-fail
+convention, e.g. the "doc numbers have producers" leg) — a sibling leg
+without that field still credits normally.
+
+### exact-tuple match, never substring
+
+(esc-051's own control, restated as mechanism here): a workflow line
+reading
 `cargo clippy -p jammi-kernels --all-targets --features cuda,flash-attn -- -D warnings`
 must NOT satisfy the registered tuple
 `cargo clippy -p jammi-kernels --all-targets --features cuda -- -D warnings`
 — the two are extracted as two DIFFERENT strings and compared by set
 membership, never by one containing the other as a substring.
 
+Comment-only lines never count in either direction (registry OR reachable
+corpus): `ci.yml`'s own module doc once named a cuda-gated tuple inside a
+`#` comment one line above a DIFFERENT, non-cuda compile-check step —
+satisfying the OLD wiring gate's name-appears-anywhere scan while never
+actually running the cuda-gated tuple. `_drop_comment_lines` blanks every
+line whose stripped content starts with `#` (never REMOVES it — removing
+would shift every subsequent line's number out from under this gate's own
+origin bookkeeping) before any tuple is extracted.
+
+### disclosed narrowness, not silently assumed
+
+`workflow_call`-only workflows (reusable workflows with no direct trigger
+of their own, e.g. `_gpu-prove-gate.yml`, `_pypi-server.yml`) are never
+evaluated TRANSITIVELY through a caller's `uses:` — a cargo invocation
+living inside a reusable workflow's own body would not be credited even if
+its caller is genuinely merge-path, because nothing in this class currently
+lives there (verified by grep at the time of writing; `_pypi-server.yml`'s
+own `cargo build ... --features ${{ inputs.cargo_features }}` is a
+parameterized value that could never character-match a literal registered
+tuple anyway). Widening to real call-graph resolution is a follow-up PR's
+job if that ever stops being true. Workflow discovery globs BOTH `*.yml`
+AND `*.yaml` (GitHub Actions accepts either extension; this repo uses only
+`.yml` today, so this widening is currently inert but costs nothing to keep
+correct).
+
 ## Rule 2 — registry completeness
 
-The tuple registry is DERIVED, never hand-maintained: `discover_tuples`
+The tuple registry is DERIVED, never hand-maintained: `discover_all_tuples`
 walks every TRACKED file (`git ls-files`, matching `check_ci_guard_wiring.py`
 and `check_doc_numbers_have_producers.py`'s own tracked-only precedent — a
 CI checkout can only ever see what git tracks) under `ci/scripts/` —
@@ -67,19 +144,48 @@ recursively, so a future sibling script (e.g. a nested
 `ci/scripts/pods/pod_seed_target_v2.sh`) cannot silently join the class
 unregistered the way F6/F7 (`check_ci_guard_wiring.py`'s own module doc)
 already had to fix once for a hand-picked, non-recursive glob — and extracts
-every line-shaped `cargo (build|test|clippy|check|run) ...` invocation. A
-tuple is REGISTERED (subject to Rule 1) only if it is GATED: its
-`--features` argument's comma-split token set intersects
-`GATED_FEATURE_TOKENS = {"cuda", "flash-attn"}` — the two features that pull
-a real CUDA/CUTLASS toolchain (`dep:bindgen_cuda` / vendored CUTLASS,
-`crates/jammi-kernels/build.rs`, `ci.yml`'s own "CANNOT be covered here"
-comment on the hermetic runner) this repo's ordinary hermetic CI runners do
-not carry. A default-feature invocation (e.g.
-`cargo test -p jammi-kernels --no-run`, no `--features` at all) is not part
-of THIS class — it needs no special hardware/toolchain and is already
-exercised, non-exactly but functionally, by the ordinary workspace test job;
-registering it here would be a different, broader gate than the one the
-retrospective asked for.
+every line-shaped `cargo (build|test|clippy|check|run) ...` invocation,
+after (a) blanking full-line comments, (b) joining a physical line ending
+in a bare trailing backslash with its continuation (so a `--features`
+argument that lands on the SECOND line of a wrapped invocation is still
+visible to gating), (c) quote-aware splitting on `;` (so a compound
+`echo ...; cargo build ...; echo ...` shell statement is examined
+per-statement, not rejected outright because the LINE doesn't start with
+`cargo`), and (d) stripping a leading chain of shell env-var assignments
+(`FOO=bar `, `FOO="$BAR" `) and this repo's own known wrapper functions
+(`run_cmd`) that legitimately precede a real invocation in these scripts.
+`_looks_like_real_invocation` then requires the token immediately after the
+subcommand to be either absent (a bare `cargo build`) or flag/variable-
+shaped (`-`/`$`-prefixed) — the discriminator that keeps a PROSE sentence
+merely starting with the words "cargo build" (a docstring explaining WHY a
+suite needs a real cargo toolchain, not a script line that runs one) from
+being registered as if it were code. This is a heuristic, not a parser: a
+hypothetical positional-argument cargo invocation (none exists in this
+class today) would be misjudged as prose, and a bash/Python STRING-LITERAL
+assignment is excluded only because its own syntax (`NAME=value` needs no
+space before `=` in bash; `name = value` needs one in Python, and a
+quoted-string assignment with nothing trailing it fails the "assignment
+must be followed by more content on the same physical line" shape this
+gate's env-prefix stripper requires) happens not to overlap with a bare
+`cargo ...` line start — not a general string-literal-aware scan. Disclosed
+residual, not silently assumed away.
+
+A tuple is REGISTERED (subject to Rule 1) only if it is GATED: the UNION of
+every `--features`/`-F` argument's comma-split token set (a line may carry
+more than one `--features` flag) intersects `GATED_FEATURE_TOKENS =
+{"cuda", "flash-attn"}`, OR any token is itself a NAMESPACED flash-attn
+forward (`<crate>/flash-attn`, e.g. `jammi-encoders/flash-attn` — the same
+feature-forwarding shape `ci.yml`'s own flash-attn-closure guard polices,
+just spelled with an explicit crate prefix rather than the bare token) —
+the two features that pull a real CUDA/CUTLASS toolchain
+(`dep:bindgen_cuda` / vendored CUTLASS, `crates/jammi-kernels/build.rs`,
+`ci.yml`'s own "CANNOT be covered here" comment on the hermetic runner)
+this repo's ordinary hermetic CI runners do not carry. A default-feature
+invocation (e.g. `cargo test -p jammi-kernels --no-run`, no `--features` at
+all) is not part of THIS class — it needs no special hardware/toolchain and
+is already exercised, non-exactly but functionally, by the ordinary
+workspace test job; registering it here would be a different, broader gate
+than the one the retrospective asked for.
 
 `ci/scripts/` only, deliberately (documented, not silently narrow, the
 SAME "never widen inside another rule's fix" discipline
@@ -93,44 +199,79 @@ needed two follow-up rounds (F6, F7) to stop hand-picking roots.
 Two paths under `ci/scripts/` are excluded from discovery
 (`_DISCOVERY_EXCLUDED_RELPATHS`): this gate's OWN source file (its
 `--self-test` fixtures are `cargo ...`-shaped string literals, not real
-invocations) and its own allowlist file (whose rows are themselves
-`cargo ...`-prefixed lines). Without this exclusion the gate would register
-tuples out of its own fixture/waiver data and immediately flag them
-UNREACHABLE against itself — a self-inflicted false positive, not a real
-finding about the tree.
+invocations — `_looks_like_real_invocation`'s prose discriminator does NOT
+help here, since a copied-verbatim real command line IS syntactically
+indistinguishable from a real one) and its own allowlist file (whose rows
+are themselves `cargo ...`-prefixed lines). Without this exclusion the gate
+would register tuples out of its own fixture/waiver data and immediately
+flag them UNREACHABLE against itself — a self-inflicted false positive,
+never a real finding about the tree. `ci/scripts/check_execution_surface_reachability.py`'s
+own entry is ALSO derived from `Path(__file__)` at runtime (belt-and-braces
+— correct even if this file is ever renamed and someone forgets to update
+the hand-written string), not solely the hand-written path constant.
 
-## Rule 3 — waiver rot
+Other files under `ci/scripts/` that mention `cargo ...` text for
+TESTING/ASSERTING purposes rather than running it (`test_pod_substrate.sh`'s
+own T3-lockstep fixture variable `X_T3_EXPECTED='cargo clippy ...'`, or a
+Python `old = "cargo clippy ...\n"` string inside an embedded heredoc) are
+NOT hand-excluded the way this gate's own two files are — they are excluded
+BY CONSTRUCTION of `_looks_like_real_invocation`'s bash/Python assignment-
+shape discrimination above, a narrower and more honest mechanism than a
+growing hand-list would be, and (per this section's own residual note) not
+airtight in general.
+
+## Rule 3 — waiver rot (and its mirror: dead waivers)
 
 `EXECUTION_SURFACE_ALLOWLIST_PATH` carries one `<tuple text>\t<reason>` row
 (TAB-separated, never ` | ` — several real tuples in this class pipe their
 own output through `tee`, e.g. `... 2>&1 | tee "$L1"`, so a `|`-based
 delimiter would collide with the tuple's OWN text; no cargo invocation in
 this repo's `ci/scripts/` contains a literal tab) per registered-but-off-
-merge-path tuple. A row's PREDICATE is mechanical and re-checked every run:
-the row's tuple text must still be a member of the CURRENT registry (Rule
-2's own discovery, re-run fresh every invocation) — a row naming a tuple
-whose script was renamed, deleted, or whose exact command line changed is
-FAILURE (rot), never a silent no-op skip. A row missing a non-empty reason
-is also a failure.
+merge-path tuple.
+
+ROT: a row's PREDICATE is mechanical and re-checked every run — the row's
+tuple text must still be a member of the CURRENT (full, gated-or-not)
+registry. `discover_all_tuples` returns the FULL registry, not just the
+gated subset, because rot is about the SUBJECT's continued EXISTENCE
+(has the exact command line been renamed, deleted, or edited away?), which
+is orthogonal to whether it is currently gated. A row naming a tuple that
+no longer exists anywhere in the registry is FAILURE (rot), never a silent
+no-op skip. A row missing a non-empty reason is also a failure.
+
+DEAD WAIVER (the mirror direction, checked independently — NOT the same
+condition as rot, and NOT derived from `discover_all_tuples`'s scope): a
+row whose tuple text is still gated AND has become REACHABLE on the merge
+path (someone wired an exact-matching invocation into a qualifying
+job/step) is not rot — its subject is very much alive — but the waiver
+itself is now unnecessary. Flagged separately so the allowlist cannot
+silently accumulate rows nobody needs anymore, mirroring the only-shrinks
+discipline `check_doc_numbers_have_producers.py`'s own allowlist already
+enforces for a different artifact class.
 
 ## Honest residual — CUDA tuples force a written choice
 
 Every tuple this class registers needs a REAL CUDA/CUTLASS toolchain to run
-meaningfully; the only lane that has one (`gpu-prove.yml`, driving
-`runpod_gpu_prove.sh` on a rented RunPod A100) is, by this repo's own design
-(module doc, `gpu-prove.yml`), never a merge-path trigger — GPU minutes cost
-money and A100 capacity is intermittent. That leaves exactly two honest
-choices per tuple, never a silent third:
+meaningfully; the only lane that has one (`gpu-prove.yml` and the reusable
+`_gpu-prove-gate.yml` it shares its `runpod_gpu_prove.sh` driver-script with
+— see the allowlist's own notes for the full invocation chain) is, by this
+repo's own design, never a merge-path trigger for this class's own scripts.
+That leaves exactly two honest choices per tuple, never a silent third:
 
-  (a) `gpu-prove.yml` is promoted to a REQUIRED merge-path check. This is a
-      GitHub branch-protection ruleset setting, not committed workflow YAML
-      — nothing in this checkout can mechanically prove or disprove it, so
-      this gate can never credit it automatically. `GPU_PROVE_PROMOTED_TO_REQUIRED`
-      below is the single named constant a human flips (with a comment
-      explaining how the promotion was verified) the day that changes; until
-      then it stays `False` and every gated tuple falls through to choice (b).
+  (a) `gpu-prove.yml` (or the release-lane chain through
+      `_gpu-prove-gate.yml`) is promoted to a REQUIRED merge-path check.
+      This is a GitHub branch-protection ruleset setting, not committed
+      workflow YAML — nothing in this checkout can mechanically prove or
+      disprove it, so this gate can never credit it automatically.
+      `GPU_PROVE_PROMOTED_TO_REQUIRED` below is the single named constant a
+      human flips (with a comment explaining how the promotion was
+      verified) the day that changes; until then it stays `False` and
+      every gated tuple falls through to choice (b).
   (b) The tuple owns an explicit, reasoned row in
-      `EXECUTION_SURFACE_ALLOWLIST_PATH`, subject to Rule 3's rot check.
+      `EXECUTION_SURFACE_ALLOWLIST_PATH`, subject to Rule 3's rot (and
+      dead-waiver) checks — and that reason must be TRUE at HEAD, verified
+      by re-derivable content (grep-confirmable claims), never a bare line
+      number, which rots the moment any PR (including THIS gate's own)
+      touches an unrelated part of the cited file.
 
 There is no code path that lets a registered-but-unreachable tuple pass
 silently: Rule 1 fails it unless (a) or (b) holds, and (b) is itself
@@ -162,14 +303,13 @@ EXECUTION_SURFACE_ALLOWLIST_REL = "ci/scripts/execution_surface_reachability_all
 EXECUTION_SURFACE_ALLOWLIST_PATH = REPO_ROOT / EXECUTION_SURFACE_ALLOWLIST_REL
 
 # This gate's OWN two files, excluded from `discover_all_tuples`'s walk of
-# `ci/scripts/**` even though both live under it: this module's own source
-# carries `cargo ...`-SHAPED string-literal fixtures for its `--self-test`
-# (see `GATED_SCRIPT` and friends below), and the allowlist file's own rows
-# are `<tuple text>\t<reason>` lines that themselves start with `cargo` —
-# both would otherwise be swept into the "real" registry as if they were
-# genuine execution-surface scripts, which they are not.
+# `ci/scripts/**` even though both live under it — see the module doc's
+# Rule 2 section. `Path(__file__).name` makes the FIRST entry self-deriving
+# (correct even under a rename this hand-written string forgets to track);
+# the allowlist path is already a single named constant, not a growing
+# hand-list.
 _DISCOVERY_EXCLUDED_RELPATHS = {
-    "ci/scripts/check_execution_surface_reachability.py",
+    f"{SCRIPTS_ROOT}{Path(__file__).name}",
     EXECUTION_SURFACE_ALLOWLIST_REL,
 }
 
@@ -180,64 +320,216 @@ GATED_FEATURE_TOKENS = {"cuda", "flash-attn"}
 CARGO_SUBCOMMANDS = ("build", "test", "clippy", "check", "run")
 DEFAULT_PR_LIFECYCLE_TYPES = {"opened", "synchronize", "reopened"}
 
-_CARGO_RE = re.compile(r"^(cargo\s+(?:" + "|".join(CARGO_SUBCOMMANDS) + r")\b.*)$")
+# Boundary is a lookahead (whitespace or end-of-string), NOT `\b`: `\b` only
+# checks word-vs-non-word, so `cargo build/run ...` (a real PROSE sentence
+# found in this repo, not a `/`-joined invocation) would satisfy `\b`
+# between "d" and "/" even though there is no actual whitespace there —
+# `(?=\s|$)` requires the subcommand to be a genuine standalone token.
+_CARGO_HEAD_RE = re.compile(r"^cargo\s+(?:" + "|".join(CARGO_SUBCOMMANDS) + r")(?=\s|$)")
 _YAML_STEP_PREFIX_RE = re.compile(r"^(?:-\s*)?(?:run|cmd):\s*(.*)$")
-_FEATURES_RE = re.compile(r"--features[=\s]+(\S+)")
+_FEATURES_RE = re.compile(r"(?:--features|-F)[=\s]+(\S+)")
+
+# A bash env-var assignment (`FOO=bar `, `FOO="$BAR" `, `FOO='' `) that
+# legitimately precedes a real invocation in this repo's scripts — matched
+# ONLY when followed by more content on the SAME line (an assignment with
+# nothing trailing it, e.g. `X_T3_EXPECTED='cargo clippy ...'` sitting
+# alone as its own statement, must NOT be treated as an env-prefixed
+# invocation — see the module doc's Rule 2 residual note).
+_ENV_ASSIGNMENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|\'[^\']*\'|\S*)\s+')
+# This repo's own known wrapper function that legitimately precedes a real
+# cargo invocation (`finetune_ab.sh`/`stacked_sweep.sh`'s own `run_cmd()`
+# provenance-logging wrapper). A hand-list, same class of "documented, not
+# silently narrow" scoping Rule 2's `ci/scripts/`-only root already states —
+# a future new wrapper needs a follow-up PR to widen this tuple, exactly
+# like every other narrow-by-design constant in this file.
+_KNOWN_WRAPPER_PREFIXES = ("run_cmd",)
 
 
 # --------------------------------------------------------------------------- #
 # tuple extraction — shared by registry discovery (ci/scripts/**) and
-# workflow-corpus extraction (.github/workflows/*.yml); the SAME function so
-# a registered tuple and a workflow's own invocation are compared as
-# identically-normalized strings, never two different normalizations that
-# could silently agree or disagree by accident.
+# workflow job/step-body extraction (.github/workflows/*.yml[a]); the SAME
+# pipeline so a registered tuple and a workflow's own invocation are
+# compared as identically-normalized strings, never two different
+# normalizations that could silently agree or disagree by accident.
 # --------------------------------------------------------------------------- #
-def extract_tuple(raw_line: str) -> str | None:
-    """Return the normalized `cargo ...` invocation a line contains, or None.
+def _looks_like_real_invocation(head: str) -> bool:
+    """See the module doc's Rule 2 section: distinguishes a genuine
+    `cargo <subcommand> <flags...>` invocation from PROSE that merely
+    starts with the same words. Every real invocation in this repo's own
+    scripts/workflows has either NOTHING after the subcommand (a bare
+    `cargo build`) or a flag/variable-shaped first token (`-`/`$`-prefixed,
+    the latter for a shell-variable-held flag like
+    `cargo build $FLASH_BUILD_FLAG -p ...`); prose's first token is an
+    ordinary English word. A heuristic, not a parser — disclosed in the
+    module doc, not silently assumed airtight.
+    """
+    m = _CARGO_HEAD_RE.match(head)
+    if not m:
+        return False
+    rest = head[m.end() :].strip()
+    if not rest:
+        return True
+    first_token = rest.split(None, 1)[0]
+    return first_token.startswith("-") or first_token.startswith("$")
 
-    Drops a leading `run:`/`cmd:`/`- cmd:` YAML-step prefix (so a single-line
+
+def _strip_env_and_wrapper_prefixes(segment: str) -> str:
+    changed = True
+    guard = 0
+    while changed and guard < 8:
+        changed = False
+        guard += 1
+        m = _ENV_ASSIGNMENT_RE.match(segment)
+        if m:
+            segment = segment[m.end() :]
+            changed = True
+            continue
+        for w in _KNOWN_WRAPPER_PREFIXES:
+            if segment == w:
+                segment = ""
+                changed = True
+                break
+            if segment.startswith(w + " "):
+                segment = segment[len(w) :].lstrip()
+                changed = True
+                break
+    return segment
+
+
+def _split_on_semicolons(line: str) -> list[str]:
+    """Quote-aware `;` split — a compound shell statement
+    (`echo "..."; cargo build ...; echo "..."`) is examined per-statement.
+    Tracks single/double-quote state so a `;` INSIDE a quoted string is
+    never treated as a statement boundary. Does not handle backslash-
+    escaped quotes within a string (`\\"`) — no real line in this class
+    needs that, and it is a strictly more permissive miss (fewer splits,
+    never a false EXTRA one) than the naive `str.split(";")` this replaced.
+    """
+    segments: list[str] = []
+    current: list[str] = []
+    in_single = False
+    in_double = False
+    for c in line:
+        if c == "'" and not in_double:
+            in_single = not in_single
+            current.append(c)
+        elif c == '"' and not in_single:
+            in_double = not in_double
+            current.append(c)
+        elif c == ";" and not in_single and not in_double:
+            segments.append("".join(current))
+            current = []
+        else:
+            current.append(c)
+    segments.append("".join(current))
+    return [s.strip() for s in segments]
+
+
+def _extract_from_segment(segment: str) -> str | None:
+    segment = segment.strip()
+    if not segment:
+        return None
+    segment = _strip_env_and_wrapper_prefixes(segment)
+    head = re.split(r"\s\|\|\s", segment, maxsplit=1)[0].strip()
+    if head.endswith("\\"):
+        head = head[:-1].rstrip()
+    if not _looks_like_real_invocation(head):
+        return None
+    return head
+
+
+def extract_tuples_from_line(raw_line: str) -> list[str]:
+    """Every normalized `cargo ...` invocation a (continuation-joined,
+    comment-free) logical line contains — zero, one, or more (a `;`-chained
+    compound statement can carry more than one). Drops a leading
+    `run:`/`cmd:`/`- cmd:` YAML-step prefix first (so a single-line
     workflow step `run: cargo clippy ...` and a bare shell-script line
-    `cargo clippy ...` normalize identically), then a trailing
-    ` || <shell fallback>` (e.g. `|| exit 1`, `|| rc=$?`) and a trailing
-    line-continuation backslash (a trailing "\\"; a genuine multi-line
-    invocation still normalizes to its FIRST line only — a distinct, real
-    tuple text, never stitched across lines) — NEVER anything else: a
-    `-- -D warnings` or `-- --nocapture` `--` marker is legitimate
-    cargo-argument syntax and must survive untouched, only ` || ` (shell-or,
-    always space-delimited in this repo's scripts) and a bare trailing
-    backslash are the boundaries.
+    `cargo clippy ...` normalize identically), then quote-aware-splits on
+    `;`, then per segment: strips a leading env-assignment/wrapper-prefix
+    chain, drops a trailing ` || <shell fallback>` (e.g. `|| exit 1`,
+    `|| rc=$?`) and a trailing line-continuation backslash (belt-and-braces
+    — `_join_line_continuations` already stitches genuine continuations
+    before this function ever sees the line; this only fires on a stray
+    unterminated trailing backslash, e.g. the last physical line of a
+    file), and finally requires `_looks_like_real_invocation`. A `--
+    -D warnings` or `-- --nocapture` `--` marker is legitimate cargo-
+    argument syntax and must survive untouched — only ` || `, a bare
+    trailing backslash, and (quote-aware) `;` are ever treated as
+    boundaries.
     """
     stripped = raw_line.strip()
     if not stripped or stripped.startswith("#"):
-        return None
+        return []
     m_prefix = _YAML_STEP_PREFIX_RE.match(stripped)
     if m_prefix:
         stripped = m_prefix.group(1).strip()
     if not stripped or stripped in ("|", ">", "|-", ">-", "|+", ">+"):
-        return None
-    head = re.split(r"\s\|\|\s", stripped, maxsplit=1)[0].strip()
-    if head.endswith("\\"):
-        head = head[:-1].rstrip()
-    m = _CARGO_RE.match(head)
-    if not m:
-        return None
-    return m.group(1).strip()
+        return []
+    found: list[str] = []
+    for segment in _split_on_semicolons(stripped):
+        t = _extract_from_segment(segment)
+        if t is not None:
+            found.append(t)
+    return found
 
 
 def is_gated(tuple_text: str) -> bool:
-    m = _FEATURES_RE.search(tuple_text)
-    if not m:
+    tokens: set[str] = set()
+    for m in _FEATURES_RE.finditer(tuple_text):
+        tokens.update(t.strip() for t in m.group(1).split(","))
+    if not tokens:
         return False
-    tokens = {t.strip() for t in m.group(1).split(",")}
-    return bool(tokens & GATED_FEATURE_TOKENS)
+    if tokens & GATED_FEATURE_TOKENS:
+        return True
+    # Namespaced flash-attn forward (`<crate>/flash-attn`) — the same
+    # feature-forwarding shape `check_flash_attn_closure.py` polices,
+    # spelled with an explicit crate prefix instead of the bare token.
+    return any(t == "flash-attn" or t.endswith("/flash-attn") for t in tokens)
 
 
-def extract_all_tuples(text: str) -> set[str]:
+def _drop_comment_lines(text: str) -> str:
+    """Blank (never REMOVE) a full-line comment — removing would shift
+    every subsequent physical line number out from under this gate's own
+    origin bookkeeping and `_join_line_continuations`'s starting-lineno
+    tracking."""
+    return "\n".join("" if line.strip().startswith("#") else line for line in text.splitlines())
+
+
+def _join_line_continuations(text: str) -> list[tuple[int, str]]:
+    """Return `(starting_lineno, logical_line)` pairs — a physical line
+    ending in a bare trailing backslash is joined with the following
+    physical line(s) into ONE logical line (`stacked_sweep.sh:321-322`'s
+    own shape: the `cargo build` token is on the first physical line, its
+    `--features` argument on the second), so a `--features` argument
+    landing on a continuation line is visible to gating.
+    `starting_lineno` is the 1-indexed physical line the logical line
+    STARTS on, used for origin reporting.
+    """
+    physical = text.splitlines()
+    out: list[tuple[int, str]] = []
+    i = 0
+    n = len(physical)
+    while i < n:
+        start_lineno = i + 1
+        parts = [physical[i]]
+        while parts[-1].rstrip().endswith("\\") and i + 1 < n:
+            stripped_line = parts[-1].rstrip()
+            parts[-1] = stripped_line[:-1].rstrip()
+            i += 1
+            parts.append(physical[i])
+        out.append((start_lineno, " ".join(p.strip() for p in parts)))
+        i += 1
+    return out
+
+
+def _extract_tuples_from_text(text: str) -> set[str]:
+    """The reachable-corpus extraction pipeline: blank comments, join
+    continuations, extract per logical line. Origins are not tracked here
+    (only a set of tuple texts) — callers that need origins use
+    `discover_all_tuples`'s own line-numbered walk instead."""
     found: set[str] = set()
-    for line in text.splitlines():
-        t = extract_tuple(line)
-        if t is not None:
-            found.add(t)
+    for _lineno, logical_line in _join_line_continuations(_drop_comment_lines(text)):
+        found.update(extract_tuples_from_line(logical_line))
     return found
 
 
@@ -263,10 +555,14 @@ def _tracked_files(repo_root: Path) -> list[str]:
 
 def discover_all_tuples(repo_root: Path) -> dict[str, TupleRecord]:
     """Every `cargo ...` invocation (gated or not) found under `ci/scripts/`
-    in a TRACKED file, keyed by its normalized text. Rule 3's rot check reads
-    this (not just the gated subset) so a row can also be judged stale if its
-    tuple text still exists but is no longer gated (a feature was removed) —
-    still "no longer a member of the registry" from Rule 1's point of view.
+    in a TRACKED file, keyed by its normalized text — the FULL registry,
+    not just the gated subset. Rule 3's rot check reads this full registry
+    because rot is about the SUBJECT's continued EXISTENCE (was the exact
+    command line renamed/deleted/edited away?), which is orthogonal to
+    whether it is currently gated; the SEPARATE dead-waiver check (see
+    `run_gate`) is the opposite direction — a still-gated, still-existing
+    tuple that has become reachable — and is not derived from this
+    function's scope at all.
     """
     registry: dict[str, TupleRecord] = {}
     for rel in _tracked_files(repo_root):
@@ -279,12 +575,10 @@ def discover_all_tuples(repo_root: Path) -> dict[str, TupleRecord]:
             text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
-        for lineno, line in enumerate(text.splitlines(), start=1):
-            t = extract_tuple(line)
-            if t is None:
-                continue
-            rec = registry.setdefault(t, TupleRecord(text=t))
-            rec.origins.append(f"{rel}:{lineno}")
+        for lineno, logical_line in _join_line_continuations(_drop_comment_lines(text)):
+            for t in extract_tuples_from_line(logical_line):
+                rec = registry.setdefault(t, TupleRecord(text=t))
+                rec.origins.append(f"{rel}:{lineno}")
     return registry
 
 
@@ -293,20 +587,23 @@ def gated_tuples(registry: dict[str, TupleRecord]) -> dict[str, TupleRecord]:
 
 
 # --------------------------------------------------------------------------- #
-# `on:` trigger parsing (Rule 1) — a deliberately minimal, targeted reader:
-# not a general YAML parser, only enough structure to answer "does this
-# workflow's `on:` block fire on the merge path" for the shapes this repo's
-# own workflows actually use (plain block-style `push`/`pull_request` with
-# `branches:`/`types:`/`tags:` as either an inline `[a, b]` list or a `- x`
-# block list). A workflow using flow-style `on: [push, pull_request]` (none
-# does today) would need a widening, exactly the same documented-narrow
-# discipline Rule 2's `ci/scripts/`-only scope above states.
+# generic indentation-based block reader — shared by `on:`-block parsing,
+# `jobs:`-block parsing, and step/matrix-leg list-item parsing. Not a
+# general YAML parser: only enough structure to answer the specific
+# questions Rule 1 asks, for the shapes this repo's own workflows actually
+# use (plain block-style mappings and `- ` block lists; no flow-style
+# `{a: b}`/`[a, b]` mapping/list syntax for `on:`/`jobs:`/`steps:`
+# themselves — inline `[a, b]` IS supported for leaf list VALUES like
+# `branches: [main]`, which this repo uses throughout).
 # --------------------------------------------------------------------------- #
-def _extract_on_block(text: str) -> str:
+def _extract_top_level_key_block(text: str, key: str) -> str:
+    """The raw body text following a top-level (column-0) `<key>:` line, up
+    to (not including) the next column-0, non-comment, non-blank line."""
     lines = text.splitlines()
     start = None
+    pattern = re.compile(rf"^{re.escape(key)}:\s*(#.*)?$")
     for i, line in enumerate(lines):
-        if re.match(r"^on:\s*(#.*)?$", line):
+        if pattern.match(line):
             start = i
             break
     if start is None:
@@ -327,6 +624,128 @@ def _first_indent(lines: list[str]) -> int | None:
     return None
 
 
+def _split_block_entries(block: str) -> dict[str, str]:
+    """Split a block-mapping's text into `{key: body_text}` at the block's
+    OWN first-observed indentation level. `key` allows hyphens/digits/dots
+    (job ids like `dep-direction`, keys like `continue-on-error`)."""
+    lines = block.splitlines()
+    base_indent = _first_indent(lines)
+    if base_indent is None:
+        return {}
+    entries: dict[str, list[str]] = {}
+    current_key: str | None = None
+    for line in lines:
+        if not line.strip() or line.lstrip().startswith("#"):
+            if current_key is not None:
+                entries[current_key].append(line)
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent == base_indent:
+            m = re.match(r"^\s*([A-Za-z0-9_.-]+):\s*(.*)$", line)
+            if not m:
+                current_key = None
+                continue
+            current_key = m.group(1)
+            entries[current_key] = [line]
+        elif indent > base_indent and current_key is not None:
+            entries[current_key].append(line)
+        else:
+            current_key = None
+    return {k: "\n".join(v) for k, v in entries.items()}
+
+
+def _sub_entries(entries: dict[str, str], key: str) -> dict[str, str]:
+    """`entries[key]`'s OWN body (dropping the `key:` line itself),
+    re-split into its own `{key: body}` map — nested-block traversal
+    (`strategy:` -> `matrix:` -> `include:`)."""
+    body = entries.get(key)
+    if body is None:
+        return {}
+    lines = body.splitlines()
+    return _split_block_entries("\n".join(lines[1:]))
+
+
+def _list_key_body(entries: dict[str, str], key: str) -> str:
+    """The raw list-items text following `entries[key]`'s own `key:` line
+    (dropping that line) — used for `steps:`/`include:`, always a block
+    list in this repo's workflows, never inline."""
+    body = entries.get(key)
+    if body is None:
+        return ""
+    lines = body.splitlines()
+    return "\n".join(lines[1:])
+
+
+def _entry_first_line_value(entries: dict[str, str], key: str) -> str | None:
+    body = entries.get(key)
+    if body is None:
+        return None
+    lines = body.splitlines()
+    if not lines:
+        return None
+    m = re.match(r"^\s*[A-Za-z0-9_.-]+:\s*(.*)$", lines[0])
+    if not m:
+        return None
+    val = m.group(1).strip()
+    return val or None
+
+
+def _step_body_text(entries: dict[str, str], key: str) -> str | None:
+    """The FULL value text of a (possibly multi-line, `run: |`-block-
+    scalar-shaped) entry, with the `key:` prefix stripped from its first
+    line only — suitable for feeding straight into
+    `_extract_tuples_from_text`."""
+    body = entries.get(key)
+    if body is None:
+        return None
+    lines = body.splitlines()
+    if not lines:
+        return None
+    m = re.match(r"^\s*[A-Za-z0-9_.-]+:\s*(.*)$", lines[0])
+    if not m:
+        return None
+    first_val = m.group(1)
+    return "\n".join([first_val] + lines[1:])
+
+
+def _split_step_items(list_body: str) -> list[str]:
+    """Split a `- ` block-list's raw text into one string per list item
+    (each item's OWN `- ` marker replaced by two spaces, so its first
+    line's keys align with its continuation lines the same way
+    `_split_block_entries` expects). Shared by ordinary `steps:` lists and
+    `strategy: matrix: include:` legs — structurally identical shapes."""
+    lines = list_body.splitlines()
+    marker_indent = None
+    for line in lines:
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s.startswith("- "):
+            marker_indent = len(line) - len(line.lstrip())
+        break
+    if marker_indent is None:
+        return []
+    items: list[list[str]] = []
+    current: list[str] | None = None
+    for line in lines:
+        if not line.strip():
+            if current is not None:
+                current.append(line)
+            continue
+        indent = len(line) - len(line.lstrip())
+        stripped = line.lstrip()
+        if indent == marker_indent and stripped.startswith("- "):
+            first = line[:marker_indent] + "  " + stripped[2:]
+            current = [first]
+            items.append(current)
+        elif current is not None:
+            current.append(line)
+    return ["\n".join(item) for item in items]
+
+
+# --------------------------------------------------------------------------- #
+# `on:` trigger parsing (Rule 1a/1b)
+# --------------------------------------------------------------------------- #
 def _extract_list_field(body: str, field_name: str) -> list[str] | None:
     lines = body.splitlines()
     for i, line in enumerate(lines):
@@ -348,6 +767,13 @@ def _extract_list_field(body: str, field_name: str) -> list[str] | None:
             l2_indent = len(l2) - len(l2.lstrip())
             if l2_indent <= field_indent:
                 break
+            # A comment line NESTED inside a block list (e.g. docs.yml's
+            # own `paths:` list carries a `# the READMEs ...` line between
+            # two `- "..."` entries) must be SKIPPED, never treated as the
+            # end of the list — the bug this repo's OWN docs.yml paths list
+            # would otherwise silently truncate.
+            if l2.lstrip().startswith("#"):
+                continue
             m2 = re.match(r"^\s*-\s*(.+)$", l2)
             if not m2:
                 break
@@ -357,87 +783,244 @@ def _extract_list_field(body: str, field_name: str) -> list[str] | None:
 
 
 def parse_on_block(text: str) -> dict[str, dict[str, list[str] | None]]:
-    block = _extract_on_block(text)
-    lines = block.splitlines()
-    base_indent = _first_indent(lines)
-    if base_indent is None:
-        return {}
-    entries: dict[str, list[str]] = {}
-    current_key: str | None = None
-    for line in lines:
-        if not line.strip() or line.lstrip().startswith("#"):
-            if current_key is not None:
-                entries[current_key].append(line)
-            continue
-        indent = len(line) - len(line.lstrip())
-        if indent == base_indent:
-            m = re.match(r"^\s*([A-Za-z_]+):\s*(.*)$", line)
-            if not m:
-                current_key = None
-                continue
-            current_key = m.group(1)
-            entries[current_key] = [line]
-        elif indent > base_indent and current_key is not None:
-            entries[current_key].append(line)
-        else:
-            current_key = None
+    block = _extract_top_level_key_block(text, "on")
+    entries = _split_block_entries(block)
     return {
         key: {
-            "branches": _extract_list_field(body_text, "branches"),
-            "types": _extract_list_field(body_text, "types"),
-            "tags": _extract_list_field(body_text, "tags"),
+            field: _extract_list_field(body_text, field)
+            for field in ("branches", "branches-ignore", "types", "tags", "tags-ignore", "paths", "paths-ignore")
         }
-        for key, body_lines in entries.items()
-        for body_text in ["\n".join(body_lines)]
+        for key, body_text in entries.items()
     }
 
 
-def is_merge_path(on_dict: dict[str, dict[str, list[str] | None]]) -> tuple[bool, str]:
+def _push_admits_main(push: dict[str, list[str] | None]) -> bool:
+    branches = push.get("branches")
+    branches_ignore = push.get("branches-ignore")
+    tags = push.get("tags")
+    tags_ignore = push.get("tags-ignore")
+    if branches is not None:
+        return "main" in branches
+    if branches_ignore is not None:
+        return "main" not in branches_ignore
+    if tags is not None or tags_ignore is not None:
+        # A push trigger scoped ONLY by tags/tags-ignore (no branches key
+        # at all) does not fire for ordinary branch pushes at all — GitHub's
+        # own documented semantics; `release-binaries.yml`/`crates.yml`/
+        # `npm.yml`'s own shape.
+        return False
+    return True  # no branches/branches-ignore/tags/tags-ignore filter at all
+
+
+def _pr_admits_main(pr: dict[str, list[str] | None]) -> bool:
+    types = pr.get("types")
+    types_ok = types is None or bool(set(types) & DEFAULT_PR_LIFECYCLE_TYPES)
+    if not types_ok:
+        return False
+    branches = pr.get("branches")
+    branches_ignore = pr.get("branches-ignore")
+    if branches is not None:
+        return "main" in branches
+    if branches_ignore is not None:
+        return "main" not in branches_ignore
+    return True
+
+
+@dataclass
+class PathLane:
+    paths: list[str] | None
+    paths_ignore: list[str] | None
+
+
+def merge_path_lanes(on_dict: dict[str, dict[str, list[str] | None]]) -> list[PathLane]:
+    """Every qualifying (Rule 1a) trigger on this workflow, each carrying
+    its OWN `paths:`/`paths-ignore:` filter (Rule 1b reads these
+    per-lane — `push:` and `pull_request:` can and do carry DIFFERENT
+    `paths:` lists in this repo, e.g. `docs.yml`)."""
+    lanes: list[PathLane] = []
     push = on_dict.get("push")
-    if push is not None:
-        branches = push.get("branches")
-        tags = push.get("tags")
-        if branches and "main" in branches:
-            return True, "push: branches include main"
-        if branches is None and tags is None:
-            return True, "push: no branches/tags filter (fires on any ref push, incl. main)"
+    if push is not None and _push_admits_main(push):
+        lanes.append(PathLane(paths=push.get("paths"), paths_ignore=push.get("paths-ignore")))
     pr = on_dict.get("pull_request")
-    if pr is not None:
-        types = pr.get("types")
-        branches = pr.get("branches")
-        types_ok = types is None or bool(set(types) & DEFAULT_PR_LIFECYCLE_TYPES)
-        branches_ok = branches is None or "main" in branches
-        if types_ok and branches_ok:
-            return True, "pull_request: default/lifecycle PR types targeting main (or unrestricted)"
+    if pr is not None and _pr_admits_main(pr):
+        lanes.append(PathLane(paths=pr.get("paths"), paths_ignore=pr.get("paths-ignore")))
+    return lanes
+
+
+def is_merge_path(on_dict: dict[str, dict[str, list[str] | None]]) -> tuple[bool, str]:
+    """Thin convenience wrapper over `merge_path_lanes` — a workflow "is
+    merge-path" (Rule 1a only, ignoring Rule 1b path-capability, which is
+    evaluated per-tuple-origin, not per-workflow) iff it has at least one
+    qualifying lane."""
+    lanes = merge_path_lanes(on_dict)
+    if lanes:
+        return True, "at least one qualifying push-to-main/pull_request-to-main trigger"
     return False, "no push-to-main and no non-label-only pull_request-to-main trigger"
 
 
-def _drop_comment_lines(text: str) -> str:
-    return "\n".join(line for line in text.splitlines() if not line.strip().startswith("#"))
+def _glob_to_regex(pattern: str) -> re.Pattern[str]:
+    """Translate a GitHub Actions path glob (`**`, `**/`, `*`, `?`, literal
+    segments) into a regex. Not a general glob engine — matches this
+    repo's own observed pattern shapes (no `{a,b}` brace expansion, no
+    `!`-negation — GitHub Actions itself does not support either in a
+    `paths:` list entry)."""
+    out = ["^"]
+    i, n = 0, len(pattern)
+    while i < n:
+        if pattern[i : i + 3] == "**/":
+            out.append("(?:.*/)?")
+            i += 3
+        elif pattern[i : i + 2] == "**":
+            out.append(".*")
+            i += 2
+        elif pattern[i] == "*":
+            out.append("[^/]*")
+            i += 1
+        elif pattern[i] == "?":
+            out.append("[^/]")
+            i += 1
+        else:
+            out.append(re.escape(pattern[i]))
+            i += 1
+    out.append("$")
+    return re.compile("".join(out))
 
 
-def merge_path_workflow_tuples(repo_root: Path) -> tuple[set[str], list[str]]:
-    """The union of every `cargo ...` invocation found in a run/cmd body of
-    every workflow whose `on:` block genuinely fires on the merge path.
-    Returns (reachable tuple texts, the list of merge-path workflow names
-    for reporting)."""
+def _lane_admits_path(lane: PathLane, path: str) -> bool:
+    if lane.paths is not None:
+        if not any(_glob_to_regex(p).match(path) for p in lane.paths):
+            return False
+    if lane.paths_ignore is not None:
+        if any(_glob_to_regex(p).match(path) for p in lane.paths_ignore):
+            return False
+    return True
+
+
+def _lane_admits_any_origin(lane: PathLane, origins: list[str]) -> bool:
+    for origin in origins:
+        path = origin.rsplit(":", 1)[0] if ":" in origin else origin
+        if _lane_admits_path(lane, path):
+            return True
+    return False
+
+
+# --------------------------------------------------------------------------- #
+# `jobs:` / step-body extraction (Rule 1c)
+# --------------------------------------------------------------------------- #
+_MATRIX_CMD_INTERP_RE = re.compile(r"^\$\{\{\s*matrix\.cmd\s*\}\}$")
+_MATRIX_CONTINUE_ON_ERROR_EXPR = "${{ matrix.continue_on_error == 'true' }}"
+
+
+def _job_is_blocked(entries: dict[str, str]) -> bool:
+    """Fail-closed: a job carrying ANY `if:` (this gate cannot evaluate
+    arbitrary GH Actions expressions) or a `continue-on-error:` key at all
+    is excluded wholesale — `ci.yml`'s own `test-live` job
+    (`if: github.ref == 'refs/heads/main'` + `continue-on-error: true`,
+    excluded from `ci-summary`'s own required set by name) is exactly this
+    shape."""
+    return "if" in entries or "continue-on-error" in entries
+
+
+def _step_is_blocked(entries: dict[str, str]) -> bool:
+    if "if" in entries:
+        return True
+    coe = _entry_first_line_value(entries, "continue-on-error")
+    if coe is None:
+        return False
+    if coe == _MATRIX_CONTINUE_ON_ERROR_EXPR:
+        return False  # handled per-leg via the matrix `continue_on_error` field
+    return True  # a literal `true`, or any OTHER expression — fail-closed
+
+
+def _job_tuples(job_body: str) -> set[str]:
+    # `job_body` is `_split_block_entries(jobs_block)`'s RAW per-job value,
+    # whose first line is still the job id's OWN `<job_id>:` line (that
+    # function's own convention, needed so `_extract_top_level_key_block`'s
+    # sibling helpers stay uniform) -- drop it before re-splitting into this
+    # job's OWN keys (`runs-on`, `if`, `steps`, `strategy`, ...), the same
+    # "drop the key line, re-split the rest" shape `_sub_entries` uses.
+    lines = job_body.splitlines()
+    entries = _split_block_entries("\n".join(lines[1:]))
+    if _job_is_blocked(entries):
+        return set()
+    found: set[str] = set()
+
+    for item_text in _split_step_items(_list_key_body(entries, "steps")):
+        step_entries = _split_block_entries(item_text)
+        if _step_is_blocked(step_entries):
+            continue
+        for key in ("run", "cmd"):
+            body_text = _step_body_text(step_entries, key)
+            if body_text is None:
+                continue
+            if _MATRIX_CMD_INTERP_RE.match(body_text.strip()):
+                continue  # handled via the matrix include: legs below
+            found |= _extract_tuples_from_text(body_text)
+
+    strategy_entries = _sub_entries(entries, "strategy")
+    matrix_entries = _sub_entries(strategy_entries, "matrix")
+    for item_text in _split_step_items(_list_key_body(matrix_entries, "include")):
+        leg_entries = _split_block_entries(item_text)
+        leg_coe = _entry_first_line_value(leg_entries, "continue_on_error")
+        if leg_coe is not None and leg_coe.strip("\"'") == "true":
+            continue
+        cmd_body = _step_body_text(leg_entries, "cmd")
+        if cmd_body is not None:
+            found |= _extract_tuples_from_text(cmd_body)
+
+    return found
+
+
+def _workflow_job_tuples(text: str) -> set[str]:
+    jobs_block = _extract_top_level_key_block(text, "jobs")
+    job_entries = _split_block_entries(jobs_block)
+    found: set[str] = set()
+    for _job_id, job_body in job_entries.items():
+        found |= _job_tuples(job_body)
+    return found
+
+
+# --------------------------------------------------------------------------- #
+# workflow scan (Rules 1a + 1b + 1c together)
+# --------------------------------------------------------------------------- #
+@dataclass
+class WorkflowScan:
+    name: str
+    lanes: list[PathLane]
+    tuples: set[str]
+
+
+def scan_workflows(repo_root: Path) -> list[WorkflowScan]:
+    """Every workflow with at least one qualifying (Rule 1a) merge-path
+    trigger, carrying its own lanes (Rule 1b's per-lane paths filters) and
+    its job/step-scoped (Rule 1c) tuple corpus. Globs BOTH `*.yml` and
+    `*.yaml` (see the module doc's disclosed narrowness note)."""
     workflows_dir = repo_root / WORKFLOWS_DIR_REL
-    reachable: set[str] = set()
-    names: list[str] = []
     if not workflows_dir.is_dir():
-        return reachable, names
-    for path in sorted(workflows_dir.glob("*.yml")):
+        return []
+    paths = sorted(set(workflows_dir.glob("*.yml")) | set(workflows_dir.glob("*.yaml")))
+    scans: list[WorkflowScan] = []
+    for path in paths:
         try:
             text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
         on_dict = parse_on_block(text)
-        merge_path, _reason = is_merge_path(on_dict)
-        if not merge_path:
+        lanes = merge_path_lanes(on_dict)
+        if not lanes:
             continue
-        names.append(path.name)
-        reachable |= extract_all_tuples(_drop_comment_lines(text))
-    return reachable, names
+        scans.append(WorkflowScan(name=path.name, lanes=lanes, tuples=_workflow_job_tuples(text)))
+    return scans
+
+
+def is_tuple_reachable(tuple_text: str, origins: list[str], scans: list[WorkflowScan]) -> bool:
+    for scan in scans:
+        if tuple_text not in scan.tuples:
+            continue
+        for lane in scan.lanes:
+            if _lane_admits_any_origin(lane, origins):
+                return True
+    return False
 
 
 # --------------------------------------------------------------------------- #
@@ -453,9 +1036,9 @@ class AllowlistRow:
 def parse_allowlist(path: Path) -> tuple[list[AllowlistRow], list[str]]:
     """Returns (rows, parse_failures). A malformed row (no TAB separator, or
     an empty reason) is a parse failure, never silently dropped. TAB, never
-    `|` — see this function's own call site / the module doc's Rule 3
-    section for why a `|`-based delimiter would collide with a real tuple's
-    own piped shell text (`... | tee "$L1"`)."""
+    `|` — see the module doc's Rule 3 section for why a `|`-based delimiter
+    would collide with a real tuple's own piped shell text
+    (`... | tee "$L1"`)."""
     if not path.exists():
         return [], []
     rows: list[AllowlistRow] = []
@@ -494,33 +1077,45 @@ def run_gate(repo_root: Path, allowlist_path: Path) -> tuple[list[str], list[str
 
     registry = discover_all_tuples(repo_root)
     gated = gated_tuples(registry)
-    reachable, merge_path_workflow_names = merge_path_workflow_tuples(repo_root)
+    scans = scan_workflows(repo_root)
     allow_rows, allow_parse_failures = parse_allowlist(allowlist_path)
     failures.extend(allow_parse_failures)
 
     allowlisted_texts = {row.tuple_text for row in allow_rows}
+    reachable_gated = {t for t in gated if is_tuple_reachable(t, gated[t].origins, scans)}
 
     info.append(
         f"{len(registry)} cargo invocation(s) discovered under {SCRIPTS_ROOT} "
         f"({len(gated)} gated on {sorted(GATED_FEATURE_TOKENS)}); "
-        f"{len(merge_path_workflow_names)} merge-path workflow(s): {', '.join(merge_path_workflow_names) or '(none)'}"
+        f"{len(scans)} merge-path workflow(s): {', '.join(s.name for s in scans) or '(none)'}"
     )
 
     # Rule 3 — waiver rot: every allowlist row's tuple must still be a
-    # member of the CURRENT (re-discovered this run) registry.
+    # member of the CURRENT (re-discovered this run) full registry.
     for row in allow_rows:
         if row.tuple_text not in registry:
             failures.append(
                 f"{allowlist_path.name}:{row.lineno}: ROT — allowlisted tuple no longer found in the "
                 f"registry (renamed/deleted script, or the exact command line changed): {row.tuple_text!r}"
             )
+            continue
+        # Rule 3 mirror — dead waiver: still gated, still exists, but has
+        # become reachable. Independent of the rot check above (a row can
+        # be rotted OR dead-waived, never both — its subject either exists
+        # or it doesn't).
+        if row.tuple_text in gated and row.tuple_text in reachable_gated:
+            failures.append(
+                f"{allowlist_path.name}:{row.lineno}: DEAD WAIVER — this tuple is now reachable on the "
+                f"merge path; remove the row (an allowlist that never shrinks stops meaning anything): "
+                f"{row.tuple_text!r}"
+            )
 
-    # Rule 1 — reachability, subject to the honest residual (Rule "no third
-    # silent state"): every gated tuple must be reachable OR allowlisted OR
+    # Rule 1 — reachability, subject to the honest residual (no third
+    # silent state): every gated tuple must be reachable OR allowlisted OR
     # (never true today, see GPU_PROVE_PROMOTED_TO_REQUIRED) mechanically
     # promoted.
     for text, rec in sorted(gated.items()):
-        if text in reachable:
+        if text in reachable_gated:
             continue
         if GPU_PROVE_PROMOTED_TO_REQUIRED:
             continue
@@ -529,9 +1124,10 @@ def run_gate(repo_root: Path, allowlist_path: Path) -> tuple[list[str], list[str
         failures.append(
             "UNREACHABLE gated tuple, no allowlist row: "
             f"{text!r} (origin(s): {', '.join(rec.origins)}) — this cargo invocation needs a real "
-            "CUDA/CUTLASS toolchain and is not invoked, byte-for-byte, by any workflow whose `on:` "
-            "trigger fires on the merge path. Either wire an exact-matching invocation into a "
-            f"merge-path workflow, or add a reasoned row to {allowlist_path.name}."
+            "CUDA/CUTLASS toolchain and is not invoked, byte-for-byte, by any eligible job/step of a "
+            "workflow whose `on:` trigger and path filter fire on the merge path for this origin. "
+            "Either wire an exact-matching invocation into a merge-path workflow, or add a reasoned "
+            f"row to {allowlist_path.name}."
         )
 
     return failures, info
@@ -554,7 +1150,7 @@ def main() -> int:
 
     print(
         "execution-surface-reachability: PASS — every gated execution-surface tuple is reachable on "
-        "the merge path or carries a live allowlist row."
+        "the merge path or carries a live, non-dead allowlist row."
     )
     return 0
 
@@ -573,6 +1169,8 @@ def _write_repo(tmp: Path, files: dict[str, str]) -> None:
     subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp, check=True)
     subprocess.run(["git", "add", "-A"], cwd=tmp, check=True)
 
+
+GATED_TUPLE_TEXT = "cargo clippy -p demo --all-targets --features cuda -- -D warnings"
 
 GATED_SCRIPT = """#!/usr/bin/env bash
 # Documentation only, NOT a real invocation — must not be registered:
@@ -662,6 +1260,155 @@ jobs:
       - run: cargo clippy -p demo --all-targets --features cuda -- -D warnings
 """
 
+BRANCHES_IGNORE_MAIN_WORKFLOW = """name: fixture-branches-ignore
+on:
+  push:
+    branches-ignore: [main]
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo clippy -p demo --all-targets --features cuda -- -D warnings
+"""
+
+BRANCHES_IGNORE_OTHER_WORKFLOW = """name: fixture-branches-ignore-other
+on:
+  push:
+    branches-ignore: [some-other-branch]
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo clippy -p demo --all-targets --features cuda -- -D warnings
+"""
+
+PATHS_FILTER_MISS_WORKFLOW = """name: fixture-paths-miss
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "docs/guide/**"
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo clippy -p demo --all-targets --features cuda -- -D warnings
+"""
+
+PATHS_FILTER_ADMIT_WORKFLOW = """name: fixture-paths-admit
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "ci/scripts/**"
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo clippy -p demo --all-targets --features cuda -- -D warnings
+"""
+
+JOB_IF_WORKFLOW = """name: fixture-job-if
+on:
+  pull_request:
+    branches: [main]
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    continue-on-error: true
+    steps:
+      - run: cargo clippy -p demo --all-targets --features cuda -- -D warnings
+"""
+
+STEP_IF_WORKFLOW = """name: fixture-step-if
+on:
+  pull_request:
+    branches: [main]
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - if: github.event_name == 'schedule'
+        run: cargo clippy -p demo --all-targets --features cuda -- -D warnings
+"""
+
+STEP_CONTINUE_ON_ERROR_WORKFLOW = """name: fixture-step-coe
+on:
+  pull_request:
+    branches: [main]
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - continue-on-error: true
+        run: cargo clippy -p demo --all-targets --features cuda -- -D warnings
+"""
+
+MATRIX_CMD_WORKFLOW = """name: fixture-matrix-cmd
+on:
+  pull_request:
+    branches: [main]
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: harmless
+            cmd: echo hi
+          - name: the-real-one
+            cmd: cargo clippy -p demo --all-targets --features cuda -- -D warnings
+    steps:
+      - run: ${{ matrix.cmd }}
+"""
+
+MATRIX_CMD_SOFT_FAIL_WORKFLOW = """name: fixture-matrix-cmd-soft
+on:
+  pull_request:
+    branches: [main]
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: soft-leg
+            cmd: cargo clippy -p demo --all-targets --features cuda -- -D warnings
+            continue_on_error: "true"
+    steps:
+      - continue-on-error: ${{ matrix.continue_on_error == 'true' }}
+        run: ${{ matrix.cmd }}
+"""
+
+ENV_PREFIXED_SCRIPT = """#!/usr/bin/env bash
+CARGO_TARGET_DIR=$SOME_DIR cargo build $SOME_FLAG -p demo --features cuda,jammi-encoders/flash-attn 2>&1 | tail -n 3
+"""
+
+WRAPPER_PREFIXED_SCRIPT = """#!/usr/bin/env bash
+run_cmd() { "$@"; }
+run_cmd cargo build --release -p demo --features cuda --manifest-path "$X/Cargo.toml" \\
+  || { echo "::error::failed"; exit 1; }
+"""
+
+SEMICOLON_CHAIN_SCRIPT = """#!/usr/bin/env bash
+echo "=== build ==="; cargo build --release -p demo --features cuda,jammi-encoders/flash-attn 2>&1 | tail -n 1; echo "done"
+"""
+
+CONTINUATION_FEATURES_SCRIPT = """#!/usr/bin/env bash
+CARGO_TARGET_DIR="$X" run_cmd cargo build --release -p demo \\
+  --features cuda,jammi-encoders/flash-attn --manifest-path "$X/Cargo.toml" || {
+  echo "::error::failed"
+  exit 1
+}
+"""
+
+PROSE_SCRIPT = """#!/usr/bin/env bash
+# a bash comment naming an unrelated thing
+X_EXPECTED='cargo clippy -p demo --all-targets --features cuda -- -D warnings'
+echo "you need a real cargo build and a real torch install to run this"
+"""
+
 
 def _run_gate_in(tmp: Path, allowlist_text: str | None = None) -> tuple[list[str], list[str]]:
     allow_path = tmp / "ci" / "scripts" / "execution_surface_reachability_allowlist.txt"
@@ -671,12 +1418,23 @@ def _run_gate_in(tmp: Path, allowlist_text: str | None = None) -> tuple[list[str
     return run_gate(tmp, allow_path)
 
 
-def self_test() -> int:
+def self_test() -> int:  # noqa: C901 - a flat sequence of independent RED-mutant legs
     failures: list[str] = []
 
-    # --- Rule 2: registry completeness — a nested script under ci/scripts/
-    # is discovered (recursion), and a doc-comment `cargo ...` line is NOT
-    # registered as a real tuple. -------------------------------------------
+    def check(label: str, tmp_files: dict[str, str], allowlist_text: str | None, expect_fail_substr: str | None) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            _write_repo(tmp, tmp_files)
+            got, _info = _run_gate_in(tmp, allowlist_text=allowlist_text)
+            if expect_fail_substr is None:
+                if got:
+                    failures.append(f"self-test FAILED ({label}): expected PASS, got findings: {got}")
+            else:
+                if not any(expect_fail_substr in g for g in got):
+                    failures.append(f"self-test FAILED ({label}): expected a finding containing {expect_fail_substr!r}, got: {got}")
+
+    # --- Rule 2: registry completeness — nested-dir recursion, doc-comment
+    # exclusion, non-gated exclusion. -----------------------------------
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         _write_repo(
@@ -688,200 +1446,191 @@ def self_test() -> int:
         )
         registry = discover_all_tuples(tmp)
         gated = gated_tuples(registry)
-        if "cargo clippy -p demo --all-targets --features cuda -- -D warnings" not in gated:
-            failures.append(
-                "self-test FAILED: a gated tuple inside a NESTED ci/scripts/ subdirectory was not "
-                f"discovered (Rule 2 recursion broken): {sorted(gated)}"
-            )
+        if GATED_TUPLE_TEXT not in gated:
+            failures.append(f"self-test FAILED: a gated tuple inside a NESTED ci/scripts/ subdirectory was not discovered: {sorted(gated)}")
         if "cargo clippy -p demo-doc-only --features cuda -- -D warnings" in registry:
-            failures.append(
-                "self-test FAILED: a `cargo ...` line living inside a `#` comment (documentation, "
-                "never a real invocation) was registered as a real tuple"
-            )
+            failures.append("self-test FAILED: a `cargo ...` line living inside a `#` comment was registered as a real tuple")
         if "cargo test -p demo --no-run" in gated:
-            failures.append(
-                "self-test FAILED: a non-gated (no --features cuda/flash-attn) invocation was "
-                "classified as gated — Rule 2 must scope to GATED_FEATURE_TOKENS only"
-            )
+            failures.append("self-test FAILED: a non-gated invocation was classified as gated")
 
-    # --- Rule 1: reachable via a genuine pull_request-to-main -> PASS ------
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
-        _write_repo(
-            tmp,
-            {
-                "ci/scripts/pod_seed_target.sh": GATED_SCRIPT,
-                ".github/workflows/fixture-ci.yml": MERGE_PATH_WORKFLOW_REACHABLE,
-            },
-        )
-        got, _info = _run_gate_in(tmp)
-        if got:
-            failures.append(f"self-test FAILED: a genuinely reachable tuple was flagged: {got}")
+    # --- Rule 1a: reachable via a genuine pull_request-to-main / push-to-main -> PASS
+    check("pull_request-to-main reachable", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-ci.yml": MERGE_PATH_WORKFLOW_REACHABLE}, None, None)
+    check("push-to-main reachable", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-push.yml": PUSH_MAIN_WORKFLOW_REACHABLE}, None, None)
 
-    # --- Rule 1: reachable via a genuine push-to-main -> PASS --------------
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
-        _write_repo(
-            tmp,
-            {
-                "ci/scripts/pod_seed_target.sh": GATED_SCRIPT,
-                ".github/workflows/fixture-push.yml": PUSH_MAIN_WORKFLOW_REACHABLE,
-            },
-        )
-        got, _info = _run_gate_in(tmp)
-        if got:
-            failures.append(f"self-test FAILED: a tuple reachable via push-to-main was flagged: {got}")
+    # --- Rule 1: unreachable, no allowlist row -> FAIL ----------------------
+    check("unreachable unallowlisted", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-ci.yml": MERGE_PATH_WORKFLOW_UNREACHABLE}, None, "UNREACHABLE gated tuple")
 
-    # --- Rule 1: unreachable, no allowlist row -> FAIL (RED) ---------------
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
-        _write_repo(
-            tmp,
-            {
-                "ci/scripts/pod_seed_target.sh": GATED_SCRIPT,
-                ".github/workflows/fixture-ci.yml": MERGE_PATH_WORKFLOW_UNREACHABLE,
-            },
-        )
-        got, _info = _run_gate_in(tmp)
-        if not any("UNREACHABLE gated tuple" in g for g in got):
-            failures.append(f"self-test FAILED: an unreachable, unallowlisted gated tuple not caught: {got}")
+    # --- Rule 1a: label-only workflow (esc-050/051 shape) -> FAIL ----------
+    check("label-only workflow", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-gpu-prove.yml": LABEL_ONLY_WORKFLOW}, None, "UNREACHABLE gated tuple")
 
-    # --- Rule 1: unreachable because the ONLY workflow mentioning it is
-    # label/dispatch/schedule-only (gpu-prove.yml's own shape) -> FAIL ------
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
-        _write_repo(
-            tmp,
-            {
-                "ci/scripts/pod_seed_target.sh": GATED_SCRIPT,
-                ".github/workflows/fixture-gpu-prove.yml": LABEL_ONLY_WORKFLOW,
-            },
-        )
-        got, _info = _run_gate_in(tmp)
-        if not any("UNREACHABLE gated tuple" in g for g in got):
-            failures.append(
-                f"self-test FAILED: a tuple whose only workflow twin lives behind a label/dispatch/"
-                f"schedule-only `on:` block was not flagged unreachable (the exact esc-050/051 "
-                f"escape shape): {got}"
-            )
+    # --- Rule 1a: tag-only push -> FAIL -------------------------------------
+    check("tag-only push", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-release.yml": TAG_ONLY_WORKFLOW}, None, "UNREACHABLE gated tuple")
 
-    # --- Rule 1: a tag-push-only workflow does not count as push-to-main ---
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
-        _write_repo(
-            tmp,
-            {
-                "ci/scripts/pod_seed_target.sh": GATED_SCRIPT,
-                ".github/workflows/fixture-release.yml": TAG_ONLY_WORKFLOW,
-            },
-        )
-        got, _info = _run_gate_in(tmp)
-        if not any("UNREACHABLE gated tuple" in g for g in got):
-            failures.append(f"self-test FAILED: a tag-push-only (`push: tags:`) workflow was credited as merge-path: {got}")
+    # --- Rule 1a: branches-ignore: [main] -> FAIL (does NOT admit main) ----
+    check("branches-ignore excludes main", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-bi.yml": BRANCHES_IGNORE_MAIN_WORKFLOW}, None, "UNREACHABLE gated tuple")
 
-    # --- Rule 1: a comment-only mention does not count ----------------------
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
-        _write_repo(
-            tmp,
-            {
-                "ci/scripts/pod_seed_target.sh": GATED_SCRIPT,
-                ".github/workflows/fixture-ci.yml": MERGE_PATH_WORKFLOW_COMMENT_ONLY,
-            },
-        )
-        got, _info = _run_gate_in(tmp)
-        if not any("UNREACHABLE gated tuple" in g for g in got):
-            failures.append(f"self-test FAILED: a tuple named only in a `#` comment was credited as reachable: {got}")
+    # --- Rule 1a: branches-ignore: [other] -> PASS (main not excluded) -----
+    check("branches-ignore admits main via omission", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-bio.yml": BRANCHES_IGNORE_OTHER_WORKFLOW}, None, None)
 
-    # --- Rule 1: exact-tuple match, never substring (esc-051's control) ----
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
-        _write_repo(
-            tmp,
-            {
-                "ci/scripts/pod_seed_target.sh": GATED_SCRIPT,
-                ".github/workflows/fixture-ci.yml": MERGE_PATH_WORKFLOW_SUPERSET_ONLY,
-            },
-        )
-        got, _info = _run_gate_in(tmp)
-        if not any("UNREACHABLE gated tuple" in g for g in got):
-            failures.append(
-                "self-test FAILED: a `--features cuda,flash-attn` invocation satisfied a plain "
-                f"`--features cuda` registered tuple (substring/superset match, esc-051's own bug "
-                f"class) — must be an exact miss: {got}"
-            )
+    # --- Rule 1b: paths filter cannot match ci/scripts/** -> FAIL ----------
+    check("paths filter misses ci/scripts", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-pm.yml": PATHS_FILTER_MISS_WORKFLOW}, None, "UNREACHABLE gated tuple")
 
-    # --- Rule 1 + residual: unreachable, but allowlisted -> PASS -----------
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
-        allow_text = (
-            "cargo clippy -p demo --all-targets --features cuda -- -D warnings\t"
-            "fixture: no merge-path CUDA toolchain lane exists; gpu-prove.yml is label/dispatch/"
-            "schedule-only (GPU_PROVE_PROMOTED_TO_REQUIRED is False)\n"
-        )
-        _write_repo(
-            tmp,
-            {
-                "ci/scripts/pod_seed_target.sh": GATED_SCRIPT,
-                ".github/workflows/fixture-ci.yml": MERGE_PATH_WORKFLOW_UNREACHABLE,
-            },
-        )
-        got, _info = _run_gate_in(tmp, allowlist_text=allow_text)
-        if got:
-            failures.append(f"self-test FAILED: a properly-allowlisted, reasoned, still-live tuple was flagged: {got}")
+    # --- Rule 1b: paths filter DOES admit ci/scripts/** -> PASS ------------
+    check("paths filter admits ci/scripts", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-pa.yml": PATHS_FILTER_ADMIT_WORKFLOW}, None, None)
 
-    # --- Rule 3: waiver rot — allowlist row cites a tuple that no longer
-    # exists in the registry (renamed/deleted script) -> FAIL ---------------
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
-        allow_text = "cargo clippy -p a-tuple-that-was-renamed --features cuda -- -D warnings\tstale reason\n"
-        _write_repo(
-            tmp,
-            {
-                "ci/scripts/pod_seed_target.sh": GATED_SCRIPT,
-                ".github/workflows/fixture-ci.yml": MERGE_PATH_WORKFLOW_UNREACHABLE,
-            },
-        )
-        got, _info = _run_gate_in(tmp, allowlist_text=allow_text)
-        if not any("ROT" in g for g in got):
-            failures.append(f"self-test FAILED: a rotted allowlist row (subject no longer in the registry) not caught: {got}")
+    # --- Rule 1c: job-level if:/continue-on-error: -> FAIL -----------------
+    check("job-level if + continue-on-error excludes", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-ji.yml": JOB_IF_WORKFLOW}, None, "UNREACHABLE gated tuple")
+
+    # --- Rule 1c: step-level if: -> FAIL ------------------------------------
+    check("step-level if excludes", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-si.yml": STEP_IF_WORKFLOW}, None, "UNREACHABLE gated tuple")
+
+    # --- Rule 1c: step-level continue-on-error: true -> FAIL ---------------
+    check("step-level continue-on-error excludes", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-sc.yml": STEP_CONTINUE_ON_ERROR_WORKFLOW}, None, "UNREACHABLE gated tuple")
+
+    # --- Rule 1c: matrix cmd: indirection is honored (positive control) ----
+    check("matrix cmd indirection credits a real leg", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-mc.yml": MATRIX_CMD_WORKFLOW}, None, None)
+
+    # --- Rule 1c: a matrix leg's own continue_on_error: "true" excludes
+    # JUST that leg (never credited even though the matrix job itself runs) -
+    check("matrix leg continue_on_error excludes that leg", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-mcs.yml": MATRIX_CMD_SOFT_FAIL_WORKFLOW}, None, "UNREACHABLE gated tuple")
+
+    # --- Rule 1: comment-only mention does not count ------------------------
+    check("comment-only mention", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-co.yml": MERGE_PATH_WORKFLOW_COMMENT_ONLY}, None, "UNREACHABLE gated tuple")
+
+    # --- Rule 1: exact-tuple match, never substring -------------------------
+    check("exact match never substring", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-ss.yml": MERGE_PATH_WORKFLOW_SUPERSET_ONLY}, None, "UNREACHABLE gated tuple")
+
+    # --- Rule 1 + residual: unreachable but allowlisted -> PASS ------------
+    check(
+        "allowlisted unreachable tuple passes",
+        {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-ci.yml": MERGE_PATH_WORKFLOW_UNREACHABLE},
+        f"{GATED_TUPLE_TEXT}\tfixture: no merge-path CUDA toolchain lane exists\n",
+        None,
+    )
+
+    # --- Rule 3: waiver rot -------------------------------------------------
+    check(
+        "rotted allowlist row",
+        {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-ci.yml": MERGE_PATH_WORKFLOW_UNREACHABLE},
+        "cargo clippy -p a-tuple-that-was-renamed --features cuda -- -D warnings\tstale reason\n",
+        "ROT",
+    )
+
+    # --- Rule 3 mirror: dead waiver — allowlisted tuple has become
+    # reachable -> FAIL, naming DEAD WAIVER, never a silent pass ------------
+    check(
+        "dead waiver flagged",
+        {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-ci.yml": MERGE_PATH_WORKFLOW_REACHABLE},
+        f"{GATED_TUPLE_TEXT}\tstale: this used to be unreachable but a fix landed\n",
+        "DEAD WAIVER",
+    )
 
     # --- Rule 3: an allowlist row missing a reason is a parse failure ------
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
-        allow_text = "cargo clippy -p demo --all-targets --features cuda -- -D warnings\t\n"
-        _write_repo(
-            tmp,
-            {
-                "ci/scripts/pod_seed_target.sh": GATED_SCRIPT,
-                ".github/workflows/fixture-ci.yml": MERGE_PATH_WORKFLOW_UNREACHABLE,
-            },
-        )
-        got, _info = _run_gate_in(tmp, allowlist_text=allow_text)
-        if not any("non-empty tuple text and a non-empty reason" in g for g in got):
-            failures.append(f"self-test FAILED: an allowlist row with an empty reason not caught: {got}")
+    check(
+        "empty reason row",
+        {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-ci.yml": MERGE_PATH_WORKFLOW_UNREACHABLE},
+        f"{GATED_TUPLE_TEXT}\t\n",
+        "non-empty tuple text and a non-empty reason",
+    )
 
-    # --- Rule 3: a malformed row (no TAB separator) is a parse failure ---
+    # --- Rule 3: a malformed row (no TAB separator) -------------------------
+    check(
+        "malformed row",
+        {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-ci.yml": MERGE_PATH_WORKFLOW_UNREACHABLE},
+        "cargo clippy -p demo --features cuda -- -D warnings NO SEPARATOR HERE\n",
+        "malformed row",
+    )
+
+    # --- Rule 2 (F3): env-var-prefixed invocation is discovered + gated ----
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
-        allow_text = "cargo clippy -p demo --features cuda -- -D warnings NO SEPARATOR HERE\n"
-        _write_repo(
-            tmp,
-            {
-                "ci/scripts/pod_seed_target.sh": GATED_SCRIPT,
-                ".github/workflows/fixture-ci.yml": MERGE_PATH_WORKFLOW_UNREACHABLE,
-            },
-        )
-        got, _info = _run_gate_in(tmp, allowlist_text=allow_text)
-        if not any("malformed row" in g for g in got):
-            failures.append(f"self-test FAILED: a malformed allowlist row (no TAB separator) not caught: {got}")
+        _write_repo(tmp, {"ci/scripts/env_prefixed.sh": ENV_PREFIXED_SCRIPT})
+        gated = gated_tuples(discover_all_tuples(tmp))
+        expect = "cargo build $SOME_FLAG -p demo --features cuda,jammi-encoders/flash-attn 2>&1 | tail -n 3"
+        if expect not in gated:
+            failures.append(f"self-test FAILED: env-var-prefixed invocation not discovered/gated: {sorted(gated)}")
+
+    # --- Rule 2 (F3): wrapper-prefixed (run_cmd) + backslash continuation --
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        _write_repo(tmp, {"ci/scripts/wrapper_prefixed.sh": WRAPPER_PREFIXED_SCRIPT})
+        gated = gated_tuples(discover_all_tuples(tmp))
+        expect = 'cargo build --release -p demo --features cuda --manifest-path "$X/Cargo.toml"'
+        if expect not in gated:
+            failures.append(f"self-test FAILED: run_cmd-wrapped invocation not discovered/gated: {sorted(gated)}")
+
+    # --- Rule 2 (F3): `;`-chained invocation is discovered -----------------
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        _write_repo(tmp, {"ci/scripts/semicolon_chain.sh": SEMICOLON_CHAIN_SCRIPT})
+        gated = gated_tuples(discover_all_tuples(tmp))
+        expect = "cargo build --release -p demo --features cuda,jammi-encoders/flash-attn 2>&1 | tail -n 1"
+        if expect not in gated:
+            failures.append(f"self-test FAILED: semicolon-chained invocation not discovered/gated: {sorted(gated)}")
+
+    # --- Rule 2 (F3): --features landing on a CONTINUATION line is still
+    # visible to gating (env-prefixed + wrapper-prefixed + continuation) ----
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        _write_repo(tmp, {"ci/scripts/continuation_features.sh": CONTINUATION_FEATURES_SCRIPT})
+        registry = discover_all_tuples(tmp)
+        gated = gated_tuples(registry)
+        expect = 'cargo build --release -p demo --features cuda,jammi-encoders/flash-attn --manifest-path "$X/Cargo.toml"'
+        if expect not in gated:
+            failures.append(f"self-test FAILED: continuation-line --features not visible to gating: {sorted(gated)}")
+        else:
+            origin = registry[expect].origins[0]
+            # Line 1 of CONTINUATION_FEATURES_SCRIPT is the shebang; the
+            # continuation-joined invocation itself STARTS on line 2 — the
+            # property under test is that the origin is the invocation's
+            # OWN first physical line, not line 3 (where the joined
+            # `--features` argument physically sits).
+            if not origin.endswith(":2"):
+                failures.append(f"self-test FAILED: continuation-joined tuple's origin lineno should be its own FIRST physical line (2), got {origin!r}")
+
+    # --- Rule 2 (F3): is_gated unions multiple --features/-F occurrences,
+    # and recognizes a bare namespaced <crate>/flash-attn with NO "cuda"
+    # token anywhere -----------------------------------------------------
+    if not is_gated("cargo build -p x --features jammi-encoders/flash-attn"):
+        failures.append("self-test FAILED: a bare namespaced <crate>/flash-attn with no 'cuda' token was not classified as gated")
+    if not is_gated("cargo build -p x -F cuda"):
+        failures.append("self-test FAILED: the -F short-flag form was not recognized as --features")
+    if not is_gated('cargo build -p x --features live-gpu-tests --features cuda'):
+        failures.append("self-test FAILED: a SECOND --features occurrence was not unioned into gating")
+    if is_gated("cargo build -p x --features live-gpu-tests,not-flash-attn-at-all"):
+        failures.append("self-test FAILED: a non-gated feature set was misclassified as gated")
+
+    # --- Rule 2 (F5): prose that merely STARTS with "cargo build" is never
+    # registered, even without a comment/assignment context -----------------
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        _write_repo(tmp, {"ci/scripts/prose.sh": PROSE_SCRIPT})
+        registry = discover_all_tuples(tmp)
+        if any("cargo clippy" in t for t in registry):
+            failures.append(f"self-test FAILED: a quoted bash-variable assignment ('cargo clippy ...') was registered as a real tuple: {sorted(registry)}")
+        if any(t.startswith("cargo build and") or t.startswith("cargo build a real") for t in registry):
+            failures.append(f"self-test FAILED: a prose sentence starting with 'cargo build' was registered as a real tuple: {sorted(registry)}")
 
     # --- on: block parsing: workflow_dispatch/schedule alone is never
-    # merge-path ------------------------------------------------------------
+    # merge-path; a workflow_call-only `on:` block is never merge-path ------
     dispatch_only = parse_on_block("on:\n  workflow_dispatch:\n  schedule:\n    - cron: \"0 0 * * *\"\n")
     ok, _reason = is_merge_path(dispatch_only)
     if ok:
         failures.append("self-test FAILED: workflow_dispatch/schedule alone was classified as merge-path")
+    call_only = parse_on_block("on:\n  workflow_call:\n    inputs:\n      git_ref:\n        required: true\n")
+    ok, _reason = is_merge_path(call_only)
+    if ok:
+        failures.append("self-test FAILED: a workflow_call-only on: block was classified as merge-path")
+
+    # --- docs.yml's own shape: a comment line NESTED inside a block `paths:`
+    # list must not truncate the list (the F1-adjacent bug this repo's own
+    # docs.yml would have hit) ------------------------------------------
+    with_comment = _extract_list_field(
+        'push:\n  branches: [main]\n  paths:\n    - "docs/guide/**"\n    # a comment mid-list\n    - "cookbook/recipes/**"\n',
+        "paths",
+    )
+    if with_comment != ["docs/guide/**", "cookbook/recipes/**"]:
+        failures.append(f"self-test FAILED: a comment line nested inside a block `paths:` list truncated it: {with_comment}")
 
     if failures:
         print("execution-surface-reachability self-test: FAIL", file=sys.stderr)
@@ -890,11 +1639,15 @@ def self_test() -> int:
         return 1
     print(
         "execution-surface-reachability self-test: OK — every rule bites: registry recursion + "
-        "doc-comment exclusion + non-gated exclusion (Rule 2), reachable-via-pull_request-to-main, "
-        "reachable-via-push-to-main, unreachable/unallowlisted, label-only-workflow unreachable "
-        "(the exact esc-050/051 shape), tag-only-push not credited, comment-only mention not "
-        "credited, exact-match-never-substring (esc-051's own control), allowlisted-and-live PASS, "
-        "rotted allowlist row, empty-reason row, and a malformed row (Rule 3)."
+        "doc-comment exclusion + non-gated exclusion (Rule 2), pull_request/push-to-main reachable, "
+        "unreachable/unallowlisted, label-only workflow, tag-only push, branches-ignore (both "
+        "directions), paths-filter capability (both directions), job-level if:/continue-on-error:, "
+        "step-level if:, step-level continue-on-error:, matrix cmd: indirection (both a credited leg "
+        "and a soft-failed leg), comment-only mention, exact-match-never-substring, allowlisted-and-"
+        "live PASS, rotted allowlist row, dead-waiver row, empty-reason row, malformed row (Rule 3), "
+        "env-prefixed/wrapper-prefixed/semicolon-chained/continuation-spanning discovery, multi-"
+        "--features/-F/namespaced-flash-attn gating, prose exclusion, workflow_call-only exclusion, "
+        "and a paths: list surviving a nested comment line."
     )
     return 0
 

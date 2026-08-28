@@ -427,6 +427,19 @@ jobs:
 
       - uses: ./.github/actions/setup-rust-ci
 
+      # `JAMMI_FLASH_MEASURE_RSS=1` is deliberately NOT set on this step
+      # (round-2 audit finding B): `build.rs::build_flash_attn` now PANICS
+      # when that var is set but `/usr/bin/time` does not exist on disk (an
+      # explicit request that would otherwise silently measure nothing --
+      # see that gate's own doc), and this crate's own CI image
+      # (`ghcr.io/f-inverse/jammi-ai-ci-cuda`) does not install GNU `time`
+      # today. Installing it is a Dockerfile change, out of THIS crate's
+      # scope. Per-TU wall times are visible in this step's own log
+      # regardless (build.rs prints them to its own stderr
+      # UNCONDITIONALLY now, not gated on this env var, precisely so this
+      # lane gets wall-time visibility without needing RSS measurement at
+      # all) -- a future maintainer who adds `time` to the CI image can
+      # flip this env var on here for real peak-RSS numbers.
       - name: Compile-check jammi-kernels --features flash-attn (nvcc, no GPU)
         run: cargo check -p jammi-kernels --features flash-attn
 

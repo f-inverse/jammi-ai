@@ -87,7 +87,7 @@ default = []
 # step (`build.rs`). THE feature chain jammi-encoders/jammi-ai hang off of in
 # a later commit; not wired to any consumer yet in this one.
 cuda = ["dep:bindgen_cuda", "candle-core/cuda", "candle-nn/cuda"]
-# Vendored FlashAttention-2 (hdim64 / bf16 / sm80, forward + backward) behind
+# Vendored FlashAttention-2 (hdim64 / bf16 / sm80+86+89+90, forward + backward) behind
 # a torch-free C wrapper — `third_party/flash-attention/`, built by
 # `build.rs::build_flash_attn` with a hand-rolled `nvcc` (needs the CUDA
 # toolkit AND the CUTLASS submodule checked out; see

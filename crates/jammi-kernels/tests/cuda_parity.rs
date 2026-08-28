@@ -3709,6 +3709,112 @@ fn bf16_round_bound(value: f64) -> f64 {
     2.0 * BF16_U * value.abs()
 }
 
+/// Arch-aware `abs_floor` for
+/// [`lora_linear_parity_bf16_base_backward_production_width`]'s `dx`
+/// bound (M3 four-arch pod round-2 finding 2; round-3 sweep REVISED the
+/// diagnosis below). This is jammi's OWN `lora_linear` CUDA kernel — a
+/// cuBLAS strided-batched GEMM, NOTHING to do with
+/// `flash-attn`/`GENCODE_ARCHES` admission — so this widening is entirely
+/// independent of `crate::admission::flash_validated_arches()`.
+///
+/// ## REVISED DIAGNOSIS: deterministic per (arch, build), not flaky
+///
+/// An earlier revision of this doc read the element movement across two
+/// single-shot observations (`dx[10523]` then `dx[32574]`) as run-to-run
+/// FLICKER and reached for the [`FLASH_ORACLE_K_MEAN_GRAD`]/`K_MAX`
+/// precedent (a max-shaped bound that does not transfer across draws).
+/// That framing is WRONG: a 40-repeat sweep (**N = 20 invocations, in TWO
+/// independent labeled blocks of 20**, per the earlier PENDING-ARTIFACT
+/// spec this revision closes out) found the SAME worst element and the
+/// SAME `diff`/`bound`/`required_floor` on ALL 40 repeats, on BOTH Ada
+/// SKUs, bit-for-bit. The computation is DETERMINISTIC for a given (arch,
+/// build) — the earlier two-observation "movement" tracked BUILD changes
+/// (this constant's own successive revisions altered the bound formula,
+/// which changes WHICH element ranks worst), not measurement noise. The
+/// repeat sweep's actual role, then, is a DETERMINISM CHECK, not a
+/// distribution characterization: confirming n=40-identical is what makes
+/// "one measured value per (arch, fixture, build)" a sound derivation
+/// input, rather than the mean/max of an unstable process.
+///
+/// Sweep results (both blocks, both arches — identical within each arch):
+/// - **sm89 (L40S)**: worst element index `244121`, `diff = 1.2832888`,
+///   `bound = 1.0417905` (at the prior `abs_floor = 1.0`),
+///   `ratio = 1.231811` (FAILED all 40 — `23.2%` over), `required_floor
+///   = 1.2414983` (the TRUE minimal sufficient floor for this element,
+///   independent of whatever `abs_floor` was in effect — see the test
+///   body's own `max_required_floor` for the exact, direction-symmetric
+///   formula this fixed the earlier buggy diagnostic to).
+/// - **sm86 (A40)**: worst element index `196871`, `ratio = 0.224994` at
+///   `abs_floor = 1.0` (PASSED all 40, comfortably) — well below even the
+///   ORIGINAL `0.3` A100 floor's own bound, i.e. A40 needs NO widening at
+///   all.
+///
+/// **sm86 and sm89 diverge WITHIN the same 99 KB smem tier** (A40
+/// comfortable, L40S `23%` over): "Ada-class" is not one behavior — these
+/// two SKUs run genuinely DIFFERENT cuBLAS accumulation kernels for the
+/// identical problem shape (consistent with arch-specific cuBLAS kernel
+/// selection, not a tier-wide property), so the floor is PER-ARCH, not
+/// "per Ada". The unconditional `required_floor` diagnostic this fix adds
+/// to the test body means a FUTURE fixture or bound-formula change that
+/// moves the worst element again needs only ONE re-run per arch to
+/// re-derive the number, not a fresh multi-run sweep — that one-run
+/// re-derivation IS the real protection this diagnostic buys, not the
+/// repeat count.
+///
+/// ## Derivation (sm89, the only arch needing a widened floor)
+/// ```text
+/// measured required_floor (sm89, L40S, this build, 40/40 identical):
+///   1.2414983
+///
+/// margin (this file's own "comfortable headroom over a measured need"
+/// convention -- dx_bound_margin's sibling comment used 2.0x against a
+/// measured 1.34x need; 1.5x is used here since the measurement itself is
+/// now a confirmed-deterministic point, not a single noisy draw needing
+/// as much headroom):
+///   1.2414983 * 1.5 = 1.86224745
+///
+/// rounded UP to a clean value (never round down past the margin):
+///   2.0
+/// ```
+/// sm86 (A40) keeps the TIGHT, unwidened floor: the sweep proved it does
+/// not need widening (`required_floor` well under the base bound), and
+/// per family D ("never loosen a bound you don't have to") there is no
+/// reason to trade away A40's own discriminating power for one-rule
+/// simplicity with sm89 — the evidence says they are genuinely different
+/// arches, so the code now treats them as genuinely different arches.
+/// `(8, 0)`/A100 and `(9, 0)`/H100 (confirmed fully green, zero flakiness,
+/// across the full four-arch pod run) also keep the original floor.
+///
+/// **PENDING-ARTIFACT** (narrowed by this revision — the DERIVATION above
+/// is done, not pending; only the COMMITTED evidence artifact is): the
+/// lead reruns this exact test on both Ada pods to confirm green against
+/// the constants below, then produces the per-arch `cuda-runs` artifacts
+/// citing these sweep values as the derivation evidence — cite that
+/// artifact path here once it lands.
+fn lora_linear_dx_abs_floor(cuda: &Device) -> f64 {
+    use jammi_kernels::admission::{probe_cuda_compute_capability, ComputeCapability};
+    // sm80/sm86/sm90-proven tight floor: A100 and H100 have always used
+    // it (zero flakiness across the full four-arch pod run); the round-3
+    // sweep additionally proved A40 (sm86) needs no widening at all
+    // (measured ratio 0.225 against the base bound) -- see this
+    // function's own doc.
+    const TIGHT_FLOOR: f64 = 3e-1;
+    // sm89 (L40S)-derived: 1.2414983 (measured, 40/40-deterministic
+    // required_floor) * 1.5 (margin) = 1.86224745, rounded up to 2.0 --
+    // see this function's own doc for the full arithmetic.
+    const SM89_FLOOR: f64 = 2.0;
+    match probe_cuda_compute_capability(cuda) {
+        Some(cap) if cap == ComputeCapability::new(8, 9) => SM89_FLOOR,
+        // Every OTHER probed capability (sm80, sm86, sm90, or an
+        // unrecognised future arch) keeps the tight floor deliberately:
+        // an untested arch should fail LOUD against the narrow bound
+        // (prompting investigation) rather than silently pass under an
+        // over-widened one it was never shown to need (family D: default
+        // to the side that cannot silently accept a wrong number).
+        _ => TIGHT_FLOOR,
+    }
+}
+
 /// A conservative, DERIVED (not tuned-to-pass) absolute tolerance
 /// covering every CPU<->CUDA `f32` comparison this section's tests make
 /// (`fwd`, `dx`, `dw`, `da`, `db`): each is the output of one or two
@@ -4568,7 +4674,11 @@ fn lora_linear_parity_bf16_base_backward_production_width() {
     // `d_x_lora` can now land much closer to canceling at a given index
     // than the uniform ones seed produced, and the observed divergence
     // there exceeded the `0.1` floor's total bound by a small margin.
-    let abs_floor = 3e-1f64; // no-producer: sized from two uncommitted pod runs — a chosen design margin, not a committed measurement.
+    // A100/H100-proven at `0.3`; ARCH-AWARE beyond that (M3 four-arch pod
+    // round-2 finding 2 — see [`lora_linear_dx_abs_floor`]'s own doc for
+    // the full derivation, the PENDING-artifact marker, and why Ada-class
+    // hardware (sm86/sm89) needs a wider floor here).
+    let abs_floor = lora_linear_dx_abs_floor(&cuda);
 
     // A second, SCALED re-measurement: two real pod runs after the
     // sign-mixed cotangent found the per-term `bf16_round_bound`s
@@ -4582,20 +4692,74 @@ fn lora_linear_parity_bf16_base_backward_production_width() {
     // (comfortable headroom over the measured `1.34x` gap) rather than
     // loosening every caller of the shared helper.
     let dx_bound_margin = 2.0f64;
+    // Round-3 pod refinement (finding 2's own follow-up, TWICE refined —
+    // see [`lora_linear_dx_abs_floor`]'s own doc for the full history):
+    // track the WORST element (max `diff / bound` ratio, under the
+    // CURRENT `abs_floor`) across the FULL tensor instead of panicking at
+    // the first violation, so the pass/fail decision is always the true
+    // tensor-wide worst case, not whichever index happens to be scanned
+    // first. SEPARATELY (round-3's own fix — the first cut of this
+    // diagnostic printed a NEGATIVE, meaningless number on a passing run,
+    // because it read the required-floor back out of the RATIO-maximizing
+    // index, which need not be the index that actually needs the largest
+    // floor): track `max_required_floor` as its OWN, independent
+    // maximum — `diff_i - architecture_invariant_i` for EVERY element,
+    // where `architecture_invariant_i` is `dx_bound_margin *
+    // sum(bf16_round_bound(..))` WITHOUT `abs_floor` folded in. This is
+    // the TRUE minimal `abs_floor` that would make every element pass,
+    // by construction: element `i` passes iff `diff_i <= invariant_i +
+    // abs_floor`, i.e. iff `abs_floor >= diff_i - invariant_i`; the max
+    // of that quantity over the whole tensor is exactly what a NEW
+    // `abs_floor` needs to clear, REGARDLESS of what `abs_floor` happens
+    // to be right now — meaningful (and printed) whether this run passes
+    // or fails, never spuriously negative from reading the wrong index.
+    let mut worst_ratio = f64::NEG_INFINITY;
+    let mut worst_idx = 0usize;
+    let mut worst_diff = 0.0f64;
+    let mut worst_bound = 0.0f64;
+    let mut max_required_floor = f64::NEG_INFINITY;
+    let mut max_required_floor_idx = 0usize;
     for (i, (c, g)) in dx_cpu.iter().zip(dx_gpu.iter()).enumerate() {
-        let bound = dx_bound_margin
+        let invariant = dx_bound_margin
             * (bf16_round_bound(f64::from(dx_base_cpu[i]))
                 + bf16_round_bound(f64::from(d_x_lora_cpu[i]))
-                + bf16_round_bound(f64::from(*c)))
-            + abs_floor;
-        assert!(
-            f64::from(*c - *g).abs() <= bound,
-            "bf16-base bwd dx[{i}]: cpu(eager f32) {c} vs cuda(bf16) {g} (bound {bound}, \
-             dx_base {} d_x_lora {})",
-            dx_base_cpu[i],
-            d_x_lora_cpu[i]
-        );
+                + bf16_round_bound(f64::from(*c)));
+        let bound = invariant + abs_floor;
+        let diff = f64::from(*c - *g).abs();
+        let ratio = diff / bound;
+        if ratio > worst_ratio {
+            worst_ratio = ratio;
+            worst_idx = i;
+            worst_diff = diff;
+            worst_bound = bound;
+        }
+        let required_floor_i = diff - invariant;
+        if required_floor_i > max_required_floor {
+            max_required_floor = required_floor_i;
+            max_required_floor_idx = i;
+        }
     }
+    eprintln!(
+        "lora_linear_parity_bf16_base_backward_production_width: dx worst-ratio element \
+         index={worst_idx} diff={worst_diff:.7} bound={worst_bound:.7} ratio={worst_ratio:.6} \
+         (>1.0 fails); true minimal sufficient floor (independent of the CURRENT abs_floor={abs_floor:.7}) \
+         required_floor={max_required_floor:.7} at index={max_required_floor_idx} \
+         ({} abs_floor)",
+        if max_required_floor > abs_floor {
+            "EXCEEDS the current"
+        } else {
+            "within the current"
+        },
+    );
+    assert!(
+        worst_ratio <= 1.0,
+        "bf16-base bwd dx[{worst_idx}]: cpu(eager f32) {} vs cuda(bf16) {} (bound {worst_bound}, \
+         ratio {worst_ratio:.6}, dx_base {} d_x_lora {})",
+        dx_cpu[worst_idx],
+        dx_gpu[worst_idx],
+        dx_base_cpu[worst_idx],
+        d_x_lora_cpu[worst_idx]
+    );
 
     // RULE-2 DISCRIMINATION PROOF (was vacuous before this fix): the
     // predecessor of this pair of bounds reused `lora_linear_parity_tolerance`

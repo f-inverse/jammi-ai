@@ -1,0 +1,58 @@
+{
+ "schema_version": 1,
+ "unit": "m3-arch-set-a40",
+ "git_sha": "80a451aa0d5dbaa07a1f0594d94453fa3fe03a29",
+ "date": "2026-08-28T13:30:00Z",
+ "box": "jammi-a40 (NVIDIA A40, driver 580.159.04, compute_cap 8.6)",
+ "driver": "580.159.04",
+ "gpu": "NVIDIA A40",
+ "features": "cuda,flash-attn",
+ "status": "GREEN",
+ "env": {
+  "JAMMI_REQUIRE_CUDA": "1",
+  "JAMMI_REQUIRE_FLASH": "1",
+  "JAMMI_REQUIRE_FLASH_ORACLE": "1",
+  "JAMMI_FLASH_ORACLE_MODEL_DIR": "/root/checkpoints/ModernBERT-large"
+ },
+ "producer": {
+  "path": "crates/jammi-encoders/src/modernbert.rs",
+  "kind": "cargo-test",
+  "invocation": "JAMMI_REQUIRE_CUDA=1 JAMMI_REQUIRE_FLASH=1 JAMMI_REQUIRE_FLASH_ORACLE=1 JAMMI_FLASH_ORACLE_MODEL_DIR=<checkpoint> cargo test -p jammi-encoders --lib --features cuda,flash-attn -- --exact modernbert::tests::flash_arm_padded_matches_block_arm_on_real_rows_cuda",
+  "gating": "env:JAMMI_REQUIRE_CUDA"
+ },
+ "observed": {
+  "flash_arm_padded_real_row_ratio_per_seed": {
+   "201": 0.12697,
+   "202": 0.11979,
+   "203": 0.23006,
+   "204": 0.12003,
+   "205": 0.11312,
+   "206": 0.13894,
+   "207": 0.20803,
+   "208": 0.13804
+  },
+  "mean": 0.149374,
+  "max": 0.230063,
+  "bound_at_run": 0.5,
+  "note": "sm86: same 99KB tier as sm89 but a DIFFERENT cuBLAS accumulation kernel (lora sweep: worst element 196871 ratio 0.225, deterministic over 40 repeats \u2014 keeps the tight 0.3 floor). 80GB-class encoder legs capability-skip honestly (46GB device)"
+ },
+ "note": "Per-arch validation evidence for the M3 compiled-arch-set widening (sm80/86/89/90) at the branch tip. Full flash leg suite green on this arch under the 4-gencode build: kernels flash_smoke + flash_op_oracles + cuda_parity, encoders full suite (8-seed padded parity oracle + all RED controls; the 80GB-class encoder-level legs capability-skip with the named VRAM reason \u2014 this arch's parity evidence is the suites whose truth arms fit), bench padded legs (exact-arch-set gate). Bounds asserted UNCHANGED from their sm80 derivations (D5) and hold on this arch. This artifact is the VALIDATED_SMS entry's evidence for compute_cap 8.6. PROVENANCE: branch sha \u2014 the train PR must land as a MERGE COMMIT.",
+ "legs": [
+  {
+   "name": "flash_smoke + flash_op_oracles + cuda_parity (jammi-kernels, flash-attn)",
+   "status": "ok",
+   "failed": 0,
+   "note": "cuda_parity includes the per-arch lora_linear floor (sm89: 2.0 sweep-derived; sm86: tight 0.3) and proves jammi's own compute_80 PTX forward-compat on this arch"
+  },
+  {
+   "name": "jammi-encoders full suite (cuda,flash-attn) incl. 8-seed padded oracle + 4 RED controls",
+   "status": "ok",
+   "failed": 0
+  },
+  {
+   "name": "finetune_step_padded_cuda (jammi-bench; a5 + a3, arch-set gate)",
+   "status": "ok",
+   "failed": 0
+  }
+ ]
+}

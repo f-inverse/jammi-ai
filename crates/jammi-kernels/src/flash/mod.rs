@@ -61,7 +61,7 @@
 //! | a buffer's element count `!=` the shape's | `FlashError::Geometry` |
 //! | `dq_accum` split count `!=` `dq_accum_splits` | `FlashError::Geometry` |
 //! | args struct size `!=` the C struct's | `FlashError::Refused(Abi)` |
-//! | device compute capability `!=` EXACTLY the build's (`check_arch`, P6 Stage B §3.4) | `FlashError::Arch` |
+//! | device compute capability not a MEMBER of the build's VALIDATED arch set (`check_arch`) | `FlashError::Arch` |
 //! | a sequence length `== 0`, or the batch is empty (`CuSeqlens::from_lengths`) | `FlashError::Geometry` |
 //! | `total_q`/per-length `> i32::MAX` (`CuSeqlens::from_lengths`) | `FlashError::Geometry` |
 //!
@@ -169,6 +169,8 @@ use candle_core::cuda_backend::cudarc::driver::{
 use candle_core::CudaDevice;
 use half::bf16;
 use thiserror::Error;
+
+use crate::admission::{flash_validated_arches, ComputeCapability};
 
 /// The `extern "C"` surface of `flash_api_jammi.h`, verbatim. Public so the
 /// smoke test can drive refusals the safe API makes unrepresentable
@@ -346,24 +348,49 @@ pub enum FlashError {
     /// A Rust-side domain refusal: geometry, config, or buffer length.
     #[error("flash-attn: {0}")]
     Geometry(String),
-    /// The device's compute capability does not EXACTLY match the one
-    /// `build.rs` compiled this crate's cubin for (`check_arch`, P6 Stage
-    /// B contract §3.4). Deliberately a distinct variant from `Geometry`
-    /// (an architecture mismatch is a capability question, not a shape
-    /// one) and distinct from `FlashStatus::ComputeCapability` (the C
-    /// wrapper's own `cc_major < 8` guard, `flash_api_jammi.cu:151-156`
-    /// — major-only, so it would NOT catch an sm_90 device on an sm_80-only
-    /// cubin; this Rust-side check is exact-equality and runs first).
+    /// The device's compute capability is not a MEMBER of the SET of
+    /// compute capabilities `crate::admission::flash_validated_arches()`
+    /// names — the VALIDATED set (compiled AND has a green pod parity
+    /// leg), not merely `build.rs`'s compiled set (`check_arch`; round-2
+    /// audit finding C widened this variant's own meaning from "compiled"
+    /// to "validated" the same way `check_arch` itself was widened).
+    /// Deliberately a distinct variant from `Geometry` (an architecture
+    /// mismatch is a capability question, not a shape one) and distinct
+    /// from `FlashStatus::ComputeCapability` (the C wrapper's own
+    /// `cc_major < 8` guard, `flash_api_jammi.cu:151-156` — major-only, so
+    /// it would NOT catch e.g. an sm_87 device on an sm_80/86/89/90-only
+    /// build; this Rust-side check is exact SET membership and runs
+    /// first). Membership is exact and enumerated, never `>=` and never
+    /// major-compat (M3 plan D2): an sm_86 device is admitted only because
+    /// `86` is literally in the validated set, not because `8 >= 8`.
+    ///
+    /// `built_for`/`built_for_sms` are a DELIBERATE dual representation of
+    /// the SAME set (round-2 audit advisory), not independent sources:
+    /// `built_for` (`Vec<(u32, u32)>`, one tuple per validated arch) is
+    /// what [`arch_mismatch`] already has on hand — the SAME
+    /// `&[ComputeCapability]` `flash_validated_arches()` returned,
+    /// re-mapped to plain tuples for a `{:?}` that prints `(8, 0)` rather
+    /// than `ComputeCapability { major: 8, minor: 0 }`; `built_for_sms`
+    /// (`String`) is a SEPARATE, purely cosmetic read of
+    /// `env!("JAMMI_FLASH_GENCODE_SMS")` (note: still the COMPILED env
+    /// var, not `JAMMI_FLASH_VALIDATED_SMS` — this field's own doc below
+    /// names it as "the -gencode sm list", i.e. what's compiled, shown
+    /// alongside `built_for`'s validated tuples for a reader comparing the
+    /// two) for the message's `-gencode sm list: ...` clause. Neither
+    /// field is independently authoritative; both are derived, at the ONE
+    /// call site that constructs this variant, from values already
+    /// computed elsewhere.
     #[error(
-        "flash-attn: device compute capability {device:?} does not exactly match the \
-         (major, minor) this crate's cubin was built for {built_for:?} — this build embeds \
-         ONLY a sm_{built_for_sm} cubin (no PTX), so a newer device cannot JIT a different, \
-         unvalidated kernel variant; it would either fail to load the module or (if the C \
-         wrapper's own major-only guard also missed it) silently run an unverified code path"
+        "flash-attn: device compute capability {device:?} is not a member of this crate's \
+         validated arch set {built_for:?} (compiled -gencode sm list: {built_for_sms}) — this \
+         build embeds ONLY those cubins (no PTX), so a device outside the set cannot JIT a \
+         different, unvalidated kernel variant; it would either fail to load the module or (if \
+         the C wrapper's own major-only guard also missed it) silently run an unverified code \
+         path"
     )]
     Arch {
-        built_for: (u32, u32),
-        built_for_sm: String,
+        built_for: Vec<(u32, u32)>,
+        built_for_sms: String,
         device: (usize, usize),
     },
     /// A cudarc driver call (context binding) failed.
@@ -453,69 +480,45 @@ fn check_abi() -> Result<()> {
     }
 }
 
-/// `build.rs`'s ONE `-gencode` literal, parsed from the `JAMMI_FLASH_GENCODE_SM`
-/// env var it emits beside that literal (`cargo:rustc-env=JAMMI_FLASH_GENCODE_SM=<sm>`,
-/// e.g. `"80"`) — never independently retyped, so this and the actual
-/// compiled cubin cannot drift apart. Two-digit `sm_XX` codes split as
-/// (all digits but the last, last digit) = (major, minor) — true of every
-/// NVIDIA compute capability this crate could plausibly target (`sm_80`,
-/// `sm_86`, `sm_89`, `sm_90`); a future 3-digit code (e.g. a hypothetical
-/// `sm_100`) would need `parse_gencode_sm` to change, which
-/// `gencode_sm_parses_the_pinned_build_value` below would catch (it pins
-/// the exact CURRENT value, not just "parses without erroring").
-fn parse_gencode_sm(sm: &str) -> Result<(u32, u32)> {
-    if sm.len() < 2 || !sm.chars().all(|c| c.is_ascii_digit()) {
-        return Err(FlashError::Geometry(format!(
-            "JAMMI_FLASH_GENCODE_SM = {sm:?}: expected at least two ASCII digits"
-        )));
-    }
-    let split = sm.len() - 1;
-    let (major_s, minor_s) = sm.split_at(split);
-    let major: u32 = major_s.parse().map_err(|_| {
-        FlashError::Geometry(format!(
-            "JAMMI_FLASH_GENCODE_SM = {sm:?}: major digits {major_s:?} do not parse as u32"
-        ))
-    })?;
-    let minor: u32 = minor_s.parse().map_err(|_| {
-        FlashError::Geometry(format!(
-            "JAMMI_FLASH_GENCODE_SM = {sm:?}: minor digit {minor_s:?} does not parse as u32"
-        ))
-    })?;
-    Ok((major, minor))
-}
-
-/// The compute capability this build's cubin was compiled for, from
-/// `build.rs`'s `JAMMI_FLASH_GENCODE_SM`.
-fn built_for_compute_cap() -> Result<(u32, u32)> {
-    parse_gencode_sm(env!("JAMMI_FLASH_GENCODE_SM"))
-}
-
-/// Pure core of [`check_arch`]: `None` iff `device` exactly matches
-/// `built_for`. Separated out so the mismatch cell is unit-testable
-/// without a device — the same `abi_mismatch`/`check_abi` split this
-/// module already uses.
-fn arch_mismatch(
-    built_for: (u32, u32),
-    built_for_sm: &str,
-    device: (usize, usize),
-) -> Option<FlashError> {
-    if (device.0 as u32, device.1 as u32) == built_for {
+/// Pure core of [`check_arch`]: `None` iff `device` is a MEMBER of
+/// `validated` (`crate::admission::flash_validated_arches()` — this
+/// module's SOLE source for the admission set, per round-2 audit findings
+/// F3 (delete the module's own independently-retyped parser; consume
+/// `admission.rs`'s accessor directly — `flash` is
+/// `#[cfg(feature = "flash-attn")]`-gated but `admission` is NOT, and
+/// `flash-attn` implies `cuda`, so `admission`'s items are always
+/// reachable here) and C (that accessor is now `flash_validated_arches`,
+/// not `flash_built_arches` — "compiled" was proven an insufficient
+/// admission criterion on its own; see `flash_validated_arches`'s own
+/// doc). Separated out from `check_arch` so the mismatch cell is
+/// unit-testable without a device — the same `abi_mismatch`/`check_abi`
+/// split this module already uses. Membership, never `>=` and never
+/// major-compat (M3 plan D2) — see [`FlashError::Arch`]'s own doc for why.
+fn arch_mismatch(validated: &[ComputeCapability], device: (usize, usize)) -> Option<FlashError> {
+    let probed = ComputeCapability::new(device.0, device.1);
+    if validated.contains(&probed) {
         return None;
     }
     Some(FlashError::Arch {
-        built_for,
-        built_for_sm: built_for_sm.to_string(),
+        built_for: validated
+            .iter()
+            .map(|c| (c.major as u32, c.minor as u32))
+            .collect(),
+        built_for_sms: env!("JAMMI_FLASH_GENCODE_SMS").to_string(),
         device,
     })
 }
 
-/// Refuses a device whose compute capability is not EXACTLY the one this
-/// crate's cubin was built for (see [`FlashError::Arch`]'s doc for why
-/// exact, not "at least"). Checked beside [`check_abi`] at every launch
-/// (`flash_varlen_fwd_into`, `flash_varlen_bwd_into`) — a cheap driver
-/// query, not a hot-path cost.
+/// Refuses a device whose compute capability is not a MEMBER of the
+/// VALIDATED set of arches this crate admits (see [`FlashError::Arch`]'s
+/// doc for why set membership, never "at least"). Checked beside
+/// [`check_abi`] at every launch (`flash_varlen_fwd_into`,
+/// `flash_varlen_bwd_into`) — a cheap driver query, not a hot-path cost.
+/// Reads [`flash_validated_arches`] directly (see [`arch_mismatch`]'s own
+/// doc for why that is this module's ONE parser, not a second retyped
+/// one, and why it is the VALIDATED set, not merely the compiled one).
 fn check_arch(dev: &CudaDevice) -> Result<()> {
-    let built_for = built_for_compute_cap()?;
+    let validated = flash_validated_arches();
     // `compute_capability()` returns signed ints (cudarc mirrors the raw
     // CUDA driver attribute query, `cudaDeviceAttr`, which is `i32`);
     // `.max(0)` before the `usize` cast mirrors `admission.rs`'s own
@@ -525,7 +528,7 @@ fn check_arch(dev: &CudaDevice) -> Result<()> {
     // driver call.
     let (major, minor) = dev.cuda_stream().context().compute_capability()?;
     let device = (major.max(0) as usize, minor.max(0) as usize);
-    match arch_mismatch(built_for, env!("JAMMI_FLASH_GENCODE_SM"), device) {
+    match arch_mismatch(validated, device) {
         None => Ok(()),
         Some(e) => Err(e),
     }
@@ -1249,55 +1252,69 @@ mod tests {
     //! The pure cells of the refusal lattice (no device needed).
     use super::*;
 
+    /// Round-2 audit findings F3 (this module has NO parser of its own
+    /// anymore — deleted `parse_one_gencode_sm`/`parse_gencode_sms`/
+    /// `built_for_compute_caps`, see `arch_mismatch`'s own doc) and C
+    /// (`check_arch` reads the VALIDATED set, not merely the compiled
+    /// one): proves `check_arch`'s `crate::admission::
+    /// flash_validated_arches()` call site resolves to the pinned
+    /// four-arch VALIDATED set on a `flash-attn`-compiled build (this
+    /// test only compiles under that feature, which implies
+    /// `FLASH_COMPILED == true`, so `flash_validated_arches()` is
+    /// guaranteed non-empty here — see that function's own doc). This is
+    /// a SIBLING pin to `admission.rs`'s own
+    /// `flash_validated_arches_env_var_is_a_pinned_subset_of_compiled`
+    /// (which runs hermetically, in every feature configuration) — this
+    /// one instead proves the FEATURE-GATED consumer (`flash::check_arch`)
+    /// actually reads the same single source, on the one lane that can
+    /// compile it.
     #[test]
-    fn gencode_sm_parses_the_pinned_build_value() {
-        // Pins the CURRENT `build.rs` literal exactly (`arch=compute_80,
-        // code=sm_80`) — a change to that literal without updating this
-        // test is exactly the drift `built_for_compute_cap` exists to
-        // prevent silently; this asserts the derivation, not just "it
-        // parses something".
-        assert_eq!(parse_gencode_sm("80").unwrap(), (8, 0));
-        assert_eq!(built_for_compute_cap().unwrap(), (8, 0));
-    }
-
-    #[test]
-    fn gencode_sm_parses_every_two_digit_ampere_hopper_code() {
-        for (sm, want) in [
-            ("80", (8, 0)),
-            ("86", (8, 6)),
-            ("89", (8, 9)),
-            ("90", (9, 0)),
-        ] {
-            assert_eq!(parse_gencode_sm(sm).unwrap(), want, "sm_{sm}");
-        }
-    }
-
-    #[test]
-    fn gencode_sm_refuses_malformed_values() {
-        for bad in ["", "8", "8a", "-80", "sm80", " 80"] {
-            let e = parse_gencode_sm(bad).unwrap_err();
-            assert!(matches!(e, FlashError::Geometry(_)), "{bad:?}: {e}");
-        }
+    fn check_arch_reads_the_pinned_flash_validated_arches_set() {
+        assert_eq!(
+            flash_validated_arches(),
+            [
+                ComputeCapability::new(8, 0),
+                ComputeCapability::new(8, 6),
+                ComputeCapability::new(8, 9),
+                ComputeCapability::new(9, 0),
+            ]
+        );
     }
 
     #[test]
     fn arch_mismatch_cells() {
-        // Exact match: no error.
-        assert!(arch_mismatch((8, 0), "80", (8, 0)).is_none());
-        // Boundary the C wrapper's own major-only guard (`cc_major < 8`)
-        // MISSES but this Rust-side check must catch: a newer device on
-        // the same major (sm_86, still major 8).
-        let e = arch_mismatch((8, 0), "80", (8, 6)).unwrap();
-        assert!(matches!(e, FlashError::Arch { .. }), "{e}");
-        // A different major (sm_90) — also caught.
-        let e = arch_mismatch((8, 0), "80", (9, 0)).unwrap();
+        let built_for = vec![
+            ComputeCapability::new(8, 0),
+            ComputeCapability::new(8, 6),
+            ComputeCapability::new(8, 9),
+            ComputeCapability::new(9, 0),
+        ];
+        // Every compiled arch is admitted, exactly — set membership, never
+        // major-compat (M3 plan D2): `(8, 6)`/`(8, 9)` admit only because
+        // they are LITERALLY in the compiled set, not because `8 >= 8`.
+        for &admit in &built_for {
+            assert!(
+                arch_mismatch(&built_for, (admit.major, admit.minor)).is_none(),
+                "{admit:?} must be admitted -- it is in the compiled set"
+            );
+        }
+        // Refused: same major, but a MINOR the compiled set does not
+        // enumerate (sm_87) — the C wrapper's own major-only guard
+        // (`cc_major < 8`) MISSES this but this Rust-side check must catch
+        // it: membership is exact and enumerated, never "same major
+        // admits".
+        let e = arch_mismatch(&built_for, (8, 7)).unwrap();
         assert!(matches!(e, FlashError::Arch { .. }), "{e}");
         // An OLDER device (sm_70) — the C wrapper WOULD catch this
-        // (major < 8), but the Rust-side exact check catches it first
-        // either way, with a message naming both capabilities.
-        let e = arch_mismatch((8, 0), "80", (7, 0)).unwrap();
+        // (major < 8), but the Rust-side check catches it first either
+        // way, with a message naming both the device and the compiled set.
+        let e = arch_mismatch(&built_for, (7, 0)).unwrap();
         let msg = e.to_string();
-        assert!(msg.contains("(8, 0)") && msg.contains("(7, 0)"), "{msg}");
+        assert!(msg.contains("(7, 0)") && msg.contains("(8, 0)"), "{msg}");
+        // A NEWER, uncompiled major (a hypothetical sm100) — the typed
+        // refusal D1 requires rather than an unvalidated PTX JIT.
+        let e = arch_mismatch(&built_for, (10, 0)).unwrap();
+        assert!(matches!(e, FlashError::Arch { .. }), "{e}");
     }
 
     fn geom() -> VarlenGeometry {

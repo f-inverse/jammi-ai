@@ -34,8 +34,11 @@ workspace crate.
   global flag).
 
 - `flash` (feature `flash-attn`, implies `cuda`, never implied by it) — the
-  vendored FlashAttention-2 hdim64/bf16/sm80 varlen forward + backward
-  kernels (`third_party/flash-attention/`, tag v2.8.3.post1, unmodified,
+  vendored FlashAttention-2 hdim64/bf16 varlen forward + backward kernels,
+  compiled as native cubins for the VALIDATED sm80/86/89/90 set (never PTX
+  — see `third_party/flash-attention/VENDORED.md`'s "Supported archs" for
+  the per-arch compiled-vs-validated distinction)
+  (`third_party/flash-attention/`, tag v2.8.3.post1, unmodified,
   behind jammi's torch-free C wrapper `flash_api_jammi.cu`) and the safe
   Rust boundary over them: `flash_varlen_fwd` → `(o, lse)`,
   `flash_varlen_bwd` → `d_qkv`, packed `[total_q, 3, H, 64]` layout,

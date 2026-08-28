@@ -3,10 +3,11 @@ use std::collections::HashMap;
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 use jammi_db::error::{JammiError, Result};
-use jammi_db::store::manifest::ComputeDevice;
+use jammi_db::store::manifest::{ComputeDevice, ModelContentDigest};
 use jammi_encoders::{
     Bert, BertConfig, DistilBert, DistilBertConfig, ModernBert, ModernBertConfig, Pooling,
 };
+use sha2::Digest;
 
 use jammi_encoders::{
     ClipText, ClipTextConfig, HtsatAudio, HtsatAudioConfig, OpenClipVisionConfig,
@@ -400,6 +401,15 @@ pub struct CandleModel {
     /// `effective_precision` in `CandleBackend::load`). Output-affecting, so
     /// the materialization contract folds it into `ModelIdentity`.
     pub(crate) compute_precision: jammi_numerics::ComputePrecision,
+    /// The model's content digest (esc-057, K7): a SHA-256 fold of the
+    /// resolved model directory's `config.json` / `1_Pooling/config.json` /
+    /// tokenizer / weights bytes, computed once here by
+    /// [`compute_model_content_digest`] and carried through unchanged. See
+    /// that function for the exact input set and ordering. Output-affecting
+    /// (two directories that share one `model_id` but differ in any of those
+    /// bytes must never collide on one `DefinitionHash`), so the
+    /// materialization contract folds it into `ModelIdentity.content_digest`.
+    pub(crate) content_digest: ModelContentDigest,
 }
 
 /// Mean-pool the `[batch, seq, hidden]` tensor along seq using
@@ -538,6 +548,138 @@ fn pooling_from_config(cfg: Option<&serde_json::Value>, model_id: &str) -> Resul
     }
 
     Ok(distinct[0])
+}
+
+/// Streaming SHA-256 (hex-encoded) of `path`'s raw bytes, plus the byte
+/// length — a bounded-size buffer, never `std::fs::read`'s whole-file `Vec`:
+/// a real checkpoint's `model.safetensors` can be several GB, and loading it
+/// entirely into memory just to hash it would roughly double this call's
+/// peak RSS for no reason — the hasher only ever needs the current chunk.
+///
+/// This is the SOLE hashing routine [`compute_model_content_digest`] calls
+/// for every input file (config, `1_Pooling/config.json`, tokenizer,
+/// weights) — never a second, independently-drifting implementation.
+/// `jammi-bench` carries an function-identical streaming pattern
+/// (`crates/jammi-bench/src/finetune_step.rs::sha256_and_len`) for its own
+/// checkpoint-identity hashing, but `jammi-bench` depends on `jammi-ai` (not
+/// the reverse), so that implementation cannot be imported here — this is an
+/// independent copy of the same technique, not a divergent one.
+fn sha256_and_len(path: &std::path::Path) -> Result<(String, u64)> {
+    use std::io::Read;
+
+    let file = std::fs::File::open(path).map_err(|e| JammiError::Model {
+        model_id: path.display().to_string(),
+        message: format!("failed to open {path:?} for content-digest hashing: {e}"),
+    })?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut hasher = sha2::Sha256::new();
+    // 64 KiB: large enough to amortize per-read syscall overhead, small
+    // enough that this function's own peak RSS contribution stays negligible
+    // regardless of the file's total size.
+    let mut buf = [0u8; 65536];
+    let mut total_len: u64 = 0;
+    loop {
+        let n = reader.read(&mut buf).map_err(|e| JammiError::Model {
+            model_id: path.display().to_string(),
+            message: format!("failed to read {path:?} for content-digest hashing: {e}"),
+        })?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        total_len += n as u64;
+    }
+    Ok((hex::encode(hasher.finalize()), total_len))
+}
+
+/// Compute a resolved model's content digest (esc-057, K7): the
+/// [`ModelIdentity`](jammi_db::store::manifest::ModelIdentity) determinant
+/// that closes the defect where `model_id` alone did not change when the
+/// referenced directory's `1_Pooling/config.json`, tokenizer, or weights
+/// bytes changed. Called ONCE per model load, from [`CandleBackend::load`].
+///
+/// **Input set** — every file whose bytes are output-affecting relative to
+/// the bare `model_id` string: `resolved.config_path` (`config.json` or
+/// `open_clip_config.json`), `1_Pooling/config.json` when
+/// `resolved.pooling_config` is `Some` (mirrors exactly the presence check
+/// `pooling_from_config` itself gates on, so the digest never hashes a file
+/// the loader did not actually read), `resolved.tokenizer`'s file when
+/// present, and every path in `resolved.weights_paths`. Deliberately
+/// excludes `preprocessor_config.json`: not part of esc-057's determinant set
+/// (config + pooling + tokenizer + weights) and not resolved to a path
+/// `ResolvedModel` carries.
+///
+/// **Ordering** — entries are sorted by their path relative to the resolved
+/// model directory (`resolved.config_path`'s parent), lexicographically by
+/// UTF-8 bytes. NOT filesystem/readdir order (unspecified across platforms
+/// and mtimes) and NOT construction order — so the digest is reproducible
+/// across hosts and process runs regardless of how the resolver assembled
+/// `resolved.weights_paths`. A path that cannot be expressed relative to the
+/// model directory (e.g. a symlinked cache layout) falls back to its
+/// absolute-path string for both the sort key and the record below; still
+/// deterministic, just less legible.
+///
+/// **Combination** — each sorted entry is hashed once via [`sha256_and_len`]
+/// (the same streaming routine for every input, never duplicated), then
+/// folds its relative-path string, its own hex digest, and its byte length
+/// into one outer SHA-256 as a canonical `"{relpath}\0{hex}\0{len}\n"`
+/// record. The NUL/newline framing makes the combined digest unambiguous — a
+/// path cannot silently absorb bytes from an adjacent record.
+///
+/// **Errors are typed refusals (K2)** — an IO failure while hashing (a file
+/// vanishing between resolve and load, a permission error, a truncated read)
+/// propagates as a `JammiError`, never silently collapsing into
+/// [`ModelContentDigest::Unavailable`]. `Unavailable` is reserved for the
+/// external-producer import path (`pipeline::import`), which has no local
+/// model directory to hash at all — a categorically different case from "the
+/// loader tried to hash local files and failed."
+fn compute_model_content_digest(resolved: &ResolvedModel) -> Result<ModelContentDigest> {
+    let model_dir = resolved
+        .config_path
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+    let mut candidates: Vec<std::path::PathBuf> = vec![resolved.config_path.clone()];
+
+    // Hash `1_Pooling/config.json` iff the resolver actually read one — the
+    // identical presence test `pooling_from_config` gates its mean-fallback
+    // on, so the digest's input set can never drift from what was actually
+    // used to select the pooling strategy.
+    if resolved.pooling_config.is_some() {
+        candidates.push(model_dir.join("1_Pooling/config.json"));
+    }
+
+    if let Some(tokenizer) = &resolved.tokenizer {
+        candidates.push(tokenizer.path().to_path_buf());
+    }
+
+    candidates.extend(resolved.weights_paths.iter().cloned());
+
+    let mut entries: Vec<(String, std::path::PathBuf)> = candidates
+        .into_iter()
+        .map(|path| {
+            let rel = path
+                .strip_prefix(&model_dir)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| path.to_string_lossy().into_owned());
+            (rel, path)
+        })
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut combined = sha2::Sha256::new();
+    for (rel, path) in &entries {
+        let (hex_digest, len) = sha256_and_len(path)?;
+        combined.update(rel.as_bytes());
+        combined.update([0u8]);
+        combined.update(hex_digest.as_bytes());
+        combined.update([0u8]);
+        combined.update(len.to_string().as_bytes());
+        combined.update([b'\n']);
+    }
+
+    Ok(ModelContentDigest::Sha256(hex::encode(combined.finalize())))
 }
 
 impl CandleModel {
@@ -1276,6 +1418,13 @@ impl ModelBackend for CandleBackend {
     fn load(&self, resolved: &ResolvedModel, device_config: &DeviceConfig) -> Result<LoadedModel> {
         let device = select_device(device_config)?;
 
+        // Computed ONCE per model load, before the (potentially expensive)
+        // weight loading below, so a hashing IO failure (K2: a typed refusal,
+        // never a silent `Unavailable`) surfaces fast rather than after
+        // mmapping several GB of safetensors. See `compute_model_content_digest`
+        // for the exact input set and ordering.
+        let content_digest = compute_model_content_digest(resolved)?;
+
         let model_type = resolved
             .model_config
             .get("model_type")
@@ -1796,6 +1945,7 @@ impl ModelBackend for CandleBackend {
             id2label,
             ner_classifier,
             compute_precision: effective_precision,
+            content_digest,
         })))
     }
 
@@ -2688,6 +2838,10 @@ mod ner_nonfinite_logit_tests {
             id2label: Some(id2label),
             ner_classifier: Some(ner_classifier),
             compute_precision: jammi_numerics::ComputePrecision::F32,
+            // No real model directory backs this synthetic fixture, so there
+            // is nothing to hash — an arbitrary fixed placeholder is fine
+            // here (no test in this module asserts on the digest value).
+            content_digest: ModelContentDigest::Sha256("test-fixture-digest".into()),
         }
     }
 

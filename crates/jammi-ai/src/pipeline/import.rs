@@ -25,7 +25,10 @@ use std::collections::BTreeMap;
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::storage::StorageUrl;
-use jammi_db::store::manifest::{InputAnchor, MaterializationEnv, ModelIdentity};
+use jammi_db::store::manifest::{
+    InputAnchor, MaterializationEnv, ModelContentDigest, ModelContentDigestUnavailableReason,
+    ModelIdentity,
+};
 use jammi_db::store::{ComputedEmbeddingProvenance, EmbeddingTableSpec, ResultStore};
 
 use crate::model::ModelSource;
@@ -142,6 +145,17 @@ impl<'a> ImportPipeline<'a> {
                 // value, matching `IMPORT_BACKEND`'s "honest mechanism
                 // placeholder" stance.
                 compute_precision: jammi_numerics::ComputePrecision::default(),
+                // The external-producer import path has no local model
+                // directory — no config, pooling config, tokenizer, or
+                // weights files — to hash (esc-057, K7). This is the ONLY
+                // site in the crate that constructs
+                // `ModelContentDigest::Unavailable`; every local-load path
+                // (`session.rs`, `pipeline/embedding.rs`) always threads a
+                // real `Sha256` digest computed at load time, never this
+                // variant.
+                content_digest: ModelContentDigest::Unavailable(
+                    ModelContentDigestUnavailableReason::ExternalImport,
+                ),
             }],
         );
         // The sole input is the external vector object, which exposes no version

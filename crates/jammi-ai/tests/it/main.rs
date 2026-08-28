@@ -6,6 +6,7 @@ mod channel_contract;
 mod common;
 mod compute_precision;
 mod conformal;
+mod content_digest;
 mod context_predictor;
 mod context_set;
 mod cookbook;

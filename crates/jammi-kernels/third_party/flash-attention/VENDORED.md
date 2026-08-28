@@ -307,6 +307,8 @@ opposed to merely compiled):
 
 Note: sm86/sm89's rows above describe the pod's own confirmed-green evidence for the flash-attn arch fence specifically; the VRAM-floor skip (Finding 1) and the `lora_linear` bound (Finding 2) are BOTH fixed in the same commit as this table update but have not yet had a SECOND pod pass confirm them on real sm86/89 hardware — the lead's own next pod loop re-validates both. If that pass finds either fix insufficient, this table (and `VALIDATED_SMS`) is the first thing to revert.
 
+This table's own truth is enforced standing, not merely asserted once and trusted forever: `ci/scripts/check_arch_validation_freshness.py` re-demands the evidence above on every CI run — it requires each `VALIDATED_SMS` entry to have a committed, GREEN, ancestor-sha artifact under `crates/jammi-kernels/artifacts/cuda-runs/` (the discriminator is exactly the `compute_cap <major>.<minor>` substring each `box` field above carries) whose evidence predates no later change to `build.rs`, `src/flash/`, this directory (including this file), or `src/admission.rs`; a later change to any of those without a fresh pod pass turns a VALIDATED cell red on the next CI run rather than leaving it silently stale.
+
 ### `ptxas -v` register/spill counts
 
 **PLACEHOLDER — measured at pod phase** (M3 plan v2 delta 4). This agent's

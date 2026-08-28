@@ -264,19 +264,20 @@ class EncodeStepIdentityFieldsSubsetTests(unittest.TestCase):
             _extract_rust_fields_block(REPORT_RS, _PROVENANCE_FIELDS_BLOCK_RE, "EncodeStepTier")
         )
 
-    def test_encode_identity_fields_has_exactly_12_entries(self):
+    def test_encode_identity_fields_has_exactly_13_entries(self):
         self.assertEqual(
             len(identity_fields.ENCODE_IDENTITY_FIELDS),
-            12,
-            "identity_fields.py::ENCODE_IDENTITY_FIELDS must have EXACTLY 12 entries "
-            "(unit-62 CONTRACT.md §E3/E6's pinned list) — a count other than 12 means "
+            13,
+            "identity_fields.py::ENCODE_IDENTITY_FIELDS must have EXACTLY 13 entries "
+            "(unit-62 CONTRACT.md §E3/E6's pinned list, grown from 12 by the F-5 audit "
+            "fix's checkpoint_tokenizer_sha256 addition) — a count other than 13 means "
             "either this const drifted from EncodeStepTier::IDENTITY_FIELDS or the "
             "Rust side itself grew/shrank; re-derive from source, never bump to make "
             "this test pass.",
         )
         self.assertEqual(
             len(set(identity_fields.ENCODE_IDENTITY_FIELDS)),
-            12,
+            13,
             "ENCODE_IDENTITY_FIELDS contains a duplicate entry",
         )
 

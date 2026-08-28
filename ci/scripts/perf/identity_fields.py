@@ -210,6 +210,7 @@ ENCODE_IDENTITY_FIELDS = (
     "checkpoint_config_sha256",
     "checkpoint_weights_sha256",
     "checkpoint_weights_size_bytes",
+    "checkpoint_tokenizer_sha256",
     "pooling",
     "normalize",
     "warmup",

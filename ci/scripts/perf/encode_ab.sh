@@ -16,18 +16,23 @@
 # C16-style front-door record; eval is single-arm") and no forced-attention-
 # arm A/B either (CONTRACT.md's Frame: "NO forced-arm encode A/B" -- the
 # fused arms are training-only by design, `attention_arm` is constant on
-# this surface and FORBIDDEN from identity). The `jammi-bench encode-step`
-# CLI itself takes NO flags today (`EncodeStepParams` is a fixed const in
-# `main.rs`, CPU-hermetic (`CPU_HERMETIC_DEVICE`) by default) -- so the one
-# meaningful A/B this producer CAN run today is a same-binary,
-# same-premise REPRODUCIBILITY check: two independent invocations must
-# agree on every identity field (the complete output-affecting parameter
-# set for this surface), the same "r1 vs r2" replicate convention
-# `fa2_ab.sh` already uses for its own timing legs. `EncodeStepParams::
-# gpu_device` is a real struct field (`CPU_HERMETIC_DEVICE = -1` is only
-# `main.rs`'s own fixed default) -- a pod producer that threads a real CUDA
-# ordinal through it is bench-side (crates/jammi-bench, E3's domain) future
-# work, not this script's to add.
+# this surface and FORBIDDEN from identity). So the one meaningful A/B this
+# producer runs is a same-binary, same-premise REPRODUCIBILITY check: two
+# independent invocations must agree on every identity field (the complete
+# output-affecting parameter set for this surface), the same "r1 vs r2"
+# replicate convention `fa2_ab.sh` already uses for its own timing legs.
+#
+# `jammi-bench encode-step` takes ONE flag, `--cuda <ordinal>` (omit for
+# CPU -- `EncodeStepParams::gpu_device` defaults to `CPU_HERMETIC_DEVICE`,
+# `main.rs`'s CI-hermetic const), the SAME `Option<usize>` convention
+# `finetune_ab.sh`/`fa2_ab.sh` already thread through their own
+# `--cuda "$AB_CUDA_ORDINAL"`. This script mirrors that convention via
+# `ENCODE_AB_CUDA_ORDINAL` (below): UNSET keeps the CPU-hermetic default
+# path byte-for-byte unchanged (no `--cuda` flag, no `cuda` cargo feature);
+# SET threads `--cuda "$ENCODE_AB_CUDA_ORDINAL"` into both legs and builds
+# jammi-bench with `--features cuda` (the SAME feature `finetune_ab.sh`'s
+# own `checkout_and_build` always turns on for its GPU-only legs) so the
+# engine's CUDA backend is actually compiled in.
 #
 # Not a CI job (no GPU strictly required -- `encode-step` is CPU-hermetic by
 # default -- but this DOES build+run a real jammi-bench release binary, the
@@ -37,20 +42,26 @@
 #   ci/scripts/perf/encode_ab.sh
 #
 # Env vars:
-#   ENCODE_AB_OUT_DIR   where the merged report + raw legs land (default
-#                        "<repo>/.encode-ab-report/<UTC timestamp>").
-#   ENCODE_AB_DRY_RUN=1 print every command this script would run instead of
-#                        executing it, and write a `{"tool":"dry-run",...}`
-#                        stub per leg so the merge stage still runs
-#                        end-to-end against real (if fabricated-empty)
-#                        files. Never mutates the checkout, never touches
-#                        the network, never claims a real number.
+#   ENCODE_AB_OUT_DIR      where the merged report + raw legs land (default
+#                           "<repo>/.encode-ab-report/<UTC timestamp>").
+#   ENCODE_AB_CUDA_ORDINAL optional CUDA device ordinal (unset = CPU-
+#                           hermetic default, unchanged; when set, both
+#                           legs run `--cuda "$ENCODE_AB_CUDA_ORDINAL"` and
+#                           the build step adds `--features cuda`).
+#   ENCODE_AB_DRY_RUN=1    print every command this script would run instead
+#                           of executing it, and write a
+#                           `{"tool":"dry-run",...}` stub per leg so the
+#                           merge stage still runs end-to-end against real
+#                           (if fabricated-empty) files. Never mutates the
+#                           checkout, never touches the network, never
+#                           claims a real number.
 set -uo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 
 ENCODE_AB_DRY_RUN="${ENCODE_AB_DRY_RUN:-0}"
+ENCODE_AB_CUDA_ORDINAL="${ENCODE_AB_CUDA_ORDINAL:-}"
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT_DIR="${ENCODE_AB_OUT_DIR:-$REPO_ROOT/.encode-ab-report/$TS}"
 RAW_DIR="$OUT_DIR/raw"
@@ -73,8 +84,17 @@ run_cmd() {
 }
 
 if [ "$ENCODE_AB_DRY_RUN" != "1" ]; then
-  run_cmd cargo build --release -p jammi-bench --manifest-path "$REPO_ROOT/Cargo.toml" \
-    || { echo "::error::cargo build -p jammi-bench failed" >&2; exit 1; }
+  if [ -n "$ENCODE_AB_CUDA_ORDINAL" ]; then
+    # A CUDA ordinal was requested: pull in the engine's CUDA backend, the
+    # SAME `cuda` cargo feature `finetune_ab.sh`'s own `checkout_and_build`
+    # always turns on for its GPU-only legs -- without it `--cuda` has no
+    # device to select.
+    run_cmd cargo build --release -p jammi-bench --features cuda --manifest-path "$REPO_ROOT/Cargo.toml" \
+      || { echo "::error::cargo build -p jammi-bench --features cuda failed" >&2; exit 1; }
+  else
+    run_cmd cargo build --release -p jammi-bench --manifest-path "$REPO_ROOT/Cargo.toml" \
+      || { echo "::error::cargo build -p jammi-bench failed" >&2; exit 1; }
+  fi
 fi
 
 # --- provenance cross-check (unification contract C5.1), same shape as
@@ -105,7 +125,18 @@ run_leg() {
   local err_file="$RAW_DIR/${leg}.stderr"
   local exit_file="$RAW_DIR/${leg}.exit"
 
-  printf -- '--- %s: %q encode-step\n' "$leg" "$BIN"
+  # `--cuda` is OMITTED entirely when ENCODE_AB_CUDA_ORDINAL is unset, so the
+  # CPU-hermetic default path (`CPU_HERMETIC_DEVICE`, main.rs's own default)
+  # is byte-for-byte unchanged -- an explicit `--cuda 0` and "no flag at all"
+  # are not the same premise to pin two replicate legs' identity against.
+  local -a cmd=("$BIN" encode-step)
+  if [ -n "$ENCODE_AB_CUDA_ORDINAL" ]; then
+    cmd+=(--cuda "$ENCODE_AB_CUDA_ORDINAL")
+  fi
+
+  printf -- '--- %s: ' "$leg"
+  printf '%q ' "${cmd[@]}"
+  printf '\n'
 
   if [ "$ENCODE_AB_DRY_RUN" = "1" ]; then
     printf '{"tool":"dry-run","ab_dry_run":true,"leg":"%s"}\n' "$leg" > "$out_file"
@@ -115,7 +146,7 @@ run_leg() {
   fi
 
   local rc=0
-  "$BIN" encode-step > "$out_file" 2> "$err_file" || rc=$?
+  "${cmd[@]}" > "$out_file" 2> "$err_file" || rc=$?
   echo "$rc" > "$exit_file"
   if [ "$rc" -ne 0 ]; then
     echo "::warning::${leg} FAILED (exit ${rc}) -- recorded as a leg outcome; sweep continues." >&2

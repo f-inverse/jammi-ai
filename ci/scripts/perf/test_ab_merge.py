@@ -1068,6 +1068,58 @@ class LegPremiseCheckTests(unittest.TestCase):
         self.assertTrue(cfg["verdict"].startswith("INVALID"))
 
 
+class GenericLegPremiseCheckTests(unittest.TestCase):
+    """Unit-62 E6: `generic_leg_identity_fields`/`generic_leg_premise_violations`
+    -- the shared core `leg_identity_fields`/`leg_premise_violations` above
+    reduce to, factored out so `encode_ab.sh`'s own merge step (this unit's
+    NEW producer, ENCODE_IDENTITY_FIELDS-driven, two `jammi-bench encode-step`
+    replicate legs) can reuse the identical leg-premise-refusal logic instead
+    of hand-rolling a second comparator. These tests exercise the two
+    functions directly (no `finetune_ab.sh`/`main()` plumbing) against a
+    small synthetic field tuple -- the same shape ENCODE_IDENTITY_FIELDS has,
+    without depending on that tuple's exact membership so a future field
+    added there cannot spuriously break this generic-machinery test.
+    """
+
+    FIELDS = ("seed", "batch", "seq")
+
+    def test_matching_premise_across_two_legs_is_clean(self):
+        block_a = {"seed": 42, "batch": 8, "seq": 128}
+        block_b = {"seed": 42, "batch": 8, "seq": 128}
+        fields_a = ab_merge.generic_leg_identity_fields(block_a, self.FIELDS)
+        fields_b = ab_merge.generic_leg_identity_fields(block_b, self.FIELDS)
+        self.assertEqual(
+            ab_merge.generic_leg_premise_violations(self.FIELDS, fields_a, fields_b, "r1", "r2"),
+            [],
+        )
+
+    def test_differing_field_is_a_violation(self):
+        fields_a = ab_merge.generic_leg_identity_fields({"seed": 42, "batch": 8, "seq": 128}, self.FIELDS)
+        fields_b = ab_merge.generic_leg_identity_fields({"seed": 42, "batch": 16, "seq": 128}, self.FIELDS)
+        violations = ab_merge.generic_leg_premise_violations(self.FIELDS, fields_a, fields_b, "r1", "r2")
+        self.assertTrue(any("batch" in v and "r1" in v and "r2" in v for v in violations), violations)
+
+    def test_field_absent_from_one_side_is_a_violation_naming_that_side(self):
+        fields_a = ab_merge.generic_leg_identity_fields({"seed": 42, "batch": 8, "seq": 128}, self.FIELDS)
+        fields_b = ab_merge.generic_leg_identity_fields({"seed": 42, "seq": 128}, self.FIELDS)  # batch absent
+        violations = ab_merge.generic_leg_premise_violations(self.FIELDS, fields_a, fields_b, "r1", "r2")
+        self.assertTrue(any("batch" in v and "['r2']" in v for v in violations), violations)
+
+    def test_present_but_null_is_folded_into_missing_by_default(self):
+        """No `ENCODE_IDENTITY_FIELDS` entry is a `null_is_value_fields`
+        member (every one is `Nullable::NonNull` on `EncodeStepTier`) -- a
+        present-but-null value must be treated identically to an absent key
+        with the default (empty) `null_is_value_fields`.
+        """
+        fields = ab_merge.generic_leg_identity_fields({"seed": None, "batch": 8, "seq": 128}, self.FIELDS)
+        self.assertIs(fields["seed"], ab_merge._MISSING)
+
+    def test_null_is_value_fields_lets_a_present_null_match(self):
+        fields_a = ab_merge.generic_leg_identity_fields({"seed": None, "batch": 8, "seq": 128}, self.FIELDS, null_is_value_fields={"seed"})
+        fields_b = ab_merge.generic_leg_identity_fields({"seed": None, "batch": 8, "seq": 128}, self.FIELDS, null_is_value_fields={"seed"})
+        self.assertEqual(ab_merge.generic_leg_premise_violations(self.FIELDS, fields_a, fields_b), [])
+
+
 class LoraInitProvenanceTests(unittest.TestCase):
     """B4: `--lora-init` is overridable, and the merged report records
     which init each side actually used.

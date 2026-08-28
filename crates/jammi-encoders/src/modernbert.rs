@@ -3964,6 +3964,28 @@ mod tests {
     /// (both arms actually computing, on a real CUDA device) is
     /// [`forward_hidden_dispatches_attention_block_flash_fused_on_a_dense_cuda_bf16_checkpoint`]
     /// and its padded counterpart below.
+    ///
+    /// FEATURE-CONDITIONAL discriminator (pod round-2 audit finding): on a
+    /// `flash-attn` build this crate compiles the REAL
+    /// `forward_flash_ragged_attention`/`forward_flash_dense_attention`,
+    /// never the stubs above — this CPU-hermetic model stays F32 (BF16
+    /// matmul has no CPU arm in this candle build, confirmed by direct
+    /// experiment: forcing BF16 here fails EARLIER, inside the base
+    /// linear's own matmul, before ever reaching either attention arm),
+    /// so the RAGGED real op (which calls straight into
+    /// `jammi_kernels::ops::flash_attention_varlen_with_rope_ragged`,
+    /// no CPU-device pre-check of its own in THIS crate) refuses at that
+    /// op's shared `check_qkv_domain` dtype gate first — `"unsupported \
+    /// dtype F32 for op flash_attention_varlen"` — while the DENSE real
+    /// op (`forward_flash_dense_attention`) checks `qkv.device()` itself,
+    /// inline, BEFORE ever calling into `jammi-kernels` at all, so it
+    /// always refuses with `"... on a non-CUDA device"` regardless of
+    /// dtype/feature. The two refusals are STILL mutually exclusive
+    /// substrings (`"flash_attention_varlen"` only ever appears in the
+    /// ragged op's own dtype-domain error; `"non-CUDA device"` only in the
+    /// dense arm's device check), so this control keeps pinning
+    /// "dispatch reaches the ragged path, never the dense one" on BOTH
+    /// build flavors — never weakened to "any error".
     #[test]
     fn padded_vs_dense_flash_decision_reaches_the_ragged_vs_dense_stub_respectively() {
         let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
@@ -3993,21 +4015,37 @@ mod tests {
         let err = forward_hidden_forcing_flash_decision(&model, &input_ids, &mask, padded_decision)
             .unwrap_err()
             .to_string();
+        #[cfg(not(feature = "flash-attn"))]
         assert!(
             err.contains("padded/ragged arm"),
             "a genuinely padded Fused decision must reach forward_flash_ragged_attention's own \
              stub -- got: {err}"
+        );
+        #[cfg(feature = "flash-attn")]
+        assert!(
+            err.contains("flash_attention_varlen"),
+            "a genuinely padded Fused decision must reach the REAL \
+             flash_attention_varlen_with_rope_ragged op (its own dtype-domain refusal, on this \
+             F32 CPU-hermetic model -- see this test's own doc) -- got: {err}"
         );
 
         let dense_decision = fused_flash_for_test(vec![6, 6], 6, &device);
         let err = forward_hidden_forcing_flash_decision(&model, &input_ids, &mask, dense_decision)
             .unwrap_err()
             .to_string();
+        #[cfg(not(feature = "flash-attn"))]
         assert!(
             !err.contains("padded/ragged arm"),
             "a DENSE Fused decision must take the UNCHANGED dims3() branch and reach \
              forward_flash_dense_attention's own (pre-existing) stub, never the new ragged one \
              -- got: {err}"
+        );
+        #[cfg(feature = "flash-attn")]
+        assert!(
+            err.contains("non-CUDA device") && !err.contains("flash_attention_varlen"),
+            "a DENSE Fused decision must take the UNCHANGED dims3() branch and reach \
+             forward_flash_dense_attention's own CUDA-device refusal, NEVER the ragged entry's \
+             dtype-domain refusal -- got: {err}"
         );
     }
 
@@ -4024,6 +4062,17 @@ mod tests {
     /// == 0` claim needs every layer to actually SUCCEED, which needs a
     /// real CUDA device (see the padded CUDA parity test below for that
     /// leg).
+    ///
+    /// FEATURE-CONDITIONAL sanity check (pod round-2 audit finding, same
+    /// mechanism as
+    /// [`padded_vs_dense_flash_decision_reaches_the_ragged_vs_dense_stub_respectively`]'s
+    /// own doc): on a `flash-attn` build the REAL ragged op is compiled
+    /// and reached, refusing at its own dtype-domain gate
+    /// (`"unsupported dtype F32 for op flash_attention_varlen"`, this
+    /// CPU-hermetic model being F32) rather than the non-`flash-attn`
+    /// stub's `"padded/ragged arm"` text — the COUNTER assertions below
+    /// (the actual point of this test) are unaffected either way, since
+    /// `admit_cascade` fires BEFORE either variant is even called.
     #[test]
     fn padded_flash_decision_fires_the_cascade_fused_counter_before_the_cpu_stub_errors() {
         let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
@@ -4054,10 +4103,18 @@ mod tests {
         let err = forward_hidden_forcing_flash_decision(&model, &input_ids, &mask, padded_decision)
             .unwrap_err();
         let after = cascade_counters_for("attention_block_flash").snapshot();
+        let err_s = err.to_string();
+        #[cfg(not(feature = "flash-attn"))]
         assert!(
-            err.to_string().contains("padded/ragged arm"),
+            err_s.contains("padded/ragged arm"),
             "sanity: the error must be the ragged stub's, or this counter reading is not about \
-             the code path this test claims -- got: {err}"
+             the code path this test claims -- got: {err_s}"
+        );
+        #[cfg(feature = "flash-attn")]
+        assert!(
+            err_s.contains("flash_attention_varlen"),
+            "sanity: the error must be the REAL ragged op's own dtype-domain refusal, or this \
+             counter reading is not about the code path this test claims -- got: {err_s}"
         );
         assert_eq!(
             after.fused - before.fused,
@@ -4237,6 +4294,13 @@ mod tests {
     /// [`strict_mode_padded_flash_dispatch_is_unchanged_in_a_fresh_process`]
     /// spawns (guarded on `STRICT_PADDED_CHILD`, same pattern as
     /// [`op_disabled_padded_batch_child_process_body`]).
+    ///
+    /// FEATURE-CONDITIONAL sanity check (pod round-2 audit finding, same
+    /// mechanism as
+    /// [`padded_flash_decision_fires_the_cascade_fused_counter_before_the_cpu_stub_errors`]'s
+    /// own doc): on a `flash-attn` build this refuses at the REAL ragged
+    /// op's own dtype-domain gate, not the stub's `"padded/ragged arm"`
+    /// text.
     #[test]
     fn strict_mode_padded_flash_dispatch_child_process_body() {
         use jammi_kernels::admission::AdmissionMode;
@@ -4277,10 +4341,18 @@ mod tests {
                 forward_hidden_forcing_flash_decision(&model, &input_ids, &mask, padded_decision)
                     .unwrap_err();
             let after = cascade_counters_for("attention_block_flash").snapshot();
+            let err_s = err.to_string();
+            #[cfg(not(feature = "flash-attn"))]
             assert!(
-                err.to_string().contains("padded/ragged arm"),
+                err_s.contains("padded/ragged arm"),
                 "sanity: must be the ragged stub's error, not a Strict-mode StrictModeFallback \
-                 -- got: {err}"
+                 -- got: {err_s}"
+            );
+            #[cfg(feature = "flash-attn")]
+            assert!(
+                err_s.contains("flash_attention_varlen"),
+                "sanity: must be the REAL ragged op's own dtype-domain refusal, not a \
+                 Strict-mode StrictModeFallback -- got: {err_s}"
             );
             assert_eq!(
                 after.fused - before.fused,
@@ -4358,7 +4430,7 @@ mod tests {
         let ids = flash_oracle_synthetic_ids(batch, seq, config.vocab_size, seed, &cuda);
         // Right-padded prefix mask, mixed lengths, INCLUDING one full-length
         // row (proving this is genuinely padded, not degenerate dense).
-        let lengths = vec![seq, seq - 8, seq / 2, 5];
+        let lengths = [seq, seq - 8, seq / 2, 5];
         assert_eq!(lengths.len(), batch);
         let mut mask_data = vec![0u32; batch * seq];
         for (b, &len) in lengths.iter().enumerate() {
@@ -4534,6 +4606,26 @@ mod tests {
     /// [`flash_arm_padded_red_control_bwd_only_window_off_by_one_cuda`]
     /// below for the config-SPLIT control that isolates the backward-only
     /// case.
+    ///
+    /// CHECKED PREMISE (pod round-2 audit finding, this control's own
+    /// assert's words: "must change ... an oracle this cannot fail is
+    /// vacuous" — and on the FIRST fixture, at `seq=64`, it never fired):
+    /// a `w+/-1` radius change is observable ONLY for a row whose segment
+    /// is long enough that widening/narrowing the window by 1 actually
+    /// crosses into (or out of) a real key. Worked from row `0`'s window
+    /// `[0, min(L-1, w)]` (segment length `L`, radius `w`, symmetric for
+    /// row `L-1`): GROWING to `w+1` first differs from `w` (gains position
+    /// `w+1`) at `L = w+2`; SHRINKING to `w-1` first differs (loses
+    /// position `w`) one segment length EARLIER, at `L = w+1` — verified
+    /// numerically (`i in 0..L`, both directions, `w=64`, `L=62..68`) as
+    /// part of this fix. The BINDING (stricter) bound covering BOTH
+    /// deltas in the SAME control is therefore `L >= half_window + 2`,
+    /// asserted in-test below — the `seq=64` fixture's longest segment
+    /// (64) sat exactly AT `half_window`, two short of that threshold,
+    /// so NEITHER delta could ever fire no matter what the seam did (this
+    /// is why the assert must be `>=` the GROWING threshold, not the
+    /// looser shrinking one). A future fixture shrink now re-vacuates
+    /// LOUDLY (a failed `assert!`, not a silent pass) instead of silently.
     #[test]
     #[cfg(all(feature = "cuda", feature = "flash-attn"))]
     fn flash_arm_padded_red_control_window_radius_off_by_one_cuda() {
@@ -4560,9 +4652,21 @@ mod tests {
                 .unwrap();
         let weights = dir.join("model.safetensors");
         let seed = 84;
-        let (batch, seq) = (4usize, 64usize);
+        // `seq`/`lengths` sized so at least one segment CLEARS the
+        // `half_window + 2` visibility threshold (this doc's own "CHECKED
+        // PREMISE" section) -- 160 and 96 both clear it on a
+        // `half_window=64` checkpoint; 40 and 6 stay BELOW it, pinning the
+        // no-truncation regime too (both regimes exercised, not just one).
+        let (batch, seq) = (4usize, 160usize);
         let ids = flash_oracle_synthetic_ids(batch, seq, config.vocab_size, seed, &cuda);
-        let lengths = vec![seq, seq - 8, seq / 2, 6];
+        let lengths = [seq, 96, 40, 6];
+        let half_window = config.half_window();
+        assert!(
+            lengths.iter().any(|&len| len >= half_window + 2),
+            "checked premise: at least one segment length must reach half_window ({half_window}) \
+             + 2 for a w+/-1 radius mutation to be visible AT ALL -- see this test's own doc, \
+             \"CHECKED PREMISE\""
+        );
         let mut mask_data = vec![0u32; batch * seq];
         for (b, &len) in lengths.iter().enumerate() {
             for s in 0..len {
@@ -4784,6 +4888,22 @@ mod tests {
     /// blind to this exact fault class, whereas layer 0's gradient
     /// backpropagates through every later (including every LOCAL) layer's
     /// own backward first.
+    ///
+    /// CHECKED PREMISE (pod round-2 audit finding — this control's own
+    /// gradient assert FAILED to fail on the first fixture, at `seq=64`,
+    /// gradients bit-identical under the fault): a `w+/-1` radius change
+    /// only touches a row's REAL attended-key set when that row's segment
+    /// is long enough for the extra/missing radius step to cross into (or
+    /// out of) a real key — see
+    /// [`flash_arm_padded_red_control_window_radius_off_by_one_cuda`]'s
+    /// own "CHECKED PREMISE" doc for the exact `L >= half_window + 2`
+    /// (GROWING, the binding direction) / `L >= half_window + 1`
+    /// (SHRINKING) derivation (identical here: this control differs from
+    /// that one only in WHICH launch — forward vs. backward — carries the
+    /// wrong radius, never in what makes the radius change observable at
+    /// all). The `seq=64` fixture's longest segment (64) sat two short of
+    /// the threshold on a `half_window=64` checkpoint. Asserted in-test below
+    /// so a future fixture shrink re-vacuates LOUDLY instead of silently.
     #[test]
     #[cfg(all(feature = "cuda", feature = "flash-attn"))]
     fn flash_arm_padded_red_control_bwd_only_window_off_by_one_cuda() {
@@ -4812,9 +4932,20 @@ mod tests {
                 .unwrap();
         let weights = dir.join("model.safetensors");
         let seed = 85;
-        let (batch, seq) = (4usize, 64usize);
+        // Same sizing rationale as `flash_arm_padded_red_control_window_
+        // radius_off_by_one_cuda`'s own doc ("CHECKED PREMISE") -- 160/96
+        // clear the `half_window + 2` visibility threshold, 40/6 stay
+        // below it.
+        let (batch, seq) = (4usize, 160usize);
         let ids = flash_oracle_synthetic_ids(batch, seq, config.vocab_size, seed, &cuda);
-        let lengths = vec![seq, seq - 8, seq / 2, 6];
+        let lengths = vec![seq, 96, 40, 6];
+        let half_window = config.half_window();
+        assert!(
+            lengths.iter().any(|&len| len >= half_window + 2),
+            "checked premise: at least one segment length must reach half_window ({half_window}) \
+             + 2 for a w+/-1 radius mutation to be visible AT ALL -- see this test's own doc, \
+             \"CHECKED PREMISE\""
+        );
         let mut mask_data = vec![0u32; batch * seq];
         for (b, &len) in lengths.iter().enumerate() {
             for s in 0..len {

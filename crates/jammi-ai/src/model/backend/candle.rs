@@ -611,21 +611,35 @@ fn sha256_and_len(path: &std::path::Path) -> Result<(String, u64)> {
 /// `open_clip_config.json`), `1_Pooling/config.json` when
 /// `resolved.pooling_config` is `Some` (mirrors exactly the presence check
 /// `pooling_from_config` itself gates on, so the digest never hashes a file
-/// the loader did not actually read), `resolved.tokenizer`'s file when
-/// present, and every path in `resolved.weights_paths`. Deliberately
-/// excludes `preprocessor_config.json`: not part of esc-057's determinant set
-/// (config + pooling + tokenizer + weights) and not resolved to a path
-/// `ResolvedModel` carries.
+/// the loader did not actually read), `preprocessor_config.json` when
+/// `resolved.preprocessor_config` is `Some` (audit round 62, F-2: the CLAP
+/// audio tower reads its whole feature-extractor geometry from it — the
+/// identical reconstruction pattern as `1_Pooling/config.json`),
+/// `resolved.tokenizer`'s file when present, every path in
+/// `resolved.weights_paths`, and — when `resolved.adapter_path` is `Some`
+/// — the fine-tune adapter's own `adapter_config.json` /
+/// `adapter.safetensors` pair (audit round 62, F-1), gated by the IDENTICAL
+/// presence check [`CandleBackend::load`] itself applies before reading them
+/// (`adapter_config.json` and `adapter.safetensors` both exist under
+/// `adapter_path`) — never hashing a file the loader did not actually read,
+/// and never silently omitting one it did.
 ///
-/// **Ordering** — entries are sorted by their path relative to the resolved
-/// model directory (`resolved.config_path`'s parent), lexicographically by
-/// UTF-8 bytes. NOT filesystem/readdir order (unspecified across platforms
+/// **Ordering** — entries are sorted by their RELATIVE path, lexicographically
+/// by UTF-8 bytes. NOT filesystem/readdir order (unspecified across platforms
 /// and mtimes) and NOT construction order — so the digest is reproducible
 /// across hosts and process runs regardless of how the resolver assembled
-/// `resolved.weights_paths`. A path that cannot be expressed relative to the
-/// model directory (e.g. a symlinked cache layout) falls back to its
-/// absolute-path string for both the sort key and the record below; still
-/// deterministic, just less legible.
+/// `resolved.weights_paths`. Every entry is expressed relative to ONE of two
+/// fixed anchor directories: the resolved model directory
+/// (`resolved.config_path`'s parent) for config/pooling/preprocessor/
+/// tokenizer/weights, or `resolved.adapter_path` (prefixed `adapter/`, so it
+/// can never collide with a model-dir-anchored relpath of the same name) for
+/// the adapter pair — never an absolute, host-specific path. A candidate that
+/// cannot be expressed relative to its own anchor (every path this engine
+/// resolves today is always a child of one of the two anchors, so this is
+/// unreachable in production) is a typed refusal rather than a silent
+/// absolute-path fallback: folding an absolute path into a digest documented
+/// to be reproducible across hosts would make that claim false the moment two
+/// hosts mounted the SAME model content under different paths.
 ///
 /// **Combination** — each sorted entry is hashed once via [`sha256_and_len`]
 /// (the same streaming routine for every input, never duplicated), then
@@ -641,52 +655,141 @@ fn sha256_and_len(path: &std::path::Path) -> Result<(String, u64)> {
 /// external-producer import path (`pipeline::import`), which has no local
 /// model directory to hash at all — a categorically different case from "the
 /// loader tried to hash local files and failed."
-/// Enumerate the `(relpath, absolute_path)` input set both
-/// [`compute_model_content_digest`] (hashes the bytes) and
-/// [`compute_model_fingerprint`] (esc-058, `stat`s the metadata) walk — the
-/// SAME set, computed by this ONE function, so the fingerprint's file
-/// coverage can never drift from the digest's. See
-/// [`compute_model_content_digest`] for exactly which files this is, why, and
-/// the ordering guarantee (sorted lexicographically by `relpath`).
-fn content_digest_entries(resolved: &ResolvedModel) -> Vec<(String, std::path::PathBuf)> {
+fn content_digest_entries(resolved: &ResolvedModel) -> Result<Vec<(String, std::path::PathBuf)>> {
+    Ok(all_candidate_paths(resolved)?
+        .into_iter()
+        .filter(|(_, _, gated)| *gated)
+        .map(|(rel, path, _)| (rel, path))
+        .collect())
+}
+
+/// One entry `all_candidate_paths` walks: a path anchored under `anchor`
+/// (the directory its relative name is computed against), and whether the
+/// resolver's own presence check says this candidate is currently
+/// output-affecting for `resolved` (`gated`) — the filter
+/// [`content_digest_entries`] applies to turn the full candidate set into
+/// the digest's present-only input set.
+struct DigestCandidate {
+    path: std::path::PathBuf,
+    anchor: std::path::PathBuf,
+    gated: bool,
+}
+
+/// Enumerate the FULL `(relpath, absolute_path, gated)` candidate set both
+/// [`content_digest_entries`] (hashes the bytes — filtered to `gated` only)
+/// and [`compute_model_fingerprint`] (esc-058 F-4b, `stat`s every candidate
+/// including absent ones so a later APPEARANCE is detectable) walk — the SAME
+/// set, computed by this ONE function, so the two can never drift from each
+/// other. `1_Pooling/config.json` and `preprocessor_config.json` are always
+/// CANDIDATES (regardless of whether the resolver actually read one for
+/// THIS load) precisely so a file that did not exist at load time but
+/// appears later is still tracked; `gated` — not omission from this list —
+/// is what decides whether [`content_digest_entries`] hashes it right now.
+/// See [`compute_model_content_digest`] for exactly which files this is, why,
+/// and the ordering/anchoring guarantee.
+fn all_candidate_paths(
+    resolved: &ResolvedModel,
+) -> Result<Vec<(String, std::path::PathBuf, bool)>> {
     let model_dir = resolved
         .config_path
         .parent()
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| std::path::PathBuf::from("."));
 
-    let mut candidates: Vec<std::path::PathBuf> = vec![resolved.config_path.clone()];
+    let mut candidates: Vec<DigestCandidate> = vec![DigestCandidate {
+        path: resolved.config_path.clone(),
+        anchor: model_dir.clone(),
+        gated: true,
+    }];
 
-    // Hash `1_Pooling/config.json` iff the resolver actually read one — the
-    // identical presence test `pooling_from_config` gates its mean-fallback
-    // on, so the digest's input set can never drift from what was actually
-    // used to select the pooling strategy.
-    if resolved.pooling_config.is_some() {
-        candidates.push(model_dir.join("1_Pooling/config.json"));
-    }
+    // `1_Pooling/config.json`: gated for the digest by whether the resolver
+    // actually read one — the identical presence test `pooling_from_config`
+    // gates its mean-fallback on — but always a CANDIDATE for the
+    // fingerprint (F-4b: appearance must be detectable).
+    candidates.push(DigestCandidate {
+        path: model_dir.join("1_Pooling/config.json"),
+        anchor: model_dir.clone(),
+        gated: resolved.pooling_config.is_some(),
+    });
+
+    // `preprocessor_config.json` (F-2): same pattern — the CLAP audio
+    // tower's whole feature-extractor geometry lives here.
+    candidates.push(DigestCandidate {
+        path: model_dir.join("preprocessor_config.json"),
+        anchor: model_dir.clone(),
+        gated: resolved.preprocessor_config.is_some(),
+    });
 
     if let Some(tokenizer) = &resolved.tokenizer {
-        candidates.push(tokenizer.path().to_path_buf());
+        candidates.push(DigestCandidate {
+            path: tokenizer.path().to_path_buf(),
+            anchor: model_dir.clone(),
+            gated: true,
+        });
     }
 
-    candidates.extend(resolved.weights_paths.iter().cloned());
+    for weights in &resolved.weights_paths {
+        candidates.push(DigestCandidate {
+            path: weights.clone(),
+            anchor: model_dir.clone(),
+            gated: true,
+        });
+    }
 
-    let mut entries: Vec<(String, std::path::PathBuf)> = candidates
-        .into_iter()
-        .map(|path| {
-            let rel = path
-                .strip_prefix(&model_dir)
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| path.to_string_lossy().into_owned());
-            (rel, path)
-        })
-        .collect();
+    // The fine-tune adapter's own pair (F-1): anchored at `adapter_path`
+    // itself — NOT the base model's directory, which the adapter's files
+    // never live under (the resolver fetches them from the artifact store
+    // into their own directory) — gated by the SAME presence check
+    // `CandleBackend::load` applies (its `saved_adapter` read block, below)
+    // before reading them, so
+    // this candidate set can never drift from what the loader actually
+    // reads.
+    if let Some(adapter_dir) = &resolved.adapter_path {
+        let cfg_path = adapter_dir.join("adapter_config.json");
+        let weights_path = adapter_dir.join("adapter.safetensors");
+        let gated = cfg_path.exists() && weights_path.exists();
+        candidates.push(DigestCandidate {
+            path: cfg_path,
+            anchor: adapter_dir.clone(),
+            gated,
+        });
+        candidates.push(DigestCandidate {
+            path: weights_path,
+            anchor: adapter_dir.clone(),
+            gated,
+        });
+    }
+
+    let mut entries: Vec<(String, std::path::PathBuf, bool)> = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let rel = candidate
+            .path
+            .strip_prefix(&candidate.anchor)
+            .map_err(|_| JammiError::Model {
+                model_id: resolved.model_id.0.clone(),
+                message: format!(
+                    "content-digest enumeration: {:?} is not nested under its expected anchor \
+                     directory {:?} — every path this engine resolves today is always a child \
+                     of its own anchor (the model directory, or the adapter directory), so this \
+                     is a genuinely unexpected resolved-model shape; refusing rather than \
+                     silently folding an ABSOLUTE, host-specific path into a digest documented \
+                     to be reproducible across hosts",
+                    candidate.path, candidate.anchor
+                ),
+            })?;
+        let rel_string = if candidate.anchor == model_dir {
+            rel.to_string_lossy().into_owned()
+        } else {
+            format!("adapter/{}", rel.to_string_lossy())
+        };
+        entries.push((rel_string, candidate.path, candidate.gated));
+    }
     entries.sort_by(|a, b| a.0.cmp(&b.0));
-    entries
+    Ok(entries)
 }
 
 fn compute_model_content_digest(resolved: &ResolvedModel) -> Result<ModelContentDigest> {
-    let entries = content_digest_entries(resolved);
+    let entries = content_digest_entries(resolved)?;
 
     let mut combined = sha2::Sha256::new();
     for (rel, path) in &entries {
@@ -722,14 +825,28 @@ fn compute_model_content_digest(resolved: &ResolvedModel) -> Result<ModelContent
 /// decides WHEN a reload is triggered, and does not strengthen the digest's
 /// own guarantee.
 ///
+/// `(relpath, absolute_path, snapshot)` for one [`ModelFingerprint`] entry.
+/// `snapshot` is `Some((len, mtime))` when the candidate existed at load
+/// time, or `None` when it did not (see [`ModelFingerprint`]'s doc, F-4b).
+type FingerprintEntry = (
+    String,
+    std::path::PathBuf,
+    Option<(u64, std::time::SystemTime)>,
+);
+
 /// [`ModelCache::get_or_load`]: super::super::cache::ModelCache::get_or_load
 #[derive(Debug, Clone)]
 pub(crate) struct ModelFingerprint {
-    /// `(relpath, absolute_path, len, mtime)` per fingerprinted file, in the
-    /// same sorted order [`compute_model_content_digest`] folds them into the
-    /// digest. Empty for a synthetic (non-disk-backed) fixture, in which case
+    /// One entry per candidate file, in the same sorted order
+    /// [`all_candidate_paths`] returns. A fixed *present-only* snapshot
+    /// cannot detect a later-appearing output-affecting file (a
+    /// `1_Pooling/config.json`, `preprocessor_config.json`, or adapter pair
+    /// that did not exist at load time but exists at probe time) because
+    /// appearance never touches any `(len, mtime)` already being tracked —
+    /// recording the ABSENCE explicitly closes that blind spot. Empty for a
+    /// synthetic (non-disk-backed) fixture, in which case
     /// [`ModelFingerprint::probe`] is vacuously fresh.
-    entries: Vec<(String, std::path::PathBuf, u64, std::time::SystemTime)>,
+    entries: Vec<FingerprintEntry>,
 }
 
 impl ModelFingerprint {
@@ -742,66 +859,97 @@ impl ModelFingerprint {
         Self { entries: vec![] }
     }
 
-    /// Re-`stat` every fingerprinted file and compare against the load-time
+    /// Re-`stat` every candidate file and compare against the load-time
     /// snapshot.
     ///
-    /// - `Ok(true)` — every file's current `(len, mtime)` matches load time:
-    ///   serve the cached model.
-    /// - `Ok(false)` — at least one file's `len` or `mtime` diverged: the
-    ///   caller must evict and reload, never serve.
-    /// - `Err` — a fingerprinted file vanished or became unreadable between
-    ///   load and this probe: a typed refusal (K2), never silently treated as
+    /// - `Ok(true)` — every candidate's current on-disk state matches load
+    ///   time (present candidates have an unchanged `(len, mtime)`; absent
+    ///   candidates are still absent): serve the cached model.
+    /// - `Ok(false)` — at least one candidate diverged: either a present
+    ///   file's `len`/`mtime` changed, or an ABSENT-at-load-time candidate
+    ///   now EXISTS (F-4b) — the caller must evict and reload, never serve.
+    /// - `Err` — a candidate that was present at load time vanished or
+    ///   became unreadable, or a candidate that was absent at load time is
+    ///   now unreadable for a reason OTHER than still not existing (e.g. a
+    ///   permission error): a typed refusal (K2), never silently treated as
     ///   fresh (would replay stale weights) or as stale (would mask a real
     ///   IO failure as an ordinary reload, which would then hit the identical
     ///   error inside `compute_model_content_digest` anyway — surfacing it
     ///   here is strictly more informative, naming the probe as the cause).
     pub(crate) fn probe(&self) -> Result<bool> {
-        for (rel, path, len, mtime) in &self.entries {
-            let meta = std::fs::metadata(path).map_err(|e| JammiError::Model {
-                model_id: path.display().to_string(),
-                message: format!(
-                    "esc-058 staleness probe: {path:?} (fingerprinted as {rel:?} at load \
-                     time) is no longer readable: {e}"
-                ),
-            })?;
-            let current_mtime = meta.modified().map_err(|e| JammiError::Model {
-                model_id: path.display().to_string(),
-                message: format!(
-                    "esc-058 staleness probe: {path:?} has no mtime available on this \
-                     platform/filesystem: {e}"
-                ),
-            })?;
-            if meta.len() != *len || current_mtime != *mtime {
-                return Ok(false);
+        for (rel, path, snapshot) in &self.entries {
+            match std::fs::metadata(path) {
+                Ok(meta) => {
+                    let current_mtime = meta.modified().map_err(|e| JammiError::Model {
+                        model_id: path.display().to_string(),
+                        message: format!(
+                            "esc-058 staleness probe: {path:?} has no mtime available on this \
+                             platform/filesystem: {e}"
+                        ),
+                    })?;
+                    match snapshot {
+                        Some((len, mtime)) => {
+                            if meta.len() != *len || current_mtime != *mtime {
+                                return Ok(false);
+                            }
+                        }
+                        // Absent at load time, present now: an
+                        // output-affecting file APPEARED (F-4b).
+                        None => return Ok(false),
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && snapshot.is_none() => {
+                    // Still absent, exactly as at load time — fine.
+                }
+                Err(e) => {
+                    return Err(JammiError::Model {
+                        model_id: path.display().to_string(),
+                        message: format!(
+                            "esc-058 staleness probe: {path:?} (fingerprinted as {rel:?} at \
+                             load time) is no longer readable: {e}"
+                        ),
+                    });
+                }
             }
         }
         Ok(true)
     }
 }
 
-/// Compute the load-time staleness fingerprint (esc-058) over the SAME input
-/// set [`compute_model_content_digest`] hashes ([`content_digest_entries`] —
-/// never independently enumerated, so the two can't drift). `stat`s each
-/// file (never reads its bytes, unlike the digest). Errors are typed
-/// refusals (K2), the identical stance [`compute_model_content_digest`]
-/// takes: an IO failure while stat'ing propagates as a `JammiError`, never
-/// silently degrading to "no fingerprint" for a model that does have local
-/// files.
+/// Compute the load-time staleness fingerprint (esc-058) over the FULL
+/// candidate set [`all_candidate_paths`] returns ([`content_digest_entries`]'s
+/// present-only input set is a filtered VIEW of this same enumeration, so the
+/// two can never drift). `stat`s each candidate (never reads its bytes,
+/// unlike the digest); a candidate absent at load time is recorded as such
+/// (F-4b) rather than omitted. Errors are typed refusals (K2) for anything
+/// other than "does not exist", the identical stance
+/// [`compute_model_content_digest`] takes.
 fn compute_model_fingerprint(resolved: &ResolvedModel) -> Result<ModelFingerprint> {
-    let entries = content_digest_entries(resolved);
+    let entries = all_candidate_paths(resolved)?;
     let mut stamped = Vec::with_capacity(entries.len());
-    for (rel, path) in entries {
-        let meta = std::fs::metadata(&path).map_err(|e| JammiError::Model {
-            model_id: resolved.model_id.0.clone(),
-            message: format!("failed to stat {path:?} for esc-058 load-time fingerprinting: {e}"),
-        })?;
-        let mtime = meta.modified().map_err(|e| JammiError::Model {
-            model_id: resolved.model_id.0.clone(),
-            message: format!(
-                "{path:?} has no mtime available for esc-058 load-time fingerprinting: {e}"
-            ),
-        })?;
-        stamped.push((rel, path, meta.len(), mtime));
+    for (rel, path, _gated) in entries {
+        match std::fs::metadata(&path) {
+            Ok(meta) => {
+                let mtime = meta.modified().map_err(|e| JammiError::Model {
+                    model_id: resolved.model_id.0.clone(),
+                    message: format!(
+                        "{path:?} has no mtime available for esc-058 load-time fingerprinting: {e}"
+                    ),
+                })?;
+                stamped.push((rel, path, Some((meta.len(), mtime))));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                stamped.push((rel, path, None));
+            }
+            Err(e) => {
+                return Err(JammiError::Model {
+                    model_id: resolved.model_id.0.clone(),
+                    message: format!(
+                        "failed to stat {path:?} for esc-058 load-time fingerprinting: {e}"
+                    ),
+                });
+            }
+        }
     }
     Ok(ModelFingerprint { entries: stamped })
 }
@@ -1668,18 +1816,54 @@ impl ModelBackend for CandleBackend {
         // variant is the type-level switch that decides whether to wire
         // LoRA inside the encoder or leave it as an external projection
         // head applied post-pool.
+        //
+        // `resolved.adapter_path` is `Some` only via the fine-tuned-model
+        // catalog-lookup path (`ModelResolver::try_catalog_lookup`), which
+        // sets it exactly when a fine-tuned model record's `artifact_path`
+        // was fetched from the artifact store into a local directory — i.e.
+        // the resolver has already asserted "this model IS fine-tuned and
+        // its adapter bundle lives here". A missing `adapter_config.json` /
+        // `adapter.safetensors` under that directory therefore signals a
+        // genuinely broken artifact (a partial fetch, corruption, an
+        // artifact-store/catalog inconsistency) — not "no adapter". The
+        // pre-fix code (`.and_then` + `.ok()?`) silently collapsed BOTH a
+        // missing-file condition AND a read/parse failure into "serve the
+        // unadapted base model", which would drop the fine-tuning entirely
+        // with no signal to the caller (K2/K7: an output-affecting file that
+        // is expected to be present must fail loudly when it is not, never
+        // silently degrade to a different, unrequested model). Audit round
+        // 62, F-1's ruling: both conditions are now typed refusals.
         let saved_adapter: Option<(crate::fine_tune::target::SavedAdapter, std::path::PathBuf)> =
-            resolved.adapter_path.as_ref().and_then(|p| {
-                let cfg_path = p.join("adapter_config.json");
-                let weights_path = p.join("adapter.safetensors");
-                if !cfg_path.exists() || !weights_path.exists() {
-                    return None;
+            match resolved.adapter_path.as_ref() {
+                None => None,
+                Some(p) => {
+                    let cfg_path = p.join("adapter_config.json");
+                    let weights_path = p.join("adapter.safetensors");
+                    if !cfg_path.exists() || !weights_path.exists() {
+                        return Err(JammiError::Model {
+                            model_id: resolved.model_id.0.clone(),
+                            message: format!(
+                                "resolved adapter_path {p:?} is missing adapter_config.json \
+                                 and/or adapter.safetensors — a fine-tuned model's adapter \
+                                 directory must carry both files; refusing to silently fall \
+                                 back to serving the unadapted base model, which would drop \
+                                 the fine-tuning with no signal"
+                            ),
+                        });
+                    }
+                    let cfg_str =
+                        std::fs::read_to_string(&cfg_path).map_err(|e| JammiError::Model {
+                            model_id: resolved.model_id.0.clone(),
+                            message: format!("failed to read {cfg_path:?}: {e}"),
+                        })?;
+                    let saved: crate::fine_tune::target::SavedAdapter =
+                        serde_json::from_str(&cfg_str).map_err(|e| JammiError::Model {
+                            model_id: resolved.model_id.0.clone(),
+                            message: format!("failed to parse {cfg_path:?}: {e}"),
+                        })?;
+                    Some((saved, weights_path))
                 }
-                let cfg_str = std::fs::read_to_string(&cfg_path).ok()?;
-                let saved: crate::fine_tune::target::SavedAdapter =
-                    serde_json::from_str(&cfg_str).ok()?;
-                Some((saved, weights_path))
-            });
+            };
 
         let encoder_adapter = saved_adapter.as_ref().and_then(|(saved, weights)| {
             if let crate::fine_tune::target::SavedAdapter::EncoderAdapters(cfg) = saved {
@@ -3045,5 +3229,377 @@ mod ner_nonfinite_logit_tests {
             "expected every row to decode successfully, got row_status {:?}",
             output.row_status
         );
+    }
+}
+
+/// Audit round 62 (F-1, F-4b, and the strip-prefix-refusal advisory):
+/// unit-level proofs for mechanisms a full `ModelCache` /
+/// `InferenceSession` round-trip cannot reach directly.
+///
+/// The adapter-appearance (F-4b) and missing-adapter-files (F-1 ruling)
+/// scenarios specifically CANNOT be exercised through the public
+/// `ModelCache` today: `ModelResolver` only ever sets `adapter_path: Some`
+/// via the fine-tuned-model catalog-lookup path (a full fine-tune
+/// round-trip), and — after this round's F-1 fix — `CandleBackend::load`
+/// now hard-errors the instant `adapter_path` is `Some` with either file
+/// missing, so no cached/served `CandleModel` can ever exist in an
+/// "adapter_path Some, files absent" state to probe appearance against.
+/// Testing `compute_model_fingerprint` / `ModelFingerprint::probe` directly
+/// proves the mechanism is correct and general (the honest, function-level
+/// proof) rather than forcing an end-to-end scenario the production wiring
+/// no longer permits.
+#[cfg(test)]
+mod digest_fingerprint_audit62_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Copy the hermetic `tiny_bert` fixture's config/weights/tokenizer into
+    /// `dst` (no `1_Pooling/`, no `preprocessor_config.json`) and return a
+    /// `ResolvedModel` pointing at it, with `adapter_path` set to whatever
+    /// the caller passes. Hand-built rather than routed through
+    /// `ModelResolver` — every `ResolvedModel` field is `pub`, and this is
+    /// the same "resolved, not yet loaded" contract `ModelResolver::resolve`
+    /// itself fulfills; the resolver's OWN local-source path never produces
+    /// `adapter_path: Some` (only the fine-tuned-model catalog-lookup path
+    /// does), so constructing one directly is the only way to unit-test the
+    /// adapter-anchored candidates in isolation.
+    fn tiny_bert_resolved(
+        dst: &std::path::Path,
+        adapter_path: Option<std::path::PathBuf>,
+    ) -> ResolvedModel {
+        std::fs::create_dir_all(dst).unwrap();
+        let fixture = jammi_test_utils::cookbook_fixture("tiny_bert");
+        for name in ["config.json", "model.safetensors", "tokenizer.json"] {
+            std::fs::copy(fixture.join(name), dst.join(name)).unwrap();
+        }
+        let model_config: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(dst.join("config.json")).unwrap()).unwrap();
+        ResolvedModel {
+            model_id: crate::model::ModelId(format!("local:{}", dst.display())),
+            backend: crate::model::BackendType::Candle,
+            task: ModelTask::TextEmbedding,
+            config_path: dst.join("config.json"),
+            weights_paths: vec![dst.join("model.safetensors")],
+            tokenizer: Some(TokenizerSource::HuggingFaceJson(dst.join("tokenizer.json"))),
+            model_config,
+            preprocessor_config: None,
+            pooling_config: None,
+            base_model_id: None,
+            adapter_path,
+            estimated_memory: 0,
+        }
+    }
+
+    /// Write a valid `ProjectionHead`-flavoured `adapter_config.json` +
+    /// `adapter.safetensors` pair at `dir`. The weights carry a single
+    /// `marker` tensor — neither `projection.lora_a`/`lora_b` nor
+    /// `distribution.lora_a`/`lora_b`, so `load_projection_head` /
+    /// `load_distribution_head` both return `Ok(None)` and
+    /// `CandleBackend::load` succeeds as an ordinary (adapter-inert) load —
+    /// the adapter's FILES are still digested/fingerprinted, which is all
+    /// F-1/F-4b need; a `ProjectionHead` adapter with no matching keys
+    /// needs no `target_modules`/LoRA-shape knowledge of `tiny_bert` at all.
+    fn write_projection_adapter(dir: &std::path::Path, marker_value: f32) {
+        std::fs::create_dir_all(dir).unwrap();
+        let cfg_json = serde_json::json!({
+            "adapter_type": "projection_head",
+            "lora_rank": 4,
+            "lora_alpha": 8.0,
+            "use_rslora": false,
+            "head_layers": []
+        });
+        std::fs::write(
+            dir.join("adapter_config.json"),
+            serde_json::to_string(&cfg_json).unwrap(),
+        )
+        .unwrap();
+
+        let device = Device::Cpu;
+        let mut weights: HashMap<String, Tensor> = HashMap::new();
+        weights.insert(
+            "marker".to_string(),
+            Tensor::new(&[marker_value], &device).unwrap(),
+        );
+        candle_core::safetensors::save(&weights, dir.join("adapter.safetensors")).unwrap();
+    }
+
+    fn device_config() -> DeviceConfig {
+        DeviceConfig {
+            gpu_device: -1,
+            memory_fraction: 1.0,
+            require_gpu: false,
+            compute_precision: jammi_numerics::ComputePrecision::F32,
+        }
+    }
+
+    /// F-1 core: mutating `adapter.safetensors` bytes in place, under a
+    /// constant `resolved.model_id` / `adapter_path`, must change
+    /// `compute_model_content_digest`'s output — the peer of
+    /// `content_digest.rs`'s weights/tokenizer/pooling mutation tests, for
+    /// the adapter pair specifically. RED before F-1: `content_digest_entries`
+    /// never enumerated the adapter files at all, so this mutation was
+    /// invisible to the digest.
+    #[test]
+    fn adapter_weights_byte_mutation_changes_content_digest() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let adapter_tmp = tempfile::tempdir().unwrap();
+        write_projection_adapter(adapter_tmp.path(), 1.0);
+        let resolved = tiny_bert_resolved(
+            &model_tmp.path().join("model"),
+            Some(adapter_tmp.path().to_path_buf()),
+        );
+
+        let digest_before = compute_model_content_digest(&resolved).unwrap();
+
+        let weights_path = adapter_tmp.path().join("adapter.safetensors");
+        let mut bytes = std::fs::read(&weights_path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&weights_path, &bytes).unwrap();
+
+        let digest_after = compute_model_content_digest(&resolved).unwrap();
+
+        assert_ne!(
+            digest_before, digest_after,
+            "mutating adapter.safetensors bytes in place, under a constant \
+             adapter_path, must change the content digest (F-1)"
+        );
+    }
+
+    /// F-1 peer: the same mutation on `adapter_config.json` itself.
+    #[test]
+    fn adapter_config_byte_mutation_changes_content_digest() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let adapter_tmp = tempfile::tempdir().unwrap();
+        write_projection_adapter(adapter_tmp.path(), 1.0);
+        let resolved = tiny_bert_resolved(
+            &model_tmp.path().join("model"),
+            Some(adapter_tmp.path().to_path_buf()),
+        );
+
+        let digest_before = compute_model_content_digest(&resolved).unwrap();
+
+        let cfg_path = adapter_tmp.path().join("adapter_config.json");
+        let mut bytes = std::fs::read(&cfg_path).unwrap();
+        bytes.push(b'\n');
+        std::fs::write(&cfg_path, &bytes).unwrap();
+
+        let digest_after = compute_model_content_digest(&resolved).unwrap();
+
+        assert_ne!(
+            digest_before, digest_after,
+            "mutating adapter_config.json bytes in place must change the content \
+             digest (F-1)"
+        );
+    }
+
+    /// Non-vacuous control: an `adapter_path` that is `Some` but whose two
+    /// files do not (yet) exist is NOT an error for the DIGEST — the digest
+    /// mirrors the loader's own presence gate and simply omits the adapter
+    /// pair — even though (per the ruling below) `CandleBackend::load`
+    /// itself refuses to load such a model. The two concerns are decoupled
+    /// on purpose: enumerating candidates never fails just because a
+    /// candidate happens to be absent.
+    #[test]
+    fn missing_adapter_files_does_not_fail_digest_computation() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let adapter_tmp = tempfile::tempdir().unwrap(); // no adapter files written
+        let resolved = tiny_bert_resolved(
+            &model_tmp.path().join("model"),
+            Some(adapter_tmp.path().to_path_buf()),
+        );
+
+        let digest = compute_model_content_digest(&resolved);
+        assert!(
+            digest.is_ok(),
+            "an adapter_path with no adapter files yet must not fail digest \
+             computation: {digest:?}"
+        );
+    }
+
+    /// F-1 ruling: `resolved.adapter_path` is `Some` only via the
+    /// fine-tuned-model catalog-lookup path, which asserts "this model IS
+    /// fine-tuned, its adapter lives here" — so a missing
+    /// `adapter_config.json` / `adapter.safetensors` under that directory is
+    /// a typed refusal (K2/K7), never a silent fall-back to the unadapted
+    /// base model. Both files missing, and each file missing individually,
+    /// must all refuse.
+    #[test]
+    fn candle_backend_load_refuses_some_adapter_path_missing_files() {
+        let cases: [&str; 3] = ["neither", "config_only", "weights_only"];
+        for case in cases {
+            let model_tmp = tempfile::tempdir().unwrap();
+            let adapter_tmp = tempfile::tempdir().unwrap();
+            match case {
+                "config_only" => {
+                    write_projection_adapter(adapter_tmp.path(), 1.0);
+                    std::fs::remove_file(adapter_tmp.path().join("adapter.safetensors")).unwrap();
+                }
+                "weights_only" => {
+                    write_projection_adapter(adapter_tmp.path(), 1.0);
+                    std::fs::remove_file(adapter_tmp.path().join("adapter_config.json")).unwrap();
+                }
+                _ => {}
+            }
+            let resolved = tiny_bert_resolved(
+                &model_tmp.path().join("model"),
+                Some(adapter_tmp.path().to_path_buf()),
+            );
+            let backend = CandleBackend;
+            let result = backend.load(&resolved, &device_config());
+            assert!(
+                result.is_err(),
+                "case {case:?}: adapter_path Some with a missing adapter file must \
+                 refuse to load, never silently serve the unadapted base model"
+            );
+        }
+    }
+
+    /// Positive control for the refusal above: BOTH adapter files present
+    /// loads successfully — proves the refusal fires on absence
+    /// specifically, not on some incidental fixture/setup issue.
+    #[test]
+    fn candle_backend_load_succeeds_when_both_adapter_files_present() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let adapter_tmp = tempfile::tempdir().unwrap();
+        write_projection_adapter(adapter_tmp.path(), 1.0);
+        let resolved = tiny_bert_resolved(
+            &model_tmp.path().join("model"),
+            Some(adapter_tmp.path().to_path_buf()),
+        );
+        let backend = CandleBackend;
+        let result = backend.load(&resolved, &device_config());
+        assert!(
+            result.is_ok(),
+            "both adapter files present must load successfully: {:?}",
+            result.err()
+        );
+    }
+
+    /// F-4b: an adapter pair that did not exist when
+    /// `compute_model_fingerprint` ran, but exists by the time `probe` is
+    /// called, must flip the probe to stale (`Ok(false)`) — the mechanism a
+    /// production warm-hit reload depends on to detect a newly-appearing
+    /// output-affecting file. Contrasted with a no-op probe (nothing
+    /// changed) staying fresh, so this isn't vacuously always-stale.
+    #[test]
+    fn adapter_files_appearing_after_fingerprint_trips_the_probe() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let adapter_tmp = tempfile::tempdir().unwrap(); // absent at fingerprint time
+        let resolved = tiny_bert_resolved(
+            &model_tmp.path().join("model"),
+            Some(adapter_tmp.path().to_path_buf()),
+        );
+
+        let fingerprint = compute_model_fingerprint(&resolved).unwrap();
+        assert!(
+            fingerprint.probe().unwrap(),
+            "nothing changed yet: probe must report fresh"
+        );
+
+        write_projection_adapter(adapter_tmp.path(), 1.0);
+
+        assert!(
+            !fingerprint.probe().unwrap(),
+            "an adapter pair that appeared after the fingerprint was captured must \
+             trip the probe to stale (F-4b)"
+        );
+    }
+
+    /// F-4b peer: `1_Pooling/config.json` appearing after the fingerprint
+    /// was captured also trips the probe — proven at the same unit level as
+    /// the adapter case above (the end-to-end `ModelCache` peer of this test
+    /// lives in `cache_staleness.rs`).
+    #[test]
+    fn pooling_config_appearing_after_fingerprint_trips_the_probe() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = tiny_bert_resolved(&dst, None);
+        assert!(resolved.pooling_config.is_none());
+
+        let fingerprint = compute_model_fingerprint(&resolved).unwrap();
+        assert!(fingerprint.probe().unwrap());
+
+        let pooling_dir = dst.join("1_Pooling");
+        std::fs::create_dir_all(&pooling_dir).unwrap();
+        std::fs::write(
+            pooling_dir.join("config.json"),
+            r#"{"pooling_mode_cls_token": true}"#,
+        )
+        .unwrap();
+
+        assert!(
+            !fingerprint.probe().unwrap(),
+            "1_Pooling/config.json appearing after the fingerprint was captured \
+             must trip the probe to stale (F-4b)"
+        );
+    }
+
+    /// F-4b peer: `preprocessor_config.json` appearing after the fingerprint
+    /// was captured also trips the probe.
+    #[test]
+    fn preprocessor_config_appearing_after_fingerprint_trips_the_probe() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = tiny_bert_resolved(&dst, None);
+        assert!(resolved.preprocessor_config.is_none());
+
+        let fingerprint = compute_model_fingerprint(&resolved).unwrap();
+        assert!(fingerprint.probe().unwrap());
+
+        std::fs::write(
+            dst.join("preprocessor_config.json"),
+            r#"{"sample_rate": 48000}"#,
+        )
+        .unwrap();
+
+        assert!(
+            !fingerprint.probe().unwrap(),
+            "preprocessor_config.json appearing after the fingerprint was captured \
+             must trip the probe to stale (F-4b)"
+        );
+    }
+
+    /// Advisory: a candidate path that cannot be expressed relative to its
+    /// own anchor directory (every path this engine resolves today is
+    /// always a child of one) is a typed refusal, never a silent fold of an
+    /// absolute, host-specific path into a digest documented to be
+    /// reproducible across hosts. Simulated with a tokenizer path deliberately
+    /// OUTSIDE the model directory — a shape `ModelResolver` never produces
+    /// today, proving the refusal is reachable and correctly wired even
+    /// though production cannot trigger it.
+    #[test]
+    fn candidate_outside_its_anchor_is_a_typed_refusal() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let outside_tmp = tempfile::tempdir().unwrap();
+        let mut resolved = tiny_bert_resolved(&model_tmp.path().join("model"), None);
+        // A tokenizer file that exists, but lives OUTSIDE the model
+        // directory (`config_path`'s parent) — the unreachable-in-production
+        // shape the refusal exists to reject.
+        let outside_tokenizer = outside_tmp.path().join("tokenizer.json");
+        std::fs::copy(
+            jammi_test_utils::cookbook_fixture("tiny_bert").join("tokenizer.json"),
+            &outside_tokenizer,
+        )
+        .unwrap();
+        resolved.tokenizer = Some(TokenizerSource::HuggingFaceJson(outside_tokenizer));
+
+        let result = compute_model_content_digest(&resolved);
+        assert!(
+            result.is_err(),
+            "a candidate outside its anchor directory must be a typed refusal, \
+             never a silent absolute-path fallback: {result:?}"
+        );
+    }
+
+    /// Positive control for the refusal above: the SAME resolved model with
+    /// its tokenizer back under the model directory succeeds — proves the
+    /// refusal fires on the anchor mismatch specifically.
+    #[test]
+    fn candidate_inside_its_anchor_succeeds() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let resolved = tiny_bert_resolved(&model_tmp.path().join("model"), None);
+        let result = compute_model_content_digest(&resolved);
+        assert!(result.is_ok(), "expected success, got {result:?}");
     }
 }

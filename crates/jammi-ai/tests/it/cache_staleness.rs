@@ -5,9 +5,11 @@
 //!
 //! Reuses `pooling_config.rs`'s hermetic `tiny_bert` fixture-copy helpers
 //! (`build_local_model_dir`, `cls_pooling_config`, `mean_pooling_config`) —
-//! the identical mutation `pooling_config.rs:150-192` already proves changes
-//! the pooled vectors, so the RED/GREEN assertions below rest on a
-//! production-proven trigger, not a hypothetical one.
+//! the identical mutation `pooling_config.rs:202-263`
+//! (`cls_declared_pooling_differs_from_mean_declared_pooling`, key assertion
+//! at `pooling_config.rs:246-251`) already proves changes the pooled
+//! vectors, so the RED/GREEN assertions below rest on a production-proven
+//! trigger, not a hypothetical one.
 //!
 //! Reverting the esc-058 staleness probe (`ModelCache::get_or_load`'s
 //! `probe_freshness` call on its fast path, back to the unconditioned
@@ -606,5 +608,207 @@ async fn stale_eviction_never_double_books_gpu_memory_while_guard_held() {
         2 * weights_len,
         "dropping the cache (its entry's last permit clone) must return the \
          scheduler to its full budget — the permit is never permanently leaked"
+    );
+}
+
+// ── F-4' (audit round 62, adversarial round 3): a deleted OPTIONAL \
+//    candidate must reload fresh, never wedge; a deleted REQUIRED \
+//    candidate keeps the typed refusal, and stays a typed refusal — never \
+//    a permanent wedge into a different failure mode ──
+
+/// F-4' core: `1_Pooling/config.json` is OPTIONAL (the loader has a
+/// documented mean-pooling fallback for its absence). Deleting it from a
+/// LIVE, load-time-CLS-declared model directory must make the next warm
+/// `get_or_load` reload FRESH — new digest, mean-fallback vectors — never a
+/// typed refusal, and never a permanent wedge (two consecutive warm calls
+/// after the deletion must both succeed with stable, matching output).
+///
+/// Pre-F-4', `ModelFingerprint::probe` collapsed this exact case
+/// (present-at-load, `NotFound`-now) into `Err` regardless of optionality,
+/// and `ModelCache::get_or_load`'s `Err` arm never evicts — so the SAME
+/// unusable `CacheEntry` stayed cached forever, and every subsequent
+/// `get_or_load` on this id re-hit the identical `Err`, even though a cold
+/// reload (bypassing the cache) would have succeeded via the mean fallback
+/// the whole time. RED there: this test's first post-deletion `get_or_load`
+/// would return `Err`, never `Ok`.
+#[tokio::test]
+async fn warm_hit_after_optional_pooling_config_deleted_reloads_fresh_never_wedges() {
+    let tmp = tempdir().unwrap();
+    let catalog_dir = tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
+    let cache = new_cache(Arc::clone(&catalog));
+
+    // Load-time: CLS-declared (1_Pooling/config.json present and read).
+    let dir = tiny_bert_dir(tmp.path(), "optional_deleted_model", &cls_pooling_config());
+    let source = ModelSource::local(&dir);
+
+    let guard1 = cache
+        .get_or_load(&source, ModelTask::TextEmbedding, None)
+        .await
+        .unwrap();
+    let d1 = assert_hashed(
+        "D1 (pre-deletion, CLS, warm)",
+        &guard1.model.content_digest().unwrap(),
+    );
+    drop(guard1);
+
+    // DELETE the optional candidate — present at load time, gone now.
+    std::fs::remove_file(dir.join("1_Pooling/config.json")).unwrap();
+
+    // First warm call after deletion: must reload FRESH (not error, not
+    // silently keep serving the pre-deletion CLS-pooled vectors).
+    let guard_warm_1 = cache
+        .get_or_load(&source, ModelTask::TextEmbedding, None)
+        .await;
+    let guard_warm_1 = match guard_warm_1 {
+        Ok(g) => g,
+        Err(e) => panic!(
+            "an OPTIONAL candidate (1_Pooling/config.json) deleted between load \
+             and probe must reload fresh via the mean-pooling fallback, never a \
+             typed refusal (F-4') — got Err({e})"
+        ),
+    };
+    let d_warm_1 = assert_hashed(
+        "D (warm, post-deletion, 1st call)",
+        &guard_warm_1.model.content_digest().unwrap(),
+    );
+    let v_warm_1 = embed(&guard_warm_1.model, TEXT);
+    drop(guard_warm_1);
+
+    assert_ne!(
+        d_warm_1, d1,
+        "deleting the optional 1_Pooling/config.json must change the served \
+         content digest (it drops out of the digest's gated input set)"
+    );
+
+    // Non-vacuous control: the post-deletion vectors must match an
+    // independent, freshly-resolved model with NO 1_Pooling/ directory at
+    // all — the exact mean-fallback shape `pooling_config.rs:202-263`
+    // (`cls_declared_pooling_differs_from_mean_declared_pooling`, control
+    // (3) at :253-262) already proves matches a mean-declared model.
+    let reference_dir = tmp.path().join("reference_no_pooling_dir");
+    build_local_model_dir(&reference_dir, None);
+    let reference_model = cache
+        .load_owned_for_test(
+            &ModelSource::local(&reference_dir),
+            ModelTask::TextEmbedding,
+        )
+        .await
+        .unwrap();
+    let v_reference = embed(&reference_model, TEXT);
+    assert_eq!(
+        v_warm_1, v_reference,
+        "post-deletion vectors must be bitwise-identical to an independent \
+         no-pooling-file (mean-fallback) reference model — proving the reload \
+         actually took the mean-pooling fallback, not merely 'some other' \
+         digest/vectors"
+    );
+
+    // Second non-vacuous control: a COLD reading of `source` taken AFTER
+    // the deletion (bypassing the cache entirely, independent re-resolve +
+    // re-load) must match the warm reload's digest and vectors — proving
+    // `d_warm_1`/`v_warm_1` are the CURRENT (post-deletion) state, not an
+    // artifact of the cache path specifically.
+    let cold_model = cache
+        .load_owned_for_test(&source, ModelTask::TextEmbedding)
+        .await
+        .unwrap();
+    let d_cold = assert_hashed(
+        "D (cold, post-deletion)",
+        &cold_model.content_digest().unwrap(),
+    );
+    let v_cold = embed(&cold_model, TEXT);
+    assert_eq!(
+        d_cold, d_warm_1,
+        "a cold reading taken after the deletion must match the warm reload's digest"
+    );
+    assert_eq!(
+        v_cold, v_warm_1,
+        "a cold reading taken after the deletion must match the warm reload's vectors"
+    );
+
+    // Never a permanent wedge: a SECOND warm call after the reload must
+    // also succeed, with STABLE output (not merely 'succeeds once, then
+    // starts failing' or vice versa).
+    let guard_warm_2 = cache
+        .get_or_load(&source, ModelTask::TextEmbedding, None)
+        .await;
+    let guard_warm_2 = match guard_warm_2 {
+        Ok(g) => g,
+        Err(e) => panic!(
+            "a SECOND warm get_or_load after the optional-candidate reload must \
+             also succeed — never a permanent wedge (F-4') — got Err({e})"
+        ),
+    };
+    let d_warm_2 = assert_hashed(
+        "D (warm, post-deletion, 2nd call)",
+        &guard_warm_2.model.content_digest().unwrap(),
+    );
+    assert_eq!(
+        d_warm_2, d_warm_1,
+        "the second warm call after the reload must report the SAME (now \
+         stable, mean-fallback) digest — no further reload should be needed \
+         since nothing changed on disk between the two calls"
+    );
+}
+
+/// F-4' control: `model.safetensors` is a REQUIRED candidate — the loader
+/// has no fallback for missing weights. Deleting it must keep the EXISTING
+/// typed refusal (K2) behaviour, unchanged from before F-4' — a reload would
+/// fail identically, so there is nothing to gain by evicting. Calling
+/// `get_or_load` TWICE after the deletion must refuse BOTH times,
+/// deterministically (never "errors once, then something else happens" —
+/// the auditor's own split (c), verified: this is the REQUIRED-candidate
+/// arm that stays a refusal on purpose, not a regression).
+#[tokio::test]
+async fn warm_hit_after_required_weights_deleted_stays_a_typed_refusal_both_calls() {
+    let tmp = tempdir().unwrap();
+    let catalog_dir = tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
+    let cache = new_cache(Arc::clone(&catalog));
+
+    let dir = tiny_bert_dir(tmp.path(), "required_deleted_model", &mean_pooling_config());
+    let source = ModelSource::local(&dir);
+
+    let guard1 = cache
+        .get_or_load(&source, ModelTask::TextEmbedding, None)
+        .await
+        .unwrap();
+    drop(guard1);
+
+    // DELETE the required candidate.
+    std::fs::remove_file(dir.join("model.safetensors")).unwrap();
+
+    let result_1 = cache
+        .get_or_load(&source, ModelTask::TextEmbedding, None)
+        .await;
+    let msg_1 = match result_1 {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!(
+            "deleting the REQUIRED model.safetensors must refuse — a reload \
+             cannot possibly succeed without the weights file"
+        ),
+    };
+    assert!(
+        msg_1.contains("no longer readable"),
+        "expected the esc-058 staleness-probe typed refusal message, got: {msg_1}"
+    );
+
+    let result_2 = cache
+        .get_or_load(&source, ModelTask::TextEmbedding, None)
+        .await;
+    let msg_2 = match result_2 {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!(
+            "a SECOND get_or_load after the first typed refusal must refuse \
+             identically — never silently start succeeding with a corrupted \
+             or half-loaded state"
+        ),
+    };
+    assert_eq!(
+        msg_1, msg_2,
+        "two consecutive calls against the same unrecoverable REQUIRED-file \
+         deletion must produce the IDENTICAL typed refusal — deterministic, \
+         not a wedge into some other failure mode"
     );
 }

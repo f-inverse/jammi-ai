@@ -4291,16 +4291,15 @@ mod tests {
     /// bit-identical to the correctly-decided forward on the SAME inputs.
     /// An oracle this mutant cannot fail is vacuous (family F).
     ///
-    /// KNOWN GAP (disclosed, not silently skipped): the companion `w±1`
-    /// local-layer window-radius RED control the contract also names is
-    /// NOT implemented in this pass — it needs a `FlashFault`-style
-    /// fwd/bwd-config-splitting harness for the RAGGED entry point
-    /// (`flash_attention_varlen_with_rope_test_only_bwd_window_override`'s
-    /// own doc explains why a crafted TENSOR cannot model a window-only
-    /// defect; the dense arm's `forward_hidden_flash_with_fault` already
-    /// has one for `flash_attention_varlen_with_rope`, but reusing it for
-    /// the ragged entry point is real, separate work this pass did not
-    /// have budget for) — see the hand-off's pod-leg list.
+    /// The companion `w±1` local-layer window-radius RED control the
+    /// contract also names lives immediately below, as two siblings:
+    /// [`flash_arm_padded_red_control_window_radius_off_by_one_cuda`]
+    /// (forward-visible, uniform fwd+bwd fault) and
+    /// [`flash_arm_padded_red_control_bwd_only_window_off_by_one_cuda`]
+    /// (backward-only, config-split fault — the ragged entry point's own
+    /// [`jammi_kernels::ops::flash_attention_varlen_with_rope_ragged_test_only_bwd_window_override`]
+    /// seam, ported from the dense arm's
+    /// [`jammi_kernels::ops::flash_attention_varlen_with_rope_test_only_bwd_window_override`]).
     #[test]
     #[cfg(all(feature = "cuda", feature = "flash-attn"))]
     fn flash_arm_padded_red_control_lengths_off_by_one_cuda() {
@@ -4367,6 +4366,349 @@ mod tests {
             "RED control: a lengths off-by-one mutant (shifting a cu_seqlens boundary) must \
              change the output -- an oracle this cannot fail is vacuous"
         );
+    }
+
+    /// RED control (forward-visible, uniform fwd+bwd fault): a `w+/-1`
+    /// perturbation of every LOCAL layer's [`ModernBertAttention::half_window`]
+    /// field on the SAME (otherwise correctly-decided) padded batch — the
+    /// same structure as
+    /// [`flash_arm_padded_red_control_lengths_off_by_one_cuda`] immediately
+    /// above, mutating the WINDOW rather than the `CompactedBatch` — must
+    /// change [`ModernBert::forward_hidden`]'s output. An oracle this
+    /// cannot fail is vacuous (family F). Uniform: both the forward and
+    /// backward flash launches read the SAME (mutated) `half_window`, so
+    /// this control alone cannot tell "forward wrong" from "backward
+    /// wrong" apart — see
+    /// [`flash_arm_padded_red_control_bwd_only_window_off_by_one_cuda`]
+    /// below for the config-SPLIT control that isolates the backward-only
+    /// case.
+    #[test]
+    #[cfg(all(feature = "cuda", feature = "flash-attn"))]
+    fn flash_arm_padded_red_control_window_radius_off_by_one_cuda() {
+        let Ok(model_dir) = std::env::var("JAMMI_FLASH_ORACLE_MODEL_DIR") else {
+            flash_oracle_require_gate("flash_arm_padded_red_control_window_radius_off_by_one_cuda");
+            return;
+        };
+        let Some(cuda) = growth_oracle_cuda_device() else {
+            return;
+        };
+        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _d2h_guard = FLASH_D2H_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !flash_compiled_or_skip("flash_arm_padded_red_control_window_radius_off_by_one_cuda") {
+            return;
+        }
+
+        let dir = std::path::PathBuf::from(&model_dir);
+        let config: ModernBertConfig =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                .unwrap();
+        let weights = dir.join("model.safetensors");
+        let seed = 84;
+        let (batch, seq) = (4usize, 64usize);
+        let ids = flash_oracle_synthetic_ids(batch, seq, config.vocab_size, seed, &cuda);
+        let lengths = vec![seq, seq - 8, seq / 2, 6];
+        let mut mask_data = vec![0u32; batch * seq];
+        for (b, &len) in lengths.iter().enumerate() {
+            for s in 0..len {
+                mask_data[b * seq + s] = 1;
+            }
+        }
+        let mask = Tensor::from_vec(mask_data, (batch, seq), &cuda).unwrap();
+
+        let healthy_model =
+            flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda, true);
+        let healthy_v: Vec<f32> = healthy_model
+            .forward_hidden(&ids, &mask)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        for delta in [1i64, -1i64] {
+            let mut mutant_model =
+                flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda, true);
+            let mut mutated_any = false;
+            for layer in mutant_model.layers.iter_mut() {
+                if let Some(half) = layer.attention.half_window {
+                    layer.attention.half_window = Some((half as i64 + delta).max(1) as usize);
+                    mutated_any = true;
+                }
+            }
+            assert!(
+                mutated_any,
+                "this control needs at least one local (windowed) layer to mutate"
+            );
+            let mutant_v: Vec<f32> = mutant_model
+                .forward_hidden(&ids, &mask)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            assert_ne!(
+                healthy_v, mutant_v,
+                "RED control: a window radius w{delta:+} mutant (every local layer's \
+                 half_window shifted, both forward AND backward) must change the padded/ragged \
+                 flash arm's output -- an oracle this cannot fail is vacuous"
+            );
+        }
+    }
+
+    /// Test-only mirror of [`ModernBert::forward_hidden_inner`]'s
+    /// PADDED/ragged transport composition — the padded-arm counterpart of
+    /// [`forward_hidden_flash_with_fault`] (which mirrors the DENSE arm's
+    /// per-layer composition instead; see that function's own doc for why
+    /// a hand-synced mirror, not the shared `forward_hidden_inner` seam, is
+    /// needed for an op-level CONFIG fault like this one). Every LOCAL
+    /// layer's ragged flash op launches FORWARD with `attn.half_window`'s
+    /// own (correct) radius and BACKWARD with that radius shifted by
+    /// `window_delta`, via the NEW
+    /// [`jammi_kernels::ops::flash_attention_varlen_with_rope_ragged_test_only_bwd_window_override`]
+    /// seam. GLOBAL layers (`half_window == None`) call the plain
+    /// [`jammi_kernels::ops::flash_attention_varlen_with_rope_ragged`] —
+    /// unaffected either way, mirroring the dense arm's own
+    /// `bwd_only_window_dropped` control's identical local/global scoping.
+    /// `admission` must be a genuinely padded (`!is_dense`) `CompactedBatch`
+    /// — this harness does not implement the dense-arm fallback, since its
+    /// whole point is to characterize the RAGGED arm's own fault surface.
+    #[cfg(all(feature = "cuda", feature = "flash-attn"))]
+    fn forward_hidden_padded_with_ragged_bwd_window_fault(
+        model: &ModernBert,
+        input_ids: &Tensor,
+        admission: &CompactedBatch,
+        window_delta: i64,
+    ) -> Result<Tensor, EncoderError> {
+        use jammi_kernels::flash::VarlenConfig;
+        use jammi_kernels::ops::{
+            flash_attention_varlen_with_rope_ragged,
+            flash_attention_varlen_with_rope_ragged_test_only_bwd_window_override,
+        };
+
+        let word_emb = model.word_embeddings.forward(input_ids)?;
+        let mut hidden = model.emb_norm.forward(&word_emb)?;
+        hidden = unpad_rows(&hidden, &admission.gather_indices)?;
+
+        for layer in &model.layers {
+            let attn = &layer.attention;
+            let normed = match &attn.attn_norm {
+                Some(ln) => ln.forward(&hidden)?,
+                None => hidden.clone(),
+            };
+            let h = attn.num_heads;
+            let d = attn.head_dim;
+            let qkv = attn.wqkv.forward(&normed)?;
+            let qkv5 = qkv.reshape((admission.total, 3, h, d))?;
+            let (cos_full, sin_full) = attn.rope.cached_tables(qkv5.dtype())?;
+            let cos = cos_full.narrow(2, 0, admission.seq)?;
+            let sin = sin_full.narrow(2, 0, admission.seq)?;
+            let fwd_cfg = VarlenConfig {
+                softmax_scale: 1.0 / (d as f32).sqrt(),
+                window: attn.half_window.map(|w| w as u32),
+                deterministic: true,
+            };
+            let o = match attn.half_window {
+                Some(half) => {
+                    let bad = (half as i64 + window_delta).max(0) as u32;
+                    let bwd_cfg = VarlenConfig {
+                        window: Some(bad),
+                        ..fwd_cfg
+                    };
+                    flash_attention_varlen_with_rope_ragged_test_only_bwd_window_override(
+                        &qkv5,
+                        &cos,
+                        &sin,
+                        &admission.lengths,
+                        &fwd_cfg,
+                        &bwd_cfg,
+                    )
+                }
+                None => flash_attention_varlen_with_rope_ragged(
+                    &qkv5,
+                    &cos,
+                    &sin,
+                    &admission.lengths,
+                    &fwd_cfg,
+                ),
+            }
+            .map_err(|e| EncoderError::Config(format!("ragged bwd-window fault: {e}")))?;
+            let ctx = o.reshape((admission.total, h * d))?;
+            let out = attn.wo.forward(&ctx)?;
+            hidden = (out + &hidden)?;
+            hidden = layer.mlp.forward(&hidden)?;
+        }
+
+        let batch = admission.lengths.len();
+        hidden = repad_rows(&hidden, &admission.gather_indices, batch, admission.seq)?;
+        model.final_norm.forward(&hidden)
+    }
+
+    /// [`flash_oracle_wqkv_lora_b`]'s general form, indexed by layer — used
+    /// ONLY by
+    /// [`flash_arm_padded_red_control_bwd_only_window_off_by_one_cuda`]
+    /// below, which (unlike [`flash_oracle_pooled_and_grad`]'s own
+    /// LAST-layer probe) deliberately needs an EARLY layer: see that
+    /// control's own doc for why the last (global) layer's gradient cannot
+    /// see a LOCAL-layer-only backward defect at all.
+    #[cfg(all(feature = "cuda", feature = "flash-attn"))]
+    fn flash_oracle_wqkv_lora_b_of_layer(model: &ModernBert, idx: usize) -> &Tensor {
+        match &model.layers[idx].attention.wqkv {
+            MaybeLoraLinear::Lora(l) => &l.lora_b,
+            MaybeLoraLinear::Frozen(_) => panic!(
+                "flash oracle: layer {idx}'s Wqkv must be LoRA-wrapped -- \
+                 target_modules=[\"Wqkv\"]"
+            ),
+        }
+    }
+
+    /// `(flattened hidden, dL/d(layer `layer_idx`'s Wqkv LoRA B))` for
+    /// `L = (pool_and_normalize(hidden) * dy).sum()` — the padded-arm
+    /// counterpart of [`flash_oracle_pooled_and_grad`], generalised to an
+    /// arbitrary layer (see [`flash_oracle_wqkv_lora_b_of_layer`]'s own
+    /// doc for why).
+    #[cfg(all(feature = "cuda", feature = "flash-attn"))]
+    fn flash_oracle_hidden_and_early_grad(
+        model: &ModernBert,
+        hidden: &Tensor,
+        mask: &Tensor,
+        dy: &Tensor,
+        layer_idx: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let hidden_v: Vec<f32> = hidden
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let pooled = pool_and_normalize(hidden, mask, Pooling::Mean).unwrap();
+        let pooled_f32 = pooled.to_dtype(DType::F32).unwrap();
+        let loss = (&pooled_f32 * dy).unwrap().sum_all().unwrap();
+        assert!(
+            loss.to_scalar::<f32>().unwrap().is_finite(),
+            "flash oracle: loss must be finite before backward"
+        );
+        let grads = loss.backward().unwrap();
+        let lora_b = flash_oracle_wqkv_lora_b_of_layer(model, layer_idx);
+        let grad_v: Vec<f32> = grads
+            .get(lora_b)
+            .expect("flash oracle: layer's Wqkv lora_b must have a gradient")
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        (hidden_v, grad_v)
+    }
+
+    /// RED control (backward-config-split): the ragged entry point's OWN
+    /// counterpart of `tests/cuda_parity.rs`'s
+    /// `flash_upstream_acceptance_form_red_control_bwd_only_window_dropped_cuda`
+    /// (`jammi-kernels`, which covers only the DENSE entry point) — closes
+    /// the gap [`flash_arm_padded_red_control_lengths_off_by_one_cuda`]'s
+    /// own doc used to disclose.
+    /// [`forward_hidden_padded_with_ragged_bwd_window_fault`] forces every
+    /// LOCAL layer's ragged flash op to launch FORWARD with the CORRECT
+    /// window radius and BACKWARD with `w+/-1`, via the NEW
+    /// [`jammi_kernels::ops::flash_attention_varlen_with_rope_ragged_test_only_bwd_window_override`]
+    /// seam. Proves two things per `delta`: (a) the forward output stays
+    /// BIT-IDENTICAL to production's OWN padded forward — the fault really
+    /// is backward-only, never leaking into the forward launch; (b) an
+    /// EARLY layer's own LoRA `B` gradient is NOT bit-identical to
+    /// production's own gradient — the fault is still caught. Deliberately
+    /// probes layer 0, not the LAST layer [`flash_oracle_wqkv_lora_b`]
+    /// targets: the last layer in this checkpoint is GLOBAL (unwindowed —
+    /// see that fn's own doc), so its gradient's own backward pass never
+    /// chains through any LOCAL layer at all and would be structurally
+    /// blind to this exact fault class, whereas layer 0's gradient
+    /// backpropagates through every later (including every LOCAL) layer's
+    /// own backward first.
+    #[test]
+    #[cfg(all(feature = "cuda", feature = "flash-attn"))]
+    fn flash_arm_padded_red_control_bwd_only_window_off_by_one_cuda() {
+        let Ok(model_dir) = std::env::var("JAMMI_FLASH_ORACLE_MODEL_DIR") else {
+            flash_oracle_require_gate(
+                "flash_arm_padded_red_control_bwd_only_window_off_by_one_cuda",
+            );
+            return;
+        };
+        let Some(cuda) = growth_oracle_cuda_device() else {
+            return;
+        };
+        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _d2h_guard = FLASH_D2H_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !flash_compiled_or_skip("flash_arm_padded_red_control_bwd_only_window_off_by_one_cuda") {
+            return;
+        }
+
+        let dir = std::path::PathBuf::from(&model_dir);
+        let config: ModernBertConfig =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                .unwrap();
+        let weights = dir.join("model.safetensors");
+        let seed = 85;
+        let (batch, seq) = (4usize, 64usize);
+        let ids = flash_oracle_synthetic_ids(batch, seq, config.vocab_size, seed, &cuda);
+        let lengths = vec![seq, seq - 8, seq / 2, 6];
+        let mut mask_data = vec![0u32; batch * seq];
+        for (b, &len) in lengths.iter().enumerate() {
+            for s in 0..len {
+                mask_data[b * seq + s] = 1;
+            }
+        }
+        let mask = Tensor::from_vec(mask_data, (batch, seq), &cuda).unwrap();
+        let dy = flash_oracle_seeded_dy(batch, config.hidden_size, seed, &cuda);
+
+        let decision = fused_flash_for_test(lengths, seq, &cuda);
+        let admission = match &decision {
+            FlashDecision::Fused(admission) => admission,
+            FlashDecision::Declined { .. } => {
+                panic!("this control needs a genuinely padded Fused decision")
+            }
+        };
+        assert!(
+            !admission.is_dense,
+            "this control needs a genuinely padded (ragged) batch"
+        );
+
+        let model = flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda, true);
+
+        let healthy_hidden = model.forward_hidden(&ids, &mask).unwrap();
+        let (healthy_hidden_v, healthy_grad_v) =
+            flash_oracle_hidden_and_early_grad(&model, &healthy_hidden, &mask, &dy, 0);
+
+        for delta in [1i64, -1i64] {
+            let mutant_hidden =
+                forward_hidden_padded_with_ragged_bwd_window_fault(&model, &ids, admission, delta)
+                    .unwrap();
+            let (mutant_hidden_v, mutant_grad_v) =
+                flash_oracle_hidden_and_early_grad(&model, &mutant_hidden, &mask, &dy, 0);
+
+            assert_eq!(
+                healthy_hidden_v, mutant_hidden_v,
+                "window w{delta:+} backward-only fault must NOT change the forward output -- \
+                 the forward launch always reads fwd_cfg (the CORRECT window), never \
+                 bwd_cfg_override; a difference here means the split leaked into forward"
+            );
+            assert_ne!(
+                healthy_grad_v, mutant_grad_v,
+                "window w{delta:+} backward-only fault must change layer 0's LoRA B gradient -- \
+                 an oracle this cannot fail is vacuous (family F)"
+            );
+        }
     }
 
     // =====================================================================

@@ -17,6 +17,12 @@ mod grpc_pipeline;
 mod grpc_remote_compute;
 mod grpc_remote_list;
 mod grpc_remote_session;
+// K4 transport-only DEVICE leg (unit 62 / CONTRACT.md E5) — GPU coverage of
+// grpc_remote_session.rs's CPU bitwise remote-vs-local assertion. Same gating
+// as grpc_embedding_gpu above: compiled only under `live-gpu-tests`, skips
+// cleanly without a visible GPU.
+#[cfg(feature = "live-gpu-tests")]
+mod grpc_remote_session_gpu;
 mod grpc_session;
 mod grpc_tracing_span;
 mod grpc_training;

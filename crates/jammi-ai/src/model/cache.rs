@@ -787,6 +787,21 @@ mod f3_prime_tests {
     /// entry is skipped, the genuinely idle one is evicted instead, and once
     /// the outstanding clone is finally dropped the (now genuinely idle)
     /// remaining entry is evicted too.
+    ///
+    /// **Advisory (audit round 62, adversarial round 6, folded)**: this test
+    /// previously ran against [`GpuScheduler::new_unlimited`], whose
+    /// `GpuPermit::drop` is a documented no-op — `reserved_memory` (and
+    /// therefore [`GpuScheduler::available`]) NEVER moves under that
+    /// scheduler, real progress or not, so the doc prose above ("would not
+    /// decrement `GpuScheduler::reserved_memory`") narrated an accounting
+    /// property this test never actually exercised; only the `CacheEntry`
+    /// containment assertions were load-bearing. It now runs against a real
+    /// BUDGETED [`GpuScheduler::new`] sized to exactly fit the real load
+    /// plus X's and Y's one-byte permits, with no slack — and asserts
+    /// [`GpuScheduler::available`] directly at each step: unmoved while
+    /// `evict_one` (correctly) claims no progress for the misleading entry,
+    /// and moved by exactly the freed amount when it evicts a genuinely
+    /// idle one. The doc now claims exactly what the test proves.
     #[tokio::test]
     async fn evict_one_does_not_claim_progress_for_an_entry_whose_permit_has_an_outstanding_clone()
     {
@@ -794,12 +809,15 @@ mod f3_prime_tests {
         let catalog_dir = tempfile::tempdir().unwrap();
         let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
         let resolver = ModelResolver::new(Arc::clone(&catalog), test_artifact_store()).unwrap();
-        let (source, _weights_len) = tiny_bert_source(tmp.path(), "model_x");
+        let (source, weights_len) = tiny_bert_source(tmp.path(), "model_x");
 
         // A real, loaded `Arc<LoadedModel>` — only used as a valid handle
         // for the hand-built `CacheEntry`s below; the model's own state is
-        // irrelevant to this test.
-        let scheduler = Arc::new(GpuScheduler::new_unlimited());
+        // irrelevant to this test. Budgeted with NO slack beyond the real
+        // load's own weight (`weights_len`) plus X's and Y's one-byte
+        // synthetic permits below, so every `available()` assertion is
+        // exact, not merely directionally suggestive.
+        let scheduler = Arc::new(GpuScheduler::new(weights_len + 2, 0.0));
         let cache = ModelCache::new(resolver, device_config(), Arc::clone(&scheduler));
         let guard = cache
             .get_or_load(&source, ModelTask::TextEmbedding, None)
@@ -851,6 +869,14 @@ mod f3_prime_tests {
         inner.lru_order.push_back(id_x.clone());
         inner.lru_order.push_back(id_y.clone());
 
+        // The budget has NO slack: the real load (`weights_len`) plus X's
+        // and Y's one-byte permits exactly exhaust it.
+        assert_eq!(
+            scheduler.available(),
+            0,
+            "sanity: the budget is fully reserved before any eviction"
+        );
+
         assert!(
             inner.evict_one(),
             "Y is genuinely idle (no outstanding permit clone) — evict_one \
@@ -866,6 +892,13 @@ mod f3_prime_tests {
             !inner.entries.contains_key(&id_y),
             "Y — the genuinely idle entry — must be the one actually evicted"
         );
+        assert_eq!(
+            scheduler.available(),
+            1,
+            "evicting the genuinely idle Y must ACTUALLY release its one \
+             reserved byte — GpuScheduler::available() must move, not just \
+             the CacheEntry map"
+        );
 
         // Now only the misleading X remains. evict_one must report NO
         // progress rather than removing X and lying about it.
@@ -878,14 +911,34 @@ mod f3_prime_tests {
              still alive"
         );
         assert!(inner.entries.contains_key(&id_x));
+        assert_eq!(
+            scheduler.available(),
+            1,
+            "evict_one's false claim of no progress must correspond to \
+             GpuScheduler::available() genuinely NOT moving — the exact \
+             accounting property the pre-fix code lied about"
+        );
 
         drop(outstanding_clone);
+        assert_eq!(
+            scheduler.available(),
+            1,
+            "dropping only the TEST's outstanding clone (not the CacheEntry's \
+             own) must not yet release the reservation — X's permit still \
+             has one live clone (the entry's own)"
+        );
         assert!(
             inner.evict_one(),
             "once the outstanding clone is gone, X is genuinely idle and \
              evict_one must now claim (and deliver) real progress"
         );
         assert!(!inner.entries.contains_key(&id_x));
+        assert_eq!(
+            scheduler.available(),
+            2,
+            "the final evict_one — now genuinely idle — must ACTUALLY \
+             release X's reserved byte too, matching its claimed progress"
+        );
     }
 }
 
@@ -1005,6 +1058,133 @@ mod single_flight_advisory_tests {
         };
         if let Err(e) = result {
             panic!("the waiter must complete its (now solo) load successfully after waking, got Err({e})");
+        }
+    }
+}
+
+// ── R5-F1 (audit round 62, adversarial round 6): a deleted tokenizer.json \
+//    must never permanently wedge `get_or_load` ──
+
+#[cfg(test)]
+mod r5_f1_tokenizer_tests {
+    use super::*;
+
+    use jammi_db::catalog::Catalog;
+    use jammi_db::storage::{StorageRegistry, StorageUrl};
+    use jammi_db::store::ArtifactStore;
+
+    fn device_config() -> DeviceConfig {
+        DeviceConfig {
+            gpu_device: -1,
+            memory_fraction: 1.0,
+            require_gpu: false,
+            compute_precision: jammi_numerics::ComputePrecision::F32,
+        }
+    }
+
+    fn test_artifact_store() -> Arc<ArtifactStore> {
+        let cache_dir = tempfile::tempdir().unwrap().keep();
+        Arc::new(
+            ArtifactStore::with_root(
+                StorageUrl::memory("r5-f1-tokenizer-test-artifacts"),
+                StorageRegistry::new(),
+                cache_dir,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn tiny_bert_source(root: &std::path::Path, name: &str) -> ModelSource {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fixture = jammi_test_utils::cookbook_fixture("tiny_bert");
+        for file in ["config.json", "model.safetensors", "tokenizer.json"] {
+            std::fs::copy(fixture.join(file), dir.join(file)).unwrap();
+        }
+        ModelSource::local(&dir)
+    }
+
+    /// R5-F1 (block), end-to-end at the `ModelCache::get_or_load` level: a
+    /// warm model whose `tokenizer.json` is deleted from its live directory
+    /// must stale-reload, never wedge.
+    ///
+    /// RED pre-fix: the tokenizer digest candidate was unconditionally
+    /// `optional: false` ("the loader has no fallback" — false for this
+    /// slot, since every resolver path re-derives `tokenizer: None` on
+    /// absence and `CandleBackend::load` accepts it). `ModelFingerprint::probe`
+    /// therefore fell into arm (c) and returned `Err`, and — critically —
+    /// `get_or_load`'s `Err` branch returns immediately WITHOUT removing the
+    /// stale `CacheEntry` from the cache. So the SECOND `get_or_load` call
+    /// (after the same deletion) hits the identical still-cached, still-stale
+    /// entry, re-probes, and re-`Err`s — wedged forever, exactly like a cold
+    /// process would NOT be (a cold process loading this same
+    /// tokenizer-less directory loads fine, with `tokenizer: None`).
+    ///
+    /// GREEN post-fix: the tokenizer candidate is `optional: true` (arm
+    /// (b)) — the first post-deletion `get_or_load` evicts the stale entry
+    /// and reloads (succeeding, with `tokenizer: None`, mirroring
+    /// cold-process semantics), and the second call is an ordinary warm hit
+    /// against the freshly-reloaded (tokenizer-less) entry. Neither call
+    /// wedges.
+    #[tokio::test]
+    async fn tokenizer_deleted_after_load_stale_reloads_never_wedges() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
+        let resolver = ModelResolver::new(Arc::clone(&catalog), test_artifact_store()).unwrap();
+        let scheduler = Arc::new(GpuScheduler::new_unlimited());
+        let cache = ModelCache::new(resolver, device_config(), scheduler);
+
+        let source = tiny_bert_source(tmp.path(), "tokenizer_wedge_model");
+
+        // (1) Cold load: tokenizer.json present, resolves to `Some(..)`.
+        let guard = cache
+            .get_or_load(&source, ModelTask::TextEmbedding, None)
+            .await
+            .expect("initial load with tokenizer.json present must succeed");
+        drop(guard);
+
+        // Delete tokenizer.json from the LIVE model directory — the exact
+        // scenario the auditor named.
+        let model_dir = match &source {
+            ModelSource::Local(p) => p.clone(),
+            other => panic!("expected a Local source, got {other:?}"),
+        };
+        std::fs::remove_file(model_dir.join("tokenizer.json")).unwrap();
+
+        // (2) First post-deletion call: must stale-reload (evict the
+        // now-invalid fingerprint entry and reload with `tokenizer: None`),
+        // never return the typed refusal that would come from mis-classifying
+        // the tokenizer as REQUIRED.
+        let first = cache
+            .get_or_load(&source, ModelTask::TextEmbedding, None)
+            .await;
+        match &first {
+            Ok(_) => {}
+            Err(e) => panic!(
+                "the first get_or_load after tokenizer.json's deletion must \
+                 stale-reload and succeed (R5-F1) — a cold process loading \
+                 this same directory would serve it fine — got Err({e})"
+            ),
+        }
+        drop(first);
+
+        // (3) Second, CONSECUTIVE post-deletion call: this is the wedge
+        // check. Pre-fix, the first call above already returned `Err`
+        // without evicting, so this second call would hit the identical
+        // stale entry and `Err` again — "permanently wedged". Post-fix, this
+        // is an ordinary warm hit against the freshly-reloaded entry from
+        // step (2).
+        let second = cache
+            .get_or_load(&source, ModelTask::TextEmbedding, None)
+            .await;
+        if let Err(e) = second {
+            panic!(
+                "the second, consecutive get_or_load call after \
+                 tokenizer.json's deletion must also succeed — two \
+                 consecutive calls behaving like cold-process loads, never a \
+                 permanent wedge (R5-F1). Got Err({e})"
+            );
         }
     }
 }

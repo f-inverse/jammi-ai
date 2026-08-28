@@ -2092,6 +2092,17 @@ pub struct EncodeStepTier {
     /// `EncodeStepTier` (hence no report) is produced at all. So on every
     /// path that reaches this field, the requested ordinal and the actually-
     /// resolved device are the same device by construction.
+    ///
+    /// **Qualification (audit round 62, adversarial round 6, folded
+    /// advisory)**: on a build compiled with `feature = "metal"` but not
+    /// `"cuda"`, `select_device` can genuinely succeed for a `gpu_device >=
+    /// 0` request via its metal branch, so the "first model load fails"
+    /// argument above does not apply there — the guarantee holds on that
+    /// build for a DIFFERENT reason instead: `encode_step::resolved_device_name`'s
+    /// `cuda_device_name` call unconditionally errors on any
+    /// `not(feature = "cuda")` build, aborting the run before a mismatched,
+    /// Metal-resolved device name could ever reach this field. See that
+    /// function's own doc for the full two-mechanism picture.
     pub device_name: String,
     /// The `JAMMI_KERNELS_DISABLE` op keys this process REQUESTED (sorted;
     /// empty when unset) — `jammi_kernels::admission::disabled_ops_requested`.

@@ -8,7 +8,7 @@
 
 use candle_core::{Device, Tensor};
 use jammi_db::error::{JammiError, Result};
-use jammi_encoders::ClipText;
+use jammi_encoders::{ClipText, Pooling};
 
 use crate::model::tokenizer::BatchEncoding;
 
@@ -51,5 +51,25 @@ impl CandleTextForward for OpenClipTextForward {
         self.0
             .forward(input_ids, attention_mask)
             .map_err(|e| JammiError::Inference(format!("OpenCLIP text forward failed: {e}")))
+    }
+
+    /// `None` — honest, not merely inherited (audit round 62, adversarial
+    /// round 8 advisory fold): [`Self::forward_pooled`] above bypasses
+    /// pooling entirely (the OpenCLIP text tower's output is already
+    /// pooled-and-projected into the shared CLIP latent space by
+    /// `ClipText::forward`, with no separate mean/CLS reduction step this
+    /// wrapper applies), so there is no [`jammi_encoders::Pooling`] strategy
+    /// to report. This override was previously left implicit — the trait's
+    /// own `None` default happened to already be the truthful answer here —
+    /// but `CandleTextForward::forward_pooled`'s pairing-rule doc requires
+    /// every wrapper that overrides ONE of the `forward_pooled` /
+    /// `resolved_pooling` pair to state BOTH explicitly at its own `impl`
+    /// block, exactly the discipline the three classification wrappers'
+    /// `classification_resolved_pooling()` override already follows (R5-F2).
+    /// Stating it here closes the one production wrapper that silently
+    /// relied on the default coinciding with the right answer instead of
+    /// declaring it.
+    fn resolved_pooling(&self) -> Option<Pooling> {
+        None
     }
 }

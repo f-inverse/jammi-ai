@@ -1950,10 +1950,10 @@ def self_test() -> int:
             "here would silently accept a torch-shaped encode leg rule (i) should reject"
         )
     encode_field_names = {f[0] for f in encode_tuple["fields"]}
-    if len(encode_field_names) != 19:  # 12 IDENTITY_FIELDS + 7 disjoint PROVENANCE_FIELDS
+    if len(encode_field_names) != 20:  # 13 IDENTITY_FIELDS + 7 disjoint PROVENANCE_FIELDS
         failures.append(
             f"self-test FAILED: (encode_step, jammi) identity tuple has {len(encode_field_names)} "
-            f"field(s), expected 19 (12 identity + 7 disjoint provenance): {sorted(encode_field_names)}"
+            f"field(s), expected 20 (13 identity + 7 disjoint provenance): {sorted(encode_field_names)}"
         )
 
     good_encode_leg = _full_leg_fixture("jammi", "c" * 40, tier_name="encode_step")

@@ -1,0 +1,122 @@
+# Execution-surface reachability allowlist (check_execution_surface_reachability.py)
+#
+# Format: one row per line, `<exact tuple text><TAB><reason>` (a literal TAB
+# character, never ` | ` — several tuples below pipe their own output
+# through `tee`, e.g. `... 2>&1 | tee "$L1"`, so a `|`-based delimiter would
+# collide with the tuple's OWN text). `#`-prefixed and blank lines are
+# ignored. A row's tuple text is re-verified against the CURRENT registry
+# (ci/scripts/**) on every run — a row naming a tuple whose script was
+# renamed/deleted, or whose exact command line changed, FAILS as rot; a row
+# whose tuple has become reachable on the merge path FAILS as a dead waiver.
+# Neither is ever silently skipped.
+#
+# Every reason below cites STABLE CONTENT (a quoted phrase, a script/job
+# name, an invariant this repo's own comments already state), never a bare
+# line number — a line number rots the moment ANY unrelated PR touches the
+# cited file, including this gate's own introduction (its first version
+# cited `ci.yml:1004`, which its own +24-line insertion into ci.yml moved
+# to line 1028 in the SAME commit).
+#
+# HONEST RESIDUAL (see the gate's own module doc "Honest residual" section):
+# every row below needs a real CUDA/CUTLASS toolchain to run meaningfully.
+# `runpod_gpu_prove.sh` (the driver script several rows below reference) is
+# invoked from TWO places, not one: directly by `gpu-prove.yml`
+# (`workflow_dispatch` / `pull_request: types: [labeled]` / nightly
+# `schedule`), and by the reusable `_gpu-prove-gate.yml` (a release gate
+# `uses:`-called from `_pypi-server.yml` — itself called by BOTH
+# `pypi-server.yml` (`with: run_gpu_prove: false` — never triggers this
+# gate) and `pypi-server-cuda.yml` (`with: run_gpu_prove: true`) — and from
+# `server-image.yml` and `release-binaries.yml`).
+# NEITHER chain is merge-path: `gpu-prove.yml`'s own triggers are label/
+# dispatch/schedule-only; the three `_gpu-prove-gate.yml` callers are each
+# scoped to `push: tags: [...]` and/or `workflow_dispatch` (release lanes),
+# and where any of them ALSO carries a `pull_request` trigger
+# (`pypi-server-cuda.yml`, `server-image.yml`), that trigger's own `paths:`
+# filter is scoped to packaging/Dockerfile changes, never `ci/scripts/**`.
+# The residual survives via tag/dispatch-gating and path-filter narrowness,
+# not via "only one caller" — promoting ANY of these chains to a REQUIRED
+# merge-path check is a GitHub branch-protection ruleset setting, not
+# committed workflow YAML, so nothing in this checkout can verify it —
+# `GPU_PROVE_PROMOTED_TO_REQUIRED` in the gate script stays `False` until a
+# human flips it (with a comment recording how the promotion was verified).
+# Until then every row below is the honest, written, non-silent choice: each
+# tuple stays off the merge path BY NAME, not by omission.
+
+# --- ci/scripts/pod_seed_target.sh's own T1/T1b/T2/T3 (esc-050/esc-051) ---
+# The pod auto-seed's own canonical CUDA/CUTLASS-toolchain-gated legs. Each
+# reds the WHOLE seed on a fresh pod the moment it regresses (pod_seed_target.sh's
+# own module doc). No hermetic ubuntu-latest runner carries `dep:bindgen_cuda`
+# / a vendored CUTLASS checkout, so none of these can run on ci.yml's bare
+# runners; runpod_gpu_prove.sh carries a byte-identical (or live-run) twin of
+# most of them (see the HONEST RESIDUAL note above for that script's own
+# two-caller chain), but neither chain is merge-path.
+cargo build --release -p jammi-bench --features cuda	T1 (pod_seed_target.sh) — needs the CUDA toolchain (dep:bindgen_cuda); ci.yml's hermetic runners have none. runpod_gpu_prove.sh does not carry this exact `--release` build (only its live it-suite invocations, rows below).
+cargo build --release -p jammi-bench --features cuda,jammi-kernels/flash-attn	T1b (pod_seed_target.sh, main-only) — needs a provisioned CUTLASS submodule + nvcc; no hermetic runner has either.
+cargo test -p jammi-server --features cuda,live-gpu-tests --test it --no-run	T2 (pod_seed_target.sh) — compile-checks jammi-server's cuda,live-gpu-tests test binary. ci.yml's "Compile-check (gated lanes)" job compile-checks jammi-ai's gpu_capability suite but never jammi-server's `it` suite with the cuda feature; genuinely off the merge path today, not merely mis-normalized.
+cargo test -p jammi-ai --features cuda,live-gpu-tests --test gpu_capability --no-run	T2 (pod_seed_target.sh) — the SAME suite ci.yml's "Compile-check GPU-capability suite" step compile-checks, but WITHOUT `cuda` (that step's own comment: "Compile-checked without `cuda`... this stays a CPU-runner step"). The cuda-enabled compile-check has no merge-path twin.
+cargo test -p jammi-kernels --features cuda --no-run	T2 (pod_seed_target.sh) — compile-checks jammi-kernels' `cuda_parity` test target (`required-features = ["cuda"]`), the one target ci.yml's own module doc names as uncoverable on the hermetic runner ("CANNOT be covered here... linted instead in runpod_gpu_prove.sh").
+cargo clippy -p jammi-kernels --all-targets --features cuda -- -D warnings	T3 (pod_seed_target.sh) — the exact esc-051 tuple. runpod_gpu_prove.sh carries a byte-identical twin, but see the HONEST RESIDUAL note above: neither of that script's two invocation chains is merge-path — green "wiring", dead on the path that gates merges.
+
+# --- ci/scripts/runpod_gpu_prove.sh's own LIVE suites (distinct from the
+# --no-run compile-checks above: these actually execute on the rented A100,
+# not merely compile). See the HONEST RESIDUAL note above for this script's
+# own two-caller chain (gpu-prove.yml directly, and _gpu-prove-gate.yml via
+# three release-tag-scoped workflows) — neither is merge-path. ---
+cargo test -p jammi-server --features cuda,live-gpu-tests --test it grpc_embedding_gpu -- --nocapture --test-threads=1	runpod_gpu_prove.sh's served client/server GPU proof — needs a real A100.
+cargo test -p jammi-ai --features cuda,live-gpu-tests --test gpu_capability -- --nocapture --test-threads=1	runpod_gpu_prove.sh's engine-core GPU correctness suite — same residual as the row above.
+cargo run -p jammi-bench --release --features cuda -- gpu-inference-scale	runpod_gpu_prove.sh's recorded-observability GPU embedding perf run (own comment: "non-gating") — same residual; this row exists for completeness, not because it was ever meant to gate a merge.
+cargo test -p jammi-kernels --features cuda -- --nocapture --test-threads=1	runpod_gpu_prove.sh's live `cuda_parity` run — same residual as the T2/`--no-run` compile-check row above, but the executed (not merely compiled) form.
+
+# --- ci/scripts/perf/pod_build_timings.sh — the A2 pod-build-timings
+# artifact producer (docs/maintainer/pod-build-guide.md §6). Operator-run on
+# a rented pod, invoked from NO workflow at all (grep over
+# .github/workflows/*.yml for this script's own filename confirms zero
+# hits) — a measurement tool, never a CI leg; its OWN artifact schema is
+# enforced on the merge path by check_pod_build_timings.py, which is the
+# actual gate for this surface. ---
+cargo build --release -p jammi-bench --features cuda -v > /tmp/pod_build_timings.clone_t1.log 2>&1	pod_build_timings.sh's own timed T1 clone-build leg (A2 producer) — an operator-run measurement script, invoked from no workflow; its output artifact is schema-gated by check_pod_build_timings.py instead.
+cargo build --release -p jammi-bench --features cuda,jammi-kernels/flash-attn > /tmp/pod_build_timings.clone_fa2.log 2>&1	pod_build_timings.sh's own timed FA2 clone-build leg (A2 producer) — same residual as the row above.
+cargo build --release -p jammi-bench --features cuda > /tmp/pod_build_timings.cold_build.log 2>&1	pod_build_timings.sh's own timed COLD-build leg (a fresh empty CARGO_TARGET_DIR, proving the seed reproduces a truly cold build's bytes) — same residual as the two rows above.
+
+# --- ci/scripts/perf/clip_artifact_producer.sh — a perf-unification
+# artifact producer (unification contract C5.1; ci.yml's own "producer
+# provenance gates" guard cross-checks this script's BINARY-PROVENANCE
+# invariant, but never EXECUTES its cargo builds/tests). NEVER INVOKED by
+# any workflow: grep over .github/workflows/*.yml for this script's own
+# filename finds ONE hit, ci.yml's own guard-matrix module doc comment
+# (a `#`-prefixed line naming it in prose, never a run:/cmd: step body) —
+# an operator/perf-lane tool, not a CI leg. ---
+cargo test -p jammi-ai --features cuda,live-gpu-tests --lib fine_tune::optimizer -- --test-threads=1 2>&1 | tee "$L1"	clip_artifact_producer.sh's optimizer proof leg — operator-run perf artifact producer, invoked from no workflow.
+cargo test -p jammi-bench --features cuda -- finetune_step::tests report::tests --test-threads=1 2>&1 | tee "$L2"	clip_artifact_producer.sh's bench proof leg — same residual as the row above.
+cargo test -p jammi-ai --features cuda,live-gpu-tests --lib -- --exact "$EXACT" 2>&1 | tee "$L3"	clip_artifact_producer.sh's exact-test proof leg — same residual as the row above.
+cargo build $FLASH_BUILD_FLAG -p jammi-bench --features cuda,jammi-encoders/flash-attn 2>&1 | tail -n 3 | tee "$L4B"	clip_artifact_producer.sh's flash-attn leg build (SKIP_FLASH_LEG-gated) — same residual as the three rows above.
+
+# --- ci/scripts/perf/finetune_ab.sh — an A/B numerics-comparison driver
+# (unification contract C5.1's `run_cmd` provenance-logging wrapper, same
+# shape as stacked_sweep.sh below). NEVER INVOKED by any workflow: grep
+# over .github/workflows/*.yml for this script's own filename finds TWO
+# hits, both `#`-prefixed comment lines in ci.yml's guard-matrix module
+# doc (one naming the script in prose, one naming
+# `test_ab_merge.py`/`ab_merge.py` — the SEPARATE, already-wired stdlib
+# suite that tests this script's own EXTRACTED merge/table-stage Python
+# module, never invokes the bash script itself) — an operator/perf-lane
+# tool, run by hand on a rented pod. ---
+cargo build --release -p jammi-bench --features cuda --manifest-path "$REPO_ROOT/Cargo.toml"	finetune_ab.sh's own build-and-check-out-ref leg (`run_cmd cargo build ...`) — operator-run, invoked from no workflow; needs the CUDA toolchain.
+
+# --- ci/scripts/perf/stacked_sweep.sh — a stacked-optimization timing sweep
+# (unification contract C5.1's `run_cmd` provenance-logging wrapper).
+# NEVER INVOKED by any workflow: grep over .github/workflows/*.yml for this
+# script's own filename finds TWO hits, both `#`-prefixed comment lines in
+# ci.yml's own "producer provenance gates" step doc (which STATICALLY
+# greps this script's own source for a cross-check invariant, never
+# EXECUTES it) — an operator/perf-lane tool, run by hand on a rented pod. ---
+cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn --manifest-path "$WORKTREE/Cargo.toml"	stacked_sweep.sh's own flash-attn build leg (`run_cmd cargo build ...`) — operator-run, invoked from no workflow; needs the CUDA toolchain + a provisioned CUTLASS submodule.
+
+# --- ci/scripts/perf/fa2_ab.sh — a one-build FA2 A/B timing driver (its own
+# module comment: "a100b (exclusive timing box)"). NEVER INVOKED by any
+# workflow: grep over .github/workflows/*.yml for this script's own
+# filename finds ONE hit, the same `#`-prefixed "producer provenance
+# gates" comment line stacked_sweep.sh's own row above cites (a static
+# grep over source, never an execution) — an operator/perf-lane tool, run
+# by hand on a rented, exclusively-reserved pod. ---
+cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn 2>&1 | tail -n 1	fa2_ab.sh's own one-shot flash-attn build (`;`-chained after the worktree checkout) — operator-run, invoked from no workflow; needs the CUDA toolchain + a provisioned CUTLASS submodule.

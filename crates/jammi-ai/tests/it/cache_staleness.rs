@@ -812,3 +812,142 @@ async fn warm_hit_after_required_weights_deleted_stays_a_typed_refusal_both_call
          not a wedge into some other failure mode"
     );
 }
+
+// ── Round 10 (audit round 62, adversarial round 10 — "the terminal class \
+//    closure"): the weights slot's alternate-arm appearance/deletion, at \
+//    the full ModelCache level ──
+
+/// (a) appearance, end-to-end: `model.onnx` appears beside an already-loaded
+/// `model.safetensors`. The warm path must NOT silently keep serving the
+/// pre-appearance `Arc<LoadedModel>` forever: it must detect the staleness
+/// and evict + genuinely reload.
+///
+/// **What this test can honestly assert at the `ModelCache` level**: by the
+/// time this model's SECOND `get_or_load` runs, `do_load`'s first call has
+/// already registered it in the catalog (`register_model`, with the
+/// persisted `backend` it loaded at — Candle). `ModelResolver::resolve`
+/// checks the catalog FIRST (`try_catalog_lookup`), so THIS reload reuses
+/// the persisted Candle/`model.safetensors` record rather than re-deriving
+/// `resolve_local`'s `has_onnx` heuristic from scratch — the backend-flip
+/// itself only happens for an resolve with no catalog record to short-circuit
+/// it, proven independently, unregistered, in `models.rs`'s
+/// `resolve_local_prefers_onnx_once_it_appears_alongside_existing_safetensors`.
+/// What THIS test proves is the piece that mechanism actually gates: the
+/// stale-fingerprint eviction genuinely fires and a NEW `Arc<LoadedModel>` is
+/// constructed (never the SAME cached instance silently handed back) —
+/// proven by `Arc::ptr_eq` inequality between the two guards' `model`
+/// handles, the direct, non-vacuous signal that a real evict+reload cycle
+/// ran rather than the fast path short-circuiting on a stale-but-undetected
+/// probe.
+///
+/// RED pre-round-10: the weights slot's fingerprint only ever tracked the
+/// SELECTED arm (`model.safetensors`) — `model.onnx` appearing was invisible
+/// to `probe`, which reported fresh forever, so the second call would return
+/// the IDENTICAL `Arc` as the first (this test's `Arc::ptr_eq` assertion
+/// would be `true`, not `false`), silently masking the appearance entirely.
+#[tokio::test]
+async fn warm_hit_after_model_onnx_appearing_beside_safetensors_evicts_and_genuinely_reloads() {
+    let tmp = tempdir().unwrap();
+    let catalog_dir = tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
+    let cache = new_cache(Arc::clone(&catalog));
+
+    let dir = tiny_bert_dir(tmp.path(), "onnx_appears_model", &mean_pooling_config());
+    let source = ModelSource::local(&dir);
+
+    // (1) Cold load: only model.safetensors exists — Candle backend.
+    let guard1 = cache
+        .get_or_load(&source, ModelTask::TextEmbedding, None)
+        .await
+        .unwrap();
+    let model1 = Arc::clone(&guard1.model);
+    drop(guard1);
+
+    // (2) model.onnx APPEARS beside the existing model.safetensors — the
+    // UNSELECTED arm of the weights slot.
+    std::fs::write(dir.join("model.onnx"), b"fake-onnx-bytes").unwrap();
+
+    // (3) The warm path must evict and genuinely reload rather than silently
+    // keep serving the pre-appearance `Arc`.
+    let guard2 = cache
+        .get_or_load(&source, ModelTask::TextEmbedding, None)
+        .await
+        .expect(
+            "model.onnx appearing must trip a stale-reload — which succeeds here \
+             because try_catalog_lookup's persisted record keeps resolving Candle/ \
+             model.safetensors (both still present and unchanged) — never a refusal",
+        );
+    assert!(
+        !Arc::ptr_eq(&model1, &guard2.model),
+        "model.onnx appearing beside model.safetensors must trip the staleness probe \
+         and produce a GENUINELY NEW Arc<LoadedModel> on the next get_or_load — the \
+         SAME Arc being handed back (Arc::ptr_eq == true) would mean the appearance \
+         was never detected (the round-10 defect) and the fast path silently kept \
+         serving the pre-appearance instance forever"
+    );
+}
+
+/// (b) deletion-with-alternate, end-to-end: the SELECTED weights arm
+/// (`model.safetensors`) is deleted while an alternate
+/// (`open_clip_model.safetensors`) survives — a cold resolve's own
+/// standard/open_clip fallback chain (`resolve_local`) succeeds via the
+/// alternate. Two consecutive warm calls after the deletion must both
+/// succeed — never wedge, never refuse.
+///
+/// RED pre-round-10: the weights slot's fingerprint only ever tracked the
+/// SELECTED arm; deleting it fell into the sole "REQUIRED, no fallback"
+/// treatment every weights path had (`optional: false` unconditionally,
+/// with no per-slot alternate-exists carve-out), so this refused instead of
+/// reloading via the alternate a cold resolve would happily use.
+#[tokio::test]
+async fn warm_hit_after_selected_weights_arm_deleted_with_alternate_present_reloads_via_alternate_never_refuses(
+) {
+    let tmp = tempdir().unwrap();
+    let catalog_dir = tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
+    let cache = new_cache(Arc::clone(&catalog));
+
+    let dir = tiny_bert_dir(
+        tmp.path(),
+        "weights_alternate_model",
+        &mean_pooling_config(),
+    );
+    let source = ModelSource::local(&dir);
+
+    // An alternate arm (open_clip_model.safetensors) ALSO exists on disk,
+    // byte-identical to model.safetensors — untracked by the pre-round-10
+    // fingerprint (only the SELECTED arm was ever a candidate).
+    std::fs::copy(
+        dir.join("model.safetensors"),
+        dir.join("open_clip_model.safetensors"),
+    )
+    .unwrap();
+
+    let guard1 = cache
+        .get_or_load(&source, ModelTask::TextEmbedding, None)
+        .await
+        .unwrap();
+    drop(guard1);
+
+    // DELETE the selected arm — the alternate survives.
+    std::fs::remove_file(dir.join("model.safetensors")).unwrap();
+
+    // Two consecutive warm calls must both succeed, never wedge and never
+    // refuse — a cold resolve of this SAME directory would happily pick up
+    // open_clip_model.safetensors via resolve_local's own fallback chain.
+    for attempt in 0..2 {
+        let result = cache
+            .get_or_load(&source, ModelTask::TextEmbedding, None)
+            .await;
+        match result {
+            Ok(guard) => drop(guard),
+            Err(e) => panic!(
+                "attempt #{attempt}: deleting the SELECTED weights arm \
+                 (model.safetensors) while an alternate (open_clip_model.safetensors) \
+                 still exists must reload via the alternate, never refuse — a cold \
+                 resolve would succeed via resolve_local's own fallback chain (round \
+                 62, adversarial round 10) — got Err({e})"
+            ),
+        }
+    }
+}

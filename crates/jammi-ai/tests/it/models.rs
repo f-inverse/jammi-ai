@@ -114,6 +114,58 @@ async fn resolve_local_path_with_onnx() {
         .any(|p| p.ends_with("model.onnx")));
 }
 
+/// Audit round 62, adversarial round 10 (the weights slot's cold-side
+/// backend flip): `model.onnx` appearing beside an already-existing
+/// `model.safetensors` must flip a FRESH resolve's backend selection to ORT
+/// — the same `has_onnx` preference `resolve_local` always applies,
+/// independent of load order. This is the cold-side half of
+/// `model::backend::candle::digest_fingerprint_audit62_tests::weights_slot_alternate_arm_appearing_trips_the_probe`,
+/// which proves the WARM staleness probe detects the appearance; this test
+/// proves what a subsequent cold reload actually does once it fires.
+#[tokio::test]
+async fn resolve_local_prefers_onnx_once_it_appears_alongside_existing_safetensors() {
+    let dir = tempdir().unwrap();
+    let model_dir = dir.path().join("onnx_appears_model");
+    std::fs::create_dir_all(&model_dir).unwrap();
+
+    std::fs::write(model_dir.join("config.json"), r#"{"model_type":"bert"}"#).unwrap();
+    std::fs::write(model_dir.join("model.safetensors"), b"fake-weights").unwrap();
+
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
+    let source = ModelSource::local(&model_dir);
+
+    // Before model.onnx exists: Candle, via model.safetensors.
+    let resolved_before = resolver
+        .resolve(&source, ModelTask::TextEmbedding, None)
+        .await
+        .unwrap();
+    assert_eq!(resolved_before.backend, BackendType::Candle);
+
+    // model.onnx APPEARS beside the existing model.safetensors.
+    std::fs::write(model_dir.join("model.onnx"), b"fake-onnx").unwrap();
+
+    // A FRESH resolve of the SAME directory now prefers ORT — proving the
+    // staleness the warm probe detects (candle.rs's peer test) corresponds
+    // to a REAL change in what a cold reload would do, not merely an inert
+    // file the resolver ignores.
+    let resolved_after = resolver
+        .resolve(&source, ModelTask::TextEmbedding, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        resolved_after.backend,
+        BackendType::Ort,
+        "a fresh resolve of a directory where model.onnx now exists alongside \
+         model.safetensors must prefer ORT (resolve_local's has_onnx branch), \
+         even though an earlier resolve of the SAME directory picked Candle"
+    );
+    assert!(resolved_after
+        .weights_paths
+        .iter()
+        .any(|p| p.ends_with("model.onnx")));
+}
+
 // --- Backend selection heuristic ---
 
 #[tokio::test]

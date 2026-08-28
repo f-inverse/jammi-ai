@@ -36,19 +36,25 @@ determinant set (esc-058 is `class_id: cache-coherence-digest-describes-disk`, d
 esc-057's `identity-completeness`).
 
 The fix is landed on this branch (commit `f0712069`, merged at `0ca0b1e6`): `get_or_load`'s warm
-fast path (`crates/jammi-ai/src/model/cache.rs:79-142`) now `stat`-probes a load-time
-`ModelFingerprint` (`ModelFingerprint::probe`, `crates/jammi-ai/src/model/backend/candle.rs:727-780`,
-computed at load by `compute_model_fingerprint`, `candle.rs:790-807`, called from `CandleBackend::load`
-at `candle.rs:1555`; exposed via `LoadedModel::probe_freshness`, `crates/jammi-ai/src/model/mod.rs:391-396`)
-before serving the cached `Arc<LoadedModel>`: `Ok(true)` serves it (`cache.rs:96-106`); `Ok(false)`
-evicts the stale entry through the existing removal machinery and falls through to the same
-single-flight reload path that re-resolves and re-hashes current bytes (`cache.rs:107-133`);
-`Err` — a fingerprinted file vanished or became unreadable — surfaces as a typed refusal (K2),
-never silently treated as fresh or stale (`cache.rs:134-140`). `stat` only, never a re-hash, so
-the fast path stays cheap. Honest residual, documented on `ModelFingerprint`: `(len, mtime)` is a
-staleness TRIPWIRE, not a cryptographic guarantee — a same-length, same-mtime content swap is
-invisible to it; the `ModelContentDigest` recomputed on every actual reload remains the sole
-authoritative attestation.
+fast path (`crates/jammi-ai/src/model/cache.rs:86-184`) clones the currently cached entry's shared
+handles under a short-held READ lock, drops the lock, then `stat`-probes a load-time
+`ModelFingerprint` (`ModelFingerprint::probe`, `crates/jammi-ai/src/model/backend/candle.rs:879-916`,
+computed at load by `compute_model_fingerprint`, `candle.rs:927-955`, called from `CandleBackend::load`
+at `candle.rs:1703`; exposed via `LoadedModel::probe_freshness` (`pub(crate)`),
+`crates/jammi-ai/src/model/mod.rs:391-396`) UNLOCKED, then RE-VALIDATES under a write lock
+(`Arc::ptr_eq` against the current cache entry) before serving the cached `Arc<LoadedModel>` — a
+narrow race (a concurrent evict/reload winning while this task probes) simply retries from the top
+against whatever is there now; the single-flight path below still ensures at most one loader per
+id: `Ok(true)` serves the snapshot if it is still the current entry (`cache.rs:122-141`); `Ok(false)`
+evicts ONLY the same probed entry — unconditional on `ref_count`, deliberately NOT routed through
+the idle-only `evict_one` path, since serving stale bytes is a correctness bug rather than a
+capacity one — and falls through to the same single-flight reload path that re-resolves and
+re-hashes current bytes (`cache.rs:142-175`); `Err` — a fingerprinted file vanished or became
+unreadable — surfaces as a typed refusal (K2), never silently treated as fresh or stale
+(`cache.rs:176-182`). `stat` only, never a re-hash, so the fast path stays cheap. Honest residual,
+documented on `ModelFingerprint`: `(len, mtime)` is a staleness TRIPWIRE, not a cryptographic
+guarantee — a same-length, same-mtime content swap is invisible to it; the `ModelContentDigest`
+recomputed on every actual reload remains the sole authoritative attestation.
 
 Red-green test: `crates/jammi-ai/tests/it/cache_staleness.rs::warm_hit_after_in_place_mutation_reloads_fresh_digest_and_vectors`
 (`closes_escape: esc-058`) drives the symptom_spec's exact observable through the real

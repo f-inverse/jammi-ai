@@ -410,6 +410,14 @@ pub struct CandleModel {
     /// bytes must never collide on one `DefinitionHash`), so the
     /// materialization contract folds it into `ModelIdentity.content_digest`.
     pub(crate) content_digest: ModelContentDigest,
+    /// The load-time `stat`-only staleness fingerprint (esc-058) over the
+    /// same input set `content_digest` was hashed from, computed once here
+    /// by [`compute_model_fingerprint`] and re-probed on every warm
+    /// `ModelCache::get_or_load` hit via [`ModelFingerprint::probe`]. See
+    /// that type's doc for the exact guarantee (a tripwire, not a
+    /// cryptographic one) and [`compute_model_fingerprint`] for the input
+    /// set.
+    pub(crate) fingerprint: ModelFingerprint,
 }
 
 /// Mean-pool the `[batch, seq, hidden]` tensor along seq using
@@ -633,7 +641,14 @@ fn sha256_and_len(path: &std::path::Path) -> Result<(String, u64)> {
 /// external-producer import path (`pipeline::import`), which has no local
 /// model directory to hash at all — a categorically different case from "the
 /// loader tried to hash local files and failed."
-fn compute_model_content_digest(resolved: &ResolvedModel) -> Result<ModelContentDigest> {
+/// Enumerate the `(relpath, absolute_path)` input set both
+/// [`compute_model_content_digest`] (hashes the bytes) and
+/// [`compute_model_fingerprint`] (esc-058, `stat`s the metadata) walk — the
+/// SAME set, computed by this ONE function, so the fingerprint's file
+/// coverage can never drift from the digest's. See
+/// [`compute_model_content_digest`] for exactly which files this is, why, and
+/// the ordering guarantee (sorted lexicographically by `relpath`).
+fn content_digest_entries(resolved: &ResolvedModel) -> Vec<(String, std::path::PathBuf)> {
     let model_dir = resolved
         .config_path
         .parent()
@@ -667,6 +682,11 @@ fn compute_model_content_digest(resolved: &ResolvedModel) -> Result<ModelContent
         })
         .collect();
     entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries
+}
+
+fn compute_model_content_digest(resolved: &ResolvedModel) -> Result<ModelContentDigest> {
+    let entries = content_digest_entries(resolved);
 
     let mut combined = sha2::Sha256::new();
     for (rel, path) in &entries {
@@ -680,6 +700,110 @@ fn compute_model_content_digest(resolved: &ResolvedModel) -> Result<ModelContent
     }
 
     Ok(ModelContentDigest::Sha256(hex::encode(combined.finalize())))
+}
+
+/// A `stat`-only on-disk staleness fingerprint (esc-058) of the SAME input
+/// file set [`compute_model_content_digest`] hashes: `(relpath, len, mtime)`
+/// per file, captured once at load time by [`compute_model_fingerprint`] and
+/// carried on [`CandleModel::fingerprint`]. [`ModelCache::get_or_load`]'s
+/// warm fast path calls [`ModelFingerprint::probe`] before serving the cached
+/// `Arc<LoadedModel>` — `stat`, never a re-hash — so an in-place model-dir
+/// mutation (e.g. rewriting `1_Pooling/config.json`) between two calls in the
+/// same warm process is detected and forces a fresh load instead of silently
+/// replaying pre-mutation weights while attesting the pre-mutation digest.
+///
+/// **Honest residual**: `(len, mtime)` is a staleness TRIPWIRE, not a
+/// cryptographic guarantee. A content swap that lands on the exact same byte
+/// length at the exact same modification time (a crafted rewrite, or a
+/// same-second overwrite on a filesystem with coarse mtime resolution) is
+/// invisible to this probe and will keep serving the stale in-memory model.
+/// The [`ModelContentDigest`] recomputed on every actual reload remains the
+/// sole authoritative attestation of what bytes were hashed; this type only
+/// decides WHEN a reload is triggered, and does not strengthen the digest's
+/// own guarantee.
+///
+/// [`ModelCache::get_or_load`]: super::super::cache::ModelCache::get_or_load
+#[derive(Debug, Clone)]
+pub(crate) struct ModelFingerprint {
+    /// `(relpath, absolute_path, len, mtime)` per fingerprinted file, in the
+    /// same sorted order [`compute_model_content_digest`] folds them into the
+    /// digest. Empty for a synthetic (non-disk-backed) fixture, in which case
+    /// [`ModelFingerprint::probe`] is vacuously fresh.
+    entries: Vec<(String, std::path::PathBuf, u64, std::time::SystemTime)>,
+}
+
+impl ModelFingerprint {
+    /// A fingerprint with no files to check — `probe` always reports fresh.
+    /// Used only by in-process test fixtures that synthesize a `CandleModel`
+    /// with no backing model directory; every real load goes through
+    /// [`compute_model_fingerprint`] instead.
+    #[cfg(test)]
+    pub(crate) fn empty() -> Self {
+        Self { entries: vec![] }
+    }
+
+    /// Re-`stat` every fingerprinted file and compare against the load-time
+    /// snapshot.
+    ///
+    /// - `Ok(true)` — every file's current `(len, mtime)` matches load time:
+    ///   serve the cached model.
+    /// - `Ok(false)` — at least one file's `len` or `mtime` diverged: the
+    ///   caller must evict and reload, never serve.
+    /// - `Err` — a fingerprinted file vanished or became unreadable between
+    ///   load and this probe: a typed refusal (K2), never silently treated as
+    ///   fresh (would replay stale weights) or as stale (would mask a real
+    ///   IO failure as an ordinary reload, which would then hit the identical
+    ///   error inside `compute_model_content_digest` anyway — surfacing it
+    ///   here is strictly more informative, naming the probe as the cause).
+    pub(crate) fn probe(&self) -> Result<bool> {
+        for (rel, path, len, mtime) in &self.entries {
+            let meta = std::fs::metadata(path).map_err(|e| JammiError::Model {
+                model_id: path.display().to_string(),
+                message: format!(
+                    "esc-058 staleness probe: {path:?} (fingerprinted as {rel:?} at load \
+                     time) is no longer readable: {e}"
+                ),
+            })?;
+            let current_mtime = meta.modified().map_err(|e| JammiError::Model {
+                model_id: path.display().to_string(),
+                message: format!(
+                    "esc-058 staleness probe: {path:?} has no mtime available on this \
+                     platform/filesystem: {e}"
+                ),
+            })?;
+            if meta.len() != *len || current_mtime != *mtime {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+/// Compute the load-time staleness fingerprint (esc-058) over the SAME input
+/// set [`compute_model_content_digest`] hashes ([`content_digest_entries`] —
+/// never independently enumerated, so the two can't drift). `stat`s each
+/// file (never reads its bytes, unlike the digest). Errors are typed
+/// refusals (K2), the identical stance [`compute_model_content_digest`]
+/// takes: an IO failure while stat'ing propagates as a `JammiError`, never
+/// silently degrading to "no fingerprint" for a model that does have local
+/// files.
+fn compute_model_fingerprint(resolved: &ResolvedModel) -> Result<ModelFingerprint> {
+    let entries = content_digest_entries(resolved);
+    let mut stamped = Vec::with_capacity(entries.len());
+    for (rel, path) in entries {
+        let meta = std::fs::metadata(&path).map_err(|e| JammiError::Model {
+            model_id: resolved.model_id.0.clone(),
+            message: format!("failed to stat {path:?} for esc-058 load-time fingerprinting: {e}"),
+        })?;
+        let mtime = meta.modified().map_err(|e| JammiError::Model {
+            model_id: resolved.model_id.0.clone(),
+            message: format!(
+                "{path:?} has no mtime available for esc-058 load-time fingerprinting: {e}"
+            ),
+        })?;
+        stamped.push((rel, path, meta.len(), mtime));
+    }
+    Ok(ModelFingerprint { entries: stamped })
 }
 
 impl CandleModel {
@@ -1424,6 +1548,11 @@ impl ModelBackend for CandleBackend {
         // mmapping several GB of safetensors. See `compute_model_content_digest`
         // for the exact input set and ordering.
         let content_digest = compute_model_content_digest(resolved)?;
+        // Same input set as `content_digest`, `stat`-only (esc-058): the
+        // warm-hit staleness tripwire `ModelCache::get_or_load` re-probes on
+        // every fast-path hit. See `ModelFingerprint`'s doc for the exact
+        // guarantee.
+        let fingerprint = compute_model_fingerprint(resolved)?;
 
         let model_type = resolved
             .model_config
@@ -1946,6 +2075,7 @@ impl ModelBackend for CandleBackend {
             ner_classifier,
             compute_precision: effective_precision,
             content_digest,
+            fingerprint,
         })))
     }
 
@@ -2842,6 +2972,9 @@ mod ner_nonfinite_logit_tests {
             // is nothing to hash — an arbitrary fixed placeholder is fine
             // here (no test in this module asserts on the digest value).
             content_digest: ModelContentDigest::Sha256("test-fixture-digest".into()),
+            // No real model directory backs this fixture either, so there is
+            // nothing to fingerprint — `empty()` probes vacuously fresh.
+            fingerprint: ModelFingerprint::empty(),
         }
     }
 

@@ -287,16 +287,33 @@ pub fn apply_inplace3<T: KernelOp + InplaceOp3>(
 ///
 /// Bound: `Send + Sync + 'static + Sealed`, deliberately WITHOUT `Copy`
 /// **or `Clone`** — for every op that ACTUALLY EXISTS in this crate today
+/// AND GENUINELY NEEDS this trait, i.e. carries an owned [`Saved`] field
 /// (`crate::ops::flash_attention::FlashVarlenAttention` and its bwd
 /// helper — a plain code span, not a doc link: that module is
 /// feature-gated behind `flash-attn` and is absent from a default-feature
-/// `cargo doc` build — plus [`crate::ops::MemEfficientAttention`], which is
-/// NOT feature-gated: the first `StatefulKernelOp` this crate ships in
-/// every default build, not merely under `flash-attn`. Updated from an
-/// earlier "the crate's only two `StatefulKernelOp`s" claim once
-/// `MemEfficientAttention` landed — the enumeration grows as real ops are
-/// added; this bound's discipline does not). This is not merely "we don't
-/// need Clone" for these types — Clone is actively refused AT THEIR
+/// `cargo doc` build — plus [`crate::ops::MemEfficientAttention`], the
+/// crate's THIRD Saved-bearing op and the FIRST one compiled in every
+/// default build, not merely under `flash-attn`). **Precision matters
+/// here** (round-3 audit correction, F-C — the SAME category error round
+/// 1's "only two `StatefulKernelOp`s" phrasing had, relocated rather than
+/// closed): `StatefulKernelOp` itself is BLANKET-implemented (below) over
+/// `Sealed + Send + Sync + 'static`, so every existing `KernelOp` in this
+/// crate — `LayerNormFused`, `RopeFused`, `GegluFused`,
+/// `AttentionBlockFused`, ... — ALSO satisfies `StatefulKernelOp`'s bound
+/// in a default build (see this module's own top doc, "This is NOT mutual
+/// exclusion" — the set of `StatefulKernelOp` implementors is a SUPERSET
+/// of `KernelOp`'s, not a disjoint or narrow one). "The first
+/// `StatefulKernelOp` in a default build" is therefore FALSE by
+/// construction; the honest predicate this section (and
+/// `tests/stateful_op_discipline.rs`, which is what actually enforces the
+/// discipline below) cares about is SAVED-BEARING — a type that
+/// STRUCTURALLY NEEDS this trait because it cannot satisfy `KernelOp`'s
+/// `Copy` bound, not merely a type that happens to satisfy this trait's
+/// own permissive bound. Updated from an earlier "the crate's only two
+/// `StatefulKernelOp`s" claim once `MemEfficientAttention` landed — the
+/// Saved-bearing enumeration grows as real ops are added; this bound's
+/// discipline does not. This is not merely "we don't need Clone" for
+/// these Saved-bearing types — Clone is actively refused AT THEIR
 /// DEFINITION SITE (none of them derives it):
 ///
 /// - Every call site in this crate constructs a fresh instance and passes

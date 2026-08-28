@@ -119,10 +119,18 @@
 //! (a backtick code span, not an intra-doc link: that module is
 //! `flash-attn`-feature-gated and absent from a default-feature `cargo
 //! doc` build):
-//! `fwd` calls `self.lse.set(..)`, `bwd` calls `self.lse.take()`. This
-//! makes `MemEfficientAttention` a [`StatefulKernelOp`], not a `KernelOp`
-//! (it cannot be `Copy` — see [`StatefulKernelOp`]'s own doc for why), run
-//! through [`super::apply_stateful3`]. A fully-masked (`Zeros`-triggered)
+//! `fwd` calls `self.lse.set(..)`, `bwd` calls `self.lse.take()`.
+//! `MemEfficientAttention` satisfies [`StatefulKernelOp`] TRIVIALLY (round-3
+//! audit correction, F-C): that trait is blanket-implemented over
+//! `Sealed + Send + Sync + 'static` — EVERY sealed op in this crate
+//! satisfies it, `KernelOp`-bounded ones included, so satisfying it says
+//! nothing distinguishing on its own (see [`StatefulKernelOp`]'s own doc,
+//! "This is NOT mutual exclusion"). What `MemEfficientAttention` actually
+//! CANNOT do is implement [`super::KernelOp`]: holding an OWNED [`Saved`]
+//! field makes it `!Copy`, and `KernelOp`'s bound requires `Copy` — that
+//! Copy-bound failure, not "being a `StatefulKernelOp` instead", is the
+//! real reason this op is run through [`super::apply_stateful3`] rather
+//! than [`super::apply3`]. A fully-masked (`Zeros`-triggered)
 //! row stores [`MASKED_LSE_SENTINEL`] instead of its real `m + ln(l)`: a
 //! large finite value chosen so `bwd`'s `exp(masked_score - lse)` cleanly
 //! UNDERFLOWS to exactly `0.0` for that row (never `NaN`/`inf` — an actual
@@ -154,55 +162,141 @@
 //!
 //! ## Memory cost: the `[b, h, s, c]` transient, priced both directions
 //!
-//! Round-2 audit (F4): the per-chunk score-shaped transient is `O(b · h ·
-//! s · c)`, LINEAR in `c` — the `MIN_CHUNK` (`512`) launch-count floor
-//! therefore inflates it directly, and this is priced HERE, both
-//! directions, with the number produced rather than assumed. At
+//! Round-2 audit (F4), CORRECTED round-3 (F-A, F-B — both stood on
+//! independent re-verification: the round-2 figures undercounted `bwd`'s
+//! peak by one whole buffer and omitted `fwd`'s persistent set entirely).
+//! The per-chunk score-shaped transient is `O(b · h · s · c)`, LINEAR in
+//! `c` — the `MIN_CHUNK` (`512`) launch-count floor therefore inflates it
+//! directly, and this is priced HERE, both directions, with the number
+//! produced rather than assumed, MEASURED with a tracking global
+//! allocator (a scratch `examples/` probe, not committed) rather than
+//! reasoned from `drop`-point inspection alone (round-2's own method,
+//! which is what missed the `[b,h,s,c]`-sized UNNAMED temporary a chained
+//! `.broadcast_sub(..)?` call leaves alive until its enclosing
+//! STATEMENT's end, not merely its last syntactic use). At
 //! `b=1, h=16, s=8192, c=512` (`f32`, `4` bytes/element — the plan's own
 //! A1 shape): one `[b, h, s, c]` buffer is `1·16·8192·512·4 =
-//! 268_435_456` bytes (`≈ 268.4 MB`).
+//! 268_435_456` bytes (`≈ 268.4 MB`); one `[b, h, s, d]` buffer (`d=64`,
+//! the shape `q`/`k`/`v`/`acc`/`dqs` are — a DIFFERENT, smaller class,
+//! `c/d = 8×` smaller at this shape) is `1·16·8192·64·4 = 33_554_432`
+//! bytes (`≈ 33.6 MB`).
 //!
-//! - **`fwd`** (`attention_fwd_memeff_f32`): `scores` (one such buffer per
-//!   chunk iteration) plus the much smaller `k_chunk`/`v_chunk`
-//!   (`[b,h,c,d]` each, `1·16·512·64·4 = 2_097_152` bytes `≈ 2.1 MB`
-//!   apiece) — momentary peak `≈ 272.6 MB`, freed automatically at the end
-//!   of EACH chunk iteration (these are `while`-loop-body-local bindings —
-//!   candle's own scoping frees them without an explicit `drop`, unlike
-//!   `bwd`'s longer-lived intermediates below) and never summed across
-//!   chunks.
+//! - **`fwd`** (`attention_fwd_memeff_f32`) has TWO distinct components,
+//!   both real, neither priced in the round-2 doc:
+//!   - **Loop-resident** (allocated ONCE, before the chunk loop, held
+//!     until the function returns): `q`, `k`, `v`, `acc` — FOUR
+//!     `[b,h,s,d]` Vecs, `4 · 33.6 MB ≈ 134.2 MB`, resident across EVERY
+//!     chunk iteration (round-2's model omitted this term entirely — it
+//!     priced only the per-chunk transient below, as if `q`/`k`/`v`/`acc`
+//!     were free).
+//!   - **Per-chunk transient**: `scores` (one `[b,h,s,c]` buffer) plus
+//!     the smaller `k_chunk`/`v_chunk` (`[b,h,c,d]` each,
+//!     `1·16·512·64·4 = 2_097_152` bytes `≈ 2.1 MB` apiece) — `≈ 272.6 MB`
+//!     — freed automatically at the end of EACH chunk iteration (these are
+//!     `while`-loop-body-local bindings) and never summed across chunks.
+//!   - **The genuine loop-body peak is therefore their SUM**:
+//!     `134.2 MB + 272.6 MB ≈ 406.8 MB`, not `≈ 272.6 MB` alone (round-2's
+//!     figure — a real undercount, not a rounding difference).
+//!   - **RoPE** (when `self.rope`, before the loop): `qr`/`kr` (two MORE
+//!     `[b,h,s,d]` buffers) are built while the ORIGINAL `q`/`k` are still
+//!     bound (needed as the rotate-half SOURCE) — `+2 · 33.6 MB ≈ 67.1 MB`
+//!     transiently, on top of the already-resident `q`/`k`/`v`/`acc`
+//!     (`≈ 201.6 MB` at that specific window), before `q = qr; k = kr;`
+//!     drops the originals.
+//!   - **Post-loop** (`out_bh`, then the final scatter into `out`): TWO
+//!     more `[b,h,s,d]`/`[b,s,h,d]`-shaped buffers (same element count,
+//!     different layout) while `acc` is still bound (nothing in this
+//!     function explicitly drops it) — `+2 · 33.6 MB ≈ 67.1 MB` on top of
+//!     the persistent set, `≈ 201.6 MB` at that window — LOWER than the
+//!     loop-body peak above, so it does not change the overall maximum.
+//!   - **Overall `fwd` peak**: the loop-body window, `≈ 406.8 MB` — this
+//!     is the number this section states, corrected from round-2's
+//!     `≈ 272.6 MB`.
 //! - **`bwd`**: FIVE `[b,h,s,c]`-shaped intermediates exist per chunk
 //!   iteration (`scores_c`, `masked_c`, `p_c`, `dp_c`, `ds_c` — `dqs_c`/
 //!   `dk_c` are `[b,h,s,d]`/`[b,h,c,d]`-shaped instead, matching `Q`'s or
-//!   `K`'s own chunk size, NOT this class). Explicit early `drop`s
-//!   (mirroring [`super::AttentionBlockFused::bwd`]'s own discipline —
-//!   see that op's module doc's "transient scoping" section) hold the
-//!   MOMENTARY peak to THREE concurrent buffers (`p_c` + `dp_c` + `ds_c`,
-//!   right before `ds_c` consumes both) rather than the up-to-six a naive
-//!   no-early-drop version would carry: `3 · 268.4 MB ≈ 805.3 MB`
-//!   momentary peak per chunk iteration at this shape — the number this
-//!   section exists to state, not omit.
+//!   `K`'s own chunk size, NOT this class; round-2's own "FIVE" count
+//!   here was already correct — the measured NO-EARLY-DROP peak is SIX
+//!   concurrent buffers, not round-2's stated "up to six" — MEASURED, not
+//!   estimated, in the same probe). A ROUND-2 BUG (F-A): the `ds_c`
+//!   statement inlined `p_c.mul(&dp_c.broadcast_sub(&delta)?)?` — Rust
+//!   keeps that call's UNNAMED `broadcast_sub` result alive until the
+//!   WHOLE STATEMENT ends (not its last syntactic use), so `p_c`, `dp_c`,
+//!   that unnamed temporary, and the freshly-built `ds_c` were all
+//!   concurrently resident: FOUR buffers, not the three round-2 claimed —
+//!   MEASURED with the tracking-allocator probe at this exact A1 shape:
+//!   `4.1880` units (`≈ 1124.2 MB`; the auditor's own independent
+//!   measurement, `1073.7 MB`, is the clean `4.0`-unit figure with no
+//!   GEMM-internal-scratch component — this session's own probe measures
+//!   a real, slightly higher total because `matmul_grad_lhs`'s own GEMM
+//!   call leaves additional scratch resident at this specific measurement
+//!   window; both are real, cited honestly, not reconciled to a single
+//!   idealized number). **Fixed** (this round): the `broadcast_sub` result
+//!   is hoisted into a named `dp_minus_delta` binding and `dp_c` is
+//!   dropped BEFORE `ds_c` is built (mirroring
+//!   [`super::AttentionBlockFused::bwd`]'s own early-drop discipline —
+//!   see that op's module doc's "transient scoping" section; the SAME
+//!   class of fix was ALSO applied, preemptively, to the `masked_c` →
+//!   `p_c` chain, which has the identical "chained call, unnamed
+//!   temporary" shape). MEASURED after the fix: exactly `3.0000` units
+//!   (`805_307_456` bytes, `≈ 805.3 MB`) for the `p_c`/`dp_c`/`ds_c`
+//!   region specifically.
+//!   - **`band_c`'s own contribution** (round-3 audit advisory, also
+//!     previously unpriced): `masked_c = masked_c.broadcast_add(&band_c)?`
+//!     keeps `scores_c` (still bound — its own `drop` runs AFTER this
+//!     whole `if let Some(w) = ..` block), the PRE-band `masked_c`, `band_c`
+//!     itself, and the POST-band `masked_c` all concurrently resident.
+//!     `band_c` is `[1,1,s,c]` (no `b`,`h` broadcast dims materialized),
+//!     so its OWN size relative to one `[b,h,s,c]` unit is exactly
+//!     `1/(b·h)` — `0.0625` at this shape (`16_777_216` bytes,
+//!     `≈ 16.8 MB`). MEASURED (same probe): `3.0625` units
+//!     (`822_084_952` bytes, `≈ 822.1 MB`) for this step.
+//!   - **The band-accumulation step, not the `ds_c` region, is `bwd`'s
+//!     TRUE post-fix bottleneck** whenever `half_window.is_some()`
+//!     (`822.1 MB > 805.3 MB`): fixing the `ds_c` region alone does not
+//!     bound the overall `bwd` peak below `≈ 822.1 MB` at this shape —
+//!     stated honestly, not left implied-solved by the `ds_c` fix alone.
+//!     Without a band (`half_window: None`), the `ds_c` region's own
+//!     `805.3 MB` IS the overall peak.
 //! - **`dk_chunks`/`dv_chunks` retention** (the module doc's "`dQ`
 //!   accumulates ACROSS the chunk loop" section): each pushed tensor is
 //!   `[b,h,clen,d]`-shaped (K/V's own chunk size, never `[.,s,c]`), so the
 //!   TOTAL retained across the whole loop — by construction, `sum(clen)
-//!   == s` — is `b·h·s·d·4` bytes each: at this shape,
-//!   `1·16·8192·64·4 = 33_554_432` bytes (`≈ 33.6 MB`) apiece, `≈ 67.1 MB`
+//!   == s` — is `b·h·s·d·4` bytes each: `≈ 33.6 MB` apiece, `≈ 67.1 MB`
 //!   combined, held until the post-loop `Tensor::cat`. This is EXACTLY the
 //!   final `dK`/`dV` output size, not an extra cost the chunking loop
 //!   introduces — a correct unchunked implementation would retain the
 //!   same total, just assembled in one shot instead of incrementally.
 //!
-//! **Both tradeoff directions, stated (v4 delta F3):** a LARGER `c`
-//! shrinks the launch count (`≈ s/c` `BackendStorage::matmul` calls per
-//! chunk-loop pass — the argument [`MIN_CHUNK`]'s own doc cites for why
-//! `c` has a floor at all) but GROWS this transient linearly (`c=1024`
-//! at the shape above: `≈ 536.9 MB` per `[b,h,s,c]` buffer, `≈ 1.61 GB`
-//! bwd momentary peak); a SMALLER `c` shrinks the transient but grows the
-//! launch count toward the `(s/c)²`-launch-latency regime the keys-only-
-//! chunking design (module doc's "why a `CustomOp3` at all" section, and
-//! the plan's own `c=128` ≈ 7 s pure-launch-latency figure) exists to
-//! avoid. `MIN_CHUNK` (`512`) is the plan's own chosen point on this
-//! curve; this crate does not re-derive it, only prices its consequence.
+//! **Both tradeoff directions, stated (v4 delta F3), numbers RE-DERIVED
+//! (round-3):** a LARGER `c` shrinks the launch count (`≈ s/c`
+//! `BackendStorage::matmul` calls per chunk-loop pass — the argument
+//! [`MIN_CHUNK`]'s own doc cites for why `c` has a floor at all) but
+//! GROWS every `[b,h,s,c]`-class transient linearly. At `c=1024`: one
+//! `[b,h,s,c]` buffer is `≈ 536.9 MB`; `bwd`'s post-fix band-inclusive
+//! peak is `≈ (3 + 1/16) · 536.9 MB ≈ 1644.1 MB` (`≈ 1.64 GB`); the
+//! PRE-fix (round-2-committed) `ds_c`-region peak at `c=1024` would have
+//! been `≈ 4 · 536.9 MB ≈ 2147.5 MB` (`≈ 2.15 GB`, matching the auditor's
+//! own cited figure) — NOT round-2's stated `≈ 2.1 GB`/`≈ 1.61 GB` pair
+//! (the `2.1 GB` figure there was ALSO the pre-fix number, silently
+//! attributed to a post-fix claim). A SMALLER `c` shrinks the transient
+//! but grows the launch count toward the `(s/c)²`-launch-latency regime
+//! the keys-only-chunking design (module doc's "why a `CustomOp3` at all"
+//! section, and the plan's own `c=128` ≈ 7 s pure-launch-latency figure)
+//! exists to avoid. `MIN_CHUNK` (`512`) is the plan's own chosen point on
+//! this curve; this crate does not re-derive it, only prices its
+//! consequence.
+//!
+//! **[`MAX_SEQ`] bounds `seq`, NOT this transient (round-3 audit
+//! advisory):** every number above is a function of `(b, h, s, c)` — `b`
+//! and `h` are entirely CALLER-controlled (this op does no admission-time
+//! check on either), and `c` is bounded only by [`MIN_CHUNK`] from below,
+//! by NOTHING from above (a caller may pass `chunk > seq`, degenerating to
+//! a single mega-chunk — see [`MemEfficientAttention::new`]'s domain).
+//! `MAX_SEQ` bounds `s` alone; it does not, and cannot, bound `b · h · s ·
+//! c` — a dispatch-time admission check (out of scope this pass — see the
+//! module doc's "Admission" section) is the layer responsible for keeping
+//! this real term bounded in production, not this op's own domain checks.
 //!
 //! ## Rounding contract (dtype-split — CPU/F32 arm only, this pass)
 //!
@@ -752,18 +846,38 @@ impl CustomOp3 for MemEfficientAttention {
             // `p_c = exp(masked_c - lse)`: for a `Zeros`-triggered row,
             // `lse == MASKED_LSE_SENTINEL` (module doc), so this
             // underflows cleanly to `0.0` — no separate branch needed.
-            let p_c = masked_c.broadcast_sub(&lse_unsq)?.exp()?;
+            // Hoisted for the SAME reason as `dp_minus_delta` below (round-3
+            // audit F-A's own class, applied preemptively here too): the
+            // chained `.broadcast_sub(..)?.exp()?` would otherwise keep an
+            // unnamed `[b,h,s,c]` temporary alive alongside `masked_c` AND
+            // the freshly-built `p_c` until this statement's end.
+            let masked_minus_lse = masked_c.broadcast_sub(&lse_unsq)?;
             drop(masked_c);
+            let p_c = masked_minus_lse.exp()?;
+            drop(masked_minus_lse);
             let dv_c = matmul_grad_rhs(&p_c, &dctx)?;
             let dp_c = matmul_grad_lhs(&dctx, &v_c)?;
             drop(v_c);
-            let ds_c = p_c.mul(&dp_c.broadcast_sub(&delta)?)?;
-            // `p_c`'s last use (its second, after `dv_c`) and `dp_c`'s
-            // only use were both building `ds_c` — drop both now, the
-            // SAME shape `AttentionBlockFused::bwd`'s own
-            // `drop(p); drop(dp);` uses.
-            drop(p_c);
+            // HOISTED (round-3 audit F-A fix): `p_c.mul(&dp_c.
+            // broadcast_sub(&delta)?)?` used to inline the subtraction —
+            // Rust keeps that call's UNNAMED temporary alive until the
+            // end of the WHOLE `let ds_c = ...;` statement (temporaries
+            // live to statement end, not to their last syntactic use),
+            // so `p_c` + `dp_c` + the unnamed `[b,h,s,c]` subtract result
+            // + `ds_c` itself were all concurrently resident — FOUR
+            // buffers, not three (module doc's "memory cost" section;
+            // measured with a tracking allocator, cited there). Naming
+            // the intermediate lets `dp_c` drop BEFORE `ds_c` is built,
+            // removing one of the four.
+            let dp_minus_delta = dp_c.broadcast_sub(&delta)?;
             drop(dp_c);
+            let ds_c = p_c.mul(&dp_minus_delta)?;
+            // `p_c`'s last use (its second, after `dv_c`) and
+            // `dp_minus_delta`'s only use were both building `ds_c` —
+            // drop both now, the SAME shape `AttentionBlockFused::bwd`'s
+            // own `drop(p); drop(dp);` uses.
+            drop(p_c);
+            drop(dp_minus_delta);
             let dqs_c = matmul_grad_lhs(&ds_c, &k_c_t)?;
             dqs = dqs.add(&dqs_c)?;
             let dk_c = matmul_grad_rhs(&q_scaled, &ds_c)?
@@ -1815,22 +1929,52 @@ mod tests {
     // post_exp_is_caught_by_the_truth_oracle` drove a disconnected,
     // UNCHUNKED toy helper — real math, but not this op's algorithm, and
     // not the truth oracle either (its own name's claim). `running_softmax_
-    // row` below fixes both: it mirrors `attention_fwd_memeff_f32`'s own
-    // per-row recurrence VARIABLE-FOR-VARIABLE (`m`, `l`, `correction`, the
-    // rescale-then-accumulate shape) over a real multi-chunk loop, with
-    // three independently togglable, REAL mutations of that SAME
-    // algorithm — so each RED control below drives an actual instance of
-    // the named bug class through the actual chunked recurrence, not a
-    // toy stand-in. A fourth, independent verification (chunk-boundary
-    // off-by-one introduced directly into `attention_fwd_memeff_f32`
-    // itself, in a scratch copy) is cited in this crate's hand-off rather
-    // than committed as a fourth Rust test — see that control's own doc.
+    // row` below fixes both: it CLOSELY mirrors `attention_fwd_memeff_f32`'s
+    // own per-row recurrence (`m`, `l`, `correction`, the rescale-then-
+    // accumulate shape, and the exact `c_start += clen` advance) over a
+    // real multi-chunk loop, with three independently togglable, REAL
+    // mutations of that SAME algorithm — so each RED control below drives
+    // an actual instance of the named bug class through a faithful
+    // chunked recurrence, not a toy stand-in. **Precisely scoped (round-3
+    // audit advisory correction):** "mirrors ... VARIABLE-FOR-VARIABLE" —
+    // an earlier draft's claim — overstated it; see `running_softmax_row`'s
+    // own doc for the one real simplification (`weights` tracks raw
+    // per-key softmax mass, not `acc`'s own V-weighted sum) and why it is
+    // sufficient here without being identical. This helper is REDUNDANT
+    // COVERAGE relative to the scratch-copy, production-code mutations
+    // this file's own hand-off already cites as independently verified
+    // (the post-exp, lse-truncation, and chunk-stride-bug classes were
+    // each confirmed to redden a REAL production oracle by editing
+    // `attention_fwd_memeff_f32` itself in a scratch copy — see F1's and
+    // F3's own hand-off notes) — `running_softmax_row`'s value is a FAST,
+    // ALWAYS-RUN regression net for the same three classes, not the sole
+    // evidence they are real bugs; it is not pinned to production via an
+    // automated agreement test this pass (a fixture tying its own `(m,l)`
+    // output to `attention_fwd_memeff_f32`'s observable `lse` at a shared
+    // shape would close that gap — left as a documented, not silently
+    // assumed-closed, opportunity). A fourth, independent verification
+    // (chunk-boundary off-by-one introduced directly into
+    // `attention_fwd_memeff_f32` itself, in a scratch copy) is cited in
+    // this crate's hand-off rather than committed as a fourth Rust test —
+    // see that control's own doc.
 
-    /// Mirrors `attention_fwd_memeff_f32`'s per-row recurrence exactly
+    /// Closely mirrors `attention_fwd_memeff_f32`'s per-row recurrence
     /// (same `m`/`l`/`correction`/rescale shape, same `c_start += clen`
-    /// advance), single-row so fixtures stay legible. Returns `(m, l,
-    /// weights)` where `weights[k] / l` is exactly the quantity
-    /// `acc_row[d] / denom` computes in production at global key `k`.
+    /// advance), single-row so fixtures stay legible — but is NOT a
+    /// variable-for-variable copy (round-3 audit correction: an earlier
+    /// draft of this doc overclaimed that). The one real simplification:
+    /// `weights[k]` tracks the raw per-key softmax numerator `exp(score_k
+    /// - m)` (rescaled by each subsequent chunk's `correction`, via `+=`
+    /// so a key visited more than once under the `chunk_stride_bug`
+    /// mutant ACCUMULATES rather than silently discards its first visit —
+    /// matching production's own `acc_row[di] += e * v_row[di]`
+    /// accumulate-not-overwrite semantics), NOT production's own `acc`
+    /// (which is additionally weighted by `V` and reduced over `d`, a
+    /// different, head-dim-shaped accumulator this single-row helper has
+    /// no need to model). `weights[k] / l` is this row's softmax
+    /// PROBABILITY at global key `k` — sufficient to detect every mutant
+    /// class below (each corrupts either which keys are weighted or how
+    /// heavily), without needing `V` or `d` in the fixture at all.
     ///
     /// Three independent mutation knobs, each a REAL instance of one named
     /// bug class:
@@ -1890,7 +2034,18 @@ mod tests {
                 if !mask_pre_exp {
                     e += mask[c_start + kj]; // the annihilation bug
                 }
-                weights[c_start + kj] = e;
+                // `+=`, not `=` (round-3 audit advisory fix — the
+                // "weights-overwrite inexactness"): production's own
+                // `acc_row[di] += e * v_row[di]` ACCUMULATES a key's
+                // contribution; it never overwrites. The two forms are
+                // IDENTICAL on the correct (non-buggy) path, where no
+                // global key is ever visited twice — they diverge only
+                // under `chunk_stride_bug < 0` (the reprocess-a-key
+                // mutant), where a duplicated key's SECOND visit must ADD
+                // to its first contribution, matching what a genuine
+                // production accumulation bug would actually do, not
+                // silently discard the first visit's contribution.
+                weights[c_start + kj] += e;
                 p_sum += e;
             }
             l = l * correction + p_sum;

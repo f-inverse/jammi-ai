@@ -1247,8 +1247,16 @@ impl CustomOp3 for MemEfficientAttention {
         // rather than inheriting `cpu_fwd`'s "general path handles it"
         // shape.
         if b == 0 || s == 0 || h == 0 {
+            // `want_dtype`, NOT `qkv.dtype()` (adversarial audit round 5
+            // fix, F-1): `qkv` was shadowed by the F32-upcast binding
+            // above, so `qkv.dtype()` here would ALWAYS read `F32` even
+            // for a genuinely `bf16` caller — the exact same "gradient
+            // dtype must match its argument's own dtype" hazard the
+            // upcast fix's own final round-back exists to avoid, missed
+            // on this early-return branch specifically because it reads
+            // `qkv` (now `f32`) rather than the pre-upcast `want_dtype`.
             return Ok((
-                Some(Tensor::zeros((b, s, 3, h, d), qkv.dtype(), qkv.device())?),
+                Some(Tensor::zeros((b, s, 3, h, d), want_dtype, qkv.device())?),
                 None,
                 None,
             ));
@@ -2046,6 +2054,57 @@ mod tests {
             let out = apply_stateful3(&qkv, &rope_pack, &mask, op).unwrap();
             assert_eq!(out.dims(), &[b, s, h * d]);
         }
+    }
+
+    /// F-1 fix (adversarial audit round 5): `bwd`'s zero-extent early
+    /// return used to build its zero gradient in `qkv.dtype()` AFTER the
+    /// F32-upcast fix's own `let qkv = qkv.to_dtype(F32)?;` had SHADOWED
+    /// the original binding — a `bf16` caller got an `f32` gradient there,
+    /// a hard dtype mismatch candle's autograd `GradStore` accumulation
+    /// would hit merging it with any other `bf16` gradient for the same
+    /// `Var`. `empty_batch_seq_or_heads_is_a_no_op_not_a_panic` (above) is
+    /// `F32`-only and never calls `.backward()` at all — it would have
+    /// passed VACUOUSLY against this exact regression. This test calls
+    /// `bwd` DIRECTLY (bypassing `cpu_fwd`, which refuses `bf16` on CPU
+    /// unconditionally — module doc's "CPU: `F32` only" section — so a
+    /// real forward-then-backward chain can never reach `bwd` with a
+    /// `bf16` `qkv` on THIS device at all; `bwd` itself has no such gate,
+    /// by design, since it is ordinary `Tensor` composition shared with
+    /// the CUDA arm). `self.lse` is seeded directly (`Saved::set`,
+    /// `pub(crate)`-reachable from this nested test module) rather than
+    /// via a real `fwd` call — the empty-shape branch returns before ever
+    /// reading it, so its actual content is irrelevant, only that
+    /// `Saved::take` succeeds at all.
+    #[test]
+    fn bwd_zero_extent_returns_the_callers_own_dtype_not_a_silently_upcast_f32() {
+        use half::bf16;
+        let device = Device::Cpu;
+        let (b, h, s, d) = (0usize, 2usize, 4usize, 4usize);
+        let qkv = Tensor::zeros((b, s, 3, h, d), candle_core::DType::BF16, &device).unwrap();
+        let rope_pack =
+            Tensor::zeros((2, 1, 1, s.max(1), d), candle_core::DType::BF16, &device).unwrap();
+        let mask = Tensor::from_vec(vec![bf16::from_f32(0.0); s], (1, 1, 1, s), &device).unwrap();
+        let res = Tensor::zeros((b, s, h * d), candle_core::DType::BF16, &device).unwrap();
+        let grad_res = Tensor::zeros((b, s, h * d), candle_core::DType::BF16, &device).unwrap();
+
+        let op =
+            MemEfficientAttention::new(0.5, FullyMaskedPolicy::Propagate, false, None, MIN_CHUNK)
+                .unwrap();
+        op.lse
+            .set(Tensor::zeros((1, 1, 1), candle_core::DType::F32, &device).unwrap())
+            .unwrap();
+
+        let (dqkv, drope, dmask) = op.bwd(&qkv, &rope_pack, &mask, &res, &grad_res).unwrap();
+        let dqkv = dqkv.expect("dqkv must be Some even for an empty shape");
+        assert_eq!(
+            dqkv.dtype(),
+            candle_core::DType::BF16,
+            "an empty-shape bf16 bwd call must return a BF16 gradient, never a silently \
+             upcast F32 one (the F32-upcast fix's own dtype contract, missed on this branch)"
+        );
+        assert_eq!(dqkv.dims(), &[b, s, 3, h, d]);
+        assert!(drope.is_none());
+        assert!(dmask.is_none());
     }
 
     // ---- truth oracle: single-chunk degenerate (bit-close vs eager) ----

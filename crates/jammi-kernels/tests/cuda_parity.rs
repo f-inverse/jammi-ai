@@ -9739,16 +9739,23 @@ fn adamw_step_fma_contracted_red_control_diverges_from_eager_cuda() {
 // convention — a max bound is seed-unstable).
 // =========================================================================
 
-/// [`MemEfficientAttention::new`]'s own PRODUCTION `chunk` floor
-/// (`jammi_kernels::ops::MEM_EFFICIENT_MIN_CHUNK`, `512`) — every small-`seq`
-/// leg below uses it directly (degenerating to one mega-chunk at these toy
-/// shapes, module doc's own documented behaviour for `chunk > seq`); only
+/// [`MemEfficientAttention::new`]'s own `chunk` FLOOR — the smallest
+/// `chunk` the PRODUCTION constructor accepts at all
+/// (`jammi_kernels::ops::MEM_EFFICIENT_MIN_CHUNK`, `512`), NOT the
+/// production DEFAULT a real training forward actually uses
+/// (`jammi_encoders::modernbert::MEM_EFFICIENT_CHUNK`, `1024` — round-6
+/// audit finding F-2 corrected an earlier doc here that conflated the
+/// two). Every small-`seq` leg below uses this FLOOR directly
+/// (degenerating to one mega-chunk at these toy shapes, module doc's own
+/// documented behaviour for `chunk > seq`);
 /// [`mem_efficient_cuda_matches_cpu_band_multi_chunk_f32`] picks a `seq`
-/// large enough to see more than one. This file has no access to
-/// `MemEfficientAttention::new_test_chunk` (that bypass is `#[cfg(test)]`-
-/// private INSIDE the library crate, unreachable from this separate
-/// integration-test binary) — every leg here goes through the SAME
-/// production constructor real callers use.
+/// large enough to see more than one chunk AT the floor width;
+/// [`mem_efficient_cuda_matches_cpu_band_production_chunk_width_f32`] is
+/// the ONLY leg that actually runs at the production DEFAULT width. This
+/// file has no access to `MemEfficientAttention::new_test_chunk` (that
+/// bypass is `#[cfg(test)]`-private INSIDE the library crate, unreachable
+/// from this separate integration-test binary) — every leg here goes
+/// through the SAME production constructor real callers use.
 const MEM_EFFICIENT_MIN_CHUNK_FOR_TEST: usize = jammi_kernels::ops::MEM_EFFICIENT_MIN_CHUNK;
 
 /// 8 fixed seeds — "a single seed's draw is not a distribution", the SAME
@@ -9929,24 +9936,87 @@ fn assert_mem_efficient_fwd_parity_sweep(
     );
 }
 
-/// **F32 first-pass bound.** `cuBLAS` (CUDA `matmul`) and the CPU `gemm`
-/// crate reduce in a DIFFERENT order than each other (both correct, esc-044's
-/// own lesson) — the SAME jitter class `F32_TOL` (this file's own
-/// `Axpy`-fmad bound) already prices for a single fused op; this op chains
-/// several GEMMs (`QKᵀ`, `PV`) plus an online-softmax recurrence per
-/// chunk, so a somewhat looser floor is a reasoned STARTING point, not a
-/// calibrated one — the pod run this leg is written FOR is what calibrates
-/// it (this crate's own "K_MAX lesson": a bound gets tightened after a
-/// real measurement, never asserted as final before one exists).
+/// **F32 fwd/policy/eager-reference bound — first-pass, NOT YET
+/// recalibrated from a per-seed measurement (round-6 audit advisory,
+/// stated honestly rather than left silently uncorrected).** `cuBLAS`
+/// (CUDA `matmul`) and the CPU `gemm` crate reduce in a DIFFERENT order
+/// than each other (both correct, esc-044's own lesson) — the SAME jitter
+/// class `F32_TOL` (this file's own `Axpy`-fmad bound) already prices for
+/// a single fused op; this op chains several GEMMs (`QKᵀ`, `PV`) plus an
+/// online-softmax recurrence per chunk. `2026-08-28-m2-memeff-cuda-84e98ac-a100-sxm4.json`
+/// (this branch's own landing artifact, cited by filename — the FIRST
+/// on-device execution of this op's CUDA composition) confirms every leg
+/// this constant guards passed GREEN on both A100 and L40S, but its
+/// `observed` block records ONLY the bwd legs' per-seed numbers
+/// ([`MEM_EFFICIENT_BWD_F32_BOUND`]/[`MEM_EFFICIENT_BWD_BF16_BOUND`],
+/// below) — the fwd/policy-discriminator/eager-reference legs this
+/// constant guards have no per-seed data recorded yet to derive a tight
+/// margin FROM (this crate's own "K_MAX lesson": a bound gets tightened
+/// after a real measurement exists, never asserted as final before one
+/// does — a future artifact recording those legs' own per-seed values is
+/// what tightens this constant next, the same way the bwd artifact just
+/// tightened [`MEM_EFFICIENT_BWD_F32_BOUND`]).
 const MEM_EFFICIENT_F32_BOUND: f64 = 1e-3;
 
-/// **BF16 first-pass bound**, wider than F32 for the same reduction-depth
-/// + rounding reason `attention_block`'s own bf16 legs price explicitly
-/// (this file's "Derived bf16 bounds" section, above) — memeff's own
-/// oracle metric class is bare `relative_l1_error`, not that section's
-/// two-term ULP form, so this is a single relative fraction, not a
-/// per-element bound; also a first-pass starting point.
+/// **BF16 fwd/policy/eager-reference bound** — the SAME "GREEN but not yet
+/// per-seed-measured for THESE legs specifically" status as
+/// [`MEM_EFFICIENT_F32_BOUND`]'s own doc states, wider than F32 for the
+/// same reduction-depth + rounding reason `attention_block`'s own bf16
+/// legs price explicitly (this file's "Derived bf16 bounds" section,
+/// above) — memeff's own oracle metric class is bare `relative_l1_error`,
+/// not that section's two-term ULP form, so this is a single relative
+/// fraction, not a per-element bound.
 const MEM_EFFICIENT_BF16_BOUND: f64 = 0.06;
+
+/// **F32 bwd bound, DERIVED (round-6 audit finding F-3) from
+/// `2026-08-28-m2-memeff-cuda-84e98ac-a100-sxm4.json`'s own
+/// `bwd_f32_rope_window_dqkv_relative_l1_per_seed`** (the `f32
+/// rope+window` leg, [`assert_mem_efficient_bwd_parity`]'s own label,
+/// `half_window=Some(3)`, `rope=true`): 8-seed mean `1.4503630840829083e-05`
+/// (`≈1.45e-5`), worst single seed `1.7665936624974642e-05` (seed `207`,
+/// `≈1.77e-5` — `≈1.22`x the mean, a tight spread). The PRIOR bound here
+/// (the shared `MEM_EFFICIENT_F32_BOUND`, `1e-3`) gave `≈69`x margin over
+/// this mean — an unmeaning bound wide enough to hide a real regression,
+/// not a first-pass placeholder anymore now that a real measurement
+/// exists (the SAME class `FLASH_ORACLE_PADDED_BOUND`'s own doc argues
+/// against: a bound this loose asserts nothing). Tightened to `5e-5`,
+/// following that constant's own margin convention: `5e-5 / 1.4503630840829083e-05`
+/// `≈3.45`x margin over the measured MEAN (comparable to
+/// [`FLASH_ORACLE_K_MEAN_GRAD`]'s own `~3.1`x mean margin,
+/// `FLASH_ORACLE_PADDED_BOUND`'s own `~3.44`x) and `5e-5 /
+/// 1.7665936624974642e-05` `≈2.83`x margin over the single WORST observed
+/// seed (comparable to that same precedent's `~1.73`x — MORE generous
+/// here, since this measurement's own spread is already far tighter) —
+/// real room for seed-to-seed variance and box/driver variation (this
+/// artifact's own bitwise-identical-across-A100-and-L40S finding suggests
+/// that variation is small for this leg, but the margin is sized to
+/// absorb it regardless) — never re-fitted to exactly the measured mean
+/// or max.
+const MEM_EFFICIENT_BWD_F32_BOUND: f64 = 5e-5;
+
+/// **BF16 bwd bound, DERIVED (round-6 audit finding F-3) from the SAME
+/// artifact's `bwd_bf16_rope_window_dqkv_relative_l1_per_seed`** (same
+/// leg/fixture as the F32 bound above, `dtype=BF16`): 8-seed mean
+/// `0.005761339489004169` (`≈5.76e-3`), per-seed spread from
+/// `0.0016994689280399305` (seed `202`, `≈1.70e-3`) to
+/// `0.01623172482798447` (seed `207`, `≈1.62e-2`) — a `≈9.53`x
+/// min-to-max spread. Stated honestly, per this file's own "K_MAX lesson"
+/// caution (`assert_mem_efficient_fwd_parity_sweep`'s own doc: "mean,
+/// never per-seed max — a max bound is seed-unstable"): that spread is
+/// DIAGNOSTIC information about this leg's seed-to-seed variance, not
+/// itself an assertable quantity — only the MEAN is asserted, below,
+/// exactly as every other leg in this file already does. KEPT at `0.06`
+/// (not re-derived down to this measurement's own tighter `~3x`-mean
+/// convention): `0.06 / 0.005761339489004169` `≈10.41`x margin over the
+/// mean and `0.06 / 0.01623172482798447` `≈3.70`x margin over the single
+/// WORST observed seed — deliberately wider than the F32 bwd bound's own
+/// `~2.83`x worst-seed margin, sized to absorb `bf16`'s own larger
+/// rounding-noise class (the SAME reason [`MEM_EFFICIENT_BF16_BOUND`] is
+/// wider than [`MEM_EFFICIENT_F32_BOUND`]) on top of ordinary seed
+/// variance, given this leg's own measured spread is already `~9.5`x
+/// wider than the F32 leg's `~1.22`x — a real, not hypothetical, source
+/// of future-run variance this margin needs to absorb.
+const MEM_EFFICIENT_BWD_BF16_BOUND: f64 = 0.06;
 
 #[test]
 fn mem_efficient_cuda_matches_cpu_plain_f32() {
@@ -10036,39 +10106,140 @@ fn mem_efficient_cuda_matches_cpu_rope_bf16() {
     );
 }
 
-/// The window+multi-chunk leg: `seq=1200` at the PRODUCTION `chunk=512`
-/// default (`jammi_encoders::modernbert::MEM_EFFICIENT_CHUNK`, mirrored
-/// here as a literal since that constant lives in a downstream crate this
-/// file cannot depend on) gives THREE chunks (`[0,512), [512,1024),
-/// [1024,1200)`), genuinely exercising chunk-boundary correctness on
-/// CUDA — every OTHER leg in this file, at `MIN_CHUNK`-or-above but
-/// `seq`-below-that, degenerates to a single mega-chunk (module doc: "a
-/// caller may pass `chunk > seq`"). `half_window=64` (production
-/// `local_attention=128`'s own half-width) with `lengths=[1200, 900, 70]`
-/// — every real row length `>= half_window + 2 = 66` (the M1b
-/// window-visibility discipline this crate's own band tests already
-/// establish: a shorter real length would make the fully-masked-row
-/// PREDICATE, not the band predicate, the effective constraint, hiding
-/// what this leg means to exercise).
+/// The window+multi-chunk leg: `seq=1200` at [`MemEfficientAttention::new`]'s
+/// own `chunk` FLOOR (`MEM_EFFICIENT_MIN_CHUNK_FOR_TEST`, `512` —
+/// `jammi_kernels::ops::MEM_EFFICIENT_MIN_CHUNK`; NOT the production
+/// default — see [`mem_efficient_cuda_matches_cpu_band_production_chunk_width_f32`]
+/// below for that leg, fixed at round-6 audit finding F-2: an earlier
+/// revision of THIS doc wrongly named `512` "the PRODUCTION `chunk=512`
+/// default" — `jammi_encoders::modernbert::MEM_EFFICIENT_CHUNK` is `1024`;
+/// `512` is only ever `MIN_CHUNK`, the FLOOR that op's own constructor
+/// enforces, never a caller's chosen width) gives THREE chunks (`[0,512),
+/// [512,1024), [1024,1200)`), genuinely exercising chunk-boundary
+/// correctness on CUDA at a NON-production width — every OTHER
+/// `MIN_CHUNK`-or-above, `seq`-below-that leg in this file degenerates to
+/// a single mega-chunk (module doc: "a caller may pass `chunk > seq`").
+/// `half_window=64` (production `local_attention=128`'s own half-width)
+/// with `lengths=[1200, 900, 70]` — every real row length `>= half_window
+/// + 2 = 66` (the M1b window-visibility discipline this crate's own band
+/// tests already establish: a shorter real length would make the
+/// fully-masked-row PREDICATE, not the band predicate, the effective
+/// constraint, hiding what this leg means to exercise) — asserted
+/// in-test, not merely stated in prose (round-6 audit advisory).
 #[test]
 fn mem_efficient_cuda_matches_cpu_band_multi_chunk_f32() {
     let Some(cuda) = cuda_device() else {
         return;
     };
+    let half_window = 64usize;
     let lengths = [1200usize, 900, 70];
+    for &len in &lengths {
+        assert!(
+            len == 0 || len >= half_window + 2,
+            "window-visibility premise: every nonzero real row length must be >= \
+             half_window + 2 ({}), got {len}",
+            half_window + 2
+        );
+    }
     assert_mem_efficient_fwd_parity_sweep(
-        "band multi-chunk f32",
+        "band multi-chunk f32 (MIN_CHUNK width)",
         &cuda,
         3,
         1200,
         2,
         16,
-        Some(64),
+        Some(half_window),
         true,
         FullyMaskedPolicy::Zeros,
         DType::F32,
         Some(&lengths),
-        512,
+        MEM_EFFICIENT_MIN_CHUNK_FOR_TEST,
+        MEM_EFFICIENT_F32_BOUND,
+    );
+}
+
+/// The `BF16` twin of the leg above (round-6 audit finding F-4: no `bf16`
+/// leg anywhere in this file had window/lengths/multi-chunk coverage —
+/// every `bf16` leg before this one was mask-free and single-chunk-only,
+/// so a `bf16`-specific bug reachable ONLY through the band predicate,
+/// padding, or a chunk boundary had no on-device leg to catch it at all).
+/// Identical fixture (`seq=1200`, `half_window=64`,
+/// `lengths=[1200, 900, 70]`, `MIN_CHUNK`-width — the SAME
+/// window-visibility premise asserted in-test), `dtype=BF16`.
+#[test]
+fn mem_efficient_cuda_matches_cpu_band_multi_chunk_bf16() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let half_window = 64usize;
+    let lengths = [1200usize, 900, 70];
+    for &len in &lengths {
+        assert!(
+            len == 0 || len >= half_window + 2,
+            "window-visibility premise: every nonzero real row length must be >= \
+             half_window + 2 ({}), got {len}",
+            half_window + 2
+        );
+    }
+    assert_mem_efficient_fwd_parity_sweep(
+        "band multi-chunk bf16 (MIN_CHUNK width)",
+        &cuda,
+        3,
+        1200,
+        2,
+        16,
+        Some(half_window),
+        true,
+        FullyMaskedPolicy::Zeros,
+        DType::BF16,
+        Some(&lengths),
+        MEM_EFFICIENT_MIN_CHUNK_FOR_TEST,
+        MEM_EFFICIENT_BF16_BOUND,
+    );
+}
+
+/// The PRODUCTION-width leg (round-6 audit finding F-2: no leg exercised
+/// `jammi_encoders::modernbert::MEM_EFFICIENT_CHUNK` itself — every other
+/// leg in this file runs at `MEM_EFFICIENT_MIN_CHUNK_FOR_TEST`, `512`, the
+/// FLOOR, never the `1024` a real training forward actually uses).
+/// `chunk=1024` (mirrored here as a literal — that constant lives in
+/// `jammi-encoders`, a downstream crate this file cannot depend on) at
+/// `seq=1500` gives exactly TWO, deliberately LOPSIDED chunks (`[0,1024),
+/// [1024,1500)` — a full-width chunk followed by a short 476-element
+/// tail), the shape a real long-sequence forward reaches (a
+/// `seq`-not-a-multiple-of-`chunk` tail chunk) rather than the
+/// evenly-divided 3-chunk shape the `MIN_CHUNK`-width leg above happens
+/// to produce. Same `half_window=64` window-visibility discipline,
+/// asserted in-test.
+#[test]
+fn mem_efficient_cuda_matches_cpu_band_production_chunk_width_f32() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    const PRODUCTION_CHUNK: usize = 1024;
+    let half_window = 64usize;
+    let lengths = [1500usize, 1100, 70];
+    for &len in &lengths {
+        assert!(
+            len == 0 || len >= half_window + 2,
+            "window-visibility premise: every nonzero real row length must be >= \
+             half_window + 2 ({}), got {len}",
+            half_window + 2
+        );
+    }
+    assert_mem_efficient_fwd_parity_sweep(
+        "band production-width (chunk=1024) f32",
+        &cuda,
+        3,
+        1500,
+        2,
+        16,
+        Some(half_window),
+        true,
+        FullyMaskedPolicy::Zeros,
+        DType::F32,
+        Some(&lengths),
+        PRODUCTION_CHUNK,
         MEM_EFFICIENT_F32_BOUND,
     );
 }
@@ -10093,14 +10264,31 @@ fn mem_efficient_cuda_fully_masked_zeros_vs_propagate_diverge_observably() {
     let Some(cuda) = cuda_device() else {
         return;
     };
+    assert_mem_efficient_fully_masked_policy_split(&cuda, DType::F32, MEM_EFFICIENT_F32_BOUND);
+}
+
+/// The `BF16` twin (round-6 audit finding F-4: no `bf16` leg had
+/// fully-masked-row coverage at all — the discriminator above was
+/// `F32`-only). Same fixture, `dtype=BF16`.
+#[test]
+fn mem_efficient_cuda_fully_masked_zeros_vs_propagate_diverge_observably_bf16() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    assert_mem_efficient_fully_masked_policy_split(&cuda, DType::BF16, MEM_EFFICIENT_BF16_BOUND);
+}
+
+/// Body shared by the `F32`/`BF16` fully-masked-policy-split legs above
+/// (round-6 audit finding F-4 refactor: extracted so the `bf16` twin is a
+/// real parameterization, not a hand-copied duplicate that could drift).
+fn assert_mem_efficient_fully_masked_policy_split(cuda: &Device, dtype: DType, bound: f64) {
     let (batch, seq, heads, head_dim) = (2usize, 6usize, 1usize, 16usize);
     let lengths = [6usize, 0]; // batch row 1 is ENTIRELY padding.
     let chunk = MEM_EFFICIENT_MIN_CHUNK_FOR_TEST;
     let rope = false;
-    let dtype = DType::F32;
 
     let (cpu_zeros, gpu_zeros) = mem_efficient_fwd_cpu_vs_cuda(
-        &cuda,
+        cuda,
         batch,
         seq,
         heads,
@@ -10114,7 +10302,7 @@ fn mem_efficient_cuda_fully_masked_zeros_vs_propagate_diverge_observably() {
         11.0,
     );
     let (cpu_prop, gpu_prop) = mem_efficient_fwd_cpu_vs_cuda(
-        &cuda,
+        cuda,
         batch,
         seq,
         heads,
@@ -10135,16 +10323,16 @@ fn mem_efficient_cuda_fully_masked_zeros_vs_propagate_diverge_observably() {
     let err_zeros = mem_efficient_relative_l1_error(&gpu_zeros, &cpu_zeros);
     let err_prop = mem_efficient_relative_l1_error(&gpu_prop, &cpu_prop);
     eprintln!(
-        "mem_efficient fully-masked policy split: Zeros relative_l1_error={err_zeros:e}, \
-         Propagate relative_l1_error={err_prop:e}"
+        "mem_efficient fully-masked policy split ({dtype:?}): Zeros relative_l1_error=\
+         {err_zeros:e}, Propagate relative_l1_error={err_prop:e}"
     );
     assert!(
-        err_zeros <= MEM_EFFICIENT_F32_BOUND,
-        "Zeros policy vs its own cpu_fwd reference: {err_zeros:e} > {MEM_EFFICIENT_F32_BOUND:e}"
+        err_zeros <= bound,
+        "Zeros policy vs its own cpu_fwd reference: {err_zeros:e} > {bound:e}"
     );
     assert!(
-        err_prop <= MEM_EFFICIENT_F32_BOUND,
-        "Propagate policy vs its own cpu_fwd reference: {err_prop:e} > {MEM_EFFICIENT_F32_BOUND:e}"
+        err_prop <= bound,
+        "Propagate policy vs its own cpu_fwd reference: {err_prop:e} > {bound:e}"
     );
 
     // The masked batch row (index 1) itself: Zeros must be EXACT zero;
@@ -10440,7 +10628,7 @@ fn mem_efficient_bwd_cuda_matches_cpu_f32() {
         true,
         DType::F32,
         MEM_EFFICIENT_MIN_CHUNK_FOR_TEST,
-        MEM_EFFICIENT_F32_BOUND,
+        MEM_EFFICIENT_BWD_F32_BOUND,
     );
 }
 
@@ -10460,6 +10648,6 @@ fn mem_efficient_bwd_cuda_matches_cpu_bf16() {
         true,
         DType::BF16,
         MEM_EFFICIENT_MIN_CHUNK_FOR_TEST,
-        MEM_EFFICIENT_BF16_BOUND,
+        MEM_EFFICIENT_BWD_BF16_BOUND,
     );
 }

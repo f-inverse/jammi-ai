@@ -22,19 +22,25 @@
 #[allow(dead_code)]
 mod build_script;
 
-use build_script::{check_toolkit_floor, gencode_sm, parse_max_rss_kb, parse_nvcc_release};
+use build_script::{
+    check_toolkit_floor, gencode_sm, parse_max_rss_kb, parse_nvcc_release, GENCODE_ARCHES,
+};
 
-/// Pins the CURRENT `GENCODE_ARCHES` literal's four entries exactly — a
-/// change to any one of them without updating this test is exactly the
-/// drift `gencode_sm` exists to prevent silently (the same anti-drift
-/// precedent `flash/mod.rs`'s `gencode_sms_parses_the_pinned_build_value`
-/// pins on the Rust-crate side of the same env var).
+/// Pins the REAL `build.rs::GENCODE_ARCHES` constant's four entries
+/// exactly — round-2 audit finding F1's fix: an EARLIER revision of this
+/// test passed hand-typed literal strings (`"arch=compute_80,code=sm_80"`,
+/// ...) to `gencode_sm` instead of reading `GENCODE_ARCHES` itself, which
+/// meant a mutation to that array (the audit's own mutant: rewritten to a
+/// pre-Ampere-inclusive, 89/90-dropping `sm_70/sm_80/sm_86` set) went
+/// completely undetected here — this test would have stayed green against
+/// its own stale literal copies regardless of what the real array said.
+/// Reading `GENCODE_ARCHES` directly through the `#[path]` seam closes
+/// that gap structurally: there is no longer a hand-typed copy for the
+/// real array to drift away from.
 #[test]
 fn gencode_sm_parses_every_pinned_gencode_entry() {
-    assert_eq!(gencode_sm("arch=compute_80,code=sm_80"), "80");
-    assert_eq!(gencode_sm("arch=compute_86,code=sm_86"), "86");
-    assert_eq!(gencode_sm("arch=compute_89,code=sm_89"), "89");
-    assert_eq!(gencode_sm("arch=compute_90,code=sm_90"), "90");
+    let smss: Vec<&str> = GENCODE_ARCHES.iter().map(|g| gencode_sm(g)).collect();
+    assert_eq!(smss, vec!["80", "86", "89", "90"]);
 }
 
 #[test]
@@ -67,6 +73,32 @@ fn parse_nvcc_release_returns_none_on_unrecognised_output() {
     assert_eq!(parse_nvcc_release(""), None);
     assert_eq!(parse_nvcc_release("nvcc: command not found"), None);
     assert_eq!(parse_nvcc_release("release not-a-version"), None);
+}
+
+/// Negative control (audit advisory): `"prerelease"` contains `"release"`
+/// as a literal SUBSTRING (`p-r-e-r-e-l-e-a-s-e`, positions 3..10 spell
+/// `release`), so an unanchored `.split("release ")`-style match would
+/// wrongly fire on a `"...prerelease 12.0..."` token shape and report a
+/// version that was never actually labelled `release`. `parse_nvcc_release`
+/// matches the whole `"release"` TOKEN (bounded by whitespace/commas), not
+/// a bare substring, specifically to make this collision impossible —
+/// this test proves the token-boundary anchor actually holds, not just
+/// that some other, unrelated input returns `None`.
+#[test]
+fn parse_nvcc_release_does_not_collide_with_the_prerelease_substring() {
+    assert_eq!(
+        parse_nvcc_release("Cuda compilation tools, prerelease 12.0, V12.0.1"),
+        None,
+        "\"prerelease\" is a DIFFERENT token than \"release\" and must never match"
+    );
+    // A genuine "release" token elsewhere in the SAME string still parses
+    // correctly even with a "prerelease" token present earlier — proves
+    // the anchor selects the right token, not merely "avoids the wrong
+    // one" by refusing everything.
+    assert_eq!(
+        parse_nvcc_release("prerelease build, Cuda compilation tools, release 11.8, V11.8.89"),
+        Some((11, 8))
+    );
 }
 
 #[test]

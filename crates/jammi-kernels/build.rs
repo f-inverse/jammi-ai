@@ -28,10 +28,26 @@ use std::path::{Path, PathBuf};
 /// `JAMMI_FLASH_GENCODE_SMS` from this UNCONDITIONALLY, in every feature
 /// configuration (see `main`'s own comment for why), and this same literal
 /// also feeds `build_flash_attn`'s real `-gencode` flags — one array, two
-/// readers, so they can never drift apart. Also reachable from the
-/// `#[path = "../build.rs"]` unit-test seam (`tests/build_rs_unit.rs`)
-/// without that suite needing the `flash-attn` feature turned on.
-const GENCODE_ARCHES: &[&str] = &[
+/// readers, so they can never drift apart.
+///
+/// `pub(crate)` (round-2 audit finding F1): `tests/build_rs_unit.rs`'s
+/// `#[path]` seam reads this constant DIRECTLY (`use build_script::
+/// GENCODE_ARCHES`), not hand-typed literal copies of its entries — an
+/// earlier revision left this private and had that suite pass
+/// hand-typed `"arch=compute_80,code=sm_80"`-shaped strings to
+/// `gencode_sm` instead, which meant a mutation to THIS array (the actual
+/// build-time source of truth) went completely undetected by that suite:
+/// the audit's own mutant (rewriting this to a pre-Ampere-inclusive,
+/// `sm_89`/`sm_90`-dropping `sm_70/sm_80/sm_86` set) stayed green against
+/// every test that only ever saw literal strings. The test that DOES
+/// catch that mutant, hermetically, in the default feature lane, is
+/// `admission.rs`'s `gencode_smss_env_var_matches_the_pinned_build_rs_set`
+/// (reads `env!("JAMMI_FLASH_GENCODE_SMS")`, the value THIS array produces
+/// via `main`'s unconditional emission — see that test's own doc); the
+/// `build_rs_unit.rs` tests below are now a SIBLING pin at the `build.rs`
+/// layer itself (this array -> `gencode_sm` -> the joined string), not the
+/// only line of defense.
+pub(crate) const GENCODE_ARCHES: &[&str] = &[
     "arch=compute_80,code=sm_80",
     "arch=compute_86,code=sm_86",
     "arch=compute_89,code=sm_89",
@@ -81,9 +97,21 @@ pub(crate) fn gencode_sm(entry: &str) -> &str {
 /// an intentional cross-cfg surface, not dead code left behind.
 #[allow(dead_code)]
 pub(crate) fn parse_nvcc_release(version_stdout: &str) -> Option<(u32, u32)> {
-    let after = version_stdout.split("release ").nth(1)?;
-    let token = after.split([',', ' ', '\n', '\r']).next()?;
-    let mut parts = token.split('.');
+    // Tokenized on whitespace/commas and matched against the WHOLE token
+    // `"release"` (round-2 audit advisory), never a bare substring search
+    // (`.split("release ")` would ALSO fire on `"prerelease "` — "release"
+    // is a genuine substring of "prerelease", starting at its 4th byte —
+    // silently reporting a version nvcc never actually labelled `release`
+    // at all). `tests/build_rs_unit.rs`'s
+    // `parse_nvcc_release_does_not_collide_with_the_prerelease_substring`
+    // is the negative-control cell proving this.
+    let tokens: Vec<&str> = version_stdout
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|s| !s.is_empty())
+        .collect();
+    let idx = tokens.iter().position(|&t| t == "release")?;
+    let version = tokens.get(idx + 1)?;
+    let mut parts = version.split('.');
     let major: u32 = parts.next()?.parse().ok()?;
     let minor: u32 = parts.next()?.parse().ok()?;
     Some((major, minor))
@@ -536,6 +564,25 @@ fn build_flash_attn() {
                 nvcc.display()
             )
         });
+    // Audit advisory: `find_nvcc()` already probed THIS exact binary
+    // successfully (its own `--version` check, above), but checking the
+    // status here too — rather than only the SPAWN result (`unwrap_or_else`
+    // above) — closes the narrow window where a toolkit answers `--version`
+    // nondeterministically (flaky between two invocations) or where stdout
+    // happens to be empty/garbled on a nonzero exit; without this, that
+    // shape would silently fall through to the generic "could not find a
+    // release token" panic below, hiding the real cause (a failing process,
+    // not merely unparseable text).
+    if !version_output.status.success() {
+        panic!(
+            "jammi-kernels `flash-attn`: `{} --version` exited with {} (stderr: {}) -- \
+             find_nvcc() already confirmed this exact binary answers --version successfully; \
+             a toolkit that fails nondeterministically is not safe to build against",
+            nvcc.display(),
+            version_output.status,
+            String::from_utf8_lossy(&version_output.stderr)
+        );
+    }
     let version_stdout = String::from_utf8_lossy(&version_output.stdout).into_owned();
     match parse_nvcc_release(&version_stdout) {
         Some(detected) => {
@@ -634,18 +681,35 @@ fn build_flash_attn() {
     // run records it, per the M3 plan's D1 cost note).
     //
     // Peak-RSS instrumentation (M3 plan v2 delta 5) is OPT-IN via
-    // `JAMMI_FLASH_MEASURE_RSS=1`, NOT autodetected from `/usr/bin/time`'s
-    // mere presence: unconditionally wrapping every nvcc invocation with
-    // `time -v` would change how this feature compiles on any machine that
-    // happens to HAVE a `/usr/bin/time` binary without GNU's `-v` support
-    // (BSD/macOS `time` has no `-v` and exits before ever running the
-    // wrapped command — this build has no cheap way to probe that ahead of
-    // spawning it) — that would turn a build that is hermetic-elsewhere
-    // into one that can newly fail on an unrelated machine shape. This PR
-    // does not flip the env var on in `ci.yml`; a maintainer confirms the
-    // CI flash-attn-compile lane's `time -v` behaviour first (see the
-    // hand-off report).
-    let measure_rss = env::var_os("JAMMI_FLASH_MEASURE_RSS").is_some();
+    // `JAMMI_FLASH_MEASURE_RSS=1` -- SET on the CI flash-attn-compile lane
+    // (`.github/workflows/ci.yml`'s `flash-attn-compile` job, the container
+    // where the ~4x device-code-section memory cost the M3 gencode
+    // widening adds is the one place with genuinely tight RAM, unlike the
+    // pod) -- AND gated a SECOND way, on `/usr/bin/time` actually existing
+    // as a file: the opt-in env var alone is not enough to make wrapping
+    // safe, because unconditionally spawning a binary that might not exist
+    // (e.g. a base-image swap that drops the `time` package, or a
+    // still-macOS/BSD dev machine that sets the var by copy-pasting CI's
+    // env) would turn a missing-binary Cargo `spawn` failure into a hard
+    // build panic. The second, existence-based gate makes the env var a
+    // pure "try to measure if you can" request: if `/usr/bin/time` is
+    // absent, this silently falls back to the unwrapped `nvcc` invocation
+    // (no RSS captured, `parse_max_rss_kb` never even called) rather than
+    // failing the build either way. This crate's own CI image
+    // (`ghcr.io/f-inverse/jammi-ai-ci-cuda`) is the one machine shape this
+    // gate is actually enabled on today (see `ci.yml`'s own comment at that
+    // step) and is expected to ship GNU coreutils/`time`; if some OTHER
+    // `/usr/bin/time` (a non-GNU variant without real `-v` support) is ever
+    // present where this env var is set, its exact spawn/argv-parsing
+    // behavior for an unrecognised `-v` flag is NOT something this build
+    // verifies — the worst case this code path is DESIGNED to tolerate is
+    // "spawns fine, `-v`'s report line is simply absent from stderr", which
+    // `parse_max_rss_kb` already degrades to `None` for (its own
+    // documented best-effort contract); a variant that instead REFUSES to
+    // spawn at all is exactly the failure mode the existence check above
+    // does not protect against and this env var should stay off for.
+    let measure_rss =
+        env::var_os("JAMMI_FLASH_MEASURE_RSS").is_some() && Path::new("/usr/bin/time").is_file();
     let started = Instant::now();
     let handles: Vec<_> = tus
         .iter()

@@ -225,19 +225,23 @@ never `>=`, never major-compat (M3 plan D2).
 **CORRECTED MECHANISM** (an earlier revision of this section claimed a
 device above sm80 "simply cannot load this module at all" — wrong for
 8.6/8.9, right for 9.0): SASS is minor-version FORWARD-COMPATIBLE within a
-major compute-capability generation (CUDA C++ Programming Guide,
-"Application Compatibility"; NVIDIA's CUDA Compatibility guide states the
-same for the driver/runtime pairing) — a device with compute capability
-`(8, 6)` or `(8, 9)` CAN load and run `sm_80` SASS; only a genuinely newer
-MAJOR (`(9, 0)` on an `sm_80`-only build, or vice versa) truly cannot load
-the module. Upstream's own current default build
-(`Dao-AILab/flash-attention`'s `setup.py`, `FORCE_CU_ARCHS`/
-`SUPPORTED_ARCHS`) targets `sm_80;sm_90;sm_100;sm_120` — **NOT** "sm80 +
-sm90 only" as an earlier draft of this section guessed, and notably NOT
-native `sm_86`/`sm_89` entries either: upstream relies on exactly the
-SASS forward-compat path above to serve RTX 30-series (8.6) and RTX
-40-series (8.9) consumer GPUs `sm_80` bytes rather than compiling for
-them natively.
+major compute-capability generation — this is the CUDA C++ Programming
+Guide's "Binary Compatibility" section (SASS/cubin forward-compat within a
+major, the actual mechanism at work here), a DIFFERENT guarantee from the
+separate CUDA Compatibility Guide's driver/runtime-version pairing (which
+governs whether an OLDER driver can run a binary built against a NEWER
+toolkit — not relevant to this crate's own per-arch cubin question, and an
+earlier revision of this section wrongly conflated the two). A device with
+compute capability `(8, 6)` or `(8, 9)` CAN load and run `sm_80` SASS under
+the Binary Compatibility guarantee; only a genuinely newer MAJOR (`(9, 0)`
+on an `sm_80`-only build, or vice versa) truly cannot load the module.
+Upstream's own current default build (`Dao-AILab/flash-attention`'s
+`setup.py`, its `FLASH_ATTN_CUDA_ARCHS` env var / `cuda_archs()` helper)
+targets `sm_80;sm_90;sm_100;sm_120` — **NOT** "sm80 + sm90 only" as an
+earlier draft of this section guessed, and notably NOT native `sm_86`/
+`sm_89` entries either: upstream relies on exactly the SASS forward-compat
+path above to serve RTX 30-series (8.6) and RTX 40-series (8.9) consumer
+GPUs `sm_80` bytes rather than compiling for them natively.
 
 jammi does **not** rely on that forward-compat path, deliberately (M3 plan
 D1): every arch in the compiled set gets its OWN native `-gencode` entry
@@ -274,7 +278,7 @@ as opposed to merely compiled):
 
 | arch | compute cap | bwd tile path (F1) | pod parity leg | status |
 |---|---|---|---|---|
-| sm80 (A100) | `(8, 0)` | 128×128 | `tests/flash_smoke.rs` + `flash_op_oracles.rs`, A100-SXM4-80GB | VALIDATED (pre-M3 landing proof) |
+| sm80 (A100) | `(8, 0)` | 128×128 | `tests/flash_smoke.rs` + `flash_op_oracles.rs`, A100-SXM4-80GB | PENDING revalidation — the landing proof this cites PREDATES the M3 4-gencode build shape (it ran against the single-`-gencode` build; `--threads`, `-Xptxas -v`, and three sibling device-code sections are all NEW to the object nvcc now emits for this same TU). Per M3 plan step 9(1), the FIRST pod leg after this PR rebuilds with all four gencodes and re-runs this exact suite on A100 before this cell reads VALIDATED again — the sm80 SASS bytes are expected to be unchanged, but that is an expectation to re-prove, not to assume |
 | sm86 (A40) | `(8, 6)` | 64×128 | A40 leg (`runpod_lib.sh`'s `rp_deploy_arch`, cheapest SKU) | PENDING — this agent's own pass is hermetic-only (no pod access); fallback per M3 plan D4/v2-delta-1 if A40 capacity blocks: drop `sm_86` from `GENCODE_ARCHES` (typed refusal) rather than ship an unvalidated cubin |
 | sm89 (L40S) | `(8, 9)` | 64×128 | L40S leg | PENDING — same hand-off note |
 | sm90 (H100) | `(9, 0)` | 128×128 | H100 leg | PENDING — same hand-off note; also proves the `sm_90` gencode loads at all (a genuinely different major, not merely a forward-compat question) |
@@ -322,8 +326,12 @@ pod, CUDA 12.6 (`V12.6.85`), g++ 13.3.1, 128 vCPU shared with a concurrent
 | the three, concurrent (what `build.rs` does) | 76.7 s |
 | `cargo build -p jammi-kernels --features flash-attn` from a cold target dir (candle + cudarc + this) | 121 s |
 
-`libjammi_flash.a` = 1,325,232 bytes (sm_80 cubin + compute_80 PTX for both
-kernels' instantiation trees). `nvcc` emitted 0 warnings.
+`libjammi_flash.a` = 1,325,232 bytes (sm_80 cubin for both kernels'
+instantiation trees; NO embedded PTX — the single `-gencode
+arch=compute_80,code=sm_80` pair this baseline built with never passed a
+bare `code=compute_80` entry, consistent with this crate's no-PTX rule
+throughout — an earlier revision of this line wrongly said "+ compute_80
+PTX", contradicting that rule). `nvcc` emitted 0 warnings.
 
 The build spike (same flags, single-threaded, otherwise idle pod) measured
 fwd TU 44 s / 2.9 GB RSS, bwd TU 70 s, 0 warnings, 0 ptxas spills.

@@ -1209,19 +1209,26 @@ mod tests {
         assert!(!ComputeCapability::new(0, 0).meets_minimum());
     }
 
-    /// [`flash_built_arches`] pins the CURRENT `build.rs::GENCODE_ARCHES`
-    /// set exactly when `FLASH_COMPILED` (this crate's own default test
-    /// build never sets the `flash-attn` feature, so this branch is the
-    /// one every hermetic CI/laptop run actually exercises), and — under
-    /// EITHER branch — every member that IS present satisfies
-    /// [`MIN_CUDA_COMPUTE_CAP`], with `(8, 0)` as the floor: "sm80 is the
-    /// true floor" is an assertion here, not merely a comment, so a future
-    /// edit that adds a pre-Ampere arch to `GENCODE_ARCHES` (which would
-    /// be a genuine regression — bf16 tensor cores need Ampere or newer)
-    /// fails this test rather than silently widening admission below the
-    /// floor `MIN_CUDA_COMPUTE_CAP` states everywhere else.
+    /// The `flash_built_arches()` ACCESSOR's own behavior under this crate's
+    /// default (no `flash-attn`) test build: `arches.is_empty()` here proves
+    /// only that the `FLASH_COMPILED` gate degrades correctly (M3 plan v2
+    /// delta 3) — it does NOT, by itself, prove `GENCODE_ARCHES` still pins
+    /// the intended sm80/86/89/90 set, because the early `return` below
+    /// skips the pinned-set assertion entirely whenever this crate's own
+    /// `flash-attn` feature is off (every hermetic default-feature lane,
+    /// which is every lane this agent's own local run and most of CI take).
+    /// A round-2 audit (mutant: `GENCODE_ARCHES` rewritten to
+    /// `sm_70/sm_80/sm_86` — a REGRESSION, dropping a pre-Ampere floor
+    /// violation in AND dropping 89/90) proved this test alone stayed GREEN
+    /// against that mutant in the hermetic lane: an earlier revision of
+    /// this doc comment claimed this test was what pins the set "in every
+    /// hermetic CI/laptop run" — that claim was WRONG. The actual hermetic
+    /// pin, which DOES run (and DOES go red on that exact mutant) in every
+    /// feature configuration including this crate's default build, is
+    /// [`gencode_smss_env_var_matches_the_pinned_build_rs_set`] below — see
+    /// that test's own doc for why `env!()` makes it possible.
     #[test]
-    fn flash_built_arches_matches_the_pinned_gencode_set_and_meets_the_floor() {
+    fn flash_built_arches_degrades_to_empty_without_flash_compiled() {
         let arches = flash_built_arches();
         if !FLASH_COMPILED {
             assert!(
@@ -1245,6 +1252,47 @@ mod tests {
         }
         assert_eq!(
             arches.iter().min().copied(),
+            Some(ComputeCapability::new(8, 0)),
+            "sm80 is the true floor of the compiled set"
+        );
+    }
+
+    /// THE hermetic pin on `build.rs::GENCODE_ARCHES` — round-2 audit
+    /// finding F1's fix. `env!("JAMMI_FLASH_GENCODE_SMS")` reads the REAL
+    /// value `build.rs`'s `main()` emitted for THIS crate's OWN
+    /// compilation, and `main()` emits it UNCONDITIONALLY (every feature
+    /// configuration, not only under `flash-attn` — see that emission's
+    /// own doc comment in `build.rs`) — so this assertion is meaningful,
+    /// and actually RUNS, in the default hermetic lane, unlike
+    /// [`flash_built_arches_degrades_to_empty_without_flash_compiled`]'s
+    /// early-return above (which the `flash_built_arches()` ACCESSOR's own
+    /// `FLASH_COMPILED` gate short-circuits before ever comparing against
+    /// `want` in that same lane). Verified against the audit's own mutant
+    /// (`GENCODE_ARCHES` rewritten to a pre-Ampere-inclusive,
+    /// 89/90-dropping `sm_70/sm_80/sm_86` set): this test goes RED against
+    /// that mutant in a scratch copy — the ONLY one of the three sites the
+    /// audit named (this test, `build_rs_unit.rs`'s parse tests,
+    /// `flash/mod.rs`'s pin) that actually catches it in a lane this repo's
+    /// hermetic gate runs.
+    #[test]
+    fn gencode_smss_env_var_matches_the_pinned_build_rs_set() {
+        assert_eq!(env!("JAMMI_FLASH_GENCODE_SMS"), "80,86,89,90");
+        let want = vec![
+            ComputeCapability::new(8, 0),
+            ComputeCapability::new(8, 6),
+            ComputeCapability::new(8, 9),
+            ComputeCapability::new(9, 0),
+        ];
+        let got = parse_gencode_sms(env!("JAMMI_FLASH_GENCODE_SMS"));
+        assert_eq!(got, want);
+        for arch in &got {
+            assert!(
+                arch.meets_minimum(),
+                "{arch:?} must meet MIN_CUDA_COMPUTE_CAP -- every compiled arch is Ampere-or-newer"
+            );
+        }
+        assert_eq!(
+            got.iter().min().copied(),
             Some(ComputeCapability::new(8, 0)),
             "sm80 is the true floor of the compiled set"
         );

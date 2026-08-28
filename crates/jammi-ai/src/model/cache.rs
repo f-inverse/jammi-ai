@@ -1262,7 +1262,20 @@ mod r5_f1_tokenizer_tests {
             .model
             .forward(&text_content, ModelTask::TextEmbedding)
         {
-            Err(_) => {}
+            Err(e) => {
+                // Advisory (audit round 62, adversarial round 10 fold): pin
+                // the refusal to the SPECIFIC typed message
+                // (`CandleModel::forward_embedding`'s tokenizer guard), not
+                // merely "any Err" — proves this refuses for the reason this
+                // test names ("no tokenizer loaded"), not some incidental
+                // unrelated failure that would make the assertion vacuous.
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("No tokenizer loaded"),
+                    "expected the typed 'No tokenizer loaded' refusal for a \
+                     tokenizer-less warm entry's embedding call, got: {msg}"
+                );
+            }
             Ok(_) => panic!(
                 "a tokenizer-less warm entry must refuse an embedding call, not silently serve"
             ),

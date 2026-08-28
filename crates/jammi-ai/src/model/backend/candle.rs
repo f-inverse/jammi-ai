@@ -879,76 +879,102 @@ fn sha256_and_len(path: &std::path::Path) -> Result<(String, u64)> {
 /// model directory to hash at all — a categorically different case from "the
 /// loader tried to hash local files and failed."
 fn content_digest_entries(resolved: &ResolvedModel) -> Result<Vec<(String, std::path::PathBuf)>> {
-    Ok(all_candidate_paths(resolved)?
+    let mut gated: Vec<(String, std::path::PathBuf)> = all_candidate_paths(resolved)?
         .into_iter()
-        .filter(|c| c.gated)
-        .map(|c| (c.rel, c.path))
-        .collect())
+        .flat_map(|slot| slot.arms.into_iter())
+        .filter(|arm| arm.gated)
+        .map(|arm| (arm.rel, arm.path))
+        .collect();
+    gated.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(gated)
 }
 
-/// One entry `all_candidate_paths` walks: a path anchored under `anchor`
-/// (the directory its relative name is computed against), whether the
-/// resolver's own presence check says this candidate is currently
-/// output-affecting for `resolved` (`gated`) — the filter
-/// [`content_digest_entries`] applies to turn the full candidate set into
-/// the digest's present-only input set — and whether this candidate SLOT is
-/// inherently optional (audit round 62, F-4': `optional`, orthogonal to
-/// `gated`). `optional` is a property of the candidate's TYPE, fixed at
-/// construction below — but NOT a property of the SLOT alone (audit round
-/// 62, F-B): whether a given slot is optional can depend on the resolved
-/// model's CLASS. `1_Pooling/config.json` is unconditionally optional —
-/// every text-embedding wrapper falls back to mean pooling on its absence.
-/// `preprocessor_config.json` is optional ONLY for a model whose loader path
-/// does not require it (every non-CLAP-audio class: BERT-family text
-/// towers, OpenCLIP, classification/NER heads); for an HF-CLAP audio model
-/// (`is_hf_clap_config`, the SAME structural signal
-/// [`CandleBackend::load`]'s own `is_clap`/`audio.is_some()` branch uses to
-/// choose the audio path) it is REQUIRED — that loader path has no
-/// fallback and hard-refuses outright when the file is missing (see
-/// `audio_frontend`'s construction in `CandleBackend::load`). The tokenizer
-/// is ALSO unconditionally optional (audit round 62, adversarial round 6,
-/// R5-F1) — every resolver path (`discover_local_tokenizer` locally, the HF
-/// Hub path's `tokenizer.json`/`bpe_simple_vocab_16e6.txt.gz` fallback chain
-/// remotely) already re-derives `tokenizer: None` when absent instead of
-/// erroring, and [`CandleBackend::load`]'s `.transpose()?` over that
-/// `Option` accepts `None` outright: the reload SUCCEEDS with
-/// `self.tokenizer == None`, exactly mirroring what a cold process loading
-/// the same (tokenizer-less) directory would produce. Only
-/// `config.json`, every weights path, and the adapter pair (once
-/// `adapter_path` is `Some`) are unconditionally required because the
-/// loader has no fallback for any of THOSE — their absence makes any reload
-/// fail identically regardless of model class. See
-/// [`preprocessor_config_is_required`] for the per-class predicate and
-/// [`ModelFingerprint::probe`] for the arm this field selects.
-struct DigestCandidate {
+/// One arm within a [`DigestSlot`] — a single candidate filename the
+/// resolver's own preference chain considers for that slot, anchored the
+/// same way every other candidate is (see [`all_candidate_paths`]'s
+/// rel/anchor machinery). `gated` mirrors the pre-reshape `DigestCandidate`'s
+/// per-file flag: whether the resolver actually SELECTED this specific arm
+/// for the CURRENT load — i.e. whether [`content_digest_entries`] hashes it.
+/// At most one arm is gated for the config/tokenizer slots (the resolver's
+/// chain picks exactly one filename); the weights slot MAY gate more than
+/// one arm at once for a sharded HF download (every shard is its own gated
+/// arm, none of them one of the three well-known single-file names).
+struct SlotArm {
     rel: String,
     path: std::path::PathBuf,
     gated: bool,
-    optional: bool,
 }
 
-/// Enumerate the FULL candidate set both [`content_digest_entries`] (hashes
-/// the bytes — filtered to `gated` only) and [`compute_model_fingerprint`]
-/// (esc-058 F-4b, `stat`s every candidate including absent ones so a later
-/// APPEARANCE is detectable) walk — the SAME set, computed by this ONE
-/// function, so the two can never drift from each other. `1_Pooling/config.json`,
-/// `preprocessor_config.json`, and BOTH tokenizer filenames
-/// (`tokenizer.json`, `bpe_simple_vocab_16e6.txt.gz` — audit round 62,
-/// adversarial round 8, R7-F1) are always CANDIDATES (regardless of
-/// whether the resolver actually read one for THIS load) precisely so a
-/// file that did not exist at load time but appears later is still tracked;
-/// `gated` — not omission from this list — is what decides whether
-/// [`content_digest_entries`] hashes it right now, and `optional` (F-4')
-/// decides how [`ModelFingerprint::probe`] treats a present-at-load,
-/// NotFound-now candidate of this slot. See [`compute_model_content_digest`]
+/// A resolver preference-chain SLOT (audit round 62, adversarial round 10 —
+/// "the terminal class closure", exhaustively enumerated over
+/// `all_candidate_paths` and all four resolver paths): every arm the
+/// resolver's OWN chain considers for one logical file, grouped together —
+/// replacing the earlier flat `DigestCandidate` list, whose per-file
+/// `optional: bool` could only describe ONE file in isolation. Two blind
+/// spots this closes, both real for the config slot (`config.json` /
+/// `open_clip_config.json`) and the weights slot (`model.safetensors` /
+/// `open_clip_model.safetensors` / `model.onnx`):
+///
+/// 1. **An unselected arm's appearance was untracked.** The pre-reshape flat
+///    list fingerprinted only the ONE arm the resolver actually selected for
+///    THIS load — so a NEW file appearing in a currently-unselected arm
+///    (`open_clip_config.json` appearing next to an existing `config.json`;
+///    `model.onnx` appearing next to `model.safetensors`, which ALSO flips
+///    the backend a COLD resolve would pick — `resolve_local` prefers ORT
+///    the instant `model.onnx` exists) never touched any tracked
+///    `(len, mtime)`, and `probe` reported fresh forever even though a cold
+///    reload might now pick a different arm, or a different backend
+///    entirely. (The tokenizer slot already closed its own version of this
+///    hole in round 8, via ad-hoc dual candidates — folded into this same
+///    slot shape here for uniformity, see [`all_candidate_paths`].)
+/// 2. **A flat `optional: bool` cannot express "required unless an
+///    alternate exists".** The selected arm's OWN deletion, with an
+///    alternate arm already present on disk, is not a hard failure — a cold
+///    resolve would simply pick the alternate — but the old binary
+///    optional/required flag could only ever mark the whole candidate
+///    always-stale or always-refuse, never "refuse only once every arm is
+///    gone."
+///
+/// [`ModelFingerprint::probe`] tracks EVERY arm of every slot (present ->
+/// `(len, mtime)`, absent -> a marker) and treats ANY arm's snapshot
+/// changing — in EITHER direction — as staleness for that slot, refusing
+/// (arm c) only when the slot as a whole cannot satisfy a cold resolve; see
+/// [`Self::absence_tolerated`] and [`ModelFingerprint::probe`]'s own doc for
+/// the full per-slot lattice.
+struct DigestSlot {
+    arms: Vec<SlotArm>,
+    /// `true` when the loader accepts EVERY arm of this slot being absent —
+    /// today, only the tokenizer: every resolver path already re-derives
+    /// `None` on total absence and `CandleBackend::load`'s `.transpose()?`
+    /// accepts it, so [`ModelFingerprint::probe`] never refuses for this
+    /// slot, only ever reports stale. `false` for a slot the loader has NO
+    /// fallback for once every arm is gone (config, weights, the adapter
+    /// pair, and — per-class — `preprocessor_config.json` on an HF-CLAP
+    /// audio model, via [`preprocessor_config_is_required`]): `probe`
+    /// refuses (arm c) ONLY in that all-arms-absent case, never merely
+    /// because the arm THIS load happened to select vanished while a
+    /// still-present alternate arm would let a cold resolve succeed.
+    absence_tolerated: bool,
+}
+
+/// Enumerate the FULL candidate SLOT set both [`content_digest_entries`]
+/// (hashes the bytes of each slot's `gated` arm(s) only) and
+/// [`compute_model_fingerprint`] (esc-058 F-4b, `stat`s every arm of every
+/// slot, including absent ones, so a later APPEARANCE on ANY arm is
+/// detectable) walk — the SAME set, computed by this ONE function, so the
+/// two can never drift from each other. See [`compute_model_content_digest`]
 /// for exactly which files this is, why, and the ordering/anchoring
-/// guarantee.
-fn all_candidate_paths(resolved: &ResolvedModel) -> Result<Vec<DigestCandidate>> {
-    struct RawCandidate {
+/// guarantee; see [`DigestSlot`]'s doc for why candidates are grouped into
+/// slots-with-alternates rather than a flat per-file list.
+fn all_candidate_paths(resolved: &ResolvedModel) -> Result<Vec<DigestSlot>> {
+    struct RawArm {
         path: std::path::PathBuf,
         anchor: std::path::PathBuf,
         gated: bool,
-        optional: bool,
+    }
+    struct RawSlot {
+        arms: Vec<RawArm>,
+        absence_tolerated: bool,
     }
 
     let model_dir = resolved
@@ -957,39 +983,64 @@ fn all_candidate_paths(resolved: &ResolvedModel) -> Result<Vec<DigestCandidate>>
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| std::path::PathBuf::from("."));
 
-    let mut candidates: Vec<RawCandidate> = vec![RawCandidate {
-        path: resolved.config_path.clone(),
-        anchor: model_dir.clone(),
-        gated: true,
-        optional: false,
-    }];
+    let mut slots: Vec<RawSlot> = Vec::new();
+
+    // Config slot (audit round 62, adversarial round 10): the resolver's OWN
+    // `config.json` / `open_clip_config.json` preference chain
+    // (`try_catalog_lookup`, `resolve_local`, `resolve_hf_hub` — every path
+    // checks `config.json` first, `open_clip_config.json` second;
+    // resolver.rs:135-137/223-225/327). `resolved.config_path` names
+    // whichever arm was actually selected for THIS load; the OTHER arm is
+    // still a tracked candidate so its appearance is detectable and a cold
+    // resolve preferring it is never silently masked. Required unless an
+    // alternate exists: a reload can only succeed while AT LEAST ONE of the
+    // two is present.
+    slots.push(RawSlot {
+        arms: ["config.json", "open_clip_config.json"]
+            .into_iter()
+            .map(|name| {
+                let path = model_dir.join(name);
+                RawArm {
+                    gated: path == resolved.config_path,
+                    path,
+                    anchor: model_dir.clone(),
+                }
+            })
+            .collect(),
+        absence_tolerated: false,
+    });
 
     // `1_Pooling/config.json`: gated for the digest by whether the resolver
     // actually read one — the identical presence test `pooling_from_config`
     // gates its mean-fallback on — but always a CANDIDATE for the
-    // fingerprint (F-4b: appearance must be detectable). `optional: true`
-    // (F-4'): a load-time-present, now-deleted config file here means a
-    // reload legitimately succeeds via the mean-pooling fallback.
-    candidates.push(RawCandidate {
-        path: model_dir.join("1_Pooling/config.json"),
-        anchor: model_dir.clone(),
-        gated: resolved.pooling_config.is_some(),
-        optional: true,
+    // fingerprint (F-4b: appearance must be detectable). Absence is always
+    // tolerated (F-4'): a load-time-present, now-deleted config file here
+    // means a reload legitimately succeeds via the mean-pooling fallback.
+    slots.push(RawSlot {
+        arms: vec![RawArm {
+            path: model_dir.join("1_Pooling/config.json"),
+            anchor: model_dir.clone(),
+            gated: resolved.pooling_config.is_some(),
+        }],
+        absence_tolerated: true,
     });
 
     // `preprocessor_config.json` (F-2): same CANDIDATE pattern as
-    // `1_Pooling/config.json` above, but its `optional`-ness is PER-CLASS,
+    // `1_Pooling/config.json` above, but its absence-tolerance is PER-CLASS,
     // not fixed (audit round 62, F-B) — see
     // [`preprocessor_config_is_required`]'s doc.
-    candidates.push(RawCandidate {
-        path: model_dir.join("preprocessor_config.json"),
-        anchor: model_dir.clone(),
-        gated: resolved.preprocessor_config.is_some(),
-        optional: !preprocessor_config_is_required(resolved),
+    slots.push(RawSlot {
+        arms: vec![RawArm {
+            path: model_dir.join("preprocessor_config.json"),
+            anchor: model_dir.clone(),
+            gated: resolved.preprocessor_config.is_some(),
+        }],
+        absence_tolerated: !preprocessor_config_is_required(resolved),
     });
 
-    // The tokenizer (audit round 62, adversarial round 6, R5-F1; round 8,
-    // R7-F1): NOT required, despite the pre-R5-F1 comment's claim that "the
+    // The tokenizer slot (audit round 62, adversarial round 6, R5-F1; round
+    // 8, R7-F1; migrated into this uniform [`DigestSlot`] shape in round
+    // 10): NOT required, despite the pre-R5-F1 comment's claim that "the
     // loader has no fallback" — every resolver path (`discover_local_tokenizer`
     // locally, resolver.rs:504-514; the HF Hub `tokenizer.json` /
     // `bpe_simple_vocab_16e6.txt.gz` fallback chain remotely, resolver.rs:379-387)
@@ -1000,37 +1051,22 @@ fn all_candidate_paths(resolved: &ResolvedModel) -> Result<Vec<DigestCandidate>>
     // text-encoding call fails LATER with that path's own typed error ("No
     // tokenizer loaded for ... model") at USE time, not at load time; a CLAP
     // audio model's `forward_audio_embedding` never reads `self.tokenizer`
-    // at all, so it serves unaffected. `optional: true` here for the same
-    // reason as `1_Pooling/config.json` and `preprocessor_config.json`
-    // above.
+    // at all, so it serves unaffected. `absence_tolerated: true` — the ONLY
+    // slot for which this holds unconditionally, regardless of how many
+    // arms are gone.
     //
-    // R7-F1 (block): the pre-fix version pushed this candidate ONLY when
-    // `resolved.tokenizer.is_some()`. That made the tokenizer the sole
-    // CONDITIONALLY-pushed candidate in this function — every other slot
-    // (`1_Pooling/config.json`, `preprocessor_config.json`) is always a
-    // candidate regardless of whether the resolver actually read one,
-    // precisely so a later APPEARANCE is fingerprinted as a `None`-snapshot
-    // absence and trips `probe`'s arm at line ~1180. The tokenizer broke
-    // that pattern: after the round-6 stale-reload sequence (delete
-    // `tokenizer.json` -> `probe` reports stale via arm (b) -> evict ->
-    // reload with `resolved.tokenizer == None`), the NEW fingerprint carried
-    // NO tokenizer entry whatsoever — restoring `tokenizer.json` on disk
-    // changed nothing that was ever fingerprinted, so `probe` reported fresh
-    // forever and every embedding call kept failing on an entry a cold
-    // process would happily serve.
-    //
-    // Fix: push BOTH filenames the resolver's preference chain considers —
+    // R7-F1: both filenames the resolver's preference chain considers —
     // `tokenizer.json` (checked first) and `bpe_simple_vocab_16e6.txt.gz`
-    // (the OpenCLIP fallback) — as UNCONDITIONAL candidates anchored under
-    // `model_dir`, exactly mirroring the `1_Pooling`/`preprocessor` pattern.
-    // `gated` is true for whichever slot `resolved.tokenizer` actually names
-    // (using its own path, so the anchor-mismatch refusal below still fires
-    // if that path is ever outside `model_dir`) and the digest keeps hashing
-    // only the file the loader actually read; the OTHER slot — and BOTH
-    // slots when `resolved.tokenizer` is `None` — is pushed with an
-    // absent-marker path (`model_dir.join(name)`), `gated: false`, so
-    // `compute_model_fingerprint` still records its `None` snapshot and a
-    // later appearance of either file trips `probe`.
+    // (the OpenCLIP fallback) — are UNCONDITIONAL arms of this ONE slot,
+    // anchored under `model_dir`, exactly mirroring the `1_Pooling`/
+    // `preprocessor` pattern above. `gated` is true for whichever arm
+    // `resolved.tokenizer` actually names (using its own path, so the
+    // anchor-mismatch refusal below still fires if that path is ever outside
+    // `model_dir`) and the digest keeps hashing only the file the loader
+    // actually read; the OTHER arm — and BOTH arms when `resolved.tokenizer`
+    // is `None` — carries an absent-marker path (`model_dir.join(name)`),
+    // `gated: false`, so `compute_model_fingerprint` still records its
+    // `None` snapshot and a later appearance of either file trips `probe`.
     let tokenizer_json_default = model_dir.join("tokenizer.json");
     let tokenizer_bpe_default = model_dir.join("bpe_simple_vocab_16e6.txt.gz");
     let (json_path, json_gated, bpe_path, bpe_gated) = match &resolved.tokenizer {
@@ -1040,88 +1076,145 @@ fn all_candidate_paths(resolved: &ResolvedModel) -> Result<Vec<DigestCandidate>>
         Some(TokenizerSource::OpenClipBpe(p)) => (tokenizer_json_default, false, p.clone(), true),
         None => (tokenizer_json_default, false, tokenizer_bpe_default, false),
     };
-    candidates.push(RawCandidate {
-        path: json_path,
-        anchor: model_dir.clone(),
-        gated: json_gated,
-        optional: true,
-    });
-    candidates.push(RawCandidate {
-        path: bpe_path,
-        anchor: model_dir.clone(),
-        gated: bpe_gated,
-        optional: true,
+    slots.push(RawSlot {
+        arms: vec![
+            RawArm {
+                path: json_path,
+                anchor: model_dir.clone(),
+                gated: json_gated,
+            },
+            RawArm {
+                path: bpe_path,
+                anchor: model_dir.clone(),
+                gated: bpe_gated,
+            },
+        ],
+        absence_tolerated: true,
     });
 
+    // Weights slot (audit round 62, adversarial round 10): the resolver's
+    // OWN `model.safetensors` / `open_clip_model.safetensors` / `model.onnx`
+    // preference chain (`try_catalog_lookup`, resolver.rs:160-162;
+    // `resolve_local`'s `has_onnx`/`has_safetensors` backend
+    // auto-selection, resolver.rs:240/251-255/261-263/273-274;
+    // `download_safetensors`'s two single-name tries, resolver.rs:426-429).
+    // Every known filename is a tracked arm regardless of which one THIS
+    // load actually selected — `model.onnx` APPEARING next to a
+    // currently-loaded `model.safetensors` is exactly the case that flips
+    // the backend a cold resolve would choose (`resolve_local` prefers ORT
+    // the instant `has_onnx` is true), so its appearance must be just as
+    // detectable as its own disappearance. A sharded HF download
+    // (`download_safetensors`'s shard fallback, resolver.rs:432-442) names
+    // files OUTSIDE this fixed three-name set entirely — those are appended
+    // below as their own always-gated extra arms of this SAME slot, exactly
+    // mirroring the pre-reshape per-file behaviour for that case (no
+    // known-name alternate exists for one specific shard; `download_safetensors`
+    // always re-fetches the identical shard set on a cold resolve, so a
+    // shard's own loss makes a cold resolve fail regardless of the three
+    // named arms' state).
+    let known_weight_names = [
+        "model.safetensors",
+        "open_clip_model.safetensors",
+        "model.onnx",
+    ];
+    let mut weight_arms: Vec<RawArm> = known_weight_names
+        .into_iter()
+        .map(|name| {
+            let path = model_dir.join(name);
+            let gated = resolved.weights_paths.iter().any(|w| w == &path);
+            RawArm {
+                gated,
+                path,
+                anchor: model_dir.clone(),
+            }
+        })
+        .collect();
     for weights in &resolved.weights_paths {
-        candidates.push(RawCandidate {
-            path: weights.clone(),
-            anchor: model_dir.clone(),
-            gated: true,
-            optional: false,
-        });
+        if !weight_arms.iter().any(|arm| &arm.path == weights) {
+            weight_arms.push(RawArm {
+                path: weights.clone(),
+                anchor: model_dir.clone(),
+                gated: true,
+            });
+        }
     }
+    slots.push(RawSlot {
+        arms: weight_arms,
+        absence_tolerated: false,
+    });
 
-    // The fine-tune adapter's own pair (F-1): anchored at `adapter_path`
-    // itself — NOT the base model's directory, which the adapter's files
-    // never live under (the resolver fetches them from the artifact store
-    // into their own directory) — gated by the SAME presence check
-    // `CandleBackend::load` applies (its `saved_adapter` read block, below)
-    // before reading them, so
-    // this candidate set can never drift from what the loader actually
-    // reads. `optional: false` — once `adapter_path` is `Some`, the loader
-    // has no unadapted-fallback and refuses outright on either file's
-    // absence (see `candle_backend_load_refuses_some_adapter_path_missing_files`
-    // below), so a reload after either file vanishes fails identically.
+    // The fine-tune adapter's own pair (F-1): two independent required
+    // files that are never alternates of each other, so each is its own
+    // degenerate single-arm slot — anchored at `adapter_path` itself, NOT
+    // the base model's directory, which the adapter's files never live
+    // under (the resolver fetches them from the artifact store into their
+    // own directory) — gated by the SAME presence check `CandleBackend::load`
+    // applies (its `saved_adapter` read block, below) before reading them,
+    // so this candidate set can never drift from what the loader actually
+    // reads. `absence_tolerated: false` — once `adapter_path` is `Some`,
+    // the loader has no unadapted-fallback and refuses outright on either
+    // file's absence (see
+    // `candle_backend_load_refuses_some_adapter_path_missing_files` below),
+    // so a reload after either file vanishes fails identically.
     if let Some(adapter_dir) = &resolved.adapter_path {
         let cfg_path = adapter_dir.join("adapter_config.json");
         let weights_path = adapter_dir.join("adapter.safetensors");
         let gated = cfg_path.exists() && weights_path.exists();
-        candidates.push(RawCandidate {
-            path: cfg_path,
-            anchor: adapter_dir.clone(),
-            gated,
-            optional: false,
+        slots.push(RawSlot {
+            arms: vec![RawArm {
+                path: cfg_path,
+                anchor: adapter_dir.clone(),
+                gated,
+            }],
+            absence_tolerated: false,
         });
-        candidates.push(RawCandidate {
-            path: weights_path,
-            anchor: adapter_dir.clone(),
-            gated,
-            optional: false,
+        slots.push(RawSlot {
+            arms: vec![RawArm {
+                path: weights_path,
+                anchor: adapter_dir.clone(),
+                gated,
+            }],
+            absence_tolerated: false,
         });
     }
 
-    let mut entries: Vec<DigestCandidate> = Vec::with_capacity(candidates.len());
-    for candidate in candidates {
-        let rel = candidate
-            .path
-            .strip_prefix(&candidate.anchor)
-            .map_err(|_| JammiError::Model {
-                model_id: resolved.model_id.0.clone(),
-                message: format!(
-                    "content-digest enumeration: {:?} is not nested under its expected anchor \
-                     directory {:?} — every path this engine resolves today is always a child \
-                     of its own anchor (the model directory, or the adapter directory), so this \
-                     is a genuinely unexpected resolved-model shape; refusing rather than \
-                     silently folding an ABSOLUTE, host-specific path into a digest documented \
-                     to be reproducible across hosts",
-                    candidate.path, candidate.anchor
-                ),
-            })?;
-        let rel_string = if candidate.anchor == model_dir {
-            rel.to_string_lossy().into_owned()
-        } else {
-            format!("adapter/{}", rel.to_string_lossy())
-        };
-        entries.push(DigestCandidate {
-            rel: rel_string,
-            path: candidate.path,
-            gated: candidate.gated,
-            optional: candidate.optional,
+    let mut result: Vec<DigestSlot> = Vec::with_capacity(slots.len());
+    for slot in slots {
+        let mut arms = Vec::with_capacity(slot.arms.len());
+        for arm in slot.arms {
+            let rel = arm
+                .path
+                .strip_prefix(&arm.anchor)
+                .map_err(|_| JammiError::Model {
+                    model_id: resolved.model_id.0.clone(),
+                    message: format!(
+                        "content-digest enumeration: {:?} is not nested under its expected \
+                         anchor directory {:?} — every path this engine resolves today is \
+                         always a child of its own anchor (the model directory, or the \
+                         adapter directory), so this is a genuinely unexpected resolved-model \
+                         shape; refusing rather than silently folding an ABSOLUTE, \
+                         host-specific path into a digest documented to be reproducible \
+                         across hosts",
+                        arm.path, arm.anchor
+                    ),
+                })?;
+            let rel_string = if arm.anchor == model_dir {
+                rel.to_string_lossy().into_owned()
+            } else {
+                format!("adapter/{}", rel.to_string_lossy())
+            };
+            arms.push(SlotArm {
+                rel: rel_string,
+                path: arm.path,
+                gated: arm.gated,
+            });
+        }
+        result.push(DigestSlot {
+            arms,
+            absence_tolerated: slot.absence_tolerated,
         });
     }
-    entries.sort_by(|a, b| a.rel.cmp(&b.rel));
-    Ok(entries)
+    Ok(result)
 }
 
 fn compute_model_content_digest(resolved: &ResolvedModel) -> Result<ModelContentDigest> {
@@ -1161,35 +1254,40 @@ fn compute_model_content_digest(resolved: &ResolvedModel) -> Result<ModelContent
 /// decides WHEN a reload is triggered, and does not strengthen the digest's
 /// own guarantee.
 ///
-/// `(relpath, absolute_path, snapshot, optional)` for one
-/// [`ModelFingerprint`] entry. `snapshot` is `Some((len, mtime))` when the
-/// candidate existed at load time, or `None` when it did not (see
-/// [`ModelFingerprint`]'s doc, F-4b). `optional` (audit round 62, F-4') is
-/// [`DigestCandidate::optional`] carried through unchanged — it is what
-/// [`ModelFingerprint::probe`] consults to decide whether a
-/// present-at-load, `NotFound`-now candidate is a STALE (evict + reload,
-/// the reload legitimately succeeds via the loader's own fallback) or a
-/// typed refusal (no fallback exists; a reload would fail identically).
-type FingerprintEntry = (
+/// `(relpath, absolute_path, snapshot)` for one arm within a
+/// [`FingerprintSlot`]. `snapshot` is `Some((len, mtime))` when the arm
+/// existed at load time, or `None` when it did not (see [`ModelFingerprint`]'s
+/// doc, F-4b).
+type FingerprintArm = (
     String,
     std::path::PathBuf,
     Option<(u64, std::time::SystemTime)>,
-    bool,
 );
+
+/// One fingerprinted SLOT — every arm of one [`DigestSlot`], captured at
+/// load time, plus that slot's [`DigestSlot::absence_tolerated`] flag
+/// carried through unchanged. See [`DigestSlot`]'s doc for why the
+/// fingerprint is grouped this way (audit round 62, adversarial round 10)
+/// rather than as a flat per-file list with an isolated `optional: bool`.
+#[derive(Debug, Clone)]
+struct FingerprintSlot {
+    arms: Vec<FingerprintArm>,
+    absence_tolerated: bool,
+}
 
 /// [`ModelCache::get_or_load`]: super::super::cache::ModelCache::get_or_load
 #[derive(Debug, Clone)]
 pub(crate) struct ModelFingerprint {
-    /// One entry per candidate file, in the same sorted order
-    /// [`all_candidate_paths`] returns. A fixed *present-only* snapshot
-    /// cannot detect a later-appearing output-affecting file (a
-    /// `1_Pooling/config.json`, `preprocessor_config.json`, or adapter pair
-    /// that did not exist at load time but exists at probe time) because
-    /// appearance never touches any `(len, mtime)` already being tracked —
-    /// recording the ABSENCE explicitly closes that blind spot. Empty for a
-    /// synthetic (non-disk-backed) fixture, in which case
-    /// [`ModelFingerprint::probe`] is vacuously fresh.
-    entries: Vec<FingerprintEntry>,
+    /// One entry per [`DigestSlot`], in [`all_candidate_paths`]'s push
+    /// order. A fixed *present-only* snapshot cannot detect a later-appearing
+    /// output-affecting file (F-4b) because appearance never touches any
+    /// `(len, mtime)` already being tracked — recording the ABSENCE
+    /// explicitly closes that blind spot, for EVERY arm of every slot, not
+    /// just the arm a given load happened to select (audit round 62,
+    /// adversarial round 10). Empty for a synthetic (non-disk-backed)
+    /// fixture, in which case [`ModelFingerprint::probe`] is vacuously
+    /// fresh.
+    slots: Vec<FingerprintSlot>,
 }
 
 impl ModelFingerprint {
@@ -1199,131 +1297,160 @@ impl ModelFingerprint {
     /// [`compute_model_fingerprint`] instead.
     #[cfg(test)]
     pub(crate) fn empty() -> Self {
-        Self { entries: vec![] }
+        Self { slots: vec![] }
     }
 
-    /// Re-`stat` every candidate file and compare against the load-time
-    /// snapshot.
+    /// Re-`stat` every arm of every candidate SLOT and compare against the
+    /// load-time snapshot, evaluated one slot at a time.
     ///
-    /// - `Ok(true)` — every candidate's current on-disk state matches load
-    ///   time (present candidates have an unchanged `(len, mtime)`; absent
-    ///   candidates are still absent): serve the cached model.
-    /// - `Ok(false)` — at least one candidate diverged: either a present
-    ///   file's `len`/`mtime` changed, an ABSENT-at-load-time candidate now
-    ///   EXISTS (F-4b), or an OPTIONAL, present-at-load candidate is now
-    ///   `NotFound` (F-4', see below) — the caller must evict and reload,
-    ///   never serve.
-    /// - `Err` — a REQUIRED (`optional == false`) candidate that was present
-    ///   at load time vanished or became unreadable, or ANY candidate
-    ///   (required or optional) is unreadable for a reason OTHER than
-    ///   `NotFound` (e.g. a permission error): a typed refusal (K2), never
-    ///   silently treated as fresh (would replay stale weights) or as stale
-    ///   (would mask a real IO failure as an ordinary reload, which would
-    ///   then hit the identical error inside `compute_model_content_digest`
-    ///   anyway — surfacing it here is strictly more informative, naming the
-    ///   probe as the cause).
+    /// - `Ok(true)` — every slot's every arm's current on-disk state matches
+    ///   load time (present arms have an unchanged `(len, mtime)`; absent
+    ///   arms are still absent): serve the cached model.
+    /// - `Ok(false)` — at least one slot has at least one arm diverged
+    ///   (a present arm's `len`/`mtime` changed, an absent-at-load arm now
+    ///   EXISTS — F-4b, on ANY arm, not only the selected one — or a
+    ///   present-at-load arm is now `NotFound`), AND the slot as a whole can
+    ///   still satisfy a cold resolve (some arm is present now, whether or
+    ///   not it is the one THIS load selected, or the slot tolerates total
+    ///   absence): the caller must evict and reload, never serve.
+    /// - `Err` — a slot whose divergence leaves EVERY arm absent, on a slot
+    ///   that does not tolerate that (config, weights, the adapter pair, or
+    ///   a per-class-required preprocessor slot) — no arm, selected or
+    ///   alternate, can satisfy a cold resolve, so a reload would fail
+    ///   identically — or ANY arm is unreadable for a reason OTHER than
+    ///   `NotFound` (e.g. a permission error, for which slot tolerance
+    ///   carries no meaning): a typed refusal (K2), never silently treated
+    ///   as fresh (would replay stale weights) or as stale (would mask a
+    ///   real IO failure as an ordinary reload, which would then hit the
+    ///   identical error inside `compute_model_content_digest` anyway —
+    ///   surfacing it here is strictly more informative, naming the probe
+    ///   as the cause).
     ///
-    /// **The `optional`/`NotFound` lattice (audit round 62, F-4')** — three
-    /// arms over "was this candidate present at load time" ×
-    /// "does it exist now", plus `optional`:
+    /// **The per-slot lattice (audit round 62, adversarial round 10 —
+    /// reshaped from F-4''s flat, per-candidate `optional: bool`, which
+    /// could only express one file in isolation)** — evaluated per SLOT,
+    /// over "did any arm change" × "is any arm present now":
     ///
-    /// (a) absent-at-load, absent-now: unchanged — `Ok(true)` continues.
-    /// (b) OPTIONAL candidate, present-at-load, `NotFound`-now (e.g.
-    ///     `1_Pooling/config.json` deleted from a live model directory,
-    ///     `preprocessor_config.json` deleted from a live NON-CLAP model, or
-    ///     the tokenizer deleted from ANY live model directory — audit round
-    ///     62, adversarial round 6, R5-F1): the loader has a documented
-    ///     fallback for this candidate's absence on THIS model's class (mean
-    ///     pooling / no preprocessor geometry / `tokenizer: None`, with any
-    ///     text-encoding call refused at USE time by its own typed error
-    ///     instead of at load time — see `all_candidate_paths`' tokenizer
-    ///     candidate doc) — a fresh reload legitimately SUCCEEDS, with a NEW
-    ///     digest reflecting the fallback. Reported as STALE (`Ok(false)`),
-    ///     not `Err`: the pre-F-4' code collapsed this into `Err`
-    ///     indistinguishably from arm (c), permanently wedging
-    ///     `ModelCache::get_or_load` on a model that a cold reload would
-    ///     serve just fine. `optional` is a per-CLASS property, not a
-    ///     per-slot constant (audit round 62, F-B) — `preprocessor_config.json`
-    ///     deleted from a live HF-CLAP audio model is NOT this arm; see
-    ///     [`preprocessor_config_is_required`] and arm (c) below. The
-    ///     tokenizer, by contrast, is UNCONDITIONALLY this arm across every
-    ///     model class, including CLAP audio (whose forward path never reads
-    ///     `self.tokenizer` at all).
-    /// (c) REQUIRED candidate (`config.json`, any weights path, the adapter
-    ///     pair once `adapter_path` is `Some`, OR `preprocessor_config.json`
-    ///     deleted from a live HF-CLAP audio model — audit round 62, F-B),
-    ///     present-at-load, `NotFound`-now: the loader has NO fallback — a
-    ///     reload would fail identically — so this remains the typed
-    ///     refusal (`Err`), unchanged from before
-    ///     F-4'.
+    /// (a) no arm of this slot changed: unchanged — continue to the next
+    ///     slot.
+    /// (b) some arm changed, AND at least one arm of this slot is present
+    ///     now — whether or not it is the SAME arm the resolver originally
+    ///     selected (e.g. `model.safetensors` deleted while
+    ///     `open_clip_model.safetensors` still exists; `1_Pooling/config.json`
+    ///     deleted from a live model directory; the tokenizer deleted from
+    ///     ANY live model directory — audit round 62, adversarial round 6,
+    ///     R5-F1): the slot can still satisfy a cold resolve, either via the
+    ///     surviving alternate arm or via a documented per-class fallback
+    ///     (mean pooling / no preprocessor geometry / `tokenizer: None`,
+    ///     with any text-encoding call refused at USE time by its own typed
+    ///     error instead of at load time — see `all_candidate_paths`'
+    ///     tokenizer slot doc) — a fresh reload legitimately SUCCEEDS, with
+    ///     a NEW digest reflecting whichever arm/fallback a cold resolve
+    ///     now takes. Reported as STALE (`Ok(false)`), never `Err`: the
+    ///     pre-round-10 per-file model collapsed the alternate-exists case
+    ///     into the SAME arm (c) `Err` as total absence, permanently
+    ///     wedging `ModelCache::get_or_load` on a model a cold reload would
+    ///     serve just fine via the alternate.
+    /// (c) some arm changed, AND every arm of this slot is now absent, on a
+    ///     slot that does NOT tolerate total absence (`absence_tolerated ==
+    ///     false` — config, weights, the adapter pair, and — per-class, see
+    ///     [`preprocessor_config_is_required`] — `preprocessor_config.json`
+    ///     on an HF-CLAP audio model): no arm can satisfy a cold resolve, so
+    ///     this remains the typed refusal (`Err`), unchanged from before the
+    ///     round-10 reshape. The tokenizer slot's `absence_tolerated == true`
+    ///     means it NEVER reaches this arm, for any number of vanished arms.
     pub(crate) fn probe(&self) -> Result<bool> {
-        for (rel, path, snapshot, optional) in &self.entries {
-            match std::fs::metadata(path) {
-                Ok(meta) => {
-                    let current_mtime = meta.modified().map_err(|e| JammiError::Model {
-                        model_id: path.display().to_string(),
-                        message: format!(
-                            "esc-058 staleness probe: {path:?} has no mtime available on this \
-                             platform/filesystem: {e}"
-                        ),
-                    })?;
-                    match snapshot {
-                        Some((len, mtime)) => {
-                            if meta.len() != *len || current_mtime != *mtime {
-                                return Ok(false);
+        for slot in &self.slots {
+            let mut changed = false;
+            let mut any_arm_present_now = false;
+            let mut vanished_arm_error: Option<JammiError> = None;
+
+            for (rel, path, snapshot) in &slot.arms {
+                match std::fs::metadata(path) {
+                    Ok(meta) => {
+                        any_arm_present_now = true;
+                        let current_mtime = meta.modified().map_err(|e| JammiError::Model {
+                            model_id: path.display().to_string(),
+                            message: format!(
+                                "esc-058 staleness probe: {path:?} has no mtime available on \
+                                 this platform/filesystem: {e}"
+                            ),
+                        })?;
+                        match snapshot {
+                            Some((len, mtime)) => {
+                                if meta.len() != *len || current_mtime != *mtime {
+                                    changed = true;
+                                }
                             }
+                            // Absent at load time, present now: an
+                            // output-affecting file APPEARED (F-4b) — even
+                            // one this load did NOT select (audit round 62,
+                            // adversarial round 10: a cold resolve may pick
+                            // it instead, and for the weights slot may pick
+                            // a different BACKEND entirely).
+                            None => changed = true,
                         }
-                        // Absent at load time, present now: an
-                        // output-affecting file APPEARED (F-4b).
-                        None => return Ok(false),
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound && snapshot.is_none() => {
+                        // Still absent, exactly as at load time — fine.
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        // This arm existed at load time and is now gone.
+                        // Whether the SLOT as a whole is arm (b) or arm (c)
+                        // depends on the OTHER arms — decided once the whole
+                        // slot has been scanned, below.
+                        changed = true;
+                        if vanished_arm_error.is_none() {
+                            vanished_arm_error = Some(JammiError::Model {
+                                model_id: path.display().to_string(),
+                                message: format!(
+                                    "esc-058 staleness probe: {path:?} (fingerprinted as \
+                                     {rel:?} at load time) is no longer readable: {e}"
+                                ),
+                            });
+                        }
+                    }
+                    // Any arm unreadable for a reason OTHER than NotFound
+                    // (e.g. a permission error): slot tolerance carries no
+                    // meaning here — the failure is not "this file doesn't
+                    // exist", it is "this file couldn't be inspected". A
+                    // typed refusal (K2), immediately.
+                    Err(e) => {
+                        return Err(JammiError::Model {
+                            model_id: path.display().to_string(),
+                            message: format!(
+                                "esc-058 staleness probe: {path:?} (fingerprinted as {rel:?} \
+                                 at load time) is no longer readable: {e}"
+                            ),
+                        });
                     }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound && snapshot.is_none() => {
-                    // Arm (a): still absent, exactly as at load time — fine.
-                }
-                // Arm (b), F-4': an OPTIONAL candidate that existed at load
-                // time (`snapshot.is_some()`) is now `NotFound`. The loader
-                // has a documented fallback for this candidate's absence —
-                // a reload legitimately succeeds — so this is STALE, not a
-                // refusal: fall through to the caller's evict-and-reload
-                // path exactly like any other divergence above.
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::NotFound
-                        && snapshot.is_some()
-                        && *optional =>
-                {
-                    return Ok(false);
-                }
-                // Arm (c): a REQUIRED candidate present at load time is now
-                // `NotFound` (no fallback exists — a reload would fail
-                // identically), or any candidate is unreadable for a reason
-                // other than `NotFound` (e.g. a permission error, for which
-                // "optional" carries no meaning — the failure is not "this
-                // file doesn't exist", it is "this file couldn't be
-                // inspected"). Both are typed refusals (K2).
-                Err(e) => {
-                    return Err(JammiError::Model {
-                        model_id: path.display().to_string(),
-                        message: format!(
-                            "esc-058 staleness probe: {path:?} (fingerprinted as {rel:?} at \
-                             load time) is no longer readable: {e}"
-                        ),
-                    });
-                }
             }
+
+            if !changed {
+                continue;
+            }
+            if !slot.absence_tolerated && !any_arm_present_now {
+                return Err(vanished_arm_error.expect(
+                    "a required slot (`absence_tolerated == false`) with every arm absent \
+                     and `changed == true` must have had at least one arm transition from \
+                     present-at-load to absent-now",
+                ));
+            }
+            return Ok(false);
         }
         Ok(true)
     }
 }
 
 /// Compute the load-time staleness fingerprint (esc-058) over the FULL
-/// candidate set [`all_candidate_paths`] returns ([`content_digest_entries`]'s
-/// present-only input set is a filtered VIEW of this same enumeration, so the
-/// two can never drift). `stat`s each candidate (never reads its bytes,
-/// unlike the digest); a candidate absent at load time is recorded as such
-/// (F-4b) rather than omitted. Errors are typed refusals (K2) for anything
-/// other than "does not exist", the identical stance
-/// [`compute_model_content_digest`] takes.
+/// candidate slot set [`all_candidate_paths`] returns
+/// ([`content_digest_entries`]'s present-only input set is a filtered VIEW of
+/// this same enumeration, so the two can never drift). `stat`s every arm of
+/// every slot (never reads its bytes, unlike the digest); an arm absent at
+/// load time is recorded as such (F-4b) rather than omitted. Errors are
+/// typed refusals (K2) for anything other than "does not exist", the
+/// identical stance [`compute_model_content_digest`] takes.
 ///
 /// **Ordering invariant (audit round 62, F-4'')**: called ONCE per model
 /// load, from [`compute_model_identity_facets`], and MUST run BEFORE
@@ -1333,39 +1460,46 @@ impl ModelFingerprint {
 /// re-hash, never silently stamped as "fresh" against a stale digest
 /// forever).
 fn compute_model_fingerprint(resolved: &ResolvedModel) -> Result<ModelFingerprint> {
-    let entries = all_candidate_paths(resolved)?;
-    let mut stamped = Vec::with_capacity(entries.len());
-    for candidate in entries {
-        let DigestCandidate {
-            rel,
-            path,
-            gated: _gated,
-            optional,
-        } = candidate;
-        match std::fs::metadata(&path) {
-            Ok(meta) => {
-                let mtime = meta.modified().map_err(|e| JammiError::Model {
-                    model_id: resolved.model_id.0.clone(),
-                    message: format!(
-                        "{path:?} has no mtime available for esc-058 load-time fingerprinting: {e}"
-                    ),
-                })?;
-                stamped.push((rel, path, Some((meta.len(), mtime)), optional));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                stamped.push((rel, path, None, optional));
-            }
-            Err(e) => {
-                return Err(JammiError::Model {
-                    model_id: resolved.model_id.0.clone(),
-                    message: format!(
-                        "failed to stat {path:?} for esc-058 load-time fingerprinting: {e}"
-                    ),
-                });
+    let raw_slots = all_candidate_paths(resolved)?;
+    let mut slots = Vec::with_capacity(raw_slots.len());
+    for slot in raw_slots {
+        let mut arms = Vec::with_capacity(slot.arms.len());
+        for arm in slot.arms {
+            let SlotArm {
+                rel,
+                path,
+                gated: _gated,
+            } = arm;
+            match std::fs::metadata(&path) {
+                Ok(meta) => {
+                    let mtime = meta.modified().map_err(|e| JammiError::Model {
+                        model_id: resolved.model_id.0.clone(),
+                        message: format!(
+                            "{path:?} has no mtime available for esc-058 load-time \
+                             fingerprinting: {e}"
+                        ),
+                    })?;
+                    arms.push((rel, path, Some((meta.len(), mtime))));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    arms.push((rel, path, None));
+                }
+                Err(e) => {
+                    return Err(JammiError::Model {
+                        model_id: resolved.model_id.0.clone(),
+                        message: format!(
+                            "failed to stat {path:?} for esc-058 load-time fingerprinting: {e}"
+                        ),
+                    });
+                }
             }
         }
+        slots.push(FingerprintSlot {
+            arms,
+            absence_tolerated: slot.absence_tolerated,
+        });
     }
-    Ok(ModelFingerprint { entries: stamped })
+    Ok(ModelFingerprint { slots })
 }
 
 /// Compute BOTH per-load staleness facets — [`ModelFingerprint`] (stat) and
@@ -3582,6 +3716,20 @@ mod ner_nonfinite_logit_tests {
     /// shape `forward_ner` receives from a genuinely diverged model (a NaN
     /// hidden state feeds through the token classifier's linear layer to a
     /// non-finite logit row, since `NaN * weight + bias` is NaN).
+    ///
+    /// **Pairing-discipline exemption (audit round 62, adversarial round 10
+    /// advisory fold)**: this stub overrides neither `forward_pooled` nor
+    /// `resolved_pooling`, so it inherits BOTH trait defaults together — the
+    /// exact combination [`CandleTextForward::forward_pooled`]'s own pairing
+    /// rule (audit round 62 advisory A1) warns never to inherit silently for
+    /// a wrapper reachable via `ModelTask::TextEmbedding`, since the default
+    /// `forward_pooled` performs REAL mean pooling while the default
+    /// `resolved_pooling` dishonestly reports `None`. This module below only
+    /// ever drives this stub through `ModelTask::Ner`
+    /// (`model.forward(&content, ModelTask::Ner)`, both tests) — `forward_pooled`
+    /// is never called, and the mismatch this stub's inherited defaults would
+    /// otherwise create is unreachable dead weight, not a silent exception to
+    /// the pairing rule.
     struct FixedHiddenForward {
         max_seq_len: usize,
         hidden_size: usize,
@@ -4523,6 +4671,263 @@ mod digest_fingerprint_audit62_tests {
             fingerprint.probe().unwrap(),
             "compute_model_identity_facets's fingerprint must report fresh \
              over the same (unmutated) directory it was captured from"
+        );
+    }
+
+    // ── Round 10 (audit round 62, adversarial round 10 — "the terminal \
+    //    class closure"): the config and weights slots gain the SAME \
+    //    appearance / deletion-with-alternate / all-arms-gone lattice the \
+    //    tokenizer slot already had since round 8, via the `DigestSlot` \
+    //    reshape ──
+
+    /// Build a `ResolvedModel` whose CONFIG SLOT is selected via
+    /// `selected_name` (`"config.json"` or `"open_clip_config.json"`) —
+    /// writing ONLY that one file initially, so these tests can add or
+    /// remove the alternate arm independently. Reuses `tiny_bert`'s
+    /// weights/tokenizer files unmodified; only the config slot is under
+    /// test here.
+    fn resolved_with_config_arm(dst: &std::path::Path, selected_name: &str) -> ResolvedModel {
+        std::fs::create_dir_all(dst).unwrap();
+        let fixture = jammi_test_utils::cookbook_fixture("tiny_bert");
+        for name in ["model.safetensors", "tokenizer.json"] {
+            std::fs::copy(fixture.join(name), dst.join(name)).unwrap();
+        }
+        let config_path = dst.join(selected_name);
+        std::fs::copy(fixture.join("config.json"), &config_path).unwrap();
+        let model_config: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(&config_path).unwrap()).unwrap();
+        ResolvedModel {
+            model_id: crate::model::ModelId(format!("local:{}", dst.display())),
+            backend: crate::model::BackendType::Candle,
+            task: ModelTask::TextEmbedding,
+            config_path,
+            weights_paths: vec![dst.join("model.safetensors")],
+            tokenizer: Some(TokenizerSource::HuggingFaceJson(dst.join("tokenizer.json"))),
+            model_config,
+            preprocessor_config: None,
+            pooling_config: None,
+            base_model_id: None,
+            adapter_path: None,
+            estimated_memory: 0,
+        }
+    }
+
+    /// (a) appearance: load with ONLY the alternate arm
+    /// (`open_clip_config.json`) present; `config.json` — the arm the
+    /// resolver's chain checks FIRST — then appears. RED pre-round-10: the
+    /// config slot only ever fingerprinted the ONE arm the resolver
+    /// selected for this load, so `config.json` appearing was invisible to
+    /// `probe`, which reported fresh forever even though a cold resolve
+    /// would now prefer it over `open_clip_config.json`.
+    #[test]
+    fn config_slot_alternate_arm_appearing_trips_the_probe() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = resolved_with_config_arm(&dst, "open_clip_config.json");
+
+        let fingerprint = compute_model_fingerprint(&resolved).unwrap();
+        assert!(
+            fingerprint.probe().unwrap(),
+            "sanity: fresh immediately after capture"
+        );
+
+        // config.json — the UNSELECTED arm, never read by this load — APPEARS.
+        std::fs::copy(
+            jammi_test_utils::cookbook_fixture("tiny_bert").join("config.json"),
+            dst.join("config.json"),
+        )
+        .unwrap();
+
+        assert!(
+            !fingerprint.probe().unwrap(),
+            "config.json appearing alongside a load selected via its alternate arm \
+             (open_clip_config.json) must trip the probe to stale — a cold resolve \
+             checks config.json FIRST and would now pick it instead (audit round 62, \
+             adversarial round 10)"
+        );
+    }
+
+    /// (b) deletion-with-alternate: BOTH arms exist on disk; the SELECTED
+    /// arm (`config.json`) is deleted while the alternate
+    /// (`open_clip_config.json`) survives. A cold resolve would succeed via
+    /// the alternate, so this must be STALE, never a refusal.
+    #[test]
+    fn config_slot_selected_arm_deleted_with_alternate_present_is_stale_not_a_refusal() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = resolved_with_config_arm(&dst, "config.json");
+        // The alternate arm ALSO exists on disk — untracked by the
+        // pre-round-10 fingerprint, since only the selected arm was ever a
+        // candidate.
+        std::fs::copy(
+            jammi_test_utils::cookbook_fixture("tiny_bert").join("config.json"),
+            dst.join("open_clip_config.json"),
+        )
+        .unwrap();
+
+        let fingerprint = compute_model_fingerprint(&resolved).unwrap();
+        assert!(fingerprint.probe().unwrap());
+
+        std::fs::remove_file(dst.join("config.json")).unwrap();
+
+        let result = fingerprint.probe();
+        assert!(
+            matches!(result, Ok(false)),
+            "deleting the SELECTED config.json while open_clip_config.json (an \
+             alternate arm) still exists must report STALE, never a refusal — a \
+             cold resolve would succeed via the alternate (audit round 62, \
+             adversarial round 10). Got {result:?}"
+        );
+    }
+
+    /// (c) all-arms-gone on a required slot: NO alternate exists at all —
+    /// unchanged from before the round-10 reshape, since a cold resolve
+    /// cannot succeed either.
+    #[test]
+    fn config_slot_all_arms_gone_stays_a_typed_refusal() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = resolved_with_config_arm(&dst, "config.json");
+        // No open_clip_config.json exists at all.
+
+        let fingerprint = compute_model_fingerprint(&resolved).unwrap();
+        std::fs::remove_file(dst.join("config.json")).unwrap();
+
+        let result = fingerprint.probe();
+        assert!(
+            result.is_err(),
+            "deleting config.json with NO alternate (open_clip_config.json) present \
+             must remain a typed refusal — no arm of the config slot can satisfy a \
+             cold resolve — unchanged from before the round-10 reshape. Got {result:?}"
+        );
+    }
+
+    /// Build a `ResolvedModel` whose WEIGHTS SLOT is selected via
+    /// `selected_name` (one of the three well-known weight filenames) —
+    /// writing ONLY that one file initially. `backend` is set to match
+    /// (`Ort` for `"model.onnx"`, `Candle` otherwise), mirroring what
+    /// `resolve_local`'s own `has_onnx` branch would have picked, even
+    /// though this fixture is hand-built rather than routed through the
+    /// resolver.
+    fn resolved_with_weights_arm(dst: &std::path::Path, selected_name: &str) -> ResolvedModel {
+        std::fs::create_dir_all(dst).unwrap();
+        let fixture = jammi_test_utils::cookbook_fixture("tiny_bert");
+        for name in ["config.json", "tokenizer.json"] {
+            std::fs::copy(fixture.join(name), dst.join(name)).unwrap();
+        }
+        let weights_path = dst.join(selected_name);
+        std::fs::copy(fixture.join("model.safetensors"), &weights_path).unwrap();
+        let model_config: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(dst.join("config.json")).unwrap()).unwrap();
+        let backend = if selected_name == "model.onnx" {
+            crate::model::BackendType::Ort
+        } else {
+            crate::model::BackendType::Candle
+        };
+        ResolvedModel {
+            model_id: crate::model::ModelId(format!("local:{}", dst.display())),
+            backend,
+            task: ModelTask::TextEmbedding,
+            config_path: dst.join("config.json"),
+            weights_paths: vec![weights_path],
+            tokenizer: Some(TokenizerSource::HuggingFaceJson(dst.join("tokenizer.json"))),
+            model_config,
+            preprocessor_config: None,
+            pooling_config: None,
+            base_model_id: None,
+            adapter_path: None,
+            estimated_memory: 0,
+        }
+    }
+
+    /// (a) appearance: load with ONLY `model.safetensors` selected;
+    /// `model.onnx` — an arm this load did NOT select — then appears. RED
+    /// pre-round-10: the weights slot only ever fingerprinted the resolved
+    /// `weights_paths` entries themselves, never the OTHER well-known
+    /// filenames, so `model.onnx` appearing was invisible to `probe` —
+    /// silently masking the fact that a cold resolve (`resolve_local`'s
+    /// `has_onnx` branch) would now pick the ORT backend instead. The
+    /// backend flip itself is a COLD-side property, verified independently
+    /// at the resolver level by `models.rs`'s
+    /// `resolve_local_prefers_onnx_once_it_appears_alongside_existing_safetensors`
+    /// — this test asserts what the warm probe can honestly assert:
+    /// staleness was detected.
+    #[test]
+    fn weights_slot_alternate_arm_appearing_trips_the_probe() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = resolved_with_weights_arm(&dst, "model.safetensors");
+
+        let fingerprint = compute_model_fingerprint(&resolved).unwrap();
+        assert!(
+            fingerprint.probe().unwrap(),
+            "sanity: fresh immediately after capture"
+        );
+
+        // model.onnx — the UNSELECTED arm — APPEARS.
+        std::fs::write(dst.join("model.onnx"), b"fake-onnx-bytes").unwrap();
+
+        assert!(
+            !fingerprint.probe().unwrap(),
+            "model.onnx appearing alongside a load resolved via model.safetensors must \
+             trip the probe to stale (audit round 62, adversarial round 10) — it is not \
+             a candle-side-irrelevant file: resolve_local prefers ORT the instant \
+             model.onnx exists"
+        );
+    }
+
+    /// (b) deletion-with-alternate: BOTH `model.safetensors` (selected) and
+    /// `open_clip_model.safetensors` (alternate, untracked pre-round-10)
+    /// exist; the selected arm is deleted. A cold resolve's own
+    /// standard/open_clip fallback chain would succeed via the alternate, so
+    /// this must be STALE, never a refusal.
+    #[test]
+    fn weights_slot_selected_arm_deleted_with_alternate_present_is_stale_not_a_refusal() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = resolved_with_weights_arm(&dst, "model.safetensors");
+        std::fs::copy(
+            dst.join("model.safetensors"),
+            dst.join("open_clip_model.safetensors"),
+        )
+        .unwrap();
+
+        let fingerprint = compute_model_fingerprint(&resolved).unwrap();
+        assert!(fingerprint.probe().unwrap());
+
+        std::fs::remove_file(dst.join("model.safetensors")).unwrap();
+
+        let result = fingerprint.probe();
+        assert!(
+            matches!(result, Ok(false)),
+            "deleting the SELECTED model.safetensors while open_clip_model.safetensors \
+             (an alternate arm) still exists must report STALE, never a refusal — a cold \
+             resolve would succeed via the alternate (audit round 62, adversarial round \
+             10). Got {result:?}"
+        );
+    }
+
+    /// (c) all-arms-gone on a required slot: NO alternate exists at all —
+    /// unchanged from before the round-10 reshape (the peer of
+    /// `probe_required_candidate_deleted_after_capture_stays_a_typed_refusal`
+    /// above, expressed explicitly against the round-10 slot model with its
+    /// own dedicated fixture).
+    #[test]
+    fn weights_slot_all_arms_gone_stays_a_typed_refusal() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = resolved_with_weights_arm(&dst, "model.safetensors");
+        // No open_clip_model.safetensors or model.onnx exists at all.
+
+        let fingerprint = compute_model_fingerprint(&resolved).unwrap();
+        std::fs::remove_file(dst.join("model.safetensors")).unwrap();
+
+        let result = fingerprint.probe();
+        assert!(
+            result.is_err(),
+            "deleting model.safetensors with NO alternate weights file present must \
+             remain a typed refusal — no arm of the weights slot can satisfy a cold \
+             resolve — unchanged from before the round-10 reshape. Got {result:?}"
         );
     }
 }

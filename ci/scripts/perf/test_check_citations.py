@@ -13,6 +13,7 @@ Run directly: `python3 ci/scripts/perf/test_check_citations.py`
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -52,6 +53,38 @@ class CheckCitationsFixture(unittest.TestCase):
         return target
 
 
+def _run_git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+
+
+class GitFixture(CheckCitationsFixture):
+    """Base for the sha-relative artifact-citation tests: a THROWAWAY `git
+    init`'d repo (never this checkout), same discipline
+    `check_cuda_run_artifacts.py --self-test` already uses for ITS OWN
+    ancestry/shallow-checkout fixtures. Restores `cc._GIT_REPO_ROOT` in
+    addition to the `_KNOWN_FILES`/`_SEARCH_ROOTS` the parent class already
+    handles.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._orig_git_repo_root = cc._GIT_REPO_ROOT
+        self.addCleanup(self._restore_git_repo_root)
+        _run_git(["init", "-q"], self.root)
+        _run_git(["config", "user.email", "test@example.com"], self.root)
+        _run_git(["config", "user.name", "Test"], self.root)
+        cc._GIT_REPO_ROOT = self.root
+
+    def _restore_git_repo_root(self):
+        cc._GIT_REPO_ROOT = self._orig_git_repo_root
+
+    def _commit(self, message: str, repo: Path | None = None) -> str:
+        repo = repo or self.root
+        _run_git(["add", "-A"], repo)
+        _run_git(["commit", "-q", "-m", message], repo)
+        return _run_git(["rev-parse", "HEAD"], repo).stdout.strip()
+
+
 class ResolvableCitationsPass(CheckCitationsFixture):
     def test_identifier_immediately_before_citation_resolves(self):
         self._set_target("fake.rs", "line one\nlet peak_thing = compute();\nline three\n")
@@ -85,6 +118,48 @@ class ResolvableCitationsPass(CheckCitationsFixture):
         )
         violations = cc.check_file(src)
         self.assertEqual(violations, [])
+
+
+class LookbackWindowBacktickPairingTests(CheckCitationsFixture):
+    """A small, safe fix folded in alongside the M1b sha-relative work
+    (flagged while writing `docs/maintainer/fine-tune-performance-guide.md`'s
+    own row_lengths table row): the OLD `_find_adjacent_identifier` re-paired
+    backticks from a `text[start - 300 : start]` SLICE, not the full text.
+    When an earlier backtick-quoted span's OPENING backtick falls before the
+    slice boundary but its CLOSING backtick falls inside it, the slice
+    contains an orphan closing backtick with no partner -- every subsequent
+    backtick in the slice re-pairs one position off, misattributing the
+    wrong (garbled) text as "the identifier" for a citation that actually
+    had a perfectly good one. Pairing backticks against the FULL text FIRST,
+    then filtering to the window, makes this structurally unreachable.
+    """
+
+    def test_a_backtick_pair_straddling_the_lookback_window_boundary_does_not_misparse_the_next_identifier(self):
+        self._set_target("fake.rs", "line one\nlet real_ident = 1;\n")
+        # An EARLIER, unrelated backtick-quoted span (150 chars -- inside
+        # `_IDENT_RE`'s 200-char cap, so it forms a real pair) positioned so
+        # the 300-char lookback window's START lands INSIDE its content:
+        # the exact straddle shape `_CANONICALIZERS`'s real occurrence hit
+        # (an unrelated `identity_fields.IDENTITY_FIELD_CANONICALIZERS`
+        # mention earlier in the same table row). A window SLICE would see
+        # only this span's closing backtick, with no opening partner in
+        # range, and (since the run of filler afterward is short enough to
+        # stay under the 200-char cap too) mis-pair that orphan closing
+        # tick with `real_ident`'s own OPENING tick, garbling the result.
+        long_span = "`" + ("A" * 150) + "`"
+        filler = "z" * 184
+        src = self._write("doc.md", long_span + filler + "`real_ident` (fake.rs:2)\n")
+        text = src.read_text()
+        # Sanity-check the fixture actually straddles the window the way
+        # this test claims, so a future `_SEARCH_WINDOW`/`_IDENT_RE` edit
+        # fails LOUDLY here rather than silently testing nothing.
+        citation_start = text.index("fake.rs:2")
+        window_start = citation_start - cc._SEARCH_WINDOW
+        self.assertGreater(window_start, 1)
+        self.assertLess(window_start, len(long_span) - 1)
+
+        violations = cc.check_file(src)
+        self.assertEqual(violations, [], [str(v) for v in violations])
 
 
 class UnresolvableCitationsFail(CheckCitationsFixture):
@@ -249,6 +324,184 @@ class MainEntryPointTests(CheckCitationsFixture):
         self._write("doc.md", "see `peak_thing`, fake.rs:2\n")
         code = cc.main()
         self.assertEqual(code, 0)
+
+
+class ArtifactShaRelativeResolutionTests(GitFixture):
+    """M1b audit round: a citation inside a file under an `artifacts/`
+    directory that declares its own `git_sha` is append-only evidence —
+    resolved against THAT sha via `git show`, never against HEAD (the
+    category error that guaranteed `crates/jammi-kernels/artifacts/
+    cuda-runs/*.json`'s citations would break the moment ANY later,
+    unrelated commit moved the cited line). Every fixture here commits TWO
+    revisions of `target.rs` into a throwaway repo: `good_sha` (where the
+    citation is true) and a later HEAD (where the SAME line has moved) —
+    proving resolution reads the `good_sha` tree, never the working tree.
+    """
+
+    def _two_revisions(self) -> str:
+        """Commits `target.rs` with `peak_thing` at line 2, returns that
+        commit's sha, then commits a SECOND revision that pushes
+        `peak_thing` down to line 3 — so line 2 at HEAD is a DIFFERENT
+        statement, and a HEAD-relative resolution of `target.rs:2` would
+        find it stale (or a flat mismatch), while the returned sha's own
+        line 2 is still exactly right.
+        """
+        self._write("target.rs", "line one\nlet peak_thing = compute();\nline three\n")
+        good_sha = self._commit("good revision")
+        self._write(
+            "target.rs",
+            "inserted prefix line\nline one\nlet peak_thing = compute();\nline three\nextra tail\n",
+        )
+        self._commit("code moved on")
+        cc._KNOWN_FILES = {"target.rs": self.root / "target.rs"}
+        cc._SEARCH_ROOTS = (self.root,)
+        return good_sha
+
+    def test_artifact_citation_stale_at_head_but_true_at_git_sha_passes(self):
+        """RED MUTANT (a): true at the artifact's own recorded git_sha,
+        stale at HEAD -- must PASS."""
+        good_sha = self._two_revisions()
+        artifact = self._write(
+            "artifacts/fixture.json",
+            f'{{"git_sha": "{good_sha}", "_comment": "see `peak_thing`, target.rs:2"}}',
+        )
+        self._commit("add artifact")
+        violations = cc.check_file(artifact)
+        self.assertEqual(violations, [], [str(v) for v in violations])
+
+    def test_head_relative_resolution_of_the_same_citation_would_have_failed(self):
+        """Positive control for the test above: the SAME target.rs:2
+        citation, cited from a file NOT under `artifacts/` (so it stays
+        HEAD-resolved), genuinely fails -- proving the PASS above comes
+        from sha-relative resolution actually engaging, not from the
+        citation being trivially fine at HEAD too.
+        """
+        self._two_revisions()
+        doc = self._write("doc.md", "see `peak_thing`, target.rs:2\n")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1)
+        self.assertIn("STALE", violations[0].message)
+
+    def test_artifact_citation_false_even_at_its_own_git_sha_fails(self):
+        """RED MUTANT (b): the identifier is NOT present at the artifact's
+        own recorded git_sha either -- must FAIL, and the message must
+        attribute the mismatch to that recorded sha (never to "the code
+        moved since"), so a reader is not sent chasing HEAD drift for a
+        citation that was simply never true."""
+        good_sha = self._two_revisions()
+        artifact = self._write(
+            "artifacts/fixture.json",
+            f'{{"git_sha": "{good_sha}", "_comment": "see `totally_wrong_identifier`, target.rs:2"}}',
+        )
+        self._commit("add artifact")
+        violations = cc.check_file(artifact)
+        self.assertEqual(len(violations), 1)
+        self.assertIn("recorded git_sha", violations[0].message)
+        self.assertNotIn("STALE", violations[0].message)
+
+    def test_artifact_citation_out_of_bounds_at_its_own_git_sha_fails(self):
+        good_sha = self._two_revisions()
+        artifact = self._write(
+            "artifacts/fixture.json",
+            f'{{"git_sha": "{good_sha}", "_comment": "see `peak_thing`, target.rs:99"}}',
+        )
+        self._commit("add artifact")
+        violations = cc.check_file(artifact)
+        self.assertEqual(len(violations), 1)
+        self.assertIn("only has", violations[0].message)
+        self.assertIn(good_sha, violations[0].message)
+
+    def test_json_not_under_artifacts_dir_ignores_its_own_git_sha_field(self):
+        """A JSON file carrying a well-formed `git_sha` field but NOT
+        living under an `artifacts/` path segment is ordinary, living
+        prose (e.g. a moved-baseline fixture outside the artifacts tree)
+        -- it must keep resolving against HEAD, never opt into
+        sha-relative resolution just because the field happens to be
+        present."""
+        good_sha = self._two_revisions()
+        not_an_artifact = self._write(
+            "not-artifacts-dir/fixture.json",
+            f'{{"git_sha": "{good_sha}", "_comment": "see `peak_thing`, target.rs:2"}}',
+        )
+        self._commit("add non-artifact json")
+        violations = cc.check_file(not_an_artifact)
+        self.assertEqual(len(violations), 1)
+        self.assertIn("STALE", violations[0].message)
+
+    def test_artifact_json_without_git_sha_field_falls_back_to_head(self):
+        self._two_revisions()
+        artifact = self._write(
+            "artifacts/fixture.json",
+            '{"status": "RECORD", "_comment": "see `peak_thing`, target.rs:2"}',
+        )
+        self._commit("add artifact with no git_sha")
+        violations = cc.check_file(artifact)
+        self.assertEqual(len(violations), 1)
+        self.assertIn("STALE", violations[0].message)
+
+
+class ShallowCheckoutRefusalTests(unittest.TestCase):
+    """RED MUTANT (c): a GENUINE `git clone --depth 1` (not a simulated
+    flag), same technique `check_cuda_run_artifacts.py --self-test` uses
+    for its own shallow-checkout regression -- `citation resolver` needs
+    `fetch_depth: "0"` in `.github/workflows/ci.yml` for exactly this
+    reason.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._orig_known_files = cc._KNOWN_FILES
+        self._orig_roots = cc._SEARCH_ROOTS
+        self._orig_git_repo_root = cc._GIT_REPO_ROOT
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        cc._KNOWN_FILES = self._orig_known_files
+        cc._SEARCH_ROOTS = self._orig_roots
+        cc._GIT_REPO_ROOT = self._orig_git_repo_root
+
+    def test_shallow_clone_refuses_sha_relative_resolution(self):
+        src = Path(self._tmp.name) / "src"
+        src.mkdir()
+        _run_git(["init", "-q"], src)
+        _run_git(["config", "user.email", "test@example.com"], src)
+        _run_git(["config", "user.name", "Test"], src)
+
+        (src / "target.rs").write_text("line one\nlet peak_thing = compute();\n")
+        _run_git(["add", "-A"], src)
+        _run_git(["commit", "-q", "-m", "c1"], src)
+        good_sha = _run_git(["rev-parse", "HEAD"], src).stdout.strip()
+
+        artifacts_dir = src / "artifacts"
+        artifacts_dir.mkdir()
+        (artifacts_dir / "fixture.json").write_text(
+            f'{{"git_sha": "{good_sha}", "_comment": "see `peak_thing`, target.rs:2"}}'
+        )
+        (src / "unrelated.txt").write_text("x\n")
+        _run_git(["add", "-A"], src)
+        _run_git(["commit", "-q", "-m", "c2"], src)
+
+        clone = Path(self._tmp.name) / "clone"
+        clone_proc = _run_git(["clone", "-q", "--depth", "1", "file://" + str(src), str(clone)], src)
+        self.assertEqual(clone_proc.returncode, 0, clone_proc.stderr)
+
+        cc._GIT_REPO_ROOT = clone
+        cc._KNOWN_FILES = {"target.rs": clone / "target.rs"}
+        cc._SEARCH_ROOTS = (clone,)
+
+        self.assertTrue(cc._is_shallow_repository(), "a genuine `git clone --depth 1` was not detected as shallow")
+
+        artifact_in_clone = clone / "artifacts" / "fixture.json"
+        with self.assertRaises(cc.CitationError) as ctx:
+            cc.check_file(artifact_in_clone)
+        self.assertIn(cc.SHALLOW_CHECKOUT_MESSAGE, str(ctx.exception))
+
+        # `main()` surfaces the SAME CitationError as one explicit FAIL
+        # line, not a per-file traceback -- drives the real entry point,
+        # not just the internal helper.
+        code = cc.main()
+        self.assertEqual(code, 1)
 
 
 if __name__ == "__main__":

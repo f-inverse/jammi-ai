@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """Re-resolve every `finetune_step.rs:<n>` / `grad_oracle.rs:<n>` PATH:LINE
-citation under `crates/jammi-bench/**` and `ci/scripts/perf/**` against the
-actual file content AT HEAD — advisory (i), round-2 audit fix on PR #372.
+citation under `crates/jammi-bench/**`, `ci/scripts/perf/**`, and
+`crates/jammi-kernels/artifacts/cuda-runs/**` — against the actual file
+content AT HEAD for ordinary living files, or against the CITING artifact's
+own recorded `git_sha` for committed evidence (see this doc's own
+"Committed artifacts are append-only evidence" section below) — advisory
+(i), round-2 audit fix on PR #372; the artifact sha-relative resolution is
+the M1b audit round's own fix.
 
 WHY THIS EXISTS: round 1 of this fix round "corrected" a stale citation in
 `finetune_step.rs` (originally naming Rust source lines 253 through 264,
@@ -47,17 +52,81 @@ can mechanically check it against. For each citation found, this script:
        "the line number is in-bounds but points at different code now",
        which an in-bounds-only check (or eyeballing the diff) would miss.
 
+## Committed artifacts are append-only evidence, not living prose (M1b audit)
+
+A citation living inside a file under an `artifacts/` directory (any path
+segment named exactly `artifacts`, not just this repo's one instance today)
+that itself carries a top-level, well-formed `git_sha` is evidence ABOUT
+THAT SHA'S TREE — the run the artifact's `_comment`/`provenance` fields
+narrate was measured against the code as it stood at `git_sha`, and the
+artifact is never edited again to track later refactors (the class this
+repo's own `check_cuda_run_artifacts.py` schema already enforces: `git_sha`
+is "the measured tip, kept verbatim"). Re-resolving such a citation against
+HEAD is a category error, not a stricter check — it demands an edit to
+historical evidence every time ANY later commit moves the cited line,
+whether or not the artifact's claim about ITS OWN tree was ever wrong. Every
+`file.rs:<n>` citation found inside such a file is instead resolved via `git
+show <git_sha>:<path>` (this same repo's sha-relative provenance discipline,
+`check_cuda_run_artifacts.py`'s ancestry model, reused rather than
+reinvented) — a citation that was true at recording time PASSES regardless
+of how far the working tree has since drifted; a citation that was NEVER
+true even at its own declared sha still FAILS, now correctly attributed to
+the artifact's own authoring mistake rather than misreported as "the code
+moved". Every OTHER citing file (not under `artifacts/`, or an `artifacts/`
+file with no resolvable `git_sha`) keeps the HEAD-resolution behaviour above
+unchanged — living docs/scripts describe the code as it IS today, and their
+citations should track that.
+
+This needs REAL commit history to mean anything, the identical shallow-
+checkout hazard `check_cuda_run_artifacts.py`'s own rule (d) already
+documents: `git show <sha>:<path>` on a shallow clone (`actions/checkout`'s
+default `fetch-depth: 1`) fails to find a sha outside the single fetched
+commit, indistinguishable from a genuinely bad citation without checking
+first. `_require_history` checks `git rev-parse --is-shallow-repository`
+before the FIRST such lookup and raises one explicit, named `CitationError`
+("shallow checkout") instead of N misleading per-citation findings that
+would look like real drift — `.github/workflows/ci.yml`'s `citation
+resolver` leg is given `fetch_depth: "0"` for exactly this reason (only that
+one leg pays the deeper-clone cost; every other leg in that matrix stays at
+the normal shallow default).
+
 Run: `python3 ci/scripts/perf/check_citations.py`
-Hermetic: reads only files in the working tree; no network, no build.
+Hermetic for every non-artifact citation (reads only files in the working
+tree; no network, no build). An artifact-scoped citation additionally shells
+out to `git show`/`git rev-parse --is-shallow-repository` against the local
+checkout's own object database — still no network, no build, no GPU.
 """
 
 from __future__ import annotations
 
+import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+
+# The repo root every git subprocess call below runs against — a module
+# variable (not a hardcoded `REPO_ROOT` reference inside each helper) so
+# `test_check_citations.py` can monkeypatch it onto a throwaway `git
+# init`'d fixture repo, the SAME pattern this file's own `_KNOWN_FILES`/
+# `_SEARCH_ROOTS` already use for isolating a test from this repo's real
+# citation inventory.
+_GIT_REPO_ROOT = REPO_ROOT
+
+GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+SHALLOW_CHECKOUT_MESSAGE = (
+    "shallow checkout — sha-relative artifact-citation resolution needs real "
+    "commit history; use fetch-depth: 0"
+)
+
+
+class CitationError(Exception):
+    """Uncomputable input (a shallow checkout, when sha-relative resolution
+    is needed) — fails closed with ONE explicit message, never N misleading
+    per-citation findings that would look like real drift."""
 
 # The only `.rs` files this script currently knows how to resolve citations
 # against — both live under `crates/jammi-bench/src/`. Add a new mapping
@@ -99,6 +168,83 @@ _SEARCH_ROOTS = (
     REPO_ROOT / "ci" / "scripts" / "perf",
     REPO_ROOT / "crates" / "jammi-kernels" / "artifacts" / "cuda-runs",
 )
+
+
+# --------------------------------------------------------------------------- #
+# Artifact sha-relative resolution -- see the module doc's "Committed
+# artifacts are append-only evidence" section above.
+# --------------------------------------------------------------------------- #
+def _run_git(args: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *args], cwd=_GIT_REPO_ROOT, capture_output=True, text=True)
+
+
+def _is_shallow_repository() -> bool:
+    proc = _run_git(["rev-parse", "--is-shallow-repository"])
+    return proc.returncode == 0 and proc.stdout.strip() == "true"
+
+
+def _require_history() -> None:
+    """Checked before the FIRST `git show` an artifact-scoped citation
+    needs -- one explicit `CitationError` naming the shallow checkout,
+    never N misleading per-citation "does not resolve" findings that would
+    look like real drift (the same discipline `check_cuda_run_
+    artifacts.py`'s `run_gate` already applies to its own ancestry rule).
+    """
+    if _is_shallow_repository():
+        raise CitationError(SHALLOW_CHECKOUT_MESSAGE)
+
+
+def _artifact_git_sha(path: Path) -> str | None:
+    """The `git_sha` this citing file declares as ITS OWN evidence tree, or
+    `None` if `path` does not qualify for sha-relative resolution at all
+    (not under an `artifacts/` path segment, not JSON, unparsable, not an
+    object, or no well-formed top-level `git_sha`). A file that does not
+    qualify keeps the ordinary HEAD-resolution behaviour -- this is an
+    opt-IN narrowing (only files that both live under `artifacts/` AND
+    self-declare a resolved `git_sha` are evidence in the append-only
+    sense this function exists to detect), never a heuristic guess.
+    """
+    if "artifacts" not in path.parts or path.suffix != ".json":
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    sha = data.get("git_sha")
+    if isinstance(sha, str) and GIT_SHA_RE.match(sha):
+        return sha
+    return None
+
+
+def _git_relpath(target_path: Path) -> str | None:
+    """`target_path` (a `_KNOWN_FILES` entry, always absolute) expressed
+    relative to `_GIT_REPO_ROOT` in POSIX form, the shape `git show
+    <sha>:<relpath>` needs -- `None` if `target_path` does not sit under
+    `_GIT_REPO_ROOT` at all (never raises; the caller turns this into an
+    ordinary `Violation` instead of an uncomputable-input `CitationError`,
+    since an unresolvable relpath is a real finding about THIS citation,
+    not a global "history is missing" condition).
+    """
+    try:
+        return target_path.resolve().relative_to(_GIT_REPO_ROOT.resolve()).as_posix()
+    except ValueError:
+        return None
+
+
+def _lines_at_sha(sha: str, relpath: str) -> list[str] | None:
+    """`relpath`'s content at `sha`, split into lines -- `None` if `git
+    show` cannot read it there (the sha or the path does not resolve in
+    this checkout's object database at all; a distinct condition from "the
+    citation is stale", which needs a successful read to even evaluate).
+    """
+    _require_history()
+    proc = _run_git(["show", f"{sha}:{relpath}"])
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.splitlines()
+
 
 # A known filename, a colon, and a line number -- optionally wrapped in a
 # matched pair of backticks around the whole citation (both forms are used
@@ -150,13 +296,27 @@ _SEARCH_WINDOW = 300
 _COMMENT_CONTINUATION_RE = re.compile(r"\n[ \t]*(?:///|//|#)?[ \t]*")
 
 
-def _find_adjacent_identifier(text: str, citation_start: int) -> str | None:
-    window = text[max(0, citation_start - _SEARCH_WINDOW) : citation_start]
-    idents = list(_IDENT_RE.finditer(window))
-    if not idents:
+def _find_adjacent_identifier(ident_spans: list[re.Match], citation_start: int) -> str | None:
+    """`ident_spans` is EVERY backtick-quoted span in the FULL source text
+    (`_IDENT_RE.finditer(text)`, computed once per file by the caller) --
+    never re-paired from a text[start:end] slice. A slice cut at an
+    arbitrary character offset can land INSIDE a real backtick pair (its
+    opening backtick outside the slice, only its closing backtick inside),
+    which silently shifts which backticks pair with which for every
+    subsequent match in that slice -- a dense table row with several
+    citations close together can trip this (round-4 audit fold-in on PR
+    #372's own row_lengths addition hit it: a `` `...` `` pair straddling
+    the 300-char boundary made the NEXT citation's adjacent-identifier
+    lookup misfire on a truncated fragment like `') | '`). Operating on
+    globally-paired spans and only then filtering to the lookback window
+    makes that class of misparse structurally unreachable.
+    """
+    window_start = max(0, citation_start - _SEARCH_WINDOW)
+    candidates = [m for m in ident_spans if m.end() <= citation_start and m.start() >= window_start]
+    if not candidates:
         return None
-    last = idents[-1]
-    gap = _COMMENT_CONTINUATION_RE.sub(" ", window[last.end():])
+    last = candidates[-1]
+    gap = _COMMENT_CONTINUATION_RE.sub(" ", last.string[last.end() : citation_start])
     if _CONNECTOR_RE.match(gap):
         return last.group(1)
     return None
@@ -207,28 +367,69 @@ def check_file(path: Path) -> list[Violation]:
     except (UnicodeDecodeError, OSError):
         return violations
 
+    # This citing file's own evidence sha, if it is a qualifying artifact --
+    # computed ONCE per file (not per citation): every citation inside the
+    # SAME artifact resolves against the SAME tree.
+    artifact_sha = _artifact_git_sha(path)
+    ident_spans = list(_IDENT_RE.finditer(text))
+
     for m in _citation_re().finditer(text):
         cited_file = m.group("file")
         cited_line = int(m.group("line"))
         source_line_no = text.count("\n", 0, m.start()) + 1
 
         target_path = _KNOWN_FILES[cited_file]
-        if not target_path.exists():
-            violations.append(
-                Violation(path, source_line_no, f"cites {cited_file} but {target_path} does not exist")
-            )
-            continue
-        target_lines = target_path.read_text().splitlines()
-        if cited_line < 1 or cited_line > len(target_lines):
-            violations.append(
-                Violation(
-                    path, source_line_no,
-                    f"cites {cited_file}:{cited_line} but that file only has {len(target_lines)} lines",
-                )
-            )
-            continue
 
-        ident = _find_adjacent_identifier(text, m.start())
+        if artifact_sha is not None:
+            relpath = _git_relpath(target_path)
+            if relpath is None:
+                violations.append(
+                    Violation(
+                        path, source_line_no,
+                        f"cites {cited_file} sha-relative to this artifact's own git_sha "
+                        f"{artifact_sha}, but {target_path} does not resolve under "
+                        f"{_GIT_REPO_ROOT} for `git show`",
+                    )
+                )
+                continue
+            target_lines = _lines_at_sha(artifact_sha, relpath)
+            if target_lines is None:
+                violations.append(
+                    Violation(
+                        path, source_line_no,
+                        f"cites {cited_file}:{cited_line} sha-relative to this artifact's own "
+                        f"recorded git_sha {artifact_sha} (committed evidence is append-only -- "
+                        f"never re-resolved against HEAD), but `git show {artifact_sha}:{relpath}` "
+                        "could not read that file at that sha",
+                    )
+                )
+                continue
+            if cited_line < 1 or cited_line > len(target_lines):
+                violations.append(
+                    Violation(
+                        path, source_line_no,
+                        f"cites {cited_file}:{cited_line} but that file only has "
+                        f"{len(target_lines)} lines at this artifact's own git_sha {artifact_sha}",
+                    )
+                )
+                continue
+        else:
+            if not target_path.exists():
+                violations.append(
+                    Violation(path, source_line_no, f"cites {cited_file} but {target_path} does not exist")
+                )
+                continue
+            target_lines = target_path.read_text().splitlines()
+            if cited_line < 1 or cited_line > len(target_lines):
+                violations.append(
+                    Violation(
+                        path, source_line_no,
+                        f"cites {cited_file}:{cited_line} but that file only has {len(target_lines)} lines",
+                    )
+                )
+                continue
+
+        ident = _find_adjacent_identifier(ident_spans, m.start())
         if ident is None:
             violations.append(
                 Violation(
@@ -244,23 +445,40 @@ def check_file(path: Path) -> list[Violation]:
 
         cited_line_text = target_lines[cited_line - 1]
         if _normalize(ident) not in _normalize(cited_line_text):
-            violations.append(
-                Violation(
-                    path, source_line_no,
-                    f"cites {cited_file}:{cited_line} for identifier {ident!r}, but that line is "
-                    f"currently {cited_line_text.strip()!r} -- the citation is STALE (the code moved "
-                    "since this was written); re-resolve it against the file at HEAD",
+            if artifact_sha is not None:
+                violations.append(
+                    Violation(
+                        path, source_line_no,
+                        f"cites {cited_file}:{cited_line} for identifier {ident!r}, but that line "
+                        f"reads {cited_line_text.strip()!r} at this artifact's own recorded git_sha "
+                        f"{artifact_sha} -- the citation was never true at the tree this evidence "
+                        "describes (committed artifacts are append-only, sha-relative evidence -- "
+                        "never re-resolve this class of citation against HEAD; the citation's line "
+                        "number, or the sha it should have cited, is wrong and needs a hand fix)",
+                    )
                 )
-            )
+            else:
+                violations.append(
+                    Violation(
+                        path, source_line_no,
+                        f"cites {cited_file}:{cited_line} for identifier {ident!r}, but that line is "
+                        f"currently {cited_line_text.strip()!r} -- the citation is STALE (the code moved "
+                        "since this was written); re-resolve it against the file at HEAD",
+                    )
+                )
     return violations
 
 
 def main() -> int:
     all_violations: list[Violation] = []
     checked = 0
-    for path in _iter_source_files():
-        checked += 1
-        all_violations.extend(check_file(path))
+    try:
+        for path in _iter_source_files():
+            checked += 1
+            all_violations.extend(check_file(path))
+    except CitationError as exc:
+        print(f"check-citations: FAIL (uncomputable) — {exc}", file=sys.stderr)
+        return 1
 
     if all_violations:
         print("check-citations: FAIL", file=sys.stderr)
@@ -268,7 +486,8 @@ def main() -> int:
             print(f"  - {v}", file=sys.stderr)
         return 1
 
-    print(f"check-citations: {checked} file(s) scanned, all PATH:LINE citations resolve at HEAD.")
+    print(f"check-citations: {checked} file(s) scanned, all PATH:LINE citations resolve "
+          "(HEAD for living files, each artifact's own recorded git_sha for committed evidence).")
     return 0
 
 

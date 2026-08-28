@@ -635,6 +635,35 @@ rp_target_dir() { # $1=tree name (optional; default "jammi-ai")
   echo "/root/target-${t}"
 }
 
+# rsync creates only the LAST path component of its own destination — it
+# never mkdir -p's a whole missing chain. Nothing in the pod bootstrap or
+# the build-substrate seed provisions /root/trees itself (only
+# /root/jammi-ai, the default tree, exists from bootstrap), so the very
+# FIRST `push --tree <name>` against a name no session has ever pushed
+# before failed outright on a fresh pod: `rsync: mkdir "/root/trees/<name>"
+# failed: No such file or directory (2)` (esc-056, observed live on pod
+# u4hfsqyu0i2qwa, 2026-08-28) — a "push first" flow gpu-dev.sh's own header
+# doc and every recipe in dev-gpu-recipes.md document as the FIRST step for
+# a new tree. rp_push_ensure_parent issues a tiny, bounded remote `mkdir
+# -p` on the tree's PARENT directory (derived from tree_dir, never passed
+# separately, so a caller can never name a parent that disagrees with the
+# tree it is about to push into) over the SAME rp_run_remote primitive
+# every other pod-reaching verb in this file uses — idempotent: `mkdir -p`
+# against an already-existing parent (e.g. /root, the default "jammi-ai"
+# tree's own parent, already present from bootstrap) is a silent no-op, so
+# this runs unconditionally on every push, not just a tree's first one.
+# $1=tree_dir (the FULL tree path, e.g. /root/trees/mytree or
+# /root/jammi-ai).
+rp_push_ensure_parent() {
+  local tree_dir="${1:?rp_push_ensure_parent needs a tree dir}"
+  local parent_dir="${tree_dir%/*}"
+  [ -n "$parent_dir" ] || parent_dir="/"
+  rp_run_remote <<EOF
+set -uo pipefail
+mkdir -p '${parent_dir}'
+EOF
+}
+
 # The env-source + CARGO_TARGET_DIR + cd preamble shared by every remote
 # command that must run correctly as if it were an interactive shell in the
 # tree (an SSH login shell does not inherit the container's Dockerfile ENV —

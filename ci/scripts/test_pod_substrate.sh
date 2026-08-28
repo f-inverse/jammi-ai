@@ -3315,6 +3315,234 @@ PY
   fi
 }
 
+# ═════════════════════════════════════════════════════════════════════════
+# (y/esc-056) escape esc-056-pod-substrate-assumes-single-fresh-state,
+# member 1 (trees-root-not-provisioned): `push --tree <name>` rsyncs to
+# /root/trees/<name>/, but rsync creates only the LAST path component of
+# its own destination — nothing in the pod bootstrap or the build-substrate
+# seed provisions /root/trees itself, so the very FIRST push to a name no
+# session has ever pushed before failed on a fresh pod: `rsync: mkdir
+# "/root/trees/<name>" failed: No such file or directory (2)` (observed
+# live on pod u4hfsqyu0i2qwa, 2026-08-28). The fix, `rp_push_ensure_parent`
+# (runpod_lib.sh), runs a bounded, idempotent remote `mkdir -p` on the
+# tree's parent BEFORE gpu-dev.sh's push case ever calls rsync.
+# ═════════════════════════════════════════════════════════════════════════
+{
+  Y_GPU_DEV="$REPO_ROOT/ci/scripts/gpu-dev.sh"
+  Y_RUNPOD_LIB="$REPO_ROOT/ci/scripts/runpod_lib.sh"
+
+  # ---- structural: single-sourced, and BEFORE the rsync it protects ------
+  y_ensure_line="$(grep -n 'rp_push_ensure_parent "\$TREE_DIR"' "$Y_GPU_DEV" | head -1 | cut -d: -f1)"
+  y_rsync_line="$(grep -n 'rsync -azc --no-times --no-owner --no-group --delete' "$Y_GPU_DEV" | head -1 | cut -d: -f1)"
+  if [ -n "$y_ensure_line" ] && [ -n "$y_rsync_line" ] && [ "$y_ensure_line" -lt "$y_rsync_line" ]; then
+    ok "(y/esc-056) gpu-dev.sh's push case calls rp_push_ensure_parent \"\$TREE_DIR\" (line ${y_ensure_line}) BEFORE its own rsync (line ${y_rsync_line})"
+  else
+    bad "(y/esc-056) expected rp_push_ensure_parent \"\$TREE_DIR\" to precede push's own rsync in gpu-dev.sh (ensure_line=${y_ensure_line:-<none>} rsync_line=${y_rsync_line:-<none>})"
+  fi
+
+  # ---- reproduce the underlying defect on a REAL local rsync -------------
+  # No ssh/network needed to reproduce this: a purely LOCAL rsync (no -e,
+  # no host: syntax) exhibits the identical "creates only the last path
+  # component" behaviour — verified live against this box's own rsync
+  # binary, not asserted from the man page.
+  Y_PODROOT="$SANDBOX/y_podroot"
+  Y_SRC="$SANDBOX/y_src"
+  rm -rf "$Y_PODROOT" "$Y_SRC"
+  mkdir -p "$Y_PODROOT" "$Y_SRC"
+  echo hi > "$Y_SRC/file.txt"
+  Y_DEST="$Y_PODROOT/trees/freshtree"   # neither "trees" nor "freshtree" exists yet
+  y_before_out="$(rsync -a "$Y_SRC/" "$Y_DEST/" 2>&1)"; y_before_rc=$?
+  if [ "$y_before_rc" -ne 0 ] && printf '%s' "$y_before_out" | grep -qi 'no such file or directory'; then
+    ok "(y/esc-056 repro) a bare rsync into a destination whose PARENT ('trees') does not exist reproduces the defect (rc=$y_before_rc): $(printf '%s' "$y_before_out" | head -1)"
+  else
+    bad "(y/esc-056 repro) expected the bare rsync to fail naming a missing parent directory (rc=$y_before_rc): $y_before_out"
+  fi
+  [ -e "$Y_PODROOT/trees" ] && bad "(y/esc-056 repro) the failed rsync must not have created 'trees' either" \
+    || ok "(y/esc-056 repro) the failed rsync left NO trace of 'trees' — confirms rsync created zero components here, not one"
+
+  # ---- rp_push_ensure_parent, exercised for REAL (function-boundary ------
+  # intercept on rp_run_remote — this suite's own established technique,
+  # see leg (a)'s module doc: never mock ssh, capture/execute the heredoc
+  # rp_run_remote would have sent). The heredoc payload here is a plain,
+  # portable `mkdir -p '<path>'` — genuinely provable against a real local
+  # filesystem without any transport involved, so the override both
+  # CAPTURES the text (for the structural assertion below) AND actually
+  # RUNS it locally, proving real behaviour, not merely matching text.
+  # A real driver SCRIPT (not `bash -c` positionals): rp_run_remote is
+  # itself called with ZERO arguments by rp_push_ensure_parent, so an
+  # override that reads ITS OWN $1/$2 (scoped to how rp_run_remote was
+  # invoked, not to this outer script's own args) would read empty values —
+  # the capture path is threaded through an exported env var instead, the
+  # same shape leg (a)'s own CAPTURE variable uses.
+  Y_ENSURE_DRIVER="$SANDBOX/y_ensure_driver.sh"
+  cat > "$Y_ENSURE_DRIVER" <<'DRV'
+#!/usr/bin/env bash
+set -uo pipefail
+export RUNPOD_API_KEY=test-dummy-key
+export RP_SESSION_ROOT="${Y_DRV_SESSIONS}"
+export RP_SSH_CONFIG="${Y_DRV_SSH_CONFIG}"
+mkdir -p "$RP_SESSION_ROOT"
+# shellcheck disable=SC1090
+. "${Y_DRV_LIB}"
+rp_run_remote() { cat > "${Y_DRV_CAPTURE}"; bash "${Y_DRV_CAPTURE}"; }
+rp_push_ensure_parent "${Y_DRV_TREE_DIR}"
+DRV
+  chmod +x "$Y_ENSURE_DRIVER"
+
+  Y_CAPTURE="$SANDBOX/y_capture.txt"
+  Y_DRV_LIB="$Y_RUNPOD_LIB" Y_DRV_TREE_DIR="$Y_DEST" Y_DRV_CAPTURE="$Y_CAPTURE" \
+    Y_DRV_SESSIONS="$SANDBOX/y_sessions" Y_DRV_SSH_CONFIG="$SANDBOX/y_ssh_config" \
+    bash "$Y_ENSURE_DRIVER" > "$SANDBOX/y_ensure.out" 2>&1
+  y_ensure_rc=$?
+  if [ "$y_ensure_rc" -eq 0 ] && [ -d "$Y_PODROOT/trees" ] && grep -qF "mkdir -p '${Y_PODROOT}/trees'" "$Y_CAPTURE"; then
+    ok "(y/esc-056 fix) rp_push_ensure_parent's captured remote command is mkdir -p on the tree's PARENT, and running it for real creates '${Y_PODROOT}/trees'"
+  else
+    bad "(y/esc-056 fix) rp_push_ensure_parent did not provision the parent as expected (rc=$y_ensure_rc, captured: $(cat "$Y_CAPTURE" 2>/dev/null); out: $(cat "$SANDBOX/y_ensure.out"))"
+  fi
+
+  # ---- idempotent (a second call against an already-existing parent) ----
+  Y_DRV_LIB="$Y_RUNPOD_LIB" Y_DRV_TREE_DIR="$Y_DEST" Y_DRV_CAPTURE="$SANDBOX/y_capture2.txt" \
+    Y_DRV_SESSIONS="$SANDBOX/y_sessions" Y_DRV_SSH_CONFIG="$SANDBOX/y_ssh_config" \
+    bash "$Y_ENSURE_DRIVER" > "$SANDBOX/y_ensure2.out" 2>&1
+  [ $? -eq 0 ] && ok "(y/esc-056 fix) a second rp_push_ensure_parent against the now-existing parent is a silent no-op (mkdir -p is idempotent)" \
+    || bad "(y/esc-056 fix) a repeat call against an existing parent must still succeed: $(cat "$SANDBOX/y_ensure2.out")"
+
+  # ---- the SAME local rsync now succeeds once the parent is provisioned --
+  y_after_out="$(rsync -a "$Y_SRC/" "$Y_DEST/" 2>&1)"; y_after_rc=$?
+  if [ "$y_after_rc" -eq 0 ] && [ -f "$Y_DEST/file.txt" ]; then
+    ok "(y/esc-056 fix) the identical rsync that failed above now succeeds once rp_push_ensure_parent has provisioned the parent"
+  else
+    bad "(y/esc-056 fix) expected the post-fix rsync to succeed (rc=$y_after_rc): $y_after_out"
+  fi
+
+  # ---- revert-RED: neutering rp_push_ensure_parent's mkdir reproduces the
+  # ORIGINAL defect on a scratch copy of runpod_lib.sh, proving this leg is
+  # genuinely mutant-killing, not vacuous.
+  Y_MUTANT_LIB="$SANDBOX/y_runpod_lib_mutant.sh"
+  cp "$Y_RUNPOD_LIB" "$Y_MUTANT_LIB"
+  python3 - "$Y_MUTANT_LIB" <<'PY'
+import sys
+p = sys.argv[1]
+t = open(p).read()
+old = "  rp_run_remote <<EOF\nset -uo pipefail\nmkdir -p '${parent_dir}'\nEOF\n"
+new = "  :\n"
+assert old in t, "revert fixture: could not locate rp_push_ensure_parent's mkdir heredoc"
+open(p, "w").write(t.replace(old, new, 1))
+PY
+  Y_MUTANT_PODROOT="$SANDBOX/y_mutant_podroot"
+  rm -rf "$Y_MUTANT_PODROOT"; mkdir -p "$Y_MUTANT_PODROOT"
+  Y_MUTANT_DEST="$Y_MUTANT_PODROOT/trees/freshtree"
+  Y_DRV_LIB="$Y_MUTANT_LIB" Y_DRV_TREE_DIR="$Y_MUTANT_DEST" Y_DRV_CAPTURE="$SANDBOX/y_capture_mutant.txt" \
+    Y_DRV_SESSIONS="$SANDBOX/y_sessions_mutant" Y_DRV_SSH_CONFIG="$SANDBOX/y_ssh_config_mutant" \
+    bash "$Y_ENSURE_DRIVER" > "$SANDBOX/y_mutant_ensure.out" 2>&1
+  y_mutant_rsync_out="$(rsync -a "$Y_SRC/" "$Y_MUTANT_DEST/" 2>&1)"; y_mutant_rsync_rc=$?
+  if [ "$y_mutant_rsync_rc" -ne 0 ] && printf '%s' "$y_mutant_rsync_out" | grep -qi 'no such file or directory'; then
+    ok "(y/esc-056 revert-RED) neutering rp_push_ensure_parent's mkdir on a scratch copy reproduces the ORIGINAL defect (rc=$y_mutant_rsync_rc) — the fix is genuinely load-bearing"
+  else
+    bad "(y/esc-056 revert-RED) expected the neutered fix to reproduce the original failure (rc=$y_mutant_rsync_rc): $y_mutant_rsync_out"
+  fi
+}
+
+# ═════════════════════════════════════════════════════════════════════════
+# (z/esc-056) escape esc-056-pod-substrate-assumes-single-fresh-state,
+# member 2 (repo-root-from-script-location): gpu-dev.sh's REPO_ROOT is
+# derived from THIS SCRIPT's own on-disk location, never from $PWD. On a
+# multi-worktree laptop, invoking one tree's script copy from inside a
+# DIFFERENT tree silently pushed/ran/targeted the WRONG tree — observed
+# live during M1b (the push-stamp's own laptop_head field was the only
+# tell). push/run/target now REFUSE (exit 2, naming both paths) on a
+# mismatch, overridable via RP_ALLOW_ROOT_MISMATCH=1.
+# ═════════════════════════════════════════════════════════════════════════
+{
+  Z_GPU_DEV="$REPO_ROOT/ci/scripts/gpu-dev.sh"
+
+  # ---- refuses from a plain (non-git) mismatched cwd ----------------------
+  Z_PLAIN_CWD="$SANDBOX/z_plain_cwd"
+  rm -rf "$Z_PLAIN_CWD"; mkdir -p "$Z_PLAIN_CWD"
+  z_plain_out="$(cd "$Z_PLAIN_CWD" && RUNPOD_API_KEY=test-dummy-key bash "$Z_GPU_DEV" push somesession --tree x 2>&1)"; z_plain_rc=$?
+  if [ "$z_plain_rc" -eq 2 ] && printf '%s' "$z_plain_out" | grep -qF "REPO_ROOT=${REPO_ROOT}" \
+     && printf '%s' "$z_plain_out" | grep -qF "$Z_PLAIN_CWD" \
+     && printf '%s' "$z_plain_out" | grep -q 'RP_ALLOW_ROOT_MISMATCH'; then
+    ok "(z/esc-056) 'push' from a plain (non-git) mismatched cwd REFUSES (exit 2), naming REPO_ROOT, the cwd, and the override"
+  else
+    bad "(z/esc-056) expected a named refusal (rc=$z_plain_rc): $z_plain_out"
+  fi
+
+  # ---- refuses from a DIFFERENT real git checkout (exercises the git ------
+  # rev-parse --show-toplevel branch, not just the plain-cwd fallback) -----
+  Z_OTHER_REPO="$SANDBOX/z_other_repo"
+  rm -rf "$Z_OTHER_REPO"; mkdir -p "$Z_OTHER_REPO"
+  ( cd "$Z_OTHER_REPO" && git init -q && git config user.email a@b.c && git config user.name t \
+      && echo hi > f.txt && git add f.txt && git commit -q -m init )
+  Z_OTHER_TOPLEVEL="$(cd "$Z_OTHER_REPO" && git rev-parse --show-toplevel)"
+  z_other_out="$(cd "$Z_OTHER_REPO" && RUNPOD_API_KEY=test-dummy-key bash "$Z_GPU_DEV" run somesession echo hi 2>&1)"; z_other_rc=$?
+  if [ "$z_other_rc" -eq 2 ] && printf '%s' "$z_other_out" | grep -qF "REPO_ROOT=${REPO_ROOT}" \
+     && printf '%s' "$z_other_out" | grep -qF "$Z_OTHER_TOPLEVEL"; then
+    ok "(z/esc-056) 'run' from a DIFFERENT real git checkout REFUSES, naming the OTHER checkout's own git toplevel (not just \$PWD verbatim)"
+  else
+    bad "(z/esc-056) expected a named refusal citing the other repo's git toplevel (rc=$z_other_rc): $z_other_out"
+  fi
+
+  # ---- 'target' is gated too -----------------------------------------------
+  z_target_out="$(cd "$Z_PLAIN_CWD" && RUNPOD_API_KEY=test-dummy-key bash "$Z_GPU_DEV" target somesession sometree 2>&1)"; z_target_rc=$?
+  [ "$z_target_rc" -eq 2 ] && printf '%s' "$z_target_out" | grep -qF "REPO_ROOT=${REPO_ROOT}" \
+    && ok "(z/esc-056) 'target' is gated by the same cwd-mismatch check as push/run" \
+    || bad "(z/esc-056) expected 'target' to refuse too (rc=$z_target_rc): $z_target_out"
+
+  # ---- the override opts in deliberately -----------------------------------
+  z_override_out="$(cd "$Z_PLAIN_CWD" && RUNPOD_API_KEY=test-dummy-key RP_ALLOW_ROOT_MISMATCH=1 bash "$Z_GPU_DEV" push somesession --tree x 2>&1)"; z_override_rc=$?
+  if ! printf '%s' "$z_override_out" | grep -q 'RP_ALLOW_ROOT_MISMATCH=1 to override' && [ "$z_override_rc" -ne 2 ]; then
+    ok "(z/esc-056) RP_ALLOW_ROOT_MISMATCH=1 opts past the refusal (proceeds to the next real check — no live session — rather than the mismatch error; rc=$z_override_rc)"
+  else
+    bad "(z/esc-056) RP_ALLOW_ROOT_MISMATCH=1 did not bypass the mismatch refusal (rc=$z_override_rc): $z_override_out"
+  fi
+
+  # ---- the ordinary (matching) invocation is never false-positived --------
+  z_ok_out="$(cd "$REPO_ROOT" && RUNPOD_API_KEY=test-dummy-key bash "$Z_GPU_DEV" push somesession --tree x 2>&1)"; z_ok_rc=$?
+  if ! printf '%s' "$z_ok_out" | grep -q "this script's own location resolves to REPO_ROOT"; then
+    ok "(z/esc-056) invoking from REPO_ROOT itself never trips the mismatch refusal (rc=$z_ok_rc, a real 'no live session' failure downstream is expected and fine)"
+  else
+    bad "(z/esc-056) a matching cwd must never trip the mismatch refusal: $z_ok_out"
+  fi
+
+  # ---- verbs OUTSIDE {push,run,target} are never gated ---------------------
+  z_attach_out="$(cd "$Z_PLAIN_CWD" && RUNPOD_API_KEY=test-dummy-key bash "$Z_GPU_DEV" attach somesession 2>&1)"; z_attach_rc=$?
+  if ! printf '%s' "$z_attach_out" | grep -q "this script's own location resolves to REPO_ROOT"; then
+    ok "(z/esc-056) 'attach' (outside the gated verb set) is unaffected by a mismatched cwd (rc=$z_attach_rc, a real 'no live session' failure downstream is expected and fine)"
+  else
+    bad "(z/esc-056) 'attach' must never be gated by the cwd-mismatch check: $z_attach_out"
+  fi
+
+  # ---- revert-RED: a scratch copy with the guard neutered no longer -------
+  # refuses — proving this leg is genuinely mutant-killing. gpu-dev.sh
+  # resolves its own sibling runpod_lib.sh via $DIR (its own on-disk
+  # location), so a real copy of runpod_lib.sh must sit alongside the
+  # mutant for that resolution to find it (same technique used throughout
+  # this suite's other revert-RED fixtures, e.g. (m/A1 revert-RED)).
+  Z_MUTANT_ROOT="$SANDBOX/z_mutant_repo/ci/scripts"
+  rm -rf "$SANDBOX/z_mutant_repo"; mkdir -p "$Z_MUTANT_ROOT"
+  cp "$REPO_ROOT/ci/scripts/runpod_lib.sh" "$Z_MUTANT_ROOT/runpod_lib.sh"
+  Z_MUTANT_GPU_DEV="$Z_MUTANT_ROOT/gpu-dev.sh"
+  cp "$Z_GPU_DEV" "$Z_MUTANT_GPU_DEV"
+  python3 - "$Z_MUTANT_GPU_DEV" <<'PY'
+import re, sys
+p = sys.argv[1]
+t = open(p).read()
+m = re.search(r'\ncase "\$CMD" in\n  push\|run\|target\)\n.*?\n    ;;\nesac\n', t, re.S)
+assert m, "revert fixture: could not locate the push|run|target cwd-mismatch guard"
+t2 = t[:m.start()] + "\n" + t[m.end():]
+assert t2 != t
+open(p, "w").write(t2)
+PY
+  bash -n "$Z_MUTANT_GPU_DEV" || bad "(z/esc-056 revert-RED) the neutered gpu-dev.sh copy has a syntax error"
+  z_mut_out="$(cd "$Z_PLAIN_CWD" && RUNPOD_API_KEY=test-dummy-key bash "$Z_MUTANT_GPU_DEV" push somesession --tree x 2>&1)"; z_mut_rc=$?
+  if [ "$z_mut_rc" -ne 2 ] && ! printf '%s' "$z_mut_out" | grep -q "this script's own location resolves to REPO_ROOT"; then
+    ok "(z/esc-056 revert-RED) neutering the cwd-mismatch guard on a scratch copy silently proceeds past a mismatched cwd (rc=$z_mut_rc) — the guard is genuinely load-bearing"
+  else
+    bad "(z/esc-056 revert-RED) expected the neutered copy to NOT refuse (rc=$z_mut_rc): $z_mut_out"
+  fi
+}
+
 echo
 echo "test_pod_substrate: ${PASS} passed, ${FAIL} failed, ${SKIP} skipped"
 [ "$FAIL" -eq 0 ]

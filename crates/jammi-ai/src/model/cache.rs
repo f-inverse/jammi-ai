@@ -87,15 +87,58 @@ impl ModelCache {
         loop {
             let mut cache = self.inner.write().await;
 
-            // Fast path: already loaded
+            // Fast path: already loaded — but only after confirming the
+            // on-disk fingerprint captured at load time still matches
+            // (esc-058). `probe_freshness` is `stat`-only (never a re-hash /
+            // re-read), so this stays cheap; the write lock is the same one
+            // the fast path already held for `touch_lru`, not a new or wider
+            // one.
             if let Some(entry) = cache.entries.get(&id) {
-                entry.ref_count.fetch_add(1, Ordering::Acquire);
-                let guard = ModelGuard {
-                    model: Arc::clone(&entry.model),
-                    ref_count: Arc::clone(&entry.ref_count),
-                };
-                cache.touch_lru(&id);
-                return Ok(guard);
+                match entry.model.probe_freshness() {
+                    Ok(true) => {
+                        entry.ref_count.fetch_add(1, Ordering::Acquire);
+                        let guard = ModelGuard {
+                            model: Arc::clone(&entry.model),
+                            ref_count: Arc::clone(&entry.ref_count),
+                        };
+                        cache.touch_lru(&id);
+                        return Ok(guard);
+                    }
+                    Ok(false) => {
+                        // Stale: at least one fingerprinted file's
+                        // (len, mtime) diverged from load time. Evict via
+                        // the SAME removal machinery `evict_one` uses below
+                        // (dropping the `CacheEntry` releases its
+                        // `_gpu_permit` through the existing `Drop` impl —
+                        // this call site does not add a new eviction policy
+                        // or touch GPU memory tracking, it invokes the
+                        // existing one) and fall through to the
+                        // single-flight load below, which re-resolves and
+                        // re-hashes the CURRENT bytes.
+                        //
+                        // Deliberately unconditional (unlike `evict_one`,
+                        // which only evicts an idle `ref_count == 0` entry
+                        // for memory-pressure reasons): serving stale bytes
+                        // is a correctness bug, not a capacity one, so it
+                        // overrides the idle-only discipline. The realistic
+                        // trigger (`EmbeddingPipeline::run` drops its guard
+                        // immediately after reading `content_digest`, before
+                        // inference runs) has `ref_count == 0` here in
+                        // practice; a stale entry still actively in use by
+                        // another in-flight guard when this fires is a
+                        // narrow, documented residual — no narrower than the
+                        // fingerprint's own same-len/same-mtime blind spot.
+                        cache.entries.remove(&id);
+                        cache.lru_order.retain(|x| x != &id);
+                    }
+                    Err(e) => {
+                        // A fingerprinted file vanished or became unreadable
+                        // between load and this probe: a typed refusal (K2),
+                        // never a silent "treat as fresh" or "treat as
+                        // stale".
+                        return Err(e);
+                    }
+                }
             }
 
             // Single-flight: wait if another task is loading this model

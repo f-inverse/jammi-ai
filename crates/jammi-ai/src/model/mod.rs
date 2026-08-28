@@ -360,6 +360,41 @@ impl LoadedModel {
         }
     }
 
+    /// Stat-only warm-cache staleness probe (esc-058). `ModelCache::get_or_load`'s
+    /// fast path calls this before handing out the cached `Arc<LoadedModel>` —
+    /// re-`stat`ing (never re-reading) the same file set `content_digest` was
+    /// hashed from at load time and comparing `(len, mtime)` against the
+    /// load-time snapshot.
+    ///
+    /// - `Ok(true)` — unchanged (or nothing local to check — see below):
+    ///   serve from cache.
+    /// - `Ok(false)` — at least one fingerprinted file diverged: the caller
+    ///   must evict the entry and reload rather than serve.
+    /// - `Err` — a fingerprinted file vanished or became unreadable between
+    ///   load and this probe: a typed refusal (K2), never a silent "treat as
+    ///   fresh".
+    ///
+    /// **Honest residual** (see `backend::candle::ModelFingerprint`'s own
+    /// doc): `(len, mtime)` is a staleness TRIPWIRE, not a cryptographic
+    /// guarantee — a same-length, same-mtime content swap is invisible to
+    /// it. `content_digest`, recomputed fresh on every actual reload, remains
+    /// the sole authoritative attestation of the bytes that were hashed;
+    /// this probe only decides WHEN a reload is triggered.
+    ///
+    /// The ORT backend never actually reaches a loaded state today (see
+    /// `content_digest`'s doc), and more generally a backend whose
+    /// `content_digest` is `ModelContentDigest::Unavailable` (an
+    /// external-producer model with no local directory at all) has nothing
+    /// on disk that could go stale — for either, this vacuously reports
+    /// fresh rather than refusing, since "no local files to check" is not a
+    /// staleness condition.
+    pub fn probe_freshness(&self) -> Result<bool> {
+        match self {
+            LoadedModel::Candle(m) => m.fingerprint.probe(),
+            LoadedModel::Ort(_) => Ok(true),
+        }
+    }
+
     /// Estimate GPU memory for one inference batch.
     pub fn estimate_batch_memory(&self, batch_size: usize, seq_len: usize) -> usize {
         match self {

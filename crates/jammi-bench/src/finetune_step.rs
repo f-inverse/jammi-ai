@@ -99,6 +99,54 @@ fn validate_max_grad_norm(v: f32) -> Result<f32, InvalidMaxGradNorm> {
     }
 }
 
+/// A `--row-lengths` value that does not name a valid right-padded batch for
+/// this run's `(batch, seq)` -- either the count does not match `batch`, or
+/// some row's length is outside `1..=seq` (`0` is a REFUSAL in the B3-padded
+/// arm's own guard inventory; `> seq` cannot describe a real padded row of a
+/// `[batch, seq]` mask at all). A step this contract measures must be the
+/// step it claims to measure, so a bad explicit value is refused rather than
+/// silently building a mask that does not mean what the caller intended.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InvalidRowLengths(pub String);
+
+impl std::fmt::Display for InvalidRowLengths {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "--row-lengths is invalid: {}", self.0)
+    }
+}
+
+impl std::error::Error for InvalidRowLengths {}
+
+/// Refuse a `--row-lengths` whose shape cannot describe a real right-padded
+/// `[batch, seq]` batch: wrong element count, or any entry outside
+/// `1..=seq`. Never called when `row_lengths` is `None` (the ordinary dense
+/// case) -- this only guards a value the operator explicitly supplied.
+fn validate_row_lengths(
+    lengths: &[usize],
+    batch: usize,
+    seq: usize,
+) -> Result<(), InvalidRowLengths> {
+    if lengths.len() != batch {
+        return Err(InvalidRowLengths(format!(
+            "--row-lengths named {} length(s) but --batch is {batch} -- one length per row is \
+             required",
+            lengths.len()
+        )));
+    }
+    if let Some((row, &bad)) = lengths
+        .iter()
+        .enumerate()
+        .find(|&(_, &l)| l == 0 || l > seq)
+    {
+        return Err(InvalidRowLengths(format!(
+            "row {row}'s length {bad} is outside 1..={seq} -- 0 is a refusal in the B3-padded \
+             arm's own guard inventory (every row needs at least one real token), and a length \
+             above --seq {seq} cannot describe a real row of a [batch, seq] mask"
+        )));
+    }
+    Ok(())
+}
+
 /// How many times this run's step loop invoked the production
 /// [`clip_gradients`] — the counted fact backing the "clip on" A/B row,
 /// rather than a log line an operator has to trust. Process-wide, so both
@@ -292,6 +340,31 @@ pub struct FinetuneStepParams {
     /// never fired; this catches the process never having received the
     /// request it was TOLD to expect at all, at any point.
     pub expect_kernels_disabled: Option<Vec<String>>,
+    /// Per-row REAL (non-pad) lengths for a genuinely right-padded batch —
+    /// `lengths.len() == batch`, each `1 <= lengths[b] <= seq` (the B3-padded
+    /// flash arm's own guard inventory, contract v4 item 1: `total == 0`
+    /// -- every row length 0 -- is a REFUSAL in the ragged arm, and pooling
+    /// needs at least one real token per row regardless). `None` (the
+    /// default) is this tier's ORIGINAL, UNCHANGED behaviour: an all-ones
+    /// dense mask built by [`Tensor::ones`], `step_once` calling
+    /// `encoder.forward` (never `forward_with_lengths`) — see
+    /// [`crate::report::FinetuneStepTier::row_lengths`]'s own doc for why
+    /// this is the field's dense-leg IDENTITY value too (`[seq; batch]`),
+    /// not merely a param default. `Some(lengths)` builds a genuine
+    /// right-padded mask (row `b`'s first `lengths[b]` positions `1`, the
+    /// rest `0` -- RIGHT padding, the prefix shape `jammi_encoders`' B3-
+    /// padded flash arm validates -- see `build_fixture`'s `prefix_mask`)
+    /// and routes every forward through
+    /// [`jammi_encoders::ModernBert::forward_with_lengths`]'s trusted-
+    /// lengths path P (contract v4 §3.7), the one production entry point
+    /// that can reach the padded transport this leg exists to measure.
+    /// `lengths` is a TRUST boundary exactly as `forward_with_lengths`'
+    /// own doc describes: this tier does not re-derive lengths from a
+    /// device-side mask reduction, it builds `mask` FROM `lengths`
+    /// host-side, so the trust and the construction are the same act —
+    /// there is no way for the two to disagree here the way an external
+    /// caller's independently-sourced `lengths` could.
+    pub row_lengths: Option<Vec<usize>>,
 }
 
 /// Deterministic synthetic token ids, uniform over `[1, vocab)` so no id is the
@@ -392,7 +465,16 @@ fn build_fixture(
         },
     )?;
 
-    let mask = Tensor::ones((params.batch, params.seq), DType::U32, &device)?;
+    // `params.row_lengths` is `None` on every pre-existing call site (the
+    // ORIGINAL dense-only behaviour, bit-identical, never routed through
+    // `prefix_mask`): the mask stays the all-ones `Tensor::ones` this fixture
+    // always built, and `step_once` (called with `row_lengths: None`, see
+    // `run()`'s call sites) keeps calling `encoder.forward` -- never
+    // `forward_with_lengths` -- exactly as before this field existed.
+    let mask = match &params.row_lengths {
+        None => Tensor::ones((params.batch, params.seq), DType::U32, &device)?,
+        Some(lengths) => prefix_mask(lengths, params.seq, &device)?,
+    };
     let blocks: Vec<Tensor> = (0..3)
         .map(|i| {
             synthetic_ids(
@@ -406,6 +488,27 @@ fn build_fixture(
         .collect();
 
     Ok((encoder, opt, trainable_count, blocks, mask, varmap))
+}
+
+/// Build a genuine RIGHT-padded `[batch, seq]` prefix mask from per-row
+/// `lengths`: row `b`'s first `lengths[b]` positions are `1`, the rest `0`
+/// -- the exact prefix shape `jammi_encoders`' `resolve_lengths_and_prefix`
+/// trusts a `forward_with_lengths` caller to have built (that function's own
+/// doc: "a caller whose `lengths` do NOT actually match `mask`'s real
+/// padding structure gets a WRONG flash-eligibility decision, not a caught
+/// error" -- this is the one place in this tier that owns keeping the two in
+/// sync, by constructing `mask` FROM `lengths` rather than the reverse).
+/// `lengths` is assumed already validated by [`validate_row_lengths`] (every
+/// entry in `1..=seq`, `lengths.len() == batch`) -- called only from
+/// `build_fixture`, downstream of that check in `run()`.
+fn prefix_mask(lengths: &[usize], seq: usize, device: &Device) -> candle_core::Result<Tensor> {
+    let mut host = vec![0u32; lengths.len() * seq];
+    for (b, &len) in lengths.iter().enumerate() {
+        for s in 0..len.min(seq) {
+            host[b * seq + s] = 1;
+        }
+    }
+    Tensor::from_vec(host, (lengths.len(), seq), device)
 }
 
 /// One forward + cosine-margin triplet loss + backward + (optional) clip +
@@ -447,24 +550,54 @@ fn step_once(
     batched_forward: bool,
     trainable: &[Var],
     max_grad_norm: Option<f32>,
+    // `Some(lengths)` routes THIS call through `ModernBert::forward_with_lengths`
+    // (path P, contract v4 §3.7) building a genuine right-padded prefix mask from
+    // `lengths` instead of the dense all-ones mask `build_fixture` otherwise builds —
+    // see `FinetuneStepParams::row_lengths`'s own doc. `None` (every existing call
+    // site before this change) is bit-identical to this function's behaviour before
+    // `row_lengths` existed.
+    row_lengths: Option<&[usize]>,
 ) -> Result<f32, Box<dyn std::error::Error>> {
     let (a, p, n) = if batched_forward {
         // One forward over the concatenated groups, split after pooling —
         // the trainer's `encode_groups` shape.
         let joined = Tensor::cat(&[&blocks[0], &blocks[1], &blocks[2]], 0)?;
         let joined_mask = Tensor::cat(&[mask, mask, mask], 0)?;
-        let all = encoder.forward(&joined, &joined_mask)?;
+        let all = match row_lengths {
+            // Anchor/positive/negative share the SAME per-row lengths (they
+            // share `mask`, above) — concatenated three times in the SAME
+            // row order as `joined`/`joined_mask` (group 0's `batch` rows,
+            // then group 1's, then group 2's), so `joined_lengths[r]` names
+            // the real length of `joined`'s row `r` exactly.
+            Some(lengths) => {
+                let joined_lengths: Vec<usize> = lengths
+                    .iter()
+                    .copied()
+                    .cycle()
+                    .take(lengths.len() * 3)
+                    .collect();
+                encoder.forward_with_lengths(&joined, &joined_mask, Some(&joined_lengths))?
+            }
+            None => encoder.forward(&joined, &joined_mask)?,
+        };
         (
             all.narrow(0, 0, batch)?,
             all.narrow(0, batch, batch)?,
             all.narrow(0, 2 * batch, batch)?,
         )
     } else {
-        (
-            encoder.forward(&blocks[0], mask)?,
-            encoder.forward(&blocks[1], mask)?,
-            encoder.forward(&blocks[2], mask)?,
-        )
+        match row_lengths {
+            Some(lengths) => (
+                encoder.forward_with_lengths(&blocks[0], mask, Some(lengths))?,
+                encoder.forward_with_lengths(&blocks[1], mask, Some(lengths))?,
+                encoder.forward_with_lengths(&blocks[2], mask, Some(lengths))?,
+            ),
+            None => (
+                encoder.forward(&blocks[0], mask)?,
+                encoder.forward(&blocks[1], mask)?,
+                encoder.forward(&blocks[2], mask)?,
+            ),
+        }
     };
     let loss = triplet_loss(&a, &p, &n, 0.3)?;
     let mut grads = loss.backward()?;
@@ -528,6 +661,13 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     // paying for a build + warmup + measured steps to discover.
     if let Some(max_norm) = params.max_grad_norm {
         validate_max_grad_norm(max_norm)?;
+    }
+    // Same posture, for `--row-lengths`: a shape that cannot describe a real
+    // right-padded `[batch, seq]` batch is a caller error, refused before
+    // any device/checkpoint/tensor work -- never silently building a mask
+    // that does not mean what the caller intended.
+    if let Some(lengths) = &params.row_lengths {
+        validate_row_lengths(lengths, params.batch, params.seq)?;
     }
 
     // `--expect-kernels-disabled` (contract K-aux, round 2 advisory): the
@@ -666,6 +806,7 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
         params.batched_forward,
         &trainable,
         params.max_grad_norm,
+        params.row_lengths.as_deref(),
     )?;
 
     // Positive-proof channel for the fused-vs-eager LayerNorm A/B: a
@@ -721,6 +862,7 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
             params.batched_forward,
             &trainable,
             params.max_grad_norm,
+            params.row_lengths.as_deref(),
         )?;
         if step >= params.warmup {
             times.push(t0.elapsed().as_secs_f64());
@@ -811,6 +953,20 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
         target_modules: params.target_modules.clone(),
         batched_forward: params.batched_forward,
         max_grad_norm: params.max_grad_norm,
+        // IDENTITY (contract v4 §1's item 1, K7 audit: 17 -> 18 entries):
+        // the per-row lengths this leg actually fed the encoder -- the
+        // REQUESTED value when `--row-lengths` was supplied, or, on the
+        // ORIGINAL dense default (`params.row_lengths == None`), the value
+        // that describes the all-ones mask `build_fixture` built:
+        // `[seq; batch]` (every row's real length equals `seq`, the SAME
+        // discriminator `jammi_encoders`' `CompactedBatch::is_dense` uses:
+        // `lengths.iter().all(|&l| l == seq)`). Never `null` -- both
+        // producers always emit a concrete vector, so this field needs no
+        // `FINETUNE_NULL_IS_A_VALUE_FIELDS` entry (unlike `max_grad_norm`).
+        row_lengths: params
+            .row_lengths
+            .clone()
+            .unwrap_or_else(|| vec![params.seq; params.batch]),
         trainable_tensors: trainable_count,
         warmup: params.warmup,
         steps_measured: times.len(),
@@ -1046,6 +1202,7 @@ mod tests {
             batched_forward: true,
             max_grad_norm,
             expect_kernels_disabled: None,
+            row_lengths: None,
         }
     }
 
@@ -1174,6 +1331,7 @@ mod tests {
                 params.batched_forward,
                 &trainable,
                 max_grad_norm,
+                None,
             )
             .expect("step");
         }
@@ -1617,6 +1775,7 @@ mod tests {
             batched_forward: true,
             max_grad_norm: None,
             expect_kernels_disabled: None,
+            row_lengths: None,
         }
     }
 
@@ -1840,6 +1999,7 @@ mod tests {
             params.batched_forward,
             &o_trainable,
             None,
+            None,
         )
         .expect("oracle pre-step");
         // Call #2: PRE-update loss with exactly ONE prior update applied —
@@ -1853,6 +2013,7 @@ mod tests {
             params.batch,
             params.batched_forward,
             &o_trainable,
+            None,
             None,
         )
         .expect("oracle second step (this call's PRE-update loss is losses[0])");
@@ -1951,6 +2112,7 @@ mod tests {
             params.batched_forward,
             &trainable,
             None,
+            None,
         )
         .expect("one step");
 
@@ -2033,6 +2195,7 @@ mod tests {
                 params.batched_forward,
                 &trainable,
                 None,
+                None,
             )
             .expect("pre-step");
             step_once(
@@ -2043,6 +2206,7 @@ mod tests {
                 params.batch,
                 params.batched_forward,
                 &trainable,
+                None,
                 None,
             )
             .expect("observed step")
@@ -2432,5 +2596,167 @@ mod tests {
             "measured peak_vram_bytes must be a finite non-negative delta, got {v}"
         );
         assert_eq!(tier.peak_vram_bytes.unit, "bytes");
+    }
+
+    // ─── row_lengths / padded-fixture knob (contract v4 §1 item 1) ──────────
+
+    /// A4 (dense invariance): the DEFAULT (`row_lengths: None`, every
+    /// existing call site before this field existed) reports the dense-leg
+    /// IDENTITY value `[seq; batch]` -- see `FinetuneStepTier::row_lengths`'s
+    /// own doc for why this is the field's dense value, not merely the param
+    /// default. `tiny_params()` is `batch: 3, seq: 8`.
+    #[test]
+    fn row_lengths_defaults_to_the_dense_seq_vector_on_every_row() {
+        let tier = run(&tiny_params()).expect("finetune-step run");
+        assert_eq!(tier.row_lengths, vec![8, 8, 8]);
+    }
+
+    /// A4, the other half: every OTHER field on a dense (`row_lengths: None`)
+    /// leg is untouched by this field's addition -- two runs of the
+    /// identical dense params still agree bit-for-bit on `losses` (the same
+    /// property `clip_on_losses_are_bit_identical_across_processes` already
+    /// pins for the clip fields; this is the row_lengths-era re-proof that
+    /// adding the field did not perturb the dense call path at all).
+    #[test]
+    fn row_lengths_absent_does_not_perturb_the_dense_leg() {
+        let params = FinetuneStepParams {
+            warmup: 0,
+            steps: 1,
+            ..tiny_params()
+        };
+        let a = run(&params).expect("run 1");
+        let b = run(&params).expect("run 2");
+        assert_eq!(a.losses, b.losses);
+        assert_eq!(a.row_lengths, vec![8, 8, 8]);
+        assert_eq!(b.row_lengths, vec![8, 8, 8]);
+    }
+
+    /// `validate_row_lengths` refuses a count that does not match `--batch`.
+    #[test]
+    fn row_lengths_rejects_wrong_count() {
+        let params = FinetuneStepParams {
+            row_lengths: Some(vec![4, 4]), // tiny_params() batch is 3
+            ..tiny_params()
+        };
+        let err = run(&params).expect_err("mismatched row_lengths count must be refused");
+        assert!(
+            err.downcast_ref::<InvalidRowLengths>().is_some(),
+            "must be the typed InvalidRowLengths refusal, got: {err}"
+        );
+    }
+
+    /// `validate_row_lengths` refuses a zero-length row (the B3-padded arm's
+    /// own guard inventory: `total == 0` -- every row length 0 -- is a
+    /// REFUSAL, never a silently-accepted empty row).
+    #[test]
+    fn row_lengths_rejects_a_zero_length_row() {
+        let params = FinetuneStepParams {
+            row_lengths: Some(vec![4, 0, 8]), // tiny_params() batch is 3, seq is 8
+            ..tiny_params()
+        };
+        let err = run(&params).expect_err("a zero-length row must be refused");
+        assert!(
+            err.downcast_ref::<InvalidRowLengths>().is_some(),
+            "must be the typed InvalidRowLengths refusal, got: {err}"
+        );
+    }
+
+    /// `validate_row_lengths` refuses a length above `--seq` -- it cannot
+    /// describe a real row of a `[batch, seq]` mask.
+    #[test]
+    fn row_lengths_rejects_a_length_above_seq() {
+        let params = FinetuneStepParams {
+            row_lengths: Some(vec![4, 4, 9]), // tiny_params() seq is 8
+            ..tiny_params()
+        };
+        let err = run(&params).expect_err("a length above seq must be refused");
+        assert!(
+            err.downcast_ref::<InvalidRowLengths>().is_some(),
+            "must be the typed InvalidRowLengths refusal, got: {err}"
+        );
+    }
+
+    /// A genuinely padded, VALID `row_lengths` is accepted, routed through
+    /// [`ModernBert::forward_with_lengths`]'s trusted-lengths path P
+    /// end-to-end (a finite loss trajectory proves the forward/backward/step
+    /// sequence completed, not just that the params were accepted), and
+    /// reported back EXACTLY as requested -- the identity field is honest
+    /// about what this leg actually fed the encoder, not a re-derived or
+    /// rounded value.
+    #[test]
+    fn row_lengths_accepts_a_genuine_padded_batch_and_reports_it_back_exactly() {
+        let params = FinetuneStepParams {
+            row_lengths: Some(vec![4, 8, 2]), // tiny_params() batch is 3, seq is 8
+            warmup: 0,
+            steps: 1,
+            ..tiny_params()
+        };
+        let tier = run(&params).expect("finetune-step run over a genuinely padded batch");
+        assert_eq!(tier.row_lengths, vec![4, 8, 2]);
+        assert_eq!(tier.losses.len(), 1);
+        assert!(
+            tier.losses[0].is_finite(),
+            "padded-batch loss must be finite, got {}",
+            tier.losses[0]
+        );
+    }
+
+    /// POSITIVE CONTROL: `row_lengths` actually changes what the encoder
+    /// computes -- a genuinely padded batch (fewer real tokens averaged into
+    /// the mean-pool per row) produces a DIFFERENT loss than the fully dense
+    /// batch at the identical seed, proving the mask this tier built from
+    /// `row_lengths` was actually consumed by the forward, not silently
+    /// ignored (the same class of positive control
+    /// `finetune_step_positive_lora_dropout_actually_changes_the_computation`
+    /// exists for `lora_dropout`).
+    #[test]
+    fn row_lengths_padded_mask_actually_changes_the_computation_vs_dense() {
+        let dense_params = FinetuneStepParams {
+            warmup: 0,
+            steps: 1,
+            ..tiny_params()
+        };
+        let dense = run(&dense_params).expect("dense run");
+
+        let padded_params = FinetuneStepParams {
+            row_lengths: Some(vec![2, 8, 4]), // NOT all == seq (8) -- genuinely padded
+            warmup: 0,
+            steps: 1,
+            ..tiny_params()
+        };
+        let padded = run(&padded_params).expect("padded run");
+
+        assert_ne!(
+            dense.losses[0], padded.losses[0],
+            "a genuinely padded row_lengths must change the pooled forward's loss relative to              the fully dense batch at the identical seed -- if this ever holds, the mask built              from row_lengths is not being consumed by the forward"
+        );
+    }
+
+    /// `prefix_mask` builds the exact RIGHT-padded prefix shape
+    /// `jammi_encoders::resolve_lengths_and_prefix`'s `trusted_lengths`
+    /// branch trusts a `forward_with_lengths` caller to have built: row
+    /// `b`'s first `lengths[b]` positions `1`, the rest `0` -- read back
+    /// directly off the host, never inferred from a downstream forward's
+    /// behaviour alone.
+    #[test]
+    fn prefix_mask_builds_the_exact_right_padded_prefix_shape() {
+        let device = Device::Cpu;
+        let lengths = [2usize, 0, 5];
+        // `lengths` here intentionally includes a `0` -- `prefix_mask` itself
+        // does not validate (that is `validate_row_lengths`'s job, already
+        // proven above); this test only pins the SHAPE construction.
+        let seq = 5usize;
+        let mask = prefix_mask(&lengths, seq, &device).expect("build prefix mask");
+        let host: Vec<u32> = mask
+            .to_dtype(DType::U32)
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_vec1())
+            .expect("read mask");
+        let expected: Vec<u32> = vec![
+            1, 1, 0, 0, 0, // row 0: length 2
+            0, 0, 0, 0, 0, // row 1: length 0
+            1, 1, 1, 1, 1, // row 2: length 5 (== seq)
+        ];
+        assert_eq!(host, expected);
     }
 }

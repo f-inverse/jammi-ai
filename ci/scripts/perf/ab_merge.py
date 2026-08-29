@@ -1325,6 +1325,30 @@ FINETUNE_RUN_EXPECTED_ADMISSION_IS_DENSE = False
 # (the probe's own baseline), never the floor value itself.
 FINETUNE_RUN_LEARNING_HAPPENED_FLOOR = 0.0
 FINETUNE_RUN_TIE_FRACTION_CAP = 0.5
+
+# CONTRACT amendment 2026-08-29e (D*, post-RED-proof measurement): the
+# learning-happened premise is DECOMPOSED into two conjunctive premises --
+# `training_effective` (`|series[0] - series[-1]| > FLOOR`: the optimizer
+# demonstrably moved the model, direction-agnostic) and `train_direction`
+# (`sign(series[0] - series[-1])` must match the leg's own DECLARED
+# direction). Because `FINETUNE_RUN_LEARNING_HAPPENED_FLOOR == 0.0`,
+# `d > f <=> (|d| > f AND d > f)` for any `f >= 0` -- so for every leg whose
+# declared direction is DESCENT (every non-RED-proof leg: primary A/B both
+# arms, lr0 control, the alloff partner of a RED-proof column, and a
+# non-RED-proof mutant column's own fused-shaped leg), this decomposition is
+# BEHAVIOR-IDENTICAL to the pre-amendment single check `delta >
+# FINETUNE_RUN_LEARNING_HAPPENED_FLOOR` -- same firing condition, same set of
+# excluded legs, only the diagnostic MESSAGE differs (training_effective vs.
+# train_direction names which half failed). A RED-proof column's own MUTANT
+# leg is the one place `train_direction` can read `ASCENT` instead (see
+# `RED_PROOF_EXPECTED_TRAIN_DIRECTION` below) -- gradient ascent makes
+# `delta` negative BY DESIGN, so the pre-amendment descent-only check refused
+# exactly the strongest true positives of the RED-proof detection question
+# (the basis this amendment fixes; see docs/plans/63-how-well/CONTRACT.md's
+# own "Amendment 2026-08-29e" section for the full pressure-tested rationale
+# and falsifiers).
+FINETUNE_RUN_TRAIN_DIRECTION_DESCENT = "descent"
+FINETUNE_RUN_TRAIN_DIRECTION_ASCENT = "ascent"
 # unit-63 round-7 audit advisory (d): amendment 2026-08-29b item 4's boundary
 # constraint ("decaying LR schedules stay disabled for this tier until the
 # resume-cycle LR-horizon defect ... is fixed; the campaign's constant/
@@ -1593,7 +1617,7 @@ def finetune_run_probe_series_delta(label, tier):
     return [], series[0] - series[-1], series
 
 
-def finetune_run_named_arm_premise_violations(arm, tier):
+def finetune_run_named_arm_premise_violations(arm, tier, expected_train_direction=FINETUNE_RUN_TRAIN_DIRECTION_DESCENT):
     """`finetune_run_arm_premise_violations`'s own STRUCTURED core -- returns
     `[(premise_name, message), ...]` for the CONTRACT Frame's three
     conjunctive premise legs (`admission_is_dense`, `learning_happened`,
@@ -1604,6 +1628,23 @@ def finetune_run_named_arm_premise_violations(arm, tier):
     `finetune_run_arm_premise_violations` below is a thin wrapper over this
     for the existing flat `leg_premise_violations` field every other check
     in this module already appends to.
+
+    `expected_train_direction` (CONTRACT amendment 2026-08-29e, D*): the
+    `learning_happened` premise is internally decomposed into
+    `training_effective` (`|delta| > FLOOR`) and `train_direction`
+    (`sign(delta)` matches this parameter) -- both are STILL reported under
+    the single `"learning_happened"` premise name (never a new name), so
+    every EXISTING caller's `failing_premises` list is unaffected; only the
+    diagnostic message text differs between the two failure shapes. Defaults
+    to `FINETUNE_RUN_TRAIN_DIRECTION_DESCENT`, exactly today's behaviour for
+    every non-RED-proof call site (primary A/B, lr0 control, alloff partner,
+    a non-RED-proof mutant column's own fused-shaped leg) -- with
+    `FINETUNE_RUN_LEARNING_HAPPENED_FLOOR == 0.0`, `d > f <=> (|d| > f AND
+    d > f)`, so the decomposition is BEHAVIOR-IDENTICAL to the pre-amendment
+    single check at this default. Only `finetune_run_mutant_column_violations`
+    ever passes `FINETUNE_RUN_TRAIN_DIRECTION_ASCENT`, and only for a
+    RED-proof column's own mutant leg whose `patch_sha256` the committed
+    `RED_PROOF_EXPECTED_TRAIN_DIRECTION` table maps to `"ascent"`.
     """
     named = []
     schedule = tier.get("schedule")
@@ -1628,16 +1669,37 @@ def finetune_run_named_arm_premise_violations(arm, tier):
     series_violations, delta, _series = finetune_run_probe_series_delta(arm, tier)
     for msg in series_violations:
         named.append(("learning_happened", msg))
-    if not series_violations and not (delta > FINETUNE_RUN_LEARNING_HAPPENED_FLOOR):
-        named.append((
-            "learning_happened",
-            f"{arm}: learning_happened_delta={delta!r} (derived: train_probe_series[0] - "
-            f"train_probe_series[-1]) does not clear the floor "
-            f"({FINETUNE_RUN_LEARNING_HAPPENED_FLOOR}) -- the train-side probe shows no "
-            "observed learning, so this leg's held-out movement cannot be attributed to "
-            "training (the CONTRACT's own RED-control precedent: an lr=0 arm fails exactly "
-            "this leg)",
-        ))
+    if not series_violations:
+        # CONTRACT amendment 2026-08-29e (D*): training_effective, then
+        # train_direction -- see this function's own `expected_train_direction`
+        # doc above for the `d > f <=> (|d| > f AND d > f)` equivalence this
+        # decomposition preserves at the default (descent) direction.
+        training_effective = abs(delta) > FINETUNE_RUN_LEARNING_HAPPENED_FLOOR
+        if not training_effective:
+            named.append((
+                "learning_happened",
+                f"{arm}: learning_happened_delta={delta!r} (derived: train_probe_series[0] - "
+                f"train_probe_series[-1]) does not clear training_effective's floor "
+                f"(|delta| > {FINETUNE_RUN_LEARNING_HAPPENED_FLOOR}) -- the train-side probe "
+                "shows no observed learning, so this leg's held-out movement cannot be "
+                "attributed to training (the CONTRACT's own RED-control precedent: an lr=0 arm "
+                "fails exactly this leg)",
+            ))
+        else:
+            actual_direction = (
+                FINETUNE_RUN_TRAIN_DIRECTION_DESCENT if delta > 0.0 else FINETUNE_RUN_TRAIN_DIRECTION_ASCENT
+            )
+            if actual_direction != expected_train_direction:
+                named.append((
+                    "learning_happened",
+                    f"{arm}: learning_happened_delta={delta!r} (derived: train_probe_series[0] - "
+                    f"train_probe_series[-1]) clears training_effective's floor but its own "
+                    f"train_direction={actual_direction!r} does not match this leg's declared "
+                    f"direction={expected_train_direction!r} -- CONTRACT amendment 2026-08-29e "
+                    "(D*): a leg's held-out movement is only attributable to training when the "
+                    "train-side probe itself moved in the direction this leg was declared to move "
+                    "in",
+                ))
     tie = tier.get("tie_fraction")
     if not isinstance(tie, (int, float)) or isinstance(tie, bool) or not (tie < FINETUNE_RUN_TIE_FRACTION_CAP):
         named.append((
@@ -1649,19 +1711,22 @@ def finetune_run_named_arm_premise_violations(arm, tier):
     return named
 
 
-def finetune_run_arm_premise_violations(arm, tier):
+def finetune_run_arm_premise_violations(arm, tier, expected_train_direction=FINETUNE_RUN_TRAIN_DIRECTION_DESCENT):
     """Per-arm conjunctive premise legs (CONTRACT Frame / H4 -- see this
     module section's own doc for each leg's rationale): `admission_is_dense`
     matches the pre-registered `False`, `learning_happened_delta` (derived
-    from `train_probe_series`, amendment 2026-08-29b) clears its floor,
-    `tie_fraction` stays under its cap. Independent of, and IN ADDITION TO,
-    the cross-arm identity check (`generic_leg_premise_violations` over
-    `FINETUNE_RUN_IDENTITY_FIELDS`) -- this checks facts about ONE leg's own
-    report, never a comparison between two legs. Returns a list of strings,
-    empty when every leg clears -- `finetune_run_named_arm_premise_violations`
-    is the structured (premise-name-tagged) form this wraps.
+    from `train_probe_series`, amendment 2026-08-29b, decomposed into
+    `training_effective`/`train_direction` by amendment 2026-08-29e) clears
+    its floor in the declared direction, `tie_fraction` stays under its cap.
+    Independent of, and IN ADDITION TO, the cross-arm identity check
+    (`generic_leg_premise_violations` over `FINETUNE_RUN_IDENTITY_FIELDS`) --
+    this checks facts about ONE leg's own report, never a comparison between
+    two legs. Returns a list of strings, empty when every leg clears --
+    `finetune_run_named_arm_premise_violations` is the structured
+    (premise-name-tagged) form this wraps; `expected_train_direction` is
+    threaded straight through to it (see that function's own doc).
     """
-    return [msg for _name, msg in finetune_run_named_arm_premise_violations(arm, tier)]
+    return [msg for _name, msg in finetune_run_named_arm_premise_violations(arm, tier, expected_train_direction)]
 
 
 # ALLOFF_DISABLED_OP_BASES (unit-63 round-3 audit, class-fix discovery,
@@ -2788,6 +2853,65 @@ def is_red_proof_dose_label(dose_label):
     return dose_label.startswith(RED_PROOF_LABEL_PREFIX)
 
 
+# CONTRACT amendment 2026-08-29e (D*): the committed, merger-side table a
+# RED-proof column's own MUTANT leg's `train_direction` premise (see
+# `finetune_run_named_arm_premise_violations`'s own doc) is looked up from --
+# keyed on the FULL, case-folded (lowercased, stripped) `patch_sha256`,
+# NEVER on the operator-supplied `dose_label` (mutants/README.md's own
+# on-pod procedure already doubly-anchors this sha: the CLI `--mutant-legs`
+# spec and the producer's own stamped `mutant_patch_sha256` must already
+# agree, per `finetune_run_mutant_column_violations`'s own labeling-error
+# check below). There is NO CLI surface for this table -- no
+# operator-override channel exists, by design; a RED-proof column whose own
+# `patch_sha256` is absent here is REFUSED (INVALID), never defaulted to
+# either direction (see `red_proof_expected_train_direction`'s own doc).
+# `c81d0ed5...` transcribes the `M_signflip_v2` prediction committed at
+# 8f06a42c BEFORE its own legs ran ("gradient ASCENT on `adjusted_grad`'s
+# direction, every step, compounding for the length of the run",
+# mutants/README.md); `9b3c824d...` transcribes `M_nobc`'s own committed
+# uncertain-but-still-learning prediction (mutants/README.md's own
+# `M_nobc`/`M_signflip_v2` patch sha256 records).
+RED_PROOF_EXPECTED_TRAIN_DIRECTION = {
+    "c81d0ed59d45761bbd6487dbb23c5aaae22f30739c0e2e613d96c4901ad9b202": FINETUNE_RUN_TRAIN_DIRECTION_ASCENT,
+    "9b3c824dc041899c12c0e2d44d12a3ac8c7b86076ffc778638108925ba51bf4e": FINETUNE_RUN_TRAIN_DIRECTION_DESCENT,
+}
+
+
+def red_proof_expected_train_direction(dose_label, patch_sha256):
+    """This dose column's own MUTANT leg's declared `train_direction`
+    (CONTRACT amendment 2026-08-29e, D*): `FINETUNE_RUN_TRAIN_DIRECTION_DESCENT`
+    for every NON-RED-proof column (identical to today's behaviour -- see
+    `finetune_run_named_arm_premise_violations`'s own doc for the `d > f <=>
+    (|d| > f AND d > f)` equivalence this preserves), or the
+    `RED_PROOF_EXPECTED_TRAIN_DIRECTION` table entry keyed on `patch_sha256`
+    (case-folded, stripped, the SAME normalization every other sha
+    comparison in this module already applies) for a RED-proof-labeled
+    column.
+
+    Returns `(direction, violation)`: `violation` is `None` when a direction
+    was resolved (`direction` is then a real `FINETUNE_RUN_TRAIN_DIRECTION_*`
+    value); when a RED-proof column's own `patch_sha256` is absent from the
+    table, `direction` is `None` and `violation` names the refusal -- NEVER
+    defaulted to either direction, and never silently accepted as
+    descent-shaped, since a false "descent" default would apply the wrong
+    (and generally unsatisfiable) direction check to a mutant this table
+    simply has no record for.
+    """
+    if not is_red_proof_dose_label(dose_label):
+        return FINETUNE_RUN_TRAIN_DIRECTION_DESCENT, None
+    key = str(patch_sha256 or "").strip().lower()
+    direction = RED_PROOF_EXPECTED_TRAIN_DIRECTION.get(key)
+    if direction is None:
+        return None, (
+            f"{dose_label}: RED-proof column's own patch_sha256={patch_sha256!r} is not present "
+            "in the committed RED_PROOF_EXPECTED_TRAIN_DIRECTION table -- CONTRACT amendment "
+            "2026-08-29e (D*): a RED-proof column's declared train_direction is looked up from "
+            "this merger-side table keyed on the FULL patch sha, never defaulted to either "
+            "direction and never read from the operator-supplied dose_label"
+        )
+    return direction, None
+
+
 def mutant_leg_repeat_tag(dose_label):
     """The `repeat` slot a mutant leg's `.exit`/`.json`/`.stderr` triple is
     filed under (`load_finetune_run_leg(raw_dir, seed, "fused",
@@ -2811,7 +2935,11 @@ def finetune_run_mutant_column_violations(dose_label, patch_sha256, tier):
     `finetune_run_named_arm_premise_violations`) -- mutants/README.md's own
     "What M1 does NOT touch" section is precisely the claim that a mutant
     leg's premise/dispatch fields read IDENTICAL to a clean fused leg; only
-    the DECISION statistic (held-out loss) is supposed to differ. PLUS the
+    the DECISION statistic (held-out loss) is supposed to differ, EXCEPT the
+    `learning_happened` premise's own `train_direction` half, which CAN
+    legitimately read `ascent` for a RED-proof column (CONTRACT amendment
+    2026-08-29e, D* -- see `red_proof_expected_train_direction`'s own doc).
+    PLUS the
     mutant's own recorded provenance (unit-63 round-7 audit finding 1: these
     three fields are producer-stamped on `FinetuneRunTier` --
     `mutant_id`/`mutant_base_sha`/`mutant_patch_sha256`, serde-skipped when
@@ -2845,9 +2973,30 @@ def finetune_run_mutant_column_violations(dose_label, patch_sha256, tier):
     patch -- refused here by folding case at the ONE place this comparison
     is actually made, so it holds regardless of which side (if either)
     happens to have normalized its own case beforehand.
+
+    CONTRACT amendment 2026-08-29e (D*): this leg's own `train_direction`
+    (part of `finetune_run_named_arm_premise_violations`'s decomposed
+    `learning_happened` premise) is DESCENT for every non-RED-proof column,
+    or the `RED_PROOF_EXPECTED_TRAIN_DIRECTION` table entry keyed on
+    `patch_sha256` for a RED-proof-labeled one (`red_proof_expected_train_
+    direction`) -- a RED-proof column whose own `patch_sha256` is absent
+    from that table is a violation here too, named by that function's own
+    refusal message, never silently defaulted.
     """
     violations = list(finetune_run_dispatch_proof_violations("fused", tier))
-    violations += finetune_run_arm_premise_violations("fused", tier)
+    expected_direction, direction_violation = red_proof_expected_train_direction(dose_label, patch_sha256)
+    if direction_violation is not None:
+        violations.append(direction_violation)
+        # A missing table entry has no direction to check against -- the
+        # violation above already invalidates this leg (and, since
+        # `patch_sha256` is a per-COLUMN value, every seed sharing this dose
+        # column), so the fused-shaped premise check below still runs at the
+        # DEFAULT descent direction rather than being skipped outright --
+        # never silently dropping the OTHER premise legs (admission_is_dense/
+        # tie_fraction/schedule/training_effective) just because
+        # train_direction itself could not be resolved.
+        expected_direction = FINETUNE_RUN_TRAIN_DIRECTION_DESCENT
+    violations += finetune_run_arm_premise_violations("fused", tier, expected_direction)
     for field in ("mutant_id", "mutant_base_sha", "mutant_patch_sha256"):
         value = tier.get(field)
         if not value or not str(value).strip():
@@ -2882,7 +3031,12 @@ def build_mutant_dose_column(raw_dir, dose_label, patch_sha256, mutant_seeds):
     (unit-63 round-7 audit finding 2: the alloff PARTNER's own conjunctive
     premise legs -- `admission_is_dense`/`learning_happened`/`tie_fraction`
     -- are checked here too, not just the mutant side; a premise-failing
-    alloff partner excludes the PAIR), and, for every premise-clean pair,
+    alloff partner excludes the PAIR -- the alloff partner's OWN premises are
+    UNCHANGED by amendment 2026-08-29e, always checked at the default
+    (descent) direction), PLUS (CONTRACT amendment 2026-08-29e, D*, RED-proof
+    columns only) `init_anchor_equality` -- the mutant leg's own
+    `train_probe_series[0]` must equal this SAME alloff partner's
+    `train_probe_series[0]` exactly -- and, for every premise-clean pair,
     computes `d_i = mutant.held_out_example_mean - alloff.held_out_example_mean`
     -- mutant vs alloff is THE GATE'S OWN STATISTIC (amendment 2026-08-29b
     item 3: "mutant-vs-fused is explicitly NOT the sensitivity claim").
@@ -2968,6 +3122,29 @@ def build_mutant_dose_column(raw_dir, dose_label, patch_sha256, mutant_seeds):
         # true.
         alloff_named_violations = finetune_run_named_arm_premise_violations("alloff", alloff_tier)
         leg_violations += [msg for _name, msg in alloff_named_violations]
+        # CONTRACT amendment 2026-08-29e (D*), new compensating premise
+        # `init_anchor_equality`: a RED-proof mutant leg's own
+        # `train_probe_series[0]` (the untrained-init probe) must equal its
+        # alloff PARTNER's `train_probe_series[0]` EXACTLY -- a measured
+        # same-starting-model guarantee (the amendment's own basis: bit-
+        # identical 3.3236749470233917 across every previously committed leg
+        # and every signflip_v2 leg). Scoped to RED-proof-labeled columns
+        # only (never an eps-family dose) -- checked here, never inside
+        # `finetune_run_mutant_column_violations`, since only this function
+        # has BOTH tiers in hand.
+        if is_red_proof_dose_label(dose_label):
+            mutant_series = tier.get("train_probe_series")
+            alloff_series = alloff_tier.get("train_probe_series")
+            mutant_init = mutant_series[0] if isinstance(mutant_series, list) and mutant_series else None
+            alloff_init = alloff_series[0] if isinstance(alloff_series, list) and alloff_series else None
+            if mutant_init is None or alloff_init is None or mutant_init != alloff_init:
+                leg_violations.append(
+                    f"{dose_label} seed {seed}: RED-proof mutant leg's train_probe_series[0]="
+                    f"{mutant_init!r} does not exactly equal its alloff partner's "
+                    f"train_probe_series[0]={alloff_init!r} -- CONTRACT amendment 2026-08-29e "
+                    "(D*) init_anchor_equality: a RED-proof mutant leg must start from the SAME "
+                    "untrained-init probe as its alloff partner"
+                )
         d_i = None
         mutant_mean = tier.get("held_out_example_mean")
         alloff_mean = alloff_tier.get("held_out_example_mean")
@@ -3056,19 +3233,27 @@ class MutantDoseLadderSensitivityError(ValueError):
 
 
 class RedProofLabelError(ValueError):
-    """Raised by `partition_red_proof_dose_columns` when a `dose_label`
-    carries the RED-PROOF prefix (`RED_PROOF_LABEL_PREFIX`, `"redproof-"`)
-    but names no mutant after it (`dose_label == RED_PROOF_LABEL_PREFIX`
-    exactly, the bare `"redproof-"` label). A RED-proof column identifies a
-    specific named mutant outside the (1+eps) lr-scale family
-    (mutants/README.md's own "RED-proof mutants" section, e.g.
-    `redproof-nobc`, `redproof-signflip`) -- an empty name after the prefix
-    is refused loudly here, never silently accepted as an anonymous
-    RED-proof column. `main` catches this alongside
-    `MutantDoseLadderSensitivityError` and folds it into the same
-    `sensitivity_error`/non-zero-exit refusal path, the same
-    correctness-of-measurement carve-out every other typed refusal in this
-    module gets.
+    """Raised by `partition_red_proof_dose_columns` for a `dose_label`
+    carrying the RED-PROOF prefix (`RED_PROOF_LABEL_PREFIX`, `"redproof-"`)
+    that names no real mutant after it -- TWO arms, both refused loudly here,
+    never silently accepted as an anonymous RED-proof column:
+
+      1. the BARE prefix (`dose_label == RED_PROOF_LABEL_PREFIX` exactly,
+         `"redproof-"` with nothing after it at all).
+      2. a WHITESPACE-ONLY name after the prefix (unit-63 round-13 audit
+         advisory (c): `"redproof- "` / `"redproof-  "` reads as non-empty
+         under a bare `==` check against arm 1 alone, so it passed this same
+         edge undetected pre-fix and only failed loudly downstream, once
+         some later consumer treated the whitespace itself as an opaque
+         mutant name).
+
+    A RED-proof column identifies a specific named mutant outside the
+    (1+eps) lr-scale family (mutants/README.md's own "RED-proof mutants"
+    section, e.g. `redproof-nobc`, `redproof-signflip`) -- neither arm above
+    names one. `main` catches this alongside `MutantDoseLadderSensitivityError`
+    and folds it into the same `sensitivity_error`/non-zero-exit refusal
+    path, the same correctness-of-measurement carve-out every other typed
+    refusal in this module gets.
     """
 
 
@@ -3552,6 +3737,27 @@ def build_red_proof_summary(red_proof_dose_columns):
     return red_proof, red_proof_verdict
 
 
+# Unit-63 round-14 audit F6: the EXACT set of dose-ladder cause names this
+# module's own `main()` ties to a non-zero `exit_code` in its `finetune-run`
+# branch (see the `dose_ladder_causes` list built there) -- the SAME source
+# `howwell_dose_ladder_cause.py`'s own namer (`_ALL_CAUSE_NAMES`) is tested
+# against, so the two can never drift apart the way a hand-duplicated list on
+# each side could: `main()`'s own exit fold is now DATA over exactly this
+# set (a fold arm cannot exist without a name here), and
+# `test_howwell_dose_ladder_cause.py`'s cross-module test imports BOTH this
+# constant and the namer's own checked-cause set and asserts equality -- a
+# fifth cause added to one side without the other is a RED test, never
+# silent drift (the prior state this round's audit found: the namer's own
+# comment CLAIMED "can never drift apart" with nothing mechanical enforcing
+# it).
+DOSE_LADDER_EXIT_CAUSE_NAMES = (
+    "sensitivity_error",
+    "invalid dose column",
+    "dose_anomalies",
+    "red_proof_verdict",
+)
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
 
@@ -3773,51 +3979,70 @@ def main(argv=None):
                 dose_lines.append(f"  red_proof: {red_proof}")
                 dose_lines.append(f"  red_proof_verdict: {red_proof_verdict}")
             fr_table = fr_table + "\n" + "\n".join(dose_lines)
-            if sensitivity_error is not None:
-                print(
-                    f"finetune_run_ab mutant-dose-ladder: FAIL — {sensitivity_error}",
-                    file=sys.stderr,
-                )
-                exit_code = 1
             invalid_doses = [c["dose_label"] for c in dose_columns if c["detected"] == "INVALID"]
-            if invalid_doses:
-                print(
+            anomalous_doses = [a["dose_label"] for a in dose_anomalies]
+            # unit-63 round-14 audit F6: the dose-ladder exit fold is DATA,
+            # never four independently-hand-maintained `if` blocks -- each
+            # `(cause_name, triggered, message)` entry here is the ONE
+            # source of truth both this loop and (via
+            # `DOSE_LADDER_EXIT_CAUSE_NAMES`, asserted below) `howwell_
+            # dose_ladder_cause.py`'s own namer are tested against
+            # (`DoseLadderCauseNamesBoundToAbMergeExitFoldTests` in
+            # `test_howwell_dose_ladder_cause.py`) -- a fifth cause added
+            # here without a matching namer check is now a RED test, never
+            # silent drift. Order mirrors this fold's own historical
+            # ordering (sensitivity_error, invalid dose column,
+            # dose_anomalies, red_proof_verdict); the namer's own set
+            # equality check is order-independent.
+            dose_ladder_causes = [
+                (
+                    "sensitivity_error",
+                    sensitivity_error is not None,
+                    f"finetune_run_ab mutant-dose-ladder: FAIL — {sensitivity_error}",
+                ),
+                (
+                    "invalid dose column",
+                    bool(invalid_doses),
                     f"finetune_run_ab mutant-dose-ladder: FAIL — dose column(s) {invalid_doses} are "
                     "INVALID (correctness-of-measurement problem, see the table above)",
-                    file=sys.stderr,
-                )
-                exit_code = 1
-            if dose_anomalies:
-                # unit-63 round-9 audit finding 3: mirrors the primary
-                # decision rule's own RED_FOR_INVESTIGATION gate (below) --
-                # an anomalous improvement under deflation is investigated,
-                # never silently celebrated, even though it can never be a
-                # 'sensitivity' straddle member.
-                anomalous_doses = [a["dose_label"] for a in dose_anomalies]
-                print(
+                ),
+                (
+                    # unit-63 round-9 audit finding 3: mirrors the primary
+                    # decision rule's own RED_FOR_INVESTIGATION gate (below)
+                    # -- an anomalous improvement under deflation is
+                    # investigated, never silently celebrated, even though
+                    # it can never be a 'sensitivity' straddle member.
+                    "dose_anomalies",
+                    bool(dose_anomalies),
                     f"finetune_run_ab mutant-dose-ladder: FAIL — dose column(s) {anomalous_doses} "
                     "read RED_FOR_INVESTIGATION at a NEGATIVE eps (anomalous improvement under "
                     "deflation, see 'dose_anomalies' above) -- investigated, never silently "
                     "celebrated",
-                    file=sys.stderr,
-                )
-                exit_code = 1
-            if red_proof_verdict is not None and red_proof_verdict.startswith("NOT_PROVEN"):
-                # unit 63: NOT_PROVEN is a failure of THIS run's own purpose
-                # (a RED-proof column exists precisely to discharge
-                # acceptance 5's "mutant column proven RED" outside the
-                # (1+eps) family) -- named here exactly as it is recorded in
-                # the artifact's own 'red_proof_verdict', never silently
-                # passed through as green. PROVEN contributes nothing to
-                # `exit_code` here -- it is the EXPECTED outcome, unlike
-                # 'dose_anomalies' above.
-                print(
+                ),
+                (
+                    # unit 63: NOT_PROVEN is a failure of THIS run's own
+                    # purpose (a RED-proof column exists precisely to
+                    # discharge acceptance 5's "mutant column proven RED"
+                    # outside the (1+eps) family) -- named here exactly as
+                    # it is recorded in the artifact's own
+                    # 'red_proof_verdict', never silently passed through as
+                    # green. PROVEN contributes nothing to `exit_code` here
+                    # -- it is the EXPECTED outcome, unlike 'dose_anomalies'
+                    # above.
+                    "red_proof_verdict",
+                    red_proof_verdict is not None and red_proof_verdict.startswith("NOT_PROVEN"),
                     f"finetune_run_ab mutant-dose-ladder: FAIL — red_proof_verdict={red_proof_verdict!r} "
                     "-- acceptance 5's 'mutant column proven RED' is undischarged by every scheduled "
                     "RED-proof column",
-                    file=sys.stderr,
-                )
-                exit_code = 1
+                ),
+            ]
+            assert {name for name, _triggered, _message in dose_ladder_causes} == set(
+                DOSE_LADDER_EXIT_CAUSE_NAMES
+            ), "dose_ladder_causes drifted from the committed DOSE_LADDER_EXIT_CAUSE_NAMES set"
+            for _cause_name, triggered, message in dose_ladder_causes:
+                if triggered:
+                    print(message, file=sys.stderr)
+                    exit_code = 1
 
         os.makedirs(fr_out_dir, exist_ok=True)
         with open(os.path.join(fr_out_dir, "finetune_run_ab_report.json"), "w") as fh:

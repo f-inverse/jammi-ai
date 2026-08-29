@@ -219,10 +219,15 @@ if [ -n "$REPORT_JSON" ] && [ -f "$REPORT_JSON" ]; then
         # main decision does NOT itself force rc=0 -- the mutant dose ladder
         # (an INVALID dose column, a negative-eps dose_anomaly, a
         # sensitivity_error, or an undischarged RED-proof column --
-        # red_proof_verdict starting with "NOT_PROVEN", ab_merge.py:3777's
-        # own exit fold -- all folded into main()'s own exit code in
-        # ab_merge.py) can still fail the merge while the primary A/B
-        # decision itself reads GREEN. Name the actual cause here BY NAME,
+        # red_proof_verdict starting with "NOT_PROVEN") can still fail the
+        # merge while the primary A/B decision itself reads GREEN. Cited by
+        # FUNCTION/BEHAVIOR name, never by line number (round-11 audit
+        # advisory (b)'s own idiom -- ab_merge.py's own line numbers have
+        # already drifted past a prior version of this very comment, unit-63
+        # round-14 audit A1): `ab_merge.py`'s `main()` `finetune-run` branch
+        # own dose-ladder exit fold -- the `dose_ladder_causes` list built
+        # from `DOSE_LADDER_EXIT_CAUSE_NAMES` right before it folds each
+        # triggered cause into `exit_code`. Name the actual cause here BY NAME,
         # mirroring this script's own loud-naming idiom above, so a
         # GREEN-but-nonzero run is legible outside the collapsed log group
         # instead of looking like an unexplained contradiction -- this

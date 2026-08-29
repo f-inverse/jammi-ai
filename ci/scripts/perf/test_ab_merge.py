@@ -2325,13 +2325,22 @@ class FinetuneRunArmPremiseMutantTests(unittest.TestCase):
     # length-vs-epochs mismatch) -- proving none of the six is vacuous.
 
     def test_floor_fail_series_is_a_violation(self):
+        # CONTRACT amendment 2026-08-29e (D*): a ZERO delta fails
+        # `training_effective` itself (message text updated: no learning was
+        # observed at all -- see that function's own doc).
         tier = _finetune_run_tier(train_probe_series=[0.5, 0.5])  # delta == floor, not strictly >
         v = ab_merge.finetune_run_arm_premise_violations("fused", tier)
-        self.assertTrue(any("does not clear the floor" in m for m in v), v)
+        self.assertTrue(any("training_effective" in m and "floor" in m for m in v), v)
 
+        # A NEGATIVE delta (the probe got WORSE) clears `training_effective`
+        # (|delta| > 0) but fails `train_direction` (this leg's own declared
+        # direction stays DESCENT at this default call site) -- a DIFFERENT
+        # message than the zero-delta case above, though both still fail the
+        # single `"learning_happened"` premise name (behavior-identical: the
+        # leg is excluded from the decision exactly as it always was).
         tier2 = _finetune_run_tier(train_probe_series=[0.5, 0.51])  # delta negative (got WORSE)
         v2 = ab_merge.finetune_run_arm_premise_violations("fused", tier2)
-        self.assertTrue(any("does not clear the floor" in m for m in v2), v2)
+        self.assertTrue(any("train_direction" in m and "ascent" in m for m in v2), v2)
 
     def test_missing_series_is_a_violation(self):
         tier = _finetune_run_tier(train_probe_series=None)
@@ -4562,6 +4571,18 @@ class RedProofColumnTests(unittest.TestCase):
 
     PATCH_SHA = "eps0-02-patch-sha"
 
+    # CONTRACT amendment 2026-08-29e (D*): `RED_PROOF_EXPECTED_TRAIN_DIRECTION`
+    # is keyed on the FULL committed sha, never any arbitrary test string --
+    # a RED-proof-labeled column whose leg-building test wants a premise-CLEAN
+    # mutant leg (`_mutant_tier`'s own default `train_probe_series` reads
+    # DESCENT, `[0.55, 0.5]`) must cite the table's own DESCENT-mapped sha
+    # here, or every such leg fails the new `train_direction` premise
+    # (missing-from-table, in fact, since an arbitrary test sha is never a
+    # member of this table at all -- see `RedProofDStarPremiseTests` below
+    # for the dedicated missing-sha/ascent-path coverage).
+    REDPROOF_DESCENT_SHA = "9b3c824dc041899c12c0e2d44d12a3ac8c7b86076ffc778638108925ba51bf4e"
+    REDPROOF_ASCENT_SHA = "c81d0ed59d45761bbd6487dbb23c5aaae22f30739c0e2e613d96c4901ad9b202"
+
     def _write_alloff(self, raw_dir, seed, mean=0.50):
         _write_finetune_run_leg(
             raw_dir, seed, "alloff", "r1", _finetune_run_tier(arm="alloff", seed=seed, held_out_example_mean=mean)
@@ -4743,7 +4764,9 @@ class RedProofColumnTests(unittest.TestCase):
                     raw_dir,
                     seed,
                     "redproof-signflip",
-                    _mutant_tier(seed=seed, held_out_example_mean=mutant_mean, mutant_patch_sha256="sha-signflip"),
+                    _mutant_tier(
+                        seed=seed, held_out_example_mean=mutant_mean, mutant_patch_sha256=self.REDPROOF_DESCENT_SHA
+                    ),
                 )
             seeds_s = ",".join(str(s) for s in range(1, 13))
             rc = ab_merge.main(
@@ -4755,7 +4778,7 @@ class RedProofColumnTests(unittest.TestCase):
                     "",
                     "--allow-missing-lr0-control",
                     "--mutant-legs",
-                    f"redproof-signflip:sha-signflip:{seeds_s}",
+                    f"redproof-signflip:{self.REDPROOF_DESCENT_SHA}:{seeds_s}",
                 ]
             )
             with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
@@ -4768,7 +4791,7 @@ class RedProofColumnTests(unittest.TestCase):
         self.assertEqual(ladder["red_proof"], [
             {
                 "dose_label": "redproof-signflip",
-                "patch_sha256": "sha-signflip",
+                "patch_sha256": self.REDPROOF_DESCENT_SHA,
                 "detected": "RED",
                 "n_pos": ladder["doses"][0]["n_pos"],
                 "n_neg": ladder["doses"][0]["n_neg"],
@@ -4805,7 +4828,9 @@ class RedProofColumnTests(unittest.TestCase):
                     raw_dir,
                     seed,
                     "redproof-nobc",
-                    _mutant_tier(seed=seed, held_out_example_mean=mutant_mean, mutant_patch_sha256="sha-nobc"),
+                    _mutant_tier(
+                        seed=seed, held_out_example_mean=mutant_mean, mutant_patch_sha256=self.REDPROOF_DESCENT_SHA
+                    ),
                 )
             seeds_s = ",".join(str(s) for s in range(1, 13))
             rc = ab_merge.main(
@@ -4817,7 +4842,7 @@ class RedProofColumnTests(unittest.TestCase):
                     "",
                     "--allow-missing-lr0-control",
                     "--mutant-legs",
-                    f"redproof-nobc:sha-nobc:{seeds_s}",
+                    f"redproof-nobc:{self.REDPROOF_DESCENT_SHA}:{seeds_s}",
                 ]
             )
             with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
@@ -4852,7 +4877,9 @@ class RedProofColumnTests(unittest.TestCase):
                     raw_dir,
                     seed,
                     "redproof-signflip",
-                    _mutant_tier(seed=seed, held_out_example_mean=redproof_mean, mutant_patch_sha256="sha-signflip"),
+                    _mutant_tier(
+                        seed=seed, held_out_example_mean=redproof_mean, mutant_patch_sha256=self.REDPROOF_DESCENT_SHA
+                    ),
                 )
             seeds_s = ",".join(str(s) for s in range(1, 13))
             rc = ab_merge.main(
@@ -4866,7 +4893,7 @@ class RedProofColumnTests(unittest.TestCase):
                     "--mutant-legs",
                     f"eps-0.50:sha-eps-neg50:{seeds_s}",
                     "--mutant-legs",
-                    f"redproof-signflip:sha-signflip:{seeds_s}",
+                    f"redproof-signflip:{self.REDPROOF_DESCENT_SHA}:{seeds_s}",
                 ]
             )
             with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
@@ -4964,7 +4991,9 @@ class RedProofColumnTests(unittest.TestCase):
                     raw_dir,
                     seed,
                     "redproof-nobc",
-                    _mutant_tier(seed=seed, held_out_example_mean=mutant_mean, mutant_patch_sha256="sha-nobc"),
+                    _mutant_tier(
+                        seed=seed, held_out_example_mean=mutant_mean, mutant_patch_sha256=self.REDPROOF_DESCENT_SHA
+                    ),
                 )
             seeds_s = ",".join(str(s) for s in range(1, 13))
             rc = ab_merge.main(
@@ -4976,7 +5005,7 @@ class RedProofColumnTests(unittest.TestCase):
                     "",
                     "--allow-missing-lr0-control",
                     "--mutant-legs",
-                    f"redproof-nobc:sha-nobc:{seeds_s}",
+                    f"redproof-nobc:{self.REDPROOF_DESCENT_SHA}:{seeds_s}",
                 ]
             )
             with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
@@ -5080,6 +5109,235 @@ class RedProofColumnTests(unittest.TestCase):
         self.assertIn("same mutant measured twice", ladder["sensitivity_error"])
         self.assertIsNone(ladder["red_proof_verdict"])
         self.assertEqual(ladder["red_proof"], [])
+
+
+class RedProofDStarPremiseTests(unittest.TestCase):
+    """CONTRACT amendment 2026-08-29e (D*): the learning-happened premise
+    decomposed into `training_effective`/`train_direction`, the committed
+    `RED_PROOF_EXPECTED_TRAIN_DIRECTION` table, and the new
+    `init_anchor_equality` premise for RED-proof mutant legs. The primary
+    A/B, lr0-control, and alloff-partner call sites are proven
+    behavior-identical by the (unmodified except message-text) 222 tests
+    this suite already carried before this class -- this class covers only
+    the NEW behavior D* adds.
+    """
+
+    ASCENT_SHA = "c81d0ed59d45761bbd6487dbb23c5aaae22f30739c0e2e613d96c4901ad9b202"
+    DESCENT_SHA = "9b3c824dc041899c12c0e2d44d12a3ac8c7b86076ffc778638108925ba51bf4e"
+
+    def _write_alloff(self, raw_dir, seed, mean=0.50, train_probe_series=None):
+        overrides = {"held_out_example_mean": mean}
+        if train_probe_series is not None:
+            overrides["train_probe_series"] = train_probe_series
+        _write_finetune_run_leg(
+            raw_dir, seed, "alloff", "r1", _finetune_run_tier(arm="alloff", seed=seed, **overrides)
+        )
+
+    def test_red_proof_expected_train_direction_table_pinned(self):
+        # The table itself, pinned exactly -- a change here is a change to
+        # this amendment's own committed basis, never an incidental refactor.
+        self.assertEqual(
+            ab_merge.RED_PROOF_EXPECTED_TRAIN_DIRECTION,
+            {
+                self.ASCENT_SHA: "ascent",
+                self.DESCENT_SHA: "descent",
+            },
+        )
+        self.assertEqual(ab_merge.FINETUNE_RUN_TRAIN_DIRECTION_ASCENT, "ascent")
+        self.assertEqual(ab_merge.FINETUNE_RUN_TRAIN_DIRECTION_DESCENT, "descent")
+
+    def test_expected_direction_defaults_descent_for_non_redproof_label(self):
+        direction, violation = ab_merge.red_proof_expected_train_direction("eps-0.50", "anything-at-all")
+        self.assertEqual(direction, ab_merge.FINETUNE_RUN_TRAIN_DIRECTION_DESCENT)
+        self.assertIsNone(violation)
+
+    def test_expected_direction_looks_up_case_folded_and_stripped(self):
+        direction, violation = ab_merge.red_proof_expected_train_direction(
+            "redproof-signflip-v2", f"  {self.ASCENT_SHA.upper()}  "
+        )
+        self.assertEqual(direction, "ascent")
+        self.assertIsNone(violation)
+
+    def test_expected_direction_missing_sha_is_refused_never_defaulted(self):
+        direction, violation = ab_merge.red_proof_expected_train_direction("redproof-bogus", "deadbeef" * 8)
+        self.assertIsNone(direction)
+        self.assertIsNotNone(violation)
+        self.assertIn("not present", violation)
+        self.assertIn("RED_PROOF_EXPECTED_TRAIN_DIRECTION", violation)
+
+    def test_ascent_redproof_mutant_leg_with_ascending_series_clears_learning_happened(self):
+        # The amendment's own core discharge: a RED-proof mutant whose
+        # train probe ASCENDS (gradient ascent, by design) must no longer be
+        # refused by a descent-only learning-happened check. series[0]
+        # matches `_finetune_run_tier`'s own default alloff init (0.55) so
+        # `init_anchor_equality` also clears.
+        tier = _mutant_tier(train_probe_series=[0.55, 20.25], mutant_patch_sha256=self.ASCENT_SHA)
+        violations = ab_merge.finetune_run_mutant_column_violations("redproof-signflip-v2", self.ASCENT_SHA, tier)
+        self.assertEqual(violations, [])
+
+    def test_same_ascending_series_fails_under_the_default_descent_direction(self):
+        # Negative control: WITHOUT the ascent-direction override (the
+        # pre-amendment shape, and still the correct behaviour for every
+        # non-RED-proof leg), an ascending series fails train_direction.
+        tier = _mutant_tier(train_probe_series=[0.55, 20.25])
+        violations = ab_merge.finetune_run_arm_premise_violations("fused", tier)
+        self.assertTrue(any("train_direction" in m and "descent" in m for m in violations), violations)
+
+    def test_missing_table_sha_is_a_named_violation_on_the_mutant_leg(self):
+        unlisted_sha = "deadbeef" * 8
+        tier = _mutant_tier(mutant_patch_sha256=unlisted_sha)
+        violations = ab_merge.finetune_run_mutant_column_violations("redproof-unknown", unlisted_sha, tier)
+        self.assertTrue(
+            any("RED_PROOF_EXPECTED_TRAIN_DIRECTION" in v and "not present" in v for v in violations), violations
+        )
+
+    def test_missing_table_sha_invalidates_the_whole_column_never_defaulted(self):
+        # Every seed shares the SAME (missing) patch_sha256, so every leg in
+        # the column fails -- clean_pair_count collapses to 0 -> INVALID,
+        # never silently defaulted to a descent (or any other) direction.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            unlisted_sha = "deadbeef" * 8
+            for seed in (1, 2):
+                self._write_alloff(raw_dir, seed)
+                _write_mutant_leg(
+                    raw_dir, seed, "redproof-unknown", _mutant_tier(seed=seed, mutant_patch_sha256=unlisted_sha)
+                )
+            column = ab_merge.build_mutant_dose_column(raw_dir, "redproof-unknown", unlisted_sha, [1, 2])
+        self.assertEqual(column["detected"], "INVALID")
+        self.assertEqual(column["clean_pair_count"], 0)
+        self.assertTrue(any("RED_PROOF_EXPECTED_TRAIN_DIRECTION" in v for v in column["violations"]))
+
+    def test_init_anchor_equality_mismatch_is_a_violation(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            seed = 1
+            self._write_alloff(raw_dir, seed)  # default train_probe_series[0] == 0.55
+            _write_mutant_leg(
+                raw_dir,
+                seed,
+                "redproof-nobc",
+                _mutant_tier(
+                    seed=seed,
+                    mutant_patch_sha256=self.DESCENT_SHA,
+                    train_probe_series=[0.60, 0.50],  # series[0]=0.60 != alloff's 0.55
+                ),
+            )
+            column = ab_merge.build_mutant_dose_column(raw_dir, "redproof-nobc", self.DESCENT_SHA, [seed])
+        self.assertTrue(any("init_anchor_equality" in v for v in column["violations"]), column["violations"])
+        self.assertIsNone(column["per_seed"]["1"]["d_i"])
+
+    def test_init_anchor_equality_holds_when_series_zero_matches(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            seed = 1
+            self._write_alloff(raw_dir, seed)  # default train_probe_series[0] == 0.55
+            _write_mutant_leg(
+                raw_dir,
+                seed,
+                "redproof-nobc",
+                _mutant_tier(
+                    seed=seed,
+                    held_out_example_mean=0.30,  # != alloff's default 0.50 (a nonzero, non-tied d_i)
+                    mutant_patch_sha256=self.DESCENT_SHA,
+                    train_probe_series=[0.55, 0.40],
+                ),
+            )
+            column = ab_merge.build_mutant_dose_column(raw_dir, "redproof-nobc", self.DESCENT_SHA, [seed])
+        # single-seed column: `clean_pair_count != MUTANT_GATE_SEED_COUNT`
+        # (12) is its own, EXPECTED violation here -- this test's own point
+        # is that THIS seed's own leg-level violations stay empty (matching
+        # init anchors), never that the whole 1-seed column reads clean.
+        self.assertEqual(column["per_seed"]["1"]["violations"], [])
+
+    def test_init_anchor_equality_never_checked_for_eps_family_columns(self):
+        # eps-family (non-RED-proof) dose columns keep today's behaviour:
+        # mismatched init anchors are never checked (D* scopes
+        # `init_anchor_equality` to RED-proof-labeled columns only).
+        with tempfile.TemporaryDirectory() as raw_dir:
+            seed = 1
+            self._write_alloff(raw_dir, seed)  # default train_probe_series[0] == 0.55
+            _write_mutant_leg(
+                raw_dir,
+                seed,
+                "eps0.50",
+                _mutant_tier(
+                    seed=seed,
+                    held_out_example_mean=0.30,  # != alloff's default 0.50 (a nonzero, non-tied d_i)
+                    train_probe_series=[0.60, 0.50],  # mismatched vs alloff's 0.55 -- irrelevant here
+                ),
+            )
+            column = ab_merge.build_mutant_dose_column(raw_dir, "eps0.50", "eps0-02-patch-sha", [seed])
+        self.assertEqual(column["per_seed"]["1"]["violations"], [])
+
+    def test_alloff_partner_premises_stay_descent_even_on_a_redproof_column(self):
+        # "Alloff partner premises unchanged" (amendment 2026-08-29e): an
+        # alloff partner leg whose OWN probe reads ascent-shaped still fails
+        # -- the ascent allowance is scoped to the RED-proof MUTANT leg only,
+        # never propagated to its alloff partner.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            seed = 1
+            self._write_alloff(raw_dir, seed, train_probe_series=[0.55, 20.25])  # alloff itself ascends
+            _write_mutant_leg(
+                raw_dir,
+                seed,
+                "redproof-signflip-v2",
+                _mutant_tier(seed=seed, mutant_patch_sha256=self.ASCENT_SHA, train_probe_series=[0.55, 20.25]),
+            )
+            column = ab_merge.build_mutant_dose_column(raw_dir, "redproof-signflip-v2", self.ASCENT_SHA, [seed])
+        self.assertTrue(any("learning_happened" in v or "train_direction" in v for v in column["violations"]), column["violations"])
+
+    def test_end_to_end_ascent_redproof_column_reads_red_via_cli_main(self):
+        # The amendment's own pre-registered prediction shape (mutants/
+        # README.md's M_signflip_v2): 12/12 legs ascend, matching the
+        # table's own `ascent` declaration, init anchors bit-identical, held-
+        # out loss degrades on every seed but one -> RED.
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            for seed in range(1, 13):
+                # the primary A/B campaign's own fused/alloff r1/r2 legs --
+                # isolation: this test's own point is the RED-proof column,
+                # so the primary decision itself just needs to be premise-
+                # clean (its own status is asserted separately below).
+                fused_mean, alloff_mean = (0.30, 0.50) if seed <= 6 else (0.55, 0.40)
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                        )
+                # the dose column's own reused alloff `r1` leg -- the SAME
+                # leg the primary campaign already wrote above (alloff_mean),
+                # re-anchored to `train_probe_series[0] == 0.55` (the
+                # `_finetune_run_tier` default every leg above already used).
+                mutant_mean = 0.99 if seed != 12 else 0.10  # 11/12 degradation-concordant
+                _write_mutant_leg(
+                    raw_dir,
+                    seed,
+                    "redproof-signflip-v2",
+                    _mutant_tier(
+                        seed=seed,
+                        held_out_example_mean=mutant_mean,
+                        mutant_patch_sha256=self.ASCENT_SHA,
+                        train_probe_series=[0.55, 20.25],  # ascends; init-anchored to alloff's own 0.55
+                    ),
+                )
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            rc = ab_merge.main(
+                [
+                    "finetune-run",
+                    raw_dir,
+                    out_dir,
+                    seeds_s,
+                    "",
+                    "--allow-missing-lr0-control",
+                    "--mutant-legs",
+                    f"redproof-signflip-v2:{self.ASCENT_SHA}:{seeds_s}",
+                ]
+            )
+            with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
+                merged = json.load(fh)
+        ladder = merged["mutant_dose_ladder"]
+        self.assertEqual(ladder["doses"][0]["violations"], [])
+        self.assertEqual(ladder["doses"][0]["clean_pair_count"], 12)
+        self.assertEqual(ladder["doses"][0]["detected"], "RED")
+        self.assertEqual(ladder["red_proof_verdict"], "PROVEN")
+        self.assertEqual(rc, 0)
 
 
 if __name__ == "__main__":

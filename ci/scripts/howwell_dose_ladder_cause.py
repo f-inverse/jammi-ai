@@ -24,17 +24,86 @@ column, `red_proof_verdict` NOT_PROVEN) -- never a subset -- and the fallback
 "unknown" text names every one it checked, so an operator reading the
 fallback text can see exactly what was ruled out rather than a bare "unknown"
 that looks like this namer forgot a cause.
+
+## Binding to `ab_merge.py`'s own exit fold (unit-63 round-14 audit F6)
+
+`ab_merge.py`'s `main()` no longer hand-maintains four independent `if`
+blocks for its `finetune-run` dose-ladder exit code -- it folds a DATA list
+of `(cause_name, triggered, message)` tuples, asserted at runtime to name
+exactly `ab_merge.DOSE_LADDER_EXIT_CAUSE_NAMES`. `_ALL_CAUSE_NAMES` below is
+that SAME constant, imported directly (never a hand-duplicated literal) --
+`DoseLadderCauseNamesBoundToAbMergeExitFoldTests`
+(`test_howwell_dose_ladder_cause.py`) imports both this module and
+`ab_merge` and asserts `set(namer._ALL_CAUSE_NAMES) ==
+set(ab_merge.DOSE_LADDER_EXIT_CAUSE_NAMES)` as an explicit, executable
+cross-module pin. What this GUARANTEES: a fifth cause added to `ab_merge.
+py`'s own exit fold without a matching entry in `DOSE_LADDER_EXIT_CAUSE_
+NAMES` fails `ab_merge.py`'s own internal assertion (`main()`'s dose-ladder
+branch) the first time that code path runs, AND (since this module imports
+that same constant) this namer's own fallback text grows to match
+automatically -- there is no third, independently-drifting copy of the
+cause-name set left anywhere in this pairing. What it does NOT guarantee: a
+literal fifth `if`/branch written OUTSIDE that data-driven fold (bypassing
+`dose_ladder_causes` entirely) would still need its own review to be
+caught -- this binding covers the one fold both sides already commit to,
+never arbitrary future code shape.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import sys
 
-# Kept as one literal, named list -- `dose_ladder_cause`'s own fallback text
-# is built FROM this list (never hand-duplicated) so the two can never drift
-# apart when a fifth cause is added to `ab_merge.py`'s own exit fold.
-_ALL_CAUSE_NAMES = ["dose_anomalies", "sensitivity_error", "invalid dose column", "red_proof_verdict"]
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "perf"))
+import ab_merge  # noqa: E402
+
+# Unit-63 round-14 audit F6: imported directly from `ab_merge.py`, never a
+# hand-duplicated literal -- see this module's own "Binding to ab_merge.py's
+# own exit fold" doc above for exactly what this import makes impossible
+# (a fifth cause silently added to one side alone) versus what it does not
+# (an exit-fold branch written outside the shared data structure).
+_ALL_CAUSE_NAMES = list(ab_merge.DOSE_LADDER_EXIT_CAUSE_NAMES)
+
+
+def _inspect_doses(ladder: dict) -> tuple[list, str | None]:
+    """Unit-63 round-14 audit A4: `ladder["doses"]` is a producer/merger
+    artifact field, never assumed well-shaped by this namer -- a corrupted
+    or hand-edited `finetune_run_ab_report.json` (`"doses": null`, `"doses"`
+    not a list at all, or a list carrying a `null`/non-dict element) must
+    degrade to a NAMED cause-inspection failure here, never an uncaught
+    `TypeError`/`AttributeError` that propagates out of `dose_ladder_cause`
+    -- `runpod_gpu_howwell.sh` catches exactly that crash shape with
+    `2>/dev/null || echo "unknown (could not inspect ...)"`, which would
+    silently swallow the SPECIFIC malformation into the same opaque
+    "unknown" text a truly-no-cause-found run also produces, defeating this
+    namer's own "never a bare unknown" purpose one layer up.
+
+    Returns `(usable_doses, malformation_cause)`: `usable_doses` is the
+    (possibly empty, possibly entry-filtered) list `dose_ladder_cause` can
+    safely scan for `INVALID` entries; `malformation_cause` is `None` when
+    `doses` was well-shaped (including simply absent/empty, never itself a
+    malformation), or a short, named string identifying WHICH shape defect
+    fired.
+    """
+    if "doses" not in ladder:
+        return [], None
+    raw = ladder.get("doses")
+    if raw is None:
+        return [], "doses_field_is_null"
+    if not isinstance(raw, list):
+        return [], f"doses_field_is_not_a_list(type={type(raw).__name__})"
+    usable = []
+    malformed_count = 0
+    for entry in raw:
+        if isinstance(entry, dict):
+            usable.append(entry)
+        else:
+            malformed_count += 1
+    if malformed_count:
+        plural = "y" if malformed_count == 1 else "ies"
+        return usable, f"doses_field_has_{malformed_count}_malformed_entr{plural}"
+    return usable, None
 
 
 def dose_ladder_cause(report: dict) -> str:
@@ -47,14 +116,24 @@ def dose_ladder_cause(report: dict) -> str:
     fallback string that enumerates all four checked classes by name (never
     a bare "unknown"), so a truly unexplained GREEN-but-nonzero contradiction
     is still legible as "none of these four" rather than silently opaque.
+
+    Unit-63 round-14 audit A4: `ladder["doses"]` itself is inspected via
+    `_inspect_doses` before being scanned for `INVALID` entries -- a
+    malformed `doses` field (`null`, not a list, or carrying a `null`/
+    non-dict element) is named as its own cause rather than crashing this
+    function outright (see that helper's own doc for why a crash here is
+    strictly worse than a named "unknown").
     """
     ladder = report.get("mutant_dose_ladder") or {}
     causes = []
     if ladder.get("sensitivity_error"):
         causes.append("sensitivity_error")
-    invalid_doses = [c.get("dose_label") for c in ladder.get("doses", []) if c.get("detected") == "INVALID"]
+    doses, doses_malformation = _inspect_doses(ladder)
+    if doses_malformation is not None:
+        causes.append(doses_malformation)
+    invalid_doses = [c.get("dose_label") for c in doses if c.get("detected") == "INVALID"]
     if invalid_doses:
-        causes.append("invalid_doses=" + ",".join(invalid_doses))
+        causes.append("invalid_doses=" + ",".join(str(d) for d in invalid_doses))
     if ladder.get("dose_anomalies"):
         causes.append("dose_anomalies")
     red_proof_verdict = ladder.get("red_proof_verdict")

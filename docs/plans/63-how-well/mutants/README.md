@@ -312,24 +312,46 @@ comparison.
    ALLOFF-reuse rule) using the gate's own merger and its own
    `>=11/12+mean` sign-test statistic — the same code path the real A/B
    verdict uses, not a bespoke mutant-vs-fused comparison.
-6. Record, per dose leg, in the column artifact:
-   - `base_sha` = the scratch checkout's base sha (`ca559b4f16cd1129a2f95ccdd82288b3418e0d0a` or `cba0b835`)
-   - `patch_sha256` = the dose's recorded sha256 above
+6. Record each dose leg's own provenance via the **three producer-stamped
+   CLI flags**, passed to that leg's `run_leg` invocation itself — this is
+   the ONLY mechanism by which a mutant leg's provenance is recorded; no
+   artifact is ever hand-edited to add or correct these fields, ever:
+   - `--mutant-id <M_eps_...>` — this dose's own patch identifier.
+   - `--mutant-base-sha <base sha>` — the scratch checkout's base sha
+     (`ca559b4f16cd1129a2f95ccdd82288b3418e0d0a` or `cba0b835`).
+   - `--mutant-patch-sha256 <sha256>` — the dose's recorded sha256 above.
+
+   These stamp the leg's own `FinetuneRunTier` report with
+   `mutant_id`/`mutant_base_sha`/`mutant_patch_sha256` (serde-skipped when
+   absent — a non-mutant leg carries none of the three), which
+   `ab_merge.finetune_run_mutant_column_violations` then checks are present
+   and that `mutant_patch_sha256` agrees with the dose column's own
+   caller-supplied `patch_sha256`. Separately, choose:
    - `dose_label = eps-0.50` / `eps-0.10` / `eps0.50` (operator-chosen
      string per the merger's `--mutant-legs DOSE_LABEL:PATCH_SHA256:SEEDS`
      convention — never `eps0.02`/`eps0.10`, which are not scheduled)
-   - the same held-out-loss / step-count / dispatch-counter fields the
-     clean fused legs record, so each dose column is diff-able against the
-     `alloff`/fused columns field-for-field.
+
+   Every other field a clean fused leg already records (held-out-loss /
+   step-count / dispatch-counter fields) is recorded exactly as it always
+   is, so each dose column is diff-able against the `alloff`/fused columns
+   field-for-field.
 7. The reported sensitivity is the pair of ADJACENT doses straddling
-   detection (per amendment item 3 and addendum 2026-08-29c) — run the
-   scheduled ladder in ascending `eps` order (`-0.50`, `-0.10`, `+0.50`) and
-   stop describing the sweep as "complete" only once a straddling pair is
-   found or all three have been run without one. The straddling pair, if
-   one exists, is expected within the negative branch (`-0.50` -> `-0.10`,
-   the DEGRADATION direction); a transition at `-0.10` -> `+0.50` would
-   additionally confirm or refute the Step-2 improvement prediction for
-   `+0.50`, which is a separate, non-degradation finding.
+   detection WITHIN THE DEGRADATION-DIRECTION (negative-`eps`) BRANCH ONLY,
+   ordered by `abs(eps)` (per amendment item 3 and addendum 2026-08-29c,
+   unit-63 round-7 audit finding 4) — run the scheduled ladder in ascending
+   SIGNED `eps` order (`-0.50`, `-0.10`, `+0.50`) and stop describing the
+   sweep as "complete" only once a straddling pair is found or all three
+   have been run without one. The merger's own `abs(eps)`-ordered scan of
+   the negative branch (`-0.10` -> `-0.50`, since `|{-0.10}| < |{-0.50}|`)
+   is deliberately NOT the same order the legs are RUN in (`-0.50` run
+   before `-0.10`) — reporting the straddle in run order would either miss
+   a real straddle (a detection at the larger-magnitude `-0.50`, run first,
+   reads `(RED, not-detected)` in run order, not the `(not-detected, RED)`
+   shape a straddle needs) or, worse, misreport a cross-sign
+   `(-0.10 not-detected, +0.50 RED)` run-order-adjacent pair as though it
+   were a degradation-direction finding. `+0.50` reading RED is instead the
+   two-sided-falsification finding (confirming the Step-2 improvement
+   prediction), reported separately, never folded into sensitivity.
 8. Tear down the scratch worktree and its build artifacts after the legs
    complete; do not leave a patched binary or scratch checkout on the pod
    past the dose-leg run. Each patch is committed to this repo as a FILE
@@ -449,10 +471,13 @@ separate record.
   on. `dose_label` is an operator-chosen string (e.g. `"eps0.02"`), never
   reinterpreted by the merger.
 - **Per-leg recorded fields**: every field a clean `fused` leg already
-  carries, PLUS this section's own three (`mutant_id`, `base_sha`,
-  `patch_sha256`, step 5 above) — a mutant leg missing any of the three, or
-  whose own `patch_sha256` disagrees with the dose column it is merged
-  under, is refused (`ab_merge.finetune_run_mutant_column_violations`).
+  carries, PLUS this section's own three producer-stamped fields
+  (`mutant_id`/`mutant_base_sha`/`mutant_patch_sha256`, serde-skipped when
+  absent — the on-pod procedure's own step 6 `--mutant-id`/
+  `--mutant-base-sha`/`--mutant-patch-sha256` CLI flags, never hand-edited
+  into the artifact) — a mutant leg missing any of the three, or whose own
+  `mutant_patch_sha256` disagrees with the dose column it is merged under,
+  is refused (`ab_merge.finetune_run_mutant_column_violations`).
 - **Merger CLI**: `ab_merge.py finetune-run RAW_DIR OUT_DIR SEEDS
   [LR0_SEEDS] [--allow-missing-lr0-control] [--mutant-legs
   DOSE_LABEL:PATCH_SHA256:SEED1,SEED2,...]` — `--mutant-legs` is repeatable,
@@ -472,10 +497,18 @@ separate record.
   malformed dose column is never silently read as "not-detected" (a
   substantive finding) when it is really "this column could not be
   evaluated at all".
-- **Sensitivity statement**: `mutant_dose_ladder.sensitivity` — the first
-  adjacent `(not-detected, RED)` pair in the CALLER-SUPPLIED dose order
-  (`ab_merge.mutant_dose_ladder_sensitivity`), or `null` if no such
-  transition exists in that order.
+- **Sensitivity statement** (unit-63 round-7 audit finding 4, addendum
+  2026-08-29c): `mutant_dose_ladder.sensitivity` — the first adjacent
+  `(not-detected, RED)` pair WITHIN THE DEGRADATION-DIRECTION (`eps < 0`)
+  BRANCH ONLY, ordered by `abs(eps)` (each dose's SIGNED eps parsed from its
+  own `dose_label`, `ab_merge._dose_label_eps`; a label that fails to parse
+  is a merge-level refusal, `mutant_dose_ladder.sensitivity_error`, never a
+  silent skip) — never the caller-supplied/run order, and never a
+  cross-sign pair. Returns `null` if no such transition exists in that
+  branch. A positive-eps (`eps > 0`) dose reading `"RED"` is reported
+  separately, under `mutant_dose_ladder.two_sided_falsification`, never
+  folded into `sensitivity` (`ab_merge.mutant_dose_ladder_sensitivity` /
+  `ab_merge.mutant_dose_ladder_two_sided_falsification`).
 - **Mutant legs never enter the primary A/B set**: proven structurally (the
   `mutant-<dose_label>` repeat tag can never equal `r1`/`r2`/`lr0`) and
   empirically (`MutantDoseLadderTests.test_mutant_leg_never_leaks_into_the_ab_set`,

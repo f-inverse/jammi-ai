@@ -1325,6 +1325,16 @@ FINETUNE_RUN_EXPECTED_ADMISSION_IS_DENSE = False
 # (the probe's own baseline), never the floor value itself.
 FINETUNE_RUN_LEARNING_HAPPENED_FLOOR = 0.0
 FINETUNE_RUN_TIE_FRACTION_CAP = 0.5
+# unit-63 round-7 audit advisory (d): amendment 2026-08-29b item 4's boundary
+# constraint ("decaying LR schedules stay disabled for this tier until the
+# resume-cycle LR-horizon defect ... is fixed; the campaign's constant/
+# 0-warmup setting is unaffected") had NO mechanical enforcement anywhere in
+# this merger -- `schedule` is a `FINETUNE_RUN_IDENTITY_FIELDS` member (so a
+# fused/alloff MISMATCH was already caught), but a leg that ran a DECAYING
+# schedule on BOTH arms identically would clear that identity check
+# unchallenged. `finetune_run_named_arm_premise_violations` below now checks
+# the POSITIVE fact the boundary constraint depends on.
+FINETUNE_RUN_EXPECTED_SCHEDULE = "constant"
 
 # The pre-registered decision rule (CONTRACT Frame / PLAN.md v2 delta 3/4,
 # unit-63 audit finding 1 -- `build_finetune_run_report` used to compute the
@@ -1478,7 +1488,7 @@ def finetune_run_probe_series_delta(label, tier):
     `"seed 4 alloff"` or `"lr0 seed 101 fused"`).
 
     Returns `(violations, delta, series)`:
-      * `violations` non-empty, `delta is None` -- one of four typed
+      * `violations` non-empty, `delta is None` -- one of five typed
         refusals fired (a leg is NEVER assumed-good on any of these):
           1. V1-ERA SCALAR-ONLY: `tier` carries the OLD
              `learning_happened_delta` field (non-null) but no
@@ -1498,6 +1508,21 @@ def finetune_run_probe_series_delta(label, tier):
              or a non-numeric JSON value) -- `series[0] - series[-1]` has no
              well-defined premise verdict over a series that is not
              entirely real-valued.
+          5. LENGTH-VS-EPOCHS MISMATCH (unit-63 round-7 audit finding 3):
+             `len(series) != tier["epochs"] + 1` -- index 0 is the
+             untrained-init probe PLUS one entry per epoch, so a
+             premise-clean series must carry exactly `epochs + 1` entries.
+             The SHORT check above (refusal 3) only catches a series with
+             fewer than 2 entries; a series whose length equals `epochs`
+             itself (never `epochs + 1`) is the v1 probe bug's EXACT shape
+             (the pre-fix producer's baseline excluded the init point) and
+             can still clear refusal 3 whenever `epochs >= 2` -- e.g.
+             `epochs=3` with a 3-entry (not 4-entry) series is not
+             "SHORT" (it has more than 2 entries) but is not
+             init-anchored either, and was previously silently
+             adjudicated as though it were. A series that is instead too
+             LONG (`len(series) > epochs + 1`, a truncation/duplication
+             producer bug in the other direction) is refused identically.
       * `violations` empty, `delta` the float `series[0] - series[-1]`,
         `series` the raw list itself (recorded by the caller into
         `premise_failure_diagnostic`/`per_arm` regardless of whether the
@@ -1544,6 +1569,27 @@ def finetune_run_probe_series_delta(label, tier):
                 None,
                 series,
             )
+    # unit-63 round-7 audit finding 3 -- see refusal 5 in this function's
+    # own doc: a leg's length-`epochs`-shaped (never `epochs+1`-shaped)
+    # series is silently adjudicated by refusals 1-4 alone whenever
+    # `epochs >= 2`, which is exactly the v1 probe bug's own shape (the
+    # baseline excluded the init point). `epochs` is only checked when it
+    # is itself a genuine (non-bool) int -- a leg missing `epochs` entirely
+    # is an even older producer, caught elsewhere (`FINETUNE_RUN_IDENTITY_FIELDS`
+    # already requires it), never fabricated here.
+    epochs = tier.get("epochs")
+    if isinstance(epochs, int) and not isinstance(epochs, bool):
+        expected_len = epochs + 1
+        if len(series) != expected_len:
+            return (
+                [
+                    f"{label}: train_probe_series has {len(series)} entries but this leg's own "
+                    f"epochs={epochs} (expected exactly epochs+1={expected_len}) -- series is not "
+                    "init-anchored or is truncated -- a producer-version mismatch"
+                ],
+                None,
+                series,
+            )
     return [], series[0] - series[-1], series
 
 
@@ -1551,7 +1597,8 @@ def finetune_run_named_arm_premise_violations(arm, tier):
     """`finetune_run_arm_premise_violations`'s own STRUCTURED core -- returns
     `[(premise_name, message), ...]` for the CONTRACT Frame's three
     conjunctive premise legs (`admission_is_dense`, `learning_happened`,
-    `tie_fraction`), so a caller building `premise_failure_diagnostic`
+    `tie_fraction`) PLUS the `schedule` boundary constraint (unit-63 round-7
+    audit advisory (d)), so a caller building `premise_failure_diagnostic`
     (amendment 2026-08-29b item 1(c)) can name WHICH premise leg(s) failed on
     a given leg, not merely that leg's flattened message strings.
     `finetune_run_arm_premise_violations` below is a thin wrapper over this
@@ -1559,6 +1606,16 @@ def finetune_run_named_arm_premise_violations(arm, tier):
     in this module already appends to.
     """
     named = []
+    schedule = tier.get("schedule")
+    if schedule != FINETUNE_RUN_EXPECTED_SCHEDULE:
+        named.append((
+            "schedule",
+            f"{arm}: schedule={schedule!r}, expected {FINETUNE_RUN_EXPECTED_SCHEDULE!r} -- "
+            "CONTRACT amendment 2026-08-29b item 4: decaying LR schedules stay disabled for this "
+            "tier until the resume-cycle LR-horizon defect (total_steps recomputed per cycle) is "
+            "fixed; `schedule` is already recorded on the tier, so this boundary constraint is "
+            "mechanically enforced here rather than left to operator discipline alone",
+        ))
     is_dense = tier.get("admission_is_dense")
     if is_dense != FINETUNE_RUN_EXPECTED_ADMISSION_IS_DENSE:
         named.append((
@@ -2628,18 +2685,23 @@ def build_finetune_run_report(raw_dir, seeds, lr0_seeds=(), allow_missing_lr0_co
 #
 # CONTRACT amendment 2026-08-29b item 3 pre-registers a one-parameter,
 # monotone, SUSTAINED mutant dose family (the fused AdamW update scaled by
-# `(1+eps)`, `eps in {0.02, 0.10, 0.50}`; see `docs/plans/63-how-well/
-# mutants/README.md` for the mutant's own patch/hash/on-pod-procedure
-# doc), replacing M1's "sensitivity bound" claim (mutants/README.md's own
-# post-hoc finding: M1 is a sign-flipping early transient, a NON-DETECTION,
-# never a bound). Each dose is run as its OWN column of `fused`-arm legs
-# (the mutant substituted INTO the fused arm, mutants/README.md's own
-# on-pod procedure step 4/6) and merged, HERE, against the campaign's
-# ALREADY-RUN `alloff` r1 legs -- the SAME alloff legs the main A/B decision
-# consumed, never a second, independently-run alloff pool -- under the
-# EXACT SAME `>=11/12` threshold and mean-sign rule the primary decision
-# rule uses (`FINETUNE_RUN_DECISION_THRESHOLD`/`FINETUNE_RUN_GATE_SEED_COUNT`
-# -- reused by reference below, never re-declared, so the two rules cannot
+# `(1+eps)`; see `docs/plans/63-how-well/mutants/README.md` for the mutant's
+# own patch/hash/on-pod-procedure doc), replacing M1's "sensitivity bound"
+# claim (mutants/README.md's own post-hoc finding: M1 is a sign-flipping
+# early transient, a NON-DETECTION, never a bound). CONTRACT.md addendum
+# 2026-08-29c SIGNS the family: the pre-spend prediction table (also in
+# mutants/README.md) falsified the original positive-only ladder's direction
+# (predicted IMPROVEMENT, not degradation) before any spend, so the
+# SCHEDULED ladder is `eps in {-0.50, -0.10, +0.50}` -- `eps in {0.02, 0.10}`
+# stay committed as the falsified-but-recorded doses, never scheduled. Each
+# dose is run as its OWN column of `fused`-arm legs (the mutant substituted
+# INTO the fused arm, mutants/README.md's own on-pod procedure step 4/6) and
+# merged, HERE, against the campaign's ALREADY-RUN `alloff` r1 legs -- the
+# SAME alloff legs the main A/B decision consumed, never a second,
+# independently-run alloff pool -- under the EXACT SAME `>=11/12` threshold
+# and mean-sign rule the primary decision rule uses
+# (`FINETUNE_RUN_DECISION_THRESHOLD`/`FINETUNE_RUN_GATE_SEED_COUNT` --
+# reused by reference below, never re-declared, so the two rules cannot
 # independently drift). Mutant legs NEVER enter the primary A/B set: this
 # entire mechanism reads its own `mutant-<dose_label>`-tagged leg files
 # (`mutant_leg_repeat_tag`), a `repeat` value that can never collide with
@@ -2680,27 +2742,32 @@ def finetune_run_mutant_column_violations(dose_label, patch_sha256, tier):
     "What M1 does NOT touch" section is precisely the claim that a mutant
     leg's premise/dispatch fields read IDENTICAL to a clean fused leg; only
     the DECISION statistic (held-out loss) is supposed to differ. PLUS the
-    mutant's own recorded provenance (mutants/README.md's own fields,
-    `mutant_id`/`base_sha`/`patch_sha256`) must be present, and this leg's
-    own `patch_sha256` must equal the dose column's caller-supplied one --
-    a leg claiming a different patch than the dose it was invoked under is
-    a labeling error, never silently trusted.
+    mutant's own recorded provenance (unit-63 round-7 audit finding 1: these
+    three fields are producer-stamped on `FinetuneRunTier` --
+    `mutant_id`/`mutant_base_sha`/`mutant_patch_sha256`, serde-skipped when
+    `None` -- via the on-pod procedure's own `--mutant-id`/
+    `--mutant-base-sha`/`--mutant-patch-sha256` CLI flags, mutants/README.md's
+    own on-pod procedure step 6; never hand-edited into the artifact) must be
+    present, and this leg's own `mutant_patch_sha256` must equal the dose
+    column's caller-supplied `patch_sha256` -- a leg claiming a different
+    patch than the dose it was invoked under is a labeling error, never
+    silently trusted.
     """
     violations = list(finetune_run_dispatch_proof_violations("fused", tier))
     violations += finetune_run_arm_premise_violations("fused", tier)
-    for field in ("mutant_id", "base_sha", "patch_sha256"):
+    for field in ("mutant_id", "mutant_base_sha", "mutant_patch_sha256"):
         if not tier.get(field):
             violations.append(
                 f"mutant leg's own {field!r} is missing/empty -- mutants/README.md's own "
-                "recorded fields (mutant_id, base_sha, patch_sha256) must be present so this "
-                "leg is attributable to a specific, auditable mutant patch"
+                "recorded fields (mutant_id, mutant_base_sha, mutant_patch_sha256) must be "
+                "present so this leg is attributable to a specific, auditable mutant patch"
             )
-    leg_patch_sha256 = tier.get("patch_sha256")
+    leg_patch_sha256 = tier.get("mutant_patch_sha256")
     if leg_patch_sha256 is not None and leg_patch_sha256 != patch_sha256:
         violations.append(
-            f"leg's own patch_sha256={leg_patch_sha256!r} does not match this dose column's "
-            f"caller-supplied patch_sha256={patch_sha256!r} -- a labeling error, never silently "
-            "trusted"
+            f"leg's own mutant_patch_sha256={leg_patch_sha256!r} does not match this dose "
+            f"column's caller-supplied patch_sha256={patch_sha256!r} -- a labeling error, never "
+            "silently trusted"
         )
     return violations
 
@@ -2713,7 +2780,11 @@ def build_mutant_dose_column(raw_dir, dose_label, patch_sha256, mutant_seeds):
     `raw_dir` here -- the campaign's ALREADY-RUN leg, never re-run, never a
     second alloff pool) via `generic_leg_premise_violations` over
     `FINETUNE_RUN_IDENTITY_FIELDS` (mirrors the main decision's own
-    fused-vs-alloff identity check), and, for every premise-clean pair,
+    fused-vs-alloff identity check) AND `finetune_run_named_arm_premise_violations`
+    (unit-63 round-7 audit finding 2: the alloff PARTNER's own conjunctive
+    premise legs -- `admission_is_dense`/`learning_happened`/`tie_fraction`
+    -- are checked here too, not just the mutant side; a premise-failing
+    alloff partner excludes the PAIR), and, for every premise-clean pair,
     computes `d_i = mutant.held_out_example_mean - alloff.held_out_example_mean`
     -- mutant vs alloff is THE GATE'S OWN STATISTIC (amendment 2026-08-29b
     item 3: "mutant-vs-fused is explicitly NOT the sensitivity claim").
@@ -2768,6 +2839,23 @@ def build_mutant_dose_column(raw_dir, dose_label, patch_sha256, mutant_seeds):
             "mutant",
             "alloff",
         )
+        # unit-63 round-7 audit finding 2: `finetune_run_mutant_column_violations`
+        # (above) already premise-checks the mutant (fused-shaped) side via
+        # `finetune_run_arm_premise_violations("fused", tier)` -- but the
+        # REUSED alloff PARTNER never got the same check here, unlike the
+        # main pool (`build_finetune_run_report` premise-checks BOTH
+        # `fused_tier` and `alloff_tier` via `finetune_run_named_arm_premise_violations`).
+        # A premise-failing alloff leg (live-demonstrated by the real
+        # campaign-v1 seed-4 alloff leg, `learning_happened_delta=-0.1125` --
+        # see measurements/campaign-v1/README.md) is EXCLUDED from the main
+        # gate's own clean-pair count, yet used to silently count as a clean
+        # partner in every dose column that reused it. Checking the SAME
+        # named premise here, and excluding the PAIR (never merely the
+        # fused/mutant side) on a partner failure, makes "the SAME alloff
+        # legs under the SAME rule" (amendment 2026-08-29b item 3) literally
+        # true.
+        alloff_named_violations = finetune_run_named_arm_premise_violations("alloff", alloff_tier)
+        leg_violations += [msg for _name, msg in alloff_named_violations]
         d_i = None
         mutant_mean = tier.get("held_out_example_mean")
         alloff_mean = alloff_tier.get("held_out_example_mean")
@@ -2836,23 +2924,120 @@ def build_mutant_dose_column(raw_dir, dose_label, patch_sha256, mutant_seeds):
     }
 
 
-def mutant_dose_ladder_sensitivity(dose_columns):
-    """The reported sensitivity statement (amendment 2026-08-29b item 3):
-    "the adjacent-dose pair straddling detection" -- the first adjacent
-    (not-detected, RED) transition in the CALLER-SUPPLIED dose order (never
-    re-sorted here: an operator's own monotone-eps ordering, e.g. `["0.02",
-    "0.10", "0.50"]`, is the ordering this straddles over). Returns
-    `{"lower": lower_dose_label, "higher": higher_dose_label}` naming that
-    transition, or `None` if none exists in the supplied order (every dose
-    RED, every dose not-detected/INVALID, or the transition runs the OTHER
-    way -- a higher dose reading LESS detected than a lower one is itself a
-    finding against the family's own claimed monotonicity, never silently
-    reported as a straddle).
+class MutantDoseLadderSensitivityError(ValueError):
+    """Raised by `_dose_label_eps` (and therefore by
+    `mutant_dose_ladder_sensitivity`/`mutant_dose_ladder_two_sided_falsification`)
+    when a dose column's own `dose_label` does not parse as a SIGNED `eps`
+    value -- see `_dose_label_eps`'s own doc. A label the sensitivity
+    computation cannot place in either the degradation (negative-eps) or
+    improvement (positive-eps) branch must never be silently dropped or
+    misclassified; `main` catches this and reports it as a dose-ladder
+    refusal, the same correctness-of-measurement carve-out every other
+    typed refusal in this module gets.
     """
-    for lower, higher in zip(dose_columns, dose_columns[1:]):
+
+
+def _dose_label_eps(dose_label):
+    """Parse a dose column's own SIGNED `eps` value from its `dose_label`
+    (CONTRACT.md addendum 2026-08-29c's own convention -- mutants/README.md's
+    on-pod procedure step 6: `dose_label = eps-0.50` / `eps-0.10` / `eps0.50`,
+    i.e. the literal string `"eps"` immediately followed by a float literal,
+    no separator, negative doses spelled with a bare `-`). Raises
+    `MutantDoseLadderSensitivityError` (never silently returns a sentinel or
+    guesses a sign) when `dose_label` does not start with `"eps"`, or the
+    remainder does not parse as a float.
+    """
+    prefix = "eps"
+    if not dose_label.startswith(prefix):
+        raise MutantDoseLadderSensitivityError(
+            f"dose_label {dose_label!r} does not start with {prefix!r} -- cannot parse a signed "
+            "eps value from it (addendum 2026-08-29c's own convention: dose_label = 'eps' + a "
+            "float literal, e.g. 'eps-0.50' / 'eps0.50')"
+        )
+    rest = dose_label[len(prefix):]
+    try:
+        return float(rest)
+    except ValueError as exc:
+        raise MutantDoseLadderSensitivityError(
+            f"dose_label {dose_label!r}'s remainder {rest!r} (after stripping the 'eps' prefix) "
+            "does not parse as a float -- cannot derive this dose's signed eps value"
+        ) from exc
+
+
+def mutant_dose_ladder_sensitivity(dose_columns):
+    """The reported sensitivity statement (CONTRACT.md addendum 2026-08-29c:
+    the signed ladder, `eps in {-0.50, -0.10, +0.50}` -- see
+    `docs/plans/63-how-well/mutants/README.md`'s own "signed dose family"
+    section): "the adjacent-dose pair straddling detection", SCOPED TO THE
+    DEGRADATION-DIRECTION (negative-eps) BRANCH ONLY, ordered by
+    `abs(eps)` WITHIN that branch -- never the caller-supplied order and
+    never every dose regardless of sign.
+
+    Unit-63 round-7 audit finding 4: the pre-addendum version of this
+    function straddled over the CALLER-SUPPLIED dose order, which was a safe
+    assumption only while the ladder itself was scheduled ascending in
+    detection strength by construction (a positive-only, ascending-magnitude
+    ladder). Addendum 2026-08-29c's SIGNED, scheduled-ascending-`eps` ladder
+    (`-0.50` run BEFORE `-0.10` BEFORE `+0.50`) breaks that assumption two
+    ways: (a) a detection at `-0.50` (the LARGEST-magnitude degradation dose,
+    run FIRST) would make the first-adjacent-transition scan see
+    `(RED, not-detected, RED)` in caller order and return `None` for a real
+    straddle that exists between `-0.50` and `-0.10` when reordered by
+    magnitude; (b) a cross-sign `(-0.10 not-detected, +0.50 RED)` adjacent
+    pair in caller order is NOT a degradation-direction straddle at all --
+    `+0.50` reading RED is the two-sided-falsification finding (see
+    `mutant_dose_ladder_two_sided_falsification`), and reporting it as
+    "sensitivity" would misrepresent an improvement-direction detection as a
+    degradation bound.
+
+    Each dose's SIGNED eps is parsed from its own `dose_label` via
+    `_dose_label_eps` (raises `MutantDoseLadderSensitivityError`, never
+    silently skipped, when a label fails to parse). Returns
+    `{"lower": lower_dose_label, "higher": higher_dose_label}` for the first
+    adjacent (not-detected, RED) transition found when the negative-eps
+    (`eps < 0.0`) subset of `dose_columns` is sorted by `abs(eps)` ascending,
+    or `None` if no such transition exists in that degradation-only,
+    magnitude-ordered subset (every negative dose RED, every negative dose
+    not-detected/INVALID, the transition runs the OTHER way, or there are
+    fewer than two negative-eps doses to straddle at all). A positive-eps
+    dose is NEVER a member of this subset, regardless of its own `detected`
+    value.
+    """
+    negative = sorted(
+        (col for col in dose_columns if _dose_label_eps(col["dose_label"]) < 0.0),
+        key=lambda col: abs(_dose_label_eps(col["dose_label"])),
+    )
+    for lower, higher in zip(negative, negative[1:]):
         if lower["detected"] == "not-detected" and higher["detected"] == "RED":
             return {"lower": lower["dose_label"], "higher": higher["dose_label"]}
     return None
+
+
+def mutant_dose_ladder_two_sided_falsification(dose_columns):
+    """The two-sided-falsification finding CONTRACT.md addendum 2026-08-29c
+    names for a POSITIVE-eps ("improvement-direction") dose: `+0.50` is
+    "retained deliberately as the two-sided falsification cell for the
+    improvement prediction itself" (mutants/README.md's own "signed dose
+    family" section) -- if it reads RED, that is a cross-sign detection
+    (the naive linear-extrapolation prediction, Step 2/3 of that same
+    README, is CONFIRMED: a positive dose detected as RED is expected to be
+    RED_FOR_INVESTIGATION-shaped improvement, not degradation), never a
+    degradation-direction sensitivity finding -- see
+    `mutant_dose_ladder_sensitivity`'s own doc for why folding a cross-sign
+    detection into that statistic would misrepresent it.
+
+    Each dose's SIGNED eps is parsed via `_dose_label_eps` (same refusal
+    behaviour as `mutant_dose_ladder_sensitivity`). Returns the list of
+    `{"dose_label", "eps", "detected"}` entries for every positive-eps
+    (`eps > 0.0`) dose column that read `"RED"`, in `dose_columns`' own
+    order, empty when none did (the ordinary, unconfirmed case).
+    """
+    out = []
+    for col in dose_columns:
+        eps = _dose_label_eps(col["dose_label"])
+        if eps > 0.0 and col["detected"] == "RED":
+            out.append({"dose_label": col["dose_label"], "eps": eps, "detected": col["detected"]})
+    return out
 
 
 def main(argv=None):
@@ -2941,28 +3126,60 @@ def main(argv=None):
                 dose_label, patch_sha256, mutant_seeds_s = parts
                 mutant_seeds = [s for s in mutant_seeds_s.split(",") if s]
                 dose_columns.append(build_mutant_dose_column(fr_raw_dir, dose_label, patch_sha256, mutant_seeds))
+            # unit-63 round-7 audit finding 4 / CONTRACT.md addendum
+            # 2026-08-29c: sensitivity is scoped to the degradation-direction
+            # (negative-eps) branch, magnitude-ordered, never the
+            # caller-supplied order -- a signed dose_label that fails to
+            # parse is a dose-ladder refusal (never a script crash), reported
+            # here and folded into the exit code like every other
+            # correctness-of-measurement problem this merge gates on.
+            sensitivity_error = None
+            try:
+                sensitivity = mutant_dose_ladder_sensitivity(dose_columns)
+                two_sided_falsification = mutant_dose_ladder_two_sided_falsification(dose_columns)
+            except MutantDoseLadderSensitivityError as exc:
+                sensitivity = None
+                two_sided_falsification = []
+                sensitivity_error = str(exc)
             fr_merged["mutant_dose_ladder"] = {
                 "doses": dose_columns,
-                "sensitivity": mutant_dose_ladder_sensitivity(dose_columns),
+                "sensitivity": sensitivity,
+                "sensitivity_error": sensitivity_error,
+                "two_sided_falsification": two_sided_falsification,
                 "note": (
-                    "CONTRACT amendment 2026-08-29b item 3: each dose column merges the mutant, "
-                    "substituted into the fused arm, against the SAME campaign alloff legs (never "
-                    "re-run) under the SAME >=11/12+mean rule the primary decision uses. Mutant "
-                    "legs never enter the primary A/B set (mutant_leg_repeat_tag's own file-naming "
-                    "isolation). 'sensitivity' names the adjacent-dose pair straddling detection, "
-                    "or null when no such transition exists in the supplied dose order."
+                    "CONTRACT amendment 2026-08-29b item 3, signed per addendum 2026-08-29c: each "
+                    "dose column merges the mutant, substituted into the fused arm, against the "
+                    "SAME campaign alloff legs (never re-run) under the SAME >=11/12+mean rule the "
+                    "primary decision uses. Mutant legs never enter the primary A/B set "
+                    "(mutant_leg_repeat_tag's own file-naming isolation). 'sensitivity' names the "
+                    "adjacent-dose pair straddling detection WITHIN the degradation-direction "
+                    "(negative-eps) branch only, magnitude-ordered, or null when no such transition "
+                    "exists there; a positive-eps dose reading RED is reported separately under "
+                    "'two_sided_falsification', never folded into 'sensitivity'; "
+                    "'sensitivity_error' names a dose_label that failed to parse as a signed eps "
+                    "value, never silently ignored."
                 ),
             }
-            dose_lines = ["", "# mutant dose ladder (amendment 2026-08-29b item 3)"]
+            dose_lines = ["", "# mutant dose ladder (amendment 2026-08-29b item 3; addendum 2026-08-29c signs it)"]
             for col in dose_columns:
                 dose_lines.append(
                     f"  dose={col['dose_label']:<12} detected={col['detected']:<12} "
                     f"n_pos={col['n_pos']} n_neg={col['n_neg']} mean_d={col['mean_d']} "
                     f"p_value={col['p_value']} clean_pairs={col['clean_pair_count']}/{col['gate_seed_count']}"
                 )
-            sensitivity = fr_merged["mutant_dose_ladder"]["sensitivity"]
-            dose_lines.append(f"  sensitivity: {sensitivity}")
+            if sensitivity_error is not None:
+                dose_lines.append(f"  sensitivity: REFUSED -- {sensitivity_error}")
+            else:
+                dose_lines.append(f"  sensitivity: {sensitivity}")
+            if two_sided_falsification:
+                dose_lines.append(f"  two_sided_falsification: {two_sided_falsification}")
             fr_table = fr_table + "\n" + "\n".join(dose_lines)
+            if sensitivity_error is not None:
+                print(
+                    f"finetune_run_ab mutant-dose-ladder: FAIL — {sensitivity_error}",
+                    file=sys.stderr,
+                )
+                exit_code = 1
             invalid_doses = [c["dose_label"] for c in dose_columns if c["detected"] == "INVALID"]
             if invalid_doses:
                 print(

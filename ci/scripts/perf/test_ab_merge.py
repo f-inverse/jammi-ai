@@ -3564,14 +3564,18 @@ class PremiseFailureDiagnosticTests(unittest.TestCase):
 
 def _mutant_tier(arm="fused", **overrides):
     """A mutant leg's own tier -- a normal, premise-clean `fused` leg
-    (`_finetune_run_tier`) plus the three fields mutants/README.md's own
-    on-pod procedure records per leg (`mutant_id`, `base_sha`,
-    `patch_sha256`)."""
+    (`_finetune_run_tier`) plus the three producer-stamped fields
+    mutants/README.md's own on-pod procedure records per leg (unit-63
+    round-7 audit finding 1: `mutant_id`/`mutant_base_sha`/
+    `mutant_patch_sha256`, the `FinetuneRunTier` field names the
+    `--mutant-id`/`--mutant-base-sha`/`--mutant-patch-sha256` CLI flags
+    stamp -- renamed from this suite's own earlier `base_sha`/`patch_sha256`
+    names to match the producer's real field names)."""
     tier = _finetune_run_tier(arm=arm)
     tier.update({
         "mutant_id": "M2",
-        "base_sha": "4257cde6d51184475b3e798f5d7e9c3885a763ca",
-        "patch_sha256": "eps0-02-patch-sha",
+        "mutant_base_sha": "4257cde6d51184475b3e798f5d7e9c3885a763ca",
+        "mutant_patch_sha256": "eps0-02-patch-sha",
     })
     tier.update(overrides)
     return tier
@@ -3660,7 +3664,7 @@ class MutantDoseLadderTests(unittest.TestCase):
                 raw_dir,
                 1,
                 "eps0.50",
-                _mutant_tier(seed=1, held_out_example_mean=0.70, patch_sha256="some-other-sha"),
+                _mutant_tier(seed=1, held_out_example_mean=0.70, mutant_patch_sha256="some-other-sha"),
             )
             col = ab_merge.build_mutant_dose_column(raw_dir, "eps0.50", self.PATCH_SHA, [1])
         self.assertTrue(any("does not match this dose column" in v for v in col["violations"]), col["violations"])

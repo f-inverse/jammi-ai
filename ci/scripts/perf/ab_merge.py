@@ -2680,27 +2680,32 @@ def finetune_run_mutant_column_violations(dose_label, patch_sha256, tier):
     "What M1 does NOT touch" section is precisely the claim that a mutant
     leg's premise/dispatch fields read IDENTICAL to a clean fused leg; only
     the DECISION statistic (held-out loss) is supposed to differ. PLUS the
-    mutant's own recorded provenance (mutants/README.md's own fields,
-    `mutant_id`/`base_sha`/`patch_sha256`) must be present, and this leg's
-    own `patch_sha256` must equal the dose column's caller-supplied one --
-    a leg claiming a different patch than the dose it was invoked under is
-    a labeling error, never silently trusted.
+    mutant's own recorded provenance (unit-63 round-7 audit finding 1: these
+    three fields are producer-stamped on `FinetuneRunTier` --
+    `mutant_id`/`mutant_base_sha`/`mutant_patch_sha256`, serde-skipped when
+    `None` -- via the on-pod procedure's own `--mutant-id`/
+    `--mutant-base-sha`/`--mutant-patch-sha256` CLI flags, mutants/README.md's
+    own on-pod procedure step 6; never hand-edited into the artifact) must be
+    present, and this leg's own `mutant_patch_sha256` must equal the dose
+    column's caller-supplied `patch_sha256` -- a leg claiming a different
+    patch than the dose it was invoked under is a labeling error, never
+    silently trusted.
     """
     violations = list(finetune_run_dispatch_proof_violations("fused", tier))
     violations += finetune_run_arm_premise_violations("fused", tier)
-    for field in ("mutant_id", "base_sha", "patch_sha256"):
+    for field in ("mutant_id", "mutant_base_sha", "mutant_patch_sha256"):
         if not tier.get(field):
             violations.append(
                 f"mutant leg's own {field!r} is missing/empty -- mutants/README.md's own "
-                "recorded fields (mutant_id, base_sha, patch_sha256) must be present so this "
-                "leg is attributable to a specific, auditable mutant patch"
+                "recorded fields (mutant_id, mutant_base_sha, mutant_patch_sha256) must be "
+                "present so this leg is attributable to a specific, auditable mutant patch"
             )
-    leg_patch_sha256 = tier.get("patch_sha256")
+    leg_patch_sha256 = tier.get("mutant_patch_sha256")
     if leg_patch_sha256 is not None and leg_patch_sha256 != patch_sha256:
         violations.append(
-            f"leg's own patch_sha256={leg_patch_sha256!r} does not match this dose column's "
-            f"caller-supplied patch_sha256={patch_sha256!r} -- a labeling error, never silently "
-            "trusted"
+            f"leg's own mutant_patch_sha256={leg_patch_sha256!r} does not match this dose "
+            f"column's caller-supplied patch_sha256={patch_sha256!r} -- a labeling error, never "
+            "silently trusted"
         )
     return violations
 

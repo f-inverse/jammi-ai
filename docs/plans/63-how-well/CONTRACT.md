@@ -440,3 +440,25 @@ M = M_signflip_v2 named explicitly. The lr0-control polarity observation
 (a RISING probe at lr=0 is an instrument finding, today recorded as an ordinary
 learning-happened failure) is a SEPARATE decision, deliberately not folded into this
 amendment — the primary path stays byte-identical.
+
+**Postscript 2026-08-29f (lead, round-15 audit block — correcting the amendment's
+falsifier demonstration; the rule stands, the cited mechanism was wrong):** the
+2026-08-29e falsifier claim "this WOULD have fired on inert M_signflip v1 — 12/12
+bit-identical legs have delta 0, failing training_effective's strict floor — a real
+committed case the pre-D* merger passed silently" was TRIPLY WRONG against the very
+legs it cites, verified by execution in round 15: (1) the v1 legs' probe deltas read
++0.6806..+0.9449, not 0 — inertness means the mutant leg equals the CLEAN FUSED leg,
+which descends, so training demonstrably happened; (2) training_effective therefore
+PASSES 12/12 on them — what actually refuses the v1 column under D* is the
+RED_PROOF_EXPECTED_TRAIN_DIRECTION absent-sha refusal (v1's patch sha is not in the
+table): 12 named violations, INVALID; (3) the pre-D* merger did not pass it
+silently — it read detected=not-detected over 12 premise-clean pairs and exited 1
+with NOT_PROVEN (redproof-signflip=not-detected). The honest falsifier statement,
+still favourable to D* and now execution-verified: pre-D* ACCEPTED twelve legs that
+never executed the mutant as premise-CLEAN pairs and computed a sign test over that
+non-evidence (loud in exit code, silent in semantics); D* refuses the column
+outright at the table. The case training_effective's strict floor genuinely catches
+is a dead leg with delta exactly 0.0 — the shape all four committed lr0 control
+legs read. Amendment 2026-08-29e's rule, table, premises, predictions, and honesty
+rider are unchanged by this correction; only the falsifier's cited mechanism is
+superseded by this postscript.

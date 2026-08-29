@@ -153,13 +153,13 @@ across seeds and arms:
 
 | field | value |
 |---|---|
-<!-- claims63: c1=abs(docs/plans/63-how-well/measurements/campaign-v1/raw/seed1__fused__lr0.json#/tiers/finetune_run/held_out_example_mean) -->
+<!-- claims63: c1=docs/plans/63-how-well/measurements/campaign-v1/raw/seed1__fused__lr0.json#/tiers/finetune_run/held_out_example_mean -->
 | `held_out_example_mean`, lr=0 (seed1, fused) | `3.422172799706459` |
-<!-- claims63: c1=abs(docs/plans/63-how-well/measurements/campaign-v1/raw/seed2__fused__lr0.json#/tiers/finetune_run/held_out_example_mean) -->
+<!-- claims63: c1=docs/plans/63-how-well/measurements/campaign-v1/raw/seed2__fused__lr0.json#/tiers/finetune_run/held_out_example_mean -->
 | `held_out_example_mean`, lr=0 (seed2, fused) | `3.422172799706459` |
-<!-- claims63: c1=abs(docs/plans/63-how-well/measurements/campaign-v1/raw/seed1__fused__r1.json#/tiers/finetune_run/held_out_example_mean) -->
+<!-- claims63: c1=docs/plans/63-how-well/measurements/campaign-v1/raw/seed1__fused__r1.json#/tiers/finetune_run/held_out_example_mean -->
 | `held_out_example_mean`, lr=2e-4 (seed1, fused, r1) | `3.218041628599167` |
-<!-- claims63: c1=abs(docs/plans/63-how-well/measurements/campaign-v1/raw/seed2__fused__r1.json#/tiers/finetune_run/held_out_example_mean) -->
+<!-- claims63: c1=docs/plans/63-how-well/measurements/campaign-v1/raw/seed2__fused__r1.json#/tiers/finetune_run/held_out_example_mean -->
 | `held_out_example_mean`, lr=2e-4 (seed2, fused, r1) | `3.4061567336320877` |
 
 <!-- claims63: c1=paircount('docs/plans/63-how-well/measurements/campaign-v1/raw/seed*__fused__lr0.json', 'docs/plans/63-how-well/measurements/campaign-v1/raw/seed*__fused__r1.json', 'held_out_example_mean'); c2=docs/plans/63-how-well/measurements/campaign-v1/finetune_run_ab_report.json#/decision/gate_seed_count -->
@@ -235,7 +235,7 @@ DEGRADE held-out loss regardless of which of the two seed slopes turns out
 to be closer to the true local derivative. This is the "undertrained-
 regression" direction addendum 2026-08-29c names: less effective lr moves
 the model back toward its untrained (`s=0`) state, which is measured
-<!-- claims63: c1=abs(docs/plans/63-how-well/measurements/campaign-v1/raw/seed1__fused__lr0.json#/tiers/finetune_run/held_out_example_mean) -->
+<!-- claims63: c1=docs/plans/63-how-well/measurements/campaign-v1/raw/seed1__fused__lr0.json#/tiers/finetune_run/held_out_example_mean -->
 WORSE (`3.422173`) than the trained (`s=1`) state at both seeds.
 
 **Predicted DIRECTION (all doses, both ends of the range): IMPROVEMENT
@@ -249,6 +249,7 @@ could reverse — that reversal is exactly the falsifiable case this
 prediction exists to be checked against; per family F/K discipline this is
 reported as a prediction to be measured, not assumed.
 
+<!-- claims63: default=docs/plans/63-how-well/measurements/campaign-v1/finetune_run_ab_report.json; c1=#/decision/threshold; c2=#/decision/gate_seed_count -->
 ### Step 3 — predicted detection verdict under the >=11/12+mean rule
 
 Committed benchmarks to compare the predicted shift against:

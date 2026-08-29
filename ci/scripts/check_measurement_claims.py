@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""esc-065's write-time oracle: every artifact-referencing measurement claim
+r"""esc-065's write-time oracle: every artifact-referencing measurement claim
 in a `docs/plans/63-how-well/measurements/**/README.md` or the
 `docs/plans/63-how-well/mutants/README.md` "Measured" record must resolve
 against a committed artifact AT WRITE TIME — never rely on an audit round N
@@ -225,8 +225,8 @@ equality after quantization preserves rule (h)'s exact precision semantics
 (trailing zeros ARE significant: they set `places`, hence the quantum)
 while being representation-independent).
 
-ANTI-VACUITY (two legs, reusing rule (h)'s own two-leg discipline —
-`EXPECTED_DENOMINATOR`/`--sweep`, generalized):
+ANTI-VACUITY (FOUR legs — round-22 audit added (c)/(d) to rule (h)'s
+original two-leg discipline, `EXPECTED_DENOMINATOR`/`--sweep`, generalized):
   (a) COVERAGE. There is no covered-region allowlist (see "INVERTED
       COVERAGE MODEL" above) — the WHOLE file, every line except a fenced
       ``` block, is scanned with the SAME tokenizer used to award tag
@@ -246,23 +246,51 @@ ANTI-VACUITY (two legs, reusing rule (h)'s own two-leg discipline —
       site (`_EXTRA_EXCLUSIONS` below) with a one-line reason and a
       self-test fixture proving it excludes ONLY its own shape; there is
       no per-file/per-line carve-out that could silently narrow past that
-      documented boundary the way a zone allowlist could.
+      documented boundary the way a zone allowlist could. Every class is
+      ANCHORED to the literal idiom it names (round-22 audit B4) — never a
+      bare `\bWORD\s+\d+\b` wide enough to also swallow an adjacent real
+      measured claim sharing the same word (e.g. "Step" as a doc-internal
+      section cross-reference vs "step" as a training-step count).
   (b) AMBIGUITY. For every DIRECT pointer binding (not `hist`/`ledger`/a
-      derived aggregate), an INDEPENDENT scan (`_check_ambiguity`, walking
-      `_iter_leaf_paths` — a traversal never used by the production
-      `Evaluator.eval` resolution path) counts how many OTHER leaves round
-      to the identical value at the token's own stated precision; more
-      than one DISTINCT pointer (under a DIFFERENT field name — a same-
-      named mirrored field, e.g. `decision.p_value` vs `sign_test.p_value`,
-      is an intentional duplicate, not a coincidence) bound to the same
-      rounded value inside one artifact is a FINDING ("ambiguous
-      binding"). Two classes are exempted, both because the leg's OWN
-      purpose is catching a DECIMAL measurement bound to the wrong
-      pointer: an INTEGER-valued token (`n_pos`/`n_neg`/dispatch-count-
-      shaped fields collide constantly and harmlessly over a small state
-      space — flagging every collision would be pure noise), and an
-      EXACT-ZERO token (the single most common possible measurement —
-      "many other leaves are also exactly 0.0" carries no signal).
+      derived aggregate — round-22 B3: an `abs(E)`-wrapped scalar pointer
+      is UNWRAPPED to a bare pointer wherever the doc token is not itself
+      printed in `|...|` magnitude notation, precisely so this leg (and
+      sign sensitivity) apply to it), an INDEPENDENT scan
+      (`_check_ambiguity`, walking `_iter_leaf_paths` — a traversal never
+      used by the production `Evaluator.eval` resolution path) counts how
+      many OTHER leaves round to the identical value at the token's own
+      stated precision; more than one DISTINCT pointer (under a DIFFERENT
+      field name — a same-named mirrored field, e.g. `decision.p_value` vs
+      `sign_test.p_value`, is an intentional duplicate, not a coincidence)
+      bound to the same rounded value inside one artifact is a FINDING
+      ("ambiguous binding"). Three classes are exempted: an INTEGER-valued
+      token (`n_pos`/`n_neg`/dispatch-count-shaped fields collide
+      constantly and harmlessly over a small state space — flagging every
+      collision would be pure noise), an EXACT-ZERO token ("many other
+      leaves are also exactly 0.0" carries no signal), and a CLOSED
+      MIRROR-EXEMPTION list (`_MIRROR_EXEMPT_FIELD_PAIRS`, round-22 B3) of
+      field-NAME pairs that are a KNOWN, legitimate same-artifact
+      duplicate (today: `held_out_example_mean`/`held_out_mean`, the
+      untrained checkpoint logged both as the summary field and under
+      every `trajectory[i]`) — grown only via a human-reviewed PR, never a
+      wildcard, and self-test-proven to exempt ONLY its own listed pairs.
+  (c) FENCE INTEGRITY (round-22 audit B1). The fence carve-out mechanism
+      (a) relies on has its OWN fail-closed check, `check_fence_integrity`:
+      an odd ``` delimiter count (an unclosed fence) is a FINDING by
+      itself — the prior version had no balance check at all, so an
+      unclosed fence silently carved out everything through EOF, never
+      even a candidate for a finding — and, independently, the total
+      fenced-line count is pinned per file (`FENCE_LINE_DENOMINATOR`,
+      parallel to `FILE_TOKEN_DENOMINATOR`), so a line appended INSIDE an
+      already-closed fence — which moves no token count, since fenced
+      content is never tokenized — still drifts a pinned number.
+  (d) UNUSED LEDGER ENTRIES (round-22 audit A2). `check_unused_ledger_entries`
+      diffs every `ledger`/`const` key an actual scan of the real tree
+      consumed against the full committed allowlist — an entry consumed by
+      NOTHING (e.g. left behind after a lexical exclusion class widened to
+      cover what it used to escape) is a FINDING; a shrink-only ratchet
+      with no liveness check on its own rows can otherwise accumulate dead
+      escapes forever.
 
 RELATIONAL CLAIMS ARE IN SCOPE (this module's own reading of esc-065,
 correcting an earlier narrower draft): a comparison/interval-containment
@@ -352,11 +380,17 @@ MEASUREMENT_FILES = [
 #       `code()` artifact are two different traversals over the same text,
 #       never in tension).
 #   (b) a CLOSED lexical exclusion class (`rule_h.excluded_spans` +
-#       `_EXTRA_EXCLUSIONS` below, plus the heading-line and
-#       `claims63:`-tag-line skips in `find_claim_tokens`) — every class is
-#       named with a one-line reason at its definition site, and every
-#       class has a self-test fixture proving it excludes ONLY its own
-#       shape (`self_test`'s "exclusion class" fixtures below).
+#       `_EXTRA_EXCLUSIONS` below, plus the `claims63:`-tag-line skip in
+#       `find_claim_tokens` — a directive line, never claim-bearing content)
+#       — every class is named with a one-line reason at its definition
+#       site, and every class has a self-test fixture proving it excludes
+#       ONLY its own shape (`self_test`'s "exclusion class" fixtures
+#       below). A1 (round-22 audit): a heading line (`^#`) is NOT its own
+#       mechanism — there used to be a whole-line heading skip here, but it
+#       swallowed a live threshold flip AND an injected false claim written
+#       directly into a heading (nothing under a heading was ever even a
+#       candidate for a finding); heading lines are in scope exactly like
+#       any other line, escaping only through (a)/(b)/(c) same as prose.
 #   (c) the `ledger`/`const` ratchets (ci/measurement_claims_allowlist.txt,
 #       shrink-only) — for a token that IS in scope but this grammar's own
 #       recipe/pointer machinery genuinely cannot reach.
@@ -367,6 +401,34 @@ MEASUREMENT_FILES = [
 # updating.
 
 
+def _fence_scan(lines: list[str]) -> tuple[set[int], int]:
+    """Single pass over `lines` producing BOTH (1) every 1-indexed line
+    number that is a ``` fence delimiter OR strictly between a matched pair
+    — mechanism (a) — and (2) the raw COUNT of delimiter lines seen (B1,
+    round-22 audit: the prior version had no balance check at all, so an
+    unclosed fence silently toggled `in_block` True for the rest of the
+    file and fenced everything through EOF — the "laundering probe": a
+    false `Measured` line appended behind a lone, unclosed ``` was
+    silently carved out of scanning entirely, never even a candidate for a
+    finding). The delimiter count's PARITY is the caller's fail-closed
+    check (`check_fence_integrity` below) — an odd count means the file's
+    OWN fence nesting is broken and every line from the last delimiter to
+    EOF was carved out on a false premise, which must itself be a finding,
+    never a silent widen of what "the whole file" scans."""
+    fenced: set[int] = set()
+    in_block = False
+    delimiter_count = 0
+    for i, line in enumerate(lines, start=1):
+        if line.strip().startswith("```"):
+            fenced.add(i)  # the delimiter itself is not claim-bearing text
+            delimiter_count += 1
+            in_block = not in_block
+            continue
+        if in_block:
+            fenced.add(i)
+    return fenced, delimiter_count
+
+
 def _fenced_line_numbers(lines: list[str]) -> set[int]:
     """Every 1-indexed line number that is a ``` fence delimiter OR strictly
     between a matched pair — mechanism (a) above. Reuses the exact
@@ -374,17 +436,13 @@ def _fenced_line_numbers(lines: list[str]) -> set[int]:
     separate traversal (fenced content is read as the `code()` artifact
     there; it is EXCLUDED from claim-token scanning here — two different
     passes over identical fence boundaries, kept in sync by construction
-    since both key off the same `stripped.startswith("```")` toggle)."""
-    fenced: set[int] = set()
-    in_block = False
-    for i, line in enumerate(lines, start=1):
-        if line.strip().startswith("```"):
-            fenced.add(i)  # the delimiter itself is not claim-bearing text
-            in_block = not in_block
-            continue
-        if in_block:
-            fenced.add(i)
-    return fenced
+    since both key off the same `stripped.startswith("```")` toggle).
+    Thin wrapper over `_fence_scan` — see it for the PARITY check this
+    function itself does not (and structurally cannot, having thrown away
+    the delimiter count) perform; every caller that needs fail-closed
+    behavior on an unbalanced file must go through `check_fence_integrity`,
+    never this function alone."""
+    return _fence_scan(lines)[0]
 
 
 # Pinned per-file TOTAL in-scope token counts (mechanism (a)/(b) applied,
@@ -396,12 +454,35 @@ def _fenced_line_numbers(lines: list[str]) -> set[int]:
 # `check_perf_claims.py`'s own `EXPECTED_DENOMINATOR` discipline, now
 # applied to the WHOLE file instead of a hand-picked subset of it.
 FILE_TOKEN_DENOMINATOR: dict[str, int] = {
-    "docs/plans/63-how-well/measurements/campaign-v1/README.md": 39,
+    # +1 (round-22 A1): heading lines are now in scope — campaign-v1's
+    # "## probe/ — H5 step-0 (4 legs, a100)" heading's own "4" token.
+    "docs/plans/63-how-well/measurements/campaign-v1/README.md": 40,
     "docs/plans/63-how-well/measurements/campaign-v2/README.md": 17,
     "docs/plans/63-how-well/measurements/dose-ladder/README.md": 22,
     "docs/plans/63-how-well/measurements/red-proof/README.md": 46,
     "docs/plans/63-how-well/measurements/red-proof/dstar/README.md": 31,
-    "docs/plans/63-how-well/mutants/README.md": 320,
+    # +2 (round-22 A1): heading lines are now in scope — the "### Step 3 —
+    # ... >=11/12+mean rule" heading's own "11"/"12" tokens.
+    "docs/plans/63-how-well/mutants/README.md": 322,
+}
+
+# B1 (round-22 audit): a SECOND, INDEPENDENT pin — the total count of fenced
+# lines (delimiters + interior) per file, exactly `check_perf_claims.py`'s
+# own `EXPECTED_DENOMINATOR` discipline applied to the region the token
+# denominator above CANNOT see. Appending a line INSIDE an already-closed
+# fence changes NOTHING in `FILE_TOKEN_DENOMINATOR` (fenced content is never
+# tokenized) — it must instead drift THIS pin, or the append is invisible to
+# both anti-vacuity legs at once. A file with no fenced content at all pins
+# to 0 (still checked: a 0 -> nonzero drift, e.g. a first fence appearing in
+# a file that previously had none, is exactly the kind of scope-shrink this
+# leg exists to catch).
+FENCE_LINE_DENOMINATOR: dict[str, int] = {
+    "docs/plans/63-how-well/measurements/campaign-v1/README.md": 0,
+    "docs/plans/63-how-well/measurements/campaign-v2/README.md": 0,
+    "docs/plans/63-how-well/measurements/dose-ladder/README.md": 0,
+    "docs/plans/63-how-well/measurements/red-proof/README.md": 0,
+    "docs/plans/63-how-well/measurements/red-proof/dstar/README.md": 0,
+    "docs/plans/63-how-well/mutants/README.md": 91,
 }
 
 LEDGER_PATH = REPO_ROOT / "ci" / "measurement_claims_allowlist.txt"
@@ -453,10 +534,31 @@ _EXTRA_EXCLUSIONS = [
     # sibling `(1-eps)` (a formula/family label, same class as rule (h)'s
     # own `1/√d`-style formula-fragment exclusion).
     re.compile(r"[(|]1[+-]eps[)|]"),
-    # an "Acceptance N" / "finding N" / "Step N" / "Step N-M" / "Step N/M"
-    # cross-reference (a CONTRACT.md item number / this doc's own numbered
-    # findings list / this doc's own numbered "Step" sections).
-    re.compile(r"\b(?:Acceptance|finding|Step)\s+\d+(?:[-/]\d+)?\b", re.IGNORECASE),
+    # B4 (round-22 audit): "Acceptance N" / "finding N" / "Step N" / "Step
+    # N-M" / "Step N/M" cross-references — each ANCHORED to its own actual
+    # idiom rather than one shared case-insensitive catch-all. The prior
+    # combined form's IGNORECASE made lowercase prose "step" (a training-
+    # step COUNT, e.g. "detected at step 12/12 seeds") collide with the
+    # doc-internal "Step N" section cross-reference and get swallowed whole
+    # — losing the adjacent real measured claim, not just the cross-ref
+    # itself (round-22 audit probes: "detected at step 12/12 seeds" and
+    # "Step 8/12 seeds" must be FOUND, not excluded, since neither is
+    # actually this doc's own Step-1/2/3 cross-reference).
+    #   - "Step" is ALWAYS capitalized in this doc's own cross-references,
+    #     and always one of this doc's own three numbered "Step" sections
+    #     (`### Step 1` / `### Step 2` / `### Step 3`) — bounded 1-3, never
+    #     IGNORECASE, so lowercase "step" (a training-step count) is never
+    #     swallowed by this class at all.
+    re.compile(r"\bStep\s+[1-3](?:[-/][1-3])?\b"),
+    #   - "Acceptance" (this doc's single acceptance criterion, "Acceptance
+    #     5") appears both capitalized and lowercase — bounded to a single
+    #     digit (this doc names only "5"; a wider criterion set is a
+    #     human-reviewed widening, never silently re-opened to \d+).
+    re.compile(r"\bAcceptance\s+[1-9]\b", re.IGNORECASE),
+    #   - "finding" (this doc's own numbered audit-finding cross-references,
+    #     "finding 1".."finding 4") is always lowercase here — bounded to a
+    #     single digit for the same reason.
+    re.compile(r"\bfinding\s+[1-9]\b"),
     # this repo's own `docs/plans/<N>-<slug>` directory-numbering
     # convention (`63-how-well`, `61-perf-unification`) — a path segment,
     # never a measurement.
@@ -467,8 +569,28 @@ _EXTRA_EXCLUSIONS = [
     # above, widened to this file's own additional numbered-reference
     # vocabulary.
     re.compile(r"\bCONTRACT\s+\d+\b"),
-    re.compile(r"\bunit[\s-]+\d+\b", re.IGNORECASE),
-    re.compile(r"\bdelta\s+\d+\b"),
+    # B4 (round-22 audit): "unit N" — this repo's own unit-numbering
+    # cross-reference is ALWAYS this unit's own number, "63" (`unit 63`,
+    # `unit-63`, `Unit 63`) in every in-scope file today — bounded to that
+    # literal rather than `\d+`, so a bare "unit 12" (a genuinely different
+    # number, e.g. a training-unit COUNT) would surface as a real claim
+    # instead of being silently swallowed as though it were this doc's own
+    # self-reference.
+    re.compile(r"\bunit[\s-]+63\b", re.IGNORECASE),
+    # B4 (round-22 audit): "delta N" was over-broad enough to swallow ANY
+    # "delta N" occurrence, anywhere — anchored to the actual idiom this
+    # corpus uses it for, the doc's own "PLAN v2 delta N" self-reference
+    # (`CONTRACT 63 (PLAN v2 delta 7; ...)`), never a bare "delta N" in
+    # isolation. NOTE (future-inclusion hazard): `CONTRACT.md` itself (not
+    # in `MEASUREMENT_FILES` today — see the module doc's SCOPE NOTE) uses
+    # a BARE "delta N" idiom per-item (`delta 0`, `delta 3`, ... one per
+    # contract item) that is a genuine per-item cross-reference, NOT a
+    # measurement, but does NOT share the "PLAN v2" prefix this pattern
+    # anchors to; a future unit that brings CONTRACT.md into scope must
+    # NOT simply widen this pattern back to `\bdelta\s+\d+\b` (that
+    # regresses this exact fix) — it needs its own anchored class (or
+    # per-item `const` bindings) for CONTRACT.md's bare "delta N" idiom.
+    re.compile(r"\bPLAN\s+v2\s+delta\s+\d+\b"),
     # an `H<n>(<m>)` requirement/heading cross-reference (`H5(1)`).
     re.compile(r"\bH\d+\(\d+\)"),
     # a `*.patch` filename (`M_eps_-0.10.patch`, `M_nobc.patch`) — the
@@ -477,20 +599,26 @@ _EXTRA_EXCLUSIONS = [
     # value (`M_eps_-0.10.patch`) is excluded as part of the name, not
     # read as a bare decimal.
     re.compile(r"\bM_[A-Za-z0-9_.+-]*\.patch\b"),
-    # this section's own `s: 0 -> 1` / `s=0` / `s=1` interpolation-parameter
-    # axis notation (the untrained/trained operating-point labels for the
-    # secant slope) — same class as the epoch/step/t axis-label exclusion
-    # above, for the one additional axis variable this section names.
-    re.compile(r"\bs\s*[:=]\s*\d+(?:\s*->\s*\d+)?\b"),
+    # B4 (round-22 audit): this section's own `s: 0 -> 1` / `s=0` / `s=1`
+    # interpolation-parameter axis notation (the untrained/trained
+    # operating-point labels for the secant slope) — bounded to the axis's
+    # own literal domain, `{0, 1}` (every real occurrence names one or both
+    # endpoints; the variable is DEFINED as running over `[0, 1]`), rather
+    # than an unbounded `\d+`, so an adjacent real measured claim written
+    # as `s=<value>` for any OTHER value is never silently swallowed.
+    re.compile(r"\bs\s*[:=]\s*[01](?:\s*->\s*[01])?\b"),
     # an `eps < 0` / `eps > 0` sign-domain condition (which branch of the
     # signed dose family a column belongs to) — a formula/domain
     # description, same class as the named-hyperparameter-assignment
     # exclusion above, not a measurement of any particular eps value.
     re.compile(r"\beps\s*[<>]\s*0\b"),
-    # a shell/CLI process exit-code label (`exit 0`) — never a stored
-    # measurement, same class as the existing `RC:\d+` exit-code
-    # exclusion, for this corpus's prose form of the same idiom.
-    re.compile(r"\bexit\s+\d+\b"),
+    # B4 (round-22 audit): a shell/CLI process exit-code label — every real
+    # occurrence in this corpus is "exit 0" (the merger/build ALWAYS exits
+    # 0 in the quoted scenarios; a non-zero exit is described in prose
+    # without a digit, e.g. "non-zero exit"), so bounded to that literal
+    # rather than `\d+` — an adjacent real measured claim written as
+    # "exit N" for any other N is never silently swallowed.
+    re.compile(r"\bexit\s+0\b"),
     # a `seed{N,M}` brace-set notation — the same "seed list" idiom the
     # `seeds? \d+(?:,|and)...` exclusion above covers for space-separated
     # lists, widened to this corpus's brace-delimited form.
@@ -530,16 +658,22 @@ def _all_excluded_spans(text: str) -> list[tuple[int, int]]:
 
 def find_claim_tokens(line: str, line_no: int) -> list[rule_h.Token]:
     """Same shape as `rule_h.find_tokens_in_row`, over `SCI_NUMBER_RE` and
-    the UNION of rule (h)'s own exclusions plus this corpus's additions —
-    heading lines (`^#`) are never scanned (a title/heading is a label,
-    never a measurement claim; this is what keeps a bare `status: GREEN`
-    in a heading from colliding with the field-adjacent form inside a
-    claim paragraph). A `claims63:` TAG line itself is never scanned either
-    — it is a directive, not claim-bearing content, and its own expr text
-    (artifact paths, function args) is not a second population of claims
-    needing its own tag one line up."""
-    if line.lstrip().startswith("#"):
-        return []
+    the UNION of rule (h)'s own exclusions plus this corpus's additions.
+    A1 (round-22 audit): heading lines (`^#`) are IN SCOPE, exactly like any
+    other line — the prior whole-line `^#` skip swallowed BOTH a live
+    threshold flip written directly into a heading AND an injected false
+    heading claim (the auditor's own probes), since nothing under a `#`
+    line was ever even a candidate for a finding. There is no bespoke
+    heading carve-out any more: a numeric token in a heading binds/excludes
+    through the exact same tag/exclusion-class machinery as prose (most
+    heading numbers already fall under an existing lexical class — a
+    self-referencing `unit 63`, a dated amendment, a bounded `Step N`/
+    `Acceptance N` cross-reference — the few that do not get an explicit
+    `claims63` tag on the line above, same as any prose line). A
+    `claims63:` TAG line itself is still never scanned — it is a directive,
+    not claim-bearing content, and its own expr text (artifact paths,
+    function args) is not a second population of claims needing its own
+    tag one line up."""
     if _TAG_RE.match(line):
         return []
     ex = _all_excluded_spans(line)
@@ -1131,11 +1265,20 @@ _RECIPE_KINDS = {
 
 
 def scan_file(
-    rel_path: str, loader: Loader, ledger: set[str] | None = None
+    rel_path: str,
+    loader: Loader,
+    ledger: set[str] | None = None,
+    consumed_ledger_keys: set[str] | None = None,
 ) -> tuple[list[Finding], int, int, dict[str, int]]:
     """Returns `(findings, tokens_in_zone, tokens_bound, breakdown)` —
     `breakdown` counts successfully-bound tokens per `_BREAKDOWN_KINDS`
-    category (a finding is never counted in any category)."""
+    category (a finding is never counted in any category). When
+    `consumed_ledger_keys` is passed, every `ledger`/`const` key that
+    successfully matches an entry gets added to it — A2 (round-22 audit):
+    the unused-entry leg (`check_unused_ledger_entries` below) diffs this
+    set against `load_ledger()`'s full contents to find an entry the doc no
+    longer cites at all (an orphan, e.g. left behind after a lexical
+    exclusion class widened to cover what the entry used to escape)."""
     ledger = ledger if ledger is not None else set()
     abspath = REPO_ROOT / rel_path
     text = abspath.read_text()
@@ -1204,6 +1347,8 @@ def scan_file(
                 else:
                     tokens_bound += 1
                     breakdown[expr.kind] += 1
+                    if consumed_ledger_keys is not None:
+                        consumed_ledger_keys.add(key)
                 continue
             try:
                 binding = evaluator.eval(expr)
@@ -1252,6 +1397,25 @@ def scan_file(
     return findings, tokens_in_zone, tokens_bound, breakdown
 
 
+# B3 (round-22 audit): MIRROR-EXEMPTION — a CLOSED list of field-NAME pairs
+# that are a KNOWN, legitimate same-artifact duplicate, never a
+# coincidental collision the ambiguity leg exists to catch. The one
+# member today: `held_out_example_mean` (the top-level per-leg summary
+# field) and `held_out_mean` (logged once per entry under
+# `tiers.finetune_run.trajectory[i]`) — the untrained (`lr=0`) checkpoint's
+# held-out mean is recorded BOTH as the summary field AND at every
+# trajectory step before the model has moved, so they are BIT-IDENTICAL by
+# construction, not an accidental match. Growing this list is a
+# human-reviewed PR (never a wildcard/prefix rule) — each entry states the
+# reason inline; a self-test fixture proves it exempts ONLY this pair (a
+# different field-name collision must still report).
+_MIRROR_EXEMPT_FIELD_PAIRS: frozenset[frozenset[str]] = frozenset(
+    {
+        frozenset({"held_out_example_mean", "held_out_mean"}),  # untrained checkpoint, logged twice
+    }
+)
+
+
 def _check_ambiguity(loader: Loader, path: str, pointer: str, token_text: str, value: Decimal) -> str | None:
     """Anti-vacuity leg (b): an INDEPENDENT leaf scan (never calling
     `Loader.resolve`/`rule_h._rfc6901_walk` again) — walks the artifact's
@@ -1287,7 +1451,13 @@ def _check_ambiguity(loader: Loader, path: str, pointer: str, token_text: str, v
         # `decision/p_value` vs `sign_test/p_value`) is an intentionally
         # mirrored quantity, not a coincidental collision — only a
         # DIFFERENT field name matching is a real ambiguity.
-        if leaf_ptr.rsplit("/", 1)[-1] == source_field:
+        leaf_field = leaf_ptr.rsplit("/", 1)[-1]
+        if leaf_field == source_field:
+            continue
+        # B3 MIRROR-EXEMPTION: a different-but-KNOWN-legit field-name pair
+        # (see `_MIRROR_EXEMPT_FIELD_PAIRS` above) — closed, reviewed,
+        # never a wildcard.
+        if frozenset({source_field, leaf_field}) in _MIRROR_EXEMPT_FIELD_PAIRS:
             continue
         q = _quantize(leaf_val, places)
         if q == tok_d:
@@ -1421,6 +1591,64 @@ def check_coverage() -> list[str]:
     return problems
 
 
+def check_fence_integrity() -> list[str]:
+    r"""B1 (round-22 audit): the fence carve-out's own two-part fail-closed
+    check. (i) PARITY — an odd `\`\`\`` delimiter count means the file's own
+    fence nesting is unbalanced; every line from the last delimiter to EOF
+    was silently treated as fenced (carved out of `check_coverage`'s token
+    count too) on a false premise — reported HERE, never absorbed into a
+    token-count drift message that would misname the defect. (ii) SPAN —
+    even when balanced, the total fenced-line count is pinned separately
+    from `FILE_TOKEN_DENOMINATOR` (`FENCE_LINE_DENOMINATOR`), so a line
+    appended INSIDE an already-closed fence — which changes NO token count,
+    since fenced content is never tokenized — still drifts a pinned number
+    and is caught."""
+    problems = []
+    for rel_path in MEASUREMENT_FILES:
+        abspath = REPO_ROOT / rel_path
+        lines = abspath.read_text().splitlines()
+        fenced, delimiter_count = _fence_scan(lines)
+        if delimiter_count % 2 != 0:
+            problems.append(
+                f"{rel_path}: odd number of ``` fence delimiters "
+                f"({delimiter_count}) — an unclosed fence would silently carve out "
+                "the remainder of the file from claim-token scanning"
+            )
+            continue  # the span pin is meaningless over an unbalanced file
+        expected = FENCE_LINE_DENOMINATOR.get(rel_path)
+        if expected is None:
+            problems.append(f"{rel_path}: no FENCE_LINE_DENOMINATOR pinned")
+        elif len(fenced) != expected:
+            problems.append(
+                f"{rel_path}: fenced-line count drifted: pinned {expected}, counted "
+                f"{len(fenced)} (a fence was added, removed, or resized without "
+                "updating the pin)"
+            )
+    return problems
+
+
+def check_unused_ledger_entries() -> list[str]:
+    """A2 (round-22 audit): a `ledger`/`const` allowlist entry that is
+    consumed by NOTHING in the real tree is itself a FINDING — a ledger
+    row is a standing claim "this specific token, at this specific line
+    hash, genuinely needs the escape"; once that token is deleted, edited,
+    or (per B4/A1) brought back in-scope by a tightened exclusion class or
+    the heading-line skip's removal, the row becomes a dead escape no
+    scan_file run will ever match again, and a shrink-only ratchet with no
+    liveness check on its OWN entries can silently accumulate orphans
+    forever (the auditor found exactly one: the `[exit-code]` row for
+    `mutants/README.md`'s "(exit 0)" token — already fully covered by the
+    `exit N` lexical exclusion class, so `scan_file` never reaches the
+    ledger-membership check for it at all)."""
+    ledger = load_ledger()
+    loader = Loader()
+    consumed: set[str] = set()
+    for rel_path in MEASUREMENT_FILES:
+        scan_file(rel_path, loader, ledger, consumed_ledger_keys=consumed)
+    unused = ledger - consumed
+    return [f"ledger entry never consumed by any scan: {key!r}" for key in sorted(unused)]
+
+
 # --- report / gate -----------------------------------------------------------
 
 
@@ -1442,7 +1670,7 @@ def run_real_tree() -> tuple[list[Finding], int, int, dict[str, int]]:
 
 
 def gate() -> int:
-    problems = check_coverage()
+    problems = check_coverage() + check_fence_integrity() + check_unused_ledger_entries()
     findings, in_zone, bound, breakdown = run_real_tree()
     ok = True
     for p in problems:
@@ -1768,6 +1996,65 @@ def self_test() -> int:
             mind_binding.value < maxd_binding.value,  # type: ignore[operator]
         )
 
+        # --- B3 (round-22 audit): abs()-unwrap sign sensitivity + mirror
+        # exemption. The five sites at mutants/README.md:156/158/160/162/238
+        # used to wrap a scalar pointer in `abs()`, which (i) is sign-blind
+        # (a negated artifact value still equals the SAME printed token,
+        # since both sides go through `abs()`) and (ii) skips the ambiguity
+        # leg entirely (`expr.kind != "ptr"`). Now unwrapped to bare `ptr`
+        # bindings — restoring both properties, demonstrated directly.
+        sign_loader = Loader()
+        sign_loader._cache["fixture-sign.json"] = {"held_out_example_mean": -3.422172799706459}
+        sign_ev = Evaluator(sign_loader, {}, "fixture-sign.json")
+        bare_binding = sign_ev.eval(parse_expr("#/held_out_example_mean"))
+        check(
+            "B3 sign sensitivity restored: a negated artifact value FAILS a bare ptr "
+            "binding against the (positive-printed) real token",
+            not compare_token("3.422172799706459", bare_binding.value)[0],  # type: ignore[arg-type]
+        )
+        abs_binding_would_absorb = sign_ev.eval(parse_expr("abs(#/held_out_example_mean)"))
+        check(
+            "B3 contrast: the OLD abs()-wrapped form would have silently absorbed the "
+            "identical sign flip (why the wrap was sign-blind, not why it's still used here)",
+            compare_token("3.422172799706459", abs_binding_would_absorb.value)[0],  # type: ignore[arg-type]
+        )
+
+        # MIRROR-EXEMPTION: the real `held_out_example_mean` sites now bind
+        # as bare `ptr`, so the ambiguity leg (b) runs on them — it must NOT
+        # flag the KNOWN legit `held_out_example_mean`/`held_out_mean`
+        # mirror (the untrained checkpoint logged both as the summary field
+        # and under every `trajectory[i]`), driven end-to-end through the
+        # REAL committed artifact (never a synthetic stand-in for this
+        # specific pair — the exemption's whole point is this real
+        # duplicate).
+        mirror_doc_path = "docs/plans/63-how-well/measurements/campaign-v1/raw/seed1__fused__lr0.json"
+        mirror_amb = _check_ambiguity(
+            loader,
+            mirror_doc_path,
+            "/tiers/finetune_run/held_out_example_mean",
+            "3.422172799706459",
+            Decimal("3.422172799706459"),
+        )
+        check(
+            "B3 mirror exemption: held_out_example_mean vs trajectory[].held_out_mean "
+            "does NOT report ambiguous (known legit same-artifact mirror)",
+            mirror_amb is None,
+        )
+        # adversarial: a DIFFERENT ambiguous pointer (not the exempted pair)
+        # must still report — proving the exemption is narrow, not a
+        # blanket "skip decimal collisions in this artifact" escape.
+        amb_fixture_doc = {"decision": {"mean_d": 0.023799}, "unrelated": {"other_field": 0.023799}}
+        amb_loader = Loader()
+        amb_loader._cache["fixture-amb.json"] = amb_fixture_doc
+        non_exempt_amb = _check_ambiguity(
+            amb_loader, "fixture-amb.json", "/decision/mean_d", "0.023799", Decimal("0.023799")
+        )
+        check(
+            "B3 mirror exemption is NARROW: a different (non-exempted) field-name "
+            "collision still reports ambiguous",
+            non_exempt_amb is not None,
+        )
+
         # wrong-file binding: dstar's n_pos=12 must NOT validate against
         # red-proof's own (pre-D*) report — `mutant_dose_ladder.red_proof[0]`
         # there (the `redproof-nobc` column) reads n_pos=3.
@@ -1815,10 +2102,59 @@ def self_test() -> int:
         "exclusion(Step N) adversarial: a measured value beside 'Step 2' is still found",
         toks_of("the measured value was 2.5 in Step 2") == ["2.5"],
     )
-    check("exclusion(CONTRACT/unit/delta N): all three excluded", toks_of("CONTRACT 63 unit 63 delta 7") == [])
+    check(
+        "exclusion(CONTRACT/unit/PLAN-v2-delta N): all three excluded (unit/delta ANCHORED, round-22 B4)",
+        toks_of("CONTRACT 63 unit 63 PLAN v2 delta 7") == [],
+    )
     check(
         "exclusion(CONTRACT N) adversarial: a measured value beside 'CONTRACT 63' is still found",
         toks_of("measured 63.5 in CONTRACT 63") == ["63.5"],
+    )
+
+    # B4 (round-22 audit): old-vs-new differential probes — the auditor's
+    # EXACT examples. Under the pre-fix combined, IGNORECASE "Step N"
+    # class, BOTH of these swallowed their own real measured claim whole
+    # (`toks_of(...) == []`); anchored per-idiom, both numerals must now be
+    # FOUND.
+    check(
+        "B4 differential (round-22 audit exact probe): 'detected at step 12/12 seeds' "
+        "no longer swallowed WHOLE by the (now-anchored, capital-only) Step class — "
+        "the second '12' surfaces; the first is still legitimately excluded by the "
+        "SEPARATE, pre-existing epoch/step/t axis-label class (a genuine 'step N' "
+        "training-step index, out of THIS fix's scope), not by a lowercase collision",
+        toks_of("detected at step 12/12 seeds") == ["12"],
+    )
+    check(
+        "B4 differential (round-22 audit exact probe): 'Step 8/12 seeds' no longer "
+        "swallowed by the unbounded 'Step N/M' range — both numerals found (8 is "
+        "outside this doc's own Step 1-3 range)",
+        toks_of("Step 8/12 seeds") == ["8", "12"],
+    )
+    # ...while the doc's own REAL cross-reference sites (bounded 1-3) still
+    # exclude cleanly, both singular and range/slash forms.
+    check(
+        "B4: real Step cross-refs still exclude cleanly (Step 1, Step 2/3, Step 1-3)",
+        toks_of("Step 1") == [] and toks_of("Step 2/3") == [] and toks_of("Step 1-3") == [],
+    )
+    check(
+        "B4: 'unit 63'/'unit-63' still excludes cleanly, but a DIFFERENT unit number "
+        "(e.g. a training-unit count) is now found, not silently swallowed",
+        toks_of("unit 63") == [] and toks_of("unit-63 round-7") == [] and toks_of("unit 12") == ["12"],
+    )
+    check(
+        "B4: 'PLAN v2 delta 7' still excludes cleanly, but a bare 'delta 3' "
+        "(e.g. CONTRACT.md's own per-item idiom) is now found, not silently swallowed",
+        toks_of("PLAN v2 delta 7") == [] and toks_of("delta 3") == ["3"],
+    )
+    check(
+        "B4: 's=1'/'s: 0 -> 1' still exclude cleanly, but 's=2' (outside the "
+        "axis's own {0,1} domain) is now found",
+        toks_of("s=1") == [] and toks_of("s: 0 -> 1") == [] and toks_of("s=2") == ["2"],
+    )
+    check(
+        "B4: 'exit 0' still excludes cleanly, but 'exit 1' (a different, real exit "
+        "code) is now found, not silently swallowed",
+        toks_of("cargo build (exit 0)") == [] and toks_of("cargo build (exit 1)") == ["1"],
     )
     check("exclusion(H\\d+(\\d+)): \"per H5(1)'s own rule\" excludes cleanly", toks_of("per H5(1)'s own rule") == [])
     check(
@@ -1861,6 +2197,80 @@ def self_test() -> int:
     check(
         "self-test: real tree tokenizer matches pinned FILE_TOKEN_DENOMINATOR",
         len(check_coverage()) == 0,
+    )
+
+    # --- B1 (round-22 audit): fence carve-out fail-closed fixtures — the
+    # auditor's exact laundering probe, both variants, plus a clean-tree and
+    # a restore proof.
+    check(
+        "B1: check_fence_integrity() is clean on the real committed tree",
+        check_fence_integrity() == [],
+    )
+
+    def _fence_problems_for(rel_path: str, text: str) -> list[str]:
+        """Same two-part logic as `check_fence_integrity`, over an
+        arbitrary text blob instead of the real committed file — lets the
+        laundering probes below mutate a COPY without touching the real
+        tree, while still exercising the exact parity/span-pin checks."""
+        problems: list[str] = []
+        fenced, delimiter_count = _fence_scan(text.splitlines())
+        if delimiter_count % 2 != 0:
+            problems.append(f"{rel_path}: odd fence delimiter count ({delimiter_count})")
+            return problems
+        expected = FENCE_LINE_DENOMINATOR.get(rel_path)
+        if len(fenced) != expected:
+            problems.append(f"{rel_path}: fenced-line count drifted: pinned {expected}, counted {len(fenced)}")
+        return problems
+
+    real_mutants_rel_for_fence = "docs/plans/63-how-well/mutants/README.md"
+    real_mutants_text_for_fence = (REPO_ROOT / real_mutants_rel_for_fence).read_text()
+
+    # laundering probe (a): append a false Measured line behind an UNCLOSED
+    # ``` fence — the prior version had NO balance check at all, so this
+    # silently fenced everything through EOF (never even a candidate for a
+    # finding, regardless of the token-count pin). Must RED via PARITY.
+    unclosed_text = real_mutants_text_for_fence + "\n```\nA laundered false Measured claim: 99.9.\n"
+    check(
+        "B1 laundering probe (a): a false claim behind an UNCLOSED ``` fence REDs "
+        "via the PARITY check (odd delimiter count)",
+        bool(_fence_problems_for(real_mutants_rel_for_fence, unclosed_text)),
+    )
+
+    # laundering probe (b): append a new line INSIDE an already-CLOSED
+    # fence — balanced parity (even delimiter count), so probe (a)'s check
+    # does not fire, and `FILE_TOKEN_DENOMINATOR` does not move either
+    # (fenced content is never tokenized) — must RED via the SPAN pin
+    # instead (`FENCE_LINE_DENOMINATOR`), the second, independent leg B1
+    # adds.
+    _fence_lines = real_mutants_text_for_fence.splitlines(keepends=True)
+    _first_open_idx = next(i for i, l in enumerate(_fence_lines) if l.strip().startswith("```"))
+    # one line PAST the opening delimiter — strictly interior to the block,
+    # never the delimiter line itself (which would instead flip parity).
+    inside_closed_fence_text = "".join(
+        _fence_lines[: _first_open_idx + 1]
+        + ["A laundered false Measured claim inside a CLOSED fence: 88.8.\n"]
+        + _fence_lines[_first_open_idx + 1 :]
+    )
+    _, inside_delim = _fence_scan(inside_closed_fence_text.splitlines())
+    check(
+        "B1 laundering probe (b) setup: appending inside an existing fence keeps "
+        f"parity EVEN ({inside_delim}) — probe (a)'s parity check does NOT fire here",
+        inside_delim % 2 == 0,
+    )
+    check(
+        "B1 laundering probe (b): a false claim appended INSIDE an already-CLOSED "
+        "fence REDs via the SPAN pin (FENCE_LINE_DENOMINATOR), even though token "
+        "count and fence parity are both unchanged",
+        bool(_fence_problems_for(real_mutants_rel_for_fence, inside_closed_fence_text)),
+    )
+
+    # restore: an unmutated copy of the real file must stay clean under the
+    # SAME per-text check the two probes above use — proving the probes
+    # above discriminate on the injected mutation, not on the harness.
+    check(
+        "B1 restore: an unmutated copy of the real file is clean under the same "
+        "per-text fence check",
+        _fence_problems_for(real_mutants_rel_for_fence, real_mutants_text_for_fence) == [],
     )
 
     # ledger cross-check: mutation-adequacy — a `ledger` tag whose key is
@@ -1908,18 +2318,88 @@ def self_test() -> int:
     # never a synthetic 2-line fixture, so a regression in the inversion
     # itself (a zone/scope narrowing creeping back in) cannot hide behind a
     # too-small fixture the way the pre-inversion CLAIM_ZONES bug did.)
-    real_mutants_path = REPO_ROOT / "docs/plans/63-how-well/mutants/README.md"
+    real_mutants_rel = "docs/plans/63-how-well/mutants/README.md"
+    real_mutants_path = REPO_ROOT / real_mutants_rel
     real_mutants_text = real_mutants_path.read_text()
     real_ledger = load_ledger()
+
+    def _remap_ledger_to_tmp(new_rel: str) -> set[str]:
+        """B2 (round-22 audit fix): the real ledger's `ledger`/`const` keys
+        are prefixed with THIS file's real repo-relative path
+        (`real_mutants_rel`). The prior version scanned a temp copy under a
+        DIFFERENT path (`str(Path(td) / "README.md")`) without remapping,
+        so every one of the ~173 mutants-scoped keys mismatched — a
+        188-finding baseline (one per ledger/const entry, since none of
+        their keys could ever match at the wrong path) loud enough that
+        ANY perturbation, even a no-op, still "REDded": the auditor ran
+        old==new and still got 188 findings, proving the five probes below
+        were vacuous. Remapping every real key for THIS file onto the temp
+        path (same trailing `:<token>:<hash>:<col>` shape, only the path
+        prefix swapped) restores a byte-identical copy to a CLEAN scan, so
+        each probe's finding count reflects ONLY the perturbation it
+        introduces."""
+        remapped: set[str] = set()
+        prefix_plain = f"{real_mutants_rel}:"
+        prefix_const = f"const:{real_mutants_rel}:"
+        for key in real_ledger:
+            if key.startswith(prefix_const):
+                remapped.add(f"const:{new_rel}:{key[len(prefix_const):]}")
+            elif key.startswith(prefix_plain):
+                remapped.add(f"{new_rel}:{key[len(prefix_plain):]}")
+        return remapped
+
+    def _scan_tmp_copy(text: str) -> list[Finding]:
+        with _tempfile.TemporaryDirectory() as td:
+            # B2: the temp copy's OWN directory is named `mutants/` — not
+            # just cosmetic: `scan_file` gates `parse_code_blocks` (the
+            # fenced-code-block self-referential `code()` artifact) on
+            # `"mutants" in rel_path`; a temp path with no such substring
+            # would silently disable that artifact too, a SECOND
+            # independent source of baseline noise the auditor's original
+            # fixture never isolated from the ledger-key mismatch.
+            p = Path(td) / "mutants" / "README.md"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(text)
+            new_rel = str(p)
+            remapped_ledger = _remap_ledger_to_tmp(new_rel)
+            findings, _, _, _ = scan_file(new_rel, Loader(), ledger=remapped_ledger)
+            return findings
 
     def _mutate_and_scan(old: str, new: str) -> list[Finding]:
         assert old in real_mutants_text, f"probe anchor text not found: {old!r}"
         mutated = real_mutants_text.replace(old, new, 1)
-        with _tempfile.TemporaryDirectory() as td:
-            p = Path(td) / "README.md"
-            p.write_text(mutated)
-            findings, _, _, _ = scan_file(str(p), Loader(), ledger=real_ledger)
-            return findings
+        return _scan_tmp_copy(mutated)
+
+    # B2 baseline proof: a byte-identical temp copy (ledger keys remapped
+    # to the temp path) must scan CLEAN — the corrected variant's own
+    # anti-vacuity proof. Every probe below relies on this baseline being
+    # 0; if it drifts nonzero again, every probe below becomes vacuous
+    # again exactly as the pre-fix version was, so this is asserted
+    # FIRST and by itself.
+    baseline_findings = _scan_tmp_copy(real_mutants_text)
+    check(
+        "B2 baseline (round-22 fix): byte-identical temp copy, ledger remapped, "
+        f"scans CLEAN ({len(baseline_findings)} findings; the pre-fix mismatched-path "
+        "form carried ~188 findings on this SAME input)",
+        len(baseline_findings) == 0,
+    )
+
+    # B2 no-op-mutation control: with the baseline now clean, a NO-OP
+    # "mutation" (the anchor text replaced by itself) must produce ZERO
+    # findings — i.e. it correctly FAILS the "expects a finding" shape
+    # every real probe below asserts. This is a deliberate NEGATIVE
+    # control (asserting the fixture discriminates, not that it always
+    # fires) — printed and checked explicitly, never silently assumed.
+    noop_findings = _mutate_and_scan(
+        "RETIRED, measured INERT on GPU (12/12 bit-identical)",
+        "RETIRED, measured INERT on GPU (12/12 bit-identical)",
+    )
+    check(
+        f"B2 no-op-mutation control: a no-op edit produces NO finding ({len(noop_findings)}, "
+        "not the pre-fix ~188) — proves the probes below discriminate rather than firing "
+        "unconditionally",
+        len(noop_findings) == 0,
+    )
 
     # probe 1 (round-21 :929 analog): M_signflip v1's own "RETIRED, measured
     # INERT on GPU (12/12 bit-identical)" perturbed to a near-miss 11/12 --
@@ -1928,14 +2408,23 @@ def self_test() -> int:
         "RETIRED, measured INERT on GPU (12/12 bit-identical)",
         "RETIRED, measured INERT on GPU (11/12 bit-identical)",
     )
-    check("round-21 probe :929 (M_signflip v1 12/12->11/12) REDs under the inverted model", bool(f929))
+    check(
+        "round-21 probe :929 (M_signflip v1 12/12->11/12) REDs under the inverted model "
+        f"with EXACTLY ONE new finding ({len(f929)}) — B2: the corrected baseline+remap "
+        "makes the count discriminating, not just nonzero",
+        len(f929) == 1,
+    )
 
     # probe 2 (round-21 :153 analog): Step 1's own committed-benchmark table,
     # one full-precision `held_out_example_mean` value perturbed in its last
     # digit -- was silently OUTSIDE every CLAIM_ZONES range before the
     # inversion (the "committed-benchmark table" round-21 itself named).
     f153 = _mutate_and_scan("`3.218041628599167`", "`3.218041628599168`")
-    check("round-21 probe :153 (Step-1 table full-precision value, last digit) REDs under the inverted model", bool(f153))
+    check(
+        "round-21 probe :153 (Step-1 table full-precision value, last digit) REDs under "
+        f"the inverted model with EXACTLY ONE new finding ({len(f153)})",
+        len(f153) == 1,
+    )
 
     # probe 3 (round-21 :551 analog): M1's own "8/12, well under either
     # threshold" restatement perturbed to a near-miss 9/12 -- was silently
@@ -1944,7 +2433,11 @@ def self_test() -> int:
         "sign-flipping-transient shape: 8/12, well under either threshold);",
         "sign-flipping-transient shape: 9/12, well under either threshold);",
     )
-    check("round-21 probe :551 (M1 8/12->9/12 restatement) REDs under the inverted model", bool(f551))
+    check(
+        "round-21 probe :551 (M1 8/12->9/12 restatement) REDs under the inverted model "
+        f"with EXACTLY ONE new finding ({len(f551)})",
+        len(f551) == 1,
+    )
 
     # probe 4 (round-21 "EOF-append"): a brand-new, untagged measured-shaped
     # claim appended past the end of the file -- the exact shape a
@@ -1955,7 +2448,11 @@ def self_test() -> int:
         real_mutants_text[-40:],
         real_mutants_text[-40:] + "\nA freshly appended, untagged measured claim: 42.42.\n",
     )
-    check("round-21 probe (EOF-append, untagged) REDs under the inverted model", bool(f_eof))
+    check(
+        "round-21 probe (EOF-append, untagged) REDs under the inverted model with "
+        f"EXACTLY ONE new finding ({len(f_eof)})",
+        len(f_eof) == 1,
+    )
 
     # negative control (round-21 :1111 analog): the "Files" section's own
     # `M_signflip_v2.patch` restatement of "measured RED, 12/12" was ALREADY
@@ -1967,7 +2464,83 @@ def self_test() -> int:
         "member of this pair, **measured RED, 12/12, `red_proof_verdict=PROVEN`",
         "member of this pair, **measured RED, 11/12, `red_proof_verdict=PROVEN`",
     )
-    check("round-21 probe :1111 analog (Files-section 12/12 restatement) STILL REDs post-inversion", bool(f1111))
+    check(
+        "round-21 probe :1111 analog (Files-section 12/12 restatement) STILL REDs "
+        f"post-inversion with EXACTLY ONE new finding ({len(f1111)})",
+        len(f1111) == 1,
+    )
+
+    # --- A1 (round-22 audit): heading lines are now IN SCOPE. Unit-level:
+    # a heading line is tokenized exactly like prose (no more whole-line
+    # `^#` skip). End-to-end: a threshold flip written directly INTO a
+    # heading, and an injected false claim appended to a heading, must
+    # both RED through the real `scan_file` entry point on the real,
+    # committed file — the auditor's exact two probes, reproduced as
+    # regression fixtures the same way the round-21 probes are above.
+    check(
+        "A1 unit: a heading line is tokenized like prose (no whole-line '#' skip)",
+        toks_of("# status: threshold 11 met, gate_seed_count 12") == ["11", "12"],
+    )
+    # probe A1-a (threshold flip IN a heading): mutants/README.md's own
+    # "Step 3" heading names the pre-registered ">=11/12+mean" rule
+    # directly in its title; flipping "11" to "10" there must RED (this
+    # exact heading now carries a real `claims63` tag one line above it,
+    # bound to `#/decision/threshold` / `#/decision/gate_seed_count`).
+    f_heading_threshold = _mutate_and_scan(
+        "### Step 3 — predicted detection verdict under the >=11/12+mean rule",
+        "### Step 3 — predicted detection verdict under the >=10/12+mean rule",
+    )
+    check(
+        f"A1 probe (threshold flip IN a heading) REDs with EXACTLY ONE new finding "
+        f"({len(f_heading_threshold)}) — the pre-fix whole-line heading skip would "
+        "have silently absorbed this",
+        len(f_heading_threshold) == 1,
+    )
+    # probe A1-b (injected false heading claim): appending a brand-new,
+    # untagged measured-shaped claim INTO the file's own H1 title line —
+    # the exact shape the pre-fix heading skip was structurally blind to,
+    # since nothing on a `#` line was ever even a candidate for a finding.
+    f_heading_inject = _mutate_and_scan(
+        "# Unit 63 H5 — kernel-mutant RED column",
+        "# Unit 63 H5 — kernel-mutant RED column (spurious measured 77.7)",
+    )
+    check(
+        f"A1 probe (injected false claim INTO a heading) REDs with EXACTLY ONE new "
+        f"finding ({len(f_heading_inject)}) — untagged, so no claims63 tag above covers it",
+        len(f_heading_inject) == 1,
+    )
+
+    # --- A2 (round-22 audit): the unused-ledger-entry leg. Unit-level: a
+    # synthetic ledger with one consumed key and one orphan must report
+    # ONLY the orphan (never the consumed one, never a false positive on
+    # the whole ledger going unused because the real tree wasn't scanned).
+    with _tempfile.TemporaryDirectory() as _td2:
+        fixture_md = Path(_td2) / "fixture-unused.md"
+        fixture_content = "<!-- claims63: c1=ledger -->\nconsumed 7 claim\n"
+        fixture_md.write_text(fixture_content)
+        fixture_rel2 = str(fixture_md)
+        fixture_line2 = fixture_content.splitlines()[1]
+        fixture_tok2 = find_claim_tokens(fixture_line2, 2)[0]
+        consumed_key = f"{fixture_rel2}:{fixture_tok2.text}:{line_hash(fixture_line2)}:{fixture_tok2.col}"
+        orphan_key = f"{fixture_rel2}:999:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef:0"
+        consumed_seen: set[str] = set()
+        scan_file(fixture_rel2, Loader(), ledger={consumed_key, orphan_key}, consumed_ledger_keys=consumed_seen)
+        check(
+            "A2 unit: a ledger key an actual scan matches is marked consumed",
+            consumed_key in consumed_seen,
+        )
+        check(
+            "A2 unit: an orphan ledger key (never matched by any scan) is correctly "
+            "NOT marked consumed",
+            orphan_key not in consumed_seen,
+        )
+
+    check(
+        "A2: check_unused_ledger_entries() is clean on the real committed tree/ledger "
+        "(the [exit-code] mutants/README.md:0 row, orphaned by the pre-existing "
+        "'exit N' exclusion class, has been removed)",
+        check_unused_ledger_entries() == [],
+    )
 
     findings, in_zone, bound, breakdown = run_real_tree()
     check(

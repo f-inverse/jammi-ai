@@ -71,6 +71,7 @@ and the pairing used (mutant-vs-fused) does not mirror the gate's own statistic.
 M1 stands as an honestly-recorded non-detection, NOT a sensitivity bound. The
 corrected dose-ladder design is in amendment 2026-08-29b.
 
+<!-- claims63: c1=const -->
 ## probe/ — H5 step-0 (4 legs, a100)
 
 <!-- claims63: default=docs/plans/63-how-well/measurements/campaign-v1/probe/p1-alloff-mnrl-r1.json; c1=absdiff(#/tiers/finetune_run/held_out_example_mean, docs/plans/63-how-well/measurements/campaign-v1/probe/p2-alloff-mnrl-r2.json#/tiers/finetune_run/held_out_example_mean) -->

@@ -1006,9 +1006,18 @@ jobs:
           # scientific notation); new grammar (derived aggregates, the
           # cross-file raw-concordance recipe, relational/interval claims,
           # a `hist` quote marker) covers what rule (h)'s own grammar has
-          # no equivalent for. Same two-leg anti-vacuity discipline: a
-          # pinned per-file CLAIM_ZONE_DENOMINATOR (coverage) and an
-          # independent-leaf ambiguity scan.
+          # no equivalent for. INVERTED (allowlist-free) coverage model:
+          # every line of every in-scope file is a candidate by default: a
+          # pinned per-file FILE_TOKEN_DENOMINATOR (whole-file token
+          # coverage, replacing the old per-zone CLAIM_ZONE_DENOMINATOR
+          # this comment used to name — the zone allowlist itself was
+          # removed), a pinned per-file FENCE_LINE_DENOMINATOR plus a
+          # fence-delimiter PARITY check (an unclosed/widened ``` fence
+          # cannot silently carve out scanning), an unused-ledger-entry
+          # leg (an escape row consumed by nothing is itself a finding),
+          # and the independent-leaf ambiguity scan, with a closed
+          # MIRROR-EXEMPTION list for the one known legitimate
+          # same-artifact duplicate.
           - name: measurement claims
             cmd: python3 ci/scripts/check_measurement_claims.py
           - name: measurement claims self-test

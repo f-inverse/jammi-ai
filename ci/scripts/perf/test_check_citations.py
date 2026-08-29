@@ -25,7 +25,7 @@ import check_citations as cc  # noqa: E402
 
 class CheckCitationsFixture(unittest.TestCase):
     def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self._tmp.cleanup)
         self.root = Path(self._tmp.name)
 
@@ -53,8 +53,19 @@ class CheckCitationsFixture(unittest.TestCase):
         return target
 
 
+# Same class as the CI incident that hit `check_arch_validation_freshness.py`
+# (run 33230050451, main, "Guard (arch validation freshness self-test)"):
+# `shutil.rmtree` during a `tempfile.TemporaryDirectory`'s teardown can hit
+# `OSError: [Errno 39] Directory not empty: '.git'` — a race between tempdir
+# cleanup and a background `git maintenance`/`gc --auto` process the scratch
+# repos below (`GitFixture`, `ShallowCheckoutRefusalTests`) can spawn.
+# `-c gc.auto=0 -c gc.autoDetach=false -c maintenance.auto=false` kills the
+# background writer AT THE SOURCE for every git invocation this suite makes.
+_GIT_NO_BACKGROUND_MAINTENANCE = ("-c", "gc.auto=0", "-c", "gc.autoDetach=false", "-c", "maintenance.auto=false")
+
+
 def _run_git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    return subprocess.run(["git", *_GIT_NO_BACKGROUND_MAINTENANCE, *args], cwd=cwd, capture_output=True, text=True)
 
 
 class GitFixture(CheckCitationsFixture):
@@ -449,7 +460,7 @@ class ShallowCheckoutRefusalTests(unittest.TestCase):
     """
 
     def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self._tmp.cleanup)
         self._orig_known_files = cc._KNOWN_FILES
         self._orig_roots = cc._SEARCH_ROOTS

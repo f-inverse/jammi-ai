@@ -53,7 +53,25 @@ import sys
 import tempfile
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
+# Fail loud rather than scan-zero-silently: this file lives at
+# `ci/scripts/perf/check_producer_provenance_gates.py`, three directories
+# below the repo root, and every OTHER sibling script under `ci/scripts/
+# perf/` already uses `parents[3]` for exactly this reason (a prior
+# `parents[2]` resolved to `<repo>/ci` instead — `git ls-files <prefix>` run
+# with THAT as `cwd` looks for `ci/scripts/**` under `<repo>/ci/ci/scripts/
+# **`, which never exists, so both `run_gate` and this module's own
+# `self_test`'s "the real tree is clean" end-to-end arm passed VACUOUSLY —
+# zero files scanned, zero findings, reads as PASS). A silent scan-zero is
+# worse than a loud crash: this assertion makes a future re-introduction of
+# that mistake (or a refactor that moves this file another directory deep)
+# fail on the very first line of `main()`/`self_test()` that touches
+# `REPO_ROOT`, not silently downstream as an empty findings list that looks
+# identical to "everything is fine".
+assert (REPO_ROOT / "Cargo.toml").is_file(), (
+    f"REPO_ROOT resolved to {REPO_ROOT}, which has no Cargo.toml -- "
+    "parents[N] is wrong for this file's depth under the repo root"
+)
 PERF_DIR = REPO_ROOT / "ci" / "scripts" / "perf"
 
 FAKE_VAR_RE = re.compile(r"\b([A-Z][A-Z0-9_]*FAKE[A-Z0-9_]*)\b")
@@ -78,6 +96,44 @@ def _tracked_sh_under(repo_root: Path, prefix: str) -> list[Path]:
 
 def _is_comment_line(line: str) -> bool:
     return line.strip().startswith("#")
+
+
+_IF_FI_TOKEN_RE = re.compile(r"\b(if|fi)\b")
+_GUARD_BLOCK_MAX_SCAN = 40
+
+
+def _guard_block_lines(lines: list[str], start_idx: int) -> list[str]:
+    """The physical lines of the `if [...]; then ... fi` block whose OWN
+    condition line is `lines[start_idx]` — a `bash`-`if`/`fi` DEPTH walk
+    (nested `if`s inside the guard both increment and later decrement the
+    same counter, so a nested conditional inside the guard body does not
+    prematurely end the scan), not a fixed line count.
+
+    Round-N false positive this replaces: the ORIGINAL implementation
+    concatenated only `lines[start_idx]` and `lines[start_idx + 1]` — two
+    lines — before searching for `exit`. `stacked_sweep.sh`'s own real
+    `SWEEP_FAKE_BIN_SHA` guard (contract C5.2) is a legitimate THREE
+    physical-line shape: `if [ -n "$VAR" ] && [ "$DRY_RUN" != "1" ]; then`
+    / `echo "::error::..." >&2` / `exit 2` — the `exit` sits on the guard's
+    THIRD line, one line past what a 2-line window could ever see, so that
+    guard read as a false-positive FINDING ("does not `exit`") even though
+    it manifestly does. Bounded at `_GUARD_BLOCK_MAX_SCAN` lines so a
+    malformed/never-closed `if` cannot make this loop unbounded — an
+    unterminated block still returns everything up to the cap, which keeps
+    the caller's `"exit" not in guard_window` check fail-closed (a
+    guard whose `fi` never resolves within the cap is treated the same as
+    one with no `exit` at all, never silently credited).
+    """
+    depth = 0
+    end = start_idx
+    limit = min(len(lines), start_idx + _GUARD_BLOCK_MAX_SCAN)
+    for i in range(start_idx, limit):
+        for tok in _IF_FI_TOKEN_RE.findall(lines[i]):
+            depth += 1 if tok == "if" else -1
+        end = i
+        if depth <= 0:
+            break
+    return lines[start_idx : end + 1]
 
 
 def check_fake_knob_inertness(path: Path) -> list[str]:
@@ -107,7 +163,7 @@ def check_fake_knob_inertness(path: Path) -> list[str]:
             )
             continue
         first_guard = min(guard_idx)
-        guard_window = lines[first_guard] + (lines[first_guard + 1] if first_guard + 1 < len(lines) else "")
+        guard_window = "\n".join(_guard_block_lines(lines, first_guard))
         if "exit" not in guard_window:
             findings.append(
                 f"{path}:{first_guard + 1}: `{var}`'s guard line does not `exit` — a guard that "
@@ -139,6 +195,20 @@ def check_producer_parity(path: Path) -> list[str]:
     return []
 
 
+# CI incident (run 33230050451, main, "Guard (arch validation freshness
+# self-test)"), same class here: `shutil.rmtree` during a `tempfile.
+# TemporaryDirectory`'s teardown can hit `OSError: [Errno 39] Directory not
+# empty: '.git'` — a race between tempdir cleanup and a background `git
+# maintenance`/`gc --auto` process the scratch repo `self_test` builds below
+# can spawn. `-c gc.auto=0 -c gc.autoDetach=false -c maintenance.auto=false`
+# kills the background writer AT THE SOURCE.
+_GIT_NO_BACKGROUND_MAINTENANCE = ("-c", "gc.auto=0", "-c", "gc.autoDetach=false", "-c", "maintenance.auto=false")
+
+
+def _scratch_git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *_GIT_NO_BACKGROUND_MAINTENANCE, *args], cwd=cwd, check=True)
+
+
 def run_gate(perf_dir: Path, repo_root: Path) -> list[str]:
     findings: list[str] = []
     for path in _tracked_sh_under(repo_root, "ci/scripts/"):
@@ -151,11 +221,11 @@ def run_gate(perf_dir: Path, repo_root: Path) -> list[str]:
 def self_test() -> int:
     failures: list[str] = []
 
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         repo = Path(tmp)
-        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
-        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
-        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+        _scratch_git(["init", "-q"], repo)
+        _scratch_git(["config", "user.email", "test@example.com"], repo)
+        _scratch_git(["config", "user.name", "Test"], repo)
         perf = repo / "ci" / "scripts" / "perf"
         perf.mkdir(parents=True)
 
@@ -163,8 +233,8 @@ def self_test() -> int:
             p = repo / rel
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(text)
-            subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
-            subprocess.run(["git", "commit", "-q", "-m", rel], cwd=repo, check=True)
+            _scratch_git(["add", "-A"], repo)
+            _scratch_git(["commit", "-q", "-m", rel], repo)
             got = check_fn(p)
             if expect_hit is None:
                 if got:
@@ -198,6 +268,42 @@ def self_test() -> int:
             '#!/usr/bin/env bash\nif [ -n "${SWEEP_FAKE_BIN_SHA:-}" ] && [ "$SWEEP_DRY_RUN" != "1" ]; then echo warn; fi\n',
             check_fake_knob_inertness,
             "does not `exit`",
+        )
+
+        # (A) RED, still: a THREE physical-line guard block that genuinely
+        # never `exit`s (warns and falls through) — proves the widened
+        # if/fi-depth window is not a rubber stamp: it reads the WHOLE
+        # enclosing block, not "any 3+ lines", and still fires when that
+        # block really has no `exit` anywhere in it.
+        commit_and_check(
+            "ci/scripts/perf/bad_guard_no_exit_multiline.sh",
+            (
+                '#!/usr/bin/env bash\n'
+                'if [ -n "${SWEEP_FAKE_BIN_SHA:-}" ] && [ "$SWEEP_DRY_RUN" != "1" ]; then\n'
+                '  echo "::error::refusing" >&2\n'
+                'fi\n'
+            ),
+            check_fake_knob_inertness,
+            "does not `exit`",
+        )
+
+        # (A) GREEN control (round-N false-positive fix): `stacked_sweep.sh`'s
+        # OWN real guard shape — a THREE physical-line `if`/`echo`/`exit`/`fi`
+        # block, `exit` on the guard's third line. The ORIGINAL 2-line window
+        # (`lines[first_guard]` + `lines[first_guard + 1]`) never reached the
+        # `exit` line at all and misreported this exact shape as "does not
+        # `exit`" — see `_guard_block_lines`'s own docstring.
+        commit_and_check(
+            "ci/scripts/perf/good_guard_three_line.sh",
+            (
+                '#!/usr/bin/env bash\n'
+                'if [ -n "${SWEEP_FAKE_BIN_SHA:-}" ] && [ "$SWEEP_DRY_RUN" != "1" ]; then\n'
+                '  echo "::error::SWEEP_FAKE_BIN_SHA is set but SWEEP_DRY_RUN != 1" >&2\n'
+                '  exit 2\n'
+                'fi\n'
+            ),
+            check_fake_knob_inertness,
+            None,
         )
 
         # (A) GREEN control: the real stacked_sweep.sh shape — guard first,
@@ -253,6 +359,28 @@ def self_test() -> int:
             '#!/usr/bin/env bash\n# see crates/jammi-bench/reference/torch_finetune_step.py\necho hi\n',
             check_producer_parity,
             None,
+        )
+
+    # Non-vacuousness control (the actual bug this round fixes): a wrong
+    # `REPO_ROOT` (previously `parents[2]`, resolving to `<repo>/ci` instead
+    # of `<repo>`) makes `git ls-files ci/scripts/` run with the WRONG `cwd`
+    # look for `<repo>/ci/ci/scripts/**`, which never exists — zero files,
+    # zero findings, a PASS that enforced nothing. Assert BOTH tracked-file
+    # scans this gate depends on see a REAL, nonzero count on the actual
+    # repo tree, so a future regression of `REPO_ROOT` (or of the
+    # `Cargo.toml` guard above being weakened/removed) cannot silently
+    # revert to scanning nothing while still printing PASS.
+    real_sh_under_scripts = _tracked_sh_under(REPO_ROOT, "ci/scripts/")
+    real_sh_under_perf = _tracked_sh_under(REPO_ROOT, "ci/scripts/perf/")
+    if not real_sh_under_scripts:
+        failures.append(
+            "self-test FAILED: `git ls-files ci/scripts/` under the real REPO_ROOT found ZERO "
+            "`.sh` files -- the scan is vacuous (REPO_ROOT is almost certainly wrong)"
+        )
+    if not real_sh_under_perf:
+        failures.append(
+            "self-test FAILED: `git ls-files ci/scripts/perf/` under the real REPO_ROOT found "
+            "ZERO `.sh` files -- the scan is vacuous (REPO_ROOT is almost certainly wrong)"
         )
 
     # End-to-end: the REAL tree, both checks, must be clean today.

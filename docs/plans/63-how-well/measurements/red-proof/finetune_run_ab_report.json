@@ -1,0 +1,1209 @@
+{
+  "seeds": [
+    "1",
+    "2",
+    "3",
+    "4",
+    "5",
+    "6",
+    "7",
+    "8",
+    "9",
+    "10",
+    "11",
+    "12"
+  ],
+  "arms": [
+    "fused",
+    "alloff"
+  ],
+  "per_seed": {
+    "1": {
+      "legs": {
+        "fused_r1": "OK",
+        "fused_r2": "OK",
+        "alloff_r1": "OK",
+        "alloff_r2": "OK"
+      },
+      "r1_r2_delta": {
+        "fused": 0.0,
+        "alloff": 0.0
+      },
+      "leg_premise_violations": [],
+      "d_i": -0.04279417544603348,
+      "trajectory": {
+        "fused": [
+          {
+            "epoch": 0,
+            "held_out_mean": 3.1766814962029457,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 1,
+            "held_out_mean": 3.2259930223226547,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 2,
+            "held_out_mean": 3.218041628599167,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          }
+        ],
+        "alloff": [
+          {
+            "epoch": 0,
+            "held_out_mean": 3.1675282046198845,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 1,
+            "held_out_mean": 3.16631867736578,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 2,
+            "held_out_mean": 3.2608358040452003,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          }
+        ]
+      }
+    },
+    "2": {
+      "legs": {
+        "fused_r1": "OK",
+        "fused_r2": "OK",
+        "alloff_r1": "OK",
+        "alloff_r2": "OK"
+      },
+      "r1_r2_delta": {
+        "fused": 0.0,
+        "alloff": 0.0
+      },
+      "leg_premise_violations": [],
+      "d_i": 0.11424878984689713,
+      "trajectory": {
+        "fused": [
+          {
+            "epoch": 0,
+            "held_out_mean": 3.1738159134984016,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 1,
+            "held_out_mean": 3.2612116411328316,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 2,
+            "held_out_mean": 3.4061567336320877,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          }
+        ],
+        "alloff": [
+          {
+            "epoch": 0,
+            "held_out_mean": 3.1778133511543274,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 1,
+            "held_out_mean": 3.166751280426979,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 2,
+            "held_out_mean": 3.2919079437851906,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          }
+        ]
+      }
+    },
+    "3": {
+      "legs": {
+        "fused_r1": "OK",
+        "fused_r2": "OK",
+        "alloff_r1": "OK",
+        "alloff_r2": "OK"
+      },
+      "r1_r2_delta": {
+        "fused": 0.0,
+        "alloff": 0.0
+      },
+      "leg_premise_violations": [],
+      "d_i": -0.0721745565533638,
+      "trajectory": {
+        "fused": [
+          {
+            "epoch": 0,
+            "held_out_mean": 3.1623740568757057,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 1,
+            "held_out_mean": 3.2183406949043274,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 2,
+            "held_out_mean": 3.2641739547252655,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          }
+        ],
+        "alloff": [
+          {
+            "epoch": 0,
+            "held_out_mean": 3.163058303296566,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 1,
+            "held_out_mean": 3.230830319225788,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 2,
+            "held_out_mean": 3.3363485112786293,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          }
+        ]
+      }
+    },
+    "4": {
+      "legs": {
+        "fused_r1": "OK",
+        "fused_r2": "OK",
+        "alloff_r1": "OK",
+        "alloff_r2": "OK"
+      },
+      "r1_r2_delta": {
+        "fused": 0.0,
+        "alloff": 0.0
+      },
+      "leg_premise_violations": [],
+      "d_i": 0.02083246409893036,
+      "trajectory": {
+        "fused": [
+          {
+            "epoch": 0,
+            "held_out_mean": 3.159734971821308,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 1,
+            "held_out_mean": 3.232553467154503,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 2,
+            "held_out_mean": 3.2655729800462723,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          }
+        ],
+        "alloff": [
+          {
+            "epoch": 0,
+            "held_out_mean": 3.2275543957948685,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 1,
+            "held_out_mean": 3.4211330637335777,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 2,
+            "held_out_mean": 3.244740515947342,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          }
+        ]
+      }
+    },
+    "5": {
+      "legs": {
+        "fused_r1": "OK",
+        "fused_r2": "OK",
+        "alloff_r1": "OK",
+        "alloff_r2": "OK"
+      },
+      "r1_r2_delta": {
+        "fused": 0.0,
+        "alloff": 0.0
+      },
+      "leg_premise_violations": [],
+      "d_i": -0.10268842428922653,
+      "trajectory": {
+        "fused": [
+          {
+            "epoch": 0,
+            "held_out_mean": 3.173385016620159,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 1,
+            "held_out_mean": 3.1950817927718163,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 2,
+            "held_out_mean": 3.22159281373024,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          }
+        ],
+        "alloff": [
+          {
+            "epoch": 0,
+            "held_out_mean": 3.17277642339468,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 1,
+            "held_out_mean": 3.2049575746059418,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 2,
+            "held_out_mean": 3.3242812380194664,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          }
+        ]
+      }
+    },
+    "6": {
+      "legs": {
+        "fused_r1": "OK",
+        "fused_r2": "OK",
+        "alloff_r1": "OK",
+        "alloff_r2": "OK"
+      },
+      "r1_r2_delta": {
+        "fused": 0.0,
+        "alloff": 0.0
+      },
+      "leg_premise_violations": [],
+      "d_i": 0.1523902490735054,
+      "trajectory": {
+        "fused": [
+          {
+            "epoch": 0,
+            "held_out_mean": 3.167324997484684,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 1,
+            "held_out_mean": 3.214503526687622,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 2,
+            "held_out_mean": 3.3395507633686066,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          }
+        ],
+        "alloff": [
+          {
+            "epoch": 0,
+            "held_out_mean": 3.158243715763092,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 1,
+            "held_out_mean": 3.1801857575774193,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 2,
+            "held_out_mean": 3.187160514295101,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          }
+        ]
+      }
+    },
+    "7": {
+      "legs": {
+        "fused_r1": "OK",
+        "fused_r2": "OK",
+        "alloff_r1": "OK",
+        "alloff_r2": "OK"
+      },
+      "r1_r2_delta": {
+        "fused": 0.0,
+        "alloff": 0.0
+      },
+      "leg_premise_violations": [],
+      "d_i": -0.07637129724025726,
+      "trajectory": {
+        "fused": [
+          {
+            "epoch": 0,
+            "held_out_mean": 3.1784166023135185,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 1,
+            "held_out_mean": 3.210080847144127,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 2,
+            "held_out_mean": 3.338038817048073,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          }
+        ],
+        "alloff": [
+          {
+            "epoch": 0,
+            "held_out_mean": 3.171831153333187,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 1,
+            "held_out_mean": 3.2495045587420464,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 2,
+            "held_out_mean": 3.41441011428833,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          }
+        ]
+      }
+    },
+    "8": {
+      "legs": {
+        "fused_r1": "OK",
+        "fused_r2": "OK",
+        "alloff_r1": "OK",
+        "alloff_r2": "OK"
+      },
+      "r1_r2_delta": {
+        "fused": 0.0,
+        "alloff": 0.0
+      },
+      "leg_premise_violations": [],
+      "d_i": -0.08588637411594391,
+      "trajectory": {
+        "fused": [
+          {
+            "epoch": 0,
+            "held_out_mean": 3.202156573534012,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 1,
+            "held_out_mean": 3.1722838953137398,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 2,
+            "held_out_mean": 3.2053088769316673,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          }
+        ],
+        "alloff": [
+          {
+            "epoch": 0,
+            "held_out_mean": 3.178554780781269,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 1,
+            "held_out_mean": 3.215305969119072,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 2,
+            "held_out_mean": 3.2911952510476112,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          }
+        ]
+      }
+    },
+    "9": {
+      "legs": {
+        "fused_r1": "OK",
+        "fused_r2": "OK",
+        "alloff_r1": "OK",
+        "alloff_r2": "OK"
+      },
+      "r1_r2_delta": {
+        "fused": 0.0,
+        "alloff": 0.0
+      },
+      "leg_premise_violations": [],
+      "d_i": -0.028555653989315033,
+      "trajectory": {
+        "fused": [
+          {
+            "epoch": 0,
+            "held_out_mean": 3.1625930666923523,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 1,
+            "held_out_mean": 3.230750694870949,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 2,
+            "held_out_mean": 3.2885832637548447,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          }
+        ],
+        "alloff": [
+          {
+            "epoch": 0,
+            "held_out_mean": 3.1644507870078087,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 1,
+            "held_out_mean": 3.250809945166111,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 2,
+            "held_out_mean": 3.3171389177441597,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          }
+        ]
+      }
+    },
+    "10": {
+      "legs": {
+        "fused_r1": "OK",
+        "fused_r2": "OK",
+        "alloff_r1": "OK",
+        "alloff_r2": "OK"
+      },
+      "r1_r2_delta": {
+        "fused": 0.0,
+        "alloff": 0.0
+      },
+      "leg_premise_violations": [],
+      "d_i": 0.03185879439115524,
+      "trajectory": {
+        "fused": [
+          {
+            "epoch": 0,
+            "held_out_mean": 3.1688709408044815,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 1,
+            "held_out_mean": 3.232133448123932,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 2,
+            "held_out_mean": 3.4289267361164093,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          }
+        ],
+        "alloff": [
+          {
+            "epoch": 0,
+            "held_out_mean": 3.1889262050390244,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 1,
+            "held_out_mean": 3.2323470637202263,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 2,
+            "held_out_mean": 3.397067941725254,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          }
+        ]
+      }
+    },
+    "11": {
+      "legs": {
+        "fused_r1": "OK",
+        "fused_r2": "OK",
+        "alloff_r1": "OK",
+        "alloff_r2": "OK"
+      },
+      "r1_r2_delta": {
+        "fused": 0.0,
+        "alloff": 0.0
+      },
+      "leg_premise_violations": [],
+      "d_i": -0.1304609403014183,
+      "trajectory": {
+        "fused": [
+          {
+            "epoch": 0,
+            "held_out_mean": 3.1660484671592712,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 1,
+            "held_out_mean": 3.1829341500997543,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 2,
+            "held_out_mean": 3.2206291779875755,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          }
+        ],
+        "alloff": [
+          {
+            "epoch": 0,
+            "held_out_mean": 3.161519668996334,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 1,
+            "held_out_mean": 3.205030344426632,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 2,
+            "held_out_mean": 3.351090118288994,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          }
+        ]
+      }
+    },
+    "12": {
+      "legs": {
+        "fused_r1": "OK",
+        "fused_r2": "OK",
+        "alloff_r1": "OK",
+        "alloff_r2": "OK"
+      },
+      "r1_r2_delta": {
+        "fused": 0.0,
+        "alloff": 0.0
+      },
+      "leg_premise_violations": [],
+      "d_i": -0.021355606615543365,
+      "trajectory": {
+        "fused": [
+          {
+            "epoch": 0,
+            "held_out_mean": 3.178702913224697,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 1,
+            "held_out_mean": 3.2063737139105797,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 2,
+            "held_out_mean": 3.225850932300091,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          }
+        ],
+        "alloff": [
+          {
+            "epoch": 0,
+            "held_out_mean": 3.193625718355179,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 1,
+            "held_out_mean": 3.2075775489211082,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 2,
+            "held_out_mean": 3.247206538915634,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          }
+        ]
+      }
+    }
+  },
+  "d_values": {
+    "1": -0.04279417544603348,
+    "2": 0.11424878984689713,
+    "3": -0.0721745565533638,
+    "4": 0.02083246409893036,
+    "5": -0.10268842428922653,
+    "6": 0.1523902490735054,
+    "7": -0.07637129724025726,
+    "8": -0.08588637411594391,
+    "9": -0.028555653989315033,
+    "10": 0.03185879439115524,
+    "11": -0.1304609403014183,
+    "12": -0.021355606615543365
+  },
+  "premise_failure_diagnostic": {
+    "failed_seeds": [],
+    "failing_legs": [],
+    "note": "Non-parameterised, explicitly non-decisional (CONTRACT amendment 2026-08-29b item 1(c)): names which CONTRACT Frame premise leg(s) failed on which leg, with that leg's raw train_probe_series, for investigation only. This block can NEVER promote an INVALID verdict to GREEN -- the 'status' field above is computed independently of it -- and the merger accepts NO operator override for a premise failure anywhere (no --allow-premise-failure, no waived-seed list, no rescale switch)."
+  },
+  "cross_seed_spread": 0.08264997071681932,
+  "determinism_floor": {
+    "deltas": [
+      {
+        "seed": "1",
+        "arm": "fused",
+        "delta": 0.0
+      },
+      {
+        "seed": "1",
+        "arm": "alloff",
+        "delta": 0.0
+      },
+      {
+        "seed": "2",
+        "arm": "fused",
+        "delta": 0.0
+      },
+      {
+        "seed": "2",
+        "arm": "alloff",
+        "delta": 0.0
+      },
+      {
+        "seed": "3",
+        "arm": "fused",
+        "delta": 0.0
+      },
+      {
+        "seed": "3",
+        "arm": "alloff",
+        "delta": 0.0
+      },
+      {
+        "seed": "4",
+        "arm": "fused",
+        "delta": 0.0
+      },
+      {
+        "seed": "4",
+        "arm": "alloff",
+        "delta": 0.0
+      },
+      {
+        "seed": "5",
+        "arm": "fused",
+        "delta": 0.0
+      },
+      {
+        "seed": "5",
+        "arm": "alloff",
+        "delta": 0.0
+      },
+      {
+        "seed": "6",
+        "arm": "fused",
+        "delta": 0.0
+      },
+      {
+        "seed": "6",
+        "arm": "alloff",
+        "delta": 0.0
+      },
+      {
+        "seed": "7",
+        "arm": "fused",
+        "delta": 0.0
+      },
+      {
+        "seed": "7",
+        "arm": "alloff",
+        "delta": 0.0
+      },
+      {
+        "seed": "8",
+        "arm": "fused",
+        "delta": 0.0
+      },
+      {
+        "seed": "8",
+        "arm": "alloff",
+        "delta": 0.0
+      },
+      {
+        "seed": "9",
+        "arm": "fused",
+        "delta": 0.0
+      },
+      {
+        "seed": "9",
+        "arm": "alloff",
+        "delta": 0.0
+      },
+      {
+        "seed": "10",
+        "arm": "fused",
+        "delta": 0.0
+      },
+      {
+        "seed": "10",
+        "arm": "alloff",
+        "delta": 0.0
+      },
+      {
+        "seed": "11",
+        "arm": "fused",
+        "delta": 0.0
+      },
+      {
+        "seed": "11",
+        "arm": "alloff",
+        "delta": 0.0
+      },
+      {
+        "seed": "12",
+        "arm": "fused",
+        "delta": 0.0
+      },
+      {
+        "seed": "12",
+        "arm": "alloff",
+        "delta": 0.0
+      }
+    ],
+    "max_delta": 0.0,
+    "cross_seed_spread": 0.08264997071681932,
+    "findings": [],
+    "note": "r1/r2 same-seed repeat delta MEASURED AND REPORTED as the determinism floor -- RED only if it exceeds the cross-seed spread of d_i (CONTRACT H4/PLAN.md v2 delta 6: 'no CUDA bitwise contract exists -- the measurement must be able to report what it measures')."
+  },
+  "sign_test": {
+    "n": 12,
+    "n_pos": 4,
+    "n_neg": 8,
+    "ties": 0,
+    "p_value": 0.3876953125
+  },
+  "sign_test_error": null,
+  "decision": {
+    "d_i": [
+      -0.04279417544603348,
+      0.11424878984689713,
+      -0.0721745565533638,
+      0.02083246409893036,
+      -0.10268842428922653,
+      0.1523902490735054,
+      -0.07637129724025726,
+      -0.08588637411594391,
+      -0.028555653989315033,
+      0.03185879439115524,
+      -0.1304609403014183,
+      -0.021355606615543365
+    ],
+    "clean_seed_count": 12,
+    "gate_seed_count": 12,
+    "n_pos": 4,
+    "n_neg": 8,
+    "ties": 0,
+    "mean_d": -0.02007972759505113,
+    "threshold": 11,
+    "concordant_direction": "none",
+    "alpha2": 0.0064,
+    "p_value": 0.3876953125,
+    "rule": "Pre-registered decision rule (CONTRACT 63 Frame / PLAN.md v2 delta 3-4): over N=12 premise-clean seeds' d_i = fused.held_out_example_mean - alloff.held_out_example_mean, RED iff (n_pos >= 11 of 12 OR n_neg >= 11 of 12) AND sign(mean(d_i)) agrees with that concordant direction (two-sided; alpha2=0.0064 is the pre-registered level for the (12, 11) cell, recorded beside the computed exact-tail p_value, never substituted for it). d_i > 0 dominant (fused worse) is degradation-concordant -> status RED; d_i < 0 dominant (fused better) is improvement-concordant -> status RED_FOR_INVESTIGATION (anomalous improvement is investigated, never silently celebrated); neither threshold met, or the threshold is met but the mean's sign disagrees, -> status GREEN. A premise-clean seed count other than exactly 12 -> status INVALID naming the count (the rule is pre-registered FOR 12 seeds; never rescaled silently)."
+  },
+  "wrong_seed_count": false,
+  "cross_seed_identity_violations": [],
+  "lr0_control": {
+    "seeds": [
+      "1",
+      "2"
+    ],
+    "per_seed": {
+      "1": {
+        "per_arm": {
+          "fused": {
+            "outcome": "OK",
+            "learning_happened_delta": 0.0,
+            "lr": 0.0,
+            "train_probe_series": [
+              3.3236749470233917,
+              3.3236749470233917,
+              3.3236749470233917,
+              3.3236749470233917
+            ],
+            "failing_premises": []
+          },
+          "alloff": {
+            "outcome": "OK",
+            "learning_happened_delta": 0.0,
+            "lr": 0.0,
+            "train_probe_series": [
+              3.3236749470233917,
+              3.3236749470233917,
+              3.3236749470233917,
+              3.3236749470233917
+            ],
+            "failing_premises": []
+          }
+        },
+        "violations": []
+      },
+      "2": {
+        "per_arm": {
+          "fused": {
+            "outcome": "OK",
+            "learning_happened_delta": 0.0,
+            "lr": 0.0,
+            "train_probe_series": [
+              3.3236749470233917,
+              3.3236749470233917,
+              3.3236749470233917,
+              3.3236749470233917
+            ],
+            "failing_premises": []
+          },
+          "alloff": {
+            "outcome": "OK",
+            "learning_happened_delta": 0.0,
+            "lr": 0.0,
+            "train_probe_series": [
+              3.3236749470233917,
+              3.3236749470233917,
+              3.3236749470233917,
+              3.3236749470233917
+            ],
+            "failing_premises": []
+          }
+        },
+        "violations": []
+      }
+    },
+    "violations": [],
+    "allow_missing_lr0_control": false,
+    "note": "lr=0 RED control (CONTRACT Frame / audit advisory (b)): separate seeds, never counted into the A/B set's own d_values/sign test above. A clean control leg FAILS learning-happened (its own learning_happened_delta does not clear FINETUNE_RUN_LEARNING_HAPPENED_FLOOR); a passing leg is recorded as a violation against the FLOOR=0.0 premise-leg ruling itself. An empty 'seeds' list is itself a refusal (INVALID) unless 'allow_missing_lr0_control' is true (block 5) -- the pre-registered control is not silently optional."
+  },
+  "status": "GREEN",
+  "mutant_dose_ladder": {
+    "doses": [
+      {
+        "dose_label": "redproof-nobc",
+        "patch_sha256": "9b3c824dc041899c12c0e2d44d12a3ac8c7b86076ffc778638108925ba51bf4e",
+        "mutant_seeds": [
+          "1",
+          "2",
+          "3",
+          "4",
+          "5",
+          "6",
+          "7",
+          "8",
+          "9",
+          "10",
+          "11",
+          "12"
+        ],
+        "per_seed": {
+          "1": {
+            "outcome": "OK",
+            "d_i": -0.038368865847587585,
+            "violations": []
+          },
+          "2": {
+            "outcome": "OK",
+            "d_i": -0.14217394217848778,
+            "violations": []
+          },
+          "3": {
+            "outcome": "OK",
+            "d_i": -0.06022128090262413,
+            "violations": []
+          },
+          "4": {
+            "outcome": "OK",
+            "d_i": 0.10692592337727547,
+            "violations": []
+          },
+          "5": {
+            "outcome": "OK",
+            "d_i": -0.15298115462064743,
+            "violations": []
+          },
+          "6": {
+            "outcome": "OK",
+            "d_i": 0.043409496545791626,
+            "violations": []
+          },
+          "7": {
+            "outcome": "OK",
+            "d_i": -0.22541028261184692,
+            "violations": []
+          },
+          "8": {
+            "outcome": "OK",
+            "d_i": 0.09760695695877075,
+            "violations": []
+          },
+          "9": {
+            "outcome": "OK",
+            "d_i": null,
+            "violations": [
+              "fused: learning_happened_delta=-0.14323920011520386 (derived: train_probe_series[0] - train_probe_series[-1]) does not clear the floor (0.0) -- the train-side probe shows no observed learning, so this leg's held-out movement cannot be attributed to training (the CONTRACT's own RED-control precedent: an lr=0 arm fails exactly this leg)"
+            ]
+          },
+          "10": {
+            "outcome": "OK",
+            "d_i": -0.1872035413980484,
+            "violations": []
+          },
+          "11": {
+            "outcome": "OK",
+            "d_i": -0.02538422867655754,
+            "violations": []
+          },
+          "12": {
+            "outcome": "OK",
+            "d_i": null,
+            "violations": [
+              "fused: learning_happened_delta=-0.14270102977752686 (derived: train_probe_series[0] - train_probe_series[-1]) does not clear the floor (0.0) -- the train-side probe shows no observed learning, so this leg's held-out movement cannot be attributed to training (the CONTRACT's own RED-control precedent: an lr=0 arm fails exactly this leg)"
+            ]
+          }
+        },
+        "clean_pair_count": 10,
+        "gate_seed_count": 12,
+        "threshold": 11,
+        "n_pos": 3,
+        "n_neg": 7,
+        "ties": 0,
+        "mean_d": -0.05838009193539619,
+        "p_value": 0.34375,
+        "sign_test_error": null,
+        "detected": "INVALID",
+        "violations": [
+          "redproof-nobc seed 9: fused: learning_happened_delta=-0.14323920011520386 (derived: train_probe_series[0] - train_probe_series[-1]) does not clear the floor (0.0) -- the train-side probe shows no observed learning, so this leg's held-out movement cannot be attributed to training (the CONTRACT's own RED-control precedent: an lr=0 arm fails exactly this leg)",
+          "redproof-nobc seed 12: fused: learning_happened_delta=-0.14270102977752686 (derived: train_probe_series[0] - train_probe_series[-1]) does not clear the floor (0.0) -- the train-side probe shows no observed learning, so this leg's held-out movement cannot be attributed to training (the CONTRACT's own RED-control precedent: an lr=0 arm fails exactly this leg)",
+          "redproof-nobc: 10 premise-clean mutant/alloff pair(s), expected exactly 12 -- never silently rescaled to whatever count ran clean"
+        ]
+      },
+      {
+        "dose_label": "redproof-signflip-v2",
+        "patch_sha256": "c81d0ed59d45761bbd6487dbb23c5aaae22f30739c0e2e613d96c4901ad9b202",
+        "mutant_seeds": [
+          "1",
+          "2",
+          "3",
+          "4",
+          "5",
+          "6",
+          "7",
+          "8",
+          "9",
+          "10",
+          "11",
+          "12"
+        ],
+        "per_seed": {
+          "1": {
+            "outcome": "OK",
+            "d_i": null,
+            "violations": [
+              "fused: learning_happened_delta=-16.928120344877243 (derived: train_probe_series[0] - train_probe_series[-1]) does not clear the floor (0.0) -- the train-side probe shows no observed learning, so this leg's held-out movement cannot be attributed to training (the CONTRACT's own RED-control precedent: an lr=0 arm fails exactly this leg)"
+            ]
+          },
+          "2": {
+            "outcome": "OK",
+            "d_i": null,
+            "violations": [
+              "fused: learning_happened_delta=-0.15420621633529663 (derived: train_probe_series[0] - train_probe_series[-1]) does not clear the floor (0.0) -- the train-side probe shows no observed learning, so this leg's held-out movement cannot be attributed to training (the CONTRACT's own RED-control precedent: an lr=0 arm fails exactly this leg)"
+            ]
+          },
+          "3": {
+            "outcome": "OK",
+            "d_i": null,
+            "violations": [
+              "fused: learning_happened_delta=-10.814633131027222 (derived: train_probe_series[0] - train_probe_series[-1]) does not clear the floor (0.0) -- the train-side probe shows no observed learning, so this leg's held-out movement cannot be attributed to training (the CONTRACT's own RED-control precedent: an lr=0 arm fails exactly this leg)"
+            ]
+          },
+          "4": {
+            "outcome": "OK",
+            "d_i": null,
+            "violations": [
+              "fused: learning_happened_delta=-21.664372235536575 (derived: train_probe_series[0] - train_probe_series[-1]) does not clear the floor (0.0) -- the train-side probe shows no observed learning, so this leg's held-out movement cannot be attributed to training (the CONTRACT's own RED-control precedent: an lr=0 arm fails exactly this leg)"
+            ]
+          },
+          "5": {
+            "outcome": "OK",
+            "d_i": null,
+            "violations": [
+              "fused: learning_happened_delta=-18.52877363562584 (derived: train_probe_series[0] - train_probe_series[-1]) does not clear the floor (0.0) -- the train-side probe shows no observed learning, so this leg's held-out movement cannot be attributed to training (the CONTRACT's own RED-control precedent: an lr=0 arm fails exactly this leg)"
+            ]
+          },
+          "6": {
+            "outcome": "OK",
+            "d_i": null,
+            "violations": [
+              "fused: learning_happened_delta=-15.56382605433464 (derived: train_probe_series[0] - train_probe_series[-1]) does not clear the floor (0.0) -- the train-side probe shows no observed learning, so this leg's held-out movement cannot be attributed to training (the CONTRACT's own RED-control precedent: an lr=0 arm fails exactly this leg)"
+            ]
+          },
+          "7": {
+            "outcome": "OK",
+            "d_i": null,
+            "violations": [
+              "fused: learning_happened_delta=-16.790915548801422 (derived: train_probe_series[0] - train_probe_series[-1]) does not clear the floor (0.0) -- the train-side probe shows no observed learning, so this leg's held-out movement cannot be attributed to training (the CONTRACT's own RED-control precedent: an lr=0 arm fails exactly this leg)"
+            ]
+          },
+          "8": {
+            "outcome": "OK",
+            "d_i": null,
+            "violations": [
+              "fused: learning_happened_delta=-19.370923668146133 (derived: train_probe_series[0] - train_probe_series[-1]) does not clear the floor (0.0) -- the train-side probe shows no observed learning, so this leg's held-out movement cannot be attributed to training (the CONTRACT's own RED-control precedent: an lr=0 arm fails exactly this leg)"
+            ]
+          },
+          "9": {
+            "outcome": "OK",
+            "d_i": null,
+            "violations": [
+              "fused: learning_happened_delta=-14.110210061073303 (derived: train_probe_series[0] - train_probe_series[-1]) does not clear the floor (0.0) -- the train-side probe shows no observed learning, so this leg's held-out movement cannot be attributed to training (the CONTRACT's own RED-control precedent: an lr=0 arm fails exactly this leg)"
+            ]
+          },
+          "10": {
+            "outcome": "OK",
+            "d_i": null,
+            "violations": [
+              "fused: learning_happened_delta=-9.645562589168549 (derived: train_probe_series[0] - train_probe_series[-1]) does not clear the floor (0.0) -- the train-side probe shows no observed learning, so this leg's held-out movement cannot be attributed to training (the CONTRACT's own RED-control precedent: an lr=0 arm fails exactly this leg)"
+            ]
+          },
+          "11": {
+            "outcome": "OK",
+            "d_i": null,
+            "violations": [
+              "fused: learning_happened_delta=-19.388529270887375 (derived: train_probe_series[0] - train_probe_series[-1]) does not clear the floor (0.0) -- the train-side probe shows no observed learning, so this leg's held-out movement cannot be attributed to training (the CONTRACT's own RED-control precedent: an lr=0 arm fails exactly this leg)"
+            ]
+          },
+          "12": {
+            "outcome": "OK",
+            "d_i": null,
+            "violations": [
+              "fused: learning_happened_delta=-15.470363855361938 (derived: train_probe_series[0] - train_probe_series[-1]) does not clear the floor (0.0) -- the train-side probe shows no observed learning, so this leg's held-out movement cannot be attributed to training (the CONTRACT's own RED-control precedent: an lr=0 arm fails exactly this leg)"
+            ]
+          }
+        },
+        "clean_pair_count": 0,
+        "gate_seed_count": 12,
+        "threshold": 11,
+        "n_pos": 0,
+        "n_neg": 0,
+        "ties": 0,
+        "mean_d": null,
+        "p_value": null,
+        "sign_test_error": null,
+        "detected": "INVALID",
+        "violations": [
+          "redproof-signflip-v2 seed 1: fused: learning_happened_delta=-16.928120344877243 (derived: train_probe_series[0] - train_probe_series[-1]) does not clear the floor (0.0) -- the train-side probe shows no observed learning, so this leg's held-out movement cannot be attributed to training (the CONTRACT's own RED-control precedent: an lr=0 arm fails exactly this leg)",
+          "redproof-signflip-v2 seed 2: fused: learning_happened_delta=-0.15420621633529663 (derived: train_probe_series[0] - train_probe_series[-1]) does not clear the floor (0.0) -- the train-side probe shows no observed learning, so this leg's held-out movement cannot be attributed to training (the CONTRACT's own RED-control precedent: an lr=0 arm fails exactly this leg)",
+          "redproof-signflip-v2 seed 3: fused: learning_happened_delta=-10.814633131027222 (derived: train_probe_series[0] - train_probe_series[-1]) does not clear the floor (0.0) -- the train-side probe shows no observed learning, so this leg's held-out movement cannot be attributed to training (the CONTRACT's own RED-control precedent: an lr=0 arm fails exactly this leg)",
+          "redproof-signflip-v2 seed 4: fused: learning_happened_delta=-21.664372235536575 (derived: train_probe_series[0] - train_probe_series[-1]) does not clear the floor (0.0) -- the train-side probe shows no observed learning, so this leg's held-out movement cannot be attributed to training (the CONTRACT's own RED-control precedent: an lr=0 arm fails exactly this leg)",
+          "redproof-signflip-v2 seed 5: fused: learning_happened_delta=-18.52877363562584 (derived: train_probe_series[0] - train_probe_series[-1]) does not clear the floor (0.0) -- the train-side probe shows no observed learning, so this leg's held-out movement cannot be attributed to training (the CONTRACT's own RED-control precedent: an lr=0 arm fails exactly this leg)",
+          "redproof-signflip-v2 seed 6: fused: learning_happened_delta=-15.56382605433464 (derived: train_probe_series[0] - train_probe_series[-1]) does not clear the floor (0.0) -- the train-side probe shows no observed learning, so this leg's held-out movement cannot be attributed to training (the CONTRACT's own RED-control precedent: an lr=0 arm fails exactly this leg)",
+          "redproof-signflip-v2 seed 7: fused: learning_happened_delta=-16.790915548801422 (derived: train_probe_series[0] - train_probe_series[-1]) does not clear the floor (0.0) -- the train-side probe shows no observed learning, so this leg's held-out movement cannot be attributed to training (the CONTRACT's own RED-control precedent: an lr=0 arm fails exactly this leg)",
+          "redproof-signflip-v2 seed 8: fused: learning_happened_delta=-19.370923668146133 (derived: train_probe_series[0] - train_probe_series[-1]) does not clear the floor (0.0) -- the train-side probe shows no observed learning, so this leg's held-out movement cannot be attributed to training (the CONTRACT's own RED-control precedent: an lr=0 arm fails exactly this leg)",
+          "redproof-signflip-v2 seed 9: fused: learning_happened_delta=-14.110210061073303 (derived: train_probe_series[0] - train_probe_series[-1]) does not clear the floor (0.0) -- the train-side probe shows no observed learning, so this leg's held-out movement cannot be attributed to training (the CONTRACT's own RED-control precedent: an lr=0 arm fails exactly this leg)",
+          "redproof-signflip-v2 seed 10: fused: learning_happened_delta=-9.645562589168549 (derived: train_probe_series[0] - train_probe_series[-1]) does not clear the floor (0.0) -- the train-side probe shows no observed learning, so this leg's held-out movement cannot be attributed to training (the CONTRACT's own RED-control precedent: an lr=0 arm fails exactly this leg)",
+          "redproof-signflip-v2 seed 11: fused: learning_happened_delta=-19.388529270887375 (derived: train_probe_series[0] - train_probe_series[-1]) does not clear the floor (0.0) -- the train-side probe shows no observed learning, so this leg's held-out movement cannot be attributed to training (the CONTRACT's own RED-control precedent: an lr=0 arm fails exactly this leg)",
+          "redproof-signflip-v2 seed 12: fused: learning_happened_delta=-15.470363855361938 (derived: train_probe_series[0] - train_probe_series[-1]) does not clear the floor (0.0) -- the train-side probe shows no observed learning, so this leg's held-out movement cannot be attributed to training (the CONTRACT's own RED-control precedent: an lr=0 arm fails exactly this leg)",
+          "redproof-signflip-v2: 0 premise-clean mutant/alloff pair(s), expected exactly 12 -- never silently rescaled to whatever count ran clean"
+        ]
+      }
+    ],
+    "sensitivity": null,
+    "sensitivity_error": null,
+    "two_sided_falsification": [],
+    "dose_anomalies": [],
+    "red_proof": [
+      {
+        "dose_label": "redproof-nobc",
+        "patch_sha256": "9b3c824dc041899c12c0e2d44d12a3ac8c7b86076ffc778638108925ba51bf4e",
+        "detected": "INVALID",
+        "n_pos": 3,
+        "n_neg": 7,
+        "mean_d": -0.05838009193539619,
+        "p_value": 0.34375,
+        "clean_pair_count": 10
+      },
+      {
+        "dose_label": "redproof-signflip-v2",
+        "patch_sha256": "c81d0ed59d45761bbd6487dbb23c5aaae22f30739c0e2e613d96c4901ad9b202",
+        "detected": "INVALID",
+        "n_pos": 0,
+        "n_neg": 0,
+        "mean_d": null,
+        "p_value": null,
+        "clean_pair_count": 0
+      }
+    ],
+    "red_proof_verdict": "NOT_PROVEN (redproof-nobc=INVALID, redproof-signflip-v2=INVALID)",
+    "note": "CONTRACT amendment 2026-08-29b item 3, signed per addendum 2026-08-29c: each dose column merges the mutant, substituted into the fused arm, against the SAME campaign alloff legs (never re-run) under the SAME >=11/12+mean rule the primary decision uses. Mutant legs never enter the primary A/B set (mutant_leg_repeat_tag's own file-naming isolation). 'sensitivity' names the adjacent-dose pair straddling detection WITHIN the degradation-direction (negative-eps) branch only, magnitude-ordered, or null when no such transition exists there; a positive-eps dose reading RED or RED_FOR_INVESTIGATION is reported separately under 'two_sided_falsification' (RED refutes the held-out-improvement prediction, RED_FOR_INVESTIGATION confirms it), never folded into 'sensitivity'; a NEGATIVE-eps dose reading RED_FOR_INVESTIGATION (an anomalous improvement detected under deflation, unit-63 round-9 audit finding 3) is reported under 'dose_anomalies' instead and gates this merge's own exit code exactly as the primary decision's own RED_FOR_INVESTIGATION state does -- investigated, never silently celebrated; 'sensitivity_error' names ANY of this family's own refusal classes over the supplied dose set -- a dose_label that failed to parse as a signed eps value, a parsed eps outside this family's own domain, or a duplicate identity across two columns (the same literal dose_label, the same parsed eps under two different labels, or the same patch_sha256 under two different labels, unit-63 round-11 audit block) -- never silently ignored. 'red_proof'/'red_proof_verdict' (unit 63, the RED-proof label class, RED_PROOF_LABEL_PREFIX='redproof-') report every dose column whose label carries that prefix -- OUTSIDE the (1+eps) lr-scale family and excluded from 'sensitivity'/'two_sided_falsification'/'dose_anomalies' and the duplicate-EPS arm above (still subject to the duplicate-LABEL/PATCH_SHA arms), but computed in 'doses' exactly like any other column. 'red_proof_verdict' is 'PROVEN' iff at least one RED-proof column's own 'detected' reads 'RED' (acceptance 5's own discharge condition); otherwise 'NOT_PROVEN' naming each RED-proof column's own 'detected' -- a RED-proof column reading RED_FOR_INVESTIGATION is recorded as-is (an anomaly for a mutant EXPECTED to degrade), never a second way to discharge PROVEN."
+  }
+}

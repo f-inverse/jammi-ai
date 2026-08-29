@@ -27,8 +27,10 @@ sorted: +0.17900 (seed 2), then +11.19540 .. +20.08700 (the other 11
 seeds). The primary A/B's own `d_values` read max |d_i| = 0.15239 and
 `cross_seed_spread` = 0.08265. The only comparisons this record asserts:
 0.17900 > 0.15239, and 0.17900 is the smallest of the 12 mutant values.
-Seed 2 is degradation-concordant by SIGN — the only property the
-pre-registered rule counts (`n_pos` requires the sign; the sign test does
-not read magnitude) — so the verdict above is unaffected. Whether seed 2's
-magnitude exceeds what the primary noise band could produce is NOT
-adjudicated by this record and no claim about it is made.
+The pre-registered rule is conjunctive — "RED iff >=11 of 12 d_i share a
+sign AND the mean agrees in sign" (CONTRACT.md, Frame) — and both legs are
+read from `doses[0]`: `n_pos` = 12 >= 11, and `mean_d` = +15.96714 > 0
+(seed 2 enters that mean at its own +0.17900). The verdict above is
+unaffected. Whether seed 2's magnitude exceeds what the primary noise band
+could produce is NOT adjudicated by this record and no claim about it is
+made.

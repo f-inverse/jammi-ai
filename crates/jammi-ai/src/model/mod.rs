@@ -538,6 +538,36 @@ pub struct ModelGuard {
     /// `ref_count == 0` for this entry is guaranteed the permit clone
     /// backing this guard is already gone.
     _gpu_permit: Option<Arc<crate::concurrency::GpuPermit>>,
+    /// Unit 62, closure-audit BLOCK 1 (admission-wake liveness hole): a
+    /// clone of `ModelCache`'s cache-level admission [`tokio::sync::Notify`].
+    ///
+    /// **Why this cannot simply reuse `GpuScheduler`'s own release notify**
+    /// (`GpuPermit::drop`'s `scheduler.notify.notify_waiters()`): that fires
+    /// only when a `GpuPermit`'s LAST `Arc` clone actually drops. But this
+    /// guard's `_gpu_permit` clone is never the last one while its
+    /// `CacheEntry` is still present in the cache — the `CacheEntry` always
+    /// retains its own clone (see `_gpu_permit`'s doc) until something
+    /// explicitly removes the entry. So `ref_count` reaching zero for a
+    /// STILL-CACHED entry — the transition that makes `evict_one` newly
+    /// eligible to reclaim it — is invisible to `GpuScheduler`'s notify: no
+    /// `Arc<GpuPermit>` clone drop event happens at all, only an atomic
+    /// `ref_count` decrement. A waiter parked purely on
+    /// `GpuScheduler::acquire`'s internal wait (or its notify directly) is
+    /// then a permanent liveness hole: budget sized to one resident copy, A
+    /// holds M1's guard, B's `do_load` fails to admit M2, evicts nothing (M1
+    /// has `ref_count == 1`), and parks; A drops its guard, `ref_count` hits
+    /// zero, M1 becomes evictable — but no `GpuPermit` clone ever dropped
+    /// (the `CacheEntry`'s own clone is still live), so `notify_waiters()`
+    /// is never called and B hangs forever.
+    ///
+    /// This field closes that hole: `Drop` notifies it, unconditionally,
+    /// AFTER the `ref_count` decrement below. `ModelCache::do_load`'s
+    /// admission loop registers a `Notified` future on this notify (plus the
+    /// `GpuScheduler`-level one) BEFORE each `try_acquire`/`evict_one` pass,
+    /// so it wakes and re-runs the full admission loop on either transition.
+    /// See `ModelCache::do_load`'s admission loop for the full wake-set
+    /// enumeration.
+    admission_notify: Arc<tokio::sync::Notify>,
 }
 
 impl ModelGuard {
@@ -548,11 +578,13 @@ impl ModelGuard {
         model: Arc<LoadedModel>,
         ref_count: Arc<AtomicUsize>,
         gpu_permit: Arc<crate::concurrency::GpuPermit>,
+        admission_notify: Arc<tokio::sync::Notify>,
     ) -> Self {
         Self {
             model,
             ref_count,
             _gpu_permit: Some(gpu_permit),
+            admission_notify,
         }
     }
 }
@@ -566,6 +598,17 @@ impl Drop for ModelGuard {
         // "ref_count == 0 may be observed by a concurrent evict_one".
         drop(self._gpu_permit.take());
         self.ref_count.fetch_sub(1, Ordering::Release);
+        // Unit 62, closure-audit BLOCK 1: signal the admission-wake notify
+        // AFTER `ref_count` is visibly decremented, so any admission loop
+        // this wakes observes the up-to-date `ref_count` when it re-checks
+        // `evict_one`'s eligibility condition. Unconditional (every guard
+        // drop signals, not just the one that happens to reach zero) —
+        // spurious wakes only cost a cheap re-check of `try_acquire` +
+        // `evict_one`'s idle scan, never a correctness problem, and a
+        // conditional signal here would have to re-derive the same
+        // "is this really the transition that matters" answer `evict_one`
+        // already computes authoritatively.
+        self.admission_notify.notify_waiters();
     }
 }
 

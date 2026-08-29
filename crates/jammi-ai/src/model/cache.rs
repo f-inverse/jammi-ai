@@ -11,7 +11,7 @@ use super::backend::ort::OrtBackend;
 use super::backend::{DeviceConfig, ModelBackend};
 use super::resolver::ModelResolver;
 use super::{BackendType, LoadedModel, ModelGuard, ModelId, ModelSource, ModelTask};
-use crate::concurrency::{GpuPermit, GpuPriority, GpuScheduler};
+use crate::concurrency::{GpuPermit, GpuScheduler};
 
 /// Where a cached model currently resides.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -79,6 +79,12 @@ pub struct ModelCache {
     backends: Backends,
     device_config: DeviceConfig,
     gpu_scheduler: Arc<GpuScheduler>,
+    /// Unit 62, closure-audit BLOCK 1 (admission-wake liveness hole): the
+    /// cache-level admission wake source. See [`ModelGuard`]'s
+    /// `admission_notify` field doc for why `GpuScheduler`'s own release
+    /// notify is not sufficient on its own, and `do_load`'s admission loop
+    /// for the full wake-set enumeration this notify is one half of.
+    admission_notify: Arc<tokio::sync::Notify>,
     /// See [`ProbePauseHandle`]. Consumed (taken) the first time
     /// `get_or_load`'s fast path reaches the pause point, so it only ever
     /// pauses once per installation.
@@ -112,6 +118,7 @@ impl ModelCache {
             },
             device_config,
             gpu_scheduler,
+            admission_notify: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
             probe_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -307,7 +314,12 @@ impl ModelCache {
                                     .gpu_permit,
                             );
                             cache.touch_lru(&id);
-                            return Ok(ModelGuard::new(model, ref_count, gpu_permit));
+                            return Ok(ModelGuard::new(
+                                model,
+                                ref_count,
+                                gpu_permit,
+                                Arc::clone(&self.admission_notify),
+                            ));
                         }
                         // The entry changed under us (a concurrent
                         // evict/reload won the race) — retry against the
@@ -514,18 +526,71 @@ impl ModelCache {
         // scheduler could EVER admit, evictions or waiting or not) via
         // `GpuScheduler::usable_capacity` — the one case a hard error is
         // still honest, since no amount of waiting would ever succeed.
-        // Otherwise, fall back to `GpuScheduler::acquire`'s async wait: it
-        // registers its `Notify` waiter (via `enable()`) before its own
-        // `try_acquire` check, so it never misses the outgoing guard's
-        // `GpuPermit::drop` -> `notify_waiters()` (or a later `evict_one`
-        // finding a newly-idle entry) — wakes on ANY permit release, in
-        // arbitrary order among waiters (v1 priority is a label only, see
-        // `GpuScheduler::acquire`'s doc), and never returns `Err` itself
-        // (its loop only ever resolves via a successful `try_acquire`), so
-        // this reload waits rather than hard-failing "nothing to evict" on
-        // a load that would otherwise have succeeded once the outgoing
-        // guard released.
+        //
+        // Unit 62, closure-audit BLOCK 1 (admission-wake liveness hole,
+        // FIXES the doc this replaces — the old text here claimed
+        // `GpuScheduler::acquire`'s wait "wakes on ANY permit release (or a
+        // later `evict_one` finding a newly-idle entry)"; the second half was
+        // FALSE. `GpuScheduler::acquire` only ever waits on
+        // `GpuScheduler`'s own release notify — it has no way to observe
+        // `evict_one`'s eligibility condition at all, let alone wake because
+        // of it. Consider: budget sized to one resident copy; A holds M1's
+        // guard; B's `do_load` (loading M2) fails `try_acquire`, finds M1
+        // NOT evictable (`ref_count == 1`), and would fall back to
+        // `GpuScheduler::acquire`'s wait. A then drops its guard: per
+        // `ModelGuard::drop`'s ordering, the permit clone releases BEFORE
+        // the `ref_count` decrement — but M1's `CacheEntry` is still present
+        // in the cache and retains its OWN clone of the SAME `Arc<GpuPermit>`
+        // (F-3's sharing discipline), so dropping A's clone only lowers the
+        // `Arc`'s strong count from 2 to 1 — it does NOT reach zero, so
+        // `GpuPermit::drop`'s body (and its `notify_waiters()` call) never
+        // runs. `ref_count` reaching zero — the transition that makes M1
+        // newly eligible for `evict_one` — is therefore INVISIBLE to
+        // `GpuScheduler`'s notify. A waiter parked purely on
+        // `GpuScheduler::acquire` would hang forever, holding
+        // `cache.in_flight[M2]`, wedging every later M2 caller behind it
+        // (the single-flight branch never runs `evict_one`, so nothing ever
+        // rescues it).
+        //
+        // Wake-set enumeration (the two, and only two, transitions that can
+        // ever make a previously-failed admission attempt newly succeed —
+        // this loop's `select!` below covers BOTH, and re-runs the ENTIRE
+        // admission sequence — `try_acquire`, `evict_one`, the unsatisfiable
+        // check — from the top on either):
+        //
+        //   1. A `GpuPermit`'s LAST `Arc` clone drops for real, directly
+        //      decrementing `GpuScheduler::reserved_memory` and calling
+        //      `scheduler.notify.notify_waiters()` (`GpuPermit::drop`, the
+        //      sole call site). This covers every already-cache-evicted
+        //      entry's outgoing guard being the final clone (the
+        //      `evict_if_current`/stale-reload case — the pre-existing,
+        //      still-green wait test) and `evict_one`'s own removal of an
+        //      idle entry (also a last-clone drop, since `evict_one` only
+        //      ever removes an entry whose `strong_count == 1`).
+        //   2. Any `ModelGuard::drop`, unconditionally — signals
+        //      `ModelCache::admission_notify` AFTER its `ref_count`
+        //      decrement (see `ModelGuard`'s `admission_notify` field doc).
+        //      This covers the hole above: a STILL-CACHED entry's
+        //      `ref_count` reaching zero, which makes `evict_one` newly
+        //      eligible to reclaim it WITHOUT any `Arc<GpuPermit>` clone
+        //      ever actually dropping (the `CacheEntry` keeps its own clone
+        //      alive the whole time) — a transition (1) alone cannot see.
+        //
+        // Both `Notified` futures are registered (`enable()`d) BEFORE the
+        // `try_acquire`/`evict_one`/unsatisfiable checks below, following the
+        // identical lost-wakeup-safe idiom `GpuScheduler::acquire` itself
+        // uses (register, then check, so a notify that fires in the gap is
+        // never missed) — never a timeout: the wake-set above is complete
+        // for every way this loop's admission state can change, so an
+        // unbounded wait is the honest contract, not a masked liveness bug.
         let gpu_permit = loop {
+            let permit_released = self.gpu_scheduler.notify.notified();
+            tokio::pin!(permit_released);
+            permit_released.as_mut().enable();
+            let entry_became_idle = self.admission_notify.notified();
+            tokio::pin!(entry_became_idle);
+            entry_became_idle.as_mut().enable();
+
             if let Some(permit) = self.gpu_scheduler.try_acquire(memory_bytes) {
                 break permit;
             }
@@ -547,10 +612,10 @@ impl ModelCache {
                     ),
                 });
             }
-            break self
-                .gpu_scheduler
-                .acquire(memory_bytes, GpuPriority::Interactive)
-                .await?;
+            tokio::select! {
+                _ = permit_released => {}
+                _ = entry_became_idle => {}
+            }
         };
 
         let loaded = backend.load(&resolved, &self.device_config)?;
@@ -606,7 +671,12 @@ impl ModelCache {
         );
         cache.lru_order.push_back(id.clone());
 
-        Ok(ModelGuard::new(model, ref_count, gpu_permit))
+        Ok(ModelGuard::new(
+            model,
+            ref_count,
+            gpu_permit,
+            Arc::clone(&self.admission_notify),
+        ))
     }
 
     /// Preload a model without running inference.
@@ -1398,5 +1468,198 @@ mod r5_f1_tokenizer_tests {
                  again (R7-F1) — a cold process loading this same, now-restored directory would \
                  serve it fine",
             );
+    }
+}
+
+// ── Unit 62, closure-audit BLOCK 1 (block): the admission-wait liveness \
+//    hole — a plain LRU-budget-pressure eviction (NOT a stale reload) must \
+//    wake once the blocking entry's ref_count reaches zero, even though no \
+//    `Arc<GpuPermit>` clone ever actually drops for that transition ──
+
+#[cfg(test)]
+mod admission_wake_tests {
+    use super::*;
+    use std::time::Duration;
+
+    use jammi_db::catalog::Catalog;
+    use jammi_db::storage::{StorageRegistry, StorageUrl};
+    use jammi_db::store::ArtifactStore;
+
+    fn device_config() -> DeviceConfig {
+        DeviceConfig {
+            gpu_device: -1,
+            memory_fraction: 1.0,
+            require_gpu: false,
+            compute_precision: jammi_numerics::ComputePrecision::F32,
+        }
+    }
+
+    fn test_artifact_store() -> Arc<ArtifactStore> {
+        let cache_dir = tempfile::tempdir().unwrap().keep();
+        Arc::new(
+            ArtifactStore::with_root(
+                StorageUrl::memory("admission-wake-test-artifacts"),
+                StorageRegistry::new(),
+                cache_dir,
+            )
+            .unwrap(),
+        )
+    }
+
+    /// Copy the hermetic `tiny_bert` fixture into a fresh directory under
+    /// `root/name` and return a `ModelSource::local` pointing at it, plus
+    /// the weights file's byte length (the scheduler budget unit this
+    /// module sizes against).
+    fn tiny_bert_source(root: &std::path::Path, name: &str) -> (ModelSource, usize) {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fixture = jammi_test_utils::cookbook_fixture("tiny_bert");
+        for file in ["config.json", "model.safetensors", "tokenizer.json"] {
+            std::fs::copy(fixture.join(file), dir.join(file)).unwrap();
+        }
+        let weights_len = std::fs::metadata(dir.join("model.safetensors"))
+            .unwrap()
+            .len() as usize;
+        (ModelSource::local(&dir), weights_len)
+    }
+
+    /// The missing lattice cell (auditor-verified mechanism chain): budget
+    /// sized to ONE resident copy; A holds M1's guard; B spawns
+    /// `get_or_load(M2)` — under this budget `do_load` cannot admit M2
+    /// without evicting M1, and M1 is NOT evictable while A's guard is live
+    /// (`ref_count == 1`), so B must park in the admission loop's wait. A
+    /// then drops M1's guard WITHOUT the entry ever being removed from the
+    /// cache (a plain idle-LRU eviction target, unlike every pre-existing
+    /// admission-wait test, which is a STALE RELOAD of the SAME model —
+    /// there the outgoing guard holds the permit's LAST clone, since the
+    /// stale entry was already removed from `cache.entries`, so
+    /// `GpuPermit::drop`'s own `notify_waiters()` fires directly). Here the
+    /// `CacheEntry` for M1 is still present and keeps its own clone of the
+    /// SAME `Arc<GpuPermit>` alive the whole time (F-3's sharing
+    /// discipline) — A's guard drop lowers the `Arc`'s strong count from 2
+    /// to 1, never to 0, so `GpuPermit::drop`'s body — and its
+    /// `notify_waiters()` — never runs. The ONLY transition that fires here
+    /// is `ModelGuard::drop`'s unconditional `admission_notify.notify_waiters()`
+    /// signal (see `ModelGuard`'s `admission_notify` field doc) — a waiter
+    /// parked purely on `GpuScheduler`'s own release notify (the pre-fix
+    /// shape: `do_load` fell back to `GpuScheduler::acquire`, which only
+    /// ever waits on that one notify) would never wake, hanging forever
+    /// while permanently holding `cache.in_flight[M2]`.
+    ///
+    /// RED proof (see this test's own doc for how to reproduce): reverting
+    /// `do_load`'s admission loop to plain `self.gpu_scheduler.acquire(...)`
+    /// (dropping the `admission_notify`/`select!` wait entirely) makes B's
+    /// task hang — never observing M1's `ref_count -> 0` transition — and
+    /// this test's final `tokio::time::timeout` bound turns that hang into
+    /// a clear, fast assertion failure instead of wedging CI. This mirrors
+    /// the single-flight lost-wakeup advisory test's own precedent
+    /// (`single_flight_advisory_tests::registered_waiter_always_wakes_even_if_notify_races_the_pause`)
+    /// for bounding a liveness regression with a timeout rather than
+    /// relying on an indefinite hang to "prove" the wait.
+    #[tokio::test]
+    async fn plain_lru_eviction_wakes_once_the_blocking_guard_drops_even_with_no_permit_release() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
+        let resolver = ModelResolver::new(Arc::clone(&catalog), test_artifact_store()).unwrap();
+
+        let (source_a, weights_len) = tiny_bert_source(tmp.path(), "admission_wake_model_a");
+        let (source_b, weights_len_b) = tiny_bert_source(tmp.path(), "admission_wake_model_b");
+        assert_eq!(
+            weights_len, weights_len_b,
+            "both fixtures are copies of the same tiny_bert weights file"
+        );
+
+        // Budget fits EXACTLY one model — B cannot be admitted until A's
+        // guard drops and M1 is evicted; there is no slack that would let
+        // B's `try_acquire` succeed on its own.
+        let scheduler = Arc::new(GpuScheduler::new(weights_len, 0.0));
+        let cache = Arc::new(ModelCache::new(resolver, device_config(), scheduler));
+
+        // (1) A loads M1 and KEEPS THE GUARD — the entire budget is
+        // reserved, and M1 is NOT idle (`ref_count == 1`).
+        let guard_a = cache
+            .get_or_load(&source_a, ModelTask::TextEmbedding, None)
+            .await
+            .unwrap();
+
+        // (2) Spawn B's load of the DISTINCT model M2 while A's guard is
+        // still held. This must park in `do_load`'s admission wait: M1 is
+        // not evictable (ref_count != 0), the budget cannot admit a second
+        // resident copy, and the request is within `usable_capacity`
+        // (satisfiable once A releases), so no hard error is legitimate.
+        let cache_for_b = Arc::clone(&cache);
+        let source_b_for_task = source_b.clone();
+        let mut task_b = tokio::spawn(async move {
+            cache_for_b
+                .get_or_load(&source_b_for_task, ModelTask::TextEmbedding, None)
+                .await
+        });
+
+        // (3) B must NOT complete yet — a generous-but-bounded probe turns
+        // "still parked" into a fast, clear assertion rather than an
+        // indefinite block that merely LOOKS like proof of parking.
+        let still_pending = tokio::time::timeout(Duration::from_millis(500), &mut task_b).await;
+        match still_pending {
+            Err(_elapsed) => {
+                // Timed out waiting for completion — genuinely still
+                // parked, exactly what "waiting on admission" looks like.
+            }
+            Ok(joined) => match joined.unwrap() {
+                Ok(_guard) => panic!(
+                    "B's load completed BEFORE A's guard was dropped, while the \
+                     1x budget could not possibly admit a second resident copy \
+                     alongside A's still-live guard — structurally impossible \
+                     either way"
+                ),
+                Err(e) => panic!(
+                    "B's load returned Err BEFORE A's guard was dropped — the \
+                     admission loop must WAIT here (M1 is genuinely reclaimable \
+                     once A releases), never hard-error on a request that is \
+                     perfectly satisfiable once the blocking guard drops — got \
+                     Err({e})"
+                ),
+            },
+        }
+
+        // (4) Release A's guard: M1's `CacheEntry` is STILL IN THE CACHE
+        // (never removed) — this is the plain idle-LRU shape, not a stale
+        // reload, so no `Arc<GpuPermit>` clone reaches zero here. Only the
+        // `ModelGuard::drop`-signalled admission notify can wake B.
+        drop(guard_a);
+
+        // (5) B must now wake, evict the now-idle M1 via `evict_one`, load
+        // M2, and complete — within a generous bound. A hang here (bounded
+        // by the timeout, never an indefinite `.await`) is exactly the
+        // liveness hole this test targets.
+        let joined = tokio::time::timeout(Duration::from_secs(10), task_b).await;
+        let result = match joined {
+            Ok(joined) => joined.unwrap(),
+            Err(_) => panic!(
+                "B's load never completed within 10s after A's guard was dropped \
+                 — the admission loop never woke because no GpuPermit clone ever \
+                 actually released (M1's CacheEntry kept its own clone alive the \
+                 whole time); this is the admission-wake liveness hole (unit 62, \
+                 closure-audit BLOCK 1) — B is left parked forever, permanently \
+                 holding cache.in_flight[M2]"
+            ),
+        };
+        let guard_b = match result {
+            Ok(guard) => guard,
+            Err(e) => panic!(
+                "B's load must succeed once A's guard is dropped and M1 becomes \
+                 evictable — got Err({e})"
+            ),
+        };
+
+        // (6) Sanity: B genuinely occupies the entire 1-model budget — M1
+        // was actually evicted (real progress), not merely "unblocked" by
+        // some accounting fluke.
+        assert_eq!(
+            cache.gpu_scheduler.available(),
+            0,
+            "B occupies the entire 1-model budget after evicting the now-idle M1"
+        );
+        drop(guard_b);
     }
 }

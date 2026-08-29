@@ -193,6 +193,16 @@ struct FinetuneRunArgs {
     backbone_dtype: String,
     #[arg(long, default_value_t = 64)]
     max_seq_length: usize,
+    /// CALLER-declared premise for the report's `admission_is_dense` field
+    /// (default: `false`, matching the committed fixture's padded
+    /// transport). This tier's real-text path never reaches
+    /// `forward_with_lengths`'s dense-vs-padded fork, so there is no live
+    /// signal to check this claim against — the value is recorded exactly
+    /// as declared, for a downstream merger to check against the fixture's
+    /// own known shape (see `finetune_run::FinetuneRunParams::expect_dense`'s
+    /// doc).
+    #[arg(long, default_value_t = false)]
+    expect_dense: bool,
     /// CUDA ordinal; omit for CPU (the CPU-hermetic smoke path).
     #[arg(long)]
     cuda: Option<usize>,
@@ -814,6 +824,7 @@ async fn main() -> std::process::ExitCode {
                 target_modules,
                 backbone_dtype,
                 max_seq_length,
+                expect_dense,
                 cuda,
                 work_dir,
             } = *args;
@@ -924,6 +935,7 @@ async fn main() -> std::process::ExitCode {
                     }
                 },
                 max_seq_length,
+                expect_dense,
                 cuda_device: cuda,
                 work_dir,
             };

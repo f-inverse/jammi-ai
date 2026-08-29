@@ -2005,13 +2005,20 @@ pub struct FinetuneRunTier {
 
     // ── Premise legs (CONTRACT H4: "recorded per run, conjunctive, for
     //    the merger to refuse on") ───────────────────────────────────────
-    /// `admission.is_dense` for this arm's real-text forward path — always
-    /// `false` (v2 delta 8): the committed fixture's variable-length arxiv
-    /// pairs take the PADDED transport, never the dense branch T6's
-    /// 1.55x figure was measured on. Pre-registered rather than measured —
-    /// see [`crate::finetune_run::run`]'s own doc for why this tier's
-    /// real-text path never reaches `forward_with_lengths`'s dense/padded
-    /// fork at all.
+    /// The caller-declared premise (`--expect-dense`, default `false`) for
+    /// whether this arm's real-text forward path took the dense transport —
+    /// CALLER-DECLARED AND MERGER-CHECKED, never measured: this tier's
+    /// real-text path drives `encode_chunk`'s plain `encoder.forward`, which
+    /// never reaches `jammi_encoders::ModernBert::forward_with_lengths`'s
+    /// dense-vs-padded fork (the one place `admission.is_dense` is actually
+    /// decided) at all, so there is no live signal on this tier's admission
+    /// path to read back and check the claim against. The committed
+    /// fixture's variable-length arxiv pairs take the PADDED transport, so
+    /// the default (`false`) matches the fixture's own known shape — see
+    /// [`crate::finetune_run::run`]'s own doc and
+    /// [`crate::finetune_run::FinetuneRunParams::expect_dense`]'s doc for
+    /// why this tier's real-text path never reaches `forward_with_lengths`'s
+    /// dense/padded fork at all.
     pub admission_is_dense: bool,
     /// `first_epoch_train_probe_mean - final_epoch_train_probe_mean` — the
     /// "learning-happened" floor leg (CONTRACT H4), measured via the SAME

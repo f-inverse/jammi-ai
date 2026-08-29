@@ -1449,6 +1449,138 @@ def finetune_run_arm_premise_violations(arm, tier):
     return violations
 
 
+def finetune_run_dispatch_proof_violations(arm, tier):
+    """Unit-63 adversarial-audit finding 2's merger half: the finetune-run
+    tier now ALSO emits finetune-step's exact `*_fused_dispatches`/
+    `*_eager_dispatches` counter pairs -- verbatim field names, the
+    `attention_block` pair included -- from a concurrent bench dispatch.
+    This reuses `dispatch_pairs`/`fused_proof` UNCHANGED (never a second,
+    independently-drifting hand-rolled dispatch-classification mechanism --
+    this module's own B2 note) rather than re-deriving the same
+    classification tables a second time for this tier.
+
+    `arm` (`"fused"` or `"alloff"`) states what this leg CLAIMS to have run;
+    this checks the COUNTED FACT behind that claim, mirroring
+    `clip_fact_violations`'s own "a claim with no counted fact behind it is
+    refused" shape, applied to dispatches instead of the clip counter:
+      * `arm == "fused"`: `fused_proof` -- the SAME gate a finetune-step
+        `jammi-fused` leg is held to -- must return `True`.
+      * `arm == "alloff"`: EVERY dispatch pair `dispatch_pairs` discovers
+        must show `fused == 0` -- an alloff leg that dispatched even one
+        fused op did not actually run with kernels disabled, so its `d_i`
+        is not a fact about the ALLOFF reference at all.
+
+    A leg with NO dispatch-counter fields at all (an older producer build
+    predating this emission) is ALSO a violation -- `dispatch_pairs`
+    returning empty is never silently ASSUMED to mean "ran the claimed arm
+    cleanly"; a classification with no counted fact behind it is
+    untrusted -- discarded, never merely annotated, mirroring the existing
+    finetune-step tier's own semantics for this same proof. A malformed
+    pair (`dispatch_pairs` raising -- a solo counter, or a base outside
+    `ALL_BASES`) is caught HERE and reported the same way, never left to
+    propagate and void the whole merge the way an uncaught raise would.
+
+    Returns a list of violation strings, empty when this leg's claimed arm
+    matches its counted dispatch facts.
+    """
+    try:
+        pairs = dispatch_pairs(tier)
+    except KeyError as exc:
+        return [f"{arm}: dispatch-pair schema error -- {exc}"]
+    if not pairs:
+        return [
+            f"{arm}: no *_fused_dispatches/*_eager_dispatches counter fields present on this "
+            "leg's report at all -- an older producer build predating this emission cannot be "
+            "assumed to have run the classified arm; the leg's own claim is untrusted, not "
+            "merely unannotated"
+        ]
+    if arm == "fused":
+        m = {
+            "dispatch_pairs": pairs,
+            "flash_compiled": tier.get("flash_compiled"),
+            "kernels_disabled_requested": tier.get("kernels_disabled_requested"),
+            "kernels_disabled_fired": tier.get("kernels_disabled_fired"),
+        }
+        proof = fused_proof(m)
+        if proof is not True:
+            return [
+                f"fused: fused-dispatch proof failed or errored ({proof!r}) -- this leg's "
+                "'fused' classification is untrusted, discarded, not merely annotated"
+            ]
+        return []
+    if arm == "alloff":
+        nonzero = sorted((base, fused) for base, fused, _fallback in pairs if fused > 0)
+        if nonzero:
+            return [
+                f"alloff: {len(nonzero)} dispatch pair(s) show a nonzero fused count "
+                f"{nonzero!r} -- an alloff leg must dispatch zero fused ops on every pair; "
+                "this leg's 'alloff' classification is untrusted, discarded, not merely "
+                "annotated"
+            ]
+        return []
+    return [f"{arm}: unrecognized finetune-run arm -- cannot apply the dispatch-proof gate to it"]
+
+
+def finetune_run_cross_seed_homogeneity_violations(leg_identities):
+    """Cross-seed leg-premise check (unit-63 adversarial-audit finding 3):
+    every OTHER identity check in this section compares WITHIN one seed
+    only -- `generic_leg_premise_violations` over `FINETUNE_RUN_IDENTITY_FIELDS`
+    (called per-seed, fused-vs-alloff below) and
+    `finetune_run_lr0_control_seed_violations` (also per-seed) never compare
+    seed N's own premise against seed M's.
+
+    Empirical reproduction that motivated this check: 6 seeds run against
+    ONE held-out fixture text, plus 6 seeds run against a DIFFERENT one --
+    each seed's own fused/alloff pair internally agreed with itself (so the
+    existing per-seed check saw nothing wrong), yet the merge still read
+    GREEN, silently averaging two DIFFERENT premises' `d_i` values into one
+    sign test as though they were twelve draws from the same experiment.
+
+    `leg_identities` is `[(label, fields), ...]` -- `label` a human-readable
+    string identifying the leg (seed/arm/repeat), `fields` the
+    `finetune_run_leg_identity`-shaped `{field: value_or_MISSING}` dict for
+    THAT leg. Every `FINETUNE_RUN_IDENTITY_FIELDS` entry EXCEPT `seed`
+    itself (expected, by construction, to differ across legs -- it is the
+    axis the sweep varies over) must canonicalize (the SAME
+    `canonicalize_identity_field` table every other identity comparison in
+    this module shares) to the SAME value across EVERY leg entering the
+    decision -- every main-arm r1/r2 leg across every seed, PLUS every
+    lr0-control leg (the caller assembles this list; see
+    `build_finetune_run_report`'s own wiring). A leg where the field folds
+    to `_MISSING` (absent, or present-but-null on a non-`null-is-a-value`
+    field) is its own distinct group -- never silently treated as agreeing
+    with a present value, nor with a DIFFERENT absent leg's own reason for
+    being absent.
+
+    Returns a list of violation strings, one per divergent field, each
+    naming the field and, for every distinct value found, the labels of the
+    legs that reported it -- never a silent drop of which legs disagreed.
+    Homogeneous input (including fewer than two legs, which cannot
+    disagree) returns `[]`.
+    """
+    violations = []
+    if len(leg_identities) < 2:
+        return violations
+    for field in FINETUNE_RUN_IDENTITY_FIELDS:
+        if field == "seed":
+            continue  # the swept axis -- expected to differ, never compared
+        groups = {}  # repr(display_value) -> (display_value, [labels])
+        for label, fields in leg_identities:
+            value = fields.get(field, _MISSING)
+            display = "<absent-or-null>" if value is _MISSING else canonicalize_identity_field(field, value)
+            key = repr(display)
+            entry = groups.setdefault(key, (display, []))
+            entry[1].append(label)
+        if len(groups) > 1:
+            parts = "; ".join(f"{display!r} on {labels}" for display, labels in groups.values())
+            violations.append(
+                f"cross-seed leg-identity field {field!r} diverges across legs entering the "
+                "decision (unit-63 audit finding 3 -- every leg's premise for this field must "
+                f"be the SAME, not merely fused/alloff agreement within one seed): {parts}"
+            )
+    return violations
+
+
 def load_finetune_run_leg(raw_dir, seed, arm, repeat):
     """Read one `finetune_run_ab.sh`-produced `.exit`/`.json`/`.stderr`
     triple, named `seed{seed}__{arm}__{repeat}` (mirrors `finetune_ab.sh`'s
@@ -1501,12 +1633,19 @@ def finetune_run_lr0_control_seed_violations(raw_dir, seed):
     `DRY_RUN` leg is the one carve-out (never itself a finding, same
     doctrine every other `*_DRY_RUN` leg in this module already gets).
 
-    Returns `(violations, per_arm)` where `per_arm` records each arm's raw
-    outcome and (when OK) its `learning_happened_delta`, for the merged
-    artifact -- never silently dropped even when clean.
+    Returns `(violations, per_arm, identities)` where `per_arm` records each
+    arm's raw outcome and (when OK) its `learning_happened_delta`, for the
+    merged artifact -- never silently dropped even when clean -- and
+    `identities` is `[(label, fields), ...]` (unit-63 audit finding 3) for
+    every OK leg here, in the exact shape
+    `finetune_run_cross_seed_homogeneity_violations` consumes, so the
+    caller can fold the lr0 control's own legs into that check alongside
+    the main A/B seeds without a second, independently-drifting loading
+    path.
     """
     violations = []
     per_arm = {}
+    identities = []
     for arm in FINETUNE_RUN_ARMS:
         leg = load_finetune_run_leg(raw_dir, seed, arm, FINETUNE_RUN_LR0_REPEAT)
         outcome = leg["outcome"]
@@ -1524,6 +1663,7 @@ def finetune_run_lr0_control_seed_violations(raw_dir, seed):
         tier = finetune_run_block(leg["report"])
         delta = tier.get("learning_happened_delta")
         per_arm[arm] = {"outcome": outcome, "learning_happened_delta": delta}
+        identities.append((f"lr0 seed {seed} {arm}", finetune_run_leg_identity(tier)))
         if isinstance(delta, (int, float)) and not isinstance(delta, bool) and delta > FINETUNE_RUN_LEARNING_HAPPENED_FLOOR:
             violations.append(
                 f"lr0 control seed {seed} {arm}: learning_happened_delta={delta!r} "
@@ -1532,7 +1672,7 @@ def finetune_run_lr0_control_seed_violations(raw_dir, seed):
                 "FLOOR=0.0 premise-leg ruling itself, not a training result "
                 "(CONTRACT H4 advisory (b))"
             )
-    return violations, per_arm
+    return violations, per_arm, identities
 
 
 def build_finetune_run_report(raw_dir, seeds, lr0_seeds=()):
@@ -1576,6 +1716,16 @@ def build_finetune_run_report(raw_dir, seeds, lr0_seeds=()):
     RED_FOR_INVESTIGATION (improvement-concordant, fused better -- anomalous
     improvement is investigated, never silently celebrated), or GREEN.
 
+    Unit-63 audit finding 3: on top of the per-seed cross-ARM identity check
+    above, EVERY OK leg entering the decision here -- every main-arm r1/r2
+    leg across every seed in `seeds`, plus every lr0-control leg across
+    `lr0_seeds` -- is also fed to
+    `finetune_run_cross_seed_homogeneity_violations`, which requires every
+    `FINETUNE_RUN_IDENTITY_FIELDS` entry except `seed` itself to agree
+    across ALL of them, never just fused-vs-alloff within one seed. A
+    divergence there ALSO collapses `status` to `INVALID`, alongside the
+    other correctness-of-measurement carve-outs above.
+
     Returns `(merged, table)`, or `(None, None)` if not one `seed` produced
     any leg output at all (an empty sweep).
     """
@@ -1587,6 +1737,11 @@ def build_finetune_run_report(raw_dir, seeds, lr0_seeds=()):
     determinism_deltas = []  # [(seed, arm, |r1-r2|)] for every OK r1/r2 pair
     any_leg_found = False
     any_dry_run_leg = False
+    # unit-63 audit finding 3 -- [(label, fields), ...] for every OK leg
+    # entering the decision, across every seed and repeat; extended with the
+    # lr0-control legs below, then fed to
+    # `finetune_run_cross_seed_homogeneity_violations` as one flat pool.
+    cross_seed_leg_identities = []
 
     for seed in seeds:
         entries = {
@@ -1594,6 +1749,24 @@ def build_finetune_run_report(raw_dir, seeds, lr0_seeds=()):
             for arm in FINETUNE_RUN_ARMS
             for repeat in FINETUNE_RUN_REPEATS
         }
+        # unit-63 audit finding 2's merger half -- every OK leg's own
+        # dispatch-proof gate (see `finetune_run_dispatch_proof_violations`'s
+        # own doc), accumulated per seed alongside its cross-seed identity
+        # record; folded into `violations` below so an untrusted
+        # classification EXCLUDES this seed's d_i from the decision, the
+        # same "discarded, not merely annotated" carve-out every other leg
+        # check in this section already gets.
+        dispatch_proof_violations_for_seed = []
+        for (arm, repeat), entry in entries.items():
+            if entry["outcome"] == "OK":
+                tier = finetune_run_block(entry["report"])
+                cross_seed_leg_identities.append(
+                    (f"seed {seed} {arm} {repeat}", finetune_run_leg_identity(tier))
+                )
+                dispatch_proof_violations_for_seed += [
+                    f"seed {seed} {arm} {repeat}: {v}"
+                    for v in finetune_run_dispatch_proof_violations(arm, tier)
+                ]
         if any(e["outcome"] != "MISSING" for e in entries.values()):
             any_leg_found = True
         if any(e["outcome"] == "DRY_RUN" for e in entries.values()):
@@ -1608,7 +1781,7 @@ def build_finetune_run_report(raw_dir, seeds, lr0_seeds=()):
         }
 
         fused_r1, alloff_r1 = entries[("fused", "r1")], entries[("alloff", "r1")]
-        violations = []
+        violations = list(dispatch_proof_violations_for_seed)
         d_i = None
         trajectory = {}
         if fused_r1["outcome"] == "OK" and alloff_r1["outcome"] == "OK":
@@ -1663,9 +1836,16 @@ def build_finetune_run_report(raw_dir, seeds, lr0_seeds=()):
     lr0_control_violations = []
     lr0_control_per_seed = {}
     for lr0_seed in lr0_seeds:
-        seed_violations, per_arm = finetune_run_lr0_control_seed_violations(raw_dir, lr0_seed)
+        seed_violations, per_arm, identities = finetune_run_lr0_control_seed_violations(raw_dir, lr0_seed)
         lr0_control_violations += seed_violations
         lr0_control_per_seed[lr0_seed] = {"per_arm": per_arm, "violations": seed_violations}
+        cross_seed_leg_identities += identities
+
+    # unit-63 audit finding 3 -- see this function's own doc; every OK leg
+    # gathered above (main A/B seeds' r1/r2, plus the lr0 control's own
+    # legs) must agree on every FINETUNE_RUN_IDENTITY_FIELDS entry except
+    # `seed` itself.
+    cross_seed_violations = finetune_run_cross_seed_homogeneity_violations(cross_seed_leg_identities)
 
     # Cross-seed spread: population stdev of every seed's `d_i` that could
     # be COMPUTED at all (even one from a premise-violating seed -- the
@@ -1739,7 +1919,14 @@ def build_finetune_run_report(raw_dir, seeds, lr0_seeds=()):
         }
         wrong_seed_count = clean_seed_count != FINETUNE_RUN_GATE_SEED_COUNT
 
-    if any_premise_violation or determinism_floor_findings or sign_error or lr0_control_violations or wrong_seed_count:
+    if (
+        any_premise_violation
+        or determinism_floor_findings
+        or sign_error
+        or lr0_control_violations
+        or wrong_seed_count
+        or cross_seed_violations
+    ):
         status = "INVALID"
     elif sign_result is None:
         # `any_dry_run_leg` (never a premise violation, see the DRY_RUN
@@ -1779,6 +1966,9 @@ def build_finetune_run_report(raw_dir, seeds, lr0_seeds=()):
         "sign_test_error": sign_error,
         "decision": decision,
         "wrong_seed_count": wrong_seed_count,
+        # unit-63 audit finding 3 -- see `finetune_run_cross_seed_homogeneity_violations`'s
+        # own doc. Never a silent drop even when clean (empty list).
+        "cross_seed_identity_violations": cross_seed_violations,
         "lr0_control": {
             "seeds": lr0_seeds,
             "per_seed": {str(s): v for s, v in lr0_control_per_seed.items()},
@@ -1832,6 +2022,10 @@ def build_finetune_run_report(raw_dir, seeds, lr0_seeds=()):
         lines.append(
             f"lr0_control: seeds={lr0_seeds} violations={len(lr0_control_violations)}"
         )
+    if cross_seed_violations:
+        lines.append(f"cross_seed_identity_violations: {len(cross_seed_violations)}")
+        for v in cross_seed_violations:
+            lines.append(f"  - {v}")
     lines.append(f"status: {status}")
     table = "\n".join(lines)
     return merged, table

@@ -1,0 +1,124 @@
+{
+  "engine_version": "0.47.0",
+  "host": {
+    "logical_cpus": 13,
+    "total_ram_mib": 2051942
+  },
+  "subcommand": "finetune-run",
+  "provenance": {
+    "build_sha": "7cca4c3187f98d14316f1c65a7432426d78fd960",
+    "target": "x86_64-unknown-linux-gnu",
+    "profile": "release",
+    "build_features": [
+      "bench-cuda",
+      "cuda",
+      "flash-attn"
+    ],
+    "report_schema_version": 2
+  },
+  "tiers": {
+    "finetune_run": {
+      "seed": 1,
+      "batch": 32,
+      "seq": 64,
+      "lora_rank": 8,
+      "lora_alpha": 16.0,
+      "lora_dropout": 0.05,
+      "margin": null,
+      "target_modules": [
+        "Wqkv",
+        "Wo",
+        "Wi"
+      ],
+      "backbone_dtype": "bf16",
+      "checkpoint_config_sha256": "55dca68059e98f0debf8eb63ab355c451c65b1f5d90fdca4754113fdaadd2cca",
+      "checkpoint_weights_sha256": "44510fec5d3a81a1877f225637b869495f18e55f6f23a09abb9be0acc030295f",
+      "checkpoint_weights_size_bytes": 1583544840,
+      "max_grad_norm": 1.0,
+      "warmup": null,
+      "row_lengths": null,
+      "epochs": 3,
+      "lr": 0.0,
+      "schedule": "constant",
+      "warmup_steps": 0,
+      "weight_decay": 0.01,
+      "grad_accum": 1,
+      "validation_fraction": 0.1,
+      "train_pairs_file_sha256": "5e19b1407125b051a98f357eb1d55db90359fe68b4932ddd5afa4d75e86f615c",
+      "heldout_ids_sha256": "8b6bf66fda0bb2e1a7061666b0396a748449610cc0567b011d408d69f7a3d55a",
+      "heldout_pairs_sha256": "476eb7bd696cca773f6c21638c77eabbb04d8c12a219ff710caf4d39aafbed5b",
+      "heldout_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061",
+      "embedding_loss": "mnrl",
+      "temperature": 20.0,
+      "matryoshka_dims": [],
+      "early_stopping_patience": 10000,
+      "early_stopping_metric": "val_loss",
+      "eval_cadence": 1,
+      "arm": "alloff",
+      "device_name": "NVIDIA A100-SXM4-80GB",
+      "kernels_disabled_requested": [
+        "adamw_step_fused",
+        "attention_block_flash"
+      ],
+      "kernels_disabled_fired": [
+        "adamw_step_fused",
+        "attention_block_flash"
+      ],
+      "flash_compiled": true,
+      "build_features": [
+        "bench-cuda",
+        "cuda",
+        "flash-attn"
+      ],
+      "attention_arm": "eager",
+      "split_rule": "positional_fraction_split",
+      "batched_forward": true,
+      "steps_measured": 234,
+      "ln_fused_dispatches": 6669,
+      "ln_eager_dispatches": 0,
+      "rope_fused_dispatches": 0,
+      "rope_eager_dispatches": 0,
+      "softmax_fused_dispatches": 0,
+      "softmax_eager_dispatches": 0,
+      "geglu_fused_dispatches": 3276,
+      "geglu_eager_dispatches": 0,
+      "lora_epilogue_fused_dispatches": 0,
+      "lora_epilogue_eager_dispatches": 0,
+      "lora_linear_fused_dispatches": 13104,
+      "lora_linear_eager_dispatches": 0,
+      "attention_block_fused_dispatches": 3276,
+      "attention_block_eager_dispatches": 0,
+      "adamw_fused_dispatches": 0,
+      "adamw_eager_dispatches": 26208,
+      "attention_block_flash_fused_dispatches": 0,
+      "attention_block_flash_declined_dispatches": 3276,
+      "admission_is_dense": false,
+      "learning_happened_delta": 0.0,
+      "tie_fraction": 0.0,
+      "final_epoch": 2,
+      "held_out_example_mean": 3.422172799706459,
+      "held_out_count": 128,
+      "final_loss_diagnostic": 3.2,
+      "trajectory": [
+        {
+          "epoch": 0,
+          "held_out_mean": 3.422172799706459,
+          "held_out_tie_fraction": 0.0,
+          "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+        },
+        {
+          "epoch": 1,
+          "held_out_mean": 3.422172799706459,
+          "held_out_tie_fraction": 0.0,
+          "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+        },
+        {
+          "epoch": 2,
+          "held_out_mean": 3.422172799706459,
+          "held_out_tie_fraction": 0.0,
+          "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+        }
+      ]
+    }
+  }
+}

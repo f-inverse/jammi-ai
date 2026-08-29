@@ -1,0 +1,19 @@
+MUTANT-CHAIN: campaign producer exited at 2026-08-29T06:33:27Z
+HEAD is now at fc6bd65 Merge numerics/63-mutant-m: kernel mutant M1 (adamw bias-correction off-by-one) patch + procedure for the pre-registered RED column (H5 step 3)
+MUTANT-BASE-SHA: fc6bd655edf32e4ab13df5ac7e6a70957f25afb4
+68d2023b936fe613c75e85a49ad4c6de01fb27442ffb967db00107fbc012d926  docs/plans/63-how-well/mutants/M1.patch
+PATCH-APPLY-RC:0
+MUTANT-BUILD-RC:0
+MUTANT-LEG[seed1]-RC:0
+MUTANT-LEG[seed2]-RC:0
+MUTANT-LEG[seed3]-RC:0
+MUTANT-LEG[seed4]-RC:0
+MUTANT-LEG[seed5]-RC:0
+MUTANT-LEG[seed6]-RC:0
+MUTANT-LEG[seed7]-RC:0
+MUTANT-LEG[seed8]-RC:0
+MUTANT-LEG[seed9]-RC:0
+MUTANT-LEG[seed10]-RC:0
+MUTANT-LEG[seed11]-RC:0
+MUTANT-LEG[seed12]-RC:0
+MUTANT-COLUMN-DONE

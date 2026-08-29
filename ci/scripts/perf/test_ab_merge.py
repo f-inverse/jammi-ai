@@ -4594,6 +4594,18 @@ class RedProofColumnTests(unittest.TestCase):
         self.assertIn("redproof-", str(ctx.exception))
         self.assertIn("no mutant name", str(ctx.exception))
 
+    def test_whitespace_only_redproof_name_is_refused(self):
+        # unit-63 round-13 audit advisory (c): "redproof- " / "redproof-  "
+        # reads as non-empty by `==` against the bare prefix, so it passed
+        # this edge undetected pre-fix and only failed loudly downstream --
+        # refused HERE, at the same edge, naming the whitespace-name class
+        # alongside the bare-prefix class.
+        for label in ("redproof- ", "redproof-  ", "redproof-\t"):
+            columns = [{"dose_label": label}]
+            with self.assertRaises(ab_merge.RedProofLabelError) as ctx:
+                ab_merge.partition_red_proof_dose_columns(columns)
+            self.assertIn("whitespace-only", str(ctx.exception))
+
     def test_eps_family_scans_never_call_dose_label_eps_on_a_redproof_label(self):
         # a RED-proof label would raise inside `_dose_label_eps` (it never
         # starts with "eps") -- proving the eps-family scans are unaffected
@@ -4922,6 +4934,16 @@ class RedProofColumnTests(unittest.TestCase):
         self.assertIn("redproof-signflip", ladder["sensitivity_error"])
         self.assertIn(shared_sha, ladder["sensitivity_error"])
         self.assertIn("same mutant measured twice", ladder["sensitivity_error"])
+        # unit-63 round-13 audit F2: a RED-proof-labeled column WAS
+        # scheduled (`redproof-signflip`) but the dose set was refused
+        # (the duplicate-PATCH_SHA arm, before RED-proof evaluation ever
+        # ran) -- `red_proof_verdict` must NOT stay `null` (byte-identical
+        # to "no RED-proof column was ever scheduled"); it must carry an
+        # explicit NOT_PROVEN-class verdict naming the refusal.
+        self.assertIsNotNone(ladder["red_proof_verdict"])
+        self.assertTrue(ladder["red_proof_verdict"].startswith("NOT_PROVEN"))
+        self.assertIn("refused before RED-proof evaluation", ladder["red_proof_verdict"])
+        self.assertIn("same mutant measured twice", ladder["red_proof_verdict"])
 
     def test_cli_wiring_redproof_rfi_recorded_with_named_anomaly(self):
         # a redproof column reading RED_FOR_INVESTIGATION is recorded as-is
@@ -5002,6 +5024,63 @@ class RedProofColumnTests(unittest.TestCase):
         self.assertIsNotNone(ladder["sensitivity_error"])
         self.assertIn("redproof-", ladder["sensitivity_error"])
         self.assertIn("no mutant name", ladder["sensitivity_error"])
+        # unit-63 round-13 audit F2: `partition_red_proof_dose_columns`
+        # itself is the raiser here -- `red_proof_dose_columns` never got
+        # assigned inside the try (it stays the pre-try `[]`) even though
+        # the raw `dose_columns` DID carry a RED-proof-prefixed label. The
+        # handler must still detect this off the RAW label, never off
+        # `red_proof_dose_columns` alone, and record an explicit
+        # NOT_PROVEN-class verdict rather than leaving `red_proof_verdict`
+        # `null`.
+        self.assertIsNotNone(ladder["red_proof_verdict"])
+        self.assertTrue(ladder["red_proof_verdict"].startswith("NOT_PROVEN"))
+        self.assertIn("refused before RED-proof evaluation", ladder["red_proof_verdict"])
+
+    def test_cli_wiring_refused_dose_set_without_any_redproof_label_keeps_verdict_null(self):
+        # unit-63 round-13 audit F2, the paired case: an eps-only dose set
+        # that is refused (no RED-proof label present anywhere in
+        # dose_columns) must leave `red_proof_verdict` exactly `null`,
+        # unchanged from today -- nothing to report, never a spurious
+        # NOT_PROVEN-class verdict invented for a family that was never
+        # scheduled.
+        shared_sha = "sha-shared-eps-only"
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            for seed in range(1, 13):
+                fused_mean, alloff_mean = (0.30, 0.50) if seed <= 6 else (0.55, 0.40)
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                        )
+                _write_mutant_leg(
+                    raw_dir, seed, "eps-0.50", _mutant_tier(seed=seed, held_out_example_mean=0.70, mutant_patch_sha256=shared_sha)
+                )
+                _write_mutant_leg(
+                    raw_dir, seed, "eps-0.10", _mutant_tier(seed=seed, held_out_example_mean=0.70, mutant_patch_sha256=shared_sha)
+                )
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            rc = ab_merge.main(
+                [
+                    "finetune-run",
+                    raw_dir,
+                    out_dir,
+                    seeds_s,
+                    "",
+                    "--allow-missing-lr0-control",
+                    "--mutant-legs",
+                    f"eps-0.50:{shared_sha}:{seeds_s}",
+                    "--mutant-legs",
+                    f"eps-0.10:{shared_sha}:{seeds_s}",
+                ]
+            )
+            with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
+                merged = json.load(fh)
+        self.assertEqual(rc, 1)
+        ladder = merged["mutant_dose_ladder"]
+        self.assertIsNotNone(ladder["sensitivity_error"])
+        self.assertIn("same mutant measured twice", ladder["sensitivity_error"])
+        self.assertIsNone(ladder["red_proof_verdict"])
+        self.assertEqual(ladder["red_proof"], [])
 
 
 if __name__ == "__main__":

@@ -770,24 +770,22 @@ class CascadePairFixtureTests(unittest.TestCase):
         self.assertTrue(str(cfg["verdict"]).startswith("INVALID"), cfg["verdict"])
         self.assertEqual(rc, 1)
 
-    def test_flash_compiled_false_capability_miss_is_not_a_hard_fail(self):
-        """Unit-63 round-3 audit block 2: the campaign builds `--features
-        cuda` WITHOUT `flash-attn` (`finetune_run_ab.sh:270`), so
-        `attention_block_flash_declined_dispatches` is nonzero-BY-
-        CONSTRUCTION (a capability miss, never a disable request --
-        `kernels_disabled_requested` stays EMPTY here, unlike the
-        self-describing-disable-request exemption rule 1(b) already
-        covers). Before this fix, rule 1 hard-failed this shape
-        unconditionally; now `flash_compiled is False` alone is the
-        exemption, and the fused arm's real proof shifts to
-        `attention_block`'s own `fused > 0` (rule 2.5) -- built from the
-        real flash-off fixture (`attention_block_fused_dispatches: 840`,
-        `attention_block_flash_declined_dispatches: 840`) with the
-        DELIBERATE disable request CLEARED (so this is genuinely a
-        capability miss, not also a self-describing one) and `flash_compiled`
-        flipped, plus a synthetic `adamw` pair (this fixture predates the
-        multi-tensor AdamW commit -- see `RealAdamwArtifactFixtureTests` for
-        the genuinely real adamw shape).
+    def test_flash_compiled_false_capability_miss_is_still_a_hard_fail(self):
+        """Unit-63 round-3 audit, coordinator correction: an earlier draft
+        of this round exempted `flash_compiled is False` from rule 1 (a
+        capability-miss carve-out) -- REVERTED. `fused_proof` is SHARED by
+        `finetune-step`'s own campaigns; a whole-campaign premise fact
+        (CONTRACT 63 Frame pre-registers the flash cascade as the
+        finetune-run how-well A/B's own differential) belongs in THAT
+        campaign's own premise check
+        (`finetune_run_dispatch_proof_violations`'s `arm == "fused"`
+        branch), never a silent, generic exemption inside the shared
+        primitive. This is the regression pin: the exact capability-miss
+        shape (a real disable request CLEARED, so this is genuinely a
+        capability miss, not also a self-describing one, plus a synthetic
+        `adamw` pair -- this fixture predates the multi-tensor AdamW commit)
+        must still hard-fail, unconditionally, exactly like an ordinary
+        silent eager fallback always has.
         """
         report = copy.deepcopy(load_fixture_finetune_step("s128_flash_off_1"))
         fs = report["tiers"]["finetune_step"]
@@ -800,19 +798,18 @@ class CascadePairFixtureTests(unittest.TestCase):
             self.write_jammi_fused_only(raw_dir, "b8-s128-capability-miss", report)
             rc, merged = self.run_merge(raw_dir)
         cfg = merged["configs"]["b8-s128-capability-miss"]
-        self.assertIs(cfg["jammi_fused_dispatch_proof"], True, cfg["jammi_fused_dispatch_proof"])
-        self.assertFalse(str(cfg["verdict"]).startswith("INVALID"), cfg["verdict"])
-        self.assertEqual(rc, 0)
+        self.assertIs(cfg["jammi_fused_dispatch_proof"], False, cfg["jammi_fused_dispatch_proof"])
+        self.assertTrue(str(cfg["verdict"]).startswith("INVALID"), cfg["verdict"])
+        self.assertEqual(rc, 1)
 
     def test_unrequested_decline_is_still_a_hard_fail_non_vacuous_control(self):
         """Negative control (non-vacuous): rule 1's exemption for a
         `CASCADE_BASES` decline is gated on `kernels_disabled_requested`
-        AND `kernels_disabled_fired` BOTH naming the base, OR (unit-63
-        round-3 audit block 2) `flash_compiled is False` -- a decline that
-        happens WITHOUT EITHER (a genuine domain/capability miss ON A BUILD
-        THAT DID compile flash in: real padding, wrong arch) must still
-        hard-fail exactly like an ordinary silent eager fallback always
-        has. Built from the real flash-on fixture (`kernels_disabled_requested: []`
+        AND `kernels_disabled_fired` BOTH naming the base -- a decline that
+        happens WITHOUT either (a genuine domain/capability miss: real
+        padding, wrong arch, `flash-attn` not compiled) must still hard-fail
+        exactly like an ordinary silent eager fallback always has. Built
+        from the real flash-on fixture (`kernels_disabled_requested: []`
         unmodified) with `attention_block_flash_declined_dispatches` alone
         flipped nonzero -- proves the exemption is NOT "any CASCADE_BASES
         decline is fine", only a SELF-DESCRIBING one.
@@ -1983,46 +1980,28 @@ def _golden_dispatch_counters(name):
 
 
 _FINETUNE_RUN_DISPATCH_COUNTERS = {
-    # `bert_fused.json` is a BERT-arch leg (no fused whole-attention-block /
-    # LayerNorm / RoPE / softmax / GEGLU kernel exists for that architecture
-    # at all -- see `report.rs`'s own field docs), so it cannot stand in for
-    # a CLEAN "fused" tier on its own (`fused_proof`'s `REQUIRED_PAIRS`
-    # demands `ln`/`geglu`/`adamw` each show `fused > 0`, which a bert leg
-    # legitimately never does). This entry therefore stays a HAND-SPECIFIED,
-    # REALISTIC modernbert-fused shape (no head_dim=64 + tokenizer fixture
-    # was available to generate a genuine modernbert-fused golden in this
-    # environment) -- `GoldenProducerAnchoredFieldSetTests` still pins its
-    # OWN field-name SET against a real golden, so a missing/renamed field
-    # here (the actual class-defect risk) is caught regardless of which
-    # golden supplies the numbers.
-    "fused": {
-        "ln_fused_dispatches": 9,
-        "ln_eager_dispatches": 0,
-        "geglu_fused_dispatches": 9,
-        "geglu_eager_dispatches": 0,
-        "rope_fused_dispatches": 0,
-        "rope_eager_dispatches": 0,
-        "softmax_fused_dispatches": 0,
-        "softmax_eager_dispatches": 0,
-        "attention_block_fused_dispatches": 9,
-        "attention_block_eager_dispatches": 0,
-        "lora_epilogue_fused_dispatches": 0,
-        "lora_epilogue_eager_dispatches": 0,
-        "lora_linear_fused_dispatches": 9,
-        "lora_linear_eager_dispatches": 0,
-        "adamw_fused_dispatches": 9,
-        "adamw_eager_dispatches": 0,
-    },
-    # `modernbert_alloff.json` -- a REAL alloff leg, read verbatim: ln=12/0,
-    # rope=8/0, softmax=4/0, geglu=4/0, lora_linear=16/0, lora_epilogue=0/0
-    # (permanently, superseded by lora_linear) ALL FUSED despite `arm:
-    # "alloff"` (the class-fix discovery `ALLOFF_DISABLED_OP_BASES`'s own
-    # doc explains); attention_block=0/4 and adamw=0/32 are the real
-    # disabled-kernel fallback counts this golden's checkpoint (head_dim=16,
-    # `attention_block`'s own domain decline) and disable request
-    # (`adamw_step_fused`) actually produced; attention_block_flash=0/
-    # declined=4 is the flash cascade's own capability-miss + disable-request
-    # decline.
+    # `modernbert_fused.json` -- CONTRACT 63 Frame pre-registers the flash
+    # cascade as the `fused` arm's own admitted branch (coordinator
+    # correction, unit-63 round-3 audit): `attention_block_flash=840/0`
+    # fires, `attention_block=0/0` is ABSORBED (its own `admit` call is
+    # never reached -- `report.rs`'s own field doc), `ln`/`geglu`/
+    # `lora_linear` independently fused, `adamw=6720/0`. Real counts
+    # composited from the committed CUDA artifacts named in this golden's
+    # own `PROVENANCE.md` ("Coordinator correction" section) -- no CUDA
+    # device exists in this environment to run a genuine `flash_compiled:
+    # true` leg against, so the counter fields are cited, never
+    # hand-invented.
+    "fused": _golden_dispatch_counters("modernbert_fused"),
+    # `modernbert_alloff.json` (corrected, same PROVENANCE.md section) --
+    # `ln=1710/0`, `rope=0/0`, `softmax=0/0`, `geglu=840/0`,
+    # `lora_linear=3360/0` (all unaffected by either disable -- the
+    # class-fix discovery `ALLOFF_DISABLED_OP_BASES`'s own doc explains);
+    # `attention_block=840/0` -- the disabled flash cascade falls through
+    # to the block arm's own, still-ACTIVE fused kernel (the positive
+    # training-path proof for this arm, per the coordinator's cascade-
+    # absorption correction -- NOT the eager shape an earlier, tiny
+    # head_dim=16 fixture produced); `attention_block_flash=0/840` and
+    # `adamw=0/6720` are the real disabled-kernel fallback counts.
     "alloff": _golden_dispatch_counters("modernbert_alloff"),
 }
 
@@ -2138,18 +2117,20 @@ class GoldenProducerAnchoredFieldSetTests(unittest.TestCase):
     base or a future one, rather than waiting for a real leg to hit
     `dispatch_pairs`'s own `KeyError` in a live sweep.
 
-    Both committed goldens are read (`bert_fused` and `modernbert_alloff`,
-    architecturally different producers of the SAME `FinetuneRunTier`
-    struct) — a single golden would still catch a MISSING field (every
+    All three committed goldens are read (`bert_fused`, `modernbert_fused`,
+    `modernbert_alloff` — see the latter two's own `PROVENANCE.md` section
+    for why their dispatch-counter fields are a documented composite of
+    real committed CUDA artifacts rather than a fresh CPU-hermetic run) —
+    a single golden would still catch a MISSING field (every
     `FinetuneRunTier` field is unconditionally serialized regardless of
-    architecture, see `report.rs`), but reading both is a stronger, still
-    entirely real-data pin: neither golden alone could silently drift to
-    "only ever has 8 of the 9 real bases" without the OTHER golden's own
+    architecture, see `report.rs`), but reading all three is a stronger,
+    still entirely real-data pin: no ONE golden alone could silently drift
+    to "only ever has 8 of the 9 real bases" without another golden's own
     set disagreeing with it.
     """
 
     def test_golden_dispatch_pair_bases_equal_all_bases(self):
-        for name in ("bert_fused", "modernbert_alloff"):
+        for name in ("bert_fused", "modernbert_fused", "modernbert_alloff"):
             tier = load_golden(name)["tiers"]["finetune_run"]
             discovered = {
                 key[: -len("_fused_dispatches")]
@@ -2172,7 +2153,7 @@ class GoldenProducerAnchoredFieldSetTests(unittest.TestCase):
         golden's own `finetune_run` tier (the exact mechanism `KeyError`d on
         `adamw` before block 1's fix).
         """
-        for name in ("bert_fused", "modernbert_alloff"):
+        for name in ("bert_fused", "modernbert_fused", "modernbert_alloff"):
             tier = load_golden(name)["tiers"]["finetune_run"]
             pairs = ab_merge.dispatch_pairs(tier)  # must not raise
             self.assertEqual({base for base, _fused, _fallback in pairs}, ab_merge.ALL_BASES)
@@ -2332,6 +2313,33 @@ class FinetuneRunDispatchProofMutantTests(unittest.TestCase):
         v = ab_merge.finetune_run_dispatch_proof_violations("fused", tier)
         self.assertTrue(any("fused-dispatch proof" in m for m in v), v)
 
+    def test_fused_arm_with_flash_compiled_false_is_an_invalid_premise(self):
+        # Unit-63 round-3 audit, coordinator correction: CONTRACT 63 Frame
+        # pre-registers the flash cascade as this arm's own admitted
+        # branch -- a build that cannot compile it in can never exercise
+        # the pre-registered differential, an INVALID premise regardless of
+        # what the (otherwise clean) dispatch counters read.
+        tier = _finetune_run_tier(arm="fused", flash_compiled=False)
+        v = ab_merge.finetune_run_dispatch_proof_violations("fused", tier)
+        self.assertTrue(any("flash_compiled=False" in m for m in v), v)
+
+    def test_fused_arm_with_flash_never_dispatched_is_a_violation(self):
+        # `fused_proof`'s own absorption rule tolerates EITHER the flash
+        # cascade or the block arm firing -- correct for finetune-step's
+        # own flash-vs-block A/B, but the finetune-run `fused` arm
+        # specifically claims to run the flash-cascade branch. A leg where
+        # the block arm picked up the slack instead (flash never fired,
+        # attention_block fired FUSED on its own) must still fail this
+        # arm's own, stricter proof.
+        tier = _finetune_run_tier(
+            arm="fused",
+            attention_block_flash_fused_dispatches=0,
+            attention_block_flash_declined_dispatches=0,
+            attention_block_fused_dispatches=840,
+        )
+        v = ab_merge.finetune_run_dispatch_proof_violations("fused", tier)
+        self.assertTrue(any("attention_block_flash_fused_dispatches=0" in m for m in v), v)
+
     def test_alloff_arm_with_real_production_dispatch_shape_is_clean(self):
         # unit-63 round-3 audit, class-fix discovery: the default alloff
         # base is now the REAL `modernbert_alloff.json` golden's own
@@ -2342,15 +2350,21 @@ class FinetuneRunDispatchProofMutantTests(unittest.TestCase):
             ab_merge.finetune_run_dispatch_proof_violations("alloff", _finetune_run_tier(arm="alloff")), []
         )
 
-    def test_alloff_arm_with_a_nonzero_fused_pair_is_a_violation(self):
-        # unit-63 round-3 audit block 4 + the class-fix discovery: the
-        # golden-derived alloff base is modernbert-shaped, so a leaked
-        # `attention_block` fused count is caught by the POSITIVE proof's
-        # own "fused == 0 and eager > 0" predicate, never a blanket
-        # "every pair must be fused == 0" rule.
-        tier = _finetune_run_tier(arm="alloff", attention_block_fused_dispatches=4)
+    def test_alloff_arm_with_attention_block_fused_zero_is_a_violation(self):
+        # unit-63 round-3 audit block 4, coordinator correction: the
+        # positive training-path proof for `alloff` is `attention_block`'s
+        # own FUSED count (it is NOT itself named in the disable list, only
+        # `attention_block_flash` is, so it must remain an ACTIVE,
+        # undisabled fused kernel on a real checkpoint) -- a leg where it
+        # reads `fused == 0` (the disabled flash cascade failing to fall
+        # through to a live fused kernel) is a violation, never tolerated
+        # as "maybe it fell back to eager instead" (an EARLIER, incorrect
+        # shape of this same proof).
+        tier = _finetune_run_tier(
+            arm="alloff", attention_block_fused_dispatches=0, attention_block_eager_dispatches=4
+        )
         v = ab_merge.finetune_run_dispatch_proof_violations("alloff", tier)
-        self.assertTrue(any("attention_block_fused_dispatches" in m and "modernbert-arch" in m for m in v), v)
+        self.assertTrue(any("attention_block_fused_dispatches=0" in m for m in v), v)
 
     def test_alloff_arm_with_ln_and_geglu_fused_is_not_a_violation(self):
         # unit-63 round-3 audit, class-fix discovery: `ln`/`geglu` are NOT
@@ -2790,28 +2804,51 @@ class BuildFinetuneRunReportDispatchProofEndToEndTests(unittest.TestCase):
         self.assertEqual(merged["per_seed"]["1"]["leg_premise_violations"], [])
         self.assertEqual(merged["per_seed"]["3"]["leg_premise_violations"], [])
 
-    def test_alloff_leg_with_nonzero_fused_invalidates_its_seed(self):
-        # unit-63 round-3 audit block 4: `attention_block` leaking a fused
-        # count on an alloff leg is caught by the POSITIVE proof's own
-        # "fused == 0 and eager > 0" predicate (this golden-derived alloff
-        # base is modernbert-shaped -- see `_golden_dispatch_counters`) --
-        # never the pre-fix blanket "every pair must be fused == 0" rule,
-        # which would have also flagged this golden's OWN real ln/rope/
-        # softmax/geglu/lora_linear fused counts as violations too.
+    def test_fused_leg_with_flash_compiled_false_invalidates_its_seed(self):
+        # Unit-63 round-3 audit, coordinator correction, end-to-end: a
+        # `fused` leg built without flash-attn compiled in is an INVALID
+        # premise the moment it reaches the real merge entry point, never
+        # merely a `fused_proof` warning buried in a table column.
         seeds = [1, 2]
         with tempfile.TemporaryDirectory() as raw_dir:
             for seed in seeds:
-                alloff_overrides = {"attention_block_fused_dispatches": 5} if seed == 1 else {}
+                fused_overrides = {"flash_compiled": False} if seed == 1 else {}
+                for repeat in ("r1", "r2"):
+                    _write_finetune_run_leg(
+                        raw_dir, seed, "fused", repeat, _finetune_run_tier(arm="fused", seed=seed, **fused_overrides)
+                    )
+                    _write_finetune_run_leg(raw_dir, seed, "alloff", repeat, _finetune_run_tier(arm="alloff", seed=seed))
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, seeds, allow_missing_lr0_control=True)
+        self.assertEqual(merged["status"], "INVALID")
+        self.assertTrue(
+            any("flash_compiled=False" in v for v in merged["per_seed"]["1"]["leg_premise_violations"]),
+            merged["per_seed"]["1"]["leg_premise_violations"],
+        )
+        self.assertEqual(merged["per_seed"]["2"]["leg_premise_violations"], [])
+
+    def test_alloff_leg_with_attention_block_fused_zero_invalidates_its_seed(self):
+        # unit-63 round-3 audit block 4, coordinator correction:
+        # `attention_block` reading `fused == 0` on an alloff leg (the
+        # disabled flash cascade failing to fall through to a live fused
+        # kernel) is caught by the positive training-path proof -- never
+        # the pre-fix blanket "every pair must be fused == 0" rule, which
+        # would have also flagged this golden's OWN real ln/rope/softmax/
+        # geglu/lora_linear fused counts as violations too.
+        seeds = [1, 2]
+        with tempfile.TemporaryDirectory() as raw_dir:
+            alloff_overrides = {"attention_block_fused_dispatches": 0, "attention_block_eager_dispatches": 4}
+            for seed in seeds:
+                overrides = alloff_overrides if seed == 1 else {}
                 for repeat in ("r1", "r2"):
                     _write_finetune_run_leg(raw_dir, seed, "fused", repeat, _finetune_run_tier(arm="fused", seed=seed))
                     _write_finetune_run_leg(
-                        raw_dir, seed, "alloff", repeat, _finetune_run_tier(arm="alloff", seed=seed, **alloff_overrides)
+                        raw_dir, seed, "alloff", repeat, _finetune_run_tier(arm="alloff", seed=seed, **overrides)
                     )
             merged, _table = ab_merge.build_finetune_run_report(raw_dir, seeds, allow_missing_lr0_control=True)
         self.assertEqual(merged["status"], "INVALID")
         self.assertTrue(
             any(
-                "attention_block_fused_dispatches" in v and "modernbert-arch" in v
+                "attention_block_fused_dispatches=0" in v
                 for v in merged["per_seed"]["1"]["leg_premise_violations"]
             ),
             merged["per_seed"]["1"]["leg_premise_violations"],

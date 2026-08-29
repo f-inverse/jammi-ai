@@ -786,43 +786,32 @@ def fused_proof(m):
       1. ANY pair with a fallback count (`eager`, or a `CASCADE_BASES`
          member's `declined`) `> 0` is a hard, unconditional fail — an
          admitted call site that actually fell back, on ANY pair, in ANY
-         group — UNLESS that pair is a `CASCADE_BASES` member AND EITHER:
-           (a) `flash_compiled is False` on this SAME leg (unit-63 round-3
-               audit block 2): a build that never compiled the vendored
-               FlashAttention-2 kernels in AT ALL cannot dispatch `Fused`
-               for this base under any circumstance, so `declined > 0` here
-               is the EXPECTED capability-miss shape (a domain/capability
-               decline this build could never have avoided), never a
-               silent fallback needing an explicit disable request to
-               excuse it — the how-well campaign's own `--features cuda`
-               (no `flash-attn`) build is exactly this leg
-               (`finetune_run_ab.sh:270`). The fused arm's real proof on
-               such a build is `attention_block`'s OWN `fused > 0` — rule
-               2.5 below already requires exactly that (its absorption
-               condition, `attention_block_flash`'s `fused > 0`, reads `0`
-               on a build that cannot compile flash at all, so 2.5 reduces
-               to "must independently clear `fused > 0`" there — no
-               separate carve-out needed once rule 1 stops rejecting the
-               leg outright); or
-           (b) its base appears in BOTH `kernels_disabled_requested` AND
-               `kernels_disabled_fired` on this SAME leg: a DELIBERATE,
-               self-describing disable request (the reference/block-arm leg
-               of a flash-vs-block A/B,
-               `JAMMI_KERNELS_DISABLE=attention_block_flash`) is not a
-               silent fallback — it is the transparently-requested and
-               transparently-recorded way this crate forces the non-flash
-               arm, and the reference leg's OWN `attention_block` pair
-               still has to independently clear rule 2.5 below on its own
-               `fused > 0`, so nothing here grants it a free pass on the
-               thing that actually matters.
-         An UNREQUESTED decline on a build that DID compile flash in (a
-         genuine domain/capability miss — real padding, wrong arch) stays a
-         hard fail exactly like an ordinary silent eager fallback always
+         group — UNLESS that pair is a `CASCADE_BASES` member AND its base
+         appears in BOTH `kernels_disabled_requested` AND
+         `kernels_disabled_fired` on this SAME leg: a DELIBERATE,
+         self-describing disable request (the reference/block-arm leg of a
+         flash-vs-block A/B, `JAMMI_KERNELS_DISABLE=attention_block_flash`)
+         is not a silent fallback — it is the transparently-requested and
+         transparently-recorded way this crate forces the non-flash arm,
+         and the reference leg's OWN `attention_block` pair still has to
+         independently clear rule 2.5 below on its own `fused > 0`, so
+         nothing here grants it a free pass on the thing that actually
+         matters. An UNREQUESTED decline (a genuine domain/capability
+         miss — real padding, wrong arch, `flash-attn` not compiled) stays
+         a hard fail exactly like an ordinary silent eager fallback always
          has (`report.rs`'s own `attention_block_flash_declined_dispatches`
          field doc, contract v5 §3.8: "`declined > 0` on any bench leg ->
-         INVALID") — (a) is scoped to the BUILD fact (`flash_compiled`),
-         never weakened to cover a build that COULD have run flash but
-         happened not to.
+         INVALID"). Unit-63 round-3 audit, coordinator correction: an
+         EARLIER draft of this rule additionally exempted
+         `flash_compiled is False` (a build-capability-miss carve-out) —
+         reverted. `fused_proof` is shared by `finetune-step`'s own
+         campaigns; a build fact that makes a WHOLE campaign's premise
+         null (CONTRACT 63 Frame pre-registers the flash cascade as the
+         finetune-run how-well A/B's own differential) belongs in that
+         CAMPAIGN's own premise check
+         (`finetune_run_dispatch_proof_violations`'s `arm == "fused"`
+         branch), never a silent, generic exemption inside the SHARED
+         dispatch-classification primitive every campaign reuses.
       2. Every `REQUIRED_PAIRS` base must be PRESENT in this report's pairs
          (a required pair vanishing from the JSON entirely — the field
          renamed, deleted, or feature-gated off — is exactly the schema
@@ -879,17 +868,11 @@ def fused_proof(m):
 
     kernels_disabled_requested = set(m.get("kernels_disabled_requested") or [])
     kernels_disabled_fired = set(m.get("kernels_disabled_fired") or [])
-    flash_compiled = m.get("flash_compiled")
     for base, (_fused, fallback) in by_base.items():
         if fallback <= 0:
             continue
-        if base in CASCADE_BASES:
-            if flash_compiled is False:
-                continue  # rule 1(a): capability miss -- this build never compiled flash in at
-                # all, so a decline here is the EXPECTED shape, not a silent fallback; the fused
-                # arm's real proof shifts to attention_block's own fused > 0 (rule 2.5 below).
-            if base in kernels_disabled_requested and base in kernels_disabled_fired:
-                continue  # rule 1(b): deliberate, self-describing disable request -- not a silent fallback
+        if base in CASCADE_BASES and base in kernels_disabled_requested and base in kernels_disabled_fired:
+            continue  # rule 1: deliberate, self-describing disable request — not a silent fallback
         return False
 
     for base in REQUIRED_PAIRS:
@@ -1535,45 +1518,75 @@ def finetune_run_dispatch_proof_violations(arm, tier):
     tier now ALSO emits finetune-step's exact `*_fused_dispatches`/
     `*_eager_dispatches` counter pairs -- verbatim field names, the
     `attention_block` pair included -- from a concurrent bench dispatch.
-    This reuses `dispatch_pairs`/`fused_proof` UNCHANGED (never a second,
+    This reuses `dispatch_pairs`/`fused_proof` for the shared "every ordinary
+    pair independently proves itself" machinery (never a second,
     independently-drifting hand-rolled dispatch-classification mechanism --
-    this module's own B2 note) rather than re-deriving the same
-    classification tables a second time for this tier.
+    this module's own B2 note), but the finetune-run tier's own CAMPAIGN
+    PREMISE -- CONTRACT 63 Frame pre-registers the arms as "fused cascade vs
+    ALLOFF=attention_block_flash,adamw_step_fused", i.e. the A/B's own
+    differential IS whether the flash cascade (and the fused AdamW kernel)
+    fired -- is checked HERE, per arm, never folded into the shared
+    `fused_proof` primitive `finetune-step`'s own campaigns also reuse
+    (coordinator correction, unit-63 round-3 audit: an earlier draft of this
+    round put a build-capability-miss exemption directly into `fused_proof`
+    itself, which would have legitimized a `finetune-run` `fused` leg built
+    WITHOUT `flash-attn` compiled in -- a leg that can never exercise the
+    pre-registered differential at all, making the experiment null).
 
     `arm` (`"fused"` or `"alloff"`) states what this leg CLAIMS to have run;
     this checks the COUNTED FACT behind that claim, mirroring
     `clip_fact_violations`'s own "a claim with no counted fact behind it is
     refused" shape, applied to dispatches instead of the clip counter:
-      * `arm == "fused"`: `fused_proof` -- the SAME gate a finetune-step
-        `jammi-fused` leg is held to -- must return `True`.
+
+      * `arm == "fused"`:
+          1. PREMISE: `flash_compiled` must be `True`. CONTRACT 63 Frame
+             pre-registers the flash cascade as this arm's own admitted
+             branch; a build that never compiled it in cannot possibly
+             exercise the pre-registered differential, regardless of what
+             its OTHER dispatch counters read -- an INVALID premise, not a
+             leg whose classification can be trusted at all
+             (`finetune_run_ab.sh` builds `--features
+             cuda,jammi-encoders/flash-attn` for exactly this reason).
+          2. `fused_proof` (the SAME gate a finetune-step `jammi-fused` leg
+             is held to, UNCHANGED -- see that function's own doc) must
+             return `True`: every ordinary `REQUIRED_PAIRS` base (`ln`,
+             `geglu`, `adamw`) independently clears `fused > 0`/`eager == 0`,
+             and the CASCADE absorption chain (`attention_block_flash`
+             absorbing `attention_block`, which in turn absorbs
+             `rope`/`softmax`) is internally consistent.
+          3. THE PRE-REGISTERED BRANCH ITSELF:
+             `attention_block_flash_fused_dispatches > 0`. `fused_proof`'s
+             own absorption rule (2.5) is satisfied whenever EITHER the
+             flash cascade OR the block arm independently fires -- correct
+             for `finetune-step`'s own flash-vs-block A/B, where either arm
+             is a legitimate leg -- but THIS arm specifically claims to be
+             running the flash-cascade branch, so it must be the one that
+             actually fired, not merely "the cascade's absorption chain
+             holds because the block arm picked up the slack instead."
       * `arm == "alloff"` (unit-63 round-3 audit, block 4 + the class-fix
-        discovery above): this leg's OWN `kernels_disabled_requested` names
-        the op(s) it actually claims to have disabled -- ONLY the
-        `ALLOFF_DISABLED_OP_BASES` members it names must show `fused == 0`
-        AND a POSITIVE counted fallback (`eager`/`declined` `> 0` -- the
-        mirror-image of the "fused == 0 alone" check the pre-fix code ran:
-        an all-zero pair reading is no counted fact behind the "disabled"
-        classification, only a claim, exactly like `clip_fact_violations`'s
-        own "a clip claim with no counted fact behind it" refusal). Every
-        OTHER dispatch pair is UNCHECKED here -- `alloff` never claimed
-        anything about them, so a real leg's own `ln`/`rope`/`softmax`/
-        `geglu`/`lora_linear` staying fused is not this arm's business.
-        SEPARATELY (block 4's own positive proof, scoped to a
-        modernbert-shaped leg): `attention_block` must show `fused == 0`
-        AND `eager > 0` -- the training-mode attention path reached via the
-        disabled-kernel fallback. This tier carries no `model_type` field to
-        read directly, so "modernbert-shaped" is read off the SAME four
-        counters `finetune_run.rs`'s own belt-and-braces refusal reads
-        (`attention_block_{fused,eager}_dispatches`,
-        `attention_block_flash_{fused,declined}_dispatches`): that producer-
-        side check already REFUSES TO EMIT a report at all for a modernbert
-        leg where every one of those four reads `0` (`cumulative_steps > 0`
-        implied by a real leg reaching this merger at all) -- so an OK
-        report with all four at `0` is definitionally a BERT-arch leg (no
-        attention-block kernel exists to prove anything about, tolerated
-        exactly like the absent/zero case elsewhere in this proof), while
-        ANY of the four being nonzero is definitionally a modernbert-shaped
-        leg.
+        discovery below, + the coordinator's cascade-absorption correction):
+        this leg's OWN `kernels_disabled_requested` names the op(s) it
+        actually claims to have disabled -- ONLY the `ALLOFF_DISABLED_OP_BASES`
+        members it names (`attention_block_flash`, `adamw`) must show
+        `fused == 0` AND a POSITIVE counted fallback (`eager`/`declined`
+        `> 0` -- the mirror-image of the "fused == 0 alone" check the
+        pre-fix code ran: an all-zero pair reading is no counted fact
+        behind the "disabled" classification, only a claim, exactly like
+        `clip_fact_violations`'s own "a clip claim with no counted fact
+        behind it" refusal). Every OTHER dispatch pair is UNCHECKED here --
+        `alloff` never claimed anything about them, so a real leg's own
+        `ln`/`rope`/`softmax`/`geglu`/`lora_linear` staying fused is not
+        this arm's business (`fixtures/finetune_run_golden/
+        modernbert_alloff.json`, a REAL leg, shows exactly this). SEPARATELY
+        (the positive training-path proof for this arm): `attention_block`
+        must show `fused > 0` -- `attention_block` is NOT itself named in
+        the alloff disable list, only `attention_block_flash` is, so on a
+        real (`head_dim == 64`) checkpoint it remains an ACTIVE, undisabled
+        fused kernel that the disabled flash cascade must fall through to;
+        the fallback ENGAGING is proven by `attention_block`'s own FUSED
+        count (never its eager one -- an eager reading there would mean the
+        block arm's OWN admission declined too, a different, unrelated
+        failure mode this proof does not paper over).
 
     A leg with NO dispatch-counter fields at all (an older producer build
     predating this emission) is ALSO a violation -- `dispatch_pairs`
@@ -1599,10 +1612,22 @@ def finetune_run_dispatch_proof_violations(arm, tier):
             "assumed to have run the classified arm; the leg's own claim is untrusted, not "
             "merely unannotated"
         ]
+    by_base = {base: (fused, fallback) for base, fused, fallback in pairs}
+
     if arm == "fused":
+        flash_compiled = tier.get("flash_compiled")
+        if flash_compiled is not True:
+            return [
+                f"fused: flash_compiled={flash_compiled!r} -- CONTRACT 63 Frame pre-registers "
+                "the flash cascade as this arm's own admitted branch ('fused cascade vs "
+                "ALLOFF=attention_block_flash,adamw_step_fused'); a build that cannot compile it "
+                "in (flash_compiled is not true) can never exercise the pre-registered "
+                "differential -- an INVALID premise, regardless of what its dispatch counters "
+                "read"
+            ]
         m = {
             "dispatch_pairs": pairs,
-            "flash_compiled": tier.get("flash_compiled"),
+            "flash_compiled": flash_compiled,
             "kernels_disabled_requested": tier.get("kernels_disabled_requested"),
             "kernels_disabled_fired": tier.get("kernels_disabled_fired"),
         }
@@ -1612,9 +1637,17 @@ def finetune_run_dispatch_proof_violations(arm, tier):
                 f"fused: fused-dispatch proof failed or errored ({proof!r}) -- this leg's "
                 "'fused' classification is untrusted, discarded, not merely annotated"
             ]
+        flash_fused, _flash_declined = by_base.get("attention_block_flash", (0, 0))
+        if flash_fused <= 0:
+            return [
+                f"fused: attention_block_flash_fused_dispatches={flash_fused!r} -- CONTRACT 63 "
+                "Frame pre-registers the flash cascade as this arm's own admitted branch; a "
+                "'fused' leg that never actually dispatched it (the block arm's own absorption "
+                "picking up the slack instead) is not the pre-registered experiment this arm "
+                "claims to run"
+            ]
         return []
     if arm == "alloff":
-        by_base = {base: (fused, fallback) for base, fused, fallback in pairs}
         violations = []
 
         # The disabled-op positive proof (class-fix discovery, see
@@ -1651,19 +1684,20 @@ def finetune_run_dispatch_proof_violations(arm, tier):
                     "counted fact behind the 'disabled' classification, only a claim"
                 )
 
-        # Block 4's own positive proof, scoped to a modernbert-shaped leg --
-        # see this function's own doc for the four-counter discriminator
-        # (this tier carries no model_type field to read directly).
-        ab_fused, ab_eager = by_base.get("attention_block", (0, 0))
-        abf_fused, abf_declined = by_base.get("attention_block_flash", (0, 0))
-        is_modernbert_shaped = (ab_fused + ab_eager + abf_fused + abf_declined) > 0
-        if is_modernbert_shaped and not (ab_fused == 0 and ab_eager > 0):
+        # The positive training-path proof for this arm (coordinator
+        # correction, replacing the eager-based shape an earlier draft of
+        # this round used): `attention_block` is NOT itself named in the
+        # alloff disable list -- only `attention_block_flash` is -- so the
+        # disabled flash cascade must fall through to `attention_block`'s
+        # own, still-ACTIVE fused kernel.
+        ab_fused, _ab_eager = by_base.get("attention_block", (0, 0))
+        if ab_fused <= 0:
             violations.append(
-                f"alloff: attention_block_fused_dispatches={ab_fused!r} "
-                f"attention_block_eager_dispatches={ab_eager!r} -- a modernbert-arch alloff leg "
-                "must show fused == 0 and eager > 0 (the training-mode attention path reached via "
-                "the disabled-kernel fallback); an all-zero (or a leaked fused > 0) reading is no "
-                "counted fact behind the 'alloff' classification, only a claim"
+                f"alloff: attention_block_fused_dispatches={ab_fused!r} -- the disabled flash "
+                "cascade must fall through to attention_block's own fused kernel (the positive "
+                "training-path proof for this arm, per CASCADE_BASES' own absorption semantics); "
+                "an all-zero reading is no counted fact behind the 'alloff' classification, only "
+                "a claim"
             )
         return violations
     return [f"{arm}: unrecognized finetune-run arm -- cannot apply the dispatch-proof gate to it"]

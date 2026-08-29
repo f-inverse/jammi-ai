@@ -336,14 +336,22 @@ comparison.
    is, so each dose column is diff-able against the `alloff`/fused columns
    field-for-field.
 7. The reported sensitivity is the pair of ADJACENT doses straddling
-   detection (per amendment item 3 and addendum 2026-08-29c) — run the
-   scheduled ladder in ascending `eps` order (`-0.50`, `-0.10`, `+0.50`) and
-   stop describing the sweep as "complete" only once a straddling pair is
-   found or all three have been run without one. The straddling pair, if
-   one exists, is expected within the negative branch (`-0.50` -> `-0.10`,
-   the DEGRADATION direction); a transition at `-0.10` -> `+0.50` would
-   additionally confirm or refute the Step-2 improvement prediction for
-   `+0.50`, which is a separate, non-degradation finding.
+   detection WITHIN THE DEGRADATION-DIRECTION (negative-`eps`) BRANCH ONLY,
+   ordered by `abs(eps)` (per amendment item 3 and addendum 2026-08-29c,
+   unit-63 round-7 audit finding 4) — run the scheduled ladder in ascending
+   SIGNED `eps` order (`-0.50`, `-0.10`, `+0.50`) and stop describing the
+   sweep as "complete" only once a straddling pair is found or all three
+   have been run without one. The merger's own `abs(eps)`-ordered scan of
+   the negative branch (`-0.10` -> `-0.50`, since `|{-0.10}| < |{-0.50}|`)
+   is deliberately NOT the same order the legs are RUN in (`-0.50` run
+   before `-0.10`) — reporting the straddle in run order would either miss
+   a real straddle (a detection at the larger-magnitude `-0.50`, run first,
+   reads `(RED, not-detected)` in run order, not the `(not-detected, RED)`
+   shape a straddle needs) or, worse, misreport a cross-sign
+   `(-0.10 not-detected, +0.50 RED)` run-order-adjacent pair as though it
+   were a degradation-direction finding. `+0.50` reading RED is instead the
+   two-sided-falsification finding (confirming the Step-2 improvement
+   prediction), reported separately, never folded into sensitivity.
 8. Tear down the scratch worktree and its build artifacts after the legs
    complete; do not leave a patched binary or scratch checkout on the pod
    past the dose-leg run. Each patch is committed to this repo as a FILE
@@ -489,10 +497,18 @@ separate record.
   malformed dose column is never silently read as "not-detected" (a
   substantive finding) when it is really "this column could not be
   evaluated at all".
-- **Sensitivity statement**: `mutant_dose_ladder.sensitivity` — the first
-  adjacent `(not-detected, RED)` pair in the CALLER-SUPPLIED dose order
-  (`ab_merge.mutant_dose_ladder_sensitivity`), or `null` if no such
-  transition exists in that order.
+- **Sensitivity statement** (unit-63 round-7 audit finding 4, addendum
+  2026-08-29c): `mutant_dose_ladder.sensitivity` — the first adjacent
+  `(not-detected, RED)` pair WITHIN THE DEGRADATION-DIRECTION (`eps < 0`)
+  BRANCH ONLY, ordered by `abs(eps)` (each dose's SIGNED eps parsed from its
+  own `dose_label`, `ab_merge._dose_label_eps`; a label that fails to parse
+  is a merge-level refusal, `mutant_dose_ladder.sensitivity_error`, never a
+  silent skip) — never the caller-supplied/run order, and never a
+  cross-sign pair. Returns `null` if no such transition exists in that
+  branch. A positive-eps (`eps > 0`) dose reading `"RED"` is reported
+  separately, under `mutant_dose_ladder.two_sided_falsification`, never
+  folded into `sensitivity` (`ab_merge.mutant_dose_ladder_sensitivity` /
+  `ab_merge.mutant_dose_ladder_two_sided_falsification`).
 - **Mutant legs never enter the primary A/B set**: proven structurally (the
   `mutant-<dose_label>` repeat tag can never equal `r1`/`r2`/`lr0`) and
   empirically (`MutantDoseLadderTests.test_mutant_leg_never_leaks_into_the_ab_set`,

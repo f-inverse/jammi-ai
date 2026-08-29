@@ -3752,16 +3752,66 @@ class MutantDoseLadderTests(unittest.TestCase):
         for seed in range(7, 13):
             self.assertAlmostEqual(merged["d_values"][str(seed)], 0.15)
 
-    def test_sensitivity_finds_the_straddling_pair(self):
-        low = {"dose_label": "eps0.02", "detected": "not-detected"}
-        mid = {"dose_label": "eps0.10", "detected": "not-detected"}
-        high = {"dose_label": "eps0.50", "detected": "RED"}
-        sensitivity = ab_merge.mutant_dose_ladder_sensitivity([low, mid, high])
-        self.assertEqual(sensitivity, {"lower": "eps0.10", "higher": "eps0.50"})
+    def test_sensitivity_finds_the_straddling_pair_ordered_by_magnitude_not_caller_order(self):
+        # unit-63 round-7 audit finding 4 / addendum 2026-08-29c: the
+        # SCHEDULED ladder runs ascending eps (-0.50, -0.10, +0.50) -- the
+        # LARGER-magnitude degradation dose (-0.50) is passed to this
+        # function FIRST, in caller order. A signed ladder with -0.50 RED
+        # (only) and -0.10 not-detected must still report the straddle,
+        # magnitude-ordered within the negative branch (-0.10 -> -0.50), not
+        # `None` (what the pre-fix caller-order scan would have returned:
+        # neither adjacent caller-order pair reads (not-detected, RED)).
+        neg50 = {"dose_label": "eps-0.50", "detected": "RED"}
+        neg10 = {"dose_label": "eps-0.10", "detected": "not-detected"}
+        pos50 = {"dose_label": "eps0.50", "detected": "not-detected"}
+        sensitivity = ab_merge.mutant_dose_ladder_sensitivity([neg50, neg10, pos50])  # caller/scheduled order
+        self.assertEqual(sensitivity, {"lower": "eps-0.10", "higher": "eps-0.50"})
 
-    def test_sensitivity_is_none_when_no_dose_is_detected(self):
-        columns = [{"dose_label": f"eps{i}", "detected": "not-detected"} for i in range(3)]
+    def test_sensitivity_is_none_when_no_negative_dose_is_detected(self):
+        columns = [
+            {"dose_label": "eps-0.50", "detected": "not-detected"},
+            {"dose_label": "eps-0.10", "detected": "not-detected"},
+            {"dose_label": "eps0.50", "detected": "not-detected"},
+        ]
         self.assertIsNone(ab_merge.mutant_dose_ladder_sensitivity(columns))
+
+    def test_positive_eps_never_enters_the_negative_branch(self):
+        # A single negative dose can never straddle anything by itself; a
+        # positive-eps dose reading RED must not be borrowed to complete a
+        # pair, regardless of its own detected value.
+        columns = [
+            {"dose_label": "eps-0.10", "detected": "not-detected"},
+            {"dose_label": "eps0.50", "detected": "RED"},
+        ]
+        self.assertIsNone(ab_merge.mutant_dose_ladder_sensitivity(columns))
+
+    def test_cross_sign_detection_is_a_falsification_finding_not_sensitivity(self):
+        # unit-63 round-7 audit finding 4: a POSITIVE-eps dose reading RED
+        # (the two-sided falsification cell, addendum 2026-08-29c) must be
+        # reported separately, never folded into 'sensitivity' as though a
+        # cross-sign (-0.10 not-detected, +0.50 RED) pair were a degradation
+        # straddle.
+        neg50 = {"dose_label": "eps-0.50", "detected": "not-detected"}
+        neg10 = {"dose_label": "eps-0.10", "detected": "not-detected"}
+        pos50 = {"dose_label": "eps0.50", "detected": "RED"}
+        columns = [neg50, neg10, pos50]
+        self.assertIsNone(ab_merge.mutant_dose_ladder_sensitivity(columns))
+        falsification = ab_merge.mutant_dose_ladder_two_sided_falsification(columns)
+        self.assertEqual(falsification, [{"dose_label": "eps0.50", "eps": 0.50, "detected": "RED"}])
+
+    def test_positive_eps_not_detected_is_not_a_falsification_finding(self):
+        columns = [{"dose_label": "eps0.50", "detected": "not-detected"}]
+        self.assertEqual(ab_merge.mutant_dose_ladder_two_sided_falsification(columns), [])
+
+    def test_unparseable_dose_label_is_refused(self):
+        # unit-63 round-7 audit finding 4: a dose_label that cannot be
+        # placed in either branch must be refused, never silently skipped
+        # or silently treated as a positive/negative default.
+        columns = [{"dose_label": "bogus", "detected": "RED"}]
+        with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
+            ab_merge.mutant_dose_ladder_sensitivity(columns)
+        with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
+            ab_merge.mutant_dose_ladder_two_sided_falsification(columns)
 
     def test_cli_wiring_folds_the_dose_ladder_into_the_same_artifact(self):
         with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
@@ -3827,6 +3877,41 @@ class MutantDoseLadderTests(unittest.TestCase):
                 ]
             )
         self.assertEqual(rc, 1)
+
+    def test_cli_wiring_fails_on_an_unparseable_dose_label(self):
+        # unit-63 round-7 audit finding 4: an operator-typo'd dose_label
+        # that does not parse as a signed eps value is a merge-level
+        # refusal (exit 1, recorded in the artifact's own
+        # 'sensitivity_error'), never a script crash and never silently
+        # skipped.
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            for seed in range(1, 13):
+                fused_mean, alloff_mean = (0.30, 0.50) if seed <= 6 else (0.55, 0.40)
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                        )
+                _write_mutant_leg(raw_dir, seed, "bogus", _mutant_tier(seed=seed, held_out_example_mean=0.70))
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            mutant_spec = f"bogus:{self.PATCH_SHA}:{seeds_s}"
+            rc = ab_merge.main(
+                [
+                    "finetune-run",
+                    raw_dir,
+                    out_dir,
+                    seeds_s,
+                    "",
+                    "--allow-missing-lr0-control",
+                    "--mutant-legs",
+                    mutant_spec,
+                ]
+            )
+            with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
+                merged = json.load(fh)
+        self.assertEqual(rc, 1)
+        self.assertIsNone(merged["mutant_dose_ladder"]["sensitivity"])
+        self.assertIsNotNone(merged["mutant_dose_ladder"]["sensitivity_error"])
 
 
 if __name__ == "__main__":

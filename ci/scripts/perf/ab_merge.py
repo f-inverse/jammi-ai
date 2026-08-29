@@ -2664,18 +2664,23 @@ def build_finetune_run_report(raw_dir, seeds, lr0_seeds=(), allow_missing_lr0_co
 #
 # CONTRACT amendment 2026-08-29b item 3 pre-registers a one-parameter,
 # monotone, SUSTAINED mutant dose family (the fused AdamW update scaled by
-# `(1+eps)`, `eps in {0.02, 0.10, 0.50}`; see `docs/plans/63-how-well/
-# mutants/README.md` for the mutant's own patch/hash/on-pod-procedure
-# doc), replacing M1's "sensitivity bound" claim (mutants/README.md's own
-# post-hoc finding: M1 is a sign-flipping early transient, a NON-DETECTION,
-# never a bound). Each dose is run as its OWN column of `fused`-arm legs
-# (the mutant substituted INTO the fused arm, mutants/README.md's own
-# on-pod procedure step 4/6) and merged, HERE, against the campaign's
-# ALREADY-RUN `alloff` r1 legs -- the SAME alloff legs the main A/B decision
-# consumed, never a second, independently-run alloff pool -- under the
-# EXACT SAME `>=11/12` threshold and mean-sign rule the primary decision
-# rule uses (`FINETUNE_RUN_DECISION_THRESHOLD`/`FINETUNE_RUN_GATE_SEED_COUNT`
-# -- reused by reference below, never re-declared, so the two rules cannot
+# `(1+eps)`; see `docs/plans/63-how-well/mutants/README.md` for the mutant's
+# own patch/hash/on-pod-procedure doc), replacing M1's "sensitivity bound"
+# claim (mutants/README.md's own post-hoc finding: M1 is a sign-flipping
+# early transient, a NON-DETECTION, never a bound). CONTRACT.md addendum
+# 2026-08-29c SIGNS the family: the pre-spend prediction table (also in
+# mutants/README.md) falsified the original positive-only ladder's direction
+# (predicted IMPROVEMENT, not degradation) before any spend, so the
+# SCHEDULED ladder is `eps in {-0.50, -0.10, +0.50}` -- `eps in {0.02, 0.10}`
+# stay committed as the falsified-but-recorded doses, never scheduled. Each
+# dose is run as its OWN column of `fused`-arm legs (the mutant substituted
+# INTO the fused arm, mutants/README.md's own on-pod procedure step 4/6) and
+# merged, HERE, against the campaign's ALREADY-RUN `alloff` r1 legs -- the
+# SAME alloff legs the main A/B decision consumed, never a second,
+# independently-run alloff pool -- under the EXACT SAME `>=11/12` threshold
+# and mean-sign rule the primary decision rule uses
+# (`FINETUNE_RUN_DECISION_THRESHOLD`/`FINETUNE_RUN_GATE_SEED_COUNT` --
+# reused by reference below, never re-declared, so the two rules cannot
 # independently drift). Mutant legs NEVER enter the primary A/B set: this
 # entire mechanism reads its own `mutant-<dose_label>`-tagged leg files
 # (`mutant_leg_repeat_tag`), a `repeat` value that can never collide with
@@ -2898,23 +2903,120 @@ def build_mutant_dose_column(raw_dir, dose_label, patch_sha256, mutant_seeds):
     }
 
 
-def mutant_dose_ladder_sensitivity(dose_columns):
-    """The reported sensitivity statement (amendment 2026-08-29b item 3):
-    "the adjacent-dose pair straddling detection" -- the first adjacent
-    (not-detected, RED) transition in the CALLER-SUPPLIED dose order (never
-    re-sorted here: an operator's own monotone-eps ordering, e.g. `["0.02",
-    "0.10", "0.50"]`, is the ordering this straddles over). Returns
-    `{"lower": lower_dose_label, "higher": higher_dose_label}` naming that
-    transition, or `None` if none exists in the supplied order (every dose
-    RED, every dose not-detected/INVALID, or the transition runs the OTHER
-    way -- a higher dose reading LESS detected than a lower one is itself a
-    finding against the family's own claimed monotonicity, never silently
-    reported as a straddle).
+class MutantDoseLadderSensitivityError(ValueError):
+    """Raised by `_dose_label_eps` (and therefore by
+    `mutant_dose_ladder_sensitivity`/`mutant_dose_ladder_two_sided_falsification`)
+    when a dose column's own `dose_label` does not parse as a SIGNED `eps`
+    value -- see `_dose_label_eps`'s own doc. A label the sensitivity
+    computation cannot place in either the degradation (negative-eps) or
+    improvement (positive-eps) branch must never be silently dropped or
+    misclassified; `main` catches this and reports it as a dose-ladder
+    refusal, the same correctness-of-measurement carve-out every other
+    typed refusal in this module gets.
     """
-    for lower, higher in zip(dose_columns, dose_columns[1:]):
+
+
+def _dose_label_eps(dose_label):
+    """Parse a dose column's own SIGNED `eps` value from its `dose_label`
+    (CONTRACT.md addendum 2026-08-29c's own convention -- mutants/README.md's
+    on-pod procedure step 6: `dose_label = eps-0.50` / `eps-0.10` / `eps0.50`,
+    i.e. the literal string `"eps"` immediately followed by a float literal,
+    no separator, negative doses spelled with a bare `-`). Raises
+    `MutantDoseLadderSensitivityError` (never silently returns a sentinel or
+    guesses a sign) when `dose_label` does not start with `"eps"`, or the
+    remainder does not parse as a float.
+    """
+    prefix = "eps"
+    if not dose_label.startswith(prefix):
+        raise MutantDoseLadderSensitivityError(
+            f"dose_label {dose_label!r} does not start with {prefix!r} -- cannot parse a signed "
+            "eps value from it (addendum 2026-08-29c's own convention: dose_label = 'eps' + a "
+            "float literal, e.g. 'eps-0.50' / 'eps0.50')"
+        )
+    rest = dose_label[len(prefix):]
+    try:
+        return float(rest)
+    except ValueError as exc:
+        raise MutantDoseLadderSensitivityError(
+            f"dose_label {dose_label!r}'s remainder {rest!r} (after stripping the 'eps' prefix) "
+            "does not parse as a float -- cannot derive this dose's signed eps value"
+        ) from exc
+
+
+def mutant_dose_ladder_sensitivity(dose_columns):
+    """The reported sensitivity statement (CONTRACT.md addendum 2026-08-29c:
+    the signed ladder, `eps in {-0.50, -0.10, +0.50}` -- see
+    `docs/plans/63-how-well/mutants/README.md`'s own "signed dose family"
+    section): "the adjacent-dose pair straddling detection", SCOPED TO THE
+    DEGRADATION-DIRECTION (negative-eps) BRANCH ONLY, ordered by
+    `abs(eps)` WITHIN that branch -- never the caller-supplied order and
+    never every dose regardless of sign.
+
+    Unit-63 round-7 audit finding 4: the pre-addendum version of this
+    function straddled over the CALLER-SUPPLIED dose order, which was a safe
+    assumption only while the ladder itself was scheduled ascending in
+    detection strength by construction (a positive-only, ascending-magnitude
+    ladder). Addendum 2026-08-29c's SIGNED, scheduled-ascending-`eps` ladder
+    (`-0.50` run BEFORE `-0.10` BEFORE `+0.50`) breaks that assumption two
+    ways: (a) a detection at `-0.50` (the LARGEST-magnitude degradation dose,
+    run FIRST) would make the first-adjacent-transition scan see
+    `(RED, not-detected, RED)` in caller order and return `None` for a real
+    straddle that exists between `-0.50` and `-0.10` when reordered by
+    magnitude; (b) a cross-sign `(-0.10 not-detected, +0.50 RED)` adjacent
+    pair in caller order is NOT a degradation-direction straddle at all --
+    `+0.50` reading RED is the two-sided-falsification finding (see
+    `mutant_dose_ladder_two_sided_falsification`), and reporting it as
+    "sensitivity" would misrepresent an improvement-direction detection as a
+    degradation bound.
+
+    Each dose's SIGNED eps is parsed from its own `dose_label` via
+    `_dose_label_eps` (raises `MutantDoseLadderSensitivityError`, never
+    silently skipped, when a label fails to parse). Returns
+    `{"lower": lower_dose_label, "higher": higher_dose_label}` for the first
+    adjacent (not-detected, RED) transition found when the negative-eps
+    (`eps < 0.0`) subset of `dose_columns` is sorted by `abs(eps)` ascending,
+    or `None` if no such transition exists in that degradation-only,
+    magnitude-ordered subset (every negative dose RED, every negative dose
+    not-detected/INVALID, the transition runs the OTHER way, or there are
+    fewer than two negative-eps doses to straddle at all). A positive-eps
+    dose is NEVER a member of this subset, regardless of its own `detected`
+    value.
+    """
+    negative = sorted(
+        (col for col in dose_columns if _dose_label_eps(col["dose_label"]) < 0.0),
+        key=lambda col: abs(_dose_label_eps(col["dose_label"])),
+    )
+    for lower, higher in zip(negative, negative[1:]):
         if lower["detected"] == "not-detected" and higher["detected"] == "RED":
             return {"lower": lower["dose_label"], "higher": higher["dose_label"]}
     return None
+
+
+def mutant_dose_ladder_two_sided_falsification(dose_columns):
+    """The two-sided-falsification finding CONTRACT.md addendum 2026-08-29c
+    names for a POSITIVE-eps ("improvement-direction") dose: `+0.50` is
+    "retained deliberately as the two-sided falsification cell for the
+    improvement prediction itself" (mutants/README.md's own "signed dose
+    family" section) -- if it reads RED, that is a cross-sign detection
+    (the naive linear-extrapolation prediction, Step 2/3 of that same
+    README, is CONFIRMED: a positive dose detected as RED is expected to be
+    RED_FOR_INVESTIGATION-shaped improvement, not degradation), never a
+    degradation-direction sensitivity finding -- see
+    `mutant_dose_ladder_sensitivity`'s own doc for why folding a cross-sign
+    detection into that statistic would misrepresent it.
+
+    Each dose's SIGNED eps is parsed via `_dose_label_eps` (same refusal
+    behaviour as `mutant_dose_ladder_sensitivity`). Returns the list of
+    `{"dose_label", "eps", "detected"}` entries for every positive-eps
+    (`eps > 0.0`) dose column that read `"RED"`, in `dose_columns`' own
+    order, empty when none did (the ordinary, unconfirmed case).
+    """
+    out = []
+    for col in dose_columns:
+        eps = _dose_label_eps(col["dose_label"])
+        if eps > 0.0 and col["detected"] == "RED":
+            out.append({"dose_label": col["dose_label"], "eps": eps, "detected": col["detected"]})
+    return out
 
 
 def main(argv=None):
@@ -3003,28 +3105,60 @@ def main(argv=None):
                 dose_label, patch_sha256, mutant_seeds_s = parts
                 mutant_seeds = [s for s in mutant_seeds_s.split(",") if s]
                 dose_columns.append(build_mutant_dose_column(fr_raw_dir, dose_label, patch_sha256, mutant_seeds))
+            # unit-63 round-7 audit finding 4 / CONTRACT.md addendum
+            # 2026-08-29c: sensitivity is scoped to the degradation-direction
+            # (negative-eps) branch, magnitude-ordered, never the
+            # caller-supplied order -- a signed dose_label that fails to
+            # parse is a dose-ladder refusal (never a script crash), reported
+            # here and folded into the exit code like every other
+            # correctness-of-measurement problem this merge gates on.
+            sensitivity_error = None
+            try:
+                sensitivity = mutant_dose_ladder_sensitivity(dose_columns)
+                two_sided_falsification = mutant_dose_ladder_two_sided_falsification(dose_columns)
+            except MutantDoseLadderSensitivityError as exc:
+                sensitivity = None
+                two_sided_falsification = []
+                sensitivity_error = str(exc)
             fr_merged["mutant_dose_ladder"] = {
                 "doses": dose_columns,
-                "sensitivity": mutant_dose_ladder_sensitivity(dose_columns),
+                "sensitivity": sensitivity,
+                "sensitivity_error": sensitivity_error,
+                "two_sided_falsification": two_sided_falsification,
                 "note": (
-                    "CONTRACT amendment 2026-08-29b item 3: each dose column merges the mutant, "
-                    "substituted into the fused arm, against the SAME campaign alloff legs (never "
-                    "re-run) under the SAME >=11/12+mean rule the primary decision uses. Mutant "
-                    "legs never enter the primary A/B set (mutant_leg_repeat_tag's own file-naming "
-                    "isolation). 'sensitivity' names the adjacent-dose pair straddling detection, "
-                    "or null when no such transition exists in the supplied dose order."
+                    "CONTRACT amendment 2026-08-29b item 3, signed per addendum 2026-08-29c: each "
+                    "dose column merges the mutant, substituted into the fused arm, against the "
+                    "SAME campaign alloff legs (never re-run) under the SAME >=11/12+mean rule the "
+                    "primary decision uses. Mutant legs never enter the primary A/B set "
+                    "(mutant_leg_repeat_tag's own file-naming isolation). 'sensitivity' names the "
+                    "adjacent-dose pair straddling detection WITHIN the degradation-direction "
+                    "(negative-eps) branch only, magnitude-ordered, or null when no such transition "
+                    "exists there; a positive-eps dose reading RED is reported separately under "
+                    "'two_sided_falsification', never folded into 'sensitivity'; "
+                    "'sensitivity_error' names a dose_label that failed to parse as a signed eps "
+                    "value, never silently ignored."
                 ),
             }
-            dose_lines = ["", "# mutant dose ladder (amendment 2026-08-29b item 3)"]
+            dose_lines = ["", "# mutant dose ladder (amendment 2026-08-29b item 3; addendum 2026-08-29c signs it)"]
             for col in dose_columns:
                 dose_lines.append(
                     f"  dose={col['dose_label']:<12} detected={col['detected']:<12} "
                     f"n_pos={col['n_pos']} n_neg={col['n_neg']} mean_d={col['mean_d']} "
                     f"p_value={col['p_value']} clean_pairs={col['clean_pair_count']}/{col['gate_seed_count']}"
                 )
-            sensitivity = fr_merged["mutant_dose_ladder"]["sensitivity"]
-            dose_lines.append(f"  sensitivity: {sensitivity}")
+            if sensitivity_error is not None:
+                dose_lines.append(f"  sensitivity: REFUSED -- {sensitivity_error}")
+            else:
+                dose_lines.append(f"  sensitivity: {sensitivity}")
+            if two_sided_falsification:
+                dose_lines.append(f"  two_sided_falsification: {two_sided_falsification}")
             fr_table = fr_table + "\n" + "\n".join(dose_lines)
+            if sensitivity_error is not None:
+                print(
+                    f"finetune_run_ab mutant-dose-ladder: FAIL — {sensitivity_error}",
+                    file=sys.stderr,
+                )
+                exit_code = 1
             invalid_doses = [c["dose_label"] for c in dose_columns if c["detected"] == "INVALID"]
             if invalid_doses:
                 print(

@@ -321,6 +321,183 @@ class DosesFieldHardeningTests(unittest.TestCase):
         self.assertNotIn("entries", cause)
 
 
+class ReportShapeHardeningTests(unittest.TestCase):
+    """Unit-63 round-17 audit shapes (a)/(b): a `json.loads`-parsed
+    `report` that is valid JSON but not an object (`null`, `[]`, `"str"`,
+    `3`), or an object whose `mutant_dose_ladder` value is present but not
+    itself an object (e.g. a list), used to crash `dose_ladder_cause` with
+    an uncaught `AttributeError` from calling `.get` on a non-dict -- which
+    `runpod_gpu_howwell.sh`'s own `2>/dev/null || echo "unknown (could not
+    inspect ...)"` wrapper collapsed into the same opaque "unknown" text a
+    genuinely-no-cause-found run also produces (rc 1, empty stdout). Both
+    now degrade to a NAMED cause, exit 0, driven here through the real CLI
+    subprocess (the exact shape `runpod_gpu_howwell.sh` invokes), pinned
+    RED at 668a3206 (each shape below crashed with the errors named in its
+    own comment before this suite's own fix).
+
+    Pre-fix RED, captured directly (each run via
+    `python3 ci/scripts/howwell_dose_ladder_cause.py <path>` at 668a3206):
+      null       -> AttributeError: 'NoneType' object has no attribute 'get' (rc=1)
+      []         -> AttributeError: 'list' object has no attribute 'get' (rc=1)
+      "str"      -> AttributeError: 'str' object has no attribute 'get' (rc=1)
+      3          -> AttributeError: 'int' object has no attribute 'get' (rc=1)
+      {"mutant_dose_ladder": [1, 2]} -> AttributeError: 'list' object has no attribute 'get' (rc=1)
+    """
+
+    def _run(self, report_text: str) -> subprocess.CompletedProcess:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
+            fh.write(report_text)
+            path = fh.name
+        try:
+            return subprocess.run([sys.executable, _SCRIPT, path], capture_output=True, text=True)
+        finally:
+            Path(path).unlink()
+
+    def test_top_level_null_degrades_to_a_named_cause(self):
+        proc = self._run("null")
+        self.assertEqual(proc.returncode, 0, msg=f"stderr={proc.stderr!r}")
+        self.assertIn("report_is_not_an_object(type=NoneType)", proc.stdout)
+
+    def test_top_level_empty_list_degrades_to_a_named_cause(self):
+        proc = self._run("[]")
+        self.assertEqual(proc.returncode, 0, msg=f"stderr={proc.stderr!r}")
+        self.assertIn("report_is_not_an_object(type=list)", proc.stdout)
+
+    def test_top_level_string_degrades_to_a_named_cause(self):
+        proc = self._run('"str"')
+        self.assertEqual(proc.returncode, 0, msg=f"stderr={proc.stderr!r}")
+        self.assertIn("report_is_not_an_object(type=str)", proc.stdout)
+
+    def test_top_level_number_degrades_to_a_named_cause(self):
+        proc = self._run("3")
+        self.assertEqual(proc.returncode, 0, msg=f"stderr={proc.stderr!r}")
+        self.assertIn("report_is_not_an_object(type=int)", proc.stdout)
+
+    def test_non_dict_mutant_dose_ladder_degrades_to_a_named_cause(self):
+        proc = self._run('{"mutant_dose_ladder": [1, 2]}')
+        self.assertEqual(proc.returncode, 0, msg=f"stderr={proc.stderr!r}")
+        self.assertIn("mutant_dose_ladder_is_not_an_object(type=list)", proc.stdout)
+
+    def test_falsy_non_dict_mutant_dose_ladder_still_degrades_to_the_empty_ladder_case(self):
+        # `mutant_dose_ladder` falsy-but-non-dict (e.g. an empty list) takes
+        # the SAME "treat as empty ladder" path a `null`/absent value takes
+        # -- this is pre-existing behavior (`or {}`, now `if not ladder`)
+        # this fix does not change, only the TRUTHY-non-dict case (above)
+        # is newly guarded.
+        proc = self._run('{"status": "GREEN", "mutant_dose_ladder": []}')
+        self.assertEqual(proc.returncode, 0, msg=f"stderr={proc.stderr!r}")
+        self.assertIn("unknown", proc.stdout)
+        self.assertNotIn("mutant_dose_ladder_is_not_an_object", proc.stdout)
+
+    def test_dose_ladder_cause_direct_call_also_names_non_dict_report(self):
+        # Same shape, driven directly through `dose_ladder_cause` (not just
+        # through `main()`'s subprocess CLI) -- proves the guard lives in
+        # the function itself, not merely something `main()` papers over.
+        self.assertEqual(namer.dose_ladder_cause(None), "report_is_not_an_object(type=NoneType)")
+        self.assertEqual(namer.dose_ladder_cause([1, 2]), "report_is_not_an_object(type=list)")
+        self.assertEqual(
+            namer.dose_ladder_cause({"mutant_dose_ladder": "not-a-dict"}),
+            "mutant_dose_ladder_is_not_an_object(type=str)",
+        )
+
+
+class ReportUndecodableHardeningTests(unittest.TestCase):
+    """Unit-63 round-17 audit shape (c): a report file that is not valid
+    UTF-8 raised `UnicodeDecodeError` from INSIDE `main()`'s own `fh.read()`
+    -- a `ValueError` subclass, not an `OSError` subclass, so the pre-fix
+    `except OSError` arm alone did not catch it; it propagated uncaught
+    (rc 1, empty stdout, a traceback on stderr). Pinned RED at 668a3206:
+    `python3 ci/scripts/howwell_dose_ladder_cause.py <non-utf8-file>` raised
+    `UnicodeDecodeError: 'utf-8' codec can't decode byte 0xff in position 0:
+    invalid start byte` uncaught. Now degrades to a NAMED
+    `report_undecodable(...)` cause, exit 0.
+    """
+
+    def test_non_utf8_file_degrades_to_a_named_cause_rc_zero(self):
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as fh:
+            fh.write(b"\xff\xfe\x00{not valid")
+            path = fh.name
+        try:
+            proc = subprocess.run([sys.executable, _SCRIPT, path], capture_output=True, text=True)
+        finally:
+            Path(path).unlink()
+        self.assertEqual(proc.returncode, 0, msg=f"stderr={proc.stderr!r}")
+        self.assertIn("report_undecodable(", proc.stdout)
+        self.assertIn("UnicodeDecodeError", proc.stdout)
+
+    def test_non_utf8_file_through_main_direct_call_matches_subprocess(self):
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as fh:
+            fh.write(b"\xff\xfe\x00{not valid")
+            path = fh.name
+        try:
+            rc, stdout = _call_main_capturing_stdout([path])
+        finally:
+            Path(path).unlink()
+        self.assertEqual(rc, 0)
+        self.assertIn("report_undecodable(", stdout)
+
+
+class ShadowedAbMergeAttributesHardeningTests(unittest.TestCase):
+    """Unit-63 round-17 audit shapes (d)/(e): a module named `ab_merge`
+    that IMPORTS cleanly (no `ImportError`/`SyntaxError`) but is stale or
+    shadowed -- lacking one of the three attribute names this module reads
+    off it at module load (`DOSE_LADDER_EXIT_CAUSE_NAMES`,
+    `MUTANT_DOSE_DETECTED_INVALID`, `RED_PROOF_VERDICT_NOT_PROVEN_PREFIX`)
+    -- used to raise an uncaught `AttributeError` straight out of module
+    load (rc 1, empty stdout, a traceback on stderr), reachable even though
+    `AbMergeImportFailureHardeningTests` (an outright `import ab_merge`
+    failure) was already hardened. Pinned RED at 668a3206: a stub `ab_merge`
+    module defining only an unrelated name crashed with `AttributeError:
+    module 'ab_merge' has no attribute 'DOSE_LADDER_EXIT_CAUSE_NAMES'` at
+    module load, and a stub defining `DOSE_LADDER_EXIT_CAUSE_NAMES` alone
+    (but not the other two) crashed with `AttributeError: module 'ab_merge'
+    has no attribute 'MUTANT_DOSE_DETECTED_INVALID'`. Both now degrade to
+    the SAME `ab_merge_import_failed(...)` named cause an outright import
+    failure produces -- same setup shape as
+    `AbMergeImportFailureHardeningTests` (copy the real script into a
+    throwaway directory alongside a deliberately-stale `perf/ab_merge.py`
+    stub, invoke as a real subprocess), with a stale-but-importable stub
+    swapped in for a broken one.
+    """
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp(prefix="howwell-dose-ladder-cause-shadowed-attrs-")
+        self.addCleanup(shutil.rmtree, self._tmpdir, ignore_errors=True)
+        shutil.copy(_SCRIPT, Path(self._tmpdir) / "howwell_dose_ladder_cause.py")
+        (Path(self._tmpdir) / "perf").mkdir()
+        self._script = str(Path(self._tmpdir) / "howwell_dose_ladder_cause.py")
+
+    def _write_stub(self, stub_source: str) -> None:
+        (Path(self._tmpdir) / "perf" / "ab_merge.py").write_text(stub_source)
+
+    def _run(self, report: dict) -> subprocess.CompletedProcess:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, dir=self._tmpdir) as fh:
+            json.dump(report, fh)
+            path = fh.name
+        return subprocess.run([sys.executable, self._script, path], capture_output=True, text=True)
+
+    def test_stub_missing_all_three_attributes_degrades_to_a_named_cause(self):
+        self._write_stub("SOME_OTHER_CONST = 1\n")
+        proc = self._run({"status": "GREEN", "mutant_dose_ladder": {}})
+        self.assertEqual(proc.returncode, 0, msg=f"stderr={proc.stderr!r}")
+        self.assertIn("ab_merge_import_failed(", proc.stdout)
+        self.assertIn("AttributeError", proc.stdout)
+        self.assertIn("DOSE_LADDER_EXIT_CAUSE_NAMES", proc.stdout)
+
+    def test_stub_missing_only_the_second_and_third_attribute_degrades_to_a_named_cause(self):
+        self._write_stub('DOSE_LADDER_EXIT_CAUSE_NAMES = ("a", "b", "c", "d")\n')
+        proc = self._run({"status": "GREEN", "mutant_dose_ladder": {}})
+        self.assertEqual(proc.returncode, 0, msg=f"stderr={proc.stderr!r}")
+        self.assertIn("ab_merge_import_failed(", proc.stdout)
+        self.assertIn("MUTANT_DOSE_DETECTED_INVALID", proc.stdout)
+
+    def test_stub_missing_attributes_never_produces_bare_unknown(self):
+        self._write_stub("SOME_OTHER_CONST = 1\n")
+        proc = self._run({"status": "GREEN", "mutant_dose_ladder": {}})
+        self.assertEqual(proc.returncode, 0, msg=f"stderr={proc.stderr!r}")
+        self.assertNotIn("unknown (no", proc.stdout)
+
+
 class MainEntryPointTests(unittest.TestCase):
     """Unit-63 round-14 audit A5: `main()` (the actual CLI entry
     `runpod_gpu_howwell.sh` invokes) had zero execution coverage -- every

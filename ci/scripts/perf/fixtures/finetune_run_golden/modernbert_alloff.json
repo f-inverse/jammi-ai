@@ -1,0 +1,110 @@
+{
+  "engine_version": "0.47.0",
+  "host": {
+    "logical_cpus": 18,
+    "total_ram_mib": 0
+  },
+  "subcommand": "finetune-run",
+  "provenance": {
+    "build_sha": "1962891cede8b3beb73289f22de08dd4b47a99b3",
+    "target": "aarch64-apple-darwin",
+    "profile": "release",
+    "build_features": [],
+    "report_schema_version": 2
+  },
+  "tiers": {
+    "finetune_run": {
+      "seed": 7,
+      "batch": 2,
+      "seq": 16,
+      "lora_rank": 2,
+      "lora_alpha": 4.0,
+      "lora_dropout": 0.0,
+      "margin": null,
+      "target_modules": [
+        "Wqkv",
+        "Wo",
+        "Wi"
+      ],
+      "backbone_dtype": "f32",
+      "checkpoint_config_sha256": "64d378211a6e8787f34228ae6f6aa8046aa4f3e41026184e6fd0060dbceb7f1f",
+      "checkpoint_weights_sha256": "2fc79747c5b140f766c629420ece0439cb4a5d8259227f31571fc07e4b918ccf",
+      "checkpoint_weights_size_bytes": 75884,
+      "max_grad_norm": null,
+      "warmup": null,
+      "row_lengths": null,
+      "epochs": 2,
+      "lr": 0.001,
+      "schedule": "constant",
+      "warmup_steps": 0,
+      "weight_decay": 0.0,
+      "grad_accum": 1,
+      "validation_fraction": 0.0,
+      "train_pairs_file_sha256": "6dd85f1682c5663493448a3c12eb0f385e7bc29bcd1ca61398e2993f2a7c2f52",
+      "heldout_ids_sha256": "be8063f8e4c1ab11fc0da9ac48541e8053aeeac14572c1a66e16c215ebc4548e",
+      "heldout_pairs_sha256": "bd110a57974fb11aa727e9ca0be99d3d259281e4ef4a9c078951d25f846959fa",
+      "heldout_batch_partition_sha256": "08fc5b466295898a0d182f131d50a6f49b6644f8606b3fb27e58ba6c45d2cd37",
+      "embedding_loss": "mnrl",
+      "temperature": 20.0,
+      "matryoshka_dims": [],
+      "early_stopping_patience": 10000,
+      "early_stopping_metric": "train_loss",
+      "eval_cadence": 1,
+      "arm": "alloff",
+      "device_name": "cpu",
+      "kernels_disabled_requested": [
+        "adamw_step_fused",
+        "attention_block_flash"
+      ],
+      "kernels_disabled_fired": [
+        "adamw_step_fused",
+        "attention_block_flash"
+      ],
+      "flash_compiled": true,
+      "build_features": [],
+      "attention_arm": "eager",
+      "split_rule": "positional_fraction_split",
+      "batched_forward": true,
+      "steps_measured": 6,
+      "ln_fused_dispatches": 1710,
+      "ln_eager_dispatches": 0,
+      "rope_fused_dispatches": 0,
+      "rope_eager_dispatches": 0,
+      "softmax_fused_dispatches": 0,
+      "softmax_eager_dispatches": 0,
+      "geglu_fused_dispatches": 840,
+      "geglu_eager_dispatches": 0,
+      "lora_epilogue_fused_dispatches": 0,
+      "lora_epilogue_eager_dispatches": 0,
+      "lora_linear_fused_dispatches": 3360,
+      "lora_linear_eager_dispatches": 0,
+      "attention_block_fused_dispatches": 840,
+      "attention_block_eager_dispatches": 0,
+      "adamw_fused_dispatches": 0,
+      "adamw_eager_dispatches": 6720,
+      "attention_block_flash_fused_dispatches": 0,
+      "attention_block_flash_declined_dispatches": 840,
+      "admission_is_dense": false,
+      "learning_happened_delta": 0.0004811286926269531,
+      "tie_fraction": 0.0,
+      "final_epoch": 1,
+      "held_out_example_mean": 0.6931476593017578,
+      "held_out_count": 2,
+      "final_loss_diagnostic": 0.45491814613342285,
+      "trajectory": [
+        {
+          "epoch": 0,
+          "held_out_mean": 0.6931476593017578,
+          "held_out_tie_fraction": 0.0,
+          "held_out_batch_partition_sha256": "08fc5b466295898a0d182f131d50a6f49b6644f8606b3fb27e58ba6c45d2cd37"
+        },
+        {
+          "epoch": 1,
+          "held_out_mean": 0.6931476593017578,
+          "held_out_tie_fraction": 0.0,
+          "held_out_batch_partition_sha256": "08fc5b466295898a0d182f131d50a6f49b6644f8606b3fb27e58ba6c45d2cd37"
+        }
+      ]
+    }
+  }
+}

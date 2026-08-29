@@ -41,7 +41,7 @@ on:
         required: true
         type: string
       lr0_seeds:
-        description: "Comma-separated lr=0 RED control seeds (default: '1,2' — the first two of the pre-registered 12-seed gate set, CONTRACT H5 step 3's own 'x2 seeds' control; CONTRACT Frame 'RED control: lr=0 arm x2 seeds fails learning-happened'. Set to an empty string to EXPLICITLY opt out — the merged artifact then records lr0_control.seeds:[] for auditability, distinguishing a deliberate skip from an unset input.)"
+        description: "Comma-separated lr=0 RED control seeds (default: '1,2' — the first two of the pre-registered 12-seed gate set, CONTRACT H5 step 3's own 'x2 seeds' control; CONTRACT Frame 'RED control: lr=0 arm x2 seeds fails learning-happened'. This input only has a source on a workflow_dispatch trigger — a run-howwell PR-label trigger carries no inputs at all and this workflow now refuses loudly rather than silently dropping the control (see the 'Resolve' step). ab_merge.py's own finetune-run merger separately refuses (INVALID) whenever the resolved seed list is empty unless --allow-missing-lr0-control was explicitly passed, so clearing this field on a dispatch run records a deliberate, visible opt-out rather than a silent skip.)"
         required: false
         type: string
         default: "1,2"
@@ -82,7 +82,7 @@ jobs:
       # rather than silently defaulting either one (a placeholder path a
       # real pod would never have, or an unstated mnrl-vs-triplet choice the
       # probe's selection must always be deliberate about).
-      - name: Resolve HOWWELL_MODEL_DIR / HOWWELL_OBJECTIVE
+      - name: Resolve HOWWELL_MODEL_DIR / HOWWELL_OBJECTIVE / HOWWELL_LR0_SEEDS
         id: resolve
         run: |
           MODEL_DIR="${{ github.event.inputs.model_dir }}"
@@ -99,6 +99,30 @@ jobs:
           fi
           echo "objective=$OBJECTIVE" >> "$GITHUB_OUTPUT"
 
+          # unit-63 round-3 audit block 5: workflow_dispatch's own
+          # `lr0_seeds` input carries a pre-registered default ("1,2") baked
+          # into this workflow's schema above, so it is empty only when an
+          # operator EXPLICITLY clears it (a deliberate, recorded opt-out —
+          # ab_merge.py's own finetune-run merger separately refuses INVALID
+          # on an empty seed list unless --allow-missing-lr0-control is
+          # passed, which this workflow does not yet forward, so clearing
+          # this field on a dispatch run currently makes the merge INVALID
+          # by design rather than silently skipping the control). A
+          # run-howwell PR-label trigger carries NO workflow_dispatch inputs
+          # at all — the SAME limitation model_dir/objective already refuse
+          # loudly on above, rather than silently collapsing (via the OLD
+          # `github.event.inputs.lr0_seeds || ''` coalesce this step
+          # replaces) to the same untagged "" a deliberate dispatch opt-out
+          # would also produce, which dropped the pre-registered lr0 RED
+          # control on EVERY label-triggered run with no visible signal.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            LR0_SEEDS="${{ github.event.inputs.lr0_seeds }}"
+          else
+            echo "::error::lr0_seeds has no source on a run-howwell PR-label trigger (it carries no workflow_dispatch inputs and cannot supply one) — use workflow_dispatch instead so the pre-registered lr=0 RED control (or a deliberate, visible opt-out) can actually be selected."
+            exit 1
+          fi
+          echo "lr0_seeds=$LR0_SEEDS" >> "$GITHUB_OUTPUT"
+
       - name: Run the how-well A/B on a real A100
         id: howwell
         env:
@@ -108,7 +132,7 @@ jobs:
           HOWWELL_MODEL_DIR: ${{ steps.resolve.outputs.model_dir }}
           HOWWELL_SEEDS: ${{ github.event.inputs.seeds || '1,2,3,4,5,6,7,8,9,10,11,12' }}
           HOWWELL_OBJECTIVE: ${{ steps.resolve.outputs.objective }}
-          HOWWELL_LR0_SEEDS: ${{ github.event.inputs.lr0_seeds || '' }}
+          HOWWELL_LR0_SEEDS: ${{ steps.resolve.outputs.lr0_seeds }}
         run: |
           set +e
           bash ci/scripts/runpod_gpu_howwell.sh

@@ -94,6 +94,17 @@
 #                              value need not, and by default does not,
 #                              collide with the gate/off-sample seed
 #                              namespaces).
+#   FINETUNE_RUN_AB_ALLOW_NO_LR0
+#                              unit-63 round-3 audit block 5. Default "0":
+#                              when FINETUNE_RUN_AB_LR0_SEEDS is empty,
+#                              ab_merge.py's own merger REFUSES (INVALID) --
+#                              the pre-registered lr=0 RED control is not
+#                              silently optional. Set to "1" to pass
+#                              ab_merge.py's `--allow-missing-lr0-control`
+#                              flag instead, recording a DELIBERATE, visible
+#                              opt-out in the merged artifact
+#                              (lr0_control.allow_missing_lr0_control) rather
+#                              than an unstated default.
 #   FINETUNE_RUN_AB_CUDA       CUDA ordinal (default: 0). Unset
 #                              FINETUNE_RUN_AB_CPU=1 to omit --cuda entirely
 #                              (the CPU-hermetic smoke path finetune-run's
@@ -266,9 +277,18 @@ run_cmd() {
   "$@"
 }
 
+# unit-63 round-3 audit, coordinator correction: CONTRACT 63 Frame
+# pre-registers the arms as "fused cascade vs ALLOFF=attention_block_flash,
+# adamw_step_fused" -- the A/B's own differential IS the flash cascade.
+# Building WITHOUT flash-attn (as this line used to) makes
+# attention_block_flash unable to dispatch in EITHER arm, nulling the
+# experiment the campaign exists to run -- mirrors fa2_ab.sh's/
+# stacked_sweep.sh's own flash-A/B build feature list exactly
+# (`--features cuda,jammi-encoders/flash-attn`), never a second,
+# independently-drifting feature-list spelling.
 if [ "$FINETUNE_RUN_AB_DRY_RUN" != "1" ]; then
-  run_cmd cargo build --release -p jammi-bench --features cuda --manifest-path "$REPO_ROOT/Cargo.toml" \
-    || { echo "::error::cargo build -p jammi-bench --features cuda failed" >&2; exit 1; }
+  run_cmd cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn --manifest-path "$REPO_ROOT/Cargo.toml" \
+    || { echo "::error::cargo build -p jammi-bench --features cuda,jammi-encoders/flash-attn failed" >&2; exit 1; }
 fi
 
 # --- provenance cross-check (unification contract C5.1), same shape as
@@ -400,7 +420,20 @@ fi
 # INTO the merged artifact by ab_merge.py's own `finetune-run` mode (unit 63
 # H4b) -- reusing the same generic leg-premise-refusal core `encode_ab.sh`'s
 # merge step already builds on, never a second, hand-rolled comparator.
-python3 "$DIR/ab_merge.py" finetune-run "$RAW_DIR" "$OUT_DIR" "$FINETUNE_RUN_AB_SEEDS" "$FINETUNE_RUN_AB_LR0_SEEDS"
+#
+# unit-63 round-3 audit block 5: `ab_merge.py`'s own merger now REFUSES
+# (INVALID) when FINETUNE_RUN_AB_LR0_SEEDS is empty, unless
+# `--allow-missing-lr0-control` is passed -- the pre-registered lr=0 RED
+# control (CONTRACT Frame) is not silently optional. This script forwards
+# that flag ONLY when the operator sets FINETUNE_RUN_AB_ALLOW_NO_LR0=1
+# (default unset/0) -- a deliberate, visible opt-out recorded in the merged
+# artifact (`lr0_control.allow_missing_lr0_control`), never a silent default.
+FINETUNE_RUN_AB_ALLOW_NO_LR0="${FINETUNE_RUN_AB_ALLOW_NO_LR0:-0}"
+MERGE_ARGS=(finetune-run "$RAW_DIR" "$OUT_DIR" "$FINETUNE_RUN_AB_SEEDS" "$FINETUNE_RUN_AB_LR0_SEEDS")
+if [ "$FINETUNE_RUN_AB_ALLOW_NO_LR0" = "1" ]; then
+  MERGE_ARGS+=(--allow-missing-lr0-control)
+fi
+python3 "$DIR/ab_merge.py" "${MERGE_ARGS[@]}"
 PY_RC=$?
 
 echo
